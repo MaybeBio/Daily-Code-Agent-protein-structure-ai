@@ -1,0 +1,337 @@
+"""Execution candidates for local refinement."""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, TypeAlias
+
+from protrepair.errors import ModelInvariantError, RefinementError
+from protrepair.scope import Scope
+from protrepair.structure.aggregate import ProteinStructure
+from protrepair.transformer.artifacts import RegionTransformationResult
+from protrepair.transformer.artifacts.patch import StructureDelta
+from protrepair.transformer.context import ProteinTransformationContext
+from protrepair.transformer.continuous.domain import ContinuousRelaxationProblem
+from protrepair.transformer.continuous.execution import ContinuousRelaxationExecution
+from protrepair.transformer.continuous.local_relaxation import (
+    ContinuousLocalRelaxationTransformer,
+)
+from protrepair.transformer.continuous.readiness import (
+    derive_atom_scope_continuous_relaxation_facts,
+    require_atom_scope_continuous_relaxation_execution,
+)
+from protrepair.transformer.refinement.acceptance import (
+    AssessedRefinementResult,
+    RefinementAcceptanceMetrics,
+)
+from protrepair.transformer.refinement.local_pipeline.lineage import (
+    CandidateConstructionStageKind,
+    RefinementCandidateLineage,
+)
+from protrepair.transformer.refinement.speculative_planning import (
+    EvaluatedSpeculativeProposal,
+    SpeculativeAdoptionDecision,
+    SpeculativeEvaluationBatch,
+    SpeculativeExecution,
+    SpeculativeExecutionBatch,
+)
+
+if TYPE_CHECKING:
+    from protrepair.transformer.refinement.local_pipeline.request import (
+        LocalRefinementRequest,
+    )
+
+
+class RefinementExecutionMode(str, Enum):
+    """Closed execution modes for prepared refinement candidates."""
+
+    CONTINUOUS_RELAXATION = "continuous_relaxation"
+    DISCRETE_ONLY = "discrete_only"
+
+
+@dataclass(frozen=True, slots=True)
+class RefinementExecutionCandidate:
+    """One canonical candidate ready for a refinement execution mode."""
+
+    context: ProteinTransformationContext
+    lineage: "RefinementCandidateLineage"
+    fallback_structure: ProteinStructure
+    execution_mode: RefinementExecutionMode = (
+        RefinementExecutionMode.CONTINUOUS_RELAXATION
+    )
+
+    def execute(
+        self,
+        *,
+        request: "LocalRefinementRequest",
+    ) -> "ExecutedRefinementCandidate":
+        """Execute this candidate according to its execution mode."""
+
+        if self.execution_mode is RefinementExecutionMode.DISCRETE_ONLY:
+            return self.execute_discrete_only()
+        if self.execution_mode is RefinementExecutionMode.CONTINUOUS_RELAXATION:
+            return self.execute_continuous(request=request)
+
+        raise RefinementError(
+            f"unknown refinement execution mode {self.execution_mode!r}"
+        )
+
+    def execute_continuous(
+        self,
+        *,
+        request: "LocalRefinementRequest",
+    ) -> "ExecutedRefinementCandidate":
+        """Execute this candidate through the continuous backend stage."""
+
+        atom_scope = self.context.atom_input.observed_atom_scope(
+            self.context.source_snapshot
+        )
+        observation = request.chemistry_observation.for_structure(
+            self.context.source_snapshot.structure
+        )
+        require_atom_scope_continuous_relaxation_execution(
+            derive_atom_scope_continuous_relaxation_facts(
+                self.context.source_snapshot,
+                atom_scope,
+                component_library=request.component_library,
+                context_radius_angstrom=request.spec.context_radius_angstrom,
+                allow_retained_non_polymer_rdkit_fallback=(
+                    request.allow_retained_non_polymer_rdkit_fallback
+                ),
+                retained_non_polymer_chemistry_evidence=(
+                    request.retained_non_polymer_chemistry_evidence
+                ),
+                chemistry_observation=observation,
+            )
+        )
+
+        problem = ContinuousRelaxationProblem.from_inputs(
+            self.context.source_snapshot,
+            self.context.atom_input,
+            spec=request.spec,
+            component_library=request.component_library,
+            allow_retained_non_polymer_rdkit_fallback=(
+                request.allow_retained_non_polymer_rdkit_fallback
+            ),
+            retained_non_polymer_chemistry_evidence=(
+                request.retained_non_polymer_chemistry_evidence
+            ),
+            retained_non_polymer_chemistry_resolution_by_residue_id=(
+                observation.hydrogen_expectation_model.retained_non_polymer_resolution_by_residue_id
+            ),
+        )
+        return SpeculativeExecution(
+            proposal=self,
+            outcome=ContinuousLocalRelaxationTransformer(
+                spec=request.spec,
+                component_library=request.component_library,
+                restraint_library=request.restraint_library,
+                backend=request.backend,
+            ).relax_problem(problem),
+        )
+
+    def execute_discrete_only(self) -> "ExecutedRefinementCandidate":
+        """Materialize this pre-backend discrete candidate without FF execution."""
+
+        if not self.lineage.moved_atom_indices():
+            raise RefinementError(
+                "discrete-only refinement candidates require pre-backend movement"
+            )
+
+        refined_structure = self.context.source_snapshot.structure
+        return SpeculativeExecution(
+            proposal=self,
+            outcome=RegionTransformationResult(
+                refined_structure=refined_structure,
+                delta=StructureDelta(
+                    before_constitution=self.fallback_structure.constitution,
+                    after_constitution=refined_structure.constitution,
+                ),
+                issues=(),
+                backend_name="discrete_preconditioning",
+            ),
+        )
+
+    def is_parser_preconditioning_candidate(self) -> bool:
+        """Return whether this is the parser-witness discrete preconditioner."""
+
+        return (
+            self.execution_mode is RefinementExecutionMode.DISCRETE_ONLY
+            and self.lineage.has_step_kind(
+                CandidateConstructionStageKind.PARSER_WITNESS_PRE_UNTANGLE
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RefinementExecutionBatch:
+    """Primary candidates and an assessment-gated original-input rescue."""
+
+    candidates: tuple[RefinementExecutionCandidate, ...]
+    original_start: RefinementExecutionCandidate | None = None
+
+    def __post_init__(self) -> None:
+        original = self.original_start
+        if original is None:
+            return
+
+        if (
+            original.execution_mode is not RefinementExecutionMode.CONTINUOUS_RELAXATION
+            or original.lineage.steps
+            or original.context.source_snapshot.structure
+            is not original.fallback_structure
+        ):
+            raise ModelInvariantError(
+                "original-start rescue must use its unchanged parent"
+            )
+        if any(
+            candidate is original
+            or candidate.fallback_structure is not original.fallback_structure
+            for candidate in self.candidates
+        ):
+            raise ModelInvariantError(
+                "refinement starts must share one parent without duplication"
+            )
+        if not any(
+            candidate.lineage.moved_atom_indices() for candidate in self.candidates
+        ):
+            raise ModelInvariantError(
+                "original-start rescue requires preparation movement"
+            )
+
+    def all_candidates(self) -> tuple[RefinementExecutionCandidate, ...]:
+        """Return planned candidates, including the assessment-gated rescue."""
+
+        if self.original_start is None:
+            return self.candidates
+
+        return (*self.candidates, self.original_start)
+
+    def candidate_count_for_mode(self, mode: RefinementExecutionMode) -> int:
+        """Return how many candidates in this batch use one execution mode."""
+
+        return sum(
+            1 for candidate in self.all_candidates() if candidate.execution_mode is mode
+        )
+
+    def discrete_parser_preconditioning_candidate(
+        self,
+    ) -> RefinementExecutionCandidate | None:
+        """Return the parser-witness discrete-only candidate when present."""
+
+        if not self.candidates:
+            return None
+
+        candidate = self.candidates[0]
+        if candidate.is_parser_preconditioning_candidate():
+            return candidate
+
+        return None
+
+    def without_candidate(
+        self,
+        excluded_candidate: RefinementExecutionCandidate,
+    ) -> "RefinementExecutionBatch":
+        """Return this batch without one candidate identity."""
+
+        return type(self)(
+            candidates=tuple(
+                candidate
+                for candidate in self.candidates
+                if candidate is not excluded_candidate
+            ),
+            original_start=(
+                None
+                if self.original_start is excluded_candidate
+                else self.original_start
+            ),
+        )
+
+    def execute(
+        self,
+        *,
+        request: "LocalRefinementRequest",
+    ) -> "ExecutedRefinementBatch":
+        """Execute primary candidates; assessment gates the original-start rescue."""
+
+        executed_candidates: list[ExecutedRefinementCandidate] = []
+        execution_errors: list[RefinementError] = []
+        for candidate in self.candidates:
+            try:
+                executed_candidates.append(candidate.execute(request=request))
+            except RefinementError as exc:
+                execution_errors.append(exc)
+
+        return SpeculativeExecutionBatch(
+            executions=tuple(executed_candidates),
+            errors=tuple(execution_errors),
+        )
+
+
+ExecutedRefinementCandidate: TypeAlias = SpeculativeExecution[
+    RefinementExecutionCandidate,
+    RegionTransformationResult,
+]
+ExecutedRefinementBatch: TypeAlias = SpeculativeExecutionBatch[
+    RefinementExecutionCandidate,
+    RegionTransformationResult,
+    RefinementError,
+]
+AssessedRefinementCandidate: TypeAlias = EvaluatedSpeculativeProposal[
+    RefinementExecutionCandidate,
+    RegionTransformationResult,
+    AssessedRefinementResult,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class AssessedRefinementBatch(
+    SpeculativeEvaluationBatch[
+        RefinementExecutionCandidate,
+        RegionTransformationResult,
+        AssessedRefinementResult,
+        RefinementError,
+    ]
+):
+    """Assessed candidates with all observed native returns before selection.
+
+    Parameters
+    ----------
+    relaxation_executions : tuple[ContinuousRelaxationExecution, ...]
+        Native returns from this batch, including rejected or unselected candidates.
+    """
+
+    relaxation_executions: tuple[ContinuousRelaxationExecution, ...] = field(
+        default=(), compare=False, repr=False, kw_only=True
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "relaxation_executions",
+            ContinuousRelaxationExecution.deduplicated(self.relaxation_executions),
+        )
+
+    def followed_by(
+        self, following: "AssessedRefinementBatch"
+    ) -> "AssessedRefinementBatch":
+        """Combine stages in execution order without losing errors or native returns."""
+
+        return type(self)(
+            evaluated_proposals=(
+                *self.evaluated_proposals,
+                *following.evaluated_proposals,
+            ),
+            execution_errors=(*self.execution_errors, *following.execution_errors),
+            relaxation_executions=(
+                *self.relaxation_executions,
+                *following.relaxation_executions,
+            ),
+        )
+
+
+SelectedRefinementCandidate: TypeAlias = SpeculativeAdoptionDecision[
+    RefinementExecutionCandidate,
+    RegionTransformationResult,
+    AssessedRefinementResult,
+]
+BeforeMetricsCache: TypeAlias = dict[tuple[int, Scope], RefinementAcceptanceMetrics]

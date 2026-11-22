@@ -1,0 +1,38 @@
+model:
+  _yaml_: "../kfold.yaml"
+  trunk:
+    blocks_per_ckpt: 1
+  score_model:
+    blocks_per_ckpt: 1
+    ckpt_atom_stack: true
+  confidence_head:
+    blocks_per_ckpt: 1
+
+train:
+  _yaml_: "full.yaml"
+  name: stage2
+  seed: 2
+
+  loss:
+    weights:
+      bond: 1.0
+
+  training:
+    diffusion_batch_size: 32
+
+  data:
+    max_chains: 20
+    max_tokens: 640
+    max_atoms: 7680
+    max_sequence_tokens: 1280
+
+    ccd_path: /data/ccd-train.pkl
+    data_root: /data/
+    train_datasets:
+      - _yaml_: "dataset/rcsb-train.yaml"
+        name: rcsb-train
+        weight: 1.0
+
+    val_datasets:
+      - _yaml_: "dataset/rcsb-val.yaml"
+        name: rcsb-val

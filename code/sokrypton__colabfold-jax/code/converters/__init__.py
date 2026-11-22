@@ -1,0 +1,107 @@
+"""AF3-lineage PyTorch -> haiku weight converters.
+
+One module per model, named for the model itself (full name + version, matching
+the runner's WEIGHTS keys and global_config.model): openfold3, intellifold2,
+opendde, boltz2, protenix2, rosettafold3, chai1. Shared primitives live in common.py;
+each family is a thin dialect + map on top. The runner dispatches through
+CONVERTERS; the per-model `convert_<model>_weights` entry points and the blob io
+are re-exported here.
+"""
+
+_ENTRY_POINTS = {
+    'openfold3': ('openfold3', 'convert_openfold3_weights'),
+    # same module: the two OpenFold3 releases share a converter, which
+    # refuses a checkpoint that does not match the name asked for.
+    'openbind0': ('openfold3', 'convert_openbind0_weights'),
+    # the ESMFold2 family: one converter, the variant named through
+    # `model_name` (they differ only in trunk depth, which derive_dims reads).
+    **{m: ('esmfold2', 'convert_esmfold2_weights')
+       for m in ('esmfold2', 'esmfold2_fast', 'esmfold2_lm600m',
+                 'esmfold2_lm300m')},
+    'intellifold2': ('intellifold2', 'convert_intellifold2_weights'),
+    'opendde': ('opendde', 'convert_opendde_weights'),
+    'boltz2': ('boltz2', 'convert_boltz2_weights'),
+    'protenix2': ('protenix2', 'convert_protenix2_weights'),
+    # same module and the same mapping: Protenix model types differ only in
+    # counts and widths, which converters/protenix2.derive_dims reads off the
+    # checkpoint. The entry point exists to pin the NAME, and refuses a
+    # checkpoint whose shape does not match it.
+    'protenix1': ('protenix2', 'convert_protenix1_weights'),
+    'rosettafold3': ('rosettafold3', 'convert_rosettafold3_weights'),
+    'chai1': ('chai1', 'convert_chai1_weights'),
+    'bioemu2': ('bioemu2', 'convert_bioemu2_weights'),
+    'helixfold3': ('helixfold3', 'convert_helixfold3_weights'),
+    # Mol-1: protenix2's mappers outside its split trunk (converters/mol1.py)
+    'mol1': ('mol1', 'convert_mol1_weights'),
+    # The two protein language models. Not AF3 models -- separate graphs with
+    # their own loader -- but they convert the same way and were previously
+    # reachable only by calling the function by hand.
+    'esmc': ('esm_lm', 'convert_esmc_weights'),
+    'esm2': ('esm_lm', 'convert_esm2_weights'),
+}
+
+
+class _Converters(dict):
+  """The converter registry, imported on first use.
+
+  Lazily, because importing a converter pulls in alphafold3 (for the blob
+  format) and numpy, and not every caller of this package has them -- the
+  registry itself is just a name table, and reading it should not require the
+  whole model to be importable.
+  """
+
+  def __missing__(self, key):
+    import importlib
+
+    if key not in _ENTRY_POINTS:
+      raise KeyError(key)
+    module, attr = _ENTRY_POINTS[key]
+    fn = getattr(importlib.import_module(f'.{module}', __name__), attr)
+    # Bind WHICH variant, where one function serves several names. The eight
+    # ESMFold2 releases share convert_esmfold2_weights, whose `model_name`
+    # defaults to 'esmfold2' -- so without this, converting any variant through
+    # this registry built the base model's graph and died in
+    # check_variant_table comparing the wrong row. Bound by inspection rather
+    # than by a list, so a converter that grows the parameter gets it too.
+    import inspect
+
+    if 'model_name' in inspect.signature(fn).parameters:
+      import functools
+
+      fn = functools.partial(fn, model_name=key)
+    self[key] = fn
+    return fn
+
+  def __iter__(self):
+    return iter(_ENTRY_POINTS)
+
+  def __len__(self):
+    return len(_ENTRY_POINTS)
+
+  def keys(self):
+    return _ENTRY_POINTS.keys()
+
+
+CONVERTERS = _Converters()
+
+
+def __getattr__(name):
+  """Module-level lazy access to the per-model entry points and the blob io."""
+  import importlib
+
+  for key, (module, attr) in _ENTRY_POINTS.items():
+    if name == attr:
+      return getattr(importlib.import_module(f'.{module}', __name__), attr)
+  if name in ('encode_record', 'read_blob', 'read_records', 'write_params_blob'):
+    return getattr(importlib.import_module('.common', __name__), name)
+  raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
+
+__all__ = [
+    'CONVERTERS',
+    'convert_intellifold2_weights', 'convert_openfold3_weights',
+    'convert_opendde_weights', 'convert_boltz2_weights',
+    'convert_protenix2_weights', 'convert_rosettafold3_weights',
+    'convert_chai1_weights',
+    'write_params_blob', 'read_blob', 'read_records', 'encode_record',
+]

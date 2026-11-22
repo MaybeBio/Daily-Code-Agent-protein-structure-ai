@@ -1,0 +1,35 @@
+from molsysmt._private.argdigest import arg_digest
+
+
+@arg_digest(form="molsysmt.MolSys")
+def to_pytraj_Topology(item, atom_indices="all", skip_digestion=False):
+    """
+    Converting from molsysmt.MolSys to pytraj.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    atom_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Atom indices (0-based) to include.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    Returns
+    -------
+    pytraj.Topology
+        Resulting object in pytraj.Topology form.
+
+
+    .. versionadded:: 1.0.0
+    """
+
+    from molsysmt.form.pytraj_Topology._from_native import export_native
+
+    return export_native(
+        item.topology,
+        atom_indices=atom_indices,
+        chemical_states=item.chemical_states,
+        skip_digestion=True,
+    )

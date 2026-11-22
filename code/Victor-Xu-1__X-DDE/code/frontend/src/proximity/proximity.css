@@ -1,0 +1,423 @@
+.proximity-partner-layout {
+  min-width: 0;
+}
+.proximity-materials {
+  display: grid;
+  gap: 20px;
+  align-content: start;
+}
+.proximity-materials label {
+  display: grid;
+  gap: 8px;
+}
+.proximity-molecule {
+  display: grid;
+  grid-template-columns: minmax(250px, 1fr) minmax(280px, 1fr);
+  gap: 24px;
+  align-items: center;
+}
+.proximity-binding-region {
+  margin-top: 24px;
+  border-top: 1px solid var(--line, #e4e8f1);
+  padding-top: 16px;
+}
+.proximity-summary {
+  display: flex;
+  gap: 36px;
+  margin: 12px 0 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.proximity-summary dt {
+  font-size: 13px;
+  color: var(--muted, #66758b);
+  margin-bottom: 4px;
+}
+.proximity-summary dd {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 600;
+}
+.proximity-request-count {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 400;
+}
+.proximity-comparison .research-table-scroll table {
+  min-width: 0;
+}
+.proximity-comparison .research-table th,
+.proximity-comparison .research-table td {
+  white-space: nowrap;
+  overflow-wrap: normal;
+  padding: 12px 10px;
+}
+.proximity-comparison .research-table .mark-cell {
+  width: 24px;
+  padding-left: 8px;
+  padding-right: 0;
+}
+.proximity-comparison .research-table .result-search {
+  flex-basis: 120px;
+  max-width: 240px;
+}
+.proximity-comparison .research-table-count {
+  margin-right: 0;
+}
+.proximity-result-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+}
+.proximity-result-heading h2 {
+  font-size: 16px;
+  font-weight: 500;
+  margin: 0;
+}
+.proximity-results .structure-workbench-details {
+  gap: 12px;
+}
+.proximity-result-overview .proximity-summary {
+  margin: 9px 0 0;
+  padding-bottom: 8px;
+  gap: 18px;
+}
+.proximity-result-overview .proximity-summary dd {
+  font-size: 17px;
+  font-variant-numeric: tabular-nums;
+}
+.proximity-result-overview .proximity-summary > div {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.proximity-result-overview .proximity-summary dt {
+  margin: 0;
+}
+.proximity-preview-heading,
+.proximity-preview-identity {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  min-width: 0;
+}
+.proximity-preview-heading {
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.proximity-preview-identity > span {
+  font-size: 12px;
+}
+.proximity-assembly-preview > .research-tabs > .research-tab-list {
+  margin: 0 0 6px;
+}
+.studio-app .proximity-assembly-preview .viewer-panel .molecular-stage {
+  border-radius: 8px;
+}
+.studio-app .proximity-results .proximity-assembly-preview .viewer-panel {
+  padding: 0;
+}
+/* The preview header already exposes both original scientific files. */
+.proximity-assembly-preview .viewer-original-downloads {
+  display: none;
+}
+.proximity-assembly-preview .viewer-panel > .studio-heading {
+  column-gap: 8px;
+}
+.proximity-comparison .research-table .result-search input[type="search"] {
+  min-height: 32px;
+  padding: 6px 0;
+  border: 0;
+  background: transparent;
+}
+@media (min-width: 1180px) {
+  .proximity-comparison .proximity-checks {
+    gap: 4px 12px;
+  }
+  .proximity-comparison .proximity-checks div {
+    flex-wrap: wrap;
+    gap: 2px 6px;
+  }
+  .proximity-assembly-preview > .research-tabs > .research-tab-list {
+    margin-block-end: 4px;
+  }
+  .studio-app .proximity-assembly-preview [role="tab"] {
+    min-height: 34px;
+    padding-block: 6px;
+  }
+  .studio-app .proximity-assembly-preview .viewer-panel {
+    > .studio-heading {
+      margin-block: 0 4px;
+    }
+    :is(.viewer-heading-actions, .viewer-mode-options)
+      > :is(button, .viewer-tool-group > button),
+    .viewer-mode-options .viewer-chain-menu > summary {
+      min-height: 34px;
+    }
+  }
+}
+@media (1180px <= width <= 1360px) and (max-height: 840px) {
+  .studio-app
+    .proximity-results
+    > .structure-workbench:not([data-workspace-expanded])
+    .proximity-assembly-preview
+    .viewer-panel:has(> .viewer-mode-options):not(:has(.viewer-attachment-count)) {
+    --compact-viewer-tools: enabled;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 8px;
+
+    > * {
+      grid-column: 1 / -1;
+    }
+    > .studio-heading {
+      grid-area: 1 / 2;
+      margin: 0 0 4px;
+      flex-wrap: nowrap;
+    }
+    > .viewer-mode-options {
+      grid-area: 1 / 1;
+      gap: 4px;
+      margin: 0 0 4px;
+    }
+    > .viewer-mode-options button {
+      padding-inline: 6px;
+    }
+    > .viewer-mode-options .viewer-chain-menu > summary {
+      white-space: nowrap;
+    }
+    .viewer-heading-actions :is(button, .viewer-tool-trigger) {
+      min-width: 34px;
+      min-height: 34px;
+    }
+    :is(.viewer-title-full, .viewer-figure-label, .viewer-mode-short + .viewer-mode-full) {
+      display: none;
+    }
+    .viewer-mode-short {
+      display: inline;
+    }
+    .viewer-figure-icon {
+      display: inline-flex;
+    }
+  }
+}
+.proximity-partner-layout > * {
+  min-width: 0;
+}
+.proximity-input-empty {
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+  color: var(--muted);
+  padding: 34px 16px;
+  background: linear-gradient(135deg, #f5f4ff, #f3fbfb);
+}
+.proximity-input-symbol {
+  font-size: 34px;
+  color: var(--accent);
+  letter-spacing: 0.2em;
+}
+.proximity-input-symbol span {
+  color: #27938e;
+}
+.proximity-partner-name {
+  display: grid;
+  gap: 8px;
+  max-width: 420px;
+  margin-bottom: 20px;
+}
+.proximity-contact-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.proximity-contact-table caption {
+  text-align: left;
+  font-weight: 600;
+  padding: 12px 0;
+}
+.proximity-contact-table th,
+.proximity-contact-table td {
+  padding: 12px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+}
+.proximity-contact-table thead th {
+  color: var(--muted);
+  font-weight: 500;
+}
+.proximity-downloads {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+:is(.proximity-preview-heading, .proximity-compare-pane-heading)
+  .proximity-downloads
+  .secondary-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 31px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.proximity-compare-toolbar,
+.proximity-compare-pane-heading,
+.proximity-compare-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+.proximity-compare-toolbar,
+.proximity-compare-pane-heading {
+  justify-content: space-between;
+}
+.proximity-compare-toolbar {
+  padding-block: 4px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.proximity-compare-toolbar h3 {
+  font-size: 16px;
+  margin: 0;
+  scroll-margin-top: 96px;
+}
+.proximity-compare-toolbar .field-help {
+  margin: 3px 0 0;
+}
+.proximity-compare-actions
+  > :is([data-workspace-expand], .workspace-structure-focus) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-width: 34px;
+  min-height: 34px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--accent);
+  background: var(--surface);
+  font-size: 12px;
+}
+.proximity-compare-actions
+  > :is([data-workspace-expand], .workspace-structure-focus):hover {
+  background: var(--accent-soft);
+}
+.proximity-compare-panels {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 14px;
+  margin-block: 10px 0;
+}
+.proximity-compare-panels > section {
+  display: grid;
+  grid-template-rows: subgrid;
+  grid-row: span 2;
+  min-width: 0;
+}
+.proximity-compare-pane-heading {
+  align-items: end;
+}
+.proximity-compare-pane-heading h4 {
+  margin: 0;
+  font-size: 14px;
+}
+.proximity-compare-pane-heading h4 span {
+  color: var(--accent);
+  margin-inline-end: 5px;
+}
+.studio-app .proximity-compare-panels .viewer-panel {
+  padding: 0;
+}
+.proximity-compare-panels .viewer-original-downloads {
+  display: none;
+}
+.studio-app .proximity-compare-panels .viewer-panel .molecular-stage {
+  border-radius: 8px;
+}
+@media (max-width: 1000px) {
+  .proximity-compare-panels {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.proximity-caption {
+  color: var(--muted, #66758b);
+  font-size: 13px;
+}
+.proximity-checks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 24px;
+  margin: 16px 0;
+}
+.proximity-checks div {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line, #e4e8f1);
+  gap: 12px;
+}
+.proximity-check-pass {
+  color: #168b73;
+}
+.proximity-check-fail {
+  color: #b66d17;
+}
+.proximity-plan-options {
+  margin: 24px 0;
+}
+.proximity-expert {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line, #e4e8f1);
+}
+.proximity-expert .inline-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  margin-top: 14px;
+}
+@media (max-width: 650px) {
+  .proximity-molecule {
+    grid-template-columns: 1fr;
+  }
+  .proximity-summary {
+    gap: 12px;
+  }
+  .proximity-summary dd {
+    font-size: 22px;
+  }
+  .proximity-checks,
+  .proximity-expert .inline-fields {
+    grid-template-columns: 1fr;
+  }
+}
+.attachment-directions {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.attachment-directions .section-heading {
+  margin: 0;
+  justify-content: flex-start;
+}
+.attachment-directions .section-heading h3 {
+  font-size: 14px;
+}
+.attachment-directions .research-table thead th {
+  white-space: nowrap;
+}
+.proximity-scope {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.proximity-scope summary {
+  cursor: pointer;
+}

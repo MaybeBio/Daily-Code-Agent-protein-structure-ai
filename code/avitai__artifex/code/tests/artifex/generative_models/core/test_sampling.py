@@ -1,0 +1,484 @@
+"""Tests for sampling utilities."""
+
+import inspect
+
+import jax
+import jax.numpy as jnp
+import pytest
+
+# Import distribution for testing
+from artifex.generative_models.core.distributions import Normal
+
+# Import sampling utilities
+from artifex.generative_models.core.sampling.ancestral import ancestral_sampling
+from artifex.generative_models.core.sampling.mcmc import mcmc_sampling, metropolis_step
+from artifex.generative_models.core.sampling.ode import euler_step, ode_sampling, rk4_step
+from artifex.generative_models.core.sampling.sde import (
+    euler_maruyama_step,
+    milstein_step,
+    sde_sampling,
+)
+
+# Import test fixtures
+from tests.artifex.generative_models.utils.test_fixtures import get_rng_key
+
+
+@pytest.fixture
+def normal_dist():
+    """Fixture for normal distribution."""
+    return Normal(loc=jnp.zeros(2), scale=jnp.ones(2))
+
+
+class TestAncestralSampling:
+    """Test cases for ancestral sampling."""
+
+    def test_ancestral_sampling_normal(self, normal_dist):
+        """Test ancestral sampling from a normal distribution."""
+        key = get_rng_key(0)  # Use consistent seed but avoid redefining fixture
+        n_samples = 1000
+        samples = ancestral_sampling(normal_dist, key, n_samples)
+
+        # Check shape
+        assert samples.shape == (n_samples, 2)
+
+        # Check statistics
+        # (mean and variance should be close to distribution parameters)
+        mean = jnp.mean(samples, axis=0)
+        std = jnp.std(samples, axis=0)
+
+        # Allow for sampling variance
+        assert jnp.allclose(mean, normal_dist.loc, atol=0.2)
+        assert jnp.allclose(std, normal_dist.scale, atol=0.2)
+
+    def test_ancestral_sampling_batched(self, normal_dist):
+        """Test ancestral sampling with batched distributions."""
+        key = get_rng_key(1)  # Different seed to avoid correlation
+
+        # Create a batched distribution
+        batch_size = 3
+        batched_loc = jnp.tile(normal_dist.loc, (batch_size, 1))
+        batched_scale = jnp.tile(normal_dist.scale, (batch_size, 1))
+        batched_dist = Normal(loc=batched_loc, scale=batched_scale)
+
+        n_samples = 1000
+        samples = ancestral_sampling(batched_dist, key, n_samples)
+
+        # Check shape (should be [batch_size, n_samples, dim])
+        assert samples.shape == (batch_size, n_samples, 2)
+
+        # Check statistics for each batch element
+        for i in range(batch_size):
+            batch_samples = samples[i]
+            mean = jnp.mean(batch_samples, axis=0)
+            std = jnp.std(batch_samples, axis=0)
+
+            assert jnp.allclose(mean, normal_dist.loc, atol=0.2)
+            assert jnp.allclose(std, normal_dist.scale, atol=0.2)
+
+    def test_ancestral_sampling_custom_distribution(self):
+        """Test ancestral sampling with a custom distribution object."""
+        key = get_rng_key(2)  # Different seed
+
+        # Create a simple custom distribution with a sample method
+        class CustomDistribution:
+            def sample(self, seed, sample_shape):
+                # Just return standard normal samples for testing
+                return jax.random.normal(seed, (*sample_shape, 2))
+
+        custom_dist = CustomDistribution()
+        n_samples = 1000
+        samples = ancestral_sampling(custom_dist, key, n_samples)
+
+        # Check shape
+        assert samples.shape == (n_samples, 2)
+
+        # Check statistics (should be close to standard normal)
+        mean = jnp.mean(samples, axis=0)
+        std = jnp.std(samples, axis=0)
+
+        assert jnp.allclose(mean, jnp.zeros(2), atol=0.2)
+        assert jnp.allclose(std, jnp.ones(2), atol=0.2)
+
+    def test_ancestral_sampling_invalid_input(self):
+        """Test that ancestral sampling raises an error for invalid inputs."""
+        key = get_rng_key(3)  # Different seed
+
+        # Create an object without a sample method
+        class InvalidObject:
+            pass
+
+        invalid_obj = InvalidObject()
+
+        # Check that it raises a ValueError
+        with pytest.raises(
+            ValueError,
+            match=("Input must be a Distribution instance or have a sample method"),
+        ):
+            ancestral_sampling(invalid_obj, key, 10)
+
+    def test_ancestral_sampling_nnx_key(self, normal_dist):
+        """Test ancestral sampling with nnx.Rngs key."""
+        # Since we can't easily mock nnx.Rngs, we'll just test that
+        # a regular JAX key works in ancestral_sampling
+        key = get_rng_key(4)  # Different seed
+        n_samples = 1000
+        samples = ancestral_sampling(normal_dist, key, n_samples)
+
+        # Check shape
+        assert samples.shape == (n_samples, 2)
+
+        # Check statistics
+        mean = jnp.mean(samples, axis=0)
+        std = jnp.std(samples, axis=0)
+
+        assert jnp.allclose(mean, normal_dist.loc, atol=0.2)
+        assert jnp.allclose(std, normal_dist.scale, atol=0.2)
+
+        # Test with a real nnx.Rngs object if flax is available
+        try:
+            from flax import nnx
+
+            rngs = nnx.Rngs(0)  # Initialize with a seed
+            nnx_samples = ancestral_sampling(normal_dist, rngs, n_samples)
+            assert nnx_samples.shape == (n_samples, 2)
+        except (ImportError, AttributeError):
+            # Skip this part of the test if flax.nnx is not available
+            # or doesn't have the expected API
+            pass
+
+    def test_ancestral_sampling_with_sample_shape(self, normal_dist):
+        """Test ancestral sampling with explicit sample_shape."""
+        key = get_rng_key(5)  # Different seed
+        n_samples = 100
+        sample_shape = (5,)  # Add an extra dimension
+        samples = ancestral_sampling(normal_dist, key, n_samples, sample_shape)
+
+        # Check shape should include sample_shape
+        expected_shape = (n_samples, *sample_shape, 2)
+        assert samples.shape == expected_shape
+
+
+class TestMCMCSampling:
+    """Test cases for MCMC sampling."""
+
+    def test_mcmc_sampling_basic(self, normal_dist):
+        """Test basic MCMC sampling."""
+        key = get_rng_key(6)  # Different seed
+
+        # Define log probability function (unnormalized)
+        def log_prob_fn(x):
+            return jnp.sum(normal_dist.log_prob(x))
+
+        # Initial state
+        init_state = jnp.zeros(2)
+
+        # Sample
+        n_samples = 1000
+        n_burnin = 200  # Increased burnin
+        samples = mcmc_sampling(log_prob_fn, init_state, key, n_samples, n_burnin=n_burnin)
+
+        # Check shape
+        assert samples.shape == (n_samples, 2)
+
+        # Check statistics
+        # (mean and variance should be close to distribution parameters)
+        mean = jnp.mean(samples, axis=0)
+        std = jnp.std(samples, axis=0)
+
+        # MCMC might need more tolerance than direct sampling
+        assert jnp.allclose(mean, normal_dist.loc, atol=1.0)
+        assert jnp.allclose(std, normal_dist.scale, atol=0.6)
+
+    def test_mcmc_step_size(self, normal_dist):
+        """Test MCMC sampling with different step sizes."""
+        key = get_rng_key(7)  # Different seed
+
+        # Define log probability function (unnormalized)
+        def log_prob_fn(x):
+            return jnp.sum(normal_dist.log_prob(x))
+
+        # Initial state
+        init_state = jnp.zeros(2)
+
+        # Sample with different step sizes
+        n_samples = 1000
+        n_burnin = 200  # Increased burnin
+
+        # Small step size should have high acceptance rate but slow mixing
+        small_step = mcmc_sampling(
+            log_prob_fn, init_state, key, n_samples, n_burnin=n_burnin, step_size=0.01
+        )
+
+        # Large step size should have lower acceptance rate
+        key2 = jax.random.fold_in(key, 0)  # Create a new key
+        large_step = mcmc_sampling(
+            log_prob_fn, init_state, key2, n_samples, n_burnin=n_burnin, step_size=1.0
+        )
+
+        # Both should have correct means
+        small_mean = jnp.mean(small_step, axis=0)
+        large_mean = jnp.mean(large_step, axis=0)
+
+        assert jnp.allclose(small_mean, normal_dist.loc, atol=1.0)
+        assert jnp.allclose(large_mean, normal_dist.loc, atol=1.0)
+
+
+class TestODESampling:
+    """Test cases for ODE-based sampling."""
+
+    def test_ode_sampling_basic(self):
+        """Test basic ODE-based sampling."""
+        key = get_rng_key(8)  # Different seed
+
+        # Function defining the vector field (e.g., score function)
+        def score_fn(x, t):
+            # Simple test score function that pushes toward the origin
+            return -x
+
+        # Sample using ODE solver
+        n_samples = 100
+        t_span = (0.0, 1.0)
+        init_noise = jax.random.normal(key, (n_samples, 2))
+
+        samples = ode_sampling(score_fn, init_noise, t_span)
+
+        # Check shape
+        assert samples.shape == (n_samples, 2)
+
+        # For this score function,
+        # final values should be closer to origin than initial
+        init_norm = jnp.linalg.norm(init_noise, axis=1)
+        final_norm = jnp.linalg.norm(samples, axis=1)
+        assert jnp.mean(final_norm) < jnp.mean(init_norm)
+
+    def test_ode_solver_methods(self):
+        """Test ODE-based sampling with different solver methods."""
+        key = get_rng_key(9)  # Different seed
+
+        # Function defining the vector field
+        def score_fn(x, t):
+            return -x
+
+        # Sample using different ODE solvers
+        n_samples = 100
+        t_span = (0.0, 1.0)
+        init_noise = jax.random.normal(key, (n_samples, 2))
+
+        # Try different methods
+        rk4_samples = ode_sampling(score_fn, init_noise, t_span, method="rk4")
+        euler_samples = ode_sampling(score_fn, init_noise, t_span, method="euler")
+
+        # Check shapes
+        assert rk4_samples.shape == (n_samples, 2)
+        assert euler_samples.shape == (n_samples, 2)
+
+        # Both should move toward the origin
+        init_norm = jnp.linalg.norm(init_noise, axis=1)
+        rk4_norm = jnp.linalg.norm(rk4_samples, axis=1)
+        euler_norm = jnp.linalg.norm(euler_samples, axis=1)
+
+        assert jnp.mean(rk4_norm) < jnp.mean(init_norm)
+        assert jnp.mean(euler_norm) < jnp.mean(init_norm)
+
+        # Different random seeds can lead to different relative performance
+        # between the methods, so we'll check they both decrease the norm
+        # but not compare them directly
+
+
+class TestSDESampling:
+    """Test cases for SDE-based sampling."""
+
+    def test_sde_sampling_basic(self):
+        """Test basic SDE-based sampling."""
+        key = get_rng_key(10)  # Different seed
+
+        def drift_fn(x, t):
+            # Pull toward origin with strength proportional to distance
+            return -x
+
+        def diffusion_fn(x, t):
+            # Constant noise level
+            return jnp.ones_like(x) * 0.1
+
+        # Sample using SDE solver
+        n_samples = 100
+        n_steps = 100
+        t_span = (0.0, 1.0)
+        init_noise = jax.random.normal(key, (n_samples, 2))
+
+        samples = sde_sampling(drift_fn, diffusion_fn, init_noise, t_span, n_steps=n_steps, key=key)
+
+        # Check shape
+        assert samples.shape == (n_samples, 2)
+
+        # Should move toward the origin overall due to drift
+        init_norm = jnp.linalg.norm(init_noise, axis=1)
+        final_norm = jnp.linalg.norm(samples, axis=1)
+        assert jnp.mean(final_norm) < jnp.mean(init_norm)
+
+    def test_sde_time_dependent_coefficients(self):
+        """Test SDE sampling with time-dependent coefficients."""
+        key = get_rng_key(11)  # Different seed
+
+        def drift_fn(x, t):
+            # Stronger pull toward origin as t increases
+            return -x * (1.0 + t)
+
+        def diffusion_fn(x, t):
+            # Decreasing noise level over time
+            return jnp.ones_like(x) * (0.2 * (1.0 - t) + 0.01)
+
+        # Sample using SDE solver
+        n_samples = 100
+        n_steps = 100
+        t_span = (0.0, 1.0)
+        init_noise = jax.random.normal(key, (n_samples, 2))
+
+        samples = sde_sampling(drift_fn, diffusion_fn, init_noise, t_span, n_steps=n_steps, key=key)
+
+        # Check shape
+        assert samples.shape == (n_samples, 2)
+
+        # Should move toward the origin overall due to drift
+        init_norm = jnp.linalg.norm(init_noise, axis=1)
+        final_norm = jnp.linalg.norm(samples, axis=1)
+        assert jnp.mean(final_norm) < jnp.mean(init_norm)
+
+    def test_metropolis_step_rejects_vector_log_prob(self):
+        """Metropolis step should require one scalar joint log probability."""
+        key = get_rng_key(12)
+        state = jnp.zeros(2)
+
+        def vector_log_prob(x):
+            return -0.5 * x**2
+
+        with pytest.raises(ValueError, match="scalar joint log probability"):
+            metropolis_step(key, state, vector_log_prob)
+
+    def test_mcmc_sampling_distribution_makes_one_acceptance_decision(self, normal_dist):
+        """Distribution-backed MCMC should move whole states, not coordinates independently."""
+        key = get_rng_key(13)
+        state = jnp.array([0.0, 0.0])
+        new_state, _ = metropolis_step(key, state, lambda x: jnp.sum(normal_dist.log_prob(x)))
+
+        changed = new_state != state
+        assert bool(jnp.all(changed) or jnp.all(~changed))
+
+    def test_ode_sampling_signature_has_no_dead_adjoint_flag(self):
+        """ODE sampling should not expose inert adjoint controls."""
+        assert "use_adjoint" not in inspect.signature(ode_sampling).parameters
+
+
+class TestSamplingJAXTransformCompatibility:
+    """Sampling steps used inside compiled loops should keep transform support."""
+
+    @pytest.mark.parametrize(
+        ("name", "step_fn"),
+        [
+            (
+                "euler",
+                lambda state: euler_step(
+                    state,
+                    0.2,
+                    0.1,
+                    lambda values, time: -0.5 * values + time,
+                ),
+            ),
+            (
+                "rk4",
+                lambda state: rk4_step(
+                    state,
+                    0.2,
+                    0.1,
+                    lambda values, time: -0.5 * values + time,
+                ),
+            ),
+            (
+                "ode_sampling",
+                lambda state: ode_sampling(
+                    lambda values, time: -0.5 * values + time,
+                    state,
+                    (0.0, 0.4),
+                    method="rk4",
+                    n_steps=4,
+                ),
+            ),
+        ],
+    )
+    def test_ode_steps_are_jittable_and_differentiable(self, name, step_fn):
+        state = jnp.array([0.25, -0.75], dtype=jnp.float32)
+
+        def scalar_loss(values):
+            return jnp.sum(step_fn(values))
+
+        compiled_value = jax.jit(scalar_loss)(state)
+        gradients = jax.grad(scalar_loss)(state)
+
+        assert name
+        assert compiled_value.shape == ()
+        assert jnp.isfinite(compiled_value)
+        assert gradients.shape == state.shape
+        assert jnp.all(jnp.isfinite(gradients))
+
+    @pytest.mark.parametrize(
+        ("name", "step_fn"),
+        [
+            (
+                "euler_maruyama",
+                lambda state, key: euler_maruyama_step(
+                    state,
+                    0.1,
+                    0.05,
+                    key,
+                    lambda values, time: -values + time,
+                    lambda values, _time: jnp.ones_like(values) * 0.2,
+                ),
+            ),
+            (
+                "milstein",
+                lambda state, key: milstein_step(
+                    state,
+                    0.1,
+                    0.05,
+                    key,
+                    lambda values, time: -values + time,
+                    lambda values, _time: jnp.ones_like(values) * 0.2,
+                    lambda values, _time: jnp.zeros_like(values),
+                ),
+            ),
+        ],
+    )
+    def test_sde_steps_are_jittable_and_differentiable(self, name, step_fn):
+        state = jnp.array([0.25, -0.75], dtype=jnp.float32)
+        key = get_rng_key(14)
+
+        def scalar_loss(values):
+            return jnp.sum(step_fn(values, key))
+
+        compiled_value = jax.jit(scalar_loss)(state)
+        gradients = jax.grad(scalar_loss)(state)
+
+        assert name
+        assert compiled_value.shape == ()
+        assert jnp.isfinite(compiled_value)
+        assert gradients.shape == state.shape
+        assert jnp.all(jnp.isfinite(gradients))
+
+    def test_metropolis_step_is_jittable_and_exposes_finite_state_gradients(self):
+        state = jnp.array([0.25, -0.75], dtype=jnp.float32)
+        key = get_rng_key(15)
+
+        def log_prob_fn(values):
+            return -0.5 * jnp.sum(values**2)
+
+        def scalar_next_state(values):
+            next_state, acceptance = metropolis_step(key, values, log_prob_fn, step_size=0.1)
+            return jnp.sum(next_state) + acceptance
+
+        compiled_value = jax.jit(scalar_next_state)(state)
+        gradients = jax.grad(scalar_next_state)(state)
+
+        assert compiled_value.shape == ()
+        assert jnp.isfinite(compiled_value)
+        assert gradients.shape == state.shape
+        assert jnp.all(jnp.isfinite(gradients))

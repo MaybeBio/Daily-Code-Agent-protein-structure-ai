@@ -1,0 +1,2218 @@
+//! Running several domains at once.
+//!
+//! A domain is a piece of physics that can be stepped: heat in a block of glass,
+//! a rigid body under contact, light through a train of surfaces. Each one knows
+//! its own equations and nothing about the others. This module is how they share
+//! a clock and a budget without knowing about each other.
+//!
+//! # The timescale problem, which is the real one
+//!
+//! Domains do not agree on how big a step is. An explicit FDTD electromagnetic
+//! solver on a nanometre grid is stable to about 10⁻¹⁷ s; heat conduction to about
+//! 10⁻⁹ s; rigid contact to 10⁻⁴ s; and a thermal drift that defocuses an
+//! instrument plays out over seconds. Stepping all of them at the smallest limit
+//! integrates the slow ones ten billion times for nothing.
+//!
+//! Two mechanisms deal with that, and they are the reason this module is not just
+//! a `for` loop over domains:
+//!
+//! - **[`Kind::QuasiStatic`]** — a domain with no state to roll forward, which is
+//!   re-solved on demand instead of stepped. Light crosses an instrument in
+//!   nanoseconds; against a thermal timescale that is zero, so optics is not
+//!   integrated at all. This is the largest single saving available, and it is
+//!   what the closed-form [`Motion`](crate::motion::Motion) and the instantaneous
+//!   `SurfaceOptics` were already doing before there was a scheduler to notice.
+//! - **[`Schedule::Multirate`]** — each evolving domain takes as many equal
+//!   substeps of the shared window as its own stability limit requires, so the
+//!   slow domain is not dragged down to the fast one's step. The limit is asked
+//!   again before every substep, so one that tightens as the domain runs divides
+//!   the rest of the window again rather than being stepped past.
+//!
+//! # Coupling, and why it goes through a bus
+//!
+//! Domains never touch each other. They publish to and consume from an
+//! [`Exchange`], which is a set of named channels carrying SI amounts. That is not
+//! only a borrow-checker convenience: it is what makes the transfer *auditable*.
+//! Each domain conserves energy internally, but the interface between two
+//! discretisations of the same surface — ray hits on one side, mesh nodes on the
+//! other — is exactly where interpolation quietly loses or invents some. The bus
+//! compares what was published against what was consumed and refuses to let the
+//! difference pass silently.
+//!
+//! # What the schedules cost
+//!
+//! [`Schedule::OneWay`] is unconditionally stable and embarrassingly parallel,
+//! because nothing feeds back. [`Schedule::Staggered`] costs one exchange per
+//! step and is stable only while the coupling is weak — and *not* fixable by
+//! shrinking `dt`, since some strongly coupled systems (the standard example is
+//! fluid-structure interaction at comparable densities, the added-mass effect)
+//! become more unstable as the step shrinks. That is what
+//! [`Schedule::Iterative`] is for, and why it is worth its cost.
+
+use std::any::Any;
+use std::collections::BTreeMap;
+
+use pantometry_units::Time;
+
+use crate::bodies::Bodies;
+use crate::conserved::{audit_with, Ledger, Tolerances, Violation};
+use crate::field::ScalarField;
+use crate::integrator::substeps_for;
+use crate::scene::{mismatch, Flux, Interface};
+
+/// Whether a domain has state to roll forward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Has state, and a stability limit on how far it can be stepped at once.
+    Evolving,
+    /// Has no state: solved from its inputs whenever asked, in zero time. Optics,
+    /// a static load, an equilibrium reaction. Never subcycled — a solve is a
+    /// solve.
+    QuasiStatic,
+}
+
+/// One piece of physics.
+///
+/// The only required methods are the name and the step; the rest have defaults
+/// that describe a well-behaved evolving domain with no stability limit and no
+/// books to keep.
+pub trait Domain {
+    /// What this domain is called. Used to look it up and to name it in a violation.
+    ///
+    /// Borrowed rather than `&'static str`, so a name can come from a scene file. That was
+    /// the first thing the workspace's own application could not do: every constructor
+    /// wanted a compile-time name and the name it had was a `String` read off disk, so it
+    /// leaked one per domain to get past the signature.
+    fn name(&self) -> &str;
+
+    /// Whether it has state to roll forward. Defaults to [`Kind::Evolving`].
+    fn kind(&self) -> Kind {
+        Kind::Evolving
+    }
+
+    /// The largest step this domain can take from `now` and stay stable — a CFL
+    /// condition, a diffusion limit, a contact penetration budget.
+    ///
+    /// Infinite means "no limit", which is the honest answer for a quasi-static
+    /// domain and for a linear one being solved implicitly.
+    ///
+    /// **From the state the domain is in now**, and [`Schedule::Multirate`] takes it at that word:
+    /// it asks again before every substep after a window's first, and no substep it hands over is
+    /// longer than a positive, finite answer it got just before. One it cannot meet in four
+    /// billion substeps of what is left of the window it refuses, naming the domain. So a domain
+    /// whose `step` refuses a step over this limit, computed by the same expression, needs no slack
+    /// for the scheduler's sake. It is asked once per substep, which is the price of a limit that
+    /// moves, and worth keeping cheaper than the step it bounds.
+    fn max_stable_dt(&self, now: Time) -> Time {
+        let _ = now;
+        Time::from_si(f64::INFINITY)
+    }
+
+    /// Advance by `dt` from `t`, reading inputs from `bus` and publishing outputs
+    /// to it. A quasi-static domain ignores `dt`.
+    ///
+    /// Must be a pure function of its state and its inputs: no wall clock, no
+    /// unordered reduction, no shared generator. [`Rng::for_index`](crate::Rng::for_index)
+    /// is how a domain gets randomness without giving that up.
+    fn step(&mut self, t: Time, dt: Time, bus: &mut Exchange) -> Result<(), Violation>;
+
+    /// How far this domain still is from agreeing with its neighbours, for
+    /// [`Schedule::Iterative`]. Zero means converged.
+    fn residual(&self) -> f64 {
+        0.0
+    }
+
+    /// What this domain is holding, for the conservation audit.
+    fn ledger(&self) -> Ledger {
+        Ledger::new()
+    }
+
+    /// Save state so an iterative sweep can be re-run from the same starting
+    /// point. A domain that does not implement this cannot take part in
+    /// [`Schedule::Iterative`], and [`Simulation::advance`] says so rather than
+    /// silently iterating from the wrong state.
+    ///
+    /// A second checkpoint replaces the first: the schedule takes one an advance.
+    fn checkpoint(&mut self) {}
+
+    /// Restore the last [`Domain::checkpoint`], **and keep it**.
+    ///
+    /// [`Schedule::Iterative`] checkpoints once an advance and restores before every sweep after
+    /// the first, so one checkpoint is restored once for each sweep after the first. A restore
+    /// that moved the checkpoint out rather than copying it finds nothing the second time and does
+    /// nothing, and the third sweep begins where the second ended.
+    ///
+    /// Everything a step writes comes back, including what only the ledger and the readings read:
+    /// a domain that audits its own books is compared, at the start of its turn in every sweep,
+    /// against what it reports just after this. `crates/pantometry/tests/a_restore_can_be_repeated.rs`
+    /// holds every domain in the library that claims [`Domain::supports_restore`] to both.
+    fn restore(&mut self) {}
+
+    /// Whether this domain's books are **exact**: its ledger changes by precisely what it takes
+    /// from the bus minus what it publishes, every step.
+    ///
+    /// # Why this is opt-in, and what it buys
+    ///
+    /// The whole-simulation audit sums every domain's ledger before comparing, so it can only see
+    /// a leak that moves the *total*. A molecular fluid holding a kilojoule and an acoustic room
+    /// holding a microjoule are checked together, and the room could lose everything it has
+    /// without the sum noticing. That is the limit `ARCHITECTURE.md` records against rule 4, and
+    /// it is not a tolerance problem — no tolerance separates them, because the scale is wrong.
+    ///
+    /// A domain that says `true` here is checked **on its own**, against its own holdings, every
+    /// step. The scheduler visits domains one at a time, so the traffic on the bus between the
+    /// call before and the call after is attributable to exactly that domain.
+    ///
+    /// # Why it is not the default
+    ///
+    /// Not every honest ledger is an exact one. A domain that loses heat to an environment which
+    /// is not on the bus is not leaking — it is modelling a boundary — but its books do not
+    /// balance against bus traffic alone, and saying `true` would make a correct domain fail.
+    /// `LumpedMass` with a convective loss is exactly that case.
+    ///
+    /// So it is a claim a domain makes about itself, and the ones that make it are held to it.
+    fn books_balance(&self) -> bool {
+        false
+    }
+
+    /// Whether [`Domain::checkpoint`] and [`Domain::restore`] actually do something.
+    ///
+    /// [`Schedule::Iterative`] refuses to run a domain that says no, rather than iterating
+    /// from the wrong state and reporting a residual that means nothing.
+    fn supports_restore(&self) -> bool {
+        false
+    }
+
+    /// This domain as [`Any`], so a caller can get the concrete type back out of a
+    /// [`Simulation`] — see [`Simulation::domain_as`].
+    ///
+    /// Opt-in, and returning `None` by default, because it cannot be automatic. Deriving it
+    /// from the trait would need `Domain: Any` plus upcasting `dyn Domain` to `dyn Any`,
+    /// which is a newer Rust than this crate promises. A domain that wants to be inspected
+    /// writes `fn as_any(&self) -> Option<&dyn Any> { Some(self) }` and is done.
+    ///
+    /// The coupling never needs this: domains meet through [`Exchange`] and nothing else,
+    /// which is the property the whole design rests on. What needs it is everything *around*
+    /// the simulation — a test asserting a temperature profile, a visualiser drawing one —
+    /// and that is a reader, not a participant.
+    fn as_any(&self) -> Option<&dyn Any> {
+        None
+    }
+
+    /// The same, mutably, so a caller can *write* to a domain between steps.
+    ///
+    /// **This does not weaken "domains never read each other."** That rule is about what happens
+    /// inside [`Domain::step`], where the only channel is [`Exchange`]. This is the owner of the
+    /// simulation, outside the step loop, holding `&mut Simulation` already — it could drop the
+    /// domain and rebuild it, so denying it a write was never protecting anything.
+    ///
+    /// What needs it is a feedback loop the bus cannot carry. A copper winding's resistance rises
+    /// with its temperature, and that temperature lives in a thermal domain: neither can see the
+    /// other's state, and neither should. A caller between frames can see both, and until this
+    /// existed it could read one and not write the other, which made the loop unclosable from
+    /// anywhere at all.
+    ///
+    /// Opt-in and `None` by default, like [`Domain::as_any`] — and that default is a hazard this
+    /// workspace has been bitten by twice, in `FRICTION.md` findings 7 and 12: a domain that
+    /// forgets it is not broken, it is silently absent from whatever asks. If you implement
+    /// `as_any`, implement this beside it.
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        None
+    }
+
+    /// This domain as a [`ScalarField`], if it has one to show.
+    ///
+    /// Opt-in and `None` by default, in the same style as [`Domain::as_any`] and for a
+    /// sharper reason than that one. `ScalarField` was written as the interface a visualiser
+    /// would read a simulation through, and then a visualiser found it unreachable: it holds
+    /// `&dyn Domain`, and there was no way to ask that for a field. So it downcast to
+    /// concrete types instead and knew every domain by name — precisely what the interface
+    /// existed to avoid.
+    ///
+    /// A domain with a field writes `fn as_field(&self) -> Option<&dyn ScalarField>
+    /// { Some(self) }`. See [`Simulation::field`].
+    fn as_field(&self) -> Option<&dyn ScalarField> {
+        None
+    }
+
+    /// The named scalars this domain reports, for a table, a chart or a caption.
+    ///
+    /// **The number a domain has when it has no picture.** A source has a remaining tank, a
+    /// winding has a dissipation, a thermal network has a temperature per node — and for several
+    /// of those the scalar *is* the result. `as_field` covers the domains that are continua and
+    /// there was no counterpart for the rest, so a caller wanting them had to know every domain
+    /// by name and downcast to each.
+    ///
+    /// That is what makes this a trait method rather than a function somewhere above: a layer
+    /// that collects readings by matching on domain types has to be edited every time a physics
+    /// is added, which is the one thing this workspace's structure exists to avoid.
+    ///
+    /// Return what the domain is *for* rather than a uniform summary. A mean over a pressure
+    /// field is zero by symmetry and would be a column of noise; the peak is the number a reader
+    /// wants. Nobody but the domain knows which.
+    ///
+    /// Empty by default, and opt-in like [`as_any`](Domain::as_any) and
+    /// [`as_field`](Domain::as_field) — with the hazard `as_any` has already taught once: four
+    /// mechanics domains never opted into it, and an orbit scene ran, conserved, and drew nothing
+    /// at all. A domain that forgets this one is silently absent from every table, not broken.
+    fn readings(&self) -> Vec<Reading> {
+        Vec::new()
+    }
+
+    /// Which of [`readings`](Domain::readings)'s labels describe the **solve** rather than the
+    /// world.
+    ///
+    /// A residual, a divergence a projection is meant to have removed, a norm a unitary scheme is
+    /// meant to preserve, a cell Péclet or Reynolds number: each is a real number a caller should
+    /// be able to see, and none of them is an *answer*. What they share is a value the solver
+    /// holds them at, so refining a grid or halving a window moves them for reasons that say
+    /// nothing about the physics.
+    ///
+    /// **Why the domain and not the caller.** A consumer comparing readings between two runs —
+    /// which is what a convergence study is — has no way to tell the two kinds apart, and will
+    /// compare them all. `pantometry-world`'s battery did, and printed
+    ///
+    /// ```text
+    ///   busbar   residual   0.000000 -> 0.000000  (281492.026%)
+    /// ```
+    ///
+    /// under a heading that says "what moved is discretisation": two converged conjugate-gradient
+    /// residuals, 7.793e-13 and 6.644e-13, divided by the 4.08e-17 one of them wobbled by between
+    /// two frames of the same run. It worked around it with a list of labels it kept itself, which
+    /// is a second copy of something only the domain knows — and keyed on the label alone, so a
+    /// *different* domain reporting `norm` as its answer would have been swallowed by it.
+    ///
+    /// **Not a field on [`Reading`].** That struct's fields are public, so a flag on it is a
+    /// breaking change for a property that six readings in this workspace have; and the property
+    /// is not really the reading's, it is the domain's statement about its own output.
+    ///
+    /// Empty by default, and opt-in with the hazard `as_any` taught: a domain that forgets it has
+    /// its residual compared across a sweep as though it converged to something, which is a row
+    /// that looks routine and measures nothing.
+    fn diagnostics(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// This domain as a countable set of bodies, if that is what it is.
+    ///
+    /// The counterpart to [`as_field`](Domain::as_field), and between them they cover both kinds
+    /// of thing a domain can be. A caller wanting to draw, measure or export no longer has to
+    /// name `NBody`, `ContactSystem` or `Fluid` — which it did for months, recorded as
+    /// `FRICTION.md` finding 11, until splitting the layers made it unpayable.
+    ///
+    /// Opt-in and `None` by default, with the hazard that default has now taught three times: a
+    /// domain that forgets is silently absent rather than broken.
+    fn as_bodies(&self) -> Option<&dyn Bodies> {
+        None
+    }
+}
+
+/// Delegation, so a domain chosen at run time can be added like any other.
+///
+/// Without this a caller holding `Box<dyn Domain>` — which is what building from data
+/// produces — could not hand it to [`Simulation::with`], even though the simulation stores
+/// exactly that internally. Prefer [`Simulation::with_boxed`], which avoids boxing the box;
+/// this impl is here so that generic code over `impl Domain` works on a boxed one too.
+impl Domain for Box<dyn Domain> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+    fn kind(&self) -> Kind {
+        (**self).kind()
+    }
+    fn max_stable_dt(&self, now: Time) -> Time {
+        (**self).max_stable_dt(now)
+    }
+    fn step(&mut self, t: Time, dt: Time, bus: &mut Exchange) -> Result<(), Violation> {
+        (**self).step(t, dt, bus)
+    }
+    fn residual(&self) -> f64 {
+        (**self).residual()
+    }
+    fn ledger(&self) -> Ledger {
+        (**self).ledger()
+    }
+    fn checkpoint(&mut self) {
+        (**self).checkpoint()
+    }
+    fn restore(&mut self) {
+        (**self).restore()
+    }
+    fn supports_restore(&self) -> bool {
+        (**self).supports_restore()
+    }
+    fn as_any_mut(&mut self) -> Option<&mut dyn Any> {
+        (**self).as_any_mut()
+    }
+    fn readings(&self) -> Vec<Reading> {
+        (**self).readings()
+    }
+
+    fn diagnostics(&self) -> &'static [&'static str] {
+        (**self).diagnostics()
+    }
+    fn books_balance(&self) -> bool {
+        (**self).books_balance()
+    }
+    fn as_bodies(&self) -> Option<&dyn Bodies> {
+        (**self).as_bodies()
+    }
+    fn as_any(&self) -> Option<&dyn Any> {
+        (**self).as_any()
+    }
+    fn as_field(&self) -> Option<&dyn ScalarField> {
+        (**self).as_field()
+    }
+}
+
+/// The channel between domains: named quantities, in SI base units.
+///
+/// A domain publishes what it produced and consumes what it needs. Nothing else
+/// crosses between domains, which means every transfer is in one place and can be
+/// checked in one place.
+#[derive(Clone, Debug, Default)]
+pub struct Exchange {
+    published: BTreeMap<&'static str, f64>,
+    consumed: BTreeMap<&'static str, f64>,
+    /// Channels that carry a place as well as an amount, keyed by
+    /// `(interface name, channel)` so the audit reports them in a fixed order.
+    spatial: BTreeMap<(String, &'static str), Flux>,
+    spatial_consumed: BTreeMap<(String, &'static str), f64>,
+    /// The outer step the current sweep is covering, in seconds. Zero when nobody has said —
+    /// a bare `Exchange` in a test — and [`Exchange::take_share`] falls back to taking
+    /// everything, which is the honest answer when the interval is unknown.
+    interval: f64,
+    /// How much of `interval` is still unclaimed, per channel. See `take_share`.
+    unclaimed_time: BTreeMap<&'static str, f64>,
+    /// How many separate `take` calls each channel saw this step.
+    ///
+    /// Counted because the conservation audit structurally cannot see the failure it detects.
+    /// [`Exchange::take`] empties a channel, so a *second* consumer of the same channel gets
+    /// zero — and the books balance perfectly, because everything published was taken. Two
+    /// plates under one lamp warm at the rate of one plate, and the audit reports it clean.
+    ///
+    /// Every scene and every integration test in this workspace had at most one consumer per
+    /// channel, which is why this went unnoticed until a world with six domains was attempted.
+    takers: BTreeMap<&'static str, u32>,
+    /// Everything ever published on each channel, spatial and plain together.
+    ///
+    /// `published` is the *current offer* and is emptied every sweep; this is the running total
+    /// and is not. It exists so [`Simulation`] can attribute a step's traffic to the domain that
+    /// made it — snapshot before, snapshot after, and the difference is that domain's, because
+    /// only that domain ran in between.
+    published_total: BTreeMap<&'static str, f64>,
+    /// What plain [`take`](Exchange::take)s have removed from each channel since the last
+    /// [`mark`](Exchange::mark), and what plain [`publish`](Exchange::publish)es have offered.
+    ///
+    /// Three things about these and each answers a way the second-consumer check was got wrong
+    /// before it was got right.
+    ///
+    /// They are **since a mark** rather than cumulative, and the caller marks before each
+    /// domain's turn, so what comes back is that domain's own traffic **summed from zero**.
+    /// Differencing two totals instead — even two per-sweep totals — carries the sensitivity of
+    /// `2⁻⁵²` times whatever has already gone through: a taker that received a microjoule after
+    /// another had received a gigajoule differences to *nothing*, and the check accused it of
+    /// receiving nothing. That was measured, on a scene written to test the opposite.
+    ///
+    /// And they are **plain only**. `take_on` credits `consumed` but not `takers`, so folding
+    /// spatial amounts in made a plain-channel decision turn on a spatial transfer — wrong in
+    /// both directions at once.
+    taken_since_mark: BTreeMap<&'static str, f64>,
+    published_since_mark: BTreeMap<&'static str, f64>,
+}
+
+impl Exchange {
+    /// An empty bus.
+    pub fn new() -> Exchange {
+        Exchange::default()
+    }
+
+    /// Offer an amount on a channel. Repeated publishes accumulate, so several
+    /// surfaces can each contribute to one heat load.
+    pub fn publish(&mut self, channel: &'static str, si_amount: f64) {
+        *self.published.entry(channel).or_insert(0.0) += si_amount;
+        *self.published_total.entry(channel).or_insert(0.0) += si_amount;
+        *self.published_since_mark.entry(channel).or_insert(0.0) += si_amount;
+    }
+
+    /// Take everything on a channel, recording that it was taken. The channel is
+    /// left empty: an amount consumed twice would be an amount doubled.
+    pub fn take(&mut self, channel: &'static str) -> f64 {
+        let amount = self.published.insert(channel, 0.0).unwrap_or(0.0);
+        *self.consumed.entry(channel).or_insert(0.0) += amount;
+        *self.taken_since_mark.entry(channel).or_insert(0.0) += amount;
+        *self.takers.entry(channel).or_insert(0) += 1;
+        amount
+    }
+
+    /// Look without taking.
+    pub fn peek(&self, channel: &'static str) -> f64 {
+        self.published.get(channel).copied().unwrap_or(0.0)
+    }
+
+    /// Take the share of a channel that belongs to a substep of length `dt`.
+    ///
+    /// For a domain that subcycles. [`Exchange::take`] empties the channel, which is right for
+    /// a domain stepping once per interval and wrong for one stepping many times: a publisher
+    /// offers a whole outer step's worth at once, so the first substep would take all of it and
+    /// the rest would find the channel dark. Every joule of the interval then lands at its
+    /// beginning, and **refining the substep stops improving the answer** — see
+    /// [`Schedule::Multirate`], where the measured error is 26% at a 300 s outer step whatever
+    /// the substep count.
+    ///
+    /// The share is taken against the time *remaining*, not against the whole interval. That is
+    /// what makes it exact: after handing out `A·dt/T` and reducing both, `A/T` is unchanged, so
+    /// the last substep — which asks for at least what is left — receives the remainder and the
+    /// channel ends empty to the last bit. Apportioning against the whole interval instead
+    /// leaves `O(n·ε·A)` stranded, and [`Exchange::audit_transfers`] uses an absolute tolerance
+    /// that would eventually refuse it.
+    ///
+    /// Falls back to [`Exchange::take`] when the interval is unknown, so a domain written
+    /// against this works unchanged under a bare `Exchange` and under
+    /// [`Schedule::Staggered`], where it steps once and the share is the whole.
+    pub fn take_share(&mut self, channel: &'static str, dt: Time) -> f64 {
+        let h = dt.to_si();
+        if self.interval <= 0.0 || !h.is_finite() || h <= 0.0 {
+            return self.take(channel);
+        }
+        let left = *self.unclaimed_time.entry(channel).or_insert(self.interval);
+        // The last substep asks for everything that is left, and gets it. Compared with a
+        // slack of `1e-12` of the interval rather than exactly, because `n` substeps of `dt/n`
+        // do not sum to `dt` in binary: three of a third leave a residue one ulp wide, and an
+        // exact comparison misses the final share and strands it on the channel.
+        if h >= left || left - h <= self.interval * 1e-12 {
+            self.unclaimed_time.insert(channel, 0.0);
+            return self.take(channel);
+        }
+        let amount = self.published.get(channel).copied().unwrap_or(0.0);
+        let share = amount * h / left;
+        self.unclaimed_time.insert(channel, left - h);
+        *self.published.entry(channel).or_insert(0.0) -= share;
+        *self.consumed.entry(channel).or_insert(0.0) += share;
+        *self.taken_since_mark.entry(channel).or_insert(0.0) += share;
+        share
+    }
+
+    /// Tell the bus what interval the current sweep covers, so [`Exchange::take_share`] can
+    /// apportion. Called by [`Simulation::advance`]; a standalone `Exchange` need not.
+    pub fn covering(&mut self, dt: Time) {
+        self.interval = dt.to_si().max(0.0);
+        self.unclaimed_time.clear();
+        self.takers.clear();
+        self.mark();
+    }
+
+    /// Offer an amount that knows where on a boundary it landed.
+    ///
+    /// The spatial counterpart of [`publish`](Exchange::publish), and the reason
+    /// [`scene`](crate::scene) exists: a coating absorbs where the beam is, and a lumped
+    /// number cannot say that. Repeated publishes accumulate face by face, so two
+    /// mechanisms heating the same surface add up in place.
+    ///
+    /// Refuses a [`Flux`] whose face count does not match the interface. Silently padding
+    /// or truncating would put energy on the wrong part of the boundary, which is worse
+    /// than losing it — losing it the audit would catch.
+    pub fn publish_on(
+        &mut self,
+        interface: &Interface,
+        channel: &'static str,
+        flux: &Flux,
+    ) -> Result<(), Violation> {
+        if flux.faces() != interface.faces() {
+            return Err(mismatch(
+                &format!("publish on {}/{channel}", interface.name()),
+                interface.faces(),
+                flux.faces(),
+            ));
+        }
+        let key = (interface.name().to_string(), channel);
+        // Counted on the same running total as a plain publish. A spatial amount is still an
+        // amount; where it landed is the interface's business and not the ledger's.
+        *self.published_total.entry(channel).or_insert(0.0) += flux.total();
+        match self.spatial.get_mut(&key) {
+            Some(existing) => existing.add(flux),
+            None => {
+                self.spatial.insert(key, flux.clone());
+                Ok(())
+            }
+        }
+    }
+
+    /// Take everything offered on an interface's channel, leaving it empty.
+    ///
+    /// Returns zeros rather than an error when nothing was published, because a consumer
+    /// stepping a boundary that happens to be dark this step is not a fault. A face-count
+    /// disagreement *is*, and is reported: the two sides do not share a discretisation, and
+    /// the fix is [`Flux::resample`] at whichever side owns the decision.
+    pub fn take_on(
+        &mut self,
+        interface: &Interface,
+        channel: &'static str,
+    ) -> Result<Flux, Violation> {
+        let key = (interface.name().to_string(), channel);
+        // Removed rather than zeroed. A drained channel is empty, and an empty channel
+        // should not go on pinning a face count for the rest of the step — the next
+        // publisher on that boundary is entitled to its own discretisation.
+        let Some(offered) = self.spatial.remove(&key) else {
+            return Ok(Flux::zeros(interface.faces()));
+        };
+        if offered.faces() != interface.faces() {
+            // Put it back: a consumer that could not read it has not consumed it, and the
+            // audit should still see the energy sitting there unclaimed.
+            let found = offered.faces();
+            self.spatial.insert(key, offered);
+            return Err(mismatch(
+                &format!("take from {}/{channel}", interface.name()),
+                interface.faces(),
+                found,
+            ));
+        }
+        *self.spatial_consumed.entry(key).or_insert(0.0) += offered.total();
+        // And on the plain running total, so a domain that takes spatially is attributed the
+        // same way as one that takes a lump. `spatial_consumed` keeps the per-interface detail
+        // the face-by-face audit needs; this is the per-channel sum attribution wants.
+        *self.consumed.entry(channel).or_insert(0.0) += offered.total();
+        Ok(offered)
+    }
+
+    /// Look at a spatial channel without taking it.
+    pub fn peek_on(&self, interface: &Interface, channel: &'static str) -> Option<&Flux> {
+        self.spatial.get(&(interface.name().to_string(), channel))
+    }
+
+    /// Channels that were published to but never taken from, with what is left on
+    /// them. Energy sitting here at the end of a step is energy that left one
+    /// domain and arrived nowhere.
+    ///
+    /// Spatial channels appear as `"interface/channel"`, with the total left on them.
+    pub fn unclaimed(&self) -> impl Iterator<Item = (String, f64)> + '_ {
+        self.published
+            .iter()
+            .filter(|(_, v)| v.abs() > 0.0)
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .chain(
+                self.spatial
+                    .iter()
+                    .filter(|(_, f)| f.total().abs() > 0.0)
+                    .map(|((i, c), f)| (format!("{i}/{c}"), f.total())),
+            )
+    }
+
+    /// Fail if anything published was not consumed.
+    ///
+    /// This is the check that catches a coupling whose two sides disagree — a
+    /// surface that absorbed 3.7 mW handing it to a mesh that received 3.4 mW
+    /// because the interpolation between their discretisations lost the rest.
+    ///
+    /// The original design said that, and then could not check it: with one number per
+    /// channel there was no discretisation to disagree about. Spatial channels close that
+    /// gap, and they are audited **face by face** rather than on their total — a
+    /// redistribution that moves heat from one side of a mirror to the other keeps the sum
+    /// exactly right, so a total-only check would pass the one bug the spatial coupling
+    /// exists to prevent. The failure names the face.
+    pub fn audit_transfers(&self, site: &str, abs_tol: f64) -> Result<(), Violation> {
+        // `NaN` is named because it compares false against every tolerance, so `|left| > tol`
+        // alone passed it — and an amount on the bus that is not a number is not nothing.
+        for (channel, left) in self.published.iter() {
+            if left.is_nan() || left.abs() > abs_tol {
+                return Err(Violation {
+                    quantity: (*channel).to_string(),
+                    site: format!("{site} (published but not consumed)"),
+                    before: *left,
+                    after: 0.0,
+                    // An absolute check: the amount left on the channel *is* the
+                    // scale, because all of it went missing.
+                    scale: left.abs(),
+                    tolerance: abs_tol,
+                });
+            }
+        }
+        for ((interface, channel), flux) in self.spatial.iter() {
+            for (face, left) in flux.per_face().iter().enumerate() {
+                if left.is_nan() || left.abs() > abs_tol {
+                    return Err(Violation {
+                        quantity: format!("{interface}/{channel} face {face}"),
+                        site: format!("{site} (published but not consumed)"),
+                        before: *left,
+                        after: 0.0,
+                        scale: left.abs(),
+                        tolerance: abs_tol,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The most any channel has left on it, and which, without judging it.
+    ///
+    /// [`Exchange::audit_transfers`] returns on the *first* thing over the line, which is right
+    /// for a refusal and useless for a margin: it says nothing when it passes, and when it fails
+    /// it names one channel out of however many were close. This walks the same two collections
+    /// and reports the largest, so a caller can see how near the run came.
+    ///
+    /// Separate from the audit rather than folded into it, because the audit's signature is
+    /// public and a check that also measures is a check somebody will call for the measurement
+    /// and get a refusal from.
+    pub fn worst_undelivered(&self) -> Option<(String, f64)> {
+        let plain = self
+            .published
+            .iter()
+            .map(|(channel, left)| ((*channel).to_string(), left.abs()));
+        let spatial = self
+            .spatial
+            .iter()
+            .flat_map(|((interface, channel), flux)| {
+                flux.per_face()
+                    .iter()
+                    .enumerate()
+                    .map(move |(face, left)| {
+                        (format!("{interface}/{channel} face {face}"), left.abs())
+                    })
+                    .collect::<Vec<_>>()
+            });
+        plain.chain(spatial).max_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
+    /// Total published on a channel over the run, plain and spatial together.
+    ///
+    /// Cumulative, unlike [`Exchange::peek`], which reports what is on offer right now.
+    pub fn total_published(&self, channel: &str) -> f64 {
+        self.published_total.get(channel).copied().unwrap_or(0.0)
+    }
+
+    /// Everything each channel has carried over the run, as `(channel, published, taken)`.
+    ///
+    /// In name order, so a caller comparing two snapshots gets a stable sequence.
+    pub fn traffic(&self) -> Vec<(&'static str, f64, f64)> {
+        let mut names: Vec<&'static str> = self.published_total.keys().copied().collect();
+        for name in self.consumed.keys() {
+            if !self.published_total.contains_key(name) {
+                names.push(name);
+            }
+        }
+        names.sort_unstable();
+        names
+            .into_iter()
+            .map(|n| (n, self.total_published(n), self.total_consumed(n)))
+            .collect()
+    }
+
+    /// Total taken from a channel over the run, for reporting.
+    pub fn total_consumed(&self, channel: &str) -> f64 {
+        self.consumed.get(channel).copied().unwrap_or(0.0)
+    }
+
+    /// Total taken from a spatial channel over the run, summed over its faces.
+    pub fn total_consumed_on(&self, interface: &Interface, channel: &'static str) -> f64 {
+        self.spatial_consumed
+            .get(&(interface.name().to_string(), channel))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// Empty the offers, keeping the running consumption totals.
+    pub fn clear_offers(&mut self) {
+        self.published.clear();
+        self.spatial.clear();
+        self.unclaimed_time.clear();
+        self.takers.clear();
+        self.mark();
+    }
+
+    /// How many times each channel has been taken from this sweep.
+    ///
+    /// Raw counts, because the bus cannot interpret them: a domain subcycling ten times takes
+    /// ten times, and ten domains taking once each also takes ten times. Only
+    /// [`Simulation`] knows whose turn it was, and it compares this between turns — see
+    /// `Simulation::sweep`, where the check that a channel had at most one *consumer* lives.
+    pub fn takes_per_channel(&self) -> impl Iterator<Item = (&'static str, u32)> + '_ {
+        self.takers.iter().map(|(c, n)| (*c, *n))
+    }
+
+    /// Start a fresh tally of plain traffic. [`Simulation`] calls this before each domain's
+    /// turn, so [`plain_traffic_since_mark`](Exchange::plain_traffic_since_mark) reports that
+    /// domain's own amounts rather than a difference of two larger numbers.
+    pub fn mark(&mut self) {
+        self.taken_since_mark.clear();
+        self.published_since_mark.clear();
+    }
+
+    /// What has plainly moved since the last [`mark`](Exchange::mark):
+    /// `(channel, taken, published)`.
+    ///
+    /// The amounts the second-consumer check is decided on, and deliberately not
+    /// [`traffic`](Exchange::traffic)'s: that one folds in spatial transfers and the whole run,
+    /// and neither belongs in a decision about who was left with nothing on a plain channel.
+    pub fn plain_traffic_since_mark(&self) -> Vec<(&'static str, f64, f64)> {
+        let mut names: Vec<&'static str> = self.taken_since_mark.keys().copied().collect();
+        for name in self.published_since_mark.keys() {
+            if !self.taken_since_mark.contains_key(name) {
+                names.push(name);
+            }
+        }
+        names.sort_unstable();
+        names
+            .into_iter()
+            .map(|n| {
+                (
+                    n,
+                    self.taken_since_mark.get(n).copied().unwrap_or(0.0),
+                    self.published_since_mark.get(n).copied().unwrap_or(0.0),
+                )
+            })
+            .collect()
+    }
+}
+
+/// One named scalar from one domain at one instant.
+///
+/// Deliberately flat and owned: it crosses a layer boundary, gets written to a CSV column and a
+/// chart legend, and neither of those wants a borrow into a running simulation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reading {
+    /// Which domain it came from. Filled in by the domain, because only it knows its own name.
+    pub domain: String,
+    /// What it is — `"mean"`, `"peak"`, `"reserve"`, a node's name.
+    pub label: String,
+    /// The value, in SI, with one exception this workspace has already made everywhere else:
+    /// temperatures are celsius, because that is the unit a column of them is read in.
+    pub value: f64,
+    /// The unit, for a header row or an axis. `&'static str` because a unit is a compile-time
+    /// fact about the quantity, not data — unlike a domain's name, which comes from a file.
+    pub unit: &'static str,
+}
+
+impl Reading {
+    /// A reading, named.
+    pub fn new(
+        domain: impl Into<String>,
+        label: impl Into<String>,
+        value: f64,
+        unit: &'static str,
+    ) -> Reading {
+        Reading {
+            domain: domain.into(),
+            label: label.into(),
+            value,
+            unit,
+        }
+    }
+}
+
+/// How the domains are interleaved.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Schedule {
+    /// One pass in declared order, no feedback expected. Unconditionally stable;
+    /// the only schedule whose domains could safely run concurrently.
+    OneWay,
+    /// One pass in declared order, with each domain seeing the previous ones'
+    /// output from this step and the later ones' from the last. Cheap, and stable
+    /// only while the coupling is weak.
+    Staggered,
+    /// Repeat the pass until every domain's residual is under `tol`, or fail.
+    ///
+    /// The cost is `max_iter` passes; the benefit is stability where a staggered
+    /// scheme diverges no matter how small the step. Failing to converge is
+    /// reported as a [`Violation`] rather than accepted, because an unconverged
+    /// coupling that is allowed through is the most expensive kind of wrong
+    /// answer: it looks like physics.
+    Iterative {
+        /// Give up after this many sweeps. Reaching it is a [`Violation`], not a result.
+        max_iter: u32,
+        /// The residual every domain must fall under for the step to be accepted.
+        tol: f64,
+    },
+    /// As [`Schedule::Staggered`], but each evolving domain takes as many equal
+    /// substeps as its own stability limit needs.
+    ///
+    /// # The limit is asked before every substep, not once a window
+    ///
+    /// [`Domain::max_stable_dt`] is the largest step from the state the domain is in, and its own
+    /// substeps move that state. Sized once at the start of the window, a domain whose limit
+    /// tightens as it runs was stepped past it: a puck warming under a hot inlet, whose limit falls
+    /// with the viscosity, was refused inside its first window, by 10.4% on a window of three
+    /// limits; at one temperature its limit came back an ulp shorter after a step, and windows of
+    /// three, five and ten limits were refused by `9.5e-16`. Now a substep longer than the limit
+    /// read just before it is not taken: what is left of the window is divided again from that
+    /// limit, into equal substeps. Every substep is at most a positive, finite limit read just
+    /// before it, and [`substeps_for`] makes that exact, not only within a rounding. A zero, NaN or
+    /// infinite one changes no plan and is left to the domain's own refusal.
+    ///
+    /// A limit that never falls below the plan never moves it, and such a run takes the same
+    /// substeps, to the bit, that it took when the limit was read once.
+    ///
+    /// # What it costs, and where it stops
+    ///
+    /// One more call to `max_stable_dt` per substep. And **a plan only ever tightens**: a limit
+    /// that dips for one read and recovers holds the rest of the window at the dip's substep: four
+    /// substeps of a quarter whose limit reads `1e-3` once, after the first, become 751. Dividing
+    /// again only when the limit falls keeps a limit that does not move to the bit; dividing again
+    /// whenever it moves would not.
+    ///
+    /// **A limit that cannot be met is refused, not followed.** One that falls toward a point
+    /// inside the window, as a fixed fraction of the time left to it, is divided ever finer; that
+    /// is the shape `NBody`'s limit takes for two unsoftened bodies closing head on, by its formula,
+    /// not by a run. When what is left of the window would take more than four billion substeps of
+    /// it, the window is refused, naming the domain, the limit and the substep: measured on such a
+    /// limit at half the time left, within a hundred substeps, where going on dividing at the cap
+    /// ran a million and was stopped. So is a window whose first read cannot be met. Before, the
+    /// first read set the plan and nothing else did, so a domain that does not refuse its own step
+    /// was stepped straight through.
+    ///
+    /// **Under [`Schedule::Iterative`]**, which sweeps the same way, each iteration follows its own
+    /// trajectory, so a limit that moves can divide a window differently from one iteration to the
+    /// next. The plan used to come from the restored state and be the same in all of them.
+    ///
+    /// # It does not refine a coupled quantity, and the audit cannot tell you
+    ///
+    /// Read this before choosing it for accuracy, because that is the obvious reason to and it
+    /// is the wrong one.
+    ///
+    /// One domain is stepped to completion before the next. A quasi-static publisher is never
+    /// subcycled, so it puts a whole outer step's worth on the bus once; a subcycling consumer
+    /// then calls [`Exchange::take`] on its **first** substep and takes all of it. So every
+    /// joule of the interval is deposited at its beginning and decays for the rest of it, and
+    /// refining the substep does not move the answer toward the truth. Taking the limit of
+    /// `u ← u·gⁿ + (P·dt/C)·g^(n−1)` with `g = 1 − h/τ` as `n → ∞` gives
+    /// `u·e^(−dt/τ) + (P·dt/C)·e^(−dt/τ)`, which is not the solution: the error is first order
+    /// in the **outer** step and independent of the substep entirely.
+    ///
+    /// Measured on a lumped plate under a steady lamp, against the closed form: 26.2% low at a
+    /// 300 s outer step, 13.8% at 150 s, 7.1% at 75 s — *whatever* the substep count. At the
+    /// same outer step it is not reliably better than [`Schedule::Staggered`] and at a coarse
+    /// one it is worse, with the errors on opposite sides.
+    ///
+    /// **Every one of those runs passes the conservation audit at around 1e-12.** The total
+    /// that crossed is exactly right; only its distribution in time is wrong, and a [`Ledger`]
+    /// has no representation for *when*. This is the time-domain twin of the reason
+    /// [`Exchange::audit_transfers`] had to become a per-face check in space — a quantity moved
+    /// to the wrong part of an interval keeps its total, and conservation is blind to it.
+    ///
+    /// So: choose this for **stability**, which is what it delivers — a domain whose limit is a
+    /// hundredth of the frame no longer forces the frame to shrink. Choose the outer step for
+    /// **accuracy**, because that is what sets it. `crates/pantometry/tests/multirate_timing.rs`
+    /// pins the consequence.
+    Multirate,
+}
+
+/// How close a check came to refusing, on the step where it came closest.
+///
+/// `advance` has **three** refusal points and only one of them is visible from outside it. The
+/// whole-simulation audit compares the ledger before and after, so a caller can redo that
+/// arithmetic itself. The other two cannot be seen from out there at all: the transfer audit
+/// reads what is left on the bus *between* domains, and the per-domain books check snapshots one
+/// domain's ledger across its own turn. Both are gone by the time `advance` returns.
+///
+/// So they are reported. A pass with no margin is a different fact from a pass, and it was
+/// previously a fact nothing above the kernel could establish for two of the three.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Margin {
+    /// What the check was about: a channel, `interface/channel face N`, or `domain/quantity`.
+    pub what: String,
+    /// What the check measured — **and the two are not in the same units**, deliberately.
+    ///
+    /// [`Report::transfer`] is an absolute amount in the channel's own quantity, because that
+    /// check is absolute: what is left on a channel *is* the scale, since all of it went missing.
+    /// [`Report::books`] is a dimensionless ratio, because that check is relative to the domain's
+    /// own holdings — which is the whole reason it exists. Reading either against
+    /// [`Margin::tolerance`] is the comparison that means something; reading them against each
+    /// other is not.
+    pub worst: f64,
+    /// What it was judged against, so a reader can compute the headroom rather than be told it.
+    pub tolerance: f64,
+}
+
+/// What one [`Simulation::advance`] actually did.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Report {
+    /// Substeps taken, per domain, in declared order.
+    ///
+    /// Owned names, because [`Domain::name`] is borrowed from the domain and this report
+    /// outlives the borrow — the same consequence of names being data rather than
+    /// constants that shows up everywhere else in this module.
+    pub substeps: Vec<(String, u32)>,
+    /// Coupling iterations used. One for every schedule but `Iterative`.
+    pub iterations: u32,
+    /// Largest residual left at the end.
+    pub residual: f64,
+    /// The most any channel had left on it when the transfer audit looked, and the absolute
+    /// tolerance it was judged against. `None` when nothing was published at all.
+    pub transfer: Option<Margin>,
+    /// The worst discrepancy a `books_balance` domain showed **on its own scale**, and the
+    /// tolerance for that quantity. `None` when no domain claims exact books.
+    ///
+    /// This is the one the whole-simulation audit structurally cannot see: a domain holding a
+    /// microjoule beside one holding a kilojoule can lose a fifth of itself without moving the
+    /// sum by more than `2e-10`.
+    pub books: Option<Margin>,
+}
+
+/// A set of domains sharing a clock.
+pub struct Simulation {
+    domains: Vec<Box<dyn Domain>>,
+    schedule: Schedule,
+    bus: Exchange,
+    t: Time,
+    transfer_tol: f64,
+    conservation_tol: Tolerances,
+}
+
+impl Simulation {
+    /// Domains are stepped in the order they are added. That order is part of the
+    /// physics under a staggered schedule — put the quasi-static producers before
+    /// the evolving consumers — and it is fixed rather than discovered, so two
+    /// runs take the same path.
+    pub fn new(schedule: Schedule) -> Simulation {
+        Simulation {
+            domains: Vec::new(),
+            schedule,
+            bus: Exchange::new(),
+            t: Time::ZERO,
+            transfer_tol: 1e-12,
+            conservation_tol: Tolerances::default(),
+        }
+    }
+
+    /// Add a domain whose type was chosen at run time.
+    ///
+    /// What [`Simulation::with`] cannot do: building a domain from a scene file produces a
+    /// `Box<dyn Domain>`, and `with` wants a concrete type. The simulation has always stored
+    /// boxes internally, so this is the shorter path and not a wider one.
+    pub fn with_boxed(mut self, domain: Box<dyn Domain>) -> Simulation {
+        self.domains.push(domain);
+        self
+    }
+
+    /// Add a domain. Order matters for [`Schedule::Staggered`] and its relatives: a domain
+    /// sees the output of those declared before it from this step, and of those after it from
+    /// the last one.
+    pub fn with(mut self, domain: impl Domain + 'static) -> Simulation {
+        self.domains.push(Box::new(domain));
+        self
+    }
+
+    /// Absolute tolerance on the bus audit, in SI units of whatever is on the
+    /// channel. Default 1e-12.
+    pub fn transfer_tolerance(mut self, tol: f64) -> Simulation {
+        self.transfer_tol = tol;
+        self
+    }
+
+    /// Relative tolerance on the whole-simulation conservation audit across a
+    /// step, for every quantity that has no override. Default 1e-9.
+    pub fn conservation_tolerance(mut self, tol: f64) -> Simulation {
+        let overrides: Vec<(&'static str, f64)> = self.conservation_tol.overrides().collect();
+        self.conservation_tol = overrides
+            .into_iter()
+            .fold(Tolerances::uniform(tol), |t, (q, v)| t.with(q, v));
+        self
+    }
+
+    /// Relative tolerance for **one** quantity, overriding the default.
+    ///
+    /// The reason this exists: a Barnes-Hut N-body gives up exact momentum by construction, and
+    /// energy in a rigid room is exact to `1e-15`. Under one number either the momentum check
+    /// refuses a correct run or the energy check stops being able to see anything. A quantity's
+    /// achievable accuracy is a property of the scheme carrying it.
+    ///
+    /// ```
+    /// # use pantometry_core::{Schedule, Simulation};
+    /// # use pantometry_core::conserved::quantity;
+    /// let sim = Simulation::new(Schedule::Staggered)
+    ///     .conservation_tolerance(1e-12)
+    ///     .conservation_tolerance_for(quantity::MOMENTUM, 1e-6);
+    /// assert_eq!(sim.tolerances().for_quantity(quantity::ENERGY), 1e-12);
+    /// assert_eq!(sim.tolerances().for_quantity(quantity::MOMENTUM), 1e-6);
+    /// ```
+    pub fn conservation_tolerance_for(mut self, quantity: &'static str, tol: f64) -> Simulation {
+        self.conservation_tol = std::mem::take(&mut self.conservation_tol).with(quantity, tol);
+        self
+    }
+
+    /// What this simulation checks each quantity against.
+    pub fn tolerances(&self) -> &Tolerances {
+        &self.conservation_tol
+    }
+
+    /// How far the simulation has been advanced.
+    pub fn time(&self) -> Time {
+        self.t
+    }
+
+    /// The coupling bus, for reading what crossed between domains.
+    pub fn bus(&self) -> &Exchange {
+        &self.bus
+    }
+
+    /// Every domain, in the order they were added.
+    ///
+    /// `domain` answers by name, which is right for a caller that knows what it is looking for
+    /// and useless for one that must visit them all. A layer capturing a run has to enumerate,
+    /// and without this it had to be handed the list by whoever built the simulation — which
+    /// means the layer above knows the composition rather than asking.
+    ///
+    /// Order is declaration order, which is also execution order under the staggered schedules,
+    /// so a caller iterating this sees domains in the order they act.
+    pub fn domains(&self) -> impl Iterator<Item = &dyn Domain> + '_ {
+        self.domains.iter().map(|d| &**d as &dyn Domain)
+    }
+
+    /// A domain by name, through the trait. For the concrete type, see
+    /// [`Simulation::domain_as`].
+    pub fn domain(&self, name: &str) -> Option<&dyn Domain> {
+        self.domains
+            .iter()
+            .find(|d| d.name() == name)
+            .map(|d| d.as_ref())
+    }
+
+    /// A domain's [`ScalarField`], if it has one and opted in.
+    ///
+    /// The domain-agnostic counterpart of [`Simulation::domain_as`]: a renderer can sample
+    /// every field in a simulation without knowing what any of them are. That was the whole
+    /// point of `ScalarField` and it was not reachable until [`Domain::as_field`] existed.
+    pub fn field(&self, name: &str) -> Option<&dyn ScalarField> {
+        self.domain(name)?.as_field()
+    }
+
+    /// A domain by name and concrete type, for a caller that needs more than the
+    /// [`Domain`] trait exposes — a temperature profile, a body's position.
+    ///
+    /// Returns `None` if the name is not here, if the type is wrong, or if that domain did
+    /// not implement [`Domain::as_any`]. Prefer [`Simulation::field`] when what is wanted is
+    /// a field to sample: that one does not need the concrete type at all.
+    pub fn domain_as<T: Any>(&self, name: &str) -> Option<&T> {
+        self.domain(name)?.as_any()?.downcast_ref::<T>()
+    }
+
+    /// The same, mutably, for a caller closing a feedback loop between steps.
+    ///
+    /// `None` if there is no such domain, if it is not a `T`, or if it does not implement
+    /// [`Domain::as_any_mut`] — three different reasons that look alike from here, which is why
+    /// that method's documentation asks for it to be implemented beside `as_any`.
+    pub fn domain_as_mut<T: Any>(&mut self, name: &str) -> Option<&mut T> {
+        self.domains
+            .iter_mut()
+            .find(|d| d.name() == name)?
+            .as_any_mut()?
+            .downcast_mut::<T>()
+    }
+
+    /// Every domain's books, summed.
+    pub fn ledger(&self) -> Ledger {
+        self.domains
+            .iter()
+            .fold(Ledger::new(), |total, d| total.merged(&d.ledger()))
+    }
+
+    /// Advance every domain by `dt`.
+    ///
+    /// Fails without advancing the clock if a domain fails, if the bus does not
+    /// balance, if an iterative coupling does not converge, or if the totalled
+    /// ledgers moved by more than the conservation tolerance.
+    pub fn advance(&mut self, dt: Time) -> Result<Report, Violation> {
+        let before = self.ledger();
+        // What a substep's share is measured against. Set here rather than in `sweep`, because
+        // `iterate` sweeps repeatedly over the same interval.
+        self.bus.covering(dt);
+        let mut report = match self.schedule {
+            Schedule::OneWay | Schedule::Staggered => self.sweep(dt, false)?,
+            Schedule::Multirate => self.sweep(dt, true)?,
+            Schedule::Iterative { max_iter, tol } => self.iterate(dt, max_iter, tol)?,
+        };
+
+        // Measured before the audit rather than after it, because the audit refuses on the first
+        // channel over the line and this has to see all of them.
+        report.transfer = self.bus.worst_undelivered().map(|(what, worst)| Margin {
+            what,
+            worst,
+            tolerance: self.transfer_tol,
+        });
+        self.bus.audit_transfers("bus", self.transfer_tol)?;
+        let after = self.ledger();
+        if !before.is_empty() || !after.is_empty() {
+            audit_with("simulation", &before, &after, &self.conservation_tol)?;
+        }
+        self.t += dt;
+        Ok(report)
+    }
+
+    /// One pass over the domains in declared order.
+    fn sweep(&mut self, dt: Time, multirate: bool) -> Result<Report, Violation> {
+        let now = self.t;
+        // How much each channel has been **moved by an earlier taker** in this sweep, as a
+        // magnitude. The second-consumer check turns on this: a domain that asks and receives
+        // nothing is only robbed if somebody before it received something.
+        let mut moved: BTreeMap<&'static str, f64> = BTreeMap::new();
+        let mut substeps = Vec::with_capacity(self.domains.len());
+        let mut books_pressure = f64::NEG_INFINITY;
+        let mut worst_books: Option<Margin> = None;
+        for domain in self.domains.iter_mut() {
+            // A quasi-static domain has no state to march, so subdividing its
+            // step would just solve the same problem several times.
+            let subcycles = multirate && domain.kind() == Kind::Evolving;
+            let mut planned = 1;
+            let mut h = dt;
+            if subcycles {
+                let limit = domain.max_stable_dt(now);
+                planned = substeps_for(dt, limit);
+                h = dt / planned as f64;
+                out_of_reach(domain.name(), limit, h)?;
+            }
+            let mut t = now;
+            // Which channels had already been drawn on before this domain's turn.
+            let before: Vec<(&'static str, u32)> = self.bus.takes_per_channel().collect();
+            // And, for a domain that claims exact books, what it was holding and what the bus
+            // had carried — snapshotted here because only this domain runs before the
+            // corresponding snapshot below, which is what makes the difference attributable.
+            let audited = domain.books_balance();
+            let books_before = audited.then(|| domain.ledger());
+            let traffic_before = audited.then(|| self.bus.traffic());
+            // From here the bus tallies this domain's own plain traffic, summed from zero.
+            // Not a difference of two larger numbers: a microjoule received after somebody
+            // else received a gigajoule differences to nothing, and the check would accuse the
+            // domain that received it.
+            self.bus.mark();
+            // **The limit is asked again before every substep after the first**, because it is the
+            // largest step *from here* and the domain's own substeps move what it is computed from.
+            // See `Schedule::Multirate`. When the planned substep is longer than the limit now,
+            // what is left of the window is divided again, from this limit, into equal substeps. A
+            // limit that never falls below the plan never moves it, so such a run takes `dt / n`,
+            // `n` times, to the bit as it always did.
+            //
+            // `left` is counted down by the substeps taken rather than recomputed from the clock,
+            // the way the bus counts each channel's unclaimed time down, so a plan made again
+            // divides the time the bus also has left.
+            let mut left = dt;
+            let mut taken: u32 = 0;
+            while planned > 0 {
+                if subcycles && taken > 0 {
+                    let limit = domain.max_stable_dt(t);
+                    // A limit of zero, NaN or infinity says nothing a plan can use, and is left to
+                    // the domain's own refusal, as at the start of the window.
+                    if limit > Time::ZERO && h > limit {
+                        planned = substeps_for(left, limit);
+                        h = left / planned as f64;
+                        out_of_reach(domain.name(), limit, h)?;
+                    }
+                }
+                domain.step(t, h, &mut self.bus)?;
+                t += h;
+                left -= h;
+                taken = taken.saturating_add(1);
+                planned -= 1;
+            }
+            if let (Some(books), Some(traffic)) = (books_before, traffic_before) {
+                let closest = attribute(
+                    domain.name(),
+                    &books,
+                    &domain.ledger(),
+                    &traffic,
+                    &self.bus.traffic(),
+                    &self.conservation_tol,
+                )?;
+                // Across domains, again by how close to refusing rather than by raw size — the
+                // small domain that is nearly out is the one this check exists for.
+                if let Some((what, ratio, tol)) = closest {
+                    if tol > 0.0 && ratio / tol > books_pressure {
+                        books_pressure = ratio / tol;
+                        worst_books = Some(Margin {
+                            what,
+                            worst: ratio,
+                            tolerance: tol,
+                        });
+                    }
+                }
+            }
+            let mine = self.bus.plain_traffic_since_mark();
+
+            // A channel this domain took from that an *earlier* domain had already emptied.
+            //
+            // `Exchange::take` empties a channel, so the second consumer gets zero — and every
+            // total agrees, because everything published was consumed. Two plates under one lamp
+            // warm at the rate of one plate and the books balance to the bit. The conservation
+            // audit structurally cannot see it.
+            //
+            // Counted per *turn* rather than per call, because a subcycling domain takes once
+            // per substep and that is one consumer collecting its own interval in pieces.
+            //
+            // Refused rather than apportioned: splitting needs a rule the kernel has no way to
+            // choose — equally, by heat capacity, by area? — and any rule it picked would be
+            // silently wrong for someone, which is the failure being fixed rather than a fresh
+            // one. A caller who knows the answer can publish on channels of their own.
+            // A channel this domain took from that an *earlier* domain had already emptied.
+            //
+            // `Exchange::take` empties a channel, so the second consumer gets zero — and every
+            // total agrees, because everything published was consumed. Two plates under one
+            // lamp warm at the rate of one plate and the conservation audit structurally
+            // cannot see it. That is what this refuses.
+            //
+            // **It asks what moved, not how many times somebody asked.** Counting takes made
+            // an empty channel taken from twice look exactly like a full one: two `Solid3D`
+            // blocks with no heater anywhere were refused, which is the first thing anybody
+            // assembling parts writes and where nothing could have been mis-split.
+            //
+            // Three properties of the arithmetic, each answering a way the amount version was
+            // got wrong on the first attempt:
+            //
+            // - **Net, not gross** — `taken − published`, the same quantity `attribute` uses
+            //   a few lines above. A domain that publishes onto a channel and takes its own
+            //   offer back received nothing, and counting the gross let it mask a robbery.
+            // - **Summed from zero, never differenced** — the bus tallies each domain's own
+            //   traffic between marks. Differencing totals carries the sensitivity of `2⁻⁵²`
+            //   times whatever has already crossed, so a microjoule received after a gigajoule
+            //   differences to nothing and the domain that received it is accused of not
+            //   having. Per-sweep totals were not enough; only per-turn is.
+            // - **Magnitudes** — a publisher may offer a negative amount, and two earlier
+            //   takers whose receipts cancel had still moved something.
+            //
+            // **What this promises is narrower than "one consumer per channel", and the
+            // difference is deliberate.** A producer that runs *between* two consumers —
+            // publish, take, publish, take — passes, because both received a real amount and
+            // nothing went missing. Which arrangement was intended cannot be read from a bus
+            // that carries amounts and an order, so this checks what can be checked: that no
+            // domain went empty-handed because another had drained the channel. Declaration
+            // order already decides who is offered what under a staggered schedule.
+            //
+            // **The spatial channel has no check of this kind at all.** `take_on` hands a
+            // second consumer a zeroed `Flux` and never touches `takers`, so nothing here
+            // sees it; that gap is older than this code and is not closed by it.
+            let plain = |t: &[(&'static str, f64, f64)], channel: &str| {
+                t.iter()
+                    .find(|(c, _, _)| *c == channel)
+                    .map_or((0.0, 0.0), |(_, taken, published)| (*taken, *published))
+            };
+            let took_now: Vec<(&'static str, u32)> = self.bus.takes_per_channel().collect();
+            for (channel, now_taken) in took_now {
+                let was = before
+                    .iter()
+                    .find(|(c, _)| *c == channel)
+                    .map_or(0, |(_, n)| *n);
+                if now_taken <= was {
+                    continue; // this domain did not take from this channel
+                }
+                let (taken, published) = plain(&mine, channel);
+                let net = taken - published;
+                let earlier = moved.get(channel).copied().unwrap_or(0.0);
+                if earlier > 0.0 && net == 0.0 {
+                    return Err(Violation {
+                        quantity: channel.to_string(),
+                        site: format!(
+                            "{} (a second domain took from a channel already emptied)",
+                            domain.name()
+                        ),
+                        // Amounts rather than call counts, so the message says what was moved
+                        // and what this domain got rather than how many times it asked.
+                        before: earlier,
+                        after: net,
+                        scale: earlier,
+                        tolerance: 0.0,
+                    });
+                }
+                *moved.entry(channel).or_insert(0.0) += net.abs();
+            }
+            substeps.push((domain.name().to_string(), taken));
+        }
+        let residual = self
+            .domains
+            .iter()
+            .map(|d| d.residual())
+            .fold(0.0f64, f64::max);
+        Ok(Report {
+            substeps,
+            iterations: 1,
+            residual,
+            // Filled by `advance`, which is where the bus is still holding whatever went
+            // undelivered — by the time a caller has this, it has been drained.
+            transfer: None,
+            books: worst_books,
+        })
+    }
+
+    /// Repeat the pass from the same starting state until the residuals settle.
+    fn iterate(&mut self, dt: Time, max_iter: u32, tol: f64) -> Result<Report, Violation> {
+        if let Some(bad) = self.domains.iter().find(|d| !d.supports_restore()) {
+            return Err(Violation::at(
+                bad.name(),
+                "iterative coupling needs a restorable domain",
+                0.0,
+            ));
+        }
+        for domain in self.domains.iter_mut() {
+            domain.checkpoint();
+        }
+
+        let mut last = Report::default();
+        for iteration in 1..=max_iter {
+            if iteration > 1 {
+                for domain in self.domains.iter_mut() {
+                    domain.restore();
+                }
+                self.bus.clear_offers();
+            }
+            let mut report = self.sweep(dt, true)?;
+            report.iterations = iteration;
+            last = report;
+            if last.residual <= tol {
+                return Ok(last);
+            }
+        }
+
+        // Not converged. Reporting this rather than proceeding is the whole point:
+        // an unconverged coupling produces plausible numbers, which is worse than
+        // producing none.
+        Err(Violation {
+            quantity: "coupling residual".to_string(),
+            site: format!("simulation (after {max_iter} iterations)"),
+            before: 0.0,
+            after: last.residual,
+            scale: last.residual.abs(),
+            tolerance: tol,
+        })
+    }
+}
+
+/// Refuse a planned substep `h` still longer than a positive `limit`, which happens only at
+/// [`substeps_for`]'s cap: four billion substeps of what is left would not be within the limit.
+///
+/// Refused rather than taken, because nothing else stops it. A domain that does not check its own
+/// step would be stepped past the limit, and one whose limit keeps falling toward a point inside
+/// the window would be divided again at the cap before every substep, for ever.
+fn out_of_reach(name: &str, limit: Time, h: Time) -> Result<(), Violation> {
+    if limit > Time::ZERO && h > limit {
+        return Err(Violation {
+            quantity: "stability limit".to_string(),
+            site: format!(
+                "{name} (out of reach: what is left of the window would take more than {} \
+                 substeps of it)",
+                u32::MAX
+            ),
+            before: limit.to_si(),
+            after: h.to_si(),
+            scale: limit.to_si(),
+            tolerance: 0.0,
+        });
+    }
+    Ok(())
+}
+
+/// Check one domain's books against its own traffic on the bus.
+///
+/// **What the whole-simulation audit structurally cannot see.** That audit sums every ledger
+/// before comparing, so the scale it measures against is the total — and a domain holding a
+/// microjoule beside one holding a kilojoule can lose everything it has without moving the sum.
+/// No tolerance fixes that, because the problem is the scale rather than the number.
+///
+/// Here the scale is the domain's own: what it held, what it holds, and what it moved. A leak of
+/// a per cent of a small domain is a per cent here, whatever else is in the simulation.
+///
+/// Only for domains that opt in through [`Domain::books_balance`], because an exact book is a
+/// claim not every honest domain can make — one losing heat to an environment that is not on the
+/// bus is modelling a boundary, not leaking.
+/// Check one domain's books against what it moved, and say how close it came.
+///
+/// Returns the quantity that came **nearest to refusing** — measured as `residual / tolerance`,
+/// which is the only ordering that means anything when two quantities have different tolerances —
+/// along with its raw ratio and that tolerance. `None` when the domain held nothing above the
+/// scale floor.
+fn attribute(
+    name: &str,
+    before: &Ledger,
+    after: &Ledger,
+    traffic_before: &[(&'static str, f64, f64)],
+    traffic_after: &[(&'static str, f64, f64)],
+    tolerances: &Tolerances,
+) -> Result<Option<(String, f64, f64)>, Violation> {
+    let moved = |channel: &str| -> f64 {
+        let find = |t: &[(&'static str, f64, f64)]| {
+            t.iter()
+                .find(|(c, _, _)| *c == channel)
+                .map(|(_, p, k)| (*p, *k))
+                .unwrap_or((0.0, 0.0))
+        };
+        let (pub_before, took_before) = find(traffic_before);
+        let (pub_after, took_after) = find(traffic_after);
+        // Taken minus published: what the domain gained from the bus.
+        (took_after - took_before) - (pub_after - pub_before)
+    };
+
+    let mut names: Vec<&'static str> = before.quantities().map(|(n, _)| n).collect();
+    for (n, _) in after.quantities() {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    names.sort_unstable();
+
+    let mut pressure = f64::NEG_INFINITY;
+    let mut closest: Option<(String, f64, f64)> = None;
+    for quantity in names {
+        let held_before = before.get(quantity).unwrap_or(0.0);
+        let held_after = after.get(quantity).unwrap_or(0.0);
+        let expected = moved(quantity);
+        let discrepancy = (held_after - held_before) - expected;
+
+        // The domain's own scale, which is the whole point: its holdings, its declared scale, and
+        // the amount it moved. Not the simulation's total.
+        let scale = held_before
+            .abs()
+            .max(held_after.abs())
+            .max(before.scale_of(quantity).unwrap_or(0.0))
+            .max(after.scale_of(quantity).unwrap_or(0.0))
+            .max(expected.abs());
+        if scale < 1e-300 {
+            continue;
+        }
+        let tol = tolerances.for_quantity(quantity);
+        let ratio = discrepancy.abs() / scale;
+        if ratio > tol {
+            return Err(Violation {
+                quantity: quantity.to_string(),
+                site: format!("{name} (its own books, against what it moved on the bus)"),
+                before: held_before + expected,
+                after: held_after,
+                scale,
+                tolerance: tol,
+            });
+        }
+        // How close this one came, in units of its own tolerance. Comparing raw residuals across
+        // quantities would rank a loose one above a tight one that is nearly out.
+        if tol > 0.0 && ratio / tol > pressure {
+            pressure = ratio / tol;
+            closest = Some((format!("{name}/{quantity}"), ratio, tol));
+        }
+    }
+    Ok(closest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conserved::quantity;
+    use pantometry_units::Area;
+
+    /// A quasi-static source: converts an input into watts on the bus without any
+    /// state of its own. This is the shape optics has — solved, never stepped.
+    struct Lamp {
+        watts: f64,
+        delivered: f64,
+    }
+
+    impl Domain for Lamp {
+        fn name(&self) -> &str {
+            "lamp"
+        }
+        fn kind(&self) -> Kind {
+            Kind::QuasiStatic
+        }
+        fn step(&mut self, _t: Time, dt: Time, bus: &mut Exchange) -> Result<(), Violation> {
+            let joules = self.watts * dt.to_si();
+            bus.publish(quantity::ENERGY, joules);
+            self.delivered += joules;
+            Ok(())
+        }
+        fn ledger(&self) -> Ledger {
+            // Energy that has left the lamp is still in the system's books until
+            // something else takes it, so the lamp reports what it has paid out.
+            Ledger::new().with(quantity::ENERGY, -self.delivered)
+        }
+        fn checkpoint(&mut self) {}
+        fn restore(&mut self) {}
+        fn supports_restore(&self) -> bool {
+            true
+        }
+    }
+
+    /// An evolving sink with a stability limit: a lumped thermal mass that must
+    /// not be stepped past a fraction of its time constant.
+    struct Block {
+        joules: f64,
+        limit: Time,
+        saved: f64,
+    }
+
+    impl Domain for Block {
+        fn name(&self) -> &str {
+            "block"
+        }
+        fn max_stable_dt(&self, _now: Time) -> Time {
+            self.limit
+        }
+        fn step(&mut self, _t: Time, _dt: Time, bus: &mut Exchange) -> Result<(), Violation> {
+            self.joules += bus.take(quantity::ENERGY);
+            Ok(())
+        }
+        fn ledger(&self) -> Ledger {
+            Ledger::new().with(quantity::ENERGY, self.joules)
+        }
+        fn checkpoint(&mut self) {
+            self.saved = self.joules;
+        }
+        fn restore(&mut self) {
+            self.joules = self.saved;
+        }
+        fn supports_restore(&self) -> bool {
+            true
+        }
+    }
+
+    fn lamp_and_block(schedule: Schedule, limit: Time) -> Simulation {
+        Simulation::new(schedule)
+            .with(Lamp {
+                watts: 0.01,
+                delivered: 0.0,
+            })
+            .with(Block {
+                joules: 0.0,
+                limit,
+                saved: 0.0,
+            })
+    }
+
+    /// The chain works end to end: a quasi-static producer hands energy across
+    /// the bus to an evolving consumer, the books balance, and the clock moves.
+    #[test]
+    fn energy_crosses_the_bus_and_the_books_balance() {
+        let mut sim = lamp_and_block(Schedule::Staggered, Time::s(1.0));
+        let report = sim.advance(Time::s(2.0)).expect("a balanced step");
+        assert_eq!(report.iterations, 1);
+        assert!((sim.time().to_si() - 2.0).abs() < 1e-15);
+        // 10 mW for 2 s is 20 mJ, and all of it arrived.
+        assert!((sim.bus().total_consumed(quantity::ENERGY) - 0.02).abs() < 1e-15);
+        // The system as a whole is where it started: the lamp is down what the
+        // block is up.
+        assert_eq!(sim.ledger().get(quantity::ENERGY), Some(0.0));
+    }
+
+    /// Energy published and not consumed is caught. This is the interpolation bug
+    /// at a coupling interface, in its simplest possible form: a producer with no
+    /// consumer.
+    #[test]
+    fn energy_that_arrives_nowhere_is_a_violation() {
+        let mut sim = Simulation::new(Schedule::Staggered).with(Lamp {
+            watts: 0.01,
+            delivered: 0.0,
+        });
+        let err = sim.advance(Time::s(1.0)).expect_err("nothing consumed it");
+        assert_eq!(err.quantity, "energy");
+        assert!(err.site.contains("not consumed"), "{err}");
+        // And the clock did not move, so the failure is not half-applied.
+        assert_eq!(sim.time(), Time::ZERO);
+    }
+
+    /// Multirate: the domain with the tight limit subcycles, and the quasi-static
+    /// one does not, because there is nothing to subdivide.
+    #[test]
+    fn only_evolving_domains_subcycle() {
+        let mut sim = lamp_and_block(Schedule::Multirate, Time::s(0.3));
+        let report = sim.advance(Time::s(1.0)).unwrap();
+        assert_eq!(
+            report.substeps,
+            vec![("lamp".to_string(), 1), ("block".to_string(), 4)],
+            "the block needs ceil(1.0/0.3) = 4 substeps; the lamp needs none"
+        );
+        // Subcycling must not change the total that crossed.
+        assert!((sim.bus().total_consumed(quantity::ENERGY) - 0.01).abs() < 1e-15);
+    }
+
+    /// A domain with no stability limit is not subcycled at all, however long the
+    /// step.
+    #[test]
+    fn an_unlimited_domain_takes_one_step() {
+        let mut sim = lamp_and_block(Schedule::Multirate, Time::from_si(f64::INFINITY));
+        let report = sim.advance(Time::s(1e6)).unwrap();
+        assert_eq!(
+            report.substeps,
+            vec![("lamp".to_string(), 1), ("block".to_string(), 1)]
+        );
+    }
+
+    /// An evolving domain whose limit is whatever `limit` says after so many steps, and which
+    /// records each step it took beside the limit it reported just before. `strict` refuses a step
+    /// over that limit with no slack, as the puck, the channel and the cavity do: they check the
+    /// step by the same expression they report.
+    struct Moving {
+        limit: Limit,
+        strict: bool,
+        taken: Vec<(f64, f64)>,
+    }
+
+    /// A limit, in seconds, as a function of how many steps have been taken.
+    type Limit = fn(u32) -> f64;
+
+    impl Moving {
+        fn new(limit: Limit, strict: bool) -> Moving {
+            Moving {
+                limit,
+                strict,
+                taken: Vec::new(),
+            }
+        }
+    }
+
+    impl Domain for Moving {
+        fn name(&self) -> &str {
+            "moving"
+        }
+        fn max_stable_dt(&self, _now: Time) -> Time {
+            Time::from_si((self.limit)(self.taken.len() as u32))
+        }
+        fn step(&mut self, _t: Time, dt: Time, _bus: &mut Exchange) -> Result<(), Violation> {
+            let (h, limit) = (dt.to_si(), (self.limit)(self.taken.len() as u32));
+            if self.strict && h > limit {
+                return Err(Violation {
+                    quantity: "stability".to_string(),
+                    site: format!("moving (substep {})", self.taken.len()),
+                    before: limit,
+                    after: h,
+                    scale: limit,
+                    tolerance: 0.0,
+                });
+            }
+            self.taken.push((h, limit));
+            Ok(())
+        }
+        fn as_any(&self) -> Option<&dyn Any> {
+            Some(self)
+        }
+    }
+
+    fn steps_of(sim: &Simulation) -> Vec<(f64, f64)> {
+        sim.domain_as::<Moving>("moving").unwrap().taken.clone()
+    }
+
+    /// **A limit that tightens inside a window is honoured inside it.** The limit is the largest
+    /// step from the state the domain is in, and here it is `1/(1 + k/4)` after `k` steps, down to
+    /// a floor of `0.4`, as a warming puck's falls and settles. Sized once from the first read, the
+    /// window of three is three steps of one, and the second is refused: the limit is `0.8` by
+    /// then.
+    ///
+    /// Every step taken is at most what the domain said just before it, the steps cover the window,
+    /// and there are more of them than the first read planned. The floor is so that a scheduler
+    /// that divided the whole window again, rather than what is left of it, covers too much and
+    /// says so here, rather than following a limit that never stops falling for ever.
+    #[test]
+    fn a_limit_that_tightens_inside_a_window_is_honoured() {
+        let mut sim = Simulation::new(Schedule::Multirate).with(Moving::new(
+            |k| (1.0 / (1.0 + 0.25 * k as f64)).max(0.4),
+            true,
+        ));
+        let report = sim
+            .advance(Time::s(3.0))
+            .expect("every substep is within the limit read before it");
+        let steps = steps_of(&sim);
+        for (k, (h, limit)) in steps.iter().enumerate() {
+            assert!(h <= limit, "substep {k} was {h:e} against {limit:e}");
+        }
+        let covered: f64 = steps.iter().map(|(h, _)| h).sum();
+        // A sum and a subtraction from what is left per substep, each of numbers under 4, so each
+        // rounds by at most `ε·4`; charged `ε·3` twice over, which is more.
+        let rounding = 2.0 * steps.len() as f64 * f64::EPSILON * 3.0;
+        assert!(
+            (covered - 3.0).abs() <= rounding,
+            "the substeps cover {covered:e} of 3 s"
+        );
+        // **And which substeps.** Three of one are planned; the limit is 0.8 after the first, so
+        // the 2 s left is three of 2/3; 2/3 after the second, which is that substep exactly and
+        // keeps the plan; 4/7 after the third, so the 2/3 left is two of 1/3; and 1/2 after the
+        // fourth, which keeps it. Dividing the whole window again, or one substep more than it
+        // takes, or a substep that only meets the limit, each covers the window within it too, in
+        // another five substeps.
+        let want = [1.0, 2.0 / 3.0, 2.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0];
+        assert_eq!(steps.len(), want.len(), "{steps:?}");
+        for (k, ((h, _), want)) in steps.iter().zip(want).enumerate() {
+            assert!(
+                (h - want).abs() <= rounding,
+                "substep {k} is {h:e}, and {want:e} divides what was left"
+            );
+        }
+        assert_eq!(
+            report.substeps,
+            vec![("moving".to_string(), steps.len() as u32)]
+        );
+    }
+
+    /// **A substep exactly at the limit is kept**, not divided again: `2/3` is what `2/3` reads as,
+    /// so a window of two takes three substeps of it, to the bit. A scheduler that divided again
+    /// when a substep only met its limit would take four here, and would move the bits of every
+    /// window that is a whole number of its limits.
+    #[test]
+    fn a_substep_exactly_at_the_limit_is_kept() {
+        let mut sim = Simulation::new(Schedule::Multirate).with(Moving::new(|_| 2.0 / 3.0, true));
+        sim.advance(Time::s(2.0)).unwrap();
+        let steps = steps_of(&sim);
+        assert_eq!(steps.len(), 3, "{steps:?}");
+        for (k, (h, _)) in steps.iter().enumerate() {
+            assert_eq!(
+                h.to_bits(),
+                (2.0f64 / 3.0).to_bits(),
+                "substep {k} is {h:e}"
+            );
+        }
+    }
+
+    /// **A plan only ever tightens**, and that has a price, pinned here because it is the price
+    /// the design chose. The limit reads `1e-3` once, after the first of four substeps of a
+    /// quarter, and a quarter again after that: the rest of the window is 750 substeps of a
+    /// thousandth. Dividing again whenever the limit moved, either way, would take five, and
+    /// would move the bits of every run whose limit rises.
+    #[test]
+    fn a_limit_that_dips_once_holds_the_rest_of_the_window() {
+        let mut sim = Simulation::new(Schedule::Multirate)
+            .with(Moving::new(|k| if k == 1 { 1e-3 } else { 0.25 }, true));
+        sim.advance(Time::s(1.0)).unwrap();
+        assert_eq!(steps_of(&sim).len(), 751);
+    }
+
+    /// **And a limit that does not move is read and kept**, so the substeps are what they were when
+    /// the limit was read once a window: `n` of `dt / n`, to the bit. A scheduler that divided what
+    /// is left again before every substep would still cover the window, and every run with a limit
+    /// on it would move in its last bits: here ten of the fifteen substeps. A window and a limit
+    /// whose substep is exact, a quarter of a second, would not show it.
+    #[test]
+    fn a_limit_that_does_not_move_changes_no_substep() {
+        let mut sim = Simulation::new(Schedule::Multirate).with(Moving::new(|_| 0.07, true));
+        sim.advance(Time::s(1.0)).unwrap();
+        let steps = steps_of(&sim);
+        assert_eq!(steps.len(), 15, "ceil(1.0/0.07)");
+        for (k, (h, _)) in steps.iter().enumerate() {
+            assert_eq!(
+                h.to_bits(),
+                (1.0f64 / 15.0).to_bits(),
+                "substep {k} is {h:e}"
+            );
+        }
+    }
+
+    /// **A window of a whole number of limits is not refused for a rounding.** The quotient below
+    /// rounds onto exactly five, and five substeps of the window are each an ulp over the limit, so
+    /// a domain that checks with no slack refused the first. Six are not.
+    #[test]
+    fn a_whole_number_of_limits_is_not_an_ulp_over() {
+        const LIMIT: f64 = 0.11305311647662632;
+        let window = 0.5652655823831316;
+        assert_eq!(
+            window / LIMIT,
+            5.0,
+            "precondition: the quotient rounds onto five"
+        );
+        assert!(
+            window / 5.0 > LIMIT,
+            "precondition: five substeps are an ulp over"
+        );
+        let mut sim = Simulation::new(Schedule::Multirate).with(Moving::new(|_| LIMIT, true));
+        sim.advance(Time::s(window))
+            .expect("no substep is over the limit, even by an ulp");
+        assert_eq!(steps_of(&sim).len(), 6);
+    }
+
+    /// **A limit of zero says nothing a plan can use**, and the plan is kept: dividing what is left
+    /// by a zero limit gives one substep of all of it, which is the longest step there is, taken
+    /// because the domain said no step was stable. Left to the domain to refuse.
+    #[test]
+    fn a_limit_that_collapses_to_zero_does_not_lengthen_the_step() {
+        let mut sim = Simulation::new(Schedule::Multirate)
+            .with(Moving::new(|k| if k == 0 { 0.25 } else { 0.0 }, false));
+        sim.advance(Time::s(1.0)).unwrap();
+        let steps = steps_of(&sim);
+        assert_eq!(
+            steps.len(),
+            4,
+            "the plan from the first read, kept: {steps:?}"
+        );
+        assert!(steps.iter().all(|(h, _)| *h == 0.25), "{steps:?}");
+    }
+
+    /// **A positive limit too short to reach is refused, not stepped past.** After the first of
+    /// four substeps the limit reads `1e-12`, then the smallest subnormal, either far below what
+    /// four billion substeps of the 0.75 s left could meet. The second is too short to divide
+    /// by at all, and `substeps_for` once answered that with one substep of everything left.
+    #[test]
+    fn a_limit_out_of_reach_is_refused() {
+        let cases: [(&str, f64, Limit); 2] = [
+            ("1e-12", 1e-12, |k| if k == 0 { 0.25 } else { 1e-12 }),
+            (
+                "a subnormal",
+                5e-324,
+                |k| if k == 0 { 0.25 } else { 5e-324 },
+            ),
+        ];
+        for (name, tiny, limit) in cases {
+            let mut sim = Simulation::new(Schedule::Multirate).with(Moving::new(limit, false));
+            let refused = sim
+                .advance(Time::s(1.0))
+                .expect_err(&format!("a limit of {name} cannot be met"));
+            assert!(refused.site.contains("out of reach"), "{name}: {refused}");
+            assert_eq!(refused.before, tiny, "{name}: {refused}");
+            let steps = steps_of(&sim);
+            assert_eq!(
+                steps.len(),
+                1,
+                "{name}: nothing past the first substep: {steps:?}"
+            );
+        }
+        // And from the first read: a window that cannot be met is not begun.
+        // Strict, so that a scheduler that began it is refused by the domain at once, rather than
+        // made to record four billion substeps.
+        let mut sim = Simulation::new(Schedule::Multirate).with(Moving::new(|_| 1e-12, true));
+        let refused = sim.advance(Time::s(1.0)).expect_err("1e-12 from the start");
+        assert!(refused.site.contains("out of reach"), "{refused}");
+        assert!(steps_of(&sim).is_empty());
+    }
+
+    /// A domain whose limit is half the time left to `t = 0.5`, a point inside a window of one —
+    /// the shape of a pair closing on each other with nothing to soften the contact — and whose
+    /// step, like `NBody`'s, does not refuse. It stops itself after a million steps, so that a
+    /// scheduler that followed it would end.
+    struct Closing {
+        t: f64,
+        taken: u32,
+    }
+
+    impl Domain for Closing {
+        fn name(&self) -> &str {
+            "closing"
+        }
+        fn max_stable_dt(&self, _now: Time) -> Time {
+            Time::from_si(0.5 * (0.5 - self.t))
+        }
+        fn step(&mut self, _t: Time, dt: Time, _bus: &mut Exchange) -> Result<(), Violation> {
+            self.t += dt.to_si();
+            self.taken += 1;
+            if self.taken > 1_000_000 {
+                return Err(Violation::at(
+                    "closing",
+                    "a million steps",
+                    self.taken as f64,
+                ));
+            }
+            Ok(())
+        }
+        fn as_any(&self) -> Option<&dyn Any> {
+            Some(self)
+        }
+    }
+
+    /// **A limit that falls toward a point inside the window is refused, not followed.** Each
+    /// substep halves the time left to the point, so the plan grows until four billion substeps
+    /// of what is left would not be within the limit, and the scheduler refuses there. A scheduler
+    /// that went on dividing at the cap took the capped substep past the point, where the limit is
+    /// negative and plans nothing, and had some four billion substeps left in the window.
+    #[test]
+    fn a_limit_closing_on_a_point_is_refused() {
+        let mut sim = Simulation::new(Schedule::Multirate).with(Closing { t: 0.0, taken: 0 });
+        let refused = sim
+            .advance(Time::s(1.0))
+            .expect_err("a limit that reaches zero inside the window cannot be met");
+        assert!(refused.site.contains("out of reach"), "{refused}");
+        let taken = sim.domain_as::<Closing>("closing").unwrap().taken;
+        assert!(taken < 100, "{taken} substeps before the refusal");
+    }
+
+    /// Publishes a kilojoule each window.
+    struct Source;
+
+    impl Domain for Source {
+        fn name(&self) -> &str {
+            "source"
+        }
+        fn kind(&self) -> Kind {
+            Kind::QuasiStatic
+        }
+        fn step(&mut self, _t: Time, _dt: Time, bus: &mut Exchange) -> Result<(), Violation> {
+            bus.publish("heat", 1.0e3);
+            Ok(())
+        }
+    }
+
+    /// Takes its share of the heat every substep, with a limit that tightens twice in every window
+    /// of three seconds: one, then 0.7 from half a second in, then 0.55 from a second and a half.
+    struct Drinker;
+
+    impl Domain for Drinker {
+        fn name(&self) -> &str {
+            "drinker"
+        }
+        fn max_stable_dt(&self, now: Time) -> Time {
+            let phase = now.to_si() % 3.0;
+            Time::from_si(if phase < 0.5 {
+                1.0
+            } else if phase < 1.5 {
+                0.7
+            } else {
+                0.55
+            })
+        }
+        fn step(&mut self, _t: Time, dt: Time, bus: &mut Exchange) -> Result<(), Violation> {
+            let _ = bus.take_share("heat", dt);
+            Ok(())
+        }
+    }
+
+    /// **A window divided again still hands its consumer all of its share**, late in a run too.
+    /// What is left is counted down by the substeps taken, as the bus counts each channel's
+    /// unclaimed time, rather than worked out from the clock: late in a run the clock's rounding of
+    /// one substep is over the bus's `1e-12` of a 3 s window, and a remainder taken from the clock
+    /// left `1.6e-9` J of a kilojoule on the channel in window 21 845, the first to cross 65 536 s.
+    /// Forty thousand windows, which is 120 000 s, each divided again twice.
+    #[test]
+    fn a_window_divided_again_late_in_a_run_still_empties_the_channel() {
+        let mut sim = Simulation::new(Schedule::Multirate)
+            .with(Source)
+            .with(Drinker);
+        for k in 0..40_000 {
+            let report = sim
+                .advance(Time::s(3.0))
+                .unwrap_or_else(|v| panic!("window {k}: {v}"));
+            assert_eq!(report.substeps[1].1, 5, "window {k}: {:?}", report.substeps);
+        }
+    }
+
+    /// Iterative coupling converges and reports how many passes it took.
+    struct Settling {
+        residual: f64,
+        saved: f64,
+    }
+
+    impl Domain for Settling {
+        fn name(&self) -> &str {
+            "settling"
+        }
+        fn step(&mut self, _t: Time, _dt: Time, _bus: &mut Exchange) -> Result<(), Violation> {
+            // Each pass halves the disagreement with the neighbour.
+            self.residual /= 2.0;
+            Ok(())
+        }
+        fn residual(&self) -> f64 {
+            self.residual
+        }
+        fn checkpoint(&mut self) {
+            self.saved = self.residual;
+        }
+        fn restore(&mut self) {
+            // The restore puts the state back but keeps the improved coupling
+            // guess, which is what makes the iteration converge rather than loop.
+            let improved = self.residual;
+            self.residual = self.saved.min(improved);
+        }
+        fn supports_restore(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn an_iterative_coupling_converges_and_says_how_long_it_took() {
+        let mut sim = Simulation::new(Schedule::Iterative {
+            max_iter: 20,
+            tol: 1e-3,
+        })
+        .with(Settling {
+            residual: 1.0,
+            saved: 0.0,
+        });
+        let report = sim.advance(Time::s(1.0)).unwrap();
+        // 1.0 halved ten times is 9.8e-4, the first value under 1e-3.
+        assert_eq!(report.iterations, 10);
+        assert!(report.residual <= 1e-3);
+    }
+
+    /// Not converging is a failure, not a result. An unconverged coupling gives
+    /// numbers that look like physics, which is the worst thing it could do.
+    #[test]
+    fn failing_to_converge_is_reported_not_accepted() {
+        let mut sim = Simulation::new(Schedule::Iterative {
+            max_iter: 3,
+            tol: 1e-9,
+        })
+        .with(Settling {
+            residual: 1.0,
+            saved: 0.0,
+        });
+        let err = sim
+            .advance(Time::s(1.0))
+            .expect_err("three halvings is not 1e-9");
+        assert_eq!(err.quantity, "coupling residual");
+        assert!(err.site.contains("after 3 iterations"), "{err}");
+        assert_eq!(sim.time(), Time::ZERO);
+    }
+
+    /// A domain that cannot put itself back cannot be iterated, and is told so by
+    /// name rather than being iterated from the wrong state.
+    #[test]
+    fn iteration_refuses_a_domain_that_cannot_rewind() {
+        struct NoRewind;
+        impl Domain for NoRewind {
+            fn name(&self) -> &str {
+                "no-rewind"
+            }
+            fn step(&mut self, _t: Time, _dt: Time, _b: &mut Exchange) -> Result<(), Violation> {
+                Ok(())
+            }
+        }
+        let mut sim = Simulation::new(Schedule::Iterative {
+            max_iter: 5,
+            tol: 1e-6,
+        })
+        .with(NoRewind);
+        let err = sim.advance(Time::s(1.0)).unwrap_err();
+        assert_eq!(err.site, "no-rewind");
+        assert!(err.quantity.contains("restorable"), "{err}");
+    }
+
+    /// The whole scheduler is deterministic: same domains, same schedule, same
+    /// numbers, down to the substep counts.
+    #[test]
+    fn advancing_is_reproducible() {
+        let run = || {
+            let mut sim = lamp_and_block(Schedule::Multirate, Time::s(0.07));
+            let mut reports = Vec::new();
+            for _ in 0..5 {
+                reports.push(sim.advance(Time::s(0.25)).unwrap());
+            }
+            (reports, sim.bus().total_consumed(quantity::ENERGY))
+        };
+        let (a, ea) = run();
+        let (b, eb) = run();
+        assert_eq!(a, b);
+        assert_eq!(ea.to_bits(), eb.to_bits(), "not bit-identical");
+        assert_eq!(
+            a[0].substeps,
+            vec![("lamp".to_string(), 1), ("block".to_string(), 4)]
+        );
+    }
+
+    /// Taking from a channel empties it, so an amount cannot be consumed twice.
+    #[test]
+    fn a_channel_cannot_be_drained_twice() {
+        let mut bus = Exchange::new();
+        bus.publish(quantity::ENERGY, 5.0);
+        bus.publish(quantity::ENERGY, 3.0);
+        assert_eq!(bus.peek(quantity::ENERGY), 8.0);
+        assert_eq!(bus.take(quantity::ENERGY), 8.0);
+        assert_eq!(bus.take(quantity::ENERGY), 0.0);
+        assert_eq!(bus.total_consumed(quantity::ENERGY), 8.0);
+        assert!(bus.unclaimed().next().is_none());
+    }
+
+    /// A spatial channel behaves like a lumped one — accumulate, drain once — but face by
+    /// face, so two mechanisms heating the same mirror add up *where* each of them did.
+    #[test]
+    fn a_spatial_channel_accumulates_and_drains_in_place() {
+        let mirror = Interface::uniform("mirror", 4, Area::from_si(1e-4));
+        let mut bus = Exchange::new();
+
+        // Absorption in the coating, on the two faces the beam covers.
+        bus.publish_on(
+            &mirror,
+            quantity::ENERGY,
+            &Flux::from_faces(vec![0.0, 2.0, 3.0, 0.0]),
+        )
+        .unwrap();
+        // And a mount conducting into one edge, which is a different mechanism on the same
+        // boundary. It must land on face 0, not be averaged in.
+        bus.publish_on(
+            &mirror,
+            quantity::ENERGY,
+            &Flux::from_faces(vec![1.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            bus.peek_on(&mirror, quantity::ENERGY).unwrap().per_face(),
+            &[1.0, 2.0, 3.0, 0.0]
+        );
+
+        let taken = bus.take_on(&mirror, quantity::ENERGY).unwrap();
+        assert_eq!(taken.per_face(), &[1.0, 2.0, 3.0, 0.0]);
+        assert!((bus.total_consumed_on(&mirror, quantity::ENERGY) - 6.0).abs() < 1e-15);
+        // Emptied, so it cannot be consumed twice.
+        assert_eq!(bus.take_on(&mirror, quantity::ENERGY).unwrap().total(), 0.0);
+        assert!(bus.unclaimed().next().is_none());
+
+        // A channel nobody published to reads as zeros over the right boundary, not an
+        // error: a mirror that happens to be dark this step is not a fault.
+        let dark = bus.take_on(&mirror, "photons").unwrap();
+        assert_eq!(dark.faces(), 4);
+        assert_eq!(dark.total(), 0.0);
+    }
+
+    /// **The bug the spatial audit exists to catch.** A consumer that keeps the total but
+    /// moves it to the wrong part of the boundary is invisible to a total-only check, and
+    /// is exactly the failure a shared discretisation is supposed to prevent.
+    #[test]
+    fn the_audit_names_the_face_that_was_left_holding_something() {
+        let mirror = Interface::uniform("mirror", 8, Area::from_si(1e-4));
+        let mut bus = Exchange::new();
+
+        // Ten joules on face 6.
+        let mut absorbed = vec![0.0; 8];
+        absorbed[6] = 10.0;
+        bus.publish_on(&mirror, quantity::ENERGY, &Flux::from_faces(absorbed))
+            .unwrap();
+
+        // A consumer takes it and puts back the same total in the wrong place. The sum is
+        // exactly right, and the sum is not what is being checked.
+        let taken = bus.take_on(&mirror, quantity::ENERGY).unwrap();
+        let mut misplaced = vec![0.0; 8];
+        misplaced[1] = -taken.total();
+        misplaced[2] = taken.total();
+        bus.publish_on(&mirror, quantity::ENERGY, &Flux::from_faces(misplaced))
+            .unwrap();
+
+        assert!(
+            bus.peek_on(&mirror, quantity::ENERGY)
+                .unwrap()
+                .total()
+                .abs()
+                < 1e-12,
+            "the total balances, which is the whole point of the example"
+        );
+        let err = bus
+            .audit_transfers("mirror coupling", 1e-9)
+            .expect_err("a redistribution that keeps the total must still be caught");
+        assert!(err.quantity.contains("face 1"), "{err}");
+        assert!(err.quantity.contains("mirror/energy"), "{err}");
+    }
+
+    /// Two sides that do not share a discretisation are refused rather than resampled
+    /// behind the caller's back, on both the publishing and the consuming side.
+    #[test]
+    fn a_discretisation_disagreement_is_refused_at_the_bus() {
+        let coarse = Interface::uniform("mirror", 4, Area::from_si(1e-4));
+        let fine = Interface::uniform("mirror", 16, Area::from_si(0.25e-4));
+        let mut bus = Exchange::new();
+
+        // Publishing 16 faces onto a 4-face boundary.
+        let err = bus
+            .publish_on(&coarse, quantity::ENERGY, &Flux::zeros(16))
+            .expect_err("16 faces is not 4 faces");
+        assert!(err.quantity.contains("expected 4"), "{err}");
+        assert!(err.site.contains("mirror/energy"), "{err}");
+
+        // And a consumer whose own boundary is finer than what was published. Note both
+        // interfaces are named "mirror": the channel matches, the discretisation does not,
+        // and it is the face count that decides.
+        bus.publish_on(&coarse, quantity::ENERGY, &Flux::from_faces(vec![1.0; 4]))
+            .unwrap();
+        let err = bus
+            .take_on(&fine, quantity::ENERGY)
+            .expect_err("a 16-cell mesh must not read a 4-face flux");
+        assert!(err.quantity.contains("expected 16"), "{err}");
+        assert!(err.quantity.contains("found 4"), "{err}");
+
+        // A refused take consumed nothing, so the energy is still there to be found.
+        assert!((bus.peek_on(&coarse, quantity::ENERGY).unwrap().total() - 4.0).abs() < 1e-15);
+        assert_eq!(bus.total_consumed_on(&coarse, quantity::ENERGY), 0.0);
+        assert!(bus.audit_transfers("mirror", 1e-9).is_err());
+
+        // Saying it explicitly is what works, and it conserves.
+        let crossed = bus
+            .take_on(&coarse, quantity::ENERGY)
+            .unwrap()
+            .resample(&coarse, &fine)
+            .unwrap();
+        assert_eq!(crossed.faces(), 16);
+        assert!((crossed.total() - 4.0).abs() < 1e-12);
+    }
+}

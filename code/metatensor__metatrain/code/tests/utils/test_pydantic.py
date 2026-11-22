@@ -1,0 +1,276 @@
+# mypy: ignore-errors
+# Satisfying mypy in this file is hard because the fixtures
+# define different classes depending on the parametrization.
+import warnings
+from copy import deepcopy
+
+import pydantic
+import pytest
+import requests
+from pydantic import BaseModel
+from typing_extensions import TypedDict
+
+from metatrain.share.base_hypers import BaseHypers
+from metatrain.utils.architectures import preload_documentation_module
+from metatrain.utils.extenders import (
+    ExtendersHypers,
+)
+from metatrain.utils.extenders import (
+    get_default_hypers as get_extender_default_hypers,
+)
+from metatrain.utils.pydantic import (
+    MetatrainArchitectureValidationError,
+    MetatrainValidationError,
+    get_train_json_schema,
+    validate,
+    validate_architecture_options,
+    validate_base_options,
+)
+
+
+@pytest.fixture(params=["typed_dict", "pydantic_model"])
+def simple_hypers_class(request: pytest.FixtureRequest):
+    if request.param == "typed_dict":
+
+        class Hypers(TypedDict):
+            a: float = 2.0
+
+    elif request.param == "pydantic_model":
+
+        class Hypers(BaseModel):
+            a: float = 2.0
+
+    return Hypers
+
+
+@pytest.fixture(params=["typed_dict", "pydantic_model"])
+def hypers_class_with_extenders(request: pytest.FixtureRequest):
+    if request.param == "typed_dict":
+
+        @pydantic.with_config(extra="forbid", strict=True)
+        class Hypers(TypedDict):
+            a: float = 2.0
+            extenders_input: ExtendersHypers = {}
+
+    elif request.param == "pydantic_model":
+
+        class Hypers(BaseModel):
+            __config__ = pydantic.ConfigDict(extra="forbid", strict=True)
+
+            a: float = 2.0
+            extenders_input: ExtendersHypers = {}
+
+    return Hypers
+
+
+def test_validate_success(simple_hypers_class: type):
+    """Test that valid data passes validation.
+
+    :param simple_hypers_class: A simple hypers class, either a TypedDict
+    or Pydantic model.
+    """
+    data = {"a": 3.5}
+    # Should not raise an error
+    validate(simple_hypers_class, data)
+
+
+def test_validate_failure(simple_hypers_class: type):
+    """Test that invalid data raises a MetatrainValidationError.
+
+    :param simple_hypers_class: A simple hypers class, either a TypedDict or
+    Pydantic model.
+    """
+    data = {"a": "whatever"}
+    with pytest.raises(MetatrainValidationError):
+        validate(simple_hypers_class, data)
+
+
+def test_validate_architecture_options(simple_hypers_class: type):
+    """Test that architecture options validation works."""
+
+    options = {
+        "name": "dummy_architecture",
+        "model": {"a": 2.0},
+        "training": {"a": 2.0},
+    }
+
+    validate_architecture_options(
+        options, model_hypers=simple_hypers_class, trainer_hypers=simple_hypers_class
+    )
+
+
+def test_validate_architecture_options_error(simple_hypers_class: type):
+    """Test that architecture options validation returns error on wrong hypers."""
+
+    options = {
+        "name": "dummy_architecture",
+        "model": {"a": "wrong_value"},
+        "training": {"a": 2.0},
+    }
+
+    with pytest.raises(MetatrainValidationError):
+        validate_architecture_options(
+            options,
+            model_hypers=simple_hypers_class,
+            trainer_hypers=simple_hypers_class,
+        )
+
+
+def test_validate_architecture_options_warning(caplog):
+    """Test that architecture options are not validated if hypers are not validatable.
+
+    This should not fail, but should issue a warning.
+    """
+
+    class Hypers:
+        a = 2.0
+
+    options = {
+        "name": "dummy_architecture",
+        "model": {"a": False},
+        "training": {"a": 2.0},
+    }
+
+    validate_architecture_options(options, model_hypers=Hypers, trainer_hypers=Hypers)
+
+    assert "Architecture does not provide validation of hyperparameters" in caplog.text
+
+
+# ============================================================================
+# Tests for validating options with extenders
+# ============================================================================
+
+
+def test_validate_options_with_extenders(
+    simple_hypers_class: type, hypers_class_with_extenders: type
+):
+    """Test that options with extenders are validated correctly."""
+
+    options = {
+        "name": "dummy_architecture",
+        "model": {"a": 2.0},
+        "training": {
+            "a": 2.0,
+            "extenders_input": {
+                "rename": "energy",
+            },
+        },
+    }
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*Pydantic serializer.*")
+        validated = validate_architecture_options(
+            options,
+            model_hypers=simple_hypers_class,
+            trainer_hypers=hypers_class_with_extenders,
+        )
+
+    expected_hypers = {"rename": get_extender_default_hypers("rename")}
+    expected_hypers["rename"]["outputs"] = "energy"
+
+    assert validated["training"]["extenders_input"] == expected_hypers
+
+
+def test_validate_options_with_extenders_error(
+    simple_hypers_class: type, hypers_class_with_extenders: type
+):
+    """Test that options with extenders raise error on invalid hypers."""
+
+    options = {
+        "name": "dummy_architecture",
+        "model": {"a": 2.0},
+        "training": {
+            "a": 2.0,
+            "extenders_input": {
+                "rename": 123,  # Invalid type for outputs
+            },
+        },
+    }
+
+    with pytest.raises(MetatrainValidationError):
+        validate_architecture_options(
+            options,
+            model_hypers=simple_hypers_class,
+            trainer_hypers=hypers_class_with_extenders,
+        )
+
+
+# ============================================================================
+# Tests for validate_base_options with indices
+# ============================================================================
+
+
+def test_indices_only_validation_set_list():
+    """validation_set accepts indices-only config with list."""
+    config = {
+        "architecture": {"name": "soap_bpnn"},
+        "training_set": {"systems": "data.xyz", "targets": {"energy": {"key": "E"}}},
+        "validation_set": {"indices": [0, 1, 2]},
+    }
+    validate_base_options(config)  # should not raise
+
+
+def test_indices_only_validation_set_string():
+    """validation_set accepts indices-only config with file path."""
+    config = {
+        "architecture": {"name": "soap_bpnn"},
+        "training_set": {"systems": "data.xyz", "targets": {"energy": {"key": "E"}}},
+        "validation_set": {"indices": "indices.txt"},
+    }
+    validate_base_options(config)  # should not raise
+
+
+def test_indices_in_full_dataset_config():
+    """Dataset config accepts optional indices field."""
+    config = {
+        "architecture": {"name": "soap_bpnn"},
+        "training_set": {
+            "systems": "data.xyz",
+            "targets": {"energy": {"key": "E"}},
+            "indices": [0, 1, 2, 3],
+        },
+        "validation_set": 0.1,
+    }
+    validate_base_options(config)  # should not raise
+
+
+def test_validation_error_doc_link():
+    error_cls = MetatrainArchitectureValidationError.for_architecture("pet")
+
+    error = error_cls(model=None, errors=[])
+
+    modelhypers_link = error.architecture_link("ModelHypers")
+    trainerhypers_link = error.architecture_link("TrainerHypers")
+
+    # Check that links are reachable.
+    # This does not check that the fragment identifier (thing after #)
+    # exists, but it is the best we can do without parsing the HTML.
+    for link in [modelhypers_link, trainerhypers_link]:
+        response = requests.head(link)
+        assert response.status_code == 200, f"Link {link} is not reachable"
+
+
+def test_get_train_json_schema():
+    """Test that get_train_json_schema returns a valid JSON schema.
+
+    Also check that the hypers classes have not gotten their annotations
+    modified by the schema generation process.
+    """
+    pet_docs = preload_documentation_module("pet")
+    pet_model_hypers = pet_docs.ModelHypers
+    pet_trainer_hypers = pet_docs.TrainerHypers
+    old_model_annotations = deepcopy(pet_model_hypers.__annotations__)
+    pet_trainer_annotations = deepcopy(pet_trainer_hypers.__annotations__)
+    base_old_annotations = deepcopy(BaseHypers.__annotations__)
+
+    schema = get_train_json_schema(allow_missing_hypers=True)
+
+    assert isinstance(schema, dict)
+    assert "properties" in schema
+    assert "architecture" in schema["properties"]
+
+    # Check that the hypers classes have not gotten their annotations
+    # modified by the schema generation process.
+    assert pet_model_hypers.__annotations__ == old_model_annotations
+    assert pet_trainer_hypers.__annotations__ == pet_trainer_annotations
+    assert BaseHypers.__annotations__ == base_old_annotations

@@ -1,0 +1,522 @@
+"""Create and manage CNS all-atom topology.
+
+The ``[topoaa]`` module is dedicated to the generation of CNS compatible
+parameters (.param) and topologies (.psf) for each of the input structures.
+
+It will:
+- Detect missing atoms, including hydrogens
+- Re-build them when missing
+- Build and write out topologies (psf) and coordinates (pdb) files
+
+This module is a pre-requisite to run any downstream modules using CNS.
+Having access to parameters and topology is mandatory for any kind
+of EM/MD related tasks.
+Therefore this is the reason why the module [topoaa] is often used as first
+module in a workflow.
+
+Note that for non-standard bio-molecules
+(apart from standard amino-acids, some modified ones, DNA, RNA, ions
+and carbohydrates ... see `detailed list of supported molecules
+<https://wenmr.science.uu.nl/haddock2.4/library>`_),
+such as small-molecules, parameters and topology are required.
+By default (`autotoppar = true`), they are generated on-the-fly with PRODRG
+for every unknown residue; the run stops with an error if PRODRG fails or is
+not available.
+They can also be provided by the user, using the `ligand_param_fname` and
+`ligand_top_fname` parameters, in which case PRODRG is not run.
+Set `autotoppar = false` to skip the generation; unknown residues are then
+removed from the models.
+
+To define specific parameters for a given molecule (charge of terminis,
+histidine protonations, peptide cyclisation, ...), you should re-define
+a quasi topoaa module and specify the molecule index, right after
+the ``[topoaa]`` module. e.g.:
+
+``
+[topoaa]
+[topoaa.mol1]
+``
+
+For more details about this module, please `refer to the haddock3 user manual
+<https://www.bonvinlab.org/haddock3-user-manual/modules/topology.html#topoaa-module>`_
+"""
+
+import operator
+import os
+import re
+from copy import deepcopy
+from functools import partial
+from pathlib import Path
+
+from haddock.core.defaults import MODULE_DEFAULT_YAML, cns_exec
+from haddock.core.typing import FilePath, Optional, ParamDict, ParamMap, Union
+from haddock.libs import libligand, libpdb
+from haddock.libs.libcns import (
+    find_desired_linkfiles,
+    generate_default_header,
+    load_workflow_params,
+    prepare_output,
+    prepare_single_input,
+)
+from haddock.libs.libontology import Format, PDBFile, TopologyFile
+from haddock.libs.libstructure import make_molecules
+from haddock.libs.libsubprocess import CNSJob
+from haddock.modules import get_engine
+from haddock.modules.base_cns_module import BaseCNSModule
+
+
+RECIPE_PATH = Path(__file__).resolve().parent
+DEFAULT_CONFIG = Path(RECIPE_PATH, MODULE_DEFAULT_YAML)
+
+
+def generate_topology(
+    input_pdb: Path,
+    recipe_str: str,
+    defaults: ParamMap,
+    mol_params: ParamMap,
+    default_params_path: Optional[FilePath] = None,
+    write_to_disk: Optional[bool] = True,
+) -> Union[Path, str]:
+    """Generate a HADDOCK topology file from input_pdb."""
+    # generate params headers
+    general_param = load_workflow_params(**defaults)
+    input_mols_params = load_workflow_params(param_header="", **mol_params)
+    general_param = general_param + input_mols_params
+
+    # generate default headers
+    _link, trans_vec, tensor, scatter, axis, water_box = generate_default_header(
+        path=default_params_path
+    )
+
+    output = prepare_output(
+        output_pdb_filename=f"{input_pdb.stem}_haddock{input_pdb.suffix}",
+        output_psf_filename=f"{input_pdb.stem}_haddock.{Format.TOPOLOGY}",
+    )
+
+    input_str = prepare_single_input(str(input_pdb))
+    # Order CNS statements
+    inp_parts = (
+        general_param,
+        input_str,
+        output,
+        trans_vec,
+        tensor,
+        scatter,
+        axis,
+        water_box,
+        recipe_str,
+    )
+    # Combine all CNS statments as a single string
+    inp = "".join(inp_parts)
+
+    if write_to_disk:
+        output_inp_filename = Path(f"{input_pdb.stem}.{Format.CNS_INPUT}")
+        output_inp_filename.write_text(inp)
+        return output_inp_filename
+    else:
+        return inp
+
+
+class HaddockModule(BaseCNSModule):
+    """HADDOCK3 module to create CNS all-atom topologies."""
+
+    name = RECIPE_PATH.name
+
+    def __init__(
+        self, order: int, path: Path, initial_params: FilePath = DEFAULT_CONFIG
+    ) -> None:
+        cns_script = RECIPE_PATH / "cns" / "generate-topology.cns"
+        super().__init__(order, path, initial_params, cns_script=cns_script)
+
+    @classmethod
+    def confirm_installation(cls) -> None:
+        """Confirm if module is installed."""
+        return
+
+    @staticmethod
+    def get_md5(ensemble_f: FilePath) -> dict[int, str]:
+        """Get MD5 hash of a multi-model PDB file."""
+        md5_dic: dict[int, str] = {}
+        text = Path(ensemble_f).read_text()
+        lines = text.split(os.linesep)
+        REMARK_lines = (line for line in lines if line.startswith("REMARK"))
+        remd5 = re.compile(r"^[a-f0-9]{32}$")
+        for line in REMARK_lines:
+            parts = line.strip().split()
+
+            try:
+                idx = parts.index("MODEL")
+            except ValueError:  # MODEL not in parts, this line can be ignored
+                continue
+
+            # check if there's a md5 hash in line
+            for part in parts:
+                group = remd5.fullmatch(part)
+                if group:
+                    # the model num comes after the MODEL
+                    model_num = int(parts[idx + 1])
+                    md5_dic[model_num] = group.string  # md5 hash
+                    break
+
+        return md5_dic
+
+    @staticmethod
+    def get_ensemble_origin(ensemble_f: FilePath) -> dict[int, str]:
+        """Try to find origin for each model in ensemble.
+
+        Parameters
+        ----------
+        ensemble_f : FilePath
+            Path to a pdb file containing an ensemble.
+
+        Returns
+        -------
+        origin_dic : dict[int, str]
+            Dictionary holding as keys the modelID and values its origin.
+        """
+        origin_dic: dict[int, str] = {}
+        text = Path(ensemble_f).read_text()
+        lines = text.split(os.linesep)
+        REMARK_lines = (line for line in lines if line.startswith("REMARK"))
+        re_origin = re.compile(
+            r"REMARK\s+MODEL\s+(\d+)\s+(FROM|from|From)\s+(([\w_-]+\.?)+)"
+        )
+        for line in REMARK_lines:
+            if match := re_origin.search(line):
+                model_num = int(match.group(1).strip())
+                original_path = match.group(3).strip()
+                original_name = Path(original_path).stem
+                origin_dic[model_num] = original_name
+        return origin_dic
+
+    def _warn_discarded_residues(
+        self,
+        model: Path,
+        custom_topology: Optional[FilePath] = None,
+    ) -> None:
+        """Warn about the unknown residues that will be removed from a model.
+
+        Parameters
+        ----------
+        model : Path
+            PDB file of the model.
+        custom_topology : Optional[FilePath]
+            User-provided topology, whose residues are not unknown.
+        """
+        unknown = libligand.identify_unknown_hetatms(model)
+        if custom_topology:
+            known = set(libpdb.get_supported_residues(custom_topology))
+            unknown = [resname for resname in unknown if resname not in known]
+        if not unknown:
+            return
+        ion_hint = libligand.ion_naming_hint(model, unknown)
+        in_chain = libligand.find_chain_residues(model, unknown)
+        chain_note = (
+            f"Removing these residues breaks their polymer chain: {', '.join(in_chain)}"
+        )
+        linked_sugars = libligand.find_linked_sugars(model, unknown)
+        sugar_note = (
+            "Removing these sugars breaks their glycosidic bonds: "
+            f"{'; '.join(linked_sugars)}"
+        )
+        self.log(
+            f"Unknown residue(s) {', '.join(unknown)} in {model.name} have no "
+            "topology and are removed from the model."
+            + (f"\n{chain_note}" if in_chain else "")
+            + (f"\n{sugar_note}" if linked_sugars else "")
+            + (f"\n{ion_hint}" if ion_hint else ""),
+            level="warning",
+        )
+
+    def _run(self) -> None:
+        """Execute module."""
+        if self.order == 0:
+            # topoaa is the first step in the workflow
+            molecules = make_molecules(self.params.pop("molecules"))
+
+        else:
+            # in case topoaa is not the first step, the topology is rebuilt for
+            # each retrieved model
+            _molecules = self.previous_io.retrieve_models()
+            molecules_paths: list[Path] = [mol.rel_path for mol in _molecules]  # type: ignore
+            molecules = make_molecules(molecules_paths, no_parent=True)
+
+        # extracts `input` key from params. The `input` keyword needs to
+        # be treated separately
+        mol_params: ParamDict = {}
+        for k in list(self.params.keys()):
+            if k.startswith("mol") and k[3:].isdigit():
+                mol_params[k] = self.params.pop(k)
+
+        # to facilitate the for loop down the line, we create a list with the
+        #  keys of `mol_params` with inverted order (we will use .pop)
+        mol_params_keys = list(mol_params.keys())[::-1]
+
+        # limit is only useful when order == 0
+        if self.order == 0 and self.params["limit"]:
+            mol_params_get = mol_params_keys.pop
+
+        # `else` is used in any case where limit is False.
+        else:
+            mol_params_get = partial(operator.getitem, mol_params_keys, -1)
+
+        # Pool of jobs to be executed by the CNS engine
+        jobs: list[CNSJob] = []
+
+        # Dictionary to store ligand files for each model
+        model_ligand_files: dict[str, tuple[Path, Path]] = {}
+
+        models_dic: dict[int, list[Path]] = {}
+        ens_dic: dict[int, dict[int, str]] = {}
+        origi_ens_dic: dict[int, dict[int, str]] = {}
+        for i, molecule in enumerate(molecules, start=1):
+            self.log(f"Molecule {i}: {molecule.file_name.name}")
+            models_dic[i] = []
+            # Copy the molecule to the step folder
+
+            # Split models
+            self.log(
+                f"Split models if needed for {molecule.with_parent}",
+                level="debug",
+            )
+            # these come already sorted
+            splited_models = libpdb.split_ensemble(
+                molecule.with_parent,
+                dest=Path.cwd(),
+            )
+
+            # get the MD5 hash of each model
+            ens_dic[i] = self.get_md5(molecule.with_parent)
+            origi_ens_dic[i] = self.get_ensemble_origin(molecule.with_parent)
+            # nice variable name, isn't it? :-)
+            # molecule parameters are shared among models of the same molecule
+            parameters_for_this_molecule = deepcopy(mol_params[mol_params_get()])
+
+            # Extract termini parameters
+            charged_nter = parameters_for_this_molecule.pop("charged_nter")
+            charged_cter = parameters_for_this_molecule.pop("charged_cter")
+            phosphate_5 = parameters_for_this_molecule.pop("5_phosphate")
+            self.log(
+                f"Termini of molecule {i}:{os.linesep}"
+                f" N-ter: {'un' if not charged_nter else ''}charged"
+                f" C-ter: {'un' if not charged_cter else ''}charged"
+                f" 5'phosphate: {'yes' if phosphate_5 else 'no'}"
+            )
+            # Find appropriate link files for this molecule
+            link_files = find_desired_linkfiles(
+                charged_nter=charged_nter,
+                charged_cter=charged_cter,
+                phosphate_5=phosphate_5,
+                path=self.toppar_path,
+            )
+            # Update molecule parameters with full path to link files
+            parameters_for_this_molecule.update(link_files)
+
+            # Loop over molecules conformations
+            for _task_id, model in enumerate(splited_models):
+                self.log(f"Sanitizing molecule {model.name}")
+                models_dic[i].append(model)
+                # rename first, so that e.g. TPO is not reported as unknown
+                selenocysteines = libpdb.rename_residues(model)
+                if selenocysteines:
+                    self.log(
+                        f"Selenocysteine(s) in {model.name} converted to cysteine "
+                        f"(SE renamed to SG): {'; '.join(selenocysteines)}. "
+                        "HADDOCK3 has no selenocysteine; its own SEC residue is a "
+                        "serine variant for covalent docking.",
+                        level="warning",
+                    )
+
+                if self.params["ligand_top_fname"]:
+                    custom_top = self.params["ligand_top_fname"]
+                    self.log(f"Using custom topology {custom_top}")
+                    self._warn_discarded_residues(model, custom_top)
+                    libpdb.sanitize(
+                        model,
+                        overwrite=True,
+                        custom_topology=custom_top,
+                    )
+                    _params = self.params
+
+                elif self.params["autotoppar"]:
+                    # No `ligand_top_fname` was provided, check if there are any unknown molecules
+                    unknown = libligand.identify_unknown_hetatms(model)
+                    if unknown:
+                        # prodrg treats each residue as a free molecule, so it
+                        # cannot handle residues that are part of a chain
+                        in_chain = libligand.find_chain_residues(model, unknown)
+                        if in_chain:
+                            self.finish_with_error(
+                                "Unknown residue(s) inside a polymer chain in "
+                                f"{model.name}: {', '.join(in_chain)}.\n"
+                                "PRODRG cannot generate their topology together "
+                                "with the bonds to the rest of the chain. Use a "
+                                "supported residue name (see "
+                                f"{libligand.SUPPORTED_DOC_URL}), mutate them to "
+                                "their parent residue, or provide their topology, "
+                                "parameters and links yourself."
+                            )
+                        linked_sugars = libligand.find_linked_sugars(model, unknown)
+                        if linked_sugars:
+                            self.finish_with_error(
+                                f"Unknown sugar(s) in {model.name}: "
+                                f"{'; '.join(linked_sugars)}.\n"
+                                "PRODRG cannot generate their topology together "
+                                "with their glycosidic bonds. Check whether they "
+                                "are supported under another name (see "
+                                f"{libligand.SUPPORTED_DOC_URL}#supported-"
+                                "carbohydrates) and rename them, remove them "
+                                "(and the sugars attached beyond them), or "
+                                "provide their topology, parameters and linkage "
+                                "patches yourself."
+                            )
+                        self.log(
+                            f"Unknown ligand(s) {unknown} detected, "
+                            "running PRODRG to generate topology"
+                        )
+                        top_path = ""
+                        par_path = ""
+                        try:
+                            top_path, par_path = libligand.run_prodrg(
+                                model, Path("."), ligand_resnames=unknown
+                            )
+                        except RuntimeError as e:
+                            ion_hint = libligand.ion_naming_hint(model, unknown)
+                            self.finish_with_error(
+                                "PRODRG could not generate the topology and "
+                                "parameters for the unknown residue(s) "
+                                f"{', '.join(unknown)} in {model.name}.\n{e}\n"
+                                + (f"{ion_hint}\n" if ion_hint else "")
+                                + "Either provide them with `ligand_top_fname` and "
+                                "`ligand_param_fname`, remove these residues from "
+                                "the input, or set `autotoppar = false` to discard "
+                                "them."
+                            )
+                        # Inject the automated toppar into the params for module
+                        _params = {
+                            **self.params,
+                            "ligand_top_fname": top_path,
+                            "ligand_param_fname": par_path,
+                        }
+
+                        # Store ligand files for this specific model
+                        model_ligand_files[model.stem] = (top_path, par_path)
+
+                        # Only set global output params if this is a single model (not ensemble)
+                        # For ensembles, we'll store the files per-model in the PDBFile objects
+
+                        # NOTE: In CNS input generation, PDBFile ligand files take precedence over global params,
+                        # so this ensures backward compatibility, but may be removed in the future
+                        if len(splited_models) == 1:
+                            # Overwrite `ligand_top_fname` and `ligand_param_fname` in the following modules
+                            #  this means that if these were NOT defined in other modules, they will take the
+                            #  values defined here
+                            self._output_params["ligand_top_fname"] = top_path
+                            self._output_params["ligand_param_fname"] = par_path
+
+                        libpdb.sanitize(model, overwrite=True, custom_topology=top_path)
+                    else:
+                        self.log("No unknown atoms found")
+                        libpdb.sanitize(model, overwrite=True)
+                        _params = self.params
+                else:
+                    self._warn_discarded_residues(model)
+                    libpdb.sanitize(model, overwrite=True)
+                    _params = self.params
+
+                # Prepare generation of topologies jobs
+                topoaa_input = generate_topology(
+                    model,
+                    self.recipe_str,
+                    _params,
+                    parameters_for_this_molecule,
+                    default_params_path=self.toppar_path,
+                    write_to_disk=self.params["debug"],
+                )
+
+                self.log("Topology CNS input created")
+
+                # Add new job to the pool
+                output_filename = Path(f"{model.stem}.{Format.CNS_OUTPUT}")
+                err_fname = f"{model.stem}.cnserr"
+                job = CNSJob(
+                    topoaa_input,
+                    output_filename,
+                    err_fname,
+                    envvars=self.envvars,
+                    cns_exec=cns_exec,
+                )
+
+                jobs.append(job)
+
+        # Run CNS Jobs
+        self.log(f"Running CNS Jobs n={len(jobs)}")
+        Engine = get_engine(self.params["mode"], self.params)
+        engine = Engine(jobs)
+        engine.run()
+        self.log("CNS jobs have finished")
+
+        # Check for generated output, fail it not all expected files
+        #  are found
+        expected: dict[int, dict[int, PDBFile]] = {}
+        for i in models_dic:
+            expected[i] = {}
+            md5_dic = ens_dic[i]
+            origin_names = origi_ens_dic[i]
+            for j, model in enumerate(models_dic[i]):
+                md5_hash = None
+                try:
+                    model_id = int(model.stem.split("_")[-1])
+                except ValueError:
+                    model_id = 0
+
+                if model_id in md5_dic:
+                    md5_hash = md5_dic[model_id]
+
+                model_name = model.stem
+                processed_pdb = Path(f"{model_name}_haddock.{Format.PDB}")
+                processed_topology = Path(f"{model_name}_haddock.{Format.TOPOLOGY}")
+
+                # Check if origin or md5 is available
+                if md5_hash or model_id in origin_names.keys():
+                    # Select prefix
+                    if md5_hash:
+                        prefix_name = md5_hash
+                    else:
+                        prefix_name = origin_names[model_id]
+                    # Check if topology and file created
+                    if processed_pdb.exists() and processed_topology.exists():
+                        # Build new filename
+                        model_name = f"{prefix_name}_from_{model_name}"
+                        # Rename files
+                        processed_pdb = processed_pdb.rename(
+                            f"{model_name}_haddock.{Format.PDB}"
+                        )
+                        processed_topology = processed_topology.rename(
+                            f"{model_name}_haddock.{Format.TOPOLOGY}"
+                        )
+
+                topology = TopologyFile(processed_topology, path=".")
+
+                # Get ligand files for this model if they exist
+                ligand_top_fname = None
+                ligand_param_fname = None
+                if model.stem in model_ligand_files:
+                    ligand_top_fname, ligand_param_fname = model_ligand_files[
+                        model.stem
+                    ]
+
+                pdb = PDBFile(
+                    file_name=processed_pdb,
+                    topology=topology,
+                    path=".",
+                    md5=md5_hash,
+                    ligand_top_fname=ligand_top_fname,
+                    ligand_param_fname=ligand_param_fname,
+                )
+                pdb.ori_name = model.stem
+                expected[i][j] = pdb
+
+        # Save module information
+        self.output_models = list(expected.values())  # type: ignore
+        self.export_io_models(faulty_tolerance=self.params["tolerance"])

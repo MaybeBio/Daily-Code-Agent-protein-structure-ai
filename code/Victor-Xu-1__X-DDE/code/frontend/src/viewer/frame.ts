@@ -1,0 +1,504 @@
+import * as mol from "3dmol";
+import { focusedViewScale } from "./appearance";
+import { currentLigandAspect, LigandFraming } from "./ligand-framing";
+import { nativeLabelLayer } from "./native-labels";
+import { molecularRecordText } from "../presentation/molecular-record";
+import {
+  complexLigandModel,
+  viewerLoad,
+  type ViewerLoad,
+} from "./source-layout";
+import { MolecularScene } from "./scene";
+import { structureBytes } from "./structure-bytes";
+import { mapNativeConfidence } from "./confidence-mapping";
+import type { ConfidenceBinding } from "./confidence-types";
+import { displayCommands } from "./display-readiness";
+import { inputChargesDeclared } from "./charge-surface";
+import { validSource } from "./protocol";
+import { spatialMolecule } from "./initial-geometry";
+import { retainModifiedPolymer } from "./modified-polymer";
+import { initializeTheme } from "../theme";
+import { searchBoxGeometry } from "./search-box";
+import "./frame.css";
+import { captureView, captureFigure } from "./capture";
+import { validFigure } from "../publication/settings";
+import { isCameraSnapshot } from "./structure-camera";
+import { potentialData } from "./scientific-overlay";
+import { defaultPotentialRange, isPotentialRange } from "./potential-range";
+import {
+  resizeZoomFactor,
+  viewportFitFactor,
+  type ViewportSize,
+} from "./camera-resize";
+initializeTheme();
+const background = () =>
+  getComputedStyle(document.documentElement)
+    .getPropertyValue("--chart-bg")
+    .trim();
+const viewer = mol.createViewer(document.getElementById("molecule")!, {
+  backgroundColor: background(),
+  antialias: true,
+});
+viewer.setViewChangeCallback(() => nativeLabelLayer(viewer).layout());
+new MutationObserver(() => {
+  viewer.setBackgroundColor(background(), 1);
+  viewer.render();
+}).observe(document.documentElement, {
+  attributes: true,
+  attributeFilter: ["data-theme"],
+});
+let previousViewport: ViewportSize | null = null;
+let ligandFraming: LigandFraming | undefined;
+function adaptCameraSize(previous: ViewportSize, next: ViewportSize) {
+  const factor = resizeZoomFactor(
+    previous,
+    next,
+    ligandFraming?.resizeAspect(),
+  );
+  const tolerance = ligandFraming ? 0 : 0.001;
+  if (Math.abs(factor - 1) > tolerance) viewer.zoom(factor);
+}
+new ResizeObserver(([entry]) => {
+  const next = {
+    width: entry.contentRect.width,
+    height: entry.contentRect.height,
+  };
+  viewer.resize();
+  if (
+    previousViewport &&
+    next.width > 0 &&
+    next.height > 0 &&
+    viewer.getModel(0)
+  )
+    adaptCameraSize(previousViewport, next);
+  if (next.width > 0 && next.height > 0) previousViewport = next;
+  viewer.render();
+}).observe(document.getElementById("molecule")!);
+const instanceId = crypto.randomUUID();
+function notify(type: string, detail: unknown = {}) {
+  window.parent.postMessage(
+    { channel: "opendde-viewer", type, detail },
+    location.origin,
+  );
+}
+let focusedChainView = false;
+let hiddenChainIds: string[] = [];
+const scene = new MolecularScene(
+  viewer,
+  (type, detail) => {
+    if (type === "chain-display") hiddenChainIds = detail as string[];
+    notify(type, detail);
+  },
+  () => document.getElementById("molecule")!.getBoundingClientRect(),
+);
+let controller: AbortController | null = null,
+  generation = 0;
+let loadedSourceIdentity: string | null = null;
+let loadedTrajectoryKey: string | undefined;
+let confidenceSource: { url: string; sha256: string; text: string } | null =
+  null;
+let confidenceRevision = 0;
+function reset() {
+  const viewport = document.getElementById("molecule")!.getBoundingClientRect();
+  const visible = focusedChainView
+    ? scene.info.chains.filter((chain) => !hiddenChainIds.includes(chain))
+    : [];
+  viewer.zoomTo(
+    visible.length
+      ? { model: 0, predicate: (atom) => visible.includes(atom.chain ?? "") }
+      : {},
+  );
+  const fit = visible.length && hiddenChainIds.length ? 1.05 : 0.85;
+  if (!ligandFraming?.fit()) viewer.zoom(fit * viewportFitFactor(viewport));
+  if (viewport.width > 0 && viewport.height > 0)
+    previousViewport = { width: viewport.width, height: viewport.height };
+  viewer.render();
+}
+async function load(input: ViewerLoad) {
+  const { urls } = input;
+  const sourceIdentity = JSON.stringify({
+    urls,
+    records: input.records,
+    comparison: input.comparison,
+    checksums: input.structureChecksums,
+  });
+  const retainedView =
+    ((input.channelGeometry || input.searchBox) &&
+      loadedSourceIdentity === sourceIdentity) ||
+    (input.trajectoryKey &&
+      loadedTrajectoryKey === input.trajectoryKey &&
+      loadedSourceIdentity)
+      ? viewer.getView()
+      : undefined;
+  const retainedOptions =
+    input.trajectoryKey && retainedView ? { ...scene.options } : undefined;
+  loadedSourceIdentity = null;
+  confidenceSource = null;
+  confidenceRevision++;
+  controller?.abort();
+  controller = new AbortController();
+  const request = controller,
+    current = ++generation;
+  focusedChainView = false;
+  hiddenChainIds = [];
+  ligandFraming = undefined;
+  scene.resetState();
+  notify("loading");
+  viewer.clear();
+  try {
+    let molecular = false;
+    const formats: string[] = [];
+    const inputCharges: boolean[] = [];
+    for (const [sourceIndex, raw] of urls.entries()) {
+      const response = await fetch(validSource(raw, location.origin), {
+        signal: request.signal,
+      });
+      const { text, sha256 } = await structureBytes(response);
+      if (current !== generation) return;
+      const expected =
+        input.structureChecksums?.[sourceIndex] ??
+        input.expectedStructureSha256;
+      if (expected && sha256 !== expected)
+        throw new Error("Reviewed structure checksum mismatch.");
+      const source = validSource(raw, location.origin);
+      const suffix =
+        response.headers.get("X-Structure-Format") ||
+        source.searchParams.get("name")?.split(".").pop()?.toLowerCase() ||
+        "cif";
+      if (!["pdb", "cif", "sdf", "mol", "mol2"].includes(suffix))
+        throw new Error("Unsupported molecular display format");
+      const format = suffix;
+      if (urls.length === 1 && format === "cif" && !input.records?.[0])
+        confidenceSource = { url: raw, sha256, text };
+      formats.push(format);
+      molecular = urls.length === 1 && ["sdf", "mol", "mol2"].includes(format);
+      const record = molecularRecordText(
+        text,
+        input.records?.[sourceIndex] ?? 0,
+        format,
+      );
+      if (["sdf", "mol", "mol2"].includes(format)) {
+        if (urls.length === 1 && !input.initialPosePrepared) {
+          notify("initial-pose-required");
+          return;
+        }
+      }
+      inputCharges.push(inputChargesDeclared(record, format));
+      const model = viewer.addModel(record, format);
+      await retainModifiedPolymer(
+        model,
+        record,
+        format,
+        input.cifAuthorResidues,
+      );
+      if (current !== generation) return;
+      if (
+        ["sdf", "mol", "mol2"].includes(format) &&
+        !spatialMolecule(
+          model.selectedAtoms({}),
+          /\b3D\b/.test(record.split(/\r?\n/)[1] ?? ""),
+        )
+      ) {
+        viewer.clear();
+        throw new Error(
+          "This ligand has only 2D coordinates. Prepare and dock a 3D pose before displaying it with a receptor.",
+        );
+      }
+      if (!model.selectedAtoms({}).length)
+        throw new Error("No atoms were found in the structure");
+    }
+    scene.inspect(
+      urls.length > 1,
+      molecular,
+      formats,
+      complexLigandModel(formats, input),
+      inputCharges,
+    );
+    scene.nativeInteractions = input.nativeInteractions;
+    if (input.ligandContext === false) {
+      scene.options.interactions = false;
+      scene.options.mode = "cartoon";
+    }
+    if (input.initialMode) {
+      scene.options.mode = input.initialMode;
+      if (input.initialMode === "cartoon") scene.options.labels = false;
+    }
+    if (retainedOptions) Object.assign(scene.options, retainedOptions);
+    scene.channelGeometry = input.channelGeometry;
+    scene.searchBox = input.searchBox;
+    if (input.channelGeometry) {
+      scene.options.mode = "cartoon";
+      scene.options.labels = false;
+    }
+    if (input.electrostaticMap) {
+      const response = await fetch(
+        validSource(input.electrostaticMap.url, location.origin),
+        { signal: request.signal },
+      );
+      if (
+        !response.ok ||
+        Number(response.headers.get("Content-Length")) > 35000000
+      )
+        throw new Error("Potential map could not be loaded");
+      const text = await response.text();
+      if (text.length > 35000000) throw new Error("Potential map is too large");
+      if (current !== generation) return;
+      scene.potential = {
+        data: potentialData(text),
+        range: input.electrostaticMap.range ?? defaultPotentialRange,
+      };
+      scene.options.mode = "surface";
+    }
+    const selectedChains = input.initialChains;
+    if (
+      selectedChains?.every((chain) =>
+        scene.info.residues.some((residue) => residue.chain === chain),
+      )
+    ) {
+      focusedChainView = true;
+      await scene.displayChains({ action: "subset", chains: selectedChains });
+    } else {
+      await scene.paint();
+    }
+    if (current !== generation) return;
+    ligandFraming =
+      molecular &&
+      !input.comparison &&
+      !input.trajectoryKey &&
+      !input.channelGeometry &&
+      !input.searchBox &&
+      !input.electrostaticMap
+        ? new LigandFraming(viewer)
+        : undefined;
+    reset();
+    if (retainedView) viewer.setView(retainedView);
+    else if (scene.channelGeometry) scene.focusChannel();
+    loadedSourceIdentity = sourceIdentity;
+    loadedTrajectoryKey = input.trajectoryKey;
+    if (
+      !retainedView &&
+      scene.options.mode === "pocket" &&
+      !scene.channelGeometry
+    )
+      scene.focusLigand();
+    notify("loaded", {
+      ...scene.info,
+      options: scene.options,
+      hiddenChains: hiddenChainIds,
+      potentialRange: scene.potential?.range,
+    });
+  } catch (error) {
+    if (!request.signal.aborted && current === generation) {
+      viewer.clear();
+      viewer.render();
+      notify("error", String(error));
+    }
+  }
+}
+async function command(type: string, value: unknown, requestId?: string) {
+  const current = generation;
+  try {
+    if (type === "confidence-selection") await scene.selectConfidence(value);
+    if (type === "confidence") {
+      const revision = ++confidenceRevision;
+      // Optional annotations must never turn a readable protein into a fatal blank view.
+      try {
+        await scene.annotateConfidence(null);
+        const mapped =
+          value && confidenceSource && !scene.isOverlay
+            ? await mapNativeConfidence(
+                value as ConfidenceBinding,
+                confidenceSource,
+                viewer.selectedAtoms({ model: 0 }),
+              )
+            : null;
+        if (current !== generation || revision !== confidenceRevision) return;
+        await scene.annotateConfidence(mapped);
+      } catch {
+        if (current !== generation || revision !== confidenceRevision) return;
+        await scene.annotateConfidence(null);
+        notify("confidence-unavailable");
+      }
+    }
+    if (type === "chain-display") {
+      await scene.displayChains(value);
+      const action = (value as { action?: string }).action;
+      if (
+        current === generation &&
+        focusedChainView &&
+        (action === "all" || action === "subset")
+      )
+        reset();
+    }
+    if (type === "sequence-selection") await scene.selectSequence(value);
+    if (type === "options" && value && typeof value === "object")
+      await scene.configure(value);
+    if (type === "selection-action" && typeof value === "string")
+      await scene.action(value);
+    if (type === "residue" && typeof value === "string")
+      await scene.selectResidue(value);
+    if (type === "atom-region") await scene.highlightAtoms(value);
+    if (type === "site-region") await scene.highlightResidues(value);
+    if (type === "focus-site") scene.focusSite();
+    if (type === "attachment-geometry") await scene.showAttachments(value);
+    if (
+      type === "potential-range" &&
+      scene.potential &&
+      isPotentialRange(value)
+    ) {
+      await scene.setPotentialRange(value);
+      if (current === generation) notify("potential-range", value);
+    }
+    if (type === "search-box") {
+      scene.searchBox = searchBoxGeometry(value);
+      await scene.paint();
+    }
+  } catch {
+    notify("error", "Could not update structure display.");
+  } finally {
+    if (current === generation && requestId)
+      notify("display-complete", requestId);
+  }
+}
+window.addEventListener("message", (event) => {
+  if (
+    event.origin !== location.origin ||
+    event.source !== window.parent ||
+    event.data?.channel !== "opendde-viewer"
+  )
+    return;
+  const { type, value, requestId } = event.data;
+  if (type === "ready-request") notify("ready", { instanceId });
+  if (
+    loadedSourceIdentity &&
+    type === "camera-read" &&
+    typeof value === "string" &&
+    /^[0-9a-f-]{36}$/.test(value)
+  ) {
+    const { width, height } = document
+      .getElementById("molecule")!
+      .getBoundingClientRect();
+    const snapshot = { camera: viewer.getView(), viewport: { width, height } };
+    notify(
+      "camera",
+      isCameraSnapshot(snapshot) ? { id: value, ...snapshot } : { id: value },
+    );
+  }
+  if (
+    loadedSourceIdentity &&
+    type === "camera-apply" &&
+    isCameraSnapshot(value)
+  ) {
+    const bounds = document.getElementById("molecule")!.getBoundingClientRect();
+    viewer.setView([...value.camera]);
+    adaptCameraSize(value.viewport, bounds);
+  }
+  if (type === "clear") {
+    confidenceSource = null;
+    confidenceRevision++;
+    loadedSourceIdentity = null;
+    controller?.abort();
+    generation++;
+    focusedChainView = false;
+    hiddenChainIds = [];
+    ligandFraming = undefined;
+    scene.resetState();
+    viewer.clear();
+    viewer.render();
+  }
+  if (type === "load") {
+    try {
+      void load(viewerLoad(value));
+    } catch {
+      notify("error", "Invalid structure request.");
+    }
+  }
+  if (displayCommands.includes(type))
+    void command(
+      type,
+      value,
+      typeof requestId === "string" && /^[0-9a-f-]{36}$/.test(requestId)
+        ? requestId
+        : undefined,
+    );
+  if (
+    type === "focus-model" &&
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value < 3 &&
+    viewer.getModel(value)
+  ) {
+    scene.focusModel(value);
+  }
+  if (
+    type === "focus-models" &&
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.length <= 3 &&
+    new Set(value).size === value.length &&
+    value.every(
+      (index) =>
+        Number.isInteger(index) &&
+        index >= 0 &&
+        index < 3 &&
+        viewer.getModel(index),
+    )
+  ) {
+    viewer.zoomTo({ model: value });
+    viewer.zoom(focusedViewScale);
+    viewer.render();
+  }
+  if (type === "reset") reset();
+  const capture = typeof value === "string" ? { id: value, scale: 1 } : value;
+  if (
+    type === "snapshot" &&
+    capture &&
+    typeof capture === "object" &&
+    typeof capture.id === "string" &&
+    /^[0-9a-f-]{36}$/.test(capture.id) &&
+    ("figure" in capture
+      ? validFigure(capture.figure)
+      : [1, 2, 3].includes(capture.scale)) &&
+    viewer.getModel(0)
+  ) {
+    try {
+      notify("snapshot", {
+        id: capture.id,
+        png: validFigure(capture.figure)
+          ? captureFigure(
+              viewer,
+              document.getElementById("molecule")!,
+              capture.figure,
+              capture.pixels,
+              ligandFraming ? currentLigandAspect(viewer) : undefined,
+            )
+          : captureView(
+              viewer,
+              document.getElementById("molecule")!,
+              capture.scale,
+            ),
+      });
+    } catch {
+      notify("snapshot", { id: capture.id, png: null });
+    }
+  }
+  if (type === "focus-ligand") scene.focusLigand();
+  if (type === "focus-channel") scene.focusChannel();
+  if (type === "zoom") {
+    viewer.zoom(value === 1 ? 1.2 : 0.8);
+    viewer.render();
+  }
+  if (type === "chain" && typeof value === "string") {
+    if (value === "all") reset();
+    else {
+      const viewport = document
+        .getElementById("molecule")!
+        .getBoundingClientRect();
+      viewer.zoomTo({ chain: value });
+      viewer.zoom(viewportFitFactor(viewport));
+      viewer.render();
+    }
+  }
+});
+notify("ready", { instanceId });

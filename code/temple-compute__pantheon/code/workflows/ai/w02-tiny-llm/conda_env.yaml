@@ -1,0 +1,20 @@
+name: horus-tiny-llm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - git
+  - pip
+  - pip:
+      - torch
+      - numpy
+      - h5py
+      - requests
+      - tqdm
+      - zstandard
+      - tiktoken
+      # the pinned repo's own deps (pyproject.toml): src/ imports both
+      - jaxtyping>=0.2.28
+      - regex
+      - datasets
+      - wandb

@@ -1,0 +1,601 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+from typing import Literal
+
+import torch
+import torch.nn as nn
+
+from bionemo_ir._torch.attention_backend import (
+    auto_select_pairwise_attention_backend,
+    auto_select_triangle_attention_backend,
+)
+from bionemo_ir._torch.graph_optimization import GraphRegion
+from bionemo_ir._torch.layers.linear import Linear
+from bionemo_ir._torch.layers.normalization import (
+    HighPrecisionLayerNorm,
+    replace_with_fused_layernorm,
+    replace_with_high_precision_layernorm,
+)
+from bionemo_ir._torch.layers.pair_averaging import PairWeightedAveraging
+from bionemo_ir._torch.layers.sequence_local_atom import build_local_attn_metadata
+from bionemo_ir._torch.layers.token_padding import pad_trunk_tokens, unpad_trunk_tokens
+from bionemo_ir._torch.layers.transformers.msa_module import MSAModuleStack
+from bionemo_ir._torch.layers.transformers.pairformer import PairformerModule
+from bionemo_ir._torch.layers.triangle_nodes import (
+    TriangleAttentionNode,
+    TriangleMultiplicationNode,
+    set_trimul_token_padding,
+)
+from bionemo_ir._torch.modules.openfold3.confidence import AuxiliaryHeadsAllAtom
+from bionemo_ir._torch.modules.openfold3.diffusion_module import (
+    DiffusionModule,
+    OpenFold3DiffusionSampler,
+)
+from bionemo_ir._torch.modules.openfold3.embedders import (
+    InputEmbedderAllAtom,
+    MSAModuleEmbedder,
+    TemplateEmbedderAllAtom,
+)
+from bionemo_ir._torch.modules.openfold3.utils.atomize_utils import prepare_atom_reduction
+from bionemo_ir._torch.sampling import EDMScheduleConfig
+from bionemo_ir._torch.sampling.frame_reuse import require_forced_reuse
+from bionemo_ir._torch.utils import (
+    CHUNK_REGISTRY,
+    RECYCLE_PAIR_UPDATE,
+    ChunkPolicy,
+    default_autochunk_min,
+    iter_chunks,
+    tensor_tree_map,
+)
+from bionemo_ir.configs import BaseConfig
+from bionemo_ir.hubs import load_weights as load_weights_from_hubs
+from bionemo_ir.models.openfold3.config import PRETRAINED_CONFIG_REGISTRY
+from bionemo_ir.models.openfold3.convert import convert_hf_openfold3_torch
+from bionemo_ir.registry import SupMat
+
+from ..optimize_module_setter import OptimizedModuleSetterMixin
+
+# On B300 (268 GiB) the scaled cap is 2368 tokens. Keeping the cache added
+# 0.8 GiB peak reserved at 2284 tokens but 18 GiB at 2398, so the growth starts
+# in between. The limit stays below 2284, the largest size measured harmless.
+_KEEP_TRUNK_CACHE_TOKEN_LIMIT = 2048
+
+
+def _keep_trunk_cache_max_tokens(device: torch.device) -> int:
+    """Largest input that keeps the trunk's cached memory for prediction.
+
+    Half the memory-scaled auto-chunk threshold, at most 2048 tokens. The ratio
+    is fitted to B200, H100 and B300 runs with five diffusion samples at the
+    default threshold: above it, prediction's pair tensors outgrew the trunk's
+    cached blocks and keeping them raised peak reserved memory. A ``min_size``
+    set on the pair-conditioning chunk policy does not move the cap, because no
+    run measured one. Neither the cap nor the free-memory test reads the sample
+    count, so more samples can make prediction outgrow a kept cache below the
+    cap; the allocator then frees its cached blocks and retries before
+    reporting out of memory.
+
+    Args:
+        device: CUDA device of the trunk pair representation.
+    """
+    return min(default_autochunk_min(device) // 2, _KEEP_TRUNK_CACHE_TOKEN_LIMIT)
+
+
+def _cache_crowds_device(device: torch.device) -> bool:
+    """Whether free device memory is below the allocator's cached, unallocated bytes.
+
+    Neither query synchronizes the device.
+    """
+    free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+    cached_bytes = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    return free_bytes < cached_bytes
+
+
+def _release_trunk_cache(device: torch.device, num_tokens: int) -> bool:
+    """Return the trunk's unused cached CUDA memory for long inputs or short memory.
+
+    Releasing drains the device and unmaps the allocator's unused segments,
+    which prediction then maps again. Inputs of at most
+    ``_keep_trunk_cache_max_tokens`` tokens keep the cache unless it crowds the
+    device; prediction then reuses the cache or fits beside it. CPU devices and
+    CUDA stream capture never release.
+
+    Args:
+        device: Device of the trunk pair representation.
+        num_tokens: Token count of the trunk pair representation.
+
+    Returns:
+        Whether the cache was released.
+    """
+    if device.type != "cuda" or torch.cuda.is_current_stream_capturing():
+        return False
+    if num_tokens <= _keep_trunk_cache_max_tokens(device) and not _cache_crowds_device(device):
+        return False
+    torch.cuda.empty_cache()
+    return True
+
+
+class OpenFold3(nn.Module, OptimizedModuleSetterMixin):
+    GRAPH_REGIONS = {
+        "trunk": "trunk_graph",
+        "diffusion_module": "diffusion_sampler.graph",
+        "confidence_pairformer": "aux_heads.pairformer_embedding.pairformer_graph",
+    }
+
+    def __init__(
+        self,
+        config: BaseConfig = None,
+        include_load_weights: bool = True,
+        model_name: str | None = None,
+        diffusion_samples: int | None = None,
+    ):
+        super().__init__()
+        self.model_name = model_name or SupMat.OpenFold3
+        self.config = config or self.get_pretrained_config(self.model_name)
+        self.dtype = self.config.torch_dtype
+        self.skip_create_weights = self.config.skip_create_weights
+        self.num_recycles = self.config.num_recycles
+        self.num_cycles = self.num_recycles + 1
+        self.n_query = self.config.n_query
+        self.n_key = self.config.n_key
+        self.no_rollout_steps = self.config.no_rollout_steps
+        self.no_rollout_samples = self.config.no_rollout_samples if diffusion_samples is None else diffusion_samples
+
+        self.noise_schedule = self.config.noise_schedule_config
+
+        trunk_dtype = self.config.trunk.pairformer.torch_dtype
+
+        self.input_embedder = InputEmbedderAllAtom(config=self.config.input_embedder_config)
+        self.layer_norm_z = nn.LayerNorm(self.config.c_z, dtype=trunk_dtype, eps=self.config.norm_epsilon)
+        self.linear_z = Linear(
+            self.config.c_z,
+            self.config.c_z,
+            bias=False,
+            dtype=trunk_dtype,
+            skip_create_weights=self.config.skip_create_weights,
+        )
+        self.recycle_pair_update_chunk_policy = CHUNK_REGISTRY.get(RECYCLE_PAIR_UPDATE)
+
+        self.template_embedder = TemplateEmbedderAllAtom(config=self.config.template_embedder_config)
+        self.msa_module_embedder = MSAModuleEmbedder(config=self.config.msa_module_embedder_config)
+        self.msa_module = MSAModuleStack(config=self.config.msa_stack_module_config)
+        self.layer_norm_s = nn.LayerNorm(self.config.c_s, dtype=trunk_dtype, eps=self.config.norm_epsilon)
+        self.linear_s = Linear(
+            self.config.c_s,
+            self.config.c_s,
+            bias=False,
+            dtype=trunk_dtype,
+            skip_create_weights=self.config.skip_create_weights,
+        )
+
+        self.pairformer_stack = PairformerModule(config=self.config.trunk.pairformer)
+        self.enable_token_pad = self.config.trunk.pairformer.enable_token_pad
+        # The trunk pads the tokens for these stacks.
+        for stack in (self.template_embedder, self.msa_module, self.pairformer_stack):
+            set_trimul_token_padding(stack, self.enable_token_pad)
+        diffusion_module = DiffusionModule(config=self.config.diffusion_module_config)
+        self.diffusion_sampler = OpenFold3DiffusionSampler(
+            config=self.config.edm_sampling_config, diffusion_module=diffusion_module
+        )
+        self.aux_heads = AuxiliaryHeadsAllAtom(config=self.config.auxiliary_heads_config)
+        self.trunk_graph = GraphRegion(self, "_recycle_step", self.config.trunk.graph_optimization_config)
+
+        # fp32 LayerNorm → cast to trunk dtype; leave fused triangle/PWA LNs as-is.
+        if self.config.trunk_ln_high_precision and trunk_dtype != torch.float32:
+            _skip = (TriangleAttentionNode, TriangleMultiplicationNode, PairWeightedAveraging)
+            for mod in (
+                self.template_embedder.template_pair_stack,
+                self.msa_module_embedder,
+                self.msa_module,
+                self.pairformer_stack,
+            ):
+                replace_with_high_precision_layernorm(mod, out_dtype=trunk_dtype, skip_types=_skip)
+            self.layer_norm_s = HighPrecisionLayerNorm.from_layernorm(self.layer_norm_s, out_dtype=trunk_dtype)
+            self.layer_norm_z = HighPrecisionLayerNorm.from_layernorm(self.layer_norm_z, out_dtype=trunk_dtype)
+            # Template pair embedder Linear is fp32; keep its LN output in fp32.
+            self.template_embedder.template_pair_embedder.layer_norm_z = HighPrecisionLayerNorm.from_layernorm(
+                self.template_embedder.template_pair_embedder.layer_norm_z, out_dtype=torch.float32
+            )
+
+        if include_load_weights:
+            self.load_weights()
+        # The exact-type rewrite preserves the high-precision replacements above.
+        replace_with_fused_layernorm(self)
+
+    @property
+    def diffusion_module(self) -> DiffusionModule:
+        """Model-owned denoiser exposed through the composed sampler."""
+        return self.diffusion_sampler.diffusion_module
+
+    def generate_attn_metadata(self, batch: dict[str, torch.Tensor]):
+        # Single OSS-equivalent zero-pad query→keys callable, consumed by both
+        # atom attention and ``convert_pair_atom_to_blocks``. The block count
+        # comes from each input, so ``batch`` only fixes the call signature.
+        return build_local_attn_metadata(self.n_query, self.n_key, bias_cache={})
+
+    def get_pretrained_config(self, model_name: str = SupMat.OpenFold3) -> BaseConfig:
+        config_class = PRETRAINED_CONFIG_REGISTRY.get(model_name)
+        if config_class is None:
+            raise ValueError(f"OpenFold3 pretrained config not found for model name: {model_name}")
+        config = config_class()
+        tri_backend = auto_select_triangle_attention_backend(torch.bfloat16)
+        pair_backend = auto_select_pairwise_attention_backend(torch.bfloat16)
+        config.msa_stack_module_config.set_triangle_attention_backend(tri_backend)
+        config.template_embedder_config.set_triangle_attention_backend(tri_backend)
+
+        config.trunk.pairformer.set_dtype("bfloat16")
+        config.trunk.pairformer.s_path_dtype = torch.bfloat16
+        config.trunk.set_triangle_attention_backend(tri_backend)
+        config.trunk.set_pairwise_attention_backend(pair_backend)
+        config.diffusion_module_config.diffusion_transformer_config.set_dtype("bfloat16")
+        config.diffusion_module_config.diffusion_transformer_config.token_transformer.set_pairwise_attention_backend(
+            pair_backend
+        )
+        # The atom encoder and decoder stay fp32 around bf16 atom transformers.
+        config.diffusion_module_config.atom_transformer_encoder_config.set_dtype("bfloat16")
+        config.diffusion_module_config.atom_transformer_decoder_config.set_dtype("bfloat16")
+
+        config.msa_stack_module_config.set_dtype("bfloat16")
+        config.template_embedder_config.template_pair_stack.set_dtype("bfloat16")
+
+        config.auxiliary_heads_config.pairformer.set_triangle_attention_backend(tri_backend)
+        config.auxiliary_heads_config.pairformer.set_dtype("bfloat16")
+        config.auxiliary_heads_config.pairformer.s_path_dtype = torch.bfloat16
+        config.auxiliary_heads_config.pairformer.set_pairwise_attention_backend(pair_backend)
+        config.auxiliary_heads_config.set_dtype("bfloat16")
+
+        return config
+
+    def load_weights(self, weights: dict = None):
+        if weights is None:
+            weights = load_weights_from_hubs(name=self.model_name)
+
+        openfold3_weights = convert_hf_openfold3_torch(config=self.config, weights=weights, model_name=self.model_name)
+
+        self.layer_norm_z.load_state_dict(openfold3_weights["layer_norm_z"])
+        self.linear_z.load_weights(openfold3_weights["linear_z"])
+        self.layer_norm_s.load_state_dict(openfold3_weights["layer_norm_s"])
+        self.linear_s.load_weights(openfold3_weights["linear_s"])
+
+        self.input_embedder.load_weights(openfold3_weights["input_embedder"])
+        self.template_embedder.load_weights(openfold3_weights["template_embedder"])
+        self.msa_module.load_weights(openfold3_weights["msa_stack"])
+        self.msa_module_embedder.load_weights(openfold3_weights["msa_module_embedder"])
+        self.diffusion_module.load_weights(openfold3_weights["diffusion_module"])
+        self.pairformer_stack.load_weights(openfold3_weights["pairformer_stack"])
+        self.aux_heads.load_weights(openfold3_weights["auxiliary_heads"])
+        # The component loaders above do not reach these regions; drop graphs over the old weights.
+        self.trunk_graph.reset()
+        self.diffusion_sampler.graph.reset()
+
+    def _update_recycle_pair(self, z_init: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """Apply pair recycling in owned row blocks for long eager inference."""
+        policy: ChunkPolicy | None = getattr(self, "recycle_pair_update_chunk_policy", None)
+        if not z.is_cuda or policy is None or not policy.should_chunk(z) or torch.cuda.is_current_stream_capturing():
+            return z_init + self.linear_z(self.layer_norm_z(z))
+
+        for start, length in iter_chunks(z.shape[-3], policy.chunk_size):
+            z_rows = z.narrow(-3, start, length)
+            update = z_init.narrow(-3, start, length) + self.linear_z(self.layer_norm_z(z_rows))
+            z_rows.copy_(update)
+            del update
+        return z
+
+    def feature_extraction(
+        self, batch: dict, num_cycles: int, attn_metadata: dict = None, sampling_seed: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Implements Algorithm 1 lines 1-14.
+
+        Args:
+            batch:
+                Input feature dictionary
+            num_cycles:
+                Number of cycles to run
+            sampling_seed:
+                Request seed for MSA subsampling across recycles.
+
+        Returns:
+            s_input:
+                [*, N_token, C_s_input] Single (input) representation
+            s:
+                [*, N_token, C_s] Single representation
+            z:
+                [*, N_token, N_token, C_z] Pair representation
+        """
+
+        pairformer_dtype = self.config.trunk.pairformer.torch_dtype
+        s_input, s_init, z_init = self.input_embedder(
+            batch=batch,
+            attn_metadata=attn_metadata,
+            pair_output_dtype=pairformer_dtype,
+        )
+        # Cast recycle state to trunk dtype once (input embedder is fp32).
+        # Long inference writes pair rows directly into this final storage.
+        s_init = s_init.to(dtype=pairformer_dtype)
+
+        n_true = z_init.shape[1]
+        if self.enable_token_pad:
+            padded, batch, n_true = pad_trunk_tokens(
+                {"s_input": s_input, "s_init": s_init, "z_init": z_init},
+                n_true,
+                self.config.trunk.token_pad_spec,
+                batch,
+            )
+            s_input, s_init, z_init = padded["s_input"], padded["s_init"], padded["z_init"]
+
+        pair_build_policy = getattr(self.input_embedder, "pair_build_chunk_policy", None)
+        reclaim_recycle_cache = (
+            z_init.is_cuda
+            and pair_build_policy is not None
+            and pair_build_policy.should_chunk(z_init)
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        # Row construction and the trunk use different allocation shapes. Drop
+        # inactive row-build segments before the trunk, then between recycles,
+        # so cached fragments do not accumulate across otherwise identical
+        # cycles. Dense, CPU, and CUDA-capture paths retain the cache.
+        if reclaim_recycle_cache:
+            torch.cuda.empty_cache()
+
+        # s: [*, N_token, C_s]
+        # z: [*, N_token, N_token, C_z]
+        s = torch.zeros_like(s_init)
+        z = torch.zeros_like(z_init)
+
+        # token_mask: [*, N_token]
+        # pair_mask: [*, N_token, N_token]
+        token_mask = batch["token_mask"]
+        pair_mask = token_mask[..., None] * token_mask[..., None, :]
+
+        msa_generator = None
+        if sampling_seed is not None:
+            msa_generator = torch.Generator(device=s_input.device).manual_seed(sampling_seed)
+
+        template_batch = {
+            name: value for name, value in batch.items() if name.startswith("template_") or name == "asym_id"
+        }
+        # The padded request mask is unchanged across recycles, so its row
+        # indices are prepared once; selected MSA features stay per cycle.
+        msa_indices = self.msa_module_embedder.prepare_msa_indices(batch)
+        for cycle_index in range(num_cycles):
+            msa_feat, msa_mask = self.msa_module_embedder.prepare_msa(
+                batch, generator=msa_generator, prepared_indices=msa_indices
+            )
+            s, z = self.trunk_graph(
+                s=s,
+                z=z,
+                s_init=s_init,
+                z_init=z_init,
+                s_input=s_input,
+                template_batch=template_batch,
+                msa_feat=msa_feat,
+                msa_mask=msa_mask,
+                token_mask=token_mask,
+                pair_mask=pair_mask,
+            )
+
+            if reclaim_recycle_cache and cycle_index + 1 < num_cycles:
+                torch.cuda.empty_cache()
+
+        s_input, s, z = unpad_trunk_tokens(s_input, s, z, n_true=n_true, kinds=("single", "single", "pair"))
+        return s_input, s, z
+
+    def _recycle_step(
+        self,
+        *,
+        s: torch.Tensor,
+        z: torch.Tensor,
+        s_init: torch.Tensor,
+        z_init: torch.Tensor,
+        s_input: torch.Tensor,
+        template_batch: dict[str, torch.Tensor],
+        msa_feat: torch.Tensor,
+        msa_mask: torch.Tensor,
+        token_mask: torch.Tensor,
+        pair_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run deterministic GPU compute for one prepared recycle."""
+        z = self._update_recycle_pair(z_init, z)
+        z = z + self.template_embedder(batch=template_batch, z=z, pair_mask=pair_mask).to(dtype=z.dtype)
+        m = self.msa_module_embedder.embed_prepared_msa(msa_feat, s_input)
+        z = self.msa_module(m, z, msa_mask=msa_mask.to(dtype=m.dtype), pair_mask=pair_mask.to(dtype=z.dtype))
+        s = s_init + self.linear_s(self.layer_norm_s(s))
+        dtype = self.config.trunk.pairformer.torch_dtype
+        return self.pairformer_stack(
+            s=s,
+            z=z,
+            mask=token_mask.to(dtype=dtype),
+            pair_mask=pair_mask.to(dtype=dtype),
+            inplace_safe=True,
+        )
+
+    def _pair_preparation(self, zij_trunk: torch.Tensor) -> Literal["none", "on_device", "from_host"]:
+        """How prediction conditions the trunk pair once before sampling.
+
+        ``"from_host"`` stages the pair on host first, above the pair-conditioning
+        chunk threshold; ``"none"`` leaves conditioning to each denoising step.
+
+        Args:
+            zij_trunk: [*, N_token, N_token, C_z] trunk pair representation.
+        """
+        if not (
+            self.diffusion_sampler.use_conditioning
+            and zij_trunk.is_cuda
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            return "none"
+        pair_policy = self.diffusion_module.diffusion_conditioning.pair_projection_chunk_policy
+        if pair_policy is not None and pair_policy.should_chunk_size(zij_trunk.shape[-3], zij_trunk.device):
+            return "from_host"
+        return "on_device"
+
+    def prediction(
+        self,
+        batch: dict,
+        si_input: torch.Tensor,
+        si_trunk: torch.Tensor,
+        zij_trunk: torch.Tensor,
+        attn_metadata: dict = None,
+        no_rollout_steps: int | None = None,
+        no_rollout_samples: int | None = None,
+        sampling_seed: int | None = None,
+    ) -> dict:
+        """
+        Mini diffusion rollout.
+        Implements Algorithm 1 lines 15-18.
+
+        Args:
+            batch:
+                Input feature dictionary
+            si_input:
+                [*, N_token, C_s_input] Single (input) representation
+            si_trunk:
+                [*, N_token, C_s] Single representation output from model trunk
+            zij_trunk:
+                [*, N_token, N_token, C_z] Pair representation output from model trunk
+
+        Returns:
+            Output dictionary containing the predicted trunk embeddings,
+            all-atom positions, and confidence/distogram head logits
+        """
+        # Compute atom positions
+        no_rollout_steps_eff = no_rollout_steps if no_rollout_steps is not None else self.no_rollout_steps
+        no_rollout_samples_eff = no_rollout_samples if no_rollout_samples is not None else self.no_rollout_samples
+
+        pair_preparation = self._pair_preparation(zij_trunk)
+        prepared_zij = None
+        zij_trunk_host = None
+        if pair_preparation == "from_host":
+            # Confidence needs the original FP32 trunk pair after sampling.
+            # Stage it first, then construct conditioned rows on device from
+            # the host snapshot so the two full pair tensors never overlap.
+            zij_trunk_host = zij_trunk.to(device="cpu", non_blocking=False)
+            del zij_trunk
+            torch.cuda.empty_cache()
+            prepared_zij = self.diffusion_module.diffusion_conditioning.prepare_pair(
+                batch=batch,
+                zij_trunk=zij_trunk_host,
+            )
+            torch.cuda.empty_cache()
+            zij_trunk = prepared_zij
+        elif pair_preparation == "on_device":
+            # Pair conditioning is noise-independent even below the chunking
+            # threshold. Keep the original trunk pair for confidence heads.
+            prepared_zij = self.diffusion_module.diffusion_conditioning.prepare_pair(
+                batch=batch,
+                zij_trunk=zij_trunk,
+            )
+
+        noise_schedule = EDMScheduleConfig(
+            sigma_data=self.noise_schedule.sigma_data,
+            s_max=self.noise_schedule.s_max,
+            s_min=self.noise_schedule.s_min,
+            rho=self.noise_schedule.p,
+            final="keep",
+        ).build(num_steps=int(no_rollout_steps_eff), dtype=si_input.dtype, device=si_input.device)
+
+        atom_positions_predicted = self.diffusion_sampler(
+            batch=batch,
+            si_input=si_input,
+            si_trunk=si_trunk,
+            zij_trunk=zij_trunk,
+            noise_schedule=noise_schedule,
+            no_rollout_samples=no_rollout_samples_eff,
+            attn_metadata=attn_metadata,
+            seed=sampling_seed,
+            prepared_zij=prepared_zij,
+        )
+
+        del prepared_zij
+        if zij_trunk_host is not None:
+            del zij_trunk
+            torch.cuda.empty_cache()
+            zij_trunk = zij_trunk_host.to(device=si_trunk.device, non_blocking=False)
+            del zij_trunk_host
+
+        output = {
+            "si_trunk": si_trunk,
+            "zij_trunk": zij_trunk,
+            "atom_positions_predicted": atom_positions_predicted,
+        }
+
+        aux_heads_output = self.aux_heads(batch=batch, si_input=si_input, output=output)
+
+        output.update(aux_heads_output)
+
+        return output
+
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        recycling_steps: int = 3,
+        num_sampling_steps: int | None = 200,
+        diffusion_samples: int = 1,
+        sampling_seed: int | None = None,
+    ):
+        # Boltz-style runtime args (mirrors ``Boltz2.forward`` signature so the
+        # generic ``FoldingEngine`` can pass the same ``runtime_args`` dict to
+        # either model). Mapping to OpenFold3 internals:
+        #   recycling_steps     → num_cycles = recycling_steps + 1
+        #   num_sampling_steps  → no_rollout_steps   (diffusion rollout length)
+        #   diffusion_samples   → no_rollout_samples (parallel rollout samples)
+        num_cycles = recycling_steps + 1
+        num_sampling_steps = self.no_rollout_steps if num_sampling_steps is None else num_sampling_steps
+        # A forced frame reuse period rejects a step count it was not evaluated with before the trunk runs.
+        require_forced_reuse(self.diffusion_sampler.frame_reuse_period, num_sampling_steps)
+
+        batch = prepare_atom_reduction(batch)
+        attn_metadata = self.generate_attn_metadata(batch)
+
+        si_input, si_trunk, zij_trunk = self.feature_extraction(
+            batch=batch, num_cycles=num_cycles, attn_metadata=attn_metadata, sampling_seed=sampling_seed
+        )
+
+        # Expand sampling dimension for rollout and diffusion
+        si_input = si_input.unsqueeze(1)
+        si_trunk = si_trunk.unsqueeze(1)
+        zij_trunk = zij_trunk.unsqueeze(1)
+
+        batch = tensor_tree_map(lambda t: t.unsqueeze(1), batch)
+
+        # Rebind before prediction so the caller does not retain a second pair
+        # representation at trunk precision throughout diffusion and confidence.
+        diffusion_dtype = self.diffusion_module.dtype
+        si_input = si_input.to(dtype=diffusion_dtype)
+        si_trunk = si_trunk.to(dtype=diffusion_dtype)
+        zij_trunk = zij_trunk.to(dtype=diffusion_dtype)
+
+        # Feature extraction and diffusion use different allocation shapes.
+        # For long inputs or short memory, return the allocator's unused cached
+        # memory while the final trunk representations are the only live model
+        # outputs. Staging the pair on host releases after the copy instead.
+        if self._pair_preparation(zij_trunk) != "from_host":
+            _release_trunk_cache(zij_trunk.device, zij_trunk.shape[-3])
+
+        pair_holder = [zij_trunk]
+        del zij_trunk
+        output = self.prediction(
+            batch=batch,
+            si_input=si_input,
+            si_trunk=si_trunk,
+            zij_trunk=pair_holder.pop(),
+            attn_metadata=attn_metadata,
+            no_rollout_steps=num_sampling_steps,
+            no_rollout_samples=diffusion_samples,
+            sampling_seed=sampling_seed,
+        )
+
+        return output

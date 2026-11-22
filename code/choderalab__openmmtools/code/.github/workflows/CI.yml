@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - "*"
+  schedule:
+    # Nightly tests run on master by default:
+    #   Scheduled workflows run on the latest commit on the default or base branch.
+    #   (from https://help.github.com/en/actions/reference/events-that-trigger-workflows#scheduled-events-schedule)
+    - cron: "0 0 * * *"
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -leo pipefail {0}    
+
+jobs:
+  test:
+    name: ${{ matrix.os }}, py-${{ matrix.python-version }}, OpenMM-${{ matrix.openmm }}, pymbar-${{ matrix.pymbar-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+        openmm: ["8.4.0", "8.5.2"]
+        os: [macOS-latest, ubuntu-latest]
+        pymbar-version: ["4"]
+        include:
+          # Test newest python, openmm, and pymbar we support on windows
+          - openmm: "8.3.1"
+            python-version: "3.13"
+            os: windows-latest
+            pymbar-version: "4"
+          # Have one job test pymbar 3 support
+          - openmm: "8.3.1"
+            python-version: "3.12"
+            os: ubuntu-latest
+            pymbar-version: "3"
+
+
+    steps:
+      - uses: actions/checkout@v3
+      - name: Additional info about the build
+        run: |
+          uname -a
+          df -h
+          ulimit -a
+
+      - name: Setup micromamba
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: devtools/conda-envs/test_env.yaml
+          environment-name: openmmtools-test
+          create-args: >-
+            python==${{ matrix.python-version }}
+            openmm==${{ matrix.openmm }}
+            pymbar==${{ matrix.pymbar-version }}.*
+          condarc: |
+            channels:
+              - conda-forge
+            
+      - name: Install package
+        run: |
+          python -m pip install -e . --no-deps
+          micromamba list
+          micromamba info
+
+      - name: Run tests
+        run: |
+          pytest -n logical -v --cov=openmmtools --cov-report=xml --cov-report=term --color=yes --durations=10 openmmtools/tests/
+
+      - name: CodeCov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-${{ matrix.os }}-py${{ matrix.python-version }}-openmm-${{ matrix.openmm }}-pymbar-${{ matrix.pymbar-version }}
+          token: ${{ secrets.CODECOV_TOKEN }}

@@ -1,0 +1,284 @@
+"""E20 arm contrasts: domain is the independence unit.
+
+Sequences within a (model, domain, arm) cell are independent draws given model
+and arm and support within-domain description only. Every cross-domain claim
+uses one number per domain (the cell mean) and a bootstrap over domains
+(``core.statistics.paired_group_bootstrap``), refused below the project's
+eight-unit floor (``MINIMUM_BOOTSTRAP_UNITS``). Sequences are never pooled
+across domains.
+
+The four main guidance arms are a 2x2 factorial in guidance content::
+
+                 no couplings   couplings
+    no fields        N              C
+    fields           M              F
+
+(M is the Potts fields h alone, so every cell comes from one model's own
+decomposition) so the claim sits on the increments, not on the arms: simple effects C-N, M-N,
+F-M, F-C; main effect of couplings ((C-N)+(F-M))/2; main effect of fields
+((M-N)+(F-C))/2; interaction (F-M)-(C-N). N is the (0,0) floor reference: a large
+C-N or M-N alone is "guidance beats unconditional generation", not the finding.
+No composite score and no ranking of arms is produced. Outside the factorial,
+pairwise only: Pr (profile guidance), Cx (permuted-column couplings) and Cd
+(cross-domain couplings) each against N and against C; P and H against N.
+
+Every contrast, for every endpoint (tm_score primary; plddt_mean and ptm
+secondary, never combined), is emitted per stratum (STRATA): unstratified; the primary identity-to-wild-type stratum; and the superseded 70% ceiling, restricted to
+sequences with max MSA identity <= the novelty ceiling. A domain enters a
+contrast only if every arm that contrast uses has sequences in that stratum; the
+factorial family shares one domain set (all of N, M, C, F), and the excluded
+domains are listed, never averaged in with partial data.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+
+from ..core.statistics import MINIMUM_BOOTSTRAP_UNITS, bootstrap_unit_floor, paired_group_bootstrap
+from .fold_recapitulation import (IDENTITY_TO_WT_CEILING, MIN_ADMISSIBLE_PER_CELL, NOVELTY_CEILING, cell_key, frozen_rows, require_frozen_strength)
+
+ENDPOINTS = ("tm_score", "plddt_mean", "ptm")  # first is primary
+FACTORIAL_ARMS = ("N", "M", "C", "F")
+
+#: Linear contrasts over per-domain arm means.
+SIMPLE = {
+    "C-N": {"C": 1, "N": -1},
+    "M-N": {"M": 1, "N": -1},
+    "F-M": {"F": 1, "M": -1},
+    "F-C": {"F": 1, "C": -1},
+}
+FACTORIAL = {
+    **SIMPLE,
+    "main_couplings": {"C": .5, "N": -.5, "F": .5, "M": -.5},
+    "main_fields": {"M": .5, "N": -.5, "F": .5, "C": -.5},
+    "interaction": {"F": 1, "M": -1, "C": -1, "N": 1},
+}
+PAIRWISE = {
+    "Pr-N": {"Pr": 1, "N": -1},
+    "C-Pr": {"C": 1, "Pr": -1},  # against established practice (profile guidance)
+    "Cx-N": {"Cx": 1, "N": -1},
+    "C-Cx": {"C": 1, "Cx": -1},
+    "Cd-N": {"Cd": 1, "N": -1},
+    "C-Cd": {"C": 1, "Cd": -1},
+    "P-N": {"P": 1, "N": -1},
+    "H-N": {"H": 1, "N": -1},
+}
+#: stratum -> (admits a row?, minimum admissible rows for a domain-cell to have a value). The primary
+#: endpoint is ``identity_restricted``; ``novelty_restricted`` is the superseded 70% MSA ceiling, kept
+#: because the development record and other artifacts reference it.
+STRATA = {
+    "unstratified": (lambda r: True, 1),
+    "novelty_restricted": (lambda r: r["max_msa_identity"] <= NOVELTY_CEILING, 1),
+    "identity_restricted": (lambda r: r["identity_to_wild_type"] < IDENTITY_TO_WT_CEILING, MIN_ADMISSIBLE_PER_CELL),
+}
+STRATUM_NOTES = {
+    "unstratified": "all sequences",
+    "novelty_restricted": (
+        f"SUPERSEDED: max MSA identity <= {NOVELTY_CEILING}%. Kept for the development record only; it "
+        "does not decontaminate the endpoint, since wild-type recovery is essentially complete by about "
+        "64% identity and this ceiling admits copies of the target."
+    ),
+    "identity_restricted": (
+        f"PRIMARY: identity to wild type < {IDENTITY_TO_WT_CEILING}%; a domain-cell with fewer than "
+        f"{MIN_ADMISSIBLE_PER_CELL} admissible candidates has no value (reported missing, never imputed)."
+    ),
+}
+READING_NOTE = (
+    "The factorial increments carry the claim. N is the floor reference; "
+    "guidance beating N is not the finding. No arm ranking or composite is reported."
+)
+
+
+def cell_admissibility(rows: Sequence[Mapping[str, Any]], stratum: str) -> dict:
+    """(model, domain, arm) -> admissible count, the cell's own depth and their rate.
+
+    Depth is the number of sequences the cell actually holds, so pool depths may differ between cells
+    (200 for primary-family cells, 100 for dose-response and reference cells) and each rate is against
+    its own cell.
+    """
+
+    admits, floor = STRATA[stratum]
+    depth: dict[tuple, int] = defaultdict(int)
+    count: dict[tuple, int] = defaultdict(int)
+    for r in rows:
+        key = (r["model"], r["domain"], r["arm"])
+        depth[key] += 1
+        count[key] += bool(admits(r))
+    return {k: {"admissible": count[k], "depth": depth[k], "feasibility_rate": count[k] / depth[k],
+                "floor": floor, "meets_floor": count[k] >= floor} for k in depth}
+
+
+def domain_means(rows: Sequence[Mapping[str, Any]], endpoint: str, *, stratum: str = "unstratified") -> dict:
+    """(model, domain, arm) -> (mean, n) over the stratum; a cell below the stratum's floor is absent."""
+
+    admits, floor = STRATA[stratum]
+    cells: dict[tuple, list[float]] = defaultdict(list)
+    for r in rows:
+        if admits(r):
+            cells[(r["model"], r["domain"], r["arm"])].append(float(r[endpoint]))
+    return {k: (float(np.mean(v)), len(v)) for k, v in cells.items() if len(v) >= floor}
+
+
+def cross_domain_interval(values: Mapping[str, float], *, seed: int, n_bootstrap: int = 2000) -> dict:
+    """Bootstrap of the mean over domains; raises below the eight-unit floor."""
+
+    domains = sorted(values)
+    v = np.array([values[d] for d in domains])
+    if len(domains) < MINIMUM_BOOTSTRAP_UNITS:
+        raise ValueError(bootstrap_unit_floor(len(domains))["degenerate_reason"])
+    result = paired_group_bootstrap(
+        np.zeros(len(v)), v, np.zeros(len(v)), domains, lambda _t, p: float(np.mean(p)),
+        seed=seed, n_bootstrap=n_bootstrap,
+    )
+    return {"mean": result["difference"], "ci95": result["difference_ci95"], "n_domains": result["n_groups"]}
+
+
+def contrast(means: Mapping, model: str, name: str, coefs: Mapping[str, float], domains: Sequence[str],
+             *, seed: int, with_interval: bool) -> dict[str, Any]:
+    per_domain, excluded = {}, {}
+    for d in domains:
+        missing = [a for a in coefs if (model, d, a) not in means]
+        if missing:
+            excluded[d] = f"no value for arm(s) {missing} in this stratum (no admissible sequences, or fewer than its floor)"
+        else:
+            per_domain[d] = float(sum(c * means[(model, d, a)][0] for a, c in coefs.items()))
+    out: dict[str, Any] = {
+        "contrast": name, "coefficients": dict(coefs), "per_domain": per_domain,
+        "excluded_domains": excluded, "n_domains": len(per_domain),
+        "mean_over_domains": float(np.mean(list(per_domain.values()))) if per_domain else None,
+    }
+    if with_interval:
+        try:
+            out["interval"] = cross_domain_interval(per_domain, seed=seed)
+        except ValueError as error:
+            out["interval"] = None
+            out["interval_refused"] = str(error)
+    return out
+
+
+def analyse(rows: Sequence[Mapping[str, Any]], *, roles: Mapping[str, str], role: str, strengths: Any,
+            seed: int = 20261013, with_interval: bool = True) -> dict[str, Any]:
+    """All contrasts for one role, per model, endpoint and stratum.
+
+    ``strengths`` is the protocol's per-(model, arm) declaration. Every contrast reads only the rows
+    at each arm's ``frozen_strength``; ``dose_response_strengths`` rows are checked against the
+    declaration and then left out here (their description is not a contrast), and counted in the output.
+
+    ``role`` is "development" or "evaluation"; rows of other roles are dropped
+    and the output records the role it covers. A contrast with fewer than eight domains yields per-domain values and an
+    explicit interval refusal, listed in ``refusals`` (the stage exits non-zero
+    on any refusal when role is evaluation).
+    """
+
+    if role != "evaluation":
+        raise ValueError("arm contrasts are evaluation-role only; the development role selects a strength "
+                         "with analyse_development and reports no contrast or cross-domain interval")
+    rows = [r for r in rows if roles[r["domain"]] == role]
+    if not rows:
+        raise ValueError(f"no records in role {role}")
+    require_frozen_strength(rows, strengths)
+    n_dose_response = len(rows)
+    rows = frozen_rows(rows, strengths)
+    n_dose_response -= len(rows)
+    domains = sorted({r["domain"] for r in rows})
+    models = sorted({r["model"] for r in rows})
+    result: dict[str, Any] = {
+        "role": role, "domains": domains, "novelty_ceiling_percent": NOVELTY_CEILING,
+        "identity_to_wild_type_ceiling_percent": IDENTITY_TO_WT_CEILING,
+        "min_admissible_per_cell": MIN_ADMISSIBLE_PER_CELL, "primary_stratum": "identity_restricted",
+        "stratum_notes": STRATUM_NOTES,
+        "independence_unit": "domain", "minimum_domains": MINIMUM_BOOTSTRAP_UNITS,
+        "n_dose_response_rows_excluded": n_dose_response,
+        "reading_note": READING_NOTE, "endpoints": list(ENDPOINTS), "primary_endpoint": ENDPOINTS[0],
+        "results": {},
+    }
+    for model in models:
+        for endpoint in ENDPOINTS:
+            for stratum in STRATA:
+                means = domain_means(rows, endpoint, stratum=stratum)
+                complete = [d for d in domains if all((model, d, a) in means for a in FACTORIAL_ARMS)]
+                block = {
+                    "factorial": {
+                        n: contrast(means, model, n, c, complete, seed=seed, with_interval=with_interval)
+                        for n, c in FACTORIAL.items()
+                    },
+                    "pairwise": {
+                        n: contrast(means, model, n, c, domains, seed=seed, with_interval=with_interval)
+                        for n, c in PAIRWISE.items()
+                    },
+                    "cell_means": {f"{d}|{a}": means[(model, d, a)] for (m, d, a) in sorted(means) if m == model},
+                    "cell_admissibility": {f"{d}|{a}": v for (m, d, a), v in sorted(cell_admissibility(rows, stratum).items())
+                                           if m == model},
+                    "factorial_domains_complete": complete,
+                    "factorial_domains_excluded_partial_coverage": [d for d in domains if d not in complete],
+                }
+                result["results"][f"{model}|{endpoint}|{stratum}"] = block
+    result["refusals"] = [
+        f"{key} {c['contrast']}: {c['interval_refused']}"
+        for key, b in result["results"].items()
+        for c in list(b["factorial"].values()) + list(b["pairwise"].values())
+        if c.get("interval_refused") and (c["n_domains"] > 0 or c["contrast"] in FACTORIAL)
+    ]
+    return result
+
+
+def analyse_development(rows: Sequence[Mapping[str, Any]], *, roles: Mapping[str, str],
+                        component_scale: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Per-setting endpoint means and the strength each (model, arm) selects.
+
+    A setting is (model, arm, lambda_fields, lambda_coupling). Its pooled value is
+    the mean of its per-domain cell means (domain-weighted, sequences never pooled
+    across domains). Selection is the setting maximising the pooled primary
+    endpoint, over settings covering every development domain present, per
+    stratum. Four domains are below the independence floor, so no contrast and no
+    interval is produced here: development selects a strength and nothing else.
+    """
+
+    rows = [r for r in rows if roles[r["domain"]] == "development"]
+    if not rows:
+        raise ValueError("no records in role development")
+    domains = sorted({r["domain"] for r in rows})
+    out: dict[str, Any] = {
+        "role": "development", "domains": domains, "primary_endpoint": ENDPOINTS[0],
+        "novelty_ceiling_percent": NOVELTY_CEILING, "settings": [], "selection": {},
+        "identity_to_wild_type_ceiling_percent": IDENTITY_TO_WT_CEILING,
+        "min_admissible_per_cell": MIN_ADMISSIBLE_PER_CELL, "stratum_notes": STRATUM_NOTES,
+        "component_scale": list(component_scale),
+        "note": "selection only; no arm contrast and no cross-domain interval at four domains",
+    }
+    for stratum, (admits, floor) in STRATA.items():
+        cells: dict[tuple, dict[str, dict]] = defaultdict(lambda: defaultdict(dict))
+        for endpoint in ENDPOINTS:
+            groups: dict[tuple, list[float]] = defaultdict(list)
+            for r in rows:
+                if admits(r):
+                    groups[cell_key(r)].append(float(r[endpoint]))
+            for (model, domain, arm, lf, lc), v in groups.items():
+                if len(v) < floor:
+                    continue
+                cells[(model, arm, lf, lc)][endpoint][domain] = (float(np.mean(v)), len(v))
+        for setting, per_endpoint in sorted(cells.items(), key=str):
+            model, arm, lf, lc = setting
+            entry = {"model": model, "arm": arm, "lambda_fields": lf, "lambda_coupling": lc,
+                     "stratum": stratum, "n_domains": len(per_endpoint[ENDPOINTS[0]]),
+                     "complete": set(per_endpoint[ENDPOINTS[0]]) == set(domains), "endpoints": {}}
+            for endpoint, per_domain in per_endpoint.items():
+                entry["endpoints"][endpoint] = {
+                    "per_domain_mean": {d: m for d, (m, _) in sorted(per_domain.items())},
+                    "per_domain_n": {d: n for d, (_, n) in sorted(per_domain.items())},
+                    "pooled_over_domains": float(np.mean([m for m, _ in per_domain.values()])),
+                }
+            out["settings"].append(entry)
+        best: dict[tuple, dict] = {}
+        for e in out["settings"]:
+            if e["stratum"] != stratum or not e["complete"]:
+                continue
+            key = (e["model"], e["arm"])
+            value = e["endpoints"][ENDPOINTS[0]]["pooled_over_domains"]
+            if key not in best or value > best[key]["value"]:
+                best[key] = {"lambda_fields": e["lambda_fields"], "lambda_coupling": e["lambda_coupling"], "value": value}
+        out["selection"][stratum] = {f"{m}|{a}": v for (m, a), v in sorted(best.items())}
+    return out

@@ -1,0 +1,54 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: "build ${{ matrix.name-prefix }} (py ${{ matrix.python-version }} on ${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - name-prefix: "all tests"
+            python-version: '3.12'
+            os: ubuntu-latest
+          - name-prefix: "all tests"
+            python-version: '3.13'
+            os: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        cache-dependency-glob: "uv.lock"
+
+    - name: Set up Python ${{ matrix.python-version }}
+      run: uv python install ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: sudo apt-get install -y hmmer
+
+    - name: Install Python dependencies
+      run: uv sync --frozen --group dev --group runtime
+
+    - name: Fetch components.cif
+      run: |
+        mkdir -p "$RUNNER_TEMP/libcifpp"
+        curl -fsSL https://pdbsnapshots.s3.us-west-2.amazonaws.com/20260101/pub/pdb/data/monomers/components.cif.gz \
+          | gunzip > "$RUNNER_TEMP/libcifpp/components.cif"
+        echo "LIBCIFPP_DATA_DIR=$RUNNER_TEMP/libcifpp" >> "$GITHUB_ENV"
+
+    - name: Build data
+      run: uv run build_data
+
+    - name: Run CPU-only tests
+      run: uv run python run_alphafold_data_test.py

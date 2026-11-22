@@ -1,0 +1,40 @@
+.metric-scatter {
+  min-width: 0;
+}
+.scatter-axes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0 4px;
+}
+.scatter-axes label {
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 0;
+}
+.scatter-axes select {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+.scatter-record-choice {
+  min-width: 0;
+}
+.scatter-axes.has-record-choice {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+@media (max-width: 640px) {
+  .scatter-axes.has-record-choice {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .scatter-record-choice {
+    grid-column: 1 / -1;
+  }
+}
+.scatter-record-count {
+  margin: 10px 0;
+  color: var(--muted);
+  font-size: 12px;
+}

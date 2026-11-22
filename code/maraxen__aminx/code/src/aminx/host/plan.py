@@ -1,0 +1,1463 @@
+# ruff: noqa: ANN001, ANN202, ANN401, PLC0415, TID251
+"""Batch planning and scheduling logic for sampling operations.
+
+Also includes InferencePlan and related components for unified inference dispatch.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import functools
+import logging
+from collections.abc import Callable
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+from xtrax.tiling import AxisDecision, BatchPlan, BatchPlanner, ChunkedMap, MemoryBudget, Vmap
+from xtrax.tiling import BudgetInfeasibleError as _XtraxBudgetInfeasibleError
+
+from aminx.tiling.axes import N_NOISES, N_SAMPLES, N_STRUCTURES, N_TEMPERATURES
+from aminx.tiling.errors import TilingError
+from aminx.tiling.memory_budget import resolve_memory_budget_bytes
+from aminx.tiling.planner import estimate_memory_theoretical
+
+if TYPE_CHECKING:
+  from collections.abc import Sequence
+
+  from jaxtyping import PRNGKeyArray
+  from xtrax.tiling import AxisSpec, CarrySpec
+  from xtrax.tiling.dedup import (
+    DedupSpec,
+  )
+
+  from aminx.inference.decode.protocols import ARDecodeFn, DecodeScoreFn, STEDecodeFn
+  from aminx.run.specs import SamplingSpecification
+  from aminx.types import StageSet
+  from aminx.types.arrays import Logits
+  from aminx.types.bundles import InferenceBundle
+  from aminx.types.configs import InferenceConfig
+  from aminx.types.encodings import EncoderOutput
+  from aminx.types.protocols import ModelProtocol
+
+logger = logging.getLogger(__name__)
+_batch_logger = logging.getLogger(__name__ + ".batch_plan")
+
+
+class PlanTopologyError(TilingError):
+  """Raised at make_inference_plan() time when plan topology is invalid.
+
+  This fires before any JAX compilation — topology errors are caught at
+  plan construction time, not at trace time or runtime.
+  """
+
+
+class PlanBudgetInfeasibleError(TilingError):
+  """Raised when no demotion sequence brings a sampling plan under its memory budget.
+
+  Translates xtrax.tiling.BudgetInfeasibleError (a plain Exception) into
+  aminx's own TilingError hierarchy at the make_sampling_planner boundary,
+  the same pattern host/plan.py already uses for PlanTopologyError /
+  xtrax.stages.PlanTopologyError and tiling/dispatch.py uses for
+  DispatchRejected / xtrax's DispatchRejected.
+  """
+
+
+# Axes with variable element shapes across the batch: jax.vmap is structurally
+# invalid on these (ragged/variable shapes), so they must always use SafeMap.
+# Passed to xtrax.tiling.BatchPlanner as heterogeneous_axes (rejects Scan on
+# these in Phase 0) AND used by _plan_with_joint_budget below to pre-fix these
+# axes to SafeMap before calling xtrax's engine -- xtrax's joint-budget mode
+# has no equivalent of aminx's old Phase 1 (force non-carry/dedup heterogeneous
+# axes to SafeMap unconditionally, before the budget loop runs); confirmed
+# empirically (2026-07-06) that without this fix, xtrax's engine assigns Vmap
+# to a heterogeneous axis whenever the joint estimate already fits budget.
+_HETEROGENEOUS_AXIS_NAMES = frozenset({"n_states", "n_structures"})
+
+
+def _plan_with_joint_budget(
+  axes: Sequence[AxisSpec],
+  *,
+  budget_bytes: int,
+  estimate_fn: Callable[[Sequence[AxisDecision]], float],
+  carry_specs: list[CarrySpec] | None = None,
+  dedup_specs: list[DedupSpec] | None = None,
+) -> BatchPlan:
+  """Plan axes under a joint memory budget via xtrax.tiling.BatchPlanner.
+
+  Thin wrapper around xtrax's joint-budget mode (EPIC #1541 T-PLANNER.2) that
+  additionally pre-fixes heterogeneous axes to SafeMap before delegating —
+  see _HETEROGENEOUS_AXIS_NAMES above for why this is necessary. The fixed
+  decisions are folded into the estimator closure (so xtrax's greedy
+  demotion loop sees the correct joint memory estimate at every step) and
+  merged back into the final plan, in the original axes order, after
+  xtrax's engine resolves the remaining (non-heterogeneous, non-fixed) axes.
+
+  Raises
+  ------
+  PlanBudgetInfeasibleError
+      If no demotion sequence for the remaining axes fits budget_bytes.
+
+  """
+  carry_specs = carry_specs or []
+  dedup_specs = dedup_specs or []
+  carry_names = {cs.axis_name for cs in carry_specs}
+  dedup_names = {ds.axis_name for ds in dedup_specs}
+
+  fixed_heterogeneous: dict[str, AxisDecision] = {}
+  remaining_axes: list[AxisSpec] = []
+  for ax in axes:
+    if ax.heterogeneous and ax.name not in carry_names and ax.name not in dedup_names:
+      fixed_heterogeneous[ax.name] = AxisDecision(
+        spec=ax,
+        batch_size=ax.default_batch_size,
+        reasoning=(
+          "heterogeneous axis: element shapes vary; safe_map required "
+          "(aminx wrapper, EPIC #1541 T-PLANNER.2 -- xtrax's joint-budget "
+          "mode has no automatic heterogeneous-axis guard)"
+        ),
+        strategy=ChunkedMap(batch_size=ax.default_batch_size),
+      )
+    else:
+      remaining_axes.append(ax)
+
+  def _estimate(pending_decisions: Sequence[AxisDecision]) -> int:
+    full = list(fixed_heterogeneous.values()) + list(pending_decisions)
+    return int(estimate_fn(full))
+
+  budget = MemoryBudget(bytes=budget_bytes, estimate=_estimate)
+  planner = BatchPlanner(
+    budget=budget,
+    carry_specs=carry_specs,
+    dedup_specs=dedup_specs,
+    heterogeneous_axes=_HETEROGENEOUS_AXIS_NAMES,
+  )
+  try:
+    sub_plan = planner.plan(remaining_axes)
+  except _XtraxBudgetInfeasibleError as exc:
+    raise PlanBudgetInfeasibleError(str(exc)) from exc
+
+  decision_by_name = {d.spec.name: d for d in sub_plan.decisions}
+  decision_by_name.update(fixed_heterogeneous)
+  ordered_decisions = tuple(decision_by_name[ax.name] for ax in axes)
+  return BatchPlan(decisions=ordered_decisions)
+
+
+def _widen_chunked_axis_tile(
+  plan: BatchPlan,
+  axis_name: str,
+  *,
+  budget_bytes: int,
+  estimate_fn: Callable[[Sequence[AxisDecision]], float],
+) -> BatchPlan:
+  """Raise a demoted axis's tile from the planner's minimum to the largest tile that fits the budget.
+
+  xtrax's joint-budget demotion turns a Vmap axis that does not fit into a ChunkedMap on the axis's
+  default tile (1), so a wide row would run one element at a time: memory-safe and bit-exact, but it
+  gives up nearly all of the parallelism (aminx #274: the first calibration fix peaked at 460 MiB where
+  ~5 GiB was available). The Vmap-vs-chunk decision is kept; only the tile is widened, by a binary search
+  over ``estimate_fn`` (a chunked axis contributes its tile to the memory product, so the estimate is
+  non-decreasing in the tile). A tile that reaches the full cardinality becomes a Vmap again: that happens
+  only when the greedy demotion chunked this axis because *other* axes also needed demoting.
+  """
+  decisions = list(plan.decisions)
+  idx = next((i for i, d in enumerate(decisions) if d.spec.name == axis_name), None)
+  if idx is None:
+    return plan
+  current = decisions[idx]
+  if not isinstance(current.strategy, ChunkedMap):
+    return plan
+
+  def _with_tile(tile: int) -> AxisDecision:
+    return AxisDecision(
+      spec=current.spec,
+      batch_size=tile,
+      reasoning=f"{current.reasoning} | tile widened to the largest that fits the joint budget (aminx #274)",
+      strategy=ChunkedMap(batch_size=tile),
+    )
+
+  def _fits(tile: int) -> bool:
+    trial = list(decisions)
+    trial[idx] = _with_tile(tile)
+    # int() matches _plan_with_joint_budget's own truncated comparison, so the two agree on the budget boundary.
+    return int(estimate_fn(trial)) <= budget_bytes
+
+  cardinality = current.spec.cardinality
+  low, high = max(1, current.batch_size), max(1, cardinality)
+  if high <= low or not _fits(low):
+    return plan
+  while low < high:
+    mid = (low + high + 1) // 2
+    if _fits(mid):
+      low = mid
+    else:
+      high = mid - 1
+  if low >= cardinality:
+    # The greedy demotion chunked this axis only because other axes also needed demoting; with them at their own tiles the
+    # whole axis fits, so it returns to a full Vmap instead of a remainder-peeling tile just below the cardinality.
+    decisions[idx] = AxisDecision(
+      spec=current.spec,
+      batch_size=current.spec.default_batch_size,
+      reasoning=f"{current.reasoning} | restored to Vmap: the whole axis fits the joint budget (aminx #274)",
+      strategy=Vmap(),
+    )
+    return BatchPlan(decisions=tuple(decisions))
+  if low == current.batch_size:
+    return plan
+  decisions[idx] = _with_tile(low)
+  return BatchPlan(decisions=tuple(decisions))
+
+
+def decision_for(plan: BatchPlan, name: str) -> AxisDecision:
+  """Look up the AxisDecision for a named axis in a BatchPlan.
+
+  xtrax.tiling.BatchPlan (unlike aminx's retired local BatchPlan) has no
+  .decision_for() convenience method -- this is the direct replacement,
+  used everywhere host/kernel_dispatch.py used to call plan.decision_for(name).
+
+  Parameters
+  ----------
+  plan : BatchPlan
+      Batch plan containing axis decisions.
+  name : str
+      Target axis name to look up.
+
+  Returns
+  -------
+  AxisDecision
+      Decision matching ``name``.
+
+  Raises
+  ------
+  KeyError
+      If no decision matches ``name``.
+
+  """
+  for d in plan.decisions:
+    if d.spec.name == name:
+      return d
+  raise KeyError(name)
+
+
+# Axis name constants for batch planning
+class AxisNames:
+  """Named access to batch axes to avoid hardcoded strings."""
+
+  N_STRUCTURES = "n_structures"
+  N_SAMPLES = "n_samples"
+  N_TEMPERATURES = "n_temperatures"
+  N_NOISES = "n_noises"
+
+
+# Conservative per-residue activation footprint (float32 bytes) for one innermost
+# (structure, noise, temperature, sample) combination in the sampling dispatch built
+# by host/kernel_dispatch.py's _sample_batch.
+#
+# The analytic part counts the tensors the decoder visibly holds per residue: the node
+# features (L, H), the per-edge message tensor (L, K, 3H) (the concatenation of edge,
+# node-i and node-j features that every message-passing layer builds) and the decode
+# output (L, 21). The constants are ProteinMPNN v_48's (K = 48 neighbours, H = 128), the
+# widest model family here, NOT the K = 32 / width-48 values this block used before.
+#
+# aminx #274: the analytic part alone is 3-4x too small, because the sample vmap keeps
+# several of those edge tensors alive at once (encoder and decoder layers, plus the wave
+# loop's carry). _SAMPLING_LIVE_TENSOR_FACTOR is that empirical factor, fitted to the
+# measured peak device memory of one production single-state MS-L row (TITAN RTX, L = 256
+# padded, ProteinMPNN v_48): width 20 -> 2254 MiB, 64 -> 8654 MiB, 128 -> 16846 MiB, 256 ->
+# RESOURCE_EXHAUSTED, i.e. 128-145 MiB per sample. With the planner's default
+# activation_multiplier (2.5) the estimate at L = 256 is ~163 MiB per sample, about 1.12x
+# the highest measured slope (the 20 -> 64 one). The old estimate was ~4.1 MiB per sample
+# (15-35x low), so a full vmap was chosen at 20, 128 and 1024 samples alike.
+#
+# LIMITS: calibrated at ONE shape (L = 256) on one GPU stack, and scaled linearly in L.
+# It has not been re-measured at other lengths or model families. If a row still OOMs
+# after planning, the estimate is too low for that shape: raise the factor (or pass a larger
+# activation_multiplier); lowering either only makes the planner vmap wider rows.
+_SAMPLING_NODE_FEATURE_DIM = 128
+_SAMPLING_EDGE_NEIGHBORS = 48
+_SAMPLING_EDGE_FEATURE_DIM = 3 * 128  # per-edge message width: concat(edge, node_i, node_j)
+_SAMPLING_DECODE_VOCAB = 21
+_SAMPLING_BYTES_PER_ELEMENT = 4  # float32
+_SAMPLING_LIVE_TENSOR_FACTOR = 3.6  # empirical, see the calibration note above
+
+
+def _sampling_activation_bytes_per_element(seq_len: int) -> float:
+  """Conservative per-residue activation-byte estimate for one sampling dispatch unit.
+
+  See the module-level constants above for the shape/constant provenance. Used as
+  ``estimate_memory_theoretical``'s ``base_shape_bytes`` argument in
+  ``make_sampling_planner`` -- previously hardcoded to ``1.0`` (a dimensionless
+  placeholder, off by ~7-8 orders of magnitude from a real device memory budget for
+  a realistic samples/temperatures/noises composition), which made the joint-budget
+  Vmap-vs-SafeMap demotion check for those three axes practically inert regardless of
+  real activation size (found investigating the E11e heterogeneous-batch benchmark
+  session, 2026-07-23; git-blame traces the ``1.0`` to the 2026-07-06 joint-budget
+  migration, commit 35dc18b8, inherited unreviewed from the pre-migration local
+  planner -- see .praxia/docs/specs/260706_epic1541-planner-joint-budget-migration.md,
+  which never discusses base_shape_bytes/activation_multiplier calibration).
+  """
+  per_residue_elements = (
+    _SAMPLING_NODE_FEATURE_DIM
+    + _SAMPLING_EDGE_NEIGHBORS * _SAMPLING_EDGE_FEATURE_DIM
+    + _SAMPLING_DECODE_VOCAB
+  )
+  return seq_len * per_residue_elements * _SAMPLING_BYTES_PER_ELEMENT * _SAMPLING_LIVE_TENSOR_FACTOR
+
+
+def make_sampling_planner(
+  spec: SamplingSpecification,
+  param_bytes: float = 0.0,
+  headroom: float = 0.80,
+  activation_multiplier: float = 2.5,
+  n_samples_override: int | None = None,
+  seq_len: int | None = None,
+) -> BatchPlan:
+  """Create a BatchPlan for _sample_batch dispatch with advisory logging.
+
+  Parameters
+  ----------
+  spec : SamplingSpecification
+      Sampling specification containing batch size and temperature/noise parameters.
+  param_bytes : float, optional
+      Estimated model parameter size in bytes. Default 0.0.
+  headroom : float, optional
+      Fraction of device memory to use. Default 0.80 (80% headroom).
+  activation_multiplier : float, optional
+      Multiplier for activation memory estimation. Default 2.5.
+  n_samples_override : int | None, optional
+      Actual n_samples cardinality for this call, e.g. from
+      ``resolve_target_samples``. When given, this is what the N_SAMPLES
+      axis is planned against instead of ``spec.samples_batch_size``.
+
+      ``spec.samples_batch_size`` and the real per-call sample count
+      (``spec.samples_chunk_size``/``spec.num_samples``, resolved via
+      ``resolve_target_samples``) are two independently-settable fields with
+      no cross-validation -- passing this override closes that gap at the
+      source: the planner's Vmap/SafeMap decision is verified against the
+      array size that's actually dispatched, not a stale, disconnected
+      proxy for it. Without this override, a plan that decides Vmap because
+      the small default ``samples_batch_size`` (16) fit the memory budget
+      gets applied to a possibly much larger real sample count with no
+      re-check -- see
+      ``.praxia/docs/specs/260706_samples-axis-planner-cardinality-mismatch.md``
+      and Finding D of
+      ``.praxia/docs/specs/260707_xtrax-migration-gap-audit-runspec-scaffolding.md``.
+      Defaults to None (falls back to the pre-existing, disconnected
+      ``spec.samples_batch_size`` behavior) only for backward compatibility
+      with callers/tests that construct a plan without a real per-call
+      sample count in hand; the one production call site
+      (``host/kernel_dispatch.py``'s ``_sample_batch``) always passes it.
+  seq_len : int | None, optional
+      Real per-structure residue count, e.g. from
+      ``batched_ensemble.coordinates.shape[1]``. Used to compute a real
+      per-element activation-byte estimate for the joint memory-budget check
+      (see ``_sampling_activation_bytes_per_element``) instead of the
+      previous hardcoded ``base_shape_bytes=1.0`` placeholder, which made the
+      budget check practically inert for the samples/temperatures/noises
+      axes regardless of real activation size. Defaults to ``None`` (falls
+      back to the old ``1.0`` placeholder) only for backward compatibility
+      with callers/tests that construct a plan without a real structure in
+      hand; the one production call site (``host/kernel_dispatch.py``'s
+      ``_sample_batch``) always passes it.
+
+  Returns
+  -------
+  BatchPlan
+      Batch size decisions for each sampling axis (structures, samples, temps, noises).
+
+  """
+  budget_bytes = int(resolve_memory_budget_bytes(headroom=headroom) - param_bytes)
+  if n_samples_override is not None:
+    samples_cardinality = max(1, n_samples_override)
+  else:
+    samples_cardinality = max(1, getattr(spec, "samples_batch_size", 128) or 128)
+  axes = [
+    dataclasses.replace(N_STRUCTURES, cardinality=max(1, getattr(spec, "batch_size", 1) or 1)),
+    dataclasses.replace(N_SAMPLES, cardinality=samples_cardinality),
+    dataclasses.replace(
+      N_TEMPERATURES,
+      cardinality=max(1, len(getattr(spec, "temperature", [1.0]))),
+    ),
+    dataclasses.replace(N_NOISES, cardinality=max(1, len(getattr(spec, "backbone_noise", [0.0])))),
+  ]
+  base_shape_bytes = 1.0 if seq_len is None else _sampling_activation_bytes_per_element(seq_len)
+  estimate_fn = functools.partial(
+    estimate_memory_theoretical,
+    base_shape_bytes=base_shape_bytes,
+    activation_multiplier=activation_multiplier,
+  )
+
+  plan = _plan_with_joint_budget(
+    axes,
+    budget_bytes=budget_bytes,
+    estimate_fn=estimate_fn,
+    carry_specs=getattr(spec, "carry_specs", None) or [],
+    dedup_specs=getattr(spec, "dedup_specs", None) or [],
+  )
+  if seq_len is None:
+    # The 1.0 placeholder is dimensionless, so a tile derived from it is meaningless (a 50M-sample row would widen to a tile of
+    # ~48M); keep the planner's own decision on that backward-compatibility path.
+    return plan
+  return _widen_chunked_axis_tile(plan, N_SAMPLES.name, budget_bytes=budget_bytes, estimate_fn=estimate_fn)
+
+
+def _legacy_batch_size(decision: AxisDecision) -> int | None:
+  """Translate an AxisDecision to xtrax.transforms.chunked_map's calling convention.
+
+  chunked_map treats batch_size=None as "no chunking, run everything at once" --
+  the Vmap-equivalent -- and any positive value as "chunk into groups of that size."
+  """
+  if isinstance(decision.strategy, Vmap):
+    return None
+  return decision.batch_size or None
+
+
+def extract_batch_sizes(plan: BatchPlan) -> tuple[int | None, int | None, int | None, int | None]:
+  """Extract batch sizes for all sampling axes from a BatchPlan.
+
+  Parameters
+  ----------
+  plan : BatchPlan
+      Batch plan from make_sampling_planner.
+
+  Returns
+  -------
+  tuple[int | None, int | None, int | None, int | None]
+      Tuple of (structures_bs, samples_bs, temps_bs, noises_bs), in
+      xtrax.transforms.chunked_map's convention (None means Vmap/no-chunking) --
+      see _legacy_batch_size.
+
+  """
+  structures_bs = _legacy_batch_size(decision_for(plan, AxisNames.N_STRUCTURES))
+  samples_bs = _legacy_batch_size(decision_for(plan, AxisNames.N_SAMPLES))
+  temps_bs = _legacy_batch_size(decision_for(plan, AxisNames.N_TEMPERATURES))
+  noises_bs = _legacy_batch_size(decision_for(plan, AxisNames.N_NOISES))
+  return structures_bs, samples_bs, temps_bs, noises_bs
+
+
+def compute_sample_keys(
+  base_key: PRNGKeyArray,
+  target_num_samples: int,
+  chunk_sample_start: int | None = None,
+  grid_lineage_sample_start: int | None = None,
+) -> jax.Array:
+  """Compute deterministic PRNG keys for all samples via fold_in.
+
+  Parameters
+  ----------
+  base_key : PRNGKeyArray
+      Base PRNG key for folding.
+  target_num_samples : int
+      Number of samples to generate keys for.
+  chunk_sample_start : int | None, optional
+      Explicit chunk start index. Default None.
+  grid_lineage_sample_start : int | None, optional
+      Grid lineage sample start index. Default None.
+
+  Returns
+  -------
+  jax.Array
+      Array of shape ``(target_num_samples,)`` containing folded keys.
+
+  """
+  sample_indices = np.arange(target_num_samples, dtype=np.int32)
+  if chunk_sample_start is not None:
+    sample_indices += int(chunk_sample_start)
+  elif grid_lineage_sample_start is not None:
+    sample_indices += int(grid_lineage_sample_start)
+
+  # Generate keys for each sample via fold_in
+  return jax.vmap(lambda idx: jax.random.fold_in(base_key, idx))(sample_indices)
+
+
+def resolve_target_samples(
+  spec: SamplingSpecification,
+  chunk_sample_count: int | None = None,
+  grid_lineage: dict[str, int | str] | None = None,
+) -> int:
+  """Resolve the target number of samples for this batch.
+
+  Prioritizes explicit chunk_sample_count, then grid lineage sample_count,
+  then spec.num_samples as fallback.
+
+  Parameters
+  ----------
+  spec : SamplingSpecification
+      Sampling specification.
+  chunk_sample_count : int | None, optional
+      Explicit sample count for this chunk. Default None.
+  grid_lineage : dict[str, int | str] | None, optional
+      Grid lineage dict with 'sample_count' key. Default None.
+
+  Returns
+  -------
+  int
+      Resolved target sample count (positive).
+
+  Raises
+  ------
+  ValueError
+      If resolved sample count is not positive.
+
+  """
+  if chunk_sample_count is not None:
+    target = int(chunk_sample_count)
+  elif grid_lineage is not None:
+    target = int(grid_lineage["sample_count"])
+  else:
+    target = int(spec.run_spec.sampling.num_samples)
+
+  if target <= 0:
+    msg = "num_samples must be positive."
+    raise ValueError(msg)
+  return target
+
+
+def resolve_chunk_size(
+  spec: SamplingSpecification,
+  total_num_samples: int,
+  grid_lineage: dict[str, int | str] | None = None,
+) -> int:
+  """Resolve the chunk size for streaming sample output.
+
+  Uses spec.samples_chunk_size if set, otherwise grid_lineage['sample_count']
+  if grid_lineage exists, otherwise total_num_samples.
+
+  Parameters
+  ----------
+  spec : SamplingSpecification
+      Sampling specification.
+  total_num_samples : int
+      Total number of samples to be generated.
+  grid_lineage : dict[str, int | str] | None, optional
+      Grid lineage dict. Default None.
+
+  Returns
+  -------
+  int
+      Chunk size (positive).
+
+  """
+  if hasattr(spec, "samples_chunk_size") and spec.samples_chunk_size:
+    return int(spec.samples_chunk_size)
+  if grid_lineage is not None:
+    return int(grid_lineage["sample_count"])
+  return total_num_samples
+
+
+def resolve_sample_start(
+  grid_lineage: dict[str, int | str] | None = None,
+) -> int:
+  """Resolve the sample start index from grid lineage or default to 0.
+
+  Parameters
+  ----------
+  grid_lineage : dict[str, int | str] | None, optional
+      Grid lineage dict with 'sample_start' key. Default None.
+
+  Returns
+  -------
+  int
+      Sample start index (0-based).
+
+  """
+  return int(grid_lineage["sample_start"]) if grid_lineage is not None else 0
+
+
+def _as_level_sequence(value: object, default: tuple[float, ...]) -> tuple[float, ...]:
+  """Coerce a temperature or noise knob into a non-empty sequence of levels.
+
+  ``make_sampling_planner`` takes ``len(...)`` of these. Sampling specs store a
+  sequence; scoring specs store a scalar float. Both have to plan.
+  """
+  if value is None or isinstance(value, (str, bytes)):
+    return default
+  if isinstance(value, (int, float)):
+    return (float(value),)
+  if not isinstance(value, (list, tuple)):
+    return default
+  return tuple(float(level) for level in value) or default
+
+
+def _topology_planner_spec(spec: object, sampling_config: object) -> SimpleNamespace:
+  """Flat spec view for the one construction-time BatchPlan.
+
+  ``_sample_batch`` rebuilds a BatchPlan per structure batch (real ``seq_len`` and
+  sample count). Topology validation runs once, here, on the spec-level plan:
+  same axes and carry/dedup specs, without a per-batch override.
+  """
+  config_temperature = getattr(sampling_config, "temperature", ())
+  config_noise = getattr(sampling_config, "backbone_noise", ())
+  temperature = _as_level_sequence(
+    getattr(spec, "temperature", None),
+    tuple(config_temperature) or (1.0,),
+  )
+  backbone_noise = _as_level_sequence(
+    getattr(spec, "backbone_noise", None),
+    tuple(config_noise) or (0.0,),
+  )
+  return SimpleNamespace(
+    batch_size=getattr(spec, "batch_size", 1),
+    samples_batch_size=getattr(spec, "samples_batch_size", 128),
+    temperature=temperature,
+    backbone_noise=backbone_noise,
+    carry_specs=getattr(spec, "carry_specs", None),
+    dedup_specs=getattr(spec, "dedup_specs", None),
+  )
+
+
+def _validate_plan_topology(
+  plan: BatchPlan,
+  stage_set: StageSet,
+) -> None:
+  """Validate plan topology at plan construction time.
+
+  Checks:
+  1. No Scan strategy on heterogeneous axes (jax.lax.scan requires static carry shape).
+  2. No ordered=True boundary op (Tap/Sink) on Vmap axes (vmap has no step ordering).
+  3. No STEDecode paired with UnconditionalDecodeStep (STE requires conditional scoring).
+
+  Rules 1-2 are generic tiling/boundary concerns, not MPNN-specific -- they're
+  delegated to xtrax.stages.validate_plan_topology (upstreamed; aminx had
+  independently built the same checks that xtrax's own AxisBoundary docstring
+  promised but never implemented). Rule 3 is aminx/MPNN-domain-specific and
+  stays local. xtrax's PlanTopologyError is translated to aminx's own (a
+  TilingError subclass) so the existing `except TilingError` / `isinstance`
+  contract is preserved for callers.
+
+  Raises:
+      PlanTopologyError: on first violation found.
+
+  """
+  from xtrax.stages import PlanTopologyError as _XtraxPlanTopologyError
+  from xtrax.stages import validate_plan_topology as _xtrax_validate_plan_topology
+
+  try:
+    _xtrax_validate_plan_topology(plan.decisions, stage_set.axis_boundaries)
+  except _XtraxPlanTopologyError as exc:
+    raise PlanTopologyError(str(exc)) from exc
+
+  # Rule 3: STEDecode requires ConditionalDecodeStep, not UnconditionalDecodeStep (Sprint 6)
+  decode_fn = getattr(plan, "decode_fn", None)
+  if decode_fn is not None:
+    # Lazy import to avoid circular dependencies
+    from aminx.inference.decode.ste import STEDecode
+    from aminx.types.stages import UnconditionalDecodeStep
+
+    if isinstance(decode_fn, STEDecode):
+      decode_step = getattr(stage_set, "decode_step", None)
+      if isinstance(decode_step, UnconditionalDecodeStep):
+        msg = (
+          "PlanTopologyError: STEDecode requires ConditionalDecodeStep on "
+          "stage_set.decode_step; got UnconditionalDecodeStep. "
+          "STE (straight-through estimator) requires conditional scoring via "
+          "sequence context; unconditional decoding is incompatible."
+        )
+        raise PlanTopologyError(msg)
+
+
+# ---------------------------------------------------------------------------
+# COMP-8: InferencePlan and related components for unified inference dispatch
+# ---------------------------------------------------------------------------
+
+
+class InferenceComponents(NamedTuple):
+  """Resolved inference components for encode-once/decode-many pipeline.
+
+  Parameters
+  ----------
+  encode_fn : Callable
+      Encoder forward pass. Signature:
+      ``(bundle: InferenceBundle, key: PRNGKeyArray, config: InferenceConfig) → EncoderOutput``
+  stage_set : Any
+      StageSet instance with all slots wired (logit_transform, ar_logit_transform,
+      decode_step, sample_step, tie_group_fuse). Ready for JIT.
+
+  References
+  ----------
+  .. [ProteinMPNN] Dauparas, J., et al. "Robust deep learning-based protein
+     sequence design using ProteinMPNN." *Science* 378(6615):49-56 (2022).
+     https://doi.org/10.1126/science.add2187
+
+  .. [LigandMPNN] Dauparas, J., et al. "Atomic context-conditioned protein
+     sequence design using LigandMPNN." *Nature Methods* 22(4):717-723 (2025).
+     https://doi.org/10.1038/s41592-025-02626-1
+
+  """
+
+  encode_fn: Callable
+  stage_set: Any  # StageSet
+
+
+class InferencePlan(eqx.Module):
+  """Resolved inference plan with encode-once/decode-many pattern.
+
+  Encodes geometry and ligand context once, then reuses encoder output for
+  multiple decode passes (sampling or scoring) with different stage_set instances.
+
+  Parameters
+  ----------
+  model : Any
+      Parameterized protein/ligand model (carries JAX arrays).
+  components : InferenceComponents
+      Resolved components: encode_fn, driver, stage_set.
+  decode_fn : DecodeScoreFn | ARDecodeFn | STEDecodeFn
+      Resolved decode mode class instance (ConditionalDecode, UnconditionalDecode,
+      AutoregressiveDecode, or STEDecode). Wired once at plan construction time.
+
+  Notes
+  -----
+  `.sample()` and `.score()` invoke the same encode → decode pipeline but with
+  different stage_set configurations. The decode_step and sample_step fields in
+  stage_set determine the output (sampled sequence or logits).
+
+  References
+  ----------
+  .. [ProteinMPNN] Dauparas, J., et al. "Robust deep learning-based protein
+     sequence design using ProteinMPNN." *Science* 378(6615):49-56 (2022).
+     https://doi.org/10.1126/science.add2187
+
+  .. [LigandMPNN] Dauparas, J., et al. "Atomic context-conditioned protein
+     sequence design using LigandMPNN." *Nature Methods* 22(4):717-723 (2025).
+     https://doi.org/10.1038/s41592-025-02626-1
+
+  """
+
+  model: Any
+  components: InferenceComponents
+  decode_fn: DecodeScoreFn | ARDecodeFn | STEDecodeFn
+  packer: Any = None
+  # Concrete/Gumbel annealing for the STE decode. STEDecode.__call__ accepts these as
+  # CALL-TIME arguments with defaults, so a plan that does not forward them silently pins the
+  # schedule at (False, 1.0, 0.1) regardless of what the SamplingSpecification asked for.
+  # Static: they are Python scalars consumed as trace-time constants, not traced arrays.
+  use_concrete: bool = eqx.field(static=True, default=False)
+  concrete_tau_start: float = eqx.field(static=True, default=1.0)
+  concrete_tau_end: float = eqx.field(static=True, default=0.1)
+
+  @property
+  def stage_set(self) -> Any:
+    """Access the wired StageSet directly.
+
+    Parameters
+    ----------
+    self : Any
+      Instance reference.
+
+    Returns
+    -------
+    Any
+        Wired StageSet instance from ``self.components``.
+    """
+    return self.components.stage_set
+
+  def with_decode_fn(self, fn: DecodeScoreFn | ARDecodeFn | STEDecodeFn) -> InferencePlan:
+    """Return a new InferencePlan with the given decode function.
+
+    Parameters
+    ----------
+    fn : DecodeScoreFn | ARDecodeFn | STEDecodeFn
+        New decode function to use.
+
+    Returns
+    -------
+    InferencePlan
+        New immutable InferencePlan with updated decode_fn.
+
+    """
+    return eqx.tree_at(lambda p: p.decode_fn, self, fn)
+
+  @eqx.filter_jit
+  def encode(
+    self,
+    bundle: InferenceBundle,
+    key: PRNGKeyArray,
+    config: InferenceConfig,
+  ) -> EncoderOutput:
+    """Encode geometry and context into reusable encoder output.
+
+    Parameters
+    ----------
+    bundle : InferenceBundle
+        Input geometry, conditioning, ligand, and wave schedule.
+    key : PRNGKeyArray
+        PRNG key (passed to encoder; may be used for noise injection).
+    config : InferenceConfig
+        Inference configuration.
+
+    Returns
+    -------
+    EncoderOutput
+        Encoded node features, edge features, neighbor indices, and mask.
+        Reuse this output across multiple decode() calls for encode-once/decode-many.
+
+    """
+    return self.components.encode_fn(bundle, key, config)
+
+  @eqx.filter_jit
+  def decode(
+    self,
+    enc: EncoderOutput,
+    bundle: InferenceBundle,
+    key: PRNGKeyArray,
+    config: InferenceConfig,
+  ) -> Any:
+    """Decode pre-encoded features into logits or sampled sequences.
+
+    Parameters
+    ----------
+    enc : EncoderOutput
+        Pre-computed encoder output from encode(). May be reused across calls.
+    bundle : InferenceBundle
+        Input bundle providing conditioning and wave schedule for decoder.
+    key : PRNGKeyArray
+        PRNG key for any stochastic decoding.
+    config : InferenceConfig
+        Inference configuration.
+
+    Returns
+    -------
+    Any
+        SampleResult containing logits (shape (L, 21)) and argmax sequence.
+        Dispatches via self.decode_fn (ConditionalDecode by default; see
+        make_inference_plan for mode configuration).
+
+    """
+    from aminx.inference.sample_autoregressive import SampleResult
+
+    if self.packer is not None and getattr(bundle, "packer", None) is None:
+      raise ValueError(
+        "Packer model is configured on the InferencePlan, but the "
+        "InferenceBundle contains no packer bundle data.",
+      )
+
+    # Forward the annealing schedule ONLY to STEDecode: the other mode classes
+    # (Conditional/Unconditional/Autoregressive) do not accept these kwargs, and passing
+    # them unconditionally would be a TypeError on every non-STE decode.
+    # Imported locally, matching this module's existing convention (see the topology check
+    # around line 511) which keeps aminx.inference.decode out of plan.py's import cycle.
+    from aminx.inference.decode.ste import STEDecode
+
+    if isinstance(self.decode_fn, STEDecode):
+      result = self.decode_fn(
+        key,
+        enc,
+        bundle,
+        config,
+        self.components.stage_set,
+        use_concrete=self.use_concrete,
+        tau_start=self.concrete_tau_start,
+        tau_end=self.concrete_tau_end,
+      )
+    else:
+      result = self.decode_fn(
+        key,
+        enc,
+        bundle,
+        config,
+        self.components.stage_set,
+      )
+    # Normalize: if driver returned raw logits, wrap as SampleResult
+    if not isinstance(result, SampleResult):
+      result = SampleResult(
+        sequence=jnp.argmax(result, axis=-1).astype(jnp.int32),
+        logits=result,
+      )
+
+    if self.packer is not None:
+      n_states = enc.node_features.shape[0]
+      seq = result.sequence
+      if seq.ndim == 1:
+        seq_broadcast = jnp.broadcast_to(seq, (n_states, seq.shape[0]))
+      else:
+        seq_broadcast = jnp.broadcast_to(seq, (n_states, seq.shape[-1]))
+
+      bundle = eqx.tree_at(
+        lambda b: b.packer.sequence,
+        bundle,
+        seq_broadcast,
+      )
+
+      keys_for_states = jax.random.split(key, n_states)
+      packer_result_stack = _run_packer_vmap(
+        self.packer,
+        keys_for_states,
+        bundle.packer,
+        config,
+      )
+
+      result = dataclasses.replace(result, packer_result=packer_result_stack)
+
+    return result
+
+  @eqx.filter_jit
+  def sample(self, bundle: InferenceBundle, key: PRNGKeyArray, config: InferenceConfig) -> Any:
+    """Encode and sample from the pipeline.
+
+    Parameters
+    ----------
+    bundle : InferenceBundle
+        Input geometry, conditioning, ligand, and wave schedule.
+    key : PRNGKeyArray
+        PRNG key for sampling.
+    config : InferenceConfig
+        Inference configuration (batch, device, etc.).
+
+    Returns
+    -------
+    Any
+        Sampled sequence (or auxiliary output from driver).
+
+    """
+    enc = self.encode(bundle, key, config)
+    return self.decode(enc, bundle, key, config)
+
+  @eqx.filter_jit
+  def score(self, bundle: InferenceBundle, key: PRNGKeyArray, config: InferenceConfig) -> Logits:
+    """Encode and score the pipeline.
+
+    Parameters
+    ----------
+    bundle : InferenceBundle
+        Input geometry, conditioning, ligand, and wave schedule.
+    key : PRNGKeyArray
+        PRNG key for any stochastic operations.
+    config : InferenceConfig
+        Inference configuration (batch, device, etc.).
+
+    Returns
+    -------
+    Logits
+        Logit scores per position per amino acid.
+
+    """
+    enc = self.encode(bundle, key, config)
+    return self.decode(enc, bundle, key, config)
+
+
+@eqx.filter_jit
+def _run_packer_vmap(packer_model, keys, packer_bundle, config_params):
+  from aminx.types.bundles import PackerBundle
+
+  packer_in_axes = PackerBundle(
+    sequence=0,
+    backbone_coords=0,
+    backbone_mask=0,
+    ligand_coords=0,
+    ligand_mask=0,
+    ligand_atom_types=0,
+    mask=0,
+    residue_index=0,
+    chain_labels=0,
+    backbone_noise=None,
+  )
+
+  def run_single(k: Any, b: Any) -> Any:
+    """Run packer model on a single state element.
+
+    Parameters
+    ----------
+    k : Any
+        Per-state PRNG key.
+    b : Any
+        Per-state PackerBundle slice.
+
+    Returns
+    -------
+    Any
+        Packer output for the state.
+    """
+    return packer_model(k, b, config_params)
+
+  return jax.vmap(run_single, in_axes=(0, packer_in_axes))(keys, packer_bundle)
+
+
+def resolve_decode_mode(
+  run_spec: Any,
+  *,
+  purpose: Literal["sample", "score"],
+) -> Any:
+  """Resolve which DecodeMode to build from a RunSpec -- the ONE place this decision is made.
+
+  Both `host.plan.make_inference_plan` (the single-structure/scoring path) and
+  `sampling.multistate_poe.sample_multistate_poe_bead` (the genuine multi-state PoE path) call
+  this instead of each independently deciding, which is how aminx#110 happened: the two paths
+  disagreed about which decode class to build (and therefore which conditioning fields --
+  fixed_mask, temperature, num_samples -- had any effect at all) with nothing forcing agreement.
+
+  `purpose` distinguishes "produce new sequences" from "evaluate a given sequence" --
+  `run_spec.sampling.sampling_strategy` alone cannot do this: a sampling call at its default
+  "temperature" strategy and a scoring call share the identical (non-"straight_through") value,
+  and were structurally indistinguishable before this parameter existed. That indistinguishability
+  is the literal root cause of aminx#110 -- `make_inference_plan` always built `ConditionalDecode`
+  (a single teacher-forced pass, correct for scoring, silently wrong for sampling) because nothing
+  told it which of the two callers it was serving.
+
+  Parameters
+  ----------
+  run_spec : RunSpec
+      The resolved `spec.run_spec` (not the flat spec) -- `sampling_strategy` lives at
+      `run_spec.sampling.sampling_strategy` (added 260716, EPIC #1541 P4).
+  purpose : {"sample", "score"}
+      "sample" -- caller wants new sequences (host.runner.sample(), the PoE campaign path).
+      "score" -- caller wants to evaluate/inspect a given sequence (host.runner.score(),
+      inspect()); always resolves to ConditionalMode unless straight_through is requested.
+
+  Returns
+  -------
+  ConditionalMode | AutoregressiveMode | STEMode
+
+  """
+  from aminx.inference.decode.mode import AutoregressiveMode, ConditionalMode, STEMode
+
+  if run_spec.sampling.sampling_strategy == "straight_through":
+    return STEMode()
+  if purpose == "sample":
+    return AutoregressiveMode()
+  return ConditionalMode()
+
+
+def make_inference_plan(
+  model: ModelProtocol,
+  spec: Any,
+  packer: Any = None,
+  *,
+  purpose: Literal["sample", "score"] = "score",
+) -> InferencePlan:
+  """Factory: resolve and create an InferencePlan from model and spec.
+
+  Assembles the inference pipeline by resolving encode_fn (from use_rolling_state),
+  wiring logit_transform (from multi_state_strategy), and instantiating stage_set
+  with ARLogitFuse and TieGroupProductOfExperts.
+
+  Parameters
+  ----------
+  model : ModelProtocol
+      Parameterized model with decoder, encoder, and embeddings.
+  spec : Any
+      Specification; decode-relevant fields are read from ``spec.run_spec.sampling``
+      (use_rolling_state, multi_state_strategy, multi_state_temperature, state_weights,
+      sampling_strategy, decoding_order_fn -- see ``run/spec.py::SamplingConfig``).
+  packer : Any, optional
+      Optional sidechain packer model to attach to the plan.
+  purpose : {"sample", "score"}, keyword-only, default "score"
+      Passed to :func:`resolve_decode_mode` -- disambiguates "produce new sequences"
+      (``host.runner.sample()``) from "evaluate a given sequence" (``score()``/``inspect()``),
+      since ``sampling_strategy`` alone cannot (see ``resolve_decode_mode``'s docstring).
+
+  Returns
+  -------
+  InferencePlan
+      Ready-to-use inference plan for sampling/scoring.
+
+  Notes
+  -----
+  Resolution order:
+
+  1. ``encode_fn`` — uses ``make_encode_fn(model, use_rolling_state=use_rolling_state)``.
+     ``use_rolling_state=True`` selects scan-based multi-state encoding; False uses vmap.
+  2. ``logit_transform`` — instantiated from ``LOGIT_STRATEGIES[multi_state_strategy]``
+     with ``state_weights`` and ``multi_state_temperature``.
+  3. ``ar_logit_transform`` — the SAME instance as ``logit_transform`` (step 2), so the
+     autoregressive path honours ``multi_state_strategy``, ``state_weights`` and
+     ``multi_state_temperature`` identically to the non-AR path; identity when S=1.
+     Until 2026-07-28 this was hardcoded to ``ARLogitFuse()`` (unweighted arithmetic
+     mean), which silently discarded all three on the AR path.
+  4. ``tie_group_fuse`` — always wired as ``TieGroupProductOfExperts()`` (log-softmax sum
+     across tied positions).
+  5. ``decode_step`` and ``sample_step`` — for ``sampling_strategy="straight_through"``,
+     ``decode_step`` is wired to ``ConditionalDecodeStep`` and ``sample_step`` remains
+     ``None`` (teacher-forced path). All other strategies leave both slots as ``None``.
+     Note: the pre-260716 note here about "driver selects topology at call time based on
+     stage_set slot occupancy" described the now-deprecated ``inference/driver.py`` dispatch
+     mechanism (``driver.decode()`` raises ``NotImplementedError`` today) -- decode dispatch is
+     resolved once below, at plan-construction time, via ``resolve_decode_mode``, not at call
+     time from stage_set slot occupancy.
+  6. ``encoding_fusion`` — wired as ``ArithmeticMeanEncodingFusion`` when
+     ``spec.average_node_features=True``; otherwise left ``None``.
+  7. ``decode_fn`` — resolved via ``resolve_decode_mode(spec.run_spec, purpose=purpose)`` (see
+     that function's docstring) then ``make_decode_fn(model, mode, strategy, decoding_order_fn)``,
+     and wired as a top-level field on the plan. ``purpose`` is what lets this same factory serve
+     both ``sample()`` (real autoregressive sampling) and ``score()``/``inspect()`` (teacher-forced
+     evaluation) correctly -- see ``resolve_decode_mode`` for why ``sampling_strategy`` alone
+     can't make that distinction (aminx#110).
+
+  References
+  ----------
+  .. [ProteinMPNN] Dauparas, J., et al. "Robust deep learning-based protein
+     sequence design using ProteinMPNN." *Science* 378(6615):49-56 (2022).
+     https://doi.org/10.1126/science.add2187
+
+  .. [LigandMPNN] Dauparas, J., et al. "Atomic context-conditioned protein
+     sequence design using LigandMPNN." *Nature Methods* 22(4):717-723 (2025).
+     https://doi.org/10.1038/s41592-025-02626-1
+
+  """
+  from xtrax.tiling import Vmap
+
+  from aminx.inference.decode.factory import make_decode_fn
+  from aminx.inference.encode import make_encode_fn
+  from aminx.inference.logits import make_stage_set
+
+  sampling_config = spec.run_spec.sampling
+
+  use_rolling_state = sampling_config.use_rolling_state
+  encode_fn = make_encode_fn(model, use_rolling_state=use_rolling_state)
+
+  strategy_name = sampling_config.multi_state_strategy or "arithmetic_mean"
+  strategy_temp = sampling_config.multi_state_temperature or 1.0
+  state_weights = sampling_config.state_weights
+  # No `or` fallback: sharpness=None means "use S", a real value, not a missing one.
+  sharpness = getattr(sampling_config, "multi_state_sharpness", 1.0)
+
+  stage_set = make_stage_set(
+    strategy_name,
+    strategy_temp,
+    state_weights,
+    sharpness=sharpness,
+  )
+
+  # Wire encoding fusion for averaged mode
+  if getattr(spec, "average_node_features", False):
+    import equinox as eqx
+
+    from aminx.host.averaging import ArithmeticMeanEncodingFusion
+
+    stage_set = eqx.tree_at(
+      lambda s: s.encoding_fusion,
+      stage_set,
+      ArithmeticMeanEncodingFusion(),
+      is_leaf=lambda x: x is None,
+    )
+
+  # Wire decoding fusion if specified in the spec
+  decoding_fusion = getattr(spec, "decoding_fusion", None)
+  if decoding_fusion is not None:
+    import equinox as eqx
+
+    stage_set = eqx.tree_at(
+      lambda s: s.decoding_fusion,
+      stage_set,
+      decoding_fusion,
+      is_leaf=lambda x: x is None,
+    )
+
+  # Wire STE (straight-through estimator) decode topology
+  if sampling_config.sampling_strategy == "straight_through":
+    import equinox as eqx
+
+    from aminx.types.stages import ConditionalDecodeStep
+
+    conditional_decode_step = ConditionalDecodeStep(
+      decoder=model.decoder,
+      w_s_embed=model.w_s_embed.weight,
+    )
+    stage_set = eqx.tree_at(
+      lambda s: s.decode_step,
+      stage_set,
+      conditional_decode_step,
+      is_leaf=lambda x: x is None,
+    )
+    # sample_step stays None (already None from make_stage_set) — teacher-forced path
+
+  # Resolve decode_fn via the shared resolver (aminx#110: this is the ONE place both this
+  # function and sample_multistate_poe_bead decide which DecodeMode to build -- see
+  # resolve_decode_mode's docstring for why sampling_strategy alone can't disambiguate
+  # "sample" from "score" callers).
+  decode_mode = resolve_decode_mode(spec.run_spec, purpose=purpose)
+  decode_strategy = Vmap()
+  decode_fn = make_decode_fn(
+    model,
+    mode=decode_mode,
+    strategy=decode_strategy,
+    decoding_order_fn=sampling_config.decoding_order_fn,
+  )
+
+  # Once per plan, not per batch. InferencePlan carries decode_fn; the sampling
+  # BatchPlan carries decisions. The validator reads both off one subject.
+  batch_plan = make_sampling_planner(_topology_planner_spec(spec, sampling_config))
+  _validate_plan_topology(
+    SimpleNamespace(decisions=batch_plan.decisions, decode_fn=decode_fn),
+    stage_set,
+  )
+
+  components = InferenceComponents(
+    encode_fn=encode_fn,
+    stage_set=stage_set,
+  )
+
+  # The annealing knobs live on the FLAT SamplingSpecification (specs.py), not on
+  # run_spec.sampling, so read them off the spec with getattr -- ScoringSpecification and the
+  # other spec classes reach this function too and do not declare them.
+  return InferencePlan(
+    model=model,
+    components=components,
+    decode_fn=decode_fn,
+    packer=packer,
+    use_concrete=bool(getattr(spec, "use_concrete", False)),
+    concrete_tau_start=float(getattr(spec, "concrete_tau_start", 1.0)),
+    concrete_tau_end=float(getattr(spec, "concrete_tau_end", 0.1)),
+  )
+
+
+
+
+class TopologyKey(NamedTuple):
+  """Static architectural topology key for multi-checkpoint XLA compilation caching.
+
+  Two models with identical ``TopologyKey`` values share the same static Equinox
+  PyTree structure (``static_treedef`` from ``eqx.partition(model, eqx.is_array)``)
+  and can execute through a single JIT-compiled XLA executable by passing
+  ``dynamic_weights`` as a dynamic PyTree argument.
+
+  Attributes
+  ----------
+  model_family : str
+    Model family identifier (e.g. ``"mpnn"``).
+  node_features : int
+    Node feature dimension.
+  edge_features : int
+    Edge feature dimension.
+  hidden_features : int
+    Hidden representation dimension.
+  num_encoder_layers : int
+    Number of MPNN encoder layers.
+  num_decoder_layers : int
+    Number of MPNN decoder layers.
+  k_neighbors : int
+    Number of k-NN graph neighbors.
+  num_positional_embeddings : int
+    Number of relative positional embedding bins.
+  physics_feature_dim : int
+    Physics conditioning feature dimension (0 when disabled, 3 for membrane).
+  atom_context_num : int
+    Ligand/sidechain atom context slot count (0 for backbone-only MPNN).
+  use_side_chain_context : bool
+    Whether LigandMPNN side-chain atom context is enabled.
+  augment_eps : float
+    Backbone coordinate noise epsilon in feature extraction.
+  ca_only : bool
+    Whether the model uses C-alpha-only features.
+  decode_mode : str
+    Decoding mode identifier.
+  multi_state_strategy : str
+    Multi-state fusion strategy identifier.
+  """
+
+  model_family: str = "mpnn"
+  model_type: str = "protein"
+  node_features: int = 128
+  edge_features: int = 128
+  hidden_features: int = 128
+  num_encoder_layers: int = 3
+  num_decoder_layers: int = 3
+  k_neighbors: int = 48
+  num_positional_embeddings: int = 32
+  physics_feature_dim: int = 0
+  atom_context_num: int = 0
+  use_side_chain_context: bool = False
+  use_cyclic_offset: bool = False
+  edge_update_dec: bool = False
+  augment_eps: float = 0.0
+  ca_only: bool = False
+  decode_mode: str = "autoregressive"
+  multi_state_strategy: str = "arithmetic_mean"
+
+
+def extract_topology_key(
+  model: Any,
+  spec: Any | None = None,
+  *,
+  model_family: str = "mpnn",
+) -> TopologyKey:
+  """Extract the ``TopologyKey`` for ``model`` and optional ``spec``.
+
+  Parameters
+  ----------
+  model : Any
+    Equinox model instance (e.g. ``Aminx``).
+  spec : Any | None, optional
+    Sampling or scoring specification.
+  model_family : str, default="mpnn"
+    Model family name.
+
+  Returns
+  -------
+  TopologyKey
+    Static architectural key suitable for XLA compilation caching.
+  """
+  enc = getattr(model, "encoder", None)
+  dec = getattr(model, "decoder", None)
+  feats = getattr(model, "features", None)
+
+  enc_seq = (
+    getattr(enc, "encoder_layers", getattr(enc, "layers", None))
+    if enc is not None
+    else getattr(model, "encoder_layers", None)
+  )
+  dec_seq = (
+    getattr(dec, "decoder_layers", getattr(dec, "layers", None))
+    if dec is not None
+    else getattr(model, "decoder_layers", None)
+  )
+  enc_layers = len(enc_seq) if enc_seq is not None else int(getattr(model, "num_encoder_layers", 3))
+  dec_layers = len(dec_seq) if dec_seq is not None else int(getattr(model, "num_decoder_layers", 3))
+  edge_update_dec = bool(
+    dec_seq
+    and (
+      getattr(dec_seq[0], "W11", None) is not None
+      or getattr(dec_seq[0], "edge_update_mlp", None) is not None
+    ),
+  )
+  w_e = getattr(enc, "w_e", None) if enc is not None else getattr(feats, "w_e_proj", None)
+  hidden_dim = int(w_e.weight.shape[0]) if w_e is not None and hasattr(w_e, "weight") else int(
+    getattr(model, "node_features_dim", 128),
+  )
+  node_dim = int(getattr(model, "node_features_dim", getattr(feats, "node_features", hidden_dim)))
+  edge_dim = int(getattr(model, "edge_features_dim", getattr(feats, "edge_features", hidden_dim)))
+  top_k = int(getattr(feats, "k_neighbors", getattr(feats, "top_k", 48)))
+  num_pos = int(getattr(feats, "num_positional_embeddings", 32))
+  phys_proj = getattr(enc, "physics_projection", None) if enc is not None else None
+  phys_dim = (
+    int(phys_proj.weight.shape[1])
+    if phys_proj is not None and hasattr(phys_proj, "weight")
+    else int(getattr(enc, "physics_feature_dim", 0))
+  )
+  atom_ctx = int(getattr(feats, "atom_context_num", 0))
+  use_sc = bool(getattr(model, "ligand_mpnn_use_side_chain_context", False))
+  # ``Aminx.cyclic`` is a static Equinox field, so a cyclic checkpoint has a different static
+  # treedef from the others and cannot share their hoisted executable.
+  use_cyclic = bool(
+    getattr(model, "cyclic", False)
+    or getattr(feats, "use_cyclic_offset", getattr(model, "use_cyclic_offset", False)),
+  )
+  aug_eps = float(getattr(feats, "augment_eps", 0.0))
+  ca_only = type(feats).__name__ == "ProteinFeaturesCA" if feats is not None else False
+  model_type = str(
+    getattr(
+      model,
+      "model_type",
+      "ligand" if (atom_ctx > 0 or use_sc) else ("ca_only" if ca_only else "protein"),
+    ),
+  )
+
+  decode_mode = "autoregressive"
+  ms_strategy = "arithmetic_mean"
+  if spec is not None:
+    ms_strategy = str(getattr(spec, "multi_state_strategy", None) or "arithmetic_mean")
+    decode_mode = str(
+      getattr(spec, "decode_mode", None)
+      or getattr(spec, "sampling_strategy", None)
+      or "autoregressive",
+    )
+    if getattr(spec, "ligand_mpnn_use_side_chain_context", None) is not None:
+      use_sc = bool(spec.ligand_mpnn_use_side_chain_context)
+    if getattr(spec, "cyclic", None) is not None:
+      use_cyclic = bool(spec.cyclic)
+
+  return TopologyKey(
+    model_family=model_family,
+    model_type=model_type,
+    node_features=node_dim,
+    edge_features=edge_dim,
+    hidden_features=hidden_dim,
+    num_encoder_layers=enc_layers,
+    num_decoder_layers=dec_layers,
+    k_neighbors=top_k,
+    num_positional_embeddings=num_pos,
+    physics_feature_dim=phys_dim,
+    atom_context_num=atom_ctx,
+    use_side_chain_context=use_sc,
+    use_cyclic_offset=use_cyclic,
+    edge_update_dec=edge_update_dec,
+    augment_eps=aug_eps,
+    ca_only=ca_only,
+    decode_mode=decode_mode,
+    multi_state_strategy=ms_strategy,
+  )
+
+
+class HoistedTopologyExecutor:
+  """Caches JIT-compiled functions by ``TopologyKey`` via ``eqx.partition``/``eqx.combine``.
+
+  Hoists ``dynamic_weights`` out of the static closure so that multiple checkpoints
+  sharing a ``TopologyKey`` (such as all 6 vanilla 128-dim MPNN weight families:
+  ``original``, ``soluble``, ``hyper``, ``pssm``, ``mem``, ``antibmpnn``) compile
+  exactly once per ``TopologyKey``.
+  """
+
+  def __init__(self) -> None:
+    """Initialize ``HoistedTopologyExecutor`` caches.
+
+    Parameters
+    ----------
+    self : Any
+      Instance reference.
+
+    Returns
+    -------
+    None
+      Initializes internal caches and compilation counters.
+    """
+    self._compiled_by_key: dict[TopologyKey, Callable[..., Any]] = {}
+    self._static_by_key: dict[TopologyKey, Any] = {}
+    self.compile_counts: dict[TopologyKey, int] = {}
+
+  def total_compiles(self) -> int:
+    """Return total number of XLA compilations across all ``TopologyKey`` buckets.
+
+    Parameters
+    ----------
+    self : Any
+      Instance reference.
+
+    Returns
+    -------
+    int
+      Total compilation count.
+    """
+    return sum(self.compile_counts.values())
+
+  def run(
+    self,
+    model: eqx.Module,
+    step_fn: Callable[..., Any],
+    *args: Any,
+    topology_key: TopologyKey | None = None,
+  ) -> Any:
+    """Execute ``step_fn(model, *args)`` using a cached JIT executable for ``topology_key``.
+
+    Parameters
+    ----------
+    model : eqx.Module
+      Equinox model whose array leaves are passed dynamically.
+    step_fn : Callable[..., Any]
+      Pure function ``step_fn(reconstructed_model, *args)``.
+    args : Any
+      Dynamic array arguments to ``step_fn``.
+    topology_key : TopologyKey | None, optional
+      Explicit ``TopologyKey``; inferred via ``extract_topology_key(model)`` if ``None``.
+
+    Returns
+    -------
+    Any
+      Output of ``step_fn(model, *args)``.
+    """
+    key = topology_key if topology_key is not None else extract_topology_key(model)
+    dynamic_weights, static_treedef = eqx.partition(model, eqx.is_array)
+
+    if key not in self._compiled_by_key:
+      self._static_by_key[key] = static_treedef
+      self.compile_counts[key] = 0
+
+      def _raw_step(dyn_w: Any, *step_args: Any) -> Any:
+        self.compile_counts[key] += 1
+        combined_model = eqx.combine(dyn_w, static_treedef)
+        return step_fn(combined_model, *step_args)
+
+      self._compiled_by_key[key] = jax.jit(_raw_step)
+
+    return self._compiled_by_key[key](dynamic_weights, *args)

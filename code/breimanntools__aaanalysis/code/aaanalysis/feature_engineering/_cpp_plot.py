@@ -1,0 +1,2323 @@
+"""
+This is a script for the frontend of the CPPPlot class.
+"""
+from typing import Optional, Dict, Union, List, Tuple, Type, Literal
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.transforms as mtransforms
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+import warnings
+
+import aaanalysis.utils as ut
+
+from ._backend.check_feature import (check_split_kws,
+                                     check_parts_len,
+                                     check_match_features_seq_parts,
+                                     check_match_df_parts_features,
+                                     check_df_scales,
+                                     check_match_df_scales_features,
+                                     check_df_cat,
+                                     check_match_df_cat_features,
+                                     check_match_df_parts_df_scales,
+                                     check_match_df_seq_jmd_len,
+                                     check_match_df_scales_df_cat)
+from ._backend.check_cpp_plot import (check_args_xtick,
+                                      check_args_ytick,
+                                      check_part_color,
+                                      check_seq_color,
+                                      check_match_dict_color_df)
+
+from ._backend.cpp.cpp_plot_eval import plot_eval
+from ._backend.cpp.cpp_plot_feature import plot_feature
+from ._backend.cpp.cpp_plot_ranking import plot_ranking
+from ._backend.cpp.cpp_plot_profile import plot_profile
+from ._backend.cpp.cpp_plot_heatmap import plot_heatmap
+from ._backend.cpp.cpp_plot_feature_map import plot_feature_map
+from ._backend.cpp._utils_cpp_plot_sizing import (fit_cells_by_rescale, fit_width_by_rescale,
+                                                  grow_to_fit, ranking_figheight,
+                                                  CELL_W_IN, CELL_H_IN, HEATMAP_CELL_H_IN)
+from ._backend.cpp._utils_cpp_plot_positions import (finalize_part_labels_, place_colorbar_below_grid_,
+                                                     align_bottom_furniture_)
+from ._backend.cpp.cpp_plot_update_seq_size import get_tmd_jmd_seq, update_seq_size_, update_tmd_jmd_labels
+
+# Points below the heatmap grid at which the scale-category legend is anchored (feature_map).
+# Kept in points (not a figure fraction), anchored to the heatmap axes, so the legend sits the
+# same distance below the grid at any figure size (and rides the grid when grow_to_fit shifts it).
+_LEGEND_BELOW_GRID_PT = 70.0
+
+# Absolute width (inches) reserved on the right for the "Cumulative feature importance" label
+# and its axis tick, so it never clips (a fixed right-fraction reserves too few inches when narrow).
+# Generous on purpose: bbox_inches="tight" trims any unused margin at save time.
+_RIGHT_LABEL_IN = 0.6
+
+
+# I Helper Functions
+def _freeze_composed_layout(fig):
+    """Neutralize ``tight_layout`` on a figure whose furniture is hand-placed below the grid.
+
+    ``feature_map`` / ``heatmap`` compose a self-managed layout (colorbar and legends anchored in
+    figure coordinates below the grid, like seaborn's clustermap). The notebook/user idiom of
+    ending a cell with ``plt.tight_layout(); plt.show()`` would otherwise re-pack every axes and
+    drop that furniture back onto the heatmap. Replacing this figure's ``tight_layout`` with a
+    no-op keeps the composed layout intact; ``savefig(bbox_inches="tight")`` and a plain
+    ``plt.show()`` measure the tight bounding box directly and are unaffected.
+    """
+    fig.tight_layout = lambda *args, **kwargs: None
+
+
+def _reshrink_row_labels(fig, ax, label_texts, optimize_labels):
+    """Re-run the subcategory-label overlap shrink on the FINAL axes geometry.
+
+    ``add_subcat_bars`` shrinks the row labels while plotting, but the frontend's later
+    ``tight_layout`` / ``subplots_adjust`` / rescale resizes the axes and can reintroduce overlap.
+    Re-running the shrink here, after all layout is settled, honors the ``auto_font`` promise of
+    zero label overlap even for a fixed ``figsize`` (where the figure cannot be grown to fit); the
+    labels shrink independently of the legend and other furniture until they no longer collide.
+    """
+    if not optimize_labels:
+        return
+    from ._backend.cpp._utils_cpp_plot_elements import PlotElements
+    wanted = {str(t) for t in label_texts}
+    labels = [t for t in ax.texts if t.get_text().strip() in wanted]
+    PlotElements.optimize_subcat_label_fontsize(fig=fig, label_artists=labels)
+
+
+def _reshrink_importance_pcts(fig, ax_grid, optimize_labels):
+    """Shrink the per-row cumulative-importance ``%`` annotations until they no longer overlap.
+
+    Those labels (one per row, on the right importance-bar axes) stack and overlap on a dense grid
+    at a fixed figsize just like the subcategory row labels; under ``auto_font`` they must clear too.
+    Re-run on the FINAL layout, independently of the row labels.
+    """
+    if not optimize_labels:
+        return
+    from ._backend.cpp._utils_cpp_plot_elements import PlotElements
+    grid = ax_grid.get_position()
+    pcts = [t for a in fig.axes if a is not ax_grid and a.get_position().x0 >= grid.x1 - 0.02
+            for t in a.texts if t.get_text().strip().endswith("%")]
+    if len(pcts) >= 2:
+        PlotElements.optimize_subcat_label_fontsize(fig=fig, label_artists=pcts)
+
+
+def _align_furniture_fixed_figure(fig, ax, fontsize_tmd_jmd=None, weight_tmd_jmd="normal"):
+    """Align the bottom furniture within a FIXED-size figure (the manual-figsize path).
+
+    The auto / cell_size path grows the figure to fit the furniture. A manual ``figsize`` is honored
+    at its exact size instead, so the grid is shrunk upward (``subplots_adjust(bottom=...)``) to
+    reserve a bottom band, and the scale-category legend, colorbar and importance legend are laid out
+    as one aligned row in it -- exactly the auto-path layout, but with the grid *cells adapting* to
+    the remaining space rather than the figure growing. Iterates until the furniture sits inside the
+    figure (or the reserve is capped).
+    """
+    for _ in range(4):
+        finalize_part_labels_(fig=fig, ax=ax, fontsize_tmd_jmd=fontsize_tmd_jmd,
+                              weight_tmd_jmd=weight_tmd_jmd)
+        place_colorbar_below_grid_(fig=fig, ax=ax)
+        align_bottom_furniture_(fig=fig, ax=ax)
+        fig.canvas.draw()
+        h_in = float(fig.get_size_inches()[1])
+        spill_in = -float(fig.get_tightbbox(fig.canvas.get_renderer()).y0)  # >0 if content below the figure
+        if spill_in <= 0.04:
+            break
+        new_bottom = min(0.6, fig.subplotpars.bottom + (spill_in + 0.05) / h_in)
+        if new_bottom <= fig.subplotpars.bottom + 1e-4:
+            break
+        fig.subplots_adjust(bottom=new_bottom)
+
+
+def _rescale_impact_markers(fig, ax, n_rows):
+    """Scale the feature-impact ``■`` markers to the FINAL cell height.
+
+    The markers are drawn at a fixed point size calibrated to the default cell (``CELL_H_IN``); on a
+    smaller manual figsize the cells shrink but the markers do not, so they overflow the cell. Scaling
+    them by the final cell height keeps each marker the same fraction of its cell at any figure size.
+    """
+    from ._backend.cpp._utils_cpp_plot_sizing import CELL_H_IN
+    fig.canvas.draw()
+    h_in = float(fig.get_size_inches()[1])
+    cell_h = ax.get_position().height * h_in / max(int(n_rows), 1)
+    scale = cell_h / CELL_H_IN
+    if abs(scale - 1.0) < 0.02:
+        return
+    for t in ax.texts:
+        if t.get_text() == "■":  # ■
+            t.set_fontsize(t.get_fontsize() * scale)
+
+
+def resolve_seq_size(seq_size=None):
+    """Split the public ``seq_size`` into (fixed_pt, req) for the residue-letter sizing.
+
+    ``"auto"`` / ``None`` -> length-adaptive auto (both returned None). ``0 < seq_size <= 1`` ->
+    a fraction of the grid cell height (``fixed_pt`` None, ``req`` = the fraction). ``seq_size > 1``
+    -> an absolute font size in points (``fixed_pt`` = the points, taken by the legacy fixed path).
+    """
+    if seq_size is None or (isinstance(seq_size, str) and seq_size == "auto"):
+        return None, None
+    ut.check_number_range(name="seq_size", val=seq_size, min_val=0, exclusive_limits=True, just_int=False)
+    if seq_size <= 1:
+        return None, seq_size
+    return seq_size, None
+
+
+def resolve_fontsize_labels(fontsize_labels=None):
+    """Resolve the subcategory row-label size into (size_pt, shrink_on_overlap).
+
+    ``"auto"`` / ``None`` follows the ``plot_settings`` font scale: 12 pt at the ``seaborn`` "talk"
+    scale of 1.0 (so the default output is unchanged), scaling linearly with the font size, and
+    shrunk to fit the row if the scaled labels would overlap. An explicit number is used as-is (no
+    shrink). Every other text element already tracks the font scale via rcParams.
+    """
+    if fontsize_labels is None or (isinstance(fontsize_labels, str) and fontsize_labels == "auto"):
+        import seaborn as sns
+        base = sns.plotting_context("talk", font_scale=1.0)["font.size"]  # 18.0 ('talk' base)
+        size = plt.rcParams["font.size"] * 12.0 / base
+        # Hard-cap at ~the grid row height (0.19 in cell * 72 * 0.95 ~ 13 pt) so a large font_scale
+        # never makes the row labels taller than their row and overlap (the overlap-shrink runs at
+        # the seed size and can miss the collision that the constant-cell resize then introduces).
+        size = min(size, 13.0)
+        return round(size, 2), True
+    ut.check_number_range(name="fontsize_labels", val=fontsize_labels, min_val=0,
+                          exclusive_limits=False, just_int=False)
+    return float(fontsize_labels), False
+
+
+# Checks for eval plot
+def check_match_dict_color_list_cat(dict_color=None, list_cat=None):
+    """Check if all categories from list_cat are in dict_color"""
+    if list_cat is None:
+        return dict_color # Skip test
+    # Check list_cat for duplicates
+    if len(list_cat) != len(set(list_cat)):
+        raise ValueError(f"'list_cat' {list_cat} should not contain duplicates.")
+
+    missing_cat = [x for x in list_cat if x not in dict_color]
+    if len(missing_cat) > 0:
+        raise ValueError(f"Following categories from 'list_cat' miss a color in 'dict_color': {missing_cat}")
+    return {cat: dict_color[cat] for cat in list_cat}
+
+
+def check_df_eval(df_eval) -> None:
+    """Check if columns in df_eval have valid values"""
+    if len(df_eval) <= 1:
+        raise ValueError("'df_eval' should contain at least two features sets")
+    # Check quality measures
+    list_n_feat = df_eval[ut.COL_N_FEAT].values[0]
+    range_abs_auc = df_eval[ut.COL_RANGE_ABS_AUC].values[0]
+    avg_mean_dif = df_eval[ut.COL_RANGE_ABS_AUC].values[0]
+    n_clusters = df_eval[ut.COL_N_CLUST].values[0]
+    avg_n_feat_per_clust = df_eval[ut.COL_AVG_N_FEAT_PER_CLUST].values[0]
+    std_n_feat_per_clust = df_eval[ut.COL_STD_N_FEAT_PER_CLUST].values[0]
+    ut.check_number_val(name=f"{ut.COL_N_FEAT}: n_features", val=list_n_feat[0], just_int=True)
+    _ = ut.check_list_like(name=f"{ut.COL_N_FEAT}: list_n_feat", val=list_n_feat[1], accept_str=False)
+    _ = ut.check_list_like(name=ut.COL_RANGE_ABS_AUC, val=range_abs_auc, accept_str=False)
+    ut.check_number_val(name=f"{ut.COL_AVG_MEAN_DIF} (pos)", val=avg_mean_dif[0], just_int=False)
+    ut.check_number_val(name=f"{ut.COL_AVG_MEAN_DIF} (neg)", val=avg_mean_dif[1], just_int=False)
+    ut.check_number_range(name=ut.COL_N_CLUST, val=n_clusters, min_val=1, just_int=True)
+    ut.check_number_range(name=ut.COL_AVG_N_FEAT_PER_CLUST, val=avg_n_feat_per_clust, just_int=False)
+    ut.check_number_range(name=ut.COL_STD_N_FEAT_PER_CLUST, val=std_n_feat_per_clust, just_int=False)
+
+
+def check_match_df_eval_list_cat(df_eval=None, list_cat=None) -> None:
+    """Check if number of features per category in df_eval and list_cat match"""
+    names = df_eval[ut.COL_NAME].to_list()
+    list_n_feat_sets = [x[1] for x in df_eval[ut.COL_N_FEAT]]
+    for list_n_feat, name in zip(list_n_feat_sets, names):
+        if len(list_n_feat) != len(list_cat):
+            raise ValueError(f"Number of features per category in '{name}' does not match with 'list_cat' {list_cat}")
+
+
+# Checks for feature plot
+def check_match_df_seq_names_to_show(df_seq=None, names_to_show=None) -> None:
+    """Check if """
+    if names_to_show is None:
+        return # Skip check
+    if ut.COL_NAME not in df_seq:
+        raise ValueError(f"'df_seq' must contain '{ut.COL_NAME}' column if 'names_to_show' ({names_to_show}) is not none")
+    list_names = df_seq[ut.COL_NAME].to_list()
+    missing_names = [x for x in names_to_show if x not in list_names]
+    if len(missing_names) > 0:
+        raise ValueError(f"Following names from 'names_to_show' are not in '{ut.COL_NAME}' "
+                         f"column of 'df_seq': {missing_names}. Available names: "
+                         f"{ut.preview_options(list_names)}.")
+
+
+# Checks for main CPP plots (ranking, profile, maps)
+def check_cmap_for_heatmap(cmap=None) -> None:
+    """Check if cmap is valid or 'SHAP'"""
+    if cmap in [ut.STR_CMAP_SHAP, ut.STR_CMAP_CPP]:
+        return None     # Skip test
+    ut.check_cmap(name="cmap", val=cmap, accept_none=True)
+
+
+def check_col_dif(col_dif=None, shap_plot=False) -> None:
+    """Check if col_dif is string and set default"""
+    ut.check_str(name="col_dif", val=col_dif, accept_none=False)
+    if col_dif is None:
+        col_dif = ut.COL_MEAN_DIF
+    if not shap_plot:
+        if col_dif != ut.COL_MEAN_DIF:
+            raise ValueError(f"'col_dif' ('{col_dif}') must be '{ut.COL_MEAN_DIF}'")
+    else:
+        if ut.COL_MEAN_DIF not in col_dif:
+            raise ValueError(f"If 'shap_plot=True', 'col_dif' ('{col_dif}') must follow '{ut.COL_MEAN_DIF}_'name''")
+
+
+def check_cols_ci(df_feat: pd.DataFrame, col_dif: str, show_ci: bool = False):
+    """Resolve the bootstrap interval columns of ``col_dif``, or ``None`` when intervals are off"""
+    if not show_ci:
+        return None
+    if col_dif != ut.COL_MEAN_DIF:
+        raise ValueError(f"If 'show_ci=True', 'col_dif' ('{col_dif}') must be the group-level "
+                         f"'{ut.COL_MEAN_DIF}'. Bootstrap intervals are computed per feature over "
+                         f"resampling rounds and therefore exist only at group level.")
+    col_low, col_high = ut.DICT_COLS_FEAT_CI[ut.COL_MEAN_DIF]
+    cols_missing = [x for x in (col_low, col_high) if x not in list(df_feat)]
+    if len(cols_missing) > 0:
+        raise ValueError(f"If 'show_ci=True', 'df_feat' must contain the interval columns "
+                         f"{cols_missing}, which are added by CPP(bootstrap=True, "
+                         f"bootstrap_kws={{'ci': 0.95}}).run().")
+    return col_low, col_high
+
+
+def check_col_imp(col_imp=None, shap_plot=False):
+    """Check if col_imp is string and set default"""
+    ut.check_str(name="col_imp", val=col_imp, accept_none=True)
+    if col_imp is None:
+        col_imp = ut.COL_FEAT_IMPACT if shap_plot else ut.COL_FEAT_IMPORT
+    if not shap_plot:
+        if ut.COL_FEAT_IMPORT not in col_imp:
+            raise ValueError(f"'col_imp' ('{col_imp}') must be '{ut.COL_FEAT_IMPORT} or follow '{ut.COL_FEAT_IMPORT}_'name'")
+    else:
+        if ut.COL_FEAT_IMPACT not in col_imp:
+            raise ValueError(f"If 'shap_plot=True', 'col_imp' ('{col_imp}') must follow '{ut.COL_FEAT_IMPACT}_'name''")
+    return col_imp
+
+
+def check_col_val(col_val=None, shap_plot=False, sample_mean_dif=False):
+    """Check if col_val is valid"""
+    list_valid_col_val = [ut.COL_MEAN_DIF, ut.COL_ABS_MEAN_DIF, ut.COL_ABS_AUC, ut.COL_FEAT_IMPORT]
+    str_error_shap = (f"If 'shap_plot=True', 'col_val' ('{col_val}') must follow '{ut.COL_FEAT_IMPACT}_'name'' or "
+                      f"'{ut.COL_MEAN_DIF}_name'")
+    str_add = f"Should be one of: {list_valid_col_val}" if not shap_plot else str_error_shap
+    ut.check_str(name="col_val", val=col_val, accept_none=False, str_add=str_add)
+    if not shap_plot:
+        if sample_mean_dif:
+            if ut.COL_MEAN_DIF not in col_val and col_val not in list_valid_col_val:
+                raise ValueError(f"'col_val' ('{col_val}') must follow {ut.COL_MEAN_DIF}_name' or "
+                                 f"should be one of: {list_valid_col_val}")
+        elif col_val not in list_valid_col_val:
+            raise ValueError(f"'col_val' ('{col_val}') should be one of: {list_valid_col_val}")
+    else:
+        if ut.COL_FEAT_IMPACT not in col_val and ut.COL_MEAN_DIF not in col_val:
+            raise ValueError(str_error_shap)
+    return col_val
+
+
+def check_match_shap_plot_add_legend_cat(shap_plot=False, add_legend_cat=False) -> None:
+    """Check if not both are True"""
+    if shap_plot and add_legend_cat:
+        raise ValueError(f"'shap_plot' ({shap_plot}) and 'add_legend_cat' ({add_legend_cat}) can not be both True.")
+
+
+def check_imp_tuples(name="imp_th", imp_tuples=None) -> None:
+    """Check if legend importance thresholds are valid"""
+    ut.check_tuple(name=name, val=imp_tuples, n=3,
+                   accept_none=False, check_number=True,
+                   accept_none_number=False, str_add=f"Or should not contain None values: {imp_tuples}")
+    th1, th2, th3 = imp_tuples
+    if th1 >= th2 or th2 >= th3:
+        raise ValueError(f"'{name}' ({imp_tuples}) should contain 3 numbers in ascending order")
+    if th1 <= 0:
+        raise ValueError(f"Minium of '{name}' ({imp_tuples[0]}) should be > 0")
+
+
+def check_cell_size(cell_size=None) -> None:
+    """Check if grid cell_size is a (width, height) tuple of positive inches, or None."""
+    if cell_size is None:
+        return None
+    ut.check_tuple(name="cell_size", val=cell_size, n=2, accept_none=False, check_number=True,
+                   str_add="a (width, height) tuple of sizes in inches")
+    if cell_size[0] <= 0 or cell_size[1] <= 0:
+        raise ValueError(f"'cell_size' ({cell_size}) should be a (width, height) tuple of positive inches")
+
+
+# Check update_seq_size
+def check_match_ax_seq_len(ax=None, jmd_n_len=10, jmd_c_len=10) -> None:
+    """Check if ax matches with required length"""
+    labels = ax.xaxis.get_ticklabels(which="both")
+    f = lambda l: l.get_window_extent(ax.figure.canvas.get_renderer())
+    tick_positions = [f(l).x0 for l in labels]
+    _, sorted_labels = zip(*sorted(zip(tick_positions, labels), key=lambda t: t[0]))
+    tmd_jmd_seq = "".join([x.get_text() for x in sorted_labels])
+    min_len = jmd_n_len + 1 + jmd_c_len
+    if len(tmd_jmd_seq) <= min_len:
+        raise ValueError(f"TMD-JMD sequence from 'ax' is shorter than minimum ({min_len}; jmd_n: {jmd_n_len}, tmd:>1, jmd_c: {jmd_c_len}."
+                         f"\n Sequence (len: {len(tmd_jmd_seq)}) retrieved from 'ax' is: '{tmd_jmd_seq}'")
+
+
+_SAMPLE_KWS_KEYS = ("sample", "df_seq", "df_parts")
+
+
+def unpack_sample_kws(sample_kws=None, resolve_seq=True):
+    """Validate a ``sample_kws`` bundle and return ``(sample, df_seq, df_parts)``.
+
+    ``sample_kws`` is a structured bundle (fixed key set): ``sample`` (an ``entry`` name or
+    ``name``-column value ``str``, or a row-position ``int``) plus ``df_seq`` and ``df_parts`` (both required for
+    sequence-level plots, to resolve the TMD-JMD parts). Returns ``(None, None, None)`` when
+    ``sample_kws`` is ``None`` (the shortcut is simply not used).
+    """
+    if sample_kws is None:
+        return None, None, None
+    ut.check_dict(name="sample_kws", val=sample_kws)
+    unknown = set(sample_kws) - set(_SAMPLE_KWS_KEYS)
+    if unknown:
+        raise ValueError(f"'sample_kws' has unknown keys {sorted(unknown)}; allowed: {list(_SAMPLE_KWS_KEYS)}.")
+    if "sample" not in sample_kws:
+        raise ValueError(f"'sample_kws' must contain 'sample' (allowed keys: {list(_SAMPLE_KWS_KEYS)}).")
+    return sample_kws.get("sample"), sample_kws.get("df_seq"), sample_kws.get("df_parts")
+
+
+def resolve_sample_kws(sample=None, df_seq=None, df_parts=None,
+                       jmd_n_seq=None, tmd_seq=None, jmd_c_seq=None,
+                       resolve_seq=True, verbose=True):
+    """Resolve the ``sample_kws`` shortcut for the sample-level plot methods.
+
+    When ``sample_kws`` is given, the feature-impact column is resolved to ``feat_impact_<entry>``
+    and (for sequence-aware plots) the TMD-JMD parts are read from ``df_parts`` via
+    :meth:`SequenceFeature.get_seq_kws`, so the per-sample ``col_imp`` string-templating and the
+    explicit ``get_seq_kws`` plumbing are no longer needed at the call site. ``sample_kws`` is the
+    bundled alternative to passing the sequences directly and **overrides** any explicitly given
+    ``tmd_seq`` / ``jmd_n_seq`` / ``jmd_c_seq`` (a verbose notice is emitted when both are supplied).
+
+    The impact column is keyed by the protein **entry name** (as written by
+    :meth:`ShapModel.add_feat_impact`). A ``sample`` given as a row position (int) is therefore
+    mapped to its entry name via ``df_parts``' index; ``ranking`` has no ``df_parts`` to map a
+    position, so it accepts the entry name (str) only.
+    """
+    is_str = isinstance(sample, str)
+    is_int = isinstance(sample, (int, np.integer)) and not isinstance(sample, bool)
+    if not (is_str or is_int):
+        raise ValueError(f"'sample' ({sample}) should be an entry name (str) or a row position (int).")
+    if resolve_seq:
+        if df_seq is None or df_parts is None:
+            raise ValueError("'df_seq' and 'df_parts' are required in 'sample_kws' to resolve the "
+                             "TMD-JMD parts for sequence-level plots.")
+        # Lazy import to avoid a circular import at module load (same subpackage).
+        from aaanalysis.feature_engineering._sequence_feature import SequenceFeature, resolve_sample_entry
+        seq_kws = SequenceFeature().get_seq_kws(df_seq=df_seq, df_parts=df_parts, sample=sample)
+        # Key 'col_imp' by the resolved entry name (a row position or a 'name'-column value maps to it).
+        name = resolve_sample_entry(df_seq=df_seq, df_parts=df_parts, sample=sample)
+        # 'sample_kws' resolves the TMD-JMD parts and WINS over any explicitly given sequences.
+        if verbose and any(s is not None for s in (jmd_n_seq, tmd_seq, jmd_c_seq)):
+            ut.print_out("'sample_kws' overrides the given 'tmd_seq' / 'jmd_n_seq' / 'jmd_c_seq'.")
+        jmd_n_seq = seq_kws[f"{ut.COL_JMD_N}_seq"]
+        tmd_seq = seq_kws[f"{ut.COL_TMD}_seq"]
+        jmd_c_seq = seq_kws[f"{ut.COL_JMD_C}_seq"]
+    else:
+        if not is_str:
+            raise ValueError(f"'sample' ({sample}) must be an entry name (str) for 'ranking'; a row "
+                             f"position is only supported for 'profile' / 'feature_map' (which have "
+                             f"'df_parts' to map it).")
+        name = sample
+    col_imp = f"{ut.COL_FEAT_IMPACT}_{name}"
+    return col_imp, jmd_n_seq, tmd_seq, jmd_c_seq
+
+
+# II Main Functions
+class CPPPlot:
+    """
+    Plotting class for :class:`CPP` (Comparative Physicochemical Profiling) results [Breimann25]_.
+
+    This class supports multiple plot types for group or sample-level analysis, including ranking plots,
+    profiles, heatmaps, and feature maps.
+
+    Every plotting method returns a ``(fig, ax)`` pair (a thin tuple subclass): unpack as
+    ``fig, ax = ...``. For backward compatibility, the returned object also forwards attribute
+    access to ``ax``, so legacy ``ax = ...; ax.set_title(...)`` keeps working.
+
+    .. versionadded:: 0.1.2
+
+    Notes
+    -----
+    * The ``jmd_n_len`` and ``jmd_c_len`` values supplied at construction are stored as ``_jmd_n_len`` and
+      ``_jmd_c_len`` and are reused by all plot methods (``ranking``, ``profile``, ``heatmap``,
+      ``feature_map``, ``update_seq_size``) so that juxta middle domain (JMD) lengths are
+      consistent across a single :class:`CPPPlot` instance.
+    * Parameters ending in ``_kws`` (e.g. ``cbar_kws``, ``legend_kws``) bundle related keyword
+      arguments into one dict; see the :ref:`keyword-dict parameters overview <kws-overview>`.
+
+    """
+    def __init__(self,
+                 df_scales: Optional[pd.DataFrame] = None,
+                 df_cat: Optional[pd.DataFrame] = None,
+                 jmd_n_len: int = 10,
+                 jmd_c_len: int = 10,
+                 accept_gaps: bool = False,
+                 verbose: bool = True
+                 ):
+        """
+        Parameters
+        ----------
+        df_scales : pd.DataFrame, shape (n_letters, n_scales), optional
+            DataFrame of scales with letters typically representing amino acids. Default from :meth:`load_scales`
+            unless specified in ``options['df_scales']``.
+        df_cat : pd.DataFrame, shape (n_scales, n_scales_info), optional
+            DataFrame of categories for physicochemical scales. Must contain all scales from ``df_scales``.
+            Default from :meth:`load_scales` with ``name='scales_cat'``, unless specified in ``options['df_cat']``.
+        jmd_n_len : int, default=10
+            Length of JMD-N (>=0).
+        jmd_c_len: int, default=10
+            Length of JMD-C (>=0).
+        accept_gaps: bool, default=False
+            Whether to accept missing values by enabling omitting for computations (if ``True``).
+        verbose: bool, default=True
+            If ``True``, verbose outputs are enabled.
+
+        Notes
+        -----
+        Several methods provide the ``shap_plot`` parameter, which allows to specify whether a
+        plot visualizes the results of the group-level Comparative Physicochemical Profiling
+        (CPP) analysis or the sample-level CPP-SHAP analysis (if ``shap_plot=True``).
+
+        - **CPP Analysis**: Group-level analysis of the most discriminant features between a test and a reference group.
+          The overall results are visualized by the :meth:`CPPPlot.feature_map`, revealing the characteristic
+          physicochemical signature of the test group.
+        - **CPP-SHAP Analysis**: Sample-level analysis of the CPP feature impact with single-residue resolution.
+
+        The methods showing the CPP and CPP-SHAP analysis results are as follows:
+
+        - :meth:`CPPPlot.ranking`: the 'CPP/-SHAP ranking plot' shows the top n ranked features, their feature value differences,
+          and feature importance/impact.
+        - :meth:`CPPPlot.profile`: the 'CPP/-SHAP profile' shows the cumulative feature importance/impact per residue position.
+        - :meth:`CPPPlot.heatmap`: the 'CPP/-SHAP heatmap' shows the feature value difference or feature impact per
+          residue position (x-axis) and scale subcategory (y-axis).
+
+        See Also
+        --------
+        * :class:`CPP`: the respective computation class for the **CPP Analysis**.
+        * :class:`ShapModel`: the class combining CPP with the `SHAP <https://shap.readthedocs.io/en/latest/index.html>`_
+          explainable Artificial Intelligence (AI) framework.
+        * `Anatomy of a figure <https://matplotlib.org/stable/gallery/showcase/anatomy.html>`_ matplotlib guide on
+          figure elements.
+
+        Examples
+        --------
+        .. include:: examples/cpp_plot.rst
+        """
+        # Load defaults
+        if df_scales is None:
+            df_scales = ut.load_default_scales()
+        if df_cat is None:
+            df_cat = ut.load_default_scales(scale_cat=True)
+        # Check input
+        verbose = ut.check_verbose(verbose)
+        check_df_scales(df_scales=df_scales)
+        check_df_cat(df_cat=df_cat)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=jmd_c_len)
+        check_parts_len(jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len, accept_none_tmd_len=True)
+        ut.check_bool(name="accept_gaps", val=accept_gaps)
+        df_scales, df_cat = check_match_df_scales_df_cat(df_cat=df_cat, df_scales=df_scales, verbose=verbose)
+        # General settings
+        self._verbose = verbose
+        self._accept_gaps = accept_gaps
+        # Set data parameters
+        self._df_cat = df_cat
+        self._df_scales = df_scales
+        # Set consistent length of JMD-N and JMD-C
+        self._jmd_n_len = jmd_n_len
+        self._jmd_c_len = jmd_c_len
+
+    @staticmethod
+    def eval(df_eval: pd.DataFrame,
+             figsize: Tuple[Union[int, float], Union[int, float]] = (6, 4),
+             dict_xlims: Optional[dict] = None,
+             legend: bool = True,
+             legend_y: float = -0.3,
+             dict_color: Optional[dict] = None,
+             list_cat: Optional[List[str]] = None,
+             ) -> Tuple[Figure, Axes]:
+        """
+        Plot evaluation output of Comparative Physicochemical Profiling (CPP) comparing multiple
+        sets of identified feature sets.
+
+        Evaluation measures are categorized into two groups:
+
+        * **Discriminative Power** measures ('range_ABS_AUC' and 'avg_MEAN_DIF'), which
+          assess the effectiveness of the feature set in distinguishing between the test and reference datasets.
+        * **Redundancy** measures ('n_clusters', 'avg_n_feat_per_clust', and 'std_n_feat_per_clust'), which
+          evaluate the internal redundancy of a feature set using Pearson correlation-based clustering.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        df_eval : pd.DataFrame, shape (n_feature_sets, n_metrics)
+            DataFrame with evaluation measures for sets of identified features. Each `row` corresponds to a specific
+            feature set. required 'columns' are:
+
+            - 'name': Name of the feature set.
+            - 'n_features': Number of features per scale category given as list.
+            - 'range_ABS_AUC': Quintile range of absolute Area Under the Curve (AUC) among all
+              features (min, 25%, median, 75%, max).
+            - 'avg_MEAN_DIF': Two mean differences averaged across all features (for positive and negative 'mean_dif')
+            - 'n_clusters': Optimal number of clusters.
+            - 'avg_n_feat_per_clust': Average number of features per cluster.
+            - 'std_n_feat_per_clust': Standard deviation of feature number per cluster
+
+        figsize : tuple, default=(6, 4)
+            Figure dimensions (width, height) in inches.
+        dict_xlims : dict, optional
+            A dictionary containing x-axis limits for subplots. Keys should be the subplot axis number ({0, 1, 2, 3, 4})
+            and values should be tuple specifying (``xmin``, ``xmax``). If ``None``, x-axis limits are auto-scaled.
+        legend : bool, default=True
+            If ``True``, scale category legend is set under number of features measures.
+        legend_y : float, default=-0.3
+            Legend position regarding the plot y-axis applied if ``legend=True``.
+        dict_color : dict, optional
+            Color dictionary of scale categories for legend. Default from :meth:`plot_get_cdict` with ``name='DICT_CAT'``.
+        list_cat : list of str, optional
+            List of scale categories for which feature numbers are shown.
+
+        Returns
+        -------
+        fig : Figure
+            Figure object for evaluation plot
+        ax : array of Axes
+            Array of Axes objects, each representing a subplot within the figure.
+
+        Notes
+        -----
+        * Altering ``figsize`` height could result in unappropriated legend spacing. This can be adjusted by the
+          ``legend_y`` parameter together with using the :func:`matplotlib.pyplot.subplots_adjust` function,
+          here used with (wspace=0.25, hspace=0, bottom=0.35) parameter settings.
+
+        See Also
+        --------
+        * :meth:`CPP.eval`: the respective computation method.
+        * :func:`comp_auc_adjusted`.
+
+        Examples
+        --------
+        .. include:: examples/cpp_plot_eval.rst
+        """
+        # Check input
+        cols_required = [ut.COL_NAME, ut.COL_N_FEAT,
+                          ut.COL_RANGE_ABS_AUC, ut.COL_AVG_MEAN_DIF,
+                          ut.COL_N_CLUST, ut.COL_AVG_N_FEAT_PER_CLUST, ut.COL_STD_N_FEAT_PER_CLUST]
+        ut.check_df(name="df_eval", df=df_eval, cols_required=cols_required, accept_none=False, accept_nan=False)
+        check_df_eval(df_eval=df_eval)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_dict_xlims(dict_xlims=dict_xlims, n_ax=5)
+        ut.check_bool(name="legend", val=legend)
+        ut.check_number_val(name="legend_y", val=legend_y)
+        ut.check_dict_color(name="dict_color", val=dict_color, accept_none=True)
+        list_cat = ut.check_list_like(name="list_cat", val=list_cat, accept_none=True, accept_str=True,
+                                      check_all_str_or_convertible=True)
+        if dict_color is None:
+            dict_color = ut.plot_get_cdict_(name="DICT_CAT")
+        if list_cat is None:
+            list_cat = ut.LIST_CAT
+        check_match_df_eval_list_cat(df_eval=df_eval, list_cat=list_cat)
+        dict_color = check_match_dict_color_list_cat(dict_color=dict_color, list_cat=list_cat)
+        # Plotting
+        fig, axes = plot_eval(df_eval=df_eval, figsize=figsize, dict_xlims=dict_xlims,
+                              legend=legend, legend_y=legend_y,
+                              dict_color=dict_color, list_cat=list_cat)
+        return ut.FigAxResult(fig, axes)
+
+    # Plotting method for single feature
+    def feature(self,
+                feature: Union[str, List[str], pd.DataFrame],
+                feat_rank: int = 1,
+                *,
+                df_seq: pd.DataFrame,
+                labels: ut.ArrayLike1D,
+                label_test: int = 1,
+                label_ref: int = 0, 
+                ax: Optional[Axes] = None,
+                figsize: Tuple[Union[int, float], Union[int, float]] = (5.6, 4.8),
+                names_to_show: Optional[Union[List[str], str]] = None,
+                name_test: str = "TEST",
+                name_ref: str = "REF",
+                color_test: str = "tab:green",
+                color_ref: str = "tab:gray",
+                show_seq: bool = False,
+                show_title: bool = True,
+                title_wrap_width: int = 45,
+                histplot: bool = False,
+                fontsize_mean_dif: Union[int, float, None] = 15,
+                fontsize_name_test: Union[int, float, None] = 13,
+                fontsize_name_ref: Union[int, float, None] = 13,
+                fontsize_names_to_show: Union[int, float, None] = 11,
+                alpha_hist: int or float = 0.1,
+                alpha_dif: int or float = 0.2,
+                ) -> Tuple[Figure, Axes]:
+        """
+        Plot distributions of Comparative Physicochemical Profiling (CPP) feature values for test
+        and reference datasets highlighting their mean difference.
+
+        Introduced in [Breimann24a]_, a CPP feature is defined as a **Part-Split-Scale** combination. For a sample,
+        a feature value is computed in three steps:
+
+            1. **Part Selection**: Identify a specific sequence part.
+            2. **Part-Splitting**: Divide the selected part into subsequences, creating a **Part-Split** combination.
+            3. **Scale Value Assignment**: For each amino acid in the **Part-Split** subsequence,
+               assign its corresponding scale value and calculate the average, which is termed the feature value.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        feature : str, list of str, or pd.DataFrame
+            The feature(s) to plot, given as a single ``PART-SPLIT-SCALE`` feature id, a list of such ids,
+            or a feature DataFrame (``df_feat``) whose ``feature`` column supplies the ids. When more than
+            one feature is provided, ``feat_rank`` selects which one is plotted. The order is taken as given
+            (pre-sort with :meth:`TreeModel.add_feat_importance` using ``sort=True`` to place the most
+            important feature first).
+        feat_rank : int, default=1
+            1-based rank selecting which feature to plot when ``feature`` holds more than one
+            (``1`` = first/top, ``2`` = second, ...). Must be between 1 and the number of provided features.
+            For a single feature it must be ``1``.
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein identifiers and sequence information
+            in a distinct **Position-based**, **Part-based**, **Sequence-based**, or **Sequence-TMD-based** format.
+        labels : array-like, shape (n_samples,)
+            Class labels for samples in sequence DataFrame (typically, test=1, reference=0).
+        label_test : int, default=1,
+            Class label of test group in ``labels``.
+        label_ref : int, default=0,
+            Class label of reference group in ``labels``.
+        ax : Axes, optional
+            Pre-defined Axes object to plot on. If ``None``, a new Axes object is created.
+        figsize : tuple, default=(5.6, 4.8)
+            Figure dimensions (width, height) in inches.
+        names_to_show : list of str, optional
+            Names of specific samples from ``df_seq`` to highlight on plot. 'name' column must be given in ``df_seq``
+            if ``names_to_show`` is not ``None``.
+        name_test : str, default="TEST"
+            Name for the test dataset.
+        name_ref : str, default="REF"
+            Name for the reference dataset.
+        color_test : str, default="tab:green"
+            Color for the test dataset.
+        color_ref : str, default="tab:gray"
+            Color for the reference dataset.
+        show_seq : bool, default=False
+            If ``True``, show sequence of samples selected via ``names_to_show``.
+        show_title : bool, default=True
+            If ``True``, set the plot title to the feature's human-readable description (see
+            :meth:`SequenceFeature.get_feature_descriptions`), line-wrapped at ``title_wrap_width``.
+            A subsequent ``plt.title(...)`` / ``ax.set_title(...)`` call still overrides it.
+        title_wrap_width : int, default=45
+            Maximum line width (in characters, >0) for wrapping the ``show_title`` description.
+        histplot : bool, default=False
+            If ``True``, plot a histogram. If ``False``, plot a kernel density estimate (KDE) plot.
+        fontsize_mean_dif : int or float, default=15
+            Font size (>0) for displayed mean difference text.
+        fontsize_name_test : int or float, default=13
+            Font size (>0) for the name of the test dataset.
+        fontsize_name_ref : int or float, default=13
+            Font size (>0) for the name of the reference dataset.
+        fontsize_names_to_show : int or float, default=11
+            Font size (>0) for the names selected via ``names_to_show``.
+        alpha_hist : int or float, default=0.1
+            The transparency alpha value [0-1] for the histogram distributions.
+        alpha_dif : int or float, default=0.2
+            The transparency alpha value [0-1] for the mean difference area.
+
+        Returns
+        -------
+        fig : Figure
+            Figure object containing the plot.
+        ax : Axes
+            CPP feature plot axes object.
+
+        Notes
+        -----
+        * Returned as a ``(fig, ax)`` pair (see :class:`CPPPlot` for the shared return contract).
+
+        See Also
+        --------
+        * :class:`SequenceFeature` for details on CPP feature concept.
+        * :meth:`SequenceFeature.get_df_parts` for details on formats of ``df_seq``.
+        * The internally used :func:`seaborn.histplot` and :func:`seaborn.kdeplot` functions.
+
+        Examples
+        --------
+        .. include:: examples/cpp_plot_feature.rst
+        """
+        # Check input
+        features = ut.check_features(features=feature, list_scales=list(self._df_scales))
+        ut.check_number_range(name="feat_rank", val=feat_rank, min_val=1, max_val=len(features), just_int=True)
+        feature = features[feat_rank - 1]
+        ut.check_df_seq(df_seq=df_seq, accept_none=False)
+        ut.check_number_val(name="label_test", val=label_test, just_int=True)
+        ut.check_number_val(name="label_ref", val=label_ref, just_int=True)
+        labels = ut.check_labels(labels=labels, vals_required=[label_test, label_ref],
+                                 len_required=len(df_seq), allow_other_vals=False)
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        names_to_show = ut.check_list_like(name="name_to_show", val=names_to_show, accept_str=True, accept_none=True)
+        ut.check_str(name="name_test", val=name_test)
+        ut.check_str(name="name_ref", val=name_ref)
+        ut.check_color(name="color_test", val=color_test)
+        ut.check_color(name="color_ref", val=color_ref)
+        ut.check_bool(name="show_seq", val=show_seq)
+        ut.check_bool(name="show_title", val=show_title)
+        ut.check_number_range(name="title_wrap_width", val=title_wrap_width, min_val=1, just_int=True)
+        ut.check_bool(name="histplot", val=histplot)
+        args_fs = ut.check_fontsize_args(fontsize_mean_dif=fontsize_mean_dif,
+                                         fontsize_name_test=fontsize_name_test,
+                                         fontsize_name_ref=fontsize_name_ref,
+                                         fontsize_names_to_show=fontsize_names_to_show)
+        ut.check_number_range(name="alpha_hist", val=alpha_hist, accept_none=False, min_val=0, max_val=1, just_int=False)
+        ut.check_number_range(name="alpha_dif", val=alpha_dif, accept_none=False, min_val=0, max_val=1, just_int=False)
+        check_match_df_seq_names_to_show(df_seq=df_seq, names_to_show=names_to_show)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=self._jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=self._jmd_c_len)
+        df_seq = check_match_df_seq_jmd_len(df_seq=df_seq, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+
+        # Plot feature
+        ax = plot_feature(ax=ax, figsize=figsize,
+                          feature=feature, df_scales=self._df_scales, df_cat=self._df_cat,
+                          accept_gaps=self._accept_gaps,
+                          df_seq=df_seq, labels=labels, label_test=label_test, label_ref=label_ref,
+                          jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len,
+                          names_to_show=names_to_show, show_seq=show_seq,
+                          show_title=show_title, title_wrap_width=title_wrap_width,
+                          name_test=name_test, name_ref=name_ref,
+                          color_test=color_test, color_ref=color_ref,
+                          **args_fs,
+                          histplot=histplot, alpha_hist=alpha_hist, alpha_dif=alpha_dif)
+        return ut.FigAxResult(ax.get_figure(), ax)
+
+    # Plotting methods for multiple features (group and sample level)
+    def ranking(self,
+                df_feat: pd.DataFrame,
+                shap_plot: bool = False,
+                col_dif: str = "mean_dif",
+                col_imp: str = "feat_importance",
+                rank: bool = True,
+                n_top: int = 15,
+                figsize: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+                tmd_len: int = 20,
+                tmd_jmd_space: int = 2,
+                tmd_color: str = "mediumspringgreen",
+                jmd_color: str = "blue",
+                tmd_jmd_alpha: Union[int, float] = 0.075,
+                name_test: str = "TEST",
+                name_ref: str = "REF",
+                fontsize_titles: Union[int, float, None] = 12,
+                fontsize_labels: Union[int, float, None] = 12,
+                fontsize_annotations: Union[int, float, None] = 11,
+                xlim_dif: Union[Tuple[Union[int, float], Union[int, float]], None] = (-17.5, 17.5),
+                xlim_rank: Optional[Tuple[Union[int, float], Union[int, float]]] = (0, 4),
+                rank_info_xy: Optional[Tuple[Optional[Union[int, float]], Optional[Union[int, float]]]] = None,
+                sample: Optional[str] = None,
+                show_ci: bool = False,
+                ci_color: str = "black",
+                ) -> Tuple[Figure, Axes]:
+        """
+        Plot CPP/-SHAP feature ranking based on feature importance or sample-specific feature impact.
+
+        Introduced in [Breimann25]_, this method visualizes the most important features for discriminating between
+        the test and the reference dataset groups. At sample level, the feature impact derived from SHAP values
+        of a specific sample can be used for ranking if ``shap_plot=True`` and 'feature_impact' column in ``df_feat``.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        df_feat : pd.DataFrame, shape (n_features, n_feature_info)
+            Feature DataFrame with a unique identifier, scale information, statistics, and positions for each feature.
+            Must also include feature importance (`feat_importance`) or impact (``feat_impact_'name'``) columns.
+        shap_plot : bool, default=False
+            Set the analysis type: **CPP Analysis** (if ``False``) for group-level or
+            **CPP-SHAP Analysis** for sample-level (or subgroup-level) results:
+
+            **CPP Analysis**
+
+            - ``col_dif``: Displays the group-level difference of feature values, with the `mean_dif` column selected by default.
+            - ``col_imp``: Refers to the group-level `feat_importance` column (shown in gray) used for feature ranking.
+
+            **CPP-SHAP Analysis**
+
+            - ``col_dif``: Allows the selection of sample-specific differences against the reference group
+              from a `mean_dif_'name'` column.
+            - ``col_imp``: Enables the selection of specific feature impacts from a `feat_impact_'name'` column for
+              an individual sample, where positive (red) and negative (blue) feature impacts are visualized in the ranking.
+
+        col_dif : str, default='mean_dif'
+            Column name in ``df_feat`` for differences in feature values. Must match with the ``shap_plot`` setting.
+        col_imp : str, default='feat_importance'
+            Column name in ``df_feat`` for feature importance/impact values. Must match with the ``shap_plot`` setting.
+        rank : bool, default=True
+            If ``True``, features will be ranked in descending order of ``col_imp`` values.
+        n_top : int, default=15
+            The number of top features to display. Should be 1 < ``n_top`` <= ``n_features``.
+        figsize : tuple, optional
+            Figure dimensions (width, height) in inches. When ``None`` (default) and the global
+            ``auto_font`` option is enabled, the height grows with ``n_top`` (width and fonts
+            fixed); any explicit ``figsize`` is honored as a fixed size. With ``auto_font``
+            disabled, ``None`` falls back to ``(8.5, 5)``.
+
+            .. versionchanged:: 1.1.0
+                Defaults to ``None`` and participates in ``auto_font``; explicit ``figsize`` wins.
+        tmd_len : int, default=20
+            Length of target middle domain (TMD) to be depicted (>0).
+        tmd_jmd_space : int, default=2
+            The space between TMD and juxta middle domain (JMD) labels (>0) in the feature
+            position subplot.
+        tmd_color : str, default='mediumspringgreen'
+            Color for TMD.
+        jmd_color : str, default='blue'
+            Color for JMDs.
+        tmd_jmd_alpha : int or float, default=0.075
+            The transparency alpha value [0-1] of the TMD-JMD area in the feature position subplot.
+        name_test : str, default="TEST"
+            Name of the test dataset to show in the mean difference subplot.
+        name_ref : str, default="REF"
+            Name of reference dataset to show in the mean difference subplot.
+        fontsize_titles : int or float, default=12
+            Font size of the titles.
+        fontsize_labels : int or float , default=12
+            Font size of plot labels.
+        fontsize_annotations : int or float, default=11
+            Font size of annotations.
+        xlim_dif : tuple, default=(-17.5, 17.5)
+            x-axis limits for the mean difference subplot.
+        xlim_rank : tuple, default=(0, 4)
+            x-axis limits for the ranking subplot. If ``None``, determined automatically.
+        rank_info_xy : tuple, optional
+            Position (x-axis, y-axis) in ranking subplot for showing additional information (optimized if ``None``):
+
+            - When ``shap_plot=False``: Displays sum of feature importance.
+            - When ``shap_plot=True``: Show the sum of the absolute feature impact and the SHAP legend.
+
+        sample : str, optional
+            Convenience shortcut for sample-level CPP-SHAP ranking. When given (a protein entry name),
+            ``col_imp`` is resolved to ``feat_impact_<sample>`` and ``shap_plot`` is set to ``True``
+            automatically, removing the manual ``col_imp=f"feat_impact_<name>"`` string-templating.
+        show_ci : bool, default=False
+            If ``True``, the bootstrap confidence interval of ``col_dif`` is drawn as horizontal
+            whiskers on the bars of the mean difference subplot. This requires the group-level
+            ``col_dif='mean_dif'`` and the ``'mean_dif_ci_low'`` / ``'mean_dif_ci_high'`` columns,
+            which :meth:`CPP.run` appends when the object is created with
+            ``CPP(bootstrap=True, bootstrap_kws={'ci': 0.95})``; a ``ValueError`` is raised if
+            either is missing. A feature with ``NaN`` bounds (selected in fewer than two rounds)
+            is drawn without whiskers. If ``False`` (default), the figure is unchanged.
+
+            .. versionadded:: 1.2.0
+
+        ci_color : str, default='black'
+            Color of the confidence interval whiskers (only used if ``show_ci=True``).
+
+            .. versionadded:: 1.2.0
+
+        Returns
+        -------
+        fig : Figure
+            The Figure object for the ranking plot.
+        ax : array of Axes
+            Array of Axes objects, each representing a subplot within the figure.
+
+        Notes
+        -----
+        * Features are shown as ordered in ``df_feat``. A ranking in descending order based one the following
+          columns is recommended:
+
+          - ``feat_importance``: when feature importance is in ``df_feat`` and ``shap_plot=False``.
+          - ``feat_impact_'name'``: when sample-specific feature impact is in ``df_feat`` and ``shap_plot=True``.
+
+        See Also
+        --------
+        * :meth:`CPP.run` for details on CPP statistical measures of the ``df_feat`` DataFrame.
+        * :class:`SequenceFeature` for definition of sequence ``Parts``.
+        * :meth:`CPPPlot.feature` for visualization of mean differences for specific features.
+
+        Examples
+        --------
+        .. include:: examples/cpp_plot_ranking.rst
+        """
+        # Resolve sample-level SHAP shortcut: 'sample' sets col_imp='feat_impact_<sample>'
+        if sample is not None:
+            col_imp, _, _, _ = resolve_sample_kws(sample=sample, resolve_seq=False)
+            shap_plot = True
+        # Check input
+        ut.check_bool(name="shap_plot", val=shap_plot)
+        check_col_dif(col_dif=col_dif, shap_plot=shap_plot)
+        col_imp = check_col_imp(col_imp=col_imp, shap_plot=shap_plot)
+        df_feat = ut.check_df_feat(df_feat=df_feat, shap_plot=shap_plot, cols_required=[col_imp, col_dif])
+        ut.check_number_range(name="n_top", val=n_top, min_val=2, max_val=len(df_feat), just_int=True)
+        ut.check_bool(name="rank", val=rank, accept_none=False)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=self._jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=self._jmd_c_len)
+        args_len, _ = check_parts_len(tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        check_match_features_seq_parts(features=df_feat[ut.COL_FEATURE],
+                                       tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        ut.check_number_range(name="tmd_jmd_space", val=tmd_jmd_space, min_val=1, just_int=True, accept_none=False)
+        ut.check_color(name="tmd_color", val=tmd_color)
+        ut.check_color(name="jmd_color", val=jmd_color)
+        ut.check_number_range(name="tmd_jmd_alpha", val=tmd_jmd_alpha, accept_none=False, min_val=0, max_val=1, just_int=False)
+        ut.check_str(name="name_test", val=name_test)
+        ut.check_str(name="name_ref", val=name_ref)
+        args = dict(min_val=0, exclusive_limits=True, accept_none=True, just_int=False)
+        ut.check_number_range(name="fontsize_titles", val=fontsize_titles, **args)
+        ut.check_number_range(name="fontsize_labels", val=fontsize_labels, **args)
+        ut.check_number_range(name="fontsize_annotations", val=fontsize_annotations, **args)
+        ut.check_lim(name="xlim_dif", val=xlim_dif)
+        ut.check_lim(name="xlim_rank", val=xlim_rank)
+        ut.check_tuple(name="rank_info_xy", val=rank_info_xy, n=2,
+                       accept_none=True, check_number=True)
+        ut.check_bool(name="show_ci", val=show_ci, accept_none=False)
+        ut.check_color(name="ci_color", val=ci_color, accept_none=False)
+        cols_ci = check_cols_ci(df_feat=df_feat, col_dif=col_dif, show_ci=show_ci)
+
+        # DEV: No match check for features and tmd (check_match_features_seq_parts) necessary
+        # Auto-sizing applies only when the caller OMITS figsize (figsize is None, the
+        # signature default); any explicit figsize is honored as a fixed size (same sentinel
+        # as feature_map/heatmap/profile). Under auto_font the figure height grows with the
+        # number of ranked features (the notebook's figsize=(width, 0.22*n + 1) rule); width
+        # and fonts stay fixed. Grow-only: floored at the default height (5) so a short
+        # ranking keeps the roomier default bar spacing rather than shrinking.
+        if figsize is None:
+            # Width 8.5 (up from 7) so the three panels' x-axis labels (e.g. "<test> - <ref> [%]"
+            # next to "Importance [%]") do not collide; height grows with n_top under auto_font.
+            figsize = (8.5, max(5, ranking_figheight(n_top))) if ut.check_auto_font() else (8.5, 5)
+        # Plot ranking
+        fig, axes = plot_ranking(df_feat=df_feat.copy(),
+                                 n_top=n_top, rank=rank,
+                                 col_dif=col_dif,
+                                 col_imp=col_imp,
+                                 shap_plot=shap_plot,
+                                 figsize=figsize,
+                                 tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len,
+                                 tmd_color=tmd_color, jmd_color=jmd_color,
+                                 tmd_jmd_alpha=tmd_jmd_alpha,
+                                 name_test=name_test, name_ref=name_ref,
+                                 fontsize_titles=fontsize_titles,
+                                 fontsize_labels=fontsize_labels,
+                                 fontsize_annotations=fontsize_annotations,
+                                 tmd_jmd_space=tmd_jmd_space,
+                                 xlim_dif=xlim_dif, xlim_rank=xlim_rank,
+                                 rank_info_xy=rank_info_xy,
+                                 cols_ci=cols_ci, ci_color=ci_color)
+
+        # Adjust plot
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            fig.tight_layout()
+            plt.subplots_adjust(left=0.25, wspace=0.15)
+        return ut.FigAxResult(fig, axes)
+
+    def profile(self,
+                # Data and Plot Type
+                df_feat: pd.DataFrame,
+                shap_plot: bool = False,
+                col_imp: Union[str, None] = "feat_importance",
+                normalize: bool = True,
+                ax: Optional[Axes] = None,
+                figsize: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+                cell_size: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+
+                # Appearance of Parts (TMD-JMD)
+                start: int = 1,
+                tmd_len: int = 20,
+                tmd_seq: Optional[str] = None,
+                jmd_n_seq: Optional[str] = None,
+                jmd_c_seq: Optional[str] = None,
+                tmd_color: str = "mediumspringgreen",
+                jmd_color: str = "blue",
+                tmd_seq_color: str = "black",
+                jmd_seq_color: str = "white",
+                seq_size: Union[str, int, float] = "auto",
+                seq_char_fill: Optional[bool] = None,
+                fontsize_tmd_jmd: Optional[Union[int, float]] = None,
+                weight_tmd_jmd: Literal['normal', 'bold'] = "normal",
+                add_xticks_pos: bool = False,
+                highlight_tmd_area: bool = True,
+                highlight_alpha: float = 0.15,
+
+                # Legend, Axis, and Grid Configurations
+                add_legend_cat: bool = False,
+                dict_color: Optional[dict] = None,
+                legend_kws: Optional[dict] = None,
+                bar_width: Union[int, float] = 0.75,
+                edge_color: Optional[str] = None,
+                grid_axis: Optional[Literal['x', 'y', 'both']] = None,
+                ylim: Optional[Tuple[float, float]] = None,
+                xtick_size: Union[int, float] = 11.0,
+                xtick_width: Union[int, float] = 2.0,
+                xtick_length: Union[int, float] = 5.0,
+                ytick_size: Optional[Union[int, float]] = None,
+                ytick_width: Optional[Union[int, float]] = None,
+                ytick_length: Union[int, float] = 5.0,
+                sample_kws: Optional[dict] = None,
+                ) -> Tuple[Figure, Axes]:
+        """
+        Plot CPP/-SHAP profile showing feature importance/impact per residue position.
+
+        Aggregates the ``col_imp`` values from ``df_feat`` per residue position and displays them
+        as a bar chart aligned to the TMD-JMD sequence. This reveals which positions carry the
+        most discriminative signal from :meth:`CPP.run` (group-level) or SHAP-enriched feature tables
+        (sample-level when ``shap_plot=True``).
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        df_feat : pd.DataFrame, shape (n_features, n_feature_info)
+            Feature DataFrame with a unique identifier, scale information, statistics, and positions for each feature.
+            Must also include either ``feat_importance`` or ``feat_impact`` column.
+        shap_plot : bool, default=False
+            Set the analysis type: **CPP Analysis** (if ``False``) for group-level or
+            **CPP-SHAP Analysis** for sample-level (or subgroup-level) results:
+
+             **CPP Analysis**
+
+             - ``col_imp``: Refers to the group-level `feat_importance` column (shown in gray),
+               depicted by gray bars for each residue position.
+
+             **CPP-SHAP Analysis**
+
+             - ``col_imp``: Enables the selection of specific feature impacts from a `feat_impact_'name'` column for
+               an individual sample, where positive (red) and negative (blue) feature impacts are visualized by +/- bars.
+
+        col_imp : str or None, default='feat_importance'
+            Column name in ``df_feat`` for feature importance/impact values. Must match with the ``shap_plot`` setting.
+            If ``None``, the number of features per residue position will be shown.
+        normalize : bool, default=True
+            If ``True``, normalizes aggregated numerical values to a total of 100%.
+        ax : Axes, optional
+            Pre-defined Axes object to plot on. If ``None``, a new Axes object is created.
+        figsize : tuple, optional
+            Figure dimensions (width, height) in inches. When ``None`` (default) and the global
+            ``auto_font`` option is enabled, the width tracks the sequence length (narrowing for a
+            short sequence, widening for a long one; height and fonts fixed); any explicit
+            ``figsize`` is honored as a fixed size. With ``auto_font`` disabled, ``None`` falls back
+            to ``(7, 5)``.
+        cell_size : tuple, optional
+            Target ``(width, height)`` in inches of one grid cell; only the width (per-position
+            column) applies to the single-row profile. When given, the profile width is sized to
+            this per-position width regardless of ``auto_font``. ``None`` (default) uses a
+            calibrated default on the ``auto_font`` path. Ignored when an explicit ``ax`` is passed.
+
+            .. versionadded:: 1.1.0
+
+            .. versionchanged:: 1.1.0
+                Defaults to ``None`` and participates in ``auto_font``; explicit ``figsize`` wins.
+        start : int, default=1
+            Position label of first residue position (starting at N-terminus).
+        tmd_len : int, default=20
+            Length of target middle domain (TMD) to be depicted (>0). Must match with all feature
+            from ``df_feat``.
+        tmd_seq : str, optional
+            TMD sequence for specific sample.
+        jmd_n_seq : str, optional
+            Juxta middle domain (JMD) N-terminal sequence for specific sample. Length must match
+            with 'jmd_n_len' attribute.
+        jmd_c_seq : str, optional
+            JMD C-terminal sequence for specific sample. Length must match with 'jmd_c_len' attribute.
+        tmd_color : str, default='mediumspringgreen'
+            Color for TMD.
+        jmd_color : str, default='blue'
+            Color for JMDs.
+        tmd_seq_color : str, default='black'
+            Color for TMD sequence.
+        jmd_seq_color : str, default='white'
+            Color for JMD sequence.
+        seq_size : str, int, or float, optional
+            Residue-letter size. ``"auto"`` (default) fits the letters to the grid cell and steps
+            the size down for short TMDs. A value in ``(0, 1]`` sets the letter height to that
+            fraction of the cell height (e.g. ``0.9``); a value ``> 1`` is an absolute font size in
+            points. The ``"auto"`` and fractional modes keep the letters from overlapping; an
+            absolute point size is used as given.
+        seq_char_fill : bool, optional
+            If ``True``, the sequence renders as a continuous, gap-free colored band (one full-width
+            cell per residue) with the letters drawn on top. If ``False``, each residue gets its own
+            glyph-sized colored box. If ``None`` (default), follows the ``auto_font`` option
+            (on when auto-sizing is enabled, off otherwise).
+
+            .. versionadded:: 1.1.0
+        fontsize_tmd_jmd : int or float, optional
+            Font size (>=0) for the part labels: 'JMD-N', 'TMD', 'JMD-C'. If ``None``, optimized automatically.
+        weight_tmd_jmd : {'normal', 'bold'}, default='normal'
+            Font weight for the part labels: 'JMD-N', 'TMD', 'JMD-C'.
+        add_xticks_pos : bool, default=False
+            If ``True``, include x-tick positions when TMD-JMD sequence is given.
+        highlight_tmd_area : bool, default=True
+            If ``True``, highlights the TMD area on the plot.
+        highlight_alpha : float, default=0.15
+            The transparency alpha value [0-1] for TMD area highlighting.
+        add_legend_cat : bool, default=False
+            If ``True``, the scale categories are indicated as stacked bars and a legend is added. If ``True``,
+            ensure that ``shap_plot=False``.
+        dict_color : dict, optional
+            Color dictionary of scale categories for legend. Default from :meth:`plot_get_cdict` with ``name='DICT_CAT'``.
+        legend_kws : dict, optional
+            Keyword arguments for the legend passed to :meth:`plot_legend`.
+        bar_width : int or float, default=0.75
+            Width of the bars.
+        edge_color : str, optional
+            Color of the bar edges.
+        grid_axis : {'x', 'y', 'both', None}, default=None
+            Axis on which the grid is drawn if not ``None``.
+        ylim : tuple, optional
+            Y-axis limits. If ``None``, y-axis limits are set automatically.
+        xtick_size : int or float, default=11.0
+            Size of x-tick labels (>0).
+        xtick_width : int or float, default=2.0
+            Width of the x-ticks (>0).
+        xtick_length : int or float, default=5.0
+            Length of the x-ticks (>0).
+        ytick_size : int or float, optional
+            Size of y-tick labels (>0).
+        ytick_width : int or float, optional
+            Width of the y-ticks (>0).
+        ytick_length : int or float, default=5.0
+            Length of the y-ticks (>0).
+        sample_kws : dict, optional
+            Structured bundle selecting one sample for a sample-level CPP-SHAP profile — the bundled
+            alternative to providing the TMD-JMD sequences directly. Fixed keys: ``sample`` (an
+            ``entry`` name or ``name``-column value ``str``, or a row-position ``int``), ``df_seq`` and ``df_parts``.
+            When given, ``col_imp`` is resolved to ``feat_impact_<entry>``, the TMD-JMD sequence parts
+            are read from ``df_parts`` via :meth:`SequenceFeature.get_seq_kws`, and ``shap_plot`` is
+            set to ``True`` automatically. It **overrides** any explicitly passed ``tmd_seq`` /
+            ``jmd_n_seq`` / ``jmd_c_seq``. Because the displayed sequence must stay faithful to the
+            ``df_parts`` the features map to, the sequence's own lengths set the geometry;
+            ``tmd_len`` / ``jmd_n_len`` / ``jmd_c_len`` apply only when no sequence is shown. See the
+            :ref:`keyword-dict parameters overview <kws-overview>`.
+
+        Returns
+        -------
+        fig : Figure
+            The Figure object for the CPP profile plot.
+        ax : Axes
+            CPP profile plot axes object.
+
+        Notes
+        -----
+        * ``tmd_seq_color`` and ``jmd_seq_color`` are applicable only when ``tmd_seq``, ``jmd_n_seq``,
+          and ``jmd_c_seq`` are provided.
+
+        Warnings
+        --------
+        * If ``ylim`` does not match with minimum and/or maximum of aggregate numerical values across all residue
+          position, a ``UserWarning`` is raised and ``ylim`` will be adjusted automatically.
+
+        Examples
+        --------
+        .. include:: examples/cpp_plot_profile.rst
+        """
+        # Resolve the 'sample_kws' shortcut: it sets col_imp='feat_impact_<sample>' and the TMD-JMD
+        # parts from df_parts (via SequenceFeature.get_seq_kws), the bundled alternative to passing
+        # the sequences directly. The displayed sequence's own lengths drive the grid geometry
+        # (faithful to df_parts); tmd_len/jmd_n_len/jmd_c_len only apply when no sequence is shown.
+        sample, df_seq, df_parts = unpack_sample_kws(sample_kws)
+        if sample is not None:
+            col_imp, jmd_n_seq, tmd_seq, jmd_c_seq = resolve_sample_kws(
+                sample=sample, df_seq=df_seq, df_parts=df_parts,
+                jmd_n_seq=jmd_n_seq, tmd_seq=tmd_seq, jmd_c_seq=jmd_c_seq, verbose=self._verbose)
+            shap_plot = True
+        # Check primary input
+        ut.check_bool(name="shap_plot", val=shap_plot)
+        if col_imp is None:
+            df_feat = ut.check_df_feat(df_feat=df_feat, df_cat=self._df_cat)
+        else:
+            col_imp = check_col_imp(col_imp=col_imp, shap_plot=shap_plot)
+            df_feat = ut.check_df_feat(df_feat=df_feat, df_cat=self._df_cat, shap_plot=shap_plot, cols_required=[col_imp])
+        ut.check_bool(name="normalize", val=normalize)
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        check_cell_size(cell_size=cell_size)
+
+        # Check specific TMD-JMD input
+        ut.check_number_range(name="start", val=start, min_val=0, just_int=True)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=self._jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=self._jmd_c_len)
+        # When any sequence is shown its own lengths set the grid geometry (faithful to df_parts, to
+        # which the features map); tmd_len/jmd_n_len/jmd_c_len only take effect when NO sequence is
+        # given. On the sample_kws path the parts come from df_parts, so the length-consistency guard
+        # (meant for user-supplied sequences) is relaxed.
+        args_len, args_seq = check_parts_len(tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len,
+                                             jmd_n_seq=jmd_n_seq, tmd_seq=tmd_seq, jmd_c_seq=jmd_c_seq,
+                                             check_jmd_seq_len_consistent=(sample_kws is None))
+        args_part_color = check_part_color(tmd_color=tmd_color, jmd_color=jmd_color)
+        args_seq_color = check_seq_color(tmd_seq_color=tmd_seq_color, jmd_seq_color=jmd_seq_color)
+        _fixed_seq_size, _req_size = resolve_seq_size(seq_size)
+        args_fs = ut.check_fontsize_args(seq_size=_fixed_seq_size,
+                                         fontsize_tmd_jmd=fontsize_tmd_jmd)
+        ut.check_str_options(name="weight_tmd_jmd", val=weight_tmd_jmd,
+                             list_str_options=["normal", "bold"])
+        ut.check_bool(name="add_xticks_pos", val=add_xticks_pos)
+        ut.check_bool(name="highlight_tmd_area", val=highlight_tmd_area)
+        ut.check_number_range(name="tmd_area_alpha", val=highlight_alpha, min_val=0, max_val=1, just_int=False)
+        check_match_features_seq_parts(features=df_feat[ut.COL_FEATURE],
+                                       tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len,
+                                       tmd_seq=tmd_seq, jmd_n_seq=jmd_n_seq, jmd_c_seq=jmd_c_seq)
+        check_match_shap_plot_add_legend_cat(shap_plot=shap_plot, add_legend_cat=add_legend_cat)
+
+        # Check plot styling input
+        ut.check_bool(name="add_legend_cat", val=add_legend_cat)
+        ut.check_dict(name="legend_kws", val=legend_kws, accept_none=True)
+        dict_color = check_match_dict_color_df(dict_color=dict_color, df=df_feat)
+        ut.check_number_range(name="bar_width", val=bar_width, min_val=0, just_int=False)
+        ut.check_color(name="edge_color", val=edge_color, accept_none=True)
+        ut.check_str_options(name="grid_axis", val=grid_axis, accept_none=True,
+                             list_str_options=["y", "x", "both"])
+        ut.check_lim(name="ylim", val=ylim, accept_none=True)
+        args_xtick = check_args_xtick(xtick_size=xtick_size, xtick_width=xtick_width, xtick_length=xtick_length)
+        args_ytick = check_args_ytick(ytick_size=ytick_size, ytick_width=ytick_width, ytick_length=ytick_length)
+        # seq_char_fill=None follows auto_font (edge-to-edge residue letters on the auto
+        # path, off when auto_font is disabled). Explicit True/False always wins.
+        if seq_char_fill is None:
+            seq_char_fill = ut.check_auto_font()
+        ut.check_bool(name="seq_char_fill", val=seq_char_fill)
+        # figsize is a SEED the sizer ADJUSTS. The profile is a single row, so only the WIDTH
+        # is sized (to a constant per-position column width, cell_size[0] or the default); the
+        # height stays as seeded. The sizer runs when a cell_size is set, or on the default
+        # auto_font path (figsize omitted) -- but only when we own the figure (ax is None); a
+        # user-supplied ax and an explicit figsize are both left as-is, so a multi-panel layout is
+        # never resized underneath the caller.
+        figsize_omitted = figsize is None
+        if figsize is None:
+            figsize = (7, 5)
+        cell_w = cell_size[0] if cell_size is not None else CELL_W_IN
+        size_grid = ax is None and (cell_size is not None or (ut.check_auto_font() and figsize_omitted))
+        n_positions = tmd_len + (jmd_n_len or 0) + (jmd_c_len or 0)
+
+        # Plot profile
+        fig, ax = plot_profile(df_feat=df_feat, df_cat=self._df_cat, shap_plot=shap_plot,
+                               col_imp=col_imp, normalize=normalize,
+                               figsize=figsize, ax=ax,
+                               start=start, **args_len, **args_seq,
+                               **args_part_color, **args_seq_color,
+                               **args_fs, weight_tmd_jmd=weight_tmd_jmd,
+                               add_xticks_pos=add_xticks_pos,
+                               highlight_tmd_area=highlight_tmd_area, highlight_alpha=highlight_alpha,
+                               add_legend_cat=add_legend_cat, dict_color=dict_color, legend_kws=legend_kws,
+                               bar_width=bar_width, edge_color=edge_color,
+                               grid_axis=grid_axis, ylim=ylim, **args_xtick, **args_ytick)
+
+        # Adjust plot
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            plt.tight_layout()
+        # Stage 1 -- hold the per-position column width (the profile widens for a long sequence
+        # and narrows for a short one; height and fonts stay fixed). Before the residue-letter fit.
+        if size_grid:
+            _, capped = fit_width_by_rescale(fig=fig, ax_grid=ax, n_cols=n_positions, cell_w=cell_w)
+            if capped and self._verbose:
+                ut.print_out("cell_size: sequence exceeds the max figure width; layout may be constrained.")
+        if tmd_seq is not None and _fixed_seq_size is None:
+            ax, seq_size = update_seq_size_(ax=ax, **args_seq, **args_part_color, **args_seq_color,
+                                            fill=seq_char_fill, req_size=_req_size)
+            if self._verbose:
+                ut.print_out(f"Optimized sequence character fontsize is: {seq_size}")
+        # Cap the TMD/JMD part labels and pin them a constant gap below the sequence band.
+        if size_grid:
+            finalize_part_labels_(fig=fig, ax=ax, fontsize_tmd_jmd=fontsize_tmd_jmd,
+                                  weight_tmd_jmd=weight_tmd_jmd)
+        # Stage 2 -- grow the canvas by any tight-bbox spill and translate the axes inward, so
+        # nothing clips while the per-position width stays exactly on target.
+        if size_grid:
+            grow_to_fit(fig=fig)
+        return ut.FigAxResult(fig, ax)
+
+    def heatmap(self,
+                # Data and Plot Type
+                df_feat: pd.DataFrame,
+                shap_plot: bool = False,
+                col_cat: Literal['category', 'subcategory', 'scale_name'] = "subcategory",
+                col_val: str = "mean_dif",
+                name_test: str = "TEST",
+                name_ref: str = "REF",
+                figsize: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+                cell_size: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+
+                # Appearance of Parts (TMD-JMD)
+                start: int = 1,
+                tmd_len: int = 20,
+                tmd_seq: Optional[str] = None,
+                jmd_n_seq: Optional[str] = None,
+                jmd_c_seq: Optional[str] = None,
+                tmd_color: str = "mediumspringgreen",
+                jmd_color: str = "blue",
+                tmd_seq_color: str = "black",
+                jmd_seq_color: str = "white",
+                seq_size: Union[str, int, float] = "auto",
+                seq_char_fill: Optional[bool] = None,
+                fontsize_tmd_jmd: Optional[Union[int, float]] = None,
+                weight_tmd_jmd: Literal['normal', 'bold'] = "normal",
+                fontsize_labels: Union[str, int, float] = 12,
+                add_xticks_pos: bool = False,
+
+                # Legend, Axis, and Grid Configurations
+                grid_linewidth: Union[int, float] = 0.01,
+                grid_linecolor: Optional[str] = None,
+                border_linewidth: Union[int, float] = 2,
+                facecolor_dark: Optional[bool] = None,
+                vmin: Optional[Union[int, float]] = None,
+                vmax: Optional[Union[int, float]] = None,
+                cmap: Optional[str] = None,
+                cmap_n_colors: int = 101,
+                cbar_pct: bool = True,
+                cbar_kws: Optional[dict] = None,
+                cbar_xywh: Tuple[Optional[float], Optional[float], Optional[float], Optional[float]] = (0.7, None, 0.2, None),
+                dict_color: Optional[dict] = None,
+                legend_kws: Optional[dict] = None,
+                legend_xy: Tuple[Optional[float], Optional[float]] = (-0.1, -0.01),
+                xtick_size: Union[int, float] = 11.0,
+                xtick_width: Union[int, float] = 2.0,
+                xtick_length: Union[int, float] = 5.0,
+                sample_kws: Optional[dict] = None,
+                ) -> Tuple[Figure, Axes]:
+        """
+        Plot a CPP/-SHAP heatmap showing the feature value mean difference/feature impact
+        per scale subcategory (y-axis) and residue position (x-axis).
+
+        For each (subcategory, position) cell the chosen ``col_val`` from ``df_feat`` is colour-coded,
+        giving a two-dimensional view of the physicochemical signature produced by :meth:`CPP.run`.
+        At sample level (``shap_plot=True``) the same layout visualises per-residue SHAP feature impact.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        df_feat : pd.DataFrame, shape (n_feature, n_feature_info)
+            Feature DataFrame with a unique identifier, scale information, statistics, and positions for each feature.
+            Can also include feature impact (``feat_impact``) column.
+        shap_plot : bool, default=False
+            Set the analysis type: **CPP Analysis** (if ``False``) for group-level or
+            **CPP-SHAP Analysis** for sample-level (or subgroup-level) results:
+
+             **CPP Analysis**
+
+            - ``col_val``: Displays typically the difference of feature values, either at group-level when the `mean_dif`
+              column is selected or at sample-level (group-level) when a `mean_dif_'name'` column is provided.
+
+            **CPP-SHAP Analysis**
+
+            - ``col_val``: Enables typically the selection of specific feature impacts from a `feat_impact_'name'` column
+              for an individual sample, where positive (red) and negative (blue) feature impacts are indicated.
+
+        col_cat : {'category', 'subcategory', 'scale_name'}, default='subcategory'
+            Column name in ``df_feat`` for scale classification (y-axis).
+        col_val : {'mean_dif', 'abs_mean_dif', 'abs_auc', 'feat_importance', ``mean_dif_'name'``, ``feat_impact_'name'``}, default='mean_dif'
+            Column name in ``df_feat`` for numerical values to display. Must match with the ``shap_plot`` setting.
+        name_test : str, default="TEST"
+            Name for the test dataset.
+        name_ref : str, default="REF"
+            Name for the reference dataset.
+        figsize : tuple, optional
+            Figure dimensions (width, height) in inches. When ``None`` (default) and the global
+            ``auto_font`` option is enabled, the size is derived from the grid shape so cells stay
+            a constant size (the figure shrinks for a small grid and grows for a large one); any
+            explicit ``figsize`` (including ``(8, 8)``) is honored as a fixed size. With
+            ``auto_font`` disabled, ``None`` falls back to ``(8, 8)``.
+        cell_size : tuple, optional
+            Target physical size ``(width, height)`` in inches of one grid cell. When given, the
+            figure is sized so every cell renders at this exact size (shrinking or growing as
+            needed, nothing clipping) regardless of ``auto_font``; ``None`` (default) uses a
+            calibrated default cell on the ``auto_font`` path. The standalone heatmap's default cell
+            is taller than the feature map's so row labels do not crowd.
+
+            .. versionadded:: 1.1.0
+
+            .. versionchanged:: 1.1.0
+                Defaults to ``None`` and participates in ``auto_font``; explicit ``figsize`` wins.
+        start : int, default=1
+            Position label of first residue position (starting at N-terminus).
+        tmd_len : int, default=20
+            Length of target middle domain (TMD) to be depicted (>0). Must match with all feature
+            from ``df_feat``.
+        tmd_seq : str, optional
+            TMD sequence for specific sample.
+        jmd_n_seq : str, optional
+            Juxta middle domain (JMD) N-terminal sequence for specific sample. Length must match
+            with 'jmd_n_len' attribute.
+        jmd_c_seq : str, optional
+            JMD C-terminal sequence for specific sample. Length must match with 'jmd_c_len' attribute.
+        tmd_color : str, default='mediumspringgreen'
+            Color for TMD.
+        jmd_color : str, default='blue'
+            Color for JMDs.
+        tmd_seq_color : str, default='black'
+            Color for TMD sequence.
+        jmd_seq_color : str, default='white'
+            Color for JMD sequence.
+        seq_size : str, int, or float, optional
+            Residue-letter size. ``"auto"`` (default) fits the letters to the grid cell and steps
+            the size down for short TMDs. A value in ``(0, 1]`` sets the letter height to that
+            fraction of the cell height (e.g. ``0.9``); a value ``> 1`` is an absolute font size in
+            points. The ``"auto"`` and fractional modes keep the letters from overlapping; an
+            absolute point size is used as given.
+        seq_char_fill : bool, optional
+            If ``True``, the sequence renders as a continuous, gap-free colored band (one full-width
+            cell per residue) with the letters drawn on top. If ``False``, each residue gets its own
+            glyph-sized colored box. If ``None`` (default), follows the ``auto_font`` option
+            (on when auto-sizing is enabled, off otherwise).
+
+            .. versionadded:: 1.1.0
+        fontsize_tmd_jmd : int or float, optional
+            Font size (>=0) for the part labels: 'JMD-N', 'TMD', 'JMD-C'. If ``None``, optimized automatically.
+        weight_tmd_jmd : {'normal', 'bold'}, default='normal'
+            Font weight for the part labels: 'JMD-N', 'TMD', 'JMD-C'.
+        fontsize_labels : str, int, or float, default=12
+            Font size (>= 0) for the figure labels (the scale-subcategory row labels, the
+            scale-category legend, and the colorbar). A number sets the size directly (the default
+            ``12`` leaves the output unchanged). ``"auto"`` scales the size with the
+            ``plot_settings`` font scale, caps it at about 13 pt, and shrinks it further if the
+            subcategory rows would overlap, so the rows never collide.
+
+            .. versionchanged:: 1.1.0
+                Accepts ``"auto"`` to track the ``plot_settings`` font scale without row overlap.
+        add_xticks_pos : bool, default=False
+            If ``True``, include x-tick positions when TMD-JMD sequence is given.
+        grid_linewidth : int or float, default=0.01
+            Line width for the grid.
+        grid_linecolor : str, optional
+            Color for the grid lines. If ``None``, automatically determined based on ``facecolor_dark``.
+        border_linewidth : int or float, default=2
+            Line width for the TMD-JMD border.
+        facecolor_dark : bool, optional
+            Sets background of heatmap to black (if ``True``) or white. If ``None``, automatically determined from
+            ``shap_plot`` setting. Affects grid cells for missing or near-zero data based on ``col_val``.
+        vmin : int or float, optional
+            Minimum ``col_val`` value setting the lower end of the colormap. If ``None``, determined automatically.
+        vmax : int or float, optional
+            Maximum ``col_val`` value setting the upper end of the colormap. If ``None``, determined automatically.
+        cmap : matplotlib colormap name or object, optional
+            Name of the colormap to use. If ``None``, automatically determined ``col_val`` data and 'shap_plot' setting.
+        cmap_n_colors : int, default=101
+            Number of discrete steps (>1) in diverging or sequential colormap.
+        cbar_pct : bool, default=True
+            If ``True``, colorbar is represented in percentage and the ``col_val`` values are converted
+            accordingly by multiplying with 100 if necessary.
+        cbar_kws : dict of key, value mappings, optional
+            Keyword arguments for colorbar passed to :meth:`matplotlib.figure.Figure.colorbar`.
+        cbar_xywh : tuple, default=(0.7, None, 0.2, None)
+            Colorbar position and size: x-axis (left), y-axis (bottom), width, height, in figure fractions.
+            Values are optimized if ``None``. Giving the ``y`` (bottom) value places the colorbar yourself:
+            the automatic bottom-row layout then leaves it (and the importance legend anchored to it) in place.
+        dict_color : dict, optional
+            Color dictionary of scale categories classifying scales shown on y-axis. Default from
+            :meth:`plot_get_cdict` with ``name='DICT_CAT'``.
+        legend_kws : dict, optional
+            Keyword arguments for the legend passed to :meth:`plot_legend`.
+        legend_xy : tuple, default=(-0.1, -0.01)
+            Position for scale category legend: x- and y-axis coordinates. Values are set to default if ``None``.
+        xtick_size : int or float, default=11.0
+            Size of x-tick labels (>0).
+        xtick_width : int or float, default=2.0
+            Width of the x-ticks (>0).
+        xtick_length : int or float, default=5.0
+            Length of the x-ticks (>0).
+        sample_kws : dict, optional
+            Structured bundle selecting one sample to draw its TMD-JMD sequence band — the bundled
+            alternative to providing the sequences directly. Fixed keys: ``sample`` (an ``entry`` name
+            or ``name``-column value ``str``, or a row-position ``int``), ``df_seq`` and ``df_parts``. The
+            TMD-JMD parts are read from ``df_parts`` via :meth:`SequenceFeature.get_seq_kws` and
+            **override** any explicitly passed ``tmd_seq`` / ``jmd_n_seq`` / ``jmd_c_seq``. Because the
+            displayed sequence must stay faithful to the ``df_parts`` the features map to, the
+            sequence's own lengths set the grid geometry; ``tmd_len`` / ``jmd_n_len`` / ``jmd_c_len``
+            apply only when no sequence is shown. See the :ref:`keyword-dict parameters overview <kws-overview>`.
+
+        Returns
+        -------
+        fig : Figure
+            The Figure object for the CPP heatmap.
+        ax : Axes
+            Axes object for the CPP heatmap.
+
+        Notes
+        -----
+        ``tmd_seq_color`` and ``jmd_seq_color`` are applicable only when ``tmd_seq``, ``jmd_n_seq``,
+        and ``jmd_c_seq`` are provided.
+
+        The returned figure is self-contained: the scale-category legend and the "Feature value"
+        colorbar are arranged automatically below the grid. The method manages its own layout, so
+        calling ``plt.tight_layout()`` afterwards is unnecessary (it is neutralized on the returned
+        figure to keep this furniture from being pulled back onto the heatmap);
+        ``fig.savefig(..., bbox_inches="tight")`` and ``plt.show()`` work as usual.
+
+        When no sequence is supplied (``tmd_seq`` is ``None``), the TMD and JMD regions are drawn as
+        a thin solid colored bar below the grid, kept at a constant height (a fixed fraction of a grid
+        cell-row) at any figure size.
+
+        See Also
+        --------
+        * :meth:`CPP.run` for details on CPP statistical measures of the ``df_feat`` DataFrame.
+        * :class:`SequenceFeature` for definition of sequence ``Parts``.
+        * :meth:`CPPPlot.feature` for visualization of mean differences for specific features.
+        * :meth:`seaborn.heatmap` for seaborn heatmap.
+        * :meth:`matplotlib.figure.Figure.colorbar` for colorbar arguments.
+        * `Matplotlib Colormaps <https://matplotlib.org/stable/users/explain/colors/colormaps.html>`_ for further ``cmap`` options.
+        * :meth:`plot_legend` used for setting scale category legend.
+
+        Examples
+        --------
+        .. include:: examples/cpp_plot_heatmap.rst
+        """
+        # Resolve the 'sample_kws' shortcut: read the TMD-JMD parts for one sample from df_parts (via
+        # SequenceFeature.get_seq_kws), the bundled alternative to passing the sequences directly. The
+        # heatmap shows the sequence band (no importance overlay), so only the parts are resolved.
+        sample, df_seq, df_parts = unpack_sample_kws(sample_kws)
+        if sample is not None:
+            _, jmd_n_seq, tmd_seq, jmd_c_seq = resolve_sample_kws(
+                sample=sample, df_seq=df_seq, df_parts=df_parts,
+                jmd_n_seq=jmd_n_seq, tmd_seq=tmd_seq, jmd_c_seq=jmd_c_seq, verbose=self._verbose)
+        # Check primary input
+        ut.check_bool(name="shap_plot", val=shap_plot)
+        ut.check_str_options(name="col_cat", val=col_cat,
+                             list_str_options=[ut.COL_CAT, ut.COL_SUBCAT, ut.COL_SCALE_NAME])
+        col_val = check_col_val(col_val=col_val, shap_plot=shap_plot)
+        df_feat = ut.check_df_feat(df_feat=df_feat, df_cat=self._df_cat, shap_plot=shap_plot,
+                                   cols_required=col_val, cols_nan_check=col_val)
+        ut.check_str(name="name_test", val=name_test)
+        ut.check_str(name="name_ref", val=name_ref)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        check_cell_size(cell_size=cell_size)
+
+        # Check specific TMD-JMD input
+        ut.check_number_range(name="start", val=start, min_val=0, just_int=True)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=self._jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=self._jmd_c_len)
+        # When any sequence is shown its own lengths set the grid geometry (faithful to df_parts, to
+        # which the features map); tmd_len/jmd_n_len/jmd_c_len only take effect when NO sequence is
+        # given. On the sample_kws path the parts come from df_parts, so the length-consistency guard
+        # (meant for user-supplied sequences) is relaxed.
+        args_len, args_seq = check_parts_len(tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len,
+                                             jmd_n_seq=jmd_n_seq, tmd_seq=tmd_seq, jmd_c_seq=jmd_c_seq,
+                                             check_jmd_seq_len_consistent=(sample_kws is None))
+        args_part_color = check_part_color(tmd_color=tmd_color, jmd_color=jmd_color)
+        args_seq_color = check_seq_color(tmd_seq_color=tmd_seq_color, jmd_seq_color=jmd_seq_color)
+        _fixed_seq_size, _req_size = resolve_seq_size(seq_size)
+        fontsize_labels, _shrink_labels = resolve_fontsize_labels(fontsize_labels)
+        args_fs = ut.check_fontsize_args(seq_size=_fixed_seq_size,
+                                         fontsize_tmd_jmd=fontsize_tmd_jmd,
+                                         fontsize_labels=fontsize_labels)
+        ut.check_str_options(name="weight_tmd_jmd", val=weight_tmd_jmd,
+                             list_str_options=["normal", "bold"])
+        ut.check_bool(name="add_xticks_pos", val=add_xticks_pos)
+        check_match_features_seq_parts(features=df_feat[ut.COL_FEATURE],
+                                       tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len,
+                                       tmd_seq=tmd_seq, jmd_n_seq=jmd_n_seq, jmd_c_seq=jmd_c_seq)
+
+        # Check plot styling input
+        ut.check_number_range(name="grid_linewidth", val=grid_linewidth, min_val=0, just_int=False)
+        ut.check_color(name="grid_linecolor", val=grid_linecolor, accept_none=True)
+        ut.check_number_range(name="border_linewidth", val=border_linewidth, min_val=0, just_int=False)
+        ut.check_bool(name="facecolor_dark", val=facecolor_dark, accept_none=True)
+        ut.check_vmin_vmax(vmin=vmin, vmax=vmax)
+        check_cmap_for_heatmap(cmap=cmap)
+        ut.check_number_range(name="cmap_n_colors", val=cmap_n_colors, min_val=2, accept_none=True, just_int=True)
+        ut.check_bool(name="cbar_pct", val=cbar_pct)
+        ut.check_dict(name="cbar_kws", val=cbar_kws, accept_none=True)
+        ut.check_tuple(name="cbar_xywh", val=cbar_xywh, n=4, accept_none=False,
+                       check_number=True, accept_none_number=True)
+        dict_color = check_match_dict_color_df(dict_color=dict_color, df=df_feat)
+        ut.check_dict(name="legend_kws", val=legend_kws, accept_none=True)
+        ut.check_tuple(name="legend_xy", val=legend_xy, n=2, accept_none=False,
+                       check_number=True, accept_none_number=True)
+        args_xtick = check_args_xtick(xtick_size=xtick_size, xtick_width=xtick_width, xtick_length=xtick_length)
+
+        # seq_char_fill=None follows auto_font: edge-to-edge residue letters under the
+        # (default) auto path, off when auto_font is disabled so that path stays
+        # byte-identical to the pre-auto_font output. Explicit True/False always wins.
+        if seq_char_fill is None:
+            seq_char_fill = ut.check_auto_font()
+        ut.check_bool(name="seq_char_fill", val=seq_char_fill)
+        # figsize is a SEED the sizer ADJUSTS so every grid cell hits a constant physical size
+        # (shrink for a sparse grid, grow for a dense one). The sizer runs when a cell_size is set,
+        # or on the default auto_font path (figsize omitted); an explicit figsize with no cell_size
+        # is honored as a fixed frame (auto_font then shrinks labels to fit). The standalone heatmap
+        # uses a taller default cell than the feature map (its grid fills more of the figure, so
+        # shorter rows crowd the row labels).
+        figsize_omitted = figsize is None
+        if figsize is None:
+            figsize = (8, 8)
+        cell_w, cell_h = cell_size if cell_size is not None else (CELL_W_IN, HEATMAP_CELL_H_IN)
+        cell_active = cell_size is not None
+        size_grid = cell_active or (ut.check_auto_font() and figsize_omitted)
+        optimize_labels = (ut.check_auto_font() and not figsize_omitted and not cell_active) or _shrink_labels
+        n_positions = tmd_len + (jmd_n_len or 0) + (jmd_c_len or 0)
+        n_subcat = int(df_feat[col_cat].nunique())
+        # Plot heatmap
+        fig, ax = plot_heatmap(df_feat=df_feat, df_cat=self._df_cat,
+                               shap_plot=shap_plot,
+                               col_cat=col_cat, col_val=col_val,
+                               name_test=name_test, name_ref=name_ref,
+                               figsize=figsize, optimize_labels=optimize_labels,
+                               start=start, **args_len, **args_seq,
+                               **args_part_color, **args_seq_color,
+                               **args_fs, weight_tmd_jmd=weight_tmd_jmd,
+                               add_xticks_pos=add_xticks_pos,
+                               grid_linewidth=grid_linewidth, grid_linecolor=grid_linecolor,
+                               border_linewidth=border_linewidth,
+                               facecolor_dark=facecolor_dark, vmin=vmin, vmax=vmax,
+                               cmap=cmap, cmap_n_colors=cmap_n_colors,
+                               cbar_pct=cbar_pct, cbar_kws=cbar_kws, cbar_xywh=cbar_xywh,
+                               dict_color=dict_color, legend_kws=legend_kws, legend_xy=legend_xy,
+                               **args_xtick)
+
+        # Adjust plot
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            fig.tight_layout()
+        # Stage 1 -- hold the cell size (shrink or grow; cell exact because fractions are
+        # preserved). Done before the residue-letter fit so letters match the final column width.
+        if size_grid:
+            _, _, capped = fit_cells_by_rescale(fig=fig, ax_grid=ax, n_rows=n_subcat,
+                                                n_cols=n_positions, cell_w=cell_w, cell_h=cell_h)
+            if capped and self._verbose:
+                ut.print_out("cell_size: grid exceeds the max figure size; cells may be smaller than target.")
+        if tmd_seq is not None and _fixed_seq_size is None:
+            ax, seq_size = update_seq_size_(ax=ax, **args_seq, **args_part_color, **args_seq_color,
+                                            fill=seq_char_fill, req_size=_req_size)
+            if self._verbose:
+                ut.print_out(f"Optimized sequence character fontsize is: {seq_size}")
+        # Cap the TMD/JMD part labels and pin them a constant gap below the sequence band, and pin
+        # the colorbar a constant distance below the grid (clear of the sequence on a sparse grid).
+        if size_grid:
+            finalize_part_labels_(fig=fig, ax=ax, fontsize_tmd_jmd=fontsize_tmd_jmd,
+                                  weight_tmd_jmd=weight_tmd_jmd)
+            place_colorbar_below_grid_(fig=fig, ax=ax)
+        # Stage 2 -- grow the canvas by any tight-bbox spill and translate the axes inward, so the
+        # point-sized furniture never clips while the cells stay exactly on target; then lay the
+        # scale-category legend and colorbar out as one aligned bottom row (a second grow/align pass
+        # absorbs any spill the re-placed row introduces). Gated on the sizer path so an explicit
+        # figsize keeps its exact size.
+        if size_grid:
+            for _ in range(2):
+                grow_to_fit(fig=fig)
+                align_bottom_furniture_(fig=fig, ax=ax)
+        else:
+            # Manual figsize: keep the exact figure and align the furniture at the bottom, letting
+            # the grid cells adapt to the reserved space (rather than growing the figure).
+            _align_furniture_fixed_figure(fig=fig, ax=ax, fontsize_tmd_jmd=fontsize_tmd_jmd,
+                                          weight_tmd_jmd=weight_tmd_jmd)
+        # After all layout is settled, re-run the subcategory-label shrink so any overlap a fixed
+        # figsize's tight_layout reintroduced is cleared (auto_font's zero-overlap promise).
+        _reshrink_row_labels(fig=fig, ax=ax, label_texts=df_feat[col_cat].unique(),
+                             optimize_labels=optimize_labels)
+        # Freeze on every path: a later plt.tight_layout() must not re-pack the axes and drop the
+        # colorbar/legend back onto the heatmap, whatever figure size was used.
+        _freeze_composed_layout(fig)
+        return ut.FigAxResult(fig, ax)
+
+    def feature_map(self,
+                    # Data and Plot Type
+                    df_feat: pd.DataFrame,
+                    shap_plot: bool = False,
+                    col_cat: Literal['category', 'subcategory', 'scale_name'] = "subcategory",
+                    col_val: str = "mean_dif",
+                    col_imp: str = "feat_importance",
+                    name_test: str = "TEST",
+                    name_ref: str = "REF",
+                    figsize: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+                    cell_size: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+
+                    # Feature importance
+                    add_imp_bar_top: bool = True,
+                    imp_bar_th: Optional[Union[int, float]] = None,
+                    imp_bar_label_type: Union[Literal['long', 'short'], None] = 'long',
+                    imp_ths: Tuple[Optional[float], Optional[float], Optional[float]] = (0.2, 0.5, 1),
+                    imp_marker_sizes: Tuple[Optional[float], Optional[float], Optional[float]] = (3, 5, 8),
+
+                    # Appearance of Parts (TMD-JMD)
+                    start: int = 1,
+                    tmd_len: int = 20,
+                    tmd_seq: Optional[str] = None,
+                    jmd_n_seq: Optional[str] = None,
+                    jmd_c_seq: Optional[str] = None,
+                    tmd_color: str = "mediumspringgreen",
+                    jmd_color: str = "blue",
+                    tmd_seq_color: str = "black",
+                    jmd_seq_color: str = "white",
+                    seq_size: Union[str, int, float] = "auto",
+                    fontsize_tmd_jmd: Optional[Union[int, float]] = None,
+                    weight_tmd_jmd: Literal['normal', 'bold'] = "normal",
+                    fontsize_titles: Union[int, float] = 11,
+                    fontsize_labels: Union[str, int, float] = 12,
+                    fontsize_annotations: Union[int, float] = 11,
+                    fontsize_imp_bar: Union[int, float] = 9,
+                    add_xticks_pos: bool = False,
+
+                    # Legend, Axis, and Grid Configurations
+                    grid_linewidth: Union[int, float] = 0.01,
+                    grid_linecolor: Optional[str] = None,
+                    border_linewidth: Union[int, float] = 2,
+                    facecolor_dark: bool = False,
+                    vmin: Optional[Union[int, float]] = None,
+                    vmax: Optional[Union[int, float]] = None,
+                    cmap: Optional[str] = None,
+                    cmap_n_colors: int = 101,
+                    cbar_pct: bool = True,
+                    cbar_kws: Optional[dict] = None,
+                    cbar_xywh: Tuple[Optional[float], Optional[float], Optional[float], Optional[float]] = (0.5, None, 0.2, None),
+                    dict_color: Optional[dict] = None,
+                    legend_kws: Optional[dict] = None,
+                    legend_xy: Tuple[Optional[float], Optional[float]] = (-0.1, -0.01),
+                    legend_imp_xy: Tuple[Optional[float], Optional[float]] = (1.25, 0),
+                    xtick_size: Union[int, float] = 11.0,
+                    xtick_width: Union[int, float] = 2.0,
+                    xtick_length: Union[int, float] = 5.0,
+                    seq_char_fill: Optional[bool] = None,
+                    sample_kws: Optional[dict] = None,
+                    ) -> Tuple[Figure, Axes]:
+        """
+        Plot Comparative Physicochemical Profiling (CPP) feature map showing feature value mean
+        difference and feature importance per scale subcategory (y-axis) and residue position
+        (x-axis).
+
+        Extends the heatmap layout by overlaying feature-importance markers on each cell and
+        optionally adding cumulative importance bars at the top and right, providing a combined
+        view of the direction and strength of each feature produced by :meth:`CPP.run`.
+        At sample level (``shap_plot=True``) the cumulative bars stack the per-feature SHapley
+        Additive exPlanations (SHAP) [Lundberg20]_ feature impact in one direction, colored by sign
+        (positive in red, negative in blue) — the per-sample attribution obtained via
+        :class:`ShapModel`.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        df_feat : pd.DataFrame, shape (n_feature, n_feature_info)
+            Feature DataFrame with a unique identifier, scale information, statistics, and positions for each feature.
+            Must also include a feature importance/impact column (``col_imp``).
+        shap_plot : bool, default=False
+            Set the analysis type: **CPP Analysis** (if ``False``) for group-level or
+            **CPP-SHAP Analysis** for sample-level (or subgroup-level) results:
+
+             **CPP Analysis**
+
+            - ``col_imp``: Refers to the group-level `feat_importance` column; markers and bars (gray)
+              show the cumulative feature importance per position and scale subcategory.
+            - ``col_val``: Displays the difference of feature values at group-level (`mean_dif`) or
+              sample-level when a `mean_dif_'name'` column is provided.
+
+             **CPP-SHAP Analysis**
+
+            - ``col_imp``: Selects the SHAP feature impact (per-sample attribution) from a
+              `feat_impact_'name'` column. The cumulative bars stack it in one direction colored by
+              sign (positive in red, negative in blue), and the markers encode ``abs`` impact (magnitude).
+            - ``col_val``: When a `mean_dif_'name'` column is given, the heatmap shows the sample-level
+              feature value difference and the impact bars are shown. When a `feat_impact_'name'` column
+              is given instead, the SHAP impact is shown directly in the heatmap (diverging colormap) and
+              the cumulative bars are switched off.
+
+            .. note::
+
+               A sample-level map must be colored by a *sample-specific* difference, i.e. **this one
+               sample (protein) minus the reference group average**, not by the group-level `mean_dif`
+               (test group minus reference group). Compute it per sample with
+               :meth:`ShapModel.add_sample_mean_dif` (which writes a `mean_dif_'name'` column contrasting
+               the selected sample against the ``label_ref`` group) and pass that column as ``col_val``.
+               Reusing the group-level `mean_dif` here would show the group signature under every sample's
+               SHAP impact instead of each protein's own deviation. Set ``name_ref`` to the reference
+               group's name (e.g. ``"others"``) so the colorbar label matches.
+
+        col_cat : {'category', 'subcategory', 'scale_name'}, default='subcategory'
+            Column name in ``df_feat`` for scale information (y-axis).
+        col_val : {'mean_dif', 'abs_mean_dif', 'abs_auc', ``mean_dif_'name'``, ``feat_impact_'name'``}, default='mean_dif'
+            Column name in ``df_feat`` for numerical values to display. Must match with the ``shap_plot`` setting.
+            For a sample-level (SHAP) map use a sample-specific ``mean_dif_'name'`` column (sample minus
+            reference group, from :meth:`ShapModel.add_sample_mean_dif`), not the group-level ``'mean_dif'``.
+        col_imp :  {``feat_importance``, ``feat_importance_'name'``, ``feat_impact_'name'``}, default='feat_importance'
+            Column name in ``df_feat`` for feature importance (group-, subgroup- or sample-level) or, when
+            ``shap_plot=True``, for sample-level feature impact. Must match with the ``shap_plot`` setting.
+        name_test : str, default="TEST"
+            Name for the test dataset.
+        name_ref : str, default="REF"
+            Name for the reference dataset.
+        figsize : tuple, optional
+            Figure dimensions (width, height) in inches. When ``None`` (default) and the global
+            ``auto_font`` option is enabled (see :class:`aaanalysis.options`), the size is derived
+            automatically from the grid shape (number of scale subcategories and residue
+            positions). Any explicit ``figsize`` (including ``(8, 8)``) is honored as a fixed size
+            and wins over ``auto_font`` — pass one to pin a predictable size (e.g. when embedding
+            the figure). With ``auto_font`` disabled, ``None`` falls back to ``(8, 8)``.
+
+            .. versionchanged:: 1.1.0
+                Auto-derived from the grid shape when ``auto_font`` is enabled and ``figsize`` is
+                omitted (the figure now shrinks for a small grid as well as growing for a large
+                one); an explicit ``figsize`` (without ``cell_size``) still wins.
+        cell_size : tuple, optional
+            Target physical size ``(width, height)`` in inches of one grid cell (a single residue
+            position wide, a single subcategory row tall). When given, the figure is sized so every
+            cell renders at this exact size — shrinking for a small grid and growing for a large
+            one, with nothing clipping — regardless of ``auto_font``. When ``None`` (default) the
+            ``auto_font`` path uses a calibrated default cell. ``figsize`` seeds the layout;
+            ``cell_size`` sets the cell.
+
+            .. versionadded:: 1.1.0
+        add_imp_bar_top : bool, default=True
+            If ``True``, add bars for cumulative feature importance per position (top).
+        imp_bar_th : int or float, optional
+            Threshold for cumulative feature importance per scale (right bars). If ``None``, determined automatically.
+        imp_bar_label_type : {'long', 'short', None} default='long'
+            Label type for cumulative feature importance bar chart. If ``None``, no label is shown.
+        imp_ths : tuple, default=(0.2, 0.5, 1)
+            Three ascending thresholds for feature importance (scale- and position-specific).
+        imp_marker_sizes : tuple, default=(3, 5, 8)
+            Size of three feature importance markers defined by ``imp_ths``.
+        start : int, default=1
+            Position label of first residue position (starting at N-terminus).
+        tmd_len : int, default=20
+            Length of target middle domain (TMD) to be depicted (>0). Must match with all feature
+            from ``df_feat``.
+        tmd_seq : str, optional
+            TMD sequence for specific sample.
+        jmd_n_seq : str, optional
+            Juxta middle domain (JMD) N-terminal sequence for specific sample. Length must match
+            with 'jmd_n_len' attribute.
+        jmd_c_seq : str, optional
+            JMD C-terminal sequence for specific sample. Length must match with 'jmd_c_len' attribute.
+        tmd_color : str, default='mediumspringgreen'
+            Color for TMD.
+        jmd_color : str, default='blue'
+            Color for JMDs.
+        tmd_seq_color : str, default='black'
+            Color for TMD sequence.
+        jmd_seq_color : str, default='white'
+            Color for JMD sequence.
+        seq_size : str, int, or float, optional
+            Residue-letter size. ``"auto"`` (default) fits the letters to the grid cell and steps
+            the size down for short TMDs. A value in ``(0, 1]`` sets the letter height to that
+            fraction of the cell height (e.g. ``0.9``); a value ``> 1`` is an absolute font size in
+            points. The ``"auto"`` and fractional modes keep the letters from overlapping; an
+            absolute point size is used as given.
+        fontsize_tmd_jmd : int or float, optional
+            Font size (>=0) for the part labels: 'JMD-N', 'TMD', 'JMD-C'. If ``None``, optimized automatically.
+        weight_tmd_jmd : {'normal', 'bold'}, default='normal'
+            Font weight for the part labels: 'JMD-N', 'TMD', 'JMD-C'.
+        fontsize_titles : int or float, default=11
+            Font size (>= 0) for figure titles. If ``None``, determined automatically.
+        fontsize_labels : str, int, or float, default=12
+            Font size (>= 0) for the figure labels (the scale-subcategory row labels, the
+            scale-category legend, and the colorbar). A number sets the size directly (the default
+            ``12`` leaves the output unchanged). ``"auto"`` scales the size with the
+            ``plot_settings`` font scale, caps it at about 13 pt, and shrinks it further if the
+            subcategory rows would overlap, so the rows never collide.
+
+            .. versionchanged:: 1.1.0
+                Accepts ``"auto"`` to track the ``plot_settings`` font scale without row overlap.
+        fontsize_annotations : int or float, default=11
+            Font size (>= 0) for figure annotations. If ``None``, determined automatically.
+        fontsize_imp_bar : int or float, default=9
+            Font size (>= 0) for feature importance in bars. If ``None``, determined automatically.
+        add_xticks_pos : bool, default=False
+            If ``True``, include x-tick positions when TMD-JMD sequence is given.
+        grid_linewidth : int or float, default=0.01
+            Line width for the grid.
+        grid_linecolor : str, optional
+            Color for the grid lines. If ``None``, automatically determined based on ``facecolor_dark``.
+        border_linewidth : int or float, default=2
+            Line width for the TMD-JMD border.
+        facecolor_dark : bool, default=False
+            Sets background of the feature map to black (if ``True``) or white. Affects grid cells for
+            missing or near-zero data based on ``col_val``.
+        vmin : int or float, optional
+            Minimum ``col_val`` value setting the lower end of the colormap. If ``None``, determined automatically.
+        vmax : int or float, optional
+            Maximum ``col_val`` value setting the upper end of the colormap. If ``None``, determined automatically.
+        cmap : matplotlib colormap name or object, optional
+            Name of the colormap to use. If ``None``, automatically determined ``col_val`` data and 'shap_plot' setting.
+        cmap_n_colors : int, default=101
+            Number of discrete steps (>1) in diverging or sequential colormap.
+        cbar_pct : bool, default=True
+            If ``True``, colorbar is represented in percentage and the ``col_val`` values are converted
+            accordingly by multiplying with 100 if necessary.
+        cbar_kws : dict of key, value mappings, optional
+            Keyword arguments for colorbar passed to :meth:`matplotlib.figure.Figure.colorbar`.
+        cbar_xywh : tuple, default=(0.5, None, 0.2, None)
+            Colorbar position and size: x-axis (left), y-axis (bottom), width, height, in figure fractions.
+            Values are optimized if ``None``. Giving the ``y`` (bottom) value places the colorbar yourself:
+            the automatic bottom-row layout then leaves it (and the importance legend anchored to it) in place.
+        dict_color : dict, optional
+            Color dictionary of scale categories classifying scales shown on y-axis. Default from
+            :meth:`plot_get_cdict` with ``name='DICT_CAT'``.
+        legend_kws : dict, optional
+            Keyword arguments for the legend passed to :meth:`plot_legend`.
+        legend_xy : tuple, default=(-0.1, -0.01)
+            Position for scale category legend: x- and y-axis coordinates. Values are set to default if ``None``.
+        legend_imp_xy : tuple, default=(1.25, 0)
+            Position for feature importance legend: x- and y-axis coordinates (relative to cbar).
+        xtick_size : int or float, default=11.0
+            Size of x-tick labels (>0).
+        xtick_width : int or float, default=2.0
+            Width of the x-ticks (>0).
+        xtick_length : int or float, default=5.0
+            Length of the x-ticks (>0).
+        seq_char_fill : bool, optional
+            If ``True``, the sequence renders as a continuous, gap-free colored band (one full-width
+            cell per residue) with the letters drawn on top. If ``False``, each residue gets its own
+            glyph-sized colored box. If ``None`` (default), follows the ``auto_font`` option: on when
+            auto-sizing is enabled, off otherwise
+            (so the ``auto_font=False`` output stays unchanged).
+
+            .. versionchanged:: 1.1.0
+                Now defaults to ``True`` (edge-to-edge residue characters).
+        sample_kws : dict, optional
+            Structured bundle selecting one sample for a sample-level CPP-SHAP feature map — the
+            bundled alternative to providing the TMD-JMD sequences directly. Fixed keys: ``sample``
+            (an ``entry`` name or ``name``-column value ``str``, or a row-position ``int``), ``df_seq`` and
+            ``df_parts``. When given, ``col_imp`` is resolved to ``feat_impact_<entry>`` (an int
+            position is mapped to its entry name via ``df_parts``), the TMD-JMD sequence parts are
+            read from ``df_parts`` via :meth:`SequenceFeature.get_seq_kws`, and ``shap_plot`` is set
+            to ``True`` automatically. It **overrides** any explicitly passed ``tmd_seq`` /
+            ``jmd_n_seq`` / ``jmd_c_seq``. Because the displayed sequence must stay faithful to the
+            ``df_parts`` the features map to, the sequence's own lengths set the grid geometry;
+            ``tmd_len`` / ``jmd_n_len`` / ``jmd_c_len`` apply only when no sequence is shown. See the
+            :ref:`keyword-dict parameters overview <kws-overview>`.
+
+        Returns
+        -------
+        fig : Figure
+            The Figure object for the CPP feature map.
+        ax : Axes
+            Axes object for the CPP feature map.
+
+        Notes
+        -----
+        ``tmd_seq_color`` and ``jmd_seq_color`` are applicable only when ``tmd_seq``, ``jmd_n_seq``,
+        and ``jmd_c_seq`` are provided.
+
+        The returned figure is self-contained: the scale-category legend, the "Feature value"
+        colorbar and the feature-importance legend are arranged automatically below the grid. The
+        method manages its own layout, so calling ``plt.tight_layout()`` afterwards is unnecessary
+        (it is neutralized on the returned figure to keep this furniture from being pulled back onto
+        the heatmap); ``fig.savefig(..., bbox_inches="tight")`` and ``plt.show()`` work as usual.
+
+        See Also
+        --------
+        * :meth:`CPP.run` for details on CPP statistical measures of the ``df_feat`` DataFrame.
+        * :class:`SequenceFeature` for definition of sequence ``Parts``.
+        * :meth:`CPPPlot.feature` for visualization of mean differences for specific features.
+        * :class:`ShapModel` for obtaining the sample-level ``feat_impact_'name'`` columns shown when ``shap_plot=True``.
+        * :meth:`seaborn.heatmap` for seaborn heatmap.
+        * :meth:`matplotlib.figure.Figure.colorbar` for colorbar arguments.
+        * `Matplotlib Colormaps <https://matplotlib.org/stable/users/explain/colors/colormaps.html>`_ for further ``cmap`` options.
+        * :meth:`plot_legend` used for setting scale category legend.
+
+        Examples
+        --------
+        .. include:: examples/cpp_plot_feature_map.rst
+        """
+        # Resolve the 'sample_kws' shortcut: it sets col_imp='feat_impact_<sample>' and the TMD-JMD
+        # parts from df_parts (via SequenceFeature.get_seq_kws), the bundled alternative to passing
+        # the sequences directly. The displayed sequence's own lengths drive the grid geometry
+        # (faithful to df_parts); tmd_len/jmd_n_len/jmd_c_len only apply when no sequence is shown.
+        sample, df_seq, df_parts = unpack_sample_kws(sample_kws)
+        if sample is not None:
+            col_imp, jmd_n_seq, tmd_seq, jmd_c_seq = resolve_sample_kws(
+                sample=sample, df_seq=df_seq, df_parts=df_parts,
+                jmd_n_seq=jmd_n_seq, tmd_seq=tmd_seq, jmd_c_seq=jmd_c_seq, verbose=self._verbose)
+            shap_plot = True
+        # Check primary input
+        ut.check_bool(name="shap_plot", val=shap_plot)
+        ut.check_str_options(name="col_cat", val=col_cat,
+                             list_str_options=[ut.COL_CAT, ut.COL_SUBCAT, ut.COL_SCALE_NAME])
+        col_val = check_col_val(col_val=col_val, shap_plot=shap_plot, sample_mean_dif=True)
+        col_imp = check_col_imp(col_imp=col_imp, shap_plot=shap_plot)
+        df_feat = ut.check_df_feat(df_feat=df_feat, df_cat=self._df_cat, shap_plot=shap_plot,
+                                   cols_required=[col_val, col_imp],
+                                   cols_nan_check=col_val)
+        ut.check_str(name="name_test", val=name_test)
+        ut.check_str(name="name_ref", val=name_ref)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        check_cell_size(cell_size=cell_size)
+
+        #  Check feature importance presentation input
+        ut.check_bool(name="add_imp_bar_top", val=add_imp_bar_top)
+        ut.check_number_range(name="imp_bar_th", val=imp_bar_th, accept_none=True, min_val=0, just_int=False)
+        ut.check_str_options(name="imp_bar_label_type", val=imp_bar_label_type, accept_none=True,
+                             list_str_options=["short", "long", None])
+        check_imp_tuples(name="imp_ths", imp_tuples=imp_ths)
+        check_imp_tuples(name="imp_marker_sizes", imp_tuples=imp_marker_sizes)
+
+        # Check specific TMD-JMD input
+        ut.check_number_range(name="start", val=start, min_val=0, just_int=True)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=self._jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=self._jmd_c_len)
+        # When any sequence is shown its own lengths set the grid geometry (faithful to df_parts, to
+        # which the features map); tmd_len/jmd_n_len/jmd_c_len only take effect when NO sequence is
+        # given. On the sample_kws path the parts come from df_parts, so the length-consistency guard
+        # (meant for user-supplied sequences) is relaxed.
+        args_len, args_seq = check_parts_len(tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len,
+                                             jmd_n_seq=jmd_n_seq, tmd_seq=tmd_seq, jmd_c_seq=jmd_c_seq,
+                                             check_jmd_seq_len_consistent=(sample_kws is None))
+        args_part_color = check_part_color(tmd_color=tmd_color, jmd_color=jmd_color)
+        args_seq_color = check_seq_color(tmd_seq_color=tmd_seq_color, jmd_seq_color=jmd_seq_color)
+        _fixed_seq_size, _req_size = resolve_seq_size(seq_size)
+        fontsize_labels, _shrink_labels = resolve_fontsize_labels(fontsize_labels)
+        args_fs = ut.check_fontsize_args(seq_size=_fixed_seq_size,
+                                         fontsize_tmd_jmd=fontsize_tmd_jmd,
+                                         fontsize_titles=fontsize_titles,
+                                         fontsize_labels=fontsize_labels,
+                                         fontsize_annotations=fontsize_annotations,
+                                         fontsize_imp_bar=fontsize_imp_bar)
+        ut.check_str_options(name="weight_tmd_jmd", val=weight_tmd_jmd,
+                             list_str_options=["normal", "bold"])
+        ut.check_bool(name="add_xticks_pos", val=add_xticks_pos)
+        check_match_features_seq_parts(features=df_feat[ut.COL_FEATURE],
+                                       tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len,
+                                       tmd_seq=tmd_seq, jmd_n_seq=jmd_n_seq, jmd_c_seq=jmd_c_seq)
+        # Check plot styling input
+        ut.check_number_range(name="grid_linewidth", val=grid_linewidth, min_val=0, just_int=False)
+        ut.check_color(name="grid_linecolor", val=grid_linecolor, accept_none=True)
+        ut.check_number_range(name="border_linewidth", val=border_linewidth, min_val=0, just_int=False)
+        ut.check_bool(name="facecolor_dark", val=facecolor_dark, accept_none=False)
+        ut.check_vmin_vmax(vmin=vmin, vmax=vmax)
+        check_cmap_for_heatmap(cmap=cmap)
+        ut.check_number_range(name="cmap_n_colors", val=cmap_n_colors, min_val=2, accept_none=True, just_int=True)
+        ut.check_bool(name="cbar_pct", val=cbar_pct)
+        ut.check_dict(name="cbar_kws", val=cbar_kws, accept_none=True)
+        ut.check_tuple(name="cbar_xywh", val=cbar_xywh, n=4, accept_none=False,
+                       check_number=True, accept_none_number=True)
+        dict_color = check_match_dict_color_df(dict_color=dict_color, df=df_feat)
+        ut.check_dict(name="legend_kws", val=legend_kws, accept_none=True)
+        ut.check_tuple(name="legend_xy", val=legend_xy, n=2, accept_none=False,
+                       check_number=True, accept_none_number=True)
+        ut.check_tuple(name="legend_imp_xy", val=legend_imp_xy, n=2, accept_none=False,
+                       check_number=True, accept_none_number=True)
+        # seq_char_fill=None follows auto_font: edge-to-edge residue letters under the
+        # (default) auto path, off when auto_font is disabled so that path stays
+        # byte-identical to the pre-auto_font output. Explicit True/False always wins.
+        if seq_char_fill is None:
+            seq_char_fill = ut.check_auto_font()
+        ut.check_bool(name="seq_char_fill", val=seq_char_fill)
+        args_xtick = check_args_xtick(xtick_size=xtick_size, xtick_width=xtick_width, xtick_length=xtick_length)
+
+        # figsize is a SEED the sizer ADJUSTS so every grid cell renders at a constant physical
+        # size -- the figure shrinks for a small grid and grows for a large one. The sizer runs
+        # when a cell_size is set, or on the default auto_font path (figsize omitted). An explicit
+        # figsize with no cell_size is honored as a fixed frame (auto_font then shrinks labels to
+        # fit via optimize_labels), so embedded consumers keep a predictable size. cell_size
+        # (width, height) inches sets the target cell; else the calibrated default.
+        figsize_omitted = figsize is None
+        if figsize is None:
+            figsize = (8, 8)
+        cell_w, cell_h = cell_size if cell_size is not None else (CELL_W_IN, CELL_H_IN)
+        cell_active = cell_size is not None
+        size_grid = cell_active or (ut.check_auto_font() and figsize_omitted)
+        optimize_labels = (ut.check_auto_font() and not figsize_omitted and not cell_active) or _shrink_labels
+        # jmd lengths are validated non-None above; `or 0` keeps the sum typed.
+        n_positions = tmd_len + (jmd_n_len or 0) + (jmd_c_len or 0)
+        n_subcat = int(df_feat[col_cat].nunique())
+
+        # Plot feature map
+        fig, ax = plot_feature_map(df_feat=df_feat, df_cat=self._df_cat,
+                                   shap_plot=shap_plot,
+                                   col_cat=col_cat, col_val=col_val, col_imp=col_imp,
+                                   name_test=name_test, name_ref=name_ref,
+                                   figsize=figsize,
+                                   add_imp_bar_top=add_imp_bar_top,
+                                   imp_bar_th=imp_bar_th,
+                                   imp_bar_label_type=imp_bar_label_type,
+                                   imp_ths=imp_ths, imp_marker_sizes=imp_marker_sizes,
+                                   start=start, **args_len, **args_seq,
+                                   **args_part_color, **args_seq_color,
+                                   **args_fs, weight_tmd_jmd=weight_tmd_jmd,
+                                   add_xticks_pos=add_xticks_pos,
+                                   grid_linewidth=grid_linewidth, grid_linecolor=grid_linecolor,
+                                   border_linewidth=border_linewidth,
+                                   facecolor_dark=facecolor_dark, vmin=vmin, vmax=vmax,
+                                   cmap=cmap, cmap_n_colors=cmap_n_colors,
+                                   cbar_pct=cbar_pct, cbar_kws=cbar_kws, cbar_xywh=cbar_xywh,
+                                   dict_color=dict_color, legend_kws=legend_kws, legend_xy=legend_xy,
+                                   legend_imp_xy=legend_imp_xy, seq_char_fill=seq_char_fill,
+                                   optimize_labels=optimize_labels, size_grid=size_grid,
+                                   **args_xtick)
+        # Adjust plot. Leave a little more room on the right than the heatmap needs
+        # so the cumulative-importance bar column's label ("Cumulative feature
+        # importance") and its per-category percentage annotations are not clipped at
+        # the figure edge under the default figsize/font scale.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            fig.tight_layout()
+            # Reserve a CONSTANT ABSOLUTE width (inches) on the right for the multi-line
+            # "Cumulative feature importance" label, not a fixed 8% fraction: at a narrow
+            # figure (short sequence / few subcats) 8% is too few inches and the label clips.
+            # Skip when tight_layout's left margin (e.g. a far-left custom legend_xy) already
+            # exceeds the reserve, which would otherwise invert the margins; grow_to_fit still
+            # prevents any clip.
+            _right = max(0.6, 1.0 - _RIGHT_LABEL_IN / fig.get_size_inches()[0])
+            if _right > fig.subplotpars.left:
+                plt.subplots_adjust(right=_right)
+        # Stage 1 -- hold the cell size: rescale the whole figure so every heatmap cell hits
+        # (cell_w, cell_h) inches. tight_layout's fractions are preserved, so the cell is exact;
+        # the figure shrinks for a sparse grid and grows for a dense one. Point-based fonts stay
+        # fixed. Done before the residue-letter fit below, so letters match the final column width.
+        if size_grid:
+            _, _, capped = fit_cells_by_rescale(fig=fig, ax_grid=ax, n_rows=n_subcat,
+                                                n_cols=n_positions, cell_w=cell_w, cell_h=cell_h)
+            if capped and self._verbose:
+                ut.print_out("cell_size: grid exceeds the max figure size; cells may be smaller than target.")
+        # Anchor the scale-category legend at the ROW-LABEL left edge (not the grid's left edge),
+        # a fixed points-distance below the grid, in AXES coordinates. Anchoring at the grid edge
+        # pushes a wide legend into the centred colorbar; the row-label left sits it under the
+        # subcategory labels (the canonical layout), clear of the colorbar. An axes anchor keeps
+        # that offset at any figure size and rides the grid when grow_to_fit shifts the axes. Skip
+        # only when the user supplied a custom legend_xy.
+        cat_legend = ax.get_legend()
+        if cat_legend is not None and tuple(legend_xy) == (-0.1, -0.01):
+            # Left edge of the grid's own content (row labels + title), measured with the legend
+            # hidden so it does not feed back into its own anchor.
+            cat_legend.set_visible(False)
+            fig.canvas.draw()
+            _content_x0 = ax.get_tightbbox(fig.canvas.get_renderer()).x0
+            _x_left = ax.transAxes.inverted().transform((_content_x0, 0.0))[0]
+            cat_legend.set_visible(True)
+            _below = mtransforms.ScaledTranslation(0.0, -_LEGEND_BELOW_GRID_PT / 72.0, fig.dpi_scale_trans)
+            cat_legend.set_loc("upper left")
+            cat_legend.set_bbox_to_anchor((_x_left, 0.0), transform=ax.transAxes + _below)
+        if tmd_seq is not None and _fixed_seq_size is None:
+            ax, seq_size = update_seq_size_(ax=ax, **args_seq, **args_part_color, **args_seq_color,
+                                            fill=seq_char_fill, req_size=_req_size)
+            if self._verbose:
+                ut.print_out(f"Optimized sequence character fontsize is: {seq_size}")
+        # Cap the TMD/JMD part-label font and pin it a constant gap below the sequence band, so
+        # the label size and its distance to the sequence stay constant across grid sizes (both
+        # otherwise ride the ballooning residue-letter size). Uses the final letters above.
+        # Pin the colorbar a constant distance below the grid too, so it (and its importance-dot
+        # legend) never rides into the sequence on a sparse grid.
+        if size_grid:
+            finalize_part_labels_(fig=fig, ax=ax, fontsize_tmd_jmd=fontsize_tmd_jmd,
+                                  weight_tmd_jmd=weight_tmd_jmd)
+            place_colorbar_below_grid_(fig=fig, ax=ax)
+        # The top importance bar shares the position x-axis with the heatmap, so it
+        # redundantly repeats the position ticks (1/10/30/40) ABOVE the grid — and
+        # set_box_aspect makes it worse. Keep the position ticks on the heatmap
+        # (bottom) only by hiding the x-tick labels of every top-row axis (the top
+        # importance bar and the empty top-right cell). The tall right importance
+        # bar (which legitimately labels its own scale at the top) is left alone.
+        # Done last so tight_layout cannot re-show them.
+        top_edge = ax.get_position().y1
+        for other in fig.axes:
+            if other is not ax and other.get_position().y0 >= top_edge - 0.05:
+                other.tick_params(axis="x", labelbottom=False, labeltop=False, length=0)
+                for lbl in other.get_xticklabels():
+                    lbl.set_visible(False)
+        # Stage 2 -- absorb any furniture that overflows the shrunken figure: grow the canvas by
+        # the tight-bbox spill and translate every axes inward. A translation preserves the cell
+        # size, so the grid stays exactly on target while nothing clips the figure edge. Then lay
+        # the scale-category legend, colorbar and importance legend out as one aligned bottom row;
+        # a second grow/align pass absorbs any spill the re-placed row introduces. Gated on the
+        # sizer path: an explicit figsize is honored at its exact size (the furniture is anchored
+        # by the backend defaults), so the canvas is never grown out from under the caller.
+        if size_grid:
+            for _ in range(2):
+                grow_to_fit(fig=fig)
+                align_bottom_furniture_(fig=fig, ax=ax)
+        else:
+            # Manual figsize: keep the exact figure and align the furniture at the bottom, letting
+            # the grid cells adapt to the reserved space (rather than growing the figure).
+            _align_furniture_fixed_figure(fig=fig, ax=ax, fontsize_tmd_jmd=fontsize_tmd_jmd,
+                                          weight_tmd_jmd=weight_tmd_jmd)
+        # After all layout is settled, re-run the subcategory-label shrink so any overlap a fixed
+        # figsize's tight_layout reintroduced is cleared (auto_font's zero-overlap promise). The
+        # per-row cumulative-importance % annotations are shrunk the same way.
+        _reshrink_row_labels(fig=fig, ax=ax, label_texts=df_feat[col_cat].unique(),
+                             optimize_labels=optimize_labels)
+        _reshrink_importance_pcts(fig=fig, ax_grid=ax, optimize_labels=optimize_labels)
+        # Scale the ■ feature-impact markers to the final cell size (no-op at the default cell) so
+        # they do not overflow the shrunken cells of a small manual figsize.
+        _rescale_impact_markers(fig=fig, ax=ax, n_rows=n_subcat)
+        # Freeze on EVERY path (auto, cell_size, manual figsize): a later plt.tight_layout() would
+        # re-pack the axes and drop the furniture back onto the heatmap regardless of how the
+        # figure was sized. This is the fix for the "legend lands on the heatmap" report.
+        _freeze_composed_layout(fig)
+        return ut.FigAxResult(fig, ax)
+
+    def update_seq_size(self,
+                        ax: Axes,
+                        fig: Optional[Figure] = None,
+                        max_x_dist: float = 0.1,
+                        fontsize_tmd_jmd: Optional[Union[int, float]] = None,
+                        weight_tmd_jmd: Literal['normal', 'bold'] = 'normal',
+                        tmd_color: str = "mediumspringgreen",
+                        jmd_color: str = "blue",
+                        tmd_seq_color: str = "black",
+                        jmd_seq_color: str = "white",
+                        ) -> Tuple[Figure, Axes]:
+        """
+        Update the font size of the sequence characters to prevent overlap.
+
+        This method adjusts the font size of TMD-JMD sequence characters based on their provided sequences
+        to ensure that the labels are clearly legible and do not overlap in the plot.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        ax : Axes
+            Comparative Physicochemical Profiling (CPP) plot axes object.
+        fig : Figure, optional
+            CPP plot figure object. If given, ``fontsize_tmd_jmd`` will be automatically adjusted.
+        max_x_dist : float, default=0.1
+            Maximum allowed horizontal distance between sequence characters during font size optimization.
+            A greater value reduces potential overlaps of sequence characters.
+        fontsize_tmd_jmd : int or float, optional
+            Font size (>=0) for the part labels: 'JMD-N', 'TMD', 'JMD-C'. If ``None``, optimized automatically.
+        weight_tmd_jmd : {'normal', 'bold'}, default='normal'
+            Font weight for the part labels: 'JMD-N', 'TMD', 'JMD-C'.
+        tmd_color : str, default='mediumspringgreen'
+            Color for target middle domain (TMD).
+        jmd_color : str, default='blue'
+            Color for juxta middle domains (JMDs).
+        tmd_seq_color : str, default='black'
+            Color for TMD sequence.
+        jmd_seq_color : str, default='white'
+            Color for JMD sequences.
+
+        Returns
+        -------
+        fig : Figure
+            Figure object containing the plot.
+        ax : Axes
+            CPP plot axes object.
+
+        Notes
+        -----
+        * Returned as a ``(fig, ax)`` pair (see :class:`CPPPlot` for the shared return contract).
+        * Use :meth:`CPPPlot.update_seq_size` AFTER :func:`matplotlib.pyplot.tight_layout`.
+
+        See Also
+        --------
+        * :meth:`CPPPlot.profile` and :meth:`CPPPlot.heatmap` methods, which also use the ``tmd_seq``, ``jmd_n_seq``,
+          and ``jmd_c_seq`` parameters. :meth:`CPPPlot.update_seq_size` should be called after further plot
+          modifications that alter the size of figure or x-axis.
+
+        Examples
+        --------
+        .. include:: examples/cpp_plot_update_seq_size.rst
+        """
+        # Check input
+        ax = ut.check_ax(ax=ax, accept_none=False, return_first=True)
+        ut.check_fig(fig=fig, accept_none=True)
+        ut.check_number_range(name="max_x_dist", val=max_x_dist, min_val=0, just_int=False)
+        ut.check_number_range(name="fontsize_tmd_jmd", val=fontsize_tmd_jmd, min_val=0, accept_none=True, just_int=False)
+        ut.check_str_options(name="weight_tmd_jmd", val=weight_tmd_jmd,
+                             list_str_options=["normal", "bold"])
+        args_part_color = check_part_color(tmd_color=tmd_color, jmd_color=jmd_color)
+        args_seq_color = check_seq_color(tmd_seq_color=tmd_seq_color, jmd_seq_color=jmd_seq_color)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=self._jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=self._jmd_c_len)
+        check_match_ax_seq_len(ax=ax, jmd_c_len=jmd_c_len, jmd_n_len=jmd_n_len)
+        # Adjust font size to prevent overlap
+        jmd_n_seq, tmd_seq, jmd_c_seq = get_tmd_jmd_seq(ax=ax, jmd_c_len=jmd_c_len, jmd_n_len=jmd_n_len)
+        args_len, args_seq = check_parts_len(jmd_n_seq=jmd_n_seq, tmd_seq=tmd_seq, jmd_c_seq=jmd_c_seq,
+                                             jmd_c_len=jmd_c_len, jmd_n_len=jmd_n_len)
+        ax, seq_size = update_seq_size_(ax=ax, **args_seq, max_x_dist=max_x_dist, **args_part_color, **args_seq_color)
+        update_tmd_jmd_labels(fig=fig, seq_size=seq_size,
+                              fontsize_tmd_jmd=fontsize_tmd_jmd,
+                              weight_tmd_jmd=weight_tmd_jmd)
+        if self._verbose:
+            ut.print_out(f"Optimized sequence character fontsize is: {seq_size}")
+        return ut.FigAxResult(ax.get_figure(), ax)

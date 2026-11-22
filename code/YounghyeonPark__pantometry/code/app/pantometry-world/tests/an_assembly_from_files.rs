@@ -1,0 +1,586 @@
+//! A scene can name STL files and get an assembly: parts where their own coordinates put them,
+//! nothing between them, and a rasterisation report for what the grid cost.
+//!
+//! The library could do this a commit ago and no file could ask for it — the oldest shape in
+//! `FRICTION.md`. What a scene could state before was a box of one material with boxes of other
+//! materials cut into it, which is a layered wall and not an assembly.
+
+use pantometry_world::{Scene, World};
+
+fn scene(json: &str) -> Scene {
+    serde_json::from_str(json).expect("the test scene parses")
+}
+
+/// Write a binary STL of an axis-aligned brick, in **millimetres**, and give back its path.
+///
+/// Millimetres because that is what an STL means: the format is unitless and every CAD tool
+/// writes mm, so `Mesh::from_stl` scales by `1e-3`. Writing metres here made every brick a
+/// thousand times too small, which voxelised to no cells at all — the first version of this
+/// fixture did exactly that, and the error it produced ("every part voxelised to no cells") was
+/// the right one for a reason it did not name.
+///
+/// Written by the test rather than committed as a fixture: the geometry under test should be
+/// visible beside the assertion, not one binary file away from it. Binary rather than ASCII
+/// because that is what a CAD tool exports.
+fn brick_stl(dir: &std::path::Path, name: &str, low: [f32; 3], high: [f32; 3]) -> String {
+    let v = |i: usize| {
+        [
+            if i & 1 == 0 { low[0] } else { high[0] },
+            if i & 2 == 0 { low[1] } else { high[1] },
+            if i & 4 == 0 { low[2] } else { high[2] },
+        ]
+    };
+    // Twelve triangles, wound so each face's normal points out of the brick.
+    let tris: [[usize; 3]; 12] = [
+        [0, 4, 6],
+        [0, 6, 2],
+        [1, 3, 7],
+        [1, 7, 5],
+        [0, 1, 5],
+        [0, 5, 4],
+        [2, 6, 7],
+        [2, 7, 3],
+        [0, 2, 3],
+        [0, 3, 1],
+        [4, 5, 7],
+        [4, 7, 6],
+    ];
+
+    let mut bytes = vec![0u8; 80];
+    bytes.extend_from_slice(&(tris.len() as u32).to_le_bytes());
+    for t in tris {
+        // The normal is left at zero: STL stores one and every reader worth the name recomputes
+        // it from the winding, which is the only copy that cannot disagree with the vertices.
+        bytes.extend_from_slice(&[0u8; 12]);
+        for idx in t {
+            for component in v(idx) {
+                bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        bytes.extend_from_slice(&[0u8; 2]);
+    }
+
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("the fixture is writable");
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// A scratch directory of this test's own, removed by the OS eventually and unique per run.
+///
+/// **It said "unique per run" and was not**: the name was `pantometry-assembly-{tag}` with no
+/// process in it, so any two runs of this binary at once wrote and read the same `left.stl`. One
+/// finishing its write while another read gave `no facets found; is this an STL?` on a fixture
+/// the failing test had itself just written — four tests in one gate run, all passing alone. The
+/// process id is what makes the sentence true.
+///
+/// Not a determinism problem: this is a path for a fixture, not an input to any physics. Nothing
+/// downstream of it reads the number.
+fn scratch(tag: &str) -> std::path::PathBuf {
+    let dir =
+        std::env::temp_dir().join(format!("pantometry-assembly-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    dir
+}
+
+/// **Two parts from two files land where their files put them, with nothing between them.**
+///
+/// The left brick spans 0–20 mm and the right 25–40 mm on a 5 mm grid, so there is one empty
+/// column between them — and it is *empty*, not the block's bulk material, which is what makes
+/// this an assembly in air rather than two inclusions in a billet.
+#[test]
+fn two_parts_from_files_assemble_with_a_gap_of_nothing() {
+    let dir = scratch("gap");
+    let left = brick_stl(&dir, "left.stl", [0.0, 0.0, 0.0], [20.0, 10.0, 10.0]);
+    let right = brick_stl(&dir, "right.stl", [25.0, 0.0, 0.0], [40.0, 10.0, 10.0]);
+
+    let json = format!(
+        r#"{{
+  "title": "two parts in air",
+  "duration_s": 1.0,
+  "frames": 1,
+  "domains": [
+    {{ "kind": "block", "name": "assembly", "cells": [8, 2, 2], "cell_mm": 5.0,
+      "initial_c": 20.0,
+      "parts": [
+        {{ "stl": "{left}", "material": "copper" }},
+        {{ "stl": "{right}", "material": "aluminium" }}
+      ] }}
+  ]
+}}"#
+    );
+
+    let world = World::build(scene(&json)).expect("the assembly builds");
+    let block = world
+        .simulation()
+        .domain_as::<pantometry::thermal::Solid3D>("assembly")
+        .expect("the block is there");
+
+    // Columns 0..4 are the left part, 5..8 the right, and column 4 is the gap.
+    for i in 0..8 {
+        let void = block.is_void(i, 0, 0);
+        assert_eq!(
+            void,
+            i == 4,
+            "column {i} should be {}",
+            if i == 4 { "empty" } else { "part of something" }
+        );
+    }
+    assert_eq!(
+        block.substance_at(0, 0, 0).name,
+        pantometry::prelude::Substance::copper().name
+    );
+
+    // And the build reported what it cost, note by note rather than by counting them — a count
+    // fails whenever anything new is worth saying, which is not the same as something being wrong.
+    let notes = world.notes();
+    let costs: Vec<&String> = notes.iter().filter(|n| n.contains("volume")).collect();
+    assert_eq!(costs.len(), 2, "one cost per part: {notes:?}");
+    for note in &costs {
+        assert!(note.contains("boundary cells"), "{note}");
+    }
+
+    // **And what the clearance's answer is resting on.** These two 10 x 10 mm faces are 5 mm
+    // apart, so `X = Y = 2` and a gap open to space would see 0.415 of itself — the block charges
+    // the infinite-plate exchange, which is exact for the mirrored sides it has, and the note says
+    // how much that reading is worth so a user who meant *open* can see the factor rather than
+    // discover it.
+    let clearance = notes
+        .iter()
+        .find(|n| n.contains("clearance"))
+        .unwrap_or_else(|| panic!("the gap should be reported: {notes:?}"));
+    assert!(
+        clearance.contains("0.415") && clearance.contains("2.4x"),
+        "{clearance}"
+    );
+}
+
+/// **Heat crosses a join, and across a gap only radiation does.**
+///
+/// The physics that makes void worth having, through the file path. The left part starts hot and
+/// nothing else feeds the block, so the only way the far end warms is whatever the space between
+/// the two parts will carry.
+///
+/// **This assertion has been wrong once and the correction is the interesting part.** It read
+/// "nothing carries nothing" and required the far end not to have moved by a bit, which was true
+/// on the day void arrived and false a commit later, when gaps started radiating — real physics
+/// that a vacuum clearance always has. What it pins now is the **ratio**, which is the stronger
+/// statement and the one a reader can check against the conductances: for these 5 mm cells a
+/// shared copper face is `kA/dx` = **2.005 W/K** against the gap's `4σT³A/(1/ε₁+1/ε₂−1)` =
+/// **2.2e-5 W/K** at the hot end — five orders of magnitude, and most of that is copper's
+/// emissivity of **0.04**, which is the same fact scene `23` is built to ask about.
+///
+/// **No heater**, and that is a correction rather than a simplification: the first version of
+/// this test drove both cases with one and read the gapped assembly as *hotter*. It has one cell
+/// fewer, so the same joules spread over less capacity — the test was measuring heat capacity
+/// and calling it conduction. With nothing arriving, the far part's temperature is about the
+/// path and nothing else.
+#[test]
+fn heat_crosses_a_join_and_not_a_gap() {
+    let dir = scratch("join");
+    let left = brick_stl(&dir, "left.stl", [0.0, 0.0, 0.0], [20.0, 10.0, 10.0]);
+    let touching = brick_stl(&dir, "touching.stl", [20.0, 0.0, 0.0], [40.0, 10.0, 10.0]);
+    let apart = brick_stl(&dir, "apart.stl", [25.0, 0.0, 0.0], [40.0, 10.0, 10.0]);
+
+    let run_with = |right: &str| {
+        let json = format!(
+            r#"{{
+  "title": "a join or a gap",
+  "duration_s": 60.0,
+  "frames": 2,
+  "domains": [
+    {{ "kind": "block", "name": "assembly", "cells": [8, 2, 2], "cell_mm": 5.0,
+      "initial_c": 20.0,
+      "parts": [
+        {{ "stl": "{left}", "material": "copper" }},
+        {{ "stl": "{right}", "material": "copper" }}
+      ] }}
+  ]
+}}"#
+        );
+        let mut world = World::build(scene(&json)).expect("builds");
+        {
+            let block = world
+                .simulation_mut()
+                .domain_as_mut::<pantometry::thermal::Solid3D>("assembly")
+                .expect("the block is there");
+            for k in 0..2 {
+                for j in 0..2 {
+                    for i in 0..4 {
+                        block.set_temperature(
+                            i,
+                            j,
+                            k,
+                            pantometry::units::Temperature::celsius(300.0),
+                        );
+                    }
+                }
+            }
+        }
+        world.run().expect("runs");
+        let block = world
+            .simulation()
+            .domain_as::<pantometry::thermal::Solid3D>("assembly")
+            .expect("the block is there");
+        block.temperature_at(7, 0, 0).to_si()
+    };
+
+    let start = pantometry::units::Temperature::celsius(20.0).to_si();
+    let joined = run_with(&touching);
+    let gapped = run_with(&apart);
+    assert!(
+        joined > start + 50.0,
+        "a shared face should carry the heat: {joined:.2} K from {start:.2} K"
+    );
+    // A gap carries something, because two surfaces that see each other radiate — and it carries
+    // so much less than metal that the two cases are not close. Bounded on both sides: a floor,
+    // so a gap that stopped radiating would fail here rather than pass more easily, and a ceiling
+    // three orders of magnitude under the joined rise.
+    assert!(
+        gapped > start,
+        "two faces that see each other radiate: {gapped:.6} K from {start:.2} K"
+    );
+    assert!(
+        (gapped - start) < (joined - start) / 100.0,
+        "and radiation across nothing is nothing like a shared face: {gapped:.4} K against \
+         {joined:.4} K"
+    );
+}
+
+/// **A part that reaches outside the block is refused with both boxes named**, rather than
+/// cropped into a different shape.
+#[test]
+fn a_part_that_does_not_fit_is_refused() {
+    let dir = scratch("toobig");
+    let big = brick_stl(&dir, "big.stl", [0.0, 0.0, 0.0], [60.0, 10.0, 10.0]);
+    let json = format!(
+        r#"{{
+  "title": "a part too long for its block",
+  "duration_s": 1.0,
+  "frames": 1,
+  "domains": [
+    {{ "kind": "block", "name": "assembly", "cells": [8, 2, 2], "cell_mm": 5.0,
+      "initial_c": 20.0,
+      "parts": [ {{ "stl": "{big}", "material": "copper" }} ] }}
+  ]
+}}"#
+    );
+    let why = World::build(scene(&json))
+        .err()
+        .expect("a part longer than its block must refuse");
+    assert!(why.contains("cut off"), "{why}");
+}
+
+/// **A missing file names itself**, and a set of parts that voxelised to nothing is refused
+/// rather than run as an empty box.
+#[test]
+fn a_missing_file_and_an_empty_assembly_are_both_refused() {
+    let json = |parts: &str| {
+        format!(
+            r#"{{
+  "title": "nothing to assemble",
+  "duration_s": 1.0,
+  "frames": 1,
+  "domains": [
+    {{ "kind": "block", "name": "assembly", "cells": [4, 2, 2], "cell_mm": 5.0,
+      "initial_c": 20.0, "parts": [{parts}] }}
+  ]
+}}"#
+        )
+    };
+
+    let why = World::build(scene(&json(
+        r#"{ "stl": "definitely-not-here.stl", "material": "copper" }"#,
+    )))
+    .err()
+    .expect("a missing mesh must refuse");
+    assert!(why.contains("definitely-not-here.stl"), "{why}");
+
+    // A brick far smaller than one cell rasterises to nothing at all.
+    let dir = scratch("tiny");
+    let tiny = brick_stl(&dir, "tiny.stl", [1.0, 1.0, 1.0], [1.2, 1.2, 1.2]);
+    let why = World::build(scene(&json(&format!(
+        r#"{{ "stl": "{tiny}", "material": "copper" }}"#
+    ))))
+    .err()
+    .expect("an assembly of nothing must refuse");
+    assert!(why.contains("no cells"), "{why}");
+}
+
+/// **The same bytes give the same block whether they came from a disk or from a page.**
+///
+/// The claim the browser rests on. A scene's `parts` names a file, and on a machine that string is
+/// a path; in a tab there is no filesystem and it is a label for bytes somebody dropped on the
+/// window. If those two paths could diverge then the web editor would be a demo — a thing that
+/// looks like the product and answers a slightly different question — so this asserts they do not,
+/// cell by cell rather than by a summary that could agree while the grids differed.
+#[test]
+fn an_assembly_reads_the_same_from_memory_as_from_a_disk() {
+    let dir = scratch("both-ways");
+    let path = brick_stl(&dir, "part.stl", [0.0, 0.0, 0.0], [15.0, 10.0, 10.0]);
+    let bytes = std::fs::read(&path).expect("the fixture is there");
+
+    let json = |named: &str| {
+        format!(
+            r#"{{
+  "title": "one part, two sources",
+  "duration_s": 1.0, "frames": 2,
+  "domains": [
+    {{ "kind": "block", "name": "assembly", "cells": [4, 2, 2], "cell_mm": 5.0,
+      "initial_c": 20.0,
+      "parts": [{{ "stl": {named}, "material": "copper" }}] }}
+  ]
+}}"#
+        )
+    };
+
+    let block_of = |world: &pantometry_world::World| {
+        let b = world
+            .simulation()
+            .domain_as::<pantometry::thermal::Solid3D>("assembly")
+            .expect("the block is there");
+        let mut cells = Vec::new();
+        for k in 0..2 {
+            for j in 0..2 {
+                for i in 0..4 {
+                    cells.push((
+                        b.is_void(i, j, k),
+                        b.substance_at(i, j, k).name.to_string(),
+                        b.temperature_at(i, j, k).to_si().to_bits(),
+                    ));
+                }
+            }
+        }
+        cells
+    };
+
+    // The path is quoted by the JSON writer rather than by hand: a Windows path is full of
+    // separators that a hand-written string literal would have to escape, and getting that wrong
+    // is a test that fails for a reason unrelated to what it is about.
+    let quoted = serde_json::to_string(&path).expect("a path is a string");
+    let from_disk = World::build(scene(&json(&quoted))).expect("builds");
+    let uploaded = pantometry_world::Uploaded::new().with("part.stl", bytes.clone());
+    let from_page = World::build_with(scene(&json("\"part.stl\"")), &uploaded).expect("builds");
+
+    assert_eq!(
+        block_of(&from_disk),
+        block_of(&from_page),
+        "the same STL must voxelise to the same block from either source"
+    );
+    // And it is not two empty blocks agreeing: a 15x10x10 mm brick fills three of the four
+    // columns of a 20x10x10 mm block, so twelve of sixteen cells are solid.
+    let solid = block_of(&from_page).iter().filter(|c| !c.0).count();
+    assert_eq!(solid, 12, "the brick should fill three columns of four");
+}
+
+/// **A part nobody uploaded is refused, and the refusal says what *is* there.**
+///
+/// The message is the feature. Somebody with three files in a tab and one misspelt name gets told
+/// which spellings exist, rather than "not found" and an afternoon.
+#[test]
+fn a_missing_upload_is_refused_by_name_and_lists_what_is_held() {
+    let json = r#"{
+  "title": "a part that is not here",
+  "duration_s": 1.0, "frames": 2,
+  "domains": [
+    { "kind": "block", "name": "assembly", "cells": [2, 2, 2], "cell_mm": 5.0,
+      "initial_c": 20.0,
+      "parts": [{ "stl": "bracket.stl", "material": "copper" }] }
+  ]
+}"#;
+
+    let empty = pantometry_world::Uploaded::new();
+    let Err(err) = World::build_with(scene(json), &empty) else {
+        panic!("a part that was never uploaded must be refused");
+    };
+    assert!(
+        err.contains("assembly/parts[0]") && err.contains("nothing has been uploaded"),
+        "the site and the state, both: {err}"
+    );
+
+    let wrong = pantometry_world::Uploaded::new()
+        .with("Bracket.STL", vec![0u8; 84])
+        .with("insert.stl", vec![0u8; 84]);
+    let Err(err) = World::build_with(scene(json), &wrong) else {
+        panic!("a near miss is still a miss");
+    };
+    assert!(
+        err.contains("Bracket.STL") && err.contains("insert.stl"),
+        "a near miss should show the spellings that are here: {err}"
+    );
+}
+
+/// **A part the grid loses builds, runs and conserves — and `verify` is the only thing that says
+/// so.**
+///
+/// The failure this whole file is about, in the one arrangement nothing catches: two parts, one
+/// of them finer than a cell. The build refuses an assembly where *every* part vanished — that is
+/// `a_missing_file_and_an_empty_assembly_are_both_refused` above — and one of two coming out at
+/// zero cells trips nothing at all. It is not a coarse answer about the assembly; it is a correct
+/// answer about a different one.
+///
+/// The geometry is closed form rather than measured. The block is 20 x 10 x 10 mm at a 2 mm cell,
+/// so cell centres sit at odd millimetres — 1, 3, 5 … 19. The keeper spans 0–12 mm and takes the
+/// six centres below 12; the plate spans 14.0–14.4 mm and contains **no centre at all**, because
+/// the nearest are 13 and 15. Nothing here depends on how the rasteriser breaks a tie.
+#[test]
+fn a_part_the_grid_loses_is_a_verify_finding_and_nothing_else_says_so() {
+    let dir = scratch("lost");
+    let keeper = brick_stl(&dir, "keeper.stl", [0.0, 0.0, 0.0], [12.0, 10.0, 10.0]);
+    let plate = brick_stl(&dir, "plate.stl", [14.0, 0.0, 0.0], [14.4, 10.0, 10.0]);
+
+    let json = format!(
+        r#"{{
+  "title": "one part the grid loses",
+  "duration_s": 0.5,
+  "frames": 2,
+  "domains": [
+    {{ "kind": "block", "name": "assembly", "cells": [10, 5, 5], "cell_mm": 2.0,
+      "initial_c": 20.0,
+      "parts": [
+        {{ "stl": "{keeper}", "material": "copper" }},
+        {{ "stl": "{plate}", "material": "aluminium" }}
+      ] }}
+  ]
+}}"#
+    );
+
+    // It builds. That is the defect, stated as an assertion so a future refusal at build time is
+    // a deliberate change to this file rather than a surprise.
+    let world = World::build(scene(&json)).expect("an assembly with a lost part still builds");
+    let rows = world.rasterised();
+    assert_eq!(rows.len(), 2, "one row per part: {rows:?}");
+
+    // The keeper's closed form: 6 x 5 x 5 centres, and a brick on cell boundaries rasterises to
+    // exactly its own volume — 150 cells of 8 mm3 against 12 x 10 x 10 mm3.
+    assert_eq!(rows[0].filled, 150, "{:?}", rows[0]);
+    assert!(
+        rows[0].loss.volume_error.abs() < 1e-12,
+        "a grid-aligned brick has no volume error to have: {:?}",
+        rows[0]
+    );
+    assert_eq!(rows[1].filled, 0, "the plate is thinner than a cell");
+
+    let battery = pantometry_world::verify::verify(&scene(&json), false).expect("the battery runs");
+    let lost: Vec<&String> = battery
+        .findings
+        .iter()
+        .filter(|f| f.contains("plate.stl"))
+        .collect();
+    assert_eq!(
+        lost.len(),
+        1,
+        "the lost part is exactly one finding: {:?}",
+        battery.findings
+    );
+    assert!(
+        lost[0].contains("parts[1]") && lost[0].contains("absent"),
+        "the finding says which part and what happened: {}",
+        lost[0]
+    );
+    assert!(
+        !battery.findings.iter().any(|f| f.contains("keeper.stl")),
+        "the part the grid held is not a finding: {:?}",
+        battery.findings
+    );
+
+    // And the report carries the measurement the finding was drawn from, so a reader can disagree
+    // with the verdict by reading the row rather than by rerunning anything.
+    let report = battery.render();
+    assert!(report.contains("rasterisation"), "{report}");
+    assert!(report.contains("keeper.stl"), "{report}");
+}
+
+/// **An assembly the grid holds produces no rasterisation finding**, which is what makes the test
+/// above worth having.
+///
+/// A check that fires on everything is not a check. Same brick, same grid, same battery — and the
+/// row is still printed, because a section that appears only on failure cannot be told apart from
+/// a pass that never ran.
+#[test]
+fn an_assembly_the_grid_holds_has_no_rasterisation_finding() {
+    let dir = scratch("held");
+    let keeper = brick_stl(&dir, "held.stl", [0.0, 0.0, 0.0], [12.0, 10.0, 10.0]);
+
+    let json = format!(
+        r#"{{
+  "title": "an assembly the grid holds",
+  "duration_s": 0.5,
+  "frames": 2,
+  "domains": [
+    {{ "kind": "block", "name": "assembly", "cells": [10, 5, 5], "cell_mm": 2.0,
+      "initial_c": 20.0,
+      "parts": [ {{ "stl": "{keeper}", "material": "copper" }} ] }}
+  ]
+}}"#
+    );
+
+    let battery = pantometry_world::verify::verify(&scene(&json), false).expect("the battery runs");
+    assert!(
+        battery.findings.is_empty(),
+        "a brick on cell boundaries loses nothing: {:?}",
+        battery.findings
+    );
+    assert_eq!(battery.rasterised.len(), 1, "the part was still measured");
+    let report = battery.render();
+    assert!(
+        report.contains("held.stl") && report.contains("150 cells"),
+        "{report}"
+    );
+}
+
+/// **A part that is present but unresolved is a finding too, and it says which clause fired.**
+///
+/// The other half of the verdict, and the half with no test until this one: a part that filled
+/// cells, so it is not absent, but filled them two deep. A seven-point stencil has no interior in
+/// a run two cells thick and a trilinear element has one element, so the feature is in the picture
+/// and not in the physics.
+///
+/// Closed form again, and chosen so exactly one clause can fire. The plate spans 14–18 mm on a
+/// 2 mm cell, taking the centres at 15 and 17 — two cells across, 5 x 5 of them, `50 x 8 = 400`
+/// mm3 against a mesh volume of `4 x 10 x 10`. The volume is **exact**, so a finding that also
+/// complained about volume error would be reporting a clause that did not fire.
+#[test]
+fn a_part_two_cells_thick_is_a_finding_that_names_the_reason() {
+    let dir = scratch("thin");
+    let plate = brick_stl(&dir, "thin.stl", [14.0, 0.0, 0.0], [18.0, 10.0, 10.0]);
+
+    let json = format!(
+        r#"{{
+  "title": "a part the grid keeps and cannot resolve",
+  "duration_s": 0.5,
+  "frames": 2,
+  "domains": [
+    {{ "kind": "block", "name": "assembly", "cells": [10, 5, 5], "cell_mm": 2.0,
+      "initial_c": 20.0,
+      "parts": [ {{ "stl": "{plate}", "material": "copper" }} ] }}
+  ]
+}}"#
+    );
+
+    let world = World::build(scene(&json)).expect("a two-cell plate still builds");
+    let row = &world.rasterised()[0];
+    assert_eq!(row.filled, 50, "{row:?}");
+    assert!(
+        row.loss.volume_error.abs() < 1e-12,
+        "two cells across is the whole of this brick, exactly: {row:?}"
+    );
+    // One run per (j, k) row along x, and the y and z runs are five cells and not thin.
+    assert_eq!(row.loss.thin_runs, 25, "{row:?}");
+
+    let battery = pantometry_world::verify::verify(&scene(&json), false).expect("the battery runs");
+    assert_eq!(
+        battery.findings.len(),
+        1,
+        "one part, one reason: {:?}",
+        battery.findings
+    );
+    let finding = &battery.findings[0];
+    assert!(
+        finding.contains("thin.stl") && finding.contains("two cells thick"),
+        "{finding}"
+    );
+    assert!(
+        !finding.contains("volume"),
+        "the volume clause did not fire and must not be quoted: {finding}"
+    );
+}

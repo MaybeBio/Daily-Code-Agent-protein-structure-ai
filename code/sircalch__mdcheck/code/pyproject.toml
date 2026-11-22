@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mdcheck"
+version = "1.2.2"
+description = "Automated Convergence, Statistical Inefficiency, and Reproducibility Assessment for Molecular Dynamics Simulations"
+readme = "README.md"
+authors = [
+    { name = "Andrés Monreal-Hernández", email = "andres.monreal@ues.mx" }
+]
+license = "MIT"
+keywords = [
+    "molecular-dynamics",
+    "gromacs",
+    "amber",
+    "openmm",
+    "convergence",
+    "statistical-inefficiency",
+    "equilibration",
+    "reproducibility",
+    "quality-assurance",
+    "science",
+    "biophysics"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent"
+]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "pandas>=1.3.0",
+    "matplotlib>=3.5.0",
+    "jinja2>=3.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "build>=0.10.0",
+    "twine>=4.0.0"
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.26"
+]
+
+[project.scripts]
+mdcheck = "mdcheck.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/sircalch/mdcheck"
+Documentation = "https://sircalch.github.io/mdcheck/"
+Repository = "https://github.com/sircalch/mdcheck.git"
+"Bug Tracker" = "https://github.com/sircalch/mdcheck/issues"
+Changelog = "https://github.com/sircalch/mdcheck/blob/master/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+include = ["mdcheck*"]
+
+

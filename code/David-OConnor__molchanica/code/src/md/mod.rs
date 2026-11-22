@@ -1,0 +1,1683 @@
+//! An interface to dynamics library.
+
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    fmt::{Display, Formatter},
+    io,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use bincode::{Decode, Encode};
+use bio_files::{
+    AtomGeneric, ResidueGeneric, create_bonds, gromacs::GromacsOutput, md_params::ForceFieldParams,
+};
+use dynamics::{
+    ComputationDevice, FfMolType, ForceFieldFamily, MdConfig, MdOverrides, MdState, MolDynamics,
+    ParamError, SimBoxInit, Solvent, compute_energy_snapshot, params::FfParamSet,
+    snapshot::Snapshot,
+};
+use graphics::{EngineUpdates, Entity, Scene};
+use lin_alg::f64::{Quaternion, Vec3};
+use mol_defs::molecules::{Atom, Bond, common::MoleculeCommon, nucleic_acid::NucleicAcidType};
+use rand::RngExt;
+use viewer::SnapshotViewer;
+
+use crate::{
+    cam::move_cam_to_active_mol,
+    gromacs,
+    state::{ComputationGuard, ComputationType, State},
+    util::{RedrawFlags, clear_cli_out, format_elapsed, handle_err, handle_success},
+    xtb,
+};
+
+pub mod mdposit;
+pub mod runs;
+pub mod trajectory;
+pub mod viewer;
+
+// Å. Static atoms must be at least this close to a dynamic atom at the start of MD to be counted.
+// Set this wide to take into account motion.
+pub const STATIC_ATOM_DIST_THRESH: f64 = 14.;
+
+// pub type MolsForMd = (FfMolType, &MoleculeCommon, usize);
+
+/// What a Dynamics run's worker returns.
+struct RunResult {
+    md: MdState,
+    elapsed: Duration,
+    /// E.g. a force error.
+    stop_error: Option<String>,
+    save_error: Option<io::Error>,
+}
+
+/// A Dynamics-backend run, on a worker thread. The UI loop pauses when the window is unfocused or
+/// minimized; this lets the run continue then. Dropping this cancels the run.
+pub struct DynamicsRun {
+    receiver: Receiver<RunResult>,
+    cancel: Arc<AtomicBool>,
+    step: Arc<AtomicUsize>,
+    pub num_steps: u32,
+    output_dir: PathBuf,
+    /// For the computation status display.
+    _computation: ComputationGuard,
+}
+
+impl DynamicsRun {
+    pub fn step(&self) -> usize {
+        self.step.load(Ordering::Relaxed)
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for DynamicsRun {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+#[derive(Default)]
+pub struct MdStateLocal {
+    /// MD state, for when running using the Dynamics engine. `None` during a run; the worker owns
+    /// it then.
+    pub mol_dynamics: Option<MdState>,
+    /// This flag lets us defer launch by a frame, so we can display a flag.
+    pub launching: bool,
+    pub run: Option<DynamicsRun>,
+    // todo: Consider if you want a dedicated MD playback operating mode. For now, this flag
+    /// If true, render the molecules from this struct, instead of primary state molecules.
+    pub draw_md_mols: bool,
+    pub gromacs_output: Option<GromacsOutput>,
+    pub gromacs_setup: gromacs::Setup,
+    pub xtb_options: bio_files::xtb::XtbMdOptions,
+    pub opened_inputs: Option<runs::RunInputs>,
+    pub viewer: SnapshotViewer,
+    // todo: putting back for now
+    /// We maintain a set of atom indices of peptides that are used in MD. This for example, might
+    /// exclude hetero atoms and atoms not near a docking site. (mol i, atom i)
+    /// todo: When you support multiple peptides, you will have to updates this. Consider moving it
+    /// to the individual peptide.
+    pub pep_atom_set: HashSet<(usize, usize)>,
+}
+
+impl MdStateLocal {
+    /// A Dynamics-backend run is in progress.
+    pub fn running(&self) -> bool {
+        self.run.is_some()
+    }
+
+    /// todo: WIP, regarding how we pass in atoms and molecules.
+    pub fn replace_snaps(&mut self, snaps: Vec<Arc<Snapshot>>) {
+        self.draw_md_mols = true;
+
+        self.viewer.snapshots = snaps;
+        self.viewer.slider_posit_ui = 0;
+        self.viewer.current_snapshot = (!self.viewer.snapshots.is_empty()).then_some(0);
+
+        if self.viewer.current_snapshot.is_some() {
+            if let Err(e) = self.viewer.change_snapshot(0) {
+                eprintln!("Error changing snapshots when replacing: {e:?}");
+            }
+        }
+    }
+
+    /// Removes all MD snapshots, and performs related cleanup.
+    pub fn clear_snaps(&mut self, ents: &mut Vec<Entity>, redraw: &mut RedrawFlags) {
+        self.viewer.snapshots = Vec::new();
+        self.viewer.current_snapshot = None;
+        self.viewer.mol_set_active = None;
+        self.viewer.playing = false;
+        self.viewer.playback_accum = 0.;
+        self.viewer.slider_posit_ui = 0;
+        self.draw_md_mols = false;
+
+        *ents = Vec::new();
+        redraw.set_all();
+    }
+}
+
+/// Runs `md` on a worker thread. See [`DynamicsRun`].
+fn start_run(state: &mut State, md: MdState, output_dir: PathBuf, (num_steps, dt): (u32, f32)) {
+    let dev = state.computation_device();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let step = Arc::new(AtomicUsize::new(md.step_count));
+    let (tx, receiver) = mpsc::channel();
+
+    let worker_dir = output_dir.clone();
+    let worker_cancel = cancel.clone();
+    let worker_step = step.clone();
+    thread::spawn(move || {
+        let result = run_worker(
+            md,
+            &dev,
+            num_steps as usize,
+            dt,
+            &worker_dir,
+            &worker_cancel,
+            &worker_step,
+        );
+        // The receiver is gone if the run was abandoned.
+        let _ = tx.send(result);
+    });
+
+    let computation = state.volatile.ongoing_computations.start(
+        ComputationType::MolecularDynamics,
+        "Dynamics",
+        Some(format!("{num_steps} steps")),
+    );
+
+    let md_local = &mut state.volatile.md_local;
+    md_local.mol_dynamics = None;
+    md_local.run = Some(DynamicsRun {
+        receiver,
+        cancel,
+        step,
+        num_steps,
+        output_dir,
+        _computation: computation,
+    });
+}
+
+/// Steps until done, cancelled, or a force error; then saves output.
+fn run_worker(
+    mut md: MdState,
+    dev: &ComputationDevice,
+    num_steps: usize,
+    dt: f32,
+    output_dir: &std::path::Path,
+    cancel: &AtomicBool,
+    step: &AtomicUsize,
+) -> RunResult {
+    let start = Instant::now();
+    let mut stop_error = None;
+
+    // Raw CUDA calls in `dynamics`, e.g. pinned host allocation, need the context current here.
+    #[cfg(feature = "cuda")]
+    if let ComputationDevice::Gpu(stream) = dev
+        && let Err(error) = stream.context().bind_to_thread()
+    {
+        stop_error = Some(format!(
+            "MD stopped: Unable to bind the CUDA context: {error:?}"
+        ));
+    }
+
+    while stop_error.is_none() && md.step_count < num_steps && !cancel.load(Ordering::Relaxed) {
+        md.step(dev, dt, None);
+        step.store(md.step_count, Ordering::Relaxed);
+
+        if let Err(error) = md.check_force_error() {
+            stop_error = Some(format!("MD stopped: {error}"));
+        }
+    }
+
+    if md.step_count >= num_steps
+        && let Ok(time) = md.computation_time()
+    {
+        println!(
+            "\nMD computation time: {time} \n Total run time: {} ms",
+            start.elapsed().as_millis()
+        );
+    }
+
+    let output_error = md.finish_run_output().err();
+    let frame_error = runs::save_final_frame(output_dir, &md, dt).err();
+
+    RunResult {
+        md,
+        elapsed: start.elapsed(),
+        stop_error,
+        save_error: output_error.or(frame_error),
+    }
+}
+
+/// Loads a finished Dynamics run's saved trajectory, as for GROMACS. Run each frame.
+pub fn poll_dynamics_run(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    let received = state
+        .volatile
+        .md_local
+        .run
+        .as_ref()
+        .map(|run| run.receiver.try_recv());
+
+    let result = match received {
+        None | Some(Err(TryRecvError::Empty)) => return,
+        Some(Err(TryRecvError::Disconnected)) => {
+            state.volatile.md_local.run = None;
+            handle_err(
+                &mut state.ui,
+                "The Dynamics MD worker stopped without returning a result.".into(),
+            );
+
+            return;
+        }
+        Some(Ok(result)) => result,
+    };
+
+    let Some(run) = state.volatile.md_local.run.take() else {
+        return;
+    };
+
+    state.volatile.md_local.mol_dynamics = Some(result.md);
+    let load_info = runs::show_dynamics_output(state, scene, updates, &run.output_dir);
+
+    match (result.save_error, load_info) {
+        (Some(error), _) => handle_err(
+            &mut state.ui,
+            format!("Dynamics finished. Error saving output: {error}"),
+        ),
+        (None, Err(error)) => handle_err(
+            &mut state.ui,
+            format!("Dynamics finished. Could not open output: {error}"),
+        ),
+        (None, Ok(load_info)) => handle_success(
+            &mut state.ui,
+            format!(
+                "Dynamics finished in {} · {}{}",
+                format_elapsed(result.elapsed),
+                run.output_dir.display(),
+                load_info
+                    .map(|info| format!(". {info}"))
+                    .unwrap_or_default()
+            ),
+        ),
+    }
+
+    if let Some(error) = result.stop_error {
+        handle_err(&mut state.ui, error);
+    }
+}
+
+/// Filter out hetero atoms, and if necessary, atoms not close to a ligand.
+pub fn filter_peptide_atoms(
+    pep: &MoleculeCommon,
+    mols_non_pep: &[(FfMolType, &MoleculeCommon, usize)],
+    near_lig_thresh: Option<f64>,
+) -> (Vec<AtomGeneric>, HashSet<(usize, usize)>) {
+    let mut set = HashSet::new();
+
+    let atoms = pep
+        .atoms
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            let pass = if let Some(thresh) = near_lig_thresh {
+                let mut closest_dist = f64::MAX;
+                for lig in mols_non_pep {
+                    if lig.0 == FfMolType::Peptide {
+                        continue;
+                    }
+                    for p in &lig.1.atom_posits {
+                        let dist = (*p - pep.atom_posits[i]).magnitude();
+                        if dist < closest_dist {
+                            closest_dist = dist;
+                        }
+                    }
+                }
+                !a.hetero && closest_dist < thresh
+            } else {
+                !a.hetero
+            };
+
+            if pass {
+                // The caller remaps this local peptide index when combining multiple peptides.
+                set.insert((0, i));
+                Some(a.to_generic())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    (atoms, set)
+}
+
+fn mol_centroid(m: &MolDynamics) -> Vec3 {
+    let posits: Vec<Vec3> = if let Some(ap) = &m.atom_posits {
+        ap.clone()
+    } else {
+        m.atoms.iter().map(|a| a.posit).collect()
+    };
+    let n = posits.len().max(1) as f64;
+    posits.iter().fold(Vec3::new_zero(), |acc, p| acc + *p) * (1.0 / n)
+}
+
+fn mol_bounding_radius(m: &MolDynamics, center: Vec3) -> f64 {
+    let posits: Vec<Vec3> = if let Some(ap) = &m.atom_posits {
+        ap.clone()
+    } else {
+        m.atoms.iter().map(|a| a.posit).collect()
+    };
+
+    posits
+        .iter()
+        .map(|p| (*p - center).magnitude())
+        .fold(0.0_f64, f64::max)
+}
+
+fn centered_box_axis_shift(min: f64, max: f64, half_extent: f64) -> Option<f64> {
+    if max - min > half_extent * 2.0 {
+        return None;
+    }
+
+    let mut shift = 0.0;
+    if min < -half_extent {
+        shift = -half_extent - min;
+    }
+    if max + shift > half_extent {
+        shift += half_extent - (max + shift);
+    }
+
+    Some(shift)
+}
+
+fn shift_posits_into_centered_box(posits: &mut [Vec3], hx: f64, hy: f64, hz: f64) -> Option<Vec3> {
+    let (mut min, mut max) = (
+        Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY),
+        Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
+    );
+
+    for &p in posits.iter() {
+        min = min.min(p);
+        max = max.max(p);
+    }
+
+    let shift = Vec3::new(
+        centered_box_axis_shift(min.x, max.x, hx)?,
+        centered_box_axis_shift(min.y, max.y, hy)?,
+        centered_box_axis_shift(min.z, max.z, hz)?,
+    );
+
+    for p in posits {
+        *p += shift;
+    }
+
+    Some(shift)
+}
+
+fn min_image_delta(delta: Vec3, extent: Vec3) -> Vec3 {
+    Vec3::new(
+        if extent.x > 0.0 {
+            delta.x - (delta.x / extent.x).round() * extent.x
+        } else {
+            delta.x
+        },
+        if extent.y > 0.0 {
+            delta.y - (delta.y / extent.y).round() * extent.y
+        } else {
+            delta.y
+        },
+        if extent.z > 0.0 {
+            delta.z - (delta.z / extent.z).round() * extent.z
+        } else {
+            delta.z
+        },
+    )
+}
+
+fn min_dist_sq_to_placed(
+    posits: &[Vec3],
+    placed_atoms: &[Vec3],
+    centroid: Vec3,
+    search_sq: f64,
+    box_extent: Option<Vec3>,
+) -> f64 {
+    let mut min_sq = f64::MAX;
+    for &np in posits {
+        for &pp in placed_atoms {
+            let center_delta = pp - centroid;
+            let center_dist_sq = match box_extent {
+                Some(extent) => min_image_delta(center_delta, extent).magnitude_squared(),
+                None => center_delta.magnitude_squared(),
+            };
+            if center_dist_sq > search_sq {
+                continue;
+            }
+
+            let delta = np - pp;
+            let dist_sq = match box_extent {
+                Some(extent) => min_image_delta(delta, extent).magnitude_squared(),
+                None => delta.magnitude_squared(),
+            };
+            min_sq = min_sq.min(dist_sq);
+        }
+    }
+    min_sq
+}
+
+/// Add multiple copies of each molecule with random orientations.
+///
+/// For fixed boxes (`box_dims = Some`): uses a regular cubic grid so every copy gets a
+/// distinct cell — no origin fallback, no piling.  At each grid position we try
+/// `MAX_ROT_ATTEMPTS` random rotations and keep whichever gives the largest minimum
+/// atom-to-atom distance to already-placed atoms.  This correctly handles elongated
+/// molecules (e.g. octanol) that can pack far more tightly than their bounding sphere
+/// radius implies.  If no rotation achieves the preferred 1.5 Å clearance the best
+/// available rotation is used and the energy minimiser resolves any remaining soft
+/// overlaps.
+///
+/// For unbounded (`box_dims = None`): falls back to the original shell-expansion strategy
+/// (bounding-sphere exclusion), which is fine for dilute / Pad-box placements.
+pub(crate) fn add_copies(
+    mols: &mut Vec<MolDynamics>,
+    mol: &MolDynamics,
+    copies: usize,
+    box_dims: Option<(f32, f32, f32)>,
+) {
+    // Preferred minimum atom-to-atom distance between copies.
+    // Soft overlaps at this scale are resolved cleanly by the energy minimiser.
+    const MIN_ATOM_DIST_SQ: f64 = 1.5 * 1.5;
+    // Match the hard inter-molecular overlap cutoff in dynamics' init validator.
+    const HARD_MIN_ATOM_DIST_SQ: f64 = 0.5 * 0.5;
+    // Keep atom positions this far from the box walls.
+    const WALL_MARGIN: f64 = 0.5;
+    // Rotation candidates tried per grid cell.
+    const MAX_ROT_ATTEMPTS: usize = 200;
+    // Position candidates for the unbounded path.
+    const MAX_POS_ATTEMPTS: usize = 500;
+
+    if copies > 1 {
+        println!("Adding {copies} molecule copies...");
+    }
+    let start = Instant::now();
+    let mut rng = rand::rng();
+
+    let orig_centroid = mol_centroid(mol);
+    let orig_radius = mol_bounding_radius(mol, orig_centroid);
+
+    // Atom positions relative to centroid — rotated cheaply for every candidate.
+    let orig_local: Vec<Vec3> = {
+        let posits: Vec<Vec3> = if let Some(ap) = &mol.atom_posits {
+            ap.clone()
+        } else {
+            mol.atoms.iter().map(|a| a.posit).collect()
+        };
+        posits.iter().map(|&p| p - orig_centroid).collect()
+    };
+
+    // All placed atom positions — grows as copies are committed.
+    let mut placed_atoms: Vec<Vec3> = mols
+        .iter()
+        .flat_map(|m| {
+            if let Some(ap) = &m.atom_posits {
+                ap.clone()
+            } else {
+                m.atoms.iter().map(|a| a.posit).collect::<Vec<_>>()
+            }
+        })
+        .collect();
+
+    // Spatial filter: placed atoms farther than this from the candidate centroid
+    // cannot possibly clash with any new atom.
+    let search_sq = (orig_radius * 2.0 + 2.0).powi(2);
+
+    // Inline helper: apply rotation + translation to a mol copy.
+    let apply_rot_trans = |mol_copy: &mut MolDynamics, rot: Quaternion, translation: Vec3| {
+        if let Some(posits) = &mut mol_copy.atom_posits {
+            for p in posits.iter_mut() {
+                let local = *p - orig_centroid;
+                *p = rot.rotate_vec(local) + orig_centroid + translation;
+            }
+        }
+        for atom in &mut mol_copy.atoms {
+            let local = atom.posit - orig_centroid;
+            atom.posit = rot.rotate_vec(local) + orig_centroid + translation;
+        }
+    };
+
+    if let Some((bx, by, bz)) = box_dims {
+        // ── Grid placement ────────────────────────────────────────────────────
+        // Build a cubic grid with n³ ≥ copies cells. Use at least n=3 (27 cells)
+        // so that even copies=1 has 27 candidates to choose from — preventing the
+        // solute from being forced onto the same (0,0,0) cell as an existing molecule.
+        let n = (copies as f64).cbrt().ceil() as usize;
+        let n = n.max(3);
+        let (sx, sy, sz) = (
+            bx as f64 / n as f64,
+            by as f64 / n as f64,
+            bz as f64 / n as f64,
+        );
+
+        let mut grid: Vec<Vec3> = (0..n)
+            .flat_map(|ix| {
+                (0..n).flat_map(move |iy| {
+                    (0..n).map(move |iz| {
+                        Vec3::new(
+                            -bx as f64 / 2.0 + (ix as f64 + 0.5) * sx,
+                            -by as f64 / 2.0 + (iy as f64 + 0.5) * sy,
+                            -bz as f64 / 2.0 + (iz as f64 + 0.5) * sz,
+                        )
+                    })
+                })
+            })
+            .collect();
+
+        let (hx, hy, hz) = (
+            bx as f64 / 2.0 - WALL_MARGIN,
+            by as f64 / 2.0 - WALL_MARGIN,
+            bz as f64 / 2.0 - WALL_MARGIN,
+        );
+        let box_extent = Vec3::new(bx as f64, by as f64, bz as f64);
+
+        // Greedy cell selection: for each copy, pick the available grid cell whose
+        // centroid is furthest from all already-placed atom positions.  This ensures
+        // copies=1 (or any small count) doesn't collide with molecules from a prior
+        // add_copies call that happened to occupy the same grid center.
+        for copy_i in 0..copies {
+            // Score remaining grid cells by min-distance of centroid to placed atoms.
+            let best_cell_idx = if placed_atoms.is_empty() {
+                // Place first molecule at the cell closest to the box centre (origin).
+                grid.iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        a.magnitude_squared()
+                            .partial_cmp(&b.magnitude_squared())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            } else {
+                grid.iter()
+                    .enumerate()
+                    .map(|(i, &c)| {
+                        let min_dsq = placed_atoms
+                            .iter()
+                            .map(|&p| (c - p).magnitude_squared())
+                            .fold(f64::MAX, f64::min);
+                        (i, min_dsq)
+                    })
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            };
+            let centroid = grid.remove(best_cell_idx);
+            let mut placement_centroid = centroid;
+            let mut best_rot = Quaternion::new(1., 0., 0., 0.);
+            let mut best_posits: Vec<Vec3> = Vec::new();
+            let mut best_min_sq = f64::NEG_INFINITY;
+
+            for _ in 0..MAX_ROT_ATTEMPTS {
+                let rot = {
+                    let (w, x, y, z): (f64, f64, f64, f64) =
+                        (rng.random(), rng.random(), rng.random(), rng.random());
+                    Quaternion::new(w, x, y, z).to_normalized()
+                };
+
+                let new_posits: Vec<Vec3> = orig_local
+                    .iter()
+                    .map(|&local| rot.rotate_vec(local) + centroid)
+                    .collect();
+
+                // Wall check: all atoms must stay inside the box.
+                if !new_posits
+                    .iter()
+                    .all(|p| p.x.abs() <= hx && p.y.abs() <= hy && p.z.abs() <= hz)
+                {
+                    continue;
+                }
+
+                // Atom-level clash check against all previously placed atoms.
+                let mut min_sq = f64::MAX;
+                'check: for &np in &new_posits {
+                    for &pp in &placed_atoms {
+                        // Skip placed atoms that are too far away to clash.
+                        if min_image_delta(pp - centroid, box_extent).magnitude_squared()
+                            > search_sq
+                        {
+                            continue;
+                        }
+                        let dsq = min_image_delta(np - pp, box_extent).magnitude_squared();
+                        if dsq < min_sq {
+                            min_sq = dsq;
+                            if min_sq < HARD_MIN_ATOM_DIST_SQ {
+                                break 'check; // Hard overlap; try next rotation.
+                            }
+                        }
+                    }
+                }
+
+                if min_sq > best_min_sq {
+                    best_min_sq = min_sq;
+                    best_rot = rot;
+                    best_posits = new_posits;
+                }
+
+                if best_min_sq >= MIN_ATOM_DIST_SQ {
+                    break; // Clean placement found.
+                }
+            }
+
+            // If every rotation attempt failed the wall check, fall back to identity.
+            // Keep that fallback inside the fixed box, and do not create hard overlaps
+            // that can make MD initialization or minimization pathological.
+            if best_posits.is_empty() {
+                best_posits = orig_local.iter().map(|&local| local + centroid).collect();
+                let Some(shift) = shift_posits_into_centered_box(&mut best_posits, hx, hy, hz)
+                else {
+                    eprintln!(
+                        "add_copies: copy {copy_i}: molecule cannot fit inside this fixed-box grid cell; skipping."
+                    );
+                    continue;
+                };
+                placement_centroid += shift;
+                best_min_sq = min_dist_sq_to_placed(
+                    &best_posits,
+                    &placed_atoms,
+                    placement_centroid,
+                    search_sq,
+                    Some(box_extent),
+                );
+            }
+
+            if best_min_sq < HARD_MIN_ATOM_DIST_SQ {
+                eprintln!(
+                    "add_copies: copy {copy_i}: best min atom dist {:.2} Å at \
+                     ({:.1},{:.1},{:.1}) — skipping to avoid a hard overlap.",
+                    best_min_sq.max(0.0).sqrt(),
+                    placement_centroid.x,
+                    placement_centroid.y,
+                    placement_centroid.z,
+                );
+                continue;
+            }
+
+            if best_min_sq < MIN_ATOM_DIST_SQ {
+                eprintln!(
+                    "add_copies: copy {copy_i}: best min atom dist {:.2} Å at \
+                     ({:.1},{:.1},{:.1}) — placing; energy minimiser will resolve.",
+                    best_min_sq.max(0.0).sqrt(),
+                    placement_centroid.x,
+                    placement_centroid.y,
+                    placement_centroid.z,
+                );
+            }
+
+            placed_atoms.extend_from_slice(&best_posits);
+
+            let mut mol_copy = mol.clone();
+            let translation = placement_centroid - orig_centroid;
+            apply_rot_trans(&mut mol_copy, best_rot, translation);
+            mols.push(mol_copy);
+        }
+    } else {
+        // ── Unbounded: shell expansion ────────────────────────────────────────
+        let min_sep = 2.0 * orig_radius + 2.0;
+        let mut sphere_placed: Vec<(Vec3, f64)> = mols
+            .iter()
+            .map(|m| {
+                let c = mol_centroid(m);
+                let r = mol_bounding_radius(m, c);
+                (c, r)
+            })
+            .collect();
+
+        for copy_i in 0..copies {
+            let base_dist = min_sep * (1.0 + copy_i as f64).cbrt();
+            let mut new_centroid = orig_centroid + Vec3::new(base_dist, 0., 0.);
+            'free_search: for attempt in 0..MAX_POS_ATTEMPTS {
+                let dx: f64 = rng.random::<f64>() * 2.0 - 1.0;
+                let dy: f64 = rng.random::<f64>() * 2.0 - 1.0;
+                let dz: f64 = rng.random::<f64>() * 2.0 - 1.0;
+                let len = (dx * dx + dy * dy + dz * dz).sqrt();
+                if len < 1e-10 {
+                    continue;
+                }
+                let dir = Vec3::new(dx / len, dy / len, dz / len);
+                let dist = base_dist + attempt as f64 * orig_radius * 0.5;
+                let candidate = orig_centroid + dir * dist;
+                for &(c, r) in &sphere_placed {
+                    if (c - candidate).magnitude() < r + orig_radius + 2.0 {
+                        continue 'free_search;
+                    }
+                }
+                new_centroid = candidate;
+                break;
+            }
+            sphere_placed.push((new_centroid, orig_radius));
+
+            let rot = {
+                let (w, x, y, z): (f64, f64, f64, f64) =
+                    (rng.random(), rng.random(), rng.random(), rng.random());
+                Quaternion::new(w, x, y, z).to_normalized()
+            };
+            let translation = new_centroid - orig_centroid;
+            let mut mol_copy = mol.clone();
+            apply_rot_trans(&mut mol_copy, rot, translation);
+            mols.push(mol_copy);
+        }
+    }
+
+    let elapsed = start.elapsed().as_millis();
+    println!("Copies added in {elapsed} ms");
+}
+
+/// Set up MD for selected molecules. A general purpose wrapper around `dynamics` API, for
+/// use in this application. Concerts molecules, atoms, and bonds into the bio_files format
+/// `dynamics` expects as input.
+///
+/// Sets up peptide-specific settings A/R.
+///
+/// If `fast_init` is set, the water solvent, and relaxation are skipped.
+pub fn build_dynamics(
+    dev: &ComputationDevice,
+    mols_in: &[(FfMolType, &MoleculeCommon, usize)],
+    param_set: &FfParamSet,
+    mol_specific_params: &HashMap<String, ForceFieldParams>,
+    cfg: &MdConfig,
+    static_peptide: bool,
+    near_lig_thresh: Option<f64>,
+    pep_atom_set: &mut HashSet<(usize, usize)>,
+) -> Result<(MdState, Vec<MolDynamics>), ParamError> {
+    build_dynamics_with_residues(
+        dev,
+        mols_in,
+        param_set,
+        mol_specific_params,
+        cfg,
+        static_peptide,
+        near_lig_thresh,
+        pep_atom_set,
+        None,
+    )
+}
+
+fn build_dynamics_with_residues(
+    dev: &ComputationDevice,
+    // Last item is number of copies.
+    mols_in: &[(FfMolType, &MoleculeCommon, usize)],
+    param_set: &FfParamSet,
+    mol_specific_params: &HashMap<String, ForceFieldParams>,
+    cfg: &MdConfig,
+    static_peptide: bool,
+    near_lig_thresh: Option<f64>,
+    pep_atom_set: &mut HashSet<(usize, usize)>,
+    peptide_residues: Option<&HashMap<String, Vec<ResidueGeneric>>>,
+) -> Result<(MdState, Vec<MolDynamics>), ParamError> {
+    println!("Setting up dynamics...");
+
+    // Extract explicit box side-lengths so add_copies can keep molecules inside the boundary.
+    // Only meaningful for Fixed boxes; Pad boxes are sized after molecule placement so we skip them.
+    let box_dims = match &cfg.sim_box {
+        SimBoxInit::Fixed((lo, hi)) => Some((hi.x - lo.x, hi.y - lo.y, hi.z - lo.z)),
+        SimBoxInit::Pad(_) => None,
+    };
+
+    let (mols, pep_set) = setup_mols_dyn_with_residues(
+        mols_in,
+        mol_specific_params,
+        static_peptide,
+        near_lig_thresh,
+        box_dims,
+        peptide_residues,
+        param_set.family,
+    )?;
+    *pep_atom_set = pep_set;
+
+    // Uncomment as required for validating individual processes.
+    let mut cfg = MdConfig {
+        overrides: MdOverrides {
+            // skip_water: true,
+            // skip_water_relaxation: false,
+            // bonded_disabled: false,
+            // coulomb_disabled: true,
+            // lj_disabled: true,
+            // long_range_recip_disabled: true,
+            // snapshots_during_equilibration: true,
+            // Merge with caller-supplied overrides so flags like `skip_water` are preserved.
+            ..cfg.overrides.clone()
+        },
+        // zero_com_drift: false,
+        // max_init_relaxation_iters: None,
+        ..cfg.clone()
+    };
+
+    let mut gfnff_params = param_set.gfnff().map(|backend| {
+        let mut set = FfParamSet::new_gfnff();
+        *set.gfnff_mut().unwrap() = backend.clone();
+
+        set
+    });
+    if let Some(set) = &mut gfnff_params {
+        crate::force_fields::configure_gfnff_md(&mut cfg, set.gfnff_mut().unwrap())
+            .map_err(|e| ParamError::new(&e))?;
+    }
+
+    println!("Initializing MD state...");
+    let res = MdState::new(dev, &cfg, &mols, gfnff_params.as_ref().unwrap_or(param_set))?;
+    println!("MD init done.");
+
+    Ok(res)
+}
+
+/// Run the dynamics in one go. Blocking.
+pub fn run_dynamics_blocking(
+    md_state: &mut MdState,
+    dev: &ComputationDevice,
+    dt: f32,
+    n_steps: usize,
+) {
+    if n_steps == 0 {
+        return;
+    }
+
+    let start = Instant::now();
+
+    let i_20_pc = n_steps / 5;
+    let mut disp_count = 0;
+    for i in 0..n_steps {
+        if i.is_multiple_of(i_20_pc) {
+            println!("{}% Complete", disp_count * 20);
+            disp_count += 1;
+        }
+
+        md_state.step(dev, dt, None);
+        if let Err(error) = md_state.check_force_error() {
+            eprintln!("MD stopped: {error}");
+            break;
+        }
+    }
+
+    println!("MD complete in {}", format_elapsed(start.elapsed()));
+}
+
+impl State {
+    pub fn clear_md_frames(
+        &mut self,
+        scene: &mut Scene,
+        redraw: &mut RedrawFlags,
+        updates: &mut EngineUpdates,
+    ) {
+        let md = &mut self.volatile.md_local;
+        md.clear_snaps(&mut scene.entities, redraw);
+        // A run in progress owns its state on the worker, and keeps no in-memory snapshots.
+        md.mol_dynamics = None;
+        self.trajectories
+            .retain(|traj| matches!(traj.source, trajectory::TrajectorySource::File(_)));
+        trajectory::set_viewed(&mut self.trajectories, None);
+        updates.entities = graphics::EntityUpdate::All;
+    }
+}
+
+/// Called directly from the UI; non-blocking if run = false. E.g., can launch here to load to state,
+/// then call `md_step`.
+pub fn launch_md(state: &mut State, run: bool, fast_init: bool) {
+    if let Err(error) = state.sync_gfnff_md_config() {
+        state.volatile.md_local.launching = false;
+        handle_err(&mut state.ui, error);
+
+        return;
+    }
+
+    state.refresh_force_fields();
+    if let Err(error) = state.check_md_force_fields() {
+        state.volatile.md_local.launching = false;
+        handle_err(&mut state.ui, error);
+        return;
+    }
+    // Filter molecules for docking by if they're selected.
+    // mut so we can move their posits in the initial snapshot change.
+
+    // Avoids borrow error.
+    let mut md_pep_sel = state.volatile.md_local.pep_atom_set.clone();
+
+    // Clone selected molecules to release the immutable borrow of `state`
+    // before the mutable borrow needed by update_mols_for_disp.
+    let mols_owned: Vec<_> = {
+        let mols = get_mols_sel_for_md(state);
+        mols.iter()
+            .map(|(ff, mol, count)| (*ff, (*mol).clone(), *count))
+            .collect()
+    };
+
+    let mols: Vec<(FfMolType, &MoleculeCommon, usize)> = mols_owned
+        .iter()
+        .map(|(ff, mol, count)| (*ff, mol, *count))
+        .collect();
+
+    let near_lig_thresh = if state.ui.md.peptide_only_near_ligs {
+        Some(STATIC_ATOM_DIST_THRESH)
+    } else {
+        None
+    };
+
+    let cfg = if fast_init {
+        &MdConfig {
+            solvent: Solvent::None,
+            max_init_relaxation_iters: None,
+            ..state.to_save.md.config.clone()
+        }
+    } else {
+        &state.to_save.md.config
+    };
+
+    let alchemical = state
+        .ui
+        .md
+        .alchemical_enabled
+        .then_some(state.ui.md.alchemical_lambda);
+
+    let selected_params = state.selected_force_field();
+    let peptide_residues = peptide_residue_map(state);
+
+    match build_dynamics_with_residues(
+        &state.computation_device(),
+        &mols,
+        selected_params,
+        &state.mol_specific_params,
+        cfg,
+        state.ui.md.peptide_static,
+        near_lig_thresh,
+        &mut md_pep_sel,
+        Some(&peptide_residues),
+    ) {
+        Ok((mut md, custom_solvent)) => {
+            let num_water = md.water.len();
+
+            let n_solute_mols: usize = mols.iter().map(|(_, _, count)| *count).sum();
+            let mut copy_i = 0;
+            let mut viewer_mol_data = Vec::with_capacity(n_solute_mols);
+            for &(kind, template, copies) in &mols {
+                for _ in 0..copies {
+                    let Some(&start) = md.mol_start_indices.get(copy_i) else {
+                        break;
+                    };
+                    copy_i += 1;
+                    let end = md
+                        .mol_start_indices
+                        .get(copy_i)
+                        .copied()
+                        .unwrap_or(md.atoms.len());
+                    let atoms = &md.atoms[start..end];
+                    if template.atoms.len() == atoms.len()
+                        && template
+                            .atoms
+                            .iter()
+                            .map(|a| a.element)
+                            .eq(atoms.iter().map(|a| a.element))
+                    {
+                        let mut mol = template.clone();
+                        for ((a, p), simulated) in
+                            mol.atoms.iter_mut().zip(&mut mol.atom_posits).zip(atoms)
+                        {
+                            *p = simulated.posit.into();
+                            a.posit = *p;
+                        }
+                        viewer_mol_data.push((kind, mol, 1));
+
+                        continue;
+                    }
+
+                    // Use the simulated atom order after peptide filtering and hydrogen addition.
+                    let actual_atoms: Vec<Atom> = atoms
+                        .iter()
+                        .map(|a| Atom {
+                            serial_number: a.serial_number,
+                            element: a.element,
+                            posit: Vec3 {
+                                x: a.posit.x as f64,
+                                y: a.posit.y as f64,
+                                z: a.posit.z as f64,
+                            },
+                            ..Default::default()
+                        })
+                        .collect();
+
+                    // Infer covalent bonds from atom distances (covers added H).
+                    let atom_generics: Vec<AtomGeneric> = actual_atoms
+                        .iter()
+                        .map(|a| AtomGeneric {
+                            serial_number: a.serial_number,
+                            posit: a.posit,
+                            element: a.element,
+                            ..Default::default()
+                        })
+                        .collect();
+                    let bonds: Vec<Bond> = create_bonds(&atom_generics)
+                        .iter()
+                        .filter_map(|bg| Bond::from_generic(bg, &actual_atoms).ok())
+                        .collect();
+
+                    let atom_posits = actual_atoms.iter().map(|a| a.posit).collect();
+                    let mut mol_common = MoleculeCommon {
+                        ident: template.ident.clone(),
+                        atoms: actual_atoms,
+                        bonds,
+                        atom_posits,
+                        selected_for_md: template.selected_for_md,
+                        ..Default::default()
+                    };
+                    mol_common.build_adjacency_list();
+                    viewer_mol_data.push((kind, mol_common, 1));
+                }
+            }
+
+            // Add a single-atom viewer mol for each counter-ion appended by MdState::new.
+            // These live at md.atoms[ion_start..] and each has its own mol_start_indices entry,
+            // so they need a matching ViewerMolecule or the non-water atom count in
+            // mols_and_traj_synced will fall short of snapshot.atom_posits.len().
+            //
+            // mol_start_indices layout: [solute_mol_0, ..., solute_mol_{M-1},
+            //                            custom_solvent_0, ..., custom_solvent_{K-1},
+            //                            ion_0, ion_1, ...]
+            // where M counts solute molecules *after* copy expansion. We must skip past BOTH
+            // the solute mols and custom solvents to reach the ions.
+            let ion_start = md
+                .mol_start_indices
+                .get(n_solute_mols + custom_solvent.len())
+                .copied()
+                .unwrap_or(md.atoms.len());
+            let ions = md.atoms[ion_start..]
+                .iter()
+                .map(|a| {
+                    let posit = Vec3 {
+                        x: a.posit.x as f64,
+                        y: a.posit.y as f64,
+                        z: a.posit.z as f64,
+                    };
+
+                    let ion_atom = Atom {
+                        serial_number: a.serial_number,
+                        element: a.element,
+                        posit,
+                        ..Default::default()
+                    };
+
+                    (
+                        FfMolType::SmallOrganic,
+                        MoleculeCommon {
+                            ident: a.force_field_type.clone(),
+                            atoms: vec![ion_atom],
+                            atom_posits: vec![posit],
+                            selected_for_md: Some(1),
+                            ..Default::default()
+                        },
+                        1,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut viewer_mol_refs: Vec<(FfMolType, &MoleculeCommon, usize)> = viewer_mol_data
+                .iter()
+                .map(|(ff, m, c)| (*ff, m, *c))
+                .collect();
+
+            let custom_mol_commons = match custom_solvents_to_mol_commons(&custom_solvent) {
+                Ok(v) => v,
+                Err(e) => {
+                    handle_err(&mut state.ui, e);
+                    return;
+                }
+            };
+            for mol_common in &custom_mol_commons {
+                viewer_mol_refs.push((FfMolType::SmallOrganic, mol_common, 1));
+            }
+
+            viewer_mol_refs.extend(ions.iter().map(|(kind, mol, count)| (*kind, mol, *count)));
+
+            if viewer_mol_refs
+                .iter()
+                .map(|(_, mol, count)| mol.atoms.len() * count)
+                .sum::<usize>()
+                != md.atoms.len()
+            {
+                handle_err(
+                    &mut state.ui,
+                    "Dynamics molecule set does not match simulated atom order.".into(),
+                );
+
+                return;
+            }
+
+            // A run's mol set reaches the viewer with its trajectory, as for GROMACS.
+            let mut run_viewer = SnapshotViewer::default();
+            run_viewer.add_mol_set(&viewer_mol_refs, num_water);
+            if !run {
+                state
+                    .volatile
+                    .md_local
+                    .viewer
+                    .add_mol_set(&viewer_mol_refs, num_water);
+            }
+
+            if let Some(lambda) = alchemical {
+                // Decouple the first molecule, matching the water_sol.rs convention.
+                if let Err(e) =
+                    md.configure_alchemical_window(&state.computation_device(), 0, lambda)
+                {
+                    handle_err(
+                        &mut state.ui,
+                        format!("Unable to configure alchemical window: {e}"),
+                    );
+                    return;
+                }
+            }
+
+            if run {
+                let settings = (state.to_save.md.num_steps, state.to_save.md.dt);
+                let saved = md
+                    .start_run_output(settings.0 as usize, settings.1)
+                    .map(std::path::Path::to_owned)
+                    .and_then(|dir| {
+                        crate::project::save_md_inputs(
+                            state,
+                            &run_viewer.mol_sets[0],
+                            &md.cfg,
+                            &dir,
+                        )?;
+                        Ok(dir)
+                    });
+                let output_dir = match saved {
+                    Ok(dir) => dir,
+                    Err(error) => {
+                        handle_err(
+                            &mut state.ui,
+                            format!("Could not save Dynamics run inputs: {error}"),
+                        );
+
+                        return;
+                    }
+                };
+                // Frames load from the saved trajectory after the run, as for GROMACS. After
+                // saving the inputs, so they keep the configured interval, e.g. for xTB.
+                md.cfg.snapshot_handlers.memory = None;
+
+                start_run(state, md, output_dir, settings);
+            } else {
+                state.volatile.md_local.mol_dynamics = Some(md);
+            }
+        }
+        Err(e) => handle_err(&mut state.ui, e.descrip),
+    }
+    state.volatile.md_local.pep_atom_set = md_pep_sel;
+}
+
+/// Converts the `custom_solvent` vec returned by `MdState::new` into owned `MoleculeCommon`
+/// values suitable for the viewer mol-set. Returns an error string if bond construction fails.
+pub fn custom_solvents_to_mol_commons(
+    custom_solvent: &[MolDynamics],
+) -> Result<Vec<MoleculeCommon>, String> {
+    let mut result = Vec::new();
+    for mol in custom_solvent {
+        // Use the packed (placed) positions from atom_posits, not the template positions
+        // stored in mol.atoms. Without this, all copies appear at the template origin.
+        let atoms: Vec<Atom> = match &mol.atom_posits {
+            Some(packed_posits) => mol
+                .atoms
+                .iter()
+                .zip(packed_posits)
+                .map(|(a, p)| {
+                    let mut atom: Atom = a.into();
+                    atom.posit = Vec3 {
+                        x: p.x,
+                        y: p.y,
+                        z: p.z,
+                    };
+                    atom
+                })
+                .collect(),
+            None => mol.atoms.iter().map(|a| a.into()).collect(),
+        };
+        let mut bonds = Vec::with_capacity(mol.bonds.len());
+        for bond in &mol.bonds {
+            let b = Bond::from_generic(bond, &atoms)
+                .map_err(|_| "Error constructing bonds from custom solvent".to_string())?;
+            bonds.push(b);
+        }
+        result.push(MoleculeCommon::new(
+            "Solvent".to_owned(),
+            atoms,
+            bonds,
+            HashMap::new(),
+            None,
+        ));
+    }
+    Ok(result)
+}
+
+/// Called directly from the UI; computes energy.
+// pub fn launch_md_energy_computation(state: &mut State) -> Result<Snapshot, ParamError> {
+pub fn launch_md_energy_computation(state: &State) -> Result<Snapshot, ParamError> {
+    state
+        .check_md_force_fields()
+        .map_err(|e| ParamError::new(&e))?;
+    let mols_in = get_mols_sel_for_md(state);
+
+    let peptide_only_near_lig = if state.ui.md.peptide_only_near_ligs {
+        Some(STATIC_ATOM_DIST_THRESH)
+    } else {
+        None
+    };
+
+    let residues = peptide_residue_map(state);
+    let selected_params = state.selected_force_field();
+    let (mols, pep_atom_set) = setup_mols_dyn_with_residues(
+        &mols_in,
+        &state.mol_specific_params,
+        state.ui.md.peptide_static,
+        peptide_only_near_lig,
+        None,
+        Some(&residues),
+        selected_params.family,
+    )?;
+
+    // state.volatile.md_local.pep_atom_set = pep_atom_set;
+
+    compute_energy_snapshot(&state.computation_device(), &mols, selected_params)
+}
+
+/// A helper to reduce repetition. Loads references to mols in state that are selected for MD.
+/// Doesn't convert to MolDynamics, but sets up in a way conducive to doing so.
+pub fn get_mols_sel_for_md(state: &State) -> Vec<(FfMolType, &MoleculeCommon, usize)> {
+    let mut res = Vec::new();
+
+    for p in &state.peptides {
+        if let Some(copies) = p.common.selected_for_md {
+            res.push((FfMolType::Peptide, &p.common, copies.max(1)));
+        }
+    }
+
+    for m in &state.ligands {
+        if let Some(copies) = m.common.selected_for_md {
+            res.push((FfMolType::SmallOrganic, &m.common, copies.max(1)));
+        }
+    }
+
+    for m in &state.lipids {
+        if let Some(copies) = m.common.selected_for_md {
+            res.push((FfMolType::Lipid, &m.common, copies.max(1)));
+        }
+    }
+
+    for m in &state.nucleic_acids {
+        let Some(copies) = m.common.selected_for_md else {
+            continue;
+        };
+        let mol_type = match m.na_type {
+            NucleicAcidType::Dna => FfMolType::Dna,
+            NucleicAcidType::Rna => FfMolType::Rna,
+        };
+        res.push((mol_type, &m.common, copies.max(1)));
+    }
+
+    res
+}
+
+pub(crate) fn peptide_residue_map(state: &State) -> HashMap<String, Vec<ResidueGeneric>> {
+    state
+        .peptides
+        .iter()
+        .map(|p| {
+            (
+                p.common.ident.clone(),
+                p.residues.iter().map(|r| r.to_generic()).collect(),
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn setup_mols_dyn(
+    mols: &[(FfMolType, &MoleculeCommon, usize)],
+    mol_specific_params: &HashMap<String, ForceFieldParams>,
+    static_peptide: bool,
+    near_lig_thresh: Option<f64>,
+    box_dims: Option<(f32, f32, f32)>,
+) -> Result<(Vec<MolDynamics>, HashSet<(usize, usize)>), ParamError> {
+    setup_mols_dyn_with_residues(
+        mols,
+        mol_specific_params,
+        static_peptide,
+        near_lig_thresh,
+        box_dims,
+        None,
+        ForceFieldFamily::Amber,
+    )
+}
+
+pub(crate) fn setup_mols_dyn_with_residues(
+    mols: &[(FfMolType, &MoleculeCommon, usize)],
+    mol_specific_params: &HashMap<String, ForceFieldParams>,
+    static_peptide: bool,
+    near_lig_thresh: Option<f64>,
+    box_dims: Option<(f32, f32, f32)>,
+    peptide_residues: Option<&HashMap<String, Vec<ResidueGeneric>>>,
+    ff_family: ForceFieldFamily,
+) -> Result<(Vec<MolDynamics>, HashSet<(usize, usize)>), ParamError> {
+    let gfnff = ff_family == ForceFieldFamily::Gfnn;
+    if gfnff {
+        validate_gfnff_positions(mols)?;
+    }
+
+    let mut res = Vec::new();
+    let mut pep_atom_set = HashSet::new();
+    let mut peptide_i = 0;
+    for (ff_mol_type, mol, copies) in mols {
+        if mol.selected_for_md.is_none() {
+            continue;
+        }
+        let copies = (*copies).max(1);
+        let is_peptide = *ff_mol_type == FfMolType::Peptide;
+
+        // In the case of Peptides, we perform optional filtering, e.g. for only atoms near a ligand.
+        // If so, we must rebuild bonds, as the indices they refer to will have changed, and some bonds
+        // are no longer present.
+        let dynamics_mol = if is_peptide {
+            let (mut atoms, pep_set) = filter_peptide_atoms(mol, mols, near_lig_thresh);
+            if gfnff {
+                let positions = mol
+                    .atom_posits
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, posit)| pep_set.contains(&(0, i)).then_some(posit));
+                for (atom, &posit) in atoms.iter_mut().zip(positions) {
+                    atom.posit = posit;
+                }
+            }
+
+            println!(
+                "Peptide atom count: {}. Set count: {}",
+                atoms.len(),
+                pep_set.len()
+            );
+            pep_atom_set.extend(pep_set.into_iter().map(|(_, atom_i)| (peptide_i, atom_i)));
+            peptide_i += 1;
+
+            let bonds = create_bonds(&atoms);
+
+            MolDynamics {
+                ff_mol_type: FfMolType::Peptide,
+                atoms,
+                atom_posits: None,
+                atom_init_velocities: None,
+                bonds,
+                adjacency_list: None,
+                static_: static_peptide,
+                bonded_only: false,
+                mol_specific_params: None,
+                explicit_params: None,
+                residues: peptide_residues.and_then(|m| m.get(&mol.ident).cloned()),
+            }
+        } else {
+            let atoms = mol.atoms.iter().map(|a| a.to_generic()).collect();
+            let bonds = mol.bonds.iter().map(|b| b.to_generic()).collect();
+            let msp = mol_specific_params.get(&mol.ident).cloned();
+            if msp.is_none()
+                && *ff_mol_type == FfMolType::SmallOrganic
+                && ff_family == ForceFieldFamily::Amber
+            {
+                return Err(ParamError::new(&format!(
+                    "Missing molecule-specific parameters for  {}",
+                    mol.ident
+                )));
+            }
+
+            MolDynamics {
+                ff_mol_type: *ff_mol_type,
+                atoms,
+                atom_posits: Some(mol.atom_posits.clone()),
+                atom_init_velocities: None,
+                bonds,
+                adjacency_list: Some(mol.adjacency_list.clone()),
+                static_: false,
+                bonded_only: false,
+                mol_specific_params: msp,
+                explicit_params: None,
+                residues: None,
+            }
+        };
+
+        if gfnff {
+            if dynamics_mol.atoms.is_empty() {
+                return Err(ParamError::new(&format!(
+                    "{} has no atoms selected for GFN-FF MD.",
+                    mol.ident
+                )));
+            }
+
+            if let Some(atom) = dynamics_mol
+                .atoms
+                .iter()
+                .find(|atom| !(1..=86).contains(&atom.element.atomic_number()))
+            {
+                return Err(ParamError::new(&format!(
+                    "{} atom {} has an unsupported element ({}) for GFN-FF.",
+                    mol.ident, atom.serial_number, atom.element
+                )));
+            }
+        }
+
+        add_copies(&mut res, &dynamics_mol, copies, box_dims);
+    }
+
+    Ok((res, pep_atom_set))
+}
+
+fn validate_gfnff_positions(
+    mols: &[(FfMolType, &MoleculeCommon, usize)],
+) -> Result<(), ParamError> {
+    for (kind, mol, _) in mols {
+        if mol.selected_for_md.is_none() {
+            continue;
+        }
+
+        if mol.atoms.len() != mol.atom_posits.len() {
+            return Err(ParamError::new(&format!(
+                "{} has mismatched atom and coordinate counts.",
+                mol.ident
+            )));
+        }
+
+        let invalid = mol
+            .atoms
+            .iter()
+            .zip(&mol.atom_posits)
+            .find(|(atom, posit)| {
+                (*kind != FfMolType::Peptide || !atom.hetero)
+                    && posit.to_arr().iter().any(|v| !v.is_finite())
+            });
+        if let Some((atom, _)) = invalid {
+            return Err(ParamError::new(&format!(
+                "{} atom {} has non-finite coordinates.",
+                mol.ident, atom.serial_number
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Default, Encode, Decode)]
+pub enum MdBackend {
+    #[default]
+    Dynamics,
+    Gromacs,
+    xTb,
+    Orca,
+}
+
+impl Display for MdBackend {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let v = match self {
+            Self::Dynamics => "Dynamics",
+            Self::Gromacs => "GROMACS",
+            Self::xTb => "xTB",
+            Self::Orca => "ORCA",
+        };
+
+        write!(f, "{v}")
+    }
+}
+
+/// For the UI functions to launch MD, and run energy computations.
+fn ready_to_run_helper(state: &mut State) -> bool {
+    clear_cli_out(&mut state.ui);
+
+    // OPLS generation runs in the background. Amber's GeoStd/GAFF2 cache is
+    // not a prerequisite, but selected molecules must finish parameterization.
+    if state.to_save.md.config.ff_family != ForceFieldFamily::Amber {
+        state.refresh_force_fields();
+        if let Err(error) = state.check_md_force_fields() {
+            handle_err(&mut state.ui, error);
+            return false;
+        }
+        return true;
+    }
+
+    let mut ready_to_run = true;
+
+    // Check that we have FF params and mol-specific parameters.
+    for lig in &state.ligands {
+        if lig.common.selected_for_md.is_none() {
+            continue;
+        }
+
+        if !lig.ff_params_loaded || !lig.frcmod_loaded {
+            state.ui.popup.show_get_geostd = true;
+            ready_to_run = false;
+        }
+    }
+
+    ready_to_run
+}
+/// Launched from the UI; initiates MD.
+pub fn start_md(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    if runs::running(state) {
+        handle_err(&mut state.ui, "An MD run is already active.".into());
+
+        return;
+    }
+
+    let prefs = &state.to_save.md;
+    let gromacs = prefs.backend == MdBackend::Gromacs;
+    let gromacs_files = gromacs && state.volatile.md_local.gromacs_setup.uses_files();
+    let native_mdp = gromacs && state.volatile.md_local.gromacs_setup.mdp.is_some();
+    if !native_mdp && (prefs.num_steps == 0 || !prefs.dt.is_finite() || prefs.dt <= 0.) {
+        handle_err(
+            &mut state.ui,
+            "Set a positive MD step count and time step.".into(),
+        );
+
+        return;
+    }
+
+    if !gromacs_files
+        && !native_mdp
+        && let Err(error) = state.sync_gfnff_md_config()
+    {
+        handle_err(&mut state.ui, error);
+
+        return;
+    }
+
+    if (!gromacs_files
+        && state.force_fields.family == ForceFieldFamily::Gfnn
+        && !matches!(
+            state.to_save.md.backend,
+            MdBackend::Dynamics | MdBackend::xTb
+        ))
+        || (state.to_save.md.backend == MdBackend::xTb
+            && state.force_fields.family != ForceFieldFamily::Gfnn)
+    {
+        handle_err(
+            &mut state.ui,
+            "xTB supports GFN-FF only; GFN-FF supports the Dynamics and xTB backends.".into(),
+        );
+
+        return;
+    }
+
+    let uses_saved_inputs = state
+        .volatile
+        .md_local
+        .opened_inputs
+        .as_ref()
+        .is_some_and(|inputs| inputs.backend() == state.to_save.md.backend);
+    if !gromacs_files && !uses_saved_inputs && !ready_to_run_helper(state) {
+        return;
+    }
+
+    let center = state
+        .peptide_for_tools_i()
+        .and_then(|i| state.peptides.get(i))
+        .map(|mol| mol.common.centroid())
+        .unwrap_or_else(Vec3::new_zero);
+    // todo: Set a loading indicator, and trigger the build next GUI frame.
+    move_cam_to_active_mol(state, scene, center, updates);
+
+    match state.to_save.md.backend {
+        MdBackend::Dynamics => {
+            let message = if state.force_fields.family == ForceFieldFamily::Gfnn {
+                "Running MD. Initializing GFN-FF and relaxing the molecules..."
+            } else {
+                "Running MD. Initializing water, and relaxing the molecules..."
+            };
+            handle_success(&mut state.ui, message.to_string());
+
+            // We will wait a frame so we can display the message above.
+            state.volatile.md_local.launching = true;
+        }
+        MdBackend::Gromacs => {
+            handle_success(&mut state.ui, "Running MD with GROMACS...".to_string());
+            // We will wait a frame so we can display the message above.
+            gromacs::launch_md(state)
+        }
+        MdBackend::xTb => xtb::launch_md(state),
+        // todo: For now, we launch ORCA MD from the quantum chemistry window.
+        MdBackend::Orca => {}
+    }
+}
+
+pub fn start_md_energy_computation(state: &mut State) {
+    // todo: WIP
+    if !ready_to_run_helper(state) {
+        return;
+    }
+
+    let mut pep_md = state.volatile.md_local.pep_atom_set.clone(); // Avoids borrow problem.
+    match launch_md_energy_computation(state) {
+        Ok(snap) => {
+            if let Some(en) = &snap.energy_data {
+                let data = if state.force_fields.family == ForceFieldFamily::Gfnn {
+                    format!(
+                        "GFN-FF potential energy: {:.6} kcal/mol",
+                        en.energy_potential
+                    )
+                } else {
+                    format!(
+                        "E result. PE: {:.2}, PE NB: {:.3} PE Bonded: {:.2}",
+                        en.energy_potential,
+                        en.energy_potential_nonbonded,
+                        en.energy_potential_bonded
+                    )
+                };
+                println!("{data}");
+                handle_success(&mut state.ui, data);
+
+                state.volatile.md_local.pep_atom_set = pep_md;
+            }
+        }
+        Err(e) => handle_err(&mut state.ui, format!("Error computing energy: {:?}", e)),
+    }
+}
+
+/// Populate energy on snapshots that are between ones that have eneryg, for display purposes.
+pub fn carry_over_snap_energy(snaps: &mut [Snapshot]) {
+    let mut last_en = None;
+    for snap in snaps {
+        match &mut snap.energy_data {
+            Some(e) => last_en = Some(e.clone()),
+            None => {
+                if last_en.is_some() {
+                    snap.energy_data = last_en.clone();
+                }
+            }
+        }
+    }
+}

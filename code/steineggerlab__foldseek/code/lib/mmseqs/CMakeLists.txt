@@ -1,0 +1,391 @@
+cmake_minimum_required(VERSION 3.15 FATAL_ERROR)
+project(MMseqs CXX C)
+message("-- Source Directory: ${CMAKE_CURRENT_SOURCE_DIR}")
+message("-- Project Directory: ${PROJECT_SOURCE_DIR}")
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+set(FRAMEWORK_ONLY 0 CACHE BOOL "Framework mode (don't create mmseqs executable)")
+set(HAVE_SANITIZER 0 CACHE BOOL "Have sanitizers")
+set(INSTALL_UTIL 1 CACHE BOOL "Install utility scripts")
+set(VERSION_OVERRIDE "" CACHE STRING "Override version string in help and usage messages")
+set(DISABLE_IPS4O 0 CACHE BOOL "Disabling IPS4O sorting library requiring 128-bit compare exchange operations")
+set(HAVE_AVX512 0 CACHE BOOL "Have CPU with AVX512")
+set(HAVE_AVX2 0 CACHE BOOL "Have CPU with AVX2")
+set(HAVE_SSE4_1 0 CACHE BOOL "Have CPU with SSE4.1")
+set(HAVE_SSE2 0 CACHE BOOL "Have CPU with SSE2")
+set(HAVE_POWER9 0 CACHE BOOL "Have POWER9 CPU")
+set(HAVE_POWER8 0 CACHE BOOL "Have POWER8 CPU")
+set(HAVE_ARM8 0 CACHE BOOL "Have ARMv8 CPU")
+set(HAVE_S390X 0 CACHE BOOL "Have s390x architecture")
+set(NATIVE_ARCH 1 CACHE BOOL "Assume native architecture for SIMD. Use one of the HAVE_* options or set CMAKE_CXX_FLAGS to the appropriate flags if you disable this.")
+set(USE_SYSTEM_ZSTD 0 CACHE BOOL "Use zstd provided by system instead of bundled version")
+set(IGNORE_RUST_VERSION 0 CACHE BOOL "Ignore Rust version check")
+set(ENABLE_HIP 0 CACHE BOOL "Enable HIP")
+set(ENABLE_CUDA 0 CACHE BOOL "Enable CUDA")
+set(AVX512_DISPATCH "AUTO" CACHE STRING "Runtime-dispatched AVX512 kernels: AUTO, ON, OFF")
+set_property(CACHE AVX512_DISPATCH PROPERTY STRINGS "AUTO" "ON" "OFF")
+set(FORCE_STATIC_DEPS 0 CACHE BOOL "Force static linking of deps")
+set(MMSEQS_INT64_IDS 0 CACHE BOOL "Use 64-bit internal sequence/database IDs")
+
+
+if(ENABLE_HIP)
+    set(ENABLE_CUDA 1)
+endif()
+
+if(FORCE_STATIC_DEPS)
+    if(ENABLE_CUDA)
+        set(CMAKE_FIND_LIBRARY_SUFFIXES .a .so CACHE INTERNAL "" FORCE)
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
+    else()
+        set(CMAKE_FIND_LIBRARY_SUFFIXES .a CACHE INTERNAL "" FORCE)
+        set(CMAKE_LINK_SEARCH_START_STATIC ON CACHE INTERNAL "" FORCE)
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
+    endif()
+    set(BUILD_SHARED_LIBS OFF CACHE INTERNAL "" FORCE)
+endif()
+
+if(NOT XCODE AND NOT MSVC AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+endif()
+
+if (HAVE_SANITIZER)
+    include(FindUBSan)
+    include(FindASan)
+    include(FindMSan)
+    include(FindTSan)
+endif ()
+
+# find compiler
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message("-- Compiler is clang(++)")
+    set(CMAKE_COMPILER_IS_CLANG 1)
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message("-- Compiler is GNU ")
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS "4.9.0")
+        message(FATAL_ERROR "Insufficient gcc version")
+    endif ()
+elseif (CMAKE_CXX_COMPILER_ID MATCHES "Intel")
+    message("-- Compiler is icc(++)")
+    set(CMAKE_COMPILER_IS_ICC 1)
+endif ()
+
+# see https://wiki.debian.org/ArchitectureSpecificsMemo for char signedness
+set(MMSEQS_CXX_FLAGS "-fsigned-char")
+
+# SIMD instruction sets support
+set(MMSEQS_ARCH "")
+if (HAVE_AVX512)
+    # With runtime dispatch the baseline stays at AVX2: only UngappedAlignerAVX512.cpp and
+    # FwbwAVX512.cpp are built for AVX512, and the CPU decides at startup which backend runs.
+    if (AVX512_DISPATCH STREQUAL "OFF")
+        set(MMSEQS_AVX512_BASE "-mavx512f -mavx512bw -mavx512dq -mavx512vl")
+    else ()
+        set(MMSEQS_AVX512_BASE "-mavx2")
+    endif ()
+    if (CMAKE_COMPILER_IS_CLANG)
+        set(MMSEQS_ARCH "${MMSEQS_ARCH} ${MMSEQS_AVX512_BASE} -mfma -mcx16")
+    else ()
+        set(MMSEQS_ARCH "${MMSEQS_ARCH} ${MMSEQS_AVX512_BASE} -mfma -mcx16 -Wa,-q")
+    endif ()
+    set(X64 1 CACHE INTERNAL "")
+elseif (HAVE_AVX2)
+    if (CMAKE_COMPILER_IS_CLANG)
+        set(MMSEQS_ARCH "${MMSEQS_ARCH} -mavx2 -mfma -mcx16")
+    else ()
+        set(MMSEQS_ARCH "${MMSEQS_ARCH} -mavx2 -mfma -mcx16 -Wa,-q")
+    endif ()
+    set(X64 1 CACHE INTERNAL "")
+elseif (HAVE_SSE4_1)
+    set(MMSEQS_ARCH "${MMSEQS_ARCH} -msse4.1 -mcx16")
+    set(X64 1 CACHE INTERNAL "")
+elseif (HAVE_SSE2)
+    set(MMSEQS_ARCH "${MMSEQS_ARCH} -msse2")
+    set(DISABLE_IPS4O 1)
+    set(X64 1 CACHE INTERNAL "")
+elseif (HAVE_POWER9)
+    set(MMSEQS_ARCH "${MMSEQS_ARCH} -mcpu=power9 -mvsx")
+    set(PPC64 1 CACHE INTERNAL "")
+elseif (HAVE_POWER8)
+    set(MMSEQS_ARCH "${MMSEQS_ARCH} -mcpu=power8 -mvsx")
+    set(PPC64 1 CACHE INTERNAL "")
+elseif (HAVE_ARM8)
+    set(MMSEQS_ARCH "${MMSEQS_ARCH} -march=armv8-a+simd")
+    set(ARM 1 CACHE INTERNAL "")
+elseif (HAVE_S390X)
+    set(MMSEQS_ARCH "${MMSEQS_ARCH} -march=z14 -mzarch -mzvector")
+    set(ZARCH 1 CACHE INTERNAL "")
+endif ()
+
+if (MMSEQS_ARCH)
+    set(NATIVE_ARCH 0 CACHE INTERNAL "")
+endif ()
+
+if (NATIVE_ARCH)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm.*|ARM.*|aarch64.*|AARCH64.*)")
+        set(ARM 1 CACHE INTERNAL "")
+    elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "PPC64*|ppc64*|powerpc64*")
+        set(PPC64 1 CACHE INTERNAL "")
+    elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "amd64|AMD64")
+        set(X64 1 CACHE INTERNAL "")
+    elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "x86|X86")
+        set(X86 1 CACHE INTERNAL "")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^s390")
+        set(ZARCH 1 CACHE INTERNAL "")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^sparc")
+        set(SPARC 1 CACHE INTERNAL "")
+    else ()
+        message(WARNING "CPU without native SIMD instructions. Performance will be bad.")
+    endif ()
+    if (EMSCRIPTEN)
+        set(MMSEQS_ARCH "-msimd128 -s WASM=1 -s ASSERTIONS=1")
+    elseif (X86 OR X64)
+        include(CheckSSEFeatures)
+        if (NOT HAVE_SSE4_1_EXTENSIONS)
+            if (NOT HAVE_SSE2_EXTENSIONS)
+                message(FATAL_ERROR "At least SSE2 is needed to compile")
+            endif ()
+            message(WARNING "At least SSE4.1 is needed for best performance")
+        endif ()
+        # clang has a problem with march=native on travis
+        if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "4.0.0")
+            set(MMSEQS_ARCH "${SSE_FLAGS}")
+        else()
+            set(MMSEQS_ARCH "-march=native")
+            if (HAVE_AVX2_EXTENSIONS AND NOT AVX512_DISPATCH STREQUAL "OFF")
+                # Keep -march=native's tuning and everything below AVX512, but hold the baseline
+                # at AVX2 so the Default backends stay the fallback and the binary still runs on
+                # an AVX2 machine. -mno-avx512f clears the whole AVX512 family; the per-source
+                # flags on the two AVX512 TUs are emitted later and re-enable it there.
+                set(MMSEQS_ARCH "${MMSEQS_ARCH} -mno-avx512f")
+            endif ()
+        endif()
+    elseif (PPC64 OR ARM)
+        set(MMSEQS_ARCH "-mcpu=native")
+    elseif (ZARCH)
+        set(MMSEQS_ARCH "-mcpu=native -mzvector")
+    else ()
+        set(MMSEQS_ARCH "-march=native")
+    endif ()
+endif ()
+
+if (ARM AND CMAKE_COMPILER_IS_CLANG AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 20.1.5)
+    message("-- Setting -DAVX2 ON ARM")
+    set(MMSEQS_ARCH "${MMSEQS_ARCH} -DAVX2")
+endif ()
+
+set(MMSEQS_ARCH ${MMSEQS_ARCH} CACHE INTERNAL "")
+
+if (NOT (MMSEQS_ARCH STREQUAL ""))
+    set(MMSEQS_CXX_FLAGS "${MMSEQS_CXX_FLAGS} ${MMSEQS_ARCH}")
+endif ()
+
+# Runtime-dispatched AVX512 kernels (gapless alignment, fwbw). Those translation units are
+# compiled with their own -m flags and are only entered when the CPU reports the features at
+# runtime, so the rest of the binary keeps its baseline instruction set. If the toolchain cannot
+# compile them the sources are dropped and MMSEQS_HAVE_AVX512_DISPATCH stays undefined, which
+# compiles the dispatch away.
+set(MMSEQS_AVX512_DISPATCH_FLAGS "" CACHE INTERNAL "")
+set(MMSEQS_WANT_AVX512_DISPATCH 0)
+if ((NOT AVX512_DISPATCH STREQUAL "OFF") AND (X86 OR X64))
+    if (AVX512_DISPATCH STREQUAL "ON" OR HAVE_AVX512 OR HAVE_AVX2)
+        # explicit baseline of AVX2 or better
+        set(MMSEQS_WANT_AVX512_DISPATCH 1)
+    elseif (NATIVE_ARCH AND HAVE_AVX2_EXTENSIONS)
+        # -march=native on a host that CheckSSEFeatures proved can run AVX2
+        set(MMSEQS_WANT_AVX512_DISPATCH 1)
+    endif ()
+endif ()
+if (MMSEQS_WANT_AVX512_DISPATCH)
+    include(CheckCXXSourceCompiles)
+    set(MMSEQS_AVX512_DISPATCH_FLAGS_TRY "-mavx512f -mavx512bw -mavx512dq -mavx512vl")
+    set(OLD_CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS}")
+    set(CMAKE_REQUIRED_FLAGS "${MMSEQS_AVX512_DISPATCH_FLAGS_TRY}")
+    check_cxx_source_compiles("
+        #include <immintrin.h>
+        int main() {
+            __m512i a = _mm512_set1_epi8(1);
+            a = _mm512_adds_epu8(a, a);
+            __m256i b = _mm256_maskz_set1_epi8(_mm256_cmpgt_epi8_mask(_mm512_castsi512_si256(a), _mm256_setzero_si256()), 1);
+            return _mm_cvtsi128_si32(_mm256_castsi256_si128(b));
+        }"
+        HAVE_AVX512_DISPATCH)
+    set(CMAKE_REQUIRED_FLAGS "${OLD_CMAKE_REQUIRED_FLAGS}")
+    if (HAVE_AVX512_DISPATCH)
+        set(MMSEQS_AVX512_DISPATCH_FLAGS "${MMSEQS_AVX512_DISPATCH_FLAGS_TRY}" CACHE INTERNAL "")
+        message("-- AVX512 runtime dispatch enabled")
+    else ()
+        message("-- AVX512 runtime dispatch not available with this compiler")
+    endif ()
+else ()
+    message("-- AVX512 runtime dispatch disabled (baseline below AVX2, or turned off)")
+endif ()
+
+if (CYGWIN OR ARM OR PPC64)
+    set(MMSEQS_CXX_FLAGS "${MMSEQS_CXX_FLAGS} -D_GNU_SOURCE=1")
+endif ()
+
+if (CMAKE_COMPILER_IS_ICC)
+    # default -fp-model results in inconsistent results in profile search
+    set(MMSEQS_CXX_FLAGS "${MMSEQS_CXX_FLAGS} -fp-model precise")
+endif ()
+
+# Apple specific features
+if (APPLE)
+    # macOS SDK started using _Atomic (in ucred.h) which g++ does not support
+    # __APPLE_API_STRICT_CONFORMANCE makes sysctl.h not include apis like ucred.h
+    # See: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=89864
+    set(MMSEQS_CXX_FLAGS "${MMSEQS_CXX_FLAGS} -D__APPLE_API_STRICT_CONFORMANCE")
+endif ()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+    set(MMSEQS_CXX_FLAGS "${MMSEQS_CXX_FLAGS} -D_WITH_GETLINE")
+endif ()
+
+if (CYGWIN)
+    # default cygwin allocator (dlmalloc) locks on every allocation and destroys MT performance
+    add_subdirectory(lib/nedmalloc)
+    # IPS4O seems to deadlock on cygwin
+    set(DISABLE_IPS4O 1)
+endif()
+
+if ((CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "5.0.0")
+        OR (CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "9.1.0"))
+    # clang before v5 throws compile errors on ips4o
+    set(DISABLE_IPS4O 1)
+endif ()
+
+if (PPC64 OR SPARC OR ZARCH)
+    # FIXME: investigate why on ppc the regression seems to fail randomly
+    set(DISABLE_IPS4O 1)
+endif ()
+
+set(MMSEQS_C_FLAGS "${MMSEQS_CXX_FLAGS}")
+if (MMSEQS_INT64_IDS)
+    set(MMSEQS_C_FLAGS "${MMSEQS_C_FLAGS} -DMMSEQS_INT64_IDS=1")
+    set(MMSEQS_CXX_FLAGS "${MMSEQS_CXX_FLAGS} -DMMSEQS_INT64_IDS=1")
+endif ()
+set(MMSEQS_CXX_FLAGS "${MMSEQS_CXX_FLAGS} -std=c++1y")
+# Compiler-specific features
+# if (CMAKE_COMPILER_IS_CLANG AND (NOT EMSCRIPTEN))
+#     set(CMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LANGUAGE_STANDARD "c++11")
+#     set(CMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++")
+#     set(MMSEQS_CXX_FLAGS "${MMSEQS_CXX_FLAGS} -stdlib=libc++")
+# endif ()
+
+set(ENV{CARGO_NET_OFFLINE} true)
+add_subdirectory(lib/corrosion)
+# don't try to link to gcc_s, its not needed anyway
+list(REMOVE_ITEM Rust_CARGO_TARGET_LINK_NATIVE_LIBS "gcc_s")
+set(Rust_CARGO_TARGET_LINK_NATIVE_LIBS ${Rust_CARGO_TARGET_LINK_NATIVE_LIBS} CACHE INTERNAL "")
+
+if(Rust_VERSION VERSION_LESS "1.68.0" AND NOT IGNORE_RUST_VERSION)
+    message(FATAL_ERROR "Rust >= 1.68.0 is required")
+endif()
+
+set(RUST_FEATURE "" CACHE INTERNAL "")
+if(HAVE_AVX2 OR HAVE_AVX512)
+    set(RUST_FEATURE simd_avx2 CACHE INTERNAL "")
+elseif(HAVE_SSE4_1 OR HAVE_SSE2)
+    set(RUST_FEATURE simd_sse2 CACHE INTERNAL "")
+elseif(HAVE_ARM8)
+    set(RUST_FEATURE simd_neon CACHE INTERNAL "")
+endif()
+
+if (NATIVE_ARCH AND (RUST_FEATURE STREQUAL ""))
+    if(EMSCRIPTEN)
+        set(RUST_FEATURE simd_wasm CACHE INTERNAL "")
+    elseif(ARM)
+        set(RUST_FEATURE simd_neon CACHE INTERNAL "")
+    elseif(X86 OR X64)
+        if (HAVE_AVX2_EXTENSIONS)
+            set(RUST_FEATURE simd_avx2 CACHE INTERNAL "")
+        elseif (HAVE_SSE2_EXTENSIONS)
+            set(RUST_FEATURE simd_sse2 CACHE INTERNAL "")
+        endif()
+    endif()
+endif()
+if(RUST_FEATURE STREQUAL "")
+    message(WARNING "No SIMD support for this architecture. Alignment performance will be bad")
+    set(RUST_FEATURE no_simd CACHE INTERNAL "")
+endif()
+message("-- Rust Feature: ${RUST_FEATURE}")
+corrosion_import_crate(
+    MANIFEST_PATH lib/block-aligner/c/Cargo.toml
+    FEATURES "${RUST_FEATURE}"
+    CRATE_TYPES staticlib
+)
+if(APPLE)
+    # corrosion adds the Command Line Tools SDK to the link path, which can mismatch the selected SDK
+    set_property(TARGET block_aligner_c-static PROPERTY INTERFACE_LINK_DIRECTORIES "")
+endif()
+include_directories(lib/block-aligner/c)
+if(EMSCRIPTEN)
+    corrosion_add_target_local_rustflags(block_aligner_c "-Clink-args=--no-entry -sRELOCATABLE=1")
+endif()
+
+if (USE_SYSTEM_ZSTD)
+    include(FindPackageHandleStandardArgs)
+    find_path(ZSTD_INCLUDE_DIRS NAMES zstd.h REQUIRED)
+    # We use ZSTD_findDecompressedSize which is only available with ZSTD_STATIC_LINKING_ONLY
+    find_library(ZSTD_LIBRARIES NAMES libzstd.a libzstd_static REQUIRED)
+    find_package_handle_standard_args(ZSTD DEFAULT_MSG ZSTD_LIBRARIES ZSTD_INCLUDE_DIRS)
+    mark_as_advanced(ZSTD_LIBRARIES ZSTD_INCLUDE_DIRS)
+    include_directories(${ZSTD_INCLUDE_DIRS})
+else ()
+    # We use ZSTD_findDecompressedSize which is only available with ZSTD_STATIC_LINKING_ONLY
+    set(ZSTD_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/zstd")
+    set(CMAKE_INSTALL_LIBDIR bin)
+    set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/lib/zstd/build/cmake/CMakeModules")
+    option(ZSTD_LEGACY_SUPPORT "LEGACY SUPPORT" OFF)
+    option(ZSTD_BUILD_STATIC "BUILD STATIC LIBRARIES" ON)
+    option(ZSTD_BUILD_SHARED "BUILD SHARED LIBRARIES" OFF)
+    option(ZSTD_MULTITHREAD_SUPPORT "MULTITHREADING SUPPORT" OFF)
+    option(ZSTD_BUILD_PROGRAMS "BUILD PROGRAMS" OFF)
+    option(ZSTD_BUILD_CONTRIB "BUILD CONTRIB" OFF)
+    option(ZSTD_BUILD_TESTS "BUILD TESTS" OFF)
+    include_directories(lib/zstd/lib)
+    add_subdirectory(lib/zstd/build/cmake/lib EXCLUDE_FROM_ALL)
+    set_target_properties(libzstd_static PROPERTIES COMPILE_FLAGS "${MMSEQS_C_FLAGS}" LINK_FLAGS "${MMSEQS_C_FLAGS}")
+    set(ZSTD_LIBRARIES libzstd_static)
+endif()
+
+# tinyexpr
+include_directories(lib/tinyexpr)
+add_subdirectory(lib/tinyexpr EXCLUDE_FROM_ALL)
+
+# microtar
+include_directories(lib/microtar)
+add_subdirectory(lib/microtar)
+
+# tantan
+include_directories(lib/tantan)
+add_subdirectory(lib/tantan)
+
+# simde
+include_directories(lib/simde)
+
+include_directories(lib)
+include_directories(lib/simd)
+include_directories(lib/alp)
+include_directories(lib/ksw2)
+include_directories(lib/xxhash)
+if (NOT DISABLE_IPS4O)
+    include_directories(lib/ips4o)
+endif ()
+
+# libmarv
+if (ENABLE_CUDA)
+    set(LIBRARY_ONLY 1 CACHE INTERNAL "" FORCE)
+    include_directories(lib/libmarv/src)
+    add_subdirectory(lib/libmarv/src EXCLUDE_FROM_ALL)
+    set_target_properties(marv PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif ()
+
+add_subdirectory(lib/alp)
+add_subdirectory(lib/ksw2)
+add_subdirectory(data)
+add_subdirectory(src)
+if (NOT FRAMEWORK_ONLY AND INSTALL_UTIL)
+    add_subdirectory(util)
+endif ()

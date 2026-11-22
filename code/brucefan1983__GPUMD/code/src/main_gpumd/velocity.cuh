@@ -1,0 +1,58 @@
+/*
+    Copyright 2017 Zheyong Fan and GPUMD development team
+    This file is part of GPUMD.
+    GPUMD is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+    GPUMD is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Lesser General Public License for more details.
+    You should have received a copy of the GNU Lesser General Public License
+    along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+#pragma once
+
+#include "utilities/gpu_vector.cuh"
+#include <vector>
+
+class Atom;
+class Group;
+
+class Velocity
+{
+public:
+  bool do_velocity_correction = false;
+  int velocity_correction_interval = 1000;
+  int velocity_correction_group_method = -1;
+
+  void initialize_cpu(
+    const bool has_velocity_in_xyz,
+    const double initial_temperature,
+    Atom& atom,
+    bool use_seed,
+    int seed);
+
+  void correct_velocity(const int step, const std::vector<Group>& group, Atom& atom);
+
+  void finalize();
+
+private:
+  GPU_Vector<double> correction_sums;
+  GPU_Vector<double> correction_parameters;
+
+  void correct_velocity(
+    const int N,
+    const std::vector<double>& cpu_mass,
+    const std::vector<double>& cpu_position_per_atom,
+    std::vector<double>& cpu_velocity_per_atom);
+
+  void scale(
+    const double initial_temperature,
+    const std::vector<double>& cpu_mass,
+    double* cpu_vx,
+    double* cpu_vy,
+    double* cpu_vz);
+};

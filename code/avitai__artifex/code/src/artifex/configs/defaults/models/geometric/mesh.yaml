@@ -1,0 +1,13 @@
+name: default_mesh_model
+description: Default typed config for sphere-template mesh generation models.
+network:
+  name: mesh_network
+  hidden_dims: [256, 128, 64]
+  activation: gelu
+  embed_dim: 256
+  num_heads: 8
+  num_layers: 4
+  edge_features_dim: 64
+num_vertices: 512
+vertex_dim: 3
+dropout_rate: 0.1

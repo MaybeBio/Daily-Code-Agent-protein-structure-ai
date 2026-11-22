@@ -1,8 +1,8 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/IRL2/nanover-server-py
-- 快照日期: 2026-11-18
-- 快照 commit: [`058e470d9432`](https://github.com/IRL2/nanover-server-py/commit/058e470d9432bc793021ec4c84106c51061a68b8)
+- 快照日期: 2026-11-22
+- 快照 commit: [`e85687abcc77`](https://github.com/IRL2/nanover-server-py/commit/e85687abcc776da9b5b1db8fa988ecc84879b2f3)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
 ## 保留 (228 个文件, 2.3 MB)
@@ -14,7 +14,7 @@
 | 构建/配置 | 6 | 13.7 KB |
 | README | 1 | 9.1 KB |
 
-按后缀: `.ipynb` 44 (1.4 MB)、`.py` 171 (673.9 KB)、`.rst` 1 (209.7 KB)、`.md` 4 (12.4 KB)、`.yml` 4 (9.4 KB)、`pyproject.toml` 1 (3.0 KB)、`.yaml` 1 (1.3 KB)、`无后缀` 1 (1.2 KB)、`.sh` 1 (23 B)
+按后缀: `.ipynb` 44 (1.4 MB)、`.py` 171 (674.0 KB)、`.rst` 1 (209.7 KB)、`.md` 4 (12.4 KB)、`.yml` 4 (9.4 KB)、`pyproject.toml` 1 (3.0 KB)、`.yaml` 1 (1.3 KB)、`无后缀` 1 (1.2 KB)、`.sh` 1 (23 B)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

@@ -1,0 +1,41 @@
+name: default_protein_extensions
+description: Canonical typed bundle for protein-specific model extensions.
+
+bond_length:
+  name: bond_length
+  description: Bond-length monitoring for protein backbone geometry.
+  weight: 1.0
+  enabled: true
+  bond_length_weight: 1.0
+  ideal_bond_lengths:
+    N-CA: 1.45
+    CA-C: 1.52
+    C-N: 1.33
+
+bond_angle:
+  name: bond_angle
+  description: Bond-angle monitoring for protein backbone geometry.
+  weight: 0.5
+  enabled: true
+  bond_angle_weight: 0.5
+  ideal_bond_angles:
+    CA-C-N: 2.025
+    C-N-CA: 2.11
+    N-CA-C: 1.94
+
+backbone:
+  name: backbone
+  description: Backbone constraint extension for protein structure generation.
+  weight: 1.0
+  enabled: true
+  bond_length_weight: 1.0
+  bond_angle_weight: 0.5
+
+mixin:
+  name: protein_mixin
+  description: Amino-acid feature integration for protein-aware models.
+  weight: 1.0
+  enabled: true
+  embedding_dim: 16
+  use_one_hot: true
+  num_aa_types: 21

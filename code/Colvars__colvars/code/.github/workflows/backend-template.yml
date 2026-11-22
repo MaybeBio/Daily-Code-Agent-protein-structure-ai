@@ -1,0 +1,224 @@
+# Reusable workflow meant to be called keyword by another workflow with the `use`
+# It generalize the test procedure to be applied by a generic MD engine
+
+# This workflow:
+#  - Checkout Colvars code
+#  - Checkout the MD engine
+#  - Build the MD engine in a container
+#  - Run the Colvars regression tests written for the MD engine
+
+name: "Test a backend with Colvars"
+
+on:
+  workflow_call:
+    # Variables needed by the template
+    inputs:
+      runner_name:
+        description: "Name of the runner"
+        required: true
+        type: string
+      backend_name:
+        description: "Name of the backend"
+        required: true
+        type: string
+      backend_repo:
+        description: "Name of the backend repository"
+        required: true
+        type: string
+      backend_repo_ref:
+        description: "Name of the branch of the backend repository"
+        required: true
+        type: string
+      container_name:
+        description: "Name of the container used to build on"
+        required: true
+        type: string
+      vmd_plugins_repo:
+        description: "Name of the VMD plugins repository"
+        required: false
+        type: string
+      vmd_plugins_repo_ref:
+        description: "Name of the branch of the plugins repository"
+        required: false
+        type: string
+      path_compile_script:
+        description: "Path of the compilation script of the backend"
+        required: true
+        type: string
+      # At least one of test_lib_directory or test_interface_directory need
+      # to be set to launch the regression tests.
+      test_lib_directory:
+        description: "Path of the library test directory"
+        required: false
+        type: string
+      test_interface_directory:
+        description: "Path of the interface test directory"
+        required: false
+        type: string
+      rpath_exe:
+        description: "Relative path of the compiled executable"
+        required: true
+        type: string
+
+jobs:
+  test_backends:
+    runs-on: ${{ inputs.runner_name }}
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/ccache_${{ inputs.container_name }}
+      # OpenMPI transport settings suitable for GH VMs
+      OMPI_MCA_mtl: "^ofi"
+      OMPI_MCA_btl: "vader,self"
+    container:
+      image: ghcr.io/colvars/devel-containers:${{ inputs.container_name }}
+      options: --user 1001:1001
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout Colvars
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Load compiler cache
+        uses: actions/cache/restore@v6
+        id: compiler-cache-restore
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: Backends_${{ inputs.backend_name }}_${{ inputs.container_name }}_${{ github.sha }}
+          restore-keys: |
+            Backends_${{ inputs.backend_name }}_${{ inputs.container_name }}
+
+      - name: Limit ccache size
+        run: ccache --max-size=200MB
+
+      - name: Checkout OpenMM (for Lepton library)
+        uses: actions/checkout@v7
+        with:
+          repository: 'openmm/openmm'
+          ref: 'master'
+          path: 'openmm-source'
+
+      - name: Generate app token for Colvars private repos
+        id: private-repos-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.UPDATE_NAMD_VMD_CLIENT_ID }}
+          private-key: ${{ secrets.UPDATE_NAMD_VMD_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            namd
+            vmd
+            vmd-plugins
+          permission-contents: read
+
+      - name: Checkout ${{ inputs.backend_name }} from the repo ${{ inputs.backend_repo }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.backend_repo }}
+          ref: ${{ inputs.backend_repo_ref }}
+          path: '${{ inputs.backend_name }}-source'
+          token: ${{ steps.private-repos-token.outputs.token }}
+
+      - name: Checkout VMD plugins if we are building VMD
+        if: ${{ inputs.backend_name == 'VMD' }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.vmd_plugins_repo }}
+          ref: ${{ inputs.vmd_plugins_repo_ref }}
+          path: 'vmd-plugins-source'
+          token: ${{ steps.private-repos-token.outputs.token }}
+
+      - name: Get small downloadable packages
+        uses: actions/checkout@v7
+        with:
+          repository: 'Colvars/build-tools-packages'
+          ref: 'master'
+          path: 'devel-tools/packages'
+
+      - name: Build and test standalone library (to catch errors early)
+        run: cmake -P devel-tools/build_test_library.cmake
+
+      - name: Update and build ${{ inputs.backend_name }}
+        shell: bash
+        env:
+          OPENMM_SOURCE: ${GITHUB_WORKSPACE}/openmm-source
+          CMAKE_GENERATOR: Ninja
+        run: |
+          ./update-colvars-code.sh -f ${{ inputs.backend_name }}-source
+          mkdir -p ${CCACHE_DIR}
+          bash ${{ inputs.path_compile_script }} ${{ inputs.backend_name }}-source
+
+      - name: Print ccache statistics
+        run: ccache -sv
+
+      - name: Save compiler cache
+        uses: actions/cache/save@v6
+        id: compiler-cache-save
+        if: always() && steps.compiler-cache-restore.outputs.cache-hit != 'true'
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: Backends_${{ inputs.backend_name }}_${{ inputs.container_name }}_${{ github.sha }}
+
+      - name: Keep only one cache besides the one from this job
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash devel-tools/cleanup-gh-cache.sh Backends_${{ inputs.backend_name }}_${{ inputs.container_name }}_
+
+      # 2 types of tests can be performed with the MD engine: library & interface
+      # It depends on the working directory
+      # Note to be run, test_lib_directory or test_interface_directory must be set by the caller workflow
+
+      - name: Run regression tests for ${{ inputs.backend_name }} interface code
+        if: ${{ inputs.test_interface_directory }}
+        shell: bash
+        working-directory: ${{ inputs.test_interface_directory }}
+        env:
+          VMDNORLWRAP: 1
+        run: |
+          ./run_tests.sh ${GITHUB_WORKSPACE}/${{ inputs.backend_name }}-source/${{ inputs.rpath_exe }}
+
+      - name: Save failed interface test artifact
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed_library_test_output_${{ inputs.backend_name }}_${{ inputs.backend_repo_ref }}_${{ inputs.container_name }}
+          path: |
+            ${{ github.workspace }}/${{ inputs.test_interface_directory }}/*/*.diff
+            ${{ github.workspace }}/${{ inputs.test_interface_directory }}/*/*.err
+            ${{ github.workspace }}/${{ inputs.test_interface_directory }}/*/*.log
+            ${{ github.workspace }}/${{ inputs.test_interface_directory }}/*/*.out
+
+      - name: Run regression tests for library code with ${{ inputs.backend_name }}
+        if: ${{ inputs.test_lib_directory }}
+        shell: bash
+        working-directory: ${{ inputs.test_lib_directory }}
+        env:
+          VMDNORLWRAP: 1
+        run: |
+          ./run_tests.sh ${GITHUB_WORKSPACE}/${{ inputs.backend_name }}-source/${{ inputs.rpath_exe }} 0??_*
+
+      - name: Save failed library test artifact
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed_library_test_output_${{ inputs.backend_name }}_${{ inputs.backend_repo_ref }}_${{ inputs.container_name }}
+          path: |
+            ${GITHUB_WORKSPACE}/${{ inputs.test_lib_directory }}/*/*.diff
+            ${GITHUB_WORKSPACE}/${{ inputs.test_lib_directory }}/*/*.err
+            ${GITHUB_WORKSPACE}/${{ inputs.test_lib_directory }}/*/*.log
+            ${GITHUB_WORKSPACE}/${{ inputs.test_lib_directory }}/*/*.out
+
+      - name: Run regression tests for library code with ${{ inputs.backend_name }} (binary restarts)
+        # Skipping GROMACS, because its restarts are always binary anyway
+        if: inputs.test_lib_directory != '' && inputs.backend_name != 'GROMACS-main'
+        shell: bash
+        working-directory: ${{ inputs.test_lib_directory }}
+        env:
+          COLVARS_BINARY_RESTART: 1
+        run: |
+          ./run_tests.sh ${GITHUB_WORKSPACE}/${{ inputs.backend_name }}-source/${{ inputs.rpath_exe }} 0??_*

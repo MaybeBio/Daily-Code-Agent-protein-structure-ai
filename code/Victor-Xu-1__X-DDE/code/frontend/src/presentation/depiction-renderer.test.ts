@@ -1,0 +1,429 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  DepictionRenderer,
+  depictionDataUrl,
+  readMolecularSource,
+} from "./depiction-renderer";
+import type { Ketcher } from "../editors/scientificEditor";
+import { webcrypto } from "node:crypto";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+function nativeRecord(source: string, explicitH = false) {
+  return JSON.stringify({
+    source,
+    mol0: {
+      type: "molecule",
+      atoms: explicitH ? [{ label: "C" }, { label: "H" }] : [{ label: "C" }],
+      bonds: explicitH ? [{ atoms: [0, 1] }] : [],
+    },
+  });
+}
+
+function nativeRenderer() {
+  const calls: string[] = [];
+  const editor = {
+    structService: {
+      dearomatize: vi.fn(async (data: { struct: string }) => {
+        calls.push("kekule");
+        return { struct: data.struct };
+      }),
+      layout: vi.fn(async (data: { struct: string; output_format: string }) => {
+        if (data.output_format === "chemical/x-mdl-molfile") {
+          calls.push("smiles-layout");
+          return { struct: data.struct };
+        }
+        calls.push("layout");
+        return { struct: nativeRecord(data.struct, true) };
+      }),
+      toggleExplicitHydrogens: vi.fn(async (data: { struct: string }) => {
+        calls.push("fold-hydrogens");
+        return { struct: nativeRecord(JSON.parse(data.struct).source) };
+      }),
+    },
+    editor: {
+      setOptions: vi.fn((_options: string) => {
+        calls.push("style");
+      }),
+    },
+    setMolecule: vi.fn(async (_structure: string) => {
+      calls.push("load");
+    }),
+    layout: vi.fn(async () => {
+      calls.push("layout");
+    }),
+    getMolfile: vi.fn(async () => {
+      calls.push("read");
+      return "native-kekule-mol";
+    }),
+    generateImage: vi.fn(async () => {
+      calls.push("draw");
+      return new Blob(['<svg xmlns="http://www.w3.org/2000/svg"/>'], {
+        type: "image/svg+xml",
+      });
+    }),
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ installed: { ketcher: { version: "3.18.0" } } }),
+    })),
+  );
+  const frame = {
+    contentWindow: { ketcher: editor as unknown as Ketcher },
+  } as unknown as HTMLIFrameElement;
+  return { renderer: new DepictionRenderer(() => frame), editor, calls };
+}
+
+it("draws the exact verified snapshot without rereading bytes and rejects another source", async () => {
+  const { renderer, editor } = nativeRenderer();
+  const text =
+    "Archived\n  native\n\n  0  0  0  0  0  0            999 V2000\nM  END\n";
+  vi.stubGlobal("crypto", webcrypto);
+  const sha256 = Buffer.from(
+    await webcrypto.subtle.digest("SHA-256", new TextEncoder().encode(text)),
+  ).toString("hex");
+  const source = {
+    url: "/api/jobs/original/download?name=source.sdf",
+    sha256,
+    record: 0,
+  };
+  const deployment = vi.mocked(fetch).getMockImplementation()!;
+  vi.mocked(fetch).mockImplementation(async (...args) =>
+    args[0] === "/api/deployment" ? deployment(...args) : new Response(text),
+  );
+  const verified = await readMolecularSource(
+    source,
+    new AbortController().signal,
+  );
+  expect(Object.isFrozen(verified)).toBe(true);
+  vi.mocked(fetch).mockClear();
+  try {
+    await renderer.render(
+      source,
+      new AbortController().signal,
+      1.6,
+      undefined,
+      verified,
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith("/api/deployment", expect.anything());
+    expect(editor.structService.dearomatize).toHaveBeenCalledWith(
+      { struct: text, output_format: "chemical/x-mdl-molfile" },
+      { "aromaticity-model": "generic" },
+    );
+    await expect(
+      renderer.render(
+        { ...source, record: 1 },
+        new AbortController().signal,
+        1.6,
+        undefined,
+        verified,
+      ),
+    ).rejects.toThrow(/does not match/);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally {
+    renderer.close();
+  }
+});
+
+it.each([false, true])(
+  "checks native file bytes before drawing (recorded source=%s)",
+  async (verified) => {
+    const { renderer, editor } = nativeRenderer();
+    const molecule =
+      "Reference\r\n  native\r\n\r\n  0  0  0  0  0  0            999 V2000\r\nM  END\r\n";
+    const sha256 = Buffer.from(
+      await webcrypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(molecule),
+      ),
+    ).toString("hex");
+    vi.stubGlobal("crypto", webcrypto);
+    const deployment = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (...args) =>
+      args[0] === "/api/deployment"
+        ? deployment(...args)
+        : new Response(molecule),
+    );
+    const source = {
+      url: "/api/jobs/source/download?name=reference.sdf",
+      record: 0,
+      ...(verified ? { sha256 } : {}),
+    };
+    try {
+      await renderer.render(source, new AbortController().signal);
+      expect(editor.structService.dearomatize).toHaveBeenCalledWith(
+        { struct: molecule, output_format: "chemical/x-mdl-molfile" },
+        { "aromaticity-model": "generic" },
+      );
+      expect(editor.generateImage).toHaveBeenCalledOnce();
+      await expect(
+        renderer.render(
+          { ...source, sha256: "0".repeat(64) },
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow(/checksum mismatch/);
+      expect(editor.generateImage).toHaveBeenCalledOnce();
+    } finally {
+      renderer.close();
+    }
+  },
+);
+
+it("rejects an invalid recorded digest before requesting a source file", async () => {
+  const { renderer, editor } = nativeRenderer();
+  try {
+    await expect(
+      renderer.render(
+        { url: "/api/jobs/source/download?name=a.sdf", sha256: "unverified" },
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow(/recorded molecular source/);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(editor.generateImage).not.toHaveBeenCalled();
+  } finally {
+    renderer.close();
+  }
+});
+
+describe("Native aromatic depiction", () => {
+  it("lays out and assigns native alternating bonds on a display copy before exporting", async () => {
+    const { renderer, editor, calls } = nativeRenderer();
+    const source = Object.freeze({ smiles: "c1ccccc1" });
+    try {
+      await renderer.render(source, new AbortController().signal, 2.2);
+      expect(calls).toEqual([
+        "style",
+        "smiles-layout",
+        "kekule",
+        "layout",
+        "fold-hydrogens",
+        "load",
+        "read",
+        "draw",
+      ]);
+      expect(
+        JSON.parse(editor.editor.setOptions.mock.calls[0][0]),
+      ).toMatchObject({
+        showHydrogenLabels: "Hetero",
+      });
+      expect(editor.structService.layout).toHaveBeenNthCalledWith(1, {
+        struct: source.smiles,
+        output_format: "chemical/x-mdl-molfile",
+      });
+      expect(editor.structService.dearomatize).toHaveBeenCalledWith(
+        { struct: source.smiles, output_format: "chemical/x-mdl-molfile" },
+        { "aromaticity-model": "generic" },
+      );
+      expect(editor.structService.toggleExplicitHydrogens).toHaveBeenCalledWith(
+        {
+          struct: nativeRecord(source.smiles, true),
+          mode: "fold",
+          output_format: "chemical/x-indigo-ket",
+        },
+      );
+      expect(editor.setMolecule).toHaveBeenCalledWith(
+        nativeRecord(source.smiles),
+      );
+      expect(editor.generateImage).toHaveBeenCalledWith("native-kekule-mol", {
+        outputFormat: "svg",
+        backgroundColor: "1,1,1",
+        "render-bond-thickness": 2.2,
+        "render-bond-thickness-unit": "px",
+      });
+      expect(source.smiles).toBe("c1ccccc1");
+    } finally {
+      renderer.close();
+    }
+  });
+  it("does not export or cache an incomplete aromatic transformation", async () => {
+    const { renderer, editor } = nativeRenderer();
+    const source = { smiles: "c1ccccc1" };
+    editor.structService.dearomatize.mockRejectedValueOnce(
+      new Error("No valid Kekulé form"),
+    );
+    try {
+      await expect(
+        renderer.render(source, new AbortController().signal),
+      ).rejects.toThrow("No valid Kekulé form");
+      expect(editor.generateImage).not.toHaveBeenCalled();
+      await renderer.render(source, new AbortController().signal);
+      expect(editor.structService.dearomatize).toHaveBeenCalledTimes(2);
+      expect(editor.generateImage).toHaveBeenCalledTimes(1);
+    } finally {
+      renderer.close();
+    }
+  });
+  it("does not continue after native stereochemical SMILES layout fails", async () => {
+    const { renderer, editor } = nativeRenderer();
+    editor.structService.layout.mockRejectedValueOnce(
+      new Error("Invalid SMILES"),
+    );
+    try {
+      await expect(
+        renderer.render({ smiles: "[nH]1cccc1" }, new AbortController().signal),
+      ).rejects.toThrow("Invalid SMILES");
+      expect(editor.structService.dearomatize).not.toHaveBeenCalled();
+      expect(editor.setMolecule).not.toHaveBeenCalled();
+      expect(editor.generateImage).not.toHaveBeenCalled();
+    } finally {
+      renderer.close();
+    }
+  });
+  it("never exports unresolved aromatic circles or disables native verification", async () => {
+    const { renderer, editor } = nativeRenderer();
+    editor.structService.layout
+      .mockResolvedValueOnce({ struct: "native-laid-mol" })
+      .mockResolvedValueOnce({
+        struct: JSON.stringify({
+          mol0: {
+            type: "molecule",
+            atoms: [{ label: "C" }, { label: "C" }],
+            bonds: [{ type: 4, atoms: [0, 1] }],
+          },
+        }),
+      });
+    try {
+      await expect(
+        renderer.render(
+          { smiles: "mixed-aromatic-form" },
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow("original SDF/MOL record");
+      expect(editor.setMolecule).not.toHaveBeenCalled();
+      expect(editor.generateImage).not.toHaveBeenCalled();
+      expect(editor.structService.dearomatize).toHaveBeenCalledWith(
+        { struct: "native-laid-mol", output_format: "chemical/x-mdl-molfile" },
+        { "aromaticity-model": "generic" },
+      );
+    } finally {
+      renderer.close();
+    }
+  });
+});
+
+describe("Native SVG image transport under the platform CSP", () => {
+  it("preserves the drawing bytes in an allowed image data URL", async () => {
+    const drawing =
+      '<svg xmlns="http://www.w3.org/2000/svg"><text>Cl–N</text></svg>';
+    const url = await depictionDataUrl(
+      new Blob([drawing], { type: "image/svg+xml" }),
+    );
+    expect(url).toMatch(/^data:image\/svg\+xml;base64,/);
+    const bytes = Uint8Array.from(atob(url.split(",")[1]), (byte) =>
+      byte.charCodeAt(0),
+    );
+    expect(new TextDecoder().decode(bytes)).toBe(drawing);
+  });
+  it("refuses empty, non-image and oversized payloads", async () => {
+    for (const blob of [
+      new Blob([], { type: "image/svg+xml" }),
+      new Blob(["<html>"], { type: "text/html" }),
+      new Blob([new Uint8Array(2 * 1024 ** 2 + 1)], { type: "image/svg+xml" }),
+    ])
+      await expect(depictionDataUrl(blob)).rejects.toThrow(
+        "bounded native SVG",
+      );
+  });
+});
+
+describe("Source-aware drawing queue", () => {
+  it("does not mutate the native editor again while a timed-out drawing is still running", async () => {
+    const { renderer, editor } = nativeRenderer();
+    const deadline = new AbortController();
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) =>
+      ms === 25000 ? deadline.signal : timeout(ms),
+    );
+    let finish!: (blob: Blob) => void;
+    editor.generateImage.mockReturnValueOnce(
+      new Promise<Blob>((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const first = renderer
+      .render({ smiles: "c1ccccc1" }, new AbortController().signal)
+      .catch((reason) => reason.name);
+    await vi.waitFor(() =>
+      expect(editor.generateImage).toHaveBeenCalledTimes(1),
+    );
+    const next = renderer.render(
+      { smiles: "CN" },
+      new AbortController().signal,
+    );
+    deadline.abort(new DOMException("Native drawing deadline", "TimeoutError"));
+    expect(await first).toBe("TimeoutError");
+    await Promise.resolve();
+    expect(editor.setMolecule).toHaveBeenCalledTimes(1);
+    // The next request gets a fresh deadline, but remains queued behind the editor.
+    vi.mocked(AbortSignal.timeout).mockImplementation(timeout);
+    finish(new Blob(["<svg/>"], { type: "image/svg+xml" }));
+    try {
+      await next;
+      expect(editor.setMolecule).toHaveBeenCalledTimes(2);
+      expect(editor.generateImage).toHaveBeenCalledTimes(2);
+    } finally {
+      renderer.close();
+    }
+  });
+  it("skips abandoned queued drawings before they touch the native editor", async () => {
+    const { renderer, editor } = nativeRenderer();
+    let release!: (value: Blob) => void;
+    editor.generateImage.mockReturnValueOnce(
+      new Promise<Blob>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const first = renderer.render(
+      { smiles: "c1ccccc1" },
+      new AbortController().signal,
+    );
+    await vi.waitFor(() =>
+      expect(editor.generateImage).toHaveBeenCalledTimes(1),
+    );
+    const abandoned = new AbortController();
+    const old = renderer
+      .render({ smiles: "CCN" }, abandoned.signal)
+      .catch((error) => error.name);
+    const current = renderer.render(
+      { smiles: "CN" },
+      new AbortController().signal,
+    );
+    abandoned.abort();
+    release(new Blob(["<svg/>"], { type: "image/svg+xml" }));
+    try {
+      await first;
+      expect(await old).toBe("AbortError");
+      await current;
+      expect(
+        editor.setMolecule.mock.calls.map((args) => JSON.parse(args[0]).source),
+      ).toEqual(["c1ccccc1", "CN"]);
+    } finally {
+      renderer.close();
+    }
+  });
+  it("retains a shared drawing while another visible consumer still needs it", async () => {
+    const { renderer, editor } = nativeRenderer();
+    const hidden = new AbortController();
+    const first = renderer
+      .render({ smiles: "c1ccccc1" }, hidden.signal)
+      .catch((error) => error.name);
+    const current = renderer.render(
+      { smiles: "c1ccccc1" },
+      new AbortController().signal,
+    );
+    hidden.abort();
+    try {
+      expect(await first).toBe("AbortError");
+      expect(await current).toBeInstanceOf(Blob);
+      expect(editor.generateImage).toHaveBeenCalledTimes(1);
+    } finally {
+      renderer.close();
+    }
+  });
+});

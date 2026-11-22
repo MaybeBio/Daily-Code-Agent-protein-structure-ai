@@ -1,0 +1,216 @@
+/** Current-project file and active-session sync contract.
+ * Transfer grants and daemon error text stay out of ordinary output and journals.
+ */
+import { usageError } from '../args.js';
+import { ApiError, NetworkError, sanitize, validateTransferUrl } from '../http.js';
+import { forgeRequest } from './forge-client.js';
+
+const API = '/api/v1/forge';
+const SYNC_STATES = new Set(['pending', 'queued', 'saved', 'failed']);
+
+// Responses and diagnostics can contain URLs supplied by remote services. Keep
+// grants and bearer credentials out of human/JSON output and local journals.
+export function redactForgeText(value) {
+  return sanitize(value).replace(/https?:\/\/[^\s"'<>]+/gi, candidate => {
+    try {
+      const url = new URL(candidate);
+      const sensitive = [...url.searchParams.keys()].some(key =>
+        /signature|credential|security.?token|access.?key|api.?key|key.?pair|(?:^|[-_])(sig|token|secret|password|policy|key)(?:$|[-_])/i.test(key));
+      return sensitive || url.username || url.password ? '[REDACTED TRANSFER URL]' : candidate;
+    } catch { return candidate; }
+  });
+}
+
+// Keep the IDs used by catalog filters. Older responses and saved tool records
+// can carry some IDs only in their per-mode metadata.
+export function presentForgeTool(tool) {
+  const { resource_evidence, patches, ...result } = tool;
+  if (!tool.capabilities) return result;
+  const { qualification, modes: previousRows, ...capabilities } = tool.capabilities;
+  if (qualification === undefined && previousRows === undefined) return result;
+  const rows = Array.isArray(qualification) ? qualification : previousRows;
+  const modelModes = new Map();
+  const toolModes = new Set(tool.modes ?? []);
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (typeof row?.mode !== 'string') continue;
+    if (row.model == null) {
+      toolModes.add(row.mode);
+    } else if (typeof row.model === 'string') {
+      if (!modelModes.has(row.model)) modelModes.set(row.model, new Set());
+      modelModes.get(row.model).add(row.mode);
+    }
+  }
+  if (modelModes.size) {
+    result.models = (tool.models ?? []).map(model => {
+      const extra = modelModes.get(model.id);
+      if (!extra) return model;
+      modelModes.delete(model.id);
+      return { ...model, modes: [...new Set([...(model.modes ?? []), ...extra])] };
+    });
+    for (const [id, modes] of modelModes) result.models.push({ id, modes: [...modes] });
+  }
+  if (toolModes.size) result.modes = [...toolModes];
+  // These catalog labels describe internal test history. Keep the attribution,
+  // license conditions and citation links as provided by the source.
+  if (Array.isArray(capabilities.terms)) {
+    capabilities.terms = capabilities.terms.map(term =>
+      term?.name === 'UniProt-derived qualification fixture sequences'
+        ? { ...term, name: 'UniProt-derived example sequences' } : term);
+  }
+  if (Array.isArray(capabilities.citations)) {
+    capabilities.citations = capabilities.citations.map(citation =>
+      citation?.title === 'Native expected-TM export, exact two-file changes applied by B47 selected source'
+        ? { ...citation, title: 'Native expected-TM export' } : citation);
+  }
+  return { ...result, capabilities };
+}
+
+export function redactForgeOutput(value) {
+  if (typeof value === 'string') return redactForgeText(value);
+  if (Array.isArray(value)) return value.map(redactForgeOutput);
+  if (!value || typeof value !== 'object') return value;
+  const record = typeof value.tool === 'string' && value.capabilities ? presentForgeTool(value) : value;
+  return Object.fromEntries(Object.entries(record)
+    .filter(([key]) => !/^(?:access_token|api_token|bearer_token|token|api_key|authorization|download_url|upload_url|signed_url|credential|credentials|secret|client_secret|private_key|password)$/i.test(key))
+    .map(([key, item]) => [key, redactForgeOutput(item)]));
+}
+
+export function workspacePath(value, directory = false) {
+  if (typeof value !== 'string' || Buffer.byteLength(value) > 1024
+      || !/^\/(workspace|inputs)(\/|$)/.test(value) || value.includes('\\')
+      || /[\x00-\x1f\x7f]/.test(value)) {
+    throw usageError('Forge paths must be absolute POSIX paths under /workspace or /inputs.');
+  }
+  const parts = value.slice(1).split('/');
+  if ((!directory && parts.length < 2) || parts.some(part => !part || part === '.' || part === '..' || Buffer.byteLength(part) > 255)) {
+    throw usageError('Forge paths cannot contain empty, dot, traversal, or backslash components.');
+  }
+  return value;
+}
+
+function invalidResponse() {
+  return new NetworkError('Current Forge workspace response is invalid or incompatible. Upgrade the CLI and server together.');
+}
+
+function publicRequestId(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value)
+    ? redactForgeText(value) : undefined;
+}
+
+function cleanError(error, label) {
+  if (!(error instanceof ApiError)) return error;
+  const code = typeof error.code === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(error.code) ? error.code : 'workspace_request_failed';
+  const result = new ApiError({ status:error.status, code,
+    message:`${label} failed${error.status ? ` (HTTP ${error.status})` : ''}.`,
+    retryable:error.retryable, requestId:publicRequestId(error.requestId), retryAfterMs:error.retryAfterMs });
+  if (error.status === 404) result.action = label.startsWith('Project')
+    ? 'File commands require an authorized PROJECT ID; the former SESSION form is unsupported. Check access and upgrade the CLI and API together for the current project workspace.'
+    : 'Check the active SESSION ID and access. The CLI, API and daemon must all support the current project workspace; upgrade them together.';
+  if (error.status === 422 && label === 'Project file download request') result.action = 'The API rejected the file request format. Check the request path and CLI/API compatibility; this is not an authentication failure.';
+  return result;
+}
+
+function dataEnvelope(result) {
+  if (!result?.raw || typeof result.raw !== 'object' || !Object.hasOwn(result.raw, 'data')
+      || !result.data || typeof result.data !== 'object' || Array.isArray(result.data)) throw invalidResponse();
+  return result.data;
+}
+
+function publicResult(result, data) {
+  return { status:result.status, data, requestId:publicRequestId(result.requestId) };
+}
+
+function entryForDirectory(entry, directory) {
+  if (!entry || typeof entry !== 'object' || !['file', 'directory'].includes(entry.kind)
+      || (entry.kind === 'directory' ? entry.size_bytes !== null
+        : !Number.isSafeInteger(entry.size_bytes) || entry.size_bytes < 0)
+      || !Number.isSafeInteger(entry.version) || entry.version <= 0
+      || (!(entry.kind === 'directory' && entry.mode === null)
+        && (!Number.isSafeInteger(entry.mode) || entry.mode < 0 || entry.mode > 0o777))) throw invalidResponse();
+  try { workspacePath(entry.path); } catch { throw invalidResponse(); }
+  const prefix = directory + '/';
+  if (!entry.path.startsWith(prefix) || entry.path.slice(prefix.length).includes('/')) throw invalidResponse();
+  return { path:entry.path, kind:entry.kind, size_bytes:entry.size_bytes, version:entry.version, mode:entry.mode };
+}
+
+export async function listProjectFiles(ctx, projectId, target, cursor) {
+  if (cursor !== undefined && (typeof cursor !== 'string' || !cursor || cursor.length > 4096)) throw usageError('Invalid file page cursor.');
+  let result;
+  try {
+    result = await ctx.client.get(`${API}/projects/${projectId}/files`, { query:{path:target, ...(cursor ? {cursor} : {})} });
+  } catch (error) { throw cleanError(error, 'Project file listing'); }
+  const data = dataEnvelope(result);
+  if (!Array.isArray(data.entries) || data.entries.length > 200
+      || !(data.next_cursor === null || (typeof data.next_cursor === 'string' && data.next_cursor && data.next_cursor.length <= 4096 && data.next_cursor !== cursor))
+      || !Number.isSafeInteger(data.mutation_revision) || data.mutation_revision < 0
+      || !['saved', 'pending', 'failed'].includes(data.sync_state)
+      || !(data.last_synced_at === null || (typeof data.last_synced_at === 'string' && Number.isFinite(Date.parse(data.last_synced_at))))
+      || typeof data.durability_gap !== 'boolean') throw invalidResponse();
+  return publicResult(result,{project_id:projectId,path:target,entries:data.entries.map(entry => entryForDirectory(entry,target)),
+    next_cursor:data.next_cursor,mutation_revision:data.mutation_revision,sync_state:data.sync_state,
+    last_synced_at:data.last_synced_at,durability_gap:data.durability_gap});
+}
+
+export async function projectFileGrant(ctx, projectId, target) {
+  let result;
+  try {
+    result = await ctx.client.post(`${API}/projects/${projectId}/files/presign`, {body:{path:target}});
+  } catch (error) { throw cleanError(error, 'Project file download request'); }
+  const data = dataEnvelope(result);
+  if (data.path !== target || !Number.isSafeInteger(data.size_bytes) || data.size_bytes < 0
+      || !Number.isSafeInteger(data.version) || data.version <= 0
+      || typeof data.checksum !== 'string' || !/^[0-9a-f]{32}-[1-9][0-9]{0,3}$/.test(data.checksum)
+      || !Number.isSafeInteger(data.part_size) || data.part_size < 5 * 1024 ** 2 || data.part_size > 5 * 1024 ** 3
+      || Number(data.checksum.split('-')[1]) !== Math.max(1,Math.ceil(data.size_bytes / data.part_size))
+      || !Number.isSafeInteger(data.mode) || data.mode < 0 || data.mode > 0o777
+      || typeof data.download_url !== 'string') throw invalidResponse();
+  validateTransferUrl(data.download_url, 'Download');
+  return publicResult(result,{path:target,size_bytes:data.size_bytes,version:data.version,checksum:data.checksum,
+    part_size:data.part_size,mode:data.mode,download_url:data.download_url});
+}
+
+function syncResult(result, syncId) {
+  const data = dataEnvelope(result);
+  if (data.sync_id !== syncId || !SYNC_STATES.has(data.state)) throw invalidResponse();
+  const value = {sync_id:syncId,state:data.state};
+  for (const field of ['saved_count','pending_count','failed_count']) {
+    if (data[field] !== undefined) {
+      if (!Number.isSafeInteger(data[field]) || data[field] < 0) throw invalidResponse();
+      value[field] = data[field];
+    }
+  }
+  for (const field of ['completed_at','last_successful_at']) {
+    if (data[field] !== undefined && data[field] !== null) {
+      if (typeof data[field] !== 'string' || !Number.isFinite(Date.parse(data[field]))) throw invalidResponse();
+      value[field] = data[field];
+    }
+  }
+  if (data.state === 'saved' && value.failed_count > 0) throw invalidResponse();
+  if (data.error && typeof data.error.code === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(data.error.code)) {
+    value.error = {code:data.error.code};
+  }
+  if (data.diagnostics !== undefined) {
+    const diagnostics = data.diagnostics;
+    if (!diagnostics || !Array.isArray(diagnostics.files) || diagnostics.files.length > 8
+        || typeof diagnostics.truncated !== 'boolean') throw invalidResponse();
+    value.diagnostics = {files:diagnostics.files.map(item => {
+      if (!item || typeof item.code !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(item.code)
+          || (item.path !== undefined && (typeof item.path !== 'string' || item.path.length > 270
+            || !/^\/(workspace|inputs)\//.test(item.path) || /[\x00-\x1f\x7f]/.test(item.path)))) throw invalidResponse();
+      return {code:item.code,...(item.path === undefined ? {} : {path:redactForgeText(item.path)})};
+    }),truncated:diagnostics.truncated};
+  }
+  return publicResult(result,value);
+}
+
+export async function readSync(ctx, sessionId, syncId, options = {}) {
+  try { return syncResult(await forgeRequest(ctx,sessionId,'GET',`/v1/sync/${syncId}`,options),syncId); }
+  catch (error) { throw cleanError(error, 'Sync inspection'); }
+}
+
+export async function startSync(ctx, sessionId, syncId, options = {}) {
+  try {
+    return syncResult(await forgeRequest(ctx,sessionId,'POST','/v1/sync',
+      {...options,body:{sync_id:syncId},idempotencyKey:syncId}),syncId);
+  } catch (error) { throw cleanError(error, 'Sync'); }
+}

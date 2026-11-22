@@ -1,0 +1,295 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* Dual-GEMM x_x CUBIN configuration, device ABI, and launcher interface.
+ */
+
+#ifndef BIOIR_CPP_KERNELS_CUTEDSL_DUAL_GEMM_X_X_LAUNCHER_H_
+#define BIOIR_CPP_KERNELS_CUTEDSL_DUAL_GEMM_X_X_LAUNCHER_H_
+
+#include "cubin_runtime.h"
+#include "cutedsl_launch_utils.h"
+#include "cutedsl_tensor_abi.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+namespace bioir::cutedsl::dual_gemm_x_x::embedded
+{
+struct CubinImage;
+}
+
+/* Direct CUDA Driver launch ABIs for Ampere, Hopper, and Blackwell dual GEMM.
+ * These are the lowered device-kernel ABIs read from EIATTR_KPARAM_INFO,
+ * not the high-level CuTeDSL __call__ signatures.
+ */
+namespace bioir::cutedsl::dual_gemm_x_x::abi
+{
+
+inline constexpr std::size_t kSM80MaxParameterCount = 9;
+inline constexpr std::size_t kSM90MaxParameterCount = 15;
+
+struct SM80Params
+{
+  cute_tensor_s1_d1_t x;
+  cute_tensor_s1_d0_t w0;
+  cute_tensor_s1_d0_t w1;
+  cute_tensor_s1_d0_t bias0;
+  cute_tensor_s1_d0_t bias1;
+  cute_tensor_s1_d0_t actual_seqlen;
+  cute_tensor_s2_d1_t output;
+  std::int32_t i_dim;
+  std::int32_t raster_factor;
+};
+
+constexpr std::size_t sm80_parameter_count(bool has_bias, bool runtime_mask, bool dynamic_mask = false)
+{
+  return 6U + (has_bias ? 2U : 0U) + ((runtime_mask || dynamic_mask) ? 1U : 0U);
+}
+
+/* Legacy images compact an absent mask out of the parameter bank. Nullable
+ * images always include its descriptor and use a null data pointer at runtime.
+ */
+inline std::size_t pack_sm80_kernel_params(
+  SM80Params* params, bool has_bias, bool runtime_mask, bool dynamic_mask, void* kernel_params[kSM80MaxParameterCount])
+{
+  std::size_t count = 0;
+  kernel_params[count++] = &params->x;
+  kernel_params[count++] = &params->w0;
+  kernel_params[count++] = &params->w1;
+  if (has_bias)
+  {
+    kernel_params[count++] = &params->bias0;
+    kernel_params[count++] = &params->bias1;
+  }
+  if (runtime_mask || dynamic_mask)
+    kernel_params[count++] = &params->actual_seqlen;
+  kernel_params[count++] = &params->output;
+  kernel_params[count++] = &params->i_dim;
+  kernel_params[count++] = &params->raster_factor;
+  return count;
+}
+
+/* Hopper tensor maps and coordinates are all passed by value. x0 and x1 get
+ * separate maps and coordinates even though the x_x family points both at the
+ * same activation.
+ */
+struct SM90Params
+{
+  CUtensorMap x0_tma;
+  CoordTensorS1 x0_coord;
+  CUtensorMap x1_tma;
+  CoordTensorS1 x1_coord;
+  CUtensorMap w0_tma;
+  CoordTensorS1 w0_coord;
+  CUtensorMap w1_tma;
+  CoordTensorS1 w1_coord;
+  CUtensorMap output_tma;
+  CoordTensorS2 output_coord;
+  cute_tensor_s1_d0_t bias0;
+  cute_tensor_s1_d0_t bias1;
+  cute_tensor_s1_d0_t actual_seqlen;
+  std::int32_t i_dim;
+  std::uint8_t tiled_mma;
+};
+
+constexpr std::size_t sm90_parameter_count(bool has_bias, bool runtime_mask, bool dynamic_mask = false)
+{
+  return 12U + (has_bias ? 2U : 0U) + ((runtime_mask || dynamic_mask) ? 1U : 0U);
+}
+
+inline std::size_t pack_sm90_kernel_params(
+  SM90Params* params, bool has_bias, bool runtime_mask, bool dynamic_mask, void* kernel_params[kSM90MaxParameterCount])
+{
+  std::size_t count = 0;
+  kernel_params[count++] = &params->x0_tma;
+  kernel_params[count++] = &params->x0_coord;
+  kernel_params[count++] = &params->x1_tma;
+  kernel_params[count++] = &params->x1_coord;
+  kernel_params[count++] = &params->w0_tma;
+  kernel_params[count++] = &params->w0_coord;
+  kernel_params[count++] = &params->w1_tma;
+  kernel_params[count++] = &params->w1_coord;
+  kernel_params[count++] = &params->output_tma;
+  kernel_params[count++] = &params->output_coord;
+  if (has_bias)
+  {
+    kernel_params[count++] = &params->bias0;
+    kernel_params[count++] = &params->bias1;
+  }
+  if (runtime_mask || dynamic_mask)
+    kernel_params[count++] = &params->actual_seqlen;
+  kernel_params[count++] = &params->i_dim;
+  kernel_params[count++] = &params->tiled_mma;
+  return count;
+}
+
+inline constexpr std::size_t kSM100MaxParameterCount = 17;
+
+/* The tcgen05 tiled MMA's runtime state, passed as zeros (SM100TiledMmaToken). */
+using SM100TiledMmaDescriptor = bioir::cutedsl::SM100TiledMmaToken;
+
+/* Blackwell lowers every TMA operand to a tagged non-executable atom plus its
+ * coordinate extents: {M} for x, {N} for each weight, {M, N} for the output.
+ * The streaming kernel passes each bias as a bare pointer (a static SMEM-sized
+ * view) and ends with the CLC scheduler's unrounded tile counts. CuTeDSL 4.8
+ * extracts that scheduler and then its fallback, which is the same object, so
+ * the two counts are kernel parameters twice; pass the same int32s again. A 4.5
+ * cubin declares them once and the driver ignores the extra pointers. The
+ * resident kernel passes each bias with its extent N and has no scheduler state.
+ */
+struct SM100Params
+{
+  SM100TiledMmaDescriptor tiled_mma;
+  CUtensorMap x_tma;
+  CoordTensorS1 x_coord;
+  CUtensorMap w0_tma;
+  CoordTensorS1 w0_coord;
+  CUtensorMap w1_tma;
+  CoordTensorS1 w1_coord;
+  CUtensorMap output_tma;
+  CoordTensorS2 output_coord;
+  cute_tensor_s0_d0_t static_bias0;
+  cute_tensor_s0_d0_t static_bias1;
+  cute_tensor_s1_d0_t bias0;
+  cute_tensor_s1_d0_t bias1;
+  cute_tensor_s1_d0_t actual_seqlen;
+  std::int32_t i_dim;
+  std::int32_t scheduler_m_tiles;
+  std::int32_t scheduler_n_tiles;
+};
+
+constexpr std::size_t sm100_parameter_count(bool has_bias, bool resident)
+{
+  return (resident ? 11U : 15U) + (has_bias ? 2U : 0U);
+}
+
+inline std::size_t pack_sm100_kernel_params(
+  SM100Params* params, bool has_bias, bool resident, void* kernel_params[kSM100MaxParameterCount])
+{
+  std::size_t count = 0;
+  kernel_params[count++] = &params->tiled_mma;
+  kernel_params[count++] = &params->x_tma;
+  kernel_params[count++] = &params->x_coord;
+  kernel_params[count++] = &params->w0_tma;
+  kernel_params[count++] = &params->w0_coord;
+  kernel_params[count++] = &params->w1_tma;
+  kernel_params[count++] = &params->w1_coord;
+  kernel_params[count++] = &params->output_tma;
+  kernel_params[count++] = &params->output_coord;
+  if (has_bias)
+  {
+    kernel_params[count++] = resident ? static_cast<void*>(&params->bias0) : static_cast<void*>(&params->static_bias0);
+    kernel_params[count++] = resident ? static_cast<void*>(&params->bias1) : static_cast<void*>(&params->static_bias1);
+  }
+  kernel_params[count++] = &params->actual_seqlen;
+  kernel_params[count++] = &params->i_dim;
+  if (!resident)
+  {
+    kernel_params[count++] = &params->scheduler_m_tiles;
+    kernel_params[count++] = &params->scheduler_n_tiles;
+    kernel_params[count++] = &params->scheduler_m_tiles;
+    kernel_params[count++] = &params->scheduler_n_tiles;
+  }
+  return count;
+}
+
+static_assert(sm80_parameter_count(true, true) == kSM80MaxParameterCount);
+static_assert(sm90_parameter_count(true, true) == kSM90MaxParameterCount);
+static_assert(sm100_parameter_count(true, false) == kSM100MaxParameterCount);
+static_assert(std::is_standard_layout_v<SM100Params>);
+static_assert(sizeof(SM100TiledMmaDescriptor) == 64);
+static_assert(alignof(SM100TiledMmaDescriptor) == 1);
+static_assert(sizeof(cute_tensor_s0_d0_t) == 8);
+static_assert(sizeof(cute_tensor_s1_d0_t) == 16);
+static_assert(alignof(cute_tensor_s1_d0_t) == 8);
+static_assert(std::is_standard_layout_v<SM80Params>);
+static_assert(std::is_standard_layout_v<SM90Params>);
+static_assert(offsetof(SM80Params, x) == 0);
+static_assert(offsetof(SM90Params, x0_tma) == 0);
+static_assert(sizeof(CUtensorMap) == 128);
+static_assert(alignof(CUtensorMap) >= 64);
+static_assert(sizeof(CoordTensorS1) == 4);
+static_assert(alignof(CoordTensorS1) == alignof(std::int32_t));
+static_assert(offsetof(CoordTensorS1, dynamic_shapes) == 0);
+static_assert(sizeof(CoordTensorS2) == 8);
+static_assert(alignof(CoordTensorS2) == alignof(std::int32_t));
+static_assert(offsetof(CoordTensorS2, dynamic_shapes) == 0);
+static_assert(sizeof(std::uint8_t) == 1);
+
+} // namespace bioir::cutedsl::dual_gemm_x_x::abi
+
+namespace bioir::cutedsl::dual_gemm_x_x
+{
+
+enum class DType : std::uint8_t
+{
+  kFloat16,
+  kBFloat16,
+};
+
+struct KernelConfig
+{
+  std::int32_t target_sm;
+  std::int32_t K;
+  std::int32_t N;
+  std::int32_t bucket;
+  DType dtype;
+  bool transpose_out;
+  bool has_bias;
+  bool runtime_mask;
+  /* Epilogue activation. Selects the image and nothing else: silu costs one
+   * extra fused multiply inside the epilogue, so it changes machine code while
+   * leaving the device parameter bank and its packing identical.
+   */
+  bool silu_gate;
+  EmbeddedCubinImage cubin;
+  embedded::CubinImage const* embedded_image;
+};
+
+struct LaunchParams
+{
+  Tensor2View x;
+  Tensor2View w0;
+  Tensor2View w1;
+  Tensor2View output;
+  Tensor1View bias0;
+  Tensor1View bias1;
+  Tensor1View actual_seqlen;
+  std::int32_t i_dim{};
+  std::uint64_t stream{};
+};
+
+KernelConfig make_kernel_config(
+  std::int32_t target_sm,
+  std::int32_t K,
+  std::int32_t N,
+  std::int32_t S,
+  DType dtype,
+  bool transpose_out,
+  bool has_bias,
+  bool runtime_mask,
+  bool silu_gate = false);
+
+std::uint32_t dynamic_smem_bytes(KernelConfig const& config);
+
+void launch(KernelConfig const& config, LaunchParams const& params);
+
+} // namespace bioir::cutedsl::dual_gemm_x_x
+
+#endif /* BIOIR_CPP_KERNELS_CUTEDSL_DUAL_GEMM_X_X_LAUNCHER_H_ */

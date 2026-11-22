@@ -1,0 +1,65 @@
+"""Diagnostic event and issue enums."""
+
+from enum import Enum
+
+
+class RepairEventKind(str, Enum):
+    """Kinds of structural repair and normalization events."""
+
+    ABSENT_RESIDUE_SPAN_RECONSTRUCTED = "absent_residue_span_reconstructed"
+    HEAVY_ATOMS_ADDED = "heavy_atoms_added"
+    HYDROGENS_ADDED = "hydrogens_added"
+    HYDROGEN_TOPOLOGY_RESOLVED = "hydrogen_topology_resolved"
+    RETAINED_NON_POLYMER_TOPOLOGY_RESOLVED = "retained_non_polymer_topology_resolved"
+    POLYMER_MICROSTATE_APPLIED = "polymer_microstate_applied"
+    LOCAL_REFINEMENT_APPLIED = "local_refinement_applied"
+    C_TERMINAL_OXT_ADDED = "c_terminal_oxt_added"
+    COMPONENT_NORMALIZED = "component_normalized"
+    STEREOCHEMISTRY_CORRECTED = "stereochemistry_corrected"
+    DISULFIDE_TOPOLOGY_RESOLVED = "disulfide_topology_resolved"
+    HYDROGENS_REMOVED = "hydrogens_removed"
+    HYDROGEN_LENGTH_ADJUSTED = "hydrogen_length_adjusted"
+
+
+class ValidationIssueKind(str, Enum):
+    """Kinds of structural validation issues."""
+
+    CHEMISTRY_CONTRADICTION = "chemistry_contradiction"
+    PARSER_READABILITY = "parser_readability"
+    AMBIGUOUS_DISULFIDE = "ambiguous_disulfide"
+    CIS_PEPTIDE = "cis_peptide"
+    MISSING_EXPECTED_ATOMS = "missing_expected_atoms"
+    MISSING_COMPONENT_DEFINITION = "missing_component_definition"
+    UNEXPECTED_ATOMS = "unexpected_atoms"
+    INVALID_BACKBONE = "invalid_backbone"
+    SPAN_RECONSTRUCTION_FAILED = "span_reconstruction_failed"
+    INVALID_GEOMETRY = "invalid_geometry"
+    GEOMETRY_PLACEMENT_SKIPPED = "geometry_placement_skipped"
+    INVALID_STEREOCHEMISTRY = "invalid_stereochemistry"
+    REFINEMENT_REJECTED = "refinement_rejected"
+    WORKFLOW_SEARCH_EXHAUSTED = "workflow_search_exhausted"
+    COMPUTATIONAL_PEPTIDE_CAP = "computational_peptide_cap"
+    SOURCE_COORDINATION_PARTNER_OMITTED = "source_coordination_partner_omitted"
+    COORDINATED_COMPONENT_PREPARATION = "coordinated_component_preparation"
+    UNSUPPORTED_TEMPLATE_REPAIR = "unsupported_template_repair"
+    UNSUPPORTED_HYDROGENATION = "unsupported_hydrogenation"
+    UNRESOLVED_POLYMER_HYDROGEN = "unresolved_polymer_hydrogen"
+    UNRESOLVED_RETAINED_HYDROGEN = "unresolved_retained_hydrogen"
+    PACKING_INVALIDATED_HYDROGENS = "packing_invalidated_hydrogens"
+    PACKING_PRESERVED_LINKED_SIDECHAIN = "packing_preserved_linked_sidechain"
+    PACKING_REBUILT_LINKED_SIDECHAIN = "packing_rebuilt_linked_sidechain"
+    RETAINED_NON_POLYMER_FALLBACK_USED = "retained_non_polymer_fallback_used"
+    RETAINED_NON_POLYMER_FALLBACK_BLOCKED = "retained_non_polymer_fallback_blocked"
+    UNSUPPORTED_COMPONENT = "unsupported_component"
+    STERIC_CLASH = "steric_clash"
+    RETAINED_WATER_REPAIR_REFUSED = "retained_water_repair_refused"
+    HYDROGEN_LENGTH_OUTLIER = "hydrogen_length_outlier"
+    HYDROGEN_PARENT_POSITION_CONFLICT = "hydrogen_parent_position_conflict"
+
+
+class IssueSeverity(str, Enum):
+    """Validation issue severity levels."""
+
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"

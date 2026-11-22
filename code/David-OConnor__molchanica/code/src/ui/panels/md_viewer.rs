@@ -1,0 +1,1141 @@
+use dynamics::snapshot::Snapshot;
+use egui::{Color32, RichText, ScrollArea, Slider, TextEdit, TextStyle, Ui};
+use graphics::{EngineUpdates, EntityUpdate, Scene};
+use mol_defs::molecules::{Atom, MolType, common::MoleculeCommon};
+use na_seq::Element;
+
+use crate::{
+    button,
+    cam::{VIEW_DIR_FRONT, move_cam_to_mol_front, reset_camera},
+    label,
+    md::{trajectory::set_viewed, viewer, viewer::ViewerMolecule},
+    state::State,
+    ui::{
+        COL_SPACING, COLOR_ACTION, COLOR_ACTIVE, COLOR_HIGHLIGHT, COLOR_REMOVE, ROW_SPACING,
+        highlighted_box,
+        misc::{selector_box, selector_option},
+        num_field,
+        panels::md_gromacs::text_width,
+    },
+    util::{RedrawFlags, handle_err, handle_success},
+};
+
+/// The first molecule selected for MD; otherwise, the first open one.
+fn cam_target_mol(state: &State) -> Option<(MolType, usize)> {
+    let mut mols: Vec<((MolType, usize), &MoleculeCommon)> = Vec::new();
+
+    mols.extend(
+        state
+            .peptides
+            .iter()
+            .enumerate()
+            .map(|(i, m)| ((MolType::Peptide, i), &m.common)),
+    );
+    mols.extend(
+        state
+            .ligands
+            .iter()
+            .enumerate()
+            .map(|(i, m)| ((MolType::Ligand, i), &m.common)),
+    );
+    mols.extend(
+        state
+            .lipids
+            .iter()
+            .enumerate()
+            .map(|(i, m)| ((MolType::Lipid, i), &m.common)),
+    );
+    mols.extend(
+        state
+            .nucleic_acids
+            .iter()
+            .enumerate()
+            .map(|(i, m)| ((MolType::NucleicAcid, i), &m.common)),
+    );
+    mols.extend(
+        state
+            .pockets
+            .iter()
+            .enumerate()
+            .map(|(i, m)| ((MolType::Pocket, i), &m.common)),
+    );
+
+    mols.iter()
+        .find(|(_, mol)| mol.selected_for_md.is_some())
+        .or(mols.first())
+        .map(|(id, _)| *id)
+}
+
+fn clear_traj_btn(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    redraw: &mut RedrawFlags,
+    ui: &mut Ui,
+) {
+    if state.volatile.md_local.viewer.snapshots.is_empty()
+        || !ui
+            .button(RichText::new("Clear Traj"))
+            .on_hover_text("Clear all trajectory snapshots, e.g. erase the previous run.")
+            .clicked()
+    {
+        return;
+    }
+
+    state.clear_md_frames(scene, redraw, updates);
+
+    if let Some(molecule) = cam_target_mol(state) {
+        move_cam_to_mol_front(state, scene, molecule, updates);
+    }
+}
+
+/// Why MD playback isn't available, e.g. no frames, or an atom count mismatch. For the MD panel.
+pub(in crate::ui) fn playback_status(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    redraw: &mut RedrawFlags,
+    ui: &mut Ui,
+) {
+    if state.volatile.md_local.viewer.mols_and_traj_synced() {
+        return;
+    }
+
+    ui.horizontal(|ui| {
+        clear_traj_btn(state, scene, updates, redraw, ui);
+
+        let viewer = &state.volatile.md_local.viewer;
+        let txt = if viewer.snapshots.is_empty() {
+            "Not ready for MD playback; no snapshots/frames loaded.".to_owned()
+        } else {
+            let mut t = "Not ready for MD playback; trajectory and mol set atom count mismatch: "
+                .to_owned();
+
+            if let Some(set) = viewer.get_active_mol_set() {
+                t.push_str(&format!(
+                    "Traj: {} Mol set: {}",
+                    viewer.snapshots[0].atom_posits.len(),
+                    set.atom_count
+                ));
+            }
+            t
+        };
+
+        label!(ui, txt, Color32::GRAY);
+    });
+}
+
+/// MD playback controls. Shown whenever loaded frames pair with the active mol set, independent
+/// of the MD panel.
+pub(in crate::ui) fn playback(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    redraw: &mut RedrawFlags,
+    ui: &mut Ui,
+) {
+    if !state.volatile.md_local.viewer.mols_and_traj_synced() {
+        return;
+    }
+
+    // --- Automatic playback tick (runs each frame while playing) ---
+    let mut auto_advance: Option<usize> = None;
+
+    let viewer = &mut state.volatile.md_local.viewer;
+    if viewer.playing {
+        viewer.playback_accum += state.ui.dt_render as f64;
+        let interval = 1.0 / viewer.playback_ratio.max(0.1);
+
+        if viewer.playback_accum >= interval {
+            viewer.playback_accum -= interval;
+            let next = viewer.slider_posit_ui + 1;
+
+            if next < viewer.snapshots.len() {
+                auto_advance = Some(next);
+            } else if viewer.looping {
+                auto_advance = Some(0);
+            } else {
+                viewer.playing = false;
+                viewer.playback_accum = 0.0;
+            }
+        }
+        ui.ctx().request_repaint();
+    }
+
+    // --- Controls row ---
+    ui.horizontal(|ui| {
+        clear_traj_btn(state, scene, updates, redraw, ui);
+
+        ui.add_space(COL_SPACING);
+
+        // Play / Pause button
+        let (play_label, play_color) = if state.volatile.md_local.viewer.playing {
+            ("Pause", COLOR_ACTIVE)
+        } else {
+            ("Play", COLOR_ACTION)
+        };
+        if button!(
+            ui,
+            play_label,
+            play_color,
+            "Start or pause automatic snapshot playback."
+        )
+        .clicked()
+        {
+            let viewer = &mut state.volatile.md_local.viewer;
+            viewer.playing = !viewer.playing;
+            viewer.playback_accum = 0.0;
+
+            // Playback without looping stops on the last snapshot; start over from there.
+            if viewer.playing && viewer.slider_posit_ui + 1 >= viewer.snapshots.len() {
+                auto_advance = Some(0);
+            }
+        }
+
+        ui.checkbox(&mut state.volatile.md_local.viewer.looping, "Loop")
+            .on_hover_text(
+                "Continue playback from the first snapshot after the last. Otherwise, playback \
+                stops at the last snapshot.",
+            );
+
+        // Playback speed slider (snapshots per second)
+        ui.label("Speed:");
+        ui.add(
+            Slider::new(
+                &mut state.volatile.md_local.viewer.playback_ratio,
+                0.5..=60.0,
+            )
+            .text("fps")
+            .fixed_decimals(1),
+        );
+    });
+
+    if let Some(snap_i) = auto_advance
+        && state.volatile.md_local.viewer.mols_and_traj_synced()
+    {
+        let viewer = &mut state.volatile.md_local.viewer;
+        viewer.slider_posit_ui = snap_i;
+        viewer.current_snapshot = Some(snap_i);
+
+        if let Err(e) = viewer.change_snapshot(snap_i) {
+            handle_err(&mut state.ui, format!("Error changing MD snapshot: {e:?}"));
+        }
+        viewer::draw_mols(state, scene, updates);
+    }
+
+    // --- Snapshot position slider ---
+    // Clear Traj may have emptied the frames.
+    if state.volatile.md_local.viewer.mols_and_traj_synced() {
+        let slider_posit_prev = state.volatile.md_local.viewer.slider_posit_ui;
+
+        ui.horizontal(|ui| {
+            let viewer = &state.volatile.md_local.viewer;
+            let i_max = viewer.snapshots.len() - 1;
+            let traj = state.trajectories.iter().find(|t| t.ui_active);
+
+            // Some files, e.g. from MDposit, have no frame times.
+            let frame_label = |i: usize, time: f64| match traj {
+                Some(traj) if !traj.has_times() => format!("Frame {}", traj.frame_index(i)),
+                _ => format!("{time:.2} ps"),
+            };
+
+            let label = match (viewer.current_snapshot, viewer.get_active_snap()) {
+                (Some(i), Some(ss)) => Some(frame_label(i, ss.time)),
+                _ => None,
+            };
+
+            // Reserve room for the value box and label at their widest, so neither spills off
+            // the right, and the slider doesn't change width during playback. The right margin
+            // matches the left.
+            let label_max = frame_label(i_max, viewer.snapshots[i_max].time);
+            let spacing = ui.spacing();
+            let value_width = (text_width(ui, &i_max.to_string(), TextStyle::Button)
+                + 2. * spacing.button_padding.x)
+                .max(spacing.interact_size.x);
+            let reserved = value_width
+                + text_width(ui, &label_max, TextStyle::Body)
+                + 2. * spacing.item_spacing.x
+                + ROW_SPACING;
+
+            ui.add_space(ROW_SPACING);
+            ui.spacing_mut().slider_width = (ui.available_width() - reserved).max(0.);
+
+            ui.add(Slider::new(
+                &mut state.volatile.md_local.viewer.slider_posit_ui,
+                0..=i_max,
+            ));
+
+            if let Some(label) = label {
+                ui.label(label);
+            }
+        });
+
+        let posit = state.volatile.md_local.viewer.slider_posit_ui;
+
+        if posit != slider_posit_prev && posit <= state.volatile.md_local.viewer.snapshots.len() {
+            state.volatile.md_local.viewer.current_snapshot = Some(posit);
+
+            if let Err(e) = state.volatile.md_local.viewer.change_snapshot(posit) {
+                handle_err(&mut state.ui, format!("Error changing MD snapshot: {e:?}"));
+            }
+
+            viewer::draw_mols(state, scene, updates);
+        }
+    }
+}
+
+pub(in crate::ui) fn energy_disp(snap: &Snapshot, ui: &mut Ui) {
+    let Some(en) = &snap.energy_data else { return };
+
+    ui.label(RichText::new("Energy (current snap):").color(Color32::WHITE));
+    ui.add_space(COL_SPACING / 2.);
+
+    let atom_count = (snap.water_o_posits.len() * 3) as f32 + snap.atom_posits.len() as f32;
+    if en.energy_kinetic.is_finite() {
+        ui.label("E (kcal/mol) KE: ");
+        ui.label(RichText::new(format!("{:.1}", en.energy_kinetic)).color(Color32::GOLD));
+
+        ui.label("KE/atom: ");
+        let ke_per_atom = en.energy_kinetic / atom_count;
+        label!(ui, format!("{:.2}", ke_per_atom), Color32::GOLD);
+    }
+
+    ui.label("PE: ");
+    label!(ui, format!("{:.2}", en.energy_potential), Color32::GOLD);
+
+    if en.energy_potential_nonbonded.abs() > 0.0001 {
+        ui.label("PE NB: ");
+        label!(
+            ui,
+            format!("{:.2}", en.energy_potential_nonbonded),
+            Color32::GOLD
+        );
+    }
+
+    ui.label("PE/atom: ");
+    // todo: Don't continuously run this!
+    let pe_per_atom = en.energy_potential / atom_count;
+    label!(ui, format!("{:.3}", pe_per_atom), Color32::GOLD);
+
+    if en.energy_kinetic.is_finite() {
+        ui.label("E tot: ");
+        let e = en.energy_potential + en.energy_kinetic;
+        label!(ui, format!("{:.2}", e), Color32::GOLD);
+    }
+
+    // ui.label("PE between mols:");
+    // // todo: One pair only for now
+    // if en.energy_potential_between_mols.len() >= 2 {
+    //     // todo: Which index?
+    //     ui.label(
+    //         RichText::new(format!("{:.2}", en.energy_potential_between_mols[1]))
+    //             .color(Color32::GOLD),
+    //     );
+    // }
+
+    if en.temperature.is_finite() {
+        ui.label("Temp: ");
+        label!(ui, format!("{:.1} K", en.temperature), Color32::GOLD);
+    }
+
+    if en.pressure.is_finite() {
+        ui.label("P: ");
+        label!(ui, format!("{:.1} bar", en.pressure), Color32::GOLD);
+    }
+
+    if en.volume.is_finite() {
+        ui.label("Vol: ");
+        label!(
+            ui,
+            format!("{:.1} k Å^3", en.volume / 1_000.),
+            Color32::GOLD
+        );
+    }
+
+    if en.density.is_finite() {
+        ui.label("Dens: ");
+        label!(ui, format!("{:.2} amu/Å^3", en.density), Color32::GOLD);
+    }
+}
+
+/// Build a single water `ViewerMolecule` whose range starts at `start_i`.
+fn make_water_mol(start_i: usize) -> ViewerMolecule {
+    let zero = lin_alg::f64::Vec3::default();
+    let atoms = vec![
+        Atom {
+            serial_number: start_i as u32,
+            posit: zero,
+            type_in_res_general: Some("OW".to_owned()),
+            hetero: true,
+            element: Element::Oxygen,
+            ..Default::default()
+        },
+        Atom {
+            serial_number: (start_i + 1) as u32,
+            posit: zero,
+            type_in_res_general: Some("HW1".to_owned()),
+            hetero: true,
+            element: Element::Hydrogen,
+            ..Default::default()
+        },
+        Atom {
+            serial_number: (start_i + 2) as u32,
+            posit: zero,
+            type_in_res_general: Some("HW2".to_owned()),
+            hetero: true,
+            element: Element::Hydrogen,
+            ..Default::default()
+        },
+    ];
+    let atom_posits = vec![zero; 3];
+    ViewerMolecule {
+        mol_type: MolType::Water,
+        mol: MoleculeCommon {
+            ident: "SOL".to_owned(),
+            atoms,
+            atom_posits,
+            ..Default::default()
+        },
+        range: (start_i, start_i + 3),
+    }
+}
+
+/// Create and edit MD molecule sets; these are associated with trajectories; they map a trajectory's
+/// flat atom index to molecules, for display purposes.
+///
+/// Sets are stored in the .gro format; GROMACS's text-based format for this. This window lets you create
+/// new sets, and edit existing ones.
+pub(in crate::ui) fn md_mol_set_editor(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    ui: &mut Ui,
+    redraw: &mut RedrawFlags,
+) {
+    ui.horizontal(|ui| {
+        label!(
+            ui,
+            "Edit and add molecule sets for MD playback",
+            Color32::WHITE
+        );
+        ui.add_space(COL_SPACING);
+
+        if button!(ui, "New", COLOR_ACTION, "Create a new empty molecule set.").clicked() {
+            let name = format!("Set {}", state.volatile.md_local.viewer.mol_sets.len() + 1);
+            state
+                .volatile
+                .md_local
+                .viewer
+                .mol_sets
+                .push(viewer::ViewerMolSet::new(None, name, vec![]));
+            state.ui.md.set_editor_active_set =
+                Some(state.volatile.md_local.viewer.mol_sets.len() - 1);
+        }
+    });
+    label!(
+        ui,
+        "Select a set to edit. To open a set from a file (e.g. .gro), open it like any other file. Use this editor to map molecules to trajectory atom ranges.",
+        Color32::GRAY
+    );
+
+    ui.add_space(ROW_SPACING);
+
+    // --- Set selection ---
+    if state.volatile.md_local.viewer.mol_sets.is_empty() {
+        label!(ui, "(No sets open)", Color32::GRAY);
+        return;
+    }
+
+    ui.horizontal(|ui| {
+        selector_box().show(ui, |ui| {
+            for (i, set) in state.volatile.md_local.viewer.mol_sets.iter().enumerate() {
+                let active = Some(i) == state.ui.md.set_editor_active_set;
+                if selector_option(ui, active, &set.name)
+                    .on_hover_text("Select this set to edit.")
+                    .clicked()
+                {
+                    state.ui.md.set_editor_active_set = if active { None } else { Some(i) };
+                }
+            }
+        });
+    });
+
+    let Some(set_i) = state.ui.md.set_editor_active_set else {
+        return;
+    };
+
+    if set_i >= state.volatile.md_local.viewer.mol_sets.len() {
+        state.ui.md.set_editor_active_set = None;
+        return;
+    }
+
+    ui.separator();
+    ui.add_space(ROW_SPACING);
+    ui.label(RichText::new("Molecules in set:").color(Color32::WHITE));
+
+    // --- Edit current mols in the set (sorted by range, water grouped) ---
+    let mols_len = state.volatile.md_local.viewer.mol_sets[set_i].mols.len();
+
+    // Sorted indices, non-water only (water shown as a group below).
+    let mut sorted_indices: Vec<usize> = (0..mols_len)
+        .filter(|&j| {
+            state.volatile.md_local.viewer.mol_sets[set_i].mols[j].mol_type != MolType::Water
+        })
+        .collect();
+    sorted_indices.sort_by_key(|&j| {
+        state.volatile.md_local.viewer.mol_sets[set_i].mols[j]
+            .range
+            .0
+    });
+
+    let water_count = state.volatile.md_local.viewer.mol_sets[set_i]
+        .mols
+        .iter()
+        .filter(|m| m.mol_type == MolType::Water)
+        .count();
+    let (water_range_start, water_range_end) = {
+        let set = &state.volatile.md_local.viewer.mol_sets[set_i];
+
+        let starts = set
+            .mols
+            .iter()
+            .filter(|m| m.mol_type == MolType::Water)
+            .map(|m| m.range.0);
+
+        let ends = set
+            .mols
+            .iter()
+            .filter(|m| m.mol_type == MolType::Water)
+            .map(|m| m.range.1);
+
+        (starts.min().unwrap_or(0), ends.max().unwrap_or(0))
+    };
+
+    let mut remove_j: Option<usize> = None;
+    let mut clear_water = false;
+
+    if mols_len == 0 {
+        label!(ui, "(No molecules in this set)", Color32::GRAY);
+    }
+
+    // Scrollable list of non-water mols + water summary row.
+    ScrollArea::vertical()
+        .id_salt("mol_set_editor_scroll")
+        .max_height(260.)
+        .show(ui, |ui| {
+            for &j in &sorted_indices {
+                let mol = &mut state.volatile.md_local.viewer.mol_sets[set_i].mols[j];
+                ui.horizontal(|ui| {
+                    label!(
+                        ui,
+                        format!(
+                            "{} [{}] ({} atoms)",
+                            mol.mol.ident,
+                            mol.mol_type,
+                            mol.mol.atoms.len()
+                        ),
+                        Color32::WHITE
+                    );
+                    num_field(&mut mol.range.0, "Start:", 54, ui);
+                    num_field(&mut mol.range.1, "End:", 54, ui);
+                    if ui
+                        .button(RichText::new("❌").color(COLOR_REMOVE))
+                        .on_hover_text("Remove from set")
+                        .clicked()
+                    {
+                        remove_j = Some(j);
+                    }
+                });
+            }
+
+            // Water summary row.
+            if water_count > 0 {
+                ui.horizontal(|ui| {
+                    label!(
+                        ui,
+                        format!(
+                            "Water: {} mols | Start: {} End: {}",
+                            water_count, water_range_start, water_range_end
+                        ),
+                        Color32::from_rgb(100, 180, 255)
+                    );
+                    if button!(
+                        ui,
+                        "Clear water",
+                        COLOR_REMOVE,
+                        "Remove all water molecules from this set."
+                    )
+                    .clicked()
+                    {
+                        clear_water = true;
+                    }
+                });
+            }
+        });
+
+    if state.volatile.md_local.viewer.mol_sets[set_i].range_overlaps {
+        label!(ui, "Warning: Mol ranges overlap", Color32::LIGHT_RED);
+    }
+
+    if let Some(j) = remove_j {
+        state.volatile.md_local.viewer.mol_sets[set_i]
+            .mols
+            .remove(j);
+    }
+    if clear_water {
+        state.volatile.md_local.viewer.mol_sets[set_i]
+            .mols
+            .retain(|m| m.mol_type != MolType::Water);
+    }
+    if remove_j.is_some() || clear_water {
+        state.volatile.md_local.viewer.mol_sets[set_i].update_derivative_vals();
+    }
+
+    // Always keep derivative vals up-to-date for range edits (num_field writes in-place).
+    state.volatile.md_local.viewer.mol_sets[set_i].update_derivative_vals();
+
+    ui.separator();
+    ui.label(RichText::new("Add from open molecules:").color(Color32::WHITE));
+    label!(
+        ui,
+        "Clicking Add places the molecule after the current last range. Edit the range fields above as needed.",
+        Color32::GRAY
+    );
+
+    // Next suggested range start: after the current last range end.
+    let next_range_start = state.volatile.md_local.viewer.mol_sets[set_i]
+        .mols
+        .iter()
+        .map(|m| m.range.1)
+        .max()
+        .unwrap_or(0);
+
+    // Collect any pending add to apply after reads (avoids borrow conflict).
+    let mut to_add: Option<ViewerMolecule> = None;
+
+    // Proteins
+    if !state.peptides.is_empty() {
+        ui.label(RichText::new("Proteins:").color(Color32::CYAN));
+        for pep in &state.peptides {
+            let atom_count = pep.common.atoms.len();
+            let common = pep.common.clone();
+            ui.horizontal(|ui| {
+                if button!(
+                    ui,
+                    format!(
+                        "{} ({} atoms)",
+                        common.name.as_deref().unwrap_or(&common.ident),
+                        atom_count
+                    ),
+                    COLOR_ACTION,
+                    "Add this protein to the mol set"
+                )
+                .clicked()
+                    && to_add.is_none()
+                {
+                    to_add = Some(ViewerMolecule {
+                        mol_type: MolType::Peptide,
+                        mol: common,
+                        range: (next_range_start, next_range_start + atom_count),
+                    });
+                }
+            });
+        }
+    }
+
+    // Ligands / small mols
+    if !state.ligands.is_empty() {
+        ui.label(RichText::new("Ligands:").color(Color32::GREEN));
+        for lig in state.ligands.iter() {
+            let atom_count = lig.common.atoms.len();
+            let common = lig.common.clone();
+            ui.horizontal(|ui| {
+                if button!(
+                    ui,
+                    format!(
+                        "{} ({} atoms)",
+                        common.name.as_deref().unwrap_or(&common.ident),
+                        atom_count
+                    ),
+                    COLOR_ACTION,
+                    "Add this ligand to the mol set"
+                )
+                .clicked()
+                    && to_add.is_none()
+                {
+                    to_add = Some(ViewerMolecule {
+                        mol_type: MolType::Ligand,
+                        mol: common,
+                        range: (next_range_start, next_range_start + atom_count),
+                    });
+                }
+            });
+        }
+    }
+
+    // Nucleic acids
+    if !state.nucleic_acids.is_empty() {
+        ui.label(RichText::new("Nucleic Acids:").color(Color32::YELLOW));
+        for na in state.nucleic_acids.iter() {
+            let atom_count = na.common.atoms.len();
+            let common = na.common.clone();
+            ui.horizontal(|ui| {
+                if button!(
+                    ui,
+                    format!(
+                        "{} ({} atoms)",
+                        common.name.as_deref().unwrap_or(&common.ident),
+                        atom_count
+                    ),
+                    COLOR_ACTION,
+                    "Add this nucleic acid to the mol set"
+                )
+                .clicked()
+                    && to_add.is_none()
+                {
+                    to_add = Some(ViewerMolecule {
+                        mol_type: MolType::NucleicAcid,
+                        mol: common,
+                        range: (next_range_start, next_range_start + atom_count),
+                    });
+                }
+            });
+        }
+    }
+
+    // Lipids
+    if !state.lipids.is_empty() {
+        ui.label(RichText::new("Lipids:").color(Color32::from_rgb(255, 128, 255)));
+        for lip in state.lipids.iter() {
+            let atom_count = lip.common.atoms.len();
+            let common = lip.common.clone();
+            ui.horizontal(|ui| {
+                if button!(
+                    ui,
+                    format!(
+                        "{} ({} atoms)",
+                        common.name.as_deref().unwrap_or(&common.ident),
+                        atom_count
+                    ),
+                    COLOR_ACTION,
+                    "Add this lipid to the mol set"
+                )
+                .clicked()
+                    && to_add.is_none()
+                {
+                    to_add = Some(ViewerMolecule {
+                        mol_type: MolType::Lipid,
+                        mol: common,
+                        range: (next_range_start, next_range_start + atom_count),
+                    });
+                }
+            });
+        }
+    }
+
+    if let Some(mol) = to_add {
+        state.volatile.md_local.viewer.mol_sets[set_i]
+            .mols
+            .push(mol);
+        state.volatile.md_local.viewer.mol_sets[set_i].update_derivative_vals();
+
+        // Saves clicking "Set" after building the first set.
+        if state.volatile.md_local.viewer.mol_set_active.is_none() {
+            state.volatile.md_local.viewer.mol_set_active = Some(set_i);
+
+            let name = &state.volatile.md_local.viewer.mol_sets[set_i].name;
+            handle_success(&mut state.ui, format!("Set {name} as the active mol set"));
+
+            show_active_mol_set(state, scene, updates, redraw);
+        }
+    }
+
+    // --- Fill rest with water ---
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Fill rest with water:").color(Color32::from_rgb(100, 180, 255)));
+        ui.label("Final atom idx:");
+        ui.add_sized(
+            [64., Ui::available_height(ui)],
+            TextEdit::singleline(&mut state.ui.md.water_fill_end_input),
+        );
+
+        let fill_clicked = button!(
+            ui,
+            "Fill",
+            COLOR_ACTION,
+            "Remove all current water mols and repopulate from the last non-water atom index up \
+            to the given final index. The range must be divisible by 3 (OW + HW1 + HW2)."
+        )
+        .clicked();
+
+        if fill_clicked {
+            match state.ui.md.water_fill_end_input.trim().parse::<usize>() {
+                Err(_) => {
+                    handle_err(
+                        &mut state.ui,
+                        "Final atom index must be a positive integer.".to_owned(),
+                    );
+                }
+                Ok(final_idx) => {
+                    // Start = last non-water range end (or 0).
+                    let water_start = state.volatile.md_local.viewer.mol_sets[set_i]
+                        .mols
+                        .iter()
+                        .filter(|m| m.mol_type != MolType::Water)
+                        .map(|m| m.range.1)
+                        .max()
+                        .unwrap_or(0);
+
+                    let span = final_idx.saturating_sub(water_start);
+                    // Round up to the nearest whole water molecule (3 atoms each).
+                    let n_water = (span + 2) / 3;
+
+                    // Remove existing water.
+                    state.volatile.md_local.viewer.mol_sets[set_i]
+                        .mols
+                        .retain(|m| m.mol_type != MolType::Water);
+
+                    // Add one ViewerMolecule per water molecule.
+                    for k in 0..n_water {
+                        let start = water_start + k * 3;
+                        state.volatile.md_local.viewer.mol_sets[set_i]
+                            .mols
+                            .push(make_water_mol(start));
+                    }
+
+                    state.volatile.md_local.viewer.mol_sets[set_i].update_derivative_vals();
+                }
+            }
+        }
+    });
+
+    ui.separator();
+    if button!(ui, "Save", COLOR_ACTION, "Save this mol set as a GRO file.").clicked() {
+        let name = format!(
+            "{}.gro",
+            state.volatile.md_local.viewer.mol_sets[set_i]
+                .name
+                .replace(' ', "_")
+        );
+        state
+            .volatile
+            .dialogs
+            .save_gro
+            .config_mut()
+            .default_file_name = name;
+
+        state.volatile.dialogs.save_gro_mol_set_i = Some(set_i);
+        state.volatile.dialogs.save_gro.save_file();
+    }
+
+    ui.add_space(ROW_SPACING);
+}
+
+/// Draws the active mol set at the current snapshot.
+fn show_active_mol_set(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    redraw: &mut RedrawFlags,
+) {
+    redraw.set_all();
+
+    let snap_i = state.volatile.md_local.viewer.current_snapshot.unwrap_or(0);
+    if state
+        .volatile
+        .md_local
+        .viewer
+        .change_snapshot(snap_i)
+        .is_err()
+    {
+        handle_err(&mut state.ui, "Error changing snaps".to_string());
+    }
+
+    reset_camera(state, scene, updates, VIEW_DIR_FRONT);
+    viewer::draw_mols(state, scene, updates);
+}
+
+/// The active molecule, if it can go in a mol set.
+fn active_set_mol(state: &State) -> Option<(MolType, &MoleculeCommon)> {
+    let (mol_type, i) = state.volatile.active_mol?;
+    let mol = match mol_type {
+        MolType::Peptide => &state.peptides.get(i)?.common,
+        MolType::Ligand => &state.ligands.get(i)?.common,
+        MolType::NucleicAcid => &state.nucleic_acids.get(i)?.common,
+        MolType::Lipid => &state.lipids.get(i)?.common,
+        _ => return None,
+    };
+
+    Some((mol_type, mol))
+}
+
+/// The active molecule's name, truncated, if it can go in a mol set.
+pub(in crate::ui) fn set_candidate_name(state: &State) -> Option<String> {
+    const MAX_LEN: usize = 16;
+
+    let (_, mol) = active_set_mol(state)?;
+    let name = mol.name.as_deref().unwrap_or(&mol.ident);
+    if name.chars().count() <= MAX_LEN {
+        return Some(name.to_owned());
+    }
+
+    let mut result: String = name.chars().take(MAX_LEN - 1).collect();
+    result.push('…');
+
+    Some(result)
+}
+
+/// Creates a mol set from the active molecule, and makes it active. Equivalent to Edit sets → New
+/// → adding the molecule.
+pub(in crate::ui) fn create_set_from_active_mol(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    redraw: &mut RedrawFlags,
+) {
+    let Some((mol_type, mol)) = active_set_mol(state) else {
+        return;
+    };
+    let mol = ViewerMolecule {
+        mol_type,
+        range: (0, mol.atoms.len()),
+        mol: mol.clone(),
+    };
+
+    let viewer = &mut state.volatile.md_local.viewer;
+    let name = format!("Set {}", viewer.mol_sets.len() + 1);
+    viewer
+        .mol_sets
+        .push(viewer::ViewerMolSet::new(None, name.clone(), vec![mol]));
+
+    let set_i = viewer.mol_sets.len() - 1;
+    viewer.mol_set_active = Some(set_i);
+    state.ui.md.set_editor_active_set = Some(set_i);
+
+    handle_success(&mut state.ui, format!("Set {name} as the active mol set"));
+
+    if state.volatile.md_local.viewer.mols_and_traj_synced() {
+        show_active_mol_set(state, scene, updates, redraw);
+    }
+}
+
+/// Selected from loaded molecule sets, which map molecules to a trajectory's flat atoms.
+/// This might be loaded, for example, from a .gro file.
+pub(in crate::ui) fn viewer_mol_set(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    ui: &mut Ui,
+    redraw: &mut RedrawFlags,
+) {
+    let empty = state.volatile.md_local.viewer.mol_sets.is_empty();
+    // Keep the force field selector available even without a loaded molecule set.
+    ui.horizontal(|ui| {
+        ui.label("MD mol sets");
+
+        ui.add_space(COL_SPACING);
+
+        // We show this if sets are empty, but trajectories are not.
+        if button!(
+        ui,
+        "Edit sets",
+        Color32::WHITE,
+        "Add or edit molecule sets associated with MD trajectories. This lets you add open molecules,\
+        and adjust which trajectory index range each is associated with."
+    ).clicked() {
+            state.ui.popup.md_mol_set_editor = !state.ui.popup.md_mol_set_editor;
+        }
+
+        ui.add_space(COL_SPACING);
+        ui.label("Force field:");
+        crate::force_fields::selector(state, ui, "sidebar_force_field", true);
+    });
+
+    if empty {
+        return;
+    }
+
+    ui.separator();
+
+    let mut close = None;
+    let mut set_clicked = false;
+
+    for i in 0..state.volatile.md_local.viewer.mol_sets.len() {
+        let mut redraw_active_set = false;
+        let (active, color) = if Some(i) == state.volatile.md_local.viewer.mol_set_active {
+            (true, COLOR_ACTIVE)
+        } else {
+            (false, Color32::WHITE)
+        };
+
+        // Extract display data before the closure to avoid borrow conflicts with &mut state.
+        let (
+            set_name,
+            set_mols_len,
+            set_atom_count,
+            set_range_covered,
+            set_range_overlaps,
+            sorted_groups_display,
+        ) = {
+            if i >= state.volatile.md_local.viewer.mol_sets.len() {
+                eprintln!("Error active mol set out of range");
+                return;
+            }
+            let set = &state.volatile.md_local.viewer.mol_sets[i];
+            (
+                set.name.clone(),
+                set.mols.len(),
+                set.atom_count,
+                set.range_covered,
+                set.range_overlaps,
+                set.groups_display(),
+            )
+        };
+
+        highlighted_box(active, Color32::from_rgb(40, 40, 55)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+
+                ui.label(RichText::new(format!("{} | {} mols", set_name, set_mols_len)).color(color));
+
+                ui.label(RichText::new(format!("At: {} | Rng: {}-{}", set_atom_count, set_range_covered.0, set_range_covered.1)).color(color));
+
+                if set_range_overlaps {
+                    ui.label(RichText::new("Warning: Mol ranges overlap").color(Color32::LIGHT_RED));
+                }
+            });
+
+            let max_count = 5;
+            for group in sorted_groups_display.iter().take(max_count) {
+
+            ui.horizontal(|ui| {if button!(
+                ui,
+                "Set",
+                COLOR_ACTION,
+                "Load this set of molecules into the MD trajectory atoms. This affects \
+            how the atoms in the trajectory are visually mapped to molecules with covalent bonds, the correct element etc."
+            ).clicked() {
+                        state.volatile.md_local.viewer.mol_set_active = if active {
+                            None }
+                        else {
+                            Some(i)
+                        };
+
+                        set_clicked = true;
+                        handle_success(&mut state.ui, format!("Set {} as the active mol set", set_name));
+                    }
+
+                    if button!(ui, "Save", COLOR_ACTION, "Save this mol set as a GRO file.").clicked() {
+                        let name = format!("{}.gro", set_name.replace(' ', "_"));
+                        state.volatile.dialogs.save_gro.config_mut().default_file_name = name;
+                        state.volatile.dialogs.save_gro_mol_set_i = Some(i);
+                        state.volatile.dialogs.save_gro.save_file();
+                    }
+
+                    if ui
+                        .button(RichText::new("❌").color(COLOR_REMOVE))
+                        .on_hover_text("Close this molecule set.")
+                        .clicked()
+                    {
+                        close = Some(i);
+                    }
+            });
+
+                ui.horizontal(|ui| {
+                    let text = if group.mol_count > 1 {
+                        format!(
+                            "{} ({} mols) | Atoms: {} Range: {}-{}",
+                            group.ident,
+                            group.mol_count,
+                            group.atom_count,
+                            group.range_covered.0,
+                            group.range_covered.1,
+                        )
+                    } else {
+                        format!(
+                            "{} | Atoms: {} Range: {}-{}",
+                            group.ident,
+                            group.atom_count,
+                            group.range_covered.0,
+                            group.range_covered.1,
+                        )
+                    };
+
+                    let mut visible = state.volatile.md_local.viewer.mol_sets[i].groups
+                        [group.group_i]
+                        .visible;
+
+                    label!(
+                        ui,
+                        text,
+                        if visible {
+                            Color32::WHITE
+                        } else {
+                            Color32::GRAY
+                        }
+                    );
+
+                    if ui.checkbox(&mut visible, "vis").changed() {
+                        state.volatile.md_local.viewer.mol_sets[i].groups[group.group_i].visible =
+                            visible;
+                        redraw_active_set = active;
+                    }
+                });
+            }
+
+            if sorted_groups_display.len() > max_count {
+                label!(ui, "...", Color32::WHITE);
+            }
+
+            ui.separator();
+
+            if set_clicked {
+                // We have this as the function calls in this branch which call state have a borrow
+                // error otherwise; the flag setting is convenience.
+                redraw.set_all();
+
+                if state.volatile.md_local.viewer.mol_set_active.is_some() {
+                    show_active_mol_set(state, scene, updates, redraw);
+                }
+            }
+
+            if redraw_active_set && state.volatile.md_local.draw_md_mols {
+                viewer::draw_mols(state, scene, updates);
+                redraw.set_all();
+            }
+        });
+    }
+
+    if let Some(i) = close {
+        state
+            .volatile
+            .md_local
+            .viewer
+            .close_mol_set(&mut state.to_save.open_history, i);
+
+        if state.volatile.md_local.draw_md_mols {
+            if state.volatile.md_local.viewer.mol_set_active.is_some() {
+                let snap_i = state.volatile.md_local.viewer.current_snapshot.unwrap_or(0);
+
+                if state
+                    .volatile
+                    .md_local
+                    .viewer
+                    .change_snapshot(snap_i)
+                    .is_err()
+                {
+                    handle_err(&mut state.ui, "Error changing snaps".to_string());
+                }
+
+                viewer::draw_mols(state, scene, updates);
+            } else {
+                state
+                    .volatile
+                    .md_local
+                    .clear_snaps(&mut scene.entities, redraw);
+                set_viewed(&mut state.trajectories, None);
+                updates.entities = EntityUpdate::All;
+            }
+        }
+    }
+}

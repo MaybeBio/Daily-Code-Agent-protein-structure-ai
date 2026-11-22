@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools==84.0.0", "wheel==0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "annotation-vocabulary"
+version = "0.1.0"
+description = "Build and migrate versioned protein annotation vocabularies from Swiss-Prot."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+  "biopython>=1.88",
+  "datasets>=5.0.1",
+  "huggingface-hub>=1.32",
+  "numpy>=2.5.3",
+  "pyarrow>=25.0.1",
+  "requests>=2.34.2",
+  "scipy>=1.18.1",
+  "tqdm>=4.70.1",
+]
+
+[project.optional-dependencies]
+report = [
+  "matplotlib>=3.11.2",
+  "pandas>=3.0.6",
+  "pypdf>=6.19",
+]
+study = [
+  "matplotlib>=3.11.2",
+  "pandas>=3.0.6",
+  "pypdf>=6.19",
+  "scikit-learn>=1.9.1",
+  "scipy>=1.18.1",
+  "safetensors>=0.8",
+  "torch>=2.14",
+  "transformers>=5.17",
+]
+analysis = [
+  "esm @ git+https://github.com/Biohub/esm.git@43ccece2ad485f27db46afdb67da2a9601e8f106",
+  "matplotlib>=3.10,<4",
+  "pandas>=2.3,<4",
+  "safetensors>=0.8",
+  "scikit-learn>=1.7,<2",
+  "scipy>=1.15,<2",
+  "statsmodels>=0.14,<1",
+  "torch>=2.11,<2.12",
+  "transformers @ git+https://github.com/Biohub/transformers.git@ef32577f55da19a4989cd7b22e004dc43a4998cb",
+  "wandb>=0.21,<1",
+]
+test = [
+  "pytest>=9.1.1",
+  "safetensors>=0.8",
+  "scipy>=1.18.1",
+  "torch>=2.14",
+]
+
+[project.scripts]
+annotation-vocabulary = "annotation_vocabulary.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"annotation_vocabulary.study" = ["local_accumulate.cpp"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+# The package and the foundry modules the public repository vendors sit under src/, which a clone tests without installing.
+pythonpath = ["src"]
+markers = [
+    "workspace: reads workspace files outside this repository, such as tools/templates; no clone holds them, so run a clone with -m 'not workspace'",
+]

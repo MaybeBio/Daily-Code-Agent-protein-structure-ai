@@ -1,0 +1,367 @@
+#!/bin/bash
+# MDClaw container verification script
+# Run inside the container to verify all components are working.
+#
+# Usage:
+#   docker run --rm mdclaw:latest bash container/scripts/test-container.sh
+#   singularity exec mdclaw.sif bash /path/to/test-container.sh
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REQUIRE_GPU=false
+case "${1:-}" in
+    --gpu) REQUIRE_GPU=true ;;
+    "") ;;
+    *) echo "Usage: $0 [--gpu]" >&2; exit 2 ;;
+esac
+GPU_TEST="$SCRIPT_DIR/test-gpu.py"
+[ -f "$GPU_TEST" ] || GPU_TEST=/opt/mdclaw/share/mdclaw/test-gpu.py
+
+# Avoid importing an adjacent source checkout instead of the installed package.
+cd "${TMPDIR:-/tmp}"
+
+PASS=0
+FAIL=0
+
+check() {
+    local desc="$1"
+    shift
+    if "$@" > /dev/null 2>&1; then
+        echo "  PASS: $desc"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: $desc"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+# Some contracts belong to one image only: the arm64 / CUDA 13 image declares
+# them through environment variables its Dockerfile sets. Running the same
+# script against an image that never made the promise is not a failure, so
+# skip the check instead of failing it.
+check_declared() {
+    local var="$1"
+    local desc="$2"
+    shift 2
+    if [ -z "${!var:-}" ]; then
+        echo "  SKIP: $desc ($var not declared by this image)"
+        return
+    fi
+    check "$desc" "$@"
+}
+
+echo "=== MDClaw Container Verification ==="
+echo ""
+
+# --- CLI ---
+echo "[CLI]"
+check "mdclaw --version" mdclaw --version
+check "mdclaw --list" mdclaw --list
+# Model backends (BioEmu, Boltz-2) are installed at runtime into isolated
+# venvs, not baked into the image, so only verify the management CLI exists.
+check "model-backend CLI discoverable" bash -c "mdclaw --list | grep -q setup_model_backend"
+check "ruff" ruff --version
+check "pytest" python -m pytest --version
+check "pytest-asyncio" python -c "import pytest_asyncio"
+check_declared PYTHONUTF8 "UTF-8 mode contract" python -c "
+import locale
+import pathlib
+import sys
+import tempfile
+
+assert sys.flags.utf8_mode == 1, sys.flags.utf8_mode
+# A GPU driver can leave the process in the C locale; under UTF-8 mode that must
+# not change how text is written.
+locale.setlocale(locale.LC_ALL, 'C')
+path = pathlib.Path(tempfile.mkdtemp()) / 'em-dash.txt'
+path.write_text('an em dash \u2014 here')
+assert '\u2014' in path.read_text()
+print('UTF-8 mode active and locale-independent')
+"
+
+# Verify the installed MCP transport from /tmp, including clean stdio, assets,
+# and exact DCD coordinates. No GUI, source checkout or validation venv needed.
+check "Molstar MCP initialization, UI and frame streaming" python - <<'PY_MOLSTAR'
+import base64
+from pathlib import Path
+import sys
+import tempfile
+import anyio
+import numpy as np
+from mdtraj.formats import DCDTrajectoryFile
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+async def check(directory):
+    root = Path(directory)
+    pdb, dcd = root / 'probe.pdb', root / 'probe.dcd'
+    pdb.write_text('ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\nEND\n')
+    xyz = np.array([[[0, 0, 0]], [[1, 2, 3]]], dtype=np.float32)
+    with DCDTrajectoryFile(str(dcd), 'w') as out:
+        out.write(xyz)
+    params = StdioServerParameters(command=sys.executable, args=['-m', 'mdclaw._cli', 'molstar-mcp'])
+    with anyio.fail_after(30):
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as client:
+                await client.initialize()
+                result = await client.call_tool('open_molstar_probe', {
+                    'structure_file': str(pdb), 'trajectory_file': str(dcd)})
+                assert not result.isError
+                token = result.structuredContent['dataset_id']
+                frame = await client.call_tool('molstar_probe_data', {
+                    'kind': 'frame', 'index': 1, 'dataset_id': token})
+                assert not frame.isError and not frame.content
+                assert base64.b64decode(frame.meta['mdclaw']['coordinates']) == xyz[1].T.astype('<f4').tobytes()
+                html = (await client.read_resource('ui://mdclaw/molstar-probe.html')).contents[0].text
+                assert 'playback up to 60 fps' in html and 'buffering' in html
+with tempfile.TemporaryDirectory() as directory:
+    anyio.run(check, directory)
+PY_MOLSTAR
+
+# --- Python imports ---
+echo ""
+echo "[Python Imports]"
+check "openmm" python -c "import openmm; print(f'OpenMM {openmm.__version__}')"
+check "rdkit" python -c "from rdkit import Chem; print('RDKit OK')"
+check "parmed" python -c "import parmed; print(f'ParmEd {parmed.__version__}')"
+check "pdbfixer" python -c "from pdbfixer import PDBFixer; print('PDBFixer OK')"
+check "mdtraj" python -c "import mdtraj; print(f'MDTraj {mdtraj.__version__}')"
+check "MDAnalysis trajectory analysis" python -c "
+import numpy as np
+import MDAnalysis as mda
+from MDAnalysis.analysis.rms import rmsd
+from MDAnalysis.coordinates.memory import MemoryReader
+
+coordinates = np.asarray(
+    [
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+    ],
+    dtype=np.float32,
+)
+universe = mda.Universe.empty(2)
+universe.load_new(coordinates, format=MemoryReader)
+universe.trajectory[0]
+reference = universe.atoms.positions.copy()
+universe.trajectory[1]
+value = rmsd(reference, universe.atoms.positions)
+assert len(universe.trajectory) == 2
+assert np.isfinite(value) and value > 0
+print(f'MDAnalysis {mda.__version__}, RMSD {value}')
+"
+# An import alone cannot detect a missing Fortran executable. Exercise both
+# trajectory frames and the sph_process/sos_triangle visualization pipeline.
+check "HOLE trajectory radii and pore surface" python - <<'PY_HOLE'
+import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+import warnings
+
+import MDAnalysis as mda
+from MDAnalysis.coordinates.memory import MemoryReader
+import mdahole2
+from mdahole2.analysis import HoleAnalysis
+import numpy as np
+
+executables = {name: shutil.which(name) for name in ("hole", "sph_process", "sos_triangle")}
+assert all(executables.values()), executables
+# A dense cylindrical wall with a known carbon VDW radius (Å). The second
+# frame narrows the pore by 2 Å; no protein download or user trajectory needed.
+angles = np.arange(32) * (2 * np.pi / 32)
+z, theta = np.meshgrid(np.arange(-12.0, 12.1, 1.5), angles, indexing="ij")
+coordinates = np.array([
+    np.column_stack((radius * np.cos(theta.ravel()),
+                     radius * np.sin(theta.ravel()), z.ravel()))
+    for radius in (5.0, 3.0)
+], dtype=np.float32)
+n_atoms = coordinates.shape[1]
+u = mda.Universe.empty(n_atoms, n_residues=n_atoms,
+                       atom_resindex=np.arange(n_atoms), trajectory=True)
+for name, values in {
+    "names": ["CA"] * n_atoms, "types": ["C"] * n_atoms,
+    "elements": ["C"] * n_atoms, "resnames": ["ALA"] * n_atoms,
+    "resids": np.arange(1, n_atoms + 1),
+}.items():
+    u.add_TopologyAttr(name, values)
+u.load_new(coordinates, format=MemoryReader)
+old_cwd = Path.cwd()
+with tempfile.TemporaryDirectory(prefix="mdclaw-hole-") as directory:
+    try:
+        os.chdir(directory)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with HoleAnalysis(u, select="all", cpoint=[0, 0, 0], cvect=[0, 0, 1],
+                              sample=0.5, end_radius=6.0) as analysis:
+                analysis.run(random_seed=31415)
+                assert set(analysis.results.profiles) == {0, 1}
+                minima = []
+                for frame, expected in enumerate((3.15, 1.15)):
+                    profile = analysis.results.profiles[frame]
+                    assert len(profile) > 10
+                    assert np.isfinite(profile.radius).all()
+                    central = profile.radius[np.abs(profile.rxn_coord) < 8.0]
+                    assert len(central) > 10
+                    value = float(np.min(central))
+                    assert abs(value - expected) < 0.15, (frame, value, expected)
+                    minima.append(value)
+                surface = Path(analysis.create_vmd_surface("pore.vmd", dot_density=5))
+                assert surface.is_file() and surface.stat().st_size > 100
+        print(json.dumps({"MDAnalysis": mda.__version__, "mdahole2": mdahole2.__version__,
+                          "executables": executables, "minimum_radii_A": minima,
+                          "surface_bytes": surface.stat().st_size, "status": "passed"}))
+    finally:
+        os.chdir(old_cwd)
+PY_HOLE
+check "pdb2pqr" python -c "import pdb2pqr; print('pdb2pqr OK')"
+check "numpy" python -c "import numpy; print(f'NumPy {numpy.__version__}')"
+check "torch" python -c "import torch; print(f'PyTorch {torch.__version__}')"
+check "NVRTC runtime contract" python -c "
+import ctypes
+import os
+
+expected = os.environ.get('MDCLAW_CUDA_TOOLKIT_VERSION')
+major_version = expected.split('.')[0] if expected else None
+soname = 'libnvrtc.so.' + ('11.2' if major_version == '11' else major_version) if expected else 'libnvrtc.so'
+nvrtc = ctypes.CDLL(soname)
+major = ctypes.c_int()
+minor = ctypes.c_int()
+assert nvrtc.nvrtcVersion(ctypes.byref(major), ctypes.byref(minor)) == 0
+actual = f'{major.value}.{minor.value}'
+assert expected is None or actual == expected, (actual, expected)
+print(f'NVRTC {actual}')
+"
+check_declared MDCLAW_CUFFT_MIN_VERSION "cuFFT runtime contract" python -c "
+import ctypes
+import os
+import re
+import sys
+from pathlib import Path
+
+minimum = tuple(map(int, os.environ['MDCLAW_CUFFT_MIN_VERSION'].split('.')))
+files = list((Path(sys.prefix) / 'lib').glob('libcufft.so.12.*'))
+versions = []
+for path in files:
+    match = re.search(r'libcufft\.so\.(\d+(?:\.\d+)+)$', str(path))
+    if match:
+        versions.append(tuple(map(int, match.group(1).split('.'))))
+assert versions and max(versions) >= minimum, (files, versions, minimum)
+cufft = ctypes.CDLL('libcufft.so.12')
+api_version = ctypes.c_int()
+assert cufft.cufftGetVersion(ctypes.byref(api_version)) == 0
+assert api_version.value >= 12010, api_version.value
+print(f'cuFFT {max(versions)}, API={api_version.value}')
+"
+check_declared MDCLAW_MODELLER_VERSION "MODELLER installed" python -c "
+import importlib.util
+import os
+import re
+from pathlib import Path
+
+spec = importlib.util.find_spec('modeller')
+assert spec is not None, 'modeller package not importable'
+locations = list(spec.submodule_search_locations or [])
+assert locations, spec
+config = Path(locations[0]) / 'config.py'
+assert config.is_file(), config
+match = re.search(r\"install_dir\s*=\s*r?['\\\"]([^'\\\"]+)['\\\"]\", config.read_text())
+assert match, config.read_text()
+install_dir = Path(match.group(1))
+assert install_dir.is_dir(), install_dir
+expected = os.environ['MDCLAW_MODELLER_VERSION']
+assert expected in install_dir.name, (install_dir, expected)
+try:
+    import _modeller
+except ImportError as exc:
+    raise AssertionError(f'MODELLER extension will not load: {exc}') from exc
+print(f'MODELLER {expected} at {install_dir}, extension loads')
+"
+check_declared MDCLAW_FUSEFIX_LIB "cuFFT FUSE preload shim contract" python -c "
+import os
+from pathlib import Path
+
+shim = os.environ['MDCLAW_FUSEFIX_LIB']
+assert shim in os.environ.get('LD_PRELOAD', '').split(':')
+assert Path(shim).is_file()
+assert shim in Path('/proc/self/maps').read_text()
+print('cuFFT FUSE preload shim active')
+"
+
+check_declared MDCLAW_PLUMED_VERSION "PLUMED actual CPU energy and force" python -c "
+import json, os, sys
+from pathlib import Path
+import openmm as mm
+from openmmplumed import PlumedForce
+
+build = json.loads((Path(sys.prefix) / 'share/mdclaw/plumed-build.json').read_text())
+assert build['plumed'] == os.environ['MDCLAW_PLUMED_VERSION'], build
+assert build.get('plugin_patch') == 'box-pointer-lifetime-v1', build
+system = mm.System()
+system.addParticle(12)
+system.addParticle(12)
+force = PlumedForce('d: DISTANCE ATOMS=1,2 NOPBC\\nb: RESTRAINT ARG=d AT=1 KAPPA=100')
+system.addForce(force)
+context = mm.Context(system, mm.VerletIntegrator(0.002), mm.Platform.getPlatformByName('CPU'))
+context.setPositions([[0,0,0], [1.5,0,0]])
+state = context.getState(getEnergy=True, getForces=True)
+assert abs(state.getPotentialEnergy()._value - 12.5) < 1e-6
+assert abs(state.getForces()[1][0]._value + 50) < 1e-6
+del context
+system.setDefaultPeriodicBoxVectors([3,0,0], [0,3,0], [0,0,3])
+periodic = mm.CustomBondForce('0')
+periodic.setUsesPeriodicBoundaryConditions(True)
+periodic.addBond(0, 1, [])
+system.addForce(periodic)
+system.removeForce(0)
+system.addForce(PlumedForce('d: DISTANCE ATOMS=1,2\\nb: RESTRAINT ARG=d AT=1 KAPPA=100'))
+context = mm.Context(system, mm.VerletIntegrator(0.002), mm.Platform.getPlatformByName('CPU'))
+context.setPositions([[0,0,0], [4.5,0,0]])
+assert abs(context.getState(getEnergy=True).getPotentialEnergy()._value - 12.5) < 1e-6
+print('PLUMED CPU force and energy verified')
+"
+
+# --- AmberTools ---
+echo ""
+echo "[AmberTools]"
+check "tleap" bash -c "echo 'quit' | tleap -f -"
+check "antechamber" antechamber -h
+check "parmchk2" bash -c "command -v parmchk2"
+check_declared MDCLAW_PPM3_PATCHED "PPM3 (immers) rebuilt from patched source" python -c "
+import shutil
+import subprocess
+
+binary = shutil.which('immers')
+assert binary, 'immers not in PATH'
+blob = open(binary, 'rb').read()
+assert b\"f7.0,'+-'\" in blob, 'immers still carries the unpatched FORMAT descriptor'
+assert b\"f7.0'+-'\" not in blob, 'immers still carries the unpatched FORMAT descriptor'
+# No stdin: it dies at its first read, well before the FORMAT is reached, which
+# is enough to show the binary loads its libraries and reaches Fortran runtime.
+result = subprocess.run([binary], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+output = result.stdout + result.stderr
+assert 'Fortran runtime error: End of file' in output, output
+print(f'PPM3 {binary} patched and runnable')
+"
+
+# --gpu is the release gate: an absent or broken GPU must fail, not skip.
+echo ""
+echo "[GPU]"
+if $REQUIRE_GPU || python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    if python "$GPU_TEST" --require-torch-force; then
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: CUDA real-computation acceptance test"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo "  SKIP: GPU calculation (CPU-only check; use --gpu for acceptance)"
+fi
+
+# --- Summary ---
+echo ""
+echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ $FAIL -gt 0 ]; then
+    exit 1
+fi

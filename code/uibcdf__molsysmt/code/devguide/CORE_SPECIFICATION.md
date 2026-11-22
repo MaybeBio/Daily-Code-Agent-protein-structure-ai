@@ -1,0 +1,171 @@
+# MolSysMT Core Technical Specification (v1.0.0)
+
+This document defines the maintained architectural invariants, object models,
+and core data structures of MolSysMT. Current code and executable tests remain
+the implementation evidence for these rules.
+
+---
+
+## 1. High-Level Layout
+The MolSysMT codebase is organized to separate high-level user verbs from low-level performance kernels and form-specific adapters.
+
+```
+molsysmt/
+  basic/           # Universal Public API (get, set, convert, select, view, info)
+  form/            # Adapters for 60+ external forms and files (Lazy Loading)
+  native/          # Tier 1 Native Objects (MolSys, Topology, Structures)
+  lib/             # Compatibility facade for native Rust kernels
+  build/           # System Construction, Repair, and Mutagenesis
+  structure/       # Geometric and conformational analysis
+  topology/        # Stable inventory and sequence analysis
+  chemical_states/ # State-dependent connectivity, components and graph analysis
+  physchem/        # Physicochemical property calculators
+  pbc/             # Periodic Boundary Condition management
+  interactions/    # Chemically classified interaction analyses by family
+  hbonds/          # Compatibility path for hydrogen-bond analysis
+  third_party/     # Optional bridges to external engines (OpenMM, MDAnalysis)
+  element/         # Canonical chemical knowledge and element-level helpers
+  data/databases/  # Serialized topology templates and residue libraries
+```
+
+---
+
+## 2. Independent Native Domains
+`MolSys` coordinates independently optional `Topology`, `ChemicalStates`,
+`Structures` and named `Interactions` domains. `MolecularMechanics` remains an
+experimental domain with typed H5MSM 1.0 persistence. Explicit 0.5 output
+retains its mechanics-free contract.
+
+### 2.1 `molsysmt.native.MolSys`
+The top-level orchestrator synchronizes the domains actually supplied.
+- **Invariants:** Present domains with declared atom axes agree in cardinality;
+  missing domains remain absent. Equality of counts is a shape check, not proof
+  of molecular identity. Correspondence is declared by construction or mapping.
+- **Coordinated Operations:** Extraction/removal/permutation apply shared maps to
+  every represented dependent domain, preserving state associations and analyses.
+
+### 2.2 `molsysmt.native.Topology`
+The stable inventory manages atom identities and represented hierarchy. It owns
+no chemical states, bonds or components, including when attached to MolSys.
+- **Data Model:** Powered by specialized Pandas DataFrames (`Atoms_DataFrame`, `Groups_DataFrame`, etc.).
+- **String ID Invariant:** All element IDs (`atom_id`, `group_id`, `molecule_id`, `chain_id`, `entity_id`) are stored as **strings** to ensure cross-format compatibility.
+- **Orthogonal Hierarchies:** MolSysMT does not use a single linear hierarchy. It uses three specialized branches:
+    1. **Semantic (Biological):** `Atom` $\subset$ `Group` $\rightarrow$ `Molecule` $\rightarrow$ `Entity`.
+    2. **Represented chains:** ordered group memberships and/or atom chain indices.
+    3. **Group-free molecules:** optional atom-aligned stable molecule membership;
+       grouped atoms instead inherit their group's molecule. Neither reads chemistry.
+
+### 2.3 `molsysmt.native.Structures`
+The dynamic payload of the system. It manages time-dependent geometric and physical data.
+- **Attributes:** Structure IDs, coordinates, velocities, box vectors, time,
+  energies, temperature, B-factors, occupancy, alternate locations, and
+  bioassembly metadata where available.
+- **Centralized Logic:** `Structures` centralizes all low-level property access via methods (`get_coordinates`, `set_coordinates`, etc.).
+- **Geometry-edit alignment:** A full/selected box assignment supplies one cell per
+  addressed structure; a single cell is not implicitly broadcast. The native
+  publication boundary checks all stored structural series before mutation,
+  independently of owner/analysis presence. Invalid cardinality preserves
+  geometry and named-analysis coverage. Constructors stage a complete new
+  payload and validate it separately. Coordinate replacement also preserves
+  the structure and atom axes shared with other stored series.
+  An attached coordinate edit also preserves the MolSys atom domain. A first
+  series may define an undeclared atom axis. Full None clearing retains the
+  other declared series/inventory, and typed native methods validate units.
+
+### 2.4 `molsysmt.ChemicalStates`
+The collection owns state-local bonds, atom assignments and components on a
+shared atom-index axis. A standalone collection begins with zero states; ordinary
+MolSys/Builder construction creates one explicitly unknown working state.
+Absent chemistry, zero states, unknown connectivity and complete edge-free
+connectivity are different conditions. State selection does not mutate the
+reference or implicitly assign states to structures.
+
+Graph tools live in `molsysmt.chemical_states`. Sequence alignment/identity and
+stable represented chains remain in `molsysmt.topology`. Component reconstruction
+uses stored edges and participation declarations; optional stable context labels
+components without redefining molecules. Controlled edits stage changes and
+interaction invalidation before publication. Live pandas tables are not a
+validated editing boundary. See [native queries](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/native_queries.md).
+
+### 2.5 `molsysmt.MolSysBuilder`
+Editable staging requires a stable Topology domain. Creating a builder from
+a system without structures creates an empty Structures staging container,
+without coordinates or observations. Absent chemical information stays absent;
+a zero-state collection stays empty. Chemical queries and bond edits require a
+declared, resolvable state rather than synthesizing chemistry. Existing state
+labels, reference selection and preparation history survive staging/building.
+The builder stores no named interactions or molecular-mechanics domain.
+
+---
+
+## 3. Data Standards & Invariants
+
+### 3.1 Numeric Tensors
+- **Coordinates:** NumPy arrays with shape `(n_structures, n_atoms, 3)`.
+- **Simulation Box:** NumPy arrays with shape `(n_structures, 3, 3)`.
+- **Precision:** Native coordinates and box vectors are stored as `float64`.
+  Native CPU working arrays and Rust arithmetic use `float64`. A single-precision
+  request is diagnosed without downcasting working coordinates. Methods that
+  explicitly implement single-coordinate publication retain that final lossy
+  quantization; native containers still store those values as `float64`.
+
+### 3.2 Standard Units
+MolSysMT enforces physical integrity via `molsysmt.pyunitwizard`.
+- **Lengths:** Nanometers (nm).
+- **Time:** Picoseconds (ps).
+- **Energy:** kJ/mol.
+- **Temperature:** Kelvin (K).
+
+### 3.3 The "Group" Mandate
+MolSysMT uses **"Group"** as the universal term for the first level of atomic aggregation. The term "Residue" is reserved strictly for amino acids and nucleotides in biological contexts. Calling a water molecule or an ion a "residue" is considered a topological error in MolSysMT.
+
+---
+
+## 4. Rebuild & Inference Logic
+MolSysMT distinguishes between two layers:
+1. **Public Element Layer (`molsysmt.element`):** Form-agnostic query helpers using dispatch and `get()`.
+2. **Native Rebuild Layer (`molsysmt.native`):** Internal reconstruction of higher-order structures (molecules, entities) using graph logic over native tables.
+
+### 4.1 Component vs Molecule: Orthogonal Concepts
+In MolSysMT, `component` and `molecule` are distinct and orthogonal concepts.
+- **Component:** A selected state's stored graph partition under its declared
+  bond participation and completeness; owned by ChemicalStates.
+- **Molecule:** A stable declared unit in Topology, represented through group
+  ownership and/or explicit atom-aligned membership for group-free atoms.
+  Group/chain inference is a construction or explicit rebuild policy, not a
+  continuously recomputed consequence of chemical-state connectivity.
+
+**Rule:** Participating stored bonds may place several stable molecules in one
+component. A stored coordination bond contributes to that partition only when
+the selected state's participation policy includes that edge. Later graph edits do not implicitly
+change declared molecule membership.
+
+### 4.2 Molecule Inference Algorithm
+When group-based inference is requested, `native/_topology_infer.py` partitions
+represented groups using their types and chain membership:
+- **Polymer types** (`amino acid`, `nucleotide`, etc.) extend the current molecule.
+- **Standalone types** (`ion`, `water`, `small molecule`) each start their own molecule.
+
+### 4.3 Canonical Fallback Rules
+- `entity_index` is inferred from molecules (molecules with the same name and type map to the same entity).
+- Water molecules are always collapsed into a single entity.
+- Native rebuild must **never** depend on public dispatchers (`msm.get`, `msm.select`).
+- A producer/builder may initially materialize a selected component partition as
+  stable molecule membership when no better declaration exists. Subsequent graph
+  edits never update that stable membership implicitly.
+
+---
+
+## 5. Persistence & Observability
+- **H5MSM:** The canonical high-performance file format for MolSysMT systems.
+  New files use modular root version 1.0 defined in
+  [h5msm_format.md](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/h5msm_format.md). Versions 0.3/0.4 remain deprecated readable
+  inputs with explicit migration. Topology layers 1/2 remain readable; layer 3
+  carries optional stable group-free molecule membership.
+- **Dictionary transport:** TopologyDict/MolSysDict writers use schema 0.2 with
+  explicit independent domains and typed array/quantity transport. Readers retain
+  the separate 0.1 interpretation. Unsupported extensions/metadata are refused
+  rather than omitted. Nonempty MolecularMechanics remains outside this schema.
+- **SMonitor:** Public and failure-prone boundaries use the structured diagnostic
+  catalog. Functions should remain silent on success unless telemetry is part of
+  their documented contract; direct `print` calls are not a diagnostic channel.

@@ -1,0 +1,751 @@
+//! Code related to saving user *preferences*. e.g. opened molecules, view configuration etc.
+//!
+//! todo: Get away from bincode. Divide into packets, so perhaps there is some breaking for
+//! todo individual packet changes, but teh whole thing can't get broken by a small change to
+//! todo the format.
+
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    io,
+    path::{Path, PathBuf},
+};
+
+use bio_apis::{
+    pubchem,
+    rcsb::{FilesAvailable, PdbDataResults},
+};
+use chrono::{DateTime, Utc};
+use dynamics::MdConfig;
+use graphics::{AmbientOcclusion, ControlScheme, GraphicsSettings};
+use lin_alg::f64::{Quaternion, Vec3};
+
+mod file_format;
+
+use mol_defs::{
+    molecules::{MolIdent, MolType, common::MoleculeCommon, peptide::MoleculePeptide},
+    sfc_mesh::MeshColoring,
+};
+
+use crate::{
+    cam::{VIEW_DEPTH_DEFAULT, VIEW_DEPTH_NEAR_MIN},
+    docking::DockingSite,
+    drawing::MoleculeView,
+    inputs::{MOVEMENT_SENS, ROTATE_SENS, SENS_MOL_MOVE_SCROLL},
+    md::MdBackend,
+    selection::{Selection, ViewSelLevel},
+    state::{
+        CamSnapshot, DistFilter, LabelSizes, LipidUi, MsaaSetting, NucleicAcidUi, ResColoring,
+        State, UiVisibility, Visibility,
+    },
+};
+
+pub const DEFAULT_PREFS_FILE: &str = "molchanica_prefs.mca";
+pub const DEFAULT_FLOOR_GRID_SPACING: u8 = 5;
+
+// Dirty preferences are written at this interval. UI interactions and asynchronous
+// state updates set ToSave::save_flag instead of cloning and comparing the full state.
+pub const PREFS_SAVE_INTERVAL: u64 = 20; // seconds
+
+#[macro_export]
+macro_rules! parse_le {
+    ($bytes:expr, $t:ty, $range:expr) => {{ <$t>::from_le_bytes($bytes[$range].try_into().unwrap()) }};
+}
+
+#[macro_export]
+macro_rules! copy_le {
+    ($dest:expr, $src:expr, $range:expr) => {{ $dest[$range].copy_from_slice(&$src.to_le_bytes()) }};
+}
+
+/// Used to sequence how we handle each file type.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum OpenType {
+    Peptide,
+    Ligand,
+    NucleicAcid,
+    Lipid,
+    Pocket,
+    Map,
+    Frcmod,
+    Trajectory,
+    MdParams,
+    ParquetDb,
+    MdMols,
+    /// DNA, RNA, or protein sequences, e.g. FASTA or GenBank. One file may hold several.
+    Sequence,
+}
+
+impl Display for OpenType {
+    /// Note: These are sometimes truncated for display purposes, to save UI space.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let v = match self {
+            Self::Peptide => "Peptide",
+            Self::Ligand => "Small mol",
+            Self::NucleicAcid => "Nucleic Acid",
+            Self::Lipid => "Lipid",
+            Self::Pocket => "Pocket",
+            Self::Map => "Density map",
+            Self::Frcmod => "Frcmod",
+            Self::Trajectory => "MD Traj",
+            Self::MdParams => "MD Params",
+            Self::ParquetDb => "Parquet DB",
+            Self::MdMols => "MD Mols",
+            Self::Sequence => "Seq",
+        };
+        write!(f, "{v}")
+    }
+}
+
+impl From<MolType> for OpenType {
+    fn from(v: MolType) -> Self {
+        use MolType::*;
+
+        match v {
+            Peptide => Self::Peptide,
+            Ligand => Self::Ligand,
+            NucleicAcid => Self::NucleicAcid,
+            Lipid => Self::Lipid,
+            Pocket => Self::Pocket,
+            Water => unimplemented!(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenHistory {
+    pub timestamp: DateTime<Utc>,
+    pub path: PathBuf,
+    pub type_: OpenType,
+    pub ident: Option<String>,
+    /// Only applicable for molecules and similar. A single central position.
+    /// todo: We may wish to add per-atom positions later.
+    pub position: Option<Vec3>,
+    /// Only applicable for molecules and similar. The rigid rotation, about the centroid, from
+    /// the file's coordinates to the molecule's current ones.
+    pub orientation: Option<Quaternion>,
+    /// For determining which to open at program start.
+    pub last_session: bool,
+}
+
+impl OpenHistory {
+    // pub fn new(path: &Path, type_: OpenType, position: Option<Vec3>) -> Self {
+    pub fn new(path: &Path, type_: OpenType, ident: Option<String>) -> Self {
+        Self {
+            timestamp: Utc::now(),
+            path: path.to_owned(),
+            ident,
+            type_,
+            orientation: None,
+            position: None,
+            last_session: true,
+        }
+    }
+}
+
+/// The rigid rotation, about the centroid, that best maps a molecule's file (internal) atom
+/// positions onto its current ones. None if it can't be determined, e.g. for fewer than three
+/// atoms, or collinear ones.
+fn mol_orientation(mol: &MoleculeCommon) -> Option<Quaternion> {
+    let local: Vec<Vec3> = mol.atoms.iter().map(|a| a.posit).collect();
+    crate::protein_alignment::fit_rotation(&mol.atom_posits, &local).ok()
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ControlSchemeType {
+    Free,
+    Arc,
+}
+
+impl ControlSchemeType {
+    /// I.e. without a default Arc center.
+    pub fn to_scheme_default(self) -> ControlScheme {
+        match self {
+            Self::Free => ControlScheme::FreeCamera,
+            Self::Arc => ControlScheme::Arc {
+                center: lin_alg::f32::Vec3::new_zero(),
+            },
+        }
+    }
+}
+#[derive(Clone, PartialEq)]
+pub struct Graphics {
+    pub msaa: MsaaSetting,
+    /// Set once the user picks an MSAA setting. Until then, `msaa` follows the GPU: none on
+    /// integrated GPUs, whose render targets live in system RAM. See `render::apply_msaa_gpu_default`.
+    pub msaa_user_set: bool,
+    pub ambient_occlusion: AmbientOcclusion,
+    /// World-space radius of the ambient-occlusion sample hemisphere, in Å. Larger values
+    /// shade broader hollows; smaller ones pick out only tight crevices.
+    pub ssao_radius: f32,
+    pub edge_cueing: Option<f32>,
+    pub depth_aware_halos: Option<f32>,
+    /// How much direct light a fully covered floor shadow blocks.
+    pub floor_shadow_strength: f32,
+}
+
+impl Default for Graphics {
+    fn default() -> Self {
+        Self {
+            msaa: Default::default(),
+            msaa_user_set: false,
+            ambient_occlusion: Default::default(),
+            // The `graphics` radius default is for unit-scale objects. Here, we
+            // use a larger scale. We use something that wouldn't be appropriate for realistic scenes
+            // of this scale, but make sense for molecule visualization / contrast. This is useful for
+            // darkening the inside of proteins.
+            // A larger SSAO radius can darken the interior of proteins, but it seems only to a
+            // point. And a larger one shows the blurry/grimy(?) effect more prominently when zoomed in.
+            ssao_radius: 10.0,
+            edge_cueing: Some(1.),
+            depth_aware_halos: Some(0.03),
+            floor_shadow_strength: 0.85,
+        }
+    }
+}
+
+impl Graphics {
+    /// The engine-side view of these settings.
+    ///
+    /// This struct is the single source of truth for every graphics setting it covers: `State`'s
+    /// initial value and the application of loaded prefs both go through here, so there's nowhere
+    /// for a second, stale set of defaults to hide. Fields the prefs don't cover keep
+    /// `GraphicsSettings`' own defaults.
+    pub fn to_engine(&self) -> GraphicsSettings {
+        GraphicsSettings {
+            msaa_samples: self.msaa as u32,
+            ambient_occlusion: self.ambient_occlusion,
+            ssao_radius: self.ssao_radius,
+            edge_cueing: self.edge_cueing,
+            depth_aware_halos: self.depth_aware_halos,
+            // The contour lines have a surprising effect, and I'm not sure what the intended
+            // one is:
+            // depth_revealing_contour_lines: Some(0.1),
+            // intersection_revealing_contour_lines: Some(1.),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub struct ControlSettings {
+    /// Direct conversion from engine standard
+    pub movement_speed: u8,
+    /// Divide this by 100 to get engine standard.
+    pub rotation_sens: u8,
+    pub mol_move_sens: u8,
+}
+
+impl Default for ControlSettings {
+    fn default() -> Self {
+        Self {
+            movement_speed: MOVEMENT_SENS as u8,
+            rotation_sens: (ROTATE_SENS * 100.) as u8,
+            mol_move_sens: (SENS_MOL_MOVE_SCROLL * 1_000.) as u8,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub struct MdPrefs {
+    pub config: MdConfig,
+    pub num_steps: u32,
+    pub dt: f32,
+    pub backend: MdBackend,
+    /// GB. Trajectories larger than this load with a frame step after runs, and when opening them.
+    pub max_traj_auto_load_gb: f32,
+    /// MB. Approximate Quick Traj download size, structure included. Sets how many frames it gets.
+    pub quick_traj_target_mb: u32,
+    /// 0 to 100. How Quick Traj spends its frames: 0 takes consecutive frames from the start,
+    /// for smooth motion; 100 spreads them over the whole simulation, for the broadest sampling.
+    /// Nonlinear; see `mdposit::FramePlan::new`.
+    pub quick_traj_span: u8,
+}
+
+impl Default for MdPrefs {
+    fn default() -> Self {
+        Self {
+            config: Default::default(),
+            num_steps: 100,
+            dt: 0.002,
+            backend: Default::default(),
+            max_traj_auto_load_gb: crate::md::trajectory::MAX_AUTO_LOAD_GB_DEFAULT,
+            quick_traj_target_mb: crate::md::mdposit::QUICK_TARGET_MB_DEFAULT,
+            quick_traj_span: crate::md::mdposit::QUICK_SPAN_DEFAULT,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub struct UiPrefs {
+    pub selection: Selection,
+    pub cam_snapshots: Vec<CamSnapshot>,
+    pub mol_view: MoleculeView,
+    pub mol_view_peptide: MoleculeView,
+    pub view_sel_level: ViewSelLevel,
+    pub visibility: Visibility,
+    pub ui_visibility: UiVisibility,
+    pub dist_filter: DistFilter,
+    pub nearby_dist_thresh: u16,
+    pub label_sizes: LabelSizes,
+    pub floor_visible: bool,
+    /// Å between floor grid lines.
+    pub floor_grid_spacing: u8,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            selection: Default::default(),
+            cam_snapshots: Default::default(),
+            mol_view: MoleculeView::DEFAULT_NON_PEPTIDE,
+            mol_view_peptide: MoleculeView::default(),
+            view_sel_level: Default::default(),
+            dist_filter: Default::default(),
+            // Matches the `State` default. (0 would hide everything once a filter is set)
+            nearby_dist_thresh: 15,
+            visibility: Default::default(),
+            ui_visibility: Default::default(),
+            label_sizes: Default::default(),
+            floor_visible: false,
+            floor_grid_spacing: DEFAULT_FLOOR_GRID_SPACING,
+        }
+    }
+}
+
+/// We maintain some of the state that is saved in the preferences file here, to keep
+/// the save/load state streamlined, instead of in an intermediate struct between main state, and
+/// saving/loading.
+///
+/// Note that this contains things which often fit cleanly in other state structs like `StateUi`,
+/// but are here due to our save mechanic.
+#[derive(Clone, PartialEq)]
+pub struct ToSave {
+    pub command_macros: Vec<crate::cli::scripts::CommandMacro>,
+    pub inspection: crate::inspection::Inspection,
+    pub named_selections: Vec<crate::selection::expression::NamedSelection>,
+    pub representations: Vec<crate::drawing::representations::Representation>,
+    pub hidden_default_objects: Vec<String>,
+    pub per_mol: HashMap<String, PerMolToSave>,
+    pub open_history: Vec<OpenHistory>,
+    pub recent_md_runs: Vec<PathBuf>,
+    pub control_scheme: ControlSchemeType,
+    pub graphics: Graphics,
+    pub control_settings: ControlSettings,
+    /// Solvent-accessible surface (and dots) precision. Lower is higher precision. A value of 0.5 - 0.6
+    /// is a good default. Too low will cause crashes and very poor performance. Higher is too coarse.
+    pub sa_surface_precision: f32,
+    pub md: MdPrefs,
+    pub ui_prefs: UiPrefs,
+    pub ph: f32,
+    pub pubchem_properties_map: HashMap<MolIdent, pubchem::Properties>,
+    /// We use this to mark that we should perform a save, even if one
+    /// of the fields here didn't change. E.g. after moving a molecule.
+    /// This is caught during our periodic check for changes in this struct.
+    pub save_flag: bool,
+    pub lipid: LipidUi,
+    pub nucleic_acid: NucleicAcidUi,
+    pub mesh_coloring: MeshColoring,
+    pub depth_mode: DepthMode,
+    /// Last manual values to restore after selecting Auto or Disabled.
+    manual_depth_cache: (u16, u16),
+    /// Display scale of the 2D molecule diagrams in the reaction popups. 1.0 is the default size.
+    pub reaction_diagram_scale: f32,
+    /// Show GHS hazard pictograms and summaries in the synthesis reaction library.
+    pub synthesis_show_safety: bool,
+    /// Where the protein design tools run.
+    pub compute_target: crate::external_tools::remote::ComputeTarget,
+    pub quantum_compute_target: crate::external_tools::remote::ComputeTarget,
+    /// For remote runs. Empty runs them anonymously.
+    pub athanor_api_token: String,
+}
+
+impl Default for ToSave {
+    fn default() -> Self {
+        Self {
+            command_macros: Vec::new(),
+            named_selections: Vec::new(),
+            inspection: Default::default(),
+            representations: Vec::new(),
+            hidden_default_objects: Vec::new(),
+            per_mol: Default::default(),
+            open_history: Default::default(),
+            recent_md_runs: Vec::new(),
+            control_scheme: ControlSchemeType::Free,
+            graphics: Default::default(),
+            control_settings: Default::default(),
+            // We override this based on protein atom count.
+            sa_surface_precision: 0.55,
+            md: Default::default(),
+            ui_prefs: Default::default(),
+            ph: 7.4,
+            pubchem_properties_map: Default::default(),
+            save_flag: false,
+            lipid: Default::default(),
+            nucleic_acid: Default::default(),
+            mesh_coloring: Default::default(),
+            depth_mode: DepthMode::default(),
+            manual_depth_cache: (VIEW_DEPTH_NEAR_MIN, VIEW_DEPTH_DEFAULT),
+            reaction_diagram_scale: 1.0,
+            synthesis_show_safety: false,
+            compute_target: Default::default(),
+            quantum_compute_target: Default::default(),
+            athanor_api_token: String::new(),
+        }
+    }
+}
+
+impl ToSave {
+    pub fn select_depth_mode(&mut self, mode: DepthMode) {
+        if let DepthMode::Manual(depth) = self.depth_mode {
+            self.manual_depth_cache = depth;
+        }
+
+        self.depth_mode = match mode {
+            DepthMode::Manual(_) => DepthMode::Manual(self.manual_depth_cache),
+            mode => mode,
+        };
+    }
+
+    fn manual_depth(&self) -> (u16, u16) {
+        match self.depth_mode {
+            DepthMode::Manual(depth) => depth,
+            _ => self.manual_depth_cache,
+        }
+    }
+}
+
+/// Camera clipping and distance fading. Manual distances are in tenths of an Å
+/// for the near plane and Å for the far fade center.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DepthMode {
+    #[default]
+    Disabled,
+    Auto,
+    Manual((u16, u16)),
+}
+
+/// Generally, data here only applies if a protein is present.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerMolToSave {
+    chain_vis: Vec<bool>,
+    pub docking_site: DockingSite,
+    show_docking_tools: bool,
+    res_coloring: ResColoring,
+    aatom_color_by_charge: bool,
+    show_aa_seq: bool,
+    rcsb_data: Option<PdbDataResults>,
+    rcsb_files_avail: Option<FilesAvailable>,
+    docking_site_posit: Vec3,
+    /// This is useful in the case of absolute positions. Ideally, this is per-ligand.
+    /// todo: This needs a rework with your generalizations.
+    lig_atom_positions: Vec<Vec3>,
+}
+
+impl PerMolToSave {
+    pub fn from_state(state: &State, mol: &MoleculePeptide) -> Self {
+        let chain_vis = mol.chains.iter().map(|c| c.visible).collect();
+        let rcsb_data = mol.rcsb_data.clone();
+        let rcsb_files_avail = mol.rcsb_files_avail.clone();
+
+        let docking_site = Default::default();
+
+        let lig_posit = Vec3::new_zero();
+        let lig_atom_positions = Vec::new();
+
+        // todo: Hmm. No longer needed? Never worked?
+        // if let Some(mol) = state.active_mol() {
+        //     // Don't save this if on init; the data in lig is the default,
+        //     // and we haven't loaded the posits to it yet.
+        //     // todo: If you find a more robust way to handle saving order-dependent data,
+        //     // todo: remove this.
+        //     if !on_init {
+        //         lig_atom_positions = mol.common().atom_posits.clone();
+        //         if !mol.common().atom_posits.is_empty() {
+        //             println!("\nSaving atom posits: {:?}", mol.common().atom_posits[0]); // todo temp
+        //         }
+        //     }
+        // }
+
+        Self {
+            chain_vis,
+            // metadata,
+            docking_site,
+            show_docking_tools: state.ui.show_docking_tools,
+            res_coloring: state.ui.res_coloring,
+            aatom_color_by_charge: state.ui.atom_color_by_charge,
+            show_aa_seq: state.ui.ui_vis.aa_seq,
+            rcsb_data,
+            rcsb_files_avail,
+            docking_site_posit: lig_posit,
+            lig_atom_positions,
+        }
+    }
+
+    // Hand-rolled (de)serialization, inline with the `copy_le!` / `parse_le!` macros. Defined here,
+    // rather than in `prefs_file_format`, so it can access this struct's private fields. The
+    // deeply-nested external types (`PdbDataResults`, `FilesAvailable`, `Vec3`) are stored as
+    // length-prefixed bincode blobs; everything else is hand-rolled.
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        out.extend_from_slice(&(self.chain_vis.len() as u32).to_le_bytes());
+        for v in &self.chain_vis {
+            out.push(*v as u8);
+        }
+
+        // Removed field; slot kept so existing files parse.
+        out.push(0);
+
+        let ds = self.docking_site.to_bytes();
+        out.extend_from_slice(&(ds.len() as u32).to_le_bytes());
+        out.extend_from_slice(&ds);
+
+        out.push(self.show_docking_tools as u8);
+        out.push(self.res_coloring.to_u8());
+        out.push(self.aatom_color_by_charge as u8);
+        out.push(self.show_aa_seq as u8);
+
+        match &self.rcsb_data {
+            Some(x) => {
+                out.push(1);
+                let b = bincode::encode_to_vec(x, bincode::config::standard()).unwrap_or_default();
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(&b);
+            }
+            None => out.push(0),
+        }
+        match &self.rcsb_files_avail {
+            Some(x) => {
+                out.push(1);
+                let b = bincode::encode_to_vec(x, bincode::config::standard()).unwrap_or_default();
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(&b);
+            }
+            None => out.push(0),
+        }
+
+        let c = bincode::encode_to_vec(&self.docking_site_posit, bincode::config::standard())
+            .unwrap_or_default();
+        out.extend_from_slice(&(c.len() as u32).to_le_bytes());
+        out.extend_from_slice(&c);
+        let l = bincode::encode_to_vec(&self.lig_atom_positions, bincode::config::standard())
+            .unwrap_or_default();
+        out.extend_from_slice(&(l.len() as u32).to_le_bytes());
+        out.extend_from_slice(&l);
+
+        out
+    }
+
+    #[allow(unused_assignments)]
+    pub(crate) fn from_bytes(data: &[u8]) -> io::Result<Self> {
+        let mut i = 0;
+
+        let n = parse_le!(data, u32, i..i + 4) as usize;
+        i += 4;
+        let mut chain_vis = Vec::with_capacity(n);
+        for _ in 0..n {
+            chain_vis.push(data[i] != 0);
+            i += 1;
+        }
+
+        // Removed field: A flag, then a u64 if set.
+        if data[i] != 0 {
+            i += 8;
+        }
+        i += 1;
+
+        let len = parse_le!(data, u32, i..i + 4) as usize;
+        i += 4;
+        let docking_site = DockingSite::from_bytes(&data[i..i + len])?;
+        i += len;
+
+        let show_docking_tools = data[i] != 0;
+        i += 1;
+        let res_coloring = ResColoring::from_u8(data[i]);
+        i += 1;
+        let aatom_color_by_charge = data[i] != 0;
+        i += 1;
+        let show_aa_seq = data[i] != 0;
+        i += 1;
+
+        let has = data[i] != 0;
+        i += 1;
+        let rcsb_data = if has {
+            let len = parse_le!(data, u32, i..i + 4) as usize;
+            i += 4;
+            let v = bincode::decode_from_slice(&data[i..i + len], bincode::config::standard())
+                .unwrap()
+                .0;
+            i += len;
+            Some(v)
+        } else {
+            None
+        };
+        let has = data[i] != 0;
+        i += 1;
+        let rcsb_files_avail = if has {
+            let len = parse_le!(data, u32, i..i + 4) as usize;
+            i += 4;
+            let v = bincode::decode_from_slice(&data[i..i + len], bincode::config::standard())
+                .unwrap()
+                .0;
+            i += len;
+            Some(v)
+        } else {
+            None
+        };
+
+        let len = parse_le!(data, u32, i..i + 4) as usize;
+        i += 4;
+        let docking_site_posit =
+            bincode::decode_from_slice(&data[i..i + len], bincode::config::standard())
+                .unwrap()
+                .0;
+        i += len;
+        let len = parse_le!(data, u32, i..i + 4) as usize;
+        i += 4;
+        let lig_atom_positions =
+            bincode::decode_from_slice(&data[i..i + len], bincode::config::standard())
+                .unwrap()
+                .0;
+
+        Ok(Self {
+            chain_vis,
+            docking_site,
+            show_docking_tools,
+            res_coloring,
+            aatom_color_by_charge,
+            show_aa_seq,
+            rcsb_data,
+            rcsb_files_avail,
+            docking_site_posit,
+            lig_atom_positions,
+        })
+    }
+}
+
+impl State {
+    /// We run this after loading a molecule.
+    pub fn update_save_prefs_no_mol(&mut self) {
+        self.to_save.save_flag = false;
+        if let Err(e) = self
+            .to_save
+            .save(&self.volatile.prefs_dir.join(DEFAULT_PREFS_FILE))
+        {
+            self.to_save.save_flag = true;
+            eprintln!("Error saving state: {e:?}");
+        }
+    }
+
+    /// Update when prefs change, periodically etc.
+    /// todo: See the note in PerMolsave::from_state. Workaround for order-related bugs.
+    pub fn update_save_prefs(&mut self) {
+        println!("Saving state to prefs file");
+
+        // Sync molecule positions.
+        let mols = self
+            .ligands
+            .iter()
+            .map(|m| &m.common)
+            .chain(self.peptides.iter().map(|m| &m.common))
+            .chain(self.pockets.iter().map(|m| &m.common))
+            .chain(self.nucleic_acids.iter().map(|m| &m.common))
+            .chain(self.lipids.iter().map(|m| &m.common));
+
+        for mol in mols {
+            for oh in &mut self.to_save.open_history {
+                if let Some(p) = &mol.path
+                    && &oh.path == p
+                {
+                    oh.position = Some(mol.centroid());
+                    oh.orientation = mol_orientation(mol);
+                }
+            }
+        }
+
+        for mol in &self.peptides {
+            let data = PerMolToSave::from_state(self, mol);
+            self.to_save.per_mol.insert(mol.common.ident.clone(), data);
+        }
+
+        self.to_save.ui_prefs.selection = self.ui.selection.clone();
+        self.to_save.ui_prefs.cam_snapshots = self.cam_snapshots.clone();
+        self.to_save.ui_prefs.mol_view = self.ui.mol_view.non_peptide_or_default();
+        self.to_save.ui_prefs.mol_view_peptide = self.ui.mol_view_peptide;
+        self.to_save.ui_prefs.view_sel_level = self.ui.view_sel_level;
+        self.to_save.ui_prefs.dist_filter = self.ui.dist_filter;
+        self.to_save.ui_prefs.nearby_dist_thresh = self.ui.nearby_dist_thresh;
+        self.to_save.ui_prefs.visibility = self.ui.visibility.clone();
+        self.to_save.ui_prefs.ui_visibility = self.ui.ui_vis.clone();
+        self.to_save.ui_prefs.label_sizes = self.ui.label_sizes.clone();
+        self.to_save.mesh_coloring = self.ui.mesh_coloring;
+        self.to_save.save_flag = false;
+
+        if let Err(e) = self
+            .to_save
+            .save(&self.volatile.prefs_dir.join(DEFAULT_PREFS_FILE))
+        {
+            self.to_save.save_flag = true;
+            eprintln!("Error saving state: {e:?}");
+        }
+    }
+
+    /// Run this when prefs, or a new molecule are loaded.
+    pub fn update_from_prefs(&mut self) {
+        self.ui.inspection.colors = self.to_save.inspection.colors.clone();
+        self.ui.inspection.charge_palette = self.to_save.inspection.charge_palette;
+        self.ui.inspection.solid_colors = self.to_save.inspection.solid_colors.clone();
+        println!("Updating state from prefs data");
+        self.reset_selections();
+
+        for mol in &mut self.peptides {
+            let Some(data) = self.to_save.per_mol.get(&mol.common.ident).cloned() else {
+                continue;
+            };
+
+            self.ui.show_docking_tools = data.show_docking_tools;
+            self.ui.res_coloring = data.res_coloring;
+            self.ui.atom_color_by_charge = data.aatom_color_by_charge;
+            self.ui.ui_vis.aa_seq = data.show_aa_seq;
+
+            for (i, chain) in mol.chains.iter_mut().enumerate() {
+                if i < data.chain_vis.len() {
+                    chain.visible = data.chain_vis[i];
+                }
+            }
+
+            mol.rcsb_data = data.rcsb_data;
+            mol.rcsb_files_avail = data.rcsb_files_avail;
+        }
+
+        self.ui.selection = self.to_save.ui_prefs.selection.clone();
+        self.cam_snapshots = self.to_save.ui_prefs.cam_snapshots.clone();
+        self.ui.mol_view = self.to_save.ui_prefs.mol_view.non_peptide_or_default();
+        self.ui.mol_view_peptide = self.to_save.ui_prefs.mol_view_peptide;
+        self.ui.view_sel_level = self.to_save.ui_prefs.view_sel_level;
+        self.ui.dist_filter = self.to_save.ui_prefs.dist_filter;
+        self.ui.nearby_dist_thresh = self.to_save.ui_prefs.nearby_dist_thresh;
+        self.ui.visibility = self.to_save.ui_prefs.visibility.clone();
+        self.ui.ui_vis = self.to_save.ui_prefs.ui_visibility.clone();
+        self.ui.label_sizes = self.to_save.ui_prefs.label_sizes.clone();
+
+        self.ui.mesh_coloring = self.to_save.mesh_coloring;
+    }
+
+    pub fn load_prefs(&mut self) {
+        match ToSave::load(&self.volatile.prefs_dir.join(DEFAULT_PREFS_FILE)) {
+            Ok(mut p) => {
+                p.save_flag = false;
+                self.to_save = p;
+
+                // Comparisons don't outlive the session.
+                crate::protein_alignment::clear_comparison_view(self);
+            }
+            Err(e) => {
+                eprintln!("Unable to load save file; possibly the first time running: {e:?}.")
+            }
+        }
+
+        self.update_from_prefs();
+    }
+}

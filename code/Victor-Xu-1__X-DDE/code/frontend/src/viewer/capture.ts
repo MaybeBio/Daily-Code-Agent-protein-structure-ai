@@ -1,0 +1,156 @@
+import type { GLViewer } from "3dmol";
+import {
+  figureAspect,
+  figureDimensions,
+  type FigureSettings,
+} from "../publication/settings";
+import { nativeLabelLayer } from "./native-labels";
+import { resizeZoomFactor } from "./camera-resize";
+import { figureOccupancy } from "./figure-occupancy";
+import { figureWithLabelLeaders } from "./figure-label-leaders";
+import {
+  nativeFigurePixels,
+  type FigurePixels,
+} from "../publication/figure-panels";
+export function captureDimensions(
+  width: number,
+  height: number,
+  scale: number,
+  pixelRatio = 1,
+) {
+  if (
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    width <= 0 ||
+    height <= 0 ||
+    ![1, 2, 3].includes(scale) ||
+    !Number.isFinite(pixelRatio) ||
+    pixelRatio <= 0
+  )
+    throw new Error("Invalid image dimensions.");
+  const factor = Math.min(
+    scale,
+    4096 / (width * pixelRatio),
+    4096 / (height * pixelRatio),
+    Math.sqrt((8 * 1024 ** 2) / (width * height * pixelRatio ** 2)),
+  );
+  return [
+    Math.max(1, Math.floor(width * factor)),
+    Math.max(1, Math.floor(height * factor)),
+  ] as const;
+}
+/** Render at the requested physical output size; viewport, camera and annotations are restored. */
+export function captureFigure(
+  viewer: GLViewer,
+  element: HTMLElement,
+  settings: FigureSettings,
+  panel?: FigurePixels,
+  ligandAspect?: number,
+) {
+  const bounds = element.getBoundingClientRect(),
+    ratio = viewer.getRenderer().devicePixelRatio;
+  if (!Number.isFinite(ratio) || ratio <= 0)
+    throw new Error("The native canvas is not ready.");
+  const size =
+    panel === undefined
+      ? figureDimensions(
+          settings,
+          figureAspect(settings, bounds.width / bounds.height),
+        )
+      : nativeFigurePixels(panel);
+  const previousWidth = element.style.width,
+    previousHeight = element.style.height,
+    view = viewer.getView();
+  const labels = nativeLabelLayer(viewer);
+  // Glyph textures use output pixels; compensate for native antialiasing/DPR
+  // in the label sprite so print size and texture detail are both preserved.
+  const restore = labels.printFont(
+    (settings.fontPt * settings.dpi) / 72,
+    ratio,
+  );
+  try {
+    element.style.width = size.width / ratio + "px";
+    element.style.height = size.height / ratio + "px";
+    // Container offsetWidth/offsetHeight round fractional CSS dimensions. Use
+    // the public native size controls so odd print-pixel dimensions stay exact.
+    viewer.setWidth(size.width / ratio);
+    viewer.setHeight(size.height / ratio);
+    viewer.setView(view);
+    const aspectScale =
+      ligandAspect === undefined
+        ? 1
+        : Math.min(1, resizeZoomFactor(bounds, size, ligandAspect));
+    const scale = (settings.structureScale ?? 1) * aspectScale;
+    if (scale !== 1) viewer.zoom(scale);
+    const placements = labels.arrangeForPrint(() => {
+      viewer.setBackgroundColor("white", 0);
+      viewer.render();
+      return figureOccupancy(viewer.getCanvas());
+    });
+    viewer.setBackgroundColor("white", settings.transparent ? 0 : 1);
+    viewer.render();
+    const canvas = viewer.getCanvas();
+    if (canvas.width !== size.width || canvas.height !== size.height)
+      throw new Error(
+        "Native canvas did not reach the requested figure resolution.",
+      );
+    if (placements.length) {
+      const figure = figureWithLabelLeaders(canvas, placements, settings.dpi);
+      return figure.toDataURL("image/png");
+    }
+    return viewer.pngURI();
+  } finally {
+    try {
+      // Restore the small live viewport before native style updates; each SDK
+      // setLabelStyle otherwise redraws the entire high-resolution figure.
+      element.style.width = previousWidth;
+      element.style.height = previousHeight;
+      const background =
+        getComputedStyle(document.documentElement)
+          .getPropertyValue("--chart-bg")
+          .trim() || "white";
+      viewer.setBackgroundColor(background, 1);
+      viewer.resize();
+      viewer.setView(view);
+    } finally {
+      try {
+        restore();
+      } finally {
+        labels.layout();
+        viewer.render();
+      }
+    }
+  }
+}
+/** Render genuine geometry at export resolution, then restore the exact view and layout. */
+export function captureView(
+  viewer: GLViewer,
+  element: HTMLElement,
+  scale: number,
+) {
+  const bounds = element.getBoundingClientRect();
+  const pixelRatio = viewer.getCanvas().width / bounds.width;
+  const [width, height] = captureDimensions(
+    bounds.width,
+    bounds.height,
+    scale,
+    pixelRatio,
+  );
+  const originalWidth = element.style.width,
+    originalHeight = element.style.height;
+  const view = viewer.getView();
+  try {
+    element.style.width = width + "px";
+    element.style.height = height + "px";
+    viewer.resize();
+    viewer.setView(view);
+    viewer.render();
+    return viewer.pngURI();
+  } finally {
+    element.style.width = originalWidth;
+    element.style.height = originalHeight;
+    viewer.resize();
+    viewer.setView(view);
+    viewer.render();
+  }
+}

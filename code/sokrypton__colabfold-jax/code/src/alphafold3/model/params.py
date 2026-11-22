@@ -1,0 +1,450 @@
+# Copyright 2024 DeepMind Technologies Limited
+#
+# AlphaFold 3 source code is licensed under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with the
+# License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# To request access to the AlphaFold 3 model parameters, follow the process set
+# out at https://github.com/google-deepmind/alphafold3. You may only use these
+# if received directly from Google. Use is subject to terms of use available at
+# https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
+
+"""Model param loading."""
+
+import bisect
+import collections
+from collections.abc import Iterator, Sequence
+import contextlib
+import io
+import logging
+import os
+import re
+import struct
+import sys
+from typing import IO
+
+from etils import epath
+import haiku as hk
+import jax.numpy as jnp
+import numpy as np
+import zstandard
+
+
+class RecordError(Exception):
+  """Error reading a record."""
+
+
+def encode_record(scope: str, name: str, arr: np.ndarray) -> bytes:
+  """Encodes a single haiku param as bytes, preserving non-numpy dtypes."""
+  scope = scope.encode('utf-8')  # pyrefly: ignore[bad-assignment]
+  name = name.encode('utf-8')  # pyrefly: ignore[bad-assignment]
+  shape = arr.shape
+  dtype = str(arr.dtype).encode('utf-8')
+  arr = np.ascontiguousarray(arr)
+  if sys.byteorder == 'big':
+    arr = arr.byteswap()
+  arr_buffer = arr.tobytes('C')
+  header = struct.pack(
+      '<5i', len(scope), len(name), len(dtype), len(shape), len(arr_buffer)
+  )
+  return header + b''.join(
+      (scope, name, dtype, struct.pack(f'{len(shape)}i', *shape), arr_buffer)  # pyrefly: ignore[bad-argument-type]
+  )
+
+
+def _read_record(stream: IO[bytes]) -> tuple[str, str, np.ndarray] | None:
+  """Reads a record encoded by `_encode_record` from a byte stream."""
+  header_size = struct.calcsize('<5i')
+  header = stream.read(header_size)
+  if not header:
+    return None
+  if len(header) < header_size:
+    raise RecordError(f'Incomplete header: {len(header)=} < {header_size=}')
+  (scope_len, name_len, dtype_len, shape_len, arr_buffer_len) = struct.unpack(
+      '<5i', header
+  )
+  fmt = f'<{scope_len}s{name_len}s{dtype_len}s{shape_len}i'
+  payload_size = struct.calcsize(fmt) + arr_buffer_len
+  payload = stream.read(payload_size)
+  if len(payload) < payload_size:
+    raise RecordError(f'Incomplete payload: {len(payload)=} < {payload_size=}')
+  scope, name, dtype, *shape = struct.unpack_from(fmt, payload)
+  scope = scope.decode('utf-8')
+  name = name.decode('utf-8')
+  dtype = dtype.decode('utf-8')
+  arr = np.frombuffer(payload[-arr_buffer_len:], dtype=dtype)
+  arr = np.reshape(arr, shape)
+  if sys.byteorder == 'big':
+    arr = arr.byteswap()
+  return scope, name, arr
+
+
+def read_records(stream: IO[bytes]) -> Iterator[tuple[str, str, np.ndarray]]:
+  """Fully reads the contents of a byte stream."""
+  while record := _read_record(stream):
+    yield record
+
+
+class _MultiFileIO(io.RawIOBase):
+  """A file-like object that presents a concatenated view of multiple files."""
+
+  def __init__(self, files: Sequence[epath.PathLike]):
+    self._files = [epath.Path(file) for file in files]
+    self._stack = contextlib.ExitStack()
+    self._handles = [
+        self._stack.enter_context(file.open('rb')) for file in self._files
+    ]
+    self._sizes = []
+    for handle in self._handles:
+      handle.seek(0, os.SEEK_END)
+      self._sizes.append(handle.tell())
+    self._length = sum(self._sizes)
+    self._offsets = [0]
+    for s in self._sizes[:-1]:
+      self._offsets.append(self._offsets[-1] + s)
+    self._abspos = 0
+    self._relpos = (0, 0)
+
+  def _abs_to_rel(self, pos: int) -> tuple[int, int]:
+    idx = bisect.bisect_right(self._offsets, pos) - 1
+    return idx, pos - self._offsets[idx]
+
+  def close(self):
+    self._stack.close()
+
+  @property
+  def closed(self) -> bool:
+    return all(handle.closed for handle in self._handles)
+
+  def fileno(self) -> int:
+    return -1
+
+  def readable(self) -> bool:
+    return True
+
+  def tell(self) -> int:
+    return self._abspos
+
+  def seek(self, pos: int, whence: int = os.SEEK_SET, /):
+    match whence:
+      case os.SEEK_SET:
+        pass
+      case os.SEEK_CUR:
+        pos += self._abspos
+      case os.SEEK_END:
+        pos = self._length - pos
+      case _:
+        raise ValueError(f'Invalid whence: {whence}')
+    self._abspos = pos
+    self._relpos = self._abs_to_rel(pos)
+
+  def readinto(self, b: bytearray | memoryview) -> int:  # pyrefly: ignore[bad-override]
+    result = 0
+    mem = memoryview(b)
+    while mem:
+      file_handle = self._handles[self._relpos[0]]
+      file_handle.seek(self._relpos[1])
+      if hasattr(file_handle, 'readinto'):
+        count = file_handle.readinto(mem)  # pyrefly: ignore[missing-attribute]
+      else:
+        # Workaround for file providers that do not support readinto.
+        data = file_handle.read(len(mem))
+        count = len(data)
+        mem[:count] = data
+
+      result += count
+      self._abspos += count
+      self._relpos = self._abs_to_rel(self._abspos)
+      mem = mem[count:]
+      if self._abspos == self._length:
+        break
+    return result
+
+
+@contextlib.contextmanager
+def open_for_reading(model_files: list[epath.PathLike], is_compressed: bool):
+  with contextlib.closing(_MultiFileIO(model_files)) as f:
+    if is_compressed:
+      buffered = io.BufferedReader(f)
+      yield zstandard.ZstdDecompressor().stream_reader(buffered)
+    else:
+      yield f
+
+
+def _match_model(
+    paths: list[epath.Path], pattern: re.Pattern[str]
+) -> dict[str, list[epath.Path]]:
+  """Match files in a directory with a pattern, and group by model name."""
+  models = collections.defaultdict(list)
+  for path in paths:
+    match = pattern.fullmatch(path.name)
+    if match:
+      models[match.group('model_name')].append(path)
+  return {k: sorted(v) for k, v in models.items()}
+
+
+def select_model_files(
+    model_dir: epath.PathLike, model_name: str | None = None
+) -> tuple[list[epath.Path], bool]:
+  """Select the model files from a model directory."""
+  model_dir = epath.Path(model_dir)
+  if model_dir.exists():
+    files = [file for file in model_dir.iterdir() if file.is_file()]
+  else:
+    files = []
+
+  for pattern, is_compressed in (
+      (r'(?P<model_name>.*)\.[0-9]+\.bin\.zst$', True),
+      (r'(?P<model_name>.*)\.bin\.zst\.[0-9]+$', True),
+      (r'(?P<model_name>.*)\.[0-9]+\.bin$', False),
+      (r'(?P<model_name>.*)\.bin]\.[0-9]+$', False),
+      (r'(?P<model_name>.*)\.bin\.zst$', True),
+      (r'(?P<model_name>.*)\.bin$', False),
+  ):
+    models = _match_model(files, re.compile(pattern))
+    if model_name is not None:
+      if model_name in models:
+        return models[model_name], is_compressed
+    else:
+      if models:
+        if len(models) > 1:
+          # Two blobs, one slot. By far the likeliest cause is two STORAGE
+          # PRECISIONS of the same model side by side (`x.bin.zst` next to
+          # `x.int8.bin.zst`), which is why weights.default_dir gives each
+          # precision its own directory. Say so: "Multiple models matched"
+          # sends the reader looking for a second model that is not there.
+          raise RuntimeError(
+              f'Multiple models matched in {model_dir}: '
+              f'{", ".join(sorted(models))}. A directory must hold ONE blob; '
+              'if these are the same model at different storage precisions, '
+              'keep them in separate directories.')
+        _, model_files = models.popitem()
+        return model_files, is_compressed
+  raise FileNotFoundError(f'No models matched in {model_dir}')
+
+
+_Q_SCALE_SUFFIX = '__q_scale'
+
+
+def dequantise_int8(q, scale):
+  """int8 payload times its scales -> float32.
+
+  Scales are per-CHANNEL over the last axis and per-BLOCK of rows down the
+  reduction axis, so one outlying row no longer coarsens a whole column. The
+  block count is not stored: it is `scale.shape[0]`, and the rows per block are
+  recovered as ceil(rows / blocks) exactly as the writer derived them
+  (converters/quantise._quantise_blocked) -- the two must agree or every
+  weight is scaled by the wrong number.
+
+  A 1-D `scale` is a blob written before the scales were split down the
+  reduction axis. Those still load, and must keep loading: they are what is
+  published today.
+
+  This is the ONE implementation. converters/quantise.py imports it rather than
+  restating it -- a second copy of a layout agreement is how half a fix ships.
+  """
+  shape = q.shape
+  flat = np.asarray(q).reshape(-1, shape[-1]).astype(np.float32)
+  scale = np.asarray(scale, np.float32)
+  if scale.ndim == 1:
+    return (flat * scale).reshape(shape)
+  rows, channels = flat.shape
+  blocks = scale.shape[0]
+  g = -(-rows // blocks)
+  pad = blocks * g - rows
+  if pad:
+    flat = np.concatenate([flat, np.zeros((pad, channels), np.float32)])
+  out = flat.reshape(blocks, g, channels) * scale[:, None, :]
+  return out.reshape(-1, channels)[:rows].reshape(shape)
+
+
+def _dequantise_records(records):
+  """Undo bfloat16 / int8 storage. A float32 blob passes through untouched.
+
+  Kept here rather than imported from `converters` so that loading a published
+  blob never depends on the conversion package being installed -- converters is
+  a standalone tool, run once, off the inference path.
+  """
+  scales = {}
+  payload = []
+  for scope, name, arr in records:
+    if name.endswith(_Q_SCALE_SUFFIX):
+      scales[(scope, name[: -len(_Q_SCALE_SUFFIX)])] = np.asarray(arr)
+    else:
+      payload.append((scope, name, np.asarray(arr)))
+  half = (np.uint16, np.float16)
+  if not scales and not any(a.dtype in half for _, _, a in payload):
+    return payload
+
+  out = []
+  for scope, name, arr in payload:
+    scale = scales.pop((scope, name), None)
+    if scale is not None:
+      arr = dequantise_int8(arr, scale)
+    elif arr.dtype == np.uint16:          # a bfloat16 bit pattern
+      arr = (arr.astype(np.uint32) << 16).view(np.float32)
+    elif arr.dtype == np.float16:
+      arr = arr.astype(np.float32)
+    out.append((scope, name, arr))
+  if scales:
+    raise RecordError(f'{len(scales)} quantisation scales with no parameter')
+  return out
+
+
+def get_model_haiku_params(model_dir: epath.PathLike) -> hk.Params:
+  """Get the Haiku parameters from a model name."""
+  params: dict[str, dict[str, jnp.Array]] = {}
+  model_files, is_compressed = select_model_files(model_dir)
+  with open_for_reading(model_files, is_compressed) as stream:  # pyrefly: ignore[bad-argument-type]
+    records = list(read_records(stream))
+  # A blob may be stored float32, bfloat16 or int8-with-scales (converters/
+  # quantise.py). Only the loader knows which; everything above this line sees
+  # float32 either way, so a smaller download is not a different code path.
+  records = _dequantise_records(records)
+  for scope, name, arr in records:
+    params.setdefault(scope, {})[name] = jnp.array(arr)
+  if not params:
+    raise FileNotFoundError(f'Model missing from "{model_dir}"')
+  _check_blob_convention(model_dir, params)
+  _check_required_scopes(model_dir, params)
+  _upgrade_esmfold2_class_rows(model_dir, params)
+  # chai1's blobs carry chai-lab's structure token-pair weights from 28141c7 on (model.Chai1StructurePair);
+  # one fetched before has the model and not its diffusion's pair input
+  if (any(scope.endswith('diffusion_embed_atom_pair_feat') for scope in params)      # (chai's alone)
+      and 'diffuser/chai1_structure_token_pair' not in params):
+    raise ValueError(
+        f'{model_dir}: these chai1 weights predate chai-lab\'s structure token-pair weights, which its '
+        'diffusion conditions on. Delete the blob there and run again to fetch the current one.')
+  if ('diffuser/chai1_structure_token_pair' in params
+      and 'chai1_chain_entity' not in params.get('diffuser/evoformer', {})):
+    # a chai1 blob from before its relative chain/entity rows: a complex keeps the monomer's classes, as it always did
+    logging.warning('%s: chai1 weights without chai1_chain_entity; complexes read single-chain relative chain and '
+                    'entity features. Delete the blob to fetch the current one once it is published.', model_dir)
+    params.setdefault('diffuser/evoformer', {})['chai1_chain_entity'] = jnp.zeros(
+        (9, params['diffuser/chai1_structure_token_pair']['weights'].shape[1]), jnp.float32)
+  if ('diffuser/chai1_structure_token_pair' in params
+      and 'diffuser/evoformer/chai1_bond_trunk' not in params):
+    # and its declared-bond trunk row: a declared bond reaches the diffusion's pair input but not the trunk's
+    logging.warning('%s: chai1 weights without chai1_bond_trunk; declared bonds reach only the diffusion\'s pair '
+                    'input, not the trunk. Delete the blob to fetch the current one once it is published.', model_dir)
+    params['diffuser/evoformer/chai1_bond_trunk'] = {'weights': jnp.zeros(
+        (1, params['diffuser/chai1_structure_token_pair']['weights'].shape[1]), jnp.float32)}
+  if ('diffuser/chai1_structure_token_pair' in params
+      and 'diffuser/evoformer/chai1_restraint_trunk' not in params):
+    # and its restraint trunk rows: a pocket/contact constraint reaches the diffusion's pair input but not the trunk
+    logging.warning('%s: chai1 weights without chai1_restraint_trunk; pocket/contact constraints reach only the '
+                    'diffusion\'s pair input, not the trunk. Delete the blob to fetch the current one once it is '
+                    'published.', model_dir)
+    params['diffuser/evoformer/chai1_restraint_trunk'] = {'weights': jnp.zeros(
+        (14, params['diffuser/chai1_structure_token_pair']['weights'].shape[1]), jnp.float32)}
+  if 'diffuser/boltz2_res_type_encoding' in params and 'boltz2_dn_res_type' not in params.get('diffuser', {}):
+    # a boltz2 blob from before Boltz's DN rows: a DNA unknown reads Boltz's RNA N, as it always did
+    logging.warning('%s: boltz2 weights without boltz2_dn_*; a DNA N or modified DNA residue reads Boltz\'s RNA '
+                    'unknown. Delete the blob to fetch the current one once it is published.', model_dir)
+    width = params['diffuser/boltz2_res_type_encoding']['weights'].shape[1]
+    params.setdefault('diffuser', {})['boltz2_dn_res_type'] = jnp.zeros((width,), jnp.float32)
+    params['diffuser']['boltz2_dn_msa_profile'] = jnp.zeros((width,), jnp.float32)
+    params.setdefault('diffuser/evoformer', {})['boltz2_dn_msa'] = jnp.zeros(
+        (params['diffuser/evoformer/msa_activations']['weights'].shape[1],), jnp.float32)
+  if 'diffuser/chai1_token_feature_embedding' in params and 'chai1_token_dx' not in params.get('diffuser', {}):
+    # likewise its DNA-unknown row: a DNA N or modified nucleotide reads chai's RX rather than its DX
+    params.setdefault('diffuser', {})['chai1_token_dx'] = jnp.zeros(
+        params['diffuser/chai1_token_feature_embedding']['bias'].shape, jnp.float32)
+  return params
+
+
+# ESMFold2's DNA and N rows of each 31-class block, and the rows a blob before convention 2 holds them in
+_ESMFOLD2_CLASS_ROWS, _ESMFOLD2_OLD_ROWS = [26, 27, 28, 29, 30], [27, 28, 29, 30, 26]
+
+
+def _upgrade_esmfold2_class_rows(model_dir, params) -> None:
+  """An ESMFold2 blob converted before blob convention 2 holds its DNA and N rows in the old shift order: rotate them
+  into ESMFold2's class order (converters/esmfold2.esm_class_of_af3), as a fresh conversion writes them."""
+  from alphafold3.model import model_config
+
+  name = os.path.basename(os.path.normpath(os.path.expanduser(str(model_dir)))).split('-')[0]
+  rec = params.get('__meta__', {}).get('__convention__')
+  if name not in model_config.ESMFOLD2_FAMILY or (rec is not None and int(np.asarray(rec).reshape(-1)[0]) >= 2):
+    return
+  evo = 'diffuser/evoformer'
+  for scope, blocks in ((f'{evo}/extra_msa_target_feat', 2), (f'{evo}/left_single', 2), (f'{evo}/right_single', 2),
+                        (f'{evo}/msa_activations', 1)):
+    w = params.get(scope, {}).get('weights')
+    if w is None:
+      continue
+    new = [r + 31 * b for b in range(blocks) for r in _ESMFOLD2_CLASS_ROWS]
+    old = [r + 31 * b for b in range(blocks) for r in _ESMFOLD2_OLD_ROWS]
+    # numpy: a jnp scatter would compile once per shape
+    w = np.array(w)
+    w[new] = w[old]
+    params[scope]['weights'] = jnp.asarray(w)
+  logging.info('%s: ESMFold2 weights before blob convention 2, DNA and N rows rotated into its class order', model_dir)
+
+
+# Scopes a model's graph builds that an OLDER blob of it lacks. Without this a
+# stale cached blob fails deep inside haiku ("Unable to retrieve parameter")
+# with nothing saying the fix is to fetch the blob again.
+_REQUIRED_SCOPES = {
+    # 2026-10-19: RF3's confidence pair needs the two s_inputs rows our 447-wide
+    # target_feat drops (confidence_head.masked_global_norm).
+    'rosettafold3': ('diffuser/confidence_head/~_embed_features/'
+                     'left_target_feat_project_absent',),
+}
+
+
+def _check_required_scopes(model_dir, params) -> None:
+  name = os.path.basename(os.path.normpath(os.path.expanduser(str(model_dir))))
+  missing = [s for s in _REQUIRED_SCOPES.get(name.split('-')[0], ())
+             if s not in params]
+  if missing:
+    raise ValueError(
+        f'{name}: these weights predate parameters this library needs '
+        f'({missing[0]}). Re-download the blob (delete {model_dir} and let '
+        'ensure_weights refetch it), or re-run the converter against the '
+        'checkpoint.')
+
+
+def _check_blob_convention(model_dir, params) -> None:
+  """Refuse a blob this library would MISREAD, rather than predicting quietly.
+
+  Some fixes change what a weight MEANS, not just its value -- ESMFold2's
+  restype/profile alphabet being a permutation rather than a shift-by-two is
+  one, because the matching widening lives in `diffusion_head`. A blob and a
+  library that disagree about that produce a fold with no error anywhere, and
+  only on inputs that have gaps or nucleic acids at all.
+
+  `converters/common.BLOB_CONVENTION` is the version a fresh conversion writes
+  into `__meta__/__convention__`; `model_config.MIN_BLOB_CONVENTION` is the
+  minimum this library will read, PER MODEL. Per model on purpose: a global
+  minimum would reject every blob of every model the moment one model's
+  convention changed, and the whole point is to be precise about which
+  artifacts are actually incompatible.
+
+  An absent record means convention 0 -- every blob published before this
+  existed -- so a model with no entry in the table is unchecked, and adding an
+  entry is what makes the guard bite.
+  """
+  from alphafold3.model import model_config
+
+  name = os.path.basename(os.path.normpath(os.path.expanduser(str(model_dir))))
+  minimum = model_config.MIN_BLOB_CONVENTION.get(name)
+  if not minimum:
+    return
+  rec = params.get('__meta__', {}).get('__convention__')
+  have = int(np.asarray(rec).reshape(-1)[0]) if rec is not None else 0
+  if have < minimum:
+    raise ValueError(
+        f'{name}: these weights were converted under blob convention {have}, '
+        f'and this library reads convention {minimum} or later. The two '
+        'disagree about what the weights MEAN, so the fold would be wrong '
+        'without erroring. Re-download the blob (delete '
+        f'{model_dir} and let ensure_weights refetch it), or re-run the '
+        'converter against the checkpoint.')

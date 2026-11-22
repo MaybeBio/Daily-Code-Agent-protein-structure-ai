@@ -1,0 +1,124 @@
+.image-molecule-input {
+  min-width: 0;
+}
+.image-molecule-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 10px 0;
+}
+.image-molecule-actions > span {
+  font-size: 12px;
+  color: var(--muted);
+}
+.image-molecule-actions > .recognition-backend-entry {
+  margin-inline-start: auto;
+}
+@media (max-width: 680px), (pointer: coarse) {
+  .image-molecule-input .image-molecule-actions > button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
+
+.image-molecule-dialog {
+  width: min(1600px, calc(100vw - 40px));
+  height: min(1000px, calc(100dvh - 40px));
+  max-width: none;
+  max-height: none;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+}
+.image-molecule-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+.image-molecule-dialog::backdrop {
+  background: #101b3366;
+}
+.image-molecule-dialog > header,
+.image-molecule-dialog > footer {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 20px;
+}
+.image-molecule-dialog > header {
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+}
+.image-molecule-dialog h2 {
+  margin: 0;
+  font-size: 20px;
+}
+.image-molecule-dialog p {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+.image-molecule-dialog > iframe {
+  width: 100%;
+  flex: 1;
+  min-height: 220px;
+  border: 0;
+}
+.image-molecule-dialog > footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--line);
+}
+.image-molecule-dialog > footer > span {
+  margin-right: auto;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (width > 1000px) {
+  .image-molecule-dialog {
+    width: min(1600px, calc(100vw - 28px));
+    height: min(1000px, calc(100dvh - 28px));
+  }
+  .image-molecule-dialog > header,
+  .image-molecule-dialog > footer {
+    padding: 8px 14px;
+    gap: 10px;
+  }
+  .image-molecule-dialog > footer {
+    margin-top: 0;
+  }
+  .image-molecule-dialog h2 {
+    font-size: 16px;
+  }
+  .image-molecule-dialog > header p {
+    margin-top: 3px;
+    font-size: 12px;
+  }
+}
+@media (max-width: 600px) {
+  .image-molecule-dialog {
+    width: calc(100vw - 12px);
+    height: calc(100dvh - 12px);
+  }
+  .image-molecule-dialog > header,
+  .image-molecule-dialog > footer {
+    padding: 10px;
+  }
+  .image-molecule-dialog > footer {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .image-molecule-dialog > footer > span {
+    flex: 1 0 100%;
+    max-width: 100%;
+  }
+  .image-molecule-dialog > footer > button {
+    white-space: nowrap;
+  }
+  .image-molecule-dialog h2 {
+    font-size: 17px;
+  }
+}

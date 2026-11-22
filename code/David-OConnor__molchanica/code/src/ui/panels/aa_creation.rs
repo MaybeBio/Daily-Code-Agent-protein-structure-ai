@@ -1,0 +1,309 @@
+//! Create peptides and amino acid sequences from single-letter amino acid codes.
+
+use std::fs;
+
+use chrono::Local;
+use egui::{Button, Color32, FontSelection, RichText, TextBuffer, TextEdit, Ui};
+use graphics::{EngineUpdates, Scene};
+use mol_defs::molecules::{MolGenericRef, MolType, MoleculeGeneric, aa_color};
+use na_seq::{AaIdent, AminoAcid, SeqType, Sequence, SequenceData};
+
+use super::sequence_input::{
+    INVALID_LETTER_COLOR, create_button, layout, letter_counts, status_label,
+};
+use crate::{
+    cam::{move_cam_to_mol_front, move_mol_to_cam},
+    drawing::aa_highlight::AMINO_ACIDS,
+    file_io::managed_mols,
+    peptide_creation::{PeptideGeometry, build_peptide},
+    prefs::OpenType,
+    state::State,
+    ui::{
+        COLOR_ACTION, COLOR_HIGHLIGHT,
+        misc::{section_box, selector},
+        popup::ProteinToolsTab,
+        util::report_cache_result,
+    },
+    util::{handle_err, handle_success, make_egui_color},
+};
+
+/// The amino acid buttons wrap at this width.
+const SECTION_WIDTH: f32 = 800.;
+const SEQ_INPUT_WIDTH: f32 = 400.;
+
+fn is_amino_acid_letter(ch: char) -> bool {
+    ch.is_ascii() && AminoAcid::from_u8_letter(ch as u8).is_ok()
+}
+
+/// Parse the single-letter amino acid codes entered. Whitespace, digits and gaps are ignored.
+fn parse_seq(text: &str) -> Result<Vec<AminoAcid>, String> {
+    let (data, skipped) = SequenceData::from_letters(text, SeqType::AminoAcid);
+
+    if skipped > 0 {
+        return Err(format!(
+            "{skipped} letter(s) in the sequence aren't amino acid codes"
+        ));
+    }
+
+    match data {
+        SequenceData::AminoAcid(seq) if !seq.is_empty() => Ok(seq),
+        _ => Err("Enter an amino acid sequence first".to_owned()),
+    }
+}
+
+/// `name` defaults to one describing the sequence's length.
+fn make_sequence(seq: Vec<AminoAcid>, name: Option<&str>) -> Sequence {
+    let name = match name {
+        Some(name) => name.to_owned(),
+        None => format!("Peptide {}aa", seq.len()),
+    };
+
+    Sequence::new(SequenceData::AminoAcid(seq), name)
+}
+
+/// A descriptive structure prediction job name, e.g. "MKTAYIAK... 2026-10-10".
+fn job_name(sequence: &Sequence) -> String {
+    const PREFIX_LEN: usize = 8;
+
+    let letters = sequence.data.to_letters();
+    let mut prefix: String = letters.chars().take(PREFIX_LEN).collect();
+
+    if letters.len() > PREFIX_LEN {
+        prefix.push_str("...");
+    }
+
+    format!("{prefix} {}", Local::now().format("%Y-%m-%d"))
+}
+
+pub(in crate::ui) fn geometry_selector(ui: &mut Ui, geometry: &mut PeptideGeometry) {
+    ui.label("Initial geometry");
+
+    let options = [
+        (
+            PeptideGeometry::Line,
+            "Line",
+            "Create the current extended chain geometry.",
+        ),
+        (
+            PeptideGeometry::BetaSheet,
+            "Beta Sheet",
+            "Create a beta strand with beta-sheet backbone angles (φ = −135°, ψ = 135°).",
+        ),
+        (
+            PeptideGeometry::AlphaHelix,
+            "Alpha Helix",
+            "Create a right-handed alpha helix (φ = −60°, ψ = −45°).",
+        ),
+    ];
+
+    if let Some(selected) = selector(ui, *geometry, &options) {
+        *geometry = selected;
+    }
+}
+
+pub(in crate::ui) fn create_peptide_button(ui: &mut Ui, enabled: bool) -> bool {
+    ui.add_enabled(
+        enabled,
+        create_button("Create peptide", COLOR_ACTION, enabled),
+    )
+    .on_hover_text(
+        "Create a peptide from this sequence using the selected initial geometry \
+            and Amber residue templates.",
+    )
+    .clicked()
+}
+
+pub(in crate::ui) fn create_folded_button(ui: &mut Ui, enabled: bool) -> bool {
+    ui.add_enabled(
+        enabled,
+        create_button("Create folded", COLOR_HIGHLIGHT, enabled),
+    )
+    .on_hover_text("Open the Predict structure tab, with this sequence as its input.")
+    .clicked()
+}
+
+pub(in crate::ui) const CREATE_SEQ_TEXT: &str = "Create sequence";
+pub(in crate::ui) const CREATE_SEQ_HOVER: &str =
+    "Add this as an amino acid sequence, e.g. to view, edit, or save.";
+
+/// The widget alone, so callers that place it at an exact rect (`Ui::put`) can share it. Pair
+/// with `CREATE_SEQ_HOVER`.
+pub(in crate::ui) fn create_seq_btn(enabled: bool) -> Button<'static> {
+    create_button(CREATE_SEQ_TEXT, COLOR_ACTION, enabled)
+}
+
+/// Add a standalone amino acid sequence from single-letter codes, and make it the active one.
+pub(in crate::ui) fn create_sequence(text: &str, name: Option<&str>, state: &mut State) {
+    match parse_seq(text) {
+        Ok(seq) => {
+            let mut sequence = make_sequence(seq, name);
+            let msg = format!("Added sequence {}", sequence.display_name());
+
+            // Kept in a managed file, so it reopens next session.
+            let result = managed_mols::store_created_seq(&state.volatile.prefs_dir, &sequence);
+            sequence.path = report_cache_result(state, result);
+
+            if let Some(path) = sequence.path.clone() {
+                let ident = Some(sequence.display_name().to_owned());
+                state.update_history(&path, OpenType::Sequence, ident);
+            }
+
+            state.sequences.push(sequence);
+            state.select_sequence(Some(state.sequences.len() - 1));
+            state.update_save_prefs();
+
+            handle_success(&mut state.ui, msg);
+        }
+        Err(e) => handle_err(&mut state.ui, e),
+    }
+}
+
+/// Build a peptide with the selected initial geometry, and add it in front of the camera.
+pub(in crate::ui) fn create_peptide(
+    seq: &[AminoAcid],
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+) {
+    match build_peptide(
+        seq,
+        &state.templates.amino_acid,
+        state.ui.aa_geometry_to_create,
+    ) {
+        Ok(mut mol) => {
+            move_mol_to_cam(&mut mol.common, &scene.camera);
+
+            // Kept in a managed file, so it reopens next session; as for a downloaded protein.
+            let result = managed_mols::store_created(
+                &state.volatile.prefs_dir,
+                MolGenericRef::Peptide(&mol),
+                &SequenceData::AminoAcid(seq.to_vec()).to_letters(),
+            );
+            let path = report_cache_result(state, result);
+
+            if let Some(path) = &path
+                && let Err(e) = fs::read_to_string(path).and_then(|text| mol.set_source_cif(text))
+            {
+                eprintln!("Problem reading back the created peptide's mmCIF: {e}");
+            }
+
+            // Makes it the active molecule.
+            state.load_mol_to_state(
+                MoleculeGeneric::Peptide(mol),
+                scene,
+                updates,
+                path.as_deref(),
+            );
+
+            let molecule = (MolType::Peptide, state.peptides.len() - 1);
+            move_cam_to_mol_front(state, scene, molecule, updates);
+        }
+        Err(e) => handle_err(&mut state.ui, format!("Problem making a peptide: {e}")),
+    }
+}
+
+/// Open the Predict structure tab, with this sequence as its input.
+pub(in crate::ui) fn create_folded(sequence: Sequence, state: &mut State) {
+    let job_name = job_name(&sequence);
+
+    state
+        .ui
+        .tool_windows
+        .load_structure_pred_seq(sequence, job_name);
+    state.ui.popup.protein_tools = true;
+    state.ui.popup.protein_tools_tab = ProteinToolsTab::PredictStructure;
+}
+
+/// Add and manage amino acids
+pub(in crate::ui) fn aa_section(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    ui: &mut Ui,
+) {
+    section_box().show(ui, |ui| {
+        // The toolbar this is in lays out horizontally.
+        ui.vertical(|ui| {
+            ui.set_max_width(SECTION_WIDTH);
+
+            ui.horizontal_wrapped(|ui| {
+                for aa in AMINO_ACIDS {
+                    if aa == AminoAcid::Sec {
+                        continue;
+                    }
+
+                    let letter = aa.to_str(AaIdent::OneLetter);
+                    let color = make_egui_color(aa_color(aa));
+
+                    if ui
+                        .button(RichText::new(aa.to_string()).color(color))
+                        .on_hover_text(format!("Add {letter} to the end of the sequence"))
+                        .clicked()
+                    {
+                        state.ui.aa_seq_to_create.push_str(&letter);
+                    }
+                }
+            });
+
+            ui.horizontal(|ui| {
+                geometry_selector(ui, &mut state.ui.aa_geometry_to_create);
+            });
+
+            ui.horizontal(|ui| {
+                let help_text = "Enter the amino acid sequence, as single-letter codes, \
+                    from the N terminus to the C terminus";
+
+                let mut layouter = |ui: &Ui, text: &dyn TextBuffer, wrap_width: f32| {
+                    let font_id = FontSelection::Default.resolve(ui.style());
+
+                    layout(ui, text.as_str(), wrap_width, font_id, |ch| {
+                        if is_amino_acid_letter(ch) {
+                            Color32::PLACEHOLDER
+                        } else {
+                            INVALID_LETTER_COLOR
+                        }
+                    })
+                };
+
+                ui.label("Seq").on_hover_text(help_text);
+
+                ui.add(
+                    TextEdit::multiline(&mut state.ui.aa_seq_to_create)
+                        .desired_width(SEQ_INPUT_WIDTH)
+                        .desired_rows(2)
+                        .layouter(&mut layouter),
+                )
+                .on_hover_text(help_text);
+
+                let (valid, invalid) =
+                    letter_counts(&state.ui.aa_seq_to_create, is_amino_acid_letter);
+                let can_create = valid > 0 && invalid == 0;
+
+                if create_peptide_button(ui, can_create) {
+                    match parse_seq(&state.ui.aa_seq_to_create) {
+                        Ok(seq) => create_peptide(&seq, state, scene, updates),
+                        Err(e) => handle_err(&mut state.ui, e),
+                    }
+                }
+
+                if create_folded_button(ui, can_create) {
+                    match parse_seq(&state.ui.aa_seq_to_create) {
+                        Ok(seq) => create_folded(make_sequence(seq, None), state),
+                        Err(e) => handle_err(&mut state.ui, e),
+                    }
+                }
+
+                if ui
+                    .add_enabled(can_create, create_seq_btn(can_create))
+                    .on_hover_text(CREATE_SEQ_HOVER)
+                    .clicked()
+                {
+                    let text = state.ui.aa_seq_to_create.clone();
+                    create_sequence(&text, None, state);
+                }
+
+                status_label(ui, valid, invalid, "amino acid");
+            });
+        });
+    });
+}

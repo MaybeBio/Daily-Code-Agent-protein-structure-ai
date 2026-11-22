@@ -1,0 +1,207 @@
+# 🛠️ Guida Completa agli Script del Progetto (`scripts/README_SCRIPTS.md`)
+
+Questo documento spiega in modo semplice e operativo **come lanciare ogni script** presente nella repository `BML`, **cosa fa ciascuno script** e **quale output (testuale, numerico e visivo 3D/2D) dovete aspettarvi** per verificare che tutto stia funzionando correttamente.
+
+> [!IMPORTANT]
+> **Regola base di esecuzione:** Tutti i comandi vanno lanciati stando nella cartella principale della repository (`/home/olly/UNI/BioMolEng2026/laboratorio/BML` su Linux o `...\BML` su Windows), perché gli script usano percorsi relativi a partire da `BML/`.
+
+---
+
+## 📋 Indice Rapido degli Script
+
+| # | Script / File | Fase | Tipo | Comando per lanciarlo |
+| :---: | :--- | :---: | :---: | :--- |
+| **0** | `scripts/VMDextensions.tcl` | Tutte | Libreria TCL | *(Caricata in automatico dagli altri script)* |
+| **1** | `scripts/01_inspect_2myo.tcl` | Fase 1 | Analisi VMD | `vmd -dispdev text -e scripts/01_inspect_2myo.tcl` |
+| **2** | `scripts/viz_01_structure_and_mask.tcl` | Fase 1 | **Grafica 3D VMD** | `vmd -e scripts/viz_01_structure_and_mask.tcl` |
+| **3** | `scripts/02_build_wt_charmm36m.tcl` | Fase 1 | Setup Topologia | `vmd -dispdev text -e scripts/02_build_wt_charmm36m.tcl` |
+| **4** | `scripts/viz_02_solvated_box.tcl` | Fase 1 | **Grafica 3D VMD** | `vmd -e scripts/viz_02_solvated_box.tcl` |
+| **5** | `02_wt_baseline/smoke_test_400K.conf` | Fase 2 | Test NAMD3 | `namd3 +p8 02_wt_baseline/smoke_test_400K.conf > 02_wt_baseline/smoke_400K.log` |
+| **6** | `scripts/03_analyze_wt_baseline.tcl` | Fase 2 | Analisi MD + `analysisMD.tcl` | `vmd -dispdev text -e scripts/03_analyze_wt_baseline.tcl` |
+| **7** | `scripts/plot_wt_baseline.py` | Fase 2 | **Grafici 2D Python** | `python3 scripts/plot_wt_baseline.py` |
+| **8** | `scripts/viz_03_wt_instability.tcl` | Fase 2 | **Grafica 3D VMD** | `vmd -e scripts/viz_03_wt_instability.tcl` |
+| **9** | `02_wt_baseline/run_overnight_wt.sh` | Fase 2 | **Batch Notturno** | `bash 02_wt_baseline/run_overnight_wt.sh` |
+| **10** | `scripts/04_ankyrin_consensus_and_targets.py` | Fase 3 | Consenso Ankyrin + Config FoldX | `python3 scripts/04_ankyrin_consensus_and_targets.py` |
+| **11** | `03_mutations/repair.cfg` | Fase 3 | FoldX `RepairPDB` | `foldx -f 03_mutations/repair.cfg > 03_mutations/repair.log` |
+| **12** | `03_mutations/position_scan_hotspots.cfg` | Fase 3 | FoldX `PositionScan` | `foldx -f 03_mutations/position_scan_hotspots.cfg > 03_mutations/position_scan.log` |
+| **12b** | `scripts/04b_run_remaining_foldx_parallel.sh` | Fase 3 | **FoldX Parallelo 8 Core (`88/88`)** | `bash scripts/04b_run_remaining_foldx_parallel.sh` |
+| **13** | `scripts/05_parse_foldx_screening.py` | Fase 3 | **Classifica + Grafico PDF FoldX** | `python3 scripts/05_parse_foldx_screening.py` |
+| **14** | `scripts/06_build_consensus_matrix.py` | Fase 3 | **Matrice Consenso 5 Pilastri + PDF** | `python3 scripts/06_build_consensus_matrix.py` |
+| **15** | `scripts/07_run_foldx_buildmodel.py` | Fase 3 | **FoldX `BuildModel` (`n=5`) + Epistasi + PDF** | `python3 scripts/07_run_foldx_buildmodel.py` |
+| **16** | `scripts/viz_04_mutations_zoom.tcl` | Fase 3 | **Grafica 3D VMD (Matched WT vs Mutanti)** | `vmd -e scripts/viz_04_mutations_zoom.tcl` |
+| **17** | `scripts/08_build_matched_mutants_charmm36m.tcl` | Fase 4 | **Setup Topologico Matched CHARMM36m + `.conf`** | `vmd -dispdev text -e scripts/08_build_matched_mutants_charmm36m.tcl` |
+| **18** | `04_md_simulations/run_batch_phase4.sh` | Fase 4 | **Batch MD Multi-Seed (`seed1`/`oleg`/`alessia`)** | `bash 04_md_simulations/run_batch_phase4.sh seed1 8` |
+| **19** | `scripts/09_analyze_matched_validation.tcl` | Fase 5 | **Analisi VMD Multi-Seed (`analysisMD.tcl` + $Q$)** | `vmd -dispdev text -e scripts/09_analyze_matched_validation.tcl` |
+| **20** | `scripts/10_plot_final_validation_bekker.py` | Fase 5 | **Bekker Table II + Test $t$ + Grafici PDF Finali** | `python3 scripts/10_plot_final_validation_bekker.py` |
+
+---
+
+## 🔍 Dettaglio di Ogni Script e Output Atteso (Numerico + Visivo)
+
+---
+
+### 1. `scripts/01_inspect_2myo.tcl` — Ispezione Chimico-Fisica di `2MYO` e `3AAA`
+- **Come si lancia:**
+  ```bash
+  vmd -dispdev text -e scripts/01_inspect_2myo.tcl
+  ```
+- **Cosa fa:** Legge `01_structures/raw/2MYO.pdb` e `3AAA_complex_ref.pdb` senza interfaccia grafica e misura la sequenza FASTA, le distanze tra le 3 Cisteine, i vicini polari delle 4 Istidine e i residui a contatto ($< 4.5\text{ Å}$) con l'Actin-Capping Protein.
+- **Cosa aspettarsi come output (a schermo):**
+  - `Numero totale atomi nel PDB: 1815` (`902` pesanti + `913` idrogeni), `118` residui continui senza `/`.
+  - Distanze $S_\gamma\text{--}S_\gamma$ delle Cisteine: `21.88 Å`, `27.01 Å`, `9.43 Å` (nessun ponte disolfuro).
+  - Contatti delle Istidine: `HIS 40` (`ND1` a `2.44 Å` da `SER 74 OG` $\rightarrow$ **`HSD`**) e `HIS 67` (`ND1` a `3.24 Å` da `LYS 37 NZ` e `NE2` a `2.40 Å` da `GLY 35 O` $\rightarrow$ **`HSE`**).
+  - `RMSD tra 2MYO e 3AAA`: **`2.365 Å`** e lista dei **24 residui della Functional Mask** (`resid 4 5 7 8 9 11 12 14 16 17 34 36 41 44 45 47 66 67 69 77 78 80 99 100`).
+
+---
+
+### 2. `scripts/viz_01_structure_and_mask.tcl` — 📸 Visualizzazione 3D dei 4 Repeat e della Functional Mask (Slide 2 & 3)
+- **Come si lancia:**
+  ```bash
+  vmd -e scripts/viz_01_structure_and_mask.tcl
+  ```
+- **Cosa aspettarsi come output VISIVO (Finestra 3D di VMD):**
+  - Si apre la finestra grafica di VMD con **sfondo bianco pulito** e senza assi cartesiani.
+  - Vedrete una proteina a forma di "molla curva" (solenoide $\alpha$-elica) divisa in **4 colori**:
+    - **Blu** = `ANK1` (residui 1–34, N-terminale)
+    - **Ciano** = `ANK2` (residui 35–67)
+    - **Arancione** = `ANK3` (residui 68–100)
+    - **Verde** = `ANK4` (residui 101–118, C-terminale)
+  - Sulla faccia concava dei loop vedrete **3 bastoncini Rossi** che sporgono: sono **`TRP 8`, `ASP 44`, `GLU 78`** (i 3 ganci funzionali).
+  - Al centro vedrete i bastoncini colorati per atomo delle istidine **`HIS 40`** e **`HIS 67`** e dei loro partner di legame a idrogeno.
+  - **Come fare le foto:** Aprendo `Graphics -> Representations`, potete fare doppio click sulla riga `Surf` per accendere una "nuvola" rossa semitrasparente sopra i 24 amminoacidi della zona funzionale vietata, e salvare l'immagine da `File -> Render -> Snapshot`!
+
+---
+
+### 3. `scripts/02_build_wt_charmm36m.tcl` — Costruzione Topologia `CHARMM36m`, Scatola d'Acqua e Ioni
+- **Come si lancia:**
+  ```bash
+  vmd -dispdev text -e scripts/02_build_wt_charmm36m.tcl
+  ```
+- **Cosa fa:** Toglie i vecchi idrogeni NMR, imposta i tautomeri corretti delle 4 istidine, ricostruisce la topologia `CHARMM36m` (`psfgen`), immerge la proteina in un cubo d'acqua `TIP3P` con margine $12\text{ Å}$ (`solvate`) e aggiunge ioni $\text{Na}^+$ e $\text{Cl}^-$ a $0.15\text{ M}$ per portare la carica totale a zero (`autoionize`).
+- **Cosa aspettarsi come output (File generati + Testo):**
+  - **File creati in `01_structures/`:**
+    - `2myo_wt.psf` e `2myo_wt.pdb` (solo proteina nel vuoto, `1.815` atomi, carica `-5.00 e`).
+    - `2myo_wb_ionized.psf` e `2myo_wb_ionized.pdb` (proteina + acqua + ioni, **`21.461` atomi**, `6.535` molecole d'acqua, `23` $\text{Na}^+$, `18` $\text{Cl}^-$, carica totale **`0.0000 e`**).
+    - `pbc_box_params.txt` (contiene i vettori della scatola `71.840 × 58.972 × 54.840 Å` e centro `7.735, -8.087, 86.003`).
+
+---
+
+### 4. `scripts/viz_02_solvated_box.tcl` — 📸 Visualizzazione 3D della Scatola Periodica d'Acqua (Slide 3)
+- **Come si lancia:**
+  ```bash
+  vmd -e scripts/viz_02_solvated_box.tcl
+  ```
+- **Cosa aspettarsi come output VISIVO (Finestra 3D di VMD):**
+  - Sfondo bianco con un **parallelepipedo delineato da bordi neri** (`pbc box`).
+  - Al centro c'è la **Myotrophin** circondata da un reticolo azzurro trasparente (le `6.535` molecole d'acqua) e da **23 sfere Blu** (ioni Sodio $\text{Na}^+$) e **18 sfere Arancioni** (ioni Cloro $\text{Cl}^-$) distribuite nel volume.
+
+---
+
+### 5. `scripts/03_analyze_wt_baseline.tcl` — Analisi Completa delle Traiettorie MD (`analysisMD.tcl` del Prof. + $Q$-value)
+- **Come si lancia:**
+  ```bash
+  vmd -dispdev text -e scripts/03_analyze_wt_baseline.tcl
+  ```
+- **Cosa fa:** Integra **tutte le analisi di `/home/olly/UNI/BioMolEng2026/laboratorio/analysisMD.tcl` del Prof. Gautieri** con il calcolo del **$Q$-value di Bekker et al. (2019)**:
+  - Allinea tutti i fotogrammi della simulazione sul backbone del fotogramma 0 (`measure fit`).
+  - Calcola per il WT a $300\text{ K}$ e a $400\text{ K}$: **RMSD del backbone**, **RMSF dei $C_\alpha$**, **Numero e % di occupazione degli Hydrogen Bonds**, **SASA** (superficie esposta al solvente), **Raggio di Girazione ($R_g$)**, **Percentuale di $\alpha$-elica (`AlphaPerc` tramite STRIDE)**, **$Q$-value nel tempo** (`all-all`, `hydrophilic-all`, `hydrophobic-small`, e separato per **`ANK1`, `ANK2`, `ANK3`, `ANK4`**) e infine il **$\langle Q_i \rangle$ per ciascuno dei 118 amminoacidi** negli ultimi 30% della run a $400\text{ K}$.
+- **Cosa aspettarsi come output (File generati in `02_wt_baseline/`):**
+  - `rmsd_300K.dat` e `rmsd_400K.dat`: 2 colonne (`Frame`, `RMSD in Å`). A $300\text{ K}$ ci aspettiamo valori bassi (~1.5–2.5 Å); a $400\text{ K}$ valori più alti (~3.0–5.0 Å).
+  - `rmsf_300K.dat` e `rmsf_400K.dat`: 2 colonne (`Resid 1..118`, `RMSF in Å`). La curva a $400\text{ K}$ sarà più alta di quella a $300\text{ K}$, con picchi sui loop e nelle zone instabili.
+  - `hbonds_300K.dat`, `hbonds_400K.dat` e `hbonds_details_400K.txt`: numero di legami a idrogeno nel tempo e tabella con la `% di esistenza` di ogni singola coppia donatore–accettore!
+  - `sasa_300K.dat`, `sasa_400K.dat`, `rgyr_300K.dat`, `rgyr_400K.dat`, `alpha_300K.dat`, `alpha_400K.dat`: evoluzione nel tempo della superficie esposta ($\text{Å}^2$), della compattezza ($R_g \approx 14.5\text{--}15.5\text{ Å}$) e della % di $\alpha$-elica ($\approx 45\text{--}55\%$).
+  - `q_time_300K.dat` e `q_time_400K.dat`: 8 colonne (`Frame`, `Q_all`, `Q_phil_all`, `Q_phob_small`, `Q_ANK1`, `Q_ANK2`, `Q_ANK3`, `Q_ANK4`). Parte da $1.000$ al frame 0; a $300\text{ K}$ resta alto ($\sim 0.85\text{--}0.95$), mentre a $400\text{ K}$ scende ($\sim 0.65\text{--}0.80$) mostrando quale dei 4 Ankyrin Repeats cede di più!
+  - **`unstable_residues_report.txt`**: La **tabella leggibile a occhio umano** con tutti i 118 amminoacidi, quanti contatti nativi avevano all'inizio, il loro $\langle Q_i \rangle$ finale a $400\text{ K}$ e l'etichetta `>>> UNSTABLE (Q<0.6) <<<`, `WEAK` o `MASKED`!
+  - `wt_400K_q_beta.pdb`: L'ultimo fotogramma della proteina a $400\text{ K}$ in cui nella colonna `Beta` di ogni atomo è scritto il valore $\langle Q_i \rangle$ del suo amminoacido (serve per colorare in 3D la proteina nello script 8!).
+
+---
+
+### 6. `scripts/plot_wt_baseline.py` — 📈 Generazione Automatica dei Grafici 2D Vettoriali per le Slide (Slide 4)
+- **Come si lancia:**
+  ```bash
+  python3 scripts/plot_wt_baseline.py
+  ```
+- **Cosa aspettarsi come output VISIVO (2 File PDF Vettoriali in `06_presentation/`):**
+  1. **`06_presentation/fig5_wt_baseline_plots.pdf`**: Pannello vettoriale a 4 quadranti pronto da inserire nella **Slide 4**:
+     - *In alto a sinistra:* Curva **RMSD** ($300\text{ K}$ blu vs $400\text{ K}$ rossa).
+     - *In alto a destra:* Curva **$Q(t)$** (`all-all` e `hydrophilic-all`).
+     - *In basso a sinistra:* Profilo **RMSF** lungo i 118 amminoacidi con le 4 bande verticali colorate di `ANK1`, `ANK2`, `ANK3`, `ANK4`.
+     - *In basso a destra:* Profilo **$\langle Q_i \rangle$ a $400\text{ K}$** con la linea tratteggiata rossa a $Q_i = 0.60$, i pallini blu della *Functional Mask* e i **pallini rossi con i nomi dei 5 amminoacidi più instabili dello scaffold**!
+  2. **`06_presentation/fig5b_wt_analysisMD_observables.pdf`**: Pannello vettoriale a 4 quadranti con tutte le osservabili di `analysisMD.tcl` del Prof. Gautieri:
+     - *In alto a sinistra:* **% di $\alpha$-elica** nel tempo ($300\text{ K}$ vs $400\text{ K}$).
+     - *In alto a destra:* **Numero di Hydrogen Bonds** nel tempo ($300\text{ K}$ vs $400\text{ K}$).
+     - *In basso a sinistra:* **Raggio di Girazione ($R_g$)** nel tempo.
+     - *In basso a destra:* **$Q(t)$ separato per i 4 singoli Ankyrin Repeats (`ANK1` Blu, `ANK2` Ciano, `ANK3` Arancio, `ANK4` Verde)** a $400\text{ K}$!
+
+---
+
+### 7. `scripts/viz_03_wt_instability.tcl` — 📸 Visualizzazione 3D dei Punti Deboli a 400 K (Slide 4)
+- **Come si lancia (dopo aver eseguito `03_analyze_wt_baseline.tcl`):**
+  ```bash
+  vmd -e scripts/viz_03_wt_instability.tcl
+  ```
+- **Cosa aspettarsi come output VISIVO (Finestra 3D di VMD):**
+  - Vedrete due strutture sovrapposte:
+    1. **Ombra Grigia Trasparente:** la forma iniziale perfetta della Myotrophin all'istante 0.
+    2. **Struttura Opaca Colorata (`Scala Rosso-Bianco-Blu`):** la forma della Myotrophin dopo lo stress termico a $400\text{ K}$, dove il colore di ogni pezzo indica il suo $\langle Q_i \rangle$:
+       - **Blu scuro** = Pezzi rimasti super-stabili ($\langle Q_i \rangle \approx 0.90\text{--}1.00$).
+       - **Bianco/Rosa** = Pezzi mediamente flessibili ($\langle Q_i \rangle \approx 0.65\text{--}0.75$).
+       - **Rosso acceso (con le catene laterali disegnate a bastoncino)** = I **"bulloni instabili" ($\langle Q_i \rangle < 0.65$)** che hanno ceduto al calore e che andremo a rinforzare con le mutazioni nella Fase 3!
+
+---
+
+### 8. `02_wt_baseline/run_overnight_wt.sh` — 🌙 Batch Notturno Automatico (Fase 2 Completa)
+- **Come si lancia (in background resistente alla chiusura del terminale):**
+  ```bash
+  nohup bash 02_wt_baseline/run_overnight_wt.sh 8 > 02_wt_baseline/overnight_master.log 2>&1 &
+  ```
+- **Cosa fa:** Esegue in sequenza automatica:
+  1. `namd3 +p8 02_wt_baseline/wt_300K.conf` (Controllo fisiologico a $300\text{ K}$)
+  2. `namd3 +p8 02_wt_baseline/wt_400K.conf` (Stress termico a $400\text{ K}$)
+  3. `vmd -dispdev text -e scripts/03_analyze_wt_baseline.tcl` (Analisi completa `analysisMD.tcl` + $Q$-value)
+  4. `python3 scripts/plot_wt_baseline.py` (Generazione dei due PDF vettoriali definitivi in `06_presentation/`)
+- **Cosa aspettarsi come output:** Tutti i file `.dcd`, `.log`, `.dat`, `unstable_residues_report.txt` e i due PDF `fig5_wt_baseline_plots.pdf` e `fig5b_wt_analysisMD_observables.pdf` pronti al mattino!
+
+---
+
+### 9. `scripts/04_ankyrin_consensus_and_targets.py` — 🧬 Allineamento Consenso Ankyrin & Preparazione Target FoldX (Fase 3.1)
+- **Come si lancia:**
+  ```bash
+  python3 scripts/04_ankyrin_consensus_and_targets.py
+  ```
+- **Cosa fa:**
+  1. Allinea i 4 moduli Ankyrin Repeat di `2MYO` (`ANK1`, `ANK2`, `ANK3`, `ANK4`) contro la sequenza consenso universale di 33 residui degli Ankyrin Repeats termostabili (*Mosavi et al., PNAS 2002*).
+  2. Incrocia le posizioni con la **Functional Mask** (24 residui intoccabili da `3AAA`) e con gli outlier torsionali di Ramachandran (`REMARK 500` di `2MYO.pdb`).
+  3. Genera automaticamente il file di configurazione per FoldX `PositionScan` sulle 35 posizioni candidate dello scaffold.
+- **Cosa aspettarsi come output (Numerico + Visivo PDF):**
+  - **`03_mutations/ankyrin_consensus_report.txt`**: Tabella di allineamento testuale dei 4 repeat con i 10 Hotspot principali (`LEU 73 -> H`, `LYS 94 -> V/I`, `PRO 64`, `LEU 105 -> F`, ecc.).
+  - **`03_mutations/position_scan_hotspots.cfg`**: File di configurazione pronto per FoldX (`35 posizioni × 20 aa = 700 mutazioni`).
+  - **`06_presentation/fig6_ankyrin_consensus_alignment.pdf`** *(Output Visivo 2D)*: Matrice grafica vettoriale a colori dei 4 Ankyrin Repeats allineati al consenso (Verde = già consenso; Giallo/Oro = Hotspot candidato; Rosso = Functional Mask vietata), pronta per la **Slide 5**!
+
+---
+
+### 10. `03_mutations/repair.cfg` & `03_mutations/position_scan_hotspots.cfg` — 🔧 Esecuzione di FoldX 5 (`RepairPDB` e `PositionScan`, Fase 3.2 & 3.3)
+- **Come si lanciano:**
+  ```bash
+  # 1. Riparazione delle catene laterali NMR (~60 secondi)
+  cp 01_structures/raw/2MYO.pdb 03_mutations/2MYO.pdb
+  foldx -f 03_mutations/repair.cfg > 03_mutations/repair.log
+
+  # 2. Scansione sistematica dei 20 amminoacidi sulle 35 posizioni candidate (~5-8 minuti)
+  foldx -f 03_mutations/position_scan_hotspots.cfg > 03_mutations/position_scan.log
+  ```
+- **Cosa aspettarsi come output:**
+  - `03_mutations/2MYO_Repair.pdb` e `2MYO_Repair.fxout`: la struttura Wild-Type rilassata nel campo di forza di FoldX.
+  - `03_mutations/PS_2MYO_Repair_scanning_output.txt`: l'elenco grezzo delle variazioni di energia libera $\Delta\Delta G_{\text{FoldX}}$ per le mutazioni testate.
+
+---
+
+### 11. `scripts/05_parse_foldx_screening.py` — 📊 Classifica Energetica FoldX + Incrocio con $\langle Q_i \rangle$ e Consenso (Fase 3.3)
+- **Come si lancia (dopo che `PositionScan` ha finito):**
+  ```bash
+  python3 scripts/05_parse_foldx_screening.py
+  ```
+- **Cosa fa:** Legge `PS_2MYO_Repair_scanning_output.txt`, scarta le auto-mutazioni ($\text{WT} \rightarrow \text{WT}$) e qualsiasi residuo della Functional Mask, incrocia ogni mutazione con il valore $\langle Q_i \rangle_{400\text{K}}$ della MD e con i target del Consenso Ankyrin, e ordina tutte le mutazioni dalla più stabilizzante ($\Delta\Delta G$ più negativo) alla meno stabilizzante.
+- **Cosa aspettarsi come output (Numerico + Visivo PDF):**
+  - **`03_mutations/foldx_top_mutations.txt`**: Tabella ordinata delle Top 40 mutazioni stabilizzanti con codice FoldX (es. `KA94V`, `LA73H`), modulo Ankyrin, $\Delta\Delta G_{\text{FoldX}}$, $\langle Q_i \rangle_{400\text{K}}$ e stella `★ CONSENSO ANKYRIN` quando la mutazione ripristina anche il consenso evolutivo!
+  - **`06_presentation/fig7_foldx_position_scan_heatmap.pdf`** *(Output Visivo 2D)*: Grafico a barre orizzontali vettoriale delle **Top 20 mutazioni termostabilizzanti** ($\Delta\Delta G < 0\text{ kcal/mol}$) colorate per Ankyrin Repeat e per convergenza col consenso (Verde), pronto per la **Slide 5 / 6**!

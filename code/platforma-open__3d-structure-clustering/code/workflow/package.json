@@ -1,0 +1,23 @@
+{
+  "name": "@platforma-open/milaboratories.3d-structure-clustering.workflow",
+  "version": "1.1.6",
+  "private": true,
+  "description": "Block Workflow",
+  "type": "module",
+  "scripts": {
+    "build": "shx rm -rf dist && pl-tengo build",
+    "format": "/usr/bin/env emacs --script ./format.el || echo 'No emacs.'",
+    "check": "pl-tengo check"
+  },
+  "dependencies": {
+    "@platforma-open/milaboratories.3d-structure-clustering.software": "workspace:*",
+    "@platforma-open/steineggerlab.software-foldseek": "catalog:",
+    "@platforma-sdk/workflow-tengo": "catalog:"
+  },
+  "devDependencies": {
+    "@platforma-sdk/tengo-builder": "catalog:",
+    "@platforma-sdk/test": "catalog:",
+    "shx": "catalog:"
+  },
+  "peerDependencies": {}
+}

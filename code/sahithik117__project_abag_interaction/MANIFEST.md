@@ -1,7 +1,7 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/sahithik117/project_abag_interaction
-- 快照日期: 2026-11-18
+- 快照日期: 2026-11-22
 - 快照 commit: [`66cc46a2d909`](https://github.com/sahithik117/project_abag_interaction/commit/66cc46a2d909ba047a533e279ba6ace97172468e)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 

@@ -1,0 +1,34 @@
+# One campaign = one design task. Paths are relative to the campaign file.
+campaign: demo_binder
+task: protein_binder      # protein_binder | small_molecule_binder | multimer | nucleic_acid_binder | enzyme_scaffold
+
+design:
+  engine: rfd4
+  # RFdiffusion4 input: annotated CIF preferred, condition JSON/YAML also works.
+  input: inputs/condition.cif
+  num_designs: 10
+  seed: 0
+  extra: []
+
+# Target definition used at prediction time. Design uses the trimmed target;
+# prediction uses the full-length target + MSA (+ AF3 templates).
+targets:
+  T1:
+    full: inputs/target_full.cif
+    trimmed: inputs/target_trim.cif
+    # a3m/stockholm; copied to each predictor's required layout automatically.
+    msa: inputs/target.a3m
+    templates: []            # AF3 only: [{mmcif: ..., queryIndices: [...], templateIndices: [...]}]
+    design_chain: B          # chain name inside the design backbone
+    predict_chain: B         # chain name in the prediction job
+    # kind: protein          # optional: protein | dna | rna (auto-detected)
+
+ligands: []                  # [{id: C, ccd: [ATP]}] or [{id: C, smiles: ...}]
+
+score:
+  predictors: [af3, boltz2, protenix2, opendde, mol1, esmfold2]
+  default: af3
+  # Chains compared against the design backbone with US-align.
+  align_chains: [A]
+  motif: null                # [{chain: A, res_ids: [45, 46, 47]}] for enzyme/motif RMSD
+  tmol: true

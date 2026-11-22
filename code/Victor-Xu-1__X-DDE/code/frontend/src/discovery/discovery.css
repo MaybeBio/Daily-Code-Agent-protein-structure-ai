@@ -1,0 +1,189 @@
+.discovery-results {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+}
+.discovery-results section,
+.discovery-results details {
+  min-width: 0;
+}
+.discovery-results .table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+.discovery-results table {
+  width: 100%;
+  min-width: 520px;
+}
+.discovery-results td,
+.discovery-results th {
+  padding: 8px;
+  text-align: left;
+}
+.discovery-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.discovery-sources span {
+  font-size: 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+.discovery-sources .is-ok {
+  background: var(--success-soft);
+  color: var(--success);
+  border-color: transparent;
+}
+.discovery-sources .is-unavailable {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: transparent;
+}
+.discovery-sources .is-ambiguous {
+  background: var(--warning-soft);
+  color: var(--warning);
+  border-color: transparent;
+}
+.discovery-results h4 {
+  margin: 6px 0;
+}
+
+.discovery-results .table-scroll {
+  max-height: 420px;
+  overflow: auto;
+}
+.discovery-results .table-scroll thead {
+  position: sticky;
+  top: 0;
+}
+.evidence-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+.evidence-header h3 {
+  font-size: 24px;
+  margin-top: 4px;
+}
+.evidence-header > span {
+  font-size: 12px;
+  color: var(--muted);
+}
+.target-evidence-results {
+  gap: 8px;
+}
+.target-evidence-results .evidence-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) fit-content(25%);
+  align-items: baseline;
+  gap: 12px;
+}
+.target-evidence-results .evidence-header > div {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  min-width: 0;
+  gap: 4px 12px;
+}
+.target-evidence-results .evidence-header h3 {
+  max-width: 100%;
+  font-size: 20px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.target-evidence-results .evidence-header .field-help {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.target-evidence-results > .result-summary-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  margin: 0;
+}
+.target-evidence-results > .result-summary-grid > div {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.target-evidence-results > .result-summary-grid dt {
+  font-size: 12px;
+  color: var(--muted);
+}
+.target-evidence-results > .result-summary-grid dd {
+  margin: 0;
+  font-size: 16px;
+}
+.target-evidence-results
+  .activity-molecule-preview
+  .molecule-drawing-style
+  select {
+  width: 180px;
+  max-width: none;
+}
+.target-evidence-results .activity-molecule-preview .figure-preview-sheet {
+  height: var(--activity-figure-height, clamp(260px, min(48svh, 65vw), 560px));
+}
+.target-evidence-results .target-activity-workspace table {
+  min-width: var(--activity-table-min-width, 320px);
+}
+html
+  body
+  .studio-app
+  .studio-content:has(> .tool-center.is-result .target-evidence-results)
+  > .module-task-picker {
+  display: none;
+}
+.evidence-description {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 5px;
+}
+.evidence-material-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.evidence-material-toolbar h3 {
+  margin-right: auto;
+}
+.target-materials {
+  display: grid;
+  gap: 20px;
+}
+.target-materials > section {
+  display: grid;
+  gap: 14px;
+}
+.evidence-row-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.tractability-cards {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  margin: 18px 0;
+}
+.tractability-cards > div {
+  display: grid;
+  gap: 7px;
+  background: var(--surface-muted);
+  padding: 16px;
+  border-radius: 10px;
+}
+.tractability-cards span {
+  color: var(--accent);
+  font-size: 12px;
+}

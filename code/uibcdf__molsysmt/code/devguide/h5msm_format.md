@@ -1,0 +1,428 @@
+# H5MSM Format Contract
+
+**Status:** normative for writers and readers implemented by MolSysMT.
+
+H5MSM is the versioned native persistence format for complete or partial
+molecular systems. Public conversion and h5msm writers emit version 1.0. Readers support versions
+0.3, 0.4, 0.5, experimental 0.6 and 1.0, with deprecation warnings for 0.3/0.4.
+Writing 0.5 or 0.6 requires an explicit `format_version`. Unknown versions
+are rejected explicitly. The legacy codec details below describe 0.3/0.4; the
+public modular layout is documented in
+[H5MSM 1.0](https://github.com/uibcdf/molsysmt/blob/HEAD/docs/content/user/tools/form/file/h5msm_10.md).
+
+## Version identities
+
+MolSysMT library versions and H5MSM format versions evolve independently.
+A new format major denotes an incompatible change to the schema or represented
+meaning; a new library major does not automatically renumber compatible files.
+Record the file version and the writing library's version separately. Readers
+accept their explicitly implemented versions/layer schemas, not every file with
+the same major. Changing a version attribute is not a schema migration.
+
+The maintainer's accepted target on 2026-11-08 is to qualify and publish the first
+stable **H5MSM 1.0 alongside MolSysMT 1.0**. The 2026-11-15 source/schema
+decision completes #256 after the bounded owner and independent consumer
+receiving. Development source supports explicit 1.0 reading and default writing;
+publication and exact-candidate qualification remain under #334/#524. See the
+[implementation and acceptance record](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/archive/resolved_proposals/h5msm_0_6_molecular_mechanics_persistence.md#resolution--2026-11-15).
+Format stability concerns the stored contract, not certification of every
+scientific model or completion of a requested force-field parameterization.
+
+## First-stable schema decision — 2026-11-15
+
+The wire contract selected for the first stable release is root **1.0** with
+the represented field types, units, presence distinctions and index associations
+specified here and in the linked 1.0/0.6/0.5 schema pages. Its admitted layers are:
+
+| Layer | Supported schema revisions |
+| --- | --- |
+| topology | 1–4 |
+| chemical_states | 1, 2 |
+| structures | 1 |
+| interactions collection | 1; result payloads 1 and 2, with current writers emitting 2 |
+| molecular_mechanics | 1 |
+| associations | 1 |
+
+The existing codecs are retained; this decision introduces no new encoding.
+The strict integral headers, typed metadata, independent domains and declared
+associations remain mandatory. Reads preserve unknown assignment-report content
+without claiming it can be used for projection, force-field reconstruction or
+export. Missing, unknown and known-empty data retain their distinct meanings.
+
+New ordinary public output uses 1.0. Explicit 0.5/0.6 writing, supported legacy
+reads and warnings, named migration helpers, version-preserving copies and
+extraction, and the legacy handler keep their documented contracts. No additional
+legacy deprecation is introduced by the stable-schema decision.
+
+The [BindingMT receiving review](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/binding_default_h5msm_acceptance_256_20261115.json)
+accepts the finite omitted-version save/migration profile alongside the earlier
+P5/P6 and MolSysViewer receiving. It does not qualify arbitrary file contents,
+an old native binary generally, another platform, or the final installed pair.
+The native domain/APIs and scientific profiles retain their separately declared
+Experimental classifications. Candidate construction and publication remain
+paused; a source/schema decision is not a published release.
+
+## Root contract
+
+Every file carries `type="h5msm"` and an explicitly implemented `version`.
+Precision, units and timestamps belong to the declarations of the particular
+root/layer schema: legacy roots carry defaults; modular layers declare their
+stored fields and units. Do not infer a global root unit or precision attribute
+in a modular file. Roots 0.6 and 1.0 require the five text attributes `type`,
+`version`, `creator`, `creator_version` and UTC `created_at`.
+The 1.0 root permits one optional `migration_source` text attribute containing
+a JSON object with the original 0.5 or 0.6 root metadata. The object retains
+`type`, `version` and any source `creator`, `creator_version`, `created_at`
+and legacy 0.5 `migrated_from_version` values. New file-writer fields are written
+at the root. Scientific producer records remain inside their original layers.
+
+Legacy roots contain `topology` and `structures` groups. Modular 0.5 layers
+`topology`, `chemical_states`, `structures` and named `interactions` are optional,
+with explicit associations; MolecularMechanics is outside 0.5. Absence of an optional
+dataset is different from a present nullable dataset and from a dataset filled
+with zero or `False`.
+
+## Modular encoding controls
+
+Integral headers such as layer versions, axis sizes, row counts and numbered
+collection counts must be scalar integers in the supported signed-64 index
+range. Boolean, floating-point, string and array encodings are rejected rather
+than coerced. Field-specific negative sentinels retain their existing meaning.
+Numbered collections compare the declared count with actual stored membership
+before enumerating their indices. These checks do not change valid wire data
+or require a format-version increment.
+
+Resident readers validate the layer schemas they decode. Metadata-only axis
+queries and association checks inspect common integral headers without
+certifying an omitted layer's payload schema or loading its arrays. Selective
+reads do not become whole-file validation; byte-preserving copies need not
+decode or validate contents. The rejection regressions are in
+`tests/form/file_h5msm/test_integer_metadata.py`.
+
+Roots 0.5, 0.6 and 1.0 use field-specific dtypes rather than a global precision flag.
+Structural floating series use float64; structure IDs use int64 or explicit
+text encoding; topology/chemical/reference data follow their layer contracts;
+mechanical tables/reports retain their declared admitted dtypes. Global casting
+could alter scientific binding or truncate typed data and is not implemented.
+Public conversion rejects explicitly supplied `int_precision`/`float_precision`
+with SMonitor `ArgumentConflictError`, including legacy single/double values,
+before file publication. Omit those keywords. Ordinary writing and represented
+values are unchanged. Legacy handler controls retain their 0.3/0.4 scope.
+Compression controls currently accept only the modular defaults (gzip, level 4);
+non-default requests are refused rather than silently substituted. These are
+writer capabilities, independent of the root and layer schema identities.
+
+## Experimental version 0.6
+
+The existing four domain codecs are reused with optional `molecular_mechanics`
+schema 1. The [0.6 user contract](https://github.com/uibcdf/molsysmt/blob/HEAD/docs/content/user/tools/form/file/h5msm_06.md)
+records the wire layout, field types, units, absence/empty distinctions and
+public operation limits. Public 0.6 writing is explicit and experimental; this
+is not the accepted first-stable-format freeze. Legacy handler support and 0.5
+writing remain unchanged. Metadata-only `h5msm.read_axis_sizes` preserves the
+independent declared domains without pretending matching counts identify them.
+
+Stored report trees may be unknown scientific schemas. Reads and full copies
+preserve them; assignment consumers and atom projection require their implemented
+schemas and refuse unsupported/incomplete reports through SMonitor. They do not
+repair, register, recalculate or rebind a stored report simply because it loaded.
+
+## Version 0.5 topology membership
+
+The canonical atoms, groups, molecules, entities and chains tables remain unchanged.
+Topology layer `schema_version=1` derives chain/group membership from stored atoms.
+Layer 2 contains the same tables plus `chain_groups/offsets` and
+`chain_groups/indices`, signed 64-bit integer vectors. Offsets start at zero,
+are nondecreasing, have `n_chains + 1` entries and end at the number of indices.
+Each slice lists unique valid group indices in chain order. Groups may occur in
+several chains. Empty slices retain empty chains; empty atom tables do not erase
+this declaration. Every observed atom group/chain pair must be included.
+
+Layer 3 adds `atom_molecules`, a signed 64-bit vector of shape `(n_atoms,)`.
+Nonnegative entries identify stored molecules for ungrouped atoms; `-1` means
+unknown. Grouped positions must be `-1`; they inherit group ownership instead.
+The layer may also contain `chain_groups`. It is independent of chemical states.
+New group-free topologies with atoms and stored molecules also use layer 3 when
+all assignments are unknown. An all-`-1` dataset distinguishes that state from
+the historical implicit reference partition; its native vector remains absent.
+
+Writers use layer 1 without an explicit relation, layer 2 for chain/group
+membership alone, and layer 3 when ungrouped atom/molecule ownership is stored.
+Readers accept all four and reject unsupported versions, malformed shapes,
+dtypes, offsets, duplicate or out-of-range memberships and conflicting grouped
+assignments. New layer schemas require an updated reader; the root remains 0.5.
+Guards: `tests/native/test_group_inventory_hierarchy.py` and
+`tests/form/file_h5msm/test_topology_v05_probe.py`.
+
+Joint legacy layer-1/2 topology and chemical-state decoding can snapshot the old
+group-free reference-component representation when an identity atom-axis link
+is declared and its reference and molecule inventory agree. Equal cardinalities
+alone establish no correspondence. Ambiguous or missing evidence stays unknown.
+Topology-only projections never load chemical states to recover it. Layers 3/4
+do not use that recovery path, and ordinary native queries never infer a
+molecule partition from chemical states.
+
+## Version 0.5 naming declarations
+
+Topology layer 4 preserves the same five stable tables and requires
+`group_naming_schemes`. The optional `chain_groups` and `atom_molecules` fields
+retain their existing contracts. The naming subgroup has exactly `schema_version`
+and `profiles` attributes and a `codes` dataset. Declaration schema 1 uses the
+JSON profile list `[{"name":"amber","version":1},{"name":"ccd","version":1},
+{"name":"legacy","version":1},{"name":"sequence","version":1}]`. The original
+three-profile registry remains accepted; a code is bounded by its actual encoded
+registry, not by every profile known to the reader. Profile versions identify this bounded
+declaration vocabulary, not an entire force-field or CCD database snapshot.
+
+`codes` is an unsigned one-byte vector of shape `(n_groups,)`: zero is unknown;
+1/2/3/4 identify the four profiles in order. Unsupported registry/schema versions,
+extra fields, invalid codes, dtypes and lengths reject. Writers choose layer 4
+when a naming declaration is present and otherwise retain layers 1/2/3. Older
+files without a declaration stay unknown; older readers reject layer 4 rather
+than dropping metadata. Root 0.5 and all other layer schemas are unchanged.
+
+The native vector is absent when all groups are unknown. Copies, extraction,
+atom-free group reordering, addition and builder growth preserve existing group
+codes; new groups start unknown. The declaration remains independent of chemistry
+and is read by the bounded #549 group-name helper and native sequence projection.
+Other name/classification/preparation consumers and general conversion overrides
+remain separately pending; metadata storage alone does not migrate them.
+Guards: `tests/native/test_group_naming_schemes.py` and
+`tests/form/file_h5msm/test_group_naming_schemes.py`.
+
+## Modular axis-link encoding
+
+An `identity` association maps every source index to the same target index and
+requires equal source and target cardinalities. Matching index values for only
+a prefix of a larger target axis are an explicit map, not an identity. Writers
+preserve those indices as a signed integer dataset, including empty source
+maps into a nonempty target population. Applying normalization repeatedly must
+retain the same association meaning and a reader-valid encoding.
+
+The number of structures need not equal the number of chemical states. A system
+with one structure, two states and a structure-to-state map `[0]` retains both
+states, its independent reference index, and the explicit map. Unknown state
+associations remain `-1`. Unsigned input maps must fit signed 64-bit storage
+before conversion; an overflowing value cannot become the unknown marker.
+Existing field, bound, injectivity and redundant-path
+checks apply; readers still reject an identity marker across unequal populations.
+This requires no H5MSM root or association-schema version change.
+
+## Resident geometry I/O
+
+The 0.5 coordinate writer transfers protected native blocks without assembling
+the full coordinate array. New coordinate datasets keep xyz together and bound
+the uncompressed HDF5 chunk size using an internal 256 KiB budget. Their temporal
+chunk extent divides the native storage and writer transfer extents, avoiding
+repeated partial compressed-chunk writes during initial creation. The precise
+shape/budget is an implementation policy, not an on-disk schema requirement.
+Empty axes retain HDF5's automatic chunk handling; readers accept older automatic
+layouts. Append preserves the dataset's existing layout and may touch partial
+edge chunks. Other series retain their existing layout policy.
+
+Loading one 0.5 path as one `MolSys` through public conversion uses the fresh
+resident graph without another eager snapshot by default. Explicit copy requests
+are honored; conversion of existing resident objects retains independent-copy
+semantics. Complete resident loading still requires storage for all loaded data,
+and public conversion can load the file before extracting a requested subset.
+This is not a public lazy-coordinate or selective-file query contract.
+Guards: `tests/form/file_h5msm/test_geometry_chunk_layout.py` and
+`tests/basic/convert/one_to_one/test_h5msm05_load_ownership.py`. Measurements and
+their limitations are in the [native-copy benchmark guide](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/benchmarking/native_copy.md).
+
+## Version 0.5 assembly metadata
+
+Native `Structures` construction normalizes each named biological assembly to
+one operation axis: proper finite rotations `(n_operations, 3, 3)` and
+unit-bearing translations `(n_operations, 3)`. Translation lists may supply
+different compatible length units. Empty quantity matrices still require length
+units. Rotation/translation counts agree; chain
+scope is either a shared nonnegative integer sequence or one sequence per
+operation. Validation creates independent containers and does not partially
+mutate the supplied mapping on failure. Repeated construction is idempotent.
+General structure/point transform axes are unchanged.
+
+The existing typed codec preserves operation order and chain scope and writes
+translations in nm. This repairs normal constructor-to-writer interoperability
+without changing the file schema or relaxing its shape checks. The storage
+codec's finite-matrix checks do not replace public proper-rotation validation
+when a caller deliberately bypasses digestion. Guard:
+`tests/form/file_h5msm/test_validated_bioassembly.py`.
+
+## Version 0.5 interaction metadata
+
+Named analyses are optional and may accompany structures, chemistry, topology,
+or stand alone with declared atom and structure index domains. Public conversion
+preserves typed sparse relations, occurrence order, evaluated-empty coverage,
+search scope, source maps, units, evidence and periodic images. The full contract
+is [Interaction Analysis API](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/interactions_api.md); the existing interaction
+codec schema is independent of the H5MSM root version.
+
+Each analysis stores producer `software` versions once in metadata. Interaction
+codec 2 also stores frame-scoped execution records separately from scientific
+parameters; codec-1 input is migrated on reading. The H5MSM root remains 0.5. Scientific
+selectors, profiles, definition labels and detached bibliography are ordinary
+versioned analysis parameters. The optional `parameters["attribution"]` payload
+uses `molsysmt.scientific_attribution@1`; it adds no per-occurrence columns and
+requires no new H5MSM root version. A loader preserves original producer
+versions and references without reporting a new calculation. Missing historical
+attribution stays absent, and missing producer versions stay unknown.
+Guards are `tests/interactions/test_scientific_attribution.py` and
+`tests/interactions/test_software_provenance.py`.
+
+Recorded covalent bonds are owned by the sibling `chemical_states` layer.
+Disulfide and metal-coordination observations must not replace that authority.
+Native Topology contains stable inventory only; its removed bond facade is not
+reconstructed by reading a file. ChemicalStates remains an independent domain.
+H5MSM 0.5 excludes `MolecularMechanics`; nonempty mechanics data are rejected
+rather than silently lost. The bounded mechanics-persistence plan is now eligible
+before the first stable H5MSM 1.0 freeze; see the version identities above.
+
+### Native composition without Structures
+
+A native system containing topology, chemical states and named analyses can be
+serialized without a Structures layer. It requires a declared identity atom link
+from chemical states to topology and from each analysis to topology. When multiple
+analyses are present, identity structure links must connect all their named axes.
+The writer emits a star rooted at the first sorted analysis name; the reader
+accepts any connected identity graph. One analysis needs no inter-analysis link.
+Equal cardinalities or matching source labels do not replace these declarations.
+
+The reader rejects missing, nonidentity or unrepresentable associations rather
+than composing ambiguous axes. Independent layer reading still preserves such
+domains. No coordinates, periodic boxes or structure-to-state association are
+created. Analyses retain their declared search scope, coverage (including evaluated
+empty frames), sparse observations, periodic images and original producer versions.
+Complete-axis scope may be normalized to its compact implicit representation by
+native remapping; the public `evaluation_scope` remains equivalent. A named empty
+analysis is supported, including a zero-length structure axis. A present-empty
+interaction layer remains distinguishable through `read_layers` and is rejected
+by native composition. Guard:
+`tests/form/file_h5msm/test_topology_chemistry_interactions_v05.py`.
+
+## Version 0.5 preparation history
+
+ChemicalStates owns historical preparation records alongside its assignments;
+history does not create another chemical store. Successful template application,
+peptide-template construction, aromatic normalization, fixed-state H generation
+and terminal attachment append an independent `molsysmt.preparation_record@1`
+envelope, retaining original
+output dimensions, provider report, indices, units and producer versions. Its
+`index_scope='operation'` explicitly excludes interpreting those indices as a
+live map after extraction, reordering, merging or edits. Merge concatenates
+histories in input order. Reading does not credit a new calculation.
+Public `ChemicalStates.append_preparation_history()` imports independent records
+in append order, keeping their original domains even in a larger destination.
+It does not apply chemistry, align axes or authenticate declarations. Intervening
+maps remain caller records. Geometry reports declare original source atom and
+structure counts and evaluated int64 structure indices; they do not duplicate
+coordinates. Legacy records without those fields leave structure coverage
+unspecified. The embedded readiness audit uses scalar lists for nullable/mixed
+columns and typed arrays for indices and homogeneous values.
+Normalization retains original order arrays with NaN for unknown values.
+Construction retains its complete declaration and original assembly version;
+reference records remain in synthetic template axes and are imported into a
+destination only through explicit historical archival. No report duplicates
+coordinates or certifies present chemistry.
+
+The chemical-state layer uses schema 2 when history exists, otherwise schema 1.
+Readers accept both; older schema-1-only readers reject schema 2. Each state's
+optional `preparation_history` group has its own schema version 1, a compressed
+UTF-8 manifest and typed numeric/string datasets with explicit NumPy dtype/shape
+declarations. No pickle or object-array decoding is supported. The public layout
+is specified in [H5MSM 0.5](https://github.com/uibcdf/molsysmt/blob/HEAD/docs/content/user/tools/form/file/h5msm_05.md).
+ChemicalStatesDict similarly writes version 2 for history-bearing states and
+reads versions 1/2. MolSysDict 0.1 rejects histories it cannot retain. Guards:
+`tests/native/test_preparation_history.py` and
+`tests/build/add_missing_hydrogens/test_preparation_history.py`, with construction
+and normalization controls in `tests/physchem/test_chemical_preparation_evidence.py`.
+
+## Version 0.4 topology
+
+`/topology` stores stable atom identity and semantic hierarchy:
+
+- `atoms`: `atom_id`, `atom_name`, `atom_type`, nullable `isotope`, `group_index`, `chain_index`;
+- `groups`, `molecules`, `entities`, and `chains` with their stable columns;
+- `chemical_states` as an ordered group keyed by contiguous integer strings.
+
+`/topology/chemical_states` declares `n_chemical_states` and a nullable
+`reference_chemical_state_index`, encoded as `-1` when absent. Each state owns:
+
+- optional `state_id`;
+- connectivity and component completeness;
+- component evidence and an optional provenance index;
+- atom-aligned `component_indices`;
+- a state-local `components` table;
+- optional nullable `atom_attributes` columns;
+- the full normalized nullable `bonds` table.
+
+Nullable datasets use a sibling `<name>__is_null` Boolean mask only when at
+least one value is missing. This preserves a materialized all-null column as
+distinct from an absent column. Canonical Pandas extension dtypes are restored
+by the reader.
+
+When a reference state exists, `/topology/components`,
+`/topology/atoms/component_index`, and endpoint datasets under
+`/topology/bonds` are compatibility hard links or projections. They do not
+constitute a second physical authority. Version-aware readers must use
+`chemical_states` for nullable and rich chemical semantics.
+
+## Structure-to-state association
+
+Version 0.4 stores `/structures/chemical_state_index` as an atom-independent
+integer vector aligned with stored structures. MolSysMT writers populate it
+from the authoritative `MolSys` association, use implicit zero for a topology
+with exactly one state, and encode missing multi-state associations as `-1`.
+The global reference state is never repeated as if it were per-structure
+evidence. Readers restore the vector on `MolSys`, not on `Structures`; the
+public `structure_chemical_state_index` attribute exposes resolved values.
+
+## Version 0.3 migration
+
+Version 0.3 remains read-only compatibility input for new scientific output.
+Its legacy bonds, components, and atom component indices become one reference
+chemical state. Connectivity is marked complete, component completeness is
+derived from missing membership, and component evidence is `unknown` because
+0.3 did not preserve source evidence. This is an explicit migration assumption,
+not a claim that the source format recorded that evidence.
+
+Legacy 0.3 extraction may retain a 0.3 output layout so large trajectories can
+be subset without materializing all coordinates. Public new conversion and writes emit 0.5. The explicit legacy codec retains
+its 0.4 layout for legacy operations.
+
+## Extraction safety
+
+Extracting an atom or structure subset from a `file:h5msm` input requires an
+explicit output filename that identifies a different file. Omitting the
+destination or naming the input through an equivalent path or hard link raises
+`ArgumentError` before any HDF5 file is opened for writing. An unrestricted
+extraction without a destination returns the original path unchanged. Callers
+that want an in-memory subset may request `to_form='molsysmt.MolSys'`.
+
+## Required validation
+
+Changes to H5MSM require tests for:
+
+- 0.3 migration and unknown-version rejection;
+- empty, single-state, and multi-state topology;
+- missing reference states;
+- absent, partially null, all-null, zero, and `False` values;
+- rich bond metadata and non-unique string IDs;
+- atom extraction with state-local endpoint and component remapping;
+- structural round trips and structure-to-state alignment;
+- direct file getters that expose a compatibility projection.
+
+Current bundled demos use H5MSM 0.4 and are validated against
+`molsysmt/data/demo_manifest.json`. One immutable 0.3 alanine-dipeptide fixture
+is isolated under `tests/form/file_h5msm/data/` for read-compatibility tests.
+Regenerating a file is not itself validation.
+
+## Declared hydrogen annotations
+
+The registered optional atom-state field `n_explicit_hydrogens` uses nullable UInt8
+semantics and the ordinary sibling null mask. It stores atom-level declarations
+such as RDKit `[NH2+]`, not indexed bonded H atoms or implicit hydrogens. The current
+chemical codec preserves it in 0.4/0.5; absent historical fields remain unknown.
+Readers predating the column may reject files containing it. Source atom/structure
+axes never grow merely to preserve this annotation. Guard:
+`tests/form/rdkit_Mol/test_declared_hydrogen_round_trip.py`.

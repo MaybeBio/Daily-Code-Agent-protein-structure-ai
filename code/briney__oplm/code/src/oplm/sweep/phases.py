@@ -1,0 +1,1678 @@
+"""Generate deterministic μP sweep phase artifacts from a production YAML."""
+
+from __future__ import annotations
+
+import math
+import shlex
+import subprocess
+from datetime import UTC, datetime
+from importlib.metadata import version
+from pathlib import Path  # noqa: TC003  # Typer resolves annotations at runtime.
+from typing import Annotated, Any, cast
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from oplm.config import get_preset_config, load_config, serialize_config
+from oplm.slurm.config import (
+    BatchPlan,
+    SlurmConfig,
+    TokenPlan,
+    load_slurm_config,
+    resolve_batch_plan,
+    resolve_token_plan,
+)
+from oplm.slurm.render import (
+    JobSpec,
+    SubmitEntry,
+    accelerate_command,
+    render_job,
+    render_submit_script,
+)
+from oplm.slurm.submit import running_job_ids, submit_all
+from oplm.sweep.common import (
+    JsonScalar,
+    Params,
+    PhaseManifest,
+    RunSpec,
+    accelerate_argv,
+    load_phase,
+    parse_candidates,
+    parse_floats,
+    relative_path,
+    result_metric,
+    write_phase,
+)
+
+app = typer.Typer(name="mup-sweep", help=__doc__, add_completion=False)
+console = Console()
+
+# Grid re-centered after the 170M coarse sweep ranked 0.0025 ~ 0.004 >> 0.0063 > 0.01 > 0.016,
+# putting the winner on the old grid's lower boundary. Same 1.6x spacing, shifted one half-decade
+# down, so both observed winners sit interior with headroom below and 0.0063 remains an upper
+# guard. The token-mode refresh passes --lrs to coarse instead (docs/mup-lr.md, "Commands").
+# The batch-mode history is in
+# https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/LR_SWEEP.md
+SMOKE_LRS = (0.0004, 0.0016, 0.0063)
+COARSE_LRS = (0.0004, 0.00063, 0.001, 0.0016, 0.0025, 0.004, 0.0063)
+OUTPUT_MULTS = (0.5, 1.0, 2.0)
+
+# μP reference depth: the 170M anchor's layer count. The repeated-block depth-LR correction
+# (24 / L) ** exponent is exactly 1.0 at this depth, so it anchors the transfer bracket.
+DEPTH_REFERENCE_LAYERS = 24
+
+# Depth-ray transfer check: fixed 768-wide (170M) geometry at depths bracketing the reference,
+# a coarse-grid-spaced (1.6x) LR bracket around each replicated finalist, and the depth-LR
+# exponent pinned at 0.5 -- the value consistent with the frozen 1/sqrt(L) residual branch
+# scaling. The phase verifies that the exponent-corrected LR optimum stays centered as depth
+# varies, rather than sweeping the exponent itself. The exponent's derivation is in
+# docs/mup-lr.md, "Depth correction"; the depth-ray check is described in
+# https://github.com/briney/oplm/blob/7db9c1bf0155fc9b4c05c8b358b3cf4cd6648f2c/docs/LR_SWEEP.md.
+TRANSFER_DEPTHS = (12, 24, 48)
+TRANSFER_LR_MULTS = (0.625, 1.0, 1.6)
+TRANSFER_DEPTH_EXPONENT = 0.5
+
+
+def _grid_default(values: tuple[float, ...]) -> str:
+    """Render an LR grid as the comma-separated string a Typer default expects."""
+    return ",".join(f"{value:g}" for value in values)
+
+
+def _as_float(value: JsonScalar) -> float:
+    """Coerce a JSON-sourced scalar that is known by construction to be numeric.
+
+    ``Params`` values are typed as ``JsonScalar`` (``str | int | float | bool | None``)
+    because they cross a JSON boundary, but the sweep phase helpers only ever populate
+    the numeric fields (``lr``, ``output_mult``, etc.) with real numbers. This narrows
+    that honest-but-wide type at the point of use; it performs the same conversion
+    ``float()`` always did and raises the same error if the assumption is ever wrong.
+    """
+    return float(cast("str | int | float", value))
+
+
+def _as_int(value: JsonScalar) -> int:
+    """Coerce a JSON-sourced scalar that is known by construction to be numeric.
+
+    See :func:`_as_float` for why the cast is needed.
+    """
+    return int(cast("str | int | float", value))
+
+
+def _parse_ints(raw: str, *, name: str) -> list[int]:
+    try:
+        values = [int(token) for token in raw.split(",") if token.strip()]
+    except ValueError as exc:
+        raise typer.BadParameter(f"{name} must be comma-separated ints, got {raw!r}") from exc
+    if not values:
+        raise typer.BadParameter(f"{name} must list at least one value")
+    return values
+
+
+def _parse_strings(raw: str, *, name: str) -> list[str]:
+    values = [token.strip() for token in raw.split(",") if token.strip()]
+    if not values:
+        raise typer.BadParameter(f"{name} must list at least one value")
+    return values
+
+
+def _cell(
+    *,
+    preset: str,
+    lr: float,
+    output_mult: float,
+    depth_exponent: float,
+    seed: int,
+    max_steps: int,
+    warmup_steps: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
+    batch_mult: float | None = None,
+    layers: int | None = None,
+    lr_mult: float | None = None,
+    base_lr: float | None = None,
+) -> Params:
+    if (global_examples is None) == (global_tokens is None):
+        raise ValueError("a sweep cell needs exactly one of global_examples or global_tokens")
+    params: Params = {
+        "preset": preset,
+        "lr": lr,
+        "output_mult": output_mult,
+        "depth_exponent": depth_exponent,
+        "seed": seed,
+        "max_steps": max_steps,
+        "warmup_steps": warmup_steps,
+    }
+    # One budget per cell: global examples (sequence batches) or a token budget (token mode).
+    if global_tokens is not None:
+        params["global_tokens"] = global_tokens
+    else:
+        params["global_examples"] = global_examples
+    if batch_mult is not None:
+        params["batch_mult"] = batch_mult
+    # Depth-ray cells override the preset's layer count and record the bracket position:
+    # `lr` is `base_lr * lr_mult`, and ranking groups by (base_lr, output_mult).
+    if layers is not None:
+        params["layers"] = layers
+    if lr_mult is not None:
+        params["lr_mult"] = lr_mult
+    if base_lr is not None:
+        params["base_lr"] = base_lr
+    return params
+
+
+def _batch_budget(
+    global_examples: int | None, global_tokens: int | None, *, default_examples: int
+) -> dict[str, int]:
+    """A phase's cell budget: ``--global-tokens`` (token mode), else ``--global-examples``.
+
+    The example count's default lives here rather than in the Typer option so the two flags can
+    be checked for mutual exclusion.
+    """
+    if global_examples is not None and global_tokens is not None:
+        raise ValueError("pass --global-examples or --global-tokens, not both")
+    if global_tokens is not None:
+        return {"global_tokens": global_tokens}
+    return {"global_examples": default_examples if global_examples is None else global_examples}
+
+
+def _batch_overrides(params: Params, plan: BatchPlan | TokenPlan) -> list[str]:
+    """Config overrides that pin a cell's batch: sequences per device, or token mode."""
+    if isinstance(plan, TokenPlan):
+        return [
+            f"train.tokens_per_step={_as_int(params['global_tokens'])}",
+            f"train.batch_tokens={plan.batch_tokens}",
+            # The derived value, which the trainer re-derives and accepts; a launch at another
+            # world size then fails at startup instead of training on a different budget.
+            f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
+            # Token mode packs whole sequences into fixed rows. train.batch_size keeps the base
+            # config's value, which in token mode sizes eval batches only.
+            "data.pack_sequences=true",
+        ]
+    return [
+        f"train.batch_size={plan.per_device_batch}",
+        f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
+    ]
+
+
+def _checkpointing_overrides(plan: BatchPlan | TokenPlan) -> list[str]:
+    """Pin full checkpointing for sequence cells; token cells keep the base config's.
+
+    Full checkpointing is what makes the derived per-device batches fit at 400M+. Both keys are
+    pinned so a change to packaged defaults cannot alter the memory profile mid-sweep. In token
+    mode the ``max_batch_tokens`` cap already bounds memory (sized under the config's own
+    checkpointing), so the pin would only add recompute.
+    """
+    if isinstance(plan, TokenPlan):
+        return []
+    return ["model.gradient_checkpointing=true", "model.gradient_checkpointing_mode=full"]
+
+
+def _write_run_config(
+    base_config: Path,
+    run_dir: Path,
+    params: Params,
+    *,
+    phase: str,
+    plan: BatchPlan | TokenPlan,
+    diagnostics: bool = False,
+) -> Path:
+    max_steps = _as_int(params["max_steps"])
+    warmup_steps = _as_int(params["warmup_steps"])
+    if warmup_steps < 0 or warmup_steps >= max_steps:
+        raise ValueError(
+            "warmup_steps must satisfy 0 <= warmup_steps < max_steps, "
+            f"got {warmup_steps} and {max_steps}"
+        )
+
+    preset = str(params["preset"])
+    preset_model = get_preset_config(preset).model
+    base = load_config(["--config", str(base_config)])
+    # AdamW-only μP (the ESM-C recipe) needs no adjust_lr_fn; Muon must use "original".
+    if base.train.optimizer == "muon" and base.train.muon_adjust_lr_fn != "original":
+        raise ValueError(
+            "μP sweep requires train.muon_adjust_lr_fn=original, "
+            f"got {base.train.muon_adjust_lr_fn}"
+        )
+    if base.train.weight_decay != 0.01:
+        raise ValueError(
+            f"μP sweep requires train.weight_decay=0.01, got {base.train.weight_decay}"
+        )
+    # Prefix the W&B run name with the phase. The run id alone is not unique across phases --
+    # SMOKE_LRS is a subset of COARSE_LRS, so a smoke cell and a coarse cell at the same LR
+    # produce the identical id and would appear as duplicate names in the W&B project, telling
+    # apart only by step count. The on-disk run directory keeps the bare id.
+    run_name = f"{phase}-{run_dir.name}"
+    # Checkpoint eight times per cell so a requeue loses at most ~12% of the run, and keep only
+    # the newest: these checkpoints exist solely to make requeue cheap.
+    save_every = max(1, max_steps // 8)
+    # Depth-ray cells keep the preset's width/heads and override only the layer count.
+    num_layers = _as_int(params["layers"]) if "layers" in params else preset_model.num_hidden_layers
+    overrides = [
+        f"model.hidden_size={preset_model.hidden_size}",
+        f"model.num_hidden_layers={num_layers}",
+        f"model.num_attention_heads={preset_model.num_attention_heads}",
+        "model.head_dim=64",
+        "model.mup_enable=true",
+        "model.mup_base_width=768",
+        f"model.mup_output_mult={params['output_mult']}",
+        *_checkpointing_overrides(plan),
+        f"train.lr={params['lr']}",
+        f"train.mup_depth_lr_exponent={params['depth_exponent']}",
+        f"train.mup_depth_reference_layers={DEPTH_REFERENCE_LAYERS}",
+        f"train.seed={params['seed']}",
+        *_batch_overrides(params, plan),
+        f"train.max_steps={params['max_steps']}",
+        "train.max_epochs=null",
+        f"train.warmup_steps={params['warmup_steps']}",
+        f"train.stable_steps={max_steps - warmup_steps}",
+        "train.scheduler=wsd_linear",
+        f"train.save_every={save_every}",
+        "train.save_total_limit=1",
+        f"train.output_dir={run_dir / 'output'}",
+        f"train.wandb_run_name={run_name}",
+        # Explicitly pin diagnostics so the flag overrides whatever the base config
+        # carries (off by default keeps the sweep robust; see docs/mup-lr.md).
+        f"train.stability_diagnostics={str(diagnostics).lower()}",
+    ]
+    cfg = load_config(["--config", str(base_config), *overrides])
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "run.yaml"
+    path.write_text(serialize_config(cfg))
+    return path
+
+
+def _resolve_metric(base_config: Path, metric: str | None) -> str:
+    cfg = load_config(["--config", str(base_config)])
+    eval_names = [name for name, value in (cfg.data.eval or {}).items() if value is not None]
+    allowed_metrics = [f"eval/{name}/loss" for name in eval_names]
+    if metric is not None:
+        if metric not in allowed_metrics:
+            if len(allowed_metrics) == 1:
+                expected = allowed_metrics[0]
+            elif allowed_metrics:
+                expected = f"one of: {', '.join(allowed_metrics)}"
+            else:
+                expected = "a configured eval/<task>/loss"
+            raise ValueError(f"--metric must be {expected}")
+        return metric
+    if len(eval_names) != 1:
+        raise ValueError("--metric is required unless the base config has exactly one eval task")
+    return allowed_metrics[0]
+
+
+def _input_candidates(source: Path, raw: str | None, names: tuple[str, ...]) -> list[Params]:
+    if raw is not None:
+        return parse_candidates(raw, names)
+    selected = load_phase(source).selected
+    if not selected:
+        raise ValueError(
+            f"source phase {source} has no selected candidates; analyze it or pass --candidates"
+        )
+    missing = sorted({name for candidate in selected for name in names if name not in candidate})
+    if missing:
+        # E.g. confirm straight from transfer (bridge skipped): no batch_mult was ever selected.
+        hint = " (batch_mult is 1 when the bridge was skipped)" if "batch_mult" in missing else ""
+        raise ValueError(
+            f"source phase {source}'s selected candidates lack {', '.join(missing)}; pass "
+            f"--candidates as {':'.join(names)}{hint}"
+        )
+    return [dict(candidate) for candidate in selected]
+
+
+def _run_id(params: Params) -> str:
+    # Depth-ray cells insert the layer count and bracket multiplier. The multiplier is not
+    # redundant with the effective lr: the coarse grid is 1.6x-spaced, so one candidate's
+    # x1.6 cell and the next candidate's x1 cell can land on the same effective lr.
+    depth = f"-d{_as_int(params['layers'])}" if "layers" in params else ""
+    mult = f"-x{_as_float(params['lr_mult']):g}" if "lr_mult" in params else ""
+    return (
+        f"{params['preset']}{depth}-lr{_as_float(params['lr']):g}"
+        f"-om{_as_float(params['output_mult']):g}"
+        f"-a{_as_float(params['depth_exponent']):g}{mult}-s{_as_int(params['seed'])}"
+    )
+
+
+def _defined_presets(tables: dict[str, dict[str, Any]]) -> list[str]:
+    """Every preset named anywhere across a `PhaseTable`'s per-phase tables, `*` excluded."""
+    return sorted({preset for table in tables.values() for preset in table if preset != "*"})
+
+
+def _resolve_nodes(slurm: SlurmConfig, *, phase: str, preset: str) -> int:
+    """Resolve the node count for a phase/preset pair, with an actionable error if missing.
+
+    `PhaseTable.resolve` raises a bare `KeyError` when no table entry covers `preset`, and every
+    phase command in this module catches only `ValueError` to convert it into a clean
+    `typer.BadParameter`. Re-raising as `ValueError` here routes a missing preset -- e.g. the
+    packaged `scale` default `50M`, which `configs/scaling.yaml` does not define -- through that
+    same clean error path instead of an uncaught traceback.
+    """
+    try:
+        return slurm.nodes.resolve(phase=phase, preset=preset)
+    except KeyError as exc:
+        defined = _defined_presets(slurm.nodes.tables)
+        raise ValueError(
+            f"preset {preset!r} has no entry in the slurm `nodes` table for phase {phase!r}; "
+            f"defined presets: {', '.join(defined) if defined else '(none)'}"
+        ) from exc
+
+
+def _resolve_preset_cap(table: dict[str, int], *, table_name: str, preset: str) -> int:
+    """Look up a per-preset cap, with an actionable error if the preset is missing.
+
+    Mirrors `_resolve_nodes`: a bare `KeyError` would surface as an uncaught traceback instead of
+    the clean `typer.BadParameter` every other validation failure produces.
+    """
+    try:
+        return table[preset]
+    except KeyError as exc:
+        defined = sorted(table)
+        raise ValueError(
+            f"preset {preset!r} has no entry in the slurm `{table_name}` table; "
+            f"defined presets: {', '.join(defined) if defined else '(none)'}"
+        ) from exc
+
+
+def _resolve_max_batch_size(slurm: SlurmConfig, preset: str) -> int:
+    return _resolve_preset_cap(slurm.max_batch_size, table_name="max_batch_size", preset=preset)
+
+
+def _resolve_max_batch_tokens(slurm: SlurmConfig, preset: str) -> int:
+    return _resolve_preset_cap(slurm.max_batch_tokens, table_name="max_batch_tokens", preset=preset)
+
+
+def _preset_sort_key(preset: str) -> tuple[float, str]:
+    """Order presets by size so `400M` precedes `1B`."""
+    scale = {"M": 1e6, "B": 1e9}.get(preset[-1].upper(), 1.0)
+    try:
+        return (float(preset[:-1]) * scale, preset)
+    except ValueError:
+        return (float("inf"), preset)
+
+
+def _resolve_time_limit(slurm: SlurmConfig, *, phase: str, preset: str | None) -> str:
+    """Resolve the time limit for a phase/preset pair, with an actionable error if missing.
+
+    Mirrors `_resolve_nodes`: a bare `KeyError` from `PhaseTable.resolve` would not be caught by
+    the `except ValueError` wrapper every phase command uses, and would surface as an uncaught
+    traceback instead of the clean `typer.BadParameter` every other validation failure produces.
+    """
+    try:
+        return slurm.time_limit.resolve(phase=phase, preset=preset)
+    except KeyError as exc:
+        raise ValueError(
+            f"phase {phase!r} preset {preset!r} has no entry in the slurm `time_limit` table"
+        ) from exc
+
+
+def _write_jobs(
+    out: Path,
+    phase: str,
+    runs: list[RunSpec],
+    slurm: SlurmConfig,
+    phase_json: Path,
+) -> list[SubmitEntry]:
+    """Write one array job per preset plus a dependent analyze job.
+
+    Slurm job arrays require homogeneous resources and node count varies by preset, so a phase
+    spanning several presets emits one array each, with a single analyze job
+    depending on all of them. Dependencies use ``afterany`` (see
+    :func:`oplm.slurm.render.render_submit_script`), so a diverged cell -- expected, ineligible
+    data to the ranking step -- cannot strand the analyze job in ``DependencyNeverSatisfied``.
+
+    Args:
+        out: The phase's resolved output directory (``phase.json``'s parent).
+        phase: The phase name, used to resolve per-phase node/time-limit overrides and to name
+            the generated scripts.
+        runs: Every cell generated for this phase, in manifest order. Grouped here by
+            ``params["preset"]``; the per-preset ``.jobs`` index file preserves that order so
+            array index ``i`` always maps to the same run ``phase.json`` would report at
+            position ``i`` within the group.
+        slurm: The phase's cluster settings.
+        phase_json: Absolute path to this phase's ``phase.json``, passed verbatim to the
+            analyze job's ``oplm sweep analyze`` command.
+
+    Returns:
+        The submission entries, in dependency order (one per preset array, then ``ANALYZE``).
+    """
+    jobs = out / "jobs"
+    jobs.mkdir(parents=True, exist_ok=True)
+    presets = sorted({str(run.params["preset"]) for run in runs}, key=_preset_sort_key)
+    entries: list[SubmitEntry] = []
+    for preset in presets:
+        group = [run for run in runs if str(run.params["preset"]) == preset]
+        index_file = jobs / f"{preset}.jobs"
+        index_file.write_text("\n".join(run.id for run in group) + "\n")
+        spec = JobSpec(
+            name=f"oplm-{phase}-{preset}",
+            nodes=_resolve_nodes(slurm, phase=phase, preset=preset),
+            time_limit=_resolve_time_limit(slurm, phase=phase, preset=preset),
+            command=accelerate_command(
+                module="oplm.sweep.run",
+                gpus_per_node=slurm.gpus_per_node,
+                args='--config "$RUN_DIR/run.yaml" --result "$RUN_DIR/result.json"',
+            ),
+            array_size=len(group),
+            array_index_file=index_file,
+            base_dir=out,
+            # `$RUN_DIR` is exported by the array-lookup block before this line renders, and
+            # matches the `output` subdir `_write_run_config` gives each cell's `train.output_dir`.
+            progress_dir="$RUN_DIR/output",
+        )
+        script = jobs / f"{preset}.sbatch"
+        script.write_text(render_job(spec, slurm))
+        entries.append(SubmitEntry(var=f"A_{preset}", script=Path("jobs") / script.name))
+
+    analyze_spec = JobSpec(
+        name=f"oplm-{phase}-analyze",
+        nodes=1,
+        time_limit=_resolve_time_limit(slurm, phase="analyze", preset=None),
+        command=f'oplm sweep analyze "{phase_json}"',
+        gres=False,
+    )
+    analyze_script = jobs / "analyze.sbatch"
+    analyze_script.write_text(render_job(analyze_spec, slurm))
+    entries.append(
+        SubmitEntry(
+            var="ANALYZE",
+            script=Path("jobs") / analyze_script.name,
+            depends_on=tuple(entry.var for entry in entries),
+        )
+    )
+
+    submit_path = jobs / "submit.sh"
+    submit_path.write_text(render_submit_script(entries))
+    submit_path.chmod(0o755)
+    return entries
+
+
+def _generate_phase(
+    *,
+    name: str,
+    base_config: Path,
+    out: Path,
+    metric: str | None,
+    source: Path | None,
+    cells: list[Params],
+    num_processes: int,
+    local: bool,
+    accelerate_config: Path | None,
+    diagnostics: bool = False,
+    submit: bool = False,
+) -> tuple[Path, list[list[str]]]:
+    if local and submit:
+        raise ValueError("--local and --submit are mutually exclusive")
+    base_config = base_config.resolve()
+    out = out.resolve()
+    source = source.resolve() if source is not None else None
+    accelerate_config = accelerate_config.resolve() if accelerate_config is not None else None
+    out.mkdir(parents=True, exist_ok=True)
+    slurm: SlurmConfig = load_slurm_config(base_config)
+    base = load_config(["--config", str(base_config)])
+    # Row width of a token-mode micro-batch (each device holds whole rows of this many tokens).
+    width = int(base.model.max_position_embeddings)
+    base_token_mode = base.train.tokens_per_step is not None
+    runs: list[RunSpec] = []
+    commands: list[list[str]] = []
+    for params in cells:
+        run_id = _run_id(params)
+        run_dir = out / "runs" / run_id
+        preset = str(params["preset"])
+        nodes = _resolve_nodes(slurm, phase=name, preset=preset)
+        # --local runs on this machine's processes, not the phase's node allocation. Deriving
+        # the plan from the node table there would silently shrink the global batch (a 400M
+        # cell is planned for 4 nodes; on 8 local processes that is 512, not 2048) and break
+        # every cross-cell comparison.
+        world_size = num_processes if local else nodes * slurm.gpus_per_node
+        if base_token_mode and "global_tokens" not in params:
+            # A sequence cell would inherit the base's token fields and train in token mode at an
+            # unplanned budget while phase.json described a sequence batch.
+            raise ValueError(
+                f"{base_config} is a token-mode config (train.tokens_per_step is set); pass "
+                "--global-tokens so every cell plans a token budget"
+            )
+        plan: BatchPlan | TokenPlan
+        if "global_tokens" in params:
+            plan = resolve_token_plan(
+                global_tokens=_as_int(params["global_tokens"]),
+                world_size=world_size,
+                max_batch_tokens=_resolve_max_batch_tokens(slurm, preset),
+                width=width,
+            )
+            audit: Params = {"batch_tokens": plan.batch_tokens}
+        else:
+            plan = resolve_batch_plan(
+                global_examples=_as_int(params["global_examples"]),
+                world_size=world_size,
+                max_batch_size=_resolve_max_batch_size(slurm, preset),
+            )
+            audit = {"per_device_batch": plan.per_device_batch}
+        config = _write_run_config(
+            base_config, run_dir, params, phase=name, plan=plan, diagnostics=diagnostics
+        )
+        result = run_dir / "result.json"
+        runs.append(
+            RunSpec(
+                run_id,
+                str(relative_path(config, out)),
+                str(relative_path(result, out)),
+                {
+                    **params,
+                    "nodes": nodes,
+                    **audit,
+                    "gradient_accumulation_steps": plan.gradient_accumulation_steps,
+                },
+            )
+        )
+        commands.append(
+            accelerate_argv(
+                config=config,
+                result=result,
+                # `plan.world_size` is the cell's true world size: equal to `num_processes` under
+                # --local, but `nodes * gpus_per_node` otherwise -- so commands.txt always agrees
+                # with run.yaml's batch keys on the same global batch.
+                num_processes=plan.world_size,
+                accelerate_config=accelerate_config,
+            )
+        )
+    phase_path = out / "phase.json"
+    manifest = PhaseManifest(
+        version=1,
+        phase=name,
+        metric=_resolve_metric(base_config, metric),
+        source=str(relative_path(source, out)) if source is not None else None,
+        runs=runs,
+        ranking=[],
+        selected=[],
+        # Record the installed distribution version for sweep provenance.
+        oplm_version=version("oplm"),
+        generated_at=datetime.now(tz=UTC).isoformat(),
+    )
+    write_phase(phase_path, manifest)
+    (out / "commands.txt").write_text("\n".join(shlex.join(command) for command in commands) + "\n")
+    entries = _write_jobs(out, name, runs, slurm, phase_path)
+    if submit:
+        manifest.job_ids = submit_all(entries, base_dir=out)
+        write_phase(phase_path, manifest)
+    return phase_path, commands
+
+
+def _smoke_cells(
+    lrs: list[float],
+    *,
+    seed: int,
+    steps: int,
+    warmup: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
+) -> list[Params]:
+    return [
+        _cell(
+            preset="170M",
+            lr=lr,
+            output_mult=1.0,
+            depth_exponent=0.0,
+            seed=seed,
+            global_examples=global_examples,
+            global_tokens=global_tokens,
+            max_steps=steps,
+            warmup_steps=warmup,
+        )
+        for lr in lrs
+    ]
+
+
+def _coarse_cells(
+    lrs: list[float],
+    *,
+    seed: int,
+    steps: int,
+    warmup: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
+) -> list[Params]:
+    return _smoke_cells(
+        lrs,
+        seed=seed,
+        steps=steps,
+        warmup=warmup,
+        global_examples=global_examples,
+        global_tokens=global_tokens,
+    )
+
+
+def _refine_cells(
+    candidates: list[Params],
+    output_mults: list[float],
+    *,
+    seed: int,
+    steps: int,
+    warmup: int,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
+) -> list[Params]:
+    return [
+        _cell(
+            preset="170M",
+            lr=_as_float(candidate["lr"]),
+            output_mult=output_mult,
+            depth_exponent=0.0,
+            seed=seed,
+            global_examples=global_examples,
+            global_tokens=global_tokens,
+            max_steps=steps,
+            warmup_steps=warmup,
+        )
+        for candidate in candidates
+        for output_mult in output_mults
+    ]
+
+
+def _replicate_cells(
+    source_runs: list[RunSpec], candidates: list[Params], seeds: list[int]
+) -> list[Params]:
+    cells: list[Params] = []
+    if 42 not in seeds:
+        raise ValueError("replicate seeds must include source seed 42")
+    for candidate in candidates:
+        source = next(
+            run
+            for run in source_runs
+            if run.params.get("lr") == candidate["lr"]
+            and run.params.get("output_mult") == candidate["output_mult"]
+            and run.params.get("seed") == 42
+        )
+        for seed in seeds:
+            if seed == 42:
+                continue
+            cells.append({**source.params, "seed": seed})
+    return cells
+
+
+def _transfer_cells(
+    candidates: list[Params],
+    *,
+    depths: list[int],
+    lr_mults: list[float],
+    exponent: float,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
+    seed: int,
+    steps: int,
+    warmup: int,
+) -> list[Params]:
+    """Cross each finalist with a per-depth LR bracket at fixed 170M width.
+
+    Every cell keeps the 170M preset's width and head count and overrides only the layer
+    count, so depth is the *only* thing that varies across the ray -- no width/heads/horizon
+    confound. The depth-LR exponent is pinned (not swept): the phase measures whether the
+    exponent-corrected LR optimum stays centered in the bracket as depth changes.
+    """
+    if 1.0 not in lr_mults:
+        raise ValueError("--lr-mults must include 1.0 (the transferred candidate itself)")
+    if DEPTH_REFERENCE_LAYERS not in depths:
+        raise ValueError(
+            f"--depths must include the μP reference depth {DEPTH_REFERENCE_LAYERS}, where the "
+            "depth-LR correction is a no-op and the bracket re-checks the finalist itself"
+        )
+    return [
+        _cell(
+            preset="170M",
+            lr=_as_float(candidate["lr"]) * lr_mult,
+            output_mult=_as_float(candidate["output_mult"]),
+            depth_exponent=exponent,
+            seed=seed,
+            global_examples=global_examples,
+            global_tokens=global_tokens,
+            max_steps=steps,
+            warmup_steps=warmup,
+            layers=depth,
+            lr_mult=lr_mult,
+            base_lr=_as_float(candidate["lr"]),
+        )
+        for candidate in candidates
+        for depth in depths
+        for lr_mult in lr_mults
+    ]
+
+
+def _bridge_cells(
+    candidates: list[Params],
+    *,
+    multipliers: list[float],
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
+    seed: int,
+    steps: int,
+    warmup: int,
+) -> list[Params]:
+    candidate = candidates[0]
+    return [
+        _cell(
+            preset="170M",
+            lr=_as_float(candidate["lr"]) * multiplier,
+            output_mult=_as_float(candidate["output_mult"]),
+            depth_exponent=_as_float(candidate["depth_exponent"]),
+            seed=seed,
+            global_examples=global_examples,
+            global_tokens=global_tokens,
+            max_steps=steps,
+            warmup_steps=warmup,
+            batch_mult=multiplier,
+        )
+        for multiplier in multipliers
+    ]
+
+
+def _confirm_cells(
+    candidates: list[Params],
+    *,
+    global_examples: int | None = None,
+    global_tokens: int | None = None,
+    seed: int,
+    steps: int,
+    warmup: int,
+) -> list[Params]:
+    return [
+        _cell(
+            preset="800M",
+            lr=_as_float(candidate["lr"]),
+            output_mult=_as_float(candidate["output_mult"]),
+            depth_exponent=_as_float(candidate["depth_exponent"]),
+            seed=seed,
+            global_examples=global_examples,
+            global_tokens=global_tokens,
+            max_steps=steps,
+            warmup_steps=warmup,
+            batch_mult=_as_float(candidate["batch_mult"]),
+        )
+        for candidate in candidates
+    ]
+
+
+def _smoke_gated_lrs(source: Path, lrs: list[float]) -> list[float]:
+    """Drop the smoke phase's highest LR from ``lrs`` when it failed to produce a finite metric.
+
+    The gate is derived from the source manifest's own learning rates rather than from a module
+    constant, so changing ``--lrs`` moves the gate with it.
+
+    Args:
+        source: Path to the completed smoke ``phase.json``.
+        lrs: Candidate coarse grid.
+
+    Returns:
+        ``lrs``, minus the smoke phase's highest learning rate if that cell diverged.
+
+    Raises:
+        ValueError: If the smoke phase has fewer than two cells, or either of its two lowest
+            learning rates lacks a finite metric.
+    """
+    phase = load_phase(source)
+    phase_dir = source.resolve().parent
+    runs_by_lr = {_as_float(run.params["lr"]): run for run in phase.runs}
+    phase_lrs = sorted(runs_by_lr)
+    if len(phase_lrs) < 2:
+        raise ValueError(f"smoke phase {source} must have at least two learning rates")
+    for lr in phase_lrs[:2]:
+        if result_metric(phase_dir, runs_by_lr[lr], phase.metric) is None:
+            raise ValueError(f"smoke lr={lr:g} lacks a finite {phase.metric}")
+    highest = phase_lrs[-1]
+    if result_metric(phase_dir, runs_by_lr[highest], phase.metric) is None:
+        return [lr for lr in lrs if lr != highest]
+    return lrs
+
+
+def _candidate(params: Params, keys: tuple[str, ...]) -> Params:
+    return {key: params[key] for key in keys if key in params}
+
+
+def _direct_ranking(phase_dir: Path, phase: PhaseManifest) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = [
+        {
+            "id": run.id,
+            "params": run.params,
+            "score": result_metric(phase_dir, run, phase.metric),
+        }
+        for run in phase.runs
+    ]
+    return sorted(
+        entries,
+        key=lambda entry: (
+            entry["score"] is None,
+            float(entry["score"]) if entry["score"] is not None else math.inf,
+            float(entry["params"].get("lr", math.inf)),
+        ),
+    )
+
+
+def _source_phase(phase_path: Path, phase: PhaseManifest) -> tuple[Path, PhaseManifest]:
+    if phase.source is None:
+        raise ValueError(f"{phase.phase} requires a source phase")
+    source_path = (phase_path.parent / phase.source).resolve()
+    return source_path, load_phase(source_path)
+
+
+def _aggregate_key(params: Params) -> tuple[float, float, float, float | None]:
+    batch_mult = params.get("batch_mult")
+    return (
+        _as_float(params["lr"]),
+        _as_float(params["output_mult"]),
+        _as_float(params.get("depth_exponent", 0.0)),
+        float(batch_mult) if batch_mult is not None else None,
+    )
+
+
+def _aggregate_params(key: tuple[float, float, float, float | None]) -> Params:
+    lr, output_mult, depth_exponent, batch_mult = key
+    params: Params = {
+        "lr": lr,
+        "output_mult": output_mult,
+        "depth_exponent": depth_exponent,
+    }
+    if batch_mult is not None:
+        params["batch_mult"] = batch_mult
+    return params
+
+
+def _sort_aggregate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def key(entry: dict[str, Any]) -> tuple[bool, float, float, float, float, float]:
+        params = entry["params"]
+        batch_mult = params.get("batch_mult")
+        return (
+            entry["score"] is None,
+            float(entry["score"]) if entry["score"] is not None else math.inf,
+            float(params["lr"]),
+            float(params["output_mult"]),
+            float(params["depth_exponent"]),
+            float(batch_mult) if batch_mult is not None else 0.0,
+        )
+
+    return sorted(entries, key=key)
+
+
+def _select_count(ranking: list[dict[str, Any]], count: int) -> list[Params]:
+    eligible = [entry for entry in ranking if entry["score"] is not None]
+    if len(eligible) < count:
+        return []
+    return [dict(entry["params"]) for entry in eligible[:count]]
+
+
+def _replicate_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str, Any]]:
+    source_path, source = _source_phase(phase_path, phase)
+    locations = [
+        *((source_path.parent, run) for run in source.runs),
+        *((phase_path.parent, run) for run in phase.runs),
+    ]
+    keys = {_aggregate_key(run.params) for run in phase.runs}
+    entries: list[dict[str, Any]] = []
+    for key in keys:
+        matching = [
+            (phase_dir, run) for phase_dir, run in locations if _aggregate_key(run.params) == key
+        ]
+        seeds = {_as_int(run.params["seed"]) for _, run in matching}
+        values = [result_metric(phase_dir, run, phase.metric) for phase_dir, run in matching]
+        score = (
+            sum(_as_float(value) for value in values) / len(values)
+            if 42 in seeds
+            and len(seeds) == len(matching)
+            and len(seeds) >= 2
+            and all(value is not None for value in values)
+            else None
+        )
+        entries.append({"params": _aggregate_params(key), "score": score})
+    return _sort_aggregate(entries)
+
+
+def _transfer_ranking(phase_path: Path, phase: PhaseManifest) -> list[dict[str, Any]]:
+    """Rank candidates by whether their transferred LR stays optimal across the depth ray.
+
+    Cells are grouped by candidate (``base_lr``, ``output_mult``). Within each depth, the
+    bracket winner is the ``lr_mult`` with the lowest finite loss; a missing or non-finite
+    bracket point counts as worst, so a diverged edge cell loses to any finite one. A candidate
+    *transfers* when the bracket center (``lr_mult=1.0``) wins at every depth; its score is the
+    mean center loss across depths. A candidate whose center cell is missing or non-finite at
+    any depth, or whose bracket winner is off-center at any depth, scores ``None`` (ineligible)
+    -- the per-depth ``winning_mults`` recorded on the entry show the drift direction.
+    """
+    groups: dict[tuple[float, float], list[RunSpec]] = {}
+    for run in phase.runs:
+        key = (_as_float(run.params["base_lr"]), _as_float(run.params["output_mult"]))
+        groups.setdefault(key, []).append(run)
+
+    entries: list[dict[str, Any]] = []
+    for (base_lr, output_mult), runs in sorted(groups.items()):
+        depths = sorted({_as_int(run.params["layers"]) for run in runs})
+        exponent = _as_float(runs[0].params["depth_exponent"])
+        winning_mults: dict[str, float | None] = {}
+        center_losses: list[float] = []
+        transfers = True
+        for depth in depths:
+            bracket = [
+                (
+                    result_metric(phase_path.parent, run, phase.metric),
+                    _as_float(run.params["lr_mult"]),
+                )
+                for run in runs
+                if _as_int(run.params["layers"]) == depth
+            ]
+            center = next((loss for loss, mult in bracket if mult == 1.0), None)
+            if center is None:
+                winning_mults[str(depth)] = None
+                transfers = False
+                continue
+            _, winner = min(
+                bracket,
+                key=lambda row: (row[0] is None, row[0] if row[0] is not None else 0.0, row[1]),
+            )
+            winning_mults[str(depth)] = winner
+            center_losses.append(center)
+            if winner != 1.0:
+                transfers = False
+        score = sum(center_losses) / len(center_losses) if transfers else None
+        entries.append(
+            {
+                "params": {
+                    "lr": base_lr,
+                    "output_mult": output_mult,
+                    "depth_exponent": exponent,
+                },
+                "score": score,
+                "winning_mults": winning_mults,
+            }
+        )
+    return _sort_aggregate(entries)
+
+
+def analyze_phase(path: Path) -> PhaseManifest:
+    path = path.resolve()
+    phase = load_phase(path)
+    phase.selected = []
+
+    if phase.phase == "replicate":
+        phase.ranking = _replicate_ranking(path, phase)
+        phase.selected = _select_count(phase.ranking, 2)
+    elif phase.phase == "transfer":
+        phase.ranking = _transfer_ranking(path, phase)
+        # Only candidates whose bracket center won at every depth are eligible; selecting one
+        # matches what bridge consumes. No eligible candidate means the exponent-corrected LR
+        # did not transfer -- inspect `winning_mults` for the drift direction instead of
+        # proceeding.
+        phase.selected = _select_count(phase.ranking, 1)
+    else:
+        phase.ranking = _direct_ranking(path.parent, phase)
+        eligible = [entry for entry in phase.ranking if entry["score"] is not None]
+        if phase.phase == "smoke":
+            scores = {float(entry["params"]["lr"]): entry["score"] for entry in phase.ranking}
+            ordered = sorted(scores)
+            if len(ordered) < 2:
+                raise ValueError("smoke requires at least two learning rates")
+            missing = [lr for lr in ordered[:2] if scores[lr] is None]
+            if missing:
+                listed = ", ".join(f"{lr:g}" for lr in missing)
+                raise ValueError(
+                    "smoke requires finite validation loss at the two lowest learning rates; "
+                    f"missing: {listed}"
+                )
+        elif phase.phase == "coarse":
+            if eligible:
+                by_lr = sorted(eligible, key=lambda entry: float(entry["params"]["lr"]))
+                winner_lr = float(phase.ranking[0]["params"]["lr"])
+                winner_index = next(
+                    index
+                    for index, entry in enumerate(by_lr)
+                    if float(entry["params"]["lr"]) == winner_lr
+                )
+                if 0 < winner_index < len(by_lr) - 1:
+                    phase.selected = [
+                        _candidate(entry["params"], ("lr", "output_mult"))
+                        for entry in by_lr[winner_index - 1 : winner_index + 2]
+                    ]
+        elif phase.phase == "refine":
+            ranked = [
+                {**entry, "params": _candidate(entry["params"], ("lr", "output_mult"))}
+                for entry in phase.ranking
+            ]
+            phase.selected = _select_count(ranked, 2)
+        elif phase.phase == "bridge":
+            keys = ("lr", "output_mult", "depth_exponent", "batch_mult")
+            ranked = [
+                {**entry, "params": _candidate(entry["params"], keys)} for entry in phase.ranking
+            ]
+            phase.selected = _select_count(ranked, 2)
+        elif phase.phase == "confirm":
+            keys = ("lr", "output_mult", "depth_exponent", "batch_mult")
+            ranked = [
+                {**entry, "params": _candidate(entry["params"], keys)} for entry in phase.ranking
+            ]
+            phase.selected = _select_count(ranked, 1)
+        elif phase.phase == "scale":
+            pass
+        else:
+            raise ValueError(f"unknown μP phase {phase.phase!r}")
+
+    write_phase(path, phase)
+    return phase
+
+
+@app.command()
+def analyze(
+    phase_json: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Rank completed cells and update one phase manifest in place."""
+    analyze_phase(phase_json)
+
+
+def _open_presets(phase_dir: Path, runs: list[RunSpec], metric: str) -> set[str]:
+    """Presets with at least one cell that has neither a finite metric nor a result file.
+
+    These are the only presets whose array job id is worth asking the scheduler about: a preset
+    whose every cell is already complete or non-finite never needs a "still running?" answer, so
+    querying its id would only add scheduler load (and risk tripping the "some id has aged out"
+    warning `running_job_ids` logs) for no benefit.
+    """
+    return {
+        str(run.params["preset"])
+        for run in runs
+        if result_metric(phase_dir, run, metric) is None and not (phase_dir / run.result).exists()
+    }
+
+
+def _cell_state(
+    *,
+    value: float | None,
+    has_result: bool,
+    job_id: str | None,
+    live: set[str],
+    scheduler_reachable: bool,
+    submitted: bool,
+) -> str:
+    """One cell's state: ``complete`` / ``non-finite`` / ``running`` / ``missing`` / ``unknown``.
+
+    ``submitted`` must reflect *this cell's own preset* (``f"A_{preset}" in job_ids``), not
+    whether the phase as a whole has any job ids at all -- a phase-wide flag would make a
+    never-submitted preset read as ``unknown`` (and thus be excluded from resubmit guidance,
+    see the ``status`` docstring) merely because some *other* preset in the same phase was
+    submitted.
+
+    ``unknown`` only arises when this cell's preset *was* submitted (so a definitive answer
+    exists in principle) but the scheduler cannot currently be asked. A preset that was simply
+    never submitted is unambiguously ``missing`` regardless of whether `squeue` happens to be on
+    PATH.
+    """
+    if value is not None:
+        return "complete"
+    if has_result:
+        return "non-finite"
+    if not scheduler_reachable:
+        return "unknown" if submitted else "missing"
+    if job_id is not None and job_id in live:
+        return "running"
+    return "missing"
+
+
+@app.command()
+def status(
+    phase_json: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Report per-cell state for one phase and print the resubmit line for incomplete cells.
+
+    States: ``complete`` (a finite metric is on disk), ``non-finite`` (a `result.json` exists but
+    its metric is missing/NaN/inf -- expected for a diverged learning rate, not an error),
+    ``running`` (no result yet, and the scheduler still reports that preset's array job), or
+    ``missing`` (no result, and the scheduler does not know about it). If the phase was submitted
+    but `squeue` cannot be queried right now, unresolved cells are reported as ``unknown`` instead
+    of being guessed as ``missing`` -- an operator seeing every cell as "missing" would resubmit
+    work that may already be running.
+
+    The resubmit line lists, per preset, the zero-based array indices that need rerunning
+    (``non-finite`` and ``missing`` cells) -- the same numbering that preset's ``.jobs`` index
+    file uses, so it can be passed directly to ``sbatch --array=``. A preset is withheld from
+    resubmit guidance when *every* one of its open cells is ``running`` or ``unknown``, for two
+    different reasons: a ``running`` cell may already be queued or executing, so resubmitting it
+    risks a duplicate run; an ``unknown`` cell's true state cannot be determined at all (the
+    scheduler could not be asked), so resubmitting it might be redundant or might be exactly the
+    first-time submission it needs -- the tool simply cannot tell. Either way, an explicit
+    ``skip`` line is printed for that preset so its absence from the resubmit guidance reads as
+    "withheld", not "complete".
+    """
+    path = phase_json.resolve()
+    phase = load_phase(path)
+    job_ids = phase.job_ids or {}
+    any_submitted = bool(job_ids)
+
+    open_presets = _open_presets(path.parent, phase.runs, phase.metric)
+    live: set[str] = set()
+    # Default to reachable: with no open presets or nothing submitted, the scheduler is never
+    # queried at all, and `_cell_state` never consults this flag when `submitted` is False for
+    # every cell (see its docstring), so this value is inert in that case.
+    scheduler_reachable = True
+    if open_presets and any_submitted:
+        query_ids = [job_ids[f"A_{preset}"] for preset in open_presets if f"A_{preset}" in job_ids]
+        query = running_job_ids(query_ids)
+        live = query.ids
+        scheduler_reachable = query.reachable
+    if open_presets and any_submitted and not scheduler_reachable:
+        console.print(
+            "[yellow]scheduler unreachable[/yellow]: cannot query the scheduler; cells with no "
+            "result on disk are marked [bold]unknown[/bold] rather than assumed finished"
+        )
+
+    table = Table(title=f"{phase.phase} ({phase.metric})")
+    table.add_column("preset")
+    table.add_column("idx", justify="right")
+    table.add_column("cell")
+    table.add_column("state")
+    table.add_column(phase.metric, justify="right")
+
+    seen: dict[str, int] = {}
+    incomplete: dict[str, list[int]] = {}
+    states_by_preset: dict[str, list[str]] = {}
+    for run in phase.runs:
+        preset = str(run.params["preset"])
+        index = seen.get(preset, 0)
+        seen[preset] = index + 1
+        value = result_metric(path.parent, run, phase.metric)
+        has_result = (path.parent / run.result).exists()
+        state = _cell_state(
+            value=value,
+            has_result=has_result,
+            job_id=job_ids.get(f"A_{preset}"),
+            live=live,
+            scheduler_reachable=scheduler_reachable,
+            submitted=f"A_{preset}" in job_ids,
+        )
+        states_by_preset.setdefault(preset, []).append(state)
+        if state in ("non-finite", "missing"):
+            incomplete.setdefault(preset, []).append(index)
+        shown = f"{value:.4f}" if value is not None else "-"
+        table.add_row(preset, str(index), run.id, state, shown)
+    console.print(table)
+
+    # A preset with open cells that never made it into `incomplete` was withheld entirely --
+    # every open cell is `running` or `unknown` -- not resolved. Say so explicitly per preset,
+    # rather than letting it silently disappear from the resubmit guidance below.
+    skipped: dict[str, str] = {}
+    for preset, states in states_by_preset.items():
+        if preset in incomplete:
+            continue
+        unknown_count = states.count("unknown")
+        running_count = states.count("running")
+        if unknown_count:
+            skipped[preset] = (
+                f"{unknown_count} cell(s) unknown -- scheduler unreachable, no resubmit "
+                "guidance offered"
+            )
+        elif running_count:
+            skipped[preset] = f"{running_count} cell(s) still running -- no resubmit needed"
+
+    if not incomplete and not skipped:
+        console.print("[green]nothing to resubmit[/green]")
+        return
+    for preset, indices in sorted(incomplete.items(), key=lambda item: _preset_sort_key(item[0])):
+        listed = ",".join(str(index) for index in indices)
+        console.print(f"resubmit {preset}: sbatch --array={listed} jobs/{preset}.sbatch")
+    for preset, reason in sorted(skipped.items(), key=lambda item: _preset_sort_key(item[0])):
+        console.print(f"[yellow]skip {preset}[/yellow]: {reason}")
+
+
+def _run_local(commands: list[list[str]]) -> None:
+    for command in commands:
+        subprocess.run(command, check=True)
+
+
+@app.command()
+def smoke(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    lrs: Annotated[str, typer.Option("--lrs")] = _grid_default(SMOKE_LRS),
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 1000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 100,
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
+) -> None:
+    """Generate the three-cell production smoke phase."""
+    try:
+        phase_path, commands = _generate_phase(
+            name="smoke",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=None,
+            cells=_smoke_cells(
+                parse_floats(lrs, name="--lrs"),
+                seed=seed,
+                steps=steps,
+                warmup=warmup,
+                **_batch_budget(global_examples, global_tokens, default_examples=2048),
+            ),
+            num_processes=num_processes,
+            local=local,
+            accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
+            submit=submit,
+        )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def coarse(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    source: Annotated[Path | None, typer.Option("--from", exists=True, dir_okay=False)] = None,
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    lrs: Annotated[str, typer.Option("--lrs")] = _grid_default(COARSE_LRS),
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 10000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k coarse run
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
+) -> None:
+    """Generate the production coarse LR phase, optionally gated by smoke results."""
+    try:
+        lr_values = parse_floats(lrs, name="--lrs")
+        if source is not None:
+            lr_values = _smoke_gated_lrs(source, lr_values)
+        phase_path, commands = _generate_phase(
+            name="coarse",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=_coarse_cells(
+                lr_values,
+                seed=seed,
+                steps=steps,
+                warmup=warmup,
+                **_batch_budget(global_examples, global_tokens, default_examples=2048),
+            ),
+            num_processes=num_processes,
+            local=local,
+            accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
+            submit=submit,
+        )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def refine(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
+    output_mults: Annotated[str, typer.Option("--output-mults")] = "0.5,1,2",
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 20000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 2000,  # 10% of the 20k refine run
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
+) -> None:
+    """Generate the production LR × output-multiplier refinement phase."""
+    try:
+        cells = _refine_cells(
+            _input_candidates(source, candidates, ("lr", "output_mult")),
+            parse_floats(output_mults, name="--output-mults"),
+            seed=seed,
+            steps=steps,
+            warmup=warmup,
+            **_batch_budget(global_examples, global_tokens, default_examples=2048),
+        )
+        phase_path, commands = _generate_phase(
+            name="refine",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=cells,
+            num_processes=num_processes,
+            local=local,
+            accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
+            submit=submit,
+        )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def replicate(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
+    seeds: Annotated[str, typer.Option("--seeds")] = "42,43,44",
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
+) -> None:
+    """Generate missing replicate seeds while retaining the source seed-42 results."""
+    try:
+        source_phase = load_phase(source)
+        cells = _replicate_cells(
+            source_phase.runs,
+            _input_candidates(source, candidates, ("lr", "output_mult")),
+            _parse_ints(seeds, name="--seeds"),
+        )
+        phase_path, commands = _generate_phase(
+            name="replicate",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=cells,
+            num_processes=num_processes,
+            local=local,
+            accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
+            submit=submit,
+        )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def transfer(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
+    depths: Annotated[str, typer.Option("--depths")] = _grid_default(TRANSFER_DEPTHS),
+    lr_mults: Annotated[str, typer.Option("--lr-mults")] = _grid_default(TRANSFER_LR_MULTS),
+    exponent: Annotated[float, typer.Option("--exponent")] = TRANSFER_DEPTH_EXPONENT,
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 10000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k transfer cells
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
+) -> None:
+    """Generate the fixed-width depth-ray LR-transfer check.
+
+    Depth is the only axis: every cell keeps the 170M width (768) and head count and varies
+    only the layer count, with the depth-LR exponent pinned (default 0.5, the value consistent
+    with the 1/sqrt(L) residual branch scaling). Each finalist gets a per-depth LR bracket;
+    the candidate transfers when the bracket center wins at every depth.
+    """
+    try:
+        cells = _transfer_cells(
+            _input_candidates(source, candidates, ("lr", "output_mult")),
+            depths=_parse_ints(depths, name="--depths"),
+            lr_mults=parse_floats(lr_mults, name="--lr-mults"),
+            exponent=exponent,
+            **_batch_budget(global_examples, global_tokens, default_examples=2048),
+            seed=seed,
+            steps=steps,
+            warmup=warmup,
+        )
+        phase_path, commands = _generate_phase(
+            name="transfer",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=cells,
+            num_processes=num_processes,
+            local=local,
+            accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
+            submit=submit,
+        )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def bridge(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
+    multipliers: Annotated[str, typer.Option("--multipliers")] = "0.7,1,1.4,2",
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 10000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k bridge run
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
+) -> None:
+    """Generate the production-batch bridge for the top transfer candidate."""
+    try:
+        cells = _bridge_cells(
+            _input_candidates(
+                source,
+                candidates,
+                ("lr", "output_mult", "depth_exponent"),
+            ),
+            multipliers=parse_floats(multipliers, name="--multipliers"),
+            **_batch_budget(global_examples, global_tokens, default_examples=8192),
+            seed=seed,
+            steps=steps,
+            warmup=warmup,
+        )
+        phase_path, commands = _generate_phase(
+            name="bridge",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=cells,
+            num_processes=num_processes,
+            local=local,
+            accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
+            submit=submit,
+        )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def confirm(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    metric: Annotated[str | None, typer.Option("--metric")] = None,
+    candidates: Annotated[str | None, typer.Option("--candidates")] = None,
+    global_examples: Annotated[int | None, typer.Option("--global-examples")] = None,
+    global_tokens: Annotated[int | None, typer.Option("--global-tokens")] = None,
+    seed: Annotated[int, typer.Option("--seed")] = 42,
+    steps: Annotated[int, typer.Option("--steps")] = 10000,
+    warmup: Annotated[int, typer.Option("--warmup")] = 1000,  # 10% of the 10k confirm run
+    num_processes: Annotated[int, typer.Option("--num-processes")] = 8,
+    local: Annotated[bool, typer.Option("--local/--no-local")] = False,
+    submit: Annotated[bool, typer.Option("--submit/--no-submit")] = False,
+    accelerate_config: Annotated[
+        Path | None, typer.Option("--accelerate-config", exists=True, dir_okay=False)
+    ] = None,
+    diagnostics: Annotated[bool, typer.Option("--diagnostics/--no-diagnostics")] = False,
+) -> None:
+    """Generate the production-batch 800M confirmation phase."""
+    try:
+        cells = _confirm_cells(
+            _input_candidates(
+                source,
+                candidates,
+                ("lr", "output_mult", "depth_exponent", "batch_mult"),
+            ),
+            **_batch_budget(global_examples, global_tokens, default_examples=8192),
+            seed=seed,
+            steps=steps,
+            warmup=warmup,
+        )
+        phase_path, commands = _generate_phase(
+            name="confirm",
+            base_config=config,
+            out=out,
+            metric=metric,
+            source=source,
+            cells=cells,
+            num_processes=num_processes,
+            local=local,
+            accelerate_config=accelerate_config,
+            diagnostics=diagnostics,
+            submit=submit,
+        )
+        if local:
+            _run_local(commands)
+            analyze_phase(phase_path)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@app.command()
+def scale(
+    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False)],
+    source: Annotated[Path, typer.Option("--from", exists=True, dir_okay=False)],
+    out: Annotated[Path, typer.Option("--out", file_okay=False)],
+    presets: Annotated[str, typer.Option("--presets")] = "170M,400M,800M,1B",
+) -> None:
+    """Write per-preset production scaling job scripts carrying the confirmed μP winner.
+
+    Unlike every other phase in this module, ``scale`` runs no proxy cells and owns no ranking:
+    it generates only. These are 100k-step production runs at the full preset ray -- days to
+    weeks each, and multi-node -- so the operator reviews and submits the generated scripts on
+    their own schedule; nothing here is ever submitted automatically.
+
+    ``config`` is an ordinary training config (see ``configs/scaling.yaml``) with no μP sweep
+    concepts in it. This command's only job is to merge the confirmed ``lr``, ``output_mult``,
+    and ``depth_exponent`` from ``source``'s selected winner into it and render one job per
+    preset through :mod:`oplm.slurm`, so someone reproducing a scaling run never needs to touch
+    the sweep. ``batch_mult`` is part of the winner's identity in ``phase.json`` (it distinguishes
+    candidates carrying different batch corrections during ranking) but has no corresponding
+    training config field: the ``bridge`` phase that produced it already folded the correction
+    into the winner's ``lr``, so there is nothing left here to merge.
+
+    With a token-mode training config (``train.tokens_per_step`` set), each preset gets its own
+    ``train.batch_tokens`` and accumulation from its node count and the slurm
+    ``max_batch_tokens`` table, so one token budget holds across the whole series.
+    """
+    try:
+        selected = load_phase(source).selected
+        if not selected:
+            raise ValueError(f"source phase {source} has no selected winner; analyze it first")
+        winner = selected[0]
+        config = config.resolve()
+        slurm = load_slurm_config(config)
+        out = out.resolve()
+        jobs = out / "jobs"
+        jobs.mkdir(parents=True, exist_ok=True)
+        base = load_config(["--config", str(config)])
+        token_mode = base.train.tokens_per_step is not None
+        for preset in _parse_strings(presets, name="--presets"):
+            run_dir = out / preset
+            run_dir.mkdir(parents=True, exist_ok=True)
+            nodes = _resolve_nodes(slurm, phase="scale", preset=preset)
+            overrides = [
+                f"model.mup_output_mult={_as_float(winner['output_mult'])}",
+                f"train.lr={_as_float(winner['lr'])}",
+                f"train.mup_depth_lr_exponent={_as_float(winner['depth_exponent'])}",
+                f"train.output_dir={run_dir / 'output'}",
+                f"train.wandb_run_name=oplm-{preset}-scale",
+                # These are days-to-weeks production runs, submitted for requeue -- bake
+                # auto-resume into the run config itself (the rendered command is just
+                # `--config run.yaml`, so this is the only place to set it).
+                "train.auto_resume=true",
+            ]
+            if token_mode:
+                # One token budget for every preset; each preset's micro-batch and accumulation
+                # follow from its node count and memory cap.
+                width = int(
+                    load_config(
+                        ["--config", str(config), "--preset", preset]
+                    ).model.max_position_embeddings
+                )
+                plan = resolve_token_plan(
+                    global_tokens=int(base.train.tokens_per_step),
+                    world_size=nodes * slurm.gpus_per_node,
+                    max_batch_tokens=_resolve_max_batch_tokens(slurm, preset),
+                    width=width,
+                )
+                overrides += [
+                    f"train.batch_tokens={plan.batch_tokens}",
+                    f"train.gradient_accumulation_steps={plan.gradient_accumulation_steps}",
+                ]
+            cfg = load_config(["--config", str(config), "--preset", preset, *overrides])
+            run_yaml = run_dir / "run.yaml"
+            run_yaml.write_text(serialize_config(cfg))
+            name = f"oplm-{preset}-scale"
+            spec = JobSpec(
+                name=name,
+                nodes=nodes,
+                time_limit=_resolve_time_limit(slurm, phase="scale", preset=preset),
+                command=accelerate_command(
+                    module="oplm.train",
+                    gpus_per_node=slurm.gpus_per_node,
+                    args=f"--config {run_yaml}",
+                ),
+                # These are the days-to-weeks production runs the requeue wrapper matters most
+                # for; its output_dir is known at render time (unlike an array job's $RUN_DIR).
+                progress_dir=str(run_dir / "output"),
+            )
+            (jobs / f"{name}.sbatch").write_text(render_job(spec, slurm))
+        typer.echo(f"wrote {len(list(jobs.glob('*.sbatch')))} scaling scripts to {jobs}")
+        typer.echo("review and submit them yourself; `scale` does not submit")
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc

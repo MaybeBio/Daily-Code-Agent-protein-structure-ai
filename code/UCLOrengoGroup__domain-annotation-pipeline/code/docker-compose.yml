@@ -1,0 +1,21 @@
+services:
+
+  cath-af-cli:
+    image: domain-annotation-pipeline-cath-af-cli
+    build:
+      context: .
+      dockerfile: docker/cath-af-cli/Dockerfile
+
+  script:
+    image: domain-annotation-pipeline-script
+    build: docker/script
+
+  ted-tools:
+    image: domain-annotation-pipeline-ted-tools
+    build:
+      context: .
+      dockerfile: docker/ted-tools/Dockerfile
+
+  foldseek:
+    image: domain-annotation-pipeline-foldseek
+    build: docker/foldseek

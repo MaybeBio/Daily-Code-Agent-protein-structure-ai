@@ -1,0 +1,628 @@
+#!/bin/bash
+# EVERY parity gate in this directory, over every model, in one resumable run.
+#
+#   bash dev/oracles/run_all_parity.sh                 # L0-L4 (the module gates)
+#   bash dev/oracles/run_all_parity.sh L5 L6           # the fold-level screens
+#   bash dev/oracles/run_all_parity.sh all             # everything
+#   FORCE=1 bash dev/oracles/run_all_parity.sh L1b     # ignore cached logs
+#   MODELS="boltz2 protenix2" bash dev/oracles/run_all_parity.sh
+#
+# WHY A DRIVER AND NOT A LIST IN A DOCUMENT. Every number in PARITY.md came out
+# of one of these scripts with a specific vendor overlay on PYTHONPATH and
+# JAX_DEFAULT_MATMUL_PRECISION=highest, and getting either wrong produces a
+# plausible degraded number rather than an error -- bf16 params and tf32 matmuls
+# faked six protenix2 "bugs" once. A refactor needs to re-run all of it, and
+# reconstructing thirty command lines by hand is where that goes wrong.
+#
+# HOW IT DECIDES WHAT TO RUN. It asks each gate about each model rather than
+# carrying a table: a gate with no adapter for a model exits non-zero with
+# "no native adapter for ...", which is recorded as SKIP, not FAIL. So adding an
+# adapter is picked up here with no change to this file, and the summary doubles
+# as the coverage matrix -- if it disagrees with PARITY.md, PARITY.md is stale.
+#
+# SERIALLY, ALWAYS. Two concurrent jobs OOM a 23 GB card. And note max|d| moves
+# ~20% between processes on the same input (XLA autotunes by timing), so read
+# corr and max|d|/rms; in-process reruns are bit-identical.
+. "$(dirname "${BASH_SOURCE[0]}")/../af3_dev_paths.sh"   # $REPO, $AF3_DEV_HOME, $AF3_PORTED_DIR
+set -u
+cd "$(dirname "$0")/../.."
+ROOT=$PWD
+PY=${PY:-$AF3_DEV_HOME/venv/bin/python}
+PY_ESM=${PY_ESM:-$AF3_DEV_HOME/venv_esm/bin/python}
+
+# --- vendor source overlays. One implementation usually serves a whole family,
+#     which is the leverage: ~/protenix covers both protenix releases and
+#     ~/openfold-3 covers openfold3 + openbind0.
+V_protenix=$AF3_DEV_HOME/protenix
+V_of3=$AF3_DEV_HOME/openfold-3
+# openbind0 is OF3 v0.5.0 and its RELEASE matters, not just its repository:
+# v0.5.0's end-node triangle attention transposes the pair bias and main's does
+# not, while main loads openbind0's pairformer tensors without complaint (the
+# releases differ by name only in the diffusion LayerNorms). Pointing this at
+# main certified the wrong convention for four days and cost 10.4 A on
+# ubiquitin. The tree is a worktree of the v0.5.0 tag:
+#   git -C ~/openfold-3 worktree add ~/openfold-3-v050 v0.5.0
+V_of3_ob=$AF3_DEV_HOME/openfold-3-v050
+V_if2=$AF3_DEV_HOME/IntelliFold
+V_dde=$AF3_DEV_HOME/OpenDDE
+V_rf3=$AF3_DEV_HOME/rf3_extra:$AF3_DEV_HOME/foundry_rf3/src:$AF3_DEV_HOME/foundry_rf3/models/rf3/src
+V_boltz2=$AF3_DEV_HOME/BoltzDesign1/boltz2/src
+# The overlay is per MODEL, and a wrong one is a silent wrong answer, not an
+# ImportError -- rf3's MSA gate ran green against openfold-3 on PYTHONPATH.
+vendor () {
+  case "$1" in
+    protenix1|protenix2)                echo "$V_protenix" ;;
+    openfold3)                          echo "$V_of3" ;;
+    openbind0)                          echo "$V_of3_ob" ;;
+    intellifold2)                       echo "$V_if2" ;;
+    opendde)                            echo "$V_dde" ;;
+    rosettafold3)                       echo "$V_rf3" ;;
+    boltz2)                             echo "$V_boltz2" ;;
+    # Everything else runs with no overlay: chai1's native is a TorchScript
+    # artifact loaded by path, esmfold2's lives in ~/venv_esm (see l1b_esm),
+    # and alphafold3 IS the reference implementation.
+    *)                                  echo "" ;;
+  esac
+}
+
+# Per DATE by default, which means a run spanning midnight writes into two
+# directories -- set LOGDIR explicitly to keep one run together.
+LOGDIR=${LOGDIR:-$ROOT/dev/oracles/parity_runs/$(date +%Y-%m-%d)}
+mkdir -p "$LOGDIR"
+SUMMARY=${SUMMARY:-$LOGDIR/summary.tsv}
+[ -f "$SUMMARY" ] || printf 'gate\tmodel\tstatus\theadline\n' > "$SUMMARY"
+
+# PROVENANCE. Every number here depends on a vendor tree, a checkpoint and a
+# library version as much as on our code, and none of them were recorded: a
+# moved vendor checkout or a new upstream revision in the hub cache changed what
+# a gate measured with no trace (PARITY.md, 2026-09-16, the ESMFold2 revision
+# switch; 2026-10-18, upstream AF3's RDKit bump reading as a featurisation bug).
+# Appended per invocation, so a resumed run shows every environment it mixed.
+# Not on REGRADE: that measures nothing, and today's versions written beside an
+# old run's logs would misdate them.
+[ -n "${REGRADE:-}" ] || {
+  echo "== $(date -Is)  ours $(git -C "$ROOT" describe --always --dirty)"
+  for v in "$V_protenix" "$V_of3" "$V_of3_ob" "$V_if2" "$V_dde" \
+           $AF3_DEV_HOME/foundry_rf3 $AF3_DEV_HOME/BoltzDesign1 \
+           $AF3_DEV_HOME/af3_upstream $AF3_DEV_HOME/ColabDesign2; do
+    printf '  %-40s %s\n' "$v" "$(git -C "$v" describe --always --dirty --tags 2>/dev/null || echo '?')"
+  done
+  for py in "$PY" "$PY_ESM" "${AF3_UPSTREAM_PY:-$HOME/venv_af3/bin/python}"; do
+    printf '  %-40s %s\n' "$py" "$($py -I -c 'import importlib.metadata as m
+print(" ".join("%s=%s" % (p, m.version(p)) for p in ("jax", "dm-haiku", "rdkit", "torch", "numpy") if any(d.metadata["Name"].lower() == p for d in m.distributions())))' 2>&1 | tail -1)"
+  done
+} >> "$LOGDIR/provenance.txt"
+
+# The sweep set: every model the graph knows. The four ESMFold2-Experimental
+# releases were removed from the project on 2026-09-09, so there is nothing to
+# exclude here any more -- model_config.MODELS is the list.
+MODELS=${MODELS:-$($PY -c 'import sys; sys.path.insert(0,"src")
+from alphafold3.model import model_config as c; print(" ".join(c.MODELS))')}
+
+# gate <name> <script+args...> -- runs one gate for one model.
+#   $1 log tag   $2 model   $3 grep pattern for the headline   rest: argv
+# A non-zero exit is not automatically a failure here, which is the whole reason
+# classification is its own function: a gate with no adapter for a model SAYS so
+# and exits 1 (SKIP), and dev/audit_coverage.py exits 1 to REPORT unaccounted
+# checkpoint tensors, which is a finding to read rather than a crash (WARN).
+# Calling those FAIL would bury the real failures in noise. Applied to cached
+# logs too, so a re-run re-classifies instead of keeping an old verdict.
+classify () {  # classify <log> <tag> -> status<TAB>detail on stdout
+  # EXIT 0 USED TO MEAN OK, and every module gate exits 0 after printing its
+  # numbers -- so a corr of 0.97 read OK and the summary counted gates that RAN.
+  # Now the NUMBERS decide (parity_audit.grade_log): PARITY, FLOOR (below the
+  # cell's own resolution), UNGRADED (nothing gradeable printed), or FAIL.
+  local log=$1 tag=$2
+  local rc; rc=$(sed -n 's/^__GATE_EXIT //p' "$log" | tail -1)
+  if [ "$rc" = 0 ]; then
+    case "$tag" in
+      # These grade themselves and exit non-zero on a bad value.
+      Lg.*|L7.*|L0.*)  printf 'OK\tself-graded\n' ;;
+      # Accuracy against a crystal structure, not agreement with a vendor.
+      L5*|L6*)         printf 'SCREEN\t\n' ;;
+      *)               $PY "$ROOT/dev/oracles/parity_audit.py" --log "$log" ;;
+    esac
+    return
+  fi
+  if [ "$rc" = 124 ]; then printf 'TIMEOUT\t\n'; return; fi
+  # Only an EXPLICIT "this gate has nothing to compare" is a skip. `KeyError` and
+  # `No module named` used to be on this list, so a crash read SKIP and then N/A:
+  # boltz2's L3.denoise was "no adapter" for weeks while it was really a missing
+  # `mashumaro` in ~/venv.
+  if grep -qi '^N/A:\|no native adapter\|no converter registered\|nothing to audit\|has no msa_encoder\|has no final-block\|no weights for\|no native dump at\|run first:' "$log"; then
+    printf 'SKIP\t\n'; return
+  fi
+  # A RESOURCE failure is not a result. Two gates sharing a 23 GB card is the
+  # usual cause and it says nothing about the port, so it gets its own status
+  # rather than being counted as a failure.
+  if grep -qi 'RESOURCE_EXHAUSTED\|CUDA_ERROR_OUT_OF_MEMORY\|Out of memory\|solver_handle_pool\|gpusolverDnCreate\|CUBLAS_STATUS_\|cuSolver internal error' "$log"; then
+    printf 'OOM\t\n'; return
+  fi
+  # NONZERO counts only. `[1-9][0-9]*` matters: every trunk gate prints
+  # "0 unmapped" on success, and matching a bare 'unmapped' made opendde's L1
+  # read WARN off a success line.
+  if grep -qEi '[1-9][0-9]* (unaccounted for|unmapped)' "$log"; then
+    printf 'WARN\t\n'; return
+  fi
+  printf 'CRASH\t%s\n' "$(grep -E '^[A-Za-z_.]+(Error|Exception):' "$log" | tail -1 | cut -c1-120)"
+}
+
+gate () {
+  local tag=$1 model=$2 pat=$3; shift 3
+  local log=$LOGDIR/$tag.$model.log
+  # REGRADE=1 classifies the logs a run already wrote and starts nothing: how a
+  # changed grading rule is applied to an old run, or to one still in progress.
+  if [ -n "${REGRADE:-}" ] && ! grep -qs '^__GATE_EXIT ' "$log"; then
+    return
+  fi
+  if [ -n "${FORCE:-}" ] || [ ! -f "$log" ] || ! grep -q '^__GATE_EXIT ' "$log"; then
+    local overlay; overlay=$(vendor "$model")
+    local pp=src:.
+    [ -n "$overlay" ] && pp=$pp:$overlay
+    # PYTHONPATH_EXTRA is for a gate that needs a SECOND implementation on the
+    # path -- af2_native_parity imports DeepMind's own alphafold alongside ours.
+    [ -n "${PYTHONPATH_EXTRA:-}" ] && pp=$pp:dev/oracles:$PYTHONPATH_EXTRA
+    # LM_CASE is set by the L5/L6 loops; the module gates feed their own inputs
+    # and want none of this.
+    local lm=; [ -n "${LM_CASE:-}" ] && lm=$(lm_env "$model" "$LM_CASE")
+    # Only a real VAR=path is passed to env. `${lm#__LM_MISSING=*}` was wrong
+    # here: `#` strips the SHORTEST matching prefix, so a missing-file marker
+    # became the bare filename and env ran it as a command (exit 127).
+    local lmset=
+    case "$lm" in *=*) [ "${lm#__LM_MISSING}" = "$lm" ] && lmset=$lm ;; esac
+    ( echo "__LM ${lm:-none}"
+      # PERSISTENT COMPILATION CACHE. Every cell is a FRESH PROCESS, so without
+      # this each one recompiles the whole graph: measured on the A10, a 6MRR
+      # fold cell is ~145 s of which ~73 s is XLA and ~67 s is the actual five
+      # samples (a second fold in the SAME process costs 67 s). With the cache
+      # warm a fresh process costs 40 s -- 3.6x, and the cache is 3.9 MB.
+      #
+      # `run_alphafold.py` has enabled this from the start via
+      # `platform.enable_compilation_cache`; the gates never did, and no cache
+      # existed on disk. The min_* settings matter: JAX's defaults skip small or
+      # fast-to-compile entries, which is most of what the module gates build.
+      #
+      # NOT for timing work. [[jax-cache-override]] records a case where a
+      # hijacked cache dir made benchmarks silently measure hits; the parity
+      # matrix compares NUMBERS, so a hit is free, but any runtime benchmark has
+      # to control for this.
+      JAX_COMPILATION_CACHE_DIR=${JAX_CACHE:-$HOME/.cache/alphafold3/jax} \
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=1 \
+      JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0 \
+      JAX_DEFAULT_MATMUL_PRECISION=highest PYTHONPATH=$pp \
+        env ${lmset:+"$lmset"} \
+        timeout "${GATE_TIMEOUT:-3600}" $PY "$@" 2>&1
+      echo "__GATE_EXIT $?" ) > "$log"
+  fi
+  local cls status detail
+  cls=$(classify "$log" "$tag"); status=${cls%%$'\t'*}; detail=${cls#*$'\t'}
+  # SKIP means two very different things: a module this model DOES NOT HAVE,
+  # and a module it has with no adapter written. Reported as one status, the
+  # summary has no denominator -- 88 SKIPs reads as 88 holes and most are not.
+  # gate_applies.py answers the question from the registry, so a variant that
+  # gains a module stops being n/a without anyone editing a list.
+  local na=
+  if [ "$status" = SKIP ]; then
+    na=$($PY "$ROOT/dev/oracles/gate_applies.py" "$tag" "$model" 2>/dev/null)
+    [ -n "$na" ] && status=N/A
+  fi
+  local head; head=$(grep -E "$pat" "$log" | tail -1)
+  [ "$status" = N/A ] && head=$na
+  [ "$status" = SKIP ] && head="HOLE: applies to this model, no adapter"
+  # The grade's own detail beats the headline when the cell is not at parity.
+  case "$status" in FAIL|FLOOR|UNGRADED|CRASH) head="$detail | ${head:0:60}" ;; esac
+  printf '  %-24s %-30s %-8s %s\n' "$tag" "$model" "$status" "${head:0:88}"
+  printf '%s\t%s\t%s\t%s\n' "$tag" "$model" "$status" "$head" >> "$SUMMARY"
+}
+
+# --- language-model inputs, per (model family, case) ---------------------
+# chai-1 folds a DIFFERENT MODEL without its ESM2 embeddings (5.70 A where chai
+# reaches 0.642), and ESMFold2 has no MSA at all -- it folds from ESM-C hidden
+# states, and each release is trained against its own tower AND its own shim
+# (crossing them reads corr 0.026). A fold-level sweep that omits these is not
+# measuring these two families; it is measuring nine other models.
+#
+# dev/oracles/lm_inputs.py writes lm_inputs/<tower>.<case>.npz. This wires them
+# in, and the log records which file was used -- or that none was found, because
+# a no-LM number must not be mistakable for a real one.
+LM_DIR=$ROOT/dev/oracles/lm_inputs
+
+lm_env () {  # lm_env <model> <case> -> prints VAR=path, or a note, or nothing
+  local model=$1 case=$2 tower= var=
+  case "$model" in
+    chai1)                      tower=esm2;      var=ESM_EMB ;;
+    esmfold2_lm600m)            tower=esmc_600m; var=ESMC_HIDDEN ;;
+    esmfold2_lm300m)            tower=esmc_300m; var=ESMC_HIDDEN ;;
+    esmfold2*)                  tower=esmc;      var=ESMC_HIDDEN ;;
+    *)                          return 0 ;;
+  esac
+  local f=$LM_DIR/$tower.$case.npz
+  if [ -f "$f" ]; then
+    echo "$var=$f"
+  else
+    echo "__LM_MISSING=$tower.$case.npz"
+  fi
+}
+
+want () {  # is this level selected?
+  local lvl=$1
+  case " $LEVELS " in *" all "*|*" $lvl "*) return 0 ;; *) return 1 ;; esac
+}
+
+LEVELS=${*:-L0 L1 L1b L1r L1t L1x L1d L2 L3 Laf3 Lship L4 L5af2 L7 Lg}
+# The README's model tables drift: it claimed 18 model types while listing 16,
+# because the test that used to keep the two in step was deleted and nothing
+# noticed. The driver already knows the real list, so it checks -- cheaper than
+# a test file, and it runs every time anyone runs the matrix.
+_readme=$ROOT/README.md
+if [ -f "$_readme" ]; then
+  _listed=$(sed -n '/^### AlphaFold 3 lineage/,/^## Parity status/p' "$_readme" \
+    | grep -oE '^\| `[a-z0-9_]+`' | tr -d '|` ' | sort -u | wc -l)
+  _have=$($PY -c 'import sys; sys.path.insert(0,"src")
+from alphafold3.model import model_config as c
+print(len(set(c.MODELS) | set(c.AF2_MODELS)))')
+  [ "$_listed" = "$_have" ] || echo "WARNING: README lists $_listed models, the registry has $_have"
+fi
+
+echo "levels: $LEVELS"
+echo "models: $MODELS"
+echo "logs:   $LOGDIR"
+
+# --- L0: does every checkpoint tensor reach a parameter, and back ----------
+if want L0; then
+  echo "== L0 conversion coverage (both directions -- see converter-coverage-audit)"
+  for m in $MODELS; do
+    gate L0.audit "$m" 'coverage|missing|unexpected|clean|CLEAN' dev/audit_coverage.py "$m"
+  done
+fi
+
+# --- L1 / L1b: the trunk, and the MSA stack inside it ---------------------
+if want L1; then
+  echo "== L1 trunk pairformer"
+  # FLOOR=1e-6: this cell has no resolution left for some models, and saying so
+  # requires MEASURING it rather than arguing it. The gate perturbs its own
+  # input by 1e-6 and emits `s_floor`/`z_floor`; parity_audit grades a row at or
+  # below its own floor as FLOOR instead of BAD. openfold3 reads 2.27e-01 on z
+  # against a 5.31e-01 floor, boltz2 3.92e-02 against 6.82e-02, protenix2
+  # 1.50e-02 against 4.94e-02 -- all three unresolvable. rosettafold3 did NOT
+  # clear its floor here (1.24e-01 against 2.44e-02) and that turned out to be a
+  # real port bug, the /L in its triangle multiplication, so the floor is doing
+  # discriminating work and not just excusing rows.
+  # In a subshell so FLOOR does not leak into the cells below it: `VAR=v fn`
+  # leaves VAR set in the calling shell for a bash FUNCTION, unlike a command.
+  for m in $MODELS; do
+    (export FLOOR=1e-6
+     gate L1.trunk "$m" '^  (single|pair|s|z) ' dev/oracles/trunk_parity.py "$m")
+  done
+  # AND AT ONE BLOCK, which is the cell that means something. At full depth this
+  # gate measures an AMPLIFIER on synthetic input: rosettafold3's z reads
+  # 5.8e-04 at one block, 5.0e-04 at four and 1.2e-01 at 48, where the single
+  # track has grown to rms 2.7e4 while the pair track has FALLEN to 24 --
+  # non-monotone, so the stack is saturated far outside its trained input
+  # distribution. Both cells are reported: the deep one is a smoke test, the
+  # shallow one is the port.
+  echo "== L1b1 trunk pairformer, ONE block"
+  # FLOOR here too. The one-block cell IS the port measurement for most models
+  # -- opendde reads 2.56e-04 and protenix1 4.27e-04, comfortably resolved --
+  # but not for the OF3 family, whose activations on synthetic input are two
+  # orders larger than anyone else's: after ONE block openfold3's single track
+  # has rms 16750 and openbind0's 1958, against 6.8 for opendde and 4.8 for
+  # protenix1, from the same N(0, 0.5) input. `rms ours/native` is 1.0000, so
+  # native amplifies identically -- it is the input being far outside the
+  # trained distribution, not a scale bug. At that magnitude a 1e-6 input
+  # perturbation already moves z by 5.7e-03 (of3) and 7.3e-03 (openbind0),
+  # which is above what our port differs by, so the cell cannot answer for
+  # those two and says FLOOR instead of a number nobody should trust.
+  for m in $MODELS; do
+    (export FLOOR=1e-6
+     gate L1.trunk1 "$m" '^  (single|pair|s|z) ' dev/oracles/trunk_parity.py "$m" --blocks 1)
+  done
+  # L1i -- the tensor the pairformer STARTS FROM. trunk_parity feeds it
+  # synthetic s and z, so nothing here ever measured the relative position
+  # encoding or the bond embeddings until this gate existed. In the driver from
+  # the day it was written, because a gate the driver does not run is a gate
+  # that stops running ([[harness-rot]]).
+  echo "== L1i trunk z-init"
+  for m in $MODELS; do gate L1i.trunk_init "$m" '^  z_init ' dev/oracles/trunk_init_parity.py "$m"; done
+  # ESMFold2 has no vendor MODULE to import -- its implementation is inside
+  # `transformers`, which lives in ~/venv_esm. What it has instead is
+  # `esmfold2_reference.py`, a complete self-contained JAX reimplementation that
+  # the port was built against and that is itself validated on native's dumps.
+  # So the reference IS the oracle here, and these two harnesses ARE the gates;
+  # they were simply never wired in. Family-scoped on purpose: they import
+  # esmfold2's converter and reference directly, so running them for another
+  # model would compare the wrong things rather than say it cannot.
+  for m in $MODELS; do
+    case $m in esmfold2*)
+      MODEL=$m gate L1.trunk_ref "$m" 'corr .*relerr' \
+        dev/oracles/esmfold2_localise_trunk.py ;;
+    esac
+  done
+fi
+if want L1b; then
+  # protenix's MSA module (and its trunk) go through prot_parity, which takes
+  # its models positionally and KeyErrors on a name it does not know -- so this
+  # one gate carries an explicit list rather than probing every model.
+  echo "== L1b MSA module (protenix goes through prot_parity)"
+  for m in protenix2 protenix1; do
+    case " $MODELS " in *" $m "*)
+      FP32=1 gate L1b.prot "$m" 'corr' dev/oracles/prot_parity.py "$m" ;;
+    esac
+  done
+  # ESMFold2's native module ships inside `transformers`, which is installed in
+  # ~/venv_esm ONLY and must not be installed beside JAX. So its native side
+  # runs there first and writes an npz (inputs included, so both sides compare
+  # on identical tensors) that msa_parity.py reads with numpy alone.
+  for m in $MODELS; do
+    case $m in esmfold2)
+      $PY_ESM dev/oracles/esmfold2_msa_dump.py "$m" > "$LOGDIR/L1b.esmdump.$m.log" 2>&1
+      $PY_ESM dev/oracles/esmfold2_msa_dump.py "$m" --nonuniform \
+        >> "$LOGDIR/L1b.esmdump.$m.log" 2>&1 ;;
+    esac
+  done
+  for m in $MODELS; do gate L1b.msa "$m" 'msa -> pair' dev/oracles/msa_parity.py "$m"; done
+  # An all-ones msa mask cannot distinguish two OPM normalisers -- that is how a
+  # wrong boltz2 fix passed once. The non-uniform case is not optional polish.
+  for m in $MODELS; do
+    NONUNIFORM=1 gate L1b.msa_nonuniform "$m" 'msa -> pair' dev/oracles/msa_parity.py "$m"
+  done
+fi
+
+# --- L1t / L1d: the two heads L1 does not reach --------------------------
+if want L1t; then
+  echo "== L1 template embedder"
+  for m in $MODELS; do gate L1t.template "$m" 'template|corr' dev/oracles/template_parity.py "$m"; done
+fi
+# --- L1r: the trunk on a REAL input. Everything in L1 feeds the trunk RANDOM
+#     s/z, so three things are measured by nothing else: the INPUT EMBEDDER
+#     (five oracles build s_inputs and none compared it), the trunk's output on
+#     a real featurisation, and RECYCLING (L1-L4 are all one pass).
+#     protenix2 only -- `native_trunk_dump.sh` runs protenix's own runner and
+#     featuriser, and no other vendor has an equivalent dump here.
+#     ALWAYS BOTH CASES. A trunk correlation well below 1.0 is normal (48
+#     blocks x 10 recycles amplify float noise; 6MRR correlates 0.960 while
+#     folding to 0.70 A), so the target the port folds WELL is the control that
+#     says whether the other one is weather or a bug. Running 5k9p alone is the
+#     mistake that cost most of a session.
+if want L1r; then
+  echo "== L1r trunk on a REAL input (input embedder + recycling)"
+  for _c in 6mrr 5k9p_plain; do
+    _npz=dev/oracles/native_trunk_$_c.npz
+    if [ ! -f "$_npz" ]; then
+      echo "  L1r.$_c              protenix2                      SKIP     run first: PX_DEPS=... bash dev/oracles/native_trunk_dump.sh $_c"
+      continue
+    fi
+    gate "L1r.$_c" protenix2 'z_trunk' \
+      dev/oracles/real_trunk_parity.py protenix2 --native "$_npz" --case "$_c"
+  done
+fi
+
+# --- L1x: the same two modules on a COMPLEX. Everything else in this file
+#     runs one protein chain, so no cell exercises a cross-chain convention --
+#     and both the boltz2 relpos entity bucket and the esmfold2 chain bucket
+#     lived exactly there. z-init carries the relative-position encoding;
+#     the template embedder masks cross-chain pairs and, for boltz2, masks by
+#     template COVERAGE. Chain B of the template case is 6MRR, which is
+#     unrelated to the 5K9P template -- note 5K9P IS ubiquitin, so "use
+#     ubiquitin as the foreign chain" silently covers both chains and tests
+#     nothing.
+if want L1x; then
+  echo "== L1x cross-chain (z-init and template on a complex)"
+  for m in $MODELS; do
+    gate L1x.zinit "$m" 'z_init|corr' dev/oracles/trunk_init_parity.py "$m" \
+      --chains_json $AF3_DEV_HOME/dimer_ours.json
+  done
+  for m in $MODELS; do
+    gate L1x.template "$m" 'template|corr' dev/oracles/template_parity.py "$m" \
+      --dimer
+  done
+fi
+if want L1d; then
+  echo "== L1 distogram head"
+  for m in $MODELS; do gate L1d.dgram "$m" 'dgram|corr' dev/oracles/dgram_parity.py "$m"; done
+fi
+
+# --- L2: the three parts, which is why the level table reads `~` ----------
+if want L2; then
+  echo "== L2 token diffusion transformer"
+  # FLOOR here for the same reason as the trunk cells: the three models that
+  # were not at parity (openfold3 3.95e-03, boltz2 1.88e-03, openbind0
+  # 1.81e-03) are the ones with the largest activations on this gate's
+  # synthetic input, and all three sit BELOW what a 1e-6 input perturbation
+  # does (6.88e-03, 3.98e-03, 1.31e-02). opendde, whose activations are 30-60x
+  # smaller, is resolved at 4.53e-05 against a 7.65e-05 floor -- so the cell
+  # discriminates, it just cannot discriminate for those three.
+  for m in $MODELS; do
+    (export FLOOR=1e-6
+     gate L2.diffusion "$m" '^  a ' dev/oracles/diffusion_parity.py "$m")
+  done
+  echo "== L2 diffusion conditioning"
+  for m in $MODELS; do gate L2.conditioning "$m" 'corr' dev/oracles/conditioning_parity.py "$m"; done
+  echo "== L2 atom cross-attention encoder"
+  for m in $MODELS; do gate L2.atom_encoder "$m" 'corr' dev/oracles/atom_parity.py "$m"; done
+  echo "== L2 atom cross-attention DECODER"
+  for m in $MODELS; do
+    DECODER=1 gate L2.atom_decoder "$m" 'corr' dev/oracles/atom_parity.py "$m"
+  done
+fi
+
+# --- L3: one denoise step, the whole diffusion module ---------------------
+if want L3; then
+  echo "== L3 denoise step"
+  for m in $MODELS; do
+    DIAG=1 gate L3.denoise "$m" 'per-atom distance' dev/oracles/denoise_parity.py "$m"
+  done
+  # boltz2 again on a REAL trunk's conditioning, at sigma_data. On the synthetic
+  # std-0.5 s/z the step is ill-conditioned in a band around sigma 16 -- a 1e-6
+  # input perturbation moves our own output 11-87% -- so the cell above grades
+  # FLOOR there. With boltz's own s/z/s_inputs it reads max|d| 5e-05 A.
+  DIAG=1 gate L3.denoise_real boltz2 'per-atom distance' \
+    dev/oracles/denoise_parity.py boltz2 --cond_npz "$HOME/boltz2_6mrr/diff_dump.npz"
+  # The old L3 note: boltz2 also has an injection replay from a captured native
+  # run (~/boltz2_6mrr/diff_dump.npz) -- its first and last steps, which are the
+  # two ends of the schedule, where the coordinate path barely matters.
+  gate L3.denoise_inject boltz2 'corr|per-atom' dev/oracles/boltz2_denoise_parity.py
+  # BOTH ENDS OF THE SCHEDULE. The default dump is a single step at
+  # times 1.4157 -> sigma 4608, where c_in is 2.2e-04 and c_out is 16: almost
+  # pure network output, with the coordinates barely entering. The last step
+  # (times -2.3026 -> sigma 0.0016, c_skip 1.0) is the opposite operating
+  # point, and a scaling difference that hides at one end shows at the other.
+  if [ -f "$HOME/boltz2_6mrr/diff_dump_last.npz" ]; then
+    gate L3.denoise_inject_last boltz2 'corr|per-atom' \
+      dev/oracles/boltz2_denoise_parity.py --dump "$HOME/boltz2_6mrr/diff_dump_last.npz"
+  fi
+  # ESMFold2's denoise step against the reference -- see the L1 note above.
+  for m in $MODELS; do
+    case $m in esmfold2*)
+      # 'rms diff' rather than 'corr': the LAST corr line in that harness is
+      # its conformer-substitution diagnostic, not its headline.
+      MODEL=$m gate L3.denoise_ref "$m" 'rms diff' \
+        dev/oracles/esmfold2_localise_denoise.py ;;
+    esac
+  done
+fi
+
+# --- L4: the confidence head --------------------------------------------
+# alphafold3 against UPSTREAM DeepMind AlphaFold 3 (~/af3_upstream, run from
+# ~/venv_af3): featurisation, the whole model on injected samples, and the
+# shipped cached conditioning against inline -- every input modality. Before
+# this, alphafold3 was N/A at every level because it "is the reference".
+if want Laf3; then
+  echo "== Laf3 alphafold3 vs upstream DeepMind AF3"
+  case " $MODELS " in *" alphafold3 "*)
+    gate Laf3.fp32 alphafold3 '__VERDICT' dev/oracles/af3_native_parity.py
+    gate Laf3.bf16 alphafold3 '__VERDICT' dev/oracles/af3_native_parity.py --bf16
+    # The shipped Ampere default puts the sampler in bf16 as well (301cc16), which
+    # upstream never does. Its own cell so the trade stays visible.
+    gate Laf3.bf16_sampler alphafold3 '__VERDICT' \
+      dev/oracles/af3_native_parity.py --bf16-sampler
+  ;; esac
+fi
+# The SHIPPED paths, ours against ours: staged trunk vs fused, cached diffusion
+# conditioning vs inline, float16 vs fp32. Every vendor gate measures the inline
+# fp32 path; this says whether that verdict carries to what a fold really runs.
+if want Lship; then
+  echo "== Lship shipped entry points agree (staged, cached, float16)"
+  for m in $MODELS; do
+    LM_CASE=protein_6mrr gate Lship.paths "$m" '__VERDICT|corr' \
+      dev/oracles/shipped_path_check.py "$m"
+  done
+fi
+if want L4; then
+  echo "== L4 confidence head"
+  for m in $MODELS; do
+    (export FLOOR=1e-6
+     gate L4.confidence "$m" '^  (full_pae|plddt)' dev/oracles/confidence_parity.py "$m")
+  done
+  # chai1's head has no standalone-constructible vendor module, but its verbatim
+  # I/O was captured during the port -- nine inputs and three LOGIT tensors -- so
+  # its L4 is an injection gate. Logits, not the derived pLDDT/PAE, so no
+  # assumption about chai's bin centres enters it.
+  gate L4.confidence_inject chai1 '_logits' \
+    dev/oracles/chai1_confidence_parity.py
+fi
+
+# --- L5af2: AlphaFold 2. Not in MODELS -- it is a SIBLING NETWORK, not an
+#     af3-family port, so none of L0-L4 applies to it (no converter, no shared
+#     modules). Its two gates live here so they are actually run: af2_fold_check
+#     is a known-answer test against the same code and parameters in
+#     colabdesign2, and af2_template_check folds a target given its OWN
+#     structure, which is the only cheap way to catch a template that is
+#     accepted and then quietly ignored.
+if want L5af2; then
+  echo "== L5af2 AlphaFold 2 (known-answer, and templates)"
+  gate L5af2.fold alphafold2_ptm 'CA-RMSD' \
+    dev/oracles/af2_fold_check.py alphafold2_ptm
+  # against DEEPMIND'S OWN CODE, not our lineage -- everything else here
+  # compares us to colabdesign2, which is the same port one generation back.
+  if [ -d "${AF2_ORIGINAL:-$AF3_DEV_HOME/af2_original}" ]; then
+    # the WHOLES, not just the pieces: the trunk end to end (input embedder,
+    # relative position, the three recycle adds, four stacks in order) and the
+    # structure module as a stack of eight fold iterations. Multimer only --
+    # a monomer checkpoint runs on the multimer graph here, so the monomer
+    # variant of either would compare two module trees rather than the port,
+    # and the gate says N/A rather than printing a number.
+    for _mod in trunk structure; do
+      PYTHONPATH_EXTRA=${AF2_ORIGINAL:-$AF3_DEV_HOME/af2_original} \
+        gate "L5af2.native_$_mod" alphafold2_ptm 'corr' \
+        dev/oracles/af2_native_parity.py "$_mod" --variant multimer
+    done
+    for _mod in template template_multimer template_1d; do
+      PYTHONPATH_EXTRA=${AF2_ORIGINAL:-$AF3_DEV_HOME/af2_original} \
+        gate "L5af2.native_$_mod" alphafold2_ptm 'corr' \
+        dev/oracles/af2_native_parity.py "$_mod"
+    done
+    # and everything that exists on BOTH paths, on both
+    for _v in monomer multimer; do
+      for _mod in evoformer extra_msa ipa heads msa; do
+        PYTHONPATH_EXTRA=${AF2_ORIGINAL:-$AF3_DEV_HOME/af2_original} \
+          gate "L5af2.native_${_mod}_${_v}" alphafold2_ptm 'corr' \
+          dev/oracles/af2_native_parity.py "$_mod" --variant "$_v"
+      done
+    done
+  fi
+  for m in af2_ptm af2_multimer; do
+    gate L5af2.template "$m" 'CA-RMSD' dev/oracles/af2_template_check.py "$m"
+  done
+fi
+
+# --- L7: the OUTPUT side. Everything above stops at a coordinate array; this
+#     folds, WRITES the mmCIF, parses it back and compares it to the batch that
+#     produced it. It is the only cell that can see an atom written at the
+#     origin -- model.py logs a warning for an atom it cannot gather and writes
+#     (0,0,0) -- or a pLDDT column on the wrong scale.
+#     It existed and nothing ran it, which is the same rot L1r had: PARITY.md
+#     quotes "the output gate 14/14" off a script with no runner.
+if want L7; then
+  echo "== L7 output side (fold -> write -> parse back)"
+  for m in $MODELS; do
+    gate L7.output "$m" 'OK|FAIL' dev/oracles/output_parity.py "$m"
+  done
+fi
+
+# --- Lg: is the model differentiable in the SEQUENCE? The design path needs
+#     d(loss)/d(soft_seq), and README states "24/24" off this script, which
+#     nothing ran either. Both engines: the af3 graph and AlphaFold 2.
+if want Lg; then
+  echo "== Lg gradient through the sequence"
+  for m in $MODELS af2_ptm af2_multimer; do
+    gate Lg.grad "$m" 'GATE (OK|PASS|FAIL)|differentiable' \
+      dev/oracles/grad_check.py "$m"
+  done
+fi
+
+# --- L5 / L6: folds. Much slower, and opt-in for that reason -------------
+if want L5; then
+  echo "== L5 fold (6MRR)"
+  for m in $MODELS; do
+    LM_CASE=protein_6mrr gate L5.fold "$m" 'CA-RMSD' \
+      dev/oracles/fold_check.py "$m"
+  done
+fi
+if want L6; then
+  echo "== L6 modality screens"
+  for m in $MODELS; do
+    for case in rna_1ehz dna_1lmb complex_1lmb ligand_1stp ptm_5k9p plain_5k9p protein_6mrr; do
+      # ptm_5k9p reuses plain_5k9p's LM input: the SEQUENCE is identical (SEP
+      # modifies a residue already there), and a language model reads sequences.
+      # This only became valid once `_attach_lm_pair` learned to map its rows by
+      # RESIDUE -- AF3 atomises a modified residue, so the batch has 85 protein
+      # tokens against the LM's 76 rows, and keying on the token count raised
+      # `lm_pair is (76, 76) but the batch has 85 tokens`.
+      lmcase=$case; [ "$case" = ptm_5k9p ] && lmcase=plain_5k9p
+      LM_CASE=$lmcase gate "L6.$case" "$m" 'RMSD|best' \
+        dev/oracles/modality_check.py "$m" "$case"
+    done
+  done
+fi
+
+echo
+echo "summary: $SUMMARY"
+echo "  (SKIP now means a real HOLE -- a module the model HAS with no adapter."
+echo "   N/A means the model does not have that module, or it is gated by"
+echo "   another cell; dev/oracles/gate_applies.py decides, from the registry.)"
+# summary.tsv APPENDS, so a resumed or re-run cell has several rows; the last
+# one is the cell's state. Counting every row double-counted stale FAILs.
+awk -F'\t' 'NR>1 {last[$1 FS $2]=$3} END {for (c in last) n[last[c]]++
+  for (k in n) printf "  %-9s %d\n", k, n[k]}' "$SUMMARY"
+echo RUN_ALL_PARITY_DONE

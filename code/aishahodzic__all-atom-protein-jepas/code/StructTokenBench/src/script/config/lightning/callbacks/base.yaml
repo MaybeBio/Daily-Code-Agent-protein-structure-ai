@@ -1,0 +1,29 @@
+checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    every_n_train_steps: null
+    # Save at every validation event. Full runs validate every second epoch.
+    every_n_epochs: 1
+    save_top_k: 3
+    monitor: "validation_f1_score"
+    mode: "max"
+    filename: "{epoch}-{step}-{validation_f1_score:.2f}"
+    save_last: True
+    dirpath: null
+
+early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    # run_eval.sh changes checkpoint.monitor/mode for regression tasks. Keep
+    # stopping and best-checkpoint selection aligned for every STB task.
+    monitor: ${..checkpoint.monitor}
+    mode: ${..checkpoint.mode}
+    # Ten validation checks at a two-epoch cadence allow approximately
+    # twenty epochs without improvement.
+    patience: 10
+
+lr_monitor:
+    _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: "step"
+
+progress_bar:
+    _target_: pytorch_lightning.callbacks.progress.TQDMProgressBar
+    refresh_rate: 10

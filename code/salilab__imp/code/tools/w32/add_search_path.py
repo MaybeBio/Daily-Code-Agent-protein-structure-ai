@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+
+"""Patch IMP and RMF SWIG wrappers to add the directory containing
+   IMP and RMF DLLs to the search path. We need to patch IMP/__init__.py
+   so we add paths before any usage of any IMP module, and RMF.py too in
+   case RMF is imported before IMP.
+
+   Note that we used to simply use the 'patch' utility to do this, but the
+   SWIG folks changed the header of their output files, which confused patch.
+   Instead, we look for import lines, and add our code after the first block
+   of imports (which import standard Python modules such as 'sys').
+   This ensures that the search path is properly set up before we try to
+   import IMP/RMF extensions, but doesn't come before the comment header
+   or any __future__ imports (which must come first).
+"""
+
+import re
+import sys
+
+IMP_PATCH = r"""
+def _add_pyext_to_path():
+    import os.path
+    import sys
+    # Get directory containing IMP's __init__.py
+    imp_dir = os.path.abspath(os.path.dirname(__file__))
+    # Make sure we're on a Windows system
+    if hasattr(sys, 'dllhandle') and len(imp_dir) > 4:
+        # Strip '\IMP' suffix from directory
+        pydir = imp_dir[:-4]
+        # Strip '\python\IMP' suffix to get directory containing DLLs
+        dlldir = imp_dir[:-11] + '\\bin'
+        # Add DLL directory to search path so Windows can find them
+        __dll_directory = os.add_dll_directory(dlldir)
+_add_pyext_to_path()
+
+"""
+
+
+RMF_PATCH = r"""
+def _add_pyext_to_path():
+    import os.path
+    import sys
+    # Get directory containing RMF.py
+    rmf_dir = os.path.abspath(os.path.dirname(__file__))
+    # Make sure we're on a Windows system
+    if hasattr(sys, 'dllhandle') and len(rmf_dir) > 4:
+        # Strip '\python' suffix to get directory containing DLLs
+        dlldir = rmf_dir[:-7] + '\\bin'
+        # Add DLL directory to search path so Windows can find them
+        __dll_directory = os.add_dll_directory(dlldir)
+_add_pyext_to_path()
+
+"""
+
+
+def add_search_path(filename):
+    patch = RMF_PATCH if 'RMF' in filename else IMP_PATCH
+    with open(filename) as fh:
+        contents = fh.readlines()
+    # An 'import block' is considered to be a set of lines beginning with
+    # 'from' or 'import' statements (except 'from .' imports, or imports of
+    # IMP C++ extensions). Any blank lines or comments are considered to
+    # be part of the block.
+    r = re.compile('(from [^.]|import (?!_IMP_))')
+    imp_import = re.compile('(from|import) _IMP_')
+    non_statement = re.compile(r'(\s*$|\s*#)')
+    in_imports = False
+    imports_done = False
+    with open(filename, 'w') as fh:
+        for line in contents:
+            if not imports_done:
+                if not in_imports and r.match(line):
+                    in_imports = True
+                elif in_imports and not r.match(line) \
+                        and not non_statement.match(line):
+                    fh.write(patch)
+                    in_imports = False
+                    imports_done = True
+                elif not in_imports and imp_import.match(line):
+                    # If no standard module imports, insert patch before
+                    # first import of an IMP .pyd module
+                    fh.write(patch)
+                    imports_done = True
+            fh.write(line)
+
+
+def main():
+    for fname in sys.argv[1:]:
+        add_search_path(fname)
+
+
+if __name__ == '__main__':
+    main()

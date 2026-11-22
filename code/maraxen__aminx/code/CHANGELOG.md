@@ -1,0 +1,968 @@
+# Changelog
+
+## 0.5.5 (2026-11-20)
+
+### Fixed
+
+- **Campaign units recompiled for every new LigandMPNN ligand atom count and every new sequences-per-unit count** (#3510). A screen of about 1,500 `score_conditionals` units paid a compile for each new value of either.
+  - **Ligand atoms (score and sample paths).** The atom axis M is padded at the end with mask-0 atoms to `aminx.host.bucketing.LIGAND_ATOM_LADDER` (16 to 1024). Padding is done on the host in numpy, and the ligand npz loader returns host arrays, so no eager device op ever sees the raw atom count.
+  - **Sequences per unit.** `score_conditionals` pads N to `SEQUENCE_COUNT_LADDER` with copies of row 0 and drops the copies from the store. It pads only when the padded logits still fit the unit's `logits_memory_budget_mb` (`campaign_score.sequence_bucket`). Stores record `n_sequences` and `n_sequences_bucket`.
+  - **Numerics.** Padded atoms carry no weight, and real rows are unchanged within `SCORE_BATCH_COMPOSITION_ATOL`. Pre-registered runs on CPU and GPU, across ProteinMPNN, SolubleMPNN and LigandMPNN, were all within the bound, with a maximum delta of 4.1e-6.
+
+### Added
+
+- `execute_manifest(..., group_by_shape_class=True)` runs rows grouped by compile shape class (`campaign.row_compile_key`, `campaign_score.score_compile_key`), keeping first-appearance order. Results are still reported in manifest order. Done markers, locks and resume are unchanged.
+  - The return value gains a `shape_classes` summary.
+  - Pass `group_by_shape_class=False` for strict manifest order.
+  - Array-sharded runs keep the grouping only if they shard by `row_compile_key`.
+- **Compile telemetry.** Done markers and row results carry an optional `compile_telemetry` block (`campaign_compile_telemetry_v1`), which never enters stores or input hashes. It records:
+  - the row's shape class and backend compile count and seconds, measured with `xtrax.profiling.count_backend_compiles`;
+  - whether the unit was the first of its class in the process;
+  - the JAX compilation-cache setting.
+- New helpers: `aminx.host.bucketing.ligand_atom_rung`, `pad_ligand_atom_axis`, `sequence_count_rung`.
+
+### Changed
+
+- **Resume recomputes once.** `SAMPLING_NUMERICS_EPOCH` goes from 2 to 3, so a campaign started on 0.5.4 or earlier recomputes its units when resumed on 0.5.5, because padding changes outputs by float reassociation. Manifest-row hashes are unchanged.
+- `read_score_conditionals_store` fills in `n_sequences` and `n_sequences_bucket` for stores written before 0.5.5.
+
+### Tests
+
+- Shape-class regression: in a fresh process, a class compiles once and later units of the same class compile zero times. A positive control shows the counter does see recompiles.
+- Cross-row leak control on the `ar_masks` pair kernel (#3525). At a fixed N, changing only the padding rows' content leaves the real rows bitwise equal for all three families, and a planted sub-bound leak is caught.
+
+## 0.5.4 (2026-11-19)
+
+### Added
+
+- **Campaign row kind `task="score_conditionals"`** (#3486): teacher-forced, mask-conditioned per-position logits for a fixed structure and sequences under K explicit visibility masks, run through `aminx.host.campaign` with the same lock, done-marker, input-hash and quarantine semantics as sampling rows. Plan with `aminx.host.campaign_score.plan_score_conditionals_manifest([ScoreConditionalsUnit(...)], ...)`, run with `run_manifest_row` / `execute_manifest`, read with `read_score_conditionals_store` (`logits` `(K, N, L, 21)`, `nll` `(K, N)`). Sequences must be MPNN-alphabet letters (token ids are refused); masks come from a `(K, L, L)` `.npy` whose bytes, and the ligand context's, enter the unit input hash. The logits budget is enforced at plan time. Sampling and ThermoMPNN rows hash exactly as before (golden-tested). `campaign run --pack` refuses task rows for now.
+- **Batched decoding masks** (#3485): `ScoringSpecification.ar_masks` `(K, L, L)` scores every sequence under every mask against one encoding in one jitted program (`ScoreSplitFns.score_pairs`): a vmap, or a chunked `lax.map` when the planner tiles it. `score()` returns `scores` `(S, K, C)` and `logits` `(S, K, C, L, 21)`. New `ScoringSpecification.designable_mask` refuses an all-zero mask row at a designable position; an all-zero mask is refused outright.
+- `aminx.scoring.score.SCORE_BATCH_COMPOSITION_ATOL` (`1e-5`): the equivalence floor for one sequence scored alone vs in a batch (#3487).
+
+### Fixed
+
+- **The 0.5.3 wheel shipped LASErMPNN's `ideal_geometry.npz` as a Git LFS pointer** (debt #3500): the release build checked out without LFS, so `runner.sample(model_family="lasermpnn")` could not build coordinates from an installed wheel. The release workflow now fetches LFS objects and refuses to publish a wheel whose packaged data files are pointers or unreadable (`scripts/release/check_wheel_data.py`); `tests/test_package_data.py` checks the same in CI.
+- **`runner.score` recompiled on every call** (#3484): the encode/score kernels were `jax.jit` closures rebuilt per call over a freshly loaded model, and the candidate activation estimate was re-lowered per call. They are now module-level `eqx.filter_jit` kernels keyed on architecture and shapes, with a process-wide estimate memo. Warm identical-shape calls: 3 backend compiles and 2.5 s, now 0 compiles and 0.24 s (1ubq, CPU; bathos runs b25cbd4e and 6f034f38).
+- **Over-budget tiles on the new `ar_masks` path are sized from the memory budget.** xtrax's planner falls back to `ChunkedMap(batch_size=0)` (the axis's default), which estimates to 0 bytes and then runs the whole axis at once; a 448-pair scoring call had asked a 24 GiB GPU for 21 GiB. `plan_axis_strategy(size_unsized_tiles=True)` sizes the tile instead, and the pair tile is capped at 32 (pre-registered sweep, run 6162354f). The option is off by default, so every existing caller keeps its 0.5.3 dispatch and float reduction order (legacy callers tracked as debt #3501).
+- Review and audit hardening of the new path: `score()` refuses `ar_masks` when a family driver would handle the spec; `ar_masks` requires the structure's valid residue count to equal the masks' L; a `score_conditionals` unit refuses multi-structure inputs and checkpoints other than ProteinMPNN / SolubleMPNN / LigandMPNN; mask and ligand bytes are always fully hashed; row and payload `task` must agree; score rows hand their logits to the unified sink.
+- **Batch-composition dependence characterised** (#3487): a sequence's logits are bitwise independent of the CONTENT of its batch and differ across batch SIZES only by float reassociation in the vmapped matmuls (at most 3.8e-6 in float32 on CPU and GPU, flat in batch size, ~1e-15 in float64; six pre-registered runs). Documented in `score()`; compare across batch compositions with `SCORE_BATCH_COMPOSITION_ATOL`.
+
+### Changed
+
+- Requires `jax>=0.11.2,<0.12` and `jaxlib>=0.11.2,<0.12` (the lock already resolved to 0.11.2). The `cpu` and `cuda12` extras are declared mutually exclusive.
+- **Breaking (install extras):** the `tests`, `docs`, `benchmark` and `dev` extras are gone from the published package metadata. They are now PEP 735 dependency groups, installed with `uv sync --group test` (or `lint`, `docs`, `benchmark`, `dev`). `pip install aminx[tests]` and `aminx[dev]` no longer work; use `pip install --group` (pip 25.1+) or `uv`.
+- New `ebm` extra for the ProteinEBM dependencies (`orbax-checkpoint`, `einops`, `scipy`, `biopython`). A venv that runs the EBM tests needs `--extra ebm`.
+
+## 0.5.3 (2026-11-13)
+
+### Changed
+
+- **Breaking (import paths):** the tiling vocabulary now comes straight from `xtrax.tiling` (#287). `aminx.tiling.SafeMap`, `aminx.tiling.iterator.SafeMapIterator`, `aminx.utils.safe_map.safe_map`, `aminx.utils.safe_scan.safe_scan` and the deprecation shim `aminx.tiling._deprecation` are removed. Use `aminx.tiling.ChunkedMap(batch_size=...)` (re-exported from `xtrax.tiling`), `xtrax.transforms.chunked_map` and `xtrax.safe_scan`. `plan_axis_strategy` and `make_axis_dispatch` now return and delegate to the `xtrax.tiling` types directly. Callers that imported the removed names fail with `ImportError`; there is no behaviour change for code that already used `ChunkedMap`, `Vmap`, `Scan` or `DedupGather`.
+- **Behaviour:** every aminx structure-parse path (`host/prep.py`) now asks proxide for `modified_residue_typing="unknown"`, so selenomethionine (MSE) is tokenised `X` instead of `M` (#288). Scores and samples for any structure containing MSE change with this release. Training loaders (`training/trainer.py`) are unchanged and still type MSE as `M`, so inference now sees `X` where training saw `M`.
+- Requires `proxide>=0.2.1` (was `>=0.2.0`) for the `OutputSpec(modified_residue_typing=...)` option. With an older proxide, the parse path refuses to run (`require_modified_residue_typing_support`) instead of silently dropping the typing.
+- Pins `xtrax[...]==0.4.1b8` (was `0.4.1b7`) in the base, `eda` and `onnx` extras (#287).
+
+### Fixed
+
+- The LigandMPNN Heavy Parity gate failed because selenomethionine was typed `M` where the reference LigandMPNN parser gives `X` (#288). It passes with the typing above (verified on the branch, run 43456465602).
+
+### Tests
+
+- `xtrax.campaign` lease-fencing and pack-verification suite added (#284). Seven deprecation and parity-shim test files for the removed tiling names were retired with #287 (browser-validation inventory 191 to 186).
+
+## 0.5.2 (2026-11-11)
+
+### Added
+
+- FrustraMPNN model support (#271).
+- An aminx domain plugin for xtrax campaign EDA (#277).
+
+### Changed
+
+- **Breaking:** `generate_ar_mask` takes the decoding order as the keyword-only argument `order` (`generate_ar_mask(order=order_array, ...)`). Calling it positionally or with the old `decoding_order=` keyword now raises `TypeError` with the order/rank contract in the message. Since 0.5.0 the function reads its argument as an ORDER array (`order[t]` = position decoded at step `t`), not a RANK array, and a caller still passing a rank array (`argsort(order)`) silently got the mask of the inverse order, because an order and a rank are both permutations of `0..L-1` and cannot be told apart by value. Making every caller name the argument turns that silent misread into a loud failure at the call site. Invert a rank array first (`jnp.argsort(rank)`) and pass it as `order=`. A rank array passed as `order=` is still read as an order, by design.
+
+### Fixed
+
+- A chunked sample axis no longer recompiles on every row (#282). `_dispatch_axis` ran a `ChunkedMap` sample axis as an eager `lax.map` over a closure rebuilt for each row, so jax compiled a fresh `jit(scan)` per row (about 5.8 s of XLA compilation per 128-wide row on a TITAN RTX, most of a ~7.8 s row). The chunked sample axis in the unified single-state path now runs through one module-level `filter_jit` function (`_chunked_sample_decode`) whose per-row data are arguments, so rows of the same shape reuse one executable. Graded by a pre-registered gate on a TITAN RTX (production MS-L cell family, main vs this change): 26 of 26 compared rows are bit-identical, the compile slope falls from 1.0 to 0 per added row, 8 rows of 128 run 5.66x faster (7.6 s to 1.3 s per row), the 20-sample row is unchanged (0.92), and peak device memory is at most 1.06x main (about 260 MiB more at the wide 0.30 cells). A review found that a Python-int `decoding_order_seed` was still a static `filter_jit` argument, so rows differing only in seed each compiled their own executable; the seed is now passed as an int32 array (`None` and seeds outside int32 range stay static; the traced seed gives the same PRNG key, so tokens are unchanged). A second pre-registered gate with a distinct seed on every row (8 rows of 128, main vs this change) found 16 of 16 rows bit-identical, compile slope 0 against 1.0 on main, 5.48x faster, and peak memory at most 1.06x main. Only the unified single-state path (no encoding fusion) is changed; the fused path and the legacy path still use the eager map and are untested. One GPU model and one shape (L=256, ProteinMPNN v_48).
+
+## 0.5.1 (2026-11-10)
+
+### Changed
+
+- Autoregressive (AR) mask dtype narrowed to `int8` across all mask helpers (`generate_ar_mask`, `ar_mask_from_decoding_order`, `generate_wave_ar_mask`, `full_context_ar_mask`), `ConditioningBundle.ar_mask`, and the `AutoRegressiveMask` type alias (1 byte per element vs 4 bytes for float32/int32). The `p04`/`p07` export wrappers keep `float32`; scripts under `scripts/` that call `build_inference_bundle` (browser-validation, benchmarks) were not changed and now get an `int8` mask unless they pass `ar_mask_dtype` (the export-oriented `export_safety_census.py` and `layer_b_ort_calibrate.py` now pass `float32`); their own `layer_a_*` helpers still build int32 masks. A grep of `scripts/` found no matrix product, sum or elementwise product of a bundle's `ar_mask`, so the int8 wraparound caveat does not apply to them. A user-supplied `ScoringSpecification.ar_mask` is validated on its own dtype (a float64 mask that was only approximately 0/1, e.g. 0.9999999999, is now rejected instead of rounding through float32) and stored as `int8` whatever its input dtype (float32, int, bool), and is padded as `int8` by `runner.score`. `build_inference_bundle` casts a caller-supplied `ar_mask` to `int8` (nonzero means visible) unless `ar_mask_dtype` says otherwise; `generate_wave_ar_mask` and `ar_mask_from_decoding_order` take a `dtype` argument. Public helper return dtypes change: `generate_ar_mask` int32 to int8 and `generate_wave_ar_mask` / `ar_mask_from_decoding_order` float32 to int8. Callers that do int8 arithmetic on the returned mask (`mask @ mask`, `mask + mask`, elementwise products of two masks) must cast first, because it wraps silently past 127; `jnp.sum` and `jnp.cumsum` upcast and are not affected. The exported `p04`/`p07` graphs keep a float32 mask, built as float32 from the start (`ar_mask_dtype=jnp.float32`).
+
+### Fixed
+
+- The sample-axis memory planner now chunks wide sample rows instead of running them out of device memory (#274). Its per-sample activation estimate was about 4.1 MiB at L=256 against a measured 128-145 MiB (15-35x low), so a full vmap was chosen at 20, 128 and 1024 samples alike; the device budget itself already honoured `XLA_PYTHON_CLIENT_MEM_FRACTION`. The estimate now uses ProteinMPNN v_48's dimensions and a documented empirical live-tensor factor (about 163 MiB per sample at L=256), and a demoted sample axis is widened from xtrax's minimum tile of 1 to the largest tile that fits the budget (35 at a 5.63 GiB budget, 100 at 15.95 GiB). Production MS-L cell on a TITAN RTX, stock 0.5.0 vs this change: 128- and 256-wide rows now complete at the production 0.30 memory fraction where stock fails with `RESOURCE_EXHAUSTED`; all 12 compared rows are bit-identical, and the 20-sample production row keeps its full vmap (slowdown 0.92, noise). The factor is fitted at one shape (L=256) on one GPU stack and scales linearly in L; other lengths and model families are unmeasured.
+
+## 0.5.0 (2026-11-09)
+
+### Added
+
+- `incremental="auto"` now takes the cached decode whenever its preconditions hold under the per-sample decoding-order vmap (#273, fixes #272). `with_decoding_order` marks its wave `mask_consistent` (a new static `WaveScheduleBundle` field, default `False`) for every `fixed_context` except `mutual_context`. With the flag set, the decoder decides slab fit from the tie map, so the exactness predicate stays unbatched and the `lax.cond` stays a real branch instead of a select that ran both bodies. Production MS-L rows: 260/260 bit-identical, single-state rows 7.99-8.29x faster. Non-identity `state_position_map`, tie groups larger than the slab, `mutual_context` and caller-supplied masks keep the full-recompute fallback.
+- `decoding_order_seed` on `SamplingSpecification` / `SamplingConfig` (#265): draws every sample's decoding order from that seed alone. `None` (default) is bit-identical to before.
+- `fixed_position_context` (`"random_order"` default and bit-identical, `"canonical_order"`, `"mutual_context"`) on the runner and fused paths (#266), recorded in every store's root attrs. Neither control is part of `manifest_row_hash`.
+- Packed per-row unit storage (`aminx.host.pack_shim`, on `xtrax.pack`) and planner EDA (`aminx.host.plan_eda`, optional `eda` extra) (#270).
+- `ligand_cutoff_for_score` wired into `score()`, with membrane labels and multi-order averaging as library helpers (#256); ThermoMPNN adoption without the stock dependency (#258); Tier 1/2 parity vehicles and hard-failure guards (#260); a sharded knob-gate ledger with `--family` flags (#254).
+
+### Changed
+
+- xtrax is pinned to `0.4.1b7` (was `0.4.1b5`) and gains the `pack` extra. proxide `>=0.2.0` (was `>=0.1.0a17`). cisternal `>=0.1.6` for the `agent` extra.
+- `generate_ar_mask` (`aminx.utils.autoregression`) reads its `decoding_order` argument as an ORDER array on the untied path too, not a RANK array. Callers that passed a rank array (`argsort(order)`) now get the mask of the inverse order, without an error. Pass the order itself. The return dtype is unchanged (int32).
+- `generate_ar_mask`'s `chain_idx`, `tie_group_map` and `num_groups` are keyword-only. A tie map passed as the second positional argument used to bind to `chain_idx` silently; passing these positionally now raises `TypeError`.
+
+## 0.4.0 (2026-10-29)
+
+### Changed
+
+- xtrax is pinned to `0.4.1b5` (was `0.4.1b2`).
+- No API that existed in 0.3.0 changed incompatibly. Everything below is new since 0.3.0.
+
+### Added
+
+- **Caliby family** (`aminx.families.caliby`, `model_family="caliby"`): port of ProteinDesignLab/caliby, with the atom MPNN, the graph Potts head (the Potts couplings scaled once, 30-neighbour truncation, zero-gauge and reciprocal symmetrization), the sidechain packer, `CalibyDriver` and strict state-dict converters. Eight checkpoints (`caliby`, `soluble_caliby`, `soluble_caliby_v1`, `caliby_distill`, `soluble_caliby_distill`, `caliby_packer_{000,010,030}`) are pinned in `family_weights.json`. `CalibyOptions.checkpoint_id=None` defers to `RunSpecification.checkpoint_id`, then to `caliby`; when both are set they must agree. Scores are the log-softmax over all 21 states including GAP, unmasked, to match upstream. This also corrects the earlier conflation of KeatingLab PottsMPNN with Caliby.
+- **FAMPNN family** (`aminx.families.fampnn`, `model_family="fampnn"`): port of richardshuai/fampnn, the full-atom MPNN with GVP encoder and sidechain diffusion, `FAMPNNDriver` and strict converters. Checkpoints `fampnn_0_0`, `fampnn_0_3`, `fampnn_0_3_cath`. FAMPNN checkpoints load through a restricted unpickler (`aminx.io.torch_checkpoint`); constraint fields the driver would silently drop are refused.
+- **ThermoMPNN driver** (`aminx.families.thermo_mpnn.ThermoMPNNDriver`): ThermoMPNN v1/v2 and ThermoMPNN-D as a registered driver family (`model_family="thermompnn"`, `output_kind="ddg"`), which derives from ThermoMPNN checkpoint ids and requires a pinned `sha256` for registry entries like the other driver families.
+- **AntiBMPNN checkpoints and CDR frequency bias** (`aminx.model.cdr_bias`): `antibmpnn_v_48_{000,010,020,030}`, IMGT/Chothia/Kabat CDR ranges, `cdr_region_mask`, `build_cdr_bias_matrix`, `make_cdr_bias_logit_transform`. The direct CDR mask is keyword-only (`cdr_mask=`). `antibmpnn` `v_48_002` is refused rather than aliased to `v_48_000`, because it is not a published checkpoint.
+- **CyclicMPNN offset wrapping**: `cyclic` on `Aminx`, `ProteinFeatures` and `ProteinFeaturesCA` wraps same-chain relative-position offsets head to tail; non-cyclic behaviour is bit-identical. `Aminx.cyclic` is set from the `cyclicmpnn` checkpoint family.
+- **MPNN variant weights** (#234): AbMPNN, HyperMPNN, CyclicMPNN, CA-only ProteinMPNN (`ProteinFeaturesCA`) and ThermoMPNN models, with pinned Hub revisions.
+- **Multi-backend campaigns** (#244): `BackendArmSpec` arms across model families, a hoisted-compile cache keyed by `TopologyKey` (`HoistedTopologyExecutor`) so checkpoints with the same static structure share one executable (`cyclicmpnn` gets its own), and a unified campaign sink.
+- **Potts**: `condition_on_fixed_sites` for exact conditioning on fixed identities (#227), the k-NN adjacency `W` forwarded to `PottsResult` (#228), and real multi-state PoE inference in place of silently using state 0 (#231).
+- **Opt-in AR wave loop** on `xtrax.intent.loop` (`AutoregressiveConfig.intent_loop`, #232); the pre-registered benchmark outcome was `no_contrast` (scan compiled 1.03× slower than while at L=512), so it stays off by default.
+- **`RunSpec`** carries `caliby`, `fampnn` and `thermompnn` options and refuses them for any other `model_family`.
+- **Incremental CI test selection** (`scripts/ci/select_affected_tests.py`): selects tests from static import closures, falling back to the full suite whenever a closure is unsound.
+- Documentation of the Tier 1–5 model families in `docs/models/mpnn_variants.md`.
+
+### Known limitations
+
+- Caliby's Potts sampler is not Gibbs. Sampling-key `fold_in` collisions are recorded in the draw-site registry rather than fixed.
+- Residue-numbering parity with the upstream Caliby and FAMPNN featurizers is not established.
+- Caliby sidechain packing is not exposed as a separate `pack_sidechains` stage, and the CDR transform does not take per-step `(V,)` logits.
+- Long sequences (around L=500) can run slowly or out of memory on the new family loops.
+- The two tests in `tests/knob_gate/test_knob_superset.py` need the `redsox` package and fail without it.
+
+### Also in this release
+
+- **Post-v0.3.0 triage and debt remediation (PR #240):** Unified Zarr + Parquet campaign sink (`UnifiedCampaignSink`, `CampaignSinkInspector`), closed-form tree-marginal Potts inverse (`tree_marginals_to_potts`, `project_to_zero_sum_gauge`), HLO smell checker (`check_hlo_smells`, `assert_no_hlo_smells`), custom `WaveScheduleBundle` threading through `SamplingSpecification`, synchronized `output_path`/`output_zarr_path`/`output_h5_path` aliases, and content-addressed deterministic `run_id` hashing.
+
+- **`ScoringSpecification.ar_mask`: score under a caller-chosen visibility pattern.**
+  `runner.score` scores every position under full context minus self, `p(s_i | s_{-i}, X)`,
+  a pseudo-likelihood whose conditionals do not multiply into a normalised joint. `ar_mask`
+  (`(L, L)`, `ar_mask[i, j] == 1` iff `i` sees `j`, the sampler's convention) scores under an
+  autoregressive factorisation instead: with a causal, self-excluding mask for an order the
+  returned logits are `p(s_i | s_{earlier}, X)` and their summed log-probs are
+  `log p_order(s)`. That is the quantity staged-order comparisons need, and it was not
+  reachable from the production surface (`score_sequence` took an `ar_mask`; the runner never
+  forwarded one). Validated at construction (square, binary, zero diagonal). Supported on the
+  plain per-structure path; `average_node_features` and `state_position_map` raise rather
+  than score under the default mask unannounced. **`ar_mask=None` (the default) is unchanged:**
+  scores and logits are bit-identical to `v0.2.0a3` on a real structure (measured on the
+  original base, not re-measured on 0.3.0).
+  `make_score_split_fns(...).score_candidate` gains the matching optional `ar_mask`.
+
+## 0.3.0 (2026-10-21)
+
+### Changed (breaking)
+
+- **`RunSpec.precision` renamed to `RunSpec.precision_config`.** xtrax >= 0.4.1b1 declares
+  `RunSpec.precision` as `str | None` and rejects any other type in `__check_init__`
+  (`xtrax/run/spec.py`), so constructing aminx's `RunSpec` with a `PrecisionConfig` raised
+  `RunSpec.precision must be a str or None`. The xtrax check is kept as-is. Update any
+  `spec.run_spec.precision.compute` reads to `spec.run_spec.precision_config.compute`, and any
+  `RunSpec(precision=...)` constructor call to `precision_config=...`. The portable JSON wire key
+  `"precision"` is unchanged.
+
+### Added
+
+**Hoisted sampler: encode once per structure per call.** `make_hoisted_sampler` (`aminx.sampling`)
+runs the structure encoder once and maps only the decode over the PRNG keys, through
+`xtrax.inference.make_hoisted`. Its output equals `vmap(sample_sequences)` (sequences and decoding
+orders exactly, logits to `rtol=1e-5, atol=1e-6`). Callers of `make_hoisted_sampler` run the encoder
+once per call instead of once per key.
+
+- Added `aminx.sampling.hoisted` (`make_hoisted_sampler`, `HoistedSampler`, `SAMPLER_AXIS`), exported
+  from `aminx.sampling`. `backbone_noise`, `wave_schedule` and `use_rolling_state` are not supported.
+- `sample_autoregressive.kernel` is split into `encode_for_sampling` and `decode_sampling`; behaviour
+  unchanged (`kernel` calls both).
+- `sample_sequences` warns with `FutureWarning` when a `precomputed_*` argument is passed. It was
+  already ignored; removal is a later change.
+- xtrax pin bumped to `==0.4.1b2` (`xtrax[io,export]`, `xtrax[onnx]`); the hoisted sampler needs
+  `xtrax.inference.make_hoisted`.
+- `runner.inspect` runs the encoder once per structure for `decoded_node_features`,
+  `encoded_node_features` and `edge_features` (they share the same encoder inputs). Outputs are unchanged.
+
+## 0.2.1 (2026-10-14)
+
+**Family checkpoints resolve by id.** The nine PottsMPNN, LASErMPNN and ProtonPottsMPNN checkpoints that
+a graded parity run used are now on the Hugging Face repo, and `--checkpoint-id` finds them. No change
+to the MPNN checkpoints or to any numerical path.
+
+### Added
+
+- **Hub resolution for the three family drivers** (`aminx.io.weights.resolve_family_checkpoint`,
+  `family_checkpoints`). Order after `model_local_path` and a checkpoint registry: `AMINX_WEIGHTS_DIR`
+  (authoritative, fails closed), then the Hub at `HF_REVISION`. The pinned table
+  `aminx/io/family_weights.json` carries the sha256 of every artifact and of its `.json` manifest; a
+  mismatch raises instead of loading. Published ids: `pottsmpnn_{vanilla_20,vanilla_30,sol_20,sol_30,ft}`,
+  `lasermpnn_{nothing_heldout,noise_ligandmpnn_split,soluble_65000}`, `protonpottsmpnn_v6_30`.
+- **`NOTICE-weights.md`** with the upstream copyright and permission notices (all three upstreams are MIT),
+  the licence decision record, and `scripts/weights/{build,upload}_family_weights.py`. The build ran as bathos
+  run `354f98dc` (outcome pass): every artifact reloads identical to the converted model, a second build is
+  byte-identical, every source hash matches the graded oracle input, and a flipped-byte control fires.
+
+### Changed
+
+- **`HF_REVISION` is now `d9a84e79`** (was `aa80d0fd`). It only adds files: all 15 weight files present at
+  `aa80d0fd` are byte-identical (checked against the Hub), so MPNN results do not change.
+
+### Fixed
+
+- **LASErMPNN loaded a serialised artifact with `build_hydrogens=False`.** The field is static, so `.eqx`
+  does not store it and `_load_eqx` rebuilt a default skeleton, but every upstream checkpoint sets it True. The
+  artifact's `.json` manifest now supplies it, with a warning when the manifest is missing.
+- **0.2.0 pointed at unloadable weights.** The `weights/pottsmpnn/*.eqx.zst` files in the source tree do not
+  deserialise into `PottsMPNN`; the 0.2.0 text that suggested them is corrected (debt #2697 covers the files).
+
+### Not included
+
+- The MSA PottsMPNN variants (vocab 22, debt #2067), and any checkpoint without parity evidence.
+
+## 0.2.0 (2026-10-14)
+
+**Beta.** The Development Status classifier moves from alpha to Beta, but the repository is still
+largely experimental: parity with the upstream references is measured per path and is not complete
+(see `.praxia/docs/audits/260926_mpnn-reference-parity-verdict.md` and the parity dashboard).
+`0.2.0a3` was the last alpha.
+
+### Added
+
+- **Three new model families** (PR #165 and the PRs after it), selected with `--model-family` or
+  inferred from the `checkpoint_id` prefix: **PottsMPNN** (`score:energy`, `score:ddg`, `sample`),
+  **LASErMPNN** (`sample`, `score:nll`, `score:logits`, proofread scoring, rotamer building) and
+  **ProtonPottsMPNN** (`score:energy`, `score:ddg`, `score:selectivity`, pH design `sample`). Which
+  purposes each family runs itself, and which fall back to stock MPNN, is in
+  `docs/MODEL_FAMILIES.md`.
+  - **Weights are not on the Hugging Face repo.** `maraxen/aminx` (revision `aa80d0fd`, the pinned
+    one) holds the ProteinMPNN, SolubleMPNN, LigandMPNN and membrane checkpoints only. A PottsMPNN,
+    ProtonPottsMPNN or LASErMPNN `checkpoint_id` therefore cannot resolve on a plain `pip install`.
+    Pass `--model-local-path`: the upstream `.pt` (needs `torch`; LASErMPNN converts it inside the
+    installed package, PottsMPNN's on-the-fly conversion needs a source checkout because the converter
+    script is not in the wheel), or a converted `.eqx`. ProtonPottsMPNN needs a converted `.eqx` from
+    `scripts/parity/convert_protonpotts_checkpoint.py`. The `weights/pottsmpnn/*.eqx.zst` files in the
+    source tree are **not** loadable PottsMPNN artifacts (they decompress to a different architecture
+    and fail to deserialise into `PottsMPNN`); do not pass them.
+  - **LASErMPNN needs the `laser` extra** (`pip install 'aminx[laser]'`, ProDy).
+- **A redsox parity gate** (`scripts/redsox/run_gate.py`) and a per-family parity ledger
+  (`tests/knob_gate/sidecar_ledger.toml`, nine rows). The gate passed by record at `8004a04f` (run
+  `cc98ddb1`, 1707 ids, `verify_wave` 135/135).
+- **Parity dashboard** (`scripts/dashboard/extract_parity.py`, `index.html`). Regenerate its JSON
+  against the current ledger before quoting numbers from it.
+- Browser export and gates for PottsMPNN and ProtonPottsMPNN (ONNX graphs, a JS scorer and sampler,
+  Node and headless-Chromium parity gates).
+
+### Parity numerics
+
+- f32 minimum bands for ProtonPottsMPNN were measured on CPU and GPU and widened to the measured
+  floor: `ph_block` 5e-5, `ph_methods` 4e-4. LASErMPNN tiers: `laser_layers` atol 4e-5,
+  `laser_encoder` scale-relative 2e-4. Ledger vehicles run JAX on GPUs by default
+  (`AMINX_WAVE_BACKEND=gpu`); the CPU pin is gone.
+
+
+### Removed
+
+- **`aminx.profiling`** (`hlo_tools`, `sampler_profile`). No importers.
+- **`aminx.training.train_diffusion`** and its in-tree test `training/test_diffusion_loop.py`.
+- **`aminx.inference.driver`** (`decode`, `infer_topology`, topology constants). `decode` raised `NotImplementedError`; topology routing lives on the plan mode classes. `aminx.host.plan.PlanTopologyError` and `aminx.tiling.errors` are unchanged.
+- **Host sinks with no production callers:** `JacobianAccumulationSink`, `jacobian_sink_session`, `stage_jacobian_io`, `scoring_tensor_sink_session`, `active_scoring_sink`, `EncoderIntermediateStagingSink`, `encoder_sink_session`, `active_encoder_staging_sink`, `take_encoder_intermediates`, `IoCallbackEncoderSink`, and `_noop_sampling_chunk_io`. Streaming tensor sinks stay.
+- **`aminx.utils.atomic_write`** and **`aminx.utils.testing.get_tolerances`**.
+
+### Changed
+
+- **Redsox ledger staleness is now per row.** A row goes stale only when a changed path is in its own import closure (`tests/knob_gate/_closure.py`, `closure_edges.toml`), not on any scoped-prefix change. Anything the scanner cannot prove irrelevant still makes the row stale. New: `scripts/redsox/stale_rows.py`, `launch_wave.sh --stale-only`, and a run-time loaded-files check (`scripts/redsox/closure_hook`). `tests/port/` is no longer scoped for rows. See `.praxia/docs/decisions/261008_per-row-closure-staleness.md`.
+
+- **Training numerics** (`TrainingSpecification.weight_decay_mask`, default `"no_bias"`).
+  No-warmup AdamW now skips decay on 1-D parameters, matching the warmup path.
+  `weight_decay_mask="all"` decays every inexact parameter and restores the previous
+  no-warmup behaviour. Gradient accumulation averages micro-batch loss and gradients.
+  Resume continues the checkpoint PRNG key and the epoch stored in `extras["epoch"]`
+  (the loader has no fixed steps-per-epoch, so the epoch is not derived from `step`).
+  Checkpoints written before this change cannot be resumed: the restore template now
+  includes that epoch leaf, and older checkpoints saved `extras={}`.
+  
+- **Spec JSON carries `schema_version` 1.** Unknown keys are rejected with close-match
+  suggestions. Legacy documents without `schema_version` still load. Removed keys are
+  migrated by a table (`drop` warns, `error` fails). The deprecated-kwargs constructor
+  shim is gone: passing those kwargs to a specification constructor raises `TypeError`.
+  Agent `spec_sha256` values change because the encoded spec gained a key.
+
+- **Runner buckets residue length by default** (xtrax `BUCKET_LADDER`). Seeded sample
+  outputs change. Past the bucket, sampled tokens are X and logits are 0 (previously
+  computed values). Old specs replay with bucketing on; pass `--no-length-bucketing` /
+  `length_bucketing=False` to reproduce a pre-bucketing run. Campaign numerics
+  epoch is 2.
+
+- **MCP `sample` and `score` no longer fit `max_length`** where the runner buckets
+  (bucketing on, `pass_mode` not inter, and for `score` not averaged or multi-state).
+  The returned spec keeps the caller's `max_length` (default 512); outputs are
+  unchanged in shape because tools already trim to each structure's residue count.
+  `inspect`, `jacobian` and the unbucketed paths still fit it.
+
+- **xtrax pinned to `0.4.0a11`** (was `0.4.0a10`). xtrax renamed its chunked strategy
+  `SafeMap` to `ChunkedMap` (`SafeMapIterator` to `ChunkedMapIterator`; xtrax #3644).
+  Every aminx use of *xtrax's* names now uses the new ones; aminx's own
+  `aminx.tiling.strategy.SafeMap` (`.tile`) is unchanged here, and is slated for
+  deprecation in favour of xtrax's (debt #2371).
+
+### Fixed
+
+- **Seed 0 means seed 0.** `random_seed or 42` used to execute seed 0 as seed 42 while the
+  saved spec recorded 0. `None` still defaults to 42, once, when the specification is
+  constructed. A legacy spec JSON document (no `schema_version`) that records 0 decodes as
+  42 with a `UserWarning`, because that is the seed the run actually used. Documents with
+  `schema_version` 1 keep 0. Campaign units whose `random_seed` is 0 are recomputed
+  (`seed0_semantics` on the unit input hash); every other unit hash is unchanged.
+  `SAMPLING_NUMERICS_EPOCH` stays 2.
+
+- **`host.kernel_dispatch._dispatch_axis` keeps xtrax plans chunked after the rename.** It
+  dispatches on `type(strategy).__name__` to serve both strategy origins and matched only
+  `"SafeMap"`. Under xtrax 0.4.0a11 an xtrax plan reports `"ChunkedMap"` (the deprecated
+  alias is the same class), so it fell through to the fallback, `batch_size=0`: no
+  chunking, no error, no warning. It now accepts both names
+  (`tests/host/test_kernel_dispatch_chunked_map.py`, red on the old code).
+
+## 0.2.0a3 (2026-09-30)
+
+**Browser inference.** ProteinMPNN sampling now runs in a page, validated against the
+reference implementation and benchmarked with a clock that had to prove itself first. No
+store-format change, hence an alpha increment rather than another minor bump.
+
+*(`0.2.0a2` was tagged without a changelog entry. Its contents — debt sweep, random
+decoding order by default, parm7 trajectory loading, PR #160 — are not restated here.)*
+
+### Added
+
+- **RNG-free export wrappers and the browser sampling path** (task
+  `260926_browser-export-loop`). `aminx.export` exposes `make_p03_featurize`,
+  `make_p04_unconditional` and `make_p07_sample`, plus the bucket ladder
+  (`export.buckets`) and a jaxpr RNG walker (`export.rng_audit.find_rng_primitives`) that
+  asserts no random primitive reaches a traced export. `gumbel_noise` and every RunSpec
+  control are runtime inputs, so one graph per length bucket serves every design
+  configuration and nothing needs a PRNG key inside ONNX.
+
+- **A four-graph split export, and the reasoning for preferring it.** `make_p07_sample`
+  keeps the whole autoregressive loop in one ONNX graph, which works but forces ONNX to
+  carry `Loop`/`If`/`Scan` **and** both decoder implementations behind a runtime
+  `lax.cond` — `AutoregressiveConfig.incremental` defaults to `"auto"`, so the exported
+  graph contains the O(L²k) full-recompute arm and the O(Lk) cached arm plus an `If` to
+  choose. Splitting into encoder / wave-schedule / decoder-step / fuse-and-sample, with
+  the loop driven from JavaScript (`browser/aminx-sampler/split_loop.mjs`), removes the
+  duplication and leaves no control flow in the per-step path:
+
+  | | L128 | L256 |
+  |---|---:|---:|
+  | monolith | 19.43 MB | 31.52 MB |
+  | split | **6.64 MB** | **6.71 MB** |
+
+  The split barely grows with length because its graphs are weight-dominated and
+  loop-free. `can_increment` is computable from `decoding_order` and `tie_group_map`
+  alone, both already built in JavaScript, so the branch decision moves out of the graph
+  rather than being exported twice.
+
+- **`aminx.parity.compare`** — the shared comparison surface the browser gates use.
+
+- **`*.onnx` tracked in LFS**, with the validated bytes pinned at `release/browser/` and a
+  manifest recording each file's sha256, byte size, input shapes and dtypes alongside the
+  commit and checkpoint id. `p07_split_export.py --verify-manifest` re-hashes them and
+  reports drift, which is how a consumer confirms the bytes being served are the bytes
+  that were validated. Each LFS pointer oid equals the manifest sha256 for that file, so
+  the two records cannot silently disagree.
+
+- **PottsMPNN browser graphs pinned at `release/browser/potts/`** under the same scheme. That is
+  encode, energy, decode and refine at L128 and L256, with manifest sha256 `cf960131…`, the set
+  the six Potts browser gates graded. `p07_split_export.py --verify-manifest
+  release/browser/potts/MANIFEST.json` checks them.
+
+### Validated
+
+Each figure below comes from a bathos run graded against a sidecar committed **before** it
+ran, with a negative control that had to fire first.
+
+- **Reference parity, measured directly against the exported graphs** — teacher-forced
+  per-position log-probs vs reference ProteinMPNN (LigandMPNN `26ec57ac`, same
+  `proteinmpnn_v_48_020` checkpoint): **3.822e-05 nats** (bound 1e-4, inherited from the
+  existing JAX-vs-reference check rather than chosen). Scoped to untied lanes on
+  fully-designed structures.
+- **Tokens exact, not within tolerance**, because a changed token is a changed design and
+  a log-prob bound cannot see one: 288/288 cells on the monolith across the full RunSpec
+  knob grid; 56/56 (L128) and 32/32 (L256) for the split under ORT-CPU; 56/56 through the
+  shipping JavaScript on ORT-Web wasm; 8/8 and 4/4 in headless Chromium.
+- **Threading changes nothing.** At 4 threads with COOP/COEP the tokens are identical and
+  the log-probs **bit-identical** to single-threaded. Worth checking rather than assuming:
+  thread count changes float accumulation order.
+- **Timing, with a planted-delay control that had to pass first** (an earlier benchmark
+  in this project never established one and its numbers were discarded). In-page at
+  L128: 15.77 s single-threaded, **6.80 s** at 4 threads. L256: 27.18 s — cost grows
+  roughly quadratically in length, not linearly.
+- **WebGPU is untested for want of hardware, not effort.** A capability probe obtained no
+  adapter on the development machine, so ORT was never asked; the one known obstacle
+  (ONNX mandates int64 `TopK` indices for the k-NN sort, unsupported by the WebGPU EP) is
+  confined to the encoder, which runs once per structure rather than once per step.
+
+### Fixed
+
+- **`generate_ar_mask`'s tied branch no longer depends on sort stability** — it sorts on
+  `(key, index)` with `num_keys=2` and `is_stable=False` instead of a bare
+  `jnp.argsort`. Every absent group shares the sentinel key `N + 1`, so ties are the
+  common case rather than an edge case, and IREE does not honour JAX's stable-sort tie
+  order. Same class of fix as `model.features.top_k` (PR #156).
+
+  Both this and `export.wrappers.wave_from_decoding_order` now carry **structural**
+  regression guards that assert on the traced jaxpr. The pre-existing tests reimplemented
+  the formula inside the test file and asserted a property of that copy, so a revert left
+  them green — verified, not assumed. A behavioural test cannot distinguish the two
+  implementations either, because the fix is designed to reproduce stable-argsort
+  semantics exactly; only the lowering differs.
+
+## Unreleased
+
+### Fixed
+
+- **The trainer optimized against AF-permuted labels** (#109). A loader batch's `aatype` is
+  AF-ordered (`ARNDCQEGHILKMFPSTWYVX`) but the model's token space is MPNN-ordered
+  (`ACDEFGHIKLMNPQRSTVWYX`), and `train_step` / `eval_step` (and the diffusion `train_step`)
+  received `batch.aatype` unconverted. The permuted array was the cross-entropy target, the
+  decoder's one-hot embedding input, and the reference for `sequence_recovery_accuracy` and
+  `perplexity`, so no symptom ever appeared. Labels are now converted at read time with
+  `aminx.utils.aa_convert.training_labels` at every call site in `training/trainer.py` and
+  `training/test_diffusion_loop.py`. The persisted `"aatype"` key in preprocessed array_record
+  datasets is unchanged (still AF-ordered), so existing datasets remain valid.
+  - **Consequence for existing checkpoints and metrics (not remediated here):** any checkpoint
+    trained or fine-tuned with aminx before this fix is suspect. Fine-tuning from an MPNN
+    checkpoint pushed the weights to relearn a permutation they already encoded correctly;
+    training from scratch self-consistently learned AF order, so those checkpoints are
+    AF-native while the whole inference stack assumes MPNN. The training metrics recorded for
+    such runs (loss, accuracy, perplexity, validation and test) are unreliable. The bundled
+    pretrained checkpoints and inference are unaffected.
+  - New guard: `tests/training/test_trainer_alphabet.py` runs the trainer's own `eval_step` /
+    `train_step` on real `proteinmpnn_v_48_020` weights and fails if raw AF labels reach them.
+
+## 0.2.0a1 (2026-09-10)
+
+**Minor bump, not another `0.1.0a` alpha.** Two things in this release change what a run writes
+to disk, and one of them introduces new hard failures on input that previously "worked". A reader
+of an aminx store cannot assume a `0.2.0a1` store is shaped like a `0.1.0a28` one, so the version
+says so. Still an alpha — the suffix is retained deliberately; nothing here claims the project has
+left alpha.
+
+### Added
+
+- **The sink is now self-describing about logit semantics, and about what produced it**
+  (backlog #4149, PR #154). `aminx.inference.decode.autoregressive` computes two logit arrays per
+  wave — `stored_logits` (fused with a **zero** bias) and `sampling_logits` (fused with
+  `cond.bias`, and the only one that reaches `jax.random.categorical`). Every sink writes the
+  bias-free array as `"logits"`. That divergence is deliberate and correct, but nothing on disk
+  recorded it, so a consumer had to already know — and the moment a nonzero bias is introduced,
+  the stored array silently stops describing the distribution that was sampled from.
+
+  New module `aminx.io.sink_provenance`, consumed by all three writers (`host/streaming.py`,
+  `sampling/multistate_poe.py`, `io/designs.py`). New optional attrs — absent means unknown,
+  since aminx has no reader for these stores yet:
+
+  | attr | meaning |
+  |---|---|
+  | `logits_bias_semantics` | which array is stored, whether a bias was nonzero, whether it was persisted, and **which group** holds it |
+  | `prng_seed` | the run seed |
+  | `grid_job_seed_hash` | the other half of a grid-mode run's sampling key |
+  | `aminx_version` | resolved via installed-distribution metadata, never `aminx.__version__` |
+  | `sink_provenance_version` | hash-free marker letting a reader tell a store carries these fields |
+
+  The raw pre-jit bias is persisted as a `bias` array when nonzero, so `sampling_logits` can be
+  reconstructed from `stored_logits` without re-deriving it. **No `@jax.jit` signature changed** —
+  the tag is derived host-side from the raw bias.
+
+  `DesignZarrWriter` gains an opt-in `aminx_version=` override for bare-source and vendored
+  imports, which have no `.dist-info` and therefore cannot resolve a wheel version.
+  (`src/aminx/io/sink_provenance.py`, `src/aminx/host/streaming.py`,
+  `src/aminx/sampling/multistate_poe.py`, `src/aminx/io/designs.py`)
+
+### Changed
+
+- **`xtrax[io]` `0.4.0a5` → `0.4.0a9`, crossing a breaking change** (PR #153). xtrax **a7** made
+  `SinkSpec.run_id` a required constructor argument; aminx was pinned at `==0.4.0a5` and had never
+  crossed it. Four construction sites were affected — CI caught two, and `host/streaming.py` and
+  `host/runner.py` were equally broken but uncovered by tests. The three sites with a `RunSpec` in
+  scope now go through the documented canonical seam `xtrax.run.derive_sink_spec`;
+  `DesignZarrWriter`, which has no run context, takes an optional `run_id` defaulting to
+  `new_run_id()` (optional rather than minted inline because `ZarrStagingSink` **raises** when a
+  store on disk carries a different `run_id`, so a caller reopening a store must be able to supply
+  the matching id).
+
+  **This does not link provenance yet.** `derive_sink_spec`'s run-id precedence is explicit
+  `run_id=`, then `run_spec.run_id`, then a fresh `new_run_id()` — and `build_run_spec` never
+  populates `run_id`, so every call still falls through to a fresh unlinked id. Routing through the
+  seam puts the decision in one place so populating `RunSpec.run_id` later fixes all three sites at
+  once; what `run_id` should derive from is deliberately left open.
+  (`pyproject.toml`, `uv.lock`, `src/aminx/host/streaming.py`, `src/aminx/host/runner.py`,
+  `src/aminx/sampling/multistate_poe.py`, `src/aminx/io/designs.py`)
+
+- **Two new hard failures, replacing silently-wrong output.** Both refuse to write a provenance
+  claim that would be false rather than writing it:
+  - `_sample_streaming` and `sample_multistate_poe_campaign_row` raise `NotImplementedError` when
+    `return_logits=True` and `sampling_strategy != "temperature"`. Decode mode is a pure function
+    of that field (`host/plan.py::resolve_decode_mode`: `"straight_through"` → `STEMode` →
+    `decode/ste.py`), and `logits_bias_semantics` describes a split only the autoregressive path
+    produces. `SamplingSpecification.__post_init__` already rejected this combination in **grid**
+    mode, but both writers also serve non-grid runs, where it was legal.
+  - `DesignZarrWriter.write()` raises `ValueError` on a `logits_bias_semantics` dict claiming
+    `bias_persisted: True`. That writer stages no `bias` array and has no root group, so the claim
+    can never be satisfied — and `logits_bias_semantics_outputs` returns it **by default**, so a
+    caller doing the obvious thing would have written a lying attr.
+
+### Bug Fixes
+
+- **A metadata constant was load-bearing for randomness.** `_grid_job_seed_hash` hashed a payload
+  keyed on `GRID_SCHEMA_VERSION`, and that digest folds into `_base_sampling_key`'s
+  `jax.random.fold_in` chain — so bumping a *schema label* silently changed the sampled output of
+  every grid-mode run (different tokens, and different logits at later AR positions, since decoded
+  tokens feed forward). **This fired for real during development:** a bump to `grid_v2` made to
+  satisfy one acceptance criterion violated another (`stored logit values bit-identical`) in the
+  same commit, caught by audit rather than by any test. Fixed with `_SEED_HASH_SCHEMA_PIN`, a
+  dedicated constant frozen forever and decoupled from the schema label. It is retained even though
+  both values currently read `"grid_v1"` again — the point is the decoupling, not the coincidence.
+
+  `GRID_SCHEMA_VERSION` also feeds `_grid_manifest_row_hash` → a campaign manifest row's **output
+  path** → `_done_marker_path`, so bumping it makes `_read_done_marker` return `None` for every
+  already-completed row on resume: a silent full recompute of an in-progress campaign, with the old
+  store orphaned on disk. That coupling is **not** fixed here; the schema bump was withdrawn
+  instead, and the hash-free `sink_provenance_version` carries the reader-facing intent.
+  `GRID_SCHEMA_VERSION` should be treated as unbumpable without a migration plan.
+  (`src/aminx/host/_sampling_grid_lineage.py`)
+
+- **The persisted `bias` array was silently dropped in grid mode.** Both sampling writers built
+  `root_arrays` via `.update(bias_arrays)` and then, only when `grid_lineage is not None`,
+  *reassigned* `root_arrays = {...}` instead of updating it — discarding the staged array while
+  `logits_bias_semantics["bias_persisted"]` still claimed `True`. A lying attr, worse than a
+  missing one. (`src/aminx/host/streaming.py`, `src/aminx/sampling/multistate_poe.py`)
+
+## Undocumented (0.1.0a7 – 0.1.0a28)
+
+> **These entries were filed under a heading that read `Unreleased`, but they are not unreleased.**
+> The section accumulated from 0.1.0a7 onward without ever being cut into per-version sections,
+> while a7–a28 were in fact released. At least the Zarr storage migration and the `xtrax.tiling`
+> decode-path dispatch described below shipped in `0.1.0a28` (they are present at tag `v0.1.0a28`).
+> The heading is corrected here rather than renamed onto `0.2.0a1`, which would have mis-attributed
+> roughly a year of already-released work to this release. No attempt is made to retroactively
+> split these entries across a7–a28 — the per-version attribution was not recorded at the time and
+> is not reliably recoverable. Only `v0.1.0a1`–`v0.1.0a7` and `v0.1.0a28` are tagged.
+
+### Added
+
+- **Decode-path dispatch now runs through `xtrax.tiling`** (EPIC #1541 P3): `make_decode_fn`
+  (`ConditionalMode`/`UnconditionalMode`/`AutoregressiveMode`) resolves its state-axis strategy
+  via `make_axis_dispatch_via_xtrax`, and the sampling planner (`make_sampling_planner`)
+  delegates strategy selection to `xtrax.tiling.BatchPlanner`'s joint-budget mode
+  (`xtrax==0.4.0a1`), replacing aminx's own hand-rolled greedy demotion loop.
+  (`src/aminx/inference/decode/factory.py`, `src/aminx/host/plan.py`)
+
+  *Closes the loop noted in 0.1.0a6: `PlannerTopology`'s planned `xtrax.ExecutionProfile`
+  field awaited xtrax reaching multi-phase `BatchPlanner` parity (T2.5) — that parity is now
+  gated and passed (see below).*
+
+- **Sampling/jacobian streaming output migrated from HDF5/ArrayRecord/`.npz` onto Zarr**
+  (`xtrax[io]==0.4.0a4`): `host/streaming.py`'s two write paths (the deprecated HDF5 path and
+  the `use_arrayrecord=True` ArrayRecord path) are unified into one Zarr-backed path built on
+  `xtrax.run.ZarrStagingSink`; `host/runner.py`'s jacobian runner writes each structure's
+  jacobian into its own keyed Zarr group instead of one `np.savez_compressed` dump at the end
+  (also removes a latent bug: the old dump required uniform jacobian shapes across all
+  structures via `np.stack`, which fails for variable-length inputs — per-key Zarr groups have
+  no such constraint). `io/designs.py`'s `DesignArrayRecordWriter` becomes `DesignZarrWriter`,
+  same validation/dtype contract (sequence uint8, logits float16, scores/state_weights
+  float32), now storing per-design metadata in the Zarr group's `.attrs` instead of a raw JSON
+  byte suffix. `output_h5_path` (field name kept, semantics updated) now points at a Zarr
+  store directory rather than a single file.
+
+  Known simplifications from this migration, not full parity with the code it replaces:
+  `DesignZarrWriter` drops the old writer's async thread-pool (writes are now synchronous);
+  campaign-mode sampling accumulates a structure's sample-chunks in memory *within one batch*
+  before staging (bounded by one batch's dispatch size, not the whole campaign) rather than
+  the old HDF5 path's true per-chunk incremental resize-writes — `xtrax.run.ZarrStagingSink`
+  would need an append-mode extension to restore that if a campaign's per-batch memory
+  footprint proves too large in practice.
+
+  `SamplingSpecification.use_arrayrecord` and its CLI flag are removed (the format is no
+  longer a caller choice). `campaign.py`'s own HDF5-based lock/done-marker/content-verification
+  machinery is explicitly OUT of scope for this migration — it's real distributed-systems
+  infrastructure (retry/resume correctness across likely-SLURM-array campaign jobs), tracked
+  separately (backlog #3182).
+  (`src/aminx/host/streaming.py`, `src/aminx/host/runner.py`, `src/aminx/io/designs.py`,
+  `src/aminx/inference/optimize_ste.py`, `src/aminx/run/specs.py`, `src/aminx/run/spec.py`,
+  `src/aminx/cli.py`, `tests/io/test_designs.py`)
+
+### Bug Fixes
+
+- **Every autoregressive mask set its diagonal, so each position read its own slot — and
+  that slot asserted ALANINE, not "undrawn". Numerical output of every AR sampling run
+  changes.**
+  ([`src/aminx/utils/autoregression.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/utils/autoregression.py),
+  [`src/aminx/inference/decode/autoregressive.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/inference/decode/autoregressive.py))
+
+  `generate_ar_mask`'s untied branch was `row_indices >= col_indices` — non-strict — and
+  `generate_wave_ar_mask` returns `earlier_wave | (same_wave & same_group)`, trivially true
+  when `i == j`. Both therefore set `ar_mask[i, i] = 1`. The decoder gathers this mask into
+  `attention_mask` to gate the *sequence* edge features (`model/decoder.py:144-146`), and a
+  residue is always among its own KNN neighbours (self-distance 0 is the global minimum), so
+  the diagonal is a live self-loop, not an inert one.
+
+  The rationale for keeping it was that a not-yet-drawn position's own slot holds a harmless
+  placeholder. That premise was false twice over. First, `decode/autoregressive.py`
+  initialized undrawn slots to token index **0**, and `MPNN_ALPHABET` is
+  `"ACDEFGHIKLMNPQRSTVWYX"` — index 0 is **alanine**, while the unknown token `X` is index 20
+  — and `model/decoder.py:124` embeds it as `one_hot_sequence @ w_s_weight`, a real nonzero
+  row of a pretrained matrix. Each position was being told "I am alanine" about itself at the
+  exact step it decided its own identity. Second, the placeholder only exists at the wave a
+  position is drawn: `_decode_one_step` rebuilds from the encoder output every wave with no
+  carried hidden state, so from the following wave onward the slot holds a real token.
+
+  Both reference implementations disagree with what we were doing, verified against primary
+  source: stock LigandMPNN builds `1 - torch.triu(torch.ones(L, L))` at
+  `model_utils.py:227-231` and four further call sites (`torch.triu` defaults to
+  `diagonal=0`, so this is strictly lower-triangular), and ColabDesign builds
+  `jnp.tri(L, k=-1)` at `colabdesign/mpnn/utils.py:19-26`. Both are self-excluding under any
+  permutation.
+
+  Our own parity suite never caught it: `tests/parity/test_full_model_parity.py:90-95`
+  hand-builds its `ar_mask` with a **strict** comparison and passes it explicitly, so the
+  `ar_mask is None` branch never runs and `generate_ar_mask` — the function the production
+  sampling path calls — was never invoked there at all.
+
+  Both constructors are now self-excluding, and the undrawn sentinel is `-1`
+  (`UNDRAWN_TOKEN`), whose one-hot is the zero vector, reproducing the reference's
+  `h_S = torch.zeros_like(h_V)`. Self-exclusion alone already makes undrawn slots
+  unreachable, so the sentinel is defence in depth — and it makes "not yet drawn"
+  distinguishable from "alanine" in a stored or mid-decode sequence, which index 0 could not
+  express.
+
+  **Impact.** Measured on TEV protease with a fixed 25-residue active-site shell: mean JSD
+  **0.0296** over designable positions between the old and new masks, with an
+  alanine-specific probability shift of **−0.0049** against a mean of 0.0016 across the other
+  twenty tokens. The score path is unaffected (it already used the diagonal-free
+  `full_context_ar_mask`). There is no opt-out: the old behaviour was not a configuration.
+
+  **Deliberately NOT changed**, both flagged for separate work: same-tie-group positions
+  remain mutually visible (whether that matches the reference's *tied* decoding is unverified,
+  and it is not the diagonal); and `generate_ar_mask` consumes a **rank** array
+  (`rank[i]` = step of position `i`) while the parity fixture treats the same argument as an
+  **order** array (`order[k]` = position at step `k`) — a live convention inconsistency that
+  is invisible for uniform random permutations and is now pinned by a test.
+
+- **`SamplingSpecification` had no `weight_profile`/`fixed_group` fields, so any manifest
+  row carrying them in its nested `sampling_spec` hard-crashed real sampling**
+  ([`src/aminx/run/specs.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/run/specs.py))
+
+  `run_manifest_row`'s `SamplingSpecification(**worker_payload)` construction
+  (`host/campaign.py`) is deliberately strict about unknown keys — an audit safety
+  mechanism, not something to weaken. A manifest-building caller (tev_design's necklace
+  campaign) writes `weight_profile`/`fixed_group` provenance labels into a row's nested
+  `sampling_spec` for anti-mislabel validation (checking the executed output against
+  manifest intent) — a pattern already established for other CLI-flag-less fields
+  (`batch_size`, `state_weights`, `multi_state_strategy`). But these two were never added
+  as real fields, so any freshly-built manifest carrying them crashed real sampling with
+  `TypeError: unexpected keyword argument 'weight_profile'`. Undetected until now because
+  the L1 static validator that manifest builders typically gate on reads raw JSON and
+  never constructs `SamplingSpecification` — only a real sampling call exercised this gap,
+  and no one had re-run one against a freshly-built manifest since these labels were added.
+
+  Fix: both are now real, first-class (if sampling-inert) `str | None = None` fields,
+  matching the same pattern as `job_id`. See `tests/run/test_specs.py`'s
+  `TestSamplingSpecificationValidation.test_weight_profile_and_fixed_group_are_real_fields`
+  for the regression coverage.
+
+- **`n_samples` axis planning was silently decoupled from the actual runtime sample count**
+  ([`src/aminx/host/plan.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/host/plan.py),
+  [`src/aminx/host/kernel_dispatch.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/host/kernel_dispatch.py))
+
+  `make_sampling_planner`'s `N_SAMPLES` axis cardinality was computed from
+  `SamplingSpecification.samples_batch_size` (a static default, 16), while the actual dispatched
+  sample count was resolved independently via `resolve_target_samples` — two unrelated fields,
+  no cross-validation. When the plan decided Vmap because the small default fit the memory budget,
+  that decision was silently applied to the real (possibly far larger) array with no re-check,
+  in both the default (`_dispatch_axis`, no fallback at all) and legacy (`safe_map`'s defeatable
+  `batch_size==0` branch) dispatch paths.
+
+  Fix: `make_sampling_planner` gained an optional `n_samples_override` parameter; `_sample_batch`
+  now resolves the real per-call sample count first and passes it through, so the planner's
+  decision is verified against the array size that's actually dispatched.
+
+  Introduced in `5ca2abf` (2026-05-07); see
+  `.praxia/docs/specs/260706_samples-axis-planner-cardinality-mismatch.md` for the full root-cause
+  history and `tests/host/test_samples_cardinality_fix.py` for the regression coverage.
+
+- **State axis in multistate PoE sampling hardcoded `Vmap`, bypassing `BatchPlanner` entirely**
+  ([`src/aminx/inference/sample_autoregressive.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/inference/sample_autoregressive.py),
+  [`src/aminx/sampling/multistate_poe.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/sampling/multistate_poe.py))
+
+  `sample_autoregressive.kernel()` always passed `strategy=Vmap()` for the state axis to
+  `make_decode_fn`, regardless of `bundle.geometry.n_states` or the device memory budget —
+  invisible to any BatchPlanner accounting, even though `aminx.tiling.axes.N_STATES` already
+  declares the canonical convention (`default_batch_size=1`, i.e. SafeMap-one-state-at-a-time
+  whenever `num_states>1`). Harmless at `num_states=1` (the only case the single-structure
+  campaign path hits), but for a genuinely fused multi-state bundle (`sample_states_fused`)
+  this batches every decoder layer's per-state MLPs simultaneously. At production sample
+  counts this produced a single fused GEMM XLA's autotuner could not find a valid kernel
+  config for: `sample_count=128` crashed after an 809s compile ("Autotuning failed for HLO:
+  `f32[128,12582912]{1,0}` fusion(...)"), `sample_count=512` failed differently ("9 out of 89
+  instructions"). Found investigating tev_design's necklace PoE production-scaling
+  bottleneck (praxia debt #942).
+
+  Fix: `kernel()` gained an optional `state_strategy` parameter (`None` preserves the prior
+  Vmap default for the single-state path); `sample_states_fused` now resolves the state axis
+  through `BatchPlanner` against `N_STATES` (a plain cardinality-vs-`default_batch_size` rule,
+  deliberately not a memory-estimator/budget call — an optimistic byte estimate is exactly
+  what let this bug go unnoticed) and passes the resolved strategy through, translating
+  xtrax-native decisions back to aminx's own `AxisStrategy` union the same way
+  `_plan_axis_strategy` already does for the samples axis.
+
+  See `tests/sampling/test_multistate_poe.py`'s
+  `test_multistate_state_axis_resolved_via_batchplanner_not_hardcoded_vmap` and
+  `test_single_state_still_passes_an_explicit_resolved_strategy` for the regression coverage.
+
+  **Follow-up (same investigation):** fixing the state axis alone wasn't sufficient —
+  `sample_count=128`/`512` still failed after this fix (differently: "Failed to get configs
+  for: N out of M instructions", not the original 809s-compile blowup), because the samples
+  axis's own memory estimate (`activation_bytes_per_element` in `sample_states_fused`) was
+  *also* a hand-typed linear formula (`num_states * seq_len * a hidden-dim-sized magic
+  constant`) that missed the AR mask's quadratic `(L, L)` term and the `(L, K, D)`
+  edge-feature term entirely. Replaced with `xtrax.tiling.estimators.
+  lowered_memory_estimate` — lowers+compiles a ONE-sample representative tile (state axis
+  already resolved) and reads XLA's own buffer-assignment numbers, a real measurement
+  instead of a formula that's now been shown to drift out of sync with reality twice in the
+  same function. This primitive already existed in xtrax with zero call sites anywhere in
+  aminx before this (praxia debt #945 tracks auditing every other hand-typed estimate
+  in aminx for the same migration).
+
+  **Tried and reverted (same investigation):** a `jax.profiler` trace of the working code
+  showed the GPU ~98% busy but firing ~12,000 kernel launches for 8 samples at
+  `num_states=4`, so an attempt was made to measure (via `lowered_memory_estimate` +
+  `xtrax.tiling.estimators.device_memory_budget`) whether `Vmap` across states fits the
+  device budget, preferring it over `SafeMap(1)` when it does, on the hypothesis that fewer
+  larger fused kernels would be faster than many small sequential ones. **Empirically
+  false for this workload**: production-scale re-validation (`sample_count` 8/32/128/512,
+  real L40S GPU) showed `Vmap`-across-states was consistently 40-70% *slower* than
+  `SafeMap(1)` at every size tested (e.g. `n=512`: 0.93s/sample with `SafeMap(1)` vs
+  1.58s/sample with the measured-fits `Vmap`) — kernel count was not the bottleneck for
+  this architecture; something about the larger fused/batched execution pattern (likely
+  memory-bandwidth-bound, not launch-overhead-bound) is genuinely slower. Reverted; kept
+  the unconditional `SafeMap(1)` default. Do not re-attempt this without new evidence that
+  the underlying bottleneck has changed.
+
+### Changed
+
+- **`xtrax` pin bumped `0.4.0a1` → `0.4.0a2`** (`pyproject.toml`): picks up xtrax's
+  `StageBundle` validator fix (PEP 563 annotation resolution, structural-callable `Protocol`
+  acceptance, N-way union support) — no breaking changes to aminx's existing xtrax usage.
+  Transitively bumps `jax`/`jaxlib` to `0.10.2` (xtrax's new floor). Unblocks 7 of `StageSet`'s
+  10 fields for a future `StageBundle` adoption attempt; the remaining 3 container-shaped
+  fields (`encoder_sink`, `decoder_sink`, `axis_boundaries`) still need backlog #3155's design
+  work regardless of this bump.
+
+### Gates
+
+- **T2.GATE** (dispatch-layer parity, R1 DoD): bit-for-bit golden fixture, identical JIT-recompile
+  count, and cluster GPU throughput within 0.2% (production shape L=208, TEV protease) all pass —
+  see `tests/tiling/test_t2_gate_bitforbit_golden.py`,
+  `scripts/benchmarks/bench_xtrax_vs_aminx_dispatch_gpu.py`.
+- **T-PLANNER.GATE** (planner-layer parity): old (retired) and new joint-budget planner decisions
+  match across representative demotion/budget scenarios, including the one deliberate behavior
+  change this migration introduces (see Breaking Changes) — see
+  `tests/host/test_t_planner_gate_parity.py`.
+
+### Breaking Changes
+
+- **Sampling/jacobian streaming output format is now Zarr, not HDF5/ArrayRecord/`.npz`** —
+  `SamplingSpecification.use_arrayrecord` and its `--use-arrayrecord` CLI flag are removed.
+  Existing `.h5`/`.arrayrecord`/`.npz` outputs from prior runs are not migrated; downstream
+  readers need to move to Zarr's array/group API. See the Added entry above for the full
+  scope. (`src/aminx/host/streaming.py`, `src/aminx/host/runner.py`, `src/aminx/io/designs.py`)
+
+- **`host/campaign.py`'s manifest-row lock/done-marker/content-verification now targets Zarr
+  stores, not HDF5 files** (`DONE_MARKER_SCHEMA_VERSION` bumped `campaign_done_marker_v1` →
+  `v2`): completes the migration above for the campaign-orchestration path. The lock layer
+  (lease-based, compare-and-swap stale-lock recovery), path-naming helpers, and atomic
+  promotion (`Path.replace()`) needed no changes — verified empirically that directory-to-
+  directory rename is atomic on POSIX, same as for files. What changed: `_h5_content_digest`
+  → `_zarr_content_digest` (same hashing primitives, walks `zarr.Group`/`zarr.Array` instead
+  of `h5py.Group`/`h5py.Dataset`); `_fsync_file` → `_fsync_tree` (a Zarr store is a directory
+  of many chunk files, not one — durability requires recursively fsyncing all of them before
+  trusting a content digest); the whole-file SHA256 (`artifact_sha256`) is dropped entirely —
+  redundant with the semantic content digest and has no clean analog for a directory. Old
+  `v1` done markers (from HDF5-era campaigns) correctly fail schema-mismatch validation
+  instead of being silently misinterpreted; no migration path, matching this project's
+  existing clean-break convention. Scoped in backlog #3182 (chose a direct semantic-digest
+  port over a spot-check optimization — the existing HDF5 path already does a full content
+  walk on every verification, so a full walk for Zarr is behavior-preserving, not a
+  regression; sampling-based verification would be a genuine guarantee weakening not
+  justified without a demonstrated performance problem).
+  (`src/aminx/host/campaign.py`)
+
+- **`make_sampling_planner` raises on an infeasible memory budget** instead of silently returning
+  a plan that exceeds it. Previously, if no combination of Vmap/SafeMap demotions fit the budget,
+  the planner returned a `BatchPlan` with `budget_exceeded=True` that callers could inspect (and
+  which nothing in production actually did). It now raises `PlanBudgetInfeasibleError` (a
+  `TilingError` subclass) instead. No production caller was found relying on the silent path, but
+  this is a new exception type in `make_sampling_planner`'s call chain.
+  (`src/aminx/host/plan.py`)
+
+### Removed
+
+- **`aminx.tiling.planner`'s local `BatchPlanner`/`AxisSpec`/`AxisDecision`/`BatchPlan`**,
+  `aminx.tiling.carry`, `aminx.tiling.dedup`, and `aminx.tiling.carry_shape` — retired once their
+  xtrax equivalents passed the parity gates above. `aminx.tiling.planner` now holds only
+  `estimate_memory_theoretical`, the one piece of the old planner with no xtrax equivalent
+  (invoked through xtrax's engine now, math unchanged). `aminx.tiling`'s `axes.py`, `bucketing.py`,
+  `pad.py`, `strategy.py`, `dispatch.py`, and `errors.py` remain — see
+  `.praxia/docs/decisions/260706_bucketing-pad-stay-local-epic-1541-p3-scope-closed.md` for why
+  those specifically stay.
+
+- **`RunSpec.tied`/`.batching`/`.averaging` sub-configs** (`TiedPositionsConfig`,
+  `BatchingConfig`, `AveragingConfig` — 18 fields total): write-only scaffolding from the RS-1
+  migration that was never finished. `build_run_spec()` populated these on every call but nothing
+  downstream ever read them — all consumers (`host/kernel_dispatch.py`,
+  `host/_sampling_grid_lineage.py`, etc.) read the equivalent flat `SamplingSpecification` field
+  instead. Removing them doesn't change behavior; the flat fields they duplicated are untouched.
+  Scoped in `.praxia/docs/specs/260707_xtrax-migration-gap-audit-runspec-scaffolding.md`
+  (backlog #3158); `GridLineageConfig` and `LigandConfig` were NOT removed — each has one live
+  field (`grid_mode`, `model_family`) plus existing partial-migration fallback logic worth
+  finishing rather than discarding.
+  (`src/aminx/run/spec.py`, `src/aminx/run/run_spec_portable_json.py`)
+
+## 0.1.0a6 (2026-06-14)
+
+### Added
+
+- **`PlannerTopology` sub-config in `RunSpec`** (RS-2): New `eqx.Module` sub-config wrapping
+  aminx kernel dispatch topology. `RunSpec.plan` carries a `PlannerTopology` with a single
+  field `use_unified_driver: bool` (default `True`, consistent with RS-5 fix in 0.1.0a5).
+  Module-level `topology_hash(plan)` produces a deterministic 16-char hex digest for
+  cache-key derivation.
+  ([`src/aminx/run/spec.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/run/spec.py))
+
+  *Note:* `PlannerTopology` will gain an `xtrax.ExecutionProfile` field once xtrax reaches
+  multi-phase `BatchPlanner` parity (T2.5).
+
+### Performance
+
+- **`PoeModel.__call__`**: Replaced Python `for i in range(self.n_backbones)` loop with
+  `eqx.filter_vmap`, matching the pattern already used in `infer_all_params`. Backbone
+  inference is now fully vectorized via JAX rather than traced sequentially at Python level.
+  ([`src/aminx/potts/poe.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/potts/poe.py))
+
+- **`PoeModel.joint_energy`**: Replaced Python `for h, j, w in params_list` loop with
+  `jax.vmap(PottsModel.log_prob, in_axes=(None, 0, 0, 0))` + `jnp.sum` over stacked params.
+  ([`src/aminx/potts/poe.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/potts/poe.py))
+
+- **`_parallel_tempering_exchange`**: Replaced Python `for parity / while i` loops with
+  `jax.vmap` over non-overlapping replica-pair edges within each parity group. Even/odd
+  parity passes remain sequential (odd uses seqs updated by even). Keys split once per
+  parity group; results scattered back via `.at[...].set`.
+  ([`src/aminx/potts/sampling.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/potts/sampling.py))
+
+### Gates
+
+- **G1 training parity gate**: All three criteria pass — pytest suite (8/8), checkpoint
+  round-trip smoke (`ResumableState` save → load, all leaves match to atol=1e-7), and
+  50-step overfit smoke (loss 3.14 → 0.00 over 50 steps).
+
+### Breaking Changes
+
+- **Checkpoint format**: Adopted `xtrax.checkpoint.orbax` single-PyTree checkpointing via
+  `PyTreeCheckpointHandler`, replacing the legacy `ocp.args.Composite` format. Checkpoints
+  saved with the old format are **NOT compatible** with this version. Delete existing
+  checkpoint directories before resuming training.
+  ([`src/aminx/training/checkpoint.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/training/checkpoint.py),
+  [`src/aminx/training/trainer.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/training/trainer.py))
+
+  The `ResumableState` (params, optimizer state, step, RNG, and extras) is now written as
+  a single flat PyTree, improving checkpoint composability and enabling future multi-device
+  training. The metrics dict (if any) lives in `ResumableState.extras`, not as a top-level
+  checkpoint key.
+
+## 0.1.0a5 (2026-06-10)
+
+### Breaking Changes
+
+- **API rename**: `xyz_37` → `atom_37` and `xyz_37_m` → `atom_37_mask` across the
+  side-chain atom-context API — the public `GeometryBundle` fields,
+  `build_inference_bundle(...)` / kernel keyword arguments, and `model.features(...)`
+  parameters. The new names describe the 37-atom representation and its validity mask
+  clearly. No deprecated alias (pre-release clean break).
+
+### Bug Fixes
+
+- **`ProteinFeaturesLigand._make_angle_features`**: correct the residue-frame projection
+  einsum ([`src/aminx/model/ligand_features.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/model/ligand_features.py))
+
+  The projection used `jnp.einsum("lqp, lym -> lyp", R_residue, diff)`. Because `q` and
+  `m` each appear in only one operand and not in the output, einsum summed both
+  independently — `(Σ_q R[l,q,p])·(Σ_m diff[l,y,m])`, an outer product of column-sums
+  rather than the frame projection `e_p·diff`. Corrected to `"lqp, lyq -> lyp"`.
+
+  This was the root cause of the side-chain-context cross-framework divergence (~0.85
+  Pearson vs ~0.9998 baseline vs the LigandMPNN reference). It only surfaced with side
+  chains ON: the no-side-chain baseline's dummy ligand is fully masked, so the corrupted
+  node features never contributed.
+
+### Tests
+
+- Add side-chain-context logits parity test vs the PyTorch LigandMPNN reference, and
+  migrate the tied-autoregressive / multistate side-chain tests to the current bundle
+  API (tie groups via `build_inference_bundle(tie_group_map=...)`; side-chain context
+  packaged onto `GeometryBundle` rather than loose kernel kwargs).
+- Add `tests/model/test_unconditional_sidechain_bundle.py` covering the
+  `build_inference_bundle` → `score_unconditional.kernel` side-chain path: shape
+  normalization for 3-D and 4-D `atom_37` inputs, logits sensitivity to `atom_37` when
+  `use_side_chains=True` (requires `fixed_mask=1` so fixed residues contribute context),
+  logits invariance when `use_side_chains=False`, and `ValueError` guard for missing
+  `atom_37` with a side-chain model.
+
+## 0.1.0a4 (2026-06-09)
+
+### Bug Fixes
+
+- **`ProteinFeaturesLigand`**: fix `top_k` crash when ligand atom count < `atom_context_num`
+  ([`src/aminx/model/ligand_features.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/model/ligand_features.py))
+
+  The 0.1.0a3 fix moved `top_k` (A → `atom_context_num=16`) outside the `use_side_chains`
+  guard, but did not account for dummy ligand inputs (`with_ligand=False`) where A=1.
+  `jax.lax.top_k` raises `ValueError: k argument to top_k must be no larger than size along
+  axis` when k=16 > A=1.
+
+  Fix: clamp k to `min(atom_context_num, A)`, matching the existing pattern for the protein
+  graph at `k = min(self.k_neighbors, Ca.shape[0])` (line 303).
+
+## 0.1.0a3 (2026-06-09)
+
+### Bug Fixes
+
+- **`ProteinFeaturesLigand`**: fix OOM on large ligand atom counts when `use_side_chains=False`
+  ([`src/aminx/model/ligand_features.py`](https://github.com/maraxen/aminx/blob/HEAD/src/aminx/model/ligand_features.py))
+
+  The `top_k` atom selection (A → `atom_context_num=16`) was only applied inside the
+  `use_side_chains` branch. Without sidechain mode the full `A=155` atoms flowed into
+  `_y_edges_coords_to_embed`, whose output buffer is pre-allocated at
+  `(L, A, A, node_features)`. With flat-multistate inputs (`L≈2048`, `A=155`) this
+  allocates `≈20 GiB` before any other live buffers, causing
+  `RESOURCE_EXHAUSTED: Out of memory while trying to allocate 23.63 GiB` on all GPU
+  tiers including H200.
+
+  Fix: move the `top_k` selection outside the `use_side_chains` guard so it always runs.
+
+- **`pyproject.toml`**: bump `proxide>=0.1.0a8`
+
+## 0.1.0a2
+
+- Initial public alpha — Sprint 2 inference API (`build_inference_bundle`,
+  `score_unconditional`, `score_conditional`), flat-multistate support, ligand chunking.
+
+## 0.1.0a1
+
+- Initial release.

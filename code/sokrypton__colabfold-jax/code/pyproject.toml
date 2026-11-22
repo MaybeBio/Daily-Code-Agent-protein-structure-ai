@@ -1,0 +1,91 @@
+[build-system]
+requires = [
+    "scikit_build_core",
+    "pybind11",
+    "cmake>=3.28",
+    "ninja",
+    "numpy",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "alphafold3-colabfold"
+dynamic = ["version"]
+requires-python = ">=3.12"
+readme = "README.md"
+license = {file = "LICENSE"}
+dependencies = [
+    # AlphaFold 2's own config objects and tree utilities. Only alphafold3.af2
+    # needs these; the AF3-family graph does not touch them.
+    "dm-tree",
+    "ml_collections",
+    "etils[epath]",
+    "numpy",
+    "tqdm",
+    "zstandard",
+]
+
+[project.optional-dependencies]
+gcsfs = [
+  # Use `uv sync --extra gcsfs` to enable GCS paths for inputs and outputs
+  "gcsfs",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=6.0",
+]
+cuda12 = [
+    "jax[cuda12]==0.10.2; sys_platform != 'darwin'",
+]
+runtime = [
+    "absl-py>=2.3.1",
+    "dm-haiku==0.0.17",
+    "jax==0.10.2",
+    "rdkit==2025.9.4",
+    "tokamax==0.0.12",
+]
+
+[tool.uv]
+package = true
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.scikit-build]
+wheel.packages = ["src/alphafold3"]
+wheel.exclude = [
+    "**.pyx",
+    "**/CMakeLists.txt",
+    "**.cc",
+    "**.h",
+    "**_test.py",
+    # download components.cif on demand instead
+    "share/**",
+    "var/**",
+    "alphafold3/test_data/**",
+    "lib64/**",
+    "lib/**",
+    "include/**",
+    "etc/**",
+]
+sdist.include = [
+    "LICENSE",
+    "OUTPUT_TERMS_OF_USE.md",
+    "WEIGHTS_PROHIBITED_USE_POLICY.md",
+    "WEIGHTS_TERMS_OF_USE.md",
+]
+metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
+
+[tool.setuptools_scm]
+fallback_version = "3.1.5"
+
+[tool.cibuildwheel]
+build = "cp3*"
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+
+[project.scripts]
+build_data = "alphafold3.build_data:build_data"

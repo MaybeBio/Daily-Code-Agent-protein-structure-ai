@@ -1,0 +1,88 @@
+# Molarium roadmap
+
+The broader roadmap is in [NEXT-BEST-IDEAS.md](https://github.com/rafwiewiora/molarium/blob/HEAD/NEXT-BEST-IDEAS.md).
+The dated [Astra review and remediation log](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/ASTRA_REVIEW_OF_SOL_WORK_2026-09-05.md)
+separate confirmed defects, completed fixes, and remaining validation work.
+Design findings have their own [public finding-to-fix ledger](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/DESIGN_FINDINGS_AND_FIXES_2026-09-06.md)
+with stable `DV-` identifiers and links to original observations and follow-up evidence.
+
+## Structure prediction evidence and release gates
+
+- [x] Remove the custom-domain analytics injection attempt through the user-controlled provider setting and verify the unchanged canonical saved-pose workflow/network guard; preserve the original CSP-blocked attempt and both outcomes ([DN-01](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/COFOLD_REVIEW_PRODUCTION_NETWORK_2026-11-17.md)).
+
+- [x] Complete the frozen 48-system, ten-seed pristine LocalFold study: independently replay all 480 predictions, publish 3/6/10-sample results and timing boundaries, and preserve the native-positive selection limits ([final report](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-rnp-spectrum-2026-11-15/README.md)).
+- [x] Export every final prediction into 96 graph/PDB/alignment-checked Foldarium libraries, with separate experimental-reference cards and empty human decisions; complete actual six-sample UI QA on all 48 systems.
+- [x] Finish the source-pinned all-48 ten-sample browser sweep and publish its complete export/persistence/reopening receipts ([UI coverage](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-rnp-spectrum-2026-11-15/review-ui-2026-11-16/README.md)).
+
+- [x] Freeze a target-diverse, drug-like [recent PDB panel](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-recent-pdb-2026-11-13/README.md) from a complete release-window harvest; check generated biological assemblies before inference and preserve all exclusions.
+- [x] Correct SMILES aromatic/bond input features before browser cofolding; retain original predictions and independently verify all nine input graphs and specified stereocentres ([finding RCF-01](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-recent-pdb-2026-11-13/findings.md)).
+- [x] Complete both 27-pose provided-MSA browser phases and compare OpenBind alignment residue/deletion rows with the actual official CPU processor; preserve all 135 predictions and failures ([results](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-recent-pdb-2026-11-13/README.md)).
+- [x] Complete the separate pristine-page 200-step/ten-seed control on eight native-positive model/system pairs, retaining all 80 predictions and 200-step frames ([results](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-stock-localfold-2026-11-13/results-200x10/README.md)).
+- [ ] Resolve matched-input numerical and broad recent-panel reconstruction differences; the completed protocol comparisons do not establish implementation parity ([status](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-recent-pdb-2026-11-13/README.md)).
+- [x] Complete the 27-pose OpenBind 200-step/MSA256 control; preserve all 162 complete-phase poses and the incomplete Boltz standard evidence, including one lost checkpoint.
+- [x] Retrieve and independently validate all 54 recent native single-sequence poses and the nine old-crystal native OpenBind poses; retain stereo failures and poor folds with raw output hashes and public reconstruction checks.
+- [x] Complete and independently reconstruct all 27 native OpenBind MSA poses and all nine old-crystal native Boltz poses; preserve interrupted sources and compute only missing seeds ([evidence](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/COFOLD_NATIVE_RECOVERY_EVIDENCE_2026-11-13.md)).
+- [x] Finish the two zero-output native Boltz MSA retries and publish all 27 poses plus original failure evidence; retain six geometrically close stereochemical failures.
+- [x] Preserve native and shared-JS tensor features for two diagnostic cases, replay all checked-field comparisons, and identify input-order/name/conformer differences ([RCF-15](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/README.md)).
+- [x] Complete a stock-native processed-SMILES control: eliminate atom-name/order differences while retaining the remaining generated-reference-coordinate discrepancy ([result](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/README.md#same-spelling-control-result)).
+- [x] Compare the actual trained atom/input-feature encoder with stock native FP32 at identical inputs/weights; preserve raw outputs and replayable evidence ([result](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/trained-target/README.md)).
+- [x] Complete the previously unmeasured YTHDF2 browser atom-feature stage on physical Apple WebGPU, reusing native/CPU inputs and weights; publish all raw output and source and independently replay numerical errors ([result](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/trained-target-ythdf2-webgpu/README.md)).
+- [x] Capture the actual native four-cycle trunk, MSA draws and trained FP32 weights once; measure all 32 corresponding Apple WebGPU boundaries and preserve original and precision-control arrays ([evidence](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/trained-trunk-apple/README.md)).
+- [x] Fix the producer's readiness race and precision omission: require the exact fixture page, disable default half-arithmetic pair paths, and reject f16 shaders in the strict-FP32 control (TRUNK-PAGE-01 / TRUNK-PRECISION-01).
+- [ ] Resolve or qualify the retained absolute-error failures under the original trunk gates; Apple 14/32 and NVIDIA 16/32 combined passes, with 32/32 relative passes on both, are not a complete-trunk parity pass.
+- [x] Measure all 32 strict-FP32 boundaries on a physical NVIDIA L4, independently replay all raw bytes, and publish the original numerical failures and complete source ([result](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/trained-trunk-nvidia/README.md)).
+- [x] Compare all 169 captured native trunk/input/MSA/template/distogram parameter tensors with the actual shipped OpenBind-0 bundle: 66 FP32 tensors match exactly and all 103 INT5 encodings reproduce exactly; independently verify decoded hashes and publish complete native input weights ([result](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/shipped-trunk-weights/README.md)).
+- [ ] Measure the effect of shipped parameter rounding with native inputs and unchanged strict-FP32 arithmetic. One regular-L4 control, job 21165, is queued at normal priority; no output or pose result is claimed ([plan](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/shipped-trunk-weights/next-control/parameter-control-plan.json)).
+- [ ] Complete the NVIDIA default-pair-arithmetic and 126-configuration transition controls on a stable allocation. Both attempts lost nodes before payload; no further automatic retry is running ([remaining gap](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/trained-trunk-nvidia/README.md#remaining-control)).
+- [x] Correct future feature-capture wall-clock timing boundaries without rewriting historical receipts or changing the separate CUDA timing (CAP-01, [details](https://github.com/rafwiewiora/molarium/blob/HEAD/folding/comparison/README.md)).
+- [ ] Establish matched full-feature/trained-weight/random-tensor browser/native parity; the 270-prediction review is a protocol comparison, not this gate.
+- [x] Publish native synchronized forward timings with explicit boundaries separate from browser end-to-end throughput.
+- [x] Preserve exact provided-MSA bytes and reject alignment drift in missing-only native recovery ([RCF-12](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/COFOLD_MSA_RECOVERY_2026-11-13.md)); retain original interrupted-source statuses.
+- [x] Recover closing IndexedDB connections once and stop on lost checkpoints without silently repeating completed inference ([RCF-09/10](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-recent-pdb-2026-11-13/findings.md)); verify deletion during an atomic checkpoint in real Chrome.
+- [x] Independently compare fixed nonzero transition-layer inputs/weights against actual official CPU FP32 and FP64, retain raw GPU outputs and reproduce errors directly from bytes ([LCP-01](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-layer-parity-2026-11-13/README.md)). Ordinary inputs pass; stress failures stay explicit.
+- [x] Exercise the actual fused/ranged/split generators, FP32/FP16 storage and GPU int5 upload against matched official FP64 and independent NumPy; preserve 126 raw measurements and failed candidate stages ([LCP-02/03](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-layer-parity-2026-11-13/production/README.md)).
+- [ ] Implement the corrected materialized row shift directly in production generators, then qualify other normalization/factor/matrix paths and full-model throughput before deployment. Current passing evidence is diagnostic component scope.
+
+- [x] Integrate pinned LocalFold AF2 and OpenBind-0 with UI/API inputs, exact ligand graphs and downloadable provenance ([LF-01](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/LOCALFOLD_INTEGRATION_2026-11-12.md)).
+- [ ] Qualify LocalFold against original native models and known ligand complexes; measure quantization separately, then broaden GPU and molecular coverage (LF-01).
+- [x] Add Boltz-2 browser structure inference and compare the 48-pose library with the official native low-step route, retaining raw outputs, seed variability and unscored Foldarium review ([comparison](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-method-comparison-2026-11-12/README.md)).
+- [x] Complete the 48-pose OpenBind-0 native FP32/dense-kernel control on T4 Spot; preserve the substantial protein/ligand disagreement as an unresolved finding, with full human-review bundles ([comparison](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-method-comparison-2026-11-12/README.md)).
+- [ ] Isolate OpenBind's observed browser/native protein disagreement (median Cα RMSD 7.04 Å) using matched weights, features, sampler and random tensors; current protocol differences do not diagnose a porting error.
+- [x] Finish and analyze all 48 native Boltz-2 standard-sampling poses on L4 Spot, retaining raw outputs, timings and review bundles ([results](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-method-comparison-2026-11-12/README.md)).
+- [x] Finish only the last two native OpenBind standard poses and assemble all48 with source hashes and interrupted statuses preserved; standard-sampling protein agreement is 1.49 Å and ligand disagreement remains substantial ([results](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-method-comparison-2026-11-12/README.md)).
+- [x] Run a predeclared three-complex experimental crystal-reference panel through both actual browser cofolding models, preserving every seed and unselected/confidence-selected/oracle results ([results and limitations](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-crystal-reference-2026-11-13/README.md)).
+- [x] Finish all native controls for the three-complex crystal-reference panel, preserving all 36 native/browser predictions and stereochemical checks.
+- [ ] Investigate OpenBind's poor single-sequence reconstruction and expand to genuinely held-out complexes; the three old structures may occur in training data.
+- [x] Preserve six OpenBind standard-sampling poses after Spot node failure, validate source-side inventory and submit only 42 missing query/seed pairs; require full unique coverage for assembly ([recovery](https://github.com/rafwiewiora/molarium/blob/HEAD/folding/comparison/README.md#interrupted-native-openbind-jobs)).
+
+## Simulation correctness and release gates
+
+- [x] Cancel queued/in-flight old-graph polish when chemistry invalidates the atom mapping ([SR-13](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/STALE_POLISH_2026-09-25.md)); retain exact coordinate-preservation assertions.
+
+- [x] Separate prepared-protein provenance from edited-System parameter validity, and minimize new/modified current Systems before MD by default ([SR-08/09](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/SIMULATION_READINESS_2026-09-10.md)).
+- [x] Refresh Run after preparation, reuse exact saved MD frames, and version deployed code URLs against mixed browser caches ([SR-10/11/12](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/SIMULATION_UI_CACHE_2026-09-10.md)).
+- [ ] Extend SR-09 beyond the 7KPA short-run reproduction: identify dominant starting-strain terms and test longer-time dynamics across prepared complexes and physical GPU vendors.
+
+- [x] Reject empty/incomplete benchmark gates, enforce exact finite 3N force vectors, and verify protocol content and result schemas (R3).
+- [x] Correct native original-input scoring and archive new derived scores without overwriting raw evidence (R5).
+- [x] Refresh Local Lab hashes, synchronize its privacy UI test, and add a non-mutating manifest freshness check in CI (R6).
+- [x] Reject unsupported whole-System force content and unsupported STORMM cutoffs; validate numeric physical domains before GPU dispatch (R1, R7).
+- [x] Restrict development-server file exposure and bind loopback by default (R2).
+- [x] Validate STORMM frame requests and exact output shapes; wire production-worker numerical smoke tests into explicitly software-labelled CI (R4, part of R8).
+- [ ] Add scheduled physical cross-vendor release gates beyond the software correctness smoke job (remaining R8).
+- [x] Compare the production STORMM worker directly with independently built native OpenMM Systems; 22/22 supported cases pass on M1 Pro and L4, with 25 unsupported cases retained explicitly.
+- [ ] Extend STORMM to matched multi-replica/native ensemble timings and longer-time constrained/OBC2 validation; single-replica job timing is not an ensemble speedup claim.
+- [ ] Extend the two-device direct-engine matrix to a third GPU vendor and longer-time dynamics/ensemble gates.
+- [x] Trace the rapid-navigation checkpoint hang to a never-settling IndexedDB open; defer blank-story opens, close connections on navigation/version change, and fail explicitly on bounded open timeout. The source-hashed rapid-navigation probe completes 10/10 imports after the fix.
+- [ ] Extend the database-navigation regression across browsers; the underlying Chromium storage failure is not independently diagnosed.
+
+## Reference-guided design
+
+- [x] Run the [three-system API and hands-on browser functional panel](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/DESIGN_FUNCTION_VALIDATION_2026-09-06.md); preserve successes, preparation failures, and the failed required-contact-set gate.
+- [x] Preserve required-contact decisions through registered graph edits and contact-list rendering, invalidate stale candidate feasibility after requirement changes, and preserve an unchanged single donor H across registered staging; both original CDK2 contacts now survive the source-stable API regression (DV-01).
+- [x] Separate cached candidate geometry from live geometry measured using current participant coordinates; commit applied alternative-feature maps with Undo/Redo state (DV-02).
+- [x] Distinguish inherited identity, released subsets and actual fixed core in the UI/API; preserve the full authored help catalogue, with accessible **i** dialogs only for 24 crucial decisions and unobtrusive native descriptions for routine/repeated controls (DV-04; [EH-01](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/ESSENTIAL_HELP_REVIEW_2026-09-07.md)).
+- [x] Make carbon-bound F hypotheses explicitly weak and optional by default under a versioned, primary-source-grounded capture policy; preserve explicit requirements and historical feature identities (DV-03). A general fluorine interaction model is not claimed.
+- [ ] Diagnose the uncurated full-assembly 1H1Q preparation's modeled-atom 0.098 Å clash without weakening the guard (DV-05).
+- [ ] Add a separately labelled, reference-preserving restrained pocket relax: keep protected inherited ligand heavy atoms fixed, move edited/released ligand atoms and nearby receptor side chains, and retain the selected pharmacophore contacts as explicit restraints. Validate it independently from the current unconstrained pocket-relax action (DV-06).
+- [ ] Extend full-complex Undo, matched API/UI water-policy, cross-browser, and coupled rotamer/minimization validation; the current panel's limited observations are retained as such (DV-07).

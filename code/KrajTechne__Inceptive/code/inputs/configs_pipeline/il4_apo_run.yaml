@@ -1,0 +1,38 @@
+# IL-4 (apo) binder design. The BindCraft2 settings live in inputs/configs_bc2/IL4_apo.json;
+# the target structure is inputs/targets/IL4_apo.cif (found by file name).
+#   python run_pipeline.py --config inputs/configs_pipeline/il4_apo_run.yaml --dry-run
+#   python run_pipeline.py --config inputs/configs_pipeline/il4_apo_run.yaml
+# Detached design only (terminal can close):
+#   python -m modal run --detach run_design.py --config inputs/configs_pipeline/il4_apo_run.yaml --spawn
+
+run_name: il4_apo_200traj   # results go to the inceptive-runs Volume under <run_name>/
+
+design:
+  bindcraft_json: inputs/configs_bc2/IL4_apo.json   # base BindCraft2 settings (paths inside it are ignored)
+  gpu: "A100:4"              # 4 GPUs (IFN-g uses 6, so both runs fit in 10 GPUs); BindCraft2 starts workers on all of them
+  cpu: 16                    # CPU cores and RAM for the container (workers need both;
+  memory_gb: 128             # 128 GB was fine for 8 workers in the earlier IL4 run)
+  timeout_hours: 10          # hard stop; progress is saved every 5 min and re-running resumes
+  # BindCraft2 settings (trajectories, workers, lengths, ...) live in the JSON above.
+  # Optional: a `bindcraft:` section here overrides the same keys in the JSON for one run, e.g.
+  # bindcraft:
+  #   max_trajectories: 10     # quick trial without editing the JSON
+
+selection:
+  top_n: 92                  # all best designs from BindCraft2's 3_Ranked/!_Ranked.csv (92 = all accepted in il4_apo_200traj)
+  binder_chain: B            # binder is chain B when the target is the single chain A
+
+validate:
+  output_name: validation_all92
+  models: [of3, esmfold2]
+  seeds: [0,21,42]
+  num_samples: 1
+  gpu_type: H100
+  max_gpus: 4                # validation jobs running at once (one GPU each); the rest wait their turn
+  max_retries: 1             # extra attempts for a job that errors (0 = never retry)
+  max_jobs: 700
+
+report:
+  min_iptm: 0.8
+  min_ipsae: 0.6
+  min_contact_pass_fraction: 1.0

@@ -1,0 +1,931 @@
+"""Explicit bound property readers; scientific definitions stay in MolSysMT."""
+
+from argdigest import arg_digest
+from smonitor import signal
+
+from ._basic import _native_documentation
+
+
+class _PhyschemTools:
+    _NAMES = (
+        "get_mass",
+        "get_charge",
+        "get_atomic_radius",
+        "get_electronegativity",
+        "get_hydrophobicity",
+        "get_polarity",
+        "get_transmembrane_tendency",
+        "get_protor_atom_type",
+        "get_protor_vdw_radius",
+        "get_surface_area",
+        "get_volume",
+        "get_area_buried",
+        "get_buried_fraction",
+        "get_sasa",
+        "get_hydrogen_inventory",
+        "get_chemical_readiness",
+        "get_aromatic_rings",
+        "get_aromaticity",
+        "get_charge_centers",
+        "get_hydrophobic_sites",
+        "get_halogen_bond_sites",
+        "get_bulkiness",
+        "get_secondary_structure_propensity",
+        "get_tpsa",
+        "get_lipophilicity",
+        "get_autodock_atom_types",
+        "get_cip_stereochemistry",
+        "get_partial_charges",
+        "get_water_sites",
+        "get_metal_coordination_sites",
+        "assess_chemical_template",
+        "apply_chemical_template",
+        "normalize_aromatic_bond_orders",
+        "get_peptide_chemical_template",
+        "get_chemical_template",
+    )
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    def __dir__(self):
+        return list(self._NAMES)
+
+    def _call(self, name, parameters):
+        from molsysmt import physchem
+
+        return self._owner._read(getattr(physchem, name), parameters)
+
+    @_native_documentation("get_mass", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_mass(
+        self,
+        element="system",
+        selection="all",
+        syntax="MolSysMT",
+        definition="physical",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_mass",
+            {
+                "element": element,
+                "selection": selection,
+                "syntax": syntax,
+                "definition": definition,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_charge", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_charge(
+        self,
+        element="group",
+        selection="all",
+        definition="physical_pH7",
+        forcefield="AMBER14",
+        water_model=None,
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_charge",
+            {
+                "element": element,
+                "selection": selection,
+                "definition": definition,
+                "forcefield": forcefield,
+                "water_model": water_model,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_atomic_radius", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_atomic_radius(
+        self,
+        element="atom",
+        selection="all",
+        definition="vdw",
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_atomic_radius",
+            {
+                "element": element,
+                "selection": selection,
+                "definition": definition,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_electronegativity", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_electronegativity(
+        self,
+        element="atom",
+        selection="all",
+        definition="pauling",
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_electronegativity",
+            {
+                "element": element,
+                "selection": selection,
+                "definition": definition,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_hydrophobicity", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_hydrophobicity(
+        self,
+        element="group",
+        selection="all",
+        definition="eisenberg",
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_hydrophobicity",
+            {
+                "element": element,
+                "selection": selection,
+                "definition": definition,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_polarity", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_polarity(
+        self,
+        element="group",
+        selection="all",
+        syntax="MolSysMT",
+        definition="grantham",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_polarity",
+            {
+                "element": element,
+                "selection": selection,
+                "syntax": syntax,
+                "definition": definition,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_transmembrane_tendency", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_transmembrane_tendency(
+        self,
+        element="group",
+        selection="all",
+        syntax="MolSysMT",
+        definition="zhao",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_transmembrane_tendency",
+            {
+                "element": element,
+                "selection": selection,
+                "syntax": syntax,
+                "definition": definition,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_protor_atom_type", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_protor_atom_type(
+        self, selection="all", syntax="MolSysMT", skip_digestion=False
+    ):
+        return self._call(
+            "get_protor_atom_type",
+            {
+                "selection": selection,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_protor_vdw_radius", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_protor_vdw_radius(
+        self, selection="all", syntax="MolSysMT", skip_digestion=False
+    ):
+        return self._call(
+            "get_protor_vdw_radius",
+            {
+                "selection": selection,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_surface_area", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_surface_area(
+        self,
+        element="group",
+        selection="all",
+        syntax="MolSysMT",
+        definition="collantes",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_surface_area",
+            {
+                "element": element,
+                "selection": selection,
+                "syntax": syntax,
+                "definition": definition,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_volume", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_volume(
+        self,
+        selection="all",
+        syntax="MolSysMT",
+        definition="grantham",
+        *,
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_volume",
+            {
+                "selection": selection,
+                "syntax": syntax,
+                "definition": definition,
+            },
+        )
+
+    @_native_documentation("get_area_buried", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_area_buried(
+        self, element="group", selection="all", definition="rose", skip_digestion=False
+    ):
+        return self._call(
+            "get_area_buried",
+            {
+                "element": element,
+                "selection": selection,
+                "definition": definition,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_buried_fraction", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_buried_fraction(
+        self,
+        element="group",
+        selection="all",
+        definition="janin",
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_buried_fraction",
+            {
+                "element": element,
+                "selection": selection,
+                "definition": definition,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_sasa", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_sasa(
+        self,
+        element="atom",
+        selection="all",
+        structure_indices="all",
+        syntax="MolSysMT",
+        engine="MolSysMT",
+        probe_radius="1.4 angstroms",
+        n_sphere_points=240,
+        use_cell_list="auto",
+        use_gpu=None,
+        gpu_backend=None,
+        parallel=None,
+        num_threads=None,
+        skip_digestion=False,
+        *,
+        pbc=True,
+    ):
+        return self._call(
+            "get_sasa",
+            {
+                "element": element,
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "syntax": syntax,
+                "engine": engine,
+                "probe_radius": probe_radius,
+                "n_sphere_points": n_sphere_points,
+                "use_cell_list": use_cell_list,
+                "use_gpu": use_gpu,
+                "gpu_backend": gpu_backend,
+                "parallel": parallel,
+                "num_threads": num_threads,
+                "skip_digestion": skip_digestion,
+                "pbc": pbc,
+            },
+        )
+
+    @_native_documentation("get_hydrogen_inventory", module="physchem")
+    @signal(tags=["addon", "physchem", "diagnostics"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_hydrogen_inventory(
+        self,
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_hydrogen_inventory",
+            {
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_chemical_readiness", module="physchem")
+    @signal(tags=["addon", "physchem", "diagnostics"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_chemical_readiness(
+        self,
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_chemical_readiness",
+            {
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_aromatic_rings", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_aromatic_rings(
+        self,
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        definition="stored_aromatic_bonds",
+        method="minimum_cycle_basis",
+        assume_complete_connectivity=False,
+        syntax="MolSysMT",
+        skip_digestion=False,
+        *,
+        max_cyclic_block_size=256,
+    ):
+        return self._call(
+            "get_aromatic_rings",
+            {
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "definition": definition,
+                "method": method,
+                "assume_complete_connectivity": assume_complete_connectivity,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+                "max_cyclic_block_size": max_cyclic_block_size,
+            },
+        )
+
+    @_native_documentation("get_aromaticity", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_aromaticity(
+        self,
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        method="fused_ring_electron_count",
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_aromaticity",
+            {
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "method": method,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_charge_centers", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_charge_centers(
+        self,
+        selection="all",
+        definition="formal_charge",
+        chemical_state="reference",
+        structure_indices="all",
+        assume_complete_connectivity=False,
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_charge_centers",
+            {
+                "selection": selection,
+                "definition": definition,
+                "chemical_state": chemical_state,
+                "structure_indices": structure_indices,
+                "assume_complete_connectivity": assume_complete_connectivity,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_hydrophobic_sites", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_hydrophobic_sites(
+        self,
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        method="smarts_hydrophobic_atoms",
+        assume_complete_connectivity=False,
+        syntax="MolSysMT",
+        skip_digestion=False,
+        *,
+        max_matches=100000,
+    ):
+        return self._call(
+            "get_hydrophobic_sites",
+            {
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "method": method,
+                "assume_complete_connectivity": assume_complete_connectivity,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+                "max_matches": max_matches,
+            },
+        )
+
+    @_native_documentation("get_halogen_bond_sites", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_halogen_bond_sites(
+        self,
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        method="smarts_donor_acceptor",
+        assume_complete_connectivity=False,
+        syntax="MolSysMT",
+        skip_digestion=False,
+        *,
+        max_matches=100000,
+    ):
+        return self._call(
+            "get_halogen_bond_sites",
+            {
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "method": method,
+                "assume_complete_connectivity": assume_complete_connectivity,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+                "max_matches": max_matches,
+            },
+        )
+
+    @_native_documentation("get_bulkiness", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_bulkiness(
+        self,
+        element="group",
+        selection="all",
+        definition="zimmerman",
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_bulkiness",
+            {
+                "element": element,
+                "selection": selection,
+                "definition": definition,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_secondary_structure_propensity", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_secondary_structure_propensity(
+        self,
+        conformation,
+        element="group",
+        selection="all",
+        definition="levitt_1978_weighted",
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_secondary_structure_propensity",
+            {
+                "conformation": conformation,
+                "element": element,
+                "selection": selection,
+                "definition": definition,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_tpsa", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_tpsa(
+        self,
+        element="molecule",
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        method="ertl_rohde_selzer",
+        include_sulfur_phosphorus=False,
+        return_report=False,
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_tpsa",
+            {
+                "element": element,
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "method": method,
+                "include_sulfur_phosphorus": include_sulfur_phosphorus,
+                "return_report": return_report,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_lipophilicity", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_lipophilicity(
+        self,
+        element="molecule",
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        method="wildman_crippen",
+        return_report=False,
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_lipophilicity",
+            {
+                "element": element,
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "method": method,
+                "return_report": return_report,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_autodock_atom_types", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_autodock_atom_types(
+        self,
+        typing_scheme,
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        method="chemical_environment",
+        return_report=False,
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_autodock_atom_types",
+            {
+                "typing_scheme": typing_scheme,
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "method": method,
+                "return_report": return_report,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_cip_stereochemistry", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_cip_stereochemistry(
+        self,
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        engine="rdkit",
+        syntax="MolSysMT",
+        skip_digestion=False,
+        *,
+        from_coordinates=False,
+    ):
+        return self._call(
+            "get_cip_stereochemistry",
+            {
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "engine": engine,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+                "from_coordinates": from_coordinates,
+            },
+        )
+
+    @_native_documentation("get_partial_charges", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_partial_charges(
+        self,
+        method,
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        forcefield=None,
+        water_model=None,
+        expected_total_charge=None,
+        return_report=False,
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_partial_charges",
+            {
+                "method": method,
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "forcefield": forcefield,
+                "water_model": water_model,
+                "expected_total_charge": expected_total_charge,
+                "return_report": return_report,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_water_sites", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_water_sites(
+        self,
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        method="explicit_water_graph",
+        assume_complete_connectivity=False,
+        syntax="MolSysMT",
+        skip_digestion=False,
+        *,
+        max_matches=100000,
+    ):
+        return self._call(
+            "get_water_sites",
+            {
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "method": method,
+                "assume_complete_connectivity": assume_complete_connectivity,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+                "max_matches": max_matches,
+            },
+        )
+
+    @_native_documentation("get_metal_coordination_sites", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_metal_coordination_sites(
+        self,
+        selection="all",
+        structure_indices="all",
+        chemical_state="reference",
+        method="smarts_metal_ligand",
+        assume_complete_connectivity=False,
+        syntax="MolSysMT",
+        skip_digestion=False,
+        *,
+        max_matches=100000,
+    ):
+        return self._call(
+            "get_metal_coordination_sites",
+            {
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "method": method,
+                "assume_complete_connectivity": assume_complete_connectivity,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+                "max_matches": max_matches,
+            },
+        )
+
+    @_native_documentation("assess_chemical_template", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def assess_chemical_template(
+        self,
+        template,
+        atom_correspondence,
+        template_provenance,
+        chemical_state="reference",
+        template_chemical_state="reference",
+        skip_digestion=False,
+        *,
+        connectivity_policy="require_same_graph",
+        selection="all",
+        syntax="MolSysMT",
+        context_atom_correspondence=None,
+    ):
+        return self._call(
+            "assess_chemical_template",
+            {
+                "template": template,
+                "atom_correspondence": atom_correspondence,
+                "template_provenance": template_provenance,
+                "chemical_state": chemical_state,
+                "template_chemical_state": template_chemical_state,
+                "skip_digestion": skip_digestion,
+                "connectivity_policy": connectivity_policy,
+                "selection": selection,
+                "syntax": syntax,
+                "context_atom_correspondence": context_atom_correspondence,
+            },
+        )
+
+    @_native_documentation("apply_chemical_template", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def apply_chemical_template(
+        self,
+        template,
+        atom_correspondence,
+        template_provenance,
+        chemical_state="reference",
+        template_chemical_state="reference",
+        skip_digestion=False,
+        *,
+        connectivity_policy="require_same_graph",
+        selection="all",
+        syntax="MolSysMT",
+        context_atom_correspondence=None,
+    ):
+        return self._call(
+            "apply_chemical_template",
+            {
+                "template": template,
+                "atom_correspondence": atom_correspondence,
+                "template_provenance": template_provenance,
+                "chemical_state": chemical_state,
+                "template_chemical_state": template_chemical_state,
+                "skip_digestion": skip_digestion,
+                "connectivity_policy": connectivity_policy,
+                "selection": selection,
+                "syntax": syntax,
+                "context_atom_correspondence": context_atom_correspondence,
+            },
+        )
+
+    @_native_documentation("normalize_aromatic_bond_orders", module="physchem")
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def normalize_aromatic_bond_orders(
+        self, chemical_state="reference", skip_digestion=False
+    ):
+        return self._call(
+            "normalize_aromatic_bond_orders",
+            {
+                "chemical_state": chemical_state,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation(
+        "get_peptide_chemical_template", module="physchem", bind_primary=False
+    )
+    @signal(tags=["addon", "physchem"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_peptide_chemical_template(
+        self,
+        residue_names,
+        n_terminal_state,
+        c_terminal_state,
+        skip_digestion=False,
+        *,
+        disulfide_group_pairs=None,
+    ):
+        from molsysmt import physchem
+
+        self._owner._view()
+        return physchem.get_peptide_chemical_template(
+            residue_names=residue_names,
+            n_terminal_state=n_terminal_state,
+            c_terminal_state=c_terminal_state,
+            skip_digestion=skip_digestion,
+            disulfide_group_pairs=disulfide_group_pairs,
+        )
+
+    @_native_documentation(
+        "get_chemical_template", module="physchem", bind_primary=False
+    )
+    @signal(tags=["addon", "physchem", "reference"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_chemical_template(
+        self,
+        component_id,
+        source,
+        method="ccd_canonical_descriptor",
+        hydrogen_policy="stored_counts",
+        descriptor_program="CACTVS",
+        max_matches=4096,
+        skip_digestion=False,
+    ):
+        from molsysmt import physchem
+
+        self._owner._view()
+        return physchem.get_chemical_template(
+            component_id=component_id,
+            source=source,
+            method=method,
+            hydrogen_policy=hydrogen_policy,
+            descriptor_program=descriptor_program,
+            max_matches=max_matches,
+            skip_digestion=skip_digestion,
+        )

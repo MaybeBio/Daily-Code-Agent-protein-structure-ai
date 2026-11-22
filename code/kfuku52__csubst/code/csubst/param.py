@@ -1,0 +1,1172 @@
+import numpy as np
+import pandas as pd
+
+import os
+import platform
+import re
+import sys
+from typing import Any
+from importlib import metadata as importlib_metadata
+
+from csubst import asrv
+from csubst import __version__
+from csubst import output_stat
+from csubst import pseudocount
+from csubst import randomness
+from csubst import recoding_config
+from csubst import runtime
+from csubst import table
+
+# Runtime diagnostics must not require tools from the isolated build environment.
+DEPENDENCY_DISTRIBUTIONS = (
+    'ete4',
+    'requests',
+    'numpy',
+    'scipy',
+    'pandas',
+    'matplotlib',
+)
+
+MAX_QUANTILE_NITER = 10000
+
+
+def _default_prostt5_cache_file():
+    return 'csubst_prostt5_cache.tsv'
+
+
+def _default_sa_state_cache_file():
+    return 'csubst_3di_state_cache.npz'
+
+
+def _infer_iqtree_output_prefix_from_alignment(alignment_file):
+    return runtime.infer_iqtree_output_prefix(alignment_file=alignment_file)
+
+
+def _parse_bool_like(value, param_name):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ['1', 'true', 'yes', 'y', 'on']:
+            return True
+        if normalized in ['0', 'false', 'no', 'n', 'off']:
+            return False
+        txt = '{} should be boolean-like (yes/no, true/false, 1/0).'
+        raise ValueError(txt.format(param_name))
+    return bool(value)
+
+
+def _require_finite_float(value, param_name):
+    if not np.isfinite(value):
+        raise ValueError('{} should be a finite number.'.format(param_name))
+    return value
+
+
+def _parse_auto_or_float(value, param_name, min_value=None, strict_min=False):
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token == 'auto':
+            return True, np.nan
+        if token == '':
+            raise ValueError('{} should be "auto" or a number.'.format(param_name))
+        try:
+            numeric = float(token)
+        except ValueError as exc:
+            raise ValueError('{} should be "auto" or a number.'.format(param_name)) from exc
+    else:
+        numeric = float(value)
+    numeric = _require_finite_float(numeric, param_name=param_name)
+    if min_value is not None:
+        min_value = float(min_value)
+        if strict_min:
+            if numeric <= min_value:
+                raise ValueError('{} should be > {}.'.format(param_name, min_value))
+        else:
+            if numeric < min_value:
+                raise ValueError('{} should be >= {}.'.format(param_name, min_value))
+    return False, float(numeric)
+
+
+def _parse_float_grid(value, param_name, min_value=None, strict_min=False):
+    if isinstance(value, (list, tuple, np.ndarray)):
+        raw_tokens = [str(v).strip() for v in value]
+    else:
+        raw_txt = '' if value is None else str(value).strip()
+        raw_tokens = [token.strip() for token in raw_txt.split(',') if token.strip() != '']
+    if len(raw_tokens) == 0:
+        raise ValueError('{} should contain one or more numeric values.'.format(param_name))
+    out = list()
+    for token in raw_tokens:
+        try:
+            numeric = float(token)
+        except ValueError as exc:
+            raise ValueError('{} should contain numeric values.'.format(param_name)) from exc
+        numeric = _require_finite_float(numeric, param_name=param_name)
+        if min_value is not None:
+            min_value = float(min_value)
+            if strict_min:
+                if numeric <= min_value:
+                    raise ValueError('{} should contain values > {}.'.format(param_name, min_value))
+            else:
+                if numeric < min_value:
+                    raise ValueError('{} should contain values >= {}.'.format(param_name, min_value))
+        out.append(float(numeric))
+    out = sorted(list(set(out)))
+    return out
+
+
+def _parse_omega_pvalue_niter_schedule(value, max_niter=MAX_QUANTILE_NITER):
+    if isinstance(value, (list, tuple, np.ndarray)):
+        raw_tokens = [str(v).strip() for v in value]
+    else:
+        raw_txt = '' if value is None else str(value).strip()
+        if raw_txt.lower() in ['', '0', 'auto']:
+            return None
+        raw_tokens = [token.strip() for token in raw_txt.split(',') if token.strip() != '']
+    if len(raw_tokens) == 0:
+        raise ValueError('--omegaC_pvalue_niter_schedule should not be empty.')
+    schedule = list()
+    for token in raw_tokens:
+        if not re.fullmatch(r'[0-9]+', token):
+            raise ValueError('--omegaC_pvalue_niter_schedule should contain integers.')
+        niter = int(token)
+        if niter <= 0:
+            raise ValueError('--omegaC_pvalue_niter_schedule should contain positive integers.')
+        schedule.append(niter)
+    for prev, curr in zip(schedule, schedule[1:]):
+        if curr <= prev:
+            raise ValueError('--omegaC_pvalue_niter_schedule should be strictly increasing.')
+    if max(schedule) > int(max_niter):
+        txt = '--omegaC_pvalue_niter_schedule upper bound should be <= {}.'
+        raise ValueError(txt.format(int(max_niter)))
+    return schedule
+
+
+def _normalize_expectation_method(value, param_name='--expectation_method'):
+    normalized = str(value).strip().lower()
+    if normalized in ['codon_model', 'submodel']:
+        return 'codon_model'
+    if normalized in ['urn', 'modelfree']:
+        return 'urn'
+    txt = '{} should be one of codon_model, urn.'
+    raise ValueError(txt.format(param_name))
+
+
+def _normalize_urn_model(value, param_name='--urn_model'):
+    normalized = str(value).strip().lower()
+    if normalized in ['wallenius', 'fisher']:
+        return normalized
+    if normalized in ['factorized_approx', 'factorized', 'legacy_factorized', 'approx']:
+        return 'factorized_approx'
+    txt = '{} should be one of wallenius, fisher, factorized_approx.'
+    raise ValueError(txt.format(param_name))
+
+
+def _get_dependency_version(distribution_name):
+    try:
+        return importlib_metadata.version(distribution_name)
+    except importlib_metadata.PackageNotFoundError:
+        return 'not installed'
+
+
+def _format_dependency_versions():
+    dep_versions = list()
+    missing_packages = list()
+    for distribution_name in DEPENDENCY_DISTRIBUTIONS:
+        version = _get_dependency_version(distribution_name)
+        dep_versions.append('{}={}'.format(distribution_name, version))
+        if version == 'not installed':
+            missing_packages.append(distribution_name)
+    return ', '.join(dep_versions), missing_packages
+
+
+def _normalize_input_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    g['random_seed'] = randomness.normalize_seed(
+        g.get('random_seed', randomness.DEFAULT_RANDOM_SEED),
+        param_name='--random_seed',
+    )
+    if 'full_cds_alignment_file' in g.keys():
+        if g['full_cds_alignment_file'] is None:
+            g['full_cds_alignment_file'] = ''
+        else:
+            g['full_cds_alignment_file'] = str(g['full_cds_alignment_file']).strip()
+    else:
+        g['full_cds_alignment_file'] = ''
+    if 'alignment_file' in g.keys():
+        if g['alignment_file'] is None:
+            g['alignment_file'] = ''
+        else:
+            g['alignment_file'] = str(g['alignment_file']).strip()
+    raw_recode_token = str(g.get('nonsyn_recode', 'no')).strip()
+    try:
+        raw_recode_normalized = recoding_config.normalize_nonsyn_recode(raw_recode_token)
+    except ValueError:
+        raw_recode_normalized = None
+    if raw_recode_normalized == '3di20':
+        full_path = str(g.get('full_cds_alignment_file', '')).strip()
+        if full_path != '':
+            if g.get('alignment_file', '') not in ['', full_path]:
+                txt = '--alignment_file is disabled when --nonsyn_recode is 3di20. Use --full_cds_alignment_file.'
+                raise ValueError(txt)
+            g['alignment_file'] = full_path
+    return g
+
+
+def _normalize_model_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    if 'calc_omega_pvalue' in g.keys():
+        g['calc_omega_pvalue'] = _parse_bool_like(g['calc_omega_pvalue'], '--calc_omegaC_pvalue')
+    else:
+        g['calc_omega_pvalue'] = False
+    expectation_method = None
+    raw_expectation_method = g.get('expectation_method', None)
+    if (raw_expectation_method is not None) and (str(raw_expectation_method).strip() != ''):
+        expectation_method = _normalize_expectation_method(raw_expectation_method, param_name='--expectation_method')
+    raw_urn_model = g.get('urn_model', None)
+    urn_model = None
+    if (raw_urn_model is not None) and (str(raw_urn_model).strip() != ''):
+        urn_model = _normalize_urn_model(raw_urn_model, param_name='--urn_model')
+    if expectation_method is None:
+        expectation_method = 'codon_model'
+    if urn_model is None:
+        urn_model = 'wallenius'
+    g['expectation_method'] = expectation_method
+    g['urn_model'] = urn_model
+    if g.get('subcommand') in ['search', 'analyze']:
+        recoding_config.validate_nonsyn_expectation(g.get('nonsyn_recode', 'no'), expectation_method, g.get('sa_asr_mode', 'direct'), g.get('sa_iqtree_model', 'GTR'))
+    if g['calc_omega_pvalue'] and (g['expectation_method'] != 'urn'):
+        raise ValueError('--calc_omegaC_pvalue "yes" should be used with --expectation_method "urn".')
+    if 'omega_pvalue_null_model' in g.keys():
+        g['omega_pvalue_null_model'] = str(g['omega_pvalue_null_model']).strip().lower()
+    else:
+        g['omega_pvalue_null_model'] = 'hypergeom'
+    if g['omega_pvalue_null_model'] not in ['hypergeom', 'poisson', 'poisson_full', 'nbinom']:
+        raise ValueError('--omegaC_pvalue_null_model should be one of hypergeom, poisson, poisson_full, nbinom.')
+    if 'omega_pvalue_nbinom_alpha' in g.keys():
+        token = g['omega_pvalue_nbinom_alpha']
+    else:
+        token = 'auto'
+    if isinstance(token, str) and (token.strip().lower() == 'auto'):
+        g['omega_pvalue_nbinom_alpha'] = 'auto'
+    else:
+        g['omega_pvalue_nbinom_alpha'] = _require_finite_float(
+            value=float(token),
+            param_name='--omegaC_pvalue_nbinom_alpha',
+        )
+        if g['omega_pvalue_nbinom_alpha'] < 0:
+            raise ValueError('--omegaC_pvalue_nbinom_alpha should be >= 0.')
+    if 'omega_pvalue_safe_min_sub_pp' in g.keys():
+        raise ValueError(
+            '--omega_pvalue_safe_min_sub_pp was removed. '
+            'Use --min_sub_pp explicitly when running --calc_omegaC_pvalue.'
+        )
+    if 'ml_anc' in g.keys():
+        g['ml_anc'] = _parse_bool_like(g['ml_anc'], '--ml_anc')
+    else:
+        g['ml_anc'] = False
+    if 'min_sub_pp' in g.keys():
+        g['min_sub_pp'] = _require_finite_float(
+            value=float(g['min_sub_pp']),
+            param_name='--min_sub_pp',
+        )
+    else:
+        g['min_sub_pp'] = 0.0
+    if g['min_sub_pp'] < 0:
+        raise ValueError('--min_sub_pp should be >= 0.')
+    if g['min_sub_pp'] > 1:
+        raise ValueError('--min_sub_pp should be <= 1.')
+    if 'omega_pvalue_niter' in g.keys():
+        raise ValueError(
+            '--omega_pvalue_niter was removed. '
+            'Use --omegaC_pvalue_niter_schedule.'
+        )
+    if 'omega_pvalue_niter_schedule' in g.keys():
+        g['omega_pvalue_niter_schedule'] = _parse_omega_pvalue_niter_schedule(g['omega_pvalue_niter_schedule'])
+    else:
+        g['omega_pvalue_niter_schedule'] = None
+    if 'omega_pvalue_refine_threshold' in g.keys():
+        raise ValueError(
+            '--omega_pvalue_refine_threshold was removed. '
+            'Use --omegaC_pvalue_refine_upper_edge_bins.'
+        )
+    if 'omega_pvalue_refine_ci_alpha' in g.keys():
+        raise ValueError(
+            '--omega_pvalue_refine_ci_alpha was removed. '
+            'Use --omegaC_pvalue_refine_upper_edge_bins.'
+        )
+    if 'omega_pvalue_refine_upper_edge_bins' in g.keys():
+        g['omega_pvalue_refine_upper_edge_bins'] = int(g['omega_pvalue_refine_upper_edge_bins'])
+    else:
+        g['omega_pvalue_refine_upper_edge_bins'] = 2
+    if g['omega_pvalue_refine_upper_edge_bins'] < 0:
+        raise ValueError('--omegaC_pvalue_refine_upper_edge_bins should be >= 0.')
+    if 'omega_pvalue_rounding' in g.keys():
+        g['omega_pvalue_rounding'] = str(g['omega_pvalue_rounding']).strip().lower()
+    else:
+        g['omega_pvalue_rounding'] = 'stochastic'
+    if g['omega_pvalue_rounding'] not in ['round', 'stochastic', 'floor', 'ceil']:
+        raise ValueError('--omegaC_pvalue_rounding should be one of round, stochastic, floor, ceil.')
+    if 'asrv' in g.keys():
+        g['asrv'] = str(g['asrv']).strip().lower()
+    else:
+        g['asrv'] = 'auto'
+    if g['asrv'] not in ['auto', *asrv.EMPIRICAL_MODES, 'no', 'pool', 'sn', 'each', 'file', 'file_each']:
+        raise ValueError('--asrv should be one of auto, empirical_all, empirical, no, pool, sn, each, file, file_each.')
+    if 'asrv_dirichlet_alpha' in g.keys():
+        g['asrv_dirichlet_alpha'] = _require_finite_float(
+            value=float(g['asrv_dirichlet_alpha']),
+            param_name='--asrv_dirichlet_alpha',
+        )
+    else:
+        g['asrv_dirichlet_alpha'] = 1.0
+    if g['asrv_dirichlet_alpha'] < 0:
+        raise ValueError('--asrv_dirichlet_alpha should be >= 0.')
+    g['asrv_report'] = _parse_bool_like(g.get('asrv_report', False), '--asrv_report')
+    asrv.validate_options(g)
+    return g
+
+
+def _normalize_epistasis_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    if 'epistasis_apply_to' in g.keys():
+        g['epistasis_apply_to'] = str(g['epistasis_apply_to']).strip().upper()
+    else:
+        g['epistasis_apply_to'] = 'N'
+    if g['epistasis_apply_to'] not in ['N', 'S', 'NS']:
+        raise ValueError('--epistasis_apply_to should be one of N, S, NS.')
+    if ('epistasis_beta' not in g.keys()) or (g['epistasis_beta'] is None):
+        g['epistasis_beta'] = 'off'
+    epistasis_beta_token = None
+    if isinstance(g['epistasis_beta'], str):
+        epistasis_beta_token = g['epistasis_beta'].strip().lower()
+    if epistasis_beta_token in ['off', 'none', 'false', 'no']:
+        epistasis_beta_auto = False
+        epistasis_beta_value = 0.0
+    else:
+        epistasis_beta_auto, epistasis_beta_value = _parse_auto_or_float(
+            value=g['epistasis_beta'],
+            param_name='--epistasis_beta',
+            min_value=0.0,
+            strict_min=False,
+        )
+    g['epistasis_beta_auto'] = bool(epistasis_beta_auto)
+    g['epistasis_beta_value'] = float(epistasis_beta_value) if (not epistasis_beta_auto) else np.nan
+    if ('epistasis_site_metric' not in g.keys()) or (g['epistasis_site_metric'] is None):
+        g['epistasis_site_metric'] = 'off'
+    else:
+        g['epistasis_site_metric'] = str(g['epistasis_site_metric']).strip().lower()
+    if g['epistasis_site_metric'] not in ['off', 'auto', 'degree', 'proximity', 'hybrid']:
+        raise ValueError('--epistasis_site_metric should be one of off, auto, degree, proximity, hybrid.')
+    if (g['epistasis_site_metric'] == 'off') and (g['epistasis_beta_auto'] or (g['epistasis_beta_value'] > 0)):
+        g['epistasis_site_metric'] = 'auto'
+    if 'epistasis_clip' not in g.keys():
+        g['epistasis_clip'] = '3.0'
+    epistasis_clip_auto, epistasis_clip_value = _parse_auto_or_float(
+        value=g['epistasis_clip'],
+        param_name='--epistasis_clip',
+        min_value=0.0,
+        strict_min=True,
+    )
+    g['epistasis_clip_auto'] = bool(epistasis_clip_auto)
+    g['epistasis_clip_value'] = float(epistasis_clip_value) if (not epistasis_clip_auto) else np.nan
+    if 'epistasis_beta_partition' not in g.keys():
+        g['epistasis_beta_partition'] = 'global'
+    g['epistasis_beta_partition'] = str(g['epistasis_beta_partition']).strip().lower()
+    if g['epistasis_beta_partition'] not in ['global', 'branch_depth']:
+        raise ValueError('--epistasis_beta_partition should be one of global, branch_depth.')
+    if 'epistasis_branch_depth_bins' not in g.keys():
+        g['epistasis_branch_depth_bins'] = 3
+    g['epistasis_branch_depth_bins'] = int(g['epistasis_branch_depth_bins'])
+    if g['epistasis_branch_depth_bins'] < 1:
+        raise ValueError('--epistasis_branch_depth_bins should be >= 1.')
+    if 'epistasis_feature_mode' not in g.keys():
+        g['epistasis_feature_mode'] = 'single'
+    g['epistasis_feature_mode'] = str(g['epistasis_feature_mode']).strip().lower()
+    if g['epistasis_feature_mode'] not in ['single', 'paired']:
+        raise ValueError('--epistasis_feature_mode should be one of single, paired.')
+    if 'epistasis_joint_auto' not in g.keys():
+        g['epistasis_joint_auto'] = False
+    g['epistasis_joint_auto'] = _parse_bool_like(g['epistasis_joint_auto'], '--epistasis_joint_auto')
+    if 'epistasis_joint_alpha_grid' not in g.keys():
+        g['epistasis_joint_alpha_grid'] = '0,0.5,1,2'
+    g['epistasis_joint_alpha_grid'] = _parse_float_grid(
+        value=g['epistasis_joint_alpha_grid'],
+        param_name='--epistasis_joint_alpha_grid',
+        min_value=0.0,
+        strict_min=False,
+    )
+    if 'epistasis_joint_clip_grid' not in g.keys():
+        g['epistasis_joint_clip_grid'] = '1.5,2,2.5,3,4,5'
+    g['epistasis_joint_clip_grid'] = _parse_float_grid(
+        value=g['epistasis_joint_clip_grid'],
+        param_name='--epistasis_joint_clip_grid',
+        min_value=0.0,
+        strict_min=True,
+    )
+    return g
+
+
+def _normalize_epistasis_structure_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    if 'epistasis_degree_file' not in g.keys():
+        g['epistasis_degree_file'] = ''
+    if g['epistasis_degree_file'] is None:
+        g['epistasis_degree_file'] = ''
+    g['epistasis_degree_file'] = str(g['epistasis_degree_file']).strip()
+    if 'epistasis_pdb' not in g.keys():
+        g['epistasis_pdb'] = ''
+    if g['epistasis_pdb'] is None:
+        g['epistasis_pdb'] = ''
+    g['epistasis_pdb'] = str(g['epistasis_pdb']).strip()
+    if 'epistasis_database' not in g.keys():
+        g['epistasis_database'] = 'swissmodel,pdb,alphafold,alphafill'
+    g['epistasis_database'] = str(g['epistasis_database']).strip().lower()
+    if g['epistasis_database'] == '':
+        g['epistasis_database'] = 'swissmodel,pdb,alphafold,alphafill'
+    epistasis_database_names = [db.strip().lower() for db in g['epistasis_database'].split(',') if db.strip() != '']
+    if len(epistasis_database_names) == 0:
+        raise ValueError('--epistasis_database should include one or more of swissmodel,pdb,alphafold,alphafill.')
+    epistasis_allowed_database_names = {'swissmodel', 'pdb', 'alphafill', 'alphafold'}
+    epistasis_unknown_database_names = sorted(set(epistasis_database_names).difference(epistasis_allowed_database_names))
+    if len(epistasis_unknown_database_names):
+        txt = '--epistasis_database includes unknown values: {}. Supported: {}.'
+        raise ValueError(txt.format(','.join(epistasis_unknown_database_names), ','.join(sorted(epistasis_allowed_database_names))))
+    g['epistasis_database'] = ','.join(epistasis_database_names)
+    if 'epistasis_database_timeout' in g.keys():
+        g['epistasis_database_timeout'] = _require_finite_float(
+            value=float(g['epistasis_database_timeout']),
+            param_name='--epistasis_database_timeout',
+        )
+    else:
+        g['epistasis_database_timeout'] = 30.0
+    if g['epistasis_database_timeout'] <= 0:
+        raise ValueError('--epistasis_database_timeout should be > 0.')
+    if 'epistasis_database_evalue_cutoff' in g.keys():
+        g['epistasis_database_evalue_cutoff'] = _require_finite_float(
+            value=float(g['epistasis_database_evalue_cutoff']),
+            param_name='--epistasis_database_evalue_cutoff',
+        )
+    else:
+        g['epistasis_database_evalue_cutoff'] = 1.0
+    if g['epistasis_database_evalue_cutoff'] <= 0:
+        raise ValueError('--epistasis_database_evalue_cutoff should be > 0.')
+    if 'epistasis_database_minimum_identity' in g.keys():
+        g['epistasis_database_minimum_identity'] = _require_finite_float(
+            value=float(g['epistasis_database_minimum_identity']),
+            param_name='--epistasis_database_minimum_identity',
+        )
+    else:
+        g['epistasis_database_minimum_identity'] = 0.25
+    if (g['epistasis_database_minimum_identity'] < 0) or (g['epistasis_database_minimum_identity'] > 1):
+        raise ValueError('--epistasis_database_minimum_identity should satisfy 0 <= value <= 1.')
+    if 'epistasis_user_alignment' not in g.keys():
+        g['epistasis_user_alignment'] = ''
+    if g['epistasis_user_alignment'] is None:
+        g['epistasis_user_alignment'] = ''
+    g['epistasis_user_alignment'] = str(g['epistasis_user_alignment']).strip()
+    if 'epistasis_contact_distance' in g.keys():
+        g['epistasis_contact_distance'] = _require_finite_float(
+            value=float(g['epistasis_contact_distance']),
+            param_name='--epistasis_contact_distance',
+        )
+    else:
+        g['epistasis_contact_distance'] = 8.0
+    if g['epistasis_contact_distance'] <= 0:
+        raise ValueError('--epistasis_contact_distance should be > 0.')
+    if 'epistasis_mafft_exe' not in g.keys():
+        g['epistasis_mafft_exe'] = 'mafft'
+    g['epistasis_mafft_exe'] = str(g['epistasis_mafft_exe']).strip()
+    if g['epistasis_mafft_exe'] == '':
+        raise ValueError('--epistasis_mafft_exe should be non-empty.')
+    if 'epistasis_mafft_op' in g.keys():
+        g['epistasis_mafft_op'] = _require_finite_float(
+            value=float(g['epistasis_mafft_op']),
+            param_name='--epistasis_mafft_op',
+        )
+    else:
+        g['epistasis_mafft_op'] = -1.0
+    if (g['epistasis_mafft_op'] != -1) and (g['epistasis_mafft_op'] < 0):
+        raise ValueError('--epistasis_mafft_op should be -1 or >= 0.')
+    if 'epistasis_mafft_ep' in g.keys():
+        g['epistasis_mafft_ep'] = _require_finite_float(
+            value=float(g['epistasis_mafft_ep']),
+            param_name='--epistasis_mafft_ep',
+        )
+    else:
+        g['epistasis_mafft_ep'] = -1.0
+    if (g['epistasis_mafft_ep'] != -1) and (g['epistasis_mafft_ep'] < 0):
+        raise ValueError('--epistasis_mafft_ep should be -1 or >= 0.')
+    if 'epistasis_pymol_max_num_chain' in g.keys():
+        g['epistasis_pymol_max_num_chain'] = int(g['epistasis_pymol_max_num_chain'])
+    else:
+        g['epistasis_pymol_max_num_chain'] = 20
+    if g['epistasis_pymol_max_num_chain'] < 1:
+        raise ValueError('--epistasis_pymol_max_num_chain should be >= 1.')
+    if 'epistasis_degree_outfile' not in g.keys():
+        g['epistasis_degree_outfile'] = 'csubst_epistasis_structure_degree.tsv'
+    if g['epistasis_degree_outfile'] is None:
+        g['epistasis_degree_outfile'] = 'csubst_epistasis_structure_degree.tsv'
+    g['epistasis_degree_outfile'] = str(g['epistasis_degree_outfile']).strip()
+    if g['epistasis_degree_outfile'] == '':
+        raise ValueError('--epistasis_degree_outfile should be non-empty.')
+    g['epistasis_requested'] = bool(g['epistasis_beta_auto'] or (g['epistasis_beta_value'] > 0))
+    return g
+
+
+def _normalize_search_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    pseudocount_config = pseudocount.validate_args(g)
+    g.update(pseudocount_config)
+    if 'exhaustive_until' in g.keys():
+        if (g['exhaustive_until']==1)&(g['foreground'] is None):
+            raise ValueError('To enable --exhaustive_until 1, use --foreground')
+    if 'fg_clade_permutation' in g.keys():
+        if g['fg_clade_permutation']>0:
+            if (g['foreground'] is None):
+                raise ValueError('To enable --fg_clade_permutation, use --foreground')
+    if g.get('fg_trait_tree'):
+        if not g.get('foreground'):
+            raise ValueError('--fg_trait_tree requires --foreground with one binary trait.')
+        if 'fg_clade_permutation' in g:
+            if g['fg_clade_permutation'] <= 0:
+                raise ValueError('--fg_trait_tree requires --fg_clade_permutation > 0 for search.')
+            if g.get('max_arity', 2) > g.get('exhaustive_until', 2):
+                raise ValueError('--fg_trait_tree requires exhaustive search through --max_arity.')
+    elif g.get('fg_trait_match_tip_count') or g.get('fg_trait_rate_model', 'er') != 'er':
+        raise ValueError('Trait CTMC rate and tip-count options require --fg_trait_tree.')
+    g = runtime.ensure_iqtree_layout(g, create_dir=False)
+    alignment_file_txt = str(g.get('alignment_file', '')).strip()
+    if alignment_file_txt != '':
+        if 'iqtree_treefile' in g.keys():
+            if (g['iqtree_treefile']=='infer'):
+                iqtree_prefix = runtime.infer_iqtree_output_prefix(
+                    alignment_file=g['alignment_file'],
+                    iqtree_outdir=g['iqtree_outdir'],
+                )
+                g['iqtree_treefile'] = iqtree_prefix+'.treefile'
+        if 'iqtree_state' in g.keys():
+            if (g['iqtree_state']=='infer'):
+                iqtree_prefix = runtime.infer_iqtree_output_prefix(
+                    alignment_file=g['alignment_file'],
+                    iqtree_outdir=g['iqtree_outdir'],
+                )
+                g['iqtree_state'] = iqtree_prefix+'.state'
+        if 'iqtree_rate' in g.keys():
+            if (g['iqtree_rate']=='infer'):
+                iqtree_prefix = runtime.infer_iqtree_output_prefix(
+                    alignment_file=g['alignment_file'],
+                    iqtree_outdir=g['iqtree_outdir'],
+                )
+                g['iqtree_rate'] = iqtree_prefix+'.rate'
+        if 'iqtree_iqtree' in g.keys():
+            if (g['iqtree_iqtree']=='infer'):
+                iqtree_prefix = runtime.infer_iqtree_output_prefix(
+                    alignment_file=g['alignment_file'],
+                    iqtree_outdir=g['iqtree_outdir'],
+                )
+                g['iqtree_iqtree'] = iqtree_prefix+'.iqtree'
+    return g
+
+
+def _normalize_state_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    from csubst import endpoint_io
+    if g.get('subcommand') == 'scan':
+        observation = g.get('scan_observation') or g.get('substitution_posterior', 'joint')
+        g['scan_observation'] = observation
+        g['substitution_posterior'] = 'marginal' if observation == 'marginal' else 'joint'
+        if g.get('scan_rate_exposure') is None:
+            g['scan_rate_exposure'] = 'q_weighted' if observation == 'marginal' else 'endpoint'
+        if g.get('scan_rate_length') is None:
+            g['scan_rate_length'] = 'n_rescaled' if observation == 'marginal' else 'raw'
+    endpoint_io.validate_options(g)
+    g['float_type'] = np.float64
+    g['float_tol'] = 10**-9
+    if 'expected_state_backend' in g.keys():
+        g['expected_state_backend'] = str(g['expected_state_backend']).lower()
+    else:
+        g['expected_state_backend'] = 'auto'
+    if g['expected_state_backend'] not in ['auto', 'expm', 'eigen']:
+        raise ValueError('--expected_state_backend should be one of auto, expm, eigen.')
+    if 'pdb' in g.keys():
+        if g['pdb']=='besthit':
+            g['run_pdb_sequence_search'] = True
+        else:
+            g['run_pdb_sequence_search'] = False
+    if 'uniprot_feature_types' in g.keys():
+        value = g['uniprot_feature_types']
+        if value is None:
+            g['uniprot_feature_types'] = None
+        else:
+            value = str(value).strip()
+            if (value=='')|(value.lower() in ['all','*']):
+                g['uniprot_feature_types'] = None
+            else:
+                g['uniprot_feature_types'] = [ v.strip() for v in value.split(',') if v.strip()!='' ]
+    if 'uniprot_include_redundant' in g.keys():
+        g['uniprot_include_redundant'] = _parse_bool_like(
+            value=g['uniprot_include_redundant'],
+            param_name='--uniprot_include_redundant',
+        )
+    if 'export2chimera' in g.keys():
+        export2chimera = _parse_bool_like(
+            value=g['export2chimera'],
+            param_name='--export2chimera',
+        )
+        g['export2chimera'] = export2chimera
+        if export2chimera and (g.get('untrimmed_cds', None) in [None, '']):
+            raise ValueError('--export2chimera "yes" requires --untrimmed_cds.')
+    drop_mode_token = str(g.get('drop_invariant_tip_sites', 'no')).strip().lower()
+    if drop_mode_token == 'no':
+        g['drop_invariant_tip_sites'] = False
+        g['drop_invariant_tip_sites_mode'] = 'no'
+    elif drop_mode_token in ['tip_invariant', 'zero_sub_mass']:
+        g['drop_invariant_tip_sites'] = True
+        g['drop_invariant_tip_sites_mode'] = drop_mode_token
+    else:
+        txt = '--drop_invariant_tip_sites should be one of no, tip_invariant, zero_sub_mass.'
+        raise ValueError(txt)
+    return g
+
+
+def _normalize_simulation_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    from csubst import simulate_scenarios
+
+    if g.get('subcommand') == 'simulate' or 'simulate_scenario' in g:
+        simulate_scenarios.apply_defaults(g)
+    if 'num_simulated_site' in g.keys():
+        g['num_simulated_site'] = int(g['num_simulated_site'])
+        if (g['num_simulated_site'] != -1) and (g['num_simulated_site'] < 1):
+            raise ValueError('--num_simulated_site should be -1 or >= 1.')
+    if 'percent_convergent_site' in g.keys():
+        g['percent_convergent_site'] = _require_finite_float(
+            value=float(g['percent_convergent_site']),
+            param_name='--percent_foreground_sites',
+        )
+        if (g['percent_convergent_site'] < 0) or (g['percent_convergent_site'] > 100):
+            raise ValueError('--percent_foreground_sites should be between 0 and 100.')
+    if 'simulate_seed' in g.keys():
+        g['simulate_seed'] = int(g['simulate_seed'])
+        if (g['simulate_seed'] < -1):
+            raise ValueError('--simulate_seed should be -1 or >= 0.')
+    if 'simulate_asrv' in g.keys():
+        g['simulate_asrv'] = str(g['simulate_asrv']).strip().lower()
+    else:
+        g['simulate_asrv'] = 'no'
+    if g['simulate_asrv'] not in ['no', 'file', 'mixture']:
+        raise ValueError('--simulate_asrv should be one of no, file, mixture.')
+    if 'export_true_asr' in g.keys():
+        g['export_true_asr'] = _parse_bool_like(
+            value=g['export_true_asr'],
+            param_name='--export_true_asr',
+        )
+    else:
+        g['export_true_asr'] = True
+    if 'export_expected_omega' in g:
+        g['export_expected_omega'] = _parse_bool_like(
+            value=g['export_expected_omega'],
+            param_name='--export_expected_omegaC',
+        )
+    if 'true_asr_prefix' in g.keys():
+        if g['true_asr_prefix'] is None:
+            g['true_asr_prefix'] = ''
+        g['true_asr_prefix'] = str(g['true_asr_prefix']).strip()
+    else:
+        g['true_asr_prefix'] = ''
+    if 'tree_scaling_factor' in g.keys():
+        g['tree_scaling_factor'] = _require_finite_float(
+            value=float(g['tree_scaling_factor']),
+            param_name='--tree_branch_length_scale',
+        )
+        if g['tree_scaling_factor'] < 0:
+            raise ValueError('--tree_branch_length_scale should be >= 0.')
+    if 'foreground_scaling_factor' in g.keys():
+        g['foreground_scaling_factor'] = _require_finite_float(
+            value=float(g['foreground_scaling_factor']),
+            param_name='--foreground_branch_length_scale',
+        )
+        if g['foreground_scaling_factor'] < 0:
+            raise ValueError('--foreground_branch_length_scale should be >= 0.')
+    if 'background_omega' in g.keys():
+        raw_background_omega = g['background_omega']
+        if raw_background_omega is None:
+            g['background_omega'] = None
+        else:
+            omega_txt = str(raw_background_omega).strip().lower()
+            if omega_txt in ['', 'none', 'auto', 'infer', 'iqtree']:
+                g['background_omega'] = None
+            elif omega_txt == 'model':
+                g['background_omega'] = 'model'
+            else:
+                g['background_omega'] = _require_finite_float(
+                    value=float(raw_background_omega),
+                    param_name='--background_omega',
+                )
+                if g['background_omega'] < 0:
+                    raise ValueError('--background_omega should be >= 0.')
+    if 'foreground_omega' in g and str(g['foreground_omega']).strip().lower() == 'background':
+        g['foreground_omega'] = 'background'
+    elif 'foreground_omega' in g.keys():
+        g['foreground_omega'] = _require_finite_float(
+            value=float(g['foreground_omega']),
+            param_name='--foreground_omega',
+        )
+        if g['foreground_omega'] < 0:
+            raise ValueError('--foreground_omega should be >= 0.')
+    if 'simulate_eq_freq' in g.keys():
+        g['simulate_eq_freq'] = str(g['simulate_eq_freq']).strip().lower()
+    else:
+        g['simulate_eq_freq'] = 'auto'
+    if g['simulate_eq_freq'] not in ['auto', 'iqtree', 'alignment']:
+        raise ValueError('--simulate_eq_freq should be one of auto, iqtree, alignment.')
+    if g.get('background_omega') == 'model' and g['simulate_eq_freq'] == 'alignment':
+        raise ValueError('--background_omega model requires fitted codon frequencies (--simulate_eq_freq auto or iqtree).')
+    if 'convergent_amino_acids' in g.keys():
+        conv_aa = str(g['convergent_amino_acids']).strip()
+        if conv_aa == '':
+            raise ValueError('--target_amino_acids should be non-empty.')
+        if conv_aa.startswith('random'):
+            suffix = conv_aa.replace('random', '', 1)
+            if not re.fullmatch(r'\d+', suffix):
+                raise ValueError('--target_amino_acids random mode should be randomN (N is an integer).')
+            num_random_aa = int(suffix)
+            if num_random_aa > 20:
+                raise ValueError('--target_amino_acids randomN should satisfy 0 <= N <= 20.')
+        else:
+            from csubst import genetic_code
+            codon_table = genetic_code.get_codon_table(ncbi_id=g.get('genetic_code', 1))
+            valid_aas = set([item[0] for item in codon_table if item[0] != '*'])
+            invalid_aas = sorted(set([aa for aa in conv_aa if aa not in valid_aas]))
+            if len(invalid_aas):
+                raise ValueError('--target_amino_acids contains unsupported amino acids: {}.'.format(','.join(invalid_aas)))
+        g['convergent_amino_acids'] = conv_aa
+    if 'percent_biased_sub' in g.keys():
+        g['percent_biased_sub'] = _require_finite_float(
+            value=float(g['percent_biased_sub']),
+            param_name='--target_bias_strength',
+        )
+        if (g['percent_biased_sub'] < 0) or (g['percent_biased_sub'] >= 100):
+            raise ValueError('--target_bias_strength should be between 0 and <100.')
+    epistasis = simulate_scenarios.epistasis_mode(g)
+    if epistasis is not None:
+        for key in ('simulate_epistasis_distance_scale', 'simulate_epistasis_preference_multiplier'):
+            g[key] = _require_finite_float(float(g[key]), '--' + key)
+        if g['simulate_epistasis_distance_scale'] <= 0.:
+            raise ValueError('--simulate_epistasis_distance_scale should be positive.')
+        if g['simulate_epistasis_preference_multiplier'] < 1.:
+            raise ValueError('--simulate_epistasis_preference_multiplier should be at least 1.')
+        g['simulate_focal_tips'] = int(g['simulate_focal_tips'])
+        if g['simulate_focal_tips'] < 2:
+            raise ValueError('--simulate_max_focal_tips should be at least 2.')
+        if str(g['simulate_focal_branch_length']).strip().lower() == 'input':
+            g['simulate_focal_branch_length'] = None
+        else:
+            g['simulate_focal_branch_length'] = _require_finite_float(
+                float(g['simulate_focal_branch_length']), '--simulate_focal_branch_length',
+            )
+            if g['simulate_focal_branch_length'] < 0.:
+                raise ValueError('--simulate_focal_branch_length should be nonnegative.')
+        if (g['foreground_omega'] != 'background' or g['convergent_amino_acids'] != 'random0'
+                or g.get('percent_biased_sub', 90.) != 90.):
+            raise ValueError('Epistasis scenarios use --simulate_epistasis_preference_multiplier for the selection effect.')
+    elif g.get('simulate_scenario', 'custom') != 'custom' and g['percent_convergent_site'] > 0. and not g.get('foreground'):
+        raise ValueError('This simulation scenario requires --foreground for the selected sites.')
+    return g
+
+
+def _normalize_site_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    if 'tree_site_plot_max_sites' in g.keys():
+        g['tree_site_plot_max_sites'] = int(g['tree_site_plot_max_sites'])
+        if g['tree_site_plot_max_sites'] < 1:
+            raise ValueError('--tree_site_plot_max_sites should be >= 1.')
+    if 'species_regex' in g.keys():
+        if g['species_regex'] is None:
+            g['species_regex'] = ''
+        else:
+            g['species_regex'] = str(g['species_regex']).strip()
+        if g['species_regex'] != '':
+            try:
+                re.compile(g['species_regex'])
+            except re.error as exc:
+                txt = '--species_regex is not a valid regular expression: {}'
+                raise ValueError(txt.format(exc))
+    if 'species_overlap_node_plot' in g.keys():
+        g['species_overlap_node_plot'] = str(g['species_overlap_node_plot']).strip().lower()
+    else:
+        g['species_overlap_node_plot'] = 'auto'
+    if g['species_overlap_node_plot'] not in ['yes', 'no', 'auto']:
+        raise ValueError('--species_overlap_node_plot should be one of yes, no, auto.')
+    if 'tree_site_plot_min_prob' in g.keys():
+        g['tree_site_plot_min_prob'] = _require_finite_float(
+            value=float(g['tree_site_plot_min_prob']),
+            param_name='--tree_site_plot_min_prob',
+        )
+        if (g['tree_site_plot_min_prob'] < 0) or (g['tree_site_plot_min_prob'] > 1):
+            raise ValueError('--tree_site_plot_min_prob should satisfy 0 <= value <= 1.')
+    if 'min_single_prob' in g.keys():
+        g['min_single_prob'] = _require_finite_float(
+            value=float(g['min_single_prob']),
+            param_name='--min_single_prob',
+        )
+        if (g['min_single_prob'] < 0) or (g['min_single_prob'] > 1):
+            raise ValueError('--min_single_prob should satisfy 0 <= value <= 1.')
+    if 'min_combinat_prob' in g.keys():
+        g['min_combinat_prob'] = _require_finite_float(
+            value=float(g['min_combinat_prob']),
+            param_name='--min_combinat_prob',
+        )
+        if (g['min_combinat_prob'] < 0) or (g['min_combinat_prob'] > 1):
+            raise ValueError('--min_combinat_prob should satisfy 0 <= value <= 1.')
+    return g
+
+
+def _normalize_variant_effect_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    g['vep_model'] = str(g.get('vep_model', 'none')).strip().lower().replace('_', '-')
+    if g['vep_model'] not in ['none', 'vesm-35m']:
+        raise ValueError('--vep_model should be one of none, vesm-35m.')
+    g['vep_min_event_pp'] = _require_finite_float(
+        value=float(g.get('vep_min_event_pp', 0.8)),
+        param_name='--vep_min_event_pp',
+    )
+    if (g['vep_min_event_pp'] < 0) or (g['vep_min_event_pp'] > 1):
+        raise ValueError('--vep_min_event_pp should satisfy 0 <= value <= 1.')
+    g['vep_plot'] = _parse_bool_like(
+        value=g.get('vep_plot', True),
+        param_name='--vep_plot',
+    )
+    g['vep_site_aggregate'] = str(g.get('vep_site_aggregate', 'most_deleterious')).strip().lower()
+    if g['vep_site_aggregate'] not in ['most_deleterious', 'pp_weighted_mean', 'mean']:
+        raise ValueError('--vep_site_aggregate should be one of most_deleterious, pp_weighted_mean, mean.')
+    g['vep_device'] = str(g.get('vep_device', 'auto')).strip().lower()
+    if g['vep_device'] not in ['auto', 'cpu', 'cuda', 'mps']:
+        raise ValueError('--vep_device should be one of auto, cpu, cuda, mps.')
+    g['vep_no_download'] = _parse_bool_like(
+        value=g.get('vep_no_download', False),
+        param_name='--vep_no_download',
+    )
+    g['vep_cache'] = _parse_bool_like(
+        value=g.get('vep_cache', True),
+        param_name='--vep_cache',
+    )
+    raw_vep_cache_file = g.get('vep_cache_file', '')
+    g['vep_cache_file'] = '' if raw_vep_cache_file is None else str(raw_vep_cache_file).strip()
+    g['pymol_color_by'] = str(g.get('pymol_color_by', 'auto')).strip().lower()
+    if g['pymol_color_by'] not in ['auto', 'substitution', 'vesm']:
+        raise ValueError('--pymol_color_by should be one of auto, substitution, vesm.')
+    if (g['pymol_color_by'] == 'vesm') and (g['vep_model'] == 'none'):
+        raise ValueError('--pymol_color_by vesm requires --vep_model vesm-35m.')
+    return g
+
+
+def _normalize_structure_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    version = str(g.get('alphafold_version', 'latest')).strip().lower()
+    if version != 'latest':
+        version = version.removeprefix('v')
+        if not re.fullmatch(r'[1-9][0-9]*', version):
+            raise ValueError('--alphafold_version should be latest or a positive version number (e.g. 6).')
+    g['alphafold_version'] = version
+    if g.get('database_search', 'remote') == 'local':
+        if g.get('run_pdb_sequence_search'):
+            databases = g['database']
+        elif g.get('epistasis_pdb', '').lower() == 'besthit':
+            databases = g['epistasis_database']
+        else:
+            raise ValueError('--database_search local requires --pdb besthit or --epistasis_pdb besthit.')
+        from csubst import local_search_config
+
+        local_search_config.normalize_paths(g, databases)
+    elif g.get('blastp_db') or g.get('mmseqs_db'):
+        raise ValueError('--blastp_db and --mmseqs_db require --database_search local.')
+    if 'database_timeout' in g.keys():
+        g['database_timeout'] = _require_finite_float(
+            value=float(g['database_timeout']),
+            param_name='--database_timeout',
+        )
+        if g['database_timeout'] <= 0:
+            raise ValueError('--database_timeout should be > 0.')
+    if 'database_evalue_cutoff' in g.keys():
+        g['database_evalue_cutoff'] = _require_finite_float(
+            value=float(g['database_evalue_cutoff']),
+            param_name='--database_evalue_cutoff',
+        )
+        if g['database_evalue_cutoff'] <= 0:
+            raise ValueError('--database_evalue_cutoff should be > 0.')
+    if 'database_minimum_identity' in g.keys():
+        g['database_minimum_identity'] = _require_finite_float(
+            value=float(g['database_minimum_identity']),
+            param_name='--database_minimum_identity',
+        )
+        if (g['database_minimum_identity'] < 0) or (g['database_minimum_identity'] > 1):
+            raise ValueError('--database_minimum_identity should satisfy 0 <= value <= 1.')
+    if 'mafft_op' in g.keys():
+        g['mafft_op'] = _require_finite_float(
+            value=float(g['mafft_op']),
+            param_name='--mafft_op',
+        )
+        if (g['mafft_op'] != -1) and (g['mafft_op'] < 0):
+            raise ValueError('--mafft_op should be -1 or >= 0.')
+    if 'mafft_ep' in g.keys():
+        g['mafft_ep'] = _require_finite_float(
+            value=float(g['mafft_ep']),
+            param_name='--mafft_ep',
+        )
+        if (g['mafft_ep'] != -1) and (g['mafft_ep'] < 0):
+            raise ValueError('--mafft_ep should be -1 or >= 0.')
+    if 'pymol_gray' in g.keys():
+        g['pymol_gray'] = int(g['pymol_gray'])
+        if (g['pymol_gray'] < 0) or (g['pymol_gray'] > 100):
+            raise ValueError('--pymol_gray should satisfy 0 <= value <= 100.')
+    if 'pymol_transparency' in g.keys():
+        g['pymol_transparency'] = _require_finite_float(
+            value=float(g['pymol_transparency']),
+            param_name='--pymol_transparency',
+        )
+        if (g['pymol_transparency'] < 0) or (g['pymol_transparency'] > 1):
+            raise ValueError('--pymol_transparency should satisfy 0 <= value <= 1.')
+    if 'pymol_surface_quality' in g.keys():
+        g['pymol_surface_quality'] = int(g['pymol_surface_quality'])
+    if 'pymol_max_num_chain' in g.keys():
+        g['pymol_max_num_chain'] = int(g['pymol_max_num_chain'])
+        if g['pymol_max_num_chain'] < 1:
+            raise ValueError('--pymol_max_num_chain should be >= 1.')
+    return g
+
+
+def _normalize_execution_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    if 'float_digit' in g.keys():
+        g['float_digit'] = int(g['float_digit'])
+        if (g['float_digit'] < 0) or (g['float_digit'] > 17):
+            raise ValueError('--float_digit should satisfy 0 <= value <= 17.')
+        g['float_format'] = '%.'+str(g['float_digit'])+'f'
+    if 'threads' in g.keys():
+        g['threads'] = int(g['threads'])
+        if g['threads'] < 1:
+            raise ValueError('--threads should be >= 1.')
+    if 'blas_threads' not in g.keys():
+        g['blas_threads'] = 1
+    g['blas_threads'] = int(g['blas_threads'])
+    if g['blas_threads'] < 1:
+        raise ValueError('--blas_threads should be >= 1.')
+    set_num_thread_variables(num_thread=g['blas_threads'])
+    return g
+
+
+def _normalize_recoding_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    g['sa_backend'] = recoding_config.normalize_sa_backend(g.get('sa_backend', recoding_config.DEFAULT_SA_BACKEND))
+    g['sa_batch_size'] = int(g.get('sa_batch_size', 0))
+    if g['sa_batch_size'] < 0:
+        raise ValueError('--sa_batch_size should be >= 0.')
+    if 'nonsyn_recode' in g.keys():
+        g['nonsyn_recode'] = recoding_config.normalize_nonsyn_recode(g['nonsyn_recode'])
+    else:
+        g['nonsyn_recode'] = 'no'
+    training_alignment = str(g.get('nonsyn_recode_training_alignment', '') or '').strip()
+    if training_alignment and g['nonsyn_recode'] not in recoding_config.AUTO_RECODING_SCHEMES:
+        raise ValueError('--nonsyn_recode_training_alignment requires srchisq6 or kgbauto6.')
+    g['nonsyn_recode_training_alignment'] = training_alignment
+    if 'sa_asr_mode' in g.keys():
+        g['sa_asr_mode'] = str(g['sa_asr_mode']).strip().lower()
+    else:
+        g['sa_asr_mode'] = 'direct'
+    if g['sa_asr_mode'] not in ['translate', 'direct']:
+        raise ValueError('--sa_asr_mode should be one of translate, direct.')
+    if 'prostt5_model' not in g.keys():
+        g['prostt5_model'] = 'Rostlab/ProstT5'
+    g['prostt5_model'] = str(g['prostt5_model']).strip()
+    if g['prostt5_model'] == '':
+        raise ValueError('--prostt5_model should be non-empty.')
+    if 'prostt5_local_dir' not in g.keys():
+        g['prostt5_local_dir'] = ''
+    if g['prostt5_local_dir'] is None:
+        g['prostt5_local_dir'] = ''
+    g['prostt5_local_dir'] = str(g['prostt5_local_dir']).strip()
+    if 'prostt5_no_download' not in g.keys():
+        g['prostt5_no_download'] = False
+    g['prostt5_no_download'] = _parse_bool_like(
+        value=g['prostt5_no_download'],
+        param_name='--prostt5_no_download',
+    )
+    if 'resource_cache_dir' not in g.keys() or g['resource_cache_dir'] is None:
+        g['resource_cache_dir'] = ''
+    g['resource_cache_dir'] = str(g['resource_cache_dir']).strip()
+    if 'resource_lock_poll' not in g.keys():
+        g['resource_lock_poll'] = 5.0
+    g['resource_lock_poll'] = _require_finite_float(
+        value=float(g['resource_lock_poll']),
+        param_name='--resource_lock_poll',
+    )
+    if g['resource_lock_poll'] <= 0:
+        raise ValueError('--resource_lock_poll should be > 0.')
+    if 'resource_lock_timeout' not in g.keys():
+        g['resource_lock_timeout'] = 3600.0
+    g['resource_lock_timeout'] = _require_finite_float(
+        value=float(g['resource_lock_timeout']),
+        param_name='--resource_lock_timeout',
+    )
+    if g['resource_lock_timeout'] <= 0:
+        raise ValueError('--resource_lock_timeout should be > 0.')
+    if 'download_prostt5' not in g.keys():
+        g['download_prostt5'] = False
+    g['download_prostt5'] = _parse_bool_like(
+        value=g['download_prostt5'],
+        param_name='--download_prostt5',
+    )
+    if 'write_instantaneous_rate_matrix' not in g.keys():
+        g['write_instantaneous_rate_matrix'] = False
+    g['write_instantaneous_rate_matrix'] = _parse_bool_like(
+        value=g['write_instantaneous_rate_matrix'],
+        param_name='--write_instantaneous_rate_matrix',
+    )
+    if 'prostt5_device' not in g.keys():
+        g['prostt5_device'] = 'auto'
+    g['prostt5_device'] = str(g['prostt5_device']).strip().lower()
+    if g['prostt5_device'] not in ['auto', 'cpu', 'cuda', 'mps']:
+        raise ValueError('--prostt5_device should be one of auto, cpu, cuda, mps.')
+    if 'prostt5_cache' not in g.keys():
+        g['prostt5_cache'] = True
+    g['prostt5_cache'] = _parse_bool_like(
+        value=g['prostt5_cache'],
+        param_name='--prostt5_cache',
+    )
+    if 'prostt5_cache_file' not in g.keys():
+        g['prostt5_cache_file'] = _default_prostt5_cache_file()
+    if g['prostt5_cache_file'] is None:
+        g['prostt5_cache_file'] = _default_prostt5_cache_file()
+    g['prostt5_cache_file'] = str(g['prostt5_cache_file']).strip()
+    if g['prostt5_cache_file'] == '':
+        raise ValueError('--prostt5_cache_file should be non-empty.')
+    if 'sa_iqtree_model' not in g.keys():
+        g['sa_iqtree_model'] = 'GTR'
+    g['sa_iqtree_model'] = str(g['sa_iqtree_model']).strip()
+    if g['sa_iqtree_model'] == '':
+        raise ValueError('--sa_iqtree_model should be non-empty.')
+    if 'sa_state_cache' not in g.keys():
+        g['sa_state_cache'] = 'auto'
+    g['sa_state_cache'] = str(g['sa_state_cache']).strip().lower()
+    if g['sa_state_cache'] not in ['auto', 'yes', 'no']:
+        raise ValueError('--sa_state_cache should be one of auto, yes, no.')
+    if 'sa_state_cache_file' not in g.keys():
+        g['sa_state_cache_file'] = _default_sa_state_cache_file()
+    if g['sa_state_cache_file'] is None:
+        g['sa_state_cache_file'] = _default_sa_state_cache_file()
+    g['sa_state_cache_file'] = str(g['sa_state_cache_file']).strip()
+    if g['sa_state_cache_file'] == '':
+        raise ValueError('--sa_state_cache_file should be non-empty.')
+    if 'sa_smoke_max_branches' in g.keys():
+        g['sa_smoke_max_branches'] = int(g['sa_smoke_max_branches'])
+    else:
+        g['sa_smoke_max_branches'] = 0
+    if g['sa_smoke_max_branches'] < 0:
+        raise ValueError('--sa_smoke_max_branches should be >= 0.')
+    if 'plot_nonsyn_recode_pca_3di20' not in g.keys():
+        g['plot_nonsyn_recode_pca_3di20'] = False
+    g['plot_nonsyn_recode_pca_3di20'] = _parse_bool_like(
+        value=g['plot_nonsyn_recode_pca_3di20'],
+        param_name='--plot_nonsyn_recode_pca_3di20',
+    )
+    if g['nonsyn_recode'] == '3di20':
+        full_path = str(g.get('full_cds_alignment_file', '')).strip()
+        if full_path == '':
+            raise ValueError('--nonsyn_recode 3di20 requires --full_cds_alignment_file.')
+        if g.get('alignment_file', '') not in ['', full_path]:
+            txt = '--alignment_file is disabled when --nonsyn_recode is 3di20. Use --full_cds_alignment_file.'
+            raise ValueError(txt)
+        g['alignment_file'] = full_path
+    return g
+
+
+def _normalize_output_parameters(g: dict[str, Any]) -> dict[str, Any]:
+    if 'output_stat' in g.keys():
+        g['output_stats'] = output_stat.parse_output_stats(g['output_stat'])
+    else:
+        g['output_stats'] = list(output_stat.ALL_OUTPUT_STATS)
+    g['output_stat'] = ','.join(g['output_stats'])
+    g['output_base_stats'] = output_stat.get_required_base_stats(g['output_stats'])
+    g['output_dif_stats'] = output_stat.get_required_dif_stats(g['output_stats'])
+    if g.get('pair_posterior') == 'joint':
+        required = {'substitution_posterior': 'joint', 'expectation_method': 'codon_model', 'output_stat': 'any2spe',
+                    'max_arity': 2, 'nonsyn_recode': 'no', 'min_sub_pp': 0, 'cb': True}
+        for key, value in required.items():
+            if g[key] != value:
+                label = 'yes' if value is True else value
+                raise ValueError('--pair_posterior joint requires --{} {}.'.format(key, label))
+        for key in ('cs', 'cbs', 'site_filter_report', 'calibrate_longtail', 'fg_clade_permutation'):
+            if g.get(key):
+                raise ValueError('--pair_posterior joint is incompatible with --{}.'.format(key))
+    if 'cutoff_stat' in g.keys():
+        min_pp = _require_finite_float(float(g.get('min_ocn_site_pp', 0)), '--min_ocn_site_pp')
+        if not 0 <= min_pp <= 1:
+            raise ValueError('--min_ocn_site_pp should satisfy 0 <= value <= 1.')
+        g['min_ocn_site_pp'] = min_pp
+        if str(g['cutoff_stat']) == output_stat.DEFAULT_CUTOFF_STAT:
+            adjusted = output_stat.get_default_cutoff_stat_for_output_stats(g['output_stats'])
+            if adjusted != g['cutoff_stat']:
+                txt = 'Default --cutoff_stat was adjusted to "{}" to match --output_stat.'
+                print(txt.format(adjusted), flush=True)
+                g['cutoff_stat'] = adjusted
+        output_stat.validate_cutoff_stat_compatibility(g['cutoff_stat'], g['output_stats'])
+        # Fail fast on malformed cutoff tokens/regex/value ranges.
+        criteria = table.parse_cutoff_stat(cutoff_stat_str=g['cutoff_stat'])
+        if min_pp == 0 and any(expr == 'cutoff_OCN' + stat for expr, _ in criteria for stat in g['output_stats']):
+            raise ValueError('A cutoff_OCN column requires --min_ocn_site_pp > 0.')
+        benchmark_ocn = g.get('benchmark_ocn_column')
+        g['cutoff_ocn_stats'] = [stat for stat in g['output_stats'] if min_pp > 0 and
+                                 (benchmark_ocn in ('OCN' + stat, 'cutoff_OCN' + stat) or
+                                  any(re.fullmatch(expr, prefix + stat) for expr, _ in criteria
+                                      for prefix in ('OCN', 'cutoff_OCN')))]
+        table.expansion_ocn_bound(criteria, g.get('high_order_pruning', 'all_cutoffs'))
+    g = runtime.ensure_output_layout(g, create_dir=False)
+    return g
+
+
+def get_global_parameters(args: Any) -> runtime.RunContext:
+    """Validate arguments in ordered stages, then freeze the configuration view."""
+    print('OS: {}'.format(platform.platform()), flush=True)
+    print('Python version: {}'.format(sys.version.replace('\n', ' ')), flush=True)
+    print('CSUBST version: {}'.format(__version__), flush=True)
+    dep_versions, missing_packages = _format_dependency_versions()
+    print('CSUBST dependency versions: {}'.format(dep_versions), flush=True)
+    if len(missing_packages):
+        print('CSUBST missing dependency packages: {}'.format(', '.join(missing_packages)), flush=True)
+    else:
+        print('CSUBST missing dependency packages: none', flush=True)
+    print('CSUBST command: {}'.format(' '.join(sys.argv)), flush=True)
+    print('CSUBST working directory: {}'.format(os.getcwd()), flush=True)
+    print('CSUBST bug report: https://github.com/kfuku52/csubst/issues', flush=True)
+    g = dict()
+    for attr in [a for a in dir(args) if not a.startswith('_')]:
+        g[attr] = getattr(args, attr)
+    g['infile_type'] = 'iqtree'
+    g = _normalize_input_parameters(g)
+    g = _normalize_model_parameters(g)
+    g = _normalize_epistasis_parameters(g)
+    g = _normalize_epistasis_structure_parameters(g)
+    asrv.validate_epistasis_compatibility(g)
+    from csubst import epistasis
+    epistasis.validate_options(g)
+    g = _normalize_search_parameters(g)
+    g = _normalize_state_parameters(g)
+    g = _normalize_simulation_parameters(g)
+    g = _normalize_site_parameters(g)
+    g = _normalize_variant_effect_parameters(g)
+    g = _normalize_structure_parameters(g)
+    g = _normalize_execution_parameters(g)
+    g = _normalize_recoding_parameters(g)
+    g = _normalize_output_parameters(g)
+    if g.get('subcommand') != 'benchmark':
+        g['asrv'] = asrv.effective_mode(g)
+    g['site_filter_report'] = _parse_bool_like(g.get('site_filter_report', False), '--site_filter_report')
+    if g['site_filter_report']:
+        from csubst import site_filter
+        site_filter.validate_report_options(g)
+    from csubst import omega_calibration
+    omega_calibration.validate_config(g)
+    from csubst import omega_null
+    omega_null.validate_config(g)
+    return runtime.ensure_run_context(g)
+
+def initialize_df_cb_stats(g):
+    cols = ['arity','elapsed_sec','fg_enrichment_factor','mode','dSC_calibration',]
+    g['df_cb_stats'] = pd.DataFrame(index=[0,], columns=cols)
+    g['df_cb_stats']['arity'] = [g['current_arity'],]
+    g['df_cb_stats']['cutoff_stat'] = g['cutoff_stat']
+    return(g)
+
+def set_num_thread_variables(num_thread=1):
+    runtime.configure_native_threads(num_threads=num_thread)
+    return None

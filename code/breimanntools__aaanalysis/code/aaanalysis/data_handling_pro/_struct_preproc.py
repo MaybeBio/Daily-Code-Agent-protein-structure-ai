@@ -1,0 +1,2289 @@
+"""
+This is a script for the frontend of the StructurePreprocessor class.
+Converts PDB-derived per-residue features (DSSP secondary structure / ASA /
+dihedrals, plus raw PDB B-factor and residue depth) into the ``dict_num``
+shape that ``CPP.run_num`` consumes, and produces the companion
+``(df_scales, df_cat)`` metadata pair that names the D dimensions.
+
+The class is pro-extra gated: biopython is required (already an
+``[pro]`` dependency) and DSSP needs ``mkdssp`` on PATH; the residue-depth
+feature additionally needs the ``msms`` binary, checked at runtime.
+"""
+from pathlib import Path
+from typing import Dict, List, Literal, Optional, Tuple, Union
+import re
+import shutil
+import tempfile
+import warnings
+
+import numpy as np
+import pandas as pd
+
+import aaanalysis.utils as ut
+from ._backend.struct_preproc.feature_registry import (
+    REGISTRY, VALID_FEATURE_KEYS, ENCODER_DSSP, ENCODER_PDB, ENCODER_PAE,
+    ENCODER_DOMAINS,
+    INVERSE_FORMULAS, validate_feature_keys, get_total_dims, get_dim_names,
+    get_categories, get_subcategories)
+from ._backend.struct_preproc.run_dssp_full import (
+    run_dssp_full_for_entry_)
+from ._backend.struct_preproc.align_dssp_full import (
+    pick_best_chain_full_, count_mismatches_full_,
+    align_chain_full_to_sequence_, apply_ss_mode_full_,
+    apply_gap_handling_full_, _make_aligner as _make_dssp_aligner)
+from ._backend.struct_preproc.encode_dssp import (
+    encode_ss, encode_rasa, encode_dihedrals_sincos,
+    encode_hbond_donor, encode_hbond_acceptor)
+from ._backend.struct_preproc.encode_pdb import (
+    load_structure, encode_bfactor, encode_depth,
+    encode_plddt, encode_plddt_disorder, encode_plddt_tier,
+    _plddt_per_residue, _resolve_best_chain,
+    encode_chi1_sincos, encode_chi2_sincos,
+    encode_ca_centroid_dist, encode_ca_centroid_dist_norm,
+    encode_contact_count_8A, encode_contact_count_12A,
+    encode_hse, encode_disulfide)
+from ._backend.struct_preproc._extras import (
+    is_msms_available, check_msms_available)
+from ._backend.struct_preproc._file_format import (
+    resolve_structure_path, resolve_pae_path)
+from ._backend.struct_preproc._alphafold import (
+    fetch_alphafold_bulk, COL_ALPHAFOLD_OK)
+from ._backend.struct_preproc._pae_io import load_pae_matrix
+from ._backend.struct_preproc.encode_pae import (
+    encode_pae_row_mean, encode_pae_row_min, encode_pae_row_max,
+    encode_pae_local_mean, encode_pae_distal_mean,
+    encode_pae_asymmetry, encode_pae_band_means)
+from ._backend.struct_preproc._domain_io import (
+    load_chopping, resolve_domain_path, _parse_chopping)
+from ._backend.struct_preproc.encode_domains import (
+    encode_domain_boundary, encode_domain_relative_position,
+    encode_domain_size, encode_n_domains_in_protein)
+from ._backend.struct_preproc._afragmenter import (
+    check_afragmenter_available, run_afragmenter_on_pae)
+from ._backend.struct_preproc._chainsaw import (
+    resolve_chainsaw_path, run_chainsaw_on_entry)
+
+
+# Same path-safety regex used by the existing get_dssp; reject characters
+# that would allow path escape or platform-specific quoting bugs.
+_SAFE_ENTRY_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+
+# Output column names appended by ``get_dssp``. Local constants — single-use,
+# not part of the cross-module domain bundle in ut.
+_COL_ASA = "asa"
+_COL_PHI = "phi"
+_COL_PSI = "psi"
+_COL_PDB_OK = "pdb_ok"
+_COL_HBOND_DONOR_OFFSET = "hbond_donor_offset"
+_COL_HBOND_DONOR_ENERGY = "hbond_donor_energy"
+_COL_HBOND_ACCEPTOR_OFFSET = "hbond_acceptor_offset"
+_COL_HBOND_ACCEPTOR_ENERGY = "hbond_acceptor_energy"
+_COL_CHOPPING = "chopping"
+_COL_DOMAIN_OK = "domain_ok"
+
+# Tool dispatch alphabet for get_domains.
+_LIST_DOMAIN_TOOLS = ["chainsaw", "afragmenter"]
+
+# Encoder-supplied options that ``get_dssp`` consumes. (These are the raw
+# DSSP stream kinds, distinct from the registry's user-facing feature keys —
+# e.g. registry key 'rasa' / 'phi_psi_sincos' both pull from the 'asa' /
+# 'phi_psi' raw streams. Registry keys 'hbond_donor' / 'hbond_acceptor'
+# both pull from the 'hbonds' raw stream.)
+_LIST_GET_DSSP_FEATURES = ["ss", "asa", "phi_psi", "hbonds"]
+_LIST_ON_FAILURE = ["nan", "drop", "raise"]
+
+
+# I Helper Functions
+def _check_mkdssp_installed():
+    """Raise ``RuntimeError`` if neither ``mkdssp`` nor ``dssp`` is on PATH."""
+    if not (shutil.which("mkdssp") or shutil.which("dssp")):
+        raise RuntimeError(
+            "'mkdssp' is not installed or not in PATH. Install the DSSP "
+            "suite (e.g. `conda install -c bioconda dssp` or "
+            "`apt install dssp`) to use StructurePreprocessor.")
+
+
+def _check_entry_is_filesystem_safe(entry):
+    """Reject entries that would escape ``pdb_folder`` when joined into a path."""
+    if not isinstance(entry, str) or not _SAFE_ENTRY_RE.match(entry):
+        raise ValueError(
+            f"'entry' ({entry!r}) should match [A-Za-z0-9_.-]+ to be safe "
+            f"for filesystem lookup")
+
+
+def _check_no_get_dssp_collisions(df_seq):
+    """Refuse to overwrite pre-existing get_dssp output columns."""
+    existing = [c for c in (ut.COL_SS, _COL_ASA, _COL_PHI, _COL_PSI,
+                            _COL_HBOND_DONOR_OFFSET, _COL_HBOND_DONOR_ENERGY,
+                            _COL_HBOND_ACCEPTOR_OFFSET, _COL_HBOND_ACCEPTOR_ENERGY,
+                            ut.COL_DSSP_OK)
+                if c in df_seq.columns]
+    if existing:
+        raise ValueError(
+            f"'df_seq' should not already contain get_dssp output columns "
+            f"(found: {existing}). Drop them before calling get_dssp.")
+
+
+def _check_no_pdb_ok_collision(df_seq):
+    """Refuse to overwrite a pre-existing ``pdb_ok`` column on encode_pdb."""
+    if _COL_PDB_OK in df_seq.columns:
+        raise ValueError(
+            f"'df_seq' should not already contain a '{_COL_PDB_OK}' column. "
+            f"Drop it before calling encode_pdb.")
+
+
+def _check_features_list(features, name="features"):
+    """Lightweight pre-check: must be a non-empty list of strings."""
+    if not isinstance(features, list):
+        raise ValueError(
+            f"'{name}' ({type(features).__name__}) should be a list of "
+            f"feature keys (str)")
+    if len(features) == 0:
+        raise ValueError(
+            f"'{name}' (len=0) should be a non-empty list of feature keys")
+    for f in features:
+        if not isinstance(f, str):
+            raise ValueError(
+                f"'{name}' items ({f!r}) should be str")
+
+
+def _check_get_dssp_features(features):
+    """Validate the ``features`` arg of ``get_dssp`` (different alphabet)."""
+    _check_features_list(features, name="features")
+    bad = [f for f in features if f not in _LIST_GET_DSSP_FEATURES]
+    if bad:
+        raise ValueError(
+            f"'features' ({bad}) should be a subset of "
+            f"{_LIST_GET_DSSP_FEATURES}")
+
+
+def _check_handle_failure(on_failure):
+    """Validate the ``on_failure`` policy string."""
+    ut.check_str_options(name="on_failure", val=on_failure,
+                         list_str_options=_LIST_ON_FAILURE)
+
+
+def _dssp_features_to_get_dssp_kinds(features):
+    """Translate ``encode_dssp`` feature keys into ``get_dssp`` feature kinds."""
+    kinds = set()
+    for f in features:
+        if f in ("ss3", "ss8"):
+            kinds.add("ss")
+        elif f == "rasa":
+            kinds.add("asa")
+        elif f == "phi_psi_sincos":
+            kinds.add("phi_psi")
+        elif f in ("hbond_donor", "hbond_acceptor"):
+            kinds.add("hbonds")
+    return sorted(kinds)
+
+
+def _drop_or_raise_failed_entries(df_seq, ok_per_row, on_failure,
+                                  source_label):
+    """Apply the ``on_failure`` policy to a per-row OK mask."""
+    n_failed = sum(1 for ok in ok_per_row if not ok)
+    if n_failed == 0:
+        return df_seq, ok_per_row, list(range(len(df_seq)))
+    if on_failure == "raise":
+        raise RuntimeError(
+            f"{source_label} failed for {n_failed} of {len(df_seq)} entries; "
+            f"on_failure='raise'")
+    if on_failure == "drop":
+        keep = [i for i, ok in enumerate(ok_per_row) if ok]
+        df_kept = df_seq.iloc[keep].reset_index(drop=True)
+        return df_kept, [True] * len(df_kept), keep
+    # on_failure == "nan" (default): keep everything; caller fills with NaNs.
+    return df_seq, ok_per_row, list(range(len(df_seq)))
+
+
+def _nan_feature_block(L, num_dims):
+    """All-NaN ``(L, num_dims)`` float block for a single isolated feature.
+
+    Used by the per-feature failure isolation (issue #340): when one feature
+    is unavailable (e.g. ``depth`` without the ``msms`` binary) or its encoder
+    raises for an entry, only that feature's column(s) are filled with NaN
+    while the other requested features are kept.
+    """
+    return np.full((L, num_dims), np.nan, dtype=np.float64)
+
+
+def _warn_isolated_features(unavailable, failed, source_label):
+    """Emit exactly one ``UserWarning`` per isolated feature (issue #340).
+
+    ``unavailable`` maps feature_key -> cause for features that could not be
+    computed at all (a missing external tool); ``failed`` maps feature_key ->
+    example error for features whose encoder raised on some entries. Both are
+    aggregated across entries so each failing feature is named once.
+    """
+    for key, cause in unavailable.items():
+        warnings.warn(
+            f"{cause} -> feature '{key}' unavailable; filled with NaN, "
+            f"other features kept.",
+            UserWarning, stacklevel=3)
+    for key, cause in failed.items():
+        warnings.warn(
+            f"{source_label} encoder '{key}' failed for one or more "
+            f"entries (e.g. {cause}); filled with NaN, other features kept.",
+            UserWarning, stacklevel=3)
+
+
+def _ensure_dssp_columns(df_seq, features_get_dssp, pdb_folder, ss_mode,
+                         gap_handling, verbose):
+    """Run get_dssp inline if ``df_seq`` is missing the requested DSSP columns.
+
+    Used by ``encode_dssp`` so users can either pre-compute DSSP once and
+    reuse, or pass a plain ``df_seq`` and let encode run DSSP transparently.
+    """
+    needed_cols = []
+    if "ss" in features_get_dssp:
+        needed_cols.append(ut.COL_SS)
+    if "asa" in features_get_dssp:
+        needed_cols.append(_COL_ASA)
+    if "phi_psi" in features_get_dssp:
+        needed_cols.extend([_COL_PHI, _COL_PSI])
+    if "hbonds" in features_get_dssp:
+        needed_cols.extend([_COL_HBOND_DONOR_OFFSET, _COL_HBOND_DONOR_ENERGY,
+                            _COL_HBOND_ACCEPTOR_OFFSET, _COL_HBOND_ACCEPTOR_ENERGY])
+    have_all = all(c in df_seq.columns for c in needed_cols)
+    if have_all:
+        return df_seq
+    return _run_get_dssp_internal(
+        df_seq=df_seq, pdb_folder=pdb_folder,
+        features=features_get_dssp, ss_mode=ss_mode,
+        gap_handling=gap_handling, verbose=verbose)
+
+
+def _run_get_dssp_internal(df_seq, pdb_folder, features, ss_mode,
+                           gap_handling, verbose):
+    """Per-entry DSSP runner shared by the public ``get_dssp`` and ``encode_dssp``.
+
+    Returns a copy of ``df_seq`` with appended list columns
+    (only the requested ones from ``features``) plus a boolean
+    ``dssp_ok`` column.
+    """
+    _check_mkdssp_installed()
+    pdb_folder = Path(pdb_folder)
+    entries = df_seq[ut.COL_ENTRY].tolist()
+    sequences = df_seq[ut.COL_SEQ].tolist()
+    ss_per_row: List[Optional[List[str]]] = []
+    asa_per_row: List[Optional[List[float]]] = []
+    phi_per_row: List[Optional[List[float]]] = []
+    psi_per_row: List[Optional[List[float]]] = []
+    hb_d_off_per_row: List[Optional[List[float]]] = []
+    hb_d_en_per_row: List[Optional[List[float]]] = []
+    hb_a_off_per_row: List[Optional[List[float]]] = []
+    hb_a_en_per_row: List[Optional[List[float]]] = []
+    ok_per_row: List[bool] = []
+    # Session-scoped temp dir for any gz decompression done by the resolver.
+    # Inner per-entry tempdir copying (for DSSP intermediates) is still
+    # handled by run_dssp_full_for_entry_.
+    session_tmp = tempfile.TemporaryDirectory()
+    session_tmp_path = Path(session_tmp.name)
+    # One session-scoped PairwiseAligner reused across all entries (and across
+    # the chain-pick, mismatch-count, and align steps within each entry),
+    # instead of constructing three fresh aligners per entry. The aligner holds
+    # no per-call state, so this is byte-identical to per-entry construction.
+    # This is a SEPARATE aligner from the encode_pdb alignment cache (#180-A).
+    dssp_aligner = _make_dssp_aligner()
+
+    def _append_nan_row():
+        """Push NaN/None onto every per-row list for a failed entry."""
+        ss_per_row.append(None)
+        asa_per_row.append(None)
+        phi_per_row.append(None)
+        psi_per_row.append(None)
+        hb_d_off_per_row.append(None)
+        hb_d_en_per_row.append(None)
+        hb_a_off_per_row.append(None)
+        hb_a_en_per_row.append(None)
+        ok_per_row.append(False)
+
+    for entry, target_seq in zip(entries, sequences):
+        _check_entry_is_filesystem_safe(entry)
+        pdb_path, _file_fmt = resolve_structure_path(
+            folder=pdb_folder, entry=entry, temp_dir=session_tmp_path)
+        if pdb_path is None:
+            warnings.warn(
+                f"Structure file for entry '{entry}' not found in "
+                f"'{pdb_folder}' (tried .pdb/.pdb.gz/.cif/.cif.gz); "
+                f"row will have dssp_ok=False",
+                UserWarning)
+            _append_nan_row()
+            continue
+        try:
+            chains = run_dssp_full_for_entry_(pdb_path)
+        except RuntimeError as e:
+            warnings.warn(
+                f"DSSP failed for entry '{entry}': {e}; "
+                f"row will have dssp_ok=False",
+                UserWarning)
+            _append_nan_row()
+            continue
+        best = pick_best_chain_full_(target_seq, chains, aligner=dssp_aligner)
+        if best is None:
+            warnings.warn(
+                f"No chains with assigned secondary structure for entry "
+                f"'{entry}'; row will have dssp_ok=False",
+                UserWarning)
+            _append_nan_row()
+            continue
+        record, identity = best
+        (chain_id, atom_seq, atom_ss, atom_asa, atom_phi, atom_psi,
+         atom_hb_d_off, atom_hb_d_en,
+         atom_hb_a_off, atom_hb_a_en) = record
+        n_mismatch = count_mismatches_full_(target_seq, atom_seq,
+                                            aligner=dssp_aligner)
+        if n_mismatch > 0:
+            warnings.warn(
+                f"Entry '{entry}': best-matching chain '{chain_id}' has "
+                f"{n_mismatch} residue mismatch(es) against df_seq[sequence] "
+                f"(identity={identity:.3f}).",
+                UserWarning)
+        (aligned_ss, aligned_asa, aligned_phi, aligned_psi,
+         aligned_hb_d_off, aligned_hb_d_en,
+         aligned_hb_a_off, aligned_hb_a_en) = \
+            align_chain_full_to_sequence_(
+                target_seq, atom_seq, atom_ss, atom_asa, atom_phi, atom_psi,
+                atom_hb_d_off, atom_hb_d_en, atom_hb_a_off, atom_hb_a_en,
+                aligner=dssp_aligner)
+        encoded_ss = apply_ss_mode_full_(aligned_ss, ss_mode)
+        (final_ss, final_asa, final_phi, final_psi,
+         final_hb_d_off, final_hb_d_en,
+         final_hb_a_off, final_hb_a_en) = apply_gap_handling_full_(
+            encoded_ss, aligned_asa, aligned_phi, aligned_psi,
+            aligned_hb_d_off, aligned_hb_d_en,
+            aligned_hb_a_off, aligned_hb_a_en, gap_handling)
+        ss_per_row.append(final_ss)
+        asa_per_row.append(final_asa)
+        phi_per_row.append(final_phi)
+        psi_per_row.append(final_psi)
+        hb_d_off_per_row.append(final_hb_d_off)
+        hb_d_en_per_row.append(final_hb_d_en)
+        hb_a_off_per_row.append(final_hb_a_off)
+        hb_a_en_per_row.append(final_hb_a_en)
+        ok_per_row.append(True)
+        if verbose:
+            ut.print_out(
+                f"   get_dssp: entry={entry}, chain={chain_id}, "
+                f"identity={identity:.3f}, n_ss={len(final_ss)}")
+
+    df_out = df_seq.copy()
+    if "ss" in features:
+        df_out[ut.COL_SS] = ss_per_row
+    if "asa" in features:
+        df_out[_COL_ASA] = asa_per_row
+    if "phi_psi" in features:
+        df_out[_COL_PHI] = phi_per_row
+        df_out[_COL_PSI] = psi_per_row
+    if "hbonds" in features:
+        df_out[_COL_HBOND_DONOR_OFFSET] = hb_d_off_per_row
+        df_out[_COL_HBOND_DONOR_ENERGY] = hb_d_en_per_row
+        df_out[_COL_HBOND_ACCEPTOR_OFFSET] = hb_a_off_per_row
+        df_out[_COL_HBOND_ACCEPTOR_ENERGY] = hb_a_en_per_row
+    df_out[ut.COL_DSSP_OK] = ok_per_row
+    session_tmp.cleanup()
+    return df_out
+
+
+# II Main Functions
+class StructurePreprocessor:
+    """
+    Preprocessing class (**[pro]**, requires ``aaanalysis[pro]``) for protein
+    structure features (PDB / CIF / AlphaFold).
+
+    Turns local structure files into the ``[0, 1]``-normalized per-residue
+    ``dict_num`` consumed by :meth:`CPP.run_num`. Each ``encode_*`` method
+    reads one kind of source from a folder and returns a ``(L, D)`` tensor per
+    protein: Define Secondary Structure of Proteins (DSSP)-derived geometry
+    (:meth:`encode_dssp`), PDB ATOM-record features (:meth:`encode_pdb`),
+    AlphaFold Predicted Aligned Error (PAE) summaries (:meth:`encode_pae`), or
+    domain segmentation (:meth:`encode_domains`).
+    :meth:`fetch_alphafold` downloads the input files first when you do not
+    already have them locally. A secondary scale-based path
+    (:meth:`build_scales` / :meth:`build_cat`) feeds the amino acid (AA)-scale
+    :meth:`CPP.run`.
+
+    .. versionadded:: 1.1.0
+    """
+
+    def __init__(self, verbose: bool = True):
+        """
+        Parameters
+        ----------
+        verbose : bool, default=True
+            If ``True``, verbose outputs are enabled.
+
+        Notes
+        -----
+        * This is the structure-side member of the per-residue ``dict_num``
+          family, alongside :class:`EmbeddingPreprocessor` (protein language
+          model (PLM) embeddings) and :class:`AnnotationPreprocessor`
+          (post-translational modification (PTM) / functional sites). All three
+          emit ``[0, 1]``-normalized tensors that
+          :meth:`NumericalFeature.get_parts` slices into the per-part inputs of
+          :meth:`CPP.run_num`, and that stack along the D axis via
+          :func:`aaanalysis.combine_dict_nums`. The accompanying
+          ``(df_scales, df_cat)`` pair names the D dimensions for the
+          redundancy filter and output columns.
+        * **Feature value range, always normalized to ``[0, 1]``** (NaN for
+          unresolved positions). Use the table below to de-normalize back to
+          raw units if needed:
+
+          .. list-table::
+             :header-rows: 1
+             :widths: 34 22 30 34
+
+             * - Feature key
+               - Raw range
+               - Recipe → normalized
+               - Inverse (de-normalize)
+             * - ``ss3`` / ``ss8``
+               - {0, 1} (one-hot)
+               - identity
+               - identity
+             * - ``rasa``
+               - [0, ~1.2]
+               - ``clip(x, 0, 1)``
+               - identity (clipped)
+             * - ``phi_psi_sincos``
+               - [-1, 1]
+               - ``(x + 1) / 2``
+               - ``x * 2 - 1`` (in [-1, 1])
+             * - ``bfactor``
+               - [0, 100+] Å²
+               - ``clip(x / 100, 0, 1)``
+               - ``x * 100`` (lossy when ≥1)
+             * - ``depth``
+               - [0, ~15] Å
+               - ``clip(x / 15, 0, 1)``
+               - ``x * 15`` (lossy when ≥1)
+             * - ``plddt``
+               - [0, 100]
+               - ``x / 100``
+               - ``x * 100``
+             * - ``plddt_disorder``
+               - {0, 1}
+               - identity
+               - identity
+             * - ``plddt_tier``
+               - {0, 1} (4-dim one-hot)
+               - identity
+               - identity
+             * - ``chi1_sincos`` / ``chi2_sincos``
+               - [-1, 1]
+               - ``(x + 1) / 2``
+               - ``x * 2 - 1`` (in [-1, 1])
+             * - ``ca_centroid_dist``
+               - [0, ~40] Å
+               - ``clip(x / 40, 0, 1)``
+               - ``x * 40`` (lossy when ≥1)
+             * - ``ca_centroid_dist_norm``
+               - [0, ~2] (Rg units)
+               - ``clip(x / 2, 0, 1)``
+               - ``x * 2`` (lossy when ≥1)
+             * - ``contact_count_8A``
+               - [0, ~30]
+               - ``clip(x / 30, 0, 1)``
+               - ``x * 30`` (lossy when ≥1)
+             * - ``contact_count_12A``
+               - [0, ~80]
+               - ``clip(x / 80, 0, 1)``
+               - ``x * 80`` (lossy when ≥1)
+             * - ``hse``
+               - [0, ~30]
+               - ``clip(x / 30, 0, 1)``
+               - ``x * 30`` (lossy when ≥1)
+             * - ``pae_row_*`` / ``pae_local_mean`` / ``pae_distal_mean`` / ``pae_band_means``
+               - [0, 31.75] Å
+               - ``clip(x / 31.75, 0, 1)``
+               - ``x * 31.75``
+             * - ``pae_asymmetry``
+               - [0, ~10] Å
+               - ``clip(x / 10, 0, 1)``
+               - ``x * 10`` (lossy when ≥1)
+
+          The recipes are the source of truth in
+          ``feature_registry.NORMALIZATION_RECIPES``; this table is generated
+          to match.
+
+        * **Feature categorization.** Every feature key emits
+          ``category='Structure'`` (the top-level redundancy / color bucket;
+          see ``ut.DICT_COLOR_CAT['Structure']`` = ``#2E6E5E`` deep teal-green).
+          The fine-grained split (``Secondary structure (3-state)``,
+          ``B-factor (CA mean)``, ``AlphaFold pLDDT (raw)``, etc.) lives in
+          ``subcategory`` and is what ``CPPPlot.feature_map`` displays on the
+          y-axis. Subcategory names follow the AAontology convention
+          (descriptive name with source / detail in parentheses). The redundancy filter's
+          ``check_cat=True`` arm therefore groups all Structure features into
+          one bucket; ``build_scales`` populates ``df_scales`` so the
+          ``max_cor`` gate can discriminate within that bucket.
+        * Requires ``aaanalysis[pro]`` (biopython) plus a ``mkdssp`` / ``dssp``
+          binary on PATH. The ``depth`` feature additionally requires the
+          ``msms`` binary; install via ``conda install -c bioconda msms``.
+        * Single-chain PDBs only — the chain whose ATOM sequence best matches
+          ``df_seq[sequence]`` is selected automatically.
+
+        See Also
+        --------
+        * :class:`EmbeddingPreprocessor`: the PLM-embedding analog.
+        * :class:`AnnotationPreprocessor`: the PTM / functional-site analog.
+        * :class:`NumericalFeature` and :class:`CPP`: the downstream consumers.
+        * :func:`aaanalysis.combine_dict_nums`: stitch multiple dict_nums.
+
+        Examples
+        --------
+        .. include:: examples/strp_encode_pdb.rst
+        """
+        self._verbose = ut.check_verbose(verbose)
+
+    # ------------------------------------------------------------------
+    # fetch_alphafold
+    # ------------------------------------------------------------------
+    def fetch_alphafold(
+        self,
+        df_seq: pd.DataFrame,
+        out_folder: Union[str, Path],
+        file_format: Literal["pdb", "cif"] = "pdb",
+        timeout: float = 30.0,
+        skip_existing: bool = True,
+        on_failure: Literal["nan", "drop", "raise"] = "nan",
+        return_df: bool = False,
+        max_workers: Optional[int] = None,
+    ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
+        """Download AlphaFold model + Predicted Aligned Error (PAE) files for
+        every entry into a folder.
+
+        Fetches each entry's F1 structure and PAE sidecar from the AlphaFold
+        Protein Structure Database [Varadi22]_ (https://alphafold.ebi.ac.uk),
+        saving them under the canonical filenames :meth:`encode_pdb` /
+        :meth:`encode_pae` / :meth:`get_dssp` already resolve — so a single call
+        populates the ``pdb_folder`` / ``pae_folder`` those methods consume. The
+        download URLs are resolved through the AlphaFold API, so the fetch tracks
+        the current data version automatically (the file naming moved
+        ``v4`` → ``v6`` and will move again). This is the ``fetch_`` (web)
+        acquisition counterpart to the local ``get_`` tools; it downloads all
+        entries in one bulk call.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein
+            identifiers (UniProt accessions). The ``entry`` values are used as
+            the AlphaFold-DB accessions to download.
+        out_folder : str or pathlib.Path
+            Destination directory for the downloaded files. Its parent must
+            exist; the leaf directory is created if absent.
+        file_format : {'pdb', 'cif'}, default='pdb'
+            Structure file type to download from AlphaFold DB (both are accepted
+            by the downstream resolvers):
+
+            - ``'pdb'``: legacy Protein Data Bank format; matches the
+              ``encode_pdb`` / ``get_dssp`` examples.
+            - ``'cif'``: Crystallographic Information File (mmCIF), the modern
+              format without the line/column limits that constrain ``'pdb'`` for
+              very large structures.
+        timeout : float, default=30.0
+            Per-request timeout in seconds.
+        skip_existing : bool, default=True
+            If ``True``, an entry whose model and PAE files both already exist
+            in ``out_folder`` is not re-downloaded; an entry with only one of
+            the two present re-fetches only the missing file.
+        on_failure : {'nan', 'drop', 'raise'}, default='nan'
+            Policy for entries missing from AlphaFold DB (a 404 on either
+            file): ``'nan'`` keeps the row marked not-ok; ``'drop'`` removes it
+            from the returned status; ``'raise'`` raises ``RuntimeError``.
+        return_df : bool, default=False
+            If ``True``, also return an echo of ``df_seq`` with an appended
+            boolean ``alphafold_ok`` column as a second element.
+        max_workers : int, optional
+            Number of threads for concurrent downloads. ``None`` or ``1``
+            (default) fetches entries sequentially. Greater than ``1`` downloads
+            on a thread pool; the status table is reassembled in input order and
+            is identical to the sequential result. Concurrency is opt-in because
+            parallel requests to AlphaFold DB risk HTTP-429 throttling that can
+            turn successful downloads into failures.
+
+        Returns
+        -------
+        df_status : pd.DataFrame, shape (n_samples, 7)
+            Per-entry download status with columns ``entry, model_ok, pae_ok,
+            alphafold_ok, skipped, model_path, pae_path``.
+        df_seq_out : pd.DataFrame
+            Returned only when ``return_df=True``. Echo of ``df_seq`` plus a
+            boolean ``alphafold_ok`` column.
+
+        Notes
+        -----
+        * Only single-fragment models are fetched (the canonical
+          ``AF-<entry>-F1-…-v4`` filenames). Proteins fragmented across ``F2``,
+          ``F3``, … in AlphaFold DB have no ``F1`` model and are reported as
+          not-ok.
+        * Network failures other than a 404 (timeout, 5xx) raise
+          ``RuntimeError`` and abort the bulk download — they are not absorbed
+          by ``on_failure``, which governs only the missing-from-AlphaFold
+          Database (AF-DB) case.
+
+        Raises
+        ------
+        ValueError
+            On invalid arguments.
+        RuntimeError
+            On network / response failure, or if any entry is missing under
+            ``on_failure='raise'``.
+
+        Examples
+        --------
+        .. include:: examples/strp_fetch_alphafold.rst
+        """
+        # Validate
+        verbose = self._verbose
+        ut.check_df_seq(df_seq=df_seq)
+        if out_folder is None:
+            raise ValueError("'out_folder' should not be None")
+        ut.check_str_options(name="file_format", val=file_format,
+                             list_str_options=["pdb", "cif"])
+        ut.check_number_range(name="timeout", val=timeout, min_val=1,
+                              just_int=False)
+        ut.check_bool(name="skip_existing", val=skip_existing)
+        _check_handle_failure(on_failure)
+        ut.check_bool(name="return_df", val=return_df)
+        if max_workers is not None:
+            ut.check_number_range(name="max_workers", val=max_workers,
+                                  min_val=1, just_int=True)
+        if COL_ALPHAFOLD_OK in df_seq.columns:
+            raise ValueError(
+                f"'df_seq' should not already contain a "
+                f"'{COL_ALPHAFOLD_OK}' column. Drop it before calling "
+                f"fetch_alphafold.")
+        entries = df_seq[ut.COL_ENTRY].tolist()
+        for entry in entries:
+            _check_entry_is_filesystem_safe(entry)
+        # Prepare output folder (parent must exist; leaf is created)
+        out_folder = Path(out_folder)
+        if not out_folder.parent.exists():
+            raise ValueError(
+                f"'out_folder' ({out_folder}) should have an existing parent "
+                f"directory")
+        out_folder.mkdir(exist_ok=True)
+        # Download
+        df_status = fetch_alphafold_bulk(
+            entries=entries, out_folder=out_folder, file_format=file_format,
+            timeout=timeout, skip_existing=skip_existing, verbose=verbose,
+            max_workers=max_workers)
+        ok_per_row = df_status[COL_ALPHAFOLD_OK].tolist()
+        df_status, ok_after, keep_idx = _drop_or_raise_failed_entries(
+            df_seq=df_status, ok_per_row=ok_per_row, on_failure=on_failure,
+            source_label="fetch_alphafold")
+        if not return_df:
+            return df_status
+        df_seq_out = df_seq.iloc[keep_idx].reset_index(drop=True).copy()
+        df_seq_out[COL_ALPHAFOLD_OK] = ok_after
+        return df_status, df_seq_out
+
+    # ------------------------------------------------------------------
+    # get_dssp
+    # ------------------------------------------------------------------
+    def get_dssp(
+        self,
+        df_seq: pd.DataFrame,
+        pdb_folder: Union[str, Path],
+        features: Optional[List[str]] = None,
+        ss_mode: Literal["ss3", "ss8"] = "ss3",
+        gap_handling: Literal["pad", "omit"] = "pad",
+    ) -> pd.DataFrame:
+        """Run Define Secondary Structure of Proteins (DSSP) and append
+        per-residue list columns to ``df_seq``.
+
+        Runs the DSSP algorithm [Kabsch83]_ (via the ``mkdssp`` binary
+        [Touw15]_) on each entry's PDB file and aligns the output to the
+        target sequence in ``df_seq``, appending per-residue list columns
+        (secondary structure, Accessible Surface Area (ASA), backbone
+        dihedrals, hydrogen bonds) plus a boolean ``dssp_ok`` flag. The result
+        is the intermediate input that :meth:`encode_dssp` consumes; call this
+        method first to inspect the raw DSSP streams before encoding.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein
+            identifiers and a ``sequence`` column with full protein sequences.
+            ``entry`` is used as the PDB-file basename (``<entry>.pdb``) and
+            ``sequence`` is the target sequence to which DSSP output is
+            aligned.
+        pdb_folder : str or pathlib.Path
+            Directory containing one ``<entry>.pdb`` file per row of
+            ``df_seq``. Missing files emit a ``UserWarning`` and produce
+            ``dssp_ok=False`` for that row.
+        features : list of str, default=['ss', 'asa', 'phi_psi', 'hbonds']
+            Which DSSP feature streams to extract. Any subset of
+            ``{'ss', 'asa', 'phi_psi', 'hbonds'}``. Only the requested columns are
+            appended; ``dssp_ok`` is always appended.
+        ss_mode : {'ss3', 'ss8'}, default='ss3'
+            Secondary-structure encoding for the ``ss`` column.
+        gap_handling : {'pad', 'omit'}, default='pad'
+            How to handle positions without DSSP coverage. ``'pad'``
+            preserves length-alignment to ``df_seq[sequence]`` and fills
+            with ``ut.STR_SS_GAP`` / NaN; ``'omit'`` drops them across all
+            requested streams simultaneously.
+
+        Returns
+        -------
+        df_out : pd.DataFrame
+            A copy of ``df_seq`` with appended list columns for each
+            requested feature stream plus a boolean ``dssp_ok`` column.
+
+        Raises
+        ------
+        RuntimeError
+            If ``mkdssp`` / ``dssp`` is not on PATH.
+        ValueError
+            On invalid arguments or pre-existing output columns in ``df_seq``.
+
+        Examples
+        --------
+        .. include:: examples/strp_get_dssp.rst
+        """
+        # Validate
+        verbose = self._verbose
+        ut.check_df_seq(df_seq=df_seq)
+        if ut.COL_SEQ not in df_seq.columns:
+            raise ValueError(
+                f"'df_seq' should contain a '{ut.COL_SEQ}' column for "
+                f"get_dssp")
+        _check_no_get_dssp_collisions(df_seq)
+        if pdb_folder is None:
+            raise ValueError("'pdb_folder' should not be None")
+        ut.check_folder_path_exists(folder_path=str(pdb_folder),
+                                    name="pdb_folder")
+        if features is None:
+            features = list(_LIST_GET_DSSP_FEATURES)
+        _check_get_dssp_features(features)
+        ut.check_str_options(name="ss_mode", val=ss_mode,
+                             list_str_options=ut.LIST_SS_MODES)
+        ut.check_str_options(name="gap_handling", val=gap_handling,
+                             list_str_options=ut.LIST_GAP_HANDLING)
+        ut.check_bool(name="verbose", val=verbose)
+        # Run
+        return _run_get_dssp_internal(
+            df_seq=df_seq, pdb_folder=pdb_folder, features=features,
+            ss_mode=ss_mode, gap_handling=gap_handling, verbose=verbose)
+
+    # ------------------------------------------------------------------
+    # encode_dssp
+    # ------------------------------------------------------------------
+    def encode_dssp(
+        self,
+        df_seq: pd.DataFrame,
+        pdb_folder: Optional[Union[str, Path]] = None,
+        *,
+        features: List[str],
+        ss_mode: Literal["ss3", "ss8"] = "ss3",
+        gap_handling: Literal["pad", "omit"] = "pad",
+        on_failure: Literal["nan", "drop", "raise"] = "nan",
+        return_df: bool = False,
+    ) -> Union[Dict[str, np.ndarray], Tuple[Dict[str, np.ndarray], pd.DataFrame]]:
+        """Run Define Secondary Structure of Proteins (DSSP) and the per-feature
+        encoders to build a ``[0, 1]``-normalized ``dict_dssp``.
+
+        DSSP [Kabsch83]_ assigns per-residue secondary structure (SS), solvent
+        accessibility, and backbone hydrogen-bond geometry from a 3D structure. This
+        method runs it (via the ``mkdssp`` binary [Touw15]_, or reuses the columns
+        already produced by :meth:`get_dssp`) and encodes the chosen ``features``
+        into the ``[0, 1]``-normalized per-residue ``dict_num`` that
+        :meth:`CPP.run_num` consumes. It is the DSSP-side companion of
+        :meth:`encode_pdb` (ATOM-record features) and :meth:`encode_pae`
+        (AlphaFold Predicted Aligned Error (PAE)); stack their outputs with
+        :func:`aaanalysis.combine_dict_nums`.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein
+            identifiers and a ``sequence`` column with full protein sequences.
+            Pre-computed DSSP columns (from :meth:`get_dssp`) are reused if
+            present; otherwise DSSP is run inline.
+        pdb_folder : str or pathlib.Path
+            Directory containing one ``<entry>.pdb`` file per row. Required
+            when ``df_seq`` does not already carry the necessary DSSP
+            columns.
+        features : list of str
+            Feature keys from the StructurePreprocessor registry that belong
+            to ``encode_dssp``: any subset of
+            ``{'ss3', 'ss8', 'rasa', 'phi_psi_sincos', 'hbond_donor', 'hbond_acceptor'}``.
+            Each key's output is normalized to ``[0, 1]`` per the registry's
+            ``NORMALIZATION_RECIPES`` (de-normalization table in the class ``Notes``).
+        ss_mode : {'ss3', 'ss8'}, default='ss3'
+            Forwarded to :meth:`get_dssp` when DSSP is run inline. The chosen
+            SS feature key (``'ss3'`` / ``'ss8'``) drives the actual one-hot
+            dimensionality independently of this option.
+        gap_handling : {'pad', 'omit'}, default='pad'
+            Forwarded to :meth:`get_dssp` when DSSP is run inline.
+        on_failure : {'nan', 'drop', 'raise'}, default='nan'
+            What to do for entries whose DSSP run failed. ``'nan'`` fills
+            with NaN-only tensors; ``'drop'`` removes failed entries from
+            the output dict; ``'raise'`` raises ``RuntimeError`` if any
+            entry failed.
+        return_df : bool, default=False
+            If ``True``, also return the per-row status DataFrame as a second
+            element ``(dict_num, df_seq_out)``. If ``False`` (default), return
+            only ``dict_num``.
+
+        Returns
+        -------
+        dict_dssp : dict[str, np.ndarray]
+            ``{entry: (L_entry, D_total) ndarray}`` per-residue DSSP
+            features concatenated in the order of ``features``. Values are in
+            ``[0, 1]`` (NaN for unresolved positions).
+        df_seq_out : pd.DataFrame
+            Returned only when ``return_df=True``. Echo of the (possibly
+            DSSP-augmented) ``df_seq`` plus an ``encode_dssp_ok`` column
+            flagging per-row success. Rows are dropped when
+            ``on_failure='drop'``.
+
+        Raises
+        ------
+        ValueError
+            On invalid arguments or feature keys not in this method's
+            registry slice.
+        RuntimeError
+            If ``mkdssp`` is unavailable, or if any entry failed under
+            ``on_failure='raise'``.
+
+        Examples
+        --------
+        .. include:: examples/strp_encode_dssp.rst
+        """
+        verbose = self._verbose
+        ut.check_df_seq(df_seq=df_seq)
+        if ut.COL_SEQ not in df_seq.columns:
+            raise ValueError(
+                f"'df_seq' should contain a '{ut.COL_SEQ}' column for "
+                f"encode_dssp")
+        validate_feature_keys(features, allowed_method=ENCODER_DSSP)
+        ut.check_str_options(name="ss_mode", val=ss_mode,
+                             list_str_options=ut.LIST_SS_MODES)
+        ut.check_str_options(name="gap_handling", val=gap_handling,
+                             list_str_options=ut.LIST_GAP_HANDLING)
+        _check_handle_failure(on_failure)
+        ut.check_bool(name="verbose", val=verbose)
+        ut.check_bool(name="return_df", val=return_df)
+        get_dssp_kinds = _dssp_features_to_get_dssp_kinds(features)
+        if pdb_folder is None:
+            needed = []
+            if "ss" in get_dssp_kinds:
+                needed.append(ut.COL_SS)
+            if "asa" in get_dssp_kinds:
+                needed.append(_COL_ASA)
+            if "phi_psi" in get_dssp_kinds:
+                needed.extend([_COL_PHI, _COL_PSI])
+            if "hbonds" in get_dssp_kinds:
+                needed.extend([_COL_HBOND_DONOR_OFFSET, _COL_HBOND_DONOR_ENERGY,
+                               _COL_HBOND_ACCEPTOR_OFFSET, _COL_HBOND_ACCEPTOR_ENERGY])
+            missing = [c for c in needed if c not in df_seq.columns]
+            if missing:
+                raise ValueError(
+                    f"'pdb_folder' (None) should be a directory path when "
+                    f"'df_seq' lacks DSSP columns "
+                    f"(missing: {missing})")
+        else:
+            ut.check_folder_path_exists(folder_path=str(pdb_folder),
+                                        name="pdb_folder")
+        # Ensure DSSP columns are present
+        df_aug = _ensure_dssp_columns(
+            df_seq=df_seq, features_get_dssp=get_dssp_kinds,
+            pdb_folder=pdb_folder, ss_mode=ss_mode,
+            gap_handling=gap_handling, verbose=verbose)
+        # Apply on_failure policy
+        if ut.COL_DSSP_OK in df_aug.columns:
+            ok = df_aug[ut.COL_DSSP_OK].tolist()
+        else:
+            ok = [True] * len(df_aug)
+        df_aug, ok, _ = _drop_or_raise_failed_entries(
+            df_seq=df_aug, ok_per_row=ok, on_failure=on_failure,
+            source_label="DSSP")
+        # Encode per entry
+        entries = df_aug[ut.COL_ENTRY].tolist()
+        sequences = df_aug[ut.COL_SEQ].tolist()
+        ss_col = df_aug[ut.COL_SS].tolist() if ut.COL_SS in df_aug.columns else None
+        asa_col = df_aug[_COL_ASA].tolist() if _COL_ASA in df_aug.columns else None
+        phi_col = df_aug[_COL_PHI].tolist() if _COL_PHI in df_aug.columns else None
+        psi_col = df_aug[_COL_PSI].tolist() if _COL_PSI in df_aug.columns else None
+        hb_d_off_col = (df_aug[_COL_HBOND_DONOR_OFFSET].tolist()
+                        if _COL_HBOND_DONOR_OFFSET in df_aug.columns else None)
+        hb_d_en_col = (df_aug[_COL_HBOND_DONOR_ENERGY].tolist()
+                       if _COL_HBOND_DONOR_ENERGY in df_aug.columns else None)
+        hb_a_off_col = (df_aug[_COL_HBOND_ACCEPTOR_OFFSET].tolist()
+                        if _COL_HBOND_ACCEPTOR_OFFSET in df_aug.columns else None)
+        hb_a_en_col = (df_aug[_COL_HBOND_ACCEPTOR_ENERGY].tolist()
+                       if _COL_HBOND_ACCEPTOR_ENERGY in df_aug.columns else None)
+        D_total = get_total_dims(features)
+        dict_dssp: Dict[str, np.ndarray] = {}
+        for i, (entry, seq, is_ok) in enumerate(zip(entries, sequences, ok)):
+            L = len(seq)
+            if not is_ok:
+                dict_dssp[entry] = np.full((L, D_total), np.nan,
+                                           dtype=np.float64)
+                continue
+            blocks: List[np.ndarray] = []
+            for key in features:
+                if key in ("ss3", "ss8"):
+                    if ss_col is None:
+                        raise RuntimeError(
+                            f"Internal: 'ss' column missing for feature "
+                            f"key {key!r}")
+                    blocks.append(encode_ss(
+                        ss_list=ss_col[i], feature_key=key))
+                elif key == "rasa":
+                    if asa_col is None:
+                        raise RuntimeError(
+                            f"Internal: 'asa' column missing for feature "
+                            f"key {key!r}")
+                    blocks.append(encode_rasa(
+                        asa_list=asa_col[i], sequence=seq))
+                elif key == "phi_psi_sincos":
+                    if phi_col is None or psi_col is None:
+                        raise RuntimeError(
+                            f"Internal: 'phi'/'psi' columns missing for "
+                            f"feature key {key!r}")
+                    blocks.append(encode_dihedrals_sincos(
+                        phi_list=phi_col[i], psi_list=psi_col[i]))
+                elif key == "hbond_donor":
+                    if hb_d_off_col is None or hb_d_en_col is None:
+                        raise RuntimeError(
+                            f"Internal: H-bond donor columns missing for "
+                            f"feature key {key!r}")
+                    blocks.append(encode_hbond_donor(
+                        offset_list=hb_d_off_col[i],
+                        energy_list=hb_d_en_col[i]))
+                elif key == "hbond_acceptor":
+                    if hb_a_off_col is None or hb_a_en_col is None:
+                        raise RuntimeError(
+                            f"Internal: H-bond acceptor columns missing for "
+                            f"feature key {key!r}")
+                    blocks.append(encode_hbond_acceptor(
+                        offset_list=hb_a_off_col[i],
+                        energy_list=hb_a_en_col[i]))
+                else:
+                    raise RuntimeError(
+                        f"Internal: feature key {key!r} not in encode_dssp "
+                        f"alphabet")
+            dict_dssp[entry] = np.concatenate(blocks, axis=1) \
+                if len(blocks) > 1 else blocks[0]
+        df_out = df_aug.copy()
+        df_out["encode_dssp_ok"] = list(ok)
+        return (dict_dssp, df_out) if return_df else dict_dssp
+
+    # ------------------------------------------------------------------
+    # encode_pdb
+    # ------------------------------------------------------------------
+    def encode_pdb(
+        self,
+        df_seq: pd.DataFrame,
+        pdb_folder: Union[str, Path],
+        features: List[str],
+        plddt_disorder_threshold: float = 70.0,
+        on_failure: Literal["nan", "drop", "raise"] = "nan",
+        return_df: bool = False,
+    ) -> Union[Dict[str, np.ndarray], Tuple[Dict[str, np.ndarray], pd.DataFrame]]:
+        """Extract per-residue features from PDB ATOM records into ``dict_pdb``.
+
+        Reads geometric and confidence features straight from a structure's ATOM
+        records — experimental ``bfactor`` / residue ``depth`` (the latter via the
+        ``msms`` surface program [Sanner96]_) and AlphaFold [Jumper21]_ model-file
+        features (``plddt`` confidence, sidechain ``chi*_sincos``, contacts, …) —
+        and encodes the chosen ``features`` into the ``[0, 1]``-normalized
+        per-residue ``dict_num`` that :meth:`CPP.run_num` consumes. It is the
+        ATOM-side companion of :meth:`encode_dssp` and :meth:`encode_pae`; stack
+        their outputs with :func:`aaanalysis.combine_dict_nums`.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein
+            identifiers and a ``sequence`` column with full protein sequences.
+            ``entry`` is the PDB-file basename; ``sequence`` is the target
+            sequence used for chain selection and alignment.
+        pdb_folder : str or pathlib.Path
+            Directory containing one ``<entry>.pdb`` file per row of
+            ``df_seq``.
+        features : list of str
+            Feature keys from the StructurePreprocessor registry that belong
+            to ``encode_pdb``: any subset of ``{bfactor, depth, plddt,
+            plddt_disorder, plddt_tier, chi1_sincos, chi2_sincos,
+            ca_centroid_dist, ca_centroid_dist_norm, contact_count_8A,
+            contact_count_12A, hse, disulfide}``. The ``depth`` feature
+            requires the external ``msms`` binary on PATH; when it is absent
+            (or a per-entry encoder raises) only that feature's column(s) are
+            filled with NaN and the other features are kept (per-feature
+            isolation), unless ``on_failure='raise'``.
+        plddt_disorder_threshold : float, default=70.0
+            predicted Local Distance Difference Test (pLDDT) cutoff (in
+            ``[0, 100]``) for the ``plddt_disorder`` feature: a residue whose
+            AlphaFold pLDDT is below this value is flagged disordered (``1.0``),
+            else ordered (``0.0``).
+        on_failure : {'nan', 'drop', 'raise'}, default='nan'
+            Failure policy. Two independent failure axes are handled:
+
+            - **Entry-level** (missing file, unparseable structure, no matched
+              chain): ``'nan'`` fills the whole entry with NaN and sets
+              ``pdb_ok=False``; ``'drop'`` removes the entry; ``'raise'``
+              re-raises.
+            - **Feature-level** (a single feature is unavailable — e.g.
+              ``depth`` without ``msms`` — or its encoder raises for an entry):
+              under ``'nan'`` / ``'drop'`` only that feature's column(s) are
+              NaN-filled while every other feature is kept and the entry is
+              retained (``pdb_ok`` stays ``True``); one ``UserWarning`` names
+              each isolated feature. Under ``'raise'`` any feature failure
+              re-raises.
+        return_df : bool, default=False
+            If ``True``, also return the per-row status DataFrame as a second
+            element ``(dict_num, df_seq_out)``. If ``False`` (default), return
+            only ``dict_num``.
+
+        Returns
+        -------
+        dict_pdb : dict[str, np.ndarray]
+            ``{entry: (L_entry, D_total) ndarray}`` per-residue PDB
+            features concatenated in the order of ``features``.
+        df_seq_out : pd.DataFrame
+            Returned only when ``return_df=True``. Echo of ``df_seq`` plus a
+            boolean ``pdb_ok`` column.
+
+        Raises
+        ------
+        ValueError
+            On invalid arguments.
+        RuntimeError
+            Only under ``on_failure='raise'``: if ``msms`` is not installed
+            and ``'depth'`` is requested, if a per-feature encoder raises, or
+            if any entry failed at the entry level. Under ``'nan'`` / ``'drop'``
+            these are isolated (NaN-filled) instead.
+
+        Examples
+        --------
+        .. include:: examples/strp_encode_pdb.rst
+        """
+        verbose = self._verbose
+        ut.check_df_seq(df_seq=df_seq)
+        if ut.COL_SEQ not in df_seq.columns:
+            raise ValueError(
+                f"'df_seq' should contain a '{ut.COL_SEQ}' column for "
+                f"encode_pdb")
+        _check_no_pdb_ok_collision(df_seq)
+        if pdb_folder is None:
+            raise ValueError("'pdb_folder' should not be None")
+        ut.check_folder_path_exists(folder_path=str(pdb_folder),
+                                    name="pdb_folder")
+        validate_feature_keys(features, allowed_method=ENCODER_PDB)
+        _check_handle_failure(on_failure)
+        ut.check_bool(name="verbose", val=verbose)
+        ut.check_bool(name="return_df", val=return_df)
+        ut.check_number_range(name="plddt_disorder_threshold",
+                              val=plddt_disorder_threshold,
+                              min_val=0.0, max_val=100.0, just_int=False)
+        # Per-feature availability (issue #340): 'depth' needs the external
+        # 'msms' binary. Under on_failure='raise' a missing binary is fatal
+        # (with an install hint); otherwise isolate 'depth' to its own NaN
+        # column(s) and keep every other feature, warning once after the loop.
+        unavailable_features: Dict[str, str] = {}
+        if "depth" in features and not is_msms_available():
+            if on_failure == "raise":
+                check_msms_available()  # raises RuntimeError with install hint
+            unavailable_features["depth"] = (
+                "'msms' binary not found on PATH (install via "
+                "`conda install -c bioconda msms`)")
+        # Per-(entry, feature) encoder failures, aggregated across entries so
+        # each failing feature triggers exactly one warning.
+        failed_features: Dict[str, str] = {}
+        pdb_folder = Path(pdb_folder)
+        entries = df_seq[ut.COL_ENTRY].tolist()
+        sequences = df_seq[ut.COL_SEQ].tolist()
+        D_total = get_total_dims(features)
+        dict_pdb: Dict[str, np.ndarray] = {}
+        ok_per_row: List[bool] = []
+        # Session-scoped temp dir for any gz decompression done by the
+        # file-format resolver (.pdb.gz / .cif.gz). Cleaned at function end.
+        session_tmp = tempfile.TemporaryDirectory()
+        session_tmp_path = Path(session_tmp.name)
+        for entry, seq in zip(entries, sequences):
+            _check_entry_is_filesystem_safe(entry)
+            L = len(seq)
+            pdb_path, _file_fmt = resolve_structure_path(
+                folder=pdb_folder, entry=entry, temp_dir=session_tmp_path)
+            if pdb_path is None:
+                warnings.warn(
+                    f"Structure file for entry '{entry}' not found in "
+                    f"'{pdb_folder}' (tried .pdb/.pdb.gz/.cif/.cif.gz); "
+                    f"row will have pdb_ok=False",
+                    UserWarning)
+                dict_pdb[entry] = np.full((L, D_total), np.nan,
+                                          dtype=np.float64)
+                ok_per_row.append(False)
+                continue
+            try:
+                structure = load_structure(pdb_path)
+            except Exception as e:
+                warnings.warn(
+                    f"PDB parse failed for entry '{entry}': {e}; "
+                    f"row will have pdb_ok=False",
+                    UserWarning)
+                dict_pdb[entry] = np.full((L, D_total), np.nan,
+                                          dtype=np.float64)
+                ok_per_row.append(False)
+                continue
+            # Collect the structure's amino-acid chains and pick the best match
+            # for this sequence at most ONCE per entry, then share that
+            # (chain, residues, atom_seq, identity) across every encoder rather
+            # than re-walking the structure ~13x. The pick is a deterministic
+            # function of (structure, seq), so sharing is byte-identical to
+            # per-encoder recompute. ``_resolve_best_chain`` returns a
+            # (None, ...) tuple for a structure with no amino-acid chains
+            # instead of raising; the encoders map that to an all-NaN block, so
+            # it is not an entry-level failure.
+            chain_pick = _resolve_best_chain(structure, seq)
+            # The per-residue pLDDT read (structure walk + alignment) is shared
+            # across the three pLDDT keys, computed at most once per entry.
+            plddt_shared = None
+            plddt_done = False
+            blocks: List[np.ndarray] = []
+            for key in features:
+                num_dims = REGISTRY[key]["num_dims"]
+                # Feature globally unavailable (e.g. 'depth' without msms):
+                # isolate it to its own NaN column(s), keep the rest.
+                if key in unavailable_features:
+                    blocks.append(_nan_feature_block(L, num_dims))
+                    continue
+                try:
+                    if key == "bfactor":
+                        block, identity = encode_bfactor(
+                            structure, seq, chain_pick=chain_pick)
+                    elif key == "depth":
+                        block, identity = encode_depth(
+                            structure, seq, chain_pick=chain_pick)
+                    elif key == "plddt":
+                        if not plddt_done:
+                            plddt_shared = _plddt_per_residue(
+                                structure, seq, chain_pick)
+                            plddt_done = True
+                        block, identity = encode_plddt(structure, seq,
+                                                       plddt=plddt_shared)
+                    elif key == "plddt_disorder":
+                        if not plddt_done:
+                            plddt_shared = _plddt_per_residue(
+                                structure, seq, chain_pick)
+                            plddt_done = True
+                        block, identity = encode_plddt_disorder(
+                            structure, seq,
+                            threshold=plddt_disorder_threshold,
+                            plddt=plddt_shared)
+                    elif key == "plddt_tier":
+                        if not plddt_done:
+                            plddt_shared = _plddt_per_residue(
+                                structure, seq, chain_pick)
+                            plddt_done = True
+                        block, identity = encode_plddt_tier(
+                            structure, seq, plddt=plddt_shared)
+                    elif key == "chi1_sincos":
+                        block, identity = encode_chi1_sincos(
+                            structure, seq, chain_pick=chain_pick)
+                    elif key == "chi2_sincos":
+                        block, identity = encode_chi2_sincos(
+                            structure, seq, chain_pick=chain_pick)
+                    elif key == "ca_centroid_dist":
+                        block, identity = encode_ca_centroid_dist(
+                            structure, seq, chain_pick=chain_pick)
+                    elif key == "ca_centroid_dist_norm":
+                        block, identity = encode_ca_centroid_dist_norm(
+                            structure, seq, chain_pick=chain_pick)
+                    elif key == "contact_count_8A":
+                        block, identity = encode_contact_count_8A(
+                            structure, seq, chain_pick=chain_pick)
+                    elif key == "contact_count_12A":
+                        block, identity = encode_contact_count_12A(
+                            structure, seq, chain_pick=chain_pick)
+                    elif key == "hse":
+                        block, identity = encode_hse(
+                            structure, seq, chain_pick=chain_pick)
+                    elif key == "disulfide":
+                        block, identity = encode_disulfide(
+                            structure, seq, chain_pick=chain_pick)
+                    else:
+                        raise RuntimeError(
+                            f"Internal: feature key {key!r} not in "
+                            f"encode_pdb alphabet")
+                    blocks.append(block)
+                    if verbose:
+                        ut.print_out(
+                            f"   encode_pdb: entry={entry}, key={key}, "
+                            f"identity={identity:.3f}, n_res={block.shape[0]}")
+                except RuntimeError as e:
+                    # Per-feature isolation (issue #340): NaN only this
+                    # feature's column(s) for this entry; keep the others.
+                    if on_failure == "raise":
+                        raise
+                    blocks.append(_nan_feature_block(L, num_dims))
+                    failed_features.setdefault(key, str(e))
+            arr = np.concatenate(blocks, axis=1) if len(blocks) > 1 \
+                else blocks[0]
+            dict_pdb[entry] = arr
+            ok_per_row.append(True)
+        _warn_isolated_features(unavailable_features, failed_features,
+                                source_label="PDB")
+        # Apply on_failure policy
+        df_aug = df_seq.copy()
+        df_aug[_COL_PDB_OK] = ok_per_row
+        df_aug, ok_after, keep_idx = _drop_or_raise_failed_entries(
+            df_seq=df_aug, ok_per_row=ok_per_row, on_failure=on_failure,
+            source_label="encode_pdb")
+        if on_failure == "drop":
+            kept_entries = {entries[i] for i in keep_idx}
+            dict_pdb = {k: v for k, v in dict_pdb.items() if k in kept_entries}
+        session_tmp.cleanup()
+        return (dict_pdb, df_aug) if return_df else dict_pdb
+
+    # ------------------------------------------------------------------
+    # encode_pae
+    # ------------------------------------------------------------------
+    def encode_pae(
+        self,
+        df_seq: pd.DataFrame,
+        pae_folder: Union[str, Path],
+        features: List[str],
+        local_window: int = 5,
+        pae_band_edges: Tuple[int, int] = (5, 15),
+        on_failure: Literal["nan", "drop", "raise"] = "nan",
+        return_df: bool = False,
+    ) -> Union[Dict[str, np.ndarray], Tuple[Dict[str, np.ndarray], pd.DataFrame]]:
+        """Load AlphaFold PAE sidecar JSONs and produce ``dict_pae``.
+
+        The Predicted Aligned Error (PAE) is AlphaFold's [Jumper21]_ per-residue-pair
+        confidence map (the expected positional error, in Å). This method reads each
+        entry's L×L PAE matrix and collapses it into the ``[0, 1]``-normalized
+        per-residue summaries (row statistics, local vs distal means, asymmetry, band
+        means) that :meth:`CPP.run_num` consumes. It is the PAE-side companion of
+        :meth:`encode_dssp` and :meth:`encode_pdb`; stack their outputs with
+        :func:`aaanalysis.combine_dict_nums`.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein identifiers
+            and a ``sequence`` column with full protein sequences. The PAE matrix
+            shape ``(L, L)`` must equal ``len(sequence)``; mismatched rows
+            are treated as failures.
+        pae_folder : str or pathlib.Path
+            Directory containing one PAE JSON per row. The resolver tries,
+            in order: ``<entry>.json``, ``<entry>.json.gz``, and the AlphaFold
+            Database (AF-DB) canonical
+            ``AF-<entry>-F1-predicted_aligned_error_v4.json`` (and its ``.gz``
+            variant).
+        features : list of str
+            Feature keys belonging to ``encode_pae``: any subset of
+            ``{pae_row_mean, pae_row_min, pae_row_max, pae_local_mean,
+            pae_distal_mean, pae_asymmetry, pae_band_means}``. All outputs
+            normalized to ``[0, 1]`` (divisor 31.75 Å for most keys, 10 Å
+            for ``pae_asymmetry``).
+        local_window : int, default=5
+            Used by ``pae_local_mean`` / ``pae_distal_mean``. The ``±k``
+            window in residue positions for the local mean (self excluded);
+            distal mean takes the complement.
+        pae_band_edges : tuple of (int, int), default=(5, 15)
+            Used by ``pae_band_means`` only. Sequence-distance bins:
+            ``(0, edges[0]]``, ``(edges[0], edges[1]]``, ``(edges[1], L]``.
+        on_failure : {'nan', 'drop', 'raise'}, default='nan'
+            What to do for entries whose PAE load fails (missing sidecar,
+            malformed JSON, shape mismatch). If instead a single PAE encoder
+            raises for an otherwise-loaded entry, only that feature's
+            column(s) are NaN-filled (per-feature isolation) and one
+            ``UserWarning`` names it — unless ``on_failure='raise'``.
+        return_df : bool, default=False
+            If ``True``, also return the per-row status DataFrame as a second
+            element ``(dict_num, df_seq_out)``. If ``False`` (default), return
+            only ``dict_num``.
+
+        Returns
+        -------
+        dict_pae : dict[str, np.ndarray]
+            ``{entry: (L_entry, D_total) ndarray}`` per-residue PAE
+            features concatenated in the order of ``features``.
+        df_seq_out : pd.DataFrame
+            Returned only when ``return_df=True``. Echo of ``df_seq`` plus a
+            boolean ``pae_ok`` column.
+
+        Raises
+        ------
+        ValueError
+            On invalid arguments or feature keys not in this method's
+            registry slice.
+        RuntimeError
+            If any entry failed under ``on_failure='raise'``.
+
+        Examples
+        --------
+        .. include:: examples/strp_encode_pae.rst
+        """
+        verbose = self._verbose
+        ut.check_df_seq(df_seq=df_seq)
+        if ut.COL_SEQ not in df_seq.columns:
+            raise ValueError(
+                f"'df_seq' should contain a '{ut.COL_SEQ}' column for "
+                f"encode_pae")
+        if "pae_ok" in df_seq.columns:
+            raise ValueError(
+                f"'df_seq' should not already contain a 'pae_ok' column. "
+                f"Drop it before calling encode_pae.")
+        if pae_folder is None:
+            raise ValueError("'pae_folder' should not be None")
+        ut.check_folder_path_exists(folder_path=str(pae_folder),
+                                    name="pae_folder")
+        validate_feature_keys(features, allowed_method=ENCODER_PAE)
+        _check_handle_failure(on_failure)
+        ut.check_bool(name="verbose", val=verbose)
+        ut.check_bool(name="return_df", val=return_df)
+        ut.check_number_range(name="local_window", val=local_window,
+                              min_val=0, just_int=True)
+        if (not isinstance(pae_band_edges, (list, tuple))
+                or len(pae_band_edges) != 2):
+            raise ValueError(
+                f"'pae_band_edges' ({pae_band_edges!r}) should be a "
+                f"length-2 tuple of int with 0 < lo < hi")
+        lo, hi = pae_band_edges
+        ut.check_number_range(name="pae_band_edges[0]", val=lo,
+                              min_val=1, just_int=True)
+        ut.check_number_range(name="pae_band_edges[1]", val=hi,
+                              min_val=2, just_int=True)
+        if not lo < hi:
+            raise ValueError(
+                f"'pae_band_edges' ({pae_band_edges}) should satisfy "
+                f"edges[0] < edges[1]")
+        pae_folder = Path(pae_folder)
+        entries = df_seq[ut.COL_ENTRY].tolist()
+        sequences = df_seq[ut.COL_SEQ].tolist()
+        D_total = get_total_dims(features)
+        dict_pae: Dict[str, np.ndarray] = {}
+        ok_per_row: List[bool] = []
+        # Per-(entry, feature) encoder failures, aggregated so each failing
+        # feature warns once (issue #340 per-feature isolation).
+        failed_features: Dict[str, str] = {}
+        session_tmp = tempfile.TemporaryDirectory()
+        session_tmp_path = Path(session_tmp.name)
+        for entry, seq in zip(entries, sequences):
+            _check_entry_is_filesystem_safe(entry)
+            L = len(seq)
+            pae_path = resolve_pae_path(folder=pae_folder, entry=entry,
+                                        temp_dir=session_tmp_path)
+            if pae_path is None:
+                warnings.warn(
+                    f"PAE sidecar for entry '{entry}' not found in "
+                    f"'{pae_folder}' (tried .json/.json.gz/AF-DB canonical); "
+                    f"row will have pae_ok=False",
+                    UserWarning)
+                dict_pae[entry] = np.full((L, D_total), np.nan,
+                                          dtype=np.float64)
+                ok_per_row.append(False)
+                continue
+            try:
+                pae = load_pae_matrix(pae_path, expected_L=L)
+            except RuntimeError as e:
+                warnings.warn(
+                    f"PAE load failed for entry '{entry}': {e}; "
+                    f"row will have pae_ok=False",
+                    UserWarning)
+                dict_pae[entry] = np.full((L, D_total), np.nan,
+                                          dtype=np.float64)
+                ok_per_row.append(False)
+                continue
+            blocks: List[np.ndarray] = []
+            for key in features:
+                num_dims = REGISTRY[key]["num_dims"]
+                try:
+                    if key == "pae_row_mean":
+                        block = encode_pae_row_mean(pae)
+                    elif key == "pae_row_min":
+                        block = encode_pae_row_min(pae)
+                    elif key == "pae_row_max":
+                        block = encode_pae_row_max(pae)
+                    elif key == "pae_local_mean":
+                        block = encode_pae_local_mean(
+                            pae, local_window=local_window)
+                    elif key == "pae_distal_mean":
+                        block = encode_pae_distal_mean(
+                            pae, local_window=local_window)
+                    elif key == "pae_asymmetry":
+                        block = encode_pae_asymmetry(pae)
+                    elif key == "pae_band_means":
+                        block = encode_pae_band_means(
+                            pae, band_edges=tuple(pae_band_edges))
+                    else:
+                        raise RuntimeError(
+                            f"Internal: feature key {key!r} not in "
+                            f"encode_pae alphabet")
+                    blocks.append(block)
+                    if verbose:
+                        ut.print_out(
+                            f"   encode_pae: entry={entry}, key={key}, "
+                            f"L={L}")
+                except RuntimeError as e:
+                    # Per-feature isolation (issue #340): NaN only this
+                    # feature's column(s) for this entry; keep the others.
+                    if on_failure == "raise":
+                        raise
+                    blocks.append(_nan_feature_block(L, num_dims))
+                    failed_features.setdefault(key, str(e))
+            arr = np.concatenate(blocks, axis=1) if len(blocks) > 1 \
+                else blocks[0]
+            dict_pae[entry] = arr
+            ok_per_row.append(True)
+        _warn_isolated_features({}, failed_features, source_label="PAE")
+        df_aug = df_seq.copy()
+        df_aug["pae_ok"] = ok_per_row
+        df_aug, ok_after, keep_idx = _drop_or_raise_failed_entries(
+            df_seq=df_aug, ok_per_row=ok_per_row, on_failure=on_failure,
+            source_label="encode_pae")
+        if on_failure == "drop":
+            kept_entries = {entries[i] for i in keep_idx}
+            dict_pae = {k: v for k, v in dict_pae.items() if k in kept_entries}
+        session_tmp.cleanup()
+        return (dict_pae, df_aug) if return_df else dict_pae
+
+    # ------------------------------------------------------------------
+    # get_domains  (v1.2 commit 4) — runtime tool wrapper
+    # ------------------------------------------------------------------
+    def get_domains(
+        self,
+        df_seq: pd.DataFrame,
+        pdb_folder: Optional[Union[str, Path]] = None,
+        pae_folder: Optional[Union[str, Path]] = None,
+        tool: Literal["chainsaw", "afragmenter"] = "afragmenter",
+        chainsaw_path: Optional[Union[str, Path]] = None,
+        resolution: float = 0.7,
+        threshold: float = 2.0,
+        on_failure: Literal["nan", "drop", "raise"] = "nan",
+    ) -> pd.DataFrame:
+        """Run a domain-segmentation tool and append a ``chopping`` column.
+
+        Mirrors the ``get_dssp`` → ``encode_dssp`` pattern: this method
+        runs the external tool inline, returns a copy of ``df_seq`` with
+        appended ``chopping`` (the common Merizo [Lau23]_ / Chainsaw [Wells24]_
+        chopping-string format) and ``domain_ok`` boolean columns. The result feeds into
+        :meth:`encode_domains` (which now accepts the in-memory
+        ``chopping`` column directly).
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein identifiers
+            and a ``sequence`` column with full protein sequences.
+        pdb_folder : str or pathlib.Path, optional
+            Directory with one ``<entry>.pdb`` / ``.cif`` / ``.pdb.gz`` /
+            ``.cif.gz`` per row. Required when ``tool='chainsaw'``.
+        pae_folder : str or pathlib.Path, optional
+            Directory with one PAE JSON per row (same canonical filename
+            resolution as :meth:`encode_pae`). Required when
+            ``tool='afragmenter'``.
+        tool : {'chainsaw', 'afragmenter'}, default='afragmenter'
+            Which segmentation tool to run.
+
+            * ``'afragmenter'`` ([Verwimp25]_): a schema-free, tuneable segmenter
+              that builds a residue network from the AlphaFold Predicted Aligned
+              Error (PAE) matrix and finds domains by Leiden clustering.
+              Pip-installable; requires the optional extra
+              ``pip install aaanalysis[pro]`` (lazy-import; the
+              friendly install hint fires only when this tool is requested).
+              Operates on the PAE matrix from ``pae_folder``.
+            * ``'chainsaw'`` ([Wells24]_): a fully-convolutional neural network
+              that predicts domain boundaries from a PDB / CIF structure. Not on
+              PyPI; clone the repo locally and pass its directory as
+              ``chainsaw_path``. Operates on PDB / CIF from ``pdb_folder`` via
+              subprocess.
+        chainsaw_path : str or pathlib.Path, optional
+            Local clone of the ChainSaw repository. Required when
+            ``tool='chainsaw'`` (ignored otherwise).
+        resolution : float, default=0.7
+            AFragmenter Leiden-resolution knob (only used when
+            ``tool='afragmenter'``).
+        threshold : float, default=2.0
+            AFragmenter PAE graph-edge threshold in Å (only used when
+            ``tool='afragmenter'``).
+        on_failure : {'nan', 'drop', 'raise'}, default='nan'
+            What to do for entries where the tool fails / file is
+            missing. ``'nan'`` fills ``chopping`` with an empty string
+            and marks ``domain_ok=False``; ``'drop'`` removes the row;
+            ``'raise'`` re-raises.
+
+        Returns
+        -------
+        df_out : pd.DataFrame
+            A copy of ``df_seq`` with two appended columns:
+
+            * ``chopping`` (str): the Merizo/ChainSaw common-format
+              chopping string, or ``''`` on failure.
+            * ``domain_ok`` (bool): ``True`` if the tool returned a
+              non-empty chopping for this entry.
+
+        Raises
+        ------
+        ValueError
+            On invalid arguments or missing per-tool kwargs.
+        RuntimeError
+            If the tool's Python dependency is not installed (AFragmenter
+            via ``[pro]``), if ``chainsaw_path`` is invalid, or if any
+            entry failed under ``on_failure='raise'``.
+
+        Examples
+        --------
+        .. include:: examples/strp_get_domains.rst
+        """
+        verbose = self._verbose
+        ut.check_df_seq(df_seq=df_seq)
+        if ut.COL_SEQ not in df_seq.columns:
+            raise ValueError(
+                f"'df_seq' should contain a '{ut.COL_SEQ}' column for "
+                f"get_domains")
+        if _COL_CHOPPING in df_seq.columns:
+            raise ValueError(
+                f"'df_seq' should not already contain a "
+                f"'{_COL_CHOPPING}' column. Drop it before calling "
+                f"get_domains.")
+        ut.check_str_options(name="tool", val=tool,
+                             list_str_options=_LIST_DOMAIN_TOOLS)
+        _check_handle_failure(on_failure)
+        ut.check_bool(name="verbose", val=verbose)
+        # Tool-specific argument validation.
+        if tool == "afragmenter":
+            if pae_folder is None:
+                raise ValueError(
+                    "'pae_folder' is required when tool='afragmenter'")
+            ut.check_folder_path_exists(folder_path=str(pae_folder),
+                                        name="pae_folder")
+            ut.check_number_range(name="resolution", val=resolution,
+                                  min_val=0.0, max_val=10.0,
+                                  just_int=False, exclusive_limits=False)
+            ut.check_number_range(name="threshold", val=threshold,
+                                  min_val=0.0, max_val=31.75,
+                                  just_int=False, exclusive_limits=False)
+            check_afragmenter_available()
+            pae_folder = Path(pae_folder)
+        else:  # chainsaw
+            if pdb_folder is None:
+                raise ValueError(
+                    "'pdb_folder' is required when tool='chainsaw'")
+            ut.check_folder_path_exists(folder_path=str(pdb_folder),
+                                        name="pdb_folder")
+            # Validate chainsaw_path up-front (cheap; saves N per-row
+            # failures if the path is wrong).
+            resolve_chainsaw_path(chainsaw_path)
+            pdb_folder = Path(pdb_folder)
+        entries = df_seq[ut.COL_ENTRY].tolist()
+        chopping_per_row: List[str] = []
+        ok_per_row: List[bool] = []
+        session_tmp = tempfile.TemporaryDirectory()
+        session_tmp_path = Path(session_tmp.name)
+        for entry in entries:
+            _check_entry_is_filesystem_safe(entry)
+            try:
+                if tool == "afragmenter":
+                    pae_path = resolve_pae_path(
+                        folder=pae_folder, entry=entry,
+                        temp_dir=session_tmp_path)
+                    if pae_path is None:
+                        raise RuntimeError(
+                            f"PAE sidecar for entry '{entry}' not found "
+                            f"in '{pae_folder}' (tried .json/.json.gz/"
+                            f"AF-DB canonical)")
+                    chopping = run_afragmenter_on_pae(
+                        pae_path, resolution=resolution,
+                        threshold=threshold)
+                else:  # chainsaw
+                    pdb_path, _fmt = resolve_structure_path(
+                        folder=pdb_folder, entry=entry,
+                        temp_dir=session_tmp_path)
+                    if pdb_path is None:
+                        raise RuntimeError(
+                            f"Structure file for entry '{entry}' not "
+                            f"found in '{pdb_folder}' "
+                            f"(tried .pdb/.pdb.gz/.cif/.cif.gz)")
+                    chopping = run_chainsaw_on_entry(
+                        pdb_path, chainsaw_path=chainsaw_path)
+            except RuntimeError as e:
+                warnings.warn(
+                    f"get_domains[{tool}] failed for entry '{entry}': "
+                    f"{e}; row will have domain_ok=False",
+                    UserWarning)
+                chopping_per_row.append("")
+                ok_per_row.append(False)
+                continue
+            chopping_per_row.append(chopping)
+            ok_per_row.append(bool(chopping))
+            if verbose:
+                ut.print_out(
+                    f"   get_domains[{tool}]: entry={entry}, "
+                    f"chopping={chopping[:60]}"
+                    f"{'...' if len(chopping) > 60 else ''}")
+        df_out = df_seq.copy()
+        df_out[_COL_CHOPPING] = chopping_per_row
+        df_out[_COL_DOMAIN_OK] = ok_per_row
+        df_out, _ok_after, _keep_idx = _drop_or_raise_failed_entries(
+            df_seq=df_out, ok_per_row=ok_per_row, on_failure=on_failure,
+            source_label=f"get_domains[{tool}]")
+        session_tmp.cleanup()
+        return df_out
+
+    # ------------------------------------------------------------------
+    # encode_domains  (v1.2 commit 3)
+    # ------------------------------------------------------------------
+    def encode_domains(
+        self,
+        df_seq: pd.DataFrame,
+        domain_folder: Optional[Union[str, Path]] = None,
+        *,
+        features: List[str],
+        on_failure: Literal["nan", "drop", "raise"] = "nan",
+        return_df: bool = False,
+    ) -> Union[Dict[str, np.ndarray], Tuple[Dict[str, np.ndarray], pd.DataFrame]]:
+        """Read pre-computed domain segmentation files into ``dict_domains``.
+
+        Bring-your-own-segmentation: the user pre-runs Merizo / ChainSaw /
+        AFragmenter / a hand-curated domain table on their PDB files and
+        saves the **chopping string** (Merizo/ChainSaw native format) to
+        one file per entry in ``domain_folder``. Two file formats are
+        accepted by the resolver (looked up by entry name):
+
+          * ``<entry>.txt`` — first non-empty line is the chopping string,
+            e.g. ``6-18_296-459,19-156``.
+          * ``<entry>.tsv`` — Merizo/ChainSaw TSV output with a
+            ``chopping`` header (first data row used).
+
+        The chopping format: domains separated by commas, segments within
+        a domain separated by underscores; segments are 1-based inclusive
+        ``start-end``. Discontinuous domains supported.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein
+            identifiers and a ``sequence`` column. ``len(sequence)`` is
+            used as the L for each per-residue output tensor.
+        domain_folder : str or pathlib.Path
+            Directory containing one chopping file per row of ``df_seq``.
+        features : list of str
+            Feature keys belonging to ``encode_domains``: any subset of
+            ``{domain_boundary, domain_relative_position, domain_size,
+            n_domains_in_protein}``. All outputs normalized to ``[0, 1]``
+            (NaN for residues unassigned to any domain).
+        on_failure : {'nan', 'drop', 'raise'}, default='nan'
+            What to do for entries whose chopping file is missing or
+            unparseable. ``'nan'`` fills with NaN-only tensors;
+            ``'drop'`` removes those entries; ``'raise'`` re-raises. If a
+            single domain encoder raises for an otherwise-parsed entry, only
+            that feature's column(s) are NaN-filled (per-feature isolation)
+            and one ``UserWarning`` names it — unless ``on_failure='raise'``.
+        return_df : bool, default=False
+            If ``True``, also return the per-row status DataFrame as a second
+            element ``(dict_num, df_seq_out)``. If ``False`` (default), return
+            only ``dict_num``.
+
+        Returns
+        -------
+        dict_domains : dict[str, np.ndarray]
+            ``{entry: (L_entry, D_total) ndarray}`` per-residue
+            domain-derived features in the order of ``features``.
+        df_seq_out : pd.DataFrame
+            Returned only when ``return_df=True``. Echo of ``df_seq`` plus a
+            boolean ``domain_ok`` column.
+
+        Raises
+        ------
+        ValueError
+            On invalid arguments or feature keys not in this method's
+            registry slice.
+        RuntimeError
+            If any entry failed under ``on_failure='raise'``.
+
+        Notes
+        -----
+        * AAanalysis deliberately does NOT bundle a segmentation tool runtime
+          (no PyTorch, no model weights, no Merizo / ChainSaw / AFragmenter
+          pinned). Keep ``aaanalysis[pro]`` lean; pre-run the tool of your
+          choice, then ingest its chopping output here.
+        * Merizo [Lau23]_ (invariant-point-attention residue clustering):
+          https://github.com/psipred/Merizo (~2 s per 425-residue chain on CPU,
+          bundled weights, pip-installable).
+        * ChainSaw [Wells24]_ (fully-convolutional boundary prediction):
+          https://github.com/JudeWells/Chainsaw (manual install).
+        * Output chopping strings: same `chopping` column in both tools'
+          TSV output, drop-in compatible.
+
+        Examples
+        --------
+        .. include:: examples/strp_encode_domains.rst
+        """
+        verbose = self._verbose
+        ut.check_df_seq(df_seq=df_seq)
+        if ut.COL_SEQ not in df_seq.columns:
+            raise ValueError(
+                f"'df_seq' should contain a '{ut.COL_SEQ}' column for "
+                f"encode_domains")
+        # v1.2 commit 4: dual-mode like encode_dssp — if df_seq already
+        # has a 'chopping' column (typically populated by get_domains),
+        # use it directly and skip the folder lookup.
+        has_inline_chopping = _COL_CHOPPING in df_seq.columns
+        if not has_inline_chopping:
+            if _COL_DOMAIN_OK in df_seq.columns:
+                raise ValueError(
+                    f"'df_seq' should not already contain a "
+                    f"'{_COL_DOMAIN_OK}' column. Drop it before calling "
+                    f"encode_domains.")
+            if domain_folder is None:
+                raise ValueError(
+                    "'domain_folder' should not be None when 'df_seq' "
+                    "lacks a 'chopping' column. Either pass a folder of "
+                    "chopping files, or run get_domains(...) first.")
+            ut.check_folder_path_exists(folder_path=str(domain_folder),
+                                        name="domain_folder")
+            domain_folder = Path(domain_folder)
+        validate_feature_keys(features, allowed_method=ENCODER_DOMAINS)
+        _check_handle_failure(on_failure)
+        ut.check_bool(name="verbose", val=verbose)
+        ut.check_bool(name="return_df", val=return_df)
+        entries = df_seq[ut.COL_ENTRY].tolist()
+        sequences = df_seq[ut.COL_SEQ].tolist()
+        chopping_col = (df_seq[_COL_CHOPPING].tolist()
+                        if has_inline_chopping else [None] * len(entries))
+        D_total = get_total_dims(features)
+        dict_domains: Dict[str, np.ndarray] = {}
+        ok_per_row: List[bool] = []
+        # Per-(entry, feature) encoder failures, aggregated so each failing
+        # feature warns once (issue #340 per-feature isolation).
+        failed_features: Dict[str, str] = {}
+        for entry, seq, inline_chopping in zip(entries, sequences,
+                                               chopping_col):
+            _check_entry_is_filesystem_safe(entry)
+            L = len(seq)
+            # Two source paths: inline 'chopping' column OR file lookup.
+            if has_inline_chopping:
+                if (inline_chopping is None
+                        or (isinstance(inline_chopping, float)
+                            and np.isnan(inline_chopping))):
+                    warnings.warn(
+                        f"Inline chopping for entry '{entry}' is missing "
+                        f"(NaN/None); row will have domain_ok=False",
+                        UserWarning)
+                    dict_domains[entry] = np.full((L, D_total), np.nan,
+                                                  dtype=np.float64)
+                    ok_per_row.append(False)
+                    continue
+                try:
+                    domains = _parse_chopping(str(inline_chopping))
+                except RuntimeError as e:
+                    warnings.warn(
+                        f"Inline chopping parse failed for entry "
+                        f"'{entry}': {e}; row will have domain_ok=False",
+                        UserWarning)
+                    dict_domains[entry] = np.full((L, D_total), np.nan,
+                                                  dtype=np.float64)
+                    ok_per_row.append(False)
+                    continue
+            else:
+                dom_path = resolve_domain_path(folder=domain_folder,
+                                               entry=entry)
+                if dom_path is None:
+                    warnings.warn(
+                        f"Domain file for entry '{entry}' not found in "
+                        f"'{domain_folder}' (tried .txt/.tsv/.csv); "
+                        f"row will have domain_ok=False",
+                        UserWarning)
+                    dict_domains[entry] = np.full((L, D_total), np.nan,
+                                                  dtype=np.float64)
+                    ok_per_row.append(False)
+                    continue
+                try:
+                    domains = load_chopping(dom_path)
+                except RuntimeError as e:
+                    warnings.warn(
+                        f"Domain load failed for entry '{entry}': {e}; "
+                        f"row will have domain_ok=False",
+                        UserWarning)
+                    dict_domains[entry] = np.full((L, D_total), np.nan,
+                                                  dtype=np.float64)
+                    ok_per_row.append(False)
+                    continue
+            blocks: List[np.ndarray] = []
+            for key in features:
+                num_dims = REGISTRY[key]["num_dims"]
+                try:
+                    if key == "domain_boundary":
+                        block = encode_domain_boundary(L, domains)
+                    elif key == "domain_relative_position":
+                        block = encode_domain_relative_position(L, domains)
+                    elif key == "domain_size":
+                        block = encode_domain_size(L, domains)
+                    elif key == "n_domains_in_protein":
+                        block = encode_n_domains_in_protein(L, domains)
+                    else:
+                        raise RuntimeError(
+                            f"Internal: feature key {key!r} not in "
+                            f"encode_domains alphabet")
+                    blocks.append(block)
+                    if verbose:
+                        ut.print_out(
+                            f"   encode_domains: entry={entry}, key={key}, "
+                            f"n_domains={len(domains)}, L={L}")
+                except RuntimeError as e:
+                    # Per-feature isolation (issue #340): NaN only this
+                    # feature's column(s) for this entry; keep the others.
+                    if on_failure == "raise":
+                        raise
+                    blocks.append(_nan_feature_block(L, num_dims))
+                    failed_features.setdefault(key, str(e))
+            arr = np.concatenate(blocks, axis=1) if len(blocks) > 1 \
+                else blocks[0]
+            dict_domains[entry] = arr
+            ok_per_row.append(True)
+        _warn_isolated_features({}, failed_features, source_label="Domain")
+        df_aug = df_seq.copy()
+        # When inline-chopping is the source, df_seq may already carry a
+        # 'domain_ok' column from get_domains; overwrite it with the
+        # per-feature-encode outcome (more informative).
+        df_aug[_COL_DOMAIN_OK] = ok_per_row
+        df_aug, ok_after, keep_idx = _drop_or_raise_failed_entries(
+            df_seq=df_aug, ok_per_row=ok_per_row, on_failure=on_failure,
+            source_label="encode_domains")
+        if on_failure == "drop":
+            kept_entries = {entries[i] for i in keep_idx}
+            dict_domains = {k: v for k, v in dict_domains.items()
+                            if k in kept_entries}
+        return (dict_domains, df_aug) if return_df else dict_domains
+
+    # ------------------------------------------------------------------
+    # encode  (feature/backend router)
+    # ------------------------------------------------------------------
+    def encode(
+        self,
+        df_seq: pd.DataFrame,
+        *,
+        features: List[str],
+        pdb_folder: Optional[Union[str, Path]] = None,
+        pae_folder: Optional[Union[str, Path]] = None,
+        domain_folder: Optional[Union[str, Path]] = None,
+        ss_mode: Literal["ss3", "ss8"] = "ss3",
+        gap_handling: Literal["pad", "omit"] = "pad",
+        plddt_disorder_threshold: float = 70.0,
+        local_window: int = 5,
+        pae_band_edges: Tuple[int, int] = (5, 15),
+        on_failure: Literal["nan", "drop", "raise"] = "nan",
+        return_df: bool = False,
+    ) -> Union[Dict[str, np.ndarray], Tuple[Dict[str, np.ndarray], pd.DataFrame]]:
+        """Encode a mixed feature list, routing each key to the right backend.
+
+        One entry point that hides the ``encode_dssp`` / ``encode_pdb`` /
+        ``encode_pae`` / ``encode_domains`` split: each requested feature key
+        is dispatched to its owning encoder via the feature registry, and the
+        per-backend outputs are merged into a single ``[0, 1]``-normalized
+        ``dict_num`` whose D-axis follows the requested ``features`` order (so
+        it lines up with :meth:`build_scales` / :meth:`build_cat`). You no
+        longer need to know which source a key comes from or call
+        :func:`aaanalysis.combine_dict_nums` yourself.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein
+            identifiers and a ``sequence`` column with full protein sequences.
+        features : list of str
+            Any mix of feature keys from the StructurePreprocessor registry.
+            Each key is routed to its owning encoder (DSSP / PDB / PAE /
+            domains); keys from different sources may be freely interleaved.
+        pdb_folder : str or pathlib.Path, optional
+            Directory of ``<entry>.pdb`` / ``.cif`` files. Required when the
+            requested ``features`` include any DSSP or PDB key (DSSP may
+            instead reuse pre-computed columns already on ``df_seq``).
+        pae_folder : str or pathlib.Path, optional
+            Directory of AlphaFold PAE sidecar JSONs. Required when the
+            requested ``features`` include any PAE key.
+        domain_folder : str or pathlib.Path, optional
+            Directory of per-entry chopping files. Required when the requested
+            ``features`` include any domain key, unless ``df_seq`` already
+            carries a ``chopping`` column.
+        ss_mode : {'ss3', 'ss8'}, default='ss3'
+            Forwarded to :meth:`encode_dssp` when a DSSP key is requested.
+        gap_handling : {'pad', 'omit'}, default='pad'
+            Forwarded to :meth:`encode_dssp` when a DSSP key is requested.
+        plddt_disorder_threshold : float, default=70.0
+            Forwarded to :meth:`encode_pdb` when the ``plddt_disorder`` key is
+            requested.
+        local_window : int, default=5
+            Forwarded to :meth:`encode_pae` for the local / distal PAE means.
+        pae_band_edges : tuple of (int, int), default=(5, 15)
+            Forwarded to :meth:`encode_pae` for ``pae_band_means``.
+        on_failure : {'nan', 'drop', 'raise'}, default='nan'
+            Passed through to every routed backend. ``'nan'`` isolates
+            failures (entry-level entries or single features are NaN-filled,
+            everything else kept); ``'drop'`` removes entries that any routed
+            backend dropped (the merged output keeps only entries present in
+            every source); ``'raise'`` re-raises.
+        return_df : bool, default=False
+            If ``True``, also return an echo of ``df_seq`` (kept entries) plus
+            a boolean ``encode_ok`` column that is the per-entry AND of every
+            routed backend's entry-level status.
+
+        Returns
+        -------
+        dict_num : dict[str, np.ndarray]
+            ``{entry: (L_entry, D_total) ndarray}`` with the requested
+            ``features`` concatenated along D in the given order. Values are
+            in ``[0, 1]`` (NaN for unresolved positions or isolated features).
+        df_seq_out : pd.DataFrame
+            Returned only when ``return_df=True``. Echo of ``df_seq`` (kept
+            entries) plus a boolean ``encode_ok`` column.
+
+        Raises
+        ------
+        ValueError
+            On invalid arguments, unknown feature keys, or a missing folder
+            required by one of the routed backends.
+        RuntimeError
+            Propagated from a routed backend under ``on_failure='raise'``.
+
+        See Also
+        --------
+        * :meth:`encode_dssp`, :meth:`encode_pdb`, :meth:`encode_pae`,
+          :meth:`encode_domains`: the per-source encoders this method routes to.
+        * :func:`aaanalysis.combine_dict_nums`: the manual merge this method
+          performs internally.
+
+        Examples
+        --------
+        .. include:: examples/strp_encode.rst
+        """
+        # Validate
+        ut.check_df_seq(df_seq=df_seq)
+        if ut.COL_SEQ not in df_seq.columns:
+            raise ValueError(
+                f"'df_seq' should contain a '{ut.COL_SEQ}' column for encode")
+        validate_feature_keys(features)
+        _check_handle_failure(on_failure)
+        ut.check_bool(name="return_df", val=return_df)
+        # Group requested features by owning backend, preserving order.
+        by_method: Dict[str, List[str]] = {}
+        for f in features:
+            by_method.setdefault(REGISTRY[f]["method"], []).append(f)
+        # Router-level folder checks (name the offending features).
+        if ENCODER_PDB in by_method and pdb_folder is None:
+            raise ValueError(
+                f"'pdb_folder' is required to encode features "
+                f"{by_method[ENCODER_PDB]} (routed to encode_pdb)")
+        if ENCODER_PAE in by_method and pae_folder is None:
+            raise ValueError(
+                f"'pae_folder' is required to encode features "
+                f"{by_method[ENCODER_PAE]} (routed to encode_pae)")
+        if (ENCODER_DOMAINS in by_method and domain_folder is None
+                and _COL_CHOPPING not in df_seq.columns):
+            raise ValueError(
+                f"'domain_folder' is required to encode features "
+                f"{by_method[ENCODER_DOMAINS]} (routed to encode_domains), "
+                f"unless 'df_seq' already carries a 'chopping' column")
+        # Dispatch each backend on its feature subset; keep per-source status.
+        sub_dicts: Dict[str, Dict[str, np.ndarray]] = {}
+        entries_in_order = df_seq[ut.COL_ENTRY].tolist()
+        ok_by_entry: Dict[str, bool] = {e: True for e in entries_in_order}
+        for method, feats in by_method.items():
+            if method == ENCODER_DSSP:
+                d, df_sub = self.encode_dssp(
+                    df_seq=df_seq, pdb_folder=pdb_folder, features=feats,
+                    ss_mode=ss_mode, gap_handling=gap_handling,
+                    on_failure=on_failure, return_df=True)
+                ok_col = "encode_dssp_ok"
+            elif method == ENCODER_PDB:
+                d, df_sub = self.encode_pdb(
+                    df_seq=df_seq, pdb_folder=pdb_folder, features=feats,
+                    plddt_disorder_threshold=plddt_disorder_threshold,
+                    on_failure=on_failure, return_df=True)
+                ok_col = _COL_PDB_OK
+            elif method == ENCODER_PAE:
+                d, df_sub = self.encode_pae(
+                    df_seq=df_seq, pae_folder=pae_folder, features=feats,
+                    local_window=local_window, pae_band_edges=pae_band_edges,
+                    on_failure=on_failure, return_df=True)
+                ok_col = "pae_ok"
+            else:  # ENCODER_DOMAINS
+                d, df_sub = self.encode_domains(
+                    df_seq=df_seq, domain_folder=domain_folder,
+                    features=feats, on_failure=on_failure, return_df=True)
+                ok_col = _COL_DOMAIN_OK
+            sub_dicts[method] = d
+            if ok_col in df_sub.columns:
+                for e, ok in zip(df_sub[ut.COL_ENTRY].tolist(),
+                                 df_sub[ok_col].tolist()):
+                    ok_by_entry[e] = ok_by_entry.get(e, True) and bool(ok)
+        # Keep entries present in every routed sub-dict ('drop' may prune).
+        kept = [e for e in entries_in_order
+                if all(e in d for d in sub_dicts.values())]
+        # Reassemble each entry in the ORIGINAL feature order by slicing each
+        # sub-dict's D-axis back into per-feature blocks.
+        dim_of = {f: REGISTRY[f]["num_dims"] for f in features}
+        offset_of: Dict[str, int] = {}
+        for method, feats in by_method.items():
+            col = 0
+            for f in feats:
+                offset_of[f] = col
+                col += dim_of[f]
+        dict_num: Dict[str, np.ndarray] = {}
+        for e in kept:
+            blocks = []
+            for f in features:
+                arr = sub_dicts[REGISTRY[f]["method"]][e]
+                c0 = offset_of[f]
+                blocks.append(arr[:, c0:c0 + dim_of[f]])
+            dict_num[e] = (np.concatenate(blocks, axis=1)
+                           if len(blocks) > 1 else blocks[0])
+        if not return_df:
+            return dict_num
+        df_out = df_seq[df_seq[ut.COL_ENTRY].isin(kept)].reset_index(
+            drop=True).copy()
+        df_out["encode_ok"] = [ok_by_entry.get(e, True)
+                               for e in df_out[ut.COL_ENTRY].tolist()]
+        return dict_num, df_out
+
+    # ------------------------------------------------------------------
+    # build_scales + build_cat
+    # ------------------------------------------------------------------
+    def build_scales(
+        self,
+        df_seq: pd.DataFrame,
+        dict_num: Dict[str, np.ndarray],
+        features: List[str],
+        return_std: bool = False,
+        dim_names_override: Optional[List[str]] = None,
+    ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
+        """Build ``df_scales`` by context-free per-amino acid (AA) averaging of the encoded corpus.
+
+        Mirrors :meth:`EmbeddingPreprocessor.build_scales`: for each
+        canonical amino acid ``a`` and each D dimension ``d``, the pseudo-scale
+        entry is the mean of ``dict_num[entry][i, d]`` over all (entry, i)
+        pairs where ``df_seq[sequence][entry][i] == a``. Non-canonical residues
+        are skipped; AAs absent from the corpus get NaN rows.
+
+        This is the **dataset-dependent** step. The values feed
+        :meth:`CPP.run_num`'s redundancy filter (``df_scales.corr()`` arm); a
+        meaningful corpus is required to make ``max_cor`` discriminative.
+        Compute pseudo-scales once on a fixed reference corpus and reuse for
+        cross-dataset comparability.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein
+            identifiers and a ``sequence`` column with full protein sequences.
+            Used here as the source of empirical amino-acid contexts.
+        dict_num : dict[str, np.ndarray]
+            Combined per-residue tensors ``{entry: (L_entry, D_total)
+            ndarray}`` — typically the output of
+            :func:`aaanalysis.combine_dict_nums`. Every entry in ``df_seq``
+            must be a key; per entry, ``L_entry == len(sequence)``;
+            ``D_total`` must equal ``sum(REGISTRY[f]['num_dims'] for f in
+            features)`` (i.e. the encoder outputs in feature-key order).
+        features : list of str
+            Feature keys from the StructurePreprocessor registry in the same
+            order as the ``dict_num`` D-axis layout. Used to name the D
+            dimensions of the output and to validate ``D_total``.
+        return_std : bool, default=False
+            If ``True``, also return per-AA standard deviations in a second
+            DataFrame of the same shape. AAs occurring exactly once receive
+            std=0; AAs absent from the corpus receive NaN.
+        dim_names_override : list of str, optional
+            Replacement names for the D columns; length must equal
+            ``D_total``. ``None`` uses the registry default names.
+
+        Returns
+        -------
+        df_scales : pd.DataFrame, shape (20, D_total)
+            Pseudo-scale DataFrame. Rows are the 20 canonical AAs
+            (``ut.LIST_CANONICAL_AA``); columns are dim names. Cells are
+            context-free per-AA means of normalized encoder outputs (each in
+            ``[0, 1]``); NaN where the AA is absent from the corpus.
+        df_stds : pd.DataFrame, shape (20, D_total)
+            Per-AA standard deviations, returned only when ``return_std=True``.
+
+        Raises
+        ------
+        ValueError
+            On missing ``df_seq`` / ``dict_num``, mismatched D, missing
+            entries, or invalid feature keys.
+
+        Warnings
+        --------
+        UserWarning
+            Pseudo-scales depend on the content of ``df_seq`` + ``dict_num``.
+
+        Examples
+        --------
+        .. include:: examples/strp_build_scales.rst
+        """
+        # Validate
+        if df_seq is None or dict_num is None:
+            raise ValueError(
+                f"'df_seq' / 'dict_num' (None) should both be provided. "
+                f"Pseudo-scales need a real corpus — fall back to "
+                f"build_cat() if you only want the (D, 5) metadata.")
+        ut.check_df_seq(df_seq=df_seq)
+        if ut.COL_SEQ not in df_seq.columns:
+            raise ValueError(
+                f"'df_seq' should contain a '{ut.COL_SEQ}' column for "
+                f"build_scales")
+        validate_feature_keys(features)
+        ut.check_bool(name="return_std", val=return_std)
+        D = get_total_dims(features)
+        dim_names = self._resolve_dim_names(features=features, D=D,
+                                            override=dim_names_override)
+        # Validate dict_num shape against df_seq + D
+        entries = df_seq[ut.COL_ENTRY].tolist()
+        sequences = dict(zip(entries, df_seq[ut.COL_SEQ].tolist()))
+        missing = [e for e in entries if e not in dict_num]
+        if missing:
+            preview = missing[:5] + (["..."] if len(missing) > 5 else [])
+            raise ValueError(
+                f"'dict_num' ({len(missing)} missing entries) should contain "
+                f"every entry in 'df_seq'. Missing: {preview}")
+        for entry in entries:
+            arr = dict_num[entry]
+            if not isinstance(arr, np.ndarray) or arr.ndim != 2:
+                raise ValueError(
+                    f"'dict_num[{entry!r}]' should be a 2-D np.ndarray of "
+                    f"shape (L, D)")
+            if arr.shape[0] != len(sequences[entry]):
+                raise ValueError(
+                    f"'dict_num[{entry!r}].shape[0]' ({arr.shape[0]}) "
+                    f"should equal len(sequence) ({len(sequences[entry])})")
+            if arr.shape[1] != D:
+                raise ValueError(
+                    f"'dict_num[{entry!r}].shape[1]' ({arr.shape[1]}) "
+                    f"should equal sum of num_dims across features ({D})")
+        if self._verbose:
+            ut.print_out(
+                "Pseudo-scales are dataset-dependent (averaged over df_seq + "
+                "dict_num). For reproducible cross-dataset comparison, compute "
+                "them once on a fixed reference corpus and reuse the resulting df_scales.")
+        # Build per-AA accumulators
+        list_aa = list(ut.LIST_CANONICAL_AA)
+        aa_to_idx = {a: i for i, a in enumerate(list_aa)}
+        sums = np.zeros((len(list_aa), D), dtype=np.float64)
+        sqs = np.zeros((len(list_aa), D), dtype=np.float64)
+        counts = np.zeros((len(list_aa), D), dtype=np.float64)
+        for entry in entries:
+            arr = dict_num[entry]
+            seq = sequences[entry]
+            for i, a in enumerate(seq):
+                if a not in aa_to_idx:
+                    continue
+                row = arr[i]
+                mask = ~np.isnan(row)
+                if not mask.any():
+                    continue
+                ai = aa_to_idx[a]
+                sums[ai, mask] += row[mask]
+                sqs[ai, mask] += row[mask] ** 2
+                counts[ai, mask] += 1
+        with np.errstate(divide="ignore", invalid="ignore"):
+            means = np.where(counts > 0, sums / counts, np.nan)
+        df_scales = pd.DataFrame(means, index=list_aa, columns=dim_names)
+        if not return_std:
+            return df_scales
+        with np.errstate(divide="ignore", invalid="ignore"):
+            # population variance: E[x^2] - E[x]^2
+            mean_sq = np.where(counts > 0, sqs / counts, np.nan)
+            var = np.maximum(mean_sq - means ** 2, 0.0)
+            stds = np.where(counts > 0, np.sqrt(var), np.nan)
+        df_stds = pd.DataFrame(stds, index=list_aa, columns=dim_names)
+        return df_scales, df_stds
+
+    def build_cat(
+        self,
+        features: List[str],
+        dim_names_override: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """Build the ``df_cat`` metadata frame for ``features``.
+
+        Pure registry lookup — corpus-free. ``df_cat[category]`` is always
+        ``'Structure'`` for every StructurePreprocessor feature;
+        the per-key semantics live in ``df_cat[subcategory]`` (see registry).
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        features : list of str
+            Feature keys from the StructurePreprocessor registry, in the
+            order they appear along the D axis of the encoder outputs.
+        dim_names_override : list of str, optional
+            Replacement names for the D columns; length must equal the
+            total dimensionality across ``features``.
+
+        Returns
+        -------
+        df_cat : pd.DataFrame, shape (D_total, 5)
+            One row per dimension: ``scale_id``, ``category``, ``subcategory``,
+            ``scale_name``, ``scale_description``. ``category`` is the
+            top-level color/redundancy-bucket bucket; ``subcategory`` carries
+            the fine-grained semantic split (``'DSSP_SS_3state'``,
+            ``'Flexibility_bfactor'``, etc.).
+
+        See Also
+        --------
+        * :meth:`StructurePreprocessor.build_scales`: corpus-derived pseudo-scale companion to ``df_cat``.
+
+        Examples
+        --------
+        .. include:: examples/strp_build_cat.rst
+        """
+        validate_feature_keys(features)
+        D = get_total_dims(features)
+        dim_names = self._resolve_dim_names(features=features, D=D,
+                                            override=dim_names_override)
+        categories = get_categories(features)
+        subcategories = get_subcategories(features)
+        return pd.DataFrame({
+            ut.COL_SCALE_ID: dim_names,
+            ut.COL_CAT: categories,
+            ut.COL_SUBCAT: subcategories,
+            ut.COL_SCALE_NAME: dim_names,
+            ut.COL_SCALE_DES: [f"{c}/{s}" for c, s in zip(categories,
+                                                          subcategories)],
+        })
+
+    @staticmethod
+    def _resolve_dim_names(features, D, override):
+        """Validate ``dim_names_override`` against D; fall back to registry."""
+        if override is None:
+            return get_dim_names(features)
+        if not isinstance(override, list):
+            raise ValueError(
+                f"'dim_names_override' ({type(override).__name__}) "
+                f"should be a list of {D} str")
+        if len(override) != D:
+            raise ValueError(
+                f"'dim_names_override' (len={len(override)}) "
+                f"should be a list of {D} str (one per output dim)")
+        for n in override:
+            if not isinstance(n, str):
+                raise ValueError(
+                    f"'dim_names_override' items ({n!r}) should be str")
+        return list(override)

@@ -1,0 +1,972 @@
+"""Water/ion solvation tool (``solvate_structure``) and its OpenMM fallback."""
+
+import json
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any, Optional
+
+from mdclaw._common import (
+    count_atoms_in_pdb,
+    create_unique_subdir,
+    create_validation_error,
+    create_validation_error_from_guardrails,
+    generate_job_id,
+    guardrail_messages,
+    split_guardrail_results,
+)
+from mdclaw._common import get_timeout, installed_version
+from mdclaw.chemistry_constants import (  # noqa: E402
+    CANONICAL_WATER_MODELS,
+)
+from mdclaw._tool_meta import node_tool
+from mdclaw.solvation.box import (
+    _write_box_dimensions_json,
+    extract_box_size_from_cryst1,
+)
+from mdclaw.solvation.constants import (
+    OPENMM_FALLBACK_WATER_MAP,
+    _evaluate_solvation_water_model_guardrails,
+    _normalize_water_model_name,
+)
+from mdclaw.solvation.preflight import (
+    box_size_advisory,
+    charged_without_ions_result,
+    elongated_cubic_warning,
+    estimate_solute_charge,
+    large_system_warning,
+    resolve_solvation_water_model,
+    water_model_required_result,
+)
+from mdclaw.solvation.pdb_identity import (
+    _auto_lipid_packmol_charge_pdb_delta,
+    _auto_metal_ion_packmol_charge_pdb_delta,
+    _auto_nucleic_packmol_charge_pdb_delta,
+    _ligand_chemistry_packmol_charge_pdb_delta,
+    _restore_packmol_solute_identity,
+    _write_packmol_safe_solute,
+)
+
+from mdclaw.solvation._base import (
+    WORKING_DIR,
+    logger,
+    packmol_memgen_wrapper,
+    _append_salt_override_arg,
+    _diagnostics_require_salt_override,
+    _packmol_memgen_diagnostics,
+    _record_packmol_memgen_output,
+    _record_periodic_seam,
+    _record_salt_override_fallback,
+    _run_packmol_if_needed,
+)
+
+
+def _neutralization_charge_from_diagnostics(text: str) -> int | float | None:
+    """Read packmol-memgen's final solute charge (including charge_pdb_delta)."""
+    matches = re.findall(
+        r"^\s*Charge\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))",
+        text,
+        flags=re.MULTILINE,
+    )
+    if not matches:
+        return None
+    charge = float(matches[-1])
+    return int(charge) if charge.is_integer() else charge
+
+
+def _count_requested_ions(pdb_path: Path, salt_c: str, salt_a: str) -> dict:
+    """Count the requested monatomic ion species in an output PDB."""
+    def normalize(value: str) -> str:
+        return "".join(c for c in value.upper() if c.isalpha())
+
+    cation_name, anion_name = normalize(salt_c), normalize(salt_a)
+    cation_count = anion_count = 0
+    for line in pdb_path.read_text(errors="replace").splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        residue_name = normalize(line[17:20].strip())
+        if residue_name == cation_name:
+            cation_count += 1
+        elif residue_name == anion_name:
+            anion_count += 1
+    return {
+        "cation_species": salt_c,
+        "cation_count": cation_count,
+        "anion_species": salt_a,
+        "anion_count": anion_count,
+    }
+
+
+def _solvate_with_openmm(
+    pdb_path: Path,
+    result: dict,
+    output_dir: Optional[str],
+    output_name: str,
+    dist: float,
+    cubic: bool,
+    salt: bool,
+    salt_c: str,
+    salt_a: str,
+    saltcon: float,
+    water_model: str,
+    *,
+    subdirectory: bool = True,
+) -> dict:
+    """Fallback solvation using OpenMM/PDBFixer when packmol-memgen is unavailable.
+
+    Uses OpenMM Modeller.addSolvent() with a padding-based box. When
+    ``subdirectory`` is True (default, used by direct CLI calls) a unique
+    ``solvate_<id>/`` directory is created under ``output_dir``. When False
+    (used by node-mode callers that pass ``output_dir=nodes/<id>/artifacts/``),
+    output files land directly in ``output_dir`` so the artifact paths
+    registered on ``node.json`` match the real on-disk layout.
+    """
+    logger.info("Using OpenMM/PDBFixer fallback for solvation")
+    try:
+        from openmm.app import PDBFile, Modeller, ForceField
+        from openmm import unit
+    except ImportError:
+        result["errors"].append("OpenMM not available for fallback solvation")
+        return result
+
+    base_dir = Path(output_dir) if output_dir else WORKING_DIR
+    if subdirectory:
+        out_dir = create_unique_subdir(base_dir, "solvate")
+    else:
+        out_dir = base_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+    result["output_dir"] = str(out_dir)
+    output_file = out_dir / f"{output_name}.pdb"
+
+    try:
+        # Load structure
+        pdb = PDBFile(str(pdb_path))
+        modeller = Modeller(pdb.topology, pdb.positions)
+
+        # Select force field and water model
+        # Map water_model to OpenMM water XML
+        water_xml = OPENMM_FALLBACK_WATER_MAP[water_model.lower()]
+
+        # Use amber14 force field (compatible with most water models)
+        ff = ForceField("amber14-all.xml", water_xml)
+
+        # Add solvent with padding
+        padding_nm = dist / 10.0  # Convert Angstrom to nm
+        modeller.addSolvent(
+            ff,
+            model=water_model.lower(),
+            padding=padding_nm * unit.nanometer,
+            ionicStrength=(saltcon if salt else 0.0) * unit.molar,
+            positiveIon=salt_c,
+            negativeIon=salt_a,
+            neutralize=salt,
+        )
+
+        # Written WITHOUT keepIds. addSolvent's solvent chains carry OpenMM's
+        # own ids, and keeping them would drop the water onto chain letters the
+        # solute already uses; letting the writer assign chains and residue
+        # numbers by index costs the solute its own numbering, which the restore
+        # below puts back.
+        with open(output_file, "w") as f:
+            PDBFile.writeFile(modeller.topology, modeller.positions, f)
+
+        # addSolvent appends: the solute comes back as the leading records of the
+        # new topology, in the input's order, with water and ions after it. So
+        # the solute's identity is restored by that prefix -- the residue names
+        # PDBFile's loader normalized (ASH->ASP, HID->HIS, CYX->CYS, ...) and the
+        # deposit chain/number/icode the write reset -- and every solvent record
+        # is left alone. Keyed on (chain, number, icode) instead this renames by
+        # collision: measured on this fallback's own output it rewrote 3002 of
+        # 4428 solute atoms, PHE to VAL 80 times.
+        from mdclaw.structure.pdb_utils import restore_solute_identity_by_prefix
+        _restored = restore_solute_identity_by_prefix(
+            output_file.read_text(), str(pdb_path)
+        )
+        if _restored is not None:
+            output_file.write_text(_restored)
+
+        # Extract box size from PDB
+        box_dims = extract_box_size_from_cryst1(str(output_file))
+
+        # Persist box_dimensions.json next to the PDB so downstream tools
+        # (build_amber_system) can resolve it as a node artifact uniformly
+        # across packmol-memgen and OpenMM-fallback paths.
+        if box_dims:
+            box_json_path = _write_box_dimensions_json(out_dir, box_dims)
+            if box_json_path is None:
+                result["errors"].append(
+                    "OpenMM fallback: failed to persist box_dimensions.json"
+                )
+                return result
+            result["box_dimensions_file"] = str(box_json_path)
+
+        # Count atoms
+        atom_count = count_atoms_in_pdb(str(output_file))
+
+        result["success"] = True
+        result["output_file"] = str(output_file)
+        result["box_dimensions"] = box_dims or {}
+        result["statistics"] = {
+            "total_atoms": atom_count,
+            "method": "openmm_fallback",
+        }
+        result["ion_counts"] = _count_requested_ions(output_file, salt_c, salt_a)
+        result["warnings"].append("Used OpenMM fallback (packmol-memgen not available)")
+        logger.info(f"OpenMM solvation complete: {output_file}")
+
+    except Exception as e:
+        result["errors"].append(f"OpenMM solvation failed: {type(e).__name__}: {e}")
+        logger.error(f"OpenMM solvation error: {e}")
+
+    return result
+
+
+@node_tool(node_type="solv")
+def solvate_structure(
+    pdb_file: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    output_name: str = "solvated",
+    dist: float = 15.0,
+    cubic: bool = True,
+    salt: bool = True,
+    salt_c: str = "Na+",
+    salt_a: str = "Cl-",
+    saltcon: float = 0.15,
+    salt_override: bool = False,
+    overwrite: bool = True,
+    notprotonate: bool = True,
+    preoriented: bool = True,
+    keepligs: bool = True,
+    water_model: Optional[str] = None,
+    ligand_chemistry: Optional[list[dict[str, Any]]] = None,
+    job_dir: Optional[str] = None,
+    node_id: Optional[str] = None
+) -> dict:
+    """Solvate a protein-ligand complex in a water box using packmol-memgen.
+    
+    With ``salt=True``, counterions neutralize the prepared solute and bulk ion
+    pairs reach ``saltcon``. The charge comes from the prepared, protonated
+    Amber residue names plus automatic ``charge_pdb_delta`` corrections for
+    ligands, nucleic acids, lipids, and metal ions. Zero counterions is correct
+    when that charge is zero.
+    
+    The output PDB file feeds into ``build_amber_system``, which uses
+    ``openmmforcefields.SystemGenerator`` over an OpenFF Pablo–loaded
+    topology to emit the ``system.xml`` + ``topology.pdb`` + ``state.xml``
+    triple consumed by ``run_minimization`` / ``run_equilibration`` /
+    ``run_production``.
+
+    Args:
+        pdb_file: Input PDB file path (e.g., merged.pdb from merge_structures)
+        output_dir: Output directory (auto-generated if None)
+        output_name: Base name for output file (default: "solvated")
+        dist: Minimum distance from solute to box boundary in Angstroms (default: 15.0)
+        cubic: Use cubic box shape (default: True). If False, uses rectangular.
+               NOTE: Cubic boxes can be significantly larger for elongated proteins
+               because packmol-memgen calculates box size from the maximum XY distance
+               from the protein's centroid (max_rad). For proteins with asymmetric
+               mass distribution, rectangular boxes (cubic=False) can reduce water
+               count by 50-70%. Before packing, ``box_advisory`` in the result
+               predicts both boxes and their atom counts; an elongated solute
+               in a cubic box adds a warning naming the rectangular
+               alternative, and a system of 500k atoms or more adds one to run
+               topo/min through ``submit_job``.
+        salt: Enable ion placement (default: True). True adds neutralizing
+              counterions plus bulk salt; False (``--no-salt``) skips both, so
+              in node mode a solute whose estimated charge is not zero is
+              refused before any work (``solvation_charged_without_ions``):
+              the topology would refuse the charged cell.
+        salt_c: Cation used for counterions and bulk salt (default: "Na+").
+        salt_a: Anion used for counterions and bulk salt (default: "Cl-").
+        saltcon: Bulk-salt concentration in molar (default: 0.15). Keep 0.15
+                 when ions are unspecified or the request only says
+                 "neutralised". Use ``salt=True, saltcon=0`` (CLI:
+                 ``--salt --saltcon 0``) only for explicit counterions only.
+        salt_override: Start with packmol-memgen's ``--salt_override``. False
+                       first tries ``saltcon`` and automatically retries once
+                       with the override only when neutralization needs a
+                       higher ion concentration than requested.
+        overwrite: Overwrite existing output files (default: True)
+        notprotonate: Do not re-run Reduce protonation (default: True). The
+                      prepared input is already protonated, and its Amber
+                      residue names are still used to determine charge.
+        preoriented: (Ignored for --solvate mode, automatically set to True by packmol-memgen)
+        keepligs: Keep ligands in the structure (default: True). Important when
+                  processing protein-ligand complexes.
+        water_model: Water model, required: "opc", "tip3p", "opc3", "tip4pew"
+                     or "spce". There is no default: an omitted value is taken
+                     from the node's declared ``--conditions`` (``water_model``)
+                     and otherwise refused before any work
+                     (``water_model_required``). build_amber_system inherits it
+                     from this node. Use the model the request names, or "opc"
+                     (paired with ff19SB, Amber Manual 2024) when it names none.
+        ligand_chemistry: Ligand chemistry records from prepare_complex. Formal
+                          charges are included in packmol-memgen's
+                          --charge_pdb_delta so arbitrary GAFF/OpenFF ligands
+                          are neutralized consistently with topology.
+    
+    Returns:
+        Dict with:
+            - success: bool - True if solvation completed successfully
+            - job_id: str - Unique identifier for this operation
+            - output_file: str - Path to the solvated PDB file
+            - output_dir: str - Output directory path
+            - input_file: str - Input PDB file path
+            - parameters: dict - Parameters used for solvation
+            - solute_net_charge_e: int | float | None - Prepared-solute
+              charge used to choose counterions; None if unavailable
+            - ion_counts: dict - Requested cation/anion species and their
+              counts in the output PDB
+            - packmol_log: str - Path to packmol log file (if available)
+            - statistics: dict - Atom counts, etc.
+            - box_dimensions: dict - Box size extracted from CRYST1 record:
+                - box_a, box_b, box_c: Box dimensions in Angstroms
+                - alpha, beta, gamma: Box angles in degrees
+                - is_cubic: True if all sides equal and all angles 90°
+            - errors: list[str] - Error messages (empty if success=True)
+            - warnings: list[str] - Non-critical issues encountered
+    
+    Example:
+        >>> result = solvate_structure(
+        ...     "output/job1/merged.pdb",
+        ...     dist=15.0,
+        ...     cubic=True,
+        ...     salt=True,
+        ...     saltcon=0.15
+        ... )
+        >>> print(result["output_file"])
+        'output/abc123/solvated.pdb'
+        >>> print(result["box_dimensions"])
+        {'box_a': 86.32, 'box_b': 86.32, 'box_c': 86.32, ...}
+    """
+    logger.info(f"Solvating structure: {pdb_file}")
+    
+    # Initialize result structure
+    job_id = generate_job_id()
+    result = {
+        "success": False,
+        "job_id": job_id,
+        "output_file": None,
+        "output_dir": None,
+        "input_file": str(pdb_file),
+        "parameters": {
+            "water_model": water_model,
+            "dist": dist,
+            "cubic": cubic,
+            "salt": salt,
+            "salt_c": salt_c,
+            "salt_a": salt_a,
+            "saltcon": saltcon,
+            "salt_override": salt_override,
+        },
+        "packmol_log": None,
+        "solute_net_charge_e": None,
+        "ion_counts": {
+            "cation_species": salt_c,
+            "cation_count": None,
+            "anion_species": salt_a,
+            "anion_count": None,
+        },
+        "statistics": {},
+        "errors": [],
+        "warnings": []
+    }
+
+    water_model, water_model_source = resolve_solvation_water_model(
+        water_model, job_dir, node_id,
+    )
+    result["parameters"]["water_model_source"] = water_model_source
+    if water_model is not None:
+        canonical_water_model = _normalize_water_model_name(water_model)
+        if not canonical_water_model:
+            blocked = create_validation_error(
+                "water_model",
+                f"Unknown water model: {water_model}",
+                expected=f"One of: {sorted(CANONICAL_WATER_MODELS.values())}",
+                actual=water_model,
+            )
+            if job_dir and node_id:
+                from mdclaw._node import fail_node_from_result
+                return fail_node_from_result(
+                    job_dir,
+                    node_id,
+                    blocked,
+                    default_error="solvate_structure unknown water_model",
+                )
+            return blocked
+        water_model = canonical_water_model
+    result["parameters"]["water_model"] = water_model
+
+    if job_dir and node_id:
+        from mdclaw._node import validate_node_execution_context
+        _ctx = validate_node_execution_context(
+            job_dir,
+            node_id,
+            "solv",
+            actual_conditions={
+                "water_model": water_model,
+                "dist": dist,
+                "cubic": cubic,
+                "salt": salt,
+                "salt_c": salt_c,
+                "salt_a": salt_a,
+                "saltcon": saltcon,
+                "salt_override": salt_override,
+            },
+        )
+        if not _ctx["success"]:
+            blocked = {"success": False, "error_type": "ValidationError", **_ctx}
+            from mdclaw._node import fail_node_from_result
+            return fail_node_from_result(
+                job_dir,
+                node_id,
+                blocked,
+                default_error="solvate_structure node execution context invalid",
+            )
+
+    if water_model is None:
+        blocked = water_model_required_result(
+            "solvate_structure", job_dir=job_dir, node_id=node_id,
+        )
+        if job_dir and node_id:
+            from mdclaw._node import fail_node_from_result
+            return fail_node_from_result(job_dir, node_id, blocked)
+        return blocked
+
+    # Node mode always uses the canonical DAG input. An explicit path may only
+    # repeat that same artifact; it cannot replace the parent provenance.
+    if job_dir and node_id:
+        from mdclaw._node import resolve_node_inputs
+        _inputs = resolve_node_inputs(
+            job_dir,
+            node_id,
+            "solv",
+            explicit_paths={"pdb_file": pdb_file} if pdb_file else None,
+        )
+        if "input_resolution_error" in _inputs:
+            blocked = create_validation_error(
+                "job_dir/node_id",
+                _inputs["input_resolution_error"],
+                expected="Completed prep ancestor with merged_pdb artifact",
+                actual=f"job_dir={job_dir}, node_id={node_id}",
+                context_extra={
+                    "input_resolution_errors": _inputs.get("input_resolution_errors", []),
+                },
+                code="input_resolution_blocked",
+            )
+            from mdclaw._node import fail_node_from_result
+            return fail_node_from_result(job_dir, node_id, blocked)
+        if "pdb_file" in _inputs:
+            pdb_file = _inputs["pdb_file"]
+        if ligand_chemistry is None and "ligand_chemistry" in _inputs:
+            ligand_chemistry = _inputs["ligand_chemistry"]
+
+    if not pdb_file:
+        blocked = create_validation_error(
+            "pdb_file",
+            "pdb_file is required",
+            expected="Explicit PDB path, or --job-dir/--node-id for DAG auto-resolve",
+            actual=pdb_file,
+            hints=["Run prepare_complex first or execute in node mode from a solv node."],
+            code="missing_pdb_file",
+        )
+        if job_dir and node_id:
+            from mdclaw._node import fail_node
+            fail_node(job_dir, node_id, errors=blocked.get("errors", []), code=blocked.get("code"))
+        return blocked
+
+    # Validate input file (resolve to absolute path for conda run compatibility)
+    pdb_path = Path(pdb_file).resolve()
+    if not pdb_path.exists():
+        result["errors"].append(f"Input PDB file not found: {pdb_file}")
+        logger.error(f"Input PDB file not found: {pdb_file}")
+        if job_dir and node_id:
+            from mdclaw._node import fail_node
+            fail_node(job_dir, node_id, errors=result.get("errors", []), code=result.get("code"))
+        return result
+
+    if not salt:
+        # --no-salt places no ions at all, and the topology refuses a charged
+        # cell (system_net_charge_without_ions) one node later.
+        charge_estimate = estimate_solute_charge(pdb_path, ligand_chemistry)
+        result["solute_charge_estimate"] = charge_estimate
+        charge = charge_estimate.get("charge")
+        if charge_estimate.get("success") and abs(float(charge)) >= 0.5:
+            blocked = charged_without_ions_result(
+                "solvate_structure", charge, job_dir=job_dir, node_id=node_id,
+            )
+            if job_dir and node_id:
+                from mdclaw._node import fail_node_from_result
+                return fail_node_from_result(job_dir, node_id, {**result, **blocked})
+            result["warnings"].append(blocked["message"])
+
+    # Check packmol-memgen availability; fall back to OpenMM if not available
+    if not packmol_memgen_wrapper.is_available():
+        guardrail_results = _evaluate_solvation_water_model_guardrails(
+            water_model,
+            backend="openmm_fallback",
+        )
+        blocking_results, warning_results = split_guardrail_results(guardrail_results)
+        if blocking_results:
+            blocked = {
+                **result,
+                **create_validation_error_from_guardrails(
+                    "water_model",
+                    guardrail_results,
+                    summary=guardrail_results[0]["message"],
+                    actual=water_model,
+                ),
+            }
+            if job_dir and node_id:
+                from mdclaw._node import fail_node
+                fail_node(job_dir, node_id, errors=blocked.get("errors", [blocked.get("message", "")]), code=blocked.get("code"))
+            return blocked
+        result["warnings"].extend(guardrail_messages(warning_results))
+        logger.warning("packmol-memgen not available, trying OpenMM fallback")
+        _node_mode = job_dir and node_id
+        if _node_mode:
+            from mdclaw._node import begin_node
+            fallback_dir = (Path(job_dir) / "nodes" / node_id / "artifacts").resolve()
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            begin_node(job_dir, node_id)
+            output_dir = str(fallback_dir)
+        fallback_result = _solvate_with_openmm(
+            pdb_path=pdb_path,
+            result=result,
+            output_dir=output_dir,
+            output_name=output_name,
+            dist=dist,
+            cubic=cubic,
+            salt=salt,
+            salt_c=salt_c,
+            salt_a=salt_a,
+            saltcon=saltcon,
+            water_model=water_model,
+            subdirectory=not _node_mode,
+        )
+        if _node_mode:
+            from mdclaw._node import complete_node, fail_node, update_job_summaries
+            if fallback_result.get("success"):
+                if not fallback_result.get("box_dimensions"):
+                    fallback_result["success"] = False
+                    fallback_result["errors"].append(
+                        "OpenMM fallback solvation did not produce box_dimensions"
+                    )
+            if fallback_result.get("success"):
+                complete_node(job_dir, node_id,
+                    artifacts={
+                        "solvated_pdb": f"artifacts/{output_name}.pdb",
+                        "box_dimensions": "artifacts/box_dimensions.json",
+                    },
+                    metadata={
+                        "water_model": water_model,
+                        "backend": "openmm_fallback",
+                        "neutralization_expected": bool(salt),
+                        "buffer_distance_angstrom": dist,
+                        "salt_cation": salt_c,
+                        "salt_anion": salt_a,
+                        "salt_concentration_M": saltcon,
+                        "solute_net_charge_e": fallback_result.get(
+                            "solute_net_charge_e"
+                        ),
+                        "ion_counts": fallback_result.get("ion_counts"),
+                        "total_atoms": fallback_result.get("statistics", {}).get("total_atoms"),
+                    },
+                    warnings=fallback_result.get("warnings", []))
+                update_job_summaries(job_dir, params={
+                    "solvation_type": "explicit",
+                    "water_model": water_model,
+                })
+            else:
+                fail_node(job_dir, node_id, errors=fallback_result.get("errors", []), code=fallback_result.get("code"))
+        return fallback_result
+
+    # Predict the box before packing: an elongated solute in the default cubic
+    # box (79_soluble_1ewf: 179 A per side, ~580k atoms) is cheap to avoid here.
+    try:
+        box_advisory = box_size_advisory(
+            pdb_path, dist=dist, cubic=cubic, water_model=water_model,
+        )
+    except Exception as exc:  # noqa: BLE001 - advisory only
+        box_advisory = None
+        logger.debug(f"box size advisory unavailable: {exc}")
+    if box_advisory:
+        result["box_advisory"] = box_advisory
+        elongated = elongated_cubic_warning(box_advisory)
+        if elongated:
+            result["warnings"].append(elongated)
+
+    # Setup output directory
+    _node_mode = job_dir and node_id
+    if _node_mode:
+        from mdclaw._node import begin_node
+        out_dir = (Path(job_dir) / "nodes" / node_id / "artifacts").resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        begin_node(job_dir, node_id)
+    else:
+        base_dir = Path(output_dir) if output_dir else WORKING_DIR
+        out_dir = create_unique_subdir(base_dir, "solvate")
+    result["output_dir"] = str(out_dir)
+
+    # Copy input file to output directory
+    input_copy = out_dir / pdb_path.name
+    shutil.copy(pdb_path, input_copy)
+    packmol_input = out_dir / f"{pdb_path.stem}.packmol.pdb"
+    _write_packmol_safe_solute(input_copy, packmol_input)
+
+    auto_charge_delta_report = {
+        "success": True,
+        "charge_pdb_delta": 0,
+        "segments": [],
+        "applied_segment_count": 0,
+        "reason": "not evaluated",
+    }
+    try:
+        auto_charge_delta_report = _auto_nucleic_packmol_charge_pdb_delta(packmol_input)
+    except Exception as exc:  # noqa: BLE001
+        auto_charge_delta_report = {
+            "success": False,
+            "code": "forcefield_template_contract_unavailable",
+            "errors": [
+                "Could not read the nucleic force-field template contract: "
+                f"{type(exc).__name__}: {exc}"
+            ],
+            "charge_pdb_delta": 0,
+            "segments": [],
+            "reason": "force-field template contract unavailable",
+        }
+    nucleic_charge_delta = int(auto_charge_delta_report.get("charge_pdb_delta", 0))
+
+    lipid_charge_delta_report = {
+        "success": True,
+        "charge_pdb_delta": 0,
+        "lipids": [],
+        "applied_lipid_count": 0,
+        "reason": "not evaluated",
+    }
+    try:
+        lipid_charge_delta_report = _auto_lipid_packmol_charge_pdb_delta(packmol_input)
+    except Exception as exc:  # noqa: BLE001
+        lipid_charge_delta_report = {
+            "success": False,
+            "code": "forcefield_template_contract_unavailable",
+            "errors": [
+                "Could not read the lipid force-field template contract: "
+                f"{type(exc).__name__}: {exc}"
+            ],
+            "charge_pdb_delta": 0,
+            "lipids": [],
+            "reason": "force-field template contract unavailable",
+        }
+    lipid_charge_delta = int(lipid_charge_delta_report.get("charge_pdb_delta", 0))
+
+    contract_errors = [
+        error
+        for report in (auto_charge_delta_report, lipid_charge_delta_report)
+        if not report.get("success", False)
+        for error in report.get("errors", [])
+    ]
+    if contract_errors:
+        result["code"] = next(
+            (
+                report.get("code")
+                for report in (auto_charge_delta_report, lipid_charge_delta_report)
+                if not report.get("success", False) and report.get("code")
+            ),
+            "forcefield_template_contract_mismatch",
+        )
+        result["errors"].extend(contract_errors)
+        result["nucleic_charge_report"] = auto_charge_delta_report
+        result["lipid_charge_report"] = lipid_charge_delta_report
+        if _node_mode:
+            from mdclaw._node import fail_node
+            fail_node(job_dir, node_id, errors=result["errors"], code=result.get("code"))
+        return result
+
+    metal_charge_delta_report = {
+        "charge_pdb_delta": 0,
+        "ions": [],
+        "applied_ion_count": 0,
+        "reason": "not evaluated",
+    }
+    try:
+        metal_charge_delta_report = _auto_metal_ion_packmol_charge_pdb_delta(packmol_input)
+    except Exception as exc:  # noqa: BLE001
+        result["warnings"].append(
+            "Could not evaluate automatic metal-ion charge_pdb_delta "
+            f"for packmol-memgen: {type(exc).__name__}: {exc}"
+        )
+    metal_charge_delta = int(metal_charge_delta_report.get("charge_pdb_delta", 0))
+
+    ligand_charge_delta_report = {
+        "charge_pdb_delta": 0,
+        "ligands": [],
+        "applied_ligand_count": 0,
+        "reason": "not evaluated",
+    }
+    try:
+        ligand_charge_delta_report = _ligand_chemistry_packmol_charge_pdb_delta(
+            ligand_chemistry
+        )
+    except Exception as exc:  # noqa: BLE001
+        result["warnings"].append(
+            "Could not evaluate automatic ligand charge_pdb_delta "
+            f"for packmol-memgen: {type(exc).__name__}: {exc}"
+        )
+    ligand_charge_delta = int(ligand_charge_delta_report.get("charge_pdb_delta", 0))
+
+    auto_charge_delta = (
+        nucleic_charge_delta
+        + lipid_charge_delta
+        + metal_charge_delta
+        + ligand_charge_delta
+    )
+    # Packmol-memgen estimates prepared-residue charge. Apply the curated
+    # true-minus-guess correction before its counterion calculation.
+    auto_charge_delta_applied = bool(auto_charge_delta)
+    _reasons = [
+        r for r in (
+            auto_charge_delta_report.get("reason"),
+            lipid_charge_delta_report.get("reason"),
+            metal_charge_delta_report.get("reason"),
+            ligand_charge_delta_report.get("reason"),
+        )
+        if r
+    ]
+    result["auto_charge_pdb_delta"] = auto_charge_delta
+    result["auto_charge_pdb_delta_applied"] = auto_charge_delta_applied
+    result["auto_charge_pdb_delta_reason"] = "; ".join(_reasons) or None
+    result["nucleic_charge_segments"] = auto_charge_delta_report.get("segments", [])
+    result["nucleic_charge_report"] = auto_charge_delta_report
+    result["lipid_charge_delta"] = lipid_charge_delta
+    result["lipid_charge_entries"] = lipid_charge_delta_report.get("lipids", [])
+    result["lipid_charge_report"] = lipid_charge_delta_report
+    result["metal_ion_charge_delta"] = metal_charge_delta
+    result["metal_ion_charge_entries"] = metal_charge_delta_report.get("ions", [])
+    result["ligand_charge_delta"] = ligand_charge_delta
+    result["ligand_charge_delta_entries"] = ligand_charge_delta_report.get("ligands", [])
+    result["parameters"]["auto_charge_pdb_delta"] = auto_charge_delta
+    result["parameters"]["auto_charge_pdb_delta_applied"] = auto_charge_delta_applied
+    result["parameters"]["forcefield_charge_templates"] = {
+        "nucleic": auto_charge_delta_report.get("forcefield_xml"),
+        "lipid": lipid_charge_delta_report.get("forcefield_xml"),
+    }
+
+    # Output file
+    output_file = out_dir / f"{output_name}.pdb"
+    packlog = out_dir / f"{output_name}_packmol"
+
+    try:
+        # Build packmol-memgen command
+        args = [
+            '--solvate',
+            '--dist', str(dist),
+            '--pdb', str(packmol_input),
+            '-o', str(output_file),
+            '--packlog', str(packlog),
+            '--ffwat', water_model.lower(),  # Water model for solvation
+            '--tolerance', '2.0'  # Default packmol tolerance
+        ]
+
+        if auto_charge_delta_applied:
+            args.extend(['--charge_pdb_delta', str(auto_charge_delta)])
+
+        if cubic:
+            args.append('--cubic')
+
+        # Counterion species applies to neutralization too, so it is passed
+        # whether or not bulk salt is requested; otherwise memgen falls back to
+        # its own K+ default and silently ignores salt_c.
+        args.extend(['--salt_c', salt_c, '--salt_a', salt_a])
+
+        if salt:
+            args.extend(['--salt', '--saltcon', str(saltcon)])
+            if salt_override:
+                _append_salt_override_arg(args)
+        else:
+            args.append('--nocounter')
+        
+        if overwrite:
+            args.append('--overwrite')
+        
+        if notprotonate:
+            args.append('--notprotonate')
+        
+        if preoriented:
+            args.append('--preoriented')
+        
+        if keepligs:
+            args.append('--keepligs')
+        
+        # Add packmol path as command-line argument (packmol-memgen doesn't read PACKMOL_PATH env var)
+        packmol_path = shutil.which("packmol")
+        if packmol_path:
+            args.extend(['--packmol', packmol_path])
+            logger.info(f"Using packmol: {packmol_path}")
+
+        logger.info(f"Running packmol-memgen with args: {' '.join(args)}")
+
+        # Run packmol-memgen (no need for env_vars since we pass --packmol)
+        solvation_timeout = get_timeout("solvation")
+        packmol_inp_file = out_dir / f"{output_name}_packmol.inp"
+        try:
+            proc_result = packmol_memgen_wrapper.run(
+                args, cwd=out_dir, timeout=solvation_timeout
+            )
+        except subprocess.CalledProcessError as exc:
+            diagnostics = _packmol_memgen_diagnostics(
+                out_dir=out_dir,
+                output_name=output_name,
+                exc=exc,
+            )
+            if salt and not salt_override and _diagnostics_require_salt_override(diagnostics):
+                _record_salt_override_fallback(
+                    result=result,
+                    out_dir=out_dir,
+                    output_name=output_name,
+                    saltcon=saltcon,
+                    mode="solvated",
+                )
+                _append_salt_override_arg(args)
+                proc_result = packmol_memgen_wrapper.run(
+                    args, cwd=out_dir, timeout=solvation_timeout
+                )
+            else:
+                raise
+        else:
+            diagnostics = _packmol_memgen_diagnostics(
+                out_dir=out_dir,
+                output_name=output_name,
+                proc_result=proc_result,
+            )
+            if (
+                salt
+                and not salt_override
+                and not output_file.exists()
+                and _diagnostics_require_salt_override(diagnostics)
+            ):
+                _record_salt_override_fallback(
+                    result=result,
+                    out_dir=out_dir,
+                    output_name=output_name,
+                    saltcon=saltcon,
+                    mode="solvated",
+                )
+                _append_salt_override_arg(args)
+                proc_result = packmol_memgen_wrapper.run(
+                    args, cwd=out_dir, timeout=solvation_timeout
+                )
+
+        _run_packmol_if_needed(
+            output_file=output_file,
+            packmol_inp_file=packmol_inp_file,
+            packmol_path=packmol_path,
+            out_dir=out_dir,
+            output_name=output_name,
+            timeout=solvation_timeout,
+            result=result,
+        )
+        _record_packmol_memgen_output(
+            output_file=output_file,
+            packmol_inp_file=packmol_inp_file,
+            out_dir=out_dir,
+            output_name=output_name,
+            proc_result=proc_result,
+            result=result,
+            success_message="Successfully solvated structure",
+        )
+        if result.get("success") and output_file.exists():
+            diagnostics = _packmol_memgen_diagnostics(
+                out_dir=out_dir,
+                output_name=output_name,
+                proc_result=proc_result,
+            )
+            result["solute_net_charge_e"] = (
+                _neutralization_charge_from_diagnostics(diagnostics)
+            )
+            result["ion_counts"] = _count_requested_ions(
+                output_file, salt_c, salt_a
+            )
+            restore_report = _restore_packmol_solute_identity(input_copy, output_file)
+            result.update(restore_report)
+            result["warnings"].extend(restore_report.get("solute_identity_restore_warnings", []))
+            if not restore_report.get("solute_identity_preserved"):
+                result["success"] = False
+                result["code"] = "solute_identity_not_preserved"
+                result["errors"].append(
+                    "Packmol output did not preserve every source solute residue; "
+                    "the solvated structure is not safe to use."
+                )
+            if result.get("success"):
+                _record_periodic_seam(result, output_file, result.get("box_dimensions") or {})
+                large = large_system_warning(
+                    (result.get("statistics") or {}).get("total_atoms"), job_dir=job_dir,
+                )
+                if large:
+                    result["warnings"].append(large)
+
+    except Exception as e:
+        error_msg = f"Error during solvation: {type(e).__name__}: {str(e)}"
+        result["errors"].append(error_msg)
+        logger.error(error_msg)
+        
+        if "timeout" in str(e).lower():
+            result["errors"].append("Hint: Solvation timed out. Try reducing box size or simplifying the structure.")
+    
+    # Save metadata
+    metadata_file = out_dir / "solvation_metadata.json"
+    with open(metadata_file, 'w') as f:
+        json.dump(result, f, indent=2, default=str)
+
+    # Node state update
+    if _node_mode:
+        from mdclaw._node import complete_node, fail_node, update_job_summaries
+        if result.get("success"):
+            _box = result.get("box_dimensions", {})
+            if not _box:
+                result["success"] = False
+                result["errors"].append(
+                    "Explicit solvation completed but box_dimensions could not be extracted"
+                )
+                fail_node(job_dir, node_id, errors=result.get("errors", []), code=result.get("code"))
+                return result
+            complete_node(job_dir, node_id,
+                artifacts={
+                    "solvated_pdb": f"artifacts/{output_name}.pdb",
+                    "box_dimensions": "artifacts/box_dimensions.json",
+                },
+                metadata={
+                    "water_model": water_model,
+                    # The OpenMM fallback above records its own backend.
+                    "backend": "packmol-memgen",
+                    "backend_version": installed_version("packmol_memgen"),
+                    "neutralization_expected": bool(salt),
+                    "box_shape": "cubic" if _box.get("is_cubic") else "rectangular",
+                    "buffer_distance_angstrom": dist,
+                    "salt_concentration_M": saltcon,
+                    "solute_net_charge_e": result.get(
+                        "solute_net_charge_e"
+                    ),
+                    "ion_counts": result.get("ion_counts"),
+                    "auto_charge_pdb_delta": result.get("auto_charge_pdb_delta"),
+                    "auto_charge_pdb_delta_applied": result.get(
+                        "auto_charge_pdb_delta_applied"
+                    ),
+                    "ligand_charge_delta": result.get("ligand_charge_delta"),
+                    "lipid_charge_delta": result.get("lipid_charge_delta"),
+                    "forcefield_charge_templates": result.get("parameters", {}).get(
+                        "forcefield_charge_templates"
+                    ),
+                    "total_atoms": result.get("statistics", {}).get("total_atoms"),
+                    "water_model_source": water_model_source,
+                },
+                warnings=result.get("warnings") or None)
+            update_job_summaries(job_dir, params={
+                "solvation_type": "explicit",
+                "water_model": water_model,
+            })
+        else:
+            fail_node(job_dir, node_id, errors=result.get("errors", []), code=result.get("code"))
+
+    return result

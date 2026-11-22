@@ -1,0 +1,422 @@
+use egui::{ComboBox, RichText, Slider, Ui};
+use graphics::{EngineUpdates, EntityUpdate, Scene};
+use mol_defs::sfc_mesh::MeshColoring;
+
+use crate::{
+    drawing::{
+        EntityClass, MoleculeView, draw_water,
+        peptide::{draw_density_point_cloud, draw_density_surface},
+        wrappers::{draw_all_ligs, draw_all_lipids, draw_all_nucleic_acids},
+    },
+    render::MESH_POCKET_START,
+    sfc_mesh::{apply_mesh_colors, get_mesh_colors},
+    state::State,
+    ui::{
+        COL_SPACING, DENS_ISO_MAX, DENS_ISO_MIN, misc,
+        misc::{active_color, toggle_btn, toggle_btn_inv},
+    },
+    util::{RedrawFlags, clear_mol_entity_indices},
+};
+
+fn molecule_view_selector(
+    ui: &mut Ui,
+    label: &str,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+    view: &mut MoleculeView,
+    options: &[MoleculeView],
+    help_text: &str,
+) -> bool {
+    ui.label(label).on_hover_text(help_text);
+    let prev_view = *view;
+
+    ComboBox::from_id_salt(id_salt)
+        .width(80.)
+        .selected_text(view.to_string())
+        .show_ui(ui, |ui| {
+            for option in options {
+                ui.selectable_value(view, *option, option.to_string());
+            }
+        })
+        .response
+        .on_hover_text(help_text);
+
+    *view != prev_view
+}
+pub fn view_settings(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    redraw: &mut RedrawFlags,
+    ui: &mut Ui,
+) {
+    let mol_help =
+        "(Hotkeys: square brackets [ ]). Change the way we display non-peptide molecules";
+    let peptide_help = "Change the way we display proteins/peptides";
+
+    if molecule_view_selector(
+        ui,
+        "Mol:",
+        "mol_view_non_peptide",
+        &mut state.ui.mol_view,
+        &MoleculeView::NON_PEPTIDE_OPTIONS,
+        mol_help,
+    ) {
+        state.ui.mol_view = state.ui.mol_view.non_peptide_or_default();
+        redraw.ligand = true;
+        redraw.na = true;
+        redraw.lipid = true;
+        // Ligands etc. that are part of a peptide use this view too.
+        redraw.peptide = !state.peptides.is_empty();
+    }
+
+    if !state.peptides.is_empty() {
+        ui.add_space(COL_SPACING / 2.);
+        if molecule_view_selector(
+            ui,
+            "Peptide:",
+            "mol_view_peptide",
+            &mut state.ui.mol_view_peptide,
+            &MoleculeView::PEPTIDE_OPTIONS,
+            peptide_help,
+        ) {
+            crate::protein_alignment::clear_comparison_view(state);
+            redraw.peptide = true;
+        }
+    }
+
+    if state.ui.mol_view_peptide == MoleculeView::Surface || !state.pockets.is_empty() {
+        mesh_coloring_selector(
+            &mut state.ui.mesh_coloring,
+            &mut state.volatile.flags.update_sas_coloring,
+            ui,
+        );
+    }
+    // Update any pocket meshes as well. Separate from the threaded protein one; this is
+    // fast enough to do directly.
+    for pocket in &mut state.pockets {
+        if state.volatile.flags.update_sas_coloring {
+            let colors = get_mesh_colors(
+                &pocket.surface_mesh,
+                &pocket.common,
+                state.ui.mesh_coloring,
+                updates,
+            );
+
+            apply_mesh_colors(&mut pocket.surface_mesh, &colors);
+            // todo warning: single scene pocket mesh again.
+            apply_mesh_colors(
+                &mut scene.meshes[MESH_POCKET_START + pocket.mesh_i_rel],
+                &colors,
+            );
+            updates.meshes = true;
+            redraw.pocket = true;
+        }
+    }
+
+    ui.add_space(COL_SPACING);
+
+    ui.label("Vis:");
+
+    if !state.peptides.is_empty() {
+        toggle_btn_inv(
+            &mut state.ui.visibility.hide_protein,
+            "Peptide",
+            "Show or hide the protein/peptide",
+            ui,
+            redraw,
+        );
+        toggle_btn_inv(
+            &mut state.ui.visibility.hide_hetero,
+            "Hetero",
+            "Show or hide non-amino-acid atoms in the protein/peptide",
+            ui,
+            redraw,
+        );
+
+        ui.add_space(COL_SPACING / 2.);
+
+        if !state.ui.visibility.hide_protein {
+            // Subset of peptide.
+            toggle_btn_inv(
+                &mut state.ui.visibility.hide_sidechains,
+                "Sidechains",
+                "Show or sidechains in the protein/peptide",
+                ui,
+                redraw,
+            );
+        }
+    }
+
+    if !state.pockets.is_empty()
+        || state
+            .ligands
+            .iter()
+            .filter(|l| l.pharmacophore.pocket.is_some())
+            .count()
+            != 0
+    {
+        toggle_btn_inv(
+            &mut state.ui.visibility.hide_pockets,
+            "Pockets",
+            "Show or hide explicitly-added protein pockets for screening, docking, etc",
+            ui,
+            redraw,
+        );
+    }
+
+    let hide_hydrogen_prev = state.ui.visibility.hide_hydrogen;
+    toggle_btn_inv(
+        &mut state.ui.visibility.hide_hydrogen,
+        "H",
+        "Show or hide non-amino-acid atoms in the protein/peptide",
+        ui,
+        redraw,
+    );
+
+    // Hanndle the other redraws.
+    if state.ui.visibility.hide_hydrogen != hide_hydrogen_prev {
+        redraw.set_all();
+    }
+
+    // We allow toggling water now regardless of hide hetero, as it's part of our MD sim.
+    // Subset of hetero.
+    let water_prev = state.ui.visibility.hide_water;
+    toggle_btn_inv(
+        &mut state.ui.visibility.hide_water,
+        "Water",
+        "Show or hide water molecules",
+        ui,
+        redraw,
+    );
+
+    if let Some(md) = &state.volatile.md_local.mol_dynamics
+        && state.ui.visibility.hide_water != water_prev
+    {
+        let snap = &md.snapshots[0];
+
+        draw_water(
+            scene,
+            &snap.water_o_posits,
+            &snap.water_h0_posits,
+            &snap.water_h1_posits,
+            state.ui.visibility.hide_water,
+        );
+    }
+
+    if !state.ligands.is_empty() {
+        toggle_btn_inv(
+            &mut state.ui.visibility.hide_ligand,
+            "Lig",
+            "Show or hide small molecules / ligands",
+            ui,
+            redraw,
+        );
+    }
+
+    if !state.nucleic_acids.is_empty() {
+        toggle_btn_inv(
+            &mut state.ui.visibility.hide_nucleic_acids,
+            "Nucleic acids",
+            "Show or hide nucleic acids",
+            ui,
+            redraw,
+        );
+    }
+
+    if !state.lipids.is_empty() {
+        toggle_btn_inv(
+            &mut state.ui.visibility.hide_lipids,
+            "Lipid",
+            "Show or hide lipids",
+            ui,
+            redraw,
+        );
+    }
+
+    toggle_btn_inv(
+        &mut state.ui.visibility.hide_h_bonds,
+        "H bonds",
+        "Show or hide Hydrogen bonds",
+        ui,
+        redraw,
+    );
+
+    toggle_btn(
+        &mut state.ui.visibility.labels.mol,
+        "Lbl",
+        "Show or hide molecule name labels",
+        ui,
+        redraw,
+    );
+
+    toggle_btn(
+        &mut state.ui.visibility.labels.atom_sn,
+        "SN",
+        "Show or hide atom serial numbers overlaid on their positions",
+        ui,
+        redraw,
+    );
+
+    if !state.peptides.is_empty() {
+        toggle_btn(
+            &mut state.ui.visibility.labels.chain,
+            "Lbl Ch",
+            "Show or hide chain labels. (i.e. for proteins)",
+            ui,
+            redraw,
+        );
+        toggle_btn(
+            &mut state.ui.visibility.labels.residue_letter,
+            "Lbl AA",
+            "Show or hide one-letter amino-acid labels at each residue's backbone center",
+            ui,
+            redraw,
+        );
+    }
+
+    let num_pharm = state
+        .ligands
+        .iter()
+        .filter(|l| !l.pharmacophore.features.is_empty())
+        .count();
+    // if !(state.ligands.is_empty() && state.pharmacophores.is_empty()) {
+    if num_pharm != 0 {
+        toggle_btn_inv(
+            &mut state.ui.visibility.hide_pharmacophore,
+            "Phar",
+            "Show or hide pharmacophores",
+            ui,
+            redraw,
+        );
+    }
+
+    if let Some(mol) = state
+        .peptide_for_tools_i()
+        .and_then(|i| state.peptides.get(i))
+        && let Some(dens) = &mol.elec_density
+    {
+        let mut redraw_dens = false;
+
+        // `toggle_btn_inv`, but with out `RedrawFlags`.
+        let color = active_color(!state.ui.visibility.hide_density_point_cloud);
+        if ui
+            .button(RichText::new("Density").color(color))
+            .on_hover_text("Show or hide the electron density point cloud visualization")
+            .clicked()
+        {
+            state.ui.visibility.hide_density_point_cloud =
+                !state.ui.visibility.hide_density_point_cloud;
+            // todo: Don't need to redraw everything.
+            redraw_dens = true;
+        }
+
+        if redraw_dens {
+            if state.ui.visibility.hide_density_point_cloud {
+                scene
+                    .entities
+                    .retain(|ent| ent.class != EntityClass::DensityPoint as u32);
+            } else {
+                draw_density_point_cloud(&mut scene.entities, dens);
+            }
+            clear_mol_entity_indices(state, None);
+            updates.entities = EntityUpdate::All;
+            // engine_updates.entities.push_class(EntityClass::Peptide as u32);
+        }
+
+        let mut redraw_dens_surface = false;
+
+        // This is `toggle_btn_inv`, but with out `RedrawFlags`.
+        let color = active_color(!state.ui.visibility.hide_density_surface);
+        if ui
+            .button(RichText::new("Density sfc").color(color))
+            .on_hover_text("Show or hide the electron density isosurface visualization")
+            .clicked()
+        {
+            state.ui.visibility.hide_density_surface = !state.ui.visibility.hide_density_surface;
+            redraw_dens_surface = true;
+        }
+
+        if !state.ui.visibility.hide_density_surface {
+            let iso_prev = state.ui.density_iso_level;
+
+            ui.spacing_mut().slider_width = 300.;
+            ui.add(Slider::new(
+                &mut state.ui.density_iso_level,
+                DENS_ISO_MIN..=DENS_ISO_MAX,
+            ))
+            .on_hover_text("The density value at which to draw the ISO surface");
+            if state.ui.density_iso_level != iso_prev {
+                state.volatile.flags.make_density_iso_mesh = true;
+            }
+        }
+
+        if redraw_dens_surface {
+            if state.ui.visibility.hide_density_surface {
+                scene
+                    .entities
+                    .retain(|ent| ent.class != EntityClass::DensitySurface as u32);
+                clear_mol_entity_indices(state, None);
+                updates.entities = EntityUpdate::All;
+            } else {
+                draw_density_surface(&mut scene.entities, state, updates);
+            }
+        }
+    }
+}
+
+fn vis_helper(vis: &mut bool, name: &str, tooltip: &str, ui: &mut Ui) {
+    toggle_btn(vis, name, tooltip, ui, &mut Default::default());
+}
+
+/// For toggling on and off UI sections.
+pub fn ui_section_vis(state: &mut State, ui: &mut Ui) {
+    if !state.peptides.is_empty() {
+        let tooltip = "Show or hide the amino acid sequence of the currently opened protein \
+                    as single-letter identifiers. When in this mode, click the AA letter to select its residue.";
+
+        vis_helper(&mut state.ui.ui_vis.aa_seq, "Seq", tooltip, ui);
+    }
+
+    let tooltip = "Show or hide tools for creating lipids";
+    vis_helper(&mut state.ui.ui_vis.lipids, "Lipid", tooltip, ui);
+
+    let tooltip = "Show or hide tools for creating nucleic acids (DNA, RNA)";
+    vis_helper(&mut state.ui.ui_vis.nucleic_acids, "NA", tooltip, ui);
+
+    let tooltip = "Show or hide tools for creating amino acid sequences (peptides, proteins). This can be used to build arbitrary proteins \
+    from a primary sequence.";
+    vis_helper(&mut state.ui.ui_vis.amino_acids, "AA", tooltip, ui);
+
+    let tooltip = "Show or hide the molecular dynamics section of the UI.";
+    vis_helper(&mut state.ui.ui_vis.dynamics, "MD", tooltip, ui);
+
+    let tooltip = "Show or hide the AA selection section of the UI";
+    vis_helper(&mut state.ui.ui_vis.aa_selection, "AA Sel", tooltip, ui);
+}
+
+pub fn mesh_coloring_selector(coloring: &mut MeshColoring, update_flag: &mut bool, ui: &mut Ui) {
+    let help_text = "If selected, the solvent-accessible surface will be colored according \
+                to the atoms closest to it. If not, it will display as a constant color.";
+    ui.label("Color sfc:").on_hover_text(help_text);
+
+    let prev = *coloring;
+    ComboBox::from_id_salt(9912)
+        .width(80.)
+        .selected_text(coloring.to_string())
+        .show_ui(ui, |ui| {
+            for v in [
+                MeshColoring::Solid,
+                MeshColoring::Element,
+                MeshColoring::PartialCharge,
+                MeshColoring::Lipophilicity,
+            ] {
+                ui.selectable_value(coloring, v, v.to_string());
+            }
+        })
+        .response
+        .on_hover_text(help_text);
+
+    if *coloring != prev {
+        *update_flag = true;
+    }
+}

@@ -1,0 +1,346 @@
+import io
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from proteingym.base.assay import FieldEncoding
+from proteingym.base.manifest import Manifest
+
+
+@pytest.fixture
+def manifest_contents() -> str:
+    return """
+version = "1.0.0"
+name = "Example Dataset"
+description = "This is an example dataset for demonstration purposes."
+reference_sequence_name = "abc"
+
+[[ assay_variables ]]
+name = "PH"
+description = "pH level of the samples"
+encoding = "numerical"
+unit = "pH"
+
+[[ assay_targets ]]
+name = "DMS Score"
+description = "DMS score of the samples"
+unit = "log fold change"
+
+[[ assay_targets ]]
+name = "DMS Score Bin"
+description = "DMS score bin of the samples"
+
+[[ assays ]]
+name = "assay"
+path = "assay.csv"
+sequence_alphabet = "AA"
+library_construction_method = "discrete"
+growth_coupled = true
+readout = "rna_sequencing"
+transformation = "non_parametric"
+target_phenotype = "activity"
+has_uncertainty = true
+number_of_biological_replicates = 3
+
+[[ assays.targets ]]
+name = "DMS Score"
+alias = "DMS_score"
+
+[[ assays.targets ]]
+name = "DMS Score Bin"
+alias = "DMS_score_bin"
+
+[[ assays.non_targets ]]
+name = "split"
+
+[ assays.variables ]
+PH = 7
+
+[[ assays_raw ]]
+name = "assay"
+path = "assay_raw.csv"
+
+[[ assays_raw.fields ]]
+name = "OD"
+unit = "log10(l0 / l)"
+description = "Optical density at 600nm"
+
+[[ sequences ]]
+type = "wild_type"
+alphabet = "DNA"
+path = "sequences.fasta"
+pfam_ids = ["PF00114"]
+
+[[ structures ]]
+path = "structures.pdb"
+
+[[ msas ]]
+path = "msas.a3m"
+format = "a3m"
+neff_per_l = 10.0
+bit_score = 0.5
+theta = 0.8
+reference_sequence_name = "abc"
+sequence_start = 1
+sequence_end = 10
+
+[[ msa_weights ]]
+name = "msas"
+path = "msas_weights.npy"
+"""
+
+
+@pytest.fixture
+def manifest_path(tmp_path: Path, manifest_contents: str) -> Path:
+    """A (temporary) manifest file."""
+    # Mock files need to exist for the manifest validation to pass
+    sequence_file = tmp_path / "sequences.fasta"
+    structure_file = tmp_path / "structures.pdb"
+    msa_file = tmp_path / "msas.a3m"
+    msa_weights_file = tmp_path / "msas_weights.npy"
+    assay_file = tmp_path / "assay.csv"
+    assay_raw_file = tmp_path / "assay_raw.csv"
+    for path in (
+        sequence_file,
+        structure_file,
+        msa_file,
+        msa_weights_file,
+        assay_file,
+        assay_raw_file,
+    ):
+        path.touch()
+    # Write header in the assay file
+    assay_file.write_text("sequence,DMS_score,DMS_score_bin,split\n")
+    assay_raw_file.write_text("OD\n")
+    manifest_file = tmp_path / "manifest.toml"
+    manifest_file.write_text(manifest_contents, encoding="utf-8")
+    return manifest_file
+
+
+def test_manifest_contents_in_documentation(manifest_contents: str) -> None:
+    """Check if the manifest contents are present in the documentation.
+
+    If this tests fails, it indicates that the documentation is not up-to-date
+    with the tested manifest contents, or vice versa. Solve this by updating
+    outdated contents.
+
+    Or, the documentation or test file is moved. Solve this by updating the path.
+    """
+    documentation_file_path = Path(__file__).parent.parent / Path("docs/manifest.md")
+    documentation_contents = documentation_file_path.read_text(encoding="utf-8")
+
+    assert documentation_file_path.exists(), (
+        f"Documentation file does not exist: {documentation_file_path}"
+    )
+    assert manifest_contents in documentation_contents, (
+        "Test manifest contents not found in documentation."
+    )
+
+
+def test_manifest_from_path_like_minimal_contents() -> None:
+    """The manifest requires only a name at minimum."""
+    manifest_contents_minimal = io.StringIO("version = '1.0.0'\nname = 'dataset'")
+
+    try:
+        Manifest.from_path(manifest_contents_minimal)
+    except ValidationError as e:
+        raise AssertionError("ValidationError raised") from e
+    else:
+        assert True, "Manifest loaded successfully from path-like object."
+
+
+def test_manifest_from_path_like_requires_version_field() -> None:
+    """The manifest version is a required field."""
+    manifest_contents_without_version = io.StringIO("name = 'dataset'")
+
+    with pytest.raises(
+        ValidationError,
+        match="validation error for Manifest\nversion\n  Field required",
+    ):
+        Manifest.from_path(manifest_contents_without_version)
+
+
+def test_manifest_from_path_like_requires_name_field() -> None:
+    """The manifest name is a required field."""
+    manifest_contents_without_name = io.StringIO(
+        "version = '1.0.0'\ndescription = 'example description'"
+    )
+
+    with pytest.raises(
+        ValidationError, match="validation error for Manifest\nname\n  Field required"
+    ):
+        Manifest.from_path(manifest_contents_without_name)
+
+
+def test_manifest_from_path_like_requires_name_field_with_non_zero_length() -> None:
+    """The manifest name is required to have non-zero length."""
+    manifest_contents_without_name = io.StringIO("version = '1.0.0'\nname = ''")
+
+    match = (
+        "validation error for Manifest\nname\n  String should have at least 1 character"
+    )
+    with pytest.raises(ValidationError, match=match):
+        Manifest.from_path(manifest_contents_without_name)
+
+
+def test_manifest_from_path_like_version_field_is_semantic() -> None:
+    """The manifest version is required to have a semantic version."""
+    manifest_contents_with_date_version = io.StringIO(
+        "name = 'd'\nversion = '2023-10-05'"
+    )  # Try date version format
+
+    match = r".* Value error, 2023-10-05 is not valid SemVer string .*"
+    with pytest.raises(ValidationError, match=match):
+        Manifest.from_path(manifest_contents_with_date_version)
+
+
+def test_manifest_from_path(manifest_path: Path) -> None:
+    """Happy flow for loading a Manifest from a file path."""
+    Manifest.from_path(manifest_path)
+
+
+def test_manifest_from_path_assay_enums(manifest_path: Path):
+    manifest = Manifest.from_path(manifest_path)
+    assay = manifest.assays[0]
+    assert assay.library_construction_method == "discrete"
+    assert assay.growth_coupled is True
+    assert assay.readout == "rna_sequencing"
+    assert assay.transformation == "non_parametric"
+    assert assay.target_phenotype == "activity"
+
+
+def test_manifest_from_path_number_of_biological_replicates(manifest_path: Path):
+    manifest = Manifest.from_path(manifest_path)
+    assay = manifest.assays[0]
+    assert assay.number_of_biological_replicates == 3
+
+
+def test_manifest_from_path_number_of_biological_replicates_defaults_to_none(
+    tmp_path: Path, manifest_path: Path
+) -> None:
+    """number_of_biological_replicates is optional and defaults to None."""
+    contents = manifest_path.read_text().replace(
+        "number_of_biological_replicates = 3\n", ""
+    )
+    path = tmp_path / "manifest.toml"
+    path.write_text(contents)
+    manifest = Manifest.from_path(path)
+    assert manifest.assays[0].number_of_biological_replicates is None
+
+
+def test_manifest_from_non_existing_path(tmp_path: Path) -> None:
+    """The manifest cannot be loaded from a non-existing path."""
+    non_existing_path = tmp_path / "non_existing_manifest.toml"
+    with pytest.raises(
+        FileNotFoundError,
+        match=f"No such file or directory: '{non_existing_path.as_posix()}'",
+    ):
+        Manifest.from_path(non_existing_path)
+
+
+@pytest.mark.parametrize(
+    "protein_data_attribute", ["assays", "sequences", "structures", "msas"]
+)
+def test_manifest_from_path_has_protein_data(
+    manifest_path: Path, protein_data_attribute: str
+) -> None:
+    """The manifest optionally has protein data. See if they are loaded correctly."""
+    manifest = Manifest.from_path(manifest_path)
+    assert len(getattr(manifest, protein_data_attribute)) == 1, (
+        f"Expecting one {protein_data_attribute}"
+    )
+
+
+def test_manifest_version() -> None:
+    """The manifest version should support comparisons."""
+    manifest_v1 = Manifest(name="test", version="1.0.0")  # noqa
+    manifest_v2 = Manifest(name="test", version="2.0.0")  # noqa
+
+    assert manifest_v1.version == manifest_v1.version
+    assert manifest_v1.version <= manifest_v1.version
+    assert manifest_v1.version >= manifest_v1.version
+
+    assert manifest_v1.version != manifest_v2.version
+    assert manifest_v1.version < manifest_v2.version
+    assert manifest_v2.version > manifest_v1.version
+    assert manifest_v1.version <= manifest_v2.version
+    assert manifest_v2.version >= manifest_v1.version
+
+
+def test_manifest_dump_creates_file_with_content(tmp_path: Path) -> None:
+    """The manifest dump should create a file with content."""
+    manifest = Manifest(version="1.0.0", name="test")  # noqa
+
+    path = manifest.dump(path=tmp_path)
+
+    assert path.exists(), "Dumped manifest file does not exist."
+    assert path.stat().st_size > 0, "Dumped manifest file is empty."
+
+
+def test_manifest_dump_from_path_unit(tmp_path: Path) -> None:
+    """The manifest dump creates a file that can be loaded back with same content."""
+    manifest = Manifest(version="1.0.0", name="test")  # noqa
+
+    path = manifest.dump(path=tmp_path)
+
+    try:
+        loaded_manifest = Manifest.from_path(path)
+    except ValidationError as e:
+        raise AssertionError(
+            f"Loading manifest failed:``` toml\n{path.read_text()}```"
+        ) from e
+    else:
+        assert loaded_manifest == manifest, (
+            f"Loaded manifest does not match dumped manifest: {path.read_text()}"
+        )
+
+
+def test_manifest_from_path_assay_variable_enum(manifest_path: Path):
+    manifest = Manifest.from_path(manifest_path)
+    assert manifest.assay_variables[0].encoding == FieldEncoding.NUMERICAL
+
+
+def test_manifest_dump_from_path_unit_docs_example(
+    tmp_path: Path, manifest_path: Path
+) -> None:
+    """The manifest dump creates a file that can be loaded back with same content.
+
+    Use the example from the documentation for more complicated manifest.
+    """
+    manifest = Manifest.from_path(manifest_path)
+    path = tmp_path / "manifest.toml"
+    manifest.dump(path=path)
+    try:
+        loaded_manifest = Manifest.from_path(path)
+    except ValidationError as e:
+        raise AssertionError(
+            f"Loading manifest failed:``` toml\n{path.read_text()}```"
+        ) from e
+    else:
+        assert loaded_manifest == manifest, (
+            f"Loaded manifest does not match dumped manifest: {path.read_text()}"
+        )
+
+
+def test_manifest_dump_version_string(tmp_path: Path) -> None:
+    """The version should be dumped as a string."""
+    manifest = Manifest(name="test", version="1.0.0")  # noqa
+
+    path = manifest.dump(path=tmp_path)
+
+    assert 'version = "1.0.0"' in path.read_text()
+
+
+@pytest.mark.parametrize(
+    "relative_path", ["sequences.fasta", "structures.pdb", "msas.a3m"]
+)
+def test_manifest_dump_relative_path(
+    tmp_path: Path, manifest_path: Path, relative_path: str
+) -> None:
+    """The protein data path should be dumped as relative paths."""
+    manifest = Manifest.from_path(manifest_path)
+
+    path = manifest.dump(path=tmp_path)
+
+    assert f'path = "{relative_path}"' in path.read_text()

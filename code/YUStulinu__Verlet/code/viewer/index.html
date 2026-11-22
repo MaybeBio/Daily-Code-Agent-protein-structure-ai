@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verlet viewer</title>
+<style>
+  :root { --bg: #f6f7f9; --panel: #fff; --ink: #1c2026; --muted: #5b6370; --line: #d9dde3; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: #0b0d10; --panel: #15181d; --ink: #e6e8eb; --muted: #9aa3ae; --line: #2a2f37; }
+  }
+  :root[data-theme="dark"] { --bg: #0b0d10; --panel: #15181d; --ink: #e6e8eb; --muted: #9aa3ae; --line: #2a2f37; }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: grid; grid-template-columns: 300px 1fr; background: var(--bg); color: var(--ink);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  aside { background: var(--panel); border-right: 1px solid var(--line); padding: 16px; overflow-y: auto; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 18px 0 6px; }
+  select, button { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  #scene { width: 100%; }
+  input[type=range] { width: 100%; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  label { display: flex; gap: 8px; align-items: center; padding: 2px 0; }
+  ul { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 10px; }
+  li { display: flex; gap: 6px; align-items: center; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .muted { color: var(--muted); }
+  main { position: relative; min-width: 0; }
+  canvas { width: 100%; height: 100%; display: block; touch-action: none; }
+  .hint { position: absolute; left: 12px; bottom: 10px; color: #8b93a0; font-size: 12px; pointer-events: none; }
+  @media (max-width: 760px) {
+    body { grid-template-columns: 1fr; grid-template-rows: 55vh auto; height: auto; }
+    main { order: -1; height: 55vh; }
+    aside { border-right: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<aside>
+  <h1>Verlet</h1>
+  <select id="scene" aria-label="System"></select>
+  <p id="info" class="muted"></p>
+  <h2>Trajectory</h2>
+  <div class="row"><button id="play">Play</button><span id="frame" class="muted"></span></div>
+  <input id="time" type="range" min="0" value="0" aria-label="Frame">
+  <h2>Display</h2>
+  <label><input type="checkbox" id="water" checked> water</label>
+  <label>style <select id="style" aria-label="Atom size"><option value="0.3" selected>ball and stick</option><option value="1">space filling</option></select></label>
+  <h2>Elements</h2>
+  <ul id="legend"></ul>
+  <p id="notes" class="muted"></p>
+</aside>
+<main>
+  <canvas id="view"></canvas>
+  <div class="hint">drag: rotate · right drag: pan · wheel: zoom</div>
+</main>
+<script type="module" src="dist/src/main.js"></script>
+</body>
+</html>

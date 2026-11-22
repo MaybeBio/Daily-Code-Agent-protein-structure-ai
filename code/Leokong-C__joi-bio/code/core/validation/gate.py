@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""
+core.validation.gate — 파이프라인 자체를 검증하는 게이트.
+
+Joi_bio 신뢰성의 근거. 알려진 활성 화합물(known actives)을 라이브러리에 섞어
+넣고, 도킹 스코어가 이들을 상위로 올리는지 측정한다.
+
+게이트를 통과하지 못한 타깃의 화합물은 어떤 보고서에도 '히트'로 실리지 않는다.
+검증 없이 나온 후보 리스트는 파는 순간 신뢰를 잃기 때문이다.
+
+지표
+  EF1%   상위 1%에서 활성이 무작위 대비 몇 배로 농축됐는가
+  AUC    활성이 decoy보다 상위에 랭크될 확률
+  BEDROC 상위 가중 농축도 (alpha=20 → 상위 8% 구간에 가중)
+  benchmark_recovery  승인약/임상 화합물이 실제로 상위 1%에 들어왔는가
+
+판정
+  INSUFFICIENT  활성 수가 10개 미만 → 통계적으로 무의미, 지표를 믿지 않는다
+  INVALID       활성 비율이 높아 EF 임계값이 도달 불가능 → 라이브러리 재구성 필요
+  ABSTAIN       대조군이 없다 → 판정하지 않는다
+  PASS          절대 문턱 + 대조군 대비 유의한 우위 + 벤치마크 회수
+  FAIL          그 외
+
+2026-10-23 개정 — 왜 절대 문턱만으로는 안 되는가
+  EPAS1 음성 대조군(3H82, 벤치마크와 유사도 0.0714)이 세 문턱을 전부 넘었다.
+  EF1% 8.170 > 5.0, AUC 0.7161 > 0.70, BEDROC 0.3004 > 0.30.
+  벤치마크와 무관한 구조가 통과하는 문턱은 문턱이 아니다. 게다가 AUC 는
+  구조 선택 기여도가 7.2% 에 불과해(EF1% 은 75%) 사실상 편향에 면역이라,
+  2-of-3 규칙에서 거의 자동 통과한다.
+
+  그래서 문턱 숫자를 임의로 올리는 대신 판정 근거를 바꿨다. 통과하려면
+  같은 라이브러리를 닮지 않은 구조에 도킹한 대조군보다 **통계적으로 유의하게**
+  나아야 한다. 짝지은 부트스트랩으로 차이의 신뢰구간을 구해 0 을 배제하는지 본다.
+  대조군이 없으면 이 비교를 할 수 없으므로 PASS 도 FAIL 도 아닌 ABSTAIN 이다.
+
+  근거: Chaput et al. 2016, J Cheminform 8:56 — 편향 타깃을 제거하자
+  성공 타깃이 Glide 5/47, Gold 4/47 로 떨어졌다.
+"""
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+
+THRESHOLDS = {"nef1": 0.40, "auc": 0.70, "bedroc": 0.30}
+# nEF1% 는 EF1% 를 그 라이브러리의 천장으로 나눈 값(0~1)이라 활성 비율이
+# 달라도 비교된다. 절대 EF1% 5.0 을 쓰던 자리를 대신한다 — 그 문턱은 기억
+# 베이스라인만으로 45회 측정 중 41회(91%) 를 통과시켜 변별하지 못했다
+# (docs/target-selection.md, ci-results run 43040414978).
+#
+# 0.40 의 근거. 선정 타깃 오렉신1 의 기억 베이스라인은 5씨앗 전부 0.364
+# 이하이고, 실제 도킹 치료군은 0.773(MET 39216466282)~0.833(EPAS1
+# 41259689466) 이다. 그 사이에 둔 값이다.
+#
+# 한계를 같이 적는다 — 9타깃을 모두 모으면 0.40 에서도 기억이 53% 통과하고,
+# 기억 최고치(0.864, 콜린수송체)는 도킹 치료군보다 높다. 이 문턱 하나로
+# 교란이 사라지지 않으므로 기억 베이스라인은 계속 같은 표에 싣는다.
+#
+# 대조군에는 이 문턱을 적용하지 않는다(CEO 결정 11-16). 대조군은 편향 없는
+# 하한이라 enrichment 가 낮은 것이 설계대로이며(EPAS1 대조군 nEF1% 0.200),
+# 같은 잣대로 재면 거의 항상 미달해 규칙 2 의 양팔 보고를 막는다.
+# 수치는 그대로 산출한다 — 판정만 면제한다.
+MIN_ACTIVES = 10
+BEDROC_ALPHA = 20.0
+
+# 활성 비율 상한. 넘으면 AUC/BEDROC 이 함께 부풀려져 어떤 지표도 믿을 수 없다.
+#
+# 예전에는 이 검사가 "EF1% 천장이 절대 문턱 5.0 아래로 내려갔는가" 로 간접
+# 구현돼 있었다. 천장은 활성이 상위 1% 칸보다 많을 때 1/활성비율 이므로 그
+# 조건은 활성 비율 20% 초과와 같았다. nEF1% 는 그 천장으로 나눈 값이라 도달
+# 불가가 원리적으로 사라지고, 간접 검사도 함께 조용히 죽는다. 같은 지점을
+# 직접 적어 안전장치를 남긴다.
+ACTIVE_FRACTION_MAX = 0.20
+
+
+# 평가셋 완전성 문턱. 적용률이 이 아래면 판정을 INCOMPLETE 로 덮는다.
+# 샤드 하나가 빠지면 0.875 이하가 되어 걸리고, 정상적인 리간드 준비
+# 실패(PubChem 고정본 실측 3.90%)만으로는 걸리지 않는 자리에 두었다.
+COVERAGE_MIN = 0.90
+
+
+def enrichment_factor(labels: list[int], frac: float) -> float | None:
+    """labels는 스코어 좋은 순으로 정렬된 0/1 배열."""
+    n, n_act = len(labels), sum(labels)
+    if n == 0 or n_act == 0:
+        return None
+    top_n = max(1, int(round(n * frac)))
+    hits = sum(labels[:top_n])
+    return round((hits / top_n) / (n_act / n), 3)
+
+
+def perfect_ef(n: int, n_act: int, frac: float = 0.01) -> float | None:
+    """도달 가능한 EF 의 상한 — 활성이 전부 맨 위에 왔을 때의 값.
+
+    EF 는 비율로 나누므로 천장이 있고, 그 천장은 활성 비율에 따라 바뀐다.
+    그래서 활성 비율이 다른 두 실행의 EF1% 를 나란히 놓고 비교하면 안 된다.
+    2026-10-23 에 50/50 분할을 검토하다 천장이 35.95 에서 18.48 로 바뀌는 것을
+    보고 설계를 되돌렸는데, 그건 지표 자체의 문제를 피한 것이지 푼 게 아니었다.
+
+    공식은 SieveStack 의 LIT-PCBA 감사(arXiv:2507.21404)와 같다.
+    활성이 상위 칸수보다 많으면 n/n_act 로 떨어지고(우리 경우가 대개 이쪽),
+    활성이 더 적으면 n/k 가 된다 — 활성을 다 올려도 칸이 남기 때문이다.
+    """
+    if n == 0 or n_act == 0:
+        return None
+    k = max(1, int(round(n * frac)))
+    expected = n_act * k / n
+    return round(min(n_act, k) / expected, 3) if expected else None
+
+
+def normalized_ef(ef: float | None, n: int, n_act: int, frac: float = 0.01):
+    """nEF = EF / 천장. 0~1 이라 활성 비율이 달라도 비교된다.
+
+    1.0 은 "천장에 닿았다" 는 뜻이고, 그건 보통 좋은 소식이 아니라
+    벤치마크가 너무 쉽다는 신호다.
+    """
+    top = perfect_ef(n, n_act, frac)
+    if ef is None or not top:
+        return None
+    return round(ef / top, 4)
+
+
+def roc_auc(labels: list[int]) -> float | None:
+    """랭킹 기반 AUC (Mann-Whitney U). labels[0]이 최상위."""
+    n_act = sum(labels)
+    n_dec = len(labels) - n_act
+    if n_act == 0 or n_dec == 0:
+        return None
+    rank_sum = sum(i + 1 for i, l in enumerate(labels) if l == 1)
+    u = rank_sum - n_act * (n_act + 1) / 2  # decoy가 active보다 앞선 쌍의 수
+    return round(1.0 - u / (n_act * n_dec), 4)
+
+
+def bedroc(labels: list[int], alpha: float = BEDROC_ALPHA) -> float | None:
+    """Truchon & Bayly (2007) BEDROC. labels[0]이 최상위."""
+    n = len(labels)
+    n_act = sum(labels)
+    if n == 0 or n_act == 0 or n_act == n:
+        return None
+    ra = n_act / n
+
+    s = sum(math.exp(-alpha * (i + 1) / n) for i, l in enumerate(labels) if l == 1)
+    denom = math.exp(alpha / n) - 1.0
+    if denom <= 0:
+        return None
+    random_sum = ra * (1.0 - math.exp(-alpha)) / denom
+    if random_sum <= 0:
+        return None
+    rie = s / random_sum
+
+    try:
+        factor = (
+            ra
+            * math.sinh(alpha / 2.0)
+            / (math.cosh(alpha / 2.0) - math.cosh(alpha / 2.0 - alpha * ra))
+        )
+        offset = 1.0 / (1.0 - math.exp(alpha * (1.0 - ra)))
+    except (OverflowError, ZeroDivisionError):
+        return None
+    return round(rie * factor + offset, 4)
+
+
+def benchmark_recovery(rows: list[dict], names: list[str], frac: float = 0.01) -> dict:
+    """승인약·임상 화합물이 상위 frac 안에 들어왔는지 이름으로 확인."""
+    if not names:
+        return {"checked": [], "note": "벤치마크 리간드 미지정"}
+    n = len(rows)
+    top_n = max(1, int(round(n * frac)))
+    wanted = {x.lower() for x in names}
+
+    found = []
+    for idx, r in enumerate(rows):
+        label = " ".join(
+            str(r.get(k, "")) for k in ("pref_name", "chembl_id", "synonyms")
+        ).lower()
+        for w in wanted:
+            if w in label:
+                found.append(
+                    {
+                        "name": w,
+                        "rank": idx + 1,
+                        "percentile": round(100.0 * (idx + 1) / n, 3),
+                        "score": r.get("score"),
+                        "chembl_id": r.get("chembl_id"),
+                        "in_top_pct": idx < top_n,
+                    }
+                )
+                break
+
+    # 같은 이름이 여러 번 나오면 가장 좋은 순위만 남긴다
+    best: dict[str, dict] = {}
+    for f in found:
+        if f["name"] not in best or f["rank"] < best[f["name"]]["rank"]:
+            best[f["name"]] = f
+
+    checked = sorted(best.values(), key=lambda f: f["rank"])
+    return {
+        "checked": checked,
+        "n_requested": len(names),
+        "n_found_in_library": len(checked),
+        "n_in_top_pct": sum(1 for f in checked if f["in_top_pct"]),
+        "top_pct": frac * 100,
+        "missing": sorted(wanted - set(best)),
+    }
+
+
+def evaluate(
+    rows: list[dict],
+    benchmark_ligands: list[str] | None = None,
+    control_rows: list[dict] | None = None,
+    n_boot: int = 2000,
+    arm: str = "treatment",
+) -> dict:
+    """도킹 결과(스코어 좋은 순 정렬)를 받아 게이트 판정을 내린다.
+
+    control_rows 가 없으면 ABSTAIN. 구조 선택 편향을 분리할 수단이 없는데
+    PASS 를 내면 그 숫자가 도킹 실력인지 구조를 잘 골라서인지 말할 수 없다.
+
+    arm="control" 은 음성 대조군 팔 자체를 재는 경우다. 절대 문턱의 PASS
+    요구를 면제하고 CONTROL_REFERENCE 를 낸다 — 지표는 모두 그대로 낸다.
+    대조군을 치료군과 같은 잣대로 떨어뜨리면 편향 없는 하한을 보고할 수
+    없게 된다(THRESHOLDS 주석 참조).
+    """
+    rows = [r for r in rows if r.get("score") is not None]
+    # 스크리닝 전용 화합물은 채점에서 뺀다. 음성으로 센 것을 후보로 내놓던
+    # 순환을 끊기 위해 라이브러리를 둘로 갈랐다(library.py 참조).
+    # 분할 이전 결과에는 screen 라벨이 없으므로 이 줄은 아무 일도 하지 않는다.
+    n_screen = sum(1 for r in rows if r.get("label") == "screen")
+    rows = [r for r in rows if r.get("label") != "screen"]
+    rows.sort(key=lambda r: r["score"])  # Vina는 낮을수록 좋다
+    labels = [1 if r.get("label") == "known_active" else 0 for r in rows]
+
+    n_act = sum(labels)
+    metrics = {
+        "n_compounds": len(rows),
+        "n_screen_excluded": n_screen,
+        "n_known_active": n_act,
+        "n_decoy": len(rows) - n_act,
+        "ef1": enrichment_factor(labels, 0.01),
+        "ef5": enrichment_factor(labels, 0.05),
+        "ef10": enrichment_factor(labels, 0.10),
+        "auc": roc_auc(labels),
+        "bedroc": bedroc(labels),
+        "best_score": rows[0]["score"] if rows else None,
+        "thresholds": THRESHOLDS,
+        "min_actives_required": MIN_ACTIVES,
+    }
+    metrics["benchmark_recovery"] = benchmark_recovery(rows, benchmark_ligands or [])
+
+    # EF 는 비율로 나누므로 상한이 있다. 활성 비율이 높으면 임계값이
+    # 어떤 성능으로도 도달 불가능해지는데, 이를 모르고 FAIL 로 읽으면
+    # 파이프라인 탓을 하게 된다. 실제로 EPAS1 첫 실행에서 그랬다.
+    ratio = n_act / len(rows) if rows else 0
+    max_ef1 = perfect_ef(len(rows), n_act, 0.01)
+    metrics["active_fraction"] = round(ratio, 4)
+    metrics["max_reachable_ef1"] = max_ef1
+
+    # 정규화 EF — 외부 보고는 이쪽을 쓴다. 활성 비율이 다른 실행끼리
+    # EF1% 를 나란히 놓으면 안 되기 때문이다 (perfect_ef 주석 참조).
+    for key, fr in (("ef1", 0.01), ("ef5", 0.05), ("ef10", 0.10)):
+        metrics[f"n{key}"] = normalized_ef(metrics[key], len(rows), n_act, fr)
+    # nEF1% 는 천장으로 나눈 값이라 문턱 도달 불가가 없다. 과거 간접 검사가
+    # 쓰던 필드는 하류 보고가 참조하므로 False 로 남기고, 활성 비율 과다는
+    # ACTIVE_FRACTION_MAX 로 직접 본다.
+    metrics["ef1_threshold_unreachable"] = False
+    active_fraction_too_high = ratio > ACTIVE_FRACTION_MAX
+    metrics["active_fraction_too_high"] = active_fraction_too_high
+
+    checks = {
+        k: (metrics[k] is not None and metrics[k] >= v) for k, v in THRESHOLDS.items()
+    }
+    metrics["checks"] = checks
+    metrics["arm"] = arm
+    metrics["thresholds_applied"] = arm != "control"
+
+    passed_checks = sum(1 for v in checks.values() if v is True)
+    usable_checks = sum(1 for v in checks.values() if v is not None)
+
+    # 대조군 대비 우위 — 절대 문턱만으로는 닮지 않은 구조도 통과한다
+    br = metrics["benchmark_recovery"]
+    bench_ok = not br.get("n_found_in_library") or bool(br.get("n_in_top_pct"))
+    paired = None
+    if control_rows:
+        from core.validation.stats import paired_diff
+
+        paired = paired_diff(rows, control_rows, n_boot=n_boot)
+        metrics["paired_vs_control"] = paired
+        sig = {
+            m: bool(v.get("significant") and (v.get("diff") or 0) > 0)
+            for m, v in paired.get("metrics", {}).items()
+        }
+        metrics["control_margin"] = sig
+        margin_ok = sum(1 for m in ("ef1", "bedroc") if sig.get(m)) >= 1 and sig.get("auc", False)
+
+    if n_act < MIN_ACTIVES:
+        metrics["verdict"] = "INSUFFICIENT"
+        metrics["verdict_reason"] = (
+            f"활성 화합물 {n_act}개 (최소 {MIN_ACTIVES}개 필요). "
+            "지표가 계산되더라도 통계적으로 무의미하다."
+        )
+    elif active_fraction_too_high:
+        metrics["verdict"] = "INVALID"
+        metrics["verdict_reason"] = (
+            f"활성 비율 {100 * ratio:.1f}% — 상한 {100 * ACTIVE_FRACTION_MAX:.0f}% 초과. "
+            f"EF1% 천장이 {max_ef1} 까지 내려앉고 AUC/BEDROC 도 함께 부풀려지므로 "
+            "nEF1% 로 정규화해도 지표를 믿을 수 없다. "
+            "라이브러리를 활성 2~3% 비율로 다시 구성할 것."
+        )
+    elif arm == "control":
+        metrics["verdict"] = "CONTROL_REFERENCE"
+        metrics["verdict_reason"] = (
+            f"음성 대조군 팔 — 절대 문턱의 PASS 요구를 적용하지 않는다. "
+            f"nEF1% {metrics['nef1']}, AUC {metrics['auc']}, BEDROC {metrics['bedroc']} 는 "
+            "편향 없는 하한으로 치료군과 같은 표에 싣는다. 대조군이 낮은 것은 설계대로이며 "
+            "결함이 아니다 — 치료군이 이보다 유의하게 높은지가 판정 대상이다."
+        )
+    elif control_rows is None:
+        metrics["verdict"] = "ABSTAIN"
+        metrics["verdict_reason"] = (
+            f"대조군이 없다. 절대 문턱은 {passed_checks}/{usable_checks} 통과이나, "
+            "이 문턱은 벤치마크와 유사도 0.07 인 구조도 통과시킨 전력이 있다"
+            "(EPAS1 대조군 3H82: EF1% 8.17, AUC 0.716, BEDROC 0.300 — 당시 절대 "
+            "EF1% 5.0 문턱을 넘었다. nEF1% 0.40 으로 바꾼 뒤 이 사례는 0.200 으로 "
+            "미달하지만, 문턱 하나로 구조 선택 편향을 분리할 수 없다는 점은 그대로다). "
+            "닮지 않은 구조에 같은 라이브러리를 도킹해 비교하기 전에는 "
+            "이 수치가 도킹 실력인지 구조 선택 덕인지 말할 수 없다."
+        )
+    elif passed_checks >= 2 and margin_ok and bench_ok:
+        metrics["verdict"] = "PASS"
+        passed = [k for k, v in checks.items() if v is True]
+        margins = [m for m, v in metrics["control_margin"].items() if v]
+        metrics["verdict_reason"] = (
+            f"절대 문턱 {passed_checks}/{usable_checks} 통과: {', '.join(passed)}. "
+            f"대조군 대비 유의한 우위: {', '.join(margins)}. "
+            f"벤치마크 상위 {br['top_pct']}% 진입 {br['n_in_top_pct']}/{br['n_found_in_library']}."
+        )
+    else:
+        metrics["verdict"] = "FAIL"
+        why = []
+        if passed_checks < 2:
+            why.append(f"절대 문턱 미달: {', '.join(k for k, v in checks.items() if v is False)}")
+        if not margin_ok:
+            lost = [m for m, v in metrics["control_margin"].items() if not v]
+            why.append(f"대조군 대비 우위가 유의하지 않음: {', '.join(lost)}")
+        if not bench_ok:
+            why.append(
+                f"벤치마크 {br['n_found_in_library']}개 중 상위 {br['top_pct']}% 진입 0개"
+            )
+        metrics["verdict_reason"] = (
+            " / ".join(why) + ". 포켓 정의, 구조 선택, 또는 이 타깃 클래스에 대한 "
+            "리지드 도킹의 한계를 의심할 것."
+        )
+
+    # 벤치마크 회수는 이제 판정에 반영된다(bench_ok). 경고는 로그 가독성용으로 남긴다.
+    if br.get("n_found_in_library") and not br.get("n_in_top_pct"):
+        metrics["benchmark_warning"] = (
+            f"벤치마크 {br['n_found_in_library']}개 중 상위 {br['top_pct']}%에 "
+            "진입한 것이 없다. 지표가 통과하더라도 이 결과는 신뢰할 수 없다."
+        )
+    return metrics
+
+
+def main() -> int:
+    import argparse
+
+    root = Path(__file__).resolve().parents[2]
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gene", required=True)
+    ap.add_argument("--targetdir", default=None)
+    ap.add_argument(
+        "--controldir",
+        default=None,
+        help="음성 대조군 결과 폴더. 없으면 ABSTAIN 이 나온다.",
+    )
+    ap.add_argument("--n-boot", type=int, default=2000)
+    ap.add_argument(
+        "--arm",
+        default="treatment",
+        choices=["treatment", "control"],
+        help="평가하는 팔. control 이면 절대 문턱의 PASS 요구를 면제하고 "
+        "CONTROL_REFERENCE 를 낸다 — 지표는 그대로 낸다. 대조군은 편향 없는 "
+        "하한이라 치료군과 같은 잣대로 떨어뜨리면 양팔 보고가 막힌다.",
+    )
+    args = ap.parse_args()
+
+    tdir = Path(args.targetdir) if args.targetdir else root / "targets" / args.gene
+
+    # 샤드 파일이 기본이지만, 앙상블처럼 합쳐진 결과는 docked_all.jsonl 로 온다.
+    # 이 폴백이 없어 앙상블 검증이 "도킹 결과 없음" 으로 멈춘 적이 있다.
+    rows: list[dict] = []
+    for shard in sorted(tdir.glob("docked_shard*.jsonl")):
+        rows += [json.loads(l) for l in shard.read_text().splitlines() if l.strip()]
+    if not rows:
+        allf = tdir / "docked_all.jsonl"
+        if allf.exists():
+            rows = [json.loads(l) for l in allf.read_text().splitlines() if l.strip()]
+    if not rows:
+        print(f"[!] {args.gene}: 도킹 결과 없음")
+        return 1
+
+    meta_path = tdir / "target_meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    bench = meta.get("benchmark_ligands", [])
+
+    ctrl_rows: list[dict] | None = None
+    if args.controldir:
+        cdir = Path(args.controldir)
+        ctrl_rows = []
+        for shard in sorted(cdir.glob("docked_shard*.jsonl")):
+            ctrl_rows += [json.loads(l) for l in shard.read_text().splitlines() if l.strip()]
+        if not ctrl_rows:
+            callf = cdir / "docked_all.jsonl"
+            if callf.exists():
+                ctrl_rows = [
+                    json.loads(l) for l in callf.read_text().splitlines() if l.strip()
+                ]
+        if not ctrl_rows:
+            print(f"[!] 대조군 폴더에 결과가 없다: {cdir}")
+            return 1
+        print(f"    대조군 {len(ctrl_rows)}개 로드 — 짝지은 부트스트랩 {args.n_boot}회")
+
+    result = evaluate(
+        rows, bench, control_rows=ctrl_rows, n_boot=args.n_boot, arm=args.arm
+    )
+    result["gene"] = args.gene
+    result["pocket_confidence"] = meta.get("pocket", {}).get("confidence")
+
+    # 평가셋 완전성 — 샤드가 통째로 빠져도 지표는 멀쩡해 보인다.
+    # 조용한 실패다. 이 저장소가 반복해서 당한 바로 그 종류다.
+    #
+    # 2026-11-01 이 그랬다: 치료군 7/8, 대조군 2/8 로 compare 를 돌렸더니
+    # BIAS_LIKELY 가 나왔고 **대조군 AUC 가 치료군보다 높았다**. 부호가
+    # 뒤집힌 것이다. 활성 14개 표본의 잡음이었다.
+    #
+    # 문턱 0.90: 샤드 하나가 빠지면 0.875 이하로 떨어져 걸리고, 정상적인
+    # 리간드 준비 실패(PubChem 고정본 실측 decoy 3.90%, 활성 0%)만으로는
+    # 걸리지 않는 자리다.
+    n_expected = None
+    lib_stats = tdir / "library_stats.json"
+    lib_file = tdir / "library.jsonl"
+    if lib_stats.exists():
+        n_expected = json.loads(lib_stats.read_text()).get("n_total")
+    if not n_expected and lib_file.exists():
+        n_expected = sum(1 for l in lib_file.read_text().splitlines() if l.strip())
+
+    if n_expected:
+        n_attempted = len(rows)
+        coverage = round(n_attempted / n_expected, 4)
+        result["eval_set_coverage"] = {
+            "n_library": n_expected,
+            "n_docking_attempted": n_attempted,
+            "n_scored": result.get("n_compounds"),
+            "coverage": coverage,
+            "threshold": COVERAGE_MIN,
+            "complete": coverage >= COVERAGE_MIN,
+        }
+        if coverage < COVERAGE_MIN:
+            result["verdict"] = "INCOMPLETE"
+            result["verdict_reason"] = (
+                f"평가셋 불완전 — 라이브러리 {n_expected}개 중 {n_attempted}개만 "
+                f"도킹됐다(적용률 {coverage:.1%}, 문턱 {COVERAGE_MIN:.0%}). "
+                f"샤드가 통째로 빠졌을 가능성이 크다. 지표를 측정값으로 쓰지 마라."
+            )
+            print(f"[!] {result['verdict_reason']}")
+
+
+    scored = sorted(
+        (r for r in rows if r.get("score") is not None), key=lambda r: r["score"]
+    )
+    (tdir / "docked_all.jsonl").write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in scored)
+    )
+    (tdir / "validation.json").write_text(
+        json.dumps(result, indent=2, ensure_ascii=False)
+    )
+
+    print(f"[*] {args.gene} 검증")
+    print(f"    화합물 {result['n_compounds']} (활성 {result['n_known_active']})")
+    for k in ("ef1", "ef5", "auc", "bedroc"):
+        v = result[k]
+        print(f"    {k:8s} = {v}" if v is not None else f"    {k:8s} = n/a")
+
+    br = result["benchmark_recovery"]
+    if br.get("checked"):
+        print(f"    벤치마크 리간드 ({br['n_in_top_pct']}/{br['n_found_in_library']} 상위 1%):")
+        for f in br["checked"]:
+            mark = "OK " if f["in_top_pct"] else "   "
+            print(
+                f"      {mark}{f['name']:16s} rank {f['rank']} "
+                f"({f['percentile']}%) score {f['score']}"
+            )
+    if br.get("missing"):
+        print(f"    라이브러리에 없음: {br['missing']}")
+
+    print(f"    판정: {result['verdict']} — {result['verdict_reason']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

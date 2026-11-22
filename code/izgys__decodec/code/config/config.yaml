@@ -1,0 +1,16 @@
+# Root config, composed by src/config.py (Hydra compose API).
+# Each entry in defaults is one file in this folder and one top-level key.
+defaults:
+  - data
+  - tracking
+  - embeddings
+  - probe
+  - similarity
+  - lora
+  - training
+  - comparison
+  - calibration
+  - random_split
+  - hybrid
+  - attribution
+  - _self_

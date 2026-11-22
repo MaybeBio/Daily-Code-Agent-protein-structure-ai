@@ -1,0 +1,235 @@
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import multiprocessing
+import os
+import sys
+
+
+_PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_VALID_PARALLEL_BACKENDS = ('auto', 'multiprocessing', 'threading')
+_DEFAULT_AUTO_BACKEND = 'multiprocessing'
+_CHUNK_FACTORS = {
+    'general': 1,
+    'reducer': 4,
+}
+_ADAPTIVE_JOB_POLICIES = {
+    'sub_tensor': (256, 64),
+    'trait_unions': (2, 1),
+    'nc_matrix': (100000, 25000),
+    'cb': (20000, 5000),
+    'cbs': (200000, 50000),
+    'branch_dist': (20000, 5000),
+    'expected_state': (50000000, 10000000),
+}
+
+
+def _has_shape(input_data):
+    return hasattr(input_data, 'shape')
+
+
+def _slice_chunk(input_data, start, size):
+    if _has_shape(input_data):
+        return input_data[start:start + size, ...]
+    return input_data[start:start + size]
+
+
+def _build_worker_pythonpath():
+    # Keep worker imports aligned with the parent process package location.
+    prioritized_paths = [_PACKAGE_ROOT]
+    cwd = os.path.abspath(os.getcwd())
+    if cwd not in prioritized_paths:
+        prioritized_paths.append(cwd)
+    if len(sys.path) > 0:
+        path0 = sys.path[0]
+        if path0 in ['', '.']:
+            path0 = cwd
+        else:
+            path0 = os.path.abspath(path0)
+        if path0 not in prioritized_paths:
+            prioritized_paths.append(path0)
+    existing = os.environ.get('PYTHONPATH', '')
+    for path in existing.split(os.pathsep):
+        if path == '':
+            continue
+        normalized = os.path.abspath(path)
+        if normalized not in prioritized_paths:
+            prioritized_paths.append(normalized)
+    return os.pathsep.join(prioritized_paths)
+
+
+def _set_spawn_worker_import_path(ctx):
+    if ctx.get_start_method() not in ['spawn', 'forkserver']:
+        return None, None, False
+    old_pythonpath = os.environ.get('PYTHONPATH')
+    old_sys_path = list(sys.path)
+    new_pythonpath = _build_worker_pythonpath()
+    prioritized_paths = [p for p in new_pythonpath.split(os.pathsep) if p != '']
+    for path in reversed(prioritized_paths):
+        if path in sys.path:
+            sys.path.remove(path)
+        sys.path.insert(0, path)
+    os.environ['PYTHONPATH'] = new_pythonpath
+    return old_pythonpath, old_sys_path, True
+
+
+def _restore_import_path(old_pythonpath, old_sys_path, changed):
+    if not changed:
+        return
+    sys.path[:] = old_sys_path
+    if old_pythonpath is None:
+        os.environ.pop('PYTHONPATH', None)
+    else:
+        os.environ['PYTHONPATH'] = old_pythonpath
+
+
+def _get_num_items(input_data):
+    if _has_shape(input_data):
+        return int(input_data.shape[0])
+    return int(len(input_data))
+
+
+def resolve_n_jobs(num_items, threads):
+    num_items = int(num_items)
+    threads = int(threads)
+    if threads < 1:
+        raise ValueError('threads should be >= 1.')
+    if num_items < 0:
+        raise ValueError('num_items should be >= 0.')
+    if num_items == 0:
+        return 1
+    return min(num_items, threads)
+
+
+def resolve_adaptive_n_jobs(num_items, threads, min_items_for_parallel=0, min_items_per_job=1):
+    num_items = int(num_items)
+    min_items_for_parallel = int(min_items_for_parallel)
+    min_items_per_job = int(min_items_per_job)
+    if min_items_for_parallel < 0:
+        raise ValueError('min_items_for_parallel should be >= 0.')
+    if min_items_per_job < 1:
+        raise ValueError('min_items_per_job should be >= 1.')
+    requested = resolve_n_jobs(num_items=num_items, threads=threads)
+    if requested <= 1:
+        return 1
+    if num_items < min_items_for_parallel:
+        return 1
+    max_jobs_by_work = max(1, num_items // min_items_per_job)
+    return max(1, min(requested, max_jobs_by_work))
+
+
+def resolve_task_n_jobs(num_items, threads, task):
+    if task not in _ADAPTIVE_JOB_POLICIES:
+        raise ValueError('Unknown parallel task policy: {}'.format(task))
+    min_items_for_parallel, min_items_per_job = _ADAPTIVE_JOB_POLICIES[task]
+    return resolve_adaptive_n_jobs(
+        num_items=num_items,
+        threads=threads,
+        min_items_for_parallel=min_items_for_parallel,
+        min_items_per_job=min_items_per_job,
+    )
+
+
+def resolve_parallel_backend(prefer_threading=False):
+    if prefer_threading:
+        return 'threading'
+    return _DEFAULT_AUTO_BACKEND
+
+
+def resolve_chunk_factor(task='general'):
+    if task not in _CHUNK_FACTORS:
+        raise ValueError('Unknown parallel chunking task: {}'.format(task))
+    return _CHUNK_FACTORS[task]
+
+
+def _normalize_parallel_backend(backend):
+    backend = str(backend).lower()
+    if backend == 'auto':
+        return _DEFAULT_AUTO_BACKEND
+    if backend in _VALID_PARALLEL_BACKENDS:
+        return backend
+    raise ValueError('parallel_backend should be one of auto, multiprocessing, threading.')
+
+
+def run_starmap(func, args_iterable, n_jobs, backend='multiprocessing', chunksize=None):
+    args_list = list(args_iterable)
+    if len(args_list) == 0:
+        return list()
+    n_jobs = int(n_jobs)
+    if n_jobs < 1:
+        raise ValueError('n_jobs should be >= 1.')
+    if n_jobs == 1:
+        return [func(*args) for args in args_list]
+    backend = _normalize_parallel_backend(backend)
+    if backend == 'threading':
+        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
+            futures = [executor.submit(func, *args) for args in args_list]
+            return [future.result() for future in futures]
+    if chunksize is None:
+        chunksize = max(1, len(args_list) // (n_jobs * 4))
+    else:
+        chunksize = int(chunksize)
+        if chunksize < 1:
+            raise ValueError('chunksize should be >= 1.')
+    ctx = multiprocessing.get_context()
+    old_pythonpath, old_sys_path, changed = _set_spawn_worker_import_path(ctx)
+    try:
+        with ctx.Pool(processes=n_jobs) as pool:
+            return pool.starmap(func, args_list, chunksize=chunksize)
+    finally:
+        _restore_import_path(old_pythonpath, old_sys_path, changed)
+
+
+@contextmanager
+def persistent_starmap_runner(n_jobs, backend='multiprocessing'):
+    """Yield a starmap callable while keeping workers alive across batches."""
+    n_jobs = int(n_jobs)
+    if n_jobs < 1:
+        raise ValueError('n_jobs should be >= 1.')
+    backend = _normalize_parallel_backend(backend)
+    if n_jobs == 1:
+        yield lambda func, args: [func(*item) for item in list(args)]
+        return
+    if backend == 'threading':
+        with ThreadPoolExecutor(max_workers=n_jobs) as executor:
+            def thread_starmap(func, args):
+                futures = [executor.submit(func, *item) for item in list(args)]
+                return [future.result() for future in futures]
+            yield thread_starmap
+        return
+    ctx = multiprocessing.get_context()
+    old_pythonpath, old_sys_path, changed = _set_spawn_worker_import_path(ctx)
+    try:
+        with ctx.Pool(processes=n_jobs) as pool:
+            def process_starmap(func, args):
+                args = list(args)
+                chunksize = max(1, len(args) // (n_jobs * 4))
+                return pool.starmap(func, args, chunksize=chunksize)
+            yield process_starmap
+    finally:
+        _restore_import_path(old_pythonpath, old_sys_path, changed)
+
+
+def get_chunks(input_data, threads, chunk_factor=1):
+    num_items = _get_num_items(input_data)
+    if num_items == 0:
+        return list(), list()
+    chunk_factor = int(chunk_factor)
+    if chunk_factor < 1:
+        raise ValueError('chunk_factor should be >= 1.')
+    workers = resolve_n_jobs(num_items=num_items, threads=threads)
+    num_chunks = min(num_items, workers * chunk_factor)
+    base = num_items // num_chunks
+    rem = num_items % num_chunks
+    chunk_sizes = [base for _ in range(num_chunks)]
+    for i in range(rem):
+        chunk_sizes[num_chunks - rem + i] += 1
+    i = 0
+    out_chunks = list()
+    starts = list()
+    for size in chunk_sizes:
+        if size == 0:
+            continue
+        out_chunks.append(_slice_chunk(input_data=input_data, start=i, size=size))
+        starts.append(i)
+        i += size
+    return out_chunks, starts

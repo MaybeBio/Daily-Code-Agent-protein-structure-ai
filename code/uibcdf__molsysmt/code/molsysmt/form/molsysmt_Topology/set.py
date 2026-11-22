@@ -1,0 +1,2244 @@
+import numpy as np
+import pandas as pd
+
+from molsysmt._private.argdigest import arg_digest
+from molsysmt._private.smonitor import ArgumentError
+from molsysmt._private.variables import is_all
+
+form = "molsysmt.Topology"
+
+
+def _assign_membership(table, column, indices, value):
+    """Preserve the native nullable schema when assigning stable parents."""
+    from molsysmt.native._table_columns import assign_nullable_integer
+
+    try:
+        assign_nullable_integer(
+            table, column, value, indices=None if is_all(indices) else indices
+        )
+    except (TypeError, ValueError) as error:
+        raise ArgumentError(
+            argument="value",
+            caller=__name__,
+            message="Membership values must be nullable integers aligned with the selected rows.",
+        ) from error
+
+
+def _string_labels(value):
+    """Normalize public ID labels without turning missing values into text."""
+    if pd.api.types.is_scalar(value):
+        return pd.NA if pd.isna(value) else str(value)
+    return pd.array(value, dtype="string")
+
+
+_PUBLIC_TO_NATIVE_ATOM_STATE = {
+    "formal_charge": "formal_charge",
+    "atom_is_aromatic": "is_aromatic",
+    "n_unpaired_electrons": "n_unpaired_electrons",
+    "n_implicit_hydrogens": "n_implicit_hydrogens",
+    "n_explicit_hydrogens": "n_explicit_hydrogens",
+    "allows_implicit_hydrogens": "allows_implicit_hydrogens",
+    "atom_stereochemistry": "stereochemistry",
+}
+
+_PUBLIC_TO_NATIVE_BOND_STATE = {
+    "bond_id": "bond_id",
+    "bond_order": "bond_order",
+    "fractional_bond_order": "fractional_bond_order",
+    "bond_type": "bond_type",
+    "bond_is_aromatic": "is_aromatic",
+    "bond_is_conjugated": "is_conjugated",
+    "bond_stereochemistry": "stereochemistry",
+    "bond_donor_atom_index": "donor_atom_index",
+    "bond_acceptor_atom_index": "acceptor_atom_index",
+    "bond_joins_components": "joins_components",
+    "bond_evidence": "evidence",
+}
+
+
+###### Set
+
+## Atom
+
+
+@arg_digest(form=form)
+def set_atom_id_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting string atom labels on a native topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Source atom indices to update; 'all' updates the complete atom column.
+    value : object, default=None
+        Integer or string labels, scalar or aligned with indices. Numeric labels
+        are stored as strings; a single label broadcasts to the selected atoms.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if pd.api.types.is_scalar(value):
+        value = pd.NA if value is None else str(value)
+    else:
+        value = pd.array(value, dtype="string")
+        if len(value) == 1:
+            value = value[0]
+
+    if is_all(indices):
+        item.atoms["atom_id"] = pd.Series(value, index=item.atoms.index, dtype="string")
+    else:
+        item.atoms.loc[indices, "atom_id"] = value
+
+
+@arg_digest(form=form)
+def set_atom_name_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting atom name to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        item.atoms.atom_name = value
+    else:
+        item.atoms.loc[indices, "atom_name"] = value
+
+    pass
+
+
+@arg_digest(form=form)
+def set_atom_type_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting atom type to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        item.atoms.atom_type = value
+    else:
+        item.atoms.loc[indices, "atom_type"] = value
+
+    pass
+
+
+@arg_digest(form=form)
+def set_isotope_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting isotope to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        if value is None or value is pd.NA or np.isscalar(value):
+            value = [value] * item.n_atoms
+        item.atoms["isotope"] = pd.array(value, dtype="UInt16")
+    else:
+        isotope = item.atoms["isotope"].copy()
+        isotope.iloc[indices] = value
+        item.atoms["isotope"] = pd.array(isotope, dtype="UInt16")
+
+
+@arg_digest(form=form)
+def set_group_index_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting group index to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    Notes
+    -----
+    Full and selected assignments retain nullable Int64 membership. A None
+    entry in the aligned value vector means unknown membership. Column edits
+    are staged before publication; invalid lengths or noninteger values do
+    not partially update that column. Existing projection and reconstruction
+    contracts remain separate.
+
+    Examples
+    --------
+    >>> from molsysmt.native import Topology
+    >>> topology = Topology(n_atoms=2, n_groups=1)
+    >>> set_group_index_to_atom(topology, value=[0, 0])
+    >>> set_group_index_to_atom(topology, indices=[0], value=[None])
+    >>> topology.atoms['group_index'].isna().tolist()
+    [True, False]
+
+    .. versionadded:: 1.0.0
+    """
+    _assign_membership(item.atoms, "group_index", indices, value)
+
+
+@arg_digest(form=form)
+def set_chain_index_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain index to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    Notes
+    -----
+    Full and selected assignments retain nullable Int64 membership. A None
+    entry in the aligned value vector means unknown membership. Column edits
+    are staged before publication; invalid lengths or noninteger values do
+    not partially update that column. Existing projection and reconstruction
+    contracts remain separate.
+
+    If any assigned chain membership is unknown, the declared chain inventory
+    is retained. Complete known assignments retain the existing rebuild policy.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        if len(value) == 1:
+            value = [value[0]] * item.n_atoms
+        _assign_membership(item.atoms, "chain_index", indices, value)
+        if item.atoms["chain_index"].isna().any():
+            return
+        n_chains = item.atoms["chain_index"].nunique()
+        if n_chains != item.chains.shape[0]:
+            item.reset_chains(n_chains=n_chains)
+            item.rebuild_chains(
+                redefine_indices=True,
+                redefine_ids=True,
+                redefine_types=True,
+                redefine_names=True,
+            )
+    else:
+        _assign_membership(item.atoms, "chain_index", indices, value)
+
+    pass
+
+
+# @arg_digest(form=form)
+# def set_chain_id_to_atom(item, indices='all', value=None, skip_digestion=False):
+#
+#    if is_all(indices):
+#        item.atoms.chain_index=0
+#        item.reset_chains(n_chains=1)
+#        item.chains.chain_id=value
+#        item.chains.chain_name='A'
+#        item.rebuild_chains(redefine_ids=False, redefine_types=True)
+#    else:
+#        raise NotImplementedError
+#
+#    pass
+
+
+## Cross-element atom setters — group attributes
+
+
+def _set_by_bridge(target_df, target_col, bridge_indices, value):
+    """Set target_df[target_col] using first value per unique bridge index.
+
+    Uses full column reassignment to avoid dtype enforcement of .at[].
+    """
+    if target_col in {"molecule_index", "entity_index"}:
+        current = target_df[target_col].tolist()
+        seen = set()
+        for source_index, parent_index in enumerate(bridge_indices):
+            parent_index = int(parent_index)
+            if parent_index not in seen:
+                current[parent_index] = value[source_index]
+                seen.add(parent_index)
+        _assign_membership(target_df, target_col, "all", current)
+        return
+
+    n_target = len(target_df)
+    new_values = [None] * n_target
+    for src_i, bi in enumerate(bridge_indices):
+        bi_int = int(bi)
+        if new_values[bi_int] is None:
+            new_values[bi_int] = value[src_i]
+    # Only update positions that were touched (keep original for untouched)
+    current = target_df[target_col].tolist()
+    for i, v in enumerate(new_values):
+        if v is not None:
+            current[i] = v
+    target_df[target_col] = current
+
+
+@arg_digest(form=form)
+def set_group_id_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting group id to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        bridge = item.atoms["group_index"].to_numpy()
+        _set_by_bridge(item.groups, "group_id", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            gi = item.atoms.at[ai, "group_index"]
+            item.groups.at[int(gi), "group_id"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_group_name_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting group name to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = item.atoms["group_index"].to_numpy()
+        _set_by_bridge(item.groups, "group_name", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            gi = item.atoms.at[ai, "group_index"]
+            item.groups.at[int(gi), "group_name"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_group_type_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting group type to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = item.atoms["group_index"].to_numpy()
+        _set_by_bridge(item.groups, "group_type", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            gi = item.atoms.at[ai, "group_index"]
+            item.groups.at[int(gi), "group_type"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_index_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule index to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = item.atoms["group_index"].to_numpy()
+        _set_by_bridge(item.groups, "molecule_index", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            gi = item.atoms.at[ai, "group_index"]
+            item.groups.at[int(gi), "molecule_index"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_id_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule id to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        group_idx = item.atoms["group_index"].to_numpy()
+        mol_idx = item.groups["molecule_index"].to_numpy()
+        bridge = mol_idx[group_idx]
+        _set_by_bridge(item.molecules, "molecule_id", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            gi = item.atoms.at[ai, "group_index"]
+            mi = item.groups.at[int(gi), "molecule_index"]
+            item.molecules.at[int(mi), "molecule_id"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_name_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule name to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        group_idx = item.atoms["group_index"].to_numpy()
+        mol_idx = item.groups["molecule_index"].to_numpy()
+        bridge = mol_idx[group_idx]
+        _set_by_bridge(item.molecules, "molecule_name", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            gi = item.atoms.at[ai, "group_index"]
+            mi = item.groups.at[int(gi), "molecule_index"]
+            item.molecules.at[int(mi), "molecule_name"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_type_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule type to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        group_idx = item.atoms["group_index"].to_numpy()
+        mol_idx = item.groups["molecule_index"].to_numpy()
+        bridge = mol_idx[group_idx]
+        _set_by_bridge(item.molecules, "molecule_type", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            gi = item.atoms.at[ai, "group_index"]
+            mi = item.groups.at[int(gi), "molecule_index"]
+            item.molecules.at[int(mi), "molecule_type"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_chain_id_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain id to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        bridge = item.atoms["chain_index"].to_numpy()
+        _set_by_bridge(item.chains, "chain_id", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            ci = item.atoms.at[ai, "chain_index"]
+            item.chains.at[int(ci), "chain_id"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_chain_name_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain name to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = item.atoms["chain_index"].to_numpy()
+        _set_by_bridge(item.chains, "chain_name", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            ci = item.atoms.at[ai, "chain_index"]
+            item.chains.at[int(ci), "chain_name"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_chain_type_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain type to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = item.atoms["chain_index"].to_numpy()
+        _set_by_bridge(item.chains, "chain_type", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            ci = item.atoms.at[ai, "chain_index"]
+            item.chains.at[int(ci), "chain_type"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_index_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity index to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        group_idx = item.atoms["group_index"].to_numpy()
+        mol_idx = item.groups["molecule_index"].to_numpy()
+        bridge = mol_idx[group_idx]
+        _set_by_bridge(item.molecules, "entity_index", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            gi = item.atoms.at[ai, "group_index"]
+            mi = item.groups.at[int(gi), "molecule_index"]
+            item.molecules.at[int(mi), "entity_index"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_id_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity id to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        group_idx = item.atoms["group_index"].to_numpy()
+        mol_idx = item.groups["molecule_index"].to_numpy()
+        ent_idx = item.molecules["entity_index"].to_numpy()
+        bridge = ent_idx[mol_idx[group_idx]]
+        _set_by_bridge(item.entities, "entity_id", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            gi = item.atoms.at[ai, "group_index"]
+            mi = item.groups.at[int(gi), "molecule_index"]
+            ei = item.molecules.at[int(mi), "entity_index"]
+            item.entities.at[int(ei), "entity_id"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_name_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity name to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        group_idx = item.atoms["group_index"].to_numpy()
+        mol_idx = item.groups["molecule_index"].to_numpy()
+        ent_idx = item.molecules["entity_index"].to_numpy()
+        bridge = ent_idx[mol_idx[group_idx]]
+        _set_by_bridge(item.entities, "entity_name", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            gi = item.atoms.at[ai, "group_index"]
+            mi = item.groups.at[int(gi), "molecule_index"]
+            ei = item.molecules.at[int(mi), "entity_index"]
+            item.entities.at[int(ei), "entity_name"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_type_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity type to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        group_idx = item.atoms["group_index"].to_numpy()
+        mol_idx = item.groups["molecule_index"].to_numpy()
+        ent_idx = item.molecules["entity_index"].to_numpy()
+        bridge = ent_idx[mol_idx[group_idx]]
+        _set_by_bridge(item.entities, "entity_type", bridge, value)
+    else:
+        for i, ai in enumerate(list(indices)):
+            gi = item.atoms.at[ai, "group_index"]
+            mi = item.groups.at[int(gi), "molecule_index"]
+            ei = item.molecules.at[int(mi), "entity_index"]
+            item.entities.at[int(ei), "entity_type"] = value[i]
+
+    pass
+
+
+## Group
+
+
+@arg_digest(form=form)
+def set_group_id_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting group id to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        item.groups.group_id = value
+    else:
+        item.groups.iloc[indices, 0] = value
+
+    pass
+
+
+@arg_digest(form=form)
+def set_group_name_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting group name to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        item.groups.group_name = value
+    else:
+        item.groups.iloc[indices, 1] = value
+
+    pass
+
+
+@arg_digest(form=form)
+def set_group_type_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting group type to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        item.groups.group_type = value
+    else:
+        item.groups.iloc[indices, 2] = value
+
+    pass
+
+
+## Cross-element group setters — molecule / chain / entity attributes
+
+
+@arg_digest(form=form)
+def set_molecule_id_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule id to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        bridge = item.groups["molecule_index"].to_numpy()
+        _set_by_bridge(item.molecules, "molecule_id", bridge, value)
+    else:
+        for i, gi in enumerate(list(indices)):
+            mi = item.groups.at[gi, "molecule_index"]
+            item.molecules.at[int(mi), "molecule_id"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_name_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule name to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = item.groups["molecule_index"].to_numpy()
+        _set_by_bridge(item.molecules, "molecule_name", bridge, value)
+    else:
+        for i, gi in enumerate(list(indices)):
+            mi = item.groups.at[gi, "molecule_index"]
+            item.molecules.at[int(mi), "molecule_name"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_type_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule type to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = item.groups["molecule_index"].to_numpy()
+        _set_by_bridge(item.molecules, "molecule_type", bridge, value)
+    else:
+        for i, gi in enumerate(list(indices)):
+            mi = item.groups.at[gi, "molecule_index"]
+            item.molecules.at[int(mi), "molecule_type"] = value[i]
+
+    pass
+
+
+def _chain_index_per_group(item):
+    """Derive per-group chain_index from atoms (chain_index is atom-level only)."""
+    import numpy as np
+
+    _adf = item.atoms[["group_index", "chain_index"]].dropna()
+    _gc = _adf.groupby("group_index", sort=False)["chain_index"].first()
+    bridge = np.full(item.n_groups, -1, dtype=np.int64)
+    bridge[_gc.index.to_numpy(dtype=np.int64)] = _gc.to_numpy(dtype=np.int64)
+    return bridge
+
+
+@arg_digest(form=form)
+def set_chain_id_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain id to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        bridge = _chain_index_per_group(item)
+        _set_by_bridge(item.chains, "chain_id", bridge, value)
+    else:
+        for i, gi in enumerate(list(indices)):
+            atom_mask = item.atoms["group_index"] == gi
+            ci = int(item.atoms.loc[atom_mask, "chain_index"].iloc[0])
+            item.chains.at[ci, "chain_id"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_chain_name_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain name to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = _chain_index_per_group(item)
+        _set_by_bridge(item.chains, "chain_name", bridge, value)
+    else:
+        for i, gi in enumerate(list(indices)):
+            atom_mask = item.atoms["group_index"] == gi
+            ci = int(item.atoms.loc[atom_mask, "chain_index"].iloc[0])
+            item.chains.at[ci, "chain_name"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_chain_type_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain type to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = _chain_index_per_group(item)
+        _set_by_bridge(item.chains, "chain_type", bridge, value)
+    else:
+        for i, gi in enumerate(list(indices)):
+            atom_mask = item.atoms["group_index"] == gi
+            ci = int(item.atoms.loc[atom_mask, "chain_index"].iloc[0])
+            item.chains.at[ci, "chain_type"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_id_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity id to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        mol_idx = item.groups["molecule_index"].to_numpy()
+        ent_idx = item.molecules["entity_index"].to_numpy()
+        bridge = ent_idx[mol_idx]
+        _set_by_bridge(item.entities, "entity_id", bridge, value)
+    else:
+        for i, gi in enumerate(list(indices)):
+            mi = item.groups.at[gi, "molecule_index"]
+            ei = item.molecules.at[int(mi), "entity_index"]
+            item.entities.at[int(ei), "entity_id"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_name_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity name to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        mol_idx = item.groups["molecule_index"].to_numpy()
+        ent_idx = item.molecules["entity_index"].to_numpy()
+        bridge = ent_idx[mol_idx]
+        _set_by_bridge(item.entities, "entity_name", bridge, value)
+    else:
+        for i, gi in enumerate(list(indices)):
+            mi = item.groups.at[gi, "molecule_index"]
+            ei = item.molecules.at[int(mi), "entity_index"]
+            item.entities.at[int(ei), "entity_name"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_type_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity type to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        mol_idx = item.groups["molecule_index"].to_numpy()
+        ent_idx = item.molecules["entity_index"].to_numpy()
+        bridge = ent_idx[mol_idx]
+        _set_by_bridge(item.entities, "entity_type", bridge, value)
+    else:
+        for i, gi in enumerate(list(indices)):
+            mi = item.groups.at[gi, "molecule_index"]
+            ei = item.molecules.at[int(mi), "entity_index"]
+            item.entities.at[int(ei), "entity_type"] = value[i]
+
+    pass
+
+
+## Component
+
+
+## Molecule
+
+
+@arg_digest(form=form)
+def set_molecule_id_to_molecule(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule id to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        item.molecules.molecule_id = value
+    else:
+        item.molecules.iloc[indices, 0] = value
+
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_name_to_molecule(
+    item, indices="all", value=None, skip_digestion=False
+):
+    """
+    Setting molecule name to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        item.molecules.molecule_name = value
+    else:
+        item.molecules.iloc[indices, 1] = value
+
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_type_to_molecule(
+    item, indices="all", value=None, skip_digestion=False
+):
+    """
+    Setting molecule type to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        item.molecules.molecule_type = value
+    else:
+        item.molecules.iloc[indices, 2] = value
+
+    pass
+
+
+## Chain
+
+
+@arg_digest(form=form)
+def set_chain_id_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain id to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    value_is_string = False
+
+    if isinstance(value, str):
+        value_is_string = True
+    elif isinstance(value, list):
+        if isinstance(value[0], str):
+            value_is_string = True
+
+    if value_is_string:
+        if item.chains.chain_id.dtype.kind == "i":
+            item.chains.chain_id = item.chains.chain_id.astype("string")
+
+    if is_all(indices):
+        item.chains.chain_id = value
+    else:
+        if len(value) == 1:
+            value = value[0]
+        item.chains.iloc[indices, 0] = value
+
+    pass
+
+
+@arg_digest(form=form)
+def set_chain_name_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain name to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        item.chains.chain_name = value
+    else:
+        item.chains.iloc[indices, 1] = value
+
+    pass
+
+
+@arg_digest(form=form)
+def set_chain_type_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain type to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        item.chains.chain_type = value
+    else:
+        if len(value) == 1:
+            value = value[0]
+        item.chains.iloc[indices, 2] = value
+
+    pass
+
+
+## Entity
+
+
+@arg_digest(form=form)
+def set_entity_id_to_entity(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity id to entity on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        item.entities.entity_id = value
+    else:
+        item.entities.iloc[indices, 0] = value
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_name_to_entity(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity name to entity on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        item.entities.entity_name = value
+    else:
+        item.entities.iloc[indices, 1] = value
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_type_to_entity(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity type to entity on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        item.entities.entity_type = value
+    else:
+        item.entities.iloc[indices, 2] = value
+
+    pass
+
+
+## ---------------------------------------------------------------------------
+## Bridge helper functions
+## ---------------------------------------------------------------------------
+
+
+def _get_chain_index_for_molecule(item):
+    """Array of chain_index, one per molecule (first atom found)."""
+    n_molecules = len(item.molecules)
+    bridge = np.zeros(n_molecules, dtype=int)
+    seen = np.zeros(n_molecules, dtype=bool)
+    group_idx = item.atoms["group_index"].to_numpy()
+    chain_idx = item.atoms["chain_index"].to_numpy()
+    mol_idx_arr = item.groups["molecule_index"].to_numpy()
+    for ai in range(len(group_idx)):
+        mi = int(mol_idx_arr[int(group_idx[ai])])
+        if not seen[mi]:
+            bridge[mi] = int(chain_idx[ai])
+            seen[mi] = True
+    return bridge
+
+
+def _get_molecule_index_for_chain(item):
+    """Array of molecule_index, one per chain (first group found)."""
+    n_chains = len(item.chains)
+    bridge = np.zeros(n_chains, dtype=int)
+    seen = np.zeros(n_chains, dtype=bool)
+    group_idx = item.atoms["group_index"].to_numpy()
+    chain_idx = item.atoms["chain_index"].to_numpy()
+    mol_idx_arr = item.groups["molecule_index"].to_numpy()
+    for ai in range(len(group_idx)):
+        ci = int(chain_idx[ai])
+        if not seen[ci]:
+            bridge[ci] = int(mol_idx_arr[int(group_idx[ai])])
+            seen[ci] = True
+    return bridge
+
+
+## ---------------------------------------------------------------------------
+## Self-index setters — indices are row positions; no-op
+## ---------------------------------------------------------------------------
+
+
+@arg_digest(form=form)
+def set_atom_index_to_atom(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting atom index to atom on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    pass
+
+
+@arg_digest(form=form)
+def set_group_index_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting group index to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_index_to_molecule(
+    item, indices="all", value=None, skip_digestion=False
+):
+    """
+    Setting molecule index to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    pass
+
+
+@arg_digest(form=form)
+def set_chain_index_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain index to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_index_to_entity(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity index to entity on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    pass
+
+
+## ---------------------------------------------------------------------------
+## FK column setters on groups table
+## ---------------------------------------------------------------------------
+
+
+@arg_digest(form=form)
+def set_molecule_index_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule index to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    Notes
+    -----
+    Full and selected assignments retain nullable Int64 membership. A None
+    entry in the aligned value vector means unknown membership. Column edits
+    are staged before publication; invalid lengths or noninteger values do
+    not partially update that column. Existing projection and reconstruction
+    contracts remain separate.
+
+    .. versionadded:: 1.0.0
+    """
+    _assign_membership(item.groups, "molecule_index", indices, value)
+
+
+@arg_digest(form=form)
+def set_chain_index_to_group(item, indices="all", value=None, skip_digestion=False):
+    # chain_index is an atom-level attribute only; groups do not have this column.
+    # Setting chain_index via groups is architecturally invalid — no-op.
+    """
+    Setting chain index to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_index_to_group(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity index to group on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = item.groups["molecule_index"].to_numpy()
+        _set_by_bridge(item.molecules, "entity_index", bridge, value)
+    else:
+        for i, gi in enumerate(list(indices)):
+            mi = item.groups.at[gi, "molecule_index"]
+            item.molecules.at[int(mi), "entity_index"] = value[i]
+
+    pass
+
+
+## ---------------------------------------------------------------------------
+## Component attribute setters from group (group→atom→component bridge)
+## ---------------------------------------------------------------------------
+
+
+## ---------------------------------------------------------------------------
+## Entity setters from molecule (molecule→entity bridge)
+## ---------------------------------------------------------------------------
+
+
+@arg_digest(form=form)
+def set_entity_index_to_molecule(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity index to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    Notes
+    -----
+    Full and selected assignments retain nullable Int64 membership. A None
+    entry in the aligned value vector means unknown membership. Column edits
+    are staged before publication; invalid lengths or noninteger values do
+    not partially update that column. Existing projection and reconstruction
+    contracts remain separate.
+
+    .. versionadded:: 1.0.0
+    """
+    _assign_membership(item.molecules, "entity_index", indices, value)
+
+
+@arg_digest(form=form)
+def set_entity_id_to_molecule(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity id to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        bridge = item.molecules["entity_index"].to_numpy()
+        _set_by_bridge(item.entities, "entity_id", bridge, value)
+    else:
+        for i, mi in enumerate(list(indices)):
+            ei = item.molecules.at[mi, "entity_index"]
+            item.entities.at[int(ei), "entity_id"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_name_to_molecule(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity name to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = item.molecules["entity_index"].to_numpy()
+        _set_by_bridge(item.entities, "entity_name", bridge, value)
+    else:
+        for i, mi in enumerate(list(indices)):
+            ei = item.molecules.at[mi, "entity_index"]
+            item.entities.at[int(ei), "entity_name"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_type_to_molecule(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity type to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = item.molecules["entity_index"].to_numpy()
+        _set_by_bridge(item.entities, "entity_type", bridge, value)
+    else:
+        for i, mi in enumerate(list(indices)):
+            ei = item.molecules.at[mi, "entity_index"]
+            item.entities.at[int(ei), "entity_type"] = value[i]
+
+    pass
+
+
+## ---------------------------------------------------------------------------
+## Chain attribute setters from molecule (molecule→atom→chain bridge)
+## ---------------------------------------------------------------------------
+
+
+@arg_digest(form=form)
+def set_chain_id_to_molecule(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain id to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        bridge = _get_chain_index_for_molecule(item)
+        _set_by_bridge(item.chains, "chain_id", bridge, value)
+    else:
+        bridge = _get_chain_index_for_molecule(item)
+        for i, mi in enumerate(list(indices)):
+            ci = bridge[mi]
+            item.chains.at[ci, "chain_id"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_chain_name_to_molecule(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain name to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = _get_chain_index_for_molecule(item)
+        _set_by_bridge(item.chains, "chain_name", bridge, value)
+    else:
+        bridge = _get_chain_index_for_molecule(item)
+        for i, mi in enumerate(list(indices)):
+            ci = bridge[mi]
+            item.chains.at[ci, "chain_name"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_chain_type_to_molecule(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain type to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = _get_chain_index_for_molecule(item)
+        _set_by_bridge(item.chains, "chain_type", bridge, value)
+    else:
+        bridge = _get_chain_index_for_molecule(item)
+        for i, mi in enumerate(list(indices)):
+            ci = bridge[mi]
+            item.chains.at[ci, "chain_type"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_chain_index_to_molecule(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting chain index to molecule on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+
+    group_idx = item.atoms["group_index"].to_numpy()
+    mol_idx_arr = item.groups["molecule_index"].to_numpy()
+    new_chain = pd.array(item.atoms["chain_index"], dtype="Int64", copy=True)
+
+    if is_all(indices):
+        for ai in range(len(group_idx)):
+            mi = int(mol_idx_arr[int(group_idx[ai])])
+            new_chain[ai] = value[mi]
+    else:
+        idx_set = set(int(i) for i in indices)
+        for ai in range(len(group_idx)):
+            mi = int(mol_idx_arr[int(group_idx[ai])])
+            if mi in idx_set:
+                new_chain[ai] = value[list(indices).index(mi)]
+
+    _assign_membership(item.atoms, "chain_index", "all", new_chain)
+    if item.atoms["chain_index"].isna().any():
+        return
+    n_chains = item.atoms["chain_index"].nunique()
+    if n_chains != item.chains.shape[0]:
+        item.reset_chains(n_chains=n_chains)
+        item.rebuild_chains(
+            redefine_indices=True,
+            redefine_ids=True,
+            redefine_types=True,
+            redefine_names=True,
+        )
+
+    pass
+
+
+## ---------------------------------------------------------------------------
+## Chain attribute setters from component (component→atom→chain bridge)
+## ---------------------------------------------------------------------------
+
+
+## ---------------------------------------------------------------------------
+## Molecule attribute setters from chain (chain→atom→group→molecule bridge)
+## ---------------------------------------------------------------------------
+
+
+@arg_digest(form=form)
+def set_molecule_id_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule id to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        bridge = _get_molecule_index_for_chain(item)
+        _set_by_bridge(item.molecules, "molecule_id", bridge, value)
+    else:
+        bridge = _get_molecule_index_for_chain(item)
+        for i, ci in enumerate(list(indices)):
+            item.molecules.at[int(bridge[ci]), "molecule_id"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_name_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule name to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = _get_molecule_index_for_chain(item)
+        _set_by_bridge(item.molecules, "molecule_name", bridge, value)
+    else:
+        bridge = _get_molecule_index_for_chain(item)
+        for i, ci in enumerate(list(indices)):
+            item.molecules.at[int(bridge[ci]), "molecule_name"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_type_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule type to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        bridge = _get_molecule_index_for_chain(item)
+        _set_by_bridge(item.molecules, "molecule_type", bridge, value)
+    else:
+        bridge = _get_molecule_index_for_chain(item)
+        for i, ci in enumerate(list(indices)):
+            item.molecules.at[int(bridge[ci]), "molecule_type"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_molecule_index_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting molecule index to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+
+    group_idx = item.atoms["group_index"].to_numpy()
+    chain_idx = item.atoms["chain_index"].to_numpy()
+    mol_idx_arr = item.groups["molecule_index"].to_numpy(copy=True)
+
+    if is_all(indices):
+        for ai in range(len(group_idx)):
+            ci = int(chain_idx[ai])
+            gi = int(group_idx[ai])
+            mol_idx_arr[gi] = value[ci]
+    else:
+        idx_set = {int(i): pos for pos, i in enumerate(indices)}
+        for ai in range(len(group_idx)):
+            ci = int(chain_idx[ai])
+            if ci in idx_set:
+                mol_idx_arr[int(group_idx[ai])] = value[idx_set[ci]]
+
+    _assign_membership(item.groups, "molecule_index", "all", mol_idx_arr)
+
+    pass
+
+
+## ---------------------------------------------------------------------------
+## Molecule attribute setters from component (component→atom→group→molecule)
+## ---------------------------------------------------------------------------
+
+
+## ---------------------------------------------------------------------------
+## Entity attribute setters from chain (chain→mol→entity bridge)
+## ---------------------------------------------------------------------------
+
+
+@arg_digest(form=form)
+def set_entity_index_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity index to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+
+    mol_for_chain = _get_molecule_index_for_chain(item)
+
+    if is_all(indices):
+        for ci, mi in enumerate(mol_for_chain):
+            item.molecules.at[int(mi), "entity_index"] = value[ci]
+    else:
+        for i, ci in enumerate(list(indices)):
+            item.molecules.at[int(mol_for_chain[ci]), "entity_index"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_id_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity id to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    value = _string_labels(value)
+    if is_all(indices):
+        mol_for_chain = _get_molecule_index_for_chain(item)
+        ent_idx = item.molecules["entity_index"].to_numpy()
+        bridge = ent_idx[mol_for_chain]
+        _set_by_bridge(item.entities, "entity_id", bridge, value)
+    else:
+        mol_for_chain = _get_molecule_index_for_chain(item)
+        for i, ci in enumerate(list(indices)):
+            mi = int(mol_for_chain[ci])
+            ei = item.molecules.at[mi, "entity_index"]
+            item.entities.at[int(ei), "entity_id"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_name_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity name to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        mol_for_chain = _get_molecule_index_for_chain(item)
+        ent_idx = item.molecules["entity_index"].to_numpy()
+        bridge = ent_idx[mol_for_chain]
+        _set_by_bridge(item.entities, "entity_name", bridge, value)
+    else:
+        mol_for_chain = _get_molecule_index_for_chain(item)
+        for i, ci in enumerate(list(indices)):
+            mi = int(mol_for_chain[ci])
+            ei = item.molecules.at[mi, "entity_index"]
+            item.entities.at[int(ei), "entity_name"] = value[i]
+
+    pass
+
+
+@arg_digest(form=form)
+def set_entity_type_to_chain(item, indices="all", value=None, skip_digestion=False):
+    """
+    Setting entity type to chain on form molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    indices : object, default='all'
+        Argument indices.
+    value : object, default=None
+        Argument value.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    .. versionadded:: 1.0.0
+    """
+    if is_all(indices):
+        mol_for_chain = _get_molecule_index_for_chain(item)
+        ent_idx = item.molecules["entity_index"].to_numpy()
+        bridge = ent_idx[mol_for_chain]
+        _set_by_bridge(item.entities, "entity_type", bridge, value)
+    else:
+        mol_for_chain = _get_molecule_index_for_chain(item)
+        for i, ci in enumerate(list(indices)):
+            mi = int(mol_for_chain[ci])
+            ei = item.molecules.at[mi, "entity_index"]
+            item.entities.at[int(ei), "entity_type"] = value[i]
+
+    pass
+
+
+## ---------------------------------------------------------------------------
+## Entity attribute setters from component (comp→mol→entity bridge)
+## ---------------------------------------------------------------------------

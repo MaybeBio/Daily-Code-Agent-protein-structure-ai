@@ -1,0 +1,67 @@
+imp (2.25.0-1~@CODENAME@) @CODENAME@; urgency=low
+
+  * IMP 2.25.0 release
+
+ -- Ben Webb <benjamin.webb@ucsf.edu>  Wed, 05 Aug 2026 11:03:43 -0700
+
+imp (2.24.0-2~@CODENAME@) @CODENAME@; urgency=low
+
+  * Fix linkage against boost_system in Ubuntu 26.04
+
+ -- Ben Webb <benjamin.webb@ucsf.edu>  Mon, 20 Apr 2026 20:52:43 -0700
+
+imp (2.24.0-1~@CODENAME@) @CODENAME@; urgency=low
+
+  * IMP 2.24.0 release
+
+ -- Ben Webb <benjamin.webb@ucsf.edu>  Thu, 29 Jan 2026 14:52:13 -0800
+
+imp (2.23.0-1~@CODENAME@) @CODENAME@; urgency=low
+
+  * IMP 2.23.0 release
+
+ -- Ben Webb <benjamin.webb@ucsf.edu>  Thu, 10 Jul 2025 10:00:13 -0700
+
+imp (2.22.0-1~@CODENAME@) @CODENAME@; urgency=low
+
+  * IMP 2.22.0 release
+
+ -- Ben Webb <benjamin.webb@ucsf.edu>  Thu, 12 Dec 2024 10:05:43 -0800
+
+imp (2.21.0-1~@CODENAME@) @CODENAME@; urgency=low
+
+  * IMP 2.21.0 release
+
+ -- Ben Webb <benjamin.webb@ucsf.edu>  Thu, 13 Jun 2024 11:19:52 -0700
+
+imp (2.20.2-1~@CODENAME@) @CODENAME@; urgency=low
+
+  * IMP 2.20.2 release
+
+ -- Ben Webb <benjamin.webb@ucsf.edu>  Thu, 04 Apr 2024 18:33:05 -0700
+
+imp (2.20.1-4~@CODENAME@) @CODENAME@; urgency=low
+
+  * Add missing dependencies in order to test the install
+  * Recommend python3-protobuf for IMP.npctransport
+
+ -- Ben Webb <benjamin.webb@ucsf.edu>  Tue, 12 Mar 2024 15:09:28 -0700
+
+imp (2.20.1-3~@CODENAME@) @CODENAME@; urgency=low
+
+  * Add tests of the installed package
+  * Fix package removal
+
+ -- Ben Webb <benjamin.webb@ucsf.edu>  Tue, 12 Mar 2024 10:23:47 -0700
+
+imp (2.20.1-2~@CODENAME@) @CODENAME@; urgency=low
+
+  * Add protobuf-compiler (protoc) to builddeps
+
+ -- Ben Webb <benjamin.webb@ucsf.edu>  Fri, 08 Mar 2024 18:49:23 -0800
+
+imp (2.20.1-1~@CODENAME@) @CODENAME@; urgency=low
+
+  * Initial .deb release
+
+ -- Ben Webb <benjamin.webb@ucsf.edu>  Fri, 08 Mar 2024 10:34:17 -0800

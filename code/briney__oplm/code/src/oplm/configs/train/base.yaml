@@ -1,0 +1,134 @@
+# OPLM default training configuration — loaded by oplm.config.load_config.
+# These are OPLM's opinionated *production* defaults: μP + Muon, with `lr` as the
+# μP base LR (see docs/mup-lr.md). They intentionally differ from the conservative
+# oplm.config.TrainConfig dataclass fallbacks (adamw / lr 1e-4 / match_rms_adamw),
+# which back bare TrainConfig() / direct construction. tests/training/test_config.py
+# checks every key here is a real TrainConfig field (typo guard), not value-equality.
+# Every user-settable TrainConfig option appears here set to its default; the one
+# omission is `config_path`, which is provenance populated by load_config, not a knob.
+train:
+  # Duration
+  max_steps: 50_000
+  max_epochs: null
+
+  # Batch
+  batch_size: 32
+  gradient_accumulation_steps: 1
+  # Token mode: set both (global tokens per optimizer step; per-process micro-batch tokens,
+  # a multiple of model.max_position_embeddings). Needs data.pack_sequences: true.
+  tokens_per_step: null
+  batch_tokens: null
+
+  # Optimizer — μP + Muon is the default recipe (configs/train/esm-c.yaml is the AdamW comparison).
+  optimizer: muon             # adamw | muon
+  # μP base learning rate. With μP on (the default; model.mup_enable), this value
+  # transfers across model width automatically — do NOT retune it per preset/size.
+  # Tuned at mup_base_width=768 (Muon, adjust_lr_fn=original) by the μP refresh funnel
+  # in docs/mup-lr.md, "Commands" (Oct 2026), at 4M tokens/step (tokens_per_step
+  # 4194304, packed, context 2048) and ranked after an LR decay; confirmed at 800M.
+  # LR depends on batch size: retune if you train at a very different batch.
+  lr: 0.0063
+  min_lr: 0.0
+  weight_decay: 0.01
+  adam_beta1: 0.9
+  adam_beta2: 0.98
+  adam_eps: 1.0e-8
+  # μP + Muon REQUIRES "original" (aspect-ratio-only, ~constant across width so the
+  # base LR transfers). "match_rms_adamw" scales like √width and does NOT transfer;
+  # build_optimizers raises if it is left on with μP + Muon.
+  muon_adjust_lr_fn: original          # match_rms_adamw | original
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
+  # Empirical repeated-block LR correction for the production scaling ray:
+  # hidden LR × (reference_layers / L) ** exponent. 0.5 is derived from the
+  # α=1/√L residual scaling and verified on the sweep's fixed-width depth ray;
+  # it is exactly 1.0 at the 24-layer (170M anchor) reference depth.
+  mup_depth_lr_exponent: 0.5
+  mup_depth_reference_layers: 24
+  # Multiplier on the AdamW-side LR only (embeddings, head, norms, biases, gates,
+  # Canon kernels). Muon matrices are untouched. 1.0 = AdamW groups inherit `lr`.
+  adamw_lr_mult: 0.333
+  # Decoupled decay for what weight_decay skips (0 = off): the token embedding toward 0, and
+  # norm gains / residual gates / biases toward their initial values. See docs/training.md, "Optimizer and schedule".
+  # 0.1 bounds the sandwich post-norm gains (they otherwise drift upward without limit,
+  # so the top layers swamp the stream on long runs) at no measurable loss cost.
+  embedding_weight_decay: 0.01
+  weight_decay_to_init: 0.1
+  max_grad_norm: 1.0
+
+  # Scheduler
+  scheduler: warmup_linear    # warmup_linear | warmup_cosine | wsd_linear | wsd_cosine | wsd_sqrt
+  warmup_steps: 5_000
+  stable_steps: 0             # WSD plateau length (WSD schedules only)
+
+  # Logging
+  log_every: 10
+  # Default eval cadence for datasets that omit `every`: {steps: N} | {tokens: N}.
+  # Left null so an override replaces it cleanly (a non-null dict would deep-merge
+  # and collide on the unit key); null resolves to {steps: 10_000} in the Evaluator.
+  eval_every: null
+  wandb_project: oplm
+  wandb_run_name: null
+  wandb_enabled: true
+
+  # Checkpointing
+  save_every: 10_000
+  save_total_limit: 3
+  save_final: true            # write a final checkpoint on completion (skips if last step already saved)
+  # Also checkpoint every N wall-clock minutes, in addition to (not instead of)
+  # the save_every step cadence; null disables the timer, > 0 if set.
+  save_every_minutes: null
+  # Retain (exempt from save_total_limit rotation) every checkpoint whose step is
+  # a multiple of N; null disables the exemption, > 0 if set.
+  keep_every_n_steps: null
+  # Retain a checkpoint at least every N wall-clock hours after the previous
+  # permanent one; null disables the exemption, > 0 if set.
+  keep_every_n_hours: null
+  init_from: null             # local HF export or checkpoint root; weights only, fresh stage
+  resume_from: null           # path to a checkpoint to resume from
+  # Branch off a checkpoint: full state (model, optimizer, counters, data position)
+  # like resume_from, but LR / weight decay / schedule come from THIS config.
+  # Needs a fresh output_dir; see docs/training.md, "Branching a decay off a checkpoint".
+  branch_from: null
+  # Automatically resume from the newest committed checkpoint under output_dir at
+  # trainer start, without an explicit resume_from (long Slurm runs set this true).
+  auto_resume: false
+  # On resume, also restore the data-loader position (sampler/shard offsets) so
+  # training continues from the same data point instead of restarting the stream.
+  resume_data_position: true
+  # Optional remote URI (e.g. s3://bucket/prefix) that committed checkpoints are
+  # additionally synced to; null disables remote sync. s3:// needs the `s3` extra.
+  remote_checkpoint_uri: null
+
+  # Exponential moving average of the trainable weights, updated once per optimizer
+  # step; null disables it. Fold stages use 0.999. Adds ema.pt + hf_ema/ to checkpoints.
+  ema_decay: null
+
+  # Infrastructure
+  seed: 42
+  output_dir: outputs
+  # ddp  — one full model replica per rank (default).
+  # hsdp — FSDP2 over a 2-D mesh (shard within a node, replicate across nodes);
+  #        required before ~24B, needs world size > 1, and is currently
+  #        incompatible with configured data.eval (see docs/training.md, "Fault tolerance").
+  parallelism: ddp            # ddp | hsdp
+  # Process-group timeout (minutes); longer tolerates slow checkpoint writes or
+  # requeue delays without a collective abort. Must be > 0.
+  dist_timeout_minutes: 15
+  mixed_precision: bf16       # bf16 | fp16 | no
+  compile: false
+  compile_mode: default       # default | reduce-overhead | max-autotune
+  compile_dynamic: true   # true | false | null(auto) — torch.compile dynamic flag
+  throughput_warmup_steps: 50
+  peak_tflops: null   # set device peak (TFLOPs) to log MFU
+
+  # Training-stability diagnostics (see docs/mup-lr.md, "Stability diagnostics").
+  # When true, logs the pre-clip global grad norm every training log and runs an
+  # eager diagnostic probe forward (per-depth residual RMS, logit RMS, attention
+  # entropy under diag/*) every stability_probe_every log emissions.
+  stability_diagnostics: false
+  stability_probe_every: 25   # probe cadence in log emissions; 0 logs only the grad norm
+  # Every N optimizer steps log per-group weight RMS and update/weight RMS ratio
+  # under diag/* (0 = off; use a multiple of log_every; ddp only).
+  weight_diag_every: 0

@@ -1,0 +1,352 @@
+/**
+ * The WebGPU diagnosis, held to the facts it asserts.
+ *
+ * 🔴 THIS IS THE MOST-READ TEXT ON THE SITE FOR ANYONE IT FAILS, and it is the
+ * one piece of copy nobody here can check by running it: the machine this is
+ * written on has WebGPU, so every branch below is for a platform that cannot be
+ * reproduced locally. The report that started it was a photograph of one
+ * sentence - "This browser has no WebGPU. It ships in current Chrome, Edge,
+ * Safari and Firefox." - shown to two readers who were using current Chrome.
+ * It named no cause, no check and no fix, and on Linux it was simply wrong.
+ *
+ * Every version claim here was checked against its source on 2026-11-11; the
+ * sources are listed in web/webgpu-support.js's header. These tests exist so
+ * that a later edit cannot quietly reintroduce a claim nobody verified.
+ */
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { webgpuAdvice, readAgent, WEBGPU_BY_DEFAULT, STEP_KINDS }
+  from "../web/webgpu-support.js";
+
+const UA = {
+  chromeLinux: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML,"
+    + " like Gecko) Chrome/143.0.0.0 Safari/537.36",
+  chromeWindows: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    + " AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+  chromeOld: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    + " (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+  edgeWindows: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    + " (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
+  firefoxLinux: "Mozilla/5.0 (X11; Linux x86_64; rv:141.0) Gecko/20100101"
+    + " Firefox/141.0",
+  firefoxWindows: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:139.0)"
+    + " Gecko/20100101 Firefox/139.0",
+  safari: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"
+    + " (KHTML, like Gecko) Version/18.3 Safari/605.1.15",
+  androidChrome: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36"
+    + " (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+};
+
+const pastes = (advice) => advice.steps
+  .map((step) => step.paste).filter((paste) => paste !== undefined);
+
+test("🔴 the agent is read browser-first, and Edge is not a Chrome", () => {
+  // Edge's UA contains "Chrome/143" too; reading Chrome first names it wrong
+  // and prints a version from the wrong product.
+  assert.deepEqual(readAgent(UA.edgeWindows),
+    { browser: "Edge", os: "Windows", version: 143 });
+  assert.deepEqual(readAgent(UA.chromeWindows),
+    { browser: "Chrome", os: "Windows", version: 143 });
+  assert.deepEqual(readAgent(UA.firefoxLinux),
+    { browser: "Firefox", os: "Linux", version: 141 });
+  assert.deepEqual(readAgent(UA.safari),
+    { browser: "Safari", os: "macOS", version: 18 });
+});
+
+test("🔴 ANDROID IS NOT DESKTOP LINUX, though its UA says Linux", () => {
+  // Every Android browser's UA contains "Linux". Testing Linux before Android
+  // sends a phone the Vulkan-flag procedure, which is not its problem and
+  // cannot be carried out.
+  assert.equal(readAgent(UA.androidChrome).os, "Android");
+  const advice = webgpuAdvice("missing", { userAgent: UA.androidChrome });
+  assert.doesNotMatch(advice.summary, /Linux/);
+  assert.ok(!pastes(advice).includes("chrome://flags/#enable-vulkan"));
+});
+
+test("🔴 Chrome on LINUX is told about both flags, and why", () => {
+  const advice = webgpuAdvice("missing", { userAgent: UA.chromeLinux });
+  // the fact the old message got wrong: Linux was never in Chrome's 113 list
+  assert.match(advice.summary, /144/);
+  assert.match(advice.summary, /Intel Gen12\+/);
+  assert.ok(pastes(advice).includes("chrome://flags/#enable-unsafe-webgpu"));
+  assert.ok(pastes(advice).includes("chrome://flags/#enable-vulkan"),
+    "Chrome's own troubleshooting page requires #enable-vulkan on Linux");
+  assert.ok(pastes(advice).includes("chrome://gpu"));
+});
+
+test("🔴 a WINDOWS Chrome is NOT told to enable Vulkan", () => {
+  // It has had WebGPU since 113 there, so the cause is local - acceleration
+  // off, a blocklisted driver, a policy - and a Linux-only flag would be noise
+  // that makes the real step harder to find.
+  const advice = webgpuAdvice("missing", { userAgent: UA.chromeWindows });
+  assert.ok(!pastes(advice).includes("chrome://flags/#enable-vulkan"));
+  assert.ok(pastes(advice).includes("chrome://settings/system"),
+    "graphics acceleration is the commonest cause on Windows");
+  assert.match(advice.summary, /113/);
+  // a two-GPU laptop is a Windows-shaped problem
+  assert.ok(pastes(advice).includes("chrome://flags/#force-high-performance-gpu"));
+});
+
+test("🔴 an out-of-date Chrome is told to update, and nothing else", () => {
+  const advice = webgpuAdvice("missing", { userAgent: UA.chromeOld });
+  assert.match(advice.summary, /113/);
+  assert.match(advice.summary, /108/);
+  assert.ok(!pastes(advice).includes("chrome://flags/#enable-unsafe-webgpu"),
+    "a flag cannot add WebGPU to a browser that does not have it");
+});
+
+test("🔴 NO ADVICE EVER NAMES A PREF THAT DOES NOT EXIST", () => {
+  // 🔴 `gfx.webgpu.force-enabled` WAS IN THIS ADVICE AND IS NOT A REAL PREF.
+  // It appears in third-party guides; `grep force-enabled` over Mozilla's own
+  // modules/libpref/init/StaticPrefList.yaml finds twenty-one prefs and none of
+  // them is that one (checked 2026-11-13). Telling a reader to create a pref
+  // that does nothing is worse than silence: they will believe they tried it.
+  const every = [];
+  for (const stage of ["missing", "no-adapter", "device-failed"]) {
+    for (const ua of Object.values(UA)) {
+      const advice = webgpuAdvice(stage, { userAgent: ua });
+      every.push(advice.summary, ...advice.steps.map((step) => step.do),
+        ...pastes(advice));
+    }
+  }
+  const text = every.join("\n");
+  assert.doesNotMatch(text, /gfx\.webgpu\.force-enabled/,
+    "that pref does not exist in StaticPrefList.yaml");
+  assert.doesNotMatch(text, /force-enabled/,
+    "no WebGPU force-enabled pref exists at all");
+  // the two that DO exist, each verified in that file
+  assert.match(text, /dom\.webgpu\.enabled/);
+  assert.match(text, /gfx\.webgpu\.ignore-blocklist/);
+});
+
+test("🔴 a LINUX Firefox is warned off forcing it on an ESR build", () => {
+  // 🔴 THE ONE CASE WHERE "JUST FLIP THE PREF" IS BAD ADVICE. Mozilla's Andy
+  // Leiserson, bugzilla 2063383: "ESR 153 does not officially support WebGPU on
+  // Linux", and they "do not plan to backport Linux-specific WebGPU security
+  // fixes to ESR153". The pref can still be flipped, which is why it has to be
+  // said.
+  for (const stage of ["missing", "no-adapter"]) {
+    const advice = webgpuAdvice(stage, { userAgent: UA.firefoxLinux });
+    const esr = advice.steps.find((step) => /ESR/.test(step.do));
+    assert.ok(esr !== undefined,
+      `no ESR caution for a Linux Firefox at the ${stage} stage`);
+    assert.match(esr.do, /not being backported|security fixes/);
+    assert.equal(esr.kind, "none", "there is nothing to paste in a caution");
+  }
+  // ...and not on Windows, where it is supported and the warning is noise
+  const windows = webgpuAdvice("missing", { userAgent: UA.firefoxWindows });
+  assert.ok(!windows.steps.some((step) => /ESR/.test(step.do)));
+});
+
+test("🔴 a Firefox reader is sent to Firefox's own controls, not Chrome's", () => {
+  for (const stage of ["missing", "no-adapter"]) {
+    const advice = webgpuAdvice(stage, { userAgent: UA.firefoxLinux });
+    assert.ok(pastes(advice).includes("about:support"),
+      "about:support is Firefox's graphics report; chrome://gpu is not it");
+    for (const paste of pastes(advice)) {
+      assert.ok(!paste.startsWith("chrome://"),
+        `a Firefox reader is given ${paste}, which Firefox has no page for`);
+    }
+  }
+  // 🔴 AND ITS null-adapter SUMMARY MUST NOT BLAME CHROME'S BLOCKLIST, which
+  // is what it did: the sentence named "Chrome's blocklist" to a Firefox user.
+  const advice = webgpuAdvice("no-adapter", { userAgent: UA.firefoxWindows });
+  assert.doesNotMatch(advice.summary, /Chrome/);
+});
+
+test("🔴 Firefox is not told it has WebGPU where it does not", () => {
+  const linux = webgpuAdvice("missing", { userAgent: UA.firefoxLinux });
+  assert.match(linux.summary, /Nightly-only|does not enable/);
+  assert.ok(pastes(linux).includes("about:config"));
+  const windows = webgpuAdvice("missing", { userAgent: UA.firefoxWindows });
+  assert.match(windows.summary, /141/,
+    "Firefox shipped WebGPU on Windows in 141 and this reader is on 139");
+});
+
+test("🔴 a LINUX null adapter gets the Vulkan flag - it was in the wrong stage", () => {
+  // 🔴 THIS IS THE BUG A READER HIT. They enabled the flags, `navigator.gpu`
+  // appeared, and `requestAdapter()` returned null - and this branch offered
+  // acceleration, the GPU report and the blocklist, with no mention of Vulkan.
+  // Chrome's own troubleshooting page lists `chrome://flags/#enable-vulkan`
+  // under "When GPU adapter is null", because `#enable-unsafe-webgpu` alone
+  // exposes the API and leaves no backend to hand out an adapter. The advice
+  // had it filed under a MISSING navigator.gpu, which is the other stage.
+  const advice = webgpuAdvice("no-adapter", { userAgent: UA.chromeLinux });
+  // 🔴 AND THE SUMMARY NAMES VULKAN, not acceleration and the blocklist. That
+  // sentence was platform-blind, so the reader checked both and was no further
+  // forward; the right step being further down a list does not help if the
+  // first sentence sends you elsewhere.
+  assert.match(advice.summary, /Vulkan/);
+  assert.match(advice.summary, /no adapter to hand out|no hardware Vulkan/);
+  assert.ok(pastes(advice).includes("chrome://flags/#enable-vulkan"),
+    "a Linux null adapter without #enable-vulkan is the commonest Linux case"
+    + " left unaddressed");
+  assert.ok(pastes(advice).includes("chrome://flags/#enable-unsafe-webgpu"));
+  // 🔴 AND THE QUESTION THE PAGE CANNOT ANSWER: does the machine have a
+  // hardware Vulkan driver at all? If not, no flag helps.
+  assert.ok(pastes(advice).includes("vulkaninfo --summary"));
+  const vulkaninfo = advice.steps
+    .find((step) => step.paste === "vulkaninfo --summary");
+  assert.equal(vulkaninfo.kind, "terminal",
+    "a terminal command pasted into the address bar is a web search");
+  assert.match(vulkaninfo.do, /llvmpipe|lavapipe/,
+    "software rendering is the answer this check exists to catch");
+  // and the documented fallback launch, X11 rather than Wayland
+  const launch = advice.steps.find((step) => step.kind === "launch");
+  assert.match(launch.paste, /--ozone-platform=x11/);
+  assert.match(launch.paste, /--enable-features=Vulkan/,
+    "the command-line switch is --enable-features=Vulkan, not --enable-vulkan");
+  assert.match(launch.paste, /--user-data-dir=/,
+    "a throwaway profile, so it does not disturb the browser they use");
+});
+
+test("🔴 a WINDOWS null adapter is not sent to Linux's Vulkan steps", () => {
+  const advice = webgpuAdvice("no-adapter", { userAgent: UA.chromeWindows });
+  assert.doesNotMatch(advice.summary, /Vulkan/,
+    "Vulkan is the Linux explanation; on Windows it is acceleration or the"
+    + " blocklist");
+  assert.match(advice.summary, /acceleration|blocklist/);
+  assert.ok(!pastes(advice).includes("chrome://flags/#enable-vulkan"));
+  assert.ok(!pastes(advice).includes("vulkaninfo --summary"));
+  assert.ok(advice.steps.every((step) => step.kind === "address"),
+    "every Windows step is an address, so none should be labelled otherwise");
+});
+
+test("🔴 every step declares where it is carried out", () => {
+  for (const stage of ["missing", "no-adapter", "device-failed"]) {
+    for (const [name, ua] of Object.entries(UA)) {
+      for (const step of webgpuAdvice(stage, { userAgent: ua }).steps) {
+        assert.ok(STEP_KINDS.includes(step.kind),
+          `${stage}/${name}: step kind ${JSON.stringify(step.kind)} is not one`
+          + ` of ${STEP_KINDS.join(", ")}`);
+        if (step.paste === undefined) assert.equal(step.kind, "none");
+      }
+    }
+  }
+});
+
+test("🔴 the three stages are three different diagnoses", () => {
+  const missing = webgpuAdvice("missing", { userAgent: UA.chromeWindows });
+  const adapter = webgpuAdvice("no-adapter", { userAgent: UA.chromeWindows });
+  const device = webgpuAdvice("device-failed",
+    { userAgent: UA.chromeWindows, detail: "maxStorageBufferBindingSize" });
+  assert.notEqual(missing.summary, adapter.summary);
+  assert.notEqual(adapter.summary, device.summary);
+  // a null adapter is NOT "no WebGPU": saying so sends a reader to a flags page
+  // for a browser that already has the API
+  assert.match(adapter.summary, /has WebGPU/);
+  // 🔴 AND A REFUSED DEVICE IS OURS TO FIX. It is the one stage where no
+  // browser setting is the answer, so the text must say so and ask for the
+  // diagnostics rather than list flags.
+  assert.match(device.summary, /our bug/);
+  assert.match(device.summary, /maxStorageBufferBindingSize/);
+  assert.ok(!pastes(device).includes("chrome://flags/#enable-unsafe-webgpu"));
+});
+
+test("🔴 an insecure origin is diagnosed as OURS, before anything else", () => {
+  // It hides every other cause - the API is simply not exposed - and it is the
+  // only one of these that the site causes rather than the visitor.
+  const advice = webgpuAdvice("missing",
+    { userAgent: UA.chromeLinux, isSecureContext: false });
+  assert.match(advice.summary, /secure/);
+  assert.match(advice.summary, /https:\/\/|localhost/);
+  // and NOT the Linux flag procedure, which would be a wild goose chase
+  assert.ok(!pastes(advice).includes("chrome://flags/#enable-vulkan"));
+});
+
+test("🔴 every diagnosis carries a diagnostics line with the stage in it", () => {
+  for (const stage of ["missing", "no-adapter", "device-failed"]) {
+    const advice = webgpuAdvice(stage, { userAgent: UA.chromeLinux });
+    assert.match(advice.diagnostics, new RegExp(`stage ${stage}`));
+    assert.match(advice.diagnostics, /Chrome 143 on Linux/);
+    assert.match(advice.diagnostics, /ua Mozilla/);
+  }
+});
+
+test("🔴 a browser nobody recognised still gets somewhere to go", () => {
+  const advice = webgpuAdvice("missing", { userAgent: "Mystery/1.0" });
+  assert.ok(advice.summary.length > 40);
+  assert.ok(advice.steps.length > 0);
+  assert.match(advice.diagnostics, /unknown/);
+});
+
+test("🔴 no step is a clickable link, because chrome:// cannot be one", () => {
+  // Chrome refuses navigation to chrome:// from page content: an anchor would
+  // do nothing when clicked, and a reader would read that as a broken page.
+  for (const stage of ["missing", "no-adapter", "device-failed"]) {
+    for (const ua of Object.values(UA)) {
+      const advice = webgpuAdvice(stage, { userAgent: ua });
+      for (const step of advice.steps) {
+        assert.ok(!("href" in step), "a step must be text to paste, not a link");
+        assert.equal(typeof step.do, "string");
+        assert.ok(step.do.length > 20, `a step with no instruction: ${step.paste}`);
+      }
+    }
+  }
+});
+
+test("🔴 the Linux guide's steps are the ones the page actually offers", () => {
+  // 🔴 A FIFTH COPY, AND THE ONE THAT GETS SENT TO PEOPLE. docs/WEBGPU-ON-LINUX.md
+  // is linked from the error panel, so a reader following it has already failed
+  // once - a step the page no longer offers, or a pref that does not exist,
+  // costs them a second round trip. Every address the guide gives must be one
+  // this module gives for the matching browser and stage.
+  const guide = readFileSync(
+    new URL("../docs/WEBGPU-ON-LINUX.md", import.meta.url), "utf8");
+  // 🔴 COMPARED WITH CONTINUATIONS FOLDED, because the long launch line is
+  // wrapped with a backslash in the guide for readability and is one line in
+  // the page. Comparing them verbatim fails on the formatting rather than on
+  // the content, which is not what this test is for.
+  const flat = guide.replace(/\\\n\s*/g, " ").replace(/\s+/g, " ");
+  const chrome = new Set([
+    ...pastes(webgpuAdvice("missing", { userAgent: UA.chromeLinux })),
+    ...pastes(webgpuAdvice("no-adapter", { userAgent: UA.chromeLinux })),
+  ]);
+  for (const paste of chrome) {
+    assert.ok(flat.includes(paste.replace(/\s+/g, " ")),
+      `the guide does not mention ${paste}, which the page tells a Linux`
+      + " Chrome reader to use");
+  }
+  const firefox = new Set([
+    ...pastes(webgpuAdvice("missing", { userAgent: UA.firefoxLinux })),
+    ...pastes(webgpuAdvice("no-adapter", { userAgent: UA.firefoxLinux })),
+  ]);
+  for (const paste of firefox) {
+    assert.ok(flat.includes(paste.replace(/\s+/g, " ")),
+      `the guide does not mention ${paste}`);
+  }
+  // the facts a reader acts on, each sourced in the guide's own last section
+  for (const fact of ["dom.webgpu.enabled", "gfx.webgpu.ignore-blocklist",
+                      "llvmpipe", "ozone-platform=x11",
+                      "--enable-features=Vulkan", "ESR 153",
+                      "Intel Gen12+", "144"]) {
+    assert.ok(guide.includes(fact), `the guide lost "${fact}"`);
+  }
+  // 🔴 AND EVERY MENTION OF THE PREF THAT DOES NOT EXIST MUST SAY SO. Written
+  // as a lookahead first, which failed on its own punctuation and told me
+  // nothing - a test I cannot read is a test I cannot trust. Plainly: find the
+  // mentions, and require each one's own sentence to deny it.
+  const mentions = [...flat.matchAll(/gfx\.webgpu\.force-enabled/g)];
+  assert.ok(mentions.length > 0,
+    "the guide should warn that the pref third-party guides name is not real");
+  for (const mention of mentions) {
+    const sentence = flat.slice(Math.max(0, mention.index - 120),
+                                mention.index + 160);
+    assert.match(sentence,
+      /does not exist|is \*\*no\*\*|no `gfx|none of them|not a real/,
+      `a mention of force-enabled that does not deny it: "...${sentence}..."`);
+  }
+});
+
+test("🔴 the README's support table is this module's, not a second copy", () => {
+  // 🔴 TWO LISTS OF VERSION NUMBERS IS ONE LIST THAT GOES STALE, and the stale
+  // one is always the prose. The README prints every row of WEBGPU_BY_DEFAULT.
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  for (const row of WEBGPU_BY_DEFAULT) {
+    assert.ok(readme.includes(row.where),
+      `the README does not mention "${row.where}"`);
+    assert.match(readme, new RegExp(`${row.from}\\b`),
+      `the README does not give version ${row.from} for ${row.where}`);
+  }
+});

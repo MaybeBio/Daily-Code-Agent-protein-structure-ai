@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - "main"
+  schedule:
+    - cron:  "0 0 * * *"
+
+jobs:
+  test:
+    if: github.event.pull_request.draft == false
+    name: mBuild Tests (python)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - uses: actions/checkout@v7
+        name: Checkout Branch / Pull Request
+
+      - name: Install Mamba (Linux)
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          micromamba-version: 'latest'
+          cache-environment: false
+          post-cleanup: 'all'
+          environment-file: environment-dev.yml
+          create-args: >-
+            python=${{ matrix.python-version }}
+
+      - name: Install Package
+        run: python -m pip install -e .
+
+      - name: Conditionally install OpenBabel
+        if: ${{ matrix.python-version > '3.13' }}
+        run: micromamba install -y "openbabel>=3.2.1"
+
+      - name: Test (OS -> ${{ matrix.os }} / Python -> ${{ matrix.python-version }})
+        run: python -m pytest -v --cov=mbuild --cov-report=xml --cov-append --cov-config=setup.cfg --color yes --pyargs mbuild
+
+      - name: Upload Coverage Report
+        uses: codecov/codecov-action@v7
+        with:
+          name: mBuild-Coverage
+          verbose: true
+          files: ./coverage.xml
+
+  arch-test:
+    if: github.event.pull_request.draft == false
+    name: mBuild Tests (arch)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macOS-latest, macOS-15, ubuntu-latest]
+        python-version: ["3.14"]
+
+    defaults:
+      run:
+        shell: bash -l {0}
+
+    steps:
+      - uses: actions/checkout@v7
+        name: Checkout Branch / Pull Request
+
+      - name: Install Mamba (Linux)
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          micromamba-version: 'latest'
+          cache-environment: false
+          post-cleanup: 'all'
+          environment-file: environment-dev.yml
+          create-args: >-
+            python=${{ matrix.python-version }}
+
+      - name: Install Package
+        run: python -m pip install -e .
+
+      - name: Test (OS -> ${{ matrix.os }} / Python -> ${{ matrix.python-version }})
+        run: python -m pytest -v --cov=mbuild --cov-report=xml --cov-append --cov-config=setup.cfg --color yes --pyargs mbuild
+
+  wsl-test:
+    if: github.event.pull_request.draft == false
+    name: mBuild Tests (WSL)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        name: Checkout Branch / Pull Request
+
+      - uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-24.04
+          wsl-shell-user: runner
+        name: Set up WSL
+
+      - name: Install mBuild and run pytest
+        shell: wsl-bash {0}
+        run: |
+          wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O $HOME/Miniforge3.sh
+          bash $HOME/Miniforge3.sh -b -p $HOME/miniforge
+          echo 'export PATH=$HOME/miniforge/bin:$PATH' >> ~/.bashrc
+          export PATH=$HOME/miniforge/bin:$PATH
+          source ~/.bashrc
+          source $HOME/miniforge/etc/profile.d/conda.sh
+          mamba update -n base --all -y
+          mamba env create -f environment-dev.yml python=3.14 -y
+          conda activate mbuild-dev
+          pip install -e . --no-build-isolation
+          python -m pytest -v --color yes --pyargs mbuild
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    name: Build Docker Image
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Get Tagged Version
+        run: |
+          echo "DOCKER_TAGS=mosdef/mbuild:${GITHUB_REF_NAME}, mosdef/mbuild:stable" >> $GITHUB_ENV
+        if: github.ref_type == 'tag'
+
+      - name: Get Push Version
+        run: |
+          echo "DOCKER_TAGS=mosdef/mbuild:${GITHUB_REF_NAME}, mosdef/mbuild:latest" >> $GITHUB_ENV
+        if: github.ref_type == 'branch'
+
+      - name: Docker Image Info
+        run: |
+          echo Docker Image tags: ${DOCKER_TAGS}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ env.DOCKER_TAGS }}

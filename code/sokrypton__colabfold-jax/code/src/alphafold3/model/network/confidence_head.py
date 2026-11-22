@@ -1,0 +1,945 @@
+# Copyright 2024 DeepMind Technologies Limited
+#
+# AlphaFold 3 source code is licensed under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with the
+# License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# To request access to the AlphaFold 3 model parameters, follow the process set
+# out at https://github.com/google-deepmind/alphafold3. You may only use these
+# if received directly from Google. Use is subject to terms of use available at
+# https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
+
+"""Confidence Head."""
+
+from alphafold3.common import base_config
+from alphafold3.model import model_config
+from alphafold3.model.network import evoformer
+from alphafold3.constants import residue_names
+from alphafold3.model.network import featurization
+from alphafold3.model.atom_layout import atom_layout
+from alphafold3.constants import atom_types
+from alphafold3.model.components import haiku_modules as hm
+from alphafold3.model.components import mapping
+from alphafold3.model.components import utils
+from . import atom_cross_attention
+from . import modules
+from . import template_modules
+import haiku as hk
+import jax
+import jax.numpy as jnp
+
+
+def _safe_norm(x, keepdims, axis, eps=1e-8):
+  return jnp.sqrt(eps + jnp.sum(jnp.square(x), axis=axis, keepdims=keepdims))
+
+
+
+# The parity harness's draw for helixfold3's confidence augmentation: (R (3, 3),
+# t (3,)) applied as x @ R + t, as stock's CentreRandomAugmentation; None in a run.
+HF3_CONF_AUGMENT = None
+
+# float32 pair copies larger than this feed the pair logit heads in row slabs (35 GiB at 6k tokens, 256 channels)
+PAIR_LOGIT_SLAB_BYTES = 2 ** 30
+
+class ConfidenceHead(hk.Module):
+  """Head to predict the distance errors in a prediction."""
+
+  class PAEConfig(base_config.BaseConfig):
+    max_error_bin: float = 31.0
+    # Classes in the confidence re-embedding's distance one-hot. boltz2's 64 is
+    # the default; ESMFold2 sets its own (see LEARNED_CONFIDENCE_BINS).
+    reembed_dist_bins: int = 64
+    num_bins: int = 64
+
+  class Config(base_config.BaseConfig):
+    """Configuration for ConfidenceHead."""
+
+    pairformer: modules.PairFormerIteration.Config = base_config.autocreate(
+        single_attention=base_config.autocreate(),
+        single_transition=base_config.autocreate(),
+        num_layer=4,
+    )
+    max_error_bin: float = 31.0
+    # Classes in the confidence re-embedding's distance one-hot. boltz2's 64 is
+    # the default; ESMFold2 sets its own (see LEARNED_CONFIDENCE_BINS).
+    reembed_dist_bins: int = 64
+    num_plddt_bins: int = 50
+    num_bins: int = 64
+    no_embedding_prob: float = 0.2
+    pae: 'ConfidenceHead.PAEConfig' = base_config.autocreate()
+    dgram_features: template_modules.DistogramFeaturesConfig = (
+        base_config.autocreate()
+    )
+
+  def __init__(
+      self,
+      config: Config,
+      global_config: model_config.GlobalConfig,
+      name='confidence_head',
+  ):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = global_config
+
+  @hk.transparent
+  def _head_norm(self, name, x):
+    """LayerNorm before a logit head -- except for boltz2, which has none.
+
+    Boltz-2's ConfidenceHeads call to_pae/pde/plddt/resolved_logits directly on z/s.
+    This cannot be expressed as a mapped weight: a LayerNorm with scale=1/offset=0
+    still normalises, so it has to be skipped in the graph, which is also why those
+    6 params have no source in the checkpoint.
+
+    @hk.transparent is REQUIRED: haiku scopes parameters by the method that creates
+    them, so without it these LayerNorms move from `<head>/logits_ln` to
+    `<head>/~_head_norm/logits_ln` and every already-converted model (of3/if2/rf3/
+    protenix) silently loses 8 parameters to init. Caught by the structural gate.
+    """
+    norm = self._head_norm_module(name)
+    return x if norm is None else norm(x)
+
+  @hk.transparent
+  def _head_norm_module(self, name):
+    skip = model_config.NO_HEAD_NORM.get(self.global_config.model, ())
+    return None if '*' in skip or name in skip else hm.LayerNorm(name=name)
+
+  def _pair_logits(self, pair_act, asym_id, fn, sym=False):
+    """fn(x, asym_rows) over the float32 pair (pair + pair^T when sym), in row slabs when that copy is large.
+
+    Every head here is row-local (LayerNorm and projection over channels), so the slabs are exact. fn must not
+    create modules: inside the slab loop a new module would get a fresh name.
+    """
+    def rows(p, pt, a):
+      x = p.astype(jnp.float32)
+      if sym:
+        x = x + jnp.swapaxes(pt, 0, 1).astype(jnp.float32)
+      return fn(x, a)
+    row_bytes = pair_act[0].size * 4
+    if hk.running_init() or pair_act.shape[0] * row_bytes <= PAIR_LOGIT_SLAB_BYTES:
+      return rows(pair_act, pair_act, asym_id)
+    return mapping.sharded_apply(rows, max(1, PAIR_LOGIT_SLAB_BYTES // row_bytes), in_axes=(0, 1, 0))(
+        pair_act, pair_act, asym_id)
+
+  @hk.transparent
+  def _boltz2_rel_pos(self, tf, num_channels, dtype):
+    """Boltz-2's RelativePositionEncoder, which is AF3's own encoding exactly.
+
+    This used to be forty lines of hand-written bucketing. Every term matches
+    `featurization.create_relative_encoding` bucket for bucket -- the clipped
+    residue offset with an out-of-chain sentinel, the token offset with an
+    out-of-residue sentinel, the same-entity column, and the symmetry-class
+    chain offset with an out-of-entity sentinel, concatenated in that order --
+    at r_max 32 / s_max 2, which are also AF3's config defaults. Verified
+    bit-exact (max|d| 0.0) against boltz's own module on all four oracle cases
+    before it was replaced, and against the hand-written version after.
+
+    Reusing AF3's also picks up cyclic_period, which the hand-written copy
+    explicitly did not wrap: a cyclic peptide's termini now read as adjacent
+    here as they already did in the trunk.
+    """
+    # THE THIRD CALL SITE OF THE SAME GATE, and the one that was still missing.
+    # The trunk's was fixed first (fbac0fc, worth 1.522 -> 0.719 A on
+    # esmfold2_lm600m) and the diffusion conditioning's after it; this one was
+    # never wired, so ESMFold2's confidence head built its relative-position
+    # block with AF3's ENTITY convention while ESMFold2 keys it on same-CHAIN.
+    # On a monomer that is not subtle -- every pair takes a different bucket.
+    #
+    # boltz2 shares this method and must NOT take the branch: its checkpoint's
+    # `fix_sym_check: True` puts it on the entity convention, which is why it
+    # left CHAIN_BUCKET_ON_SAME_CHAIN on 2026-09-10. Reading the list here keeps
+    # the two models' answers where the evidence for each of them lives.
+    feat = featurization.create_relative_encoding(
+        seq_features=tf, max_relative_idx=32, max_relative_chain=2,
+        chain_bucket_on_same_chain=(
+            self.global_config.model in model_config.CHAIN_BUCKET_ON_SAME_CHAIN))
+    return hm.Linear(num_channels, name='rel_pos_project')(feat.astype(dtype))
+
+  @hk.transparent
+  def _boltz2_contact_conditioning(self, contact, threshold, num_channels, dtype):
+    """Boltz-2's ContactConditioning -- the evoformer's, called from here.
+
+    It used to be a verbatim copy, justified on the grounds that the two sites
+    hold DIFFERENT weights (model.contact_conditioning vs
+    confidence_module.contact_conditioning). They do, and that is not a reason
+    to duplicate the body: haiku names parameters by the module stack at CALL
+    time, so one function called from two places already produces two separate
+    sets. The copy bought nothing and had to be kept in step by hand.
+    """
+    return evoformer.boltz2_contact_conditioning(
+        contact, threshold, num_channels, dtype)
+
+  @hk.transparent
+  def _boltz2_split_heads(self, asym_id, num_bins, intra_name, inter_name):
+    """boltz2's intra/inter-chain logit pair: `intra(z)*same + inter(z)*different`.
+
+    Not a blend -- the two are disjoint hard masks, so on a monomer this reduces
+    exactly to the intra head and the inter weights are dead. That is the whole reason
+    the monomer gate could not see the missing head.
+
+    Returns fn(z, asym_rows) for `_pair_logits`, z holding the rows of asym_rows.
+    """
+    intra = hm.Linear(num_bins, initializer=self.global_config.final_init,
+                      name=intra_name)
+    inter = hm.Linear(num_bins, initializer=self.global_config.final_init,
+                      name=inter_name)
+
+    def fn(z, asym_rows):
+      same_chain = (asym_rows[:, None] == asym_id[None])[..., None].astype(z.dtype)
+      return intra(z) * same_chain + inter(z) * (1 - same_chain)
+    return fn
+
+  @hk.transparent
+  def _normed_linear(self, num_bins, norm_name, name, use_bias=False):
+    """fn(x, _) = Linear(head_norm(x)) for `_pair_logits`."""
+    norm = self._head_norm_module(norm_name)
+    lin = hm.Linear(num_bins, use_bias=use_bias, initializer=self.global_config.final_init, name=name)
+    return lambda x, _: lin(x if norm is None else norm(x))
+
+  def _boltz2_reembed(self, pair_act, single_act, target_feat, positions, pair_mask,
+                      token_features, bond_matrix, bond_type_matrix, batch=None):
+    """Boltz-2 rebuilds s and z from scratch before its confidence pairformer.
+
+    AF3 adds a couple of projections to the trunk's z; boltz LayerNorms the trunk
+    outputs and then adds NINE terms. The full sum was verified exactly (mean|d| 3e-8)
+    against the module's own hooked activations, which is how the term that had been
+    missing all along -- s_to_z_prod, `add_s_to_z_prod=True` in this checkpoint -- was
+    finally found: it is uncorrelated with every other term, so fitting it out of an
+    aggregate residual had repeatedly mis-attributed it to whichever term was being
+    tested at the time.
+
+    contact_conditioning reads the same pocket/contact features as the trunk's (its own
+    weights, confidence_module.contact_conditioning).
+    """
+    c = pair_act.shape[-1]
+    dtype = pair_act.dtype
+    n = pair_act.shape[0]
+
+    # WIDEN 447 -> 451 FIRST for ESMFold2, because `s_inputs_norm` is a
+    # LayerNorm: it subtracts the mean over the width and divides by it, so
+    # normalising 447 channels where native normalises 451 rescales every term
+    # that reads s_inputs. Exactly the trap diffusion_head.py already handles
+    # for `single_cond_initial_norm`, and the same permutation -- ESMFold2 puts
+    # the gap at class 1, below the residues, so this is NOT a pad-with-zeros.
+    #
+    # Measured term by term against native's captured terms (2026-09-11):
+    # z_norm exact at 2.00e-06 while all three s_inputs-derived terms were low
+    # by the same ~0.5% -- one shared input, one shared error.
+    #
+    # boltz2 shares this method and must NOT widen: its s_inputs is AF3's own
+    # 447 and its weights are converted at that width.
+    if self.global_config.model in model_config.PAIR_ONLY_TRUNK:
+      target_feat = featurization.widen_s_inputs(target_feat, token_features.is_dna)
+    s_inputs = hm.LayerNorm(name='s_inputs_norm')(target_feat)
+    single_act = hm.LayerNorm(name='s_norm')(single_act)
+    single_act = single_act + hm.Linear(
+        single_act.shape[-1], name='s_input_to_s')(s_inputs)
+
+    z = hm.LayerNorm(name='z_norm')(pair_act)
+    z += self._boltz2_rel_pos(token_features, c, dtype)
+    z += hm.Linear(c, name='token_bonds_project')(
+        bond_matrix[..., None].astype(dtype))
+    z += hm.Linear(c, name='token_bonds_type_embed')(
+        jax.nn.one_hot(bond_type_matrix, 7).astype(dtype))
+    z += self._boltz2_contact_conditioning(
+        *evoformer.boltz2_contact_inputs(batch, n), c, dtype)
+
+    # Orientation is load-bearing and the opposite of what the names suggest: boltz adds
+    # s_to_z(s)[:, :, None] -- broadcast along j, so indexed by i -- which is our
+    # RIGHT projection, and s_to_z_transpose is the LEFT one.
+    z += hm.Linear(c, name='right_target_feat_project')(s_inputs)[:, None]
+    z += hm.Linear(c, name='left_target_feat_project')(s_inputs)[None]
+    prod = (hm.Linear(c, name='s_to_z_prod_in1')(s_inputs)[:, None]
+            * hm.Linear(c, name='s_to_z_prod_in2')(s_inputs)[None])
+    z += hm.Linear(c, name='s_to_z_prod_out')(prod)
+
+    # Boltz embeds representative-atom distance into 64 bins (63 edges, 2..22 A) with an
+    # nn.Embedding, not AF3's 39-bin projection. ESMFold2 shares the module but
+    # NOT the binning: it trains its own `boundaries`, 38 edges over 3.25..50.75
+    # (127 on the experimental line). Those were converted into the reference
+    # map and never into the graph, so its embedding rows -- padded out to
+    # boltz2's 64 to fit -- were being selected by boltz2's bins. Nothing about
+    # a fold depends on this, which is why it survived every fold gate.
+    d = jnp.sqrt(jnp.sum((positions[:, None] - positions[None]) ** 2, -1) + 1e-10)
+    if self.global_config.model in model_config.LEARNED_CONFIDENCE_BINS:
+      num_bins = self.config.reembed_dist_bins
+      bnd = hk.get_parameter('distogram_boundaries', [num_bins - 1],
+                             dtype=jnp.float32, init=jnp.zeros)
+    else:
+      num_bins = 64
+      bnd = jnp.linspace(2.0, 22.0, 63)
+    dgram = jax.nn.one_hot(
+        (d[..., None] > bnd.astype(d.dtype)).sum(-1), num_bins).astype(dtype)
+    z += hm.Linear(c, name='distogram_feat_project')(dgram * pair_mask[..., None])
+    return z, single_act
+
+  @hk.transparent
+  def _helixfold3_embed(self, dense_atom_positions, pair_act, single_act,
+                        target_feat, batch):
+    """HelixFold3's re-embedding of a predicted structure (ConfidenceHead,
+    helixfold/model/modules_all_atom.py).
+
+    The predicted atoms are centred, randomly rotated and translated
+    (CentreRandomAugmentation), scaled by 1/sigma_data and run through an atom
+    encoder conditioned on the trunk single and RAW trunk pair, so -- unlike
+    AF3's distance features -- the result depends on the rotation drawn. Then
+      z += left(LN([a_conf, s_inputs]))_i + right(...)_j      (biased Linears)
+      z += Linear(one_hot(#{v in 0, .5, ..., 21.5 : d_ij > v}, 45))
+    with d over each token's CENTRE atom (CA, C1', or the atom of an atom
+    token), unmasked. Returns the pair and the encoder output, whose skips the
+    pLDDT/resolved decoder reads.
+    """
+    dtype = pair_act.dtype
+    c = pair_act.shape[-1]
+    mask = batch.predicted_structure_info.atom_mask.astype(jnp.float32)   # (N, A)
+    x = dense_atom_positions.astype(jnp.float32)
+    centre = (x * mask[..., None]).sum((0, 1)) / (mask.sum() + 1e-6)
+    x = x - centre
+    if HF3_CONF_AUGMENT is not None:
+      rot = jnp.asarray(HF3_CONF_AUGMENT[0], jnp.float32)
+      trans = jnp.asarray(HF3_CONF_AUGMENT[1], jnp.float32).reshape(3)
+    else:
+      from . import diffusion_head
+      key = hk.maybe_next_rng_key()
+      key = jax.random.PRNGKey(0) if key is None else key
+      k_rot, k_trans = jax.random.split(key)
+      rot = diffusion_head.random_rotation(k_rot)
+      trans = jax.random.normal(k_trans, (3,))
+    x = (jnp.einsum('nad,de->nae', x, rot) + trans) * mask[..., None]
+
+    enc = atom_cross_attention.atom_cross_att_encoder(
+        token_atoms_act=x / 16.0,
+        trunk_single_cond=single_act,
+        trunk_pair_cond=pair_act,
+        config=atom_cross_attention.AtomCrossAttEncoderConfig(
+            per_token_channels=single_act.shape[-1]),
+        global_config=self.global_config,
+        batch=batch,
+        name='confidence',
+    )
+    # LayerNorm over the vendor's 833 channels: ours [a 384 | target_feat 447]
+    # then its two unknown-DNA columns (converters/helixfold3.py)
+    # target_feat is [447 | restype DN, profile DN] (model.hf3_dn_columns)
+    feat = jnp.concatenate([enc.token_act.astype(dtype), target_feat.astype(dtype)], -1)
+    feat = hm.LayerNorm(name='hf3_single_norm', use_fast_variance=False)(feat)
+    z = pair_act + hm.Linear(c, use_bias=True, name='right_target_feat_project')(feat)[:, None]
+    z = z + hm.Linear(c, use_bias=True, name='left_target_feat_project')(feat)[None]
+
+    names = batch.ref_structure.atom_name_chars                         # (N, A, 4)
+    is_ca = jnp.all(names == jnp.asarray([35, 33, 0, 0]), -1)
+    is_c1 = jnp.all(names == jnp.asarray([35, 17, 7, 0]), -1)
+    hit = is_ca | is_c1
+    slot = jnp.where(hit.any(-1), jnp.argmax(hit, -1), 0)
+    rep_pos = jnp.take_along_axis(x, slot[:, None, None], axis=1)[:, 0]   # (N, 3)
+    d = jnp.sqrt(jnp.sum((rep_pos[:, None] - rep_pos[None]) ** 2, -1) + 1e-8)
+    bins = jnp.arange(44, dtype=jnp.float32) * 0.5
+    dgram = jax.nn.one_hot((d[..., None] > bins).sum(-1), 45)
+    z = z + hm.Linear(c, use_bias=True, name='distogram_feat_project')(dgram.astype(dtype))
+    return z.astype(dtype), enc
+
+  def _embed_features(
+      self,
+      dense_atom_positions,
+      token_atoms_to_pseudo_beta,
+      pair_mask,
+      pair_act,
+      target_feat,
+      target_feat_absent=None,
+  ):
+    out = hm.Linear(pair_act.shape[-1], name='left_target_feat_project')(
+        target_feat
+    ).astype(pair_act.dtype)
+    out += hm.Linear(pair_act.shape[-1], name='right_target_feat_project')(
+        target_feat
+    ).astype(pair_act.dtype)[:, None]
+    if target_feat_absent is not None:
+      # The vendor's input columns our target_feat does not carry, at the value
+      # its normalisation gives them (masked_global_norm absent_value): (N, k).
+      out += hm.Linear(pair_act.shape[-1],
+                       name='left_target_feat_project_absent')(
+                           target_feat_absent).astype(pair_act.dtype)
+      out += hm.Linear(pair_act.shape[-1],
+                       name='right_target_feat_project_absent')(
+                           target_feat_absent).astype(pair_act.dtype)[:, None]
+    positions = atom_layout.convert(
+        token_atoms_to_pseudo_beta,
+        dense_atom_positions,
+        layout_axes=(-3, -2),
+    )
+    dgram = template_modules.dgram_from_positions(
+        positions, self.config.dgram_features
+    )
+    dgram *= pair_mask[..., None]
+
+    if self.global_config.model == 'rosettafold3':
+      # RF3 confidence embeds the predicted structure via REPRESENTATIVE-atom
+      # distances discretized to 40 bins (bucketize over 39 boundaries 3.25..50.75),
+      # not AF3's dgram. The representative atom is atomworks'
+      # get_af3_token_representative_idxs -- CB, CA for glycine, C4/C2 for
+      # nucleotides -- which is exactly the pseudo-beta gather above. This read
+      # CA (dense slot 1) on the assumption that RF3 used the token centre; the
+      # stock-RF3 comparison (vendor_native_parity) read pae 0.11 / pde 0.16 on a
+      # plain protein, and forcing the vendor to CA reproduced ours to 3e-3.
+      d = jnp.sqrt(
+          jnp.sum((positions[:, None] - positions[None]) ** 2, -1) + 1e-10)
+      bnd = jnp.arange(39) * ((50.75 - 3.25) / 39.0) + 3.25
+      dgram = jax.nn.one_hot((d[..., None] > bnd).sum(-1), 40).astype(pair_act.dtype)
+      dgram = dgram * pair_mask[..., None]
+    if self.global_config.model == 'chai1':
+      # chai bins the REFERENCE-atom distances into 16 bins by searchsorted over
+      # 15 learned-but-frozen boundaries (atom_distance_v_bins, an evenly spaced
+      # 3.375..21.375), where AF3 uses 39 bins over a different range. Its
+      # reference atom is the pseudo-beta we already gather: reading
+      # token_reference_atom_index back through the 6MRR atom layout gives dense
+      # slot 4 (CB) for every residue and slot 1 (CA) for the glycine.
+      # chai does NOT mask this term, so neither do we.
+      d = jnp.sqrt(
+          jnp.sum((positions[:, None] - positions[None]) ** 2, -1) + 1e-10)
+      bnd = jnp.linspace(3.375, 21.375, 15)
+      dgram = jax.nn.one_hot((d[..., None] > bnd).sum(-1), 16).astype(
+          pair_act.dtype)
+    out += hm.Linear(pair_act.shape[-1], name='distogram_feat_project')(
+        dgram.astype(pair_act.dtype)
+    )
+    if self.global_config.model in model_config.PROTENIX_FAMILY:
+      # Protenix adds a SECOND distance term alongside the binned one: a linear on the
+      # raw distance (`linear_no_bias_d_wo_onehot`, in_features=1). Unbinned, so it
+      # carries the sub-bin resolution the one-hot throws away. Its binning is otherwise
+      # ours exactly -- arange(3.25, 52.0, 1.25) is the same 39 bins as AF3's default.
+      d = jnp.sqrt(jnp.sum((positions[:, None] - positions[None]) ** 2, -1) + 1e-10)
+      out += hm.Linear(pair_act.shape[-1], name='distance_feat_project')(
+          d[..., None].astype(pair_act.dtype))
+    return out
+
+  def __call__(
+      self,
+      dense_atom_positions: jnp.ndarray,
+      embeddings: dict[str, jnp.ndarray],
+      seq_mask: jnp.ndarray,
+      token_atoms_to_pseudo_beta: atom_layout.GatherInfo,
+      asym_id: jnp.ndarray,
+      token_features=None,
+      bond_matrix: jnp.ndarray | None = None,
+      bond_type_matrix: jnp.ndarray | None = None,
+      atom_name_chars: jnp.ndarray | None = None,
+      use_dropout=False,
+      return_logits=False,
+      batch=None,
+  ) -> dict[str, jnp.ndarray]:
+    """Builds ConfidenceHead module.
+
+    Arguments:
+      dense_atom_positions: [N_res, N_atom, 3] array of positions.
+      embeddings: Dictionary of representations.
+      seq_mask: Sequence mask.
+      token_atoms_to_pseudo_beta: Pseudo beta info for atom tokens.
+      asym_id: Asym ID token features.
+      return_logits: Also return the pLDDT, PAE, PDE and resolved logits.
+
+    Returns:
+      Dictionary of results.
+    """
+    dtype = utils.compute_dtype(self.global_config)
+    with utils.bfloat16_context():
+      seq_mask_cast = seq_mask.astype(dtype)
+      pair_mask = seq_mask_cast[:, None] * seq_mask_cast[None, :]
+      pair_mask = pair_mask.astype(dtype)
+
+      pair_act = embeddings['pair'].astype(dtype)
+      single_act = embeddings['single'].astype(dtype)
+      target_feat = embeddings['target_feat'].astype(dtype)
+
+      # ESMFold2's single is ROW-POOLED FROM THE PAIR, and it happens AFTER the
+      # pairformer -- see `_row_pool` and its call site below the stack. It used
+      # to be done here, on the pre-pairformer pair, which left every PAIR-derived
+      # output close (pae corr 0.9947) and every PER-ATOM one uncorrelated
+      # (plddt 0.1059, our values ~4x too low), because plddt and resolved are
+      # the only heads that read the single.
+      if self.global_config.model in model_config.PROTENIX_FAMILY:
+        # Protenix LayerNorms (and clamps) the trunk single before ANY use -- the
+        # confidence pairformer and every head see the normalised one
+        # (`input_strunk_ln(clamp(s_trunk, -512, 512))`). AF3 uses it raw, and our
+        # unnormalised single was entering the head at std 211, so this is the same
+        # class of gate-invisible divergence RF3's global LayerNorm turned out to be.
+        single_act = hm.LayerNorm(name='input_single_norm')(
+            jnp.clip(single_act, -512.0, 512.0))
+
+      target_feat_absent = None
+      if self.global_config.model == 'rosettafold3':
+        # RF3 confidence applies a parameter-free LayerNorm over the WHOLE tensor
+        # (layer_norm_along_feature_dimension=False) to each detached trunk input
+        # before use; AF3 uses them raw. No trained params, so purely a forward branch.
+        #
+        # The statistics are over REAL tokens only. Everything else here is
+        # per-element, so padding cannot reach it -- but a mean and a variance
+        # taken over the whole tensor are shifted by however many padding tokens
+        # the bucket happened to add, and the head's own inputs move with them.
+        # Native RF3 never sees padding, so including it is simply wrong, and it
+        # is not a small effect: 76 residues padded into a 128-token bucket gave
+        # a PAE of ~28 A everywhere, diagonal included, and pTM 0.04 against 0.89
+        # for the same fold run unpadded.
+        seq_mask_bool = seq_mask.astype(bool)
+        pair_act = masked_global_norm(
+            pair_act, seq_mask_bool[:, None] & seq_mask_bool[None, :])
+        single_act = masked_global_norm(single_act, seq_mask_bool)
+        # RF3's s_inputs is 449 wide where our target_feat is 447; see
+        # masked_global_norm on why the width is passed and what it buys.
+        target_feat, target_feat_absent = masked_global_norm(
+            target_feat, seq_mask_bool, width=449, return_absent=True)
+
+      num_residues = seq_mask.shape[0]
+      num_pair_channels = pair_act.shape[2]
+
+      hf3 = self.global_config.model == 'helixfold3'
+      hf3_enc = None
+      if hf3:
+        pair_act, hf3_enc = self._helixfold3_embed(
+            dense_atom_positions, pair_act, single_act, target_feat, batch)
+      elif self.global_config.model in model_config.REEMBED_CONFIDENCE_PAIR:
+        positions = atom_layout.convert(
+            token_atoms_to_pseudo_beta, dense_atom_positions, layout_axes=(-3, -2))
+        pair_act, single_act = self._boltz2_reembed(
+            pair_act, single_act, target_feat, positions, pair_mask,
+            token_features, bond_matrix, bond_type_matrix, batch=batch)
+      else:
+        pair_act += self._embed_features(
+            dense_atom_positions,
+            token_atoms_to_pseudo_beta,
+            pair_mask,
+            pair_act,
+            target_feat,
+            target_feat_absent=target_feat_absent,
+        )
+
+      def pairformer_fn(act):
+        pair_act, single_act = act
+        return modules.PairFormerIteration(
+            self.config.pairformer,
+            self.global_config,
+            with_single=True,
+            # ESMFold2's confidence trunk is pair-only, like its main trunk: no
+            # triangle attention. The single track stays built -- its zeroed
+            # weights cost O(L*c), not the O(L^3) the attention does.
+            with_pair_attention=(self.global_config.model
+                                 not in model_config.PAIR_ONLY_TRUNK),
+            name='confidence_pairformer',
+        )(
+            act=pair_act,
+            single_act=single_act,
+            pair_mask=pair_mask,
+            seq_mask=seq_mask,
+            # The confidence head has its OWN pairformer and it was trained with
+            # the same 0.25 pair dropout as the trunk's -- OpenFold3 carries it
+            # under `pairformer_embedding.pairformer.pair_dropout`. It was the
+            # one stack here that never received the flag.
+            use_dropout=use_dropout,
+        )
+
+      pairformer_stack = hk.experimental.layer_stack(
+          self.config.pairformer.num_layer
+      )(pairformer_fn)
+
+      pair_stack_in = pair_act
+      pair_act, single_act = pairformer_stack((pair_act, single_act))
+      if self.global_config.model in model_config.PAIR_ONLY_TRUNK:
+        # ESMFold2 ADDS the trunk's output to the pair that entered it:
+        #
+        #     pair_delta = self.folding_trunk(pair, ...)
+        #     pair.add_(pair_delta.float())         modeling_esmfold2.py:53-54
+        #
+        # and `FoldingTrunk.forward` returns the FULL updated pair, not a delta,
+        # despite that variable's name -- its blocks are already residual. So the
+        # pair the heads read carries z_base twice, and dropping the outer add
+        # feeds them a different tensor entirely.
+        #
+        # This was the whole of the family's remaining L4 gap. Our heads on
+        # native's own tapped trunk output read pae 2.53e-02 (esmfold2) and
+        # 1.10e-01 (esmfold2_fast); on z_base + that output they read 1.35e-06
+        # and 1.11e-06, rms ratio 1.0000 both.
+        pair_act = pair_stack_in + pair_act
+      if self.global_config.model in model_config.PAIR_ONLY_TRUNK:
+        # No trunk single exists, so there is nothing to read: ESMFold2 builds
+        # its single by ROW-ATTENTION POOLING the pair -- softmax over j of a
+        # learned scalar per (i, j), then a projection -- and it pools the pair
+        # THE FOLDING TRUNK HAS ALREADY UPDATED:
+        #     pair.add_(folding_trunk(pair)); single = row_attention_pooling(pair)
+        # (modeling_esmfold2.py ConfidenceHead.forward). Pooling the pre-stack
+        # pair instead is a different function, and the heads that read the
+        # single are the only ones that can see it.
+        pair_f32 = pair_act.astype(jnp.float32)
+        scores = hm.Linear(1, name='row_pool_attn')(pair_f32)[..., 0]
+        scores = jnp.where(seq_mask_cast[None, :] > 0, scores, -1e9)
+        single_act = hm.Linear(
+            single_act.shape[-1], name='row_pool_out')(
+                jnp.einsum('nm,nmd->nd', jax.nn.softmax(scores, axis=-1),
+                           pair_f32))
+      assert pair_act.shape == (num_residues, num_residues, num_pair_channels)
+
+      # Produce logits to predict a distogram of pairwise distance errors
+      # between the input prediction and the ground truth.
+      pred_distance_error = None
+      average_pred_distance_error = None
+      # NO_PDE_HEAD is live again. It was retired on 2026-09-09 when its last
+      # members lost their confidence heads entirely; Synthyra's 2026-09-25
+      # release gives the lm-tier pair a TRAINED head that still has no
+      # pde_head tensor, so the branch it used to guard is reachable once more.
+      # Building it anyway would emit a PDE from random init -- a number that
+      # looks like a prediction and is noise.
+      # Shape (num_res, num_res, num_bins)
+      if self.global_config.model in model_config.NO_PDE_HEAD:
+        distance_logits = None
+      elif self.global_config.model == 'boltz2':
+        # boltz2 has use_separate_heads=True: SEPARATE intra- and inter-chain heads for
+        # both PDE and PAE, each hard-masked to its half of the pair matrix. On a
+        # monomer the inter head never fires, which is why the intra head alone was
+        # exact on 6MRR and why this needs a complex to validate.
+        distance_logits = self._pair_logits(  # boltz symmetrizes FIRST
+            pair_act, asym_id, self._boltz2_split_heads(
+                asym_id, self.config.num_bins,
+                'left_half_distance_logits', 'inter_half_distance_logits'), sym=True)
+      elif self.global_config.model in model_config.PRE_SYMMETRISED_PDE:
+        # protenix normalises the SYMMETRISED pair, so the symmetrisation is
+        # inside the LayerNorm rather than outside the projection.
+        distance_logits = self._pair_logits(pair_act, asym_id, self._normed_linear(
+            self.config.num_bins, 'logits_ln', 'left_half_distance_logits', use_bias=hf3), sym=True)
+      else:
+        left_distance_logits = self._pair_logits(pair_act, asym_id, self._normed_linear(
+            self.config.num_bins, 'logits_ln', 'left_half_distance_logits'))
+        if self.global_config.model in model_config.UNSYMMETRISED_PDE:
+          # ESMFold2 does not symmetrise at all -- its PDE head is its PAE head
+          # with different weights. See model_config.UNSYMMETRISED_PDE.
+          distance_logits = left_distance_logits
+        else:
+          right_distance_logits = left_distance_logits
+          distance_logits = left_distance_logits + jnp.swapaxes(  # Symmetrize.
+              right_distance_logits, -2, -3
+          )
+      # Shape (num_bins,)
+      distance_breaks = jnp.linspace(
+          0.0, self.config.max_error_bin, self.config.num_bins - 1
+      )
+
+      step = distance_breaks[1] - distance_breaks[0]
+
+      # Add half-step to get the center
+      bin_centers = distance_breaks + step / 2
+      # Add a catch-all bin at the end.
+      bin_centers = jnp.concatenate(
+          [bin_centers, bin_centers[-1:] + step], axis=0
+      )
+
+      if distance_logits is not None:
+        distance_probs = jax.nn.softmax(distance_logits, axis=-1)
+
+        pred_distance_error = (
+            jnp.sum(distance_probs * bin_centers, axis=-1) * pair_mask
+        )
+        average_pred_distance_error = jnp.sum(
+            pred_distance_error, axis=[-2, -1]
+        ) / jnp.sum(pair_mask, axis=[-2, -1])
+
+      # Predicted aligned error
+      pae_outputs = {}
+      # Shape (num_res, num_res, num_bins)
+      if self.global_config.model == 'boltz2':
+        pae_logits = self._pair_logits(pair_act, asym_id, self._boltz2_split_heads(
+            asym_id, self.config.pae.num_bins, 'pae_logits', 'pae_inter_logits'))
+      else:
+        pae_logits = self._pair_logits(pair_act, asym_id, self._normed_linear(
+            self.config.pae.num_bins, 'pae_logits_ln', 'pae_logits', use_bias=hf3))
+      # Shape (num_bins,)
+      pae_breaks = jnp.linspace(
+          0.0, self.config.pae.max_error_bin, self.config.pae.num_bins - 1
+      )
+      step = pae_breaks[1] - pae_breaks[0]
+      # Add half-step to get the center
+      bin_centers = pae_breaks + step / 2
+      # Add a catch-all bin at the end.
+      bin_centers = jnp.concatenate(
+          [bin_centers, bin_centers[-1:] + step], axis=0
+      )
+      pae_probs = jax.nn.softmax(pae_logits, axis=-1)
+
+      seq_mask_bool = seq_mask.astype(bool)
+      pair_mask_bool = seq_mask_bool[:, None] * seq_mask_bool[None, :]
+      pae = jnp.sum(pae_probs * bin_centers, axis=-1) * pair_mask_bool
+      pae_outputs.update({
+          'full_pae': pae,
+      })
+
+    # The pTM is computed outside of bfloat16 context.
+    tmscore_adjusted_pae_global, tmscore_adjusted_pae_interface = (
+        self._get_tmscore_adjusted_pae(
+            asym_id=asym_id,
+            # helixfold3 weights pTM by the FRAME mask: an ion or a collinear ligand
+            # counts toward neither d0 nor any pair (helixfold/common/confidence.py)
+            seq_mask=(seq_mask_bool & batch.frames.mask.astype(bool)) if hf3 else seq_mask,
+            pair_mask=(((seq_mask_bool & batch.frames.mask.astype(bool))[:, None]
+                        & (seq_mask_bool & batch.frames.mask.astype(bool))[None, :])
+                       if hf3 else pair_mask_bool),
+            bin_centers=bin_centers,
+            pae_probs=pae_probs,
+        )
+    )
+    pae_outputs.update({
+        'tmscore_adjusted_pae_global': tmscore_adjusted_pae_global,
+        'tmscore_adjusted_pae_interface': tmscore_adjusted_pae_interface,
+    })
+    single_act = single_act.astype('float32')
+
+    # pLDDT
+    # Shape (num_res, num_atom, num_bins)
+    # Boltz predicts pLDDT PER TOKEN ((n,50)) where AF3 predicts per dense-atom
+    # slot ((n,24,50)). Broadcasting one token-level logit across the slots is
+    # the same function as a per-slot weight whose slots are all equal, so the
+    # boltz2 converter TILES its weight and this needs no branch. Its prediction
+    # is still token-level -- every atom of a token reports the same number.
+    _n_atom = dense_atom_positions.shape[-2]
+    # boltz2's tiled weights are stored at AF3's 24 slots; a wider layout (one token per large modified residue)
+    # builds them there and broadcasts slot 0, which every slot equals
+    _n_w = 24 if self.global_config.model == 'boltz2' else _n_atom
+    _widen = lambda x: x if _n_w == _n_atom else jnp.broadcast_to(x[:, :1], (x.shape[0], _n_atom) + x.shape[2:])
+    if hf3:
+      # helixfold3 predicts pLDDT and resolved PER ATOM, off its own atom
+      # decoder over LN(single) and the confidence encoder's skips
+      atom_feat = atom_cross_attention.atom_cross_att_decoder(
+          hm.LayerNorm(name='hf3_single_ln', use_fast_variance=False)(single_act),
+          hf3_enc, atom_cross_attention.AtomCrossAttDecoderConfig(),
+          self.global_config, batch, name='confidence', return_features=True)
+      plddt_logits = hm.Linear(self.config.num_plddt_bins, use_bias=True,
+                               name='hf3_plddt_logits')(atom_feat)
+    elif self.global_config.model == 'chai1' and atom_name_chars is not None:
+      # chai predicts pLDDT over 37 slots and gathers per atom by the atom's index
+      # in ITS table -- not by our dense slot (CB is slot 3 there and dense slot 4;
+      # TRP's NE1 is 24), so the permutation is residue-type dependent and cannot
+      # be folded into the weights. chai's atom_names_to_atom37_indices: ATOM37
+      # for amino acids, a per-nucleotide order for A G C U / DA DG DC DT, the
+      # position for UNK, and slot 0 for a single-atom token. Recovered by
+      # matching the atom NAME against the token's restype row.
+      from alphafold3.constants import chai1_atom_slots
+      plddt_logits = hm.Linear(
+          (len(atom_types.ATOM37), self.config.num_plddt_bins),
+          initializer=self.global_config.final_init,
+          name='plddt_logits',
+      )(self._head_norm('plddt_logits_ln', single_act))
+      rows = chai1_atom_slots.SLOT_NAMES
+      table = jnp.asarray(
+          [[[ord(c) - 32 for c in n.ljust(4)] if n else [-1] * 4 for n in (r or [''] * 37)] for r in rows],
+          jnp.int32)                                        # (restypes, 37, 4)
+      by_name = jnp.asarray([r is not None for r in rows])
+      aatype = token_features.aatype
+      hit = jnp.all(atom_name_chars[:, :, None, :] == table[aatype][:, None], axis=-1)
+      n_atom = atom_name_chars.shape[1]
+      n_real = jnp.any(atom_name_chars != 0, axis=-1).sum(axis=-1)
+      idx = jnp.where(by_name[aatype][:, None], jnp.argmax(hit, axis=-1),
+                      jnp.arange(n_atom)[None, :])
+      idx = jnp.where(n_real[:, None] <= 1, 0, idx)          # (n_token, n_atom)
+      plddt_logits = jnp.take_along_axis(
+          plddt_logits, idx[..., None], axis=1)
+    else:
+      plddt_logits = _widen(hm.Linear(
+          (_n_w, self.config.num_plddt_bins),
+          initializer=self.global_config.final_init,
+          name='plddt_logits',
+      )(self._head_norm('plddt_logits_ln', single_act)))
+    # Some vendors index the per-atom heads by the atom's RANK among the token's
+    # real atoms, not by its dense slot. The two agree until a slot is empty:
+    # a nucleotide's dropped OP3 is dense slot 0, so every atom read its
+    # neighbour's logit (rna pLDDT corr 0.43 against stock RF3; 0.9996 by rank).
+    # A real slot has a non-empty name.
+    atom_rank = None
+    if (self.global_config.model in model_config.PER_ATOM_HEADS_BY_RANK
+        and atom_name_chars is not None):
+      real = jnp.any(atom_name_chars != 0, axis=-1)            # (n_token, n_atom)
+      atom_rank = jnp.clip(jnp.cumsum(real, axis=-1) - 1, 0, _n_atom - 1)
+      plddt_logits = jnp.take_along_axis(
+          plddt_logits, atom_rank[..., None], axis=1)
+
+    bin_width = 1.0 / self.config.num_plddt_bins
+    bin_centers = jnp.arange(0.5 * bin_width, 1.0, bin_width)
+    predicted_lddt = jnp.sum(
+        jax.nn.softmax(plddt_logits, axis=-1) * bin_centers, axis=-1
+    )
+    predicted_lddt = predicted_lddt * 100.0
+
+    # Experimentally resolved
+    # Shape (num_res, num_atom, 2)
+    #
+    # chai has NO such head, so building it left three parameters at random
+    # init and produced a `predicted_experimentally_resolved` that looked like a
+    # prediction and was noise. Don't create it; the key is simply absent for
+    # chai1, which is honest and also what makes the converter's coverage exact.
+    experimentally_resolved_logits = None
+    if self.global_config.model in model_config.NO_RESOLVED_HEAD:
+      pass          # no such head here; nothing to build
+    elif hf3:
+      experimentally_resolved_logits = hm.Linear(
+          2, use_bias=True, name='hf3_resolved_logits')(atom_feat)
+    else:
+      experimentally_resolved_logits = _widen(hm.Linear(
+          (_n_w, 2),
+          initializer=self.global_config.final_init,
+          name='experimentally_resolved_logits',
+      )(self._head_norm('experimentally_resolved_ln', single_act)))
+      if atom_rank is not None:
+        experimentally_resolved_logits = jnp.take_along_axis(
+            experimentally_resolved_logits, atom_rank[..., None], axis=1)
+
+    # gate on the LOGITS, which every branch either assigns or leaves None --
+    # gating on the derived value read an unassigned local for every non-chai
+    # model, which the fast suite could not see because the tests that exercise
+    # those models are all slow-marked
+    predicted_experimentally_resolved = None
+    if experimentally_resolved_logits is not None:
+      predicted_experimentally_resolved = jax.nn.softmax(
+          experimentally_resolved_logits, axis=-1
+      )[..., 1]
+
+    out = {
+        'predicted_lddt': predicted_lddt,
+        **({} if pred_distance_error is None else {
+            'full_pde': pred_distance_error,
+            'average_pde': average_pred_distance_error,
+        }),
+        **pae_outputs,
+    }
+    if predicted_experimentally_resolved is not None:
+      out['predicted_experimentally_resolved'] = (
+          predicted_experimentally_resolved)
+    if return_logits:
+      out.update(predicted_lddt_logits=plddt_logits, predicted_aligned_error_logits=pae_logits,
+                 predicted_distance_error_logits=distance_logits)
+      if experimentally_resolved_logits is not None:
+        out['experimentally_resolved_logits'] = experimentally_resolved_logits
+    return out
+
+  def _get_tmscore_adjusted_pae(
+      self,
+      asym_id: jnp.ndarray,
+      seq_mask: jnp.ndarray,
+      pair_mask: jnp.ndarray,
+      bin_centers: jnp.ndarray,
+      pae_probs: jnp.ndarray,
+  ):
+    return tmscore_adjusted_pae(
+        asym_id=asym_id, seq_mask=seq_mask, pair_mask=pair_mask,
+        bin_centers=bin_centers, pae_probs=pae_probs)
+
+
+def tmscore_adjusted_pae(
+    *,
+    asym_id: jnp.ndarray,
+    seq_mask: jnp.ndarray,
+    pair_mask: jnp.ndarray,
+    bin_centers: jnp.ndarray,
+    pae_probs: jnp.ndarray,
+):
+  """PAE reweighted by the TM-score term, globally and per interface.
+
+  Module level because it is the head's arithmetic and not its parameters:
+  OpenDDE has its own confidence head whose outputs still have to reach the same
+  pTM/ipTM the rest of the pipeline reports.
+  """
+
+  def get_tmscore_adjusted_pae(num_interface_tokens, bin_centers, pae_probs):
+    # Clip to avoid negative/undefined d0.
+    clipped_num_res = jnp.maximum(num_interface_tokens, 19)
+
+    # Compute d_0(num_res) as defined by TM-score, eqn. (5) in
+    # http://zhanglab.ccmb.med.umich.edu/papers/2004_3.pdf
+    # Yang & Skolnick "Scoring function for automated
+    # assessment of protein structure template quality" 2004.
+    d0 = 1.24 * (clipped_num_res - 15) ** (1.0 / 3) - 1.8
+
+    # Make compatible with [num_tokens, num_tokens, num_bins]
+    d0 = d0[:, :, None]
+    bin_centers = bin_centers[None, None, :]
+
+    # TM-Score term for every bin.
+    tm_per_bin = 1.0 / (1 + jnp.square(bin_centers) / jnp.square(d0))
+    # E_distances tm(distance).
+    predicted_tm_term = jnp.sum(pae_probs * tm_per_bin, axis=-1)
+    return predicted_tm_term
+
+  # Interface version
+  x = asym_id[None, :] == asym_id[:, None]
+  num_chain_tokens = jnp.sum(x * pair_mask, axis=-1)
+  num_interface_tokens = num_chain_tokens[None, :] + num_chain_tokens[:, None]
+  # Don't double-count within a single chain
+  num_interface_tokens -= x * (num_interface_tokens // 2)
+  num_interface_tokens = num_interface_tokens * pair_mask
+
+  num_global_tokens = jnp.full(
+      shape=pair_mask.shape, fill_value=seq_mask.sum()
+  )
+
+  assert num_global_tokens.dtype == 'int32'
+  assert num_interface_tokens.dtype == 'int32'
+  global_apae = get_tmscore_adjusted_pae(
+      num_global_tokens, bin_centers, pae_probs
+  )
+  interface_apae = get_tmscore_adjusted_pae(
+      num_interface_tokens, bin_centers, pae_probs
+  )
+  return global_apae, interface_apae
+
+
+def masked_global_norm(x, mask, width=None, return_absent=False):
+  """Normalise x by the mean and variance over the REAL tokens only.
+
+  RoseTTAFold3's confidence head layer-norms each detached trunk input over the
+  whole tensor rather than along the feature axis
+  (`layer_norm_along_feature_dimension=False`). A statistic that reduces over
+  more than the feature axis is padding-sensitive in a way a per-feature one is
+  not: native RF3 never pads, so including our padding tokens shifts every
+  confidence output by however many the bucket happened to add.
+
+  mask broadcasts over x's leading axes; the feature axis is always last.
+
+  `width` is the VENDOR's feature width where it differs from ours, and it
+  matters only because this statistic spans the feature axis: RF3's s_inputs is
+  449 wide, ours 447, the missing two being residue-vocabulary classes our
+  alphabet does not carry. They are zero on the inputs we compare, but they
+  still enter native's mean and variance, so normalising over 447 elements is a
+  different function from normalising over 449. Measured on rf3's confidence
+  head: it halves the residual, pae max|d| 0.047 -> 0.022 (corr 0.999998 ->
+  0.999999). Small, but it is the one term left after the port matched
+  everything else, and converters/opendde.py flags the same 831-vs-833 mismatch
+  as "minor; confirm via e2e" -- this is that confirmation.
+
+  The correction assumes the dropped columns are ZERO, which is what makes them
+  contribute mean**2 apiece. That holds for the inputs our featurisation
+  produces; it would not hold for an input our alphabet mapped INTO one of the
+  dropped classes, which is why this is opt-in per call site rather than the
+  default.
+
+  Matching the statistics is not the whole of it: a dropped column is zero
+  BEFORE the norm and (0 - mean) / std AFTER it, so its weight row still
+  reaches whatever reads the normalised tensor. return_absent=True also
+  returns that value, (..., width - ours), for the caller to project with the
+  vendor's rows for those columns. On rf3's confidence pair input this was the
+  remaining 6.6e-3 (of 2.3) in each s_inputs projection, and the 1e-2 PAE/PDE
+  gap on every input, protein included (stock-RF3 comparison, 2026-10-19).
+  """
+  xf = x.astype(jnp.float32)
+  m = mask.astype(jnp.float32)[..., None]
+  width = xf.shape[-1] if width is None else width
+  n = jnp.maximum(jnp.sum(m) * width, 1.0)
+  mean = jnp.sum(xf * m) / n
+  # each dropped column is zero, so it contributes mean**2 to the variance sum,
+  # once per real token
+  pad = (width - xf.shape[-1]) * jnp.sum(mask.astype(jnp.float32))
+  var = (jnp.sum(jnp.square(xf - mean) * m) + pad * jnp.square(mean)) / n
+  inv = 1.0 / jnp.sqrt(var + 1e-5)
+  out = ((xf - mean) * inv).astype(x.dtype)
+  if not return_absent:
+    return out
+  absent = jnp.broadcast_to(-mean * inv, xf.shape[:-1] + (width - xf.shape[-1],))
+  return out, absent.astype(x.dtype)

@@ -1,0 +1,785 @@
+name: User interface checks
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "frontend/src/presentation/**"
+      # Research-file classification has exact result/input handoff checks.
+      - "!frontend/src/presentation/research-files*"
+      - "frontend/src/integrations/**"
+      # Explicit stopped-binder recovery has its own exact continuation gate.
+      - "!frontend/src/integrations/BinderContinuation*"
+      # Shared form defaults/validation have the exact scientific-form contract gate.
+      - "!frontend/src/integrations/generated.ts"
+      - "!frontend/src/integrations/validation*"
+      # Chemical-scope questionnaires have a focused native Ketcher/review gate.
+      - "!frontend/src/integrations/Reinvent*"
+      - "!frontend/src/integrations/reinvent-modes.ts"
+      - "!frontend/src/integrations/ScientificReview*"
+      - "!frontend/src/integrations/ScientificSelection.tsx"
+      - "!frontend/src/integrations/ScientificChoices*"
+      - "!frontend/src/integrations/inputs.css"
+      - "frontend/src/App.tsx"
+      - "frontend/src/App.test.tsx"
+      # Task-history navigation and App's direct consumers have exact scoped checks.
+      - "!frontend/src/App.tsx"
+      - "!frontend/src/App.test.tsx"
+      - "frontend/src/TaskDetail*"
+      - "frontend/src/useWorkbench*"
+      # Workbench task URLs have task-history-checks.yml and its direct App consumer.
+      - "!frontend/src/useWorkbench*"
+      - "frontend/src/studio/RuntimeStatus*"
+      - "frontend/src/studio/EnvironmentStatusTable*"
+      - "frontend/src/studio/runtime-status.css"
+      - "frontend/src/operations/filter*"
+      - "frontend/src/**/*Results*"
+      # Bilingual native ternary results have the focused proximity preview gate.
+      - "!frontend/src/proximity/Results*"
+      # Structural comparison has exact bilingual/native lifecycle checks.
+      - "!frontend/src/structure-comparison/**"
+      - "!frontend/src/operations/OperationResults*"
+      # Paired-result inspection is verified by viewer-checks.yml.
+      - "!frontend/src/poses/PoseResults*"
+      - "!frontend/src/receptors/ReceptorResults*"
+      - "!frontend/src/diffsbdd/InteractionResults*"
+      # Prepared receptor results use the native preparation workspace gate.
+      - "!frontend/src/diffsbdd/PreparedReceptorResults.tsx"
+      # Native pocket results have a focused result/geometry gate.
+      - "!frontend/src/presentation/ResearchTable*"
+      - "!frontend/src/presentation/research-table.css"
+      - "!frontend/src/presentation/table-selection.ts"
+      - "!frontend/src/operations/PropertyResults.tsx"
+      - "!frontend/src/presentation/ResultRow*"
+      - "!frontend/src/presentation/result-row.css"
+      - "!frontend/src/datasets/ResearchTable.tsx"
+      - "!frontend/src/presentation/ensemble-results.css"
+      - "frontend/src/research/ResearchWorkspace*"
+      - "frontend/src/operations/ToolCenter*"
+      - "!frontend/src/operations/ToolCenter.tsx"
+      - "frontend/src/studio/HomeWorkspace*"
+      - "frontend/src/deployment/**"
+      - "!frontend/src/deployment/labels.ts"
+      # Directory/installation intent has Installation checks and its exact consumers.
+      - "!frontend/src/deployment/DeploymentPanel.tsx"
+      - "!frontend/src/deployment/installation.ts"
+      - "!frontend/src/deployment/deployment.test.tsx"
+      - "!frontend/src/deployment/installation.test.ts"
+      # Installation-page presentation uses its own exact component/control gate.
+      - "!frontend/src/deployment/ComponentLibrary*"
+      - "!frontend/src/deployment/ComponentCard.tsx"
+      - "!frontend/src/deployment/component-groups*"
+      - "!frontend/src/deployment/component-content.ts"
+      - "!frontend/src/deployment/components.css"
+      - "frontend/src/design/**"
+      - "frontend/src/humanization/**"
+      - "frontend/src/guided/questionnaire.css"
+      - "frontend/src/guided/Questionnaire*"
+      - "frontend/src/TaskForm*"
+      - "frontend/src/operations/AssetPicker*"
+      # Source metadata callbacks use the exact molecular questionnaire gate.
+      - "!frontend/src/operations/AssetPicker*"
+      - "frontend/src/operations/HarnessForm*"
+      - "frontend/src/operations/CampaignForm*"
+      # Local campaign review and permission have an exact form/browser gate.
+      - "!frontend/src/operations/CampaignForm.tsx"
+      - "!frontend/src/operations/CampaignForm.test.tsx"
+      - "!frontend/src/operations/CampaignForm.review.test.tsx"
+      # Exact dataset material controls use research-material-checks.yml.
+      - "!frontend/src/datasets/DatasetPicker*"
+      - "frontend/src/datasets/SourcePicker*"
+      - "frontend/src/datasets/ModelValidationPlot*"
+      - "frontend/src/datasets/DatasetCharts*"
+      - "frontend/src/datasets/DatasetResults*"
+      - "frontend/src/datasets/DatasetHeatmaps*"
+      - "frontend/src/datasets/ResearchTable*"
+      - "frontend/src/datasets/chart-documents*"
+      - "frontend/src/datasets/useChartDocuments*"
+      - "frontend/src/datasets/IndexedLibraryResults*"
+      - "frontend/src/datasets/useIndexedMember*"
+      - "frontend/src/datasets/supplier-label*"
+      - "frontend/src/datasets/useDatasetSources*"
+      - "frontend/src/datasets/DEL*"
+      # Retained DEL series views have exact SQLite/chart/browser checks.
+      - "!frontend/src/datasets/DELSeriesContext*"
+      - "!frontend/src/datasets/DELCandidateEvidence*"
+      - "!frontend/src/datasets/DELReviewQuestion.test.tsx"
+      - "!frontend/src/datasets/DELCountMaterials*"
+      - "!frontend/src/datasets/DELMaterialQuestion.tsx"
+      - "frontend/src/receptors/SurfaceForm*"
+      - "frontend/src/editors/Editors*"
+      - "frontend/src/workflow.css"
+      - "frontend/src/research/ObjectInspector*"
+      - "frontend/src/research/research.css"
+      # Native file inspection uses workspace-preview-checks.yml.
+      - "!frontend/src/research/ResearchWorkspace*"
+      - "!frontend/src/research/ObjectInspector*"
+      - "!frontend/src/research/research.css"
+      # Sequence and QC inspections use their own focused native-result gate.
+      - "!frontend/src/presentation/SequenceTrack*"
+      - "!frontend/src/presentation/SequencePositions*"
+      - "!frontend/src/presentation/sequence-track.css"
+      - "!frontend/src/presentation/result-inspection.css"
+      - "!frontend/src/operations/SequenceScoreResults*"
+      - "!frontend/src/operations/sequence-scores.css"
+      - "!frontend/src/antibodies/AntibodyNumberResults*"
+      - "!frontend/src/humanization/HumanizationResults*"
+      - "!frontend/src/humanization/SequenceAlignment*"
+      - "!frontend/src/humanization/SequenceComparison*"
+      - "!frontend/src/humanization/ReferenceMetrics*"
+      - "!frontend/src/humanization/humanization.css"
+      - "!frontend/src/humanization/sequence-alignment.css"
+      - "!frontend/src/quality/QualityResults*"
+      - "!frontend/src/quality/tests/QualityResults.test.tsx"
+      # Shared research-shell changes have a focused native navigation gate.
+      - "!frontend/src/studio/Navigation*"
+      - "!frontend/src/studio/navigation-frame.css"
+      - "!frontend/src/studio/Header*"
+      - "!frontend/src/studio/header.css"
+      - "!frontend/src/studio/TaskSearch*"
+      - "!frontend/src/studio/TaskNotifications*"
+      - "!frontend/src/studio/ModuleTaskPicker*"
+      - "!frontend/src/studio.css"
+      - "!frontend/src/design/workspaces.css"
+      # Shared shell appearance has navigation-shell-checks.yml and real page consumers.
+      - "!frontend/src/design/layout.css"
+      - "!frontend/src/design/controls.css"
+      - "!frontend/src/design/module-surfaces.css"
+      - "!frontend/src/presentation/prediction-shell.css"
+      - "!frontend/src/presentation/prediction-workspace.css"
+      # Public case controls have a focused native gate.
+      - "!frontend/src/examples/ExampleActions*"
+      - "!frontend/src/examples/ExampleToolbar*"
+      - "!frontend/src/examples/ExampleGuide*"
+      - "!frontend/src/examples/ExampleFeedback*"
+      - "!frontend/src/examples/useExampleTemplate*"
+      - "!frontend/src/examples/examples.css"
+      - "!frontend/src/TaskForm*"
+      - "!frontend/src/studio/HomeWorkspace*"
+      - "!frontend/src/presentation/result-layout.css"
+      # Molecular property pages use their focused inspection gate.
+      - "!frontend/src/admet/**"
+      # Print export and shared entry motion use publication-checks.yml.
+      - "!frontend/src/guided/Questionnaire*"
+      - "!frontend/src/presentation/InteractionDiagram.test.tsx"
+      - "!frontend/src/presentation/InteractionDiagram.tsx"
+      - "!frontend/src/presentation/MetricBars.tsx"
+      - "!frontend/src/presentation/MetricScatter*"
+      - "!frontend/src/presentation/metric-scatter*"
+      - "!frontend/src/presentation/MoleculeImage*"
+      - "!frontend/src/presentation/hidden-frame-focus*"
+      - "!frontend/src/presentation/molecule-image.css"
+      - "!frontend/src/presentation/ResearchTabs.tsx"
+      - "!frontend/src/simulations/DynamicsResults.tsx"
+      - "!frontend/src/presentation/useReveal.test.tsx"
+      - "!frontend/src/presentation/useReveal.ts"
+      # Metric landscapes and exact direct consumers use landscape-checks.yml.
+      - "!frontend/src/integrations/ScientificResults*"
+      # Backend-choice metadata and deployment grouping use simulation-backend-checks.yml.
+      - "!frontend/src/integrations/operations.ts"
+      - "!frontend/src/operations/CandidateSequenceResults.test.tsx"
+      - "!frontend/src/operations/PropertyResults.test.tsx"
+      - "!server_tests/test_result_visuals_browser.py"
+      # The view alignment gate builds and checks these exact preview consumers.
+      - "!frontend/src/examples/CampaignCasePreview.tsx"
+      - "!frontend/src/examples/campaign-preview.css"
+      - "!frontend/src/operations/CampaignMonitor.tsx"
+      # Shared interactive charts and appearance use chart-quality-checks.yml.
+      - "!frontend/src/presentation/plots/**"
+      - "!frontend/src/datasets/DatasetCharts.test.tsx"
+      - "!frontend/src/datasets/DatasetCharts.tsx"
+      - "!frontend/src/datasets/ModelValidationPlot.tsx"
+      - "!frontend/src/datasets/chart-documents*"
+      - "!frontend/src/simulations/SimulationResults.test.tsx"
+      - "!frontend/src/datasets/CountEvidencePlot.tsx"
+      - "!frontend/src/datasets/count-summary.ts"
+      - "!frontend/src/datasets/count-summary.test.ts"
+      - "!frontend/src/datasets/DatasetResults.tsx"
+      - "!frontend/src/datasets/PlotFrame.tsx"
+      - "!frontend/src/datasets/DatasetHeatmaps.tsx"
+      - "!frontend/src/viewer/style.ts"
+      # MD/FEP result interactions use simulation-view-checks.yml.
+      - "!frontend/src/simulations/FreeEnergyResults.tsx"
+      # Study-only prefills use the dedicated template gate.
+      - "!frontend/src/integrations/ScientificForm.tsx"
+      - "!frontend/src/integrations/ScientificInputs.tsx"
+      - "!frontend/src/integrations/ScientificForm.test.tsx"
+      - "!frontend/src/integrations/LibraryInput*"
+      - "!frontend/src/receptors/SurfaceForm.tsx"
+      # Shared hydrogen display has focused native Ketcher/3D checks.
+      - "!frontend/src/editors/Editors.tsx"
+      - "!frontend/src/editors/Editors.load.test.tsx"
+      # Shared task actions have a dedicated real-worker recovery gate.
+      - "!frontend/src/TaskDetail*"
+      - "!frontend/src/presentation/research-content*"
+      - "!frontend/src/presentation/depiction-renderer*"
+      # Shared row interaction has one focused native selection gate.
+      - "!frontend/src/datasets/ResearchTable.tsx"
+      - "!frontend/src/space/ChannelResults.tsx"
+      # These controls are covered with native consumers by publication-checks.yml.
+      - "!frontend/src/guided/questionnaire.css"
+      - "!frontend/src/presentation/ResearchTabs.test.tsx"
+      - "!frontend/src/presentation/research-tabs.css"
+      - "!frontend/src/presentation/ActiveIndicator*"
+      - "!frontend/src/presentation/active-indicator.css"
+      # Questionnaire availability controls use task-readiness-checks.yml.
+      - "!frontend/src/datasets/DELForm.tsx"
+      - "!frontend/src/datasets/DELMethodQuestion.tsx"
+      - "!frontend/src/datasets/DELScopeQuestion.tsx"
+      - "!frontend/src/datasets/DELCountUnit.tsx"
+      - "!frontend/src/datasets/DELAnalysisSupport.test.tsx"
+      - "!frontend/src/datasets/DELReviewQuestion.tsx"
+      - "!frontend/src/datasets/DELTemplateReplay.test.tsx"
+      - "!frontend/src/datasets/supplier-label*"
+      - "!frontend/src/humanization/HumanizationForm.tsx"
+      - "!frontend/src/operations/HarnessForm.tsx"
+      - "!frontend/src/operations/HarnessSubmissionRecovery*"
+      # Exact interface and deposited-PTM checks use protein-interface-checks.yml.
+      - "!frontend/src/integrations/ProteinInterface*"
+      - "!frontend/src/viewer/modified-polymer*"
+      - "!frontend/src/integrations/types.ts"
+      - "!frontend/src/operations/ToolCenter.tsx"
+      - "!.github/workflows/user-interface-checks.yml"
+      # Saved-material handoff uses result-handoff-checks.yml.
+      - "!frontend/src/docking/DockingResults*"
+      # Pose continuity and exact downstream versions use pose-handoff-checks.yml.
+      - "!frontend/src/chemistry/StateResults.tsx"
+      - "!frontend/src/diffsbdd/DiffResults*"
+      - "!frontend/src/presentation/MolecularPreview*"
+      - "!frontend/src/operations/OperationResults*"
+      # Molecular view alignment has structure-layout-checks.yml.
+      - "!frontend/src/operations/NativeReport.tsx"
+      - "!frontend/src/operations/EpitopeResults.tsx"
+      - "!frontend/src/operations/StructureComparisonResults.tsx"
+      - "!frontend/src/admet/AdmetResults.tsx"
+      - "!frontend/src/admet/admet.css"
+      - "!frontend/src/admet/AdmetResults.test.tsx"
+      - "!frontend/src/admet/AdmetSelectedMolecule.tsx"
+      - "!frontend/src/admet/AdmetCandidateViews.tsx"
+      - "!frontend/src/admet/EndpointTable.tsx"
+      - "!frontend/src/admet/EndpointValue.tsx"
+      - "!frontend/src/admet/EndpointValue.test.tsx"
+      - "!frontend/src/admet/types.ts"
+      - "!frontend/src/chemistry/StateCollectionPreview.tsx"
+      - "!frontend/src/datasets/CandidateView.tsx"
+      - "!frontend/src/datasets/IndexedLibraryResults*"
+      - "!frontend/src/datasets/useIndexedMember*"
+      - "!frontend/src/datasets/DatasetResults*"
+      - "!frontend/src/datasets/ResearchTable*"
+      - "!frontend/src/datasets/member-page-export*"
+      - "!frontend/src/datasets/datasets.css"
+      - "!frontend/src/diffsbdd/FixedAtomPicker.tsx"
+      - "!frontend/src/diffsbdd/GeneratedCandidates.tsx"
+      - "!frontend/src/diffsbdd/InteractionResults.tsx"
+      - "!frontend/src/diffsbdd/PocketPicker.tsx"
+      - "!frontend/src/diffsbdd/ReferencePocketResults.tsx"
+      - "!frontend/src/diffsbdd/interaction-results.css"
+      - "!frontend/src/discovery/ReferenceImportResults.tsx"
+      # Native target evidence is checked by dataset-discovery-checks.yml.
+      - "!frontend/src/discovery/TargetResearchResults*"
+      - "!frontend/src/discovery/ActivityResults*"
+      - "!frontend/src/docking/DockingResults.tsx"
+      - "!frontend/src/examples/ExampleJobResult.tsx"
+      - "!frontend/src/examples/StudyInputPreview.tsx"
+      - "!frontend/src/examples/examples.css"
+      - "!frontend/src/integrations/InteractionResults*"
+      - "!frontend/src/integrations/ProteinInterfaceResults*"
+      - "!frontend/src/integrations/ProteinInterfaceContacts.tsx"
+      - "!frontend/src/integrations/interaction-residue*"
+      - "!frontend/src/integrations/interaction-workspace.css"
+      - "!frontend/src/integrations/PotentialResults.tsx"
+      - "!frontend/src/integrations/ScaffoldSelection.tsx"
+      - "!frontend/src/integrations/ScientificResults*"
+      - "!frontend/src/integrations/StructureTargetSelection.tsx"
+      - "!frontend/src/integrations/target-selection.css"
+      - "!frontend/src/operations/CandidateSequenceResults.tsx"
+      - "!frontend/src/operations/CovalentEditor.tsx"
+      - "!frontend/src/operations/PropertyResults.tsx"
+      - "!frontend/src/pockets/PocketResults*"
+      - "!frontend/src/pockets/pocket-results.css"
+      # Native pocket comparisons and handoffs use pocket-result-checks.yml.
+      - "!frontend/src/pockets/ReferenceComparison*"
+      - "!server_tests/test_stat6_pocket_handoff_browser.py"
+      - "!frontend/src/pockets/PocketSelection*"
+      - "!frontend/src/poses/ClusterResults.tsx"
+      - "!frontend/src/poses/PoseResults.tsx"
+      - "!frontend/src/poses/cluster.css"
+      - "!frontend/src/presentation/ensemble-results.css"
+      - "!frontend/src/proximity/AttachmentDirections.tsx"
+      - "!frontend/src/proximity/BindingRegion.tsx"
+      - "!frontend/src/proximity/PartnerStep.tsx"
+      - "!frontend/src/proximity/Results.tsx"
+      - "!frontend/src/proximity/proximity.css"
+      - "!frontend/src/quality/QualityResults.tsx"
+      - "!frontend/src/receptors/ReceptorResults.tsx"
+      - "!frontend/src/receptors/StructurePrepareForm.tsx"
+      - "!frontend/src/receptors/StructurePrepareResults*"
+      - "!frontend/src/operations/PreparedInputResults*"
+      - "!frontend/src/receptors/SurfaceRegionPicker.tsx"
+      - "!frontend/src/receptors/SurfaceResults.tsx"
+      - "!frontend/src/receptors/surface.css"
+      - "!frontend/src/regions/AtomSelection.tsx"
+      - "!frontend/src/regions/RegionResult.tsx"
+      - "!frontend/src/research/ResearchWorkspace.tsx"
+      - "!frontend/src/research/research.css"
+      - "!frontend/src/simulations/DynamicsResults.tsx"
+      - "!frontend/src/simulations/FreeEnergyResults.tsx"
+      - "!frontend/src/space/ChannelResults.tsx"
+      - "!frontend/src/space/channels.css"
+      - "!frontend/src/studio/PredictionResults.tsx"
+      - "!frontend/src/viewer/MinimizedPoseResults.tsx"
+      - "!frontend/src/presentation/StructureWorkbench.tsx"
+      - "!frontend/src/presentation/CandidateReviewBar.tsx"
+      - "!frontend/src/presentation/candidate-review-bar.css"
+      # Native workspace fullscreen and retained figure/trajectory checks have exact scopes.
+      - "!frontend/src/presentation/WorkspaceFullscreenControl*"
+      - "!frontend/src/presentation/useWorkspaceFullscreen.ts"
+      - "!frontend/src/presentation/workspace-fullscreen.css"
+      - "!frontend/src/presentation/structure-workbench.css"
+      # Defined-region sources and exact PLIP review use defined-site-checks.yml.
+      - "!frontend/src/docking/BoxFields.tsx"
+      - "!frontend/src/design/capabilities.css"
+      - "!server_tests/test_defined_region_browser.py"
+      # Do not select the whole-product browser matrix for these bounded changes.
+      - "!frontend/src/sites/**"
+      - "!frontend/src/integrations/PlipReview*"
+      - "!frontend/src/poses/PoseWorkspace*"
+      - "!frontend/src/poses/PoseForm*"
+      - "!frontend/src/poses/PosePlanRun*"
+      - "!frontend/src/poses/PoseRunControls*"
+      - "!frontend/src/poses/PoseDetail*"
+      - "!frontend/src/poses/poses.css"
+      - "!frontend/src/poses/ClusterCoverage*"
+      - "!frontend/src/poses/ClusterResults.test.tsx"
+      - "!frontend/src/docking/poseScore*"
+      - "!server_tests/test_pose_quality_handoff_browser.py"
+      - "!frontend/src/poses/PoseOutcomeList*"
+      - "!frontend/src/poses/source-label.ts"
+      - "!frontend/src/poses/types.ts"
+      - "!frontend/src/poses/LigandChoice*"
+      - "!frontend/src/poses/ClusterForm.tsx"
+      - "!frontend/src/viewer/search-box*"
+      - "!frontend/src/viewer/StructureViewport.tsx"
+      - "!frontend/src/diffsbdd/ReviewReference.tsx"
+      # Exact interface and deposited-PTM checks use protein-interface-checks.yml.
+      - "!frontend/src/integrations/ProteinInterface*"
+      - "!frontend/src/viewer/modified-polymer*"
+      - "!.github/workflows/user-interface-checks.yml"
+  pull_request:
+    paths:
+      - "frontend/src/presentation/**"
+      # Match push scope: shared table selection has exact result/pose checks.
+      - "!frontend/src/presentation/ResearchTable*"
+      - "frontend/src/integrations/**"
+      # Explicit stopped-binder recovery has its own exact continuation gate.
+      - "!frontend/src/integrations/BinderContinuation*"
+      # Shared form defaults/validation have the exact scientific-form contract gate.
+      - "!frontend/src/integrations/generated.ts"
+      - "!frontend/src/integrations/validation*"
+      - "!frontend/src/integrations/Reinvent*"
+      - "!frontend/src/integrations/reinvent-modes.ts"
+      - "!frontend/src/integrations/ScientificReview*"
+      - "!frontend/src/integrations/ScientificSelection.tsx"
+      - "!frontend/src/integrations/ScientificChoices*"
+      - "!frontend/src/integrations/inputs.css"
+      - "frontend/src/App.tsx"
+      - "frontend/src/App.test.tsx"
+      # Match push scope: application/history navigation has its dedicated native gates.
+      - "!frontend/src/App.tsx"
+      - "!frontend/src/App.test.tsx"
+      - "frontend/src/TaskDetail*"
+      - "frontend/src/useWorkbench*"
+      - "!frontend/src/useWorkbench*"
+      - "frontend/src/studio/RuntimeStatus*"
+      - "frontend/src/studio/EnvironmentStatusTable*"
+      - "frontend/src/studio/runtime-status.css"
+      - "frontend/src/operations/filter*"
+      - "frontend/src/**/*Results*"
+      # Structural comparison has exact bilingual/native lifecycle checks.
+      # Native ternary result tabs use the focused proximity preview gate.
+      - "!frontend/src/proximity/Results*"
+      - "!frontend/src/structure-comparison/**"
+      - "!frontend/src/operations/OperationResults*"
+      # Paired-result inspection is verified by viewer-checks.yml.
+      - "!frontend/src/poses/PoseResults*"
+      - "!frontend/src/receptors/ReceptorResults*"
+      - "!frontend/src/diffsbdd/InteractionResults*"
+      # Prepared receptor results use the native preparation workspace gate.
+      - "!frontend/src/diffsbdd/PreparedReceptorResults.tsx"
+      - "!frontend/src/presentation/ensemble-results.css"
+      - "frontend/src/research/ResearchWorkspace*"
+      - "frontend/src/operations/ToolCenter*"
+      - "!frontend/src/operations/ToolCenter.tsx"
+      - "frontend/src/studio/HomeWorkspace*"
+      - "frontend/src/deployment/**"
+      - "!frontend/src/deployment/labels.ts"
+      # Directory/installation intent has Installation checks and its exact consumers.
+      - "!frontend/src/deployment/DeploymentPanel.tsx"
+      - "!frontend/src/deployment/installation.ts"
+      - "!frontend/src/deployment/deployment.test.tsx"
+      - "!frontend/src/deployment/installation.test.ts"
+      # Installation-page presentation uses its own exact component/control gate.
+      - "!frontend/src/deployment/ComponentLibrary*"
+      - "!frontend/src/deployment/ComponentCard.tsx"
+      - "!frontend/src/deployment/component-groups*"
+      - "!frontend/src/deployment/component-content.ts"
+      - "!frontend/src/deployment/components.css"
+      - "frontend/src/design/**"
+      - "frontend/src/humanization/**"
+      - "frontend/src/guided/questionnaire.css"
+      - "frontend/src/guided/Questionnaire*"
+      - "frontend/src/TaskForm*"
+      - "frontend/src/operations/AssetPicker*"
+      # Source metadata callbacks use the exact molecular questionnaire gate.
+      - "!frontend/src/operations/AssetPicker*"
+      - "frontend/src/operations/HarnessForm*"
+      - "frontend/src/operations/CampaignForm*"
+      # Local campaign review and permission have an exact form/browser gate.
+      - "!frontend/src/operations/CampaignForm.tsx"
+      - "!frontend/src/operations/CampaignForm.test.tsx"
+      - "!frontend/src/operations/CampaignForm.review.test.tsx"
+      # Exact dataset material controls use research-material-checks.yml.
+      - "!frontend/src/datasets/DatasetPicker*"
+      - "frontend/src/datasets/SourcePicker*"
+      - "frontend/src/datasets/useDatasetSources*"
+      - "frontend/src/datasets/DEL*"
+      # Retained DEL series views have exact SQLite/chart/browser checks.
+      - "!frontend/src/datasets/DELSeriesContext*"
+      - "!frontend/src/datasets/DELCandidateEvidence*"
+      - "!frontend/src/datasets/DELReviewQuestion.test.tsx"
+      - "!frontend/src/datasets/DELCountMaterials*"
+      - "!frontend/src/datasets/DELMaterialQuestion.tsx"
+      - "frontend/src/receptors/SurfaceForm*"
+      - "frontend/src/editors/Editors*"
+      - "frontend/src/workflow.css"
+      - "frontend/src/research/ObjectInspector*"
+      - "frontend/src/research/research.css"
+      # Native file inspection uses workspace-preview-checks.yml.
+      - "!frontend/src/research/ResearchWorkspace*"
+      - "!frontend/src/research/ObjectInspector*"
+      - "!frontend/src/research/research.css"
+      # Sequence and QC inspections use their own focused native-result gate.
+      - "!frontend/src/presentation/SequenceTrack*"
+      - "!frontend/src/presentation/SequencePositions*"
+      - "!frontend/src/presentation/sequence-track.css"
+      - "!frontend/src/presentation/result-inspection.css"
+      - "!frontend/src/operations/SequenceScoreResults*"
+      - "!frontend/src/operations/sequence-scores.css"
+      - "!frontend/src/antibodies/AntibodyNumberResults*"
+      - "!frontend/src/humanization/HumanizationResults*"
+      - "!frontend/src/humanization/SequenceAlignment*"
+      - "!frontend/src/humanization/SequenceComparison*"
+      - "!frontend/src/humanization/ReferenceMetrics*"
+      - "!frontend/src/humanization/humanization.css"
+      - "!frontend/src/humanization/sequence-alignment.css"
+      - "!frontend/src/quality/QualityResults*"
+      - "!frontend/src/quality/tests/QualityResults.test.tsx"
+      # Shared research-shell changes have a focused native navigation gate.
+      - "!frontend/src/studio/Navigation*"
+      - "!frontend/src/studio/navigation-frame.css"
+      - "!frontend/src/studio/Header*"
+      - "!frontend/src/studio/header.css"
+      - "!frontend/src/studio/TaskSearch*"
+      - "!frontend/src/studio/TaskNotifications*"
+      - "!frontend/src/studio/ModuleTaskPicker*"
+      - "!frontend/src/studio.css"
+      - "!frontend/src/design/workspaces.css"
+      # Shared shell appearance has navigation-shell-checks.yml and real page consumers.
+      - "!frontend/src/design/layout.css"
+      - "!frontend/src/design/controls.css"
+      - "!frontend/src/design/module-surfaces.css"
+      - "!frontend/src/presentation/prediction-shell.css"
+      - "!frontend/src/presentation/prediction-workspace.css"
+      # Public case controls have a focused native gate.
+      - "!frontend/src/examples/ExampleActions*"
+      - "!frontend/src/examples/ExampleToolbar*"
+      - "!frontend/src/examples/ExampleGuide*"
+      - "!frontend/src/examples/ExampleFeedback*"
+      - "!frontend/src/examples/useExampleTemplate*"
+      - "!frontend/src/examples/examples.css"
+      - "!frontend/src/TaskForm*"
+      - "!frontend/src/studio/HomeWorkspace*"
+      - "!frontend/src/presentation/result-layout.css"
+      # Molecular property pages use their focused inspection gate.
+      - "!frontend/src/admet/**"
+      # Print export and shared entry motion use publication-checks.yml.
+      - "!frontend/src/guided/Questionnaire*"
+      - "!frontend/src/presentation/InteractionDiagram.test.tsx"
+      - "!frontend/src/presentation/InteractionDiagram.tsx"
+      - "!frontend/src/presentation/MetricBars.tsx"
+      - "!frontend/src/presentation/MetricScatter*"
+      - "!frontend/src/presentation/metric-scatter*"
+      - "!frontend/src/presentation/MoleculeImage*"
+      - "!frontend/src/presentation/hidden-frame-focus*"
+      - "!frontend/src/presentation/molecule-image.css"
+      - "!frontend/src/presentation/ResearchTabs.tsx"
+      - "!frontend/src/simulations/DynamicsResults.tsx"
+      - "!frontend/src/presentation/useReveal.test.tsx"
+      - "!frontend/src/presentation/useReveal.ts"
+      # Metric landscapes and exact direct consumers use landscape-checks.yml.
+      - "!frontend/src/integrations/ScientificResults*"
+      - "!frontend/src/operations/CandidateSequenceResults.test.tsx"
+      - "!frontend/src/operations/PropertyResults.test.tsx"
+      - "!server_tests/test_result_visuals_browser.py"
+      # Shared interactive charts and appearance use chart-quality-checks.yml.
+      - "!frontend/src/presentation/plots/**"
+      - "!frontend/src/simulations/SimulationResults.test.tsx"
+      - "!frontend/src/datasets/CountEvidencePlot.tsx"
+      - "!frontend/src/datasets/count-summary.ts"
+      - "!frontend/src/datasets/count-summary.test.ts"
+      - "!frontend/src/datasets/DatasetResults.tsx"
+      - "!frontend/src/datasets/PlotFrame.tsx"
+      - "!frontend/src/datasets/DatasetHeatmaps.tsx"
+      - "!frontend/src/viewer/style.ts"
+      # Study prefills have a focused template/preview gate, without full interface replay.
+      - "!frontend/src/integrations/ScientificForm.tsx"
+      - "!frontend/src/receptors/SurfaceForm.tsx"
+      # Shared hydrogen display has focused native Ketcher/3D checks.
+      - "!frontend/src/editors/Editors.tsx"
+      - "!frontend/src/editors/Editors.load.test.tsx"
+      # Shared task actions have a dedicated real-worker recovery gate.
+      - "!frontend/src/TaskDetail*"
+      - "!frontend/src/presentation/research-content*"
+      - "!frontend/src/presentation/depiction-renderer*"
+      # Shared row interaction has one focused native selection gate.
+      - "!frontend/src/datasets/ResearchTable.tsx"
+      - "!frontend/src/space/ChannelResults.tsx"
+      - "!frontend/src/guided/questionnaire.css"
+      - "!frontend/src/presentation/ResearchTabs.test.tsx"
+      - "!frontend/src/presentation/research-tabs.css"
+      - "!frontend/src/presentation/ActiveIndicator*"
+      - "!frontend/src/presentation/active-indicator.css"
+      # Questionnaire availability controls use task-readiness-checks.yml.
+      - "!frontend/src/datasets/DELForm.tsx"
+      - "!frontend/src/datasets/DELMethodQuestion.tsx"
+      - "!frontend/src/datasets/DELScopeQuestion.tsx"
+      - "!frontend/src/datasets/DELCountUnit.tsx"
+      - "!frontend/src/datasets/DELAnalysisSupport.test.tsx"
+      - "!frontend/src/datasets/DELReviewQuestion.tsx"
+      - "!frontend/src/datasets/DELTemplateReplay.test.tsx"
+      - "!frontend/src/datasets/supplier-label*"
+      - "!frontend/src/humanization/HumanizationForm.tsx"
+      - "!frontend/src/operations/HarnessForm.tsx"
+      - "!frontend/src/operations/HarnessSubmissionRecovery*"
+      # Exact interface and deposited-PTM checks use protein-interface-checks.yml.
+      - "!frontend/src/integrations/ProteinInterface*"
+      - "!frontend/src/viewer/modified-polymer*"
+      - "!.github/workflows/user-interface-checks.yml"
+      # Saved-material handoff uses result-handoff-checks.yml.
+      - "!frontend/src/docking/DockingResults*"
+      # Pose continuity and exact downstream versions use pose-handoff-checks.yml.
+      - "!frontend/src/chemistry/StateResults.tsx"
+      - "!frontend/src/diffsbdd/DiffResults*"
+      - "!frontend/src/presentation/MolecularPreview*"
+      - "!frontend/src/operations/OperationResults*"
+      # Molecular view alignment has structure-layout-checks.yml.
+      - "!frontend/src/operations/NativeReport.tsx"
+      - "!frontend/src/operations/EpitopeResults.tsx"
+      - "!frontend/src/operations/StructureComparisonResults.tsx"
+      - "!frontend/src/admet/AdmetResults.tsx"
+      - "!frontend/src/admet/admet.css"
+      - "!frontend/src/admet/AdmetResults.test.tsx"
+      - "!frontend/src/admet/AdmetSelectedMolecule.tsx"
+      - "!frontend/src/admet/AdmetCandidateViews.tsx"
+      - "!frontend/src/admet/EndpointTable.tsx"
+      - "!frontend/src/admet/EndpointValue.tsx"
+      - "!frontend/src/admet/EndpointValue.test.tsx"
+      - "!frontend/src/admet/types.ts"
+      - "!frontend/src/chemistry/StateCollectionPreview.tsx"
+      - "!frontend/src/datasets/CandidateView.tsx"
+      - "!frontend/src/datasets/IndexedLibraryResults*"
+      - "!frontend/src/datasets/useIndexedMember*"
+      - "!frontend/src/datasets/DatasetResults*"
+      - "!frontend/src/datasets/ResearchTable*"
+      - "!frontend/src/datasets/member-page-export*"
+      - "!frontend/src/datasets/datasets.css"
+      - "!frontend/src/diffsbdd/FixedAtomPicker.tsx"
+      - "!frontend/src/diffsbdd/GeneratedCandidates.tsx"
+      - "!frontend/src/diffsbdd/InteractionResults.tsx"
+      - "!frontend/src/diffsbdd/PocketPicker.tsx"
+      - "!frontend/src/diffsbdd/ReferencePocketResults.tsx"
+      - "!frontend/src/diffsbdd/interaction-results.css"
+      - "!frontend/src/discovery/ReferenceImportResults.tsx"
+      # Native target evidence is checked by dataset-discovery-checks.yml.
+      - "!frontend/src/discovery/TargetResearchResults*"
+      - "!frontend/src/discovery/ActivityResults*"
+      - "!frontend/src/docking/DockingResults.tsx"
+      - "!frontend/src/examples/ExampleJobResult.tsx"
+      - "!frontend/src/examples/StudyInputPreview.tsx"
+      - "!frontend/src/examples/examples.css"
+      - "!frontend/src/integrations/InteractionResults*"
+      - "!frontend/src/integrations/ProteinInterfaceResults*"
+      - "!frontend/src/integrations/ProteinInterfaceContacts.tsx"
+      - "!frontend/src/integrations/interaction-residue*"
+      - "!frontend/src/integrations/interaction-workspace.css"
+      - "!frontend/src/integrations/PotentialResults.tsx"
+      - "!frontend/src/integrations/ScaffoldSelection.tsx"
+      - "!frontend/src/integrations/ScientificResults*"
+      - "!frontend/src/integrations/StructureTargetSelection.tsx"
+      - "!frontend/src/operations/CandidateSequenceResults.tsx"
+      - "!frontend/src/operations/CovalentEditor.tsx"
+      - "!frontend/src/operations/PropertyResults.tsx"
+      - "!frontend/src/pockets/PocketResults*"
+      - "!frontend/src/pockets/pocket-results.css"
+      # Native pocket comparisons and handoffs use pocket-result-checks.yml.
+      - "!frontend/src/pockets/ReferenceComparison*"
+      - "!server_tests/test_stat6_pocket_handoff_browser.py"
+      - "!frontend/src/pockets/PocketSelection*"
+      - "!frontend/src/poses/ClusterResults.tsx"
+      - "!frontend/src/poses/PoseResults.tsx"
+      - "!frontend/src/poses/cluster.css"
+      - "!frontend/src/presentation/ensemble-results.css"
+      - "!frontend/src/proximity/AttachmentDirections.tsx"
+      - "!frontend/src/proximity/BindingRegion.tsx"
+      - "!frontend/src/proximity/PartnerStep.tsx"
+      - "!frontend/src/proximity/Results.tsx"
+      - "!frontend/src/proximity/proximity.css"
+      - "!frontend/src/quality/QualityResults.tsx"
+      - "!frontend/src/receptors/ReceptorResults.tsx"
+      - "!frontend/src/receptors/StructurePrepareForm.tsx"
+      - "!frontend/src/receptors/StructurePrepareResults*"
+      - "!frontend/src/operations/PreparedInputResults*"
+      - "!frontend/src/receptors/SurfaceRegionPicker.tsx"
+      - "!frontend/src/receptors/SurfaceResults.tsx"
+      - "!frontend/src/receptors/surface.css"
+      - "!frontend/src/regions/AtomSelection.tsx"
+      - "!frontend/src/regions/RegionResult.tsx"
+      - "!frontend/src/research/ResearchWorkspace.tsx"
+      - "!frontend/src/research/research.css"
+      - "!frontend/src/simulations/DynamicsResults.tsx"
+      - "!frontend/src/simulations/FreeEnergyResults.tsx"
+      - "!frontend/src/space/ChannelResults.tsx"
+      - "!frontend/src/space/channels.css"
+      - "!frontend/src/studio/PredictionResults.tsx"
+      - "!frontend/src/viewer/MinimizedPoseResults.tsx"
+      - "!frontend/src/presentation/StructureWorkbench.tsx"
+      - "!frontend/src/presentation/CandidateReviewBar.tsx"
+      - "!frontend/src/presentation/candidate-review-bar.css"
+      # Native workspace fullscreen and retained figure/trajectory checks have exact scopes.
+      - "!frontend/src/presentation/WorkspaceFullscreenControl*"
+      - "!frontend/src/presentation/useWorkspaceFullscreen.ts"
+      - "!frontend/src/presentation/workspace-fullscreen.css"
+      - "!frontend/src/presentation/structure-workbench.css"
+      # Defined-region sources and exact PLIP review use defined-site-checks.yml.
+      - "!frontend/src/docking/BoxFields.tsx"
+      - "!frontend/src/design/capabilities.css"
+      - "!server_tests/test_defined_region_browser.py"
+      # Do not select the whole-product browser matrix for these bounded changes.
+      - "!frontend/src/sites/**"
+      - "!frontend/src/integrations/PlipReview*"
+      - "!frontend/src/poses/PoseWorkspace*"
+      - "!frontend/src/poses/PoseForm*"
+      - "!frontend/src/poses/PosePlanRun*"
+      - "!frontend/src/poses/PoseRunControls*"
+      - "!frontend/src/poses/PoseDetail*"
+      - "!frontend/src/poses/poses.css"
+      - "!frontend/src/poses/ClusterCoverage*"
+      - "!frontend/src/poses/ClusterResults.test.tsx"
+      - "!frontend/src/docking/poseScore*"
+      - "!server_tests/test_pose_quality_handoff_browser.py"
+      - "!frontend/src/poses/PoseOutcomeList*"
+      - "!frontend/src/poses/source-label.ts"
+      - "!frontend/src/poses/types.ts"
+      - "!frontend/src/poses/LigandChoice*"
+      - "!frontend/src/poses/ClusterForm.tsx"
+      - "!frontend/src/viewer/search-box*"
+      - "!frontend/src/viewer/StructureViewport.tsx"
+      - "!frontend/src/diffsbdd/ReviewReference.tsx"
+      # Exact interface and deposited-PTM checks use protein-interface-checks.yml.
+      - "!frontend/src/integrations/ProteinInterface*"
+      - "!frontend/src/viewer/modified-polymer*"
+      - "!.github/workflows/user-interface-checks.yml"
+  workflow_dispatch:
+jobs:
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  guidance-scope:
+    uses: ./.github/workflows/restraint-guidance-checks.yml
+    with:
+      scope_only: true
+  prediction-scope:
+    uses: ./.github/workflows/prediction-workspace-checks.yml
+    with:
+      scope_only: true
+  model-context:
+    uses: ./.github/workflows/property-model-review-checks.yml
+    with:
+      scope_only: true
+  presentation:
+    needs: [model-context, prediction-scope, guidance-scope, utility-scope]
+    if: needs.guidance-scope.outputs.file_navigation_only != 'true' && needs.prediction-scope.outputs.target_evidence_only != 'true' && needs.prediction-scope.outputs.interaction_only != 'true' && needs.prediction-scope.outputs.reference_only != 'true' && needs.utility-scope.outputs.utility_only != 'true' && (needs.prediction-scope.outputs.appearance_only != 'true' && needs.model-context.outputs.calculation_plan_only != 'true' && needs.model-context.outputs.model_context_only != 'true' && needs.model-context.outputs.managed_compute_only != 'true' && needs.prediction-scope.outputs.prediction_only != 'true' && needs.guidance-scope.outputs.guidance_only != 'true')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install locked frontend dependencies and build
+        run: |
+          npm ci --prefix frontend
+          npm run build --prefix frontend
+      - name: Check changed presentation and direct user-page consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run
+          src/presentation/ResearchTable.test.tsx
+          src/presentation/FileSelect.test.tsx
+          src/integrations/StructureTargetSelection.test.tsx
+          src/integrations/PropertyModelSelection.test.tsx
+          src/integrations/ScientificChoices.test.tsx
+          src/datasets/SourcePicker.test.tsx
+          src/datasets/ModelValidationPlot.test.tsx
+          src/datasets/DatasetCharts.test.tsx
+          src/datasets/DatasetResults.test.tsx
+          src/datasets/IndexedLibraryResults.test.tsx
+          src/datasets/ResearchTable.test.tsx
+          src/datasets/indexed-source.test.ts
+          src/datasets/chart-documents.test.ts
+          src/receptors/SurfaceForm.test.tsx
+          src/operations/AssetPicker.test.tsx
+          src/TaskForm.test.tsx
+          src/guided/workflows.test.tsx
+          src/operations/CampaignForm.test.tsx
+          src/presentation/MetricScatter.test.tsx
+          src/presentation/InteractionDiagram.test.tsx
+          src/presentation/depiction-renderer.test.ts
+          src/viewer/useViewerSnapshot.test.ts
+          src/viewer/capture.test.ts
+          src/viewer/camera-resize.test.ts
+          src/presentation/research-files.test.tsx
+          src/presentation/research-graph.test.ts
+          src/research/ResearchWorkspace.test.tsx
+          src/TaskDetail.test.tsx
+          src/useWorkbench.test.ts
+          src/App.test.tsx
+          src/studio/Navigation.test.tsx
+          src/studio/ResearchEntry.test.tsx
+          src/studio/research-modules.test.ts
+          src/studio/TaskWorkspace.test.tsx
+          src/studio/PredictionResults.test.tsx
+          src/studio/CandidatePanel.test.tsx
+          src/studio/InterfaceSettings.test.tsx
+          src/studio/RuntimeStatus.test.tsx
+          src/diffsbdd/DesignInputContext.test.tsx
+          src/studio/HomeWorkspace.test.tsx
+          src/operations/ToolCenter.test.tsx
+          src/examples/ExampleActions.test.tsx
+          src/operations/filter.test.ts
+          src/operations/ToolQuestionnaires.test.tsx
+          src/operations/OperationResults.test.tsx
+          src/operations/CandidateSequenceResults.test.tsx
+          src/operations/candidate-structures.test.ts
+          src/operations/StructureComparisonResults.test.tsx
+          src/examples/CampaignCasePreview.test.tsx
+          src/examples/ExampleJobResult.test.tsx
+          src/admet/AdmetResults.test.tsx
+          src/quality/tests/QualityResults.test.tsx
+          src/antibodies/AntibodyNumberResults.test.tsx
+          src/chemistry/LibraryScreenResults.test.tsx
+          src/chemistry/StateResults.test.tsx
+          src/humanization/HumanizationResults.test.tsx
+          src/docking/DockingResults.test.tsx
+          src/deployment/deployment.test.tsx
+          src/deployment/component-groups.test.ts
+          src/deployment/ComputeServicePanel.test.tsx

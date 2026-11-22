@@ -1,0 +1,684 @@
+"""Workflow-boundary request contracts for the redesigned ProtRepair package."""
+
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, TypeAlias, TypeVar, overload
+
+from protrepair.io.ingress_policy import NonPolymerRetentionPolicy
+from protrepair.scope import (
+    ResidueBoundaryScope,
+    ResidueBoundarySide,
+    Scope,
+    WholeStructureScope,
+)
+from protrepair.sources.chemistry import RetainedNonPolymerChemistryOverride
+from protrepair.state import (
+    BackboneHeavyAtomCompletenessState,
+    BondedGeometryState,
+    ClashPresenceState,
+    ClashState,
+    HydrogenCoverageState,
+    OxtPresenceState,
+    ScopedState,
+    SidechainHeavyAtomCompletenessState,
+)
+from protrepair.state.bonded_geometry import BONDED_GEOMETRY_SCOPE_TYPES
+from protrepair.structure.labels import ResidueId
+from protrepair.transformer.completion.hydrogen.protonation import (
+    DisabledHistidineProtonationRequest,
+    HistidineProtonationRequest,
+    normalize_histidine_protonation_request,
+)
+from protrepair.transformer.packing.spec import PackingSpec
+from protrepair.transformer.refinement.spec import (
+    BackboneWindowRefinementSpec,
+    RepairRefinementSpec,
+)
+from protrepair.workflow.contracts.external_reference import (
+    ExternalSpanReconstructionSpec,
+)
+from protrepair.workflow.contracts.policies import (
+    LigandPolicy,
+    MutationPolicy,
+    OccupancyPolicy,
+    OrphanFragmentPolicy,
+)
+
+if TYPE_CHECKING:
+    from protrepair.io.ingress_policy import StructureNormalizationPolicy
+
+WorkflowGoalStateValue: TypeAlias = (
+    BondedGeometryState
+    | ClashState
+    | ClashPresenceState
+    | BackboneHeavyAtomCompletenessState
+    | SidechainHeavyAtomCompletenessState
+    | HydrogenCoverageState
+    | OxtPresenceState
+)
+WorkflowGoalStateValueT = TypeVar(
+    "WorkflowGoalStateValueT",
+    bound=WorkflowGoalStateValue,
+)
+WorkflowGoal: TypeAlias = ScopedState[WorkflowGoalStateValue]
+
+
+def requested_process_goal(
+    *,
+    scope: Scope,
+    value: WorkflowGoalStateValue,
+) -> WorkflowGoal:
+    """Return one canonical requested goal for the workflow boundary."""
+
+    if not is_workflow_goal_state_value(value):
+        raise TypeError("requested goal contained an unsupported requested-goal value")
+
+    goal = ScopedState(scope=scope, value=value)
+    validate_workflow_goal_scope(goal)
+    return goal
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class RequestedGoalSet(Sequence[WorkflowGoal]):
+    """Normalized requested-goal set over scoped state propositions."""
+
+    goals: tuple[WorkflowGoal, ...] = ()
+
+    def __init__(self, goals: Iterable[WorkflowGoal] = ()) -> None:
+        object.__setattr__(self, "goals", _normalize_requested_goals(goals))
+
+    def __iter__(self) -> Iterator[WorkflowGoal]:
+        """Iterate over normalized requested goals."""
+
+        return iter(self.goals)
+
+    def __len__(self) -> int:
+        """Return the number of normalized requested goals."""
+
+        return len(self.goals)
+
+    @overload
+    def __getitem__(
+        self,
+        index: int,
+    ) -> WorkflowGoal: ...
+
+    @overload
+    def __getitem__(
+        self,
+        index: slice,
+    ) -> tuple[WorkflowGoal, ...]: ...
+
+    def __getitem__(
+        self,
+        index: int | slice,
+    ) -> WorkflowGoal | tuple[WorkflowGoal, ...]:
+        """Return one requested goal or slice of requested goals."""
+
+        return self.goals[index]
+
+    def goal_state_value(
+        self,
+        state_type: type[WorkflowGoalStateValueT],
+        *,
+        scope: Scope,
+    ) -> WorkflowGoalStateValueT | None:
+        """Return the targeted state value for one exact scope/type pair."""
+
+        for goal in self.goals:
+            if goal.scope != scope:
+                continue
+            if isinstance(goal.value, state_type):
+                return goal.value
+
+        return None
+
+    def is_empty(self) -> bool:
+        """Return whether the normalized requested-goal set is empty."""
+
+        return not self.goals
+
+    def whole_structure_goal_state_value(
+        self,
+        state_type: type[WorkflowGoalStateValueT],
+    ) -> WorkflowGoalStateValueT | None:
+        """Return one whole-structure goal value for a specific state axis."""
+
+        return self.goal_state_value(
+            state_type,
+            scope=WholeStructureScope(),
+        )
+
+    def requests_whole_structure_heavy_atom_completion(self) -> bool:
+        """Return whether the set requests global heavy-atom completeness."""
+
+        return (
+            self.requests_whole_structure_backbone_heavy_atom_completion()
+            or self.requests_whole_structure_sidechain_heavy_atom_completion()
+        )
+
+    def requests_whole_structure_backbone_heavy_atom_completion(self) -> bool:
+        """Return whether the set requests global backbone completeness."""
+
+        requested_state = self.whole_structure_goal_state_value(
+            BackboneHeavyAtomCompletenessState,
+        )
+        return requested_state is BackboneHeavyAtomCompletenessState.COMPLETE
+
+    def requests_whole_structure_sidechain_heavy_atom_completion(self) -> bool:
+        """Return whether the set requests global side-chain completeness."""
+
+        requested_state = self.whole_structure_goal_state_value(
+            SidechainHeavyAtomCompletenessState,
+        )
+        return requested_state is SidechainHeavyAtomCompletenessState.COMPLETE
+
+    def requests_whole_structure_hydrogen_population(self) -> bool:
+        """Return whether the set requests global hydrogen coverage."""
+
+        requested_state = self.whole_structure_goal_state_value(
+            HydrogenCoverageState,
+        )
+        return requested_state is HydrogenCoverageState.COMPLETE
+
+    def requests_whole_structure_clash_absence(self) -> bool:
+        """Return whether the set requests structure-level clash absence."""
+
+        requested_state = self.whole_structure_goal_state_value(
+            ClashPresenceState,
+        )
+        return requested_state is ClashPresenceState.NONE
+
+    def requests_bonded_geometry_repair(self) -> bool:
+        """Return whether the request authorizes bonded-geometry repair."""
+
+        return bool(self.bonded_geometry_repair_scopes())
+
+    def bonded_geometry_repair_scopes(self) -> tuple[Scope, ...]:
+        """Return the requested tolerance targets in goal order.
+
+        Returns
+        -------
+        tuple[Scope, ...]
+            Target scopes for bonded-geometry repair, not movable atom sets.
+        """
+
+        return tuple(
+            goal.scope
+            for goal in self.goals
+            if goal.value is BondedGeometryState.WITHIN_TOLERANCE
+        )
+
+    def requests_hydrogen_preparation(
+        self, *, required_residue_ids: tuple[ResidueId, ...] = ()
+    ) -> bool:
+        """Include explicit local prerequisites without broadening their scope.
+
+        Parameters
+        ----------
+        required_residue_ids : tuple[ResidueId, ...]
+            Polymer residues required by another requested action.
+
+        Returns
+        -------
+        bool
+            Whether global H completion or local preparation is requested.
+        """
+        return self.requests_whole_structure_hydrogen_population() or bool(
+            required_residue_ids
+        )
+
+    def boundary_goals(
+        self,
+        state_type: type[WorkflowGoalStateValue],
+        *,
+        side: ResidueBoundarySide | None = None,
+    ) -> tuple[WorkflowGoal, ...]:
+        """Return requested boundary-scoped goals for one specific state axis."""
+
+        return tuple(
+            goal
+            for goal in self.goals
+            if isinstance(goal.scope, ResidueBoundaryScope)
+            and (side is None or goal.scope.side is side)
+            and isinstance(goal.value, state_type)
+        )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class StructureIngressOptions:
+    """Ingress-boundary normalization configuration for source interpretation.
+
+    Parameters
+    ----------
+    occupancy_policy : OccupancyPolicy, default=OccupancyPolicy.HIGHEST
+        How to select alternate atom positions.
+    mutation_policy : MutationPolicy, default=MutationPolicy.HIGHEST_OCCUPANCY
+        How to select between residue variants at one position.
+    ligand_policy : LigandPolicy, default=LigandPolicy.DROP
+        How to treat non-water ligands.
+    non_polymer_retention : NonPolymerRetentionPolicy or None, default=None
+        Select water and other non-polymers instead of applying legacy defaults.
+    retained_non_polymer_chemistry_overrides : iterable of RetainedNonPolymerChemistryOverride
+        Explicit chemistry to use for the named retained residues.
+    omit_zero_occupancy_sidechain_heavy_atoms : bool, default=False
+        Treat eligible explicitly zero standard side-chain positions in input
+        coordinate files as missing. This option does not request reconstruction.
+    omit_zero_occupancy_polymer_residues : bool, default=False
+        Withhold eligible interior standard residues whose source coordinates
+        are all explicitly zero. This does not request span reconstruction.
+
+    Raises
+    ------
+    TypeError
+        A policy or retained chemistry override has a noncanonical type.
+    ValueError
+        More than one override targets the same residue.
+    """
+
+    occupancy_policy: OccupancyPolicy = OccupancyPolicy.HIGHEST
+    mutation_policy: MutationPolicy = MutationPolicy.HIGHEST_OCCUPANCY
+    ligand_policy: LigandPolicy = LigandPolicy.DROP
+    non_polymer_retention: NonPolymerRetentionPolicy | None = field(
+        default=None, kw_only=True
+    )
+    retained_non_polymer_chemistry_overrides: tuple[
+        RetainedNonPolymerChemistryOverride,
+        ...,
+    ] = ()
+    omit_zero_occupancy_sidechain_heavy_atoms: bool = field(default=False, kw_only=True)
+    omit_zero_occupancy_polymer_residues: bool = field(default=False, kw_only=True)
+
+    def __init__(
+        self,
+        occupancy_policy: OccupancyPolicy = OccupancyPolicy.HIGHEST,
+        mutation_policy: MutationPolicy = MutationPolicy.HIGHEST_OCCUPANCY,
+        ligand_policy: LigandPolicy = LigandPolicy.DROP,
+        retained_non_polymer_chemistry_overrides: Iterable[
+            RetainedNonPolymerChemistryOverride
+        ] = (),
+        *,
+        omit_zero_occupancy_sidechain_heavy_atoms: bool = False,
+        omit_zero_occupancy_polymer_residues: bool = False,
+        non_polymer_retention: NonPolymerRetentionPolicy | None = None,
+    ) -> None:
+        object.__setattr__(self, "occupancy_policy", occupancy_policy)
+        object.__setattr__(self, "mutation_policy", mutation_policy)
+        object.__setattr__(self, "ligand_policy", ligand_policy)
+        object.__setattr__(self, "non_polymer_retention", non_polymer_retention)
+        object.__setattr__(
+            self,
+            "omit_zero_occupancy_sidechain_heavy_atoms",
+            omit_zero_occupancy_sidechain_heavy_atoms,
+        )
+        object.__setattr__(
+            self,
+            "omit_zero_occupancy_polymer_residues",
+            omit_zero_occupancy_polymer_residues,
+        )
+        object.__setattr__(
+            self,
+            "retained_non_polymer_chemistry_overrides",
+            tuple(retained_non_polymer_chemistry_overrides),
+        )
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.occupancy_policy, OccupancyPolicy):
+            raise TypeError("ingress occupancy_policy must be an OccupancyPolicy value")
+        if not isinstance(self.mutation_policy, MutationPolicy):
+            raise TypeError("ingress mutation_policy must be a MutationPolicy value")
+        if not isinstance(self.ligand_policy, LigandPolicy):
+            raise TypeError("ingress ligand_policy must be a LigandPolicy value")
+        if self.non_polymer_retention is not None:
+            if not isinstance(self.non_polymer_retention, NonPolymerRetentionPolicy):
+                raise TypeError(
+                    "non_polymer_retention must be a NonPolymerRetentionPolicy"
+                )
+            if self.ligand_policy is not LigandPolicy.DROP:
+                raise ValueError("non_polymer_retention replaces ligand_policy")
+        if not isinstance(self.omit_zero_occupancy_sidechain_heavy_atoms, bool):
+            raise TypeError("omit_zero_occupancy_sidechain_heavy_atoms must be a bool")
+        if not isinstance(self.omit_zero_occupancy_polymer_residues, bool):
+            raise TypeError("omit_zero_occupancy_polymer_residues must be a bool")
+
+        normalized_overrides: list[RetainedNonPolymerChemistryOverride] = []
+        seen_override_residue_ids = set()
+        for override in self.retained_non_polymer_chemistry_overrides:
+            if not isinstance(override, RetainedNonPolymerChemistryOverride):
+                raise TypeError(
+                    "ingress retained_non_polymer_chemistry_overrides must contain "
+                    "RetainedNonPolymerChemistryOverride values"
+                )
+            if override.residue_id in seen_override_residue_ids:
+                raise ValueError(
+                    "ingress retained_non_polymer_chemistry_overrides must not "
+                    f"repeat {override.residue_id.display_token()}"
+                )
+            normalized_overrides.append(override)
+            seen_override_residue_ids.add(override.residue_id)
+
+        object.__setattr__(
+            self,
+            "retained_non_polymer_chemistry_overrides",
+            tuple(normalized_overrides),
+        )
+
+    def structure_normalization_policy(self) -> "StructureNormalizationPolicy":
+        """Project this ingress request into canonical structure normalization."""
+
+        from protrepair.io.ingress_policy import (
+            LigandHandling,
+            StructureNormalizationPolicy,
+        )
+
+        if (
+            self.non_polymer_retention is not None
+            or self.ligand_policy is LigandPolicy.KEEP
+        ):
+            ligand_handling = LigandHandling.KEEP
+        elif self.ligand_policy is LigandPolicy.REJECT:
+            ligand_handling = LigandHandling.REJECT
+        else:
+            ligand_handling = LigandHandling.DROP
+        return StructureNormalizationPolicy(
+            occupancy_policy=self.occupancy_policy,
+            mutation_policy=self.mutation_policy,
+            ligand_handling=ligand_handling,
+            non_polymer_retention=self.non_polymer_retention,
+            omit_zero_occupancy_sidechain_heavy_atoms=self.omit_zero_occupancy_sidechain_heavy_atoms,
+            omit_zero_occupancy_polymer_residues=self.omit_zero_occupancy_polymer_residues,
+        )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class WorkflowTransformRequests:
+    """Explicit workflow transform requests not expressible as desired states."""
+
+    orphan_fragment_policy: OrphanFragmentPolicy = OrphanFragmentPolicy.REBUILD
+    external_span_reconstructions: tuple[
+        ExternalSpanReconstructionSpec,
+        ...,
+    ] = ()
+    reference_sidechain_packing: PackingSpec | None = None
+    committed_sidechain_packing: PackingSpec | None = None
+    backbone_window_refinements: tuple[BackboneWindowRefinementSpec, ...] = ()
+    repair_refinement: RepairRefinementSpec | None = None
+    protonate_histidines: bool = False
+    allow_retained_non_polymer_rdkit_fallback: bool = True
+    histidine_protonation: HistidineProtonationRequest | None = None
+
+    def __init__(
+        self,
+        orphan_fragment_policy: OrphanFragmentPolicy = OrphanFragmentPolicy.REBUILD,
+        external_span_reconstructions: Iterable[ExternalSpanReconstructionSpec] = (),
+        reference_sidechain_packing: PackingSpec | None = None,
+        committed_sidechain_packing: PackingSpec | None = None,
+        backbone_window_refinements: Iterable[BackboneWindowRefinementSpec] = (),
+        repair_refinement: RepairRefinementSpec | None = None,
+        protonate_histidines: bool = False,
+        allow_retained_non_polymer_rdkit_fallback: bool = True,
+        histidine_protonation: HistidineProtonationRequest | None = None,
+    ) -> None:
+        object.__setattr__(self, "orphan_fragment_policy", orphan_fragment_policy)
+        object.__setattr__(
+            self,
+            "external_span_reconstructions",
+            tuple(external_span_reconstructions),
+        )
+        object.__setattr__(
+            self,
+            "reference_sidechain_packing",
+            reference_sidechain_packing,
+        )
+        object.__setattr__(
+            self,
+            "committed_sidechain_packing",
+            committed_sidechain_packing,
+        )
+        object.__setattr__(
+            self,
+            "backbone_window_refinements",
+            tuple(backbone_window_refinements),
+        )
+        object.__setattr__(self, "repair_refinement", repair_refinement)
+        object.__setattr__(self, "protonate_histidines", protonate_histidines)
+        object.__setattr__(
+            self,
+            "allow_retained_non_polymer_rdkit_fallback",
+            allow_retained_non_polymer_rdkit_fallback,
+        )
+        object.__setattr__(self, "histidine_protonation", histidine_protonation)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        external_span_reconstructions_list: list[ExternalSpanReconstructionSpec] = []
+        for reconstruction in self.external_span_reconstructions:
+            if reconstruction not in external_span_reconstructions_list:
+                external_span_reconstructions_list.append(reconstruction)
+
+        external_span_reconstructions = tuple(external_span_reconstructions_list)
+        backbone_window_refinements: list[BackboneWindowRefinementSpec] = []
+        for refinement in self.backbone_window_refinements:
+            if not isinstance(refinement, BackboneWindowRefinementSpec):
+                raise TypeError(
+                    "backbone_window_refinements must contain "
+                    "BackboneWindowRefinementSpec values"
+                )
+            if refinement not in backbone_window_refinements:
+                backbone_window_refinements.append(refinement)
+
+        reference_sidechain_packing = self.reference_sidechain_packing
+        committed_sidechain_packing = self.committed_sidechain_packing
+        repair_refinement = self.repair_refinement
+        histidine_protonation = normalize_histidine_protonation_request(
+            self.histidine_protonation,
+            protonate_histidines=self.protonate_histidines,
+        )
+        for reconstruction in external_span_reconstructions:
+            if not isinstance(
+                reconstruction,
+                ExternalSpanReconstructionSpec,
+            ):
+                raise TypeError(
+                    "external_span_reconstructions must contain "
+                    "ExternalSpanReconstructionSpec values"
+                )
+        for reconstruction_index, reconstruction in enumerate(
+            external_span_reconstructions
+        ):
+            reconstruction_absent_ids = frozenset(
+                reconstruction.scope.absent_residue_ids
+            )
+            reconstruction_anchor_ids = frozenset(
+                reconstruction.scope.anchor_residue_ids()
+            )
+            for previous_reconstruction in external_span_reconstructions[
+                :reconstruction_index
+            ]:
+                if reconstruction.scope == previous_reconstruction.scope:
+                    continue
+
+                previous_absent_ids = frozenset(
+                    previous_reconstruction.scope.absent_residue_ids
+                )
+                previous_anchor_ids = frozenset(
+                    previous_reconstruction.scope.anchor_residue_ids()
+                )
+                if (
+                    reconstruction_absent_ids & previous_absent_ids
+                    or reconstruction_absent_ids & previous_anchor_ids
+                    or previous_absent_ids & reconstruction_anchor_ids
+                ):
+                    raise ValueError(
+                        "external_span_reconstructions with different scopes "
+                        "must not overlap or depend on one another"
+                    )
+        if reference_sidechain_packing is not None and not isinstance(
+            reference_sidechain_packing, PackingSpec
+        ):
+            raise TypeError("reference_sidechain_packing must be a PackingSpec or None")
+        if committed_sidechain_packing is not None and not isinstance(
+            committed_sidechain_packing, PackingSpec
+        ):
+            raise TypeError("committed_sidechain_packing must be a PackingSpec or None")
+        if repair_refinement is not None and not isinstance(
+            repair_refinement,
+            RepairRefinementSpec,
+        ):
+            raise TypeError("repair_refinement must be a RepairRefinementSpec or None")
+        if not isinstance(self.orphan_fragment_policy, OrphanFragmentPolicy):
+            raise TypeError(
+                "orphan_fragment_policy must be an OrphanFragmentPolicy value"
+            )
+        if not isinstance(self.allow_retained_non_polymer_rdkit_fallback, bool):
+            raise TypeError("allow_retained_non_polymer_rdkit_fallback must be a bool")
+        if (
+            reference_sidechain_packing is not None
+            and committed_sidechain_packing is not None
+        ):
+            raise ValueError(
+                "reference_sidechain_packing and committed_sidechain_packing "
+                "must not both be set"
+            )
+
+        object.__setattr__(
+            self,
+            "external_span_reconstructions",
+            external_span_reconstructions,
+        )
+        object.__setattr__(
+            self,
+            "backbone_window_refinements",
+            tuple(backbone_window_refinements),
+        )
+        object.__setattr__(self, "histidine_protonation", histidine_protonation)
+
+    def requests_reference_sidechain_packing(self) -> bool:
+        """Return whether workflow-reference side-chain packing was requested."""
+
+        return self.reference_sidechain_packing is not None
+
+    def requests_committed_sidechain_packing(self) -> bool:
+        """Return whether committed side-chain packing was requested."""
+
+        return self.committed_sidechain_packing is not None
+
+    def requests_backbone_window_refinement(self) -> bool:
+        """Return whether explicit backbone-window refinement was requested."""
+
+        return bool(self.backbone_window_refinements)
+
+    def requests_external_span_reconstruction(self) -> bool:
+        """Return whether explicit absent-span reconstruction was requested."""
+
+        return bool(self.external_span_reconstructions)
+
+    def requests_only_distinct_external_spans(self) -> bool:
+        """Identify two or more span requests without alternatives or other transforms."""
+
+        spans = self.external_span_reconstructions
+        if len(spans) < 2:
+            return False
+
+        return (
+            not self.requests_reference_sidechain_packing()
+            and not self.requests_committed_sidechain_packing()
+            and not self.requests_backbone_window_refinement()
+            and self.repair_refinement is None
+            and isinstance(
+                self.histidine_protonation_request(),
+                DisabledHistidineProtonationRequest,
+            )
+            and len({span.scope for span in spans}) == len(spans)
+        )
+
+    def histidine_protonation_request(self) -> HistidineProtonationRequest:
+        """Return the normalized histidine protonation request."""
+
+        histidine_protonation = self.histidine_protonation
+        assert histidine_protonation is not None
+        return histidine_protonation
+
+
+def _normalize_requested_goals(
+    requested_goals: Iterable[WorkflowGoal],
+) -> tuple[WorkflowGoal, ...]:
+    """Normalize one requested-goal set and reject conflicting duplicates."""
+
+    normalized_goals: list[WorkflowGoal] = []
+    goal_values_by_axis: dict[
+        tuple[object, type[WorkflowGoalStateValue]],
+        WorkflowGoalStateValue,
+    ] = {}
+    for goal in requested_goals:
+        if not isinstance(goal, ScopedState):
+            raise TypeError("requested_goals must contain ScopedState values")
+        if not is_workflow_goal_state_value(goal.value):
+            raise TypeError(
+                "requested_goals contained an unsupported requested-goal value"
+            )
+        validate_workflow_goal_scope(goal)
+
+        axis_key = (goal.scope, type(goal.value))
+        existing_value = goal_values_by_axis.get(axis_key)
+        if existing_value is not None:
+            if existing_value != goal.value:
+                raise ValueError(
+                    "requested_goals must not contain conflicting values for "
+                    "the same scope and state axis"
+                )
+            continue
+
+        normalized_goals.append(goal)
+        goal_values_by_axis[axis_key] = goal.value
+
+    return tuple(normalized_goals)
+
+
+def is_workflow_goal_state_value(
+    value: object,
+) -> bool:
+    """Return whether one value belongs to the current workflow goal surface."""
+
+    return isinstance(
+        value,
+        (
+            BondedGeometryState,
+            ClashPresenceState,
+            ClashState,
+            BackboneHeavyAtomCompletenessState,
+            HydrogenCoverageState,
+            OxtPresenceState,
+            SidechainHeavyAtomCompletenessState,
+        ),
+    )
+
+
+def validate_workflow_goal_scope(goal: WorkflowGoal) -> None:
+    """Reject requested goal propositions with incompatible scope axes."""
+
+    if isinstance(goal.value, BondedGeometryState) and not isinstance(
+        goal.scope, BONDED_GEOMETRY_SCOPE_TYPES
+    ):
+        raise ValueError(  # noqa: TRY004 - Invalid data values retain their ValueError contract.
+            "BondedGeometryState goals require WholeStructureScope, "
+            "ChainSetScope or ResidueSetScope"
+        )
+    if isinstance(goal.value, ClashState) and isinstance(
+        goal.scope,
+        WholeStructureScope,
+    ):
+        raise ValueError("whole-structure clash goals must use ClashPresenceState")  # noqa: TRY004 - Invalid data values retain their ValueError contract.
+    if isinstance(goal.value, ClashPresenceState) and not isinstance(
+        goal.scope,
+        WholeStructureScope,
+    ):
+        raise ValueError("ClashPresenceState goals require WholeStructureScope")  # noqa: TRY004 - Invalid data values retain their ValueError contract.
+    if isinstance(goal.value, OxtPresenceState) and (
+        not isinstance(goal.scope, ResidueBoundaryScope)
+        or goal.scope.side is not ResidueBoundarySide.C_TERMINUS
+    ):
+        raise ValueError(
+            "OxtPresenceState goals require a C-terminal ResidueBoundaryScope"
+        )

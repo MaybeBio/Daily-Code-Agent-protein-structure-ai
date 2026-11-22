@@ -1,0 +1,64 @@
+"""Core functionality for generative models."""
+
+# pyright: reportUnsupportedDunderAll=false
+
+from importlib import import_module
+from typing import Any
+
+
+_LAZY_EXPORTS: dict[str, str | tuple[str, str]] = {
+    "cli": "artifex.generative_models.core.cli",
+    "configuration": "artifex.generative_models.core.configuration",
+    "distributions": "artifex.generative_models.core.distributions",
+    "layers": "artifex.generative_models.core.layers",
+    "losses": "artifex.generative_models.core.losses",
+    "protocols": "artifex.generative_models.core.protocols",
+    "sampling": "artifex.generative_models.core.sampling",
+    "CHECKPOINT_POLICIES": (
+        "artifex.generative_models.core.gradient_checkpointing",
+        "CHECKPOINT_POLICIES",
+    ),
+    "apply_remat": (
+        "artifex.generative_models.core.gradient_checkpointing",
+        "apply_remat",
+    ),
+    "resolve_checkpoint_policy": (
+        "artifex.generative_models.core.gradient_checkpointing",
+        "resolve_checkpoint_policy",
+    ),
+}
+
+
+__all__ = [
+    # Modules
+    "cli",
+    "configuration",
+    "distributions",
+    "layers",
+    "losses",
+    "protocols",
+    "sampling",
+    # Functions
+    "CHECKPOINT_POLICIES",
+    "apply_remat",
+    "resolve_checkpoint_policy",
+]
+
+
+def __getattr__(name: str) -> Any:
+    """Load exported modules and symbols lazily on first attribute access."""
+    try:
+        export = _LAZY_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+
+    if isinstance(export, tuple):
+        module_path, attr_name = export
+        return getattr(import_module(module_path), attr_name)
+
+    return import_module(export)
+
+
+def __dir__() -> list[str]:
+    """Keep introspection aligned with the documented export surface."""
+    return sorted(__all__)

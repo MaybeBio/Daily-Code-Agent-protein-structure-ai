@@ -1,0 +1,51 @@
+/**
+ *  \file rotation_helper.h
+ *  \brief Functions related with rotations in em2d
+ *
+ *  Copyright 2007-2026 IMP Inventors. All rights reserved.
+*/
+
+#ifndef IMPEM2D_INTERNAL_ROTATION_HELPER_H
+#define IMPEM2D_INTERNAL_ROTATION_HELPER_H
+
+#include "IMP/em2d/em2d_config.h"
+#include "IMP/em2d/Matrix.h"
+#include "IMP/algebra/algebra_config.h"
+#include "IMP/algebra/SphericalVector3D.h"
+#include "IMP/algebra/Vector3D.h"
+#include "IMP/algebra/Rotation3D.h"
+#include <IMP/log_macros.h>
+
+IMPEM2D_BEGIN_INTERNAL_NAMESPACE
+
+//! Distributes N points into a sphere evenly. Fast algorithm that almost
+//! guarantees similar distance from one point to the nearest one
+IMPEM2DEXPORT
+void spherical_even_distribution(const unsigned long N,
+                                 algebra::SphericalVector3Ds &vs);
+
+IMPEM2DEXPORT
+void semispherical_even_distribution(const unsigned long N,
+                                     algebra::SphericalVector3Ds &vs);
+
+//! Converts a SphericalVector3D proposing a direction of projection
+//! in the rotation needed to put such direction in the Z axis.
+/**
+  \param v is the spherical vector with radius,zenith and azimut
+**/
+IMPEM2DEXPORT
+algebra::Rotation3D get_rotation_from_projection_direction(
+    const algebra::SphericalVector3D &v);
+
+//! Extract the euler angles from a rotation
+/**
+  This code assumes than the 1st and 3rd axes are the same
+  a1 is the 1st and 3rd axis and a2 is the 2nd. x=0, y=1, z=2.
+**/
+IMPEM2DEXPORT
+algebra::Vector3D get_euler_angles_from_rotation(const algebra::Rotation3D &R,
+                                                 int a1, int a2);
+
+IMPEM2D_END_INTERNAL_NAMESPACE
+
+#endif /* IMPEM2D_INTERNAL_ROTATION_HELPER_H */

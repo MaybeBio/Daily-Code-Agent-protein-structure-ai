@@ -1,0 +1,214 @@
+"""SLURM Server - Generic SLURM job submission and management.
+
+Provides tools for submitting, monitoring, and managing SLURM batch jobs.
+These tools are MD-agnostic: they handle job scripts, submission, and log
+retrieval for any workload (MD, structure prediction, analysis, etc.).
+
+The job script content is written by Claude/user following skill instructions;
+these tools only handle the SLURM layer.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import shutil
+
+from mdclaw._common import (
+    check_external_tool as _check_external_tool,
+    run_command as _run_command,
+)
+
+
+_SLURM_CLIENTS = {"sbatch", "squeue", "sacct", "scancel", "sinfo", "scontrol"}
+_CONTAINER_BIND_ENV = (
+    "SINGULARITY_BIND", "APPTAINER_BIND", "SINGULARITY_BINDPATH", "APPTAINER_BINDPATH",
+    "SINGULARITY_MOUNT", "APPTAINER_MOUNT",
+)
+# Loader and interpreter settings that describe this image, not the worker.
+_IMAGE_ONLY_ENV = ("LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME")
+_CONTAINER_ENV_PREFIXES = ("SINGULARITY", "APPTAINER")
+# Appended to a worker's PATH after MDCLAW_SLURM_PATH; source-built
+# singularity-ce lives in /usr/local/bin, distro apptainer and nvidia-smi in /usr/bin.
+_WORKER_SYSTEM_PATH = ["/usr/local/bin", "/usr/bin", "/bin"]
+
+
+_HOST_PATH_CACHE: dict = {}
+
+
+def _proc_environ(pid: int):
+    """Environment of process ``pid`` from /proc, or None when unreadable."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    env = {}
+    for item in raw.split(b"\0"):
+        if b"=" in item:
+            key, _, value = item.partition(b"=")
+            env[key.decode(errors="replace")] = value.decode(errors="replace")
+    return env
+
+
+def _proc_parent(pid: int):
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _ancestor_environments(start_pid=None, max_depth=12):
+    """Yield the environments of the ancestor processes, nearest first."""
+    pid = os.getppid() if start_pid is None else start_pid
+    for _ in range(max_depth):
+        if not pid or pid <= 1:
+            return
+        env = _proc_environ(pid)
+        if env is not None:
+            yield env
+        pid = _proc_parent(pid)
+
+
+def host_search_path(environment=None):
+    """The search path a Slurm job should inherit.
+
+    ``MDCLAW_SLURM_PATH`` when set. Otherwise, when this process runs inside a
+    container image, the PATH of the nearest ancestor process that is not in
+    the image: the ``apptainer`` / ``singularity`` launcher inherited the host
+    shell's PATH, and the container runs in the host PID namespace, so
+    ``/proc/<ppid>/environ`` shows it. That is the PATH the compute node needs
+    (measured 2026-09-16: the same job submitted with the image's PATH died with
+    `singularity: command not found`). None outside an image or when no
+    ancestor exposes a PATH that resolves a container runtime.
+    """
+    env = os.environ if environment is None else environment
+    explicit = env.get("MDCLAW_SLURM_PATH")
+    if explicit:
+        return explicit
+    if not (env.get("SINGULARITY_CONTAINER") or env.get("APPTAINER_CONTAINER")):
+        return None
+    if "path" in _HOST_PATH_CACHE:
+        return _HOST_PATH_CACHE["path"]
+    own = env.get("PATH", "")
+    found = None
+    for ancestor in _ancestor_environments():
+        path = ancestor.get("PATH")
+        if not path or path == own:
+            continue
+        if ancestor.get("SINGULARITY_CONTAINER") or ancestor.get("APPTAINER_CONTAINER"):
+            continue
+        if any(shutil.which(name, path=path) for name in ("singularity", "apptainer")):
+            found = path
+            break
+    _HOST_PATH_CACHE["path"] = found
+    return found
+
+
+def _slurm_executable(tool_name, env=None):
+    environment = {**os.environ, **(env or {})}
+    search_path = environment.get("MDCLAW_SLURM_PATH", environment.get("PATH", os.defpath))
+    executable = shutil.which(tool_name, path=search_path)
+    return os.path.abspath(executable) if executable else None
+
+
+def check_external_tool(tool_name: str) -> bool:
+    """Resolve Slurm clients from an explicit search path or the current PATH."""
+    if tool_name in _SLURM_CLIENTS:
+        return _slurm_executable(tool_name) is not None
+    return _check_external_tool(tool_name)
+
+
+def run_command(cmd, cwd=None, timeout=None, capture_output=True, env=None, use_modules=False):
+    """Use the detected Slurm client without exporting submission-host mounts."""
+    if cmd and cmd[0] in _SLURM_CLIENTS:
+        executable = _slurm_executable(cmd[0], env)
+        if executable is None:
+            raise FileNotFoundError(f"Slurm client {cmd[0]!r} not found in its configured search path")
+        environment = {**os.environ, **(env or {})}
+        if cmd[0] == "sbatch" and (
+            environment.get("SINGULARITY_CONTAINER") or environment.get("APPTAINER_CONTAINER")
+        ):
+            # Singularity exports active binds; workers must not inherit mounts
+            # of this host's Slurm libraries. Empty values override merged env.
+            env = {**(env or {}), **dict.fromkeys(_CONTAINER_BIND_ENV, "")}
+            # sbatch hands its own environment to the job (--export=ALL), and
+            # this image's environment does not exist on the worker: LD_PRELOAD
+            # names a library the host cannot open, and PATH lacks the host's
+            # container runtime. Measured 2026-09-09 on Rikyu, a job submitted
+            # from inside the SIF failed with `singularity: command not found`.
+            # The host search path handed in through MDCLAW_SLURM_PATH is what
+            # the worker's PATH should be; container bookkeeping variables
+            # (APPTAINER_*, SINGULARITYENV_*, ...) are blanked the same way.
+            env.update(dict.fromkeys(_IMAGE_ONLY_ENV, ""))
+            env.update({key: "" for key in environment
+                        if key.startswith(_CONTAINER_ENV_PREFIXES)})
+            # Keep the system directories behind it: a Slurm-only search path
+            # hides /usr/bin, and `singularity --nv` binds nvidia-smi only
+            # when PATH resolves it (measured 2026-09-10 on n2: job 137274
+            # had no nvidia-smi with MDCLAW_SLURM_PATH=/usr/local/bin alone).
+            worker_path = host_search_path(environment)
+            if worker_path:
+                env["PATH"] = os.pathsep.join(dict.fromkeys(
+                    worker_path.split(os.pathsep) + _WORKER_SYSTEM_PATH))
+        cmd = [executable, *cmd[1:]]
+    return _run_command(
+        cmd, cwd=cwd, timeout=timeout, capture_output=capture_output,
+        env=env, use_modules=use_modules,
+    )
+
+
+# File-argument flags used to auto-extract bind paths for Singularity
+_FILE_ARG_PATTERN = re.compile(r"--[\w-]*file\s+(\S+)")
+
+
+_DIR_ARG_PATTERN = re.compile(r"--[\w-]*dir\s+(\S+)")
+
+
+_SUBMITTED_BATCH_JOB_RE = re.compile(r"^\s*Submitted batch job (\d+)\s*$")
+
+
+_SLURM_JOB_ID_RE = re.compile(r"^\d+(?:_\d+)?$")
+
+
+_SLURM_SUBMISSION_METADATA_KEYS = (
+    "slurm_job_id",
+    "slurm_script_file",
+    "slurm_stdout_log",
+    "slurm_stderr_log",
+    "slurm_submitted_at",
+    "slurm_array_task_id",
+    "slurm_parent_job_id",
+    "slurm_mps_slot",
+)
+
+
+_SLURM_SUBMISSION_INTENT_KEYS = (
+    "slurm_submission_intent_id",
+    "slurm_submission_kind",
+    "slurm_submission_intent_at",
+    "slurm_submission_prior_status",
+    # What check_job needs to adopt a job whose sbatch answer was lost.
+    "slurm_submission_job_name",
+    "slurm_submission_script_file",
+    "slurm_submission_stdout_log",
+    "slurm_submission_stderr_log",
+    "slurm_submission_uncertain_at",
+    "slurm_submission_error",
+)
+
+
+# Job tracking file
+_JOBS_JSONL = ".mdclaw_jobs.jsonl"
+
+
+logger = logging.getLogger(__name__)
+
+
+# Single patch point for externals shared across submodules.
+_PATCHABLE_EXTERNALS = (check_external_tool, run_command,)

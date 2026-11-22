@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% set active = 'archive' %}
+{% block title %}Archive &middot; AlphaFraud{% endblock %}
+
+{% block content %}
+  <h1>Weekly releases</h1>
+  <p class="sub">Every weekly PDB release since AlphaFold's 2018 cutoff, newest first — {{ weeks|length }}
+  weeks in all. The 50 most recent are shown; use “Show all” for the full history. Each week links to
+  its structures, with the count AlphaFold got confidently wrong.</p>
+  <div class="tablewrap">
+    <table id="archiveTable" data-visible="50">
+      <thead><tr><th>Week</th><th>Structures analysed</th><th>Confidently wrong</th></tr></thead>
+      <tbody>
+        {% for w in weeks %}
+        <tr{% if loop.index0 >= 50 %} class="wk-extra" hidden{% endif %}>
+          <td><a href="{{ url_for('week', label=w.week) }}">{{ w.week }}</a></td>
+          <td class="num">{{ w.n_analysed }}</td>
+          <td class="num">{{ w.n_cw }}</td>
+        </tr>
+        {% endfor %}
+        {% if not weeks %}<tr><td colspan="3">No releases yet.</td></tr>{% endif %}
+      </tbody>
+    </table>
+  </div>
+  {% if weeks|length > 50 %}
+  <button type="button" id="wkToggle" class="arc-toggle">Show all {{ weeks|length }} weeks ▾</button>
+  {% endif %}
+  <div class="dlbar"><button class="dl" onclick="downloadTableCsv('archiveTable','alphafraud_weeks.csv')">⬇ Download CSV</button></div>
+{% endblock %}

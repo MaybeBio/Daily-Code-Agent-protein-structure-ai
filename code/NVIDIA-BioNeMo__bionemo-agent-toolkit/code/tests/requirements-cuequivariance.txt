@@ -1,0 +1,2 @@
+# Use the CPU dependency revision shipped with the upstream skill.
+-r ../library-skills/cuequivariance/scripts/requirements.txt

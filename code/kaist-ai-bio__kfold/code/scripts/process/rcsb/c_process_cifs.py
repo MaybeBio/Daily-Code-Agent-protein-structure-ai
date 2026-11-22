@@ -1,0 +1,447 @@
+# Copyright 2026 Korea Advanced Institute of Science and Technology (KAIST)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Preprocess RCSB mmCIF files.
+
+This script processes mmCIF files from the RCSB PDB database.
+
+## Usage:
+```
+python c_process_rcsb.py
+    --cif_dir /path/to/mmCIF/           # Path to RCSB mmCIF files
+    --ccd_path /path/to/ccd.pkl         # Path to CCD pickled file
+    --out_dir /path/to/output_npz/      # Output Directory
+    --split train                       # Use predefined AlphaFold3 train split
+    --num_workers 120                   # Number of parallel workers
+```
+
+We follow similar processing and filtering criteria as in the AlphaFold3 paper. However,
+we also introduce additional filtering logic to extract high-quality structures for
+evaluation: `handle_invalid_chains="disallow"` in validation and test splits.
+This is to reduce biases due to extracting partial structures with valid chains only.
+"""
+
+import argparse
+import dataclasses
+import functools
+import logging
+import multiprocessing
+import os
+import pathlib
+from datetime import datetime
+
+import gemmi
+import msgpack
+from tqdm import tqdm
+
+import kfold.constants as C
+from kfold.data.types.ccd import CCD
+from kfold.data.types.metadata import Metadata
+from kfold.data.types.structure import RefStructure
+from kfold.training.preprocess import cif_factory
+from kfold.training.preprocess.structure_cleaning import clean_up_ref_structure
+
+# Error handling
+SUCCESS = 0
+FAILED = 1
+DATE_FILTERED = 2
+RESOLUTION_FILTERED = 3
+METHOD_FILTERED = 4
+INVALID_POLYMER_TYPES = 5
+CHAIN_COUNT_FILTERED = 6
+TOKEN_COUNT_FILTERED = 7
+SHORT_POLYMER_FILTERED = 8
+EMPTY_STRUCTURE_FILTERED = 9
+INVALID_CHAIN_FILTERED = 10
+
+STATUS_NAMES = {
+    SUCCESS: "success",
+    FAILED: "failed",
+    DATE_FILTERED: "date_filtered",
+    RESOLUTION_FILTERED: "resolution_filtered",
+    METHOD_FILTERED: "method_filtered",
+    INVALID_POLYMER_TYPES: "invalid_polymer_types",
+    CHAIN_COUNT_FILTERED: "chain_count_filtered",
+    TOKEN_COUNT_FILTERED: "token_count_filtered",
+    SHORT_POLYMER_FILTERED: "short_polymer_filtered",
+    EMPTY_STRUCTURE_FILTERED: "empty_structure_filtered",
+    INVALID_CHAIN_FILTERED: "invalid_chain_filtered",
+}
+
+
+@dataclasses.dataclass
+class DataFilter:
+    date_start: datetime = datetime.min
+    date_end: datetime = datetime.max
+    max_resolution: float | None = None
+    min_chains: int = 1
+    max_chains: int = 100_000  # A large number
+    min_tokens: int = 1
+    max_tokens: int = 1_000_000_000  # A large number
+    filter_nmr: bool = False
+    handle_invalid_chains: str = "allow"  # "allow" or "disallow"
+
+    def __post_init__(self):
+        if self.handle_invalid_chains not in ["allow", "disallow"]:
+            raise ValueError(
+                "handle_invalid_chains must be either 'allow' or 'disallow'."
+            )
+
+    def __repr__(self):
+        return (
+            f"DataFilter(\n"
+            f"  date_start={self.date_start},\n"
+            f"  date_end={self.date_end},\n"
+            f"  max_resolution={self.max_resolution},\n"
+            f"  min_chains={self.min_chains},\n"
+            f"  max_chains={self.max_chains},\n"
+            f"  min_tokens={self.min_tokens},\n"
+            f"  max_tokens={self.max_tokens},\n"
+            f"  filter_nmr={self.filter_nmr},\n"
+            f"  handle_invalid_chains='{self.handle_invalid_chains}'\n"
+            f")"
+        )
+
+
+SPLITS = {
+    "train": DataFilter(
+        date_start=datetime.min,
+        date_end=datetime.fromisoformat("2021-09-30 23:59:59"),
+        max_resolution=9.0,
+        max_chains=300,
+    ),
+    "val": DataFilter(
+        date_start=datetime.fromisoformat("2021-10-01 00:00:00"),
+        date_end=datetime.fromisoformat("2023-01-12 23:59:59"),
+        max_resolution=4.5,
+        max_chains=1000,
+        max_tokens=2560,
+        handle_invalid_chains="disallow",
+    ),
+    "test": DataFilter(
+        date_start=datetime.fromisoformat("2022-05-02 00:00:00"),
+        date_end=datetime.fromisoformat("2023-01-12 23:59:59"),
+        max_resolution=4.5,
+        max_chains=1000,
+        max_tokens=5120,
+        filter_nmr=True,
+        handle_invalid_chains="disallow",
+    ),
+}
+
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Process RCSB mmCIF files.")
+    parser.add_argument(
+        "--cif_dir",
+        type=pathlib.Path,
+        required=True,
+        help="Path to the `mmCIF/` directory from RCSB.",
+    )
+    parser.add_argument(
+        "--ccd_path",
+        type=pathlib.Path,
+        required=True,
+        help="Path to CCD pickled file.",
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=pathlib.Path,
+        required=True,
+        help="Path to output directory for processed .npz files.",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=None,
+        help="Output dataset directory name. Defaults to rcsb-{split}.",
+    )
+
+    # Predefined splits for date and resolution cutoffs
+    parser.add_argument(
+        "--split",
+        type=str,
+        required=True,
+        choices=["train", "val", "test"],
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=len(os.sched_getaffinity(0)),
+        help="Number of parallel workers.",
+    )
+    args = parser.parse_args()
+    return args
+
+
+_CCD_CACHE = None
+
+
+def init_worker(ccd_path):
+    """Initialize worker process with global CCD data."""
+    global _CCD_CACHE
+    _CCD_CACHE = CCD.load(ccd_path)
+
+
+def check_chain_count_cutoff(
+    raw_struct: gemmi.Structure,
+    min_chains: int,
+    max_chains: int,
+) -> bool:
+    """Returns True if the structure passes the chain count filter."""
+    num_polymer_chains = 0
+    for entity in raw_struct.entities:
+        if entity.entity_type == gemmi.EntityType.Polymer:
+            num_polymer_chains += len(entity.subchains)
+    return min_chains <= num_polymer_chains <= max_chains
+
+
+def check_residue_count_cutoff(
+    raw_struct: gemmi.Structure,
+    min_residues: int,
+    max_residues: int,
+) -> bool:
+    """Returns True if the structure passes the residue count filter."""
+    # Count total residues
+    n_residues = sum(len(chain) for chain in raw_struct[0].subchains())
+    return min_residues <= n_residues <= max_residues
+
+
+def parse_cif(
+    cif_path: pathlib.Path,
+    ccd: CCD,
+    out_path: pathlib.Path,
+    data_filter: DataFilter,
+) -> int:
+    """Parse a CIF file and return a gemmi.cif.Document object."""
+    if out_path.exists():
+        return SUCCESS
+
+    # Read CIF file
+    if cif_path.suffix == ".gz":
+        doc: gemmi.cif.Document = gemmi.cif.read(str(cif_path))
+    else:
+        doc: gemmi.cif.Document = gemmi.cif.read_file(str(cif_path))
+    block: gemmi.cif.Block = doc[0]
+
+    # Get metadata without chain information
+    # Handle cases like "1abc.cif.gz"
+    pdb_id = cif_path.name.split(".")[0].lower()
+    metadata: Metadata = cif_factory.prepare_metadata_from_rcsb(pdb_id, block)
+
+    # Filter by date
+    if not cif_factory.check_date_cutoff(
+        metadata, data_filter.date_start, data_filter.date_end
+    ):
+        return DATE_FILTERED
+
+    # Filter by experimental method (NMR)
+    if data_filter.filter_nmr:
+        exclude_methods = C.training.NMR_METHODS
+        if not cif_factory.check_method(metadata, exclude_methods):
+            return METHOD_FILTERED
+
+    # Filter by resolution
+    if data_filter.max_resolution is not None:
+        if not cif_factory.check_resolution_cutoff(
+            metadata, data_filter.max_resolution, skip_nmr=True
+        ):
+            return RESOLUTION_FILTERED
+
+    # Prepare gemmi structure
+    raw_struct: gemmi.Structure = gemmi.make_structure_from_block(block)
+    cif_factory.expand_first_assembly(raw_struct)
+    cif_factory.clean_up_gemmi_structure(raw_struct)
+
+    # Filter by chain count
+    if not check_chain_count_cutoff(
+        raw_struct, data_filter.min_chains, data_filter.max_chains
+    ):
+        return CHAIN_COUNT_FILTERED
+
+    # Filter by token count with naive residue counting
+    # NOTE: Only applied when invalid chains are disallowed since
+    # partial structures may skew the token count.
+    if data_filter.handle_invalid_chains == "disallow":
+        if not check_residue_count_cutoff(
+            raw_struct, data_filter.min_tokens, data_filter.max_tokens
+        ):
+            return TOKEN_COUNT_FILTERED
+
+    # Filter out invalid polymer types (e.g., PNA)
+    valid_polymer_types = {
+        gemmi.PolymerType.PeptideL,
+        gemmi.PolymerType.Dna,
+        gemmi.PolymerType.Rna,
+    }
+    if data_filter.handle_invalid_chains == "disallow":
+        for entity in raw_struct.entities:
+            if (
+                entity.entity_type == gemmi.EntityType.Polymer
+                and entity.polymer_type not in valid_polymer_types
+            ):
+                return INVALID_POLYMER_TYPES
+
+    # Prepare reference structure with chain metadata
+    ref_struct: RefStructure = cif_factory.prepare_ref_structure(
+        raw_struct, metadata, ccd
+    )
+    # Insert coordinates
+    cif_factory.insert_coordinates(ref_struct, raw_struct, metadata)
+
+    # Validate target (AF3 SI 2.5.4: Filtering of targets)
+    if not cif_factory.validate_target(ref_struct):
+        return SHORT_POLYMER_FILTERED
+
+    # Identify invalid chains
+    invalid_chains: set[int] = set()
+
+    # Validate chain geometry
+    cif_factory.validate_chain_geometry(ref_struct, invalid_chains)
+
+    # Get interfaces and those metadata; Detect clashes
+    cif_factory.detect_interfaces_and_detect_clashes(ref_struct, invalid_chains)
+
+    # Detect orphaned branched ligands
+    cif_factory.propagate_invalidity_to_ligands(ref_struct, invalid_chains)
+
+    if data_filter.handle_invalid_chains == "disallow" and len(invalid_chains) > 0:
+        return INVALID_CHAIN_FILTERED
+
+    # Drop invalid chains
+    cif_factory.prune_invalid_chains(ref_struct, invalid_chains)
+
+    # Final checks
+    if ref_struct.num_chains == 0:
+        return EMPTY_STRUCTURE_FILTERED
+    if ref_struct.num_polymer_chains == 0:
+        return EMPTY_STRUCTURE_FILTERED
+    if not (
+        data_filter.min_chains <= ref_struct.num_polymer_chains <= data_filter.max_chains
+    ):
+        return CHAIN_COUNT_FILTERED
+    if not (data_filter.min_tokens <= ref_struct.num_tokens <= data_filter.max_tokens):
+        return TOKEN_COUNT_FILTERED
+
+    # Persist bond cleaning once, rather than repeating it during training.
+    ref_struct = clean_up_ref_structure(ref_struct)
+
+    # Validate final structure
+    ref_struct.validate()
+
+    # Save output if path is given
+    ref_struct.save_npz(out_path)
+    return SUCCESS
+
+
+def worker_fn(
+    cif_path: pathlib.Path,
+    output_dir: pathlib.Path,
+    data_filter: DataFilter,
+) -> tuple[str, int]:
+    global _CCD_CACHE
+    ccd = _CCD_CACHE
+    assert ccd is not None, "CCD data not initialized in worker."
+
+    # Output path
+    pdb_id = cif_path.name.split(".")[0].lower()
+    out_path = output_dir / pdb_id[1:3] / f"{pdb_id}.npz"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        status = parse_cif(cif_path, ccd, out_path, data_filter)
+    except Exception as e:
+        print(f"Failed to process ({pdb_id}): {e}")
+        status = FAILED
+    return pdb_id, status
+
+
+def main():
+    """Main function to process RCSB mmCIF files"""
+    args = parse_args()
+    cif_dir: pathlib.Path = args.cif_dir
+    dataset_name = args.dataset_name or f"rcsb-{args.split}"
+    data_dir: pathlib.Path = args.data_dir / dataset_name
+
+    out_dir: pathlib.Path = data_dir / "npz"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    assert args.ccd_path.exists(), f"CCD file not found: {args.ccd_path}"
+
+    # Apply split defaults if specified
+    print(f"Applying KFold {args.split} split parameters...")
+    data_filter = SPLITS[args.split]
+    print(data_filter)
+
+    # Prepare partial function for multiprocessing
+    worker_wrapped = functools.partial(
+        worker_fn,
+        output_dir=out_dir,
+        data_filter=data_filter,
+    )
+
+    cif_paths = sorted(
+        path
+        for path in cif_dir.rglob("*")
+        if path.is_file()
+        and path.name.endswith((".cif", ".cif.gz", ".mmcif", ".mmcif.gz"))
+    )
+    print(f"Found {len(cif_paths)} mmCIF files to process.")
+    with multiprocessing.Pool(
+        args.num_workers,
+        initializer=init_worker,
+        initargs=(args.ccd_path,),
+    ) as pool:
+        results = list(
+            tqdm(
+                pool.imap_unordered(worker_wrapped, cif_paths),
+                total=len(cif_paths),
+                desc="Processing RCSB mmCIF files",
+            )
+        )
+    print("Processing completed.")
+
+    status_by_id = dict(sorted(results))
+    status_path = data_dir / "processing_status.msgpack"
+    with open(status_path, "wb") as f:
+        msgpack.pack(
+            {
+                "status_names": {str(k): v for k, v in STATUS_NAMES.items()},
+                "entries": status_by_id,
+            },
+            f,
+        )
+    statuses = list(status_by_id.values())
+    print(f"Saved per-entry processing status to {status_path}")
+
+    # Print stats
+    print("Processing statistics:")
+    print(f"  Total files processed: {len(statuses)}")
+    print(f"  Successfully processed: {statuses.count(SUCCESS)}")
+    print(f"  Failed to process: {statuses.count(FAILED)}")
+    print(f"  Date filtered: {statuses.count(DATE_FILTERED)}")
+    print(f"  Resolution filtered: {statuses.count(RESOLUTION_FILTERED)}")
+    print(f"  Method filtered: {statuses.count(METHOD_FILTERED)}")
+    print(f"  Invalid polymer types filtered: {statuses.count(INVALID_POLYMER_TYPES)}")
+    print(f"  Chain count filtered: {statuses.count(CHAIN_COUNT_FILTERED)}")
+    print(f"  Token count filtered: {statuses.count(TOKEN_COUNT_FILTERED)}")
+    print(f"  Short polymer filtered: {statuses.count(SHORT_POLYMER_FILTERED)}")
+    print(f"  Empty structure filtered: {statuses.count(EMPTY_STRUCTURE_FILTERED)}")
+    print(f"  Invalid chain filtered: {statuses.count(INVALID_CHAIN_FILTERED)}")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING)
+    main()

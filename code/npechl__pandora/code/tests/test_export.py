@@ -1,0 +1,313 @@
+from pathlib import Path
+
+import pytest
+
+from pandora.canonicalisation import canonicalise_structure
+from pandora.export import (
+    export_chain_mmcif,
+    read_records,
+    structure_to_mmcif,
+    write_fasta,
+    write_json,
+    write_records,
+)
+from pandora.parsing import mmcif_to_structure
+from pandora.schemas.canonicalisation import (
+    AssemblyRules,
+    ChainCopyRecord,
+    ChainIdRules,
+    IdentifierRules,
+    IncompleteChainRules,
+    LigandRules,
+    MissingAtomsRules,
+    MissingDataRules,
+    ResidueNumberingRules,
+    canonicalisationPolicy,
+)
+from pandora.schemas.dataset import ChainRecord, DatasetChainRecord
+from pandora.schemas.provenance import CanonicalisationEntryRecord
+
+MMCIF_DIR = Path(__file__).parent.parent / "datasets" / "dev" / "mmcif"
+MMCIF_PATH = MMCIF_DIR / "ay" / "1ayi.cif"
+
+
+def test_structure_to_mmcif_round_trips_core_fields(tmp_path):
+    structure, _, _ = mmcif_to_structure(str(MMCIF_PATH))
+
+    out_path = structure_to_mmcif(structure, tmp_path / "1ayi.out.cif")
+    reparsed, _, status = mmcif_to_structure(str(out_path))
+
+    assert status in ("success", "warning")
+    assert reparsed.entry_id == structure.entry_id
+    assert len(reparsed.atoms) == len(structure.atoms)
+    assert {e.id for e in reparsed.entities} == {
+        e.id for e in structure.entities
+    }
+    assert len(reparsed.assemblies) == len(structure.assemblies)
+
+
+def test_structure_to_mmcif_keeps_real_struct_conn(tmp_path):
+    path = MMCIF_DIR / "04" / "104m.cif"
+    structure, _, _ = mmcif_to_structure(str(path))
+
+    out_path = structure_to_mmcif(structure, tmp_path / "104m.out.cif")
+    reparsed, _, _ = mmcif_to_structure(str(out_path))
+
+    assert structure.connections
+    assert reparsed.connections == structure.connections
+
+
+def test_export_chain_mmcif_keeps_only_that_chain(tmp_path):
+    structure, _, _ = mmcif_to_structure(str(MMCIF_PATH))
+    all_chain_ids = {a.label_asym_id for a in structure.atoms}
+    assert "B" in all_chain_ids and len(all_chain_ids) > 1
+
+    out_path = export_chain_mmcif(structure, "B", tmp_path / "1ayi_B.cif")
+    reparsed, _, status = mmcif_to_structure(str(out_path))
+
+    assert status in ("success", "warning")
+    assert {a.label_asym_id for a in reparsed.atoms} == {"B"}
+    assert len(reparsed.atoms) == sum(
+        1 for a in structure.atoms if a.label_asym_id == "B"
+    )
+
+
+def test_write_json_round_trips(tmp_path):
+
+    structure, _, _ = mmcif_to_structure(str(MMCIF_PATH))
+
+    out_path = write_json(structure.entry, tmp_path / "entry.json")
+
+    assert out_path.exists()
+    loaded = type(structure.entry).model_validate_json(out_path.read_text())
+    assert loaded == structure.entry
+
+
+def test_write_records_jsonl_and_json(tmp_path):
+    records = [
+        ChainRecord(
+            entry_id="1ayi",
+            chain_id="A",
+            entity_id="1",
+            residue_count=10,
+            atom_count=80,
+        )
+    ]
+
+    jsonl_path = write_records(records, tmp_path / "chains.jsonl")
+    json_path = write_records(records, tmp_path / "chains.json")
+
+    assert jsonl_path.read_text().strip().count("\n") == 0
+    reloaded = ChainRecord.model_validate_json(jsonl_path.read_text().strip())
+    assert reloaded == records[0]
+
+    import json
+
+    assert json.loads(json_path.read_text()) == [records[0].model_dump()]
+
+
+def test_write_records_rejects_empty_and_bad_suffix(tmp_path):
+    with pytest.raises(ValueError):
+        write_records([], tmp_path / "empty.json")
+
+    record = ChainRecord(
+        entry_id="1ayi",
+        chain_id="A",
+        entity_id="1",
+        residue_count=1,
+        atom_count=1,
+    )
+    with pytest.raises(ValueError):
+        write_records([record], tmp_path / "chains.csv")
+
+
+def test_write_records_parquet(tmp_path):
+    pytest.importorskip("pandas")
+    pytest.importorskip("pyarrow")
+    pd = pytest.importorskip("pandas")
+
+    record = ChainRecord(
+        entry_id="1ayi",
+        chain_id="A",
+        entity_id="1",
+        residue_count=1,
+        atom_count=1,
+    )
+    out_path = write_records([record], tmp_path / "chains.parquet")
+
+    df = pd.read_parquet(out_path)
+    assert df.iloc[0]["chain_id"] == "A"
+
+
+def test_truncated_structure_round_trips_through_mmcif(tmp_path):
+    structure, _, _ = mmcif_to_structure(str(MMCIF_DIR / "0m" / "10mv.cif"))
+    policy = canonicalisationPolicy(
+        policy_id="p",
+        policy_name="p",
+        policy_version="1.0.0",
+        missing_data_rules=MissingDataRules(
+            incomplete_chains=IncompleteChainRules(
+                strategy="truncate_to_complete_regions"
+            )
+        ),
+    )
+    canonical, _, _ = canonicalise_structure(structure, policy)
+    path = tmp_path / "10mv.cif"
+    structure_to_mmcif(canonical, str(path))
+    reparsed, _, status = mmcif_to_structure(str(path))
+    assert reparsed is not None, status
+
+
+def test_expanded_assembly_round_trips_through_mmcif(tmp_path):
+    # 1a08: assembly 1 is chains A, B (+ ligands); C, D, G, H are dropped.
+    structure, _, _ = mmcif_to_structure(str(MMCIF_DIR / "a0" / "1a08.cif"))
+    policy = canonicalisationPolicy(
+        policy_id="p",
+        policy_name="p",
+        policy_version="1.0.0",
+        assembly_rules=AssemblyRules(
+            strategy="standardize_biological_assembly"
+        ),
+    )
+    canonical, _, _ = canonicalise_structure(structure, policy)
+    path = tmp_path / "1a08.cif"
+    structure_to_mmcif(canonical, str(path))
+    reparsed, _, status = mmcif_to_structure(str(path))
+    assert reparsed is not None, status
+
+
+@pytest.mark.parametrize(
+    "rules",
+    [
+        {
+            "identifier_rules": IdentifierRules(
+                chain_id=ChainIdRules(strategy="remap")
+            )
+        },
+        {
+            "identifier_rules": IdentifierRules(
+                chain_id=ChainIdRules(strategy="use_auth_chain_id")
+            )
+        },
+        {
+            "identifier_rules": IdentifierRules(
+                residue_numbering=ResidueNumberingRules(strategy="renumber")
+            )
+        },
+        {
+            "identifier_rules": IdentifierRules(
+                residue_numbering=ResidueNumberingRules(strategy="use_auth_seq")
+            )
+        },
+        {
+            "missing_data_rules": MissingDataRules(
+                missing_atoms=MissingAtomsRules(strategy="drop_partial_residue")
+            )
+        },
+        {
+            "ligand_rules": LigandRules(
+                strategy="filter", keep_waters=False, keep_ions=False
+            )
+        },
+    ],
+    ids=[
+        "remap",
+        "auth_chain",
+        "renumber",
+        "auth_seq",
+        "drop_partial",
+        "ligands",
+    ],
+)
+@pytest.mark.parametrize("entry_id", ["13dg", "1a08", "10mv", "1aui"])
+def test_canonical_structure_round_trips_through_mmcif(
+    entry_id, rules, tmp_path
+):
+    structure, _, _ = mmcif_to_structure(
+        str(MMCIF_DIR / entry_id[1:3] / f"{entry_id}.cif")
+    )
+    policy = canonicalisationPolicy(
+        policy_id="p", policy_name="p", policy_version="1.0.0", **rules
+    )
+    canonical, _, _ = canonicalise_structure(structure, policy)
+    path = tmp_path / f"{entry_id}.cif"
+    structure_to_mmcif(canonical, str(path))
+    reparsed, _, status = mmcif_to_structure(str(path))
+    assert reparsed is not None, status
+
+
+def test_write_fasta_strips_whitespace(tmp_path):
+    path = write_fasta(
+        {"1abc_A": "MKT\nAYI ", "1abc_B": "GG"}, tmp_path / "out" / "s.fasta"
+    )
+
+    assert path.read_text() == ">1abc_A\nMKTAYI\n>1abc_B\nGG\n"
+
+
+def test_structure_to_mmcif_refuses_structure_without_atoms(tmp_path):
+    structure, _, _ = mmcif_to_structure(str(MMCIF_PATH))
+    empty = structure.model_copy(update={"atoms": []})
+
+    with pytest.raises(ValueError, match="no atoms"):
+        structure_to_mmcif(empty, tmp_path / "empty.cif")
+
+    assert not (tmp_path / "empty.cif").exists()
+
+
+@pytest.mark.parametrize("suffix", [".jsonl", ".json", ".parquet"])
+def test_read_records_round_trips_with_nulls(tmp_path, suffix):
+    rows = [
+        DatasetChainRecord(
+            entry_id="1ABC",
+            chain_id="A",
+            entity_id="1",
+            residue_count=1,
+            atom_count=1,
+        ),
+        DatasetChainRecord(
+            entry_id="1ABC",
+            chain_id="A_2",
+            entity_id="1",
+            residue_count=1,
+            atom_count=1,
+            copy_of="A",
+            resolution=2.0,
+        ),
+    ]
+    path = write_records(rows, tmp_path / f"t{suffix}")
+    assert read_records(path, DatasetChainRecord) == rows
+
+
+def test_read_records_list_columns_parquet(tmp_path):
+    copy = ChainCopyRecord(
+        entry_id="1", chain_id="A_2", source_chain_id="A", operator_id="2"
+    )
+    entry = CanonicalisationEntryRecord(
+        entry_id="1",
+        policy_id="p",
+        policy_name="n",
+        policy_version="1",
+        canonicalised_at="t",
+        transforms=["a:b"],
+    )
+    for record in (copy, entry):
+        model = type(record)
+        path = write_records([record], tmp_path / f"{model.__name__}.parquet")
+        assert read_records(path, model) == [record]
+
+
+def test_read_records_rejects_bad_suffix(tmp_path):
+    with pytest.raises(ValueError):
+        read_records(tmp_path / "x.csv", ChainCopyRecord)
+
+
+def test_structure_to_mmcif_writes_single_row_categories_as_pairs(tmp_path):
+    # As the PDB does (`_entry.id 1AYI` on one line); tools such as COCaDA
+    # read the value from the same line as the key.
+    structure, _, _ = mmcif_to_structure(str(MMCIF_PATH))
+
+    text = structure_to_mmcif(structure, tmp_path / "1ayi.cif").read_text()
+
+    assert "_entry.id 1AYI\n" in text
+    assert "loop_\n_entry.id" not in text
+    assert "loop_\n_atom_site.group_PDB" in text

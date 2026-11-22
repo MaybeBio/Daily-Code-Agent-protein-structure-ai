@@ -1,0 +1,131 @@
+"""Only complete study requests are prefilled; missing experiment inputs stay explicit."""
+
+
+def study_request(capability, objects, sequences, *, antibody=None):
+    if capability == "rmsd":
+        from ...structure_comparison.contract import StructureComparisonTask
+
+        reference = objects["comparison_reference"].reference
+        moving = objects["comparison_moving"].reference
+        return StructureComparisonTask(
+            name="STAT6 · DNA-free vs DNA-bound phosphorylated dimer",
+            reference=reference,
+            moving=moving,
+            scientific_inputs=[reference, moving],
+            options={
+                "purpose": "conformational_comparison",
+                "correspondence": "author_numbering",
+                "target_mapping": [{"reference": "A", "moving": "A"}],
+                "partner_mapping": [{"reference": "B", "moving": "C"}],
+            },
+        ).model_dump(mode="json")
+    if capability == "biopython.exposure" and "receptor" not in objects:
+        return None
+    if capability == "biopython.ensemble" and "receptor_a" not in objects:
+        return None
+    if (
+        capability in {"gnina.dock", "caver.paths", "apbs.potential", "diffsbdd.generate"}
+        and "receptor" not in objects
+    ):
+        return None
+    if capability in {"diffsbdd.prepare", "ligandmpnn.design"} and "structure" not in objects:
+        return None
+
+    def reference(key):
+        return objects[key].reference.model_dump(mode="json")
+
+    if capability == "predict":
+        has_msa = "prediction_msa" in objects
+        return {
+            "operation": "predict",
+            "name": "STAT6 · defined-molecule complex prediction",
+            "components": [
+                {
+                    "kind": "protein",
+                    "value": sequences["protein"],
+                    "count": 1,
+                    "chain_ids": ["A"],
+                    "source_sequence": str(objects["protein_sequence"].reference.asset_id),
+                    **(
+                        {"unpaired_msa": str(objects["prediction_msa"].reference.asset_id)}
+                        if has_msa
+                        else {}
+                    ),
+                },
+                {
+                    "kind": "ligand",
+                    "value": "",
+                    "count": 1,
+                    "chain_ids": ["B"],
+                    "ligand_file": str(objects["ligand"].reference.asset_id),
+                },
+            ],
+            "parameters": {
+                "samples": 1,
+                "seed": 20261009,
+                "model": "standard",
+                "feature_mode": "uploaded" if has_msa else "none",
+                "allow_network": False,
+            },
+            "scientific_inputs": [
+                reference("protein_sequence"),
+                reference("ligand"),
+                *([reference("prediction_msa")] if has_msa else []),
+            ],
+        }
+    if capability == "p2rank.detect":
+        return {
+            "operation": "pocket_search",
+            "name": "STAT6 · candidate pockets",
+            "protein": reference("receptor"),
+            "profile": "experimental",
+            "threads": 4,
+            "memory_mib": 2048,
+            "point_threshold": 0.4,
+            "minimum_cluster": 3,
+            "review_limit": 20,
+        }
+    if capability == "discovery.import":
+        return {
+            "operation": "reference_import",
+            "name": "STAT6 · experimental reference",
+            "source": "pdb",
+            "identifier": "9BIG",
+            "format": "cif",
+            "allow_external": True,
+        }
+    if capability == "discovery.target":
+        return {
+            "operation": "target_research",
+            "name": "STAT6 · target evidence",
+            "entity": "target",
+            "identifier": "ENSG00000166888",
+            "allow_external": True,
+        }
+    if capability == "library.import":
+        molecule = reference("ligand")
+        return {
+            "operation": "library_prepare",
+            "name": "STAT6 · supplied study molecule",
+            "inputs": [{"role": "data", "source": molecule}],
+            "scientific_inputs": [molecule],
+            "sources": [],
+            "payload": {
+                "kind": "chemistry",
+                "mode": "prepare",
+                "supplier": "custom",
+                "library_name": "STAT6 study input",
+                "id_column": "_Name",
+                "smiles_column": "SMILES",
+                "source_permission": "user_owned_file",
+            },
+        }
+    from .harness_requests import harness_study
+    from .integrated_requests import integrated_study
+    from .task_requests import study_task
+
+    return (
+        integrated_study(capability, objects, sequences)
+        or harness_study(capability, objects, sequences, antibody=antibody)
+        or study_task(capability, objects, sequences)
+    )

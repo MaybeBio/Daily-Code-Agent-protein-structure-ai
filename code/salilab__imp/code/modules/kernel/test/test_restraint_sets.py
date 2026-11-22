@@ -1,0 +1,417 @@
+import IMP
+import IMP.core
+import IMP.test
+import pickle
+try:
+    import jax
+except ImportError:
+    jax = None
+
+
+class JAXMultiConstRestraint(IMP.Restraint):
+    """Like IMP._ConstRestraint but supporting get_jax_multiple()"""
+    def __init__(self, m, ps, value, multi_value):
+        super().__init__(m, "JAXMultiConstRestraint%1%")
+        self.m, self.ps = m, ps
+        self.value, self.multi_value = value, multi_value
+
+    def do_get_inputs(self):
+        return self.ps
+
+    def _get_jax(self, space):
+        return self._wrap_jax(lambda jm: self.value)
+
+    @classmethod
+    def _get_jax_multiple(cls, restraints, space):
+        import jax.numpy as jnp
+        ours, rest = [], []
+        for r in restraints:
+            (ours if isinstance(r, cls) else rest).append(r)
+        if ours:
+            values = jnp.array([r.multi_value * r.get_weight() for r in ours])
+            return [cls._wrap_jax_multiple(ours[0], lambda jm: values)], rest
+        else:
+            return None, restraints
+
+
+class LinkScoreState(IMP.ScoreState):
+    """ScoreState that links one particle to another"""
+
+    def __init__(self, m, pin, pout):
+        super().__init__(m, "LinkScoreState%1%")
+        self.pin, self.pout = pin, pout
+
+    def do_before_evaluate(self):
+        pass
+
+    def do_after_evaluate(self, accum):
+        pass
+
+    def do_get_inputs(self):
+        return [self.pin]
+
+    def do_get_outputs(self):
+        return [self.pout]
+
+
+class LogRestraint(IMP.Restraint):
+    """Restraint that logs how it was called (or skipped)"""
+
+    def __init__(self, m, ps, value):
+        super().__init__(m, 'LogRestraint%1%')
+        self.ps = ps
+        self.value = value
+        self.moved_evaluate = None
+
+    def unprotected_evaluate(self, accum):
+        self.moved_evaluate = False
+        return self.value
+
+    def unprotected_evaluate_moved(self, accum, moved_pis, reset_pis):
+        self.moved_evaluate = True
+        return self.value
+
+    def do_get_inputs(self):
+        return self.ps
+
+
+class Tests(IMP.test.TestCase):
+
+    """Test RestraintSets"""
+
+    def _make_stuff(self):
+        m = IMP.Model("restraint sets")
+        rs = IMP.RestraintSet(m, .5, "RS.5")
+        r0 = IMP._ConstRestraint(m, [], 1)
+        rs.add_restraint(r0)
+        r1 = IMP._ConstRestraint(m, [], 1)
+        rs.add_restraint(r1)
+        r2 = IMP._ConstRestraint(m, [], 1)
+        return (m, rs, r0, r1, r2)
+
+    def test_printing(self):
+        """Test that sets can be printed"""
+        (m, rs, r0, r1, r2) = self._make_stuff()
+        sf = IMP.core.RestraintsScoringFunction([rs, r2])
+        self.assertEqual(sf.evaluate(False), 2)
+        print(rs)
+
+    def test_aggregate(self):
+        """Test get_is_aggregate()"""
+        m, rs, r0, r1, r2 = self._make_stuff()
+        self.assertFalse(r1.get_is_aggregate())
+        self.assertTrue(rs.get_is_aggregate())
+
+    def test_pickle(self):
+        """Test that RestraintSet can be (un-)pickled"""
+        m, rs, r0, r1, r2 = self._make_stuff()
+        rs.set_name("foo")
+        r0.set_name("bar")
+        r1.set_name("baz")
+        self.assertEqual(rs.evaluate(False), 1)
+        dump = pickle.dumps(rs)
+        newrs = pickle.loads(dump)
+        self.assertEqual(newrs.get_name(), "foo")
+        self.assertEqual([r.get_name() for r in newrs.restraints],
+                         ["bar", "baz"])
+        self.assertEqual(newrs.evaluate(False), 1)
+
+    def test_pickle_polymorphic(self):
+        """Test that RestraintSet can be (un-)pickled via polymorphic pointer"""
+        m = IMP.Model()
+        rs1 = IMP.RestraintSet(m, 2.0)
+        rs1.restraints.append(IMP._ConstRestraint(m, [], 1))
+        rs2 = IMP.RestraintSet(m, 12.0)
+        rs2.restraints.append(rs1)
+        self.assertEqual(rs2.evaluate(False), 24.)
+        dump = pickle.dumps(rs2)
+        newrs2 = pickle.loads(dump)
+        self.assertEqual(newrs2.evaluate(False), 24.)
+
+    def test_restraints(self):
+        """Check access to RestraintSet's restraints"""
+        (m, rs, r0, r1, r2) = self._make_stuff()
+        rsrs = rs.get_restraints()
+        self.assertEqual(rsrs.count(r0), 1)
+        self.assertEqual(rsrs.count(r1), 1)
+        self.assertEqual(rsrs.count(r2), 0)
+        # Use Python listlike object
+        self.assertEqual(len(rs.restraints), 2)
+        self.assertEqual(rs.restraints.index(r0), 0)
+        self.assertEqual(rs.restraints.index(r1), 1)
+        self.assertRaises(ValueError, rs.restraints.index, r2)
+
+    def test_restraints_weights(self):
+        """Check weights on restraints"""
+        (m, rs, r0, r1, r2) = self._make_stuff()
+        self.assertEqual(rs.evaluate(False), 1)
+        self.assertEqual(r0.evaluate(False), 1)
+        r0.set_weight(0)
+        self.assertEqual(r0.evaluate(False), 0)
+        self.assertEqual(rs.evaluate(False), .5)
+
+    def test_evaluate(self):
+        """Test evaluate() of RestraintSets and their children"""
+        (m, rs, r0, r1, r2) = self._make_stuff()
+        self.assertEqual(rs.evaluate(False), 1)
+        self.assertEqual(r0.evaluate(False), 1)
+
+    def test_evaluate_2(self):
+        """Test restraints added multiple times"""
+        (m, rs, r0, r1, r2) = self._make_stuff()
+        sf = IMP.core.RestraintsScoringFunction([rs, r2, r0])
+        self.assertEqual(sf.evaluate(False), 3)
+
+    def test_removed(self):
+        """Test that restraints are usable after set is destroyed"""
+        (m, rs, r0, r1, r2) = self._make_stuff()
+        print("print removed", r1.evaluate(False))
+        del rs
+        print("destroyed", r1.evaluate(False))
+
+    def test_evaluate_moved(self):
+        """Test scoring with moved particles"""
+        def assert_restraint_skipped(r):
+            # In debug mode restraints aren't actually skipped; they
+            # evaluated and the score is checked against the 'skipped' score
+            if IMP.get_check_level() >= IMP.USAGE_AND_INTERNAL:
+                assert_restraint_evaluate_moved(r)
+            else:
+                self.assertIsNone(r.moved_evaluate)
+
+        def assert_restraint_evaluate(r):
+            self.assertFalse(r.moved_evaluate)
+
+        def assert_restraint_evaluate_moved(r):
+            self.assertTrue(r.moved_evaluate)
+        m = IMP.Model()
+        p1 = IMP.Particle(m)
+        p2 = IMP.Particle(m)
+        p3 = IMP.Particle(m)
+        p4 = IMP.Particle(m)
+        ss = LinkScoreState(m, p3, p4)
+        m.add_score_state(ss)
+        r1 = LogRestraint(m, [p1], 100.0)
+        r4 = LogRestraint(m, [p4], 10.0)
+        rs = IMP.RestraintSet(m, 1.0, 'rs')
+        innerrs = IMP.RestraintSet(m, 1.0, 'rs')
+        innerrs.add_restraints([r1, r4])
+        rs.add_restraint(innerrs)
+
+        def clear_restraints():
+            r1.moved_evaluate = r4.moved_evaluate = None
+        # Plain evaluate should *not* call the evaluate_moved method on r1,r4
+        clear_restraints()
+        self.assertAlmostEqual(rs.evaluate(False), 110.0, delta=1e-6)
+        assert_restraint_evaluate(r1)
+        assert_restraint_evaluate(r4)
+
+        # If we move p1, r1 should be evaluate_moved, r4 skipped
+        # (and score should be unchanged, of course)
+        clear_restraints()
+        self.assertAlmostEqual(rs.evaluate_moved(False, [p1], []),
+                               110.0, delta=1e-6)
+        assert_restraint_evaluate_moved(r1)
+        assert_restraint_skipped(r4)
+
+        # No restraints depend on p2
+        clear_restraints()
+        self.assertAlmostEqual(rs.evaluate_moved(False, [p2], []),
+                               110.0, delta=1e-6)
+        assert_restraint_skipped(r1)
+        assert_restraint_skipped(r4)
+
+        # If we move p3, p4 is touched (by the LinkScoreState) so r4 should
+        # be evaluate_moved
+        clear_restraints()
+        self.assertAlmostEqual(rs.evaluate_moved(False, [p3], []),
+                               110.0, delta=1e-6)
+        assert_restraint_skipped(r1)
+        assert_restraint_evaluate_moved(r4)
+
+        # p4 causes r4 to be updated
+        clear_restraints()
+        self.assertAlmostEqual(rs.evaluate_moved(False, [p4], []),
+                               110.0, delta=1e-6)
+        assert_restraint_skipped(r1)
+        assert_restraint_evaluate_moved(r4)
+
+        # reset particles should skip evaluation
+        clear_restraints()
+        self.assertAlmostEqual(rs.evaluate_moved(False, [p2], [p4]),
+                               110.0, delta=1e-6)
+        assert_restraint_skipped(r1)
+        assert_restraint_skipped(r4)
+
+        # Moves of multiple particles are not specially handled but will
+        # pass through to evaluate_moved
+        clear_restraints()
+        self.assertAlmostEqual(rs.evaluate_moved(False, [p1, p2], []),
+                               110.0, delta=1e-6)
+        assert_restraint_evaluate_moved(r1)
+        assert_restraint_evaluate_moved(r4)
+
+        # Moves with derivatives are not specially handled but will
+        # pass through to evaluate_moved
+        clear_restraints()
+        self.assertAlmostEqual(rs.evaluate_moved(True, [p1], []),
+                               110.0, delta=1e-6)
+        assert_restraint_evaluate_moved(r1)
+        assert_restraint_evaluate_moved(r4)
+
+        # Changes in weights should be handled
+        innerrs.set_weight(2.)
+        self.assertAlmostEqual(rs.evaluate_moved(False, [p1], []),
+                               220.0, delta=1e-6)
+        innerrs.set_weight(1.)
+
+        # Changing weight of an evaluated restraint should be OK
+        r1.set_weight(2.)
+        clear_restraints()
+        self.assertAlmostEqual(rs.evaluate_moved(False, [p1], []),
+                               210.0, delta=1e-6)
+        assert_restraint_evaluate_moved(r1)
+        assert_restraint_skipped(r4)
+
+        # Changing weight of a skipped restraint should be OK
+        clear_restraints()
+        self.assertAlmostEqual(rs.evaluate_moved(False, [p4], []),
+                               210.0, delta=1e-6)
+        assert_restraint_skipped(r1)
+        assert_restraint_evaluate_moved(r4)
+
+        # Cache should be cleared since we changed the dependency graph here;
+        # now moving p1 should force recalc of r1 *and* r4
+        clear_restraints()
+        ss2 = LinkScoreState(m, p1, p4)
+        m.add_score_state(ss2)
+        self.assertAlmostEqual(rs.evaluate_moved(False, [p1], []),
+                               210.0, delta=1e-6)
+        assert_restraint_evaluate_moved(r1)
+        assert_restraint_evaluate_moved(r4)
+
+        # Newly-added restraints should use regular evaluate to get first score
+        clear_restraints()
+        r3 = LogRestraint(m, [p3], 30.0)
+        r3.moved_evaluate = None
+        innerrs.add_restraint(r3)
+        self.assertAlmostEqual(rs.evaluate_moved(False, [p4], []),
+                               240.0, delta=1e-6)
+        assert_restraint_skipped(r1)
+        assert_restraint_evaluate(r3)
+        assert_restraint_evaluate_moved(r4)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_score(self):
+        """Test JAX RestraintSet score"""
+        import IMP.jax
+        m = IMP.Model()
+        p = IMP.Particle(m)
+        r1 = IMP._ConstRestraint(m, [p], 42)
+        r1.set_weight(2.0)
+        r2 = IMP._ConstRestraint(m, [p], 18)
+        r2.set_weight(3.0)
+        r = IMP.RestraintSet(m)
+        r.set_weight(4.0)
+        r.add_restraints([r1, r2])
+        ji = r._get_jax(space=IMP.jax.FreeSpace)
+        X = ji.get_jax_model()
+        j = jax.jit(ji.score_func)
+        self.assertAlmostEqual(j(X), 552.0, delta=0.1)
+
+        # RestraintSet with no restraints should score zero
+        r = IMP.RestraintSet(m)
+        for weight in (1.0, 4.0):
+            r.set_weight(weight)
+            ji = r._get_jax(space=IMP.jax.FreeSpace)
+            X = ji.get_jax_model()
+            j = jax.jit(ji.score_func)
+            g = jax.jit(jax.grad(ji.score_func))
+            self.assertAlmostEqual(j(X), 0.0, delta=0.1)
+            dX = g(X)
+            self.assertEqual(dX['xyz'].shape, (0, 3))
+
+        # RestraintSet of weight zero should score zero
+        m = IMP.Model()
+        r = IMP.RestraintSet(m)
+        p = IMP.Particle(m)
+        r1 = IMP._ConstRestraint(m, [p], 42)
+        r1.set_weight(2.0)
+        r.add_restraint(r1)
+        r.set_weight(0.0)
+        self.assertAlmostEqual(r._evaluate_jax(), 0.0, delta=1e-4)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_score_periodic(self):
+        """Test JAX RestraintSet score with PBC"""
+        import IMP.jax
+        space = IMP.jax.PeriodicSpace([10., 10., 10.])
+        m = IMP.Model()
+        p1 = IMP.Particle(m)
+        d1 = IMP.core.XYZ.setup_particle(p1, IMP.algebra.Vector3D(0, 0, 0))
+        p2 = IMP.Particle(m)
+        d2 = IMP.core.XYZ.setup_particle(p2, IMP.algebra.Vector3D(7, 0, 0))
+        uf = IMP.core.Linear(0.0, 1.0)
+        dr = IMP.core.DistanceRestraint(m, uf, p1, p2)
+        rs = IMP.RestraintSet(m, 1.0)
+        rs.add_restraint(dr)
+        jax_score = rs._evaluate_jax(space=space)
+
+        # In periodic space, distance is 3.0, not 7.0
+        self.assertAlmostEqual(jax_score, 3.0, delta=1e-3)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_score_multi(self):
+        """Test JAX RestraintSet with _get_jax_multiple()"""
+        import IMP.jax
+        m = IMP.Model()
+        p = IMP.Particle(m)
+        r1 = JAXMultiConstRestraint(m, [p], 42.0, 100.0)
+        r1.set_weight(2.0)
+        r2 = JAXMultiConstRestraint(m, [p], 18.0, 200.0)
+        r2.set_weight(3.0)
+        r = IMP.RestraintSet(m)
+        r.set_weight(4.0)
+        r.add_restraints([r1, r2])
+        # JAXMultiConstRestraint deliberately returns a different score
+        # via _get_jax() or _get_jax_multiple() so that we can test them here
+        # (normally they should return the same value)
+        # Score via _get_jax():
+        self.assertAlmostEqual(
+            (r1._evaluate_jax() + r2._evaluate_jax()) * 4.0, 552.0, delta=1e-4)
+        # RestraintSet should fuse the two restraints using
+        # _get_jax_multiple():
+        self.assertAlmostEqual(r._evaluate_jax(), 3200.0, delta=1e-4)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_multi_attr(self):
+        """Test JAX RestraintSet with multiple attribute sets"""
+        import IMP.jax
+
+        # First set
+        m = IMP.Model()
+        p = IMP.Particle(m)
+        IMP.core.XYZ.setup_particle(p, IMP.algebra.Vector3D(4,0,0))
+
+        func = IMP.core.Harmonic(1.0, 4.0)
+        s = IMP.core.DistanceToSingletonScore(
+            func, IMP.algebra.Vector3D(0,0,0))
+        r = IMP.core.SingletonRestraint(m, s, p)
+        rs = IMP.RestraintSet(m)
+        rs.restraints.append(r)
+        imp_score1 = rs.evaluate(False)
+
+        # Second set
+        m.set_number_of_sphere_attribute_sets(2)
+        m.set_active_sphere_attribute_set(1)
+        IMP.core.XYZ.setup_particle(p, IMP.algebra.Vector3D(14,0,0))
+        imp_score2 = rs.evaluate(False)
+
+        jax_score = rs._evaluate_jax()
+        self.assertEqual(jax_score.shape, (2,))
+        self.assertAlmostEqual(jax_score[0], imp_score1, delta=1e-4)
+        self.assertAlmostEqual(jax_score[1], imp_score2, delta=1e-4)
+
+
+if __name__ == '__main__':
+    IMP.test.main()

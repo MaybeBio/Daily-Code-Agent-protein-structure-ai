@@ -1,0 +1,130 @@
+"""Review the component/library layout without installing or executing any software."""
+
+import json
+import os
+import re
+from pathlib import Path
+
+from layout_browser_helpers import initialize_layout_page
+from playwright.sync_api import expect, sync_playwright
+
+
+def card_geometry(page, selector):
+    return page.locator(selector).evaluate_all("""elements => elements
+      .filter(e => !e.closest('details:not([open])') && e.getBoundingClientRect().height > 0)
+      .map(e => {
+        const box = e.getBoundingClientRect();
+        const actions = e.querySelector('.component-actions');
+        const button = e.querySelector('.component-primary');
+        const title = e.querySelector('h3');
+        return {name: e.getAttribute('aria-label') ?? title?.textContent,
+          x:box.x, y:box.y, width:box.width, height:box.height, right:box.right,
+          footerBottom: actions?.getBoundingClientRect().bottom ?? box.bottom,
+          buttonWidth:button?.getBoundingClientRect().width ?? 0,
+          titleClipped: title ? title.scrollWidth > title.clientWidth + 1 : false};
+      })""")
+
+
+def check_cards(cards, viewport):
+    assert cards, "No component cards rendered"
+    for card in cards:
+        assert card["right"] <= viewport + 1, card
+        assert 0.7 <= card["width"] / card["height"] <= 1.4, card
+        assert card["footerBottom"] <= card["y"] + card["height"] - 8, card
+        assert not card["titleClipped"], card
+        assert card["buttonWidth"] < card["width"] * 0.65, card
+    for first, second in zip(cards, cards[1:], strict=False):
+        if abs(first["y"] - second["y"]) < 1:
+            assert second["x"] >= first["right"] + 10, (first, second)
+
+
+def test_component_cards_groups_and_runtime_desktop_mobile():
+    evidence = Path("server_tests/evidence/task-layout")
+    evidence.mkdir(parents=True, exist_ok=True)
+    rows, errors, mutations = [], [], []
+    with sync_playwright() as engine:
+        browser = engine.chromium.launch()
+        page = browser.new_page(viewport={"width": 1440, "height": 1000})
+        initialize_layout_page(page)
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.on(
+            "request",
+            lambda request: (
+                mutations.append(request.url)
+                if request.method in {"POST", "PUT", "PATCH", "DELETE"}
+                and "/api/deployment/" in request.url
+                else None
+            ),
+        )
+        try:
+            page.goto(os.environ["WB_BROWSER_URL"])
+            page.get_by_role("button", name="设置与帮助", exact=True).click()
+            page.get_by_role("menuitem", name="安装与运行", exact=True).click()
+            expect(page.locator(".component-grid > .component-card:visible").first).to_be_visible()
+            picker = page.get_by_role("combobox", name="组件分组")
+            groups = picker.locator("option").all_text_contents()
+            for width in (1440, 1920, 2560, 768, 390):
+                page.set_viewport_size({"width": width, "height": 1000})
+                picker.select_option("all")
+                all_cards = card_geometry(page, ".component-grid > .component-card")
+                check_cards(all_cards, width)
+                assert len({card["name"] for card in all_cards}) == len(all_cards)
+                for group in groups:
+                    picker.select_option(label=group)
+                    cards = card_geometry(page, ".component-grid > .component-card")
+                    check_cards(cards, width)
+                    assert not re.search(r"drug\s*clip", page.locator("main").inner_text(), re.I)
+                    grid = page.locator(".component-library > .component-grid")
+                    geometry = grid.evaluate("""e => ({x:e.getBoundingClientRect().x,
+                        width:e.getBoundingClientRect().width,
+                        containerWidth:e.closest('.deployment-workspace').clientWidth,
+                        tracks:getComputedStyle(e).gridTemplateColumns.split(' ').map(parseFloat),
+                        gap:parseFloat(getComputedStyle(e).columnGap)})""")
+                    if group == "动力学与结合自由能":
+                        assert [card["name"] for card in cards] == [
+                            "动力学与结构优化 · OpenMM",
+                            "分子动力学 · GROMACS",
+                            "相对结合自由能 · OpenFE",
+                        ]
+                    assert abs(cards[0]["width"] - all_cards[0]["width"]) <= 1, (
+                        "Every group must retain the same adaptive card width"
+                    )
+                    page.screenshot(
+                        path=str(evidence / f"components-{width}-{groups.index(group)}.png")
+                    )
+                    rows.append({"width": width, "group": group, "cards": cards, "grid": geometry})
+                picker.select_option("all")
+                optional = page.locator(".component-additions > summary")
+                if optional.count():
+                    optional.click()
+                    check_cards(card_geometry(page, ".component-additions .component-card"), width)
+                    page.screenshot(path=str(evidence / f"optional-components-{width}.png"))
+                    optional.click()
+                page.get_by_role("group", name="安装与运行").get_by_role(
+                    "button", name="运行状态", exact=True
+                ).click()
+                expect(page.locator(".runtime-workspace .studio-panel").first).to_be_visible()
+                assert not re.search(r"drug\s*clip", page.locator("main").inner_text(), re.I)
+                summary = card_geometry(page, ".runtime-summary > .studio-panel")
+                assert all(item["right"] <= width + 1 for item in summary), summary
+                table = page.get_by_role("region", name="集成环境", exact=True)
+                expect(table.get_by_role("table")).to_be_visible()
+                assert table.get_by_role("rowheader").count() > 0
+                expect(page.get_by_role("button", name="管理集成环境", exact=True)).to_have_count(1)
+                assert table.locator(".table-scroll").bounding_box()["width"] <= width + 1
+                assert not page.evaluate("document.documentElement.scrollWidth>innerWidth+1")
+                page.screenshot(path=str(evidence / f"runtime-table-{width}.png"))
+                page.get_by_role("group", name="安装与运行").get_by_role(
+                    "button", name="组件安装", exact=True
+                ).click()
+            assert not errors, errors
+            assert not mutations, "Layout review must not alter component installations"
+        finally:
+            (evidence / "component-layout.json").write_text(
+                json.dumps(
+                    {"pages": rows, "errors": errors, "mutations": mutations},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            browser.close()

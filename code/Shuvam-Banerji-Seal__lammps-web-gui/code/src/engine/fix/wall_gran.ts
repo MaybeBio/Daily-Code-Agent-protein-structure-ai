@@ -1,0 +1,1094 @@
+import { Fix } from './fix';
+import { EQUAL_STYLES } from '../argInfo';
+import { StyleError } from '../force/types';
+import { inumeric, numeric, parseNum } from '../force/util';
+import type { System } from '../system';
+import type { SimState } from '../types';
+import { granularContact, heatFlowOf, mdrPairOf, newContactOut, parseGranularSpec, PairGranular, type ContactIn, type ContactOut, type MdrApi, type MdrMaterialCore, type Pm } from '../force/pair/granular';
+import { contactMassArray, HEAT_FLOW, HEAT_TEMPERATURE } from '../atoms';
+
+/** The classic fstyles of fix wall/gran/region (hooke, hooke/history, hertz/history). */
+const CLASSIC_FSTYLES = ['hooke', 'hooke/history', 'hertz/history'] as const;
+
+/**
+ * The classic fstyle words (any fstyle but granular) as native LAMMPS reads them (src/GRANULAR/granular_model.cpp
+ * GranularModel::define_classic_model at b332f28): the word count, Kn Kt gamma_n gamma_t xmu (utils::numeric, NULL for
+ * the default Kt and gamma_t), dampflag (utils::inumeric; gamma_t is 0 without damping), the range check, and then the
+ * style name.
+ */
+/**
+ * The variables of a granular wall, checked at init as native LAMMPS does (src/GRANULAR/fix_wall_gran.cpp
+ * FixWallGran::init at b332f28): the wall temperature, then the wall positions; each exists and is equal-style.
+ */
+const checkWallVariables = (sys: System, planes: readonly { variable?: string }[], wallT: string | null): void => {
+  if (wallT !== null) {
+    const v = sys.vars.get(wallT);
+    if (!v) throw new StyleError(`Variable ${wallT} for fix wall/gran does not exist`);
+    if (!EQUAL_STYLES.has(v.style)) throw new StyleError(`Variable ${wallT} for fix wall/gran must be an equal style variable`);
+  }
+  for (const p of planes) {
+    if (p.variable === undefined) continue;
+    const v = sys.vars.get(p.variable);
+    if (!v) throw new StyleError(`Variable ${p.variable} for fix wall/gran wall position does not exist`);
+    if (!EQUAL_STYLES.has(v.style)) throw new StyleError(`Variable ${p.variable} for fix wall/gran wall position must be an equal style variable`);
+  }
+};
+
+const classicModel = (args: string[]): { kn: number; kt: number; gn: number; gt: number; xmu: number; dampflag: number } => {
+  if (args.length <= 6) throw new StyleError('Insufficient arguments provided for classic gran model command');
+  const kn = numeric(args[1]);
+  const kt = args[2] === 'NULL' ? (kn * 2) / 7 : numeric(args[2]);
+  const gn = numeric(args[3]);
+  let gt = args[4] === 'NULL' ? 0.5 * gn : numeric(args[4]);
+  const xmu = numeric(args[5]);
+  const dampflag = inumeric(args[6]);
+  if (dampflag === 0) gt = 0;
+  if (kn < 0 || kt < 0 || gn < 0 || gt < 0 || xmu < 0 || xmu > 10000 || dampflag < 0 || dampflag > 1) throw new StyleError('Illegal classic gran model command');
+  if (!(CLASSIC_FSTYLES as readonly string[]).includes(args[0])) throw new StyleError('Invalid classic gran model');
+  return { kn, kt, gn, gt, xmu, dampflag };
+};
+import { type Region, type SurfaceContact } from '../region';
+import { gplHook } from '../gplHooks';
+
+/**
+ * The native region wall of src/engine-gpl/granular/wall_gran_region.ts (lazy group gpl_wall_gran_region, HOOKS word
+ * wall/gran/region): native's region match, surface contacts, wall velocity and per-atom history slots.
+ */
+interface NativeRegionWall {
+  readonly region: {
+    readonly cDelx: Float64Array; readonly cDely: Float64Array; readonly cDelz: Float64Array;
+    readonly cR: Float64Array; readonly cRadius: Float64Array;
+    velocity_contact(vwall: Float64Array, x: ArrayLike<number>, ic: number, dt: number): void;
+  };
+  init(): void;
+  begin(step: number, dt: number): boolean;
+  atom(aid: number, x: number, y: number, z: number, cutoff: number): number;
+  history(ic: number): Float64Array;
+}
+/** The native region's contact list and match (src/engine-gpl/region/native_region.ts). */
+interface NativeRegionSurface {
+  readonly cDelx: Float64Array; readonly cDely: Float64Array; readonly cDelz: Float64Array;
+  readonly cR: Float64Array; readonly cRadius: Float64Array; readonly cIwall: Int32Array;
+  match(x: number, y: number, z: number): number;
+  surface(x: number, y: number, z: number, cutoff: number): number;
+  velocity_contact(vwall: Float64Array, x: ArrayLike<number>, ic: number, dt: number): void;
+  dynamic_check(): number;
+  prematch(): void;
+}
+interface RegionWallHook {
+  createRegionWall(sys: System, regionId: string, sizeHistory: number, useHistory: boolean): NativeRegionWall | null;
+}
+import { libm } from '../libm';
+
+/*
+ * fix ID group-ID wall/gran fstyle fstyle_params wallstyle args keyword values ...
+ * — docs.lammps.org/fix_wall_gran.html (fix_wall_gran.rst). This class: fstyle hooke, hooke/history,
+ * hertz/history on wallstyle xplane, yplane, zplane, with the keywords wiggle, shear and contacts (fstyle
+ * granular and fix wall/gran/region are FixWallGranGranular below). "If the :code:`contacts` option is used,
+ * this fix generates a per-atom array" of the contact data. These styles have no heat model, so the temperature
+ * keyword stops as native does ("Must define wall temperature with heat model").
+ *
+ * "The equation for the force between the wall and particles touching it is
+ * the same as the corresponding equation on the :doc:`pair_style gran/\* <pair_gran>` and
+ * :doc:`pair_style granular <pair_granular>` doc pages, in the limit of
+ * one of the two particles going to infinite radius and mass (flat wall)."
+ * Specifically, delta = radius - r = overlap of particle with wall, m_eff =
+ * mass of particle, and the effective radius of contact is the radius of the
+ * particle (paraphrased from the page).
+ * "The effective mass *m_eff* ... is the mass of the particle for
+ * particle/wall interactions (mass of wall is infinite)."
+ * The pair equations (docs.lammps.org/pair_gran.html) are
+ *   F_{hk} = (k_n \delta \mathbf{n}_{ij} - m_{eff} \gamma_n\mathbf{ v}_n) -
+ *            (k_t \boldsymbol{\Delta} \mathbf{s}_t + m_{eff} \gamma_t \mathbf{v}_t)
+ *   F_{hz} = \sqrt{\delta} \sqrt{\frac{R_i R_j}{R_i + R_j}} F_{hk}
+ * with R_i R_j / (R_i + R_j) -> R_i for a flat wall, so the Hertz factor is
+ * sqrt(delta * R). "If a NULL is used for *Kt*, then a default value is used
+ * where *Kt* = 2/7 *Kn*" and "If a NULL is used for *gamma_t*, then a default
+ * value is used where *gamma_t* = 1/2 *gamma_n*."
+ *
+ * Measured with native LAMMPS (black box, one sphere of diameter 1, density 1,
+ * against a plane at 0.0 with the sphere at z = 0.4, so delta = 0.1):
+ * - a plane wall acts on both sides: the normal is sign(x_i - coord) along the
+ *   wall axis and the overlap is radius - |x_i - coord|; a sphere at x = 0.4
+ *   with a hi wall at 0.0 is pushed to +x (Fx = 200 = Kn delta), at x = -0.4
+ *   with a lo wall at 0.0 to -x (Fx = -200);
+ * - no contact for |x_i - coord| >= radius (x = 0.7, hi wall at 0: F = 0);
+ * - with the sphere at the wall position native returns NaN forces;
+ * - Fz = 200 without damping; with gn = 50 and vz = -0.3 Fz = 207.854 (the
+ *   damping term m gn |v_n| with m = 0.5236); the wall is at rest unless moved;
+ * - hertz/history: Fz = 2000 * 0.1 * sqrt(0.1 * 0.5) = 44.7214 (no damping);
+ * - the tangential relative velocity uses the wall velocity: a sphere with
+ *   vx = 0.2 and gt = 30 (m gt vt = 3.14159) gives Fx = -3.14159 and
+ *   tau_y = +1.5708 = -R (n x F_t)_y with n = +z (torque -R n x F_t, as in pair gran);
+ * - the Coulomb cap is xmu |F_n| (vx = 2, xmu = 0.1, Fn = 200: Fx = -20 and
+ *   tau_y = +10); the capped tangential force is dropped at a contact with no
+ *   stored shear (run setup): Fx = 0 at run 0 and -2 at the first run step;
+ * - limit_damping zeroes the whole contact when F_n < 0 (gn = 1000, vz = 1:
+ *   F_z = -323.599 without it, 0 with it); vz = 0.1 gives Fz = 147.640;
+ * - hooke/history with dampflag 0: step n adds -kt n dt vt, so Fx = -0.0114286
+ *   at the first step with kt = 2/7 * 2000, vx = 0.2, dt = 1e-4 (the displacement
+ *   accumulates inside timesteps only, not at run setup);
+ * - wiggle z 0.1 2.0 (omega = pi): at t = 0.1 (step 1000, dt = 1e-4) the wall
+ *   is at 0.1 - 0.1 cos(0.1 pi) = 0.004894 and Fz = 209.7887 without damping,
+ *   212.3303 with gn = 50, gt = 30 (the wall velocity 0.1 pi sin(0.1 pi) enters
+ *   the damping term); at t = 0.2, Fz = 243.031. Time is counted from when the
+ *   fix was specified (step * dt);
+ * - shear y 0.3 on zplane: Fy = +4.71239 and tau_x = +2.35619 (the wall moves
+ *   tangentially at vshear, so v_t = -0.3 y);
+ * - wiggle x 0.1 2.0 on zplane (in-plane): Fx = 1.52494 at t = 0.1;
+ * - native errors, reused verbatim as the StyleError messages: Cannot wiggle
+ *   and shear fix wall/gran; Invalid shear direction for fix wall/gran (shear
+ *   along the wall normal, e.g. shear z on zplane); The zcylinder keyword has
+ *   been removed. Please use fix wall/gran/region instead.; Cannot use wall in
+ *   periodic dimension.
+ *
+ * Restrictions kept from the doc: "Both keywords cannot be used together." and
+ * "Any dimension (xyz) that has a granular wall must be non-periodic."
+ * The wall is applied as a post_force of every timestep (fix postForce, which
+ * is inside a timestep); the setup call (run start) computes the forces with
+ * the current shear history but does not advance it.
+ */
+
+type FStyle = 'hooke' | 'hooke/history' | 'hertz/history';
+type Dim = 0 | 1 | 2;
+const DIM_OF: Record<string, Dim> = { x: 0, y: 1, z: 2 };
+
+/** wiggle or shear motion of the walls (the same for every wall of the fix). */
+interface Motion {
+  kind: 'wiggle' | 'shear';
+  dim: Dim;
+  amp: number;
+  omega: number;
+  vshear: number;
+}
+
+/**
+ * One plane: the axis, the side and its position (undefined = NULL). A position given as v_name
+ * (fix_wall_gran.html, versionadded 2Sep2026) is re-evaluated every timestep: `variable` is the
+ * equal-style variable name and `prev` the position of its last evaluation (undefined before the first).
+ */
+interface Plane {
+  dim: Dim;
+  lo: boolean;
+  coord: number;
+  variable?: string;
+  prev?: number;
+}
+
+export class FixWallGran extends Fix {
+  readonly style = 'wall/gran';
+  private readonly fstyle: FStyle;
+  private readonly hertz: boolean;
+  private readonly history: boolean;
+  private kn = 0; private kt = 0; private gn = 0; private gt = 0; private xmu = 0;
+  private limitDamping = false;
+  private readonly planes: Plane[] = [];
+  private motion: Motion | null = null;
+  private readonly wallDim: Dim;
+  /** Step when the fix was specified: wiggle time is (step - step0) * dt. */
+  private readonly step0: number;
+  /** Shear displacement per (plane index, atom ID) while in contact. */
+  /** Shear history per plane (index k), by atom ID. */
+  private shear: Map<number, Float64Array>[] = [];
+  /** apply's call counter: a contact record holds the stamp of the call that touched it in entry 3. */
+  private stampN = 0;
+  /** The shear of a contact without history, and apply's wall normal. */
+  private readonly zeroShear = new Float64Array(4);
+  private readonly nrm = [0, 0, 0];
+  /**
+   * keyword contacts: the per-atom array of the contact data, as native fix_wall_gran.cpp post_force stores it after
+   * clear_stored_contacts: column 1 flag (1 in contact), 2-4 the wall force on the atom, 5-7 the contact point, 8 radius.
+   */
+  private contactsOn = false;
+
+  constructor(sys: System, id: string, group: string, args: string[]) {
+    super(sys, id, group, args);
+    const usage = 'usage: fix ID group-ID wall/gran fstyle fstyle_params wallstyle args [keyword values ...]';
+    if (args.length < 1) throw new StyleError(usage);
+    // the registry sends fstyle granular to FixWallGranGranular
+    const fs = args[0];
+    ({ kn: this.kn, kt: this.kt, gn: this.gn, gt: this.gt, xmu: this.xmu } = classicModel(args));
+    this.fstyle = fs as FStyle;
+    this.hertz = this.fstyle === 'hertz/history';
+    this.history = this.fstyle !== 'hooke';
+    let k = 7;
+    if (args[k] === 'limit_damping') { this.limitDamping = true; k++; }
+
+    // wallstyle args; the planar styles take lo hi (NULL allowed, not both)
+    const ws = args[k++];
+    if (ws === 'zcylinder') {
+      throw new StyleError('The zcylinder keyword has been removed. Please use fix wall/gran/region instead.');
+    }
+    if (ws !== 'xplane' && ws !== 'yplane' && ws !== 'zplane') {
+      throw new StyleError(`fix ${id} wall/gran: unsupported wallstyle '${ws ?? ''}' (xplane, yplane, zplane)`);
+    }
+    const dim = (ws === 'xplane' ? 0 : ws === 'yplane' ? 1 : 2) as Dim;
+    this.wallDim = dim;
+    const lo = args[k++], hi = args[k++];
+    // As native LAMMPS does (src/GRANULAR/fix_wall_gran.cpp FixWallGran::FixWallGran at b332f28): if (narg < iarg+3) error "Illegal fix wall/gran command"
+    if (lo === undefined || hi === undefined) throw new StyleError('Illegal fix wall/gran command');
+    if (lo === 'NULL' && hi === 'NULL') throw new StyleError(`fix ${id} wall/gran ${ws}: lo and hi are both NULL, no wall is defined`);
+    // fix_wall_gran.html (versionadded 2Sep2026): "The *lo* and *hi* wall positions can also be set by an equal-style
+    // :doc:`variable <variable>`, specified as v_name" -- the value is read as a variable name, not parsed
+    const wallPos = (w: string, what: string): Plane['variable'] | number => {
+      if (!w.startsWith('v_') || w.length < 3) return parseNum(w, what);
+      return w.slice(2);
+    };
+    if (lo !== 'NULL') {
+      const c = wallPos(lo, `${ws} lo`);
+      this.planes.push(typeof c === 'number' ? { dim, lo: true, coord: c } : { dim, lo: true, coord: NaN, variable: c });
+    }
+    if (hi !== 'NULL') {
+      const c = wallPos(hi, `${ws} hi`);
+      this.planes.push(typeof c === 'number' ? { dim, lo: false, coord: c } : { dim, lo: false, coord: NaN, variable: c });
+    }
+
+    // keyword values
+    while (k < args.length) {
+      const w = args[k];
+      if (w === 'wiggle') {
+        const d = DIM_OF[args[k + 1]];
+        if (d === undefined) throw new StyleError(`fix ${id} wall/gran wiggle: dim must be x, y or z, got '${args[k + 1] ?? ''}'`);
+        const amp = parseNum(args[k + 2], 'wiggle amplitude');
+        const period = parseNum(args[k + 3], 'wiggle period');
+        if (!(period > 0)) throw new StyleError(`fix ${id} wall/gran wiggle: period must be > 0`);
+        this.setMotion({ kind: 'wiggle', dim: d, amp, omega: (2 * Math.PI) / period, vshear: 0 }, id);
+        k += 4;
+      } else if (w === 'shear') {
+        const d = DIM_OF[args[k + 1]];
+        if (d === undefined) throw new StyleError(`fix ${id} wall/gran shear: dim must be x, y or z, got '${args[k + 1] ?? ''}'`);
+        const vshear = parseNum(args[k + 2], 'shear velocity');
+        this.setMotion({ kind: 'shear', dim: d, amp: 0, omega: 0, vshear }, id);
+        k += 3;
+      } else if (w === 'contacts') {
+        // fix_wall_gran.cpp: "peratom_flag = 1; size_peratom_cols = 8 + model->nsvector" (no extra values here)
+        this.contactsOn = true;
+        this.peratomFlag = true;
+        this.sizePeratomCols = 8;
+        k += 1;
+      } else if (w === 'temperature') {
+        // fix_wall_gran.cpp: these styles have no heat model, so a wall temperature is "Must define wall
+        // temperature with heat model"
+        if (args[k + 1] === undefined) throw new StyleError('Illegal fix wall/gran command');
+        throw new StyleError('Must define wall temperature with heat model');
+      } else {
+        // As native LAMMPS does (src/GRANULAR/fix_wall_gran.cpp FixWallGran::FixWallGran at b332f28): an unrecognised optional word stops with "Illegal fix wall/gran command".
+        throw new StyleError('Illegal fix wall/gran command');
+      }
+    }
+    this.step0 = sys.state.step;
+    if (this.planes.some((p) => p.variable !== undefined)) {
+      // "A wall position set by a variable cannot be combined with the *wiggle* or *shear* keyword."
+      if (this.motion) throw new StyleError(`fix ${id} wall/gran: a wall position set by a variable cannot be combined with wiggle or shear`);
+    }
+  }
+
+  private setMotion(m: Motion, id: string): void {
+    if (this.motion) throw new StyleError(`fix ${id} wall/gran: Cannot wiggle and shear fix wall/gran`);
+    // "Note that if the dimension is in the plane of the wall, this is effectively a shearing motion."
+    if (m.kind === 'shear' && m.dim === this.wallDim) {
+      throw new StyleError(`Invalid shear direction for fix wall/gran (shear must be tangential to the wall)`);
+    }
+    this.motion = m;
+  }
+
+  init(): void {
+    const s = this.sys.state;
+    for (const p of this.planes) {
+      if (s.dimension === 2 && p.dim === 2) throw new StyleError('fix wall/gran: cannot use a z wall in a 2d simulation');
+      if (s.box.periodic[p.dim]) throw new StyleError('Cannot use wall in periodic dimension');
+    }
+    checkWallVariables(this.sys, this.planes, null);
+  }
+
+  /** Forces of the walls are applied in post_force, as in every timestep. */
+  postForce(): void { this.apply(true); }
+
+  /** A run start computes the forces with the stored shear but does not advance it. */
+  setup(): void { this.apply(false); }
+
+  private apply(update: boolean): void {
+    const s = this.sys.state;
+    const { x, v, f, id, mask, radius, rmass, omega, torque } = s;
+    const cmass = contactMassArray(s);
+    if (!radius || !rmass || !omega || !torque) throw new StyleError('fix wall/gran requires atom_style sphere');
+    const dt = s.dt;
+    const delta = (s.step - this.step0) * dt;
+    // wall velocity (mv) and the wiggle offset of the wall position along its normal
+    const mv = [0, 0, 0];
+    let off = 0;
+    const m = this.motion;
+    if (m?.kind === 'wiggle') {
+      off = m.amp - m.amp * libm.cos(m.omega * delta);
+      mv[m.dim] = m.amp * m.omega * libm.sin(m.omega * delta);
+    } else if (m?.kind === 'shear') {
+      mv[m.dim] = m.vshear;
+    }
+    // planes set by a variable: the position is evaluated now (setup and every timestep), and the wall
+    // velocity is the difference to the previous evaluation over dt (zero at the first one).
+    // Measured with native LAMMPS (black box, one sphere of diameter 1 and density 1 at z = 1.7 under a zplane
+    // hi wall v_zhi with zhi = 2.0 - 0.001 step, dt = 0.001, hooke, Kn 2000, gamma_n 50): the setup force is
+    // -400 (wall velocity zero at the first evaluation), the post_force force of step 1 is -417.416, which needs
+    // the wall velocity -1 = (zhi(1) - zhi(0)) / dt, so the setup evaluation is the previous value; vz after
+    // steps 1 and 2 is -0.78057477705 and -1.5575082544 (a dump of vz, two steps).
+    const planeMv: number[][] = this.planes.map(() => mv);
+    const planeCoord = this.planes.map((p) => p.coord);
+    this.planes.forEach((p, k) => {
+      if (p.variable === undefined) return;
+      const cur = this.sys.equalVariable(p.variable);
+      if (!Number.isFinite(cur)) throw new StyleError(`fix ${id} wall/gran: variable ${p.variable} gave a non-finite wall position`);
+      const vw = p.prev === undefined ? 0 : (cur - p.prev) / dt;
+      p.prev = cur;
+      p.coord = cur;
+      planeCoord[k] = cur;
+      const pm = [0, 0, 0];
+      pm[p.dim] = vw;
+      planeMv[k] = pm;
+    });
+    // "LAMMPS stops with an error if the *lo* wall position does not remain below the *hi* wall position during a run."
+    this.planes.forEach((p, k) => {
+      if (!p.lo || p.variable === undefined) return;
+      this.planes.forEach((q, j) => {
+        if (!q.lo && q.dim === p.dim && !(planeCoord[k] < planeCoord[j])) {
+          throw new StyleError(`fix ${id} wall/gran: the lo wall position must remain below the hi wall position`);
+        }
+      });
+    });
+    const { kn, kt, gn, gt, xmu } = this;
+    const bit = this.groupBit;
+    if (this.contactsOn) {
+      // clear_stored_contacts: the per-atom contact data restart every evaluation
+      if (this.arrayAtom.length !== 8 * s.n) this.arrayAtom = new Float64Array(8 * s.n);
+      else this.arrayAtom.fill(0);
+    }
+    // a contact record carries the stamp of the call that touched it; the others leave after the loop (a contact that
+    // ends drops its shear, as at once)
+    const stamp = ++this.stampN;
+    const zero = this.zeroShear;
+    for (let i = 0; i < s.n; i++) {
+      if (!(mask[i] & bit)) continue;
+      const R = radius[i];
+      const mi = cmass[i];
+      for (let k = 0; k < this.planes.length; k++) {
+        const p = this.planes[k];
+        const d = p.dim;
+        const mv = planeMv[k];
+        const c = planeCoord[k] + (m?.kind === 'wiggle' && m.dim === d && p.variable === undefined ? off : 0);
+        const sd = x[3 * i + d] - c;
+        const key = id[i];
+        const dist = Math.abs(sd);
+        if (dist >= R) continue;
+        const hist = this.shear[k] ?? (this.shear[k] = new Map());
+        if (sd === 0) {
+          throw new StyleError(`fix wall/gran: particle ${id[i]} is at the wall position (zero distance); native LAMMPS gives NaN forces`);
+        }
+        // "delta = radius - r = overlap of particle with wall"; the normal points from the wall to the particle
+        const sg = sd > 0 ? 1 : -1;
+        const n = this.nrm;
+        n[0] = n[1] = n[2] = 0;
+        n[d] = sg;
+        const ov = R - dist;
+        const vr0 = v[3 * i] - mv[0], vr1 = v[3 * i + 1] - mv[1], vr2 = v[3 * i + 2] - mv[2];
+        const vn = vr0 * n[0] + vr1 * n[1] + vr2 * n[2];
+        const poly = this.hertz ? Math.sqrt(ov * R) : 1;
+        const fn = poly * (kn * ov - mi * gn * vn);
+        if (this.limitDamping && fn < 0) continue;
+        // tangential relative velocity: v_t = v_r - (v_r.n) n - (R w) x n
+        const wx = R * omega[3 * i], wy = R * omega[3 * i + 1], wz = R * omega[3 * i + 2];
+        const cx = wy * n[2] - wz * n[1], cy = wz * n[0] - wx * n[2], cz = wx * n[1] - wy * n[0];
+        const vt0 = vr0 - vn * n[0] - cx, vt1 = vr1 - vn * n[1] - cy, vt2 = vr2 - vn * n[2] - cz;
+        let sh: Float64Array = zero;
+        if (this.history) {
+          const rec = hist.get(key);
+          if (rec) sh = rec;
+          else { sh = new Float64Array(4); hist.set(key, sh); }
+          sh[3] = stamp;
+          if (update) {
+            sh[0] += vt0 * dt; sh[1] += vt1 * dt; sh[2] += vt2 * dt;
+            // keep the displacement in the tangent plane
+            const pr = sh[0] * n[0] + sh[1] * n[1] + sh[2] * n[2];
+            sh[0] -= pr * n[0]; sh[1] -= pr * n[1]; sh[2] -= pr * n[2];
+          }
+        }
+        let ft0 = -(kt * sh[0] + mi * gt * vt0) * poly;
+        let ft1 = -(kt * sh[1] + mi * gt * vt1) * poly;
+        let ft2 = -(kt * sh[2] + mi * gt * vt2) * poly;
+        const fsMag = Math.sqrt(ft0 * ft0 + ft1 * ft1 + ft2 * ft2);
+        const cap = xmu * Math.abs(fn);
+        if (fsMag > cap) {
+          let scale = fsMag > 0 ? cap / fsMag : 0;
+          if (this.history) {
+            // measured: with no stored shear (a contact at run setup) native drops the capped force
+            if (sh[0] === 0 && sh[1] === 0 && sh[2] === 0) scale = 0;
+            else if (kt > 0) {
+              const cc = (mi * gt) / kt;
+              for (let q = 0; q < 3; q++) {
+                const vq = q === 0 ? vt0 : q === 1 ? vt1 : vt2;
+                sh[q] = scale * (sh[q] + cc * vq) - cc * vq;
+              }
+            }
+          }
+          ft0 *= scale; ft1 *= scale; ft2 *= scale;
+        }
+        // force on the particle: normal along n plus the tangential part
+        f[3 * i] += fn * n[0] + ft0;
+        f[3 * i + 1] += fn * n[1] + ft1;
+        f[3 * i + 2] += fn * n[2] + ft2;
+        if (this.contactsOn) {
+          // store contact info: the flag, the force on the atom, the contact point on the wall, the radius
+          const av = this.arrayAtom, base = 8 * i;
+          av[base] = 1.0;
+          av[base + 1] = fn * n[0] + ft0; av[base + 2] = fn * n[1] + ft1; av[base + 3] = fn * n[2] + ft2;
+          av[base + 4] = x[3 * i]; av[base + 5] = x[3 * i + 1]; av[base + 6] = x[3 * i + 2];
+          av[base + 4 + d] = x[3 * i + d] - sd;
+          av[base + 7] = R;
+        }
+        // torque on the particle: -R n x F_t
+        torque[3 * i] -= R * (n[1] * ft2 - n[2] * ft1);
+        torque[3 * i + 1] -= R * (n[2] * ft0 - n[0] * ft2);
+        torque[3 * i + 2] -= R * (n[0] * ft1 - n[1] * ft0);
+      }
+    }
+    for (const hist of this.shear) if (hist) for (const [key, rec] of hist) if (rec[3] !== stamp) hist.delete(key);
+  }
+}
+
+/*
+ * fix wall/gran granular and fix wall/gran/region granular — docs.lammps.org/fix_wall_gran.html and
+ * fix_wall_gran_region.html (plans/lammps-docs). "For *granular*, *fstyle_params* are set using the same
+ * syntax as for the *pair_coeff* command of pair_style granular"; the wall/particle contact is the
+ * granular contact of pair_style granular with the wall as the second particle:
+ * "delta = radius - r = overlap of particle with wall, m_eff = mass of particle, and the effective radius
+ * of contact = RiRj/Ri+Rj is set to the radius of the particle" (flat walls, fix_wall_gran.rst);
+ * for region walls "the effective radius is calculated using the radius of the particle and the radius
+ * of curvature of the wall at the contact point ... The radius of curvature can be negative for a concave
+ * wall section, e.g. the interior of cylinder" (fix_wall_gran_region.rst).
+ * "The distance between a particle and the region boundary is the distance to the nearest point on the
+ * region surface" and "for region_style block, a particle in the interior, near a corner of the block,
+ * could feel wall forces from 1, 2, or 3 faces of the block" (fix_wall_gran_region.rst).
+ * E_eff of the wall/particle pair: E_eff = 960 / (2 (1 - 0.2^2)) = 500 (the worked example of the fix_wall_gran.rst note); the
+ * pair_coeff of pair_style granular is NOT used for the wall ("Any pair coefficients defined by pair_style
+ * granular are not taken into consideration").
+ * Supported here: planes xplane/yplane/zplane (lo and hi, NULL allowed; wiggle and shear motion) for
+ * wall/gran; region walls for wall/gran/region with block, sphere (interior), cylinder and cone
+ * regions, including compound (union/intersect) regions and dynamic (move/rotate) regions.  For a
+ * compound region the sub-region faces are filtered as documented on region.html (see region.ts);
+ * for a moving region the surface velocity enters the granular contact through the full relative
+ * velocity (measured with native LAMMPS, see updateVelocities).  A side-out region (or a compound
+ * region with a side-out member) contributes the nearest point of the solid (region.ts
+ * surfaceContacts/outContacts), measured with native LAMMPS for block, sphere and cylinder. The contacts
+ * keyword stores each atom's contact data (planes and regions), and temperature sets the wall temperature of the
+ * heat model.
+ */
+
+const WALL_WORDS = ['xplane', 'yplane', 'zplane', 'zcylinder', 'region'] as const;
+
+/** A wall/particle contact candidate: history key, distance to the surface, unit normal (wall to particle), effective radius. */
+/** A wall contact: nx, ny, nz the force normal, vnx, vny, vnz the normal of the contact point of the wall velocity. */
+interface WallElement {
+  key: string; dist: number; nx: number; ny: number; nz: number; Rf: number; source: Region | null;
+  vnx: number | undefined; vny: number | undefined; vnz: number | undefined;
+  /** The wall velocity of a native region contact (Region::velocity_contact; 0 for a static region). */
+  wx: number | undefined; wy: number | undefined; wz: number | undefined;
+}
+
+/**
+ * Element k of a pool of wall elements, made on first use: the contacts of one atom are written into the pool's
+ * first elements (every field, so an element keeps one shape), and the pool is never cleared.
+ */
+const poolElement = (pool: WallElement[], k: number): WallElement => {
+  let e = pool[k];
+  if (e === undefined) {
+    e = { key: '', dist: 0, nx: 0, ny: 0, nz: 0, Rf: 0, source: null, vnx: undefined, vny: undefined, vnz: undefined, wx: undefined, wy: undefined, wz: undefined };
+    pool[k] = e;
+  }
+  return e;
+};
+
+export class FixWallGranGranular extends Fix {
+  readonly style: string;
+  private readonly pm: Pm;
+  /** Legacy hertz/history: forces scaled by sqrt(delta R). */
+  private readonly planes: Plane[] = [];
+  private motion: Motion | null = null;
+  private readonly regionId: string | null;
+  private readonly step0: number;
+  /** Shear history by atom ID, then by wall element key (the face of a region, or the plane index). */
+  private shear = new Map<number, Map<string, Float64Array>>();
+  /** The contacts of one atom in apply: a pool regionElements writes into (poolElement). */
+  private readonly candBuf: WallElement[] = [];
+  /** The same for mdrContacts (the mdr bulk update reads the walls from the pair step). */
+  private readonly mdrBuf: WallElement[] = [];
+  /** The face keys an atom touches at this step (apply). */
+  private readonly touchedBuf: string[] = [];
+  private readonly csBuf: SurfaceContact[] = [];
+  /** keyword temperature: a number, or the name of an equal-style variable (v_name); null when not given. */
+  private wallT: number | string | null = null;
+  private readonly out: ContactOut = newContactOut();
+  /** apply's contact input (refilled for every contact). */
+  private readonly cin: ContactIn = {
+    pm: null as unknown as Pm, nx: 0, ny: 0, nz: 0, r: 0, delta: 0, Rf: 0, ri: 0, rj: 0, meff: 0,
+    vrx: 0, vry: 0, vrz: 0, oix: 0, oiy: 0, oiz: 0, ojx: 0, ojy: 0, ojz: 0, dt: 0, update: false, sg: 1,
+    surfaceArm: true, normal: undefined, rsq: undefined, radsum: undefined, dx: undefined, dy: undefined, dz: undefined,
+  };
+  /** Previous move/rotate state of every sub-region, for the surface velocity. */
+  private readonly prevStates = new Map<Region, { d: [number, number, number]; theta: number }>();
+  /** mdr normal model of this wall (its own coefficients) and whether it was checked against the pair style yet. */
+  private mdrMat: MdrMaterialCore | null = null;
+  private mdrChecked = false;
+  /**
+   * keyword contacts (fix_wall_gran_region.html): the per-atom array of the contact data, as native (fix_wall_gran_region.cpp
+   * clear_stored_contacts and post_force): column 1 flag, 2-4 contact force on the atom, 5-7 contact point, 8 radius, then the
+   * contact area of the mdr model (one column). Each atom keeps its last contact.
+   */
+  private contactsOn = false;
+
+  constructor(sys: System, id: string, group: string, args: string[], regionMode: boolean) {
+    super(sys, id, group, args);
+    this.style = regionMode ? 'wall/gran/region' : 'wall/gran';
+    // native: every fstyle but granular is a classic model (classicModel)
+    const classic = args[0] !== 'granular';
+    if (classic && !regionMode) throw new StyleError(`fix ${id} wall/gran: classic fstyle ${args[0]} is the plane legacy style (FixWallGran)`);
+    let k = 1;
+    let pmOut: Pm;
+    if (classic) {
+      // fstyle_params: Kn Kt gamma_n gamma_t xmu dampflag [limit_damping], then the wallstyle region ID
+      const cm = classicModel(args);
+      const { gn, gt: gtEff, xmu } = cm;
+      // define_classic_model: "convert Kn and Kt from pressure units to force/distance^2 if Hertzian" (kn /= nktv2p)
+      const nktv2p = args[0] === 'hertz/history' ? sys.state.units.nktv2p : 1;
+      const kn = args[0] === 'hertz/history' ? cm.kn / nktv2p : cm.kn, kt = args[0] === 'hertz/history' ? cm.kt / nktv2p : cm.kt;
+      k = 7;
+      let limit = false;
+      if (args[k] === 'limit_damping') { limit = true; k++; }
+      // As native LAMMPS does (src/GRANULAR/granular_model.cpp GranularModel::define_classic_model at b332f28): hooke is
+      // hooke + linear_nohistory + mass_velocity, hooke/history hooke + linear_history_classic + mass_velocity, and
+      // hertz/history hertz + mindlin_classic + viscoelastic; the tangential damping ratio is gamma_t / gamma_n
+      const hist = args[0] !== 'hooke';
+      const hertz = args[0] === 'hertz/history';
+      pmOut = {
+        normal: hertz ? 'hertz' : 'hooke', kn, Eeff: 0, kHM: 0, dampC: 0, gamma: 0, eta: gn, damp: hertz ? 'viscoelastic' : 'mass_velocity',
+        tang: hertz ? 'mindlin_classic' : hist ? 'linear_history_classic' : 'linear_nohistory', kt, xgt: gn > 0 ? gtEff / gn : 0, mu: xmu,
+        roll: 'none', kr: 0, gr: 0, mr: 0, twist: 'none', kw: 0, gw: 0, mw: 0, limit, cutoff: -1, heat: 'none', hk: 0, sig: 'legacy',
+      };
+    } else {
+      while (k < args.length && !(WALL_WORDS as readonly string[]).includes(args[k])) k++;
+      if (k >= args.length) throw new StyleError(`fix ${id} ${this.style} granular: missing wallstyle`);
+      const sp = parseGranularSpec(args.slice(1, k));
+      pmOut = new PairGranular().wallParams(sp, regionMode);
+      if (sp.normal === 'mdr') this.mdrMat = { E: sp.E, nu: sp.nu, Y: sp.Y, gamma: sp.gamma, psib: sp.psib, eta: sp.eta, dtype: sp.dtype };
+    }
+    this.pm = pmOut;
+    const ws = args[k];
+    if (regionMode) {
+      if (ws !== 'region') throw new StyleError(`fix ${id} wall/gran/region: wallstyle must be region, got '${ws}'`);
+      // As native LAMMPS does (src/GRANULAR/fix_wall_gran.cpp FixWallGran::FixWallGran at b332f28): if (narg < iarg+2) error "Illegal fix wall/gran command"
+      this.regionId = args[k + 1] ?? null;
+      if (!this.regionId) throw new StyleError('Illegal fix wall/gran command');
+      this.sys.region(this.regionId, `Region ${this.regionId} for fix wall/gran/region does not exist`);
+      k += 2;
+    } else {
+      this.regionId = null;
+      if (ws === 'region') throw new StyleError(`fix ${id} wall/gran: wallstyle region is wall/gran/region`);
+      if (ws === 'zcylinder') throw new StyleError('The zcylinder keyword has been removed. Please use fix wall/gran/region instead.');
+      const dim = (ws === 'xplane' ? 0 : ws === 'yplane' ? 1 : 2) as Dim;
+      const lo = args[k + 1], hi = args[k + 2];
+      // As native LAMMPS does (src/GRANULAR/fix_wall_gran.cpp FixWallGran::FixWallGran at b332f28): if (narg < iarg+3) error "Illegal fix wall/gran command"
+      if (lo === undefined || hi === undefined) throw new StyleError('Illegal fix wall/gran command');
+      if (lo === 'NULL' && hi === 'NULL') throw new StyleError(`fix ${id} wall/gran ${ws}: lo and hi are both NULL, no wall is defined`);
+      if (lo !== 'NULL') this.planes.push({ dim, lo: true, coord: parseNum(lo, `${ws} lo`) });
+      if (hi !== 'NULL') this.planes.push({ dim, lo: false, coord: parseNum(hi, `${ws} hi`) });
+      k += 3;
+    }
+    this.step0 = sys.state.step;
+    while (k < args.length) {
+      const w = args[k];
+      if (w === 'wiggle' && !regionMode) {
+        const d = DIM_OF[args[k + 1]];
+        if (d === undefined) throw new StyleError(`fix ${id} wall/gran wiggle: dim must be x, y or z`);
+        const amp = parseNum(args[k + 2], 'wiggle amplitude');
+        const period = parseNum(args[k + 3], 'wiggle period');
+        if (!(period > 0)) throw new StyleError(`fix ${id} wall/gran wiggle: period must be > 0`);
+        this.motion = { kind: 'wiggle', dim: d, amp, omega: (2 * Math.PI) / period, vshear: 0 };
+        k += 4;
+      } else if (w === 'shear' && !regionMode) {
+        const d = DIM_OF[args[k + 1]];
+        if (d === undefined) throw new StyleError(`fix ${id} wall/gran shear: dim must be x, y or z`);
+        this.motion = { kind: 'shear', dim: d, amp: 0, omega: 0, vshear: parseNum(args[k + 2], 'shear velocity') };
+        k += 3;
+      } else if (w === 'contacts') {
+        // fix_wall_gran.html and fix_wall_gran_region.html: "contacts" stores the contact data of each atom as a
+        // per-atom array (see apply)
+        this.contactsOn = true;
+        k += 1;
+        continue;
+      } else if (w === 'temperature') {
+        // fix_wall_gran.html: "The following value can either be a numeric value or an equal-style variable. If the value is a variable, it should be specified as v_name"
+        const tw = args[k + 1];
+        if (tw === undefined) throw new StyleError(`fix ${id} ${this.style} temperature needs a value`);
+        this.wallT = tw.startsWith('v_') ? tw.slice(2) : parseNum(tw, 'wall temperature');
+        k += 2;
+      } else {
+        // As native LAMMPS does (src/GRANULAR/fix_wall_gran.cpp FixWallGran::FixWallGran at b332f28, shared by fix_wall_gran_region.cpp): an unrecognised optional word stops with "Illegal fix wall/gran command".
+        throw new StyleError('Illegal fix wall/gran command');
+      }
+    }
+    if (this.contactsOn) {
+      // the per-atom contact array (keyword contacts): flag, force, contact point, radius and, for mdr, the contact area
+      this.peratomFlag = true;
+      this.sizePeratomCols = this.mdrMat ? 9 : 8;
+    }
+    // heat conduction: the wall temperature and the heat model go together (measured with native LAMMPS: a heat model
+    // without the temperature keyword, and the keyword with heat none, both stop with Must define wall temperature with heat model)
+    if (this.pm.heat !== 'none' && this.wallT === null) throw new StyleError(`fix ${id} ${this.style}: heat ${this.pm.heat} needs the temperature keyword (wall temperature)`);
+    if (this.pm.heat === 'none' && this.wallT !== null) throw new StyleError(`fix ${id} ${this.style}: temperature needs a heat model (heat radius or heat area)`);
+    if (this.motion && this.planes.length) {
+      for (const p of this.planes) {
+        if (this.motion.kind === 'shear' && this.motion.dim === p.dim) throw new StyleError('Invalid shear direction for fix wall/gran (shear must be tangential to the wall)');
+      }
+    }
+  }
+
+  /** The native region wall of the region (undefined before the first use; null when a region style has no port). */
+  private nwall: NativeRegionWall | null | undefined = undefined;
+  private nwallRegion: Region | null = null;
+  private readonly vwall = new Float64Array(3);
+  private readonly xi3 = new Float64Array(3);
+  private readonly noHist = new Float64Array(8);
+
+  /**
+   * The native region wall, for the models that act only in contact (not jkr or mdr, which keep the engine's contact
+   * list). As native LAMMPS does (src/GRANULAR/fix_wall_gran_region.cpp init at b332f28): a region redefined between
+   * runs is a new region with its motion reset, "Region properties for region ID changed between runs, resetting its
+   * motion".
+   */
+  private nativeWall(): NativeRegionWall | null {
+    if (!this.regionId || this.pm.normal === 'jkr' || this.mdrMat) return null;
+    return this.regionMirror();
+  }
+
+  /**
+   * The native region of the wall (its surfaces, match and wall velocity) for every model: the jkr and mdr walls keep the
+   * engine's contact records (by wall ID) and take the contacts and velocities from it (regionElements).
+   */
+  private regionMirror(): NativeRegionWall | null {
+    if (!this.regionId) return null;
+    const core = this.sys.region(this.regionId);
+    if (this.nwall !== undefined && this.nwallRegion === core) return this.nwall;
+    if (this.nwall !== undefined) this.sys.warn(`Region properties for region ${this.regionId} changed between runs, resetting its motion`);
+    const pm = this.pm;
+    // native's use_history: a model with history (size_history > 0), as granularContact keeps one (granular.ts)
+    const useHistory = pm.tang !== 'linear_nohistory' || pm.roll !== 'none' || pm.twist !== 'none';
+    this.nwall = gplHook<RegionWallHook>('wall/gran/region').createRegionWall(this.sys, this.regionId, 8, useHistory);
+    this.nwallRegion = core;
+    this.nwallHistory = useHistory;
+    return this.nwall;
+  }
+  private nwallHistory = false;
+
+  init(): void {
+    if (this.regionId) this.regionMirror()?.init();
+    const s = this.sys.state;
+    for (const p of this.planes) {
+      if (s.dimension === 2 && p.dim === 2) throw new StyleError('fix wall/gran: cannot use a z wall in a 2d simulation');
+      if (s.box.periodic[p.dim]) throw new StyleError('Cannot use wall in periodic dimension');
+    }
+    if (this.pm.heat !== 'none' && (!s.custom.has(HEAT_TEMPERATURE) || !s.custom.has(HEAT_FLOW))) {
+      throw new StyleError(`fix ${this.id} ${this.style}: heat conduction needs fix property/atom temperature heatflow`);
+    }
+    checkWallVariables(this.sys, this.planes, typeof this.wallT === 'string' ? this.wallT : null);
+  }
+
+  postForce(): void { this.apply(true); }
+
+  setup(): void { this.apply(false); }
+
+  /** The primitive sub-regions of a region (a compound recurses into members). */
+  private sourcesOf(r: Region, out: Region[]): void {
+    if (r.style === 'union' || r.style === 'intersect') {
+      const c = r as unknown as { members: string[] };
+      for (const id of c.members) this.sourcesOf(this.sys.region(id), out);
+      return;
+    }
+    out.push(r);
+  }
+
+  /**
+   * Velocity of a moving region at the contact point.  Measured with native
+   * LAMMPS (black box, a block region moved by dy = v*time and a block rotated
+   * by theta = omega*time, single sphere with classic hooke and xmu > 0): the
+   * surface velocity enters the granular contact through the full relative
+   * velocity — its normal component changes the normal damping and its
+   * tangential component enters the tangential damping, Coulomb-capped by
+   * xmu |F_n|.  The surface velocity is the finite difference of the region's
+   * move/rotate state over one timestep (zero on the setup step):
+   * ddot + omega x (q - (P + d)), with the move displacement applied to the
+   * rotation point P (region.html).
+   */
+  private updateVelocities(dt: number, vel: Map<Region, { ddot: number[]; omega: number[]; d: number[] }>): void {
+    const srcs: Region[] = [];
+    this.sourcesOf(this.sys.region(this.regionId!), srcs);
+    for (const src of srcs) {
+      const cur = src.transformState();
+      const prev = this.prevStates.get(src);
+      const ddot = [0, 0, 0], omega = [0, 0, 0];
+      if (prev) {
+        for (let q = 0; q < 3; q++) ddot[q] = (cur.d[q] - prev.d[q]) / dt;
+        if (src.rotate) {
+          const dth = (cur.theta - prev.theta) / dt;
+          omega[0] = dth * src.rotate.r[0]; omega[1] = dth * src.rotate.r[1]; omega[2] = dth * src.rotate.r[2];
+        }
+      }
+      this.prevStates.set(src, cur);
+      vel.set(src, { ddot, omega, d: cur.d });
+    }
+  }
+
+  /**
+   * The mdr model of the pair style. Native fix_granular_mdr checks that this wall's E, nu, Y, psi_b and damping agree with
+   * the pair style (its surface energy and friction may differ); checked once.
+   */
+  private mdrApi(s: SimState): MdrApi {
+    const pr = mdrPairOf(s);
+    if (!pr) throw new StyleError(`fix ${this.id} ${this.style}: normal model 'mdr' needs pair_style granular with the mdr normal model`);
+    if (!this.mdrChecked) {
+      const a = pr.mat, b = this.mdrMat!;
+      const eps = 1e-10;
+      if (Math.abs(a.E - b.E) > eps) throw new StyleError(`fix ${this.id} ${this.style}: Young's modulus in pair style, ${a.E}, does not agree with value ${b.E} in fix gran/wall/region`);
+      if (Math.abs(a.nu - b.nu) > eps) throw new StyleError(`fix ${this.id} ${this.style}: Poisson's ratio in pair style, ${a.nu}, does not agree with value ${b.nu} in fix gran/wall/region`);
+      if (Math.abs(a.Y - b.Y) > eps) throw new StyleError(`fix ${this.id} ${this.style}: yield stress in pair style, ${a.Y}, does not agree with value ${b.Y} in fix gran/wall/region`);
+      if (Math.abs(a.psib - b.psib) > eps) throw new StyleError(`fix ${this.id} ${this.style}: bulk response trigger in pair style, ${a.psib}, does not agree with value ${b.psib} in fix gran/wall/region`);
+      if (Math.abs(a.eta - b.eta) > eps) throw new StyleError(`fix ${this.id} ${this.style}: damping in pair style, ${a.eta}, does not agree with value ${b.eta} in fix gran/wall/region`);
+      this.mdrChecked = true;
+    }
+    return pr.api;
+  }
+
+  /** The wall contacts of atom i within its radius (the candidates of the force loop): the contacts of the bulk update. */
+  private mdrContacts(i: number): Array<{ face: string; aid: number; dist: number }> {
+    const s = this.sys.state;
+    if (!(s.mask[i] & this.groupBit)) return [];
+    // As native LAMMPS does (src/GRANULAR/fix_granular_mdr.cpp at b332f28): the bulk update of the pair step calls
+    // "if (region->dynamic_check()) region->prematch();" before its wall loop, so the region moves to this step
+    const mirror = this.regionMirror();
+    if (mirror && this.mdrPrematchStep !== s.step) {
+      const reg = mirror.region as unknown as NativeRegionSurface;
+      if (reg.dynamic_check()) reg.prematch();
+      this.mdrPrematchStep = s.step;
+    }
+    const R = s.radius![i];
+    const cand = this.mdrBuf;
+    const nc = this.regionElements(s.x[3 * i], s.x[3 * i + 1], s.x[3 * i + 2], R, cand);
+    const out: Array<{ face: string; aid: number; dist: number }> = [];
+    for (let q = 0; q < nc; q++) {
+      const e = cand[q];
+      if (e.dist < R) out.push({ face: this.mdrFace(e.key), aid: s.id[i], dist: e.dist });
+    }
+    return out;
+  }
+
+  /** The mdr history key of a face of this wall, "fixID|face", one string per face (see faceKey). */
+  private mdrFace(face: string): string {
+    let k = this.mdrFaces.get(face);
+    if (k === undefined) this.mdrFaces.set(face, (k = `${this.id}|${face}`));
+    return k;
+  }
+
+  private readonly mdrFaces = new Map<string, string>();
+
+  /**
+   * The history key of a face of a (sub-)region, "regionID:face", one string per face: the shear history is looked up
+   * for every atom and face at every step, and a string built anew each time would be hashed anew each time.
+   */
+  private faceKey(src: Region, face: string): string {
+    let m = this.faceKeys.get(src);
+    if (!m) this.faceKeys.set(src, (m = new Map()));
+    let k = m.get(face);
+    if (k === undefined) m.set(face, (k = `${src.id}:${face}`));
+    return k;
+  }
+  private readonly faceKeys = new Map<Region, Map<string, string>>();
+  /** The history key of each native wall ID. */
+  private readonly iwallKeys: string[] = [];
+  /** The step of the last prematch of the mdr bulk update (mdrContacts). */
+  private mdrPrematchStep = -1;
+
+  /**
+   * Contact candidates of one atom at its position (region faces; all sub-regions of a compound), those closer than
+   * cutoff (the atom's radius; every face for the models that act beyond contact).
+   */
+  private regionElements(x: number, y: number, z: number, R: number, out: WallElement[], cutoff = Infinity, dynamic = false): number {
+    let n = 0;
+    const nw = this.regionMirror();
+    if (nw) {
+      // native region contacts (src/engine-gpl/region): the atom must match the region (native post_force skips it
+      // otherwise); r, nx = dx * (1 / r), Reff from the contact radius; the key is the native wall ID
+      const reg = nw.region as unknown as NativeRegionSurface;
+      if (!reg.match(x, y, z)) return 0;
+      const nc = reg.surface(x, y, z, cutoff === Infinity ? Number.MAX_VALUE : cutoff);
+      const xi3 = this.xi3;
+      xi3[0] = x; xi3[1] = y; xi3[2] = z;
+      for (let ic = 0; ic < nc; ic++) {
+        const r = reg.cR[ic], radj = reg.cRadius[ic], rinv = 1.0 / r;
+        const Rf = radj === 0 ? R : R * radj / (R + radj);
+        const iw = reg.cIwall[ic];
+        const key = this.iwallKeys[iw] ??= `w${iw}`;
+        const nx = reg.cDelx[ic] * rinv, ny = reg.cDely[ic] * rinv, nz = reg.cDelz[ic] * rinv;
+        let wx = 0, wy = 0, wz = 0;
+        if (dynamic) {
+          reg.velocity_contact(this.vwall, xi3, ic, this.sys.state.dt);
+          wx = this.vwall[0]; wy = this.vwall[1]; wz = this.vwall[2];
+        }
+        const e = poolElement(out, n++);
+        e.key = key; e.dist = r; e.nx = nx; e.ny = ny; e.nz = nz; e.Rf = Rf; e.source = null;
+        e.vnx = undefined; e.vny = undefined; e.vnz = undefined; e.wx = wx; e.wy = wy; e.wz = wz;
+      }
+      return n;
+    }
+    const r = this.sys.region(this.regionId!);
+    const cs = this.csBuf;
+    cs.length = 0;
+    r.surfaceContacts(x, y, z, cs, cutoff);
+    for (const c of cs) {
+      const Rf = c.curvature === 0 ? R : (R * c.curvature) / (R + c.curvature);
+      const e = poolElement(out, n++);
+      e.key = this.faceKey(c.source, c.key); e.dist = c.dist; e.nx = c.nx; e.ny = c.ny; e.nz = c.nz; e.Rf = Rf;
+      e.source = c.source; e.vnx = c.vnx ?? c.nx; e.vny = c.vny ?? c.ny; e.vnz = c.vnz ?? c.nz;
+      e.wx = undefined; e.wy = undefined; e.wz = undefined;
+    }
+    return n;
+  }
+
+  private apply(update: boolean): void {
+    const nw = this.nativeWall();
+    if (nw) { this.applyRegion(nw, update); return; }
+    const s = this.sys.state;
+    const { x, v, f, id, mask, radius, rmass, omega, torque } = s;
+    const cmass = contactMassArray(s);
+    if (!radius || !rmass || !omega || !torque) throw new StyleError('fix wall/gran requires atom_style sphere');
+    const dt = s.dt;
+    const mv = [0, 0, 0];
+    // wiggle: as native LAMMPS does (src/GRANULAR/fix_wall_gran.cpp post_force at b332f28): "arg = omega *
+    // (update->ntimestep - time_origin) * dt", "wlo = lo + amplitude - amplitude * cos(arg)" and "vwall[axis] =
+    // amplitude * omega * sin(arg)"
+    let wigCos = 0, wiggle = false;
+    const m = this.motion;
+    if (m?.kind === 'wiggle') {
+      const arg = m.omega * (s.step - this.step0) * dt;
+      wiggle = true;
+      wigCos = libm.cos(arg);
+      mv[m.dim] = m.amp * m.omega * libm.sin(arg);
+    } else if (m?.kind === 'shear') {
+      mv[m.dim] = m.vshear;
+    }
+    const bit = this.groupBit;
+    const pm = this.pm;
+    const jkr = pm.normal === 'jkr';
+    if (this.contactsOn) {
+      // clear_stored_contacts: the per-atom contact data restart every step
+      if (this.arrayAtom.length !== this.sizePeratomCols * s.n) this.arrayAtom = new Float64Array(this.sizePeratomCols * s.n);
+      else this.arrayAtom.fill(0);
+    }
+    // mdr (region walls): the model of the pair style; the wall registers its contacts for the bulk update of the pair step
+    const mdr = this.mdrMat ? this.mdrApi(s) : null;
+    if (mdr) mdr.wallProvider(this.id, (i: number) => this.mdrContacts(i));
+    const vel = new Map<Region, { ddot: number[]; omega: number[]; d: number[] }>();
+    // the native region's motion of this step (prematch, set_velocity) and whether its walls move
+    const mirror = this.regionMirror();
+    const regionDynamic = mirror ? mirror.begin(s.step, dt) : false;
+    if (this.regionId && !mirror) this.updateVelocities(dt, vel);
+    // heat conduction (fix_wall_gran.html, temperature keyword): the wall temperature of this step, from a constant or an
+    // equal-style variable evaluated now
+    const heat = pm.heat !== 'none';
+    const T = heat ? s.custom.get(HEAT_TEMPERATURE)!.data : null;
+    const HF = heat ? s.custom.get(HEAT_FLOW)!.data : null;
+    const Tw = typeof this.wallT === 'string' ? this.sys.equalVariable(this.wallT) : (this.wallT ?? 0);
+    for (let i = 0; i < s.n; i++) {
+      if (!(mask[i] & bit)) continue;
+      const R = radius[i];
+      const mi = cmass[i];
+      const xi = x[3 * i], yi = x[3 * i + 1], zi = x[3 * i + 2];
+      const cand = this.candBuf;
+      let nc = 0;
+      if (this.regionId) {
+        // only the faces in contact (jkr acts beyond contact; mdr drops the bulk record of each face out of contact)
+        nc = this.regionElements(xi, yi, zi, R, cand, jkr || mdr ? Infinity : R, regionDynamic);
+      } else {
+        // As native LAMMPS does (src/GRANULAR/fix_wall_gran.cpp post_force at b332f28): the nearer of the lo and hi walls,
+        // "del1 = x[i][2] - wlo; del2 = whi - x[i][2]; if (del1 < del2) dz = del1; else dz = -del2", one contact (and one
+        // history) per atom; the model then takes r = sqrt(rsq) and nx = dx * (1 / r) (granular_model.cpp)
+        let wlo = -Infinity, whi = Infinity, dim: Dim = 0;
+        for (const p of this.planes) {
+          const c = wiggle && m!.dim === p.dim ? p.coord + m!.amp - m!.amp * wigCos : p.coord;
+          if (p.lo) wlo = c; else whi = c;
+          dim = p.dim;
+        }
+        if (this.planes.length) {
+          const xd = x[3 * i + dim];
+          const del1 = xd - wlo, del2 = whi - xd;
+          const d = del1 < del2 ? del1 : -del2;
+          if (d === 0) throw new StyleError(`fix wall/gran: particle ${id[i]} is at the wall position (zero distance); native LAMMPS gives NaN forces`);
+          const r = Math.sqrt(d * d);
+          const nd = d * (1.0 / r);
+          const e = poolElement(cand, nc++);
+          e.key = 'w'; e.dist = r; e.nx = dim === 0 ? nd : 0; e.ny = dim === 1 ? nd : 0; e.nz = dim === 2 ? nd : 0; e.Rf = R;
+          e.source = null; e.vnx = undefined; e.vny = undefined; e.vnz = undefined; e.wx = undefined; e.wy = undefined; e.wz = undefined;
+        }
+      }
+      const aid = id[i];
+      let hist = this.shear.get(aid);
+      // the faces this atom touches now: the first nt entries of the pool
+      const touched = this.touchedBuf;
+      let nt = 0;
+      for (let q = 0; q < nc; q++) {
+        const e = cand[q];
+        if (e.dist >= R && !jkr) {
+          hist?.delete(e.key);
+          if (mdr) mdr.wallDrop(this.mdrFace(e.key), aid);
+          continue;
+        }
+        // region walls: the moving surface velocity enters the granular contact
+        // through the full relative velocity (measured with native LAMMPS, see
+        // updateVelocities)
+        let vrx = v[3 * i] - mv[0], vry = v[3 * i + 1] - mv[1], vrz = v[3 * i + 2] - mv[2];
+        if (e.wx !== undefined) {
+          vrx = v[3 * i] - e.wx; vry = v[3 * i + 1] - e.wy!; vrz = v[3 * i + 2] - e.wz!;
+        } else if (e.source) {
+          const st = vel.get(e.source);
+          let wx = 0, wy = 0, wz = 0;
+          if (st) {
+            // the contact point of the sub-region's own contact (native velocity_contact)
+            const qx = xi - e.dist * (e.vnx ?? e.nx), qy = yi - e.dist * (e.vny ?? e.ny), qz = zi - e.dist * (e.vnz ?? e.nz);
+            const P = e.source.rotate ? e.source.rotate.p : [0, 0, 0];
+            const rx = qx - (P[0] + st.d[0]), ry = qy - (P[1] + st.d[1]), rz = qz - (P[2] + st.d[2]);
+            wx = st.ddot[0] + st.omega[1] * rz - st.omega[2] * ry;
+            wy = st.ddot[1] + st.omega[2] * rx - st.omega[0] * rz;
+            wz = st.ddot[2] + st.omega[0] * ry - st.omega[1] * rx;
+          }
+          vrx = v[3 * i] - wx;
+          vry = v[3 * i + 1] - wy;
+          vrz = v[3 * i + 2] - wz;
+        }
+        const had = hist?.get(e.key);
+        const sh = had ?? new Float64Array(8);
+        const normal = mdr && this.mdrMat
+          ? mdr.wallNormal({ face: this.mdrFace(e.key), aid, ai: i, R, delta: R - e.dist, Rf: e.Rf, nx: e.nx, ny: e.ny, nz: e.nz, meff: mi, hu: update, p: this.mdrMat })
+          : undefined;
+        // the contact input, one object refilled for every contact (granularContact only reads it); the touch test
+        // values and the separation are left to granularContact's defaults, as before
+        const c = this.cin;
+        c.pm = pm; c.nx = e.nx; c.ny = e.ny; c.nz = e.nz; c.r = e.dist; c.delta = R - e.dist; c.Rf = e.Rf;
+        c.ri = R; c.rj = 0; c.meff = mi; c.vrx = vrx; c.vry = vry; c.vrz = vrz;
+        c.oix = omega[3 * i]; c.oiy = omega[3 * i + 1]; c.oiz = omega[3 * i + 2];
+        c.ojx = 0; c.ojy = 0; c.ojz = 0; c.dt = dt; c.update = update; c.sg = 1; c.surfaceArm = true; c.normal = normal;
+        c.rsq = undefined; c.radsum = undefined; c.dx = undefined; c.dy = undefined; c.dz = undefined;
+        const ok = granularContact(c, sh, this.out, had !== undefined);
+        if (!ok) {
+          hist?.delete(e.key);
+          continue;
+        }
+        if (this.out.hist) {
+          if (!hist) this.shear.set(aid, (hist = new Map()));
+          hist.set(e.key, sh);
+        }
+        touched[nt++] = e.key;
+        if (this.contactsOn) {
+          const base = i * this.sizePeratomCols;
+          const av = this.arrayAtom;
+          av[base] = 1;
+          av[base + 1] = this.out.fx; av[base + 2] = this.out.fy; av[base + 3] = this.out.fz;
+          av[base + 4] = xi - e.dist * e.nx; av[base + 5] = yi - e.dist * e.ny; av[base + 6] = zi - e.dist * e.nz;
+          av[base + 7] = R;
+          if (normal?.svector !== undefined) av[base + 8] = normal.svector;
+        }
+        f[3 * i] += this.out.fx; f[3 * i + 1] += this.out.fy; f[3 * i + 2] += this.out.fz;
+        torque[3 * i] += this.out.tix; torque[3 * i + 1] += this.out.tiy; torque[3 * i + 2] += this.out.tiz;
+        if (HF) HF[i] += heatFlowOf(pm.heat, pm.hk, this.out.a, Tw - T![i]);
+      }
+      // As native LAMMPS does (src/GRANULAR/fix_wall_gran_region.cpp post_force and update_contacts at b332f28): an
+      // atom inside the region keeps the history of the faces it touches now only; an atom outside the region is
+      // skipped ("if (!region->match(...)) continue") and keeps its history
+      const inRegion = this.regionId !== null && (mirror ? (mirror.region as unknown as NativeRegionSurface).match(xi, yi, zi) === 1 : this.sys.region(this.regionId).match(xi, yi, zi));
+      if (hist && hist.size > nt && inRegion) {
+        for (const k of hist.keys()) {
+          let kept = false;
+          for (let t = 0; t < nt; t++) if (touched[t] === k) { kept = true; break; }
+          if (!kept) hist.delete(k);
+        }
+      }
+    }
+  }
+
+  /**
+   * fix wall/gran/region with the native region wall, as native LAMMPS does (src/GRANULAR/fix_wall_gran_region.cpp
+   * post_force at b332f28): prematch and set_velocity of a dynamic region, then for each group atom the region match,
+   * the contacts within its radius and the history upkeep (the hook), and for each contact GranularModel's WALLREGION
+   * geometry: rsq = r * r, radsum = radi, Reff = radi (flat) or radi * radj / (radi + radj), nx = dx * (1 / r)
+   * (granular_model.cpp check_contact and calculate_forces), the wall velocity of the contact (velocity_contact), and a
+   * contact out of touch zeroes its history slot.
+   */
+  private applyRegion(nw: NativeRegionWall, update: boolean): void {
+    const s = this.sys.state;
+    const { x, v, f, id, mask, radius, rmass, omega, torque } = s;
+    const cmass = contactMassArray(s);
+    if (!radius || !rmass || !omega || !torque) throw new StyleError('fix wall/gran requires atom_style sphere');
+    const dt = s.dt;
+    const bit = this.groupBit;
+    const pm = this.pm;
+    const regiondynamic = nw.begin(s.step, dt);
+    const vwall = this.vwall;
+    vwall[0] = vwall[1] = vwall[2] = 0.0;
+    if (this.contactsOn) {
+      // clear_stored_contacts: the per-atom contact data restart every step
+      if (this.arrayAtom.length !== this.sizePeratomCols * s.n) this.arrayAtom = new Float64Array(this.sizePeratomCols * s.n);
+      else this.arrayAtom.fill(0);
+    }
+    const heat = pm.heat !== 'none';
+    const T = heat ? s.custom.get(HEAT_TEMPERATURE)!.data : null;
+    const HF = heat ? s.custom.get(HEAT_FLOW)!.data : null;
+    const Tw = typeof this.wallT === 'string' ? this.sys.equalVariable(this.wallT) : (this.wallT ?? 0);
+    const reg = nw.region;
+    const useHistory = this.nwallHistory;
+    const xi3 = this.xi3;
+    const out = this.out;
+    const c = this.cin;
+    for (let i = 0; i < s.n; i++) {
+      if (!(mask[i] & bit)) continue;
+      const xi = x[3 * i], yi = x[3 * i + 1], zi = x[3 * i + 2];
+      const R = radius[i];
+      const nc = nw.atom(id[i], xi, yi, zi, R);
+      if (nc <= 0) continue;
+      xi3[0] = xi; xi3[1] = yi; xi3[2] = zi;
+      const mi = cmass[i];
+      for (let ic = 0; ic < nc; ic++) {
+        const dx = reg.cDelx[ic], dy = reg.cDely[ic], dz = reg.cDelz[ic];
+        const r = reg.cR[ic], radj = reg.cRadius[ic];
+        const Rf = radj === 0 ? R : R * radj / (R + radj);
+        if (regiondynamic) reg.velocity_contact(vwall, xi3, ic, dt);
+        const sh = useHistory ? nw.history(ic) : this.noHist.fill(0);
+        const rinv = 1.0 / r;
+        c.pm = pm; c.nx = dx * rinv; c.ny = dy * rinv; c.nz = dz * rinv; c.r = r; c.delta = R - r; c.Rf = Rf;
+        c.ri = R; c.rj = 0; c.meff = mi;
+        c.vrx = v[3 * i] - vwall[0]; c.vry = v[3 * i + 1] - vwall[1]; c.vrz = v[3 * i + 2] - vwall[2];
+        c.oix = omega[3 * i]; c.oiy = omega[3 * i + 1]; c.oiz = omega[3 * i + 2];
+        c.ojx = 0; c.ojy = 0; c.ojz = 0; c.dt = dt; c.update = update; c.sg = 1; c.surfaceArm = true; c.normal = undefined;
+        c.rsq = undefined; c.radsum = undefined; c.dx = dx; c.dy = dy; c.dz = dz;
+        if (!granularContact(c, sh, out, false)) {
+          if (useHistory) sh.fill(0.0);
+          continue;
+        }
+        f[3 * i] += out.fx; f[3 * i + 1] += out.fy; f[3 * i + 2] += out.fz;
+        torque[3 * i] += out.tix; torque[3 * i + 1] += out.tiy; torque[3 * i + 2] += out.tiz;
+        if (HF) HF[i] += heatFlowOf(pm.heat, pm.hk, out.a, Tw - T![i]);
+        if (this.contactsOn) {
+          const base = i * this.sizePeratomCols;
+          const av = this.arrayAtom;
+          av[base] = 1.0;
+          av[base + 1] = out.fx; av[base + 2] = out.fy; av[base + 3] = out.fz;
+          av[base + 4] = xi - dx; av[base + 5] = yi - dy; av[base + 6] = zi - dz;
+          av[base + 7] = R;
+        }
+      }
+    }
+  }
+}

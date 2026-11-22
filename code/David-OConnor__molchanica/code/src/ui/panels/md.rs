@@ -1,0 +1,1158 @@
+use dynamics::{
+    ForceFieldFamily, HydrogenConstraint, Integrator, LANGEVIN_GAMMA_DEFAULT, LINCS_ITER_DEFAULT,
+    LINCS_ORDER_DEFAULT, MdConfig, SHAKE_TOL_DEFAULT, SimBoxInit, Solvent, TAU_TEMP_DEFAULT,
+    snapshot::SnapshotHandlers,
+};
+use egui::{
+    Button, Color32, ComboBox, RichText, TextEdit, TextFormat, TextStyle, Ui, text::LayoutJob,
+};
+use graphics::{EngineUpdates, EntityUpdate, Scene};
+use lin_alg::f32::Vec3 as Vec3F32;
+use mol_defs::molecules::MolType;
+
+use crate::{
+    button,
+    drawing::EntityClass,
+    external_tools::{self, Tool},
+    md,
+    md::{MdBackend, launch_md, start_md_energy_computation},
+    prefs::ToSave,
+    state::State,
+    ui::{
+        COL_SPACING, COLOR_ACTION, COLOR_ACTIVE, COLOR_AMBER, COLOR_HIGHLIGHT, COLOR_INACTIVE,
+        ROW_SPACING, flag_btn, misc, num_field, panels::md_viewer,
+        popup::external_tools::install_btn, sidebar::mol_picker::mol_type_color, util::open_dir,
+    },
+    util::{RedrawFlags, handle_err},
+};
+
+pub fn md_setup(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    ui: &mut Ui,
+    redraw: &mut RedrawFlags,
+) {
+    if !using_gromacs_files(state)
+        && !using_native_mdp(state)
+        && let Err(error) = state.sync_gfnff_md_config()
+    {
+        handle_err(&mut state.ui, error);
+    }
+
+    // This sequencing code is above the UI code below, so it's deferred a frame after any actions.
+    if state.volatile.md_local.launching {
+        state.volatile.md_local.launching = false;
+        launch_md(state, true, false);
+    } else if state.volatile.md_local.running() {
+        // This is spammed each frame, so don't print, which handle_success does.
+        state.ui.cmd_line_output = "MD Running...".to_string();
+        state.ui.cmd_line_out_is_err = false;
+    }
+
+    let mut run = false;
+    misc::section_box().show(ui, |ui| {
+        run = run_picker(state, scene, updates, ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("MD setup:").color(Color32::WHITE));
+
+            ui.add_space(COL_SPACING / 2.0);
+
+            selected_mols_summary(state, ui);
+
+            ui.add_space(COL_SPACING / 2.0);
+
+            let peptide_selected = state
+                .peptides
+                .iter()
+                .any(|mol| mol.common.selected_for_md.is_some());
+            let num_ligs = state
+                .ligands
+                .iter()
+                .filter(|lig| lig.common.selected_for_md.is_some())
+                .count();
+            if !using_gromacs_files(state) && peptide_selected && num_ligs > 0 {
+                flag_btn(&mut state.ui.md.peptide_only_near_ligs, "Pep only near lig", "Only model the subset of peptide atoms near a small molecule", ui);
+                flag_btn(&mut state.ui.md.peptide_static, "Pep static", "Let peptide (protein) atoms affect other molecules, but they don't move themselves", ui);
+            }
+
+            if !using_gromacs_files(state) && !state.lipids.is_empty() {
+                let all_selected = state
+                    .lipids
+                    .iter()
+                    .all(|l| l.common.selected_for_md.is_some());
+                let color = if all_selected { COLOR_ACTIVE } else { COLOR_INACTIVE };
+
+                if button!(ui, "All lipids", color, "Select all lipids for MD")
+                    .clicked()
+                {
+                    for l in &mut state.lipids {
+                        l.common.selected_for_md = if all_selected {
+                            None
+                        } else {
+                            Some(l.common.selected_for_md.unwrap_or(1))
+                        };
+                    }
+                }
+            }
+
+            // for mol in &mut state.ligands {
+            //     flag_btn(&mut mol.common.selected_for_md, &mol.common.ident, "Toggle if we use this molecule for MD.", ui);
+            // }
+
+            let using_files = using_gromacs_files(state);
+            for mol in state.nucleic_acids.iter_mut().filter(|_| !using_files) {
+                let mut selected = mol.common.selected_for_md.is_some();
+                flag_btn(
+                    &mut selected,
+                    mol.common.name.as_deref().unwrap_or(&mol.common.ident),
+                    "Toggle if we use this molecule for MD.",
+                    ui,
+                );
+                if selected != mol.common.selected_for_md.is_some() {
+                    mol.common.selected_for_md = selected.then_some(1);
+                }
+            }
+
+            // ui.add_space(COL_SPACING / 2.);
+
+            if ui.button("Save Cfg")
+                .on_hover_text(if state.to_save.md.backend == MdBackend::xTb {
+                    "Save xTB geometry, MD settings, and command"
+                } else if using_gromacs_files(state) {
+                    "Run grompp and save the processed GROMACS inputs"
+                } else {
+                    "Save GROMACS .gro, .mdp, and .top files"
+                })
+                .clicked() {
+                state.volatile.dialogs.save_md.pick_directory();
+            }
+
+            if ui.button(RichText::new("Reset").color(Color32::LIGHT_RED))
+                .on_hover_text("Reset all MD settings to defaults.")
+                .clicked() {
+                state.to_save.md.config = MdConfig::for_family(state.force_fields.family);
+                if let Some(set) = state.force_fields.params.as_mut().and_then(|p| p.gfnff_mut()) {
+                    set.alpb_solvent = None;
+                    state.force_fields.invalidate();
+                    state.ui.ff_params.gfnff_report = None;
+                    state.ui.ff_params.gfnff_job = None;
+                }
+
+                let to_save_default = ToSave::default();
+
+                state.to_save.md.dt = to_save_default.md.dt;
+                state.to_save.md.num_steps = to_save_default.md.num_steps;
+                state.volatile.md_local.gromacs_setup = Default::default();
+                state.volatile.md_local.xtb_options = Default::default();
+
+                state.ui.md.sync(&state.to_save.md.config, state.to_save.md.dt);
+            }
+
+            if let Some(ss) = state.volatile.md_local.viewer.get_active_snap() && ss.water_o_posits.is_empty() && ui
+                .button(RichText::new("Clear water"))
+                .on_hover_text("Clear all rendered water molecules from the display")
+                .clicked() {
+                scene
+                    .entities
+                    .retain(|ent| ent.class != EntityClass::WaterModel as u32);
+
+                // todo: Setting water class isn't working for this update.
+                // engine_updates.entities = EntityUpdate::Classes(vec![EntityClass::WaterModel as u32]);
+                updates.entities = EntityUpdate::All;
+            }
+
+            ui.add_space(COL_SPACING / 2.);
+            force_field_cfg(state, ui);
+
+            let gfnff = state.force_fields.family == ForceFieldFamily::Gfnn;
+
+            ui.add_space(COL_SPACING / 2.);
+            ui.label("Backend:");
+
+            // GROMACS can't run GFN-FF.
+            let mut backends = vec![MdBackend::Dynamics];
+            if gfnff && state.force_fields.params.as_ref().and_then(|p| p.gfnff()).is_some() {
+                backends.push(MdBackend::xTb);
+            }
+            if !gfnff || state.volatile.md_local.gromacs_setup.uses_files() || using_native_mdp(state) {
+                backends.push(MdBackend::Gromacs);
+            }
+
+            // todo: For now, we launch ORCA MD from the quantum chemistry window, but we may
+            // todo wish to move it here.
+            // if orca_available {
+            //     backends.push(MdBackend::Orca);
+            // }
+
+            ComboBox::from_id_salt(523)
+                .width(80.)
+                .selected_text(state.to_save.md.backend.to_string())
+                .show_ui(ui, |ui| {
+                    for v in backends {
+                        ui.selectable_value(&mut state.to_save.md.backend, v.clone(), v.to_string());
+                    }
+                })
+                .response
+                .on_hover_text(if gfnff {
+                    "Use the Dynamics integrator or xTB's native MD engine."
+                } else {
+                    "Select the MD engine. GROMACS requires an installed executable."
+                });
+
+            if state.to_save.md.backend == MdBackend::Gromacs
+                && !external_tools::is_installed(Tool::Gromacs)
+            {
+                install_btn(state, Tool::Gromacs, ui);
+            }
+
+            if let Some(run) = &state.volatile.md_local.run {
+                if ui
+                    .button(RichText::new("Abort").color(Color32::LIGHT_RED))
+                    .on_hover_text("Stop the in-progress simulation")
+                    .clicked()
+                {
+                    // The worker stops, saves output, and returns; it loads then, as on completion.
+                    run.cancel();
+                }
+
+                let count = (run.step() / 100) * 100;
+
+                ui.label(
+                    RichText::new(format!("MD running. Step {count} of {}", run.num_steps))
+                        .color(COLOR_HIGHLIGHT),
+                );
+            }
+
+            if let Some(run) = &state.volatile.thread_receivers.xtb_md {
+                ui.label("xTB MD running");
+                if ui.button(RichText::new("Abort xTB").color(Color32::LIGHT_RED)).clicked() {
+                    run.cancel();
+                }
+            }
+            if state.volatile.thread_receivers.gromacs_md_avail.is_some() {
+                ui.label("GROMACS running");
+            }
+        });
+
+        ui.add_space(ROW_SPACING / 2.);
+        if using_gromacs_files(state) || using_native_mdp(state) {
+            super::md_gromacs::quick_settings(state, ui);
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                num_field(&mut state.to_save.md.num_steps, "Steps:", 70, ui);
+                time_step(state, ui);
+                show_runtime(
+                    ui,
+                    f64::from(state.to_save.md.num_steps),
+                    f64::from(state.to_save.md.dt),
+                );
+
+                ui.add_space(COL_SPACING / 2.);
+                relax(state, ui);
+                output_control(state, ui);
+
+                if state.to_save.md.backend == MdBackend::Dynamics {
+                    alchemical_cfg(state, ui);
+                }
+            });
+        }
+
+        if !using_gromacs_files(state) && !using_native_mdp(state) {
+            ui.add_space(ROW_SPACING / 2.);
+
+            let help = "Cutoff distances for non-bonded forces, in Å. For Coulomb, transitions between short-range, and \
+        long-range reciprical forces at this distance. For LJ, may represent a hard-cutoff. See the appropriate docs for \
+        the backend used, details vary.";
+            ui.horizontal_wrapped(|ui| {
+                integrator_cfg(state, ui);
+
+                if state.force_fields.family != ForceFieldFamily::Gfnn {
+                    ui.add_space(COL_SPACING / 2.);
+                    ui.label("Cutoffs (Å).").on_hover_text(help);
+                    num_field(&mut state.to_save.md.config.coulomb_cutoff, "Coulomb:", 34, ui);
+                    num_field(&mut state.to_save.md.config.lj_cutoff, "LJ:", 34, ui);
+                }
+            });
+
+            ui.add_space(ROW_SPACING / 2.);
+            ui.horizontal_wrapped(|ui| {
+                temp_pressure(state, ui);
+            });
+        } else if !using_gromacs_files(state) {
+            ui.horizontal_wrapped(|ui| {
+                preparation_cfg(state, ui);
+                sim_box(state, ui);
+            });
+        }
+        match state.to_save.md.backend {
+            MdBackend::Gromacs => super::md_gromacs::setup(state, ui),
+            MdBackend::xTb => super::md_xtb::setup(state, ui),
+            _ => (),
+        }
+
+        if let Some(ss) = state.volatile.md_local.viewer.get_nearest_energy_snap() {
+            ui.add_space(ROW_SPACING / 2.);
+
+            ui.horizontal_wrapped(|ui| {
+                md_viewer::energy_disp(ss, ui);
+            });
+        }
+    });
+
+    if run {
+        md::start_md(state, scene, updates);
+    }
+
+    // Playback controls display independently of this panel; see `md_viewer::playback`.
+    md_viewer::playback_status(state, scene, updates, redraw, ui);
+}
+
+fn force_field_cfg(state: &mut State, ui: &mut Ui) {
+    ui.label("Force field:");
+    let external_topology = using_gromacs_files(state);
+    ui.add_enabled_ui(!external_topology, |ui| {
+        crate::force_fields::selector(state, ui, "md_force_field", external_topology);
+    })
+    .response
+    .on_disabled_hover_text("GROMACS uses the force field in the loaded TOP.");
+}
+
+/// Counts molecule copies using the same selection as the simulation.
+fn selected_mols_summary(state: &State, ui: &mut Ui) {
+    if using_gromacs_files(state) {
+        ui.label("GROMACS file inputs");
+
+        return;
+    }
+    if using_saved_inputs(state) {
+        ui.label("Using saved run inputs");
+        return;
+    }
+
+    let mols = md::get_mols_sel_for_md(state);
+    if mols.is_empty() {
+        ui.label(RichText::new("No mols selected; solvent only").color(COLOR_AMBER));
+
+        return;
+    }
+
+    let format = TextFormat {
+        font_id: TextStyle::Body.resolve(ui.style()),
+        color: ui.visuals().text_color(),
+        ..Default::default()
+    };
+    let mut label = LayoutJob::default();
+    label.append("Mols: ", 0., format.clone());
+
+    let mut first = true;
+    for mol_type in [
+        MolType::Ligand,
+        MolType::Peptide,
+        MolType::Lipid,
+        MolType::NucleicAcid,
+    ] {
+        let count: usize = mols
+            .iter()
+            .filter(|(t, _, _)| MolType::from(*t) == mol_type)
+            .map(|(_, _, copies)| *copies)
+            .sum();
+        if count == 0 {
+            continue;
+        }
+
+        if !first {
+            label.append(", ", 0., format.clone());
+        }
+        first = false;
+
+        let letter = mol_type.to_string().chars().next().unwrap();
+        label.append(
+            &format!("{count}{letter}"),
+            0.,
+            TextFormat {
+                color: mol_type_color(mol_type),
+                ..format.clone()
+            },
+        );
+    }
+
+    ui.label(label);
+}
+
+fn using_gromacs_files(state: &State) -> bool {
+    state.to_save.md.backend == MdBackend::Gromacs
+        && state.volatile.md_local.gromacs_setup.uses_files()
+}
+
+fn using_native_mdp(state: &State) -> bool {
+    state.to_save.md.backend == MdBackend::Gromacs
+        && state.volatile.md_local.gromacs_setup.mdp.is_some()
+}
+
+fn using_saved_inputs(state: &State) -> bool {
+    state
+        .volatile
+        .md_local
+        .opened_inputs
+        .as_ref()
+        .is_some_and(|inputs| inputs.backend() == state.to_save.md.backend)
+}
+
+/// Returns true if Run was clicked.
+fn run_picker(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    ui: &mut Ui,
+) -> bool {
+    let running = md::runs::running(state);
+    let mut run = false;
+
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(!running, |ui| {
+            run = button!(
+                ui,
+                "Run",
+                COLOR_ACTION,
+                "Run the current MD setup."
+            )
+                .clicked();
+
+            if !using_gromacs_files(state) && button!(
+                ui,
+                "Compute E",
+                COLOR_ACTION,
+                "Compute and display instantaneous energy of selected molecules."
+            )
+                .clicked() {
+                start_md_energy_computation(state);
+            }
+
+            ui.add_space(COL_SPACING);
+
+            let picked = ComboBox::from_id_salt("recent_md_runs")
+                .selected_text("Recent MD runs")
+                .height(360.)
+                .show_ui(ui, |ui| {
+                    let runs = md::runs::recent(&state.to_save.recent_md_runs);
+                    if runs.is_empty() {
+                        ui.label("No saved runs");
+                    }
+
+                    runs.into_iter().find(|run| {
+                        ui.selectable_label(false, &run.name)
+                            .on_hover_text(run.directory.display().to_string())
+                            .clicked()
+                    })
+                })
+                .inner
+                .flatten();
+            if let Some(run) = picked {
+                md::runs::open(state, scene, updates, &run.directory, run.legacy.as_deref());
+            }
+        });
+
+        if ui.button("Open MD out folder").clicked() {
+            let result = std::env::current_dir().and_then(|dir| {
+                let folder = dir.join("md_out");
+                std::fs::create_dir_all(&folder)?;
+
+                open_dir(&folder)
+            });
+
+            if let Err(error) = result {
+                handle_err(
+                    &mut state.ui,
+                    format!("Error opening MD out folder: {error}"),
+                );
+            }
+        }
+
+        if ui
+            .add_enabled(!running, Button::new("Open MD run"))
+            .clicked()
+        {
+            state.volatile.dialogs.open_md_run.pick_directory();
+        }
+        if ui
+            .add_enabled(!running, Button::new("Load GROMACS files"))
+            .on_hover_text("Select an MDP, GRO, and TOP together or choose each file separately. GROMACS resolves the TOP's ITP includes.")
+            .clicked()
+        {
+            super::md_gromacs::pick(state, crate::gromacs::InputFile::Bundle);
+        }
+        if state.volatile.md_local.opened_inputs.is_some()
+            && ui.button("Use selected molecules").clicked()
+        {
+            state.volatile.md_local.opened_inputs = None;
+            state.volatile.md_local.xtb_options.restart = None;
+        }
+    });
+
+    run
+}
+
+/// Section for integrator config, various modelling parameters etc
+fn integrator_cfg(state: &mut State, ui: &mut Ui) {
+    let gfnff = state.force_fields.family == ForceFieldFamily::Gfnn;
+
+    if state.to_save.md.backend == MdBackend::xTb {
+        preparation_cfg(state, ui);
+
+        return;
+    }
+
+    let help_text =
+        "Set the integrator to use for molecular dynamics. Verlet Velocity is a good default.";
+    ui.label("Integrator:").on_hover_text(help_text);
+
+    let prev = state.to_save.md.config.integrator.clone();
+    ComboBox::from_id_salt(4)
+        .width(80.)
+        .selected_text(state.to_save.md.config.integrator.to_string())
+        .show_ui(ui, |ui| {
+            for v in [
+                Integrator::Leapfrog {
+                    thermostat: Some(TAU_TEMP_DEFAULT),
+                },
+                Integrator::LangevinMiddle {
+                    gamma: LANGEVIN_GAMMA_DEFAULT,
+                },
+                Integrator::VerletVelocity {
+                    thermostat: Some(TAU_TEMP_DEFAULT),
+                },
+            ] {
+                let label = v.to_string();
+                ui.selectable_value(&mut state.to_save.md.config.integrator, v, label);
+            }
+        })
+        .response
+        .on_hover_text(help_text);
+
+    if state.to_save.md.config.integrator != prev {
+        if let Integrator::LangevinMiddle { gamma } = state.to_save.md.config.integrator
+            && !matches!(prev, Integrator::LangevinMiddle { .. })
+        {
+            state.ui.md.langevin_γ = gamma.to_string();
+        }
+
+        if let Integrator::VerletVelocity {
+            thermostat: Some(tau),
+        } = state.to_save.md.config.integrator
+            && !matches!(prev, Integrator::VerletVelocity { .. })
+        {
+            state.ui.md.temp_tau = tau.to_string();
+        }
+    }
+
+    ui.add_space(COL_SPACING / 2.);
+
+    if gfnff {
+        ui.label("H: Flexible");
+    } else {
+        let help_text =
+            "Set to Constrained to allow higher time steps; Flexible may more more accurate.";
+        ui.label("H:").on_hover_text(help_text);
+        ComboBox::from_id_salt(5)
+            .width(80.)
+            .selected_text(state.to_save.md.config.hydrogen_constraint.to_string())
+            .show_ui(ui, |ui| {
+                // todo: Don't hard-code shake tol
+                for v in &[
+                    HydrogenConstraint::Linear {
+                        order: LINCS_ORDER_DEFAULT,
+                        iter: LINCS_ITER_DEFAULT,
+                    },
+                    HydrogenConstraint::Shake {
+                        shake_tolerance: SHAKE_TOL_DEFAULT,
+                    },
+                    HydrogenConstraint::Flexible,
+                ] {
+                    ui.selectable_value(
+                        &mut state.to_save.md.config.hydrogen_constraint,
+                        *v,
+                        v.to_string(),
+                    );
+                }
+            })
+            .response
+            .on_hover_text(help_text);
+    }
+
+    preparation_cfg(state, ui);
+}
+
+fn preparation_cfg(state: &mut State, ui: &mut Ui) {
+    let gfnff = state.force_fields.family == ForceFieldFamily::Gfnn;
+
+    if gfnff {
+        crate::force_fields::gfnff_solvent_selector(state, ui, "md_gfnff_solvent");
+    } else if using_saved_inputs(state) {
+        ui.label("Solvent from saved structure");
+    } else {
+        let help_text = "Set the solvent";
+        ui.label("Solvent:").on_hover_text(help_text);
+        ComboBox::from_id_salt(6)
+            .width(80.)
+            .selected_text(
+                if matches!(state.to_save.md.config.solvent, Solvent::WaterOpc) {
+                    "Water (force field default)".to_owned()
+                } else {
+                    state.to_save.md.config.solvent.to_string()
+                },
+            )
+            .show_ui(ui, |ui| {
+                // todo: Don't hard-code shake tol
+                for v in &[
+                    Solvent::None,
+                    Solvent::WaterOpc,
+                    Solvent::OctanolWithWater,
+                    // todo: Custom
+                    // Solvent::Custom(),
+                ] {
+                    ui.selectable_value(
+                        &mut state.to_save.md.config.solvent,
+                        v.clone(),
+                        if matches!(v, Solvent::WaterOpc) {
+                            "Water (force field default)".to_owned()
+                        } else {
+                            v.to_string()
+                        },
+                    );
+                }
+            })
+            .response
+            .on_hover_text(help_text);
+    }
+}
+
+pub(super) fn time_step(state: &mut State, ui: &mut Ui) {
+    let help = if state.to_save.md.backend == MdBackend::xTb {
+        "xTB time step in ps. xTB recommends 0.002 ps with a hydrogen mass of 4 u and SHAKE off."
+    } else if state.force_fields.family == ForceFieldFamily::Gfnn {
+        "Simulation time step in picoseconds. GFN-FF H bonds are flexible; large steps may be unstable."
+    } else {
+        "Simulation time step in picoseconds."
+    };
+    ui.label("dt (ps):").on_hover_text(help);
+
+    if ui
+        .add(TextEdit::singleline(&mut state.ui.md.dt_input).desired_width(55.))
+        .on_hover_text(help)
+        .changed()
+        && let Ok(dt) = state.ui.md.dt_input.parse::<f32>()
+    {
+        state.to_save.md.dt = dt;
+    }
+}
+
+pub(super) fn show_runtime(ui: &mut Ui, steps: f64, dt: f64) {
+    ui.label(format!("Runtime: {:.3} ps", steps * dt));
+}
+
+pub(super) fn relax(state: &mut State, ui: &mut Ui) {
+    let xtb_restart = state.to_save.md.backend == MdBackend::xTb
+        && state.volatile.md_local.xtb_options.restart.is_some();
+    relax_checkbox(&mut state.to_save.md.config, !xtb_restart, ui);
+}
+
+pub(super) fn relax_checkbox(cfg: &mut MdConfig, available: bool, ui: &mut Ui) {
+    let mut enabled = available && cfg.max_init_relaxation_iters.is_some();
+    if ui
+        .add_enabled(available, egui::Checkbox::new(&mut enabled, "Relax"))
+        .on_hover_text("Minimize energy before running MD.")
+        .on_disabled_hover_text("Initial relaxation is unavailable for this run.")
+        .changed()
+    {
+        cfg.max_init_relaxation_iters = if enabled {
+            MdConfig::default().max_init_relaxation_iters
+        } else {
+            None
+        };
+    }
+}
+
+/// Section for temp/pressure/ambient data
+fn temp_pressure(state: &mut State, ui: &mut Ui) {
+    // We show this even if there is no thermostat, to set the initial temperature.
+    ui.label(RichText::new("Ambient:").color(Color32::WHITE));
+    ui.add_space(COL_SPACING / 2.);
+
+    if state.to_save.md.backend == MdBackend::xTb {
+        super::md_xtb::temperature(state, ui);
+        ui.label("Nonperiodic");
+
+        return;
+    }
+
+    let thermostat_enabled = match &mut state.to_save.md.config.integrator {
+        Integrator::Leapfrog { thermostat } | Integrator::VerletVelocity { thermostat } => {
+            let help_text = "Enable or disable the thermostat";
+            ui.label("Therm:").on_hover_text(help_text);
+            let mut therm_en = thermostat.is_some();
+            if ui
+                .checkbox(&mut therm_en, "")
+                .on_hover_text(help_text)
+                .changed()
+            {
+                *thermostat = if therm_en {
+                    Some(TAU_TEMP_DEFAULT)
+                } else {
+                    None
+                };
+            }
+
+            if let Some(tau) = thermostat {
+                let help_text = "Thermostat time constant for use with a non-Langevin integrator. \
+                0.1ps is a good default.";
+
+                ui.label("Therm tau (ps):").on_hover_text(help_text);
+                if ui
+                    .add_sized(
+                        [22., Ui::available_height(ui)],
+                        TextEdit::singleline(&mut state.ui.md.temp_tau),
+                    )
+                    .on_hover_text(help_text)
+                    .changed()
+                    && let Ok(v) = &mut state.ui.md.temp_tau.parse::<f64>()
+                {
+                    *tau = *v;
+                }
+            }
+
+            therm_en
+        }
+        Integrator::LangevinMiddle { gamma } => {
+            let help_text = "Thermostat time constant for use with the Langevin (stochastic) integrator. \
+            0.5 1/ps is a good default.";
+
+            ui.label("Therm γ (1/ps):").on_hover_text(help_text);
+            if ui
+                .add_sized(
+                    [22., Ui::available_height(ui)],
+                    TextEdit::singleline(&mut state.ui.md.langevin_γ),
+                )
+                .on_hover_text(help_text)
+                .changed()
+                && let Ok(v) = &mut state.ui.md.langevin_γ.parse::<f32>()
+            {
+                *gamma = *v;
+            }
+
+            true
+        }
+    };
+
+    if thermostat_enabled {
+        ui.label("Temp (K):");
+        if ui
+            .add_sized(
+                [30., Ui::available_height(ui)],
+                TextEdit::singleline(&mut state.ui.md.temp_tgt),
+            )
+            .changed()
+            && let Ok(v) = &mut state.ui.md.temp_tgt.parse::<f32>()
+        {
+            state.to_save.md.config.temp_target = *v;
+        }
+    }
+
+    ui.add_space(COL_SPACING / 2.);
+
+    // todo: A/R
+    // ui.checkbox(&mut state.to_save.md.config.zero_com_drift, "Zero drift")
+    //     .on_hover_text("Zero the center-of-mass of items in the simulation.");
+
+    if state.force_fields.family == ForceFieldFamily::Gfnn {
+        ui.label("Nonperiodic; no barostat");
+
+        return;
+    }
+
+    let help = "Enable or disable the barostat";
+    ui.label("Baro:").on_hover_text(help);
+    let mut baro_en = state.to_save.md.config.barostat_cfg.is_some();
+    if ui.checkbox(&mut baro_en, "").on_hover_text(help).changed() {
+        state.to_save.md.config.barostat_cfg = if baro_en {
+            Some(dynamics::BarostatCfg::default())
+        } else {
+            None
+        };
+    }
+
+    if let Some(bc) = &mut state.to_save.md.config.barostat_cfg {
+        let help = "The target pressure, in bar, for the barostat to maintain. The sim box changes size in \
+    order to meet this.";
+        ui.label("Pres (bar):").on_hover_text(help);
+        if ui
+            .add_sized(
+                [22., Ui::available_height(ui)],
+                TextEdit::singleline(&mut state.ui.md.pressure_tgt),
+            )
+            .on_hover_text(help)
+            .changed()
+            && let Ok(v) = &mut state.ui.md.pressure_tgt.parse::<f32>()
+        {
+            bc.pressure_target = *v;
+        }
+
+        let help_text = "Barostat time constant. 5ps is a good default.";
+        ui.label("Baro tau (ps):").on_hover_text(help_text);
+        if ui
+            .add_sized(
+                [22., Ui::available_height(ui)],
+                TextEdit::singleline(&mut state.ui.md.pressure_tau),
+            )
+            .on_hover_text(help_text)
+            .changed()
+            && let Ok(v) = &mut state.ui.md.pressure_tau.parse::<f32>()
+        {
+            bc.tau = *v;
+        }
+    }
+
+    if using_saved_inputs(state) {
+        ui.label("Box from saved GRO");
+    } else {
+        sim_box(state, ui);
+    }
+}
+
+fn sim_box(state: &mut State, ui: &mut Ui) {
+    {
+        let help = "Set the sim box size. Affects wrapping, SPME logic, and \
+        solvent initialization and behavior.";
+        ui.label("Box (Å):").on_hover_text(help);
+
+        // Select Fixed or Pad
+        let txt = if matches!(state.to_save.md.config.sim_box, SimBoxInit::Fixed(_)) {
+            "Fixed"
+        } else {
+            "Pad"
+        };
+
+        let prev = state.to_save.md.config.sim_box.clone();
+        ComboBox::from_id_salt(10)
+            .width(60.)
+            .selected_text(txt)
+            .show_ui(ui, |ui| {
+                for v in &[
+                    (SimBoxInit::Pad(12.), "Pad"),
+                    (
+                        SimBoxInit::Fixed((Vec3F32::new_zero(), Vec3F32::new_zero())),
+                        "Fixed",
+                    ),
+                ] {
+                    ui.selectable_value(&mut state.to_save.md.config.sim_box, v.0.clone(), v.1);
+                }
+            });
+
+        if state.to_save.md.config.sim_box != prev {
+            state
+                .ui
+                .md
+                .sync(&state.to_save.md.config, state.to_save.md.dt);
+        }
+
+        ui.add_space(COL_SPACING / 2.);
+
+        match &mut state.to_save.md.config.sim_box {
+            SimBoxInit::Pad(pad_v) => {
+                let hover_text = "Set the minimum distance to pad the molecule in solvent atoms. Large values \
+            can be more realistic, but significantly increase computation time. This also sets the periodic boundary \
+            condition wrapping, and extent of the simulated area.";
+
+                ui.label("Pad (Å):").on_hover_text(hover_text);
+                if ui
+                    .add_sized(
+                        [22., Ui::available_height(ui)],
+                        TextEdit::singleline(&mut state.ui.md.simbox_pad_input),
+                    )
+                    .on_hover_text(hover_text)
+                    .changed()
+                    && let Ok(v) = &mut state.ui.md.simbox_pad_input.parse::<f32>()
+                {
+                    *pad_v = *v;
+                }
+            }
+            SimBoxInit::Fixed((start, end)) => {
+                let hover_text = "Set the fixed simulation box bounds in Å. Min values define one corner of the box, \
+             and max values define the opposite corner.";
+
+                let coord_width = 32.;
+
+                if ui
+                    .add_sized(
+                        [22., Ui::available_height(ui)],
+                        TextEdit::singleline(&mut state.ui.md.simbox_x_min_input),
+                    )
+                    .on_hover_text(hover_text)
+                    .changed()
+                    && let Ok(v) = state.ui.md.simbox_x_min_input.parse::<f32>()
+                {
+                    start.x = v;
+                }
+
+                if ui
+                    .add_sized(
+                        [coord_width, Ui::available_height(ui)],
+                        TextEdit::singleline(&mut state.ui.md.simbox_y_min_input),
+                    )
+                    .on_hover_text(hover_text)
+                    .changed()
+                    && let Ok(v) = state.ui.md.simbox_y_min_input.parse::<f32>()
+                {
+                    start.y = v;
+                }
+
+                if ui
+                    .add_sized(
+                        [coord_width, Ui::available_height(ui)],
+                        TextEdit::singleline(&mut state.ui.md.simbox_z_min_input),
+                    )
+                    .on_hover_text(hover_text)
+                    .changed()
+                    && let Ok(v) = state.ui.md.simbox_z_min_input.parse::<f32>()
+                {
+                    start.z = v;
+                }
+
+                ui.label("-");
+
+                if ui
+                    .add_sized(
+                        [coord_width, Ui::available_height(ui)],
+                        TextEdit::singleline(&mut state.ui.md.simbox_x_max_input),
+                    )
+                    .on_hover_text(hover_text)
+                    .changed()
+                    && let Ok(v) = state.ui.md.simbox_x_max_input.parse::<f32>()
+                {
+                    end.x = v;
+                }
+
+                if ui
+                    .add_sized(
+                        [coord_width, Ui::available_height(ui)],
+                        TextEdit::singleline(&mut state.ui.md.simbox_y_max_input),
+                    )
+                    .on_hover_text(hover_text)
+                    .changed()
+                    && let Ok(v) = state.ui.md.simbox_y_max_input.parse::<f32>()
+                {
+                    end.y = v;
+                }
+
+                if ui
+                    .add_sized(
+                        [coord_width, Ui::available_height(ui)],
+                        TextEdit::singleline(&mut state.ui.md.simbox_z_max_input),
+                    )
+                    .on_hover_text(hover_text)
+                    .changed()
+                    && let Ok(v) = state.ui.md.simbox_z_max_input.parse::<f32>()
+                {
+                    end.z = v;
+                }
+            }
+        }
+    }
+}
+
+fn num_field_option<T>(val: &mut Option<T>, label: &str, width: u16, ui: &mut Ui)
+where
+    T: std::fmt::Display + std::str::FromStr + Default + PartialEq,
+{
+    if !label.is_empty() {
+        ui.label(label);
+    }
+    let mut s = val
+        .as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    if ui
+        .add_sized(
+            [width as f32, Ui::available_height(ui)],
+            TextEdit::singleline(&mut s),
+        )
+        .changed()
+        && let Ok(v) = s.parse::<T>()
+    {
+        *val = if v == T::default() { None } else { Some(v) };
+    }
+}
+
+/// Checkbox to enable alchemical free-energy decoupling at a single lambda window,
+/// plus a text edit for the lambda value (shown when enabled). The decoupling is
+/// applied to the first selected molecule, mirroring `water_sol.rs`'s pattern.
+fn alchemical_cfg(state: &mut State, ui: &mut Ui) {
+    let help = "Enable alchemical free-energy decoupling of the first selected molecule at \
+    a single lambda window. lambda=0 leaves the solute fully coupled to the solvent; \
+    lambda=1 fully decouples it. Useful for visually confirming the decoupling.";
+    ui.label("Alch λ:").on_hover_text(help);
+    ui.checkbox(&mut state.ui.md.alchemical_enabled, "")
+        .on_hover_text(help);
+
+    if state.ui.md.alchemical_enabled {
+        let help = "Alchemical lambda value in [0, 1]. 0 = fully coupled, 1 = fully decoupled.";
+        if ui
+            .add_sized(
+                [34., Ui::available_height(ui)],
+                TextEdit::singleline(&mut state.ui.md.alchemical_lambda_input),
+            )
+            .on_hover_text(help)
+            .changed()
+            && let Ok(v) = state.ui.md.alchemical_lambda_input.parse::<f64>()
+            && (0.0..=1.0).contains(&v)
+        {
+            state.ui.md.alchemical_lambda = v;
+        }
+    }
+}
+
+fn output_control(state: &mut State, ui: &mut Ui) {
+    if state.to_save.md.backend == MdBackend::xTb {
+        xtb_frame_interval(state, ui);
+
+        return;
+    }
+
+    ui.label("Out.").on_hover_text(
+        "Trajectory formats and save intervals. GROMACS playback supports TRR coordinates and XTC.",
+    );
+
+    let mut sync_ui = false;
+    const W: u16 = 44;
+    let sh_def = SnapshotHandlers::default();
+    // Use memory's default ratio as the shared fallback for all handler types.
+    let default_file = sh_def.memory.map(|v| v as u32);
+
+    // TRR (coords / velocities / forces)
+    {
+        let help = "Save trajectory to a TRR file (coords, velocities, forces).";
+        ui.label("TRR:").on_hover_text(help);
+        if ui
+            .checkbox(&mut state.ui.md.trr_enabled, "")
+            .on_hover_text(help)
+            .changed()
+        {
+            let g = &mut state.to_save.md.config.snapshot_handlers.gromacs;
+            if state.ui.md.trr_enabled {
+                g.nstxout = default_file;
+                g.nstvout = default_file;
+                g.nstfout = default_file;
+            } else {
+                g.nstxout = None;
+                g.nstvout = None;
+                g.nstfout = None;
+            }
+            sync_ui = true;
+        }
+
+        if state.ui.md.trr_enabled {
+            let g = &mut state.to_save.md.config.snapshot_handlers.gromacs;
+            num_field_option(&mut g.nstxout, "Pos:", W, ui);
+            num_field_option(&mut g.nstvout, "V:", W, ui);
+            num_field_option(&mut g.nstfout, "F:", W, ui);
+        }
+
+        let g = &mut state.to_save.md.config.snapshot_handlers.gromacs;
+
+        let en_prev = g.nstenergy;
+        num_field_option(&mut g.nstenergy, "En:", W, ui);
+        if g.nstenergy != en_prev {
+            g.nstcalcenergy = g.nstenergy;
+        }
+    }
+
+    // XTC
+    {
+        let help = "Save compressed coordinates to an XTC file.";
+        ui.label("XTC:").on_hover_text(help);
+        if ui
+            .checkbox(&mut state.ui.md.xtc_enabled, "")
+            .on_hover_text(help)
+            .changed()
+        {
+            state
+                .to_save
+                .md
+                .config
+                .snapshot_handlers
+                .gromacs
+                .nstxout_compressed = if state.ui.md.xtc_enabled {
+                default_file
+            } else {
+                None
+            };
+            sync_ui = true;
+        }
+        if state
+            .to_save
+            .md
+            .config
+            .snapshot_handlers
+            .gromacs
+            .nstxout_compressed
+            .is_some()
+        {
+            num_field_option(
+                &mut state
+                    .to_save
+                    .md
+                    .config
+                    .snapshot_handlers
+                    .gromacs
+                    .nstxout_compressed,
+                "",
+                W,
+                ui,
+            );
+        }
+    }
+
+    // DCD
+    if state.to_save.md.backend != MdBackend::Gromacs {
+        let help = "Save trajectory to a DCD file.";
+        ui.label("DCD:").on_hover_text(help);
+        if ui
+            .checkbox(&mut state.ui.md.dcd_enabled, "")
+            .on_hover_text(help)
+            .changed()
+        {
+            state.to_save.md.config.snapshot_handlers.dcd = if state.ui.md.dcd_enabled {
+                sh_def.memory
+            } else {
+                None
+            };
+            sync_ui = true;
+        }
+
+        if state.to_save.md.config.snapshot_handlers.dcd.is_some() {
+            num_field_option(
+                &mut state.to_save.md.config.snapshot_handlers.dcd,
+                "",
+                W,
+                ui,
+            );
+        }
+    }
+
+    if sync_ui {
+        state
+            .ui
+            .md
+            .sync(&state.to_save.md.config, state.to_save.md.dt);
+    }
+}
+
+pub(super) fn xtb_frame_interval(state: &mut State, ui: &mut Ui) {
+    let memory = &mut state.to_save.md.config.snapshot_handlers.memory;
+    let previous = memory.unwrap_or(crate::xtb::DEFAULT_FRAME_INTERVAL);
+    let mut interval = previous;
+    num_field(&mut interval, "Frames every (steps):", 50, ui);
+    if interval != previous {
+        *memory = Some(interval);
+    }
+}

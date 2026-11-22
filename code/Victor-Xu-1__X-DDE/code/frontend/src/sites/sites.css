@@ -1,0 +1,67 @@
+.site-workspace {
+  display: grid;
+  gap: 0.65rem;
+  min-width: 0;
+}
+.site-workspace fieldset {
+  display: grid;
+  gap: 0.75rem;
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+.site-workspace .field {
+  min-width: 0;
+}
+.site-workspace select {
+  max-width: 100%;
+}
+.site-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.site-table-wrap table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 620px;
+}
+.site-table-wrap th,
+.site-table-wrap td {
+  text-align: left;
+  white-space: nowrap;
+  padding: 0.45rem;
+  border-bottom: 1px solid var(--line);
+}
+.site-results pre {
+  overflow: auto;
+  max-width: 100%;
+}
+
+.site-results {
+  min-width: 0;
+  max-width: 100%;
+}
+.site-table-wrap {
+  min-width: 0;
+  width: 100%;
+}
+.defined-region-editor {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.defined-region-editor > .operation-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.defined-region-editor .operation-grid .field {
+  margin-bottom: 12px;
+}
+.defined-region-form .questionnaire-steps button {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  font-size: 11px;
+  line-height: 1.3;
+}

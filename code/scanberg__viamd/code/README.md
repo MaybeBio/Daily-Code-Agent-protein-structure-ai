@@ -1,0 +1,94 @@
+# VIAMD
+Visual Interactive Analysis of Molecular Dynamics
+
+VIAMD is an interactive analysis tool for molecular dynamics (MD) written in C/C++. VIAMD is developed at the PDC Center for High Performance Computing (KTH, Stockholm). It exposes a rudimentary scripting language for declaring operations performed across trajectory frames.
+The results can then be viewed in the different windows exposed in the application. 
+<p align="center">
+<img src="https://github.com/scanberg/viamd/assets/38646069/5651ef62-28bc-4f41-8234-75cf9ba85612" alt="This is an overview of the viamd software" width="800"/>
+</p>
+
+## Status
+[![Windows (MSVC 19)](https://github.com/scanberg/viamd/actions/workflows/windows.yml/badge.svg?branch=master)](https://github.com/scanberg/viamd/actions/workflows/windows.yml)
+[![Ubuntu 22.04 (GCC 11)](https://github.com/scanberg/viamd/actions/workflows/ubuntu22.yml/badge.svg)](https://github.com/scanberg/viamd/actions/workflows/ubuntu22.yml)
+[![Ubuntu 24.04 (GCC 13)](https://github.com/scanberg/viamd/actions/workflows/ubuntu24.yml/badge.svg)](https://github.com/scanberg/viamd/actions/workflows/ubuntu24.yml)
+[![MacOS (Clang)](https://github.com/scanberg/viamd/actions/workflows/macos.yml/badge.svg)](https://github.com/scanberg/viamd/actions/workflows/macos.yml)
+
+## Running VIAMD 
+
+### Windows
+For Windows, we recommend using the latest binary available on the [release page](https://github.com/scanberg/viamd/releases/).
+
+### macOS
+For macOS, we recommend using the latest binary available on the [release page](https://github.com/scanberg/viamd/releases/).
+
+**NOTE:** To be able to run this, you will have to do some magic in a terminal to be able to run the app bundle since we do not have code signing.
+
+```xattr -dr com.apple.quarantine viamd.app```
+
+
+### Building for Ubuntu and macOS
+To [build](https://github.com/scanberg/viamd/wiki/0.-Building) VIAMD on your machine, you can follow the procedure described in detail in the wiki for [Linux](https://github.com/scanberg/viamd/wiki/0.-Building#linux) and [MacOS](https://github.com/scanberg/viamd/wiki/0.-Building#mac).
+
+On macOS, VIAMD builds without Xcode: CMake and the macOS Command Line Tools are
+enough. If Apple's Metal compiler happens to be available, the Metal compute
+kernels are compiled to `.metallib` during the build; otherwise VIAMD embeds the
+shader source and compiles it with Metal's runtime shader compiler on first use,
+which costs a fraction of a second at startup and is otherwise identical. Xcode
+is only needed if you are changing the offline Metal shader compilation pipeline
+itself.
+
+## Documentation
+Documentation about VIAMD is available on the github [wiki](https://github.com/scanberg/viamd/wiki). The first two chapters relate to the [visual](https://github.com/scanberg/viamd/wiki/1.-Visual) and [analysis](https://github.com/scanberg/viamd/wiki/2.-Analysis) features, respectively, where we highlight the interactive part of the software. The third chapter focuses on the VIAMD [language](https://github.com/scanberg/viamd/wiki/3.-Language) used for scripting, and the fourth chapter proposes a series of [tutorial](https://github.com/scanberg/viamd/wiki/4.-Tutorials) (under construction). 
+
+A series of videos is available on [youtube](https://youtube.com/playlist?list=PLNx9MpJY8ffr9CeK7WefdOnuGRw_E5rSj&si=VatBHEwiL7jWyhPK).
+
+## Update
+If you want to stay informed about the latest updates of VIAMD, please register your email address on the [form](https://forms.gle/fAxuWob8nMLcrS5h9). 
+
+## Citations:
+* General Framework:
+  * R Skånberg, I Hotz, A Ynnerman, M Linares, VIAMD: a Software for Visual Interactive Analysis of Molecular Dynamics, J. Chem. Inf. Model. 2023, 63, 23, 7382–7391 https://doi.org/10.1021/acs.jcim.3c01033
+  * R Skånberg, C König, P Norman, M Linares, D Jönsson, I Hotz, A Ynnerman, VIA-MD: Visual Interactive Analysis of Molecular Dynamics, 2018, Eurographics Proceedings, p. 19–27
+
+* Specific tool:
+  * Selection tool: Robin Skånberg, Mathieu Linares, Martin Falk, Ingrid Hotz, Anders Ynnerman, MolFind-Integrated Multi-Selection Schemes for Complex Molecular Structures, 2019, The Eurographics Association, p. 17-21​
+  * Shape Space and Spatial Distribution Function: Robin Skånberg, Martin Falk, Mathieu Linares, Anders Ynnerman, Ingrid Hotz, Tracking Internal Frames of Reference for Consistent Molecular Distribution Functions, 2021, IEEE Transactions on Visualization and Computer Graphics, 28 (9), 3126-3137​
+
+## Financial Support
+<p align="center">
+<img src="https://raw.githubusercontent.com/scanberg/viamd/master/docs/images/serc.png"  height="75" >
+ &nbsp;&nbsp;&nbsp;
+<img src="https://raw.githubusercontent.com/scanberg/viamd/master/docs/images/wallenberg.jpg"  height="75" >
+ &nbsp;&nbsp;&nbsp;
+<img src="https://raw.githubusercontent.com/scanberg/viamd/master/docs/images/infravis.png"  height="75" >
+ 
+</p>
+
+* VIAMD has received financial support since 2018 from the Swedish e-Research center ([SeRC](https://e-science.se/)) and the [Wallenberg Foundation](https://www.wallenberg.org/en)
+* VIAMD is currently supported as a development project in [InfraVis](https://infravis.se/)
+
+## Acknowledgements
+
+https://github.com/glfw/glfw
+
+https://github.com/dougbinks/enkiTS
+
+https://github.com/ocornut/imgui
+
+https://github.com/epezent/implot
+
+https://github.com/BalazsJako/ImGuiColorTextEdit
+
+https://github.com/skaslev/gl3w
+
+https://github.com/mlabbe/nativefiledialog
+
+https://github.com/nothings/stb
+
+#
+<p align="center">
+<img src="https://github.com/user-attachments/assets/39b69b10-88a1-43a7-9d69-68513ac4e632"  width="150" alt="This is the VIAMD logo" >
+</p>
+
+
+

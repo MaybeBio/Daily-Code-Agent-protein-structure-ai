@@ -1,0 +1,206 @@
+.research-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  min-width: 0;
+}
+.research-workspace .editor-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+.research-workspace .editor-toolbar button,
+.research-workspace .editor-toolbar a,
+.research-inspector > button,
+.research-inspector li button,
+.research-workspace > .notice button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 13px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.5;
+  text-decoration: none;
+}
+.research-workspace .editor-toolbar button:hover:enabled,
+.research-workspace .editor-toolbar a:hover,
+.research-inspector button:hover:enabled {
+  background: var(--surface-hover);
+  border-color: var(--accent);
+}
+.research-workspace .editor-toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.research-workspace .editor-toolbar select {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 13px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+.research-workspace .research-inspector > button {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+}
+.research-workspace .research-inspector > button:hover:enabled {
+  background: var(--accent);
+  filter: brightness(0.92);
+}
+.research-inspector li {
+  margin: 8px 0;
+}
+.research-inspector.is-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 280px;
+  color: var(--muted);
+  text-align: center;
+}
+.research-inspector.is-empty p {
+  max-width: 360px;
+  margin: 0;
+}
+.research-node-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: clamp(240px, calc(100dvh - 460px), 460px);
+  overflow: auto;
+}
+.research-node-list button {
+  display: grid;
+  text-align: left;
+  width: 100%;
+  gap: 4px;
+  padding: 10px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.research-node-list button:hover {
+  background: var(--surface-hover);
+}
+.research-node-list .selected {
+  background: var(--accent-soft);
+  box-shadow: inset 3px 0 var(--accent);
+}
+.research-node-list .asset-context {
+  font-size: 11px;
+  line-height: 1.5;
+}
+.research-selected-preview {
+  margin-top: 20px;
+  min-width: 0;
+}
+.research-selected-preview > .field-help {
+  margin: 0;
+}
+.research-node-list small,
+.graph-kind {
+  color: var(--muted);
+  font-size: 11px;
+}
+.research-graph-scroll {
+  min-width: 0;
+  max-width: 100%;
+  max-height: 380px;
+  overflow: auto;
+  border: 0;
+  border-radius: 0;
+  background: var(--surface);
+  padding: 12px 0;
+  box-shadow: none;
+}
+.research-graph {
+  display: block;
+  max-width: none;
+}
+.relationship-node {
+  cursor: pointer;
+}
+.relationship-node rect {
+  fill: var(--surface);
+  stroke: var(--line);
+}
+.relationship-node.selected rect,
+.relationship-node:focus rect {
+  stroke: var(--accent);
+  stroke-width: 2;
+  fill: var(--accent-soft);
+}
+.relationship-node text {
+  font-size: 12px;
+  fill: var(--ink);
+}
+.relationship-node .graph-kind {
+  font-size: 10px;
+  fill: var(--muted);
+}
+.relationship-edge {
+  color: var(--muted);
+}
+.relationship-edge path {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  opacity: 0.8;
+}
+
+.research-relationships > summary,
+.asset-annotations > summary,
+.asset-version-help > summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 13px;
+}
+.research-relationships {
+  min-width: 0;
+}
+.research-relationships .research-graph-scroll {
+  margin-top: 12px;
+}
+.research-inspector .asset-annotations {
+  border-top: 1px solid var(--line);
+  margin-top: 18px;
+  padding-top: 14px;
+}
+.asset-annotations > .field:first-of-type {
+  margin-top: 16px;
+}
+.asset-annotations > button {
+  margin-top: 12px;
+}
+.asset-version-help {
+  margin-top: 12px;
+}
+.research-relations {
+  max-height: 300px;
+  overflow: auto;
+  padding-left: 18px;
+  font-size: 13px;
+}
+.research-inspector > h3 {
+  font-size: 14px;
+  margin-top: 24px;
+}
+
+.asset-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 12px;
+}

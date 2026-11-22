@@ -1,0 +1,259 @@
+/*
+ * Splitting LAMMPS input text into commands and words, following
+ * docs.lammps.org/Commands_parse.html:
+ *
+ *  1. "If the last printable character on the line is a “&” character, the
+ *     command is assumed to continue on the next line. The next line is
+ *     concatenated to the previous line by removing the “&” character and
+ *     line break."
+ *  2. "All characters from the first “#” character onward are treated as
+ *     comment and discarded. ... a comment after a trailing “&” character
+ *     will prevent the command from continuing on the next line. Also note
+ *     that for multi-line commands a single leading “#” will comment out the
+ *     entire command."
+ *  3. "$" substitution: "${myTemp} and $x refer to variables named “myTemp”
+ *     and “x”"; "$(...)" is an immediate equal-style formula, optionally
+ *     followed by ":" and a C-style format ("If a format string is not
+ *     specified, a high-precision %.20g is used as the default format").
+ *     "neither the curly-bracket or immediate form of variables can contain
+ *     nested $ characters".
+ *  4/5. Words are separated by white-space; the first word is the command.
+ *  6. Single, double or triple quotes make one argument; "the single,
+ *     double, or triple quotes are removed"; triple quotes keep line breaks
+ *     and "“&” characters are not needed and do not function as line
+ *     continuation character"; "A “#” or “$” character that is between
+ *     quotes will not be treated as a comment indicator in 2 or substituted
+ *     for as a variable in 3."
+ */
+
+export interface RawCommand {
+  /** 1-based line where the command starts. */
+  line: number;
+  /** Command text with comments removed and continuations joined. */
+  text: string;
+}
+
+const restOfLineBlank = (s: string, from: number): boolean => {
+  for (let k = from; k < s.length && s[k] !== '\n'; k++) {
+    if (s[k] !== ' ' && s[k] !== '\t' && s[k] !== '\r') return false;
+  }
+  return true;
+};
+
+const skipToNextLine = (s: string, from: number): number => {
+  let k = from;
+  while (k < s.length && s[k] !== '\n') k++;
+  return k;   // index of '\n' (or end)
+};
+
+/** Splits input text into commands (quotes kept; comments and '&' handled). */
+export const splitCommands = (text: string, firstLine = 1): RawCommand[] => {
+  const out: RawCommand[] = [];
+  let buf = '';
+  let line = firstLine;
+  let start = firstLine;
+  let mode: 'normal' | 'sq' | 'dq' | 'tq' | 'comment' = 'normal';
+  const flush = () => {
+    if (buf.trim()) out.push({ line: start, text: buf.trim() });
+    buf = '';
+  };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '\n') {
+      line++;
+      if (mode === 'tq') { buf += c; continue; }
+      mode = 'normal';
+      flush();
+      start = line;
+      continue;
+    }
+    if (mode === 'tq') {
+      if (text.startsWith('"""', i)) { buf += '"""'; i += 2; mode = 'normal'; } else buf += c;
+      continue;
+    }
+    if (c === '&' && restOfLineBlank(text, i + 1)) {
+      // line continuation, also inside a comment or a single/double quote
+      i = skipToNextLine(text, i + 1);
+      if (i < text.length) line++;
+      continue;
+    }
+    if (mode === 'comment') continue;
+    if (mode === 'sq' || mode === 'dq') {
+      buf += c;
+      if ((mode === 'sq' && c === "'") || (mode === 'dq' && c === '"')) mode = 'normal';
+      continue;
+    }
+    // normal
+    if (c === '#') { mode = 'comment'; continue; }
+    if (text.startsWith('"""', i)) { buf += '"""'; i += 2; mode = 'tq'; continue; }
+    if (c === '"') { buf += c; mode = 'dq'; continue; }
+    if (c === "'") { buf += c; mode = 'sq'; continue; }
+    buf += c;
+  }
+  flush();
+  return out;
+};
+
+/** Calls `fn` on each unquoted stretch of `text`, leaving quoted parts unchanged. */
+export const mapUnquoted = (text: string, fn: (part: string) => string): string => {
+  let out = '';
+  let i = 0;
+  while (i < text.length) {
+    let q: string | null = null;
+    let j = i;
+    for (; j < text.length; j++) {
+      if (text.startsWith('"""', j)) { q = '"""'; break; }
+      if (text[j] === '"' || text[j] === "'") { q = text[j]; break; }
+    }
+    out += fn(text.slice(i, j));
+    if (q === null) break;
+    const end = text.indexOf(q, j + q.length);
+    const stop = end < 0 ? text.length : end + q.length;
+    out += text.slice(j, stop);
+    i = stop;
+  }
+  return out;
+};
+
+/**
+ * Replaces $x, ${name} and $(formula[:fmt]) in `text`. `lookup` returns the
+ * text of a named variable; `immediate` evaluates a formula. Throws on an
+ * unknown variable or an unterminated reference.
+ */
+export const substituteVariables = (
+  text: string,
+  lookup: (name: string) => string,
+  immediate: (formula: string, format?: string) => string,
+): string => {
+  // As native LAMMPS does (src/input.cpp Input::substitute at b332f28): the text a variable substitutes is copied and
+  // scanning continues after it (it is not scanned again), and a $ right after a backslash is kept as a $ (the backslash
+  // is dropped) instead of starting a reference. A string variable is substituted when it is defined (variable.html:
+  // "string performs variable substitution even if the string parameter is quoted"; commands/misc.ts), so a string
+  // defined as "${a}0" after variable a equal 2 gives 20. Measured with native LAMMPS: an index variable holding ${a}0
+  // prints ${a}0.
+  let s = text;
+  let substitutions = 0;
+  const splice = (i: number, end: number, value: string): void => {
+    if (++substitutions > 10000) throw new Error('variable substitution does not terminate (a variable refers to itself)');
+    s = s.slice(0, i) + value + s.slice(end + 1);
+  };
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] !== '$') { i++; continue; }
+    if (i > 0 && s[i - 1] === '\\') {
+      s = s.slice(0, i - 1) + s.slice(i);
+      continue;
+    }
+    const next = s[i + 1];
+    if (next === undefined) throw new Error("a '$' at the end of the line has no variable name");
+    if (next === '{') {
+      const end = s.indexOf('}', i + 2);
+      if (end < 0) throw new Error("unterminated '${' variable reference");
+      const name = s.slice(i + 2, end);
+      if (name.includes('$')) throw new Error('variable references cannot be nested');
+      const value = lookup(name);
+      splice(i, end, value);
+      i += value.length;
+    } else if (next === '(') {
+      let depth = 0;
+      let end = -1;
+      for (let k = i + 1; k < s.length; k++) {
+        if (s[k] === '(') depth++;
+        else if (s[k] === ')') { depth--; if (depth === 0) { end = k; break; } }
+      }
+      if (end < 0) throw new Error("unterminated '$(' immediate variable");
+      const body = s.slice(i + 2, end);
+      if (body.includes('$')) throw new Error('immediate variables cannot contain $ references');
+      // optional trailing :%fmt — a colon followed by a % format
+      const colon = body.lastIndexOf(':');
+      const value = colon >= 0 && /^%/.test(body.slice(colon + 1).trim())
+        ? immediate(body.slice(0, colon), body.slice(colon + 1).trim())
+        : immediate(body);
+      splice(i, end, value);
+      i += value.length;
+    } else {
+      const value = lookup(next);
+      splice(i, i + 1, value);
+      i += value.length;
+    }
+  }
+  return s;
+};
+
+/**
+ * The quote check that native reads a command line with, before any substitution: a '#' outside quotes starts a
+ * comment, and each single, double or triple quote needs its closing quote on the same line. As native LAMMPS does
+ * (src/input.cpp Input::parse at b332f28): "Unmatched single quote in command: {line}", "Unmatched triple quote in
+ * command: {line}" and "Unmatched double quote in command: {line}", with the whole line.
+ */
+export const checkQuotes = (text: string): void => {
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '#') return;
+    if (c === "'") {
+      const end = text.indexOf("'", i + 1);
+      if (end < 0) throw new Error(`Unmatched single quote in command: ${text}`);
+      i = end + 1;
+    } else if (c === '"') {
+      if (text.startsWith('"""', i)) {
+        const end = text.indexOf('"""', i + 3);
+        if (end < 0) throw new Error(`Unmatched triple quote in command: ${text}`);
+        i = end + 3;
+      } else {
+        const end = text.indexOf('"', i + 1);
+        if (end < 0) throw new Error(`Unmatched double quote in command: ${text}`);
+        i = end + 1;
+      }
+    } else i++;
+  }
+};
+
+/** Splits a substituted command into words, removing the quotes of quoted words. */
+export const tokenize = (text: string): string[] => {
+  const words: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (i >= text.length) break;
+    let word = '';
+    let quoted = false;
+    while (i < text.length && !/\s/.test(text[i])) {
+      const q = text.startsWith('"""', i) ? '"""' : text[i] === '"' || text[i] === "'" ? text[i] : null;
+      if (q) {
+        const end = text.indexOf(q, i + q.length);
+        if (end < 0) throw new Error(`unbalanced ${q} quote`);
+        word += text.slice(i + q.length, end);
+        i = end + q.length;
+        quoted = true;
+      } else {
+        word += text[i++];
+      }
+    }
+    if (word || quoted) words.push(word);
+  }
+  return words;
+};
+
+/**
+ * C-style number formatting for "$(expr:%fmt)" and print: %[flags][width]
+ * [.precision](f|e|g|d|i). Anything else is an error — a format must
+ * consume one floating-point value (Commands_parse.html). The implementation is in cformat.ts.
+ */
+export { formatNumber } from './cformat';
+
+/**
+ * Files a script reads by name — read_data, read_dump and include take the
+ * file as their first argument, molecule as its second — so the notebook can
+ * remind the user to add them. Names built from variables are skipped.
+ */
+export const filesReadBy = (script: string): string[] => {
+  const out = new Set<string>();
+  for (const raw of script.split('\n')) {
+    const line = raw.replace(/#.*$/, '').trim();
+    const w = line.split(/\s+/);
+    if ((w[0] === 'read_data' || w[0] === 'read_dump' || w[0] === 'include') && w[1] && !w[1].includes('$')) out.add(w[1]);
+    if (w[0] === 'molecule' && w[2] && !w[2].includes('$')) out.add(w[2]);
+  }
+  return [...out];
+};

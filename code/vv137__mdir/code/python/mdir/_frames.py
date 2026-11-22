@@ -1,0 +1,775 @@
+"""The frame evaluator (docs/python-frames.md): the potential energy that
+the forces sample, the virial, and the observed columns at stored frames,
+with the vector-Jacobian product in the tunables.
+
+A fit by reweighting (Thaler and Zavadlav, Nat. Commun. 12, 6884 (2021))
+needs U and dU/dtheta at frames sampled at other values of theta; the
+weights and the loss stay in the framework.
+"""
+import sys
+from collections.abc import Mapping
+from types import MappingProxyType
+
+import numpy as np
+
+from . import _core
+
+#: The bytes of float64 positions that one call into the extension takes.
+_BATCH_BYTES = 1 << 26
+#: The gradients of the energy that `evaluate` gives as arrays where they
+#: are asked, in the order of what `_evaluate_frames` returns.
+_GRADIENTS = ("positions", "strain")
+
+
+def _named(gradients):
+    """The names of `gradients`, each once, in the order given: a tuple
+    among "tunables", "positions", and "strain"."""
+    if isinstance(gradients, str) or not hasattr(gradients, "__iter__"):
+        raise _core.InputError("frames: gradients is a tuple of names among 'tunables', "
+                               f"'positions', and 'strain'; found {gradients!r}")
+    named = tuple(dict.fromkeys(gradients))
+    for name in named:
+        if name not in ("tunables",) + _GRADIENTS:
+            raise _core.InputError("frames: gradients names 'tunables', 'positions', and "
+                                   f"'strain'; found {name!r}")
+    return named
+
+
+def _array(source, name):
+    """A NumPy array of `source` on the host, without a copy where it is one
+    already. A tensor that requires a gradient is refused here: the
+    evaluator returns arrays, which carry no graph, and a gradient left out
+    is not zero. `mdir.torch.evaluate` differentiates in the positions and
+    the cell given as tensors (D252). A tensor that carries a tangent of
+    forward mode is refused too (D391): the arrays
+    carry no tangent, and one left out is not zero. PyTorch is looked at
+    only where it is imported already, by its public `unpack_dual`."""
+    torch = sys.modules.get("torch")
+    if (torch is not None and isinstance(source, torch.Tensor) and
+            torch.autograd.forward_ad.unpack_dual(source).tangent is not None):
+        raise _core.UnsupportedError(
+            f"{name} carry a tangent of forward mode (torch.func.jvp, jacfwd, or "
+            "torch.autograd.forward_ad), which the arrays of the frame evaluator do not carry: "
+            "forward mode is not implemented; reverse mode (torch.autograd.grad / backward) "
+            "is, through mdir.torch.evaluate. The tangent would not be zero")
+    if getattr(source, "requires_grad", False):
+        raise _core.UnsupportedError(
+            f"{name} require a gradient, which the arrays of FrameEvaluator.evaluate do not "
+            "carry: ask for gradients=('positions', 'strain'), or give mdir.torch.evaluate the "
+            "positions as one tensor (K, N, 3) and the cells and tilts as tensors; or detach "
+            "them")
+    if isinstance(source, np.ndarray):
+        return source
+    if hasattr(source, "__dlpack__"):
+        try:
+            return np.from_dlpack(source)
+        except Exception:
+            # A buffer of a device, or one that NumPy cannot alias.
+            if hasattr(source, "cpu"):
+                return np.asarray(source.cpu())
+            raise _core.InputError(f"{name}: cannot read the buffer on the host") from None
+    return np.asarray(source)
+
+
+def _cell(cell):
+    """The cell of one frame as its diagonal a_x, b_y, c_z and its tilts
+    b_x, c_x, c_y (D238), each (3,) float64, the tilts None for an
+    orthorhombic cell given by its edges: the one place that knows the
+    shapes a cell is given in. Takes an `mdir.Cell` (or any object with
+    `diagonal` and `tilt` in its convention), the array of the three edges,
+    and the (3, 3) matrix of the cell vectors in rows, lower triangular, as
+    a frame of `mdir.read_h5md` unpacks it for a triclinic cell (D239)."""
+    if cell is None:
+        return None, None
+    if hasattr(cell, "tilt"):
+        return (np.asarray(cell.diagonal, dtype=np.float64).reshape(3),
+                np.asarray(cell.tilt, dtype=np.float64).reshape(3))
+    given = np.asarray(_array(cell, "cells"), dtype=np.float64)
+    if given.shape == (3, 3):
+        if given[0, 1] != 0.0 or given[0, 2] != 0.0 or given[1, 2] != 0.0:
+            raise _core.InputError(
+                "frames: the cell vectors of a frame are the rows of a lower-triangular "
+                "matrix, a = (a_x, 0, 0), b = (b_x, b_y, 0), c = (c_x, c_y, c_z)")
+        return np.array(np.diag(given)), np.array([given[1, 0], given[2, 0], given[2, 1]])
+    if given.shape != (3,):
+        raise _core.InputError("frames: the cell of a frame is an mdir.Cell, its three edges, "
+                               f"shape (3,), or its vectors, shape (3, 3); found {given.shape}")
+    return given, None
+
+
+def _cells(cells, tilts, count):
+    """The cells of `count` frames given as arrays: `cells` (3,) or (K, 3),
+    the diagonal a_x, b_y, c_z (the edges of an orthorhombic cell), and
+    `tilts` None or (3,) or (K, 3), b_x, c_x, c_y."""
+    def rows(values, name):
+        if values is None:
+            return None
+        if hasattr(values, "tilt"):
+            raise _core.InputError(f"frames: {name} is an array; give an mdir.Cell with "
+                                   "each frame of an iterable")
+        a = np.asarray(_array(values, name), dtype=np.float64)
+        if a.shape == (3,):
+            a = np.broadcast_to(a, (count, 3))
+        if a.shape != (count, 3):
+            raise _core.InputError(f"frames: expected {name} of shape (3,) or ({count}, 3); "
+                                   f"found {a.shape}")
+        return a
+    if cells is None and tilts is not None:
+        raise _core.InputError("frames: tilts are given with the diagonals of the cells, "
+                               "cells")
+    return rows(cells, "cells"), rows(tilts, "tilts")
+
+
+class _Arrays:
+    """Frames given as one array (K, N, 3), read a batch at a time: an array
+    on disk is not read whole."""
+
+    reusable = True
+
+    def __init__(self, positions, cells, tilts, particles):
+        if positions.ndim == 2:
+            positions = positions[None]
+        if positions.ndim != 3 or positions.shape[1:] != (particles, 3):
+            raise _core.InputError(f"frames: expected positions of shape (K, {particles}, 3) or "
+                                   f"({particles}, 3) in nm, in the order of the input; found "
+                                   f"{positions.shape}")
+        if positions.dtype not in (np.float64, np.float32):
+            raise _core.InputError("frames: positions are float64 or float32; found "
+                                   f"{positions.dtype}")
+        self.positions, self.count = positions, positions.shape[0]
+        self.cells, self.tilts = _cells(cells, tilts, self.count)
+        self.step = max(1, _BATCH_BYTES // max(24 * particles, 1))
+
+    def batches(self):
+        for at in range(0, self.count, self.step):
+            end = min(at + self.step, self.count)
+            yield (np.ascontiguousarray(self.positions[at:end], dtype=np.float64),
+                   None if self.cells is None else np.ascontiguousarray(self.cells[at:end]),
+                   None if self.tilts is None else np.ascontiguousarray(self.tilts[at:end]))
+
+
+class _Items:
+    """Frames given one at a time by an iterable: each item an object with
+    `positions` and `cell` (an `mdir.State`, or the frame of a reader of a
+    file), a pair (positions, cell), or the positions alone."""
+
+    def __init__(self, items, particles):
+        self.items, self.particles = items, particles
+        # An iterator is read once; a second pass needs the frames again.
+        self.reusable = iter(items) is not items
+        self.count = len(items) if hasattr(items, "__len__") else None
+        self.step = max(1, _BATCH_BYTES // max(24 * particles, 1))
+
+    def _frame(self, item, index):
+        if hasattr(item, "positions"):
+            positions, cell = item.positions, getattr(item, "cell", None)
+        elif isinstance(item, (tuple, list)) and len(item) == 2:
+            positions, cell = item
+        else:
+            positions, cell = item, None
+        x = _array(positions, "positions")
+        if x.shape != (self.particles, 3):
+            raise _core.InputError(f"frame {index}: expected positions of shape "
+                                   f"({self.particles}, 3); found {x.shape}")
+        return (np.asarray(x, dtype=np.float64),) + _cell(cell)
+
+    def batches(self):
+        x, cells, tilts = [], [], []
+
+        def flush():
+            given = [c is not None for c in cells]
+            if any(given) and not all(given):
+                raise _core.InputError("frames: some frames give a cell and some do not")
+            tilted = [t is not None for t in tilts]
+            # A frame without tilts among frames with them is orthorhombic.
+            rows = (np.array([t if t is not None else np.zeros(3) for t in tilts])
+                    if any(tilted) else None)
+            batch = (np.ascontiguousarray(np.stack(x)), np.array(cells) if all(given) else None,
+                     rows)
+            x.clear(), cells.clear(), tilts.clear()
+            return batch
+
+        for index, item in enumerate(self.items):
+            frame = self._frame(item, index)
+            x.append(frame[0]), cells.append(frame[1]), tilts.append(frame[2])
+            if len(x) == self.step:
+                yield flush()
+        if x:
+            yield flush()
+
+
+def _source(positions, cells, tilts, particles):
+    """The frames of a call, as batches that can be asked for."""
+    array_like = isinstance(positions, np.ndarray) or hasattr(positions, "__dlpack__") or (
+        hasattr(positions, "__array__") and not hasattr(positions, "positions"))
+    if array_like:
+        return _Arrays(_array(positions, "positions"), cells, tilts, particles)
+    if hasattr(positions, "positions"):
+        positions = [positions]         # one State
+    if cells is not None or tilts is not None:
+        raise _core.InputError("frames: an iterable gives the cell of each frame with the "
+                               "frame; cells and tilts must be None")
+    try:
+        iter(positions)
+    except TypeError:
+        raise _core.InputError("frames: expected an array (K, N, 3), or an iterable of states "
+                               "or of pairs (positions, cell)") from None
+    return _Items(positions, particles)
+
+
+class FrameGradient(Mapping):
+    """The product of a cotangent on the energies of the frames with their
+    derivative in the tunables: a read-only mapping of the names of the
+    tunables to arrays of the shape of their values, in kJ/mol per unit of
+    the tunable times the unit of the cotangent, as `TunableGradient`
+    (D230) is at one state."""
+
+    def __init__(self, values, zero, version, positions=None):
+        self._values, self.zero, self.version = values, zero, version
+        # With "positions" in the gradients of FrameEnergies.vjp, the
+        # derivative of the product in the positions (K, N, 3) float64, in
+        # the order of the input (D383); None otherwise.
+        self.positions = positions
+
+    def __getitem__(self, name):
+        return self._values[name]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __repr__(self):
+        return f"FrameGradient(version={self.version}, {list(self._values)})"
+
+
+class FrameTangent:
+    """The tangent of the outputs of `FrameEvaluator.evaluate` along a
+    tangent of the tunables, what `FrameEnergies.jvp` returns (#726,
+    D389): `energy`, the tangent of the energies (K,)
+    float64 in kJ/mol per unit of the tunable times the unit of the
+    tangent, with what the host adds to the energy; `gradients`, a
+    read-only mapping, with "positions" where it was asked: the tangent of
+    the gradients in the positions (K, N, 3) float64, in the order of the
+    input; and `version`, that of the values of the tunables."""
+
+    def __init__(self, energy, gradients, version):
+        self.energy = _frozen(energy)
+        self.gradients = MappingProxyType({name: _frozen(a) for name, a in gradients.items()})
+        self.version = version
+
+    def __repr__(self):
+        return (f"FrameTangent(count={len(self.energy)}, version={self.version}, "
+                f"gradients={list(self.gradients)})")
+
+
+def _frozen(array):
+    array.setflags(write=False)
+    return array
+
+
+class FrameEnergies:
+    """What `FrameEvaluator.evaluate` returns; see docs/python-frames.md.
+
+    With `terms="all"` it has `energy`, the potential energy, and `virial`;
+    with `terms="dependent"` it has `dependent_energy`, the energy of the
+    terms that a tunable enters, which is not the potential energy: each
+    name raises in the other mode, and `unavailable` lists what the mode
+    does not give."""
+
+    def __init__(self, evaluator, source, energy, virial, volume, observed, rows, gradient,
+                 gradients):
+        self._evaluator, self._source, self._gradient = evaluator, source, gradient
+        # The gradients of the energy that were asked (D252):
+        # "positions", dU/dx (K, N, 3) in kJ/mol/nm, in the order of the
+        # input and the type of the forces of the program; "strain",
+        # dU/d(epsilon) (K, 3, 3) float64 in kJ/mol.
+        self.gradients = MappingProxyType({name: _frozen(a) for name, a in gradients.items()})
+        self._energy, self._virial, self.volume = _frozen(energy), _frozen(virial), _frozen(volume)
+        self.terms, self.unavailable = evaluator.terms, evaluator.unavailable
+        self.count = len(energy)
+        self.observables = {name: _frozen(np.ascontiguousarray(observed[:, k]))
+                            for k, name in enumerate(evaluator._columns)}
+        self.depends = dict(evaluator._depends)
+        self.version = evaluator.tunables.version
+        self.zero = evaluator._zero
+        self._rows = None if rows is None else _frozen(rows)
+        self.jacobian = None if rows is None else {
+            name: self._rows[:, begin:end] for name, (begin, end) in evaluator._slices.items()}
+
+    def _only(self, name, mode, value):
+        if self.terms != mode:
+            raise _core.UnsupportedError(
+                f"'{name}' is not given by a frame evaluator with terms='{self.terms}': " +
+                ("it evaluates the terms that a tunable enters alone, whose energy is "
+                 "'dependent_energy' and is not the potential energy"
+                 if self.terms == "dependent" else
+                 "its energy is 'energy', that of the whole potential"))
+        return value
+
+    @property
+    def energy(self):
+        """The potential energy that the forces sample (D210), kJ/mol."""
+        return self._only("energy", "all", self._energy)
+
+    @property
+    def virial(self):
+        return self._only("virial", "all", self._virial)
+
+    @property
+    def dependent_energy(self):
+        """The energy of the terms that a tunable enters, kJ/mol: its
+        differences in the tunables and its derivative are those of the
+        potential energy."""
+        return self._only("dependent_energy", "dependent", self._energy)
+
+    def vjp(self, cotangent=None, *, positions=None, gradients=("tunables",)):
+        """sum_n cotangent[n] dU_n/dtheta, for a cotangent (K,) float64 on
+        the energy: a product with the Jacobian if it was kept, a second pass
+        over the frames otherwise.
+
+        With `positions`, a cotangent (K, N, 3) on the gradients in the
+        positions dU_n/dx_i (`gradients["positions"]`, the forces with the
+        opposite sign), in the order of the input, the product adds
+        sum_n sum_i positions[n, i] . d2U_n/dx_i dtheta, the mixed
+        derivative of force matching (D381, #726), by a pass
+        of the product program of the evaluator over the frames; without
+        `cotangent` that of the energy is zero. The sign of a loss on the
+        forces is the caller's: its cotangent on F is minus that on dU/dx.
+
+        `gradients` names what is returned, among "tunables" (the mapping,
+        the default) and "positions" (D383, #771): the
+        derivative of the same product in the positions,
+        cotangent[n] dU_n/dx + H_n positions[n] with H_n the Hessian of U_n
+        in the positions, as the attribute `positions` (K, N, 3) float64, in
+        the order of the input, by the same pass of a product program that
+        gives it as well; a term without a rule for it (the reciprocal sum
+        of particle mesh Ewald) raises UnsupportedError, naming it.
+        Virtual sites take both: linear ones (D384) and the extra points
+        of Amber, placed by the directions of their bonds, with the
+        curvature of their placement (D387); the
+        cotangent on a site is not read, its gradient being zero."""
+        evaluator = self._evaluator
+        if isinstance(gradients, str) or not hasattr(gradients, "__iter__"):
+            raise _core.InputError("vjp: gradients is a tuple of names among 'tunables' and "
+                                   f"'positions'; found {gradients!r}")
+        names = tuple(dict.fromkeys(gradients))
+        for name in names:
+            if name not in ("tunables", "positions"):
+                raise _core.InputError("vjp: gradients names 'tunables' and 'positions'; "
+                                       f"found {name!r}")
+        wants = "positions" in names
+        if not self._gradient:
+            raise _core.InputError("these frames were evaluated without 'tunables' in gradients")
+        if cotangent is None and positions is None:
+            raise _core.InputError("vjp: give a cotangent on the energies, on their gradients "
+                                   "in the positions (positions=), or both")
+        g = None
+        if cotangent is not None:
+            g = np.asarray(_array(cotangent, "cotangent"), dtype=np.float64)
+            if g.shape != (self.count,):
+                raise _core.InputError(f"vjp: expected a cotangent of shape ({self.count},); "
+                                       f"found {g.shape}")
+            if not np.all(np.isfinite(g)):
+                raise _core.InputError("vjp: the cotangent is not finite")
+        dx = None
+        if wants and positions is None:
+            positions = np.zeros((self.count, evaluator._particles, 3))
+        if positions is not None:
+            v = np.asarray(_array(positions, "positions"), dtype=np.float64)
+            shape = (self.count, evaluator._particles, 3)
+            if v.shape != shape:
+                raise _core.InputError(f"vjp: expected a cotangent on the gradients in the "
+                                       f"positions of shape {shape}; found {v.shape}")
+            if not np.all(np.isfinite(v)):
+                raise _core.InputError("vjp: the cotangent on the gradients in the positions is "
+                                       "not finite")
+            total = evaluator._product_pass(
+                self._source, self.version,
+                np.zeros(self.count) if g is None else g, np.ascontiguousarray(v), wants)
+            if wants:
+                total, dx = total
+                dx = _frozen(dx)
+        elif self._rows is not None:
+            total = g @ self._rows
+        else:
+            total = evaluator._second_pass(self._source, self.version, g)
+        values = {} if "tunables" not in names else {
+            name: _frozen(np.ascontiguousarray(total[begin:end]))
+            for name, (begin, end) in evaluator._slices.items()}
+        return FrameGradient(values, self.zero, self.version, dx)
+
+    def jvp(self, tangent, *, gradients=("positions",)):
+        """The tangent of the outputs of `evaluate` along `tangent`, a
+        mapping of names of the tunables to arrays of the shapes of their
+        values (a name left out is zero): a `FrameTangent` with `energy`,
+        sum_m dU_n/dtheta_m tangent_m (K,), and, with "positions" in
+        `gradients`, gradients["positions"], sum_m d2U_n/dx dtheta_m
+        tangent_m (K, N, 3) float64, forward mode in the tunables of the
+        gradient in the positions (#726, D389).
+
+        The tangent of the gradient is formed by a pass of a product program
+        of the evaluator over the frames, compiled at the first such call;
+        that pass gives the tangent of the energy too. With `gradients=()`
+        there is no such pass: the energy alone, from the kept Jacobian or a
+        second pass. The frames and the values of the tunables are those of
+        `evaluate`, as for `vjp`. Virtual sites take it as their atoms do."""
+        evaluator = self._evaluator
+        if isinstance(gradients, str) or not hasattr(gradients, "__iter__"):
+            raise _core.InputError("jvp: gradients is a tuple of names among 'positions'; "
+                                   f"found {gradients!r}")
+        names = tuple(dict.fromkeys(gradients))
+        for name in names:
+            if name != "positions":
+                raise _core.InputError(f"jvp: gradients names 'positions'; found {name!r}")
+        if not self._gradient:
+            raise _core.InputError("these frames were evaluated without 'tunables' in gradients")
+        if not isinstance(tangent, Mapping):
+            raise _core.InputError("jvp: the tangent is a mapping of names of the tunables to "
+                                   "arrays of the shapes of their values")
+        flat = np.zeros(evaluator._entries)
+        for name, value in tangent.items():
+            if name not in evaluator._slices:
+                raise _core.InputError(f"jvp: '{name}' is not a tunable of the program; the "
+                                       f"tunables are {list(evaluator._slices)}")
+            begin, end = evaluator._slices[name]
+            v = np.asarray(_array(value, f"tangent['{name}']"), dtype=np.float64)
+            if v.shape != (end - begin,):
+                raise _core.InputError(f"jvp: expected a tangent of '{name}' of shape "
+                                       f"({end - begin},); found {v.shape}")
+            if not np.all(np.isfinite(v)):
+                raise _core.InputError(f"jvp: the tangent of '{name}' is not finite")
+            flat[begin:end] = v
+        if "positions" in names:
+            energy, dx = evaluator._direction_pass(self._source, self.version, flat)
+            return FrameTangent(energy, {"positions": dx}, self.version)
+        if self._rows is not None:
+            energy = self._rows @ flat
+        else:
+            energy = evaluator._tangent_pass(self._source, self.version, flat, self.count)
+        return FrameTangent(np.ascontiguousarray(energy, dtype=np.float64), {}, self.version)
+
+    def __repr__(self):
+        return (f"FrameEnergies(count={self.count}, version={self.version}, "
+                f"jacobian={'kept' if self._rows is not None else 'not kept'})")
+
+
+class FrameEvaluator:
+    """Evaluates a program at stored frames, in a simulation of its own.
+
+    `program` is compiled with tunables and `System.tunable_gradient`: the
+    energy of a frame is the potential that the forces sample (D210), which
+    that program carries. The Jacobian of the energies in the tunables,
+    8 K M bytes, is kept up to `jacobian_bytes`; above it `vjp` evaluates
+    the frames again."""
+
+    def __init__(self, program, jacobian_bytes=1 << 28, terms="all"):
+        if terms not in ("all", "dependent"):
+            raise _core.InputError("FrameEvaluator: terms is 'all' or 'dependent'")
+        given = list(program.plan.get("observables", []))
+        if terms == "dependent":
+            # A program of its own with the terms that a tunable enters,
+            # built from the model of the one given; its simulations take
+            # its code as those of any program do (D236).
+            program = program._dependent()
+        self.terms = terms
+        plan = program.plan
+        declared = plan.get("tunables", [])
+        if not declared:
+            raise _core.InputError("FrameEvaluator: the program declares no tunable parameters "
+                                   "(System.tunables)")
+        if any("gradient" not in d for d in declared):
+            raise _core.InputError(
+                "FrameEvaluator: the program was compiled without the derivative in the "
+                "tunables, whose potential gives the energy of a frame: set "
+                "System.tunable_gradient = True and compile again")
+        if int(jacobian_bytes) < 0:
+            raise _core.InputError("FrameEvaluator: jacobian_bytes is not negative")
+        self.program, self.jacobian_bytes = program, int(jacobian_bytes)
+        # The product program (D381, #726), compiled at the
+        # first product.
+        self._product = None
+        # The product program that also gives the derivative in the
+        # positions (#771), compiled at the first such product.
+        self._product_positions = None
+        # The product program of forward mode in the tunables (#726,
+        # D389), compiled at the first such call.
+        self._product_direction = None
+        # A simulation whose entry is a loop over frames: the frames of
+        # every call are evaluated in one activation of it.
+        self._simulation = _core.Simulation(program, _frames=True)
+        self._particles = self._simulation._particle_count
+        # The type of the gradient in the positions: that of the forces of
+        # the program.
+        self._force_type = np.dtype(np.float64 if self._simulation._forces_double
+                                    else np.float32)
+        # The cell of a frame that gives none is that of the program, not
+        # that of the last frame evaluated.
+        cell = self._simulation.state().cell
+        edges = np.array(cell.diagonal, dtype=np.float64)
+        self._edges = edges if np.all(edges > 0.0) else None
+        self._tilt = np.array(cell.tilt, dtype=np.float64)
+        self._slices, at = {}, 0
+        for d in declared:
+            self._slices[d["name"]] = (at, at + d["entries"])
+            at += d["entries"]
+        self._entries = at
+        self._zero = frozenset(d["name"] for d in declared if d["gradient"] == "zero")
+        self._columns = list(plan.get("observables", []))
+        # What each output may read at fixed positions. The energy and the
+        # virial: every tunable that the energy reads. A column of `observe`
+        # is of one term: the constants and parameters of that term that are
+        # tunable, and the charges, which an expression may read; the
+        # Lennard-Jones parameters of the types enter no observed term
+        # (D230 refuses a pair term that reads them). The volume: none.
+        reads = frozenset(d["name"] for d in declared) - self._zero
+        if terms == "all":
+            self._depends = {"energy": reads, "virial": reads, "volume": frozenset()}
+            self.unavailable = ("dependent_energy",)
+        else:
+            self._depends = {"dependent_energy": reads, "volume": frozenset()}
+            self.unavailable = ("energy", "virial", "gradients") + tuple(
+                c for c in given if c not in self._columns)
+        for column in self._columns:
+            term = column.rsplit(".", 1)[0]
+            self._depends[column] = frozenset(
+                d["name"] for d in declared if d["name"] in reads and
+                (d["term"] == term or d["parameter"] == "charge"))
+
+    def _second_pass(self, source, version, cotangent):
+        """The product of `cotangent` with the derivative of the energies
+        of the frames `source`, which were evaluated at the version
+        `version` of the values, by evaluating them again."""
+        if self.tunables.version != version:
+            raise _core.SimulationError(
+                "the Jacobian of these frames was not kept (jacobian_bytes), and the values of "
+                f"the tunables changed since they were evaluated (version {version}, now "
+                f"{self.tunables.version}): a second pass would differentiate another potential")
+        total, at = np.zeros(self._entries), 0
+        for x, cells, tilts in source.batches():
+            rows = self._simulation._evaluate_frames(x, *self._cells(x, cells, tilts), True, at)[4]
+            if at + len(x) > len(cotangent):
+                break
+            total += cotangent[at:at + len(x)] @ rows
+            at += len(x)
+        if at != len(cotangent):
+            raise _core.InputError(f"vjp: the frames gave another number of frames in the second "
+                                   f"pass than the {len(cotangent)} of the first")
+        return total
+
+    def _tangent_pass(self, source, version, tangent, count):
+        """The products of the rows of the frames `source` with `tangent`,
+        (K,), by evaluating them again, as `_second_pass`."""
+        if self.tunables.version != version:
+            raise _core.SimulationError(
+                "the Jacobian of these frames was not kept (jacobian_bytes), and the values of "
+                f"the tunables changed since they were evaluated (version {version}, now "
+                f"{self.tunables.version}): a second pass would differentiate another potential")
+        parts, at = [], 0
+        for x, cells, tilts in source.batches():
+            rows = self._simulation._evaluate_frames(x, *self._cells(x, cells, tilts), True, at)[4]
+            parts.append(rows @ tangent)
+            at += len(x)
+        if at != count:
+            raise _core.InputError(f"jvp: the frames gave another number of frames in the second "
+                                   f"pass than the {count} of the first")
+        return np.concatenate(parts) if parts else np.zeros(0)
+
+    def _direction_pass(self, source, version, tangent):
+        """Forward mode in the tunables over the frames `source`, evaluated
+        at the version `version`, along `tangent` (entries,): the tangents of
+        the energies (K,) and of their gradients in the positions (K, N, 3),
+        by the product program of forward mode (#726,
+        D389), a simulation of its own compiled at the
+        first call, at the values of the tunables of the evaluator."""
+        if self.terms != "all":
+            raise _core.UnsupportedError(
+                "the tangent of the gradients in the positions is not given by a frame "
+                "evaluator with terms='dependent': its gradients are not those of the "
+                "potential energy")
+        if not source.reusable:
+            raise _core.InputError(
+                "jvp: the tangent of the gradients in the positions evaluates the frames "
+                "again, and an iterator gives them once: give a sequence")
+        if self.tunables.version != version:
+            raise _core.SimulationError(
+                f"jvp: the values of the tunables changed since these frames were evaluated "
+                f"(version {version}, now {self.tunables.version}): the tangent would "
+                "differentiate another potential")
+        if self._product_direction is None:
+            try:
+                self._product_direction = _core.Simulation(
+                    self.program, _frames=True, _frame_product=True,
+                    _frame_product_direction=True)
+            except (_core.InputError, _core.CompileError) as error:
+                raise _core.UnsupportedError(
+                    "forward mode in the tunables of the gradients in the positions is not "
+                    f"formed for this program: {error}") from None
+        product = self._product_direction
+        changes = {}
+        for name in self._slices:
+            value = np.ascontiguousarray(self.tunables[name])
+            if value.tobytes() != np.ascontiguousarray(product.tunables[name]).tobytes():
+                changes[name] = value
+        if changes:
+            product.tunables.update(changes)
+        energies, gradients, at = [], [], 0
+        for x, cells, tilts in source.batches():
+            u, dx = product._evaluate_frame_directions(
+                x, *self._cells(x, cells, tilts), np.ascontiguousarray(tangent), at)
+            energies.append(u)
+            gradients.append(dx)
+            at += len(x)
+        if not energies:
+            return np.zeros(0), np.zeros((0, self._particles, 3))
+        return np.concatenate(energies), np.concatenate(gradients)
+
+    def _product_pass(self, source, version, energy, position, positions=False):
+        """The sum over the frames `source`, evaluated at the version
+        `version`, of energy[n] dU_n/dtheta + position[n] . d2U_n/dx dtheta,
+        by the product program (D381, #726), a simulation of
+        its own compiled at the first product, at the values of the tunables
+        of the evaluator.
+
+        With `positions`, also the derivative of the product of each frame in
+        its positions, energy[n] dU_n/dx + H_n position[n], (K, N, 3), by the
+        product program that gives it (#771, D383), compiled
+        at the first such product; returns (total, derivative)."""
+        if self.terms != "all":
+            raise _core.UnsupportedError(
+                "the product in the gradients in the positions is not given by a frame "
+                "evaluator with terms='dependent': its gradients are not those of the "
+                "potential energy")
+        if not source.reusable:
+            raise _core.InputError(
+                "vjp: the product in the gradients in the positions evaluates the frames again, "
+                "and an iterator gives them once: give a sequence")
+        if self.tunables.version != version:
+            raise _core.SimulationError(
+                f"vjp: the values of the tunables changed since these frames were evaluated "
+                f"(version {version}, now {self.tunables.version}): the product would "
+                "differentiate another potential")
+        if positions:
+            if self._product_positions is None:
+                try:
+                    self._product_positions = _core.Simulation(
+                        self.program, _frames=True, _frame_product=True,
+                        _frame_product_positions=True)
+                except (_core.InputError, _core.CompileError) as error:
+                    raise _core.UnsupportedError(
+                        "the derivative in the positions of the product of the gradients in the "
+                        f"positions is not formed for this program: {error}") from None
+            product = self._product_positions
+        else:
+            if self._product is None:
+                try:
+                    self._product = _core.Simulation(self.program, _frames=True,
+                                                     _frame_product=True)
+                except (_core.InputError, _core.CompileError) as error:
+                    raise _core.UnsupportedError(
+                        "the product of the gradients in the positions with their derivative in "
+                        f"the tunables is not formed for this program: {error}") from None
+            product = self._product
+        changes = {}
+        for name in self._slices:
+            value = np.ascontiguousarray(self.tunables[name])
+            if value.tobytes() != np.ascontiguousarray(product.tunables[name]).tobytes():
+                changes[name] = value
+        if changes:
+            product.tunables.update(changes)
+        total, at, parts = np.zeros(self._entries), 0, []
+        for x, cells, tilts in source.batches():
+            if at + len(x) > len(energy):
+                break
+            result = product._evaluate_frame_products(
+                x, *self._cells(x, cells, tilts), energy[at:at + len(x)],
+                np.ascontiguousarray(position[at:at + len(x)]), at, positions)
+            if positions:
+                total += result[0]
+                parts.append(result[1])
+            else:
+                total += result
+            at += len(x)
+        if at != len(energy):
+            raise _core.InputError(f"vjp: the frames gave another number of frames in the "
+                                   f"product than the {len(energy)} of the first pass")
+        if positions:
+            return total, (parts[0] if len(parts) == 1 else np.concatenate(parts))
+        return total
+
+    def _cells(self, x, cells, tilts):
+        """The edges and the tilts of the frames of a batch: those given
+        (edges alone are an orthorhombic cell), or those of the program."""
+        if cells is not None or self._edges is None:
+            return cells, tilts
+        return (np.ascontiguousarray(np.broadcast_to(self._edges, (len(x), 3))),
+                np.ascontiguousarray(np.broadcast_to(self._tilt, (len(x), 3))))
+
+    @property
+    def tunables(self):
+        """The values of the tunables that the frames are evaluated at
+        (`TunableValues`, D213); those of the program at first."""
+        return self._simulation.tunables
+
+    def evaluate(self, positions, cells=None, tilts=None, *, gradients=("tunables",)):
+        """The energies, virials, volumes, and observed columns of the
+        frames `positions`, and the gradients of the energy that
+        `gradients` names, a tuple among "tunables" (the derivative in the
+        tunables: `jacobian` and `vjp`; the default), "positions", and
+        "strain" (`gradients["positions"]`, `gradients["strain"]`); see
+        docs/python-frames.md."""
+        simulation = self._simulation
+        named = _named(gradients)
+        gradient = "tunables" in named
+        asked = tuple(name for name in named if name != "tunables")
+        if asked and self.terms != "all":
+            raise _core.UnsupportedError(
+                "the gradients in the positions and the strain are not given by a frame "
+                "evaluator with terms='dependent': it evaluates the terms that a tunable enters "
+                "alone, whose gradients are not those of the potential energy")
+        wants = ("positions" in asked, "strain" in asked)
+        source = _source(positions, cells, tilts, self._particles)
+        keep = bool(gradient)
+        if keep and source.count is not None:
+            keep = 8 * source.count * self._entries <= self.jacobian_bytes
+        if gradient and not keep and not source.reusable:
+            raise _core.InputError(
+                "frames: the Jacobian of these frames is above jacobian_bytes, so that vjp "
+                "needs the frames again, and an iterator gives them once: give a sequence")
+        parts, at = [], 0
+        for x, c, t in source.batches():
+            if keep and 8 * (at + len(x)) * self._entries > self.jacobian_bytes:
+                # The rows pass the bound: they are dropped, and vjp reads
+                # the frames again.
+                if not source.reusable:
+                    raise _core.InputError(
+                        f"frame {self.jacobian_bytes // (8 * self._entries)}: the Jacobian "
+                        f"passes jacobian_bytes ({self.jacobian_bytes}), so that vjp needs the "
+                        "frames again, and an iterator gives them once: give a sequence")
+                keep = False
+                parts = [p[:4] + (None,) + p[5:] for p in parts]
+            parts.append(simulation._evaluate_frames(x, *self._cells(x, c, t), keep, at, *wants))
+            at += len(x)
+        if not parts:
+            raise _core.InputError("frames: no frames were given")
+        if source.count is None:
+            source.count = at
+
+        def joined(k):
+            # One batch is the usual case, and its array is not copied.
+            return parts[0][k] if len(parts) == 1 else np.concatenate([p[k] for p in parts])
+
+        columns = [joined(k) for k in range(4)]
+        rows = joined(4) if keep else None
+        given = {name: joined(5 + k) for k, name in enumerate(_GRADIENTS) if name in asked}
+        return FrameEnergies(self, source, *columns, rows, bool(gradient),
+                             {name: given[name] for name in asked})
+
+    def _evaluate_device_batch(self, positions, theta, energies, **outputs):
+        """Internal DLPack entry; buffers stay borrowed through its status wait."""
+        return self._simulation._evaluate_device_batch(positions, theta, energies, **outputs)
+
+    def __repr__(self):
+        return (f"FrameEvaluator(terms='{self.terms}', tunables={list(self._slices)}, "
+                f"observables={self._columns})")

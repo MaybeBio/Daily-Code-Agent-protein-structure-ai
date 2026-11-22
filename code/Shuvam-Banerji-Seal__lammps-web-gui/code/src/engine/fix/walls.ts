@@ -1,0 +1,543 @@
+import { Fix } from './fix';
+import { StyleError } from '../force/types';
+import type { System } from '../system';
+import { parseNumOrVar, valueOf, type NumOrVar } from './util';
+import { logical, numeric } from '../force/util';
+import { libm } from '../libm';
+
+/*
+ * Wall fixes — docs.lammps.org/fix_wall.html (fix_wall.rst). One class per
+ * style; all share the syntax
+ *
+ *   fix ID group-ID style [tabstyle] [N] face args ... keyword value ...
+ *
+ * with "face = *xlo* or *xhi* or *ylo* or *yhi* or *zlo* or *zhi*", "one or
+ * more face/arg pairs may be appended", "zero or more keyword/value pairs may
+ * be appended" and "keyword = *units* or *fld* or *pbc*":
+ *
+ *   *units* value = *lattice* or *box*
+ *   *fld* value = *yes* or *no*
+ *   *pbc* value = *yes* or *no*
+ *
+ * "In all cases, *r* is the distance from the particle to the wall at
+ * position *coord*, and :math:`r_c` is the *cutoff* distance at which the
+ * particle and wall no longer interact. The energy of the wall
+ * potential is shifted so that the wall-particle interaction energy is
+ * 0.0 at the cutoff distance."
+ * "The position of each wall can be specified in one of 3 ways: as the EDGE
+ * of the simulation box, as a constant value, or as a variable."
+ * "The *units* keyword determines the meaning of the distance units used to
+ * define a wall position, but only when a numeric constant or variable is
+ * used.  It is not relevant when EDGE is used to specify a face position."
+ * "A *lattice* value means the distance units are in lattice spacings"
+ * (converted with the lattice spacing of the wall dimension; by default
+ * lattice.html defines lattice none 1.0, so one lattice spacing is one
+ * distance unit). "A *box* value selects standard
+ * distance units as defined by the units command".
+ *
+ * "The *fld* keyword can be used with a *yes* setting to invoke the wall
+ * constraint before pairwise interactions are computed. ... If the setting is
+ * no, wall forces are imposed after pairwise interactions, in the usual
+ * manner." — fld yes applies the forces in pre_force, else in post_force
+ * (docs.lammps.org/Developer_flow.html).
+ *
+ * "The *pbc* keyword can be used with a *yes* setting to allow walls to be
+ * specified in a periodic dimension. ... The default for *pbc* is *no*, which
+ * means the system must be non-periodic when using a wall."
+ *
+ * Output: "This fix computes a global scalar energy and a global vector of
+ * forces ... the scalar energy is the sum of interactions with all defined
+ * walls ... The length of the vector is equal to the number of walls defined
+ * by the fix.  Each vector value is the normal force on a specific wall.
+ * Note that an outward force on a wall will be
+ * a negative value for *lo* walls and a positive value for *hi* walls. The scalar and vector values
+ * calculated by this fix are "extensive"."
+ * fix_modify: "The fix_modify *energy* option is supported by this fix ...
+ * The default setting for this fix is fix_modify energy no." and "The
+ * fix_modify *virial* option is supported by this fix ... The default setting
+ * for this fix is fix_modify virial no." The virial is tallied as r . F with
+ * r the vector from the wall to the atom along the wall axis (the wall acts
+ * like a second body of a pair interaction fixed at coord).
+ * "The forces due to this fix are imposed during an energy minimization,
+ * invoked by the minimize command."
+ *
+ * Restriction measured with native LAMMPS (2Sep2026): an atom of the fix
+ * group on (r = 0) or behind (r < 0) a wall errors with
+ * "Particle on or inside fix wall surface" regardless of the cutoff; atoms
+ * outside the fix group do not trigger it (fix_wall.html: "For all of the
+ * styles, you must ensure that r is always > 0 for
+ * all particles in the group, or LAMMPS will generate an error.  This
+ * means you cannot start your simulation with particles at the wall
+ * position *coord* (r = 0) or with particles on the wrong side of the
+ * wall (r < 0).")
+ *
+ * Units: energies are in LAMMPS energy units (the style parameters are
+ * "epsilon = strength factor for wall-particle interaction (energy or energy/distance\^2 units)",
+ * "sigma = size factor for wall-particle interaction (distance units)"); the
+ * force added to the engine's force array is
+ * -dE/dr, which is already in LAMMPS force units (energy/distance).
+ */
+
+const FACES = ['xlo', 'xhi', 'ylo', 'yhi', 'zlo', 'zhi'] as const;
+type Face = (typeof FACES)[number];
+const isFace = (w: string): w is Face => (FACES as readonly string[]).includes(w);
+
+/**
+ * The box checks of a wall fix when it is created, as native LAMMPS does (src/fix_wall.cpp FixWall::FixWall at b332f28):
+ * no z wall in 2d, and without pbc yes no wall in a periodic dimension (fix_wall.html: "Any dimension (xyz) that has a
+ * wall must be non-periodic", unless "pbc yes").
+ */
+export const checkWallBox = (sys: System, style: string, walls: { dim: number; lo: boolean }[], pbcOk: boolean): void => {
+  const s = sys.state;
+  if (s.dimension === 2 && walls.some((w) => w.dim === 2)) throw new StyleError(`Cannot use fix ${style} zlo/zhi for a 2d simulation`);
+  if (pbcOk) return;
+  for (const w of walls) {
+    if (s.box.periodic[w.dim]) throw new StyleError(`Cannot use ${FACES[2 * w.dim + (w.lo ? 0 : 1)]} wall in periodic ${'xyz'[w.dim]} dimension`);
+  }
+};
+
+/** One wall: axis, side, position, style parameters, cutoff. */
+interface Wall {
+  dim: 0 | 1 | 2;
+  lo: boolean;
+  coord: { edge: true } | { edge: false; v: NumOrVar };
+  /** Style parameters that may be variables (epsilon/sigma, or D_0/alpha/r_0). */
+  params: NumOrVar[];
+  /** "cutoff = distance from wall at which wall-particle interactions are cut off". */
+  cutoff: number;
+}
+
+export abstract class FixWallBase extends Fix {
+  protected readonly walls: Wall[] = [];
+  private unitsMode: 'lattice' | 'box' = 'lattice';
+  private fld = false;
+  private pbcOk = false;
+  /** Per-wall normal force tallied in the last force application (f_ID vector). */
+  private wallForce = new Float64Array(0);
+  /** Sum of shifted interaction energies with all walls (f_ID scalar). */
+  private wallEnergy = 0;
+
+  constructor(sys: System, id: string, group: string, args: string[], protected readonly wallStyle: string, nArgs: number) {
+    super(sys, id, group, args);
+    // As native LAMMPS does (src/fix_wall.cpp FixWall::FixWall at b332f28): faces with their words, then units, fld
+    // and pbc; any other word is "Illegal fix {style} command"; the cutoffs are checked after all the words
+    const illegal = (): StyleError => new StyleError(`Illegal fix ${wallStyle} command`);
+    for (let k = 0; k < args.length;) {
+      const w = args[k];
+      if (isFace(w)) {
+        if (k + 1 + nArgs > args.length) throw new StyleError(`Missing argument for fix ${wallStyle} command`);
+        if (this.walls.some((x) => FACES[x.dim * 2 + (x.lo ? 0 : 1)] === w)) {
+          throw new StyleError(`${w} wall defined twice in fix ${wallStyle} command`);
+        }
+        this.walls.push(this.parseWall(w, args.slice(k + 1, k + 1 + nArgs)));
+        k += 1 + nArgs;
+      } else if (w === 'units') {
+        const v = args[k + 1];
+        if (v !== 'lattice' && v !== 'box') throw illegal();
+        this.unitsMode = v;
+        k += 2;
+      } else if (w === 'fld' || w === 'pbc') {
+        if (k + 2 > args.length) throw illegal();
+        if (w === 'fld') this.fld = logical(args[k + 1]);
+        else this.pbcOk = logical(args[k + 1]);
+        k += 2;
+      } else {
+        throw illegal();
+      }
+    }
+    if (!this.walls.length) throw new StyleError(`Illegal fix ${wallStyle} command: no walls defined`);
+    for (const w of this.walls) {
+      if (w.cutoff <= 0) throw new StyleError(`Fix ${wallStyle} cutoff <= 0.0 for ${FACES[w.dim * 2 + (w.lo ? 0 : 1)]} wall`);
+    }
+    checkWallBox(sys, wallStyle, this.walls, this.pbcOk);
+    this.wallForce = new Float64Array(this.walls.length);
+    // "This fix computes a global scalar energy and a global vector of forces"
+    this.scalarFlag = true;
+    this.vectorFlag = true;
+    this.sizeVector = this.walls.length;
+    this.extscalar = 1;
+    this.extvector = 1;
+    this.energyGlobal = true;
+    this.virialGlobal = true;
+  }
+
+  /** coord epsilon sigma cutoff (or coord D_0 alpha r_0 cutoff for morse). */
+  private parseWall(face: Face, words: string[]): Wall {
+    const dim = 'xyz'.indexOf(face[0]) as 0 | 1 | 2;
+    const lo = face[1] === 'l';
+    const coordW = words[0];
+    const coord: Wall['coord'] = coordW === 'EDGE'
+      ? { edge: true }
+      : coordW.startsWith('v_') ? { edge: false, v: { variable: coordW.slice(2) } }
+        : { edge: false, v: parseNumOrVar(coordW, `${face} wall coord`) };
+    if (!coord.edge && typeof coord.v === 'object') {
+      // native's message (fix_wall.cpp init; the engine checks when the fix is defined)
+      if (!this.sys.vars.has(coord.v.variable)) throw new StyleError('Variable name for fix wall does not exist');
+    }
+    const params: NumOrVar[] = [];
+    for (let p = 1; p < words.length - 1; p++) {
+      const w = words[p];
+      const v = parseNumOrVar(w, `${face} wall parameter ${p}`);
+      if (typeof v !== 'number' && !this.sys.vars.has(v.variable)) {
+        throw new StyleError('Variable name for fix wall does not exist');
+      }
+      params.push(v);
+    }
+    const cutoff = numeric(words[words.length - 1]);
+    return { dim, lo, coord, params, cutoff };
+  }
+
+
+  /** The box checks are made when the fix is created (checkWallBox); the wall styles extend this. */
+  init(): void {}
+
+  /** "invoke the wall constraint before pairwise interactions" (fld yes). */
+  preForce(): void { this.apply(); }
+
+  /** wall forces are "imposed after pairwise interactions, in the usual manner" (fld no, the default). */
+  postForce(): void { this.apply(); }
+
+  setup(): void {
+    if (this.fld) this.preForce();
+    else this.postForce();
+  }
+
+  /** "The forces due to this fix are imposed during an energy minimization". */
+  minPostForce(): void { this.apply(); }
+
+  /** Resolved wall positions for this step: EDGE, or value * lattice spacing (units keyword). */
+  protected coords(): Float64Array {
+    const g = this.sys.geom;
+    const sp = this.sys.lattice?.spacing;
+    const out = new Float64Array(this.walls.length);
+    for (let k = 0; k < this.walls.length; k++) {
+      const w = this.walls[k];
+      out[k] = w.coord.edge
+        ? (w.lo ? g.lo[w.dim] : g.hi[w.dim])
+        : valueOf(this.sys, w.coord.v) * (this.unitsMode === 'lattice' ? sp?.[w.dim] ?? 1 : 1);
+    }
+    return out;
+  }
+
+  /** Applies every wall force, tallies energy, per-wall forces and the virial. */
+  protected apply(): void {
+    const s = this.sys.state;
+    const coord = this.coords();
+    const bit = this.groupBit;
+    const walls = this.walls;
+    this.wallEnergy = 0;
+    this.wallForce.fill(0);
+    if (this.thermoVirial) this.virial.fill(0);
+    if (this.vAtom.length !== 6 * s.n) this.vAtom = new Float64Array(6 * s.n);
+    else this.vAtom.fill(0);
+    // shifted energy at the cutoff per wall (depends on the current parameters)
+    const eCut = new Float64Array(walls.length);
+    for (let k = 0; k < walls.length; k++) eCut[k] = this.energyAt(walls[k].cutoff, walls[k]);
+    for (let i = 0; i < s.n; i++) {
+      if (!(s.mask[i] & bit)) continue;
+      for (let k = 0; k < walls.length; k++) {
+        const w = walls[k];
+        const d = w.dim;
+        if (this.outside) {
+          // wall/harmonic/outside: distance of the atom beyond the wall; atoms on the inner side
+          // (dOut <= 0) are not an error for this style and feel no force.
+          const dOut = w.lo ? coord[k] - s.x[3 * i + d] : s.x[3 * i + d] - coord[k];
+          if (dOut <= 0 || dOut >= w.cutoff) continue;
+          const sign = w.lo ? 1 : -1;
+          const f = this.forceAt(dOut, w);
+          s.f[3 * i + d] += sign * f;
+          this.wallEnergy += this.energyAt(dOut, w);
+          this.wallForce[k] -= sign * f;
+          if (this.thermoVirial) this.virial[d] += dOut * f;
+          this.vAtom[6 * i + d] += dOut * f;
+          continue;
+        }
+        const r = w.lo ? s.x[3 * i + d] - coord[k] : coord[k] - s.x[3 * i + d];
+        // As native LAMMPS does (src/fix_wall_lj93.cpp, fix_wall_lj126.cpp, fix_wall_harmonic.cpp, fix_wall_morse.cpp and
+        // fix_wall_lj1043.cpp wall_particle at b332f28): an atom on or behind the wall stops the run with "Particle on or
+        // inside fix wall surface", except for wall/lj1043, which skips it
+        if (r <= 0) {
+          if (this.wallStyle === 'wall/lj1043') continue;
+          throw new StyleError('Particle on or inside fix wall surface');
+        }
+        if (r >= w.cutoff) continue;
+        // F = -dE/dr, pointing away from the wall; sign flips the axis for hi walls
+        const f = this.forceAt(r, w);
+        const sign = w.lo ? 1 : -1;
+        s.f[3 * i + d] += sign * f;
+        this.wallEnergy += this.energyAt(r, w) - eCut[k];
+        // force ON the wall is opposite the force on the atom
+        this.wallForce[k] -= sign * f;
+        if (this.thermoVirial) this.virial[d] += r * f;
+        this.vAtom[6 * i + d] += r * f;
+      }
+    }
+  }
+
+  /** True for styles whose distance is measured on the outside of the wall (wall/harmonic/outside). */
+  protected get outside(): boolean { return false; }
+
+  /** E(r) of the unshifted wall potential with the wall's current parameters. */
+  protected abstract energyAt(r: number, w: Wall): number;
+
+  /** F(r) = -dE/dr of the unshifted wall potential (positive pushes away from the wall). */
+  protected abstract forceAt(r: number, w: Wall): number;
+
+  energy(): number { return this.wallEnergy; }
+  /**
+   * Per-atom wall virial of the last evaluation, for compute stress/atom fix. fix_wall.html: the
+   * fix_modify virial option adds the wall contribution "to both the global pressure and per-atom
+   * stress of the system"; the energy option names only the global potential energy, and measured
+   * with native LAMMPS (black box) compute pe/atom fix stays 0 with fix_modify energy yes walls.
+   */
+  private vAtom = new Float64Array(0);
+  virialAtom(out: Float64Array): void {
+    for (let k = 0; k < this.vAtom.length && k < out.length; k++) out[k] += this.vAtom[k];
+  }
+  computeScalar(): number { return this.wallEnergy; }
+  computeVector(i: number): number { return this.wallForce[i]; }
+}
+
+/**
+ * fix wall/lj93 — docs.lammps.org/fix_wall.html, args and formula verbatim:
+ *
+ *   args = coord epsilon sigma cutoff
+ *     coord = position of wall = EDGE or constant or variable
+ *     epsilon = strength factor for wall-particle interaction (energy or energy/distance^2 units)
+ *     sigma = size factor for wall-particle interaction (distance units)
+ *     cutoff = distance from wall at which wall-particle interactions are cut off (distance units)
+ *
+ *   E = \epsilon \left[ \frac{2}{15} \left(\frac{\sigma}{r}\right)^{9} -
+ *                        \left(\frac{\sigma}{r}\right)^3 \right]
+ *                        \qquad r < r_c
+ *
+ * "The *wall/lj93* interaction is derived by integrating over a 3d
+ * half-lattice of Lennard-Jones 12/6 particles."
+ */
+export class FixWallLJ93 extends FixWallBase {
+  readonly style = 'wall/lj93';
+
+  constructor(sys: System, id: string, group: string, args: string[]) {
+    super(sys, id, group, args, 'wall/lj93', 4);
+  }
+
+  protected energyAt(r: number, w: Wall): number {
+    const eps = valueOf(this.sys, w.params[0]);
+    const sig = valueOf(this.sys, w.params[1]);
+    const u = sig / r;
+    return eps * ((2 / 15) * u ** 9 - u ** 3);
+  }
+
+  protected forceAt(r: number, w: Wall): number {
+    const eps = valueOf(this.sys, w.params[0]);
+    const sig = valueOf(this.sys, w.params[1]);
+    const u = sig / r;
+    return eps * (sig / (r * r)) * ((6 / 5) * u ** 8 - 3 * u ** 2);
+  }
+}
+
+/**
+ * fix wall/lj126 — docs.lammps.org/fix_wall.html, args and formula verbatim:
+ *
+ *   args = coord epsilon sigma cutoff
+ *
+ *   E = 4 \epsilon \left[ \left(\frac{\sigma}{r}\right)^{12} -
+ *                         \left(\frac{\sigma}{r}\right)^6 \right]
+ *                         \qquad r < r_c
+ *
+ * "The *wall/lj126*
+ * interaction is effectively a harder, more repulsive wall interaction."
+ */
+export class FixWallLJ126 extends FixWallBase {
+  readonly style = 'wall/lj126';
+
+  constructor(sys: System, id: string, group: string, args: string[]) {
+    super(sys, id, group, args, 'wall/lj126', 4);
+  }
+
+  protected energyAt(r: number, w: Wall): number {
+    const eps = valueOf(this.sys, w.params[0]);
+    const sig = valueOf(this.sys, w.params[1]);
+    const u = sig / r;
+    return 4 * eps * (u ** 12 - u ** 6);
+  }
+
+  protected forceAt(r: number, w: Wall): number {
+    const eps = valueOf(this.sys, w.params[0]);
+    const sig = valueOf(this.sys, w.params[1]);
+    const u = sig / r;
+    return 4 * eps * (sig / (r * r)) * (12 * u ** 11 - 6 * u ** 5);
+  }
+}
+
+/**
+ * fix wall/lj1043 — docs.lammps.org/fix_wall.html, args and formula verbatim:
+ *
+ *   args = coord epsilon sigma cutoff
+ *
+ *   E = 2 \pi \epsilon \left[ \frac{2}{5} \left(\frac{\sigma}{r}\right)^{10} -
+ *                        \left(\frac{\sigma}{r}\right)^4 -
+ *                        \frac{\sqrt(2)\sigma^3}{3\left(r+\left(0.61/\sqrt(2)\right)\sigma\right)^3}\right]
+ *                        \qquad r < r_c
+ *
+ * "The *wall/lj1043* interaction is yet a different form of wall
+ * interaction, described in Magda et al in :ref:`(Magda) <Magda>`."
+ */
+export class FixWallLJ1043 extends FixWallBase {
+  readonly style = 'wall/lj1043';
+  /** 0.61/sqrt(2), the offset of the attractive term (docs: "0.61/\sqrt(2)"). */
+  private static readonly A = 0.61 / Math.SQRT2;
+
+  constructor(sys: System, id: string, group: string, args: string[]) {
+    super(sys, id, group, args, 'wall/lj1043', 4);
+  }
+
+  protected energyAt(r: number, w: Wall): number {
+    const eps = valueOf(this.sys, w.params[0]);
+    const sig = valueOf(this.sys, w.params[1]);
+    const u = sig / r;
+    const off = r + FixWallLJ1043.A * sig;
+    return 2 * Math.PI * eps * ((2 / 5) * u ** 10 - u ** 4 - (Math.SQRT2 * sig ** 3) / (3 * off ** 3));
+  }
+
+  protected forceAt(r: number, w: Wall): number {
+    const eps = valueOf(this.sys, w.params[0]);
+    const sig = valueOf(this.sys, w.params[1]);
+    const u = sig / r;
+    const off = r + FixWallLJ1043.A * sig;
+    return 2 * Math.PI * eps * ((4 * u ** 10 - 4 * u ** 4) / r - (Math.SQRT2 * sig ** 3) / off ** 4);
+  }
+}
+
+/**
+ * fix wall/harmonic — docs.lammps.org/fix_wall.html, args and formula verbatim:
+ *
+ *   args = coord epsilon sigma cutoff
+ *
+ *   E = \epsilon \quad (r - r_c)^2 \qquad r < r_c
+ *
+ * "For the *wall/harmonic* style, :math:`\epsilon` is effectively the spring
+ * constant K, and has units (energy/distance\^2).  The input parameter
+ * :math:`\sigma` is ignored.  The minimum energy position of the harmonic
+ * spring is at the *cutoff*.  This is a repulsive-only spring since the
+ * interaction is truncated at the *cutoff*". E is 0.0 at the cutoff, so no
+ * shift is applied.
+ */
+export class FixWallHarmonic extends FixWallBase {
+  readonly style = 'wall/harmonic';
+
+  constructor(sys: System, id: string, group: string, args: string[]) {
+    super(sys, id, group, args, 'wall/harmonic', 4);
+  }
+
+  protected energyAt(r: number, w: Wall): number {
+    const eps = valueOf(this.sys, w.params[0]);
+    const d = r - w.cutoff;
+    return eps * d * d;
+  }
+
+  protected forceAt(r: number, w: Wall): number {
+    const eps = valueOf(this.sys, w.params[0]);
+    return 2 * eps * (w.cutoff - r);
+  }
+}
+
+/**
+ * fix wall/morse — docs.lammps.org/fix_wall.html, args and formula verbatim:
+ *
+ *   args = coord D_0 alpha r_0 cutoff
+ *     D_0 = depth of the potential (energy units)
+ *     alpha = width factor for wall-particle interaction (1/distance units)
+ *     r_0 = distance of the potential minimum from the face of region (distance units)
+ *     cutoff = distance from wall at which wall-particle interactions are cut off (distance units)
+ *
+ *   E = D_0 \left[ e^{- 2 \alpha (r - r_0)} - 2 e^{- \alpha (r - r_0)} \right]
+ *       \qquad r < r_c
+ *
+ * "For the *wall/morse* style, the three parameters are in this order:
+ * :math:`D_0` the depth of the potential, :math:`\alpha` the width
+ * parameter, and :math:`r_0` the location of the minimum.  :math:`D_0` has
+ * energy units, :math:`\alpha` inverse distance units, and :math:`r_0`
+ * distance units."
+ */
+export class FixWallMorse extends FixWallBase {
+  readonly style = 'wall/morse';
+
+  constructor(sys: System, id: string, group: string, args: string[]) {
+    super(sys, id, group, args, 'wall/morse', 5);
+  }
+
+  protected energyAt(r: number, w: Wall): number {
+    const d0 = valueOf(this.sys, w.params[0]);
+    const alpha = valueOf(this.sys, w.params[1]);
+    const r0 = valueOf(this.sys, w.params[2]);
+    const a = libm.exp(-alpha * (r - r0));
+    return d0 * (a * a - 2 * a);
+  }
+
+  protected forceAt(r: number, w: Wall): number {
+    const d0 = valueOf(this.sys, w.params[0]);
+    const alpha = valueOf(this.sys, w.params[1]);
+    const r0 = valueOf(this.sys, w.params[2]);
+    const a = libm.exp(-alpha * (r - r0));
+    return 2 * alpha * d0 * (a * a - a);
+  }
+}
+
+/**
+ * fix wall/harmonic/outside — docs.lammps.org/fix_wall.html (current docs), args and formula verbatim:
+ *
+ *   args = coord epsilon sigma cutoff
+ *
+ *   E = \epsilon \quad (r - w_0)^2 \qquad r < r_c
+ *
+ * "For style *wall/harmonic/outside*, the energy E is given by an attractive-only harmonic spring potential for
+ * selected atoms group passing outside the wall placed at :math:`w_0` up to a cutoff distance :math:`r_c`"
+ * "For the *wall/harmonic* and *wall/harmonic/outside* style, :math:`\epsilon` is effectively the spring constant K,
+ * and has units (energy/distance^2). The input parameter :math:`\sigma` is ignored."
+ * "For style *wall/harmonic/outside*, the formulation avoids the presence of repulsive bands inside a controlled
+ * volume preventing the definition of a precise volumetric concentration"
+ * "For all of the styles (except wall/harmonic/outside), you must ensure that r is always > 0 for all particles
+ * in the group, or LAMMPS will generate an error."
+ *
+ * Measured with native LAMMPS (black box), one atom, lj units, boundary f f f, 3d:
+ * - the distance is d = (wall - x) for an lo wall and (x - wall) for a hi wall, i.e. the atom's distance
+ *   beyond the wall; E = epsilon d^2 (sigma ignored), no shift at the cutoff (d = 0.99 with rc = 1 gives 0.9801).
+ * - atoms with d >= rc (checked at 2.5 and 1.0 with rc = 2.5 and 1.0) have E = 0 and F = 0; the cutoff is exclusive.
+ * - atoms on the inner side of the wall, including d = 0 (x = 0 for an lo wall at 0), give E = 0 and F = 0 and
+ *   no error, so the r > 0 requirement quoted above does not apply to this style.
+ * - the force on the atom points towards the wall with magnitude 2 epsilon d (x = -2, epsilon 1: f_w[1] = -4 for an
+ *   lo wall; hi wall at 0 with x = 2: f_w[1] = +4); the scalar energy f_w is 4.
+ * - the lattice keyword scales only the wall position: with lattice none 2.0, an lo wall given as 1.0 sits at 2.0 and
+ *   the cutoff 1.5 is taken as 1.5 distance units (x = 0.6 gives E = 1.96, x = 0.0 gives 0).
+ * - a variable wall position v_name is evaluated (wall 0.5 with x = 0.0 gives E = 0.25).
+ * - fix_modify energy yes adds the energy to PotEng (PotEng = 1 with energy yes and 0 without).
+ * - fix_modify virial yes adds d times the force magnitude to the virial: for one atom at d = 1 with epsilon 1 in a
+ *   20 x 20 x 20 box, Pxx = 0.00025 = 2/8000.
+ * - cutoff 0.0 errors with the native message Fix wall/harmonic/outside cutoff <= 0.0 for xlo wall, and a
+ *   periodic dimension without pbc errors with Cannot use xlo wall in periodic x dimension; the refusals here
+ *   use the messages of the base class.
+ */
+export class FixWallHarmonicOutside extends FixWallBase {
+  readonly style: string;
+
+  /** name: wall/harmonic/outside or wall/harmonic/returned (one class registered under both names). */
+  constructor(sys: System, id: string, group: string, args: string[], name = 'wall/harmonic/outside') {
+    super(sys, id, group, args, name, 4);
+    this.style = name;
+  }
+
+  protected get outside(): boolean { return true; }
+
+  /** E = epsilon d^2 for d = distance beyond the wall (unshifted). */
+  protected energyAt(d: number, w: Wall): number {
+    const eps = valueOf(this.sys, w.params[0]);
+    return eps * d * d;
+  }
+
+  /** Magnitude of the attractive force 2 epsilon d, directed towards the wall. */
+  protected forceAt(d: number, w: Wall): number {
+    const eps = valueOf(this.sys, w.params[0]);
+    return 2 * eps * d;
+  }
+}

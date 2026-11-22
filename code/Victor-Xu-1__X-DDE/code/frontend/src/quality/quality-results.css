@@ -1,0 +1,151 @@
+.quality-check-scroll {
+  max-height: 430px;
+}
+.quality-measurements {
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.quality-measurements dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
+  gap: 12px;
+  margin: 0;
+}
+.quality-measurements dt,
+.quality-measurements p,
+.quality-preview-modes span {
+  font-size: 12px;
+  color: var(--muted);
+}
+.quality-measurements dd {
+  font-size: 24px;
+  font-weight: 600;
+  margin: 4px 0 0;
+  font-variant-numeric: tabular-nums;
+}
+.quality-preview-modes {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.quality-check-scroll td,
+.quality-check-scroll th {
+  padding: 10px 8px;
+  font-size: 12px;
+  vertical-align: top;
+}
+.quality-outcome {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.quality-outcome.is-pass {
+  color: var(--teal);
+}
+.quality-outcome.is-fail {
+  color: var(--danger);
+}
+.quality-outcome.is-unavailable {
+  color: var(--muted);
+}
+.quality-outcome.is-unassessed {
+  color: var(--warning);
+}
+.quality-outcome.is-not_applicable {
+  color: var(--muted);
+}
+.quality-assessment-bar {
+  display: grid;
+  gap: 10px;
+}
+.quality-assessment-bar label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.quality-assessment-bar label > span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.quality-assessment-bar select {
+  min-height: 36px;
+  min-width: 0;
+  width: 100%;
+}
+.quality-review {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.quality-results .structure-workbench-toolbar,
+.quality-results .quality-panel-jump {
+  display: none;
+}
+.quality-review,
+.quality-scene {
+  scroll-margin-block-start: 110px;
+}
+@media (min-width: 1080px) and (max-height: 719px) {
+  .studio-app .quality-scene .viewer-panel:not(:popover-open) {
+    padding: 0;
+  }
+  .quality-results:has(.quality-preview-modes) {
+    --short-spatial-stage-reserve: 272px;
+  }
+  .quality-review,
+  .quality-assessment-bar {
+    gap: 8px;
+  }
+  .quality-measurements dd {
+    font-size: 20px;
+  }
+}
+@media (max-width: 1000px) {
+  .studio-app .quality-scene .viewer-panel:not(:popover-open) {
+    padding-inline: 0;
+  }
+  .quality-results .structure-workbench-toolbar {
+    display: flex;
+    justify-content: flex-end;
+  }
+  .studio-app .quality-results .quality-panel-jump {
+    display: inline-flex;
+    justify-self: end;
+    align-items: center;
+    min-height: 44px;
+  }
+}
+.quality-assessment-summary {
+  display: grid;
+  gap: 6px;
+}
+.quality-assessment-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+}
+.quality-check-note {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.quality-method-details {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.quality-method-details summary {
+  cursor: pointer;
+}
+.quality-method-details p {
+  max-width: 90ch;
+}

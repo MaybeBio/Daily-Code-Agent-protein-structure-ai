@@ -1,0 +1,35 @@
+# Roots and absolute paths — kept in config/env, never in source (dev root CLAUDE.md portability rule).
+# Override the project root via env: SPA_PROJECT_ROOT=/path python scripts/train.py
+project_root: ${oc.env:SPA_PROJECT_ROOT,${oc.env:HOME}/projects/spa}
+models_root: ${paths.project_root}/models
+data_root: ${paths.project_root}/training_data
+# Foundry's RFD3 training-transform yamls (read by spa.data.dataset to rebuild the CDDB featurization,
+# dev 09 §6/§8). A dependency-repo path -> config, overridable on cloud where foundry is installed.
+foundry_train_cfg_dir: ${paths.project_root}/needed_repos/foundry/models/rfd3/configs/datasets/train
+
+# ProteinMPNN repo (dev 05 Stage 2 inverse folding). Read-only dependency-repo path -> config,
+# overridable on cloud (env SPA_PROTEINMPNN_REPO also overrides). Weights bundled in-repo
+# (vanilla_model_weights/v_48_020.pt is the default).
+proteinmpnn_repo: ${paths.project_root}/needed_repos/ProteinMPNN
+
+# Frozen-host weights (dev root CLAUDE.md → Model Weights). RFD3 ckpt_path accepts an arbitrary path.
+rfd3_ckpt: ${paths.models_root}/rfdiffusion3/rfd3_latest.ckpt
+# ESM3 loads from the HF cache by name (esm3_sm_open_v1), not a path here. CLSS (variant A only)
+# loads from HF too; leave clss_ckpt null unless overriding with a local file.
+clss_ckpt: null
+# OpenFold3 (dev 05 Stage 3 refold / designability). ckpt accepts an arbitrary path; the no-kernel
+# runner-yaml (F1.5.4: disables DeepSpeed/triton/cueq attention kernels -> stock attention) ships in
+# the repo. run_openfold itself is an entry point in the spa-verify-of3 env (eval.of3.conda_env).
+openfold3_ckpt: ${paths.models_root}/openfold3/of3-p2-155k.pt
+openfold3_runner_yaml: ${paths.project_root}/structure-prompt-adapter/configs/of3/of3_nokernel.yml
+
+# Caches and outputs.
+esm3_cache_dir: ${paths.data_root}/processed/esm3_cache
+ckpt_dir: ${oc.env:SPA_CKPT_DIR,./checkpoints}
+# Run artifacts (designs, FASTAs, refolds, sweep JSON). ABSOLUTE and run-scoped on purpose: a
+# *relative* default resolves against the invoking cwd, which historically sent output into
+# whichever repo Claude Code was launched from ("cwd-spill"), and a *shared* default path made
+# every run write into one flat directory — so runs overwrote each other's files by name. Both
+# failure modes are documented in dev docs/plan/30. Keep new run dirs under _incoming/ and file
+# them into the archive's <family>/<YYYY-MM-DD>__<run-name>/ layout when a run is worth keeping.
+outputs_root: ${oc.env:SPA_OUTPUTS_ROOT,${paths.project_root}/outputs}

@@ -1,0 +1,76 @@
+name: API
+
+on:
+  push:
+    branches: [main]
+    paths: ["apps/api/**", ".github/workflows/api.yml", "docker-compose.yml"]
+  pull_request:
+    paths: ["apps/api/**", ".github/workflows/api.yml", "docker-compose.yml"]
+
+concurrency:
+  group: api-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-types:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv venv --python 3.12
+      - run: uv pip install -e ".[dev]"
+      - name: ruff check
+        run: uv run ruff check .
+      - name: ruff format
+        run: uv run ruff format --check .
+      - name: mypy (strict)
+        run: uv run mypy
+
+  test:
+    # Runs the suite through docker compose, exactly as a developer does
+    # locally. GitHub's `services:` cannot be used for MongoDB here: service
+    # containers take no custom command, so mongod starts without --replSet and
+    # replication cannot be enabled afterwards ("This node was not started with
+    # replication enabled"). Compose can pass the flag, and using it keeps CI
+    # and local development on the identical path.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MongoDB (single-node replica set)
+        run: docker compose up -d --wait mongo
+
+      - name: Tests
+        run: docker compose --profile test run --rm api-test
+
+      - name: MongoDB logs on failure
+        if: failure()
+        run: docker compose logs mongo
+
+  smoke:
+    # Proves the production image boots and serves real HTTP, not just that
+    # the tests pass in-process.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start the stack
+        run: docker compose --profile app up -d --build api
+      - name: Wait for readiness
+        run: |
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:8000/readyz | grep -q '"status":"ready"'; then
+              curl -fsS http://localhost:8000/readyz; echo; exit 0
+            fi
+            sleep 3
+          done
+          echo "API never became ready"; docker compose logs api; exit 1
+      - name: Smoke test
+        run: python3 apps/api/scripts/smoke.py http://localhost:8000
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs

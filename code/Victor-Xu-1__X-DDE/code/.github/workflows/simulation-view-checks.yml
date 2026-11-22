@@ -1,0 +1,259 @@
+name: Interactive dynamics and FEP previews
+on:
+  workflow_dispatch:
+  push:
+    paths: &simulation_paths
+      - "frontend/src/simulations/DynamicsResults.tsx"
+      - "frontend/src/simulations/DynamicsAnalysis.tsx"
+      - "frontend/src/simulations/TrajectoryControls.tsx"
+      - "frontend/src/simulations/result-workspace.css"
+      - "frontend/src/presentation/StructureWorkbench.tsx"
+      - "frontend/src/presentation/structure-workbench.css"
+      - "frontend/src/simulations/SimulationPlot.tsx"
+      - "frontend/src/simulations/SimulationResults.test.tsx"
+      - "frontend/src/simulations/sample-selection.ts"
+      - "frontend/src/simulations/FreeEnergyCycle*"
+      - "frontend/src/simulations/FreeEnergyDiagnostics.tsx"
+      - "frontend/src/simulations/FreeEnergyForest.tsx"
+      - "frontend/src/simulations/OverlapHeatmap*"
+      - "frontend/src/simulations/AdjacentOverlapTable.tsx"
+      - "frontend/src/simulations/overlap*"
+      - "frontend/src/simulations/FreeEnergyResults.tsx"
+      - "frontend/src/simulations/BoundPoseComparison*"
+      - "frontend/src/simulations/MoleculeMapPanel.tsx"
+      - "frontend/src/simulations/pose-comparison.css"
+      - "frontend/src/simulations/comparison-figure*"
+      - "frontend/src/simulations/molecular-view-state*"
+      - "frontend/src/simulations/MolecularViewport*"
+      - "frontend/src/presentation/WorkspaceFullscreenControl*"
+      - "frontend/src/presentation/useWorkspaceFullscreen.ts"
+      - "frontend/src/presentation/workspace-expansion.ts"
+      - "frontend/src/presentation/workspace-fullscreen.css"
+      - "frontend/src/presentation/workspace-structure-focus.ts"
+      - "frontend/src/simulations/molecular-surfaces*"
+      - "frontend/src/simulations/molecular-update-queue*"
+      - "frontend/src/simulations/useMolecularPresentation*"
+      - "frontend/src/simulations/molstar-figure*"
+      - "frontend/src/simulations/FreeEnergyNetwork.tsx"
+      - "frontend/src/simulations/molstar-controller.ts"
+      - "frontend/src/simulations/molecular-first-draw*"
+      - "frontend/src/simulations/molecular-focus*"
+      - "frontend/src/simulations/molecular-depth*"
+      - "frontend/src/simulations/viewport-lifetime*"
+      - "frontend/src/viewer/molstar-sticks.ts"
+      - "frontend/src/editors/molstar-appearance*"
+      - "frontend/src/publication/plotly*"
+      # Shared figure controls and physical sizes also have native Mol* consumers.
+      - "frontend/src/publication/settings*"
+      - "frontend/src/publication/png-resolution*"
+      - "frontend/src/publication/FigureExport*"
+      - "frontend/src/publication/FigureDialog.tsx"
+      - "frontend/src/publication/FigurePreview*"
+      - "frontend/src/publication/useFigurePreview*"
+      - "frontend/src/presentation/plots/InteractivePlot*"
+      - "server_tests/test_fep_diagnostics_browser.py"
+      - "server_tests/test_native_simulation_views.py"
+      - "server_tests/test_simulation_structure_focus.py"
+      - "server_tests/test_short_simulation_review.py"
+      - "server_tests/test_native_molstar_framing.py"
+      - "server_tests/fullscreen_browser_helpers.py"
+      - ".github/workflows/simulation-view-checks.yml"
+  pull_request:
+    paths: *simulation_paths
+permissions:
+  contents: read
+jobs:
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  desktop-results:
+    needs: utility-scope
+    if: needs.utility-scope.outputs.simulation_desktop_only == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 17
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Trajectory state and FEP comparison contracts
+        working-directory: frontend
+        run: >-
+          npx vitest run src/simulations/SimulationResults.test.tsx
+          src/simulations/SimulationFiles.test.tsx src/simulations/BoundPoseComparison.test.tsx
+          src/simulations/MolecularViewport.test.tsx src/simulations/comparison-figure.test.ts
+          src/presentation/WorkspaceFullscreenControl.test.tsx
+          src/simulations/molecular-first-draw.test.ts
+      - run: uv sync --locked --group dev --group browser
+      - name: Restore native OpenMM and TYK2 plan artefacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 37797255499 --repo "$GITHUB_REPOSITORY" --name native-simulation-evidence --dir outputs/native-simulations
+      - run: uv run --locked playwright install chromium --with-deps
+      - name: Native desktop trajectory, coincident A/B views and figure exports
+        run: |
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_native_molstar_framing.py server_tests/test_simulation_structure_focus.py server_tests/test_short_simulation_review.py
+          uv run --locked python -m pytest -x -q tests/test_molecular_utility_scope.py
+          uv run --locked python -m pytest -x -q \
+            server_tests/test_short_simulation_review.py server_tests/test_native_molstar_framing.py \
+            server_tests/test_simulation_structure_focus.py server_tests/test_native_simulation_views.py \
+            server_tests/test_fep_diagnostics_browser.py -k 'not calculation'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-simulation-results
+          path: |
+            outputs/native-simulations/openmm.dynamics/browser/**
+            outputs/native-simulations/openfe.rbfe/browser/**
+            outputs/native-molstar-framing/**
+            outputs/simulation-diagnostics/**
+  framing-scope:
+    uses: ./.github/workflows/figure-framing-scope.yml
+  docking-scope:
+    uses: ./.github/workflows/docking-result-scope.yml
+  prediction-scope:
+    uses: ./.github/workflows/prediction-workspace-checks.yml
+    with:
+      scope_only: true
+  previews:
+    needs: [prediction-scope, framing-scope, utility-scope, docking-scope]
+    if: >-
+      needs.utility-scope.outputs.simulation_desktop_only != 'true' &&
+      needs.docking-scope.outputs.paired_comparison_only != 'true' &&
+      needs.framing-scope.outputs.framing_only != 'true' &&
+      needs.framing-scope.outputs.compact_only != 'true' &&
+      needs.prediction-scope.outputs.confidence_frame != 'true' &&
+      needs.prediction-scope.outputs.utility_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select chart exports, molecular framing or simulation-view consumers
+        id: export_scope
+        env:
+          BASE: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: |
+          python - <<'PY'
+          import os, re, subprocess
+          base = os.environ.get('BASE', '')
+          if os.environ.get('GITHUB_REF_NAME') != 'main':
+              base = subprocess.check_output(['git','merge-base','origin/main','HEAD'], text=True).strip()
+          changed = subprocess.check_output(['git','diff','--name-only',base,'HEAD'], text=True).splitlines() if base and set(base) != {'0'} else []
+          allowed = {'frontend/src/publication/plotly.ts', 'frontend/src/publication/plotly.test.ts',
+                     '.github/workflows/simulation-view-checks.yml', 'docs/design/screening-and-del.md',
+                     'pyproject.toml', 'uv.lock', 'frontend/package.json', 'frontend/package-lock.json',
+                     'install.sh', 'install.ps1'}
+          only = bool(changed) and 'frontend/src/publication/plotly.ts' in changed and set(changed) <= allowed
+          simulation = 'frontend/src/simulations/'
+          framing = {simulation + 'molstar-figure.ts', simulation + 'molstar-figure.test.ts',
+                     'server_tests/test_native_molstar_framing.py'}
+          consumers = {simulation + 'MolecularViewport.tsx', simulation + 'BoundPoseComparison.tsx'}
+          versions = {'pyproject.toml', 'uv.lock', 'frontend/package.json',
+                      'frontend/package-lock.json', 'install.sh', 'install.ps1'}
+          framing_changed = bool(set(changed) & framing)
+          native_only = (os.environ['GITHUB_EVENT_NAME'] in {'push', 'pull_request'}
+                         and framing_changed
+                         and set(changed) <= framing | consumers | versions
+                           | {'.github/workflows/simulation-view-checks.yml'})
+          for path in set(changed) & consumers if native_only else ():
+              delta = subprocess.check_output(
+                  ['git', 'diff', '--unified=0', base, 'HEAD', '--', path], text=True
+              )
+              edits = [line for line in delta.splitlines() if re.match(r'^[+-][^+-]', line)]
+              native_only = native_only and len(edits) == 1 and bool(
+                  re.fullmatch(r'\+\s+structureFraming', edits[0]))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('only=' + str(only).lower() + '\n')
+              output.write('native_framing=' + str(native_only).lower() + '\n')
+              output.write('framing_changed=' + str(framing_changed).lower() + '\n')
+          PY
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && python scripts/generate-plotly-css.py --check && npm run build --prefix frontend
+      - run: uv sync --locked --group dev --group browser
+      - name: Changed simulation previews and direct result consumers
+        if: steps.export_scope.outputs.only != 'true' && steps.export_scope.outputs.native_framing != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/simulations/SimulationResults.test.tsx
+          src/presentation/WorkspaceFullscreenControl.test.tsx
+          src/simulations/FreeEnergyCycle.test.tsx src/publication/plotly.test.ts
+          src/simulations/OverlapHeatmap.test.tsx src/simulations/overlap-data.test.ts
+          src/presentation/plots/InteractivePlot.test.tsx
+          src/simulations/molecular-focus.test.ts src/simulations/bound-pairs.test.ts
+          src/simulations/molecular-depth.test.ts src/simulations/viewport-lifetime.test.ts
+          src/simulations/molecular-surfaces.test.ts src/simulations/MolecularViewport.test.tsx
+          src/simulations/molecular-update-queue.test.ts
+          src/simulations/molstar-figure.test.ts
+          src/simulations/BoundPoseComparison.test.tsx
+          src/simulations/comparison-figure.test.ts src/simulations/molecular-view-state.test.ts
+          src/editors/molstar-appearance.test.ts
+      - name: Offscreen molecular framing, camera restoration and comparison views
+        if: steps.export_scope.outputs.native_framing == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/simulations/molstar-figure.test.ts
+          src/simulations/MolecularViewport.test.tsx src/simulations/BoundPoseComparison.test.tsx
+          src/simulations/comparison-figure.test.ts
+      - name: Native chart sizing, intervals, category/heatmap/continuous consumers only
+        if: steps.export_scope.outputs.only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/publication/plotly.test.ts
+          src/datasets/SeriesEvidencePlots.test.tsx src/datasets/statistical-plots.test.tsx
+          src/presentation/plots/InteractivePlot.test.tsx
+          src/simulations/FreeEnergyCycle.test.tsx src/simulations/OverlapHeatmap.test.tsx
+      - name: Restore retained MD and TYK2 plan; no new scientific execution
+        if: steps.export_scope.outputs.only != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 37797255499 --repo "$GITHUB_REPOSITORY" --name native-simulation-evidence --dir outputs/native-simulations
+      - run: uv run --locked playwright install chromium --with-deps
+        if: steps.export_scope.outputs.native_framing != 'true'
+      - name: Native results, controlled completed-result diagnostics and exact downloads
+        if: steps.export_scope.outputs.only != 'true' && steps.export_scope.outputs.native_framing != 'true'
+        run: >-
+          uv run --locked python -m pytest -x -q
+          server_tests/test_native_simulation_views.py
+          server_tests/test_fep_diagnostics_browser.py -k 'not calculation'
+      - name: Verify framing and actual downloads from native MD and FEP results
+        if: steps.export_scope.outputs.framing_changed == 'true'
+        run: |
+          google-chrome --version
+          uv run --locked ruff check server_tests/test_native_molstar_framing.py
+          uv run --locked python -m pytest -x -q server_tests/test_native_molstar_framing.py
+      - name: Restore retained DEL chart results for physical export checks, without science
+        if: steps.export_scope.outputs.only == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export WB_HOME="$RUNNER_TEMP/x-dde-chart-export"
+          export WB_STATE_DIR="$RUNNER_TEMP/x-dde-chart-export/state"
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-chart-export" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-chart-export/state" >> "$GITHUB_ENV"
+          gh release download examples-v1 --repo "$GITHUB_REPOSITORY" --pattern x-dde-public-cases-v1.zip --dir "$RUNNER_TEMP"
+          .venv/bin/python server_tests/prepare_layout_cases.py "$RUNNER_TEMP/x-dde-public-cases-v1.zip"
+          .venv/bin/python server_tests/prepare_visual_components.py --components public-dataset-examples
+      - name: Actual bilingual retained series charts and native SVG downloads only
+        if: steps.export_scope.outputs.only == 'true'
+        run: uv run --locked python -m pytest -x -q server_tests/test_statistical_previews_browser.py -k 'del.series'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: simulation-preview-evidence
+          path: |
+            outputs/statistical-previews/**
+            outputs/native-simulations/openmm.dynamics/browser/**
+            outputs/native-simulations/openfe.rbfe/browser/**
+            outputs/simulation-diagnostics/**

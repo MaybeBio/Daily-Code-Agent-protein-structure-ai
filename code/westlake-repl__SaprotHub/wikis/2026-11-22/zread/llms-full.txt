@@ -1,0 +1,2998 @@
+# Overview
+
+
+SaprotHub is a revolutionary platform that democratizes protein language model training, sharing, and collaboration for the entire biology community. Built around the concept of making advanced protein modeling accessible to all biologists—regardless of their coding or machine learning background—SaprotHub provides an intuitive interface for training custom protein models without requiring extensive technical expertise.
+
+## What Makes SaprotHub Unique
+
+### Core Innovation: Structure-Aware Protein Modeling
+SaprotHub introduces **Structure-Aware (SA) sequences**, a breakthrough approach that combines amino acid residues with structural information at each position. Unlike traditional protein language models that only consider sequence data, SA sequences integrate 3D structural information encoded through Foldseek, enabling more accurate and contextually rich protein representations.
+
+![SA Sequence Visualization](https://github.com/westlake-repl/SaProtHub/blob/main/Figure/SA_Sequence.png?raw=true)
+
+### The Adapter Mechanism
+At the heart of SaprotHub's collaborative approach is the **Adapter mechanism**, which allows researchers to train lightweight task-specific adapters while sharing a common backbone model. This approach dramatically reduces storage and communication costs, enabling efficient model sharing and collaborative development—much like grafting different fruits onto a single tree trunk.
+
+## Architecture Overview
+
+```mermaid
+graph TB
+    subgraph "User Interface Layer"
+        A[ColabSaprot] --> B[ColabSeprot]
+        A --> C[ColabProtT5]
+    end
+    
+    subgraph "Core Framework"
+        D[SaprotHub Platform] --> E[Adapter System]
+        D --> F[Model Registry]
+        D --> G[Dataset Manager]
+    end
+    
+    subgraph "Model Backbone"
+        H[SaProt 35M] --> I[SaProt 650M]
+        I --> J[ESM Models]
+        I --> K[ProtT5 Models]
+    end
+    
+    subgraph "Task Types"
+        L[Classification] --> M[Regression]
+        M --> N[Zero-shot Prediction]
+        N --> O[Sequence Design]
+    end
+    
+    A --> D
+    E --> H
+    F --> L
+    G --> L
+```
+
+## Supported Task Categories
+
+SaprotHub supports a comprehensive range of protein prediction tasks, organized into six main categories:
+
+| Task Category | Description | Example Applications |
+|---------------|-------------|---------------------|
+| **Protein-Level Classification** | Classify entire protein sequences | Fold class prediction, localization prediction, function prediction |
+| **Protein-Level Regression** | Predict numerical properties of proteins | Thermal stability, fluorescence intensity, binding affinity |
+| **Protein-Protein Classification** | Predict interactions between protein pairs | PPI prediction, interaction type classification |
+| **Protein-Protein Regression** | Quantify interaction strengths | Binding free energy, interaction affinity |
+| **Zero-shot Mutation Effect** | Predict effects without training | Enzyme activity, virus fitness, driver mutations |
+| **Protein Sequence Design** | Generate novel protein sequences | Enzyme optimization, stability enhancement, antibody design |
+
+## Getting Started Paths
+
+SaprotHub offers multiple entry points depending on your needs:
+
+### 🚀 Quick Start with Colab
+- **[ColabSaprot](https://colab.research.google.com/github/westlake-repl/SaprotHub/blob/main/colab/SaprotHub_v2.ipynb)**: Access SaProt models (35M, 650M parameters)
+- **[ColabSeprot](https://colab.research.google.com/github/westlake-repl/SaprotHub/blob/main/colab/ColabSeprot.ipynb)**: Access multiple models including ESM1b, ESM2, ProtBert, ProTrek
+- **[ColabProtT5](https://colab.research.google.com/github/westlake-repl/SaprotHub/blob/main/colab/ColabProtT5.ipynb)**: Access ProtT5-based models
+
+### 🏠 Local Deployment
+For users preferring local environments, SaprotHub provides comprehensive [local server deployment](https://github.com/westlake-repl/SaprotHub/blob/main/local_server) options for both Linux and Windows systems.
+
+## The OPMC Vision
+
+SaprotHub is the pioneering implementation of the **Open Protein Modeling Consortium (OPMC)**, a collaborative initiative aimed at:
+- Fostering resource sharing and co-development
+- Enabling decentralized model training
+- Building a community-driven protein modeling ecosystem
+
+The OPMC brings together multiple protein language model platforms under a unified framework, allowing researchers to contribute, share, and build upon each other's work.
+
+## Model Ecosystem
+
+SaprotHub supports six types of models, each serving different purposes:
+
+| Model Type | Use Case | Description |
+|------------|----------|-------------|
+| **Official Pretrained SaProt (35M)** | Training | Lightweight model for rapid prototyping |
+| **Official Pretrained SaProt (650M)** | Training | Full-featured model for maximum performance |
+| **Self-Trained Models** | Continual training, prediction | Models you train on ColabSaprot |
+| **Community Shared Models** | Continual training, prediction | Models shared on SaprotHub platform |
+| **Local Models** | Continual training, prediction | Models saved locally as .zip files |
+| **Multi-Model Ensembles** | Prediction | Combines multiple models for improved accuracy |
+
+## Data Format Flexibility
+
+SaprotHub accommodates multiple data input formats:
+
+### Single Protein Inputs
+- AA sequences
+- SA sequences (structure-aware)
+- UniProt IDs
+- PDB/CIF structure files
+
+### Multiple Protein Inputs
+- Batch AA sequences
+- Batch SA sequences
+- Batch UniProt IDs
+- Batch structure files
+
+### Pair-based Inputs
+For protein-protein interaction tasks:
+- Pairs of AA sequences
+- Pairs of SA sequences
+- Pairs of UniProt IDs
+- Pairs of structure files
+
+## Community and Support
+
+SaprotHub maintains active community engagement through:
+- **Slack Group**: [Join discussions](https://westlakeai.slack.com/archives/C08JNBN40P7)
+- **WeChat Groups**: Two active groups with 500+ researchers
+- **Hugging Face Hub**: [Model and dataset repository](https://huggingface.co/SaProtHub)
+- **Documentation and Tutorials**: Comprehensive guides and video tutorials
+
+## Next Steps
+
+To get started with SaprotHub:
+
+1. **[Quick Start](2-quick-start)**: Set up your first protein model
+2. **[Understanding Protein Prediction Tasks](3-understanding-protein-prediction-tasks)**: Learn about different task types
+3. **[Preparing Your Dataset](4-preparing-your-dataset)**: Format your data for SaprotHub
+4. **[Choosing the Right Model](5-choosing-the-right-model)**: Select the appropriate model for your needs
+
+> [!TIP]
+> Start with ColabSaprot for the most user-friendly experience. It provides guided interfaces for training and prediction without requiring any local setup or coding knowledge.
+
+> [!TIP]
+> For protein structure-related tasks, always use SA sequences instead of plain AA sequences. The structural information significantly improves prediction accuracy for most biological applications.
+
+# Quick Start
+
+
+
+Welcome to SaprotHub - a revolutionary platform that democratizes protein language model training, sharing, and collaboration for the entire biology community. This guide will help you get started with protein modeling tasks in minutes, even without coding experience.
+
+## What is SaprotHub?
+
+SaprotHub is an official implementation of the [SaprotHub paper](https://www.biorxiv.org/content/10.1101/2024.05.24.595648v5) published in Nature Biotechnology. It enables biologists to train and share protein language models through a user-friendly interface, eliminating the need for advanced machine learning knowledge or coding skills.
+
+![SaprotHub Architecture](https://github.com/westlake-repl/SaprotHub/blob/main/Figure/SA_Sequence.png?raw=true)
+
+## Getting Started in 3 Ways
+
+### 1. Google Colab (Recommended for Beginners)
+
+The fastest way to start is through Google Colab, which provides free GPU access:
+
+#### Access Options:
+- **[ColabSaprot](https://colab.research.google.com/github/westlake-repl/SaprotHub/blob/main/colab/SaprotHub_v2.ipynb)** - Structure-aware protein models (35M, 650M)
+- **[ColabSeprot](https://colab.research.google.com/github/westlake-repl/SaprotHub/blob/main/colab/ColabSeprot.ipynb)** - Sequence-based models including ESM1b, ESM2, ProtBert, ProTrek
+
+#### Setup Steps:
+1. Open the Colab notebook link
+2. Switch to GPU runtime: `Runtime > Change runtime type > GPU`
+3. Click the run button to start the installation (3-8 minutes)
+
+#### GPU Selection Guide:
+| GPU Type | Cost | Best For | Model Size |
+|----------|------|----------|------------|
+| T4 | Free | Basic tasks, small datasets | Saprot 35M |
+| L4 | Colab Pro | Medium datasets | Saprot 650M |
+| A100 | Colab Pro | Large datasets, complex tasks | Saprot 650M |
+
+### 2. Local Server Deployment
+
+For users who prefer local deployment:
+
+#### Linux Users:
+```bash
+cd local_server
+bash install.sh
+bash run.sh
+```
+
+#### Windows Users:
+1. Download [SaprotHubImage.tar](https://huggingface.co/datasets/lxzcpro/SaprotHubWindowsDeploy/tree/main) and WindowsDeploy.bat
+2. Install [Docker Desktop](https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe)
+3. Run WindowsDeploy.bat
+4. Start Jupyter: `bash run.sh`
+
+#### Connection:
+Connect to `http://localhost:12315/?token=SaprotHub` through Colab's "Connect to local runtime" option.
+
+### 3. Local Installation
+
+For advanced users who want to integrate SaprotHub into their workflows:
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Or using Poetry
+pip install poetry
+poetry install
+```
+
+[pyproject.toml](pyproject.toml#L1-L34) and [requirements.txt](requirements.txt#L1-L26) contain all necessary dependencies including PyTorch, transformers, and specialized bioinformatics libraries.
+
+## Understanding Your Tasks
+
+SaprotHub supports various protein prediction tasks. Understanding your task type is crucial for selecting the right approach:
+
+### Classification & Regression Tasks (Training Required)
+
+| Task Type | Description | Examples |
+|-----------|-------------|----------|
+| **Protein-level Classification** | Classify entire protein sequences | Fold prediction, localization, function prediction |
+| **Protein-level Regression** | Predict numerical protein properties | Thermal stability, fluorescence intensity, binding affinity |
+| **Residue-level Classification** | Classify individual amino acids | Secondary structure, binding sites, active sites |
+| **Pair Classification** | Predict protein-protein interactions | PPI prediction, interaction type classification |
+| **Pair Regression** | Predict interaction strength | Binding energy, interaction affinity |
+
+### Zero-shot Tasks (No Training Required)
+
+| Task Type | Description | Examples |
+|-----------|-------------|----------|
+| **Mutational Effect Prediction** | Predict effects of mutations | Enzyme activity, virus fitness, driver mutations |
+| **Inverse Folding** | Predict sequences from structures | Enzyme optimization, stability enhancement |
+
+## Data Preparation
+
+### Supported Data Formats
+
+SaprotHub accepts multiple data types:
+
+#### Single Protein Input:
+- AA Sequences (FASTA format)
+- SA Sequences (Structure-aware sequences)
+- UniProt IDs
+- PDB/CIF Structure files
+
+#### Batch Input:
+- Multiple AA/SA sequences (CSV format)
+- Multiple UniProt IDs (CSV format)
+- Multiple PDB/CIF structures (CSV + ZIP)
+
+#### Pair Input (for interaction tasks):
+- Pairs of any single input type above
+
+### Structure-Aware (SA) Sequences
+
+SA sequences combine residue and structural information using Foldseek encoding:
+
+![SA Sequence Generation](https://github.com/westlake-repl/SaProtHub/blob/main/Figure/SA_Sequence.png?raw=true)
+
+### Dataset Format Requirements
+
+For training tasks, prepare a CSV file with three required columns:
+
+| Column | Description | Example |
+|--------|-------------|---------|
+| `sequence` | Protein data based on your data type | `MKTLLL...` or SA sequence |
+| `label` | Task-specific labels | `0,1,2` (classification) or `1.23` (regression) |
+| `stage` | Data split | `train`, `valid`, `test` |
+
+## Model Selection
+
+### Available Model Types
+
+| Model Type | Use Case | Description |
+|------------|----------|-------------|
+| **Official SaProt 35M** | Training | Lightweight model for quick experiments |
+| **Official SaProt 650M** | Training | Full-featured model for best performance |
+| **Self-trained Models** | Continual training/prediction | Models you've trained on ColabSaprot |
+| **SaprotHub Community Models** | Continual training/prediction | Models shared by the community |
+| **Local Models** | Continual training/prediction | Models saved to your computer |
+| **Multi-model Ensembles** | Prediction | Combine multiple models for better accuracy |
+
+### Finding Community Models
+
+1. Visit [SaprotHub Repository](https://huggingface.co/SaProtHub)
+2. Browse models by task, performance, or popularity
+3. Copy the Model ID for use in ColabSaprot
+
+## Quick Workflow
+
+```mermaid
+flowchart TD
+    A[Start] --> B{Choose Access Method}
+    B -->|Colab| C[Open ColabSaprot]
+    B -->|Local| D[Install Dependencies]
+    B -->|Server| E[Deploy Local Server]
+    
+    C --> F{Select Task Type}
+    D --> F
+    E --> F
+    
+    F -->|Training Required| G[Prepare Dataset]
+    F -->|Zero-shot| H[Select Pretrained Model]
+    
+    G --> I[Choose Base Model]
+    H --> J[Configure Input]
+    
+    I --> K[Configure Training]
+    J --> L[Run Prediction]
+    
+    K --> M[Train Model]
+    L --> N[Get Results]
+    
+    M --> O[Save/Share Model]
+    N --> P[Analyze Results]
+    
+    O --> Q[End]
+    P --> Q
+```
+
+## Training Configuration
+
+For training tasks, configure these key parameters:
+
+| Parameter | Recommended Values | Description |
+|-----------|-------------------|-------------|
+| `batch_size` | Adaptive (default) or 8-256 | Depends on dataset size and GPU memory |
+| `max_epochs` | 10-50 | Maximum training iterations |
+| `learning_rate` | 5.0e-4 (650M) or 1.0e-3 (35M) | Convergence speed control |
+
+> [!TIP]
+> Start with smaller `max_epochs` (10-20) and monitor validation performance. The best model is saved after each epoch automatically.
+
+## Community and Support
+
+### Getting Help:
+- **Email**: {sujin, yuanfajie}@westlake.edu.cn (24-hour response time)
+- **Slack**: [Join our community](https://westlakeai.slack.com/archives/C08JNBN40P7)
+- **WeChat**: Scan QR code in README for group access (500+ members)
+
+### Contributing to OPMC:
+SaprotHub is part of the [Open Protein Modeling Consortium (OPMC)](https://theopmc.github.io/). You can contribute by:
+- Training and sharing models on SaprotHub
+- Developing new ColabPLM interfaces
+- Joining as an OPMC member for authorship opportunities
+
+## Next Steps
+
+Now that you understand the basics, explore these specific guides:
+
+- [Understanding Protein Prediction Tasks](3-understanding-protein-prediction-tasks) - Deep dive into task types and applications
+- [Preparing Your Dataset](4-preparing-your-dataset) - Detailed dataset preparation instructions
+- [Choosing the Right Model](5-choosing-the-right-model) - Model selection strategies and comparisons
+
+Ready to start? Open [ColabSaprot](https://colab.research.google.com/github/westlake-repl/SaprotHub/blob/main/colab/SaprotHub_v2.ipynb) and begin your protein modeling journey!
+
+# Understanding Protein Prediction Tasks
+
+
+
+Protein prediction tasks form the foundation of computational biology and drug discovery, enabling researchers to understand protein functions, interactions, and properties without expensive wet-lab experiments. SaprotHub provides a comprehensive platform for various protein prediction tasks, leveraging the power of structure-aware protein language models to deliver accurate predictions across multiple biological applications.
+
+## Task Categories Overview
+
+SaprotHub supports protein prediction tasks organized into seven main categories, each addressing specific biological questions and applications:
+
+![Task Overview](https://github.com/westlake-repl/SaProtHub/blob/main/Figure/task_list.png?raw=true)
+
+Based on the comprehensive task list defined in [task_list.md](task_list.md#L1-L144), these categories encompass the full spectrum of protein analysis needs:
+
+## Protein-Level Classification Tasks
+
+Protein-level classification tasks categorize entire protein sequences into predefined classes based on their properties or functions. These tasks are fundamental for understanding protein behavior and biological roles.
+
+**Key Applications:**
+- **Fold Class Prediction**: Determining the structural fold category of proteins
+- **Localization Prediction**: Predicting subcellular localization (e.g., nucleus, cytoplasm, membrane)
+- **Function Prediction**: Classifying proteins based on their biological functions
+- **Enzyme Classification**: Assigning Enzyme Commission (EC) numbers to enzymes
+- **Domain Classification**: Identifying protein domain types and architectures
+
+**Implementation in SaprotHub:**
+The platform supports protein-level classification through specialized models like the DeepLoc classifier, which can predict subcellular localization with 2-class (cytoplasmic vs non-cytoplasmic) or 10-class configurations [saprot/config/DeepLoc/cls2/saprot.yaml](saprot/config/DeepLoc/cls2/saprot.yaml#L1-L70).
+
+## Protein-Level Regression Tasks
+
+Regression tasks predict continuous numerical values associated with protein properties, enabling quantitative assessment of protein characteristics.
+
+**Key Applications:**
+- **Thermal Stability Prediction**: Estimating protein melting temperatures
+- **Binding Affinity Prediction**: Measuring interaction strength between proteins and ligands
+- **Enzymatic Activity Prediction**: Quantifying catalytic efficiency
+- **Solubility Prediction**: Assessing protein solubility properties
+- **Expression Level Prediction**: Estimating protein expression yields
+
+**Technical Implementation:**
+These tasks utilize regression models that output continuous values, typically trained on datasets with numerical labels representing the target property [tutorial.md](tutorial.md#L200-L210).
+
+## Protein-Protein Interaction Tasks
+
+These tasks analyze relationships between protein pairs, crucial for understanding cellular pathways and drug target identification.
+
+**Classification Applications:**
+- **Protein-Protein Interaction (PPI) Prediction**: Determining whether two proteins interact
+- **Interaction Type Classification**: Categorizing interaction mechanisms
+- **Disease-Associated Interaction Prediction**: Identifying interactions linked to diseases
+
+**Regression Applications:**
+- **Interaction Strength Prediction**: Quantifying binding affinity
+- **Binding Free Energy Calculation**: Computing thermodynamic parameters
+- **Interaction Kinetics Prediction**: Estimating rate constants
+
+## Zero-Shot Mutation Effect Prediction
+
+This advanced category uses pre-trained models to predict the effects of mutations without task-specific training, leveraging the model's learned biological knowledge.
+
+**Applications:**
+- **Pathogenicity Prediction**: Assessing disease-causing potential of mutations
+- **Protein Stability Prediction**: Estimating stability changes upon mutation
+- **Enzyme Activity Prediction**: Predicting functional impact of mutations
+- **Immune Escape Prediction**: Identifying mutations that evade immune detection
+
+**SaprotHub Implementation:**
+The ClinVar configuration demonstrates zero-shot prediction capabilities, using the SaProt model to predict mutational effects without fine-tuning [saprot/config/ClinVar/saprot.yaml](saprot/config/ClinVar/saprot.yaml#L1-L38).
+
+## Protein Sequence Design
+
+This forward-looking category focuses on generating novel protein sequences with desired properties, enabling protein engineering and drug design.
+
+**Applications:**
+- **Enzyme Function Optimization**: Designing enzymes with improved catalytic properties
+- **Protein Stability Enhancement**: Creating more stable protein variants
+- **Antibody Design**: Engineering therapeutic antibodies
+- **Vaccine Design**: Developing immunogenic protein sequences
+
+## Residue-Level Classification Tasks
+
+These tasks perform fine-grained analysis at the amino acid level, providing detailed insights into protein structure and function.
+
+**Applications:**
+- **Secondary Structure Prediction**: Classifying residues into helix, sheet, or coil
+- **Binding Site Prediction**: Identifying ligand-binding residues
+- **Active Site Prediction**: Locating catalytic residues
+- **Post-Translational Modification Site Prediction**: Identifying modification sites
+- **Metal Binding Site Prediction**: Finding metal-coordinating residues
+
+## Task Architecture in SaprotHub
+
+The platform employs a unified architecture that supports different task types through specialized model configurations:
+
+```mermaid
+graph TD
+    A[SaProt Base Model] --> B[Task-Specific Heads]
+    B --> C[Classification Tasks]
+    B --> D[Regression Tasks]
+    B --> E[Zero-Shot Tasks]
+    B --> F[Pair Tasks]
+    
+    C --> C1[Protein-Level]
+    C --> C2[Residue-Level]
+    C --> C3[Pair Classification]
+    
+    D --> D1[Protein-Level]
+    D --> D2[Pair Regression]
+    
+    E --> E1[Mutation Effects]
+    E --> E2[Inverse Folding]
+    
+    F --> F1[PPI Prediction]
+    F --> F2[Binding Affinity]
+```
+
+## Model Selection by Task Type
+
+Different tasks require different model architectures and training strategies:
+
+| Task Category | Model Type | Input Format | Output Type |
+|---------------|------------|--------------|-------------|
+| Protein Classification | Classification Model | Single Sequence | Class Labels |
+| Protein Regression | Regression Model | Single Sequence | Continuous Values |
+| Residue Classification | Sequence Tagging Model | Single Sequence | Per-Residue Labels |
+| PPI Prediction | Pair Classification Model | Sequence Pair | Binary/Multi-class |
+| Mutation Effects | Zero-shot Model | Wild-type + Mutation | Effect Scores |
+| Sequence Design | Generative Model | Structure/Constraints | Novel Sequences |
+
+## Data Requirements and Formats
+
+Each task type has specific data requirements:
+
+**For Classification/Regression Tasks:**
+- CSV format with `sequence`, `label`, and `stage` columns
+- Sequence format varies by data type (AA sequence, SA sequence, UniProt ID, PDB structure)
+- Labels depend on task type (categorical indices for classification, numerical values for regression)
+
+**For Zero-Shot Tasks:**
+- Wild-type sequence and mutation information
+- No training data required
+- Uses pre-trained model knowledge
+
+**For Pair Tasks:**
+- Two protein sequences or structures per sample
+- Interaction labels or affinity values
+
+> [!TIP]
+> The choice between different task types depends on your biological question and available data. Start with simpler classification tasks if you're new to protein prediction, then progress to more complex regression or zero-shot tasks as you gain experience.
+
+## Next Steps
+
+After understanding the available protein prediction tasks, you should:
+
+1. **[Preparing Your Dataset](4-preparing-your-dataset)**: Learn how to format your data according to task requirements
+2. **[Choosing the Right Model](5-choosing-the-right-model)**: Select appropriate model architecture for your specific task
+3. **[Structure-Aware Protein Representation](6-structure-aware-protein-representation)**: Understand how Saprot processes protein structure information
+
+Each task type in SaprotHub is supported by comprehensive documentation, example datasets, and pre-configured models to help you get started quickly with your protein analysis projects.
+
+# Preparing Your Dataset
+
+
+
+Understanding how to properly prepare your dataset is crucial for successful protein analysis with SaprotHub. This guide will walk you through the essential steps and formats needed to structure your data effectively.
+
+## Dataset Structure Overview
+
+SaprotHub supports multiple dataset formats designed for different protein analysis tasks. The system is built around a flexible LMDB (Lightning Memory-Mapped Database) infrastructure that enables efficient data handling for large-scale protein datasets.
+
+```mermaid
+flowchart TD
+    A[Raw Data] --> B[CSV Format]
+    B --> C{Task Type}
+    C -->|Classification| D[Labels: Integer Categories]
+    C -->|Regression| D[Labels: Float Values]
+    C -->|Token Classification| D[Labels: Per-residue Tags]
+    C -->|Pair Tasks| D[Labels: Relationship Scores]
+    D --> E[LMDB Conversion]
+    E --> F[Ready for Training]
+```
+
+## Supported Input Formats
+
+### CSV Dataset Structure
+
+Your primary input should be formatted as CSV files with specific column requirements. The system automatically processes these into LMDB format for optimal performance.
+
+**Basic Structure Requirements:**
+- `sequence`: Protein amino acid sequences
+- `label`: Target values for your specific task
+- `stage`: Data partition (train/valid/test)
+
+### Task-Specific Formats
+
+#### Classification Tasks
+For protein classification, your dataset should include integer labels representing different categories:
+
+```csv
+sequence,label,stage
+MEETMKLATMEDTVEYCLFLIPDESRDSDKHKEILQKYIERIITRFAPMLVPYIWQNQPFNLKYKPGKGGVPAHMFGVTKFGDNIEDEWFIVYVIKQITKEFPELVARIEDNDGEFLLIEAADFLPKWLDPENSTNRVFFCHGELCIIPAPRKSGAESWLPTTPPTIPQALNIITAHSEKILASESIRAAVNRRIRGYPEKIQASLHRAHCFLPAGIVAVLKQRPRLVAAAVQAFYLRDPIDLRACRVFKTFLPETRIMTSVTFTKCLYAQLVQQRFVPDRRSGYRLPPPSDPQYRAHEL,0,train
+MAVMAPRTLLLLLSGALALTQTWAGSHSMRYFFTSVSRPGRGEPRFIAVGYVDDTQFVRFDSDAASQRMEPRAPWIEQEGPEYWDQETRNVKAQSQTDRVDLGTLRGYYNQSEAGSHTIQIMYGCDVGSDGRFLRGYRQDAYDGKDYIALNEDLRSWTAADMAAQITKRKWEAAHEAEQLRAYLDGTCVEWLRRYLENGKETLQRTDPPKTHMTHHPISDHEATLRCWALGFYPAEITLTWQRDGEDQTQDTELVETRPAGDGTFQKWAAVVVPSGEEQRYTCHVQHEGLPKPLTLRWEL,1,test
+```
+
+#### Regression Tasks
+For regression analysis, labels should be continuous float values representing measurements like fitness scores or binding affinities.
+
+#### Pair-Based Tasks
+For protein-protein interaction or comparative tasks, the format expands to include paired sequences:
+
+```csv
+sequence_1,sequence_2,name_1,name_2,chain_1,chain_2,label,stage
+MKVLWAALLVTFLAGCQAKVEQAVETEPEPELRQQTEWD... ,MVLSEGEWQLVLHVWAKVEADVAGHGQDILIRLFKSHPETLEKFDRVKHLKTEAEMKASEDLKKHGVTVLTALGAILKKKGHHEAELKPLAQSHATKHKIPIKYLEFISEAIIHVLHSRHPGDFGADAQGAMNKALELFRKDIAAKYKELGYQG,protein1,protein2,A,B,0.85,train
+```
+
+## Data Processing Pipeline
+
+### Automatic LMDB Conversion
+
+SaprotHub provides automated tools to convert your CSV files into optimized LMDB format. The `construct_lmdb` function handles this transformation efficiently:
+
+```python
+from saprot.utils.construct_lmdb import construct_lmdb
+
+# Convert your CSV to LMDB format
+construct_lmdb(
+    csv_file="path/to/your/dataset.csv",
+    root_dir="output/directory",
+    dataset_name="my_protein_dataset",
+    task_type="classification"
+)
+```
+
+The system automatically validates your data format and handles different task types appropriately.
+
+### Sequence Length Management
+
+The framework includes intelligent sequence truncation to manage computational resources:
+
+- Training sequences: Limited to 2044 amino acids for memory efficiency
+- Validation/Test sequences: Full length preserved for complete evaluation
+- Token classification: Labels truncated to 1022 positions during training
+
+## Advanced Dataset Features
+
+### Structure-Aware Datasets
+
+For tasks requiring structural information, SaprotHub supports specialized datasets that incorporate 3D protein coordinates:
+
+- **SaprotLMDataset**: Combines sequence masking with structural bias features
+- **SaprotFoldseekDataset**: Uses Foldseek-based structural representations
+- Coordinate data is processed through the protein structure parser for optimal encoding
+
+### Data Transformation Utilities
+
+The framework provides comprehensive data transformation tools:
+
+- **One-hot encoding**: For sequence representation
+- **Distance maps**: Spatial relationship calculations between residues
+- **Orientation features**: 3D structural information extraction
+- **RBF (Radial Basis Function) encoding**: Continuous value discretization
+
+## Best Practices for Dataset Preparation
+
+### Quality Assurance
+
+1. **Sequence Validation**: Ensure all amino acid sequences use standard 20 amino acid notation
+2. **Label Consistency**: Verify label types match your task (integers for classification, floats for regression)
+3. **Data Partitioning**: Maintain balanced train/validation/test splits
+4. **Missing Data Handling**: Address gaps in sequences or labels before processing
+
+### Performance Optimization
+
+1. **Batch Size Consideration**: Larger datasets benefit from LMDB's memory-mapped architecture
+2. **Sequence Length**: Consider truncation strategies for very long proteins
+3. **Storage Planning**: LMDB files typically require 2-3x the original CSV size
+
+### Example Dataset Files
+
+The repository includes comprehensive examples in the `upload_files/example_csv_dataset/train/` directory:
+
+- `[EXAMPLE]Multiple_AA_Sequences.csv`: Basic sequence classification format
+- `[EXAMPLE][Classification-2Categories]Multiple_AA_Sequences.csv`: Binary classification example
+- `[EXAMPLE][Regression]Multiple_AA_Sequences.csv`: Regression task format
+- `[EXAMPLE]Multiple_pairs_of_AA_Sequences.csv`: Protein-pair analysis format
+
+## Integration with Training Pipeline
+
+Once your dataset is properly formatted and converted to LMDB, it integrates seamlessly with SaprotHub's training infrastructure. The dataset interface automatically handles:
+
+- Data loading and batching
+- Tokenization and masking for language model training
+- Coordinate processing for structure-aware tasks
+- Multi-GPU data distribution
+
+## Next Steps
+
+After preparing your dataset, you'll want to explore [Choosing the Right Model](5-choosing-the-right-model) to select the optimal SaprotHub configuration for your specific protein analysis task. The model selection process considers your dataset characteristics, task requirements, and available computational resources.
+
+For detailed information about specific dataset format requirements and advanced processing options, refer to [Dataset Format Requirements](13-dataset-format-requirements) in the comprehensive documentation.
+
+# Choosing the Right Model
+
+
+
+Selecting the appropriate model is crucial for achieving optimal performance in your protein prediction tasks. SaprotHub provides a comprehensive suite of models designed for different types of protein analysis, from sequence-only predictions to structure-aware computations. This guide will help you understand the available model options and choose the one that best fits your specific requirements.
+
+## Model Architecture Overview
+
+SaprotHub is built around two main model families: **SaProt** (structure-aware protein models) and **ProtT5** (sequence-based protein models). Each family offers specialized implementations for different downstream tasks.
+
+```mermaid
+graph TD
+    A[SaprotHub Models] --> B[SaProt Family]
+    A --> C[ProtT5 Family]
+    
+    B --> D[Classification]
+    B --> E[Regression]
+    B --> F[Mutation Analysis]
+    B --> G[Inverse Folding]
+    B --> H[Token Classification]
+    
+    C --> I[Classification]
+    C --> J[Regression]
+    C --> K[Token Classification]
+    
+    D --> L[SaprotClassificationModel]
+    E --> M[SaprotRegressionModel]
+    F --> N[SaprotFoldseekMutationModel]
+    G --> O[SaProtIFModel]
+    H --> P[SaprotTokenClassificationModel]
+    
+    I --> Q[ProtT5ClassificationModel]
+    J --> R[ProtT5RegressionModel]
+    K --> S[ProtT5TokenClassificationModel]
+```
+
+## Model Selection Matrix
+
+| Task Type | SaProt Model | ProtT5 Model | Structure Required | Best For |
+|-----------|-------------|--------------|-------------------|----------|
+| **Protein Classification** | SaprotClassificationModel | ProtT5ClassificationModel | Optional (SaProt) | Multi-class protein labeling, functional prediction |
+| **Property Regression** | SaprotRegressionModel | ProtT5RegressionModel | Optional (SaProt) | Thermostability, binding affinity prediction |
+| **Mutation Effect Prediction** | SaprotFoldseekMutationModel | ❌ | Required | Zero-shot mutational scanning, variant analysis |
+| **Inverse Folding** | SaProtIFModel | ❌ | Required | Sequence design from structure |
+| **Token Classification** | SaprotTokenClassificationModel | ProtT5TokenClassificationModel | Optional (SaProt) | Per-residue annotation, binding site prediction |
+
+## SaProt Models: Structure-Aware Protein Analysis
+
+### Classification Tasks
+
+**SaprotClassificationModel** is designed for multi-class protein classification tasks. It leverages both sequence and structural information when available, making it ideal for tasks like:
+
+- Enzyme commission (EC) number prediction
+- Gene Ontology (GO) term classification
+- Subcellular localization prediction
+- Protein family classification
+
+The model supports both frozen backbone and fine-tuning modes, allowing you to choose between efficient feature extraction and full model adaptation [saprot/model/saprot/saprot_classification_model.py](saprot/model/saprot/saprot_classification_model.py#L24-L40).
+
+### Regression Tasks
+
+**SaprotRegressionModel** handles continuous value prediction tasks. It's particularly effective for:
+
+- Protein thermostability prediction
+- Binding affinity estimation
+- Expression level prediction
+- Activity measurement
+
+The model provides comprehensive metrics including Spearman correlation, Pearson correlation, and R² score for thorough performance evaluation [saprot/model/saprot/saprot_regression_model.py](saprot/model/saprot/saprot_regression_model.py#L20-L24).
+
+### Mutation Effect Analysis
+
+**SaprotFoldseekMutationModel** is the flagship model for zero-shot mutational effect prediction. Key features include:
+
+- **Foldseek Integration**: Converts 3D structures to structural sequences for efficient processing
+- **Confidence-based Masking**: Automatically masks low-confidence regions based on pLDDT scores
+- **MSA Support**: Incorporates multiple sequence alignment information when available
+- **Comprehensive Logging**: Tracks predictions for clinical variants and research datasets
+
+This model excels at predicting the effects of single and multiple mutations without task-specific training [saprot/model/saprot/saprot_foldseek_mutation_model.py](saprot/model/saprot/saprot_foldseek_mutation_model.py#L136-L281).
+
+### Inverse Folding
+
+**SaProtIFModel** specializes in protein inverse folding - designing amino acid sequences that fold into desired 3D structures. It supports:
+
+- **Multiple Prediction Methods**: Argmax for deterministic predictions or multinomial sampling for diverse sequence generation
+- **Partial Masking**: Predict only specific regions while preserving others
+- **Batch Processing**: Generate multiple sequence candidates simultaneously
+
+This model is essential for protein design applications and structure-based sequence optimization [saprot/model/saprot/saprot_if_model.py](saprot/model/saprot/saprot_if_model.py#L77-L130).
+
+## ProtT5 Models: Sequence-Based Protein Analysis
+
+When structural information is unavailable or when you prefer sequence-only approaches, ProtT5 models provide excellent alternatives:
+
+### ProtT5 Classification
+
+**ProtT5ClassificationModel** offers sequence-based classification with strong performance on tasks where structural information may be less critical. It uses the ProtT5-XL-U50 pretrained model as its foundation [saprot/model/protT5/protT5_classification_model.py](saprot/model/protT5/protT5_classification_model.py#L36-L58).
+
+### ProtT5 Regression
+
+**ProtT5RegressionModel** provides sequence-based regression capabilities, suitable for property prediction when only sequence data is available.
+
+## Configuration and Usage
+
+### Model Configuration
+
+All models in SaprotHub follow a unified configuration system based on YAML files. The default configuration template is located at [saprot/config/default.yaml](saprot/config/default.yaml), with task-specific configurations available in subdirectories:
+
+- **Structure-aware tasks**: Use configurations in task-specific folders (e.g., `saprot/config/DeepLoc/`)
+- **Pretrained models**: Available in `saprot/config/pretrain/`
+
+### Key Configuration Parameters
+
+```yaml
+model:
+  kwargs:
+    load_pretrained: True  # Load pretrained weights
+    # num_labels: 2        # Number of output classes (for classification)
+  
+dataset:
+  kwargs:
+    plddt_threshold: null  # Confidence threshold for structure masking
+    
+Trainer:
+  max_epochs: 2          # Training epochs
+  precision: 16          # Mixed precision training
+```
+
+## Decision Guidelines
+
+### Choose SaProt Models When:
+
+1. **High-accuracy prediction is critical** and you have structural data
+2. **Working with mutation effects** or variant analysis
+3. **Designing proteins** with specific structural constraints
+4. **Analyzing structure-function relationships**
+
+### Choose ProtT5 Models When:
+
+1. **Only sequence data is available**
+2. **Computational resources are limited** (faster inference)
+3. **Working with large-scale sequence datasets**
+4. **Structure information is less relevant** to your task
+
+### Model Selection Flowchart
+
+```mermaid
+flowchart TD
+    A[Start: What's your task?] --> B{Structural data available?}
+    
+    B -->|Yes| C{Task type?}
+    B -->|No| H[Use ProtT5 Models]
+    
+    C -->|Classification| D[SaprotClassificationModel]
+    C -->|Regression| E[SaprotRegressionModel]
+    C -->|Mutation Analysis| F[SaprotFoldseekMutationModel]
+    C -->|Protein Design| G[SaProtIFModel]
+    
+    H --> I{Task type?}
+    I -->|Classification| J[ProtT5ClassificationModel]
+    I -->|Regression| K[ProtT5RegressionModel]
+    I -->|Token Classification| L[ProtT5TokenClassificationModel]
+```
+
+## Next Steps
+
+After selecting your model, proceed to:
+
+1. **[Understanding Protein Prediction Tasks](3-understanding-protein-prediction-tasks)** - Learn about the theoretical foundations
+2. **[Structure-Aware Protein Representation](6-structure-aware-protein-representation)** - Deep dive into SaProt's architecture
+3. **[Transformer-Based Model Architecture](7-transformer-based-model-architecture)** - Understand the underlying transformer mechanisms
+
+> [!TIP]
+> For beginners, start with the classification models as they have the most straightforward setup and comprehensive documentation. The SaprotClassificationModel provides an excellent introduction to structure-aware protein analysis.
+
+> [!TIP]
+> When working with mutation analysis, the SaprotFoldseekMutationModel offers the most comprehensive approach, supporting both single and multiple mutations with confidence-based structural masking.
+
+# Structure-Aware Protein Representation
+
+
+
+SaProt introduces a revolutionary approach to protein representation by integrating three-dimensional structural information directly into the language model's embedding space. Unlike traditional protein language models that process sequences independently of their spatial context, SaProt's structure-aware representation captures the intricate relationship between amino acid sequence and protein folding, enabling more accurate predictions across diverse biological tasks.
+
+## Core Architecture: Structure-Sequence Integration
+
+The foundation of SaProt's structure-aware representation lies in its dual-input processing pipeline, which seamlessly combines sequence and structural information through specialized encoding mechanisms.
+
+### Structure Encoding Pipeline
+
+The structural encoding process begins with extracting geometric features from protein coordinates using a sophisticated feature extraction pipeline:
+
+```python
+def coords2feature(coords: dict, device: str = 'cpu'):
+    pair_feature = make_rbf(coords, device=device)
+    pair_feature = torch.cat([pair_feature, make_orientations(coords, device)], dim=-1)
+    return pair_feature
+```
+
+This pipeline generates **407-dimensional feature vectors** that capture both distance-based and orientation-based structural relationships between amino acid pairs [saprot/data/pdb2feature.py#L19-L23](saprot/data/pdb2feature.py#L19-L23).
+
+### Radial Basis Function (RBF) Distance Features
+
+The distance encoding employs **Radial Basis Functions (RBFs)** to discretize continuous distance measurements into learnable representations:
+
+```python
+def make_rbf(coord_dict, num_rbf=16, device='cpu'):
+    coords = torch.stack([torch.tensor(coord_dict[k]) for k in ["N", "CA", "C", "O"]], dim=1)
+    coords_dist = make_dist_map(coords)
+    RBFs = torch.cat([rbf(coords_dist[..., i], 2., 22., num_rbf) for i in range(coords_dist.shape[-1])], dim=-1)
+    return RBFs
+```
+
+The RBF transformation maps pairwise distances between backbone atoms (N, CA, C, O) into a **16-dimensional embedding space** spanning distances from 2Å to 22Å [saprot/data/data_transform.py#L95-L115](saprot/data/data_transform.py#L95-L115). This approach preserves continuous spatial information while making it amenable to neural network processing.
+
+### Orientation Encoding with Quaternions
+
+SaProt captures relative orientation between amino acids through a sophisticated quaternion-based representation:
+
+```python
+def make_orientations(coord_dict, device='cuda'):
+    X_N, X_CA, X_C, _ = [atom_coords for atom_coords in coord_dict.values()]
+    vec_CAtoC = F.normalize(X_C - X_CA, dim=-1)
+    vec_CAtoN = F.normalize(X_N - X_CA, dim=-1)
+    vec_cross_product = F.normalize(torch.cross(vec_CAtoN, vec_CAtoC), dim=-1)
+    
+    O = torch.stack((vec_CAtoN, vec_cross_product, torch.cross(vec_CAtoN, vec_cross_product)), -2)
+    dX = X_CA[..., None, :] - X_CA[..., None, :, :]
+    dU = torch.matmul(O[..., None, :, :].transpose(-1, -2), dX.unsqueeze(-1)).squeeze(-1)
+    dU = F.normalize(dU, dim=-1)
+    
+    rots = torch.matmul(O.unsqueeze(-3).transpose(-1, -2), O.unsqueeze(-4))
+    quats = rot2quat(rots)
+    O_features = torch.cat((dU, quats), dim=-1)
+    return O_features
+```
+
+This process creates **local reference frames** for each amino acid using the backbone geometry (N-CA-C atoms) and computes relative orientations between all residue pairs using **quaternion representations** [saprot/data/data_transform.py#L118-L152](saprot/data/data_transform.py#L118-L152). The resulting orientation features capture both directional relationships and rotational alignments between amino acids.
+
+## Foldseek Integration: Efficient Structure-to-Sequence Mapping
+
+SaProt leverages **Foldseek**, a structure alignment tool, to convert complex 3D protein structures into sequences that preserve structural information:
+
+```python
+def get_struc_seq(foldseek, path, chains: list = None, process_id: int = 0, 
+                  plddt_mask: bool = True, plddt_threshold: float = 70.,
+                  foldseek_verbose: bool = False) -> dict:
+```
+
+This function processes PDB files through Foldseek's `structureto3didescriptor` operation, generating **structural sequences** that encode geometric relationships in a sequence-like format [saprot/utils/foldseek_util.py#L12-L38](saprot/utils/foldseek_util.py#L12-L38). The integration enables:
+
+- **Efficient storage**: Structural information compressed into sequence format
+- **Fast processing**: Leverages existing protein language model infrastructure
+- **Quality filtering**: Incorporates pLDDT confidence scores from AlphaFold2 predictions
+
+> [!TIP]
+> The Foldseek integration is crucial for scalability—it converts high-dimensional structural data into a format that can be processed by existing transformer architectures without requiring specialized 3D convolution operations.
+
+## Model Architecture: Unified Sequence-Structure Processing
+
+### Base Model Framework
+
+The `SaprotBaseModel` serves as the foundation for all structure-aware tasks, providing a unified interface for different downstream applications:
+
+```python
+class SaprotBaseModel(AbstractModel):
+    def __init__(self, task: str, config_path: str, extra_config: dict = None,
+                 load_pretrained: bool = False, freeze_backbone: bool = False,
+                 gradient_checkpointing: bool = False, lora_kwargs: dict = None, **kwargs):
+```
+
+This architecture supports **multiple task types** including classification, regression, token classification, and language modeling [saprot/model/saprot/base.py#L21-L34](saprot/model/saprot/base.py#L21-L34).
+
+### Structure-Enhanced Tokenization
+
+SaProt employs a specialized tokenizer that processes both sequence and structural information simultaneously:
+
+```python
+def __getitem__(self, index):
+    entry = json.loads(self._get(index))
+    seq = entry['seq']
+    tokens = self.tokenizer.tokenize(seq)[:self.max_length]
+    masked_tokens, labels = self._apply_bert_mask(tokens)
+    return masked_seq, labels
+```
+
+The dataset implementation supports **masked language modeling** with structure-aware tokens, enabling the model to learn joint sequence-structure representations during pre-training [saprot/dataset/saprot/saprot_foldseek_dataset.py#L59-L74](saprot/dataset/saprot/saprot_foldseek_dataset.py#L59-L74).
+
+## Training Configuration and Optimization
+
+### Pre-training Strategy
+
+The pre-training configuration emphasizes structure-aware learning through carefully designed hyperparameters:
+
+```yaml
+dataset:
+  dataset_py_path: saprot/saprot_foldseek_dataset
+  kwargs:
+    tokenizer: westlake-repl/SaProt_35M_AF2
+    max_length: 1024
+    mask_ratio: 0.15
+```
+
+The model uses a **15% masking ratio** for structure-aware tokens during pre-training, following established BERT-style training protocols while incorporating structural context [saprot/config/pretrain/saprot.yaml#L47-L52](saprot/config/pretrain/saprot.yaml#L47-L52).
+
+### Learning Rate Scheduling
+
+The training employs a sophisticated learning rate schedule with warmup and decay phases:
+
+```yaml
+lr_scheduler_kwargs:
+  last_epoch: -1
+  init_lr: 0
+  max_lr: 4.0e-4
+  final_lr: 4.0e-5
+  warmup_steps: 2000
+  start_decay_after_n_steps: 150000
+  end_decay_after_n_steps: 1500000
+```
+
+This schedule enables **stable convergence** during the initial training phase and gradual learning rate decay to fine-tune the structure-aware representations [saprot/config/pretrain/saprot.yaml#L17-L25](saprot/config/pretrain/saprot.yaml#L17-L25).
+
+## Feature Engineering Pipeline
+
+### Multi-scale Structural Features
+
+SaRot's representation captures structural information at multiple scales:
+
+1. **Local geometry**: Backbone dihedral angles and bond lengths
+2. **Pairwise relationships**: Distance and orientation between amino acid pairs
+3. **Global topology**: Overall fold architecture through Foldseek encoding
+
+### Feature Integration Strategy
+
+The final representation combines multiple feature streams:
+
+```python
+pair_feature = make_rbf(coords, 16, device=device)
+pair_feature = torch.cat([pair_feature, make_orientations(coords, device)], dim=-1)
+```
+
+This concatenation creates a **comprehensive 407-dimensional feature vector** that captures both distance-based and orientation-based structural relationships [saprot/data/pdb2feature.py#L12-L13](saprot/data/pdb2feature.py#L12-L13).
+
+> [!TIP]
+> The multi-modal feature integration enables the model to learn complementary representations—RBF features capture spatial proximity while orientation features preserve directional relationships critical for understanding protein folding patterns.
+
+## Advantages Over Sequence-Only Models
+
+### Enhanced Biological Realism
+
+Structure-aware representations provide several key advantages:
+
+- **Contextual understanding**: Amino acid function depends on structural context
+- **Long-range dependencies**: Captures interactions between distant residues
+- **Conformational sensitivity**: Accounts for structural changes affecting function
+
+### Performance Benefits
+
+The integration of structural information leads to improved performance across diverse tasks:
+
+- **Mutation effect prediction**: Structural context crucial for understanding impacts
+- **Protein-protein interactions**: Interface geometry captured in representations
+- **Function prediction**: Structure correlates strongly with biological function
+
+## Implementation Considerations
+
+### Computational Efficiency
+
+Despite the complexity of structural encoding, SaProt maintains computational efficiency through:
+
+- **Pre-computed features**: Structural features calculated offline
+- **Batch processing**: Optimized for GPU acceleration
+- **Memory management**: Efficient tensor operations for large proteins
+
+### Scalability
+
+The architecture supports proteins of varying lengths through:
+
+- **Dynamic padding**: Handles variable sequence lengths
+- **Gradient checkpointing**: Reduces memory usage for large proteins
+- **Distributed training**: Scales across multiple GPUs
+
+## Next Steps
+
+To understand how these structure-aware representations are utilized in specific applications, continue with **[Transformer-Based Model Architecture](7-transformer-based-model-architecture)** which details the transformer modifications that enable effective processing of structure-aware tokens. For practical implementation guidance, see **[Structure-Aware Sequence Generation](12-structure-aware-sequence-generation)** which covers the data processing pipeline for preparing structure-aware datasets.
+
+# Transformer-Based Model Architecture
+
+
+
+The SaprotHub framework implements a sophisticated transformer-based architecture that leverages both ESM (Evolutionary Scale Modeling) and ProtT5 transformer models for protein analysis. This architecture provides a unified foundation for various protein prediction tasks while supporting advanced parameter-efficient fine-tuning techniques.
+
+## Core Architecture Components
+
+### Model Hierarchy and Base Classes
+
+The framework is built upon a well-structured hierarchy with `AbstractModel` serving as the foundational class that extends PyTorch Lightning [saprot/model/abstract_model.py](saprot/model/abstract_model.py#L12-L405). This abstract base defines the essential interface for all models, including methods for model initialization, forward propagation, metric handling, and checkpoint management. Two primary concrete implementations extend this foundation:
+
+- **SaprotBaseModel**: Utilizes ESM transformer architecture for structure-aware protein representation
+- **ProtT5BaseModel**: Implements ProtT5 transformer for sequence-based protein analysis
+
+Both base models share common patterns but differ in their underlying transformer architectures and tokenization strategies.
+
+### ESM-Based Architecture (Saprot)
+
+The SaprotBaseModel implements ESM-based transformers with sophisticated structure integration capabilities [saprot/model/saprot/base.py](saprot/model/saprot/base.py#L21-L453):
+
+```python
+class SaprotBaseModel(AbstractModel):
+    """
+    ESM base model. It cannot be used directly but provides model initialization for downstream tasks.
+    """
+```
+
+The model initialization process dynamically selects appropriate transformer architectures based on task requirements:
+
+- **Classification Tasks**: Utilizes `AutoModelForSequenceClassification` for multi-class protein predictions
+- **Token Classification**: Implements sequence-level labeling capabilities
+- **Regression Tasks**: Supports continuous value prediction
+
+The ESM architecture excels at capturing both sequence and structural information through its attention mechanisms, making it particularly suitable for structure-aware protein analysis.
+
+### ProtT5-Based Architecture
+
+The ProtT5BaseModel leverages the T5 encoder-decoder architecture adapted specifically for protein sequences [saprot/model/protT5/base.py](saprot/model/protT5/base.py#L27-L393):
+
+```python
+class ProtT5BaseModel(AbstractModel):
+    """
+    T5 base model. It cannot be used directly but provides model initialization for downstream tasks.
+    """
+```
+
+ProtT5 uses the `T5Tokenizer` and `T5EncoderModel` components, providing robust sequence understanding capabilities. The architecture is particularly effective for tasks requiring deep sequence comprehension and can be extended with custom classification heads for specific protein prediction tasks.
+
+## Parameter-Efficient Fine-Tuning with LoRA
+
+Both architectures implement advanced Low-Rank Adaptation (LoRA) techniques for efficient fine-tuning, enabling parameter-efficient adaptation to specific tasks while preserving the knowledge captured in pre-trained weights.
+
+### LoRA Configuration and Management
+
+The framework supports sophisticated LoRA configurations with multiple adapter management [saprot/model/saprot/base.py](saprot/model/saprot/base.py#L74-L120):
+
+```python
+lora_config = {
+    "task_type": "SEQ_CLS",
+    "target_modules": ["query", "key", "value", "intermediate.dense", "output.dense"],
+    "modules_to_save": ["classifier"],
+    "inference_mode": False,
+    "r": getattr(self.lora_kwargs, "r", 8),
+    "lora_dropout": getattr(self.lora_kwargs, "lora_dropout", 0.0),
+    "lora_alpha": getattr(self.lora_kwargs, "lora_alpha", 16),
+}
+```
+
+For ProtT5 models, the target modules are specifically tailored to the T5 architecture [saprot/model/protT5/base.py](saprot/model/protT5/base.py#L79-L125):
+
+```python
+"target_modules": ["SelfAttention.q", "SelfAttention.k", "SelfAttention.v", "SelfAttention.o", 
+                   "EncDecAttention.q", "EncDecAttention.k", "EncDecAttention.v", "EncDecAttention.o"]
+```
+
+### Multi-Adapter Support
+
+The framework supports loading and managing multiple LoRA adapters simultaneously, enabling:
+
+- **Transfer Learning**: Loading pre-trained adapters for specific domains
+- **Multi-Task Learning**: Maintaining separate adapters for different tasks
+- **Adapter Composition**: Combining multiple adapters for enhanced performance
+
+## Hidden State Extraction and Representation
+
+Both architectures provide sophisticated methods for extracting and processing transformer hidden states, enabling flexible feature extraction for various downstream applications.
+
+### Hidden State Processing
+
+The `get_hidden_states_from_dict` method demonstrates the sophisticated approach to representation learning [saprot/model/saprot/base.py](saprot/model/saprot/base.py#L257-L290):
+
+```python
+def get_hidden_states_from_dict(self, inputs: dict, reduction: str = None) -> list:
+    """
+    Get hidden representations from input dict
+    
+    Args:
+        inputs: A dictionary of inputs containing ["input_ids", "attention_mask", "token_type_ids"]
+        reduction: Whether to reduce the hidden states ("mean" for averaging over sequence length)
+    
+    Returns:
+        hidden_states: List of tensors with shape [L, D] where L is sequence length and D is hidden dimension
+    """
+```
+
+This method intelligently handles EOS token detection and provides flexible reduction strategies for different use cases, supporting both token-level and sequence-level representations.
+
+## Structure Integration Capabilities
+
+A key innovation in the Saprot architecture is the seamless integration of structural information into transformer representations through bias features.
+
+### Structure-Aware Attention
+
+The `add_bias_feature` method enables structure integration by adding coordinate-derived features to attention mechanisms [saprot/model/saprot/base.py](saprot/model/saprot/base.py#L327-L336):
+
+```python
+def add_bias_feature(self, inputs, coords: List[Dict]) -> torch.Tensor:
+    """
+    Add structure information as biases to attention map. This function is used to add structure information
+    to the model as Evoformer does.
+    
+    Args:
+        inputs: Input dictionary with ["input_ids", "attention_mask", "token_type_ids"]
+        coords: Coordinates of backbone atoms with keys ["N", "CA", "C", "O"]
+    
+    Returns:
+        pair_feature: Tensor of shape [B, L, L, 407] representing RBF of distance(400) + angle(7)
+    """
+```
+
+This approach enables the transformer to incorporate 3D structural information directly into its attention mechanisms, significantly enhancing the model's ability to understand protein structure-function relationships.
+
+## Task-Specific Implementations
+
+The framework provides specialized implementations for various protein prediction tasks, each tailored to leverage the transformer architecture effectively.
+
+### Classification Models
+
+Classification implementations demonstrate the practical application of the transformer architecture [saprot/model/saprot/saprot_classification_model.py](saprot/model/saprot/saprot_classification_model.py#L10-L82):
+
+```python
+class SaprotClassificationModel(SaprotBaseModel):
+    def forward(self, inputs, coords=None):
+        if coords is not None:
+            inputs = self.add_bias_feature(inputs, coords)
+        
+        if self.freeze_backbone:
+            # Extract and process hidden states for frozen backbone
+            repr = torch.stack(self.get_hidden_states_from_dict(inputs, reduction="mean"))
+            x = self.model.classifier.dropout(repr)
+            x = self.model.classifier.dense(x)
+            x = torch.tanh(x)
+            x = self.model.classifier.dropout(x)
+            logits = self.model.classifier.out_proj(x)
+        else:
+            logits = self.model(**inputs).logits
+        
+        return logits
+```
+
+The ProtT5 classification model follows similar patterns but is adapted to the T5 architecture [saprot/model/protT5/protT5_classification_model.py](saprot/model/protT5/protT5_classification_model.py#L10-L106):
+
+```python
+class ProtT5ClassificationModel(ProtT5BaseModel):
+    def forward(self, inputs, coords=None):
+        if coords is not None:
+            inputs = self.add_bias_feature(inputs, coords)
+        
+        if self.freeze_backbone:
+            # Similar processing for frozen backbone
+            repr = torch.stack(self.get_hidden_states_from_dict(inputs, reduction="mean"))
+            # ... classifier processing
+        else:
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            repr = outputs.last_hidden_state[:, 1: -1].mean(dim=1)
+            logits = self.model.classifier(repr)
+        
+        return logits
+```
+
+## Architecture Comparison
+
+| Feature | ESM-Based (Saprot) | ProtT5-Based |
+|---------|-------------------|--------------|
+| **Base Architecture** | ESM Transformer | T5 Encoder |
+| **Tokenizer** | AutoTokenizer | T5Tokenizer |
+| **LoRA Target Modules** | query, key, value, intermediate.dense, output.dense | SelfAttention.*, EncDecAttention.* |
+| **Structure Integration** | Native support via bias features | Supported via bias features |
+| **Hidden State Access** | outputs["hidden_states"][-1] | outputs.last_hidden_state |
+| **Best For** | Structure-aware tasks, complex protein representations | Sequence analysis, transfer learning |
+
+## Next Steps
+
+To deepen your understanding of the SaprotHub architecture:
+
+1. **[Structure-Aware Protein Representation](6-structure-aware-protein-representation)** - Explore how structural information is processed and integrated
+2. **[Pre-training and Fine-tuning Strategies](8-pre-training-and-fine-tuning-strategies)** - Learn about training methodologies and optimization approaches
+3. **[Zero-shot Mutational Effect Prediction](9-zero-shot-mutational-effect-prediction)** - Discover practical applications of the transformer architecture
+
+The transformer-based architecture in SaprotHub represents a sophisticated approach to protein analysis, combining state-of-the-art transformer models with structure-aware processing and efficient fine-tuning techniques. This foundation enables powerful protein prediction capabilities across diverse biological applications.
+
+# Pre-training and Fine-tuning Strategies
+
+
+
+The Saprot framework implements a comprehensive training architecture that supports both large-scale pre-training and task-specific fine-tuning for structure-aware protein language models. This documentation outlines the strategic approaches, configurations, and implementation patterns that enable effective model development across various protein prediction tasks.
+
+## Training Architecture Overview
+
+Saprot employs a unified training framework built on PyTorch Lightning that abstracts the complexities of both pre-training and fine-tuning workflows. The architecture follows a modular design where different model types, datasets, and training strategies can be seamlessly integrated through configuration files.
+
+```mermaid
+graph TB
+    A[Training Script] --> B[Configuration System]
+    B --> C{Training Mode}
+    C -->|Pre-training| D[Language Model Training]
+    C -->|Fine-tuning| E[Task-Specific Training]
+    
+    D --> F[SaProt FoldSeek Dataset]
+    E --> G[Task Datasets]
+    
+    F --> H[Masked Language Modeling]
+    G --> I[Classification/Regression]
+    G --> J[Mutation Prediction]
+    G --> K[PPI Prediction]
+    
+    H --> L[AbstractModel Framework]
+    I --> L
+    J --> L
+    K --> L
+    
+    L --> M[Learning Rate Schedulers]
+    L --> N[Optimizers]
+    L --> O[Checkpoint Management]
+```
+
+## Pre-training Strategy
+
+### Core Configuration
+
+The pre-training strategy is designed for large-scale language model training on protein sequences with structural information. The primary configuration ([saprot/config/pretrain/saprot.yaml](saprot/config/pretrain/saprot.yaml#L1-L82)) establishes the foundation for self-supervised learning:
+
+**Model Configuration:**
+- **Model Path**: `saprot/saprot_lm_model` for language modeling
+- **Base Configuration**: `westlake-repl/SaProt_35M_AF2` 
+- **Pretrained Loading**: Disabled (`load_pretrained: False`) for training from scratch
+- **Checkpoint Saving**: `/content/saprot/weights/Pretrain/SaProt_35M_AF2.pt`
+
+**Learning Rate Schedule:**
+The pre-training employs the ESM2-style learning rate scheduler ([saprot/utils/lr_scheduler.py](saprot/utils/lr_scheduler.py#L108-L187)) with the following parameters:
+- **Initial LR**: 0.0 
+- **Maximum LR**: 4.0e-4
+- **Final LR**: 4.0e-5
+- **Warmup Steps**: 2,000
+- **Decay Range**: 150,000 to 1,500,000 steps
+
+**Training Parameters:**
+- **Maximum Steps**: 1,000,000
+- **Batch Size**: 1 (gradient accumulation handled separately)
+- **Precision**: 16-bit mixed precision
+- **Mask Ratio**: 0.15 for masked language modeling
+
+### Dataset Processing
+
+The pre-training utilizes the Saprot FoldSeek dataset ([saprot/dataset/saprot/saprot_foldseek_dataset.py](saprot/dataset/saprot/saprot_foldseek_dataset.py)) which processes protein sequences with structural embeddings:
+
+- **Data Source**: AF2_Uniref50 database with Foldseek structural encodings
+- **Tokenization**: SaProt-specific tokenizer integrating sequence and structure
+- **Maximum Length**: 1024 tokens
+- **LMDB Storage**: Efficient data loading for large-scale training
+
+## Fine-tuning Strategies
+
+### Task-Specific Adaptation
+
+Fine-tuning adapts the pre-trained model to specific downstream tasks through specialized configurations. The framework supports multiple task types:
+
+**Classification Tasks:**
+- **DeepLoc**: Protein subcellular localization (2-class and 10-class)
+- **EC**: Enzyme commission number prediction
+- **GO**: Gene ontology terms (BP, CC, MF branches)
+- **MetalIonBinding**: Metal ion binding site prediction
+
+**Regression Tasks:**
+- **Thermostability**: Protein stability prediction
+- **ProteinGym**: Fitness landscape prediction
+
+**Specialized Tasks:**
+- **ClinVar**: Clinical variant effect prediction
+- **HumanPPI**: Protein-protein interaction prediction
+
+### Configuration Patterns
+
+Each fine-tuning task follows a consistent configuration pattern while adapting to specific requirements:
+
+**Model Loading:**
+```yaml
+model:
+  model_py_path: saprot/saprot_classification_model  # Task-specific model
+  kwargs:
+    config_path: westlake-repl/SaProt_35M_AF2
+    load_pretrained: True  # Load pre-trained weights
+    num_labels: 2  # Task-specific output dimension
+```
+
+**Learning Rate Strategy:**
+Fine-tuning typically uses conservative learning rates:
+- **Constant LR**: 2.0e-5 for most classification tasks
+- **Scheduler**: Often disabled (`on_use: false`) for stability
+- **Training Epochs**: 2-5 epochs to prevent overfitting
+
+**Dataset Configuration:**
+Each task uses specialized dataset classes with appropriate data processing:
+- **Classification**: `saprot_classification_dataset`
+- **Mutation**: `mutation_zeroshot_dataset`
+- **PPI**: `saprot_ppi_dataset`
+
+> [!TIP]
+> The fine-tuning configurations maintain the same tokenizer and structural processing pipeline as pre-training, ensuring consistent feature representation across tasks while allowing task-specific model heads.
+
+## Learning Rate Scheduling
+
+### ESM2 Scheduler
+
+The ESM2-style scheduler ([saprot/utils/lr_scheduler.py](saprot/utils/lr_scheduler.py#L108-L187)) implements a three-phase learning rate schedule:
+
+1. **Warmup Phase** (0 to `warmup_steps`): Linear increase from `init_lr` to `max_lr`
+2. **Constant Phase** (`warmup_steps` to `start_decay_after_n_steps`): Maintain `max_lr`
+3. **Decay Phase** (`start_decay_after_n_steps` to `end_decay_after_n_steps`): Linear decay to `final_lr`
+
+**Mathematical Formulation:**
+- Warmup: `lr = init_lr + (step/warmup_steps) * (max_lr - init_lr)`
+- Decay: `lr = max_lr - portion * (max_lr - final_lr)`
+
+### Alternative Schedulers
+
+**Constant Scheduler:**
+Maintains fixed learning rate throughout training, suitable for fine-tuning scenarios where stability is prioritized over adaptation speed.
+
+**Cosine Annealing:**
+Provides smooth decay following cosine curve, useful for scenarios requiring gradual learning rate reduction.
+
+## Training Infrastructure
+
+### Optimization Strategy
+
+The framework implements sophisticated optimization strategies ([saprot/model/abstract_model.py](saprot/model/abstract_model.py#L350-L399)):
+
+**Parameter Grouping:**
+- **Decay Parameters**: All weights except LayerNorm and bias terms
+- **No-Decay Parameters**: LayerNorm weights and bias terms
+- **Weight Decay**: Applied selectively to prevent over-regularization
+
+**Optimizer Configuration:**
+- **Default**: AdamW with β=(0.9, 0.98)
+- **Weight Decay**: 0.01 for decay parameters
+- **Learning Rate**: Determined by scheduler configuration
+
+### Checkpoint Management
+
+The training system supports comprehensive checkpoint management ([saprot/model/abstract_model.py](saprot/model/abstract_model.py#L250-L320)):
+
+**Save Conditions:**
+- **Best Model**: Based on validation metrics (min/max mode)
+- **Training State**: Global step, epoch, best value
+- **Optimizer State**: For resuming training
+- **Scheduler State**: Learning rate scheduling continuity
+
+**Loading Strategies:**
+- **Weights Only**: For inference or transfer learning
+- **Full State**: For resuming interrupted training
+- **Selective Loading**: Handles parameter mismatches gracefully
+
+## Task-Specific Implementations
+
+### Classification Fine-tuning
+
+Classification tasks use the Saprot classification model with task-specific heads:
+
+**DeepLoc Configuration** ([saprot/config/DeepLoc/cls2/saprot.yaml](saprot/config/DeepLoc/cls2/saprot.yaml#L1-L70)):
+- **Model Path**: `saprot/saprot_classification_model`
+- **Labels**: 2 (binary classification)
+- **Data**: Foldseek-processed protein structures
+- **PLDDT Threshold**: 70 for quality filtering
+
+**Training Parameters:**
+- **Epochs**: 2 with validation at 0.5 epoch intervals
+- **Batch Size**: 1 with gradient accumulation
+- **Precision**: 16-bit for memory efficiency
+
+### Mutation Effect Prediction
+
+The ClinVar configuration ([saprot/config/ClinVar/saprot.yaml](saprot/config/ClinVar/saprot.yaml#L1-L38)) demonstrates specialized task handling:
+
+**Model Configuration:**
+- **Model Path**: `saprot/saprot_foldseek_mutation_model`
+- **Foldseek Integration**: Direct structural processing
+- **Quality Threshold**: PLDDT > 70 for reliable structures
+
+**Task-Specific Features:**
+- **Zero-shot Evaluation**: Direct prediction without training examples
+- **Logging**: Detailed ClinVar-specific logging for analysis
+- **Structure Processing**: Real-time Foldseek execution
+
+## Training Workflow Execution
+
+### Script-Based Training
+
+The training framework ([saprot/scripts/training.py](saprot/scripts/training.py#L1-L137)) provides unified execution:
+
+**Main Components:**
+1. **Configuration Loading**: YAML-based parameter management
+2. **Environment Setup**: GPU allocation, distributed training configuration
+3. **Model Initialization**: Dynamic loading based on configuration
+4. **Data Module**: Task-specific dataset handling
+5. **Training Loop**: PyTorch Lightning integration
+
+**Execution Flow:**
+```python
+def main(args):
+    # Load configuration
+    config = EasyDict(yaml.safe_load(open(args.config)))
+    
+    # Setup environment and seed
+    setup_seed(config.setting.seed)
+    
+    # Initialize components
+    model = load_model(config.model)
+    data_module = load_dataset(config.dataset)
+    trainer = load_trainer(config)
+    
+    # Execute training
+    trainer.fit(model=model, datamodule=data_module)
+    
+    # Load best model and evaluate
+    model.load_checkpoint(model.save_path)
+    trainer.test(model=model, datamodule=data_module)
+```
+
+> [!TIP]
+> The training framework supports both single-GPU and multi-GPU distributed training through PyTorch Lightning's strategy system, with automatic handling of gradient accumulation and mixed precision training.
+
+## Best Practices and Recommendations
+
+### Pre-training Guidelines
+
+1. **Data Quality**: Use high-quality protein structures (PLDDT > 70)
+2. **Batch Size**: Optimize based on GPU memory constraints
+3. **Learning Rate**: Follow the ESM2 schedule for stable convergence
+4. **Checkpoint Frequency**: Save regularly to prevent training loss
+
+### Fine-tuning Strategies
+
+1. **Learning Rate**: Start with 2.0e-5 for most tasks
+2. **Epochs**: 2-5 epochs typically sufficient
+3. **Validation**: Monitor task-specific metrics closely
+4. **Early Stopping**: Prevent overfitting on small datasets
+
+### Resource Optimization
+
+1. **Mixed Precision**: Use 16-bit training for memory efficiency
+2. **Gradient Accumulation**: Simulate larger batch sizes
+3. **Distributed Training**: Scale to multiple GPUs for large datasets
+4. **LMDB Storage**: Use efficient data loading for large-scale training
+
+The Saprot training framework provides a comprehensive foundation for both pre-training structure-aware protein language models and fine-tuning them for diverse downstream tasks, with flexible configuration systems and robust infrastructure supporting the full development lifecycle.
+
+## Next Steps
+
+For understanding the model architecture that these training strategies support, see [Structure-Aware Protein Representation](6-structure-aware-protein-representation). To learn about specific prediction tasks that use these fine-tuned models, explore [Zero-shot Mutational Effect Prediction](9-zero-shot-mutational-effect-prediction).
+
+# Zero-shot Mutational Effect Prediction
+
+
+
+Zero-shot mutational effect prediction enables the assessment of protein mutation impacts without task-specific training, leveraging pre-trained protein language models to evaluate fitness changes directly from sequence and structure information.
+
+## Core Architecture and Workflow
+
+The zero-shot prediction system operates through a sophisticated pipeline that integrates structure-aware protein representations with mutational analysis. The architecture is built around the `SaprotFoldseekMutationModel` [saprot_foldseek_mutation_model.py#L19], which extends the base Saprot model with specialized mutation prediction capabilities.
+
+```mermaid
+flowchart TD
+    A[Input Data] --> B[MutationZeroShotDataset]
+    A --> C[Protein Structure]
+    B --> D[SaprotFoldseekMutationModel]
+    C --> D
+    D --> E[Foldseek Processing]
+    E --> F[Structure-Aware Sequence]
+    F --> G[Mutation Masking]
+    G --> H[Probability Calculation]
+    H --> I[Mutational Effect Score]
+    I --> J[Output Results]
+```
+
+### Model Components
+
+The prediction system consists of three main components working in concert:
+
+1. **Dataset Handler**: The `MutationZeroShotDataset` [mutation_zeroshot_dataset.py#L9] processes mutation data, extracting sequences, mutation information, and fitness scores from LMDB databases.
+
+2. **Core Model**: The `SaprotFoldseekMutationModel` [saprot_foldseek_mutation_model.py#L19] implements the zero-shot prediction logic using structure-aware representations.
+
+3. **Execution Engine**: The `mutation_zeroshot.py` script [mutation_zeroshot.py#L17] orchestrates the prediction process across multiple datasets.
+
+## Structure-Aware Mutation Analysis
+
+### Foldseek Integration
+
+The system leverages Foldseek to convert 3D protein structures into structure-aware sequences. This process involves:
+
+- **Structure Processing**: Converting PDB/mmCIF files to structural descriptors using the Foldseek binary [saprot_foldseek_mutation_model.py#L96]
+- **Quality Filtering**: Applying pLDDT thresholds to mask low-confidence regions [saprot_foldseek_mutation_model.py#L112]
+- **Token Integration**: Combining amino acid sequences with structural tokens to create unified representations
+
+> [!TIP]
+> The pLDDT threshold (default: 70) is crucial for prediction accuracy. Regions below this threshold are masked to prevent unreliable structural information from influencing predictions.
+
+### Mutation Encoding
+
+Mutations are encoded using a standardized format where each mutation follows the pattern "A123B" (original amino acid, position, mutated amino acid). Multiple mutations are separated by colons. The system handles both substitution and insertion mutations through specialized processing logic [saprot_foldseek_mutation_model.py#L172-L194].
+
+## Prediction Mechanism
+
+### Zero-shot Scoring
+
+The core prediction mechanism computes mutational effects through probability ratio calculations:
+
+```python
+pred += torch.log(mut_prob / ori_prob)
+```
+
+This formula [saprot_foldseek_mutation_model.py#L270] represents the log-likelihood ratio between mutated and original amino acid probabilities at specific positions, providing a quantitative measure of mutational impact.
+
+### Advanced Features
+
+The system supports several advanced features for enhanced prediction accuracy:
+
+- **MSA Integration**: Optional multiple sequence alignment information can be incorporated to improve predictions [saprot_foldseek_mutation_model.py#L263-L267]
+- **Structural Masking**: Random masking of structural tokens for robustness [saprot_foldseek_mutation_model.py#L117-L122]
+- **Sequence Substitution**: Random amino acid substitution for data augmentation [saprot_foldseek_mutation_model.py#L147-L152]
+
+## Configuration and Usage
+
+### Benchmark Datasets
+
+The system supports multiple benchmark datasets through standardized configurations:
+
+| Dataset | Configuration File | Key Features |
+|---------|-------------------|--------------|
+| ProteinGym | `ProteinGym/saprot.yaml` | Substitution mutations, fitness prediction |
+| ClinVar | `ClinVar/saprot.yaml` | Clinical variants, evolutionary indices logging |
+| Thermostability | `Thermostability/saprot.yaml` | Temperature stability predictions |
+
+> [!TIP]
+> The ClinVar configuration includes special logging functionality to save predicted evolutionary indices for clinical variant analysis, supporting downstream medical research applications.
+
+### Model Parameters
+
+Key configuration parameters for zero-shot prediction:
+
+```yaml
+model:
+  kwargs:
+    foldseek_path: /path/to/foldseek
+    config_path: westlake-repl/SaProt_35M_AF2
+    load_pretrained: True
+    plddt_threshold: 70
+```
+
+These parameters [ProteinGym/saprot.yaml#L7-L14] control the model's behavior and processing pipeline.
+
+## API Methods
+
+The model provides several convenient methods for mutation prediction:
+
+- **Single Mutation Prediction**: `predict_mut()` [saprot_foldseek_mutation_model.py#L311] for individual mutations
+- **Position-Specific Analysis**: `predict_pos_mut()` [saprot_foldseek_mutation_model.py#L351] for comprehensive mutational scanning
+- **Probability Distribution**: `predict_pos_prob()` [saprot_foldseek_mutation_model.py#L388] for amino acid probability analysis
+
+## Performance Evaluation
+
+The system evaluates predictions using Spearman correlation coefficients between predicted scores and experimental fitness values. Metrics are computed automatically during testing and logged for analysis [saprot_foldseek_mutation_model.py#L290-L295].
+
+## Next Steps
+
+For comprehensive protein analysis, consider exploring:
+- [Protein Inverse Folding](10-protein-inverse-folding) for sequence design applications
+- [Multi-model Ensemble Prediction](11-multi-model-ensemble-prediction) for improved accuracy
+- [Structure-Aware Sequence Generation](12-structure-aware-sequence-generation) for advanced representation techniques
+
+The zero-shot mutational effect prediction capability represents a powerful tool for protein engineering and variant interpretation, enabling rapid assessment of mutation impacts without extensive training requirements.
+
+# Protein Inverse Folding
+
+
+
+Protein inverse folding is the computational challenge of predicting amino acid sequences that fold into specific three-dimensional structures. This capability is crucial for protein engineering, drug design, and understanding the sequence-structure relationship in proteins. SaProt provides a specialized inverse folding model that leverages structure-aware representations to generate sequences compatible with target protein structures.
+
+## Model Architecture
+
+The SaProt Inverse Folding Model (`SaProtIFModel`) extends the base SaProt architecture specifically for sequence generation tasks. It operates as a language model with masked token reconstruction capabilities, trained to predict amino acids given structural context [saprot/model/saprot/saprot_if_model.py#L11-L17].
+
+```mermaid
+graph TD
+    A[Input Structure] --> B[Foldseek Processing]
+    B --> C[Structure Sequence]
+    D[Masked AA Sequence] --> E[Sequence-Structure Fusion]
+    C --> E
+    E --> F[SaProt Transformer]
+    F --> G[Logits Prediction]
+    G --> H[Sequence Decoding]
+    H --> I[Predicted AA Sequence]
+```
+
+The model inherits from `SaprotBaseModel` with task configuration set to 'lm' (language modeling) [saprot/model/saprot/saprot_if_model.py#L16-L17]. This enables the model to handle sequence generation tasks while maintaining structure awareness through the underlying transformer architecture.
+
+## Core Prediction Mechanism
+
+### Input Processing
+
+The inverse folding process begins with two essential inputs:
+- **Amino acid sequence**: Can be fully or partially masked (using `#` as mask token)
+- **Structure sequence**: Foldseek-derived structural representation
+
+The model fuses these inputs by interleaving amino acid and structural tokens [saprot/model/saprot/saprot_if_model.py#L99]:
+
+```python
+sa_seq = "".join(f"{aa}{struc}" for aa, struc in zip(aa_seq, struc_seq))
+```
+
+### Prediction Methods
+
+The model supports two distinct prediction strategies [saprot/model/saprot/saprot_if_model.py#L77-L93]:
+
+| Method | Description | Use Case | Sample Count |
+|--------|-------------|----------|--------------|
+| **argmax** | Selects most probable amino acid | Deterministic prediction | 1 |
+| **multinomial** | Samples from probability distribution | Stochastic exploration | Multiple |
+
+> [!TIP]
+> The multinomial method is particularly useful for generating diverse sequence variants when exploring the sequence space around a target structure, while argmax provides the most likely sequence according to the model.
+
+### Loss Function and Training
+
+During training, the model employs cross-entropy loss with masked tokens [saprot/model/saprot/saprot_if_model.py#L29-L46]:
+
+```python
+loss = cross_entropy(logits, labels, ignore_index=-1)
+```
+
+The model tracks accuracy metrics for masked token prediction, enabling optimization of sequence reconstruction capabilities.
+
+## Data Processing Pipeline
+
+### Structure Sequence Generation
+
+Structure sequences are generated using Foldseek, which converts 3D protein structures into discrete structural alphabets [saprot/utils/foldseek_util.py#L12-L18]. The `get_struc_seq` function processes PDB files and applies confidence masking based on pLDDT scores:
+
+```python
+def get_struc_seq(foldseek, path, chains: list = None, plddt_mask: bool = True, 
+                  plddt_threshold: float = 70., foldseek_verbose: bool = False)
+```
+
+> [!TIP]
+> The pLDDT masking feature allows the model to ignore low-confidence structural regions, improving prediction reliability by focusing on well-defined structural elements.
+
+### Training Data Preparation
+
+The `SaprotLMDataset` class handles data preparation for inverse folding training [saprot/dataset/saprot/saprot_lm_dataset.py#L15-L18]. Key features include:
+
+- **BERT-style masking**: 15% of tokens are masked with 80% mask token, 10% random token, 10% unchanged [saprot/dataset/saprot/saprot_lm_dataset.py#L87-L110]
+- **Structure integration**: Optional coordinate bias features for enhanced structural awareness
+- **Flexible sequence length**: Configurable maximum sequence length (default 512)
+
+## Model Initialization and Configuration
+
+### Basic Setup
+
+The inverse folding model is initialized through the model interface system [saprot/model/model_interface.py#L89-L100]:
+
+```python
+from saprot.model.model_interface import ModelInterface
+model = ModelInterface.init_model("saprot/saprot_if_model.py", **kwargs)
+```
+
+### Configuration Parameters
+
+The base model supports extensive configuration options [saprot/model/saprot/base.py#L26-L35]:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `task` | str | 'lm' | Task type (language modeling) |
+| `config_path` | str | - | HuggingFace model config path |
+| `load_pretrained` | bool | False | Load pretrained weights |
+| `freeze_backbone` | bool | False | Freeze transformer backbone |
+| `gradient_checkpointing` | bool | False | Enable memory optimization |
+| `lora_kwargs` | dict | None | LoRA adaptation configuration |
+
+## Usage Examples
+
+### Basic Sequence Prediction
+
+```python
+# Initialize model
+model = ModelInterface.init_model("saprot/saprot_if_model.py", 
+                                 config_path="path/to/config")
+
+# Predict sequence from structure
+aa_seq = "####"  # Fully masked sequence
+struc_seq = "aBcDeFgH"  # Foldseek structure sequence
+predicted = model.predict(aa_seq, struc_seq, method="argmax")
+```
+
+### Stochastic Sequence Generation
+
+```python
+# Generate multiple sequence variants
+variants = model.predict(
+    aa_seq="A#C##G",  # Partially masked
+    struc_seq="aBcDeFgH",
+    method="multinomial",
+    num_samples=5
+)
+```
+
+## Integration with Training Pipeline
+
+The inverse folding model integrates seamlessly with the training infrastructure:
+
+- **Distributed training**: Supports multi-GPU training with proper metric aggregation [saprot/model/saprot/saprot_if_model.py#L55-L75]
+- **Validation monitoring**: Tracks accuracy and loss for model selection
+- **Checkpoint management**: Automatic model saving based on validation performance
+
+## Next Steps
+
+For comprehensive understanding of structure-aware processing, explore [Structure-Aware Protein Representation](6-structure-aware-protein-representation). To implement inverse folding in practice, refer to [Preparing Your Dataset](4-preparing-your-dataset) for data format requirements and [Choosing the Right Model](5-choosing-the-right-model) for model selection guidance.
+
+For advanced ensemble approaches combining multiple predictions, see [Multi-model Ensemble Prediction](11-multi-model-ensemble-prediction).
+
+# Multi-model Ensemble Prediction
+
+
+
+Multi-model ensemble prediction in SaprotHub enables developers to leverage multiple protein representation models simultaneously, combining their strengths to achieve superior prediction performance across diverse protein tasks. This approach integrates both sequence-based models like ProtT5 and structure-aware models like SaProt, allowing for robust predictions that capture complementary aspects of protein biology.
+
+## Ensemble Architecture Overview
+
+SaprotHub's ensemble prediction framework is built upon a modular architecture that supports seamless integration of multiple model types. The core components work together through a unified interface that standardizes model initialization, data processing, and prediction aggregation.
+
+```mermaid
+graph TD
+    A[Input Protein Data] --> B[Data Preprocessing]
+    B --> C[Model Interface Layer]
+    C --> D[ProtT5 Models]
+    C --> E[SaProt Models]
+    C --> F[Custom Models]
+    D --> G[Prediction Aggregation]
+    E --> G
+    F --> G
+    G --> H[Ensemble Output]
+    
+    I[Configuration System] --> C
+    I --> G
+```
+
+The ensemble system leverages the `ModelInterface` class [saprot/model/model_interface.py](saprot/model/model_interface.py#L89-L104) as the central orchestrator, which dynamically loads and initializes different model types based on configuration specifications. This design allows for flexible model combinations without requiring code modifications.
+
+## Model Integration Framework
+
+### Supported Model Types
+
+The ensemble framework supports multiple model architectures, each optimized for different protein prediction tasks:
+
+| Model Type | Architecture | Primary Use Cases | Key Features |
+|------------|-------------|-------------------|--------------|
+| ProtT5 Classification | Transformer-based encoder | Protein classification, functional annotation | Sequence-only processing, pre-trained on massive protein datasets |
+| SaProt Classification | Structure-aware transformer | Structure-dependent tasks | Integrates 3D structure via Foldseek encoding |
+| ProtT5 Regression | Transformer encoder | Continuous value prediction | Stability, binding affinity prediction |
+| SaProt Regression | Structure-aware transformer | Structure-based regression | Combines sequence and structural features |
+
+### Model Loading Mechanism
+
+The ensemble system uses a sophisticated model loading strategy implemented in `module_loader.py` [saprot/utils/module_loader.py](saprot/utils/module_loader.py#L15-L73). The `my_load_model` function dynamically imports and instantiates models based on configuration parameters:
+
+```python
+def my_load_model(config):
+    model_config = copy.deepcopy(config)
+    model_type = model_config.pop("model_py_path")
+    
+    if model_type == "saprot/saprot_classification_model":
+        from model.saprot.saprot_classification_model import SaprotClassificationModel
+        return SaprotClassificationModel(**model_config)
+    # Additional model types follow similar pattern
+```
+
+This approach enables runtime model selection and configuration without hardcoding dependencies.
+
+## Configuration-Driven Ensemble Setup
+
+### Ensemble Configuration Structure
+
+Ensemble prediction is configured through YAML files that specify model combinations and their respective parameters. The configuration system supports both individual model settings and ensemble-level parameters.
+
+> [!TIP]
+> The configuration system uses hierarchical inheritance where ensemble-level settings can override individual model defaults, enabling fine-grained control over prediction behavior.
+
+### Example Ensemble Configuration
+
+```yaml
+ensemble:
+  models:
+    - model_py_path: saprot/saprot_classification_model
+      weight: 0.6
+      kwargs:
+        config_path: westlake-repl/SaProt_35M_AF2
+        load_pretrained: True
+    - model_py_path: protT5/protT5_classification_model
+      weight: 0.4
+      kwargs:
+        config_path: Rostlab/prot_t5_xl_uniref50
+        load_pretrained: True
+  
+  aggregation_strategy: weighted_average
+  output_format: probabilities
+```
+
+## Prediction Aggregation Strategies
+
+### Weighted Averaging
+
+The most common ensemble approach combines model outputs through weighted averaging, where each model's contribution is scaled by its confidence or historical performance. This method is particularly effective for classification tasks where probability distributions need to be combined.
+
+### Voting Mechanisms
+
+For discrete predictions, the ensemble supports both hard voting (majority rule) and soft voting (probability-weighted) strategies. The choice depends on the task requirements and the diversity of model outputs.
+
+### Custom Aggregation Functions
+
+Advanced users can implement custom aggregation functions that incorporate domain-specific knowledge or task-specific logic. The framework provides extension points for integrating these custom strategies.
+
+## Implementation Workflow
+
+### Step-by-Step Ensemble Prediction
+
+```mermaid
+flowchart TD
+    A[Load Configuration] --> B[Initialize Model Interface]
+    B --> C[Load Individual Models]
+    C --> D[Prepare Input Data]
+    D --> E[Generate Individual Predictions]
+    E --> F[Apply Aggregation Strategy]
+    F --> G[Post-process Results]
+    G --> H[Output Ensemble Prediction]
+    
+    I[Model Validation] --> C
+    J[Data Validation] --> D
+    K[Result Validation] --> H
+```
+
+### Zero-shot Mutation Prediction Example
+
+The ensemble framework is particularly powerful for zero-shot mutation effect prediction, as demonstrated in the mutation zeroshot script [saprot/scripts/mutation_zeroshot.py](saprot/scripts/mutation_zeroshot.py#L17-L56):
+
+```python
+def run(config):
+    # Initialize ensemble models
+    models = [load_model(model_config) for model_config in config.ensemble.models]
+    
+    # Initialize dataset
+    data_module = load_dataset(config.dataset)
+    
+    # Generate ensemble predictions
+    for name in tqdm(os.listdir(config.setting.dataset_dir)):
+        individual_predictions = []
+        for model in models:
+            result = trainer.test(model=model, datamodule=data_module)
+            individual_predictions.append(result[0]['spearman'])
+        
+        # Aggregate predictions
+        ensemble_result = aggregate_predictions(individual_predictions, config.ensemble.aggregation_strategy)
+```
+
+## Performance Optimization
+
+### Parallel Processing
+
+The ensemble system supports parallel model execution to maximize computational efficiency. Models can be distributed across multiple GPUs or nodes, with results collected and aggregated centrally.
+
+### Memory Management
+
+To handle large-scale ensemble predictions, the framework implements intelligent memory management strategies, including model caching and batch processing optimizations.
+
+### Caching Strategies
+
+Prediction results can be cached at multiple levels to avoid redundant computations, particularly useful when evaluating the same protein across multiple ensemble configurations.
+
+## Advanced Features
+
+### Dynamic Model Selection
+
+The ensemble framework can dynamically select the most appropriate model subset based on input characteristics, task requirements, or computational constraints.
+
+### Confidence Estimation
+
+Beyond point predictions, the ensemble provides confidence estimates by analyzing the consensus among individual models, helping users assess prediction reliability.
+
+### Ensemble Diagnostics
+
+Comprehensive diagnostic tools help analyze ensemble performance, identify model disagreements, and optimize model weights for specific tasks.
+
+## Integration with Existing Workflows
+
+### Seamless API Integration
+
+The ensemble prediction system integrates seamlessly with existing SaprotHub workflows through the standardized `ModelInterface` [saprot/model/model_interface.py](saprot/model/model_interface.py#L89-L104), requiring minimal changes to existing pipelines.
+
+### Backward Compatibility
+
+Legacy single-model configurations remain fully supported, allowing gradual migration to ensemble approaches without disrupting existing workflows.
+
+### Extensibility
+
+The modular design enables easy addition of new model types and aggregation strategies, ensuring the framework can evolve with advancing protein representation techniques.
+
+## Best Practices
+
+### Model Selection Guidelines
+
+Choose complementary models that capture different aspects of protein biology. For optimal performance, combine sequence-based models with structure-aware models when structural information is available.
+
+### Weight Tuning
+
+Optimize model weights based on validation performance for specific tasks. Consider cross-validation to ensure robust weight selection.
+
+### Validation Strategies
+
+Implement rigorous validation procedures to assess ensemble performance, including comparison against individual models and baseline methods.
+
+Multi-model ensemble prediction represents a powerful approach for leveraging the complementary strengths of diverse protein representation models, enabling more accurate and robust predictions across the full spectrum of protein science applications.
+
+For next steps, explore [Structure-Aware Sequence Generation](12-structure-aware-sequence-generation) to understand how ensemble predictions can inform protein design tasks, or review [Dataset Format Requirements](13-dataset-format-requirements) to ensure your data is properly formatted for ensemble analysis.
+
+# Structure-Aware Sequence Generation
+
+
+
+Structure-aware sequence generation in SaprotHub represents a sophisticated approach to protein design that integrates both sequence and structural information through the powerful **SaProt inverse folding model**. This capability enables the prediction of amino acid sequences that are compatible with given protein structures, opening doors to novel protein engineering and design applications.
+
+## Core Architecture and Data Flow
+
+The structure-aware sequence generation pipeline operates through a coordinated system of data processing, model architecture, and prediction mechanisms. The process begins with structural representation conversion using **Foldseek**, which transforms 3D protein coordinates into discrete structural sequences that can be processed by the transformer model.
+
+```mermaid
+flowchart TD
+    A[PDB Structure] --> B[Foldseek Processing]
+    B --> C[Structural Sequence]
+    C --> D[SA Sequence Combination]
+    D --> E[SaProt Model]
+    E --> F[Sequence Prediction]
+    
+    G[Training Data] --> H[Mask Application]
+    H --> I[LMDB Storage]
+    I --> J[Dataset Loading]
+    J --> E
+    
+    subgraph "Quality Control"
+        K[pLDDT Masking] --> B
+        L[Chain Selection] --> B
+    end
+```
+
+The **SaprotSequenceDesignDataset** class handles the training data preparation by implementing a comprehensive masking strategy where amino acids are systematically replaced with mask tokens (`#`) to create reconstruction tasks [source](saprot/dataset/saprot/saprot_seq_design_dataset.py#L52-L61). This approach trains the model to understand the relationship between structure and sequence through self-supervised learning.
+
+## Structural Sequence Generation Process
+
+### Foldseek Integration
+
+The foundation of structure-aware generation lies in the **Foldseek utility** that converts 3D protein structures into 1D structural sequences [source](saprot/utils/foldseek_util.py#L12-L90). This process involves:
+
+1. **Structure-to-Descriptor Conversion**: Using Foldseek's `structureto3didescriptor` command to extract structural representations
+2. **Quality Filtering**: Implementing pLDDT masking for AlphaFold2 predictions to ensure high-confidence structural regions
+3. **Chain-wise Processing**: Handling multi-chain proteins with selective chain extraction
+
+The structural sequences are then combined with amino acid sequences to create **SA sequences** where each amino acid is paired with its corresponding structural character.
+
+> [!TIP]
+> The pLDDT masking mechanism is crucial for quality control - regions with confidence scores below 70.0 are automatically masked, preventing the model from learning from unreliable structural predictions.
+
+### Data Processing Pipeline
+
+The training pipeline utilizes **LMDB datasets** for efficient storage and retrieval of protein data. The masking strategy employed in `SaprotSequenceDesignDataset._apply_mask()` systematically replaces amino acid tokens with mask tokens while preserving the original tokens as labels for the reconstruction task [source](saprot/dataset/saprot/saprot_seq_design_dataset.py#L52-L61).
+
+| Processing Stage | Input | Output | Purpose |
+|---|---|---|---|
+| Tokenization | Raw sequence | Token IDs | Convert to model-readable format |
+| Masking | Token sequence | Masked tokens + labels | Create reconstruction targets |
+| Collation | Batch of samples | Model inputs | Prepare for batch processing |
+
+## Model Architecture and Prediction
+
+### SaProt Inverse Folding Model
+
+The **SaProtIFModel** extends the base Saprot architecture specifically for sequence generation tasks [source](saprot/model/saprot/saprot_if_model.py#L11-L131). The model operates through:
+
+1. **Structure Integration**: Adding bias features from coordinate information when available
+2. **Transformer Processing**: Standard transformer forward pass with combined sequence-structure inputs
+3. **Loss Calculation**: Cross-entropy loss with accuracy metrics for reconstruction evaluation
+
+### Prediction Mechanisms
+
+The model supports two distinct prediction methods for sequence generation:
+
+- **Argmax Sampling**: Selects the most probable amino acid at each position, providing deterministic outputs
+- **Multinomial Sampling**: Samples from the probability distribution, enabling diverse sequence generation
+
+The `predict()` method orchestrates this process by combining amino acid and structural sequences, identifying masked positions, and generating predictions through the trained model [source](saprot/model/saprot/saprot_if_model.py#L77-L130).
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Model as SaProtIFModel
+    participant Tokenizer
+    participant Structure as Foldseek
+    
+    User->>Structure: PDB File
+    Structure->>User: Structural Sequence
+    
+    User->>Model: AA Seq + Struct Seq + Mask
+    Model->>Tokenizer: Tokenize Combined Sequence
+    Tokenizer->>Model: Token IDs
+    Model->>Model: Forward Pass
+    Model->>Model: Generate Predictions
+    Model->>User: Predicted Sequence
+```
+
+> [!TIP]
+> The combined SA sequence format (amino acid + structural character) is the key innovation - it allows the transformer to simultaneously learn sequence patterns and structural constraints during training.
+
+## Implementation Considerations
+
+### Quality Assurance
+
+The system incorporates multiple quality control mechanisms:
+
+1. **pLDDT Thresholding**: Automatically masking low-confidence structural regions
+2. **Length Validation**: Ensuring amino acid and structural sequences match in length
+3. **Chain Selection**: Supporting selective processing of specific protein chains
+
+### Performance Optimization
+
+The architecture is designed for efficient processing through:
+
+- **LMDB Storage**: Fast random access to large protein datasets
+- **Batch Processing**: Optimized collation functions for GPU utilization
+- **Parallel Processing**: Support for multi-threaded Foldseek operations
+
+## Usage Patterns and Applications
+
+Structure-aware sequence generation enables several key applications:
+
+1. **Protein Design**: Generating novel sequences for existing structural frameworks
+2. **Function Prediction**: Understanding sequence-structure relationships
+3. **Mutation Analysis**: Predicting effects of structural modifications
+
+For comprehensive implementation details and configuration options, refer to the [Dataset Format Requirements](13-dataset-format-requirements) and [Protein Structure Processing with Foldseek](14-protein-structure-processing-with-foldseek) documentation.
+
+The system's modular design allows for flexible integration with different protein prediction tasks while maintaining the core structure-aware capabilities that distinguish SaprotHub from sequence-only approaches.
+
+# Dataset Format Requirements
+
+
+
+This page outlines the comprehensive dataset format requirements for SaprotHub, covering various protein analysis tasks and input formats. Understanding these requirements is essential for preparing data that works seamlessly with the Saprot model architecture.
+
+## Core Data Architecture
+
+SaprotHub uses LMDB (Lightning Memory-Mapped Database) as its primary data storage format, providing efficient access to large-scale protein datasets. All dataset classes inherit from the abstract `LMDBDataset` class [saprot/dataset/lmdb_dataset.py](saprot/dataset/lmdb_dataset.py#L14-L17), which provides the foundation for data loading and management.
+
+### Dataset Loading Interface
+
+The `DataInterface` class [saprot/dataset/data_interface.py](saprot/dataset/data_interface.py#L88-L99) provides dynamic dataset loading capabilities:
+
+```python
+@classmethod
+def init_dataset(cls, dataset_py_path: str, **kwargs):
+    """
+    Args:
+       dataset_py_path: Path to dataset file
+       **kwargs: Kwargs for model initialization
+    Returns: Corresponding model
+    """
+```
+
+## Input Format Categories
+
+### 1. Amino Acid Sequences
+
+For standard amino acid sequence analysis, datasets should follow this CSV format:
+
+**Structure:**
+```csv
+sequence,label,stage
+MEETMKLATMEDTVEYCLFLIPDESRDSDKHKEILQKYIERIITRFAPMLVPYIWQNQPFNLKYKPGKGGVPAHMFGVTKFGDNIEDEWFIVYVIKQITKEFPELVARIEDNDGEFLLIEAADFLPKWLDPENSTNRVFFCHGELCIIPAPRKSGAESWLPTTPPTIPQALNIITAHSEKILASESIRAAVNRRIRGYPEKIQASLHRAHCFLPAGIVAVLKQRPRLVAAAVQAFYLRDPIDLRACRVFKTFLPETRIMTSVTFTKCLYAQLVQQRFVPDRRSGYRLPPPSDPQYRAHEL,0,train
+MAVMAPRTLLLLLSGALALTQTWAGSHSMRYFFTSVSRPGRGEPRFIAVGYVDDTQFVRFDSDAASQRMEPRAPWIEQEGPEYWDQETRNVKAQSQTDRVDLGTLRGYYNQSEAGSHTIQIMYGCDVGSDGRFLRGYRQDAYDGKDYIALNEDLRSWTAADMAAQITKRKWEAAHEAEQLRAYLDGTCVEWLRRYLENGKETLQRTDPPKTHMTHHPISDHEATLRCWALGFYPAEITLTWQRDGEDQTQDTELVETRPAGDGTFQKWAAVVVPSGEEQRYTCHVQHEGLPKPLTLRWEL,1,test
+```
+
+**Fields:**
+- `sequence`: Raw amino acid sequence string
+- `label`: Target value (classification or regression)
+- `stage`: Data split (train/test/valid)
+
+### 2. Structure-Aware Sequences
+
+For structure-aware protein representation, use the enhanced format with structural information:
+
+**Structure:**
+```csv
+sequence,label,stage
+MdEvEvTvMpKpLpApTaMpEaDqTkVkEkYkCwLkFdLfIpPpDpEpSdRpDpSqDvKvHvKqEvIvLqQvKvYlIqElRlIlIcTlRlFcAcPlMqLqVlPvYfIqWqQlNfQaPgFaNfLwKdYwKdPpGdKdGdGlVrPhAtHtMiFmGtVmTdKrFrGdDpNdIcEvDrEvWlFvIvVvYvVsIqKlQvIsTlKqEvFpPqErLmVkAmRdImEaDhNpDlGgErFcLlLcIvElAlAvDvFpLdPdKpWvLdDdPpEqNaSqTaNlRqVwFiFrCgHnGsEaLiCfIgIqPdAa,0,train
+```
+
+**Key Features:**
+- Each amino acid is paired with structural annotation
+- Format: `AminoAcid(1 letter) + StructuralState(1 letter)`
+- Structural states indicate 3D conformation information
+
+### 3. PDB Structure Files
+
+For direct structure-based analysis using PDB or AlphaFold2 files:
+
+**Structure:**
+```csv
+sequence,type,chain,label,stage
+1qsf.pdb,PDB,A,1,valid
+1szh.pdb,PDB,A,0,train
+2br2.pdb,PDB,A,1,test
+O95905.pdb,AF2,A,1,train
+P04439.pdb,AF2,A,0,train
+```
+
+**Fields:**
+- `sequence`: PDB filename or UniProt ID
+- `type`: PDB (experimental) or AF2 (AlphaFold2 predicted)
+- `chain`: Protein chain identifier
+- `label`: Target value
+- `stage`: Data split
+
+## Task-Specific Dataset Formats
+
+### Classification Tasks
+
+**Dataset Class:** `SaprotClassificationDataset` [saprot/dataset/saprot/saprot_classification_dataset.py](saprot/dataset/saprot/saprot_classification_dataset.py#L11-L99)
+
+**Input Requirements:**
+- Tokenizer path for sequence encoding
+- Optional structure masking capabilities
+- pLDDT threshold support for confidence filtering
+- Maximum sequence length (default: 1024)
+
+**Key Parameters:**
+```python
+mask_struc_ratio: float = None  # Ratio of masked structure tokens
+plddt_threshold: float = None   # Mask structure tokens with pLDDT < threshold
+use_bias_feature: bool = False   # Include structural coordinates
+```
+
+### Regression Tasks
+
+**Dataset Class:** `SaprotRegressionDataset` [saprot/dataset/saprot/saprot_regression_dataset.py](saprot/dataset/saprot/saprot_regression_dataset.py#L13-L108)
+
+**Additional Features:**
+```python
+min_clip: [float, float] = None      # [given_value, clip_value]
+mix_max_norm: [float, float] = None  # [min_norm, max_norm] for normalization
+```
+
+### Pair Classification Tasks
+
+**Dataset Class:** `SaprotPairClassificationDataset` [saprot/dataset/saprot/saprot_pair_classification_dataset.py](saprot/dataset/saprot/saprot_pair_classification_dataset.py#L10-L82)
+
+**Input Format:**
+```csv
+seq_1,seq_2,label
+MEETMKLATMEDTVEYCLFLIPDESRDSDKHKEILQKYIERIITRFAPMLVPYIWQNQPFNLKYKPGKGGVPAHMFGVTKFGDNIEDEWFIVYVIKQITKEFPELVARIEDNDGEFLLIEAADFLPKWLDPENSTNRVFFCHGELCIIPAPRKSGAESWLPTTPPTIPQALNIITAHSEKILASESIRAAVNRRIRGYPEKIQASLHRAHCFLPAGIVAVLKQRPRLVAAAVQAFYLRDPIDLRACRVFKTFLPETRIMTSVTFTKCLYAQLVQQRFVPDRRSGYRLPPPSDPQYRAHEL,MAVMAPRTLLLLLSGALALTQTWAGSHSMRYFFTSVSRPGRGEPRFIAVGYVDDTQFVRFDSDAASQRMEPRAPWIEQEGPEYWDQETRNVKAQSQTDRVDLGTLRGYYNQSEAGSHTIQIMYGCDVGSDGRFLRGYRQDAYDGKDYIALNEDLRSWTAADMAAQITKRKWEAAHEAEQLRAYLDGTCVEWLRRYLENGKETLQRTDPPKTHMTHHPISDHEATLRCWALGFYPAEITLTWQRDGEDQTQDTELVETRPAGDGTFQKWAAVVVPSGEEQRYTCHVQHEGLPKPLTLRWEL,1
+```
+
+## Data Processing Pipeline
+
+### LMDB Entry Structure
+
+Each LMDB entry contains JSON-formatted data with the following common fields:
+
+```json
+{
+  "seq": "structure_aware_sequence",
+  "label": "target_value",
+  "coords": {
+    "N": [x1, y1, z1, ...],
+    "CA": [x2, y2, z2, ...],
+    "C": [x3, y3, z3, ...],
+    "O": [x4, y4, z4, ...]
+  },
+  "plddt": [confidence_scores]
+}
+```
+
+### Quality Control Features
+
+**Structure Masking:**
+- Random structure token masking based on `mask_struc_ratio`
+- Confidence-based masking using `plddt_threshold`
+- Seed-based reproducible masking
+
+**Sequence Length Management:**
+- Automatic truncation to `max_length`
+- Token-based length calculation
+- Preserves structural information integrity
+
+## Advanced Dataset Types
+
+SaprotHub supports specialized dataset classes for various protein analysis tasks:
+
+- **Annotation Tasks:** `saprot_annotation_dataset.py`
+- **Contact Prediction:** `saprot_contact_dataset.py`  
+- **Foldseek Integration:** `saprot_foldseek_dataset.py`
+- **Language Modeling:** `saprot_lm_dataset.py`
+- **PPI Prediction:** `saprot_ppi_dataset.py`
+- **Sequence Design:** `saprot_seq_design_dataset.py`
+- **Token Classification:** `saprot_token_classification_dataset.py`
+
+## Implementation Guidelines
+
+### Dataset Registration
+
+Use the `@register_dataset` decorator to make custom datasets available:
+
+```python
+@register_dataset
+class CustomDataset(LMDBDataset):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Custom initialization
+    
+    def __getitem__(self, index):
+        # Custom data loading logic
+        pass
+    
+    def __len__(self):
+        # Custom length calculation
+        pass
+    
+    def collate_fn(self, batch):
+        # Custom batch processing
+        pass
+```
+
+### Data Validation
+
+Ensure data quality by implementing:
+- Sequence format validation
+- Structure coordinate verification
+- Label range checking
+- Missing data handling
+
+> [!TIP]
+> Always validate input sequences and structures before LMDB conversion to prevent runtime errors during training.
+
+> [!TIP]
+> Use the provided example datasets in `upload_files/example_csv_dataset/` as templates for understanding the expected format for different task types.
+
+## Next Steps
+
+For detailed information on processing protein structures with Foldseek integration, refer to [Protein Structure Processing with Foldseek](14-protein-structure-processing-with-foldseek). To understand how structure-aware sequences are generated, see [Structure-Aware Sequence Generation](12-structure-aware-sequence-generation).
+
+# Protein Structure Processing with Foldseek
+
+
+
+Foldseek integration in SaprotHub enables efficient protein structure analysis by converting 3D structural information into sequence-like representations that can be processed by transformer models. This documentation explores the architecture and implementation of Foldseek-based structure processing.
+
+## Foldseek Integration Architecture
+
+The Foldseek processing pipeline transforms protein structures into three complementary sequence representations that capture both sequential and structural information:
+
+```mermaid
+flowchart TD
+    A[PDB/CIF Structure File] --> B[Foldseek Binary]
+    B --> C[3Di Descriptor Generation]
+    C --> D[Sequence Extraction]
+    D --> E[PLDDT Masking]
+    E --> F[Combined Sequence]
+    
+    G[AlphaFold2 Detection] --> H{AF2 Structure?}
+    H -->|Yes| I[Apply PLDDT Masking]
+    H -->|No| J[Skip PLDDT Masking]
+    I --> E
+    J --> E
+```
+
+The core processing function `get_struc_seq()` [foldseek_util.py#L12-L88](saprot/utils/foldseek_util.py#L12-L88) orchestrates this transformation by calling the Foldseek binary with specific parameters for 3Di descriptor generation.
+
+## Structural Sequence Generation
+
+### Core Function Parameters
+
+The `get_struc_seq()` function accepts several key parameters that control the processing behavior:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `foldseek` | str | Required | Path to Foldseek binary executable |
+| `path` | str | Required | Path to PDB or CIF structure file |
+| `chains` | list | None | Specific chains to extract (None = all chains) |
+| `process_id` | int | 0 | Process ID for parallel processing |
+| `plddt_mask` | bool | True | Enable PLDDT-based quality masking |
+| `plddt_threshold` | float | 70.0 | Minimum PLDDT score for inclusion |
+| `foldseek_verbose` | bool | False | Enable verbose Foldseek output |
+
+### Output Format
+
+The function returns a dictionary where each key represents a chain ID, and each value contains a tuple of three sequences:
+
+- **Sequence**: Standard amino acid sequence
+- **Structure Sequence**: Foldseek 3Di descriptor sequence  
+- **Combined Sequence**: Interleaved amino acid and 3Di characters
+
+```python
+# Example output structure
+seq_dict = {
+    "A": (
+        "MKTLLILAV...",           # Amino acid sequence
+        "ABCD123456...",          # 3Di structure sequence  
+        "MaBbKcCdD1..."           # Combined sequence
+    )
+}
+```
+
+> [!TIP]
+> The combined sequence interleaves amino acid residues with their corresponding 3Di structure descriptors, creating a unified representation that preserves both sequence and structural information for transformer processing.
+
+## PLDDT Quality Masking
+
+### AlphaFold2 Detection
+
+The system automatically detects AlphaFold2 structures by checking for "alphafold" in the file header [foldseek_util.py#L35-L36](saprot/utils/foldseek_util.py#L35-L36). This detection determines whether PLDDT masking should be applied, as experimental structures lack confidence scores.
+
+### PLDDT Extraction Process
+
+The `extract_plddt()` function [foldseek_util.py#L90-L125](saprot/utils/foldseek_util.py#L90-L125) handles confidence score extraction from both PDB and CIF formats:
+
+```python
+def extract_plddt(pdb_path: str) -> np.ndarray:
+    # Parser selection based on file extension
+    if pdb_path.endswith(".cif"):
+        parser = MMCIFParser()
+    elif pdb_path.endswith(".pdb"):
+        parser = PDBParser()
+    
+    # Extract B-factors as PLDDT scores
+    structure = parser.get_structure('protein', pdb_path)
+    model = structure[0]
+    chain = model["A"]
+    
+    plddts = []
+    for residue in chain:
+        residue_plddts = []
+        for atom in residue:
+            plddt = atom.get_bfactor()  # B-factor = PLDDT score
+            residue_plddts.append(plddt)
+        plddts.append(np.mean(residue_plddts))
+    
+    return np.array(plddts)
+```
+
+### Masking Implementation
+
+Low-confidence regions (PLDDT < threshold) are masked with "#" characters in the structure sequence, effectively removing unreliable structural information from the model input [foldseek_util.py#L42-L52](saprot/utils/foldseek_util.py#L42-L52).
+
+> [!TIP]
+> The masking threshold of 70.0 balances structural information retention with quality control, removing regions where AlphaFold2 confidence is insufficient for reliable prediction.
+
+## Integration with Model Pipeline
+
+### Structure Feature Conversion
+
+The Foldseek-generated sequences integrate with the broader Saprot pipeline through the `pdb2feature()` function [pdb2feature.py#L10-L16](saprot/data/pdb2feature.py#L10-L16), which converts PDB coordinates into tensor features compatible with transformer models.
+
+### Chain Processing Support
+
+The system supports multi-chain protein structures through the `parse_structure()` function [parse.py#L421-L473](saprot/data/parse.py#L421-L473), which can extract specific chains or process all chains in a structure:
+
+```python
+def parse_structure(path, chains: list = None, CA_only: bool = False) -> dict:
+    # Returns dict of parsed chains with sequences and coordinates
+    # Each chain contains: seq, coords, name, chain
+```
+
+## Usage Examples
+
+### Basic Structure Processing
+
+```python
+from saprot.utils.foldseek_util import get_struc_seq
+
+# Process a protein structure
+foldseek_path = "/path/to/foldseek"
+pdb_path = "/path/to/protein.pdb"
+
+result = get_struc_seq(
+    foldseek=foldseek_path,
+    path=pdb_path,
+    chains=["A", "B"],  # Process specific chains
+    plddt_threshold=75.0,  # Higher quality threshold
+    foldseek_verbose=True
+)
+
+# Access results
+for chain_id, (seq, struct_seq, combined) in result.items():
+    print(f"Chain {chain_id}: {combined[:50]}...")
+```
+
+### Parallel Processing
+
+For large datasets, utilize the `process_id` parameter to enable parallel processing without file conflicts:
+
+```python
+import multiprocessing as mp
+
+def process_structure(args):
+    foldseek_path, pdb_path, proc_id = args
+    return get_struc_seq(foldseek_path, pdb_path, process_id=proc_id)
+
+with mp.Pool(processes=4) as pool:
+    args = [(foldseek_path, pdb, i) for i, pdb in enumerate(pdb_files)]
+    results = pool.map(process_structure, args)
+```
+
+## Error Handling and Validation
+
+The system includes comprehensive validation:
+
+1. **File Existence**: Verifies both Foldseek binary and structure files exist [foldseek_util.py#L19-L20](saprot/utils/foldseek_util.py#L19-L20)
+2. **Format Support**: Supports both PDB and CIF file formats [parse.py#L426-L427](saprot/data/parse.py#L426-L427)
+3. **PLDDT Validation**: Ensures PLDDT array length matches structure sequence length [foldseek_util.py#L45](saprot/utils/foldseek_util.py#L45)
+4. **Graceful Degradation**: Continues processing even if PLDDT masking fails [foldseek_util.py#L53-L57](saprot/utils/foldseek_util.py#L53-L57)
+
+## Next Steps
+
+To fully leverage Foldseek processing in your Saprot workflow:
+
+1. Review [Structure-Aware Protein Representation](6-structure-aware-protein-representation) for model integration details
+2. Explore [Dataset Format Requirements](13-dataset-format-requirements) for input specifications
+3. Consult [Transformer-Based Model Architecture](7-transformer-based-model-architecture) for sequence processing details
+
+# SaprotHub Model Repository
+
+
+
+The SaprotHub Model Repository serves as a centralized hub for accessing and utilizing pre-trained protein models across various computational biology tasks. This repository provides a structured approach to model management, configuration, and deployment for protein structure-aware machine learning applications.
+
+## Repository Architecture Overview
+
+The model repository is organized around a modular architecture that separates concerns between model definitions, configurations, datasets, and utilities. This design enables flexible model selection and easy integration across different protein analysis tasks.
+
+```mermaid
+graph TB
+    A[Model Repository] --> B[Model Definitions]
+    A --> C[Configurations]
+    A --> D[Datasets]
+    A --> E[Utilities]
+    
+    B --> B1[SaProt Models]
+    B --> B2[ProtT5 Models]
+    B --> B3[Abstract Base Classes]
+    
+    C --> C1[Task-Specific Configs]
+    C --> C2[Default Configurations]
+    
+    D --> D1[Classification Datasets]
+    D --> D2[Regression Datasets]
+    D --> D3[Mutation Datasets]
+    
+    E --> E1[Module Loaders]
+    E --> E2[Data Processing]
+    E --> E3[Metric Utilities]
+```
+
+## Model Interface System
+
+The repository employs a dynamic model loading system through the `ModelInterface` class [saprot/model/model_interface.py](saprot/model/model_interface.py#L89-L99). This system allows for flexible model instantiation based on configuration files, enabling users to switch between different model architectures without modifying code.
+
+> [!TIP]
+> The model interface uses Python's dynamic import capabilities to load models at runtime, making it possible to add new model types simply by creating new Python files and referencing them in configuration YAML files.
+
+### Available Model Categories
+
+| Model Type | Purpose | Configuration Examples |
+|------------|---------|------------------------|
+| Classification | Protein property classification | [DeepLoc](saprot/config/DeepLoc/cls2/saprot.yaml), [EC Number](saprot/config/EC/saprot.yaml) |
+| Regression | Continuous value prediction | [Thermostability](saprot/config/Thermostability/saprot.yaml) |
+| Mutation Analysis | Variant effect prediction | [ClinVar](saprot/config/ClinVar/saprot.yaml), [ProteinGym](saprot/config/ProteinGym/saprot.yaml) |
+| Protein-Protein Interaction | Interaction prediction | [HumanPPI](saprot/config/HumanPPI/saprot.yaml) |
+
+## Configuration Management
+
+The repository uses a hierarchical configuration system where task-specific configurations inherit from a base configuration defined in [default.yaml](saprot/config/default.yaml). The [config_dict.py](saprot/config/config_dict.py) file serves as a centralized registry that loads all available configurations.
+
+### Configuration Structure
+
+Each configuration file follows a standardized structure:
+
+```yaml
+setting:    # Global settings and environment variables
+model:      # Model-specific parameters and architecture
+dataset:    # Data loading and preprocessing parameters
+Trainer:    # PyTorch Lightning training configuration
+```
+
+The configuration system supports:
+- **Environment variable management** for distributed training
+- **Flexible model loading** through dynamic module paths
+- **Dataset path configuration** for different data splits
+- **Training hyperparameters** with sensible defaults
+
+## Model Abstraction Layer
+
+All models in the repository inherit from the `AbstractModel` class [saprot/model/abstract_model.py](saprot/model/abstract_model.py#L12), which provides a standardized interface for training, validation, and checkpointing. This abstraction ensures consistency across different model implementations and facilitates:
+
+- **Unified training workflows** using PyTorch Lightning
+- **Automatic checkpoint management** with best model tracking
+- **Standardized metric logging** and evaluation
+- **Flexible optimizer configuration** with custom learning rate schedulers
+
+> [!TIP]
+> The abstract model class enforces implementation of key methods like `initialize_model()`, `forward()`, and `loss_func()`, ensuring that all model implementations follow consistent patterns while allowing for task-specific customization.
+
+## Task-Specific Model Implementations
+
+### SaProt Model Family
+
+The SaProt models [saprot/model/saprot/](saprot/model/saprot/) implement structure-aware protein representations, supporting various downstream tasks:
+
+- **Classification models** for protein property prediction
+- **Regression models** for continuous value estimation
+- **Mutation effect models** for variant impact analysis
+- **Inverse folding models** for sequence design
+
+### ProtT5 Integration
+
+The repository also supports ProtT5-based models [saprot/model/protT5/](saprot/model/protT5/), providing compatibility with existing protein language model workflows while maintaining the same training and evaluation infrastructure.
+
+## Dataset Management
+
+The repository includes a comprehensive dataset management system with:
+
+- **LMDB-based data storage** for efficient large-scale dataset handling
+- **Task-specific dataset classes** for different protein analysis tasks
+- **Dynamic dataset loading** through the `DataInterface` class [saprot/dataset/data_interface.py](saprot/dataset/data_interface.py#L88-L99)
+- **Preprocessing utilities** for protein structure and sequence data
+
+## Utility Infrastructure
+
+The [utils/](saprot/utils/) directory provides essential tools for:
+
+- **Module loading** and dynamic instantiation [module_loader.py](saprot/utils/module_loader.py#L113-L140)
+- **Protein structure processing** with Foldseek integration
+- **Metric computation** and evaluation utilities
+- **Data transformation** and preprocessing pipelines
+
+## Usage Workflow
+
+The typical workflow for using models from the repository involves:
+
+1. **Select a task configuration** from the available YAML files
+2. **Customize paths and parameters** as needed
+3. **Load the model** using the module loader system
+4. **Prepare datasets** following the specified format requirements
+5. **Train or evaluate** using the standardized training scripts
+
+This system enables researchers to quickly prototype and deploy protein analysis models without dealing with low-level implementation details, while still providing flexibility for customization and extension.
+
+## Community Integration
+
+The repository is designed to facilitate community contributions through:
+
+- **Standardized model interfaces** that make adding new models straightforward
+- **Configuration-driven model selection** that doesn't require code modifications
+- **Comprehensive documentation** and example configurations
+- **Modular architecture** that supports independent component development
+
+For developers interested in contributing to the model ecosystem, the [Contributing to OPMC](16-contributing-to-opmc) and [Adapter-based Model Sharing](17-adapter-based-model-sharing) pages provide detailed guidelines for extending the repository with new models and sharing them with the community.
+
+# Contributing to OPMC
+
+
+
+The Open Protein Modeling Consortium (OPMC) represents a collaborative vision to democratize protein language model development and sharing across the biology community. Contributing to OPMC offers opportunities to shape the future of protein AI research while gaining recognition for your innovations.
+
+## Understanding OPMC's Mission
+
+OPMC is founded on the principle of **decentralized model development** with **centralized resource sharing**. Unlike traditional approaches that silo research efforts, OPMC fosters a collaborative ecosystem where:
+
+- **Individual researchers** can train specialized protein models tailored to their specific biological questions
+- **Community members** can build upon existing models, creating a cumulative knowledge base
+- **Biologists without ML backgrounds** gain access to powerful protein prediction tools through user-friendly interfaces
+
+The consortium currently encompasses multiple protein language model platforms including ColabSaprot, ColabSeprot, ColabProtT5, and emerging tools like Evolla and ProTrek [README.md#L34-L50].
+
+## Contribution Pathways
+
+### 1. Model Development and Integration
+
+The most significant contribution pathway involves developing new protein language models or adapting existing ones:
+
+```mermaid
+flowchart TD
+    A[Identify Research Need] --> B[Develop/Adapt PLM]
+    B --> C[Create Colab Interface]
+    C --> D[Integrate with OPMC]
+    D --> E[Community Testing]
+    E --> F[Formal OPMC Membership]
+    
+    style A fill:#e1f5fe
+    style F fill:#c8e6c9
+```
+
+**Technical Requirements:**
+- Follow the established SaprotHub architecture patterns using the `AbstractModel` class [saprot/model/abstract_model.py#L12-L105]
+- Implement standardized interfaces for model loading via `ModelInterface` [saprot/model/model_interface.py#L89-L100]
+- Ensure compatibility with the existing dataset and configuration systems
+
+### 2. Platform Enhancement
+
+Beyond model development, you can contribute through:
+
+- **Interface Improvements**: Enhancing user experience for biologists
+- **Documentation**: Creating tutorials and guides for specific use cases
+- **Benchmark Development**: Establishing standardized evaluation protocols
+- **Tool Integration**: Connecting OPMC with complementary bioinformatics resources
+
+## Membership and Recognition
+
+### OPMC Membership Tiers
+
+| Contribution Type | Membership Level | Recognition | Timeline |
+|-------------------|------------------|-------------|----------|
+| Model Development | Full Member | Co-author on SaprotHub paper | Before final revision |
+| Tool Enhancement | Associate Member | Acknowledged contributor | Ongoing |
+| Community Support | Contributor | Listed in community resources | Quarterly review |
+
+### Authorship Criteria
+
+To qualify for authorship on the SaprotHub paper:
+
+1. **Pre-Publication**: All OPMC members are automatically included as authors before the paper's final revision (4-12 month window) [README.md#L155-L160]
+2. **Post-Publication**: New members can join OPMC but won't be listed as paper authors due to journal constraints [README.md#L162-L165]
+3. **Independent PLMHubs**: Developers creating separate platforms (like ESMHub or ProtTransHub) can gain authorship by acknowledging OPMC framework origins [README.md#L60-L67]
+
+## Technical Integration Process
+
+### Step 1: Join SaprotHub Organization
+
+Begin by joining the SaprotHub HuggingFace Organization to gain repository access [tutorial.md#L493-L500].
+
+### Step 2: Model Integration
+
+Choose your integration approach:
+
+**Option A: Model Transfer (Recommended)**
+- Upload your model using ColabSaprot
+- Transfer directly to SaprotHub repository
+- Benefits: Simplified process, immediate community access
+
+**Option B: Manual Repository Creation**
+- Create new model repository on SaprotHub
+- Upload model files manually
+- Benefits: Greater control over repository structure
+
+### Step 3: Architecture Compliance
+
+Ensure your model follows the established patterns:
+
+```python
+# Example: Extending the AbstractModel
+class YourProteinModel(AbstractModel):
+    def initialize_model(self):
+        # Your model initialization logic
+        self.model = YourModelArchitecture()
+    
+    def forward(self, batch):
+        # Forward pass implementation
+        return self.model(batch)
+    
+    def initialize_metrics(self, stage):
+        # Task-specific metrics
+        return {"accuracy": AccuracyMetric()}
+```
+
+## Quality Standards and Review
+
+### Code Quality Requirements
+
+- **Documentation**: Comprehensive docstrings for all public methods
+- **Testing**: Unit tests covering core functionality
+- **Compatibility**: Adherence to existing API contracts
+- **Performance**: Reasonable computational efficiency for biological use cases
+
+### Community Review Process
+
+1. **Initial Assessment**: Technical compliance with OPMC standards
+2. **Community Testing**: Beta testing by consortium members
+3. **Integration Review**: Final approval by steering committee
+4. **Formal Inclusion**: Official recognition as OPMC contribution
+
+## Next Steps
+
+Ready to contribute to OPMC? Here's your action plan:
+
+1. **Explore Existing Models**: Study current implementations in [saprot/model/saprot/](saprot/model/saprot) to understand architectural patterns
+2. **Identify Your Niche**: Determine what unique capabilities you can bring to the ecosystem
+3. **Review Guidelines**: Examine the [contribution tutorial](tutorial.md#L489-L523) for detailed technical requirements
+4. **Engage with Community**: Join discussion forums to connect with existing members
+
+For specific implementation guidance, refer to [Adapter-based Model Sharing](17-adapter-based-model-sharing) or explore the [SaprotHub Model Repository](15-saprothub-model-repository) to see examples of successful integrations.
+
+The future of protein AI research depends on collaborative innovation. By contributing to OPMC, you're not just sharing code—you're helping build a more accessible, powerful, and collaborative future for computational biology.
+
+# Adapter-based Model Sharing
+
+
+
+Adapter-based model sharing in SaprotHub provides an efficient mechanism for distributing and reusing specialized protein models without sharing the full backbone weights. This approach leverages Parameter-Efficient Fine-Tuning (PEFT) techniques, particularly LoRA (Low-Rank Adaptation), to enable lightweight model sharing and rapid task adaptation.
+
+## Architecture Overview
+
+The adapter system is built around a hierarchical architecture that separates the base protein language model from task-specific adapters:
+
+```mermaid
+graph TB
+    A[Base Saprot Model] --> B[PeftModel Wrapper]
+    B --> C[Adapter 0 - Default]
+    B --> D[Adapter 1 - Task Specific]
+    B --> E[Adapter N - Additional Task]
+    
+    C --> C1[LoRA Layers]
+    D --> D1[LoRA Layers]
+    E --> E1[LoRA Layers]
+    
+    F[Model Interface] --> G[Dynamic Loading]
+    G --> B
+    
+    H[Save/Load System] --> I[Adapter Weights Only]
+    I --> J[HuggingFace Hub Integration]
+```
+
+The core architecture utilizes the `PeftModel` class from the custom PEFT implementation [saprot/model/saprot/self_peft/peft_model.py](saprot/model/saprot/self_peft/peft_model.py#L88), which wraps the base model and manages multiple adapters simultaneously.
+
+## Adapter Management System
+
+### Multi-Adapter Support
+
+SaprotHub supports loading and managing multiple adapters within a single model instance. The system initializes adapters through the `_init_lora()` method [saprot/model/saprot/base.py](saprot/model/saprot/base.py#L74):
+
+```python
+for i in range(self.lora_kwargs.num_lora):
+    adapter_name = f"adapter_{i}" if self.lora_kwargs.num_lora > 1 else "default"
+```
+
+Each adapter can be independently configured as either:
+- **Pre-trained adapters**: Loaded from existing checkpoint files
+- **Training adapters**: Initialized with new LoRA configurations
+
+### Adapter Configuration
+
+The LoRA configuration supports comprehensive customization through the `LoraConfig` class:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `task_type` | "SEQ_CLS" | Task type for adapter specialization |
+| `target_modules` | ["query", "key", "value", "intermediate.dense", "output.dense"] | Transformer layers to adapt |
+| `modules_to_save` | ["classifier"] | Additional modules to train |
+| `r` | 8 | LoRA rank (adaptation capacity) |
+| `lora_alpha` | 16 | LoRA scaling parameter |
+| `lora_dropout` | 0.0 | Dropout rate for LoRA layers |
+
+> [!TIP]
+> The `modules_to_save` parameter is crucial for task-specific components like classification heads, allowing these modules to be trained separately from the frozen backbone.
+
+## Model Loading and Registration
+
+### Dynamic Model Interface
+
+The `ModelInterface` class provides dynamic model loading capabilities [saprot/model/model_interface.py](saprot/model/model_interface.py#L89):
+
+```python
+@classmethod
+def init_model(cls, model_py_path: str, **kwargs):
+    sub_dirs = model_py_path.split(os.sep)
+    cmd = f"from {'.' + '.'.join(sub_dirs[:-1])} import {sub_dirs[-1]}"
+    exec(cmd)
+    return now_cls(**kwargs)
+```
+
+This system enables runtime model registration through the `@register_model` decorator, allowing new model implementations to be discovered and instantiated dynamically.
+
+### Abstract Model Framework
+
+All adapter-enabled models inherit from `SaprotBaseModel` [saprot/model/saprot/base.py](saprot/model/saprot/base.py#L21), which extends `AbstractModel` [saprot/model/abstract_model.py](saprot/model/abstract_model.py#L12) and provides:
+
+- **Adapter initialization** through `_init_lora()`
+- **Checkpoint management** with adapter-specific saving
+- **Metrics tracking** for multi-adapter scenarios
+- **Training orchestration** with adapter switching capabilities
+
+## Adapter Persistence and Sharing
+
+### Efficient Weight Serialization
+
+The adapter system implements specialized state dict management that extracts only adapter-specific parameters:
+
+```python
+def get_peft_model_state_dict(model, state_dict=None, adapter_name="default"):
+    # Extract only LoRA parameters
+    to_return = {k: state_dict[k] for k in state_dict if "lora_" in k}
+    # Handle bias parameters based on configuration
+    # Process embedding layers if needed
+```
+
+This approach reduces model size dramatically, with typical adapters being only 1-5% of the full model size.
+
+### HuggingFace Hub Integration
+
+Adapters can be shared through the HuggingFace Hub using the `PushToHubMixin` functionality. The system supports:
+
+- **Safe serialization** using safetensors format
+- **Metadata preservation** including base model information
+- **Version control** through adapter naming conventions
+- **Automatic model card generation** with PEFT-specific details
+
+### Loading Mechanisms
+
+The system provides flexible adapter loading through multiple pathways:
+
+1. **Local file loading**: Direct path specification
+2. **Hub downloading**: Automatic retrieval from HuggingFace Hub
+3. **Multi-adapter composition**: Loading multiple adapters simultaneously
+
+> [!TIP]
+> When loading multiple adapters, each maintains its own configuration and trainable parameters, enabling efficient multi-task learning and rapid task switching.
+
+## Task-Specific Implementations
+
+### Classification Models
+
+The `SaprotClassificationModel` [saprot/model/saprot/saprot_classification_model.py](saprot/model/saprot/saprot_classification_model.py#L11) demonstrates adapter integration for classification tasks:
+
+```python
+def forward(self, inputs, coords=None):
+    if coords is not None:
+        inputs = self.add_bias_feature(inputs, coords)
+    
+    if self.freeze_backbone:
+        # Use frozen backbone with adapter-enhanced representations
+        repr = torch.stack(self.get_hidden_states_from_dict(inputs, reduction="mean"))
+        # ... classification head processing
+    else:
+        logits = self.model(**inputs).logits
+```
+
+### Model Variants
+
+The framework supports multiple task-specific model types:
+
+- **Sequence Classification**: `SaprotClassificationModel`
+- **Regression**: `SaprotRegressionModel`
+- **Token Classification**: `SaprotTokenClassificationModel`
+- **Pair Classification**: `SaprotPairClassificationModel`
+- **Mutation Prediction**: `SaprotFoldseekMutationModel`
+- **Inverse Folding**: `SaprotIFModel`
+
+Each variant implements task-specific forward passes and loss functions while leveraging the common adapter infrastructure.
+
+## Advanced Features
+
+### Gradient Checkpointing Support
+
+The system includes automatic gradient checkpointing setup for memory-efficient training:
+
+```python
+def _prepare_model_for_gradient_checkpointing(self, model: PreTrainedModel):
+    # Configure gradient checkpointing for base model
+    # Handle adapter-specific considerations
+```
+
+### Parameter Efficiency Tracking
+
+Built-in utilities monitor parameter efficiency:
+
+```python
+def get_nb_trainable_parameters(self) -> tuple[int, int]:
+    # Returns (trainable_params, total_params)
+    
+def print_trainable_parameters(self) -> None:
+    # Displays percentage of trainable parameters
+```
+
+### Adapter Switching
+
+Runtime adapter switching enables dynamic task adaptation:
+
+```python
+def set_adapter(self, adapter_name: str) -> None:
+    # Activate specified adapter for inference/training
+    
+@contextmanager
+def disable_adapter(self):
+    # Temporarily disable all adapters
+```
+
+## Best Practices
+
+### Adapter Design Guidelines
+
+1. **Rank Selection**: Choose `r` values based on task complexity (typically 4-32)
+2. **Target Module Selection**: Focus on attention and feed-forward layers
+3. **Module Preservation**: Save task-specific heads separately
+4. **Regularization**: Apply appropriate dropout to prevent overfitting
+
+### Sharing Workflows
+
+1. **Training**: Train adapters with frozen backbone
+2. **Validation**: Evaluate adapter performance on held-out data
+3. **Export**: Save adapter weights with metadata
+4. **Distribution**: Share through HuggingFace Hub
+5. **Loading**: Dynamic loading in downstream applications
+
+### Performance Considerations
+
+- **Memory Usage**: Adapters reduce GPU memory requirements by 90-95%
+- **Training Speed**: Faster convergence due to fewer parameters
+- **Inference Latency**: Minimal overhead compared to full fine-tuning
+- **Storage Efficiency**: Dramatically reduced model sizes for distribution
+
+## Integration with SaprotHub Ecosystem
+
+The adapter system seamlessly integrates with other SaprotHub components:
+
+- **Dataset Pipeline**: Compatible with all dataset formats
+- **Training Scripts**: Full support in training workflows
+- **Configuration System**: YAML-based adapter configuration
+- **Evaluation Framework**: Adapter-specific metric tracking
+
+This integration enables end-to-end workflows from data preparation through model sharing, making SaprotHub a comprehensive platform for protein AI research and application development.
+
+For continued learning, explore [Multi-model Ensemble Prediction](11-multi-model-ensemble-prediction) to understand how adapters can be combined for enhanced performance, or review [SaprotHub Model Repository](15-saprothub-model-repository) for available pre-trained adapters.

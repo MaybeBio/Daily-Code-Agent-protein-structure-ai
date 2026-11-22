@@ -1,0 +1,1197 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import subprocess
+import sys
+import threading
+import tomllib
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+from packaging.specifiers import SpecifierSet
+from packaging.version import Version
+
+from bionemo_ir._torch.custom_ops.fused_ln_proj_moveaxis_pad import LNProjMoveaxisPad
+from bionemo_ir._torch.layers.random_augmentation import _quaternion_components_to_matrix
+from bionemo_ir.dsl_kernels.cache_base import make_driver_launcher
+from bionemo_ir.dsl_kernels.triton.atom_gather_kernel import (
+    _AtomReduction,
+    _cached_reduction,
+    _reduce_atom_slots,
+    reduce_atom_slots,
+)
+from bionemo_ir.dsl_kernels.triton.edm import _churn, _churn_kernel, churn_update
+from bionemo_ir.dsl_kernels.triton.fused_ln_proj_moveaxis_pad import (
+    _STREAMING_DEFAULT_TUNING,
+    _STREAMING_TUNING,
+    FusedLNProjMoveaxisPad,
+    _fused_ln_proj_moveaxis_pad_kernel,
+    _fused_ln_proj_moveaxis_pad_streaming_kernel,
+    _resident_programs,
+    _streaming_chunk,
+    _streaming_grid,
+    _streaming_supported,
+    _streaming_tuning,
+    _streaming_variant,
+    _StreamingTuning,
+    fused_ln_proj_moveaxis_pad,
+)
+from bionemo_ir.dsl_kernels.triton.fused_swiglu import FusedSwiGLU, _fused_swiglu_kernel
+from bionemo_ir.dsl_kernels.triton.ln_pair_bias import LNPairBias
+from bionemo_ir.dsl_kernels.triton.moveaxis_pad import MoveaxisPad, _moveaxis_pad_kernel
+from bionemo_ir.dsl_kernels.triton.quaternion_rotation import _quaternion_rotation_kernel, quaternion_matrix
+from bionemo_ir.dsl_kernels.triton_cache import (
+    _DRIVER_TRITON_OK,
+    _SUPPORTED_TRITON_VERSIONS,
+    CachedKernel,
+    TritonKernelCache,
+    _compile_in_subprocess,
+    _looks_like_compiled_kernel,
+    value_specialized_params,
+)
+
+# Kernels reusing CUBINs compiled from dummy tensors.
+DRIVER_LAUNCHED_KERNELS = [
+    _churn,
+    _reduce_atom_slots,
+    _fused_ln_proj_moveaxis_pad_kernel,
+    _fused_ln_proj_moveaxis_pad_streaming_kernel,
+    _moveaxis_pad_kernel,
+    _fused_swiglu_kernel,
+]
+
+# Skip rather than assert: an unvalidated Triton is a property of the image, not a
+# defect, and shape-agnostic launch is covered on any version by
+# ``test_cached_cubin_is_correct_for_shapes_it_was_not_compiled_with``.
+requires_driver_path = pytest.mark.skipif(
+    not _DRIVER_TRITON_OK,
+    reason=(
+        f"direct CUBIN launcher needs Triton "
+        f"{' / '.join('.'.join(map(str, v)) for v in _SUPPORTED_TRITON_VERSIONS)}, "
+        f"found {triton.__version__}"
+    ),
+)
+
+
+def test_driver_abi_versions_stay_within_the_declared_triton_range() -> None:
+    """Every ABI the fast path claims must be a Triton the package can install.
+
+    These drifted once: requirements widened to 3.7 while the launcher still gated on
+    3.6, silently costing a supported install its fast path.
+    """
+    pyproject = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text())
+    (pin,) = [dependency for dependency in pyproject["project"]["dependencies"] if dependency.startswith("triton")]
+    allowed = SpecifierSet(pin.removeprefix("triton"))
+
+    assert _SUPPORTED_TRITON_VERSIONS, "the fast path must claim at least one ABI"
+    for major, minor in _SUPPORTED_TRITON_VERSIONS:
+        assert allowed.contains(Version(f"{major}.{minor}.0")), (
+            f"driver path claims Triton {major}.{minor}, which {pin!r} does not allow"
+        )
+
+
+@pytest.mark.parametrize("jit_fn", DRIVER_LAUNCHED_KERNELS, ids=lambda fn: fn.fn.__name__)
+def test_driver_launched_kernels_declare_do_not_specialize(jit_fn) -> None:
+    """A reused CUBIN must not be specialized on its compile-time argument values.
+
+    Triton derives ``divisible_by_16`` from the dummy arguments, which corrupts output
+    for runtime values that are not multiples of 16, and ``equal_to_1``, which drops
+    the argument and shifts every later ``params[i]`` assignment.
+    """
+    unprotected = [
+        param.name
+        for param in jit_fn.params
+        if not param.is_constexpr and not param.do_not_specialize and not param.name.endswith("_ptr")
+    ]
+    assert unprotected == [], (
+        f"{jit_fn.fn.__name__} is launched from a cached CUBIN, so scalar parameter(s) "
+        f"{unprotected} must be listed in do_not_specialize"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_value_specialized_params_flags_unprotected_scalars() -> None:
+    """The guard that keeps an unsafe kernel off the driver path."""
+    op = FusedLNProjMoveaxisPad(D=128, H=16, dtype=torch.bfloat16)
+    dummy = op._make_dummy_args(torch.bfloat16)
+
+    assert value_specialized_params(_fused_ln_proj_moveaxis_pad_kernel, dummy) == []
+
+    # A scalar in a pointer slot is not exempt; unreadable parameters are unverifiable.
+    scalar_for_pointer = (dummy[0], 1, *dummy[2:])
+    assert "w_ln_ptr" in value_specialized_params(_fused_ln_proj_moveaxis_pad_kernel, scalar_for_pointer)
+
+    class _NoParams:
+        pass
+
+    assert value_specialized_params(_NoParams(), dummy) is None
+
+
+@triton.jit
+def _add_n_kernel(dst_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    tl.store(dst_ptr + offs, offs.to(tl.float32) + n)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_value_specialized_compile_does_not_wrap_dummy_cubin() -> None:
+    """An unprotected scalar must not be launched from the dummy CompiledKernel.
+
+    Compiling with n=1 lets Triton fold equal_to_1 into the CUBIN. CachedKernel.launch()
+    used to call .run() on that CUBIN, so n=5 still added 1. The JIT path recompiles.
+    """
+    block = 16
+    dummy_out = torch.empty(block, device="cuda", dtype=torch.float32)
+    dummy = (dummy_out, 1)
+    assert value_specialized_params(_add_n_kernel, dummy) == ["n"]
+
+    kernel = TritonKernelCache().compile(_add_n_kernel, dummy, (1,), {"BLOCK": block})
+    assert kernel.driver is None
+    assert kernel.compiled is _add_n_kernel
+    assert not _looks_like_compiled_kernel(kernel.compiled)
+
+    out = torch.empty(block, device="cuda", dtype=torch.float32)
+    kernel.launch((1,), out, 5, block)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, torch.arange(block, device="cuda", dtype=torch.float32) + 5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compiling_populates_the_cache_without_running_the_kernel() -> None:
+    """Compilation addresses the dummy buffers; it must never execute on their contents.
+
+    The dummies are ``torch.empty``, so a stray launch computes garbage here and
+    would fault outright for a kernel that indexed through one.
+    """
+    block = 16
+    sentinel = torch.full((block,), -7.0, device="cuda", dtype=torch.float32)
+    kernel = TritonKernelCache().compile(_add_n_kernel, (sentinel, 5), (1,), {"BLOCK": block})
+    torch.cuda.synchronize()
+
+    assert bool((sentinel == -7.0).all()), "compiling the kernel launched it over the dummy buffer"
+
+    out = torch.empty(block, device="cuda", dtype=torch.float32)
+    kernel.launch((1,), out, 5, block)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, torch.arange(block, device="cuda", dtype=torch.float32) + 5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_unreadable_params_do_not_wrap_dummy_cubin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When specialization cannot be inspected, launch must not reuse the dummy CUBIN."""
+    monkeypatch.setattr(
+        "bionemo_ir.dsl_kernels.triton_cache.value_specialized_params",
+        lambda jit_fn, dummy_args: None,
+    )
+    block = 16
+    dummy = (torch.empty(block, device="cuda", dtype=torch.float32), 1)
+    kernel = TritonKernelCache().compile(_add_n_kernel, dummy, (1,), {"BLOCK": block})
+    assert kernel.driver is None
+    assert kernel.compiled is _add_n_kernel
+
+    out = torch.empty(block, device="cuda", dtype=torch.float32)
+    kernel.launch((1,), out, 5, block)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, torch.arange(block, device="cuda", dtype=torch.float32) + 5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_driver_path
+def test_driver_fast_path_launches_fused_swiglu() -> None:
+    pytest.importorskip("cuda.bindings.driver")
+
+    d = 128
+    torch.manual_seed(123)
+    z = torch.randn(37, 2 * d, device="cuda", dtype=torch.bfloat16)
+    op = FusedSwiGLU(d=d, three_way=False, dtype=z.dtype)
+    kernel = op._kernels[z.dtype]
+    assert kernel.driver is not None
+
+    actual = op(z)
+    torch.cuda.synchronize()
+    expected = z[:, :d] * F.silu(z[:, d:])
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_driver_path
+def test_fused_ln_projection_driver_is_deterministic_in_cuda_graph() -> None:
+    pytest.importorskip("cuda.bindings.driver")
+
+    batch, i, j, d, heads = 1, 199, 199, 128, 4
+    torch.manual_seed(123)
+    z = torch.randn(batch, i, j, d, device="cuda", dtype=torch.bfloat16)
+    ln_weight = torch.randn(d, device="cuda", dtype=torch.float32)
+    ln_bias = torch.randn(d, device="cuda", dtype=torch.float32)
+    proj_weight = torch.randn(heads, d, device="cuda", dtype=z.dtype)
+    op = FusedLNProjMoveaxisPad(D=d, H=heads, dtype=z.dtype)
+    signature = (z.dtype, ln_weight.dtype, ln_bias.dtype, proj_weight.dtype)
+    assert op._kernels[signature].driver is not None
+
+    for _ in range(3):
+        op(z, ln_weight, ln_bias, proj_weight, multiple=8)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = op(z, ln_weight, ln_bias, proj_weight, multiple=8)
+    graph.replay()
+    eager_output = op(z, ln_weight, ln_bias, proj_weight, multiple=8)
+    torch.cuda.synchronize()
+
+    assert torch.equal(graph_output, eager_output)
+    assert torch.count_nonzero(graph_output[..., j:]) == 0
+    # Graph and eager run the same kernel, so agreeing shows capture safety, not
+    # correctness: at j=199 this passed while the kernel corrupted that very shape.
+    expected = _ln_proj_moveaxis_pad_reference(z, ln_weight, ln_bias, proj_weight, graph_output.shape[-1])
+    torch.testing.assert_close(graph_output.float(), expected, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_driver_path
+def test_fused_ln_projection_leaves_i32_overflowing_strides_to_the_jit_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The driver's scalar slots are i32 and would wrap a 2**31 batch stride, so such a call takes the JIT launch."""
+    pytest.importorskip("cuda.bindings.driver")
+
+    # D=48 is not a multiple of the streaming chunk, so bfloat16 takes the non-streaming kernel.
+    i, j, d, heads = 9, 13, 48, 4
+    stride, rows = 2**31 + 64, i * j * d
+    if torch.cuda.mem_get_info()[0] < 2 * (stride + rows) + (1 << 30):
+        pytest.skip("needs about 5 GiB of free device memory")
+    torch.manual_seed(123)
+    z = torch.empty(stride + rows, device="cuda", dtype=torch.bfloat16).as_strided((2, i, j, d), (stride, j * d, d, 1))
+    z.copy_(torch.randn(z.shape, device="cuda", dtype=z.dtype))
+    ln_weight, ln_bias = torch.randn(2, d, device="cuda", dtype=z.dtype).unbind()
+    proj_weight = torch.randn(heads, d, device="cuda", dtype=z.dtype)
+    op = FusedLNProjMoveaxisPad(D=d, H=heads, dtype=z.dtype)
+    driver = op._kernels[z.dtype].driver
+    assert driver is not None and not op.streams(z.dtype)
+    monkeypatch.setattr(type(driver), "launch_with", lambda *args, **kwargs: pytest.fail("driver took a 2**31 stride"))
+
+    actual = op(z, ln_weight, ln_bias, proj_weight, multiple=8)
+
+    expected = _ln_proj_moveaxis_pad_reference(z, ln_weight, ln_bias, proj_weight, actual.shape[-1])
+    torch.testing.assert_close(actual.float(), expected, rtol=0.05, atol=0.05)
+
+
+def _ln_proj_moveaxis_pad_reference(
+    z: torch.Tensor,
+    ln_weight: torch.Tensor,
+    ln_bias: torch.Tensor | None,
+    proj_weight: torch.Tensor,
+    j_padded: int,
+) -> torch.Tensor:
+    if ln_bias is None:
+        out = F.rms_norm(z.float(), [z.shape[-1]], ln_weight.float(), eps=1e-5)
+    else:
+        out = F.layer_norm(z.float(), [z.shape[-1]], ln_weight.float(), ln_bias.float(), eps=1e-5)
+    out = F.linear(out, proj_weight.float()).movedim(-1, -3)
+    return F.pad(out, (0, j_padded - out.shape[-1]))
+
+
+@pytest.mark.parametrize("sm", [None, *sorted(_STREAMING_TUNING)])
+def test_streaming_chunk_divides_every_streamed_feature_dim(sm: int | None) -> None:
+    """The kernel walks D in CHUNK-wide slices, so each tuning's chunk must divide every D that streams."""
+    tuning = _STREAMING_DEFAULT_TUNING if sm is None else _STREAMING_TUNING[sm]
+    for dim_d in range(1, 1025):
+        if _streaming_supported(dim_d, 16):
+            assert dim_d % _streaming_chunk(dim_d, tuning) == 0, dim_d
+
+
+@pytest.mark.parametrize(("sm", "sms"), [(100, 148), (100, 144), (103, 148)])
+@pytest.mark.parametrize("dim_d", [256, 384])
+def test_blackwell_streaming_pipeline_threshold(sm: int, sms: int, dim_d: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Blackwell stages populated RMSNorm grids and keeps smaller calls and LayerNorm unrolled."""
+    monkeypatch.setattr("bionemo_ir.dsl_kernels.triton.fused_ln_proj_moveaxis_pad._device_info", lambda _: (sm, sms))
+    tuning = _STREAMING_TUNING[sm]
+    device = torch.device("cuda", 0)
+    assert _streaming_variant(sms * 64 - 1, 200, device, tuning, True, dim_d) == (64, 4, 1)
+    assert _streaming_variant(sms * 64, 200, device, tuning, True, dim_d) == (64, 4, 3)
+    assert _streaming_variant(sms * 1024, 200, device, tuning, False, dim_d) == (64, 4, 1)
+
+
+@pytest.mark.parametrize("sm", [100, 103])
+def test_blackwell_streaming_keeps_d128_unrolled(sm: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the existing loop for the D128/N400 case that regressed in the Blackwell screen."""
+    monkeypatch.setattr("bionemo_ir.dsl_kernels.triton.fused_ln_proj_moveaxis_pad._device_info", lambda _: (sm, 148))
+    assert _streaming_variant(400 * 400, 400, torch.device("cuda", 0), _STREAMING_TUNING[sm], True, 128) == (64, 4, 1)
+
+
+@pytest.mark.parametrize("sm", [100, 103])
+def test_blackwell_streaming_layernorm_d128_takes_the_wide_tile(sm: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Blackwell LayerNorm at D128 (the pair-weighted-averaging pair bias) takes the 128-row tile; other widths keep 64."""
+    monkeypatch.setattr("bionemo_ir.dsl_kernels.triton.fused_ln_proj_moveaxis_pad._device_info", lambda _: (sm, 148))
+    device = torch.device("cuda", 0)
+    tuning = _STREAMING_TUNING[sm]
+    assert _streaming_variant(512 * 512, 512, device, tuning, False, 128) == (128, 4, 1)
+    assert _streaming_variant(512 * 512, 512, device, tuning, False, 256) == (64, 4, 1)
+    assert _streaming_variant(400 * 400, 400, device, tuning, True, 128) == (64, 4, 1)
+
+
+@pytest.mark.parametrize("sm", [90, 100, 103])
+@pytest.mark.parametrize("dim_d", [64, 128, 192, 256, 384, 512])
+def test_streaming_compiles_only_admitted_pipeline_widths(sm: int, dim_d: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compile stage-3 variants only for widths that can dispatch to them."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(FusedLNProjMoveaxisPad, "_global_cache", {})
+    monkeypatch.setattr(
+        "bionemo_ir.dsl_kernels.triton.fused_ln_proj_moveaxis_pad._streaming_tuning", lambda _: _STREAMING_TUNING[sm]
+    )
+    stages = []
+
+    def compile_stub(self, dtypes, norm_dtype, kwargs, projection_dtype=None):
+        stages.append(kwargs["STAGES"])
+        return {}
+
+    monkeypatch.setattr(FusedLNProjMoveaxisPad, "_compile_streaming", compile_stub)
+    op = FusedLNProjMoveaxisPad(D=dim_d, H=16, rms_norm=True)
+    op._ensure_streaming_compiled([torch.bfloat16])
+    assert stages.count(3) == (2 if sm == 90 or dim_d in (256, 384) else 0)
+    assert stages.count(1) == 2 * len(_STREAMING_TUNING[sm].tiles)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "tile_j",
+    sorted(
+        {tile_j for tuning in (_STREAMING_DEFAULT_TUNING, *_STREAMING_TUNING.values()) for tile_j, _ in tuning.tiles}
+    ),
+)
+def test_streaming_ln_projection_dummy_args_carry_no_value_specialization(
+    tile_j: int, structural_model: Callable[..., FusedLNProjMoveaxisPad]
+) -> None:
+    op = structural_model(FusedLNProjMoveaxisPad, D=128, H=16, dtype=torch.bfloat16)
+    dummy = op._make_streaming_dummy_args(torch.bfloat16, tile_j=tile_j)
+
+    assert op.streams(torch.bfloat16)
+    assert not op.streams(torch.float32)
+    assert value_specialized_params(_fused_ln_proj_moveaxis_pad_streaming_kernel, dummy) == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("dim_d", "heads", "rms_norm", "norm_dtype", "batch", "tokens", "multiple"),
+    [
+        pytest.param(128, 4, False, torch.float32, 1, 199, 8, id="d128-h4-mixed-j199"),
+        pytest.param(256, 12, False, torch.bfloat16, 3, 64, 8, id="d256-h12-b3"),
+        pytest.param(384, 12, True, torch.bfloat16, 2, 37, 8, id="rmsnorm-d384-b2-j37"),
+        pytest.param(384, 16, False, torch.float32, 2, 30, -1, id="d384-h16-unpadded"),
+        pytest.param(256, 32, False, torch.bfloat16, 1, 130, 0, id="d256-h32-j130"),
+        pytest.param(384, 16, False, torch.bfloat16, 2, 250, 8, id="d384-h16-b2-j250-wide-tile"),
+        pytest.param(256, 8, True, torch.bfloat16, 1, 128, 0, id="rmsnorm-d256-j128-wide-tile"),
+        pytest.param(192, 8, False, torch.bfloat16, 2, 41, 8, id="d192-h8-b2-j41-chunk-fallback"),
+    ],
+)
+def test_streaming_ln_projection_matches_reference(
+    dim_d: int,
+    heads: int,
+    rms_norm: bool,
+    norm_dtype: torch.dtype,
+    batch: int,
+    tokens: int,
+    multiple: int,
+) -> None:
+    """The folded, chunked kernel matches LayerNorm/RMSNorm + Linear + moveaxis + pad in fp32."""
+    torch.manual_seed(123)
+    z = torch.randn(batch, tokens, tokens, dim_d, device="cuda", dtype=torch.bfloat16) + 0.5
+    ln_weight = torch.randn(dim_d, device="cuda", dtype=norm_dtype)
+    ln_bias = None if rms_norm else torch.randn(dim_d, device="cuda", dtype=norm_dtype)
+    proj_weight = torch.randn(heads, dim_d, device="cuda", dtype=z.dtype) * dim_d**-0.5
+
+    op = FusedLNProjMoveaxisPad(D=dim_d, H=heads, dtype=z.dtype, rms_norm=rms_norm)
+    assert op.streams(z.dtype)
+    actual = op(z, ln_weight, ln_bias, proj_weight, multiple=multiple)
+    torch.cuda.synchronize()
+
+    j_padded = tokens if multiple <= 0 else -(-tokens // multiple) * multiple
+    assert actual.shape == (batch, heads, tokens, j_padded)
+    assert torch.count_nonzero(actual[..., tokens:]) == 0
+    expected = _ln_proj_moveaxis_pad_reference(z, ln_weight, ln_bias, proj_weight, j_padded)
+    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
+    if not rms_norm:
+        functional = fused_ln_proj_moveaxis_pad(z, ln_weight, ln_bias, proj_weight, multiple=multiple)
+        torch.testing.assert_close(functional, actual)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("batch", "tokens", "multiple"),
+    [(1, 136, 8), (2, 45, -1), (2, 208, 8)],
+    ids=["padded", "unpadded-b2", "pipelined-b2"],
+)
+def test_fp32_folded_projection_reproduces_each_layers_fold(batch: int, tokens: int, multiple: int) -> None:
+    """Two RMSNorm layers' gamma-folded FP32 weights under a unit gamma give each layer's own bias, bit for bit."""
+    torch.manual_seed(7)
+    dim_d, heads = 384, 12
+    z = torch.randn(batch, tokens, tokens, dim_d, device="cuda", dtype=torch.bfloat16)
+    gammas = [(1 + 0.2 * torch.randn(dim_d, device="cuda")).to(torch.bfloat16) for _ in range(2)]
+    weights = [(torch.randn(heads, dim_d, device="cuda") * dim_d**-0.5).to(torch.bfloat16) for _ in range(2)]
+    single = FusedLNProjMoveaxisPad(D=dim_d, H=heads, rms_norm=True)
+    merged = FusedLNProjMoveaxisPad(D=dim_d, H=2 * heads, rms_norm=True, fp32_projection=True)
+    folded = torch.cat([weight.float() * gamma.float() for gamma, weight in zip(gammas, weights, strict=True)])
+
+    actual = merged(z, torch.ones(dim_d, device="cuda"), None, folded, multiple=multiple)
+    for index, (gamma, weight) in enumerate(zip(gammas, weights, strict=True)):
+        expected = single(z, gamma, None, weight, multiple=multiple)
+        torch.testing.assert_close(actual[:, index * heads : (index + 1) * heads], expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    ("dim_d", "heads", "fp32_projection", "tokens", "multiple"),
+    [
+        pytest.param(384, 24, True, 136, 8, id="d384-h24-folded"),
+        pytest.param(384, 12, False, 45, -1, id="d384-h12-unpadded"),
+        pytest.param(256, 16, False, 130, 0, id="d256-h16"),
+        pytest.param(128, 4, False, 199, 8, id="d128-h4-j199"),
+    ],
+)
+def test_pipelined_slice_loop_keeps_the_bits(
+    dim_d: int,
+    heads: int,
+    fp32_projection: bool,
+    tokens: int,
+    multiple: int,
+    dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The software-pipelined RMSNorm slice loop gives the unrolled loop's bits."""
+    tuning = _streaming_tuning(torch.device("cuda"))
+    if tuning.pipelined is None:
+        pytest.skip("no pipelined streaming variant on this GPU")
+    # This test forces the pipeline even for widths excluded by dispatch.
+    tuning = tuning._replace(pipeline_dims=None)
+    monkeypatch.setattr("bionemo_ir.dsl_kernels.triton.fused_ln_proj_moveaxis_pad._streaming_tuning", lambda _: tuning)
+    torch.manual_seed(5)
+    weight_dtype = torch.float32 if fp32_projection else dtype
+    z = torch.randn(2, tokens, tokens, dim_d, device="cuda", dtype=dtype)
+    ln_weight = (1 + 0.2 * torch.randn(dim_d, device="cuda")).to(weight_dtype)
+    proj_weight = (torch.randn(heads, dim_d, device="cuda") * dim_d**-0.5).to(weight_dtype)
+    op = FusedLNProjMoveaxisPad(D=dim_d, H=heads, dtype=dtype, rms_norm=True, fp32_projection=fp32_projection)
+
+    tile_j, num_warps, stages = tuning.pipelined
+    variant = "bionemo_ir.dsl_kernels.triton.fused_ln_proj_moveaxis_pad._streaming_variant"
+    monkeypatch.setattr(variant, lambda *_: (tile_j, num_warps, stages))
+    pipelined = op(z, ln_weight, None, proj_weight, multiple=multiple)
+    monkeypatch.setattr(variant, lambda *_: (tile_j, num_warps, 1))
+    unrolled = op(z, ln_weight, None, proj_weight, multiple=multiple)
+    assert torch.equal(pipelined, unrolled)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("pipelined", [False, True], ids=["unrolled", "pipelined"])
+@pytest.mark.parametrize(("batch", "tokens", "multiple"), [(1, 37, 8), (2, 136, -1)], ids=["j37", "unpadded-b2"])
+def test_streaming_rmsnorm_leaves_row_sums_without_changing_the_bias(
+    batch: int, tokens: int, multiple: int, pipelined: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``row_sumsq`` receives every row's sum of squares, and asking for it leaves the bias's bits alone."""
+    tuning = _streaming_tuning(torch.device("cuda"))
+    if pipelined and tuning.pipelined is None:
+        pytest.skip("no pipelined streaming variant on this GPU")
+    tile = tuning.pipelined if pipelined else (*tuning.tiles[0], 1)
+    monkeypatch.setattr("bionemo_ir.dsl_kernels.triton.fused_ln_proj_moveaxis_pad._streaming_variant", lambda *_: tile)
+    torch.manual_seed(11)
+    dim_d, heads = 384, 12
+    z = torch.randn(batch, tokens, tokens, dim_d, device="cuda", dtype=torch.bfloat16) * 3
+    z[0, 0, 0] = 0
+    ln_weight = torch.ones(dim_d, device="cuda")
+    proj_weight = torch.randn(heads, dim_d, device="cuda") * dim_d**-0.5
+    op = FusedLNProjMoveaxisPad(D=dim_d, H=heads, rms_norm=True, fp32_projection=True)
+
+    row_sumsq = torch.full((batch, tokens, tokens), float("nan"), device="cuda")
+    bias = op(z, ln_weight, None, proj_weight, multiple=multiple, row_sumsq=row_sumsq)
+    assert torch.equal(bias, op(z, ln_weight, None, proj_weight, multiple=multiple))
+    torch.testing.assert_close(row_sumsq.double(), z.double().square().sum(-1), rtol=1e-6, atol=0)
+    assert row_sumsq[0, 0, 0] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("call", ["layer norm", "fp32 input", "short buffer", "bf16 buffer", "split fallback"])
+def test_row_sums_need_a_streaming_rmsnorm_call_and_a_matching_buffer(call: str) -> None:
+    """Only the streaming RMSNorm kernel forms the sums; any other call, or a buffer that does not fit, raises."""
+    z = torch.randn(1, 8, 8, 128, device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
+    proj_weight = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16)
+    row_sumsq = torch.empty(1, 8, 8, device="cuda")
+    rms = FusedLNProjMoveaxisPad(D=128, H=4, rms_norm=True)
+    layer_norm = FusedLNProjMoveaxisPad(D=128, H=4)
+    calls = {
+        "layer norm": lambda: layer_norm(z, weight, torch.zeros_like(weight), proj_weight, row_sumsq=row_sumsq),
+        "fp32 input": lambda: rms(z.float(), weight.float(), None, proj_weight.float(), row_sumsq=row_sumsq),
+        "short buffer": lambda: rms(z, weight, None, proj_weight, row_sumsq=row_sumsq[..., :7]),
+        "bf16 buffer": lambda: rms(z, weight, None, proj_weight, row_sumsq=row_sumsq.bfloat16()),
+        "split fallback": lambda: LNProjMoveaxisPad(D=128, H=4, rms_norm=True)(
+            z.transpose(1, 2), weight, None, proj_weight, row_sumsq=row_sumsq
+        ),
+    }
+    with pytest.raises(ValueError, match="row_sumsq"):
+        calls[call]()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_rmsnorm_calls_from_the_row_threshold_take_the_pipelined_variant() -> None:
+    """Below the threshold a call is bound by per-tile latency and keeps the unpipelined tile that pads J least, as
+    LayerNorm calls always do."""
+    device = torch.device("cuda")
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    tuning = _StreamingTuning(
+        tiles=((64, 4), (128, 8)), programs_per_sm=4, pipelined=(64, 4, 3), pipeline_min_rows_per_sm=512
+    )
+    assert _streaming_variant(512 * sms, 208, device, tuning, rms_norm=True) == (64, 4, 3)
+    assert _streaming_variant(512 * sms - 1, 208, device, tuning, rms_norm=True) == (128, 8, 1)
+    assert _streaming_variant(512 * sms - 1, 400, device, tuning, rms_norm=True) == (64, 4, 1)
+    assert _streaming_variant(512 * sms, 208, device, tuning, rms_norm=False) == (128, 8, 1)
+
+
+class _CompiledStub:
+    """The parts of a compiled kernel ``_resident_programs`` reads."""
+
+    def __init__(self, n_regs: int, shared: int) -> None:
+        self.compiled = SimpleNamespace(n_regs=n_regs, metadata=SimpleNamespace(shared=shared))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("n_regs", "num_warps", "shared", "resident", "per_sm"),
+    [(134, 4, 12288, 3, 3), (85, 4, 10240, 5, 4), (128, 8, 20480, 2, 4)],
+    ids=["three-fit", "all-fit", "two-whole-waves"],
+)
+def test_streaming_grid_runs_whole_waves(n_regs: int, num_warps: int, shared: int, resident: int, per_sm: int) -> None:
+    """Registers bound these variants, and the persistent grid of 4 programs per SM rounds down to whole waves of
+    those an SM holds: with 3 resident, a fourth would run alone on each SM after the others finish."""
+    assert _resident_programs(_CompiledStub(n_regs, shared), num_warps) == resident
+    device = torch.device("cuda")
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    assert _streaming_grid(device, 1 << 30, 4, resident) == per_sm * sms
+    assert _streaming_grid(device, 7, 4, resident) == 7
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_unpadded_pair_bias_takes_the_streaming_kernel() -> None:
+    """``pad_multiple < 0`` (the SDPA layout) uses the fused kernel when it streams."""
+    torch.manual_seed(0)
+    dim_d, heads, tokens = 256, 12, 45
+    z = torch.randn(2, tokens, tokens, dim_d, device="cuda", dtype=torch.bfloat16)
+    norm = torch.nn.LayerNorm(dim_d, device="cuda")
+    projection = torch.nn.Linear(dim_d, heads, bias=False, device="cuda", dtype=torch.bfloat16)
+    op = LNProjMoveaxisPad(D=dim_d, H=heads)
+
+    calls = []
+    fused = op._fused_kernel
+    original_call = type(fused).__call__
+    type(fused).__call__ = lambda self, *args, **kwargs: calls.append(kwargs) or original_call(self, *args, **kwargs)
+    try:
+        actual = op(z, norm.weight, norm.bias, projection.weight, pad_multiple=-1, proj_z=projection)
+    finally:
+        type(fused).__call__ = original_call
+
+    assert calls == [{"multiple": -1, "row_sumsq": None}]
+    expected = _ln_proj_moveaxis_pad_reference(z, norm.weight, norm.bias, projection.weight, tokens)
+    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_float16_op_streams_after_a_bfloat16_op_of_the_same_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The streaming cache keys on the dtypes it compiled, so a bfloat16 op cannot strand a float16 one."""
+    monkeypatch.setattr(FusedLNProjMoveaxisPad, "_global_cache", {})
+    FusedLNProjMoveaxisPad(D=128, H=4, dtype=torch.bfloat16)
+    op = FusedLNProjMoveaxisPad(D=128, H=4, dtype=torch.float16)
+    assert op.streams(torch.float16)
+    tile_j, _, stages = _streaming_variant(128 * 128, 128, torch.device("cuda"), op._streaming_tuning, False, 128)
+    assert (torch.float16, tile_j, stages) in op._streaming_kernels
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("dim_d", "heads", "rms_norm", "norm_dtype"),
+    [
+        pytest.param(196, 4, False, torch.float32, id="layernorm-d196-mixed"),
+        pytest.param(384, 12, True, torch.bfloat16, id="rmsnorm-d384-velocity"),
+    ],
+)
+def test_fused_ln_projection_supports_non_power_of_two_feature_dims(
+    dim_d: int,
+    heads: int,
+    rms_norm: bool,
+    norm_dtype: torch.dtype,
+) -> None:
+    """Padded reduction lanes and the final partial K tile must not affect output."""
+    tokens = 19
+    torch.manual_seed(123)
+    z = torch.randn(1, tokens, tokens, dim_d, device="cuda", dtype=torch.bfloat16)
+    ln_weight = torch.randn(dim_d, device="cuda", dtype=norm_dtype)
+    ln_bias = None if rms_norm else torch.randn(dim_d, device="cuda", dtype=norm_dtype)
+    proj_weight = torch.randn(heads, dim_d, device="cuda", dtype=z.dtype) * 0.05
+
+    op = FusedLNProjMoveaxisPad(D=dim_d, H=heads, dtype=z.dtype, rms_norm=rms_norm)
+    actual = op(z, ln_weight, ln_bias, proj_weight, multiple=8)
+    torch.cuda.synchronize()
+
+    if rms_norm:
+        normalized = F.rms_norm(z.float(), [dim_d], ln_weight.float(), eps=1e-5)
+    else:
+        assert ln_bias is not None
+        normalized = F.layer_norm(z.float(), [dim_d], ln_weight.float(), ln_bias.float(), eps=1e-5)
+    expected = F.linear(normalized, proj_weight.float()).movedim(-1, -3)
+    expected = F.pad(expected, (0, actual.shape[-1] - tokens))
+
+    assert torch.count_nonzero(actual[..., tokens:]) == 0
+    torch.testing.assert_close(actual.float(), expected, rtol=0.05, atol=0.05)
+
+
+# 30 and 42 are the Boltz-2 token counts that crashed, neither a multiple of 16.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("num_tokens", [30, 42, 199, 256])
+def test_cached_cubin_is_correct_for_shapes_it_was_not_compiled_with(num_tokens: int) -> None:
+    """Regression: launching the cached CUBIN must not depend on the dummy shapes.
+
+    Compiles from ``_make_dummy_args``, where every scalar is a multiple of 16, then
+    launches that CUBIN with real token counts as ``DriverLauncher`` does. Before
+    ``do_not_specialize`` this produced wrong values and NaNs from out-of-bounds reads.
+    """
+    pytest.importorskip("cuda.bindings.driver")
+    dim_d, heads, tile_j, heads_per_blk = 128, 16, 32, 16
+    constexprs = {
+        "TILE_J": tile_j,
+        "TILE_K": 128,
+        "BLOCK_D": dim_d,
+        "DIM_D": dim_d,
+        "NUM_HEADS": heads,
+        "HEADS_PER_BLK": heads_per_blk,
+        "EPS": 1e-5,
+        "ELEMENTWISE_AFFINE": True,
+        "RMS_NORM": False,
+    }
+    torch.manual_seed(0)
+    ln_weight = torch.randn(dim_d, device="cuda", dtype=torch.bfloat16)
+    ln_bias = torch.randn(dim_d, device="cuda", dtype=torch.bfloat16)
+    proj_weight = torch.randn(heads, dim_d, device="cuda", dtype=torch.bfloat16) * 0.05
+
+    op = FusedLNProjMoveaxisPad(D=dim_d, H=heads, dtype=torch.bfloat16)
+    dummy_z = torch.empty(1, 2, tile_j, dim_d, device="cuda", dtype=torch.bfloat16)
+    dummy_out = torch.empty(1, heads, 2, tile_j, device="cuda", dtype=torch.bfloat16)
+    compiled = _fused_ln_proj_moveaxis_pad_kernel[(1, 2, 1)](
+        dummy_z,
+        ln_weight,
+        ln_bias,
+        proj_weight,
+        dummy_out,
+        *op._make_dummy_args(torch.bfloat16)[5:],
+        **constexprs,
+    )
+    torch.cuda.synchronize()
+    launcher = make_driver_launcher(compiled)
+    assert launcher is not None
+
+    j_padded = ((num_tokens + 7) // 8) * 8
+    z = torch.randn(1, num_tokens, num_tokens, dim_d, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(1, heads, num_tokens, j_padded, device="cuda", dtype=torch.bfloat16)
+    values = [
+        z.data_ptr(),
+        ln_weight.data_ptr(),
+        ln_bias.data_ptr(),
+        proj_weight.data_ptr(),
+        out.data_ptr(),
+        num_tokens,
+        j_padded,
+        *z.stride()[:3],
+        *out.stride()[:3],
+    ]
+    # Triton appends scratch pointers after the declared arguments; they stay NULL.
+    launcher.launch_with(values, triton.cdiv(j_padded, tile_j), num_tokens, triton.cdiv(heads, heads_per_blk))
+    torch.cuda.synchronize()
+
+    expected = _ln_proj_moveaxis_pad_reference(z, ln_weight, ln_bias, proj_weight, j_padded)
+    assert not torch.isnan(out).any()
+    torch.testing.assert_close(out.float(), expected, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("heads", [3, 4, 6, 13, 16])
+def test_moveaxis_pad_masks_the_head_axis(heads: int) -> None:
+    """Regression: BLOCK_H rounds H up to a power of two, so h needs a mask.
+
+    Without one the kernel stores ``(BLOCK_H - H) * I * J_padded`` elements past the
+    output, which a canary allocated right behind it catches.
+    """
+    tokens_i, tokens_j = 8, 30
+    j_padded = ((tokens_j + 7) // 8) * 8
+    n_out = heads * tokens_i * j_padded
+
+    op = MoveaxisPad(H=heads, dtype=torch.bfloat16)
+    torch.manual_seed(0)
+    x = torch.randn(1, tokens_i, tokens_j, heads, device="cuda", dtype=torch.bfloat16)
+
+    arena = torch.full((n_out * 4,), 7.0, device="cuda", dtype=torch.bfloat16)
+    canary_before = arena[n_out:].clone()
+
+    real_empty = torch.empty
+
+    def fake_empty(*size, **kwargs):
+        if len(size) == 1 and isinstance(size[0], (tuple, list)):
+            size = tuple(size[0])
+        if size == (1, heads, tokens_i, j_padded):
+            return arena[:n_out].view(1, heads, tokens_i, j_padded)
+        return real_empty(*size, **kwargs)
+
+    torch.empty = fake_empty
+    try:
+        actual = op(x, multiple=8)
+    finally:
+        torch.empty = real_empty
+    torch.cuda.synchronize()
+
+    assert torch.equal(arena[n_out:], canary_before), "kernel wrote past the end of the output"
+    expected = F.pad(x.movedim(-1, -3), (0, j_padded - tokens_j))
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("transposed", [False, True])
+@pytest.mark.parametrize("offset", [512, 3], ids=["aligned", "misaligned"])
+def test_moveaxis_pad_reads_head_slices_of_a_wider_projection(transposed: bool, offset: int) -> None:
+    heads, tokens, width = 4, 30, 544
+    op = MoveaxisPad(H=heads, dtype=torch.bfloat16)
+    torch.manual_seed(0)
+    projection = torch.randn(1, tokens, tokens, width, device="cuda", dtype=torch.bfloat16)
+    x = projection[..., offset : offset + heads]
+    if transposed:
+        x = x.transpose(1, 2)
+
+    expected = F.pad(x.contiguous().movedim(-1, -3), (0, 32 - tokens))
+    assert torch.equal(op(x, multiple=8), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_moveaxis_pad_rejects_more_heads_than_compiled_for() -> None:
+    op = MoveaxisPad(H=4, dtype=torch.bfloat16)
+    too_many = torch.randn(1, 8, 30, 8, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="heads"):
+        op(too_many, multiple=8)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda: MoveaxisPad(H=4, dtype=torch.bfloat16), id="moveaxis_pad"),
+        pytest.param(lambda: FusedSwiGLU(d=128, three_way=False, dtype=torch.bfloat16), id="fused_swiglu"),
+        pytest.param(lambda: FusedLNProjMoveaxisPad(D=128, H=4, dtype=torch.bfloat16), id="fused_ln_proj"),
+        pytest.param(
+            lambda: LNPairBias(128, 4, dtype=torch.bfloat16),
+            id="ln_pair_bias",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+                reason="LNPairBias compiles only on SM80+",
+            ),
+        ),
+    ],
+)
+def test_compilation_does_not_launch_on_dummy_tensors(
+    monkeypatch: pytest.MonkeyPatch, build: Callable[[], TritonKernelCache]
+) -> None:
+    """Regression: a compile-time launch reads the ``torch.empty`` dummies, which
+    compute-sanitizer initcheck reports as uninitialized global reads.
+
+    Every tensor dummy is filled with a distinct value; a launch would overwrite the
+    output dummy with values computed from the inputs. The grid handed to the
+    cold-cache warmup subprocess stays empty too.
+    """
+    for cls in (MoveaxisPad, FusedSwiGLU, FusedLNProjMoveaxisPad, LNPairBias):
+        monkeypatch.setattr(cls, "_global_cache", {})
+    dummies: list[tuple[torch.Tensor, torch.Tensor]] = []
+    compile_for_dtypes = TritonKernelCache.compile_for_dtypes
+
+    def recording(
+        self: TritonKernelCache,
+        jit_fn: object,
+        dtypes: list[torch.dtype],
+        make_dummy_args: Callable[[torch.dtype], tuple],
+        **kwargs: object,
+    ) -> dict[torch.dtype, CachedKernel]:
+        def make(dtype: torch.dtype) -> tuple:
+            args = make_dummy_args(dtype)
+            tensors = [arg for arg in args if isinstance(arg, torch.Tensor)]
+            for value, tensor in enumerate(tensors, start=1):
+                tensor.fill_(value)
+            # Snapshot after every fill: LNPairBias passes one dummy as both LayerNorm weight and bias.
+            dummies.extend((tensor, tensor.clone()) for tensor in tensors)
+            return args
+
+        return compile_for_dtypes(self, jit_fn, dtypes, make, **kwargs)
+
+    monkeypatch.setattr(TritonKernelCache, "compile_for_dtypes", recording)
+    # Take the cold-cache path without spawning it; record the grid the warmup subprocess would get.
+    warmup_grids: list[tuple[int, ...]] = []
+    monkeypatch.setattr("bionemo_ir.dsl_kernels.triton_cache._triton_cache_was_cold", lambda: True)
+    monkeypatch.setattr(
+        "bionemo_ir.dsl_kernels.triton_cache._compile_in_subprocess",
+        lambda jit_fn, dummy_args_by_dtype, grid, constexpr_kwargs: warmup_grids.append(grid),
+    )
+    # No compiler worker: each cold configuration takes the one-shot path recorded above, with the same grid.
+    monkeypatch.setattr("bionemo_ir.dsl_kernels.triton_cache._CompilerPool.submit", lambda self, job: None)
+    build()
+    torch.cuda.synchronize()
+
+    assert dummies, "nothing was compiled"
+    for tensor, snapshot in dummies:
+        assert torch.equal(tensor, snapshot), "compilation launched a kernel on its dummy tensors"
+    assert warmup_grids and all(0 in grid for grid in warmup_grids), "the warmup subprocess would launch"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("use_driver", [False, True])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("strided", [False, True])
+def test_atom_cache_reuses_shapes(
+    monkeypatch: pytest.MonkeyPatch, use_driver: bool, index_dtype: torch.dtype, strided: bool
+) -> None:
+    def reject_compile(*args: object, **kwargs: object) -> None:
+        pytest.fail("Atom reduction recompiled for a new shape")
+
+    # Strided channels force scalar accesses; contiguous rows use 16-byte vectors.
+    vector = 1 if strided else 4
+    for max_slots in (8, 16, 32):
+        kernel = _cached_reduction(
+            torch.cuda.current_device(), (torch.float32, index_dtype, torch.bool, torch.int64), max_slots, vector
+        )
+        if use_driver:
+            if not _DRIVER_TRITON_OK:
+                pytest.skip("Unsupported Triton driver ABI")
+            assert kernel.driver is not None
+        else:
+            monkeypatch.setattr(kernel, "_driver", None)
+    monkeypatch.setattr(_reduce_atom_slots, "run", reject_compile)
+    monkeypatch.setattr(_AtomReduction, "__init__", reject_compile)
+
+    torch.manual_seed(7)
+    shapes = [(1, 1, 1, 1, 4), (2, 3, 5, 31, 132), (3, 2, 7, 3, 16), (1, 5, 9, 14, 768), (2, 1, 4, 25, 8)]
+    for batch, samples, tokens, slots, channels in shapes:
+        atoms = tokens * slots
+        features = torch.randn(batch, samples, atoms, channels * (1 + strided), device="cuda")[..., :: 1 + strided]
+        indices = torch.arange(atoms, device="cuda", dtype=index_dtype).reshape(1, 1, atoms).expand(batch, -1, -1)
+        valid = torch.rand(batch, 1, tokens, slots, device="cuda") > 0.25
+        valid[..., 0, :] = False
+        counts = valid.sum(-1)
+        expected = torch.zeros(batch, samples, tokens, channels, device="cuda")
+        packed = features.reshape(batch, samples, tokens, slots, channels)
+        for slot in range(slots):
+            expected += torch.where(valid[..., slot, None], packed[..., slot, :], 0.0)
+        expected /= counts[..., None] + 1e-6
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            actual = reduce_atom_slots(features, indices, valid, counts, tokens, 1e-6)
+        torch.cuda.current_stream().wait_stream(stream)
+        assert torch.equal(actual, expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = reduce_atom_slots(features, indices, valid, counts, tokens, 1e-6)
+        features.mul_(2)
+        graph.replay()
+        assert torch.equal(captured, expected * 2)
+
+
+@pytest.fixture
+def warm_specs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    """Specs the warm subprocess receives, against an empty Triton cache."""
+    from bionemo_ir.dsl_kernels import triton_cache
+
+    monkeypatch.setattr(triton_cache, "TRITON_CACHE_DIR", str(tmp_path))
+    specs = []
+
+    def capture(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        specs.append(json.loads(Path(command[-1]).read_text()))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", capture)
+    return specs
+
+
+def test_subprocess_warmup_keeps_float_scalars(warm_specs: list[dict]) -> None:
+    """A float dummy argument must reach the subprocess as fp32, not an i32 variant."""
+    _compile_in_subprocess(_add_n_kernel, {torch.float32: (torch.empty(1), 0.0, 3)}, (1,), {"BLOCK": 16})
+
+    (variant,) = warm_specs[0]["variants"]
+    assert variant[1:] == [{"type": "float", "value": 0.0}, {"type": "int", "value": 3}]
+    assert isinstance(variant[1]["value"], float)
+
+
+@pytest.mark.parametrize("epsilon", [1e-5, -0.5, 1.0])
+def test_subprocess_warmup_keeps_constexpr_types(epsilon: float, warm_specs: list[dict]) -> None:
+    constexprs = {"EPS": epsilon, "BLOCK": 16, "ENABLED": True}
+    _compile_in_subprocess(_add_n_kernel, {torch.float32: (torch.empty(1), 0)}, (1,), constexprs)
+
+    actual = warm_specs[0]["constexpr_kwargs"]
+    assert actual == constexprs
+    assert {name: type(value) for name, value in actual.items()} == {
+        name: type(value) for name, value in constexprs.items()
+    }
+
+
+def test_subprocess_warmup_runs_once_per_config(warm_specs: list[dict]) -> None:
+    """Processes sharing a Triton cache warm each config once."""
+    for block in (16, 16, 32):
+        _compile_in_subprocess(_add_n_kernel, {torch.float32: (torch.empty(1), 0)}, (1,), {"BLOCK": block})
+
+    assert [spec["constexpr_kwargs"]["BLOCK"] for spec in warm_specs] == [16, 32]
+
+
+@triton.jit
+def _constexpr_float_kernel(dst_ptr, EPS: tl.constexpr, BLOCK: tl.constexpr, ENABLED: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    if ENABLED:
+        tl.store(dst_ptr + offsets, offsets.to(tl.float32) + EPS)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_subprocess_float_constexpr_reuses_disk_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from bionemo_ir.dsl_kernels import triton_cache
+
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(triton_cache, "TRITON_CACHE_DIR", str(tmp_path))
+    output = torch.empty(16, device="cuda")
+    constexprs = {"EPS": 1e-5, "BLOCK": 16, "ENABLED": True}
+    _compile_in_subprocess(_constexpr_float_kernel, {torch.float32: (output,)}, (1,), constexprs)
+    warmed = sorted(tmp_path.rglob("*.cubin"))
+    assert len(warmed) == 1
+
+    _constexpr_float_kernel[(1,)](output, **constexprs)
+    torch.cuda.synchronize()
+
+    assert sorted(tmp_path.rglob("*.cubin")) == warmed
+    torch.testing.assert_close(output, torch.arange(16, device="cuda", dtype=torch.float32) + 1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_session_worker_compiles_each_config_itself(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One real session worker compiles two configurations from dtype placeholders; this process only loads them."""
+    from bionemo_ir.dsl_kernels import triton_cache
+
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(triton_cache, "TRITON_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(triton_cache, "_triton_cache_was_cold", lambda: True)
+    monkeypatch.setattr(triton_cache, "_session_worker_limit", lambda: 1)
+
+    def one_shot(*args: object) -> None:
+        pytest.fail("the session worker must compile every configuration itself")
+
+    monkeypatch.setattr(triton_cache, "_run_warm_subprocess", one_shot)
+    outputs = {block: torch.empty(block, device="cuda") for block in (16, 32)}
+    kernels = {}
+    with triton_cache.triton_warmup_session():
+        for block, output in outputs.items():
+            (kernels[block],) = (
+                TritonKernelCache()
+                .compile_for_dtypes(
+                    _constexpr_float_kernel,
+                    [torch.float32],
+                    lambda dtype, output=output: (output,),
+                    EPS=1e-5,
+                    BLOCK=block,
+                    ENABLED=True,
+                )
+                .values()
+            )
+            assert type(kernels[block]) is not CachedKernel
+        pool = triton_cache._warm_session.pool
+    assert len(pool._processes) == 1
+    assert [job.outcome for job in pool._jobs.values()] == [triton_cache._WARMED] * 2
+    warmed = sorted(tmp_path.rglob("*.cubin"))
+    assert len(warmed) == 2
+
+    for block, output in outputs.items():
+        assert type(kernels[block]) is CachedKernel
+        # The direct launcher exists only on the Triton versions its ABI supports.
+        assert (kernels[block].driver is not None) == _DRIVER_TRITON_OK
+        _constexpr_float_kernel[(1,)](output, EPS=1e-5, BLOCK=block, ENABLED=True)
+    torch.cuda.synchronize()
+
+    assert sorted(tmp_path.rglob("*.cubin")) == warmed
+    for block, output in outputs.items():
+        torch.testing.assert_close(output, torch.arange(block, device="cuda", dtype=torch.float32) + 1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compiler_process_never_initializes_cuda(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The compiler process takes the parent's target and so leaves CUDA, and the parent's GPU, alone."""
+    from bionemo_ir.dsl_kernels import triton_cache
+
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(triton_cache, "TRITON_CACHE_DIR", str(tmp_path))
+    check = (
+        "import ctypes\n"
+        "count = ctypes.c_int()\n"
+        "# CUDA_ERROR_NOT_INITIALIZED: nothing in this process called cuInit.\n"
+        "assert ctypes.CDLL('libcuda.so.1').cuDeviceGetCount(ctypes.byref(count)) == 3\n"
+    )
+    monkeypatch.setattr(triton_cache, "_SUBPROCESS_SCRIPT", triton_cache._SUBPROCESS_SCRIPT + check)
+    # A kernel whose module, unlike this test module, initializes nothing on import.
+    op = MoveaxisPad.__new__(MoveaxisPad)
+    op._block_j, op._block_h = 128, 4
+    dummy_args = op._make_dummy_args(torch.bfloat16)
+    _compile_in_subprocess(_moveaxis_pad_kernel, {torch.bfloat16: dummy_args}, (0,), {"BLOCK_J": 128, "BLOCK_H": 4})
+
+    assert len(list(tmp_path.rglob("*.cubin"))) == 1
+    # The marker records a process that exited cleanly, past the check.
+    assert len([path for path in (tmp_path / "bioir_warm").iterdir() if path.suffix != ".lock"]) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_atom_offset_views() -> None:
+    features = torch.randn(1, 2, 6, 129, device="cuda")[..., 1:]
+    indices = torch.arange(7, device="cuda")[1:].sub_(1).reshape(1, 1, 6)
+    valid = torch.ones(7, dtype=torch.bool, device="cuda")[1:].reshape(1, 1, 2, 3)
+    counts = valid.sum(-1)
+    actual = reduce_atom_slots(features, indices, valid, counts, 2, 1e-9)
+    expected = reduce_atom_slots(features.contiguous(), indices.clone(), valid.clone(), counts, 2, 1e-9)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("shape", [(0, 2, 6, 128), (1, 0, 6, 128), (1, 2, 6, 0)])
+def test_atom_empty_features(shape: tuple[int, ...]) -> None:
+    features = torch.empty(shape, device="cuda")
+    indices = torch.arange(6, device="cuda").reshape(1, 1, 6).expand(shape[0], -1, -1)
+    valid = torch.ones(shape[0], 1, 2, 3, dtype=torch.bool, device="cuda")
+    actual = reduce_atom_slots(features, indices, valid, valid.sum(-1), 2, 1e-9)
+    assert actual.shape == (*shape[:2], 2, shape[-1])
+    assert actual.numel() == 0
+
+
+def _run_in_threads(*workers: Callable[[], None]) -> None:
+    """Run each worker on a fresh thread and re-raise its exception."""
+    with ThreadPoolExecutor(len(workers)) as pool:
+        for future in [pool.submit(worker) for worker in workers]:
+            future.result()
+
+
+def _quaternion_reference(quaternions: torch.Tensor) -> torch.Tensor:
+    r, i, j, k = torch.unbind(quaternions, -1)
+    return _quaternion_components_to_matrix(r, i, j, k, 2.0 / (quaternions * quaternions).sum(-1))
+
+
+# Each case returns the shared kernel, a launch closure and its expected output.
+# Shapes match across seeds so a racing launch stays in bounds.
+_ThreadCase = tuple[CachedKernel, Callable[[], torch.Tensor], torch.Tensor]
+
+
+def _churn_thread_case(seed: int) -> _ThreadCase:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    x, noise = (torch.randn(4096, device="cuda", generator=generator) for _ in range(2))
+    levels = torch.tensor([1.0 + seed, 2.0 + 2 * seed], device="cuda")
+    scale = 1.0 + 0.1 * seed
+    expected = x + (scale * torch.sqrt(levels[1] * levels[1] - levels[0] * levels[0])) * noise
+    kernel = _churn_kernel(torch.cuda.current_device()).kernel
+    return kernel, lambda: churn_update(x, noise, levels[0], levels[1], scale), expected
+
+
+def _quaternion_thread_case(seed: int) -> _ThreadCase:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    quaternions = torch.randn(1000, 4, device="cuda", generator=generator)
+    kernel = _quaternion_rotation_kernel(torch.cuda.current_device()).kernel
+    return kernel, lambda: quaternion_matrix(quaternions), _quaternion_reference(quaternions)
+
+
+def _moveaxis_pad_thread_case(seed: int) -> _ThreadCase:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(2, 8, 30, 4, device="cuda", dtype=torch.bfloat16, generator=generator)
+    expected = F.pad(x.movedim(-1, -3), (0, 2))
+    op = MoveaxisPad(H=4, dtype=torch.bfloat16)
+    return op._kernels[torch.bfloat16], lambda: op(x, multiple=8), expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_driver_path
+@pytest.mark.parametrize(
+    "make_case",
+    [_churn_thread_case, _quaternion_thread_case, _moveaxis_pad_thread_case],
+    ids=["churn", "quaternion", "moveaxis_pad"],
+)
+def test_shared_launcher_keeps_thread_arguments(make_case: Callable[[int], _ThreadCase]) -> None:
+    """Threads sharing one ``DriverLauncher`` must launch with their own arguments."""
+    threads, iterations = 4, 200
+    cases = [make_case(seed) for seed in range(threads)]
+    if any(kernel.driver is None for kernel, _, _ in cases):
+        pytest.skip("CUDA driver launcher unavailable")
+    assert len({id(kernel.driver) for kernel, _, _ in cases}) == 1, "cases must share one launcher"
+    main = torch.cuda.current_stream()
+    torch.cuda.synchronize()
+    results: list[list[torch.Tensor]] = [[] for _ in range(threads)]
+    barrier = threading.Barrier(threads, timeout=30)
+
+    def worker(index: int) -> None:
+        _, run, _ = cases[index]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(main)
+        with torch.cuda.stream(stream):
+            barrier.wait()
+            for _ in range(iterations):
+                results[index].append(run())
+        stream.synchronize()
+
+    interval = sys.getswitchinterval()
+    # Frequent GIL hand-offs land inside the write-then-launch window.
+    sys.setswitchinterval(1e-6)
+    try:
+        _run_in_threads(*(partial(worker, index) for index in range(threads)))
+    finally:
+        sys.setswitchinterval(interval)
+    for (_, _, expected), outputs in zip(cases, results, strict=True):
+        assert len(outputs) == iterations
+        for actual in outputs:
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_driver_path
+def test_driver_launch_binds_context_on_fresh_thread() -> None:
+    """A thread whose only CUDA work is reading pointers can still launch."""
+    kernel = _quaternion_rotation_kernel(torch.cuda.current_device()).kernel
+    if kernel.driver is None:
+        pytest.skip("CUDA driver launcher unavailable")
+    quaternions = torch.randn(129, 4, device="cuda")
+    output = torch.empty(129, 3, 3, device="cuda")
+    expected = _quaternion_reference(quaternions)
+    torch.cuda.synchronize()
+
+    def worker() -> None:
+        kernel.driver.launch_with((quaternions.data_ptr(), output.data_ptr(), 129), triton.cdiv(129, 128))
+
+    _run_in_threads(worker)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_driver_path
+def test_driver_launch_rejects_extra_values() -> None:
+    """Values beyond the kernel's parameters are an error, not silently dropped."""
+    kernel = _quaternion_rotation_kernel(torch.cuda.current_device()).kernel
+    if kernel.driver is None:
+        pytest.skip("CUDA driver launcher unavailable")
+    with pytest.raises(ValueError, match="params"):
+        kernel.driver.launch_with((0,) * (len(kernel.driver.params) + 1), 1)

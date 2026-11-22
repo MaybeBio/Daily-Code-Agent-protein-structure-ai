@@ -1,0 +1,5799 @@
+# Page: Overview
+
+# Overview
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [ani-amber-logo-dark.png](ani-amber-logo-dark.png)
+- [ani-amber-logo-light.png](ani-amber-logo-light.png)
+- [jit/jit.py](jit/jit.py)
+- [jit/make_bulk.py](jit/make_bulk.py)
+- [src/torchani.cpp](src/torchani.cpp)
+
+</details>
+
+
+
+## Purpose and Scope
+
+TorchANI-Amber is a high-performance interface that integrates neural network potentials from the ANI family with the Amber molecular dynamics simulation suite. This system enables both full machine learning (ML) simulations where the entire potential energy surface is computed by neural networks, and hybrid ML/MM simulations where quantum mechanical regions are handled by neural networks while molecular mechanical regions use classical force fields.
+
+This document provides a technical overview of the system architecture, core components, and integration mechanisms. For detailed installation instructions, see [Installation and Build](#2.1). For simulation configuration details, see [Simulation Configuration](#4.1). For performance testing information, see [Benchmarking System](#5).
+
+## System Architecture
+
+The following diagram illustrates the overall system architecture, showing how the various components interact during runtime:
+
+```mermaid
+graph TB
+    subgraph "Build System"
+        CMAKE["CMakeLists.txt<br/>Build Configuration"]
+        JIT_PY["jit/jit.py<br/>Model Compilation"]
+        MODELS["Pre-trained Models<br/>ANI1x, ANI2x, AimNet2"]
+    end
+    
+    subgraph "Core Runtime Engine"
+        TORCHANI_CPP["torchani.cpp<br/>C++ Implementation"]
+        TORCHANI_H["torchani.h<br/>C API Interface"]
+        GLOBAL_CONFIG["GlobalConfig<br/>Device & Precision"]
+        JIT_MODELS["JIT Models<br/>.pt files"]
+    end
+    
+    subgraph "Amber Integration Layer"
+        TORCHANI_F90["torchani.F90<br/>Fortran Interface"]
+        EXTPOT["External Potential<br/>iextpot=1"]
+        QMMM["QM/MM Interface<br/>ifqnt=1"]
+        MDIN["mdin Configuration<br/>&ani namelist"]
+    end
+    
+    subgraph "MD Engines"
+        SANDER["sander<br/>Amber MD Engine"]
+        PMEMD["pmemd<br/>Amber MD Engine"]
+    end
+    
+    CMAKE --> JIT_PY
+    JIT_PY --> JIT_MODELS
+    MODELS --> JIT_MODELS
+    
+    JIT_MODELS --> TORCHANI_CPP
+    TORCHANI_CPP --> TORCHANI_H
+    GLOBAL_CONFIG --> TORCHANI_CPP
+    
+    TORCHANI_H --> TORCHANI_F90
+    MDIN --> EXTPOT
+    MDIN --> QMMM
+    
+    TORCHANI_F90 --> SANDER
+    EXTPOT --> SANDER
+    QMMM --> SANDER
+    EXTPOT --> PMEMD
+    TORCHANI_F90 --> PMEMD
+```
+
+**Sources:** [src/torchani.cpp:1-918](), [include/torchani.h](), [jit/jit.py:1-180](), [README.md:9-18]()
+
+## Core Runtime Components
+
+### C++ Computational Engine
+
+The core computational engine is implemented in `torchani.cpp` and provides the primary interface between Amber and PyTorch. Key global components include:
+
+| Component | Type | Purpose |
+|-----------|------|---------|
+| `model` | `torch::jit::Module` | Loaded JIT-compiled neural network model |
+| `torchani_atomic_numbers` | `torch::Tensor` | Atomic numbers tensor for the system |
+| `config` | `GlobalConfig` | Device, precision, and runtime configuration |
+| `torchani_builtin_models` | `std::vector<std::string>` | List of supported model names |
+
+The following diagram shows the data flow through the C++ engine:
+
+```mermaid
+flowchart LR
+    subgraph "Input Processing"
+        COORDS["coords_buf[][]<br/>Atomic Coordinates"]
+        ATOMIC_NUMS["atomic_nums[]<br/>Element Types"]
+        CELL["cell_buf[][]<br/>Unit Cell"]
+    end
+    
+    subgraph "Tensor Building"
+        DBL_BUF_TO_COORDS["dbl_buf_to_coords_tensor()"]
+        DBL_BUF_TO_CELL["dbl_buf_to_cell_tensor()"]
+        SETUP_INPUTS["setup_inputs_pbc()<br/>setup_inputs_nopbc()"]
+    end
+    
+    subgraph "Model Execution"
+        MODEL_FORWARD["model.forward()"]
+        JIT_IVALUE["torch::jit::IValue<br/>Output Tuple"]
+        VALIDATE["validate_model_output()"]
+    end
+    
+    subgraph "Output Processing"
+        CALC_FORCES["calculate_and_populate_forces()"]
+        POP_ENERGY["populate_potential_energy()"]
+        POP_CHARGES["populate_atomic_charges()"]
+    end
+    
+    COORDS --> DBL_BUF_TO_COORDS
+    ATOMIC_NUMS --> SETUP_INPUTS
+    CELL --> DBL_BUF_TO_CELL
+    
+    DBL_BUF_TO_COORDS --> SETUP_INPUTS
+    DBL_BUF_TO_CELL --> SETUP_INPUTS
+    SETUP_INPUTS --> MODEL_FORWARD
+    
+    MODEL_FORWARD --> JIT_IVALUE
+    JIT_IVALUE --> VALIDATE
+    VALIDATE --> CALC_FORCES
+    VALIDATE --> POP_ENERGY
+    VALIDATE --> POP_CHARGES
+```
+
+**Sources:** [src/torchani.cpp:22-70](), [src/torchani.cpp:372-563](), [include/build_tensors.h]()
+
+### Model Loading and JIT Compilation
+
+The system uses PyTorch's JIT compilation to convert Python models into optimized `.pt` files that can be loaded by the C++ runtime:
+
+```mermaid
+graph TD
+    subgraph "JIT Compilation Phase"
+        PYTHON_MODELS["Python ANI Models<br/>torchani.models.*"]
+        JIT_SCRIPT["torch.jit.script()"]
+        JIT_SAVE["torch.jit.save()"]
+        PT_FILES[".pt Model Files<br/>ani1x.pt, ani2x.pt"]
+    end
+    
+    subgraph "Runtime Loading"
+        TORCHANI_INIT["torchani_initialize()"]
+        JIT_LOAD["torch::jit::load()"]
+        MODEL_CONFIG["Model Configuration<br/>set_active_members()"]
+        DTYPE_CAST["model.to(config.dtype())"]
+    end
+    
+    PYTHON_MODELS --> JIT_SCRIPT
+    JIT_SCRIPT --> JIT_SAVE
+    JIT_SAVE --> PT_FILES
+    
+    PT_FILES --> TORCHANI_INIT
+    TORCHANI_INIT --> JIT_LOAD
+    JIT_LOAD --> MODEL_CONFIG
+    MODEL_CONFIG --> DTYPE_CAST
+```
+
+**Sources:** [jit/jit.py:76-93](), [src/torchani.cpp:485-558]()
+
+## Integration Workflows
+
+### Full-ML Simulation Workflow
+
+For simulations where the entire system potential is computed by neural networks:
+
+```mermaid
+sequenceDiagram
+    participant AMBER as "Amber (sander/pmemd)"
+    participant EXTPOT as "External Potential"
+    participant TORCHANI as "torchani_calc_energy_force()"
+    participant MODEL as "torch::jit::Module"
+    
+    AMBER->>EXTPOT: "Coordinates + Configuration"
+    EXTPOT->>TORCHANI: "torchani_calc_energy_force()"
+    TORCHANI->>MODEL: "setup_inputs_pbc() + model.forward()"
+    MODEL->>TORCHANI: "Energy + Forces Tensors"
+    TORCHANI->>EXTPOT: "Forces + Potential Energy"
+    EXTPOT->>AMBER: "Energy/Force Values"
+```
+
+**Sources:** [src/torchani.cpp:645-702](), [README.md:116-169]()
+
+### ML/MM Simulation Workflow
+
+For hybrid simulations with quantum and classical regions:
+
+```mermaid
+sequenceDiagram
+    participant AMBER as "Amber sander"
+    participant QMMM as "QM/MM Interface"
+    participant TORCHANI as "torchani_energy_force_with_coupling()"
+    participant ELECTRO as "electro.h (Coupling)"
+    
+    AMBER->>QMMM: "QM Region + MM Environment"
+    QMMM->>TORCHANI: "QM coords + MM charges"
+    TORCHANI->>TORCHANI: "ene_pot_invacuo = model.forward()"
+    TORCHANI->>ELECTRO: "coulombic_embedding_energy()"
+    ELECTRO->>TORCHANI: "Coupling Energy"
+    TORCHANI->>QMMM: "Total Energy + Forces"
+    QMMM->>AMBER: "Combined ML/MM Potential"
+```
+
+**Sources:** [src/torchani.cpp:730-833](), [include/electro.h](), [README.md:172-257]()
+
+## Key Capabilities
+
+### Supported Neural Network Models
+
+The system supports multiple neural network potentials through the `torchani_builtin_models` vector:
+
+| Model Family | Variants | Elements Supported |
+|--------------|----------|--------------------|
+| ANI-1x | `ani1x`, `ani1x-infer` | H, C, N, O |
+| ANI-2x | `ani2x`, `ani2x-infer` | H, C, N, O, F, Cl, S |
+| ANI-1ccx | `ani1ccx`, `ani1ccx-infer` | H, C, N, O |
+| AimNet2 | `aimnet2-*-dsf/ewald/nocut` | Multiple variants |
+| NutMeg | `nutmeg-small/medium/large` | Condensed phase systems |
+
+### Runtime Configuration
+
+The `GlobalConfig` class manages critical runtime parameters:
+
+- **Device Selection**: CPU vs CUDA device configuration
+- **Precision Control**: Float32 vs Float64 tensor operations  
+- **PBC Support**: Periodic boundary condition handling
+- **Atom Masking**: Selective evaluation for efficiency
+
+### Performance Features
+
+- **cuAEV Extension**: CUDA-accelerated atomic environment vectors via `use_cuaev`
+- **External Neighborlists**: Amber-managed neighbor lists through `use_amber_neighborlist`
+- **JIT Optimizations**: Disabled for accuracy via `torch::jit::setGraphExecutorOptimize(false)`
+- **Ensemble Support**: Multiple network evaluation for uncertainty quantification
+
+**Sources:** [src/torchani.cpp:34-69](), [src/torchani.cpp:474-539](), [include/config.h]()
+
+---
+
+# Page: Getting Started
+
+# Getting Started
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [CMakeLists.txt](CMakeLists.txt)
+- [README.md](README.md)
+- [ani-amber-logo-dark.png](ani-amber-logo-dark.png)
+- [ani-amber-logo-light.png](ani-amber-logo-light.png)
+- [environment.yaml](environment.yaml)
+
+</details>
+
+
+
+This page provides an overview of the steps required to install, build, and configure TorchANI-Amber for your first molecular dynamics simulations. TorchANI-Amber integrates neural network potentials with the Amber molecular dynamics suite, enabling both full-ML simulations and ML/MM hybrid approaches.
+
+For detailed installation and build instructions, see [Installation and Build](#2.1). For a complete step-by-step tutorial to run your first simulation, see [Quick Start Tutorial](#2.2). For information about the underlying architecture and API details, see [Core Architecture](#3).
+
+## Prerequisites Overview
+
+Before beginning the installation process, ensure you have access to the following system requirements:
+
+| Component | Requirement | Purpose |
+|-----------|-------------|---------|
+| **Operating System** | Linux | Required by build system validation |
+| **Compiler** | GNU GCC 11.0-13.2 | C++17 support for core libraries |
+| **Python Environment** | Conda/Mamba | Dependency management |
+| **CUDA Toolkit** | 12.4 | GPU acceleration (optional but recommended) |
+| **Memory** | 8GB+ RAM | Model loading and tensor operations |
+| **Storage** | 10GB+ free space | Dependencies and compiled libraries |
+
+The system enforces these requirements through validation checks in the build configuration, as seen in [CMakeLists.txt:75-88]().
+
+**Sources:** [CMakeLists.txt:75-88](), [README.md:35-37](), [environment.yaml:34-46]()
+
+## Getting Started Workflow
+
+The TorchANI-Amber setup process follows a structured workflow that ensures all dependencies are properly configured:
+
+#### High-Level Installation Flow
+```mermaid
+graph TD
+    A["Clone Repository<br/>git clone --recurse-submodules"] --> B["Create Conda Environment<br/>conda env create -f environment.yaml"]
+    B --> C["Activate Environment<br/>conda activate ani-amber"]
+    C --> D["Install TorchANI Python<br/>pip install torchani_sandbox_pub"]
+    D --> E["Build TorchANI-Amber<br/>./run-cmake"]
+    E --> F["Build Amber<br/>cmake with CMAKE_PREFIX_PATH"]
+    F --> G["Configure Simulation<br/>Create mdin files"]
+    G --> H["Run Simulation<br/>sander/pmemd with TorchANI"]
+    
+    style A fill:#e1f5fe
+    style E fill:#e8f5e8
+    style H fill:#fff3e0
+```
+
+**Sources:** [README.md:39-83](), [CMakeLists.txt:1-12]()
+
+## System Components and Build Targets
+
+TorchANI-Amber consists of several interconnected components that work together to provide neural network potential calculations within Amber:
+
+#### Core Build Architecture
+```mermaid
+graph TB
+    subgraph "Source Components"
+        REPO["torchani-amber Repository"]
+        SUBMODS["Git Submodules<br/>torchani_sandbox<br/>Catch2"]
+        CONDA_ENV["Conda Environment<br/>ani-amber"]
+    end
+    
+    subgraph "Build System"
+        CMAKE["CMakeLists.txt<br/>Build Configuration"]
+        JIT_SCRIPT["jit.py<br/>Model Compilation"]
+        RUN_CMAKE["run-cmake<br/>Build Script"]
+    end
+    
+    subgraph "Generated Libraries"
+        LIBTORCHANI["libtorchani.so<br/>Main C++ Interface"]
+        LIBCUAEV["libcuaev.so<br/>CUDA AEV Extension"]
+        LIBCELL["libcell_list.so<br/>Neighbor Lists"]
+        JIT_MODELS["*.pt Files<br/>JIT-Compiled Models"]
+    end
+    
+    subgraph "Integration Points"
+        C_API["torchani.h<br/>C Interface"]
+        F90_API["torchani.F90<br/>Fortran Interface"]
+        AMBER_LINK["Amber Integration<br/>CMAKE_PREFIX_PATH"]
+    end
+    
+    REPO --> CMAKE
+    SUBMODS --> CMAKE
+    CONDA_ENV --> CMAKE
+    CMAKE --> RUN_CMAKE
+    CMAKE --> JIT_SCRIPT
+    JIT_SCRIPT --> JIT_MODELS
+    RUN_CMAKE --> LIBTORCHANI
+    RUN_CMAKE --> LIBCUAEV
+    RUN_CMAKE --> LIBCELL
+    LIBTORCHANI --> C_API
+    C_API --> F90_API
+    LIBTORCHANI --> AMBER_LINK
+    JIT_MODELS --> AMBER_LINK
+```
+
+**Sources:** [CMakeLists.txt:234-323](), [CMakeLists.txt:439-461](), [README.md:58-64]()
+
+## Configuration Overview
+
+TorchANI-Amber simulations are configured through Amber's `mdin` input files using specific namelists. The configuration approach differs depending on the simulation type:
+
+#### Simulation Configuration Patterns
+```mermaid
+graph LR
+    subgraph "Full-ML Configuration"
+        A["&cntrl<br/>iextpot = 1"] --> B["&extpot<br/>extprog = 'TORCHANI'"]
+        B --> C["&ani<br/>model_type<br/>use_cuda_device<br/>use_double_precision"]
+    end
+    
+    subgraph "ML/MM Configuration"
+        D["&cntrl<br/>ifqnt = 1"] --> E["&qmmm<br/>qm_theory = 'EXTERN'<br/>qmmask = ':1'"]
+        E --> F["&ani<br/>model_type<br/>use_torchani_charges<br/>mlmm_coupling"]
+    end
+    
+    subgraph "Available Models"
+        G["ani1x<br/>ANI-1x Ensemble"]
+        H["ani2x<br/>ANI-2x Ensemble"]
+        I["ani1ccx<br/>ANI-1ccx Ensemble"]
+        J["animbis<br/>MBIS Charge Model"]
+    end
+    
+    C --> G
+    C --> H
+    C --> I
+    F --> G
+    F --> H
+    F --> I
+    F --> J
+```
+
+**Sources:** [README.md:116-169](), [README.md:172-257]()
+
+## Environment and Dependencies
+
+The build process relies on a carefully configured conda environment that provides all necessary dependencies:
+
+| Dependency Category | Key Components | Purpose |
+|-------------------|----------------|---------|
+| **Python Runtime** | `python=3.11`, `pip>=24.0` | Core interpreter and package management |
+| **PyTorch Stack** | `pytorch=2.5`, `pytorch-cuda=12.4` | Neural network backend and GPU support |
+| **CUDA Toolkit** | `cuda-libraries-dev=12.4`, `cuda-nvcc=12.4` | GPU compilation and runtime |
+| **Build Tools** | `cmake=3.31.1`, `gxx_linux-64=12.2` | Build system and compilers |
+| **Amber Dependencies** | `fftw=3.3.10`, `netcdf-fortran=4.6.1` | MD simulation support |
+
+The environment configuration is defined in [environment.yaml:1-68]() and automatically validated during the build process through [CMakeLists.txt:95-113]().
+
+**Sources:** [environment.yaml:8-46](), [CMakeLists.txt:95-113]()
+
+## Next Steps
+
+To proceed with your TorchANI-Amber installation and setup:
+
+1. **Installation**: Follow the detailed build instructions in [Installation and Build](#2.1), which covers environment setup, dependency resolution, and compilation of all required libraries.
+
+2. **First Simulation**: Complete the hands-on tutorial in [Quick Start Tutorial](#2.2) to configure and run your first simulation with step-by-step guidance.
+
+3. **Advanced Configuration**: For detailed information about simulation parameters, model options, and ML/MM setup, see [Simulation Configuration](#4.1).
+
+4. **Performance Optimization**: To benchmark your installation and optimize performance, consult the [Benchmarking System](#5) documentation.
+
+The build process typically takes 15-30 minutes depending on your system specifications and whether you're using GPU acceleration. Ensure you have a stable internet connection for downloading dependencies during the conda environment creation phase.
+
+**Sources:** [README.md:29-95](), [CMakeLists.txt:214-224]()
+
+---
+
+# Page: Installation and Build
+
+# Installation and Build
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [CMakeLists.txt](CMakeLists.txt)
+- [benchmark/templates/mlmm.mdin.jinja](benchmark/templates/mlmm.mdin.jinja)
+- [cmake/CudaToolkitHelper.cmake](cmake/CudaToolkitHelper.cmake)
+- [cmake/CudnnHelper.cmake](cmake/CudnnHelper.cmake)
+- [cmake/LibtorchHelper.cmake](cmake/LibtorchHelper.cmake)
+- [cmake/LinuxBuild.cmake](cmake/LinuxBuild.cmake)
+- [cmake/OutOfSourceBuild.cmake](cmake/OutOfSourceBuild.cmake)
+- [cmake/PytorchHelper.cmake](cmake/PytorchHelper.cmake)
+- [cmake/TorchScriptUtils.cmake](cmake/TorchScriptUtils.cmake)
+- [environment.yaml](environment.yaml)
+- [run-cmake](run-cmake)
+
+</details>
+
+
+
+This document provides comprehensive instructions for building TorchANI-Amber from source, including dependency management, environment setup, and build configuration. It covers the CMake-based build system that handles complex dependency resolution for PyTorch, CUDA, and cuDNN libraries, and produces the core shared libraries required for Amber integration.
+
+For information about configuring and running simulations with the built libraries, see [Quick Start Tutorial](#2.2). For details about the underlying build system architecture, see [Build System Deep Dive](#6.1).
+
+## Prerequisites and System Requirements
+
+TorchANI-Amber requires a Linux system with specific compiler and library versions. The build system enforces strict version compatibility to ensure proper integration with PyTorch and CUDA libraries.
+
+### System Requirements
+
+| Component | Requirement | Notes |
+|-----------|-------------|-------|
+| Operating System | Linux only | Enforced by `LinuxBuild_ensure()` |
+| CMake | ≥ 3.24 | Specified in `CMakeLists.txt:2` |
+| Compilers | GNU 11.0-13.2 | g++, gcc, gfortran required |
+| Python | 3.11 | For PyTorch integration and JIT compilation |
+
+### Core Dependencies
+
+| Library | Version | Purpose |
+|---------|---------|---------|
+| PyTorch/LibTorch | 2.5.x | Neural network backend |
+| CUDA Toolkit | 12.4 | GPU acceleration |
+| cuDNN | 9.1 | Deep learning primitives |
+
+**Build Dependencies Diagram**
+
+```mermaid
+graph TB
+    subgraph "System Requirements"
+        Linux["Linux OS"]
+        CMAKE["CMake ≥3.24"]
+        GNU["GNU Compilers 11.0-13.2"]
+    end
+    
+    subgraph "Core Libraries"
+        PYTORCH["PyTorch 2.5"]
+        CUDA["CUDA Toolkit 12.4"] 
+        CUDNN["cuDNN 9.1"]
+        PYTHON["Python 3.11"]
+    end
+    
+    subgraph "Build Outputs"
+        LIBTORCHANI["libtorchani.so"]
+        LIBCUAEV["libcuaev.so"]
+        LIBCELLLIST["libcell_list.so"]
+    end
+    
+    subgraph "CMake Options"
+        LINK_PYTORCH["LINK_TO_PYTORCH_LIBS"]
+        PREFER_CONDA["PREFER_CONDA_LIBS"]
+        JIT_COMPILE["JIT_COMPILE_MODELS"]
+        DOWNLOAD_LIBTORCH["DOWNLOAD_AND_INSTALL_LIBTORCH"]
+    end
+    
+    Linux --> CMAKE
+    CMAKE --> GNU
+    GNU --> PYTORCH
+    PYTORCH --> CUDA
+    CUDA --> CUDNN
+    PYTHON --> PYTORCH
+    
+    LINK_PYTORCH --> PYTORCH
+    PREFER_CONDA --> PYTORCH
+    JIT_COMPILE --> PYTHON
+    DOWNLOAD_LIBTORCH --> PYTORCH
+    
+    PYTORCH --> LIBTORCHANI
+    CUDA --> LIBCUAEV
+    PYTHON --> LIBCUAEV
+    PYTORCH --> LIBCELLLIST
+```
+
+Sources: [CMakeLists.txt:47-51](), [CMakeLists.txt:74-88](), [environment.yaml:8-47]()
+
+## Environment Setup
+
+The recommended approach is to use the provided conda environment, which automatically handles all dependency versions and compatibility requirements.
+
+### Conda Environment Installation
+
+```bash
+# Clone the repository with submodules
+git clone --recursive https://github.com/roitberg-group/torchani-amber.git
+cd torchani-amber
+
+# Create and activate the conda environment
+conda env create -f environment.yaml
+conda activate ani-amber
+```
+
+The `environment.yaml` defines the `ani-amber` environment with all required dependencies, including:
+
+- **Core Runtime**: `pytorch=2.5`, `pytorch-cuda=12.4`
+- **Build Tools**: `cmake=3.31.1`, GNU compiler suite
+- **CUDA Development**: `cuda-libraries-dev=12.4`, `cuda-nvcc=12.4`
+- **Additional Libraries**: OpenMPI, NetCDF-Fortran for Amber integration
+
+### Manual Dependency Installation
+
+For custom installations without conda, ensure these components are available:
+
+1. **PyTorch with CUDA**: Install PyTorch 2.5 compiled with CUDA 12.4 support
+2. **CUDA Toolkit Development**: Full CUDA 12.4 installation with headers and nvcc
+3. **cuDNN**: Version 9.1 compatible with CUDA 12.4
+4. **GNU Compilers**: g++, gcc, gfortran versions 11.0-13.2
+
+Sources: [environment.yaml:1-68](), [CMakeLists.txt:95-112]()
+
+## Build Configuration
+
+The build system provides extensive configuration options through CMake variables and the `run-cmake` wrapper script. The configuration process handles dependency detection, version validation, and library path setup.
+
+### CMake Configuration Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `LINK_TO_PYTORCH_LIBS` | ON | Link to existing PyTorch installation |
+| `DOWNLOAD_AND_INSTALL_LIBTORCH` | OFF | Download LibTorch binaries |
+| `PREFER_CONDA_LIBS` | ON | Use conda environment libraries |
+| `JIT_COMPILE_MODELS` | ON | Compile ANI models to TorchScript |
+| `USE_CUSTOM_CUDNN` | OFF | Use custom cuDNN installation |
+| `COMPILE_WITH_CXX11ABI` | OFF | Use C++11 ABI (requires LibTorch) |
+
+### Dependency Resolution Process
+
+**Build Configuration Flow**
+
+```mermaid
+flowchart TD
+    START["cmake configuration"]
+    
+    subgraph "Environment Detection"
+        CONDA_CHECK["Check CONDA_PREFIX"]
+        PYTORCH_DETECT["detect_pytorch.py"]
+        VERSION_VALIDATE["Validate versions"]
+    end
+    
+    subgraph "Library Setup"
+        PYTORCH_SETUP["PyTorch/LibTorch setup"]
+        CUDNN_SETUP["CudnnHelper_set_*_paths()"]
+        CUDA_SETUP["CudaToolkitHelper_set_*_paths()"]
+    end
+    
+    subgraph "Model Compilation"
+        JIT_CHECK["JIT_COMPILE_MODELS?"]
+        JIT_COMPILE["TorchScriptUtils_jit_compile_models()"]
+    end
+    
+    subgraph "Target Building"
+        FIND_TORCH["find_package(Torch)"]
+        BUILD_CUAEV["add_library(cuaev)"]
+        BUILD_CELLLIST["add_library(cell_list)"]
+        BUILD_TORCHANI["add_library(torchani)"]
+    end
+    
+    START --> CONDA_CHECK
+    CONDA_CHECK --> PYTORCH_DETECT
+    PYTORCH_DETECT --> VERSION_VALIDATE
+    VERSION_VALIDATE --> PYTORCH_SETUP
+    
+    PYTORCH_SETUP --> CUDNN_SETUP
+    CUDNN_SETUP --> CUDA_SETUP
+    CUDA_SETUP --> JIT_CHECK
+    
+    JIT_CHECK -->|YES| JIT_COMPILE
+    JIT_CHECK -->|NO| FIND_TORCH
+    JIT_COMPILE --> FIND_TORCH
+    
+    FIND_TORCH --> BUILD_CUAEV
+    BUILD_CUAEV --> BUILD_CELLLIST
+    BUILD_CELLLIST --> BUILD_TORCHANI
+```
+
+Sources: [CMakeLists.txt:114-165](), [CMakeLists.txt:167-212](), [cmake/detect_pytorch.py]()
+
+### Version Validation
+
+The build system enforces exact version matching for critical dependencies:
+
+```cpp
+// Required versions from CMakeLists.txt:47-51
+REQUIRED_TORCH_VERSION = "2.5"
+REQUIRED_CUDATK_VERSION = "12.4" 
+REQUIRED_CUDNN_VERSION = "9.1"
+```
+
+Version validation occurs through the `detect_pytorch.py` script, which queries the PyTorch installation and reports version mismatches as fatal errors.
+
+Sources: [CMakeLists.txt:47-51](), [CMakeLists.txt:119-150]()
+
+## Build Process
+
+### Using the run-cmake Script
+
+The `run-cmake` script provides a convenient wrapper around the CMake build process with sensible defaults:
+
+```bash
+# Standard build with conda libraries
+./run-cmake
+
+# Build without running tests
+./run-cmake -T
+
+# Build only (no install)
+./run-cmake -I
+
+# Debug build
+./run-cmake -g
+
+# Use custom libraries instead of conda
+./run-cmake -C
+```
+
+### Manual CMake Build
+
+For more control over the build process:
+
+```bash
+# Configure
+cmake -S. -Bbuild \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=$HOME/.local \
+    -DLINK_TO_PYTORCH_LIBS=ON \
+    -DPREFER_CONDA_LIBS=ON \
+    -DJIT_COMPILE_MODELS=ON
+
+# Build
+cmake --build build
+
+# Test
+./build/tests
+
+# Install
+cmake --install build
+```
+
+### Build Targets
+
+The build process creates three primary shared libraries:
+
+| Library | Source Location | Purpose |
+|---------|----------------|---------|
+| `libcuaev.so` | `submodules/torchani_sandbox/torchani/csrc/` | CUDA-accelerated AEV calculations |
+| `libcell_list.so` | `submodules/torchani_sandbox/torchani/csrc/` | Neighbor list generation |
+| `libtorchani.so` | `src/*.cpp` | Main TorchANI interface library |
+
+### Compilation Flags and Optimizations
+
+The CUDA library `libcuaev.so` is built with specific optimizations:
+
+```cpp
+// From CMakeLists.txt:263-275
+TORCHANI_OPT           // Enable CUDA intrinsics for math functions
+-use_fast_math         // Enable fast math library
+CUB_NS_QUALIFIER       // Wrapped CUB namespace for PyTorch compatibility
+```
+
+Sources: [run-cmake:1-114](), [CMakeLists.txt:234-287](), [CMakeLists.txt:289-323]()
+
+## JIT Model Compilation
+
+When `JIT_COMPILE_MODELS=ON` (default), the build system automatically compiles ANI neural network models to TorchScript format for optimized runtime performance.
+
+### JIT Compilation Process
+
+```mermaid
+sequenceDiagram
+    participant CMAKE as "CMake"
+    participant JIT_PY as "jit/jit.py"
+    participant TORCHANI as "TorchANI Python"
+    participant MODELS as "Model Files"
+    
+    CMAKE->>JIT_PY: TorchScriptUtils_jit_compile_models()
+    JIT_PY->>TORCHANI: Import model classes
+    TORCHANI->>JIT_PY: Load model instances
+    JIT_PY->>JIT_PY: torch.jit.script()
+    JIT_PY->>MODELS: Save *.pt files
+    MODELS->>CMAKE: Models available for linking
+```
+
+The JIT compilation is controlled by several options:
+
+- `JIT_DISABLE_OPTIMIZATIONS`: Disable TorchScript optimizations
+- `JIT_FORCE_RECOMPILATION`: Force recompilation of existing `.pt` files
+
+Sources: [CMakeLists.txt:215-223](), [cmake/TorchScriptUtils.cmake:1-29]()
+
+## Installation and Library Paths
+
+### Installation Directories
+
+The CMake install process creates the following directory structure:
+
+```
+$CMAKE_INSTALL_PREFIX/
+├── lib/Torchani/
+│   ├── libtorchani.so
+│   ├── libcuaev.so
+│   └── libcell_list.so
+├── include/Torchani/
+│   └── torchani.h
+├── share/Torchani/
+│   └── Fortran/torchani.F90
+└── share/cmake/Torchani/
+    ├── TorchaniConfig.cmake
+    ├── TorchaniConfigVersion.cmake
+    └── TorchaniTargets.cmake
+```
+
+### RPATH Configuration
+
+The build system automatically configures RPATH settings to ensure libraries can find their dependencies at runtime:
+
+```cpp
+// From CMakeLists.txt:340-364
+TORCHANI_LIBRARIES_INSTALL_RPATH = {
+    LIBTORCH_LIBRARY_DIR,      // PyTorch libraries
+    CUDA_TOOLKIT_ROOT_DIR,     // CUDA runtime
+    CMAKE_INSTALL_FULL_LIBDIR  // TorchANI libraries
+}
+```
+
+This prevents runtime linking issues when using conda environments or custom CUDA installations.
+
+Sources: [CMakeLists.txt:404-461](), [CMakeLists.txt:340-364]()
+
+## Build Verification
+
+### Running Tests
+
+The build includes a comprehensive test suite using the Catch2 framework:
+
+```bash
+# Run tests after build
+./build/tests
+
+# Or use CTest
+cd build && ctest
+```
+
+### Verifying Installation
+
+Check that all libraries are properly installed and linked:
+
+```bash
+# Verify library installation
+ls $HOME/.local/lib/Torchani/
+
+# Check library dependencies
+ldd $HOME/.local/lib/Torchani/libtorchani.so
+
+# Verify CMake package detection
+cmake --find-package -DNAME=Torchani -DCOMPILER_ID=GNU -DLANGUAGE=CXX
+```
+
+### Common Build Issues
+
+| Issue | Cause | Solution |
+|-------|-------|---------|
+| PyTorch version mismatch | Wrong PyTorch version | Install PyTorch 2.5 exactly |
+| CUDA not found | Missing CUDA development packages | Install `cuda-libraries-dev` |
+| Compiler not supported | Non-GNU compiler | Use g++/gcc/gfortran 11.0-13.2 |
+| cuDNN missing | cuDNN not in expected location | Set `USE_CUSTOM_CUDNN=ON` or use conda |
+
+Sources: [CMakeLists.txt:378-391](), [CMakeLists.txt:74-88](), [CMakeLists.txt:125-149]()
+
+---
+
+# Page: Quick Start Tutorial
+
+# Quick Start Tutorial
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [ani-amber-logo-dark.png](ani-amber-logo-dark.png)
+- [ani-amber-logo-light.png](ani-amber-logo-light.png)
+- [benchmark/templates/scaling.mdin.jinja](benchmark/templates/scaling.mdin.jinja)
+
+</details>
+
+
+
+This tutorial guides you through running your first molecular dynamics simulation with TorchANI-Amber, from initial setup to execution. You will learn to configure both full-ML simulations (entire system uses neural networks) and ML/MM hybrid simulations (neural networks for QM region, classical force fields for MM region).
+
+For detailed installation procedures, see [Installation and Build](#2.1). For comprehensive configuration options, see [Simulation Configuration](#4.1). For performance optimization, see [Benchmarking System](#5).
+
+## Prerequisites and Environment Setup
+
+TorchANI-Amber requires a conda environment with PyTorch, CUDA toolkit, and molecular dynamics dependencies. The system uses JIT-compiled neural network models that must be compatible with the LibTorch backend.
+
+### Required Components
+
+| Component | Purpose | Notes |
+|-----------|---------|--------|
+| `environment.yaml` | Conda environment specification | Includes PyTorch, CUDA, cuDNN, GFortran |
+| `run-cmake` | Build automation script | Handles CMake configuration and testing |
+| Amber source | MD simulation engine | Must be compiled with TorchANI integration |
+| CUDA Toolkit | GPU acceleration | Required even for CPU-only runs |
+
+**Installation Workflow**
+
+```mermaid
+flowchart TD
+    A["git clone --recurse-submodules"] --> B["conda env create -f environment.yaml"]
+    B --> C["conda activate ani-amber"]
+    C --> D["pip install torchani_sandbox_pub"]
+    D --> E["./run-cmake"]
+    E --> F["cmake amber with CMAKE_PREFIX_PATH"]
+    F --> G["Amber binaries with TorchANI integration"]
+    
+    H["environment.yaml"] --> B
+    I["run-cmake script"] --> E
+    J["CMakeLists.txt"] --> E
+    K["Amber source"] --> F
+    
+    style E fill:#e1f5fe
+    style G fill:#e8f5e8
+```
+
+Sources: [README.md:39-95]()
+
+## Build Process Overview
+
+The TorchANI-Amber build system creates shared libraries that integrate with Amber's external potential interface. The process involves compiling C++ extensions, linking PyTorch libraries, and generating JIT-compatible model files.
+
+**Build System Components**
+
+```mermaid
+graph TB
+    subgraph "Source_Components"
+        A["torchani_sandbox_pub/"] 
+        B["src/torchani.cpp"]
+        C["src/torchani.h"]
+        D["src/torchani.F90"]
+    end
+    
+    subgraph "Build_Artifacts"
+        E["libtorchani.so"]
+        F["libcuaev.so"] 
+        G["libcell_list.so"]
+        H["JIT model files (.pt)"]
+    end
+    
+    subgraph "Integration_Points"
+        I["~/.local/lib/"]
+        J["Amber CMAKE_PREFIX_PATH"]
+        K["sander/pmemd binaries"]
+    end
+    
+    A --> E
+    B --> E
+    C --> E
+    D --> E
+    A --> F
+    A --> G
+    A --> H
+    
+    E --> I
+    F --> I
+    G --> I
+    H --> I
+    
+    I --> J
+    J --> K
+    
+    style E fill:#e1f5fe
+    style K fill:#e8f5e8
+```
+
+Sources: [README.md:54-95]()
+
+## Configuration File Structure
+
+TorchANI-Amber simulations require specific namelist configurations in `mdin` files. The structure differs between full-ML and ML/MM simulation types, with different required namelists and parameters.
+
+### Full-ML Configuration
+
+Full-ML simulations use the external potential interface with three required namelists:
+
+| Namelist | Required Parameters | Purpose |
+|----------|-------------------|---------|
+| `&cntrl` | `iextpot = 1` | Enable external potential |
+| `&extpot` | `extprog = 'TORCHANI'` | Specify TorchANI as external program |
+| `&ani` | `model_type`, `use_cuda_device` | Configure neural network parameters |
+
+**Namelist Configuration Flow**
+
+```mermaid
+flowchart LR
+    A["mdin file"] --> B["&cntrl namelist"]
+    A --> C["&extpot namelist"] 
+    A --> D["&ani namelist"]
+    
+    B --> E["iextpot = 1"]
+    C --> F["extprog = 'TORCHANI'"]
+    D --> G["model_type = 'ani2x'"]
+    D --> H["use_cuda_device = .true."]
+    D --> I["use_double_precision = .true."]
+    
+    E --> J["torchani_initialize()"]
+    F --> J
+    G --> K["torch::jit::load()"]
+    H --> L["CUDA device selection"]
+    I --> M["Float64 tensor operations"]
+    
+    style J fill:#e1f5fe
+    style K fill:#e8f5e8
+```
+
+Sources: [README.md:116-169](), [benchmark/templates/scaling.mdin.jinja:1-48]()
+
+### ML/MM Configuration
+
+ML/MM simulations use the QM/MM interface with different namelists:
+
+| Namelist | Required Parameters | Purpose |
+|----------|-------------------|---------|
+| `&cntrl` | `ifqnt = 1` | Enable QM/MM calculations |
+| `&qmmm` | `qm_theory = 'EXTERN'`, `qmmask` | Configure QM region and coupling |
+| `&ani` | Standard parameters + ML/MM options | Configure neural network and coupling |
+
+## Running Your First Simulation
+
+### Step 1: Environment Activation
+
+```bash
+conda activate ani-amber
+```
+
+The `ani-amber` environment must be active during runtime because the compiled binaries depend on CUDA and PyTorch libraries within the conda environment.
+
+### Step 2: Prepare Input Files
+
+Create the standard Amber input files:
+- `.prmtop` topology file
+- `.inpcrd` or `.rst7` coordinate file  
+- `mdin` configuration file with TorchANI namelists
+
+### Step 3: Basic Full-ML Simulation
+
+**Example mdin Configuration**
+
+```
+&cntrl
+    iextpot = 1
+    imin = 0
+    nstlim = 1000
+    dt = 0.002
+    ntc = 2, ntf = 2
+    temp0 = 300.0
+    ntt = 3
+/
+&extpot
+    extprog = "TORCHANI"
+/
+&ani
+    model_type = "ani2x"
+    use_double_precision = .true.
+    use_cuda_device = .true.
+    use_cuaev = .true.
+/
+```
+
+**Execution Command**
+
+```bash
+sander -O -i input.mdin -p system.prmtop -c system.inpcrd -o output.mdout
+```
+
+### Step 4: Basic ML/MM Simulation
+
+**Example mdin Configuration**
+
+```
+&cntrl
+    ifqnt = 1
+    imin = 0
+    nstlim = 1000
+    dt = 0.002
+/
+&qmmm
+    qm_theory = 'EXTERN'
+    qm_ewald = 0
+    qmmm_int = 1
+    qmmask = ':1'
+    qmcut = 15.0
+/
+&ani
+    model_type = 'ani2x'
+    use_cuda_device = .true.
+    use_torchani_charges = .false.
+    mlmm_coupling = 0
+/
+```
+
+Sources: [README.md:152-257]()
+
+## Runtime Execution Flow
+
+The following diagram shows how TorchANI-Amber integrates with Amber during simulation execution:
+
+**Simulation Runtime Architecture**
+
+```mermaid
+sequenceDiagram
+    participant U as "User Command"
+    participant S as "sander/pmemd"
+    participant T as "torchani_initialize()"
+    participant J as "torch::jit::load()"
+    participant C as "torchani_compute()"
+    participant G as "GPU/CPU tensors"
+    
+    U->>S: "sander -i input.mdin"
+    S->>T: "Parse &ani namelist"
+    T->>J: "Load .pt model file"
+    J->>T: "Return JIT module"
+    
+    loop "MD Steps"
+        S->>C: "coordinates, cell, pbc"
+        C->>G: "Tensor operations"
+        G->>C: "energies, forces, charges"
+        C->>S: "Return forces/energies"
+        S->>S: "Update positions"
+    end
+    
+    S->>U: "Write trajectory files"
+```
+
+Sources: [README.md:114-169]()
+
+## Verification and Testing
+
+### Quick Validation Test
+
+Run a short simulation to verify the installation:
+
+```bash
+# Create minimal test case (10 steps)
+sander -O -i test.mdin -p system.prmtop -c system.inpcrd -o test.out
+```
+
+Check for successful initialization messages in the output:
+- `TorchANI initialization successful`
+- `Model loaded: [model_type]`
+- `Device: CUDA:0` or `Device: CPU`
+
+### Common Issues and Solutions
+
+| Issue | Symptom | Solution |
+|-------|---------|----------|
+| CUDA library missing | `libcudart.so not found` | Ensure conda environment is activated |
+| Model load failure | `Could not load model` | Verify `model_type` parameter |
+| Memory errors | `CUDA out of memory` | Reduce system size or use CPU |
+
+Sources: [README.md:347-349]()
+
+## Next Steps
+
+After successfully running your first simulation:
+
+1. **Performance Optimization**: Use the [Bench CLI Tool](#5.1) to optimize GPU settings and scaling
+2. **Advanced Configuration**: Explore [ML/MM Setup and Coupling](#4.2) for hybrid simulations  
+3. **Custom Models**: See [Model Wrappers](#3.3) for using custom neural network potentials
+4. **Production Runs**: Review [Input Templates and Examples](#4.3) for simulation-specific configurations
+
+The benchmark templates in [benchmark/templates/scaling.mdin.jinja:1-48]() provide examples of production-ready configurations with various performance optimizations.
+
+Sources: [README.md:1-451](), [benchmark/templates/scaling.mdin.jinja:1-48]()
+
+---
+
+# Page: Core Architecture
+
+# Core Architecture
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [jit/jit.py](jit/jit.py)
+- [jit/make_bulk.py](jit/make_bulk.py)
+- [src/build_tensors.cpp](src/build_tensors.cpp)
+- [src/build_tensors.h](src/build_tensors.h)
+- [src/config.h](src/config.h)
+- [src/torchani.cpp](src/torchani.cpp)
+
+</details>
+
+
+
+This document describes the core runtime architecture of TorchANI-Amber, focusing on the C++ engine, JIT compilation system, and tensor operations that form the computational foundation. For information about build system configuration, see [Build System Deep Dive](#6.1). For API usage details, see [API Reference](#3.2). For Python model wrappers, see [Model Wrappers](#3.3).
+
+## Global Configuration System
+
+The architecture centers around a `GlobalConfig` class that manages device placement, precision, and computational settings throughout the system. This singleton-like configuration object ensures consistent tensor operations across all components.
+
+```mermaid
+graph TB
+    subgraph "GlobalConfig Management"
+        GC["GlobalConfig"] --> Device["Device Selection<br/>CPU/CUDA + Index"]
+        GC --> Precision["Precision Control<br/>Float32/Float64"]
+        GC --> PBC["PBC Configuration<br/>Periodic Boundaries"]
+        GC --> NoEval["No-Eval Atoms<br/>Selective Evaluation"]
+    end
+    
+    subgraph "Tensor Operations"
+        Device --> TensorOpts["torch::TensorOptions"]
+        Precision --> TensorOpts
+        TensorOpts --> TensorConv["Tensor Conversion<br/>tensor_to_torchani_dtype_and_device()"]
+    end
+    
+    subgraph "Runtime Usage"
+        TensorConv --> ModelExec["Model Execution"]
+        NoEval --> AtomMasking["Selective Atom Processing"]
+        PBC --> BoundaryHandling["Periodic Boundary Logic"]
+    end
+```
+
+**Configuration Management Overview**
+Sources: [src/config.h:1-65](), [src/torchani.cpp:23-26]()
+
+The `GlobalConfig` class provides centralized control over:
+- **Device Management**: CPU vs CUDA device selection with device indexing
+- **Precision Control**: Float32 vs Float64 precision for all tensor operations  
+- **PBC Handling**: Automatic periodic boundary condition tensor creation
+- **Selective Evaluation**: Support for excluding specific atoms from neural network evaluation
+
+Key methods include `set_device_and_precision()` for initialization and `tensor_to_torchani_dtype_and_device()` for consistent tensor conversion throughout the pipeline.
+
+## JIT Compilation Pipeline
+
+The system uses a sophisticated JIT compilation pipeline that converts Python-based neural network models into optimized `.pt` files for C++ execution.
+
+```mermaid
+graph TB
+    subgraph "Model Sources"
+        TorchANI["TorchANI Models<br/>ANI1x, ANI2x, etc."]
+        AimNet2["AimNet2 Models<br/>Various functionals"]
+        Nutmeg["Nutmeg Models<br/>Small/Medium/Large"]
+    end
+    
+    subgraph "JIT Compilation Process"
+        ModelSpec["ModelSpec<br/>cls, infer, kwargs"]
+        InstantiatePy["Python Model<br/>Instantiation"]
+        OptimDisable["Optimization Disable<br/>_disable_jit_optimizations()"]
+        JITScript["torch.jit.script()"]
+        JITSave["torch.jit.save()"]
+    end
+    
+    subgraph "Output Files"
+        PTFiles[".pt Files<br/>JIT-compiled models"]
+        ModelRegistry["Built-in Model Registry<br/>torchani_builtin_models"]
+    end
+    
+    TorchANI --> ModelSpec
+    AimNet2 --> ModelSpec
+    Nutmeg --> ModelSpec
+    
+    ModelSpec --> InstantiatePy
+    InstantiatePy --> OptimDisable
+    OptimDisable --> JITScript
+    JITScript --> JITSave
+    JITSave --> PTFiles
+    PTFiles --> ModelRegistry
+```
+
+**JIT Compilation System**
+Sources: [jit/jit.py:1-180](), [src/torchani.cpp:34-69](), [src/torchani.cpp:475-478]()
+
+The compilation process involves:
+
+1. **Model Specification**: `ModelSpec` dataclass defines model class, inference mode, and compilation kwargs
+2. **Selective Compilation**: Only compiles missing `.pt` files unless force recompilation is requested
+3. **Optimization Control**: Disables various PyTorch JIT optimizations to ensure numerical accuracy
+4. **Registry Management**: Maintains `torchani_builtin_models` vector with all available model names
+5. **Error Handling**: Graceful fallback for models that fail compilation
+
+The system supports both training and inference-optimized model variants, with inference models using `to_infer_model()` for reduced memory usage.
+
+## Tensor Building and Data Conversion
+
+A critical architectural component handles conversion between raw C/Fortran buffers and PyTorch tensors with proper device placement and gradient tracking.
+
+```mermaid
+graph TB
+    subgraph "Input Buffers"
+        CoordsBuffer["coords_buf[][3]<br/>double arrays"]
+        CellBuffer["cell_buf[][3]<br/>3x3 cell matrix"]
+        NeighborBuffer["neighborlist_buf[2]<br/>int arrays"]
+        ShiftsBuffer["shifts_buf[][3]<br/>shift vectors"]
+    end
+    
+    subgraph "Tensor Conversion Functions"
+        DBLCoords["dbl_buf_to_coords_tensor()"]
+        DBLCell["dbl_buf_to_cell_tensor()"]
+        INTNeighbor["int_buf_to_neighborlist_tensor()"]
+        DBLShifts["dbl_buf_to_shifts_tensor()"]
+    end
+    
+    subgraph "PyTorch Tensors"
+        CoordsTensor["coords tensor<br/>requires_grad=true<br/>batch dimension added"]
+        CellTensor["cell tensor<br/>device/dtype converted"]
+        NeighborTensor["neighborlist tensor<br/>int32->int64 conversion"]
+        ShiftsTensor["shifts tensor<br/>requires_grad=true"]
+    end
+    
+    subgraph "Model Input Preparation"
+        SetupInputs["setup_inputs_*()<br/>functions"]
+        IValueVectors["std::vector<torch::jit::IValue>"]
+    end
+    
+    CoordsBuffer --> DBLCoords
+    CellBuffer --> DBLCell
+    NeighborBuffer --> INTNeighbor
+    ShiftsBuffer --> DBLShifts
+    
+    DBLCoords --> CoordsTensor
+    DBLCell --> CellTensor
+    INTNeighbor --> NeighborTensor
+    DBLShifts --> ShiftsTensor
+    
+    CoordsTensor --> SetupInputs
+    CellTensor --> SetupInputs
+    NeighborTensor --> SetupInputs
+    ShiftsTensor --> SetupInputs
+    
+    SetupInputs --> IValueVectors
+```
+
+**Tensor Building Architecture**
+Sources: [src/build_tensors.cpp:1-71](), [src/build_tensors.h:1-46](), [src/torchani.cpp:72-153]()
+
+Key tensor conversion functions:
+
+| Function | Purpose | Special Handling |
+|----------|---------|-----------------|
+| `dbl_buf_to_coords_tensor()` | Coordinate conversion | Adds batch dimension, enables gradients |
+| `dbl_buf_to_cell_tensor()` | Unit cell conversion | 3x3 matrix handling |
+| `int_buf_to_neighborlist_tensor()` | Neighbor list conversion | int32 → int64 widening |
+| `dbl_buf_to_shifts_tensor()` | Shift vector conversion | Gradient tracking enabled |
+
+All conversion functions use the global `GlobalConfig` to ensure consistent device placement and dtype conversion via `tensor_to_torchani_dtype_and_device()`.
+
+## Model Loading and Execution Engine
+
+The core execution engine manages JIT model loading, method resolution, and configuration for different computational scenarios.
+
+```mermaid
+graph TB
+    subgraph "Model Loading"
+        ModelPath["Model Path Resolution<br/>Built-in vs Custom"]
+        JITLoad["torch::jit::load()"]
+        ModelConfig["Model Configuration<br/>Precision, Device, Strategy"]
+    end
+    
+    subgraph "Model Configuration"
+        NetworkIdx["set_active_members()<br/>Network Selection"]
+        Strategy["set_strategy()<br/>cuaev vs pyaev"]
+        ExtraFeatures["set_extra_features()<br/>Nutmeg features"]
+        Precision["model.to(dtype)"]
+    end
+    
+    subgraph "Execution Pathways"
+        StandardForward["model.forward()<br/>Standard execution"]
+        ExternalNeighbors["compute_from_external_neighbors()<br/>Custom neighbor lists"]
+        MethodValidation["validate_model_output()<br/>Output validation"]
+    end
+    
+    ModelPath --> JITLoad
+    JITLoad --> ModelConfig
+    ModelConfig --> NetworkIdx
+    ModelConfig --> Strategy
+    ModelConfig --> ExtraFeatures
+    ModelConfig --> Precision
+    
+    ModelConfig --> StandardForward
+    ModelConfig --> ExternalNeighbors
+    StandardForward --> MethodValidation
+    ExternalNeighbors --> MethodValidation
+```
+
+**Model Execution Architecture**
+Sources: [src/torchani.cpp:371-563](), [src/torchani.cpp:621-635](), [src/torchani.cpp:688-701]()
+
+The execution engine provides:
+
+1. **Dynamic Model Loading**: Resolves built-in model names to file paths or accepts custom paths
+2. **Method-Based Configuration**: Uses optional model methods for runtime configuration
+3. **Execution Strategy Selection**: Supports both standard neighbor computation and external neighbor lists
+4. **Output Validation**: Ensures model outputs match expected tuple structure
+
+Key execution optimizations include disabling TF32/FP16 for numerical accuracy and JIT graph optimizations for deterministic behavior.
+
+## Computation Pathways
+
+The system supports multiple computation pathways depending on simulation requirements and model capabilities.
+
+```mermaid
+graph TB
+    subgraph "Input Classification"
+        HasPBC{{"Periodic Boundaries?"}}
+        OnlyBonded{{"Only Bonded Interactions?"}}
+        HasExternalNL{{"External Neighbor List?"}}
+        UseCharges{{"Predict/Use Charges?"}}
+    end
+    
+    subgraph "Pathway Selection"
+        StandardPBC["setup_inputs_pbc()"]
+        StandardNoPBC["setup_inputs_nopbc()"]
+        BondedPBC["setup_inputs_only_bonded_pbc()"]
+        BondedNoPBC["setup_inputs_only_bonded_nopbc()"]
+        ExternalNL["torchani_calc_energy_force_from_external_neighbors()"]
+    end
+    
+    subgraph "Output Processing"
+        ForceCalc["calculate_and_populate_forces()"]
+        EnergyPop["populate_potential_energy()"]
+        ChargePop["populate_atomic_charges()"]
+        QBCCalc["calc_qbcs()<br/>Uncertainty quantification"]
+    end
+    
+    HasPBC -->|Yes| HasExternalNL
+    HasPBC -->|No| OnlyBonded
+    
+    HasExternalNL -->|Yes| ExternalNL
+    HasExternalNL -->|No| OnlyBonded
+    
+    OnlyBonded -->|Yes + PBC| BondedPBC
+    OnlyBonded -->|Yes + No PBC| BondedNoPBC
+    OnlyBonded -->|No + PBC| StandardPBC
+    OnlyBonded -->|No + No PBC| StandardNoPBC
+    
+    StandardPBC --> ForceCalc
+    StandardNoPBC --> ForceCalc
+    BondedPBC --> ForceCalc
+    BondedNoPBC --> ForceCalc
+    ExternalNL --> ForceCalc
+    
+    ForceCalc --> EnergyPop
+    EnergyPop --> ChargePop
+    ChargePop --> QBCCalc
+```
+
+**Computation Pathway Architecture**
+Sources: [src/torchani.cpp:645-702](), [src/torchani.cpp:704-722](), [src/torchani.cpp:859-879](), [src/torchani.cpp:881-916]()
+
+Available computation pathways:
+
+| Function | Use Case | Key Features |
+|----------|----------|-------------|
+| `torchani_calc_energy_force()` | Standard MD | PBC support, bonded-only option |
+| `torchani_calc_energy_force_from_external_neighbors()` | Custom neighbor lists | External neighbor list input |
+| `torchani_energy_force_atomic_charges()` | Charge prediction | Charge output with derivatives |
+| `torchani_energy_force_with_coupling()` | QM/MM embedding | Environmental charge coupling |
+| `torchani_energy_force_qbc()` | Uncertainty quantification | Ensemble standard deviation |
+| `torchani_data_for_monitored_mlmm()` | Advanced QM/MM | Combined charge and QBC derivatives |
+
+Each pathway handles automatic differentiation for force calculation via `torch::autograd::grad()` and includes unit conversion from Hartree to kcal/mol using the constant `HARTREE_TO_KCALMOL = 627.5094738898777`.
+
+Sources: [src/torchani.cpp:1-918](), [src/config.h:1-65](), [src/build_tensors.cpp:1-71](), [src/build_tensors.h:1-46](), [jit/jit.py:1-180]()
+
+---
+
+# Page: C++ Engine and JIT System
+
+# C++ Engine and JIT System
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [jit/jit.py](jit/jit.py)
+- [jit/make_bulk.py](jit/make_bulk.py)
+- [src/build_tensors.cpp](src/build_tensors.cpp)
+- [src/build_tensors.h](src/build_tensors.h)
+- [src/config.h](src/config.h)
+- [src/torchani.cpp](src/torchani.cpp)
+
+</details>
+
+
+
+## Purpose and Scope
+
+This document covers the core C++ implementation that powers TorchANI-Amber's neural network potential calculations and the JIT (Just-In-Time) compilation system that prepares PyTorch models for high-performance execution. The C++ engine handles tensor operations, automatic differentiation for force calculations, and interfaces with PyTorch's LibTorch backend for model inference.
+
+For information about the C and Fortran API interfaces that wrap this engine, see [API Reference](#3.2). For details about Python model wrappers, see [Model Wrappers](#3.3).
+
+## JIT Compilation System
+
+The JIT compilation system transforms PyTorch models into optimized `.pt` files that can be loaded and executed efficiently by the C++ engine. This system is implemented primarily in Python and handles the compilation of various neural network potential models.
+
+### JIT Compilation Workflow
+
+```mermaid
+flowchart TD
+    A["`jit.py script`"] --> B["`_check_which_models_need_compilation()`"]
+    B --> C{"`Models need compilation?`"}
+    C -->|No| D["`Exit: nothing to compile`"]
+    C -->|Yes| E["`Import torch and torchani`"]
+    E --> F["`_disable_jit_optimizations()`"]
+    F --> G["`ModelSpec creation`"]
+    G --> H["`_jit_compile_and_save_models_in_spec()`"]
+    H --> I["`getattr(torchani.models, spec.cls)`"]
+    I --> J["`torch.jit.script(model)`"]
+    J --> K["`torch.jit.save(.pt file)`"]
+    K --> L["`Model ready for C++ loading`"]
+    
+    M["`Built-in models`"] --> N["`ani1x, ani2x, aimnet2, nutmeg`"]
+    N --> G
+    
+    O["`External models`"] --> P["`Custom .pt paths`"]
+    P --> G
+```
+
+**Sources:** [jit/jit.py:1-180]()
+
+### Model Compilation Process
+
+The `ModelSpec` class defines the compilation parameters for each model:
+
+| Property | Description | Usage |
+|----------|-------------|--------|
+| `cls` | Model class name | Maps to `torchani.models` attributes |
+| `infer` | Inference-only optimization | Reduces model size for deployment |
+| `kwargs` | Model parameters | Sets neighborlist and strategy options |
+
+The compilation process involves several key functions:
+
+- `_jit_compile_and_save_models_in_spec()` - Core compilation logic
+- `_reset_jit_registry()` - Clears PyTorch JIT state between compilations
+- `_disable_jit_optimizations()` - Prevents optimization bugs during compilation
+
+**Sources:** [jit/jit.py:15-93]()
+
+## C++ Engine Core
+
+The C++ engine is the performance-critical component that loads JIT-compiled models and executes neural network calculations. It manages global state, coordinates tensor operations, and handles automatic differentiation for force calculations.
+
+### Engine Architecture
+
+```mermaid
+flowchart TD
+    A["`torchani_initialize()`"] --> B["`GlobalConfig config`"]
+    A --> C["`torch::jit::Module model`"]
+    A --> D["`torchani_atomic_numbers`"]
+    
+    B --> E["`Device/precision setup`"]
+    C --> F["`torch::jit::load(.pt file)`"]
+    D --> G["`Atomic number tensors`"]
+    
+    H["`Calculation Functions`"] --> I["`torchani_calc_energy_force()`"]
+    H --> J["`torchani_energy_force_with_coupling()`"]
+    H --> K["`torchani_calc_energy_force_from_external_neighbors()`"]
+    
+    I --> L["`setup_inputs_pbc/nopbc()`"]
+    J --> L
+    K --> L
+    
+    L --> M["`model.forward(inputs)`"]
+    M --> N["`calculate_and_populate_forces()`"]
+    M --> O["`populate_potential_energy()`"]
+    
+    P["`Tensor Building`"] --> Q["`dbl_buf_to_coords_tensor()`"]
+    P --> R["`int_buf_to_neighborlist_tensor()`"]
+    Q --> L
+    R --> L
+```
+
+**Sources:** [src/torchani.cpp:22-70](), [src/torchani.cpp:371-563]()
+
+### Global State Management
+
+The engine maintains several global variables that persist across function calls:
+
+```mermaid
+classDiagram
+    class GlobalState {
+        +GlobalConfig config
+        +torch::jit::Module model
+        +torch::Tensor torchani_atomic_numbers
+        +torch::Tensor torchani_do_eval_atoms_mask
+        +torch::Tensor torchani_do_eval_idxs
+        +double HARTREE_TO_KCALMOL
+        +vector~string~ torchani_builtin_models
+    }
+    
+    class GlobalConfig {
+        -torch::TensorOptions m_opts
+        -bool m_use_no_eval_atoms
+        +dtype()
+        +device()
+        +set_device_and_precision()
+        +tensor_to_torchani_dtype_and_device()
+        +enabled_pbc()
+    }
+    
+    GlobalState --> GlobalConfig
+```
+
+The `GlobalConfig` class encapsulates device and precision settings, providing methods to convert tensors to the appropriate format for model execution.
+
+**Sources:** [src/torchani.cpp:22-32](), [src/config.h:12-64]()
+
+## Tensor Building System
+
+The tensor building system converts C-style arrays from Amber into PyTorch tensors with proper device placement, data types, and gradient requirements. This system is crucial for bridging Amber's memory layout with PyTorch's tensor operations.
+
+### Tensor Conversion Pipeline
+
+```mermaid
+flowchart LR
+    A["`C arrays from Amber`"] --> B["`torch::from_blob()`"]
+    B --> C["`Type conversion`"]
+    C --> D["`Device placement`"]
+    D --> E["`Gradient setup`"]
+    E --> F["`Batch dimension`"]
+    F --> G["`PyTorch tensors`"]
+    
+    H["`dbl_buf_to_coords_tensor()`"] --> I["`3D coordinates`"]
+    J["`int_buf_to_neighborlist_tensor()`"] --> K["`Neighbor indices`"]
+    L["`dbl_buf_to_cell_tensor()`"] --> M["`Unit cell vectors`"]
+    
+    I --> G
+    K --> G
+    M --> G
+```
+
+**Sources:** [src/build_tensors.cpp:18-70]()
+
+### Key Tensor Building Functions
+
+| Function | Input | Output | Purpose |
+|----------|-------|--------|---------|
+| `dbl_buf_to_coords_tensor()` | `double coords[][3]` | `torch::Tensor` | Atomic coordinates with gradients |
+| `int_buf_to_neighborlist_tensor()` | `int* neighborlist[2]` | `torch::Tensor` | Neighbor pair indices |
+| `dbl_buf_to_cell_tensor()` | `double cell[][3]` | `torch::Tensor` | Periodic cell vectors |
+| `dbl_buf_to_tensor()` | `void* buf` | `torch::Tensor` | Generic tensor conversion |
+
+The coordinate tensors are marked with `requires_grad_(true)` to enable automatic differentiation for force calculations.
+
+**Sources:** [src/build_tensors.h:12-45]()
+
+## Force and Energy Calculations
+
+The engine provides multiple calculation pathways for different simulation scenarios, each optimized for specific use cases.
+
+### Calculation Function Architecture
+
+```mermaid
+flowchart TD
+    A["`Input Setup`"] --> B["`setup_inputs_pbc()`"]
+    A --> C["`setup_inputs_nopbc()`"]
+    A --> D["`setup_inputs_only_bonded_pbc()`"]
+    
+    B --> E["`model.forward(inputs)`"]
+    C --> E
+    D --> E
+    
+    E --> F["`validate_model_output()`"]
+    F --> G["`torch::autograd::grad()`"]
+    G --> H["`calculate_and_populate_forces()`"]
+    
+    I["`Energy Extraction`"] --> J["`output.toTuple()->elements()[1]`"]
+    J --> K["`populate_potential_energy()`"]
+    
+    L["`Charge Calculations`"] --> M["`calculate_and_populate_charge_derivatives()`"]
+    L --> N["`populate_atomic_charges()`"]
+```
+
+**Sources:** [src/torchani.cpp:72-153](), [src/torchani.cpp:250-298]()
+
+### Force Calculation Process
+
+The force calculation uses PyTorch's automatic differentiation:
+
+1. **Setup**: Coordinates are wrapped in tensors with `requires_grad=True`
+2. **Forward Pass**: Model computes energy from coordinates
+3. **Backward Pass**: `torch::autograd::grad()` computes energy derivatives
+4. **Force Extraction**: Forces = negative gradient × unit conversion factor
+5. **Memory Transfer**: Results copied back to C arrays for Amber
+
+The `HARTREE_TO_KCALMOL` constant (627.5094738898777) converts from atomic units to kcal/mol.
+
+**Sources:** [src/torchani.cpp:250-298](), [src/torchani.cpp:31]()
+
+## Model Integration and Validation
+
+The engine includes robust model loading, validation, and configuration management to ensure compatibility with different neural network potential models.
+
+### Model Loading and Configuration
+
+```mermaid
+flowchart TD
+    A["`torchani_initialize()`"] --> B{"`Built-in model?`"}
+    B -->|Yes| C["`Construct path from jit_models_dir`"]
+    B -->|No| D["`Use provided path directly`"]
+    
+    C --> E["`Check model subdirectory`"]
+    E --> F["`aimnet2/`, `nutmeg/`, or root`"]
+    F --> G["`torch::jit::load(model_path)`"]
+    D --> G
+    
+    G --> H["`model.to(config.dtype())`"]
+    H --> I["`Configure model methods`"]
+    I --> J["`set_active_members(network_index)`"]
+    I --> K["`set_strategy(cuaev/pyaev)`"]
+    I --> L["`set_extra_features(file_data)`"]
+    
+    M["`JIT Optimizations`"] --> N["`torch::jit::setGraphExecutorOptimize(false)`"]
+    N --> O["`Disable TF32, FP16 for accuracy`"]
+```
+
+The built-in model list includes ANI, AimNet2, and NutMeg variants, with automatic path resolution based on model type.
+
+**Sources:** [src/torchani.cpp:389-562](), [src/torchani.cpp:34-69]()
+
+## Configuration Management
+
+The `GlobalConfig` class centralizes device and precision management, ensuring consistent tensor operations across the entire engine.
+
+### Configuration System
+
+```mermaid
+classDiagram
+    class GlobalConfig {
+        -torch::TensorOptions m_opts
+        -bool m_use_no_eval_atoms
+        +set_device_and_precision(use_cuda, device_idx, use_double)
+        +tensor_to_torchani_dtype_and_device(tensor)
+        +enabled_pbc()
+        +device()
+        +dtype()
+    }
+    
+    class TensorOperations {
+        +dbl_buf_to_coords_tensor(config, coords, num_atoms)
+        +int_buf_to_neighborlist_tensor(config, neighborlist, num_neighbors)
+        +config.tensor_to_torchani_dtype_and_device(tensor)
+    }
+    
+    GlobalConfig --> TensorOperations : "configures"
+```
+
+The configuration system handles:
+- **Device Selection**: CPU vs CUDA with specific device indices
+- **Precision Management**: Float32 vs Float64 for different accuracy requirements
+- **PBC Settings**: Automatic periodic boundary condition tensor generation
+- **Atom Masking**: Support for excluding atoms from neural network evaluation
+
+**Sources:** [src/config.h:9-64]()
+
+---
+
+# Page: API Reference
+
+# API Reference
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.gitmodules](.gitmodules)
+- [include/torchani.h](include/torchani.h)
+- [src-fortran/torchani.F90](src-fortran/torchani.F90)
+- [tests/tests.cpp](tests/tests.cpp)
+
+</details>
+
+
+
+This document provides a complete reference for the C and Fortran APIs that enable integration of TorchANI neural network potentials with Amber molecular dynamics simulations. The APIs handle model initialization, energy and force calculations, charge predictions, and ML/MM coupling for various simulation scenarios.
+
+For information about the underlying C++ engine implementation, see [C++ Engine and JIT System](#3.1). For simulation configuration details, see [Simulation Configuration](#4.1).
+
+## API Architecture Overview
+
+The TorchANI-Amber API is structured in two layers: a core C interface that directly wraps the C++ implementation, and a Fortran interface that provides both direct bindings and convenience wrappers for Amber integration.
+
+**API Layer Architecture**
+
+```mermaid
+graph TB
+    subgraph "Amber Integration Layer"
+        SANDER["sander/pmemd MD Engines"]
+        AMBER_CALLS["Amber Force Calculations"]
+    end
+    
+    subgraph "Fortran Interface Layer"
+        FORTRAN_API["torchani.F90<br/>Fortran Module"]
+        FORTRAN_WRAPPERS["Convenience Wrappers<br/>torchani_energy_force<br/>torchani_energy_force_pbc"]
+        FORTRAN_DIRECT["Direct Bindings<br/>torchani_calc_energy_force<br/>torchani_initialize"]
+    end
+    
+    subgraph "C Interface Layer"
+        C_API["torchani.h<br/>C External Interface"]
+        INIT_FUNC["torchani_initialize"]
+        CALC_FUNC["torchani_calc_energy_force"]
+        CHARGES_FUNC["torchani_energy_force_atomic_charges"]
+        COUPLING_FUNC["torchani_energy_force_with_coupling"]
+    end
+    
+    subgraph "C++ Engine"
+        CPP_IMPL["torchani.cpp<br/>Implementation"]
+        PYTORCH["PyTorch JIT Runtime"]
+    end
+    
+    AMBER_CALLS --> FORTRAN_WRAPPERS
+    AMBER_CALLS --> FORTRAN_DIRECT
+    FORTRAN_WRAPPERS --> FORTRAN_DIRECT
+    FORTRAN_DIRECT --> C_API
+    
+    C_API --> INIT_FUNC
+    C_API --> CALC_FUNC
+    C_API --> CHARGES_FUNC
+    C_API --> COUPLING_FUNC
+    
+    INIT_FUNC --> CPP_IMPL
+    CALC_FUNC --> CPP_IMPL
+    CHARGES_FUNC --> CPP_IMPL
+    COUPLING_FUNC --> CPP_IMPL
+    
+    CPP_IMPL --> PYTORCH
+```
+
+Sources: [include/torchani.h:1-109](), [src-fortran/torchani.F90:1-782]()
+
+## C API Reference
+
+The C API provides the core interface functions for model initialization and various types of energy/force calculations. All functions use C-compatible data types and follow C calling conventions.
+
+### Initialization Function
+
+**`torchani_initialize`**
+
+Initializes a TorchANI model for subsequent energy and force calculations.
+
+```c
+void torchani_initialize(
+    int num_atoms,
+    int atomic_nums[],      // Shape (num_atoms,)
+    int no_eval_atoms[],    // Shape (num_atoms,)
+    const char* model_type,
+    int device_index,
+    int network_index,
+    bool use_double_precision,
+    bool use_cuda_device,
+    bool use_cuaev
+);
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `num_atoms` | `int` | Total number of atoms in the system |
+| `atomic_nums` | `int[]` | Array of atomic numbers for each atom |
+| `no_eval_atoms` | `int[]` | Mask array: 1 = skip evaluation, 0 = evaluate |
+| `model_type` | `const char*` | Model name: "ani1x", "ani1ccx", "ani2x", "animbis" |
+| `device_index` | `int` | CUDA device index (0 for first GPU, ignored for CPU) |
+| `network_index` | `int` | Network ensemble index (-1 for all networks) |
+| `use_double_precision` | `bool` | Use double precision calculations |
+| `use_cuda_device` | `bool` | Enable CUDA acceleration |
+| `use_cuaev` | `bool` | Use CUDA-accelerated AEV calculations |
+
+Sources: [include/torchani.h:4-14]()
+
+### Core Energy and Force Functions
+
+**`torchani_calc_energy_force`**
+
+Calculates energy and forces for a molecular system with optional periodic boundary conditions.
+
+```c
+void torchani_calc_energy_force(
+    int num_atoms,
+    double coords[][3],        // Shape (num_atoms, 3)
+    double cell[][3],          // Shape (3, 3)
+    bool use_pbc,
+    int* molecule_idxs_buf,    // Shape (num_atoms,)
+    bool calc_only_bonded,
+    int net_charge,
+    /* outputs */
+    double forces[][3],        // Shape (num_atoms, 3)
+    double* potential_energy   // Scalar
+);
+```
+
+**`torchani_calc_energy_force_from_external_neighbors`**
+
+Calculates energy and forces using a pre-computed neighbor list, typically from Amber's neighbor list generation.
+
+```c
+void torchani_calc_energy_force_from_external_neighbors(
+    int num_atoms,
+    int num_neighbors,
+    double coords[][3],        // Shape (num_atoms, 3)
+    int* neighborlist[2],      // Shape (2, num_neighbors)
+    double shifts[][3],        // Shape (num_neighbors, 3)
+    int* molecule_idxs_buf,    // Shape (num_atoms,)
+    bool calc_only_bonded,
+    int net_charge,
+    /* outputs */
+    double forces[][3],        // Shape (num_atoms, 3)
+    double* potential_energy
+);
+```
+
+Sources: [include/torchani.h:16-41]()
+
+### Charge Prediction Functions
+
+**`torchani_energy_force_atomic_charges`**
+
+Calculates energy, forces, and atomic charges for charge-capable models like animbis.
+
+```c
+void torchani_energy_force_atomic_charges(
+    int num_atoms,
+    double coords[][3],        // Shape (num_atoms, 3)
+    /* outputs */
+    double forces[][3],        // Shape (num_atoms, 3)
+    double atomic_charges[],   // Shape (num_atoms,)
+    double* potential_energy   // Scalar
+);
+```
+
+**`torchani_energy_force_atomic_charges_with_derivatives`**
+
+Extended charge calculation that also provides charge derivatives for ML/MM coupling.
+
+```c
+void torchani_energy_force_atomic_charges_with_derivatives(
+    int num_atoms,
+    double coords[][3],        // Shape (num_atoms, 3)
+    /* outputs */
+    double forces[][3],        // Shape (num_atoms, 3)
+    double atomic_charges[],   // Shape (num_atoms,)
+    double* atomic_charges_grad,  // Shape (num_atoms, num_atoms, 3)
+    double* potential_energy   // Scalar
+);
+```
+
+The `atomic_charges_grad` array stores derivatives where element `[i, j, k]` represents the derivative of the charge on atom `k` with respect to the `i`-th coordinate of atom `j`.
+
+Sources: [include/torchani.h:43-64]()
+
+### ML/MM Coupling Functions
+
+**`torchani_energy_force_with_coupling`**
+
+Performs energy and force calculations with electrostatic coupling to external point charges for ML/MM simulations.
+
+```c
+void torchani_energy_force_with_coupling(
+    int num_atoms,
+    int num_env_charges,
+    double distortion_k,
+    double coords_buf[][3],
+    double atomic_alphas_buf[],        // Shape (num_atoms,)
+    double env_charge_coords_buf[][3], // Shape (num_env_charges, 3)
+    double env_charges_buf[],          // Shape (num_env_charges,)
+    bool predict_charges,
+    bool use_simple_polarization_correction,
+    bool use_charge_derivatives,
+    /* outputs */
+    double forces_on_atoms_buf[][3],     // Shape (num_atoms, 3)
+    double forces_on_env_charges_buf[][3], // Shape (num_env_charges, 3)
+    double atomic_charges_buf[],         // Shape (num_atoms,)
+    double* ene_pot_invacuo_buf,
+    double* ene_pot_embed_pol_buf,
+    double* ene_pot_embed_dist_buf,
+    double* ene_pot_embed_coulomb_buf,
+    double* ene_pot_total_buf
+);
+```
+
+This function decomposes the total potential energy into vacuum, polarization, distortion, and Coulomb embedding components for detailed analysis of ML/MM interactions.
+
+Sources: [include/torchani.h:87-107]()
+
+## Fortran Interface Reference
+
+The Fortran interface provides both direct C bindings and higher-level convenience wrappers that simplify common usage patterns in Amber simulations.
+
+### Module Structure
+
+**Fortran API Organization**
+
+```mermaid
+graph TB
+    subgraph "torchani Fortran Module"
+        PUBLIC_INTERFACE["Public Interface"]
+        DIRECT_BINDINGS["Direct C Bindings<br/>internal_* procedures"]
+        WRAPPER_FUNCTIONS["Convenience Wrappers"]
+        UTILITY_FUNCTIONS["Utility Functions"]
+    end
+    
+    subgraph "Direct Bindings"
+        INIT_BIND["internal_initialize"]
+        CALC_BIND["internal_energy_force"]
+        NEIGHBOR_BIND["internal_energy_force_from_external_neighbors"]
+        COUPLING_BIND["internal_energy_force_with_coupling"]
+    end
+    
+    subgraph "Convenience Wrappers"
+        SIMPLE_EF["torchani_energy_force"]
+        PBC_EF["torchani_energy_force_pbc"]
+        BONDED_EF["torchani_bonded_energy_force_pbc"]
+        LEGACY_INIT["torchani_init_model"]
+    end
+    
+    subgraph "Utility Functions"
+        SANDER_CONV["convert_sander_neighborlist_to_ani_fmt"]
+        PMEMD_CONV["convert_pmemd_neighborlist_to_ani_fmt"]
+        WALLTIME["torchani_dump_walltime"]
+        BOOL_CONV["fbool_to_cbool"]
+    end
+    
+    PUBLIC_INTERFACE --> DIRECT_BINDINGS
+    PUBLIC_INTERFACE --> WRAPPER_FUNCTIONS
+    PUBLIC_INTERFACE --> UTILITY_FUNCTIONS
+    
+    WRAPPER_FUNCTIONS --> DIRECT_BINDINGS
+```
+
+Sources: [src-fortran/torchani.F90:1-24]()
+
+### Key Fortran Wrapper Functions
+
+**`torchani_initialize`**
+
+High-level Fortran wrapper for model initialization with automatic array size detection and type conversion.
+
+```fortran
+subroutine torchani_initialize(
+    atomic_nums,
+    no_eval_atoms,
+    device_index,
+    model_type,
+    network_index,
+    use_double_precision,
+    use_cuda_device,
+    use_cuaev
+)
+```
+
+**`torchani_energy_force`**
+
+Simplified energy/force calculation for non-periodic systems.
+
+```fortran
+subroutine torchani_energy_force(
+    num_atoms,
+    coords,
+    forces,
+    potential_energy
+)
+```
+
+**`torchani_energy_force_pbc`**
+
+Energy/force calculation with periodic boundary conditions.
+
+```fortran
+subroutine torchani_energy_force_pbc(
+    num_atoms,
+    coords,
+    cell,
+    forces,
+    potential_energy
+)
+```
+
+Sources: [src-fortran/torchani.F90:283-543]()
+
+### Neighbor List Conversion Utilities
+
+The Fortran interface provides specialized functions to convert Amber's neighbor list formats to the format expected by TorchANI.
+
+**`convert_sander_neighborlist_to_ani_fmt`**
+
+Converts sander's image-based neighbor list to TorchANI format.
+
+**`convert_pmemd_neighborlist_to_ani_fmt`**
+
+Converts pmemd's neighbor list format to TorchANI format.
+
+These utilities handle the complex mapping between Amber's internal neighbor representations and TorchANI's expectations, including proper handling of periodic boundary conditions and translation vectors.
+
+Sources: [src-fortran/torchani.F90:591-713]()
+
+## Function Call Flow Patterns
+
+**Typical API Usage Flow**
+
+```mermaid
+flowchart TD
+    START["Simulation Start"]
+    INIT["torchani_initialize<br/>• Load model<br/>• Set device/precision<br/>• Initialize tensors"]
+    
+    subgraph "MD Loop"
+        COORDS["Update Coordinates"]
+        NEIGHBORS["Generate Neighbor List<br/>(Optional)"]
+        CALC_CHOICE{"Calculation Type"}
+        
+        BASIC_CALC["torchani_calc_energy_force<br/>Basic E&F calculation"]
+        NEIGHBOR_CALC["torchani_calc_energy_force_from_external_neighbors<br/>Use pre-computed neighbors"]
+        CHARGES_CALC["torchani_energy_force_atomic_charges<br/>E&F with charges"]
+        COUPLING_CALC["torchani_energy_force_with_coupling<br/>ML/MM coupling"]
+        
+        UPDATE_FORCES["Update Forces in MD"]
+    end
+    
+    START --> INIT
+    INIT --> COORDS
+    COORDS --> NEIGHBORS
+    NEIGHBORS --> CALC_CHOICE
+    
+    CALC_CHOICE --> BASIC_CALC
+    CALC_CHOICE --> NEIGHBOR_CALC
+    CALC_CHOICE --> CHARGES_CALC
+    CALC_CHOICE --> COUPLING_CALC
+    
+    BASIC_CALC --> UPDATE_FORCES
+    NEIGHBOR_CALC --> UPDATE_FORCES
+    CHARGES_CALC --> UPDATE_FORCES
+    COUPLING_CALC --> UPDATE_FORCES
+    
+    UPDATE_FORCES --> COORDS
+```
+
+Sources: [tests/tests.cpp:94-146](), [include/torchani.h:4-107]()
+
+## Parameter Specifications
+
+### Model Types
+
+| Model Type | Description | Charge Prediction | Elements Supported |
+|------------|-------------|-------------------|-------------------|
+| `"ani1x"` | ANI-1x model | No | H, C, N, O |
+| `"ani1ccx"` | ANI-1ccx model | No | H, C, N, O |
+| `"ani2x"` | ANI-2x model | No | H, C, N, O |
+| `"animbis"` | ANI with MBIS charges | Yes | H, C, N, O |
+
+### Array Layouts and Memory Management
+
+- **Coordinates**: Row-major layout `coords[atom_idx][xyz]`
+- **Forces**: Row-major layout `forces[atom_idx][xyz]`
+- **Cell matrix**: Row-major layout `cell[3][3]` representing unit cell vectors
+- **Neighbor lists**: Format `neighborlist[pair_idx][atom1/atom2]`
+- **Charge derivatives**: Layout `[num_atoms, num_atoms, 3]` with Fortran ordering
+
+### Boolean Parameter Conventions
+
+The C API uses C99 `bool` types, while the Fortran interface automatically converts between Fortran logical types and C boolean types using the `fbool_to_cbool` utility function.
+
+Sources: [include/torchani.h:1-109](), [src-fortran/torchani.F90:733-740]()
+
+---
+
+# Page: Model Wrappers
+
+# Model Wrappers
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [jit/aimnet2_wrapper.py](jit/aimnet2_wrapper.py)
+- [jit/nutmeg_wrapper.py](jit/nutmeg_wrapper.py)
+
+</details>
+
+
+
+This document covers the model wrapper system that enables integration of external neural network potentials into TorchANI-Amber. Model wrappers provide a standardized interface for different neural network architectures, handling coordinate transformations, neighbor list calculations, and unit conversions.
+
+For information about the core C++ integration layer, see [C++ Engine and JIT System](#3.1). For simulation configuration details, see [Simulation Configuration](#4.1).
+
+## Purpose and Architecture
+
+Model wrappers serve as adaptation layers that allow external neural network potentials to interface with the TorchANI-Amber system. They handle the differences in input formats, coordinate systems, and output structures between various neural network implementations.
+
+### Wrapper System Architecture
+
+```mermaid
+graph TB
+    subgraph "External Models"
+        AIMNET["AimNet2 Models<br/>.pt files"]
+        NUTMEG["Nutmeg Models<br/>.pt files"]
+        OTHER["Other NN Models"]
+    end
+    
+    subgraph "Wrapper Layer"
+        AIM_WRAP["AimNet2Wrapper<br/>torchani.nn.Module"]
+        AIM_MBIS["AimNet2Mbis<br/>torchani.nn.Module"]
+        NUT_WRAP["NutmegWrapper<br/>torchani.nn.Module"]
+    end
+    
+    subgraph "TorchANI Interface"
+        COMMON["Common Interface<br/>forward(species_coords)"]
+        NLIST["Neighbor Lists<br/>AdaptiveList"]
+        UNITS["Unit Conversion<br/>Hartree/eV/kJ·mol⁻¹"]
+    end
+    
+    subgraph "Output"
+        SPECIES["Species Tensors"]
+        ENERGIES["Energy Values"]
+        CHARGES["Atomic Charges"]
+    end
+    
+    AIMNET --> AIM_WRAP
+    AIMNET --> AIM_MBIS
+    NUTMEG --> NUT_WRAP
+    OTHER --> NUT_WRAP
+    
+    AIM_WRAP --> COMMON
+    AIM_MBIS --> COMMON
+    NUT_WRAP --> COMMON
+    
+    COMMON --> NLIST
+    COMMON --> UNITS
+    
+    NLIST --> SPECIES
+    UNITS --> ENERGIES
+    COMMON --> CHARGES
+    
+    style AIM_WRAP fill:#e1f5fe
+    style COMMON fill:#e8f5e8
+    style NLIST fill:#fff3e0
+```
+
+**Sources:** [jit/aimnet2_wrapper.py:54-338](), [jit/nutmeg_wrapper.py:18-152]()
+
+### Data Flow Through Wrappers
+
+```mermaid
+flowchart LR
+    subgraph "Input Processing"
+        COORDS["Coordinates<br/>Tensor[batch, atoms, 3]"]
+        SPECIES["Species<br/>Tensor[batch, atoms]"]
+        CELL["Cell Parameters<br/>Optional[Tensor]"]
+        PBC["Periodic Boundary<br/>Optional[Tensor]"]
+    end
+    
+    subgraph "Wrapper Processing"
+        NLIST_CALC["Neighbor List<br/>AdaptiveList._nlist()"]
+        COORD_TRANS["Coordinate Transform<br/>Units & Format"]
+        FEAT_BUILD["Feature Building<br/>Atom Types & Charges"]
+    end
+    
+    subgraph "Model Execution"
+        EXTERNAL["External Model<br/>model.forward()"]
+        POST_PROC["Post Processing<br/>Unit Conversion"]
+    end
+    
+    subgraph "Output"
+        OUT_SPECIES["Species"]
+        OUT_ENERGY["Energies"]
+        OUT_CHARGES["Atomic Charges"]
+    end
+    
+    COORDS --> NLIST_CALC
+    SPECIES --> NLIST_CALC
+    CELL --> NLIST_CALC
+    PBC --> NLIST_CALC
+    
+    NLIST_CALC --> COORD_TRANS
+    COORD_TRANS --> FEAT_BUILD
+    FEAT_BUILD --> EXTERNAL
+    
+    EXTERNAL --> POST_PROC
+    POST_PROC --> OUT_SPECIES
+    POST_PROC --> OUT_ENERGY
+    POST_PROC --> OUT_CHARGES
+    
+    style NLIST_CALC fill:#fff3e0
+    style EXTERNAL fill:#e1f5fe
+    style POST_PROC fill:#e8f5e8
+```
+
+**Sources:** [jit/aimnet2_wrapper.py:120-195](), [jit/nutmeg_wrapper.py:106-151]()
+
+## AimNet2 Wrapper System
+
+The AimNet2 wrapper system provides integration for AimNet2 neural network potentials, supporting multiple long-range electrostatic treatment methods and charge prediction schemes.
+
+### AimNet2Wrapper Class
+
+The `AimNet2Wrapper` class provides the primary interface for AimNet2 models:
+
+| Component | Description | Configuration |
+|-----------|-------------|---------------|
+| `method_lr` | Long-range method | `"simple"`, `"dsf"`, `"ewald"` |
+| `cutoff_lr` | Long-range cutoff | `None` (auto), or float value |
+| `dsf_alpha` | DSF damping parameter | `None` (auto), or float value |
+| `output_hartree` | Energy units | `True` (Hartree), `False` (eV) |
+
+**Core Methods:**
+
+- `from_jit_file(path, device, **kwargs)` - Load model from JIT file
+- `forward(species_coords, cell, pbc, charge, atomic, ensemble_values)` - Main inference
+- `_calc_neighbors(species, coords, cell, pbc)` - Neighbor list calculation
+
+### Long-Range Electrostatic Methods
+
+```mermaid
+graph TB
+    subgraph "Method Types"
+        SIMPLE["method_lr='simple'<br/>No cutoff (inf)"]
+        DSF["method_lr='dsf'<br/>Damped Shifted Force"]
+        EWALD["method_lr='ewald'<br/>Ewald summation"]
+    end
+    
+    subgraph "Configuration"
+        CUTOFF["cutoff_lr parameter<br/>Default: 15.0 Å"]
+        ALPHA["dsf_alpha parameter<br/>Default: 0.2"]
+        VALIDATION["Parameter Validation<br/>_validate_lr_params()"]
+    end
+    
+    subgraph "Model Application"
+        MODULE_FIND["Find .lrcoulomb modules<br/>model.named_modules()"]
+        METHOD_SET["Set module.method<br/>Set module.dsf_alpha"]
+        CUTOFF_CHECK["Validate cutoff_lr < model.cutoff"]
+    end
+    
+    SIMPLE --> CUTOFF
+    DSF --> CUTOFF
+    DSF --> ALPHA
+    EWALD --> CUTOFF
+    
+    CUTOFF --> VALIDATION
+    ALPHA --> VALIDATION
+    VALIDATION --> MODULE_FIND
+    
+    MODULE_FIND --> METHOD_SET
+    METHOD_SET --> CUTOFF_CHECK
+    
+    style DSF fill:#e1f5fe
+    style VALIDATION fill:#fff3e0
+    style METHOD_SET fill:#e8f5e8
+```
+
+**Sources:** [jit/aimnet2_wrapper.py:74-95](), [jit/aimnet2_wrapper.py:100-104]()
+
+### AimNet2Mbis Charge Prediction
+
+The `AimNet2Mbis` class extends `AimNet2Wrapper` to use MBIS (Minimal Basis Iterative Stockholder) charge prediction instead of Hirshfeld charges:
+
+```mermaid
+graph LR
+    subgraph "AimNet2Mbis Components"
+        BASE["AimNet2Wrapper<br/>Base functionality"]
+        ASSEMBLER["Assembler<br/>ANIq model builder"]
+        CHARGE_NET["Charge Networks<br/>_ANINetworksDiscardFirstScalar"]
+        NORMALIZER["ChargeNormalizer<br/>electronegativity_and_hardness"]
+    end
+    
+    subgraph "State Dict Loading"
+        ANI2X["ani2x_state_dict.pt<br/>AEV parameters"]
+        CHARGE_DICT["charge_nn_state_dict.pt<br/>Charge network weights"]
+    end
+    
+    subgraph "Execution Flow"
+        AIMNET_FORWARD["_run_aimnet_forward()<br/>Energy calculation"]
+        CHARGE_FORWARD["_charge_model.compute_from_neighbors()<br/>MBIS charges"]
+        COMBINE["Combine results<br/>SpeciesEnergiesAtomicCharges"]
+    end
+    
+    BASE --> ASSEMBLER
+    ASSEMBLER --> CHARGE_NET
+    CHARGE_NET --> NORMALIZER
+    
+    ANI2X --> CHARGE_NET
+    CHARGE_DICT --> CHARGE_NET
+    
+    AIMNET_FORWARD --> CHARGE_FORWARD
+    CHARGE_FORWARD --> COMBINE
+    
+    style CHARGE_NET fill:#e1f5fe
+    style COMBINE fill:#e8f5e8
+```
+
+**Sources:** [jit/aimnet2_wrapper.py:257-338](), [jit/aimnet2_wrapper.py:268-298]()
+
+## Nutmeg Wrapper System
+
+The `NutmegWrapper` class provides integration for Nutmeg neural network potentials, which use different atomic representations and units.
+
+### Atomic Number Mapping
+
+Nutmeg models use a specific mapping from atomic numbers to internal indices:
+
+| Atomic Number | Element | Internal Index |
+|---------------|---------|----------------|
+| 1 | H | 0 |
+| 6 | C | 3 |
+| 7 | N | 4 |
+| 8 | O | 5 |
+| 9 | F | 6 |
+| 16 | S | 11 |
+| 17 | Cl | 12 |
+| 35 | Br | 15 |
+| 53 | I | 16 |
+
+### Feature Engineering
+
+```mermaid
+graph TB
+    subgraph "Input Processing"
+        SPECIES_IN["Species Tensor<br/>Atomic numbers"]
+        COORDS_IN["Coordinates<br/>Angstroms"]
+        CHARGES_IN["Atomic Charges<br/>Gasteiger charges"]
+    end
+    
+    subgraph "Feature Creation"
+        TYPE_MAP["_types_map<br/>Z_NUM_IDX_MAP lookup"]
+        ONE_HOT["One-hot encoding<br/>17 element types"]
+        CHARGE_FEAT["Charge features<br/>_atomic_charges"]
+    end
+    
+    subgraph "Model Input"
+        NODE_ATTRS["node_attrs<br/>Concatenated features"]
+        EDGE_INDEX["edge_index<br/>Neighbor pairs"]
+        COORDINATES["coordinates<br/>Nanometers"]
+        CELL_SHIFT["cell_shift_vector<br/>PBC shifts"]
+    end
+    
+    SPECIES_IN --> TYPE_MAP
+    TYPE_MAP --> ONE_HOT
+    CHARGES_IN --> CHARGE_FEAT
+    
+    ONE_HOT --> NODE_ATTRS
+    CHARGE_FEAT --> NODE_ATTRS
+    COORDS_IN --> COORDINATES
+    
+    NODE_ATTRS --> MODEL_INPUT["Nutmeg Model"]
+    EDGE_INDEX --> MODEL_INPUT
+    COORDINATES --> MODEL_INPUT
+    CELL_SHIFT --> MODEL_INPUT
+    
+    style TYPE_MAP fill:#fff3e0
+    style NODE_ATTRS fill:#e1f5fe
+    style MODEL_INPUT fill:#e8f5e8
+```
+
+**Sources:** [jit/nutmeg_wrapper.py:19-37](), [jit/nutmeg_wrapper.py:70-81](), [jit/nutmeg_wrapper.py:134-149]()
+
+### Unit Conversion System
+
+The Nutmeg wrapper handles multiple unit conversions:
+
+| Conversion | Factor | Purpose |
+|------------|--------|---------|
+| kJ/mol → Hartree | `1 / HARTREE_TO_KJOULEMOL` | Energy units |
+| Angstrom → Nanometer | `0.1` | Distance units |
+| Cutoff scaling | `/self._angstrom_to_nm` | Neighbor list cutoff |
+
+**Sources:** [jit/nutmeg_wrapper.py:54-56]()
+
+## Common Interface Patterns
+
+All model wrappers implement a consistent interface for integration with the TorchANI-Amber system.
+
+### Standard Forward Method Signature
+
+```python
+def forward(
+    self,
+    species_coords: Tuple[Tensor, Tensor],
+    cell: Optional[Tensor] = None,
+    pbc: Optional[Tensor] = None,
+    charge: int = 0,
+    atomic: bool = False,
+    ensemble_values: bool = False,
+    _molecule_idxs: Optional[Tensor] = None,
+) -> Union[SpeciesEnergiesAtomicCharges, Tuple[Tensor, Tensor]]
+```
+
+### Neighbor List Management
+
+All wrappers use the `AdaptiveList` neighbor list implementation:
+
+```mermaid
+graph LR
+    subgraph "Neighbor List Workflow"
+        INIT["AdaptiveList()<br/>Initialize neighbor list"]
+        COMPUTE["_nlist(cutoff, species, coords, cell, pbc)<br/>Compute neighbors"]
+        FILTER["discard_inter_molecule_pairs()<br/>Optional molecule filtering"]
+        PROCESS["Wrapper-specific processing<br/>Format conversion"]
+    end
+    
+    INIT --> COMPUTE
+    COMPUTE --> FILTER
+    FILTER --> PROCESS
+    
+    style COMPUTE fill:#e1f5fe
+    style FILTER fill:#fff3e0
+    style PROCESS fill:#e8f5e8
+```
+
+**Sources:** [jit/aimnet2_wrapper.py:99](), [jit/aimnet2_wrapper.py:232-254](), [jit/nutmeg_wrapper.py:60](), [jit/nutmeg_wrapper.py:82-104]()
+
+### JIT Compilation Support
+
+Model wrappers support TorchScript compilation for deployment:
+
+```python
+# Example compilation pattern
+model = AimNet2Wrapper.from_jit_file("model.pt")
+scripted_model = torch.jit.script(model)
+torch.jit.save(scripted_model, "compiled_model.pt")
+```
+
+**Sources:** [jit/aimnet2_wrapper.py:481-487](), [jit/nutmeg_wrapper.py:156-159]()
+
+---
+
+# Page: Amber Integration
+
+# Amber Integration
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [ani-amber-logo-dark.png](ani-amber-logo-dark.png)
+- [ani-amber-logo-light.png](ani-amber-logo-light.png)
+- [src/electro.cpp](src/electro.cpp)
+- [src/electro.h](src/electro.h)
+- [tests/templates/input.mdin.jinja](tests/templates/input.mdin.jinja)
+- [tests/test_amber_integration.py](tests/test_amber_integration.py)
+
+</details>
+
+
+
+This document provides a comprehensive overview of how TorchANI integrates with the Amber molecular dynamics simulation suite. It covers the architecture, integration modes, and configuration mechanisms that enable neural network potentials to be used within Amber's `pmemd` and `sander` engines.
+
+For detailed configuration options and namelist parameters, see [Simulation Configuration](#4.1). For ML/MM setup specifics and coupling schemes, see [ML/MM Setup and Coupling](#4.2). For example configurations and templates, see [Input Templates and Examples](#4.3).
+
+## Integration Architecture
+
+TorchANI-Amber provides two primary integration pathways with Amber: external potential interface for full-ML simulations and QM/MM interface for hybrid ML/MM simulations. Both pathways utilize the same core C++ engine but interface with different Amber subsystems.
+
+```mermaid
+graph TB
+    subgraph "Amber MD Engines"
+        PMEMD["pmemd"]
+        SANDER["sander"]
+    end
+    
+    subgraph "Integration Interfaces"
+        EXTPOT["External Potential Interface<br/>iextpot=1, extprog='TORCHANI'"]
+        QMMM["QM/MM Interface<br/>ifqnt=1, qm_theory='EXTERN'"]
+    end
+    
+    subgraph "TorchANI Core Engine"
+        CAPI["torchani.h<br/>C API Functions"]
+        FAPI["torchani.F90<br/>Fortran Interface"]
+        CPP["torchani.cpp<br/>Core Implementation"]
+    end
+    
+    subgraph "Neural Network Backend"
+        JIT["PyTorch JIT Models<br/>.pt files"]
+        CUAEV["cuAEV Extensions<br/>CUDA Acceleration"]
+    end
+    
+    PMEMD --> EXTPOT
+    PMEMD --> QMMM
+    SANDER --> EXTPOT
+    SANDER --> QMMM
+    
+    EXTPOT --> FAPI
+    QMMM --> FAPI
+    FAPI --> CAPI
+    CAPI --> CPP
+    
+    CPP --> JIT
+    CPP --> CUAEV
+```
+
+Sources: [README.md:9-18](), [README.md:172-184](), [tests/test_amber_integration.py:32-76]()
+
+## Integration Modes
+
+TorchANI-Amber supports two distinct integration modes, each targeting different simulation scenarios and utilizing different Amber interfaces.
+
+### Full-ML Mode
+
+```mermaid
+graph LR
+    subgraph "Amber Configuration"
+        MDIN1["mdin file<br/>iextpot=1"]
+        EXTPOT1["&extpot namelist<br/>extprog='TORCHANI'"]
+        ANI1["&ani namelist<br/>model configuration"]
+    end
+    
+    subgraph "Integration Flow"
+        AMBER1["Amber Engine"] --> EXT_IF["External Potential<br/>Interface"]
+        EXT_IF --> TORCHANI1["TorchANI Engine"]
+        TORCHANI1 --> FORCES1["Forces & Energies"]
+        FORCES1 --> AMBER1
+    end
+    
+    MDIN1 --> AMBER1
+    EXTPOT1 --> EXT_IF
+    ANI1 --> TORCHANI1
+```
+
+In full-ML mode, the entire molecular system's potential energy is calculated using neural network models. This mode uses Amber's external potential interface (`iextpot=1`) and requires the `&extpot` namelist with `extprog='TORCHANI'`.
+
+### ML/MM Mode
+
+```mermaid
+graph LR
+    subgraph "Amber Configuration"
+        MDIN2["mdin file<br/>ifqnt=1"]
+        QMMM2["&qmmm namelist<br/>qm_theory='EXTERN'"]
+        ANI2["&ani namelist<br/>ML/MM options"]
+    end
+    
+    subgraph "System Partitioning"
+        QM_REGION["QM Region<br/>(Neural Network)"]
+        MM_REGION["MM Region<br/>(Force Field)"]
+        COUPLING["ML/MM Coupling<br/>Electrostatic"]
+    end
+    
+    subgraph "Integration Flow"
+        AMBER2["Sander Engine"] --> QMMM_IF["QM/MM Interface"]
+        QMMM_IF --> QM_REGION
+        QMMM_IF --> MM_REGION
+        QM_REGION --> COUPLING
+        MM_REGION --> COUPLING
+        COUPLING --> FORCES2["Combined Forces"]
+        FORCES2 --> AMBER2
+    end
+    
+    MDIN2 --> AMBER2
+    QMMM2 --> QMMM_IF
+    ANI2 --> QM_REGION
+```
+
+ML/MM mode partitions the system into QM and MM regions, using neural networks for the QM region and classical force fields for the MM region. This mode requires `ifqnt=1` and uses Amber's QM/MM subsystem with `qm_theory='EXTERN'`.
+
+Sources: [README.md:116-170](), [README.md:172-257](), [tests/templates/input.mdin.jinja:3-47]()
+
+## Electrostatic Coupling Mechanisms
+
+The ML/MM interface implements sophisticated electrostatic coupling schemes to handle the interaction between QM and MM regions.
+
+```mermaid
+graph TB
+    subgraph "Coupling Types"
+        COULOMBIC["Coulombic Coupling<br/>mlmm_coupling=0<br/>Fixed charges"]
+        POLARIZABLE["Simple Polarizable Coupling<br/>mlmm_coupling=1<br/>Variable charges"]
+    end
+    
+    subgraph "Charge Handling"
+        FIXED["use_torchani_charges=false<br/>Topology charges"]
+        PREDICTED["use_torchani_charges=true<br/>Neural network charges"]
+    end
+    
+    subgraph "Electrostatic Functions"
+        COULOMB_FUNC["coulombic_embedding_energy()<br/>electro.cpp:78-88"]
+        POLAR_FUNC["polarizable_embedding_energy()<br/>electro.cpp:61-77"]
+        EFIELD["calc_efield()<br/>electro.cpp:24-39"]
+    end
+    
+    COULOMBIC --> FIXED
+    COULOMBIC --> COULOMB_FUNC
+    POLARIZABLE --> PREDICTED
+    POLARIZABLE --> POLAR_FUNC
+    POLAR_FUNC --> EFIELD
+```
+
+The electrostatic coupling is implemented through dedicated functions in the `electro` namespace that calculate electric fields, polarization energies, and Coulombic interactions between QM and MM regions.
+
+Sources: [src/electro.cpp:78-88](), [src/electro.cpp:61-77](), [src/electro.h:4-18](), [README.md:197-212]()
+
+## Configuration Flow
+
+```mermaid
+graph TD
+    subgraph "Input Configuration"
+        TEMPLATE["Jinja2 Templates<br/>input.mdin.jinja"]
+        MDIN["Generated mdin file"]
+        SYSTEM["System Files<br/>.prmtop, .inpcrd"]
+    end
+    
+    subgraph "Runtime Configuration"
+        NAMELISTS["Amber Namelists<br/>&cntrl, &extpot, &qmmm, &ani"]
+        INIT["torchani_initialize()"]
+        MODEL_LOAD["Model Loading<br/>torch::jit::load()"]
+    end
+    
+    subgraph "Execution Flow"
+        MD_LOOP["MD Time Step"]
+        COORD_PASS["Coordinate Transfer"]
+        ENERGY_CALC["Energy/Force Calculation"]
+        FORCE_RETURN["Force Return"]
+    end
+    
+    TEMPLATE --> MDIN
+    MDIN --> NAMELISTS
+    NAMELISTS --> INIT
+    INIT --> MODEL_LOAD
+    MODEL_LOAD --> MD_LOOP
+    
+    MD_LOOP --> COORD_PASS
+    COORD_PASS --> ENERGY_CALC
+    ENERGY_CALC --> FORCE_RETURN
+    FORCE_RETURN --> MD_LOOP
+```
+
+The configuration process involves template-based mdin file generation, namelist parsing, model initialization, and runtime execution through Amber's MD loop.
+
+Sources: [tests/templates/input.mdin.jinja:1-98](), [tests/test_amber_integration.py:344-380]()
+
+## Interface API Structure
+
+The integration is implemented through a layered API structure that provides both C and Fortran interfaces to accommodate Amber's mixed-language codebase.
+
+| Interface Layer | File | Purpose |
+|----------------|------|---------|
+| Fortran Interface | `torchani.F90` | Amber-compatible Fortran bindings |
+| C API | `torchani.h` | C function declarations and types |
+| Core Implementation | `torchani.cpp` | PyTorch JIT model execution |
+| Electrostatic Coupling | `electro.cpp` | ML/MM interaction calculations |
+
+The API supports both full-ML calculations where TorchANI handles the entire system potential and ML/MM calculations where it integrates with Amber's QM/MM infrastructure.
+
+## Configuration Namelist Overview
+
+TorchANI-Amber uses Amber's namelist system for configuration, with different namelists required for different integration modes:
+
+| Namelist | Required For | Key Parameters |
+|----------|-------------|----------------|
+| `&cntrl` | All modes | `iextpot=1` (full-ML) or `ifqnt=1` (ML/MM) |
+| `&extpot` | Full-ML only | `extprog='TORCHANI'` |
+| `&qmmm` | ML/MM only | `qm_theory='EXTERN'`, `qmmask` |
+| `&ani` | All modes | `model_type`, `use_cuda_device`, coupling options |
+
+The `&ani` namelist contains TorchANI-specific options including model selection, precision settings, CUDA configuration, and ML/MM coupling parameters.
+
+Sources: [README.md:123-151](), [README.md:180-207](), [tests/templates/input.mdin.jinja:48-96]()
+
+---
+
+# Page: Simulation Configuration
+
+# Simulation Configuration
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [ani-amber-logo-dark.png](ani-amber-logo-dark.png)
+- [ani-amber-logo-light.png](ani-amber-logo-light.png)
+- [benchmark/templates/mlmm.mdin.jinja](benchmark/templates/mlmm.mdin.jinja)
+- [run-cmake](run-cmake)
+
+</details>
+
+
+
+This page covers how to configure molecular dynamics simulations with TorchANI-Amber through `mdin` input files. It explains the required namelists, configuration options, and provides examples for both full-ML and ML/MM simulation types.
+
+For information about ML/MM coupling mechanisms and charge prediction methods, see [ML/MM Setup and Coupling](#4.2). For ready-to-use configuration templates, see [Input Templates and Examples](#4.3).
+
+## Configuration Overview
+
+TorchANI-Amber integrates with Amber through specific namelist configurations in `mdin` files. The configuration approach depends on the simulation type:
+
+### Configuration Types
+
+```mermaid
+graph TD
+    subgraph "Simulation Configuration"
+        A["mdin Input File"] --> B{"Simulation Type"}
+        
+        B --> C["Full-ML Simulation"]
+        B --> D["ML/MM Simulation"]
+        
+        C --> E["&cntrl namelist<br/>iextpot = 1"]
+        C --> F["&extpot namelist<br/>extprog = 'TORCHANI'"]
+        C --> G["&ani namelist<br/>TorchANI configuration"]
+        
+        D --> H["&cntrl namelist<br/>ifqnt = 1"]
+        D --> I["&qmmm namelist<br/>qm_theory = 'EXTERN'"]
+        D --> J["&ani namelist<br/>TorchANI + ML/MM configuration"]
+        
+        E --> K["Complete mdin"]
+        F --> K
+        G --> K
+        H --> L["Complete mdin"]
+        I --> L
+        J --> L
+    end
+```
+
+Sources: [README.md:116-122](), [README.md:172-183]()
+
+## Full-ML Configuration
+
+Full-ML simulations use neural network potentials for the entire molecular system. This requires three specific namelists:
+
+### Required Namelists Structure
+
+```mermaid
+graph LR
+    subgraph "Full-ML mdin Structure"
+        A["&cntrl"] --> B["Standard Amber options<br/>+ iextpot = 1"]
+        C["&extpot"] --> D["extprog = 'TORCHANI'"]
+        E["&ani"] --> F["Neural network<br/>configuration"]
+        
+        B --> G["Complete Configuration"]
+        D --> G
+        F --> G
+    end
+```
+
+### Core Configuration Options
+
+The `&ani` namelist contains the primary TorchANI configuration:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model_type` | string | `"ani1x"` | Neural network model (`"ani1x"`, `"ani1ccx"`, `"ani2x"`, `"anidr"`) |
+| `use_double_precision` | bool | `.true.` | Use float64 parameters for accurate dynamics |
+| `use_cuda_device` | bool | `.true.` | Enable GPU acceleration |
+| `use_cuaev` | bool | - | Use cuAEV CUDA extension for supported models |
+| `use_amber_neighborlist` | bool | - | Use Amber's neighborlist calculation |
+| `model_index` | int | `-1` | Select specific model from ensemble (-1 = use full ensemble) |
+| `cuda_device_index` | int | `0` | GPU device index |
+
+Sources: [README.md:123-151]()
+
+### Example Full-ML Configuration
+
+```fortran
+&cntrl
+    iextpot = 1 ! Required to run full-ML TorchANI-Amber
+    ! ... Add the rest of the Sander options here
+/
+&extpot
+    extprog = "TORCHANI"  ! Required to run full-ML TorchANI-Amber
+/
+&ani
+    model_type = "ani2x"
+    use_double_precision = .true.
+    use_cuda_device = .true.
+    use_cuaev = .true.
+    ! ... Add the rest of the TorchANI-Amber config options here
+/
+```
+
+Sources: [README.md:152-169]()
+
+## ML/MM Configuration
+
+ML/MM simulations partition the system into QM (quantum mechanical) and MM (molecular mechanical) regions, with the QM region handled by neural networks.
+
+### ML/MM Namelist Structure
+
+```mermaid
+graph LR
+    subgraph "ML/MM mdin Structure"
+        A["&cntrl"] --> B["Standard Amber options<br/>+ ifqnt = 1"]
+        C["&qmmm"] --> D["qm_theory = 'EXTERN'<br/>qm_ewald = 0<br/>qmmm_int = 1"]
+        E["&ani"] --> F["Neural network +<br/>ML/MM configuration"]
+        
+        B --> G["Complete Configuration"]
+        D --> G
+        F --> G
+    end
+```
+
+### Required QM/MM Parameters
+
+The `&qmmm` namelist requires specific settings:
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `qm_theory` | `'EXTERN'` | Use external program (TorchANI) for QM region |
+| `qm_ewald` | `0` | Required for Sander EXTERN QM/MM |
+| `qmmm_int` | `1` | Let TorchANI-Amber handle ML/MM coupling |
+| `qmmask` | Selection string | Define QM region (e.g., `':1'` for first molecule) |
+| `qmcut` | Distance | Recommended: `15.0` Å |
+
+Sources: [README.md:181-183](), [README.md:223-228]()
+
+### ML/MM Specific Options
+
+The `&ani` namelist includes additional ML/MM configuration:
+
+#### Output Control
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `write_xyz` | bool | Dump QM region coordinates to `.xyz` file |
+| `write_forces` | bool | Dump QM atom forces to `.dat` file |
+| `write_charges` | bool | Dump QM atom charges to `.dat` file |
+| `write_charges_grad` | bool | Dump charge derivatives to `.dat` file |
+
+#### Coupling Configuration
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `use_torchani_charges` | bool | Use NN-predicted charges (requires charge-predicting model) |
+| `mlmm_coupling` | int | Coupling type: `0` (coulombic), `1` (simple polarizable) |
+
+Sources: [README.md:187-207]()
+
+### Recommended ML/MM Configurations
+
+#### Configuration 1: Variable NN-Predicted Charges
+```fortran
+&cntrl
+    ifqnt = 1  ! Required for all ML/MM TorchANI-Amber dynamics
+    ! ... Add extra simulation settings here
+/
+&qmmm
+    qm_theory = 'EXTERN'  ! Required for all ML/MM TorchANI-Amber dynamics
+    qm_ewald = 0  ! Required for Sander EXTERN QM/MM
+    qmmm_int = 1  ! Required, let TorchANI-Amber handle the ML/MM coupling
+    qmmask = ':1',  ! Select the first molecule as the QM-region
+    qmcut = 15.0  ! Recommended
+/
+&ani
+    model_type = 'animbis'  ! Charge-predicting model
+    use_torchani_charges = .true.  ! Use geometry dependent, nn-predicted charges
+    mlmm_coupling = 1  ! Simple polarizable coupling
+/
+```
+
+#### Configuration 2: Fixed Topology Charges
+```fortran
+&cntrl
+    ifqnt = 1  ! Required for all ML/MM TorchANI-Amber dynamics
+    ! ... Add extra simulation settings here
+/
+&qmmm
+    qm_theory = 'EXTERN'  ! Required for all ML/MM TorchANI-Amber dynamics
+    qm_ewald = 0  ! Required for Sander EXTERN QM/MM
+    qmmm_int = 1  ! Required, let TorchANI-Amber handle the ML/MM coupling
+    qmmask = ':1'  ! Select the first molecule as the QM-region
+    qmcut = 15.0  ! Recommended
+/
+&ani
+    model_type = 'ani2x'  ! Select any model
+    use_torchani_charges = .false.  ! Use fixed topology charges
+    mlmm_coupling = 0  ! Coulombic coupling
+/
+```
+
+Sources: [README.md:215-257]()
+
+## Configuration Templates
+
+TorchANI-Amber provides Jinja2 templates for automated configuration generation, particularly useful for benchmarking and systematic studies.
+
+### Template Structure
+
+```mermaid
+graph TD
+    subgraph "Template System"
+        A["mlmm.mdin.jinja"] --> B["Jinja2 Template Engine"]
+        C["Configuration Parameters"] --> B
+        B --> D["Generated mdin File"]
+        
+        E["Template Variables"] --> F["mlmm.protocol"]
+        E --> G["mlmm.selection"]
+        E --> H["mlmm.cutoff"]
+        E --> I["mlmm.cuda"]
+        E --> J["mlmm.float64"]
+        
+        F --> K["ani_me<br/>ani_mbispol<br/>sander_me"]
+        G --> L["QM region mask"]
+        H --> M["QM/MM cutoff"]
+        I --> N["GPU usage"]
+        J --> O["Precision level"]
+    end
+```
+
+Sources: [benchmark/templates/mlmm.mdin.jinja:1-88]()
+
+### Template Parameters
+
+The ML/MM template accepts these key parameters:
+
+| Parameter | Values | Description |
+|-----------|--------|-------------|
+| `mlmm.protocol` | `"ani_me"`, `"ani_mbispol"`, `"sander_me"` | ML/MM coupling protocol |
+| `mlmm.selection` | Amber mask | QM region selection |
+| `mlmm.cutoff` | Float | QM/MM interaction cutoff |
+| `mlmm.cuda` | Boolean | Enable CUDA acceleration |
+| `mlmm.float64` | Boolean | Use double precision |
+| `dump_traj` | Boolean | Control output verbosity |
+
+Sources: [benchmark/templates/mlmm.mdin.jinja:36-84]()
+
+### Protocol-Specific Configuration
+
+The template automatically configures different ML/MM protocols:
+
+```mermaid
+graph LR
+    subgraph "Protocol Configuration Logic"
+        A["mlmm.protocol"] --> B{"Protocol Type"}
+        
+        B --> C["ani_me"]
+        B --> D["ani_mbispol"] 
+        B --> E["sander_me"]
+        
+        C --> F["model_type = 'ani2x'<br/>mlmm_coupling = 0<br/>use_torchani_charges = .False."]
+        D --> G["model_type = 'animbis'<br/>mlmm_coupling = 1<br/>use_torchani_charges = .True."]
+        E --> H["model_type = 'ani2x'<br/>qmmm_int = 5<br/>allow_untested_protocols = .True."]
+    end
+```
+
+Sources: [benchmark/templates/mlmm.mdin.jinja:39-70]()
+
+## Advanced Configuration Options
+
+For experimental features and advanced use cases, additional options are available:
+
+### Experimental Features
+
+| Feature | Parameters | Description |
+|---------|------------|-------------|
+| Switching | `use_switching_function`, `switching_program`, `qlow`, `qhigh` | Mix NN potential with external QM program |
+| ExtCoupling | `use_extcoupling`, `extcoupling_program` | Use external program for QM/MM interaction |
+| Numerical Forces | `use_numerical_qmmm_forces` | Calculate ML/MM coupling numerically |
+
+### Element-Specific Polarizabilities
+
+Fixed atomic polarizabilities can be specified using `pol_<element>` format:
+- `pol_H`, `pol_C`, `pol_N`, `pol_O`, etc. (up to `Ne`)
+
+Sources: [README.md:376-421]()
+
+---
+
+# Page: ML/MM Setup and Coupling
+
+# ML/MM Setup and Coupling
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [ani-amber-logo-dark.png](ani-amber-logo-dark.png)
+- [ani-amber-logo-light.png](ani-amber-logo-light.png)
+- [src/electro.cpp](src/electro.cpp)
+- [src/electro.h](src/electro.h)
+- [tests/templates/input.mdin.jinja](tests/templates/input.mdin.jinja)
+- [tests/test_amber_integration.py](tests/test_amber_integration.py)
+
+</details>
+
+
+
+This document covers the setup and configuration of quantum mechanics/molecular mechanics (QM/MM) simulations using TorchANI-Amber, where a portion of the system is treated with neural network potentials (QM region) while the remainder uses classical force fields (MM region). For information about full-ML simulations where the entire system uses neural networks, see [Simulation Configuration](#4.1). For implementation details of the core C++ engine, see [C++ Engine and JIT System](#3.1).
+
+## Overview
+
+ML/MM simulations in TorchANI-Amber partition the molecular system into two regions: a QM region calculated using neural network potentials and an MM region using classical Amber force fields. The interface handles the electrostatic and van der Waals interactions between these regions through various coupling schemes.
+
+## Configuration Requirements
+
+### Basic Namelist Setup
+
+ML/MM simulations require three key namelists in the `mdin` input file:
+
+**Control Namelist (`&cntrl`)**
+- `ifqnt = 1` - Enables QM/MM functionality
+- Standard MD parameters (timestep, temperature, etc.)
+
+**QM/MM Namelist (`&qmmm`)**
+- `qm_theory = 'EXTERN'` - Specifies external QM program (TorchANI)
+- `qm_ewald = 0` - Required for external QM/MM
+- `qmmm_int = 1` - Default, lets TorchANI handle ML/MM coupling
+- `qmmask = ':1'` - Defines QM region atoms
+- `qmcut = 15.0` - QM/MM interaction cutoff distance
+
+**ANI Namelist (`&ani`)**
+- Standard TorchANI parameters plus ML/MM specific options
+
+Sources: [README.md:172-183](), [tests/templates/input.mdin.jinja:36-42]()
+
+### ML/MM Configuration Flow
+
+```mermaid
+flowchart TD
+    A["mdin Input File"] --> B["&cntrl namelist"]
+    A --> C["&qmmm namelist"] 
+    A --> D["&ani namelist"]
+    
+    B --> E["ifqnt = 1"]
+    C --> F["qm_theory = 'EXTERN'"]
+    C --> G["qm_ewald = 0"]
+    C --> H["qmmm_int = 1"]
+    C --> I["qmmask definition"]
+    
+    D --> J["mlmm_coupling"]
+    D --> K["use_torchani_charges"]
+    D --> L["Standard ANI options"]
+    
+    E --> M["Amber QM/MM Engine"]
+    F --> M
+    G --> M
+    H --> M
+    I --> M
+    
+    J --> N["Coupling Method Selection"]
+    K --> O["Charge Handling"]
+    
+    M --> P["TorchANI ML/MM Interface"]
+    N --> P
+    O --> P
+```
+
+Sources: [README.md:177-183](), [tests/templates/input.mdin.jinja:3-47]()
+
+## Coupling Schemes
+
+TorchANI-Amber supports two primary coupling methods controlled by the `mlmm_coupling` parameter:
+
+### Coulombic Coupling (mlmm_coupling = 0)
+
+This represents mechanical embedding where QM and MM regions interact through fixed point charges:
+
+- Uses topology-defined charges from the parameter file
+- QM region charges remain constant during simulation
+- Simpler implementation, faster computation
+- Recommended with `use_torchani_charges = .false.`
+
+### Simple Polarizable Coupling (mlmm_coupling = 1)
+
+This advanced method includes polarization effects:
+
+- Supports geometry-dependent charge prediction
+- Includes distortion energy corrections
+- More accurate for systems with significant charge transfer
+- Recommended with `use_torchani_charges = .true.` and charge-predicting models
+
+Sources: [README.md:205-212](), [tests/templates/input.mdin.jinja:66-84]()
+
+### Coupling Implementation Architecture
+
+```mermaid
+flowchart LR
+    A["QM Region"] --> B["torchani_calculate_forces"]
+    C["MM Region"] --> D["Amber Force Field"]
+    
+    B --> E["QM Energies & Forces"]
+    D --> F["MM Energies & Forces"]
+    
+    E --> G["electro::coulombic_embedding_energy"]
+    F --> G
+    C --> H["MM Point Charges"]
+    H --> G
+    
+    E --> I["electro::polarizable_embedding_energy"]
+    F --> I
+    J["Atomic Polarizabilities"] --> I
+    
+    G --> K["Total QM/MM Energy"]
+    I --> K
+    K --> L["Combined System Forces"]
+```
+
+Sources: [src/electro.h:4-18](), [src/electro.cpp:78-89]()
+
+## Charge Prediction and Handling
+
+### Geometry-Dependent Charges
+
+When `use_torchani_charges = .true.`, the system uses neural network-predicted charges:
+
+- Currently supported by `animbis` model type
+- Charges predicted at each MD step based on geometry
+- Charge derivatives contribute to forces via `use_charges_derivatives`
+- MBIS atomic charges at wB97X/def2-TZVPP level for ANI-mbis
+
+### Fixed Topology Charges
+
+When `use_torchani_charges = .false.`:
+
+- Uses charges from Amber topology file
+- Charges remain constant throughout simulation
+- Faster computation, suitable for mechanical embedding
+
+Sources: [README.md:198-204](), [tests/templates/input.mdin.jinja:67-77]()
+
+### Charge Handling Implementation
+
+```mermaid
+flowchart TD
+    A["use_torchani_charges"] --> B{".true. or .false."}
+    
+    B -->|".true."| C["Neural Network Charge Prediction"]
+    B -->|".false."| D["Topology File Charges"]
+    
+    C --> E["Model Forward Pass"]
+    E --> F["Geometry-Dependent Charges"]
+    F --> G["Charge Derivatives Calculation"]
+    
+    D --> H["Fixed Point Charges"]
+    
+    G --> I["electro::coulombic_embedding_energy"]
+    H --> I
+    
+    I --> J["QM/MM Electrostatic Energy"]
+    J --> K["Force Contribution"]
+```
+
+Sources: [README.md:201-204](), [tests/test_amber_integration.py:33-36]()
+
+## Recommended Configurations
+
+The system provides two main recommended setups:
+
+### Configuration 1: Variable Neural Network Charges
+```
+mlmm_coupling = 1
+use_torchani_charges = .true.
+model_type = "animbis"
+```
+
+### Configuration 2: Fixed Topology Charges  
+```
+mlmm_coupling = 0
+use_torchani_charges = .false.
+model_type = "ani2x"  # or any standard model
+```
+
+Sources: [README.md:209-212]()
+
+## Advanced Options
+
+### Experimental Features
+
+**Switching Function (`use_switching_function`)**
+- Dynamically switches between neural network and external QM methods
+- Based on prediction uncertainty between ensemble models
+- Controlled by `qlow` and `qhigh` parameters
+
+**External Coupling (`use_extcoupling`)**
+- Uses external QM program for QM/MM interactions
+- Supports DFTB, ORCA, and LIO programs
+- Specified via `extcoupling_program`
+
+**Alternative QM/MM Integration (`qmmm_int = 5`)**
+- Lets Amber handle MM/ML coupling directly
+- May provide better PBC handling
+- Always uses force field charges regardless of `&ani` settings
+
+Sources: [README.md:356-421]()
+
+### Output Control Options
+
+The interface provides several debugging and analysis outputs:
+
+| Option | Purpose | Output Format |
+|--------|---------|---------------|
+| `write_xyz` | QM region coordinates | `.xyz` file |
+| `write_forces` | Forces on QM atoms | `.dat` file |
+| `write_charges` | QM atomic charges | `.dat` file |
+| `write_charges_grad` | Charge derivatives | `.dat` file |
+
+Sources: [README.md:187-196](), [tests/templates/input.mdin.jinja:85-90]()
+
+## Implementation Details
+
+### Core Electrostatic Functions
+
+The ML/MM coupling is implemented through two main functions in the `electro` namespace:
+
+**`coulombic_embedding_energy`** - Calculates simple Coulombic interactions between QM and MM charges
+**`polarizable_embedding_energy`** - Computes polarization energy including electric field effects and atomic polarizabilities
+
+Both functions handle unit conversions between Amber (Angstrom/elementary charge) and atomic units (Bohr/Hartree).
+
+Sources: [src/electro.h:13-17](), [src/electro.cpp:78-89]()
+
+### Testing Framework
+
+The ML/MM functionality is extensively tested with multiple configurations:
+
+- Different coupling protocols (`me`, `mbispol`) 
+- CUDA vs CPU execution
+- Various precision levels (float32/float64)
+- Shake constraints on/off
+- Vacuum vs explicit solvent
+
+Sources: [tests/test_amber_integration.py:80-86](), [tests/test_amber_integration.py:33-36]()
+
+---
+
+# Page: Input Templates and Examples
+
+# Input Templates and Examples
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [benchmark/templates/mlmm.mdin.jinja](benchmark/templates/mlmm.mdin.jinja)
+- [benchmark/templates/scaling.mdin.jinja](benchmark/templates/scaling.mdin.jinja)
+- [run-cmake](run-cmake)
+
+</details>
+
+
+
+This page documents the Jinja2 template system used to generate Amber `mdin` input files for TorchANI-Amber simulations. The template system provides parameterized configurations for different simulation types, including full-ML simulations and ML/MM hybrid approaches.
+
+For detailed information about simulation configuration parameters, see [Simulation Configuration](#4.1). For ML/MM setup procedures, see [ML/MM Setup and Coupling](#4.2). For benchmarking workflows that use these templates, see [Bench CLI Tool](#5.1).
+
+## Template System Architecture
+
+The TorchANI-Amber system uses Jinja2 templates to generate standardized `mdin` input files for different simulation scenarios. This templating approach ensures consistent configuration while allowing parameterization for various system sizes, simulation protocols, and hardware configurations.
+
+```mermaid
+graph TB
+    subgraph "Template Files"
+        MLMM["mlmm.mdin.jinja<br/>ML/MM Simulations"]
+        SCALE["scaling.mdin.jinja<br/>Performance Testing"]
+    end
+    
+    subgraph "Configuration Parameters"
+        VARS["Template Variables<br/>tstep_num, model, cuda, etc."]
+        PROTO["Protocol Settings<br/>ani_me, ani_mbispol, sander_me"]
+        SYS["System Settings<br/>cutoff, shake, precision"]
+    end
+    
+    subgraph "Generated Output"
+        MDIN1["simulation.mdin<br/>ML/MM Configuration"]
+        MDIN2["benchmark.mdin<br/>Scaling Configuration"]
+    end
+    
+    subgraph "Amber Integration"
+        AMBER["Amber MD Engine<br/>pmemd/sander"]
+        SIM["Molecular Dynamics<br/>Simulation"]
+    end
+    
+    MLMM --> MDIN1
+    SCALE --> MDIN2
+    
+    VARS --> MLMM
+    VARS --> SCALE
+    PROTO --> MLMM
+    SYS --> SCALE
+    
+    MDIN1 --> AMBER
+    MDIN2 --> AMBER
+    AMBER --> SIM
+```
+
+Sources: [benchmark/templates/mlmm.mdin.jinja](), [benchmark/templates/scaling.mdin.jinja]()
+
+## Template Types and Use Cases
+
+TorchANI-Amber provides specialized templates for different simulation workflows. Each template is optimized for specific use cases and contains appropriate namelist configurations.
+
+```mermaid
+graph LR
+    subgraph "ML/MM Template"
+        MLMM_T["mlmm.mdin.jinja"]
+        MLMM_T --> QM["QM Region<br/>TorchANI Potential"]
+        MLMM_T --> MM["MM Region<br/>Amber Force Field"]
+        MLMM_T --> COUP["Coupling Protocol<br/>ani_me, ani_mbispol, sander_me"]
+    end
+    
+    subgraph "Scaling Template"
+        SCALE_T["scaling.mdin.jinja"]
+        SCALE_T --> FULL["Full-ML System<br/>iextpot=2"]
+        SCALE_T --> PERF["Performance Testing<br/>Various System Sizes"]
+        SCALE_T --> BENCH["Benchmarking<br/>cuAEV Toggle"]
+    end
+    
+    subgraph "Common Features"
+        THERMO["Thermostat Settings<br/>ntt=3, temp0=300.0"]
+        SHAKE_OPT["SHAKE Options<br/>ntc, ntf, dt"]
+        OUTPUT["Output Control<br/>ntwx, ntpr, ioutfm"]
+    end
+    
+    QM --> THERMO
+    MM --> THERMO
+    FULL --> THERMO
+    PERF --> SHAKE_OPT
+    BENCH --> OUTPUT
+```
+
+Sources: [benchmark/templates/mlmm.mdin.jinja:1-88](), [benchmark/templates/scaling.mdin.jinja:1-49]()
+
+## ML/MM Template Configuration
+
+The `mlmm.mdin.jinja` template supports QM/MM simulations with TorchANI handling the quantum mechanical region. The template includes conditional logic for different coupling protocols and charge prediction methods.
+
+### Core ML/MM Settings
+
+| Parameter | Template Variable | Default | Description |
+|-----------|------------------|---------|-------------|
+| QM/MM Enable | `mlmm` | - | Boolean flag to enable QM/MM |
+| QM Selection | `mlmm.selection` | - | Atom mask for QM region |
+| QM Cutoff | `mlmm.cutoff` | - | QM-MM interaction cutoff |
+| Coupling Protocol | `mlmm.protocol` | - | `ani_me`, `ani_mbispol`, `sander_me` |
+
+### Protocol-Specific Configuration
+
+The template uses conditional blocks to configure different ML/MM coupling approaches:
+
+**ANI Mechanical Embedding (`ani_me`)**:
+- `qmmm_int = 1` (ANI-controlled coupling)
+- `mlmm_coupling = 0` 
+- `use_torchani_charges = .False.`
+- `model_type = "ani2x"`
+
+**ANI Multi-Body Interaction Scheme Polarization (`ani_mbispol`)**:
+- `qmmm_int = 1` (ANI-controlled coupling)
+- `mlmm_coupling = 1`
+- `use_torchani_charges = .True.`
+- `model_type = "animbis"`
+
+**Sander Mechanical Embedding (`sander_me`)**:
+- `qmmm_int = 5` (Sander-controlled coupling)
+- `mlmm_coupling = 0`
+- `use_torchani_charges = .False.`
+- `allow_untested_protocols = .True.`
+
+Sources: [benchmark/templates/mlmm.mdin.jinja:28-46](), [benchmark/templates/mlmm.mdin.jinja:47-85]()
+
+### Output Control Variables
+
+The template includes conditional output settings based on the `dump_traj` variable:
+
+```
+{% if dump_traj %}
+ntwx = 1
+ntpr = 1
+write_charges = .True.
+write_forces = .True.
+write_xyz = .True.
+{% else %}
+ntwx = {{ tstep_num }}
+ntpr = {{ tstep_num }}
+write_charges = .False.
+{% endif %}
+```
+
+Sources: [benchmark/templates/mlmm.mdin.jinja:21-27](), [benchmark/templates/mlmm.mdin.jinja:74-84]()
+
+## Scaling Template Configuration
+
+The `scaling.mdin.jinja` template is designed for performance benchmarking and scaling studies. It configures full-ML simulations where the entire system uses TorchANI potentials via the external potential interface.
+
+### External Potential Setup
+
+The template configures TorchANI as an external potential using:
+
+```
+iextpot = 2  ! Use ANI as an external potential
+extprog = "torchani"  ! Use ANI as an external potential
+```
+
+### Performance-Related Parameters
+
+| Parameter | Template Variable | Options | Description |
+|-----------|------------------|---------|-------------|
+| GPU Usage | `cuda` | `True`/`False` | Enable CUDA acceleration |
+| cuAEV Extension | `cuaev` | `True`/`False` | Use optimized CUDA AEV |
+| Model Type | `model` | `ani1x`, `ani2x`, etc. | Neural network model |
+| Neighborlist | `use_amber_neighborlist` | `True`/`False` | Use Amber neighborlist |
+| Precision | - | `False` (float32) | Use single precision |
+
+### SHAKE Configuration
+
+The template includes conditional SHAKE settings:
+
+```
+{% if shake %}
+dt = 0.002,  ! Timestep [ps] (2 fs)
+ntc = 2, ntf = 2,  ! Shake ON for H
+{% else %}
+dt = 0.001,  ! Timestep [ps] (1 fs) 
+ntc = 1, ntf = 1,  ! Shake OFF
+{% endif %}
+```
+
+Sources: [benchmark/templates/scaling.mdin.jinja:12-18](), [benchmark/templates/scaling.mdin.jinja:33-47]()
+
+## Template Variable Reference
+
+### Common Variables
+
+| Variable | Type | Purpose | Used In |
+|----------|------|---------|---------|
+| `tstep_num` | Integer | Number of simulation steps | Both templates |
+| `dump_traj` | Boolean | Enable trajectory output | Both templates |
+| `cutoff` | Float | Non-bonded cutoff distance | Scaling template |
+| `cuda` | Boolean | Enable GPU acceleration | Both templates |
+
+### ML/MM Specific Variables
+
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `mlmm.selection` | String | QM atom selection mask |
+| `mlmm.cutoff` | Float | QM-MM interaction cutoff |
+| `mlmm.protocol` | String | Coupling protocol type |
+| `mlmm.cuda` | Boolean | GPU usage for QM region |
+| `mlmm.float64` | Boolean | Double precision for QM |
+| `mlmm.use_torch_coupling` | Boolean | Use PyTorch for coupling |
+
+### Scaling Specific Variables
+
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `cuaev` | Boolean | Enable cuAEV optimization |
+| `model` | String | Neural network model name |
+| `shake` | Boolean | Enable SHAKE constraints |
+| `use_amber_neighborlist` | Boolean | Use Amber neighborlist |
+| `use_all_amber_nonbond` | Boolean | Use all Amber non-bonded terms |
+
+Sources: [benchmark/templates/mlmm.mdin.jinja:4](), [benchmark/templates/scaling.mdin.jinja:7](), [benchmark/templates/mlmm.mdin.jinja:36-58](), [benchmark/templates/scaling.mdin.jinja:37-46]()
+
+## Common Simulation Examples
+
+### Example 1: Basic ML/MM Simulation
+
+Template variables for a simple alanine dipeptide ML/MM simulation:
+
+```python
+{
+    "tstep_num": 1000,
+    "dump_traj": False,
+    "mlmm": {
+        "selection": ":1-3",
+        "cutoff": 8.0,
+        "protocol": "ani_me", 
+        "cuda": True,
+        "float64": False,
+        "use_torch_coupling": True
+    }
+}
+```
+
+### Example 2: Performance Scaling Study
+
+Template variables for benchmarking with cuAEV optimization:
+
+```python
+{
+    "tstep_num": 100,
+    "dump_traj": False,
+    "cutoff": 8.0,
+    "cuda": True,
+    "cuaev": True,
+    "model": "ani2x",
+    "shake": True,
+    "use_amber_neighborlist": True
+}
+```
+
+### Example 3: Development Testing with Full Output
+
+Template variables for debugging with complete trajectory output:
+
+```python
+{
+    "tstep_num": 10,
+    "dump_traj": True,
+    "mlmm": {
+        "selection": ":1-9",
+        "cutoff": 8.0,
+        "protocol": "ani_mbispol",
+        "cuda": False,
+        "float64": True,
+        "use_torch_coupling": False
+    }
+}
+```
+
+Sources: [benchmark/templates/mlmm.mdin.jinja:15](), [benchmark/templates/scaling.mdin.jinja:13](), [benchmark/templates/mlmm.mdin.jinja:21-27]()
+
+---
+
+# Page: Benchmarking System
+
+# Benchmarking System
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [benchmark/bench](benchmark/bench)
+- [benchmark/templates/hpg.slurm.sh.jinja](benchmark/templates/hpg.slurm.sh.jinja)
+
+</details>
+
+
+
+The benchmarking system provides a comprehensive framework for performance testing and scaling studies of TorchANI-Amber simulations. It enables automated execution of molecular dynamics simulations across different system sizes, neural network models, and hardware configurations, with integrated analysis and visualization tools.
+
+For information about configuring individual simulations, see [Simulation Configuration](#4.1). For details about the command-line interface specifically, see [Bench CLI Tool](#5.1).
+
+## System Architecture
+
+The benchmarking framework consists of a Python-based CLI tool that orchestrates simulation execution, data collection, and performance analysis across both local and HPC environments.
+
+```mermaid
+graph TB
+    subgraph "Benchmarking Frontend"
+        CLI["bench CLI Tool"]
+        CONFIG["ScalingConfig"]
+        TEMPLATES["Jinja2 Templates"]
+    end
+    
+    subgraph "Execution Environment"
+        LOCAL["Local Execution"]
+        HPC["HPC/SLURM Execution"]
+        SCHEDULER["send_to_scheduler()"]
+    end
+    
+    subgraph "Simulation Systems"
+        WATER["Water Box Systems"]
+        SIZES["1k - 200k atoms"]
+        FILES["prmtop/inpcrd files"]
+    end
+    
+    subgraph "Models & Configuration"
+        MODELS["Neural Network Models"]
+        ANI["ANI variants"]
+        AIMNET["AimNet2"]
+        NUTMEG["NutMeg"]
+    end
+    
+    subgraph "Output & Analysis"
+        TIMING["walltime_ms.dat"]
+        RESULTS["Performance Data"]
+        PLOTS["Scaling Plots"]
+        CSV["CSV Reports"]
+    end
+    
+    CLI --> CONFIG
+    CLI --> TEMPLATES
+    CLI --> LOCAL
+    CLI --> SCHEDULER
+    SCHEDULER --> HPC
+    
+    CONFIG --> MODELS
+    TEMPLATES --> WATER
+    WATER --> SIZES
+    SIZES --> FILES
+    
+    LOCAL --> TIMING
+    HPC --> TIMING
+    TIMING --> RESULTS
+    RESULTS --> PLOTS
+    RESULTS --> CSV
+```
+
+Sources: [benchmark/bench:1-471]()
+
+## Benchmark Types and Configuration
+
+The system supports different benchmark types through the `BenchKind` enum and configurable parameters via the `ScalingConfig` dataclass.
+
+### Benchmark Categories
+
+| Benchmark Type | Purpose | Implementation Status |
+|----------------|---------|----------------------|
+| `SCALING` | Performance scaling across system sizes | Implemented |
+| `REMD` | Replica Exchange MD benchmarks | Not implemented |
+
+### Configuration Parameters
+
+The `ScalingConfig` dataclass defines the core benchmark parameters:
+
+```mermaid
+graph LR
+    subgraph "ScalingConfig Parameters"
+        CUAEV["cuaev: bool"]
+        CUDA["cuda: bool"] 
+        CUTOFF["cutoff: float"]
+        TSTEPS["tstep_num: int"]
+        MODEL["model: str"]
+        SHAKE["shake: bool"]
+        TRAJ["dump_traj: bool"]
+        AMBER_NB["use_all_amber_nonbond: bool"]
+        AMBER_NL["use_amber_neighborlist: bool"]
+    end
+    
+    subgraph "Model-Specific Defaults"
+        ANI_CUTOFF["ANI models: 5.2 Å"]
+        ANI2DR_CUTOFF["ani2dr: 8.0 Å"] 
+        AIMNET_CUTOFF["AimNet2/NutMeg: 10.0 Å"]
+    end
+    
+    CUTOFF --> ANI_CUTOFF
+    CUTOFF --> ANI2DR_CUTOFF
+    CUTOFF --> AIMNET_CUTOFF
+```
+
+Sources: [benchmark/bench:33-52](), [benchmark/bench:241-247]()
+
+## System Size Matrix
+
+The benchmarking framework uses predefined water box systems spanning multiple orders of magnitude in system size:
+
+```mermaid
+graph TB
+    subgraph "Small Systems (1k-10k atoms)"
+        S1["water-1k"]
+        S2["water-2_5k"]
+        S3["water-3k"]
+        S4["water-4k"] 
+        S5["water-5k"]
+        S6["water-6k"]
+        S7["water-7k"]
+        S8["water-8k"]
+        S9["water-9k"]
+        S10["water-10k"]
+    end
+    
+    subgraph "Medium Systems (15k-75k atoms)"
+        M1["water-15k"]
+        M2["water-20k"]
+        M3["water-25k"]
+        M4["water-30k"]
+        M5["water-45k"]
+        M6["water-60k"]
+        M7["water-75k"]
+    end
+    
+    subgraph "Large Systems (100k-200k atoms)"
+        L1["water-100k"]
+        L2["water-125k"]
+        L3["water-150k"]
+        L4["water-175k"]
+        L5["water-200k"]
+    end
+```
+
+Sources: [benchmark/bench:177-200]()
+
+## Execution Workflow
+
+The benchmark execution follows a structured workflow that handles both local and HPC environments:
+
+```mermaid
+flowchart TD
+    START["bench run command"]
+    DETECT["Detect execution environment"]
+    
+    subgraph "Environment Detection"
+        LOCAL_CHECK["Check --hpg flag"]
+        HOSTNAME_CHECK["Check hostname pattern"]
+        HPC_DECISION{"Execute on HPC?"}
+    end
+    
+    subgraph "HPC Execution Path"
+        SLURM_TEMPLATE["Load hpg.slurm.sh.jinja"]
+        SUBMIT_JOB["Submit SLURM job"]
+        SCHEDULER_EXEC["Execute via send_to_scheduler()"]
+    end
+    
+    subgraph "Local Execution Path"
+        SETUP_ENV["Set TORCHANI_AMBER_WALLTIME=1"]
+        ITERATE_SYSTEMS["Iterate through systems"]
+        GENERATE_MDIN["Generate mdin from template"]
+        COPY_FILES["Copy prmtop/inpcrd files"]
+        RUN_AMBER["Execute sander/pmemd"]
+        COLLECT_TIMING["Collect timing data"]
+    end
+    
+    subgraph "Results Processing"
+        WALLTIME_DATA["walltime_ms.dat files"]
+        CONFIG_JSON["config.json files"]
+        OUTPUT_DIR["Organized output directory"]
+    end
+    
+    START --> DETECT
+    DETECT --> LOCAL_CHECK
+    LOCAL_CHECK --> HOSTNAME_CHECK
+    HOSTNAME_CHECK --> HPC_DECISION
+    
+    HPC_DECISION -->|Yes| SLURM_TEMPLATE
+    SLURM_TEMPLATE --> SUBMIT_JOB
+    SUBMIT_JOB --> SCHEDULER_EXEC
+    
+    HPC_DECISION -->|No| SETUP_ENV
+    SETUP_ENV --> ITERATE_SYSTEMS
+    ITERATE_SYSTEMS --> GENERATE_MDIN
+    GENERATE_MDIN --> COPY_FILES
+    COPY_FILES --> RUN_AMBER
+    RUN_AMBER --> COLLECT_TIMING
+    
+    SCHEDULER_EXEC --> WALLTIME_DATA
+    COLLECT_TIMING --> WALLTIME_DATA
+    WALLTIME_DATA --> CONFIG_JSON
+    CONFIG_JSON --> OUTPUT_DIR
+```
+
+Sources: [benchmark/bench:224-237](), [benchmark/bench:278-307]()
+
+## HPC Integration
+
+The system provides sophisticated HPC integration through SLURM templates and environment management:
+
+### SLURM Configuration
+
+| Parameter | Purpose | Configuration |
+|-----------|---------|---------------|
+| `job-name` | Job identification | `{{ unique_id }}-v{{ version }}-{{ name }}` |
+| `partition` | Queue selection | Configurable via `--gpu` parameter |
+| `gres` | GPU resources | `gpu:{{ gpu }}` specification |
+| `time` | Walltime limit | `{{ hours }}:00:00` format |
+| `nodes` | Node allocation | Fixed at 1 node |
+| `cpus-per-task` | CPU cores | Fixed at 1 core |
+
+### Environment Management
+
+The SLURM template supports multiple installation configurations:
+
+```mermaid
+graph TB
+    subgraph "Installation Types"
+        MODULES["modules: Shared module system"]
+        LOCAL["local: User conda environment"]
+        SHARED["shared-env: Shared conda environment"]
+        BLACKWELL["b200:1: Blackwell GPU support"]
+    end
+    
+    subgraph "Module Loading"
+        CUDA["CUDA modules"]
+        GCC["GCC compiler"]
+        MPI["OpenMPI"]
+        CONDA["Conda environment"]
+        CMAKE["CMake build system"]
+    end
+    
+    subgraph "Environment Activation"
+        AMBER_ENV["Amber environment"]
+        CONDA_ACT["Conda activation"]
+        MAMBA_ACT["Mamba activation"]
+    end
+    
+    MODULES --> CUDA
+    MODULES --> GCC
+    MODULES --> MPI
+    MODULES --> CONDA
+    MODULES --> CMAKE
+    
+    LOCAL --> CONDA_ACT
+    LOCAL --> MAMBA_ACT
+    
+    SHARED --> CONDA_ACT
+    SHARED --> AMBER_ENV
+    
+    BLACKWELL --> CUDA
+    BLACKWELL --> MAMBA_ACT
+```
+
+Sources: [benchmark/templates/hpg.slurm.sh.jinja:1-32]()
+
+## Performance Analysis and Visualization
+
+The benchmarking system includes comprehensive analysis capabilities through the `plot` command:
+
+### Data Processing Pipeline
+
+```mermaid
+flowchart LR
+    subgraph "Raw Data"
+        WALLTIME["walltime_ms.dat"]
+        INPCRD["inpcrd files"]
+        CONFIG["config.json"]
+    end
+    
+    subgraph "Processing Steps"
+        PARSE["Parse timing data"]
+        BURNIN["Apply burn-in filter"]
+        ATOMS["Extract atom counts"]
+        STATS["Calculate statistics"]
+    end
+    
+    subgraph "Metrics Calculation"
+        MEAN["Mean walltime per step"]
+        STD["Standard deviation"]
+        NSDAY["ns/day conversion"]
+        SCALING["Scaling analysis"]
+    end
+    
+    subgraph "Visualization"
+        SCATTER["Scatter plots"]
+        TREND["Trend lines"]
+        CSV_OUT["CSV export"]
+        PLOTS["Interactive plots"]
+    end
+    
+    WALLTIME --> PARSE
+    INPCRD --> ATOMS
+    PARSE --> BURNIN
+    BURNIN --> STATS
+    ATOMS --> STATS
+    
+    STATS --> MEAN
+    STATS --> STD
+    MEAN --> NSDAY
+    NSDAY --> SCALING
+    
+    SCALING --> SCATTER
+    SCALING --> TREND
+    SCALING --> CSV_OUT
+    SCATTER --> PLOTS
+```
+
+### Performance Metrics
+
+The system generates two primary performance metrics:
+
+| Metric | Units | Calculation | Purpose |
+|--------|-------|-------------|---------|
+| Walltime per timestep | milliseconds | Direct measurement | Low-level performance |
+| Simulation rate | ns/day | `86.4 / walltime_ms` | Production throughput |
+
+Sources: [benchmark/bench:309-467](), [benchmark/bench:441-444]()
+
+## Model Support and Optimization
+
+The benchmarking framework supports multiple neural network models with model-specific optimizations:
+
+### Supported Models
+
+```mermaid
+graph TB
+    subgraph "ANI Model Family"
+        ANI1X["ani1x"]
+        ANI2X["ani2x"] 
+        ANI2XR["ani2xr"]
+        ANI2DR["ani2dr"]
+    end
+    
+    subgraph "AimNet2 Models"
+        AIMNET_BASE["aimnet2-wb97m-dsf"]
+        AIMNET_VARIANTS["AimNet2 variants"]
+    end
+    
+    subgraph "NutMeg Models"
+        NUTMEG_SMALL["nutmeg-small"]
+        NUTMEG_VARIANTS["NutMeg variants"]
+    end
+    
+    subgraph "Model-Specific Features"
+        CUAEV_SUPPORT["CUAEV acceleration"]
+        CHARGE_PRED["Charge prediction"]
+        CUTOFF_OPT["Cutoff optimization"]
+    end
+    
+    ANI1X --> CUAEV_SUPPORT
+    ANI2X --> CUAEV_SUPPORT
+    ANI2XR --> CUAEV_SUPPORT
+    ANI2DR --> CUTOFF_OPT
+    
+    AIMNET_BASE --> CHARGE_PRED
+    NUTMEG_SMALL --> CHARGE_PRED
+```
+
+### Hardware Optimization
+
+The system automatically detects and configures hardware-specific optimizations:
+
+| Feature | Detection Method | Configuration |
+|---------|------------------|---------------|
+| CUDA availability | `torch.cuda.is_available()` | Automatic GPU usage |
+| CUAEV acceleration | Model name pattern matching | ANI models only |
+| Amber neighborlist | User configuration | Optional optimization |
+| Amber nonbonded | User configuration | Performance trade-off |
+
+Sources: [benchmark/bench:26](), [benchmark/bench:156-158](), [benchmark/bench:239-252](), [benchmark/bench:282-285]()
+
+---
+
+# Page: Bench CLI Tool
+
+# Bench CLI Tool
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [benchmark/bench](benchmark/bench)
+- [benchmark/templates/hpg.slurm.sh.jinja](benchmark/templates/hpg.slurm.sh.jinja)
+
+</details>
+
+
+
+The `bench` CLI tool provides a comprehensive benchmarking framework for TorchANI-Amber molecular dynamics simulations. It automates the execution of scaling studies and performance analysis across different system sizes, neural network models, and hardware configurations. The tool supports both local execution and HPC cluster submission with SLURM scheduling.
+
+For information about interpreting benchmark results and performance metrics, see [Performance Testing and Analysis](#5.2).
+
+## CLI Commands Overview
+
+The `bench` tool provides two primary commands implemented using the Typer framework:
+
+| Command | Purpose | Key Options |
+|---------|---------|-------------|
+| `run` | Execute benchmark simulations | `--model`, `--systems`, `--hpg`, `--tsteps` |
+| `plot` | Generate performance plots from results | `--ns-per-day`, `--burn-in-tstep-num`, `--labels` |
+
+**CLI Application Structure**
+```mermaid
+graph TB
+    app["app: Typer(name='bench')"]
+    app --> run_cmd["run() command"]
+    app --> plot_cmd["plot() command"]
+    
+    run_cmd --> local_exec["Local Execution"]
+    run_cmd --> hpg_submit["HPC Submission"]
+    
+    plot_cmd --> data_analysis["_plot_single()"]
+    plot_cmd --> matplotlib_output["Performance Plots"]
+    
+    local_exec --> amber_sim["Amber MD Simulation"]
+    hpg_submit --> slurm_sched["SLURM Scheduler"]
+    
+    slurm_sched --> remote_exec["Remote Execution"]
+    remote_exec --> amber_sim
+```
+
+Sources: [benchmark/bench:21-31](), [benchmark/bench:54-150](), [benchmark/bench:309-340]()
+
+## Run Command
+
+The `run` command orchestrates benchmark execution with extensive configuration options for different simulation scenarios.
+
+### Core Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--model` | str | "ani2xr" | Neural network model to benchmark |
+| `--tsteps` | int | 1000 | Number of MD timesteps to execute |
+| `--systems` | List[str] | Auto-detected | System sizes for scaling studies |
+| `--hpg` | bool | Auto-detected | Enable HPC cluster submission |
+| `--cuda` | bool | Auto-detected | Use CUDA acceleration |
+
+### Benchmark Types
+
+The tool supports different benchmark kinds through the `BenchKind` enum:
+
+```mermaid
+graph LR
+    bench_kind["--bench-kind"]
+    bench_kind --> scaling["BenchKind.SCALING"]
+    bench_kind --> remd["BenchKind.REMD"]
+    
+    scaling --> water_systems["Water box systems<br/>1k-200k atoms"]
+    remd --> not_impl["NotImplementedError"]
+    
+    water_systems --> template["scaling.mdin.jinja"]
+```
+
+The scaling benchmark automatically selects water box systems ranging from 1,000 to 200,000 atoms when no specific systems are provided [benchmark/bench:177-200]().
+
+### Configuration Management
+
+Benchmark parameters are managed through the `ScalingConfig` dataclass:
+
+```mermaid
+graph TB
+    config["ScalingConfig"]
+    config --> cuaev["cuaev: bool"]
+    config --> cuda["cuda: bool"] 
+    config --> cutoff["cutoff: float"]
+    config --> tstep_num["tstep_num: int"]
+    config --> model["model: str"]
+    config --> shake["shake: bool"]
+    config --> dump_traj["dump_traj: bool"]
+    config --> amber_nb["use_all_amber_nonbond: bool"]
+    config --> amber_nl["use_amber_neighborlist: bool"]
+    
+    config --> json_export["to_json_file()"]
+    json_export --> config_json["config.json"]
+```
+
+Sources: [benchmark/bench:38-52](), [benchmark/bench:264-274]()
+
+### Execution Workflow
+
+**Local vs HPC Execution Decision Tree**
+```mermaid
+graph TD
+    start["bench run command"]
+    start --> hpg_check{"--hpg specified?"}
+    
+    hpg_check -->|No| hostname_check{"hostname matches<br/>login*.ufhpc?"}
+    hpg_check -->|Yes| hpg_true["hpg = True"]
+    
+    hostname_check -->|Yes| hpg_auto["hpg = True"]
+    hostname_check -->|No| hpg_false["hpg = False"]
+    
+    hpg_true --> slurm_submit["send_to_scheduler()"]
+    hpg_auto --> slurm_submit
+    hpg_false --> local_exec["Local execution"]
+    
+    slurm_submit --> sys_exit["sys.exit(0)"]
+    
+    local_exec --> setup_dirs["Setup output directories"]
+    setup_dirs --> system_loop["Iterate over systems"]
+    system_loop --> render_mdin["Render mdin template"]
+    render_mdin --> copy_files["Copy .prmtop/.inpcrd"]
+    copy_files --> run_amber["subprocess.run(cmd)"]
+    run_amber --> check_result{"Success?"}
+    check_result -->|No| error_output["Print error and break"]
+    check_result -->|Yes| next_system["Next system"]
+```
+
+Sources: [benchmark/bench:224-237](), [benchmark/bench:280-307]()
+
+## Plot Command
+
+The `plot` command generates performance visualizations from benchmark output data.
+
+### Key Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--burn-in-tstep-num` | int | 50 | Skip initial timesteps in analysis |
+| `--ns-per-day` | bool | False | Plot simulation speed vs walltime |
+| `--labels` | List[str] | Auto-generated | Custom labels for plot series |
+| `--max-num-atoms` | int | 1e12 | Filter systems by atom count |
+
+### Data Processing Pipeline
+
+```mermaid
+graph LR
+    input_paths["names_or_paths"]
+    input_paths --> path_resolution["Resolve paths in ~/IO/ani-amber"]
+    
+    path_resolution --> system_dirs["System directories"]
+    system_dirs --> walltime_data["walltime_ms.dat"]
+    system_dirs --> inpcrd_data["inpcrd (atom count)"]
+    
+    walltime_data --> burn_in["Apply burn-in filter"]
+    burn_in --> stats["Calculate mean/std"]
+    
+    inpcrd_data --> atom_count["Extract num_atoms"]
+    
+    stats --> plot_data["Plotting data"]
+    atom_count --> plot_data
+    
+    plot_data --> matplotlib_viz["matplotlib visualization"]
+    plot_data --> csv_export["CSV export"]
+```
+
+The plotting function automatically converts walltime measurements to ns/day performance metrics using the conversion factor `86.4 / means` [benchmark/bench:441-444]().
+
+Sources: [benchmark/bench:309-385](), [benchmark/bench:387-467]()
+
+## HPC Integration
+
+The tool integrates with SLURM schedulers through the `send_to_scheduler` function and Jinja2 templates.
+
+### SLURM Template System
+
+```mermaid
+graph TB
+    hpg_template["hpg.slurm.sh.jinja"]
+    hpg_template --> sbatch_directives["SBATCH directives"]
+    hpg_template --> module_loading["Module loading"]
+    hpg_template --> env_activation["Environment activation"]
+    hpg_template --> bench_execution["bench command execution"]
+    
+    sbatch_directives --> job_name["--job-name={{ unique_id }}-v{{ version }}-{{ name }}"]
+    sbatch_directives --> gpu_resources["--gres=gpu:{{ gpu }}"]
+    sbatch_directives --> time_limit["--time={{ hours }}:00:00"]
+    
+    module_loading --> cuda_mod["CUDA modules"]
+    module_loading --> conda_mod["Conda modules"]
+    
+    env_activation --> install_kinds["Different install_kind options"]
+    install_kinds --> modules_env["modules: shared benchmark env"]
+    install_kinds --> local_env["local: user conda env"]
+    install_kinds --> shared_env["shared-env: group environment"]
+```
+
+The template supports multiple installation configurations based on the `install_kind` parameter [benchmark/templates/hpg.slurm.sh.jinja:17-29]().
+
+### GPU Resource Management
+
+| GPU Type | CUDA Version | Environment |
+|----------|--------------|-------------|
+| `b200:1` | 12.8 | ani-amber-blackwell |
+| Standard | 12.4 | ani-amber-bench |
+| Shared | 12.4 | ani-amber-gcc1104-cuda1204 |
+
+Sources: [benchmark/templates/hpg.slurm.sh.jinja:1-32](), [benchmark/bench:227-236]()
+
+## Configuration and Templates
+
+### Jinja2 Template Environment
+
+The tool uses a Jinja2 environment configured for strict template processing:
+
+```mermaid
+graph LR
+    jinja_env["jinja2.Environment"]
+    jinja_env --> loader["FileSystemLoader"]
+    jinja_env --> strict["StrictUndefined"]
+    jinja_env --> autoescape["select_autoescape()"]
+    jinja_env --> formatting["trim_blocks + lstrip_blocks"]
+    
+    loader --> templates_dir["benchmark/templates/"]
+    templates_dir --> scaling_template["scaling.mdin.jinja"]
+    templates_dir --> slurm_template["hpg.slurm.sh.jinja"]
+    
+    strict --> template_vars["Template variable validation"]
+    autoescape --> security["XSS protection"]
+```
+
+### Model-Specific Configuration
+
+The tool automatically configures cutoff distances and CUAEV settings based on the selected model:
+
+| Model Pattern | Cutoff (Å) | CUAEV Enabled |
+|---------------|------------|---------------|
+| `ani2dr` | 8.0 | True |
+| `nutmeg*` | 10.0 | False |
+| `aimnet*` | 10.0 | False |
+| Default | 5.2 | True for `ani*` models |
+
+Special handling exists for NutMeg models, which require charge file specification [benchmark/bench:282-285]().
+
+Sources: [benchmark/bench:161-167](), [benchmark/bench:239-247](), [benchmark/bench:282-285]()
+
+## Output Management
+
+### Directory Structure
+
+```mermaid
+graph TB
+    out_root["~/IO/ani-amber/"]
+    out_root --> unique_dir["{{ unique_id }}-{{ name }}/"]
+    
+    unique_dir --> system_dirs["System directories"]
+    system_dirs --> water_1k["water-1k/"]
+    system_dirs --> water_2_5k["water-2_5k/"]
+    system_dirs --> water_etc["..."]
+    
+    water_1k --> mdin_file["mdin"]
+    water_1k --> config_file["config.json"]
+    water_1k --> input_files["inpcrd, prmtop"]
+    water_1k --> output_files["Output files"]
+    
+    output_files --> walltime_dat["walltime_ms.dat"]
+    output_files --> amber_out["mdout, mdcrd, etc."]
+```
+
+### Environment Variables
+
+The tool sets `TORCHANI_AMBER_WALLTIME=1` to enable walltime measurement collection from the Amber integration [benchmark/bench:278]().
+
+### Performance Data Collection
+
+Walltime data is collected per timestep and written to `walltime_ms.dat` files. The plotting system processes this data with configurable burn-in periods to exclude initialization overhead from performance analysis.
+
+Sources: [benchmark/bench:254-259](), [benchmark/bench:288-294](), [benchmark/bench:418-433]()
+
+---
+
+# Page: Performance Testing and Analysis
+
+# Performance Testing and Analysis
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [benchmark/bench](benchmark/bench)
+- [benchmark/templates/hpg.slurm.sh.jinja](benchmark/templates/hpg.slurm.sh.jinja)
+- [tests/test_values_cpu_1ccx_ensemble.txt](tests/test_values_cpu_1ccx_ensemble.txt)
+- [tests/test_values_cpu_1x_ensemble.txt](tests/test_values_cpu_1x_ensemble.txt)
+- [tests/test_values_cpu_2x_ensemble.txt](tests/test_values_cpu_2x_ensemble.txt)
+- [tests/test_values_cpu_mbis_ensemble.txt](tests/test_values_cpu_mbis_ensemble.txt)
+- [tests/test_values_cuda_1ccx_ensemble.txt](tests/test_values_cuda_1ccx_ensemble.txt)
+- [tests/test_values_cuda_1x_ensemble.txt](tests/test_values_cuda_1x_ensemble.txt)
+- [tests/test_values_cuda_2x_ensemble.txt](tests/test_values_cuda_2x_ensemble.txt)
+- [tests/test_values_cuda_mbis_ensemble.txt](tests/test_values_cuda_mbis_ensemble.txt)
+
+</details>
+
+
+
+This page covers the performance testing and analysis capabilities of TorchANI-Amber, focusing on how to conduct scaling studies, interpret benchmark results, and generate performance visualizations. For information about the bench CLI tool itself and basic usage, see [Bench CLI Tool](#5.1).
+
+## Purpose and Scope
+
+The performance testing system provides comprehensive tools for analyzing TorchANI-Amber's computational performance across different system sizes, hardware configurations, and model types. The analysis framework supports:
+
+- Scaling studies across different molecular system sizes
+- Performance comparison between different neural network models
+- Hardware performance analysis (CPU vs GPU, different GPU types)
+- HPC cluster scaling analysis
+- Automated visualization and reporting
+
+Sources: [benchmark/bench:1-470]()
+
+## Scaling Study Workflow
+
+The typical scaling study workflow involves running benchmarks across multiple system sizes and then analyzing the results to understand performance characteristics.
+
+```mermaid
+flowchart TD
+    A[Configure scaling study] --> B["bench run --bench-kind scaling"]
+    B --> C["Execute across system sizes"]
+    C --> D["Collect walltime_ms.dat files"]
+    D --> E["Generate performance plots"]
+    E --> F["Analyze scaling behavior"]
+    
+    subgraph "System sizes"
+        G["water-1k"]
+        H["water-5k"] 
+        I["water-10k"]
+        J["water-25k"]
+        K["water-100k+"]
+    end
+    
+    subgraph "Analysis outputs"
+        L["Performance plots"]
+        M["CSV data files"]
+        N["ns/day metrics"]
+    end
+    
+    C --> G
+    C --> H
+    C --> I
+    C --> J
+    C --> K
+    
+    E --> L
+    E --> M
+    E --> N
+```
+
+The scaling study automatically tests predefined system sizes ranging from 1,000 to 200,000 atoms, allowing comprehensive performance characterization.
+
+Sources: [benchmark/bench:169-200](), [benchmark/bench:277-307]()
+
+## Benchmark Data Structure
+
+Each benchmark execution generates a structured output directory containing performance data and configuration information:
+
+```mermaid
+graph TD
+    A["benchmark-output-dir/"] --> B["unique-id-model-name/"]
+    B --> C["water-1k/"]
+    B --> D["water-5k/"]
+    B --> E["water-10k/"]
+    
+    C --> F["walltime_ms.dat"]
+    C --> G["config.json"]
+    C --> H["mdin"]
+    C --> I["inpcrd"]
+    C --> J["prmtop"]
+    C --> K["mdout"]
+    
+    D --> L["walltime_ms.dat"]
+    D --> M["config.json"]
+    E --> N["walltime_ms.dat"]
+    E --> O["config.json"]
+```
+
+**Key Data Files:**
+
+| File | Purpose |
+|------|---------|
+| `walltime_ms.dat` | Per-timestep walltime measurements in milliseconds |
+| `config.json` | ScalingConfig parameters for reproducibility |
+| `mdin` | Generated Amber input file |
+| `mdout` | Amber simulation output |
+
+The `walltime_ms.dat` file contains one measurement per line, with each value representing the walltime for a single MD timestep.
+
+Sources: [benchmark/bench:418-421](), [benchmark/bench:291-294]()
+
+## Performance Visualization
+
+The plotting system provides automated visualization of benchmark results with multiple analysis modes:
+
+### Basic Performance Plotting
+
+```bash
+bench plot ani2xr-scaling aimnet2-scaling --label "ANI-2xr" --label "AimNet2"
+```
+
+### Throughput Analysis
+
+```bash
+bench plot ani2xr-scaling --ns-per-day --ymax 6
+```
+
+The plotting system generates two key metrics:
+
+```mermaid
+graph LR
+    A["walltime_ms.dat"] --> B["Walltime per timestep (ms)"]
+    A --> C["ns/day calculation"]
+    
+    B --> D["Performance comparison"]
+    C --> E["Throughput analysis"]
+    
+    F["Formula: 86.4 / walltime_ms"] --> C
+```
+
+**Performance Metrics:**
+
+| Metric | Formula | Purpose |
+|--------|---------|---------|
+| Walltime per timestep | Direct from data | Raw performance measurement |
+| ns/day throughput | `86.4 / walltime_ms` | Simulation productivity metric |
+
+Sources: [benchmark/bench:441-445](), [benchmark/bench:324-327]()
+
+## Statistical Analysis and Burn-in
+
+The analysis system incorporates statistical rigor through burn-in periods and error analysis:
+
+```mermaid
+flowchart LR
+    A["Raw walltime data"] --> B["Apply burn-in filter"]
+    B --> C["Calculate statistics"]
+    C --> D["Mean walltime"]
+    C --> E["Standard deviation"]
+    
+    F["burn_in_tstep_num=50"] --> B
+    
+    D --> G["Performance plots"]
+    E --> H["Error bars"]
+```
+
+The system automatically:
+- Excludes initial timesteps (default: 50) to account for initialization overhead
+- Calculates mean and standard deviation for each system size
+- Generates CSV output with statistical summaries
+
+Sources: [benchmark/bench:421-433](), [benchmark/bench:460-466]()
+
+## Model and Hardware Performance Analysis
+
+The benchmarking system supports comparative analysis across different configurations:
+
+### Model Comparison Framework
+
+```mermaid
+graph TD
+    A["ScalingConfig parameters"] --> B["Model selection"]
+    A --> C["Hardware configuration"] 
+    A --> D["Optimization settings"]
+    
+    B --> E["ani1x, ani2x, ani2xr"]
+    B --> F["aimnet2-wb97m-dsf"]
+    B --> G["nutmeg variants"]
+    
+    C --> H["CUDA vs CPU"]
+    C --> I["cuAEV acceleration"]
+    
+    D --> J["Amber neighborlist"]
+    D --> K["Amber nonbonded"]
+    D --> L["SHAKE constraints"]
+```
+
+**Key Configuration Parameters:**
+
+| Parameter | Options | Impact |
+|-----------|---------|--------|
+| `cuaev` | true/false | Enables CUDA-accelerated AEV computation |
+| `cuda` | true/false | GPU vs CPU execution |
+| `use_amber_neighborlist` | true/false | Amber vs TorchANI neighbor detection |
+| `use_all_amber_nonbond` | true/false | Hybrid force calculation |
+| `shake` | true/false | Bond constraint algorithm |
+
+Sources: [benchmark/bench:39-48](), [benchmark/bench:239-247]()
+
+## HPC Scaling Analysis
+
+For large-scale performance studies, the system integrates with HPC schedulers:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as "bench CLI"
+    participant SLURM as "HPC Scheduler"
+    participant Compute as "Compute Nodes"
+    
+    User->>CLI: bench run --hpg
+    CLI->>SLURM: Submit job via template
+    SLURM->>Compute: Allocate resources
+    Compute->>Compute: Execute scaling study
+    Compute->>CLI: Return results
+    CLI->>User: Performance data
+```
+
+The HPC integration automatically:
+- Detects HPC environment based on hostname pattern
+- Submits jobs via SLURM templates
+- Manages environment modules and conda activation
+- Handles GPU resource allocation
+
+Sources: [benchmark/bench:224-237](), [benchmark/templates/hpg.slurm.sh.jinja:1-32]()
+
+## Automated Analysis Pipeline
+
+A complete performance analysis typically follows this pipeline:
+
+```mermaid
+flowchart TD
+    A["Define test systems"] --> B["Execute scaling study"]
+    B --> C["Collect performance data"]
+    C --> D["Generate visualizations"]
+    D --> E["Export CSV data"]
+    E --> F["Analyze scaling trends"]
+    
+    subgraph "Quality control"
+        G["Burn-in filtering"]
+        H["Statistical validation"]
+        I["Outlier detection"]
+    end
+    
+    C --> G
+    G --> H
+    H --> I
+    I --> D
+    
+    subgraph "Output products"
+        J["Performance plots"]
+        K["CSV datasets"]
+        L["Scaling coefficients"]
+    end
+    
+    D --> J
+    E --> K
+    F --> L
+```
+
+The system ensures reproducibility by:
+- Saving complete configuration in `config.json`
+- Using consistent system definitions
+- Applying standardized analysis methods
+- Generating machine-readable output formats
+
+Sources: [benchmark/bench:264-274](), [benchmark/bench:413-466]()
+
+---
+
+# Page: Development Guide
+
+# Development Guide
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [CMakeLists.txt](CMakeLists.txt)
+- [environment.yaml](environment.yaml)
+- [src/electro.cpp](src/electro.cpp)
+- [src/electro.h](src/electro.h)
+- [tests/templates/input.mdin.jinja](tests/templates/input.mdin.jinja)
+- [tests/test_amber_integration.py](tests/test_amber_integration.py)
+
+</details>
+
+
+
+This guide provides essential information for developers contributing to TorchANI-Amber, covering the development environment, build system, testing infrastructure, and contribution workflow. This document focuses on the technical aspects of working with the codebase and build system.
+
+For detailed build system configuration options, see [Build System Deep Dive](#6.1). For comprehensive testing procedures and framework details, see [Testing Framework](#6.2). For development workflow and code quality standards, see [Code Quality and Development Workflow](#6.3).
+
+## Development Environment Setup
+
+TorchANI-Amber requires a carefully configured development environment due to its complex dependency chain involving PyTorch, CUDA, cuDNN, and Amber molecular dynamics engines.
+
+### Conda Environment Configuration
+
+The project uses a conda environment specification that ensures compatibility across all components:
+
+```mermaid
+graph TB
+    subgraph "Base Dependencies"
+        PYTHON["python=3.11"]
+        PYTORCH["pytorch=2.5"]
+        NUMPY["numpy=1.26"]
+    end
+    
+    subgraph "CUDA Stack"
+        PYTORCH_CUDA["pytorch-cuda=12.4"]
+        CUDA_LIBS["cuda-libraries-dev=12.4"]
+        CUDA_NVCC["cuda-nvcc=12.4"]
+        CUDNN["cudnn"]
+    end
+    
+    subgraph "Compilers"
+        GXX["gxx_linux-64=12.2"]
+        GCC["gcc_linux-64=12.2"]
+        GFORTRAN["gfortran_linux-64=12.2"]
+    end
+    
+    subgraph "Build Tools"
+        CMAKE["cmake=3.31.1"]
+        SETUPTOOLS["setuptools>=64"]
+    end
+    
+    subgraph "Amber Dependencies"
+        FFTW["fftw=3.3.10"]
+        NETCDF["netcdf-fortran=4.6.1"]
+        OPENMPI["openmpi=4.1.6"]
+    end
+    
+    PYTHON --> PYTORCH
+    PYTORCH --> PYTORCH_CUDA
+    PYTORCH_CUDA --> CUDA_LIBS
+    CUDA_LIBS --> CUDA_NVCC
+    GCC --> CMAKE
+    CMAKE --> FFTW
+    FFTW --> NETCDF
+```
+
+Sources: [environment.yaml:1-68]()
+
+The environment enforces strict version compatibility, particularly for the CUDA stack where PyTorch 2.5 must match CUDA 12.4 and the corresponding cuDNN version.
+
+### Compiler Requirements
+
+The build system enforces specific compiler versions to ensure compatibility with CUDA and PyTorch:
+
+```mermaid
+graph LR
+    COMPILERS["GNU Compilers"] --> VERSION_CHECK{"Version 11.0-13.2?"}
+    VERSION_CHECK -->|Yes| CUDA_COMPAT["CUDA nvcc Compatibility"]
+    VERSION_CHECK -->|No| ERROR["Build Error"]
+    CUDA_COMPAT --> PYTORCH_ABI["PyTorch ABI Compatibility"]
+    PYTORCH_ABI --> BUILD_SUCCESS["Build Success"]
+```
+
+Sources: [CMakeLists.txt:74-88]()
+
+## Build System Architecture
+
+The CMake build system is designed to handle the complex dependency resolution required for a project that bridges Python ML frameworks with high-performance C++ execution.
+
+### Build Configuration Flow
+
+```mermaid
+flowchart TD
+    START["cmake_minimum_required(3.24)"] --> OPTIONS["Build Options"]
+    OPTIONS --> VALIDATION["Option Validation"]
+    VALIDATION --> PYTORCH_SETUP["PyTorch/LibTorch Setup"]
+    PYTORCH_SETUP --> CUDA_SETUP["CUDA Dependencies"]
+    CUDA_SETUP --> JIT_COMPILE["JIT Model Compilation"]
+    JIT_COMPILE --> LIBRARIES["Library Compilation"]
+    LIBRARIES --> TESTS["Test Setup"]
+    TESTS --> INSTALL["Installation Config"]
+    
+    subgraph "Key Options"
+        LINK_PYTORCH["LINK_TO_PYTORCH_LIBS"]
+        DOWNLOAD_LIBTORCH["DOWNLOAD_AND_INSTALL_LIBTORCH"]
+        PREFER_CONDA["PREFER_CONDA_LIBS"]
+        USE_CUSTOM_CUDA["USE_CUSTOM_CUDNN/CUDATK"]
+        JIT_MODELS["JIT_COMPILE_MODELS"]
+    end
+    
+    OPTIONS --> LINK_PYTORCH
+    OPTIONS --> DOWNLOAD_LIBTORCH
+    OPTIONS --> PREFER_CONDA
+    OPTIONS --> USE_CUSTOM_CUDA
+    OPTIONS --> JIT_MODELS
+```
+
+Sources: [CMakeLists.txt:36-93]()
+
+### Library Compilation Targets
+
+The build system creates three main shared libraries:
+
+```mermaid
+graph TB
+    subgraph "Library Targets"
+        CELL_LIST["libcell_list.so"]
+        CUAEV["libcuaev.so"] 
+        TORCHANI["libtorchani.so"]
+    end
+    
+    subgraph "Source Files"
+        CELL_SRC["torchani_sandbox/torchani/csrc/cell_list.cpp"]
+        CUAEV_SRC["torchani_sandbox/torchani/csrc/cuaev.cpp"]
+        CUAEV_CUDA["torchani_sandbox/torchani/csrc/aev.cu"]
+        TORCHANI_SRC["src/*.cpp"]
+    end
+    
+    subgraph "Dependencies"
+        TORCH_LIBS["TORCH_LIBRARIES"]
+        PYTHON_LIBS["Python_LIBRARIES"]
+        CUDA_RUNTIME["CUDA Runtime"]
+    end
+    
+    CELL_SRC --> CELL_LIST
+    CUAEV_SRC --> CUAEV
+    CUAEV_CUDA --> CUAEV
+    TORCHANI_SRC --> TORCHANI
+    
+    TORCH_LIBS --> CELL_LIST
+    TORCH_LIBS --> CUAEV
+    TORCH_LIBS --> TORCHANI
+    
+    PYTHON_LIBS --> CELL_LIST
+    PYTHON_LIBS --> CUAEV
+    
+    CUDA_RUNTIME --> CUAEV
+```
+
+Sources: [CMakeLists.txt:234-323]()
+
+The `libcuaev.so` library includes CUDA-specific optimizations with the `TORCHANI_OPT` flag and fast math compilation options.
+
+## Testing Infrastructure
+
+TorchANI-Amber employs a comprehensive testing strategy that validates integration with Amber MD engines across multiple configuration combinations.
+
+### Test Configuration Matrix
+
+The testing framework uses parameterized tests to validate functionality across different runtime configurations:
+
+```mermaid
+graph TD
+    CONFIG_GEN["Test Configuration Generator"] --> CUDA_OPTS["CUDA Options"]
+    CONFIG_GEN --> MLMM_OPTS["ML/MM Options"]
+    CONFIG_GEN --> RUNTIME_OPTS["Runtime Options"]
+    
+    subgraph "CUDA Configurations"
+        CUDA_NONE["None (CPU)"]
+        CUDA_CUAEV["CudaConfig(cuaev=True)"]
+        CUDA_NO_CUAEV["CudaConfig(cuaev=False)"]
+    end
+    
+    subgraph "ML/MM Configurations"
+        FULLML["None (Full-ML)"]
+        MLMM_ME["MlmmConfig('me')"]
+        MLMM_MBISPOL["MlmmConfig('mbispol')"]
+        MLMM_TORCH["MlmmConfig(use_torch_coupling=True)"]
+    end
+    
+    subgraph "Runtime Options"
+        SHAKE["shake: True/False"]
+        VACUUM["vacuum: True/False"]
+        FLOAT64["float64: True/False"]
+        AMBER_NL["use_amber_neighborlist: True/False"]
+    end
+    
+    CUDA_OPTS --> CUDA_NONE
+    CUDA_OPTS --> CUDA_CUAEV
+    CUDA_OPTS --> CUDA_NO_CUAEV
+    
+    MLMM_OPTS --> FULLML
+    MLMM_OPTS --> MLMM_ME
+    MLMM_OPTS --> MLMM_MBISPOL
+    MLMM_OPTS --> MLMM_TORCH
+    
+    RUNTIME_OPTS --> SHAKE
+    RUNTIME_OPTS --> VACUUM
+    RUNTIME_OPTS --> FLOAT64
+    RUNTIME_OPTS --> AMBER_NL
+```
+
+Sources: [tests/test_amber_integration.py:77-111]()
+
+### Test Execution Framework
+
+```mermaid
+sequenceDiagram
+    participant TF as "Test Framework"
+    participant JT as "Jinja2 Template"
+    participant AE as "Amber Engine"
+    participant VO as "Validation Oracle"
+    
+    TF->>JT: render("input.mdin.jinja", config)
+    JT->>TF: input.mdin file
+    TF->>AE: execute pmemd/sander
+    AE->>TF: output files (.dat, .mdcrd, .xyz)
+    TF->>VO: compare with expected outputs
+    VO->>TF: assertion results
+```
+
+The test framework generates Amber input files using Jinja2 templates that adapt to different configuration combinations:
+
+Sources: [tests/test_amber_integration.py:113-125](), [tests/templates/input.mdin.jinja:1-98]()
+
+### Unit Test Infrastructure
+
+The project uses Catch2 for C++ unit testing with CMake integration:
+
+```mermaid
+graph LR
+    CATCH2_SUB["Catch2 Submodule"] --> CATCH2_BUILD["Catch2 Build"]
+    CATCH2_BUILD --> TEST_TARGET["tests executable"]
+    TEST_TARGET --> TEST_DISCOVERY["catch_discover_tests()"]
+    TEST_DISCOVERY --> CTEST["CTest Integration"]
+    
+    subgraph "Test Sources"
+        TEST_CPP["tests/tests.cpp"]
+        TORCHANI_LIB["libtorchani.so"]
+    end
+    
+    TEST_CPP --> TEST_TARGET
+    TORCHANI_LIB --> TEST_TARGET
+```
+
+Sources: [CMakeLists.txt:378-391]()
+
+## Code Organization
+
+The codebase follows a multi-language architecture with clear separation between computational kernels, interfaces, and integration layers.
+
+### Core Implementation Structure
+
+```mermaid
+graph TB
+    subgraph "C++ Core (src/)"
+        TORCHANI_CPP["torchani.cpp"]
+        ELECTRO_CPP["electro.cpp"]
+        ELECTRO_H["electro.h"]
+    end
+    
+    subgraph "Interfaces (include/)"
+        TORCHANI_H["torchani.h"]
+    end
+    
+    subgraph "Fortran Interface (src-fortran/)"
+        TORCHANI_F90["torchani.F90"]
+    end
+    
+    subgraph "CUDA Extensions (submodules/)"
+        CUAEV_CPP["cuaev.cpp"]
+        AEV_CU["aev.cu"]
+        CELL_LIST_CPP["cell_list.cpp"]
+    end
+    
+    subgraph "Test Infrastructure (tests/)"
+        INTEGRATION_TESTS["test_amber_integration.py"]
+        UNIT_TESTS["tests.cpp"]
+        INPUT_TEMPLATES["templates/input.mdin.jinja"]
+    end
+    
+    TORCHANI_H --> TORCHANI_F90
+    TORCHANI_CPP --> TORCHANI_H
+    ELECTRO_CPP --> ELECTRO_H
+    CUAEV_CPP --> AEV_CU
+```
+
+Sources: [CMakeLists.txt:289-323](), [src/electro.cpp:1-90](), [src/electro.h:1-19]()
+
+### Key Computational Modules
+
+The `electro` namespace provides core electrostatic calculation functionality:
+
+- `coulombic_embedding_energy()`: Calculates Coulombic QM/MM interaction energy
+- `polarizable_embedding_energy()`: Computes polarizable embedding energy using atomic polarizabilities
+
+Sources: [src/electro.h:4-18](), [src/electro.cpp:78-89]()
+
+## Development Workflow
+
+### Build Process
+
+1. **Environment Setup**: Activate the `ani-amber` conda environment
+2. **Configuration**: Run CMake with appropriate options for your development setup
+3. **Compilation**: Build the shared libraries and test executables
+4. **Testing**: Execute the test suite to validate functionality
+
+### Common Development Scenarios
+
+```mermaid
+flowchart LR
+    subgraph "Development Tasks"
+        NEW_FEATURE["New Feature"]
+        BUG_FIX["Bug Fix"]
+        PERF_OPT["Performance Optimization"]
+    end
+    
+    subgraph "Workflow Steps"
+        BRANCH["Create Branch"]
+        CODE["Code Changes"]
+        BUILD["Build & Test"]
+        VALIDATE["Integration Tests"]
+        PR["Pull Request"]
+    end
+    
+    NEW_FEATURE --> BRANCH
+    BUG_FIX --> BRANCH
+    PERF_OPT --> BRANCH
+    
+    BRANCH --> CODE
+    CODE --> BUILD
+    BUILD --> VALIDATE
+    VALIDATE --> PR
+```
+
+### Testing Strategy
+
+The testing approach validates both individual components and full system integration:
+
+- **Unit Tests**: C++ components tested with Catch2 framework
+- **Integration Tests**: Full Amber MD simulations with expected output comparison
+- **Configuration Tests**: Parameterized testing across CUDA/CPU, ML/MM modes
+- **Regression Tests**: Automated comparison against reference outputs
+
+Sources: [tests/test_amber_integration.py:127-383]()
+
+The development environment supports rapid iteration through automated build configuration detection and comprehensive test coverage across deployment scenarios.
+
+---
+
+# Page: Build System Deep Dive
+
+# Build System Deep Dive
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [CMakeLists.txt](CMakeLists.txt)
+- [cmake/Msg.cmake](cmake/Msg.cmake)
+- [cmake/TorchaniConfig.cmake.in](cmake/TorchaniConfig.cmake.in)
+- [cmake/detect_pytorch.py](cmake/detect_pytorch.py)
+- [environment.yaml](environment.yaml)
+
+</details>
+
+
+
+This document provides a comprehensive overview of the CMake-based build system used in TorchANI-Amber. It covers the build configuration process, dependency resolution, target compilation, and installation procedures. For information about using the build artifacts in simulations, see [Amber Integration](#4). For testing the build outputs, see [Testing Framework](#6.2).
+
+## Build System Architecture
+
+The TorchANI-Amber build system is implemented as a sophisticated CMake project that manages complex dependencies including PyTorch/LibTorch, CUDA toolkit, cuDNN, and Python extensions. The system supports multiple build configurations and deployment scenarios.
+
+### Build Process Overview
+
+```mermaid
+flowchart TD
+    A["CMakeLists.txt"] --> B["Configuration Validation"]
+    B --> C["Environment Detection"]
+    C --> D["Dependency Resolution"]
+    D --> E["JIT Model Compilation"]
+    E --> F["Target Compilation"]
+    F --> G["Testing Integration"]
+    G --> H["Installation & Packaging"]
+    
+    B --> B1["Option Validation"]
+    B --> B2["Compiler Verification"]
+    
+    C --> C1["Conda Environment"]
+    C --> C2["PyTorch Detection"]
+    
+    D --> D1["LibTorch/PyTorch"]
+    D --> D2["CUDA Toolkit"]
+    D --> D3["cuDNN Library"]
+    D --> D4["Python Headers"]
+    
+    F --> F1["libcell_list.so"]
+    F --> F2["libcuaev.so"]
+    F --> F3["libtorchani.so"]
+    
+    H --> H1["CMake Config Files"]
+    H --> H2["Shared Libraries"]
+    H --> H3["Include Headers"]
+    H --> H4["Fortran Interface"]
+```
+
+Sources: [CMakeLists.txt:1-462]()
+
+### Configuration Options and Flags
+
+The build system provides extensive configuration through CMake options that control dependency handling and compilation behavior:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `LINK_TO_PYTORCH_LIBS` | ON | Link to existing PyTorch installation |
+| `DOWNLOAD_AND_INSTALL_LIBTORCH` | OFF | Download LibTorch if PyTorch unavailable |
+| `PREFER_CONDA_LIBS` | ON | Prioritize libraries from active conda environment |
+| `COMPILE_WITH_CXX11ABI` | OFF | Use C++11 ABI (requires LibTorch mode) |
+| `USE_CUSTOM_CUDNN` | OFF | Use cuDNN from `./external/cudnn<version>` |
+| `USE_CUSTOM_CUDATK` | OFF | Use CUDA Toolkit from `/usr/local/cuda-<version>` |
+| `JIT_COMPILE_MODELS` | ON | JIT-compile ANI models during build |
+| `JIT_FORCE_RECOMPILATION` | OFF | Force recompilation of existing `.pt` files |
+| `SET_TORCHANI_LIBRARIES_INSTALL_RPATH` | ON | Set RPATH for installed libraries |
+
+Sources: [CMakeLists.txt:38-46](), [CMakeLists.txt:91-93]()
+
+### Dependency Resolution Workflow
+
+```mermaid
+flowchart LR
+    subgraph "PyTorch Detection"
+        A["detect_pytorch.py"] --> B["Extract Versions"]
+        B --> C["Validate Compatibility"]
+        C --> D["Set CMAKE_PREFIX_PATH"]
+    end
+    
+    subgraph "CUDA Setup"
+        E["Environment Check"] --> F{"Conda or Custom?"}
+        F -->|Conda| G["CudaToolkitHelper_set_conda_paths"]
+        F -->|Custom| H["CudaToolkitHelper_set_custom_paths"]
+        G --> I["Set CUDA_TOOLKIT_ROOT_DIR"]
+        H --> I
+    end
+    
+    subgraph "cuDNN Setup"
+        J["cuDNN Detection"] --> K{"Source Location?"}
+        K -->|Conda| L["CudnnHelper_set_conda_paths"]
+        K -->|Custom| M["CudnnHelper_set_custom_paths"]
+        K -->|System| N["Use CUDA Toolkit Dir"]
+        L --> O["Set CUDNN_LIBRARY"]
+        M --> O
+        N --> O
+    end
+    
+    D --> P["find_package(Torch)"]
+    I --> P
+    O --> P
+```
+
+The dependency resolution process handles three critical components:
+
+**PyTorch/LibTorch Detection**: The system uses [cmake/detect_pytorch.py:1-16]() to extract version information and installation paths from an existing PyTorch installation. This script extracts torch version, CUDA version, cuDNN version, and the PyTorch root directory.
+
+**CUDA Toolkit Resolution**: Depending on configuration, the system either uses CUDA from the active conda environment or searches custom paths. The `CudaToolkitHelper` modules set `CUDA_TOOLKIT_ROOT_DIR` and `CMAKE_CUDA_COMPILER` variables.
+
+**cuDNN Library Management**: Similar to CUDA, cuDNN can be sourced from conda, custom directories, or assumed to be co-located with the CUDA Toolkit.
+
+Sources: [CMakeLists.txt:115-165](), [CMakeLists.txt:167-186](), [CMakeLists.txt:188-212](), [cmake/detect_pytorch.py:1-16]()
+
+## Target Compilation Process
+
+### Library Target Hierarchy
+
+```mermaid
+graph TB
+    subgraph "External Dependencies"
+        TORCH["${TORCH_LIBRARIES}"]
+        PYTHON["${Python_LIBRARIES}"]
+        CUDA["CUDA Runtime"]
+    end
+    
+    subgraph "TorchANI Libraries"
+        CELL["cell_list"]
+        CUAEV["cuaev"] 
+        TORCHANI["torchani"]
+    end
+    
+    subgraph "Source Locations"
+        CELL_SRC["submodules/torchani_sandbox/torchani/csrc/cell_list.cpp"]
+        CUAEV_SRC["submodules/torchani_sandbox/torchani/csrc/cuaev.cpp<br/>submodules/torchani_sandbox/torchani/csrc/aev.cu"]
+        TORCHANI_SRC["src/*.cpp"]
+    end
+    
+    subgraph "Testing"
+        CATCH2["Catch2::Catch2WithMain"]
+        TESTS["tests"]
+    end
+    
+    CELL_SRC --> CELL
+    CUAEV_SRC --> CUAEV
+    TORCHANI_SRC --> TORCHANI
+    
+    TORCH --> CELL
+    PYTHON --> CELL
+    TORCH --> CUAEV
+    PYTHON --> CUAEV
+    TORCH --> TORCHANI
+    CUAEV --> TORCHANI
+    CELL --> TORCHANI
+    
+    CATCH2 --> TESTS
+    TORCHANI --> TESTS
+```
+
+### Compilation Specifications
+
+**cell_list Library**: Built from TorchANI sandbox submodule sources with C++17 standard and PyTorch/Python linking.
+
+**cuaev Library**: CUDA-enabled library with specific optimizations:
+- `TORCHANI_OPT` preprocessor definition enables CUDA intrinsics
+- `-use_fast_math` NVCC flag for fast math library
+- Custom CUB namespace definitions to avoid conflicts with PyTorch
+
+**torchani Library**: Main interface library with comprehensive warning flags and special linking requirements:
+- Force-loading of `cuaev` and `cell_list` using `LINKER:-force_load`
+- `--no-as-needed` linker flag to ensure proper dependency resolution
+
+Sources: [CMakeLists.txt:234-287](), [CMakeLists.txt:289-323]()
+
+### JIT Model Compilation
+
+The build system includes a JIT compilation step for ANI models when `JIT_COMPILE_MODELS` is enabled:
+
+```mermaid
+flowchart LR
+    A["TorchScriptUtils_jit_compile_models"] --> B["Python Model Sources"]
+    B --> C["JIT Compilation Process"]
+    C --> D[".pt Model Files"]
+    
+    E["JIT_FORCE_RECOMPILATION"] -.-> C
+    F["JIT_DISABLE_OPTIMIZATIONS"] -.-> C
+    
+    D --> G["Runtime Model Loading"]
+```
+
+This process converts Python-defined ANI models into TorchScript format for efficient C++ runtime loading.
+
+Sources: [CMakeLists.txt:215-223]()
+
+## Installation and Packaging
+
+### RPATH Configuration
+
+The build system implements sophisticated RPATH handling to ensure runtime library resolution:
+
+```mermaid
+graph TD
+    A["SET_TORCHANI_LIBRARIES_INSTALL_RPATH"] --> B["Configure Install RPATH"]
+    B --> C["${LIBTORCH_LIBRARY_DIR}"]
+    B --> D["${CUDA_TOOLKIT_ROOT_DIR}"]
+    B --> E["${CMAKE_INSTALL_FULL_LIBDIR}/Torchani"]
+    
+    C --> F["Runtime Library Resolution"]
+    D --> F
+    E --> F
+    
+    G["INSTALL_RPATH_USE_LINK_PATH"] --> F
+```
+
+The RPATH configuration prevents re-linking issues during installation and ensures libraries can locate dependencies regardless of system-wide CUDA installations.
+
+Sources: [CMakeLists.txt:340-364]()
+
+### CMake Package Configuration
+
+The build system generates complete CMake package configuration for downstream usage:
+
+| File | Purpose |
+|------|---------|
+| `TorchaniConfig.cmake` | Main configuration file with paths and targets |
+| `TorchaniConfigVersion.cmake` | Version compatibility checking |
+| `TorchaniTargets.cmake` | Exported target definitions |
+
+**Installation Structure**:
+- Libraries: `${CMAKE_INSTALL_LIBDIR}/Torchani/`
+- Headers: `${CMAKE_INSTALL_INCLUDEDIR}/Torchani/`
+- CMake files: `${CMAKE_INSTALL_DATAROOTDIR}/cmake/Torchani/`
+- Fortran interface: `${CMAKE_INSTALL_DATAROOTDIR}/Torchani/Fortran/`
+
+Sources: [CMakeLists.txt:393-461](), [cmake/TorchaniConfig.cmake.in:1-13]()
+
+## Environment and Dependency Management
+
+### Conda Environment Specification
+
+The project defines a comprehensive conda environment that aligns with build requirements:
+
+```mermaid
+graph LR
+    subgraph "Core Runtime"
+        A["python=3.11"]
+        B["pytorch=2.5"]
+        C["pytorch-cuda=12.4"]
+    end
+    
+    subgraph "Build Tools"
+        D["cmake=3.31.1"]
+        E["gxx_linux-64=12.2"]
+        F["gcc_linux-64=12.2"]
+        G["gfortran_linux-64=12.2"]
+    end
+    
+    subgraph "CUDA Development"
+        H["cuda-libraries-dev=12.4"]
+        I["cuda-nvcc=12.4"]
+        J["cuda-cudart-static=12.4"]
+    end
+    
+    subgraph "Molecular Dynamics"
+        K["fftw=3.3.10"]
+        L["netcdf-fortran=4.6.1"]
+        M["openmpi=4.1.6"]
+    end
+    
+    A --> N["Build Environment"]
+    B --> N
+    C --> N
+    D --> N
+    E --> N
+    F --> N
+    G --> N
+    H --> N
+    I --> N
+    J --> N
+    K --> O["Amber Integration"]
+    L --> O
+    M --> O
+```
+
+The environment specification enforces exact version matching for critical components like PyTorch (2.5), CUDA (12.4), and compiler toolchain (GCC 12.2).
+
+Sources: [environment.yaml:1-68]()
+
+### Compiler and Version Validation
+
+The build system includes strict compiler validation:
+
+```mermaid
+flowchart TD
+    A["Compiler Detection"] --> B{"GNU Compilers?"}
+    B -->|No| C["FATAL_ERROR"]
+    B -->|Yes| D["Version Check"]
+    D --> E{"11.0 <= Version <= 13.2?"}
+    E -->|No| F["FATAL_ERROR"]
+    E -->|Yes| G["Continue Build"]
+    
+    H["ALLOW_UNSUPPORTED_COMPILERS"] -.-> I["Skip Validation"]
+    I -.-> G
+```
+
+This validation ensures compatibility with CUDA toolkit requirements and PyTorch ABI constraints.
+
+Sources: [CMakeLists.txt:74-88]()
+
+---
+
+# Page: Testing Framework
+
+# Testing Framework
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [src/electro.cpp](src/electro.cpp)
+- [src/electro.h](src/electro.h)
+- [tests/generate_test_values.py](tests/generate_test_values.py)
+- [tests/templates/input.mdin.jinja](tests/templates/input.mdin.jinja)
+- [tests/test_amber_integration.py](tests/test_amber_integration.py)
+- [tests/test_values_cpu_1ccx_ensemble.txt](tests/test_values_cpu_1ccx_ensemble.txt)
+- [tests/test_values_cpu_1x_ensemble.txt](tests/test_values_cpu_1x_ensemble.txt)
+- [tests/test_values_cpu_2x_ensemble.txt](tests/test_values_cpu_2x_ensemble.txt)
+- [tests/test_values_cpu_dr_ensemble.txt](tests/test_values_cpu_dr_ensemble.txt)
+- [tests/test_values_cpu_mbis_ensemble.txt](tests/test_values_cpu_mbis_ensemble.txt)
+- [tests/test_values_cuda_1ccx_ensemble.txt](tests/test_values_cuda_1ccx_ensemble.txt)
+- [tests/test_values_cuda_1x_ensemble.txt](tests/test_values_cuda_1x_ensemble.txt)
+- [tests/test_values_cuda_2x_ensemble.txt](tests/test_values_cuda_2x_ensemble.txt)
+- [tests/test_values_cuda_dr_ensemble.txt](tests/test_values_cuda_dr_ensemble.txt)
+- [tests/test_values_cuda_mbis_ensemble.txt](tests/test_values_cuda_mbis_ensemble.txt)
+
+</details>
+
+
+
+## Overview
+
+The TorchANI-Amber testing framework provides comprehensive integration testing for the entire system, validating the correctness of neural network potential calculations, Amber MD engine integration, and ML/MM coupling mechanisms. The framework systematically tests combinations of computational backends (CPU/CUDA), precision levels, molecular environments, and coupling protocols to ensure robust operation across diverse simulation scenarios.
+
+For information about the build system that compiles the test executables, see [6.1](#6.1). For performance testing and benchmarking tools, see [5.2](#5.2).
+
+## Test Configuration System
+
+The testing framework uses a sophisticated configuration system based on dataclasses to systematically generate test scenarios across multiple dimensions of variability.
+
+### Configuration Classes
+
+The `RunConfig` class in [tests/test_amber_integration.py:44-75]() serves as the primary configuration container, composed of:
+
+- `CudaConfig`: Controls GPU execution and CUAEV acceleration
+- `MlmmConfig`: Defines ML/MM coupling protocols (`me` or `mbispol`)  
+- Boolean flags for shake constraints, vacuum/explicit solvent, precision, and neighborlist options
+
+```mermaid
+graph TB
+    subgraph "Configuration Generation"
+        A["RunConfig"] --> B["CudaConfig"]
+        A --> C["MlmmConfig"] 
+        A --> D["Boolean Flags"]
+        
+        B --> B1["cuaev: bool"]
+        C --> C1["protocol: me|mbispol"]
+        C --> C2["use_torch_coupling: bool"]
+        D --> D1["shake: bool"]
+        D --> D2["vacuum: bool"]
+        D --> D3["float64: bool"]
+        D --> D4["use_amber_neighborlist: bool"]
+    end
+    
+    subgraph "Test Matrix Generation"
+        E["itertools.product()"] --> F["288 Base Combinations"]
+        F --> G["Filter Logic"]
+        G --> H["Final Test Configs"]
+        
+        G --> G1["Float64 Restrictions"]
+        G --> G2["Neighborlist Compatibility"]
+        G --> G3["Legacy Mode Filtering"]
+    end
+    
+    A --> E
+```
+
+**Test Matrix Generation**
+
+The framework generates test configurations using `itertools.product()` across all parameter combinations in [tests/test_amber_integration.py:87-110](), then applies filtering logic to remove invalid or unsupported combinations:
+
+| Filter Type | Condition | Rationale |
+|-------------|-----------|-----------|
+| Float64 Restriction | Only MLMM + CUDA + CUAEV + Vacuum | Performance optimization |
+| Neighborlist Incompatibility | No MLMM with Amber neighborlist | Not implemented |
+| Vacuum FullML | No FullML + Vacuum + Amber neighborlist | Not applicable |
+
+Sources: [tests/test_amber_integration.py:32-110]()
+
+## Integration Test Suite
+
+The test suite is organized into parameterized test methods that systematically validate different execution engines and coupling modes.
+
+### Test Method Organization
+
+```mermaid
+graph TB
+    subgraph "AmberIntegration Test Class"
+        A["testPmemd()"] --> A1["Full ML Tests"]
+        A --> A2["No Amber Neighborlist"]
+        
+        B["testPmemdFromNeighbors()"] --> B1["Full ML Tests"]
+        B --> B2["With Amber Neighborlist"]
+        
+        C["testSander()"] --> C1["Standard Configurations"]
+        C --> C2["No Torch Coupling"]
+        
+        D["testSanderFromNeighbors()"] --> D1["Full ML Tests"]
+        D --> D2["With Amber Neighborlist"]
+        
+        E["testSanderTorchCoupledMLMM()"] --> E1["ML/MM Tests"]
+        E --> E2["Torch Coupling Enabled"]
+        
+        F["testNetCDFWorks()"] --> F1["NetCDF Output Format"]
+        F --> F2["Both pmemd and sander"]
+    end
+    
+    subgraph "Test Execution Flow"
+        G["_testPmemd()/_testSander()"] --> H["Generate Input Files"]
+        H --> I["_run_engine()"]
+        I --> J["Parse Output"]
+        J --> K["Compare vs Expected"]
+    end
+    
+    A --> G
+    B --> G
+    C --> G
+    D --> G
+    E --> G
+```
+
+### Input File Generation
+
+Each test generates Amber input files using Jinja2 templates. The `input.mdin.jinja` template in [tests/templates/input.mdin.jinja:1-98]() supports both legacy and modern configuration formats:
+
+**Template Structure:**
+- Control namelist (`&cntrl`) with dynamics parameters
+- QM/MM namelist (`&qmmm`) for ML/MM simulations  
+- External potential namelist (`&extpot`) for full ML simulations
+- TorchANI-specific namelist (`&ani`) with model and device configuration
+
+Sources: [tests/test_amber_integration.py:127-243](), [tests/templates/input.mdin.jinja:1-98]()
+
+## Test Execution Workflow
+
+The test execution follows a standardized workflow that isolates each test case and validates outputs against expected results.
+
+### Execution Pipeline
+
+```mermaid
+flowchart TD
+    A["Test Method Entry"] --> B["Setup Temporary Directory"]
+    B --> C["Render Jinja Template"]
+    C --> D["Write input.mdin"]
+    D --> E["Copy System Files"]
+    E --> F["Execute Amber Engine"]
+    F --> G["Parse Output Files"]
+    G --> H["Load Expected Values"]
+    H --> I["Numerical Comparison"]
+    I --> J["Cleanup"]
+    
+    subgraph "File Operations"
+        E --> E1["system.prmtop"]
+        E --> E2["system.inpcrd"]
+        F --> F1["system.mdout"]
+        F --> F2["system.mdcrd"]
+        F --> F3["*.dat files"]
+        F --> F4["*.xyz files"]
+    end
+    
+    subgraph "Validation Logic"
+        I --> I1["assert_allclose()"]
+        I --> I2["Tolerance Configuration"]
+        I --> I3["Error Reporting"]
+    end
+```
+
+### Engine Execution
+
+The `_run_engine()` method in [tests/test_amber_integration.py:344-379]() handles subprocess execution of both `pmemd` and `sander` with standardized command-line arguments:
+
+```
+engine -i input.mdin -p system.prmtop -c system.inpcrd 
+       -o system.mdout -r system.restart -x system.mdcrd 
+       -inf system.mdinfo -O
+```
+
+Sources: [tests/test_amber_integration.py:151-379]()
+
+## Test Data Generation and Validation
+
+### Reference Data Generation
+
+The `generate_test_values.py` script creates reference datasets by executing JIT-compiled neural network models directly through PyTorch:
+
+```mermaid
+graph LR
+    subgraph "Model Execution"
+        A["JIT Model Files"] --> B["torch.jit.load()"]
+        B --> C["Test Coordinates"]
+        C --> D["Forward Pass"]
+        D --> E["Energy Calculation"]
+        E --> F["Force Derivatives"]
+    end
+    
+    subgraph "Output Generation"
+        F --> G["Energy Values"]
+        F --> H["Force Components"]
+        F --> I["Atomic Charges"]
+        F --> J["Charge Derivatives"]
+    end
+    
+    subgraph "File Output"
+        G --> K["test_values_cpu_*.txt"]
+        H --> K
+        I --> K
+        J --> K
+        
+        G --> L["test_values_cuda_*.txt"]
+        H --> L
+        I --> L
+        J --> L
+    end
+```
+
+**Test Value Files Structure:**
+Each `.txt` file contains numerical values in sequence:
+1. Energy (kcal/mol)
+2. Force components (3 × num_atoms)
+3. QBC values (for ensemble models)
+4. QBC derivatives (for ensemble models)  
+5. Atomic charges (for charge-predicting models)
+6. Charge derivatives (for charge-predicting models)
+
+### Tolerance Configuration
+
+The validation system applies different numerical tolerances based on computational context:
+
+| Configuration | rtol | atol | Rationale |
+|---------------|------|------|-----------|
+| CPU Standard | 1e-7 | 1e-5 | High precision baseline |
+| CUDA Standard | 0.0 | 1.0002e-3 | GPU numerical differences |
+| Amber Neighborlist | 0.0005 | 1.5e-3 | Mapping approximations |
+
+Sources: [tests/test_amber_integration.py:183-194](), [tests/test_amber_integration.py:301-312](), [tests/generate_test_values.py:13-119]()
+
+## Environment Variables and Controls
+
+The testing framework provides several environment variables for debugging and development workflows:
+
+### Control Variables
+
+| Variable | Effect | Use Case |
+|----------|--------|----------|
+| `TORCHANI_AMBER_KEEP_TEST_DIRS=1` | Preserve test directories | Debugging failed tests |
+| `TORCHANI_AMBER_OVERWRITE_EXPECTED=1` | Update expected output files | Creating new baselines |
+| `TORCHANI_AMBER_LEGACY_TEST=1` | Enable legacy compatibility mode | Testing older branches |
+
+### Output Parsing and Comparison
+
+The `parse_amber_output()` method in [tests/test_amber_integration.py:334-342]() handles different output formats:
+
+- **XYZ format**: Filters out comment lines containing "TORCHANI"
+- **MDCRD format**: Removes header line with filename
+- **DAT format**: Direct numerical parsing
+
+Sources: [tests/test_amber_integration.py:1-10](), [tests/test_amber_integration.py:152-157](), [tests/test_amber_integration.py:195-202]()
+
+## Test Coverage Matrix
+
+The parameterized testing approach ensures comprehensive coverage across the configuration space:
+
+```mermaid
+graph TB
+    subgraph "Execution Engines"
+        A["pmemd"] --> A1["Full ML"]
+        A --> A2["From Neighbors"]
+        B["sander"] --> B1["Standard"]
+        B --> B2["From Neighbors"] 
+        B --> B3["Torch Coupled MLMM"]
+    end
+    
+    subgraph "Configuration Dimensions"
+        C["Hardware"] --> C1["CPU"]
+        C --> C2["CUDA"]
+        C --> C3["CUAEV"]
+        
+        D["Precision"] --> D1["Float32"]
+        D --> D2["Float64"]
+        
+        E["Environment"] --> E1["Vacuum"]
+        E --> E2["Explicit Solvent"]
+        
+        F["Constraints"] --> F1["SHAKE"]
+        F --> F2["No SHAKE"]
+        
+        G["Coupling"] --> G1["Full ML"]
+        G --> G2["ME Protocol"]
+        G --> G3["MBISPOL Protocol"]
+    end
+    
+    subgraph "Output Validation"
+        H["Numerical Comparison"] --> H1["Energy Values"]
+        H --> H2["Force Components"]
+        H --> H3["Atomic Charges"]
+        H --> H4["Charge Derivatives"]
+    end
+```
+
+Sources: [tests/test_amber_integration.py:77-110](), [tests/test_amber_integration.py:135-266]()
+
+---
+
+# Page: Code Quality and Development Workflow
+
+# Code Quality and Development Workflow
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.flake8](.flake8)
+- [.gitignore](.gitignore)
+- [.pre-commit-config.yaml](.pre-commit-config.yaml)
+- [benchmark/environment.yaml](benchmark/environment.yaml)
+- [benchmark/utils.py](benchmark/utils.py)
+- [external/README.md](external/README.md)
+
+</details>
+
+
+
+This document covers the development workflow, code quality tools, pre-commit hooks, and contribution guidelines for TorchANI-Amber. It provides essential information for developers contributing to the codebase, including automated quality checks, git workflows, and environment management practices.
+
+For information about the build system and dependency management, see [Build System Deep Dive](#6.1). For testing infrastructure and test execution, see [Testing Framework](#6.2).
+
+## Development Workflow Overview
+
+TorchANI-Amber employs a structured development workflow that emphasizes code quality, automated testing, and systematic integration practices. The workflow integrates multiple quality assurance tools and follows established patterns for collaborative development.
+
+### Pre-commit Hook System
+
+The development workflow centers around a comprehensive pre-commit hook system that enforces code quality standards before changes enter the repository.
+
+```mermaid
+flowchart TD
+    DEV["Developer Makes Changes"] --> STAGE["git add files"]
+    STAGE --> COMMIT["git commit"]
+    
+    COMMIT --> PRECOMMIT["Pre-commit Hooks Trigger"]
+    
+    PRECOMMIT --> BRANCH_CHECK["no-commit-to-branch"]
+    BRANCH_CHECK --> BRANCH_PASS{"Branch Check Pass?"}
+    BRANCH_PASS -->|No| ABORT_COMMIT["Commit Aborted"]
+    BRANCH_PASS -->|Yes| PUSH_ATTEMPT["git push"]
+    
+    PUSH_ATTEMPT --> PREPUSH["Pre-push Hooks Trigger"]
+    
+    PREPUSH --> SYNTAX_CHECKS["File Syntax Validation"]
+    SYNTAX_CHECKS --> CHECK_YAML["check-yaml"]
+    CHECK_YAML --> CHECK_TOML["check-toml"] 
+    CHECK_TOML --> CHECK_JSON["check-json"]
+    
+    SYNTAX_CHECKS --> QUALITY_CHECKS["Code Quality Checks"]
+    QUALITY_CHECKS --> LARGE_FILES["check-added-large-files"]
+    LARGE_FILES --> MERGE_CONFLICT["check-merge-conflict"]
+    MERGE_CONFLICT --> DEBUG_STMT["debug-statements"]
+    
+    QUALITY_CHECKS --> PYTHON_TOOLS["Python Code Quality"]
+    PYTHON_TOOLS --> BLACK["black formatter"]
+    BLACK --> FLAKE8["flake8 linter"]
+    FLAKE8 --> AUTOFLAKE["autoflake unused imports"]
+    
+    AUTOFLAKE --> CHECKS_PASS{"All Checks Pass?"}
+    CHECKS_PASS -->|No| FIX_ISSUES["Fix Issues & Retry"]
+    CHECKS_PASS -->|Yes| PUSH_SUCCESS["Push Successful"]
+    
+    FIX_ISSUES --> STAGE
+    ABORT_COMMIT --> DEV
+```
+
+Sources: [.pre-commit-config.yaml:1-40]()
+
+### Code Quality Tools Configuration
+
+The project employs several code quality tools with specific configurations tailored to the codebase requirements.
+
+| Tool | Purpose | Configuration File | Key Settings |
+|------|---------|-------------------|--------------|
+| `black` | Python code formatting | `.pre-commit-config.yaml` | Version 22.6.0, runs on pre-push |
+| `flake8` | Python linting | `.flake8` | Max line length 88, ignores W503 |
+| `autoflake` | Remove unused imports | `.pre-commit-config.yaml` | Version v1.4, runs on pre-push |
+| `pre-commit` | Hook orchestration | `.pre-commit-config.yaml` | Multiple stages and repositories |
+
+The `flake8` configuration specifically addresses Python coding standards:
+
+```mermaid
+graph LR
+    FLAKE8_CONFIG[".flake8 Configuration"] --> IGNORE["ignore = W503"]
+    FLAKE8_CONFIG --> MAXLINE["max-line-length = 88"]
+    FLAKE8_CONFIG --> EXCLUDE["exclude patterns"]
+    
+    IGNORE --> W503_REASON["Line break before binary operator<br/>conflicts with PEP8 preference"]
+    MAXLINE --> BLACK_COMPAT["Matches black formatter settings"]
+    
+    EXCLUDE --> GIT_DIR[".git"]
+    EXCLUDE --> PYCACHE["__pycache__"]
+    EXCLUDE --> EGGS[".eggs"]
+    EXCLUDE --> BUILD["build"]
+    EXCLUDE --> EGGINFO["torchani.egg-info"]
+    EXCLUDE --> DOCS["docs/examples"]
+    EXCLUDE --> TOOLS["tools/dump_dispersion_constants.py"]
+```
+
+Sources: [.flake8:1-15](), [.pre-commit-config.yaml:23-40]()
+
+## Repository Management
+
+### Git Ignore Patterns
+
+The repository maintains strict control over tracked files through comprehensive ignore patterns that prevent accidental inclusion of generated content and development artifacts.
+
+| Category | Patterns | Purpose |
+|----------|----------|---------|
+| Build artifacts | `build/*`, `*.x`, `*.mod` | CMake and compilation outputs |
+| Generated models | `jit/*.pt`, `aimnet2/`, `nutmeg/` | JIT-compiled neural network models |
+| Development cache | `.mypy_cache/`, `__pycache__/`, `.ccls-cache` | Language server and Python caches |
+| Test outputs | `test/test_values*.txt`, `tests/dump_*` | Temporary test result files |
+| Benchmark results | `benchmark/*` (selective) | Performance test outputs |
+| Runtime artifacts | `*.mdcrd`, `*.restart`, `*mdout` | Amber simulation outputs |
+
+The selective inclusion pattern for benchmark directory preserves essential development tools while excluding generated results:
+
+```mermaid
+graph TD
+    BENCHMARK_DIR["benchmark/ directory"] --> EXCLUDED["Excluded by default"]
+    EXCLUDED --> INCLUDE_ENV["!benchmark/environment.yaml"]
+    EXCLUDED --> INCLUDE_BENCH["!benchmark/bench"]
+    EXCLUDED --> INCLUDE_UTILS["!benchmark/utils.py"]
+    EXCLUDED --> INCLUDE_SYSTEMS["!benchmark/systems/"]
+    EXCLUDED --> INCLUDE_TEMPLATES["!benchmark/templates/"]
+    
+    INCLUDE_ENV --> ENV_PURPOSE["Conda environment specification"]
+    INCLUDE_BENCH --> BENCH_PURPOSE["CLI benchmarking tool"]
+    INCLUDE_UTILS --> UTILS_PURPOSE["Development utilities"]
+    INCLUDE_SYSTEMS --> SYS_PURPOSE["Test system configurations"]
+    INCLUDE_TEMPLATES --> TMPL_PURPOSE["Jinja2 job templates"]
+```
+
+Sources: [.gitignore:1-51]()
+
+### Branch Protection and Workflow
+
+The pre-commit configuration enforces branch protection policies that prevent direct commits to primary branches, encouraging a proper development workflow through feature branches and pull requests.
+
+```mermaid
+sequenceDiagram
+    participant DEV as "Developer"
+    participant FEATURE as "Feature Branch"
+    participant PRECOMMIT as "Pre-commit Hooks"
+    participant MAIN as "main/master Branch"
+    
+    DEV->>FEATURE: "git checkout -b feature-branch"
+    DEV->>FEATURE: "Make changes"
+    DEV->>PRECOMMIT: "git commit"
+    
+    PRECOMMIT->>PRECOMMIT: "no-commit-to-branch check"
+    Note over PRECOMMIT: "Allows commit to feature branch"
+    PRECOMMIT->>FEATURE: "Commit allowed"
+    
+    DEV->>MAIN: "Attempt direct commit"
+    PRECOMMIT->>PRECOMMIT: "no-commit-to-branch check"
+    Note over PRECOMMIT: "args: ['--branch', 'main', '--branch', 'master']"
+    PRECOMMIT->>DEV: "Commit blocked"
+```
+
+Sources: [.pre-commit-config.yaml:6-8]()
+
+## Environment Management
+
+### Development Environment Specification
+
+The project provides standardized environment specifications for consistent development setups across different systems and contributors.
+
+The benchmark environment configuration demonstrates the project's approach to dependency management:
+
+```mermaid
+graph LR
+    ENV_YAML["benchmark/environment.yaml"] --> NAME["name: ani-amber-bench"]
+    ENV_YAML --> CHANNELS["Channel Configuration"]
+    ENV_YAML --> DEPS["Dependencies"]
+    
+    CHANNELS --> NODEFAULTS["- nodefaults"]
+    CHANNELS --> CONDA_FORGE["- conda-forge"]
+    
+    DEPS --> PYTHON["python=3.11"]
+    DEPS --> CORE_LIBS["Core Libraries"]
+    DEPS --> DEV_TOOLS["Development Tools"]
+    DEPS --> ANALYSIS["Analysis Tools"]
+    
+    CORE_LIBS --> NUMPY["numpy"]
+    CORE_LIBS --> SCIPY["scipy"]
+    
+    DEV_TOOLS --> PIP["pip>=24.0"]
+    DEV_TOOLS --> TYPER["typer"]
+    DEV_TOOLS --> RICH["rich"]
+    DEV_TOOLS --> JINJA2["jinja2"]
+    
+    ANALYSIS --> MATPLOTLIB["matplotlib"]
+    ANALYSIS --> PANDAS["pandas"]
+    ANALYSIS --> TYPING_EXT["typing_extensions>=4.0.0"]
+```
+
+Sources: [benchmark/environment.yaml:1-16]()
+
+## Development Utilities
+
+### Scheduler Integration for HPC Development
+
+The development workflow includes sophisticated utilities for high-performance computing environments, particularly for testing and benchmarking on cluster systems.
+
+The `send_to_scheduler` function in `benchmark/utils.py` demonstrates the integration between development tools and HPC infrastructure:
+
+```mermaid
+flowchart TD
+    CLI_ARGS["CLI Arguments"] --> PARSE_ARGS["Argument Parsing"]
+    PARSE_ARGS --> CLUSTER_CONFIG["Cluster Configuration"]
+    
+    CLUSTER_CONFIG --> HPG_CHECK{"cluster == 'hpg'?"}
+    HPG_CHECK -->|Yes| GPU_MAPPING["GPU to Partition Mapping"]
+    HPG_CHECK -->|No| UNKNOWN_CLUSTER["Unknown cluster error"]
+    
+    GPU_MAPPING --> GPU_2080TI["2080ti → gpu partition"]
+    GPU_MAPPING --> GPU_B200["b200 → hpg-b200 partition"]
+    GPU_MAPPING --> GPU_L4["l4 → hpg-turin partition"]
+    
+    CLUSTER_CONFIG --> TEMPLATE_ENV["Jinja2 Environment Setup"]
+    TEMPLATE_ENV --> SCHED_ROOT["~/Sched/ani-amber/"]
+    SCHED_ROOT --> VERSION_CHECK["Version Increment Logic"]
+    
+    VERSION_CHECK --> TEMPLATE_RENDER["Template Rendering"]
+    TEMPLATE_RENDER --> SLURM_SCRIPT["Generate .slurm.sh file"]
+    SLURM_SCRIPT --> SBATCH["subprocess.run(['sbatch', script])"]
+```
+
+Sources: [benchmark/utils.py:14-79]()
+
+### Model Support Matrix
+
+The development framework supports a comprehensive range of neural network models through a standardized interface:
+
+| Model Family | Variants | Purpose |
+|--------------|----------|---------|
+| ANI | `ani1x`, `ani1ccx`, `ani2x`, `ani2xr`, `ani2dr` | Legacy ANI models |
+| ANI Specialized | `animbis`, `aniala`, `anir2s` variants | Specialized systems |
+| AIMNet2 | `b973c` and `wb97m` functionals | Advanced charge prediction |
+| NutMeg | `small`, `medium`, `large` | Variable complexity models |
+
+The `SUPPORTED_MODELS` list serves as the authoritative registry for model validation and benchmarking workflows.
+
+Sources: [benchmark/utils.py:82-109]()
+
+## Contribution Guidelines
+
+### Code Quality Standards
+
+Contributors must ensure their code adheres to the established quality standards enforced by the automated toolchain:
+
+1. **Python Code Formatting**: All Python code must pass `black` formatting with default settings
+2. **Linting Compliance**: Code must satisfy `flake8` requirements with project-specific configurations
+3. **Import Management**: Unused imports are automatically detected and must be removed
+4. **Branch Workflow**: Direct commits to `main` or `master` branches are prohibited
+5. **File Size Limits**: Large files are blocked from commits to maintain repository efficiency
+
+### Development Environment Setup
+
+New contributors should establish their development environment using the provided specifications:
+
+1. Create conda environment: `conda env create -f benchmark/environment.yaml`
+2. Install pre-commit hooks: `pre-commit install`
+3. Verify tool functionality: `pre-commit run --all-files`
+4. Configure IDE/editor to use project-specific settings (88-character line limit, etc.)
+
+### Integration Testing
+
+Before submitting contributions, developers should run the full suite of quality checks locally to ensure compatibility with the automated systems. The pre-commit framework provides immediate feedback on code quality issues, enabling rapid iteration during development.
+
+Sources: [.pre-commit-config.yaml:1-40](), [.flake8:1-15](), [benchmark/environment.yaml:1-16]()

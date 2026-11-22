@@ -1,0 +1,85 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+import { buildBatch } from '../shared/rfd4p/pipeline/index.js';
+import { StudioDoc } from '../web/studio-api.js';
+
+const binder = () => new StudioDoc(readFileSync(new URL('../web/studio/examples/protein_binder.cif', import.meta.url), 'utf8'), 'binder');
+const resIdsOf = (doc, chain) => {
+  const a = doc.atoms;
+  const out = [];
+  for (let i = 0; i < a.nAtoms; i += 1) {
+    if (String(a.chain_id[i]) === chain && !/^\d+-\d+$/.test(String(a.res_name[i])) && out.at(-1) !== a.res_id[i]) out.push(a.res_id[i]);
+  }
+  return out;
+};
+const atomOf = (doc, chain, resId) => doc.atoms.chain_id.findIndex((c, i) => String(c) === chain && doc.atoms.res_id[i] === resId);
+
+test('new residues inserted inside a chain leave its numbering alone', () => {
+  const doc = binder();
+  const before = resIdsOf(doc, 'A');
+  doc.insertSegment({ minimum: 5, maximum: 10, atomIndex: atomOf(doc, 'A', 41), before: true });
+  doc.insertSegment({ minimum: 3, maximum: 3, atomIndex: atomOf(doc, 'A', 41), before: true });
+  assert.deepEqual(resIdsOf(doc, 'A'), before);
+  const sentinels = doc.atoms.res_name.map((r, i) => [r, doc.atoms.res_id[i], doc.atoms.ins_code[i]]).filter(([r]) => /^\d+-\d+$/.test(String(r)));
+  assert.deepEqual(sentinels.filter(([, , c]) => c).map(([r, id, c]) => `${r}@${id}${c}`), ['5-10@40A', '3-3@40B']);
+  const pieces = doc.chainPlan('A').parts.map((p) => (p.kind === 'new' ? `new ${p.min}-${p.max}` : `${p.lo}-${p.hi}`));
+  assert.deepEqual(pieces, ['17-40', 'new 5-10', 'new 3-3', '41-131']);
+});
+
+test('the model sees the same input as when the chain was renumbered', () => {
+  // The old way: the sentinel takes 41 and the rest of the chain moves up by one.
+  const old = binder();
+  old.insertSegment({ minimum: 6, maximum: 6, atomIndex: atomOf(old, 'A', 41), before: true });
+  const a = old.atoms;
+  const s = a.res_name.findIndex((r) => r === '6-6');
+  a.ins_code[s] = '';
+  for (let i = 0; i < a.nAtoms; i += 1) {
+    if (String(a.chain_id[i]) === 'A' && i > s) { a.res_id[i] += 1; a.auth_seq_id[i] += 1; }
+  }
+  a.res_id[s] = 41;
+  a.auth_seq_id[s] = 41;
+  const now = binder();
+  now.insertSegment({ minimum: 6, maximum: 6, atomIndex: atomOf(now, 'A', 41), before: true });
+
+  const lengths = { segmentLengths: [6, 50] };
+  const rx = buildBatch(old.toCif(), { seed: 3, ...lengths });
+  const ry = buildBatch(now.toCif(), { seed: 3, ...lengths });
+  // Expanded, the chain is numbered straight through either way (no "40A"s reaching a design).
+  const numbering = (atoms) => {
+    const out = [];
+    for (let i = 0; i < atoms.nAtoms; i += 1) {
+      const k = `${atoms.res_id[i]}${atoms.ins_code?.[i] ?? ''}`;
+      if (String(atoms.chain_id[i]) === 'A' && out.at(-1) !== k) out.push(k);
+    }
+    return out;
+  };
+  assert.deepEqual(numbering(ry.atoms), numbering(rx.atoms));
+  assert.deepEqual(numbering(ry.atoms).slice(20, 30), ['37', '38', '39', '40', '41', '42', '43', '44', '45', '46']);
+  const x = rx.batch;
+  const y = ry.batch;
+  assert.deepEqual(Object.keys(y).sort(), Object.keys(x).sort());
+  const flat = (v) => (v?.data ? Array.from(v.data) : ArrayBuffer.isView(v) ? Array.from(v) : v);
+  for (const k of Object.keys(x)) assert.deepEqual(flat(y[k]), flat(x[k]), k);
+});
+
+test('new residues stay joined to the chain when the residues beside them are removed afterwards', () => {
+  // New residues added after 59, then 60-62 removed: they must reach 63, or the model reads a chain break there.
+  const doc = binder();
+  doc.insertSegment({ minimum: 20, maximum: 20, atomIndex: atomOf(doc, 'A', 59), before: false });
+  const a = doc.atoms;
+  doc.deleteAtoms(Array.from({ length: a.nAtoms }, (_, i) => i).filter((i) => String(a.chain_id[i]) === 'A' && a.res_id[i] >= 60 && a.res_id[i] <= 62));
+  const res = buildBatch(doc.toCif(), { seed: 1 });
+  const pl = res.batch.token_bond_path_length;
+  const n = pl.shape.at(-1);
+  const at = res.atoms;
+  const tok = new Map();
+  for (let i = 0; i < at.res_id.length; i += 1) {
+    if (String(at.chain_id[i]) === 'A' && !tok.has(Number(at.token_id[i]))) tok.set(Number(at.token_id[i]), at.res_name[i] === '<M>');
+  }
+  // Chain A's tokens in order (the binder's own new chain B is not this one).
+  const order = [...tok.entries()].sort((x, y) => x[0] - y[0]);
+  const last = order.findLastIndex(([, isNew]) => isNew);
+  assert.equal(pl.data[order[last][0] * n + order[last + 1][0]], 1, 'the last new residue is bonded to the one after');
+});

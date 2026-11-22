@@ -1,0 +1,75 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{times}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+
+\begin{document}
+\thispagestyle{empty}
+
+\noindent\textbf{Nikhil Dehariya}$^{1,*}$, \textbf{Prof. Ravinder Tanwar}$^{1}$\\
+$^{1}$Department of Computer Science and Engineering (Artificial Intelligence and Data Science)\\
+Jai Narain College of Technology (JNCT), Bhopal, Madhya Pradesh, India\\
+Corresponding Email: \texttt{nikhildehariya101@gmail.com}\\
+Co-author Email: \texttt{ravindra.cse@jnctbhopal.ac.in}\\
+Project Repository: \url{https://github.com/nikhildehariya/proteopredict}\\[1.5em]
+
+\noindent October 23, 2026\\[1.5em]
+
+\noindent\textbf{To:} Prof. Yuan-Ting Zhang\\
+Editor-in-Chief, \textit{Computers in Biology and Medicine} (Elsevier)\\[1.5em]
+
+\noindent\textbf{SUBJECT: Submission of Original Research Article -- ``ProteoPredict: Tri-Modal Deep Network Fusion for High-Resolution Protein Function Prediction Across Low 3-mer Feature-Space Similarity Regimes''}\\[1em]
+
+\noindent Dear Prof. Yuan-Ting Zhang and Editorial Board Members,
+
+We are pleased to submit our original research manuscript titled \textbf{``ProteoPredict: Tri-Modal Deep Network Fusion for High-Resolution Protein Function Prediction Across Low 3-mer Feature-Space Similarity Regimes''} for consideration as an \textbf{Original Research Article} in \textit{Computers in Biology and Medicine}.
+
+\vspace{0.5em}
+\noindent\textbf{Scientific Problem \& Core Significance:}\\
+High-throughput automated prediction of Gene Ontology (GO) terms directly from primary amino acid sequences is central to functional genomics and precision drug discovery. However, traditional homology transfer baselines (e.g., BLAST and $k$-NN transfer) suffer marked performance degradation in remote homology regimes (empirically corresponding to low sequence similarity), where divergence obscures evolutionary signals. Furthermore, while pre-trained protein language models (PLMs) capture global tertiary fold topology, standard pooled transformer embeddings frequently dilute localized catalytic linear motifs and surface biophysical properties essential for enzymatic specificity.
+
+\vspace{0.5em}
+\noindent\textbf{Key Innovations of ProteoPredict:}
+\begin{enumerate}
+    \item \textbf{Graph-Partitioned Non-Redundant Benchmark:} From an initial retrieval of $18,338$ reviewed human Swiss-Prot proteins ($18,288$ unique), $17,624$ fully annotated proteins were partitioned into $16,171$ disjoint clusters via an alignment-free $3$-mer TF-IDF nearest-neighbor graph heuristic ($d_{\cos} \le 0.50$, zero cluster overlap across $12,302$ train / $2,691$ val / $2,631$ test splits).
+    \item \textbf{Tri-Modal Multi-Branch Deep Architecture:} Joint fusion of evolutionary semantics (Meta AI ESM-2, $320\text{D}$), alignment-free sequence motifs ($3$-mer TF-IDF, $1,500\text{D}$), and biophysical descriptors ($430\text{D}$), routing into decoupled sub-ontology decision heads optimized with multi-label Focal Loss ($\gamma = 2.0, \alpha = 0.35$).
+    \item \textbf{Performance Under Low Feature-Space Similarity:} On the held-out test cohort ($N=2,631$), ProteoPredict achieves validation-calibrated test Micro-$F_1$ of \textbf{0.5031} and Macro-$F_1$ of \textbf{0.4997}. Crucially, compared to homology transfer ($F_1 = 0.4607$), ProteoPredict captures \textbf{$+35.5\%$ more true functional annotations} (Recall $= 0.5917$ vs. $0.4366$; Precision $= 0.4375$ vs. $0.4877$), achieving $F_1 = \textbf{0.6146}$ in Molecular Function.
+    \item \textbf{Lowest Semantic Distance ($S_{\min} = 19.86$):} In CAFA Information Accretion semantic evaluation, ProteoPredict achieves $S_{\min} = 19.86$ (Remaining Uncertainty $RU = 18.12$, Misinformation $MI = 8.13$), outperforming both the Naive Frequency Prior ($28.31$) and Homology Transfer ($22.76$).
+    \item \textbf{Active-Site Functional Sensitivity Enrichment:} \textit{In silico} sliding-window Alanine perturbation demonstrates a \textbf{1.31-fold functional sensitivity enrichment at verified catalytic residues} within the human EGFR Kinase domain (one-sided Mann-Whitney $U = 1168.5$, logged tie-corrected $p = 0.0091 < 0.01$; unadjusted asymptotic normal approximation $p = 0.017$).
+\end{enumerate}
+
+\vspace{0.5em}
+\noindent\textbf{Software and Open-Science Reproducibility:}\\
+All source code, pre-trained model checkpoints, and reproducible evaluation scripts are publicly available at \url{https://github.com/nikhildehariya/proteopredict}. A standalone script (\texttt{reproduce\_benchmark.py}) reproduces all seven core benchmark metrics directly from saved model weights on the held-out test cohort in approximately 1 second.
+
+\vspace{0.5em}
+\noindent\textbf{Declarations:}
+\begin{itemize}
+    \item This manuscript represents original work that has not been published previously and is not under consideration for publication elsewhere.
+    \item All authors have read and approved the manuscript and agree with its submission to \textit{Computers in Biology and Medicine}.
+    \item The authors declare no competing financial or commercial interests.
+\end{itemize}
+
+\vspace{0.5em}
+\noindent\textbf{Suggested Independent Reviewers:}
+\begin{enumerate}
+    \item \textbf{Prof. Predrag Radivojac}, Khoury College of Computer Sciences, Northeastern University (\texttt{p.radivojac@northeastern.edu}).
+    \item \textbf{Dr. Maxat Kulmanov}, Computational Bioscience Research Center (CBRC), KAUST (\texttt{maxat.kulmanov@kaust.edu.sa}).
+    \item \textbf{Prof. Iddo Friedberg}, Department of Veterinary Microbiology \& Pathology, Washington State University (\texttt{irokicki@gmail.com}).
+    \item \textbf{Prof. Yana Bromberg}, Department of Biochemistry and Microbiology, Rutgers University (\texttt{yanab@rci.rutgers.edu}).
+\end{enumerate}
+
+\vspace{1em}
+\noindent Sincerely,\\[0.5em]
+\textbf{Nikhil Dehariya} (First \& Corresponding Author)\\
+Department of Computer Science and Engineering (Artificial Intelligence and Data Science)\\
+Jai Narain College of Technology (JNCT), Bhopal, Madhya Pradesh, India\\
+Email: \texttt{nikhildehariya101@gmail.com}\\[1em]
+\textbf{Prof. Ravinder Tanwar} (Co-Author \& Head of Department)\\
+Email: \texttt{ravindra.cse@jnctbhopal.ac.in}
+
+\end{document}

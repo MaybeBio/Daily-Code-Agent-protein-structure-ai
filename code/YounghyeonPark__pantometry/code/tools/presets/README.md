@@ -1,0 +1,154 @@
+# `tools/presets` — the starting points the editor offers
+
+`make.py` writes two things and both are **committed**:
+
+| what | where | why it exists |
+| --- | --- | --- |
+| `presets.rs` | `app/pantometry-world/src/` | the thirty-four shipped scenes, grouped by what they are a simulation of, with each scene's text embedded |
+| 29 PNG tiles | `app/pantometry-world/thumbnails/` | a picture of each scene's last frame, 240×156, 130 KiB in total and 4.5 KiB each, as `make.py` prints them. **Measured here rather than remembered**: this line said 282 KiB and 10.4 KiB each while the committed tiles were already a smaller size, and then 125 KiB and 4.3 KiB while they were these — 132 884 bytes, found on 2026-10-19 by a regeneration that changed no tile |
+
+```sh
+cargo build --release --bin pantometry --manifest-path app/Cargo.toml
+python tools/presets/make.py
+```
+
+It runs every scene, renders the last frame with `pantometry view --thumbnail`, sweeps away any
+tile no scene names any more, writes the Rust and runs `rustfmt` over it. Running it twice
+reproduces `presets.rs` byte for byte and rewrites the tiles identically — measured on 2026-10-02,
+two runs, every tile's SHA-256 the same, and again on 2026-10-19 for scene 34. That run also
+rejoined thirteen `thumb: Some(include_bytes!(...))` lines the committed file had split across
+three. rustfmt 1.10.0 accepts both spellings — `rustfmt --check` passes the old file and the new —
+so the format check could not have said which one the script writes; the script writes one line,
+and the committed file was therefore not its output as it stands. Where the split came from is
+not recorded.
+
+**The committed tiles are the script's output again**, and for a while they were not. Adding scene
+33 rewrote five that no scene change had touched — `06`, `07`, `14`, `25` and `31` — because the
+renderer had moved after they were drawn, and that commit kept the old five. Regenerating them was
+its own change, and it found a renderer defect: **`25` came out a solid block of one colour.** The
+viewer coloured every field on the *selected* panel's scale, and scene 25's displacement, some
+1e-6 m, was painted on its temperature's, from 300 K — every value fell off the bottom.
+`a_field_takes_its_own_scale_and_not_the_selected_panels` holds the fix, and `18`, the other scene
+with two fields, moved with it. The rest moved because the renderer did: `31` is the protein with
+its backbone, 1232 lit pixels against 275. `14-a-world` falls to **14** against 170, for the reason
+below.
+
+**A tile's pixels are held by nothing but a regeneration.** No test compares a committed tile with
+a fresh render, so the only way to know one is current is to run this and see what `git status`
+says.
+
+`python tools/presets/make.py --rust-only` writes `presets.rs` from the tiles already committed,
+without a binary and without rendering anything, for a change to the table that is not a change to
+any picture.
+
+**A preset carries the files it names.** Every string in a scene that is a file beside the scenes
+directory — the protein's `structures/1CRN.pdb`, the bracket's `parts/l-bracket.stl` — goes into
+`presets.rs` as `include_bytes!`, because a preset opens as an unsaved `scene.json` with no
+directory beside it. This was a flag, `needs_a_part`, set by searching for `"stl"`. It could not see
+a `"pdb"`, so the protein opened as a missing file and an empty viewport with no warning.
+`every_preset_builds_from_the_files_it_carries` builds each preset from its own files and nothing
+else, and holds the names the builder asked for against the set carried. Saving the scene writes
+them beside it.
+
+The `rustfmt` step is not tidiness. This script writes each `AREAS` entry on one line at up to 104
+characters and rustfmt reflows them across four, so without it the committed file is **not** what
+the script produces and the tree fails the app gate's first step. That sentence about reproducing
+byte for byte was here before the step was, and it read as true only because `cargo fmt --all`
+happened to run after the comparison that checked it.
+
+## This is the first exception to "nothing generated is committed"
+
+That rule is stated twice — `EXAMPLES.md` and `app/pantometry-world/scenes/README.md` — and it is
+about **what a run writes**: the SVG an example plots, the glTF a scene exports. Those are outputs.
+Nobody has to have them for the repository to build, and a stale one is worse than none.
+
+These are the other thing: **build inputs**. `presets.rs` is `include_str!`'d and the tiles are
+`include_bytes!`'d, so they have to exist before `cargo build` starts. The alternatives were
+considered and each fails on something concrete:
+
+* **A `build.rs` that renders them.** It would need a GPU adapter at build time. CI's runners have
+  none, `editor-core` compiles to `wasm32` where there is no adapter and no disk, and the whole
+  point of the tiles is to be *in* the wasm binary.
+* **Render them at startup.** The editor would need the scenes directory, which a shipped binary
+  does not have — the reason `templates` and the scenes are embedded in the first place — and it
+  would run thirty simulations to draw a menu.
+* **Ship without pictures.** That is what the screen was, and it is the thing the user said was
+  hard to choose from twice.
+
+So the cost is 130 KiB in git, once per change to a scene, and the guard against the usual price
+of a committed artefact — that it drifts from its source and nobody notices — is that the two
+generated things are checked against the scenes rather than against themselves — `presets.rs`
+is; a tile's pixels are not, as above:
+
+| check | where | what it would catch |
+| --- | --- | --- |
+| `every_shipped_scene_is_offered` | `pantometry-world` | a scene added or removed and not regenerated |
+| `a_presets_title_and_kinds_are_the_scenes_own` | `pantometry-world` | a scene's title edited after the last run of this script |
+| `a_preset_has_a_picture_unless_its_scene_has_nothing_to_draw` | `pantometry-world` | a tile that failed to render, which the screen would otherwise explain as "this one reports readings, not places" |
+| `every_tile_decodes_to_something` | `pantometry-world` | a tile of the wrong size, or of nothing but background |
+| `the_tiles_tell_the_scenes_apart_or_say_which_they_do_not` | `pantometry-world` | two scenes whose tiles are the same picture |
+| `every_shipped_scene_puts_something_on_the_canvas` | `pantometry-app` | a scene that stopped producing a panel — the live half, run on every commit |
+| `an_open_area_shows_its_scenes_and_a_shut_one_does_not` | `pantometry-app` | a tile that stopped decoding *in the app*, counted through the sentence the screen says about it |
+
+**The third row is a pin on a generated file and not corroboration**, and it was described here as
+"the other end of the same fact, from a GPU render rather than from the files", which was wrong
+twice. Both it and the `pantometry-app` row trace to one `eprintln!` — `this run has no panels at
+all`, which this script greps for and which the test greps for. And it is not a GPU render either
+way: that branch runs before an adapter is requested, which is why the live half still reports the
+same five on CI — three motor scenes and the two compartment models, scenes 32 and 34, which this
+line said three for after the first was added — where `ci.yml` says the runner has none.
+
+## What is a judgement here and what is not
+
+The `AREA` map and the `AREAS` table in `make.py` are editorial: which of eleven applications a
+scene is filed under, and what that application is called on screen. A reader can disagree with
+`24-a-power-module` being under power electronics rather than heat, and no test asserts the
+assignment — one that did would only repeat it. What *is* asserted is that every area is named and
+non-empty and that every scene is placed.
+
+## Three tiles are nearly empty, and that is the renderer being honest
+
+`07-bouncing-ball` lights 7 pixels of 37 440, `14-a-world` 14 and `06-orbits` 31, against 10 704 for
+a room mode. `14` is a 20 mm bar and a 4.4 m room beside orbits 1.5e11 m across, framed together,
+so it opens on three planets' markers: the tile is what the scene shows, and seeing the bar means
+framing the bar. The other two are a handful of point bodies, and a point is drawn as a cross about 1.2% of the frame
+across whatever the camera is fitted to — so cropping harder does not rescue them. Measured: at a
+twentyfold magnification cap the bouncing ball is a small cross in the middle of a grey field,
+which is a picture of the *marker* rather than of the run. `crop_to_content` caps at three for that
+reason, and `every_tile_decodes_to_something` pins those three **by rank** — the three lowest,
+with their counts — so a fourth one arriving is a failure rather than something to notice on the
+screen. By rank because the threshold it replaced sat at 90 and the next tile was then 94: four
+pixels of 37 440, which is not a margin. It is 170 now.
+
+## One group of tiles is the same picture, and the group that was a real defect is gone
+
+29 tiles, **27 distinct images**: `20`, `21` and `22` draw one image between them and nothing else
+collides.
+
+**This paragraph said three groups and twenty-four distinct, and both were stale.** Measured by
+hash: 20, 21 and 22 share `b5f4f6a5…`, while 24 is `3b467ac8…` and 25 is `c817ebce…` — two
+different pictures that this file went on calling one. The test beside it,
+`the_tiles_tell_the_scenes_apart_or_say_which_they_do_not`, pins the *set* of collisions rather
+than a count of them and so had been right all along; nothing compared the two.
+
+**It was 23, and the extra collision is why this check exists.** `08-atoms-crystal` and
+`09-atoms-liquid` drew the identical picture because both scenes were frozen lattices — they asked
+for `duration_s: 6.0e-12` against a domain built in reduced units where `τ` is one second, so the
+whole run was 6e-12 τ and the mean square displacement grew as exactly `t²`: free flight, not one
+collision in twelve frames. A liquid sitting on the crystal's own sites draws the crystal's own
+picture. Every check those scenes had went on passing, because the *speeds* were right and only the
+clock was wrong. The duration is 6.0 now, `scene.rs` asserts the displacement, and the two tiles
+differ.
+
+The rest are explicable. A tile's shade is the sample's value normalised over the run's own range
+and the frame is the last one, so three heat scenes in the same block driven to the same steady
+state give the same *normalised* field whatever the material between them is — and for those three
+it is exact rather than approximate, because with no cooling, one material and a uniform source a
+uniform field is a fixed point of the update for any conductivity. All 1331 cells hold one number.
+`--frame` is not the culprit: `20-melting-a-block-of-ice` at frames 0, 6 and 11 gives three
+different pictures.
+
+Honest, and still bad on the screen: a chooser whose pictures cannot tell two scenes apart is a
+chooser with no pictures, for those two. `the_tiles_tell_the_scenes_apart_or_say_which_they_do_not`
+pins the set so a new one fails, and drawing the run rather than one instant of it is the open
+question.

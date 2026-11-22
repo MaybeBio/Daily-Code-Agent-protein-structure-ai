@@ -1,0 +1,146 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# One run per branch or pull request: a new push cancels a run that is already queued or going,
+# so superseded commits do not hold the runners (tags and the default branch are not cancelled).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  cmake:
+    name: ${{ matrix.os }} (CMake)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: CLI smoke test
+        shell: bash
+        run: |
+          exe=build/chemlarp; [ -f build/Release/chemlarp.exe ] && exe=build/Release/chemlarp.exe
+          [ -f build/chemlarp.exe ] && exe=build/chemlarp.exe
+          "$exe" canon 'C1=CC=C(C=C1)/C=C/C(=O)O'
+          "$exe" reaction '1 C + 2 O=O -> 1 O=C=O + 2 O'
+          "$exe" kinetics data/mechanisms/h2o2.ocm -m adiabatic-v -T 1000 -P 1 -t 1e-3 H2=2 O2=1 AR=7 > kinetics.txt
+          head -4 kinetics.txt
+          "$exe" kinetics data/mechanisms/h2o2/chem.inp --thermo data/mechanisms/h2o2/therm.dat -T 1000 -t 1e-3 H2=2 O2=1 AR=7 > ck.txt
+          "$exe" kinetics data/mechanisms/h2o2.yaml -T 1000 -t 1e-3 H2=2 O2=1 AR=7 > yaml.txt
+          grep ignition kinetics.txt ck.txt yaml.txt
+          "$exe" embed 'C[C@@H](C(=O)O)N' --sdf ala.sdf
+          grep -c "V2000" ala.sdf
+
+      - name: Python binding smoke test
+        shell: bash
+        run: |
+          python -I -c "
+          import sys; sys.path.insert(0, 'python'); import chemlarp
+          print('loaded', chemlarp.library_path())
+          assert chemlarp.canonical('C1=CC=CC=C1')['canonical'] == 'c1ccccc1'
+          r = chemlarp.kinetics('data/mechanisms/h2o2.ocm', {'H2': 2, 'O2': 1, 'AR': 7}, 1000, 1e5, t_end=1e-3)
+          assert r['ignition_time'] and r['samples'][-1]['T'] > 2500
+          print('ok', r['ignition_time'])
+          e = chemlarp.embed('C[C@@H](C(=O)O)N')
+          assert e['stereo']['centres_ok'] == 1 and e['converged'] and len(e['coordinates']) == 13
+          print('embed ok', e['energy_kcal_mol'])
+          "
+
+  mingw:
+    name: windows-latest (MSYS2 MinGW, Makefile)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e  # v2
+        with:
+          msystem: UCRT64
+          install: make mingw-w64-ucrt-x86_64-gcc
+      - name: Build and test
+        run: make -j4 all && make test
+
+  tsan:
+    name: ubuntu-latest (ThreadSanitizer, 4 threads)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Build and test with ThreadSanitizer
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=thread -pthread -Itests -Iinclude -DCHEMLARP_STATIC \
+            -DCHEMLARP_TEST_DATA_DIR="\"$PWD/data\"" src/*.cpp tests/*.cpp -o tests_tsan
+          CHEMLARP_THREADS=4 TSAN_OPTIONS=halt_on_error=1 ./tests_tsan
+
+  asan:
+    name: ubuntu-latest (AddressSanitizer, UBSan, LeakSanitizer)
+    # macOS spins inside the sanitizer's own scheduler with this thread pool, so these run on Linux
+    # (docs/AUDITS.md, audit 1.3). UBSan also runs here, where ASan's allocator makes it stricter.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Build and test with AddressSanitizer, UBSan and LeakSanitizer
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+            -fno-omit-frame-pointer -pthread -Itests -Iinclude -DCHEMLARP_STATIC \
+            -DCHEMLARP_TEST_DATA_DIR="\"$PWD/data\"" src/*.cpp tests/*.cpp -o tests_asan
+          CHEMLARP_THREADS=4 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+            UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./tests_asan
+
+  fuzz:
+    name: ubuntu-latest (libFuzzer, parsers)
+    # Apple's clang does not ship libFuzzer, so this runs on Linux (docs/AUDITS.md, audit 1.5).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Build the fuzz target
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
+            -fno-omit-frame-pointer -pthread -Iinclude -DCHEMLARP_STATIC \
+            src/*.cpp tests/fuzz_parsers.cpp -o fuzz_parsers
+      - name: Seed a corpus from the repository's own inputs
+        run: |
+          mkdir -p corpus
+          i=0
+          for f in data/*.pdb data/mechanisms/* data/mechanisms/h2o2/* tests/data/* ; do
+            [ -f "$f" ] || continue
+            i=$((i+1)); printf '\%d' "$((i % 16))" > "corpus/seed$i"; head -c 4000 "$f" >> "corpus/seed$i"
+          done
+          for s in 'CC(=O)Oc1ccccc1C(=O)O' 'c1ccncc1' '[C@@H](N)(C)C(=O)O' 'add NaCl 1' 'feed F T=300'; do
+            i=$((i+1)); printf '\1%s' "$s" > "corpus/seed$i"
+          done
+          ls corpus | wc -l
+      - name: Fuzz
+        run: |
+          ASAN_OPTIONS=detect_leaks=0 ./fuzz_parsers corpus -max_total_time=240 -max_len=4096 \
+            -timeout=25 -rss_limit_mb=4096 -print_final_stats=1
+      - name: Upload any crash
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore

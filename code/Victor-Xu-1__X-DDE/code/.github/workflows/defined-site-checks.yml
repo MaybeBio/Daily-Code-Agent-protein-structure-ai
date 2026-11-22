@@ -1,0 +1,151 @@
+name: Defined pocket exploration checks
+on:
+  workflow_dispatch:
+  push:
+    paths: &molecular_review_paths
+      - "src/opendde_workbench/sites/**"
+      - "src/opendde_workbench/examples/stat6_bundle_release.py"
+      - "src/opendde_workbench/examples/bundle_states.py"
+      - "src/opendde_workbench/examples/record_sources.py"
+      - "src/opendde_workbench/receptors/alignment_evidence.py"
+      - "src/opendde_workbench/pose_ensembles/contracts.py"
+      - "src/opendde_workbench/pose_ensembles/planning.py"
+      - "src/opendde_workbench/pose_ensembles/sources.py"
+      - "src/opendde_workbench/pose_ensembles/storage.py"
+      - "src/opendde_workbench/research/graph_records.py"
+      - "src/opendde_workbench/research/receptor_sets.py"
+      - "src/opendde_workbench/research/routes.py"
+      - "frontend/src/sites/**"
+      - "frontend/src/design/capabilities.css"
+      - "frontend/src/poses/Pose*"
+      - "frontend/src/poses/LigandChoice*"
+      - "frontend/src/poses/source-label.ts"
+      - "frontend/src/viewer/search-box*"
+      - "frontend/src/viewer/source-layout.ts"
+      - "frontend/src/integrations/PlipReview*"
+      - "frontend/src/integrations/ScientificReview.tsx"
+      - "frontend/src/diffsbdd/ReviewReference.tsx"
+      - "frontend/src/docking/BoxFields.tsx"
+      - "tests/test_defined*"
+      - "tests/test_stat6_case_data.py"
+      - "tests/test_stat6_recipe_replay.py"
+      - "src/opendde_workbench/examples/stat6/catalogue-profiles.json"
+      # Shared catalogue compatibility has exact DEL/STAT6 cold-restore checks
+      # in del-example-guidance-checks.yml; source/profile changes still run here.
+      - "tests/fixtures/stat6/9big-ak1690*"
+      - "tests/fixtures/stat6/retained-alignment.source.json"
+      - "server_tests/test_defined_region_browser.py"
+      - ".github/workflows/defined-site-checks.yml"
+  pull_request:
+    paths: *molecular_review_paths
+permissions:
+  contents: read
+jobs:
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  antibody-scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      antibody_only: ${{ steps.scope.outputs.antibody_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/antibody_template_scope.py
+  model-context:
+    uses: ./.github/workflows/property-model-review-checks.yml
+    with:
+      scope_only: true
+  scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      del_only: ${{ steps.select.outputs.del_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: select
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: python3 scripts/del-ci-scope.py
+  definitions:
+    needs: [scope, model-context, antibody-scope, utility-scope]
+    if: needs.utility-scope.outputs.utility_only != 'true' && (needs.antibody-scope.outputs.antibody_only != 'true' && needs.scope.outputs.del_only != 'true' && needs.model-context.outputs.model_context_only != 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev --group browser
+      - name: Defined-source questionnaire, exact source labels and PLIP review
+        working-directory: frontend
+        run: >-
+          npx vitest run src/sites/DefinedRegionForm.test.tsx src/sites/defined-sources.test.ts
+          src/poses/PoseWorkspace.test.tsx src/poses/PoseForm.test.tsx
+          src/poses/PosePlanRun.test.tsx
+          src/viewer/search-box.test.ts
+          src/viewer/source-layout.test.ts src/diffsbdd/ReviewReference.test.tsx
+          src/integrations/PlipReview.test.tsx
+          src/docking/DockingForm.test.tsx src/docking/SearchPreview.test.tsx
+      - name: Restore only the immutable public data fixture; no tasks run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v0.5.77 --repo "$GITHUB_REPOSITORY" --pattern stat6-reviewed-results-v7.zip --dir "$RUNNER_TEMP/defined-site-data"
+          echo "WB_DEFINED_SITE_ARCHIVE=$RUNNER_TEMP/defined-site-data/stat6-reviewed-results-v7.zip" >> "$GITHUB_ENV"
+          uv run --locked python - <<'PY'
+          import os
+          from pathlib import Path
+          from server_tests.prepare_quality_context_cases import download_archive
+          archive = download_archive(Path(os.environ['RUNNER_TEMP']) / 'defined-site-data')
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'WB_REVIEWED_STAT6_ARCHIVE={archive}\n')
+          PY
+      - name: Defined conditions, existing native-site contracts and real retained-frame API
+        run: >-
+          uv run --locked --with biopython==1.88 --with numpy==1.26.4 pytest -q
+          tests/test_defined_pose_regions.py tests/test_defined_site_api.py
+          tests/test_pose_exploration_contract.py tests/test_pose_exploration_api.py
+          tests/test_site_association.py tests/test_receptor_contract.py
+          tests/test_stat6_case_data.py tests/test_stat6_recipe_replay.py
+      - run: uv run --locked python -m playwright install --with-deps chromium
+      - name: Real STAT6 source questionnaire, live 3D and plan-only handoff in Chromium
+        run: >-
+          uv run --locked --with biopython==1.88 --with numpy==1.26.4 python -m pytest -q
+          server_tests/test_defined_region_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: defined-region-browser
+          path: |
+            outputs/defined-regions
+            outputs/stat6-case-data
+            outputs/reviewed-recipe-replay
+      - name: Only changed source authorities and direct consumers
+        run: >-
+          uv run --locked ruff check src/opendde_workbench/sites
+          src/opendde_workbench/receptors/alignment_evidence.py
+          src/opendde_workbench/pose_ensembles/contracts.py
+          src/opendde_workbench/pose_ensembles/planning.py
+          src/opendde_workbench/pose_ensembles/sources.py
+          src/opendde_workbench/pose_ensembles/storage.py
+          src/opendde_workbench/research/graph_records.py
+          src/opendde_workbench/research/receptor_sets.py
+          src/opendde_workbench/research/routes.py
+          src/opendde_workbench/examples/bundle_states.py
+          src/opendde_workbench/examples/record_sources.py
+          tests/test_defined_pose_regions.py tests/test_defined_site_api.py
+          tests/test_stat6_case_data.py
+          server_tests/test_defined_region_browser.py

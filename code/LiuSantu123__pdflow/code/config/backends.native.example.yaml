@@ -1,0 +1,111 @@
+# pdflow native profile: every tool is called from its own conda environment.
+# Materialize with `pdflow setup --profile native`; __TOKENS__ are filled from
+# --home/--conda-base/--model-root/--kit-root/--af3-root/--usalign.
+pdflow:
+  workspace: "__HOME__/pdflow-runs"
+  threads: 8
+  gpu_memory_gb: 14
+
+usalign:
+  binary: "__USALIGN__"
+  clean_ld_library_path: true
+
+design:
+  rfd4:
+    python: "__CONDA_BASE__/envs/rfd4/bin/python"
+    binary: "__CONDA_BASE__/envs/rfd4/bin/rfd4-generate"
+    command: >-
+      {binary} inputs={input} num_replicates={num_designs}
+      out_dir={out_dir} {extra}
+    default_extra:
+      - "hf_ckpt_path=null"
+      - "ckpt_path=__HOME__/hf-bundle/flow_checkpoints"
+      - "ckpt_name=rfd4_proteina_flow-ema.ckpt"
+      - "autoencoder_ckpt_path=__HOME__/hf-bundle/ae_checkpoints/rfd4_proteina_ae-ema.ckpt"
+    env: {}
+
+  mpnn:
+    python: "__CONDA_BASE__/envs/ligandmpnn/bin/python"
+    command: >-
+      {python} /path/to/LigandMPNN/run.py
+      --pdb_path {input} --out_folder {out_dir} --number_of_batches {num_designs}
+    env: {}
+
+predictors:
+  af3:
+    python: "__CONDA_BASE__/envs/alphafold3/bin/python"
+    # Use run_alphafold_5070ti.py + --flash_attention_implementation=xla on
+    # RTX 50-series cards; run_alphafold.py is the portable default.
+    script: "__AF3_ROOT__/run_alphafold.py"
+    model_dir: "__AF3_ROOT__/models"
+    db_dir: ""
+    num_samples: 5
+    extra_args: []
+    env: {}
+
+  boltz2:
+    binary: "__CONDA_BASE__/envs/boltz2/bin/boltz"
+    cache: "__MODEL_ROOT__/boltz2/cache"
+    num_samples: 5
+    extra_args: []
+    env: {}
+
+  protenix2:
+    binary: "__CONDA_BASE__/envs/protenix2/bin/protenix"
+    model_name: protenix_base_default_v1.0.0
+    num_samples: 5
+    extra_args: []
+    env:
+      PROTENIX_ROOT_DIR: "__MODEL_ROOT__/protenix2"
+
+  opendde:
+    binary: "__CONDA_BASE__/envs/opendde/bin/opendde"
+    model_name: opendde_v1
+    num_samples: 5
+    extra_args: []
+    env:
+      OPENDDE_ROOT_DIR: "__MODEL_ROOT__/opendde/runtime"
+
+  mol1:
+    binary: "__CONDA_BASE__/envs/mol1/bin/mol"
+    model_name: mol-1-base
+    num_samples: 5
+    extra_args: []
+    env:
+      MOL_ROOT_DIR: "__HOME__/mol1-data"
+
+  # Legacy ID: runs ESMFold v1.
+  esmfold2:
+    python: "__CONDA_BASE__/envs/esmfold/bin/python"
+    script: "__MODEL_ROOT__/esmfold/run_esmfold.py"
+    pythonpath: "__MODEL_ROOT__/esmfold/openfold-latest"
+    weights: "__HOME__/.cache/torch/hub/checkpoints/esmfold_3B_v1.pt"
+    extra_args: ["--fp32"]
+    env: {}
+    single_chain_only: true
+
+  # ESMFold2 + ESMC-6B. Enable and set repo, python and both local checkpoints.
+  esmfold2_overlay:
+    enabled: false
+    repo: "__KIT_ROOT__"
+    python: "__HOME__/.venvs/esmfold2kit/bin/python"
+    mode: blackwell
+    env:
+      ESMFOLD2_WEIGHTS: "__HOME__/esmfold2/ESMFold2"
+      ESMFOLD2_ESMC: "__HOME__/esmfold2/ESMC-6B"
+
+tmol:
+  python: "__CONDA_BASE__/envs/tmol/bin/python"
+  mode: score
+  device: cuda
+  num_repeats: 2
+
+metrics:
+  contact_cutoff: 5.0
+  pae_interface_cutoff: 10.0
+  sasa_probe: 1.4
+  weights:
+    iptm: 0.45
+    ptm: 0.20
+    plddt: 0.20
+    pae: 0.15

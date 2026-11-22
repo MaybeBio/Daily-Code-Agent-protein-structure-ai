@@ -1,0 +1,4148 @@
+//! The app holds itself to the library's standard: every number checked against something
+//! the code did not compute.
+
+use pantometry::electrical::Winding;
+use pantometry::prelude::*;
+use pantometry_world::{DomainSpec, Scene, World};
+
+/// How far the atoms wandered, and whether that grew like `t`, like `t²`, or not at all.
+///
+/// Returns `(rms displacement at the last frame in units of the nearest-neighbour spacing,
+/// MSD(t) / MSD(t/2))`. The ratio is the discriminator and it needs no constant remembered from
+/// anywhere: **4** is free flight, `r = vt` with not one collision; **2** is diffusion, the
+/// Einstein relation; **1** is a solid, saturated about its lattice sites.
+///
+/// Displacements are taken to the nearest periodic image, or an atom crossing the wall counts as
+/// having moved a box length — which is how a frozen lattice first read as `mean 0.617841, max
+/// 7.12592`, the second of which is exactly `L√2`, a two-axis wrap and nothing else.
+fn wandered(frames: &[pantometry_world::Frame], panel: usize) -> (f64, f64) {
+    let at = |i: usize| match &frames[i].panels[panel].data {
+        pantometry_world::PanelData::Points {
+            positions, bounds, ..
+        } => (positions.clone(), bounds[3] - bounds[0]),
+        _ => panic!("atoms are bodies, not a field"),
+    };
+    let (first, side) = at(0);
+    let image = |d: f64| d - side * (d / side).round();
+    let rms = |i: usize| {
+        let (now, _) = at(i);
+        let total: f64 = first
+            .iter()
+            .zip(&now)
+            .map(|(a, b)| (0..3).map(|c| image(b[c] - a[c]).powi(2)).sum::<f64>())
+            .sum();
+        (total / first.len() as f64).sqrt()
+    };
+    // fcc with four atoms to a cube of side `side / cells`; the nearest neighbour is a face
+    // diagonal's half. `cells` is 3 in both scenes, and the cube side is what `bounds` gives.
+    let neighbour = side / 3.0 / std::f64::consts::SQRT_2;
+    let (half, end) = (rms(frames.len() / 2), rms(frames.len() - 1));
+    (
+        end / neighbour,
+        if half > 0.0 {
+            (end / half).powi(2)
+        } else {
+            0.0
+        },
+    )
+}
+
+fn scene_from(text: &str) -> Scene {
+    serde_json::from_str(text).expect("it parsed once already")
+}
+
+fn room_scene(duration_s: f64, frames: usize, cells: usize) -> Scene {
+    serde_json::from_str(&format!(
+        r#"{{
+          "title": "test", "schedule": "multirate",
+          "duration_s": {duration_s}, "frames": {frames},
+          "domains": [{{ "kind": "room", "name": "room", "width_m": 4.4,
+            "height_m": 3.1, "cells_across": {cells},
+            "release": {{ "as": "mode", "nx": 1, "ny": 1, "amplitude_pa": 1.0 }} }}]
+        }}"#
+    ))
+    .expect("the test scene parses")
+}
+
+/// A scene survives being written down and read back.
+///
+/// The point of a scene format is that it leaves the process. If a round trip loses a field,
+/// every saved world is quietly a different world.
+/// **Asserted from the hand-written text, not from the serialiser's own output.**
+///
+/// The previous version compared `to_string(parse(hand_written))` against
+/// `to_string(parse(to_string(parse(hand_written))))` — both sides serialiser output, so the
+/// hand-written spelling never entered any comparison. A key the parser silently dropped was
+/// already gone before the first `to_string`, and the assertion could not see it. Regressing
+/// the helper to the pre-`release` spelling left all ten tests passing.
+///
+/// This goes the other way: parse the text a person would type, serialise it, and require
+/// specific substrings to be present. A dropped key then shows as a missing key in the bytes.
+/// `deny_unknown_fields` on the scene types is the real guard; this is the test that would
+/// have noticed before it existed.
+#[test]
+fn a_hand_written_scene_survives_being_parsed() {
+    let text = r#"{
+      "title": "round trip", "schedule": "staggered",
+      "duration_s": 0.25, "frames": 4, "conservation_tolerance": 1e-7,
+      "domains": [
+        { "kind": "room", "name": "room", "width_m": 4.4, "height_m": 3.1,
+          "cells_across": 41,
+          "release": { "as": "pulse", "x_m": 1.0, "y_m": 0.8,
+                       "radius_m": 0.2, "amplitude_pa": 3.0 } },
+        { "kind": "bar", "name": "bar", "length_mm": 20.0, "cells": 21,
+          "area_mm2": 100.0, "initial_c": 20.0,
+          "exposes": { "name": "face", "face_area_mm2": 0.5 } }
+      ]
+    }"#;
+    let scene: Scene = serde_json::from_str(text).expect("the hand-written scene parses");
+    let out = serde_json::to_string(&scene).unwrap();
+
+    // Every value the text states must come back out. A `#[serde(default)]` field that was
+    // dropped and refilled would fail here on the value, not merely on the key.
+    for want in [
+        r#""title":"round trip""#,
+        r#""schedule":"staggered""#,
+        r#""conservation_tolerance":1e-7"#,
+        r#""as":"pulse""#,
+        r#""amplitude_pa":3.0"#,
+        r#""radius_m":0.2"#,
+        r#""exposes":{"name":"face""#,
+    ] {
+        assert!(
+            out.contains(want),
+            "{want} did not survive the round trip:
+{out}"
+        );
+    }
+    assert_eq!(scene.domains.len(), 2);
+    assert!((scene.duration_s - 0.25).abs() < 1e-15);
+
+    // And a second pass is byte-stable, which is what catches a field that serialises to
+    // something it cannot read back.
+    let again: Scene = serde_json::from_str(&out).unwrap();
+    assert_eq!(serde_json::to_string(&again).unwrap(), out);
+}
+
+/// A key this format does not know is refused, not discarded.
+///
+/// The pre-`release` spelling, which used to parse into the default and produce a
+/// byte-identical run — so editing it was a no-op that reported success.
+#[test]
+fn an_unknown_key_is_refused_rather_than_dropped() {
+    let stale = r#"{
+      "title": "the old spelling", "duration_s": 0.01, "frames": 2,
+      "domains": [
+        { "kind": "room", "name": "room", "width_m": 4.4, "height_m": 3.1,
+          "cells_across": 41, "mode": [3, 2], "amplitude_pa": 7.0 }
+      ]
+    }"#;
+    let err = serde_json::from_str::<Scene>(stale).expect_err("`mode` is not a field any more");
+    let message = err.to_string();
+    assert!(
+        message.contains("mode") && message.contains("release"),
+        "the refusal should name the key and what is expected: {message}"
+    );
+}
+
+/// The standing mode oscillates at the frequency the closed form gives, and the gap
+/// between the two converges at **second** order.
+///
+/// The room is released at its (1,1) antinode with amplitude 1 Pa. A standing mode is
+/// separable, so every point follows `cos(2 pi f t)` and the peak of the field is
+/// `|cos(2 pi f t)|`. That is a closed form the integration never sees.
+///
+/// Worst departure over a run of 0.02 s, against grid resolution, before and after the
+/// leapfrog startup was fixed:
+///
+/// ```text
+///   cells     first order      second order
+///      31        0.0528            0.00238
+///      61        0.0265            0.00059
+///     121        0.0151            0.00007
+///     241        0.0076            0.00002
+///     481        0.0039            0.0000032
+/// ```
+///
+/// The left column halves on refinement and the right one quarters. The cause of the left
+/// column was `Room::released_from` leaving the velocity at `t = 0` when a staggered
+/// leapfrog carries it at `t = -h/2`; the first velocity update then travelled a whole step
+/// where it was owed half. `O(h)`, permanent, and enough to drag a second-order scheme to
+/// first. `Tube` had it too.
+///
+/// **The rate is asserted and not the size**, because only the rate separates a coarse
+/// scheme from a wrong one — the same lesson as the wall-weighting defect, which was 1.4%
+/// and looked like coarseness. Measured across three doublings rather than one: the
+/// per-doubling ratio bounces between 3.9 and 8.1 because "worst over forty sampled frames"
+/// is a maximum and therefore noisy, while the span 31 -> 241 is a stable 127x. Second order
+/// over three doublings is 64x and first order is 8x, so 40x separates them with room on
+/// both sides.
+#[test]
+fn the_room_rings_at_the_closed_form_frequency_and_converges_at_second_order() {
+    let worst_at = |cells: usize| {
+        let probe = Room::of_air("probe", Length::m(4.4), Length::m(3.1), cells);
+        let f = probe.mode_frequency(1, 1).to_si();
+        let mut world = World::build(room_scene(0.02, 40, cells)).expect("the scene builds");
+        world
+            .run()
+            .expect("a rigid room conserves")
+            .iter()
+            .map(|frame| {
+                let peak = frame.panels[0]
+                    .values()
+                    .iter()
+                    .fold(0.0f64, |m, v| m.max(v.abs()));
+                let want = (2.0 * std::f64::consts::PI * f * frame.time_s).cos().abs();
+                (peak - want).abs()
+            })
+            .fold(0.0f64, f64::max)
+    };
+
+    // The size first: a 61-cell grid tracks the closed form to a tenth of a percent of the
+    // amplitude. Measured 0.00059, so this uses 30% of its budget.
+    let mid = worst_at(61);
+    assert!(mid < 0.002, "61 cells departed by {mid:.5} Pa");
+
+    let (coarse, fine) = (worst_at(31), worst_at(241));
+    let fall = coarse / fine;
+    assert!(
+        fall > 40.0,
+        "31 -> 241 cells is three doublings: second order is 64x, first order 8x. \
+         Got {coarse:.5} -> {fine:.5}, a factor of {fall:.1}"
+    );
+}
+
+/// A scene that cannot describe a simulation is refused before anything runs.
+#[test]
+fn a_scene_that_makes_no_sense_is_refused() {
+    let mut empty = room_scene(0.01, 4, 41);
+    empty.domains.clear();
+    assert!(World::build(empty).is_err());
+
+    let mut backwards = room_scene(0.01, 4, 41);
+    backwards.duration_s = -1.0;
+    assert!(World::build(backwards).is_err());
+
+    let mut still = room_scene(0.01, 4, 41);
+    still.frames = 0;
+    assert!(World::build(still).is_err());
+}
+
+/// **A region that selects no cells is refused, and a block with no material is still aluminium.**
+///
+/// Two halves of the same worry, in opposite directions.
+///
+/// A mistyped region is the silent failure this key can have. `"to": [9, 9, 9]` where `[9, 9, 18]`
+/// was meant selects nothing, and a block of one material runs, audits, renders and answers the
+/// wrong question with nothing anywhere saying the coating was not applied. So an empty region — or
+/// one naming a cell the block does not have — is a refusal with the convention spelled out, because
+/// half-open bounds are exactly what a person gets wrong here.
+///
+/// And the other way: `material` and `regions` were **added** to a format that carries a
+/// compatibility promise, so every block written before they existed has to keep meaning what it
+/// meant. Absence is aluminium, and that is asserted from the old spelling rather than assumed.
+#[test]
+fn a_region_that_selects_nothing_is_refused_and_absence_is_aluminium() {
+    let block = |extra: &str| {
+        format!(
+            r#"{{ "title": "t", "schedule": "multirate", "duration_s": 1e-4, "frames": 2,
+              "domains": [{{ "kind": "block", "name": "b", "cells": [4, 4, 8],
+                "cell_mm": 1.0, "initial_c": 20.0{extra} }}] }}"#
+        )
+    };
+
+    // The pre-`material` spelling, which is what every shipped block scene was.
+    let old: Scene = serde_json::from_str(&block("")).expect("an old block still parses");
+    let world = World::build(old).expect("and still builds");
+    let b = world
+        .simulation()
+        .domain_as::<pantometry::thermal::Solid3D>("b")
+        .expect("it is a block");
+    assert_eq!(b.substances(), 1, "no regions means one material");
+    assert_eq!(
+        b.substance_at(0, 0, 0).name,
+        "Al 6061",
+        "absence of `material` is aluminium, as it was before the key existed"
+    );
+
+    // A region that is fine, to establish that the refusals below are about the bounds.
+    let good = block(
+        r#", "material": "copper",
+             "regions": [{ "material": "fr4", "from": [0, 0, 4], "to": [4, 4, 8] }]"#,
+    );
+    let world = World::build(serde_json::from_str(&good).expect("parses")).expect("builds");
+    let b = world
+        .simulation()
+        .domain_as::<pantometry::thermal::Solid3D>("b")
+        .expect("it is a block");
+    assert_eq!(b.substances(), 2, "the region is a second material");
+    assert_eq!(b.substance_at(0, 0, 0).name, "Cu ETP");
+    assert_eq!(b.substance_at(0, 0, 7).name, "FR-4");
+
+    for (why, spec) in [
+        (
+            "an empty range",
+            r#", "regions": [{ "material": "fr4", "from": [0, 0, 4], "to": [4, 4, 4] }]"#,
+        ),
+        (
+            "a range that runs backwards",
+            r#", "regions": [{ "material": "fr4", "from": [0, 0, 6], "to": [4, 4, 2] }]"#,
+        ),
+        (
+            "a cell the block does not have",
+            r#", "regions": [{ "material": "fr4", "from": [0, 0, 4], "to": [4, 4, 9] }]"#,
+        ),
+        (
+            "an unknown material",
+            r#", "regions": [{ "material": "unobtainium", "from": [0, 0, 4], "to": [4, 4, 8] }]"#,
+        ),
+    ] {
+        let scene: Scene =
+            serde_json::from_str(&block(spec)).expect("it parses; the check is later");
+        let Err(err) = World::build(scene) else {
+            panic!("{why} must be refused");
+        };
+        assert!(
+            err.contains("b/regions[0]"),
+            "{why}: the message should say which region: {err}"
+        );
+    }
+}
+
+/// **A region can be made of nothing, and a scene cannot redefine what nothing means.**
+///
+/// The format could say what a box was made of and could not say it was *empty*, so a clearance
+/// between two parts had to be spelled as some substance with a low conductivity — which still
+/// conducts, still stores heat and still sets a stability limit. `"void"` is the one reserved
+/// spelling here, and it is reserved rather than resolved: a scene that declared a material by
+/// that name would be solid in one file and empty in another.
+#[test]
+fn a_region_can_be_nothing_and_nothing_is_a_reserved_word() {
+    let scene = |extra: &str| {
+        format!(
+            r#"{{ "title": "t", "schedule": "multirate", "duration_s": 1e-4, "frames": 2{extra},
+              "domains": [{{ "kind": "block", "name": "b", "cells": [4, 4, 4],
+                "cell_mm": 5.0, "initial_c": 20.0,
+                "regions": [{{ "material": "void", "from": [0, 0, 1], "to": [4, 4, 3] }}] }}] }}"#
+        )
+    };
+
+    let world = World::build(serde_json::from_str(&scene("")).expect("parses")).expect("builds");
+    let b = world
+        .simulation()
+        .domain_as::<pantometry::thermal::Solid3D>("b")
+        .expect("it is a block");
+    assert_eq!(b.void_cells(), 32, "two layers of sixteen cells are empty");
+    assert!(b.is_void(0, 0, 1) && !b.is_void(0, 0, 0));
+    assert!(
+        b.temperature_at(0, 0, 1).to_si().is_nan(),
+        "there is nothing there to have a temperature"
+    );
+
+    // And the name cannot be taken. The message has to say why, or somebody will simply rename
+    // their material and wonder where the gap went.
+    let declared = r#", "materials": { "void": { "name": "not nothing", "density": 1.0,
+        "thermal": { "conductivity": 1.0, "specific_heat": 1.0,
+                     "expansion": 0.0, "emissivity": 0.5 } } }"#;
+    let Err(err) = World::build(serde_json::from_str(&scene(declared)).expect("parses")) else {
+        panic!("a scene may not redefine nothing");
+    };
+    assert!(
+        err.contains("materials.void") && err.contains("nothing"),
+        "the refusal should name the key and say what the word is for: {err}"
+    );
+}
+
+/// **A region can start at its own temperature**, which is the difference between a scene that
+/// can pose a transient and one that can only pose a source.
+///
+/// Found by writing scene `23`: a hot part under a cold lid is the commonest thermal question
+/// there is, and the format could not state it in either direction. `regions` said what a box was
+/// made of and `initial_c` was a property of the whole block, while the bus — deliberately — has
+/// no location at all, so heat arriving there spreads over everything that can hold it. Neither
+/// could put 300 C in one corner.
+///
+/// Refused on a void region, because nothing has no temperature to start at, and that would
+/// otherwise be a value quietly discarded.
+#[test]
+fn a_region_can_start_hot_and_nothing_cannot() {
+    let block = |regions: &str| {
+        format!(
+            r#"{{ "title": "t", "schedule": "multirate", "duration_s": 1e-6, "frames": 2,
+              "domains": [{{ "kind": "block", "name": "b", "cells": [4, 4, 4],
+                "cell_mm": 5.0, "initial_c": 20.0, "regions": {regions} }}] }}"#
+        )
+    };
+
+    let hot = block(
+        r#"[{ "material": "copper", "from": [0, 0, 0], "to": [4, 4, 1], "initial_c": 300.0 }]"#,
+    );
+    let world = World::build(serde_json::from_str(&hot).expect("parses")).expect("builds");
+    let b = world
+        .simulation()
+        .domain_as::<pantometry::thermal::Solid3D>("b")
+        .expect("it is a block");
+    assert!(
+        (b.temperature_at(0, 0, 0).to_si() - 573.15).abs() < 1e-9,
+        "the region starts where it says: {:.4} K",
+        b.temperature_at(0, 0, 0).to_si()
+    );
+    assert!(
+        (b.temperature_at(0, 0, 3).to_si() - 293.15).abs() < 1e-9,
+        "and the rest starts at the block's own figure: {:.4} K",
+        b.temperature_at(0, 0, 3).to_si()
+    );
+
+    // Omitting it leaves the block's figure, which is what every scene written before the key
+    // existed relies on.
+    let cold = block(r#"[{ "material": "copper", "from": [0, 0, 0], "to": [4, 4, 1] }]"#);
+    let world = World::build(serde_json::from_str(&cold).expect("parses")).expect("builds");
+    let b = world
+        .simulation()
+        .domain_as::<pantometry::thermal::Solid3D>("b")
+        .expect("it is a block");
+    assert!((b.temperature_at(0, 0, 0).to_si() - 293.15).abs() < 1e-9);
+
+    let void = block(
+        r#"[{ "material": "void", "from": [0, 0, 0], "to": [4, 4, 1], "initial_c": 300.0 }]"#,
+    );
+    let Err(err) = World::build(serde_json::from_str(&void).expect("parses")) else {
+        panic!("nothing cannot start at a temperature");
+    };
+    assert!(
+        err.contains("b/regions[0]"),
+        "the refusal should say which region: {err}"
+    );
+}
+
+/// **A scene can say where the heat is made, and is refused when it says nowhere.**
+///
+/// The gap this key closes is structural rather than cosmetic. Every other source in this format
+/// hands watts to the bus, and the bus carries an amount and no location *by design* — heat
+/// arriving there spreads to a uniform rise over everything that can hold it, which is the only
+/// choice that adds no information and the wrong answer for every real thing that dissipates.
+///
+/// The refusals matter as much as the key. A box that selects no cell, or only void, is a scene
+/// that states watts and generates none — and it would run, conserve, and answer a question about
+/// a different object.
+#[test]
+fn a_scene_can_state_where_its_heat_is_made() {
+    let block = |extra: &str| {
+        format!(
+            r#"{{ "title": "t", "schedule": "multirate", "duration_s": 1e-3, "frames": 2,
+              "domains": [{{ "kind": "block", "name": "b", "cells": [4, 4, 4],
+                "cell_mm": 5.0, "initial_c": 20.0{extra} }}] }}"#
+        )
+    };
+
+    let good = block(r#", "dissipation": [{ "watts": 30.0, "from": [0, 0, 0], "to": [2, 2, 2] }]"#);
+    let world = World::build(serde_json::from_str(&good).expect("parses")).expect("builds");
+    let b = world
+        .simulation()
+        .domain_as::<pantometry::thermal::Solid3D>("b")
+        .expect("it is a block");
+    assert!(
+        (b.generated_power().to_si() - 30.0).abs() < 1e-12,
+        "the watts stated are the watts held: {} W",
+        b.generated_power().to_si()
+    );
+
+    // **The total is the box's, not the cell's.** Eight cells or one, the block generates 30 W —
+    // which is what lets `verify` refine the grid without changing the physics.
+    let one = block(r#", "dissipation": [{ "watts": 30.0, "from": [0, 0, 0], "to": [1, 1, 1] }]"#);
+    let world = World::build(serde_json::from_str(&one).expect("parses")).expect("builds");
+    let b = world
+        .simulation()
+        .domain_as::<pantometry::thermal::Solid3D>("b")
+        .expect("it is a block");
+    assert!((b.generated_power().to_si() - 30.0).abs() < 1e-12);
+
+    // Absence generates nothing, which every scene written before this key existed relies on.
+    let none = World::build(serde_json::from_str(&block("")).expect("parses")).expect("builds");
+    assert_eq!(
+        none.simulation()
+            .domain_as::<pantometry::thermal::Solid3D>("b")
+            .expect("it is a block")
+            .generated_power()
+            .to_si(),
+        0.0
+    );
+
+    for (why, spec) in [
+        (
+            "an empty range",
+            r#", "dissipation": [{ "watts": 30.0, "from": [0, 0, 0], "to": [0, 4, 4] }]"#,
+        ),
+        (
+            "a cell the block does not have",
+            r#", "dissipation": [{ "watts": 30.0, "from": [0, 0, 0], "to": [4, 4, 5] }]"#,
+        ),
+        (
+            "watts that are not a number",
+            r#", "dissipation": [{ "watts": null, "from": [0, 0, 0], "to": [4, 4, 4] }]"#,
+        ),
+    ] {
+        let parsed: Result<Scene, _> = serde_json::from_str(&block(spec));
+        let refused = match parsed {
+            Err(_) => true, // `null` is not a number and never reaches the builder
+            Ok(scene) => World::build(scene).is_err(),
+        };
+        assert!(refused, "{why} must be refused");
+    }
+
+    // A box entirely inside a clearance states watts that would be generated nowhere.
+    let in_void = block(
+        r#", "regions": [{ "material": "void", "from": [0, 0, 0], "to": [4, 4, 2] }],
+             "dissipation": [{ "watts": 30.0, "from": [0, 0, 0], "to": [4, 4, 2] }]"#,
+    );
+    let Err(err) = World::build(serde_json::from_str(&in_void).expect("parses")) else {
+        panic!("watts generated in nothing must be refused");
+    };
+    assert!(
+        err.contains("b/dissipation[0]") && err.contains("nowhere"),
+        "the refusal should say which box and why: {err}"
+    );
+}
+
+/// Two domains that do not interact still run, and both are captured.
+#[test]
+fn a_scene_can_hold_more_than_one_domain() {
+    let mut scene = room_scene(0.01, 3, 31);
+    scene.domains.push(
+        serde_json::from_str::<DomainSpec>(
+            r#"{ "kind": "bar", "name": "bar", "length_mm": 20.0,
+                 "cells": 21, "area_mm2": 100.0, "initial_c": 20.0 }"#,
+        )
+        .unwrap(),
+    );
+    let mut world = World::build(scene).unwrap();
+    let frames = world
+        .run()
+        .expect("neither domain publishes, so nothing can go missing");
+    assert_eq!(frames[0].panels.len(), 2);
+    assert_eq!(frames[0].panels[1].name, "bar");
+    // An isolated bar at a uniform temperature has nowhere to send heat, so it stays put.
+    let bar = &frames[frames.len() - 1].panels[1];
+    for v in bar.values() {
+        assert!((v - 293.15).abs() < 1e-9, "bar drifted to {v} K");
+    }
+}
+
+/// **Two domains that actually talk**, driven entirely from data.
+///
+/// Everything before this ran domains side by side: they stepped, they were drawn, and none
+/// of them ever put anything on the bus. So the part of the library the whole architecture
+/// exists for — domains meeting on `Exchange` and the kernel auditing the crossing — had only
+/// ever been exercised by tests written inside the workspace, which is the condition that
+/// produced the API frictions in the first place.
+///
+/// A heater pays joules onto the channel; a bar takes them and warms. Neither names the
+/// other, and the scene names neither: it says "heater" and "bar" and the coupling is the
+/// channel they happen to share.
+///
+/// The heater is defined in *this* crate, which is the other half of the point. A consumer
+/// implementing `Domain` from outside needs the trait, `Exchange`, `Ledger`, `Kind`,
+/// `Violation` and a channel constant, and all six come out of `pantometry::prelude`. Nothing
+/// private was required.
+///
+/// `multirate` and not `staggered`, and the difference is not cosmetic: half a second is
+/// thirty-eight times the bar's diffusion limit, so a staggered scene diverges. See
+/// `a_schedule_a_scene_cannot_survive_is_named_and_refused` — the kernel catches it, but
+/// only when the step is taken, which is a thing a scene format could check earlier.
+#[test]
+fn a_heater_and_a_bar_meet_on_the_bus() {
+    let scene: Scene = serde_json::from_str(
+        r#"{
+          "title": "coupled", "schedule": "multirate",
+          "duration_s": 4.0, "frames": 8,
+          "conservation_tolerance": 1e-9,
+          "domains": [
+            { "kind": "heater", "name": "element", "watts": 2.0, "reserve_j": 6.0 },
+            { "kind": "bar", "name": "bar", "length_mm": 20.0, "cells": 21,
+              "area_mm2": 100.0, "initial_c": 20.0 }
+          ]
+        }"#,
+    )
+    .expect("the coupled scene parses");
+
+    let mut world = World::build(scene).expect("it builds");
+    // The audit is the assertion. At 1e-9 nothing may appear or vanish between the tank and
+    // the bar, and anything left unclaimed on the channel at the end of a step is refused.
+    let frames = world.run().expect("the books close across the bus");
+
+    // The heater has no field, so it contributes no panel: one domain, one drawing.
+    assert_eq!(frames[0].panels.len(), 1);
+    assert_eq!(frames[0].panels[0].name, "bar");
+
+    // 2 W for 4 s is 8 J of capacity against a 6 J tank, so it runs dry and the bar receives
+    // exactly the tank — which is the number to check, because it is set by the scene rather
+    // than by the physics.
+    let heater = world
+        .simulation()
+        .domain_as::<pantometry_world::heater::Heater>("element")
+        .expect("the heater is still there");
+    assert!(
+        heater.reserve().to_si() < 1e-12,
+        "the tank should be empty, {} J left",
+        heater.reserve().to_si()
+    );
+    let crossed = world.simulation().bus().total_consumed(quantity::ENERGY);
+    assert!(
+        (crossed - 6.0).abs() < 1e-9,
+        "every joule in the tank should have crossed, got {crossed}"
+    );
+
+    // And the bar is warmer by the amount those joules buy. An independent number: 6 J into
+    // 20 mm x 1 cm^2 of aluminium is 6 / (rho V c_p), and the bar is insulated so none of it
+    // leaves. Computed here from the substance rather than read off the bar.
+    //
+    // **Read from the domain, not from the panel.** This assertion used to average the render
+    // panel, which is `ScalarField` *sampled* at evenly spaced points including both ends — and
+    // the bar's grid is cell-centred, so the end samples sit half a cell outside the outermost
+    // centres and the average is not the state. It passed at 1e-6 only because the field was
+    // nearly uniform by the end of the run; changing *when* the heat arrives changed the
+    // profile enough to expose it at 4.1e-6. That is `FRICTION.md` finding 10, in a test
+    // written after finding 10 was documented.
+    let capacity = Substance::aluminium_6061()
+        .heat_capacity(Volume::from_si(20e-3 * 100e-6))
+        .expect("aluminium has a specific heat");
+    let expected_rise = 6.0 / capacity.to_si();
+    let bar = world
+        .simulation()
+        .domain_as::<Bar1D>("bar")
+        .expect("the bar is still there");
+    let mean_rise = bar.mean_temperature().to_si() - Temperature::celsius(20.0).to_si();
+    assert!(
+        (mean_rise / expected_rise - 1.0).abs() < 1e-9,
+        "the bar should have risen {expected_rise:.6} K, got {mean_rise:.6}"
+    );
+}
+
+/// A scene can ask for a schedule its domains cannot survive, and it is refused **while it is
+/// being built** rather than when the step is taken.
+///
+/// The same scene as above with `staggered` in place of `multirate`. Half a second is
+/// seventy-six times the bar's explicit-diffusion limit — thirty-eight in Fourier units, which is
+/// how the domain's own refusal reports it and where `FRICTION.md`'s figure comes from — and
+/// without subcycling the bar would fill with oscillating nonsense, the classic silently-wrong
+/// result.
+///
+/// **This test asserted `it builds; the trouble only shows when it runs`**, and its own doc
+/// recorded that as finding 8: nothing checked a schedule against the domains until the first
+/// step, and a scene format could ask every domain for its `max_stable_dt` and refuse where the
+/// message can name the file. It does now, so the assertion this test was built on is the one
+/// that changed — which is the right kind of breakage.
+///
+/// The step-time refusal is unchanged and is still the complete one, because the build sees only
+/// the initial state. It is tested where it belongs: `pantometry-thermal`'s
+/// `explicit_conduction_refuses_an_unstable_step` asserts the quantity, the site and the limit.
+/// `a_schedule_is_checked_before_the_first_step.rs` has the rest of this half.
+#[test]
+fn a_schedule_a_scene_cannot_survive_is_named_and_refused() {
+    let scene: Scene = serde_json::from_str(
+        r#"{
+          "title": "too big a step", "schedule": "staggered",
+          "duration_s": 4.0, "frames": 8,
+          "domains": [
+            { "kind": "heater", "name": "element", "watts": 2.0, "reserve_j": 6.0 },
+            { "kind": "bar", "name": "bar", "length_mm": 20.0, "cells": 21,
+              "area_mm2": 100.0, "initial_c": 20.0 }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    // `let else` rather than `expect_err`: `World` is not `Debug`, and giving it one so a test
+    // could print it would be a public impl for the sake of a message.
+    let Err(err) = World::build(scene) else {
+        panic!("a scene that could never step must not build");
+    };
+
+    assert!(
+        err.starts_with("bar:"),
+        "the refusal names the domain: {err}"
+    );
+    assert!(
+        err.contains("5.000e-1 s window"),
+        "and the frame it asked for: {err}"
+    );
+    // The battery's vocabulary, kept: `verify` used to say this about a world it had built and
+    // could no longer run, and a reader who knows those words should still meet them.
+    assert!(
+        err.contains("does not subcycle") && err.contains("silently unstable"),
+        "the refusal dropped the words verify used: {err}"
+    );
+    assert!(err.contains("76.1x"), "and by how much: {err}");
+    // The suggestion is the number of frames that fits, and `frames` is the key a reader would
+    // change. Asserted rather than trusted: a message naming an untried number is a plausible
+    // number, and `a_schedule_is_checked_before_the_first_step` builds at it.
+    assert!(
+        err.contains("raise `frames` to at least 609"),
+        "and what to do about it: {err}"
+    );
+    // And that it is the *necessary* half, in the message rather than only in a doc comment.
+    assert!(err.contains("when the step is taken"), "{err}");
+}
+
+/// **A beam that heats where it lands**, over a boundary two domains share, from data.
+///
+/// The last part of the kernel with no outside consumer. A plain channel carries an amount;
+/// an `Interface` carries an amount *and a place*, and is audited face by face — because a
+/// flux redistributed to the wrong part of a boundary keeps the total exactly right, so a
+/// total-only check would pass the one bug the spatial coupling exists to prevent.
+///
+/// The scene builds a bar that exposes a boundary and a beam that publishes onto it. Neither
+/// names the other; they name the same boundary.
+///
+/// The check is a shape, not a total. A total would be satisfied by spreading the joules
+/// evenly, which is exactly the failure mode: the middle cell must end up hotter than the
+/// ends by the ratio the Gaussian says, computed here rather than read off the bar.
+#[test]
+fn a_beam_heats_the_bar_where_it_lands() {
+    let cells = 41;
+    let scene: Scene = serde_json::from_str(&format!(
+        r#"{{
+          "title": "a beam on a bar", "schedule": "multirate",
+          "duration_s": 0.2, "frames": 4,
+          "conservation_tolerance": 1e-9,
+          "domains": [
+            {{ "kind": "beam", "name": "beam", "onto": "face", "faces": {cells},
+               "face_area_mm2": 0.5, "watts": 4.0, "reserve_j": 0.4,
+               "waist_fraction": 0.12 }},
+            {{ "kind": "bar", "name": "bar", "length_mm": 20.0, "cells": {cells},
+               "area_mm2": 100.0, "initial_c": 20.0,
+               "exposes": {{ "name": "face", "face_area_mm2": 0.5 }} }}
+          ]
+        }}"#
+    ))
+    .expect("the spatial scene parses");
+
+    let mut world = World::build(scene).expect("it builds");
+    // The audit is face by face, and anything left unclaimed on a spatial channel at the end
+    // of a step is refused just as it is on a plain one.
+    let frames = world.run().expect("the books close over the boundary");
+
+    let beam = world
+        .simulation()
+        .domain_as::<pantometry_world::beam::Beam>("beam")
+        .expect("the beam is still there");
+    assert!(
+        beam.reserve().to_si() < 1e-12,
+        "0.4 J at 4 W runs out in 0.1 s, {} J left",
+        beam.reserve().to_si()
+    );
+
+    let profile = frames[frames.len() - 1].panels[0].values();
+    assert_eq!(profile.len(), cells);
+
+    // The shape. Conduction has had 0.2 s to smear it, so the peak is lower than the
+    // Gaussian's and the check is a bound rather than an equality: the middle must still be
+    // clearly hotter than the ends, and a uniform spread would put it at exactly 1.0.
+    // Ambient in kelvin, because the panel is kelvin: `ScalarField::at` returns what the cells
+    // hold and the celsius a picture wants is a view's conversion. Subtracting 20 here — which
+    // is what this said while the app did the conversion inside its own sampler — leaves 273.15
+    // in both terms and turns a ratio of 4 into a ratio of 1.002. The assertion would still have
+    // passed at `> 1.0` and measured nothing.
+    let middle = profile[cells / 2] - 293.15;
+    let edge = profile[0] - 293.15;
+    assert!(
+        middle / edge > 3.0,
+        "the beam should land in the middle: centre rose {middle:.4} K, end {edge:.4} K, \
+         ratio {:.2} — a flat spread would give 1.0",
+        middle / edge
+    );
+
+    // And the total is exactly what was paid, independent of where it went. 0.4 J into
+    // 20 mm x 1 cm^2 of aluminium, insulated, computed from the substance rather than the bar.
+    //
+    // **This used to say "read from the bar and not from the panel", and it was describing a
+    // defect it had decided to keep.** A panel was `ScalarField` sampled at evenly spaced points
+    // *including both ends*, and the bar's grid is cell-centred, so the two end samples sat half
+    // a cell outside the outermost centres and the average came out about 1/2n low — 1.2% at 41
+    // cells. That was measured, written down here, pinned by the assertion below and recorded in
+    // `FRICTION.md` finding 10 as "not a defect anywhere".
+    //
+    // It was a defect. The same arithmetic wrote a six-cell block holding `0 0 100 0 0 0` into
+    // the run file as `0 0 90 0 0 0` — the array the viewer, the report, glTF, USD and the CSV
+    // all read — while `readings` beside it said `peak 100`. A field says where its own values
+    // are now (`Lattice`), the sampler asks, and the panel *is* the cells.
+    let capacity = Substance::aluminium_6061()
+        .heat_capacity(Volume::from_si(20e-3 * 100e-6))
+        .expect("aluminium has a specific heat");
+    let bar = world
+        .simulation()
+        .domain_as::<Bar1D>("bar")
+        .expect("the bar is still there");
+    let mean_rise = bar.mean_temperature().to_si() - Temperature::celsius(20.0).to_si();
+    assert!(
+        (mean_rise / (0.4 / capacity.to_si()) - 1.0).abs() < 1e-6,
+        "the bar holds every joule the beam paid: {mean_rise:.5} K"
+    );
+
+    // And the panel's average **is** the bar's, which is what the sentence above now buys. The
+    // assertion here required `gap > 1e-4` — it asserted the error was present, so a fix would
+    // have failed it, and it did.
+    let sampled_rise = profile.iter().sum::<f64>() / cells as f64 - 293.15;
+    let gap = (sampled_rise / mean_rise - 1.0).abs();
+    assert!(
+        gap < 1e-9,
+        "the panel is the cells now, and its average is {gap:.3e} from the bar's"
+    );
+}
+
+/// Two sides that disagree about the boundary are refused, and told both numbers.
+///
+/// The face count is stated twice in a scene — once as the bar's `cells` and once as the
+/// beam's `faces` — because nothing derives one from the other. So it can be stated wrongly,
+/// and this is what happens when it is.
+///
+/// Not a silent renormalisation onto whichever discretisation happened to be first. A flux
+/// padded or truncated to fit would put energy on the wrong part of the boundary while
+/// keeping the total right, which is the failure the spatial channel exists to prevent and
+/// the one a conservation audit cannot see.
+#[test]
+fn a_boundary_the_two_sides_cut_differently_is_refused() {
+    let scene: Scene = serde_json::from_str(
+        r#"{
+          "title": "mismatched", "schedule": "multirate",
+          "duration_s": 0.1, "frames": 2,
+          "domains": [
+            { "kind": "beam", "name": "beam", "onto": "face", "faces": 20,
+              "face_area_mm2": 0.5, "watts": 4.0, "reserve_j": 0.4,
+              "waist_fraction": 0.12 },
+            { "kind": "bar", "name": "bar", "length_mm": 20.0, "cells": 41,
+              "area_mm2": 100.0, "initial_c": 20.0,
+              "exposes": { "name": "face", "face_area_mm2": 0.5 } }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let violation = World::build(scene)
+        .expect("it builds; the two sides only meet when they run")
+        .run()
+        .expect_err("20 faces cannot be published onto a boundary cut into 41");
+
+    // The refusal names the boundary and the channel, and carries both counts.
+    assert!(
+        violation.site.contains("face") && violation.site.contains("energy"),
+        "the refusal should name the boundary and channel, got {:?}",
+        violation.site
+    );
+    assert!(
+        (violation.before - 41.0).abs() < 0.5 || (violation.after - 41.0).abs() < 0.5,
+        "one side of the report should be the 41 faces the bar offered: \
+         before {} after {}",
+        violation.before,
+        violation.after
+    );
+}
+
+/// **Every scene that ships is run**, because a scene in this repository is a claim.
+///
+/// The same rule the library's examples follow: one that compiles and then produces nonsense
+/// is worse than none at all, and the only way to know is to run it. Running one is not a
+/// weak check — the conservation audit is live for the whole run, so a scene that leaked
+/// energy or left it unclaimed on a channel would fail here rather than draw something
+/// plausible.
+///
+/// Each also gets one number asserted, chosen to be a property of the physics rather than of
+/// the file: what would change if the scene were edited, and what would change if the library
+/// broke.
+#[test]
+fn every_scene_that_ships_runs_and_says_something_true() {
+    // Which shipped scenes solve a field on a grid and answer it as a lump, collected as the
+    // walk goes and pinned below. See `verify::UNIFORM_FIELD` for the measurement and the corpus.
+    let mut flat: Vec<String> = Vec::new();
+    // Every `(label, unit)` any shipped scene reports, collected as the walk goes and pinned
+    // below, and beside it which `(domain, label)` pairs the domains themselves called statements
+    // about the solve. See `Domain::diagnostics`.
+    let mut emitted: Vec<(String, &'static str)> = Vec::new();
+    // And *who* emits a diagnostic label, which the pair above cannot see. See the pin below.
+    let mut diagnosed: Vec<(String, String)> = Vec::new();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scenes");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the scenes directory is there")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".json"))
+        .collect();
+    names.sort();
+    assert!(
+        names.len() >= 5,
+        "expected the shipped scenes, found {names:?}"
+    );
+
+    for name in &names {
+        let text = std::fs::read_to_string(dir.join(name)).unwrap();
+        let scene: Scene =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name} does not parse: {e}"));
+        let title = scene.title.clone();
+        // **Beside the scene, not beside the runner.** Scene 29 names an STL, and a `parts`
+        // entry is relative to the file that states it -- which is also what the CLI and the
+        // editor do, so this test and a person at a terminal build the same world.
+        let mut world = World::build_with(scene, &pantometry_world::Beside::of(dir.join(name)))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let frames = world
+            .run()
+            .unwrap_or_else(|v| panic!("{name} ({title}) stopped conserving: {v}"));
+
+        // What this scene's own domains say about their own readings, asked of the built world
+        // rather than looked up in a list somebody else keeps.
+        let declared: std::collections::BTreeSet<(String, String)> = world
+            .simulation()
+            .domains()
+            .flat_map(|d| {
+                d.diagnostics()
+                    .iter()
+                    .map(move |l| (d.name().to_string(), (*l).to_string()))
+            })
+            .collect();
+
+        for frame in &frames {
+            for r in &frame.readings {
+                let pair = (r.label.clone(), r.unit);
+                if !emitted.contains(&pair) {
+                    emitted.push(pair);
+                }
+                let who = (r.domain.clone(), r.label.clone());
+                if declared.contains(&who) && !diagnosed.contains(&who) {
+                    diagnosed.push(who);
+                }
+            }
+        }
+
+        let last = frames.last().expect("a run produces frames");
+        // The crate's only guard against a scene that checks nothing. It used to be an
+        // out-of-bounds panic inside a loop over ten files, naming neither the scene nor the
+        // domain; a shipped scene whose every domain lacked a field would have reported that.
+        //
+        // A scene may legitimately draw nothing — a thermal network's nodes have capacities and
+        // not positions, so `as_field` declines — but then it owes an arm in the match below,
+        // and this list is how it says so. Adding a name here without an arm reintroduces
+        // exactly the hole: a scene that runs, draws nothing, checks nothing, and passes.
+        const NOTHING_TO_DRAW: [&str; 5] = [
+            "11-motor-thermal-network.json",
+            "12-winding-heats-a-motor.json",
+            "13-winding-that-heats-itself.json",
+            // A compartment is an apparent volume and not a place, so there is nothing to put
+            // anywhere — the same reason the three above draw nothing, and the reason this scene
+            // could exist at all: "no space" was never what kept pharmacokinetics out of the
+            // format.
+            "32-a-dose-distributing-and-leaving.json",
+            // The same model with organs in it: blood flow and a liver change what the volumes
+            // are called and not that they are volumes rather than places.
+            "34-a-tablet-that-meets-the-liver-first.json",
+        ];
+        // Zero for a scene with no panel, which never reads it — the arms below that do are all
+        // in the drawn branch.
+        let peak = last.panels.first().map_or(0.0, |p| {
+            p.values().iter().fold(0.0f64, |m, v| m.max(v.abs()))
+        });
+        if NOTHING_TO_DRAW.contains(&name.as_str()) {
+            assert!(
+                last.panels.is_empty(),
+                "{name}: listed as undrawable but it produced a panel — drop it from the list"
+            );
+        } else {
+            assert!(
+                !last.panels.is_empty(),
+                "{name} ({title}): no domain produced a panel, so there is nothing to draw \
+                 and nothing to check"
+            );
+            assert!(peak.is_finite(), "{name}: the field went to {peak}");
+
+            // **The panel is the cells, and the readings say so independently.**
+            //
+            // `readings.peak` is taken from what the domain holds; the panel is the same field
+            // sampled on a grid. They are two paths to one number and they must agree, and for
+            // every cell-based scene in this repository they did not: the sampler placed its
+            // points at `i/(n-1)` of the extent, which for a field of cell averages is the cell
+            // *boundaries*. A six-cell block holding `0 0 100 0 0 0` was written out as
+            // `0 0 90 0 0 0` while `readings` beside it said `peak 100` — one frame carrying two
+            // answers, in the array the viewer, the report, glTF, USD and the CSV all read.
+            //
+            // `Lattice` is the fix at the field's end and this is the check at the run's. It also
+            // found the other half of the same defect: a `Room` builds `dx = width/(nx-1)` and
+            // quantises its height to whole cells, so a 4.4 x 3.1 m room asked for 81 across is
+            // 3.080 m tall — and the *extent* said 3.1, putting every sample in y between nodes.
+            // `03-room-pulse` was 0.149% low and is now exact.
+            //
+            // **1e-6 relative**, which is what the panel's own precision earns: `to_json` writes
+            // seven significant figures, so a value near 294 K round-trips to about 2e-7. Not a
+            // chosen tolerance — the worst of the eighteen scenes that have both is 1.7e-7.
+            if let Some(panel) = last.panels.first() {
+                let held = last
+                    .readings
+                    .iter()
+                    .find(|r| r.domain == panel.name && r.label == "peak");
+                let sampled = panel
+                    .values()
+                    .iter()
+                    .copied()
+                    .filter(|v| v.is_finite())
+                    .fold(f64::NEG_INFINITY, f64::max);
+                if let Some(held) = held.filter(|_| sampled.is_finite()) {
+                    // The readings report celsius where the field is kelvin, which is a view's
+                    // choice and not a disagreement. Nothing else in the workspace differs.
+                    let want = held.value
+                        + if held.unit == "C" && panel.unit == "K" {
+                            273.15
+                        } else {
+                            0.0
+                        };
+                    let off = (sampled - want).abs() / want.abs().max(1e-30);
+                    assert!(
+                        off < 1e-6,
+                        "{name}: the panel's peak is {sampled:.8} and the cells hold \
+                         {want:.8} — {off:.3e} apart, so the samples are not on the values"
+                    );
+                }
+            }
+        }
+
+        match name.as_str() {
+            // The electro-thermal feedback, closed between frames because it cannot be closed
+            // inside the step loop. The claim is the *amplification*: a winding whose resistance
+            // follows its own temperature settles hotter than one held at ambient, by
+            // 1/(1 − g) where g = I²R₂₀·α·R_th is the loop gain.
+            //
+            // Checked as a ratio against the same scene without `tracks`, because a ratio
+            // cancels most of what the two runs share and isolates the feedback.
+            "13-winding-that-heats-itself.json" => {
+                let net = world
+                    .simulation()
+                    .domain_as::<ThermalNetwork>("motor")
+                    .expect("the motor is a network");
+                let node = |n: &str| net.node_named(n).expect("the node is there");
+                let hot = net.temperature(node("winding")).to_si() - 273.15;
+                let housing = net.temperature(node("housing")).to_si() - 273.15;
+
+                // The same scene with the feedback removed.
+                let mut open = scene_from(&text);
+                if let Some(DomainSpec::Winding { tracks, .. }) = open.domains.get_mut(0) {
+                    *tracks = None;
+                }
+                let mut open = World::build(open).expect("the open-loop scene builds");
+                open.run().expect("it conserves too");
+                let cold = open
+                    .simulation()
+                    .domain_as::<ThermalNetwork>("motor")
+                    .expect("the motor is a network")
+                    .temperature(node("winding"))
+                    .to_si()
+                    - 273.15;
+
+                let measured = (hot - 25.0) / (cold - 25.0);
+
+                // The loop gain, computed here. `R_th` is the series path winding → stator →
+                // housing → ambient, and the last term is **not** just convection: at 74.6 °C
+                // the housing's linearised radiative conductance `4εσAT³` is 0.036 W/K against
+                // 0.294 for convection, which is 12% of the path's weakest link and moves the
+                // prediction from 1.310 to 1.280. Leaving it out is a 2.2% error, which is
+                // larger than the agreement being asserted — so it is in.
+                let (rho_20, alpha, sigma, emissivity, area) =
+                    (1.724e-8, 0.00393, 5.670_374_419e-8, 0.09, 0.042);
+                let r_20 = rho_20 * 62.0 / 0.35e-6;
+                let radiative = 4.0 * emissivity * sigma * area * (housing + 273.15).powi(3);
+                let r_th = 1.0 / 0.9 + 1.0 / 2.4 + 1.0 / (7.0 * area + radiative);
+                let gain = 2.0 * 2.0 * r_20 * alpha * r_th;
+                let want = 1.0 / (1.0 - gain);
+
+                assert!(
+                    (measured / want - 1.0).abs() < 5e-3,
+                    "{name}: amplification {measured:.4} against {want:.4} from a loop gain of \
+                     {gain:.4}"
+                );
+                // And it is a real effect rather than a rounding one: 16 K of winding.
+                assert!(
+                    hot - cold > 10.0,
+                    "{name}: the feedback is worth only {:.2} K",
+                    hot - cold
+                );
+            }
+            // The first scene with more than two domains, and the reason it exists: the crate
+            // split's claim is that domains compose, and it had been verified in pairs and
+            // never beyond. Building this found two things pairwise coupling cannot reach —
+            // a second consumer of one channel silently getting nothing, and the fact that a
+            // world's tolerance is set by its loosest domain.
+            //
+            // Four crates on one bus: optics publishes twice (spatially onto the bar's face,
+            // and as a plain amount from the lamp), thermal consumes both, acoustics and
+            // mechanics conserve alongside without exchanging anything. All at 1e-9.
+            "14-a-world.json" => {
+                assert_eq!(world.scene().domains.len(), 5);
+
+                // The bar took from *both* couplings, which is the composition being tested.
+                let bar = world
+                    .simulation()
+                    .domain_as::<Bar1D>("bar")
+                    .expect("the bar is there");
+                let took = bar.absorbed_energy().to_si();
+                assert!(
+                    took > 0.5,
+                    "{name}: the bar should have absorbed from beam and lamp, got {took:.4} J"
+                );
+
+                // Both producers reached it, and neither reached it whole.
+                //
+                // The beam's 0.4 J is a flux onto a face and arrives entire. The lamp's 2.0 J
+                // is *spent*, not delivered: it lands on an aluminium coating that reflects
+                // most of it, and only the absorbed fraction becomes heat. Asserting 2.4 J
+                // here — which I did first — reads the reserve as though a mirror were a
+                // blackbody, and the run said 0.708 instead.
+                assert!(
+                    took > 0.4,
+                    "{name}: {took:.4} J is no more than the beam alone, so the lamp gave nothing"
+                );
+                assert!(
+                    took < 2.4,
+                    "{name}: {took:.4} J means the mirror absorbed everything it reflected"
+                );
+
+                // The room is still ringing and the orbits still moving, which is what makes
+                // this a world rather than a coupling with spectators.
+                assert!(peak > 0.1, "{name}: the room went quiet, peak {peak:.4} Pa");
+            }
+            // The scene that computes its own watts. `11` states 12 W; this one derives them
+            // from 62 m of 0.35 mm² copper at 1.75 A, and the point is that the number is now
+            // wrong if the geometry is wrong. Checked against `I²R` written out here, with
+            // copper's resistivity and coefficient as literals rather than read from the
+            // library — otherwise this compares the library with itself.
+            "12-winding-heats-a-motor.json" => {
+                let rho_20 = 1.724e-8;
+                let r_20 = rho_20 * 62.0 / 0.35e-6;
+                let r_90 = r_20 * (1.0 + 0.00393 * 70.0);
+                let watts = 1.75 * 1.75 * r_90;
+
+                let coil = world
+                    .simulation()
+                    .domain_as::<Winding>("coil")
+                    .expect("the coil is a winding");
+                assert!(
+                    (coil.dissipation().to_si() / watts - 1.0).abs() < 1e-9,
+                    "{name}: dissipating {:.4} W against {watts:.4} W",
+                    coil.dissipation().to_si()
+                );
+
+                // Evaluated hot, and that is worth 27.5% — the whole reason the temperature is
+                // a parameter rather than an omission.
+                let cold = 1.75 * 1.75 * r_20;
+                assert!(
+                    (watts / cold - 1.2751).abs() < 1e-3,
+                    "{name}: hot/cold is {:.4}",
+                    watts / cold
+                );
+
+                // Every joule it spent reached the network, which is the coupling itself.
+                let net = world
+                    .simulation()
+                    .domain_as::<ThermalNetwork>("motor")
+                    .expect("the motor is a network");
+                assert!(
+                    (net.absorbed_energy().to_si() / coil.dissipated_energy().to_si() - 1.0).abs()
+                        < 1e-12,
+                    "{name}: {} J absorbed against {} J dissipated",
+                    net.absorbed_energy().to_si(),
+                    coil.dissipated_energy().to_si()
+                );
+
+                // And it lands where `11` put it with a stated 12 W, which is the scene's
+                // argument: the guess was reasonable, and this one would have caught it if not.
+                let winding = net.node_named("winding").expect("there is a winding");
+                let hot = net.temperature(winding).to_si() - 273.15;
+                assert!((hot - 54.85).abs() < 0.5, "{name}: winding at {hot:.2} C");
+            }
+            // The ordering a network exists to produce, and the reason a `lump` will not do:
+            // heat enters the winding and leaves through the housing, so the temperatures must
+            // fall along the chain and every drop must be positive. A transposed index or a
+            // one-sided link keeps the ledger exact and breaks this.
+            "11-motor-thermal-network.json" => {
+                let net = world
+                    .simulation()
+                    .domain_as::<ThermalNetwork>("motor")
+                    .expect("the motor is a thermal network");
+                let temps: Vec<(&str, f64)> = net
+                    .handles()
+                    .map(|(n, label)| (label, net.temperature(n).to_si()))
+                    .collect();
+                assert_eq!(temps.len(), 3);
+                for pair in temps.windows(2) {
+                    assert!(
+                        pair[0].1 > pair[1].1,
+                        "{}: {} at {:.2} K is not above {} at {:.2} K",
+                        name,
+                        pair[0].0,
+                        pair[0].1,
+                        pair[1].0,
+                        pair[1].1
+                    );
+                }
+
+                // And the winding is meaningfully hotter than the housing, not hotter by a
+                // rounding error — 12 W across 0.9 and 2.4 W/K is 13.3 + 5.0 K at steady state,
+                // and this run stops around half a time constant in, so a good part of it.
+                let (hot, cold) = (temps[0].1, temps[2].1);
+                assert!(
+                    hot - cold > 10.0,
+                    "{name}: the winding is only {:.2} K above the housing",
+                    hot - cold
+                );
+
+                // **The winding overshoots, and a steady run cannot show that.**
+                //
+                // This scene ran at a constant 12 W and climbed to 55.04 °C, monotonically,
+                // because a first-order network under a constant source has no other shape. The
+                // number a designer needs is not that one: a motor's losses go as `I²R` and its
+                // starting current is several times its running current, so the winding sees its
+                // worst temperature in the first few minutes and the steady state is the *cool*
+                // part of the run.
+                //
+                // 36 W for 300 s and 12 W after — three times the loss, which is 1.73 times the
+                // current — puts the winding at **72.82 °C** and it settles back to 59.64. The
+                // steady scene reported 55.04, which is **17.8 K low** for choosing an insulation
+                // class.
+                //
+                // The winding's own time constant is what makes the shape: 18 cm³ of copper is
+                // 62 J/K across 0.9 W/K to the stator, so 69 s — it tracks the load, while the
+                // 140 cm³ stator at 216 s and the housing behind it are still climbing when the
+                // load drops. That is the overshoot.
+                //
+                // Asserted as a *shape* rather than a value: the peak is above the end. Under a
+                // constant drive that difference is exactly zero and no tolerance makes it
+                // otherwise, so this is a claim `stages` is required for.
+                let winding: Vec<f64> = frames
+                    .iter()
+                    .filter_map(|f| {
+                        f.readings
+                            .iter()
+                            .find(|r| r.domain == "motor" && r.label == "winding")
+                            .map(|r| r.value)
+                    })
+                    .collect();
+                assert_eq!(
+                    winding.len(),
+                    frames.len(),
+                    "{name}: the winding is not reported in every frame"
+                );
+                let top = winding.iter().fold(f64::MIN, |m, v| m.max(*v));
+                let end = *winding.last().expect("frames");
+                println!("  {name}: the winding peaks {top:.4} C and ends {end:.4} C");
+                assert!(
+                    top - end > 10.0,
+                    "{name}: the winding peaked {top:.4} C and ended {end:.4} C, an overshoot of \
+                     {:.4} K — a start-up transient this scene exists to show",
+                    top - end
+                );
+                // And the peak is in the loaded part, not at the end of a slow climb.
+                let at = winding
+                    .iter()
+                    .position(|v| *v == top)
+                    .expect("the peak is one of the frames");
+                assert!(
+                    at * 150 <= 300,
+                    "{name}: the winding peaked at frame {at} ({} s), and the load drops at 300 s",
+                    at * 150
+                );
+            }
+            // A standing mode keeps its shape and rides |cos|, so it can never exceed the
+            // amplitude it was released at. A scheme going unstable shows up here first.
+            "01-room-mode.json" | "02-room-higher-mode.json" => {
+                assert!(
+                    peak <= 1.0 + 1e-9,
+                    "{name}: a standing mode cannot exceed its release amplitude, got {peak}"
+                );
+            }
+            // A pulse released from rest splits into waves going every way, so no part of it
+            // keeps the full height. It must have spread and it must not have blown up.
+            "03-room-pulse.json" => {
+                assert!(
+                    peak < 0.5 && peak > 0.02,
+                    "{name}: a spread pulse should be well under its release height and \
+                     still visible, got {peak}"
+                );
+            }
+            // Six joules into 20 mm x 1 cm^2 of aluminium, insulated, is 1.24 K — computed
+            // from the substance and not from the bar.
+            //
+            // Against the *mean*, and read from the domain rather than the panel. Two traps
+            // in one assertion, both met while writing it. The peak is 1.30 K, not 1.24,
+            // because heat arriving on a plain channel has no place and `Bar1D` puts it in
+            // cell 0 — four seconds of conduction have not finished levelling it, and that
+            // gradient is the physics rather than an error. And a mean taken over the panel
+            // would be about 1/2n low, for the reason in `FRICTION.md` finding 10.
+            "04-heater-and-bar.json" => {
+                let capacity = Substance::aluminium_6061()
+                    .heat_capacity(Volume::from_si(20e-3 * 100e-6))
+                    .unwrap();
+                let want = 6.0 / capacity.to_si();
+                let bar = world
+                    .simulation()
+                    .domain_as::<Bar1D>("bar")
+                    .expect("the bar is still there");
+                let mean = bar.mean_temperature().to_si() - Temperature::celsius(20.0).to_si();
+                assert!(
+                    (mean / want - 1.0).abs() < 1e-6,
+                    "{name}: the bar holds every joule: wanted {want:.4} K, got {mean:.4}"
+                );
+                assert!(
+                    peak - 20.0 > mean,
+                    "{name}: the fed end should still be above the mean, peak {:.4} against mean {mean:.4}",
+                    peak - 20.0
+                );
+            }
+            // The beam lands in the middle, so the middle must be hotter than the ends. A
+            // flat spread would make these equal — which is what the scene showed at its
+            // first duration of 1.5 s, because 20 mm of aluminium has a diffusion time
+            // constant of about 0.59 s and had levelled itself twice over. The scene is
+            // 0.2 s now, which spans the beam being on and the spot starting to spread.
+            "05-beam-on-bar.json" => {
+                let v = last.panels[0].values();
+                let (middle, end) = (v[v.len() / 2] - 293.15, v[0] - 293.15);
+                assert!(
+                    middle > 2.0 * end,
+                    "{name}: the beam landed in the middle: {middle:.4} K against {end:.4} K"
+                );
+            }
+            // **Equipartition, and then the crystallographer.**
+            //
+            // The closed form first: every one of the `3N - 6` non-rigid modes carries exactly
+            // `k_B T`, half kinetic and half potential, because that is what the amplitudes were
+            // chosen to put there. 46 residues is 132 modes at 310.15 K, which is `5.647e-19 J`
+            // and does not move over the run -- the motion is written down rather than
+            // integrated, so there is no integrator to leak.
+            //
+            // Then the part that makes this a protein rather than a spring network: the file
+            // carries a temperature factor for every atom, `B = 8 pi^2 <dr^2> / 3`, refined by
+            // somebody else years before this existed. The panel this scene draws is coloured by
+            // the predicted fluctuation, so the two are directly comparable -- as a **shape**,
+            // not a size, because the spring constant divides every prediction equally and
+            // nothing here predicts it. `pantometry-protein`'s own tests measure 0.395 for this
+            // entry at this cutoff, and what is asserted here is that the picture on the screen
+            // is that number rather than a different one computed the same way somewhere else.
+            "31-a-protein-shaking-at-body-temperature.json" => {
+                let reading = |label: &str| {
+                    last.readings
+                        .iter()
+                        .find(|r| r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: no {label} reading"))
+                        .value
+                };
+                assert_eq!(
+                    reading("rigid modes"),
+                    6.0,
+                    "{name}: crambin is not collinear"
+                );
+                assert!(
+                    reading("mode separation") > 1e6,
+                    "{name}: the six zeros are only {:e} below the first real mode",
+                    reading("mode separation")
+                );
+                let modes = 3.0 * 46.0 - 6.0;
+                let want = modes * 1.380_649e-23 * (37.0 + 273.15);
+                let held = reading("energy");
+                assert!(
+                    (held / want - 1.0).abs() < 1e-12,
+                    "{name}: equipartition says {want:e} J in {modes} modes, and it holds {held:e}"
+                );
+
+                // The deposited B-factors, out of the structure the scene names.
+                let pdb = dir.join("structures/1CRN.pdb");
+                let text = std::fs::read_to_string(&pdb)
+                    .unwrap_or_else(|e| panic!("{name}: {}: {e}", pdb.display()));
+                let measured = pantometry::protein::Structure::from_pdb(&text)
+                    .expect("alpha carbons")
+                    .experimental_fluctuations()
+                    .expect("1CRN carries B-factors");
+                // The panel is `sqrt(<dr^2>)`; the file's is `<dr^2>`.
+                let predicted: Vec<f64> = last.panels[0].values().iter().map(|v| v * v).collect();
+                assert_eq!(predicted.len(), measured.len(), "{name}: 46 residues");
+                let r = pantometry::protein::correlation(&predicted, &measured)
+                    .expect("neither series is constant");
+                assert!(
+                    (r - 0.395).abs() < 0.01,
+                    "{name}: the drawn fluctuations correlate with the deposited B-factors at \
+                     {r:.3}, and the crate measures 0.395 for this entry at this cutoff -- so \
+                     either the scene is not drawing what it says or the two have diverged"
+                );
+            }
+            // **The slow root of the quadratic, and the mass balance.**
+            //
+            // A two-compartment model's plasma curve is `A e^{−αt} + B e^{−βt}` with `α` and `β`
+            // the roots of `λ² − (k₁₀ + k₁₂ + k₂₁)λ + k₁₀k₂₁ = 0`, computed here from the scene's
+            // own litres and litres per hour: `k₁₀ = 3/5`, `k₁₂ = 8/5`, `k₂₁ = 8/20` per hour, so
+            // `α = 2.504 /h` and `β = 0.09584 /h`. Twelve hours in, the fast term is `e^{−30}` of
+            // where it started, so the last frame's plasma concentration is the slow term alone
+            // and its value follows from the roots without any curve fitting.
+            //
+            // The *order* at which the step reaches that is
+            // `a_dose_leaves_at_the_rate_the_roots_say`, which is where the tolerance below is
+            // earned: explicit Euler at this window reads the terminal rate `1.3e-4` from `β`, and
+            // over twelve hours that is what the concentration inherits.
+            "32-a-dose-distributing-and-leaving.json" => {
+                let reading = |label: &str| {
+                    last.readings
+                        .iter()
+                        .find(|r| r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: no {label} reading"))
+                        .value
+                };
+                // The roots, from the file rather than from the run.
+                let (k10, k12, k21) = (3.0f64 / 5.0, 8.0f64 / 5.0, 8.0f64 / 20.0);
+                let b = k10 + k12 + k21;
+                let root = (b * b - 4.0 * k10 * k21).sqrt();
+                let (alpha, beta) = ((b + root) / 2.0, (b - root) / 2.0);
+                // A bolus into the central compartment: `C(t) = (D/V₁)·[(α−k₂₁)e^{−αt} +
+                // (k₂₁−β)e^{−βt}]/(α−β)`, the standard two-compartment solution.
+                let (dose_mg, v1) = (500.0f64, 5.0f64);
+                let hours = 12.0f64;
+                let want = dose_mg / v1
+                    * ((alpha - k21) * (-alpha * hours).exp()
+                        + (k21 - beta) * (-beta * hours).exp())
+                    / (alpha - beta);
+                let got = reading("plasma");
+                assert!(
+                    (got / want - 1.0).abs() < 2e-3,
+                    "{name}: the closed form says {want:.5} mg/L at twelve hours and the run \
+                     reports {got:.5}"
+                );
+
+                // Nothing is created or destroyed: what was given is what is held plus what has
+                // been cleared. Exact, because the model moves mass rather than concentration.
+                let (held, cleared) = (reading("in the body"), reading("cleared"));
+                assert!(
+                    ((held + cleared) / dose_mg - 1.0).abs() < 1e-9,
+                    "{name}: {dose_mg} mg went in and {held:.4} + {cleared:.4} came out"
+                );
+                // And it has actually left: a run where nothing eliminated would hold all of it
+                // and satisfy the line above.
+                assert!(
+                    cleared > 0.7 * dose_mg,
+                    "{name}: only {cleared:.1} mg of {dose_mg} cleared in twelve hours"
+                );
+            }
+            // **A tablet: the gut's books exactly, and every organ's place in the terminal phase
+            // from its own balance.**
+            //
+            // - **Before the first step nothing has been taken**, and the tablet is all of the
+            //   books. The dose is taken at the step that reaches it.
+            // - **The loss is `(1 − F)·D` exactly**, booked once when the tablet is taken.
+            // - **The gut empties exactly.** The depot is integrated by `e^{−kₐs}` and not by
+            //   Euler, so at the end it holds `F·D·e^{−kₐ(T − t_lag)}`, to the rounding of one
+            //   product per step — `1.1nε` is the library's own bound for it.
+            // - **The books close**: what is in the body, cleared, still to take, in the gut and
+            //   lost is the dose, to the library's 1e-12, at every frame.
+            // - **Fat holds the drug longest, by exactly what its balance says.** Ninety-six hours
+            //   in, every mode but the slowest is gone — the next, at 0.66/h against 0.0209/h, is
+            //   `e^{−61}` of it — so each organ falls by one factor `ρ` a step. A tissue's balance
+            //   `V_t(ρ − 1)C_t/h = Q(C_b − C_t/K_p)` then fixes `C_t/C_b = Q/(Q/K_p −
+            //   V_t(1 − ρ)/h)`, and the liver's, with its clearance on the venous blood,
+            //   `Q/((Q + CL)/K_p − V(1 − ρ)/h)`. `ρ` comes from the blood's own last two frames.
+            //   Fat reads 123.26 times the blood against a `K_p` of 39.38: it is the slowest to
+            //   empty, so it lags, and the drug's last days are the fat giving it back.
+            //
+            //   **The tolerance is rounding, derived, and it was the gut's.** At 24 h the one
+            //   input the single-mode argument left out was the gut still feeding the liver, and
+            //   the tolerance was 64 times that feed. Benzene's partitions slowed the slowest mode
+            //   from 0.13/h to 0.0209/h, so 24 h no longer reached a single mode — the second was
+            //   still 2.2e-7 of it, and only 88% of what was absorbed had been cleared — and the
+            //   scene became four days. There the feed is 3.1e-39 and the second mode `e^{−61}`,
+            //   and what is left is the rounding in `ρ`: the two frames' ratio is good to `(n +
+            //   8)ε` over their `n` steps, the library's bound for a stable map, so `1 − ρ` is off
+            //   by `(n + 8)ε/n`, and the balance carries that through `V_t(1 − ρ)/h` into a
+            //   denominator that, for fat, is 0.146 left of 0.459 — the cancellation that makes it
+            //   123 times the blood multiplies the slip too. Measured: the liver, lean tissue and
+            //   fat depart by 6.7e-16, 4.9e-15 and 1.8e-12, 0.12, 0.19 and 0.21 of their bounds.
+            //   Off by one step in the frame spacing, the liver is 1.4e8 bounds out; with a `K_p`
+            //   off by its last written digit, 8.5e11.
+            // - **The note counts the tablet**, which is what `nothing was administered` and the
+            //   note's sum were changed to do.
+            "34-a-tablet-that-meets-the-liver-first.json" => {
+                let DomainSpec::Compartments {
+                    volumes,
+                    perfusions,
+                    depots,
+                    oral,
+                    ..
+                } = &world.scene().domains[0]
+                else {
+                    panic!("{name}: the first domain is the compartment model");
+                };
+                let reading = |frame: &pantometry_world::Frame, label: &str| {
+                    frame
+                        .readings
+                        .iter()
+                        .find(|r| r.domain == "body" && r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: no {label} reading"))
+                        .value
+                };
+                let (dose, f, ka, lag) = (
+                    oral[0].dose_mg,
+                    depots[0].bioavailability,
+                    depots[0].absorption_per_h,
+                    depots[0].lag_h,
+                );
+                let hours = world.scene().duration_s / 3600.0;
+                let steps = world.steps();
+                let h = hours / steps as f64;
+                let books = |frame: &pantometry_world::Frame| {
+                    reading(frame, "in the body")
+                        + reading(frame, "cleared")
+                        + reading(frame, "still to take")
+                        + reading(frame, "in the depot")
+                        + reading(frame, "lost before absorption")
+                };
+
+                // Before the first step, the tablet is everything.
+                let first = &frames[0];
+                // To the two roundings of milligrams to kilograms and back: 400 mg reads
+                // 399.99999999999994.
+                let pending = reading(first, "still to take");
+                assert!(
+                    (pending / dose - 1.0).abs() < 2.0 * f64::EPSILON,
+                    "{name}: {pending} mg still to take before any step, of {dose}"
+                );
+                for label in [
+                    "in the body",
+                    "cleared",
+                    "in the depot",
+                    "lost before absorption",
+                ] {
+                    assert_eq!(
+                        reading(first, label).to_bits(),
+                        0.0f64.to_bits(),
+                        "{name}: {label} before the first step"
+                    );
+                }
+
+                let lost = reading(last, "lost before absorption");
+                let want_lost = dose - f * dose;
+                assert!(
+                    (lost / want_lost - 1.0).abs() < 4.0 * f64::EPSILON,
+                    "{name}: {lost} mg lost before absorption, and (1 - F)D is {want_lost}"
+                );
+                assert_eq!(
+                    reading(last, "still to take").to_bits(),
+                    0.0f64.to_bits(),
+                    "{name}: the tablet is taken"
+                );
+
+                let gut = reading(last, "in the depot");
+                let absorbing = ((hours - lag) / h).round();
+                let want_gut = f * dose * (-ka * (hours - lag)).exp();
+                let gut_off = (gut / want_gut - 1.0).abs();
+                let gut_bound = (1.1 * absorbing + 8.0) * f64::EPSILON;
+                println!(
+                    "  {name}: the gut holds {gut:.6e} mg against F*D*exp(-ka(T - lag)) = \
+                     {want_gut:.6e}, off {gut_off:.2e} against {gut_bound:.2e}"
+                );
+                assert!(
+                    gut_off < gut_bound,
+                    "{name}: the depot holds {gut:e} mg and the exact decay says {want_gut:e}"
+                );
+
+                for frame in &frames {
+                    let off = (books(frame) / dose - 1.0).abs();
+                    assert!(
+                        off < 1e-12,
+                        "{name}: the books at {} s are {} mg of {dose}, {off:.2e} apart",
+                        frame.time_s,
+                        books(frame)
+                    );
+                }
+                assert!(
+                    reading(last, "cleared") > 0.95 * f * dose,
+                    "{name}: only {} mg of the {} absorbed has been cleared in {hours} h",
+                    reading(last, "cleared"),
+                    f * dose
+                );
+
+                // The terminal phase, organ by organ.
+                let before = &frames[frames.len() - 2];
+                let per_frame = (steps / world.scene().frames) as f64;
+                let rho =
+                    ((reading(last, "blood") / reading(before, "blood")).ln() / per_frame).exp();
+                let blood = reading(last, "blood");
+                let volume = |label: &str| {
+                    volumes
+                        .iter()
+                        .find(|c| c.label == label)
+                        .expect("a compartment")
+                };
+                // The gut's feed into the liver, as a fraction of the blood the liver is sent:
+                // the one input the single-mode argument leaves out.
+                let liver_flow = perfusions
+                    .iter()
+                    .find(|p| p.tissue == "liver")
+                    .expect("a perfused liver")
+                    .flow_l_per_h;
+                let feed = ka * gut / (liver_flow * blood);
+                // The blood's last two frames are `n` steps apart and their ratio is good to
+                // `(n + 8)ε`, the library's own bound for a stable map; `ρ` is its `n`-th root, so
+                // `1 − ρ` is off by `(n + 8)ε/n`, absolutely.
+                let slip = (per_frame + 8.0) * f64::EPSILON / per_frame;
+                for p in perfusions {
+                    let v = volume(&p.tissue);
+                    let draining = v.volume_l * (1.0 - rho) / h;
+                    let denominator =
+                        (p.flow_l_per_h + v.clearance_l_per_h) / p.partition - draining;
+                    let want = p.flow_l_per_h / denominator;
+                    // That slip, carried through `V_t(1 − ρ)/h` into the denominator, plus a
+                    // rounding for each of the ratio, the division and the subtraction.
+                    let tolerance = v.volume_l / h * slip / denominator.abs() + 16.0 * f64::EPSILON;
+                    let got = reading(last, &p.tissue) / blood;
+                    let off = (got / want - 1.0).abs();
+                    println!(
+                        "  {name}: {} at {got:.6} times the blood against {want:.6} from its \
+                         balance (K_p {}), off {off:.2e} = {:.2} of {tolerance:.2e}; draining \
+                         {draining:.4} of {:.4}",
+                        p.tissue,
+                        p.partition,
+                        off / tolerance,
+                        denominator + draining
+                    );
+                    assert!(
+                        off < tolerance,
+                        "{name}: {} holds {got:.8} times the blood, and its balance in the \
+                         terminal phase says {want:.8}",
+                        p.tissue
+                    );
+                }
+                println!("  {name}: the gut still feeds the liver {feed:.2e} of its blood supply");
+                assert!(
+                    feed < 1e-7,
+                    "{name}: the gut still feeds {feed:.2e} of the liver's supply, so the last \
+                     frame is not a single mode and the check above is not about one"
+                );
+
+                let notes = world.notes().join("\n");
+                assert!(
+                    notes.contains(&format!("{dose:.1} mg administered")),
+                    "{name}: the note does not count the tablet: {notes}"
+                );
+            }
+            // **A minimisation, held to what minimisation guarantees and to one fact about the
+            // molecule — none of them a pinned energy.**
+            //
+            // The relaxed energy is a property of this force field's minimum nearest the
+            // dictionary's geometry, and no closed form says what it should be, so nothing here
+            // compares against it. What *is* exact:
+            //
+            // - **The energy never rises.** The minimiser takes a step only when the Armijo
+            //   condition holds, so every accepted step lowers the energy and a refused one leaves
+            //   the atoms where they were. The scene photographs every step — `frames` is the step
+            //   count — so frame to frame *is* step to step, and a frame in which anything moved
+            //   must be strictly lower.
+            // - **It ends converged**: the largest force on any atom at most the tolerance the
+            //   domain minimises to, 1e-4 kcal/mol/Å. Not "or stalled": aspirin converges, in 454
+            //   iterations of the 500 this scene runs, and a stall here would be a change in the
+            //   minimiser worth a failure rather than a branch that accepts it.
+            // - **The clash opens.** The dictionary's ideal coordinates put the acetyl oxygen O4
+            //   1.645 Å from the ring hydrogen H1, and that one pair is 134 kcal/mol of the start's
+            //   van der Waals energy. The threshold is a published one and not a measurement of
+            //   this run: Bondi's van der Waals radii, 1.52 Å for O and 1.20 for H (J. Phys. Chem.
+            //   68, 441 (1964)), less the 0.4 Å overlap that MolProbity calls a serious clash
+            //   (Word et al., J. Mol. Biol. 285, 1735 (1999)) — 2.32 Å. Read off the *panel*, by the
+            //   atom names the dictionary gives them, because the picture is what claims it.
+            //
+            //   **It does not reach the Bondi contact distance, 2.72 Å, and that is not asserted
+            //   either way.** The relaxed pair sits at 2.666 Å, still inside UFF's own zero
+            //   crossing for O···H (2.831 Å): the ester is held planar by its conjugation, and
+            //   the minimum is a compromise between that and this contact.
+            "33-aspirin-relaxing-out-of-a-clash.json" => {
+                let reading = |frame: &pantometry_world::Frame, label: &str| {
+                    frame
+                        .readings
+                        .iter()
+                        .find(|r| r.domain == "aspirin" && r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: no {label} reading"))
+                        .value
+                };
+                let points = |frame: &pantometry_world::Frame| match &frame.panels[0].data {
+                    pantometry_world::PanelData::Points {
+                        positions,
+                        labels,
+                        bonds,
+                        ..
+                    } => (positions.clone(), labels.clone(), bonds.clone()),
+                    _ => panic!("{name}: a molecule is bodies, not a field"),
+                };
+                assert_eq!(
+                    world.steps(),
+                    world.scene().frames,
+                    "{name}: every step has to be photographed for frame-to-frame to be \
+                     step-to-step"
+                );
+
+                // The energy never rises, and a frame that moved is strictly lower.
+                let mut moved = 0;
+                for (k, pair) in frames.windows(2).enumerate() {
+                    let (before, after) =
+                        (reading(&pair[0], "energy"), reading(&pair[1], "energy"));
+                    assert!(
+                        after <= before,
+                        "{name}: the energy rose at step {}: {after} kcal/mol after {before}",
+                        k + 1
+                    );
+                    if points(&pair[0]).0 != points(&pair[1]).0 {
+                        assert!(
+                            after < before,
+                            "{name}: step {} moved the atoms without lowering the energy",
+                            k + 1
+                        );
+                        moved += 1;
+                    }
+                }
+                let (start, end) = (reading(&frames[0], "energy"), reading(last, "energy"));
+                println!(
+                    "  {name}: {start:.3} -> {end:.3} kcal/mol, {moved} of {} frames moved",
+                    frames.len() - 1
+                );
+                assert!(moved > 0, "{name}: nothing moved in the whole run");
+
+                // The O4-H1 clash, at the start and at the end, by name.
+                let contact = |frame: &pantometry_world::Frame| {
+                    let (positions, labels, _) = points(frame);
+                    let at = |atom: &str| {
+                        let i = labels
+                            .iter()
+                            .position(|l| l == atom)
+                            .unwrap_or_else(|| panic!("{name}: no atom called {atom} drawn"));
+                        positions[i]
+                    };
+                    let (o, h) = (at("O4"), at("H1"));
+                    (0..3).map(|c| (o[c] - h[c]).powi(2)).sum::<f64>().sqrt() / 1e-10
+                };
+                const BONDI_O: f64 = 1.52;
+                const BONDI_H: f64 = 1.20;
+                const SERIOUS_OVERLAP: f64 = 0.4;
+                let clear = BONDI_O + BONDI_H - SERIOUS_OVERLAP;
+                let (opened_from, opened_to) = (contact(&frames[0]), contact(last));
+                println!(
+                    "  {name}: O4-H1 {opened_from:.3} -> {opened_to:.3} A against a clash \
+                     threshold of {clear:.2} A"
+                );
+                // The start is the clash, or the check below could pass on a molecule that never
+                // had one.
+                assert!(
+                    opened_from < clear,
+                    "{name}: O4-H1 starts at {opened_from:.3} A, which is not a clash"
+                );
+                assert!(
+                    opened_to > clear,
+                    "{name}: O4-H1 is {opened_to:.3} A at the end, still a serious clash \
+                     (closer than {clear:.2} A)"
+                );
+
+                // Converged, to the domain's own tolerance.
+                let force = reading(last, "max force");
+                assert!(
+                    reading(last, "converged") == 1.0 && force <= 1e-4,
+                    "{name}: the run ended unconverged, the largest force {force:.3e} kcal/mol/A \
+                     after {} minimiser steps",
+                    reading(last, "minimiser steps")
+                );
+
+                // Ball-and-stick: every bond the dictionary states is drawn, and nothing else.
+                let (_, labels, bonds) = points(last);
+                assert_eq!(
+                    labels.len() as f64,
+                    reading(last, "atoms"),
+                    "{name}: one body per atom"
+                );
+                assert_eq!(
+                    bonds.len() as f64,
+                    reading(last, "bonds"),
+                    "{name}: the panel draws a different number of bonds from the molecule's"
+                );
+            }
+            // Kepler's third law, from the picture. The satellites are on circular orbits,
+            // so `v = sqrt(GM/r)` and the fastest is the innermost: 7546 m/s at 7000 km
+            // against Earth's mass, computed here and not read off the domain.
+            "06-orbits.json" => {
+                let want = (6.674_30e-11f64 * 5.972e24 / 7.0e6).sqrt();
+                assert!(
+                    (peak / want - 1.0).abs() < 0.02,
+                    "{name}: the innermost should be at {want:.1} m/s, got {peak:.1}"
+                );
+                let (positions, bounds) = match &last.panels[0].data {
+                    pantometry_world::PanelData::Points {
+                        positions, bounds, ..
+                    } => (positions, bounds),
+                    _ => panic!("{name}: an orbit is bodies, not a field"),
+                };
+                // The frame holds the widest orbit, in all three axes.
+                assert!(
+                    bounds[3] > 2.0e7,
+                    "{name}: the frame should hold the widest orbit"
+                );
+                // And the satellites are genuinely out of one plane, which is what the third
+                // axis is for. A flat system would leave every z at zero and the projection
+                // would be an expensive way to draw a circle.
+                let out_of_plane = positions.iter().map(|p| p[2].abs()).fold(0.0f64, f64::max);
+                assert!(
+                    out_of_plane > 5.0e6,
+                    "{name}: the orbits should be inclined, largest |z| is {out_of_plane:.3e}"
+                );
+            }
+            // The dashpot takes the height away. Restitution is about 0.51, so after a
+            // second the ball is on the floor and not moving — and the audit having passed
+            // at all means a lump took every joule the contact published.
+            "07-bouncing-ball.json" => {
+                assert!(
+                    peak < 0.2,
+                    "{name}: a second is enough bounces to settle, still at {peak:.3} m/s"
+                );
+            }
+            // Equipartition, twice. The mean square speed is `3(N-1)k_B T / N m`, so the
+            // liquid at T* = 1.4 must be quicker than the crystal at 0.15 by about
+            // sqrt(1.4/0.15) = 3.06. Peaks are noisier than means, so this is a band.
+            //
+            // **And that they moved at all**, which equipartition cannot see. Both scenes ran with
+            // `duration_s: 6.0e-12` against a domain built in reduced units, where `τ = σ√(m/ε)`
+            // is one SI second: the whole run was 6e-12 τ, ten orders short of the 0.01 τ the
+            // domain suggests for a single step. Measured, MSD grew as exactly `t²` — ratio
+            // **4.000** — which is free flight with not one collision, and the "liquid" sat on the
+            // crystal's own lattice sites to 1e-11 σ. Its title, its row in the README and its
+            // picture in the chooser all described something that had not happened, and the
+            // equipartition check above passed throughout, because the speeds were right.
+            "08-atoms-crystal.json" => {
+                assert!(
+                    (0.5..4.0).contains(&peak),
+                    "{name}: a cold crystal's fastest atom, got {peak:.3}"
+                );
+                let (moved, growth) = wandered(&frames, 0);
+                // Lindemann: a solid melts near 0.1 of the neighbour spacing. This one vibrates
+                // at 0.075 and saturates, so the growth has stopped rather than gone diffusive.
+                assert!(
+                    moved < 0.12,
+                    "{name}: a crystal keeps its sites, and these wandered {moved:.3} of a \
+                     neighbour spacing"
+                );
+                assert!(
+                    growth < 1.5,
+                    "{name}: saturated growth is about 1 and this is {growth:.3} — 4 would be \
+                     free flight and 2 diffusion"
+                );
+            }
+            "09-atoms-liquid.json" => {
+                assert!(
+                    peak > 3.0,
+                    "{name}: at nine times the temperature the atoms are quicker, got {peak:.3}"
+                );
+                let (moved, growth) = wandered(&frames, 0);
+                assert!(
+                    moved > 1.0,
+                    "{name}: a liquid leaves its site, and these moved {moved:.3} of a neighbour \
+                     spacing"
+                );
+                assert!(
+                    (1.5..3.0).contains(&growth),
+                    "{name}: diffusion grows like t, so the ratio is about 2 and this is \
+                     {growth:.3} — 4 is free flight and 1 is a solid"
+                );
+            }
+            // Every joule the lamp paid arrived in the mirror.
+            //
+            // Against what the lamp actually spent, not against its 12 J budget: at 3.6 W of
+            // absorbed light the three-second run only gets through about 10.9 J, so asserting
+            // the budget would be asserting the scene's arithmetic rather than the coupling's.
+            // The absorbed *fraction* — the optics' own answer — is checked separately.
+            "10-lamp-on-a-mirror.json" => {
+                let capacity = Substance::aluminium_6061()
+                    .heat_capacity(Volume::from_si(20e-3 * 100e-6))
+                    .unwrap();
+                let lamp = world
+                    .simulation()
+                    .domain_as::<pantometry_world::light::Light>("lamp")
+                    .expect("the lamp is still there");
+                let paid = 12.0 - lamp.reserve().to_si();
+                assert!(
+                    paid > 8.0,
+                    "{name}: the lamp should have spent most of its budget, got {paid:.3} J"
+                );
+                let want = paid / capacity.to_si();
+                let bar = world
+                    .simulation()
+                    .domain_as::<Bar1D>("mirror")
+                    .expect("the mirror bar is still there");
+                let mean = bar.mean_temperature().to_si() - Temperature::celsius(20.0).to_si();
+                assert!(
+                    (mean / want - 1.0).abs() < 1e-6,
+                    "{name}: {paid:.4} J is {want:.4} K, got {mean:.4}"
+                );
+            }
+            // **The claim only a three-dimensional model can make.** One cell of a 9x9x9
+            // aluminium block starts 60 K hot; six milliseconds later the spot has spread.
+            //
+            // Three things are checked and each rules out a different wrong model.
+            //
+            // The mean is exactly `20 + 60/729`, because the faces are insulated and nothing is
+            // on the bus — so the block holds every joule it started with and the audit at 1e-9
+            // is not the only thing saying so.
+            //
+            // The spread is **isotropic**: the neighbour one cell away along z is exactly as
+            // warm as the one along x. A model that resolved a plane and stacked it, or one that
+            // used the wrong spacing on one axis, fails here and passes everything else.
+            //
+            // And the spot is still a spot. A block that had levelled completely would satisfy
+            // both of the above trivially, which is the vacuous version of this scene.
+            "15-a-hot-spot-in-a-block.json" => {
+                let block = world
+                    .simulation()
+                    .domain_as::<pantometry::thermal::Solid3D>("block")
+                    .expect("the block is still there");
+
+                let ambient = Temperature::celsius(20.0).to_si();
+                let levelled = ambient + 60.0 / 729.0;
+                let mean = block.mean_temperature().to_si();
+                assert!(
+                    (mean - levelled).abs() < 1e-9,
+                    "{name}: insulated, so the mean is fixed at {levelled:.9} K, got {mean:.9}"
+                );
+
+                let hot = block.temperature_at(4, 4, 4).to_si();
+                let along = |d: (usize, usize, usize)| block.temperature_at(d.0, d.1, d.2).to_si();
+                let (x_arm, y_arm, z_arm) = (along((5, 4, 4)), along((4, 5, 4)), along((4, 4, 5)));
+                assert!(
+                    (x_arm - z_arm).abs() < 1e-9 && (x_arm - y_arm).abs() < 1e-9,
+                    "{name}: the spread must be isotropic: x {x_arm:.9}, y {y_arm:.9}, \
+                     z {z_arm:.9}"
+                );
+                assert!(
+                    z_arm - ambient > 1.0,
+                    "{name}: the third axis should have carried real heat, only {:.4} K",
+                    z_arm - ambient
+                );
+
+                assert!(
+                    hot > z_arm && z_arm > along((4, 4, 6)),
+                    "{name}: it should still fall away from the spot: {hot:.4} > {z_arm:.4} > {:.4}",
+                    along((4, 4, 6))
+                );
+                assert!(
+                    hot - ambient > 2.0 && hot - ambient < 30.0,
+                    "{name}: the spot should be well spread and still visible, {:.3} K above",
+                    hot - ambient
+                );
+
+                // And the panel is a volume rather than a plane, which is what the capture layer
+                // could not express before this domain existed.
+                let panel = &last.panels[0];
+                assert_eq!(panel.grid(), Some((9, 9, 9)));
+                assert_eq!(panel.values().len(), 729, "{name}: a slice is not a solid");
+                assert!(
+                    panel.slice(0) != panel.slice(4),
+                    "{name}: every slice is identical, so z was never sampled"
+                );
+            }
+            // **A heater melting a block of ice**, and the plateau it holds at while it does. The
+            // scene a domain with no latent heat cannot express at all: without it the block would
+            // sail through zero and be at 190 °C by the end.
+            //
+            // Three numbers, and none of them is the temperature — which is the point. The melt rate
+            // is `P/ρL` and nothing else: a hundred watts against 306 mJ per cubic millimetre is
+            // 327 mm³/s, and it is a *straight line* because a phase change has no rate constant in
+            // it. Then the plateau ends when the latent heat is paid, and the run's leftover joules
+            // warm what is now all liquid by exactly what its capacity says.
+            "20-melting-a-block-of-ice.json" => {
+                let block = world
+                    .simulation()
+                    .domain_as::<pantometry::thermal::Solid3D>("ice")
+                    .expect("the ice is still there");
+                let cells = 11.0 * 11.0 * 11.0;
+                let cell = 1e-9;
+                // Ice, written out here rather than read back from the substance the scene named.
+                let (rho, cp, latent) = (917.0, 2050.0, 333_550.0);
+                let capacity = cells * cell * rho * cp;
+                let fusion = cells * cell * rho * latent;
+
+                // Every cubic millimetre is liquid by the end, and the reading exists at all — a
+                // block that cannot melt does not report this column, so its presence is the check
+                // that the scene's `"material": "ice"` reached the domain.
+                let melted = last
+                    .readings
+                    .iter()
+                    .find(|r| r.label == "melted")
+                    .expect("a block that can melt reports how much has");
+                assert!(
+                    (melted.value - cells).abs() < 1e-9,
+                    "{name}: all {cells} mm3 should be liquid, got {}",
+                    melted.value
+                );
+
+                // The plateau's length is what the two heats cost, and its end is where the
+                // temperature leaves zero. 25.0 J of warming then 407.1 J of melting, at 100 W.
+                let warming = capacity * 10.0;
+                let done_at = (warming + fusion) / 100.0;
+                let leftover = (5.0 - done_at) * 100.0;
+                let want = leftover / capacity;
+                let got = block.mean_temperature().to_si() - 273.15;
+                println!(
+                    "  {name}: melting took {done_at:.3} s of the 5, and the remaining \
+                     {leftover:.1} J warmed it {want:.4} K — measured {got:.4}, off {:.2e}",
+                    (got / want - 1.0).abs()
+                );
+                // `1e-4`, which is the resolution the delivery has: the heater pays in whole steps
+                // and the last frame lands where it lands. A first draft allowed 5%, on numbers that
+                // agree to five digits.
+                assert!(
+                    (got / want - 1.0).abs() < 1e-4,
+                    "{name}: the leftover joules warm the water by {want:.4} K, got {got:.4}"
+                );
+
+                // And the rate in between is `P/ρL`, straight. Read off two frames well inside the
+                // plateau, where nothing else is happening.
+                let at = |n: usize| {
+                    let f = &frames[n];
+                    (
+                        f.time_s,
+                        f.readings
+                            .iter()
+                            .find(|r| r.label == "melted")
+                            .expect("melted")
+                            .value,
+                    )
+                };
+                let (t1, v1) = at(2);
+                let (t2, v2) = at(8);
+                let slope = (v2 - v1) / (t2 - t1);
+                let closed = 100.0 / (rho * latent * cell);
+                println!(
+                    "  and it melted at {slope:.2} mm3/s against P/rho L = {closed:.2} mm3/s — off \
+                     {:.2e}",
+                    (slope / closed - 1.0).abs()
+                );
+                // **Machine precision, and that is not luck.** Inside the plateau every joule the
+                // heater pays goes to melting and none to warming, so the discrete slope *is* `P/ρL`
+                // — the scheme has no discretisation error here at all, and 3.33e-16 is the last bit
+                // of the division. A tolerance of a percent would have passed for a scheme that was
+                // merely close.
+                assert!(
+                    (slope / closed - 1.0).abs() < 1e-12,
+                    "{name}: the melt rate is the power over the latent heat: {slope:.2} against \
+                     {closed:.2} mm3/s"
+                );
+            }
+            // **A wall of glass halfway down a block of aluminium**, and the heat piling up
+            // against it. The scene a single-material block cannot express.
+            //
+            // What is checked is where the *gradient* is, which is the only thing a two-material
+            // block says that a one-material block does not. Aluminium's 150x conductivity leaves
+            // it nearly isothermal over its own 9 mm, and borosilicate's diffusion length in half
+            // a second is half a cell — so the whole temperature drop sits on one face, and the
+            // largest cell-to-cell step along z must be exactly the one at the material interface.
+            //
+            // A block with the coating quietly not applied would put its largest step next to the
+            // hot spot instead, which is the failure this catches and a peak temperature would not.
+            "19-a-coating-stops-the-heat.json" => {
+                let block = world
+                    .simulation()
+                    .domain_as::<pantometry::thermal::Solid3D>("joint")
+                    .expect("the joint is still there");
+                let ambient = Temperature::celsius(20.0).to_si();
+                let at = |k: usize| block.temperature_at(4, 4, k).to_si();
+
+                // The books, not the mean: with two capacities it is `Σ Cᵢ Tᵢ` that is fixed, and
+                // the mean temperature is not. 180 K above ambient across the 81 aluminium cells
+                // of the heated face, each of 2.4192 mJ/K.
+                //
+                // # It was one cell at +60 K, and the whole scene was 0.08 K
+                //
+                // A single cell of a 1 458-cell block carries 0.145 J, and by the time it has
+                // spread the block holds a **0.08 K** range — so every claim below was true and
+                // was a claim about eight hundredths of a kelvin. It is a heated *face* now: the
+                // same pulse, eighty-one times the energy, and the interface step is 9.47 K of a
+                // 19.12 K rise.
+                //
+                // The second thing it bought is a sweep. `verify` refuses to refine a scene with
+                // a `hot_spot` — one cell halves its physical size when the grid doubles, which
+                // is a different problem rather than a finer one — and says in as many words to
+                // state the initial condition as a region instead. As a region the bounds double
+                // with the counts, so the resolution sweep runs, and it measures 0.106% on the
+                // peak. This scene had no resolution measurement at all before.
+                let opening = 2700.0 * 896.0 * 1e-9 * 180.0 * 81.0;
+                let held = block
+                    .ledger()
+                    .get(quantity::ENERGY)
+                    .expect("energy is on the books");
+                assert!(
+                    (held - opening).abs() < 1e-9 * opening,
+                    "{name}: insulated, so it still holds {opening:.9} J, got {held:.9}"
+                );
+
+                let steps: Vec<f64> = (0..17).map(|k| at(k) - at(k + 1)).collect();
+                let (worst, _) = steps.iter().enumerate().fold((0, 0.0f64), |acc, (k, s)| {
+                    if *s > acc.1 {
+                        (k, *s)
+                    } else {
+                        acc
+                    }
+                });
+                assert_eq!(
+                    worst, 8,
+                    "{name}: the gradient belongs on the interface face, not at cell {worst}: \
+                     {steps:?}"
+                );
+                // **And by a margin, which the old magnitude could not show.** 9.4656 K on the
+                // interface face against 7.3315 K on the next one in — a pulse that ran long
+                // enough for the front to enter the glass would put the steepest step *inside*
+                // it, and that is what a run four times this long does. Asserted as a ratio, so
+                // it is the shape of the profile and not the size of the pulse.
+                let runner_up = steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k != worst)
+                    .map(|(_, s)| *s)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                assert!(
+                    steps[worst] > 1.2 * runner_up,
+                    "{name}: the interface step {:.4} K is not clear of the next {runner_up:.4} K",
+                    steps[worst]
+                );
+
+                // The metal is nearly isothermal and the glass is nearly untouched, which is the
+                // same statement read from either side.
+                let (near, far) = (at(0) - ambient, at(8) - ambient);
+                assert!(
+                    (near - far).abs() < 0.2 * far,
+                    "{name}: 150x the conductivity should level the metal: {near:.3} K at the far \
+                     face against {far:.3} K at the interface"
+                );
+                assert!(
+                    at(12) - ambient < 0.02 * far,
+                    "{name}: the glass should have stopped it: {:.4} K four cells in against \
+                     {far:.3} K in the metal",
+                    at(12) - ambient
+                );
+
+                let panel = &last.panels[0];
+                assert_eq!(panel.grid(), Some((9, 9, 18)));
+            }
+            // **The mode a floor plan does not have.** A 4.4 x 3.1 x 2.4 m room released in its
+            // oblique (1,1,1) mode, which needs all three axes at once.
+            //
+            // The peak of a standing mode rides `|cos(2 pi f t)|` exactly, and `f` is the
+            // rigid-wall closed form — computed here from the **quantised** dimensions, because
+            // the grid makes the ceiling 3.2 m rather than the 3.1 m the file asks for and a
+            // closed form about the wrong room is not a check.
+            //
+            // 97.46 Hz, so 0.02 s is 1.949 periods and the peak should be back near 0.949.
+            "16-a-room-with-a-ceiling.json" => {
+                let hall = world
+                    .simulation()
+                    .domain_as::<pantometry::acoustic::Hall>("hall")
+                    .expect("the hall is still there");
+                let (lx, ly, lz) = (
+                    hall.width().to_si(),
+                    hall.height().to_si(),
+                    hall.depth().to_si(),
+                );
+                let f = 343.0 / 2.0
+                    * ((1.0f64 / lx).powi(2) + (1.0 / ly).powi(2) + (1.0 / lz).powi(2)).sqrt();
+                let want = (2.0 * std::f64::consts::PI * f * last.time_s).cos().abs();
+                assert!(
+                    (peak - want).abs() < 0.02,
+                    "{name}: a standing mode rides |cos(2 pi f t)|: {peak:.4} against \
+                     {want:.4} at {f:.2} Hz"
+                );
+                assert!(
+                    peak <= 1.0 + 1e-9,
+                    "{name}: and can never exceed its release amplitude, got {peak}"
+                );
+
+                // The vertical mode is the thing `DomainSpec::Room` cannot express at all. It is
+                // not a smaller number there; it is absent.
+                let vertical = hall.mode_frequency((0, 0, 1)).to_si();
+                assert!(
+                    (vertical - 343.0 / (2.0 * lz)).abs() < 1e-9
+                        && (60.0..85.0).contains(&vertical),
+                    "{name}: the floor-to-ceiling mode is c/2Lz, got {vertical:.2} Hz"
+                );
+
+                // And the panel is a volume, sampled at the grid's own node count.
+                assert_eq!(last.panels[0].grid(), Some(hall.nodes()));
+            }
+            // **A resistance that no formula gives.** A 12 x 5 x 5 mm copper busbar with a
+            // notch three cells deep across the middle, driven at 1 mV.
+            //
+            // Two bounds, both provable, and neither is a value: `rho L/A` for the full section
+            // is a floor, because removing conductor cannot help; and a naive series estimate
+            // that treats the notched slice as a shorter bar of reduced section is *also* a
+            // floor, because the current has to spread back out and spreading costs. The excess
+            // over the second is the spreading resistance, and it has no closed form for this
+            // shape -- which is the entire reason to solve rather than to state.
+            //
+            // Measured 12.392 uohm, against 8.275 for the full section and 9.310 for the naive
+            // series. A bound rather than the measurement, because the measurement is what the
+            // code produced and a test that asserts it checks nothing.
+            // **"The resistance the shape actually has"** — and until now nothing said what that
+            // was. Every check below is an inequality or an identity: more than `rho L/A`, more
+            // than a series estimate, Tellegen, the books closing. All of them hold at any grid,
+            // and the sweep that would have asked about the grid **refused to run** — on the
+            // reasoning that a blocked cell is one cell, so refining shrinks it. A blocked cell is
+            // a box; it refines into its eight children and the notch keeps its millimetres. See
+            // `a_notch_keeps_its_millimetres` in the battery's own tests.
+            //
+            // With the sweep running, the answer is that this grid is **4.65% high**, and that the
+            // error is not waiting for a finer grid. Current crowds into a re-entrant corner the
+            // way stress does: the conducting wedge at the notch root has an interior angle of
+            // `3*pi/2`, so the potential goes as `r^lambda` with `lambda = pi/omega = 2/3` and the
+            // flux as `r^(-1/3)`, unbounded. A resistance is a *quadratic* functional of that
+            // field, so it converges as `h^(2*lambda) = h^(4/3)` and not as `h^2`. Measured
+            // 1.33534, 1.33296, 1.33318, 1.33367 across six grids, which bracket 4/3 rather than
+            // descend to it; `a_notch_converges_at_the_corner_exponent` holds it and says why.
+            //
+            // The slot is **one cell wide** here, so at this grid the two notch roots are exactly
+            // `h` apart and the corner is not resolved at all. The ligament is two cells and stays
+            // two cells in millimetres at every refinement; what two cells do not resolve is the
+            // corner. Refining the plane is cheap — `R*t` is exactly independent of the thickness,
+            // so 0.0625 mm costs 1.1 s — but the scene *refuses* 0.015625 mm, its own 1e-9 drift
+            // budget reading 1.094e-9 over 246 k cells. The finest thing it can say about itself
+            // still has 0.046% in it.
+            "17-a-busbar-with-a-notch.json" => {
+                let bar = world
+                    .simulation()
+                    .domain_as::<pantometry::electrical::Conductor>("busbar")
+                    .expect("the busbar is still there");
+                assert!(bar.converged(), "residual {:.3e}", bar.residual());
+
+                let (rho, dx) = (1.724e-8, 1e-3);
+                let full = rho * (12.0 * dx) / (25.0 * dx * dx);
+                let naive = rho * (11.0 * dx) / (25.0 * dx * dx) + rho * dx / (10.0 * dx * dx);
+                let got = bar.resistance().to_si();
+                assert!(
+                    got > full * 1.2,
+                    "{name}: a notch must cost: {got:.4e} against rho L/A = {full:.4e}"
+                );
+                assert!(
+                    got > naive,
+                    "{name}: spreading costs more than a series estimate: \
+                     {got:.4e} against {naive:.4e}"
+                );
+
+                // **And how far this grid is from the shape's own answer.** Richardson at the
+                // measured `p = 4/3` over the 8x and 16x runs puts the `h -> 0` resistance at
+                // 1.1841011e-05 ohm. That number is not a second implementation of this one — it
+                // is this one's own limit, extrapolated along a rate that a closed form predicts
+                // and a separate test measures — so the comparison is against the shape rather
+                // than against a copy of the arithmetic.
+                //
+                // **Bracketed rather than bounded**, and the reason is what a one-sided band
+                // turned out to admit. `(0.0..5.0)` left 0.33% of headroom upward and **4.45%**
+                // downward, so a resistivity typed as 1.672e-8 instead of 1.724e-8 — a 3% slip in
+                // a copper value — passed, and the two checks above cannot see a resistivity
+                // change at all because they restate `rho` from the same file. It also pinned
+                // nothing: any figure in `[0, 5)` passed, while four documents state **4.65%**.
+                //
+                // Nothing here is random and nothing consults a clock, so this number is exact
+                // and a band around it is a statement rather than a hedge. The width is for the
+                // last digit of the extrapolation, not for the run.
+                // The finest three pairs give 1.1841016, 1.1841012 and 1.1841016e-05, so
+                // 1.184101e-05 is what is earned and the eighth digit is not. This was
+                // 1.1841011e-05, from the 8x/16x pair alone, which the 16x/32x pair puts 4e-7 low.
+                let limit = 1.1841016e-5;
+                let excess = (got / limit - 1.0) * 100.0;
+                println!("  {name}: {excess:.4}% above the h -> 0 resistance of the shape");
+                assert!(
+                    (4.5..4.8).contains(&excess),
+                    "{name}: {got:.7e} against the extrapolated {limit:.7e} — {excess:.4}%, and \
+                     four documents say 4.65%"
+                );
+
+                // Tellegen, through the scene format: the power from the field equals the power
+                // at the terminals.
+                let terminal = bar.drive().to_si() * bar.current().to_si();
+                assert!(
+                    (bar.dissipation().to_si() / terminal - 1.0).abs() < 1e-9,
+                    "{name}: field power against terminal power"
+                );
+
+                // And every joule it paid, the heatsink took -- which the audit at 1e-9 also
+                // says, from the other side.
+                let sink = last
+                    .readings
+                    .iter()
+                    .find(|r| r.domain == "heatsink" && r.label == "absorbed")
+                    .expect("the heatsink reports what it absorbed");
+                assert!(
+                    (sink.value / bar.dissipated_energy().to_si() - 1.0).abs() < 1e-9,
+                    "{name}: {} J absorbed against {} J paid",
+                    sink.value,
+                    bar.dissipated_energy().to_si()
+                );
+
+                // The panel is the potential, a volume, at the conductor's own cell count.
+                assert_eq!(last.panels[0].grid(), Some(bar.counts()));
+                assert_eq!(last.panels[0].unit, "V");
+            }
+            // **Two baskets, identical but for the ring against the wall**, and the whole
+            // difference between them is a permeability that nobody stated.
+            //
+            // The flow ratio is exact rather than approximate, and the reason is worth stating:
+            // every column of cells from inlet to outlet is an independent series chain, so the
+            // basket is columns in **parallel** and its conductance is their sum. Widening a
+            // column changes only its own term. So
+            //
+            //     Q_gap / Q_even  =  (1 - f) + f * m(0.60)/m(0.45),    m(e) = e^3/(1-e)^2
+            //
+            // with `f` the fraction of the cross-section the ring covers. Kozeny-Carman gives
+            // the mobility ratio as 4.482; `f` is **counted** rather than estimated, because
+            // estimating it from `2 pi r / pi r^2` was wrong by a third -- a staircase ring on
+            // a 15-cell radius is not a circle -- and the test was asserting a bound that the
+            // right answer failed.
+            //
+            // The pair is what makes it a channel rather than merely a faster bed: more liquid,
+            // and *less* coffee in it. Both directions are asserted, because either alone is
+            // ambiguous -- a bed that is simply coarser all through would give the first and not
+            // the second.
+            "18-an-espresso-shot.json" => {
+                // **It ran for eight seconds and called itself a shot.** Every claim below is
+                // about the *comparison* between two baskets — a flow ratio, a strength ordering,
+                // a ring against a core — and all of them held at any length, because Darcy at a
+                // fixed pressure through a fixed bed gives a constant flow. So nothing failed, and
+                // the scene delivered 3.28 g at **4.81% extraction** where a shot is 18–22%: a
+                // quarter of one, on a scene named for it.
+                //
+                // Twenty-five seconds is a shot. The comparison is unchanged — the flow ratio
+                // measures 1.786775 either way — and the channelling reads harder for it: the
+                // gapped basket pours nearly twice the liquid at 58% of the strength.
+                let read = |domain: &str, label: &str| {
+                    last.readings
+                        .iter()
+                        .find(|r| r.domain == domain && r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: {domain} reports {label}"))
+                        .value
+                };
+                let (even_g, bad_g) = (read("even", "delivered"), read("wall gap", "delivered"));
+                let (even_tds, bad_tds) = (read("even", "TDS"), read("wall gap", "TDS"));
+                let (even_ring, bad_ring) = (
+                    read("even", "ring over core"),
+                    read("wall gap", "ring over core"),
+                );
+
+                let puck = world
+                    .simulation()
+                    .domain_as::<pantometry::porous::Puck>("even")
+                    .expect("the basket is still there");
+                let (nx, _, nz) = puck.counts();
+                let (mut packed, mut ring) = (0usize, 0usize);
+                for kk in 0..nz {
+                    for i in 0..nx {
+                        if !puck.is_packed(i, 0, kk) {
+                            continue;
+                        }
+                        packed += 1;
+                        if i == 0
+                            || kk == 0
+                            || i + 1 == nx
+                            || kk + 1 == nz
+                            || !puck.is_packed(i - 1, 0, kk)
+                            || !puck.is_packed(i + 1, 0, kk)
+                            || !puck.is_packed(i, 0, kk - 1)
+                            || !puck.is_packed(i, 0, kk + 1)
+                        {
+                            ring += 1;
+                        }
+                    }
+                }
+                let f = ring as f64 / packed as f64;
+                let mobility = |e: f64| e.powi(3) / (1.0 - e).powi(2);
+                let predicted = (1.0 - f) + f * mobility(0.60) / mobility(0.45);
+                let measured = bad_g / even_g;
+                assert!(
+                    (measured / predicted - 1.0).abs() < 1e-6,
+                    "{name}: columns in parallel give the flow ratio exactly: {measured:.6}x \
+                     against {predicted:.6}x, with the ring {:.1}% of the section",
+                    f * 100.0
+                );
+                assert!(
+                    bad_tds < even_tds,
+                    "{name}: and carry less coffee in it: {bad_tds:.3}% against {even_tds:.3}%"
+                );
+
+                // **And it is a shot**, which is the claim the scene's name makes and nothing
+                // checked. Extraction yield is the mass dissolved over the mass of dry coffee, and
+                // 18–22% is where a shot is pulled — under it the cup is sour and thin, over it
+                // bitter. The even basket measures 19.90%, and its 10.26 g from a 4.29 g dose is a
+                // 2.4:1 ratio, a normal shot.
+                //
+                // Asserted as a band rather than a number: what makes this a shot is that it lands
+                // in the range a barista pulls to, and a scene that drifted out of it either way
+                // would be worth knowing about.
+                let yield_pct = read("even", "yield");
+                println!("  {name}: the even basket extracts {yield_pct:.4}% of its dose");
+                assert!(
+                    (18.0..22.0).contains(&yield_pct),
+                    "{name}: a shot is pulled to 18-22% extraction; this is {yield_pct:.4}%"
+                );
+
+                // The diagnosis, which is the reading that separates the two hypotheses.
+                assert!(
+                    (even_ring - 1.0).abs() < 0.02,
+                    "{name}: an evenly packed basket extracts its ring and its core alike: \
+                     {even_ring:.4}"
+                );
+                assert!(
+                    bad_ring > 1.05,
+                    "{name}: and the gap's ring must outrun the core it starved: {bad_ring:.4} \
+                     against {even_ring:.4}"
+                );
+
+                // Darcy in closed form, through the scene format. Nothing in the file is a flow
+                // rate; this is what the permeability the grind gives actually produces.
+                let mu = pantometry::porous::Liquid::water()
+                    .viscosity(pantometry::units::Temperature::celsius(93.0))
+                    .to_si();
+                let k =
+                    pantometry::porous::Grind::sieved(pantometry::units::Length::from_si(250e-6))
+                        .permeability(0.45)
+                        .to_si();
+                let ny = puck.counts().1;
+                let dx = puck.spacing().to_si();
+                let closed = k * (packed as f64 * dx * dx) * 9.0e5 / (mu * ny as f64 * dx);
+                let measured =
+                    puck.flow_rate().to_si() / pantometry::porous::Liquid::water().density.to_si();
+                assert!(
+                    (measured / closed - 1.0).abs() < 1e-9,
+                    "{name}: Q = kA dp / (mu L): {measured:.6e} against {closed:.6e}"
+                );
+
+                // The panel is a volume at the basket's own cells, and it is the extraction
+                // rather than the temperature -- a bed under flow is isothermal, so a
+                // temperature panel would be a flat rectangle that renders and says nothing.
+                assert_eq!(last.panels[0].grid(), Some(puck.counts()));
+                assert_eq!(last.panels[0].unit, "");
+            }
+            "21-a-wax-thermal-buffer.json" => {
+                // n-octadecane, and every number here is in the scene file rather than in the
+                // library. That is the point of the scene: nothing in `pantometry` knows this substance.
+                let (rho, cp, latent, melting_c) = (814.0, 1934.0, 244_000.0, 301.3 - 273.15);
+                // `melted` is reported in mm3 and the cells are 2 mm, so the two conversions are
+                // different numbers and mixing them up is easy: one cell is 8 mm3, and a cubic
+                // millimetre is 1e-9 m3 whatever the cell size. A first draft used 8e-9 as the
+                // mm3-to-m3 factor and reported the block as 402% melted.
+                const MM3: f64 = 1e-9;
+                let total_mm3 = 11.0 * 11.0 * 11.0 * 8.0;
+                let mass = total_mm3 * MM3 * rho;
+
+                let reading = |f: &pantometry_world::Frame, label: &str| {
+                    f.readings
+                        .iter()
+                        .find(|r| r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: no {label} reading"))
+                        .value
+                };
+
+                // **The plateau is at the declared melting point**, and that number appears nowhere
+                // except the file. Ice's plateau is 0.000 and every catalogue material has none at
+                // all, so this single assertion is what says the declaration reached the domain
+                // rather than being parsed and dropped in favour of the aluminium default.
+                let held = world
+                    .simulation()
+                    .domain_as::<pantometry::thermal::Solid3D>("wax")
+                    .expect("the wax is still there")
+                    .mean_temperature()
+                    .to_si()
+                    - 273.15;
+                assert!(
+                    (held - melting_c).abs() < 1e-9,
+                    "{name}: the plateau should sit at the declared {melting_c} C, is {held}"
+                );
+
+                // Half melted and stopped there, because the reserve ran out. Both halves matter:
+                // a block that melts entirely would not show the plateau ending, and one that melts
+                // nothing would look identical to a declaration that never took.
+                let melted = reading(last, "melted");
+                let fraction = melted / total_mm3;
+                assert!(
+                    (0.45..0.55).contains(&fraction),
+                    "{name}: about half should be liquid, {fraction:.4} is"
+                );
+
+                // The rate is `P/rho L` with the density and the latent heat coming out of the file.
+                // Read between two frames well inside the plateau and after the sensible warming is
+                // done, where every joule arriving goes to melting and none to warming.
+                let slope = (reading(&frames[5], "melted") - reading(&frames[2], "melted"))
+                    / (frames[5].time_s - frames[2].time_s);
+                let closed = 20.0 / (rho * latent * MM3);
+                println!(
+                    "  {name}: melted at {slope:.4} mm3/s against P/rho L = {closed:.4} — off {:.2e}",
+                    (slope / closed - 1.0).abs()
+                );
+                // **Machine precision, for the reason `20` states.** Inside the plateau every joule
+                // the heater pays goes to melting and none to warming, so the discrete slope *is*
+                // `P/rho L` and the scheme has no discretisation error here at all. Measured 8.3e-15.
+                // A tolerance of 1e-4 would have been eleven orders too loose and would have passed a
+                // density read from the wrong column.
+                assert!(
+                    (slope / closed - 1.0).abs() < 1e-12,
+                    "{name}: {slope:.4} mm3/s against a closed-form {closed:.4}"
+                );
+
+                // The energy accounts, and this is the check a wrong specific heat could not pass:
+                // the sensible term uses `c_p` and the latent term does not, so the two are only
+                // consistent with the reserve if both declared numbers are right.
+                let sensible = mass * cp * (melting_c - 20.0);
+                let fusion = melted * MM3 * rho * latent;
+                let absorbed = reading(last, "absorbed");
+                println!(
+                    "  and {absorbed:.4} J absorbed = {sensible:.4} warming + {fusion:.4} melting \
+                     = {:.4}, off {:.2e}",
+                    sensible + fusion,
+                    ((sensible + fusion) / absorbed - 1.0).abs()
+                );
+                // 1.13e-14, and exact for the same reason: in the enthalpy method energy *is* the
+                // state, so the split between sensible and latent is bookkeeping rather than
+                // approximation. `1e-12` and not `1e-3`, because the looser number would pass a
+                // specific heat that was 8% wrong — the sensible term is a ninth of the total.
+                assert!(
+                    ((sensible + fusion) / absorbed - 1.0).abs() < 1e-12,
+                    "{name}: {absorbed:.4} J absorbed against {:.4} accounted for",
+                    sensible + fusion
+                );
+
+                // And once the reserve is empty nothing moves. A block still melting after its
+                // heater is exhausted is inventing energy, which the audit would catch on the sum
+                // and not on this domain — so it is worth saying here where it is unambiguous.
+                let empty: Vec<f64> = frames
+                    .iter()
+                    .filter(|f| reading(f, "melted") > 0.0 && f.time_s > 70.0)
+                    .map(|f| reading(f, "melted"))
+                    .collect();
+                assert!(
+                    empty.len() >= 4,
+                    "{name}: not enough frames after the reserve ran dry"
+                );
+                for v in &empty {
+                    assert_eq!(
+                        *v, melted,
+                        "{name}: melting continued after the heater was empty"
+                    );
+                }
+            }
+            "22-wax-in-an-aluminium-matrix.json" => {
+                // The same wax as `21`, now four fifths of a composite whose other fifth is aluminium.
+                // Every number here comes from the two constituents; nothing is read back from the scene.
+                const MM3: f64 = 1e-9;
+                let (rho_w, c_w, l_w, phi_w) = (814.0, 1934.0, 244_000.0, 0.8);
+                let (rho_a, c_a, phi_a) = (2700.0, 896.0, 0.2);
+                let melting_c = 301.3 - 273.15;
+                let total_mm3 = 11.0 * 11.0 * 11.0 * 8.0;
+
+                let reading = |f: &pantometry_world::Frame, label: &str| {
+                    f.readings
+                        .iter()
+                        .find(|r| r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: no {label} reading"))
+                        .value
+                };
+
+                // The plateau sits at the melting part's own melting point, **undiluted**. A latent heat
+                // dilutes with the mass fraction and a temperature does not, and mixing the two rules up
+                // is the mistake `Mix::fusion` exists to prevent.
+                let held = world
+                    .simulation()
+                    .domain_as::<pantometry::thermal::Solid3D>("buffer")
+                    .expect("the buffer is still there")
+                    .mean_temperature()
+                    .to_si()
+                    - 273.15;
+                assert!(
+                    (held - melting_c).abs() < 1e-9,
+                    "{name}: the plateau should sit at the wax's own {melting_c} C, is {held}"
+                );
+
+                // **The melting rate is `P/(phi_w rho_w L_w)`**, which is the composite's volumetric latent
+                // heat and nothing else. Read between two frames well inside the plateau.
+                let slope = (reading(&frames[5], "melted") - reading(&frames[2], "melted"))
+                    / (frames[5].time_s - frames[2].time_s);
+                let closed = 20.0 / (phi_w * rho_w * l_w * MM3);
+                println!(
+                    "  {name}: melted at {slope:.4} mm3/s against P/(phi rho L) = {closed:.4} — off \
+                     {:.2e}",
+                    (slope / closed - 1.0).abs()
+                );
+                assert!(
+                    (slope / closed - 1.0).abs() < 1e-12,
+                    "{name}: {slope:.4} mm3/s against a closed-form {closed:.4}"
+                );
+
+                // **And it is exactly `1/phi_w` times scene 21's rate**, which is the statement only
+                // having both scenes can make: the ratio of the two has no material property left in it
+                // at all. Diluting the wax by a fifth makes a cubic millimetre of composite hold a fifth
+                // less latent heat, so the same watts clear it a quarter faster.
+                let pure = 20.0 / (rho_w * l_w * MM3);
+                println!(
+                    "  and {:.6}x scene 21's {pure:.4} mm3/s, against 1/phi = {:.6}",
+                    slope / pure,
+                    1.0 / phi_w
+                );
+                assert!(
+                    (slope / pure * phi_w - 1.0).abs() < 1e-12,
+                    "{name}: the ratio to pure wax should be 1/phi_w = {:.6}, is {:.6}",
+                    1.0 / phi_w,
+                    slope / pure
+                );
+
+                // The energy accounts, and this is where the volume-and-mass rules are both exercised at
+                // once: the sensible term uses the volume-additive `rho c` and the latent term uses the
+                // mass-diluted `L`. Getting either weighting wrong breaks the sum.
+                let volumetric = phi_w * rho_w * c_w + phi_a * rho_a * c_a;
+                let sensible = volumetric * total_mm3 * MM3 * (melting_c - 20.0);
+                let melted = reading(last, "melted");
+                let fusion = melted * MM3 * phi_w * rho_w * l_w;
+                let absorbed = reading(last, "absorbed");
+                println!(
+                    "  and {absorbed:.4} J = {sensible:.4} warming + {fusion:.4} melting = {:.4}, off \
+                     {:.2e}",
+                    sensible + fusion,
+                    ((sensible + fusion) / absorbed - 1.0).abs()
+                );
+                assert!(
+                    ((sensible + fusion) / absorbed - 1.0).abs() < 1e-12,
+                    "{name}: {absorbed:.4} J absorbed against {:.4} accounted for",
+                    sensible + fusion
+                );
+
+                // About three fifths melted, and stopped: the reserve is the limit rather than the block.
+                let fraction = melted / total_mm3;
+                assert!(
+                    (0.55..0.70).contains(&fraction),
+                    "{name}: about three fifths should be liquid, {fraction:.4} is"
+                );
+                for f in frames.iter().filter(|f| f.time_s > 70.0) {
+                    assert_eq!(
+                        reading(f, "melted"),
+                        melted,
+                        "{name}: melting continued after the heater was empty"
+                    );
+                }
+            }
+            "23-a-part-radiating-to-its-lid.json" => {
+                // A hot part sitting in a housing, surrounded on five sides by **nothing** and
+                // facing a cooled lid across a clearance. The geometry is what makes this
+                // checkable: the part has no conducting face to anywhere, so its heat leaves by
+                // the parallel-plate exchange across the gap and by the air around it, and the
+                // lid's only exit is the film on `z-max`. That is a two-body lumped system whose
+                // closed form is a pair of ODEs in nothing but constants.
+                //
+                // # It was a vacuum, and called itself a housing
+                //
+                // Until `air` existed, `losing_from` reached the block's six **outer** faces and
+                // nothing else — so a part rasterised inside a block had no convective path at
+                // all, and this scene modelled a part in an evacuated enclosure. It was honest
+                // about being radiation-only, in the title and in this comment, and it was 65 K
+                // wrong for anyone reading it as a housing: the part settles at **471.22 K** with
+                // still air in the cavity against **536.22** without, over the same 600 s.
+                const SIGMA: f64 = 5.670_374_419e-8;
+                let cell = 8e-3_f64; // metres, from the scene
+                let (rho, c, emissivity) = (2700.0_f64, 896.0_f64, 0.85_f64);
+                let (h, ambient) = (12.0_f64, 293.15_f64);
+
+                let face = cell * cell;
+                let gap_area = 16.0 * face; // the 4x4 part looking up at the lid
+                let top_area = 36.0 * face; // the whole 6x6 lid looking at the room
+                                            // The faces each body turns to the air, counted from the scene's own geometry: the
+                                            // part's four 4x3 sides and its 4x4 top, and the lid's 6x6 underside. Its sides
+                                            // and its top are the block's own boundary and touch no void. Derived here and
+                                            // checked against the library's count below, because a closed form built on the
+                                            // wrong number of faces agrees with a solver built on the same wrong number.
+                let part_wetted = (4.0 * 4.0 * 3.0 + 16.0) * face;
+                let lid_wetted = 36.0 * face;
+                let h_air = 8.0_f64;
+                let part_capacity = 48.0 * cell.powi(3) * rho * c; // 4 x 4 x 3 cells
+                let lid_capacity = 72.0 * cell.powi(3) * rho * c; // 6 x 6 x 2 cells
+                let series = 2.0 / emissivity - 1.0;
+
+                let reading = |f: &pantometry_world::Frame, label: &str| {
+                    f.readings
+                        .iter()
+                        .find(|r| r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: no {label} reading"))
+                        .value
+                        + 273.15
+                };
+
+                // **The part really does cool, and only radiation can have done it.** Without the
+                // gap exchange this assertion is false by construction: void breaks conduction, so
+                // a part with no radiating clearance sits at its starting temperature forever.
+                let start = reading(&frames[0], "peak");
+                let end = reading(frames.last().expect("frames"), "peak");
+                assert!(
+                    (start - 573.15).abs() < 0.1,
+                    "{name}: the part starts where the region says, {start:.2} K"
+                );
+                assert!(
+                    start - end > 20.0,
+                    "{name}: the clearance should have carried tens of kelvin, carried \
+             {:.2} K",
+                    start - end
+                );
+
+                // **And the amount is the lumped two-body answer**, integrated here from the
+                // constants above with RK4 — no property is read back from the library, and the
+                // library's own arithmetic is cellwise rather than lumped, so this is a check
+                // against the physics and not against a second copy of the code.
+                let rates = |t_part: f64, t_lid: f64| {
+                    let radiated = SIGMA * gap_area * (t_part.powi(4) - t_lid.powi(4)) / series;
+                    let filmed = h * top_area * (t_lid - ambient);
+                    // The air, which is convection only: a transparent gas does not radiate, and
+                    // what the two surfaces exchange with each other is the term above.
+                    let part_air = h_air * part_wetted * (t_part - ambient);
+                    let lid_air = h_air * lid_wetted * (t_lid - ambient);
+                    (
+                        -(radiated + part_air) / part_capacity,
+                        (radiated - filmed - lid_air) / lid_capacity,
+                    )
+                };
+                let (mut t_part, mut t_lid) = (573.15_f64, 293.15_f64);
+                let dt = 0.01;
+                for _ in 0..60_000 {
+                    let (a1, b1) = rates(t_part, t_lid);
+                    let (a2, b2) = rates(t_part + 0.5 * dt * a1, t_lid + 0.5 * dt * b1);
+                    let (a3, b3) = rates(t_part + 0.5 * dt * a2, t_lid + 0.5 * dt * b2);
+                    let (a4, b4) = rates(t_part + dt * a3, t_lid + dt * b3);
+                    t_part += dt / 6.0 * (a1 + 2.0 * a2 + 2.0 * a3 + a4);
+                    t_lid += dt / 6.0 * (b1 + 2.0 * b2 + 2.0 * b3 + b4);
+                }
+
+                // The lumped model's error is the gradient it assumes away, and both gradients here
+                // are small on purpose: the part's diffusion time over its 24 mm is `L^2/alpha` =
+                // 8 s and the lid's over its 48 mm span is 33 s, against a 600 s run. What is left
+                // is that the library radiates cell by cell on `T^4` where this averages first, and
+                // Jensen's inequality makes that a second-order term in the spread. Judged on the
+                // **cooling**, which is the quantity the scene is about; as a fraction of the
+                // absolute temperature it would be twenty times looser and would notice nothing.
+                //
+                // Measured at **0.20%**, and the bound is 1% rather than the 5% the lag argument
+                // alone would buy, because a tolerance twenty-five times the residual is one that
+                // would sit still through a real change to the exchange.
+                // The library counted the same faces this closed form did, or the agreement
+                // below is two arithmetics sharing a mistake.
+                let counted = world
+                    .simulation()
+                    .domain_as::<pantometry::thermal::Solid3D>("housing")
+                    .expect("the housing is a block")
+                    .faces_touching_void();
+                assert_eq!(
+                    counted,
+                    ((part_wetted + lid_wetted) / face).round() as usize,
+                    "{name}: the closed form wets {} faces and the block has {counted}",
+                    ((part_wetted + lid_wetted) / face).round() as usize
+                );
+
+                let cooled = start - end;
+                let closed = 573.15 - t_part;
+                println!(
+                    "  {name}: the part shed {cooled:.2} K against a lumped {closed:.2} K — off {:.2}%",
+                    100.0 * (cooled / closed - 1.0).abs()
+                );
+                assert!(
+                    (cooled / closed - 1.0).abs() < 0.01,
+                    "{name}: {cooled:.2} K shed against a closed-form {closed:.2} K"
+                );
+
+                // **The lid warms, and stays far below the part**, which is what says the exchange
+                // ran one way. A gap that conducted rather than radiated would have levelled them.
+                let lid = reading(frames.last().expect("frames"), "coldest");
+                assert!(
+                    lid > 293.15 + 1.0 && lid < end - 100.0,
+                    "{name}: the lid should warm a little and stay cold, {lid:.2} K against a part at {end:.2} K"
+                );
+            }
+            "24-a-power-module-junction-to-ambient.json" => {
+                // A die dissipating 45 W through the stack under it — solder, DBC ceramic, copper,
+                // a cold plate. The scene the format could not state at all until `dissipation`
+                // existed: every other source here hands watts to the bus, and the bus carries an
+                // amount and no location, so a die's heat would have spread over the baseplate as
+                // fast as over the die and there would have been no junction temperature to read.
+                //
+                // **At steady state the answer is a resistance stack**, and every term in it is
+                // written out below from the geometry and the conductivities. Nothing is read back
+                // from the scene: the layers are named here, the harmonic face mean is the two
+                // half-cells in series, and the film carries the last half cell of copper.
+                //
+                // # Two of the layers stopped being layers, and one resistance was missing
+                //
+                // The solder is **100 µm** and the DBC ceramic **0.63 mm**, against a 1.5 mm cell.
+                // A layer of material is at least one cell, so 1.5 mm was the thinnest either
+                // could be stated as and the solder carried **fifteen times** its own resistance.
+                // That is a floor rather than a discretisation error — the resolution sweep
+                // doubles a region's bounds with the counts, so a 1.5 mm layer stays 1.5 mm and
+                // refining does not approach anything. No grid this scene can carry fixes it
+                // either: 100 µm cells are 120 a side. They are `contact` entries now, which have
+                // a resistance and no thickness.
+                //
+                // And the largest resistance in a real junction-to-ambient path was **absent**.
+                // A baseplate is bolted to its cold plate through an interface material, five to
+                // twenty thousand W/m²K, and this format had no way to say it. At 5000 it is
+                // 1.3889 K/W against a stack that was 3.1379 — so the scene answered 32.5% low on
+                // the number it is named after, while the two thick layers pushed the other way
+                // and left something plausible.
+                let dx = 1.5e-3;
+                let area = (8.0 * dx) * (8.0 * dx);
+                let watts = 45.0;
+                let ambient = 40.0;
+                // k = 0..5 copper baseplate and DBC copper | 6,7 silicon. The ceramic and the
+                // solder are no longer cells at all; they are the two contacts below.
+                let k_of = |layer: usize| match layer {
+                    6 | 7 => 148.0, // Si
+                    _ => 401.0,     // Cu ETP
+                };
+                // Each joint as its own material and thickness, so the file's `w_per_m2_k` is a
+                // number this test derives rather than one it copies.
+                let ceramic = 24.0 / 0.63e-3; // 0.63 mm of Al2O3 96%
+                let solder = 58.0 / 100e-6; // 100 µm of SAC305
+                let mounting = 5000.0; // the interface material under the baseplate
+
+                // Centre to centre, half a cell of each material per face. This *is* the harmonic
+                // mean the sweep uses, written the other way round — as two resistances in series
+                // rather than as one averaged conductivity — so agreeing with it is a statement
+                // about the physics and not a repeat of the implementation.
+                let mut resistance = 0.0;
+                for upper in (1..8).rev() {
+                    resistance +=
+                        (dx / 2.0) / (k_of(upper) * area) + (dx / 2.0) / (k_of(upper - 1) * area);
+                }
+                // The joints, on the faces the scene names: the ceramic between cells 3 and 4,
+                // the solder between 5 and 6. A contact adds `1/(h·A)` to a face and nothing else.
+                resistance += 1.0 / (ceramic * area) + 1.0 / (solder * area);
+                // The bottom cell's own half, then the mounting, then the film.
+                resistance += (dx / 2.0) / (k_of(0) * area);
+                resistance += 1.0 / (mounting * area);
+                resistance += 1.0 / (3000.0 * area);
+
+                let junction = ambient + watts * resistance;
+                // **The place, by name.** This read the block's `peak` — the hottest cell
+                // *anywhere* — which is the junction here by a coincidence of the geometry: the
+                // die spans the whole cross-section, so the problem is one-dimensional in `z` and
+                // the top face is the hottest place in the part. It would not be for a module with
+                // two dies at different powers, and there would have been no way to ask for the
+                // cooler one.
+                //
+                // The scene states `probes` now. The two agree to the bit, which is worth having
+                // on its own: `peak` comes from the cells the domain holds and a probe comes from
+                // `ScalarField::at`, which interpolates — two different paths to one number, and
+                // this repository has already found a case where two such paths disagreed.
+                let at = |label: &str| {
+                    frames
+                        .last()
+                        .expect("frames")
+                        .readings
+                        .iter()
+                        .find(|r| r.domain == "module" && r.label == label)
+                        .unwrap_or_else(|| panic!("the module reports {label}"))
+                        .value
+                };
+                let peak = at("junction");
+                assert!(
+                    (peak - at("peak")).abs() < 1e-9,
+                    "{name}: the junction probe reads {peak} and the peak is {}",
+                    at("peak")
+                );
+                assert!(
+                    (at("baseplate") - at("coldest")).abs() < 1e-9,
+                    "{name}: the baseplate probe reads {} and the coldest is {}",
+                    at("baseplate"),
+                    at("coldest")
+                );
+                println!(
+                    "  {name}: junction {peak:.2} C against a {resistance:.4} K/W stack giving \
+                     {junction:.2} C — off {:.2e}",
+                    (peak - junction).abs() / (junction - ambient)
+                );
+                assert!(
+                    (peak - junction).abs() / (junction - ambient) < 2e-3,
+                    "{name}: {peak:.3} C against the stack's {junction:.3} C"
+                );
+
+                // **And it is steady**, or the agreement above is a coincidence of run length.
+                // The last two frames are 15 s apart and the junction must have stopped moving.
+                let earlier = frames[frames.len() - 2]
+                    .readings
+                    .iter()
+                    .find(|r| r.label == "peak")
+                    .expect("a peak")
+                    .value;
+                assert!(
+                    (peak - earlier).abs() < 0.05,
+                    "{name}: still climbing at the end, {earlier:.3} then {peak:.3} C"
+                );
+
+                // **The heat leaves where the scene said it does.** A stack whose film was on the
+                // wrong face would still reach a steady temperature, and a wrong one; the die must
+                // be the hottest thing and the baseplate the coldest.
+                let block = world
+                    .simulation()
+                    .domain_as::<pantometry::thermal::Solid3D>("module")
+                    .expect("the module is a block");
+                assert!(
+                    block.temperature_at(4, 4, 7).to_si() > block.temperature_at(4, 4, 0).to_si(),
+                    "{name}: the die should be hotter than the baseplate"
+                );
+                assert!(
+                    (block.generated_power().to_si() - watts).abs() < 1e-12,
+                    "{name}: the scene states {watts} W and the block has {} W",
+                    block.generated_power().to_si()
+                );
+            }
+            "25-what-140-kelvin-does-to-the-solder.json" => {
+                // The same power module as `24`, with a body on the same grid whose stress-free
+                // strain is the block's temperature. The first scene in this format that couples
+                // two physics on one mesh, and the first that reaches `pantometry-elastic` at all.
+                //
+                // **The failure mode of a real module is not its temperature.** It is the solder,
+                // fatigued by silicon at 2.6e-6 per kelvin sitting on solder at 2.15e-5 through
+                // every power cycle. The platform could compute the temperature to four figures
+                // and could say nothing about that until a structure could follow a block.
+                //
+                // # And this scene is outside the model it is solved with
+                //
+                // `pantometry-elastic` is linear and has no plasticity. It says so, and says what
+                // that costs: past yield it "returns a displacement that is arithmetically correct
+                // and physically meaningless, and nothing in the answer says which".
+                //
+                // SAC305 yields at 30 MPa against 41 GPa, a strain of **0.0732%**, and this scene
+                // asks for **0.3806%** — `5.20x`. So the strain energy below is arithmetic on a
+                // constitutive law the solder left long before, and a real joint would have
+                // yielded and crept instead. The scene is kept because the *coupling* is what it
+                // demonstrates and the coupling is right; what was missing is anything saying so.
+                // `verify` names it now, and this asserts the number rather than the adjective.
+                {
+                    let mut probe = World::build_with(
+                        serde_json::from_str::<Scene>(&text).expect("it parses again"),
+                        &pantometry_world::Beside::of(dir.join(name)),
+                    )
+                    .expect("it builds again");
+                    probe.run().expect("it runs again");
+                    let (which, ratio, at) = probe
+                        .past_yield()
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| panic!("{name}: nothing measured its yield"));
+                    println!(
+                        "  {name}: {which} is asked for {ratio:.3}x its yield strain, worst at {at:?}"
+                    );
+                    // 0.3806% against 0.0732%, from the declared coefficient and the declared
+                    // yield — both in the scene, neither read back from the solve.
+                    assert!(
+                        (ratio - 5.201).abs() < 0.01,
+                        "{name}: {ratio:.4}x, and the scene's own numbers say 5.201"
+                    );
+                    assert_eq!(
+                        at[2], 5,
+                        "{name}: the worst element is the solder layer at z = 5"
+                    );
+                }
+                let reading = |f: &pantometry_world::Frame, label: &str| {
+                    f.readings
+                        .iter()
+                        .find(|r| r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: no {label} reading"))
+                        .value
+                };
+
+                // **The first frame is exact and it is not zero.** The block starts uniform at
+                // 40 C and the body is the size it was drawn at 217 C — its solder's reflow — so
+                // every element is already strained before anything is switched on. The peak is
+                // the solder's own, `alpha (T - T_ref)`, computed here from the scene's declared
+                // coefficient and nothing read back.
+                let (reference_c, start_c, solder_alpha) = (217.0, 40.0, 2.15e-5);
+                let closed = solder_alpha * (start_c - reference_c);
+                let at_start = reading(&frames[0], "free strain");
+                assert!(
+                    (at_start - closed).abs() < 1e-12,
+                    "{name}: cold, the solder wants {closed:e} and has {at_start:e}"
+                );
+                // An equilibrium rather than a body handed a strain and not yet asked. Judged
+                // against the solve's own tolerance and not against zero: an unsolved body reports
+                // an **infinite** residual, so this separates the two cases without asserting that
+                // conjugate gradients terminate exactly.
+                let residual = reading(&frames[0], "residual");
+                assert!(
+                    residual.is_finite() && residual < 1e-9,
+                    "{name}: the first frame must be an equilibrium: residual {residual:e}"
+                );
+
+                // **And the last frame is exact too**, against the temperature the block reached.
+                // This is the claim that says the coupling is live rather than frozen at build.
+                let block = world
+                    .simulation()
+                    .domain_as::<pantometry::thermal::Solid3D>("module")
+                    .expect("the module is a block");
+                // Scanned over every element, exactly as the domain does, with the coefficient
+                // the scene's layers imply. The peak is **not** the hottest cell of any layer: all
+                // the strains are negative, so the largest magnitude belongs to whatever sits
+                // furthest *below* the reference — and which layer that is depends on the product
+                // of the coefficient and the distance, not on either alone. Getting it by hand was
+                // wrong twice before it was scanned.
+                let copper_alpha = pantometry::prelude::Substance::copper()
+                    .thermal
+                    .expect("copper expands")
+                    .expansion
+                    .to_si();
+                let alpha_at = |k: usize| match k {
+                    3 => 7.4e-6,       // Al2O3 96%
+                    5 => solder_alpha, // SAC305
+                    6 | 7 => 2.6e-6,   // Si
+                    _ => copper_alpha, // Cu ETP, the block's bulk
+                };
+                let mut want = 0.0f64;
+                for k in 0..8 {
+                    for j in 0..8 {
+                        for i in 0..8 {
+                            let t = block.temperature_at(i, j, k).to_si() - 273.15;
+                            let e = alpha_at(k) * (t - reference_c);
+                            if e.abs() > want.abs() {
+                                want = e;
+                            }
+                        }
+                    }
+                }
+                let at_end = reading(frames.last().expect("frames"), "free strain");
+                assert!(
+                    (at_end - want).abs() < 1e-9,
+                    "{name}: hot, the worst element wants {want:e} and has {at_end:e}"
+                );
+
+                // **The module is most stressed cold and relaxes as it heats**, which is the
+                // answer a module assembled at reflow has to give: warming it back towards the
+                // temperature it was built at relieves the assembly strain. Monotone across the
+                // run, not merely lower at the end.
+                let energy: Vec<f64> = frames.iter().map(|f| reading(f, "strain energy")).collect();
+                for pair in energy.windows(2) {
+                    assert!(
+                        pair[1] <= pair[0] + 1e-12,
+                        "{name}: heating towards the reference must relieve, not add: {energy:?}"
+                    );
+                }
+                println!(
+                    "  {name}: strain energy {:.4} J cold falling to {:.4} J hot, {:.1}x",
+                    energy[0],
+                    energy[energy.len() - 1],
+                    energy[0] / energy[energy.len() - 1]
+                );
+                assert!(
+                    energy[0] / energy[energy.len() - 1] > 5.0,
+                    "{name}: it should relax by a lot: {:?} to {:?}",
+                    energy[0],
+                    energy[energy.len() - 1]
+                );
+
+                // **And the thermal answer is untouched by being watched.** The coupling is
+                // one-way — nothing writes back into the block — so the junction climbs
+                // monotonically towards the 181.190771 C this scene's own resistance stack fixes,
+                // and not past it. A structure that fed back would leave that path, and the shape
+                // of the climb is a stronger statement than one number because it holds at every
+                // frame rather than at the last.
+                //
+                // # It was scene `24`'s number and it is not any more
+                //
+                // This comment said "the same physics scene `24` settles", and that stopped being
+                // true when `24` learned to state a joint: its solder is a 100 µm contact now, its
+                // ceramic a 0.63 mm one, and its baseplate is bolted through an interface
+                // material — 227.15 C, not 181.19. **This scene keeps the layers**, because a
+                // contact has a resistance and no elements, and the question here is what 140 K
+                // does to the solder: a strain needs a thickness and an expansion coefficient to
+                // act on. The two scenes are the same module and no longer the same stack, which
+                // is worth a sentence rather than a shared constant that quietly drifts.
+                let junction: Vec<f64> = frames.iter().map(|f| reading(f, "peak")).collect();
+                for pair in junction.windows(2) {
+                    assert!(
+                        pair[1] >= pair[0] - 1e-9,
+                        "{name}: the junction only climbs while the module warms: {junction:?}"
+                    );
+                }
+                let peak = *junction.last().expect("frames");
+                assert!(
+                    peak < 181.190_771 && peak > 179.0,
+                    "{name}: 60 s is short of steady, so it sits just under this scene's own \
+                     181.190771 C: {peak:.6} C"
+                );
+            }
+            "26-poiseuille-in-a-cooling-channel.json" => {
+                // The first scene to reach `pantometry-fluid`, and the crate's own docs say why one
+                // has to be written carefully: "it looks like a fluid" is the easiest wrong answer
+                // in computational physics to accept, because a scheme with the wrong viscosity
+                // still makes plausible vortices. So this is written around an exact solution.
+                //
+                // **And against the *discrete* parabola, not the continuum one.** A no-slip wall
+                // imposed by reflecting the first cell makes the linear interpolation vanish at
+                // the wall, and a parabola is not its own linear interpolation — so the settled
+                // mean is `(gh²/12ν)(1 + 2/n²)`, exactly, and the `2/n²` is a closed form rather
+                // than an error term. `pantometry-fluid`'s own test derives it; this scene checks that
+                // the *format* delivers the same problem the library was given.
+                let (g, nu, cells) = (0.02, 1.004e-6, 16.0);
+                let gap = cells * 0.125e-3;
+                let continuum = pantometry::fluid::poiseuille_mean_speed(g, gap, nu);
+                let discrete = continuum * (1.0 + 2.0 / (cells * cells));
+
+                let mean = frames
+                    .last()
+                    .expect("frames")
+                    .readings
+                    .iter()
+                    .find(|r| r.label == "mean speed")
+                    .expect("a channel reports its mean speed")
+                    .value;
+
+                // The tolerance is the **startup transient**, and it is predicted rather than
+                // chosen. A channel from rest approaches its profile as `exp(−π²νt/h²)`, whose
+                // time constant here is `h²/(π²ν)` = 0.405 s; the scene runs 4 s, which is 9.9 of
+                // them, so what is left is `e^-9.9` = 5.0e-5 of the answer. Measured 4.8e-5.
+                let constant = gap * gap / (std::f64::consts::PI.powi(2) * nu);
+                let left = (-4.0f64 / constant).exp();
+                println!(
+                    "  {name}: mean {mean:.9} against a discrete {discrete:.9} m/s, off \
+                     {:.2e}, with {left:.1e} of the startup left",
+                    (mean / discrete - 1.0).abs()
+                );
+                assert!(
+                    (mean / discrete - 1.0).abs() < 3.0 * left,
+                    "{name}: {mean:.9} against the discrete parabola's {discrete:.9} m/s"
+                );
+
+                // **And it is nearer the discrete answer than the continuum one**, which is the
+                // half that says the `2/n²` is real. They differ by 0.78% here and the run agrees
+                // with one of them to 5e-5.
+                assert!(
+                    (mean - discrete).abs() < (mean - continuum).abs() / 100.0,
+                    "{name}: the discrete parabola is the one this scheme solves: {mean:.9} \
+                     against {discrete:.9} and {continuum:.9}"
+                );
+
+                // **The flow is incompressible and the advection is resolved**, or the profile
+                // above would be a coincidence of a scheme that had stopped meaning anything.
+                let last = frames.last().expect("frames");
+                let of = |label: &str| {
+                    last.readings
+                        .iter()
+                        .find(|r| r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: no {label}"))
+                        .value
+                };
+                assert!(
+                    of("divergence").abs() < 1e-9,
+                    "{name}: divergence {:e} is not zero",
+                    of("divergence")
+                );
+                assert!(
+                    of("cell Reynolds") < pantometry::fluid::CELL_REYNOLDS_LIMIT,
+                    "{name}: cell Reynolds {:.3} is over the limit",
+                    of("cell Reynolds")
+                );
+                // The pump is doing work and the run says how much — a driven channel whose books
+                // showed nothing arriving would be one the audit had been talked out of.
+                assert!(
+                    of("work driven in") > 0.0,
+                    "{name}: the drive must have put energy in: {:e} J",
+                    of("work driven in")
+                );
+            }
+            "27-a-cavity-ringing-at-its-own-frequency.json" => {
+                // The first scene to reach `pantometry-em`, and it is written the way the acoustic
+                // `room` scenes are: **a resonance is a property of the box**, not of the solver,
+                // so `f = (c/2)√((l/a)² + (m/b)² + (n/d)²)` is the thing to check against.
+                const C: f64 = 299_792_458.0;
+                let side = 24.0 * 5e-3;
+                let closed = C / 2.0 * ((1.0f64 / side).powi(2) + (1.0f64 / side).powi(2)).sqrt();
+
+                let of = |f: &pantometry_world::Frame, label: &str| {
+                    f.readings
+                        .iter()
+                        .find(|r| r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: no {label} reading"))
+                        .value
+                };
+
+                // **The frequency, from the electric energy's own peaks.** It peaks twice per
+                // cycle, because energy goes as the square, so the mean peak spacing is half the
+                // period — the same measurement `pantometry-em`'s closed-form test makes, here through
+                // the scene format.
+                let electric: Vec<(f64, f64)> = frames
+                    .iter()
+                    .map(|f| (f.time_s, of(f, "electric")))
+                    .collect();
+                let peaks: Vec<f64> = (1..electric.len() - 1)
+                    .filter(|i| {
+                        electric[*i].1 > electric[i - 1].1 && electric[*i].1 >= electric[i + 1].1
+                    })
+                    .map(|i| electric[i].0)
+                    .collect();
+                assert!(
+                    peaks.len() >= 8,
+                    "{name}: too few peaks to measure a period: {}",
+                    peaks.len()
+                );
+                let half = (peaks[peaks.len() - 1] - peaks[0]) / (peaks.len() - 1) as f64;
+                let measured = 1.0 / (2.0 * half);
+
+                // **The bound is Yee's dispersion, not a tolerance.** A wave on this grid travels
+                // slightly slow, by `(kΔ)²/24` to leading order — `k = 2π/λ`, `λ = c/f` = 169.7 mm
+                // and `Δ` = 5 mm, so `kΔ` = 0.185 and the bound is 1.4e-3. Measured 1.4e-4, well
+                // inside it, because a standing mode along the diagonal samples the grid more
+                // finely than an axis-aligned wave does.
+                let k = 2.0 * std::f64::consts::PI * closed / C;
+                let dispersion = (k * 5e-3).powi(2) / 24.0;
+                println!(
+                    "  {name}: {:.6} GHz against a closed-form {:.6} GHz, off {:.2e}, \
+                     dispersion bound {dispersion:.2e}",
+                    measured / 1e9,
+                    closed / 1e9,
+                    (measured / closed - 1.0).abs()
+                );
+                assert!(
+                    (measured / closed - 1.0).abs() < dispersion,
+                    "{name}: {measured:.6} against {closed:.6} Hz"
+                );
+                assert!(
+                    measured < closed,
+                    "{name}: a Yee wave travels *slow*, so the mode should come out under the \
+                     continuum frequency: {measured:.6} against {closed:.6} Hz"
+                );
+
+                // **The invariant does not move, and the field energy does.** `½εE² + ½μH²` is not
+                // what leapfrog conserves — `E` and `H` are half a step apart — so it swings by
+                // `2 sin(ωΔt/2)` about the quantity that is conserved. Both halves are asserted,
+                // because a run where *neither* moved would mean the fields had stopped.
+                let invariant: Vec<f64> = frames.iter().map(|f| of(f, "invariant")).collect();
+                for v in &invariant[1..] {
+                    assert!(
+                        (v / invariant[1] - 1.0).abs() < 1e-12,
+                        "{name}: the invariant must hold to the bit: {v:e} against {:e}",
+                        invariant[1]
+                    );
+                }
+                let naive: Vec<f64> = frames.iter().map(|f| of(f, "field energy")).collect();
+                let (lo, hi) = naive
+                    .iter()
+                    .fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+                let swing = (hi - lo) / invariant[1];
+                assert!(
+                    (0.02..0.20).contains(&swing),
+                    "{name}: the naive energy should swing by a few percent and does not: {swing}"
+                );
+
+                // **And `∇·B` is zero, not converging to zero.** Every term in the discrete
+                // divergence of the discrete curl appears twice with opposite signs, so the update
+                // cannot change it. A number drifting here is a scheme that has stopped being
+                // Yee's, whatever else still looks right.
+                for f in &frames {
+                    assert!(
+                        of(f, "div B").abs() < 1e-10,
+                        "{name}: div B is an identity: {:e}",
+                        of(f, "div B")
+                    );
+                }
+            }
+            "28-an-eigenstate-that-does-not-move.json" => {
+                // The last of the eleven domains to reach a scene, and the claim is the strongest
+                // a solver can be given: **an eigenstate is stationary.** Its energy does not
+                // move, its position expectation does not move, and the norm holds — so a scheme
+                // that has drifted has nowhere to hide behind a plausible-looking wavefunction.
+                const HBAR: f64 = 1.054_571_817e-34;
+                const ELECTRON_KG: f64 = 9.109_383_701_5e-31;
+                let (n, cells, width) = (3.0, 200.0, 10e-9);
+                let dx = width / (cells + 1.0);
+
+                let of = |f: &pantometry_world::Frame, label: &str| {
+                    f.readings
+                        .iter()
+                        .find(|r| r.label == label)
+                        .unwrap_or_else(|| panic!("{name}: no {label} reading"))
+                        .value
+                };
+
+                // **The discrete Hamiltonian's exact eigenvalue**, written out here from the
+                // constants: `E_n = (2ℏ²/m·dx²)·sin²(nπ/2(N+1))`. Not the continuum one — the
+                // solver marches the discrete operator and this is what it rotates at.
+                let theta = n * std::f64::consts::PI / (2.0 * (cells + 1.0));
+                let discrete = 2.0 * HBAR * HBAR / (ELECTRON_KG * dx * dx) * theta.sin().powi(2);
+                let energy = of(frames.last().expect("frames"), "<E>");
+                assert!(
+                    (energy / discrete - 1.0).abs() < 1e-9,
+                    "{name}: the state rotates at {discrete:e} J and reports {energy:e}"
+                );
+
+                // **And the gap to the continuum is `θ²/3`, exactly.** `sin²θ/θ² = 1 − θ²/3 +
+                // O(θ⁴)`, so the discrete level sits *below* `n²π²ℏ²/2mL²` by a known amount
+                // rather than by a tolerance — 1.83e-4 at these two hundred cells. A test that
+                // compared to the continuum and called the difference an error would have been
+                // measuring the grid and calling it the physics.
+                let continuum = n * n * std::f64::consts::PI.powi(2) * HBAR * HBAR
+                    / (2.0 * ELECTRON_KG * width * width);
+                let gap = 1.0 - discrete / continuum;
+                println!(
+                    "  {name}: E3 = {discrete:.6e} J, below the continuum by {gap:.4e}, \
+                     predicted {:.4e}",
+                    theta * theta / 3.0
+                );
+                assert!(
+                    (gap / (theta * theta / 3.0) - 1.0).abs() < 1e-3,
+                    "{name}: the gap should be theta^2/3 = {:.4e}, is {gap:.4e}",
+                    theta * theta / 3.0
+                );
+                assert!(
+                    discrete < continuum,
+                    "{name}: a discrete Laplacian is softer than a continuous one, so the level \
+                     sits below: {discrete:e} against {continuum:e}"
+                );
+
+                // **Nothing moves**, which is what stationary means and is checked frame by frame
+                // rather than end to end — a run that wandered and came back would pass the
+                // second and fail this.
+                for f in &frames {
+                    for (label, want) in [
+                        ("<E>", discrete),
+                        // By symmetry the third state of a hard-walled well is centred.
+                        ("<x>", width / 2.0),
+                        ("norm", 1.0),
+                    ] {
+                        let got = of(f, label);
+                        assert!(
+                            (got / want - 1.0).abs() < 1e-9,
+                            "{name}: {label} moved at t = {}: {got:e} against {want:e}",
+                            f.time_s
+                        );
+                    }
+                }
+            }
+            "29-a-designed-bracket-becomes-cells.json" => {
+                // **The first shipped scene whose geometry comes from a file.** Everything else
+                // here states its shape as numbers in the JSON; this one names an STL, and the
+                // question it exists to answer is whether the cells the solver ran on are the
+                // part somebody drew.
+                let part = world
+                    .rasterised()
+                    .first()
+                    .unwrap_or_else(|| panic!("{name}: the part did not rasterise"));
+
+                // The closed form is the **outline**, not the mesh. `Loss::volume_error`
+                // compares the cells against `Mesh::volume`, which is the divergence theorem
+                // over the same triangles the rasteriser read — so agreeing with it would only
+                // say the crate agrees with itself. The shoelace area of the seven-point
+                // outline times the extrusion is an independent derivation, and it has to
+                // match, or either the file or the reader is wrong.
+                //
+                //   shoelace of (10,10) (60,10) (60,30) (40,30) (30,40) (30,60) (10,60)
+                //     = 1650 mm², extruded 20 mm = 33 000 mm³
+                const OUTLINE_MM2: f64 = 1650.0;
+                const EXTRUSION_MM: f64 = 20.0;
+                let designed_m3 = OUTLINE_MM2 * EXTRUSION_MM * 1e-9;
+
+                let cell_m = part.cell_mm * 1e-3;
+                let rasterised_m3 = part.filled as f64 * cell_m.powi(3);
+                let error = rasterised_m3 / designed_m3 - 1.0;
+
+                // 2 mm cells on a part whose thinnest wall is 20 mm: the surface passes through
+                // a shell of cells and each can be counted or not, so the error is a *surface*
+                // effect. It measures −0.61%, and 2% is the number `Loss::CLEAN_VOLUME_ERROR`
+                // already calls clean — asserted against that rather than against a figure
+                // chosen to fit, so a change that made this worse would have to argue with the
+                // crate's own threshold.
+                assert!(
+                    error.abs() < pantometry::shape::Loss::CLEAN_VOLUME_ERROR,
+                    "{name}: the cells are {:.2}% off the designed volume",
+                    error * 100.0
+                );
+
+                // And the crate's own measurement agrees with the independent one. Two ways of
+                // asking the same question, which is the only way to find out that one of them
+                // was answering a different one.
+                assert!(
+                    (part.loss.volume_error - error).abs() < 1e-3,
+                    "{name}: the crate reports {:.4} and the outline says {:.4}",
+                    part.loss.volume_error,
+                    error
+                );
+
+                // Nothing survives a rasterisation this coarse without loss, and the point of
+                // shipping the scene is that the loss is *stated*. A part that suddenly had no
+                // boundary cells at all would mean the grid stopped touching the surface.
+                assert!(
+                    part.loss.boundary_fraction > 0.0 && part.loss.boundary_fraction < 1.0,
+                    "{name}: boundary fraction {}",
+                    part.loss.boundary_fraction
+                );
+                assert_eq!(
+                    part.loss.ambiguous_rows, 0,
+                    "{name}: the rasteriser could not decide {} row(s)",
+                    part.loss.ambiguous_rows
+                );
+
+                // **The physics is the path, which is what rasterising a shape is for.**
+                //
+                // It was a uniformly hot bracket cooling over its whole footprint, and the three
+                // bounds here were a cooling body's: the peak may only fall, nothing may end
+                // below the air, and it must have moved. All true, and the field they described
+                // held a range of **0.067 K** — a Biot number of 8.6e-4, so 4 100 cells rasterised
+                // from an STL all carried the same number and a single lumped node answered the
+                // scene. `verify` names that now, and named this scene.
+                //
+                // A bracket does not sit there being hot. It carries what is mounted on it into
+                // the chassis it is bolted to, and the route — along one arm, round the corner,
+                // down the other — is the only reason its shape is in the file. So: 20 W into the
+                // far end of one arm, a bolt pad on six by four cells at the tip of the other,
+                // and the whole footprint no longer a heatsink. That needed `cooling` to be able
+                // to name a *box* on a face; stating a smaller area does not do it, because the
+                // area is divided among the cells on the face and a tenth of the area is a tenth
+                // of the conductance spread over all of it.
+                //
+                // Measured at the end of the run: **51.8655 °C at the module, 30.2982 at the
+                // bolts**, a 21.57 K spread over a path the shape decides. Its top loses to still
+                // air as well, 16.5 cm² of it, and did not until the grid was cut to the part's
+                // height: the part filled ten layers of twelve, the top film sat on the empty
+                // twelfth and cooled nothing, and the answer was 52.4420 °C.
+                //
+                // # It starts at 43.7 °C, and that is what a run length is for
+                //
+                // From 20 °C this needed **900 s** to settle, because most of that was spent
+                // charging the bracket's mass rather than establishing the gradient the scene is
+                // about — and nine test binaries walk every shipped scene, so the cost was
+                // multiplied by nine. Starting near the answer leaves only the shape to settle.
+                // Settled, the mean is 43.2586 °C and the peak 51.8857. From 44 °C the peak
+                // overshot and fell, breaking the rise asserted below; from 43.7, 43.8 and 43.9 it
+                // did not, so the line is between 43.9 and 44 — measured, and not the mean, which
+                // all four starts are above: how the peak arrives is the slowest mode's, and that
+                // mode weighs the hot arm. From 43.7 the 200 s run ends 0.020 K short of the
+                // settled peak — 0.063% of the rise — and moves 0.0041 K over its last frame. An
+                // initial condition is a statement about when you start looking.
+                const AMBIENT_K: f64 = 293.15;
+                let at = |f: &pantometry_world::Frame, pick: fn(f64, f64) -> f64, seed: f64| {
+                    f.panels.first().map_or(f64::NAN, |p| {
+                        p.values()
+                            .iter()
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .fold(seed, pick)
+                    })
+                };
+                let hottest = |f: &pantometry_world::Frame| at(f, f64::max, f64::MIN);
+                let coldest = |f: &pantometry_world::Frame| at(f, f64::min, f64::MAX);
+
+                // Warming towards a steady state, monotonically. From ambient a source that never
+                // stops and a sink that grows with temperature can do nothing else; from a start
+                // near the answer it is a property of the start, measured — 44 °C overshoots and
+                // 43.7 does not, above. A scheme overshooting its own limit would break it while
+                // conserving perfectly.
+                for pair in frames.windows(2) {
+                    let (before, after) = (hottest(&pair[0]), hottest(&pair[1]));
+                    assert!(
+                        after >= before - 1e-9,
+                        "{name}: the peak fell from {before} to {after} under a steady 20 W"
+                    );
+                }
+                for f in &frames {
+                    assert!(
+                        coldest(f) >= AMBIENT_K - 1e-6,
+                        "{name}: a cell reached {} K, below the {AMBIENT_K} K air",
+                        coldest(f)
+                    );
+                }
+
+                // **And it arrived.** The last two frames are 15 s apart and the peak must have
+                // stopped moving, or the spread below is a number the run length chose. It moves
+                // by 0.0041 K across that gap, against a fully settled 51.8857 — so what is left
+                // is 0.063% of the rise.
+                let end = hottest(frames.last().expect("frames"));
+                let earlier = hottest(&frames[frames.len() - 2]);
+                assert!(
+                    (end - earlier).abs() < 0.01,
+                    "{name}: still climbing at the end, {earlier:.4} then {end:.4} K"
+                );
+
+                // **The spread is the claim.** A lump would hold one number; this holds 21.57 K
+                // between the module's corner and the bolt pad, which is `verify`'s flat-field
+                // threshold by a factor of thirteen. Asserted against the rise above air rather
+                // than as a bare kelvin count, so it is the shape of the answer and not its size.
+                let spread = end - coldest(frames.last().expect("frames"));
+                let rise = end - AMBIENT_K;
+                println!("  {name}: {spread:.4} K across the bracket on a {rise:.4} K rise");
+                assert!(
+                    spread / rise > 0.5,
+                    "{name}: {spread:.4} K of a {rise:.4} K rise is a lump, not a path"
+                );
+            }
+            "30-two-phases-crossing-at-a-clearance.json" => {
+                // **Two busbars crossing at a clearance, in one block.**
+                //
+                // It was two `block` domains with a `poses` entry on the second, and that was the
+                // first scene to state a pose at all — every other one sits at the origin, so
+                // three separate consumers dropped the placement in turn and all twenty-nine
+                // agreed with every one of them. The pose is still here, on the assembly.
+                //
+                // # What two domains could not do
+                //
+                // **See each other.** They are 4 mm apart and blackened, ε = 0.9, and two surfaces
+                // at 335.6 K and 319.0 K facing across that gap exchange real heat — measured at
+                // **6.5711 mW**, which is 7.64% of what the cooler bar dissipates. Two `Solid3D`
+                // domains exchange nothing but bus totals, and the bus carries an amount with no
+                // location, so the arrangement the scene is named for was not modelled at all.
+                //
+                // In one block it is `find_gaps`, the same pairing `23-a-part-radiating-to-its-lid`
+                // is checked on: along each grid line, a run of void with solid at both ends is a
+                // gap and its ends see each other. The 8 × 8 mm patch where the bars cross is four
+                // such columns.
+                //
+                // The clearance is a `void` region over the whole block with the two bars filled
+                // back in, which is the readable way to say it and did not work until `fill`
+                // stopped leaving `void` set.
+                //
+                // # The closed form is now a pair
+                //
+                // Each bar sheds to still air, convectively and radiatively, **and** exchanges
+                // with the other:
+                //
+                //   P_a = hA(T_a − T∞) + εσA(T_a⁴ − T∞⁴) + Q      P_b + Q = (the same for b)
+                //   Q   = σ A_face (T_a⁴ − T_b⁴) / (1/ε + 1/ε − 1)
+                //
+                // Two equations, two unknowns, solved here by iteration from the constants. The
+                // single-bar balance this replaced is what the scene answered *without* the
+                // coupling, and the difference between them is the point: 22.4297 K against
+                // 22.0246, and 5.8120 against 6.2523.
+                const SIGMA: f64 = 5.670_374_419e-8;
+                const AMBIENT_C: f64 = 40.0;
+                const AMBIENT_K: f64 = AMBIENT_C + 273.15;
+                const H: f64 = 8.0;
+                const EPS: f64 = 0.9;
+                // Each bar is 32 × 8 × 8 mm and sheds from its four long faces. The two end faces
+                // are the joints to the rest of the bus and the file does not cool them.
+                let area = 4.0 * (0.032 * 0.008);
+                // The patch where they cross: two cells by two, at 4 mm.
+                let facing = 0.008 * 0.008;
+                let shed = |t: f64| {
+                    H * area * (t - AMBIENT_K)
+                        + EPS * SIGMA * area * (t.powi(4) - AMBIENT_K.powi(4))
+                };
+                // The temperature at which a bar sheds exactly `watts`, by bisection.
+                let alone = |watts: f64| {
+                    let (mut lo, mut hi) = (AMBIENT_K, AMBIENT_K + 1.0e4);
+                    for _ in 0..200 {
+                        let mid = 0.5 * (lo + hi);
+                        if shed(mid) < watts {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    0.5 * (lo + hi)
+                };
+                let (mut ta, mut tb) = (alone(0.344), alone(0.086));
+                let mut exchange = 0.0;
+                for _ in 0..20_000 {
+                    exchange = SIGMA * facing * (ta.powi(4) - tb.powi(4)) / (2.0 / EPS - 1.0);
+                    let (na, nb) = (alone(0.344 - exchange), alone(0.086 + exchange));
+                    ta += 0.2 * (na - ta);
+                    tb += 0.2 * (nb - tb);
+                }
+                let (want_a, want_b) = (ta - AMBIENT_K, tb - AMBIENT_K);
+
+                let last = frames.last().expect("frames");
+                let block = world
+                    .simulation()
+                    .domain_as::<pantometry::thermal::Solid3D>("busbars")
+                    .expect("the busbars are a block");
+                // A cell of each bar, away from the crossing so neither is read at the one place
+                // the exchange lands. Each bar is isothermal anyway — see below.
+                let got_a = block.temperature_at(0, 3, 0).to_si() - AMBIENT_K;
+                let got_b = block.temperature_at(3, 0, 4).to_si() - AMBIENT_K;
+                println!(
+                    "  {name}: {got_a:.4} and {got_b:.4} K against the pair balance's {want_a:.4} \
+                     and {want_b:.4}, exchanging {:.4} mW",
+                    exchange * 1e3
+                );
+                // The run stops at 8.0 τ, so e⁻⁸ = 3.3e-4 of the rise is still to come. That is
+                // where this tolerance comes from and it is the whole of it.
+                const SHORT_OF_STEADY: f64 = 1e-3;
+                for (which, got, want) in [("a", got_a, want_a), ("b", got_b, want_b)] {
+                    assert!(
+                        (got - want).abs() / want < SHORT_OF_STEADY,
+                        "{name}: bar {which} rose {got:.4} K, the pair balance says {want:.4} K"
+                    );
+                }
+
+                // **And the coupling is doing something**, or the pair balance above is satisfied
+                // by a scene in which the bars still cannot see each other. Uncoupled, the same
+                // two bars settle at 22.4297 and 5.8120 K; the exchange moves each by about
+                // 0.4 K, which is forty times the tolerance the balance is asserted to.
+                let (solo_a, solo_b) = (alone(0.344) - AMBIENT_K, alone(0.086) - AMBIENT_K);
+                println!(
+                    "  {name}: without the exchange they would sit at {solo_a:.4} and {solo_b:.4} K"
+                );
+                assert!(
+                    solo_a - got_a > 0.3 && got_b - solo_b > 0.3,
+                    "{name}: the bars are not exchanging: {got_a:.4}/{got_b:.4} against \
+                     {solo_a:.4}/{solo_b:.4}"
+                );
+                // The hotter bar gives and the cooler receives, which is the only direction the
+                // second law allows and the one a sign error would reverse.
+                assert!(
+                    got_a < solo_a && got_b > solo_b,
+                    "{name}: heat flowed uphill"
+                );
+
+                // **Each bar is a lump, and that is the physics rather than a defect.** With every
+                // watt leaving at the two ends — which is more than this arrangement does — a
+                // 32 mm bar of copper 8 mm square generating 0.344 W has a peak-to-end difference
+                // of `P·L/(8kA)` = 53.6 mK, 0.24% of its own rise. `verify` names both bars for it
+                // and is right to; no cooling arrangement makes this object have a field.
+                let along_a: Vec<f64> = (0..8)
+                    .map(|i| block.temperature_at(i, 3, 0).to_si())
+                    .collect();
+                let ripple = along_a.iter().cloned().fold(f64::MIN, f64::max)
+                    - along_a.iter().cloned().fold(f64::MAX, f64::min);
+                let bound = 0.344 * 0.032 / (8.0 * 401.0 * 0.008 * 0.008);
+                println!(
+                    "  {name}: bar a varies {:.4} mK along its length, and cannot exceed {:.1}",
+                    ripple * 1e3,
+                    bound * 1e3
+                );
+                assert!(
+                    ripple < bound,
+                    "{name}: {ripple:.6} K along a bar that cannot exceed {bound:.6}"
+                );
+
+                // **The clearance is 4 mm and the bars do not touch.** The one dimension a fault
+                // would close: the void layer between them carries no conductance at all, so a
+                // region that failed to apply would show as a face that conducts.
+                let across = block
+                    .face_conductance((4, 4, 1), (4, 4, 2))
+                    .expect("neighbours along z")
+                    .to_si();
+                assert!(
+                    across == 0.0,
+                    "{name}: the clearance conducts {across:.6e} W/K"
+                );
+                assert!(
+                    block.is_void(4, 4, 2),
+                    "{name}: the clearance layer is not empty"
+                );
+
+                // **The pose reaches the drawing.** Under the identity a domain's own coordinates
+                // and the world's are the same thing, which is why this went unnoticed in three
+                // consumers at once. The assembly is turned 30° about z and moved, so its world
+                // box is neither its own extent nor that extent translated.
+                let panel = last.panels.first().expect("one field");
+                assert!(
+                    panel.place.at_m != [0.0, 0.0, 0.0],
+                    "{name}: the pose did not reach the panel"
+                );
+                let turn = |q: [f64; 4], v: [f64; 3]| {
+                    let (qx, qy, qz, qw) = (q[0], q[1], q[2], q[3]);
+                    let t = [
+                        qy * v[2] - qz * v[1] + qw * v[0],
+                        qz * v[0] - qx * v[2] + qw * v[1],
+                        qx * v[1] - qy * v[0] + qw * v[2],
+                    ];
+                    [
+                        v[0] + 2.0 * (qy * t[2] - qz * t[1]),
+                        v[1] + 2.0 * (qz * t[0] - qx * t[2]),
+                        v[2] + 2.0 * (qx * t[1] - qy * t[0]),
+                    ]
+                };
+                let PanelData::Field { extent_m: e, .. } = &panel.data else {
+                    panic!("{name}: the busbars are a field");
+                };
+                let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+                for c in 0..8 {
+                    let local = [
+                        if c & 1 == 0 { e[0] } else { e[3] },
+                        if c & 2 == 0 { e[1] } else { e[4] },
+                        if c & 4 == 0 { e[2] } else { e[5] },
+                    ];
+                    let w = turn(panel.place.turn, local);
+                    for a in 0..3 {
+                        lo[a] = lo[a].min(w[a] + panel.place.at_m[a]);
+                        hi[a] = hi[a].max(w[a] + panel.place.at_m[a]);
+                    }
+                }
+                // A 32 x 32 x 20 mm box turned 30° about z spans 43.71 mm in x and in y, and the
+                // corner it starts from is not the one it started from. Written out rather than
+                // recomputed from the pose, so a placement that silently became the identity
+                // cannot satisfy this by agreeing with itself.
+                let envelope = [0.034, 0.020, 0.010, 0.077_712_8, 0.063_712_8, 0.030];
+                for a in 0..3 {
+                    assert!(
+                        (lo[a] - envelope[a]).abs() < 1e-6
+                            && (hi[a] - envelope[a + 3]).abs() < 1e-6,
+                        "{name}: axis {a} spans {} to {}, not {} to {}",
+                        lo[a],
+                        hi[a],
+                        envelope[a],
+                        envelope[a + 3]
+                    );
+                }
+            }
+            other => panic!("{other} ships but nothing checks it; add a claim for it"),
+        }
+
+        // **Which of these is a lump written as a grid.** Free here, because the run has already
+        // happened; `pantometry verify` computes the same numbers and raises them as findings, and
+        // a finding sets that command's exit code. Without this pin a shipped scene could start
+        // failing its own verification and nothing in the gate would say so.
+        //
+        // Measured exactly as `verify` measures it, **through the same function**: per connected
+        // body rather than per domain, because a domain's `peak` and `coldest` are the extremes of
+        // everything in it and two separate objects at different temperatures read as a large
+        // spread. `verify::connected_bodies` is public for this reason — a pin against a second
+        // copy of the walk would agree with itself while the two drifted apart.
+        let mut span: std::collections::BTreeMap<(String, &str), (f64, f64)> =
+            std::collections::BTreeMap::new();
+        for frame in &frames {
+            for r in &frame.readings {
+                if !r.value.is_finite() {
+                    continue;
+                }
+                let e = span
+                    .entry((r.domain.clone(), r.unit))
+                    .or_insert((r.value, r.value));
+                e.0 = e.0.min(r.value);
+                e.1 = e.1.max(r.value);
+            }
+        }
+        let bodies = pantometry_world::verify::connected_bodies(last);
+        for peak in last.readings.iter().filter(|r| r.label == "peak") {
+            if !last
+                .readings
+                .iter()
+                .any(|r| r.domain == peak.domain && r.label == "coldest" && r.unit == peak.unit)
+            {
+                continue;
+            }
+            let Some((lo, hi)) = span.get(&(peak.domain.clone(), peak.unit)) else {
+                continue;
+            };
+            let travel = hi - lo;
+            if travel <= 0.0 {
+                continue;
+            }
+            let mine: Vec<&(String, usize, f64)> = bodies
+                .iter()
+                .filter(|(d, _, _)| *d == peak.domain)
+                .collect();
+            for (n, (_, cells, spread)) in mine.iter().enumerate() {
+                if *cells > 1 && spread / travel < pantometry_world::verify::UNIFORM_FIELD {
+                    let which = if mine.len() > 1 {
+                        format!("{name}/{} body {}", peak.domain, n + 1)
+                    } else {
+                        format!("{name}/{}", peak.domain)
+                    };
+                    flat.push(which);
+                }
+            }
+        }
+    }
+
+    // **Pinned, both ways.** Seven bodies across five scenes, and every one of them is a lump for
+    // a reason worth reading rather than a defect to clear.
+    //
+    // Three are **melting**: the temperature is the melting point everywhere that is mushy, and
+    // the answer lives in a phase fraction the readings report only as a total, so the measurement
+    // cannot see their structure and says as much in its own words.
+    //
+    // Two are the part and the lid of `23-a-part-radiating-to-its-lid`, each isothermal and
+    // exchanging radiation across a clearance. **This is what measuring per body found.** As one
+    // domain that scene read 0.79 and passed, because `peak - coldest` over a domain holding two
+    // separate objects is the difference between them and not a gradient in either.
+    //
+    // Two are the busbars, which is the other half of the same lesson in the other direction:
+    // merging them into one block — which is what gives them a radiative path across their
+    // clearance — would have made a per-domain measurement stop naming them, with neither bar
+    // gaining a field. A 32 mm copper bar 8 mm square generating 0.344 W cannot vary by more than
+    // `P·L/(8kA)` = 53.6 mK along its length even if every watt left at the ends. It measures
+    // 0.585 mK.
+    //
+    // An eighth arriving means a scene lost its gradient, and one leaving means a scene gained
+    // one — both worth a failure rather than a quieter list. `pantometry verify` exits 1 on all
+    // five, which is the state this pin makes visible rather than the state it approves.
+    //
+    // **It was seven and then six and then five scenes.** `19-a-coating-stops-the-heat` left when
+    // its pulse stopped being a single cell, and `29-a-designed-bracket-becomes-cells` when a face
+    // could be cooled only where it is bolted — each visible here as a line removed rather than as
+    // a claim, which is what a pin is for.
+    // **A reading is an answer or a statement about the solve, and the sweep has to know which.**
+    //
+    // A *list* of labels is a shape that goes stale in silence: a domain that gains a residual
+    // would be compared across grids as though it converged to something, and nothing would say.
+    // `verify::DIAGNOSTICS` was that list; `Domain::diagnostics` replaced it, so a domain now says
+    // which of its own readings describe the solve. This is what stops the drift. It pins all
+    // **85** labels the thirty-four scenes emit, so a new one fails here and has to be decided
+    // about.
+    //
+    // What the sweep did without it, on `17-a-busbar-with-a-notch`:
+    //
+    // ```text
+    //   busbar   residual   0.000000 -> 0.000000  (281492.026%)
+    // ```
+    //
+    // Two converged residuals, 7.793e-13 and 6.644e-13, divided by the 4.08e-17 the first one
+    // wobbled by between two frames of the same run — conjugate gradients stopping at a different
+    // iterate — under a heading that says "what moved is discretisation". It also measured the
+    // residual "converging" at order **-0.77**, in a column beside four real ones.
+    //
+    // The five are a residual (17, 25), a divergence a projection removes (26), a `div B` a Yee
+    // grid preserves (27), a wavefunction norm (28), and a cell Reynolds number (26). Each has a
+    // value the solver holds it at, so what it reads says nothing about the answer. The near
+    // misses are worth naming: `invariant` (27) is the *energy* an FDTD scheme conserves — a
+    // physical quantity that converges — and `unevenness` and `ring over core` (18) are what
+    // scene 18 is asking, not how well it was solved.
+    // **Which domains call one of their readings a diagnostic**, pinned as `(domain, label)`.
+    //
+    // This took three assertions when the classification was a list of labels in `verify`: one for
+    // the labels the scenes emit, one for the length of the list — a label in it that no scene
+    // emitted changed nothing, so `"flux"` and `"peak "` could be added and the whole walk stayed
+    // green — and one for who emitted them, because keying on the label alone meant a *new* domain
+    // reporting `norm` as its answer would have been swallowed.
+    //
+    // `Domain::diagnostics` removed the first two problems by removing the list: a domain that
+    // declares a label it does not emit fails in `pantometry`'s own suite, and there is no second
+    // copy to drift. What is left is this — the set of pairs, so an arrival or a departure is a
+    // decision somebody made rather than a line nobody read.
+    diagnosed.sort();
+    assert_eq!(
+        diagnosed
+            .iter()
+            .map(|(d, l)| format!("{d}/{l}"))
+            .collect::<Vec<_>>(),
+        [
+            "aspirin/converged",
+            "aspirin/max force",
+            "aspirin/minimiser steps",
+            "aspirin/rms force",
+            "busbar/residual",
+            "coolant/cell Reynolds",
+            "coolant/divergence",
+            "crambin/mode separation",
+            "crambin/rigid modes",
+            "particle/norm",
+            "resonator/div B",
+            "stress/residual",
+        ],
+        "a domain started or stopped reporting a solver diagnostic"
+    );
+
+    emitted.sort();
+    let declared_labels: std::collections::BTreeSet<&str> =
+        diagnosed.iter().map(|(_, l)| l.as_str()).collect();
+    let (diagnostics, answers): (Vec<_>, Vec<_>) = emitted
+        .iter()
+        .partition(|(label, _)| declared_labels.contains(label.as_str()));
+    let named = |v: &[&(String, &'static str)]| -> Vec<String> {
+        v.iter().map(|(l, u)| format!("{l} [{u}]")).collect()
+    };
+    assert_eq!(
+        named(&diagnostics),
+        [
+            "cell Reynolds []",
+            "converged []",
+            "div B []",
+            "divergence [m/s]",
+            "max force [kcal/mol/Å]",
+            "minimiser steps []",
+            "mode separation []",
+            "norm []",
+            "residual []",
+            "rigid modes []",
+            "rms force [kcal/mol/Å]",
+        ],
+        "the set of readings that describe the solve rather than the world has changed"
+    );
+    assert_eq!(
+        named(&answers),
+        [
+            "<E> [J]",
+            "<x> [m]",
+            "TDS [%]",
+            "absorbed [J]",
+            "angle bend [kcal/mol]",
+            "atoms []",
+            "baseplate [C]",
+            "bed temperature [C]",
+            "blood [mg/L]",
+            "blood to fat [mg/h]",
+            "blood to lean tissue [mg/h]",
+            "blood to liver [mg/h]",
+            "bond stretch [kcal/mol]",
+            "bonds []",
+            "cleared [mg]",
+            "coldest [C]",
+            "current [A]",
+            "delivered [g]",
+            "displacement [m]",
+            "dissipated [J]",
+            "dissipating [W]",
+            "electric [J]",
+            "electrostatic [kcal/mol]",
+            "energy [J]",
+            "energy [kcal/mol]",
+            "fat [mg/L]",
+            "field energy [J]",
+            "flow [g/s]",
+            "formal charge [e]",
+            "free strain []",
+            "generated [J]",
+            "heavy atoms []",
+            "housing [C]",
+            "in the body [mg]",
+            "in the depot [mg]",
+            "invariant [J]",
+            "inversion [kcal/mol]",
+            "junction [C]",
+            "kinetic energy [J]",
+            "lean tissue [mg/L]",
+            "liver [mg/L]",
+            "lost before absorption [mg]",
+            "magnetic [J]",
+            "mean [C]",
+            "mean speed [m/s]",
+            "melted [mm3]",
+            "outlet temperature [C]",
+            "peak [C]",
+            "peak [Pa]",
+            "peak speed [m/s]",
+            "plasma [mg/L]",
+            "plasma to tissue [mg/h]",
+            "reserve [J]",
+            "resistance [ohm]",
+            "ring over core []",
+            "softest mode [Hz]",
+            "spent [J]",
+            "spread [m]",
+            "stator [C]",
+            "still to take [mg]",
+            "strain energy [J]",
+            "strain x []",
+            "strain y []",
+            "strain z []",
+            "temperature [C]",
+            "tissue [mg/L]",
+            "torsion [kcal/mol]",
+            "unevenness []",
+            "van der Waals [kcal/mol]",
+            "volume change []",
+            "winding [C]",
+            "work driven in [J]",
+            "work in [J]",
+            "yield [%]",
+        ],
+        "a scene reports something new, and the sweep has to be told whether it is an answer"
+    );
+
+    // **`EVIDENCE.md` states these four counts, and they are measured here.** Each pin above
+    // holds a list, and a list growing by one reads as a one-line diff; the sentence in
+    // `EVIDENCE.md` that counts them did not move with it and nothing compared the two.
+    //
+    // Not behind an `if let`: this crate is `publish = false`, so there is no copy of it anywhere
+    // that EVIDENCE.md is legitimately absent from, and the first version skipped when it was.
+    // The answers begin at the dash, because "2 answers" is inside "52 answers".
+    let evidence = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../EVIDENCE.md");
+    let evidence = std::fs::read_to_string(evidence).expect("EVIDENCE.md at the repository root");
+    let evidence = evidence.split_whitespace().collect::<Vec<_>>().join(" ");
+    for claim in [
+        format!("the **{}** `(label, unit)` pairs", emitted.len()),
+        format!(
+            "— {} answers and {} diagnostics",
+            answers.len(),
+            diagnostics.len()
+        ),
+        format!("the **{}** `(domain, label)` pairs", diagnosed.len()),
+    ] {
+        assert!(
+            evidence.contains(&claim),
+            "EVIDENCE.md should say {claim:?} — the count moved, or the sentence was reworded \
+             and this has to follow it"
+        );
+    }
+
+    flat.sort();
+    assert_eq!(
+        flat,
+        [
+            "20-melting-a-block-of-ice.json/ice",
+            "21-a-wax-thermal-buffer.json/wax",
+            "22-wax-in-an-aluminium-matrix.json/buffer",
+            "23-a-part-radiating-to-its-lid.json/housing body 1",
+            "23-a-part-radiating-to-its-lid.json/housing body 2",
+            "30-two-phases-crossing-at-a-clearance.json/busbars body 1",
+            "30-two-phases-crossing-at-a-clearance.json/busbars body 2",
+        ],
+        "the set of scenes whose grid is not carrying the answer has changed"
+    );
+}
+
+/// **The lamp's colour changes how much of it becomes heat**, and that is the whole point of
+/// carrying spectra around.
+///
+/// The mirror is aluminium-like: about 90.5% reflective at 380 nm and 96.8% at 700 nm, so it
+/// absorbs roughly three times as much in the blue as in the red. A blackbody at 6500 K puts
+/// far more of its visible output at the blue end than one at 2800 K, so the same hundred
+/// watts leaves more heat behind.
+///
+/// A flat reflectance would make this ratio exactly 1 and the entire spectral apparatus —
+/// `Spectrum`, `SpectralPower`, `SurfaceOptics::absorptance` — would be an expensive way to
+/// multiply by a constant. Asserting the *difference between two colour temperatures* is what
+/// makes this a test of the optics rather than of a number.
+#[test]
+fn a_hotter_lamp_leaves_more_heat_on_a_mirror_that_is_worse_in_the_blue() {
+    use pantometry_world::light::{aluminium_mirror, Light};
+
+    let at = |k: f64| Light::new("lamp", 100.0, k, aluminium_mirror()).absorbed_fraction();
+    let (warm, cool) = (at(2800.0), at(6500.0));
+
+    // Both are small: a good mirror absorbs a few percent, which is exactly why a hundred
+    // watts on one is a thermal problem and not a catastrophe.
+    assert!(
+        (0.02..0.12).contains(&warm) && (0.02..0.12).contains(&cool),
+        "a mirror absorbs a few percent, got {warm:.4} and {cool:.4}"
+    );
+    assert!(
+        cool > warm,
+        "6500 K is bluer than 2800 K and the mirror is worse in the blue: \
+         {cool:.4} against {warm:.4}"
+    );
+}
+
+/// **A scene can set a tolerance per quantity, and a typo in one is refused.**
+///
+/// The kernel gained `conservation_tolerance_for` because one number meant the loosest quantity in
+/// a simulation set what every other one was checked against. Reaching it from data is this
+/// crate's job, and the interesting half is the refusal: a channel name is matched against the
+/// kernel's constants rather than passed through, so a misspelling cannot quietly leave a quantity
+/// at the default.
+///
+/// That is the same failure `aluminum` for `aluminium` produced once already in this format — a
+/// one-character difference that turned off the check the library exists for.
+#[test]
+fn a_scene_can_set_a_tolerance_per_quantity() {
+    let text = r#"{
+      "title": "per quantity", "duration_s": 0.01, "frames": 2,
+      "conservation_tolerance": 1e-9,
+      "tolerance_for": { "momentum": 1e-6, "photons": 0.5 },
+      "domains": [
+        { "kind": "room", "name": "room", "width_m": 4.4, "height_m": 3.1,
+          "cells_across": 21 }
+      ]
+    }"#;
+    let scene: Scene = serde_json::from_str(text).expect("it parses");
+    let world = World::build(scene).expect("it builds");
+    let tol = world.simulation().tolerances();
+
+    assert_eq!(tol.default_tolerance(), 1e-9);
+    assert_eq!(
+        tol.for_quantity("energy"),
+        1e-9,
+        "unnamed keeps the default"
+    );
+    assert_eq!(tol.for_quantity("momentum"), 1e-6);
+    assert_eq!(tol.for_quantity("photons"), 0.5);
+
+    // A name the kernel does not have is refused, and the message says what is known.
+    let typo = text.replace("\"momentum\"", "\"momentom\"");
+    let scene: Scene = serde_json::from_str(&typo).expect("the JSON is still valid JSON");
+    let Err(err) = World::build(scene) else {
+        panic!("a misspelt channel must not be ignored");
+    };
+    assert!(
+        err.contains("momentom") && err.contains("momentum"),
+        "the refusal should name both what was written and what is known: {err}"
+    );
+
+    // And a scene that says nothing is unchanged — the feature costs nothing to ignore.
+    let plain = text.replace(
+        "\"tolerance_for\": { \"momentum\": 1e-6, \"photons\": 0.5 },",
+        "",
+    );
+    let scene: Scene = serde_json::from_str(&plain).expect("it parses");
+    let world = World::build(scene).expect("it builds");
+    assert_eq!(world.simulation().tolerances().overrides().count(), 0);
+    assert_eq!(
+        world.simulation().tolerances().for_quantity("momentum"),
+        1e-9
+    );
+}
+
+/// **A scene from a newer build is refused, not half-run.**
+///
+/// `deny_unknown_fields` already catches a key that was *added*. It cannot catch a key whose
+/// **meaning changed** — same name, same type, different semantics — and that is the whole reason
+/// a format carries a version.
+///
+/// The failure being prevented is one this format has already had in a smaller form: a key that
+/// is not read leaves its field at a default, and the run proceeds quietly doing something other
+/// than what the file says. Refusing forward rather than attempting a best-effort downgrade is
+/// deliberate: a plausible run that is not the one written down is worse than no run.
+#[test]
+fn a_scene_from_the_future_is_refused() {
+    let text = r#"{
+      "format": 99, "title": "from a newer pantometry", "duration_s": 0.01, "frames": 2,
+      "domains": [
+        { "kind": "room", "name": "room", "width_m": 4.4, "height_m": 3.1, "cells_across": 21 }
+      ]
+    }"#;
+    let scene: Scene = serde_json::from_str(text).expect("it is still valid JSON");
+    assert_eq!(scene.format, 99);
+    let Err(err) = World::build(scene) else {
+        panic!("a format this build cannot read must not run");
+    };
+    assert!(err.contains("99") && err.contains("upgrade"), "{err}");
+
+    // Zero is not a version this format ever had, and is what an uninitialised field looks like.
+    let zero = text.replace("\"format\": 99", "\"format\": 0");
+    let scene: Scene = serde_json::from_str(&zero).unwrap();
+    assert!(World::build(scene).is_err(), "0 is not a version");
+}
+
+/// **Every scene that ships loads, and absence of the key means version 1.**
+///
+/// The seventeen shipped files were written before the field existed and none of them has it.
+/// Defaulting to 1 is what makes that true rather than a special case — and it is why the default
+/// is *absence means the original format* rather than *absence means whatever is current*.
+#[test]
+fn the_shipped_scenes_are_format_one_by_omission() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scenes");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&dir).expect("the scenes are there") {
+        let path = entry.expect("readable").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(
+            !text.contains("\"format\""),
+            "{}: written before the field existed",
+            path.display()
+        );
+        let scene: Scene = serde_json::from_str(&text).expect("it parses");
+        assert_eq!(scene.format, 1, "{}", path.display());
+        scene.check_version().expect("format 1 is readable");
+        seen += 1;
+    }
+    assert!(seen >= 17, "only {seen} scenes were checked");
+}
+
+/// **What this build writes, it can read back — including the version.**
+///
+/// The narrow promise the number carries: within one version, a file that loads today loads
+/// tomorrow. A round trip is the cheapest test of it and the one that would catch a serialiser
+/// that emitted a version its own reader refuses.
+#[test]
+fn what_it_writes_it_reads() {
+    let text = r#"{
+      "title": "round trip", "duration_s": 0.25, "frames": 4,
+      "domains": [
+        { "kind": "room", "name": "room", "width_m": 4.4, "height_m": 3.1, "cells_across": 21 }
+      ]
+    }"#;
+    let scene: Scene = serde_json::from_str(text).expect("it parses");
+    let written = serde_json::to_string(&scene).expect("it serialises");
+
+    assert!(
+        written.contains(&format!("\"format\":{}", pantometry_world::FORMAT)),
+        "a file this build writes states its version: {written}"
+    );
+    let back: Scene = serde_json::from_str(&written).expect("it reads its own output");
+    assert_eq!(back.format, pantometry_world::FORMAT);
+    back.check_version().expect("its own output is readable");
+    World::build(back).expect("and runnable");
+}

@@ -1,0 +1,285 @@
+# MDClaw Agent Guide
+
+This guide is mirrored as both `CLAUDE.md` and `AGENTS.md`. Keep the two copies
+identical. Keep it short. Put long reference material under `docs/developer/`
+and link to it from here.
+
+## Project Overview
+
+MDClaw provides skills and CLIs for vibe-MD simulations and autonomous
+scientific investigation in the Amber/OpenMM ecosystem. It combines:
+
+- `mdclaw <tool>` CLI tools for concrete MD operations.
+- `skills/*/SKILL.md` instructions for translating scientific intent into MD
+  actions.
+- Boltz-2 for AI structure prediction.
+- AmberTools (`pdb4amber`, `cpptraj`) for structure preparation support.
+- HPacker for mutation-side-chain reconstruction and surrogate side-chain
+  packing.
+- `openmmforcefields` (`SystemGenerator` + `GAFFTemplateGenerator`) for
+  force-field application.
+- OpenFF Pablo for chemistry-aware PDB → topology loading (CCD-based).
+- OpenMM for equilibration and production MD.
+
+`build_amber_system` and `build_openmm_system` emit a `system.xml` +
+`topology.pdb` + `state.xml` artifact triple — the only topology
+contract on the run side. min / eq / prod / analyze consume that triple via
+the DAG resolver; the run side never reconstructs a System from
+ForceField XML.
+
+## Design Principle
+
+**Skills state intent; tools enforce guardrails.**
+
+- A skill says *what to do and why*, in plain procedure a weak LLM can follow.
+  It is advice: it can be skipped, misread, or out of date.
+- A tool is the only layer that can refuse. Anything that must never happen
+  (wrong chemistry, a doomed submission, a double-run node) is checked in the
+  tool and answered with a stable `code`, a `next_action`, and the node left in
+  a recoverable state.
+- So when an agent makes a mistake, fix the tool first (guardrail, clearer
+  `next_action`), then shorten the skill. Do not patch a missing guardrail with
+  more skill prose, and prefer designs with few agent-side judgement calls over
+  ones that need a careful reader.
+
+Longer form: `docs/developer/architecture.md` (Mental Model).
+
+## Molecular Display
+
+For requests to show a molecule, play a trajectory, rotate interactively, or
+create a still image, follow `skills/common/visual-qa.md`. It selects Molstar
+or PyMOL using the request and current-session capabilities, including remote
+connections. Display-only requests use existing results without starting MD.
+In Claude Code, Molstar playback is an Artifact page from `export_molstar_page`
+(Claude Code does not render MCP viewer widgets); it needs no port, so it reaches
+a desktop outside the site firewall and shows a running production's frames so
+far. For missing Molstar tools or
+remote display failures in other clients, read that page's MCP troubleshooting
+steps first. Distinguish the execution host from the display
+client, and verify registration, session tool loading, and rendering separately.
+
+## Where Things Live
+
+- `mdclaw/`: Python package and CLI dispatch. Each tool server is a
+ `mdclaw/<tool>/` package whose `__init__.py` assembles its `TOOLS` dict.
+- `skills/`: platform-agnostic MDClaw skill instructions.
+- `.agents/skills/`, `.claude/skills/`: skill discovery mirrors of `skills/`.
+- `.claude-plugin/`, `bin/`, `hooks/`: plugin distribution and runtime wrapper.
+- `tests/`: unit, smoke, and pipeline tests.
+- `docs/developer/`: long-form developer references.
+- `docs/research/`: research notes and citation inventory.
+- `examples/`: runnable skeletons.
+
+Developer references:
+
+- `docs/developer/architecture.md`: repository map and schema v3 DAG details.
+- `docs/developer/analysis-node-contract.md`: `analyze` node condition contract
+ (scope, subjects, comparison mapping, validation).
+- `docs/developer/skill-conventions.md`: how to author/refactor `skills/**` so
+ weak LLMs can follow them (spine + routed leaf pages, single canonical home).
+- `docs/developer/tool-reference.md`: tool modules and signatures index.
+- `docs/developer/cli-internals.md`: CLI discovery, argument mapping, guardrails.
+- `docs/developer/testing.md`: test levels and commands.
+- `docs/developer/configuration.md`: environment variables and CLI basics.
+- `docs/developer/container.md`: Docker, GHCR, and Singularity notes.
+- `docs/developer/release.md`: version sync and release steps.
+- `docs/developer/roadmap-and-known-issues.md`: known issues and deferred work.
+
+## Development Defaults
+
+Default to the checkout pixi environment for local development, linting, and
+tests (`pixi install` once; it materializes the committed `pixi.lock`; on NVIDIA
+drivers older than R575 add `pixi install -e cuda118`, which `bin/mdclaw` then
+selects):
+
+```bash
+pixi run ruff check mdclaw/
+pixi run pytest tests/test_registry.py tests/test_cli.py tests/test_guardrails.py tests/test_guardrail_code_registry.py tests/test_slurm_server.py -v
+```
+
+An existing `mdclaw` conda env still works through `conda run -n mdclaw ...`,
+but pixi is preferred: it installs the lockfile, so every machine gets the
+same resolved environment.
+
+On Linux hosts where creating conda is expensive, use the current SIF as a
+dependency/runtime image and import the checkout source instead of rebuilding
+the SIF for every Python-only edit:
+
+```bash
+PYTHONPATH="$PWD" singularity exec --nv --bind "$PWD:$PWD" --pwd "$PWD" \
+  mdclaw.sif python -m mdclaw._cli --list
+PYTHONPATH="$PWD" singularity exec --nv --bind "$PWD:$PWD" --pwd "$PWD" \
+  mdclaw.sif python -m mdclaw._cli <tool> ...
+singularity exec mdclaw.sif ruff check mdclaw/ tests/
+```
+
+Pass `--nv` whenever the work can touch OpenMM: without it the container sees
+no CUDA platform and `platform="auto"` silently falls back to CPU — a membrane
+equilibration that takes minutes on a GPU runs for an hour. Lint and pure
+scoring tests do not need it.
+
+If Singularity warns `unknown userid` (hosts whose accounts come from NIS or
+LDAP), keep the plain `singularity exec` above and add `--no-home` plus a
+neutral bind path; a user namespace (`unshare`) is not the fix. Inside one the
+setuid starter is ignored: Singularity on floyd then re-extracted the whole SIF
+on every call, while Apptainer 1.4.5 on RIKYU mounts it unprivileged through
+squashfuse at full speed (MDDataBench's agent sandbox relies on that). See
+`docs/developer/container.md`.
+
+```bash
+singularity exec --no-home --bind "$PWD:/work" --pwd /work \
+  mdclaw.sif python -m mdclaw._cli --list
+singularity exec --no-home --bind "$PWD:/work" --pwd /work \
+  mdclaw.sif env XDG_CACHE_HOME=/tmp/mdclaw-cache ruff check mdclaw/ tests/
+```
+
+Use this SIF-overlay loop for changes under `mdclaw/`, `skills/`, tests,
+and docs. Rebuild and push the SIF only when container
+contents change: `pixi.toml`/`pixi.lock`, `recipes/`, `container/Dockerfile.pixi`,
+runtime binaries, package metadata/version, or release artifacts.
+
+If touching tool execution paths, also run the relevant smoke or pipeline tests
+from `docs/developer/testing.md`.
+
+## Recording Work
+
+`docs/memo.md` is the running record of benchmark and investigation work: what
+was run, the numbers it produced, what was decided, and why. Append a dated entry
+there whenever you finish a piece of work or reach a conclusion that outlives the
+session. Newest first. When a later finding contradicts an earlier entry, add the
+correction and name what it overturns rather than editing the old entry away.
+
+Write the memo and every other tracked file in English. The repository is
+public: do not record cluster account or project IDs, other users' accounts, or
+personal home paths. Use the placeholders `$PROJECT`, `$USER`, `$MEMBER_A`, ...,
+`/home/$USER` (defined in the 2026-11-18 memo entry), inside backticks so GitHub
+does not render them as math.
+
+## Adding Or Changing Tools
+
+1. Add or update the function in the appropriate `mdclaw/<tool>/` submodule.
+2. Re-export it from the package `__init__.py` and add it to that package's
+   `TOOLS` dict.
+3. If adding a server, register it in `mdclaw/_registry.py` and
+   `mdclaw/__init__.py`.
+4. Add or update unit tests and smoke tests.
+5. Run `conda run -n mdclaw mdclaw --list` to verify CLI discovery.
+6. Update `docs/developer/tool-reference.md` and affected `skills/*` examples.
+
+## Skill Workflow Invariants
+
+User-facing sequence:
+
+```text
+md-prepare -> md-equilibration -> md-production -> md-analyze
+```
+
+Core schema v3 rules:
+
+- `skill = scientific intent and procedure`; skills do not mutate state.
+- Every MD workflow, including clear single-system requests such as "simulate
+  1AKE chain A", starts from a study plan and the canonical
+  `study_dir/jobs/<job_id>` layout. Direct runs use a minimal plan, usually
+  `jobs/main`; broader questions use richer `md-study` planning.
+- `md-study` is the study-planning skill: it translates scientific questions
+  into a small MD goal, planned jobs, analysis intent, and decision criteria.
+- `tool = run + record`; tools call `_node.py` helpers to update state.
+- `inspect_job` is the read-only re-entry point for existing job DAGs; it
+ returns node statuses, leaves, open needs, and progress params.
+- `explain_node` validates a candidate node before execution and reports
+ `ready_to_run`, resolved inputs, missing inputs, and blocking codes.
+- `create_node` auto-resolves the canonical forward parent when
+ `--parent-node-ids` is omitted (the single open frontier leaf of the parent
+ type; pending parents are allowed so chains can be submitted with Slurm
+ dependencies). Otherwise it answers `parent_required` with the candidates.
+ CLI preflight failures return structured `code`s (`node_context_required`,
+ `parent_not_completed`, `node_terminal`, ...) that carry the fix, and every
+ result starts with the same envelope plus `dag` / `next` blocks
+ (`mdclaw/_envelope.py`; `mdclaw --workflow` states the contract).
+- New scientific work should start with a `study_dir`; a simple one-system MD
+  run is a study with one job, usually `jobs/main`, and still has
+  `study_plan.json`.
+- A study may index many `job_dir`s. Each job DAG has one `source` node, and
+  that source node records a structural source bundle.
+- A source bundle may contain multiple structures, such as NMR models,
+  assembly candidates, or generated prediction ensemble members.
+- The source node normalizes those inputs into
+  `artifacts/candidates/candidate_*` files plus `source_bundle.json`; optional
+  raw inputs are provenance only.
+- Use `list_source_candidates` to expose candidate IDs, ranks, generator
+  metadata, and confidence metrics to the agent/user.
+- `prep` selects one concrete candidate from the source bundle before creating
+  an MD-ready physical system. A `prep` may also derive from a completed
+  `prep` (`create_mutated_structure`, `extract_tripeptide`): the child's
+  `merged_pdb` is what its own `solv` / `topo` descendants read.
+- Branch variants from `prep`, `solv`, `topo`, `min`, `eq`, or `prod` after that
+  concrete structure has been prepared.
+- `min` owns post-topology coordinate minimization and writes the portable
+  minimized `state` consumed by `eq`.
+- `eq` accepts `min` parents by default, with `topo` accepted only for legacy
+  DAGs and prior `eq` parents for multi-stage equilibration chains
+  (e.g. NPT compress -> NVT thermalize -> NPT relax).
+- `fep` (hybrid-topology FEP for one point mutation) sits where `prod` would:
+  its `topo` ancestor is built by `build_hybrid_system`, parents are `eq` or a
+  prior `fep` (extension), and `analyze_fep` consumes all-`fep` parents
+  (`analysis_data_scope: alchemical`). Both legs of a folding-stability ddG
+  live in one job: the unfolded leg is a `prep` child of the protein's `prep`
+  (`extract_tripeptide`, `leg_role = unfolded`), and `estimate_ddg` is the
+  `comparison` analyze node over the two legs' `analyze_fep` nodes. A `prod`
+  node under a hybrid topology is refused at input resolution
+  (`hybrid_topology_production_blocked`). A charge-changing mutation gets a
+  co-alchemical ion from `build_hybrid_system` (one bulk water becomes the
+  counter-ion, so both end states carry the same box charge); both legs must
+  agree on `charge_correction`. Skill: `skills/md-fep/`; design
+  notes: `docs/research/fep-references.md`.
+- Absolute binding free energy of a ligand (`skills/md-abfe/`) has the same
+  two-leg, one-job shape on a decoupling `topo` (`build_decoupled_system`):
+  the solvent leg is a `prep` child (`extract_ligand`), and
+  `estimate_binding_dg` is the `comparison` analyze node. The complex leg is
+  the one place a `topo` hangs under an `eq` (`add_boresch_restraint`) and
+  `fep` nodes hang under a `topo`; a `fep` node under the unrestrained complex
+  topo is refused (`abfe_restraint_required`), as is one with no equilibrated
+  ancestor (`fep_equilibration_required`). Design notes:
+  `docs/research/abfe-references.md`.
+- Round-driven sampling (`mdclaw/rounds/`, `skills/md-production/rounds.md`,
+  `skills/md-we/`): `setup_rounds` records a scheme, `run_rounds` runs a batch
+  of `prod` segments (`prod_<scheme>_r<round>_w<replica>`, ordinary nodes run
+  by `run_production`), lets the policy plan the next batch (`replicas`
+  continues every replica; `we_resample` splits, merges and recycles walkers
+  by weight on an `analyze` node whose parents are the round's segments) and
+  creates it; `--executor mps` packs each round under MPS (`submit_mps_job`)
+  with the driver on the host. Segments carry `metadata.scheme` (round, replica, seed,
+  weight); `analyze_we` turns the recycled flux into a rate. Never advance
+  one segment by hand: the `next` of any scheme node is `run_rounds`.
+- Each node owns `node.json`, `node.lock`, and `artifacts/`.
+- `progress.json` is a thin index plus cached summaries.
+- Events are append-only JSON files in `events/`.
+- Workflow tools require both `--job-dir` and `--node-id`.
+- Completed and failed nodes are terminal and immutable. Failed nodes keep
+  details under `artifacts/failure/latest/`; use
+  `trace_failure` to compute read-only recovery options
+  before creating an explicit branch.
+
+See `docs/developer/architecture.md` for the full job and study directory
+contracts.
+
+## Important Code Contracts
+
+- `_node.py` is the source of truth for DAG resolution, locking, status, and
+  progress synchronization. Refactor it only with focused tests.
+- `run_production` and `run_equilibration` both prefer portable XML state over
+  binary checkpoints for restart, and use `metadata.final_step` to restore
+  timeline metadata. The ensemble-agnostic loader (`_load_state_into_simulation`
+  in `mdclaw/simulation/restart.py`) transfers positions / velocities / box
+  via `XmlSerializer.deserialize` without restoring Context parameters, so
+  NPT ↔ NVT switching is safe across nodes (barostat parameters in the saved
+  state are dropped or introduced as the new System requires).
+- `build_amber_system` guardrails are part of the public agent contract; branch
+  on stable `code` values rather than human messages.
+- Skills invoke tools through the CLI. When tool signatures change, update the
+  matching skill examples.
+
+## Release And Distribution
+
+Keep the Python package version, plugin metadata, and container tag in sync.
+Follow `docs/developer/release.md` and `docs/developer/container.md`.

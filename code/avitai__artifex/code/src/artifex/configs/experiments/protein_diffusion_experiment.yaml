@@ -1,0 +1,39 @@
+experiment_name: protein_diffusion_cath
+seed: 42
+output_dir: "{ARTIFEX_OUTPUT_ROOT}/protein_diffusion_cath/"
+
+# Reference to config files
+model_config: models/geometric/protein_point_cloud.yaml
+data_config: data/protein_dataset.yaml
+training_config: training/protein_diffusion_training.yaml
+inference_config: inference/protein_diffusion_inference.yaml
+
+# Logging settings
+log_level: INFO
+use_wandb: true
+wandb_project: protein-diffusion
+
+# Override specific settings from default configs
+overrides:
+  # Model overrides
+  model:
+    num_residues: 150
+    num_points: 600
+
+  # Data overrides
+  data:
+    data_dir: "{ARTIFEX_DATA_ROOT}/cath_dataset"
+    metadata:
+      cache_dir: "{ARTIFEX_CACHE_ROOT}/cath_dataset"
+      splits_file: "{ARTIFEX_DATA_ROOT}/cath_dataset/chain_set_splits.json"
+      max_seq_length: 150
+
+  # Training overrides
+  training:
+    num_epochs: 50
+    batch_size: 64
+
+  # Inference overrides
+  inference:
+    num_samples: 10
+    target_seq_length: 150

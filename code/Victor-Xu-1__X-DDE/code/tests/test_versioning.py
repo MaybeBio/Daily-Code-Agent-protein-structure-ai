@@ -1,0 +1,168 @@
+"""Version carries, legacy transition and real manifest consistency."""
+
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+from opendde_workbench.versioning import ReleaseNumber
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location(
+    "release_version", ROOT / "scripts/release-version.py"
+)
+release = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(release)
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("0.1.1", "0.1.2"),
+        ("0.1.99", "0.1.100"),
+        ("0.1.100", "0.2.0"),
+        ("0.10.99", "0.10.100"),
+        ("0.10.100", "1.0.0"),
+        ("1.10.100", "2.0.0"),
+    ],
+)
+def test_exact_carry_rules(before, after):
+    assert str(ReleaseNumber.parse(before).next()) == after
+
+
+@pytest.mark.parametrize("value", ["0.11.0", "0.1.101", "0.1.0rc1", "0.01.1", "v0.1.1", "-1.1.1"])
+def test_invalid_current_versions_are_rejected(value):
+    with pytest.raises(ValueError):
+        ReleaseNumber.parse(value)
+
+
+def test_legacy_rc_moves_forward_without_downgrading():
+    assert str(ReleaseNumber.parse("0.4.0rc6", legacy=True).next()) == "0.4.1"
+
+
+def test_numeric_comparison_is_not_lexicographic():
+    assert ReleaseNumber.parse("0.10.0") > ReleaseNumber.parse("0.9.100")
+    assert ReleaseNumber.parse("0.1.100") > ReleaseNumber.parse("0.1.99")
+
+
+def test_repository_version_has_consistent_mirrors():
+    assert str(release.check(ROOT)) == release.read_version(ROOT)
+
+
+def test_stale_frontend_version_is_detected(tmp_path):
+    for name in (
+        "pyproject.toml",
+        "uv.lock",
+        "frontend/package.json",
+        "frontend/package-lock.json",
+        "install.sh",
+        "install.ps1",
+    ):
+        source = ROOT / name
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+    path = tmp_path / "frontend/package.json"
+    value = json.loads(path.read_text())
+    value["version"] = "0.1.1"
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="mirrors"):
+        release.check(tmp_path)
+
+
+def test_exact_commit_increment_accepts_legacy_transition_and_rejects_repeats(
+    monkeypatch, tmp_path
+):
+    import subprocess
+
+    root = manifest_fixture(tmp_path)
+    base = "a" * 40
+    monkeypatch.setattr(
+        subprocess, "check_output", lambda *args, **kwargs: '[project]\nversion = "0.4.0rc6"\n'
+    )
+    assert str(release.check(root, base)) == "0.4.1"
+    monkeypatch.setattr(
+        subprocess, "check_output", lambda *args, **kwargs: '[project]\nversion = "0.4.1"\n'
+    )
+    with pytest.raises(ValueError, match="Each publication"):
+        release.check(root, base)
+
+
+def test_skipped_versions_are_rejected(monkeypatch, tmp_path):
+    import subprocess
+
+    monkeypatch.setattr(
+        subprocess, "check_output", lambda *args, **kwargs: '[project]\nversion = "0.3.99"\n'
+    )
+    with pytest.raises(ValueError, match="Each publication"):
+        release.check(manifest_fixture(tmp_path), "a" * 40)
+
+
+def manifest_fixture(root, version="0.4.1"):
+    files = {
+        "pyproject.toml": f'[project]\nversion = "{version}"\n',
+        "uv.lock": (
+            f'[[package]]\nname = "x-dde"\nversion = "{version}"\n'
+            'source = { editable = "." }\n'
+        ),
+        "frontend/package.json": json.dumps({"version": version}),
+        "frontend/package-lock.json": json.dumps(
+            {"version": version, "packages": {"": {"version": version}}}
+        ),
+        "install.ps1": f"$Release = 'v{version}'\n",
+        "install.sh": f'release="${{1:-v{version}}}"\n',
+    }
+    for name, body in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+    return root
+
+
+def test_publication_updates_only_project_lock_metadata_without_resolving_dependencies(
+    monkeypatch, tmp_path
+):
+    import subprocess
+
+    root = manifest_fixture(tmp_path)
+    dependency = (
+        '\n[[package]]\nname = "retained-dependency"\nversion = "1.2.3"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    lock = root / "uv.lock"
+    lock.write_text(lock.read_text() + dependency)
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda command, **kwargs: calls.append(command))
+    assert release.bump(root) == "0.4.2"
+    assert lock.read_text().endswith(dependency)
+    assert calls == [["uv", "lock", "--check", "--offline"]]
+    assert str(release.check(root)) == "0.4.2"
+
+
+def test_unlocked_dependencies_roll_back_all_version_mirrors(monkeypatch, tmp_path):
+    import subprocess
+
+    root = manifest_fixture(tmp_path)
+    saved = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+    def reject(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, args[0])
+
+    monkeypatch.setattr(subprocess, "run", reject)
+    with pytest.raises(subprocess.CalledProcessError):
+        release.bump(root)
+    assert all(path.read_bytes() == raw for path, raw in saved.items())
+
+
+@pytest.mark.parametrize(
+    "source", ['{ registry = "https://pypi.org/simple" }', '{ editable = "elsewhere" }']
+)
+def test_publication_refuses_another_lock_authority(tmp_path, source):
+    root = manifest_fixture(tmp_path)
+    lock = root / "uv.lock"
+    lock.write_text(lock.read_text().replace('{ editable = "." }', source))
+    before = lock.read_bytes()
+    with pytest.raises(ValueError, match="exactly one editable"):
+        release.sync_project_lock(root, "0.4.1", "0.4.2")
+    assert lock.read_bytes() == before

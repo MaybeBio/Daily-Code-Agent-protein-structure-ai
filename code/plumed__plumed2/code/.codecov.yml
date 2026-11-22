@@ -1,0 +1,18 @@
+ignore:
+  - regtest
+  - src/lapack
+  - src/blas
+  - src/lepton
+  - src/asmjit
+  - src/xdrfile
+  - src/thread_mpi
+  - src/gemmi
+  
+coverage:
+  status:
+    project:
+      default:
+        threshold: 0.2%
+    patch:
+      default:
+        threshold: 20%

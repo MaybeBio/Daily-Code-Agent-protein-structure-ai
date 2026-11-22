@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openmm-pcff"
+version = "0.0.1"
+description = "PCFF (class II) force field for OpenMM"
+requires-python = ">=3.11"
+dependencies = ["openmm>=8.6", "numpy", "rdkit", "scipy"]
+
+[tool.setuptools]
+packages = ["openmm_pcff"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Import openmm_pcff from the repository root without installing it.
+pythonpath = ["."]

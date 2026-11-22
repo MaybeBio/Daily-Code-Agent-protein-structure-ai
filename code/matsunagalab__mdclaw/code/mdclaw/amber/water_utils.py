@@ -1,0 +1,434 @@
+"""
+Amber Server — curated Amber → OpenMM System builder.
+
+Provides tools for:
+- ``build_amber_system``: load a prepared PDB through OpenFF Pablo, apply Amber
+  protein / nucleic / glycan / lipid / PTM force fields plus topology-time
+  ligand templates (``GAFFTemplateGenerator``), and emit a portable
+  ``system.xml`` +
+  ``topology.pdb`` + ``state.xml`` triple consumed by ``run_minimization`` /
+  ``run_equilibration`` / ``run_production``, plus a minimization report for
+  benchmark evidence.
+- Supporting both implicit (no PBC) and explicit (with PBC, optionally
+  membrane) solvent setups.
+- Handling protein-ligand complexes by consuming prep-stage
+  ``ligand_chemistry`` records; topology parameterizes the small molecules
+  with ``GAFFTemplateGenerator``.
+- Handling glycoproteins by converting deposited glycan residues to
+  Amber/GLYCAM notation at topology time, preserving the generated bond plan,
+  and completing only GLYCAM-specific hydrogens before System creation.
+
+The XML triple is the only topology contract on the run side; tleap and
+parm7/rst7 are not produced or consumed anywhere. AmberTools
+(``pdb4amber`` and ``cpptraj``) remain available for structure-preparation
+support; ligand parameterization is not a prep-stage mdclaw artifact.
+"""
+
+# Configure logging early to suppress noisy third-party logs
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from mdclaw._common import setup_logger  # noqa: E402
+
+logger = setup_logger(__name__)
+
+from pathlib import Path  # noqa: E402
+from typing import List, Optional, Dict, Any  # noqa: E402
+
+from mdclaw._common import (  # noqa: E402
+    BaseToolWrapper, create_guardrail_result, normalize_choice,
+)
+from mdclaw.chemistry_constants import (  # noqa: E402
+    CANONICAL_WATER_MODELS,
+)
+
+# Default output location, created when a tool writes there, not at import.
+WORKING_DIR = Path("outputs").resolve()
+
+# Initialize tool wrappers.
+# ``tleap`` is no longer used: the curated build path runs through
+# ``openmmforcefields.SystemGenerator`` and emits the modern
+# ``system.xml`` + ``topology.pdb`` + ``state.xml`` triple (PR3 of the
+# openmmforcefields-unification refactor). ``cpptraj`` is still used for
+# the GLYCAM ``prepareforleap`` glycan conversion stage; see
+# ``_prepare_glycam_pdb_with_cpptraj`` for context.
+cpptraj_wrapper = BaseToolWrapper("cpptraj")
+
+
+# =============================================================================
+# Force Field Mappings (based on Amber Manual 2024 recommendations)
+# =============================================================================
+
+from mdclaw.amber.forcefield_constants import CANONICAL_PROTEIN_FORCEFIELDS, FORCEFIELD_WATER_COMPATIBILITY  # noqa: E402
+
+
+def _canonical_forcefield_name(forcefield: Optional[str]) -> Optional[str]:
+    """Normalize force field aliases to their canonical names."""
+    return normalize_choice(forcefield, CANONICAL_PROTEIN_FORCEFIELDS)
+
+
+def _canonical_water_model_name(water_model: Optional[str]) -> Optional[str]:
+    """Normalize water model aliases to their canonical names."""
+    return normalize_choice(water_model, CANONICAL_WATER_MODELS)
+
+
+def default_forcefield_for_water(water_model: Optional[str]) -> str:
+    """The protein force field to pair with ``water_model`` when none was given.
+
+    ff19SB with OPC is the modern default; a water ff19SB advises against
+    (TIP3P) gets the force field that lists it as recommended (ff14SB), so
+    "the task says TIP3P" needs one flag at solvation and nothing at topology.
+    """
+    canonical = _canonical_water_model_name(water_model) or water_model
+    for forcefield in ("ff19SB", "ff14SB"):
+        compat = FORCEFIELD_WATER_COMPATIBILITY.get(forcefield, {})
+        if canonical in compat.get("recommended", []) or canonical in compat.get("acceptable", []):
+            return forcefield
+    return "ff19SB"
+
+
+def resolve_water_and_forcefield(
+    *,
+    water_model: Optional[str],
+    forcefield: Optional[str],
+    solvation_water_model: Optional[str] = None,
+    solvation_node_id: Optional[str] = None,
+    job_dir: Optional[str] = None,
+    node_id: Optional[str] = None,
+) -> dict:
+    """Effective water model and force field for a topology build.
+
+    The water model is fixed by the solvated coordinates (OPC waters carry a
+    virtual site, TIP3P waters do not), so in node mode an omitted
+    ``water_model`` is inherited from the solv node and a different explicit
+    value is a mismatch that names both ways out. An omitted force field is
+    paired with the water. On 036_ligand_1ceb (2026-09-10) the agent
+    solvated with the default and built with ``--water-model tip3p``; the
+    old check only said "match the solvation step".
+    """
+    warnings: list[str] = []
+    # "auto" / "default" mean "decide for me", the same as omitting the flag:
+    # --nucleic-forcefield accepts auto, so agents write --forcefield auto too
+    # (049_nucleic_1iv6 cli_sif r2 lost a topo node to unknown_forcefield: auto).
+    if isinstance(forcefield, str) and forcefield.strip().lower() in {"auto", "default", ""}:
+        forcefield = None
+    if isinstance(water_model, str) and water_model.strip().lower() in {"auto", "default", ""}:
+        water_model = None
+    solvation_canonical = _canonical_water_model_name(solvation_water_model) if solvation_water_model else None
+    if water_model is None:
+        if solvation_water_model:
+            effective_water = solvation_water_model
+            water_source = f"inherited from solv node {solvation_node_id or 'ancestor'}"
+        else:
+            effective_water = "opc"
+            water_source = "default"
+    else:
+        effective_water = water_model
+        water_source = "argument"
+    requested_canonical = _canonical_water_model_name(effective_water) or effective_water
+    mismatch = None
+    if (water_model is not None and solvation_water_model
+            and requested_canonical != (solvation_canonical or solvation_water_model)):
+        job = job_dir or "<job_dir>"
+        node = node_id or "<topo_node_id>"
+        keep = (f"mdclaw --job-dir {job} --node-id {node} build_amber_system ... "
+                f"(without --water-model; the topo inherits {solvation_water_model!r})")
+        change = (f"mdclaw create_node --job-dir {job} --node-type solv, then "
+                  f"mdclaw --job-dir {job} --node-id <new solv node> solvate_structure "
+                  f"--water-model {water_model} ..., then a new topo node")
+        mismatch = {
+            "message": (
+                f"Topology water_model {water_model!r} does not match solv node "
+                f"{solvation_node_id or 'ancestor'} ({solvation_water_model!r}); the solvated "
+                "coordinates fix the water model, so the topology cannot change it."
+            ),
+            "hints": [f"Keep the solvation: {keep}", f"Change the water: {change}"],
+            "next_action": keep,
+            "solvation_water_model": solvation_water_model,
+        }
+    if forcefield is None:
+        effective_forcefield = default_forcefield_for_water(effective_water)
+        forcefield_source = f"paired with water model {effective_water!r}"
+        if effective_forcefield != "ff19SB":
+            warnings.append(
+                f"forcefield defaulted to {effective_forcefield} to pair with the water model "
+                f"{effective_water!r} ({water_source}); pass --forcefield to choose another."
+            )
+    else:
+        effective_forcefield = forcefield
+        forcefield_source = "argument"
+    return {
+        "water_model": effective_water,
+        "forcefield": effective_forcefield,
+        "water_model_source": water_source,
+        "forcefield_source": forcefield_source,
+        "warnings": warnings,
+        "mismatch": mismatch,
+    }
+
+
+def _evaluate_forcefield_water_guardrails(forcefield: str, water_model: str) -> list[Dict[str, Any]]:
+    """Evaluate explicit-solvent forcefield/water guardrails."""
+    compat = FORCEFIELD_WATER_COMPATIBILITY.get(forcefield, {})
+    recommended = compat.get("recommended", [])
+    acceptable = compat.get("acceptable", [])
+    not_recommended = compat.get("not_recommended", [])
+    pair = f"{forcefield} + {water_model}"
+    results = []
+
+    if water_model in not_recommended:
+        preferred_pair = f"{forcefield} + {recommended[0]}" if recommended else forcefield
+        results.append(create_guardrail_result(
+            "water_model",
+            f"{pair} is blocked by MDClaw: Amber recommends against this pairing.",
+            severity="error",
+            actual=pair,
+            expected=preferred_pair,
+            # Both exits, and neither of them hedged. Which half of the pair
+            # the caller may change is not ours to assume: a request can fix
+            # the water model and leave the force field open, and then advice
+            # to move the water is advice it cannot take. "for legacy systems"
+            # used to qualify the second exit, which reads as a reason not to
+            # take it.
+            suggested_fix=(
+                f"Either change the water: water_model='{recommended[0]}'"
+                if recommended else "Either change the water model"
+            ) + (
+                f"; or keep water_model='{water_model}' and change the protein "
+                f"force field to one that lists it, e.g. forcefield='ff14SB'."
+            ),
+            code="forcefield_water_blocked",
+        ))
+    elif water_model in acceptable:
+        results.append(create_guardrail_result(
+            "water_model",
+            f"{pair} is allowed, but {forcefield} is optimized for {', '.join(recommended)}.",
+            severity="warning",
+            actual=pair,
+            expected=", ".join(recommended) if recommended else None,
+            suggested_fix=f"Prefer water_model='{recommended[0]}' for new {forcefield} systems." if recommended else None,
+            code="forcefield_water_not_preferred",
+        ))
+    elif recommended and water_model not in recommended:
+        results.append(create_guardrail_result(
+            "water_model",
+            f"{pair} is allowed, but recommended water models for {forcefield} are: {', '.join(recommended)}.",
+            severity="warning",
+            actual=pair,
+            expected=", ".join(recommended),
+            suggested_fix=f"Prefer water_model='{recommended[0]}' for new {forcefield} systems.",
+            code="forcefield_water_recommended_alternative",
+        ))
+
+    return results
+
+
+def fix_ligand_residue_names(pdb_path: Path, output_path: Path, 
+                              ligand_residue_names: List[str]) -> dict:
+    """Fix ligand residue names in PDB file.
+    
+    packmol-memgen sometimes renames unknown ligands to "UNL".
+    This function replaces UNL with the correct residue name.
+    
+    Args:
+        pdb_path: Input PDB file path
+        output_path: Output PDB file path
+        ligand_residue_names: List of correct ligand residue names
+    
+    Returns:
+        Dict with statistics about replacements made
+    """
+    result = {
+        "success": True,
+        "unl_count": 0,
+        "replacements": [],
+        "errors": [],
+    }
+    
+    if not ligand_residue_names:
+        # No ligands to fix, just copy file
+        import shutil
+        shutil.copy(pdb_path, output_path)
+        return result
+    
+    unique_ligand_names = sorted({name[:3].upper() for name in ligand_residue_names if name})
+    target_residue = unique_ligand_names[0] if len(unique_ligand_names) == 1 else None
+    
+    lines_out = []
+    with open(pdb_path, 'r') as f:
+        for line in f:
+            if line.startswith(('ATOM', 'HETATM')):
+                # Check if residue name is UNL (columns 17-20)
+                res_name = line[17:20].strip()
+                if res_name == 'UNL':
+                    result["unl_count"] += 1
+                    if target_residue:
+                        # Replace UNL with target residue name (right-padded to 3 chars)
+                        new_line = line[:17] + f"{target_residue:>3}" + line[20:]
+                        lines_out.append(new_line)
+                        continue
+            lines_out.append(line)
+
+    if result["unl_count"] > 0 and not target_residue:
+        result["success"] = False
+        result["errors"].append(
+            "Ambiguous UNL residue repair: input PDB contains UNL but multiple ligand "
+            f"templates are present ({unique_ligand_names}). Refusing to guess."
+        )
+        return result
+    
+    with open(output_path, 'w') as f:
+        f.writelines(lines_out)
+    
+    if result["unl_count"] > 0:
+        result["replacements"].append(f"Replaced {result['unl_count']} UNL atoms with {target_residue}")
+        logger.info(f"Fixed {result['unl_count']} UNL residue atoms -> {target_residue}")
+
+    return result
+
+
+def fix_histidine_protonation_consistency(pdb_path: Path, output_path: Path) -> dict:
+    """Fix inconsistent HIS residue names vs present hydrogen atom names.
+
+    Amber/OpenMM residue template matching at openmmforcefields build time
+    requires the residue name to agree with the hydrogen atoms that are
+    present (e.g. a residue named HIE that still carries HD1 fails to
+    match any HIS template). This can happen when upstream tools relabel
+    residues but keep their original hydrogen names.
+
+    Rules (Amber):
+    - HID: delta-protonated -> has HD1 (and typically no HE2)
+    - HIE: epsilon-protonated -> has HE2 (and typically no HD1)
+    - HIP: doubly protonated -> has both HD1 and HE2
+
+    This function rewrites residue names to match present atom names.
+    It does NOT add/remove atoms; it only changes residue name columns.
+    """
+    result = {"changed": 0, "changes": []}
+
+    # First pass: collect per-residue whether HD1/HE2 are present
+    residues: dict[tuple[str, str, str], dict[str, bool]] = {}
+    lines = pdb_path.read_text().splitlines(keepends=True)
+    for line in lines:
+        if not line.startswith(("ATOM", "HETATM")):
+            continue
+        resname = line[17:20].strip().upper()
+        if resname not in {"HIS", "HID", "HIE", "HIP"}:
+            continue
+        chain = line[21:22]
+        resnum = line[22:26]
+        icode = line[26:27]
+        key = (chain, resnum, icode)
+        atom = line[12:16].strip().upper()
+        flags = residues.setdefault(key, {"hd1": False, "he2": False, "resname": resname})
+        if atom == "HD1":
+            flags["hd1"] = True
+        elif atom == "HE2":
+            flags["he2"] = True
+
+    # Determine desired residue names
+    desired: dict[tuple[str, str, str], str] = {}
+    for key, flags in residues.items():
+        hd1 = bool(flags.get("hd1"))
+        he2 = bool(flags.get("he2"))
+        current = str(flags.get("resname", "HIS")).upper()
+        target = current
+        if hd1 and he2:
+            target = "HIP"
+        elif hd1 and not he2:
+            target = "HID"
+        elif he2 and not hd1:
+            target = "HIE"
+        # If neither hydrogen present, leave as-is (HIS/HID/HIE from upstream)
+        if target != current:
+            desired[key] = target
+
+    # Second pass: rewrite residue name field for matching residues.
+    # Filter on resname too — packmol-memgen reuses chain IDs and residue
+    # numbers for waters and ions, so a water molecule can share
+    # (chain, resnum, icode) with a HIS residue. Without the resname
+    # guard, the water's resname would be silently renamed to HID/HIE/HIP
+    # too, breaking residue template matching at openmmforcefields build time.
+    _his_family = {"HIS", "HID", "HIE", "HIP"}
+    out_lines: list[str] = []
+    for line in lines:
+        if line.startswith(("ATOM", "HETATM")):
+            resname_cur = line[17:20].strip().upper()
+            if resname_cur in _his_family:
+                chain = line[21:22]
+                resnum = line[22:26]
+                icode = line[26:27]
+                key = (chain, resnum, icode)
+                if key in desired:
+                    old = line[17:20]
+                    new = f"{desired[key]:>3}"
+                    if old != new:
+                        result["changed"] += 1
+                        result["changes"].append(f"{chain.strip() or '_'}:{resnum.strip()}{icode.strip() or ''} {old.strip()} -> {new.strip()}")
+                        line = line[:17] + new + line[20:]
+        out_lines.append(line)
+
+    output_path.write_text("".join(out_lines))
+    return result
+
+
+def strip_crystal_waters(input_pdb: Path, output_pdb: Path) -> dict:
+    """Remove crystal water molecules from a PDB file.
+
+    This function removes all water residues (HOH, WAT, SOL, etc.) from the PDB.
+    Crystal waters should be removed for both implicit and explicit solvent simulations:
+    - Implicit: GB models don't support discrete water molecules
+    - Explicit: Bulk water will be added by solvate_structure
+
+    Args:
+        input_pdb: Path to input PDB file
+        output_pdb: Path to output PDB file (can be same as input)
+
+    Returns:
+        dict with:
+            - success: bool
+            - waters_removed: int - Number of water residues removed
+            - atoms_removed: int - Number of water atoms removed
+    """
+    water_names = {"WAT", "HOH", "SOL", "TP3", "OPC", "T4P", "T5P", "H2O", "DOD", "D2O"}
+
+    result = {
+        "success": False,
+        "waters_removed": 0,
+        "atoms_removed": 0,
+    }
+
+    try:
+        lines_to_keep = []
+        water_residues = set()
+        atoms_removed = 0
+
+        with open(input_pdb, 'r') as f:
+            for line in f:
+                if line.startswith(('ATOM', 'HETATM')):
+                    res_name = line[17:20].strip()
+                    if res_name in water_names:
+                        # Track water residue
+                        res_num = line[22:26].strip()
+                        chain = line[21:22]
+                        water_residues.add(f"{chain}:{res_num}")
+                        atoms_removed += 1
+                        continue  # Skip this line
+                lines_to_keep.append(line)
+
+        with open(output_pdb, 'w') as f:
+            f.writelines(lines_to_keep)
+
+        result["success"] = True
+        result["waters_removed"] = len(water_residues)
+        result["atoms_removed"] = atoms_removed
+
+        if len(water_residues) > 0:
+            logger.info(f"Stripped {len(water_residues)} crystal water(s) ({atoms_removed} atoms) from PDB")
+
+    except Exception as e:
+        logger.error(f"Failed to strip crystal waters: {e}")
+        result["errors"] = [str(e)]
+
+    return result

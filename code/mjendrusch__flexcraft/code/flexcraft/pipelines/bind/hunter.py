@@ -1,0 +1,188 @@
+# Protein Hunter-like binder design script
+
+import os
+import uuid
+import numpy as np
+import jax
+
+
+from flexcraft.utils.options import parse_options
+from flexcraft.utils.rng import Keygen
+from flexcraft.utils import Keygen, parse_options
+from flexcraft.sequence.sample import *
+from flexcraft.data.data import DesignData
+from flexcraft.sequence.mpnn import make_pmpnn
+import flexcraft.sequence.aa_codes as aas
+from flexcraft.structure.boltz._model import Joltz2, JoltzResult
+from flexcraft.structure.boltz._data import JoltzSpec, JoltzInput
+from flexcraft.structure.boltz._result import JoltzPrediction
+from flexcraft.files import FastaFile, ScoreCSV
+
+opt = parse_options(
+    "predict structures with AlphaFold",
+    pmpnn_path="params/solmpnn/v_48_030.pkl",
+    target_sequence="none",
+    name="target",
+    use_msa="True",
+    out_path="out",
+    save_features="False",
+    boltz_path="params/boltz/",
+    num_designs=48,
+    length=80,
+    cycles=10,
+    temperature=0.1,
+    samples=10,
+    seed=42,
+    tmpdir="tmp/"
+)
+binder_length = opt.length
+key = Keygen(opt.seed)
+kval = key()
+# set up protein mpnn
+pmpnn = make_pmpnn(opt.pmpnn_path, eps=0.05, split_params=False)
+params = dict()
+# set up logit transform:
+transform = lambda T: transform_logits((
+    scale_by_temperature(T),
+    forbid("C", aas.PMPNN_CODE),
+    norm_logits
+))
+# retrieve target
+target_sequence: str = opt.target_sequence
+if target_sequence.endswith((".fa", ".fasta")):
+    sequences = FastaFile(target_sequence).line_dict
+else:
+    sequences = {opt.name: target_sequence}
+# set up Boltz models
+model = Joltz2()
+# unknown-aa hallucination model
+joltz, joltz_params = model.evaluator(num_recycle=4)
+joltz_pred = model.predictor(num_recycle=4)
+params["joltz"] = joltz_params
+
+def _hunter_step(params, key, data: JoltzInput) -> JoltzResult:
+    result: JoltzResult = joltz(params).predict(key, data)
+    return result
+hunter_step = jax.jit(_hunter_step)
+
+def protein_hunter(key, cycles=5):
+    def _init_sequence():
+        init_sequence = jax.random.gumbel(key(), (opt.length, 20), dtype=jnp.float32)
+        init_sequence *= np.random.uniform(low=0.75, high=5.0)
+        init_sequence = jnp.array(init_sequence, dtype=jnp.float32)
+        init_sequence = jax.nn.softmax(0.01 * init_sequence, axis=-1) # FIXME
+        return init_sequence
+    def _pmpnn(data: DesignData):
+        data = data.update(aa=data["aa"].at[:binder_length].set(20))
+        data = data.update(aa=aas.translate(data["aa"], aas.AF2_CODE, aas.PMPNN_CODE))
+        temperature = 0.1
+        logit_transform = transform(temperature)
+        pmpnn_sampler = sample(pmpnn, logit_transform=logit_transform)
+        pmpnn_result, _ = pmpnn_sampler(key(), data)
+        pmpnn_result = data.update(
+            aa=aas.translate(pmpnn_result["aa"], aas.PMPNN_CODE, aas.AF2_CODE))
+        return pmpnn_result.to_sequence_string().split(":")[0]
+    def _inner(target_sequence: str, binder_length: int, init_input=None,
+               template=None, use_msa=True, report=None) -> JoltzPrediction:
+        spec = (
+            JoltzSpec()
+            .add_protein(binder_length * "X")
+            .add_protein(*[c for c in target_sequence.split(":")])
+        )
+        if template is not None:
+            spec = spec.add_template(template, to_chains=[
+                "BCDEFGHIJKLMNOPQRSTUVWXYZ"[i] 
+                for i, c in enumerate(target_sequence.split(":"))])
+        joltz_input, joltz_writer = spec.to_input(pad=True, cache=opt.boltz_path)
+        joltz_input: JoltzInput
+        if use_msa:
+            joltz_input = joltz_input.inherit_msa(init_input)
+        init_sequence = _init_sequence()
+        binder_sequence = aas.decode(np.argmax(init_sequence, axis=-1), aas.AF2_CODE)
+        #joltz_input = joltz_input.set_aa(init_sequence)
+        result: JoltzResult = hunter_step(joltz_params, key(), joltz_input).unpad()
+        pred = JoltzPrediction(data=result.data, writer=joltz_writer)
+        if report is not None:
+            report(0, binder_sequence, pred)
+        for c in range(cycles - 1):
+            binder_sequence = _pmpnn(result.to_data().unpad())
+            spec = (
+                JoltzSpec()
+                .add_protein(binder_sequence)
+                .add_protein(*[c for c in target_sequence.split(":")])
+            )
+            if template is not None:
+                spec = spec.add_template(template, to_chains=[
+                    "BCDEFGHIJKLMNOPQRSTUVWXYZ"[i] 
+                    for i, c in enumerate(target_sequence.split(":"))])
+            joltz_input, joltz_writer = spec.to_input(pad=True, cache=opt.boltz_path)
+            if use_msa:
+                joltz_input = joltz_input.inherit_msa(init_input)
+            result = hunter_step(joltz_params, key(), joltz_input).unpad()
+            pred = JoltzPrediction(data=result.data, writer=joltz_writer)
+            if report is not None:
+                report(c + 1, binder_sequence, pred)
+        return JoltzPrediction(data=result.data, writer=joltz_writer)
+    return _inner
+
+def _report_trajectory(target: str, index: int, writer: ScoreCSV, start_step=0):
+    def _report(step: int, sequence: str, pred: JoltzPrediction):
+        result = pred.result.unpad()
+        pad_mask = result.token_pad_mask
+        is_binder = (np.arange(pad_mask.shape[0]) < binder_length) & np.asarray(pad_mask, dtype=bool)
+        binder_plddt = float(result.index_plddt(is_binder).mean())
+        line_info = dict(
+            target=target,
+            attempt=index, step=start_step + step,
+            sequence=sequence,
+            plddt=binder_plddt,
+            iptm=float(result.iptm.max()))
+        pred.save_pdb(f"{opt.out_path}/attempts/{target}_{index}_{step}.pdb")
+        writer.write_line(line_info)
+    return _report
+
+os.makedirs(f"{opt.out_path}/attempts/", exist_ok=True)
+os.makedirs(f"{opt.out_path}/final/", exist_ok=True)
+common_keys = [
+    "attempt",
+    "step",
+    "sequence",
+    "plddt",
+    "iptm",
+]
+trajectory_keys = [k for k in common_keys]
+trajectory = ScoreCSV(f"{opt.out_path}/trajectory.csv", keys=["target"] + trajectory_keys)
+
+hunter = protein_hunter(key, cycles=opt.cycles)
+for name, sequence in sequences.items():
+    # set up per-target MSA input (use_msa) or a predicted template (no MSA)
+    target_template = None
+    init_input = None
+    if opt.use_msa == "True":
+        init_input, _ = (JoltzSpec()
+            .add_protein("X" * binder_length)
+            .add_protein(*[c for c in sequence.split(":")], use_msa=True)
+            .to_input(pad=True, cache=opt.boltz_path))
+    else:
+        os.makedirs(opt.tmpdir, exist_ok=True)
+        target_template = f"{opt.tmpdir}/target_{str(uuid.uuid4())}.cif"
+        prediction = joltz_pred(key(), JoltzSpec().add_protein(
+            *[c for c in sequence.split(":")], use_msa=True))
+        prediction.save_cif(target_template)
+    success_count = 0
+    attempt = 0
+    _attempt = 0
+    while success_count < opt.num_designs:
+        attempt = _attempt
+        _attempt += 1
+
+        prediction = hunter(
+            sequence,
+            binder_length,
+            init_input=init_input,
+            use_msa=opt.use_msa == "True",
+            template=target_template,
+            report=_report_trajectory(name, attempt, trajectory))
+        if opt.save_features == "True":
+            prediction.save(f"{opt.out_path}/prediction_{attempt}.npz")
+        success_count += 1

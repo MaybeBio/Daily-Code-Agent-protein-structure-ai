@@ -1,0 +1,249 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2021-2023 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#include "CoordinationBase.h"
+#include "tools/SwitchingFunction.h"
+#include "core/ActionRegister.h"
+#include "core/PlumedMain.h"
+#include "tools/IFile.h"
+
+#include <string>
+
+namespace PLMD {
+namespace colvar {
+
+//+PLUMEDOC COLVAR GHBFIX
+/*
+Calculate the GHBFIX interaction energy between GROUPA and GROUPB
+
+The GHBFIX interaction energy between GROUPA and GROUPB is computed
+using a potential that is defined in the paper cited in the bibliography below.  The potential introduced in that paper is
+essentially a switching function that is -1 for small distances and 0 for large distances with a smooth interpolation in the middle.
+This function can be scaled as desired by specifying interaction scaling parameters and energy units.
+
+The scaling parameter of a pair of atoms is read from the line of the PARAMS file whose first type is the type of the atom in GROUPA
+and whose second type is the type of the atom in GROUPB. The parameters are not symmetrised: the line `type1 type2` is not used for a pair
+in which the atom of GROUPA has `type2` and the atom of GROUPB has `type1`, and a pair of types without a line has a scaling parameter of zero.
+If the same two types can appear in both orders (for example when GROUPA and GROUPB contain atoms of the same types, or when only GROUPA is given,
+in which case the order of the two atoms of a pair is not specified) the file should contain both lines.
+
+This collective variable can be used to analyze hydrogen bond interactions, or to generate bias potentials.
+Notice that the value of the GHBFIX is returned in plumed units (see [UNITS](UNITS.md)), unless the ENERGY_UNITS keyword is employed.
+
+This example prints the GHBFIX interaction in kcal/mol between two groups of atoms using D_0, D_MAX and C
+It is applied in the functional form introduced in the pioneering paper.
+The types of atoms 1-6 should be defined in typesTable_examples.dat while their interaction parameters should be defined in scalingParameters_examples.dat in kBT units.
+
+```plumed
+#SETTINGS INPUTFILES=regtest/basic/rt-ghbfix/typesTable_examples.dat,regtest/basic/rt-ghbfix/scalingParameters_examples.dat
+gh: GHBFIX ...
+   PAIR GROUPA=1,2,3 GROUP=4,5,6 D_0=0.2 D_MAX=0.3 C=0.8
+   TYPES=regtest/basic/rt-ghbfix/typesTable_examples.dat
+   PARAMS=regtest/basic/rt-ghbfix/scalingParameters_examples.dat
+   ENERGY_UNITS=kcal/mol
+...
+PRINT FILE=output ARG=gh
+```
+
+*/
+//+ENDPLUMEDOC
+
+class GHBFIX : public CoordinationBase {
+
+  double dmax;
+  double dmax_squared;
+  double d0;
+  double c;
+
+  std::vector<unsigned> typesTable;
+
+  std::vector<double> etas;
+
+  unsigned n;
+
+  double dmax2;
+  double A;
+  double B;
+  double C;
+  double D;
+
+public:
+  explicit GHBFIX(const ActionOptions&);
+// active methods:
+  static void registerKeywords( Keywords& keys );
+  double pairing(double distance,double&dfunc,unsigned i,unsigned j)const override;
+  double pairCutoff2() const override {
+    return dmax_squared;
+  }
+};
+
+PLUMED_REGISTER_ACTION(GHBFIX,"GHBFIX")
+
+void GHBFIX::registerKeywords( Keywords& keys ) {
+  CoordinationBase::registerKeywords(keys);
+
+  keys.add("optional","ENERGY_UNITS","the value of ENERGY_UNITS in the switching function");
+  keys.add("compulsory","TYPES","the value of TYPES in the switching function");
+  keys.add("compulsory","PARAMS","the value of PARAMS in the switching function");
+  keys.add("compulsory","D_MAX","the value of D_MAX in the switching function");
+  keys.add("compulsory","D_0","the value of D_0 in the switching function");
+  keys.add("compulsory","C","the value of C in the switching function");
+  keys.setValueDescription("scalar","the GHBFIX interaction energy between the atoms in GROUPA and GROUPB");
+  keys.addDOI("10.1021/acs.jctc.8b00955");
+}
+
+GHBFIX::GHBFIX(const ActionOptions&ao):
+  Action(ao),
+  CoordinationBase(ao) {
+  std::string types;
+  std::string params;
+  std::string energy_units ="plumed" ;
+
+  parse("D_MAX",dmax);
+  dmax_squared = dmax*dmax;
+  parse("D_0",d0);
+  parse("C",c);
+  parse("TYPES",types);
+  parse("PARAMS",params);
+  parse("ENERGY_UNITS",energy_units);
+  checkRead();
+
+  if( d0<0.0 || dmax<=d0 ) {
+    error("D_MAX should be larger than D_0 and D_0 should not be negative");
+  }
+  if( !(c>0.0 && c<1.0) ) {
+    error("C should be larger than 0 and smaller than 1");
+  }
+  dmax2 = dmax-d0;
+
+  A = (-c*dmax2*dmax2)/((1-c)*dmax2*dmax2);
+  B = (2*dmax2)/((1-c)*dmax2*dmax2);
+  C = -1/((1-c)*dmax2*dmax2);
+  D = 1/(c*dmax2*dmax2);
+
+  std::map<std::string,unsigned> MapTypesTable;
+
+  //typesTable
+  IFile typesfile;
+  typesfile.link(*this);
+  typesfile.open(types);
+  std::string itype;
+  while(typesfile.scanField("itype",itype).scanField()) {
+    plumed_assert(itype.empty()==false)<<"itype is empty";
+
+    if (MapTypesTable.empty()) {
+      MapTypesTable.insert({itype, 0});
+    } else if (MapTypesTable.count(itype) == 0) {
+      unsigned currentMax = 0;
+      for(auto it = MapTypesTable.cbegin(); it != MapTypesTable.cend(); ++it ) {
+        if (it ->second > currentMax) {
+          currentMax = it->second;
+        }
+      }
+      MapTypesTable.insert({itype, currentMax+1});
+    }
+
+    typesTable.push_back(MapTypesTable[itype]);
+  }
+
+  if( typesTable.empty() ) {
+    error("no atom types were found in the file " + types);
+  }
+  // the atoms of the two groups should all have a type
+  for(const auto & index : getAbsoluteIndexes() ) {
+    if( index.index()>=typesTable.size() ) {
+      error("your types table only covers " + std::to_string(typesTable.size()) + " atoms, but atom " + std::to_string(index.serial()) + " is used");
+    }
+  }
+  n = (int)*std::max_element(std::begin(typesTable), std::end(typesTable));
+  n+=1;
+
+  //scalingParameters
+  etas.resize(static_cast<std::size_t>(n)*n,0.0);
+  IFile etafile;
+  etafile.open(params);
+  std::string it,jt;
+  double eta;
+  unsigned nskipped=0;
+  while(etafile.scanField("itype",it).scanField("jtype",jt).scanField("eta",eta).scanField()) {
+    plumed_assert(it.empty()==false)<<"itype is empty";
+    plumed_assert(jt.empty()==false)<<"jtype is empty";
+    // The file of the parameters can contain types that are not used by the atoms
+    // in the types table: these cannot be used and must be skipped.
+    // Using operator[] here would add them to the map as type 0 and the parameters
+    // of the (wrong) type 0 would be overwritten.
+    const auto iti = MapTypesTable.find(it);
+    const auto itj = MapTypesTable.find(jt);
+    if( iti==MapTypesTable.end() || itj==MapTypesTable.end() ) {
+      nskipped++;
+      continue;
+    }
+    etas[n*iti->second+itj->second]=eta;
+  }
+  if( nskipped>0 ) {
+    log.printf("  skipped %u lines of %s that contain types that are not in %s\n",nskipped,params.c_str(),types.c_str());
+  }
+
+  if(energy_units!="plumed") {
+    Units units;
+    units.setEnergy(energy_units);
+    for(unsigned i=0; i<etas.size(); i++) {
+      etas[i]*=units.getEnergy()/getUnits().getEnergy();
+    }
+  }
+
+}
+
+
+double GHBFIX::pairing(double distance2,double&dfunc,unsigned i,unsigned j)const {
+  // Most of the pairs are beyond the cutoff: check it before looking up the types
+  if(distance2>dmax_squared) {
+    dfunc=0.0;
+    return 0.;
+  }
+  // that the atoms are in the table of the types is checked in the constructor
+  const auto i1=getAbsoluteIndex(i).index();
+  const auto i2=getAbsoluteIndex(j).index();
+  plumed_dbg_assert(i1<typesTable.size() && i2<typesTable.size());
+  const double scale=etas[n*typesTable[i1]+typesTable[i2]];
+  double distance=std::sqrt(distance2);
+  const double rdist = (distance-d0);
+  double result=-1.;
+  if(rdist<=0.) {
+    dfunc=0.0;
+  } else {
+    dfunc=0.0;
+    if (rdist > c*dmax2) {
+      result+=(A + B*rdist + C*rdist*rdist);
+      dfunc+=B+2*C*rdist;
+    } else {
+      result+=D*(rdist*rdist);
+      dfunc+=2*D*rdist;
+    }
+    dfunc/=distance;
+  }
+  result*=scale;
+  dfunc*=scale;
+  return result;
+}
+
+}
+}

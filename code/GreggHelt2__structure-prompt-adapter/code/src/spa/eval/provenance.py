@@ -1,0 +1,607 @@
+"""Write a self-describing ``RUN_PROVENANCE.json`` next to a run's outputs.
+
+WHY THIS EXISTS. An audit on 2026-07-31 of every run this project has ever produced found that the
+as-run configuration survived only by accident:
+
+- Of 104 local run directories, **26 carried no recoverable config at all** (no Hydra snapshot, no
+  embedded ``config`` block), and the artifacts cannot be regenerated to recover it because RFD3's
+  CUDA sampler is not bitwise reproducible.
+- The single best provenance format in the project was a hand-written ``RUN_PROVENANCE.json``, which
+  is exactly why it existed for **2 of those 104 runs**. Anything that depends on remembering does
+  not happen; anything a driver writes automatically survives.
+- Of 93 cloud jobs, none pinned a code revision or an image digest, and the job stdout logs that
+  echoed the resolved config were already past retention when we went looking.
+
+So this module exists to make the record a by-product of running, not a thing to remember. It is
+deliberately **best-effort and non-fatal**: a provenance failure must never take down a run that has
+already spent GPU time. Every collector is individually guarded.
+
+WHAT IT RECORDS, and why each field is here rather than assumed:
+
+``code``        git sha AND dirty flag for both repos. Cloud jobs now pin a sha at submit
+                (``scripts/cloud/_pin_run_env.sh``); local runs had nothing, and a dirty tree means
+                the sha alone does not identify what ran.
+``checkpoint``  path plus **sha256** of the adapter. `results/17` had to state its checkpoint hash by
+                hand to make the claim checkable. The RFD3 host is recorded by path/size/mtime rather
+                than hash, because hashing 2.6 GB on every run is not worth eight seconds.
+``prompts``     id, path, length and ⭐ **split**. `results/25` ran 80 prompts of which 68 were
+                train-split and nobody noticed for three days, by which time the claim was in the
+                paper. Looking the split up at run time turns that into a warning at second zero.
+``sampler``     the requested knobs. ``generate.py`` separately reads the values back off the live
+                sampler and aborts on mismatch, so requested == effective by construction.
+``env``         host, GPU, conda env, python/torch, because "which box" has silently mattered before.
+``timing``      start and end in **Pacific**, per the project convention.
+
+The two fields a machine cannot supply are ``purpose`` and ``scope``, and ``scope`` is the one that
+prevents later over-reading: "ProteinMPNN and OpenFold3 were NOT run, so no designability numbers
+exist here". Callers should pass them.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import platform
+import socket
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+FILENAME = "RUN_PROVENANCE.json"
+_PACIFIC = "America/Los_Angeles"
+
+
+def _now_pacific() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(_PACIFIC)).strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _git(repo: str | os.PathLike) -> dict[str, Any]:
+    out: dict[str, Any] = {"repo": str(repo)}
+    try:
+        out["sha"] = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                             stderr=subprocess.DEVNULL, timeout=15).decode().strip()
+        rc = subprocess.run(["git", "-C", str(repo), "diff", "--quiet", "HEAD"],
+                            stderr=subprocess.DEVNULL, timeout=15).returncode
+        out["dirty"] = bool(rc)
+    except Exception:
+        out["sha"] = None
+    return out
+
+
+def _sha256(path: str | os.PathLike, limit_mb: int = 512) -> str | None:
+    """Hash a file, but skip anything above ``limit_mb`` so a 2.6 GB host checkpoint is not rehashed
+    on every run. Returns None when skipped or unreadable."""
+    try:
+        p = Path(path)
+        if not p.is_file() or p.stat().st_size > limit_mb * 1024 * 1024:
+            return None
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _file_id(path) -> dict[str, Any] | None:
+    try:
+        p = Path(str(path))
+        st = p.stat()
+        return {"path": str(p), "bytes": st.st_size,
+                "mtime_utc": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+                "sha256": _sha256(p)}
+    except Exception:
+        return {"path": str(path), "exists": False} if path else None
+
+
+def lookup_split(accession: str, splits_root: str | os.PathLike | None) -> str | None:
+    """Which split of the pinned partition an accession belongs to, or None if unresolvable.
+
+    Best-effort by design: a public user has no split manifests, and a run must not fail because a
+    provenance nicety could not be computed.
+    """
+    if not splits_root or not accession:
+        return None
+    try:
+        import pandas as pd
+    except Exception:
+        return None
+    for split in ("train", "validate", "test"):
+        try:
+            man = Path(str(splits_root)) / split / "manifest.parquet"
+            if not man.exists():
+                continue
+            key = _split_cache(str(man))
+            if accession in key:
+                return split
+        except Exception:
+            continue
+    return None
+
+
+_SPLIT_CACHE: dict[str, set] = {}
+
+
+def _split_cache(manifest: str) -> set:
+    if manifest not in _SPLIT_CACHE:
+        import pandas as pd
+        df = pd.read_parquet(manifest, columns=["stem"])
+        _SPLIT_CACHE[manifest] = {s.split("-")[1] for s in df["stem"] if "-" in s}
+    return _SPLIT_CACHE[manifest]
+
+
+def describe_prompt(path_or_id, splits_root=None) -> dict[str, Any]:
+    """One prompt's record: id, path, and the split it came from (warning loudly if not held out)."""
+    s = str(path_or_id) if path_or_id is not None else ""
+    stem = Path(s).stem
+    acc = stem.split("-")[1] if stem.startswith("AF-") and "-" in stem else stem
+    rec: dict[str, Any] = {"id": acc, "source": s or None}
+    rec["split"] = lookup_split(acc, splits_root)
+    return rec
+
+
+def describe_conditioning(cfg) -> dict[str, Any] | None:
+    """What the run conditioned on, and ⭐ **what it did NOT isolate**, emitted automatically.
+
+    Exists because of this module's founding lesson: anything that depends on someone remembering does
+    not happen. The specific thing being remembered here is dev ``90`` §5.0b.
+
+    ⛔ **The disclosure.** RFdiffusion3 atomizes a ligand into the **same token track** SPA attends to,
+    one token per heavy atom (``rfd3/transforms/pipelines.py:172-179``; dev ``90`` §3.1a). For the
+    ``ligand:``-field spec form the ligand tokens are **appended last**, after the whole contig is
+    accumulated (``rfd3/inference/input_parsing.py:738``). ⚠️ **This docstring and the emitted string
+    below said "interleaved" until 2026-09-16, which was wrong**; nothing branched on it and no run was
+    affected, and the disclosure's conclusion is unchanged either way, since an appended ligand token is
+    still a token a uniform λ reaches. Audit: dev ``111`` §15.1 A4. SPA's cross-attention query is the
+    full token tensor, so **with a uniform λ and no per-residue profile the adapter also steers the
+    ligand's tokens**, using a fold prompt that knows nothing about small molecules. That is a
+    deliberate, approved scope choice for the first runs (Gregg, 2026-09-03: route **(c)** of §5.0b,
+    "go with c for now, and note it in the run record") and **not** a defect. What it forecloses is
+    narrow and specific: such a run **cannot claim the ligand channel was isolated**.
+
+    Returns ``None`` when no ligand is configured, so ordinary monomer runs gain no field.
+    """
+    try:
+        ev = cfg.eval
+    except Exception:
+        return None
+
+    ligand = None
+    for getter in (lambda: (ev.get("specification") or {}).get("ligand", None),
+                   lambda: (ev.get("motif") or {}).get("ligand", None)):
+        try:
+            ligand = ligand or getter()
+        except Exception:
+            pass
+    if not ligand:
+        return None
+
+    rec: dict[str, Any] = {
+        "ligand": _plain(ligand),
+        "lambda_profile": "uniform (no per-residue profile set)",
+        "ligand_tokens_steered": True,
+        "isolation": "NOT ISOLATED",
+        "disclosure": (
+            "RFdiffusion3 atomizes the ligand into the same token track SPA attends to (one token per "
+            "heavy atom, appended after the protein for the `ligand:` spec form). With a uniform "
+            "lambda this run therefore applied the fold "
+            "prompt to the ligand's tokens as well as the protein's. This is route (c) of dev plan/90 "
+            "section 5.0b, chosen deliberately on 2026-09-03. CONSEQUENCE: this run may NOT be "
+            "described as isolating the ligand conditioning channel. The controlled arm needs the "
+            "token-level is_ligand mask wired into the profile builder (route (b), prerequisite P2)."
+        ),
+        "decided": "2026-09-03 (Gregg), dev plan/90 section 5.0b",
+    }
+    return rec
+
+
+# ---------------------------------------------------------------------------
+# SPA conditioning capture (dev plan/159b). The design-side λ profile and the prompt-side selection are
+# armed POST-COMPOSE via set_profile/set_prompts and serialize NOWHERE on their own, so this block records
+# them explicitly: per soft prompt the PROMPT-side selection (which prompt rows the design attends to) and
+# the DESIGN-side selection (which design residues it steers), plus any Fixed Motif's source->design span.
+# The main generate.py path derives it from `cfg` (describe_spa_conditioning); the probe drivers, which arm
+# several prompts in Python, build it with the helpers below and pass `collect(spa_conditioning=...)`.
+#
+# ⚠️ CONVENTION: every prompt-frame and design-frame span is HALF-OPEN [lo, hi), matching
+# `eval.profile.steered` (generate.py:985-997) and `eval.subregion.keep_range` (generate.py:706-726).
+# ---------------------------------------------------------------------------
+
+def prompt_whole() -> dict[str, Any]:
+    """Prompt-side selection: the design attends to the WHOLE fold prompt."""
+    return {"kind": "whole", "keep_range": None, "keep": None, "M_attended": None}
+
+
+def prompt_keep_range(a: int, b: int) -> dict[str, Any]:
+    """Prompt-side selection: attend to prompt rows [a, b) only (eval.subregion.keep_range)."""
+    a, b = int(a), int(b)
+    return {"kind": "keep_range", "keep_range": [a, b], "keep": None, "M_attended": b - a}
+
+
+def design_whole() -> dict[str, Any]:
+    """Design-side selection: steer EVERY design residue (uniform λ, no profile)."""
+    return {"kind": "whole", "spans": None, "n_steered": None, "lambda_region": None}
+
+
+def design_span(lo: int, hi: int, *, lambda_region: float | None = None) -> dict[str, Any]:
+    """Design-side selection: steer design residues [lo, hi) (one boxcar span of the λ profile)."""
+    lo, hi = int(lo), int(hi)
+    return {"kind": "profile", "spans": [[lo, hi]], "n_steered": hi - lo, "lambda_region": lambda_region}
+
+
+def soft_slot(prompt_id, prompt_source=None, *, prompt_side=None, design_side=None) -> dict[str, Any]:
+    """One soft-prompt slot for `spa_conditioning(...)`. `prompt_side`/`design_side` default to whole."""
+    return {"prompt_id": prompt_id,
+            "prompt_source": (str(prompt_source) if prompt_source else None),
+            "prompt_side": prompt_side or prompt_whole(),
+            "design_side": design_side or design_whole()}
+
+
+def motif_slot(source, source_span=None, design=None) -> dict[str, Any]:
+    """One Fixed Motif slot: source structure, its source span (contig/seg), and the design-frame extent
+    [lo, hi) (min..max of the motif residues; exact segments live in `source_span`)."""
+    return {"source": (str(source) if source is not None else None),
+            "source_span": (str(source_span) if source_span is not None else None),
+            "design_span": ([int(design[0]), int(design[1])] if design is not None else None)}
+
+
+def spa_conditioning(*, soft=(), motif=(), source: str = "driver") -> dict[str, Any] | None:
+    """Assemble a `spa_conditioning` block from slot dicts (`soft_slot`/`motif_slot`), numbering the slots
+    1..N. Returns None when BOTH are empty (a baseline arm, which must carry no block, dev plan/159 §4.1)."""
+    soft = list(soft or [])
+    motif = list(motif or [])
+    if not soft and not motif:
+        return None
+    for i, s in enumerate(soft, 1):
+        s["slot"] = i
+    for i, m in enumerate(motif, 1):
+        m["slot"] = i
+    return {"capture_source": source, "n_soft_prompts": len(soft), "n_fixed_motifs": len(motif),
+            "soft_prompts": soft, "fixed_motifs": motif}
+
+
+def describe_spa_conditioning(cfg) -> dict[str, Any] | None:
+    """The SPA conditioning this run armed, derived from `cfg.eval` (the main generate.py path, which has at
+    most one soft prompt). The probe drivers pass an explicit block via `collect(spa_conditioning=...)`.
+
+    Returns None for a run with NO soft prompt AND no Fixed Motif (a plain unconditional/baseline run), so
+    those gain no block. Best-effort: the caller wraps this; a failure must not block a run.
+
+    ⚠️ Scope: the block records the SPA arming for this INVOCATION (the `spa` condition's designs). A
+    multi-condition run (`conditions=[baseline, spa]`) applies the soft prompt only to its `spa` designs; a
+    Fixed Motif, when present, applies to every condition (baseline = motif-only, spa = motif+SPA,
+    generate.py:1059). The condition axis on the design/cell, not this block, says which parts a design used.
+    """
+    try:
+        ev = cfg.eval
+    except Exception:
+        return None
+
+    conditions = _plain(ev.get("conditions", None)) or []
+    if isinstance(conditions, str):
+        conditions = [conditions]
+
+    soft: list[dict[str, Any]] = []
+    src = ev.get("prompt_pdb", None) or ev.get("prompt_cache", None)
+    if "spa" in conditions and src:  # a real soft prompt only; a "spa" arm with no prompt emits no slot
+        pr = describe_prompt(src)
+        # prompt-side selection: eval.subregion (keep_range / keep), else whole
+        ps = prompt_whole()
+        sr = ev.get("subregion", None)
+        if sr is not None:
+            kr = sr.get("keep_range", None) if hasattr(sr, "get") else None
+            keep = sr.get("keep", None) if hasattr(sr, "get") else None
+            if kr is not None:
+                kr = _plain(kr)
+                ps = prompt_keep_range(kr[0], kr[1])
+            elif keep is not None:
+                keep = [int(i) for i in _plain(keep)]
+                ps = {"kind": "keep", "keep_range": None, "keep": keep, "M_attended": len(keep)}
+        # design-side selection: eval.profile.steered (half-open spans), else whole
+        ds = design_whole()
+        prof = ev.get("profile", None)
+        if prof is not None:
+            steered = _plain(prof.get("steered", None)) if hasattr(prof, "get") else None
+            if steered:
+                spans = [[int(s[0]), int(s[1])] for s in steered]
+                ds = {"kind": "profile", "spans": spans,
+                      "n_steered": sum(hi - lo for lo, hi in spans), "lambda_region": None}
+        soft.append(soft_slot(pr.get("id"), pr.get("source"), prompt_side=ps, design_side=ds))
+
+    motif: list[dict[str, Any]] = []
+    m = ev.get("motif", None)
+    if m:
+        source = _plain(m.get("source_pdb", None)) if hasattr(m, "get") else None
+        contig = _plain(m.get("contig", None)) if hasattr(m, "get") else None
+        src_span = contig if contig else (_plain(m.get("unindex", None)) if hasattr(m, "get") else None)
+        dspan = None
+        if contig:
+            try:  # deferred import: generate imports this module at load time
+                from .generate import _parse_contig_motif_indices
+                res = sorted(_parse_contig_motif_indices(str(contig)))
+                if res:
+                    dspan = [res[0], res[-1] + 1]  # half-open extent
+            except Exception:
+                dspan = None
+        motif.append(motif_slot(source, src_span, dspan))
+
+    return spa_conditioning(soft=soft, motif=motif, source="cfg")
+
+
+def collect(cfg=None, *, prompts=None, purpose=None, scope=None,
+            extra: dict | None = None, spa_conditioning=None,
+            started: str | None = None) -> dict[str, Any]:
+    """Assemble the provenance record. Never raises.
+
+    ``spa_conditioning``: an explicit block (from the `spa_conditioning(...)` builder) that OVERRIDES the
+    cfg-derived one, for drivers that arm prompts in Python (dev plan/159b §3.2). When None, the block is
+    derived from ``cfg`` via ``describe_spa_conditioning``.
+    """
+    rec: dict[str, Any] = {
+        "schema": "spa-run-provenance/2",
+        "purpose": purpose,
+        "scope": scope,
+        "started_pacific": started,
+        "written_pacific": _now_pacific(),
+        "anomalies": [],
+    }
+    try:
+        here = Path(__file__).resolve().parents[3]
+        rec["code"] = {"public": _git(here), "dev": _git(here.parent / "structure-prompt-adapter-dev")}
+    except Exception:
+        pass
+    try:
+        import torch
+        rec["env"] = {
+            "host": socket.gethostname(),
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "conda_env": os.environ.get("CONDA_DEFAULT_ENV"),
+            "torch": torch.__version__,
+            "cuda": getattr(torch.version, "cuda", None),
+            "gpu": (torch.cuda.get_device_name(0) if torch.cuda.is_available() else None),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        }
+    except Exception:
+        rec["env"] = {"host": socket.gethostname()}
+
+    if cfg is not None:
+        try:
+            ev = cfg.eval
+            rec["eval"] = {
+                "conditions": _plain(ev.get("conditions", None)),
+                "lambda_scale": _plain(ev.get("lambda_scale", None)),
+                "num_designs": _plain(ev.get("num_designs", None)),
+                "length": _plain(ev.get("length", None)),
+                "seed": _plain(ev.get("seed", None)),
+                # ⭐ `seeds` and `motif`, added 2026-09-15, both load-bearing and both previously absent.
+                # `seeds`: under the K=1 convention a design's identity IS its seed (dev plan/100), so a
+                # record with `num_designs: 1` and no seed list does not say how many designs ran.
+                # `motif`: its absence made a reader conclude that a hard⊕soft run pinned NO motif
+                # (dev results/55 §4.3). It pins one; this block simply never echoed it. With a motif
+                # active, `length` above is inert because generate.py takes the length from the contig,
+                # which is a second thing this record could not previously show.
+                "seeds": _plain(ev.get("seeds", None)),
+                "motif": _plain(ev.get("motif", None)),
+                # The derived sample size, named and recorded 2026-09-15 (dev plan/100 §1).
+                "draws_per_cell": _draws_per_cell(ev),
+                "out_dir": str(ev.get("out_dir", "")),
+            }
+            rec["sampler_requested"] = {k: _plain(ev.get(k, None))
+                                        for k in ("num_timesteps", "gamma_0", "step_scale")}
+            # Which BUILD made this. Without it the deterministic and stock builds are
+            # indistinguishable after the fact, and they differ by up to 2.469 A at the same seed
+            # (dev plan/91 §1.2). `requested` is the config; `active` is what actually got patched.
+            try:
+                from .determinism import state as _det_state
+                rec["determinism"] = {"requested": _plain(ev.get("deterministic", False)),
+                                      **_det_state()}
+            except Exception:
+                pass
+            # `batch_size` added 2026-11-15 (dev plan/159b §3.4): it is results-affecting and part of the
+            # reproducibility identity (dev plan/159a §2.3), not a throughput knob.
+            rec["proteinmpnn"] = {k: _plain(ev.proteinmpnn.get(k, None))
+                                  for k in ("seed", "num_seqs", "sampling_temp", "batch_size")} \
+                if ev.get("proteinmpnn", None) is not None else None
+            # The REFOLD stage's oracle identity. Recorded because its ABSENCE is indistinguishable
+            # from its being off: queue row 25 generated deterministically and refolded on STOCK
+            # OpenFold3 for 15 h 57 m while being labelled contract v2, and nothing logged, because
+            # an unset opt-in is byte-identical to a chosen opt-out (root CLAUDE.md, 2026-09-18).
+            # Measured again on row 37 (dev results/73 §0): this record carried RFD3's determinism
+            # and NOTHING for OpenFold3, so contract v3 and MSA-free both had to be recovered from a
+            # subprocess log. `of3_contract()` was written for exactly this and was called by nobody.
+            # ⛔ `deterministic_requested` IS THE CONFIG, NOT THE OUTCOME, and the two can differ:
+            # OF3Refolder resolves None -> deterministic but STANDS DOWN for bs>1 at runtime
+            # (openfold3.py:115-131), and the shim is a SUBPROCESS, so no in-process state can report
+            # what it did. => named `_requested` to match the RFD3 block above, which pairs its own
+            # `requested` with a `_det_state()` the refolder has no equivalent of. To prove EFFECT,
+            # read the shim's `CONTRACT` banner from `<out_dir>/of3_batch/of3_subprocess.log`.
+            # ⚠️ `contract` is what the shim WOULD apply, so it is null when determinism is declined,
+            # never 0: unknown and off are different answers (dev plan/101 §6).
+            try:
+                _fw = ev.get("flywheel", None)
+                _rf = _fw.get("refolder", None) if _fw is not None else None
+            except Exception:
+                _rf = None
+            if _rf is not None:
+                try:
+                    from .openfold3 import OF3Refolder
+                    _req = _plain(_rf.get("deterministic", None))
+                    rec["openfold3"] = {
+                        "refolder": _plain(_rf.get("_target_", None)),
+                        "deterministic_requested": _req,
+                        # None means "take the refolder's default", which IS deterministic.
+                        "deterministic_default_applies": _req is None,
+                        "contract": None if _req is False else OF3Refolder.of3_contract(),
+                        # `contract_applied` is the EFFECT, read from the subprocess CONTRACT banner by
+                        # `write()` when the log already exists (refold-only re-runs); None here otherwise,
+                        # resolved loader-side (dev plan/159b §3.4/§5). `contract` above is only intent.
+                        "contract_applied": None,
+                        "runner_yaml": _plain(_rf.get("runner_yaml", None)),
+                        "use_msa_server": _plain(_rf.get("use_msa_server", None)),
+                        # `batch_size` (bs): results-affecting QUERY batch, part of the reproducibility
+                        # identity (dev plan/159a §2.3); not the same knob as RFD3's K (dev plan/100 §9).
+                        "batch_size": _plain(_rf.get("batch_size", None)),
+                        "num_diffusion_samples": _plain(_rf.get("num_diffusion_samples", None)),
+                        "ckpt": _file_id(_rf.get("ckpt_path", None))
+                        if _rf.get("ckpt_path", None) else None,
+                    }
+                except Exception as exc:
+                    rec["anomalies"].append(
+                        f"openfold3 capture failed: {type(exc).__name__}: {exc}")
+            rec["checkpoint"] = _file_id(ev.get("ckpt", None)) if ev.get("ckpt", None) else None
+            try:
+                rec["rfd3_ckpt"] = _file_id(cfg.paths.rfd3_ckpt)
+            except Exception:
+                pass
+            splits_root = None
+            try:
+                splits_root = cfg.data.get("splits_root", None)
+            except Exception:
+                pass
+            if prompts is None:
+                prompts = [p for p in (ev.get("prompt_pdb", None), ev.get("prompt_cache", None)) if p]
+            rec["prompts"] = [describe_prompt(p, splits_root) for p in (prompts or [])]
+        except Exception as exc:  # config shapes vary across drivers; record rather than fail
+            rec["anomalies"].append(f"config capture partial: {type(exc).__name__}: {exc}")
+    elif prompts:
+        rec["prompts"] = [describe_prompt(p) for p in prompts]
+
+    if cfg is not None:
+        try:
+            cond = describe_conditioning(cfg)
+            if cond:
+                rec["conditioning"] = cond
+                # Surfaced as an anomaly too, not because it is wrong, but because `anomalies` is the
+                # field a reader actually reads. A scope limit nobody notices is a scope limit that
+                # gets over-read later.
+                rec["anomalies"].append(
+                    "LIGAND TOKENS STEERED: uniform lambda applied to the ligand's own tokens; this "
+                    "run does NOT isolate the ligand channel (deliberate; dev plan/90 5.0b route c)."
+                )
+        except Exception as exc:
+            rec["anomalies"].append(f"conditioning capture failed: {type(exc).__name__}: {exc}")
+
+    # SPA conditioning block (dev plan/159b): an explicit block (drivers that arm in Python) wins; else
+    # derive it from cfg for the main generate.py path. Best-effort; a failure records an anomaly only.
+    try:
+        block = spa_conditioning if spa_conditioning is not None else (
+            describe_spa_conditioning(cfg) if cfg is not None else None)
+        if block:
+            rec["spa_conditioning"] = _plain(block)
+    except Exception as exc:
+        rec["anomalies"].append(f"spa_conditioning capture failed: {type(exc).__name__}: {exc}")
+
+    not_heldout = [p["id"] for p in rec.get("prompts", []) if p.get("split") not in (None, "test")]
+    if not_heldout:
+        rec["anomalies"].append(
+            "PROMPTS NOT HELD OUT: " + ", ".join(f"{p['id']}={p['split']}"
+                                                 for p in rec["prompts"]
+                                                 if p.get("split") not in (None, "test")))
+    if extra:
+        rec["extra"] = _plain(extra)
+    return rec
+
+
+def _draws_per_cell(ev) -> int | None:
+    """``|distinct(eval.seeds ?? [eval.seed])| * eval.num_designs``, or ``None`` if unreadable.
+
+    WHY THIS EXISTS. ``K`` (``num_designs``) is the diffusion BATCH and part of the reproducibility
+    identity; the number of designs one ``(condition, lambda)`` cell actually contributes is this
+    product, and it is the statistical n behind every rate and Fisher test in the results docs. It had
+    no name and no recorded field, so specs borrowed the letter K for it: dev ``plan/107`` shipped
+    saying "K=16" for a run whose K is 1. Definition: dev ``plan/100`` section 1.
+
+    ``_normalize_seeds`` is imported from the generator rather than reimplemented, because it DROPS
+    duplicate seeds; counting the raw list would overstate the draws. The import is deferred since
+    ``generate`` imports this module at load time.
+    """
+    try:
+        from .generate import _normalize_seeds
+        k = ev.get("num_designs", None)
+        if k is None:
+            return None
+        return len(_normalize_seeds(ev)) * int(k)
+    except Exception:
+        return None
+
+
+def _plain(v):
+    """OmegaConf containers and Paths to plain JSON-able values."""
+    try:
+        from omegaconf import OmegaConf
+        if OmegaConf.is_config(v):
+            return OmegaConf.to_container(v, resolve=True)
+    except Exception:
+        pass
+    if isinstance(v, Path):
+        return str(v)
+    if isinstance(v, dict):
+        return {k: _plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_plain(x) for x in v]
+    return v
+
+
+def of3_contract_applied(out_dir) -> int | None:
+    """The OF3 determinism contract the shim ACTUALLY applied, read from the subprocess CONTRACT banner
+    (``<out_dir>/of3_batch/of3_subprocess.log``), as an int, or None when the log is absent (the provenance
+    write usually PRECEDES the refold, dev plan/159b §3.4) or the shim stood down (stock).
+
+    ⚠️ Anchored on the ``[of3_determinism_patch] contract v{N}`` banner line (of3_determinism_patch.py:183),
+    NOT a bare ``contract v\\d`` — the same file prints a warning line containing "contract v1 or v2" that
+    a loose pattern would false-match. Best-effort; never raises.
+    """
+    try:
+        log = Path(str(out_dir)) / "of3_batch" / "of3_subprocess.log"
+        if not log.is_file():
+            return None
+        import re
+        m = re.search(r"\[of3_determinism_patch\]\s+contract\s+v(\d+)", log.read_text(errors="ignore"))
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def write(out_dir, cfg=None, **kw) -> str | None:
+    """Write ``RUN_PROVENANCE.json`` into ``out_dir``. Returns the path, or None on failure.
+
+    Never raises: a provenance failure must not kill a run that has already spent GPU time. If the
+    file exists (a multi-stage run writing into one directory), numbered siblings are added rather
+    than overwriting, because the earlier stage's record is not redundant.
+    """
+    try:
+        d = Path(str(out_dir))
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / FILENAME
+        n = 1
+        while path.exists():
+            path = d / f"{Path(FILENAME).stem}.{n}.json"
+            n += 1
+        rec = collect(cfg, **kw)
+        # The APPLIED OF3 contract (effect), if the refold already ran so its banner exists (refold-only
+        # re-runs write provenance post-refold). None otherwise -> resolved loader-side (dev plan/159b §5).
+        try:
+            if isinstance(rec.get("openfold3"), dict):
+                ca = of3_contract_applied(out_dir)
+                if ca is not None:
+                    rec["openfold3"]["contract_applied"] = ca
+        except Exception:
+            pass
+        path.write_text(json.dumps(rec, indent=2, default=str))
+        warn = [a for a in rec.get("anomalies", []) if a.startswith("PROMPTS NOT HELD OUT")]
+        for w in warn:
+            print(f"[provenance] ⚠️  {w}")
+        print(f"[provenance] wrote {path}")
+        return str(path)
+    except Exception as exc:
+        print(f"[provenance] WARNING: could not write provenance ({type(exc).__name__}: {exc})")
+        return None

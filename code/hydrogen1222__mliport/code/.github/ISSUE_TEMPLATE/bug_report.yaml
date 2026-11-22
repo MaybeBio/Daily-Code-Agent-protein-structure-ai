@@ -1,0 +1,70 @@
+name: Bug report
+description: Report a problem with mliport
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report. Please include
+        the output of `mliport doctor --engine <your-engine>` if possible.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What went wrong?
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      description: Which MLIP engine are you using?
+      options:
+        - UMA (fairchem)
+        - MACE
+        - DPA (DeepMD)
+        - GRACE
+    validations:
+      required: true
+  - type: input
+    id: mliport-version
+    attributes:
+      label: mliport version
+      placeholder: e.g. 2.0.0
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: e.g. 3.12
+    validations:
+      required: true
+  - type: input
+    id: framework
+    attributes:
+      label: Backend framework version
+      description: torch / tensorflow / fairchem-core version
+      placeholder: e.g. torch 2.8.0+cu126
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: e.g. NVIDIA V100, RTX 4090
+  - type: input
+    id: driver
+    attributes:
+      label: NVIDIA driver
+      placeholder: e.g. 580.173.02
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Command(s) that trigger the bug
+      render: bash
+  - type: textarea
+    id: doctor
+    attributes:
+      label: mliport doctor output
+      description: Please paste `mliport doctor --engine <your-engine>` output
+      render: text

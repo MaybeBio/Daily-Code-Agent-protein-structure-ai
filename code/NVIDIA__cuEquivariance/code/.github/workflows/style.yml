@@ -1,0 +1,28 @@
+name: Run Style Check (Pre-commit)
+
+on:
+  push:
+    branches: [ "main", "release" ]
+  pull_request:
+    branches: [ "main", "release" ]
+
+
+jobs:
+  style:
+
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/setup-python-uv
+      with:
+        python-version: "3.12"
+    - name: Setup Pre-commit
+      run: |
+        uv pip install pre-commit
+        pre-commit install
+    - name: Run Pre-commit
+      run: |
+        pre-commit run --all-files

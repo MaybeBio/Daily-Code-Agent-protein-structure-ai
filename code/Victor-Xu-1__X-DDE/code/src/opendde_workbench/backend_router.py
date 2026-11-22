@@ -1,0 +1,297 @@
+"""One trusted routing authority for start, cancellation and restart recovery.
+
+Capabilities describe scientific operations. Engines choose the scientific implementation.
+Execution backends own process/container lifecycle. The existing Store remains task authority.
+"""
+
+import asyncio
+import json
+import logging
+import os
+from collections.abc import Awaitable
+
+from . import harness_process, local_process
+from .admet.backend import AdmetBackend
+from .antibodies.backend import AntibodyBackend
+from .chemistry.backend import ChemistryBackend
+from .datasets.backend import DatasetBackend
+from .datasets.contract import DatasetTask
+from .diffsbdd.runtime import configuration
+from .diffsbdd.runtime import readiness as diff_readiness
+from .discovery.backend import DiscoveryBackend
+from .docking.backend import DockingBackend
+from .engine import DockerEngine
+from .engine_registry import engine_for
+from .execution_environment import capture as capture_environment
+from .humanization.backend import HumanizationBackend
+from .integrations.backend import ScientificBackend
+from .integrations.runtime import readiness as scientific_readiness
+from .integrations.specs import PROGRAMS
+from .pockets.backend import PocketBackend
+from .quality.backend import QualityBackend
+from .receptors.backend import ReceptorBackend
+from .space.backend import SpaceBackend
+from .store import Store
+
+
+class BackendRouter:
+    def __init__(self, settings):
+        self.settings = settings
+        self.admission = None
+        self.store = Store(settings.state_dir / "jobs.sqlite3")
+        self.opendde = DockerEngine(settings)
+        self.pockets = PocketBackend(settings)
+        self.docking = DockingBackend(settings)
+        self.chemistry = ChemistryBackend(settings)
+        self.datasets = DatasetBackend(settings)
+        self.biopython = ReceptorBackend(settings)
+        self.caver = SpaceBackend(settings)
+        self.discovery = DiscoveryBackend(settings)
+        self.anarcii = AntibodyBackend(settings)
+        self.posebusters = QualityBackend(settings)
+        self.admet = AdmetBackend(settings)
+        self.sapiens = HumanizationBackend(settings)
+        self.scientific = {
+            key: ScientificBackend(settings, key)
+            for key in PROGRAMS
+            if key not in {"drugclip", "deli"}
+        }
+
+    async def start(self, job, directory):
+        if self.admission and (reason := self.admission(job)):
+            raise RuntimeError(reason)
+        implementation = engine_for(job.request.operation).id
+        if implementation not in self.scientific and implementation not in {
+            "opendde",
+            "diffsbdd",
+            "harness",
+            "p2rank",
+            "gnina",
+            "chemistry",
+            "biopython",
+            "caver",
+            "discovery",
+            "anarcii",
+            "posebusters",
+            "admet",
+            "sapiens",
+            "drugclip",
+            "deli",
+        }:
+            raise ValueError("No execution adapter for registered engine: " + implementation)
+        environment = capture_environment(self.settings, implementation)
+        self.store.bind_environment(job.id, environment)
+        (directory / "environment.json").write_text(environment.model_dump_json(), encoding="utf-8")
+        if isinstance(job.request, DatasetTask):
+            return await self.datasets.start(job, directory)
+        if implementation in self.scientific:
+            return await self.scientific[implementation].start(job, directory)
+        if implementation == "sapiens":
+            return await self.sapiens.start(job, directory)
+        if implementation == "admet":
+            return await self.admet.start(job, directory)
+        if implementation == "posebusters":
+            return await self.posebusters.start(job, directory)
+        if implementation == "anarcii":
+            return await self.anarcii.start(job, directory)
+        if implementation == "discovery":
+            return await self.discovery.start(job, directory)
+        if implementation == "caver":
+            return await self.caver.start(job, directory)
+        if implementation == "biopython":
+            return await self.biopython.start(job, directory)
+        if implementation == "chemistry":
+            return await self.chemistry.start(job, directory)
+        if implementation == "gnina":
+            return await self.docking.start(job, directory)
+        if implementation == "p2rank":
+            return await self.pockets.start(job, directory)
+        if implementation == "harness":
+            return await harness_process.start(self.settings, directory)
+        if implementation == "diffsbdd":
+            python, source, root = configuration(self.settings)
+            from .diffsbdd.snapshot import capture
+
+            runner, adapter_digests = capture(directory)
+            # Scientific software never inherits model-provider or compute-service secrets.
+            env = {
+                key: value
+                for key, value in os.environ.items()
+                if key in {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "CUDA_VISIBLE_DEVICES"}
+            }
+            env.update(
+                XDDE_DIFFSBDD_SOURCE=str(source),
+                XDDE_DIFFSBDD_HOME=str(root),
+                XDDE_DIFFSBDD_MANIFEST_SHA256=self.settings.diffsbdd_manifest_sha256,
+                PYTHONUNBUFFERED="1",
+                PYTHONDONTWRITEBYTECODE="1",
+                WANDB_MODE="disabled",
+                OMP_NUM_THREADS="2",
+                MKL_NUM_THREADS="2",
+            )
+            (directory / "execution.json").write_text(
+                json.dumps(
+                    {
+                        "engine": "diffsbdd",
+                        "core_verification": "rdkit_fixed_core_v1",
+                        "adapter_sha256": adapter_digests,
+                        "environment_snapshot_sha256": environment.snapshot_sha256,
+                        "backend": "local_process",
+                        "source": str(source),
+                        "runtime": str(root),
+                        "manifest_sha256": self.settings.diffsbdd_manifest_sha256,
+                    }
+                )
+            )
+            from .local_scope import ScopeLimits
+
+            return await local_process.start(
+                python,
+                runner,
+                directory,
+                env,
+                limits=ScopeLimits(runtime_seconds=self.settings.job_timeout),
+            )
+        if implementation == "opendde":
+            return await self.opendde.start(job, directory)
+        raise ValueError("No execution adapter for registered engine: " + implementation)
+
+    async def stop(self, job_id):
+        # Never route using request.json: task directories contain untrusted scientific outputs.
+        job = self.store.get(job_id)
+        if job is None:
+            raise RuntimeError("Cannot recover a process without its persisted task request.")
+        directory = self.settings.state_dir / "jobs" / job.id
+        environment = self.store.environment(job.id)
+        implementation = (
+            environment.specification.scientific_software
+            if environment
+            else engine_for(job.request.operation).id
+        )
+        if isinstance(job.request, DatasetTask):
+            await self.datasets.stop(job.id, directory)
+        elif implementation in self.scientific:
+            await self.scientific[implementation].stop(job.id, directory)
+        elif implementation == "sapiens":
+            await self.sapiens.stop(job.id, directory)
+        elif implementation == "admet":
+            await self.admet.stop(job.id, directory)
+        elif implementation == "posebusters":
+            await self.posebusters.stop(job.id, directory)
+        elif implementation == "anarcii":
+            await self.anarcii.stop(job.id, directory)
+        elif implementation == "discovery":
+            await self.discovery.stop(job.id, directory)
+        elif implementation == "caver":
+            await self.caver.stop(job.id, directory)
+        elif implementation == "biopython":
+            await self.biopython.stop(job.id, directory)
+        elif implementation == "chemistry":
+            await self.chemistry.stop(job.id, directory)
+        elif implementation == "gnina":
+            await self.docking.stop(job.id, directory)
+        elif implementation == "p2rank":
+            await self.pockets.stop(job.id, directory)
+        elif implementation == "harness":
+            await harness_process.stop(self.settings, directory)
+        elif implementation == "diffsbdd":
+            await local_process.stop(directory / "adapter/runner.py", directory)
+        elif implementation == "opendde":
+            await self.opendde.stop(job_id)
+        else:
+            raise ValueError("No execution adapter for registered engine: " + implementation)
+
+    async def retained_pause(self, job):
+        implementation = engine_for(job.request.operation).id
+        if implementation not in self.scientific:
+            return False
+        from .native_pause import retained_pause
+
+        return await retained_pause(
+            implementation, job.id, self.settings.state_dir / "jobs" / job.id
+        )
+
+    async def readiness(self):
+        # Preserve the existing OpenDDE health contract; expose other engines independently.
+        (
+            opendde,
+            diff,
+            pockets,
+            docking,
+            chemistry,
+            biopython,
+            anarcii,
+            quality,
+            admet,
+            sapiens,
+        ) = await asyncio.gather(
+            self._checked_readiness("opendde", self.opendde.readiness()),
+            self._checked_readiness("diffsbdd", asyncio.to_thread(diff_readiness, self.settings)),
+            self._checked_readiness("p2rank", self.pockets.readiness()),
+            self._checked_readiness("gnina", self.docking.readiness()),
+            self._checked_readiness("chemistry", self.chemistry.readiness()),
+            self._checked_readiness("biopython", self.biopython.readiness()),
+            self._checked_readiness("anarcii", self.anarcii.readiness()),
+            self._checked_readiness("posebusters", self.posebusters.readiness()),
+            self._checked_readiness("admet", self.admet.readiness()),
+            self._checked_readiness("sapiens", self.sapiens.readiness()),
+        )
+        client_present = bool(
+            self.settings.harness_python and self.settings.harness_python.is_file()
+        )
+        harness = {
+            "ready": client_present,
+            "reason": None
+            if client_present
+            else "Configure the native Harness interpreter, then restart X-DDE.",
+            "compute_configured": bool(self.settings.harness_url),
+        }
+        scientific_states = await asyncio.gather(
+            *(
+                self._checked_readiness(
+                    key,
+                    self.scientific[key].readiness()
+                    if key in self.scientific
+                    else scientific_readiness(self.settings, key),
+                )
+                for key in PROGRAMS
+            )
+        )
+        return {
+            **opendde,
+            "backends": {
+                **dict(zip(PROGRAMS, scientific_states, strict=True)),
+                "opendde": opendde,
+                "diffsbdd": diff,
+                "harness": harness,
+                "p2rank": pockets,
+                "gnina": docking,
+                "chemistry": chemistry,
+                "biopython": biopython,
+                "caver": await self._checked_readiness("caver", self.caver.readiness()),
+                "anarcii": anarcii,
+                "posebusters": quality,
+                "admet": admet,
+                "sapiens": sapiens,
+                "discovery": await self.discovery.readiness(),
+            },
+        }
+
+    async def _checked_readiness(self, identifier: str, check: Awaitable[dict]) -> dict:
+        try:
+            result = await check
+            if not isinstance(result, dict):
+                raise ValueError("Engine returned an invalid runtime status.")
+            return result
+        except Exception as exc:
+            # Diagnostics identify the failing adapter without exposing provider/config secrets.
+            logging.getLogger(__name__).warning(
+                "Scientific runtime check failed: engine=%s error_type=%s",
+                identifier,
+                type(exc).__name__,
+            )
+            return {
+                "ready": False,
+                "gpu": None,
+                "reason": "Engine runtime check failed. Check installation and X-DDE logs.",
+            }

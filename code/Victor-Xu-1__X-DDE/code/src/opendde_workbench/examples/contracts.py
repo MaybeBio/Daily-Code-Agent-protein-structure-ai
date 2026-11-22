@@ -1,0 +1,138 @@
+from typing import Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from ..assets import Asset
+from ..research.contracts import ScientificObject
+
+
+class ExampleModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class SourceFile(ExampleModel):
+    key: str
+    name: str
+    url: str
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    bytes: int = Field(ge=1, le=64 * 1024**2)
+    kind: Literal[
+        "structure", "ligand", "sequences", "config", "library", "counts", "reads", "measurements"
+    ]
+    license: Literal[
+        "CC0-1.0", "CC-BY-SA-3.0", "CC-BY-3.0-US", "MIT", "CC-BY-4.0", "LicenseRef-User-Provided"
+    ]
+
+    @model_validator(mode="after")
+    def bounded_public_input(self):
+        if self.kind not in {"counts", "reads", "library"} and self.bytes > 8 * 1024**2:
+            raise ValueError("Public structure and configuration examples remain limited to 8 MiB.")
+        return self
+
+
+class CaseStudy(ExampleModel):
+    id: str
+    revision: int = Field(ge=1)
+    label: tuple[str, str]
+    description: tuple[str, str]
+    files: tuple[str, ...]
+    sources: tuple[str, ...]
+    evidence_entities: dict[str, dict[str, str]] = Field(default_factory=dict)
+
+
+class ModuleExample(ExampleModel):
+    case_id: str
+    capability_id: str
+    revision: int = Field(ge=1)
+    pinned_run_required: bool
+    parent_capability: str | None = None
+
+
+class PreparedExample(ExampleModel):
+    module: ModuleExample
+    case: CaseStudy
+    objects: dict[str, ScientificObject]
+    data_assets: dict[str, Asset] = Field(default_factory=dict)
+    sequences: dict[str, str]
+    sequence_sources: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    sources: tuple[str, ...]
+    request: dict | None = None
+    workflow_plan: dict | None = None
+    record: dict | None = None
+    source_record: dict | None = None
+    campaign_draft: dict | None = None
+    study: dict | None = None
+    evidence_draft: dict | None = None
+
+
+class ExampleReview(ExampleModel):
+    scope: Literal["reviewed_computational_example"] = "reviewed_computational_example"
+    interpretation: str = Field(min_length=20, max_length=2000)
+    limitations: str = Field(min_length=20, max_length=2000)
+    checked: tuple[
+        Literal["input_identity", "method_scope", "native_outputs", "visual_preview", "downloads"],
+        ...,
+    ] = Field(min_length=5, max_length=5)
+
+    @model_validator(mode="after")
+    def complete_review(self):
+        if len(set(self.checked)) != 5 or any(
+            not text.strip() or any(ord(c) < 32 and c not in "\n\t" for c in text)
+            for text in (self.interpretation, self.limitations)
+        ):
+            raise ValueError(
+                "Review the input, method, native output, preview and downloads explicitly."
+            )
+        return self
+
+
+class PinRequest(ExampleModel):
+    job_id: UUID
+    review: ExampleReview | None = None
+    initial_candidate_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,80}$")
+    supporting_job_ids: tuple[UUID, ...] = Field(default=(), max_length=8)
+
+
+class JobEvidence(ExampleModel):
+    job_id: UUID
+    request_sha256: str
+    environment_sha256: str
+    artifact_sha256: dict[str, str]
+
+
+class ExamplePin(ExampleModel):
+    capability_id: str
+    case_id: str
+    revision: int
+    job_id: UUID
+    request_sha256: str
+    environment_sha256: str
+    artifact_sha256: dict[str, str]
+    created_at: str
+    review: ExampleReview | None = None
+    initial_candidate_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,80}$")
+    supporting_evidence: tuple[JobEvidence, ...] = Field(default=(), max_length=8)
+
+
+class RecordPinRequest(ExampleModel):
+    record_id: UUID
+    run_id: UUID | None = None
+    review: ExampleReview | None = None
+    supporting_job_ids: tuple[UUID, ...] = Field(default=(), max_length=8)
+
+
+class ExampleRecordPin(ExampleModel):
+    capability_id: Literal[
+        "regions", "workflows", "pose_exploration", "campaign", "experimental.evidence"
+    ]
+    case_id: str
+    revision: int
+    record_id: UUID
+    record_sha256: str
+    run_id: UUID | None = None
+    evidence: tuple[JobEvidence, ...]
+    computed_result_available: bool
+    created_at: str
+    review: ExampleReview | None = None
+    supporting_evidence: tuple[JobEvidence, ...] = Field(default=(), max_length=8)

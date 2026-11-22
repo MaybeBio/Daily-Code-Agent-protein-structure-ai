@@ -1,0 +1,81 @@
+[project]
+name = "deepfold3"
+version = "0.1.0"
+description = "DeepFold 3: Biomolecular Complex Structure Prediction"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.3.1",
+    "gemmi>=0.7.4",
+    "numpy>=2.4.2",
+    "pdbeccdutils>=1.0.0",
+    "rdkit>=2025.9.4",
+    "torch>=2.11.0",
+    "tqdm>=4.67.3",
+    "safetensors>=0.5.2",
+    "zstandard>=0.25.0",
+    "matplotlib>=3.10.8",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.8.0",
+    "wandb>=0.26.0",
+    "msgspec>=0.21.1",
+]
+
+[project.scripts]
+deepfold3 = "deepfold3.scripts:cli"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["deepfold3"]
+
+[dependency-groups]
+dev = [
+    "jax[cpu]>=0.4.30",
+    "pytest>=9.0.0",
+    "pytest-timeout>=2.3.0",
+    "ruff>=0.9.4",
+]
+optim = ["triton>=3.0.0"]
+# NVIDIA proprietary license; stays optional. Serves --optim inference-cueq.
+cueq = ["cuequivariance-torch>=0.13.0", "cuequivariance-ops-torch-cu13>=0.13.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "network: marks tests that require network access",
+]
+timeout = 60
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+exclude = [
+    ".git",
+    ".ruff_cache",
+    ".venv",
+    "__pypackages__",
+    "dist",
+    "build",
+    "docs",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "UP", # pyupgrade
+]
+ignore = ["E501"] # line too long, handled by ruff format
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

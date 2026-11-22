@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+navigation:
+  - section: Get Started
+    skip-slug: true
+    contents:
+      - page: Overview
+        path: ../docs/overview.mdx
+        slug: overview
+      - page: Installation
+        path: ../docs/install.md
+        slug: install
+      - page: Quickstart
+        path: ../docs/quickstart.md
+        slug: quickstart
+  - section: Documentation
+    slug: references
+    contents:
+      - section: Inference Runtime
+        skip-slug: true
+        collapsed: true
+        contents:
+          - page: Architecture
+            path: ../docs/ref/architecture.md
+          - page: Sampling
+            path: ../docs/ref/sampling.md
+          - page: RFProteína Architecture
+            path: ../docs/ref/rfproteina.md
+            slug: rfproteina
+          - page: Support Matrix
+            path: ../docs/ref/support-matrix.md
+          - page: Model Weights
+            path: ../docs/ref/model-weights.md
+          - page: Configuration
+            path: ../docs/ref/config.md
+            slug: config
+          - page: Token Padding
+            path: ../docs/ref/token-padding.md
+            slug: token-padding
+          - page: Custom Structure Oracles
+            path: ../docs/ref/oracles.md
+            slug: oracles
+      - section: Performance and Scaling
+        skip-slug: true
+        collapsed: true
+        contents:
+          - page: Ray Quickstart
+            path: ../docs/ray.md
+            slug: ray
+          - page: Benchmarks
+            path: ../docs/ref/benchmark.md
+            slug: benchmark
+      - section: API Reference
+        skip-slug: true
+        collapsed: true
+        contents:
+          - page: Python API
+            path: ../docs/ref/api.md
+            slug: api
+      - section: Advanced Guides
+        skip-slug: true
+        collapsed: true
+        contents:
+          - page: Port a Model to BioIR
+            path: ../docs/advanced/port-model.md
+            slug: port-model
+          - page: Accelerate a Custom Model
+            path: ../docs/advanced/accelerate-custom-model.md
+            slug: accelerate-custom-model
+          - page: Design Proteins with RFProteína
+            path: ../docs/advanced/design-with-rfproteina.md
+            slug: design-with-rfproteina
+          - page: Port a Data Pipeline
+            path: ../docs/advanced/port-data-pipeline.md
+            slug: port-data-pipeline
+          - page: Validate a Ported Pipeline
+            path: ../docs/advanced/validate-data-pipeline.md
+            slug: validate-data-pipeline
+      - section: Developer Reference
+        skip-slug: true
+        collapsed: true
+        contents:
+          - page: Development Workflow
+            path: ../docs/dev.md
+            slug: dev
+          - page: Docker Images
+            path: ../docs/ref/docker-images.md
+          - page: Coding Guidelines
+            path: ../docs/coding.md
+            slug: coding
+          - page: Collecting system information
+            path: ../docs/ref/system-information.md
+            slug: system-information
+          - page: GPU Stack
+            path: ../docs/ref/gpu-stack.md
+            slug: gpu-stack
+  - section: Release Notes
+    slug: release-notes
+    contents:
+      - page: All releases
+        path: ../docs/release-notes/index.md
+        slug: overview
+      # bioir:release-note-pages
+  - section: Community
+    slug: community
+    contents:
+      - page: Contributing
+        path: ../docs/contributing.md
+      - page: Code of Conduct
+        path: ../docs/CODE_OF_CONDUCT.md
+        slug: code-of-conduct
+      - page: Security Policy
+        path: ../docs/SECURITY.md
+        slug: security

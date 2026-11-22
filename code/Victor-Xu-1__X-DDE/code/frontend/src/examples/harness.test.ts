@@ -1,0 +1,189 @@
+import { describe, expect, it } from "vitest";
+import { exampleHarnessInputs, exampleHarnessPayload } from "./harness";
+import type { PreparedExample } from "./types";
+import type { ScientificObject } from "../research/types";
+
+const heavy = "EVQLVESGG";
+const light = "DIQMTQSPSS";
+function object(id: string): ScientificObject {
+  return {
+    id,
+    family_id: id,
+    kind: "structure",
+    label: "Protocol fixture",
+    reference: {
+      asset_id: id,
+      sha256: "a".repeat(64),
+      record: 0,
+      conformer: 0,
+      version_id: id,
+    },
+    parent_id: null,
+    relation: "derived_from",
+    notes: "Protocol fixture, not a published research case",
+    rating: 0,
+    source_job: null,
+    created_at: "2026-10-02",
+    validation: "file_integrity_only",
+  };
+}
+const structure = object("00000000-0000-4000-8000-000000000001");
+const unused = object("00000000-0000-4000-8000-000000000002");
+const fasta = {
+  ...object("00000000-0000-4000-8000-000000000003"),
+  kind: "sequence" as const,
+};
+const example: PreparedExample = {
+  module: {
+    capability_id: "epitope",
+    case_id: "trastuzumab-her2",
+    revision: 1,
+  },
+  case: {
+    id: "trastuzumab-her2",
+    revision: 1,
+    label: ["Protocol fixture", "Protocol fixture"],
+    description: ["", ""],
+    sources: [],
+  },
+  objects: { her2: structure, her2_pertuzumab: unused, antibody_chains: fasta },
+  sequences: { heavy, light },
+  sequence_sources: { antibody_chains: [heavy, light] },
+  sources: [],
+};
+describe("native example input provenance", () => {
+  it("keeps pinned native structural input versions and removes them when the file selection changes", () => {
+    const pinned = {
+      ...example,
+      request: {
+        operation: "harness" as const,
+        tool: "rmsd",
+        name: "Protocol comparison",
+        payload: {
+          reference_path: `asset:${unused.reference.asset_id}`,
+          mobile_path: `asset:${structure.reference.asset_id}`,
+        },
+        scientific_inputs: [unused.reference, structure.reference],
+        allow_external: false,
+      },
+    };
+    const values = exampleHarnessInputs("rmsd", pinned.request.payload, pinned);
+    expect(values).toContainEqual(unused.reference);
+    expect(values).toContainEqual(structure.reference);
+    expect(
+      exampleHarnessInputs(
+        "rmsd",
+        { reference_path: `asset:${structure.reference.asset_id}` },
+        pinned,
+      ),
+    ).not.toContainEqual(unused.reference);
+  });
+  it("uses a real asset token and does not attach unused experimental structures", () => {
+    const payload = exampleHarnessPayload(
+      "epitope",
+      { cdr_regions: {} },
+      example,
+    );
+    expect(payload.structure_path).toBe(
+      `asset:${structure.reference.asset_id}`,
+    );
+    expect(exampleHarnessInputs("epitope", payload, example)).toEqual([
+      structure.reference,
+    ]);
+  });
+  it("attaches matching multichain FASTA provenance and drops it after editing", () => {
+    expect(
+      exampleHarnessInputs("esm", { sequences: [heavy, light] }, example),
+    ).toEqual([fasta.reference]);
+    expect(
+      exampleHarnessInputs("esm", { sequences: [heavy + "A", light] }, example),
+    ).toEqual([]);
+  });
+  it("keeps exact target and Fv FASTA sources when native chains carry MSA files", () => {
+    const target = "MKVLQEPTCVSDYMSISTCEWK";
+    const targetSource = {
+      ...object("00000000-0000-4000-8000-000000000004"),
+      kind: "sequence" as const,
+    };
+    const rich = {
+      ...example,
+      objects: { antibody_chains: fasta, target_sequence: targetSource },
+      sequence_sources: {
+        antibody_chains: [heavy, light],
+        target_sequence: [target],
+      },
+    };
+    const payload = {
+      candidates: [
+        {
+          candidate_id: "Fv",
+          chains: {
+            A: { sequence: heavy, unpairedMsaPath: `asset:${structure.id}` },
+            B: light,
+          },
+        },
+      ],
+      options: {
+        target_chains: {
+          C: { sequence: target, unpairedMsaPath: `asset:${unused.id}` },
+        },
+      },
+    };
+    const before = structuredClone(payload);
+    expect(exampleHarnessInputs("fold", payload, rich)).toEqual([
+      fasta.reference,
+      targetSource.reference,
+    ]);
+    payload.options.target_chains.C.sequence += "A";
+    expect(exampleHarnessInputs("fold", payload, rich)).toEqual([
+      fasta.reference,
+    ]);
+    payload.options.target_chains.C.sequence = target;
+    payload.candidates[0].chains.A.sequence += "A";
+    expect(exampleHarnessInputs("fold", payload, rich)).toEqual([
+      targetSource.reference,
+    ]);
+    expect(rich.sequence_sources).toEqual({
+      antibody_chains: [heavy, light],
+      target_sequence: [target],
+    });
+    expect(before.candidates[0].chains.A.sequence).toBe(heavy);
+  });
+  it("loads the immutable native request without changing its source record", () => {
+    const request = {
+      operation: "harness" as const,
+      tool: "esm2",
+      name: "Protocol",
+      payload: {
+        parent_chains: { B: heavy },
+        mutable_positions: { B: [2] },
+        num_sequences: 4,
+      },
+      allow_external: false,
+    };
+    const loaded = exampleHarnessPayload("esm2", {}, { ...example, request });
+    expect(loaded).toEqual(request.payload);
+    (loaded.mutable_positions as Record<string, number[]>).B.push(3);
+    expect(request.payload.mutable_positions.B).toEqual([2]);
+  });
+  it("uses the exact selected domain sequence source and detaches it after a sequence edit", () => {
+    const domain = {
+      ...example,
+      objects: { sh2_sequence: fasta, protein_sequence: unused },
+      sequence_sources: {
+        sh2_sequence: [heavy],
+        protein_sequence: [heavy + light],
+      },
+    };
+    expect(
+      exampleHarnessInputs("esm2", { parent_chains: { A: heavy } }, domain),
+    ).toEqual([fasta.reference]);
+    expect(
+      exampleHarnessInputs(
+        "esm2",
+        { parent_chains: { A: heavy + "A" } },
+        domain,
+      ),
+    ).toEqual([]);
+  });
+});

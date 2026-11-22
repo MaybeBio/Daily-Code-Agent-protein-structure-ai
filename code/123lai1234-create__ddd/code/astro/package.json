@@ -1,0 +1,34 @@
+{
+  "name": "astro",
+  "type": "module",
+  "version": "0.0.2",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "astro dev",
+    "prebuild": "echo 'prebuild skipped on Vercel (dist already committed)'",
+    "sync-frontend": "node scripts/sync_frontend.mjs && node scripts/convert_pages.mjs",
+    "build": "astro build && npx pagefind --site dist --output-path dist/pagefind",
+    "preview": "astro preview",
+    "mascot:stats": "node scripts/sync-mascot-stats.mjs",
+    "mascot:stats:check": "node scripts/sync-mascot-stats.mjs --check",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/react": "^4.2.1",
+    "@vercel/analytics": "^2.0.1",
+    "@vercel/og": "^0.6.5",
+    "animejs": "^4.5.0",
+    "astro": "^6.1.6",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "pagefind": "^1.3.0",
+    "three": "^0.160.0",
+    "typescript": "^5.7.3"
+  }
+}

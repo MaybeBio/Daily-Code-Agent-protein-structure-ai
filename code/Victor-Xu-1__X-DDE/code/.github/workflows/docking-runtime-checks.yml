@@ -1,0 +1,173 @@
+name: Docking input and CUDA runtime qualification
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: &docking_runtime_paths
+      - "src/opendde_workbench/docking/image.py"
+      - "src/opendde_workbench/deployment/docking_install.py"
+      - "src/opendde_workbench/deployment/locked_packages.py"
+      - "src/opendde_workbench/integrations/offline_context.py"
+      - "tests/test_locked_packages.py"
+      - "src/opendde_workbench/docking/native-requirements.*"
+      - "src/opendde_workbench/docking/receptor_input.py"
+      - "src/opendde_workbench/docking/native.py"
+      - "src/opendde_workbench/docking/chemistry.py"
+      - "src/opendde_workbench/docking/scoring.py"
+      - "src/opendde_workbench/datasets/native_docking.py"
+      - "src/opendde_workbench/datasets/backend.py"
+      - "src/opendde_workbench/docking/snapshot.py"
+      - "src/opendde_workbench/docking/reference*.py"
+      - "src/opendde_workbench/docking/result.py"
+      - "src/opendde_workbench/docking/flexible*.py"
+      - "src/opendde_workbench/docking/receptor_atoms.py"
+      - "src/opendde_workbench/docking/receptor_links.py"
+      - "src/opendde_workbench/docking/residue_geometry.py"
+      - "tests/test_flexible_receptor.py"
+      - "tests/test_receptor_metadata.py"
+      - "tests/fixtures/docking_metadata/**"
+      - "scripts/docking-refinement-scope.py"
+      - "tests/ci/test_docking_refinement_scope.py"
+      - "server_tests/flexible_receptor_probe.py"
+      - "server_tests/flexible_receptor_browser.py"
+      - "server_tests/flexible_receptor_questionnaire.py"
+      - "frontend/src/docking/FlexibleReceptor*"
+      - "frontend/src/docking/ReceptorRefinementSummary*"
+      - "frontend/src/docking/useReceptorRefinement*"
+      - ".github/workflows/docking-runtime-checks.yml"
+      - "frontend/src/docking/DockingReview*"
+      - "frontend/src/docking/ReferenceComparison*"
+      # Pose-table defaults have sealed native view/download coverage in pose-handoff-checks.yml.
+      - "frontend/src/docking/DockingJobReview.tsx"
+      - "frontend/src/docking/docking-job-request.ts"
+      - "server_tests/test_docking_job_review_browser.py"
+      - "frontend/src/docking/SearchPreview.test.tsx"
+      - "frontend/src/docking/SearchPreview.tsx"
+      - "frontend/src/docking/SearchRegion.tsx"
+      - "frontend/src/docking/docking-job-review.css"
+      - "frontend/src/docking/DockingForm*"
+      - "frontend/src/docking/types.ts"
+      - "frontend/src/docking/results.css"
+      - "src/opendde_workbench/assets.py"
+      # Shared attach/removal changes use native-container-checks.yml; they do not
+      # change GNINA science or require downloading and rerunning its model.
+      - "tests/test_docking_runtime_qualification.py"
+      - "tests/test_docking.py"
+      - "tests/test_docking_scoring.py"
+      - "tests/test_docking_reference.py"
+      - "server_tests/reference_geometry_checks.py"
+      - "server_tests/docking_scoring_checks.py"
+      - "server_tests/test_scientific_handoff.py"
+      - "server_tests/test_docking_serialization.py"
+      - "server_tests/docking_source_tools.py"
+      - "server_tests/docking_browser.py"
+      - "server_tests/test_native_docking.py"
+  pull_request:
+    paths: *docking_runtime_paths
+permissions:
+  contents: read
+concurrency:
+  group: docking-runtime-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+jobs:
+  scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      del_only: ${{ steps.change.outputs.del_only }}
+      docking_review_only: ${{ steps.prediction.outputs.docking_review_only }}
+      drafts_only: ${{ steps.prediction.outputs.drafts_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: change
+        env:
+          BASE: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: python3 scripts/del-ci-scope.py
+      - id: prediction
+        env:
+          BASE: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: python3 scripts/prediction-workspace-scope.py
+  docking-runtime:
+    needs: scope
+    if: needs.scope.outputs.del_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - name: Locked platform and direct docking result consumers
+        run: |
+          npm ci --prefix frontend
+          npm run build --prefix frontend
+          uv sync --locked --group dev --group browser
+      - name: Exact binding, source snapshot and runtime contracts
+        if: needs.scope.outputs.docking_review_only != 'true'
+        run: |
+          python3 -m unittest discover -s tests/ci -p test_docking_refinement_scope.py
+          uv run --locked ruff check server_tests/flexible_receptor_browser.py server_tests/flexible_receptor_questionnaire.py
+          uv run --locked python -c "import sys; sys.path.insert(0, 'server_tests'); import flexible_receptor_browser"
+          uv run --locked ruff check src/opendde_workbench/docking/flexible_contract.py src/opendde_workbench/docking/receptor_atoms.py src/opendde_workbench/docking/receptor_links.py src/opendde_workbench/docking/residue_geometry.py src/opendde_workbench/docking/flexible_receptor.py src/opendde_workbench/docking/flexible_validation.py server_tests/flexible_receptor_probe.py tests/test_flexible_receptor.py
+          uv run --locked ruff check tests/test_receptor_metadata.py
+          uv run --locked pytest -q tests/test_flexible_receptor.py tests/test_receptor_metadata.py
+          uv run --locked pytest -q tests/test_workflow_quality_binding.py
+          uv run --locked pytest -q tests/test_research_assets.py tests/test_result_metadata.py tests/test_input_catalog.py tests/test_example_pins.py tests/test_case_output_witnesses.py
+          uv run --locked ruff check src/opendde_workbench/docking/image.py src/opendde_workbench/docking/receptor_input.py src/opendde_workbench/docking/native.py src/opendde_workbench/docking/chemistry.py src/opendde_workbench/docking/scoring.py src/opendde_workbench/docking/snapshot.py src/opendde_workbench/docking/reference.py src/opendde_workbench/docking/reference_contract.py src/opendde_workbench/docking/result.py src/opendde_workbench/assets.py src/opendde_workbench/container_supervision.py tests/test_docking_scoring.py tests/test_docking_reference.py tests/test_docking_runtime_qualification.py tests/test_native_container_cleanup.py server_tests/reference_geometry_checks.py server_tests/docking_scoring_checks.py server_tests/test_native_docking.py
+          uv run --locked pytest -q tests/test_docking.py tests/test_docking_scoring.py tests/test_docking_reference.py tests/test_docking_runtime_qualification.py tests/test_native_container_cleanup.py tests/test_locked_packages.py tests/test_pose_minimization.py tests/test_pose_score_ranking.py
+          cd frontend
+          npx vitest run src/docking/FlexibleReceptorForm.test.tsx
+          npx vitest run src/docking/DockingResults.test.tsx src/docking/usePoseAssets.test.tsx src/docking/DockingForm.test.tsx src/docking/DockingReview.test.tsx src/docking/ReferenceComparison.test.tsx
+      - name: Direct source handoff with the real pinned chemical parser
+        if: needs.scope.outputs.docking_review_only != 'true'
+        env:
+          PYTHONPATH: src
+        run: >-
+          uv run --no-project --python 3.10
+          --with pytest==9.1.1 --with numpy==1.26.4 --with rdkit==2023.9.6
+          --with pydantic==2.13.5
+          python -m pytest -q
+          server_tests/test_scientific_handoff.py::test_property_handoff_selects_one_real_sdf_record
+          server_tests/test_scientific_handoff.py::test_docking_native_atom_labels_must_match_the_real_chemical_graph
+          server_tests/test_scientific_handoff.py::test_atom_map_identifiers_do_not_create_false_stereochemical_changes
+          server_tests/test_docking_serialization.py
+      - name: Actual isolated GNINA install, native CPU and CNN scoring modes
+        if: needs.scope.outputs.drafts_only != 'true' && needs.scope.outputs.docking_review_only != 'true'
+        env:
+          WB_TEST_NATIVE_DOCKING: "1"
+        run: |
+          sudo --non-interactive env GITHUB_ACTIONS="$GITHUB_ACTIONS" RUNNER_OS="$RUNNER_OS" python scripts/ci-browser-network.py
+          uv run --locked playwright install chromium --with-deps
+          uv run --locked pytest -x -q server_tests/test_native_docking.py
+      - name: Docking review controls and compiled STAT6 geometry without inference
+        if: needs.scope.outputs.docking_review_only == 'true'
+        run: |
+          uv run --locked ruff check src/opendde_workbench/asset_records.py src/opendde_workbench/chemistry/sdf_io.py tests/test_asset_record_download.py server_tests/test_docking_job_review_browser.py server_tests/docking_browser.py server_tests/flexible_receptor_browser.py server_tests/flexible_receptor_questionnaire.py
+          uv run --locked pytest -q tests/test_prediction_workspace_scope.py tests/test_pose_quality.py::test_raw_record_splitter_preserves_invalid_empty_and_eof_source_positions
+          (cd frontend && npx vitest run src/docking/DockingForm.test.tsx src/docking/DockingReview.test.tsx src/docking/FlexibleReceptorForm.test.tsx src/docking/SearchPreview.test.tsx src/viewer/search-box.test.ts)
+          uv run --locked playwright install chromium --with-deps
+          export WB_DOCKING_VISUAL_STATE="$RUNNER_TEMP/x-dde-docking-review-tools/state"
+          WB_HOME="$RUNNER_TEMP/x-dde-docking-review-tools" WB_STATE_DIR="$WB_DOCKING_VISUAL_STATE" \
+            uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked python -m pytest -q server_tests/test_docking_job_review_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always() && needs.scope.outputs.docking_review_only == 'true'
+        with:
+          name: docking-job-review-visuals
+          path: outputs/docking-job-review
+      - name: Preserve the exact frontend for candidate-only browser acceptance
+        uses: actions/upload-artifact@v4
+        with:
+          name: docking-refinement-frontend-${{ github.sha }}
+          path: src/opendde_workbench/web
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qualified-docking-native-evidence
+          path: server_tests/evidence/**

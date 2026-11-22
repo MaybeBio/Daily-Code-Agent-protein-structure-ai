@@ -1,0 +1,468 @@
+/* Component cards own their geometry; grids retain empty tracks instead of stretching a short group. */
+.deployment-workspace {
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
+}
+.deployment-workspace h2 {
+  font-size: 16px;
+  margin: 0;
+}
+.component-library {
+  min-width: 0;
+}
+.component-overview,
+.component-overview-title,
+.component-overview-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+}
+.component-overview {
+  margin-bottom: 14px;
+}
+.component-overview-title {
+  justify-content: flex-start;
+  gap: 6px 12px;
+}
+.component-overview-title > span {
+  color: var(--muted);
+  font-size: 13px;
+}
+.component-overview-controls {
+  gap: 8px;
+  max-width: 100%;
+}
+.deployment-workspace .component-group-select {
+  width: min(100%, 292px);
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+}
+.deployment-workspace .component-bundle {
+  padding: 7px 11px;
+  font-size: 13px;
+}
+.deployment-workspace .component-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr));
+  gap: 16px;
+  align-items: stretch;
+}
+.deployment-workspace .component-card {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  min-height: 320px;
+  aspect-ratio: 1;
+  padding: 14px;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: none;
+}
+.component-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+.component-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 17px;
+}
+.component-icon.is-model {
+  background: color-mix(in srgb, var(--violet) 10%, var(--surface));
+  color: var(--violet);
+}
+.component-icon.is-editor {
+  background: color-mix(in srgb, var(--teal) 10%, var(--surface));
+  color: var(--teal);
+}
+.component-icon.is-data {
+  background: color-mix(in srgb, #ac854b 12%, var(--surface));
+  color: #ac854b;
+}
+.component-category {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.component-title {
+  min-width: 0;
+}
+.deployment-workspace .component-card h3 {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.35;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.deployment-workspace .component-card p {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted);
+  margin: 0;
+  flex: 1 0 auto;
+  overflow-wrap: anywhere;
+}
+.deployment-workspace .component-card .component-size {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.deployment-workspace .component-card .component-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+  margin-top: auto;
+}
+.deployment-workspace .component-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 88px;
+  padding: 7px 12px;
+  font-size: 13px;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+}
+.deployment-workspace .component-primary.is-installed {
+  background: var(--success-soft);
+  color: var(--success);
+  border-color: transparent;
+  opacity: 1;
+  cursor: default;
+}
+.component-maintenance {
+  position: relative;
+  flex-shrink: 0;
+}
+.component-maintenance > summary {
+  padding: 7px 2px;
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  list-style: none;
+}
+.component-maintenance > summary::after {
+  content: "⌄";
+  margin-left: 4px;
+}
+.component-maintenance[open] > summary {
+  color: var(--accent);
+}
+.component-maintenance-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(210px, calc(100vw - 48px));
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px #0002;
+  overflow-wrap: anywhere;
+}
+.component-maintenance-menu small {
+  font-size: 12px;
+  color: var(--muted);
+}
+.component-maintenance-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.deployment-workspace .component-maintenance-actions button {
+  padding: 7px 10px;
+  font-size: 13px;
+  text-align: left;
+}
+.component-removal {
+  position: fixed;
+  z-index: 30;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(600px, calc(100vw - 40px));
+  max-height: 80vh;
+  overflow: auto;
+  box-shadow: 0 8px 40px #0003;
+}
+.deployment-progress:empty {
+  display: none;
+}
+.deployment-workspace .deployment-activity article {
+  padding: 14px;
+  gap: 10px;
+}
+.install-location {
+  display: flex;
+  align-items: end;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  border: 0;
+  border-radius: 0;
+  background: var(--surface);
+  box-shadow: none;
+}
+.install-location-choice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1 1 360px;
+  min-width: 0;
+}
+.install-location-choice strong {
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.install-location select,
+.install-location input {
+  min-width: 0;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+}
+.install-location input {
+  flex: 1 1 280px;
+}
+.install-location .field-help {
+  flex-basis: 100%;
+  margin: 0;
+}
+.deployment-workspace > .setup-card {
+  padding: 14px 16px;
+  border-radius: 0;
+  border: 0;
+  box-shadow: none;
+}
+.deployment-workspace > .setup-card .section-heading {
+  margin: 0;
+  align-items: center;
+}
+.deployment-workspace > .setup-card .section-heading h2 {
+  margin: 0;
+}
+.compute-service-panel {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.compute-service-panel .component-actions,
+.deployment-activity .component-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.compute-service-panel .section-heading {
+  flex: 1;
+  min-width: 180px;
+  justify-content: flex-start;
+}
+.compute-service-panel h2,
+.compute-service-panel .status-pill {
+  white-space: nowrap;
+}
+.compute-service-panel .field-help {
+  flex-basis: 100%;
+  order: 2;
+  margin: 0;
+}
+@container (max-width: 659px) {
+  .install-location-choice {
+    flex-basis: 100%;
+  }
+}
+.component-additions {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.component-additions > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 4px 0;
+}
+.component-additions .component-grid {
+  margin-top: 16px;
+}
+
+@media (min-width: 1000px) {
+  .studio-app .combined-workspace:has(> :not([hidden]) > .deployment-workspace) > .workspace-tabs {
+    min-height: 0;
+    padding-block: 0;
+    margin-bottom: 12px;
+  }
+  .deployment-workspace:has(> .compute-service-panel) {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+    grid-template-areas:
+      "alert alert"
+      "location compute"
+      "confirmation confirmation"
+      "catalogue catalogue"
+      "activity activity";
+    gap: 0 12px;
+  }
+  .deployment-workspace > [role="alert"] {
+    grid-area: alert;
+    margin-block: 0 12px;
+  }
+  .deployment-workspace > .install-location {
+    grid-area: location;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "label confirmation"
+      "directory directory"
+      "custom custom"
+      "hint hint";
+    align-content: start;
+    align-items: center;
+    gap: 0 8px;
+  }
+  .deployment-workspace > .compute-service-panel {
+    grid-area: compute;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "state controls"
+      "help help";
+    align-content: start;
+    gap: 8px;
+  }
+  .deployment-workspace > .field-help {
+    grid-area: confirmation;
+    margin-block: 8px 0;
+  }
+  .deployment-workspace > .component-library {
+    grid-area: catalogue;
+  }
+  .deployment-workspace > .deployment-progress {
+    grid-area: activity;
+  }
+  .deployment-workspace:has(> .compute-service-panel) > :is(.component-library, .deployment-progress) {
+    margin-block-start: 14px;
+  }
+  .deployment-workspace > :is(.install-location, .compute-service-panel) {
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .install-location-choice {
+    display: contents;
+  }
+  .install-location-choice strong {
+    grid-area: label;
+  }
+  .install-location select {
+    grid-area: directory;
+    margin-block-start: 4px;
+  }
+  .install-location input {
+    grid-area: custom;
+    margin-block-start: 8px;
+  }
+  .install-location > button {
+    grid-area: confirmation;
+  }
+  .install-location .field-help {
+    grid-area: hint;
+    margin-block-start: 8px;
+  }
+  .deployment-workspace > :is(.install-location, .compute-service-panel) button {
+    flex-shrink: 0;
+    padding: 6px 10px;
+  }
+  .compute-service-panel .section-heading {
+    grid-area: state;
+    min-width: 0;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .deployment-workspace > .compute-service-panel .section-heading h2 {
+    font-size: 16px;
+  }
+  .compute-service-panel .status-pill {
+    padding: 3px 6px;
+    font-size: 12px;
+  }
+  .compute-service-panel .component-actions {
+    grid-area: controls;
+    justify-content: flex-end;
+    max-inline-size: 240px;
+  }
+  .compute-service-panel .field-help {
+    grid-area: help;
+  }
+  .deployment-workspace .component-grid {
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 224px), 1fr));
+    gap: 12px;
+  }
+  .deployment-workspace .component-card {
+    min-height: clamp(210px, 25cqw, 248px);
+    aspect-ratio: auto;
+  }
+  @container (width < 940px) {
+    .deployment-workspace > .compute-service-panel {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas: "state" "controls" "help";
+      gap: 6px;
+    }
+    .compute-service-panel .component-actions {
+      justify-content: flex-start;
+      max-inline-size: none;
+    }
+    .compute-service-panel .field-help {
+      font-size: 12px;
+      line-height: 1.45;
+    }
+  }
+  @container (min-width: 940px) {
+    .deployment-workspace .component-card {
+      min-height: 248px;
+    }
+  }
+}

@@ -1,0 +1,216 @@
+import metatensor.torch as mts
+import torch
+from metatensor.torch import Labels, TensorBlock, TensorMap
+
+from metatrain.scaler.checkpoints import update_per_property_scales
+from metatrain.utils.data.target_info import TargetInfo
+from metatrain.utils.omegaconf import DEPRECATED_METATOMIC_TARGET_NAMES
+
+
+def _rename_column_in_labels(labels: Labels, old_name: str, new_name: str) -> Labels:
+    """If labels has a column called ``old_name``, return a copy where it is renamed to
+    ``new_name``, otherwise return ``labels`` unchanged"""
+
+    if old_name not in labels.names:
+        return labels
+
+    renamed_names = [new_name if name == old_name else name for name in labels.names]
+    return Labels(renamed_names, labels.values)
+
+
+def _rename_target_name_in_tensor_map(
+    tensor_map: TensorMap, old_name: str, new_name: str
+) -> TensorMap:
+    """Return a copy of tensor_map in which every ``Labels`` has its ``old_name`` column
+    renamed to ``new_name``"""
+
+    renamed_blocks = []
+    for block in tensor_map.blocks():
+        # rewrite all Labels on the main block
+        renamed_block = TensorBlock(
+            values=block.values,
+            samples=_rename_column_in_labels(block.samples, old_name, new_name),
+            components=[
+                _rename_column_in_labels(c, old_name, new_name)
+                for c in block.components
+            ],
+            properties=_rename_column_in_labels(block.properties, old_name, new_name),
+        )
+
+        # do the same for each gradient block
+        for gradient_name, gradient_block in block.gradients():
+            renamed_block.add_gradient(
+                parameter=gradient_name,
+                gradient=TensorBlock(
+                    values=gradient_block.values,
+                    samples=_rename_column_in_labels(
+                        gradient_block.samples, old_name, new_name
+                    ),
+                    components=[
+                        _rename_column_in_labels(c, old_name, new_name)
+                        for c in gradient_block.components
+                    ],
+                    properties=_rename_column_in_labels(
+                        gradient_block.properties, old_name, new_name
+                    ),
+                ),
+            )
+
+        renamed_blocks.append(renamed_block)
+
+    return TensorMap(keys=tensor_map.keys, blocks=renamed_blocks)
+
+
+###########################
+# MODEL ###################
+###########################
+
+
+def model_update_v1_v2(checkpoint: dict) -> None:
+    """
+    Update a v1 checkpoint to v2.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    update_per_property_scales(checkpoint)
+
+
+def model_update_v2_v3(checkpoint: dict) -> None:
+    """
+    Update a v2 checkpoint to v3 to rename deprecated metatomic target names
+    in dataset_info, train_hypers and state_dict
+
+    :param checkpoint: The checkpoint to update.
+    """
+    targets = checkpoint["model_data"]["dataset_info"].targets
+    loss = checkpoint.get("train_hypers", {}).get("loss")
+    loss = loss if isinstance(loss, dict) else {}
+    model_state_dict = checkpoint.get("model_state_dict") or {}
+    best_model_state_dict = checkpoint.get("best_model_state_dict") or {}
+
+    for old, new in DEPRECATED_METATOMIC_TARGET_NAMES.items():
+        # 1. rename in dataset_info.targets
+        if old in targets:
+            target_info = targets.pop(old)
+            targets[new] = TargetInfo(
+                layout=_rename_target_name_in_tensor_map(target_info.layout, old, new),
+                quantity=target_info.quantity,
+                unit=target_info.unit,
+                description=target_info.description,
+            )
+
+        # 2. rename in trainer loss hypers (keyed by target name)
+        if old in loss:
+            loss[new] = loss.pop(old)
+
+        # 3. rename in state_dict paths
+        for state_dict in (model_state_dict, best_model_state_dict):
+            for key in list(state_dict.keys()):
+                new_key = (
+                    # heads
+                    key.replace(f"node_heads.{old}.", f"node_heads.{new}.")
+                    .replace(f"edge_heads.{old}.", f"edge_heads.{new}.")
+                    # last layers
+                    .replace(f"node_last_layers.{old}.", f"node_last_layers.{new}.")
+                    .replace(f"edge_last_layers.{old}.", f"edge_last_layers.{new}.")
+                    # scaler
+                    .replace(f"scaler.{old}_", f"scaler.{new}_")
+                    # <target>___.weight / bias
+                    .replace(f".{old}___", f".{new}___")
+                )
+                if new_key != key:
+                    value = state_dict.pop(key)
+                    if key.startswith("scaler.") and key.endswith("_buffer"):
+                        # buffer = serialized TensorMap; deserialize, rebuild its
+                        # Labels, re-serialize
+                        value = mts.save_buffer(
+                            mts.make_contiguous(
+                                _rename_target_name_in_tensor_map(
+                                    mts.load_buffer(value), old, new
+                                )
+                            )
+                        )
+                    state_dict[new_key] = value
+
+
+def model_update_v3_v4(checkpoint: dict) -> None:
+    """
+    Update a v3 checkpoint to v4.
+
+    It removes the additive models and scaler from the model checkpoint,
+    as this is now handled by the MetatrainModel wrapper.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    removed_prefixes = (
+        "additive_models.",
+        "scaler.",
+    )
+    for key in ["model_state_dict", "best_model_state_dict"]:
+        if (state_dict := checkpoint.get(key)) is not None:
+            for k in list(state_dict):
+                for prefix in removed_prefixes:
+                    if k.startswith(prefix):
+                        state_dict.pop(k)
+
+
+def model_update_v4_v5(checkpoint: dict) -> None:
+    """
+    Update model checkpoint from version 4 to version 5.
+
+    The embedded composition model and scaler now use
+    ``metatensor.torch.learn.nn.Module`` with ``register_buffer`` instead of
+    manually tracked buffers.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    for key in ["model_state_dict", "best_model_state_dict"]:
+        if (state_dict := checkpoint.get(key)) is None:
+            continue
+
+        # If both model_state_dict and best_model_state_dict point to the same
+        # dict, the upgrade was already applied in the first iteration.
+        if "_mts_helper" in state_dict:
+            continue
+
+        reference = next(v for v in state_dict.values() if isinstance(v, torch.Tensor))
+        empty_tensor = torch.zeros(0, dtype=reference.dtype, device=reference.device)
+
+        state_dict["_mts_helper"] = empty_tensor
+        state_dict["_extra_state"] = {}
+
+
+###########################
+# TRAINER #################
+###########################
+
+
+def trainer_update_v1_v2(checkpoint: dict) -> None:
+    """
+    Update trainer checkpoint from version 1 to version 2.
+
+    The ``batch_atom_bounds`` field has been removed from the trainer schema
+    (max-atom packing is now done by the sampler, via ``max_atoms_per_batch``
+    and ``min_atoms_per_batch``). ``batch_atom_bounds`` bounds are translated
+    into the equivalent sampler settings; if it was unset, the new sampler
+    settings default to no packing.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    train_hypers = checkpoint["train_hypers"]
+    min_bound, max_bound = train_hypers.pop("batch_atom_bounds", [None, None])
+    train_hypers["max_atoms_per_batch"] = max_bound
+    train_hypers["min_atoms_per_batch"] = min_bound if min_bound is not None else 0
+
+
+def trainer_update_v2_v3(checkpoint: dict) -> None:
+    """
+    Deprecate the ``distributed`` hyperparameter.
+
+    So that it doesn't show up in the restarting options.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    train_hypers = checkpoint["train_hypers"]
+    if "distributed" in train_hypers and train_hypers["distributed"] is None:
+        train_hypers.pop("distributed")

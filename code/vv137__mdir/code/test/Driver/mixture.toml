@@ -1,0 +1,75 @@
+# A mixture of two types of particles: the parameters of a pair follow from
+# those of its particles, which the kernel reads from fields.
+#
+# RUN: mdir run %s | FileCheck %s
+# RUN: mdir emit %s | FileCheck %s --check-prefix=MODULE
+
+# The potential energy, the virial, and the pressure at the start agree
+# with the sums over all pairs of Inputs/mixture_reference.py:
+# -497.729755 kcal/mol, -1117.778154 kcal/mol, and -1712.033551 atm. The
+# total energy is conserved.
+#
+# The initial velocities have 120 K in their kinetic energy. The
+# temperature of the log is estimated from the kinetic energies half a
+# step before and after as well: 120.002014 K.
+#
+# CHECK:      MDIR: 256 particles, 200 steps of 0.004 ps
+# CHECK:      INFO:      STEP           TIME      TOTAL_ENE  POTENTIAL_ENE    KINETIC_ENE    TEMPERATURE         VIRIAL       PRESSURE
+# CHECK-NEXT: INFO:         0         0.0000 {{ *-[0-9.]+}} {{ *}}-497.7298 {{ *[0-9.]+}} {{ *}}120.0020 {{ *}}-1117.7782 {{ *}}-1712.0336
+# CHECK-NEXT: INFO:        50         0.2000
+# CHECK-NEXT: INFO:       100         0.4000
+# CHECK-NEXT: INFO:       150         0.6000
+# CHECK-NEXT: INFO:       200         0.8000
+# CHECK:      MDIR: the total energy changed by {{[0-9.]+}}e-0{{[5-9]}} of its value
+
+# A parameter that differs between the types is a field, and the kernel
+# mixes the values of the two particles.
+#
+# MODULE:      md.potential @energy([[X:%[a-z0-9]+]]: !md.field<@atoms, 3 x f64>, [[CELL:%[a-z0-9]+]]: !md.cell, [[EPSILON:%[a-z0-9]+]]: !md.field<@atoms, f64>, [[SIGMA:%[a-z0-9]+]]: !md.field<@atoms, f64>) -> f64
+# MODULE:        md.sum_relation {{%[a-z0-9]+}}, [[X]], [[CELL]] gather([[EPSILON]], [[SIGMA]] : !md.field<@atoms, f64>, !md.field<@atoms, f64>) exchange(symmetric) truncation(switch, from = 7.500000e-01)
+# MODULE-NEXT:   ^bb0({{%[a-z0-9]+}}: f64, {{%[a-z0-9]+}}: vector<3xf64>, [[EI:%[a-z0-9]+]]: f64, [[EJ:%[a-z0-9]+]]: f64, [[SI:%[a-z0-9]+]]: f64, [[SJ:%[a-z0-9]+]]: f64):
+# MODULE:          [[PRODUCT:%[a-z0-9]+]] = arith.mulf [[EI]], [[EJ]] : f64
+# MODULE-NEXT:     math.sqrt [[PRODUCT]] : f64
+# MODULE:          arith.addf [[SI]], [[SJ]] : f64
+# MODULE:        func.func @mdir_run({{%[a-z0-9]+}}: memref<?x3xf64>, {{%[a-z0-9]+}}: memref<?x3xf64>, {{%[a-z0-9]+}}: memref<?xf64> {mdrt.read_only}, {{%[a-z0-9]+}}: memref<?xf64> {mdrt.read_only}, {{%[a-z0-9]+}}: memref<?xf64> {mdrt.read_only},
+
+[input]
+coordinates = "Inputs/mixture.pdb"
+
+[energy]
+switch_distance = 7.5
+cutoff       = 9.0
+pairlist_distance = 10.0
+
+[[energy.pair]]
+name       = "lj"
+expression = "4*epsilon*((sigma/r)^12 - (sigma/r)^6)"
+mixing     = "lorentz-berthelot"
+
+[[energy.type]]
+name    = "AR"
+mass    = 39.95
+epsilon = 0.238465
+sigma   = 3.4
+
+[[energy.type]]
+name    = "KR"
+mass    = 83.80
+epsilon = 0.3253
+sigma   = 3.65
+
+[dynamics]
+integrator    = "VELOCITY_VERLET"
+time_step     = 0.004
+steps         = 200
+
+[ensemble]
+ensemble    = "NVE"
+temperature = 120.0
+
+[boundary]
+type       = "PERIODIC"
+box = [23.2, 23.2, 23.2]
+
+[output]
+energy_interval = 50

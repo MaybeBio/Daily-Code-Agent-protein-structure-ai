@@ -1,0 +1,218 @@
+// -*- c++ -*-
+
+// This file is part of the Collective Variables module (Colvars).
+// The original version of Colvars and its updates are located at:
+// https://github.com/Colvars/colvars
+// Please update all Colvars source files before making any changes.
+// If you wish to distribute your changes, please submit them to the
+// Colvars repository at GitHub.
+
+#include <iostream>
+#include <fstream>
+#include <iomanip>
+
+#include "colvarmodule.h"
+#include "colvarscript.h"
+#include "colvaratoms.h"
+#include "colvarproxy.h"
+#include "colvarproxy_stub.h"
+#include "colvars_version.h"
+
+#define COLVARPROXY_VERSION COLVARS_VERSION
+
+
+colvarproxy_stub::colvarproxy_stub()
+{
+  version_int = get_version_from_string(COLVARPROXY_VERSION);
+
+  use_internal_pbc_ = true;
+
+  b_simulation_running = false;
+
+  // both fields are taken from data structures already available
+  updated_masses_ = updated_charges_ = true;
+
+  cvmodule = new colvarmodule(this);
+  cvmodule->log("Using minimal testing interface.\n");
+
+  cvmodule->cv_traj_freq = 0; // I/O will be handled explicitly
+  cvmodule->restart_out_freq = 0;
+  cvm::rotation::monitor_crossings = false; // Avoid unnecessary error messages
+
+  cvmodule->setup_input();
+  cvmodule->setup_output();
+
+  colvarproxy_stub::setup();
+}
+
+
+colvarproxy_stub::~colvarproxy_stub()
+{}
+
+
+int colvarproxy_stub::setup()
+{
+  // Set system boundaries as the default (non-periodic)
+  boundaries_.reset();
+
+  if (cvmodule) {
+    cvmodule->it = cvmodule->it_restart = 0;
+    return cvmodule->update_engine_parameters();
+  }
+
+  return COLVARS_OK;
+}
+
+
+void colvarproxy_stub::request_total_force(bool yesno)
+{
+  total_force_requested = yesno;
+}
+
+
+bool colvarproxy_stub::total_forces_enabled() const
+{
+  return total_force_requested;
+}
+
+
+bool colvarproxy_stub::total_forces_same_step() const
+{
+  return true;
+}
+
+
+int colvarproxy_stub::set_unit_system(std::string const &units_in,
+                                            bool check_only)
+{
+  // if check_only is specified, just test for compatibility
+  // colvarmodule sets this flag if new units are requested while colvars are already defined
+  if (check_only) {
+    if ((units != "" && units_in != units) || (units == "" && units_in != "real")) {
+      cvmodule->error("Specified unit system \"" + units_in + "\" is incompatible with previous setting \""
+                  + units + "\".\nReset the Colvars Module or delete all variables to change the unit.\n");
+      return COLVARS_ERROR;
+    } else {
+      return COLVARS_OK;
+    }
+  }
+
+  if (units_in == "real") {
+    angstrom_value_ = 1.;
+    kcal_mol_value_ = 1.;
+  } else if (units_in == "metal") {
+    angstrom_value_ = 1.;
+    kcal_mol_value_ = 0.0433641017; // eV
+    // inverse of LAMMPS value is 1/23.060549 = .043364102
+  } else if (units_in == "electron") {
+    angstrom_value_ = 1.88972612;    // Bohr
+    kcal_mol_value_ = 0.00159360144; // Hartree
+  } else if (units_in == "gromacs") {
+    angstrom_value_ = 0.1;    // nm
+    kcal_mol_value_ = 4.184;  // kJ/mol
+  } else {
+    cvmodule->error("Unknown unit system specified: \"" + units_in + "\". Supported are real, metal, electron, and gromacs.\n");
+    return COLVARS_ERROR;
+  }
+
+  units = units_in;
+  return COLVARS_OK;
+}
+
+
+void colvarproxy_stub::log(std::string const &message)
+{
+  std::cout << "colvars: " << message;
+}
+
+
+void colvarproxy_stub::error(std::string const &message)
+{
+  add_error_msg(message);
+  std::cerr << "colvars: " << message;
+}
+
+
+int colvarproxy_stub::check_atom_id(int atom_number)
+{
+  return atom_number-1;
+}
+
+
+int colvarproxy_stub::init_atom(int atom_number)
+{
+  // save time by checking first whether this atom has been requested before
+  // (this is more common than a non-valid atom number)
+  int aid = (atom_number-1);
+
+  for (size_t i = 0; i < atoms_ids.size(); i++) {
+    if (atoms_ids[i] == aid) {
+      // this atom id was already recorded
+      atoms_refcount[i] += 1;
+      return i;
+    }
+  }
+
+  aid = check_atom_id(atom_number);
+
+  if (aid < 0) {
+    return COLVARS_INPUT_ERROR;
+  }
+
+  int const index = add_atom_slot(aid);
+
+  return index;
+}
+
+
+int colvarproxy_stub::read_frame_xyz(const char *filename, const bool write_force_file)
+{
+  // The XYZ file lists atoms by increasing ID, but atom slots follow the order in which the
+  // atoms were requested: read all positions first, then copy them into their slots
+  auto &positions = *(modify_atom_positions());
+  const size_t numAtoms = positions.size();
+  // xyz_positions is empty on the first call, and resized to the total number of atoms on
+  // subsequent calls - this will read all positions in both cases
+  int err = cvmodule->load_coords_xyz(filename, &xyz_positions, nullptr, true);
+  std::string force_filename;
+  if (write_force_file) {
+    force_filename = cvmodule->output_prefix() + ".forces.xyz";
+  }
+  if ( !err ) {
+    bool atom_id_invalid = false;
+    for (size_t i = 0; i < numAtoms; ++i) {
+      atom_id_invalid = atom_id_invalid || !(static_cast<size_t>(atoms_ids[i]) < xyz_positions.size());
+      positions[i] = !atom_id_invalid ? xyz_positions[atoms_ids[i]] : cvm::rvector();
+    }
+    if (atom_id_invalid) {
+      return cvmodule->error("Invalid atom ID.\n", COLVARS_INPUT_ERROR);
+    }
+    auto& new_forces = *(modify_atom_applied_forces());
+    std::fill(new_forces.begin(), new_forces.end(), cvm::rvector{0, 0, 0});
+    cvmodule->calc();
+    cvmodule->it++;
+    if (write_force_file) {
+      // Write the forces in XYZ trajectory format
+      // forces_by_id is indexed by atom ID, so we need to cover all atoms
+      size_t const numAtoms_total = xyz_positions.size();
+      forces_by_id.resize(numAtoms_total);
+      // Initialize all forces to zero, then fill in the relevant ones by atom ID
+      std::fill(forces_by_id.begin(), forces_by_id.end(), cvm::rvector{0, 0, 0});
+      for (size_t i = 0; i < numAtoms; ++i) {
+        forces_by_id[atoms_ids[i]] = new_forces[i];
+      }
+      // Create XYZ trajectory: overwrite on first frame, append on subsequent frames
+      std::ios::openmode mode = (cvmodule->it == 1) ? std::ios::out : std::ios::app;
+      std::ofstream ofs(force_filename, mode);
+      ofs << numAtoms_total << std::endl;
+      ofs << std::endl;
+      for (size_t i = 0; i < numAtoms_total; ++i) {
+        ofs << std::setw(7) << (i+1) << " "  // Atom ID (1-based)
+            << std::scientific << std::setprecision(8) << std::setw(16) << forces_by_id[i].x << std::setw(0) << " "
+            << std::scientific << std::setprecision(8) << std::setw(16) << forces_by_id[i].y << std::setw(0) << " "
+            << std::scientific << std::setprecision(8) << std::setw(16) << forces_by_id[i].z << std::endl;
+      }
+    }
+  }
+  return err;
+}

@@ -1,0 +1,126 @@
+# Reference — scope, verdicts, checklist, template
+
+## Package scope (the "does it fit" test)
+
+AAanalysis is **interpretable, sequence-based protein prediction centered on CPP**
+(Comparative Physicochemical Profiling), with AAclust, AAontology, dPULearn, TreeModel,
+and a `pro` extra for heavy/fragile deps (shap, biopython, …). BSD-3, **semver-strict from
+v1.x**. An issue *fits* when it extends this core (CPP/scales/features/interpretation, the
+data pipeline, performance of the existing computation, or docs/tests for them).
+
+It does **not** fit cleanly when it:
+- balloons the dependency surface (new DL/causal/dashboard stacks: captum, DoWhy, PyMC,
+  dash, NGLview, …) → usually belongs in the downstream **ProtXplain** (#26), mark 🔄/⏸️;
+- is a research program rather than a package feature;
+- contradicts a documented decision (see the checklist below).
+
+## Verdict taxonomy
+
+| Verdict | Meaning | Action |
+|---|---|---|
+| ✅ **Ready** | Fits scope + standards, not yet done, well-enough specified | Implement; put in a lane |
+| 🔄 **Revisit** | Fits scope but under-specified, partially conflicts, oversized, or needs a design decision first | Resolve the open question (grill) before coding |
+| ⏸️ **Defer-v2** | Legitimate but explicitly v2-scoped by sharp-edges | Park; cite the rule |
+| ❌ **Reject** | Conflicts with a hard rule / sharp-edge | Recommend close/won't-do; cite the rule |
+| ☑️ **Done / Partial** | Already addressed by a commit/ADR/code | Verify, then recommend close or re-scope the remainder |
+
+## Standing reject / defer checklist (from `.claude/rules/sharp-edges.md` + CLAUDE.md)
+
+Reject (hard rules — won't do, even in v2 as written):
+- Custom exception base / `AAanalysisError` hierarchy.
+- Adding `SECURITY.md`, a ruff config, pre-commit config, or mypy config.
+
+Defer-to-v2 (accepted limitations, not to "fix" opportunistically):
+- Splitting the `utils.py` god module.
+- Adding a type checker (mypy/pyright) or ruff/pre-commit to CI.
+- Standing up `tests/integration/` or `tests/e2e/`.
+- Typed row records (NamedTuple/dataclass) in the backend — stays positional-list-based.
+- Dropping the `[tool.poetry]` block (PEP 621 / Poetry duality is accepted).
+
+Always-loaded standards to check a "Ready" issue against (CLAUDE.md §3 + rules):
+- No `print(...)` in library code (`ut.print_out`), no `aaanalysis._utils.*` imports outside
+  `utils.py`, no bare `except Exception`, bare `ValueError`/`RuntimeError` only.
+- CONFIRM-FIRST surfaces (need explicit approval to edit): `pyproject.toml`, `__init__.py`,
+  `aaanalysis.__all__` renames/removals, `_data/`, `.github/workflows/`, `config.py`,
+  `template_classes.py`.
+- Frontend/backend split, validation block, `random_state`/`seed` contract, numpydoc
+  docstrings — an issue that ignores these is 🔄 until the plan accounts for them.
+
+## Overlap detection (what must not be parallelized)
+
+Two issues conflict when their implementations edit the **same files / same feature path**.
+Typical clusters in this repo:
+- **Performance / CPP loop:** anything touching `feature_engineering/_backend/cpp/**` or
+  `df_parts` computation (vectorize, batch, GPU, df_parts perf) → one lane, serialized.
+- **CPP output schema** changes ripple into plotting + downstream consumers.
+- **Structure / conservation / MSA** issues share `data_handling_pro` + the pending pro move.
+- **XAI cluster** items often share the same new plotting/attribution surface.
+
+For each cluster: pick a *primary* issue, list the rest as blocked-by, and state "serialize."
+Independent issues (different subpackages, no shared files) go in separate **parallel lanes**.
+
+## PR ↔ Issue mapping (secondary)
+
+Issues are primary; PRs are secondary context layered on top. Fetch:
+- Open PRs: `gh pr list --state open --json number,title,headRefName,files`
+- Merged PRs: `gh pr list --state merged --limit 30 --json number,title,mergedAt,closingIssuesReferences`
+
+Map each PR to its issue(s):
+- **Closing PR** — `closingIssuesReferences` non-empty (a `Closes/Fixes/Resolves #NN` keyword): the PR
+  closed that issue → mark the issue ☑️ **closed** and link the PR (`#NN ✅`).
+- **Advancing PR** — no closing keyword (e.g. an "Addresses #NN" body, or a program PR with no issue):
+  attribute it to the issue / program item it advances; write it `(#NN)` in parens (vs a closing `#NN ✅`).
+- **In-flight collision** — an open PR whose changed `files` overlap an open issue's file-path means that
+  issue is *being worked* and its lane is occupied → note it on the issue's audit row and in the overlap
+  clusters; do **not** hand it to a second parallel session.
+
+Keep PRs as context, not the spine: order/lanes/verdicts stay issue-driven, and a PR never changes an
+issue's verdict on its own — verify the merged code before marking an issue ☑️ done.
+
+## Handoff file template (`docs/guides/handoff_github_issues.md`)
+
+```markdown
+# GitHub issues — implementation handoff
+
+_Generated by the `github-issues` skill on <YYYY-MM-DD>. Regenerate:_
+_`python .claude/skills/github-issues/scripts/fetch_issues.py` then re-run the skill._
+
+## Snapshot
+- Open issues: N (by verdict: ✅ a · 🔄 b · ⏸️ c · ❌ d · ☑️ e)
+- Recently resolved on master (verify before closing): #..., #...
+- In flight now (open PRs): #.. (<issue>) · ...
+
+## Issue ↔ PR activity (secondary)
+> **Issues on the left** (the spine); their PR(s) on the right — **—** when an issue has no PR yet.
+> `✅` = a PR closed the issue · `↗` = PR(s) advance it (no closing keyword, or still in progress).
+
+| issue | state | PR(s) | what landed / in flight |
+|---|---|---|---|
+| #.. | ✅ closed / 🔄 open / partial | #.. / #.. ↗ / — | <what> |
+
+- **Issues with no PR yet ( — ):** list them (or "all other open issues — see the per-issue audit").
+- **Program / tooling PRs with no backing issue:** #.. (<what>), … (program work that advances no GitHub issue).
+
+## Implementation order (do top-down; respect blockers + in-flight PRs)
+1. <issue> — <one-line why-first> — lane <L>
+2. ...
+
+## Parallel lanes (safe to run in separate sessions)
+- **Lane A — <theme>:** #.., #..  (no shared files)
+- **Lane B — <theme>:** #..
+- **Serialize (shared code, NOT parallel):** cluster <name> = #.., #.. → primary #.., then the rest
+  (include any open-PR file collision here)
+
+## Per-issue audit
+### <topic group>
+| # | prio | verdict | PR | scope / standards | already-addressed | implementation note (complements the issue) |
+|---|---|---|---|---|---|---|
+| .. | .. | ✅/🔄/⏸️/❌/☑️ | #.. open/merged or — | .. | .. | files to touch · reuse · the decision to make |
+
+## Reject / Defer appendix (with cited rule)
+- #.. ❌ — <rule citation>
+- #.. ⏸️ — <sharp-edge citation>
+```
+
+Keep tables scannable; put the depth in the "implementation note" column (the value the
+handoff adds over the raw issue). Preserve human-added notes on update.

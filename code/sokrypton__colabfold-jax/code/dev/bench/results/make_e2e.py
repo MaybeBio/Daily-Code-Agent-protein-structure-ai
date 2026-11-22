@@ -1,0 +1,81 @@
+"""Build the Colab end-to-end test notebook FROM the notebook users run.
+
+The test used to be a hand-kept copy of the install cell, which meant it
+drifted the moment the real one changed -- and a test of last week's notebook
+is not a test. This takes the install, input and run cells of
+`ColabFold2_preview.ipynb` verbatim and appends one cell that asserts on the
+result, so the thing under test is the thing users get. That notebook lives in
+the ColabFold repository; it is fetched from its main branch unless a local
+copy (or another URL) is given.
+
+    python dev/bench/results/make_e2e.py [NOTEBOOK_PATH_OR_URL]
+    colab --auth adc exec -f dev/bench/results/e2e.ipynb --timeout 1400
+
+Form fields are overridden through AF3_NB_OVERRIDES, which the install cell
+reads; see the headless-overrides block there. The defaults here keep the run
+small and off the MSA server so a failure is ours.
+"""
+
+import json
+import os
+import pathlib
+import sys
+import urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+NOTEBOOK = ('https://raw.githubusercontent.com/sokrypton/ColabFold/main/'
+            'ColabFold2_preview.ipynb')
+OVERRIDES = {
+    'model': os.environ.get('E2E_MODEL', 'openbind0'),
+    'protein': 'PIAQIHILEGRSDEQKETLIREVSEAISRSLDAPLTSVRVIITEMAKGHFGIGGELASK',
+    'msa_mode': os.environ.get('E2E_MSA', 'single_sequence'),
+    'num_diffusion_samples': 1,
+    'num_recycles': 3,
+    'ligand_ccd': os.environ.get('E2E_LIGAND', 'ATP'),
+    'jobname': 'e2e',
+}
+
+CHECK = '''
+import glob, json, os
+cifs = sorted(glob.glob(f'{job_dir}/**/*.cif', recursive=True))
+text = open(cifs[0]).read() if cifs else ''
+# HETATM too: a CCD ligand is never an ATOM record, so counting only those
+# made an ATP run indistinguishable from a protein-only one (448 both times).
+atoms = sum(1 for l in text.splitlines() if l.startswith(('ATOM', 'HETATM')))
+het = sum(1 for l in text.splitlines() if l.startswith('HETATM'))
+print('CIFS:', len(cifs), 'ATOMS:', atoms, 'HETATM:', het)
+ligand_ok = (not ccd_codes) or all(c in text for c in ccd_codes)
+print('LIGANDS:', ccd_codes, 'present' if ligand_ok else 'MISSING')
+conf = sorted(glob.glob(f'{job_dir}/**/*summary_confidences.json', recursive=True))
+if conf:
+  print('PLDDT/PTM:', {k: v for k, v in json.load(open(conf[0])).items()
+                       if k in ('ptm', 'iptm', 'fraction_disordered')})
+print('RESULT:', 'PASS' if (cifs and atoms > 100 and ligand_ok) else 'FAIL')
+'''
+
+
+def main():
+  source = sys.argv[1] if len(sys.argv) > 1 else NOTEBOOK
+  if source.startswith(('http://', 'https://')):
+    with urllib.request.urlopen(source) as r:
+      nb = json.loads(r.read().decode('utf-8'))
+  else:
+    nb = json.loads(pathlib.Path(source).read_text())
+  by_id = {c['metadata'].get('id'): c for c in nb['cells']}
+  setenv = ('import os\n'
+            f'os.environ["AF3_NB_OVERRIDES"] = {json.dumps(json.dumps(OVERRIDES))}\n'
+            'print("overrides:", os.environ["AF3_NB_OVERRIDES"])\n')
+  cells = [setenv] + [''.join(by_id[i]['source']) for i in ('install', 'input', 'run')] + [CHECK]
+  for src in cells:
+    assert '\n%%time' not in src, 'a cell magic after #@title aborts under colab-cli'
+  out = {'cells': [{'cell_type': 'code', 'metadata': {}, 'source': s.splitlines(keepends=True),
+                    'outputs': [], 'execution_count': None} for s in cells],
+         'metadata': nb['metadata'], 'nbformat': 4, 'nbformat_minor': 0}
+  dst = ROOT / 'dev/bench/results/e2e.ipynb'
+  dst.write_text(json.dumps(out, indent=1) + '\n')
+  print(f'wrote {dst} from {source} ({len(cells)} cells, '
+        f'model={OVERRIDES["model"]})')
+
+
+if __name__ == '__main__':
+  main()

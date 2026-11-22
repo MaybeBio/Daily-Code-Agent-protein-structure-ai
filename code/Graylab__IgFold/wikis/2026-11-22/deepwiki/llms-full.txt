@@ -1,0 +1,5169 @@
+# Page: Overview
+
+# Overview
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [setup.cfg](setup.cfg)
+
+</details>
+
+
+
+This document provides a high-level introduction to IgFold, explaining its purpose, key capabilities, and system architecture. This overview is intended for users and developers who want to understand what IgFold does and how its major components fit together.
+
+For detailed installation instructions, see [Installation and Setup](#2). For hands-on usage examples, see [Quick Start Guide](#3). For comprehensive API documentation, see [IgFoldRunner API](#4.1).
+
+## What is IgFold
+
+IgFold is a deep learning system for fast and accurate antibody structure prediction from amino acid sequences. It addresses the challenge of predicting three-dimensional antibody structures, which is critical for drug discovery, vaccine design, and understanding immune responses.
+
+The system uses transformer-based neural networks trained on a large dataset of natural antibody structures to predict:
+- 3D atomic coordinates for antibody heavy and light chains
+- Per-residue confidence estimates (pRMSD values)
+- Structural embeddings for downstream machine learning tasks
+
+IgFold supports both paired antibodies (heavy + light chains) and single chains like nanobodies, making it applicable to a wide range of antibody engineering scenarios.
+
+*Sources: [README.md:1-227]()*
+
+## Key Capabilities
+
+IgFold provides several core capabilities through its main interface:
+
+| Capability | Description | Primary Method |
+|------------|-------------|----------------|
+| Structure Prediction | Generate 3D coordinates from sequences | `IgFoldRunner.fold()` |
+| Confidence Estimation | Per-residue predicted RMSD values | Included in fold output |
+| Sequence Embedding | Extract learned representations | `IgFoldRunner.embed()` |
+| Structure Refinement | Post-prediction optimization | PyRosetta or OpenMM integration |
+| Antibody Renumbering | Standardize numbering schemes | AbNumber integration |
+
+The system handles various input formats including paired sequences, single chains, and can work with or without template structures. Output includes standard PDB files with confidence scores encoded in B-factor columns.
+
+*Sources: [README.md:47-186]()*
+
+## System Architecture
+
+The following diagram shows IgFold's high-level architecture and how the major components interact:
+
+### Core System Architecture
+
+```mermaid
+graph TB
+    subgraph "User Interface"
+        IgFoldRunner["IgFoldRunner"]
+        fold_method["fold()"]
+        embed_method["embed()"]
+    end
+    
+    subgraph "Processing Pipeline"
+        folding_utils["folding utilities"]
+        embed_utils["embed utilities"]
+        input_proc["input processing"]
+    end
+    
+    subgraph "Deep Learning Core"
+        IgFoldModel["IgFoldModel"]
+        AntiBERTy["AntiBERTy"]
+        GraphTransformer["Graph Transformers"]
+        IPATransformer["IPA Transformers"]
+    end
+    
+    subgraph "Data Processing"
+        pdb_utils["PDB utilities"]
+        fasta_proc["FASTA processing"]
+        abnumber_int["AbNumber integration"]
+    end
+    
+    subgraph "Structure Refinement"
+        pyrosetta_ref["PyRosetta refinement"]
+        openmm_ref["OpenMM refinement"]
+    end
+    
+    IgFoldRunner --> fold_method
+    IgFoldRunner --> embed_method
+    fold_method --> folding_utils
+    embed_method --> embed_utils
+    
+    folding_utils --> IgFoldModel
+    embed_utils --> IgFoldModel
+    
+    IgFoldModel --> AntiBERTy
+    IgFoldModel --> GraphTransformer
+    IgFoldModel --> IPATransformer
+    
+    input_proc --> pdb_utils
+    input_proc --> fasta_proc
+    input_proc --> abnumber_int
+    
+    folding_utils --> pyrosetta_ref
+    folding_utils --> openmm_ref
+```
+
+*Sources: [README.md:54-186](), [setup.cfg:1-15]()*
+
+## Core Components
+
+The system consists of several key components that work together to transform antibody sequences into 3D structures:
+
+### Component Architecture
+
+```mermaid
+graph TD
+    subgraph "Input Layer"
+        sequences["Antibody Sequences"]
+        templates["Template PDB"]
+    end
+    
+    subgraph "Embedding Layer"
+        AntiBERTy_model["AntiBERTy Model"]
+        bert_embs["BERT Embeddings"]
+        bert_atts["BERT Attentions"]
+    end
+    
+    subgraph "Neural Network Core"
+        node_transform["Node Transform"]
+        edge_transform["Edge Transform"]
+        graph_layers["Graph Transformer Layers"]
+        template_ipa["Template IPA"]
+        structure_ipa["Structure IPA"]
+        deviation_ipa["Deviation IPA"]
+    end
+    
+    subgraph "Output Layer"
+        coordinates["3D Coordinates"]
+        translations["Translations"]
+        quaternions["Quaternions"]
+        prmsd_values["pRMSD Values"]
+    end
+    
+    sequences --> AntiBERTy_model
+    AntiBERTy_model --> bert_embs
+    AntiBERTy_model --> bert_atts
+    
+    bert_embs --> node_transform
+    bert_atts --> edge_transform
+    
+    node_transform --> graph_layers
+    edge_transform --> graph_layers
+    
+    graph_layers --> structure_ipa
+    templates --> template_ipa
+    template_ipa --> structure_ipa
+    
+    structure_ipa --> coordinates
+    structure_ipa --> translations
+    structure_ipa --> quaternions
+    
+    coordinates --> deviation_ipa
+    deviation_ipa --> prmsd_values
+```
+
+*Sources: [README.md:54-162]()*
+
+## Key Workflows
+
+IgFold supports two primary workflows:
+
+### Structure Prediction Workflow
+1. Input sequences provided to `IgFoldRunner.fold()`
+2. Sequences processed through AntiBERTy for embeddings
+3. Neural network generates coordinates and confidence estimates
+4. Optional refinement with PyRosetta or OpenMM
+5. Optional renumbering with AbNumber
+6. Output PDB file with pRMSD values in B-factors
+
+### Embedding Extraction Workflow
+1. Input sequences provided to `IgFoldRunner.embed()`
+2. Forward pass through model layers
+3. Extract intermediate representations at different stages
+4. Return embeddings for downstream use
+
+Both workflows use the same underlying `IgFoldModel` but expose different outputs depending on the intended use case.
+
+*Sources: [README.md:49-162]()*
+
+## Input and Output Overview
+
+### Input Formats
+- **Sequences**: Dictionary with chain IDs as keys (`"H"`, `"L"`) and amino acid sequences as values
+- **Templates**: Optional PDB files for template-based prediction
+- **Parameters**: Various options for refinement, renumbering, and model behavior
+
+### Output Formats
+- **PDB Files**: Standard protein structure format with predicted coordinates
+- **pRMSD Values**: Per-residue confidence estimates (stored in B-factor column)
+- **Embeddings**: Various learned representations for different model layers
+- **Return Objects**: Structured data containing coordinates, confidence scores, and metadata
+
+The system is designed to be flexible while maintaining compatibility with standard bioinformatics tools and file formats.
+
+*Sources: [README.md:51-162]()*
+
+---
+
+# Page: Installation and Setup
+
+# Installation and Setup
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [MANIFEST.in](MANIFEST.in)
+- [requirements.txt](requirements.txt)
+- [setup.cfg](setup.cfg)
+
+</details>
+
+
+
+This page provides comprehensive instructions for installing IgFold and configuring its dependencies. It covers core installation requirements, optional components for structure refinement, and various installation methods to get IgFold running in different environments.
+
+For information about using IgFold after installation, see [Quick Start Guide](#3). For details about specific dependencies and their roles in the architecture, see [Core Architecture](#5).
+
+## Prerequisites and System Requirements
+
+IgFold requires Python 3.7 or higher and is built on the PyTorch deep learning framework. The system has been tested on Linux, macOS, and Windows environments.
+
+### Core Dependencies
+
+The following diagram shows the essential dependencies installed with IgFold:
+
+**Core Dependency Structure**
+```mermaid
+graph TD
+    IgFold["igfold"] --> torch["torch>=1.7.1"]
+    IgFold --> lightning["pytorch-lightning>=1.5.10,<1.9.0"]
+    IgFold --> antiberty["antiberty>=0.1.1"] 
+    IgFold --> biopython["biopython>=1.79"]
+    IgFold --> einops["einops>=0.3.0"]
+    
+    subgraph "Deep Learning Stack"
+        torch
+        lightning
+        einops
+    end
+    
+    subgraph "Bioinformatics"
+        antiberty
+        biopython
+    end
+    
+    antiberty --> torch
+    lightning --> torch
+```
+
+Sources: [setup.cfg:9-14]()
+
+### System Requirements
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| Python | 3.7+ | 3.8+ |
+| RAM | 8GB | 16GB+ |
+| Storage | 2GB | 5GB+ |
+| GPU | None (CPU works) | CUDA-compatible GPU |
+
+## Core Installation
+
+### Method 1: pip Installation (Recommended)
+
+Install IgFold and its core dependencies using pip:
+
+```bash
+pip install igfold
+```
+
+This installs the packages specified in [setup.cfg:9-14](), including:
+- `torch` for deep learning computations
+- `pytorch-lightning` for model training infrastructure  
+- `antiberty` for antibody sequence embeddings
+- `biopython` for biological sequence and structure processing
+- `einops` for tensor operations
+
+### Method 2: Installation from Source
+
+For development or latest features:
+
+```bash
+git clone https://github.com/Graylab/IgFold.git
+cd IgFold
+pip install -e .
+```
+
+### Method 3: Conda Environment
+
+Create an isolated environment:
+
+```bash
+conda create -n igfold python=3.8
+conda activate igfold
+pip install igfold
+```
+
+Sources: [setup.cfg:1-15]()
+
+## Optional Dependencies
+
+IgFold supports additional components for enhanced functionality. The installation workflow depends on your intended use case:
+
+**Installation Decision Tree**
+```mermaid
+flowchart TD
+    Start["Start Installation"] --> CoreInstall["pip install igfold"]
+    CoreInstall --> NeedViz{"Need Visualization?"}
+    
+    NeedViz -->|Yes| InstallViz["pip install py3Dmol matplotlib seaborn"]
+    NeedViz -->|No| NeedRefine{"Need Structure Refinement?"}
+    
+    InstallViz --> NeedRefine
+    
+    NeedRefine -->|OpenMM| InstallOpenMM["conda install -c conda-forge openmm"]
+    NeedRefine -->|PyRosetta| InstallPyRosetta["Install PyRosetta (License Required)"]
+    NeedRefine -->|None| NeedAbNumber{"Need AbNumber Integration?"}
+    
+    InstallOpenMM --> NeedAbNumber
+    InstallPyRosetta --> NeedAbNumber
+    
+    NeedAbNumber -->|Yes| InstallAbNumber["pip install abnumber"]
+    NeedAbNumber -->|No| Complete["Installation Complete"]
+    
+    InstallAbNumber --> Complete
+```
+
+### Visualization Dependencies
+
+For Jupyter notebook visualization and plotting capabilities:
+
+```bash
+pip install py3Dmol matplotlib seaborn
+```
+
+These dependencies enable:
+- `py3Dmol`: 3D structure visualization in notebooks
+- `matplotlib` and `seaborn`: Plotting and analysis charts
+
+### Structure Refinement Options
+
+#### OpenMM Integration
+
+For molecular dynamics-based structure refinement:
+
+```bash
+conda install -c conda-forge openmm
+```
+
+OpenMM enables post-prediction structure optimization through the refinement pipeline.
+
+#### PyRosetta Integration  
+
+PyRosetta requires a license and separate installation:
+
+1. Obtain license from [https://www.pyrosetta.org/](https://www.pyrosetta.org/)
+2. Install following PyRosetta documentation
+3. Verify installation with: `python -c "import pyrosetta; pyrosetta.init()"`
+
+### AbNumber Integration
+
+For antibody numbering and CDR identification:
+
+```bash
+pip install abnumber
+```
+
+Sources: [requirements.txt:1-13]()
+
+## Package Structure and Trained Models
+
+The IgFold installation includes pre-trained model weights automatically:
+
+**Package Installation Components**
+```mermaid
+graph TD
+    PackageInstall["Package Installation"] --> CoreCode["igfold Python Package"]
+    PackageInstall --> TrainedModels["Pre-trained Models"]
+    PackageInstall --> License["LICENSE.md"]
+    
+    CoreCode --> Runner["IgFoldRunner Class"]
+    CoreCode --> Models["Model Architecture Code"]
+    CoreCode --> Utils["Utility Functions"]
+    
+    TrainedModels --> IgFoldWeights["IgFold Model Weights"]
+    
+    subgraph "Included Files"
+        IgFoldWeights
+        License
+    end
+    
+    Runner --> IgFoldWeights
+```
+
+The trained models are automatically included via [MANIFEST.in:1]() which specifies `igfold/trained_models/IgFold/*` files.
+
+Sources: [MANIFEST.in:1-2]()
+
+## Installation Verification
+
+Verify your installation by running basic functionality tests:
+
+```python
+# Test core installation
+from igfold import IgFoldRunner
+igfold = IgFoldRunner()
+print("IgFold successfully installed")
+
+# Test dependencies
+import torch
+import antiberty
+import Bio
+print(f"PyTorch version: {torch.__version__}")
+print(f"AntiBERTy available: {antiberty is not None}")
+print(f"BioPython available: {Bio is not None}")
+```
+
+### GPU Verification
+
+Check CUDA availability for GPU acceleration:
+
+```python
+import torch
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU device: {torch.cuda.get_device_name(0)}")
+```
+
+## Troubleshooting Common Issues
+
+### PyTorch Installation Issues
+
+If PyTorch installation fails, install manually with appropriate CUDA version:
+
+```bash
+# CPU only
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# CUDA 11.8
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+```
+
+### Version Conflicts
+
+IgFold requires specific PyTorch Lightning versions [setup.cfg:13](). If conflicts arise:
+
+```bash
+pip install "pytorch-lightning>=1.5.10,<1.9.0"
+```
+
+### Memory Issues
+
+For systems with limited RAM, consider:
+- Using CPU-only inference
+- Processing smaller batches
+- Increasing system swap space
+
+### Import Errors
+
+If `import igfold` fails, verify installation:
+
+```bash
+pip list | grep igfold
+python -c "import sys; print(sys.path)"
+```
+
+Sources: [setup.cfg:9-14](), [requirements.txt:1-13]()
+
+---
+
+# Page: Quick Start Guide
+
+# Quick Start Guide
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [igfold/IgFoldRunner.py](igfold/IgFoldRunner.py)
+
+</details>
+
+
+
+This guide provides the fastest path to making your first antibody structure predictions with IgFold. It covers the essential workflows using the `IgFoldRunner` API with minimal configuration. For detailed installation instructions, see [Installation and Setup](#2). For comprehensive API documentation, see [IgFoldRunner API](#4.1).
+
+## Essential Workflow
+
+The core IgFold workflow involves three main steps: initialization, sequence input, and structure prediction. The `IgFoldRunner` class serves as the primary interface for all prediction tasks.
+
+**Basic IgFold Prediction Workflow**
+```mermaid
+graph TD
+    INIT["IgFoldRunner()"] --> INPUT["sequences = {'H': '...', 'L': '...'}"]
+    INPUT --> FOLD["igfold.fold(pdb_file, sequences=sequences)"]
+    FOLD --> PDB["Output: Structure PDB + pRMSD values"]
+    
+    FOLD --> REFINE{"do_refine=True?"}
+    REFINE -->|Yes| PYROSETTA["PyRosetta/OpenMM refinement"]
+    REFINE -->|No| RENUM{"do_renum=True?"}
+    PYROSETTA --> RENUM
+    RENUM -->|Yes| ABNUMBER["AbNumber renumbering"]
+    RENUM -->|No| PDB
+    ABNUMBER --> PDB
+```
+
+Sources: [README.md:49-94](), [igfold/IgFoldRunner.py:77-124]()
+
+## Quick Start: Paired Antibody Prediction
+
+The most common use case is predicting structures from paired heavy and light chain sequences:
+
+```python
+from igfold import IgFoldRunner
+
+# Initialize the runner (loads pre-trained models)
+igfold = IgFoldRunner()
+
+# Define your antibody sequences
+sequences = {
+    "H": "EVQLVQSGPEVKKPGTSVKVSCKASGFTFMSSAVQWVRQARGQRLEWIGWIVIGSGNTNYAQKFQERVTITRDMSTSTAYMELSSLRSEDTAVYYCAAPYCSSISCNDGFDIWGQGTMVTVS",
+    "L": "DVVMTQTPFSLPVSLGDQASISCRSSQSLVHSNGNTYLHWYLQKPGQSPKLLIYKVSNRFSGVPDRFSGSGSGTDFTLKISRVEAEDLGVYFCSQSTHVPYTFGGGTKLEIK"
+}
+
+# Predict structure
+igfold.fold(
+    "my_antibody.pdb",        # Output filename
+    sequences=sequences,       # Input sequences
+    do_refine=False,          # Skip refinement for speed
+    do_renum=False            # Skip renumbering for speed
+)
+```
+
+**Key Components in Code**
+```mermaid
+graph LR
+    USER["User Input"] --> IGFOLDRUNNER["IgFoldRunner.__init__()"]
+    IGFOLDRUNNER --> ANTIBERTY["self.antiberty: AntiBERTyRunner"]
+    IGFOLDRUNNER --> MODELS["self.models: List[IgFold]"]
+    
+    SEQUENCES["sequences dict"] --> FOLD["IgFoldRunner.fold()"]
+    FOLD --> FOLDING_UTILS["igfold.utils.folding.fold()"]
+    
+    ANTIBERTY --> FOLDING_UTILS
+    MODELS --> FOLDING_UTILS
+    FOLDING_UTILS --> PDB_OUTPUT["PDB file output"]
+```
+
+Sources: [igfold/IgFoldRunner.py:26-76](), [igfold/IgFoldRunner.py:77-104](), [README.md:53-72]()
+
+## Single Chain Prediction (Nanobodies)
+
+For single heavy chain antibodies (nanobodies) or individual chains:
+
+```python
+from igfold import IgFoldRunner
+
+igfold = IgFoldRunner()
+
+sequences = {
+    "H": "QVQLQESGGGLVQAGGSLTLSCAVSGLTFSNYAMGWFRQAPGKEREFVAAITWDGGNTYYTDSVKGRFTISRDNAKNTVFLQMNSLKPEDTAVYYCAAKLLGSSRYELALAGYDYWGQGTQVTVS"
+}
+
+igfold.fold(
+    "my_nanobody.pdb",
+    sequences=sequences,
+    do_refine=False,
+    do_renum=False
+)
+```
+
+Sources: [README.md:74-94]()
+
+## Understanding Prediction Outputs
+
+The `fold()` method returns an output object containing structure coordinates and confidence estimates:
+
+```python
+# Capture the output for analysis
+out = igfold.fold(
+    "my_antibody.pdb",
+    sequences=sequences,
+    do_refine=False,
+    do_renum=False
+)
+
+# Access predicted RMSD values (stored in B-factor column of PDB)
+predicted_rmsd = out.prmsd  # Shape: (1, sequence_length, 4)
+```
+
+**Output Data Flow**
+```mermaid
+graph TD
+    FOLD_METHOD["IgFoldRunner.fold()"] --> FOLDING_UTILS["utils.folding.fold()"]
+    FOLDING_UTILS --> MODEL_OUTPUT["IgFold model predictions"]
+    
+    MODEL_OUTPUT --> COORDS["3D coordinates"]
+    MODEL_OUTPUT --> PRMSD["predicted RMSD values"]
+    
+    COORDS --> PDB_FILE["PDB file with coordinates"]
+    PRMSD --> B_FACTOR["B-factor column in PDB"]
+    PRMSD --> RETURN_OBJ["output.prmsd attribute"]
+    
+    PDB_FILE --> REFINEMENT{"refinement enabled?"}
+    REFINEMENT -->|Yes| REFINED_PDB["Refined PDB structure"]
+    REFINEMENT -->|No| FINAL_PDB["Final PDB output"]
+    REFINED_PDB --> FINAL_PDB
+```
+
+Sources: [README.md:115-140](), [igfold/IgFoldRunner.py:105-124]()
+
+## Quick Sequence Embedding
+
+For machine learning applications, extract embeddings without full structure prediction:
+
+```python
+from igfold import IgFoldRunner
+
+igfold = IgFoldRunner()
+
+sequences = {
+    "H": "EVQLVQSGPEVKKPGTSVKVSCKASGFTFMSSAVQWVRQARGQRLEWIGWIVIGSGNTNYAQKFQERVTITRDMSTSTAYMELSSLRSEDTAVYYCAAPYCSSISCNDGFDIWGQGTMVTVS",
+    "L": "DVVMTQTPFSLPVSLGDQASISCRSSQSLVHSNGNTYLHWYLQKPGQSPKLLIYKVSNRFSGVPDRFSGSGSGTDFT"
+}
+
+emb = igfold.embed(sequences=sequences)
+
+# Access different representation layers
+bert_embeddings = emb.bert_embs        # AntiBERTy embeddings (1, L, 512)
+graph_embeddings = emb.gt_embs         # Graph transformer embeddings (1, L, 64)  
+structure_embeddings = emb.structure_embs  # Structure-aware embeddings (1, L, 64)
+```
+
+**Embedding Pipeline Components**
+```mermaid
+graph TD
+    EMBED_METHOD["IgFoldRunner.embed()"] --> EMBED_UTILS["utils.embed.embed()"]
+    EMBED_UTILS --> ANTIBERTY_MODEL["self.antiberty model"]
+    EMBED_UTILS --> IGFOLD_MODEL["self.models[model_idx]"]
+    
+    ANTIBERTY_MODEL --> BERT_EMBS["bert_embs: AntiBERTy output"]
+    IGFOLD_MODEL --> GT_EMBS["gt_embs: Graph transformer output"]
+    IGFOLD_MODEL --> STRUCT_EMBS["structure_embs: IPA output"]
+    
+    BERT_EMBS --> EMB_OBJECT["EmbeddingOutput object"]
+    GT_EMBS --> EMB_OBJECT
+    STRUCT_EMBS --> EMB_OBJECT
+```
+
+Sources: [igfold/IgFoldRunner.py:126-158](), [README.md:142-162]()
+
+## Common Parameters Quick Reference
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `do_refine` | `True` | Enable PyRosetta/OpenMM structure refinement |
+| `use_openmm` | `False` | Prefer OpenMM over PyRosetta for refinement |
+| `do_renum` | `True` | Renumber output using AbNumber (Chothia scheme) |
+| `num_models` | `4` | Number of ensemble models to use (1-4) |
+| `model_idx` | `0` | Specific model index for embedding |
+
+Sources: [igfold/IgFoldRunner.py:30-44](), [igfold/IgFoldRunner.py:77-104]()
+
+## Next Steps
+
+- For refinement setup with PyRosetta or OpenMM, see [Installation and Setup](#2)
+- For detailed parameter descriptions and advanced options, see [IgFoldRunner API](#4.1)
+- For visualization and analysis of results, see [Output Analysis and Visualization](#4.4)
+- For Jupyter notebook examples with interactive visualization, see [Jupyter Notebook Interface](#4.2)
+
+---
+
+# Page: User Guide
+
+# User Guide
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [igfold/IgFoldRunner.py](igfold/IgFoldRunner.py)
+
+</details>
+
+
+
+This guide provides comprehensive documentation for using IgFold's main interfaces and features for antibody structure prediction and analysis. It covers the core workflows, configuration options, and usage patterns for both programmatic and interactive use.
+
+For detailed API documentation, see [IgFoldRunner API](#4.1). For interactive usage, see [Jupyter Notebook Interface](#4.2). For input format specifications, see [Input Formats and Data Preparation](#4.3). For output analysis, see [Output Analysis and Visualization](#4.4).
+
+## Core System Overview
+
+IgFold provides two primary interfaces for antibody structure prediction and analysis through the `IgFoldRunner` class. The system processes antibody sequences through deep learning models to generate 3D structures and molecular embeddings.
+
+### Main IgFold Workflow
+
+```mermaid
+flowchart TD
+    User["User"] --> IgFoldRunner["IgFoldRunner"]
+    IgFoldRunner --> fold_method["fold()"]
+    IgFoldRunner --> embed_method["embed()"]
+    
+    fold_method --> sequence_input["sequences dict"]
+    fold_method --> options["refinement/numbering options"]
+    
+    sequence_input --> AntiBERTy["AntiBERTy"]
+    sequence_input --> IgFold_models["IgFold models (1-4)"]
+    
+    AntiBERTy --> embeddings["BERT embeddings"]
+    embeddings --> IgFold_models
+    
+    IgFold_models --> coordinates["3D coordinates"]
+    IgFold_models --> prmsd["predicted RMSD"]
+    
+    coordinates --> refinement_choice{"refinement?"}
+    refinement_choice -->|"do_refine=True"| PyRosetta["PyRosetta"]
+    refinement_choice -->|"use_openmm=True"| OpenMM["OpenMM"]
+    refinement_choice -->|"do_refine=False"| pdb_output["PDB file"]
+    
+    PyRosetta --> renumbering_choice{"renumber?"}
+    OpenMM --> renumbering_choice
+    
+    renumbering_choice -->|"do_renum=True"| AbNumber["AbNumber"]
+    renumbering_choice -->|"do_renum=False"| pdb_output
+    
+    AbNumber --> pdb_output
+    
+    embed_method --> embeddings_output["bert_embs, gt_embs, structure_embs"]
+    
+    style IgFoldRunner fill:#f9f9f9
+    style fold_method fill:#e8f4f8
+    style embed_method fill:#e8f4f8
+```
+
+Sources: [README.md:48-185](), [igfold/IgFoldRunner.py:26-158]()
+
+### Code Entity Mapping
+
+```mermaid
+graph TB
+    subgraph "IgFoldRunner Class"
+        init_method["__init__()"]
+        fold_method["fold()"]  
+        embed_method["embed()"]
+        models_attr["self.models"]
+        antiberty_attr["self.antiberty"]
+    end
+    
+    subgraph "Core Dependencies"
+        AntiBERTyRunner["AntiBERTyRunner"]
+        IgFold_class["IgFold"]
+        fold_util["igfold.utils.folding.fold"]
+        embed_util["igfold.utils.embed.embed"]
+    end
+    
+    subgraph "Refinement Modules"
+        pyrosetta_ref["igfold.refine.pyrosetta_ref"]
+        openmm_ref["igfold.refine.openmm_ref"]
+    end
+    
+    subgraph "Output Processing"
+        abnumber["AbNumber"]
+        pdb_utils["PDB utilities"]
+    end
+    
+    init_method --> AntiBERTyRunner
+    init_method --> IgFold_class
+    init_method --> models_attr
+    init_method --> antiberty_attr
+    
+    fold_method --> fold_util
+    embed_method --> embed_util
+    
+    fold_util --> pyrosetta_ref
+    fold_util --> openmm_ref
+    fold_util --> abnumber
+    fold_util --> pdb_utils
+    
+    style IgFoldRunner fill:#f9f9f9
+```
+
+Sources: [igfold/IgFoldRunner.py:26-75](), [igfold/IgFoldRunner.py:77-124](), [igfold/IgFoldRunner.py:126-158]()
+
+## Primary Usage Patterns
+
+### Structure Prediction with fold()
+
+The `fold()` method is the primary interface for antibody structure prediction. It accepts sequence dictionaries and produces PDB files with optional refinement and renumbering.
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `pdb_file` | str | Output PDB file path | Required |
+| `sequences` | dict | Chain name to sequence mapping | None |
+| `fasta_file` | str | Alternative input via FASTA | None |
+| `template_pdb` | str | Template structure for guidance | None |
+| `do_refine` | bool | Enable structure refinement | True |
+| `use_openmm` | bool | Use OpenMM over PyRosetta | False |
+| `do_renum` | bool | Renumber with AbNumber (Chothia) | True |
+| `truncate_sequences` | bool | Truncate sequences with AbNumber | False |
+
+### Embedding Generation with embed()
+
+The `embed()` method generates molecular representations without full structure prediction, useful for machine learning features.
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `model_idx` | int | Which model to use (0-3) | 0 |
+| `sequences` | dict | Chain name to sequence mapping | None |
+| `fasta_file` | str | Alternative input via FASTA | None |
+| `template_pdb` | str | Template structure for guidance | None |
+
+Sources: [igfold/IgFoldRunner.py:77-124](), [igfold/IgFoldRunner.py:126-158]()
+
+## Sequence Input Specifications
+
+### Sequence Dictionary Format
+
+Antibody sequences are provided as Python dictionaries where keys represent chain identifiers and values contain amino acid sequences:
+
+```python
+# Paired antibody (Fab)
+sequences = {
+    "H": "EVQLVQSGPEVKKPGTSVKVSCKASGFTF...",  # Heavy chain
+    "L": "DVVMTQTPFSLPVSLGDQASISCRSSQSL..."   # Light chain
+}
+
+# Single chain (nanobody)
+sequences = {
+    "H": "QVQLQESGGGLVQAGGSLTLSCAVSGLTF..."   # Heavy chain only
+}
+```
+
+### Chain Naming Conventions
+
+| Chain Type | Identifier | Description |
+|------------|------------|-------------|
+| Heavy chain | "H" | Antibody heavy chain or nanobody |
+| Light chain | "L" | Antibody light chain (kappa or lambda) |
+| Custom | Any string | User-defined chain identifier |
+
+Sources: [README.md:51-94]()
+
+## Model Configuration
+
+### Multi-Model Ensemble
+
+`IgFoldRunner` supports ensemble prediction using 1-4 pre-trained models for improved accuracy:
+
+```python
+# Use all 4 pre-trained models (default)
+igfold = IgFoldRunner(num_models=4)
+
+# Use single model for faster prediction
+igfold = IgFoldRunner(num_models=1)
+
+# Use custom model checkpoints
+igfold = IgFoldRunner(model_ckpts=["path/to/model1.ckpt", "path/to/model2.ckpt"])
+```
+
+### Device Selection
+
+The system automatically detects and uses CUDA GPUs when available, with CPU fallback:
+
+```python
+# Enable GPU usage (default)
+igfold = IgFoldRunner(try_gpu=True)
+
+# Force CPU usage
+igfold = IgFoldRunner(try_gpu=False)
+```
+
+Sources: [igfold/IgFoldRunner.py:30-75]()
+
+## Processing Options
+
+### Structure Refinement
+
+IgFold supports two refinement methods for improving structural quality:
+
+```mermaid
+flowchart LR
+    raw_coords["Raw Coordinates"] --> refinement_check{"do_refine=True?"}
+    
+    refinement_check -->|"No"| output["PDB Output"]
+    refinement_check -->|"Yes"| method_check{"use_openmm?"}
+    
+    method_check -->|"False"| PyRosetta["PyRosetta Refinement"]
+    method_check -->|"True"| OpenMM["OpenMM Refinement"]
+    
+    PyRosetta --> output
+    OpenMM --> output
+    
+    style refinement_check fill:#f9f9f9
+    style method_check fill:#f9f9f9
+```
+
+### Renumbering Options
+
+Antibody renumbering standardizes residue numbering schemes using AbNumber:
+
+| Scheme | Description | Usage |
+|--------|-------------|--------|
+| Chothia | Default renumbering scheme | `do_renum=True` |
+| Original | Keep original numbering | `do_renum=False` |
+
+Sources: [README.md:31-44](), [README.md:166-185]()
+
+## Output Data Types
+
+### Structure Prediction Output
+
+The `fold()` method returns an object containing:
+
+- **Coordinates**: 3D atomic positions
+- **pRMSD values**: Per-residue predicted RMSD stored in B-factor column
+- **PDB file**: Written to specified output path
+
+### Embedding Output  
+
+The `embed()` method returns representations at multiple levels:
+
+| Embedding Type | Attribute | Shape | Description |
+|----------------|-----------|-------|-------------|
+| BERT embeddings | `bert_embs` | (1, L, 512) | AntiBERTy final hidden layer |
+| Graph embeddings | `gt_embs` | (1, L, 64) | After graph transformer layers |
+| Structure embeddings | `structure_embs` | (1, L, 64) | After template incorporation |
+
+Sources: [README.md:115-141](), [README.md:144-162]()
+
+## Common Use Cases
+
+### Single Chain Prediction
+For nanobodies or individual heavy/light chains, provide one sequence in the dictionary.
+
+### Paired Chain Prediction  
+For traditional antibodies (Fab), provide both heavy ("H") and light ("L") chain sequences.
+
+### Template-Guided Prediction
+When experimental structures are available, use `template_pdb` parameter for improved accuracy.
+
+### High-Throughput Processing
+Use `num_models=1` and `do_refine=False` for faster batch processing of many sequences.
+
+### Feature Extraction
+Use `embed()` method to generate molecular representations for downstream machine learning tasks.
+
+Sources: [README.md:48-113](), [README.md:144-162]()
+
+---
+
+# Page: IgFoldRunner API
+
+# IgFoldRunner API
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/IgFoldRunner.py](igfold/IgFoldRunner.py)
+- [igfold/utils/embed.py](igfold/utils/embed.py)
+- [igfold/utils/folding.py](igfold/utils/folding.py)
+
+</details>
+
+
+
+The `IgFoldRunner` class provides the primary programmatic interface for antibody structure prediction and embedding generation using IgFold. This API encapsulates model loading, sequence processing, and prediction workflows in a convenient Python interface.
+
+This documentation covers the core API methods `fold()` and `embed()` and their parameters. For interactive usage through Jupyter notebooks, see [Jupyter Notebook Interface](#4.2). For details on input data formats, see [Input Formats and Data Preparation](#4.3).
+
+## Class Initialization
+
+The `IgFoldRunner` class manages multiple pre-trained IgFold models and the AntiBERTy embedding model required for predictions.
+
+### Constructor Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `num_models` | `int` | `4` | Number of pre-trained IgFold models to load (1-4) |
+| `model_ckpts` | `List[str]` | `None` | Custom model checkpoint paths (overrides `num_models`) |
+| `try_gpu` | `bool` | `True` | Whether to attempt GPU usage for acceleration |
+
+### Initialization Process
+
+```mermaid
+flowchart TD
+    init["IgFoldRunner.__init__()"] --> license["display_license()"]
+    license --> check_ckpts{"model_ckpts provided?"}
+    
+    check_ckpts -->|Yes| load_custom["Load custom checkpoints"]
+    check_ckpts -->|No| validate["Validate num_models (1-4)"]
+    
+    validate --> find_ckpts["Find pre-trained models in trained_models/IgFold/"]
+    find_ckpts --> load_custom
+    
+    load_custom --> device_check["Detect CUDA device"]
+    device_check --> load_igfold["Load IgFold models to device"]
+    
+    load_igfold --> load_antiberty["Load AntiBERTy model"]
+    load_antiberty --> ready["IgFoldRunner ready"]
+    
+    style init fill:#f9f9f9
+    style ready fill:#e8f5e8
+```
+
+Sources: [igfold/IgFoldRunner.py:26-76]()
+
+## Core API Methods
+
+### fold() Method
+
+The `fold()` method performs complete antibody structure prediction, including coordinate generation, refinement, and PDB output.
+
+#### Method Signature
+
+```python
+def fold(
+    self,
+    pdb_file,
+    fasta_file=None,
+    sequences=None,
+    template_pdb=None,
+    ignore_cdrs=None,
+    ignore_chain=None,
+    skip_pdb=False,
+    do_refine=True,
+    use_openmm=False,
+    do_renum=True,
+    truncate_sequences=False,
+) -> IgFoldOutput
+```
+
+#### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pdb_file` | `str` | Required | Output PDB file path |
+| `fasta_file` | `str` | `None` | Input FASTA file containing sequences |
+| `sequences` | `Dict[str, str]` | `None` | Dictionary mapping chain IDs to sequences |
+| `template_pdb` | `str` | `None` | Template PDB file for structure guidance |
+| `ignore_cdrs` | `List[str]` or `str` or `bool` | `None` | CDR regions to ignore in template |
+| `ignore_chain` | `str` | `None` | Chain to ignore in template ("H" or "L") |
+| `skip_pdb` | `bool` | `False` | Skip PDB file writing and processing |
+| `do_refine` | `bool` | `True` | Perform structure refinement |
+| `use_openmm` | `bool` | `False` | Use OpenMM instead of PyRosetta for refinement |
+| `do_renum` | `bool` | `True` | Renumber output PDB using AbNumber |
+| `truncate_sequences` | `bool` | `False` | Truncate sequences to antibody variable domains |
+
+#### Processing Pipeline
+
+```mermaid
+flowchart TD
+    fold_call["fold()"] --> get_seq["get_sequence_dict()"]
+    get_seq --> trunc_check{"truncate_sequences?"}
+    
+    trunc_check -->|Yes| truncate["truncate_seq() via AbNumber"]
+    trunc_check -->|No| create_fasta["Create FASTA file if needed"]
+    truncate --> create_fasta
+    
+    create_fasta --> antiberty["AntiBERTy.embed()"]
+    antiberty --> process_template["process_template()"]
+    
+    process_template --> create_input["Create IgFoldInput"]
+    create_input --> model_ensemble["Run model ensemble"]
+    
+    model_ensemble --> select_best["Select best model by pRMSD"]
+    select_best --> process_pred["process_prediction()"]
+    
+    process_pred --> refine_check{"do_refine?"}
+    refine_check -->|Yes| refine_type{"use_openmm?"}
+    refine_check -->|No| renum_check
+    
+    refine_type -->|Yes| openmm["OpenMM refinement"]
+    refine_type -->|No| pyrosetta["PyRosetta refinement"]
+    
+    openmm --> renum_check{"do_renum?"}
+    pyrosetta --> renum_check
+    
+    renum_check -->|Yes| abnumber["AbNumber renumbering"]
+    renum_check -->|No| bfactor["Write B-factors"]
+    abnumber --> bfactor
+    
+    bfactor --> return_output["Return IgFoldOutput"]
+    
+    style antiberty fill:#e1f5fe
+    style model_ensemble fill:#fff3e0
+    style openmm fill:#ffcc99
+    style pyrosetta fill:#ffcc99
+```
+
+Sources: [igfold/IgFoldRunner.py:77-124](), [igfold/utils/folding.py:153-231]()
+
+### embed() Method
+
+The `embed()` method generates structural embeddings without full coordinate prediction, useful for analysis and feature extraction.
+
+#### Method Signature
+
+```python
+def embed(
+    self,
+    model_idx=0,
+    fasta_file=None,
+    sequences=None,
+    template_pdb=None,
+    ignore_cdrs=None,
+    ignore_chain=None,
+) -> IgFoldOutput
+```
+
+#### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model_idx` | `int` | `0` | Index of loaded model to use for embedding |
+| `fasta_file` | `str` | `None` | Input FASTA file containing sequences |
+| `sequences` | `Dict[str, str]` | `None` | Dictionary mapping chain IDs to sequences |
+| `template_pdb` | `str` | `None` | Template PDB file for structure guidance |
+| `ignore_cdrs` | `List[str]` or `str` or `bool` | `None` | CDR regions to ignore in template |
+| `ignore_chain` | `str` | `None` | Chain to ignore in template ("H" or "L") |
+
+#### Embedding Pipeline
+
+```mermaid
+flowchart TD
+    embed_call["embed()"] --> get_seq_emb["get_sequence_dict()"]
+    get_seq_emb --> antiberty_emb["AntiBERTy.embed()"]
+    
+    antiberty_emb --> process_template_emb["process_template()"]
+    process_template_emb --> create_input_emb["Create IgFoldInput"]
+    
+    create_input_emb --> single_model["Run single IgFold model"]
+    single_model --> reshape_prmsd["Reshape pRMSD output"]
+    
+    reshape_prmsd --> return_embeddings["Return embeddings + pRMSD"]
+    
+    style antiberty_emb fill:#e1f5fe
+    style single_model fill:#fff3e0
+```
+
+Sources: [igfold/IgFoldRunner.py:126-158](), [igfold/utils/embed.py:7-53]()
+
+## Parameter Details
+
+### CDR Specification
+
+The `ignore_cdrs` parameter accepts multiple formats:
+
+- `False`: No CDRs ignored (include all)
+- `List[str]`: Specific CDRs to ignore (e.g., `["h1", "h3", "l2"]`)
+- `str`: Single CDR to ignore (e.g., `"h3"`)
+- Default `None`: Uses default CDR masking
+
+Valid CDR identifiers: `["h1", "h2", "h3", "l1", "l2", "l3"]`
+
+### Input Source Priority
+
+When both `sequences` and `fasta_file` are provided, the FASTA file takes precedence:
+
+```mermaid
+flowchart LR
+    input_check{"Input provided?"} --> both["Both sequences + fasta_file"]
+    input_check --> fasta_only["fasta_file only"]
+    input_check --> seq_only["sequences only"]
+    input_check --> none["Neither"]
+    
+    both --> use_fasta["Use FASTA file"]
+    fasta_only --> use_fasta
+    seq_only --> use_seq["Use sequences dict"]
+    none --> error["Exit with error"]
+    
+    style use_fasta fill:#e8f5e8
+    style error fill:#ffebee
+```
+
+Sources: [igfold/utils/folding.py:13-27]()
+
+## Return Values
+
+Both methods return an `IgFoldOutput` object containing:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `coords` | `torch.Tensor` | Predicted 3D coordinates |
+| `prmsd` | `torch.Tensor` | Per-residue predicted RMSD values |
+| `embeddings` | `torch.Tensor` | Structural embeddings (when requested) |
+| Additional model outputs | Various | Intermediate representations and predictions |
+
+## Usage Examples
+
+### Basic Structure Prediction
+
+```python
+from igfold import IgFoldRunner
+
+# Initialize runner
+igfold = IgFoldRunner(num_models=2)
+
+# Predict structure from sequences
+sequences = {
+    "H": "QVQLVQSGAEVKKPGASVKVSCKASGYTFT...",
+    "L": "DIQMTQSPSSLSASVGDRVTITC..."
+}
+
+result = igfold.fold(
+    pdb_file="antibody.pdb",
+    sequences=sequences,
+    do_refine=True,
+    do_renum=True
+)
+```
+
+### Template-Guided Prediction
+
+```python
+# Use template structure for guidance
+result = igfold.fold(
+    pdb_file="predicted.pdb",
+    fasta_file="input.fasta",
+    template_pdb="template.pdb",
+    ignore_cdrs=["h3", "l3"],  # Ignore hypervariable regions
+    do_refine=False
+)
+```
+
+Sources: [igfold/IgFoldRunner.py:77-158]()
+
+---
+
+# Page: Jupyter Notebook Interface
+
+# Jupyter Notebook Interface
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [IgFold.ipynb](IgFold.ipynb)
+- [igfold/utils/visualize.py](igfold/utils/visualize.py)
+
+</details>
+
+
+
+The Jupyter Notebook Interface provides an interactive web-based environment for antibody structure prediction with integrated 3D visualization and analysis tools. This interface is designed for users who want immediate visual feedback and interactive exploration of prediction results. For programmatic access to IgFold functionality, see [IgFoldRunner API](#4.1).
+
+## Notebook Structure and Workflow
+
+The main IgFold notebook consists of six sequential cells that guide users through the complete structure prediction workflow:
+
+```mermaid
+flowchart TD
+    INPUT["Input Configuration Cell"]
+    INSTALL["Dependency Installation Cell"]
+    PREDICT["Structure Prediction Cell"] 
+    PLOT["pRMSD Analysis Cell"]
+    VISUALIZE["3D Visualization Cell"]
+    DOWNLOAD["Results Download Cell"]
+
+    INPUT --> INSTALL
+    INSTALL --> PREDICT
+    PREDICT --> PLOT
+    PREDICT --> VISUALIZE
+    PLOT --> DOWNLOAD
+    VISUALIZE --> DOWNLOAD
+
+    INPUT -.-> |"name, sequences, options"| PREDICT
+    PREDICT -.-> |"pred_pdb, prmsd"| PLOT
+    PREDICT -.-> |"pred_pdb"| VISUALIZE
+```
+
+**Cell Execution Workflow**
+Sources: [IgFold.ipynb:1-199]()
+
+### Input Configuration Cell
+
+Users configure their prediction job through form-based input widgets:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `name` | string | Prediction job name and output directory |
+| `heavy_sequence` | string | Heavy chain amino acid sequence |
+| `light_sequence` | string | Light chain amino acid sequence |
+| `do_refine` | boolean | Enable OpenMM structural refinement |
+| `do_renum` | boolean | Apply AbNumber renumbering scheme |
+| `single_model` | boolean | Use single model vs ensemble prediction |
+
+The notebook builds a `sequences` dictionary from the provided heavy and light chain sequences [IgFold.ipynb:38-42]().
+
+Sources: [IgFold.ipynb:23-49]()
+
+### Dependency Installation Cell
+
+The notebook automatically handles dependency installation based on user configuration:
+
+```mermaid
+graph LR
+    CONFIG["User Configuration"] --> CONDA["Conda Installation"]
+    CONDA --> IGFOLD["IgFold + PyTorch"]
+    CONFIG --> REFINE_CHECK{Refinement?}
+    CONFIG --> RENUM_CHECK{Renumbering?}
+    
+    REFINE_CHECK -->|Yes| OPENMM["OpenMM + PDBFixer"]
+    RENUM_CHECK -->|Yes| ABNUMBER["AbNumber"]
+    
+    IGFOLD --> READY["Environment Ready"]
+    OPENMM --> READY
+    ABNUMBER --> READY
+```
+
+**Dependency Installation Flow**
+
+The installation process creates marker files (`CONDA_READY`, `CODE_READY`, `AMBER_READY`, `ABNUMBER_READY`) to avoid redundant installations [IgFold.ipynb:65-89]().
+
+Sources: [IgFold.ipynb:61-89]()
+
+## Interactive Structure Prediction
+
+### Core Prediction Workflow
+
+The notebook interfaces with the core `IgFoldRunner` API to perform structure prediction:
+
+```mermaid
+sequenceDiagram
+    participant NB as "Notebook Cell"
+    participant IGF as "IgFoldRunner"
+    participant VIZ as "Visualization Functions"
+
+    NB->>IGF: "Initialize with num_models"
+    NB->>IGF: "fold(pred_pdb, sequences, options)"
+    IGF-->>NB: "prediction results + prmsd"
+    NB->>VIZ: "show_pdb(pred_pdb, styling)"
+    VIZ-->>NB: "py3Dmol viewer object"
+```
+
+**Prediction and Visualization Integration**
+
+The prediction cell creates an `IgFoldRunner` instance and calls the `fold()` method with user-specified parameters [IgFold.ipynb:109-119]():
+
+```python
+igfold = IgFoldRunner(num_models=num_models)
+pred = igfold.fold(
+    pred_pdb,
+    sequences=sequences,
+    do_refine=do_refine,
+    use_openmm=True,
+    do_renum=do_renum,
+)
+```
+
+Sources: [IgFold.ipynb:101-120]()
+
+## Visualization Capabilities
+
+### 3D Structure Visualization
+
+The notebook provides interactive 3D structure viewing through the `show_pdb()` function from [igfold/utils/visualize.py:13-28]():
+
+```mermaid
+graph TD
+    SHOW_PDB["show_pdb()"] --> PY3DMOL["py3Dmol.view()"]
+    
+    STYLING["Styling Options"] --> SHOW_PDB
+    STYLING --> CARTOON["Cartoon representation"]
+    STYLING --> STICKS["Side chain sticks"]
+    STYLING --> COLORS["Color schemes"]
+    
+    COLORS --> RAINBOW["Spectrum coloring"]
+    COLORS --> CHAIN["Chain-based coloring"] 
+    COLORS --> BFACTOR["B-factor coloring"]
+    
+    PY3DMOL --> INTERACTIVE["Interactive 3D View"]
+```
+
+**3D Visualization Architecture**
+
+| Visualization Mode | Color Scheme | Purpose |
+|-------------------|--------------|---------|
+| `rainbow` | Spectrum | Chain topology overview |
+| `chain` | Per-chain colors | Multi-chain distinction |
+| `b` | B-factor gradient | Confidence visualization |
+
+The notebook displays structures with side chain sticks enabled and configurable backbone representation [IgFold.ipynb:120]().
+
+Sources: [igfold/utils/visualize.py:13-138](), [IgFold.ipynb:120](), [IgFold.ipynb:151]()
+
+### Per-Residue Confidence Analysis
+
+The notebook generates predicted RMSD plots using the `plot_prmsd()` function:
+
+```mermaid
+graph LR
+    PRMSD_DATA["pred.prmsd tensor"] --> PLOT_FUNC["plot_prmsd()"]
+    SEQ_DATA["sequences dict"] --> PLOT_FUNC
+    CDR_OPTION["do_renum flag"] --> PLOT_FUNC
+    PDB_FILE["pred_pdb"] --> PLOT_FUNC
+    
+    PLOT_FUNC --> MATPLOTLIB["Matplotlib Figure"]
+    PLOT_FUNC --> CDR_SHADING["CDR Region Highlighting"]
+    PLOT_FUNC --> CHAIN_SUBPLOTS["Per-Chain Subplots"]
+    
+    MATPLOTLIB --> PNG_OUTPUT["PNG Output File"]
+```
+
+**pRMSD Plotting Workflow**
+
+The plotting function [igfold/utils/visualize.py:141-184]() processes the predicted RMSD tensor, splits it by chain, and optionally overlays CDR region annotations when renumbering is enabled.
+
+Sources: [igfold/utils/visualize.py:141-184](), [IgFold.ipynb:132-135]()
+
+## Configuration Options and Parameters
+
+### Model Ensemble Control
+
+The notebook supports both ensemble and single model predictions through the `single_model` parameter:
+
+| Mode | `num_models` | Prediction Quality | Speed |
+|------|-------------|-------------------|-------|
+| Ensemble | 4 | Higher accuracy | Slower |
+| Single | 1 | Good accuracy | Faster |
+
+This parameter directly controls the `IgFoldRunner` initialization [IgFold.ipynb:109-110]().
+
+### Refinement Options
+
+| Option | Module | Purpose | Requirements |
+|--------|--------|---------|-------------|
+| `do_refine` | OpenMM | Energy minimization | OpenMM installation |
+| `do_renum` | AbNumber | CDR identification | AbNumber installation |
+| `use_openmm` | OpenMM | Refinement backend | Hardcoded to `True` |
+
+### Output Management
+
+The notebook automatically creates output directories and manages file naming [IgFold.ipynb:31-32]():
+- Creates directory with `name` parameter
+- Generates PDB files as `{name}.pdb`
+- Creates pRMSD plots as `{name}_prmsd.png`
+
+Sources: [IgFold.ipynb:31-32](), [IgFold.ipynb:112](), [IgFold.ipynb:134]()
+
+## Integration with Core Components
+
+### IgFoldRunner Interface
+
+The notebook directly uses the `IgFoldRunner` class as its primary interface to the prediction system:
+
+```mermaid
+graph TD
+    NOTEBOOK["Notebook Interface"] --> RUNNER["IgFoldRunner"]
+    
+    RUNNER --> FOLD_METHOD["fold() method"]
+    RUNNER --> EMBED_METHOD["embed() method"]
+    
+    FOLD_METHOD --> PIPELINE["Folding Pipeline"]
+    PIPELINE --> REFINEMENT["Optional Refinement"]
+    PIPELINE --> OUTPUT["PDB + pRMSD Output"]
+    
+    OUTPUT --> VIZ_UTILS["Visualization Utils"]
+    VIZ_UTILS --> PY3DMOL_DISPLAY["3D Structure Display"]
+    VIZ_UTILS --> MATPLOTLIB_PLOTS["pRMSD Plots"]
+```
+
+**Core API Integration**
+
+The notebook leverages the same APIs documented in [IgFoldRunner API](#4.1), specifically using the `fold()` method with the same parameter interface.
+
+### Visualization Utilities
+
+The notebook imports visualization functions from `igfold.utils.visualize` [IgFold.ipynb:106]():
+
+```python
+from igfold.utils.visualize import *
+from igfold import IgFoldRunner
+```
+
+This provides access to:
+- `show_pdb()` - Interactive 3D structure viewing
+- `show_pdbs()` - Multi-structure grid display  
+- `plot_prmsd()` - Confidence analysis plotting
+
+Sources: [IgFold.ipynb:106-107](), [igfold/utils/visualize.py:1-184]()
+
+## Results Download and Export
+
+The notebook provides automated result packaging through Google Colab's file download system [IgFold.ipynb:163-172](). Results are compressed into a zip file containing:
+
+- Predicted PDB structure file
+- pRMSD confidence plot (PNG format)
+- Any intermediate files generated during processing
+
+This download mechanism ensures users can easily retrieve all prediction outputs for further analysis or publication.
+
+Sources: [IgFold.ipynb:163-172]()
+
+---
+
+# Page: Input Formats and Data Preparation
+
+# Input Formats and Data Preparation
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/model/interface.py](igfold/model/interface.py)
+- [igfold/utils/fasta.py](igfold/utils/fasta.py)
+- [igfold/utils/pdb.py](igfold/utils/pdb.py)
+
+</details>
+
+
+
+This page documents the input formats accepted by IgFold and the data preparation steps required for antibody structure prediction. It covers sequence input requirements, template structure usage, and the processing pipeline that converts raw inputs into the standardized format required by the IgFold model.
+
+For information about using the processed data with the main API, see [IgFoldRunner API](#4.1). For details about the internal model input structure, see [Core Architecture](#5).
+
+## Supported Input Formats
+
+IgFold accepts antibody sequences in multiple formats and provides utilities to process template structures for enhanced prediction accuracy.
+
+### Sequence Input Formats
+
+#### FASTA Format
+The primary input format for antibody sequences is FASTA, with specific chain identification conventions:
+
+```mermaid
+graph TD
+    FASTA["FASTA File"] --> PARSE["get_fasta_chain_seq()"]
+    PARSE --> CHAIN_ID["Chain ID Detection"]
+    CHAIN_ID --> H_CHAIN[":H (Heavy Chain)"]
+    CHAIN_ID --> L_CHAIN[":L (Light Chain)"]
+    H_CHAIN --> SEQ_DICT["Sequence Dictionary"]
+    L_CHAIN --> SEQ_DICT
+    SEQ_DICT --> VALIDATION["Sequence Validation"]
+```
+
+**FASTA Chain Identification**
+- Heavy chain sequences must include `:H` in the sequence identifier
+- Light chain sequences must include `:L` in the sequence identifier
+- Example header format: `>antibody_name:H` or `>antibody_name:L`
+
+#### Dictionary Format
+Sequences can also be provided as Python dictionaries:
+
+| Key | Value | Description |
+|-----|--------|-------------|
+| `"H"` | `str` | Heavy chain amino acid sequence |
+| `"L"` | `str` | Light chain amino acid sequence (optional) |
+
+Sources: [igfold/utils/fasta.py:4-18]()
+
+### Template Structure Input
+
+Template PDB structures can be provided to improve prediction accuracy through structural templating:
+
+```mermaid
+graph TD
+    PDB["Template PDB File"] --> PARSE_PDB["PDBParser"]
+    PARSE_PDB --> COORDS["get_atom_coords()"]
+    COORDS --> ATOMS["Atom Coordinates"]
+    ATOMS --> N["N atoms"]
+    ATOMS --> CA["CA atoms"] 
+    ATOMS --> C["C atoms"]
+    ATOMS --> CB["CB atoms"]
+    ATOMS --> O["O atoms"]
+    
+    FASTA_REF["Reference FASTA"] --> ALIGN["Sequence Alignment"]
+    ATOMS --> ALIGN
+    ALIGN --> TEMPLATE_COORDS["template_coords"]
+    ALIGN --> TEMPLATE_MASK["template_mask"]
+```
+
+**Supported Template Features:**
+- Standard PDB format with ATOM records
+- Multi-chain antibody structures
+- Automatic missing atom placement for CB and O atoms
+- Chain reordering and renumbering capabilities
+
+Sources: [igfold/utils/pdb.py:194-252](), [igfold/utils/pdb.py:160-192]()
+
+## Sequence Requirements and Validation
+
+### Amino Acid Sequences
+IgFold expects standard single-letter amino acid codes. The system handles:
+
+- **Heavy chains**: Typically 110-130 residues for antibody variable domains
+- **Light chains**: Typically 105-115 residues for antibody variable domains  
+- **Standard amino acids**: All 20 canonical amino acids supported
+- **Non-standard residues**: Converted or flagged during processing
+
+### Chain Processing Pipeline
+
+```mermaid
+flowchart TD
+    INPUT["Raw Sequence Input"] --> FORMAT_CHECK["Format Detection"]
+    FORMAT_CHECK --> FASTA_PATH["FASTA File"]
+    FORMAT_CHECK --> DICT_PATH["Dictionary"]
+    
+    FASTA_PATH --> FASTA_PARSE["get_fasta_chain_dict()"]
+    DICT_PATH --> DICT_VALIDATE["Dictionary Validation"]
+    
+    FASTA_PARSE --> CHAIN_EXTRACT["Chain Extraction"]
+    DICT_VALIDATE --> CHAIN_EXTRACT
+    
+    CHAIN_EXTRACT --> H_SEQ["Heavy Chain Sequence"]
+    CHAIN_EXTRACT --> L_SEQ["Light Chain Sequence"]
+    
+    H_SEQ --> SEQ_VALIDATE["Sequence Validation"]
+    L_SEQ --> SEQ_VALIDATE
+    
+    SEQ_VALIDATE --> ANTIBERTY["AntiBERTy Processing"]
+    ANTIBERTY --> EMBEDDINGS["Sequence Embeddings"]
+    ANTIBERTY --> ATTENTIONS["Attention Weights"]
+    
+    EMBEDDINGS --> IGFOLD_INPUT["IgFoldInput"]
+    ATTENTIONS --> IGFOLD_INPUT
+```
+
+Sources: [igfold/utils/fasta.py:13-18](), [igfold/model/interface.py:7-20]()
+
+## Template Structure Processing
+
+When template structures are provided, IgFold performs sophisticated alignment and coordinate extraction:
+
+### PDB Processing Workflow
+
+```mermaid
+graph TD
+    PDB_FILE["Template PDB"] --> PDB_PARSER["PDBParser"]
+    PDB_PARSER --> STRUCTURE["Bio.PDB Structure"]
+    
+    STRUCTURE --> CHAINS["Chain Extraction"]
+    CHAINS --> RESIDUES["Residue Lists"]
+    
+    RESIDUES --> CONTINUOUS["get_continuous_ranges()"]
+    CONTINUOUS --> PEPTIDE_BONDS["Peptide Bond Validation"]
+    
+    FASTA_INPUT["FASTA Sequence"] --> ALIGNMENT["Sequence Alignment"]
+    PEPTIDE_BONDS --> ALIGNMENT
+    
+    ALIGNMENT --> COORD_EXTRACT["Coordinate Extraction"]
+    COORD_EXTRACT --> BACKBONE["Backbone Atoms (N,CA,C)"]
+    COORD_EXTRACT --> SIDECHAIN["Side Chain (CB)"]
+    COORD_EXTRACT --> CARBONYL["Carbonyl (O)"]
+    
+    BACKBONE --> MISSING_ATOM["place_missing_cb_o()"]
+    SIDECHAIN --> MISSING_ATOM
+    CARBONYL --> MISSING_ATOM
+    
+    MISSING_ATOM --> ATOM_COORDS["Complete Atom Coordinates"]
+    ATOM_COORDS --> TEMPLATE_INPUT["Template Input Tensors"]
+```
+
+**Key Processing Functions:**
+- `get_atom_coords()`: Extracts atomic coordinates from PDB structures
+- `get_continuous_ranges()`: Identifies continuous peptide segments 
+- `place_missing_cb_o()`: Reconstructs missing CB and O atoms using geometric constraints
+
+Sources: [igfold/utils/pdb.py:139-157](), [igfold/utils/pdb.py:194-251]()
+
+## Data Processing Utilities
+
+### PDB Manipulation Functions
+
+| Function | Purpose | Input | Output |
+|----------|---------|--------|---------|
+| `pdb2fasta()` | Convert PDB to FASTA | PDB file path | FASTA string |
+| `get_pdb_chain_seq()` | Extract chain sequence | PDB file, chain ID | Amino acid sequence |
+| `renumber_pdb()` | AbNumber renumbering | PDB file path | Renumbered PDB |
+| `reorder_pdb_chains()` | Reorder chains | PDB file, chain order | Reordered PDB |
+| `count_pdb_chains()` | Count chains | PDB file path | Integer count |
+
+### Coordinate Processing
+
+```mermaid
+graph LR
+    RAW_PDB["Raw PDB Coordinates"] --> EXTRACT["get_atom_coord()"]
+    EXTRACT --> ATOM_TYPES["Atom Type Specific"]
+    ATOM_TYPES --> N_COORDS["N Coordinates"]
+    ATOM_TYPES --> CA_COORDS["CA Coordinates"] 
+    ATOM_TYPES --> C_COORDS["C Coordinates"]
+    ATOM_TYPES --> CB_COORDS["CB Coordinates"]
+    ATOM_TYPES --> O_COORDS["O Coordinates"]
+    
+    CB_COORDS --> MISSING_CHECK["Missing Atom Check"]
+    O_COORDS --> MISSING_CHECK
+    MISSING_CHECK --> GEOMETRIC["Geometric Reconstruction"]
+    GEOMETRIC --> COMPLETE["Complete Coordinates"]
+```
+
+**Coordinate Tensors:**
+- All coordinates stored as PyTorch tensors
+- Shape: `[num_residues, 3]` for each atom type
+- Automatic masking for missing atoms
+- Geometric reconstruction for standard missing atoms
+
+Sources: [igfold/utils/pdb.py:120-137](), [igfold/utils/pdb.py:254-265]()
+
+## IgFoldInput Data Structure
+
+The processed input data is consolidated into the `IgFoldInput` dataclass:
+
+```mermaid
+classDiagram
+    class IgFoldInput {
+        +List~List~torch.FloatTensor~~ embeddings
+        +List~List~torch.FloatTensor~~ attentions  
+        +Optional~torch.FloatTensor~ template_coords
+        +Optional~torch.BoolTensor~ template_mask
+        +Optional~torch.BoolTensor~ batch_mask
+        +Optional~torch.BoolTensor~ align_mask
+        +Optional~torch.FloatTensor~ coords_label
+        +Optional~bool~ return_embeddings
+    }
+```
+
+**Field Descriptions:**
+- `embeddings`: AntiBERTy sequence embeddings per layer
+- `attentions`: Multi-head attention weights per layer  
+- `template_coords`: Template structure coordinates (optional)
+- `template_mask`: Mask indicating valid template positions
+- `batch_mask`: Mask for batch processing
+- `align_mask`: Alignment mask between sequence and template
+
+Sources: [igfold/model/interface.py:6-20]()
+
+## CDR Loop Processing
+
+IgFold includes specialized utilities for CDR (Complementarity-Determining Region) identification and processing:
+
+### CDR Identification Pipeline
+
+```mermaid
+graph TD
+    CHOTHIA_PDB["Chothia-numbered PDB"] --> CDR_FUNC["cdr_indices()"]
+    CDR_FUNC --> CDR_RANGES["CDR Range Dictionary"]
+    
+    CDR_RANGES --> H1["H1: 26-32"]
+    CDR_RANGES --> H2["H2: 52-56"] 
+    CDR_RANGES --> H3["H3: 95-102"]
+    CDR_RANGES --> L1["L1: 24-34"]
+    CDR_RANGES --> L2["L2: 50-56"]
+    CDR_RANGES --> L3["L3: 89-97"]
+    
+    H1 --> BINARY_SEARCH["Binary Search Mapping"]
+    H2 --> BINARY_SEARCH
+    H3 --> BINARY_SEARCH
+    L1 --> BINARY_SEARCH
+    L2 --> BINARY_SEARCH
+    L3 --> BINARY_SEARCH
+    
+    BINARY_SEARCH --> INDICES["Sequence Indices"]
+```
+
+**CDR Processing Functions:**
+- `cdr_indices()`: Maps Chothia numbering to sequence indices
+- `get_cdr_range_dict()`: Returns all CDR ranges for a structure
+- `h3_indices()`: Specialized H3 loop identification
+
+Sources: [igfold/utils/pdb.py:314-403]()
+
+## AbNumber Integration
+
+IgFold integrates with the AbNumber web service for antibody renumbering:
+
+### Renumbering Workflow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant IgFold
+    participant AbNumber as "AbNumber Web Service"
+    participant PDB as "PDB File"
+    
+    User->>IgFold: renumber_pdb(old_pdb)
+    IgFold->>PDB: Read PDB file
+    PDB-->>IgFold: Raw PDB data
+    IgFold->>AbNumber: POST request with PDB
+    AbNumber-->>IgFold: Renumbered PDB response
+    IgFold->>PDB: Write renumbered PDB
+    IgFold-->>User: Success/failure status
+```
+
+**Renumbering Features:**
+- Automatic retry logic for network failures
+- Chothia numbering scheme by default
+- Heavy and light chain processing
+- Error handling and validation
+
+Sources: [igfold/utils/pdb.py:21-59]()
+
+---
+
+# Page: Output Analysis and Visualization
+
+# Output Analysis and Visualization
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [IgFold.ipynb](IgFold.ipynb)
+- [igfold/model/interface.py](igfold/model/interface.py)
+- [igfold/utils/visualize.py](igfold/utils/visualize.py)
+
+</details>
+
+
+
+This page covers understanding and analyzing IgFold prediction outputs, including PDB structure files, predicted RMSD (pRMSD) values, and using the built-in visualization tools for structure analysis and quality assessment.
+
+For information about input preparation and formats, see [Input Formats and Data Preparation](#4.3). For details about the core model architecture that generates these outputs, see [IgFold Model](#5.1).
+
+## Understanding IgFold Outputs
+
+IgFold generates structured predictions containing both 3D coordinates and confidence estimates. The primary outputs include predicted protein structures in PDB format and per-residue predicted RMSD values that indicate local structure confidence.
+
+### Output Data Structure
+
+The `IgFoldOutput` dataclass defines the complete set of model outputs:
+
+```mermaid
+classDiagram
+    class IgFoldOutput {
+        +torch.FloatTensor coords
+        +torch.FloatTensor prmsd
+        +torch.FloatTensor translations
+        +torch.FloatTensor rotations
+        +Optional[torch.FloatTensor] coords_loss
+        +Optional[torch.FloatTensor] torsion_loss
+        +Optional[torch.FloatTensor] bondlen_loss
+        +Optional[torch.FloatTensor] prmsd_loss
+        +Optional[torch.FloatTensor] loss
+        +Optional[torch.FloatTensor] bert_embs
+        +Optional[torch.FloatTensor] bert_attn
+        +Optional[torch.FloatTensor] gt_embs
+        +Optional[torch.FloatTensor] structure_embs
+    }
+    
+    class "Primary Outputs" {
+        coords: "3D atom coordinates"
+        prmsd: "Per-residue predicted RMSD"
+        translations: "Translation vectors"
+        rotations: "Rotation matrices"
+    }
+    
+    class "Training Outputs" {
+        coords_loss: "Coordinate loss"
+        torsion_loss: "Torsion angle loss"
+        bondlen_loss: "Bond length loss"
+        prmsd_loss: "pRMSD prediction loss"
+        loss: "Total loss"
+    }
+    
+    class "Optional Embeddings" {
+        bert_embs: "BERT embeddings"
+        bert_attn: "BERT attention weights"
+        gt_embs: "Graph transformer embeddings"
+        structure_embs: "Structure embeddings"
+    }
+    
+    IgFoldOutput --> "Primary Outputs"
+    IgFoldOutput --> "Training Outputs"
+    IgFoldOutput --> "Optional Embeddings"
+```
+
+**Key Output Components:**
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `coords` | `torch.FloatTensor` | 3D atomic coordinates for all atoms |
+| `prmsd` | `torch.FloatTensor` | Per-residue predicted RMSD confidence scores |
+| `translations` | `torch.FloatTensor` | Translation vectors for structure positioning |
+| `rotations` | `torch.FloatTensor` | Rotation matrices for structure orientation |
+
+Sources: [igfold/model/interface.py:22-40]()
+
+## Visualization Pipeline
+
+IgFold provides integrated visualization tools that work seamlessly with prediction outputs to create interactive 3D structure viewers and analysis plots.
+
+```mermaid
+flowchart TD
+    IgFoldOutput["IgFoldOutput"] --> coords["coords tensor"]
+    IgFoldOutput --> prmsd["prmsd tensor"]
+    
+    coords --> pdb_file["PDB file"]
+    
+    pdb_file --> show_pdb["show_pdb()"]
+    pdb_file --> show_pdbs["show_pdbs()"]
+    
+    show_pdb --> py3Dmol["py3Dmol viewer"]
+    show_pdbs --> py3Dmol
+    
+    prmsd --> plot_prmsd["plot_prmsd()"]
+    sequences["sequences dict"] --> plot_prmsd
+    pdb_file --> plot_prmsd
+    
+    plot_prmsd --> matplotlib["matplotlib figure"]
+    
+    subgraph "Visualization Options"
+        color_b["color='b' (pRMSD)"]
+        color_rainbow["color='rainbow'"]
+        color_chain["color='chain'"]
+        bb_sticks["bb_sticks=True"]
+        sc_sticks["sc_sticks=True"]
+    end
+    
+    color_b --> show_pdb
+    color_rainbow --> show_pdb
+    color_chain --> show_pdb
+    bb_sticks --> show_pdb
+    sc_sticks --> show_pdb
+    
+    shade_cdr["shade_cdr=True"] --> plot_prmsd
+```
+
+Sources: [igfold/utils/visualize.py:13-184](), [IgFold.ipynb:120-135]()
+
+## 3D Structure Visualization
+
+### Basic Structure Display
+
+The `show_pdb()` function creates interactive 3D structure viewers using py3Dmol:
+
+**Basic Usage:**
+```python
+from igfold.utils.visualize import show_pdb
+
+# Display structure with default settings
+show_pdb("my_antibody.pdb", num_sequences=2)
+```
+
+**Function Parameters:**
+
+| Parameter | Type | Purpose |
+|-----------|------|---------|
+| `pdb_filename` | `str` | Path to PDB structure file |
+| `num_sequences` | `int` | Number of chains in structure |
+| `bb_sticks` | `bool` | Show backbone as sticks |
+| `sc_sticks` | `bool` | Show sidechains as sticks |
+| `color` | `str` | Color scheme: `"b"`, `"rainbow"`, `"chain"` |
+| `view_size` | `tuple` | Viewer dimensions `(width, height)` |
+
+### Color Schemes
+
+**pRMSD Coloring (`color="b"`):**
+- Colors structure from blue (low pRMSD/high confidence) to red (high pRMSD/low confidence)
+- Uses B-factor field in PDB to store pRMSD values
+- Gradient range: 0.5 Å (blue) to 1.5 Å (red)
+
+**Rainbow Coloring (`color="rainbow"`):**
+- Colors structure from N-terminus (blue) to C-terminus (red)
+- Useful for visualizing overall structure topology
+
+**Chain Coloring (`color="chain"`):**
+- Assigns distinct colors to each chain
+- Supports up to 8 chains with predefined colors: lime, cyan, magenta, yellow, salmon, white, blue, orange
+
+Sources: [igfold/utils/visualize.py:13-84](), [IgFold.ipynb:120-151]()
+
+### Multiple Structure Comparison
+
+The `show_pdbs()` function displays multiple structures in a grid layout:
+
+```python
+# Compare multiple predictions
+show_pdbs(
+    ["model1.pdb", "model2.pdb", "model3.pdb"], 
+    num_sequences=2,
+    view_size=(800, 800)
+)
+```
+
+The function automatically calculates optimal grid dimensions using `math.ceil(math.sqrt(len(pdb_filenames)))` for width and height.
+
+Sources: [igfold/utils/visualize.py:36-138]()
+
+## Predicted RMSD Analysis
+
+### Understanding pRMSD Values
+
+Predicted RMSD (pRMSD) values provide per-residue confidence estimates for structural predictions:
+
+- **Low pRMSD (< 1.0 Å):** High confidence regions, typically well-structured domains
+- **Medium pRMSD (1.0-2.0 Å):** Moderate confidence, may include flexible loops
+- **High pRMSD (> 2.0 Å):** Low confidence regions, often highly flexible or disordered
+
+### pRMSD Plotting
+
+The `plot_prmsd()` function generates per-residue confidence plots:
+
+```mermaid
+flowchart LR
+    sequences["sequences dict"] --> get_sequence_dict["get_sequence_dict()"]
+    prmsd["prmsd tensor"] --> process_rmsd["Process pRMSD values"]
+    
+    get_sequence_dict --> seq_dict["Chain sequences"]
+    process_rmsd --> res_rmsd["Per-residue RMSD"]
+    
+    seq_dict --> split_chains["Split by chains"]
+    res_rmsd --> split_chains
+    
+    split_chains --> plot_chains["Plot each chain"]
+    
+    pdb_file["PDB file"] --> cdr_ranges["get_cdr_range_dict()"]
+    shade_cdr["shade_cdr=True"] --> cdr_ranges
+    
+    cdr_ranges --> shade_regions["Shade CDR regions"]
+    shade_regions --> plot_chains
+    
+    plot_chains --> matplotlib_fig["Matplotlib figure"]
+```
+
+**Key Features:**
+- Separate subplot for each chain (Heavy, Light)
+- Optional CDR region highlighting when `shade_cdr=True`
+- Residue numbering starts from 1 for each chain
+- Gray shaded regions indicate CDR loops when AbNumber renumbering is used
+
+**Function Parameters:**
+
+| Parameter | Type | Purpose |
+|-----------|------|---------|
+| `sequences` | `dict` | Chain sequences dictionary |
+| `prmsd` | `torch.Tensor` | pRMSD predictions from model |
+| `out_file` | `str` | Output file path for saving plot |
+| `shade_cdr` | `bool` | Highlight CDR regions |
+| `pdb_file` | `str` | PDB file for CDR identification |
+
+Sources: [igfold/utils/visualize.py:141-184](), [IgFold.ipynb:132-135]()
+
+### CDR Region Analysis
+
+When `shade_cdr=True` and a PDB file is provided, the plotting function automatically identifies and highlights CDR regions:
+
+1. Uses `get_cdr_range_dict()` to identify CDR boundaries
+2. Handles different antibody formats:
+   - Heavy chain only (`heavy_only=True`)
+   - Light chain only (`light_only=True`) 
+   - Heavy-Light pairs
+3. Applies gray shading (`alpha=0.5`) to CDR regions
+4. Requires AbNumber renumbering for accurate CDR identification
+
+Sources: [igfold/utils/visualize.py:154-174]()
+
+## Jupyter Notebook Integration
+
+The main IgFold notebook demonstrates the complete output analysis workflow:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant IgFoldRunner
+    participant show_pdb
+    participant plot_prmsd
+    participant Files
+    
+    User->>IgFoldRunner: fold(sequences, options)
+    IgFoldRunner-->>User: IgFoldOutput + PDB file
+    
+    User->>show_pdb: show_pdb(pred_pdb, num_chains)
+    show_pdb-->>User: Interactive 3D viewer
+    
+    User->>plot_prmsd: plot_prmsd(sequences, prmsd)  
+    plot_prmsd-->>User: pRMSD confidence plot
+    
+    User->>show_pdb: show_pdb(pred_pdb, color="b")
+    show_pdb-->>User: pRMSD-colored structure
+    
+    User->>Files: Download results zip
+    Files-->>User: Structure + analysis files
+```
+
+**Typical Analysis Workflow:**
+1. **Initial Structure View:** Rainbow-colored structure showing overall topology
+2. **Confidence Analysis:** pRMSD plot identifying reliable vs. uncertain regions  
+3. **Confidence Visualization:** Structure colored by pRMSD values
+4. **Results Export:** Download PDB files and analysis plots
+
+Sources: [IgFold.ipynb:101-172]()
+
+## Advanced Visualization Options
+
+### Structure Representation Options
+
+**Sidechain Display (`sc_sticks=True`):**
+- Shows sidechain atoms as sticks with 0.2 Å radius
+- Special handling for Glycine (sphere representation) and Proline
+- Uses WhiteCarbon color scheme for chemical intuition
+
+**Backbone Display (`bb_sticks=True`):**
+- Displays backbone atoms (C, O, N, CA) as sticks
+- 0.3 Å radius for visibility
+- Useful for detailed structural analysis
+
+### Viewer Configuration
+
+**Grid Layout for Multiple Structures:**
+- Automatic grid calculation: `math.ceil(math.sqrt(num_structures))`
+- Each structure gets individual viewer in grid
+- Synchronized zoom and rotation controls
+
+**View Size Options:**
+- Default single structure: 500×500 pixels
+- Default multiple structures: 800×800 pixels
+- Customizable via `view_size` parameter
+
+Sources: [igfold/utils/visualize.py:84-138]()
+
+---
+
+# Page: Core Architecture
+
+# Core Architecture
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/model/IgFold.py](igfold/model/IgFold.py)
+- [igfold/utils/folding.py](igfold/utils/folding.py)
+
+</details>
+
+
+
+This page provides a technical overview of IgFold's internal architecture, focusing on the core system components, data flow patterns, and model structure that enable fast and accurate antibody structure prediction. For detailed information about specific model components, see [IgFold Model](#5.1). For implementation details of the processing pipeline, see [Processing Pipeline](#5.2). For utilities and data handling specifics, see [Data Processing Utilities](#5.3).
+
+## System Overview
+
+IgFold implements a deep learning architecture that transforms antibody sequences into 3D protein structures through a multi-stage processing pipeline. The system is built around three main architectural layers: input processing, neural network prediction, and output refinement.
+
+**High-Level Architecture**
+```mermaid
+graph TB
+    subgraph "Input_Layer" ["Input Processing Layer"]
+        SEQ_PROC["get_sequence_dict()"]
+        TEMP_PROC["process_template()"]
+        ANTIBERTY["AntiBERTy Embedding"]
+    end
+    
+    subgraph "Model_Layer" ["Neural Network Layer"]  
+        IGFOLD_INPUT["IgFoldInput"]
+        IGFOLD_MODEL["IgFold"]
+        IGFOLD_OUTPUT["IgFoldOutput"]
+    end
+    
+    subgraph "Processing_Layer" ["Processing Components"]
+        TRIANGLE_GT["TriangleGraphTransformer"]
+        TEMPLATE_IPA["IPAEncoder (Template)"]
+        STRUCTURE_IPA["IPATransformer (Structure)"]
+        DEV_IPA["IPAEncoder (Deviation)"]
+    end
+    
+    subgraph "Output_Layer" ["Output Processing Layer"]
+        GRADIENT_REF["gradient_refine()"]
+        PROCESS_PRED["process_prediction()"]
+        REFINEMENT["Structure Refinement"]
+    end
+    
+    SEQ_PROC --> ANTIBERTY
+    TEMP_PROC --> IGFOLD_INPUT
+    ANTIBERTY --> IGFOLD_INPUT
+    
+    IGFOLD_INPUT --> IGFOLD_MODEL
+    IGFOLD_MODEL --> TRIANGLE_GT
+    IGFOLD_MODEL --> TEMPLATE_IPA  
+    IGFOLD_MODEL --> STRUCTURE_IPA
+    IGFOLD_MODEL --> DEV_IPA
+    
+    IGFOLD_MODEL --> IGFOLD_OUTPUT
+    IGFOLD_OUTPUT --> GRADIENT_REF
+    GRADIENT_REF --> PROCESS_PRED
+    PROCESS_PRED --> REFINEMENT
+```
+
+Sources: [igfold/utils/folding.py:13-231](), [igfold/model/IgFold.py:19-488]()
+
+## Core Components
+
+The IgFold architecture consists of several key components that work together to transform sequence inputs into structural predictions:
+
+| Component | Class/Function | Purpose | Location |
+|-----------|----------------|---------|----------|
+| **Main Model** | `IgFold` | Core neural network implementing structure prediction | [igfold/model/IgFold.py:19]() |
+| **Input Interface** | `IgFoldInput` | Standardized input data container | [igfold/model/interface.py]() |
+| **Output Interface** | `IgFoldOutput` | Structured output with coordinates and metadata | [igfold/model/interface.py]() |
+| **Folding Pipeline** | `fold()` | Main entry point orchestrating the prediction process | [igfold/utils/folding.py:153-231]() |
+| **Sequence Processing** | `get_sequence_dict()` | Input sequence standardization and validation | [igfold/utils/folding.py:13-27]() |
+| **Template Processing** | `process_template()` | Template structure preprocessing and alignment | [igfold/utils/folding.py:30-75]() |
+
+**Core Component Relationships**
+```mermaid
+graph LR
+    subgraph "folding_py" ["folding.py"]
+        FOLD_FUNC["fold()"]
+        GET_SEQ["get_sequence_dict()"]
+        PROC_TEMP["process_template()"]
+        PROC_PRED["process_prediction()"]
+    end
+    
+    subgraph "IgFold_py" ["IgFold.py"]
+        IGFOLD_CLASS["IgFold"]
+        FORWARD["forward()"]
+        GRADIENT_REF["gradient_refine()"]
+        SCORE_COORDS["score_coords()"]
+    end
+    
+    subgraph "interface_py" ["interface.py"]
+        IGFOLD_INPUT["IgFoldInput"]
+        IGFOLD_OUTPUT["IgFoldOutput"]
+    end
+    
+    FOLD_FUNC --> GET_SEQ
+    FOLD_FUNC --> PROC_TEMP
+    FOLD_FUNC --> IGFOLD_INPUT
+    IGFOLD_INPUT --> FORWARD
+    FORWARD --> IGFOLD_OUTPUT
+    IGFOLD_OUTPUT --> GRADIENT_REF
+    GRADIENT_REF --> PROC_PRED
+    FORWARD --> SCORE_COORDS
+```
+
+Sources: [igfold/utils/folding.py:153-231](), [igfold/model/IgFold.py:19-488]()
+
+## Data Flow Architecture
+
+The system processes data through a well-defined pipeline that transforms sequence inputs into 3D structural coordinates:
+
+**Data Flow Through Core Pipeline**
+```mermaid
+flowchart TD
+    INPUT_SEQ["Antibody Sequences"] --> GET_SEQ_DICT["get_sequence_dict()"]
+    TEMPLATE_PDB["Template PDB"] --> PROCESS_TEMPLATE["process_template()"]
+    
+    GET_SEQ_DICT --> ANTIBERTY_EMBED["antiberty.embed()"]
+    ANTIBERTY_EMBED --> EMBEDDINGS["embeddings"]
+    ANTIBERTY_EMBED --> ATTENTIONS["attentions"]
+    
+    PROCESS_TEMPLATE --> TEMP_COORDS["temp_coords"]
+    PROCESS_TEMPLATE --> TEMP_MASK["temp_mask"]
+    
+    EMBEDDINGS --> IGFOLD_INPUT["IgFoldInput"]
+    ATTENTIONS --> IGFOLD_INPUT
+    TEMP_COORDS --> IGFOLD_INPUT
+    TEMP_MASK --> IGFOLD_INPUT
+    
+    IGFOLD_INPUT --> MODEL_FORWARD["model.forward()"]
+    MODEL_FORWARD --> IGFOLD_OUTPUT["IgFoldOutput"]
+    
+    IGFOLD_OUTPUT --> GRADIENT_REFINE["model.gradient_refine()"]
+    GRADIENT_REFINE --> REFINED_OUTPUT["Refined IgFoldOutput"]
+    
+    REFINED_OUTPUT --> PROCESS_PREDICTION["process_prediction()"]
+    PROCESS_PREDICTION --> PDB_OUTPUT["Final PDB Structure"]
+```
+
+Sources: [igfold/utils/folding.py:168-231](), [igfold/model/IgFold.py:196-488]()
+
+The data transformation occurs in several key stages:
+
+1. **Input Standardization**: [igfold/utils/folding.py:168-189]() - Raw sequences converted to standardized dictionary format
+2. **Embedding Generation**: [igfold/utils/folding.py:190-195]() - AntiBERTy produces sequence embeddings and attention matrices
+3. **Template Processing**: [igfold/utils/folding.py:197-202]() - Optional template structures processed and aligned
+4. **Neural Network Prediction**: [igfold/model/IgFold.py:196-370]() - Core model predicts 3D coordinates and confidence scores
+5. **Gradient Refinement**: [igfold/model/IgFold.py:427-488]() - Iterative optimization improves structural quality
+6. **Output Processing**: [igfold/utils/folding.py:221-231]() - Final coordinates converted to PDB format with optional refinement
+
+## Model Architecture Overview
+
+The `IgFold` neural network implements a sophisticated transformer-based architecture specifically designed for protein structure prediction:
+
+**Neural Network Architecture**
+```mermaid
+graph TD
+    subgraph "Input_Processing" ["Input Processing"]
+        BERT_FEATS["bert_feats"]
+        BERT_ATTN["bert_attn"]
+        STR_NODE_TRANS["str_node_transform"]
+        STR_EDGE_TRANS["str_edge_transform"]
+    end
+    
+    subgraph "Main_Block" ["Graph Transformer Block"]
+        MAIN_BLOCK["TriangleGraphTransformer"]
+    end
+    
+    subgraph "Template_Processing" ["Template Processing"]
+        TEMP_COORDS["temp_coords"]
+        GET_COORDS_TRAN_ROT["get_coords_tran_rot()"]
+        TEMPLATE_IPA["template_ipa"]
+    end
+    
+    subgraph "Structure_Prediction" ["Structure Prediction"]
+        STRUCTURE_IPA["structure_ipa"]
+        IPA_COORDS["ipa_coords"]
+        IPA_TRANSLATIONS["ipa_translations"] 
+        IPA_QUATERNIONS["ipa_quaternions"]
+    end
+    
+    subgraph "Deviation_Prediction" ["Deviation Prediction"]
+        DEV_NODE_TRANS["dev_node_transform"]
+        DEV_EDGE_TRANS["dev_edge_transform"]
+        DEV_IPA["dev_ipa"]
+        DEV_LINEAR["dev_linear"]
+    end
+    
+    BERT_FEATS --> STR_NODE_TRANS
+    BERT_ATTN --> STR_EDGE_TRANS
+    STR_NODE_TRANS --> MAIN_BLOCK
+    STR_EDGE_TRANS --> MAIN_BLOCK
+    
+    TEMP_COORDS --> GET_COORDS_TRAN_ROT
+    GET_COORDS_TRAN_ROT --> TEMPLATE_IPA
+    MAIN_BLOCK --> TEMPLATE_IPA
+    
+    TEMPLATE_IPA --> STRUCTURE_IPA
+    STRUCTURE_IPA --> IPA_COORDS
+    STRUCTURE_IPA --> IPA_TRANSLATIONS
+    STRUCTURE_IPA --> IPA_QUATERNIONS
+    
+    BERT_FEATS --> DEV_NODE_TRANS
+    BERT_ATTN --> DEV_EDGE_TRANS
+    DEV_NODE_TRANS --> DEV_IPA
+    DEV_EDGE_TRANS --> DEV_IPA
+    IPA_TRANSLATIONS --> DEV_IPA
+    IPA_QUATERNIONS --> DEV_IPA
+    DEV_IPA --> DEV_LINEAR
+```
+
+Sources: [igfold/model/IgFold.py:50-275]()
+
+### Model Components
+
+The architecture consists of several specialized neural network components:
+
+- **Node/Edge Transformers**: [igfold/model/IgFold.py:50-65]() - Convert AntiBERTy embeddings to model internal representation
+- **TriangleGraphTransformer**: [igfold/model/IgFold.py:67-75]() - Processes sequence relationships using graph attention
+- **Template IPA**: [igfold/model/IgFold.py:76-81]() - Incorporates template structural information via invariant point attention
+- **Structure IPA**: [igfold/model/IgFold.py:83-88]() - Predicts 3D coordinates using invariant point attention
+- **Deviation IPA**: [igfold/model/IgFold.py:103-112]() - Estimates prediction confidence (pRMSD values)
+
+## Key Interfaces and Abstractions
+
+IgFold uses several key data structures that define the interfaces between system components:
+
+### IgFoldInput Structure
+The `IgFoldInput` class serves as the primary interface for providing data to the neural network. Key fields include:
+- `embeddings`: Sequence embeddings from AntiBERTy
+- `attentions`: Attention matrices from AntiBERTy  
+- `template_coords`: Optional template structure coordinates
+- `template_mask`: Mask indicating valid template positions
+- `batch_mask`: Mask for valid sequence positions
+- `coords_label`: Ground truth coordinates (training only)
+
+Sources: [igfold/model/interface.py](), [igfold/model/IgFold.py:203-208]()
+
+### IgFoldOutput Structure  
+The `IgFoldOutput` class contains all prediction results:
+- `coords`: Predicted 3D coordinates for all atoms
+- `prmsd`: Per-residue confidence estimates
+- `translations`/`rotations`: Rigid body transformations
+- Loss terms for training: `coords_loss`, `bondlen_loss`, `prmsd_loss`
+- Optional embeddings: `bert_embs`, `gt_embs`, `structure_embs`
+
+Sources: [igfold/model/interface.py](), [igfold/model/IgFold.py:355-368]()
+
+### Processing Functions Interface
+The main `fold()` function provides the primary API for structure prediction:
+
+```python
+def fold(
+    antiberty,           # AntiBERTy model instance
+    models,             # List of IgFold model instances  
+    pdb_file,           # Output PDB file path
+    fasta_file=None,    # Input FASTA file
+    sequences=None,     # Input sequences dictionary
+    template_pdb=None,  # Optional template structure
+    # ... additional parameters
+)
+```
+
+Sources: [igfold/utils/folding.py:153-167]()
+
+This interface abstracts away the complexity of the neural network pipeline while providing flexible options for different use cases, from simple sequence-to-structure prediction to template-guided modeling with structure refinement.
+
+---
+
+# Page: IgFold Model
+
+# IgFold Model
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/model/IgFold.py](igfold/model/IgFold.py)
+- [igfold/model/components/IPABlock.py](igfold/model/components/IPABlock.py)
+- [igfold/model/components/IPATransformer.py](igfold/model/components/IPATransformer.py)
+- [igfold/model/interface.py](igfold/model/interface.py)
+- [igfold/utils/transforms.py](igfold/utils/transforms.py)
+
+</details>
+
+
+
+The IgFold model is the core deep learning architecture for antibody structure prediction. This document covers the neural network components, forward pass flow, and architectural design of the main prediction model. For information about the processing pipeline that feeds into this model, see [Processing Pipeline](#5.2). For details about training and optimization, see [Training and Loss Functions](#7.2).
+
+## Architecture Overview
+
+The IgFold model follows a multi-stage architecture that combines sequence embeddings, template information, and geometric constraints to predict 3D antibody structures. The model is implemented as a PyTorch Lightning module in the `IgFold` class.
+
+```mermaid
+graph TD
+    subgraph "Input Processing"
+        INPUT[IgFoldInput] --> CLEAN[clean_input]
+        CLEAN --> BERT_FEATS["BERT Features"]
+        CLEAN --> BERT_ATTN["BERT Attentions"]
+        CLEAN --> TEMP_COORDS["Template Coordinates"]
+    end
+    
+    subgraph "Feature Transformation"
+        BERT_FEATS --> STR_NODE[str_node_transform]
+        BERT_ATTN --> STR_EDGE[str_edge_transform] 
+        STR_NODE --> NODES["Node Features"]
+        STR_EDGE --> EDGES["Edge Features"]
+    end
+    
+    subgraph "Graph Processing"
+        NODES --> MAIN_BLOCK[main_block]
+        EDGES --> MAIN_BLOCK
+        MAIN_BLOCK --> GT_EMBS["Graph Transformer Embeddings"]
+    end
+    
+    subgraph "Template Processing"
+        TEMP_COORDS --> KABSCH[get_coords_tran_rot]
+        KABSCH --> TEMP_TRANS["Template Translations"]
+        KABSCH --> TEMP_ROT["Template Rotations"]
+        GT_EMBS --> TEMPLATE_IPA[template_ipa]
+        TEMP_TRANS --> TEMPLATE_IPA
+        TEMP_ROT --> TEMPLATE_IPA
+        TEMPLATE_IPA --> STRUCT_EMBS["Structure Embeddings"]
+    end
+    
+    subgraph "Structure Prediction"
+        STRUCT_EMBS --> STRUCTURE_IPA[structure_ipa]
+        GT_EMBS --> STRUCTURE_IPA
+        STRUCTURE_IPA --> COORDS["3D Coordinates"]
+        STRUCTURE_IPA --> TRANSLATIONS["Translations"]
+        STRUCTURE_IPA --> QUATERNIONS["Quaternions"]
+    end
+    
+    subgraph "Confidence Prediction"
+        BERT_FEATS --> DEV_NODE[dev_node_transform]
+        BERT_ATTN --> DEV_EDGE[dev_edge_transform]
+        DEV_NODE --> DEV_IPA[dev_ipa]
+        DEV_EDGE --> DEV_IPA
+        TRANSLATIONS --> DEV_IPA
+        QUATERNIONS --> DEV_IPA
+        DEV_IPA --> DEV_LINEAR[dev_linear]
+        DEV_LINEAR --> PRMSD["Predicted RMSD"]
+    end
+    
+    subgraph "Output"
+        COORDS --> OUTPUT[IgFoldOutput]
+        PRMSD --> OUTPUT
+        TRANSLATIONS --> OUTPUT
+        QUATERNIONS --> OUTPUT
+    end
+```
+
+Sources: [igfold/model/IgFold.py:19-488]()
+
+## Input and Output Interfaces
+
+The model uses structured dataclasses to define its input and output specifications.
+
+### IgFoldInput
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `embeddings` | `List[List[torch.FloatTensor]]` | BERT embeddings for each chain |
+| `attentions` | `List[List[torch.FloatTensor]]` | BERT attention matrices |
+| `template_coords` | `Optional[torch.FloatTensor]` | Template structure coordinates |
+| `template_mask` | `Optional[torch.BoolTensor]` | Mask for valid template positions |
+| `batch_mask` | `Optional[torch.BoolTensor]` | Mask for valid sequence positions |
+| `align_mask` | `Optional[torch.BoolTensor]` | Mask for alignment during training |
+| `coords_label` | `Optional[torch.FloatTensor]` | Ground truth coordinates for training |
+| `return_embeddings` | `Optional[bool]` | Whether to return intermediate embeddings |
+
+### IgFoldOutput
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `coords` | `torch.FloatTensor` | Predicted 3D coordinates |
+| `prmsd` | `torch.FloatTensor` | Predicted RMSD confidence scores |
+| `translations` | `torch.FloatTensor` | Rigid body translations |
+| `rotations` | `torch.FloatTensor` | Rigid body rotations |
+| `coords_loss` | `Optional[torch.FloatTensor]` | Coordinate prediction loss |
+| `bondlen_loss` | `Optional[torch.FloatTensor]` | Bond length constraint loss |
+| `prmsd_loss` | `Optional[torch.FloatTensor]` | Confidence prediction loss |
+| `loss` | `Optional[torch.FloatTensor]` | Total training loss |
+
+Sources: [igfold/model/interface.py:1-40]()
+
+## Core Components
+
+### Graph Transformer Block
+
+The `main_block` is a `TriangleGraphTransformer` that processes sequence-level features extracted from BERT embeddings and attentions.
+
+```mermaid
+graph LR
+    subgraph "Graph Transformer Processing"
+        BERT_FEATS["BERT Features<br/>(B, L, 512)"] --> STR_NODE_TRANS[str_node_transform]
+        BERT_ATTN["BERT Attentions<br/>(B, L, L, 64)"] --> STR_EDGE_TRANS[str_edge_transform]
+        
+        STR_NODE_TRANS --> NODE_DIM["Node Features<br/>(B, L, node_dim)"]
+        STR_EDGE_TRANS --> EDGE_DIM["Edge Features<br/>(B, L, L, node_dim)"]
+        
+        NODE_DIM --> TRIANGLE_GT[TriangleGraphTransformer]
+        EDGE_DIM --> TRIANGLE_GT
+        
+        TRIANGLE_GT --> GT_NODES["Updated Nodes"]
+        TRIANGLE_GT --> GT_EDGES["Updated Edges"]
+    end
+```
+
+The transformations use linear layers followed by ReLU activation and LayerNorm:
+
+```mermaid
+graph LR
+    INPUT["Input Features"] --> LINEAR[Linear Layer]
+    LINEAR --> RELU[ReLU Activation]
+    RELU --> LAYERNORM[LayerNorm]
+    LAYERNORM --> OUTPUT["Transformed Features"]
+```
+
+Sources: [igfold/model/IgFold.py:50-75](), [igfold/model/IgFold.py:239-245]()
+
+### Invariant Point Attention (IPA) Components
+
+The model employs three different IPA modules for different purposes:
+
+1. **Template IPA** (`template_ipa`): Processes template structural information
+2. **Structure IPA** (`structure_ipa`): Predicts 3D coordinates with rigid body transformations  
+3. **Deviation IPA** (`dev_ipa`): Estimates confidence scores
+
+```mermaid
+graph TD
+    subgraph "IPA Architecture Components"
+        NODES["Node Features"] --> IPA_ENCODER[IPAEncoder]
+        TRANSLATIONS["Translations"] --> IPA_ENCODER
+        ROTATIONS["Rotations"] --> IPA_ENCODER
+        PAIRWISE["Pairwise Repr"] --> IPA_ENCODER
+        
+        IPA_ENCODER --> UPDATED_NODES["Updated Node Features"]
+        
+        NODES2["Node Features"] --> IPA_TRANSFORMER[IPATransformer]
+        PAIRWISE2["Pairwise Repr"] --> IPA_TRANSFORMER
+        
+        IPA_TRANSFORMER --> COORDS["3D Coordinates"]
+        IPA_TRANSFORMER --> NEW_TRANS["New Translations"]
+        IPA_TRANSFORMER --> QUATERNIONS["Quaternions"]
+    end
+```
+
+Sources: [igfold/model/IgFold.py:76-88](), [igfold/model/IgFold.py:103-108](), [igfold/model/components/IPATransformer.py:16-174]()
+
+## Forward Pass Flow
+
+The model's forward pass follows a structured pipeline:
+
+### 1. Input Processing and Cleaning
+
+The `clean_input` method processes raw inputs, handling missing values and ensuring proper tensor shapes and masks.
+
+```mermaid
+graph TD
+    INPUT[IgFoldInput] --> EXTRACT["Extract Components"]
+    EXTRACT --> CHECK_NONE["Check for None Values"]
+    CHECK_NONE --> CREATE_DEFAULTS["Create Default Tensors"]
+    CREATE_DEFAULTS --> APPLY_MASKS["Apply Batch/Align Masks"]  
+    APPLY_MASKS --> CENTER_COORDS["Center Template Coords"]
+    CENTER_COORDS --> CLEANED[Cleaned Input]
+```
+
+Sources: [igfold/model/IgFold.py:144-194]()
+
+### 2. Feature Processing
+
+BERT embeddings and attentions are concatenated and transformed into the model's internal feature space.
+
+| Configuration Parameter | Default Value | Description |
+|------------------------|---------------|-------------|
+| `bert_feat_dim` | 512 | BERT feature dimension |
+| `bert_attn_dim` | 64 | BERT attention dimension |
+| `node_dim` | configurable | Internal node feature dimension |
+
+Sources: [igfold/model/IgFold.py:32-36](), [igfold/model/IgFold.py:223-245]()
+
+### 3. Template Coordinate Processing
+
+Template coordinates are processed using Kabsch alignment to extract rigid body transformations:
+
+```mermaid
+graph LR
+    TEMP_COORDS["Template Coords<br/>(B, L*4, 3)"] --> RESHAPE["Reshape to<br/>(B, L, 4, 3)"]
+    RESHAPE --> IDEAL_COORDS["Get Ideal Coords"]
+    IDEAL_COORDS --> KABSCH[Kabsch Alignment]
+    KABSCH --> TRANSLATIONS["Translations<br/>(B, L, 3)"]
+    KABSCH --> ROTATIONS["Rotations<br/>(B, L, 3, 3)"]
+```
+
+Sources: [igfold/model/IgFold.py:114-142](), [igfold/model/IgFold.py:233-237]()
+
+### 4. Structure Prediction
+
+The `structure_ipa` (`IPATransformer`) predicts final coordinates by iteratively refining translations and quaternions:
+
+```mermaid
+graph TD
+    STRUCT_NODES["Structure Node Features"] --> IPA_LAYERS["IPA Layers"]
+    PAIRWISE["Pairwise Features"] --> IPA_LAYERS
+    
+    IPA_LAYERS --> LAYER_BLOCK[IPABlock]
+    LAYER_BLOCK --> LINEAR_UPDATE[Linear Update]
+    LINEAR_UPDATE --> QUAT_UPDATE["Quaternion Update"]
+    LINEAR_UPDATE --> TRANS_UPDATE["Translation Update"] 
+    
+    QUAT_UPDATE --> MULTIPLY[Quaternion Multiply]
+    TRANS_UPDATE --> ADD[Translation Add]
+    
+    MULTIPLY --> NEXT_LAYER["Next Layer or Output"]
+    ADD --> NEXT_LAYER
+    
+    NEXT_LAYER --> FINAL_COORDS["Final 3D Coordinates"]
+```
+
+Sources: [igfold/model/IgFold.py:256-263](), [igfold/model/components/IPATransformer.py:83-174]()
+
+### 5. Confidence Prediction
+
+A separate deviation pathway predicts per-residue confidence using the `dev_ipa`:
+
+```mermaid
+graph LR
+    BERT_FEATS --> DEV_NODE[dev_node_transform]
+    BERT_ATTN --> DEV_EDGE[dev_edge_transform]
+    PRED_TRANS["Predicted Translations<br/>(detached)"] --> DEV_IPA[dev_ipa]
+    PRED_ROT["Predicted Rotations<br/>(detached)"] --> DEV_IPA
+    DEV_NODE --> DEV_IPA
+    DEV_EDGE --> DEV_IPA
+    DEV_IPA --> DEV_LINEAR[dev_linear]
+    DEV_LINEAR --> RELU[ReLU]
+    RELU --> PRMSD["Predicted RMSD"]
+```
+
+Sources: [igfold/model/IgFold.py:265-275]()
+
+## Loss Functions
+
+During training, multiple loss components are computed:
+
+| Loss Component | Function | Purpose |
+|---------------|----------|---------|
+| `coords_loss` | `kabsch_mse` | Coordinate prediction accuracy |
+| `bondlen_loss` | `bond_length_l1` | Bond length constraints |
+| `prmsd_loss` | `bb_prmsd_l1` | Confidence prediction accuracy |
+
+Sources: [igfold/model/IgFold.py:287-346]()
+
+## Advanced Features
+
+### Coordinate Scoring
+
+The `score_coords` method allows re-evaluation of confidence scores for given coordinates without full forward pass:
+
+Sources: [igfold/model/IgFold.py:372-403]()
+
+### Gradient Refinement
+
+The `gradient_refine` method performs iterative optimization of predicted structures using violation constraints:
+
+```mermaid
+graph TD
+    INPUT_COORDS["Input Coordinates"] --> ENABLE_GRAD["Enable Gradients"]
+    ENABLE_GRAD --> OPTIMIZER["Adam Optimizer<br/>(lr=2e-2)"]
+    OPTIMIZER --> ITER_START["Iteration Loop<br/>(80 steps)"]
+    
+    ITER_START --> TRANSFORM[transform_ideal_coords]
+    TRANSFORM --> CALC_VIOL[violation_loss]
+    TRANSFORM --> CALC_RMSD[kabsch_mse]
+    
+    CALC_VIOL --> TOTAL_LOSS["Total Loss"]
+    CALC_RMSD --> TOTAL_LOSS
+    TOTAL_LOSS --> BACKWARD[loss.backward]
+    BACKWARD --> STEP[optimizer.step]
+    STEP --> ITER_END{"More Steps?"}
+    
+    ITER_END -->|Yes| ITER_START
+    ITER_END -->|No| FINAL_COORDS["Refined Coordinates"]
+```
+
+Sources: [igfold/model/IgFold.py:427-488]()
+
+## Model Configuration
+
+Key hyperparameters control the model architecture:
+
+| Parameter | Description | Typical Range |
+|-----------|-------------|---------------|
+| `depth` | Main transformer depth | 4-8 |
+| `gt_depth` | Graph transformer depth | 2-4 |
+| `gt_heads` | Graph transformer heads | 8-16 |
+| `temp_ipa_depth` | Template IPA depth | 2-4 |
+| `str_ipa_depth` | Structure IPA depth | 4-8 |
+| `dev_ipa_depth` | Deviation IPA depth | 2-4 |
+
+Sources: [igfold/model/IgFold.py:37-48]()
+
+---
+
+# Page: Processing Pipeline
+
+# Processing Pipeline
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/utils/embed.py](igfold/utils/embed.py)
+- [igfold/utils/folding.py](igfold/utils/folding.py)
+
+</details>
+
+
+
+This document covers IgFold's structure prediction pipeline, detailing the sequence of operations that transform antibody sequences into predicted 3D structures. The pipeline orchestrates input processing, sequence embeddings, model inference, and output generation through a series of well-defined stages.
+
+For information about the neural network model components used within this pipeline, see [IgFold Model](#5.1). For details about the data processing utilities that support the pipeline, see [Data Processing Utilities](#5.3).
+
+## Pipeline Overview
+
+The IgFold processing pipeline consists of two main entry points: the `fold()` function for complete structure prediction and the `embed()` function for embedding generation only. Both pipelines share common input processing stages but differ in their outputs and post-processing steps.
+
+### Main Pipeline Flow
+
+```mermaid
+flowchart TD
+    INPUT[Input Sequences] --> GET_SEQ_DICT["get_sequence_dict()"]
+    FASTA[FASTA File] --> GET_SEQ_DICT
+    
+    GET_SEQ_DICT --> SEQ_DICT["Sequence Dictionary"]
+    
+    TEMPLATE_PDB[Template PDB] --> PROCESS_TEMPLATE["process_template()"]
+    SEQ_DICT --> PROCESS_TEMPLATE
+    
+    PROCESS_TEMPLATE --> TEMP_COORDS["Template Coordinates"]
+    PROCESS_TEMPLATE --> TEMP_MASK["Template Mask"]
+    
+    SEQ_DICT --> ANTIBERTY["AntiBERTy Embedding"]
+    ANTIBERTY --> EMBEDDINGS["Embeddings"]
+    ANTIBERTY --> ATTENTIONS["Attentions"]
+    
+    EMBEDDINGS --> IGFOLD_INPUT["IgFoldInput Object"]
+    ATTENTIONS --> IGFOLD_INPUT
+    TEMP_COORDS --> IGFOLD_INPUT
+    TEMP_MASK --> IGFOLD_INPUT
+    
+    IGFOLD_INPUT --> MODEL_INFERENCE["Model Inference Loop"]
+    MODEL_INFERENCE --> ENSEMBLE_SELECTION["Best Model Selection"]
+    
+    ENSEMBLE_SELECTION --> PROCESS_PRED["process_prediction()"]
+    PROCESS_PRED --> PDB_OUTPUT["PDB Output"]
+    PROCESS_PRED --> REFINED_STRUCTURE["Refined Structure"]
+```
+
+*Sources: [igfold/utils/folding.py:153-231](), [igfold/utils/embed.py:7-53]()*
+
+### Function-Level Architecture
+
+```mermaid
+graph TD
+    subgraph "Entry Points"
+        FOLD_FUNC["fold()"]
+        EMBED_FUNC["embed()"]
+    end
+    
+    subgraph "Input Processing"
+        GET_SEQ["get_sequence_dict()"]
+        PROC_TEMPLATE["process_template()"]
+    end
+    
+    subgraph "Model Interface"
+        IGFOLD_INPUT_CLASS["IgFoldInput"]
+        MODEL_CALL["model(model_in)"]
+        GRADIENT_REFINE["model.gradient_refine()"]
+    end
+    
+    subgraph "Post Processing"
+        PROC_PREDICTION["process_prediction()"]
+        SAVE_PDB["save_PDB()"]
+        WRITE_BFACTOR["write_pdb_bfactor()"]
+    end
+    
+    subgraph "Optional Refinement"
+        OPENMM_REF["OpenMM refine()"]
+        PYROSETTA_REF["PyRosetta refine()"]
+        RENUMBER_PDB["renumber_pdb()"]
+    end
+    
+    FOLD_FUNC --> GET_SEQ
+    EMBED_FUNC --> GET_SEQ
+    
+    FOLD_FUNC --> PROC_TEMPLATE
+    EMBED_FUNC --> PROC_TEMPLATE
+    
+    GET_SEQ --> IGFOLD_INPUT_CLASS
+    PROC_TEMPLATE --> IGFOLD_INPUT_CLASS
+    
+    IGFOLD_INPUT_CLASS --> MODEL_CALL
+    MODEL_CALL --> GRADIENT_REFINE
+    
+    FOLD_FUNC --> PROC_PREDICTION
+    PROC_PREDICTION --> SAVE_PDB
+    PROC_PREDICTION --> WRITE_BFACTOR
+    
+    PROC_PREDICTION --> OPENMM_REF
+    PROC_PREDICTION --> PYROSETTA_REF
+    PROC_PREDICTION --> RENUMBER_PDB
+```
+
+*Sources: [igfold/utils/folding.py:13-232](), [igfold/utils/embed.py:7-53]()*
+
+## Input Processing
+
+The pipeline begins with sequence input processing through the `get_sequence_dict()` function, which handles multiple input formats and validates the provided data.
+
+### Sequence Input Handling
+
+| Input Type | Processing Method | Output |
+|------------|-------------------|--------|
+| Direct sequences | Use provided dictionary | `seq_dict` |
+| FASTA file | Parse via `get_fasta_chain_dict()` | `seq_dict` |
+| Both provided | Prioritize FASTA file with warning | `seq_dict` |
+| Neither provided | Exit with error | - |
+
+The function implements a priority system where FASTA files take precedence over direct sequence input when both are provided [igfold/utils/folding.py:13-27]().
+
+### Optional Sequence Truncation
+
+When `truncate_sequences=True`, the pipeline utilizes AbNumber integration to trim sequences to their canonical regions:
+
+```mermaid
+flowchart LR
+    RAW_SEQ["Raw Sequences"] --> TRUNCATE["truncate_seq()"]
+    TRUNCATE --> CANONICAL_SEQ["Canonical Sequences"]
+    CANONICAL_SEQ --> EMBEDDING["AntiBERTy Embedding"]
+```
+
+This feature requires AbNumber installation and processes each sequence through the `truncate_seq()` function [igfold/utils/folding.py:173-179]().
+
+*Sources: [igfold/utils/folding.py:13-27](), [igfold/utils/folding.py:173-179]()*
+
+## Embedding Generation
+
+The pipeline generates sequence embeddings and attention maps using the AntiBERTy model through a standardized interface.
+
+### AntiBERTy Processing
+
+```mermaid
+flowchart TD
+    SEQ_VALUES["seq_dict.values()"] --> ANTIBERTY["antiberty.embed()"]
+    ANTIBERTY --> RAW_EMBEDDINGS["Raw Embeddings"]
+    ANTIBERTY --> RAW_ATTENTIONS["Raw Attentions"]
+    
+    RAW_EMBEDDINGS --> TRIM_EMB["[1:-1] Trim CLS/SEP"]
+    RAW_ATTENTIONS --> TRIM_ATT["[:,∶,1:-1,1:-1] Trim"]
+    
+    TRIM_EMB --> UNSQUEEZE_EMB["unsqueeze(0)"]
+    TRIM_ATT --> UNSQUEEZE_ATT["unsqueeze(0)"]
+    
+    UNSQUEEZE_EMB --> FINAL_EMBEDDINGS["Final Embeddings"]
+    UNSQUEEZE_ATT --> FINAL_ATTENTIONS["Final Attentions"]
+```
+
+The embedding process strips special tokens (`[CLS]` and `[SEP]`) and adds batch dimensions to prepare data for model input [igfold/utils/folding.py:190-195]().
+
+*Sources: [igfold/utils/folding.py:190-195](), [igfold/utils/embed.py:22-27]()*
+
+## Template Processing
+
+Optional template PDB files are processed through the `process_template()` function, which extracts coordinates and applies masking based on user specifications.
+
+### Template Coordinate Extraction
+
+```mermaid
+flowchart TD
+    TEMPLATE_PDB["Template PDB"] --> GET_COORDS["get_atom_coords()"]
+    GET_COORDS --> ATOM_COORDS["N, CA, C, CB Coordinates"]
+    
+    ATOM_COORDS --> STACK_COORDS["torch.stack() + reshape"]
+    STACK_COORDS --> TEMP_COORDS["Template Coordinates"]
+    
+    TEMP_COORDS --> CREATE_MASK["Create Boolean Mask"]
+    CREATE_MASK --> INVALID_CHECK["Check NaN & Zero Values"]
+    INVALID_CHECK --> TEMP_MASK["Template Mask"]
+    
+    CDR_IGNORE["ignore_cdrs parameter"] --> CDR_MASKING["CDR Region Masking"]
+    CHAIN_IGNORE["ignore_chain parameter"] --> CHAIN_MASKING["Chain Masking"]
+    
+    CDR_MASKING --> TEMP_MASK
+    CHAIN_MASKING --> TEMP_MASK
+```
+
+### Template Masking Options
+
+The pipeline supports selective template masking through two parameters:
+
+- **CDR Masking**: `ignore_cdrs` parameter accepts boolean, string, or list values to mask specific CDR regions [igfold/utils/folding.py:54-66]()
+- **Chain Masking**: `ignore_chain` parameter masks entire heavy ("H") or light ("L") chains [igfold/utils/folding.py:67-73]()
+
+*Sources: [igfold/utils/folding.py:30-75]()*
+
+## Model Inference
+
+The core prediction phase involves creating an `IgFoldInput` object and running inference through an ensemble of models.
+
+### Model Input Construction
+
+```mermaid
+flowchart LR
+    EMBEDDINGS["Processed Embeddings"] --> IGFOLD_INPUT["IgFoldInput()"]
+    ATTENTIONS["Processed Attentions"] --> IGFOLD_INPUT
+    TEMP_COORDS["Template Coordinates"] --> IGFOLD_INPUT
+    TEMP_MASK["Template Mask"] --> IGFOLD_INPUT
+    
+    IGFOLD_INPUT --> MODEL_INPUT["Model Input Object"]
+    MODEL_INPUT --> INFERENCE["Model Inference Loop"]
+```
+
+### Ensemble Prediction Loop
+
+The pipeline runs multiple models and selects the best prediction based on quantile scoring:
+
+| Step | Operation | Output |
+|------|-----------|--------|
+| 1 | Forward pass: `model(model_in)` | Raw predictions |
+| 2 | Gradient refinement: `model.gradient_refine()` | Refined coordinates |
+| 3 | Score calculation: `prmsd.quantile(0.9)` | Quality score |
+| 4 | Best model selection: `min(scores)` | Final prediction |
+
+The scoring mechanism uses the 90th percentile of predicted RMSD values to identify the most confident prediction [igfold/utils/folding.py:211-220]().
+
+*Sources: [igfold/utils/folding.py:203-220](), [igfold/utils/embed.py:35-44]()*
+
+## Post-Processing and Output
+
+The `process_prediction()` function handles model output formatting, structure refinement, and file generation.
+
+### Output Processing Flow
+
+```mermaid
+flowchart TD
+    MODEL_OUT["Model Output"] --> REARRANGE_PRMSD["Rearrange pRMSD"]
+    REARRANGE_PRMSD --> COORDS_EXTRACT["Extract Coordinates"]
+    COORDS_EXTRACT --> CALC_RMSD["Calculate Residue RMSD"]
+    
+    CALC_RMSD --> SAVE_PDB_CALL["save_PDB()"]
+    SAVE_PDB_CALL --> PDB_STRING["PDB String"]
+    
+    PDB_STRING --> REFINE_CHECK{"do_refine?"}
+    REFINE_CHECK -->|Yes| REFINE_CHOICE{"use_openmm?"}
+    REFINE_CHECK -->|No| RENUM_CHECK{"do_renum?"}
+    
+    REFINE_CHOICE -->|Yes| OPENMM_REF["OpenMM Refinement"]
+    REFINE_CHOICE -->|No| PYROSETTA_REF["PyRosetta Refinement"]
+    
+    OPENMM_REF --> RENUM_CHECK
+    PYROSETTA_REF --> RENUM_CHECK
+    
+    RENUM_CHECK -->|Yes| RENUMBER["renumber_pdb()"]
+    RENUM_CHECK -->|No| BFACTOR_WRITE["write_pdb_bfactor()"]
+    
+    RENUMBER --> BFACTOR_WRITE
+    BFACTOR_WRITE --> FINAL_PDB["Final PDB Output"]
+```
+
+### Refinement Options
+
+The pipeline supports two refinement backends:
+
+- **OpenMM**: Physics-based energy minimization [igfold/utils/folding.py:118-123]()
+- **PyRosetta**: Rosetta-based structure optimization [igfold/utils/folding.py:125-131]()
+
+Both refinement methods require separate installation and are imported dynamically with error handling for missing dependencies.
+
+### Output File Generation
+
+The pipeline generates several output files:
+
+| File Type | Content | Function |
+|-----------|---------|----------|
+| PDB | 3D coordinates with atoms N, CA, C, CB, O | `save_PDB()` |
+| FASTA | Sequence information (auto-generated if needed) | Direct file writing |
+| B-factor PDB | Structure with confidence scores | `write_pdb_bfactor()` |
+
+*Sources: [igfold/utils/folding.py:78-150]()*
+
+## Pipeline Variants
+
+The system provides two main pipeline variants optimized for different use cases:
+
+### Structure Prediction Pipeline (`fold()`)
+- Complete structure prediction workflow
+- Optional template integration
+- Ensemble model scoring
+- Structure refinement and renumbering
+- Full PDB output generation
+
+### Embedding Pipeline (`embed()`)
+- Embeddings and attention extraction only
+- Minimal post-processing
+- Returns `IgFoldOutput` with embedding data
+- Useful for downstream analysis or custom modeling
+
+The embedding pipeline shares input processing with the full pipeline but bypasses refinement and file generation steps [igfold/utils/embed.py:7-53]().
+
+*Sources: [igfold/utils/folding.py:153-231](), [igfold/utils/embed.py:7-53]()*
+
+---
+
+# Page: Data Processing Utilities
+
+# Data Processing Utilities
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/utils/constants.py](igfold/utils/constants.py)
+- [igfold/utils/coordinates.py](igfold/utils/coordinates.py)
+- [igfold/utils/geometry.py](igfold/utils/geometry.py)
+- [igfold/utils/pdb.py](igfold/utils/pdb.py)
+
+</details>
+
+
+
+This document covers IgFold's core data processing utilities that handle PDB files, coordinate extraction, geometric calculations, and antibody-specific processing. These utilities form the foundation layer that supports the structure prediction pipeline and refinement components.
+
+For information about the overall processing pipeline workflow, see [Processing Pipeline](#5.2). For details about neural network model components, see [IgFold Model](#5.1).
+
+## Overview
+
+The data processing utilities are organized into four main modules that work together to handle structural data:
+
+```mermaid
+graph TD
+    subgraph "PDB Processing"
+        PDB_UTILS["igfold.utils.pdb"]
+        PDB_FUNCS["renumber_pdb<br/>get_atom_coords<br/>save_PDB<br/>cdr_indices"]
+    end
+    
+    subgraph "Geometric Operations"
+        GEOM_UTILS["igfold.utils.geometry"]
+        GEOM_FUNCS["normed_vec<br/>dist<br/>angle<br/>dihedral"]
+    end
+    
+    subgraph "Coordinate Manipulation"
+        COORD_UTILS["igfold.utils.coordinates"] 
+        COORD_FUNCS["place_fourth_atom<br/>get_ideal_coords<br/>place_o_coords"]
+    end
+    
+    subgraph "Physical Constants"
+        CONST_UTILS["igfold.utils.constants"]
+        CONST_VALS["BL_N_CA<br/>BA_N_CA_C<br/>VDW_N"]
+    end
+    
+    PDB_UTILS --> PDB_FUNCS
+    GEOM_UTILS --> GEOM_FUNCS
+    COORD_UTILS --> COORD_FUNCS
+    CONST_UTILS --> CONST_VALS
+    
+    PDB_FUNCS --> COORD_FUNCS
+    GEOM_FUNCS --> COORD_FUNCS
+    CONST_VALS --> COORD_FUNCS
+```
+
+**Sources:** [igfold/utils/pdb.py:1-515](), [igfold/utils/geometry.py:1-77](), [igfold/utils/coordinates.py:1-76](), [igfold/utils/constants.py:1-22]()
+
+## PDB File Processing
+
+The `igfold.utils.pdb` module provides comprehensive tools for reading, writing, and manipulating PDB files. The main data flow processes raw PDB files into structured coordinate tensors:
+
+```mermaid
+flowchart TD
+    INPUT_PDB["PDB File Input"] --> PARSE_PDB["PDBParser.get_structure"]
+    FASTA_INPUT["FASTA File (optional)"] --> PARSE_PDB
+    
+    PARSE_PDB --> EXTRACT_COORDS["get_atom_coords"]
+    EXTRACT_COORDS --> ATOM_EXTRACTION["Extract N, CA, C, CB, O coordinates"]
+    
+    ATOM_EXTRACTION --> MISSING_ATOMS["place_missing_cb_o"]
+    MISSING_ATOMS --> COORD_TENSORS["PyTorch Coordinate Tensors"]
+    
+    COORD_TENSORS --> MASKS["get_atom_coords_mask"]
+    MASKS --> FINAL_OUTPUT["Structured Coordinate Data"]
+    
+    subgraph "Chain Processing"
+        CHAIN_COUNT["count_pdb_chains"]
+        CHAIN_REORDER["reorder_pdb_chains"] 
+        CHAIN_SEQ["get_pdb_chain_seq"]
+    end
+    
+    subgraph "CDR Identification"
+        CDR_INDICES["cdr_indices"]
+        CDR_RANGES["get_cdr_range_dict"]
+        H3_INDICES["h3_indices"]
+    end
+    
+    subgraph "AbNumber Integration"
+        RENUMBER["renumber_pdb"]
+        ABNUMBER_SERVICE["AbNum Web Service"]
+        RENUMBER --> ABNUMBER_SERVICE
+    end
+```
+
+**Sources:** [igfold/utils/pdb.py:194-251](), [igfold/utils/pdb.py:21-59](), [igfold/utils/pdb.py:314-378]()
+
+### Coordinate Extraction
+
+The primary function `get_atom_coords` extracts backbone and side-chain coordinates from PDB files:
+
+| Function | Purpose | Input | Output |
+|----------|---------|--------|--------|
+| `get_atom_coords` | Extract all atom coordinates | PDB file, optional FASTA | Dict of coordinate tensors |
+| `get_atom_coord` | Get single atom coordinate | Residue, atom type | 3D coordinate array |
+| `get_cb_or_ca_coord` | Get CB coordinate (CA fallback) | Residue | 3D coordinate array |
+| `place_missing_cb_o` | Fill missing CB and O atoms | Coordinate dict | Updated coordinates |
+
+**Sources:** [igfold/utils/pdb.py:194-251](), [igfold/utils/pdb.py:120-137](), [igfold/utils/pdb.py:160-192]()
+
+### Chain Management
+
+Chain processing functions handle multi-chain antibody structures:
+
+- `count_pdb_chains`: Returns the number of chains in a PDB file [igfold/utils/pdb.py:61-68]()
+- `reorder_pdb_chains`: Reorders chains according to specified sequence [igfold/utils/pdb.py:71-117]()
+- `get_pdb_chain_seq`: Extracts amino acid sequence from specific chain [igfold/utils/pdb.py:294-311]()
+
+### CDR Loop Identification
+
+Antibody-specific processing includes CDR (Complementarity Determining Region) identification using Chothia numbering:
+
+```mermaid
+graph TD
+    CHOTHIA_PDB["Chothia Numbered PDB"] --> CDR_FUNC["cdr_indices"]
+    CDR_TYPE["CDR Type (h1, h2, h3, l1, l2, l3)"] --> CDR_FUNC
+    
+    CDR_FUNC --> CHOTHIA_RANGES["Chothia Range Dictionary"]
+    CHOTHIA_RANGES --> BINARY_SEARCH["Binary Search on Residue IDs"]
+    BINARY_SEARCH --> CDR_START_END["CDR Start/End Indices"]
+    
+    subgraph "CDR Ranges"
+        H1["h1: (26, 32)"]
+        H2["h2: (52, 56)"]
+        H3["h3: (95, 102)"]
+        L1["l1: (24, 34)"]
+        L2["l2: (50, 56)"]
+        L3["l3: (89, 97)"]
+    end
+```
+
+**Sources:** [igfold/utils/pdb.py:314-378](), [igfold/utils/pdb.py:381-402]()
+
+## Geometric Calculations
+
+The `igfold.utils.geometry` module provides fundamental geometric operations for structural calculations:
+
+| Function | Purpose | Formula |
+|----------|---------|---------|
+| `normed_vec` | Vector normalization | `vec / ||vec||` |
+| `dist` | Euclidean distance | `sqrt(sum((x1-x2)²))` |
+| `angle` | Bond angle | `arccos(a·b)` |
+| `dihedral` | Dihedral angle | `atan2(y, x)` using cross products |
+| `coords_to_frame` | Local coordinate frame | N-CA-C backbone frame |
+
+**Sources:** [igfold/utils/geometry.py:7-77]()
+
+### Reference Frame Calculations
+
+The `coords_to_frame` function converts backbone coordinates into local reference frames for structural analysis:
+
+```mermaid
+graph LR
+    COORDS["Backbone Coordinates<br/>(N, CA, C, O)"] --> VECTORS["Vector Calculations"]
+    VECTORS --> CA_N["CA-N vector"]
+    VECTORS --> CA_C["CA-C vector"]
+    
+    CA_N --> N1["n1 = normalized CA-N"]
+    CA_C --> N2["n2 = cross(n1, CA-C)"]
+    N1 --> N3["n3 = cross(n1, n2)"]
+    N2 --> N3
+    
+    N1 --> ROTATION_MATRIX["Rotation Matrix [n1, n2, n3]"]
+    N2 --> ROTATION_MATRIX
+    N3 --> ROTATION_MATRIX
+    
+    ROTATION_MATRIX --> LOCAL_FRAME["Local Coordinate Frame"]
+```
+
+**Sources:** [igfold/utils/geometry.py:61-77]()
+
+## Coordinate Manipulation
+
+The `igfold.utils.coordinates` module handles precise atom placement and coordinate transformations:
+
+### Fourth Atom Placement
+
+The `place_fourth_atom` function uses geometric constraints to determine atom positions:
+
+```mermaid
+graph TD
+    INPUT_ATOMS["Three Known Atoms<br/>(A, B, C)"] --> CONSTRAINTS["Geometric Constraints"]
+    CONSTRAINTS --> BOND_LENGTH["Bond Length"]
+    CONSTRAINTS --> PLANAR_ANGLE["Planar Angle"] 
+    CONSTRAINTS --> DIHEDRAL_ANGLE["Dihedral Angle"]
+    
+    BOND_LENGTH --> CALC["Coordinate Calculation"]
+    PLANAR_ANGLE --> CALC
+    DIHEDRAL_ANGLE --> CALC
+    
+    CALC --> BC_VEC["bc_vec = normalized(B-C)"]
+    CALC --> N_VEC["n_vec = cross(B-A, bc_vec)"]
+    CALC --> M_VEC["m_vec basis vectors"]
+    
+    BC_VEC --> D_COORD["Fourth Atom Position"]
+    N_VEC --> D_COORD
+    M_VEC --> D_COORD
+```
+
+**Sources:** [igfold/utils/coordinates.py:4-30]()
+
+### Ideal Coordinates
+
+Standard backbone geometry is provided through `get_ideal_coords` with ideal bond lengths and angles:
+
+- N: `[0, 0, -1.458]`
+- CA: `[0, 0, 0]` (reference point)
+- CB: `[0, 1.426, 0.531]`
+- C: Calculated using `place_fourth_atom`
+
+**Sources:** [igfold/utils/coordinates.py:33-54]()
+
+## Physical Constants
+
+The `igfold.utils.constants` module defines standard structural parameters from Engh and Huber:
+
+| Constant Type | Examples | Value (Å or degrees) |
+|---------------|----------|---------------------|
+| Bond Lengths | `BL_N_CA`, `BL_CA_C`, `BL_C_N` | 1.459, 1.525, 1.336 |
+| Bond Angles | `BA_N_CA_C`, `BA_CA_C_N` | 111.0°, 117.2° |
+| VdW Radii | `VDW_N`, `VDW_C` | 1.55, 1.7 |
+
+**Sources:** [igfold/utils/constants.py:1-22]()
+
+## AbNumber Integration
+
+PDB renumbering uses the AbNumber web service for consistent antibody numbering:
+
+```mermaid
+sequenceDiagram
+    participant CLIENT as "renumber_pdb"
+    participant ABNUM as "AbNum Web Service"
+    participant FILE as "PDB File"
+    
+    CLIENT->>FILE: Read PDB file
+    CLIENT->>ABNUM: POST pdb file with parameters
+    Note over ABNUM: scheme="-c" (Chothia)<br/>output="-HL"<br/>plain="1"
+    
+    alt Success
+        ABNUM-->>CLIENT: Renumbered PDB text
+        CLIENT->>FILE: Write renumbered PDB
+    else Failure
+        ABNUM-->>CLIENT: Error response
+        CLIENT->>CLIENT: Retry with exponential backoff
+    end
+```
+
+**Sources:** [igfold/utils/pdb.py:21-59]()
+
+## Structure Output
+
+The `save_PDB` function writes coordinate tensors back to standard PDB format:
+
+| Parameter | Purpose | Type |
+|-----------|---------|------|
+| `coords` | Atom coordinates | `torch.Tensor` |
+| `seq` | Amino acid sequence | `str` |
+| `chains` | Chain identifiers | `List[str]` |
+| `error` | B-factor values | `torch.Tensor` |
+| `delim` | Chain boundaries | `List[int]` |
+
+The function handles chain assignment, residue numbering, and proper PDB formatting including TER and END records.
+
+**Sources:** [igfold/utils/pdb.py:428-478]()
+
+---
+
+# Page: Advanced Features
+
+# Advanced Features
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/__init__.py](igfold/__init__.py)
+- [igfold/refine/openmm_ref.py](igfold/refine/openmm_ref.py)
+- [igfold/refine/pyrosetta_ref.py](igfold/refine/pyrosetta_ref.py)
+
+</details>
+
+
+
+This page documents IgFold's advanced capabilities beyond basic structure prediction, including post-prediction refinement methods, specialized antibody analysis tools, and integration with external bioinformatics software. These features enable enhanced structure quality, domain-specific analysis, and customized workflows for specialized research applications.
+
+For basic structure prediction workflows, see [Quick Start Guide](#3) and [User Guide](#4). For technical details on the core model architecture, see [Core Architecture](#5).
+
+## Overview
+
+IgFold provides several advanced features that extend beyond standard structure prediction:
+
+- **Structure Refinement**: Post-prediction optimization using molecular dynamics and energy minimization
+- **Antibody-Specific Tools**: Integration with specialized antibody analysis software
+- **Advanced Analysis**: Enhanced metrics, validation, and visualization capabilities
+- **External Tool Integration**: Seamless workflow integration with established bioinformatics tools
+
+```mermaid
+graph TD
+    subgraph "Core Prediction"
+        IGFOLD["IgFold.fold()"]
+        COORDS["Raw Coordinates"]
+    end
+    
+    subgraph "Structure Refinement"
+        OPENMM_REF["openmm_ref.refine()"]
+        PYROSETTA_REF["pyrosetta_ref.refine()"]
+        MINIMIZATION["Energy Minimization"]
+        CONSTRAINTS["Structural Constraints"]
+    end
+    
+    subgraph "Antibody Analysis"
+        ABNUMBER["AbNumber Integration"]
+        CDR_ANALYSIS["CDR Identification"]
+        RENUMBERING["Chain Renumbering"]
+    end
+    
+    subgraph "Advanced Output"
+        REFINED_PDB["Refined PDB Structures"]
+        PRMSD_ANALYSIS["pRMSD Analysis"]
+        VISUALIZATION["3D Visualization"]
+        VALIDATION["Structure Validation"]
+    end
+    
+    IGFOLD --> COORDS
+    COORDS --> OPENMM_REF
+    COORDS --> PYROSETTA_REF
+    
+    OPENMM_REF --> MINIMIZATION
+    PYROSETTA_REF --> MINIMIZATION
+    MINIMIZATION --> CONSTRAINTS
+    
+    COORDS --> ABNUMBER
+    ABNUMBER --> CDR_ANALYSIS
+    CDR_ANALYSIS --> RENUMBERING
+    
+    CONSTRAINTS --> REFINED_PDB
+    RENUMBERING --> REFINED_PDB
+    REFINED_PDB --> PRMSD_ANALYSIS
+    REFINED_PDB --> VISUALIZATION
+    REFINED_PDB --> VALIDATION
+```
+
+Sources: [igfold/refine/openmm_ref.py:1-44](), [igfold/refine/pyrosetta_ref.py:1-125](), [igfold/__init__.py:1-3]()
+
+## Structure Refinement Pipeline
+
+IgFold supports two primary refinement backends that can be applied after initial structure prediction to improve geometric quality and energy profiles.
+
+### Refinement Workflow
+
+```mermaid
+flowchart TD
+    INPUT_PDB["Input PDB Structure"]
+    
+    subgraph "OpenMM Refinement"
+        PDBFIXER["pdbfixer.PDBFixer"]
+        MISSING_ATOMS["findMissingAtoms()"]
+        ADD_HYDROGENS["addHydrogens()"]
+        FORCE_FIELD["amber14/protein.ff14SB.xml"]
+        CUSTOM_FORCE["CustomExternalForce"]
+        HARMONIC_CONSTRAINTS["Harmonic Constraints"]
+        ENERGY_MIN["minimizeEnergy()"]
+    end
+    
+    subgraph "PyRosetta Refinement"
+        POSE_IMPORT["pose_from_pdbstring()"]
+        COORD_CST["AtomCoordinateCstMover"]
+        MIN_MOVER["get_min_mover()"]
+        SCORE_FUNCTION["ref2015_cst"]
+        REPACK_MOVER["get_repack_mover()"]
+        IDEALIZE_MOVER["IdealizeMover"]
+    end
+    
+    INPUT_PDB --> PDBFIXER
+    INPUT_PDB --> POSE_IMPORT
+    
+    PDBFIXER --> MISSING_ATOMS
+    MISSING_ATOMS --> ADD_HYDROGENS
+    ADD_HYDROGENS --> FORCE_FIELD
+    FORCE_FIELD --> CUSTOM_FORCE
+    CUSTOM_FORCE --> HARMONIC_CONSTRAINTS
+    HARMONIC_CONSTRAINTS --> ENERGY_MIN
+    
+    POSE_IMPORT --> COORD_CST
+    COORD_CST --> MIN_MOVER
+    MIN_MOVER --> SCORE_FUNCTION
+    SCORE_FUNCTION --> REPACK_MOVER
+    REPACK_MOVER --> IDEALIZE_MOVER
+    
+    ENERGY_MIN --> OUTPUT_PDB["Refined PDB Structure"]
+    IDEALIZE_MOVER --> OUTPUT_PDB
+```
+
+Sources: [igfold/refine/openmm_ref.py:7-44](), [igfold/refine/pyrosetta_ref.py:92-125]()
+
+### Refinement Configuration Options
+
+Both refinement backends provide configurable parameters for customizing the refinement process:
+
+| Backend | Key Parameters | Description |
+|---------|----------------|-------------|
+| OpenMM | `stiffness` | Harmonic constraint strength (default: 10.0) |
+| OpenMM | `tolerance` | Energy minimization tolerance (default: 2.39) |
+| OpenMM | `use_gpu` | Enable GPU acceleration (default: False) |
+| PyRosetta | `minimization_iter` | Maximum minimization iterations (default: 100) |
+| PyRosetta | `constrain` | Apply coordinate constraints (default: True) |
+| PyRosetta | `idealize` | Apply geometry idealization (default: False) |
+
+### PyRosetta Refinement Components
+
+The PyRosetta refinement system uses several specialized movers and scoring functions:
+
+```mermaid
+graph TD
+    subgraph "Scoring Functions"
+        REF2015["ref2015_cst"]
+        CART_BONDED["cart_bonded weight"]
+        COORD_CST["coordinate_constraint"]
+        DIHED_CST["dihedral_constraint"]
+    end
+    
+    subgraph "Movement Configuration"
+        MOVEMAP["MoveMap"]
+        BB_MOVES["set_bb(True)"]
+        CHI_MOVES["set_chi(False)"]
+        JUMP_MOVES["set_jump(False)"]
+    end
+    
+    subgraph "Refinement Movers"
+        MIN_MOVER["MinMover"]
+        RELAX_MOVER["FastRelax"]
+        REPACK_MOVER["PackRotamersMover"]
+        CST_MOVER["AtomCoordinateCstMover"]
+    end
+    
+    REF2015 --> MIN_MOVER
+    CART_BONDED --> MIN_MOVER
+    COORD_CST --> MIN_MOVER
+    DIHED_CST --> MIN_MOVER
+    
+    MOVEMAP --> MIN_MOVER
+    BB_MOVES --> MOVEMAP
+    CHI_MOVES --> MOVEMAP
+    JUMP_MOVES --> MOVEMAP
+    
+    MIN_MOVER --> CST_MOVER
+    RELAX_MOVER --> REPACK_MOVER
+```
+
+Sources: [igfold/refine/pyrosetta_ref.py:12-54](), [igfold/refine/pyrosetta_ref.py:57-89]()
+
+## External Tool Integration
+
+IgFold integrates with several external bioinformatics tools to provide specialized antibody analysis capabilities and enhanced structure processing.
+
+### Integration Architecture
+
+```mermaid
+graph LR
+    subgraph "IgFold Core"
+        RUNNER["IgFoldRunner"]
+        FOLD_METHOD["fold()"]
+        EMBED_METHOD["embed()"]
+    end
+    
+    subgraph "Structure Processing"
+        PDBFIXER_LIB["pdbfixer"]
+        OPENMM_LIB["openmm"]
+        PYROSETTA_LIB["pyrosetta"]
+        BIOPYTHON["Bio.PDB"]
+    end
+    
+    subgraph "Antibody Tools"
+        ANTIBERTY["AntiBERTy"]
+        ABNUMBER["AbNumber"]
+        CDR_TOOLS["CDR Analysis"]
+    end
+    
+    subgraph "Visualization"
+        PY3DMOL["py3Dmol"]
+        MATPLOTLIB["matplotlib"]
+        VISUALIZATION_TOOLS["3D Structure Viewer"]
+    end
+    
+    RUNNER --> FOLD_METHOD
+    RUNNER --> EMBED_METHOD
+    
+    FOLD_METHOD --> PDBFIXER_LIB
+    FOLD_METHOD --> OPENMM_LIB
+    FOLD_METHOD --> PYROSETTA_LIB
+    FOLD_METHOD --> BIOPYTHON
+    
+    EMBED_METHOD --> ANTIBERTY
+    FOLD_METHOD --> ABNUMBER
+    ABNUMBER --> CDR_TOOLS
+    
+    FOLD_METHOD --> PY3DMOL
+    FOLD_METHOD --> MATPLOTLIB
+    PY3DMOL --> VISUALIZATION_TOOLS
+```
+
+Sources: [igfold/refine/openmm_ref.py:1-3](), [igfold/refine/pyrosetta_ref.py:1-1]()
+
+## Advanced Configuration
+
+Advanced users can customize IgFold's behavior through various configuration options and programmatic interfaces.
+
+### Refinement Method Selection
+
+The refinement backend can be selected and configured through the main API:
+
+- **OpenMM Backend**: Molecular dynamics-based refinement with GPU acceleration support
+- **PyRosetta Backend**: Rosetta-based refinement with advanced scoring functions
+- **No Refinement**: Direct output of predicted coordinates
+
+### Scoring and Constraint Configuration
+
+PyRosetta refinement allows fine-tuning of scoring function weights:
+
+| Score Term | Default Weight | Purpose |
+|------------|----------------|---------|
+| `cart_bonded` | 1.0 | Cartesian bonded geometry |
+| `pro_close` | 0.0 | Proline closure (disabled) |
+| `coordinate_constraint` | 1.0 | Position constraints |
+| `dihedral_constraint` | 1.0 | Dihedral angle constraints |
+
+### Minimization Parameters
+
+Both backends support customizable minimization settings:
+
+- **Iteration Limits**: Control computational cost vs. convergence
+- **Constraint Strengths**: Balance refinement vs. structure preservation
+- **Move Maps**: Specify which degrees of freedom to optimize
+
+For detailed information on structure refinement methods, see [Structure Refinement](#6.1). For antibody-specific analysis tools and integrations, see [Antibody-Specific Tools](#6.2).
+
+Sources: [igfold/refine/pyrosetta_ref.py:12-54](), [igfold/refine/openmm_ref.py:7-44]()
+
+---
+
+# Page: Structure Refinement
+
+# Structure Refinement
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/__init__.py](igfold/__init__.py)
+- [igfold/refine/openmm_ref.py](igfold/refine/openmm_ref.py)
+- [igfold/refine/pyrosetta_ref.py](igfold/refine/pyrosetta_ref.py)
+
+</details>
+
+
+
+This document covers the post-prediction structure refinement capabilities in IgFold. Structure refinement is an optional post-processing step that applies physics-based energy minimization to improve the quality of predicted antibody structures. For information about the core structure prediction pipeline, see [5.2 Processing Pipeline](#5.2).
+
+IgFold provides two refinement backends: OpenMM for lightweight constraint-based minimization and PyRosetta for comprehensive full-atom refinement with advanced molecular mechanics protocols.
+
+## Overview
+
+Structure refinement in IgFold addresses limitations inherent in neural network-based structure prediction by applying established computational biology methods to relax steric clashes, optimize side chain conformations, and improve overall geometric quality of predicted structures.
+
+## Refinement Workflow
+
+The refinement process operates as a post-processing step in the IgFold pipeline, taking predicted 3D coordinates and applying physics-based optimization:
+
+```mermaid
+flowchart TD
+    COORDS["Predicted Coordinates"] --> REFINE_CHOICE{"Refinement Method"}
+    
+    REFINE_CHOICE -->|"OpenMM"| OPENMM_FLOW["OpenMM Refinement"]
+    REFINE_CHOICE -->|"PyRosetta"| PYROSETTA_FLOW["PyRosetta Refinement"]
+    REFINE_CHOICE -->|"None"| OUTPUT["Final PDB Output"]
+    
+    OPENMM_FLOW --> PDBFIXER["PDBFixer.findMissingAtoms()"]
+    PDBFIXER --> ADD_HYDROGENS["Modeller.addHydrogens()"]
+    ADD_HYDROGENS --> FORCE_FIELD["ForceField.createSystem()"]
+    FORCE_FIELD --> CONSTRAINTS["CustomExternalForce"]
+    CONSTRAINTS --> MINIMIZE["simulation.minimizeEnergy()"]
+    MINIMIZE --> OUTPUT
+    
+    PYROSETTA_FLOW --> INIT_POSE["pose_from_pdbstring()"]
+    INIT_POSE --> COORD_CST["AtomCoordinateCstMover.apply()"]
+    COORD_CST --> MIN_MOVER["MinMover.apply()"]
+    MIN_MOVER --> IDEALIZE["IdealizeMover.apply()"]
+    IDEALIZE --> REPACK["PackRotamersMover.apply()"]
+    REPACK --> FINAL_MIN["MinMover.apply()"]
+    FINAL_MIN --> OUTPUT
+```
+
+Sources: [igfold/refine/openmm_ref.py:1-44](), [igfold/refine/pyrosetta_ref.py:92-125]()
+
+## OpenMM Refinement
+
+OpenMM refinement provides lightweight structure optimization focused on resolving steric clashes while maintaining the overall predicted fold. The `refine` function in the OpenMM module implements constraint-based energy minimization.
+
+### OpenMM Refinement Process
+
+| Step | Function | Purpose |
+|------|----------|---------|
+| Structure Preparation | `pdbfixer.PDBFixer()` | Add missing atoms and residues |
+| Hydrogen Addition | `modeller.addHydrogens()` | Add hydrogen atoms for complete structure |
+| Force Field Setup | `ForceField.createSystem()` | Initialize AMBER14 force field |
+| Constraint Application | `CustomExternalForce()` | Apply harmonic constraints to backbone atoms |
+| Energy Minimization | `simulation.minimizeEnergy()` | Optimize structure geometry |
+
+### OpenMM Configuration
+
+The OpenMM refinement accepts several parameters:
+
+```mermaid
+classDiagram
+    class OpenMMRefinement {
+        +stiffness: float
+        +tolerance: float
+        +use_gpu: bool
+        +refine(pdb_file, stiffness, tolerance, use_gpu)
+    }
+    
+    class PDBFixer {
+        +findMissingResidues()
+        +findMissingAtoms()
+        +addMissingAtoms()
+    }
+    
+    class CustomExternalForce {
+        +addGlobalParameter("k", stiffness)
+        +addPerParticleParameter("x0")
+        +addPerParticleParameter("y0") 
+        +addPerParticleParameter("z0")
+        +addParticle(atom_index, position)
+    }
+    
+    OpenMMRefinement --> PDBFixer
+    OpenMMRefinement --> CustomExternalForce
+```
+
+The harmonic constraints are applied to backbone atoms N, CA, C, and CB with force constant `k = stiffness * ENERGY / LENGTH²`. Default stiffness is 10 kcal/mol/Ų and tolerance is 2.39 kcal/mol.
+
+Sources: [igfold/refine/openmm_ref.py:7-44]()
+
+## PyRosetta Refinement
+
+PyRosetta refinement provides comprehensive full-atom structure optimization using Rosetta's advanced molecular mechanics protocols. This backend offers more sophisticated refinement capabilities including side chain optimization and geometric idealization.
+
+### PyRosetta Refinement Components
+
+```mermaid
+graph TD
+    INIT["init_pyrosetta()"] --> POSE["pose_from_pdbstring()"]
+    
+    POSE --> CONSTRAIN{"constrain=True"}
+    CONSTRAIN -->|"Yes"| CST_MOVER["AtomCoordinateCstMover"]
+    CONSTRAIN -->|"No"| MIN_MOVER["get_min_mover()"]
+    
+    CST_MOVER --> MIN_MOVER
+    MIN_MOVER --> MIN_APPLY["MinMover.apply()"]
+    
+    MIN_APPLY --> IDEALIZE_CHECK{"idealize=True"}
+    IDEALIZE_CHECK -->|"Yes"| IDEALIZE_MOVER["IdealizeMover"]
+    IDEALIZE_CHECK -->|"No"| REPACK_MOVER["get_repack_mover()"]
+    
+    IDEALIZE_MOVER --> REPACK_MOVER
+    REPACK_MOVER --> REPACK_APPLY["PackRotamersMover.apply()"]
+    REPACK_APPLY --> FINAL_MIN["MinMover.apply()"]
+    FINAL_MIN --> DUMP["pose.dump_pdb()"]
+```
+
+### PyRosetta Movers and Score Functions
+
+| Component | Class | Configuration | Purpose |
+|-----------|-------|---------------|---------|
+| Minimizer | `MinMover` | L-BFGS-Armijo, Cartesian | Backbone optimization |
+| Score Function | `ref2015_cst` | Coordinate/dihedral constraints | Energy evaluation |
+| Relaxer | `FastRelax` | Full-atom relax protocol | Comprehensive optimization |
+| Packer | `PackRotamersMover` | Restrict to repacking | Side chain optimization |
+
+The `get_min_mover` function creates a minimization mover with customizable constraint weights:
+
+```mermaid
+classDiagram
+    class MinMover {
+        +max_iter: int
+        +sf_name: str  
+        +coord_cst_weight: float
+        +dih_cst_weight: float
+        +set_weight(ScoreType, weight)
+        +cartesian(True)
+        +max_iter(1000)
+    }
+    
+    class MoveMap {
+        +set_bb(True)
+        +set_chi(False) 
+        +set_jump(False)
+    }
+    
+    class ScoreFunction {
+        +cart_bonded: 1.0
+        +pro_close: 0.0
+        +coordinate_constraint: coord_cst_weight
+        +dihedral_constraint: dih_cst_weight
+    }
+    
+    MinMover --> MoveMap
+    MinMover --> ScoreFunction
+```
+
+Sources: [igfold/refine/pyrosetta_ref.py:12-54](), [igfold/refine/pyrosetta_ref.py:92-125]()
+
+## Refinement Integration
+
+Structure refinement integrates with the main IgFold prediction pipeline as an optional post-processing step. The refinement choice is typically specified through the `IgFoldRunner` interface, which coordinates the refinement process after structure prediction is complete.
+
+### Refinement Pipeline Integration
+
+```mermaid
+sequenceDiagram
+    participant Runner as "IgFoldRunner"
+    participant Model as "IgFold Model"
+    participant OpenMM as "openmm_ref.refine()"
+    participant PyRosetta as "pyrosetta_ref.refine()"
+    participant Output as "PDB Output"
+    
+    Runner->>Model: "fold(sequences, template)"
+    Model-->>Runner: "coordinates + pRMSD"
+    
+    alt "OpenMM Refinement"
+        Runner->>OpenMM: "refine(pdb_file, stiffness, tolerance)"
+        OpenMM-->>Runner: "refined structure"
+    else "PyRosetta Refinement"  
+        Runner->>PyRosetta: "refine(pdb_string, constrain, idealize)"
+        PyRosetta-->>Runner: "refined structure"
+    else "No Refinement"
+        Runner->>Output: "raw predicted structure"
+    end
+    
+    Runner->>Output: "final PDB structure"
+```
+
+### Refinement Method Selection
+
+The refinement backend selection depends on the intended use case and available computational resources:
+
+| Method | Computational Cost | Use Case | Key Features |
+|--------|-------------------|----------|--------------|
+| None | Minimal | Fast prediction, analysis | Raw neural network output |
+| OpenMM | Low-Medium | Production use, moderate quality | Constraint-based minimization |
+| PyRosetta | High | High-quality structures, detailed analysis | Full-atom optimization, side chain packing |
+
+Both refinement methods preserve the overall fold predicted by the IgFold neural network while improving local geometry and reducing energy.
+
+Sources: [igfold/refine/openmm_ref.py:1-44](), [igfold/refine/pyrosetta_ref.py:1-125]()
+
+---
+
+# Page: Antibody-Specific Tools
+
+# Antibody-Specific Tools
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/utils/ab_metrics.py](igfold/utils/ab_metrics.py)
+- [igfold/utils/abnumber_.py](igfold/utils/abnumber_.py)
+
+</details>
+
+
+
+This section covers IgFold's integration with specialized antibody analysis tools, primarily the AbNumber library for antibody numbering and CDR identification, as well as PyRosetta-based metrics for structural analysis. These tools provide antibody-specific functionality beyond the core structure prediction capabilities.
+
+For core structure prediction capabilities, see [IgFoldRunner API](#4.1). For general structure refinement options, see [Structure Refinement](#6.1).
+
+## AbNumber Integration Architecture
+
+IgFold integrates with the AbNumber library to provide standardized antibody numbering schemes, chain type identification, and CDR region analysis. The integration is primarily handled through utility functions that process both sequences and structures.
+
+**AbNumber Processing Pipeline**
+
+```mermaid
+flowchart TD
+    INPUT_SEQ["Antibody Sequence"] --> IS_HEAVY["is_heavy()"]
+    INPUT_PDB["PDB Structure"] --> RECHAIN["rechain_pdb()"]
+    
+    IS_HEAVY --> CHAIN_OBJ["abnumber.Chain()"]
+    RECHAIN --> PARSER["Bio.PDB.PDBParser"]
+    
+    CHAIN_OBJ --> CHAIN_TYPE["Heavy/Light Classification"]
+    PARSER --> EXTRACT_SEQ["Extract Sequence from PDB"]
+    
+    EXTRACT_SEQ --> ABNUMBER_CHAIN["abnumber.Chain()"]
+    ABNUMBER_CHAIN --> POSITIONS["positions.items()"]
+    
+    POSITIONS --> RENUMBER_PDB["renumber_pdb()"]
+    POSITIONS --> TRUNCATE_SEQ["truncate_seq()"]
+    
+    RENUMBER_PDB --> NUMBERED_PDB["Renumbered PDB File"]
+    TRUNCATE_SEQ --> CLEAN_SEQ["Cleaned Sequence"]
+    
+    NUMBERED_PDB --> PDBIO["Bio.PDB.PDBIO"]
+    PDBIO --> OUTPUT_PDB["Output PDB"]
+```
+
+Sources: [igfold/utils/abnumber_.py:9-88]()
+
+## Chain Type Identification
+
+The `is_heavy()` function determines whether an antibody sequence corresponds to a heavy or light chain using AbNumber's classification system.
+
+**Chain Identification Process**
+
+```mermaid
+flowchart LR
+    SEQ["Input Sequence"] --> CHAIN_CREATE["Chain(seq, scheme='chothia')"]
+    CHAIN_CREATE --> IS_HEAVY_CHECK["is_heavy_chain()"]
+    IS_HEAVY_CHECK --> HEAVY_RESULT["True/False"]
+    
+    HEAVY_RESULT --> H_CHAIN["Heavy Chain"]
+    HEAVY_RESULT --> L_CHAIN["Light Chain"]
+```
+
+The function uses the Chothia numbering scheme by default and leverages AbNumber's built-in heavy chain detection algorithms.
+
+| Function | Purpose | Returns |
+|----------|---------|---------|
+| `is_heavy(seq)` | Classify chain type | Boolean (True=Heavy, False=Light) |
+| `Chain(seq, scheme='chothia')` | Create AbNumber chain object | AbNumber Chain instance |
+| `is_heavy_chain()` | AbNumber classification method | Boolean classification |
+
+Sources: [igfold/utils/abnumber_.py:9-12]()
+
+## PDB Structure Renumbering
+
+The renumbering system provides two main capabilities: chain ID assignment and residue renumbering according to standard antibody numbering schemes.
+
+**PDB Renumbering Workflow**
+
+```mermaid
+flowchart TD
+    INPUT_PDB["Input PDB File"] --> CLEAN_PDB["clean_pdb()"]
+    CLEAN_PDB --> PARSE_STRUCT["PDBParser.get_structure()"]
+    
+    PARSE_STRUCT --> ITER_CHAINS["Iterate Chains"]
+    ITER_CHAINS --> EXTRACT_SEQ_CHAIN["Extract Chain Sequence"]
+    
+    EXTRACT_SEQ_CHAIN --> CREATE_ABNUMBER["Chain(seq, scheme)"]
+    CREATE_ABNUMBER --> GET_POSITIONS["positions.items()"]
+    
+    GET_POSITIONS --> VALIDATE_LENGTH["Assert len(chain_res) == len(numbering)"]
+    VALIDATE_LENGTH --> ITER_RESIDUES["Iterate Residues"]
+    
+    ITER_RESIDUES --> VALIDATE_AA["Validate Amino Acid Match"]
+    VALIDATE_AA --> PARSE_POSITION["Parse Position & Insertion"]
+    
+    PARSE_POSITION --> UPDATE_ID["Update residue._id"]
+    UPDATE_ID --> NEXT_RESIDUE["Next Residue"]
+    NEXT_RESIDUE --> ITER_RESIDUES
+    
+    ITER_RESIDUES --> SAVE_STRUCT["PDBIO.save()"]
+    SAVE_STRUCT --> OUTPUT_PDB["Renumbered PDB"]
+```
+
+**Chain Re-identification Process**
+
+```mermaid
+flowchart TD
+    PDB_CHAINS["PDB Chain Objects"] --> EXTRACT_SEQ["seq1(residue.resname)"]
+    EXTRACT_SEQ --> ABNUMBER_OBJ["abnumber.Chain()"]
+    
+    ABNUMBER_OBJ --> CHAIN_TYPE["is_heavy_chain()"]
+    CHAIN_TYPE --> SET_ID_H["Set chain.id = 'H'"]
+    CHAIN_TYPE --> SET_ID_L["Set chain.id = 'L'"]
+    
+    SET_ID_H --> HANDLE_CONFLICT["Handle ValueError"]
+    SET_ID_L --> HANDLE_CONFLICT
+    
+    HANDLE_CONFLICT --> TEMP_ID["chain.id = 'H_' or 'L_'"]
+    TEMP_ID --> CLEANUP["Remove '_' suffix"]
+    CLEANUP --> FINAL_CHAINS["Final Chain IDs"]
+```
+
+| Function | Parameters | Purpose |
+|----------|------------|---------|
+| `rechain_pdb(pdb_file)` | PDB file path | Assigns H/L chain IDs |
+| `renumber_pdb(in_pdb_file, out_pdb_file, scheme)` | Input PDB, output PDB, numbering scheme | Renumbers residues |
+| `truncate_seq(seq, scheme)` | Sequence, numbering scheme | Truncates sequence to numbered positions |
+
+Sources: [igfold/utils/abnumber_.py:15-88]()
+
+## Sequence Processing Functions
+
+The sequence processing utilities handle antibody-specific sequence manipulations that align with standard numbering conventions.
+
+### Truncation Function
+
+The `truncate_seq()` function processes sequences to include only positions that have valid AbNumber assignments:
+
+```mermaid
+flowchart LR
+    INPUT_SEQ["Input Sequence"] --> CREATE_CHAIN["Chain(seq, scheme)"]
+    CREATE_CHAIN --> GET_POSITIONS["positions.items()"]
+    GET_POSITIONS --> EXTRACT_AA["Extract Amino Acids"]
+    EXTRACT_AA --> JOIN_SEQ["''.join([r[1] for r in numbering])"]
+    JOIN_SEQ --> CLEAN_SEQ["Truncated Sequence"]
+```
+
+This ensures that processed sequences contain only residues with valid numbering positions, removing any terminal extensions or non-standard regions.
+
+Sources: [igfold/utils/abnumber_.py:83-88]()
+
+## PyRosetta-based Antibody Analysis
+
+The `ab_metrics.py` module provides advanced structural analysis capabilities using PyRosetta's antibody-specific tools.
+
+**PyRosetta Antibody Analysis Pipeline**
+
+```mermaid
+flowchart TD
+    POSE_INPUT["PyRosetta Pose"] --> ANTIBODY_INFO["AntibodyInfo(pose)"]
+    
+    ANTIBODY_INFO --> VH_VL_ORIENT["vl_vh_orientation_coords()"]
+    ANTIBODY_INFO --> CDR_RMSD["cdr_backbone_rmsds()"]
+    ANTIBODY_INFO --> CDR_CLUSTERS["setup_CDR_clusters()"]
+    
+    VH_VL_ORIENT --> ORIENT_METRICS["VL-VH Distance, Opening Angle, etc."]
+    CDR_RMSD --> RMSD_METRICS["H1/H2/H3 and L1/L2/L3 RMSDs"]
+    CDR_CLUSTERS --> CLUSTER_ASSIGN["CDR Cluster Assignments"]
+    
+    ORIENT_METRICS --> RESULTS_DICT["Results Dictionary"]
+    RMSD_METRICS --> RESULTS_DICT
+    CLUSTER_ASSIGN --> RESULTS_DICT
+```
+
+### Structural Metrics
+
+| Function | Returns | Metrics |
+|----------|---------|---------|
+| `get_vh_vl_orientation(pose)` | Dictionary | VL-VH distance, opening angle, opposite angle, packing angle |
+| `get_ab_metrics(pose1, pose2)` | Dictionary | OCD, FRH/FRL RMSD, H1/H2/H3 RMSD, L1/L2/L3 RMSD |
+| `get_pose_cdr_clusters(pose)` | Dictionary | CDR cluster assignments (H1-H3, L1-L3) |
+
+### CDR Analysis Details
+
+```mermaid
+flowchart LR
+    CDR_ENUM["CDRNameEnum(1-6)"] --> GET_CLUSTER["get_CDR_cluster()"]
+    GET_CLUSTER --> CLUSTER_RESULT["cluster.cluster()"]
+    CLUSTER_RESULT --> CLUSTER_NAME["get_cluster_name()"]
+    CLUSTER_NAME --> FINAL_CLUSTER["CDR Cluster Assignment"]
+    
+    MAPPING["clus_name = {1: 'h1', 2: 'h2', 3: 'h3', 4: 'l1', 5: 'l2', 6: 'l3'}"]
+```
+
+Sources: [igfold/utils/ab_metrics.py:1-60]()
+
+## Integration with IgFold Pipeline
+
+These antibody-specific tools integrate with IgFold's main prediction pipeline through optional post-processing steps and validation utilities.
+
+**Pipeline Integration Points**
+
+```mermaid
+flowchart TD
+    IGFOLD_PRED["IgFold Prediction"] --> PDB_OUTPUT["PDB Structure"]
+    
+    PDB_OUTPUT --> OPT_RECHAIN["Optional: rechain_pdb()"]
+    PDB_OUTPUT --> OPT_RENUMBER["Optional: renumber_pdb()"]
+    
+    OPT_RECHAIN --> VALIDATION["Chain ID Validation"]
+    OPT_RENUMBER --> STANDARD_NUM["Standard Numbering"]
+    
+    VALIDATION --> DOWNSTREAM["Downstream Analysis"]
+    STANDARD_NUM --> DOWNSTREAM
+    
+    DOWNSTREAM --> PYROSETTA_ANALYSIS["Optional: PyRosetta Metrics"]
+    PYROSETTA_ANALYSIS --> FINAL_RESULTS["Final Analysis Results"]
+```
+
+The integration typically occurs during the refinement phase, where structures can be automatically renumbered and validated before final output.
+
+### Configuration Options
+
+When using these tools with IgFold, several parameters control the antibody-specific processing:
+
+| Parameter | Options | Purpose |
+|-----------|---------|---------|
+| `scheme` | 'chothia', 'kabat', 'imgt' | Numbering scheme for renumbering |
+| `rechain` | Boolean | Whether to reassign chain IDs |
+| `renumber` | Boolean | Whether to renumber residues |
+
+Sources: [igfold/utils/abnumber_.py:37-88](), [igfold/utils/ab_metrics.py:1-60]()
+
+---
+
+# Page: Developer Documentation
+
+# Developer Documentation
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/model/__init__.py](igfold/model/__init__.py)
+- [igfold/model/components/GraphTransformer.py](igfold/model/components/GraphTransformer.py)
+- [igfold/model/components/TriangleGraphTransformer.py](igfold/model/components/TriangleGraphTransformer.py)
+- [igfold/training/utils.py](igfold/training/utils.py)
+
+</details>
+
+
+
+This document provides technical documentation for developers working on IgFold's internal architecture, model components, training systems, and extensibility. It covers the core neural network implementations, training utilities, loss functions, and package organization from a developer perspective.
+
+For user-facing API documentation, see [User Guide](#4). For high-level architecture concepts, see [Core Architecture](#5). For specific neural network component details, see [Model Components](#7.1). For training system specifics, see [Training and Loss Functions](#7.2).
+
+## Development Architecture Overview
+
+IgFold's development architecture centers around modular neural network components, training utilities, and a structured package hierarchy that enables extensibility and experimentation.
+
+```mermaid
+graph TB
+    subgraph "Core Model Development"
+        IGFOLD_MODEL["IgFoldModel"]
+        GRAPH_TRANS["GraphTransformer"]
+        TRI_GRAPH_TRANS["TriangleGraphTransformer"] 
+        IPA_TRANS["IPATransformer"]
+        ATTENTION["Attention"]
+    end
+    
+    subgraph "Training Infrastructure"
+        TRAIN_UTILS["training/utils.py"]
+        KABSCH["kabsch()"]
+        LOSS_FUNCS["Loss Functions"]
+        METRICS["Structural Metrics"]
+    end
+    
+    subgraph "Component Architecture"
+        PRENORM["PreNorm"]
+        GATED_RES["GatedResidual"]
+        RESIDUAL["Residual"]
+        FEEDFORWARD["FeedForward"]
+    end
+    
+    subgraph "Geometric Processing"
+        KABSCH_MSE["kabsch_mse()"]
+        BOND_LOSS["bond_length_l1()"]
+        ANGLE_LOSS["bond_angle_loss()"]
+        VDW_LOSS["vdw_clash_loss()"]
+    end
+    
+    IGFOLD_MODEL --> GRAPH_TRANS
+    IGFOLD_MODEL --> TRI_GRAPH_TRANS
+    IGFOLD_MODEL --> IPA_TRANS
+    
+    GRAPH_TRANS --> ATTENTION
+    GRAPH_TRANS --> PRENORM
+    GRAPH_TRANS --> GATED_RES
+    
+    TRI_GRAPH_TRANS --> GRAPH_TRANS
+    
+    TRAIN_UTILS --> KABSCH
+    TRAIN_UTILS --> LOSS_FUNCS
+    TRAIN_UTILS --> METRICS
+    
+    LOSS_FUNCS --> KABSCH_MSE
+    LOSS_FUNCS --> BOND_LOSS
+    LOSS_FUNCS --> ANGLE_LOSS
+    LOSS_FUNCS --> VDW_LOSS
+    
+    style IGFOLD_MODEL fill:#f9f9f9
+    style TRAIN_UTILS fill:#f9f9f9
+    style GRAPH_TRANS fill:#f9f9f9
+```
+
+**Sources:** [igfold/training/utils.py:1-287](), [igfold/model/components/GraphTransformer.py:1-255](), [igfold/model/components/TriangleGraphTransformer.py:1-63]()
+
+## Core Neural Network Components
+
+The model architecture implements a hierarchical transformer design with geometric constraints and structural loss functions. Key components follow a modular pattern enabling easy modification and extension.
+
+```mermaid
+graph TB
+    subgraph "Transformer Components"
+        GT[GraphTransformer]
+        TGT[TriangleGraphTransformer] 
+        ATT[Attention]
+        PN[PreNorm]
+        GR[GatedResidual]
+        FF[FeedForward]
+    end
+    
+    subgraph "Geometric Operations"
+        KABSCH_FUNC[kabsch]
+        DO_KABSCH[do_kabsch]
+        KABSCH_MSE_FUNC[kabsch_mse]
+    end
+    
+    subgraph "Structural Constraints"
+        BOND_LEN[bond_len_loss]
+        BOND_ANG[bond_angle_loss]
+        VDW_CLASH[vdw_clash_loss]
+        CIS_PEP[cis_peptide_loss]
+        VIOLATION[violation_loss]
+    end
+    
+    GT --> ATT
+    GT --> PN
+    GT --> GR
+    GT --> FF
+    
+    TGT --> GT
+    TGT --> TMM[TriangleMultiplicativeModule]
+    
+    KABSCH_FUNC --> DO_KABSCH
+    DO_KABSCH --> KABSCH_MSE_FUNC
+    
+    VIOLATION --> BOND_LEN
+    VIOLATION --> BOND_ANG  
+    VIOLATION --> VDW_CLASH
+    VIOLATION --> CIS_PEP
+    
+    style GT fill:#f9f9f9
+    style KABSCH_FUNC fill:#f9f9f9
+    style VIOLATION fill:#f9f9f9
+```
+
+**Sources:** [igfold/model/components/GraphTransformer.py:187-255](), [igfold/model/components/TriangleGraphTransformer.py:8-63](), [igfold/training/utils.py:277-286]()
+
+### Key Component Classes
+
+| Component | File Location | Purpose |
+|-----------|---------------|---------|
+| `GraphTransformer` | [igfold/model/components/GraphTransformer.py:187-255]() | Multi-head attention over graph nodes with edge features |
+| `TriangleGraphTransformer` | [igfold/model/components/TriangleGraphTransformer.py:8-63]() | Combines graph attention with triangle multiplicative updates |
+| `Attention` | [igfold/model/components/GraphTransformer.py:70-177]() | Multi-head attention with edge incorporation |
+| `GatedResidual` | [igfold/model/components/GraphTransformer.py:50-65]() | Learned gating for residual connections |
+| `PreNorm` | [igfold/model/components/GraphTransformer.py:14-36]() | Layer normalization before operations |
+
+## Training and Loss Function Systems
+
+The training system implements geometric loss functions that enforce protein structural constraints while enabling gradient-based optimization of 3D coordinates.
+
+### Geometric Loss Functions
+
+The training utilities provide several specialized loss functions for structural validation:
+
+| Function | Purpose | Key Parameters |
+|----------|---------|----------------|
+| `kabsch_mse()` | Optimal alignment RMSE | `align_mask`, `clamp`, `sqrt` |
+| `bond_len_loss()` | Bond length constraints | `seq_lens`, `mask` |
+| `bond_angle_loss()` | Bond angle constraints | `seq_lens`, `mask` |
+| `vdw_clash_loss()` | Van der Waals clash detection | `tol=1.5` |
+| `violation_loss()` | Combined structural violations | `seq_lens`, `mask` |
+
+The `violation_loss()` function [igfold/training/utils.py:277-286]() combines all structural constraints:
+
+```python
+def violation_loss(pred, seq_lens, mask, eps=EPS):
+    bl_loss = bond_len_loss(pred, seq_lens, mask, eps=eps)
+    ba_loss = bond_angle_loss(pred, seq_lens, mask, eps=eps)
+    vdw_loss = vdw_clash_loss(pred, mask)
+    cis_loss = cis_peptide_loss(pred, seq_lens, mask, eps=eps)
+    loss = bl_loss + ba_loss + vdw_loss + cis_loss
+    return loss
+```
+
+**Sources:** [igfold/training/utils.py:194-286]()
+
+### Kabsch Alignment System
+
+The Kabsch algorithm implementation [igfold/training/utils.py:11-76]() provides optimal superposition for structure comparison:
+
+```mermaid
+graph LR
+    MOBILE["mobile coords"] --> KABSCH["kabsch()"]
+    STATIONARY["stationary coords"] --> KABSCH
+    KABSCH --> TRANSFORM["transformation"]
+    KABSCH --> ALIGNED["aligned coords"]
+    
+    ALIGNED --> DO_KABSCH["do_kabsch()"]
+    ALIGN_MASK["align_mask"] --> DO_KABSCH
+    
+    DO_KABSCH --> KABSCH_MSE["kabsch_mse()"]
+    MASK["mask"] --> KABSCH_MSE
+    KABSCH_MSE --> LOSS["RMSE loss"]
+```
+
+**Sources:** [igfold/training/utils.py:11-136]()
+
+## Development Workflow
+
+### Model Component Development
+
+1. **Transformer Components**: Extend `GraphTransformer` [igfold/model/components/GraphTransformer.py:187-255]() for new attention mechanisms
+2. **Loss Functions**: Add new structural constraints to [igfold/training/utils.py]()
+3. **Geometric Operations**: Modify Kabsch alignment in [igfold/training/utils.py:11-98]()
+
+### Testing and Validation
+
+Key functions for structural validation:
+- `kabsch_mse()` for alignment quality [igfold/training/utils.py:100-136]()
+- `violation_loss()` for structural constraints [igfold/training/utils.py:277-286]()
+- `bb_prmsd_l1()` for predicted RMSD validation [igfold/training/utils.py:159-192]()
+
+## Code Organization for Developers
+
+### Package Structure
+
+```mermaid
+graph TB
+    subgraph "Model Components"
+        MODEL_INIT["model/__init__.py"]
+        GRAPH_TRANS_FILE["model/components/GraphTransformer.py"]
+        TRI_GRAPH_FILE["model/components/TriangleGraphTransformer.py"]
+    end
+    
+    subgraph "Training Systems"
+        TRAIN_UTILS_FILE["training/utils.py"]
+        LOSS_FUNCTIONS["Loss Functions"]
+        GEOMETRY["Geometric Operations"]
+    end
+    
+    subgraph "Core Classes"
+        GRAPH_TRANSFORMER["GraphTransformer"]
+        ATTENTION_CLASS["Attention"]
+        GATED_RESIDUAL["GatedResidual"]
+        PRENORM_CLASS["PreNorm"]
+    end
+    
+    GRAPH_TRANS_FILE --> GRAPH_TRANSFORMER
+    GRAPH_TRANS_FILE --> ATTENTION_CLASS
+    GRAPH_TRANS_FILE --> GATED_RESIDUAL
+    GRAPH_TRANS_FILE --> PRENORM_CLASS
+    
+    TRI_GRAPH_FILE --> TRIANGLE_GT["TriangleGraphTransformer"]
+    
+    TRAIN_UTILS_FILE --> LOSS_FUNCTIONS
+    TRAIN_UTILS_FILE --> GEOMETRY
+    
+    style MODEL_INIT fill:#f9f9f9
+    style TRAIN_UTILS_FILE fill:#f9f9f9
+```
+
+**Sources:** [igfold/model/__init__.py:1](), [igfold/model/components/GraphTransformer.py:1-255](), [igfold/training/utils.py:1-287]()
+
+### Extension Points
+
+For developers extending IgFold:
+
+1. **New Attention Mechanisms**: Inherit from `Attention` class [igfold/model/components/GraphTransformer.py:70-177]()
+2. **Custom Loss Functions**: Add to training utilities [igfold/training/utils.py]()
+3. **Geometric Constraints**: Extend violation functions [igfold/training/utils.py:194-286]()
+4. **Transformer Variants**: Modify `GraphTransformer` parameters [igfold/model/components/GraphTransformer.py:187-255]()
+
+For detailed component specifications, see [Model Components](#7.1). For training system details, see [Training and Loss Functions](#7.2). For package organization, see [Package Structure and Utilities](#7.3).
+
+**Sources:** [igfold/model/components/GraphTransformer.py:1-255](), [igfold/model/components/TriangleGraphTransformer.py:1-63](), [igfold/training/utils.py:1-287]()
+
+---
+
+# Page: Model Components
+
+# Model Components
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/model/__init__.py](igfold/model/__init__.py)
+- [igfold/model/components/GraphTransformer.py](igfold/model/components/GraphTransformer.py)
+- [igfold/model/components/IPABlock.py](igfold/model/components/IPABlock.py)
+- [igfold/model/components/IPATransformer.py](igfold/model/components/IPATransformer.py)
+- [igfold/model/components/TriangleGraphTransformer.py](igfold/model/components/TriangleGraphTransformer.py)
+- [igfold/model/components/TriangleMultiplicativeModule.py](igfold/model/components/TriangleMultiplicativeModule.py)
+- [igfold/utils/transforms.py](igfold/utils/transforms.py)
+
+</details>
+
+
+
+This document provides detailed technical documentation of the neural network architectural components that form the core of the IgFold deep learning system. These components implement specialized attention mechanisms, transformer architectures, and geometric operations designed for protein structure prediction.
+
+For information about the overall IgFold model architecture and how these components integrate into the full prediction pipeline, see [IgFold Model](#5.1). For training and optimization details, see [Training and Loss Functions](#7.2).
+
+## Component Architecture Overview
+
+The IgFold model is built from several key neural network components that work together to process antibody sequences and predict 3D structures:
+
+```mermaid
+graph TB
+    subgraph "Attention Mechanisms"
+        IPA["InvariantPointAttention<br/>(IPABlock.py)"]
+        GA["Attention<br/>(GraphTransformer.py)"]
+    end
+    
+    subgraph "Transformer Blocks"
+        IPAB["IPABlock<br/>(IPABlock.py)"]
+        IPAEnc["IPAEncoder<br/>(IPATransformer.py)"]
+        IPATrans["IPATransformer<br/>(IPATransformer.py)"]
+        GT["GraphTransformer<br/>(GraphTransformer.py)"]
+        TGT["TriangleGraphTransformer<br/>(TriangleGraphTransformer.py)"]
+    end
+    
+    subgraph "Specialized Modules"
+        TMM["TriangleMultiplicativeModule<br/>(TriangleMultiplicativeModule.py)"]
+        FF["FeedForward<br/>(Multiple files)"]
+        GR["GatedResidual<br/>(GraphTransformer.py)"]
+    end
+    
+    subgraph "Geometric Operations"
+        QT["quaternion_to_matrix<br/>(transforms.py)"]
+        QM["quaternion_multiply<br/>(transforms.py)"]
+        R6D["rotation_6d_to_matrix<br/>(transforms.py)"]
+    end
+    
+    IPA --> IPAB
+    IPAB --> IPAEnc
+    IPAB --> IPATrans
+    GA --> GT
+    GT --> TGT
+    TMM --> TGT
+    FF --> IPAB
+    FF --> GT
+    GR --> GT
+    QT --> IPATrans
+    QM --> IPATrans
+```
+
+Sources: [igfold/model/components/IPABlock.py:1-248](), [igfold/model/components/IPATransformer.py:1-175](), [igfold/model/components/GraphTransformer.py:1-255](), [igfold/model/components/TriangleGraphTransformer.py:1-63](), [igfold/model/components/TriangleMultiplicativeModule.py:1-109](), [igfold/utils/transforms.py:1-521]()
+
+## Invariant Point Attention (IPA)
+
+The core innovation of IgFold is the Invariant Point Attention mechanism, which processes both sequence representations and 3D geometric information while maintaining rotational and translational invariance.
+
+### InvariantPointAttention Class
+
+The `InvariantPointAttention` class implements a specialized attention mechanism that operates in both sequence space and 3D coordinate space:
+
+| Parameter | Purpose | Default |
+|-----------|---------|---------|
+| `dim` | Input feature dimension | Required |
+| `heads` | Number of attention heads | 8 |
+| `scalar_key_dim` | Dimension for scalar attention keys | 16 |
+| `scalar_value_dim` | Dimension for scalar attention values | 16 |
+| `point_key_dim` | Dimension for point attention keys | 4 |
+| `point_value_dim` | Dimension for point attention values | 4 |
+| `pairwise_repr_dim` | Pairwise representation dimension | `dim` |
+
+The attention computation combines three types of logits:
+- **Scalar attention**: Standard dot-product attention on sequence features
+- **Point attention**: Distance-based attention in 3D coordinate space  
+- **Pairwise attention**: Bias from pairwise sequence representations
+
+Sources: [igfold/model/components/IPABlock.py:34-196]()
+
+### IPABlock Architecture
+
+The `IPABlock` combines `InvariantPointAttention` with feedforward layers and normalization:
+
+```mermaid
+graph LR
+    Input["Input Features<br/>(b, n, dim)"] --> AN["LayerNorm<br/>(attn_norm)"]
+    AN --> IPA["InvariantPointAttention"]
+    Input --> Add1["+"]
+    IPA --> Add1
+    Add1 --> FN["LayerNorm<br/>(ff_norm)"]
+    FN --> FF["FeedForward<br/>(3 layers)"]
+    Add1 --> Add2["+"]
+    FF --> Add2
+    Add2 --> Output["Output Features<br/>(b, n, dim)"]
+```
+
+Sources: [igfold/model/components/IPABlock.py:219-248]()
+
+## Transformer Architectures
+
+### IPATransformer
+
+The `IPATransformer` is the primary structure-generating component that iteratively refines 3D coordinates through multiple IPA layers:
+
+```mermaid
+graph TB
+    SR["single_repr<br/>(b, n, dim)"] --> Layer1["IPABlock + Linear"]
+    T0["translations<br/>(b, n, 3)"] --> Layer1
+    Q0["quaternions<br/>(b, n, 4)"] --> QTM1["quaternion_to_matrix"]
+    QTM1 --> R1["rotations<br/>(b, n, 3, 3)"]
+    R1 --> Layer1
+    
+    Layer1 --> Updates1["quaternion_update<br/>translation_update"]
+    Updates1 --> QM1["quaternion_multiply"]
+    Updates1 --> T1["Updated translations"]
+    Q0 --> QM1
+    QM1 --> Q1["Updated quaternions"]
+    
+    Q1 --> Layer2["IPABlock + Linear"]
+    T1 --> Layer2
+    Layer2 --> Updates2["..."]
+    
+    Updates2 --> FinalCoords["get_ideal_coords +<br/>place_o_coords"]
+    FinalCoords --> Points["points_global<br/>(b, n, atoms, 3)"]
+```
+
+The key operations include:
+- Converting quaternions to rotation matrices via `quaternion_to_matrix`
+- Updating poses through `quaternion_multiply` and translation updates
+- Generating final atomic coordinates with `get_ideal_coords` and `place_o_coords`
+
+Sources: [igfold/model/components/IPATransformer.py:55-175]()
+
+### GraphTransformer
+
+The `GraphTransformer` processes node and edge representations using standard attention mechanisms:
+
+| Component | Class | Purpose |
+|-----------|-------|---------|
+| `Attention` | Graph attention layer | Processes nodes with edge bias |
+| `FeedForward` | MLP with GELU activation | Node feature transformation |
+| `GatedResidual` | Gated residual connection | Adaptive residual weighting |
+| `PreNorm` | Layer normalization | Input normalization |
+
+The attention mechanism incorporates edge information by adding edge features to keys and values:
+
+```python
+# From GraphTransformer.py lines 140-141
+k = k + ek  # Add edge features to keys
+v = v + ev  # Add edge features to values
+```
+
+Sources: [igfold/model/components/GraphTransformer.py:70-255]()
+
+## Specialized Modules
+
+### TriangleMultiplicativeModule
+
+This module implements the triangle multiplicative update from AlphaFold, which updates pairwise representations through multiplicative interactions:
+
+```mermaid
+graph LR
+    X["Input<br/>(b, n, n, dim)"] --> Norm["LayerNorm"]
+    Norm --> LP["left_proj"]
+    Norm --> RP["right_proj"]
+    Norm --> LG["left_gate"]
+    Norm --> RG["right_gate"]
+    Norm --> OG["out_gate"]
+    
+    LP --> LGate["sigmoid"]
+    RP --> RGate["sigmoid"]
+    LG --> LGate
+    RG --> RGate
+    OG --> OutGate["sigmoid"]
+    
+    LGate --> Einsum["einsum<br/>(mix equation)"]
+    RGate --> Einsum
+    Einsum --> OutNorm["LayerNorm"]
+    OutNorm --> ToOut["Linear"]
+    ToOut --> OutGate
+    OutGate --> Output["Output<br/>(b, n, n, dim)"]
+```
+
+The module supports two mixing patterns:
+- **Outgoing**: `'... i k d, ... j k d -> ... i j d'`
+- **Ingoing**: `'... k j d, ... k i d -> ... i j d'`
+
+Sources: [igfold/model/components/TriangleMultiplicativeModule.py:12-109]()
+
+### TriangleGraphTransformer
+
+Combines graph attention with triangle multiplicative updates in alternating layers:
+
+```mermaid
+graph TB
+    Input["nodes, edges"] --> GT["GraphTransformer"]
+    GT --> Nodes1["Updated nodes"]
+    GT --> Edges1["edges"]
+    Edges1 --> TriOut["TriangleMultiplicativeModule<br/>(outgoing)"]
+    TriOut --> Edges2["edges + tri_out"]
+    Edges2 --> TriIn["TriangleMultiplicativeModule<br/>(ingoing)"]
+    TriIn --> Edges3["edges + tri_in"]
+    
+    Nodes1 --> NextLayer["Next Layer"]
+    Edges3 --> NextLayer
+```
+
+Sources: [igfold/model/components/TriangleGraphTransformer.py:8-62]()
+
+## Geometric Transformations
+
+The model relies heavily on quaternion-based rotations and geometric transformations for maintaining 3D structure consistency:
+
+### Core Transform Functions
+
+| Function | Input | Output | Purpose |
+|----------|-------|--------|---------|
+| `quaternion_to_matrix` | `(*, 4)` | `(*, 3, 3)` | Convert quaternions to rotation matrices |
+| `quaternion_multiply` | `(*, 4)`, `(*, 4)` | `(*, 4)` | Compose rotations |
+| `matrix_to_quaternion` | `(*, 3, 3)` | `(*, 4)` | Convert rotation matrices to quaternions |
+| `rotation_6d_to_matrix` | `(*, 6)` | `(*, 3, 3)` | Convert 6D rotation representation |
+| `quaternion_apply` | `(*, 4)`, `(*, 3)` | `(*, 3)` | Apply rotation to 3D points |
+
+### Quaternion Operations
+
+The quaternion operations maintain numerical stability and standard form:
+
+```python
+# From transforms.py lines 331-345
+def quaternion_multiply(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Multiply quaternions representing rotations with standardization"""
+    ab = quaternion_raw_multiply(a, b)
+    return standardize_quaternion(ab)  # Ensure non-negative real part
+```
+
+Sources: [igfold/utils/transforms.py:37-521]()
+
+## Component Integration Patterns
+
+The model components follow several key integration patterns:
+
+```mermaid
+graph TB
+    subgraph "Structure Generation Pipeline"
+        SeqRepr["Sequence Representations"] --> GT["GraphTransformer"]
+        GT --> NodeFeats["Node Features"]
+        NodeFeats --> IPATrans["IPATransformer"]
+        IPATrans --> Coords["3D Coordinates"]
+        
+        PairRepr["Pairwise Representations"] --> GT
+        PairRepr --> IPA["InvariantPointAttention"]
+        IPA --> IPATrans
+        
+        Templates["Template Coordinates"] --> IPATrans
+    end
+    
+    subgraph "Geometric Consistency"
+        Coords --> QT["quaternion_to_matrix"]
+        QT --> Rotations["Rotation Matrices"]
+        Rotations --> IPA
+        IPATrans --> QM["quaternion_multiply"]
+        QM --> IPATrans
+    end
+    
+    subgraph "Feature Processing"
+        NodeFeats --> FF1["FeedForward"]
+        FF1 --> NodeFeats
+        PairRepr --> TMM["TriangleMultiplicativeModule"]
+        TMM --> PairRepr
+    end
+```
+
+Key design principles:
+- **Geometric consistency**: All operations preserve rotational/translational invariance
+- **Iterative refinement**: Multiple layers progressively improve structure predictions  
+- **Multi-scale processing**: Combines local (attention) and global (geometric) information
+- **Residual connections**: Enable stable deep architectures with gradient flow
+
+Sources: [igfold/model/components/IPATransformer.py:55-175](), [igfold/model/components/GraphTransformer.py:187-255](), [igfold/model/components/TriangleGraphTransformer.py:45-62]()
+
+---
+
+# Page: Training and Loss Functions
+
+# Training and Loss Functions
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/model/components/IPABlock.py](igfold/model/components/IPABlock.py)
+- [igfold/model/components/IPATransformer.py](igfold/model/components/IPATransformer.py)
+- [igfold/training/utils.py](igfold/training/utils.py)
+- [igfold/utils/constants.py](igfold/utils/constants.py)
+- [igfold/utils/geometry.py](igfold/utils/geometry.py)
+- [igfold/utils/transforms.py](igfold/utils/transforms.py)
+
+</details>
+
+
+
+This document covers the training utilities, loss functions, and structural validation metrics used in IgFold's deep learning pipeline. These components are responsible for optimizing the neural network models during training and evaluating the quality of predicted protein structures against ground truth data.
+
+For information about the core model architecture that these loss functions train, see [Model Components](#7.1). For the overall processing pipeline, see [Processing Pipeline](#5.2).
+
+## Overview of Training Components
+
+IgFold's training system incorporates specialized loss functions designed for protein structure prediction, focusing on geometric constraints, structural validity, and alignment-based metrics. The training utilities handle the complex requirements of 3D protein structure optimization.
+
+```mermaid
+graph TD
+    subgraph "Training Pipeline"
+        PRED["Predicted Coordinates"]
+        TARGET["Target Coordinates"]
+        MASK["Sequence Masks"]
+    end
+    
+    subgraph "Alignment Utilities"
+        KABSCH["kabsch()"]
+        DO_KABSCH["do_kabsch()"]
+        KABSCH_MSE["kabsch_mse()"]
+    end
+    
+    subgraph "Structural Loss Functions"
+        BOND_LEN["bond_len_loss()"]
+        BOND_ANG["bond_angle_loss()"]
+        VDW_CLASH["vdw_clash_loss()"]
+        CIS_PEP["cis_peptide_loss()"]
+        VIOLATION["violation_loss()"]
+    end
+    
+    subgraph "Quality Metrics"
+        BB_PRMSD["bb_prmsd_l1()"]
+        BOND_L1["bond_length_l1()"]
+    end
+    
+    PRED --> KABSCH_MSE
+    TARGET --> KABSCH_MSE
+    KABSCH_MSE --> KABSCH
+    KABSCH_MSE --> DO_KABSCH
+    
+    PRED --> BOND_LEN
+    PRED --> BOND_ANG
+    PRED --> VDW_CLASH
+    PRED --> CIS_PEP
+    
+    BOND_LEN --> VIOLATION
+    BOND_ANG --> VIOLATION
+    VDW_CLASH --> VIOLATION
+    CIS_PEP --> VIOLATION
+    
+    PRED --> BB_PRMSD
+    TARGET --> BB_PRMSD
+    PRED --> BOND_L1
+    TARGET --> BOND_L1
+    
+    MASK --> BOND_LEN
+    MASK --> BOND_ANG
+    MASK --> VDW_CLASH
+    MASK --> CIS_PEP
+```
+
+Sources: [igfold/training/utils.py:1-287]()
+
+## Core Loss Functions
+
+### Kabsch-Based Alignment Loss
+
+The primary loss function for structure prediction uses Kabsch alignment to optimally superpose predicted and target structures before computing the mean squared error.
+
+| Function | Purpose | Key Parameters |
+|----------|---------|----------------|
+| `kabsch()` | Optimal rigid-body alignment | `mobile`, `stationary`, `return_translation_rotation` |
+| `do_kabsch()` | Apply Kabsch transformation | `mobile`, `stationary`, `align_mask` |
+| `kabsch_mse()` | MSE loss after alignment | `pred`, `target`, `align_mask`, `clamp`, `sqrt` |
+
+```mermaid
+flowchart TD
+    MOBILE["Mobile Coordinates"]
+    STATIONARY["Stationary Coordinates"]
+    ALIGN_MASK["Alignment Mask"]
+    
+    MOBILE --> KABSCH["kabsch()"]
+    STATIONARY --> KABSCH
+    
+    KABSCH --> SVD["SVD Decomposition"]
+    SVD --> ROTATION["Rotation Matrix U"]
+    SVD --> TRANSLATION["Translation Vectors"]
+    
+    ROTATION --> TRANSFORM["Transform Function"]
+    TRANSLATION --> TRANSFORM
+    
+    MOBILE --> DO_KABSCH["do_kabsch()"]
+    STATIONARY --> DO_KABSCH
+    ALIGN_MASK --> DO_KABSCH
+    
+    DO_KABSCH --> KABSCH
+    DO_KABSCH --> ALIGNED["Aligned Coordinates"]
+    
+    ALIGNED --> MSE["kabsch_mse()"]
+    STATIONARY --> MSE
+    MSE --> LOSS["Final Loss"]
+```
+
+The `kabsch()` function implements the Kabsch algorithm using SVD decomposition to find the optimal rotation and translation matrices. For PyTorch versions prior to 1.8, it handles the transpose requirement for the W matrix from `torch.svd()`.
+
+Sources: [igfold/training/utils.py:11-76](), [igfold/training/utils.py:78-98](), [igfold/training/utils.py:100-137]()
+
+### Structural Validation Losses
+
+IgFold incorporates multiple structural validation loss functions that enforce protein geometry constraints:
+
+#### Bond Length Loss
+```python
+bond_len_loss(pred, seq_lens, mask, eps=EPS)
+```
+Enforces ideal bond lengths for backbone atoms (N-CA, CA-C, C-N bonds) using literature values from Engh and Huber constants.
+
+#### Bond Angle Loss  
+```python
+bond_angle_loss(pred, seq_lens, mask, eps=EPS)
+```
+Validates backbone bond angles, specifically CA-C-N and C-N-CA angles, using cosine-based loss functions.
+
+#### Van der Waals Clash Loss
+```python
+vdw_clash_loss(pred, mask, tol=1.5, eps=EPS)  
+```
+Prevents atomic clashes by penalizing violations of van der Waals radii with a specified tolerance.
+
+#### Cis-Peptide Loss
+```python
+cis_peptide_loss(pred, seq_lens, mask, eps=EPS)
+```
+Enforces trans-peptide bond geometry by penalizing deviations from the expected π dihedral angle.
+
+Sources: [igfold/training/utils.py:194-219](), [igfold/training/utils.py:221-241](), [igfold/training/utils.py:243-261](), [igfold/training/utils.py:263-275]()
+
+### Combined Violation Loss
+
+The `violation_loss()` function combines all structural validation losses into a single comprehensive metric:
+
+```mermaid
+graph TD
+    PRED["Predicted Structure"]
+    SEQ_LENS["Sequence Lengths"]
+    MASK["Structure Mask"]
+    
+    PRED --> BL["bond_len_loss()"]
+    PRED --> BA["bond_angle_loss()"]
+    PRED --> VDW["vdw_clash_loss()"]
+    PRED --> CIS["cis_peptide_loss()"]
+    
+    SEQ_LENS --> BL
+    SEQ_LENS --> BA
+    SEQ_LENS --> CIS
+    
+    MASK --> BL
+    MASK --> BA
+    MASK --> VDW
+    MASK --> CIS
+    
+    BL --> TOTAL["Total Violation Loss"]
+    BA --> TOTAL
+    VDW --> TOTAL
+    CIS --> TOTAL
+```
+
+Sources: [igfold/training/utils.py:277-287]()
+
+## Quality Metrics and Evaluation
+
+### Predicted RMSD Loss
+
+The `bb_prmsd_l1()` function evaluates the accuracy of predicted per-residue RMSD values against actual structural deviations:
+
+```python
+bb_prmsd_l1(pdev, pred, target, align_mask=None, mask=None)
+```
+
+This function compares predicted deviation values (`pdev`) with actual backbone deviations computed after Kabsch alignment, using L1 loss for robustness.
+
+### Bond Length Validation
+
+The `bond_length_l1()` function provides detailed bond length validation with configurable offset analysis:
+
+```python
+bond_length_l1(pred, target, mask, offsets=[1, 2])
+```
+
+This evaluates bond lengths at different sequence separations (1-bond, 2-bond distances) using L1 loss.
+
+Sources: [igfold/training/utils.py:159-193](), [igfold/training/utils.py:139-157]()
+
+## Geometric Utilities Integration
+
+The training system leverages geometric calculation utilities for loss computation:
+
+| Utility Function | Purpose | Source Module |
+|------------------|---------|---------------|
+| `dist()` | Euclidean distance | `igfold.utils.geometry` |
+| `angle()` | Bond angle calculation | `igfold.utils.geometry` |  
+| `dihedral()` | Dihedral angle calculation | `igfold.utils.geometry` |
+| Constants (BL_*, BA_*, VDW_*) | Literature geometry values | `igfold.utils.constants` |
+
+```mermaid
+graph LR
+    subgraph "Constants"
+        BL_N_CA["BL_N_CA = 1.459"]
+        BL_CA_C["BL_CA_C = 1.525"] 
+        BL_C_N["BL_C_N = 1.336"]
+        BA_CA_C_N["BA_CA_C_N = 117.2"]
+        BA_C_N_CA["BA_C_N_CA = 121.7"]
+        VDW_N["VDW_N = 1.55"]
+        VDW_C["VDW_C = 1.7"]
+    end
+    
+    subgraph "Geometry Functions"
+        DIST["dist()"]
+        ANGLE["angle()"]
+        DIHEDRAL["dihedral()"]
+    end
+    
+    subgraph "Loss Functions"
+        BOND_LEN_LOSS["bond_len_loss()"]
+        BOND_ANG_LOSS["bond_angle_loss()"]
+        VDW_LOSS["vdw_clash_loss()"]
+        CIS_LOSS["cis_peptide_loss()"]
+    end
+    
+    BL_N_CA --> BOND_LEN_LOSS
+    BL_CA_C --> BOND_LEN_LOSS
+    BL_C_N --> BOND_LEN_LOSS
+    BA_CA_C_N --> BOND_ANG_LOSS
+    BA_C_N_CA --> BOND_ANG_LOSS
+    VDW_N --> VDW_LOSS
+    VDW_C --> VDW_LOSS
+    
+    DIST --> BOND_LEN_LOSS
+    ANGLE --> BOND_ANG_LOSS
+    DIHEDRAL --> CIS_LOSS
+```
+
+Sources: [igfold/utils/geometry.py:23-28](), [igfold/utils/geometry.py:38-44](), [igfold/utils/geometry.py:46-58](), [igfold/utils/constants.py:1-22]()
+
+## Model Integration
+
+These loss functions operate on the output of IgFold's neural network components, particularly the coordinate predictions from the `IPATransformer` and related modules:
+
+- **IPATransformer**: Produces final 3D coordinates (`points_global`) that serve as input to loss functions
+- **IPABlock**: Provides intermediate representations used in deviation prediction
+- **Structural Outputs**: Include translations, quaternions, and per-atom coordinates that are validated against geometric constraints
+
+The training system expects predictions in the format `(batch, length, atoms, dimensions)` where atoms typically represent the backbone atoms N, CA, C, CB for each residue.
+
+Sources: [igfold/model/components/IPATransformer.py:154-174](), [igfold/training/utils.py:194-287]()
+
+---
+
+# Page: Package Structure and Utilities
+
+# Package Structure and Utilities
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [igfold/refine/__init__.py](igfold/refine/__init__.py)
+- [igfold/utils/__init__.py](igfold/utils/__init__.py)
+- [igfold/utils/general.py](igfold/utils/general.py)
+
+</details>
+
+
+
+This document provides an overview of IgFold's package organization, initialization files, utility modules, and development infrastructure. It covers the codebase structure, common utility functions, and setup considerations for developers working on IgFold internals.
+
+For information about the core neural network components, see [Model Components](#7.1). For training-related utilities and metrics, see [Training and Loss Functions](#7.2).
+
+## Package Organization
+
+IgFold follows a modular package structure that separates core functionality, utilities, and optional components into distinct modules. The codebase is organized to support both end-user interfaces and internal development workflows.
+
+### Top-Level Package Structure
+
+```mermaid
+graph TD
+    subgraph "igfold/"
+        INIT["__init__.py"]
+        MAIN["IgFoldRunner"]
+        FOLDING["folding/"]
+        EMBEDDING["embedding/"]
+        TRAINING["training/"]
+        UTILS["utils/"]
+        REFINE["refine/"]
+    end
+    
+    subgraph "Core Modules"
+        FOLDING --> FOLD_UTILS["fold utilities"]
+        EMBEDDING --> EMBED_UTILS["embed utilities"] 
+        TRAINING --> TRAIN_UTILS["training utilities"]
+    end
+    
+    subgraph "Support Modules"
+        UTILS --> GENERAL["general.py"]
+        UTILS --> PDB_UTILS["pdb utilities"]
+        UTILS --> COORD_UTILS["coordinate utilities"]
+        REFINE --> OPENMM_REF["openmm refinement"]
+        REFINE --> PYROSETTA_REF["pyrosetta refinement"]
+    end
+    
+    INIT --> MAIN
+    MAIN --> FOLDING
+    MAIN --> EMBEDDING
+```
+
+**Sources:** [igfold/refine/__init__.py:1](), [igfold/utils/__init__.py:1]()
+
+### Module Hierarchy
+
+The package structure reflects the logical separation of concerns in the IgFold system:
+
+| Module | Purpose | Key Components |
+|--------|---------|----------------|
+| `igfold/` | Main package entry point | `IgFoldRunner`, core APIs |
+| `igfold/folding/` | Structure prediction pipeline | Folding utilities, model interfaces |
+| `igfold/embedding/` | Sequence embedding functionality | AntiBERTy integration, embeddings |
+| `igfold/training/` | Model training components | Loss functions, training loops |
+| `igfold/utils/` | General utilities | Data processing, constants, helpers |
+| `igfold/refine/` | Structure refinement | OpenMM, PyRosetta integration |
+
+## Initialization Files
+
+The package uses `__init__.py` files to define module boundaries and control import behavior. These files are typically minimal, focusing on exposing the primary interfaces from each module.
+
+### Package Initialization Pattern
+
+```mermaid
+graph LR
+    subgraph "Package Structure"
+        ROOT["igfold/__init__.py"]
+        UTILS_INIT["igfold/utils/__init__.py"]
+        REFINE_INIT["igfold/refine/__init__.py"]
+    end
+    
+    subgraph "Import Behavior"
+        ROOT --> RUNNER["IgFoldRunner"]
+        ROOT --> FOLD_API["fold()"]
+        ROOT --> EMBED_API["embed()"]
+        
+        UTILS_INIT --> UTIL_FUNCS["utility functions"]
+        REFINE_INIT --> REFINE_FUNCS["refinement functions"]
+    end
+```
+
+The initialization files follow a consistent pattern:
+- **Empty initialization files** - Most `__init__.py` files are empty, serving only as package markers
+- **Selective exports** - Main package exposes primary user-facing APIs
+- **Lazy loading** - Heavy dependencies loaded only when needed
+
+**Sources:** [igfold/refine/__init__.py:1](), [igfold/utils/__init__.py:1]()
+
+## Utility Modules
+
+The `utils` package contains shared functionality used across the IgFold system, including data processing utilities, constants, and helper functions.
+
+### General Utilities
+
+The `general.py` module provides fundamental constants and utility functions used throughout the codebase:
+
+```mermaid
+graph TD
+    subgraph "igfold/utils/general.py"
+        AA_DICT["_aa_dict"]
+        AA_1_3_DICT["_aa_1_3_dict"] 
+        EXISTS_FUNC["exists()"]
+        DEFAULT_FUNC["default()"]
+    end
+    
+    subgraph "Amino Acid Mappings"
+        AA_DICT --> SINGLE_TO_NUM["Single letter → Number"]
+        AA_1_3_DICT --> SINGLE_TO_THREE["Single letter → Three letter"]
+    end
+    
+    subgraph "Utility Functions"
+        EXISTS_FUNC --> NULL_CHECK["None value checking"]
+        DEFAULT_FUNC --> DEFAULT_VAL["Default value assignment"]
+    end
+```
+
+#### Amino Acid Constants
+
+The module defines standard amino acid mappings used for sequence processing:
+
+- **`_aa_dict`** - Maps single-letter amino acid codes to numeric representations [igfold/utils/general.py:1-22]()
+- **`_aa_1_3_dict`** - Maps single-letter codes to three-letter codes [igfold/utils/general.py:24-46]()
+
+These dictionaries support 20 standard amino acids plus a gap character, providing consistent encoding across the system.
+
+#### Helper Functions
+
+Core utility functions provide common functionality:
+
+- **`exists(x)`** - Checks if a value is not None [igfold/utils/general.py:49-50]()
+- **`default(val, d)`** - Returns value if it exists, otherwise returns default [igfold/utils/general.py:53-57]()
+
+**Sources:** [igfold/utils/general.py:1-57]()
+
+### Utility Module Structure
+
+```mermaid
+graph TD
+    subgraph "Utils Package Structure"
+        UTILS_INIT["utils/__init__.py"]
+        GENERAL["utils/general.py"]
+        PDB_UTILS["utils/pdb_utils.py"]
+        COORD_UTILS["utils/coord_utils.py"]
+        GEOMETRY["utils/geometry.py"]
+    end
+    
+    subgraph "Functional Areas"
+        GENERAL --> CONSTANTS["Constants & Helpers"]
+        PDB_UTILS --> PDB_IO["PDB File I/O"]
+        COORD_UTILS --> COORDINATES["Coordinate Processing"]
+        GEOMETRY --> TRANSFORMATIONS["Geometric Operations"]
+    end
+    
+    subgraph "Usage Pattern"
+        CONSTANTS --> ENCODING["Sequence Encoding"]
+        PDB_IO --> STRUCTURE_IO["Structure File Handling"]
+        COORDINATES --> COORD_CALC["Coordinate Calculations"]
+        TRANSFORMATIONS --> GEOM_OPS["Geometric Transformations"]
+    end
+```
+
+**Sources:** [igfold/utils/__init__.py:1](), [igfold/utils/general.py:1-57]()
+
+## Common Functionality Patterns
+
+### Data Type Conventions
+
+IgFold follows consistent patterns for data representation and processing:
+
+| Data Type | Representation | Usage |
+|-----------|---------------|-------|
+| Amino Acids | Single-letter codes | Primary sequence representation |
+| Coordinates | NumPy arrays | 3D structure coordinates |
+| Sequences | Dictionary format | Multi-chain sequence input |
+| Templates | PDB format | Structure templates |
+
+### Error Handling Utilities
+
+The utility functions support robust error handling throughout the system:
+
+```mermaid
+graph LR
+    subgraph "Error Handling Pattern"
+        INPUT["Input Value"]
+        EXISTS["exists() check"]
+        DEFAULT["default() assignment"]
+        RESULT["Safe Output"]
+    end
+    
+    INPUT --> EXISTS
+    EXISTS -->|"not None"| RESULT
+    EXISTS -->|"None"| DEFAULT
+    DEFAULT --> RESULT
+```
+
+**Sources:** [igfold/utils/general.py:49-57]()
+
+## Development Setup Considerations
+
+### Package Dependencies
+
+The modular structure allows for flexible dependency management:
+
+- **Core utilities** - Minimal dependencies for basic functionality
+- **Refinement modules** - Optional heavy dependencies (OpenMM, PyRosetta)
+- **Visualization** - Optional display dependencies (py3Dmol, matplotlib)
+
+### Import Organization
+
+The package structure supports clean imports and minimal coupling:
+
+```mermaid
+graph TD
+    subgraph "Import Hierarchy"
+        USER_CODE["User Code"]
+        MAIN_API["igfold main API"]
+        CORE_MODULES["Core modules"]
+        UTILS["Utils modules"]
+    end
+    
+    USER_CODE --> MAIN_API
+    MAIN_API --> CORE_MODULES
+    CORE_MODULES --> UTILS
+    
+    subgraph "Dependency Direction"
+        UTILS --> EXTERNAL["External libraries"]
+        CORE_MODULES --> MODELS["PyTorch models"]
+        MAIN_API --> INTERFACES["User interfaces"]
+    end
+```
+
+### Testing and Validation
+
+The package structure supports systematic testing:
+- **Unit tests** for utility functions
+- **Integration tests** for module interfaces  
+- **End-to-end tests** for complete workflows
+
+**Sources:** [igfold/refine/__init__.py:1](), [igfold/utils/__init__.py:1](), [igfold/utils/general.py:1-57]()

@@ -1,0 +1,177 @@
+name: Perf (A/B regression gate)
+
+# MERGE-GATING perf check (issue #187). Runs on PRs and master pushes (and on a
+# daily schedule as a heartbeat). It micro-benchmarks the hot public entry points
+# (tests/benchmarks/) TWICE on the SAME runner in the SAME job:
+#   * the current working tree (editable install), and
+#   * the latest stable release from PyPI, installed --no-deps onto the SAME
+#     dependency set, so only aaanalysis's own source differs.
+# Comparing both builds on one runner cancels cross-runner hardware variance,
+# OS/Python differences, and dependency drift -- the failure mode that made a
+# static committed baseline flap red. The comparison
+# (.github/scripts/check_perf_regression.py) gates per-benchmark: a tight 1.3x
+# band on the meaty paths, a looser 2.0x band on the sub-2ms micro-paths whose
+# relative jitter is far higher.
+#
+# Docs-only changes can't affect timings, so they are path-ignored like main.yml.
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '**/*.rst'
+  pull_request:
+    branches:
+      - master
+    # NO paths-ignore on the PR trigger: the benchmark is a REQUIRED check, and a
+    # path-skipped workflow never reports it, so a docs-only PR would block forever. The
+    # `changes` job skips it on a docs-only diff (docs can't affect timings) while still
+    # reporting success. The `push` trigger keeps its paths-ignore below.
+  schedule:
+    - cron: "0 5 * * *"   # 05:00 UTC daily heartbeat (after the 04:00 nightly)
+  workflow_dispatch: {}
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # On a docs-only PR the benchmark below skips (docs can't affect timings) yet still
+  # reports success. Fail-safe: anything not purely docs (docs/**, *.md, *.rst), a non-PR
+  # event (schedule / dispatch / push), or a detection failure runs the full benchmark.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: filter
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          files="$(git diff --name-only "${BASE}...${HEAD}" || true)"
+          echo "Changed files:"; printf '%s\n' "$files"
+          # Count files that are NOT docs (docs/**, *.md, *.rst). Use -c (a count), not
+          # -vq: BSD and GNU grep disagree on the exit status of `-vq`, but the count is
+          # identical on both. Fail-safe: an empty list, or any doubt, runs the full check.
+          if [ -z "$files" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            n_code=$(printf '%s\n' "$files" | grep -vcE '^(docs/|.*\.md$|.*\.rst$)' || true)
+            if [ "${n_code:-1}" -gt 0 ]; then
+              echo "code=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "code=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  benchmark:
+    needs: changes
+    # Skipped on a docs-only PR (reports skipped = passing); docs can't affect timings.
+    if: needs.changes.outputs.code == 'true'
+    name: A/B benchmark hot paths (Linux/py3.11)
+    runs-on: ubuntu-latest
+    env:
+      MPLBACKEND: Agg
+      # CRITICAL for a correct A/B: stop Python prepending the cwd (the repo root,
+      # which holds the aaanalysis/ source tree) onto sys.path. Without this, the
+      # released venv's pytest would import the WORKING TREE, not the installed
+      # release -> a master-vs-master comparison that can never see a regression.
+      # Paired with pytest --import-mode=importlib (tests/__init__.py would
+      # otherwise make prepend-mode insert the repo root too).
+      PYTHONSAFEPATH: "1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Build current (working-tree) venv
+        run: |
+          python -m venv .venv-current
+          .venv-current/bin/python -m pip install --upgrade pip
+          .venv-current/bin/pip install -e .[dev,pro,bench]
+
+      - name: Guard — current venv imports the working tree
+        run: |
+          .venv-current/bin/python - <<'PY'
+          import aaanalysis, pathlib
+          repo = str(pathlib.Path.cwd())
+          assert repo in aaanalysis.__file__, \
+              f"current venv imported {aaanalysis.__file__}, expected the working tree under {repo}"
+          print("current ->", aaanalysis.__file__)
+          PY
+
+      - name: Benchmark current working tree
+        run: |
+          .venv-current/bin/pytest tests/benchmarks --import-mode=importlib \
+            --benchmark-json=current_run.json -c tests/pytest.ini -v
+
+      - name: Freeze the dependency set (everything except aaanalysis)
+        run: |
+          .venv-current/bin/pip freeze | grep -viE '^(-e |aaanalysis([=@ ]|$))' > deps.txt
+          echo "----- shared dependency set -----"; cat deps.txt
+
+      - name: Build released venv on the SAME deps
+        run: |
+          python -m venv .venv-released
+          .venv-released/bin/python -m pip install --upgrade pip
+          .venv-released/bin/pip install -r deps.txt
+          .venv-released/bin/pip install aaanalysis --no-deps
+          echo "----- released aaanalysis version -----"
+          # 1.0.3 does not define aaanalysis.__version__; read the install metadata.
+          .venv-released/bin/python -c "from importlib.metadata import version; print(version('aaanalysis'))"
+
+      - name: Guard — released venv imports the installed release, NOT the working tree
+        run: |
+          .venv-released/bin/python - <<'PY'
+          import aaanalysis
+          # The installed release lives in site-packages; the working-tree source is
+          # <repo>/aaanalysis/__init__.py (NO "site-packages" in its path). The venv
+          # dir sits INSIDE the repo checkout on CI, so a naive "repo not in path"
+          # check false-fails -- key on site-packages, which the source tree lacks.
+          path = aaanalysis.__file__
+          assert "site-packages" in path, \
+              f"released venv imported the WORKING TREE ({path}); A/B would be master-vs-master"
+          print("released ->", path)
+          PY
+
+      - name: Benchmark latest stable release
+        # Tolerant: a benchmark exercising an API newer than the published release
+        # errors out of released_run.json instead of failing the job. The compare
+        # step is the gate; current-only benchmarks are reported unbaselined and
+        # not gated.
+        continue-on-error: true
+        run: |
+          .venv-released/bin/pytest tests/benchmarks --import-mode=importlib \
+            --benchmark-json=released_run.json -c tests/pytest.ini -v || true
+
+      - name: Gate current vs released (A/B)
+        run: |
+          # Pass the installed release version so the gated_since guard can fail
+          # on silent coverage loss (a gated method missing from the released run).
+          REL_VER="$(.venv-released/bin/python -c 'from importlib.metadata import version; print(version("aaanalysis"))')"
+          python .github/scripts/check_perf_regression.py current_run.json \
+            --baseline-run released_run.json --released-version "$REL_VER"
+
+      - name: Upload both benchmark runs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: perf-ab-runs
+          path: |
+            current_run.json
+            released_run.json
+          if-no-files-found: ignore

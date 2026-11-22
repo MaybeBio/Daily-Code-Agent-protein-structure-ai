@@ -1,0 +1,29 @@
+[package]
+name = "pantometry-core"
+description = "Kernel for physical simulation: conservation audits, fixed-step integrators, fields, multi-domain scheduling and deterministic sampling"
+keywords = ["physics", "simulation", "multiphysics", "integrator", "deterministic"]
+categories = ["science", "simulation"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+# The reference tables for exp, ln, sin and cos are 2.4 MB of test data. Every user of the kernel
+# downloads it, and none needs to: CI and both gates run the tests from the repository. Left out
+# of the package with the two tests that read them and the module they share, so a published
+# crate holds no test that cannot compile.
+exclude = [
+    "tests/data/",
+    "tests/reference/",
+    "tests/exp_and_ln_against_mpmath.rs",
+    "tests/sin_and_cos_against_mpmath.rs",
+]
+
+[dependencies]
+pantometry-units = { workspace = true }
+glam = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

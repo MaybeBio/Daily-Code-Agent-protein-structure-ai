@@ -1,0 +1,178 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2012-2020 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#include "core/ActionShortcut.h"
+#include "core/ActionWithArguments.h"
+#include "core/PlumedMain.h"
+#include "core/ActionSet.h"
+#include "core/ActionRegister.h"
+#include "tools/Tools.h"
+
+namespace PLMD {
+namespace bias {
+
+class Walls : public ActionShortcut {
+public:
+  explicit Walls(const ActionOptions&);
+  static void registerKeywords(Keywords& keys);
+};
+
+PLUMED_REGISTER_ACTION(Walls,"UPPER_WALLS")
+PLUMED_REGISTER_ACTION(Walls,"LOWER_WALLS")
+
+void Walls::registerKeywords(Keywords& keys) {
+  ActionShortcut::registerKeywords(keys);
+  keys.addInputKeyword("numbered","ARG","scalar/vector","the arguments on which the bias is acting");
+  keys.add("compulsory","AT","the positions of the wall. The a_i in the expression for a wall.");
+  keys.add("compulsory","KAPPA","the force constant for the wall.  The k_i in the expression for a wall.");
+  keys.add("compulsory","OFFSET","0.0","the offset for the start of the wall.  The o_i in the expression for a wall.");
+  keys.add("compulsory","EXP","2.0","the powers for the walls.  The e_i in the expression for a wall.");
+  keys.add("compulsory","EPS","1.0","the values for s_i in the expression for a wall");
+  keys.add("hidden","STRIDE","the frequency with which the forces due to the bias should be calculated.  This can be used to correctly set up multistep algorithms");
+  keys.addOutputComponent("bias","default","scalar","the instantaneous value of the bias potential");
+  keys.addOutputComponent("force2","default","scalar","the instantaneous value of the squared force due to this bias potential");
+  keys.addActionNameSuffix("_SCALAR");
+  keys.needsAction("COMBINE");
+  keys.needsAction("CUSTOM");
+  keys.needsAction("SUM");
+  keys.needsAction("BIASVALUE");
+}
+
+Walls::Walls(const ActionOptions&ao):
+  Action(ao),
+  ActionShortcut(ao) {
+  // Read the arguments
+  std::vector<std::string> args;
+  parseVector("ARG",args);
+  if( args.size()==0 ) {
+    error("found no input arguments");
+  }
+  std::string allargs=args[0];
+  for(unsigned i=1; i<args.size(); ++i) {
+    allargs += "," + args[i];
+  }
+  std::vector<Value*> vals;
+  ActionWithArguments::interpretArgumentList( args, plumed.getActionSet(), this, vals );
+  if( vals.size()==0 ) {
+    error("found no input arguments");
+  }
+
+  // Find the rank
+  unsigned rank=vals[0]->getRank();
+  for(unsigned i=0; i<vals.size(); ++i) {
+    if( vals[i]->getRank()>0 && vals[i]->hasDerivatives() ) {
+      error("argument should not be function on grid");
+    }
+    if( vals[i]->getRank()!=rank ) {
+      error("all arguments should have same rank");
+    }
+  }
+  if( rank==0 ) {
+    if( getName()=="UPPER_WALLS") {
+      readInputLine( getShortcutLabel() + ": UPPER_WALLS_SCALAR ARG=" + allargs + " " + convertInputLineToString() );
+    } else if( getName()=="LOWER_WALLS") {
+      readInputLine( getShortcutLabel() + ": LOWER_WALLS_SCALAR ARG=" + allargs + " " + convertInputLineToString() );
+    } else {
+      plumed_merror( getName() + " is not valid");
+    }
+    return;
+  }
+
+  // Note : the sizes of these vectors are checked automatically by parseVector
+  std::vector<std::string> kappa(args.size());
+  parseVector("KAPPA",kappa);
+  std::vector<std::string> offset(kappa.size());
+  parseVector("OFFSET",offset);
+  std::vector<std::string> eps(kappa.size());
+  parseVector("EPS",eps);
+  std::vector<std::string> exp(kappa.size());
+  parseVector("EXP",exp);
+  std::vector<std::string> at(kappa.size());
+  parseVector("AT",at);
+
+  std::string stride;
+  parse("STRIDE",stride);
+  if( stride.length()>0 ) {
+    stride=" STRIDE=" + stride;
+  }
+  std::string biasinp, forceinp;
+  for(unsigned i=0; i<args.size(); ++i) {
+    std::string argn;
+    std::size_t dot=args[i].find_first_of(".");
+    if(dot!=std::string::npos) {
+      argn = args[i].substr(0,dot) + "_" + args[i].substr(dot+1);
+    } else {
+      argn = args[i];
+    }
+    // The wall acts on the value of the argument in its domain, without periodic images
+    // (see https://github.com/plumed/plumed2/issues/658). COMBINE cannot be used here
+    // because it applies periodic boundary conditions to the difference: CUSTOM with PERIODIC=NO does not.
+    std::vector<Value*> argvals;
+    ActionWithArguments::interpretArgumentList( std::vector<std::string>(1,args[i]), plumed.getActionSet(), this, argvals );
+    for(const auto & v : argvals) {
+      if( v->isPeriodic() ) {
+        double min, max, atv;
+        v->getDomain( min, max );
+        Tools::convert( at[i], atv );
+        if( atv<min || atv>max ) {
+          error("the position of the wall (AT) for periodic argument " + v->getName() + " should be within its periodic domain");
+        }
+        log.printf("  WARNING: argument %s is periodic. The wall acts on its value in the domain [%f,%f]\n"
+                   "    without periodic images, so the bias is discontinuous at the boundary of the domain.\n"
+                   "    Make sure that the walls keep the argument far from it (e.g. use both an upper and a lower wall).\n",
+                   v->getName().c_str(), min, max );
+      }
+    }
+    // The scaled distance from the wall, s=(x-AT+OFFSET)/EPS (UPPER_WALLS) or s=(x-AT-OFFSET)/EPS (LOWER_WALLS).
+    // The wall acts where s is positive (UPPER_WALLS) or negative (LOWER_WALLS): select() is used instead of
+    // a product with step(), because a non-integer power of a negative number is nan and nan*0 is nan.
+    // Energy and squared force of each element are computed by one CUSTOM each: the chain of one CUSTOM per
+    // operation that was used before took about four times longer.
+    std::string scaled, inactive, power;
+    if( getName()=="UPPER_WALLS" ) {
+      scaled = "(((x-(" + at[i] + "))+(" + offset[i] + "))/(" + eps[i] + "))";
+      inactive = "step(-" + scaled + ")";
+      power = scaled + "^(" + exp[i] + ")";
+    } else if( getName()=="LOWER_WALLS" ) {
+      scaled = "(((x-(" + at[i] + "))-(" + offset[i] + "))/(" + eps[i] + "))";
+      inactive = "step(" + scaled + ")";
+      power = "(-" + scaled + ")^(" + exp[i] + ")";
+    }
+    readInputLine( getShortcutLabel() + "_v_wall_" + argn + ": CUSTOM PERIODIC=NO FUNC=select(" + inactive + ",0,(" + kappa[i] + ")*" + power + ") ARG=" + args[i] );
+    readInputLine( getShortcutLabel() + "_wall_" + argn + ": SUM ARG=" + getShortcutLabel() + "_v_wall_" + argn + " PERIODIC=NO");
+    // the derivative of the wall with respect to x is KAPPA*EXP*s^EXP/(s*EPS)
+    readInputLine( getShortcutLabel() + "_v_force2_" + argn + ": CUSTOM PERIODIC=NO FUNC=select(" + inactive + ",0,((" + kappa[i] + ")*(" + exp[i] + ")*" + power + "/(" + scaled + "*(" + eps[i] + ")))^2) ARG=" + args[i] );
+    readInputLine( getShortcutLabel() + "_force2_" + argn + ": SUM ARG=" + getShortcutLabel() + "_v_force2_" + argn + " PERIODIC=NO");
+    if(i==0) {
+      biasinp = " ARG=" + getShortcutLabel() + "_wall_" + argn;
+      forceinp = " ARG=" + getShortcutLabel() + "_force2_" + argn;
+    } else {
+      biasinp += "," + getShortcutLabel() + "_wall_" + argn;
+      forceinp += "," + getShortcutLabel() + "_force2_" + argn;
+    }
+  }
+  readInputLine( getShortcutLabel() + "_bias: COMBINE PERIODIC=NO " + biasinp );
+  readInputLine( "BIASVALUE ARG=" + getShortcutLabel() + "_bias" + stride );
+  readInputLine( getShortcutLabel() + "_force2: COMBINE PERIODIC=NO " + forceinp  );
+}
+
+}
+}

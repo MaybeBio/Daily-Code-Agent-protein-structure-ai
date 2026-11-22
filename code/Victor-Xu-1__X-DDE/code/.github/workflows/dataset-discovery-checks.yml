@@ -1,0 +1,461 @@
+name: Dataset discovery scoped checks
+on:
+  push:
+    paths: &dataset_paths
+      - 'src/opendde_workbench/asset_upload*'
+      - 'src/opendde_workbench/dataset_inputs.py'
+      - 'src/opendde_workbench/datasets/**'
+      - 'frontend/src/datasets/**'
+      # Exact candidate material lookup/recovery has its own focused gate.
+      - '!frontend/src/datasets/CandidateHandoff*'
+      - '!frontend/src/datasets/CandidateView*'
+      - 'frontend/src/datasets/CandidateView.css'
+      - 'tests/test_dataset*'
+      # Resource transfer/installation has its full-file checks in the case bundle gate.
+      - '!tests/test_dataset_resources.py'
+      # Generated DEL defaults and exact replay are owned by research-material-checks.yml.
+      - '!frontend/src/datasets/catalog.ts'
+      - 'tests/test_supplier*'
+      - 'server_tests/*dataset*'
+      # Shared result labels/downloads use the real retained-case browser gate;
+      # changing its old manual fixture must not run unrelated native DEL engines.
+      - '!server_tests/test_dataset_browser.py'
+      - 'server_tests/test_del_umi_count.py'
+      - 'tests/test_del_umi.py'
+      - 'scripts/del-ci-scope.py'
+      # Shared interactive charts and appearance use chart-quality-checks.yml.
+      - "!frontend/src/datasets/CountBars.tsx"
+      - "!frontend/src/datasets/DatasetCharts.test.tsx"
+      - "!frontend/src/datasets/DatasetCharts.tsx"
+      - "!frontend/src/datasets/ModelValidationPlot.tsx"
+      - "!frontend/src/datasets/SampleCorrelationPlot.tsx"
+      - "!frontend/src/datasets/SequencingQualityPlot.tsx"
+      - "!frontend/src/datasets/SeriesEnrichmentPlot.tsx"
+      - "!frontend/src/datasets/SeriesEvidencePlots*"
+      - "!frontend/src/datasets/MonosynthonPlot*"
+      - "!frontend/src/datasets/DELSeriesContext*"
+      - "!frontend/src/datasets/chart-documents*"
+      - "!frontend/src/datasets/BarcodeQuality*"
+      - "!frontend/src/datasets/barcode-quality*"
+      - "!frontend/src/datasets/series-map.test.ts"
+      - "!frontend/src/datasets/series-map.ts"
+      - "!frontend/src/datasets/statistical-plots.test.tsx"
+      - "!frontend/src/datasets/CountEvidencePlot.tsx"
+      - "!frontend/src/datasets/count-summary.ts"
+      - "!frontend/src/datasets/count-summary.test.ts"
+      - "!frontend/src/datasets/DatasetResults.tsx"
+      - "!frontend/src/datasets/PlotFrame.tsx"
+      - "!frontend/src/datasets/DatasetHeatmaps.tsx"
+      - "!frontend/src/viewer/style.ts"
+      # Exact material-source gate; no new native calculations.
+      - "!frontend/src/datasets/DELCountMaterials*"
+      - "!frontend/src/datasets/DELMaterialQuestion.tsx"
+      - "!frontend/src/datasets/DatasetPicker*"
+      # Row interaction is checked alongside retained molecular result selections.
+      - '!frontend/src/datasets/ResearchTable.tsx'
+      # Questionnaire availability controls use task-readiness-checks.yml.
+      - "!frontend/src/datasets/BatchDockingForm.tsx"
+      - "!frontend/src/datasets/DELForm.tsx"
+      # The actual library questionnaire, identifier choices and reviewed
+      # recipes use dataset-submission-checks.yml, without unrelated DEL runs.
+      - "!frontend/src/datasets/LibraryForm*"
+      - "!frontend/src/datasets/DatasetSubmission*"
+      - "!frontend/src/datasets/ScreeningForm.tsx"
+      - "!frontend/src/datasets/screening-readiness*"
+      - '.github/workflows/dataset-discovery-checks.yml'
+      # Saved target evidence has a closed presentation-only gate below.
+      - 'frontend/src/discovery/TargetResearchResults*'
+      - 'frontend/src/discovery/ActivityResults*'
+      - 'frontend/src/discovery/ActivityMoleculePreview.tsx'
+      - 'frontend/src/discovery/AssociationResults.tsx'
+      - 'frontend/src/discovery/TargetMaterials.tsx'
+      - 'frontend/src/discovery/ReferenceImportResults.tsx'
+      - 'frontend/src/discovery/target-desktop.css'
+      - 'frontend/src/operations/SequenceSearchResults*'
+      - 'frontend/src/discovery/discovery.css'
+      - 'scripts/target-evidence-scope.py'
+      - 'tests/test_target_evidence_scope.py'
+      - 'server_tests/test_target_evidence_browser.py'
+      - 'server_tests/test_target_review_desktop.py'
+      # Native member inspection and its library adapter have their exact gate.
+      - "!src/opendde_workbench/datasets/member_structure.py"
+      - "!src/opendde_workbench/datasets/member_inspection.py"
+      - "!src/opendde_workbench/datasets/native_library.py"
+      - "!frontend/src/datasets/IndexedLibraryResults*"
+      - "!frontend/src/datasets/useIndexedMember*"
+      - "!frontend/src/datasets/DatasetResults*"
+      - "!frontend/src/datasets/ResearchTable*"
+      - "!frontend/src/datasets/member-page-export*"
+      - "!tests/test_dataset_member_inspection.py"
+  pull_request:
+    paths: *dataset_paths
+  workflow_dispatch:
+    inputs:
+      engine:
+        description: Changed contracts or one actual isolated scientific engine
+        type: choice
+        default: contracts
+        options: [contracts, browser, images, supplier-files, drugclip, deli, gnina, stereo, inputs, discovery]
+permissions:
+  contents: read
+jobs:
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  target-ui-scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      target_evidence_only: ${{ steps.scope.outputs.target_evidence_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: python3 scripts/target-evidence-scope.py
+  discovery-evidence:
+    needs: target-ui-scope
+    if: needs.target-ui-scope.outputs.target_evidence_only == 'true' || (github.event_name == 'workflow_dispatch' && inputs.engine == 'discovery')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      WB_AUTO_DEPLOY: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev --group browser
+      - name: Exact target and disease identity, without molecular calculation
+        if: github.event_name == 'workflow_dispatch'
+        run: >-
+          uv run --locked pytest -q tests/test_discovery.py tests/test_stat6_disease_example.py
+          tests/test_stat6_source_revisions.py tests/test_stat6_predicted_references.py
+      - name: Bilingual disease scope, target handoff, result tables and tabs
+        working-directory: frontend
+        run: >-
+          npx vitest run src/discovery/TargetResearchResults.test.tsx
+          src/discovery/ActivityResults.test.tsx
+          src/discovery/ReferenceImportResults.test.tsx src/operations/SequenceSearchResults.test.tsx
+          src/discovery/TargetResearchForm.test.tsx src/presentation/ResearchTable.test.tsx
+          src/presentation/ResearchTabs.test.tsx
+      - name: Closed target presentation scope and shared CSS exclusions
+        if: needs.target-ui-scope.outputs.target_evidence_only == 'true'
+        run: |
+          uv run --locked pytest -q tests/test_target_evidence_scope.py
+          uv run --locked ruff check scripts/target-evidence-scope.py tests/test_target_evidence_scope.py server_tests/test_target_evidence_browser.py server_tests/test_target_review_desktop.py
+      - name: Restore sealed public target outputs, without new queries or calculations
+        if: needs.target-ui-scope.outputs.target_evidence_only == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          readarray -t source < <(uv run --locked python -c 'from opendde_workbench.examples.stat6_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          [[ "${source[0]}" =~ ^examples-v[0-9]+$ ]]
+          [[ "${source[1]}" =~ ^stat6-reviewed-results-v[0-9]+\.zip$ ]]
+          gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+          echo "WB_REVIEWED_STAT6_ARCHIVE=$RUNNER_TEMP/${source[1]}" >> "$GITHUB_ENV"
+          uv run --locked playwright install-deps chromium
+      - name: Actual bilingual Chrome evidence density, native CSV and return to form
+        if: needs.target-ui-scope.outputs.target_evidence_only == 'true'
+        run: >-
+          uv run --locked python -m pytest -x -q server_tests/test_target_evidence_browser.py server_tests/test_target_review_desktop.py
+          --basetemp "$RUNNER_TEMP/target-evidence-browser"
+      - uses: actions/upload-artifact@v4
+        if: always() && needs.target-ui-scope.outputs.target_evidence_only == 'true'
+        with:
+          name: target-evidence-browser
+          path: outputs/target-evidence/**
+          if-no-files-found: error
+          retention-days: 7
+  source-inputs:
+    if: github.event_name == 'workflow_dispatch' && inputs.engine == 'inputs'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Exact native source context without result mutation or model execution
+        run: >-
+          uv run --locked pytest -q tests/test_dataset_source_context.py tests/test_dataset_contracts.py
+          tests/test_dataset_worker.py
+      - name: Same-name selection, pending-file confirmation and direct form consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/datasets/SourcePicker.test.tsx src/datasets/PocketQuestions.test.tsx
+          src/datasets/ScreeningForm.test.tsx src/datasets/dataset-model.test.ts
+          src/datasets/BatchCandidates.test.tsx src/datasets/useBatchCandidates.test.tsx
+          src/datasets/BatchDockingForm.test.tsx
+          src/research/asset-context.test.ts src/diffsbdd/ReferencePickerLifecycle.test.tsx
+  native-source-stereo:
+    if: github.event_name == 'workflow_dispatch' && inputs.engine == 'stereo'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Actual RDKit source-to-3D Molfile and minimization roundtrips only
+        run: >-
+          uv run --no-project --python 3.12 --with pytest==9.1.1
+          --with numpy==2.3.4 --with rdkit==2026.3.6 --with pydantic==2.14.0
+          --with dimorphite-dl==2.1.0
+          python -m pytest -q server_tests/test_source_stereo_serialization.py
+          server_tests/test_docking_serialization.py
+          server_tests/test_docking_candidate_inputs.py
+          server_tests/test_docking_receptor_handoff.py
+          server_tests/test_molecular_states.py
+      - name: Exact batch candidate chemistry with the GNINA-pinned parser
+        run: >-
+          uv run --no-project --python 3.10 --with pytest==9.1.1
+          --with numpy==1.26.4 --with rdkit==2023.9.6
+          python -m pytest -q server_tests/test_docking_candidate_inputs.py
+          server_tests/test_docking_receptor_handoff.py
+  contracts:
+    needs: [target-ui-scope, utility-scope]
+    if: needs.utility-scope.outputs.runtime_switch_only != 'true' && needs.utility-scope.outputs.candidate_desktop_only != 'true' && needs.utility-scope.outputs.del_desktop_only != 'true' && needs.target-ui-scope.outputs.target_evidence_only != 'true' && (github.event_name == 'push' || github.event_name == 'pull_request' || inputs.engine == 'contracts')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select exact DEL or wider dataset consumers
+        id: scope
+        env:
+          BASE: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: python3 scripts/del-ci-scope.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Research upload and directly affected trust boundaries
+        if: steps.scope.outputs.del_only != 'true'
+        run: >-
+          uv run --locked pytest -q tests/test_dataset_uploads.py
+          tests/test_dataset_contracts.py tests/test_api_security.py
+          tests/test_dataset_worker.py tests/test_dataset_resources.py
+          tests/test_dataset_views.py tests/test_dataset_input_preview.py
+          tests/test_dataset_member_view.py
+          tests/test_dataset_member_inspection.py
+          tests/test_dataset_workflows.py tests/test_workflows.py
+          tests/test_case_bundle.py tests/test_case_bundle_sources.py
+          tests/test_example_library.py tests/test_example_pins.py tests/test_examples.py
+          tests/test_dataset_examples.py tests/test_research_assets.py
+          tests/test_plip_coordinates.py
+          tests/test_supplier_resources.py
+          tests/test_supplier_text.py
+      - name: Changed data forms, upload and workflow UI only
+        if: steps.scope.outputs.del_only != 'true'
+        working-directory: frontend
+        run: npx vitest run src/datasets src/studio/research-modules.test.ts src/deployment/component-groups.test.ts src/workflows/model.test.ts
+      - name: DEL completeness, submission, source integrity, paging and direct worker contracts
+        if: steps.scope.outputs.del_only == 'true' && steps.scope.outputs.series_views_only != 'true' && steps.scope.outputs.candidate_views_only != 'true'
+        run: >-
+          uv run --locked pytest -q tests/test_del_umi.py tests/test_dataset_contracts.py
+          tests/test_dataset_views.py tests/test_dataset_worker.py tests/test_dataset_workflows.py
+          tests/test_del_analysis_support.py
+      - name: Actual UMI method choices and unchanged template replay
+        if: steps.scope.outputs.del_only == 'true' && steps.scope.outputs.series_views_only != 'true' && steps.scope.outputs.candidate_views_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/datasets/UMICountChoices.test.tsx src/datasets/DELTemplateReplay.test.tsx
+          src/datasets/DELAnalysisSupport.test.tsx src/datasets/ResearchTable.test.tsx
+      - name: Retained SQLite series/follow-up search, source integrity and shared route consumers
+        if: steps.scope.outputs.series_views_only == 'true'
+        run: >-
+          uv run --locked pytest -q tests/test_dataset_series_views.py
+          tests/test_dataset_source_context.py tests/test_dataset_views.py
+          tests/test_dataset_contracts.py
+      - name: Exact source-report and readonly table consumers
+        if: steps.scope.outputs.candidate_views_only == 'true' && steps.scope.outputs.candidate_preview_only != 'true'
+        run: uv run --locked pytest -q tests/test_dataset_source_context.py tests/test_dataset_views.py
+      - name: Candidate evidence, retained rows, source switches and template replay only
+        if: steps.scope.outputs.candidate_views_only == 'true' && steps.scope.outputs.candidate_preview_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/datasets/DELCandidateEvidence.test.tsx
+          src/datasets/ResearchTable.test.tsx
+          src/datasets/DELReviewQuestion.test.tsx src/datasets/CandidateView.test.tsx
+          src/datasets/DELTemplateReplay.test.tsx
+      - name: Candidate selection, exact native downloads and direct preview consumers
+        if: steps.scope.outputs.candidate_preview_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/datasets/CandidateView.test.tsx
+          src/datasets/CandidateTable.test.tsx src/datasets/CandidateHandoff.test.tsx
+  native-del-data:
+    needs: [target-ui-scope, utility-scope]
+    if: needs.utility-scope.outputs.runtime_switch_only != 'true' && needs.utility-scope.outputs.candidate_desktop_only != 'true' && needs.utility-scope.outputs.del_desktop_only != 'true' && needs.target-ui-scope.outputs.target_evidence_only != 'true' && (github.event_name == 'push' || github.event_name == 'pull_request' || inputs.engine == 'contracts')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select exact native DEL or wider dataset consumers
+        id: scope
+        env:
+          BASE: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: python3 scripts/del-ci-scope.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Install the reviewed independent DEL environment, without platform interpreter changes
+        if: steps.scope.outputs.del_only != 'true' || steps.scope.outputs.native_umi_changed == 'true' || steps.scope.outputs.native_enrichment_changed == 'true'
+        run: |
+          uv venv --python 3.13 .dataset-native
+          uv pip install --python .dataset-native/bin/python --require-hashes -r src/opendde_workbench/integrations/recipes/deli.txt
+          uv pip install --python .dataset-native/bin/python -e . pytest==9.1.1 pydantic==2.13.0
+      - name: Real compound libraries, public DEL chemistry/reads/counts and ranking boundaries only
+        if: steps.scope.outputs.del_only != 'true'
+        env:
+          PYTHONPATH: src
+          WB_TEST_DATASET_NATIVE: '1'
+        run: .dataset-native/bin/python -m pytest -q server_tests/test_dataset_native.py server_tests/test_dataset_curation.py
+      - name: Real public 1000-read decoding, professional UMI methods and incomplete-barcode exclusions
+        if: steps.scope.outputs.del_only == 'true' && steps.scope.outputs.native_umi_changed == 'true'
+        env:
+          PYTHONPATH: src
+          WB_TEST_DATASET_NATIVE: '1'
+        run: >-
+          .dataset-native/bin/python -m pytest -q server_tests/test_del_umi_count.py
+          server_tests/test_dataset_native.py -k 'umi'
+      - name: Native enrichment, observed sample support and unchanged public DELi ratio
+        if: steps.scope.outputs.del_only == 'true' && steps.scope.outputs.native_enrichment_changed == 'true'
+        env:
+          PYTHONPATH: src
+          WB_TEST_DATASET_NATIVE: '1'
+        run: >-
+          .dataset-native/bin/python -m pytest -q server_tests/test_del_analysis_support.py
+          server_tests/test_dataset_native.py -k 'support or public_del_counts_enrichment or exact_count_model'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dataset-native-check-evidence
+          path: /tmp/pytest-of-runner/pytest-*/**/output
+          if-no-files-found: ignore
+          retention-days: 7
+  native:
+    if: github.event_name == 'workflow_dispatch' && (inputs.engine == 'drugclip' || inputs.engine == 'deli' || inputs.engine == 'gnina')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: astral-sh/setup-uv@v6
+      - name: Reserve space on this disposable CI runner for official model files
+        if: inputs.engine == 'drugclip'
+        run: |
+          for path in /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost; do
+            if [ -d "$path" ] && [ ! -L "$path" ]; then sudo rm -rf -- "$path"; fi
+          done
+          df -h .
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Actual public scientific inputs through API, native container, Worker and downloads
+        env:
+          WB_DATASET_ENGINE: ${{ inputs.engine }}
+          PYTHONPATH: src
+          PYTHONUNBUFFERED: '1'
+        run: uv run --locked --with h5py==3.14.0 --with numpy==1.26.4 pytest -q -s server_tests/test_native_dataset_engines.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dataset-${{ inputs.engine }}-acceptance
+          path: |
+            server_tests/evidence/datasets
+            /tmp/pytest-of-runner/pytest-*/**/install.log
+            /tmp/pytest-of-runner/pytest-*/**/jobs/*/run.log
+          if-no-files-found: ignore
+          retention-days: 7
+  browser:
+    if: github.event_name == 'workflow_dispatch' && inputs.engine == 'browser'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - run: uv run --locked --with playwright==1.58.0 playwright install --with-deps chromium
+      - name: Actual public-case API, questionnaire, Ketcher and 3D research pages
+        env:
+          WB_TEST_DATASET_BROWSER: '1'
+          PYTHONPATH: src
+        run: uv run --locked --with playwright==1.58.0 pytest -q -s server_tests/test_dataset_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dataset-browser-acceptance
+          path: server_tests/evidence/dataset-browser
+          if-no-files-found: ignore
+          retention-days: 7
+  images:
+    if: github.event_name == 'workflow_dispatch' && inputs.engine == 'images'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Identical pinned runtimes for offline installation, without model redistribution
+        env:
+          PYTHONPATH: src
+          PYTHONUNBUFFERED: '1'
+        run: uv run --locked python server_tests/export_dataset_images.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dataset-reviewed-runtime-images
+          path: server_tests/evidence/runtime-images
+          retention-days: 7
+  supplier-files:
+    if: github.event_name == 'workflow_dispatch' && inputs.engine == 'supplier-files'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: The reviewed independent RDKit environment
+        run: |
+          uv venv --python 3.13 .dataset-native
+          uv pip install --python .dataset-native/bin/python --require-hashes -r src/opendde_workbench/integrations/recipes/deli.txt
+          uv pip install --python .dataset-native/bin/python -e . pytest==9.1.1 pydantic==2.13.0
+      - name: Real supplier archives and original SDF identifiers
+        env:
+          WB_TEST_SUPPLIER_NATIVE: '1'
+        run: .dataset-native/bin/python -m pytest -q server_tests/test_supplier_native.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: supplier-native-file-evidence
+          path: server_tests/evidence/supplier-files
+          if-no-files-found: ignore
+          retention-days: 7

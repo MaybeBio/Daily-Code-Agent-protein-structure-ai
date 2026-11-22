@@ -1,0 +1,267 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+import pytest
+import torch
+from test_utils.openfold.create_and_load_weights import (
+    create_template_pair_stack_block_weights,
+    create_template_pointwise_attention_weights,
+    load_template_pair_stack_block_weights_torch,
+    load_template_pointwise_attention_weights_torch,
+)
+from test_utils.openfold.ref_layers import RefTemplatePairStackBlock, RefTemplatePointwiseAttention
+
+from bionemo_ir._torch.layers.triangle_nodes import precompute_trimul_metadata
+from bionemo_ir._torch.modules.openfold2.embedders import TemplateEmbedder
+from bionemo_ir._torch.modules.openfold2.template import TemplatePairBlock, TemplatePointwiseAttention
+from bionemo_ir.models.openfold2.config import TemplateEmbedderConfig
+from bionemo_ir.models.openfold2.modeling import OpenFold2
+from bionemo_ir.utils import str_dtype_to_torch
+from tests._torch import make_left_aligned_mask
+
+
+@dataclass(kw_only=True, frozen=True)
+class Scenario:
+    batch_size: int = 1
+    n_res: int = 64
+    n_templ: int = 32
+    dtype: str = "float32"
+    triangle_attn_backend: str = "VANILLA"
+
+
+@pytest.mark.parametrize(
+    "sc",
+    [
+        Scenario(triangle_attn_backend="VANILLA"),
+        Scenario(triangle_attn_backend="CUEQUIV"),
+        Scenario(triangle_attn_backend="VANILLA", dtype="bfloat16"),
+        Scenario(triangle_attn_backend="CUEQUIV", dtype="bfloat16"),
+    ],
+    ids=["vanilla", "cuequiv", "vanilla_bf16", "cuequiv_bf16"],
+)
+def test_template_pair_stack_block(sc: Scenario):
+    torch.manual_seed(123)
+    os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "0"
+    os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+    bs = 1
+    torch_dtype = str_dtype_to_torch(sc.dtype)
+    device = torch.device("cuda")
+
+    ref_module = RefTemplatePairStackBlock.load_weights()
+    ref_module = ref_module.to(device)
+
+    weights_and_biases = create_template_pair_stack_block_weights(from_ref=ref_module)
+    t = torch.randn(bs, sc.n_templ, sc.n_res, sc.n_res, ref_module.c_t, dtype=torch.float32).cuda()
+    # Same layout the pipeline feeds this block: an outer product of a
+    # left-aligned sequence mask (valid residues then padding). An arbitrary
+    # interior-zero mask is outside the contract TriangleMultiplicationNode
+    # declares via pair_mask_left_aligned, under which the CuTe dual_gemm_x_x
+    # kernel masks by a per-row prefix count.
+    seq_mask = make_left_aligned_mask(
+        bs, sc.n_templ, sc.n_res, dtype=torch.float32, device=device, min_valid=max(sc.n_res - 4, 1)
+    )
+    mask = seq_mask[..., None] * seq_mask[..., None, :]
+
+    module = TemplatePairBlock(
+        local_layer_idx=0,
+        c_t=ref_module.c_t,
+        c_hidden_tri_att=ref_module.c_hidden_tri_att,
+        c_hidden_tri_mul=ref_module.c_hidden_tri_mul,
+        no_heads=ref_module.no_heads,
+        pair_transition_n=ref_module.pair_transition_n,
+        tri_mul_first=ref_module.tri_mul_first,
+        dtype=torch_dtype,
+    )
+
+    load_template_pair_stack_block_weights_torch(module, weights_and_biases)
+    module = module.to(device)
+    module.eval()
+    ref_module.eval()
+
+    with torch.no_grad():
+        t = t.flatten(0, 1)  # fused batch_dim and template_dim
+        mask = mask.flatten(0, 1)  # fused batch_dim and template_dim
+        ref_t = ref_module(t, mask)
+
+        t = t.to(torch_dtype)
+        mask = mask.to(torch_dtype)
+        output_t = module(t, mask, precompute_trimul_metadata(t, None, None))
+
+    if torch_dtype == torch.float32:
+        torch.testing.assert_close(output_t.float(), ref_t.float(), atol=1e-3, rtol=1e-4)
+    else:
+        torch.testing.assert_close(output_t.float(), ref_t.float(), atol=0.15, rtol=0.15)
+
+
+@pytest.mark.parametrize("sc", [Scenario(triangle_attn_backend="VANILLA")])
+def test_template_pointwise_attention(sc: Scenario):
+    torch.manual_seed(123)
+    os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "0"
+    os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+    bs = 1
+    torch_dtype = str_dtype_to_torch(sc.dtype)
+    device = torch.device("cuda")
+
+    ref_module = RefTemplatePointwiseAttention.load_weights()
+    ref_module = ref_module.to(device)
+    ref_module.eval()
+
+    weights_and_biases = create_template_pointwise_attention_weights(from_ref=ref_module)
+    t = torch.randn(bs, sc.n_templ, sc.n_res, sc.n_res, ref_module.c_t, dtype=torch.float32).cuda()
+    z = torch.randn(bs, sc.n_res, sc.n_res, ref_module.c_z, dtype=torch.float32).cuda()
+    template_mask = torch.randint(0, 2, (bs, sc.n_templ), dtype=torch.float32).cuda()
+
+    module = TemplatePointwiseAttention(
+        c_t=ref_module.c_t,
+        c_z=ref_module.c_z,
+        c_hidden=ref_module.c_hidden,
+        no_heads=ref_module.no_heads,
+        inf=ref_module.inf,
+        dtype=torch_dtype,
+    )
+
+    load_template_pointwise_attention_weights_torch(module, weights_and_biases)
+    module = module.to(device)
+    module.eval()
+    ref_module.eval()
+
+    with torch.no_grad():
+        ref_z = ref_module(t, z, template_mask)
+        output_z = module(t, z, template_mask)
+
+    torch.testing.assert_close(output_z.float(), ref_z.float(), atol=1e-3, rtol=1e-4)
+
+
+def _empty_template_batch(n_templ: int, n_res: int, device: torch.device) -> dict[str, torch.Tensor]:
+    """Template features padded to ``n_templ`` slots, none of them present."""
+    g = torch.Generator().manual_seed(7)
+    n_atoms = 37
+    feats = {
+        "template_aatype": torch.randint(0, 22, (n_templ, n_res), generator=g),
+        "template_all_atom_positions": torch.randn(n_templ, n_res, n_atoms, 3, generator=g),
+        "template_all_atom_mask": torch.zeros(n_templ, n_res, n_atoms),
+        "template_pseudo_beta": torch.randn(n_templ, n_res, 3, generator=g),
+        "template_pseudo_beta_mask": torch.zeros(n_templ, n_res),
+        "template_torsion_angles_sin_cos": torch.randn(n_templ, n_res, 7, 2, generator=g),
+        "template_alt_torsion_angles_sin_cos": torch.randn(n_templ, n_res, 7, 2, generator=g),
+        "template_torsion_angles_mask": torch.zeros(n_templ, n_res, 7),
+        "template_mask": torch.zeros(n_templ),
+    }
+    return {k: v.to(device) for k, v in feats.items()}
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_template_embedder_omits_absent_pair_embedding(dtype: torch.dtype):
+    """Without a present template the pair embedding is exactly zero, so omitting it is exact."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    config = TemplateEmbedderConfig()
+    config.template_pointwise_attention.set_dtype(dtype)
+    module = TemplateEmbedder(config).to(device).eval()
+    with torch.no_grad():
+        for p in module.parameters():
+            p.copy_(torch.randn_like(p) * 0.1)
+
+    n_res = 24
+    batch = _empty_template_batch(n_templ=4, n_res=n_res, device=device)
+    z = torch.randn(n_res, n_res, config.template_pointwise_attention.c_z, device=device)
+    pair_mask = torch.ones(n_res, n_res, device=device)
+
+    with torch.no_grad():
+        full = module(batch, z, pair_mask, templ_dim=0, skip_template_pair_stack=True)
+        skipped = module(batch, z, pair_mask, templ_dim=0, skip_template_pair_stack=True, template_mask_any=False)
+
+    assert torch.count_nonzero(full["template_pair_embedding"]) == 0
+    assert "template_pair_embedding" not in skipped
+    assert torch.equal(skipped["template_single_embedding"], full["template_single_embedding"])
+
+
+@pytest.mark.parametrize("template_mask", [[0, 0, 0, 0], [1, 0, 0, 0]], ids=["all_masked", "unresolved_hit"])
+def test_embed_templates_follows_template_mask(template_mask: list[int]):
+    """The pair embedding is omitted only when every template_mask entry is 0.
+
+    A hit without resolved atoms has ``is_template_present=False`` but a set
+    mask; main then skips the pair stack and still adds a nonzero pointwise
+    term, which must be kept.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    config = TemplateEmbedderConfig()
+    module = TemplateEmbedder(config).to(device).eval()
+    with torch.no_grad():
+        for p in module.parameters():
+            p.copy_(torch.randn_like(p) * 0.1)
+    model = SimpleNamespace(
+        config=SimpleNamespace(enable_template=True, skip_template_pair_stack=False),
+        is_multimer=False,
+        template_embedder=module,
+    )
+
+    n_res = 24
+    feats = _empty_template_batch(n_templ=4, n_res=n_res, device=device)
+    feats["template_mask"] = torch.tensor(template_mask, dtype=torch.float32, device=device)
+    z = torch.randn(n_res, n_res, config.template_pointwise_attention.c_z, device=device)
+    pair_mask = torch.ones(n_res, n_res, device=device)
+
+    mask_any = OpenFold2.template_mask_any(model, feats)
+    assert mask_any == any(template_mask)
+    with torch.no_grad():
+        base = module(feats, z, pair_mask, templ_dim=0, skip_template_pair_stack=True)
+        out = OpenFold2.embed_templates(
+            model, feats, z, pair_mask, 0, is_template_present=False, template_mask_any=mask_any
+        )
+
+    if mask_any:
+        assert torch.count_nonzero(base["template_pair_embedding"]) > 0
+        assert torch.equal(out["template_pair_embedding"], base["template_pair_embedding"])
+    else:
+        assert torch.count_nonzero(base["template_pair_embedding"]) == 0
+        assert "template_pair_embedding" not in out
+    assert torch.equal(out["template_single_embedding"], base["template_single_embedding"])
+
+
+@pytest.mark.parametrize("template_mask", [[0, 0, 0, 0], [1, 0, 0, 0]], ids=["all_masked", "unresolved_hit"])
+@pytest.mark.parametrize("extra_msa_present", [False, True], ids=["empty_extra_msa", "present_extra_msa"])
+def test_iteration_keys_trunk_graph_on_template_mask(template_mask: list[int], extra_msa_present: bool):
+    """``iteration`` keys template and extra-MSA omissions independently."""
+
+    class Captured(Exception):
+        pass
+
+    def trunk_graph(**kwargs):
+        raise Captured(kwargs)
+
+    model = SimpleNamespace(config=SimpleNamespace(enable_template=True), is_multimer=False, trunk_graph=trunk_graph)
+    model.template_mask_any = lambda feats: OpenFold2.template_mask_any(model, feats)
+    feats = {
+        "is_template_present": torch.tensor(False),
+        "template_mask": torch.tensor(template_mask, dtype=torch.float32),
+        "seq_mask": torch.ones(8),
+        "msa_mask": torch.ones(16, 8),
+        "msa_feat": torch.zeros(16, 8, 4),
+    }
+    prevs = [torch.zeros(8, 4), torch.zeros(8, 8, 4), torch.zeros(8, 37, 3)]
+
+    with pytest.raises(Captured) as captured:
+        OpenFold2.iteration(model, feats, prevs, extra_msa_present=extra_msa_present)
+
+    kwargs = captured.value.args[0]
+    assert kwargs["template_present"] is False
+    assert kwargs["template_mask_any"] is any(template_mask)
+    assert kwargs["extra_msa_present"] is extra_msa_present

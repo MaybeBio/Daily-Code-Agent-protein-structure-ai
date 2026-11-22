@@ -1,0 +1,7 @@
+streamlit
+numpy
+pandas
+torch
+biopython
+reportlab
+py3Dmol

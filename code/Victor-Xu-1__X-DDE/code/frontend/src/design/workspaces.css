@@ -1,0 +1,219 @@
+.studio-content:focus {
+  outline: none;
+}
+.utility-heading,
+.task-project-filter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-width: 0;
+}
+.task-project-filter {
+  font-size: 13px;
+  color: var(--muted);
+}
+.task-project-filter button {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--ink);
+  background: var(--surface);
+  padding: 6px 10px;
+}
+.task-page-list button.active {
+  background: var(--accent-soft);
+}
+.studio-app .terminal {
+  background: var(--code-bg);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.studio-content table {
+  font-size: 13px;
+  color: var(--ink);
+}
+.studio-content th {
+  background: var(--surface-muted);
+  color: var(--muted);
+}
+.studio-content td,
+.studio-content th {
+  border-color: var(--line);
+  padding: 10px 12px;
+}
+.studio-content pre {
+  background: var(--code-bg);
+  color: var(--ink);
+  max-width: 100%;
+  overflow: auto;
+}
+.editor-empty {
+  min-height: 300px;
+  background: var(--surface);
+  padding: 32px;
+  text-align: center;
+  gap: 16px;
+}
+.editor-empty .step-number {
+  font-size: 36px;
+}
+.editor-tabs {
+  gap: 8px;
+  margin-bottom: 24px;
+}
+.editor-toolbar {
+  padding: 12px 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  border-bottom: 1px solid var(--line);
+}
+.file-choice {
+  max-width: 100%;
+  flex-wrap: wrap;
+}
+.molecular-editor {
+  background: var(--chart-bg);
+}
+.viewer-stage,
+.structure-viewer,
+.viewer-empty {
+  background: var(--chart-bg);
+}
+dialog {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow);
+  max-width: calc(100vw - 32px);
+}
+dialog::backdrop {
+  background: var(--overlay);
+}
+.studio-content :where(.setup-grid, .component-grid) {
+  gap: 20px;
+}
+.setup-card {
+  padding: 24px;
+}
+.setup-card h2 {
+  font-size: 18px;
+}
+@media (max-width: 1280px) {
+  .tool-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .studio-content {
+    padding: 24px;
+  }
+}
+@media (max-width: 960px) {
+  .task-page-grid {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 640px) {
+  .studio-content {
+    padding: 24px 16px 16px;
+  }
+  .studio-content h1,
+  .tool-grid,
+  .model-grid {
+    grid-template-columns: 1fr;
+  }
+  .tool-card {
+    min-height: 0;
+    padding: 18px;
+  }
+  .tool-card h2 {
+    margin-top: 8px;
+  }
+  .studio-panel,
+  .studio-app .panel,
+  .studio-app .input-panel,
+  .tool-form,
+  .management-card,
+  .setup-card {
+    padding: 18px;
+  }
+  .empty-state {
+    padding: 32px 18px;
+  }
+  .studio-content .parameter-grid {
+    grid-template-columns: 1fr;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition: none !important;
+  }
+}
+
+.operation-results .research-download {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.result-method-notes {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+.result-method-notes summary {
+  color: var(--accent);
+  cursor: pointer;
+}
+.task-detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.task-detail-header .panel-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: flex-start;
+  min-width: 0;
+  margin: 0;
+}
+.task-detail-header .task-actions {
+  padding: 0;
+  margin: 0;
+  border: 0;
+  flex: 0 0 auto;
+}
+.task-files,
+.task-information {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.task-files > summary,
+.task-information > summary {
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 5px 0;
+}
+.task-information .task-meta {
+  margin-top: 12px;
+  padding: 0;
+  background: transparent;
+}
+@media (max-width: 640px) {
+  .task-detail-header {
+    align-items: flex-start;
+  }
+  .task-detail-header .panel-heading {
+    flex-wrap: wrap;
+  }
+}

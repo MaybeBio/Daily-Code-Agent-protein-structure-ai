@@ -1,0 +1,93 @@
+/**
+ *  \file IMP/mpi/ReplicaExchange.h
+ *  \brief A class to do replica exchange in a generic Hamiltonian parameter
+ *
+ *  Copyright 2007-2026 IMP Inventors. All rights reserved.
+ */
+
+#ifndef IMPMPI_REPLICA_EXCHANGE_H
+#define IMPMPI_REPLICA_EXCHANGE_H
+
+#include <IMP/mpi/mpi_config.h>
+#include <IMP/Object.h>
+#include <IMP/types.h>
+#include <string>
+#include <cereal/access.hpp>
+#include <cereal/types/base_class.hpp>
+
+// We only want the C API, so try to suppress the C++ API
+#ifndef MPICH_SKIP_MPICXX
+#define MPICH_SKIP_MPICXX
+#endif
+#ifndef OMPI_SKIP_MPICXX
+#define OMPI_SKIP_MPICXX
+#endif
+#ifndef _MPICC_H
+#define _MPICC_H
+#endif
+#include <mpi.h>
+
+IMPMPI_BEGIN_NAMESPACE
+
+//! A class to implement Hamiltonian Replica Exchange
+/** Any model parameter can be used as exchange parameter:
+    temperature, restraint intensity, ...
+*/
+class IMPMPIEXPORT ReplicaExchange : public Object {
+  //! MPI rank
+  int myrank_;
+  //! Number of replicas
+  int nproc_;
+  //! List of replica indexes
+  Ints index_;
+  //! List of number of exchanges accepted
+  Ints exarray_;
+  //! Exchange parameters
+  std::map<std::string, Floats> parameters_;
+
+  friend class cereal::access;
+
+ template<class Archive> void serialize(Archive &ar) {
+   ar(cereal::base_class<Object>(this), myrank_, nproc_, index_, exarray_,
+      parameters_);
+ }
+
+ private:
+  //! Create list of replica indices
+  Ints create_indexes();
+  //! Create list of number of exchange accepted
+  /** This is useful to track exchange acceptance across replicas */
+  Ints create_exarray();
+  //! Calculate acceptance probability
+  bool get_acceptance(double myscore, double fscore);
+  //! Get the rank for a given replica index
+  int get_rank(int index);
+
+ public:
+  ReplicaExchange();
+  //! Set exchange parameter
+  void set_my_parameter(std::string key, Floats values);
+  //! Get the value of my exchange parameter
+  Floats get_my_parameter(std::string key);
+  //! Get the index of friend with which trying an exchange
+  int get_friend_index(int istep);
+  //! Get the array with exchange acceptance
+  Ints get_exchange_array();
+  //! Get the value of my friend's parameter
+  Floats get_friend_parameter(std::string key, int findex);
+  //! Try an exchange
+  bool do_exchange(double myscore0, double myscore1, int findex);
+  //! Initialize array of temperatures
+  /** Temperatures are distributed according to a geometric progression */
+  Floats create_temperatures(double tmin, double tmax, int nrep);
+  //! Get replica index
+  int get_my_index() const { return index_[myrank_]; }
+  //! Get number of replicas
+  int get_number_of_replicas() const { return nproc_; }
+
+  IMP_OBJECT_METHODS(ReplicaExchange);
+};
+
+IMPMPI_END_NAMESPACE
+
+#endif /* IMPMPI_REPLICA_EXCHANGE_H */

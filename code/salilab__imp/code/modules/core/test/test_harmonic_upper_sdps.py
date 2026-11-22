@@ -1,0 +1,110 @@
+import IMP
+import IMP.test
+import IMP.core
+import pickle
+try:
+    import jax
+    import IMP.jax
+except ImportError:
+    jax = None
+
+
+def make_score(multi=False):
+    m = IMP.Model()
+    s = IMP.core.HarmonicUpperBoundSphereDistancePairScore(0, 1)
+    p1 = IMP.Particle(m)
+    IMP.core.XYZR.setup_particle(
+        p1, IMP.algebra.Sphere3D(IMP.algebra.Vector3D(4., 0., 0.), 1.0))
+    p2 = IMP.Particle(m)
+    IMP.core.XYZR.setup_particle(
+        p2, IMP.algebra.Sphere3D(IMP.algebra.Vector3D(5., 6., 7.), 2.0))
+
+    if multi:
+        m.set_number_of_sphere_attribute_sets(2)
+        m.set_active_sphere_attribute_set(1)
+        IMP.core.XYZR.setup_particle(
+            p1, IMP.algebra.Sphere3D(IMP.algebra.Vector3D(8., 0., 0.), 1.0))
+        IMP.core.XYZR.setup_particle(
+            p2, IMP.algebra.Sphere3D(IMP.algebra.Vector3D(15., 6., 7.), 2.0))
+
+    return m, p1, p2, s
+
+
+class Tests(IMP.test.TestCase):
+
+    def test_pickle(self):
+        """Test (un-)pickle of HarmonicUpperBoundSphereDistancePairScore"""
+        m, p1, p2, s = make_score()
+        s.set_name('foo')
+        self.assertAlmostEqual(s.evaluate_index(m, (p1, p2), None),
+                               19.6791, delta=1e-4)
+        dump = pickle.dumps(s)
+        news = pickle.loads(dump)
+        self.assertEqual(s.get_name(), 'foo')
+        self.assertAlmostEqual(news.evaluate_index(m, (p1, p2), None),
+                               19.6791, delta=1e-4)
+
+    def test_pickle_polymorphic(self):
+        """Test (un-)pickle of HarmonicUpperBoundSphereDistancePairScore
+           via poly ptr"""
+        m, p1, p2, s = make_score()
+        r = IMP.core.PairRestraint(m, s, (p1, p2))
+        self.assertAlmostEqual(r.evaluate(False), 19.6791, delta=1e-4)
+        dump = pickle.dumps(r)
+        newr = pickle.loads(dump)
+        self.assertAlmostEqual(newr.evaluate(False), 19.6791, delta=1e-4)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax(self):
+        """Test JAX HarmonicUpperBoundSphereDistancePairScore impl"""
+        m, p1, p2, s = make_score()
+        r = IMP.core.PairRestraint(m, s, (p1, p2))
+        ji = r._get_jax(space=IMP.jax.FreeSpace)
+        j = jax.jit(ji.score_func)
+
+        for coord, exp_score in (((5.0, 6.0, 7.0), 19.6791),
+                                 ((4.1, 0.2, 0.3), 0.0),
+                                 ((15.0, 16.0, 17.0), 260.0791)):
+            IMP.core.XYZ(p2).set_coordinates(IMP.algebra.Vector3D(*coord))
+            imp_score = r.evaluate(False)
+
+            jm = ji.get_jax_model()
+            jax_score = j(jm)
+            self.assertAlmostEqual(imp_score, exp_score, delta=1e-4)
+            self.assertAlmostEqual(imp_score, jax_score, delta=1e-4)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_periodic(self):
+        """Test JAX HarmonicUpperBoundSphereDistancePairScore impl with PBC"""
+        import jax.numpy as jnp
+        space = IMP.jax.PeriodicSpace([10., 10., 10.])
+        m, p1, p2, s = make_score()
+        ji = s._get_jax(m, jnp.array([[p1.get_index(), p2.get_index()]]),
+                        space=space)
+        jax_s = jax.jit(ji.score_func)
+        jm = ji.get_jax_model()
+        jax_score = jax_s(jm)
+        self.assertAlmostEqual(jax_score, 2.2029414, delta=1e-3)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_multi(self):
+        """Test JAX implementation with multiple attrsets"""
+        import jax.numpy as jnp
+        import IMP.jax
+        m, p1, p2, s = make_score(multi=True)
+        ji = s._get_jax(m, jnp.array([[p1.get_index(), p2.get_index()]]),
+                        space=IMP.jax.FreeSpace)
+        m.set_active_sphere_attribute_set(0)
+        imp_score1 = s.evaluate_index(m, (p1, p2), None)
+        m.set_active_sphere_attribute_set(1)
+        imp_score2 = s.evaluate_index(m, (p1, p2), None)
+        jm = ji.get_jax_model()
+        jax_s = jax.jit(jax.vmap(ji.score_func, in_axes=(jm.get_vmap_axes(),)))
+        jax_score = jax_s(jm)
+        self.assertEqual(jax_score.shape, (2,1))
+        self.assertAlmostEqual(jax_score[0,0], imp_score1, delta=1e-4)
+        self.assertAlmostEqual(jax_score[1,0], imp_score2, delta=1e-4)
+
+
+if __name__ == '__main__':
+    IMP.test.main()

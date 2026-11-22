@@ -1,0 +1,92 @@
+/**
+ *  \file example/Gaussian.cpp
+ *  \brief Decorator to hold Gaussian3D
+ *
+ *  Copyright 2007-2022 IMP Inventors. All rights reserved.
+ *
+ */
+
+#include <IMP/core/Gaussian.h>
+#include <cmath>
+
+IMPCORE_BEGIN_NAMESPACE
+
+void Gaussian::do_setup_particle(Model *m, ParticleIndex pi,
+                                 const algebra::Gaussian3D &g) {
+  if (!RigidBody::get_is_setup(m, pi)) {
+    RigidBody::setup_particle(m, pi, g.get_reference_frame());
+  } else {
+    RigidBody r(m, pi);
+    r.set_reference_frame(g.get_reference_frame());
+  }
+  IMP_NEW(Matrix3D,local,(Eigen::Vector3d(g.get_variances().get_data()).asDiagonal()));
+  m->add_attribute(get_local_covariance_key(), pi,local);
+  local->set_was_used(true);
+  core::Gaussian(m,pi).update_global_covariance();
+}
+
+void Gaussian::do_setup_particle(Model *m, ParticleIndex pi) {
+  do_setup_particle(m,pi,algebra::Gaussian3D());
+}
+
+void Gaussian::set_gaussian(const algebra::Gaussian3D &g) {
+  set_reference_frame(g.get_reference_frame());
+  set_variances(g.get_variances());
+  get_model()->clear_particle_caches(get_particle_index());
+  update_global_covariance();
+}
+
+
+ObjectKey Gaussian::get_local_covariance_key() {
+  static ObjectKey local_covariance_key=ObjectKey("local_covariance");
+  return local_covariance_key;
+}
+
+ObjectKey Gaussian::get_global_covariance_key(){
+  static ObjectKey global_covariance_key=ObjectKey("global_covariance");
+  return global_covariance_key;
+}
+
+void Gaussian::update_global_covariance(){
+  algebra::Vector4D v = get_rotation_quaternion();
+  Eigen::Quaterniond q(v[0], v[1], v[2], v[3]);
+  Eigen::Matrix3d rot = q.toRotationMatrix();
+  Eigen::Matrix3d rad = get_local_covariance();
+  Eigen::Matrix3d covar = rot * (rad * rot.transpose());
+  ObjectKey k = get_global_covariance_key();
+  ParticleIndex pi = get_particle_index();
+  if (get_model()->get_has_attribute(k, pi)) {
+    // reuse the cached object; this runs whenever the Gaussian has moved
+    static_cast<Matrix3D*>(get_model()->get_attribute(k, pi))
+        ->set_mat(covar, v);
+  } else {
+    set_global_covariance(covar);
+  }
+}
+
+Eigen::Matrix3d Gaussian::get_updated_global_covariance() {
+  update_global_covariance();
+  return static_cast<Matrix3D*>(get_model()->get_attribute(
+      get_global_covariance_key(), get_particle_index()))->get_mat();
+}
+
+void Gaussian::show(std::ostream &out) const { out << get_gaussian(); }
+
+
+/*void Gaussian::update_inverse(){
+  Float determinant;
+  bool invertible;
+  current_covar_.computeInverseAndDetWithCheck(current_inv_,determinant,invertible);
+  current_det_invsqrt_ = 1.0/sqrt(determinant);
+  }*/
+
+/*Float Gaussian::get_probability_at_point(const algebra::Vector3D &point) const{
+  Eigen::Vector3d v = Eigen::Vector3d(point.get_data());
+  Float prob = current_det_invsqrt_ *
+      std::exp(-0.5*v.transpose()*(current_inv_ * v));
+  return prob;
+  }*/
+
+IMP_OBJECT_SERIALIZE_IMPL(IMP::core::Matrix3D);
+
+IMPCORE_END_NAMESPACE

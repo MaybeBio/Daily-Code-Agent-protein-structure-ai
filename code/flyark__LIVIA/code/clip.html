@@ -1,0 +1,2335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LIVIA — cLIP</title>
+<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
+<script src="js/canvas2svg.js?v=20260720"></script>
+<script src="js/livia-maps.js?v=20261117b"></script>
+<script src="js/livia-xlsx.js?v=20261104a"></script>
+<script src="js/clip-clustering.js?v=20261115a"></script>
+<script src="js/clip-pipeline.js?v=20261006a"></script>
+<script src="js/clip-resolver.js?v=20261116a"></script>
+<script src="js/livia-viewer.js?v=20261119a"></script>
+<script src="js/livia-subnav.js?v=20261007a"></script>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="stylesheet" href="css/livia.css?v=20261116a">
+<style>
+  /* cLIP-specific — livia.css provides the shell (body, .header, .container, .card, .btn) */
+  .card h2 { margin:0 0 .5rem; font-size:1.05rem; color:#1a5276; font-weight:600; }
+  .card h3 { margin:0 0 .3rem; font-size:.92rem; color:#1a5276; font-weight:600; }
+  .seq-flow { font:14px/2.6 ui-monospace,SFMono-Regular,Menlo,monospace; margin-top:.5rem; color:#1a2733; }
+  .seq-flow .g10 { position:relative; margin-right:.75em; white-space:nowrap; }
+  .seq-flow .g10::before { content:attr(data-n); position:absolute; top:-1.05em; right:.05em; font-size:.6rem; line-height:1; color:#8a93a0; font-weight:400; letter-spacing:0; }
+  .dropgrid { display:grid; grid-template-columns:repeat(4,1fr); gap:.8rem; }
+  .dz { border:2px dashed #b7c6d6; border-radius:10px; padding:1rem .8rem; text-align:center; color:#557; cursor:pointer; transition:.15s; }
+  .dz.hover { border-color:#2471A3; background:#eef5fb; }
+  .dz-ic { font-size:1.4rem; }
+  .dz-t { font-weight:600; color:#334; margin-top:.2rem; }
+  .dz-h { font-size:.72rem; color:#5E5E6E; margin-top:.15rem; }
+  .dz-l { font-size:.8rem; color:#2471A3; font-weight:600; margin-top:.4rem; min-height:1em; }
+  .opt { font-weight:400; font-size:.72rem; color:#5E6C6C; }
+  @media (max-width:900px){ .dropgrid { grid-template-columns:repeat(2,1fr); } }
+  @media (max-width:520px){ .dropgrid { grid-template-columns:1fr; } }
+  .chips { display:flex; flex-wrap:wrap; gap:.4rem; }
+  .cchip { display:inline-flex; align-items:center; gap:.35rem; padding:.22rem .6rem; border:1px solid #d0d8e0; border-radius:14px; font-size:.78rem; cursor:pointer; background:#fff; user-select:none; transition:.12s; }
+  .cchip .dot { width:11px; height:11px; border-radius:50%; }
+  .cchip.off { opacity:.35; }
+  .cchip.sel { background:#2471A3; color:#fff; border-color:#2471A3; }
+  .row { display:flex; gap:1rem; align-items:center; flex-wrap:wrap; }
+  .row select, .row input[type=number] { font-size:0.9rem; padding:.4rem .6rem; border:1px solid #ccd6e0; border-radius:7px; background:#fff; }
+  button.ghost { background:none; border:none; color:#2471A3; cursor:pointer; font-size:.85rem; font-weight:600; }
+  .clip-sz-btn { background:#eef3f8; border:1px solid #d4dfea; border-radius:5px; color:#2471A3; cursor:pointer; font-size:.74rem; font-weight:600; padding:1px 7px; }
+  .clip-sz-box { display:inline-flex; align-items:center; gap:.3rem; flex-wrap:wrap; }
+  .clip-sz-box[hidden] { display:none; }
+  .stat { display:inline-flex; flex-direction:column; padding:.5rem .9rem; background:#f5f7fa; border-radius:8px; margin-right:.6rem; }
+  .stat b { font-size:1.35rem; color:#1a5276; } .stat span { font-size:.72rem; color:#667; text-transform:uppercase; letter-spacing:.04em; }
+  table { width:100%; border-collapse:collapse; font-size:0.85rem; }
+  th, td { padding:.4rem .6rem; border-bottom:1px solid #eef1f5; text-align:right; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align:left; }
+  th { color:#556; font-weight:600; }
+  .chip { display:inline-block; width:12px; height:12px; border-radius:3px; vertical-align:middle; margin-right:5px; }
+  canvas { max-width:100%; }
+  .muted { color:#5E5E6E; font-size:.82rem; }
+  .hidden { display:none; }
+  .gtip { position:fixed; z-index:1000; pointer-events:none; background:rgba(23,38,58,.94); color:#fff; font-size:12.5px; line-height:1.4; padding:7px 10px; border-radius:8px; max-width:min(420px, calc(100vw - 20px)); box-shadow:0 8px 24px rgba(0,0,0,.18); }
+  .gtip[hidden] { display:none; }
+  .hot { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:.5rem; }
+  .hot span { font-family:ui-monospace, Menlo, monospace; font-size:12px; padding:2px 8px; border-radius:6px; background:#E0F2F1; color:#00695C; }
+  .hot .hot-lbl { background:none; color:#667080; font-family:inherit; padding-left:0; }
+  #status { font-size:.85rem; color:#667; margin-left:.5rem; }
+  @media (max-width:768px){
+    .seq-flow { font-size:0.68rem; }                 /* match universal.html — fit 4 blocks/line, no wasted right gap */
+    #ptable { width:auto; min-width:640px; }          /* wide partner table overflows its wrapper (overflow:auto) → scrolls sideways */
+    #ptable th, #ptable td { white-space:nowrap; }    /* keep numeric columns on one line instead of squishing */
+  }
+#cluster-info { display: grid; gap: 8px; font-size: 13.5px; line-height: 1.65; }
+#cluster-info .cl-row { display: grid; grid-template-columns: 14px 1fr; gap: 10px; padding: 8px 12px; border: 1px solid #E6ECF2; border-radius: 10px; background: #FBFCFD; }
+#cluster-info .cl-row > i { width: 13px; height: 13px; border-radius: 3px; margin-top: 5px; display: inline-block; }
+#cluster-info a[data-p] { color: #2471A3; text-decoration: underline; text-decoration-color: rgba(36, 113, 163, 0.35); text-underline-offset: 2px; cursor: pointer; }
+#cluster-info a[data-p]:hover { color: #1A5276; text-decoration-color: currentColor; }
+/* reported in BioGRID: LIVIA Atlas highlighter mark (physical light blue, genetic light orange, both light orchid) */
+#cluster-info a.kb-p, #cluster-info a.kb-g, .kb-mark { padding: 1px 5px; border-radius: 4px; text-decoration: none; box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+#cluster-info a.kb-p, #cluster-info a.kb-g { padding: 0 3px; margin: 0 -1px; color: #1A5276; text-decoration: underline; text-decoration-color: rgba(26, 82, 118, 0.35); text-underline-offset: 2px; }
+.kb-mark { color: #33414E; font-weight: 500; }
+#cluster-info a.kb-p, .kb-mark.kb-p { background: #DCEBF7; }
+#cluster-info a.kb-g, .kb-mark.kb-g { background: #FCE3CF; }
+#cluster-info a.kb-p.kb-g, .kb-mark.kb-p.kb-g { background: #F2DCF5; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="container" role="main">
+    <h1><span style="color:#2471A3;">LIVIA</span> &mdash; cLIP <span style="font-weight:400;">(<b style="color:#2471A3">c</b>lustered <b style="color:#2471A3">L</b>ocal <b style="color:#2471A3">I</b>nteraction <b style="color:#2471A3">P</b>rofiler)</span></h1>
+    <p>Cluster a protein's interactome by shared contact residues (cLIR) &mdash; drop lis.py output, all in your browser</p>
+    <div class="header-links">
+      <a href="index.html">Home</a>
+      <a href="universal.html">Prediction Analysis</a>
+      <a href="flypredictome.html">FlyPredictome</a>
+      <a href="ortholog_predictome.html">Ortholog Interactome</a>
+      <a href="dimer.html">AFDB Dimer</a>
+      <a href="monomer.html">AFDB Monomer Subdomain</a>
+            <a href="clip.html" class="active">cLIP</a>
+            <a href="network.html">PPI Network</a>
+            <a href="https://flyark.github.io/livia-atlas/" target="_blank" rel="noopener">LIVIA Atlas<span class="new-tag">new</span></a>
+      <a href="tutorials.html">Tutorials</a>
+      <a href="about.html">About</a>
+      <a href="https://github.com/flyark/LIVIA" target="_blank">GitHub</a>
+    </div>
+  </div>
+</div>
+
+<div class="container">
+  <div class="card">
+      <div style="font-size:0.82rem; color:#6B6B6B; margin-bottom:0.8rem;">
+    Need the input? Generate it with <code style="background:#d6e9f8; color:#33414E; padding:0.1rem 0.3rem; border-radius:3px; font-size:0.75rem;">lis.py</code> from <a href="https://github.com/flyark/AFM-LIS" target="_blank" style="color:#2471A3; font-weight:600;">AFM-LIS</a>.
+      </div>
+    <div class="dropgrid">
+      <div class="dz" id="dz-csv">
+        <div class="dz-ic">📄</div><div class="dz-t">lis.py output <b style="color:#c0392b">*</b> <span class="opt">+ FASTA</span></div>
+        <div class="dz-h">Drop lis.py output and FASTA here — CSV, XLSX, FASTA, or zips. Sorted automatically.</div>
+        <div class="dz-l" id="ld-csv"></div>
+        <input id="in-csv" type="file" accept=".csv,.tsv,.txt,.zip,.xlsx,.fasta,.fa,.faa,.fas,.fna,.mfa,.pep,.seq" multiple class="hidden">
+      </div>
+      <div class="dz" id="dz-fasta">
+        <div class="dz-ic">🧬</div><div class="dz-t">FASTA <span class="opt">optional · or drop above</span></div>
+        <div class="dz-h">Predicted sequences → color cLIR on the 3D structure and fill the sequence viewer (you can also drop these in the panel on the left)</div>
+        <div class="dz-l" id="ld-fasta"></div>
+        <input id="in-fasta" type="file" accept=".fasta,.fa,.faa,.fas,.fna,.mfa,.pep,.seq,.txt,.zip" multiple class="hidden">
+      </div>
+      <div class="dz" id="dz-meta">
+        <div class="dz-ic">🏷️</div><div class="dz-t">Identity map <span class="opt">optional</span></div>
+        <div class="dz-h"><b>name, chain</b> + ID columns (uniprot / gene / label — any scheme) · resolves arbitrary prediction names</div>
+        <div class="dz-l" id="ld-meta"></div>
+        <input id="in-meta" type="file" accept=".csv,.tsv,.txt" class="hidden">
+      </div>
+      <div class="dz" id="dz-struct">
+        <div class="dz-ic">🧊</div><div class="dz-t">Structure <span class="opt">optional</span></div>
+        <div class="dz-h">Drag or click to upload a structure (PDB/CIF) to use instead of AlphaFold DB</div>
+        <div class="dz-l" id="ld-struct"></div>
+        <input id="in-struct" type="file" accept=".pdb,.cif,.bcif,.ent,.mmcif" class="hidden">
+      </div>
+    </div>
+    <div style="background:#eaf2f8; border:1px solid #b8d4e8; border-left:4px solid #2471A3; border-radius:6px; padding:.5rem .7rem; margin-top:.7rem; font-size:.82rem; color:#1f4e6b;">
+      <strong>Proteins not resolving?</strong> Drop the <strong>FASTA used for the prediction</strong> — proteins are matched by exact sequence, so a truncated or engineered chain will not resolve from its name alone. Otherwise fill in the identity-map template below, or use auto-convert. Tested with ColabFold inputs. Still stuck? <a href="https://github.com/flyark/LIVIA/issues" target="_blank" style="color:#2471A3; font-weight:600;">Open an issue on GitHub</a>.
+    </div>
+    <div id="meta-label-wrap" class="hidden" style="margin-top:.6rem; font-size:.85rem; color:#556;">
+      🏷️ Identity map · <span id="meta-stat"></span> · Label by: <select id="meta-label" style="font-size:.85rem; padding:2px 6px"></select>
+    </div>
+    <div id="skel-wrap" class="hidden" style="margin-top:.5rem; font-size:.82rem; color:#556;">
+      <b>Names showing as IDs</b> (UniProt accession, FlyBase, entry name) instead of gene symbols? &nbsp;<a href="#" id="mg-convert" style="display:inline-block; padding:3px 10px; background:#2471A3; color:#fff; border-radius:5px; font-weight:600; text-decoration:none">✨ Auto-convert names → gene symbols</a> &nbsp;— looks each ID up via mygene.info + UniProt. <select id="mg-species" style="font-size:.8rem; padding:1px 4px"><option value="">all species</option><option value="7227">fly</option><option value="9606">human</option><option value="10090">mouse</option><option value="10116">rat</option><option value="6239">worm</option><option value="7955">zebrafish</option><option value="559292">yeast</option><option value="3702">arabidopsis</option><option value="83333">E. coli</option></select> <label style="margin-left:2px"><input type="checkbox" id="mg-auto" checked style="accent-color:#1a5276"> auto on load</label>
+      <br><span style="color:#5E5E6E; font-size:.78rem;">Or <a href="#" id="skel-link" style="color:#2471A3; font-weight:600">↓ download an identity-map template</a> to name each chain yourself.</span>
+    </div>
+    <div style="margin-top:.7rem; font-size:.85rem; color:#556;">
+      ▶ Try examples — kinase-transcription factor screen (<a href="https://www.biorxiv.org/content/10.1101/2025.10.10.681672" target="_blank" style="color:#2471A3">Kim et al. 2025</a>):<br>
+      <span style="color:#5E5E6E; font-size:.8rem;">fly TF &rarr;</span>
+      <a href="#" class="load-ex" data-file="ftz_kinase_screen.zip" data-gene="ftz" style="color:#2471A3; font-weight:600; text-decoration:none;">ftz</a> ·
+      <a href="#" class="load-ex" data-file="eve_kinase_screen.zip" data-gene="eve" style="color:#2471A3; font-weight:600; text-decoration:none;">eve</a> ·
+      <a href="#" class="load-ex" data-file="antp_kinase_screen.zip" data-gene="Antp" style="color:#2471A3; font-weight:600; text-decoration:none;">Antp</a>
+      &nbsp; <span style="color:#5E5E6E; font-size:.8rem;">fly kinase &rarr;</span>
+      <a href="#" class="load-ex" data-file="apkc_tf_screen.zip" data-gene="aPKC" style="color:#2471A3; font-weight:600; text-decoration:none;">aPKC</a> ·
+      <a href="#" class="load-ex" data-file="pdk1_tf_screen.zip" data-gene="Pdk1" style="color:#2471A3; font-weight:600; text-decoration:none;">Pdk1</a> ·
+      <a href="#" class="load-ex" data-file="s6k_tf_screen.zip" data-gene="S6k" style="color:#2471A3; font-weight:600; text-decoration:none;">S6k</a><br>
+      <span style="color:#5E5E6E; font-size:.8rem;">human TF &rarr;</span>
+      <a href="#" class="load-ex" data-file="jun_kinase_screen.zip" data-gene="JUN" style="color:#2471A3; font-weight:600; text-decoration:none;">JUN</a> ·
+      <a href="#" class="load-ex" data-file="tp53_kinase_screen.zip" data-gene="TP53" style="color:#2471A3; font-weight:600; text-decoration:none;">TP53</a> ·
+      <a href="#" class="load-ex" data-file="myc_kinase_screen.zip" data-gene="MYC" style="color:#2471A3; font-weight:600; text-decoration:none;">MYC</a>
+      &nbsp; <span style="color:#5E5E6E; font-size:.8rem;">human kinase &rarr;</span>
+      <a href="#" class="load-ex" data-file="akt1_tf_screen.zip" data-gene="AKT1" style="color:#2471A3; font-weight:600; text-decoration:none;">AKT1</a> ·
+      <a href="#" class="load-ex" data-file="p38a_tf_screen.zip" data-gene="MAPK14" style="color:#2471A3; font-weight:600; text-decoration:none;">p38&alpha;</a> ·
+      <a href="#" class="load-ex" data-file="chk1_tf_screen.zip" data-gene="CHEK1" style="color:#2471A3; font-weight:600; text-decoration:none;">CHK1</a>
+    </div>
+    <div style="margin-top:.55rem; font-size:.85rem; color:#556;">
+      ▶ …or one gene's evidence-supported interactome (fly literature or conserved interologs), from <a href="https://flyark.github.io/FlyPredictome-network/" target="_blank" style="color:#2471A3">FlyPredictome</a> (<a href="https://doi.org/10.64898/2026.04.14.718529" target="_blank" style="color:#2471A3">Kim et al. 2026</a>):<br>
+      <span style="color:#5E5E6E; font-size:.8rem;">RTK&ndash;Ras&ndash;MAPK &rarr;</span>
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0003731.zip" data-gene="Egfr" style="color:#2471A3; font-weight:600; text-decoration:none;">Egfr</a> <span style="color:#667080; font-size:.72rem;">(EGFR)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0283499.zip" data-gene="InR" style="color:#2471A3; font-weight:600; text-decoration:none;">InR</a> <span style="color:#667080; font-size:.72rem;">(insulin R)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0285896.zip" data-gene="btl" style="color:#2471A3; font-weight:600; text-decoration:none;">btl</a> <span style="color:#667080; font-size:.72rem;">(FGFR)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0003205.zip" data-gene="Ras85D" style="color:#2471A3; font-weight:600; text-decoration:none;">Ras85D</a> <span style="color:#667080; font-size:.72rem;">(Ras)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0003256.zip" data-gene="rl" style="color:#2471A3; font-weight:600; text-decoration:none;">rl</a> <span style="color:#667080; font-size:.72rem;">(ERK)</span><br>
+      <span style="color:#5E5E6E; font-size:.8rem;">Notch &rarr;</span>
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0004647.zip" data-gene="N" style="color:#2471A3; font-weight:600; text-decoration:none;">N</a> <span style="color:#667080; font-size:.72rem;">(Notch)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0000463.zip" data-gene="Delta" style="color:#2471A3; font-weight:600; text-decoration:none;">Delta</a> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0004197.zip" data-gene="Ser" style="color:#2471A3; font-weight:600; text-decoration:none;">Ser</a> <span style="color:#667080; font-size:.72rem;">(Jagged)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0004837.zip" data-gene="Su(H)" style="color:#2471A3; font-weight:600; text-decoration:none;">Su(H)</a> <span style="color:#667080; font-size:.72rem;">(CSL)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0002973.zip" data-gene="numb" style="color:#2471A3; font-weight:600; text-decoration:none;">numb</a><br>
+      <span style="color:#5E5E6E; font-size:.8rem;">Wnt &rarr;</span>
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0284084.zip" data-gene="wg" style="color:#2471A3; font-weight:600; text-decoration:none;">wg</a> <span style="color:#667080; font-size:.72rem;">(Wnt)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0001085.zip" data-gene="fz" style="color:#2471A3; font-weight:600; text-decoration:none;">fz</a> <span style="color:#667080; font-size:.72rem;">(Frizzled)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0000499.zip" data-gene="dsh" style="color:#2471A3; font-weight:600; text-decoration:none;">dsh</a> <span style="color:#667080; font-size:.72rem;">(Dishevelled)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0000117.zip" data-gene="arm" style="color:#2471A3; font-weight:600; text-decoration:none;">arm</a> <span style="color:#667080; font-size:.72rem;">(&beta;-catenin)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0003371.zip" data-gene="sgg" style="color:#2471A3; font-weight:600; text-decoration:none;">sgg</a> <span style="color:#667080; font-size:.72rem;">(GSK-3)</span><br>
+      <span style="color:#5E5E6E; font-size:.8rem;">BMP / TGF-&beta; &rarr;</span>
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0000490.zip" data-gene="dpp" style="color:#2471A3; font-weight:600; text-decoration:none;">dpp</a> <span style="color:#667080; font-size:.72rem;">(BMP)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0003716.zip" data-gene="tkv" style="color:#2471A3; font-weight:600; text-decoration:none;">tkv</a> <span style="color:#667080; font-size:.72rem;">(BMPR-I)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0003169.zip" data-gene="put" style="color:#2471A3; font-weight:600; text-decoration:none;">put</a> <span style="color:#667080; font-size:.72rem;">(BMPR-II)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0011648.zip" data-gene="Mad" style="color:#2471A3; font-weight:600; text-decoration:none;">Mad</a> <span style="color:#667080; font-size:.72rem;">(Smad1/5)</span> ·
+      <a href="#" class="load-ex" data-file="https://flyark.github.io/FlyPredictome-clip-data/FBgn0011655.zip" data-gene="Med" style="color:#2471A3; font-weight:600; text-decoration:none;">Med</a> <span style="color:#667080; font-size:.72rem;">(Smad4)</span><br>
+      <span style="color:#5E5E6E; font-size:.8rem;">or jump to any gene &rarr;</span>
+      <input id="clip-gene-jump" list="clip-gene-list" placeholder="e.g. aPKC, ci, Stat92E&hellip;" autocomplete="off" spellcheck="false" style="font-size:.8rem; padding:2px 7px; border:1px solid #ccd; border-radius:6px; width:160px;">
+      <datalist id="clip-gene-list"></datalist>
+      &nbsp; <a href="https://flyark.github.io/FlyPredictome-network/" target="_blank" style="color:#2471A3; font-weight:600; text-decoration:none;">browse the full network &rarr;</a>
+    </div>
+    <div class="row" style="margin-top:1rem">
+      <label>Query protein: <select id="gene"><option>—</option></select></label>
+      <label title="every model that reaches the cutoff is clustered, whatever its rank">iLIS ≥ <input id="ilis" type="number" value="0.223" step="0.01" style="width:92px"></label>
+      <label>FPR <select id="fpr">
+        <option value="">custom</option>
+        <option value="0.223" selected>10% (0.223)</option>
+        <option value="0.339">5% (0.339)</option>
+        <option value="0.551">1% (0.551)</option>
+      </select></label>
+      <label title="the N highest-iLIS predictions (partners, when one prediction per partner is on)">top N <input id="topn" type="number" placeholder="all" step="5" style="width:64px"></label>
+      <label title="Cluster each partner once, on its best-iLIS prediction among its models that pass (any model of a partner that passes counts), instead of every passing model"><input type="checkbox" id="one-per-partner"> one prediction per partner</label>
+      <button id="run" class="btn btn-primary" disabled>Generate report</button>
+      <span id="status"></span>
+    </div>
+    <div id="subset-wrap" class="hidden" style="margin-top:.7rem; font-size:.85rem; color:#556;">
+      🔎 Include partners: <span id="subset-stat"></span>
+      &nbsp;<a href="#" id="subset-all" style="color:#2471A3; font-weight:600">all</a> ·
+      <a href="#" id="subset-none" style="color:#2471A3; font-weight:600">none</a>
+      &nbsp;·&nbsp;<a href="#" id="subset-dl" style="color:#2471A3; font-weight:600">↓ review list</a> ·
+      <label style="color:#2471A3; font-weight:600; cursor:pointer">↑ upload<input type="file" id="subset-ul" accept=".csv,.tsv,.txt" class="hidden"></label> ·
+      <a href="#" id="subset-dl-lis" style="color:#2471A3; font-weight:600">↓ lis.py output (selected)</a> ·
+      <a href="#" id="subset-dl-fasta" style="color:#2471A3; font-weight:600">↓ FASTA (selected)</a>
+      <div id="subset-list" style="margin-top:.4rem; max-height:150px; overflow:auto; display:flex; flex-wrap:wrap; gap:.3rem .8rem;"></div>
+    </div>
+    <div id="clip-clust-wrap" class="hidden" style="margin-top:.5rem; font-size:.85rem; color:#556;">
+      🎨 Cluster assignment: <span id="clip-clust-stat">fingerprint clustering (automatic)</span>
+      &nbsp;·&nbsp;<label style="color:#2471A3; font-weight:600; cursor:pointer">↑ upload <code>partner,cluster</code><input type="file" id="clip-clust-ul" accept=".csv,.tsv,.txt" class="hidden"></label>
+      <span id="clip-clust-mode-wrap" class="hidden">&nbsp;·&nbsp;<select id="clip-clustmode" style="font-size:.8rem; padding:1px 4px; border:1px solid #ccd; border-radius:5px"><option value="user">use my clusters</option><option value="fingerprint">fingerprint clustering</option></select> · <a href="#" id="clip-clust-clear" style="color:#c0392b; font-weight:600">✕ clear</a></span>
+    </div>
+    <div class="row" style="margin-top:.6rem; font-size:.85rem; color:#556">
+      <span class="muted">3D structure via AlphaFold DB — resolved from FASTA sequence (exact) or protein name + length.</span>
+    </div>
+  </div>
+
+  <div id="report" class="hidden" data-subnav>
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <div><h2 data-nav="Summary" id="title" style="margin:0"></h2><div class="muted" id="subtitle"></div><div class="muted" id="query-uniprot" style="margin-top:3px"></div>
+          <div class="muted" id="uniprot-fix" style="margin-top:3px; font-size:.78rem">
+            Resolved from the names in your file, so it might land on the wrong protein or species. Not right?
+            <input id="uniprot-force" placeholder="UniProt accession, e.g. Q7KU87" style="font-size:.78rem; padding:1px 4px; width:190px">
+            <button class="ghost" id="uniprot-go" style="font-size:.72rem; padding:1px 7px">use this</button>
+            <span id="uniprot-forced" class="hidden" style="color:#1a5276; font-weight:600"></span>
+          </div>
+        </div>
+        <div>
+          <span class="stat"><b id="s-partners">0</b><span>partners</span></span>
+          <span class="stat"><b id="s-predictions">0</b><span>predictions</span></span>
+          <span class="stat"><b id="s-clusters">0</b><span>clusters</span></span>
+          <span class="stat"><b id="s-len">0</b><span>query length</span></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="padding:.5rem 1rem; display:flex; align-items:center; gap:.7rem; flex-wrap:wrap">
+      <span style="font-weight:600; color:#1a5276">Cluster colors</span>
+      <select id="palette" style="font-size:.9rem; padding:2px 6px"><option value="auto" selected>auto (scales with cluster count)</option><option value="tab10">tab10</option><option value="tab20">tab20</option><option value="tab20b">tab20b</option><option value="tab20c">tab20c</option><option value="distinct">distinct (60+, no repeats)</option></select>
+      <span class="muted">&mdash; applies to all panels (heatmap, frequency, 3D, scatter)</span>
+      <div id="clustercolor-upload" style="flex-basis:100%"></div>
+    </div>
+
+    <div class="card">
+      <h2 data-nav="Frequency" style="display:flex; justify-content:space-between; align-items:baseline; gap:1rem; flex-wrap:wrap">Contact residue frequency
+        <span style="font-weight:400; font-size:.76rem; color:#667; display:inline-flex; align-items:center; gap:.4rem; flex-wrap:wrap">style<select class="clip-style freq-style" title="by cluster: each cluster over all models; all models: combined total only; classic: bars colored by the dominant cluster" onchange="setClipStyle(this.value)"><option value="cluster">by cluster</option><option value="total">all models</option><option value="classic">classic</option></select><label class="clip-rlab" style="display:inline-flex;align-items:center;gap:3px;cursor:pointer" title="show cluster names at the right"><input type="checkbox" class="clip-rlabels" checked onchange="setClipLabels(this.checked)">right labels</label> &middot; x-ticks<input id="clip-xticks" type="number" value="15" min="2" max="40" step="1" title="residue x-tick count (frequency + fingerprint)" style="width:44px" onchange="if(LAST){renderFreq(LAST);renderHeatmap(LAST);}"> <button type="button" class="clip-sz-btn" onclick="const b=this.nextElementSibling;b.hidden=!b.hidden;this.textContent=b.hidden?'SVG size ▸':'SVG size ▾'">SVG size ▸</button><span class="clip-sz-box" hidden>w<input id="svg-w" type="number" value="900" step="50" title="width (px)" style="width:62px"> &middot; h<input id="svg-h" type="number" placeholder="auto" step="20" title="height (px; blank = auto)" style="width:56px"> &middot; font<input id="svg-fs" type="number" value="9" step="1" title="font size (pt)" style="width:44px"></span> <button class="ghost" id="svg-freq">&#8595; SVG</button></span>
+      </h2>
+      <div class="muted">How often each query residue is a contact residue (cLIR) across predictions (each model of each partner; one per partner when that box is ticked), <span id="freq-style-note">one line per cluster over the total (gray)</span> · click clusters to filter.<br><b>C<i>n</i> (N)</b>: N = predictions (AlphaFold ranks) in that cluster.<br>Tracks below the bars: AlphaFold <b>pLDDT</b> (0&ndash;100) &mdash; <span style="white-space:nowrap"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;background:#FF7D45"></span> &le;50 &nbsp;<span style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;background:#FFDB13"></span> 50&ndash;70 &nbsp;<span style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;background:#65CBF3"></span> 70&ndash;90 &nbsp;<span style="display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;background:#0053D6"></span> &gt;90</span><span class="am-only hidden"><br><b style="color:#a33">AM path.</b> = AlphaMissense mean pathogenicity per residue (averaged over all ~19 substitutions at that position; blue = benign &rarr; red = pathogenic; human only, from AlphaFold DB).</span></div>
+      <div id="freq-chips" class="chips" style="margin:.4rem 0"></div>
+      <canvas id="freq"></canvas>
+      <div id="freq-domains" style="font-size:.8rem; color:#556; margin-top:.35rem; line-height:1.55"></div>
+      <div class="hot" id="freq-hot"></div>
+    </div>
+
+
+    <div class="card">
+      <h2 data-nav="Fingerprint" style="display:flex; justify-content:space-between; align-items:baseline; gap:1rem; flex-wrap:wrap">Clustered interaction fingerprint
+        <span style="font-weight:400; font-size:.76rem; color:#667; display:inline-flex; align-items:center; gap:.4rem; flex-wrap:wrap">style<select class="clip-style" title="by cluster: each cluster in its own color; classic: one color for every contact" onchange="setClipStyle(this.value)"><option value="cluster">by cluster</option><option value="classic">classic</option></select><label class="clip-rlab" style="display:inline-flex;align-items:center;gap:3px;cursor:pointer" title="show cluster names at the right"><input type="checkbox" class="clip-rlabels" checked onchange="setClipLabels(this.checked)">right labels</label> <button type="button" class="clip-sz-btn" onclick="const b=this.nextElementSibling;b.hidden=!b.hidden;this.textContent=b.hidden?'SVG size ▸':'SVG size ▾'">SVG size ▸</button><span class="clip-sz-box" hidden>w<input id="hm-w" type="number" value="900" step="50" title="width (px)" style="width:62px"> &middot; h<input id="hm-h" type="number" placeholder="auto" step="20" title="height (px; blank = auto)" style="width:56px"> &middot; font<input id="hm-fs" type="number" value="9" step="1" title="font size (pt)" style="width:44px"></span> <button class="ghost" id="svg-heatmap">&#8595; SVG</button></span>
+      </h2>
+      <div class="muted" id="fp-note">Rows = partners (dendrogram order), columns = query residues. cLIR contacts in their cluster's color, very light = none; left: dendrogram + cluster strip; right: each cluster, its predictions and the partners with the most predictions.</div>
+      <div id="fp-chips" class="chips" style="margin:.4rem 0"></div>
+      <canvas id="heatmap"></canvas>
+    </div>
+
+    <div class="card">
+      <h2 data-nav="Clusters">Cluster info</h2>
+      <div class="muted">Partners in each cluster (dendrogram order) — <b>(proteins / predictions)</b>. A partner can have several AlphaFold ranks (each prediction's own model order, ipTM-based, not the iLIS order), so it may appear at multiple rows and across clusters. With <i>one prediction per partner</i> ticked, each partner is clustered once, on its best-iLIS prediction.</div>
+      <div id="cluster-info" style="margin-top:.5rem; font-size:.85rem; line-height:1.55"></div>
+    </div>
+
+
+    <div class="card" id="pair-card">
+      <h2 data-nav="Residues">Interaction Residues</h2>
+      <div class="muted">The interaction residues on each protein, taken from the lis.py indices. No structure file needed.<br>
+        <b>LIR</b> = local interaction residue (PAE &le; 12&nbsp;&Aring;); <b>cLIR</b> = contact residue (PAE &le; 12&nbsp;&Aring; &amp; C&beta; &le; 8&nbsp;&Aring;).</div>
+      <h3 style="margin-top:.9rem">Interface map</h3>
+      <div style="display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; margin:.4rem 0 .2rem">
+        <label style="margin:0">partner <select id="pair-partner" style="max-width:340px"></select></label>
+        <input id="pair-partner-search" autocomplete="off" placeholder="🔍 search partner…" style="font:inherit; padding:2px 6px; width:170px">
+        <label style="margin:0; font-size:.8rem; color:#556">x-ticks <input id="pair-xticks" type="number" value="10" min="2" max="40" step="1" title="residue x-tick count" style="width:44px" onchange="{var p=document.getElementById('pair-partner'); if(LAST&&p&&p.value)drawPairTracks(document.getElementById('pair-canvas'),LAST,p.value);}"></label>
+        <span class="muted" id="pair-note" style="font-size:.8rem"></span>
+      </div>
+      <div id="pair-map-wrap"><canvas id="pair-canvas"></canvas></div>
+      <div id="pair-seq" style="margin-top:1rem; border-top:1px solid var(--line, #e2e6ea); padding-top:.8rem">
+        <h3 style="margin:0 0 .2rem; display:flex; align-items:baseline; gap:.55rem; flex-wrap:wrap">Sequence viewer <label style="font-size:.78rem; font-weight:400; color:#556"><select id="pair-seq-rank" title="model rank from the prediction — ColabFold/AlphaFold-Multimer rank by ipTM (rank 1 = top model)" style="font:inherit; padding:1px 5px"></select></label></h3>
+        <div class="muted" style="font-size:.8rem">Light background = interaction residue (LIR: PAE &le; 12&nbsp;&Aring;). Dark background = contact residue (cLIR: also C&beta; &le; 8&nbsp;&Aring;).</div>
+        <div id="pair-seq-msg" class="muted" style="font-size:.82rem; margin-top:.5rem"></div>
+        <div id="pair-seq-body" style="font:12.5px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; margin-top:.5rem; overflow-x:auto"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2 data-nav="3D structure">3D structure <span id="struct-badge" class="muted" style="font-weight:400; font-size:.8rem"></span></h2>
+      <div class="muted">Query protein structure, residues colored by the cluster that consensus-contacts them · click clusters to isolate.<br><b>C<i>n</i> (N)</b>: N = predictions (AlphaFold ranks) in that cluster.</div>
+      <div class="muted" style="margin-top:.35rem">Highlight residues contacted by &ge; <select id="commonality" style="font-size:.82rem; padding:1px 4px" title="Fraction of a cluster's members (predictions) that must contact a residue for it to take the cluster's color"><option value="0.1">10%</option><option value="0.2">20%</option><option value="0.3">30%</option><option value="0.4">40%</option><option value="0.5" selected>50%</option><option value="0.6">60%</option><option value="0.7">70%</option><option value="0.8">80%</option><option value="0.9">90%</option><option value="custom">custom&hellip;</option></select><span id="commonality-custom" class="hidden"> <input type="number" id="commonality-pct" min="1" max="100" step="1" style="width:4.2em; font-size:.82rem; padding:1px 4px" title="Any value from 1 to 100%; applied on Enter or when the field loses focus"> %</span> of a cluster's members (consensus / core residues).</div>
+      <div class="muted" style="margin-top:.25rem">Color only clusters with &ge; <input id="min-cluster" type="number" min="1" value="5" style="width:46px; font-size:.82rem; padding:1px 4px"> predictions (hides tiny clusters).</div>
+      <div id="chip-n-note" class="muted" style="font-size:.78rem; color:#5E5E6E">&nbsp;&nbsp;(the <b>(N)</b> on each cluster chip — AlphaFold ranks, not unique partners).</div>
+      <div id="cluster-chips" class="chips" style="margin:.5rem 0 0"></div>
+      <div class="row" style="margin-top:.5rem; gap:.4rem; align-items:center; flex-wrap:wrap">
+        <span class="muted">Color selection:</span>
+        <span class="cchip cmode sel" data-mode="cluster">cluster</span>
+        <span class="cchip cmode" data-mode="plddt">pLDDT</span>
+        <span class="cchip cmode am-only hidden" data-mode="am">AlphaMissense</span>
+        <span id="am-cut-wrap" class="muted hidden">&middot; AM pathogenicity average &ge; <select id="am-cutoff" style="font-size:.82rem; padding:1px 4px"><option value="0" selected>0%</option><option value="0.1">10%</option><option value="0.2">20%</option><option value="0.3">30%</option><option value="0.4">40%</option><option value="0.5">50%</option><option value="0.6">60%</option><option value="0.7">70%</option><option value="0.8">80%</option><option value="0.9">90%</option><option value="1">100%</option></select></span>
+      </div>
+      <iframe id="viewer3d-frame" style="width:100%; height:600px; border:1px solid var(--line); border-radius:8px; background:#fff; margin-top:.5rem" title="3D structure viewer"></iframe>
+    </div>
+
+    <div class="card">
+      <h2 data-nav="Scatter">Interaction scatter plot</h2>
+      <div class="row" style="font-size:.85rem; margin-bottom:.5rem">
+        <label style="margin:0">Y <select id="scatter-y"></select></label>
+        <label style="margin:0">X <select id="scatter-x"></select></label>
+        <label style="margin:0">show <select id="scatter-points"><option value="all">every prediction</option><option value="rank1" title="Each pair's rank-1 model: the predictor's first, by ipTM-based confidence (not necessarily the highest iLIS)">rank-1 per pair</option></select></label>
+        <label style="margin:0; position:relative">find <input id="scatter-search" type="search" list="scatter-list" placeholder="🔍 partner…" autocomplete="off" spellcheck="false" style="font:inherit; font-size:.85rem; padding:2px 8px; width:130px; border:1px solid #ccd6e0; border-radius:6px"><datalist id="scatter-list"></datalist></label>
+        <span id="scatter-rho" class="muted" style="margin-left:.5rem; font-weight:600; color:#445"></span>
+        <span class="muted">gray = below cutoff / unclustered · colored = clustered. <b>rank</b> = global rank (1..N) by the Y-axis metric across all predictions.</span>
+      </div>
+      <div id="scatter" style="height:380px"></div>
+    </div>
+
+    <div class="card">
+      <h2 data-nav="Partners" style="display:flex; align-items:center; gap:.4rem; flex-wrap:wrap;">Partners <input id="ptable-search" type="search" list="ptable-list" placeholder="🔍 filter partner…" autocomplete="off" spellcheck="false" style="font:inherit; font-size:.8rem; font-weight:400; padding:2px 8px; width:150px; border:1px solid #ccd6e0; border-radius:6px; vertical-align:middle"><span id="ptable-count" class="muted" style="font-size:.72rem; font-weight:400"></span> <button id="export" class="ghost" style="margin-left:auto">⬇ Download report HTML</button><datalist id="ptable-list"></datalist></h2>
+      <div style="max-height:360px; overflow:auto"><table id="ptable"></table></div>
+      <p id="ptable-note" style="font-size:0.78rem; color:#6B6B6B; margin:0.35rem 0 0">* actifpTM is approximate: lis.py's estimate from the PAE over residue pairs in contact (About).</p>
+    </div>
+  </div>
+  <div class="footer">
+    <a href="https://github.com/flyark/LIVIA" target="_blank">LIVIA GitHub</a> &middot; <a href="https://github.com/flyark/AFM-LIS" target="_blank">AFM-LIS GitHub</a>
+    <br>
+    <a href="https://doi.org/10.64898/2026.05.01.721633" target="_blank">Kim &amp; Perrimon (2026)</a>
+    <br>
+    Ah-Ram Kim &middot; Harvard Medical School
+  </div>
+</div>
+
+<script>
+const TAB10 = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2','#bcbd22','#17becf'];   // Tableau 10 without its gray (gray reads as "not clustered"); the Atlas uses the same
+const TAB20 = TAB10.concat(['#aec7e8','#ffbb78','#98df8a','#ff9896','#c5b0d5','#c49c94','#f7b6d2','#dbdb8d','#9edae5']);   // Tableau 20 without its two grays, strong nine first, then the pale nine (the Atlas uses the same order)
+const TAB20B = ['#393b79','#5254a3','#6b6ecf','#9c9ede','#637939','#8ca252','#b5cf6b','#cedb9c','#8c6d31','#bd9e39','#e7ba52','#e7cb94','#843c39','#ad494a','#d6616b','#e7969c','#7b4173','#a55194','#ce6dbd','#de9ed6'];
+const TAB20C = ['#3182bd','#6baed6','#9ecae1','#c6dbef','#e6550d','#fd8d3c','#fdae6b','#fdd0a2','#31a354','#74c476','#a1d99b','#c7e9c0','#756bb1','#9e9ac8','#bcbddc','#dadaeb','#636363','#969696','#bdbdbd','#d9d9d9'];
+const TAB60 = TAB20.concat(TAB20B, TAB20C.filter((c) => !['#636363','#969696','#bdbdbd','#d9d9d9'].includes(c)));   // 54 distinct, no grays — 'auto' uses this beyond 18 clusters
+const PALETTES = { tab10: TAB10, tab20: TAB20, tab20b: TAB20B, tab20c: TAB20C, distinct: TAB60 };
+let PALETTE = 'auto';   // default; 'auto' scales with k (tab10->tab20->tab60->HSL); fixed palettes extend with generated colors past their length
+let CLUSTER_OVERRIDE = {};   // per-cluster custom color (cluster id -> hex); wins over the palette
+let USERCLUST_CLIP = null;   // user-supplied partner symbol -> cluster label (Map); overrides the fingerprint clustering
+// user clusters are used when a map is loaded and the toggle is not set back to fingerprint
+function clipUserClusterMode(){ return !!(USERCLUST_CLIP && USERCLUST_CLIP.size && (!$('clip-clustmode') || $('clip-clustmode').value === 'user')); }
+// display name for a cluster index: the user's label if any (bare number -> "Cluster N"/"CN"), else "Cluster N"/"CN"
+function clusterLabel(c, short){
+  const nm = LAST && LAST.cl && LAST.cl.commNames && LAST.cl.commNames[c];
+  if (nm == null) return short ? ('C' + c) : ('Cluster ' + c);
+  return /^\d+$/.test(nm) ? (short ? ('C' + nm) : ('Cluster ' + nm)) : nm;
+}
+// Override cl.labels with the user's partner->cluster map. The fingerprint tree (cl.Z) and leaf
+// order are left untouched, so the heatmap dendrogram still renders — only the cluster identities
+// (and thus every color/chip/legend that reads cl.labels) change. Partners absent from the map go
+// to a neutral trailing 'unassigned' cluster; dropping them would break the tree (n would change).
+function applyUserClusters(cl, pipe){
+  const n = cl.labels.length, labelStr = new Array(n), freq = new Map();
+  for (let i = 0; i < n; i++){
+    const l = USERCLUST_CLIP.get(pipe.rows[i].Symbol_2);
+    labelStr[i] = (l != null && l !== '') ? String(l) : null;
+    if (labelStr[i] != null) freq.set(labelStr[i], (freq.get(labelStr[i]) || 0) + 1);
+  }
+  const order = [...freq.keys()].sort((a, b) => (freq.get(b) - freq.get(a)) || (a < b ? -1 : a > b ? 1 : 0));   // largest first
+  const idx = new Map(order.map((l, i) => [l, i + 1]));   // 1-indexed, matches cLIP's size-ranked convention
+  const hasUn = labelStr.some(l => l == null), unIdx = order.length + 1;
+  cl.labels = labelStr.map(l => l == null ? unIdx : idx.get(l));
+  cl.optimalK = order.length + (hasUn ? 1 : 0);
+  const names = {}; order.forEach((l, i) => names[i + 1] = l); if (hasUn) names[unIdx] = 'unassigned';
+  cl.commNames = names;
+}
+function parseClipClusterMap(text){                          // partner -> cluster label
+  const rows = CLIPPipeline.parseCSV(text).rows; if (!rows || !rows.length) return null;
+  const ks = Object.keys(rows[0]);
+  const nodeK = ks.find(k => /^(partner|node|name|symbol|symbol_2|protein|protein_2|gene)$/i.test(k)) || ks[0];
+  const clK = ks.find(k => /^(cluster|community|module|group|class|label)$/i.test(k)) || ks.find(k => k !== nodeK) || ks[1];
+  if (!clK) return null;
+  const m = new Map();
+  for (const r of rows){ const nkey = String(r[nodeK] != null ? r[nodeK] : '').trim(), c = String(r[clK] != null ? r[clK] : '').trim(); if (nkey && c !== '') m.set(nkey, c); }
+  return m.size ? m : null;
+}
+function clipClustStat(){
+  const on = !!(USERCLUST_CLIP && USERCLUST_CLIP.size);
+  $('clip-clust-mode-wrap').classList.toggle('hidden', !on);
+  $('clip-clust-stat').textContent = on
+    ? (clipUserClusterMode() ? `user-defined · ${USERCLUST_CLIP.size} partners mapped` : 'fingerprint clustering (your map is loaded but off)')
+    : 'fingerprint clustering (automatic)';
+}
+function regenerateClip(){ if ($('run') && !$('run').disabled && LAST) $('run').click(); }
+function loadClipClusterMap(text){
+  USERCLUST_CLIP = parseClipClusterMap(text);
+  if (!USERCLUST_CLIP) { $('status').textContent = '⚠ cluster map: no partner,cluster rows found (need a header like partner,cluster or Symbol_2,cluster).'; }
+  else if ($('clip-clustmode')) $('clip-clustmode').value = 'user';
+  clipClustStat(); regenerateClip();
+}
+function clearClipClusters(){ USERCLUST_CLIP = null; clipClustStat(); regenerateClip(); }
+// golden-angle HSL so colors never collide when clusters exceed the curated palettes
+function hslDistinct(i){ const h = (i * 137.508) % 360, s = (62 + (i % 2) * 16)/100, l = (42 + (i % 3) * 13)/100, a = s * Math.min(l, 1-l); const f = (n) => { const k = (n + h/30) % 12, c = l - a * Math.max(-1, Math.min(k-3, 9-k, 1)); return Math.round(255*c).toString(16).padStart(2,'0'); }; return `#${f(0)}${f(8)}${f(4)}`; }
+function clusterColor(id, k){
+  if (CLUSTER_OVERRIDE[id]) return CLUSTER_OVERRIDE[id];                                     // user custom color wins
+  if (PALETTE === 'distinct') return id <= TAB60.length ? TAB60[id - 1] : hslDistinct(id - 1);        // never cycles, any N
+  if (PALETTE !== 'auto' && PALETTES[PALETTE]){ const p = PALETTES[PALETTE]; return id <= p.length ? p[id - 1] : hslDistinct(id - 1); }   // fixed palette, extends with generated colors past its length
+  const pal = k <= TAB10.length ? TAB10 : k <= TAB20.length ? TAB20 : k <= TAB60.length ? TAB60 : null;                    // auto: smallest curated palette that fits
+  return pal ? pal[(id - 1) % pal.length] : hslDistinct(id - 1);                             // more clusters -> generated distinct colors
+}
+// Single-model iLIS thresholds (Y2H reference sets in yeast/fly/human via ColabFold; Kim et al. 2026)
+function amColor(v){ const t=Math.max(0,Math.min(1,v));   // AlphaMissense: benign(blue) -> ambiguous(gray) -> pathogenic(red)
+  const lerp=(a,b,u)=>[0,1,2].map(i=>Math.round(a[i]+(b[i]-a[i])*u));
+  const c = t<0.5 ? lerp([44,123,182],[224,224,224],t/0.5) : lerp([224,224,224],[215,25,28],(t-0.5)/0.5);
+  return '#' + c.map(x => x.toString(16).padStart(2, '0')).join('');
+}
+const FPR_ILIS = [['10% FPR', 0.223], ['5% FPR', 0.339], ['1% FPR', 0.551]];
+// Shared residue x-axis layout so the frequency plot and the fingerprint heatmap align column-for-column.
+// AX_L holds the heatmap's dendrogram + cluster strip (and the frequency plot's y-axis) → shared = aligned.
+const PLOT_W = 900, AX_L = 58, AX_R = 46;
+let CLIP_STYLE = 'cluster', CLIP_FREQ_STYLE = 'cluster', CLIP_RLABELS = true;   // frequency + fingerprint: 'cluster', 'total' (frequency only: all models line), or 'classic'
+const clipAXR = (svg) => (CLIP_STYLE === 'cluster' && CLIP_RLABELS && (svg || window.innerWidth >= 640) ? 156 : AX_R);   // room for the cluster labels (not on a phone, where the scaled canvas makes them unreadable); both plots use it so their residue axes stay aligned
+function setClipLabels(on){
+  CLIP_RLABELS = !!on; document.querySelectorAll('.clip-rlabels').forEach((x) => { x.checked = CLIP_RLABELS; });
+  if (LAST){ renderFreq(LAST); renderHeatmap(LAST); }
+}
+function setClipStyle(v){
+  if (v === 'total'){
+    CLIP_FREQ_STYLE = 'total';
+    document.querySelectorAll('.freq-style').forEach((x) => { x.value = 'total'; });
+    { const fn = document.getElementById('freq-style-note'); if (fn) fn.textContent = 'combined total across models'; }
+    if (LAST) renderFreq(LAST);
+    return;
+  }
+  CLIP_STYLE = v; CLIP_FREQ_STYLE = v;
+  document.querySelectorAll('.clip-style').forEach((x) => { x.value = v; });
+  document.querySelectorAll('.clip-rlab').forEach((x) => { x.style.display = v === 'cluster' ? 'inline-flex' : 'none'; });
+  { const fn = document.getElementById('freq-style-note'); if (fn) fn.textContent = v === 'cluster' ? 'one line per cluster over the total (gray)' : 'colored by the dominant cluster'; }
+  const nt = document.getElementById('fp-note'); if (nt) nt.innerHTML = v === 'cluster' ? 'Rows = partners (dendrogram order), columns = query residues. cLIR contacts in their cluster\'s color, very light = none; left: dendrogram + cluster strip; right: each cluster, its predictions and the partners with the most predictions.'
+    : 'Rows = partners (dendrogram order), columns = query residues. <span style="color:#08306b;font-weight:600">Dark blue</span> = cLIR contact, very light = none; left: dendrogram + cluster strip.';
+  if (LAST){ renderFreq(LAST); renderHeatmap(LAST); }
+}
+function clusterBlocks(A, order){   // runs of rows in one cluster, each with its label: 'C1: 21 (MDM2, TADA2A, …)', predictions and the partners with the most predictions
+  const { pipe, cl } = A, out = [];
+  order.forEach((idx, row) => { const c = cl.labels[idx], b = out[out.length - 1]; if (b && b.c === c) b.end = row; else out.push({ c, start: row, end: row }); });
+  for (const b of out){ const per = new Map(); let n = 0;
+    for (let i = 0; i < cl.labels.length; i++) if (cl.labels[i] === b.c){ n++; const p = pipe.rows[i].Symbol_2 || ''; per.set(p, (per.get(p) || 0) + 1); }
+    const nm = [...per].sort((a, z) => z[1] - a[1]).slice(0, 2).map(([p]) => p);
+    b.label = `C${b.c}: ${n}${nm.length ? ` (${nm.join(', ')}${per.size > 2 ? ', \u2026' : ''})` : ''}`; }
+  return out;
+}
+function fitLabel(t, room, width){ while (t.length > 4 && width(t) > room) t = t.slice(0, -2) + '\u2026'; return t; }
+
+
+let FILES = [];      // {name, rows} — parsed+converted once on drop, reused for gene list + every generate
+let LAST = null;     // last analysis result (for export)
+let FASTA_PARSE = null;  // parsed FASTA {map, byLen, seqs} from optional FASTA
+let FASTA_WARN = [];
+let STRUCT_FILE = null; // optional user-uploaded structure
+let META = null, META_LABELCOL = null, LABEL_IDS = {}, LABEL_FRAG = {};   // identity map globals; LABEL_IDS: label -> resolvable ids; LABEL_FRAG: label -> {start,end} for partial proteins
+let XLSX_IDS = {};   // symbol -> ids stated by a workbook (Protein_*/Uniprot_*); an identity map by another name
+let FORCE_ACC = '';  // user-supplied UniProt accession; overrides name-based resolution for the query
+let ACTIVE = null;      // active cluster ids (shared: 3D viewer + frequency plot)
+let TABLE_SORT = null;  // {label, dir} for the partners table
+let TABLE_FILTER = '';  // partner-name filter for the partners table (substring, case-insensitive)
+let SCATTER_HL = '';    // partner name highlighted in the interaction scatter plot ('' = none)
+const CHIP_CONTAINERS = ['cluster-chips', 'freq-chips', 'fp-chips'];
+
+const $ = (id) => document.getElementById(id);
+// Three independent drop zones (CSV / FASTA / structure), each drag-or-click.
+function wireZone(zoneId, inputId, kind){
+  const z = $(zoneId), inp = $(inputId);
+  z.onclick = () => inp.click();
+  ['dragover','dragenter'].forEach(e => z.addEventListener(e, ev => { ev.preventDefault(); z.classList.add('hover'); }));
+  ['dragleave','drop'].forEach(e => z.addEventListener(e, ev => { ev.preventDefault(); z.classList.remove('hover'); }));
+  z.addEventListener('drop', ev => routeFiles(ev.dataTransfer.files, kind));
+  inp.addEventListener('change', ev => routeFiles(ev.target.files, kind));
+}
+wireZone('dz-csv', 'in-csv', 'csv'); wireZone('dz-fasta', 'in-fasta', 'fasta'); wireZone('dz-meta', 'in-meta', 'meta'); wireZone('dz-struct', 'in-struct', 'struct');
+(async function net2clip(){   // hand-off from the network builder: load the query's CSV (+ identity map), pick the query, generate
+  let raw; try { raw = localStorage.getItem('livia_net2clip'); } catch(e){ return; }
+  if (!raw) return;
+  try { localStorage.removeItem('livia_net2clip'); } catch(e){}
+  let h; try { h = JSON.parse(raw); } catch(e){ return; }
+  try {
+    await routeFiles([new File([h.csv], 'network_query.csv', { type:'text/csv' })], 'csv');
+    if (h.meta) await routeFiles([new File([h.meta], 'identity_map.csv', { type:'text/csv' })], 'meta');
+    if (h.fasta) await routeFiles([new File([h.fasta], 'network_query.fasta', { type:'text/plain' })], 'fasta');   // sequences carried from the network
+    const sel = $('gene');
+    if (sel && (h.querySym||h.query)){ const o=[...sel.options].find(o=>o.value===h.querySym) || [...sel.options].find(o=>o.value===h.query); if(o){ sel.value=o.value; PARTNER_EXCLUDE = new Set(); rebuildSubsetPicker(); if ($('run') && !$('run').disabled) $('run').click(); } }
+  } catch(e){ console.warn('net2clip', e); }
+})();
+// Report options a hand-off link may carry: ?ilis=<cutoff> and ?topn=<n>. Applied before the run
+// click so the report a site links to opens at the threshold that site means, not the 10% default.
+function applyClipOpts(ilis, topn){
+  if (ilis != null && ilis !== '' && isFinite(+ilis)){
+    $('ilis').value = String(+ilis);
+    if ($('fpr')) $('fpr').value = ['0.223','0.339','0.551'].includes($('ilis').value) ? $('ilis').value : '';
+  }
+  if (topn != null && topn !== '') $('topn').value = String(topn);
+}
+// Direct data hand-off: clip.html?data=<url>[&gene=<symbol>] — fetch a per-gene bundle (a .zip of CSV+FASTA,
+// or a bare CSV/.gz) and cluster it. Used by external sites (e.g. FlyPredictome-network) that link straight in.
+(async function dataParam(){
+  const params = new URLSearchParams(location.search);
+  const url = params.get('data'); if (!url) return;
+  try {
+    $('status').textContent = 'loading data…';
+    const resp = await fetch(url); if (!resp.ok) throw new Error('HTTP ' + resp.status);   // await first: lets the top-level `let`s finish initializing (avoids TDZ)
+    const blob = await resp.blob();
+    FILES.length = 0; FASTA_PARSE = null; FASTA_WARN = []; META = null; META_LABELCOL = null;
+    LABEL_IDS = {}; LABEL_FRAG = {}; XLSX_IDS = {}; FORCE_ACC = ''; STRUCT_FILE = null; PARTNER_EXCLUDE = new Set();
+    // Pin the organism for a single-species hand-off so a symbol like CDK2AP1 resolves to the FLY
+    // protein, not the human ortholog. Explicit ?species= wins; else infer fly from an FBgn-named
+    // bundle or a FlyPredictome URL (that's the fly-network → cLIP hand-off).
+    { const sp = $('mg-species'), spq = params.get('species');
+      if (sp){ if (spq) sp.value = spq;
+               else if (/FBgn\d+/i.test(url) || /flypredictome/i.test(url)) sp.value = '7227'; } }
+    await routeFiles([new File([blob], (url.split('/').pop() || 'data.zip'))], 'csv');   // .zip → CSV+FASTA auto-sorted
+    const sel = $('gene'); if (!sel || !sel.options.length){ $('status').textContent = 'no proteins found in the data'; return; }
+    const o = pickHandoffQuery(sel, params.get('gene'));
+    applyClipOpts(params.get('ilis'), params.get('topn'));
+    if (o){ sel.value = o.value; rebuildSubsetPicker(); if ($('run') && !$('run').disabled) $('run').click(); }
+  } catch(e){ $('status').textContent = '⚠ could not load data: ' + e.message; console.warn('dataParam', e); }
+})();
+
+// ── Pushed data via postMessage: clip.html?post=1 — an opener (e.g. an offline cLIP index served on
+// localhost) hands over a lis.py bundle's BYTES directly, so hosted LIVIA never fetches the local file
+// (sidesteps file:// / CORS / Private-Network-Access — postMessage is subject to none). Opt-in via
+// ?post=1 so a normal tab never accepts injected data. Handshake: opener pings {type:'livia-ping'} → we
+// reply {source:'livia',type:'livia-ready'} → opener posts {type:'livia-load', name, data, gene?}.
+// Same ingest + bait-pick + generate as ?data= above.
+(function(){
+  if (!new URLSearchParams(location.search).has('post')) return;
+  const ready = (src) => { try { src && src.postMessage({ source: 'livia', type: 'livia-ready' }, '*'); } catch (e) {} };
+  // Data another page sent are marked as such: a page opened by a third party cannot pass for the user's own files.
+  const showOrigin = (ev) => {
+    let from = ev.origin || 'another page'; try { if (ev.source && ev.source.location) from = ev.source.location.href.split('#')[0]; } catch (e) {}   // the page itself when same-origin
+    let n = document.getElementById('post-origin');
+    if (!n) { n = document.createElement('div'); n.id = 'post-origin'; n.setAttribute('role', 'status');
+      n.style.cssText = 'max-width:1100px; margin:0.6rem auto 0; padding:0.45rem 0.8rem; border:1px solid #d6e2ee; border-radius:8px; background:#f5f9fc; color:#33414E; font-size:0.85rem;';
+      const main = document.querySelector('[role="main"]'); main ? main.prepend(n) : document.body.prepend(n); }
+    n.textContent = 'Loaded from ' + from + ': these data were sent by another page, not opened from your files.';
+  };
+  // While the opener is still reading (the LIVIA Atlas reads the data first): a status line at the top of the page, fed by
+  // {type:'livia-status', text, error} from the opener only, so the tab is never a blank page with nothing happening.
+  const banner = (text, kind) => {
+    let n = document.getElementById('post-status');
+    if (!n) { n = document.createElement('div'); n.id = 'post-status'; n.setAttribute('role', 'status'); n.setAttribute('aria-live', 'polite');
+      const main = document.querySelector('[role="main"]'); main ? main.prepend(n) : document.body.prepend(n); }
+    if (!text) { n.remove(); return; }
+    const err = kind === 'error';
+    n.style.cssText = 'max-width:1100px; margin:0.6rem auto 0.8rem; padding:0.55rem 0.8rem; border-radius:8px; font-size:0.9rem; font-weight:600; '
+      + (err ? 'border:1px solid #e3b4ad; background:#fbefed; color:#8a2c1f;' : 'border:1px solid #c9dbe9; background:#eef5fb; color:#1f4e79;');
+    n.textContent = text;
+  };
+  if (window.opener) banner('Waiting for the data from the page that opened this tab…');   // opened by hand (no opener): nothing is coming, so no waiting line
+  window.addEventListener('message', async (ev) => {
+    const m = ev.data;
+    if (!m || typeof m !== 'object') return;
+    if (m.type === 'livia-ping') { ready(ev.source); return; }
+    if (m.type === 'livia-status') { if (ev.source && ev.source === window.opener && m.text) banner(String(m.text).slice(0, 400), m.error ? 'error' : ''); return; }
+    if (m.type !== 'livia-load' || m.data == null) return;
+    banner('');
+    showOrigin(ev);
+    try {
+      const blob = (m.data instanceof Blob) ? m.data : new Blob([m.data]);
+      const nm = (m.name ? String(m.name) : 'data').replace(/[^\w.\-]+/g, '_');
+      const fname = /\.(zip|gz|csv|xlsx)$/i.test(nm) ? nm : nm + '.zip';
+      $('status').textContent = 'loading ' + (m.name || 'data') + '…';
+      FILES.length = 0; FASTA_PARSE = null; FASTA_WARN = []; META = null; META_LABELCOL = null;
+      LABEL_IDS = {}; LABEL_FRAG = {}; XLSX_IDS = {}; FORCE_ACC = ''; STRUCT_FILE = null; PARTNER_EXCLUDE = new Set();
+      if ($('mg-species')) $('mg-species').value = '';
+      await routeFiles([new File([blob], fname, { type: blob.type || 'application/zip' })], 'csv');   // .zip → CSV+FASTA auto-sorted
+      const sel = $('gene'); if (!sel || !sel.options.length){ $('status').textContent = 'no proteins found in the data'; return; }
+      const o = pickHandoffQuery(sel, m.gene);
+      applyClipOpts(m.ilis, m.topn);
+      if (o){ sel.value = o.value; rebuildSubsetPicker(); if ($('run') && !$('run').disabled) $('run').click(); }
+    } catch (e) { $('status').textContent = '⚠ could not load pushed data: ' + e.message; }
+  });
+  if (window.opener) ready(window.opener);   // announce readiness in case the opener is already waiting
+})();
+// Examples: fly TF kinase screens (published, Kim et al. 2025) — load the CSV, pick the TF, generate.
+let _clipExSeq = 0, _clipExAbort = null, _clipExKey = null;
+async function loadExample(file, gene) {
+  if (location.protocol === 'file:'){   // file:// blocks fetch of the bundled files; dropping your own still works
+    $('status').textContent = 'Bundled examples need an http server. Run  python3 -m http.server 8000  in the LIVIA folder — or just drop your own lis.py CSV, which works offline.';
+    return;
+  }
+  const key = `${file}|${gene}`;
+  if (_clipExKey === key && _clipExAbort) return;
+  const seq = ++_clipExSeq;
+  if (_clipExAbort) { try { _clipExAbort.abort(); } catch (e) {} }
+  const ac = new AbortController();
+  _clipExAbort = ac;
+  _clipExKey = key;
+  $('status').textContent = `loading ${gene}…`;
+  try {
+    // a data-file may be a bundled name (examples/…) or a full hosted URL (FlyPredictome-clip-data)
+    const src = /^https?:\/\//.test(file) ? file : 'examples/' + file;
+    const resp = await fetch(src, { signal: ac.signal });
+    if (seq !== _clipExSeq) return;
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const blob = await resp.blob();
+    if (seq !== _clipExSeq) return;
+    // start clean so a second example doesn't stack on the first
+    FILES.length = 0; FASTA_PARSE = null; FASTA_WARN = []; META = null; META_LABELCOL = null;
+    LABEL_IDS = {}; LABEL_FRAG = {}; XLSX_IDS = {}; FORCE_ACC = ''; STRUCT_FILE = null; PARTNER_EXCLUDE = new Set();
+    if ($('mg-species')) $('mg-species').value = '';
+    // routeFiles handles a .zip (CSV + optional FASTA, auto-sorted) or a bare .csv, and awaits the
+    // name→symbol auto-conversion, so the bait below is the converted symbol.
+    await routeFiles([new File([blob], file, { type: blob.type })], 'csv');
+    if (seq !== _clipExSeq) return;
+    const sel = $('gene'); const o = [...sel.options].find(x => x.value.toLowerCase() === gene.toLowerCase()) || sel.options[0];
+    if (o){ sel.value = o.value; $('run').click(); }
+  } catch (err) {
+    if (seq !== _clipExSeq || (err && err.name === 'AbortError')) return;
+    $('status').textContent = '⚠ could not load example: ' + err.message;
+  } finally {
+    if (seq === _clipExSeq) { _clipExAbort = null; _clipExKey = null; }
+  }
+}
+document.querySelectorAll('.load-ex').forEach(a => a.onclick = (e) => { e.preventDefault(); loadExample(a.dataset.file, a.dataset.gene); });
+// Jump-to-gene: search any FlyPredictome network gene and load its interactome bundle. Lazily
+// fetches the gene list (network nodes.csv) on first focus, resolves the typed name → FBgn, and
+// reuses loadExample (which reports a missing bundle). Names are the network's display symbols.
+(function(){
+  const inp = $('clip-gene-jump'), dl = $('clip-gene-list');
+  if (!inp) return;
+  let MAP = null, loading = false, last = '';
+  async function ensureList(){
+    if (MAP || loading) return; loading = true;
+    try {
+      const txt = await (await fetch('https://flyark.github.io/FlyPredictome-network/data/nodes.csv')).text();
+      MAP = {}; const frag = document.createDocumentFragment(); const lines = txt.split('\n');
+      for (let i = 1; i < lines.length; i++){ const c = lines[i].split(','); if (c.length < 2 || !c[0] || !c[1]) continue; MAP[c[0].toLowerCase()] = { fb: c[1], name: c[0] }; const o = document.createElement('option'); o.value = c[0]; frag.appendChild(o); }
+      dl.appendChild(frag);
+    } catch(e){ /* offline / CORS: autocomplete unavailable, exact typing still resolves once loaded */ }
+    loading = false;
+  }
+  inp.addEventListener('focus', ensureList);
+  inp.addEventListener('input', () => { last = ''; });
+  function go(){
+    const v = inp.value.trim(); if (!v || v === last) return; last = v;
+    const hit = MAP && MAP[v.toLowerCase()];
+    if (!hit){ $('status').textContent = MAP ? ('no gene "' + v + '" in the network — check the symbol, or browse the full network') : 'gene list still loading — try again in a moment'; return; }
+    loadExample('https://flyark.github.io/FlyPredictome-clip-data/' + hit.fb + '.zip', hit.name);
+  }
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter'){ e.preventDefault(); go(); } });
+  inp.addEventListener('change', go);
+})();
+{ const _ml = $('meta-label'); if (_ml) _ml.onchange = () => { META_LABELCOL = _ml.value; applyMetadata(); $('status').textContent = 'display labels updated — pick a query and generate'; }; }
+{ const _sk = $('skel-link'); if (_sk) _sk.onclick = (e) => { e.preventDefault(); downloadSkeleton(); }; }
+{ const _mc = $('mg-convert'); if (_mc) _mc.onclick = (e) => { e.preventDefault(); autoConvertClip(); };
+  const _ms = $('mg-species'); if (_ms) _ms.onchange = () => { if (LAST && !window.__CLIP_DATA__) loadReported(LAST); }; }
+{ const _ug = $('uniprot-go'), _uf = $('uniprot-force');
+  const applyForce = () => {
+    const v = (_uf.value || '').trim().toUpperCase();
+    FORCE_ACC = v;
+    const tag = $('uniprot-forced');
+    if (v){ tag.textContent = `· forced to ${v}`; tag.classList.remove('hidden'); } else tag.classList.add('hidden');
+    if (LAST) resolve3D(LAST);   // re-resolve and re-render the structure card in place
+  };
+  if (_ug) _ug.onclick = (e) => { e.preventDefault(); applyForce(); };
+  if (_uf) _uf.onkeydown = (e) => { if (e.key === 'Enter'){ e.preventDefault(); applyForce(); } }; }
+// FPR ⇄ iLIS cutoff sync
+$('fpr').onchange = () => { if ($('fpr').value) $('ilis').value = $('fpr').value; };
+$('ilis').oninput = () => { $('fpr').value = ['0.223','0.339','0.551'].includes($('ilis').value) ? $('ilis').value : ''; };
+$('gene').addEventListener('change', () => { PARTNER_EXCLUDE = new Set(); rebuildSubsetPicker(); });
+{ const _sa = $('subset-all'); if (_sa) _sa.onclick = (e) => { e.preventDefault(); PARTNER_EXCLUDE = new Set(); rebuildSubsetPicker(); };
+  const _sn = $('subset-none'); if (_sn) _sn.onclick = (e) => { e.preventDefault(); PARTNER_EXCLUDE = new Set(queryPartners($('gene').value)); rebuildSubsetPicker(); }; }
+{ const _sd = $('subset-dl'); if (_sd) _sd.onclick = (e) => { e.preventDefault(); downloadSubsetList(); };
+  const _sl = $('subset-dl-lis'); if (_sl) _sl.onclick = (e) => { e.preventDefault(); downloadFilteredLis(); };
+  const _sf = $('subset-dl-fasta'); if (_sf) _sf.onclick = (e) => { e.preventDefault(); downloadFilteredFasta(); };
+  const _su = $('subset-ul'); if (_su) _su.onchange = async (ev) => { const f = ev.target.files && ev.target.files[0]; if (!f) return; try { uploadSubsetList(await f.text()); } catch(err){ $('status').textContent = '⚠ subset list parse failed: ' + err.message; } finally { ev.target.value = ''; } }; }
+{ const _cu = $('clip-clust-ul'); if (_cu) _cu.onchange = async (ev) => { const f = ev.target.files && ev.target.files[0]; if (!f) return; try { loadClipClusterMap(await f.text()); } catch(err){ $('status').textContent = '⚠ cluster map parse failed: ' + err.message; } finally { ev.target.value = ''; } };
+  const _cm = $('clip-clustmode'); if (_cm) _cm.onchange = () => { clipClustStat(); regenerateClip(); };
+  const _cc = $('clip-clust-clear'); if (_cc) _cc.onclick = (e) => { e.preventDefault(); clearClipClusters(); }; }
+
+// A workbook states each protein's real identifiers alongside the display symbol. Feeding those to
+// the resolver is what separates FBgn0035802 (one fly gene) from the symbol 'Pura', which also matches
+// a human and an E. coli protein of a similar length. The fragment suffix rides along: resolveStructure
+// reads 'FBgn0035802_1_387' as residues 1–387 of that gene.
+function harvestXlsxIds(wb){
+  const add = (sym, ids) => {
+    const s = String(sym||'').trim(); if (!s) return;
+    const set = XLSX_IDS[s] = XLSX_IDS[s] || new Set();
+    for (const v of ids){ const x = String(v||'').trim(); if (x && x !== s) set.add(x); }
+  };
+  for (const name of Object.keys(wb)) for (const r of wb[name].rows){
+    add(r.Symbol_1, [r.Protein_1, r.Uniprot_1]);
+    add(r.Symbol_2, [r.Protein_2, r.Uniprot_2]);
+  }
+  applyXlsxIds();
+}
+function applyXlsxIds(){
+  for (const s in XLSX_IDS){ const ids = [...XLSX_IDS[s]]; if (ids.length) LABEL_IDS[s] = [...new Set((LABEL_IDS[s]||[]).concat(ids))]; }
+}
+
+// An .xlsx workbook already holds lis.py's converted columns, so it skips parseCSV/convertRows'
+// and goes straight in as rows. A Sequence sheet, if present, doubles as the FASTA upload.
+async function loadXlsx(file){
+  $('status').textContent = `parsing ${file.name}…`;
+  await new Promise(r => setTimeout(r, 0));
+  const wb = LiviaXlsx.parseXlsx(new Uint8Array(await file.arrayBuffer()));
+  const sheet = LiviaXlsx.pickLisSheet(wb);
+  if (!sheet){
+    const names = Object.keys(wb).join(', ') || '(none)';
+    throw new Error(`no sheet in ${file.name} has lis.py columns (Symbol_1/2, iLIS, cLIR_indice_A/B). Sheets: ${names}`);
+  }
+  let haveLen = sheet.kind === 'lis-full';
+  if (!haveLen){                                        // widest sheet often drops the lengths — borrow them from a sheet that has them
+    const len = LiviaXlsx.lengthMap(wb);
+    for (const r of sheet.rows){
+      const la = len.get(String(r.Symbol_1||'').trim()), lb = len.get(String(r.Symbol_2||'').trim());
+      if (la){ r.Protein_Len_A = la; haveLen = true; }
+      if (lb) r.Protein_Len_B = lb;
+    }
+  }
+  FILES.push({ name: `${file.name} · ${sheet.name}`, rows: sheet.rows });
+  harvestXlsxIds(wb);   // Protein_1 = 'FBgn0035802_1_387' resolves far better than the symbol 'Pura_1_387'
+
+  const sp = $('mg-species'), tax = LiviaXlsx.speciesHint(sheet.rows);   // Protein_*/Uniprot_* name the organism
+  if (sp && tax && !sp.value && [...sp.options].some(o=>o.value===tax)) sp.value = tax;
+  if (!FASTA_PARSE || !FASTA_PARSE.seqs.length){        // Sequence sheet → FASTA, so the user needn't upload one
+    const seqs = LiviaXlsx.sequenceSheet(wb);
+    if (seqs){
+      const { fasta, count } = LiviaXlsx.sequenceSheetToFasta(seqs);
+      if (count){
+        FASTA_PARSE = CLIPResolver.parseFastaToSeqMap(fasta);
+        FASTA_WARN = FASTA_PARSE.warn || [];
+        $('ld-fasta').textContent = `${count} sequences from ${file.name} · ${seqs.name}`;
+      }
+    }
+  }
+  if (!haveLen)   // no length anywhere in the workbook — cLIP falls back to the largest contact index
+    FASTA_WARN.push(`no Protein_Len in "${file.name}"; query length is inferred from the contacts — upload a FASTA for an exact match`);
+}
+
+async function routeFiles(list, kind){
+  if (!list || !list.length) return;
+  if (kind === 'struct'){ STRUCT_FILE = list[0]; updateLoaded(); return; }   // read later as object URL
+  if (kind === 'meta'){                                                        // identity map: prediction + chain -> protein IDs
+    try { META = parseMetadata(await list[0].text()); } catch(e){ $('status').textContent = '⚠ identity map parse failed: ' + e.message; return; }
+    if (!META || !META.cols.length){ META = null; $('ld-meta').textContent = '⚠ no id columns'; return; }
+    const sel = $('meta-label'); sel.innerHTML = ''; for (const c of META.cols){ const o = document.createElement('option'); o.value = c; o.textContent = c; sel.appendChild(o); }
+    META_LABELCOL = META.cols[0]; $('meta-label-wrap').classList.remove('hidden');
+    applyMetadata(); updateLoaded(); return;
+  }
+  try {
+    // The lis panel takes CSV, xlsx, and FASTA together (drop both zips at once). Everything is
+    // sorted by content, not by which box it landed in: a leading '>' or a FASTA extension is a
+    // sequence, the rest is lis.py CSV. The dedicated FASTA box still works for sequences alone.
+    const FA_EXT = /\.(fasta|fa|faa|fas|fna|mfa|pep|seq)$/i;
+    const wantExt = kind === 'fasta' ? /\.(fasta|fa|faa|fas|fna|mfa|pep|seq|txt)$/i
+                                     : /\.(csv|tsv|txt|fasta|fa|faa|fas|fna|mfa|pep|seq)$/i;
+    const items = [], fastaTexts = [];   // {name,text}: a dropped .zip of lis.py CSVs and/or FASTA files is expanded here
+    let metaText = null;                  // a bundled identity_map.csv is routed to the metadata parser, not the lis-CSV bucket
+    const looksLikeIdMap = (nm, tx) => {
+      if (/identity[_-]?map/i.test(nm)) return true;
+      const h = (String(tx).split(/\r?\n/)[0] || '').toLowerCase().split(',').map(s => s.trim());
+      return h.includes('name') && h.includes('chain') && (h.includes('uniprot') || h.includes('gene') || h.includes('label'));
+    };
+    const sort = (name, text) => {
+      const isFa = kind === 'fasta' || FA_EXT.test(name) || /^\s*>/.test(text);
+      if (isFa) { fastaTexts.push(text); return; }
+      if (!metaText && !META && looksLikeIdMap(name, text)) { metaText = text; return; }   // identity map bundled in the drop/zip
+      items.push({ name, text });
+    };
+    for (const f of list){
+      if (kind === 'csv' && /\.xlsx$/i.test(f.name)){ await loadXlsx(f); continue; }   // collaborator workbook
+      if (/\.zip$/i.test(f.name)){
+        if (typeof fflate === 'undefined') throw new Error('zip support failed to load (needs an internet connection)');
+        const entries = fflate.unzipSync(new Uint8Array(await f.arrayBuffer())), dec = new TextDecoder();
+        for (const nm in entries){ if (nm.startsWith('__MACOSX/') || nm.endsWith('/')) continue; const base = nm.split('/').pop(); if (wantExt.test(base)) sort(base, dec.decode(entries[nm])); }
+      } else sort(f.name, await f.text());
+    }
+    if (fastaTexts.length){ FASTA_PARSE = CLIPResolver.parseFastaToSeqMap(fastaTexts.join('\n')); FASTA_WARN = FASTA_PARSE.warn || []; }
+    if (metaText && !META){                                                  // a bundled identity map → set up META (same as the dedicated meta box)
+      try { const _m = parseMetadata(metaText); if (_m && _m.cols.length){
+        META = _m; const sel = $('meta-label'); sel.innerHTML = ''; for (const c of META.cols){ const o = document.createElement('option'); o.value = c; o.textContent = c; sel.appendChild(o); }
+        META_LABELCOL = META.cols[0]; $('meta-label-wrap').classList.remove('hidden');
+      } } catch(e){ console.warn('bundled identity map parse failed:', e); }
+    }
+    for (const it of items){                                                 // csv — parse+convert ONCE, reuse for gene list + every generate
+      $('status').textContent = `parsing ${it.name}…`;
+      await new Promise(r => setTimeout(r, 0));
+      FILES.push({ name: it.name, rows: CLIPPipeline.convertRows(CLIPPipeline.parseCSV(it.text).rows) });
+    }
+  } catch (e){ $('status').textContent = `⚠ error reading ${kind} file: ${e.message}`; console.error(e); return; }
+  if (kind === 'fasta' && (!FASTA_PARSE || !FASTA_PARSE.seqs.length)){
+    $('ld-fasta').textContent = '⚠ 0 sequences parsed'; $('status').textContent = 'FASTA loaded but no sequences parsed — check the file format.'; return;
+  }
+  if (kind === 'csv'){ if (META) applyMetadata(); else rebuildGenes(); }
+  updateLoaded();
+  if (LAST && FASTA_PARSE) renderPairTracks(LAST);   // FASTA added after generating → light up the sequence viewer
+  if (kind === 'csv' && $('mg-auto') && $('mg-auto').checked && !META) await maybeAutoConvertClip();
+}
+function parseMetadata(text){
+  const rows = CLIPPipeline.parseCSV(text).rows;
+  if (!rows || !rows.length) return null;
+  const lc = (s) => String(s||'').toLowerCase(), ks = Object.keys(rows[0]);
+  const nameK = ks.find(k => lc(k) === 'name') || 'name', chainK = ks.find(k => lc(k) === 'chain') || 'chain';
+  const startK = ks.find(k => lc(k) === 'start') || null, endK = ks.find(k => lc(k) === 'end') || null;   // optional: partial-protein boundary on the full protein
+  const cols = ks.filter(k => k !== nameK && k !== chainK && k !== startK && k !== endK);
+  const byKey = {};
+  for (const r of rows){ const nm = String(r[nameK]||'').trim(), ch = String(r[chainK]||'').trim(); if (!nm) continue; byKey[nm + ':::' + ch] = r; }
+  return { byKey, cols, nameK, chainK, startK, endK };
+}
+function metaId(name, chain, col){   // identity for (name, chain): chosen column, else first non-empty id
+  if (!META) return null;
+  const m = META.byKey[String(name).trim() + ':::' + String(chain).trim()];
+  if (!m) return null;
+  const nz = (c) => { const v = m[c]; return v != null && String(v).trim() ? String(v).trim() : null; };
+  return (col && nz(col)) || META.cols.map(nz).find(Boolean) || null;
+}
+function applyMetadata(){             // override Symbol_1/2 from the identity map (chain_i -> Symbol_1, chain_j -> Symbol_2)
+  if (!META){ rebuildGenes(); return; }
+  const col = META_LABELCOL || META.cols[0], names = new Set(), matched = new Set();
+  for (const f of FILES){ for (const r of f.rows){ names.add(r.name);
+    const li = metaId(r.name, r.chain_i, col), lj = metaId(r.name, r.chain_j, col);
+    if (li) r.Symbol_1 = li; if (lj) r.Symbol_2 = lj; if (li && lj) matched.add(r.name); } }
+  LABEL_IDS = {}; LABEL_FRAG = {};   // label -> resolvable ids + optional partial-protein {start,end}
+  for (const k in META.byKey){ const m = META.byKey[k];
+    let label = (m[col] != null && String(m[col]).trim()) ? String(m[col]).trim() : (META.cols.map(c => m[c]).find(v => v != null && String(v).trim()) || null);
+    if (label == null) continue;
+    label = String(label).trim();
+    LABEL_IDS[label] = [...new Set(META.cols.map(c => m[c]).filter(v => v != null && String(v).trim()).map(v => String(v).trim()))];
+    if (META.startK && META.endK){ const s = +m[META.startK], e = +m[META.endK]; if (s >= 1 && e > s) LABEL_FRAG[label] = { start: s, end: e }; }
+  }
+  applyXlsxIds();   // an identity map rebuilds LABEL_IDS from scratch — keep any ids a workbook stated
+  rebuildGenes();
+  const st = $('meta-stat'); if (st) st.textContent = matched.size + '/' + names.size + ' predictions mapped';
+}
+function downloadSkeleton(){       // emit a blank identity map (name, chain, id1) for every prediction+chain in the loaded CSV
+  if (!FILES.length) return;
+  const seen = new Set(), out = [['name','chain','uniprot','gene','label','start','end']];   // ID columns + start/end (fill start/end ONLY for a partial protein: its range on the full protein)
+  for (const f of FILES){ for (const r of f.rows){ for (const ch of [r.chain_i, r.chain_j]){ if (ch == null || ch === '') continue; const k = r.name + ':::' + ch; if (seen.has(k)) continue; seen.add(k); out.push([r.name, ch, '', '', '', '', '']); } } }
+  const esc = (x) => { x = String(x == null ? '' : x); return /[,"\n]/.test(x) ? '"' + x.replace(/"/g, '""') + '"' : x; };
+  const blob = new Blob([out.map(row => row.map(esc).join(',')).join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'identity_map_template.csv';
+  document.body.appendChild(a); a.click(); setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch(e){} a.remove(); }, 1000);
+}
+async function convertNames(ids, species){   // names/IDs -> official symbols: mygene.info + UniProt fallback (GENE_SPECIES entry names)
+  const baseOf = new Map(ids.map(id=>[id, id.replace(/_\d+_\d+$/,'')])), bases=[...new Set(baseOf.values())], sym=new Map();
+  for (let i=0;i<bases.length;i+=800){
+    const chunk=bases.slice(i,i+800); $('status').textContent=`Converting (mygene.info)… ${Math.min(i+800,bases.length)}/${bases.length}`;
+    const body=new URLSearchParams(); body.set('q',chunk.join(',')); body.set('scopes','symbol,alias,retired,entrezgene,flybase,uniprot,ensembl.protein,refseq,accession'); body.set('fields','symbol'); if(species) body.set('species',species);
+    const res=await (await fetch('https://mygene.info/v3/query',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body})).json();
+    for (const h of res){ if(!h.notfound && h.symbol && !sym.has(h.query)) sym.set(h.query,h.symbol); }
+  }
+  const missing=bases.filter(b=>!sym.has(b)), accRE=/^([OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2})$/;
+  for (let i=0;i<missing.length;i+=80){
+    const chunk=missing.slice(i,i+80); $('status').textContent=`Converting (UniProt)… ${Math.min(i+80,missing.length)}/${missing.length}`;
+    const q=chunk.map(x=>accRE.test(x)?`accession:${x}`:`id:${x}`).join(' OR ');
+    const res=await (await fetch(`https://rest.uniprot.org/uniprotkb/search?query=${encodeURIComponent('('+q+')')}&fields=id,accession,gene_primary&format=json&size=500`)).json();
+    const m={}; for (const r of (res.results||[])){ const g=r.genes&&r.genes[0]&&r.genes[0].geneName&&r.genes[0].geneName.value; if(g){ m[r.uniProtkbId]=g; m[r.primaryAccession]=g; } }
+    for (const x of chunk){ if(m[x]) sym.set(x,m[x]); }
+  }
+  // Re-attach a fragment range (BASE_start_end) to the symbol: dropping it makes resolveStructure
+  // treat the fragment length as the full-length expectation and pick whatever protein is nearest.
+  const out=new Map(); for (const id of ids){ const s=sym.get(baseOf.get(id)); if(!s) continue; const m=id.match(/_(\d+_\d+)$/); out.set(id, m ? s+'_'+m[1] : s); } return out;
+}
+function maybeAutoConvertClip(){   // auto-run name→symbol conversion when loaded names look like IDs (FBpp/FBgn/entry name/accession)
+  if (!FILES.length || META) return;
+  const syms=new Set(); for (const f of FILES) for (const r of f.rows){ if(r.Symbol_1) syms.add(r.Symbol_1); if(r.Symbol_2) syms.add(r.Symbol_2); }
+  const ids=[...syms], idLike=ids.filter(n=>/^FB(pp|gn|tr)\d+$/i.test(n)||/_(HUMAN|MOUSE|RAT|YEAST|DROME|CAEEL|DANRE|ARATH|SCHPO|BOVIN|CHICK|XENLA|PIG|HORSE|RABIT)(_\d+_\d+)?$/i.test(n)||/^[A-NR-Z][0-9][A-Z0-9]{3}[0-9]/.test(n)||/^\d+$/.test(n)).length;
+  if (ids.length && idLike/ids.length >= 0.3){
+    const sp=$('mg-species');   // FlyBase IDs and UniProt mnemonic suffixes pin the organism
+    if (sp && !sp.value){
+      const INF = [['7227', n=>/^FB(gn|pp|tr)\d+/i.test(n)||/_DROME(_\d+_\d+)?$/i.test(n)], ['9606', n=>/_HUMAN(_\d+_\d+)?$/i.test(n)], ['10090', n=>/_MOUSE(_\d+_\d+)?$/i.test(n)], ['10116', n=>/_RAT(_\d+_\d+)?$/i.test(n)], ['6239', n=>/^WBGene\d+/i.test(n)||/_CAEEL(_\d+_\d+)?$/i.test(n)], ['7955', n=>/_DANRE(_\d+_\d+)?$/i.test(n)], ['559292', n=>/_YEAST(_\d+_\d+)?$/i.test(n)], ['3702', n=>/_ARATH(_\d+_\d+)?$/i.test(n)], ['83333', n=>/_ECOLI(_\d+_\d+)?$/i.test(n)]];
+      for (const [tx, fn] of INF){ if (ids.some(fn)){ sp.value = tx; break; } }
+    }
+    return autoConvertClip();
+  }
+}
+async function autoConvertClip(){   // convert loaded query/partner names to symbols -> build a name+chain identity map -> applyMetadata
+  if (!FILES.length){ $('status').textContent='Load a lis.py CSV first.'; return; }
+  const syms=new Set(); for (const f of FILES) for (const r of f.rows){ const a=r._oSym1||(r._oSym1=r.Symbol_1), b=r._oSym2||(r._oSym2=r.Symbol_2); if(a) syms.add(a); if(b) syms.add(b); }
+  const ids=[...syms], species=$('mg-species').value;
+  let clean; try { clean=await convertNames(ids, species); } catch(e){ $('status').textContent='Conversion error: '+(e.message||e); return; }
+  if (!clean.size){ $('status').textContent='No names could be converted — check the species.'; return; }
+  // An identity map is keyed by prediction name + chain, which a workbook sheet does not carry.
+  // Keying those rows anyway collapses every chain onto one key, relabeling the whole file as
+  // the last row's protein — so rename the symbols in place instead.
+  const keyed = FILES.some(f => f.rows.some(r => r.name != null && r.chain_i != null));
+  if (!keyed){
+    for (const f of FILES) for (const r of f.rows){
+      r.Symbol_1 = clean.get(r._oSym1) || r._oSym1;
+      r.Symbol_2 = clean.get(r._oSym2) || r._oSym2;
+    }
+    for (const [oldSym, newSym] of clean){        // ids follow the rename, and the old name is itself resolvable
+      if (oldSym === newSym) continue;
+      const set = XLSX_IDS[newSym] = XLSX_IDS[newSym] || new Set();
+      for (const v of (XLSX_IDS[oldSym] || [])) set.add(v);
+      set.add(oldSym);
+    }
+    applyXlsxIds();
+    rebuildGenes();
+    $('status').textContent=`Converted ${clean.size}/${ids.length} names → symbols — pick a query and generate`;
+    return;
+  }
+  const _old = META, _gs = _old && _old.startK, _ge = _old && _old.endK;   // preserve fragment start/end from a loaded identity map — dropping them shifts partial-protein highlights onto the local 1..N coords
+  const byKey={};
+  for (const f of FILES) for (const r of f.rows){
+    const _ki = r.name+':::'+String(r.chain_i), _kj = r.name+':::'+String(r.chain_j);
+    const _oi = _old && _old.byKey[_ki], _oj = _old && _old.byKey[_kj];
+    byKey[_ki]={ symbol: clean.get(r._oSym1)||r._oSym1, orig:r._oSym1, start:(_gs&&_oi)?_oi[_gs]:null, end:(_ge&&_oi)?_oi[_ge]:null };
+    byKey[_kj]={ symbol: clean.get(r._oSym2)||r._oSym2, orig:r._oSym2, start:(_gs&&_oj)?_oj[_gs]:null, end:(_ge&&_oj)?_oj[_ge]:null };
+  }
+  META={ byKey, cols:['symbol','orig'], nameK:'name', chainK:'chain', startK:(_gs&&_ge)?'start':null, endK:(_gs&&_ge)?'end':null };
+  META_LABELCOL='symbol';
+  const sel=$('meta-label'); sel.innerHTML=''; for(const c of META.cols){ const o=document.createElement('option'); o.value=c; o.textContent=c; sel.appendChild(o); } sel.value='symbol';
+  $('meta-label-wrap').classList.remove('hidden');
+  applyMetadata();
+  $('status').textContent=`Converted ${clean.size}/${ids.length} names → symbols — pick a query and generate`;
+}
+function rebuildGenes(){
+  const partners = {}, lenOf = {};   // symbol → distinct partners (# predictions) + aa length
+  for (const f of FILES){
+    for (const r of f.rows){ const a=r.Symbol_1, b=r.Symbol_2; if(!a||!b) continue;
+      (partners[a]=partners[a]||new Set()).add(b);
+      (partners[b]=partners[b]||new Set()).add(a);
+      if (lenOf[a]==null){ const l=+r.Protein_Len_A; if(l) lenOf[a]=l; }
+      if (lenOf[b]==null){ const l=+r.Protein_Len_B; if(l) lenOf[b]=l; } }
+  }
+  const genes = Object.keys(partners).sort((x,y)=>partners[y].size-partners[x].size);   // most-connected first
+  const sel = $('gene'); sel.innerHTML='';
+  for (const g of genes) { const o=document.createElement('option'); o.value=g; o.textContent=`${g} (${partners[g].size} predictions${lenOf[g]?', '+lenOf[g]+' aa':''})`; sel.appendChild(o); }
+  $('run').disabled = genes.length===0;
+  preselectBait(sel);
+  rebuildSubsetPicker();
+}
+
+// Query for a hand-off (?data=…&gene= or a postMessage livia-load with gene). Looked up in ALL the rows
+// rather than only among the dropdown's options — never silently replaced by another protein (a network
+// viewer handing cLIP one shared bundle of thousands of proteins opened the wrong query for most of them,
+// back when the dropdown was capped at the 500 most-connected). A requested name that is not in the data
+// stops with a message. No request: the protein present in the most rows (the bait).
+function pickHandoffQuery(sel, want){
+  if (want){
+    const w = String(want).toLowerCase();
+    let o = [...sel.options].find(x => x.value.toLowerCase() === w);
+    if (o) return o;
+    const partners = {}, lenOf = {};
+    for (const f of FILES) for (const r of f.rows){ const a = r.Symbol_1, b = r.Symbol_2; if (!a || !b) continue;
+      (partners[a] = partners[a] || new Set()).add(b); (partners[b] = partners[b] || new Set()).add(a);
+      if (lenOf[a] == null && +r.Protein_Len_A) lenOf[a] = +r.Protein_Len_A;
+      if (lenOf[b] == null && +r.Protein_Len_B) lenOf[b] = +r.Protein_Len_B; }
+    const hit = Object.keys(partners).find(g => g.toLowerCase() === w);
+    if (!hit){ $('status').textContent = `⚠ "${want}" is not in this data — pick a query from the list`; return null; }
+    o = document.createElement('option'); o.value = hit;
+    o.textContent = `${hit} (${partners[hit].size} predictions${lenOf[hit] ? ', ' + lenOf[hit] + ' aa' : ''})`;
+    sel.appendChild(o);
+    return o;
+  }
+  const c = {};
+  for (const f of FILES) for (const r of f.rows){ if (r.Symbol_1) c[r.Symbol_1] = (c[r.Symbol_1]||0)+1; if (r.Symbol_2) c[r.Symbol_2] = (c[r.Symbol_2]||0)+1; }
+  const top = Object.keys(c).sort((a,b)=>c[b]-c[a])[0];
+  return [...sel.options].find(x => x.value === top) || sel.options[0];
+}
+// Bait-vs-library screens put one protein in Symbol_1 on nearly every row. Select it, so a
+// single-bait file (a collaborator's workbook, say) opens on the protein it is about rather
+// than on whichever partner happens to sort first.
+function preselectBait(sel){
+  const n = FILES.reduce((s,f)=>s+f.rows.length, 0);
+  if (!n) return;
+  const c = {};
+  for (const f of FILES) for (const r of f.rows){ const s = r.Symbol_1; if (s) c[s] = (c[s]||0)+1; }
+  const top = Object.keys(c).sort((x,y)=>c[y]-c[x])[0];
+  if (top && c[top] >= 0.8*n && [...sel.options].some(o=>o.value===top)) sel.value = top;
+}
+
+// ── Subset picker (5th loader): choose which of the query's partners to cluster ──
+let PARTNER_EXCLUDE = new Set();   // partner symbols to drop before clustering
+function queryPartners(gene){
+  const set = new Set();
+  for (const f of FILES) for (const r of f.rows){
+    if (r.Symbol_1 === gene) set.add(r.Symbol_2);
+    else if (r.Symbol_2 === gene) set.add(r.Symbol_1);
+  }
+  return [...set].filter(Boolean).sort();
+}
+function updateSubsetStat(total){
+  const checked = [...document.querySelectorAll('.subset-cb')].filter(c => c.checked).length;
+  $('subset-stat').textContent = `${checked} / ${total} partners`;
+}
+function rebuildSubsetPicker(){
+  const gene = $('gene').value, wrap = $('subset-wrap'), box = $('subset-list');
+  if (!wrap || !box) return;
+  const partners = (gene && gene !== '\u2014' && FILES.length) ? queryPartners(gene) : [];
+  const cw = $('clip-clust-wrap'); if (cw){ cw.classList.toggle('hidden', partners.length < 2); if (partners.length >= 2) clipClustStat(); }
+  if (partners.length < 2){ wrap.classList.add('hidden'); return; }
+  box.innerHTML = '';
+  for (const pt of partners){
+    const lab = document.createElement('label'); lab.style.cssText = 'white-space:nowrap;';
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.className = 'subset-cb'; cb.value = pt; cb.checked = !PARTNER_EXCLUDE.has(pt); cb.style.accentColor = '#1a5276';
+    cb.onchange = () => { if (cb.checked) PARTNER_EXCLUDE.delete(pt); else PARTNER_EXCLUDE.add(pt); updateSubsetStat(partners.length); };
+    lab.appendChild(cb); lab.appendChild(document.createTextNode(' ' + pt)); box.appendChild(lab);
+  }
+  wrap.classList.remove('hidden');
+  updateSubsetStat(partners.length);
+}
+// ── Subset review list: download (converted + ORIGINAL names, partial/full, dup counts) / re-upload ──
+function partnerReviewInfo(gene){
+  const info = {};
+  for (const f of FILES) for (const r of f.rows){
+    let pt, oOrig, pLen;
+    if (r.Symbol_1 === gene){ pt = r.Symbol_2; oOrig = r._oSym2 != null ? r._oSym2 : r.Symbol_2; pLen = +r.Protein_Len_B || 0; }
+    else if (r.Symbol_2 === gene){ pt = r.Symbol_1; oOrig = r._oSym1 != null ? r._oSym1 : r.Symbol_1; pLen = +r.Protein_Len_A || 0; }
+    else continue;
+    if (!pt) continue;
+    const e = info[pt] || (info[pt] = { names:new Set(), origSyms:new Set(), ranks:new Set(), nRows:0, frags:new Set() });
+    e.nRows++;
+    if (r.name != null) e.names.add(r.name);
+    if (oOrig != null) e.origSyms.add(oOrig);
+    if (r.Rank != null && r.Rank !== '') e.ranks.add(Math.trunc(+r.Rank));
+    let fr = null; try { fr = CLIPResolver.parseFragmentRange(pt, pLen); } catch(_){}
+    if (!fr && typeof LABEL_FRAG !== 'undefined' && LABEL_FRAG[pt]) fr = LABEL_FRAG[pt];
+    if (fr) e.frags.add(fr.start + '-' + fr.end);
+  }
+  return info;
+}
+function _csvEsc(x){ x = String(x == null ? '' : x); return /[,"\n]/.test(x) ? '"' + x.replace(/"/g,'""') + '"' : x; }
+function _saveCsv(text, fname){
+  const blob = new Blob([text], { type:'text/csv' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = fname;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch(_){} a.remove(); }, 1000);
+}
+function downloadSubsetList(){
+  const gene = $('gene').value;
+  if (!gene || gene === '—' || !FILES.length) return;
+  const partners = queryPartners(gene); if (!partners.length) return;
+  const info = partnerReviewInfo(gene);
+  const out = [['partner','original_name(s)','original_symbol(s)','type','n_rows','n_ranks','include']];
+  for (const pt of partners){
+    const e = info[pt] || { names:new Set(), origSyms:new Set(), ranks:new Set(), nRows:0, frags:new Set() };
+    const type = e.frags.size ? 'partial:' + [...e.frags].join(';') : 'full';
+    out.push([pt, [...e.names].join(';'), [...e.origSyms].join(';'), type, e.nRows, e.ranks.size, PARTNER_EXCLUDE.has(pt) ? 0 : 1]);
+  }
+  _saveCsv(out.map(row => row.map(_csvEsc).join(',')).join('\n'), 'clip_' + gene + '_partners.csv');
+}
+function uploadSubsetList(text){
+  const gene = $('gene').value;
+  const present = new Set(queryPartners(gene));
+  const parsed = CLIPPipeline.parseCSV(text), rows = parsed.rows || [];
+  const excl = new Set(); let unknown = 0;
+  const truthy = (v) => { const s = String(v == null ? '' : v).trim().toLowerCase(); return !(s==='0'||s==='false'||s==='no'||s==='exclude'||s==='n'||s===''); };
+  for (const r of rows){
+    const pt = String(r.partner != null ? r.partner : (r.Partner || '')).trim(); if (!pt) continue;
+    if (!present.has(pt)) { unknown++; continue; }
+    if (!truthy(r.include != null ? r.include : r.Include)) excl.add(pt);
+  }
+  PARTNER_EXCLUDE = excl; rebuildSubsetPicker();
+  $('status').textContent = 'subset applied — ' + (present.size - excl.size) + '/' + present.size + ' partners included' + (unknown ? ' · ' + unknown + ' not found for ' + gene + ' (ignored)' : '');
+}
+function downloadFilteredLis(){
+  const gene = $('gene').value;
+  if (!gene || gene === '—' || !FILES.length) return;
+  const rows = FILES.flatMap(f=>f.rows).filter(r => { const pt = r.Symbol_1===gene ? r.Symbol_2 : (r.Symbol_2===gene ? r.Symbol_1 : null); return pt && !PARTNER_EXCLUDE.has(pt); });
+  if (!rows.length) return;
+  const cols = [...new Set(rows.flatMap(r => Object.keys(r)))].filter(k => k[0] !== '_'); cols.push('original_name');
+  const body = rows.map(r => cols.map(c => _csvEsc(c==='original_name' ? r.name : r[c])).join(','));
+  _saveCsv([cols.join(','), ...body].join('\n'), 'clip_' + gene + '_filtered.csv');
+}
+// The paired FASTA that matches the lis.py output above — one ">Sym1___Sym2" record per included
+// partner, sequences joined by ':'. Lets people see exactly the format cLIP expects so they can
+// build their own from a screen.
+function downloadFilteredFasta(){
+  const gene = $('gene').value;
+  if (!gene || gene === '—' || !FILES.length) return;
+  if (!FASTA_PARSE || !FASTA_PARSE.seqs.length){ $('status').textContent = 'No FASTA loaded — drop sequences first, then download.'; return; }
+  const rows = FILES.flatMap(f=>f.rows).filter(r => { const pt = r.Symbol_1===gene ? r.Symbol_2 : (r.Symbol_2===gene ? r.Symbol_1 : null); return pt && !PARTNER_EXCLUDE.has(pt); });
+  const seen = new Set(); let out = '', miss = 0;
+  for (const r of rows){
+    const key = r.Symbol_1 + '___' + r.Symbol_2; if (seen.has(key)) continue; seen.add(key);
+    const q1 = seqForSymbol(r.Symbol_1, parseInt(r.Protein_Len_A,10)||0), q2 = seqForSymbol(r.Symbol_2, parseInt(r.Protein_Len_B,10)||0);
+    if (!q1 || !q2){ miss++; continue; }
+    out += `>${r.Symbol_1}___${r.Symbol_2}\n${q1}:${q2}\n`;
+  }
+  if (!out){ $('status').textContent = 'No sequences matched the selected partners.'; return; }
+  const blob = new Blob([out], { type:'text/plain' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'clip_' + gene + '_sequences.fasta';
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch(_){} a.remove(); }, 1000);
+  if (miss) $('status').textContent = `FASTA downloaded · ${miss} partner(s) had no sequence in the loaded FASTA`;
+}
+function updateLoaded(){
+  $('ld-csv').textContent = FILES.length ? `✓ ${FILES.length} file${FILES.length>1?'s':''}` : '';
+  const nf = FASTA_PARSE ? FASTA_PARSE.seqs.length : 0;
+  $('ld-fasta').textContent = nf ? `✓ ${nf} seq${FASTA_WARN.length ? ` ⚠${FASTA_WARN.length}` : ''}` : '';
+  $('ld-struct').textContent = STRUCT_FILE ? `✓ ${STRUCT_FILE.name}` : '';
+  $('ld-meta').textContent = META ? '✓ identity map' : '';
+  { const sw = $('skel-wrap'); if (sw) sw.classList.toggle('hidden', !FILES.length); }
+  $('status').textContent = FILES.length ? `${$('gene').options.length} proteins — pick a query and generate.` : 'Drop a lis.py CSV to begin.';
+  if (FILES.length && !$('gene').options.length) { const cols = Object.keys((FILES.find((f) => f.rows && f.rows[0]) || { rows: [{}] }).rows[0] || {}); $('status').textContent = `No protein could be read: cLIP needs lis.py's columns (name, iLIS and the residue columns cLIR_indices_i / cLIR_indices_j). ${cols.length ? `This file has: ${cols.slice(0, 12).join(', ')}${cols.length > 12 ? ', …' : ''}.` : 'The file could not be read as a table.'}`; }
+  { const tr = FILES.reduce((n,f)=>n+f.rows.length,0); if (tr > 500000) $('status').textContent += ` ⚠ ${Math.round(tr/1000)}K predictions (~${Math.round(tr*1030/1e6)} MB in memory) — very large loads can hit the browser memory limit; split by query if a tab crashes.`; }
+}
+
+let WASM_P = null;
+function ensureWasm(){
+  if (window.LiviaWasm) return window.LiviaWasm.ready();
+  if (!WASM_P){
+    WASM_P = new Promise((res)=>{
+      const s = document.createElement('script');
+      s.src = 'js/livia-wasm.js?v=20261115a';
+      s.onload = () => { if (!window.LiviaWasm) WASM_P = null; (window.LiviaWasm ? window.LiviaWasm.ready() : Promise.resolve(false)).then(res); };
+      s.onerror = () => { s.remove(); WASM_P = null; res(false); };
+      document.head.appendChild(s);
+    });
+  }
+  return WASM_P;
+}
+
+$('run').onclick = () => {
+  PAIR_DOMAINS = {}; PAIR_SEQ = {};
+  if (LAST) LAST._resolved = false;
+  const gene = $('gene').value;
+  const tn = $('topn').value.trim();   // blank = all partners (no cap)
+  const _cut = parseFloat($('ilis').value);   // 0 is a legitimate cutoff — `||` would swallow it
+  const opts = { ilisCutoff: Number.isFinite(_cut) ? _cut : 0.223, topN: tn==='' ? Infinity : (parseInt(tn)||Infinity), sortBy:'iLIS', onePerPartner: !!($('one-per-partner') && $('one-per-partner').checked),
+    fastaParse: FASTA_PARSE, alignMap: (window.CLIPResolver && CLIPResolver.alignMap) };   // normalize mixed full/partial constructs onto one frame
+  $('status').textContent = 'clustering…';
+  setTimeout(async () => {
+    await ensureWasm();
+    const t0 = performance.now();
+    const allRows = FILES.flatMap(f=>f.rows);
+    const rows = PARTNER_EXCLUDE.size ? allRows.filter(r => { const pt = r.Symbol_1===gene ? r.Symbol_2 : (r.Symbol_2===gene ? r.Symbol_1 : null); return !(pt && PARTNER_EXCLUDE.has(pt)); }) : allRows;
+    const RESCOL = ['cLIR_indice_A', 'cLIR_indice_B', 'cLIR_indices_i', 'cLIR_indices_j'];   // the contact residues cLIP clusters on
+    if (rows.length && !rows.some((r) => RESCOL.some((k) => r[k] != null && String(r[k]).trim() !== ''))) {
+      $('status').textContent = 'This table has scores but no interaction residues (lis.py’s cLIR_indices columns), so cLIP cannot cluster the partners. Load the lis.py output for these pairs; for a network from the LIVIA Atlas, the protein’s Atlas page clusters its partners.'; return; }
+    const pipe = CLIPPipeline.runPipelineRows(rows, gene, opts);
+    if (pipe.fingerprints.length < 2){ $('status').textContent = `Only ${pipe.fingerprints.length} partner(s) passed filtering — need ≥2.`; return; }
+    const cl = CLIPCluster.clusterInteractions(pipe.fingerprints, { maxK:30, dropThreshold:0.05 });
+    { const cnt = {}; for (const l of cl.labels) cnt[l] = (cnt[l]||0)+1;                     // renumber clusters by size: largest = cluster 1
+      const remap = {}; Object.keys(cnt).map(Number).sort((a,b) => cnt[b]-cnt[a] || a-b).forEach((old,i) => remap[old]=i+1);
+      cl.labels = cl.labels.map(l => remap[l]); }
+    if (clipUserClusterMode()) applyUserClusters(cl, pipe);   // user's partner->cluster map wins (tree kept)
+    const order = CLIPCluster.leafOrder(cl.Z, pipe.fingerprints.length);
+    LAST = { gene, opts, pipe, cl, order, ms: performance.now()-t0 };
+    render(LAST);
+    $('status').textContent = `done in ${LAST.ms.toFixed(0)} ms`;
+    resolve3D(LAST);   // async, best-effort — fills the 3D card when ready
+  }, 20);
+};
+
+function render(A){
+  const { gene, pipe, cl, order } = A;
+  const n = pipe.fingerprints.length, k = cl.optimalK, plen = pipe.proteinLen;
+  const uniqueP = new Set(pipe.rows.map(r => r.Symbol_2)).size;
+  ACTIVE = new Set(Array.from({length:k},(_,i)=>i+1));
+  TABLE_SORT = null; TABLE_FILTER = ''; SCATTER_HL = '';
+  { const a=$('ptable-search'), b=$('scatter-search'); if(a){a.value='';a.classList.remove('nf');} if(b){b.value='';b.classList.remove('nf');} }
+  $('report').classList.remove('hidden');
+  $('title').textContent = A.opts && A.opts.onePerPartner ? `${gene} — interactome (${uniqueP} partners, one prediction each, ${k} clusters)` : `${gene} — interactome (${uniqueP} partners, ${n} predictions, ${k} clusters)`;
+  { const nt = $('chip-n-note'); if (nt) nt.innerHTML = A.opts && A.opts.onePerPartner ? '&nbsp;&nbsp;(the <b>(N)</b> on each cluster chip — partners, one prediction each).' : '&nbsp;&nbsp;(the <b>(N)</b> on each cluster chip — AlphaFold ranks, not unique partners).'; }
+  const _norm = pipe.constructNorm || {};
+  $('subtitle').textContent = `query length ${plen} aa · ` + (cl.commNames ? 'clusters: user-defined · tree = fingerprint similarity' : 'cosine + average linkage · silhouette-optimal k')
+    + (_norm.remapped ? ` · ⤳ ${_norm.remapped} partial-construct row${_norm.remapped>1?'s':''} remapped to full-length coordinates` : '')
+    + (_norm.mixed && !_norm.remapped ? ` · ⚠ mixed full/partial constructs detected — add the paired FASTA so coordinates can be unified` : '');
+  $('s-partners').textContent = uniqueP; $('s-predictions').textContent = n; $('s-clusters').textContent = k; $('s-len').textContent = plen;
+  populateAxes(A);   // fill X/Y axis options from the metrics present in the data
+  renderHeatmap(A); renderFreq(A); renderPairTracks(A); renderScatter(A); renderTable(A); renderClusterInfo(A);
+  CHIP_CONTAINERS.forEach(id => renderChipBar(id, A));
+  $('scatter-x').onchange = $('scatter-y').onchange = () => renderScatter(LAST);
+  { const sp = $('scatter-points'); if (sp) sp.onchange = () => renderScatter(LAST); }
+  { const ps = $('ptable-search'); if (ps) ps.oninput = () => { TABLE_FILTER = ps.value.trim(); if (LAST) renderTable(LAST); }; }
+  { const ss = $('scatter-search');
+    if (ss){
+      const apply = () => { SCATTER_HL = ss.value.trim(); if (LAST) renderScatter(LAST); };
+      ss.onchange = apply;                                                   // datalist pick / commit
+      ss.onkeydown = (e) => { if (e.key==='Enter'){ e.preventDefault(); apply(); } };
+      ss.oninput = () => { if (ss.value===''){ SCATTER_HL=''; ss.classList.remove('nf'); if (LAST) renderScatter(LAST); } };
+    } }
+  $('svg-freq').onclick = () => { if (LAST) downloadSVG(`clip_${LAST.gene}_frequency.svg`, svgFreq(LAST, svgOpts())); };
+  $('svg-heatmap').onclick = () => { if (LAST) downloadSVG(`clip_${LAST.gene}_fingerprint.svg`, svgHeatmap(LAST, heatOpts())); };
+  $('commonality').onchange = () => {                   // a preset (10–90%), or "custom…" for any value from 1 to 100%
+    if ($('commonality').value === 'custom') { $('commonality-custom').classList.remove('hidden'); $('commonality-pct').value = +(COMMONALITY * 100).toFixed(1); $('commonality-pct').focus(); $('commonality-pct').select(); return; }   // selected: typing replaces the value
+    $('commonality-custom').classList.add('hidden'); COMMONALITY = +$('commonality').value; if (LAST) recolor3D(LAST); };
+  $('commonality-pct').onchange = () => {
+    const pct = Math.min(100, Math.max(1, parseFloat($('commonality-pct').value) || 50));
+    $('commonality-pct').value = pct; COMMONALITY = pct / 100; if (LAST) recolor3D(LAST); };
+  { const _mc = $('min-cluster'); if (_mc) _mc.onchange = () => { MIN_CLUSTER = Math.max(1, +$('min-cluster').value || 1); if (LAST) recolor3D(LAST); }; }
+  document.querySelectorAll('.cmode').forEach(el => el.onclick = () => {
+    document.querySelectorAll('.cmode').forEach(x => x.classList.remove('sel')); el.classList.add('sel');
+    COLOR3D = el.dataset.mode; const w = $('am-cut-wrap'); if (w) w.classList.toggle('hidden', COLOR3D !== 'am');
+    if (LAST) recolor3D(LAST);
+  });
+  $('am-cutoff').onchange = () => { AM_CUTOFF = +$('am-cutoff').value; if (LAST) recolor3D(LAST); };
+  $('palette').onchange = () => { PALETTE = $('palette').value; if (LAST) redraw(LAST); };
+  // Custom cluster colors: upload/paste "cluster,#hex" (cluster = 1,2,… or C1,C2,…). Wins over the palette.
+  { const _cu = $('clustercolor-upload'); if (_cu && !_cu.dataset.wired) { _cu.dataset.wired = '1';
+    LiviaMaps.attachColorUpload(_cu, {
+      label: 'cluster colors', keyHeader: 'cluster',
+      currentRows: () => { if (!LAST || !LAST.cl) return []; const k = Math.max(0, ...LAST.cl.labels); const rows=[]; for (let c=1;c<=k;c++) rows.push({ key:'C'+c, color: clusterColor(c,k) }); return rows; },
+      apply: (rows) => {
+        let applied=0;
+        for (const {key,color} of rows){ const id = parseInt(String(key).replace(/^[Cc]/,''),10); if(!id) continue; CLUSTER_OVERRIDE[id]=color; applied++; }
+        if (applied && LAST) redraw(LAST);
+        return applied;
+      },
+    }); } }
+}
+
+function mergeRuns(fp){
+  const s = fp.slice().sort((a,b)=>a-b), out=[]; if(!s.length) return out;
+  let a=s[0], p=s[0];
+  for(let i=1;i<s.length;i++){ if(s[i]===p+1) p=s[i]; else { out.push([a,p]); a=s[i]; p=s[i]; } }
+  out.push([a,p]); return out;
+}
+// Residue x-tick counts (user-adjustable). Fingerprint + frequency share the aligned axis (#clip-xticks);
+// the Interaction-Residues interface map has its own (#pair-xticks).
+function clipXTicks(){ return Math.max(2, Math.min(40, parseInt((document.getElementById('clip-xticks')||{}).value) || 15)); }
+function pairXTicks(){ return Math.max(2, Math.min(40, parseInt((document.getElementById('pair-xticks')||{}).value) || 10)); }
+
+function renderHeatmap(A){
+  const { pipe, cl } = A, plen = pipe.proteinLen, k = cl.optimalK;
+  const showAll = !ACTIVE || ACTIVE.size === k;
+  const order = showAll ? A.order : A.order.filter(idx => ACTIVE.has(cl.labels[idx]));   // cluster chips: show only selected clusters' rows (dendrogram auto-hides when filtered, since Z.length !== n-1)
+  const n = order.length || 1;
+  // sns.clustermap-style: row dendrogram | cluster row_colors strip |
+  // binary contact matrix in Blues (non-cLIR = Blues min, cLIR = Blues max), rows in dendrogram
+  // order, residue-number x-ticks. Integer buffer px → no seams. AX_L holds the dendrogram + strip
+  // and is shared with the frequency plot, so residue columns stay aligned.
+  const S = 2, W = PLOT_W, AXB = 22, H = 238 + AXB;               // AXB = bottom tick strip; rows 30% shorter
+  const rowsHb = (H - AXB) * S;
+  const BW = W * S, BH = H * S;
+  const cv = $('heatmap'); cv.width = BW; cv.height = BH;
+  cv.style.width = '100%'; cv.style.height = 'auto';
+  const ctx = cv.getContext('2d'); ctx.clearRect(0, 0, BW, BH);
+  const Z = cl.Z || [];
+  const R = clipAXR(), byCl = CLIP_STYLE === 'cluster';
+  const step = (W - AX_L - R) / plen;
+  const edge = (r) => Math.round((AX_L + (r - 1) * step) * S);
+  const rowTop = (row) => Math.round(row * rowsHb / n);
+  const rowMid = (row) => (rowTop(row) + rowTop(row + 1)) / 2;
+  const dendroX0 = 2 * S, dendroX1 = 28 * S;                      // dendrogram area (left)
+  const stripX0 = 31 * S, stripX1 = Math.round((AX_L - 8) * S);   // cluster row_colors strip
+  const BG = byCl ? '#ffffff' : '#f7fbff', CONTACT = '#08306b';   // pure white in by-cluster mode; Blues min / max in classic mode
+  const resX0 = Math.round(AX_L * S), resX1 = Math.round((W - R) * S);
+  for (let row = 0; row < n; row++){
+    const idx = order[row], y0 = rowTop(row), hh = Math.max(1, rowTop(row + 1) - y0);
+    ctx.fillStyle = clusterColor(cl.labels[idx], k);
+    ctx.fillRect(stripX0, y0, stripX1 - stripX0, hh);            // left strip = cluster
+    ctx.fillStyle = BG; ctx.fillRect(resX0, y0, resX1 - resX0, hh);
+    ctx.fillStyle = byCl ? clusterColor(cl.labels[idx], k) : CONTACT;
+    for (const [s, e] of mergeRuns(pipe.fingerprints[idx])){       // merged runs → no residue gaps
+      const x0 = edge(s), x1 = Math.max(x0 + 1, edge(e + 1));
+      ctx.fillRect(x0, y0, x1 - x0, hh);
+    }
+  }
+  if (byCl) { ctx.strokeStyle = '#d5dde6'; ctx.lineWidth = S; ctx.strokeRect(resX0 + 0.5 * S, 0.5 * S, resX1 - resX0 - S, rowsHb - S); }
+  // row dendrogram — leaves at the right edge of the dendro area, root at the left; x ∝ merge distance
+  if (Z.length === n - 1 && n >= 2){
+    const yv = {}, xv = {};
+    for (let row = 0; row < n; row++){ const id = order[row]; yv[id] = rowMid(row); xv[id] = dendroX1; }
+    const maxD = Z[Z.length - 1][2] || 1;
+    for (let m = 0; m < Z.length; m++){ const a = Z[m][0], b = Z[m][1], id = n + m; yv[id] = (yv[a] + yv[b]) / 2; xv[id] = dendroX0 + (dendroX1 - dendroX0) * (1 - Z[m][2] / maxD); }
+    ctx.strokeStyle = '#555'; ctx.lineWidth = 1; ctx.beginPath();
+    for (let m = 0; m < Z.length; m++){ const a = Z[m][0], b = Z[m][1], xm = xv[n + m];
+      ctx.moveTo(xv[a], yv[a]); ctx.lineTo(xm, yv[a]);
+      ctx.moveTo(xv[b], yv[b]); ctx.lineTo(xm, yv[b]);
+      ctx.moveTo(xm, yv[a]); ctx.lineTo(xm, yv[b]);
+    }
+    ctx.stroke();
+  }
+  if (byCl && R > AX_R){   // each cluster's block of rows, labeled at the right
+    ctx.font = `600 ${9 * S}px sans-serif`; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    for (const b of clusterBlocks(A, order)){ const y0 = rowTop(b.start), y1 = rowTop(b.end + 1); if (y1 - y0 < 8 * S) continue;
+      ctx.fillStyle = clusterColor(b.c, k); ctx.fillRect(resX1 + 2 * S, (y0 + y1) / 2 - S / 2, 4 * S, S);
+      ctx.fillText(fitLabel(b.label, (R - 12) * S, (t) => ctx.measureText(t).width), resX1 + 8 * S, (y0 + y1) / 2); }
+  }
+  // residue-number x-axis ticks (~15 evenly spaced; centered on the cell, aligned with frequency)
+  ctx.fillStyle = '#333'; ctx.strokeStyle = '#ccc'; ctx.lineWidth = 1;
+  ctx.font = `${9 * S}px sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  const nT = clipXTicks(), ticks = [];
+  for (let i = 0; i < nT; i++){ const r = Math.round(1 + i * (plen - 1) / (nT - 1)); if (!ticks.includes(r)) ticks.push(r); }
+  for (const r of ticks){ const x = edge(r) + step * S / 2; ctx.beginPath(); ctx.moveTo(x, rowsHb); ctx.lineTo(x, rowsHb + 3 * S); ctx.stroke(); ctx.fillText(String(r + (A._fragOffset||0)), x, rowsHb + 5 * S); }
+  const at = (e) => {                                   // the row (prediction) and residue under the pointer
+    const b = cv.getBoundingClientRect(), x = (e.clientX - b.left) * W / b.width, y = (e.clientY - b.top) * H / b.height;
+    if (y < 0 || y >= H - AXB || x < 31) return null;
+    const idx = order[Math.min(n - 1, Math.floor(y / (H - AXB) * n))];
+    return idx == null ? null : { idx, r: Math.floor((x - AX_L) / step) + 1 };
+  };
+  cv.onmousemove = (e) => {
+    const h = at(e); if (!h){ cv.style.cursor = ''; return hideTip(); }
+    cv.style.cursor = 'pointer';
+    const row = pipe.rows[h.idx], c = cl.labels[h.idx];
+    const res = h.r >= 1 && h.r <= plen ? `<br>residue ${_esc(residueLabel(A, h.r))}${pipe.fingerprints[h.idx].includes(h.r) ? ' \u00b7 contact' : ''}` : '';
+    showTip(`<b>${_esc(row.Symbol_2 || '')}</b>${row.Rank ? ' \u00b7 rank ' + _esc(row.Rank) : ''} \u00b7 iLIS ${(+row.iLIS || 0).toFixed(3)} \u00b7 `
+      + `<span style="color:${clusterColor(c, k)}">\u25cf</span> ${clusterName(c)}${res}<br><span style="color:#b9c6d6">click: its residues below</span>`, e.clientX, e.clientY);
+  };
+  cv.onmouseleave = () => { cv.style.cursor = ''; hideTip(); };
+  cv.onclick = (e) => {                                 // open that partner in the Interaction residues panel
+    const h = at(e); if (!h) return; hideTip();
+    const sel = $('pair-partner'), p = pipe.rows[h.idx].Symbol_2;
+    if (!sel || ![...sel.options].some((o) => o.value === p)) return;
+    sel.value = p; if (sel.onchange) sel.onchange();
+    $('pair-card').scrollIntoView({ behavior: 'auto', block: 'start' });
+  };
+}
+
+// ── Reported in BioGRID: partners with an interaction reported with the query, marked as in the LIVIA Atlas cluster
+// list (physical light blue, genetic light orange, both light orchid). Asked through LIVIA's proxy Worker (only NCBI Gene IDs
+// and a taxon leave the page; the BioGRID key stays server-side), 40 genes per request, so the query and 39 partners at a time.
+// The answer is kept on the analysis (A.bg), so an exported report shows it offline.
+const BG_PROXY = ((window.LIVIA_CONFIG && window.LIVIA_CONFIG.proxy) || 'https://livia-proxy.flyark.workers.dev') + '/?biogrid=1';
+const BG_TAXA = ['9606', '7227', '10090', '10116', '6239', '7955', '559292', '3702'];
+async function mgGeneIds(syms, tax){   // symbol -> { id, tax, byTax: Map(tax -> id) } from mygene.info (one taxon, or the model organisms)
+  const out = new Map(), baseOf = (s) => String(s).replace(/_\d+_\d+$/, '');
+  const bases = [...new Set(syms.map(baseOf))];
+  for (let i = 0; i < bases.length; i += 900){
+    const body = new URLSearchParams(); body.set('q', bases.slice(i, i + 900).join(',')); body.set('scopes', 'symbol,alias');
+    body.set('fields', 'entrezgene,taxid'); body.set('species', tax || BG_TAXA.join(','));
+    const r = await fetch('https://mygene.info/v3/query', { method: 'POST', body }); if (!r.ok) throw new Error('mygene ' + r.status);
+    for (const h of await r.json()){
+      if (!h || h.notfound || !h.entrezgene) continue;
+      const id = String(h.entrezgene), tx = String(h.taxid);
+      if (!out.has(h.query)) out.set(h.query, { id, tax: tx, byTax: new Map([[tx, id]]) });
+      else if (!out.get(h.query).byTax.has(tx)) out.get(h.query).byTax.set(tx, id);
+    }
+  }
+  const res = new Map();
+  for (const s of syms){ const hit = out.get(baseOf(s)); if (hit) res.set(s, hit); }
+  return res;
+}
+async function loadReported(A){
+  const q = A.gene, partners = [...new Set(A.pipe.rows.map(r => r.Symbol_2))].filter(p => p && p !== q);
+  const pick = $('mg-species'); let tax = pick && pick.value ? pick.value : '';
+  const key = q + '|' + tax + '|' + partners.length;
+  if (A.bg && A.bg.key === key) return;
+  A.bg = { key, status: 'checking', map: {} }; renderClusterInfo(A);
+  try {
+    const ids = await mgGeneIds([q].concat(partners), tax), qi = ids.get(q);
+    const qId = qi && (tax ? qi.byTax.get(tax) : qi.id);
+    if (!qi || !qId){ A.bg = { key, status: 'nogene', map: {} }; return renderClusterInfo(A); }
+    tax = tax || qi.tax;
+    const byId = new Map();
+    for (const p of partners){ const g = ids.get(p), pid = g && g.byTax.get(tax); if (pid && pid !== qId) byId.set(pid, p); }
+    const pids = [...byId.keys()], map = {};
+    for (let i = 0; i < pids.length; i += 39){
+      const r = await fetch(BG_PROXY + '&ids=' + encodeURIComponent([qId].concat(pids.slice(i, i + 39)).join(',')) + '&taxId=' + tax);
+      const d = await r.json(); if (!r.ok || d.error) throw new Error(d.error || ('proxy ' + r.status));
+      for (const [k, v] of Object.entries(d.pairs || {})){ const [a, b] = k.split('|'), other = a === qId ? b : b === qId ? a : null;
+        if (other && byId.has(other)) map[byId.get(other)] = { ph: v.physical || 0, ge: v.genetic || 0 }; }
+    }
+    A.bg = { key, status: 'ok', map, n: pids.length, tax };
+  } catch (e){ A.bg = { key, status: 'error', map: {}, msg: String(e.message || e) }; }
+  renderClusterInfo(A);
+}
+
+function renderClusterInfo(A){
+  const { pipe, cl } = A, k = cl.optimalK;
+  const members = {};
+  for (let i = 0; i < pipe.rows.length; i++){ const c = cl.labels[i]; (members[c] = members[c] || []).push(pipe.rows[i].Symbol_2); }
+  const ordered = [];
+  for (let c = 1; c <= k; c++) ordered.push(c);   // largest cluster first (labels are size-ranked)
+  const bg = A.bg || { map: {} }, rep = (p) => bg.map[p];
+  const isRep = (p) => { const kb = rep(p); return !!(kb && (kb.ph || kb.ge)); };
+  const anyRep = bg.status === 'ok' && Object.values(bg.map).some(x => x && (x.ph || x.ge));
+  const tip = (p, kb) => kb && (kb.ph || kb.ge) ? `${p}: reported in BioGRID with ${A.gene} (${[kb.ph ? `physical, ${kb.ph} record${kb.ph === 1 ? '' : 's'}` : '', kb.ge ? `genetic, ${kb.ge} record${kb.ge === 1 ? '' : 's'}` : ''].filter(Boolean).join('; ')}) · click: its residues` : `${p} · click: its residues`;
+  const name = (p) => { const kb = rep(p); return `<a href="#" data-p="${_esc(p)}" class="${kb && kb.ph ? 'kb-p' : ''}${kb && kb.ge ? ' kb-g' : ''}" title="${_esc(tip(p, kb))}">${_esc(p)}</a>`; };
+  let html = '';
+  for (const c of ordered){
+    const all = members[c] || []; const mem = [...new Set(all)].sort((a, b) => String(a).toLowerCase().localeCompare(String(b).toLowerCase()));
+    const nRep = mem.filter(isRep).length;
+    html += `<div class="cl-row"><i style="background:${clusterColor(c,k)}"></i>`
+      + `<div><b>${_esc(clusterLabel(c))}</b> <span class="muted">(${mem.length} partner${mem.length === 1 ? '' : 's'}, ${all.length} prediction${all.length === 1 ? '' : 's'})${anyRep ? ` &middot; <span title="partners in this cluster with a physical or genetic interaction reported in BioGRID with ${_esc(A.gene)}">${nRep} of ${mem.length} reported</span>` : ''}</span>: ${mem.map(name).join(', ')}</div></div>`;
+  }
+  const vals = Object.values(bg.map);
+  const nP = vals.filter(x => x.ph && !x.ge).length, nG = vals.filter(x => x.ge && !x.ph).length, nB = vals.filter(x => x.ph && x.ge).length;
+  html += `<div class="muted" style="font-size:.8rem; margin-top:.2rem">Click a partner to show its interaction residues below. `
+    + (bg.status === 'ok'
+        ? (anyRep
+            ? `Literature evidence: <span class="kb-mark kb-p">physical</span> ${nP} &nbsp;<span class="kb-mark kb-g">genetic</span> ${nG} &nbsp;<span class="kb-mark kb-p kb-g">both</span> ${nB} (reported in BioGRID with ${_esc(A.gene)}, of ${bg.n} partners with an NCBI Gene ID; reported, not validated).`
+            : `Literature evidence: none of these ${bg.n} partners is reported in BioGRID with ${_esc(A.gene)}.`)
+        : bg.status === 'checking' ? 'Checking BioGRID for interactions reported with ' + _esc(A.gene) + '…'
+        : bg.status === 'nogene' ? 'BioGRID not checked: no NCBI Gene ID found for ' + _esc(A.gene) + ' (set the species above).'
+        : bg.status === 'error' ? 'BioGRID could not be reached (' + _esc(bg.msg || '') + ').' : '') + `</div>`;
+  $('cluster-info').innerHTML = html;
+  $('cluster-info').querySelectorAll('a[data-p]').forEach(a => a.onclick = (e) => {   // the same hand-off as a fingerprint row
+    e.preventDefault(); const sel = $('pair-partner'), p = a.dataset.p;
+    if (!sel || ![...sel.options].some((o) => o.value === p)) return;
+    sel.value = p; if (sel.onchange) sel.onchange();
+    $('pair-card').scrollIntoView({ behavior: 'auto', block: 'start' });
+  });
+  if (!A.bg && !window.__CLIP_DATA__) loadReported(A);
+}
+
+// ── Contact residues per partner ────────────────────────────────────────────────
+// lis.py already names the interface residues on both chains, so a pair can be reviewed
+// without ever loading a structure: gray = not in the interface, light = LIR, dark = cLIR.
+const PAIR_COL = { q:{ base:'#e0e0e0', lir:'#80CBC4', clir:'#00897B' },      // chain A — same defaults as Prediction Analysis
+                   p:{ base:'#e0e0e0', lir:'#FFAB91', clir:'#E64A19' } };     // chain B
+
+function bestRowPerPartner(A){
+  const m = new Map();
+  for (const r of A.pipe.rows){ const p = r.Symbol_2, prev = m.get(p);
+    if (!prev || (+r.iLIS||0) > (+prev.iLIS||0)) m.set(p, r); }
+  return m;
+}
+function idxSet(v){ const s = new Set(); for (const n of CLIPPipeline.parseIndice(v)) if (n>=1) s.add(n); return s; }
+
+let PAIR_DOMAINS = {};   // partner symbol -> [{start,end,name}] (canonical coords) · null = fetch in flight
+let PAIR_SEQ = {};      // partner symbol -> {seq, acc, len}: UniProt canonical sequence, shown when no FASTA is loaded
+function fetchPartnerDomainsFor(A, part, done){
+  const r = bestRowPerPartner(A).get(part), pl = r ? (parseInt(r.Protein_Len_B,10)||0) : 0;
+  ensurePartnerDomains(part, pl, ($('mg-species') && $('mg-species').value) || '').then(ch => { if (ch && done) done(); });
+}
+// Resolve a partner to a UniProt accession (reusing whatever ids we know) and pull its domains,
+// so the interface map can show them like Prediction Analysis. Best-effort and cached per symbol.
+async function ensurePartnerDomains(sym, len, species){
+  if (sym in PAIR_DOMAINS) return false;
+  PAIR_DOMAINS[sym] = null;
+  let acc = null;
+  for (const id of [sym].concat(LABEL_IDS[sym] || [])){
+    try { const r = await CLIPResolver.resolveStructure({ gene: id, length: len, species });
+      if (r && r.accession){ acc = r.accession; if (r.structureSequence) PAIR_SEQ[sym] = { seq: r.structureSequence, acc: r.accession, len: r.structureLength }; break; } } catch(e){}
+  }
+  PAIR_DOMAINS[sym] = acc ? (await CLIPResolver.fetchDomains(acc).catch(() => [])) : [];
+  return true;
+}
+// Query domains are in full-protein coords; the query may be a fragment, so shift by its offset.
+function mapQueryDomains(A){
+  const off = A._fragOffset || 0, len = A.pipe.proteinLen, out = [];
+  for (const d of (A._domains || [])){ const s = d.start - off, e = d.end - off; if (e < 1 || s > len) continue; out.push({ start: Math.max(1, s), end: Math.min(len, e), name: d.name }); }
+  return out;
+}
+function clipDomains(doms, len){ const out = []; for (const d of (doms || [])){ if (d.end < 1 || d.start > len) continue; out.push({ start: Math.max(1, d.start), end: Math.min(len, d.end), name: d.name }); } return out; }
+
+function allRanksFor(A, partner){   // every prediction of the query↔partner pair, in rank order (1 first)
+  const rows = A.pipe.rows.filter(r => r.Symbol_2 === partner);
+  rows.sort((a,b) => (+a.Rank||99) - (+b.Rank||99) || (+b.iLIS||0) - (+a.iLIS||0));
+  return rows;
+}
+
+function drawPairTracks(cv, A, partner){
+  const rows = allRanksFor(A, partner);
+  if (!rows.length) return;
+  const r0 = rows[0];
+  const qLen = parseInt(r0.Protein_Len_A, 10) || A.pipe.proteinLen, qKnown = !!parseInt(r0.Protein_Len_A, 10);
+  let pLen = parseInt(r0.Protein_Len_B, 10) || 0; const pKnown = !!pLen;
+  if (!pLen) for (const r of rows){ for (const v of idxSet(r.LIR_indice_B)) if (v>pLen) pLen=v; for (const v of idxSet(r.cLIR_indice_B)) if (v>pLen) pLen=v; }
+  const qDoms = mapQueryDomains(A), pDoms = clipDomains(PAIR_DOMAINS[partner], pLen);
+  const domRowH = (qDoms.length || pDoms.length) ? 16 : 0;
+  const clById = new Map(); if (A.cl && A.cl.labels) A.pipe.rows.forEach((r,i) => clById.set(r, A.cl.labels[i]));
+
+  const S = 2, W = PLOT_W, padR = AX_R, barH = 18, tickH = 15, hdrH = 17, blockGap = 16;
+  const labelFont = '600 12px sans-serif';
+  const meas = cv.getContext('2d'); meas.font = labelFont;
+  const fit = (s, max) => { if (meas.measureText(s).width <= max) return s;
+    while (s.length > 1 && meas.measureText(s + '…').width > max) s = s.slice(0, -1); return s + '…'; };
+  const padL = Math.min(230, 14 + Math.max(60, meas.measureText(A.gene).width, meas.measureText(partner).width) + 12);
+  const blockH = hdrH + 2*(domRowH + barH + tickH);
+  const H = 8 + rows.length*(blockH + blockGap) + 46;
+  cv.width = W*S; cv.height = H*S; cv.style.width = '100%'; cv.style.height = 'auto';
+  const ctx = cv.getContext('2d'); ctx.scale(S, S); ctx.clearRect(0, 0, W, H);
+  const domHits = [];   // UniProt domain boxes, for the hover tooltip below
+
+  const track = (y, label, len, doms, lir, clir, col) => {
+    const bw = (W - padL - padR) / len, xOf = (r) => padL + (r-1)*bw;
+    if (domRowH){                                        // UniProt domains above the bar
+      for (const d of doms){
+        const dx0 = xOf(d.start), dx1 = Math.max(dx0 + 2, xOf(d.end) + bw);
+        ctx.fillStyle = '#8579b8'; ctx.fillRect(dx0, y + 2, dx1 - dx0, domRowH - 5);
+        domHits.push({ d, len, label, x0: dx0, x1: dx1, y0: y + 2, y1: y + domRowH - 3 });
+        ctx.fillStyle = '#fff'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        if (ctx.measureText(d.name).width < dx1 - dx0 - 4) ctx.fillText(d.name, (dx0 + dx1)/2, y + 2 + (domRowH-5)/2);
+      }
+    }
+    const barY = y + domRowH;
+    ctx.fillStyle = col.clir; ctx.font = labelFont; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(fit(label, padL - 14), padL - 10, barY + barH/2);
+    ctx.fillStyle = col.base; ctx.fillRect(padL, barY, W - padL - padR, barH);
+    const paint = (set, color) => { if (!set.size) return; ctx.fillStyle = color;
+      for (const [s, e] of LiviaMaps.setToRanges(set)) ctx.fillRect(xOf(s), barY, Math.max(1.2, (e-s+1)*bw), barH); };
+    paint(lir, col.lir); paint(clir, col.clir);          // cLIR ⊂ LIR, so it paints over
+    ctx.strokeStyle = '#ccc'; ctx.lineWidth = 1; ctx.strokeRect(padL+.5, barY+.5, W - padL - padR - 1, barH-1);
+    ctx.fillStyle = '#333'; ctx.font = '9px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    const nT = pairXTicks(), tks = []; for (let i = 0; i < Math.min(nT, len); i++){ const r = Math.round(1 + i*(len-1)/(Math.max(1, Math.min(nT,len)-1))); if(!tks.includes(r)) tks.push(r); }
+    for (const r of tks){ const x = xOf(r) + bw/2;
+      ctx.strokeStyle = '#ddd'; ctx.beginPath(); ctx.moveTo(x, barY+barH); ctx.lineTo(x, barY+barH+3); ctx.stroke();
+      ctx.fillText(String(r), x, barY+barH+4); }
+    return barY + barH + tickH;
+  };
+
+  // one block per rank of this pair
+  let y = 8;
+  for (const row of rows){
+    const c = clById.get(row);
+    const qL = idxSet(row.LIR_indice_A), qC = idxSet(row.cLIR_indice_A), pL = idxSet(row.LIR_indice_B), pC = idxSet(row.cLIR_indice_B);
+    ctx.fillStyle = '#456'; ctx.font = '600 11px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(`rank ${row.Rank || '?'}  ·  iLIS ${(+row.iLIS||0).toFixed(3)}${c!=null ? `  ·  cluster ${c}` : ''}  ·  ${qC.size} / ${pC.size} cLIR`, padL, y + 12);
+    y += hdrH;
+    y = track(y, A.gene, qLen, qDoms, qL, qC, PAIR_COL.q);
+    y = track(y, partner, pLen, pDoms, pL, pC, PAIR_COL.p);
+    y += blockGap;
+  }
+
+  // legend + length summary
+  y += 2;
+  const chip = (x, cols, text) => {
+    cols.forEach((c, i) => { ctx.fillStyle = c; ctx.fillRect(x + i*11, y, 10, 10); });
+    x += cols.length*11 + 4;
+    ctx.fillStyle = '#333'; ctx.font = '10px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(text, x, y + 5.5);
+    return x + 13 + ctx.measureText(text).width;
+  };
+  let x = padL;
+  x = chip(x, [PAIR_COL.q.base], 'not an interaction residue');
+  x = chip(x, [PAIR_COL.q.lir, PAIR_COL.p.lir], 'LIR (PAE≤12Å)');
+  x = chip(x, [PAIR_COL.q.clir, PAIR_COL.p.clir], 'cLIR (PAE≤12Å & Cβ≤8Å)');
+  if (qDoms.length || pDoms.length){ ctx.fillStyle = '#8579b8'; ctx.fillRect(x, y, 10, 10);
+    ctx.fillStyle = '#333'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText('domain (UniProt)', x + 13, y + 5.5); }
+  y += 20;
+  ctx.fillStyle = '#889'; ctx.font = '10px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  const ql = qKnown ? `${qLen} aa` : `≥${qLen} aa`, pl = pKnown ? `${pLen} aa` : `≥${pLen} aa (length not in file)`;
+  ctx.fillText(`${A.gene} · ${ql}    ${partner} · ${pl}    ${rows.length} rank${rows.length>1?'s':''} shown`, padL, y + 5.5);
+  if (cv.getBoundingClientRect){   // hovering a domain box: its name and span, as hovering a residue elsewhere
+    cv.onmousemove = (e) => { const b = cv.getBoundingClientRect(), x = (e.clientX - b.left) * W / b.width, yy = (e.clientY - b.top) * H / b.height;
+      const h = domHits.find((k) => x >= k.x0 && x <= k.x1 && yy >= k.y0 && yy <= k.y1); if (!h) { cv.style.cursor = ''; return hideTip(); }
+      showTip(`<b>${_esc(h.d.name)}</b> · ${_esc(h.label)}<br>residues ${h.d.start}–${h.d.end} (${h.d.end - h.d.start + 1} aa) · UniProt domain`, e.clientX, e.clientY); };
+    cv.onmouseleave = () => hideTip(); }
+}
+
+// Sequence viewer, mirroring Prediction Analysis: 10-residue blocks, 80 per line, numbered both ends.
+// Only drawn when a FASTA (or a workbook Sequence sheet) supplied the actual sequences.
+function seqPanel(label, seq, lir, clir, col){
+  const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[c]));
+  // Residues flow as one continuous string that wraps to the available width, so it stays fully
+  // searchable (Cmd-F across gaps and line wraps): the 10-residue gap is a CSS margin, the wrap
+  // opportunity between blocks is a <wbr>, and the running position number is CSS ::before content
+  // — none of the three put a character into the text, so a motif is never broken.
+  let body = '';
+  for (let i = 0; i < seq.length; i++){
+    if (i % 10 === 0){ if (i) body += '</span><wbr>'; body += `<span class="g10" data-n="${Math.min(i + 10, seq.length)}">`; }
+    const r = i + 1, ch = esc(seq[i]);
+    if (clir.has(r))      { const cf = LiviaMaps.chipFill(col.clir); body += `<span style="background:${cf.fill}; color:${cf.ink}; font-weight:700">${ch}</span>`; }
+    else if (lir.has(r))  body += `<span style="background:${col.lir}">${ch}</span>`;
+    else                  body += ch;
+  }
+  body += '</span>';
+  return `<div style="margin-top:.9rem"><b style="color:${col.clir}">${esc(label)}</b> <span class="muted">(${seq.length} residues)</span></div>`
+       + `<div class="seq-flow">${body}</div>`;
+}
+
+// Paired FASTA headers key sequences on FBgn/UniProt ids, not the display symbol, so try the
+// symbol first and then whatever ids the workbook or identity map recorded for it.
+function seqForSymbol(sym, len){
+  let s = CLIPResolver.baitSequence(FASTA_PARSE, sym, len);
+  if (s) return s;
+  for (const id of (LABEL_IDS[sym] || [])){ s = CLIPResolver.baitSequence(FASTA_PARSE, id, len); if (s) return s; }
+  return null;
+}
+
+// Remap prediction-space residue indices onto the full UniProt sequence (fragment offset / alignment).
+function remapIndices(set, map){ if (!map) return set; const out = new Set(); for (const i of set){ const r = map[i-1]; if (r != null) out.add(r); } return out; }
+
+function renderPairSeq(A, partner){
+  const sel = $('pair-seq-rank'), body = $('pair-seq-body'), msg = $('pair-seq-msg');
+  const ranks = allRanksFor(A, partner);
+  if (!ranks.length){ body.innerHTML = ''; msg.textContent = ''; if (sel) sel.parentElement.style.display = 'none'; return; }
+  if (sel){                                 // rank picker — default to the best rank, keep the user's pick within a partner
+    const same = sel.dataset.partner === partner, keep = same ? sel.value : null;
+    sel.innerHTML = '';
+    for (const r of ranks){ const o = document.createElement('option'); o.value = String(r.Rank); o.textContent = `rank ${r.Rank || '?'} · iLIS ${(+r.iLIS||0).toFixed(3)}`; sel.appendChild(o); }
+    sel.parentElement.style.display = ranks.length > 1 ? '' : 'none';
+    sel.value = (keep && ranks.some(r => String(r.Rank) === keep)) ? keep : String(ranks[0].Rank);
+    sel.dataset.partner = partner;
+    sel.onchange = () => drawSeqPanels(A, partner);
+  }
+  drawSeqPanels(A, partner);
+}
+function drawSeqPanels(A, partner){
+  const sel = $('pair-seq-rank'), msg = $('pair-seq-msg'), body = $('pair-seq-body');
+  const ranks = allRanksFor(A, partner);
+  const row = (sel && ranks.find(r => String(r.Rank) === sel.value)) || ranks[0];
+  if (!row){ body.innerHTML = ''; msg.textContent = ''; return; }
+  const plen = A.pipe.proteinLen, pLen = parseInt(row.Protein_Len_B,10) || 0;
+  // Prefer the uploaded FASTA (the exact predicted construct). With none, fall back to the UniProt
+  // canonical sequence resolved for the 3D card — approximate, so it carries a caveat. The query's
+  // indices are remapped onto its full sequence (fragment/isoform); the partner is taken directly.
+  let qSeq = seqForSymbol(A.gene, plen), qLir = idxSet(row.LIR_indice_A), qClir = idxSet(row.cLIR_indice_A), qGuess = false;
+  if (!qSeq && A._uniprotSeq){ qSeq = A._uniprotSeq; qLir = remapIndices(qLir, A.residueMap); qClir = remapIndices(qClir, A.residueMap); qGuess = true; }
+  let pSeq = seqForSymbol(partner, pLen), pLir = idxSet(row.LIR_indice_B), pClir = idxSet(row.cLIR_indice_B), pGuess = false;
+  const ps = PAIR_SEQ[partner];
+  if (!pSeq && ps && ps.seq){ pSeq = ps.seq; pGuess = true; }
+
+  if (!qSeq && !pSeq){
+    body.innerHTML = '';
+    msg.innerHTML = (FASTA_PARSE && FASTA_PARSE.seqs.length)
+      ? `No sequence matched ${A.gene} or ${partner}.`
+      : 'Resolving from UniProt… or upload a <b>FASTA</b> (or a <b>.zip</b>) for the exact sequences.';
+    return;
+  }
+  let html = '';
+  if (qSeq) html += seqPanel(A.gene + (qGuess ? ` · UniProt ${A._uniprotAcc || ''}` : ''), qSeq, qLir, qClir, PAIR_COL.q);
+  if (pSeq) html += seqPanel(partner + (pGuess && ps && ps.acc ? ` · UniProt ${ps.acc}` : ''), pSeq, pLir, pClir, PAIR_COL.p);
+  body.innerHTML = html;
+  msg.innerHTML = (qGuess || pGuess)
+    ? '⚠ No FASTA loaded, so these are <b>UniProt canonical</b> sequences — they may not match what was predicted (isoform, fragment, tags). Upload a FASTA for the exact sequences.'
+    : '';
+}
+
+function renderPairTracks(A){
+  const sel = $('pair-partner'), search = $('pair-partner-search'), m = bestRowPerPartner(A);
+  const parts = [...m.keys()].sort((a,b) => (+m.get(b).iLIS||0) - (+m.get(a).iLIS||0));
+  if (!parts.length){ $('pair-card').classList.add('hidden'); return; }
+  $('pair-card').classList.remove('hidden');
+  const clById = new Map(); A.pipe.rows.forEach((r,i) => clById.set(r, A.cl.labels[i]));   // each partner's best-row cluster
+  const info = (p) => { const r = m.get(p), c = clById.get(r);
+    return `iLIS ${(+r.iLIS||0).toFixed(3)}${r.Rank?` (rank ${r.Rank})`:''}${c!=null?` (C${c})`:''}`; };
+  const keep = (sel.value && m.has(sel.value)) ? sel.value : parts[0];
+  sel.innerHTML = '';
+  for (const p of parts){ const o = document.createElement('option'); o.value = p; o.textContent = `${p} — ${info(p)}`; sel.appendChild(o); }
+  sel.value = keep;
+  const anyLir = [...m.values()].some(r => CLIPPipeline.parseIndice(r.LIR_indice_A).length);
+  $('pair-note').textContent = anyLir ? '' : 'this file carries no LIR indices — showing cLIR only';
+  const draw = () => drawPairTracks($('pair-canvas'), A, sel.value);
+  const paint = () => { draw(); renderPairSeq(A, sel.value);
+    LiviaMaps.attachExportBar('pair-canvas', { name:`clip_${A.gene}_vs_${sel.value}_residues`, svg:draw, png:true });
+    if (A._resolved) fetchPartnerDomainsFor(A, sel.value, () => { if (sel.value) { draw(); renderPairSeq(A, sel.value); } }); };   // query first; partners after it resolves
+  paint();
+  sel.onchange = paint;
+  // Separate search: type to filter the scrollable dropdown (hides non-matching options); the
+  // select itself still opens the full list. Enter jumps to the first match.
+  if (search){ search.value = '';
+    search.oninput = () => { const q = search.value.trim().toLowerCase();
+      let first = null;
+      for (const o of sel.options){ const hit = !q || o.value.toLowerCase().includes(q) || o.textContent.toLowerCase().includes(q);
+        o.hidden = !hit; if (hit && !first) first = o.value; }
+      if (q && first){ sel.value = first; } };
+    search.onkeydown = (e) => { if (e.key === 'Enter'){ e.preventDefault(); if (m.has(sel.value)) paint(); } };
+    search.onchange = () => { if (m.has(sel.value)) paint(); }; }
+}
+
+// ---- hover tooltips on the frequency plot and the fingerprint (as on the LIVIA Atlas) ----
+const TIP = (() => { const d = document.createElement('div'); d.className = 'gtip'; d.hidden = true; document.body.appendChild(d); return d; })();
+function showTip(html, x, y){
+  TIP.innerHTML = html; TIP.hidden = false;
+  const w = TIP.offsetWidth, h = TIP.offsetHeight, m = 10;
+  let left = x - w / 2, top = y - h - 14;
+  if (top < m) top = y + 18;
+  left = Math.max(m, Math.min(window.innerWidth - w - m, left));
+  TIP.style.left = left + 'px'; TIP.style.top = top + 'px';
+}
+function hideTip(){ TIP.hidden = true; }
+// Residue r of the plot (1..plen) as the reader sees it: its letter when the sequence is known, and its number with any
+// fragment offset (the x-ticks' numbering).
+function residueLabel(A, r){
+  const q = seqForSymbol(A.gene, A.pipe.proteinLen);
+  let aa = q ? q[r - 1] : '';
+  if (!aa && A._uniprotSeq && A.residueMap){ const sr = A.residueMap[r - 1]; if (sr) aa = A._uniprotSeq[sr - 1] || ''; }
+  return (aa || '') + (r + (A._fragOffset || 0));
+}
+const clusterName = (c) => 'Cluster ' + c;
+
+function freqSeries(tot, byC, plen, k, xc, yOf, base, totalOnly){   // 'by cluster' or 'total' frequency: [gray area of all, its black edge, and optionally one line per cluster]
+  const all = []; for (let r=1;r<=plen;r++) all.push([xc(r), yOf(tot[r])]);
+  const out = [{ area:true, pts:[...all, [xc(plen), base], [xc(1), base]], breaks:new Set() }, { color:'#1b2430', w: totalOnly ? 1.5 : 1.2, pts:all, breaks:new Set() }];
+  if (totalOnly) return out;
+  const size = {}; for (let r=1;r<=plen;r++) for (const c in (byC[r]||{})) size[c] = (size[c]||0) + byC[r][c];
+  for (const c of Object.keys(size).sort((a,z)=>size[z]-size[a])){ const v=(r)=>(r>=1&&r<=plen&&byC[r]&&byC[r][c])||0, pts=[], breaks=new Set(); let on=false;
+    for (let r=1;r<=plen;r++){ if(!v(r)&&!v(r-1)&&!v(r+1)){ on=false; continue; } if(!on) breaks.add(pts.length); pts.push([xc(r), yOf(v(r))]); on=true; }
+    out.push({ color:clusterColor(+c,k), w:1.5, pts, breaks }); }
+  return out;
+}
+function freqKey(byC, plen, k, fit, totalOnly){   // the lines' key for the right gutter: all predictions, then clusters by size
+  if (totalOnly) return [['all predictions', '#1b2430']];
+  const size = {}; for (let r=1;r<=plen;r++) for (const c in (byC[r]||{})) size[c] = (size[c]||0) + byC[r][c];
+  const list = [['all predictions', '#1b2430'], ...Object.keys(size).sort((a,z)=>size[z]-size[a]).map((c)=>[`C${c}`, clusterColor(+c,k)])];
+  return list.slice(0, fit).map(([t,col],j)=>[j === fit - 1 && list.length > fit ? `+ ${list.length - fit + 1} more` : t, col]);
+}
+function renderFreq(A){
+  const { pipe, cl } = A, n = pipe.fingerprints.length, plen = pipe.proteinLen, k = cl.optimalK;
+  const tot = new Float64Array(plen+1), byC = {};
+  for (let i=0;i<n;i++){ const lab=cl.labels[i]; if(ACTIVE && !ACTIVE.has(lab)) continue; for (const res of pipe.fingerprints[i]){ if(res<1||res>plen)continue; tot[res]++; (byC[res]=byC[res]||{})[lab]=((byC[res]||{})[lab]||0)+1; } }
+  let maxF=1; for (let r=1;r<=plen;r++) if(tot[r]>maxF)maxF=tot[r];
+  const hasP = !!(A._plddt && A._plddt.size);
+  const S=2, W=PLOT_W, padL=AX_L, padR=clipAXR();
+  const bw=(W-padL-padR)/plen, xOf=(r)=>padL+(r-1)*bw;
+  // domain boxes with lane-stacking (overlapping domains stack into rows)
+  let inv=null; if(A.residueMap){ inv={}; for(let i=0;i<A.residueMap.length;i++){ const sr=A.residueMap[i]; if(sr!=null && inv[sr]==null) inv[sr]=i+1; } }
+  const doms=[];
+  for (const d of (A._domains||[])){
+    const ps = inv ? (inv[d.start]||d.start) : d.start, pe = inv ? (inv[d.end]||d.end) : d.end;
+    if (pe<1 || ps>plen) continue;
+    const dx0=xOf(Math.max(1,ps)), dx1=Math.max(dx0+2, xOf(Math.min(plen,pe)+1));
+    doms.push({ x0:dx0, x1:dx1, name:d.name, start:d.start, end:d.end, ps, pe });
+  }
+  doms.sort((a,b)=>a.x0-b.x0); doms.forEach((d,i)=>d.idx=i+1);
+  const laneEnd=[];
+  for (const d of doms){ let l=0; while(l<laneEnd.length && laneEnd[l] > d.x0+0.5) l++; d.lane=l; laneEnd[l]=d.x1; }
+  const nL=laneEnd.length, DRH=13, domBoxH=11, domTop=2, domTotal=nL*DRH;
+  // vertical layout: domains | # predictions | (pLDDT) | x-ticks
+  const padT = domTop + domTotal + (nL?4:14);
+  const freqH = 108, freqBase = padT + freqH;
+  const gap=15, plddtH=48;
+  const plddtTop = hasP ? freqBase+gap : freqBase, plddtBase = hasP ? plddtTop+plddtH : freqBase;
+  const hasAM = !!(A._am && A._am.length);
+  const amTop = plddtBase + 15, amH = 44, amBase = hasAM ? amTop + amH : plddtBase;
+  const padB=22, H = amBase + padB;
+  const cv=$('freq'); cv.width=W*S; cv.height=H*S; cv.style.width='100%'; cv.style.height='auto';
+  const ctx=cv.getContext('2d'); ctx.scale(S,S); ctx.clearRect(0,0,W,H);
+  // # predictions panel
+  ctx.strokeStyle='#ccc'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(padL,padT); ctx.lineTo(padL,freqBase); ctx.lineTo(W-padR,freqBase); ctx.stroke();
+  ctx.fillStyle='#333'; ctx.font='9px sans-serif'; ctx.textAlign='right'; ctx.textBaseline='middle';
+  for (const t of [...new Set([0, Math.round(maxF/2), maxF])]) ctx.fillText(String(t), padL-4, freqBase-(t/maxF)*freqH);
+  if (CLIP_FREQ_STYLE === 'cluster' || CLIP_FREQ_STYLE === 'total'){   // all predictions as a gray area edged in black, optionally with each cluster's line
+    const totalOnly = CLIP_FREQ_STYLE === 'total';
+    for (const sg of freqSeries(tot, byC, plen, k, (r)=>xOf(r)+bw/2, (v)=>freqBase-(v/maxF)*freqH, freqBase, totalOnly)){
+      ctx.beginPath(); sg.pts.forEach(([x,y],i)=> i && !sg.breaks.has(i) ? ctx.lineTo(x,y) : ctx.moveTo(x,y));
+      if (sg.area){ ctx.closePath(); ctx.fillStyle='#e3e8ee'; ctx.fill(); continue; }
+      ctx.strokeStyle=sg.color; ctx.lineWidth=sg.w; ctx.stroke(); }
+    if (padR > AX_R){ ctx.font='9px sans-serif'; ctx.textAlign='left'; ctx.textBaseline='middle'; }   // the lines' key, in the gutter the fingerprint labels use
+    if (padR > AX_R) freqKey(byC, plen, k, Math.floor(freqH/12), totalOnly).forEach(([t,col],j)=>{ const x=W-padR+8, y=padT+6+j*12; ctx.strokeStyle=col; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x+14,y); ctx.stroke(); ctx.fillStyle='#333'; ctx.fillText(t, x+19, y); });
+  } else for (let r=1;r<=plen;r++){ if(!tot[r])continue; let dom=1,best=-1; const cc=byC[r]||{}; for(const c in cc) if(cc[c]>best){best=cc[c];dom=+c;}
+    const h=(tot[r]/maxF)*freqH; ctx.fillStyle=clusterColor(dom,k); ctx.fillRect(xOf(r), freqBase-h, Math.max(1,bw), h); }
+  ctx.save(); ctx.translate(11,(padT+freqBase)/2); ctx.rotate(-Math.PI/2); ctx.textAlign='center'; ctx.fillStyle='#333'; ctx.fillText('# predictions',0,0); ctx.restore();
+  // pLDDT panel (separate, below; AFDB confidence)
+  const xtickBase = amBase;
+  if (hasP){
+    const map=A.residueMap, yOf=(pl)=>plddtBase-(pl/100)*plddtH, xc=(r)=>padL+(r-1)*bw+bw/2, qc=A._queryChain||'A';
+    ctx.strokeStyle='#ccc'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(padL,plddtTop); ctx.lineTo(padL,plddtBase); ctx.lineTo(W-padR,plddtBase); ctx.stroke();
+    let prev=null;
+    for (let r=1;r<=plen;r++){ const sr=map?map[r-1]:r; if(!sr){prev=null;continue;} const pl=A._plddt.get(qc+':'+sr); if(pl==null){prev=null;continue;}
+      const x=xc(r), y=yOf(pl); if(prev){ const mx=(prev.x+x)/2, my=(prev.y+y)/2; ctx.lineWidth=1.4; ctx.strokeStyle=plddtColor(prev.v); ctx.beginPath(); ctx.moveTo(prev.x,prev.y); ctx.lineTo(mx,my); ctx.stroke(); ctx.strokeStyle=plddtColor(pl); ctx.beginPath(); ctx.moveTo(mx,my); ctx.lineTo(x,y); ctx.stroke(); } prev={x,y,v:pl}; }
+    ctx.fillStyle='#333'; ctx.font='9px sans-serif'; ctx.textAlign='right'; ctx.textBaseline='middle';
+    for (const t of [0,50,100]) ctx.fillText(String(t), padL-4, plddtBase-(t/100)*plddtH);
+    ctx.save(); ctx.translate(11,(plddtTop+plddtBase)/2); ctx.rotate(-Math.PI/2); ctx.textAlign='center'; ctx.fillStyle='#5a86b3'; ctx.fillText('pLDDT',0,0); ctx.restore();
+  }
+  // AlphaMissense per-residue mean pathogenicity curve (human only; mean over all substitutions at each residue)
+  if (hasAM){ const amap=A.residueMap, yOfA=(v)=>amBase-v*amH, xcA=(r)=>padL+(r-1)*bw+bw/2;
+    ctx.strokeStyle='#ccc'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(padL,amTop); ctx.lineTo(padL,amBase); ctx.lineTo(W-padR,amBase); ctx.stroke();
+    let prevA=null;
+    for (let r=1;r<=plen;r++){ const sr=amap?amap[r-1]:r; const v=sr?A._am[sr]:null; if(v==null){prevA=null;continue;} const x=xcA(r), y=yOfA(v); if(prevA){ const mx=(prevA.x+x)/2, my=(prevA.y+y)/2; ctx.lineWidth=1.4; ctx.strokeStyle=amColor(prevA.v); ctx.beginPath(); ctx.moveTo(prevA.x,prevA.y); ctx.lineTo(mx,my); ctx.stroke(); ctx.strokeStyle=amColor(v); ctx.beginPath(); ctx.moveTo(mx,my); ctx.lineTo(x,y); ctx.stroke(); } prevA={x,y,v}; }
+    ctx.fillStyle='#333'; ctx.font='9px sans-serif'; ctx.textAlign='right'; ctx.textBaseline='middle';
+    for (const t of [0,0.5,1]) ctx.fillText(t.toFixed(1), padL-4, amBase-t*amH);
+    ctx.save(); ctx.translate(11,(amTop+amBase)/2); ctx.rotate(-Math.PI/2); ctx.textAlign='center'; ctx.textBaseline='alphabetic'; ctx.fillStyle='#a33'; ctx.fillText('AM path.',0,0); ctx.restore();
+  }
+  // shared residue x-axis ticks (bottom)
+  ctx.fillStyle='#333'; ctx.strokeStyle='#ccc'; ctx.lineWidth=1; ctx.font='9px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='top';
+  { const nT=clipXTicks(), ticks=[]; for (let i=0;i<nT;i++){ const r=Math.round(1+i*(plen-1)/(nT-1)); if(!ticks.includes(r)) ticks.push(r); }
+    for (const r of ticks){ const x=xOf(r)+bw/2; ctx.beginPath(); ctx.moveTo(x,xtickBase); ctx.lineTo(x,xtickBase+3); ctx.stroke(); ctx.fillText(String(r + (A._fragOffset||0)), x, xtickBase+5); } }
+  // domain track (stacked lanes, top)
+  ctx.font='9px sans-serif'; ctx.textBaseline='middle';
+  for (const d of doms){ const y=domTop + d.lane*DRH, w=d.x1-d.x0;
+    ctx.fillStyle='#e3e9f1'; ctx.fillRect(d.x0, y, w, domBoxH); ctx.strokeStyle='#9fb0c4'; ctx.lineWidth=.5; ctx.strokeRect(d.x0, y, w, domBoxH);
+    ctx.fillStyle='#333'; ctx.textAlign='center'; const _lbl='D'+d.idx; if (ctx.measureText(_lbl).width < w-2) ctx.fillText(_lbl, d.x0+w/2, y+domBoxH/2); }   // short D1/D2/... labels (always fit); full names in the legend below
+  cv.onmousemove = (e) => {                             // residue under the pointer: predictions by cluster, domain, pLDDT, AlphaMissense
+    const b = cv.getBoundingClientRect(), r = Math.floor(((e.clientX - b.left) * W / b.width - padL) / bw) + 1;
+    if (r < 1 || r > plen) return hideTip();
+    const cc = byC[r] || {}, parts = Object.keys(cc).map(Number).sort((a, z) => cc[z] - cc[a])
+      .map((c) => `<span style="color:${clusterColor(c, k)}">\u25cf</span> ${clusterName(c)} ${cc[c]}`).join(' \u00b7 ');
+    const sr = A.residueMap ? A.residueMap[r - 1] : r;
+    const pl = hasP && sr ? A._plddt.get((A._queryChain || 'A') + ':' + sr) : null, am = hasAM && sr ? A._am[sr] : null;
+    const dom = doms.filter((d) => r >= d.ps && r <= d.pe).map((d) => d.name).join(', ');
+    showTip(`<b>${_esc(residueLabel(A, r))}</b> \u00b7 ${tot[r]} prediction${tot[r] === 1 ? '' : 's'}${parts ? '<br>' + parts : ''}`
+      + `${dom ? '<br>' + _esc(dom) : ''}${pl != null ? '<br>pLDDT ' + pl.toFixed(0) : ''}${am != null ? (pl != null ? ' \u00b7 ' : '<br>') + 'AlphaMissense ' + am.toFixed(2) : ''}`, e.clientX, e.clientY);
+  };
+  cv.onmouseleave = hideTip;
+  { const hot = $('freq-hot'), top = [];
+    for (let r = 1; r <= plen; r++) if (tot[r]) top.push(r);
+    top.sort((a, z) => tot[z] - tot[a] || a - z);
+    if (hot) hot.innerHTML = top.length ? `<span class="hot-lbl">Most contacted</span>${top.slice(0, 12).map((r) => `<span title="${tot[r]} prediction${tot[r] === 1 ? '' : 's'}">${_esc(residueLabel(A, r))} \u00b7 ${tot[r]}</span>`).join('')}` : ''; }
+  { const dl = $('freq-domains');
+    if (dl){ if (doms.length){
+      const items = doms.map(d => `<b style="color:#456">D${d.idx}</b> = ${_esc(d.name)} <span style="color:#667080">(${d.start}\u2013${d.end})</span>`).join(' &nbsp;\u00b7&nbsp; ');
+      const acc = A._accession, link = acc ? ` &nbsp;\u2014&nbsp; <a href="https://www.uniprot.org/uniprotkb/${acc}/entry#family_and_domains" target="_blank" style="color:#2471A3">on UniProt ${acc} \u2197</a>` : '';
+      dl.innerHTML = `<b style="color:#456">Domains:</b> ${items}${link}`;
+    } else dl.innerHTML = ''; } }
+}
+
+// ---- publication SVG export (vector; same layout math as the canvas renderers) ----
+const _f = (v) => Math.round(v * 100) / 100;
+const _esc = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const SVG_FONT = 'Helvetica, Arial, sans-serif';
+
+function svgHeatmap(A, opts){
+  opts = opts || {};
+  const { pipe, cl } = A, plen = pipe.proteinLen, k = cl.optimalK;
+  const showAll = !ACTIVE || ACTIVE.size === k;
+  const order = showAll ? A.order : A.order.filter(idx => ACTIVE.has(cl.labels[idx]));
+  const n = order.length || 1;
+  const W = opts.width || PLOT_W, fs = opts.fontSize || 9;
+  const AXB = fs + 14;
+  const rowH = opts.rowH || (opts.height ? Math.max(0.5, (opts.height - AXB) / n) : Math.max(3, Math.min(10, 238 / n)));
+  const rowsH = n * rowH, H = rowsH + AXB;
+  const R = clipAXR(true), byCl = CLIP_STYLE === 'cluster';
+  const step = (W - AX_L - R) / plen, edge = (r) => AX_L + (r - 1) * step;
+  const rowTop = (row) => row * rowH, rowMid = (row) => rowTop(row) + rowH / 2;
+  const dendroX0 = 2, dendroX1 = 28, stripX0 = 31, stripX1 = AX_L - 8, resX0 = AX_L, resX1 = W - R;
+  const BG = byCl ? '#ffffff' : '#f7fbff', CONTACT = '#08306b';
+  let s = '';
+  for (let row = 0; row < n; row++){
+    const idx = order[row], y0 = rowTop(row);
+    s += `<rect x="${stripX0}" y="${_f(y0)}" width="${_f(stripX1 - stripX0)}" height="${_f(rowH)}" fill="${clusterColor(cl.labels[idx], k)}"/>`;
+    s += `<rect x="${resX0}" y="${_f(y0)}" width="${_f(resX1 - resX0)}" height="${_f(rowH)}" fill="${BG}"/>`;
+    for (const [st, e] of mergeRuns(pipe.fingerprints[idx])){ const x0 = edge(st), x1 = Math.max(x0 + 0.5, edge(e + 1));
+      s += `<rect x="${_f(x0)}" y="${_f(y0)}" width="${_f(x1 - x0)}" height="${_f(rowH)}" fill="${byCl ? clusterColor(cl.labels[idx], k) : CONTACT}"/>`; }
+  }
+  if (byCl) s += `<rect x="${_f(resX0)}" y="0" width="${_f(resX1 - resX0)}" height="${_f(rowsH)}" fill="none" stroke="#d5dde6" stroke-width="0.8"/>`;
+  const Z = cl.Z || [];
+  if (Z.length === n - 1 && n >= 2){
+    const yv = {}, xv = {};
+    for (let row = 0; row < n; row++){ const id = order[row]; yv[id] = rowMid(row); xv[id] = dendroX1; }
+    const maxD = Z[Z.length - 1][2] || 1;
+    for (let m = 0; m < Z.length; m++){ const a = Z[m][0], b = Z[m][1], id = n + m; yv[id] = (yv[a] + yv[b]) / 2; xv[id] = dendroX0 + (dendroX1 - dendroX0) * (1 - Z[m][2] / maxD); }
+    let d = '';
+    for (let m = 0; m < Z.length; m++){ const a = Z[m][0], b = Z[m][1], xm = xv[n + m];
+      d += `M${_f(xv[a])} ${_f(yv[a])}L${_f(xm)} ${_f(yv[a])}M${_f(xv[b])} ${_f(yv[b])}L${_f(xm)} ${_f(yv[b])}M${_f(xm)} ${_f(yv[a])}L${_f(xm)} ${_f(yv[b])}`; }
+    s += `<path d="${d}" stroke="#555" stroke-width="0.8" fill="none"/>`;
+  }
+  if (byCl && R > AX_R) for (const b of clusterBlocks(A, order)){ const ym = (rowTop(b.start) + rowTop(b.end + 1)) / 2; if (rowTop(b.end + 1) - rowTop(b.start) < fs) continue;
+    s += `<rect x="${_f(resX1 + 2)}" y="${_f(ym - 0.5)}" width="4" height="1" fill="${clusterColor(b.c, k)}"/><text x="${_f(resX1 + 8)}" y="${_f(ym)}" font-size="${fs}" font-weight="600" fill="${clusterColor(b.c, k)}" dominant-baseline="central">${_esc(fitLabel(b.label, R - 12, (t) => t.length * fs * 0.55))}</text>`; }
+  const nT = clipXTicks(), ticks = [];
+  for (let i = 0; i < nT; i++){ const r = Math.round(1 + i * (plen - 1) / (nT - 1)); if (!ticks.includes(r)) ticks.push(r); }
+  for (const r of ticks){ const x = edge(r) + step / 2;
+    s += `<line x1="${_f(x)}" y1="${_f(rowsH)}" x2="${_f(x)}" y2="${_f(rowsH + 3)}" stroke="#ccc" stroke-width="1"/>`
+      + `<text x="${_f(x)}" y="${_f(rowsH + 4 + fs)}" font-size="${fs}" fill="#333" text-anchor="middle">${r + (A._fragOffset||0)}</text>`; }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${_f(W)}" height="${_f(H)}" viewBox="0 0 ${_f(W)} ${_f(H)}" font-family="${SVG_FONT}">${s}</svg>`;
+}
+
+function svgFreq(A, opts){
+  opts = opts || {};
+  const { pipe, cl } = A, n = pipe.fingerprints.length, plen = pipe.proteinLen, k = cl.optimalK;
+  const W = opts.width || PLOT_W, fs = opts.fontSize || 9, padL = AX_L, padR = clipAXR(true);
+  const bw = (W-padL-padR)/plen, xOf=(r)=>padL+(r-1)*bw;
+  const tot = new Float64Array(plen+1), byC = {};
+  for (let i=0;i<n;i++){ const lab=cl.labels[i]; if(ACTIVE&&!ACTIVE.has(lab))continue; for(const res of pipe.fingerprints[i]){ if(res<1||res>plen)continue; tot[res]++; (byC[res]=byC[res]||{})[lab]=((byC[res]||{})[lab]||0)+1; } }
+  let maxF=1; for(let r=1;r<=plen;r++) if(tot[r]>maxF)maxF=tot[r];
+  const hasP=!!(A._plddt&&A._plddt.size);
+  let inv=null; if(A.residueMap){ inv={}; for(let i=0;i<A.residueMap.length;i++){ const sr=A.residueMap[i]; if(sr!=null&&inv[sr]==null)inv[sr]=i+1; } }
+  const doms=[];
+  for(const d of (A._domains||[])){ const ps=inv?(inv[d.start]||d.start):d.start, pe=inv?(inv[d.end]||d.end):d.end; if(pe<1||ps>plen)continue; const dx0=xOf(Math.max(1,ps)), dx1=Math.max(dx0+2,xOf(Math.min(plen,pe)+1)); doms.push({x0:dx0,x1:dx1,name:d.name}); }
+  doms.sort((a,b)=>a.x0-b.x0);
+  const laneEnd=[]; for(const d of doms){ let l=0; while(l<laneEnd.length&&laneEnd[l]>d.x0+0.5)l++; d.lane=l; laneEnd[l]=d.x1; }
+  const nL=laneEnd.length, DRH=13, domBoxH=11, domTop=2, domTotal=nL*DRH;
+  const padT = domTop + domTotal + (nL?4:14);
+  const freqH = opts.height || 108, freqBase = padT + freqH;
+  const gap=15, plddtH = Math.round(freqH*0.44);
+  const plddtTop = hasP ? freqBase+gap : freqBase, plddtBase = hasP ? plddtTop+plddtH : freqBase;
+  const hasAM = !!(A._am && A._am.length);
+  const amTop = plddtBase + 15, amH = 44, amBase = hasAM ? amTop + amH : plddtBase;
+  const padB=22, H = amBase + padB;
+  let s='';
+  s += `<path d="M${padL} ${_f(padT)}L${padL} ${_f(freqBase)}L${_f(W-padR)} ${_f(freqBase)}" stroke="#ccc" stroke-width="1" fill="none"/>`;
+  for(const t of [...new Set([0,Math.round(maxF/2),maxF])]) s += `<text x="${padL-4}" y="${_f(freqBase-(t/maxF)*freqH)}" font-size="${fs}" fill="#333" text-anchor="end" dominant-baseline="central">${t}</text>`;
+  if (CLIP_FREQ_STYLE === 'cluster' || CLIP_FREQ_STYLE === 'total'){
+    const totalOnly = CLIP_FREQ_STYLE === 'total';
+    for (const sg of freqSeries(tot, byC, plen, k, (r)=>xOf(r)+bw/2, (v)=>freqBase-(v/maxF)*freqH, freqBase, totalOnly)){
+      const d = sg.pts.map(([x,y],i)=>`${i && !sg.breaks.has(i) ? 'L' : 'M'}${_f(x)} ${_f(y)}`).join('');
+      s += sg.area ? `<path d="${d}Z" fill="#e3e8ee"/>` : `<path d="${d}" stroke="${sg.color}" stroke-width="${sg.w}" fill="none" stroke-linejoin="round"/>`; }
+    if (padR > AX_R) freqKey(byC, plen, k, Math.floor(freqH/(fs+3)), totalOnly).forEach(([t,col],j)=>{ const x=W-padR+8, y=padT+6+j*(fs+3);
+      s += `<line x1="${_f(x)}" y1="${_f(y)}" x2="${_f(x+14)}" y2="${_f(y)}" stroke="${col}" stroke-width="2"/><text x="${_f(x+19)}" y="${_f(y)}" font-size="${fs}" fill="#333" dominant-baseline="central">${_esc(t)}</text>`; });
+  } else for(let r=1;r<=plen;r++){ if(!tot[r])continue; let dom=1,best=-1; const cc=byC[r]||{}; for(const c in cc)if(cc[c]>best){best=cc[c];dom=+c;} const h=(tot[r]/maxF)*freqH; s += `<rect x="${_f(xOf(r))}" y="${_f(freqBase-h)}" width="${_f(Math.max(0.5,bw))}" height="${_f(h)}" fill="${clusterColor(dom,k)}"/>`; }
+  const ycl1=_f((padT+freqBase)/2); s += `<text x="11" y="${ycl1}" font-size="${fs}" fill="#333" text-anchor="middle" transform="rotate(-90 11 ${ycl1})"># predictions</text>`;
+  const xtickBase = amBase;
+  if(hasP){ const map=A.residueMap, yOf=(pl)=>plddtBase-(pl/100)*plddtH, xc=(r)=>padL+(r-1)*bw+bw/2, qc=A._queryChain||'A';
+    s += `<path d="M${padL} ${_f(plddtTop)}L${padL} ${_f(plddtBase)}L${_f(W-padR)} ${_f(plddtBase)}" stroke="#ccc" stroke-width="1" fill="none"/>`;
+    let prev=null;
+    for(let r=1;r<=plen;r++){ const sr=map?map[r-1]:r; if(!sr){prev=null;continue;} const pl=A._plddt.get(qc+':'+sr); if(pl==null){prev=null;continue;} const x=xc(r),y=yOf(pl); if(prev){ const mx=(prev.x+x)/2, my=(prev.y+y)/2; s+=`<line x1="${_f(prev.x)}" y1="${_f(prev.y)}" x2="${_f(mx)}" y2="${_f(my)}" stroke="${plddtColor(prev.v)}" stroke-width="1.4"/><line x1="${_f(mx)}" y1="${_f(my)}" x2="${_f(x)}" y2="${_f(y)}" stroke="${plddtColor(pl)}" stroke-width="1.4"/>`; } prev={x,y,v:pl}; }
+    for(const t of [0,50,100]) s += `<text x="${padL-4}" y="${_f(plddtBase-(t/100)*plddtH)}" font-size="${fs}" fill="#333" text-anchor="end" dominant-baseline="central">${t}</text>`;
+    const ycl2=_f((plddtTop+plddtBase)/2); s += `<text x="11" y="${ycl2}" font-size="${fs}" fill="#5a86b3" text-anchor="middle" transform="rotate(-90 11 ${ycl2})">pLDDT</text>`;
+  }
+  if (hasAM){ const amap=A.residueMap, yOfA=(v)=>amBase-v*amH, xcA=(r)=>padL+(r-1)*bw+bw/2;
+    s += `<path d="M${padL} ${_f(amTop)}L${padL} ${_f(amBase)}L${_f(W-padR)} ${_f(amBase)}" stroke="#ccc" stroke-width="1" fill="none"/>`;
+    let prevA=null;
+    for (let r=1;r<=plen;r++){ const sr=amap?amap[r-1]:r; const v=sr?A._am[sr]:null; if(v==null){prevA=null;continue;} const x=xcA(r), y=yOfA(v); if(prevA){ const mx=(prevA.x+x)/2, my=(prevA.y+y)/2; s += `<line x1="${_f(prevA.x)}" y1="${_f(prevA.y)}" x2="${_f(mx)}" y2="${_f(my)}" stroke="${amColor(prevA.v)}" stroke-width="1.4"/><line x1="${_f(mx)}" y1="${_f(my)}" x2="${_f(x)}" y2="${_f(y)}" stroke="${amColor(v)}" stroke-width="1.4"/>`; } prevA={x,y,v}; }
+    for (const t of [0,0.5,1]) s += `<text x="${padL-4}" y="${_f(amBase-t*amH)}" font-size="${fs}" fill="#333" text-anchor="end" dominant-baseline="central">${t.toFixed(1)}</text>`;
+    const yamL=_f((amTop+amBase)/2); s += `<text x="11" y="${yamL}" font-size="${fs}" fill="#a33" text-anchor="middle" transform="rotate(-90 11 ${yamL})">AM path.</text>`;
+  }
+  const nT=clipXTicks(),ticks=[]; for(let i=0;i<nT;i++){const r=Math.round(1+i*(plen-1)/(nT-1)); if(!ticks.includes(r))ticks.push(r);}
+  for(const r of ticks){ const x=xOf(r)+bw/2; s += `<line x1="${_f(x)}" y1="${_f(xtickBase)}" x2="${_f(x)}" y2="${_f(xtickBase+3)}" stroke="#ccc" stroke-width="1"/><text x="${_f(x)}" y="${_f(xtickBase+4+fs)}" font-size="${fs}" fill="#333" text-anchor="middle">${r + (A._fragOffset||0)}</text>`; }
+  for(const d of doms){ const y=domTop+d.lane*DRH, w=d.x1-d.x0; s += `<rect x="${_f(d.x0)}" y="${y}" width="${_f(w)}" height="${domBoxH}" fill="#e3e9f1" stroke="#9fb0c4" stroke-width="0.5"/>`; if(String(d.name).length*fs*0.55 < w-3) s += `<text x="${_f(d.x0+w/2)}" y="${y+domBoxH/2}" font-size="${fs}" fill="#456" text-anchor="middle" dominant-baseline="central">${_esc(d.name)}</text>`; }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${_f(W)}" height="${_f(H)}" viewBox="0 0 ${_f(W)} ${_f(H)}" font-family="${SVG_FONT}">${s}</svg>`;
+}
+function downloadSVG(filename, svg){
+  const blob = new Blob([svg], { type: 'image/svg+xml' });
+  const url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = filename; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+function svgOpts(){ const w = $('svg-w'), h = $('svg-h'), f = $('svg-fs'); return { width: (w && +w.value) || PLOT_W, height: (h && +h.value) || undefined, fontSize: (f && +f.value) || 9 }; }
+function heatOpts(){ const w = $('hm-w'), h = $('hm-h'), f = $('hm-fs'); return { width: (w && +w.value) || PLOT_W, height: (h && +h.value) || undefined, fontSize: (f && +f.value) || 9 }; }
+function redraw(A){ renderHeatmap(A); renderFreq(A); renderScatter(A); renderTable(A); renderClusterInfo(A); CHIP_CONTAINERS.forEach(id => renderChipBar(id, A)); recolor3D(A); }
+
+
+// pDockQ (Bryant, Pozzati & Elofsson 2022, author-corrected constants), fed this file's own cLIR
+// interface (cLIpLDDT + half of cLIA, which counts both PAE directions) to give an estimated LIpDockQ: lis.py counts confident contacting residue pairs. Only a
+// fallback for a CSV that predates lis.py's own pDockQ family (no LIpDockQ column at all): a CSV
+// that already carries the column hits the literal parseFloat(o[key]) path above and never reaches
+// this. pDockQ (needs a structure-derived geometric interface) and pDockQ2/LIpDockQ2 (need raw PAE)
+// are not derivable from a lis.py CSV's columns alone, so no fallback exists for them here.
+function calcPdockqCLIP(avgIfPlddt, nIfContacts){
+  if (nIfContacts == null || isNaN(nIfContacts) || nIfContacts < 0) return NaN;
+  if (nIfContacts === 0) return 0;
+  if (avgIfPlddt == null || isNaN(avgIfPlddt)) return NaN;
+  const x = avgIfPlddt * Math.log10(nIfContacts);
+  return 0.724/(1+Math.exp(-0.052*(x-152.611)))+0.018;
+}
+function scVal(o, key){
+  const v = (o[key] != null && o[key] !== '') ? parseFloat(o[key]) : NaN;
+  if (!isNaN(v)) return v;
+  if (key === 'iLISA') { const a = parseFloat(o.iLIS), b = parseFloat(o.iLIA); if (!isNaN(a) && !isNaN(b)) return a * b; }
+  if (key === 'pLDDT') { const a = parseFloat(o.pLDDT_A), b = parseFloat(o.pLDDT_B), la = parseFloat(o.Protein_Len_A)||1, lb = parseFloat(o.Protein_Len_B)||1; if (!isNaN(a) && !isNaN(b)) return (a*la + b*lb)/(la+lb); if (!isNaN(a)) return a; if (!isNaN(b)) return b; }
+  if (key === 'LIpDockQ') {
+    // Weighted by cLIR residue counts (the interface, not the whole chain) -- matches lis.py's
+    // _wmean_plddt(cLIpLDDT_i, cLIpLDDT_j, len(clirI), len(clirJ)).
+    const a = parseFloat(o.cLIpLDDT_A), b = parseFloat(o.cLIpLDDT_B), wa = parseFloat(o.cLIR_A)||0, wb = parseFloat(o.cLIR_B)||0, n = parseFloat(o.cLIA) / 2;
+    const plddt = (!isNaN(a) && !isNaN(b) && (wa+wb)>0) ? (a*wa+b*wb)/(wa+wb) : (!isNaN(a) ? a : (!isNaN(b) ? b : NaN));
+    const r = calcPdockqCLIP(plddt, n);
+    return isNaN(r) ? 0 : r;
+  }
+  return 0;
+}
+// Metrics offered on the scatter axes — known AFM-LIS/confidence metrics first (in order),
+// then any other numeric column present in the data. iLISA always available (computed).
+const METRIC_ORDER = ['iLIS','iLIA','iLISA','ipTM','ipSAE','actifpTM','LIS','cLIS','LIA','cLIA','pLDDT','pLDDT_A','pLDDT_B','LIpLDDT_A','LIpLDDT_B','cLIpLDDT_A','cLIpLDDT_B','LIpDockQ'];
+const SKIP_COLS = new Set(['Symbol_1','Symbol_2','Protein_1','Protein_2','Rank','name','chain_i','chain_j','model','structure_file','pae_plot','cLIR_indice_A','cLIR_indice_B','LIR_indice_A','LIR_indice_B','cLIR_A','cLIR_B','LIR_A','LIR_B','Protein_Len_A','Protein_Len_B','deeploc_1','deeploc_2','iLIS_x_iLIA']);
+function availableMetrics(rows){
+  const first = rows[0] || {};
+  const isNum = (c) => first[c]!=null && first[c]!=='' && !isNaN(parseFloat(first[c]));
+  const out = [];
+  for (const m of METRIC_ORDER){
+    // LIpDockQ: offered either as a literal column (a lis.py CSV new enough to ship the pDockQ
+    // family) or derived from cLIpLDDT_A + cLIA (any lis.py CSV ever produced) -- never offered
+    // with neither available, so the axis doesn't silently plot a flat zero.
+    if (m === 'LIpDockQ' && !isNum(m)) { if (isNum('cLIpLDDT_A') && isNum('cLIA')) out.push(m); continue; }
+    if (m==='iLISA' || m==='pLDDT' || isNum(m)) out.push(m);
+  }
+  for (const k in first){ if (!k.startsWith('_') && !SKIP_COLS.has(k) && !out.includes(k) && isNum(k)) out.push(k); }
+  return out;
+}
+const RANK_METRIC = '_rank';   // synthetic axis: pure global rank (1..N) by iLIS across every prediction
+function populateAxes(A){
+  const metrics = availableMetrics(A.pipe.rows).concat(RANK_METRIC);
+  const first = A.pipe.rows[0] || {}, litLiq = first.LIpDockQ != null && first.LIpDockQ !== '' && !isNaN(parseFloat(first.LIpDockQ));
+  const LABEL = { [RANK_METRIC]: 'rank (global)', actifpTM: 'actifpTM*', ...(litLiq ? {} : { LIpDockQ: 'LIpDockQ est.' }) };   // without the column, an estimate from half of cLIA
+  const fill = (id, def) => { const s=$(id); if(!s) return; const cur=s.value;
+    s.innerHTML=''; for (const m of metrics){ const o=document.createElement('option'); o.value=m; o.textContent=LABEL[m]||m; s.appendChild(o); }
+    s.value = metrics.includes(cur) ? cur : def; };
+  fill('scatter-y', metrics.includes('iLIS') ? 'iLIS' : metrics[0]);
+  fill('scatter-x', metrics.includes('iLISA') ? 'iLISA' : (metrics[1] || metrics[0]));
+}
+function spearman(xs, ys){
+  const n = xs.length; if (n < 3) return NaN;
+  const rank = (a) => { const idx = a.map((v,i)=>[v,i]).sort((p,q)=>p[0]-q[0]); const r = new Array(a.length);
+    for (let i=0;i<idx.length;){ let j=i; while(j<idx.length && idx[j][0]===idx[i][0]) j++; const avg=(i+j-1)/2+1; for(let t=i;t<j;t++) r[idx[t][1]]=avg; i=j; } return r; };
+  const rx=rank(xs), ry=rank(ys); let mx=0,my=0; for(let i=0;i<n;i++){mx+=rx[i];my+=ry[i];} mx/=n; my/=n;
+  let num=0,dx=0,dy=0; for(let i=0;i<n;i++){const a=rx[i]-mx,b=ry[i]-my; num+=a*b; dx+=a*a; dy+=b*b;}
+  return (dx&&dy) ? num/Math.sqrt(dx*dy) : NaN;
+}
+function pearson(xs, ys){
+  const n = xs.length; if (n < 3) return NaN;
+  let mx=0,my=0; for(let i=0;i<n;i++){mx+=xs[i];my+=ys[i];} mx/=n; my/=n;
+  let num=0,dx=0,dy=0; for(let i=0;i<n;i++){const a=xs[i]-mx,b=ys[i]-my; num+=a*b; dx+=a*a; dy+=b*b;}
+  return (dx&&dy) ? num/Math.sqrt(dx*dy) : NaN;
+}
+function renderScatter(A){
+  // Plotly (1.3 MB gzipped) is fetched here, the first time a scatter is drawn, not on every visit.
+  // Until it has arrived, hold this plot and redraw from LAST when its script loads; the other
+  // panels render meanwhile. If it cannot load at all (offline report, blocked CDN), say so here
+  // instead of throwing, which used to take the table and cluster panels down with it.
+  if (typeof Plotly === 'undefined'){
+    const el = $('scatter');
+    let tag = $('plotly-lib');
+    const note = (msg) => { if (el) el.innerHTML = '<div class="plotly-wait" style="padding:24px; color:#6B6B6B; font-size:0.85rem;">' + msg + '</div>'; };
+    if (window.__PLOTLY_FAILED){ note('Scatter unavailable: the plotting library (Plotly) could not be loaded.'); return; }
+    if (!tag){
+      tag = document.createElement('script'); tag.id = 'plotly-lib'; tag.async = true;
+      tag.src = 'https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.3/plotly.min.js';
+      tag.onerror = () => { window.__PLOTLY_FAILED = true; };
+      document.head.appendChild(tag);
+    }
+    note('Loading plot…');
+    if (!tag.dataset.waiting){
+      tag.dataset.waiting = '1';
+      const again = () => { if (LAST) renderScatter(LAST); };
+      tag.addEventListener('load', again, { once: true });
+      tag.addEventListener('error', again, { once: true });
+    }
+    return;
+  }
+  { const w = $('scatter') && $('scatter').querySelector('.plotly-wait'); if (w) w.remove(); }
+  const { pipe, cl } = A, k = cl.optimalK;
+  const cutoff = (A.opts && A.opts.ilisCutoff) || 0.223;
+  const xKey = ($('scatter-x') && $('scatter-x').value) || 'iLISA';
+  const yKey = ($('scatter-y') && $('scatter-y').value) || 'iLIS';
+  const pointsMode = ($('scatter-points') && $('scatter-points').value) || 'all';   // every prediction vs rank-1 per pair
+  const pk = (p) => p.Symbol_2 + '\u0001' + p.Rank;
+  // Pure global rank over every prediction, by whichever metric the axes are showing (the Y metric,
+  // or X if Y itself is the rank axis, else iLIS). 6465 predictions → ranks 1..6465. Keyed by
+  // pair+model-rank so it maps onto any point instance.
+  const rankBy = yKey !== RANK_METRIC ? yKey : (xKey !== RANK_METRIC ? xKey : 'iLIS');
+  const allPreds = pipe.allPredictions || pipe.allPoints || pipe.rows;
+  const grankMap = new Map();
+  allPreds.map((p,i)=>[p,i]).sort((a,b)=>(scVal(b[0],rankBy)-scVal(a[0],rankBy))||(a[1]-b[1]))
+    .forEach(([p],i)=>{ const key=pk(p); if(!grankMap.has(key)) grankMap.set(key, i+1); });
+  const val = (p, key) => key===RANK_METRIC ? (grankMap.get(pk(p)) ?? NaN) : scVal(p, key);
+  const rl = (p) => `${p.Symbol_2} (R${p.Rank != null && p.Rank !== '' ? p.Rank : '?'})`;   // rank label, e.g. "sqa (R1)"
+  const HM_BASE = ['iLIS','iLIA','iLISA','ipTM'], HM_FMT = {iLIS:'.4g', iLIA:'.4g', iLISA:'.1f', ipTM:'.3g'};
+  const hoverM = HM_BASE.concat([...new Set([yKey, xKey])].filter(m => !HM_BASE.includes(m)));   // append the selected Y/X metric when it isn't one of the four already shown (e.g. ipSAE, actifpTM)
+  const cd = (p) => hoverM.map(m => val(p, m));
+  const HT = '%{text}' + hoverM.map((m,i) => `<br>${m==='actifpTM' ? 'actifpTM*' : m} %{customdata[${i}]:${HM_FMT[m]||'.4g'}}`).join('') + '<extra></extra>';
+  // Color is per PREDICTION, not per gene: clustering runs on each prediction's contact fingerprint,
+  // so the same partner's different ranks can land in different clusters (a protein that binds two
+  // domains of the target shows up as two clusters). Key the cluster by gene+rank. A prediction that
+  // never entered the clustered set — below the iLIS cutoff, e.g. iLIS≈0 — has no cluster and stays
+  // gray; it is never colored by borrowing a sibling rank's cluster.
+  const predCluster = new Map();
+  for (let i=0;i<pipe.rows.length;i++) predCluster.set(pk(pipe.rows[i]), cl.labels[i]);
+  const fg = (pointsMode === 'all' ? allPreds.filter(p => predCluster.has(pk(p)))
+                                   : allPreds.filter(p => predCluster.has(pk(p)) && +p.Rank === 1))
+             .map(p => ({ p, lab: predCluster.get(pk(p)) }));
+  const fgKeys = new Set(fg.map(f => pk(f.p)));
+  const bg = allPreds.filter(p => !fgKeys.has(pk(p)));
+  const bgTrace = { x: bg.map(p=>val(p,xKey)), y: bg.map(p=>val(p,yKey)), text: bg.map(rl), customdata: bg.map(cd),
+    mode:'markers', type:'scatter', legendrank:9999, name:`other predictions (${bg.length})`, marker:{ size:5, color:'#cdd3db', line:{width:0} }, hovertemplate: HT };
+  const traces = {};
+  for (const { p, lab } of fg){
+    (traces[lab]=traces[lab]||{x:[],y:[],text:[],cd:[]});
+    traces[lab].x.push(val(p,xKey)); traces[lab].y.push(val(p,yKey)); traces[lab].text.push(rl(p)); traces[lab].cd.push(cd(p)); }
+  const clTraces = Object.keys(traces).sort((a,b)=>a-b).map(lab=>({ x:traces[lab].x, y:traces[lab].y, text:traces[lab].text, customdata:traces[lab].cd,
+    mode:'markers', type:'scatter', legendrank:+lab, name:'cluster '+lab+' ('+traces[lab].x.length+')', marker:{ size:9, color:clusterColor(+lab,k), line:{width:.5,color:'#fff'} }, hovertemplate: HT }));
+  const axTitle = (kk) => kk===RANK_METRIC ? `global rank (by ${rankBy})` : kk==='actifpTM' ? 'actifpTM* (approximate)' : kk;
+  const layout = { margin:{t:10,r:10,b:45,l:62}, xaxis:{title:axTitle(xKey), rangemode:'tozero'}, yaxis:{title:axTitle(yKey), rangemode:'tozero'}, legend:{font:{size:10}} };
+  // FPR iLIS reference lines when iLIS is on an axis, each in its band color (LiviaMaps.BAND; active cutoff bolder)
+  const bandOf = (v) => LiviaMaps.BAND[v >= 0.551 ? 1 : v >= 0.339 ? 5 : 10];
+  const fprShape = (ax, v) => ax==='y'
+    ? { type:'line', xref:'paper', x0:0, x1:1, y0:v, y1:v, line:{ color:bandOf(v), width: v===cutoff?1.5:0.8, dash: 'dash' } }
+    : { type:'line', yref:'paper', y0:0, y1:1, x0:v, x1:v, line:{ color:bandOf(v), width: v===cutoff?1.5:0.8, dash: 'dash' } };
+  const fprAnn = (ax, lbl, v) => ax==='y'
+    ? { xref:'paper', x:1, xanchor:'right', y:v, yanchor:'bottom', text:`${lbl} (${v})`, showarrow:false, font:{size:9, color:bandOf(v)} }
+    : { yref:'paper', y:1, yanchor:'top', x:v, xanchor:'left', text:`${lbl} (${v})`, showarrow:false, font:{size:9, color:bandOf(v)}, textangle:-90 };
+  const ax = yKey==='iLIS' ? 'y' : (xKey==='iLIS' ? 'x' : null);
+  if (ax){ layout.shapes = FPR_ILIS.map(([,v])=>fprShape(ax,v)); layout.annotations = FPR_ILIS.map(([l,v])=>fprAnn(ax,l,v)); }
+  const _cx=[], _cy=[];   // Spearman rank correlation of the two axes across all plotted predictions
+  for (const p of bg){ _cx.push(val(p,xKey)); _cy.push(val(p,yKey)); }
+  for (const lab in traces){ for (let i=0;i<traces[lab].x.length;i++){ _cx.push(traces[lab].x[i]); _cy.push(traces[lab].y[i]); } }
+  const _rho = spearman(_cx, _cy), _r = pearson(_cx, _cy);
+  { const el = $('scatter-rho'); if (el) el.textContent = (isNaN(_r) ? '' : `Pearson r = ${_r.toFixed(3)} \u00b7 `) + (isNaN(_rho) ? '' : `Spearman \u03c1 = ${_rho.toFixed(3)}`) + ` (n=${_cx.length})`; }
+  // Autocomplete list of partner names present in the plot (unique, sorted)
+  const partnerNames = [...new Set(allPreds.map(p=>String(p.Symbol_2)))];
+  { const dl=$('scatter-list'); if(dl) dl.innerHTML = partnerNames.slice().sort((a,b)=>a.toLowerCase()<b.toLowerCase()?-1:a.toLowerCase()>b.toLowerCase()?1:0).map(n=>`<option value="${n.replace(/"/g,'&quot;')}"></option>`).join(''); }
+  // Highlight the searched partner: ring every one of its plotted points (all its ranks) and label them
+  const extra=[];
+  if (SCATTER_HL){
+    const q=SCATTER_HL.toLowerCase();
+    const canon = partnerNames.find(n=>n.toLowerCase()===q) || partnerNames.find(n=>n.toLowerCase().startsWith(q)) || partnerNames.find(n=>n.toLowerCase().includes(q));
+    const si=$('scatter-search');
+    if (canon){
+      if(si) si.classList.remove('nf');
+      const hip = allPreds.filter(p=>String(p.Symbol_2)===canon);
+      extra.push({ x:hip.map(p=>val(p,xKey)), y:hip.map(p=>val(p,yKey)), text:hip.map(rl), mode:'markers+text', type:'scatter',
+        name:'\u2605 '+canon, legendrank:-1, textposition:'top center', textfont:{size:11,color:'#111'},
+        marker:{ size:17, color:'rgba(0,0,0,0)', symbol:'circle-open', line:{width:3, color:'#111'} }, hoverinfo:'skip' });
+    } else if(si){ si.classList.add('nf'); }
+  }
+  Plotly.newPlot('scatter', [bgTrace, ...clTraces, ...extra], layout, {responsive:true, displaylogo:false});
+}
+
+function renderTable(A){
+  const { pipe, cl } = A, k = cl.optimalK, first = pipe.rows[0] || {};
+  const has = (c) => first[c] != null && first[c] !== '';
+  const numFmt = (key, dp) => (r) => { if(key==='iLISA'){ const a=+r.iLIS||0,b=+r.iLIA||0; const v=(r.iLISA!=null&&r.iLISA!=='')?+r.iLISA:a*b; return v.toFixed(dp); } const v=+r[key]; return isNaN(v)?'':v.toFixed(dp); };
+  const numSort = (key) => (r) => key==='iLISA' ? ((r.iLISA!=null&&r.iLISA!=='')?+r.iLISA:(+r.iLIS||0)*(+r.iLIA||0)) : (isNaN(+r[key])?-Infinity:+r[key]);
+  const combo = (ka, kb) => (r) => `${Math.round(+r[ka]||0)} / ${Math.round(+r[kb]||0)}`;
+  const plddtKey = has('pLDDT') ? 'pLDDT' : (has('pLDDT_A') ? 'pLDDT_A' : null);
+  const cols = [
+    { l:'Partner', fmt:(r)=>r.Symbol_2, sort:(r)=>String(r.Symbol_2).toLowerCase() },
+    { l:'Rank', fmt:(r)=>Math.trunc(+r.Rank)||'', sort:(r)=>+r.Rank||0 },
+    { l:'Cluster', fmt:(r,lab)=>`<span class="chip" style="background:${clusterColor(lab,k)}"></span>${lab}`, sort:(r,lab)=>lab },
+  ];
+  const M = (l, key, dp) => { if (key==='iLISA' || has(key)) cols.push({ l, fmt:numFmt(key,dp), sort:numSort(key) }); };
+  M('iLIS','iLIS',3); M('iLIA','iLIA',1); M('iLISA','iLISA',1); M('ipSAE','ipSAE',3); M('actifpTM*','actifpTM',3); M('ipTM','ipTM',3);
+  { const nt = $('ptable-note'); if (nt) nt.hidden = !has('actifpTM'); }
+  if (plddtKey) cols.push({ l:'pLDDT', fmt:numFmt(plddtKey,1), sort:numSort(plddtKey) });
+  M('LIS','LIS',3); M('cLIS','cLIS',3);
+  if (has('LIR_A')||has('LIR_B')) cols.push({ l:'LIR (i/j)', fmt:combo('LIR_A','LIR_B'), sort:(r)=>(+r.LIR_A||0)+(+r.LIR_B||0) });
+  if (has('cLIR_A')||has('cLIR_B')) cols.push({ l:'cLIR (i/j)', fmt:combo('cLIR_A','cLIR_B'), sort:(r)=>(+r.cLIR_A||0)+(+r.cLIR_B||0) });
+
+  let items = pipe.rows.map((r,i)=>({ r, lab: cl.labels[i] }));   // keep row↔cluster pairing
+  // Autocomplete list of partner names (unique, sorted)
+  { const dl = $('ptable-list');
+    if (dl){ const names=[...new Set(pipe.rows.map(r=>String(r.Symbol_2)))].sort((a,b)=>a.toLowerCase()<b.toLowerCase()?-1:a.toLowerCase()>b.toLowerCase()?1:0);
+      dl.innerHTML = names.map(n=>`<option value="${n.replace(/"/g,'&quot;')}"></option>`).join(''); } }
+  const _total = items.length;
+  if (TABLE_FILTER){ const q=TABLE_FILTER.toLowerCase(); items = items.filter(it=>String(it.r.Symbol_2).toLowerCase().includes(q)); }
+  { const cnt=$('ptable-count'); if(cnt) cnt.textContent = TABLE_FILTER ? `${items.length} / ${_total}` : ''; }
+  if (TABLE_SORT){
+    const col = cols.find(c=>c.l===TABLE_SORT.label);
+    if (col){ const d = TABLE_SORT.dir==='desc'?-1:1;
+      items.sort((a,b)=>{ const va=col.sort(a.r,a.lab), vb=col.sort(b.r,b.lab); const c = typeof va==='string'?va.localeCompare(vb):(va-vb); return d*c; }); }
+  }
+  const arrow = (l) => (TABLE_SORT && TABLE_SORT.label===l) ? (TABLE_SORT.dir==='desc'?' ▾':' ▴') : '';
+  let html = '<thead><tr><th>#</th>'+cols.map(c=>`<th data-col="${c.l}" style="cursor:pointer">${c.l}${arrow(c.l)}</th>`).join('')+'</tr></thead><tbody>';
+  items.forEach((it,i)=>{ html += `<tr><td>${i+1}</td>`+cols.map(c=>`<td>${c.fmt(it.r, it.lab)}</td>`).join('')+'</tr>'; });
+  const t = $('ptable'); t.innerHTML = html + '</tbody>';
+  t.querySelectorAll('th[data-col]').forEach(th => th.onclick = () => {
+    const l = th.dataset.col;
+    TABLE_SORT = (TABLE_SORT && TABLE_SORT.label===l) ? { label:l, dir: TABLE_SORT.dir==='desc'?'asc':'desc' } : { label:l, dir:'desc' };
+    renderTable(LAST);
+  });
+}
+
+$('export').onclick = async () => {
+  if (!LAST) return;
+  const btn = $('export'), prev = btn.textContent; btn.textContent = 'preparing…';
+  try {
+    // Self-contained interactive report via base64 (no </scr''ipt> / comment escaping hazards):
+    // local JS become data: script URLs, the report data is atob+JSON.parse'd, and the page re-renders.
+    const b64 = (s) => btoa(unescape(encodeURIComponent(s)));
+    let out = await (await fetch(location.href)).text();
+    const navBase = location.origin + location.pathname.replace(/[^/]*$/, '');   // downloaded nav points back at the live site
+    out = out.replace(/href="(?!https?:|#|mailto:)([^"]+\.html[^"]*)"/g, 'href="' + navBase + '$1"');
+    const locals = ['js/canvas2svg.js', 'js/livia-maps.js', 'js/livia-xlsx.js', 'js/clip-clustering.js', 'js/clip-pipeline.js', 'js/clip-resolver.js', 'js/livia-viewer.js', 'js/livia-subnav.js', 'js/livia-count.js', 'js/livia-version.js'];
+    const tagRe = (f) => new RegExp('<script src="' + f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:\\?v=[^"]*)?"><\\/script>');
+    try { const wjs = await (await fetch('js/livia-wasm.js')).text(); out = out.replace(tagRe('js/clip-clustering.js'), '<script src="data:text/javascript;base64,' + b64(wjs) + '"></scr' + 'ipt>\n$&'); } catch(e){}
+    for (const f of locals){ const js = await (await fetch(f)).text(); out = out.replace(tagRe(f), '<script src="data:text/javascript;base64,' + b64(js) + '"></scr' + 'ipt>'); }
+    try { const ff = await (await fetch('https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js')).text(); out = out.replace('<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"><\/script>', '<script src="data:text/javascript;base64,' + b64(ff) + '"></scr' + 'ipt>'); } catch(e){}
+    try { const css = await (await fetch('css/livia.css')).text(); out = out.replace(/<link rel="stylesheet" href="css\/livia\.css(?:\?v=[^"]*)?">/, '<style>\n' + css + '\n</style>'); } catch(e){}
+    // Slim the bundled data. structure_file / pae_plot are path strings no view reads,
+    // so drop them everywhere. The LIR/cLIR residue indices ARE read — by the sequence
+    // viewer and the interface map — but only off `rows` (via allRanksFor /
+    // bestRowPerPartner). The scatter reads allPredictions / allPoints and needs no
+    // indices, and that is where the weight sits (≈450 KB there vs ≈80 KB on rows), so
+    // keep dropping them there and keep them on rows. Dropping indices off rows too was
+    // a bug: it left the downloaded report's sequence viewer with no highlights and its
+    // interface map blank, since those views had nothing to plot.
+    const DROP_ALL = ['structure_file', 'pae_plot'];
+    const DROP_BIG = DROP_ALL.concat(['cLIR_indice_A', 'cLIR_indice_B', 'LIR_indice_A', 'LIR_indice_B']);
+    const trim = (drop) => (r) => { const o = {}; for (const k in r) if (drop.indexOf(k) < 0) o[k] = r[k]; return o; };
+    const P = LAST.pipe, slimP = { ...P, rows: (P.rows||[]).map(trim(DROP_ALL)), allPredictions: (P.allPredictions||[]).map(trim(DROP_BIG)), allPoints: (P.allPoints||[]).map(trim(DROP_BIG)) };
+    const slimLAST = { ...LAST, pipe: slimP };
+    const gz = fflate.gzipSync(fflate.strToU8(JSON.stringify({ LAST: slimLAST, PALETTE, CLUSTER_OVERRIDE, COMMONALITY, MIN_CLUSTER, COLOR3D, AM_CUTOFF, ACTIVE: [...ACTIVE], badge: $('struct-badge').innerHTML, uniprot: $('query-uniprot').innerHTML })));
+    let dataB64 = ''; for (let i = 0; i < gz.length; i += 0x8000) dataB64 += String.fromCharCode.apply(null, gz.subarray(i, i + 0x8000)); dataB64 = btoa(dataB64);
+    out = out.replace('</head>', '<script>window.__CLIP_DATA__ = JSON.parse(fflate.strFromU8(fflate.gunzipSync(Uint8Array.from(atob("' + dataB64 + '"), c => c.charCodeAt(0)))));</scr' + 'ipt>\n</head>');
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([out], { type: 'text/html' })); a.download = 'clip_' + LAST.gene + '.html';
+    document.body.appendChild(a); a.click(); setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch(e){} a.remove(); }, 2000);
+  } catch(e){ console.error('export failed', e); alert('Export failed: ' + e.message); }
+  btn.textContent = prev;
+};
+function loadExportData(d){                           // reconstruct a bundled report — fully interactive, no upload/network (except Plotly/Mol* CDN)
+  try {
+    PALETTE = d.PALETTE || 'tab20'; CLUSTER_OVERRIDE = d.CLUSTER_OVERRIDE || {}; COMMONALITY = d.COMMONALITY != null ? d.COMMONALITY : 0.5;
+    COLOR3D = d.COLOR3D || 'cluster'; AM_CUTOFF = d.AM_CUTOFF != null ? d.AM_CUTOFF : 0; MIN_CLUSTER = d.MIN_CLUSTER != null ? d.MIN_CLUSTER : 5;
+    LAST = d.LAST;
+    const sv = (id, v) => { const el = $(id); if (el && v != null) el.value = String(v); };
+    sv('palette', PALETTE); syncCommonality(); sv('am-cutoff', AM_CUTOFF); sv('min-cluster', MIN_CLUSTER);
+    render(LAST);                                     // builds every panel AND wires the interactive handlers
+    if (d.ACTIVE && d.ACTIVE.length){ ACTIVE = new Set(d.ACTIVE); redraw(LAST); }
+    if (LAST._am) document.querySelectorAll('.am-only').forEach(e => e.classList.remove('hidden'));
+    document.querySelectorAll('.cmode').forEach(x => x.classList.toggle('sel', x.dataset.mode === COLOR3D));
+    const w = $('am-cut-wrap'); if (w) w.classList.toggle('hidden', COLOR3D !== 'am');
+    if (d.badge) $('struct-badge').innerHTML = d.badge;
+    if (d.uniprot) $('query-uniprot').innerHTML = d.uniprot;
+    if (LAST._structText && typeof buildMolstarPage === 'function'){
+      const base = location.origin + location.pathname.replace(/[^/]*$/, '');
+      $('viewer3d-frame').setAttribute('srcdoc', buildMolstarPage(LAST._structText, LAST._fmt || 'cif', clusterColorComponents(LAST), base));
+    }
+    // strip the upload/query controls — the export is a report, not the tool
+    const _ic = $('in-csv'); if (_ic){ const _c = _ic.closest('.card'); if (_c) _c.style.display = 'none'; }   // upload panel is dead in an export
+    const _eb = $('export'); if (_eb) _eb.style.display = 'none';                                             // no re-download from a downloaded report
+    $('status').textContent = 'exported report';
+  } catch(e){ console.error('loadExportData failed', e); }
+}
+
+// ---- cluster selection chips (shared control: 3D viewer + frequency plot) ----
+function _allClusters(k){ return new Set(Array.from({length:k},(_,i)=>i+1)); }
+function renderChipBar(id, A){
+  const k = A.cl.optimalK, box = $(id); if (!box) return;
+  const sizes = {}; for (const lab of A.cl.labels) sizes[lab] = (sizes[lab]||0)+1;   // # PPIs per cluster
+  let html = `<span class="cchip all sel" data-c="all">All clusters (${A.cl.labels.length})</span>`;
+  for (let c=1;c<=k;c++) html += `<span class="cchip" data-c="${c}"><span class="dot" style="background:${clusterColor(c,k)}"></span>${_esc(clusterLabel(c,true))} (${sizes[c]||0})</span>`;
+  box.innerHTML = html;
+  box.querySelectorAll('.cchip').forEach(chip => chip.onclick = () => toggleCluster(chip.dataset.c, A));
+  refreshChipVisuals(A);
+}
+function toggleCluster(c, A){
+  const k = A.cl.optimalK;
+  if (c === 'all') ACTIVE = _allClusters(k);
+  else { const id = +c;
+    if (ACTIVE.size === k) ACTIVE = new Set([id]);            // all → isolate this one
+    else if (ACTIVE.has(id)){ ACTIVE.delete(id); if(!ACTIVE.size) ACTIVE = _allClusters(k); }
+    else ACTIVE.add(id);
+  }
+  refreshChipVisuals(A); renderHeatmap(A); renderFreq(A); recolor3D(A);
+}
+function refreshChipVisuals(A){
+  const k = A.cl.optimalK, all = ACTIVE.size === k;
+  CHIP_CONTAINERS.forEach(id => { const box = $(id); if (!box) return;
+    box.querySelectorAll('.cchip').forEach(chip => { const c = chip.dataset.c;
+      if (c === 'all') chip.classList.toggle('sel', all);
+      else { chip.classList.toggle('off', !all && !ACTIVE.has(+c)); chip.classList.toggle('sel', !all && ACTIVE.has(+c)); } });
+  });
+}
+
+// ---- 3D structure: LIVIA-style base Mol* iframe + MVS coloring, with remapped coords ----
+// Multi-chain (dimer) structure: the query is the chain whose residue count matches the query
+// length — not necessarily chain A (ColabFold order can put the query second). Length disambiguates.
+function pickQueryChain(plddtMap, queryLen){
+  if (!plddtMap || !plddtMap.size) return 'A';
+  const counts = {};
+  for (const key of plddtMap.keys()){ const ch = key.split(':')[0]; counts[ch] = (counts[ch]||0) + 1; }
+  const chains = Object.keys(counts);
+  if (chains.length <= 1) return chains[0] || 'A';
+  chains.sort((a,b) => Math.abs(counts[a]-queryLen) - Math.abs(counts[b]-queryLen) || (a<b?-1:1));
+  return chains[0];
+}
+let COMMONALITY = 0.5;   // 3D: color a residue with a cluster when >= this fraction of the cluster's members contact it
+// Show COMMONALITY in its control: the matching preset, or "custom…" with the value in the percent field (a saved report
+// can carry any value from 1 to 100%).
+function syncCommonality(){
+  const sel = $('commonality'), box = $('commonality-custom'), pct = $('commonality-pct'); if (!sel) return;
+  const preset = [...sel.options].find((o) => o.value !== 'custom' && Math.abs(+o.value - COMMONALITY) < 1e-9);
+  if (preset) { sel.value = preset.value; box.classList.add('hidden'); }
+  else { sel.value = 'custom'; box.classList.remove('hidden'); pct.value = +(COMMONALITY * 100).toFixed(1); }
+}
+let MIN_CLUSTER = 5;   // 3D: skip clusters with fewer than this many predictions/members (matches the "Cn (N)" chip count); ignored when a single cluster is isolated
+let COLOR3D = 'cluster';   // 3D color mode: cluster | plddt | am
+let AM_CUTOFF = 0;         // AM mode: only color residues with mean pathogenicity >= this (0 = show all)
+function clusterColorComponents(A){
+  const { pipe, cl } = A, k = cl.optimalK, map = A.residueMap;
+  let N = A._structLen || pipe.proteinLen; const GRAY = '#e6e6e6', qc = A._queryChain || 'A'; if (A.residueMap){ for (const sr of A.residueMap) if (sr && sr > N) N = sr; }   // fragment cLIR coords map onto the full structure (e.g. 410-764) — cover them
+  const colorAt = new Array(N+1).fill(GRAY);
+  const mode = COLOR3D;
+  if (mode === 'plddt' && A._plddt){ for (let sr=1;sr<=N;sr++){ const v=A._plddt.get(qc+':'+sr); if(v!=null) colorAt[sr]=plddtColor(v); } }
+  else if (mode === 'am' && A._am){ for (let sr=1;sr<=N;sr++){ const v=A._am[sr]; if(v!=null && v>=AM_CUTOFF) colorAt[sr]=amColor(v); } }
+  else {   // cluster consensus: color a residue with a cluster only when >= COMMONALITY fraction of its members contact it
+    const active = ACTIVE || _allClusters(k), toStruct = (r) => map ? map[r-1] : r, thr = COMMONALITY;
+    const byRes = {}, clusterSize = {};
+    for (let i=0;i<pipe.fingerprints.length;i++){ const lab=cl.labels[i]; clusterSize[lab]=(clusterSize[lab]||0)+1;
+      for (const res of pipe.fingerprints[i]){ const sr=toStruct(res); if(!sr||sr<1)continue; (byRes[sr]=byRes[sr]||{})[lab]=(byRes[sr][lab]||0)+1; } }
+    for (const res in byRes){ const r=+res; if(r<1||r>N)continue; let dom=null, domHits=-1, domSize=-1; const cc=byRes[res];
+      for (const c in cc){ if(!active.has(+c)) continue; if(active.size !== 1 && (clusterSize[c]||0) < MIN_CLUSTER) continue; const hits=cc[c]; if(hits/(clusterSize[c]||1) < thr) continue; const sz=clusterSize[c]||0;
+        if(hits>domHits || (hits===domHits && sz>domSize) || (hits===domHits && sz===domSize && dom!=null && +c<dom)){ domHits=hits; domSize=sz; dom=+c; } }   // shared residue → the passing cluster contacting it most (raw count = size × consensus): big, strongly-contacting cluster wins, so a small cluster can't steal C1's territory
+      if (dom!=null) colorAt[r]=clusterColor(dom,k); }
+  }
+  const byColor = {}; let r=1;
+  while (r<=N){ const c=colorAt[r]; let e=r; while(e<N && colorAt[e+1]===c) e++; (byColor[c]=byColor[c]||[]).push({start:r,end:e}); r=e+1; }
+  return Object.entries(byColor).map(([color,ranges]) => ({ chain: A._queryChain || 'A', ranges, color }));
+}
+function recolor3D(A){ if (A._structText) applyColorsToMolstarFrame('viewer3d-frame', clusterColorComponents(A), A._fmt); }
+async function load3D(source, A){
+  const frame = $('viewer3d-frame');
+  let text, fmt;
+  if (source.file){ text = await source.file.text(); fmt = /\.(pdb|ent)$/i.test(source.file.name) ? 'pdb' : 'mmcif'; }
+  else { text = await (await fetch(source.url)).text(); fmt = 'mmcif'; }
+  A._structText = text; A._fmt = fmt; A._structLen = source.structLen || null;
+  try { A._plddt = parseBfactorsPerResidue(text, fmt === 'mmcif' ? 'cif' : 'pdb'); } catch(e){ A._plddt = null; }
+  A._queryChain = pickQueryChain(A._plddt, A.pipe.proteinLen);   // dimer: pick the chain matching the query length, not always A
+  { const chs = A._plddt ? new Set([...A._plddt.keys()].map(k => k.split(':')[0])) : new Set();
+    if (chs.size > 1) $('struct-badge').textContent += ` · query = chain ${A._queryChain}`; }
+  renderFreq(A); if (A._fragOffset) renderHeatmap(A);   // re-render with the AFDB pLDDT overlay + fragment full-protein axis now available
+  const base = window.location.origin + window.location.pathname.replace(/[^/]*$/, '');
+  const page = buildMolstarPage(text, fmt, clusterColorComponents(A), base);
+  const blob = new Blob([page], { type:'text/html' });
+  if (frame._url) { try { URL.revokeObjectURL(frame._url); } catch(e){} }
+  frame._url = URL.createObjectURL(blob); frame.src = frame._url;
+}
+function no3D(html){   // why the 3D card is empty (or nothing, to clear it); the viewer frame hides while a reason shows
+  let m = $('v3d-msg'); const fr = $('viewer3d-frame'); if (!fr) return;
+  if (!m){ m = document.createElement('div'); m.id = 'v3d-msg'; m.className = 'muted'; m.style.cssText = 'margin-top:.5rem; padding:.7rem .9rem; border:1px dashed var(--line, #d5dbe2); border-radius:8px; font-size:.85rem; line-height:1.5'; fr.parentNode.insertBefore(m, fr); }
+  m.innerHTML = html; m.hidden = !html; fr.style.display = html ? 'none' : '';
+}
+async function resolve3D(A){
+  const badge = $('struct-badge'), gene = A.gene, plen = A.pipe.proteinLen, species = ($('mg-species') && $('mg-species').value) || '';
+  A.residueMap = null; A._structText = null; A._domains = null; A._accession = null; A._fragOffset = 0; $('query-uniprot').innerHTML = '';
+  // bait sequence from FASTA — by symbol/pair-name, else by unique length (arbitrary headers)
+  const predSeq = CLIPResolver.baitSequence(FASTA_PARSE, gene, plen);
+  if (STRUCT_FILE){                                   // uploaded structure wins (offline / confidential)
+    badge.textContent = `· uploaded ${STRUCT_FILE.name} (coords 1:1 with predicted)`;
+    no3D(''); load3D({ file: STRUCT_FILE }, A); return;
+  }
+  badge.textContent = '· resolving…';
+  let res = null;
+  // A forced accession still describes the same fragment: 'Pura_1_387' + Q7KU87 -> 'Q7KU87_1_387',
+  // which resolveStructure reads as residues 1–387 of that entry rather than a length mismatch.
+  const _frag = String(gene).match(/_(\d+_\d+)$/);
+  const _all = FORCE_ACC ? [FORCE_ACC + (_frag ? '_' + _frag[1] : '')]   // the user named the protein — do not second-guess it
+                        : [...new Set([gene].concat(LABEL_IDS[gene] || []))];   // identity map and/or workbook-stated ids
+  const _ACC = /^([OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2})(_\d+_\d+)?$/;   // UniProt accession (opt. fragment suffix) — species-unambiguous, unlike a bare symbol
+  const _xrefish = (s) => _ACC.test(String(s)) || /^(FB(gn|pp|tr)\d+|WBGene\d+|ENS[A-Z]*[GPT]\d+)/i.test(String(s));   // resolve via an accession / xref first — a bare symbol resolves to the human paralog when no organism is set
+  const _cands = [..._all.filter(_xrefish), ..._all.filter(x => !_xrefish(x))];   // then the display label / identity-map id columns
+  for (const _c of _cands){ let _r = null; try { _r = await CLIPResolver.resolveStructure({ gene: _c, length: plen, seq: predSeq, species }); } catch(e){ console.warn(e); } if (_r && _r.cifUrl){ res = _r; break; } if (_r && !res) res = _r; }
+  if (!res){ badge.textContent = `· no UniProt match (${gene}${species ? ', ' + species : ''}) — drop a structure or set species`; $('viewer3d-frame').src = 'about:blank';
+    no3D(`No 3D structure: ${_esc(gene)} could not be matched to a UniProt entry${species ? '' : ' (no species set)'}, so there is no AlphaFold DB model to show. Set the species in the name-conversion bar above, or drop a structure file (.cif or .pdb) of the query to color its clusters in 3D.`); return; }
+  // UniProt identity — shown whether or not an AFDB structure is available.
+  const _atlasSp = typeof LiviaMaps !== 'undefined' && LiviaMaps.atlasSpecies ? LiviaMaps.atlasSpecies(res.taxonId, res.organism) : null;
+  const _atlasHref = _atlasSp && res.accession ? LiviaMaps.atlasProteinUrl(_atlasSp, res.accession) : null;
+  $('query-uniprot').innerHTML = `UniProt <a href="https://www.uniprot.org/uniprotkb/${res.accession}" target="_blank">${res.accession}</a>`
+    + (_atlasHref ? ` · <a href="${_atlasHref}" target="_blank" rel="noopener" style="font-weight:600">LIVIA Atlas ↗</a>` : '')
+    + (res.gene ? ` · gene <b>${res.gene}</b>` : '') + (res.organism ? ` · ${res.organism}` : '') + ` · via ${res.matchedBy}`
+    + (res.fragment ? ` · <b>fragment ${res.fragment.start}–${res.fragment.end}</b>${res.fragment.mutations.length ? ' ('+res.fragment.mutations.join('/')+')' : ''}` : '');
+  // Align predicted → structure (canonical) sequence and remap cLIR coordinates (isoform/len diffs).
+  let note;
+  if (res.fragment){                                   // partial protein: shift cLIR coords onto the full structure
+    A.residueMap = []; for (let i = 1; i <= plen; i++) A.residueMap[i-1] = res.fragment.offset + i; A._fragOffset = res.fragment.offset;
+    note = `fragment ${res.fragment.start}–${res.fragment.end} on full ${res.accession}` + (res.fragment.mutations.length ? ` · ${res.fragment.mutations.join('/')}` : '');
+  } else if (typeof LABEL_FRAG !== 'undefined' && LABEL_FRAG[gene]){ const mf = LABEL_FRAG[gene]; A.residueMap = []; for (let i = 1; i <= plen; i++) A.residueMap[i-1] = (mf.start - 1) + i; A._fragOffset = mf.start - 1; note = `fragment ${mf.start}\u2013${mf.end} on full ${res.accession}` + ((mf.end - mf.start + 1) !== plen ? ` \u26a0 range ${mf.end-mf.start+1}\u2260query ${plen}` : ''); }   // partial protein from the identity map's start/end columns
+  else if (predSeq && res.structureSequence){ const mi = CLIPResolver.alignMap(predSeq, res.structureSequence); A.residueMap = mi.map; note = mi.method === 'identical' ? 'seq 1:1 ✓' : `remapped (${mi.method}, ${Math.round(100 * mi.covered / predSeq.length)}% matched)`; }
+  else if (res.structureLength && plen && res.structureLength !== plen){ note = `⚠ len ${res.structureLength}≠${plen}, no FASTA to align`; }
+  else note = res.lengthOk ? 'len ✓' : `⚠ len ${res.structureLength}≠${plen}`;
+  document.querySelectorAll('.am-only').forEach(e => e.classList.add('hidden'));   // AM is human-only; revealed only if AlphaMissense loads
+  A._accession = res.accession;
+  A._uniprotSeq = res.structureSequence || null; A._uniprotAcc = res.accession;   // fallback sequence when no FASTA
+  A._resolved = true;   // query structure resolved — now safe to look up partner domains without starving it
+  if ($('pair-partner') && $('pair-partner').value) renderPairSeq(A, $('pair-partner').value);
+  CLIPResolver.fetchDomains(res.accession).then(d => { if (d && d.length){ A._domains = d; renderFreq(A); if ($('pair-partner') && $('pair-partner').value) drawPairTracks($('pair-canvas'), A, $('pair-partner').value); } });   // UniProt domain track (needs only accession)
+  { const pp = $('pair-partner') && $('pair-partner').value; if (pp) fetchPartnerDomainsFor(A, pp, () => { if ($('pair-partner').value === pp) { drawPairTracks($('pair-canvas'), A, pp); renderPairSeq(A, pp); } }); }
+  CLIPResolver.fetchAlphaMissense(res.accession).then(am => { if (am && am.length){ A._am = am; renderFreq(A); document.querySelectorAll('.am-only').forEach(e => e.classList.remove('hidden')); } });   // AlphaMissense per-residue pathogenicity (human only)
+  if (!res.cifUrl){ badge.textContent = `· ${res.accession}${res.gene ? ' (' + res.gene + ')' : ''} · via ${res.matchedBy} · ⚠ no AFDB structure`; $('viewer3d-frame').src = 'about:blank';
+    const long = Math.max(+res.length || 0, +res.structureLength || 0, plen || 0) > 2700;
+    no3D(`No 3D structure: AlphaFold DB returned no model for UniProt ${_esc(res.accession)}${long ? ' (it has none for proteins longer than 2,700 residues)' : ' (the entry may not be in the database, or the site did not answer; reload the page to try again)'}. Drop a structure file (.cif or .pdb) of the query to color its clusters in 3D.`); return; }
+  no3D('');
+  badge.textContent = `· AFDB ${res.accession}${res.organism ? ' · ' + res.organism : ''} · via ${res.matchedBy} · ${note}`;
+  load3D({ url: res.cifUrl, structLen: res.structureLength }, A);
+}
+if (typeof window !== 'undefined' && window.__CLIP_DATA__) loadExportData(window.__CLIP_DATA__);   // self-contained export bootstrap
+</script>
+<script>window.goatcounter = { path: function () { return location.pathname.replace(/index\.html$/, ''); }, title: 'LIVIA ' + (location.pathname.split('/').pop() || 'index.html') };   /* the page only: never the file, pair or query */</script>
+<script data-goatcounter="https://livia.goatcounter.com/count"
+        async src="https://gc.zgo.at/count.js"></script>
+<script src="js/livia-count.js?v=20261105a"></script>
+<script src="js/livia-version.js?v=20261117b"></script>
+</body>
+</html>

@@ -1,0 +1,272 @@
+"""Unit tests for Liquid-State Transport Modules, Templates, and Validation Rules."""
+import unittest
+from app.lammps.viscosity import calculate_green_kubo_viscosity, generate_green_kubo_commands
+from app.lammps.diffusion import calculate_diffusion_coefficient, generate_msd_commands
+from app.generation.templates import template_water_liquid, template_molten_metal
+from app.lammps.validator import ScriptValidator
+
+
+class TestLiquidStateModules(unittest.TestCase):
+    """Test suite for liquid-specific calculations, templates, and protocol validation."""
+
+    def setUp(self):
+        self.validator = ScriptValidator()
+
+    # ── Viscosity Module Tests (Green-Kubo) ──────────────────────────
+    def test_green_kubo_viscosity_calculation(self):
+        # Synthetic decaying correlation data: C(t) = exp(-t/100)
+        import math
+        time_pts = [float(i * 5) for i in range(100)]  # 0 to 495 fs
+        acf_pxy = [math.exp(-t / 100.0) for t in time_pts]
+        acf_pxz = [0.98 * math.exp(-t / 100.0) for t in time_pts]
+        acf_pyz = [1.02 * math.exp(-t / 100.0) for t in time_pts]
+
+        res = calculate_green_kubo_viscosity(
+            time_pts=time_pts,
+            acf_pxy=acf_pxy,
+            acf_pxz=acf_pxz,
+            acf_pyz=acf_pyz,
+            volume=8000.0,
+            temp=300.0,
+            units="real"
+        )
+        self.assertGreater(res["viscosity_pa_s"], 0.0)
+        self.assertGreater(res["viscosity_cp"], 0.0)
+        self.assertEqual(res["components_averaged"], 3)
+        self.assertIn("scientific_note", res)
+
+    def test_green_kubo_integral_matches_closed_form(self):
+        # integral of exp(-t/100) from 0 to 395 fs (80% cutoff of 100 points) = 100 * (1 - e^-3.95)
+        import math
+        time_pts = [float(i * 5) for i in range(100)]
+        acf = [math.exp(-t / 100.0) for t in time_pts]
+        res = calculate_green_kubo_viscosity(time_pts, acf, units="lj", volume=2.0, temp=4.0)
+        expected = 100.0 * (1.0 - math.exp(-3.95))
+        self.assertAlmostEqual(res["integrated_integral"], expected, delta=expected * 1e-3)
+        self.assertAlmostEqual(res["viscosity_pa_s"], res["integrated_integral"] * 2.0 / 4.0)
+        running = res["running_integral"]
+        self.assertEqual(len(running), res["data_points_integrated"])
+        self.assertEqual(running[-1], res["integrated_integral"])
+        self.assertEqual(running, sorted(running))  # positive ACF: the integral only grows
+
+    def test_green_kubo_rejects_mismatched_lengths(self):
+        # Used to raise IndexError while averaging the components.
+        res = calculate_green_kubo_viscosity([0.0, 1.0, 2.0], [1.0, 0.5])
+        self.assertFalse(res["converged"])
+        self.assertEqual(res["viscosity_pa_s"], 0.0)
+
+    def test_green_kubo_real_and_metal_units_agree(self):
+        # The same physical ACF in real units (atm, fs) and metal units (bar, ps) is one viscosity.
+        import math
+        t_fs = [float(i * 2) for i in range(400)]
+        acf_atm2 = [1.0e4 * math.exp(-t / 150.0) for t in t_fs]
+        real = calculate_green_kubo_viscosity(t_fs, acf_atm2, units="real", volume=27000.0, temp=300.0)
+        metal = calculate_green_kubo_viscosity([t / 1000.0 for t in t_fs], [a * 1.01325 ** 2 for a in acf_atm2],
+                                               units="metal", volume=27000.0, temp=300.0)
+        self.assertAlmostEqual(metal["viscosity_pa_s"], real["viscosity_pa_s"], delta=real["viscosity_pa_s"] * 1e-9)
+        self.assertAlmostEqual(real["viscosity_cp"], real["viscosity_pa_s"] * 1000.0)
+
+    def test_green_kubo_refuses_unsupported_units(self):
+        # 'si', 'cgs' or a typo used to be treated as LJ and reported as Pa·s.
+        for units in ("si", "cgs", "Real"):
+            res = calculate_green_kubo_viscosity([0.0, 1.0, 2.0], [1.0, 0.5, 0.2], units=units)
+            self.assertFalse(res["converged"])
+            self.assertEqual(res["viscosity_pa_s"], 0.0)
+            self.assertIn("not supported", res["warning"])
+
+    def test_green_kubo_commands_generation(self):
+        cmds = generate_green_kubo_commands(sample_interval=1, num_samples=50, corr_length=50)
+        self.assertIn("variable        pxy equal pxy", cmds)
+        self.assertIn("variable        pxz equal pxz", cmds)
+        self.assertIn("variable        pyz equal pyz", cmds)
+        self.assertIn("fix             fGK all ave/correlate", cmds)
+
+    def test_read_correlate_file_takes_the_last_block(self):
+        import math
+        import os
+        import tempfile
+        from app.lammps.viscosity import read_correlate_file
+
+        def block(step, scale):
+            rows = "".join(f"{i + 1} {i * 2} {50 - i} {scale * math.exp(-i / 4)} {scale} {scale}\n"
+                           for i in range(5))
+            return f"{step} 5\n" + rows
+
+        text = ("# Time-correlated data for fix fGK\n# Timestep Number-of-time-windows\n"
+                "# Index TimeDelta Ncount v_pxy*v_pxy v_pxz*v_pxz v_pyz*v_pyz\n"
+                + block(100, 9.0) + block(200, 1.0) + "300 5\n1 0 50 nan 1 1\n")   # cut off mid-write
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "profile.gk.2d")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            time, acfs = read_correlate_file(path, timestep=2.0)
+            with self.assertRaises(ValueError):
+                read_correlate_file(path, timestep=0)
+        self.assertEqual(time, [0.0, 4.0, 8.0, 12.0, 16.0])   # delta in steps x 2 fs
+        self.assertEqual(len(acfs), 3)
+        self.assertAlmostEqual(acfs[0][0], 1.0)                # the last complete block, not 9.0
+        res = calculate_green_kubo_viscosity(time, *acfs, units="real", volume=8000.0, temp=300.0)
+        self.assertEqual(res["components_averaged"], 3)
+        self.assertGreater(res["viscosity_pa_s"], 0)
+
+    # ── Diffusion Module Tests (Einstein MSD) ────────────────────────
+    def test_core_diffusion_calculation(self):
+        # Linear MSD: MSD(t) = 6 * D * t + noise. Let D = 2.5e-9 m^2/s = 0.25 A^2/ps
+        # Slope = 6 * D = 1.5 A^2/ps
+        time_ps = [float(i) for i in range(50)]
+        msd_angstrom2 = [1.5 * t for t in time_ps]
+
+        res = calculate_diffusion_coefficient(time_ps, msd_angstrom2, fit_start_fraction=0.2)
+        self.assertAlmostEqual(res["slope_angstrom2_ps"], 1.5, places=3)
+        # D = 1.5 / 6 * 1e-8 m^2/s = 2.5e-9 m^2/s
+        self.assertAlmostEqual(res["diffusion_coefficient_m2_s"], 2.5e-9, places=12)
+        self.assertGreaterEqual(res["r_squared"], 0.99)
+
+    def test_msd_commands_generation(self):
+        cmds = generate_msd_commands(group="all", compute_id="cMSD")
+        self.assertIn("compute         cMSD all msd", cmds)
+        self.assertIn("fix             fMSD all ave/time", cmds)
+        self.assertIn('title1 "# TimeStep MSD_total"', cmds)   # the column is a step, not a time
+
+    def test_msd_file_steps_become_picoseconds(self):
+        import tempfile
+        from app.lammps.diffusion import read_msd_file
+        # fix ave/time output: 1 fs steps every 10 steps, MSD growing 1.5 A^2 per ps
+        lines = ["# TimeStep MSD_total", ""] + [f"{s} {1.5 * s * 0.001}" for s in range(0, 50010, 10)]
+        with tempfile.NamedTemporaryFile("w", suffix=".out", delete=False) as f:
+            f.write("\n".join(lines))
+        t, msd = read_msd_file(f.name, timestep_ps=0.001)
+        self.assertAlmostEqual(t[-1], 50.0)
+        res = calculate_diffusion_coefficient(t, msd)
+        self.assertAlmostEqual(res["diffusion_coefficient_m2_s"], 2.5e-9, places=12)
+        # Fitting against the raw step numbers would have given a D 1000x too small.
+        steps = [float(line.split()[0]) for line in lines[2:]]
+        self.assertAlmostEqual(calculate_diffusion_coefficient(steps, msd)["diffusion_coefficient_m2_s"], 2.5e-12, places=15)
+        with self.assertRaises(ValueError):
+            read_msd_file(f.name, timestep_ps=0)
+
+    def test_msd_fit_refuses_a_bad_start_fraction_and_skips_nan_rows(self):
+        import tempfile
+        from app.lammps.diffusion import read_msd_file
+        t = [i * 0.01 for i in range(100)]
+        msd = [6.0 * x for x in t]
+        for bad in (-0.5, 1.0, float("nan")):
+            with self.assertRaises(ValueError):
+                calculate_diffusion_coefficient(t, msd, fit_start_fraction=bad)
+        self.assertAlmostEqual(calculate_diffusion_coefficient(t, msd, fit_start_fraction=0.0)["slope_angstrom2_ps"], 6.0)
+        lines = ["0 0.0", "10 0.06", "20 nan", "30 0.18", "40 -inf", "50 0.30"]
+        with tempfile.NamedTemporaryFile("w", suffix=".out", delete=False) as f:
+            f.write("\n".join(lines))
+        times, values = read_msd_file(f.name, timestep_ps=0.001)
+        self.assertEqual(len(times), 4)
+        res = calculate_diffusion_coefficient(times, values, fit_start_fraction=0.0)
+        self.assertAlmostEqual(res["slope_angstrom2_ps"], 6.0)
+
+    # ── Template & Protocol Tests ────────────────────────────────────
+    def test_spce_water_template_syntax(self):
+        script = template_water_liquid(
+            temp=300.0,
+            ensemble="NVT",
+            timestep=1.0,
+            nsteps=1000,
+            kspace_choice="pppm",
+            compute_rdf=True,
+            compute_msd=True
+        )
+        val = self.validator.validate_static(script)
+        self.assertTrue(val["valid"])
+        self.assertEqual(len(val["errors"]), 0)
+        self.assertIn("fix             rigidH2O all shake 0.0001 20 0 b 1 a 1", script)
+        self.assertIn("pair_style      lj/cut/coul/long 9.8", script)
+        self.assertIn("kspace_style    pppm 1.0e-4", script)
+        self.assertIn("compute         cRDF all rdf", script)
+        self.assertIn("compute         cMSD all msd", script)
+
+    def test_spce_water_cutoff_tradeoff_documented(self):
+        script = template_water_liquid(
+            temp=300.0,
+            ensemble="NVT",
+            kspace_choice="cut"
+        )
+        self.assertIn("pair_style      lj/cut/coul/cut 9.8", script)
+        self.assertIn("ELECTROSTATICS WARNING", script)
+        self.assertIn("truncated", script)
+        self.assertNotIn("kspace_style", script)
+
+    def test_molten_metal_liquid_protocol(self):
+        script = template_molten_metal(
+            material="Copper",
+            element="Cu",
+            lattice_a=3.615,
+            mass=63.546,
+            pot_file="Cu_zhou.eam.alloy",
+            ensemble="NVE",
+            t_stop=1500.0,
+            nsteps=2000
+        )
+        val = self.validator.validate_static(script)
+        self.assertTrue(val["valid"])
+        # Liquid protocol: superheat melt at T_hot = max(1.5*T_m, T+300) -> liquid equilibration -> NVE production
+        self.assertIn("fix             melt all npt temp 300.0 1800.0", script)
+        self.assertIn("fix             eq all npt temp 1500.0 1500.0", script)
+        self.assertIn("fix             prod all nve", script)
+
+    # ── Validator Edge Cases (Issues #17 & #18) ──────────────────────
+    def test_validator_detects_non_integrating_fix(self):
+        # Script with only fix setforce (non-integrating) should warn
+        script = """units lj
+atom_style atomic
+boundary p p p
+lattice fcc 0.84
+region box block 0 4 0 4 0 4
+create_box 1 box
+create_atoms 1 box
+pair_style lj/cut 2.5
+pair_coeff 1 1 1.0 1.0 2.5
+velocity all create 1.0 1234
+timestep 0.005
+fix 1 all setforce 0.0 0.0 0.0
+run 100"""
+        val = self.validator.validate_static(script)
+        self.assertTrue(val["valid"])
+        self.assertTrue(any("No active time-integrating 'fix'" in w for w in val["warnings"]))
+
+    def test_validator_warns_on_missing_velocity_in_dynamics(self):
+        # Script with run but no velocity initialization should warn
+        script = """units lj
+atom_style atomic
+boundary p p p
+lattice fcc 0.84
+region box block 0 4 0 4 0 4
+create_box 1 box
+create_atoms 1 box
+pair_style lj/cut 2.5
+pair_coeff 1 1 1.0 1.0 2.5
+timestep 0.005
+fix 1 all nvt temp 1.0 1.0 0.5
+run 100"""
+        val = self.validator.validate_static(script)
+        self.assertTrue(val["valid"])
+        self.assertTrue(any("velocity" in w.lower() for w in val["warnings"]))
+
+    def test_validator_warns_on_missing_explicit_timestep(self):
+        # Script with no timestep declaration should warn
+        script = """units lj
+atom_style atomic
+boundary p p p
+lattice fcc 0.84
+region box block 0 4 0 4 0 4
+create_box 1 box
+create_atoms 1 box
+pair_style lj/cut 2.5
+pair_coeff 1 1 1.0 1.0 2.5
+velocity all create 1.0 1234
+fix 1 all nvt temp 1.0 1.0 0.5
+run 100"""
+        val = self.validator.validate_static(script)
+        self.assertTrue(val["valid"])
+        self.assertTrue(any("No explicit 'timestep' set" in w for w in val["warnings"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

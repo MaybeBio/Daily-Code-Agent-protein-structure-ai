@@ -1,0 +1,175 @@
+name: Unit Tests
+
+on:
+  push:
+    branches:
+      - master
+    # Docs-only changes can't affect test outcomes, so skip the matrix for them.
+    # A commit touching any non-doc file (e.g. *.py, pyproject.toml) still runs.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '**/*.rst'
+  pull_request:
+    branches:
+      - master
+    # NO paths-ignore on the PR trigger, on purpose. These matrix jobs are REQUIRED
+    # status checks: a workflow skipped by a path filter never reports its contexts, so
+    # a docs-only PR would sit blocked forever "waiting for status". Instead the workflow
+    # always runs on PRs and the `changes` job below skips the heavy work on a docs-only
+    # diff, so the required contexts still report success. The `push` trigger keeps its
+    # paths-ignore (a docs-only master push is not merge-gated and can skip to save runners).
+
+# Cancel a superseded in-progress run on PR branches (saves runner minutes), but
+# NOT on master: a cancelled run's conclusion renders as red "failing" on the
+# Unit Tests badge, so master runs always complete to a real pass/fail.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  # Pick the matrix by event so the PR gate stays fast (the merge-blocking check):
+  #   - pull_request -> floor+ceiling Python on both OSes (4 jobs, ~5 min) and the
+  #     heavy `slow` tier is deselected (it runs in the coverage job + nightly).
+  #   - push to master -> the full Linux 3.11-3.14 range + Windows brackets (6 jobs),
+  #     so every supported interpreter is still exercised once changes land.
+  configure:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo 'matrix={"include":[{"os":"ubuntu-latest","python-version":"3.11"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"windows-2022","python-version":"3.11"},{"os":"windows-2022","python-version":"3.14"}]}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix={"include":[{"os":"ubuntu-latest","python-version":"3.11"},{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.13"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"windows-2022","python-version":"3.11"},{"os":"windows-2022","python-version":"3.14"}]}' >> "$GITHUB_OUTPUT"
+          fi
+
+  # Is there anything in this PR a code check cares about? On a docs-only diff the
+  # required jobs below run but skip their heavy steps, reporting success without the
+  # matrix. Fail-safe: anything that is not purely docs (docs/**, *.md, *.rst), a
+  # non-PR event, or any detection failure, runs the full check.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: filter
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          files="$(git diff --name-only "${BASE}...${HEAD}" || true)"
+          echo "Changed files:"; printf '%s\n' "$files"
+          # Count files that are NOT docs (docs/**, *.md, *.rst). Use -c (a count), not
+          # -vq: BSD and GNU grep disagree on the exit status of `-vq`, but the count is
+          # identical on both. Fail-safe: an empty list, or any doubt, runs the full check.
+          if [ -z "$files" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            n_code=$(printf '%s\n' "$files" | grep -vcE '^(docs/|.*\.md$|.*\.rst$)' || true)
+            if [ "${n_code:-1}" -gt 0 ]; then
+              echo "code=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "code=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  test:
+    needs: [configure, changes]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      # windows pinned to a concrete image (windows-latest redirects to
+      # windows-2025 by 2026-06-15) for reproducible runs; bump deliberately.
+      matrix: ${{ fromJSON(needs.configure.outputs.matrix) }}
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache Python dependencies
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-${{ matrix.python-version }}-
+
+    - name: Install package and test dependencies
+      if: needs.changes.outputs.code == 'true'
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .[pro]
+        pip install pytest hypothesis ipython pytest-xdist
+
+    - name: Install cd-hit (Ubuntu)
+      if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cd-hit
+
+    - name: Install mmseqs2 (Ubuntu)
+      if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mmseqs2
+
+    # FIMO (MEME suite) gates the scan_motif end-to-end / parity / golden tests
+    # (@fimo_required). It is not in apt and we avoid conda (ADR-0019), so it is
+    # built from source on Linux and cached on the version key. @fimo_required
+    # tests skip on Windows.
+    - name: Cache MEME suite (FIMO)
+      if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+      id: cache-meme
+      uses: actions/cache@v5
+      with:
+        path: ~/meme-install
+        key: ${{ runner.os }}-meme-5.5.8
+
+    - name: Build FIMO from MEME suite (Ubuntu)
+      if: runner.os == 'Linux' && steps.cache-meme.outputs.cache-hit != 'true' && needs.changes.outputs.code == 'true'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential zlib1g-dev
+        MEME_VERSION=5.5.8
+        curl -sSL "https://meme-suite.org/meme/meme-software/${MEME_VERSION}/meme-${MEME_VERSION}.tar.gz" -o meme.tar.gz
+        tar -xzf meme.tar.gz
+        cd "meme-${MEME_VERSION}"
+        ./configure --prefix="$HOME/meme-install" --enable-build-libxml2 --enable-build-libxslt
+        make -j"$(nproc)"
+        make install
+
+    - name: Add FIMO to PATH (Ubuntu)
+      if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
+      run: echo "$HOME/meme-install/bin" >> "$GITHUB_PATH"
+
+    - name: Run Tests
+      if: needs.changes.outputs.code == 'true'
+      # Fast PR gate: the exact-value regression anchor (-m regression, ADR-0015),
+      # the integration/e2e tiers (own `Integration & E2E Tests` workflow,
+      # ADR-0031), and the heavy `slow` tier (multi-minute pipe sweeps; run by the
+      # coverage job + nightly) are all deselected so this check stays the ~5-minute
+      # merge gate.
+      run: pytest tests -m "not regression and not integration and not e2e and not slow" -x -n auto --durations=20
+      env:
+        MPLBACKEND: Agg
+
+  # Coverage is measured and uploaded by the standalone `Test Coverage` workflow
+  # (.github/workflows/test_coverage.yml) — kept separate so it appears as its own
+  # action/check and runs on its own canonical config (Linux, Python 3.12). Like
+  # this matrix it deselects the heavy `slow` tier so the blocking job stays fast;
+  # the slow tier's coverage is measured nightly (mutation_nightly.yml, non-gating).

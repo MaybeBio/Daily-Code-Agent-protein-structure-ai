@@ -1,0 +1,188 @@
+import { isChainSubset } from "./chain-visibility";
+import { defaultPotentialRange, isPotentialRange } from "./potential-range";
+import { nativeInteractions, type PotentialMap } from "./scientific-data";
+import type { NativeInteraction } from "../integrations/types";
+import { channelGeometry, type ChannelGeometry } from "./channel-input";
+import type { ViewMode } from "./protocol";
+import { searchBoxGeometry, type SearchBoxGeometry } from "./search-box";
+export interface ViewerLoad {
+  expectedStructureSha256?: string;
+  structureChecksums?: readonly string[];
+  cifAuthorResidues?: boolean;
+  trajectoryKey?: string;
+  initialPosePrepared?: boolean;
+  ligandContext?: boolean;
+  initialMode?: ViewMode;
+  initialChains?: readonly string[];
+  channelGeometry?: ChannelGeometry;
+  searchBox?: SearchBoxGeometry;
+  urls: string[];
+  comparison: boolean;
+  focusModel?: number;
+  focusModels?: number[];
+  records?: number[];
+  nativeInteractions?: NativeInteraction[];
+  electrostaticMap?: PotentialMap;
+}
+/** A receptor and its separately stored pose are one complex, not a comparison. */
+export function complexLigandModel(
+  formats: string[],
+  input: ViewerLoad,
+): number | null {
+  return !input.comparison &&
+    input.focusModel === 1 &&
+    formats.length === 2 &&
+    ["pdb", "cif"].includes(formats[0]) &&
+    ["sdf", "mol", "mol2"].includes(formats[1])
+    ? 1
+    : null;
+}
+export function viewerLoad(value: unknown): ViewerLoad {
+  if (!value || typeof value !== "object")
+    throw new Error("Invalid structure request");
+  const v = value as Record<string, unknown>;
+  if (
+    !Array.isArray(v.urls) ||
+    v.urls.length < 1 ||
+    v.urls.length > 3 ||
+    v.urls.some((url) => typeof url !== "string")
+  )
+    throw new Error("Invalid structure sources");
+  const sourceCount = v.urls.length;
+  const expectedStructureSha256 = v.expectedStructureSha256;
+  const digests = v.structureChecksums;
+  if (
+    expectedStructureSha256 !== undefined &&
+    (sourceCount !== 1 ||
+      typeof expectedStructureSha256 !== "string" ||
+      !/^[0-9a-f]{64}$/.test(expectedStructureSha256))
+  )
+    throw new Error("Invalid reviewed structure checksum");
+  if (
+    digests !== undefined &&
+    (expectedStructureSha256 !== undefined ||
+      !Array.isArray(digests) ||
+      digests.length !== sourceCount ||
+      digests.some(
+        (digest) =>
+          typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest),
+      ))
+  )
+    throw new Error("Invalid reviewed source checksums");
+  if (
+    v.cifAuthorResidues !== undefined &&
+    typeof v.cifAuthorResidues !== "boolean"
+  )
+    throw new Error("Invalid residue display identity");
+  if (
+    v.initialChains !== undefined &&
+    (sourceCount !== 1 ||
+      v.comparison !== false ||
+      !isChainSubset(v.initialChains))
+  )
+    throw new Error("Invalid initial chain selection");
+  if (
+    v.trajectoryKey !== undefined &&
+    (typeof v.trajectoryKey !== "string" ||
+      !/^[A-Za-z0-9_.:-]{1,100}$/.test(v.trajectoryKey))
+  )
+    throw new Error("Invalid trajectory identity");
+  if (
+    v.initialPosePrepared !== undefined &&
+    typeof v.initialPosePrepared !== "boolean"
+  )
+    throw new Error("Invalid initial pose qualification");
+  if (v.ligandContext !== undefined && typeof v.ligandContext !== "boolean")
+    throw new Error("Invalid ligand display context");
+  if (v.ligandContext === false && v.initialMode === "pocket")
+    throw new Error("Pocket display requires a ligand context");
+  if (
+    v.initialMode !== undefined &&
+    (typeof v.initialMode !== "string" ||
+      !["cartoon", "pocket", "surface"].includes(v.initialMode))
+  )
+    throw new Error("Invalid initial structure view");
+  if (
+    typeof v.comparison !== "boolean" ||
+    (v.focusModel !== undefined &&
+      (!Number.isInteger(v.focusModel) ||
+        Number(v.focusModel) < 0 ||
+        Number(v.focusModel) >= v.urls.length))
+  )
+    throw new Error("Invalid structure layout");
+  if (
+    v.focusModels !== undefined &&
+    (v.focusModel !== undefined ||
+      !Array.isArray(v.focusModels) ||
+      v.focusModels.length < 1 ||
+      v.focusModels.length > v.urls.length ||
+      new Set(v.focusModels).size !== v.focusModels.length ||
+      v.focusModels.some(
+        (n) => !Number.isInteger(n) || n < 0 || n >= sourceCount,
+      ))
+  )
+    throw new Error("Invalid comparison focus");
+  if (
+    v.records !== undefined &&
+    (!Array.isArray(v.records) ||
+      v.records.length !== v.urls.length ||
+      v.records.some((n) => !Number.isInteger(n) || n < 0 || n > 9999))
+  )
+    throw new Error("Invalid molecular records");
+  return {
+    ...(expectedStructureSha256 === undefined
+      ? {}
+      : { expectedStructureSha256 }),
+    ...(digests === undefined ? {} : { structureChecksums: [...digests] }),
+    ...(v.cifAuthorResidues === undefined
+      ? {}
+      : { cifAuthorResidues: v.cifAuthorResidues }),
+    ...(v.trajectoryKey === undefined
+      ? {}
+      : { trajectoryKey: v.trajectoryKey as string }),
+    ...(v.initialPosePrepared === undefined
+      ? {}
+      : { initialPosePrepared: v.initialPosePrepared as boolean }),
+    ...(v.ligandContext === undefined
+      ? {}
+      : { ligandContext: v.ligandContext as boolean }),
+    ...(v.initialMode === undefined
+      ? {}
+      : { initialMode: v.initialMode as ViewMode }),
+    ...(v.initialChains === undefined
+      ? {}
+      : { initialChains: [...v.initialChains] }),
+    nativeInteractions: nativeInteractions(v.nativeInteractions),
+    ...(v.channelGeometry === undefined
+      ? {}
+      : { channelGeometry: channelGeometry(v.channelGeometry) }),
+    ...(v.searchBox === undefined
+      ? {}
+      : { searchBox: searchBoxGeometry(v.searchBox) }),
+    ...(v.electrostaticMap
+      ? { electrostaticMap: potentialMap(v.electrostaticMap) }
+      : {}),
+    urls: v.urls as string[],
+    ...(v.records === undefined ? {} : { records: v.records as number[] }),
+    comparison: v.comparison,
+    ...(v.focusModels === undefined
+      ? {}
+      : { focusModels: [...(v.focusModels as number[])] }),
+    ...(v.focusModel === undefined ? {} : { focusModel: Number(v.focusModel) }),
+  };
+}
+function potentialMap(value: unknown): PotentialMap {
+  const map = value as PotentialMap;
+  if (
+    !map ||
+    typeof map.url !== "string" ||
+    map.unit !== "kBT/e" ||
+    (map.range !== undefined && !isPotentialRange(map.range))
+  )
+    throw new Error("Invalid potential display request");
+  return {
+    url: map.url,
+    unit: map.unit,
+    range: map.range ?? defaultPotentialRange,
+  };
+}

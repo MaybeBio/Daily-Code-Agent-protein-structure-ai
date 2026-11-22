@@ -1,0 +1,360 @@
+import numpy as np
+
+import json
+import os
+import re
+import requests
+import time
+import urllib
+
+from csubst import sequence
+from csubst import local_search_config
+from csubst import local_sequence_search
+from csubst import ncbi_blast
+from csubst import parser_pymol
+from csubst import resource_cache
+from csubst import structure_resources
+from csubst import ete
+
+def run_qblast(aa_query, num_display=10, evalue_cutoff=10, timeout=30):
+    print('Running NCBI BLAST against UniProtKB/SwissProt. '
+          'This step should finish within minutes but may take hours depending on the NCBI QBLAST server conditions.')
+    start = time.time()
+    timeout = float(timeout)
+    if (not np.isfinite(timeout)) or timeout <= 0:
+        raise ValueError('QBLAST timeout should be a finite value > 0.')
+    hits = ncbi_blast.search_blastp_swissprot(
+        sequence=aa_query,
+        expect=evalue_cutoff,
+        timeout=timeout,
+    )
+    print('Time elapsed for NCBI QBLAST: {:,} sec'.format(int(time.time() - start)))
+    if len(hits) == 0:
+        print('No hit found.')
+        return []
+    print('Top hits (up to {:,} displayed)'.format(num_display))
+    for i, hit in enumerate(hits):
+        if i >= num_display:
+            break
+        print(hit.title)
+    return [hit.accession for hit in hits]
+
+def _resolve_network_timeout(g, default=30):
+    timeout = g.get('database_timeout', default)
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError):
+        return float(default)
+    if timeout <= 0:
+        return float(default)
+    return timeout
+
+def get_representative_leaf(node, size='median'):
+    leaves = ete.get_leaves(node)
+    if len(leaves) == 0:
+        raise ValueError('No leaves were found to select a representative sequence.')
+    leaf_seqlens = [len(ete.get_prop(leaf, 'sequence', '').replace('-', '')) for leaf in leaves]
+    if size == 'median':
+        ind = np.argsort(leaf_seqlens)[len(leaf_seqlens) // 2]
+    else:
+        raise ValueError('Unsupported representative leaf size mode: {}'.format(size))
+    representative_leaf = leaves[ind]
+    return representative_leaf
+
+def is_url_valid(url, timeout=30):
+    request = urllib.request.Request(url)
+    request.get_method = lambda: 'HEAD'
+    try:
+        with urllib.request.urlopen(request, timeout=timeout):
+            pass
+        return True
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.close()
+        except Exception:
+            pass
+        # Some servers reject HEAD even when GET is available.
+        if int(getattr(exc, 'code', 0)) in [403, 405, 501]:
+            get_request = urllib.request.Request(url)
+            get_request.get_method = lambda: 'GET'
+            try:
+                with urllib.request.urlopen(get_request, timeout=timeout):
+                    pass
+                return True
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+                return False
+        return False
+    except (urllib.error.URLError, TimeoutError):
+        return False
+
+
+def _normalize_branch_ids(branch_ids):
+    if branch_ids is None:
+        return list()
+    values = np.asarray(branch_ids, dtype=object)
+    flat_values = np.atleast_1d(values).reshape(-1)
+    if flat_values.size == 0:
+        return list()
+    normalized = []
+    for value in flat_values.tolist():
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError('branch_ids should be integer-like.')
+        if isinstance(value, (int, np.integer)):
+            normalized.append(int(value))
+            continue
+        if isinstance(value, (float, np.floating)):
+            if (not np.isfinite(value)) or (not float(value).is_integer()):
+                raise ValueError('branch_ids should be integer-like.')
+            normalized.append(int(value))
+            continue
+        value_txt = str(value).strip()
+        if (value_txt == '') or (not bool(re.fullmatch(r'[+-]?[0-9]+(?:\.0+)?', value_txt))):
+            raise ValueError('branch_ids should be integer-like.')
+        normalized.append(int(value_txt.split('.', 1)[0]))
+    return normalized
+
+
+def _get_numeric_sort_key(value, default=float('-inf')):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _get_swissmodel_coverage_length(structure_dict):
+    try:
+        start = int(structure_dict.get('from'))
+        end = int(structure_dict.get('to'))
+    except (TypeError, ValueError):
+        return 0
+    return max(end - start + 1, 0)
+
+
+def _select_best_swissmodel_structure(structures):
+    swissmodel_structures = [
+        structure_dict for structure_dict in structures
+        if str(structure_dict.get('provider', '')).strip().upper() == 'SWISSMODEL'
+    ]
+    if len(swissmodel_structures) == 0:
+        return None
+    return max(
+        swissmodel_structures,
+        key=lambda structure_dict: (
+            _get_numeric_sort_key(structure_dict.get('gmqe')),
+            _get_numeric_sort_key(structure_dict.get('qmean', {}).get('avg_local_score')),
+            _get_swissmodel_coverage_length(structure_dict),
+            _get_numeric_sort_key(structure_dict.get('identity')),
+        ),
+    )
+
+
+def get_swissmodel_download_info(top_hit_id, timeout=30):
+    metadata_url = 'https://swissmodel.expasy.org/repository/uniprot/{}.json'.format(top_hit_id)
+    with urllib.request.urlopen(metadata_url, timeout=timeout) as response:
+        swissmodel_metadata = json.load(response)
+    structures = swissmodel_metadata.get('result', {}).get('structures', [])
+    best_structure = _select_best_swissmodel_structure(structures)
+    if best_structure is None:
+        return None, None
+    download_url = str(best_structure.get('coordinates', '')).strip()
+    if download_url == '':
+        download_url = 'https://swissmodel.expasy.org/repository/uniprot/{}.pdb?provider=swissmodel'.format(top_hit_id)
+    download_info = {
+        'template': str(best_structure.get('template', '')).strip(),
+        'gmqe': best_structure.get('gmqe', None),
+        'identity': best_structure.get('identity', None),
+        'from': best_structure.get('from', None),
+        'to': best_structure.get('to', None),
+    }
+    return download_url, download_info
+
+
+def _remote_pdb_hit_ids(aa_query, g, network_timeout):
+    endpoint_url = 'https://search.rcsb.org/rcsbsearch/v2/query'
+    params = {
+        'evalue_cutoff': g['database_evalue_cutoff'],
+        'identity_cutoff': g['database_minimum_identity'],
+        'sequence_type': 'protein',
+        'value': aa_query,
+    }
+    query = {
+        'query': {'type': 'terminal', 'service': 'sequence', 'parameters': params},
+        'request_options': {'scoring_strategy': 'sequence'},
+        'return_type': 'polymer_entity',
+    }
+    start = time.time()
+    response = requests.post(
+        url=endpoint_url, data=json.dumps(query), headers={'Content-Type': 'application/json'},
+        timeout=network_timeout,
+    )
+    response.raise_for_status()
+    print('Time elapsed for MMseqs2 search: {:,} sec'.format(int(time.time() - start)))
+    hits = response.json()['result_set']
+    print('Top hits (up to 10 displayed)')
+    for hit in hits[:10]:
+        print('PDB identifier: {}  RCSB PDB Search Score: {}'.format(hit['identifier'], hit['score']))
+    return [hit['identifier'].rsplit('_', 1)[0] for hit in hits]
+
+
+def _select_pdb_hit(pdb_ids, g):
+    for pdb_id in pdb_ids:
+        parser_pymol.initialize_pymol(pdb_id=pdb_id, g=g)
+        num_chain = parser_pymol.get_num_chain()
+        if num_chain <= g['pymol_max_num_chain']:
+            print('MMseqs2 search against PDB: Best hit entry = {}'.format(pdb_id))
+            return pdb_id
+        print(f'Number of chains in {pdb_id} ({num_chain}) is larger than the maximum of '
+              f'{g["pymol_max_num_chain"]} (--pymol_max_num_chain). Unsuitable.', flush=True)
+    print('No suitable hit found in the PDB database.')
+    return None
+
+
+def _fetch_hit_structure(provider, accession, alphafold_version, cache_options, alphafold_lookup):
+    if provider == 'alphafold':
+        try:
+            return structure_resources.ensure_alphafold_structure(
+                accession, alphafold_version, latest_lookup=alphafold_lookup, **cache_options,
+            )
+        except Exception as exc:
+            print(f'AlphaFold DB retrieval failed for {accession} (version {alphafold_version}): {exc}', flush=True)
+            return None
+
+    download_info = None
+    if provider == 'swissmodel':
+        try:
+            download_url, download_info = get_swissmodel_download_info(
+                top_hit_id=accession, timeout=cache_options['network_timeout'],
+            )
+        except Exception as exc:
+            print(f'SWISS-MODEL lookup failed for {accession} ({exc})', flush=True)
+            return None
+        if download_url is None:
+            print(f'No SWISS-MODEL homology model found for: {accession}', flush=True)
+            return None
+        filename = accession + '.swissmodel.pdb'
+    else:  # alphafill
+        download_url = 'https://alphafill.eu/v1/aff/' + accession
+        filename = os.path.basename(download_url) + '.cif'
+    try:
+        path = structure_resources.ensure_remote_structure(
+            source=provider, structure_id=accession, url=download_url, filename=filename, **cache_options,
+        )
+    except Exception as exc:
+        print(f'Structure download failed at: {download_url} ({exc})', flush=True)
+        return None
+    if download_info is not None:
+        txt = 'SWISS-MODEL best hit: template={} GMQE={} identity={} range={}-{}'
+        print(txt.format(
+            download_info.get('template', ''), download_info.get('gmqe', ''),
+            download_info.get('identity', ''), download_info.get('from', ''), download_info.get('to', ''),
+        ), flush=True)
+    return path
+
+
+def pdb_sequence_search(g, *, local_searches=None, alphafold_lookup=None):
+    if local_searches is None:
+        local_searches = local_sequence_search
+    print('')
+    branch_ids = _normalize_branch_ids(g.get('branch_ids', []))
+    if len(branch_ids) == 0:
+        raise ValueError('No branch IDs were provided for selecting a representative sequence.')
+    representative_branch_id = branch_ids[0]
+    representative_leaf = None
+    structure_tip_aa = parser_pymol.get_structure_tip_aa_alignment(g=g)
+    for node in g['tree'].traverse():
+        if (ete.get_prop(node, "numerical_label")==representative_branch_id):
+            representative_leaf = get_representative_leaf(node, size='median')
+            nlabel = ete.get_prop(representative_leaf, "numerical_label")
+            representative_name = str(representative_leaf.name)
+            if (structure_tip_aa is not None) and (representative_name in structure_tip_aa):
+                aa_query = str(structure_tip_aa[representative_name])
+            else:
+                aa_query = sequence.translate_state(nlabel=nlabel, mode='aa', g=g)
+            aa_query = aa_query.replace('-', '')
+            break
+    if representative_leaf is None:
+        raise ValueError('Representative branch ID {} was not found in the tree.'.format(representative_branch_id))
+    if aa_query == '':
+        raise ValueError('Representative amino acid query was empty.')
+    g['structure_search_query_length_aa'] = int(len(aa_query))
+    pdb_id = None
+    top_hit_ids = None
+    local_search = g.get('database_search', 'remote') == 'local'
+    database_names = [db.strip().lower() for db in g['database'].split(',') if db.strip()]
+    allowed_database_names = local_search_config.UNIPROT_DATABASES | {'pdb'}
+    if len(database_names) == 0:
+        raise ValueError('No database was specified. Use --database with one or more of swissmodel,pdb,alphafold,alphafill.')
+    unknown_database_names = [db for db in database_names if db not in allowed_database_names]
+    if len(unknown_database_names) > 0:
+        txt = 'Unknown database name(s) in --database: {}. Supported values: {}.'
+        raise ValueError(txt.format(','.join(unknown_database_names), ','.join(sorted(allowed_database_names))))
+    network_timeout = _resolve_network_timeout(g=g)
+    for database_name in database_names:
+        if pdb_id is not None:
+            break
+        print('Starting the sequence similarity search against protein structure database: {}'.format(database_name))
+        if (database_name=='pdb'):
+            if local_search:
+                pdb_hit_ids = local_searches.mmseqs_pdb_ids(
+                    aa_query, g['mmseqs_db'], g['database_evalue_cutoff'],
+                    g['database_minimum_identity'], g.get('threads', 1),
+                )
+            try:
+                if not local_search:
+                    print('MMseqs2 search against PDB: Query = {}'.format(representative_leaf.name))
+                    print('MMseqs2 search against PDB: Query sequence = {}'.format(aa_query))
+                    pdb_hit_ids = _remote_pdb_hit_ids(aa_query, g, network_timeout)
+                pdb_id = _select_pdb_hit(pdb_hit_ids, g)
+                if pdb_id is not None:
+                    g['selected_database'] = 'pdb'
+            except Exception as e:
+                print(e)
+                print('MMseqs2 search against PDB was unsuccessful.')
+                pdb_id = None
+        elif database_name in local_search_config.UNIPROT_DATABASES:
+            if local_search and top_hit_ids is None:
+                top_hit_ids = local_searches.blastp_accessions(
+                    aa_query, g['blastp_db'], g['database_evalue_cutoff'], g.get('threads', 1),
+                )
+            elif not local_search and top_hit_ids is None:
+                try:
+                    top_hit_ids = run_qblast(
+                        aa_query,
+                        num_display=10,
+                        evalue_cutoff=g['database_evalue_cutoff'],
+                        timeout=network_timeout,
+                    )
+                except Exception as e:
+                    print(e)
+                    print('QBLAST search was unsuccessful.')
+                    # Leave the search pending so another provider can retry a failed request.
+                    continue
+            if not top_hit_ids:
+                backend = 'local BLAST+' if local_search else 'QBLAST'
+                print('No {} hit with the E-value threshold of {}.'.format(backend, g['database_evalue_cutoff']))
+                pdb_id = None
+            else:
+                cache_options = {
+                    'cache_dir': g.get('resource_cache_dir', ''),
+                    'network_timeout': network_timeout,
+                    'poll_seconds': float(g.get('resource_lock_poll', resource_cache.DEFAULT_LOCK_POLL_SECONDS)),
+                    'lock_timeout_seconds': float(g.get('resource_lock_timeout', resource_cache.DEFAULT_LOCK_TIMEOUT_SECONDS)),
+                }
+                for accession in top_hit_ids:
+                    print('Retrieving protein structure: {}'.format(accession), flush=True)
+                    pdb_id = _fetch_hit_structure(
+                        database_name, accession, g.get('alphafold_version', 'latest'), cache_options, alphafold_lookup,
+                    )
+                    if pdb_id is None:
+                        continue
+                    print('Structure download/cache ready: {}'.format(pdb_id), flush=True)
+                    g['selected_database'] = database_name
+                    break
+    g['pdb'] = pdb_id
+    if g['pdb'] is not None:
+        print('Selected database and ID: {} and {}'.format(g['selected_database'], g['pdb']))
+    else:
+        txt = 'All specified databases ({}) were searched but no suitable structure was found. '
+        txt += 'Continuing without protein structure.'
+        print(txt.format(g['database']))
+    return g

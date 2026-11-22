@@ -1,0 +1,3231 @@
+from __future__ import annotations
+
+import json
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+import mdclaw.solvation._base as solv_base  # noqa: F401
+import mdclaw.solvation.water as solv_water
+import mdclaw.solvation.membrane as solv_membrane
+from mdclaw.chemistry_constants import (
+    BARE_ION_CHARGES,
+    STANDARD_BARE_ION_RESNAMES,
+)
+from mdclaw.solvation.pdb_identity import (
+    _auto_lipid_packmol_charge_pdb_delta,
+    _auto_metal_ion_packmol_charge_pdb_delta,
+    _auto_nucleic_packmol_charge_pdb_delta,
+    _ligand_chemistry_packmol_charge_pdb_delta,
+)
+from mdclaw.solvation._base import _record_packmol_memgen_output
+from mdclaw.solvation.box import extract_box_size_from_packmol_inp
+from mdclaw.solvation.membrane import embed_in_membrane
+
+
+def _pdb_atom(
+    serial, atom, resname, chain, resseq, element, x=0.0, insertion_code=""
+):
+    return (
+        f"ATOM  {serial:5d} {atom:<4} {resname:>3} {chain:1}{resseq:4d}"
+        f"{insertion_code:1}   {x:8.3f}{0.0:8.3f}{0.0:8.3f}"
+        f"  1.00  0.00          {element:>2}\n"
+    )
+
+
+def _pdb_hetatm(serial, atom, resname, chain, resseq, element, x=0.0, y=0.0, z=0.0):
+    return (
+        f"HETATM{serial:5d} {atom:<4} {resname:>3} {chain:1}{resseq:4d}"
+        f"    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {element:>2}\n"
+    )
+
+
+def test_memembed_restore_transforms_dropped_nonwater_heterogens():
+    input_lines = [
+        _pdb_atom(1, "CA", "ALA", "A", 1, "C", x=0.0).rstrip(),
+        "ATOM      2  C   ALA A   1       1.000   0.000   0.000  1.00  0.00           C",
+        "ATOM      3  N   ALA A   1       0.000   1.000   0.000  1.00  0.00           N",
+        _pdb_hetatm(4, "K", "K", "E", 401, "K", x=0.0, y=0.0, z=1.0).rstrip(),
+        _pdb_hetatm(5, "O", "HOH", "W", 1, "O", x=5.0, y=5.0, z=5.0).rstrip(),
+    ]
+    oriented_lines = [
+        "ATOM      1  CA  ALA A   1      10.000   2.000   3.000  1.00  0.00           C",
+        "ATOM      2  C   ALA A   1      11.000   2.000   3.000  1.00  0.00           C",
+        "ATOM      3  N   ALA A   1      10.000   3.000   3.000  1.00  0.00           N",
+    ]
+
+    restored, warnings = solv_membrane._transform_heterogen_lines_like_memembed(
+        input_lines=input_lines,
+        oriented_lines=oriented_lines,
+    )
+
+    assert len(restored) == 1
+    assert restored[0].startswith("HETATM")
+    assert restored[0][17:21].strip() == "K"
+    assert float(restored[0][30:38]) == 10.0
+    assert float(restored[0][38:46]) == 2.0
+    assert float(restored[0][46:54]) == 4.0
+    assert warnings == ["restored 1 non-water HETATM solute atom(s) dropped by MEMEMBED"]
+
+
+def test_memembed_orientation_uses_barrel_options_and_recenters_dummy_midplane(
+    tmp_path,
+    monkeypatch,
+):
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text(
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    commands = []
+
+    def fake_run(cmd, cwd, stdout, stderr, text, timeout):
+        commands.append(cmd)
+        output = Path(cmd[cmd.index("-o") + 1])
+        output.write_text(
+            "HETATM    1  O   DUM D   1       0.000   0.000   0.000  1.00  0.00           O\n"
+            "HETATM    2  N   DUM D   2       0.000   0.000  10.000  1.00  0.00           N\n"
+            "ATOM      3  CA  ALA A   1       1.000   2.000  15.000  1.00  0.00           C\n"
+            "END\n"
+        )
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(solv_membrane.shutil, "which", lambda name: "/bin/memembed")
+    monkeypatch.setattr(solv_membrane.subprocess, "run", fake_run)
+
+    result = solv_membrane._orient_protein_with_memembed(
+        protein_pdb=input_pdb,
+        out_dir=tmp_path,
+        beta_barrel=True,
+        force_span=True,
+    )
+
+    assert result["success"] is True
+    assert "-b" in commands[0]
+    assert "-l" in commands[0]
+    assert result["memembed"]["dummy_membrane"]["center_z"] == 5.0
+    assert result["membrane_center_z"] == 0.0
+    oriented = Path(result["oriented_pdb"]).read_text()
+    assert "DUM" not in oriented
+    assert float(oriented.splitlines()[0][46:54]) == 10.0
+
+
+def _solute_pdb(tmp_path, z_values, name="solute.pdb"):
+    path = tmp_path / name
+    lines = [
+        f"ATOM  {i + 1:5d}  CA  ALA A{i + 1:4d}    "
+        f"{0.0:8.3f}{0.0:8.3f}{z:8.3f}  1.00  0.00           C"
+        for i, z in enumerate(z_values)
+    ]
+    path.write_text("\n".join(lines) + "\nEND\n")
+    return path
+
+
+def test_the_cell_follows_the_solute_and_is_asymmetric(tmp_path):
+    """dist_wat is water beyond the membrane *or* the solute, whichever is taller.
+
+    The cell height was 2*(dist_wat + leaflet) and nothing else, so a protein
+    taller than the patch was written into a cell shorter than itself while x
+    and y were tiled to cover it. Measured on 5L7D: the solute spans z -30.3 ..
+    +77.9 A against an 81 A box, so a third of its atoms fall outside and the
+    extracellular domain lands inside the bilayer of the periodic image.
+
+    The interval is asymmetric on purpose. Mirroring the extracellular domain's
+    water below the membrane would add tens of thousands of molecules that do
+    nothing: 143.2 A here against 190.8 A symmetric.
+    """
+    from mdclaw.solvation.patch_membrane import (
+        _parse_pdb_atoms, solute_box_interval,
+    )
+
+    pdb = _solute_pdb(tmp_path, (-30.324, 0.0, 77.894))
+    _lines, atoms = _parse_pdb_atoms(pdb)
+
+    interval = solute_box_interval(
+        atoms, leaflet=23.0, dist_wat=17.5, membrane_center_z=0.0
+    )
+
+    assert interval["extended"] is True
+    assert interval["patch_box_c"] == pytest.approx(81.0)
+    assert interval["low"] == pytest.approx(-47.824, abs=1e-3)
+    assert interval["high"] == pytest.approx(95.394, abs=1e-3)
+    assert interval["box_c"] == pytest.approx(143.218, abs=1e-3)
+    assert interval["extend_above"] == pytest.approx(54.894, abs=1e-3)
+    assert interval["extend_below"] == pytest.approx(7.324, abs=1e-3)
+    # exactly the requested water beyond the furthest atom, on both sides
+    assert interval["high"] - 77.894 == pytest.approx(17.5, abs=1e-3)
+    assert -30.324 - interval["low"] == pytest.approx(17.5, abs=1e-3)
+
+
+def test_the_bilayer_patch_is_requested_at_the_callers_dist_wat(tmp_path):
+    """The patch must stay a cache hit whatever the protein looks like.
+
+    Its height is part of the cache fingerprint, and *most* membrane proteins
+    reach past the leaflet, so sizing the patch from the solute would miss the
+    cache and pay for a fresh pack and equilibration nearly every time. Only the
+    water above and below is fitted to the solute.
+    """
+    from mdclaw.solvation.patch_membrane import (
+        _parse_pdb_atoms, solute_box_interval,
+    )
+
+    for top in (19.0, 40.0, 77.894):
+        pdb = _solute_pdb(tmp_path, (-19.0, 0.0, top), name=f"s{top}.pdb")
+        _lines, atoms = _parse_pdb_atoms(pdb)
+        interval = solute_box_interval(
+            atoms, leaflet=23.0, dist_wat=17.5, membrane_center_z=0.0
+        )
+        # the patch is always the same one; only the cell differs
+        assert interval["dist_wat"] == pytest.approx(17.5)
+        assert interval["patch_box_c"] == pytest.approx(81.0)
+
+    contained = solute_box_interval(
+        _parse_pdb_atoms(_solute_pdb(tmp_path, (-19.0, 0.0, 19.0), name="tm.pdb"))[1],
+        leaflet=23.0, dist_wat=17.5, membrane_center_z=0.0,
+    )
+    assert contained["extended"] is False
+    assert contained["box_c"] == pytest.approx(81.0)
+
+
+def test_a_solute_taller_than_the_assembled_box_is_refused(tmp_path):
+    """Last line of defence, for a box that came from a cache or an older build.
+
+    The patch is sized for the solute now, but the height can still arrive from
+    a cached patch or a CRYST1 written under the previous rules. Shipping that
+    system means its protein overlaps its own periodic image with nothing
+    downstream noticing.
+    """
+    from mdclaw.solvation.patch_membrane import _parse_pdb_atoms, solute_fits_box
+
+    pdb = _solute_pdb(tmp_path, (-30.324, 0.0, 77.894))
+    _lines, atoms = _parse_pdb_atoms(pdb)
+
+    verdict = solute_fits_box(atoms, box_c=81.0)
+
+    assert verdict["fits"] is False
+    assert verdict["solute_z_span"] == pytest.approx(108.218, abs=1e-3)
+    assert verdict["required_box_c"] == pytest.approx(108.218, abs=1e-3)
+    assert solute_fits_box(atoms, box_c=206.0)["fits"]
+
+
+def _patch_atoms(tmp_path, *, plane_lo, plane_hi, box_c, lower_n=40, upper_n=10,
+                 waters_at=(), name="patch.pdb"):
+    """A minimal bilayer patch: two headgroup planes, tails between, water outside."""
+    from mdclaw.solvation.patch_membrane import _parse_pdb_atoms
+
+    rows, serial = [], 1
+    for z, count in ((plane_lo, lower_n), (plane_hi, upper_n)):
+        for i in range(count):
+            rows.append(
+                "ATOM  %5d  P31 PC  A%4d    %8.3f%8.3f%8.3f  1.00  0.00"
+                % (serial, serial % 10000, 3.0 * (i % 8), 3.0 * (i // 8), z)
+            )
+            serial += 1
+    mid = 0.5 * (plane_lo + plane_hi)
+    for i in range(60):
+        rows.append(
+            "ATOM  %5d  C21 OL  B%4d    %8.3f%8.3f%8.3f  1.00  0.00"
+            % (serial, serial % 10000, 2.0 * (i % 10), 2.0 * (i // 10),
+               mid + 6.0 * ((i % 5) - 2) / 5.0)
+        )
+        serial += 1
+    for z in waters_at:
+        for i in range(20):
+            rows.append(
+                "ATOM  %5d  O   WAT C%4d    %8.3f%8.3f%8.3f  1.00  0.00"
+                % (serial, serial % 10000, 2.0 * i, 0.0, z)
+            )
+            serial += 1
+    path = tmp_path / name
+    path.write_text("\n".join(rows) + "\nEND\n")
+    _lines, atoms = _parse_pdb_atoms(path)
+    return atoms
+
+
+def test_the_midplane_is_the_lipid_core_not_the_water(tmp_path):
+    """A periodic mean unwraps at the widest gap, and a bilayer has two.
+
+    The hydrophobic core and the water layer are comparable in thickness, so
+    unwrapping across the core returns the middle of the water — half a box from
+    the midplane. Measured on the bundled POPC patch: true midplane 48.8, the
+    old estimator returned 10.3, and the assembled bilayer wrapped the
+    receptor's extracellular domain while its helices sat in water.
+    """
+    from mdclaw.solvation.patch_membrane import _estimate_patch_membrane_center_z
+
+    box_c = 76.8
+    atoms = _patch_atoms(
+        tmp_path, plane_lo=26.4, plane_hi=71.2, box_c=box_c,
+        waters_at=(5.0, 15.0, 75.0),
+    )
+
+    centre = _estimate_patch_membrane_center_z(atoms, box_c=box_c)
+
+    assert centre == pytest.approx(48.8, abs=1.5)
+    # not the water midpoint half a box away
+    assert abs(centre - (48.8 - box_c / 2)) > 10.0
+
+
+def test_the_midplane_is_not_pulled_by_the_larger_leaflet(tmp_path):
+    """Leaflets can differ in composition, so a plain mean leans to the bigger one."""
+    from mdclaw.solvation.patch_membrane import _estimate_patch_membrane_center_z
+
+    box_c = 76.8
+    atoms = _patch_atoms(
+        tmp_path, plane_lo=26.4, plane_hi=71.2, box_c=box_c,
+        lower_n=80, upper_n=8, waters_at=(5.0, 15.0, 75.0),
+    )
+
+    centre = _estimate_patch_membrane_center_z(atoms, box_c=box_c)
+
+    assert centre == pytest.approx(48.8, abs=1.5)
+
+
+def test_a_misplaced_bilayer_is_caught_without_re_estimating_it(tmp_path):
+    """The guard cannot be the estimator run again.
+
+    The shift is `target - E(atoms)` and E is translation-equivariant, so
+    `E(atoms + shift)` returns the target whether or not E found the bilayer —
+    it would pass a patch left half a box away. Judge the frame by what should
+    be there instead: tails, no water, headgroups on both sides.
+    """
+    from mdclaw.solvation.patch_membrane import _membrane_core_evidence
+
+    atoms = _patch_atoms(
+        tmp_path, plane_lo=-22.0, plane_hi=22.0, box_c=90.0,
+        waters_at=(-40.0, 40.0),
+    )
+    placed = [(a, a.line, a.x, a.y, a.z) for a in atoms]
+
+    on_frame = _membrane_core_evidence(placed, centre=0.0)
+    off_frame = _membrane_core_evidence(placed, centre=45.0)
+
+    assert on_frame["is_membrane_core"] is True
+    assert on_frame["tail_carbons"] > on_frame["water_oxygens"]
+    assert off_frame["is_membrane_core"] is False
+
+
+def test_too_little_lipid_is_reported_not_refused(tmp_path):
+    """Refusing a build on absent evidence is its own wrong answer."""
+    from mdclaw.solvation.patch_membrane import _membrane_core_evidence, _parse_pdb_atoms
+
+    stub = tmp_path / "stub.pdb"
+    stub.write_text(
+        "ATOM      1  P31 PC  A   1       0.000   0.000  20.000  1.00  0.00\nEND\n"
+    )
+    _lines, atoms = _parse_pdb_atoms(stub)
+
+    verdict = _membrane_core_evidence(
+        [(a, a.line, a.x, a.y, a.z) for a in atoms], centre=0.0
+    )
+
+    assert verdict["assessable"] is False
+    assert verdict["is_membrane_core"] is True      # not judged, so not refused
+
+
+def test_salt_already_in_the_patch_is_not_added_again():
+    """The cached patch is packed at the requested concentration, then tiled.
+
+    Adding a full complement on top of it delivers roughly twice the
+    concentration asked for. Measured on 5L7D: 0.268 M against 0.150 requested.
+    """
+    from mdclaw.solvation.patch_membrane import plan_neutralizing_ions
+
+    fresh = plan_neutralizing_ions(
+        net_charge=0, n_water_residues=16554, saltcon=0.15, add_bulk_salt=True
+    )
+    already = plan_neutralizing_ions(
+        net_charge=0, n_water_residues=16554, saltcon=0.15, add_bulk_salt=True,
+        existing_cations=35, existing_anions=0,
+    )
+
+    assert fresh["cations"] == fresh["anions"] == 45
+    # In pairs, and pairs are what the patch already has: 35 cations with no
+    # anions is not 35 pairs. Counting the deficit per species would add 45
+    # unmatched anions and take the system off neutrality — measured as -87 e.
+    assert already["pairs_present"] == 0
+    assert already["cations"] == already["anions"] == 45
+
+
+def test_bulk_salt_is_added_in_pairs_so_the_system_stays_neutral():
+    """Only neutralisation may be unbalanced, and only by the solute's charge."""
+    from mdclaw.solvation.patch_membrane import plan_neutralizing_ions
+
+    plan = plan_neutralizing_ions(
+        net_charge=3, n_water_residues=32131, saltcon=0.15, add_bulk_salt=True,
+        existing_cations=102, existing_anions=0,
+    )
+
+    # 102 cations and no anions is zero pairs, so a full complement of pairs is
+    # added; the only imbalance is the 3 anions that neutralise the solute.
+    assert plan["cations"] == plan["target_pairs"]
+    assert plan["anions"] == plan["target_pairs"] + 3
+    # net charge after: +3 solute, +102 patch cations, and the added ions
+    assert 3 + 102 + plan["cations"] - plan["anions"] == 102
+
+
+def test_the_patch_arrives_without_the_salt_it_was_equilibrated_with():
+    """Ions are placed after assembly, not carried in from the patch.
+
+    The patch is packed and equilibrated with salt on purpose, but that salt
+    sits where the patch's own equilibration put it — on the bundled POPC patch,
+    at the headgroup interface — and tiling reproduces it nx*ny times with
+    whatever species imbalance it has. VMD and CHARMM-GUI both build the bilayer
+    ion-free and place ions last, into the water phase, which is what
+    `_apply_neutralizing_swap` already does.
+    """
+    from mdclaw.solvation.patch_membrane import PATCH_ION_RESNAMES_UPPER
+
+    # The module's own defaults are "Na+"/"Cl-", so those forms have to be
+    # recognised or a patch built with them would keep its salt.
+    for name in ("NA", "CL", "K", "SOD", "POT", "CLA", "NA+", "CL-", "K+"):
+        assert name in PATCH_ION_RESNAMES_UPPER, name
+
+
+def test_ion_species_are_not_assigned_in_z_order():
+    """Sites are sorted by z; filling one species then the other separates charge."""
+    from mdclaw.solvation.patch_membrane import plan_neutralizing_ions
+
+    plan = plan_neutralizing_ions(
+        net_charge=-37, n_water_residues=16554, saltcon=0.15, add_bulk_salt=True
+    )
+
+    assert plan["cations"] == 45 + 37
+    assert plan["anions"] == 45
+
+
+def test_membrane_embedding_geometry_report_passes_transmembrane_layout(tmp_path):
+    pdb = tmp_path / "good_membrane.pdb"
+    lines = ["CRYST1   80.000   80.000   80.000  90.00  90.00  90.00 P 1           1"]
+    serial = 1
+    for z in (-18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0):
+        lines.append(
+            f"ATOM  {serial:5d}  CA  ALA A{serial:4d}    "
+            f"{0.0:8.3f}{0.0:8.3f}{z:8.3f}  1.00  0.00           C"
+        )
+        serial += 1
+    for z in (-20.0, 20.0):
+        for _ in range(4):
+            lines.append(
+                f"HETATM{serial:5d} P31  PC  M{serial:4d}    "
+                f"{0.0:8.3f}{0.0:8.3f}{z:8.3f}  1.00  0.00           P"
+            )
+            serial += 1
+    pdb.write_text("\n".join(lines) + "\nEND\n")
+
+    report = solv_membrane._membrane_embedding_geometry_report(
+        pdb_file=pdb,
+        box_dimensions={"box_c": 80.0},
+    )
+
+    assert report["status"] == "passed"
+    assert report["protein_headgroup_overlap_fraction"] == 1.0
+
+
+def test_membrane_embedding_geometry_report_fails_protein_taller_than_the_box(
+    tmp_path,
+):
+    """A GPCR can sit correctly in the bilayer and still not fit the cell.
+
+    Reported from a real 5L7D build: the extracellular domain reached past both
+    z faces. The headgroup-overlap test passes — the transmembrane helices give
+    it far more than the 15% it needs — so containment has to be checked on its
+    own, or a system whose protein overlaps its own periodic image ships with a
+    clean geometry report.
+    """
+    pdb = tmp_path / "tall_protein.pdb"
+    lines = ["CRYST1   80.000   80.000   80.000  90.00  90.00  90.00 P 1           1"]
+    serial = 1
+    for z in (-18.0, -12.0, -6.0, 0.0, 6.0, 12.0, 18.0):     # transmembrane
+        lines.append(
+            f"ATOM  {serial:5d}  CA  ALA A{serial:4d}    "
+            f"{0.0:8.3f}{0.0:8.3f}{z:8.3f}  1.00  0.00           C"
+        )
+        serial += 1
+    for z in (30.0, 45.0, 60.0, 75.0):                        # extracellular domain
+        lines.append(
+            f"ATOM  {serial:5d}  CA  ALA A{serial:4d}    "
+            f"{0.0:8.3f}{0.0:8.3f}{z:8.3f}  1.00  0.00           C"
+        )
+        serial += 1
+    for z in (-20.0, 20.0):
+        for _ in range(4):
+            lines.append(
+                f"HETATM{serial:5d} P31  PC  M{serial:4d}    "
+                f"{0.0:8.3f}{0.0:8.3f}{z:8.3f}  1.00  0.00           P"
+            )
+            serial += 1
+    pdb.write_text("\n".join(lines) + "\nEND\n")
+
+    report = solv_membrane._membrane_embedding_geometry_report(
+        pdb_file=pdb,
+        box_dimensions={"box_c": 80.0},
+    )
+
+    assert report["status"] == "failed"
+    assert report["failure_reasons"] == ["protein_exceeds_periodic_box_z"]
+    # the membrane checks are satisfied; only containment is not
+    assert report["protein_headgroup_overlap_fraction"] >= 0.15
+    assert report["protein_z_span"] == pytest.approx(93.0)   # -18.0 .. +75.0
+    assert report["protein_z_headroom"] == pytest.approx(-13.0)
+
+
+def test_membrane_embedding_geometry_report_accepts_an_asymmetric_box(tmp_path):
+    """packmol-memgen sizes an asymmetric cell around a lopsided protein.
+
+    Judging containment by faces placed at the membrane centre would assume the
+    cell is centred on the bilayer. That is true of the tiled patch and false
+    here, and it would reject a 143 A cell holding a 108 A solute — after the
+    `auto` fallback had already built a perfectly good system. Under PBC the
+    origin is a choice; only a molecule longer than the period cannot be placed.
+    """
+    pdb = tmp_path / "asymmetric.pdb"
+    lines = ["CRYST1   80.000   80.000  143.200  90.00  90.00  90.00 P 1           1"]
+    serial = 1
+    for z in (-30.3, -18.0, -6.0, 6.0, 18.0, 40.0, 60.0, 77.9):
+        lines.append(
+            f"ATOM  {serial:5d}  CA  ALA A{serial:4d}    "
+            f"{0.0:8.3f}{0.0:8.3f}{z:8.3f}  1.00  0.00           C"
+        )
+        serial += 1
+    for z in (-20.0, 20.0):
+        for _ in range(4):
+            lines.append(
+                f"HETATM{serial:5d} P31  PC  M{serial:4d}    "
+                f"{0.0:8.3f}{0.0:8.3f}{z:8.3f}  1.00  0.00           P"
+            )
+            serial += 1
+    pdb.write_text("\n".join(lines) + "\nEND\n")
+
+    report = solv_membrane._membrane_embedding_geometry_report(
+        pdb_file=pdb,
+        box_dimensions={"box_c": 143.2},
+    )
+
+    assert "protein_exceeds_periodic_box_z" not in report["failure_reasons"]
+    assert report["protein_z_span"] == pytest.approx(108.2, abs=1e-3)
+    assert report["protein_z_headroom"] > 0.0
+
+
+def test_membrane_embedding_geometry_report_fails_off_membrane_protein(tmp_path):
+    pdb = tmp_path / "bad_membrane.pdb"
+    lines = ["CRYST1   80.000   80.000   80.000  90.00  90.00  90.00 P 1           1"]
+    serial = 1
+    for z in (38.0, 42.0, 46.0, 50.0):
+        lines.append(
+            f"ATOM  {serial:5d}  CA  ALA A{serial:4d}    "
+            f"{0.0:8.3f}{0.0:8.3f}{z:8.3f}  1.00  0.00           C"
+        )
+        serial += 1
+    for _ in range(8):
+        lines.append(
+            f"HETATM{serial:5d} P31  PC  M{serial:4d}    "
+            f"{0.0:8.3f}{0.0:8.3f}{5.0:8.3f}  1.00  0.00           P"
+        )
+        serial += 1
+    pdb.write_text("\n".join(lines) + "\nEND\n")
+
+    report = solv_membrane._membrane_embedding_geometry_report(
+        pdb_file=pdb,
+        box_dimensions={"box_c": 80.0},
+    )
+
+    assert report["status"] == "failed"
+    assert "membrane_headgroup_span_too_narrow_near_protein" in report["failure_reasons"]
+    assert "protein_does_not_intersect_bilayer_headgroup_span" in report["failure_reasons"]
+
+
+def test_auto_nucleic_packmol_charge_delta_counts_standard_segments(tmp_path):
+    pdb = tmp_path / "dna.pdb"
+    lines = []
+    serial = 1
+    for chain, start in (("A", 1), ("B", 13)):
+        for offset, resname in enumerate(["DC", "DG", "DA"]):
+            lines.append(
+                _pdb_atom(
+                    serial, "P", resname, chain, start + offset, "P", x=serial
+                )
+            )
+            serial += 1
+    pdb.write_text("".join(lines) + "END\n")
+
+    report = _auto_nucleic_packmol_charge_pdb_delta(pdb)
+
+    assert report["charge_pdb_delta"] == 2
+    assert report["applied_segment_count"] == 2
+    assert [segment["charge_pdb_delta"] for segment in report["segments"]] == [1, 1]
+
+
+def test_auto_nucleic_packmol_charge_delta_accepts_complete_terminal_names(tmp_path):
+    pdb = tmp_path / "dna_terminal_named.pdb"
+    pdb.write_text(
+        "".join(
+            [
+                _pdb_atom(1, "P", "DC5", "A", 1, "P"),
+                _pdb_atom(2, "P", "DG", "A", 2, "P"),
+                _pdb_atom(3, "P", "DG3", "A", 3, "P"),
+            ]
+        )
+        + "END\n"
+    )
+
+    report = _auto_nucleic_packmol_charge_pdb_delta(pdb)
+
+    assert report["success"] is True
+    assert report["charge_pdb_delta"] == 0
+    assert report["segments"][0]["naming_mode"] == "explicit_terminal_names"
+
+
+def test_auto_nucleic_packmol_charge_delta_handles_singletons(tmp_path):
+    ordinary = tmp_path / "ordinary_single.pdb"
+    ordinary.write_text(_pdb_atom(1, "P", "DA", "A", 1, "P") + "END\n")
+    explicit = tmp_path / "explicit_single.pdb"
+    explicit.write_text(_pdb_atom(1, "P", "DAN", "A", 1, "P") + "END\n")
+
+    ordinary_report = _auto_nucleic_packmol_charge_pdb_delta(ordinary)
+    explicit_report = _auto_nucleic_packmol_charge_pdb_delta(explicit)
+
+    assert ordinary_report["charge_pdb_delta"] == 1
+    assert ordinary_report["segments"][0]["selected_template_names"] == ["DAN"]
+    assert explicit_report["charge_pdb_delta"] == 0
+
+
+def test_auto_nucleic_packmol_charge_delta_rejects_partial_terminal_names(tmp_path):
+    pdb = tmp_path / "partial_terminal_names.pdb"
+    pdb.write_text(
+        _pdb_atom(1, "P", "DC5", "A", 1, "P")
+        + _pdb_atom(2, "P", "DG", "A", 2, "P")
+        + _pdb_atom(3, "P", "DA", "A", 3, "P")
+        + "END\n"
+    )
+
+    report = _auto_nucleic_packmol_charge_pdb_delta(pdb)
+
+    assert report["success"] is False
+    assert report["code"] == "forcefield_template_contract_mismatch"
+
+
+def _pdb_4char_residue(serial, atom, resname, chain, resseq, element):
+    return (
+        f"HETATM{serial:5d} {atom:<4} {resname:<4}{chain:1}{resseq:4d}    "
+        f"{0.0:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00  0.00          {element:>2}\n"
+    )
+
+
+def test_auto_lipid_charge_delta_uses_modular_template_charges(tmp_path):
+    pdb = tmp_path / "modular_lipids.pdb"
+    groups = [
+        (1, ["PA", "PGR", "OL"]),
+        (2, ["PA", "PS", "OL"]),
+        (3, ["PA", "PH-", "OL"]),
+        (4, ["SA", "SPM", "PA"]),
+    ]
+    serial = 1
+    lines = []
+    for resseq, names in groups:
+        for name in names:
+            lines.append(_pdb_hetatm(serial, "C", name, "M", resseq, "C"))
+            serial += 1
+    pdb.write_text("".join(lines) + "END\n")
+
+    report = _auto_lipid_packmol_charge_pdb_delta(pdb)
+
+    assert report["success"] is True
+    assert report["charge_pdb_delta"] == -3
+    assert [entry["charge_pdb_delta"] for entry in report["lipids"]] == [
+        -1,
+        -1,
+        -1,
+        0,
+    ]
+
+
+def test_auto_lipid_charge_delta_uses_full_template_charges(tmp_path):
+    pdb = tmp_path / "full_lipids.pdb"
+    pdb.write_text(
+        _pdb_4char_residue(1, "P", "DOPG", "M", 1, "P")
+        + _pdb_4char_residue(2, "P", "POPS", "M", 2, "P")
+        + _pdb_4char_residue(3, "P", "DOPC", "M", 3, "P")
+        + "END\n"
+    )
+
+    report = _auto_lipid_packmol_charge_pdb_delta(pdb)
+
+    assert report["success"] is True
+    assert report["charge_pdb_delta"] == -2
+    assert {entry["residue_names"][0] for entry in report["lipids"]} == {
+        "DOPG",
+        "POPS",
+        "DOPC",
+    }
+
+
+def test_auto_nucleic_packmol_charge_delta_respects_ter_records(tmp_path):
+    pdb = tmp_path / "same_chain_two_strands.pdb"
+    pdb.write_text(
+        "".join(
+            [
+                _pdb_atom(1, "P", "DC", "A", 1, "P"),
+                _pdb_atom(2, "P", "DG", "A", 2, "P"),
+                "TER\n",
+                _pdb_atom(3, "P", "DC", "A", 1, "P"),
+                _pdb_atom(4, "P", "DG", "A", 2, "P"),
+            ]
+        )
+        + "END\n"
+    )
+
+    report = _auto_nucleic_packmol_charge_pdb_delta(pdb)
+
+    assert report["charge_pdb_delta"] == 2
+    assert report["applied_segment_count"] == 2
+
+
+def test_auto_nucleic_packmol_charge_delta_ignores_protein_only(tmp_path):
+    pdb = tmp_path / "protein.pdb"
+    pdb.write_text(
+        _pdb_atom(1, "CA", "ALA", "A", 1, "C")
+        + _pdb_atom(2, "CA", "GLY", "A", 2, "C")
+        + "END\n"
+    )
+
+    report = _auto_nucleic_packmol_charge_pdb_delta(pdb)
+
+    assert report["charge_pdb_delta"] == 0
+    assert report["segments"] == []
+
+
+def test_metal_ion_charge_delta_counts_uncounted_zinc(tmp_path):
+    pdb = tmp_path / "zn.pdb"
+    pdb.write_text(
+        _pdb_atom(1, "CA", "ALA", "A", 1, "C")
+        + "TER\n"
+        + _pdb_hetatm(2, "ZN", "ZN", "B", 262, "Zn")
+        + "END\n"
+    )
+
+    report = _auto_metal_ion_packmol_charge_pdb_delta(pdb)
+
+    assert report["charge_pdb_delta"] == 2
+    assert report["applied_ion_count"] == 1
+    assert report["ions"][0]["resname"] == "ZN"
+    assert report["ions"][0]["kind"] == "metal_ion"
+
+
+def test_metal_ion_charge_delta_ignores_packmol_recognized_ions(tmp_path):
+    # packmol-memgen already counts CA/MG, so they contribute no extra delta.
+    pdb = tmp_path / "ca_mg.pdb"
+    pdb.write_text(
+        _pdb_hetatm(1, "CA", "CA", "A", 300, "Ca")
+        + "TER\n"
+        + _pdb_hetatm(2, "MG", "MG", "B", 301, "Mg")
+        + "END\n"
+    )
+
+    report = _auto_metal_ion_packmol_charge_pdb_delta(pdb)
+
+    assert report["charge_pdb_delta"] == 0
+
+
+def test_bare_ion_charge_delta_counts_retained_halides(tmp_path):
+    pdb = tmp_path / "halides.pdb"
+    pdb.write_text(
+        "".join(
+            _pdb_hetatm(i, "CL", "CL", chain, 500 + i, "Cl")
+            for i, chain in enumerate("ABCD", start=1)
+        )
+        + "END\n"
+    )
+
+    report = _auto_metal_ion_packmol_charge_pdb_delta(pdb)
+
+    assert report["charge_pdb_delta"] == -4
+    assert report["applied_ion_count"] == 4
+    assert {entry["kind"] for entry in report["ions"]} == {"bare_ion"}
+
+
+def test_bare_ion_charge_table_covers_every_standard_water_template():
+    assert set(BARE_ION_CHARGES) == set(STANDARD_BARE_ION_RESNAMES)
+
+
+def test_bare_ion_charge_delta_preserves_case_sensitive_oxidation_states(tmp_path):
+    expected = {
+        "AG": 1,
+        "Ag": 2,
+        "CE": 3,
+        "Ce": 4,
+        "CR": 3,
+        "Cr": 2,
+        "SM": 3,
+        "Sm": 2,
+        "TL": 1,
+        "Tl": 3,
+        "FE": 3,
+        "FE2": 2,
+        "CU": 2,
+        "CU1": 1,
+    }
+    pdb = tmp_path / "oxidation_states.pdb"
+    pdb.write_text(
+        "".join(
+            _pdb_hetatm(i, resname, resname, "A", 600 + i, "X")
+            for i, resname in enumerate(expected, start=1)
+        )
+        + "END\n"
+    )
+
+    report = _auto_metal_ion_packmol_charge_pdb_delta(pdb)
+
+    observed = {
+        entry["resname"]: entry["formal_charge"] for entry in report["ions"]
+    }
+    assert observed == expected
+    assert report["charge_pdb_delta"] == sum(expected.values())
+
+
+def test_metal_ion_charge_delta_counts_packmol_resseq_collision(tmp_path):
+    # packmol-memgen tracks charged residues by residue number only, so two
+    # consecutive recognized ions with the same resseq are counted once.
+    pdb = tmp_path / "same_resseq_mg.pdb"
+    pdb.write_text(
+        _pdb_hetatm(1, "MG", "MG", "C", 101, "Mg")
+        + _pdb_hetatm(2, "MG", "MG", "D", 101, "Mg")
+        + "END\n"
+    )
+
+    report = _auto_metal_ion_packmol_charge_pdb_delta(pdb)
+
+    assert report["charge_pdb_delta"] == 2
+    assert [entry["packmol_recognized_charge"] for entry in report["ions"]] == [2, 0]
+    assert [entry["charge_pdb_delta"] for entry in report["ions"]] == [0, 2]
+
+
+def test_metal_ion_charge_delta_counts_deprotonated_cysteine(tmp_path):
+    # CYM is truly -1 but packmol-memgen counts it as neutral.
+    pdb = tmp_path / "cym.pdb"
+    pdb.write_text(
+        _pdb_atom(1, "N", "CYM", "A", 5, "N")
+        + _pdb_atom(2, "CA", "CYM", "A", 5, "C")
+        + _pdb_atom(3, "SG", "CYM", "A", 5, "S")
+        + "END\n"
+    )
+
+    report = _auto_metal_ion_packmol_charge_pdb_delta(pdb)
+
+    assert report["charge_pdb_delta"] == -1
+
+
+def test_charge_delta_counts_canonical_protonated_acids(tmp_path):
+    # Packmol-memgen counts canonical ASP/GLU as -1 by name, but Amber/OpenMM
+    # treats explicit side-chain acid protons as neutral ASH/GLH chemistry.
+    pdb = tmp_path / "neutral_acids.pdb"
+    pdb.write_text(
+        _pdb_atom(1, "OE2", "GLU", "A", 21, "O")
+        + _pdb_atom(2, "HE2", "GLU", "A", 21, "H")
+        + "TER\n"
+        + _pdb_atom(3, "OD2", "ASP", "A", 48, "O")
+        + _pdb_atom(4, "HD2", "ASP", "A", 48, "H")
+        + "END\n"
+    )
+
+    report = _auto_metal_ion_packmol_charge_pdb_delta(pdb)
+
+    assert report["charge_pdb_delta"] == 2
+    assert [entry["kind"] for entry in report["ions"]] == [
+        "neutral_protonated_acid",
+        "neutral_protonated_acid",
+    ]
+    assert [entry["packmol_recognized_charge"] for entry in report["ions"]] == [-1, -1]
+    assert [entry["formal_charge"] for entry in report["ions"]] == [0, 0]
+
+
+def test_charge_delta_counts_canonical_doubly_protonated_histidine(tmp_path):
+    # A canonical HIS with both ring protons is HIP-like (+1), while
+    # packmol-memgen's fixed table counts HIS/HID/HIE as neutral.
+    pdb = tmp_path / "hip_like_his.pdb"
+    pdb.write_text(
+        _pdb_atom(1, "ND1", "HIS", "A", 31, "N")
+        + _pdb_atom(2, "HD1", "HIS", "A", 31, "H")
+        + _pdb_atom(3, "NE2", "HIS", "A", 31, "N")
+        + _pdb_atom(4, "HE2", "HIS", "A", 31, "H")
+        + "END\n"
+    )
+
+    report = _auto_metal_ion_packmol_charge_pdb_delta(pdb)
+
+    assert report["charge_pdb_delta"] == 1
+    assert report["ions"][0]["kind"] == "protonated_histidine"
+
+
+def test_metal_ion_charge_delta_combines_zinc_and_cym(tmp_path):
+    pdb = tmp_path / "zn_cym.pdb"
+    pdb.write_text(
+        _pdb_atom(1, "N", "CYM", "A", 5, "N")
+        + _pdb_atom(2, "SG", "CYM", "A", 5, "S")
+        + "TER\n"
+        + _pdb_hetatm(3, "ZN", "ZN", "B", 262, "Zn")
+        + "END\n"
+    )
+
+    report = _auto_metal_ion_packmol_charge_pdb_delta(pdb)
+
+    # +2 (Zn) + -1 (CYM) = +1
+    assert report["charge_pdb_delta"] == 1
+    assert report["applied_ion_count"] == 2
+
+
+def test_metal_ion_charge_delta_ignores_metal_inside_cofactor(tmp_path):
+    # A multi-atom residue (e.g. HEM) with an Fe atom is not a bare ion and
+    # must not be double-counted via the monoatomic ion path.
+    pdb = tmp_path / "hem.pdb"
+    pdb.write_text(
+        _pdb_hetatm(1, "FE", "HEM", "A", 155, "Fe")
+        + _pdb_hetatm(2, "NA", "HEM", "A", 155, "N")
+        + _pdb_hetatm(3, "C1A", "HEM", "A", 155, "C")
+        + "END\n"
+    )
+
+    report = _auto_metal_ion_packmol_charge_pdb_delta(pdb)
+
+    assert report["charge_pdb_delta"] == 0
+
+
+def test_ligand_chemistry_charge_delta_counts_charged_ligands():
+    ligand_chemistry = [
+        {
+            "residue_name": "STI",
+            "ligand_instance_id": "A:STI:201",
+            "net_charge": 1,
+        },
+        {
+            "residue_name": "BEN",
+            "ligand_instance_id": "A:BEN:1",
+            "net_charge": 0,
+        },
+        {
+            "residue_name": "NEG",
+            "ligand_instance_id": "A:NEG:2",
+            "mol_formal_charge": -1,
+        },
+    ]
+
+    report = _ligand_chemistry_packmol_charge_pdb_delta(ligand_chemistry)
+
+    assert report["charge_pdb_delta"] == 0
+    assert report["applied_ligand_count"] == 2
+    assert [entry["charge_pdb_delta"] for entry in report["ligands"]] == [1, 0, -1]
+
+
+def test_solvate_structure_passes_auto_nucleic_charge_delta(
+    tmp_path,
+    monkeypatch,
+):
+    pdb = tmp_path / "dna.pdb"
+    lines = []
+    serial = 1
+    for chain, start in (("A", 1), ("B", 13)):
+        for offset, resname in enumerate(["DC", "DG", "DA"]):
+            lines.append(
+                _pdb_atom(
+                    serial,
+                    "P",
+                    resname,
+                    chain,
+                    start + offset,
+                    "P",
+                    x=serial,
+                )
+            )
+            serial += 1
+    pdb.write_text("".join(lines) + "END\n")
+    calls = []
+
+    def fake_run(args, cwd, timeout):
+        calls.append(list(args))
+        input_path = Path(args[args.index("--pdb") + 1])
+        output_path = Path(args[args.index("-o") + 1])
+        atom_lines = [
+            line
+            for line in input_path.read_text().splitlines()
+            if line.startswith(("ATOM", "HETATM"))
+        ]
+        output_path.write_text(
+            "CRYST1   40.000   40.000   40.000  90.00  90.00  90.00 P 1           1\n"
+            + "\n".join(atom_lines)
+            + "\nHETATM 9999  O   WAT W   1       9.000   0.000   0.000  1.00  0.00           O\n"
+            + "END\n"
+        )
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.run",
+        fake_run,
+    )
+
+    result = solv_water.solvate_structure(
+        pdb_file=str(pdb),
+        output_dir=str(tmp_path),
+        output_name="solvated",
+        salt=True,
+        water_model="opc",
+    )
+
+    assert result["success"] is True
+    assert len(calls) == 1
+    assert calls[0][calls[0].index("--charge_pdb_delta") + 1] == "2"
+    assert result["auto_charge_pdb_delta"] == 2
+    assert result["auto_charge_pdb_delta_applied"] is True
+    assert result["parameters"]["auto_charge_pdb_delta"] == 2
+
+
+def _install_fake_memgen(monkeypatch):
+    """Capture the packmol-memgen argv and emit a minimal solvated PDB."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, cwd, timeout):
+        calls.append(list(args))
+        input_path = Path(args[args.index("--pdb") + 1])
+        output_path = Path(args[args.index("-o") + 1])
+        atom_lines = [
+            line
+            for line in input_path.read_text().splitlines()
+            if line.startswith(("ATOM", "HETATM"))
+        ]
+        output_path.write_text(
+            "CRYST1   40.000   40.000   40.000  90.00  90.00  90.00 P 1           1\n"
+            + "\n".join(atom_lines)
+            + "\nHETATM 9999  O   WAT W   1       9.000   0.000   0.000  1.00  0.00           O\n"
+            + "END\n"
+        )
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.run",
+        fake_run,
+    )
+    return calls
+
+
+def test_solvate_structure_rejects_packmol_solute_residue_collapse(
+    tmp_path,
+    monkeypatch,
+):
+    pdb = tmp_path / "insertions.pdb"
+    pdb.write_text(
+        _pdb_atom(1, "CA", "SER", "H", 82, "C")
+        + _pdb_atom(2, "CA", "SER", "H", 82, "C", insertion_code="A")
+        + _pdb_atom(3, "CA", "SER", "H", 82, "C", insertion_code="B")
+        + "END\n"
+    )
+    calls = []
+
+    def fake_run(args, cwd, timeout):
+        calls.append(list(args))
+        input_path = Path(args[args.index("--pdb") + 1])
+        output_path = Path(args[args.index("-o") + 1])
+        atoms = [
+            line.ljust(80)[:22] + "   1 " + line.ljust(80)[27:]
+            for line in input_path.read_text().splitlines()
+            if line.startswith(("ATOM", "HETATM"))
+        ]
+        output_path.write_text(
+            "CRYST1   40.000   40.000   40.000  90.00  90.00  90.00 P 1           1\n"
+            + "\n".join(atoms)
+            + "\nHETATM 9999  O   WAT W   1       9.000   0.000   0.000  1.00  0.00           O\n"
+            + "END\n"
+        )
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.run",
+        fake_run,
+    )
+
+    result = solv_water.solvate_structure(
+        pdb_file=str(pdb),
+        output_dir=str(tmp_path),
+        output_name="solvated",
+        salt=True,
+        water_model="opc",
+    )
+
+    packmol_input = Path(calls[0][calls[0].index("--pdb") + 1])
+    packmol_atoms = [
+        line for line in packmol_input.read_text().splitlines()
+        if line.startswith(("ATOM", "HETATM"))
+    ]
+    assert [line[22:26].strip() for line in packmol_atoms] == ["1", "2", "3"]
+    assert result["success"] is False
+    assert result["code"] == "solute_identity_not_preserved"
+    assert result["solute_residue_count_source"] == 3
+    assert result["solute_residue_count_restored"] is None
+
+
+def test_solvate_structure_no_salt_disables_counterions(tmp_path, monkeypatch):
+    pdb = tmp_path / "protein.pdb"
+    pdb.write_text(_pdb_atom(1, "CA", "ALA", "A", 1, "C") + "END\n")
+    calls = _install_fake_memgen(monkeypatch)
+
+    result = solv_water.solvate_structure(
+        pdb_file=str(pdb),
+        output_dir=str(tmp_path),
+        output_name="solvated",
+        salt=False,
+        water_model="opc",
+    )
+
+    assert result["success"] is True
+    assert "--salt" not in calls[0]
+    assert "--nocounter" in calls[0]
+
+
+def test_count_requested_ions_accepts_pdb_and_cli_names(tmp_path):
+    pdb = tmp_path / "ions.pdb"
+    pdb.write_text(
+        _pdb_hetatm(1, "NA", "NA", "I", 1, "Na")
+        + _pdb_hetatm(2, "Cl-", "Cl-", "I", 2, "Cl")
+        + "END\n"
+    )
+
+    counts = solv_water._count_requested_ions(pdb, "Na+", "Cl-")
+
+    assert counts["cation_count"] == 1
+    assert counts["anion_count"] == 1
+
+
+def _nucleic_strand_pdb(path, resnames, chains):
+    """A strand per chain whose 5' residue carries O5' but no phosphate.
+
+    packmol-memgen estimates every standard nucleotide at -1, including the
+    5' terminus that has no phosphate to be negative with, so a linear segment
+    is one unit less negative than the estimate. Writing the terminus without
+    a P is what the deposited structures actually look like.
+    """
+    lines = []
+    serial = 1
+    for chain, start in chains:
+        for offset, resname in enumerate(resnames):
+            atoms = ["O5'"] if offset == 0 else ["P", "O5'"]
+            for atom in atoms:
+                element = "P" if atom == "P" else "O"
+                lines.append(
+                    _pdb_atom(
+                        serial, atom, resname, chain, start + offset, element,
+                        x=serial,
+                    )
+                )
+                serial += 1
+        lines.append("TER\n")
+    path.write_text("".join(lines) + "END\n")
+    return path
+
+
+def test_solvate_structure_applies_dna_charge_delta_without_bulk_salt(
+    tmp_path,
+    monkeypatch,
+):
+    # --saltcon 0 asks for counterions without bulk pairs. The curated charge
+    # correction must still reach packmol-memgen's neutralization calculation.
+    pdb = _nucleic_strand_pdb(
+        tmp_path / "dna.pdb", ["DC", "DG", "DA"], [("A", 1), ("B", 13)]
+    )
+    calls = _install_fake_memgen(monkeypatch)
+
+    result = solv_water.solvate_structure(
+        pdb_file=str(pdb),
+        output_dir=str(tmp_path),
+        output_name="solvated",
+        salt=True,
+        saltcon=0,
+        water_model="opc",
+    )
+
+    assert result["success"] is True
+    argv = calls[0]
+    assert "--salt" in argv
+    assert argv[argv.index("--saltcon") + 1] == "0"
+    assert argv[argv.index("--charge_pdb_delta") + 1] == "2"
+    assert result["auto_charge_pdb_delta"] == 2
+    assert result["auto_charge_pdb_delta_applied"] is True
+
+
+def test_solvate_structure_applies_rna_charge_delta_without_bulk_salt(
+    tmp_path,
+    monkeypatch,
+):
+    pdb = _nucleic_strand_pdb(tmp_path / "rna.pdb", ["C", "G", "A"], [("A", 1)])
+    calls = _install_fake_memgen(monkeypatch)
+
+    result = solv_water.solvate_structure(
+        pdb_file=str(pdb),
+        output_dir=str(tmp_path),
+        output_name="solvated",
+        salt=True,
+        saltcon=0,
+        water_model="opc",
+    )
+
+    assert result["success"] is True
+    argv = calls[0]
+    assert "--salt" in argv
+    assert argv[argv.index("--saltcon") + 1] == "0"
+    assert argv[argv.index("--charge_pdb_delta") + 1] == "1"
+    assert result["auto_charge_pdb_delta_applied"] is True
+
+
+def test_solvate_structure_protein_only_passes_no_charge_delta(
+    tmp_path,
+    monkeypatch,
+):
+    # The control: an ordinary protein needs no correction, and the neutralize-
+    # only path must not start inventing one.
+    pdb = tmp_path / "protein.pdb"
+    pdb.write_text(_pdb_atom(1, "CA", "ALA", "A", 1, "C") + "END\n")
+    calls = _install_fake_memgen(monkeypatch)
+    monkeypatch.setattr(
+        solv_water, "_packmol_memgen_diagnostics", lambda **_: "Charge = 0"
+    )
+
+    result = solv_water.solvate_structure(
+        pdb_file=str(pdb),
+        output_dir=str(tmp_path),
+        output_name="solvated",
+        salt=True,
+        saltcon=0,
+        water_model="opc",
+    )
+
+    assert result["success"] is True
+    assert "--charge_pdb_delta" not in calls[0]
+    assert result["auto_charge_pdb_delta"] == 0
+    assert result["auto_charge_pdb_delta_applied"] is False
+    assert result["solute_net_charge_e"] == 0
+    assert result["ion_counts"] == {
+        "cation_species": "Na+",
+        "cation_count": 0,
+        "anion_species": "Cl-",
+        "anion_count": 0,
+    }
+
+
+def test_solvate_structure_passes_counterion_species_without_bulk_salt(
+    tmp_path,
+    monkeypatch,
+):
+    # packmol-memgen defaults its counterion to K+. The neutralize-only recipe
+    # must still pass solvate_structure's Na+ default explicitly.
+    pdb = tmp_path / "protein.pdb"
+    pdb.write_text(_pdb_atom(1, "CA", "ALA", "A", 1, "C") + "END\n")
+    calls = _install_fake_memgen(monkeypatch)
+
+    result = solv_water.solvate_structure(
+        pdb_file=str(pdb),
+        output_dir=str(tmp_path),
+        output_name="solvated",
+        salt=True,
+        saltcon=0,
+        water_model="opc",
+    )
+
+    assert result["success"] is True
+    argv = calls[0]
+    assert "--salt" in argv
+    assert argv[argv.index("--saltcon") + 1] == "0"
+    assert argv[argv.index("--salt_c") + 1] == "Na+"
+    assert argv[argv.index("--salt_a") + 1] == "Cl-"
+
+
+def test_solvate_structure_includes_ligand_charge_delta(
+    tmp_path,
+    monkeypatch,
+):
+    pdb = tmp_path / "protein_ligand.pdb"
+    pdb.write_text(
+        _pdb_atom(1, "CA", "ALA", "A", 1, "C")
+        + _pdb_hetatm(2, "C1", "STI", "B", 201, "C")
+        + "END\n"
+    )
+    calls = []
+
+    def fake_run(args, cwd, timeout):
+        calls.append(list(args))
+        input_path = Path(args[args.index("--pdb") + 1])
+        output_path = Path(args[args.index("-o") + 1])
+        atom_lines = [
+            line
+            for line in input_path.read_text().splitlines()
+            if line.startswith(("ATOM", "HETATM"))
+        ]
+        output_path.write_text(
+            "CRYST1   40.000   40.000   40.000  90.00  90.00  90.00 P 1           1\n"
+            + "\n".join(atom_lines)
+            + "\nHETATM 9999  O   WAT W   1       9.000   0.000   0.000  1.00  0.00           O\n"
+            + "END\n"
+        )
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.run",
+        fake_run,
+    )
+
+    result = solv_water.solvate_structure(
+        pdb_file=str(pdb),
+        ligand_chemistry=[
+            {
+                "residue_name": "STI",
+                "ligand_instance_id": "A:STI:201",
+                "net_charge": 1,
+            }
+        ],
+        output_dir=str(tmp_path),
+        output_name="solvated",
+        salt=True,
+        water_model="opc",
+    )
+
+    assert result["success"] is True
+    assert calls[0][calls[0].index("--charge_pdb_delta") + 1] == "1"
+    assert result["auto_charge_pdb_delta"] == 1
+    assert result["ligand_charge_delta"] == 1
+    assert result["ligand_charge_delta_entries"][0]["residue_name"] == "STI"
+
+
+def test_solvate_structure_normalizes_duplicate_mg_resseq_before_charge_delta(
+    tmp_path,
+    monkeypatch,
+):
+    pdb = tmp_path / "dna_mg.pdb"
+    lines = []
+    serial = 1
+    for chain, start in (("A", 1), ("B", 13)):
+        for offset, resname in enumerate(["DC", "DG", "DA"]):
+            lines.append(
+                _pdb_atom(
+                    serial,
+                    "P",
+                    resname,
+                    chain,
+                    start + offset,
+                    "P",
+                    x=serial,
+                )
+            )
+            serial += 1
+    lines.append(_pdb_hetatm(serial, "MG", "MG", "C", 101, "Mg", x=serial))
+    serial += 1
+    lines.append(_pdb_hetatm(serial, "MG", "MG", "D", 101, "Mg", x=serial))
+    pdb.write_text("".join(lines) + "END\n")
+    calls = []
+
+    def fake_run(args, cwd, timeout):
+        calls.append(list(args))
+        input_path = Path(args[args.index("--pdb") + 1])
+        output_path = Path(args[args.index("-o") + 1])
+        atom_lines = [
+            line
+            for line in input_path.read_text().splitlines()
+            if line.startswith(("ATOM", "HETATM"))
+        ]
+        output_path.write_text(
+            "CRYST1   40.000   40.000   40.000  90.00  90.00  90.00 P 1           1\n"
+            + "\n".join(atom_lines)
+            + "\nHETATM 9999  O   WAT W   1       9.000   0.000   0.000  1.00  0.00           O\n"
+            + "END\n"
+        )
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.run",
+        fake_run,
+    )
+
+    result = solv_water.solvate_structure(
+        pdb_file=str(pdb),
+        output_dir=str(tmp_path),
+        output_name="solvated",
+        salt=True,
+        water_model="opc",
+    )
+
+    assert result["success"] is True
+    assert calls[0][calls[0].index("--charge_pdb_delta") + 1] == "2"
+    assert result["auto_charge_pdb_delta"] == 2
+    assert result["metal_ion_charge_delta"] == 0
+    assert [
+        entry["charge_pdb_delta"]
+        for entry in result["metal_ion_charge_entries"]
+    ] == [0, 0]
+
+
+def test_packmol_box_extraction_uses_union_of_inside_boxes(tmp_path):
+    inp = tmp_path / "membrane_packmol.inp"
+    inp.write_text(
+        "\n".join(
+            [
+                "structure POPC.pdb",
+                "  inside box -34.76 -34.76 -23.0 34.76 34.76 0.0",
+                "end structure",
+                "structure WAT.pdb",
+                "  inside box -34.76 -34.76 -35.06 34.76 34.76 -23.0",
+                "end structure",
+                "structure WAT.pdb",
+                "  inside box -34.76 -34.76 23.0 34.76 34.76 31.0",
+                "end structure",
+            ]
+        )
+    )
+
+    box = extract_box_size_from_packmol_inp(str(inp))
+
+    assert box is not None
+    assert box["box_a"] == 69.52
+    assert box["box_b"] == 69.52
+    assert box["box_c"] == 66.06
+
+
+def test_openmm_fallback_preserves_requested_salt_species(tmp_path, monkeypatch):
+    pdb = tmp_path / "input.pdb"
+    pdb.write_text(
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    captured = {}
+
+    def fake_solvate_with_openmm(**kwargs):
+        captured.update(kwargs)
+        result = kwargs["result"]
+        result["success"] = True
+        result["output_file"] = str(tmp_path / "solvated.pdb")
+        return result
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        solv_water,
+        "_solvate_with_openmm",
+        fake_solvate_with_openmm,
+    )
+
+    result = solv_water.solvate_structure(
+        pdb_file=str(pdb),
+        output_dir=str(tmp_path),
+        salt=True,
+        salt_c="K+",
+        salt_a="Cl-",
+        saltcon=0.30,
+        water_model="tip3p",
+    )
+
+    assert result["success"]
+    assert captured["salt_c"] == "K+"
+    assert captured["salt_a"] == "Cl-"
+    assert result["parameters"]["salt_c"] == "K+"
+    assert result["parameters"]["salt_a"] == "Cl-"
+
+
+def test_packmol_imperfect_packing_is_not_success(tmp_path):
+    output = tmp_path / "membrane.pdb"
+    output.write_text(
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    inp = tmp_path / "membrane_packmol.inp"
+    inp.write_text("inside box -1.0 -1.0 -1.0 1.0 1.0 1.0\n")
+    (tmp_path / "membrane_packmol.log").write_text(
+        "STOP: Maximum number of GENCAN loops achieved.\n"
+        "Packmol was not able to find a solution\n"
+        "ENDED WITHOUT PERFECT PACKING:\n"
+    )
+    result = {
+        "errors": [],
+        "warnings": [],
+        "statistics": {},
+        "parameters": {
+            "lipids": "POPC:POPE:CHL1",
+            "ratio": "2:1:1",
+            "dist": 15.0,
+            "dist_wat": 17.5,
+            "leaflet": 23.0,
+            "preoriented": False,
+            "salt": True,
+            "salt_c": "Na+",
+            "salt_a": "Cl-",
+            "saltcon": 0.15,
+            "salt_override": False,
+            "water_model": "opc",
+            "nloop": 20,
+            "nloop_all": 100,
+        },
+    }
+
+    _record_packmol_memgen_output(
+        output_file=output,
+        packmol_inp_file=inp,
+        out_dir=tmp_path,
+        output_name="membrane",
+        proc_result=SimpleNamespace(stdout="", stderr=""),
+        result=result,
+        success_message="ok",
+    )
+
+    assert result["success"] is False
+    assert result["code"] == "packmol_packing_quality_failed"
+    assert result["packing_quality"]["passed"] is False
+    assert "packmol_imperfect_packing" in result["packing_quality"]["failure_reasons"]
+    assert result["recommended_next_action"] == "retry_membrane_with_larger_box"
+    suggestion = result["retry_suggestion"]["suggested_parameters"]
+    assert suggestion["lipids"] == "POPC:POPE:CHL1"
+    assert suggestion["ratio"] == "2:1:1"
+    assert result["retry_suggestion"]["box_growth_axis"] == "xy"
+    assert result["retry_suggestion"]["preserve_z_parameters"] == ["dist_wat", "leaflet"]
+    assert suggestion["dist"] > 15.0
+    assert suggestion["leaflet"] == 23.0
+    assert suggestion["dist_wat"] == 17.5
+    assert suggestion["nloop"] == 20
+    assert suggestion["nloop_all"] == 100
+
+
+def test_packmol_forced_output_is_recorded_but_not_accepted(tmp_path):
+    output = tmp_path / "membrane.pdb"
+    output.write_text(
+        "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    forced = tmp_path / "membrane.pdb_FORCED"
+    forced.write_text(
+        "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n"
+        "HETATM    2  C1  POPC M   1       2.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    inp = tmp_path / "membrane_packmol.inp"
+    inp.write_text("inside box -20.0 -20.0 -35.0 20.0 20.0 35.0\n")
+    (tmp_path / "membrane_packmol.log").write_text(
+        "STOP: Maximum number of GENCAN loops achieved.\n"
+        "Packmol was not able to find a solution\n"
+        "The forced point was writen to the output file: membrane.pdb_FORCED\n"
+        "ENDED WITHOUT PERFECT PACKING:\n"
+    )
+    result = {
+        "errors": [],
+        "warnings": [],
+        "statistics": {},
+        "parameters": {
+            "lipids": "POPC:POPE:CHL1",
+            "ratio": "2:1:1",
+            "dist": 15.0,
+            "dist_wat": 17.5,
+            "leaflet": 23.0,
+            "preoriented": False,
+            "salt": True,
+            "salt_c": "Na+",
+            "salt_a": "Cl-",
+            "saltcon": 0.15,
+            "salt_override": False,
+            "water_model": "opc",
+            "nloop": 20,
+            "nloop_all": 100,
+            "allow_forced_output": True,
+        },
+    }
+
+    _record_packmol_memgen_output(
+        output_file=output,
+        packmol_inp_file=inp,
+        out_dir=tmp_path,
+        output_name="membrane",
+        proc_result=SimpleNamespace(stdout="", stderr=""),
+        result=result,
+        success_message="ok",
+        allow_forced_output=True,
+    )
+
+    assert result["success"] is False
+    assert result["code"] == "packmol_packing_quality_failed"
+    assert result["output_file"] == str(output)
+    assert result["forced_output_available"] is True
+    assert result["forced_output_file"] == str(forced)
+    assert result["packing_quality"]["passed"] is False
+    assert "packmol_imperfect_packing" in result["packing_quality"]["failure_reasons"]
+    assert result["box_dimensions"]["box_a"] == 40.0
+    assert result["statistics"]["total_atoms"] == 1
+
+
+def test_packmol_imperfect_primary_can_continue_to_objective_validation(tmp_path):
+    output = tmp_path / "membrane.pdb"
+    output.write_text(
+        "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+        "ATOM      1  P   PC  M   1       0.000   0.000   0.000  1.00  0.00           P\n"
+        "END\n"
+    )
+    forced = tmp_path / "membrane.pdb_FORCED"
+    forced.write_text(
+        "ATOM      1  P   POP M   1       0.000   0.000   0.000  1.00  0.00           P\n"
+        "END\n"
+    )
+    (tmp_path / "membrane_packmol.log").write_text(
+        "Packmol was not able to find a solution\n"
+        "Maximum number of GENCAN loops achieved\n"
+        "The forced point was writen to the output file: membrane.pdb_FORCED\n"
+        "ENDED WITHOUT PERFECT PACKING:\n"
+    )
+    result = {"statistics": {}, "warnings": [], "errors": []}
+
+    _record_packmol_memgen_output(
+        output_file=output,
+        packmol_inp_file=tmp_path / "membrane_packmol.inp",
+        out_dir=tmp_path,
+        output_name="membrane",
+        proc_result=SimpleNamespace(stdout="", stderr=""),
+        result=result,
+        success_message="ok",
+        allow_forced_output=False,
+        allow_imperfect_primary_output=True,
+    )
+
+    assert result["success"] is True
+    assert result["code"] == "packmol_imperfect_primary_output_candidate"
+    assert result["output_file"] == str(output)
+    assert result["forced_output_available"] is True
+    assert result["forced_output_file"] == str(forced)
+    assert result["packing_quality"]["passed"] is False
+    assert result["packing_quality"]["primary_output_accepted"] is True
+    assert result["recommended_next_action"] == (
+        "continue_to_topology_and_minimization_validation"
+    )
+
+
+def test_packmol_failure_without_output_still_suggests_membrane_retry(tmp_path):
+    inp = tmp_path / "membrane_packmol.inp"
+    inp.write_text("inside box -1.0 -1.0 -1.0 1.0 1.0 1.0\n")
+    (tmp_path / "packmol-memgen.log").write_text(
+        "Lipid piercing finder failed\n"
+        "Packmol was not able to find a solution\n"
+    )
+    result = {
+        "errors": [],
+        "warnings": [],
+        "statistics": {},
+        "parameters": {
+            "lipids": "POPC:POPE:CHL1",
+            "ratio": "2:1:1",
+            "dist": 15.0,
+            "dist_wat": 17.5,
+            "leaflet": 23.0,
+            "preoriented": False,
+            "salt": True,
+            "salt_c": "Na+",
+            "salt_a": "Cl-",
+            "saltcon": 0.15,
+            "salt_override": False,
+            "water_model": "opc",
+            "nloop": 20,
+            "nloop_all": 100,
+        },
+    }
+
+    _record_packmol_memgen_output(
+        output_file=tmp_path / "missing.pdb",
+        packmol_inp_file=inp,
+        out_dir=tmp_path,
+        output_name="membrane",
+        proc_result=SimpleNamespace(stdout="", stderr=""),
+        result=result,
+        success_message="ok",
+    )
+
+    assert result["success"] is False
+    assert result["code"] == "packmol_packing_quality_failed"
+    assert result["recommended_next_action"] == "retry_membrane_with_larger_box"
+    assert result["retry_suggestion"]["box_growth_axis"] == "xy"
+    assert "membrane_lipid_piercing" in result["packing_quality"]["failure_reasons"]
+
+
+def test_embed_in_membrane_restores_packmol_solute_identity(tmp_path, monkeypatch):
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text(
+        "ATOM      1  CA  ALA X   7       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  C   ALA X   7       1.000   0.000   0.000  1.00  0.00           C\n"
+        "HETATM    3 ZN    ZN Y 300       2.000   0.000   0.000  1.00  0.00          Zn\n"
+        "END\n"
+    )
+    calls = []
+
+    def fake_run(args, cwd, timeout):
+        calls.append(list(args))
+        output_path = Path(args[args.index("-o") + 1])
+        output_path.write_text(
+            "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+            "ATOM    101  CA  GLY Z 999       0.000   0.000   0.000  1.00  0.00           C\n"
+            "ATOM    102  C   GLY Z 999       1.000   0.000   0.000  1.00  0.00           C\n"
+            "HETATM  103 ZN    ZN Z 999       2.000   0.000   0.000  1.00  0.00          Zn\n"
+            "HETATM  104  C1  POPC M   1       3.000   0.000   0.000  1.00  0.00           C\n"
+            "END\n"
+        )
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.run",
+        fake_run,
+    )
+
+    result = embed_in_membrane(
+        water_model="opc",
+        pdb_file=str(input_pdb),
+        output_dir=str(tmp_path),
+        output_name="membrane",
+        lipids="POPC",
+        ratio="1",
+        preoriented=True,
+        membrane_backend="packmol-memgen",
+        packmol_race_lanes=1,
+    )
+
+    assert result["success"] is True
+    assert result["solute_identity_restored"] is True
+    assert result["solute_identity_restored_atom_count"] == 3
+    assert calls[0][calls[0].index("--charge_pdb_delta") + 1] == "2"
+    assert result["parameters"]["neutralization_expected"] is True
+    output_text = Path(result["output_file"]).read_text()
+    assert "ALA X   7" in output_text
+    assert "ZN Y 300" in output_text
+    assert "GLY Z 999" not in output_text
+
+
+def _patch_pdb_text(lipids_by_group, waters=8, box=(40.0, 40.0, 81.0)):
+    """Build a minimal packed-patch PDB (CRYST1 + lipids + bulk waters)."""
+    lines = [
+        f"CRYST1{box[0]:9.3f}{box[1]:9.3f}{box[2]:9.3f}"
+        f"{90.0:7.2f}{90.0:7.2f}{90.0:7.2f} P 1           1"
+    ]
+    serial = 1
+    for index, (resname, atom, elem) in enumerate(lipids_by_group):
+        resseq = index // 3 + 1
+        z = 5.0 if resseq % 2 == 0 else -5.0
+        lines.append(
+            _pdb_hetatm(
+                serial,
+                atom,
+                resname,
+                "M",
+                resseq,
+                elem,
+                x=0.0,
+                y=0.0,
+                z=z,
+            ).rstrip()
+        )
+        serial += 1
+    for widx in range(1, waters + 1):
+        # Bulk waters well outside the membrane core (|z| large).
+        z = 30.0 if widx % 2 == 0 else -30.0
+        x = float((widx % 4) * 5)
+        y = float((widx // 4) * 5)
+        lines.append(_pdb_hetatm(serial, "O", "HOH", "W", widx, "O", x=x, y=y, z=z).rstrip())
+        serial += 1
+    lines.append("END")
+    return "\n".join(lines) + "\n"
+
+
+def _fake_patch_packmol(lipids_by_group):
+    """Return a packmol-memgen runner stub that writes a fixed patch PDB."""
+    def _runner(args, cwd, timeout):
+        output_path = Path(args[args.index("-o") + 1])
+        output_path.write_text(_patch_pdb_text(lipids_by_group))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    return _runner
+
+
+def test_patch_membrane_fingerprint_is_protein_size_independent():
+    from mdclaw.solvation.patch_membrane import membrane_patch_fingerprint
+
+    kwargs = dict(
+        lipids="POPC:POPE:CHL1", ratio="2:1:1", water_model="opc",
+        salt=True, salt_c="Na+", salt_a="Cl-", saltcon=0.15,
+        dist_wat=17.5, leaflet=23.0, patch_side=40.0,
+        nloop=20, nloop_all=100, equil_nvt_ns=0.2, equil_npt_ns=0.2,
+        equil_temperature_k=303.15, equil_pressure_bar=1.0, forcefield="ff19SB",
+    )
+    fp1, payload1 = membrane_patch_fingerprint(**kwargs)
+    fp2, _ = membrane_patch_fingerprint(**kwargs)
+    fp3, _ = membrane_patch_fingerprint(**{**kwargs, "patch_side": 50.0})
+    assert fp1 == fp2
+    assert fp1 != fp3
+    # The packer version must not participate in the fingerprint, so patches
+    # stay reusable across environments with different packmol-memgen builds.
+    assert "packmol_memgen_version" not in payload1
+
+
+def test_patch_membrane_fingerprint_ignores_packmol_memgen_version():
+    import inspect
+
+    from mdclaw.solvation.patch_membrane import membrane_patch_fingerprint
+
+    assert "packmol_memgen_version" not in inspect.signature(
+        membrane_patch_fingerprint
+    ).parameters
+
+
+def test_patch_molecule_ids_group_lipid_fragments_and_split_solvent(tmp_path):
+    from mdclaw.solvation.patch_membrane import _parse_pdb_atoms, _patch_molecule_ids
+
+    pdb = (
+        # One Lipid21 lipid: PA/PC/OL fragments share chain + residue number.
+        _pdb_hetatm(1, "C12", "PA", "A", 1, "C")
+        + _pdb_hetatm(2, "P", "PC", "A", 1, "P")
+        + _pdb_hetatm(3, "C12", "OL", "A", 1, "C")
+        # A neighboring lipid on the same chain must remain a separate molecule.
+        + _pdb_hetatm(4, "C12", "PA", "A", 2, "C")
+        + _pdb_hetatm(5, "P", "PC", "A", 2, "P")
+        + _pdb_hetatm(6, "C12", "OL", "A", 2, "C")
+        # Two waters, each on its own (reused) chain letter.
+        + _pdb_hetatm(7, "O", "HOH", "B", 1, "O")
+        + _pdb_hetatm(8, "H1", "HOH", "B", 1, "H")
+        + _pdb_hetatm(9, "O", "HOH", "C", 1, "O")
+        + _pdb_hetatm(10, "H1", "HOH", "C", 1, "H")
+    )
+    path = tmp_path / "mdclaw_wrap_ids.pdb"
+    path.write_text(pdb)
+    _lines, atoms = _parse_pdb_atoms(path)
+    ids = _patch_molecule_ids(atoms)
+    # 4 molecules: two lipids (3 fragment atoms each) + two waters (2 atoms each).
+    assert ids == [0, 0, 0, 1, 1, 1, 2, 2, 3, 3]
+
+
+def test_wrap_patch_pdb_images_whole_molecules_into_box(tmp_path):
+    from mdclaw.solvation.patch_membrane import (
+        _bounds,
+        _parse_pdb_atoms,
+        wrap_patch_pdb,
+    )
+
+    box = {"box_a": 40.0, "box_b": 40.0, "box_c": 80.0,
+           "alpha": 90.0, "beta": 90.0, "gamma": 90.0, "is_cubic": False}
+    # A lipid that has drifted a full box out in x (centroid ~ +91) and a water
+    # that drifted below the box in y (centroid ~ -5). Wrapping must move each
+    # molecule as a rigid unit, never splitting a lipid across the boundary.
+    pdb = (
+        _pdb_hetatm(1, "C12", "PA", "A", 1, "C", x=90.0, y=10.0, z=40.0)
+        + _pdb_hetatm(2, "P", "PC", "A", 1, "P", x=92.0, y=11.0, z=41.0)
+        + _pdb_hetatm(3, "C12", "OL", "A", 1, "C", x=91.0, y=10.0, z=39.0)
+        + _pdb_hetatm(4, "O", "HOH", "B", 1, "O", x=5.0, y=-5.0, z=10.0)
+        + _pdb_hetatm(5, "H1", "HOH", "B", 1, "H", x=6.0, y=-4.0, z=10.0)
+    )
+    src = tmp_path / "patch.pdb"
+    src.write_text(pdb)
+    dst = tmp_path / "wrapped.pdb"
+    wrap_patch_pdb(src, dst, box_dims=box)
+
+    _lines, atoms = _parse_pdb_atoms(dst)
+    assert len(atoms) == 5
+    # Lipid fragments all shift by the same -80 in x (floor(91/40)=2 -> -80),
+    # so the lipid stays intact and its centroid lands in [0, 40).
+    lipid = [a for a in atoms if a.resname in {"PA", "PC", "OL"}]
+    cx = sum(a.x for a in lipid) / len(lipid)
+    assert 0.0 <= cx < 40.0
+    # Intra-lipid geometry preserved (max pairwise x-gap unchanged ~2 A).
+    assert max(a.x for a in lipid) - min(a.x for a in lipid) < 3.0
+    # Water shifted +40 in y into the cell.
+    water = [a for a in atoms if a.resname == "HOH"]
+    cy = sum(a.y for a in water) / len(water)
+    assert 0.0 <= cy < 40.0
+    # Everything sits within roughly one cell laterally now.
+    minx, maxx, miny, maxy, _minz, _maxz = _bounds(atoms)
+    assert maxx - minx < 40.0
+    assert maxy - miny < 40.0
+
+
+def test_validate_membrane_patch_quality_rejects_pbc_water_overlap(tmp_path):
+    from mdclaw.solvation.patch_membrane import validate_membrane_patch_quality
+
+    pdb = (
+        "CRYST1   42.000   42.000   83.000  90.00  90.00  90.00 P 1           1\n"
+        + _pdb_hetatm(1, "P", "PC", "A", 1, "P", x=12.0, y=12.0, z=40.0)
+        # Two distinct waters that are nearly identical under minimum image.
+        + _pdb_hetatm(2, "O", "HOH", "B", 1, "O", x=-9.496, y=5.496, z=27.322)
+        + _pdb_hetatm(3, "O", "HOH", "A", 1, "O", x=-9.570, y=47.476, z=27.371)
+        + "END\n"
+    )
+    path = tmp_path / "bad_patch.pdb"
+    path.write_text(pdb)
+
+    valid, errors, quality = validate_membrane_patch_quality(path, lipids="POPC")
+
+    assert valid is False
+    assert quality["water_oxygen_overlap_count"] == 1
+    assert quality["min_water_oxygen_distance_angstrom"] < 0.1
+    assert any("water O-O overlaps" in error for error in errors)
+
+
+def test_patch_tile_protein_grid_detects_periodic_boundary_contacts():
+    from mdclaw.solvation.patch_membrane import PDBAtom, _near_protein, _protein_grid
+
+    atom = PDBAtom(
+        line=(
+            "ATOM      1  CA  ALA A   1       0.000   0.000 -16.000"
+            "  1.00  0.00           C"
+        ),
+        index=0,
+        record="ATOM",
+        atom_name="CA",
+        resname="ALA",
+        chain_id="A",
+        resseq="1",
+        insertion_code="",
+        x=0.0,
+        y=0.0,
+        z=-16.0,
+    )
+
+    nonperiodic_grid = _protein_grid([atom], 3.0)
+    periodic_grid = _protein_grid([atom], 3.0, box_lengths=(100.0, 100.0, 77.0))
+
+    assert not _near_protein(0.0, 0.0, 63.0, grid=nonperiodic_grid, cutoff=3.0)
+    assert _near_protein(0.0, 0.0, 63.0, grid=periodic_grid, cutoff=3.0)
+
+
+def test_lookup_cached_patch_skips_invalid_geometry_cache(tmp_path):
+    from mdclaw._common import sha256_file
+    from mdclaw.solvation.patch_membrane import (
+        _lookup_cached_patch,
+        patch_cache_entry_dir,
+    )
+
+    fingerprint = "a" * 64
+    root = tmp_path / "cache"
+    entry = patch_cache_entry_dir(root, fingerprint)
+    entry.mkdir(parents=True)
+    patch = entry / "patch.pdb"
+    patch.write_text(
+        "CRYST1   42.000   42.000   83.000  90.00  90.00  90.00 P 1           1\n"
+        + _pdb_hetatm(1, "P", "PC", "A", 1, "P", x=12.0, y=12.0, z=40.0)
+        + _pdb_hetatm(2, "O", "HOH", "B", 1, "O", x=1.0, y=1.0, z=1.0)
+        + _pdb_hetatm(3, "O", "HOH", "C", 1, "O", x=1.1, y=1.0, z=1.0)
+        + "END\n"
+    )
+    (entry / "manifest.json").write_text(
+        json.dumps(
+            {
+                "patch_sha256": sha256_file(patch),
+                "box_dimensions": {
+                    "box_a": 42.0,
+                    "box_b": 42.0,
+                    "box_c": 83.0,
+                    "alpha": 90.0,
+                    "beta": 90.0,
+                    "gamma": 90.0,
+                    "is_cubic": False,
+                },
+                "parameters": {"lipids": "POPC"},
+            }
+        )
+    )
+    warnings = []
+
+    hit = _lookup_cached_patch(
+        fingerprint,
+        writable_root=root,
+        bundled_roots=[],
+        invalid_cache_warnings=warnings,
+    )
+
+    assert hit is None
+    assert warnings
+    assert "Skipped invalid writable membrane patch cache" in warnings[0]
+
+
+def test_ensure_membrane_patch_rejects_equilibrated_box_mismatch(tmp_path):
+    from mdclaw.solvation.patch_membrane import ensure_membrane_patch
+
+    lipids_by_group = [("PA", "P", "P"), ("PC", "N", "N"), ("OL", "C1", "C")]
+
+    def fake_packmol(args, cwd, timeout):
+        output_path = Path(args[args.index("-o") + 1])
+        output_path.write_text(_patch_pdb_text(lipids_by_group, box=(40.0, 40.0, 81.0)))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    def fake_equilibrate(patch_pdb, box_dims, out_dir, equil_params):
+        out = Path(out_dir) / "equilibrated.pdb"
+        out.write_text(_patch_pdb_text(lipids_by_group, box=(42.0, 42.0, 83.0)))
+        return {
+            "success": True,
+            "equilibrated_pdb": str(out),
+            "box_dimensions": box_dims,
+            "warnings": [],
+            "errors": [],
+        }
+
+    result = ensure_membrane_patch(
+        lipids="POPC",
+        ratio="1",
+        water_model="opc",
+        salt=True,
+        salt_c="Na+",
+        salt_a="Cl-",
+        saltcon=0.15,
+        dist_wat=17.5,
+        leaflet=23.0,
+        patch_side=40.0,
+        nloop=20,
+        nloop_all=100,
+        equil_params={
+            "nvt_ns": 0.2,
+            "npt_ns": 0.2,
+            "temperature_k": 303.15,
+            "pressure_bar": 1.0,
+        },
+        forcefield="ff19SB",
+        cache_mode="refresh",
+        cache_dir=str(tmp_path / "cache"),
+        packmol_memgen_runner=fake_packmol,
+        packmol_path=None,
+        equilibrate_fn=fake_equilibrate,
+        timeout=30,
+    )
+
+    assert result["success"] is False
+    assert result["code"] == "membrane_patch_build_invalid_output"
+    assert any("CRYST1 box conflicts" in error for error in result["errors"])
+
+
+def test_equilibrate_membrane_patch_disables_pablo_auto_download(
+    tmp_path,
+    monkeypatch,
+):
+    captured: dict = {}
+    minimized: dict = {}
+    equilibrated: dict = {}
+    patch = tmp_path / "patch.pdb"
+    patch.write_text(_patch_pdb_text([("PA", "P", "P"), ("PC", "N", "N")]))
+    state = tmp_path / "state.xml"
+    state.write_text("<State/>")
+
+    def fake_build_amber_system(**kwargs):
+        captured.update(kwargs)
+        return {
+            "success": True,
+            "system_xml": str(tmp_path / "system.xml"),
+            "topology_pdb": str(tmp_path / "topology.pdb"),
+            "state_xml": str(tmp_path / "initial_state.xml"),
+            "warnings": [],
+        }
+
+    def fake_minimize(**kwargs):
+        minimized.update(kwargs)
+        return {"success": True, "state_file": str(state), "warnings": []}
+
+    def fake_equilibrate(**kwargs):
+        equilibrated.update(kwargs)
+        return {
+            "success": True,
+            "state_file": str(state),
+            "final_structure": str(tmp_path / "final.pdb"),
+            "warnings": [],
+        }
+
+    def fake_export(**_kwargs):
+        return {
+            "success": True,
+            "output_pdb": str(tmp_path / "exported.pdb"),
+            "box_dimensions": {
+                "box_a": 42.0,
+                "box_b": 42.0,
+                "box_c": 83.0,
+                "alpha": 90.0,
+                "beta": 90.0,
+                "gamma": 90.0,
+                "is_cubic": False,
+            },
+            "warnings": [],
+            "errors": [],
+        }
+
+    monkeypatch.setattr(
+        "mdclaw.amber.build_system.build_amber_system",
+        fake_build_amber_system,
+    )
+    monkeypatch.setattr(
+        "mdclaw.simulation.minimize.run_minimization",
+        fake_minimize,
+    )
+    monkeypatch.setattr(
+        "mdclaw.simulation.equilibrate.run_equilibration",
+        fake_equilibrate,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation.membrane._export_patch_pdb_from_state",
+        fake_export,
+    )
+
+    result = solv_membrane._equilibrate_membrane_patch(
+        patch_pdb=patch,
+        box_dims={"box_a": 40.0, "box_b": 40.0, "box_c": 81.0},
+        out_dir=tmp_path / "build",
+        equil_params={},
+    )
+
+    assert result["success"] is True
+    assert captured["pablo_auto_download"] is False
+    assert minimized["restraint_force_constant"] == 0.0
+    assert equilibrated["restraint_force_constant"] == 0.0
+
+
+def test_compute_membrane_net_charge_disables_pablo_auto_download(
+    tmp_path,
+    monkeypatch,
+):
+    captured: dict = {}
+    pdb = tmp_path / "assembled.pdb"
+    pdb.write_text(_patch_pdb_text([("PA", "P", "P"), ("PC", "N", "N")]))
+
+    def fake_build_amber_system(**kwargs):
+        captured.update(kwargs)
+        return {
+            "success": False,
+            "code": "fake_build_failed",
+            "errors": ["stop before OpenMM XML deserialize"],
+        }
+
+    monkeypatch.setattr(
+        "mdclaw.amber.build_system.build_amber_system",
+        fake_build_amber_system,
+    )
+
+    result = solv_membrane._compute_membrane_net_charge(
+        pdb_file=pdb,
+        box_dims={"box_a": 40.0, "box_b": 40.0, "box_c": 81.0},
+        water_model="tip3p",
+    )
+
+    assert result["success"] is False
+    assert captured["pablo_auto_download"] is False
+    assert captured["water_model"] == "tip3p"
+
+
+def test_patch_cache_root_precedence_and_user_cache_fallback(tmp_path, monkeypatch):
+    from mdclaw.solvation.patch_membrane import resolve_patch_cache_root
+
+    explicit = tmp_path / "explicit"
+    membrane_env = tmp_path / "membrane-env"
+    mdclaw_env = tmp_path / "mdclaw-env"
+    xdg = tmp_path / "xdg"
+    home = tmp_path / "home"
+    monkeypatch.setenv("MDCLAW_MEMBRANE_CACHE_DIR", str(membrane_env))
+    monkeypatch.setenv("MDCLAW_CACHE_DIR", str(mdclaw_env))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(home))
+
+    assert resolve_patch_cache_root(str(explicit)) == explicit.resolve()
+    assert resolve_patch_cache_root() == membrane_env.resolve()
+    monkeypatch.delenv("MDCLAW_MEMBRANE_CACHE_DIR")
+    assert resolve_patch_cache_root() == (mdclaw_env / "membrane_patches").resolve()
+    monkeypatch.delenv("MDCLAW_CACHE_DIR")
+    assert resolve_patch_cache_root() == (xdg / "mdclaw" / "membrane_patches").resolve()
+    monkeypatch.delenv("XDG_CACHE_HOME")
+    assert resolve_patch_cache_root() == (
+        home / ".cache" / "mdclaw" / "membrane_patches"
+    ).resolve()
+
+
+def test_embed_in_membrane_patch_tile_builds_then_reuses_default_cache(
+    tmp_path, monkeypatch
+):
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text(
+        "ATOM      1  CA  ALA X   7       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  C   ALA X   7       1.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    xdg_cache = tmp_path / "xdg-cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_cache))
+    monkeypatch.delenv("MDCLAW_MEMBRANE_CACHE_DIR", raising=False)
+    monkeypatch.delenv("MDCLAW_CACHE_DIR", raising=False)
+    calls = []
+
+    lipids_by_group = [
+        ("PA", "P", "P"), ("PC", "N", "N"), ("OL", "C1", "C"),
+    ]
+
+    def fake_run(args, cwd, timeout):
+        calls.append(list(args))
+        output_path = Path(args[args.index("-o") + 1])
+        output_path.write_text(_patch_pdb_text(lipids_by_group))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr("mdclaw.solvation.membrane._run_packmol_memgen_noninteractive", fake_run)
+    monkeypatch.setattr(
+        "mdclaw.solvation.patch_membrane.resolve_bundled_patch_cache_roots",
+        lambda: [],
+    )
+    # Skip the internal OpenMM equilibration and exact charge build in unit tests;
+    # cache the packed patch directly and skip protein-charge neutralization.
+    monkeypatch.setattr("mdclaw.solvation.membrane._equilibrate_membrane_patch", None)
+    monkeypatch.setattr("mdclaw.solvation.membrane._compute_membrane_net_charge", None)
+
+    common = dict(
+        pdb_file=str(input_pdb),
+        output_name="membrane",
+        lipids="POPC",
+        ratio="1",
+        preoriented=True,
+        membrane_backend="patch-tile",
+        membrane_cache_mode="auto",
+        membrane_patch_side=40.0,
+        water_model="opc",
+    )
+    first_cwd = tmp_path / "cwd-a"
+    second_cwd = tmp_path / "cwd-b"
+    first_cwd.mkdir()
+    second_cwd.mkdir()
+    monkeypatch.chdir(first_cwd)
+    first = embed_in_membrane(output_dir=str(tmp_path / "a"), **common)
+    monkeypatch.chdir(second_cwd)
+    second = embed_in_membrane(output_dir=str(tmp_path / "b"), **common)
+
+    assert first["success"] is True, first.get("errors")
+    assert first["parameters"]["membrane_backend_used"] == "patch-tile"
+    assert first["parameters"]["membrane_cache_hit"] is False
+    assert second["success"] is True
+    assert second["parameters"]["membrane_cache_hit"] is True
+    assert (xdg_cache / "mdclaw" / "membrane_patches").is_dir()
+    # Patch packmol runs exactly once (cold build), reused on the second call.
+    assert len(calls) == 1
+    assert "--distxy_fix" in calls[0]
+
+    output_text = Path(first["output_file"]).read_text()
+    assert "ALA X   7" in output_text
+    assert "PC" in output_text  # requested POPC lipid survived tiling+carve
+    assert Path(first["box_dimensions_file"]).exists()
+
+
+def test_embed_in_membrane_patch_tile_tiles_cover_large_protein(tmp_path, monkeypatch):
+    # A protein wider than one patch must be covered by multiple tiles that do
+    # not overlap the protein core after carving.
+    lines = ["REMARK large protein"]
+    serial = 1
+    for xi in range(-30, 31, 15):
+        for yi in range(-30, 31, 15):
+            lines.append(
+                f"ATOM  {serial:5d}  CA  ALA X{serial:4d}    {float(xi):8.3f}"
+                f"{float(yi):8.3f}{0.0:8.3f}  1.00  0.00           C"
+            )
+            serial += 1
+    lines.append("END")
+    input_pdb = tmp_path / "big.pdb"
+    input_pdb.write_text("\n".join(lines) + "\n")
+
+    lipids_by_group = [("PA", "P", "P"), ("PC", "N", "N"), ("OL", "C1", "C")]
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available", lambda: True
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation.membrane._run_packmol_memgen_noninteractive",
+        _fake_patch_packmol(lipids_by_group),
+    )
+    monkeypatch.setattr("mdclaw.solvation.membrane._equilibrate_membrane_patch", None)
+    monkeypatch.setattr("mdclaw.solvation.membrane._compute_membrane_net_charge", None)
+
+    result = embed_in_membrane(
+        water_model="opc",
+        pdb_file=str(input_pdb),
+        output_dir=str(tmp_path / "out"),
+        output_name="membrane",
+        lipids="POPC",
+        ratio="1",
+        preoriented=True,
+        membrane_backend="patch-tile",
+        membrane_cache_mode="auto",
+        membrane_cache_dir=str(tmp_path / "cache"),
+        membrane_patch_side=40.0,
+        dist=15.0,
+    )
+
+    assert result["success"] is True, result.get("errors")
+    tiles = result["statistics"]["tiles"]
+    assert tiles >= 4  # protein spans ~60A > one 40A patch in both x and y
+    # No retained membrane atom sits inside the protein carve radius.
+    box = result["box_dimensions"]
+    assert box["box_a"] >= 80.0 and box["box_b"] >= 80.0
+
+
+def test_embed_in_membrane_patch_tile_neutralizes_net_charge(tmp_path, monkeypatch):
+    input_pdb = tmp_path / "input.pdb"
+    # A charged residue set so the assembled system has a nonzero net charge.
+    input_pdb.write_text(
+        "ATOM      1  CA  LYS X   7       0.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    lipids_by_group = [("PA", "P", "P"), ("PC", "N", "N"), ("OL", "C1", "C")]
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available", lambda: True
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation.membrane._run_packmol_memgen_noninteractive",
+        _fake_patch_packmol(lipids_by_group * 2),
+    )
+    monkeypatch.setattr("mdclaw.solvation.membrane._equilibrate_membrane_patch", None)
+
+    # Stub the exact-charge evaluation to report a +2 net charge.
+    def fake_charge(pdb_file, box_dims, water_model, disulfide_bonds, ligand_chemistry):
+        return {"success": True, "net_charge": 2, "warnings": [], "errors": []}
+
+    monkeypatch.setattr("mdclaw.solvation.membrane._compute_membrane_net_charge", fake_charge)
+
+    result = embed_in_membrane(
+        water_model="opc",
+        pdb_file=str(input_pdb),
+        output_dir=str(tmp_path / "out"),
+        output_name="membrane",
+        lipids="POPC",
+        ratio="1",
+        preoriented=True,
+        salt=True,
+        saltcon=0,
+        membrane_backend="patch-tile",
+        membrane_cache_mode="auto",
+        membrane_cache_dir=str(tmp_path / "cache"),
+        membrane_patch_side=40.0,
+    )
+
+    assert result["success"] is True, result.get("errors")
+    neutralization = result["statistics"]["neutralization"]
+    assert neutralization["applied"] is True
+    assert neutralization["complete"] is True
+    assert neutralization["net_charge"] == 2
+    # +2 net charge is neutralized by adding 2 anions (Cl-).
+    assert neutralization["anions_added"] == 2
+    assert neutralization["cations_added"] == 0
+    output_text = Path(result["output_file"]).read_text()
+    assert "CL" in output_text
+    assert result["parameters"]["neutralization_expected"] is True
+
+
+def test_embed_in_membrane_patch_tile_rejects_charge_evaluation_failure(
+    tmp_path,
+    monkeypatch,
+):
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text(
+        "ATOM      1  CA  ALA X   7       0.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    lipids = [("PA", "P", "P"), ("PC", "N", "N"), ("OL", "C1", "C")]
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation.membrane._run_packmol_memgen_noninteractive",
+        _fake_patch_packmol(lipids),
+    )
+    monkeypatch.setattr("mdclaw.solvation.membrane._equilibrate_membrane_patch", None)
+
+    def failed_charge(pdb_file, box_dims, water_model, disulfide_bonds, ligand_chemistry):
+        return {
+            "success": False,
+            "code": "net_charge_exception",
+            "errors": ["synthetic charge failure"],
+        }
+
+    monkeypatch.setattr(
+        "mdclaw.solvation.membrane._compute_membrane_net_charge",
+        failed_charge,
+    )
+
+    result = embed_in_membrane(
+        water_model="opc",
+        pdb_file=str(input_pdb),
+        output_dir=str(tmp_path / "out"),
+        lipids="POPC",
+        preoriented=True,
+        membrane_backend="patch-tile",
+        membrane_cache_mode="auto",
+        membrane_cache_dir=str(tmp_path / "cache"),
+        membrane_geometry_validation=False,
+    )
+
+    assert result["success"] is False
+    assert result["code"] == "membrane_neutralization_failed"
+    assert "synthetic charge failure" in result["errors"]
+
+
+def test_embed_in_membrane_patch_tile_read_only_miss_falls_back(tmp_path, monkeypatch):
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text(
+        "ATOM      1  CA  ALA X   7       0.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    calls = []
+
+    def fake_full_run(args, cwd, timeout):
+        calls.append(list(args))
+        output_path = Path(args[args.index("-o") + 1])
+        output_path.write_text(
+            "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+            "ATOM    101  CA  GLY Z 999       0.000   0.000   0.000  1.00  0.00           C\n"
+            "END\n"
+        )
+        (Path(cwd) / "membrane_packmol.log").write_text("")
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available", lambda: True
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.run", fake_full_run
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation.patch_membrane.resolve_bundled_patch_cache_roots",
+        lambda: [],
+    )
+
+    result = embed_in_membrane(
+        water_model="opc",
+        pdb_file=str(input_pdb),
+        output_dir=str(tmp_path),
+        output_name="membrane",
+        lipids="POPC",
+        ratio="1",
+        preoriented=True,
+        membrane_backend="auto",
+        membrane_cache_mode="read-only",
+        membrane_cache_dir=str(tmp_path / "empty-cache"),
+        packmol_race_lanes=1,
+    )
+
+    assert result["success"] is True
+    assert result["membrane_patch_fallback"]["reason"] == "membrane_patch_cache_miss"
+    assert "falling back to full packmol-memgen" in result["warnings"][-1]
+    assert len(calls) == 1
+    assert "--distxy_fix" not in calls[0]
+
+
+def test_embed_in_membrane_retries_before_reporting_packmol_failure(
+    tmp_path,
+    monkeypatch,
+):
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text(
+        "ATOM      1  CA  ALA X   7       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  C   ALA X   7       1.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    calls = []
+
+    def fake_run(args, cwd, timeout):
+        calls.append(list(args))
+        output_path = Path(args[args.index("-o") + 1])
+        if len(calls) == 1:
+            output_path.write_text(
+                "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+                "ATOM    101  CA  GLY Z 999       0.000   0.000   0.000  1.00  0.00           C\n"
+                "ATOM    102  C   GLY Z 999       1.000   0.000   0.000  1.00  0.00           C\n"
+                "END\n"
+            )
+            output_path.with_name(f"{output_path.name}_FORCED").write_text(
+                "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+                "ATOM    101  CA  GLY Z 999       0.000   0.000   0.000  1.00  0.00           C\n"
+                "ATOM    102  C   GLY Z 999       1.000   0.000   0.000  1.00  0.00           C\n"
+                "HETATM  103  C1  POPC M   1       2.000   0.000   0.000  1.00  0.00           C\n"
+                "END\n"
+            )
+            (Path(cwd) / "membrane_packmol.log").write_text(
+                "STOP: Maximum number of GENCAN loops achieved.\n"
+                "Packmol was not able to find a solution\n"
+                "The forced point was writen to the output file: membrane.pdb_FORCED\n"
+                "ENDED WITHOUT PERFECT PACKING:\n"
+            )
+            return SimpleNamespace(stdout="", stderr="")
+        output_path.write_text(
+            "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+            "ATOM    101  CA  GLY Z 999       0.000   0.000   0.000  1.00  0.00           C\n"
+            "ATOM    102  C   GLY Z 999       1.000   0.000   0.000  1.00  0.00           C\n"
+            "END\n"
+        )
+        (Path(cwd) / "membrane_packmol.log").write_text("")
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.run",
+        fake_run,
+    )
+
+    result = embed_in_membrane(
+        water_model="opc",
+        pdb_file=str(input_pdb),
+        output_dir=str(tmp_path),
+        output_name="membrane",
+        lipids="POPC",
+        ratio="1",
+        preoriented=True,
+        membrane_backend="packmol-memgen",
+        packmol_race_lanes=1,
+    )
+
+    assert result["success"] is True
+    assert len(calls) == 2
+    assert calls[0][calls[0].index("--nloop_all") + 1] == "100"
+    assert calls[1][calls[1].index("--nloop_all") + 1] == "200"
+    assert "--random" in calls[1]
+    assert result["adaptive_packmol_retry"]["attempts"][0]["status"] == "retry_packing_quality"
+    assert result["adaptive_packmol_retry"]["attempts"][1]["status"] == "success"
+    assert result["packing_quality"]["passed"] is True
+    output_text = Path(result["output_file"]).read_text()
+    assert "ALA X   7" in output_text
+    assert "GLY Z 999" not in output_text
+
+
+def test_embed_in_membrane_accepts_imperfect_primary_before_lateral_retry(
+    tmp_path,
+    monkeypatch,
+):
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text(
+        "ATOM      1  CA  ALA X   7       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  C   ALA X   7       1.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    calls = []
+
+    def fake_run(args, cwd, timeout):
+        calls.append(list(args))
+        output_path = Path(args[args.index("-o") + 1])
+        output_path.write_text(
+            "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+            "ATOM    101  CA  GLY Z 999       0.000   0.000   0.000  1.00  0.00           C\n"
+            "ATOM    102  C   GLY Z 999       1.000   0.000   0.000  1.00  0.00           C\n"
+            "END\n"
+        )
+        output_path.with_name(f"{output_path.name}_FORCED").write_text(
+            "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+            "HETATM  103  C1  POPC M   1       2.000   0.000   0.000  1.00  0.00           C\n"
+            "END\n"
+        )
+        (Path(cwd) / "membrane_packmol.log").write_text(
+            "STOP: Maximum number of GENCAN loops achieved.\n"
+            "Packmol was not able to find a solution\n"
+            "The forced point was writen to the output file: membrane.pdb_FORCED\n"
+            "ENDED WITHOUT PERFECT PACKING:\n"
+        )
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.run",
+        fake_run,
+    )
+
+    result = embed_in_membrane(
+        water_model="opc",
+        pdb_file=str(input_pdb),
+        output_dir=str(tmp_path),
+        output_name="membrane",
+        lipids="POPC",
+        ratio="1",
+        preoriented=True,
+        membrane_backend="packmol-memgen",
+        packmol_race_lanes=1,
+    )
+
+    assert result["success"] is True
+    assert result["code"] == "packmol_imperfect_primary_output_candidate"
+    assert len(calls) == 2
+    assert result["adaptive_packmol_retry"]["attempts"][0]["status"] == "retry_packing_quality"
+    final_attempt = result["adaptive_packmol_retry"]["attempts"][1]
+    assert final_attempt["status"] == "accepted_imperfect_primary"
+    assert final_attempt["accepted_output_file"] == result["packmol_primary_output_file"]
+    assert final_attempt["dist"] == 15.0
+    assert result["packing_quality"]["primary_output_accepted"] is True
+
+
+def test_embed_in_membrane_runs_parallel_packmol_race(tmp_path, monkeypatch):
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text(
+        "ATOM      1  CA  ALA X   7       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  C   ALA X   7       1.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    calls = []
+    # Hold every lane until all four have entered the runner. The race is meant
+    # to cancel lanes that have not started once a winner is accepted, so
+    # without this barrier the winner can be decided before the last lane is
+    # scheduled, its future gets cancelled, and the call is never recorded —
+    # which made this test fail roughly half the time. The timeout keeps a real
+    # regression (fewer lanes started) a loud failure instead of a hang.
+    lanes_started = threading.Barrier(4, timeout=30)
+
+    def fake_run(args, *, cwd, timeout, cancel_event):
+        lanes_started.wait()
+        calls.append((list(args), Path(cwd)))
+        output_path = Path(args[args.index("-o") + 1])
+        output_path.write_text(
+            "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+            "ATOM    101  CA  GLY Z 999       0.000   0.000   0.000  1.00  0.00           C\n"
+            "ATOM    102  C   GLY Z 999       1.000   0.000   0.000  1.00  0.00           C\n"
+            "END\n"
+        )
+        output_path.with_name(f"{output_path.name}_FORCED").write_text(
+            "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+            "HETATM  103  C1  POPC M   1       2.000   0.000   0.000  1.00  0.00           C\n"
+            "END\n"
+        )
+        packlog = Path(cwd) / "membrane_packmol.log"
+        if args[args.index("--dist") + 1] == "25.0":
+            packlog.write_text(
+                "STOP: Maximum number of GENCAN loops achieved.\n"
+                "Packmol was not able to find a solution\n"
+                "The forced point was writen to the output file: membrane.pdb_FORCED\n"
+                "ENDED WITHOUT PERFECT PACKING:\n"
+            )
+        else:
+            packlog.write_text(
+                "STOP: Maximum number of GENCAN loops achieved.\n"
+                "Packmol was not able to find a solution\n"
+                "ENDED WITHOUT PERFECT PACKING:\n"
+            )
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation.membrane._run_packmol_memgen_cancellable",
+        fake_run,
+    )
+
+    result = embed_in_membrane(
+        water_model="opc",
+        pdb_file=str(input_pdb),
+        output_dir=str(tmp_path),
+        output_name="membrane",
+        lipids="POPC",
+        ratio="1",
+        preoriented=True,
+        membrane_backend="packmol-memgen",
+    )
+
+    assert result["success"] is True
+    assert result["code"] == "packmol_imperfect_primary_output_candidate"
+    assert len(calls) == 4
+    assert len({cwd for _, cwd in calls}) == 4
+    assert len({args[args.index("-o") + 1] for args, _ in calls}) == 4
+    retry = result["adaptive_packmol_retry"]
+    assert retry["mode"] == "parallel_race"
+    assert retry["effective_lanes"] == 4
+    assert len(retry["attempts"]) == 4
+    selected = [attempt for attempt in retry["attempts"] if attempt.get("selected")]
+    assert len(selected) == 1
+    assert selected[0]["dist"] == 25.0
+    assert selected[0]["status"] == "accepted_imperfect_primary"
+    assert selected[0]["accepted_output_file"] == result["packmol_primary_output_file"]
+    output_text = Path(result["output_file"]).read_text()
+    assert "ALA X   7" in output_text
+    assert "GLY Z 999" not in output_text
+
+
+def test_embed_in_membrane_cancels_pending_parallel_race_lanes(tmp_path, monkeypatch):
+    input_pdb = tmp_path / "input.pdb"
+    input_pdb.write_text(
+        "ATOM      1  CA  ALA X   7       0.000   0.000   0.000  1.00  0.00           C\n"
+        "ATOM      2  C   ALA X   7       1.000   0.000   0.000  1.00  0.00           C\n"
+        "END\n"
+    )
+    calls = []
+    cancelled_lanes = []
+
+    def write_imperfect_lane(args, cwd):
+        output_path = Path(args[args.index("-o") + 1])
+        output_path.write_text(
+            "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+            "ATOM    101  CA  GLY Z 999       0.000   0.000   0.000  1.00  0.00           C\n"
+            "ATOM    102  C   GLY Z 999       1.000   0.000   0.000  1.00  0.00           C\n"
+            "END\n"
+        )
+        output_path.with_name(f"{output_path.name}_FORCED").write_text(
+            "CRYST1   40.000   40.000   70.000  90.00  90.00  90.00 P 1           1\n"
+            "HETATM  103  C1  POPC M   1       2.000   0.000   0.000  1.00  0.00           C\n"
+            "END\n"
+        )
+        (Path(cwd) / "membrane_packmol.log").write_text(
+            "STOP: Maximum number of GENCAN loops achieved.\n"
+            "Packmol was not able to find a solution\n"
+            "The forced point was writen to the output file: membrane.pdb_FORCED\n"
+            "ENDED WITHOUT PERFECT PACKING:\n"
+        )
+
+    def fake_run(args, *, cwd, timeout, cancel_event):
+        lane = int(Path(cwd).name.rsplit("lane", 1)[1])
+        calls.append((lane, list(args), Path(cwd)))
+        if lane == 4:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if cancel_event.is_set():
+                    cancelled_lanes.append(lane)
+                    raise solv_membrane._PackmolRaceCancelled("lane cancelled")
+                time.sleep(0.01)
+            raise AssertionError("slow lane was not cancelled")
+
+        if lane == 3:
+            time.sleep(0.05)
+        write_imperfect_lane(args, cwd)
+        return SimpleNamespace(stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "mdclaw.solvation._base.packmol_memgen_wrapper.is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "mdclaw.solvation.membrane._run_packmol_memgen_cancellable",
+        fake_run,
+    )
+
+    result = embed_in_membrane(
+        water_model="opc",
+        pdb_file=str(input_pdb),
+        output_dir=str(tmp_path),
+        output_name="membrane",
+        lipids="POPC",
+        ratio="1",
+        preoriented=True,
+        membrane_backend="packmol-memgen",
+    )
+
+    assert result["success"] is True
+    assert len(calls) == 4
+    assert cancelled_lanes == [4]
+    retry = result["adaptive_packmol_retry"]
+    selected = [attempt for attempt in retry["attempts"] if attempt.get("selected")]
+    cancelled = [
+        attempt
+        for attempt in retry["attempts"]
+        if attempt["status"] == "cancelled_after_selection"
+    ]
+    assert len(selected) == 1
+    assert selected[0]["lane"] == 3
+    assert selected[0]["status"] == "accepted_imperfect_primary"
+    assert len(cancelled) == 1
+    assert cancelled[0]["lane"] == 4
+
+
+# --- the copied water must arrive at the density of the slab it came from ----
+def _hbonded_water_pdb(path, *, z_ranges, spacing=3.1):
+    """Water on a lattice, with hydrogens where hydrogen bonds put them.
+
+    Neighbouring molecules sit ``spacing`` apart O-O, and each H points at the
+    next oxygen 1.0 A away, so H...O is ``spacing - 1.0`` -- inside the 2.2 A
+    separation the copier uses. That is the geometry of real water, and it is
+    what an all-atom clash test mistakes for an overlap.
+    """
+    rows, serial, resseq = [], 1, 1
+    for lo, hi in z_ranges:
+        z = lo
+        while z < hi - 1e-9:
+            for iy in range(6):
+                for ix in range(6):
+                    x, y = spacing * ix, spacing * iy
+                    for name, dx, dy in (("O", 0.0, 0.0), ("H1", 1.0, 0.0),
+                                         ("H2", 0.0, 1.0)):
+                        rows.append(
+                            "ATOM  %5d  %-3s WAT W%4d    %8.3f%8.3f%8.3f"
+                            "  1.00  0.00" % (
+                                serial, name, resseq % 10000, x + dx, y + dy, z)
+                        )
+                        serial += 1
+                    resseq += 1
+            z += spacing
+    path.write_text("\n".join(rows) + "\nEND\n")
+    return path
+
+
+def _placed_from_pdb(path):
+    from mdclaw.solvation.patch_membrane import _parse_pdb_atoms
+
+    _lines, atoms = _parse_pdb_atoms(path)
+    placed = [(a, a.line, a.x, a.y, a.z) for a in atoms]
+    keys = [(a.chain_id, a.resseq) for a in atoms]
+    return placed, keys
+
+
+def test_copied_water_keeps_the_density_of_the_slab_it_came_from(tmp_path):
+    """A copy is one rigid translation of an equilibrated slab, so every
+    molecule in it must survive.
+
+    The copier used to add each accepted molecule to the same grid it tested
+    against, so a copy was screened against itself: accepting one water rejected
+    the neighbours it was hydrogen-bonded to. Measured on SMO 5L7D in POPC,
+    41 % of every copy survived and the added water arrived at 40 % of bulk
+    density -- 23,819 of 41,157 copies "dropped for overlap". NPT then collapsed
+    the cell by 23 % and still left an 18 A void.
+    """
+    from mdclaw.solvation.patch_membrane import extend_water_slabs
+
+    box_c, leaflet = 40.0, 8.0
+    pdb = _hbonded_water_pdb(
+        tmp_path / "slab.pdb", z_ranges=((-20.0, -8.0), (8.0, 20.0))
+    )
+    placed, keys = _placed_from_pdb(pdb)
+    source_molecules = len({k for k in keys})
+    interval = {
+        "low": -20.0, "high": 44.0, "extend_below": 0.0, "extend_above": 24.0,
+    }
+
+    out, out_keys, report = extend_water_slabs(
+        placed, keys, membrane_center_z=0.0, leaflet=leaflet,
+        patch_box_c=box_c, interval=interval,
+    )
+
+    assert report["extended"] is True
+    # Nothing is thinned: every molecule that lands inside the target interval
+    # is kept, copy by copy.
+    assert report["dropped_overlapping"] == 0
+    for copy in report["copies"]:
+        assert copy["added"] == copy["attempted"] - copy["outside"], copy
+    assert report["added_molecules"] >= source_molecules
+    assert len(out) == len(placed) + report["added_atoms"]
+    assert len(out_keys) == len(out)
+
+
+def test_a_copy_landing_on_something_already_there_is_still_dropped(tmp_path):
+    """The overlap test must still reject a real clash, not everything."""
+    from mdclaw.solvation.patch_membrane import _parse_pdb_atoms, extend_water_slabs
+
+    box_c, leaflet = 40.0, 8.0
+    pdb = _hbonded_water_pdb(
+        tmp_path / "slab.pdb", z_ranges=((-20.0, -8.0), (8.0, 20.0))
+    )
+    placed, keys = _placed_from_pdb(pdb)
+    # An obstacle where copy 1's oxygens land. Copy 0 is exempt -- it is one
+    # patch box vector from the primary cell, so its contacts are the patch's
+    # own periodic contacts -- so the obstacle has to sit in a later copy to
+    # exercise the test at all. Copy 1 lifts the 8..20 molecules by one period
+    # to 32..44.
+    blocker = tmp_path / "blocker.pdb"
+    blocker.write_text(
+        "ATOM      1  CA  ALA X   1       0.000   0.000  32.000  1.00  0.00\n"
+        "END\n"
+    )
+    _lines, obstacle = _parse_pdb_atoms(blocker)
+    placed = placed + [(a, a.line, a.x, a.y, a.z) for a in obstacle]
+    keys = keys + [("X", "1") for _ in obstacle]
+    interval = {
+        "low": -20.0, "high": 44.0, "extend_below": 0.0, "extend_above": 24.0,
+    }
+
+    _out, _out_keys, report = extend_water_slabs(
+        placed, keys, membrane_center_z=0.0, leaflet=leaflet,
+        patch_box_c=box_c, interval=interval,
+    )
+
+    assert report["dropped_overlapping"] == 1
+
+
+def test_the_stacking_period_comes_from_the_lipids_not_the_nominal_leaflet(tmp_path):
+    """`leaflet` is what the caller asked for; the patch's lipids are the truth.
+
+    When the bilayer is thicker than 2*leaflet, the water selected for copying
+    starts where the lipids end, but stepping by the nominal `box_c - 2*leaflet`
+    reproduces the headgroup-occupied space as vacuum. Measured on the bundled
+    POPC patch: lipids span 54.76 A against a nominal 46, and every seam showed
+    a density trough down to ~52 % of bulk until the period was measured.
+    """
+    from mdclaw.solvation.patch_membrane import _parse_pdb_atoms, extend_water_slabs
+
+    box_c, leaflet = 40.0, 8.0
+    pdb = _hbonded_water_pdb(
+        tmp_path / "slab.pdb", z_ranges=((-20.0, -12.0), (12.0, 20.0))
+    )
+    placed, keys = _placed_from_pdb(pdb)
+    # A bilayer 24 A thick — wider than 2*leaflet = 16.
+    rows = []
+    for serial, z in enumerate((-12.0, -6.0, 6.0, 12.0), start=1):
+        for i in range(8):
+            rows.append(
+                "ATOM  %5d  P31 PC  L%4d    %8.3f%8.3f%8.3f  1.00  0.00"
+                % (serial * 100 + i, serial, 3.0 * i, 0.0, z)
+            )
+    lipids = tmp_path / "lipids.pdb"
+    lipids.write_text("\n".join(rows) + "\nEND\n")
+    _lines, lipid_atoms = _parse_pdb_atoms(lipids)
+    placed = placed + [(a, a.line, a.x, a.y, a.z) for a in lipid_atoms]
+    keys = keys + [("L", str(a.resseq)) for a in lipid_atoms]
+    interval = {
+        "low": -20.0, "high": 44.0, "extend_below": 0.0, "extend_above": 24.0,
+    }
+
+    _out, _out_keys, report = extend_water_slabs(
+        placed, keys, membrane_center_z=0.0, leaflet=leaflet,
+        patch_box_c=box_c, interval=interval,
+    )
+
+    assert report["slab_high"] == pytest.approx(12.0)
+    assert report["slab_low"] == pytest.approx(-12.0)
+    # measured 40 - 24 = 16, not the nominal 40 - 2*8 = 24
+    assert report["slab_period"] == pytest.approx(16.0)
+    assert report["extended"] is True
+    assert report["added_molecules"] > 0
+    # The nominal period would have started the copies at 12 + 24 = 36, leaving
+    # the 26..36 band empty. With the measured one they start at 28.
+    starts = sorted(c["z_min"] for c in report["copies"] if c["z_min"] is not None)
+    assert starts[0] == pytest.approx(20.0)
+    assert min(value for value in starts if value > 20.0) < 36.0
+
+
+def test_an_unrecognised_residue_is_not_mistaken_for_bilayer(tmp_path):
+    """Classifying the membrane by exclusion turns any stray heteroatom into
+    bilayer, which widens the span to the whole box and silently skips the
+    extension. A divalent counter-ion in bulk water is the realistic case."""
+    from mdclaw.solvation.patch_membrane import _parse_pdb_atoms, extend_water_slabs
+
+    box_c, leaflet = 40.0, 8.0
+    pdb = _hbonded_water_pdb(
+        tmp_path / "slab.pdb", z_ranges=((-20.0, -8.0), (8.0, 20.0))
+    )
+    placed, keys = _placed_from_pdb(pdb)
+    stray = tmp_path / "stray.pdb"
+    stray.write_text(
+        "ATOM      1 MG    MG  M   1      50.000  50.000 -19.000  1.00  0.00\n"
+        "ATOM      2 MG    MG  M   2      50.000  50.000  19.000  1.00  0.00\n"
+        "END\n"
+    )
+    _lines, ions = _parse_pdb_atoms(stray)
+    placed = placed + [(a, a.line, a.x, a.y, a.z) for a in ions]
+    keys = keys + [("M", str(a.resseq)) for a in ions]
+    interval = {
+        "low": -20.0, "high": 44.0, "extend_below": 0.0, "extend_above": 24.0,
+    }
+
+    _out, _out_keys, report = extend_water_slabs(
+        placed, keys, membrane_center_z=0.0, leaflet=leaflet,
+        patch_box_c=box_c, interval=interval,
+    )
+
+    # The stray ions sit at +/-19, so classifying them as bilayer would give a
+    # 38 A span and a 2 A period. The nominal leaflet must survive instead.
+    assert report["slab_period"] == pytest.approx(24.0)
+    assert report["extended"] is True
+    assert report["added_molecules"] > 0
+
+
+# --- the density gate itself -------------------------------------------------
+def _density_atoms(*, box, water_per_bin, z_range, bilayer=(-5.0, 5.0)):
+    """Water oxygens spread uniformly over z, at a chosen number per 4 A bin."""
+    atoms = []
+    z = z_range[0]
+    while z < z_range[1]:
+        for i in range(water_per_bin):
+            atoms.append({
+                "name": "O", "resname": "HOH",
+                "x": (i % 30) * 3.0, "y": (i // 30) * 3.0, "z": z + 2.0,
+            })
+        z += 4.0
+    for z in bilayer:
+        for i in range(40):
+            atoms.append({
+                "name": "P31", "resname": "PC",
+                "x": (i % 8) * 3.0, "y": (i // 8) * 3.0, "z": z,
+            })
+    return atoms
+
+
+def test_a_uniformly_dilute_cell_is_caught_by_the_absolute_criterion():
+    """The defect this gate exists for filled the whole cell to 41 % of bulk.
+    A cell judged against its own median scores 0.85 and passes."""
+    from mdclaw.solvation.membrane import _solvent_density_profile
+
+    box = 40.0
+    full = int(round(0.03344 * box * box * 4.0))
+    for fraction, expected in ((1.0, True), (0.41, False)):
+        atoms = _density_atoms(
+            box=box, water_per_bin=int(full * fraction), z_range=(-60.0, 60.0)
+        )
+        report = _solvent_density_profile(
+            atoms, box_a=box, box_b=box, box_c=120.0,
+            alpha=90.0, beta=90.0, gamma=90.0,
+            centre=0.0, exclude_low=-9.0, exclude_high=9.0,
+        )
+        assert report["assessed"] is True
+        passes = report["median_fraction_of_bulk"] >= 0.75
+        assert passes is expected, (fraction, report)
+        # relative to itself the dilute cell looks fine — that is the point
+        assert report["min_fraction_of_median"] > 0.9
+
+
+def test_the_density_gate_declines_to_judge_a_triclinic_cell():
+    """Bin volume is box_a * box_b * width, which is the cross section only for
+    a rectangular cell; a gamma=60 cell would measure a correctly hydrated
+    system well under bulk."""
+    from mdclaw.solvation.membrane import _solvent_density_profile
+
+    atoms = _density_atoms(box=40.0, water_per_bin=200, z_range=(-60.0, 60.0))
+    report = _solvent_density_profile(
+        atoms, box_a=40.0, box_b=40.0, box_c=120.0,
+        alpha=90.0, beta=90.0, gamma=60.0,
+        centre=0.0, exclude_low=-9.0, exclude_high=9.0,
+    )
+    assert report == {"assessed": False, "reason": "cell_is_not_orthorhombic"}
+
+
+def test_water_the_gate_cannot_recognise_is_reported_not_passed():
+    """Silently returning "fine" for a water model whose oxygen is named
+    something else would make the gate a decoration."""
+    from mdclaw.solvation.membrane import _solvent_density_profile
+
+    atoms = _density_atoms(box=40.0, water_per_bin=200, z_range=(-60.0, 60.0))
+    for atom in atoms:
+        if atom["resname"] == "HOH":
+            atom["name"] = "OW2"
+    report = _solvent_density_profile(
+        atoms, box_a=40.0, box_b=40.0, box_c=120.0,
+        alpha=90.0, beta=90.0, gamma=90.0,
+        centre=0.0, exclude_low=-9.0, exclude_high=9.0,
+    )
+    assert report["assessed"] is False
+    assert report["reason"] == "too_few_recognised_waters"
+
+
+def test_a_channel_through_the_cell_is_caught_though_the_z_profile_passes():
+    """A z profile averages over the whole cross section.
+
+    A channel through 12.5 % of the area leaves every slab at ~0.87 of bulk,
+    comfortably past the 0.75 median and the 0.35 per-bin floor, so slabs alone
+    cannot see it. The columns can, because it is empty from one face to the
+    other.
+
+    The band where this matters is bounded on both sides. Much wider and the
+    slab median falls below 0.75 on its own — a quarter-area channel measures
+    0.729 and the slab test already fails it. Much narrower and the column
+    fraction drops under the 8 % threshold: on a 112 A cell that floor is a
+    channel roughly 35 A across, and anything smaller is left to the slab
+    tests, which see it only if it moves a whole slab's density.
+    """
+    from mdclaw.solvation.membrane import _solvent_density_profile
+
+    box = 40.0
+    step = 10.0
+    ncol = int(box // step)                    # 4 x 4 columns of 10 A
+    per_column = int(round(0.03344 * step * step * 4.0))   # ~13 waters, bulk
+    # Twelve of sixteen columns filled at bulk density, four empty from top to
+    # bottom: a channel through a quarter of the cross section. Filling the
+    # columns rather than a stripe is the point — water crammed into a narrow
+    # band is far easier to detect than the real thing.
+    atoms = []
+    z = -60.0
+    while z < 60.0:
+        for ix in range(ncol):
+            for iy in range(ncol):
+                if ix == 3 and iy >= 2:
+                    continue                   # the channel: 2 of 16 columns
+                for k in range(per_column):
+                    atoms.append({
+                        "name": "O", "resname": "HOH",
+                        "x": ix * step + (k % 4) * 2.0 + 1.0,
+                        "y": iy * step + (k // 4) * 2.5 + 1.0,
+                        "z": z + 2.0,
+                    })
+        z += 4.0
+    for z in (-5.0, 5.0):
+        for i in range(40):
+            atoms.append({"name": "P31", "resname": "PC",
+                          "x": (i % 8) * 3.0, "y": (i // 8) * 3.0, "z": z})
+
+    report = _solvent_density_profile(
+        atoms, box_a=box, box_b=box, box_c=120.0,
+        alpha=90.0, beta=90.0, gamma=90.0,
+        centre=0.0, exclude_low=-9.0, exclude_high=9.0,
+    )
+
+    assert report["assessed"] is True
+    # the slab tests are satisfied ...
+    assert report["median_fraction_of_bulk"] >= 0.75
+    assert report["min_fraction_of_bulk"] >= 0.35
+    # ... and the columns are not: one of sixteen is empty through the whole
+    # water region, and the gate only counts a column that is.
+    assert report["void_column_fraction"] > 0.08
+
+
+TILES_PER_SIDE = 3
+TILE_COUNT = TILES_PER_SIDE * TILES_PER_SIDE
+
+
+def _tiled_water_sites(n_slabs=3200):
+    """Water sites shaped like a tiled patch, sorted the way the code sorts them.
+
+    Tiling copies the patch in x and y only, so every copy keeps the original z
+    bit-for-bit -- measured on a real POPC system, 32126 waters held only 3597
+    distinct z values, 100% of them shared. The z key of the (z, x, y) sort is
+    therefore almost always tied and the x/y keys decide the order, lining the
+    candidate list up with the tile grid.
+    """
+    tile = 116.0 / TILES_PER_SIDE
+    sites = []
+    for slab in range(n_slabs):
+        z = round(-60.0 + slab * 0.0375, 3)
+        for ix in range(TILES_PER_SIDE):
+            for iy in range(TILES_PER_SIDE):
+                sites.append((ix * tile - 58.0, iy * tile - 58.0, z))
+    sites.sort(key=lambda p: (p[2], p[0], p[1]))
+    return sites
+
+
+def _tile_offsets(sites, chosen):
+    """Which position inside its z slab each chosen site occupies (0..8)."""
+    offset_of = {}
+    seen_z = None
+    k = 0
+    for site in sites:
+        if site[2] != seen_z:
+            seen_z, k = site[2], 0
+        offset_of[site] = k
+        k += 1
+    return [offset_of[c] for c in chosen]
+
+
+def _column_spread(offsets):
+    """Ratio of the least- to most-visited tile column. 1.0 is perfectly even."""
+    counts = [0] * TILES_PER_SIDE
+    for off in offsets:
+        counts[off % TILES_PER_SIDE] += 1
+    return min(counts) / max(counts) if max(counts) else 0.0
+
+
+def _select_blocks(candidates, needed):
+    """The shipped selection, run on plain coordinate tuples."""
+    import random
+
+    from mdclaw.solvation.patch_membrane import ION_PLACEMENT_SEED
+
+    rng = random.Random(ION_PLACEMENT_SEED)
+    total = len(candidates)
+    chosen = []
+    for block in range(min(needed, total)):
+        start = (block * total) // needed
+        stop = ((block + 1) * total) // needed
+        if stop <= start:
+            stop = start + 1
+        chosen.append(candidates[rng.randrange(start, min(stop, total))])
+    return chosen
+
+
+def test_a_constant_stride_can_lock_onto_one_column_of_tiles():
+    """The failure the shipped selection exists to avoid.
+
+    A stride sharing a factor with the tile count walks the within-slab offsets
+    0, 6, 3, ... which all sit in the same y column, so the ions come out
+    drifting across y as z advances. Measured on a real 9UWI POPC system,
+    stride 150 gave Spearman rho = 0.62 between an ion's z rank and its y,
+    while stride 172 on 5L7D gave 0.07 -- a coincidence of arithmetic, not a
+    property of either structure.
+    """
+    sites = _tiled_water_sites()
+
+    resonant = _tile_offsets(sites, sites[::150][:194])
+    coprime = _tile_offsets(sites, sites[::172][:194])
+
+    # The resonant stride never leaves its column; the coprime one spreads.
+    assert _column_spread(resonant) == 0.0
+    assert _column_spread(coprime) > 0.5
+
+
+def test_block_selection_visits_every_tile_column():
+    """The shipped selection stays even at the stride that broke."""
+    sites = _tiled_water_sites()
+
+    chosen = _select_blocks(sites, 194)
+
+    assert len(chosen) == 194
+    assert _column_spread(_tile_offsets(sites, chosen)) > 0.5
+
+
+def test_block_selection_is_even_across_many_ion_counts():
+    """Evenness must not depend on how the ion count divides the candidates."""
+    sites = _tiled_water_sites()
+
+    worst = min(
+        _column_spread(_tile_offsets(sites, _select_blocks(sites, needed)))
+        for needed in range(150, 320, 7)
+    )
+
+    assert worst > 0.4
+
+
+def test_block_selection_keeps_the_z_spread_and_is_reproducible():
+    """Blocks preserve the spread the stride was there for, deterministically."""
+    sites = _tiled_water_sites()
+
+    chosen = _select_blocks(sites, 194)
+    again = _select_blocks(sites, 194)
+
+    assert chosen == again, "same seed must reproduce the same placement"
+    zs = [c[2] for c in chosen]
+    all_z = [s[2] for s in sites]
+    assert min(zs) - min(all_z) < 2.0
+    assert max(all_z) - max(zs) < 2.0
+    assert len(set(zs)) > 150, "picks must not pile into a few slabs"
+
+
+# --- why the solvated write does not keep ids ---------------------------------
+# Not because the ids collide -- measured on OpenMM 8.5.1, addSolvent makes
+# exactly two solvent chains whose residue ids continue past the solute's, and
+# keeping them collides nothing. Because they are an internal detail of the
+# version in the container, and the comment that used to be here described a
+# one-chain-per-water shape addSolvent does not build. What the solute needs is
+# put back after the write instead, from the input, by prefix -- which is immune
+# to however this version of addSolvent happens to group its water.
+
+def test_the_solvated_write_does_not_keep_openmm_s_water_chain_ids():
+    """A regression guard: this was changed to keepIds=True and had to come back."""
+    import inspect
+
+    from mdclaw.solvation import water
+
+    source = inspect.getsource(water._solvate_with_openmm)
+    call = next(line for line in source.splitlines()
+                if "PDBFile.writeFile" in line)
+    assert "keepIds" not in call, (
+        "the solute's identity is restored from the input after the write, not "
+        "carried through it; see the comment above the call"
+    )

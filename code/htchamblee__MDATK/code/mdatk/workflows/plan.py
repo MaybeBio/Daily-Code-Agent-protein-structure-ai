@@ -1,0 +1,971 @@
+"""RNAdo's plan: turn a plan (steps + connections) into consistently named files.
+
+A plan is a directed graph stored in :class:`mdatk.config.WorkflowParams`.
+Resolving it walks the steps in dependency order, hands every step the file
+names its upstream steps will produce, runs the step's logic checks and
+collects the names of its own outputs.  Writing it generates every step's
+files into ``<plan folder>/<step>_<tool>/`` (``<step>_<tool>_<folder tag>/``
+for a step with a folder tag) plus a master script and a Markdown summary
+named ``<project>_00_plan_<stamp>.{sh,md}``, and records what the folders are:
+``MANIFEST`` and each written folder's ``MDATK_step.toml``
+(:mod:`mdatk.workflows.manifest`).  Steps that write no files (notes, existing
+files, the analysis box) have no folder.
+
+Step numbers are stored with each step and never change on their own: a new
+step gets the number after the highest one in the plan (:func:`next_step`), so
+after the last steps are deleted a new step gets their numbers, and folders,
+again, and a template's steps are numbered after the existing ones.  Step ids
+(``n1``, ``n2`` ...) are never given out twice (:func:`new_node_id`).  When a
+step's folder holds the files another step wrote (its ``MDATK_step.toml`` names
+another step), the check says so before the step is written over them.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime as _dt
+import heapq
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Any, Collection, Dict, List, Optional, Sequence, Tuple
+
+from .. import PROJECT_ABBREV, __version__
+from ..config import PlanEdge, PlanNode, WorkflowParams
+from . import cluster
+from .base import PortValue, StepContext, Tool, waiting_file
+from .naming import (file_name, folder_tag_problem, new_stamp, sanitize_project, sanitize_tag, step_folder,
+                     step_label)
+from .registry import TOOLS
+from .schema import GeneratedFile, Issue, Port, errors, guess_kind, kind_label
+
+
+@dataclass
+class ResolvedStep:
+    node: PlanNode
+    tool: Optional[Tool]
+    settings: Dict[str, Any] = field(default_factory=dict)
+    ctx: Optional[StepContext] = None
+    outputs: Dict[str, PortValue] = field(default_factory=dict)
+    issues: List[Issue] = field(default_factory=list)
+    files: List[GeneratedFile] = field(default_factory=list)
+    # the step's folder holds the files another step wrote, by the folder's MDATK_step.toml: what they are,
+    # e.g. "03_amber-md/ holds the files of 03 · production model12 (node n3, written 2026-11-07 17:18)"
+    # ("": they are the step's own, or nothing says; mdatk.workflows.manifest.held)
+    held: str = ""
+
+    @property
+    def label(self) -> str:
+        return step_title(self.node)
+
+    @property
+    def ok(self) -> bool:
+        return not errors(self.issues)
+
+    @property
+    def adopted(self) -> str:
+        """Stamp of the earlier run whose outputs this step uses ("": none); such a step is not run again."""
+        return self.node.adopted if self.tool is not None and self.tool.generates else ""
+
+    def level(self) -> str:
+        levels = {i.level for i in self.issues}
+        for lvl in ("error", "warning", "info"):
+            if lvl in levels:
+                return lvl
+        return "ok"
+
+
+@dataclass
+class WriteReport:
+    root: str
+    written: List[str] = field(default_factory=list)
+    skipped: Dict[str, str] = field(default_factory=dict)  # node id -> reason
+    kept: Dict[str, str] = field(default_factory=dict)  # node id -> stamp of the earlier run it uses
+    # node id -> the completed run moved aside before the step was written (mdatk.workflows.supersede);
+    # one that could not be moved has its error, and the step is in ``skipped``
+    superseded: Dict[str, Any] = field(default_factory=dict)
+    # node ids not written because their run completed after the caller asked which runs move aside
+    # (``confirmed`` of Plan.write); they are in ``skipped`` too
+    late: List[str] = field(default_factory=list)
+    master: str = ""
+    summary: str = ""
+    # what the folders are (mdatk.workflows.manifest), not in ``written``: the plan folder's MANIFEST ("": not
+    # written, e.g. by the stand-alone wizard) and node id -> the MDATK_step.toml of each folder written into
+    manifest: str = ""
+    identity: Dict[str, str] = field(default_factory=dict)
+    # those records that could not be written, and why ("": none); the step files are written all the same
+    records_error: str = ""
+
+
+def node_title(node: PlanNode) -> str:
+    """The title on the step's box: its own, else its type's label."""
+    tool = TOOLS.get(node.tool)
+    return node.title or (tool.label if tool else node.tool)
+
+
+def step_title(node: PlanNode, tag: bool = True) -> str:
+    """The step's label: ``03 · <title>`` for a step that writes files, with its folder tag after it
+    (``03 · <title> · model12``) so steps that share a number are told apart in logs and messages; ``tag``
+    False leaves the tag out (the box on the canvas shows it beside the title)."""
+    tool = TOOLS.get(node.tool)
+    title = node_title(node)
+    if tool is not None and not tool.generates:
+        return title
+    folder_tag = node_folder_tag(node) if tag else ""
+    return f"{step_label(node.step)} · {title}" + (f" · {folder_tag}" if folder_tag else "")
+
+
+def node_folder_tag(node: PlanNode) -> str:
+    """The step's folder tag as it is used ("": none)."""
+    return (node.folder_tag or "").strip()
+
+
+def node_folder(workflow: WorkflowParams, node: PlanNode) -> str:
+    """Plan-relative folder of the step's files: ``<step>_<tool>`` with its folder tag added,
+    ``<step>_<tool>_<folder tag>``; "" for the plan folder (a plan without step folders) and for a step that
+    writes no files (it has no folder)."""
+    tool = TOOLS.get(node.tool)
+    if not workflow.step_folders or tool is None or not tool.generates:
+        return ""
+    return step_folder(node.step, tool.tag, node_folder_tag(node))
+
+
+_NODE_ID = re.compile(r"^n(\d+)$")
+
+
+def new_node_id(workflow: WorkflowParams) -> str:
+    """A step id the plan has never given out (``n<k>``), also not one of a deleted step: the id after the
+    highest one given out so far, which the plan remembers (``WorkflowParams.last_node``), and after the
+    highest one in the plan.  A step's id is what its folder's ``MDATK_step.toml`` names, so a new step
+    must never get an id that may still name an old folder.  Gives the id out (records it)."""
+    used = {n.id for n in workflow.nodes}
+    numbers = [int(m.group(1)) for m in (_NODE_ID.match(i) for i in used) if m]
+    k = max([workflow.last_node or 0] + numbers) + 1
+    while f"n{k}" in used:
+        k += 1
+    workflow.last_node = k
+    return f"n{k}"
+
+
+def next_step(workflow: WorkflowParams) -> int:
+    """The number after the highest step number in the plan (deleted steps' numbers come back when they were
+    the highest)."""
+    steps = [n.step for n in workflow.nodes if TOOLS.get(n.tool) is not None and TOOLS[n.tool].generates]
+    return max(steps, default=0) + 1
+
+
+def add_node(workflow: WorkflowParams, tool: str, x: float = 40.0, y: float = 40.0,
+             step: Optional[int] = None, title: str = "",
+             settings: Optional[Dict[str, Any]] = None) -> PlanNode:
+    if tool not in TOOLS:
+        raise KeyError(f"unknown step type {tool!r}")
+    t = TOOLS[tool]
+    node = PlanNode(id=new_node_id(workflow), tool=tool,
+                    step=step if step is not None else (next_step(workflow) if t.generates else 0),
+                    title=title, x=float(x), y=float(y),
+                    settings=t.normalise(settings or {}))
+    workflow.nodes.append(node)
+    return node
+
+
+def remove_node(workflow: WorkflowParams, node_id: str) -> None:
+    workflow.nodes = [n for n in workflow.nodes if n.id != node_id]
+    workflow.edges = [e for e in workflow.edges if node_id not in (e.source, e.target)]
+
+
+def connect(workflow: WorkflowParams, source: str, output: str, target: str, input: str) -> PlanEdge:
+    """Add a connection (replacing any other edge into a single-file input).
+
+    A collection output (the full set of a step's files) connects only to collection inputs; into an input
+    that takes a table it connects the output tabulating the set (``Port.table``) instead.  An output that
+    needs an option of its step (``Port.turns_on``) switches that option on."""
+    nodes = {n.id: n for n in workflow.nodes}
+    if source not in nodes or target not in nodes:
+        raise KeyError("unknown step")
+    if source == target:
+        raise ValueError("a step cannot feed itself")
+    src_tool, dst_tool = TOOLS[nodes[source].tool], TOOLS[nodes[target].tool]
+    src_s = src_tool.normalise(nodes[source].settings)
+    dst_s = dst_tool.normalise(nodes[target].settings)
+    out_ports = src_tool.output_ports(src_s)
+    out_port = _port(out_ports, output)
+    in_port = _port(dst_tool.input_ports(dst_s), input)
+    if out_port is None or in_port is None:
+        raise KeyError("unknown port")
+    if out_port.table and not in_port.accepts(out_port.kind):
+        table = _port(out_ports, out_port.table)
+        if table is not None and in_port.accepts(table.kind):
+            out_port, output = table, table.name
+    if not in_port.accepts(out_port.kind):
+        raise ValueError(f"{in_port.label} accepts {', '.join(kind_label(k) for k in in_port.kinds)}, "
+                         f"not {kind_label(out_port.kind)}")
+    if out_port.collection and not in_port.collection:
+        raise ValueError(f"{out_port.label} is a set of files listed when its step runs; {in_port.label} "
+                         + ("takes one file" if not in_port.multiple else "takes files one by one")
+                         + ": connect the set to an input drawn as a large dot")
+    if _reaches(workflow, target, source):
+        raise ValueError("this connection would create a loop")
+    if not in_port.multiple:
+        workflow.edges = [e for e in workflow.edges if not (e.target == target and e.input == input)]
+    edge = PlanEdge(source, output, target, input)
+    if not any(e == edge for e in workflow.edges):
+        workflow.edges.append(edge)
+    if out_port.turns_on and not src_s.get(out_port.turns_on):
+        nodes[source].settings[out_port.turns_on] = True
+    return edge
+
+
+def _reaches(workflow: WorkflowParams, start: str, goal: str) -> bool:
+    todo, seen = [start], set()
+    while todo:
+        cur = todo.pop()
+        if cur == goal:
+            return True
+        if cur in seen:
+            continue
+        seen.add(cur)
+        todo.extend(e.target for e in workflow.edges if e.source == cur)
+    return False
+
+
+def _port(ports: Sequence[Port], name: str) -> Optional[Port]:
+    for p in ports:
+        if p.name == name:
+            return p
+    return None
+
+
+class Plan:
+    """A resolved plan.  ``root`` is the plan folder (needed for writing).  ``standalone``: the stand-alone
+    wizard's one-step plan (:func:`single_step_plan`), which is not the plan of its folder, so writing it
+    leaves the folder's MANIFEST alone."""
+
+    def __init__(self, workflow: WorkflowParams, root: str = "", groups: Optional[Sequence] = None,
+                 stamp: Optional[str] = None, standalone: bool = False):
+        self.workflow = workflow
+        self.root = os.path.abspath(root) if root else ""
+        self.groups = list(groups or [])
+        self.standalone = standalone
+        if stamp is None:
+            stamp = (workflow.stamp or new_stamp()) if workflow.use_stamp else ""
+        self.stamp = stamp
+        self.project = sanitize_project(workflow.project_name)
+        self.issues: List[Issue] = []  # plan-wide problems
+        self.steps: Dict[str, ResolvedStep] = {}
+        self.order: List[str] = []
+        self._resolve()
+
+    # ------------------------------------------------------------ resolve
+    def _resolve(self) -> None:
+        nodes: Dict[str, PlanNode] = {}
+        for n in self.workflow.nodes:
+            if n.id in nodes or not n.id:
+                self.issues.append(Issue("error", f"duplicate or empty step id {n.id!r}"))
+                continue
+            nodes[n.id] = n
+        for nid, node in nodes.items():
+            tool = TOOLS.get(node.tool)
+            step = ResolvedStep(node, tool)
+            if tool is None:
+                step.issues.append(Issue("error", f"unknown step type {node.tool!r}"))
+            else:
+                step.settings = tool.normalise(node.settings, step.issues)
+            self.steps[nid] = step
+
+        edges = self._valid_edges(nodes)
+        self.order, cyclic = self._toposort(nodes, edges)
+        for nid in cyclic:
+            self.steps[nid].issues.append(Issue("error", "this step is part of a loop of connections"))
+
+        for nid in self.order:
+            self._resolve_step(self.steps[nid], [e for e in edges if e.target == nid])
+        self._check_steps_and_names()
+        self._check_held_folders()
+
+    def _valid_edges(self, nodes: Dict[str, PlanNode]) -> List[PlanEdge]:
+        valid = []
+        for e in self.workflow.edges:
+            src, dst = self.steps.get(e.source), self.steps.get(e.target)
+            if src is None or dst is None or src.tool is None or dst.tool is None:
+                self.issues.append(Issue("warning", f"ignoring a connection to a missing step "
+                                                    f"({e.source} -> {e.target})"))
+                continue
+            if _port(src.tool.output_ports(src.settings), e.output) is None:
+                dst.issues.append(Issue("warning", f"{src.label} no longer produces '{e.output}'; "
+                                                   "that connection is ignored"))
+                continue
+            if _port(dst.tool.input_ports(dst.settings), e.input) is None:
+                dst.issues.append(Issue("warning", f"this step no longer has an input '{e.input}'; "
+                                                   "that connection is ignored"))
+                continue
+            valid.append(e)
+        return valid
+
+    def _toposort(self, nodes: Dict[str, PlanNode], edges: List[PlanEdge]) -> Tuple[List[str], List[str]]:
+        indeg = {nid: 0 for nid in nodes}
+        succ: Dict[str, List[str]] = {nid: [] for nid in nodes}
+        for e in edges:
+            indeg[e.target] += 1
+            succ[e.source].append(e.target)
+
+        def key(nid):
+            n = nodes[nid]
+            return (n.step, n.y, n.x, nid)
+
+        heap = [(key(n), n) for n, d in indeg.items() if d == 0]
+        heapq.heapify(heap)
+        order = []
+        while heap:
+            _, nid = heapq.heappop(heap)
+            order.append(nid)
+            for t in succ[nid]:
+                indeg[t] -= 1
+                if indeg[t] == 0:
+                    heapq.heappush(heap, (key(t), t))
+        cyclic = [nid for nid, d in indeg.items() if d > 0]
+        return order, cyclic
+
+    def _resolve_step(self, step: ResolvedStep, incoming: List[PlanEdge]) -> None:
+        tool, node = step.tool, step.node
+        if tool is None:
+            return
+        inputs: Dict[str, PortValue] = {}
+        for port in tool.input_ports(step.settings):
+            values: List[PortValue] = []
+            for e in (x for x in incoming if x.input == port.name):
+                src = self.steps[e.source]
+                pv = src.outputs.get(e.output)
+                if pv is None or not pv.paths:
+                    step.issues.append(Issue(
+                        "error" if not port.optional else "warning",
+                        f"{port.label}: {src.label} does not produce this file with its current "
+                        "settings", (f"input:{port.name}",)))
+                    continue
+                if not port.accepts(pv.kind):
+                    step.issues.append(Issue("error", f"{port.label} cannot take a "
+                                                      f"{kind_label(pv.kind)}", (f"input:{port.name}",)))
+                    continue
+                if pv.lists and not port.collection:
+                    step.issues.append(Issue("error", f"{port.label} cannot take the set of files "
+                                                      f"{src.label} lists when it runs: connect it to an "
+                                                      "input drawn as a large dot", (f"input:{port.name}",)))
+                    continue
+                values.append(pv)
+            if len(values) > 1 and not port.multiple:
+                step.issues.append(Issue("error", f"{port.label} takes one file but "
+                                                  f"{len(values)} steps feed it", (f"input:{port.name}",)))
+                values = values[:1]
+            if values:
+                merged = PortValue([p for v in values for p in v.paths], values[0].kind,
+                                   dict(values[0].data), values[0].source, values[0].source_label,
+                                   {k: n for v in values for k, n in v.lists.items()})
+                inputs[port.name] = merged
+                if node.files.get(port.name):
+                    step.issues.append(Issue("info", f"{port.label}: the connected file is used; the "
+                                                     "hand-picked file is ignored", (f"input:{port.name}",)))
+            elif node.files.get(port.name):
+                paths = [p.strip() for p in node.files[port.name].split(";") if p.strip()]
+                paths = [os.path.abspath(os.path.expanduser(p)) for p in paths]
+                kind = guess_kind(paths[0]) if paths else port.kind
+                if not port.accepts(kind):
+                    kind = port.kind
+                inputs[port.name] = PortValue(paths, kind, {}, "", "chosen file")
+                missing = [p for p in paths if not os.path.exists(p)]
+                if missing:
+                    step.issues.append(Issue("warning", f"{port.label}: file not found (yet): "
+                                                        f"{missing[0]}", (f"input:{port.name}",)))
+            elif not port.optional:
+                step.issues.append(Issue("error", f"{port.label}: connect a step that produces it or "
+                                                  "choose a file", (f"input:{port.name}",)))
+        step.ctx = StepContext(self.project, node.step, self.stamp, tool.tag, inputs, self.root,
+                               self.workflow.step_folders, step_title(node, tag=False), node.id, self.groups)
+        # the context names every step's folder <step>_<tool>: a step's folder carries its folder tag, and a
+        # step that writes no files has none
+        step.ctx.folder = node_folder(self.workflow, node)
+        if tool.generates and node.step < 1:
+            step.issues.append(Issue("error", "step numbers start at 1"))
+        try:
+            step.issues.extend(tool.check(step.settings, step.ctx))
+            if "job_header" in step.settings:
+                step.issues.extend(cluster.job_issues(step.settings, step.ctx, tool))
+            setup_file = (step.settings.get("env_file") or "").strip() if tool.generates else ""
+            if setup_file and not os.path.isfile(setup_file):
+                step.issues.append(Issue("warning", f"setup file {setup_file} does not exist on this computer: "
+                                         "a script that runs here skips it (with a warning); fine if the "
+                                         "scripts run elsewhere", ("env_file",)))
+            elif setup_file and not os.path.isabs(setup_file):
+                step.issues.append(Issue("warning", f"setup file {setup_file}: give an absolute path (the "
+                                         "script runs in the step folder)", ("env_file",)))
+            step.outputs = tool.output_values(step.settings, step.ctx)
+        except Exception as exc:  # a generator bug must not break the planner
+            step.issues.append(Issue("error", f"internal error while checking this step: {exc}"))
+            step.outputs = {}
+        if step.adopted:
+            self._use_adopted_run(step)
+        for pv in step.outputs.values():
+            pv.source = node.id
+            pv.source_label = step.label
+
+    def _use_adopted_run(self, step: ResolvedStep) -> None:
+        """Point the outputs of a step that adopted an earlier run at that run's files, so later steps
+        read (and check) them; the step itself is neither written nor run again."""
+        stamp = step.adopted
+        if stamp != self.stamp:
+            try:
+                step.outputs = step.tool.output_values(step.settings, step.ctx.with_stamp(stamp))
+            except Exception as exc:  # a generator bug must not break the planner
+                step.issues.append(Issue("error", f"internal error while naming the run of {stamp}: {exc}"))
+                step.outputs = {}
+        own = {p for v in step.ctx.inputs.values() for p in v.paths}  # passed through, not this step's
+        missing = [p for v in step.outputs.values() for p in v.paths
+                   if p not in own and self.root and not os.path.exists(self.node_path(p))]
+        if missing:
+            step.issues.append(Issue("warning", f"uses the outputs of its run of {stamp}, but "
+                                                f"{missing[0]} is missing" +
+                                     (f" (and {len(missing) - 1} more)" if len(missing) > 1 else "") +
+                                     "; check previous runs again, or run the step again"))
+        else:
+            step.issues.append(Issue("info", f"uses the outputs of its run of {stamp}: not written or run "
+                                             "again"))
+
+    def _name_key(self, step: ResolvedStep) -> Tuple:
+        """Steps with one key write into one folder with the same file names: the step number and type, and
+        in step folders the folder tag (in any case: two names that differ only in case are one folder on a
+        case-insensitive file system)."""
+        key: Tuple = (step.node.step, step.tool.tag)
+        if self.workflow.step_folders:
+            tag = node_folder_tag(step.node)
+            key += (sanitize_tag(tag).lower() if tag else "",)
+        return key
+
+    def _check_folder_tag(self, step: ResolvedStep) -> None:
+        tag = node_folder_tag(step.node)
+        if not tag:
+            return
+        where = ("folder_tag",)
+        if not step.tool.generates:
+            step.issues.append(Issue("warning", f"folder tag {tag!r}: this step writes no files, so it has no "
+                                                "folder and the tag is not used", where))
+            return
+        problem = folder_tag_problem(tag)
+        if problem:
+            step.issues.append(Issue("error", f"{problem}; it is added to the step's folder name", where))
+        elif not self.workflow.step_folders:
+            store = step_folder(step.node.step, step.tool.tag, tag)
+            step.issues.append(Issue("info", f"folder tag {tag!r}: the plan writes no step folders, so the tag "
+                                             f"names only the folder its completed runs move into "
+                                             f"(superseded/{store}/), and it is in the step's title and "
+                                             "MANIFEST line", where))
+
+    def _check_steps_and_names(self) -> None:
+        seen: Dict[Tuple, str] = {}
+        for nid in self.order:
+            step = self.steps[nid]
+            if step.tool is None:
+                continue
+            self._check_folder_tag(step)
+            if not step.tool.generates:
+                continue
+            key = self._name_key(step)
+            if key in seen:
+                other = self.steps[seen[key]]
+                mine, theirs = step.ctx.folder, other.ctx.folder
+                tagged = self.workflow.step_folders and node_folder_tag(step.node)
+                if tagged and mine != theirs:  # folder tags that differ only in case
+                    step.issues.append(Issue("error", f"{step.label} and {other.label} would write into "
+                                                      f"{mine}/ and {theirs}/, one folder on a file system "
+                                                      "that ignores case (macOS, Windows): give one of them "
+                                                      "another folder tag", ("folder_tag",)))
+                elif tagged:
+                    step.issues.append(Issue("error", f"{step.label} and {other.label} would write into the "
+                                                      f"same folder {mine}/ with the same names: give one of "
+                                                      "them another folder tag or step number",
+                                             ("folder_tag",)))
+                else:
+                    step.issues.append(Issue("error", f"{step.label} and {other.label} would write into the "
+                                                      "same folder with the same names: give one of them "
+                                                      "another step number"))
+            seen[key] = nid
+        self._check_shared_outputs()
+        numbers: Dict[int, List[str]] = {}
+        for nid in self.order:
+            step = self.steps[nid]
+            if step.tool is not None and step.tool.generates:
+                numbers.setdefault(step.node.step, []).append(step.label)
+        for num, labels in numbers.items():
+            if len(labels) > 1:
+                self.issues.append(Issue("info", f"step number {step_label(num)} is used by "
+                                                 f"{', '.join(labels)}"))
+
+    def _check_held_folders(self) -> None:
+        """A step whose folder holds the files of another step, or files no step can be told for (by the
+        folder's MDATK_step.toml: type, folder tag and title, the node id only confirming them, since a plan
+        made again from scratch numbers its ids afresh; :func:`mdatk.workflows.manifest.claim`) would put its
+        files beside them, and writing it would move their completed run aside as this step's.  Steps only
+        warn: the folder may hold the step renamed since (or the plan)."""
+        if not self.root or not self.workflow.step_folders:
+            return
+        from .manifest import held
+
+        for nid in self.order:
+            step = self.steps[nid]
+            if step.tool is None or not step.tool.generates or step.ctx is None or not step.ctx.folder:
+                continue
+            step.held, why = held(self, nid)
+            if not step.held:
+                continue
+            if why == "project":  # another plan's files: their names differ from this plan's
+                text = "writing this step puts this plan's files beside them; give it a folder tag or another " \
+                       "step number to keep the two apart"
+            else:
+                text = "writing this step puts its files beside them and moves a completed run there aside as " \
+                       "this step's; give it a folder tag or another step number" + (
+                           ", or, if it is that step under a new title, write it again" if why == "title" else "")
+            step.issues.append(Issue("warning", f"{step.held}: {text}", ("folder_tag",)))
+
+    def _check_shared_outputs(self) -> None:
+        """Two steps must not write the same output file.  Built-in steps put their number and tag in every
+        name, but a custom script's outputs can be given any name, and in a plan without step folders the
+        steps after such a pair would read whichever file was written last."""
+        claimed: Dict[str, str] = {}  # plan-relative path -> node id of the first step that writes it
+        for nid in self.order:
+            step = self.steps[nid]
+            if step.tool is None or not step.tool.generates or step.ctx is None:
+                continue
+            # another step's files, and files chosen by hand that the step passes on (a FARFAR2 FASTA file)
+            passed = {p for v in step.ctx.inputs.values() for p in v.paths}
+            passed |= {str(step.settings.get(key) or "").strip()
+                       for key, opt in step.tool.flat_options().items() if opt.kind == "file"}
+            for port, value in step.outputs.items():
+                for path in value.paths:
+                    if os.path.isabs(path) or path in passed or os.path.dirname(path) != step.ctx.folder:
+                        continue  # not written by this step
+                    first = self.steps[claimed.setdefault(path, nid)]
+                    if first is step or self._name_key(first) == self._name_key(step):
+                        continue  # the same step, or a pair already reported as writing the same names
+                    step.issues.append(Issue("error", f"output '{port}': {path} is also written by "
+                                                      f"{first.label}; give one of them another file name"))
+
+    # ------------------------------------------------------------ queries
+    def all_issues(self) -> List[Tuple[str, Issue]]:
+        out = [("", i) for i in self.issues]
+        for nid in self.order + [n for n in self.steps if n not in self.order]:
+            out += [(nid, i) for i in self.steps[nid].issues]
+        return out
+
+    def has_errors(self, node_ids: Optional[Sequence[str]] = None) -> bool:
+        if errors(self.issues):
+            return True
+        ids = node_ids if node_ids is not None else list(self.steps)
+        return any(not self.steps[n].ok for n in ids if n in self.steps)
+
+    def node_path(self, path: str) -> str:
+        return path if os.path.isabs(path) else os.path.join(self.root, path)
+
+    # ----------------------------------------------------------- generate
+    def generate(self, node_ids: Optional[Sequence[str]] = None) -> Dict[str, List[GeneratedFile]]:
+        out: Dict[str, List[GeneratedFile]] = {}
+        for nid in self.order:
+            if node_ids is not None and nid not in node_ids:
+                continue
+            step = self.steps[nid]
+            if step.tool is None or not step.tool.generates or not step.ok:
+                continue
+            step.files = generate_step(step)
+            out[nid] = step.files
+        return out
+
+    def write(self, node_ids: Optional[Sequence[str]] = None, master: bool = True,
+              project_path: Optional[str] = None, supersede: Optional[bool] = None,
+              confirmed: Optional[Collection[str]] = None, discard: bool = False) -> WriteReport:
+        """Write the files of every step without errors (all steps by default).
+
+        Before a step's files are written, its complete run of the plan's stamp moves into
+        ``<step folder>/superseded/`` (:mod:`mdatk.workflows.supersede`; ``supersede``, by default the
+        project option ``supersede_runs``); a step whose run cannot be moved is not written (``skipped``).
+        Moves are recorded in the step log of ``project_path``.  ``confirmed``: the steps whose runs the
+        caller listed (:func:`mdatk.workflows.supersede.pending`) before asking; another step whose run has
+        completed since is neither moved nor written (``late``), since nobody was asked about it and a
+        running step may be reading it (None: every run may move).  ``discard``: delete those runs instead
+        of moving them aside (:func:`mdatk.workflows.supersede.delete`; cannot be undone).
+
+        Every write also records what the folders are (:mod:`mdatk.workflows.manifest`): the plan folder's
+        ``MANIFEST`` lists every step of the plan (not for the stand-alone wizard's plan), and each step
+        folder that files were written into gets its ``MDATK_step.toml``; they are reported in
+        ``manifest`` and ``identity``, not in ``written``, and a record that cannot be written is reported
+        in ``records_error`` without failing the write."""
+        from .manifest import write_records
+        from .supersede import candidate, move_aside
+
+        if not self.root:
+            raise ValueError("no plan folder set")
+        report = WriteReport(self.root)
+        targets = [n for n in self.order if node_ids is None or n in node_ids]
+        report.kept = {n: self.steps[n].adopted for n in targets if self.steps[n].adopted}
+        targets = [n for n in targets if n not in report.kept]  # their earlier files stay as they are
+        for nid in targets:
+            step = self.steps[nid]
+            if step.tool is not None and step.tool.generates and not step.ok:
+                report.skipped[nid] = "; ".join(i.message for i in errors(step.issues))
+        generated = self.generate(targets)
+        paths: Dict[str, str] = {}
+        for nid, files in generated.items():
+            for f in files:
+                rel = self.steps[nid].ctx.from_own(f.name)
+                if rel in paths:
+                    report.skipped[nid] = f"{rel} is also written by {self.steps[paths[rel]].label}"
+                paths.setdefault(rel, nid)
+        move = self.workflow.supersede_runs if supersede is None else supersede
+        when = _dt.datetime.now()  # one time for the runs moved by this write (and its records)
+        into: List[str] = []  # the steps whose files were written
+        for nid, files in generated.items():
+            if nid in report.skipped:
+                continue
+            if move and confirmed is not None and nid not in confirmed and candidate(self, nid) is not None:
+                report.late.append(nid)
+                report.skipped[nid] = ("its run completed after the question which runs move aside, so it "
+                                       "was neither moved nor written; write the step again")
+                continue
+            moved = move_aside(self, nid, when, project_path, discard=discard) if move else None
+            if moved is not None:
+                report.superseded[nid] = moved
+                if moved.error and moved.deleted:  # part of the run is left: writing would mix runs
+                    report.skipped[nid] = (f"its completed run could not be deleted completely, so the step "
+                                           f"was not written: {moved.error}")
+                    continue
+                if moved.error:  # nothing of the run was moved (or what could not go back is kept)
+                    report.skipped[nid] = (f"its completed run could not be moved aside, so the step was not "
+                                           f"written: {moved.error}")
+                    continue
+            ctx = self.steps[nid].ctx
+            for f in files:
+                path = os.path.join(self.root, ctx.from_own(f.name))
+                _write_text(path, f.content, f.executable)
+                report.written.append(path)
+            if files:
+                into.append(nid)
+        if self.workflow.use_stamp and not self.workflow.stamp:
+            self.workflow.stamp = self.stamp
+        if master and node_ids is None:
+            report.master = os.path.join(self.root, file_name(self.project, 0, "plan", self.stamp, "sh"))
+            _write_text(report.master, self.master_script(), True)
+            report.summary = os.path.join(self.root, file_name(self.project, 0, "plan", self.stamp, "md"))
+            _write_text(report.summary, self.summary_text(), False)
+            report.written += [report.master, report.summary]
+            submit = cluster.submit_script(self)
+            if submit is not None:
+                _write_text(cluster.submit_path(self), submit, True)
+                report.written.append(cluster.submit_path(self))
+        report.manifest, report.identity, report.records_error = write_records(self, into, when)
+        return report
+
+    def master_script(self) -> str:
+        lines = ["#!/bin/bash",
+                 f"# Master script of plan {self.project} - written by {PROJECT_ABBREV} {__version__} "
+                 f"on {_dt.date.today().isoformat()}.",
+                 "# Runs the main script of every step in plan order.  Scripts marked 'run separately'",
+                 "# (e.g. production runs for a cluster) are listed but not started.",
+                 "", "set -eo pipefail", 'cd "$(dirname "$0")"', ""]
+        for nid in self.order:
+            step = self.steps[nid]
+            if step.tool is None or not step.tool.generates:
+                continue
+            lines.append(f"# {step.label}")
+            if step.adopted:
+                lines += [f"#   uses the outputs of its run of {step.adopted} (not run again)", ""]
+                continue
+            if not step.files and step.ok:
+                step.files = generate_step(step)
+            if not step.ok:
+                lines.append("#   (not written: the step has errors)")
+            for f in step.files:
+                rel = step.ctx.from_own(f.name)
+                if f.role == "run":
+                    lines.append(f'bash "{rel}"')
+                    if waiting_file(f.name) in f.content:  # it waits with exit 0, leaving its .waiting file
+                        lines.append(f'if [ -e "{waiting_file(rel)}" ]; then echo "WAITING: {rel} waits for its '
+                                     'separately run script; run that, then this script again" >&2; exit 0; fi')
+                elif f.role == "run-separate":
+                    lines.append(f"#   run separately: bash {rel}")
+                elif f.role == "job":
+                    lines.append(f"#   cluster job: {rel} (the submit script submits it)")
+            lines.append("")
+        return "\n".join(lines)
+
+    def summary_text(self) -> str:
+        lines = [f"# Plan {self.project}", "",
+                 f"Written by {PROJECT_ABBREV} {__version__} on {_dt.date.today().isoformat()}. "
+                 f"File names follow `<project>_<step>_<tool>_<time>.<ext>`"
+                 + (f" with time stamp `{self.stamp}`." if self.stamp else " (no time stamp)."), ""]
+        for nid in self.order:
+            step = self.steps[nid]
+            node = step.node
+            if step.tool is None:
+                continue
+            if node.tool == "note":
+                text = step.settings.get("text", "").strip()
+                if text:
+                    lines += [f"> {line}" for line in text.splitlines()] + [""]
+                continue
+            lines += [f"## {step.label}", ""]
+            if step.tool.generates and step.ctx is not None:
+                lines.append(f"Folder: `{step.ctx.folder or '.'}`  ")
+            lines.append(f"Type: {step.tool.label}")
+            lines.append("")
+            if step.adopted:
+                lines += [f"Uses the outputs of its run of `{step.adopted}` (not written or run again).", ""]
+            extra = step.tool.summary_lines(step.settings, step.ctx) if step.ctx is not None else []
+            if extra:
+                lines += extra + [""]
+            if step.ctx and step.ctx.inputs:
+                lines.append("Inputs:")
+                for port, value in step.ctx.inputs.items():
+                    src = f" (from {value.source_label})" if value.source else ""
+                    lines.append(f"- {port}: `{'`, `'.join(value.paths)}`{src}")
+                lines.append("")
+            if step.outputs:
+                lines.append("Outputs:")
+                for port, value in step.outputs.items():
+                    lines.append(f"- {port}: `{'`, `'.join(value.paths)}`")
+                lines.append("")
+            if step.files:
+                lines.append("Files written: " + ", ".join(f"`{f.name}`" for f in step.files))
+                lines.append("")
+            notes = [i for i in step.issues if i.level != "info"]
+            if notes:
+                lines.append("Checks:")
+                lines += [f"- {i}" for i in notes]
+                lines.append("")
+        return "\n".join(lines)
+
+
+def generate_step(step: ResolvedStep) -> List[GeneratedFile]:
+    """The step's files, with a 'Please cite' block for the resources it uses in its shell scripts."""
+    from ..citations import comment_lines, step_resources
+
+    files = step.tool.generate(step.settings, step.ctx)
+    if "job_header" in step.settings:
+        job = cluster.job_file(step.settings, step.ctx, files, step.ctx.title, step.tool)
+        if job is not None:
+            files = list(files) + [job]
+    cite = comment_lines(step_resources(step))
+    if not cite:
+        return files
+    out = []
+    for f in files:
+        lines = f.content.split("\n")
+        if f.role in ("run", "run-separate") and lines and lines[0].startswith("#!"):
+            k = 1
+            while k < len(lines) and lines[k].startswith("#"):
+                k += 1  # after the header comment block
+            f = dataclasses.replace(f, content="\n".join(lines[:k] + cite + lines[k:]))
+        out.append(f)
+    return out
+
+
+def _write_text(path: str, text: str, executable: bool) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text if text.endswith("\n") else text + "\n")
+    if executable:
+        os.chmod(tmp, 0o755)
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------------
+# stand-alone wizard (one step without a plan)
+# ---------------------------------------------------------------------------
+
+
+def scratch_node(workflow: WorkflowParams, tool: str) -> PlanNode:
+    """The stand-alone wizard's settings for ``tool`` (created on first use)."""
+    for node in workflow.scratch:
+        if node.tool == tool:
+            return node
+    t = TOOLS[tool]
+    node = PlanNode(id=f"wizard-{tool}", tool=tool, step=1, settings=t.normalise({}))
+    workflow.scratch.append(node)
+    return node
+
+
+def single_step_plan(workflow: WorkflowParams, node: PlanNode, root: str = "",
+                     groups: Optional[Sequence] = None) -> Plan:
+    """A one-step plan used by the stand-alone wizard (inputs are hand-picked files)."""
+    solo = WorkflowParams(project_name=workflow.project_name, stamp=workflow.stamp,
+                          use_stamp=workflow.use_stamp, out_dir=workflow.out_dir,
+                          step_folders=workflow.step_folders, supersede_runs=workflow.supersede_runs,
+                          nodes=[node], edges=[])
+    plan = Plan(solo, root, groups, standalone=True)
+    return plan
+
+
+def analysis_inputs(plan: Plan, node_id: str) -> Tuple[str, List[str]]:
+    """Absolute topology / trajectory paths feeding an 'MDATK analysis' step."""
+    step = plan.steps[node_id]
+    ctx = step.ctx
+    if ctx is None:
+        return "", []
+    top = ctx.value("topology")
+    traj = ctx.value("trajectory")
+    top_path = plan.node_path(top.path) if top and top.paths else ""
+    traj_paths = [plan.node_path(p) for p in traj.paths] if traj else []
+    return top_path, traj_paths
+
+
+# ---------------------------------------------------------------------------
+# templates: pre-connected chains of steps
+# ---------------------------------------------------------------------------
+
+# name -> (label, [(key, tool, column, row, settings)], [(src key, output, dst key, input)])
+TEMPLATES: Dict[str, Tuple[str, List[Tuple[str, str, int, int, Dict[str, Any]]],
+                           List[Tuple[str, str, str, str]]]] = {
+    "amber": ("Amber RNA protocol: build → helix restraints → MD → analysis", [
+        ("build", "amber-build", 0, 0, {}),
+        ("restraints", "amber-restraints", 1, 1, {}),
+        ("md", "amber-md", 2, 0, {}),
+        ("analysis", "mdatk", 3, 0, {}),
+    ], [
+        ("build", "topology", "restraints", "topology"),
+        ("build", "topology", "md", "topology"),
+        ("build", "coordinates", "md", "coordinates"),
+        ("restraints", "restraints", "md", "restraints"),
+        ("md", "topology", "analysis", "topology"),
+        ("md", "trajectory", "analysis", "trajectory"),
+    ]),
+    "farfar2-amber": ("Sequence to MD ensemble: FARFAR2 → models → Amber → analysis + VMD", [
+        ("fold", "farfar2", 0, 0, {}),
+        ("models", "farfar2-models", 1, 0, {}),
+        ("build", "amber-build", 2, 0, {}),
+        ("restraints", "amber-restraints", 3, 1, {}),
+        ("md", "amber-md", 4, 0, {"dry_traj": True}),
+        ("analysis", "mdatk", 5, 0, {}),
+        ("vmd", "vmd", 5, 1, {}),
+    ], [
+        ("fold", "silent", "models", "silent"),
+        ("models", "best", "build", "structure"),
+        ("build", "topology", "restraints", "topology"),
+        ("fold", "secstruct", "restraints", "secstruct"),
+        ("build", "topology", "md", "topology"),
+        ("build", "coordinates", "md", "coordinates"),
+        ("restraints", "restraints", "md", "restraints"),
+        ("md", "topology", "analysis", "topology"),
+        ("md", "trajectory", "analysis", "trajectory"),
+        ("md", "dry_topology", "vmd", "topology"),
+        ("md", "dry_trajectory", "vmd", "trajectory"),
+    ]),
+    "builder-amber": ("Ideal A-form helix → Amber build → helix restraints → MD", [
+        ("helix", "structure-builder", 0, 0, {"mode": "helix"}),
+        ("build", "amber-build", 1, 0, {}),
+        ("restraints", "amber-restraints", 2, 1, {}),
+        ("md", "amber-md", 3, 0, {}),
+    ], [
+        ("helix", "pdb", "build", "structure"),
+        ("helix", "secstruct", "restraints", "secstruct"),
+        ("build", "topology", "restraints", "topology"),
+        ("build", "topology", "md", "topology"),
+        ("build", "coordinates", "md", "coordinates"),
+        ("restraints", "restraints", "md", "restraints"),
+    ]),
+    "cryoem-refine": ("Model + map → restraint dictionaries → Phenix RSR → Coot RSR", [
+        ("model", "input-file", 0, 0, {"kind": "pdb"}),
+        ("map", "input-file", 0, 1, {"kind": "map"}),
+        ("dicts", "restraint-dicts", 1, 1, {}),
+        ("phenix", "phenix-rsr", 2, 0, {}),
+        ("coot", "coot-rsr", 3, 0, {}),
+    ], [
+        ("model", "file", "dicts", "structure"),
+        ("model", "file", "phenix", "model"),
+        ("map", "file", "phenix", "map"),
+        ("dicts", "dictionaries", "phenix", "dictionaries"),
+        ("phenix", "refined", "coot", "model"),
+        ("map", "file", "coot", "map"),
+        ("dicts", "dictionaries", "coot", "dictionaries"),
+    ]),
+    "amber-gromacs": ("Amber topology → GROMACS MD", [
+        ("build", "amber-build", 0, 0, {}),
+        ("gmx", "gromacs", 1, 0, {}),
+    ], [
+        ("build", "topology", "gmx", "topology"),
+        ("build", "coordinates", "gmx", "coordinates"),
+    ]),
+    "amber-mdff": ("Model + map → Amber build → NAMD MDFF on the Amber topology", [
+        ("model", "input-file", 0, 0, {"kind": "pdb"}),
+        ("map", "input-file", 0, 1, {"kind": "map"}),
+        ("build", "amber-build", 1, 0, {"box": "rect"}),
+        ("mdff", "namd-mdff", 2, 0, {}),
+        ("note", "note", 2, 1, {"text": (
+            "NAMD reads the Amber topology as built (CP, NBfix19, 0BPh, L-RNA, Mg²⁺ pairs, HMR) and an "
+            "energy comparison with sander checks it before fitting.\n"
+            "Rectangular box: NAMD fits the MDFF potential into a truncated octahedron only with a small margin.\n"
+            "The model is the map-frame model: tleap moves the solute, MDFF moves the map with it.\n"
+            "Restraints are MDATK's L-RNA-safe ones; never add VMD's chirality / ssrestraints.\n"
+            "The fitted model has Amber residue names: 'mdatk pdb clean --scheme ccd' before Phenix / Coot.")}),
+    ], [
+        ("model", "file", "build", "structure"),
+        ("build", "topology", "mdff", "topology"),
+        ("build", "coordinates", "mdff", "coordinates"),
+        ("map", "file", "mdff", "map"),
+        ("model", "file", "mdff", "model"),
+    ]),
+    # the user's validation order for a FARFAR2 decoy campaign against a cryo-EM map: validity filters
+    # before clustering, quality checks on the cluster centres after it
+    "decoy-validation": ("Decoy validation (FARFAR2): models → clashes → support → Q-score dQ → kinks", [
+        ("fold", "farfar2", 0, 0, {}),
+        ("models", "farfar2-models", 1, 0, {"valid_closure": True, "closure_term": "linear_chainbreak",
+                                             "closure_max": 5.0}),
+        ("validity", "note", 1, 1, {"text": (
+            "Validity filters, applied to every decoy before clustering (models step, Validity filters):\n"
+            "- closure: linear_chainbreak ≤ 5 (set);\n"
+            "- hands: turn on Hands with the construct's counts (e.g. 44 D / 29 L) or ranges;\n"
+            "- defining pairs: turn on Required pairs with the register's defining base pairs.\n"
+            "Hands and pairs need the construct, so they are left for you to fill in.")}),
+        ("check", "model-check", 2, 0, {}),
+        ("rule", "note", 2, 1, {"text": (
+            "'filter on validity before clustering; filter on quality after, when choosing representatives'\n"
+            "Validity (closure, hands, defining pairs) decides which decoys are clustered at all; quality "
+            "(clashes, interface support, Q-score dQ, kinks) only ranks the cluster centres.")}),
+        ("interface", "decoy-interface", 3, 0, {"support": True}),
+        ("map", "input-file", 3, 1, {"kind": "map"}),
+        ("score", "map-model-score", 4, 0, {"method": "qscore",
+                                            "regions": [{"name": "interface", "ranges": ""}]}),
+        ("kinks", "model-check", 5, 0, {"gate_kinks": True}),
+        ("kink", "note", 5, 1, {"text": (
+            "The kink test (this model check): virtual C1′ angle below 60° flagged; give the positions "
+            "in-line probing shows flexible (Kinks allowed at, or a reactivity file) so a real kink there is "
+            "not rejected.")}),
+    ], [
+        # no decoy table for the quality steps: the models step's table lists each decoy by its extracted
+        # file (models/rNN/<tag>.pdb), never the cluster centres model-NN these steps check, so its score
+        # columns would stay empty and score limits would fail every model
+        ("fold", "silent", "models", "silent"),
+        ("fold", "secstruct", "check", "secstruct"),
+        ("models", "models", "check", "models"),
+        ("check", "passed", "interface", "models"),
+        ("check", "passed", "score", "model"),
+        ("map", "file", "score", "map"),
+        ("check", "passed", "kinks", "models"),
+    ]),
+}
+
+COLUMN_DX = 280
+ROW_DY = 190
+
+
+def apply_template(workflow: WorkflowParams, name: str, x: float = 40.0, y: float = 40.0) -> List[PlanNode]:
+    """Add a template's steps (numbered after the existing ones) and connect them."""
+    if name not in TEMPLATES:
+        raise KeyError(f"unknown template {name!r} (known: {', '.join(TEMPLATES)})")
+    _label, steps, edges = TEMPLATES[name]
+    made: Dict[str, PlanNode] = {}
+    for key, tool, col, row, settings in steps:
+        if tool not in TOOLS:
+            continue
+        made[key] = add_node(workflow, tool, x + col * COLUMN_DX, y + row * ROW_DY, settings=settings)
+    for src, out, dst, inp in edges:
+        if src in made and dst in made:
+            try:
+                connect(workflow, made[src].id, out, made[dst].id, inp)
+            except (KeyError, ValueError):
+                pass
+    return list(made.values())

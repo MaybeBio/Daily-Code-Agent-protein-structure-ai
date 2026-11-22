@@ -1,0 +1,8 @@
+modal
+pyyaml
+biotite==1.7.1
+gemmi
+pandas
+numpy
+molview
+py2Dmol==1.6.5 # This version is compatible with Windows. If you are using Linux or MacOS, you can use the latest version of py2Dmol.

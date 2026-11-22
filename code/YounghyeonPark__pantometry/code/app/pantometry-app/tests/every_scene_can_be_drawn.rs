@@ -1,0 +1,341 @@
+//! **The viewer refused every scene that ships.**
+//!
+//! `pantometry view` drew `Panel::Paths` and nothing else, and said so rather than opening a blank
+//! window — which was the right thing to say and hid how far it went: `PanelData::paths` is built
+//! by two examples and by tests and by **no `Domain` at all**. Not one of the thirty shipped
+//! scenes produced a panel this shell could draw, so the only thing it ever said about a scene
+//! was that it could not draw it.
+//!
+//! A body and a field sample are points, and a point is two short segments in screen space, which
+//! is the pipeline that was already there. This runs every scene, renders frame 0 offscreen, and
+//! asks how much of the canvas came back with something on it.
+//!
+//! # What this cannot see
+//!
+//! Whether the picture is *right*. It counts lit pixels: a renderer that drew the correct number
+//! of crosses in the wrong places would pass. What it holds is the thing that was wrong — a shell
+//! that drew nothing at all for every input it ships with.
+//!
+//! # Not under `wasm32`, and not without an adapter
+//!
+//! The scenes are read off a disk and the render wants a GPU. A machine with no adapter skips
+//! loudly, which is a result; a skip that says nothing is the shape of a suite that has stopped
+//! testing anything.
+
+#![cfg(not(target_family = "wasm"))]
+
+/// The binary, and a place to put what it writes.
+fn tools() -> (std::path::PathBuf, std::path::PathBuf) {
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pantometry"));
+    let dir = std::env::temp_dir().join("pantometry-draws-every-scene");
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    (bin, dir)
+}
+
+/// **Every shipped scene draws something.**
+#[test]
+fn every_shipped_scene_puts_something_on_the_canvas() {
+    let (bin, out) = tools();
+    let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("pantometry-app has a parent")
+        .join("pantometry-world/scenes");
+    let mut paths: Vec<_> = std::fs::read_dir(&scenes)
+        .expect("the scenes directory reads")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    paths.sort();
+    assert!(
+        paths.len() >= 28,
+        "only {} scenes in {}",
+        paths.len(),
+        scenes.display()
+    );
+
+    let mut drawn = 0;
+    let mut blank = Vec::new();
+    let mut empty = Vec::new();
+    let mut skipped = 0;
+    let paths_seen = paths.len();
+    for scene in paths {
+        let name = scene
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let run = out.join(format!("{name}.json"));
+        let ran = std::process::Command::new(&bin)
+            .args(["run", &scene.to_string_lossy(), &run.to_string_lossy()])
+            .output()
+            .expect("the binary runs");
+        assert!(
+            ran.status.success(),
+            "{name}: the run refused: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+
+        let shot = out.join(format!("{name}.ppm"));
+        let drew = std::process::Command::new(&bin)
+            .args([
+                "view",
+                &run.to_string_lossy(),
+                "--snapshot",
+                &shot.to_string_lossy(),
+            ])
+            .output()
+            .expect("the binary runs");
+        let said = String::from_utf8_lossy(&drew.stdout).into_owned()
+            + &String::from_utf8_lossy(&drew.stderr);
+        // A machine with no adapter is not a failing renderer. It says so, and this says which.
+        if said.contains("no adapter") || said.contains("no GPU") {
+            skipped += 1;
+            continue;
+        }
+        // A scene with nothing to draw is a fact about the scene, not a failing renderer: a
+        // network, a lump and a source are readings rather than places. Collected and pinned
+        // below rather than treated as either a pass or a failure.
+        if said.contains("no panels at all") {
+            empty.push(name);
+            continue;
+        }
+        assert!(drew.status.success(), "{name}: the viewer refused: {said}");
+
+        // `--snapshot` reports how much of the canvas is not background, which is the number this
+        // test is about. Parsed from its own line rather than by reading the PPM again.
+        let lit = said
+            .split_once(" — ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("{name}: no pixel count in: {said}"));
+        if lit == 0 {
+            blank.push(name);
+        } else {
+            drawn += 1;
+        }
+    }
+
+    if skipped > 0 {
+        println!("  {skipped} scenes skipped: this machine has no GPU adapter");
+    }
+    println!("  {drawn} scenes drew something");
+    println!("  {} with no panel at all: {empty:?}", empty.len());
+    assert!(
+        blank.is_empty(),
+        "these scenes rendered an empty canvas: {blank:?}"
+    );
+    // **Pinned, in both directions.** Twenty-nine of the thirty-four draw; five carry no panel at
+    // all, and every one of them is a graph rather than a place — a `network`, two `winding`s and
+    // two compartment models, which report readings and not positions. A sixth arriving means
+    // either a scene lost its geometry or a domain stopped reporting one, and both are worth a
+    // failure rather than a quieter list.
+    //
+    // The fourth is `32`, and it is the reason that domain has a scene at all: "a compartment is
+    // an apparent volume, not a place" is why it draws nothing, and it was mistaken for a reason
+    // it could not be a scene. The three above it had been proving otherwise since they shipped.
+    assert_eq!(
+        empty,
+        [
+            "11-motor-thermal-network",
+            "12-winding-heats-a-motor",
+            "13-winding-that-heats-itself",
+            "32-a-dose-distributing-and-leaving",
+            // The fifth is the same domain with organs perfused by blood: the volumes have names
+            // now, and they are still not places.
+            "34-a-tablet-that-meets-the-liver-first"
+        ],
+        "the set of scenes with nothing to draw has changed"
+    );
+    // **Every scene landed in exactly one bucket.** The guard here was `drawn > 0 || skipped > 0`,
+    // written against "a run in which every scene skipped would report nothing and pass" — and
+    // `|| skipped > 0` admits precisely that run, which is CI's: `ci.yml` says the runner has no
+    // adapter, so all 29 drawable scenes skip and this passes on the second term. A disjunction
+    // cannot be false in the environment it was written to protect.
+    //
+    // Arithmetic instead. A scene that fell out of the walk — a `continue` added above, a bucket
+    // that stopped being pushed to — is a number that no longer adds up, whatever the machine.
+    assert_eq!(
+        drawn + skipped + empty.len() + blank.len(),
+        paths_seen,
+        "{paths_seen} scenes walked and {} accounted for",
+        drawn + skipped + empty.len() + blank.len()
+    );
+    // And which machine this is, said rather than left to be inferred from a fold in a log. There
+    // is no middle: an adapter renders all 29 or there is none and all 29 skip. A run that drew 24
+    // is a renderer that started refusing scenes, and under the old guard it was just a smaller
+    // number.
+    assert!(
+        (drawn == 29 && skipped == 0) || (drawn == 0 && skipped == 29),
+        "{drawn} drew and {skipped} skipped — with an adapter all 29 draw, without one all 29 skip"
+    );
+}
+
+/// **A field is drawn as a solid, and the solid is the exporters' geometry.**
+///
+/// This shell drew every panel as line segments — a body and a field sample each became a small
+/// cross — so a block of cells came out as a cloud of `+` glyphs with no surface, no shading and
+/// no way to tell which way is up. `render.rs` was written to answer exactly that criticism for
+/// the editor's viewport and says so in its own first paragraph; the shell a person reaches by
+/// typing `pantometry view` kept the old picture.
+///
+/// Measured on `24-a-power-module-junction-to-ambient`, four materials in a stack:
+///
+/// | | lit pixels | shades |
+/// | --- | --- | --- |
+/// | crosses | 5 045 (0.64%) | **8** |
+/// | solid | 152 160 (19.2%) | 17 |
+///
+/// What is asserted is the property rather than those numbers, which are a camera's business: a
+/// scene with a field covers a **substantial** fraction of the canvas, because a solid does, and a
+/// scatter of markers cannot. Twelve percent is far above the 0.64% the crosses managed and far
+/// below what a background fill would give.
+///
+/// # Not under `wasm32`, and not without an adapter
+///
+/// The same conditions the walk above runs under, and the same loud skip.
+#[test]
+fn a_field_is_drawn_as_a_solid() {
+    let (bin, out) = tools();
+    let scenes = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("pantometry-app has a parent")
+        .join("pantometry-world/scenes");
+    // Three shapes of field: a three-dimensional stack, a plane, and a part with voids in it.
+    // A `Points` panel is deliberately not here — a set of bodies has no surface and is still
+    // drawn as crosses, which is what it is.
+    for name in [
+        "24-a-power-module-junction-to-ambient",
+        "01-room-mode",
+        "29-a-designed-bracket-becomes-cells",
+    ] {
+        let run = out.join(format!("{name}.solid.json"));
+        let ran = std::process::Command::new(&bin)
+            .args([
+                "run",
+                &scenes.join(format!("{name}.json")).to_string_lossy(),
+                &run.to_string_lossy(),
+            ])
+            .output()
+            .expect("the binary runs");
+        assert!(
+            ran.status.success(),
+            "{name}: the run refused: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        let shot = out.join(format!("{name}.solid.png"));
+        let drew = std::process::Command::new(&bin)
+            .args([
+                "view",
+                &run.to_string_lossy(),
+                "--snapshot",
+                &shot.to_string_lossy(),
+            ])
+            .output()
+            .expect("the binary runs");
+        let said = String::from_utf8_lossy(&drew.stdout).into_owned()
+            + &String::from_utf8_lossy(&drew.stderr);
+        if said.contains("no adapter") || said.contains("no GPU") {
+            println!("  skipped: this machine has no GPU adapter");
+            return;
+        }
+        assert!(drew.status.success(), "{name}: the viewer refused: {said}");
+        // From the `wrote` line and not from the whole output: the first `(` in it belongs to a
+        // title — `a small room ringing in its (1,1) mode` — and parsing that gave `1,1`.
+        let percent = said
+            .lines()
+            .find(|l| l.contains("wrote") && l.contains('%'))
+            .and_then(|l| l.split_once('('))
+            .and_then(|(_, rest)| rest.split('%').next())
+            .and_then(|n| n.trim().parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("{name}: no coverage in: {said}"));
+        assert!(
+            percent > 12.0,
+            "{name}: a field drawn as a solid covers the canvas; this covered {percent}%, \
+             which is the scatter the crosses gave"
+        );
+    }
+}
+
+/// **The picture carries its own legend, and a tile does not.**
+///
+/// A shaded solid says where the hot end is and cannot say how hot. The snapshot is the only
+/// static figure this workspace produces and it had no colour bar, no scale and no units — a
+/// reader could not tell 119 °C from 1190, nor a 12 mm module from a 4 m room. `glyphs` is what
+/// makes numbers drawable by the pipeline that is already there.
+///
+/// What is measured is the **shade count**, which is the one thing a legend must add: a colour bar
+/// is a ramp, so it puts tens of colours on a canvas that a flat-shaded solid alone does not have.
+/// Measured on `24-a-power-module-junction-to-ambient` at 1100x720: 17 shades without, 114 with.
+///
+/// And **not on a tile**. At 240x156 the labels are a fifth of the size they are laid out for and
+/// read as speckle, and the bar spans the full width so `crop_to_content` crops to the legend
+/// rather than to the object. The chooser prints the title and the kinds beside the picture.
+#[test]
+fn a_snapshot_carries_a_legend_and_a_tile_does_not() {
+    let (bin, out) = tools();
+    let scene = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("pantometry-app has a parent")
+        .join("pantometry-world/scenes/24-a-power-module-junction-to-ambient.json");
+    let run = out.join("legend.json");
+    let ran = std::process::Command::new(&bin)
+        .args(["run", &scene.to_string_lossy(), &run.to_string_lossy()])
+        .output()
+        .expect("the binary runs");
+    assert!(
+        ran.status.success(),
+        "the run refused: {}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+
+    let shades = |extra: &[&str], name: &str| -> Option<usize> {
+        let shot = out.join(name);
+        let mut argv = vec![
+            "view".to_string(),
+            run.to_string_lossy().into_owned(),
+            "--snapshot".to_string(),
+            shot.to_string_lossy().into_owned(),
+        ];
+        argv.extend(extra.iter().map(|s| (*s).to_string()));
+        let drew = std::process::Command::new(&bin)
+            .args(&argv)
+            .output()
+            .expect("the binary runs");
+        let said = String::from_utf8_lossy(&drew.stdout).into_owned()
+            + &String::from_utf8_lossy(&drew.stderr);
+        if said.contains("no adapter") || said.contains("no GPU") {
+            println!("  skipped: this machine has no GPU adapter");
+            return None;
+        }
+        assert!(drew.status.success(), "the viewer refused: {said}");
+        said.lines()
+            .find(|l| l.contains("wrote") && l.contains("shades"))
+            .and_then(|l| l.rsplit_once(", in "))
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .or_else(|| panic!("no shade count in: {said}"))
+    };
+
+    let Some(full) = shades(&[], "legend-full.png") else {
+        return;
+    };
+    let Some(tile) = shades(&["--thumbnail"], "legend-tile.png") else {
+        return;
+    };
+    // A ramp is tens of colours. A flat-shaded solid on its own was 17.
+    assert!(
+        full > 60,
+        "a snapshot with a colour bar shows {full} shades, which is a solid with no ramp on it"
+    );
+    // And the tile stayed the solid it was — the legend is off, so no ramp joined it.
+    assert!(
+        tile < 60,
+        "a tile shows {tile} shades, so the legend is being drawn into it"
+    );
+    // Both drew the object rather than only the legend.
+    assert!(
+        tile > 3,
+        "a tile shows {tile} shades, which is not a shaded solid"
+    );
+}

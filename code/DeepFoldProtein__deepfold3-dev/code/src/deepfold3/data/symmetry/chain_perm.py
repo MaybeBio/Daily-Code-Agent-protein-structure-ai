@@ -1,0 +1,774 @@
+"""Chain permutation alignment for homo- and hetero-multimer training.
+
+In a multimeric assembly, chains that share an ``entity_id`` (i.e. the
+same sequence) are physically indistinguishable — the prediction is
+free to place "copy 0" at what the ground-truth labels "copy 1", and
+vice versa. Without an explicit realignment, the loss would penalise
+such perfectly-correct predictions and inject spurious gradients into
+the training loop.
+
+This module computes the optimal ground-truth-to-prediction chain
+assignment following AlphaFold-Multimer / AlphaFold 3 §4.2: chains are
+grouped into **covalently-connected components** (a polymer chain plus its
+covalently-bonded glycans / ligands — OF3 ``assign_mol_symmetry_ids``),
+a single global rigid frame is fitted from an anchor chain, and each
+predicted component is greedily matched — as a whole unit — to the
+spatially nearest ground-truth component of its symmetry class (components
+sharing a class iff their coarse molecule graphs are isomorphic;
+see :mod:`deepfold3.data.symmetry.mol_labels`). A per-pair Kabsch cost is
+*not* used — it removes the global rotation and so scores only internal
+shape (near-identical, hence ambiguous, for symmetric copies), which cannot
+resolve the spatial correspondence the permutation exists for. With no
+inter-chain covalent bonds every chain is its own singleton component and a
+component class reduces to an ``entity_id`` class; symmetry classes of size 1
+are passed through unchanged.
+
+Heteromers (e.g. A2B2) are handled naturally: the anchor's global frame
+plus the per-entity greedy match assign each entity's copies independently.
+
+Clean-room implementation; no third-party permutation code is
+reproduced. Only standard numpy/torch primitives are used.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
+    import torch
+
+logger = logging.getLogger(__name__)
+
+
+def _kabsch_transform_np(p: np.ndarray, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Rigid transform ``(R, t)`` mapping ``p`` onto ``q`` (Kabsch 1976).
+
+    Both inputs are ``[K, 3]`` float64 arrays with matching row order.
+    Returns ``R`` ``[3, 3]`` and ``t`` ``[3]`` such that ``R @ p_k + t ≈ q_k``,
+    with a determinant-sign flip guarding against reflections. numpy (not
+    torch) because LAPACK's 3×3 SVD has far lower per-call overhead.
+    """
+    import numpy as np
+
+    p_mean = p.mean(axis=0)
+    q_mean = q.mean(axis=0)
+    p_c = p - p_mean
+    q_c = q - q_mean
+
+    # 3×3 cross-covariance; order chosen so R maps p_c → q_c.
+    h = p_c.T @ q_c
+    u, _s, vt = np.linalg.svd(h)
+    d = np.sign(np.linalg.det(vt.T @ u.T))
+    diag = np.eye(3, dtype=np.float64)
+    diag[2, 2] = d
+    r = vt.T @ diag @ u.T
+    t = q_mean - r @ p_mean
+    return r, t
+
+
+def _match_component_chains(
+    pred_members: tuple[int, ...],
+    gt_members: tuple[int, ...],
+    r_mat: np.ndarray,
+    t_vec: np.ndarray,
+    ent_of: dict[int, int],
+    cen_pred: dict[int, np.ndarray | None],
+    cen_gt: dict[int, np.ndarray | None],
+) -> tuple[dict[int, int], float]:
+    """Map one predicted component's chains onto a matched GT component's chains.
+
+    The two components are in the same symmetry class (isomorphic coarse
+    graphs), so their per-entity chain multisets are identical. Within the
+    matched pair, each predicted chain is greedily assigned to the spatially
+    nearest still-unused GT chain **of the same entity** (after the global
+    anchor frame ``R, t``). For a singleton component this is the single
+    same-entity chain — identical to the historical per-chain match.
+
+    Returns ``({pred_asym: gt_asym}, summed_squared_distance)``.
+    """
+    from collections import defaultdict
+
+    gt_by_ent: dict[int, list[int]] = defaultdict(list)
+    for g in gt_members:
+        if cen_gt.get(g) is not None:
+            gt_by_ent[ent_of[g]].append(g)
+
+    mapping: dict[int, int] = {}
+    score = 0.0
+    used: set[int] = set()
+    for p in pred_members:
+        if cen_pred.get(p) is None:
+            continue
+        pt = r_mat @ cen_pred[p] + t_vec
+        best_d: float | None = None
+        best_g: int | None = None
+        for g in gt_by_ent.get(ent_of[p], ()):
+            if g in used:
+                continue
+            d = float(((pt - cen_gt[g]) ** 2).sum())
+            if best_d is None or d < best_d:
+                best_d = d
+                best_g = g
+        if best_g is not None:
+            used.add(best_g)
+            mapping[p] = best_g
+            score += best_d
+    return mapping, score
+
+
+def _anchor_greedy_assignment(
+    order: list[int],
+    ent_of: dict[int, int],
+    cen_pred: dict[int, np.ndarray | None],
+    cen_gt: dict[int, np.ndarray | None],
+    at_pred: dict[int, np.ndarray],
+    at_gt: dict[int, np.ndarray],
+    res: dict[int, np.ndarray],
+    is_lig: dict[int, bool] | None = None,
+    sti: dict[int, np.ndarray] | None = None,
+    inter_chain_bonds: list[tuple] | None = None,
+) -> dict[int, int]:
+    """AF-Multimer anchor-based greedy chain assignment (AF3 §4.2).
+
+    Unlike a per-pair Kabsch cost (which removes the global rotation and so
+    scores *internal shape* similarity — near-zero and ambiguous for
+    identical chains), this fits a **single global frame** from an anchor
+    chain and then greedily matches each predicted chain to the spatially
+    nearest ground-truth chain of the same entity. Spatial position — the
+    thing the permutation must resolve — drives the assignment.
+
+    Chains are permuted at the granularity of **covalently-connected
+    components** (AF3 §4.2 / OF3 ``assign_mol_symmetry_ids``): a polymer chain
+    and its covalently-bonded glycans / ligands form one unit that moves
+    together, and two components are interchangeable only when their coarse
+    molecule graphs are isomorphic. With no inter-chain covalent bonds every
+    chain is its own singleton component and a component class reduces to an
+    ``entity_id`` class — behaviourally identical to the entity-only path.
+
+    Algorithm:
+      1. Anchor entity = a **polymer** entity if any (ligand-only entities are
+         deprioritised — their still-unresolved symmetric atoms make for a
+         noisy frame, per OF3 ``get_gt_anchor_mask``); among equal-priority
+         entities, the fewest resolved chains (least ambiguous), tie-broken
+         toward more resolved atoms; ``gt_anchor`` = its most-resolved chain.
+      2. For each predicted chain of the anchor entity (the candidate global
+         frames), Kabsch-align it onto ``gt_anchor``, apply that transform to
+         every predicted **component** centroid (the component's polymer-anchor
+         chain centroid), greedily assign each predicted component to the
+         nearest unused GT component of its symmetry class, then match the
+         chains within the paired components (per-entity nearest).
+      3. Keep the frame with the smallest total matched squared distance.
+
+    Per-chain inputs are keyed by chain id: ``cen_*`` are resolved-atom
+    centroids (``None`` if fully unresolved); ``at_*`` / ``res`` are the
+    per-chain resolved-atom coordinate blocks + boolean mask used only for
+    the anchor Kabsch. ``is_lig`` maps chain id → True for ligand
+    (all-nonpolymer) chains; used only to deprioritise ligand-only entities as
+    the anchor. When ``None``, no ligand distinction is made (legacy behaviour).
+
+    ``sti`` maps chain id → its per-token ``sym_token_index`` array (same row
+    order as ``at_*`` / ``res``). When given, the anchor Kabsch matches
+    symmetric chains by **shared sym-index** rather than requiring equal token
+    counts, so chains a crop cut to unequal lengths still align on their common
+    residues (gap-1). When ``None``, chains of one entity are assumed to share
+    their atom layout row-for-row (legacy positional path).
+
+    ``inter_chain_bonds`` lists covalent bonds crossing a chain boundary — each
+    ``(asym_a, asym_b)`` or ``(asym_a, asym_b, rel_atom_a, rel_atom_b)`` — used
+    to build the covalent components and their isomorphism classes. ``None`` /
+    empty → singleton components (each chain its own unit).
+    """
+    from collections import defaultdict
+
+    import numpy as np
+
+    from deepfold3.data.symmetry.mol_labels import (
+        assign_component_symmetry_classes,
+        connected_chain_components,
+    )
+
+    assignment = {a: a for a in order}
+
+    # Covalently-connected components + their graph-isomorphism symmetry classes.
+    components, _comp_of = connected_chain_components(order, inter_chain_bonds)
+    class_of = assign_component_symmetry_classes(components, ent_of, inter_chain_bonds)
+    class_to_comps: dict[int, list[int]] = defaultdict(list)
+    for ci, cls in enumerate(class_of):
+        class_to_comps[cls].append(ci)
+    if not any(len(v) > 1 for v in class_to_comps.values()):
+        return assignment  # no symmetric component copies → nothing to permute
+
+    resolved_chains = [a for a in order if cen_pred.get(a) is not None and cen_gt.get(a) is not None]
+    if len(resolved_chains) < 2:
+        return assignment
+
+    ent_res: dict[int, list[int]] = defaultdict(list)
+    for a in resolved_chains:
+        ent_res[ent_of[a]].append(a)
+    natoms = {a: int(res[a].sum()) for a in resolved_chains}
+
+    # Each component is represented for the whole-unit spatial match by its
+    # anchor chain — the polymer (non-ligand), most-resolved member — so a
+    # misplaced light glycan / ligand cannot drag the unit's match away from the
+    # polymer it is bonded to. For a singleton component this is just the chain
+    # itself (unchanged common path). ``None`` when no member chain is resolved.
+    def _rep_atoms(a: int) -> int:
+        r = res.get(a)
+        return int(r.sum()) if r is not None else 0
+
+    def _chain_is_lig(a: int) -> bool:
+        return bool(is_lig.get(a, False)) if is_lig else False
+
+    comp_cen_pred: dict[int, np.ndarray | None] = {}
+    comp_cen_gt: dict[int, np.ndarray | None] = {}
+    for ci, members in enumerate(components):
+        resolved = [a for a in members if cen_pred.get(a) is not None and cen_gt.get(a) is not None]
+        if not resolved:
+            comp_cen_pred[ci] = None
+            comp_cen_gt[ci] = None
+            continue
+        rep = min(resolved, key=lambda a: (_chain_is_lig(a), -_rep_atoms(a)))
+        comp_cen_pred[ci] = cen_pred[rep]
+        comp_cen_gt[ci] = cen_gt[rep]
+
+    # Deprioritise ligand-only entities as the anchor (their symmetric atoms
+    # are not yet permutation-resolved → noisy frame). Among equal ligand-ness:
+    # fewest symmetry mates (least ambiguous), then most resolved atoms.
+    def _ent_is_ligand(e: int) -> bool:
+        return bool(is_lig) and all(is_lig.get(a, False) for a in ent_res[e])
+
+    anchor_entity = min(
+        ent_res.keys(),
+        key=lambda e: (_ent_is_ligand(e), len(ent_res[e]), -max(natoms[a] for a in ent_res[e])),
+    )
+    gt_anchor = max(ent_res[anchor_entity], key=lambda a: natoms[a])
+
+    def _anchor_kabsch_points(pa: int) -> tuple[np.ndarray, np.ndarray] | None:
+        """Matched (pred_pa, gt_anchor) coords for the anchor Kabsch.
+
+        Over tokens resolved in both chains. Positional row-for-row when
+        ``sti`` is None (equal-length same-entity chains, legacy path); by
+        shared ``sym_token_index`` when provided, so a symmetric chain that a
+        crop cut to a different surviving token count still aligns on the
+        residues the two chains have in common. Returns ``None`` when fewer
+        than 3 points match (Kabsch under-determined → skip this frame).
+        """
+        if sti is None:
+            # Legacy: row-for-row correspondence needs equal token counts.
+            if res[pa].shape[0] != res[gt_anchor].shape[0]:
+                return None
+            both = res[pa] & res[gt_anchor]
+            if int(both.sum()) < 3:
+                return None
+            return at_pred[pa][both], at_gt[gt_anchor][both]
+        pa_sti, pa_res = sti[pa], res[pa]
+        p_of_sym: dict[int, int] = {}
+        for r in range(pa_sti.shape[0]):
+            if pa_res[r]:
+                p_of_sym.setdefault(int(pa_sti[r]), r)  # dup sym (atomized) → first
+        g_sti, g_res = sti[gt_anchor], res[gt_anchor]
+        rows_p: list[int] = []
+        rows_g: list[int] = []
+        seen: set[int] = set()
+        for r in range(g_sti.shape[0]):
+            if not g_res[r]:
+                continue
+            s = int(g_sti[r])
+            rp = p_of_sym.get(s)
+            if rp is not None and s not in seen:
+                seen.add(s)
+                rows_p.append(rp)
+                rows_g.append(r)
+        if len(rows_p) < 3:
+            return None
+        return at_pred[pa][rows_p], at_gt[gt_anchor][rows_g]
+
+    best: dict[int, int] | None = None
+    best_score = np.inf
+    for pa in ent_res[anchor_entity]:
+        pts = _anchor_kabsch_points(pa)
+        if pts is None:
+            continue
+        r_mat, t_vec = _kabsch_transform_np(pts[0], pts[1])
+        trial = {a: a for a in order}
+        score = 0.0
+        # Match whole components within each symmetry class, then the chains
+        # inside each paired component. Singleton components collapse to the
+        # per-chain, per-entity greedy match (unchanged common path).
+        for comps in class_to_comps.values():
+            gt_avail = [c for c in comps if comp_cen_gt[c] is not None]
+            used_comps: set[int] = set()
+            for pc in [c for c in comps if comp_cen_pred[c] is not None]:
+                pt = r_mat @ comp_cen_pred[pc] + t_vec
+                best_d: float | None = None
+                best_gc: int | None = None
+                for gc in gt_avail:
+                    if gc in used_comps:
+                        continue
+                    d = float(((pt - comp_cen_gt[gc]) ** 2).sum())
+                    if best_d is None or d < best_d:
+                        best_d = d
+                        best_gc = gc
+                if best_gc is not None:
+                    used_comps.add(best_gc)
+                    chain_map, chain_score = _match_component_chains(
+                        components[pc], components[best_gc], r_mat, t_vec, ent_of, cen_pred, cen_gt
+                    )
+                    trial.update(chain_map)
+                    score += chain_score
+        if score < best_score:
+            best_score = score
+            best = trial
+
+    return best if best is not None else assignment
+
+
+def _inter_chain_bonds_from_structure(
+    chains: np.ndarray,
+    bonds: np.ndarray | None,
+) -> list[tuple] | None:
+    """Derive inter-chain covalent bonds (as asym-id pairs) from a Structure.
+
+    Maps each ``BOND_DTYPE`` bond's global atom endpoints to the chain that
+    owns them (via each chain's ``[atom_idx, atom_idx + atom_num)`` range) and
+    keeps only bonds that cross a chain boundary. Each returned entry is
+    ``(asym_a, asym_b, rel_atom_a, rel_atom_b)`` where ``rel_atom_*`` is the
+    endpoint's atom index relative to its chain — the OF3 link-node label used
+    to sharpen the component isomorphism to the attachment site. Returns
+    ``None`` when there are no inter-chain bonds.
+    """
+    import bisect
+
+    if bonds is None or len(bonds) == 0 or len(chains) == 0:
+        return None
+
+    ranges = sorted((int(r["atom_idx"]), int(r["atom_idx"]) + int(r["atom_num"]), int(r["asym_id"])) for r in chains)
+    starts = [r[0] for r in ranges]
+
+    def owner(atom: int) -> tuple[int | None, int]:
+        i = bisect.bisect_right(starts, atom) - 1
+        if 0 <= i < len(ranges):
+            s, e, asym = ranges[i]
+            if s <= atom < e:
+                return asym, s
+        return None, 0
+
+    out: list[tuple] = []
+    for b in bonds:
+        a1, a2 = int(b["atom_1"]), int(b["atom_2"])
+        c1, s1 = owner(a1)
+        c2, s2 = owner(a2)
+        if c1 is None or c2 is None or c1 == c2:
+            continue
+        out.append((c1, c2, a1 - s1, a2 - s2))
+    return out or None
+
+
+def compute_chain_permutation(
+    pred_coords: torch.Tensor,  # [N_atoms, 3]
+    gt_coords: torch.Tensor,  # [N_atoms, 3]
+    gt_mask: torch.Tensor,  # [N_atoms] bool
+    chains: np.ndarray,  # CHAIN_DTYPE structured array
+    bonds: np.ndarray | None = None,  # BOND_DTYPE — inter-chain covalent bonds
+) -> dict[int, int]:
+    """Find the optimal pred-to-GT chain mapping for a multimer.
+
+    Flat atom-layout adapter around :func:`_anchor_greedy_assignment`
+    (AF-Multimer / AF3 §4.2): chains are grouped into covalently-connected
+    components, a single global rigid frame is fitted from an anchor chain, and
+    each predicted component is greedily matched (whole-unit) to the spatially
+    nearest GT component of its isomorphism class over resolved heavy atoms,
+    then its chains to the paired GT component's chains. This resolves the
+    spatial correspondence between symmetric copies — which a
+    rotation-invariant per-pair Kabsch cost cannot, since it collapses to
+    a near-constant matrix for identical chains and yields an arbitrary
+    assignment.
+
+    Parameters
+    ----------
+    pred_coords : torch.Tensor [N_atoms, 3]
+        Predicted atom coordinates in the flat atom layout described by
+        ``chains``. Any device / dtype is accepted.
+    gt_coords : torch.Tensor [N_atoms, 3]
+        Ground-truth atom coordinates, same layout as ``pred_coords``.
+    gt_mask : torch.Tensor [N_atoms], bool
+        True at atoms with valid (resolved) GT positions. Atoms where
+        this mask is False are excluded from the centroid computation.
+    chains : np.ndarray
+        Structured array with ``CHAIN_DTYPE`` fields — at minimum
+        ``entity_id``, ``asym_id``, ``atom_idx`` and ``atom_num``.
+    bonds : np.ndarray, optional
+        ``BOND_DTYPE`` bonds (``atom_1``, ``atom_2``). Inter-chain covalent
+        bonds group chains into components that permute as whole molecules
+        (AF3 §4.2). ``None`` / no inter-chain bonds → each chain is its own
+        component (entity-only behaviour, unchanged).
+
+    Returns
+    -------
+    dict[int, int]
+        Mapping ``{pred_asym_id: gt_asym_id}`` giving the GT chain that
+        should be matched to each pred chain. Chains whose entity has
+        only one copy are mapped to themselves. Chains whose atoms are
+        all masked fall back to the identity mapping.
+    """
+    import numpy as np
+    import torch
+
+    if len(chains) == 0:
+        return {}
+
+    order: list[int] = [int(r["asym_id"]) for r in chains]
+    ent_of: dict[int, int] = {int(r["asym_id"]): int(r["entity_id"]) for r in chains}
+    cen_pred: dict[int, np.ndarray | None] = {}
+    cen_gt: dict[int, np.ndarray | None] = {}
+    at_pred: dict[int, np.ndarray] = {}
+    at_gt: dict[int, np.ndarray] = {}
+    res: dict[int, np.ndarray] = {}
+
+    with torch.no_grad():
+        for row in chains:
+            a = int(row["asym_id"])
+            start = int(row["atom_idx"])
+            num = int(row["atom_num"])
+            end = start + num
+            m = gt_mask[start:end].detach().cpu().numpy().astype(bool) if num > 0 else np.zeros(0, dtype=bool)
+            if num == 0 or not m.any():
+                cen_pred[a] = None
+                cen_gt[a] = None
+                continue
+            pf = pred_coords[start:end].detach().cpu().numpy().astype(np.float64, copy=False)
+            gf = gt_coords[start:end].detach().cpu().numpy().astype(np.float64, copy=False)
+            at_pred[a] = pf
+            at_gt[a] = gf
+            res[a] = m
+            cen_pred[a] = pf[m].mean(axis=0)
+            cen_gt[a] = gf[m].mean(axis=0)
+
+    inter_chain_bonds = _inter_chain_bonds_from_structure(chains, bonds)
+    return _anchor_greedy_assignment(
+        order, ent_of, cen_pred, cen_gt, at_pred, at_gt, res, inter_chain_bonds=inter_chain_bonds
+    )
+
+
+def apply_chain_permutation(
+    coords: torch.Tensor,  # [N_atoms, 3]
+    mask: torch.Tensor,  # [N_atoms] bool
+    chains: np.ndarray,
+    chain_assignment: dict[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reorder GT atom blocks according to a chain assignment.
+
+    For each chain in ``chains`` (iterated in pred order), the returned
+    tensors contain the atoms from the GT chain given by
+    ``chain_assignment[asym_id]``. Chain lengths must match for the
+    slices to line up — mismatched entries are skipped by the
+    assignment builder, so the fallback here is the identity copy.
+
+    Parameters
+    ----------
+    coords : torch.Tensor [N_atoms, 3]
+        Typically the GT coordinates to be reordered. Any device / dtype.
+    mask : torch.Tensor [N_atoms], bool
+        Per-atom validity mask aligned with ``coords``.
+    chains : np.ndarray
+        Structured array with ``CHAIN_DTYPE`` fields.
+    chain_assignment : dict[int, int]
+        ``{pred_asym_id: gt_asym_id}`` mapping as returned by
+        :func:`compute_chain_permutation`.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        ``(permuted_coords, permuted_mask)`` with the same total length
+        as the inputs. Both are detached from any input autograd graph.
+    """
+    import torch
+
+    if len(chains) == 0:
+        return coords.detach(), mask.detach()
+
+    # Fast path: no-op if the assignment is identity everywhere.
+    if all(int(k) == int(v) for k, v in chain_assignment.items()):
+        return coords.detach(), mask.detach()
+
+    # Lookup: asym_id -> (atom_idx, atom_num)
+    chain_by_asym: dict[int, tuple[int, int]] = {
+        int(r["asym_id"]): (int(r["atom_idx"]), int(r["atom_num"])) for r in chains
+    }
+
+    n_atoms = coords.shape[0]
+    index = torch.arange(n_atoms, dtype=torch.long, device=coords.device)
+
+    for row in chains:
+        pred_asym = int(row["asym_id"])
+        pred_start = int(row["atom_idx"])
+        pred_num = int(row["atom_num"])
+        gt_asym = int(chain_assignment.get(pred_asym, pred_asym))
+        if gt_asym == pred_asym:
+            continue
+        gt_start, gt_num = chain_by_asym.get(gt_asym, (pred_start, pred_num))
+        if gt_num != pred_num:
+            # Length mismatch — cannot safely reorder, leave the slice in place.
+            logger.debug(
+                "chain_perm: length mismatch for pred asym_id=%d -> gt asym_id=%d "
+                "(pred=%d, gt=%d); leaving slice unchanged",
+                pred_asym,
+                gt_asym,
+                pred_num,
+                gt_num,
+            )
+            continue
+        index[pred_start : pred_start + pred_num] = torch.arange(
+            gt_start, gt_start + gt_num, dtype=torch.long, device=coords.device
+        )
+
+    permuted_coords = coords.index_select(0, index).detach()
+    permuted_mask = mask.index_select(0, index).detach()
+    return permuted_coords, permuted_mask
+
+
+# ---------------------------------------------------------------------------
+# Token-aware variants for the diffusion loss path
+# ---------------------------------------------------------------------------
+
+
+def compute_chain_permutation_tokens(
+    pred_pos: torch.Tensor,  # [N, M, 3]
+    gt_pos: torch.Tensor,  # [N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M] bool
+    asym_id: torch.Tensor,  # [N] int
+    entity_id: torch.Tensor,  # [N] int
+    token_to_rep_atom: torch.Tensor | None = None,  # [N] int — rep-atom slot per token
+    mol_type: torch.Tensor | None = None,  # [N] int — polymer/ligand anchor priority
+    seq_mask: torch.Tensor | None = None,  # [N] bool — real (non-padding) tokens
+    sym_token_index: torch.Tensor | None = None,  # [N] int — per-chain ordinal (crop-robust key)
+    inter_chain_bonds: list[tuple] | None = None,  # covalent (asym_a, asym_b[, rel_a, rel_b]) pairs
+) -> dict[int, int]:
+    """Token-layout version of :func:`compute_chain_permutation`.
+
+    Operates on the per-token ``[N, M, 3]`` layout used by the diffusion
+    loss. Tokens are grouped by ``asym_id`` (each chain is one group) and
+    chains into covalently-connected components (AF3 §4.2 / OF3
+    ``assign_mol_symmetry_ids``); components are matched into permutation
+    classes by graph isomorphism. The pred → GT chain assignment is resolved by
+    :func:`_anchor_greedy_assignment` — the AF-Multimer anchor-based greedy
+    algorithm (AF3 §4.2): a single global frame is fitted from an anchor chain
+    and each predicted component is matched (as a whole unit) to the spatially
+    nearest GT component of its class. This resolves the spatial correspondence
+    between symmetric copies that a per-pair Kabsch cost (rotation-invariant,
+    hence blind to position) cannot.
+
+    ``inter_chain_bonds`` lists covalent bonds crossing a chain boundary (as
+    ``(asym_a, asym_b)`` pairs) so a protein chain plus its bonded glycans /
+    ligands permute together. ``None`` / empty → each chain is its own
+    singleton component (entity-only behaviour, unchanged).
+
+    ``token_to_rep_atom`` selects each token's representative (token-center)
+    atom — CA / C1' / the single ligand atom — so the alignment operates on
+    the AF-Multimer/AF3 §4.2 primitive rather than all heavy atoms (cleaner
+    centroids, and a row-for-row ``[T]`` correspondence between symmetric
+    chains). When absent, all heavy atoms are flattened (legacy behaviour).
+    ``mol_type`` lets ligand-only entities be deprioritised as the anchor.
+    ``seq_mask`` drops padding tokens (which carry ``asym_id == 0`` and would
+    otherwise pollute chain 0's token block). ``sym_token_index`` (rep-atom
+    path only) keys the anchor Kabsch by shared per-chain ordinal, so
+    symmetric chains a crop cut to unequal token counts still align (gap-1).
+
+    Returns ``{pred_asym_id: gt_asym_id}``. Identity for chains in singleton
+    entity classes or when no valid anchor frame exists.
+    """
+    import numpy as np
+    import torch
+
+    from deepfold3.data import const
+
+    asym_ids_np = asym_id.detach().cpu().numpy()
+    entity_ids_np = entity_id.detach().cpu().numpy()
+    mol_np = mol_type.detach().cpu().numpy() if mol_type is not None else None
+    sym_np = sym_token_index.detach().cpu().numpy() if sym_token_index is not None else None
+    valid_np = (
+        seq_mask.detach().cpu().numpy().astype(bool)
+        if seq_mask is not None
+        else np.ones(asym_ids_np.shape[0], dtype=bool)
+    )
+
+    # Pre-gather the representative (token-center) atom per token to [N, 3];
+    # each chain then reduces to a clean [T]-row block. All heavy atoms would
+    # give a ragged, noisier centroid and break the row-for-row anchor Kabsch.
+    if token_to_rep_atom is not None:
+        with torch.no_grad():
+            rep = token_to_rep_atom.to(dtype=torch.long, device=pred_pos.device)
+            tok_ar = torch.arange(rep.shape[0], device=pred_pos.device)
+            am = atom_mask.to(device=pred_pos.device)
+            pred_rep = pred_pos[tok_ar, rep].detach().cpu().numpy().astype(np.float64, copy=False)  # [N, 3]
+            gt_rep = gt_pos[tok_ar, rep].detach().cpu().numpy().astype(np.float64, copy=False)
+            mask_rep = am[tok_ar, rep].detach().cpu().numpy().astype(bool)  # [N]
+    else:
+        pred_rep = gt_rep = mask_rep = None
+
+    # Iterate chains in first-appearance order (over real tokens) for stability.
+    seen: set[int] = set()
+    chain_order: list[int] = []
+    for i, a in enumerate(asym_ids_np.tolist()):
+        if not valid_np[i] or a in seen:
+            continue
+        seen.add(a)
+        chain_order.append(int(a))
+
+    ent_of: dict[int, int] = {}
+    lig_of: dict[int, bool] = {}
+    sti_of: dict[int, np.ndarray] = {}
+    cen_pred: dict[int, np.ndarray | None] = {}
+    cen_gt: dict[int, np.ndarray | None] = {}
+    at_pred: dict[int, np.ndarray] = {}
+    at_gt: dict[int, np.ndarray] = {}
+    res: dict[int, np.ndarray] = {}
+
+    with torch.no_grad():
+        for asym in chain_order:
+            idx = np.where((asym_ids_np == asym) & valid_np)[0]
+            ent_of[asym] = int(entity_ids_np[idx[0]])
+            if mol_np is not None:
+                lig_of[asym] = bool(np.all(mol_np[idx] == const.MOL_NONPOLYMER))
+            if pred_rep is not None:
+                m = mask_rep[idx]  # [T]
+                pf = pred_rep[idx]  # [T, 3]
+                gf = gt_rep[idx]
+            else:
+                tok_idx = torch.as_tensor(idx, dtype=torch.long, device=pred_pos.device)
+                # Flatten (token × atom) so chains of one entity share a row layout.
+                m = atom_mask[tok_idx].reshape(-1).detach().cpu().numpy().astype(bool)  # [T*M]
+                pf = pred_pos[tok_idx].reshape(-1, 3).detach().cpu().numpy().astype(np.float64, copy=False)
+                gf = gt_pos[tok_idx].reshape(-1, 3).detach().cpu().numpy().astype(np.float64, copy=False)
+            if not m.any():
+                cen_pred[asym] = None
+                cen_gt[asym] = None
+                continue
+            at_pred[asym] = pf
+            at_gt[asym] = gf
+            res[asym] = m
+            cen_pred[asym] = pf[m].mean(axis=0)
+            cen_gt[asym] = gf[m].mean(axis=0)
+            # sym-index key (rep-atom path only): row-aligned with pf/gf/m.
+            if pred_rep is not None and sym_np is not None:
+                sti_of[asym] = sym_np[idx]
+
+    return _anchor_greedy_assignment(
+        chain_order,
+        ent_of,
+        cen_pred,
+        cen_gt,
+        at_pred,
+        at_gt,
+        res,
+        is_lig=lig_of if mol_np is not None else None,
+        sti=sti_of if (pred_rep is not None and sym_np is not None) else None,
+        inter_chain_bonds=inter_chain_bonds,
+    )
+
+
+def chain_permutation_index(
+    asym_id: torch.Tensor,  # [N] int
+    chain_assignment: dict[int, int],
+    sym_token_index: torch.Tensor | None = None,  # [N] int — per-chain ordinal
+    device: object | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the token reorder for a chain assignment.
+
+    Returns ``(index, keep)`` — ``index[i]`` is the GT token feeding pred token
+    ``i`` (so ``gt_new[i] = gt[index[i]]``), and ``keep[i]`` is False when pred
+    token ``i`` has no GT counterpart under the assignment (only reachable on
+    the sym-index path). Identity assignment → ``(arange, all-True)``.
+
+    Without ``sym_token_index`` chains are matched **positionally** and
+    length-mismatched groups are skipped (legacy). With it, each pred token is
+    matched to the GT token of the **same per-chain ordinal**, so symmetric
+    chains a crop cut to unequal counts are still reordered (gap-1).
+    """
+    import torch
+
+    dev = device if device is not None else asym_id.device
+    n_tokens = int(asym_id.shape[0])
+    asym_ids_t = asym_id.to(dtype=torch.long, device=dev)
+    keep = torch.ones(n_tokens, dtype=torch.bool, device=dev)
+
+    if not chain_assignment or all(int(k) == int(v) for k, v in chain_assignment.items()):
+        return torch.arange(n_tokens, dtype=torch.long, device=dev), keep
+
+    if sym_token_index is None:
+        # Legacy positional path: reorder only equal-length chain pairs.
+        index = torch.arange(n_tokens, dtype=torch.long, device=dev)
+        chain_by_asym: dict[int, torch.Tensor] = {}
+        for a in chain_assignment.values():
+            a_int = int(a)
+            if a_int not in chain_by_asym:
+                chain_by_asym[a_int] = torch.where(asym_ids_t == a_int)[0]
+        for pred_asym, gt_asym in chain_assignment.items():
+            if int(pred_asym) == int(gt_asym):
+                continue
+            pred_idx = torch.where(asym_ids_t == int(pred_asym))[0]
+            gt_idx = chain_by_asym.get(int(gt_asym), pred_idx)
+            if pred_idx.numel() != gt_idx.numel():
+                continue
+            index[pred_idx] = gt_idx
+        return index, keep
+
+    # sym-index path: match pred token → GT token of the same per-chain ordinal.
+    import numpy as np
+
+    asym_np = asym_ids_t.detach().cpu().numpy()
+    sym_np = sym_token_index.detach().cpu().numpy()
+    index_np = np.arange(n_tokens, dtype=np.int64)
+    keep_np = np.ones(n_tokens, dtype=bool)
+
+    for pred_asym, gt_asym in chain_assignment.items():
+        if int(pred_asym) == int(gt_asym):
+            continue
+        pred_rows = np.where(asym_np == int(pred_asym))[0]
+        gt_rows = np.where(asym_np == int(gt_asym))[0]
+        # GT sym-index → GT row. A duplicate sym (e.g. stochastic atomization
+        # expanded a residue) makes the mapping ill-defined → skip this chain.
+        gt_of_sym: dict[int, int] = {}
+        dup = False
+        for r in gt_rows.tolist():
+            s = int(sym_np[r])
+            if s in gt_of_sym:
+                dup = True
+                break
+            gt_of_sym[s] = r
+        if dup:
+            continue
+        for r in pred_rows.tolist():
+            g = gt_of_sym.get(int(sym_np[r]))
+            if g is None:
+                keep_np[r] = False  # no GT token of this ordinal → nothing to score
+            else:
+                index_np[r] = g
+
+    index = torch.from_numpy(index_np).to(device=dev)
+    keep = torch.from_numpy(keep_np).to(device=dev)
+    return index, keep
+
+
+def apply_chain_permutation_tokens(
+    gt_pos: torch.Tensor,  # [..., N, M, 3]
+    atom_mask: torch.Tensor,  # [N, M] bool
+    asym_id: torch.Tensor,  # [N] int
+    chain_assignment: dict[int, int],
+    sym_token_index: torch.Tensor | None = None,  # [N] int — per-chain ordinal (crop-robust key)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reorder GT token rows (and mask) according to a chain assignment.
+
+    Thin wrapper over :func:`chain_permutation_index`. Pred tokens with no GT
+    counterpart (sym-index path) have their mask zeroed — there is no aligned
+    GT coordinate to score against. Returns the permuted ``gt_pos`` and mask,
+    both detached. Used for the per-sample augmented GT in the diffusion MSE.
+    """
+    if not chain_assignment or all(int(k) == int(v) for k, v in chain_assignment.items()):
+        return gt_pos.detach(), atom_mask.detach()
+    index, keep = chain_permutation_index(asym_id, chain_assignment, sym_token_index, device=gt_pos.device)
+    permuted = gt_pos.index_select(-3, index).detach()
+    permuted_mask = (atom_mask.index_select(0, index) & keep.unsqueeze(-1)).detach()
+    return permuted, permuted_mask

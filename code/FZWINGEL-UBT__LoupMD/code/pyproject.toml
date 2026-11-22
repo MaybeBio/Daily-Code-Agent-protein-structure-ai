@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loupmd"
+dynamic = ["version"]
+description = "Molecular dynamics with MACE potentials on a C++/CUDA engine"
+readme = "README.md"
+requires-python = ">=3.10"
+# MIT for LoupMD; BSD-3-Clause for the tensor-core GEMM kernels compiled from CUTLASS headers; LGPL-2.1-or-later
+# for the code that follows ASE: the optimiser modules (PLAN.md decision O6) and the engine's integrator and
+# minimiser kernels, and with them the compiled library as a whole (O35). NOTICE.md lists the files of each.
+license = "MIT AND BSD-3-Clause AND LGPL-2.1-or-later"
+license-files = ["LICENSE", "NOTICE.md", "cubins/LICENSE.cutlass", "LICENSES/LGPL-2.1-or-later.txt"]
+authors = [{ name = "Fabian Zwingel" }]
+keywords = ["molecular dynamics", "MACE", "machine-learned interatomic potentials", "CUDA"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+# The runtime needs no torch and no compiler. The CUDA 13 runtime, cuBLAS and cuFFT (the split dispersion sum, opened
+# only when used; PLAN.md D79) come from the NVIDIA wheels, pinned exactly as the export extra's torch pins them, so
+# that torch and the engine load the same libraries: cuda-toolkit 13.2.2 with torch 2.15.0+cu132
+# (nvidia-cuda-runtime 13.2.86, nvidia-cublas 13.4.1.3), and on Python 3.10 cuda-toolkit 13.0.3 with torch
+# 2.14.1+cu130 (nvidia-cuda-runtime 13.0.96, nvidia-cublas 13.1.1.3).
+dependencies = [
+    "numpy>=1.26",
+    "ase>=3.23",
+    "tomli>=2; python_version < '3.11'",
+    "cuda-toolkit[cublas,cudart,cufft]==13.2.2; platform_system == 'Linux' and python_version >= '3.11'",
+    "cuda-toolkit[cublas,cudart,cufft]==13.0.3; platform_system == 'Linux' and python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+# Exporting a model to a bundle and computing gate references: the versions the exporters were tested with (the
+# owner's decision O36). torch 2.15 and mace-torch 0.3.17 need Python 3.11; Python 3.10 keeps the last versions
+# that support it. mace-torch 0.3.17 is the first whose MACE-POLAR-1 stress has the long-range term's cell
+# dependence. graph_longrange is what MACE's POLAR-1 models are made of (mace-torch's own "polar" extra).
+export = [
+    "torch==2.15.0; python_version >= '3.11'",
+    "torch==2.14.1; python_version < '3.11'",
+    "mace-torch==0.3.17; python_version >= '3.11'",
+    "mace-torch==0.3.16; python_version < '3.11'",
+    "graph_longrange==0.4.4",
+    "cuequivariance==0.12.0",
+    "cuequivariance-torch==0.12.0",
+]
+dev = [
+    "pytest>=8",
+    "tomli>=2; python_version < '3.11'",
+    "build>=1.2",
+]
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.29",
+]
+
+[project.urls]
+Documentation = "https://fzwingel-ubt.github.io/LoupMD/"
+Repository = "https://github.com/FZWINGEL-UBT/LoupMD"
+Changelog = "https://github.com/FZWINGEL-UBT/LoupMD/blob/release/v1/CHANGELOG.md"
+
+[project.scripts]
+loupmd = "loupmd.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "loupmd.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["loupmd*"]
+
+[tool.setuptools.package-data]
+# _lib/ is filled by the wheel build (PLAN.md S2-T02) and is not tracked: the library, the tensor-core cubins, the
+# kernel manifest, the kernels' signature header (part of the bundle cache's key), and what `loupmd build-kernels`
+# compiles a plugin from (three headers and the generator).
+loupmd = ["_lib/*.so", "_lib/cubins/*", "_lib/generated_generic_manifest.json",
+          "_lib/kernel-src/*",
+          "bench/reference.json", "bench/structures/*", "export/_vendor/VERSION", "data/d3_tables.npz"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "fast: the fast tier of tests/gpu, every GPU test not marked otherwise (under ten minutes)",
+    "full: the full tier of tests/gpu: long runs, statistics, step costs, model families",
+    "acceptance: the accuracy gate per model family (exports and float64 references)",
+]

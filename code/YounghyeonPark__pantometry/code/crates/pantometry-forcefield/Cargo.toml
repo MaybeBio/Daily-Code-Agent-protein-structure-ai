@@ -1,0 +1,42 @@
+[package]
+name = "pantometry-forcefield"
+description = "Small molecules as a simulation domain: a wwPDB chemical component typed for the Universal Force Field, in implicit or explicit water, with dynamics and free energies"
+keywords = ["chemistry", "force-field", "molecular-mechanics", "physics", "simulation"]
+categories = ["science", "simulation"]
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+# Kept in the repository and out of the published crate. `tests/amber/` holds ff14SB's
+# Lennard-Jones and residue types, read from ambermini, which is AmberTools 14 under GPL v3. The
+# values may well be facts rather than a work, but MIT OR Apache-2.0 should not rest on that.
+# `benzene_bound_in_tip3p.rs` uses them. `tests/gaff/` holds GAFF's van der Waals for octanol's five
+# types and benzene's two, read from the same ambermini's `gaff.dat`, and is kept out for the same
+# reason, with the three files that include it: `liquid_octanol_with_gaff.rs`,
+# `benzene_partitioned_into_octanol.rs` and `benzene_bound_in_tip3p.rs`; and `tests/hexadecane/`,
+# with `liquid_hexadecane_with_gaff.rs`, which use GAFF's `c3` and `hc` from it; and `tests/partition/`,
+# 4c-2's machinery shared with `benzene_partitioned_into_decane.rs`, both of which use it. FreeSolv's CC BY 4.0 mol2 in
+# `tests/freesolv/` needs only its attribution, which travels with it, so it stays.
+exclude = [
+    "tests/amber/",
+    "tests/benzene_bound_in_tip3p.rs",
+    "tests/benzene_partitioned_into_decane.rs",
+    "tests/benzene_partitioned_into_octanol.rs",
+    "tests/gaff/",
+    "tests/hexadecane/",
+    "tests/liquid_hexadecane_with_gaff.rs",
+    "tests/liquid_octanol_with_gaff.rs",
+    "tests/p_xylene_partitioned_into_octanol.rs",
+    "tests/phenol_partitioned_into_octanol.rs",
+    "tests/partition/",
+]
+
+[dependencies]
+pantometry-core = { workspace = true }
+pantometry-units = { workspace = true }
+
+[dev-dependencies]
+pantometry-core = { workspace = true }
+pantometry-units = { workspace = true }

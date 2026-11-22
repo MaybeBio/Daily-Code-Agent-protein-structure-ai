@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+
+import argparse
+import itertools
+import math
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pandas
+from _installed_package import configure_package_imports, package_subprocess_env
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+configure_package_imports(REPO_ROOT, installed='--installed' in sys.argv)
+
+from csubst import ete  # noqa: E402 - repository path is inserted above
+from csubst import tree  # noqa: E402 - repository path is inserted above
+from _safe_workdir import prepare_owned_workdir  # noqa: E402
+
+
+# Current defaults: joint substitution posteriors and no invariant-tip filter.
+# The earlier marginal/filtered snapshots are not equivalent analyses.
+EXPECTED = {
+    "PGK": {
+        "branch_id_1": 23,
+        "branch_id_2": 51,
+        "omegaCany2spe": 1.910709,
+        "convergent": 5,
+        "divergent": 7,
+        "blank": 405,
+    },
+    "PEPC": {
+        "branch_id_1": 9,
+        "branch_id_2": 108,
+        "omegaCany2spe": 0.030734,
+        "convergent": 0,
+        "divergent": 2,
+        "blank": 969,
+    },
+}
+
+# Deliberately allow broad hosted-runner variance while still failing on the
+# order-of-magnitude regressions that sparse/dense fallback bugs can cause.
+PERFORMANCE_LIMITS = {
+    "PGK": {
+        "analyze_elapsed_sec": 30.0,
+        "analyze_max_rss_kb": 800_000,
+        "site_elapsed_sec": 60.0,
+        "site_max_rss_kb": 800_000,
+    },
+    "PEPC": {
+        "analyze_elapsed_sec": 60.0,
+        "analyze_max_rss_kb": 1_200_000,
+        "site_elapsed_sec": 120.0,
+        "site_max_rss_kb": 1_200_000,
+    },
+}
+ELAPSED_BASELINE_MULTIPLIER = 2.0
+RSS_BASELINE_MULTIPLIER = 1.75
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run PGK/PEPC parity checks and capture runtime + peak RAM."
+    )
+    parser.add_argument('--installed', action='store_true', help='Validate the installed wheel and its bundled datasets.')
+    parser.add_argument('--numerical-only', action='store_true', help='Do not apply Linux performance limits (e.g. for macOS wheels).')
+    parser.add_argument(
+        "--output",
+        default="parity_metrics.tsv",
+        help="Output TSV path for collected metrics.",
+    )
+    parser.add_argument(
+        "--workdir",
+        default="parity_runs",
+        help="Temporary working directory for generated analysis files.",
+    )
+    parser.add_argument(
+        "--baseline",
+        default=str(REPO_ROOT / ".github" / "performance_baseline.tsv"),
+        help="Versioned Linux performance baseline TSV.",
+    )
+    return parser.parse_args()
+
+
+def parse_elapsed_seconds(elapsed_text):
+    elapsed_text = elapsed_text.strip()
+    if ":" not in elapsed_text:
+        return float(elapsed_text)
+    parts = [float(p) for p in elapsed_text.split(":")]
+    seconds = 0.0
+    for part in parts:
+        seconds = seconds * 60.0 + part
+    return seconds
+
+
+def parse_time_metrics(stderr_text):
+    # GNU time -v (Linux CI expected path)
+    m_elapsed = re.search(
+        r"Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*([0-9:.]+)",
+        stderr_text,
+    )
+    m_rss = re.search(
+        r"Maximum resident set size \(kbytes\):\s*([0-9]+)",
+        stderr_text,
+    )
+    if (m_elapsed is not None) and (m_rss is not None):
+        return parse_elapsed_seconds(m_elapsed.group(1)), int(m_rss.group(1))
+
+    # BSD time -l reports resident size in bytes.
+    m_elapsed_bsd = re.search(
+        r"^\s*([0-9.]+)\s+real\s+",
+        stderr_text,
+        flags=re.MULTILINE,
+    )
+    m_rss_bsd = re.search(
+        r"^\s*([0-9]+)\s+maximum resident set size\s*$",
+        stderr_text,
+        flags=re.MULTILINE,
+    )
+    if (m_elapsed_bsd is not None) and (m_rss_bsd is not None):
+        return float(m_elapsed_bsd.group(1)), int(m_rss_bsd.group(1)) // 1024
+
+    # POSIX time -p fallback (elapsed only)
+    m_elapsed_p = re.search(r"^real\s+([0-9.]+)$", stderr_text, flags=re.MULTILINE)
+    if m_elapsed_p is not None:
+        return float(m_elapsed_p.group(1)), -1
+
+    raise RuntimeError("Failed to parse timing metrics from /usr/bin/time output.")
+
+
+def run_timed_command(cmd, cwd, label, env=None):
+    if sys.platform.startswith("linux"):
+        wrapper = ["/usr/bin/time", "-v"]
+    elif sys.platform == "darwin":
+        wrapper = ["/usr/bin/time", "-l"]
+    else:
+        wrapper = ["/usr/bin/time", "-p"]
+    proc = subprocess.run(
+        wrapper + cmd,
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    log_path = Path(cwd) / (label + ".log.txt")
+    log_path.write_text(proc.stdout + "\n" + proc.stderr, encoding="utf-8")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Command failed ({}): {}\nSee {}".format(
+                proc.returncode, " ".join(cmd), str(log_path)
+            )
+        )
+    elapsed_sec, max_rss_kb = parse_time_metrics(proc.stderr)
+    return elapsed_sec, max_rss_kb
+
+
+def ensure_precomputed_iqtree_outputs(repo_root, dataset_name):
+    dataset_dir = repo_root / "csubst" / "dataset"
+    required = [
+        dataset_dir / f"{dataset_name}.alignment.fa",
+        dataset_dir / f"{dataset_name}.tree.nwk",
+        dataset_dir / f"{dataset_name}.alignment.fa.treefile",
+        dataset_dir / f"{dataset_name}.alignment.fa.state",
+        dataset_dir / f"{dataset_name}.alignment.fa.rate",
+        dataset_dir / f"{dataset_name}.alignment.fa.iqtree",
+        dataset_dir / f"{dataset_name}.alignment.fa.log",
+    ]
+    missing = [str(path) for path in required if not path.exists()]
+    if len(missing) > 0:
+        raise FileNotFoundError(
+            "Missing precomputed IQ-TREE outputs for {}:\n{}".format(
+                dataset_name, "\n".join(missing)
+            )
+        )
+    return required
+
+
+def read_iqtree_model(iqtree_report_path):
+    iqtree_report_path = Path(iqtree_report_path)
+    pattern = re.compile(r"^\s*Model of substitution:\s*(.+?)\s*$")
+    with iqtree_report_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            match = pattern.match(line)
+            if match is not None:
+                model = match.group(1).strip()
+                if model != "":
+                    return model
+                break
+    raise RuntimeError("Failed to read IQ-TREE model from {}".format(str(iqtree_report_path)))
+
+
+def write_pepc_foreground_file(repo_root, run_dir):
+    tree_file = repo_root / "csubst" / "dataset" / "PEPC.tree.nwk"
+    tr = ete.PhyloNode(str(tree_file), format=1)
+    tr = tree.add_numerical_node_labels(tr)
+    leaves = list(ete.iter_leaves(tr))
+    best = None
+    for leaf_a, leaf_b in itertools.combinations(leaves, 2):
+        dist = ete.get_distance(leaf_a, leaf_b, topology_only=False)
+        key = (dist, leaf_a.name, leaf_b.name)
+        if (best is None) or (key > best):
+            best = key
+    fg_path = Path(run_dir) / "PEPC.parity.foreground.txt"
+    with fg_path.open("w", encoding="utf-8") as handle:
+        # Foreground file names are regex patterns; anchor exact tip-name matches.
+        handle.write("1\t^{}$\n".format(re.escape(best[1])))
+        handle.write("2\t^{}$\n".format(re.escape(best[2])))
+    return fg_path
+
+
+def run_dataset(repo_root, run_root, dataset_name, installed=False):
+    run_dir = Path(run_root) / dataset_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    python_exe = sys.executable
+    data_root = configure_package_imports(repo_root, installed=installed)
+    dataset_dir = data_root / "csubst" / "dataset"
+    env = package_subprocess_env(repo_root, installed=installed)
+    ensure_precomputed_iqtree_outputs(repo_root=data_root, dataset_name=dataset_name)
+    iqtree_model = read_iqtree_model(dataset_dir / f"{dataset_name}.alignment.fa.iqtree")
+
+    if dataset_name == "PGK":
+        foreground = dataset_dir / "PGK.foreground.txt"
+    elif dataset_name == "PEPC":
+        foreground = write_pepc_foreground_file(repo_root=data_root, run_dir=run_dir)
+    else:
+        raise ValueError("Unsupported dataset: {}".format(dataset_name))
+
+    analyze_cmd = [
+        python_exe,
+        "-m",
+        "csubst",
+        "analyze",
+        "--outdir",
+        ".",
+        "--output_prefix",
+        "csubst",
+        "--alignment_file",
+        str(dataset_dir / f"{dataset_name}.alignment.fa"),
+        "--rooted_tree_file",
+        str(dataset_dir / f"{dataset_name}.tree.nwk"),
+        "--foreground",
+        str(foreground),
+        "--exhaustive_until",
+        "1",
+        "--threads",
+        "1",
+        "--float_digit",
+        "6",
+        "--iqtree_treefile",
+        str(dataset_dir / f"{dataset_name}.alignment.fa.treefile"),
+        "--iqtree_state",
+        str(dataset_dir / f"{dataset_name}.alignment.fa.state"),
+        "--iqtree_rate",
+        str(dataset_dir / f"{dataset_name}.alignment.fa.rate"),
+        "--iqtree_iqtree",
+        str(dataset_dir / f"{dataset_name}.alignment.fa.iqtree"),
+        "--iqtree_log",
+        str(dataset_dir / f"{dataset_name}.alignment.fa.log"),
+        "--iqtree_model",
+        iqtree_model,
+    ]
+    analyze_elapsed_sec, analyze_max_rss_kb = run_timed_command(
+        cmd=analyze_cmd,
+        cwd=run_dir,
+        label=f"{dataset_name}.analyze",
+        env=env,
+    )
+
+    cb_path = run_dir / "csubst_cb_2.tsv"
+    if not cb_path.exists():
+        raise FileNotFoundError("Missing analyze output: {}".format(str(cb_path)))
+    cb = pandas.read_csv(cb_path, sep="\t")
+    if cb.shape[0] < 1:
+        raise RuntimeError("No rows in {}".format(str(cb_path)))
+    cb = cb.sort_values(["branch_id_1", "branch_id_2"]).reset_index(drop=True)
+    row = cb.iloc[0]
+    branch_id_1 = int(row["branch_id_1"])
+    branch_id_2 = int(row["branch_id_2"])
+    omega = float(row["omegaCany2spe"])
+
+    branch_id_text = "{},{}".format(branch_id_1, branch_id_2)
+    site_outdir = "csubst_sites"
+    site_output_prefix = "csubst"
+    site_cmd = [
+        python_exe,
+        "-m",
+        "csubst",
+        "site",
+        "--outdir",
+        site_outdir,
+        "--output_prefix",
+        site_output_prefix,
+        "--alignment_file",
+        str(dataset_dir / f"{dataset_name}.alignment.fa"),
+        "--rooted_tree_file",
+        str(dataset_dir / f"{dataset_name}.tree.nwk"),
+        "--branch_id",
+        branch_id_text,
+        "--threads",
+        "1",
+        "--float_digit",
+        "6",
+        "--site_state_plot",
+        "no",
+        "--tree_site_plot",
+        "yes",
+        "--tree_site_plot_format",
+        "pdf",
+        "--min_single_prob",
+        "0.5",
+        "--min_combinat_prob",
+        "0.5",
+        "--tree_site_plot_max_sites",
+        "60",
+        "--iqtree_treefile",
+        str(dataset_dir / f"{dataset_name}.alignment.fa.treefile"),
+        "--iqtree_state",
+        str(dataset_dir / f"{dataset_name}.alignment.fa.state"),
+        "--iqtree_rate",
+        str(dataset_dir / f"{dataset_name}.alignment.fa.rate"),
+        "--iqtree_iqtree",
+        str(dataset_dir / f"{dataset_name}.alignment.fa.iqtree"),
+        "--iqtree_log",
+        str(dataset_dir / f"{dataset_name}.alignment.fa.log"),
+        "--iqtree_model",
+        iqtree_model,
+    ]
+    site_elapsed_sec, site_max_rss_kb = run_timed_command(
+        cmd=site_cmd,
+        cwd=run_dir,
+        label=f"{dataset_name}.site",
+        env=env,
+    )
+
+    tree_site_path = (
+        run_dir
+        / site_outdir
+        / f"{site_output_prefix}.branch_id{branch_id_text}"
+        / f"{site_output_prefix}.tree_site.tsv"
+    )
+    if not tree_site_path.exists():
+        raise FileNotFoundError("Missing site output: {}".format(str(tree_site_path)))
+    tree_site = pandas.read_csv(tree_site_path, sep="\t")
+    counts = tree_site["tree_site_category"].value_counts().to_dict()
+    convergent = int(counts.get("convergent", 0))
+    divergent = int(counts.get("divergent", 0))
+    blank = int(counts.get("blank", 0))
+
+    return {
+        "dataset": dataset_name,
+        "branch_id_1": branch_id_1,
+        "branch_id_2": branch_id_2,
+        "omegaCany2spe": omega,
+        "convergent": convergent,
+        "divergent": divergent,
+        "blank": blank,
+        "analyze_elapsed_sec": analyze_elapsed_sec,
+        "analyze_max_rss_kb": analyze_max_rss_kb,
+        "site_elapsed_sec": site_elapsed_sec,
+        "site_max_rss_kb": site_max_rss_kb,
+    }
+
+
+def validate_metrics(rows, baseline_path, numerical_only=False):
+    errors = []
+    baseline = None if numerical_only else pandas.read_csv(baseline_path, sep="\t").set_index("dataset")
+    for row in rows:
+        dataset = row["dataset"]
+        expected = EXPECTED[dataset]
+        for key in ["branch_id_1", "branch_id_2", "convergent", "divergent", "blank"]:
+            if int(row[key]) != int(expected[key]):
+                errors.append(
+                    "{}: expected {}={}, got {}".format(
+                        dataset, key, expected[key], row[key]
+                    )
+                )
+        if not math.isfinite(float(row["omegaCany2spe"])):
+            errors.append("{}: omegaCany2spe is non-finite".format(dataset))
+        elif abs(float(row["omegaCany2spe"]) - float(expected["omegaCany2spe"])) > 1e-6:
+            errors.append(
+                "{}: expected omegaCany2spe={}, got {}".format(
+                    dataset, expected["omegaCany2spe"], row["omegaCany2spe"]
+                )
+            )
+        if numerical_only:
+            continue
+        limits = PERFORMANCE_LIMITS[dataset]
+        for key in ["analyze_elapsed_sec", "site_elapsed_sec"]:
+            value = float(row[key])
+            if (not math.isfinite(value)) or value > float(limits[key]):
+                errors.append(
+                    "{}: {} {:.3f} exceeded {:.3f}".format(
+                        dataset, key, value, float(limits[key])
+                    )
+                )
+        if dataset not in baseline.index:
+            errors.append("{}: missing versioned performance baseline".format(dataset))
+            continue
+        baseline_row = baseline.loc[dataset]
+        for key in ["analyze_elapsed_sec", "site_elapsed_sec"]:
+            baseline_limit = float(baseline_row[key]) * ELAPSED_BASELINE_MULTIPLIER
+            if float(row[key]) > baseline_limit:
+                errors.append(
+                    "{}: {} {:.3f} exceeded baseline-relative limit {:.3f}".format(
+                        dataset, key, float(row[key]), baseline_limit
+                    )
+                )
+        for key in ["analyze_max_rss_kb", "site_max_rss_kb"]:
+            value = int(row[key])
+            baseline_limit = int(float(baseline_row[key]) * RSS_BASELINE_MULTIPLIER)
+            if value >= 0 and value > baseline_limit:
+                errors.append(
+                    "{}: {} {:,} exceeded baseline-relative limit {:,}".format(
+                        dataset, key, value, baseline_limit
+                    )
+                )
+        for key in ["analyze_max_rss_kb", "site_max_rss_kb"]:
+            value = int(row[key])
+            if value >= 0 and value > int(limits[key]):
+                errors.append(
+                    "{}: {} {:,} exceeded {:,}".format(
+                        dataset, key, value, int(limits[key])
+                    )
+                )
+    if len(errors) > 0:
+        raise RuntimeError("Parity check failed:\n- " + "\n- ".join(errors))
+
+
+def main():
+    args = parse_args()
+    repo_root = REPO_ROOT
+    run_root = prepare_owned_workdir(args.workdir, repo_root=repo_root)
+
+    rows = []
+    for dataset_name in ["PGK", "PEPC"]:
+        rows.append(
+            run_dataset(
+                repo_root=repo_root,
+                run_root=run_root,
+                dataset_name=dataset_name,
+                installed=args.installed,
+            )
+        )
+
+    validate_metrics(rows, baseline_path=Path(args.baseline).resolve(), numerical_only=args.numerical_only)
+
+    out_df = pandas.DataFrame(rows)
+    out_df = out_df.sort_values(by=["dataset"]).reset_index(drop=True)
+    out_path = Path(args.output).resolve()
+    out_df.to_csv(out_path, sep="\t", index=False)
+    print(out_df.to_string(index=False))
+    print("Wrote parity metrics: {}".format(str(out_path)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

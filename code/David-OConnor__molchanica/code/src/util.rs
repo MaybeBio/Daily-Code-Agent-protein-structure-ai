@@ -1,0 +1,1733 @@
+//! A collection of utility functions that don't neatly belong in other modules.
+//! For example, we may call some of these from the GUI, but they won't have any EGUI-specific
+//! logic in them.
+
+use std::{
+    f64::consts::TAU,
+    io,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+
+use bio_apis::pdbe::SiftsUniprotMapping;
+use bio_files::ResidueType;
+#[cfg(feature = "cudarc")]
+use cudarc::{
+    driver::{CudaContext, CudaFunction},
+    nvrtc::Ptx,
+};
+#[cfg(feature = "cuda")]
+use dynamics::ComputationDevice;
+use egui::Color32;
+use graphics::{ControlScheme, EngineUpdates, EntityUpdate, Scene};
+use lin_alg::{
+    f32::Vec3 as Vec3F32,
+    f64::{Quaternion, Vec3},
+};
+use mol_defs::{
+    molecules::{
+        Atom, Bond, Chain, MolGenericRefMut, MolType, MoleculeGeneric, Residue, aa_color,
+        common::MoleculeCommon, peptide::MoleculePeptide, small::MoleculeSmall,
+    },
+    sfc_mesh::{SOLVENT_RAD, make_sas_mesh},
+};
+
+use crate::{
+    drawing::{
+        COLOR_AA_NON_RESIDUE, EntityClass, HYDROPHOBICITY_MAX, HYDROPHOBICITY_MIN, MoleculeView,
+        color_alternating_contrast, color_viridis, color_viridis_float, effective_mol_view_peptide,
+        peptide::{draw_density_point_cloud, draw_peptide},
+        ribbon_mesh::build_ribbon_mesh,
+        wrappers::draw_all_ligs,
+    },
+    mol_manip::{ManipMode, PeptideMeshTransform, transform_peptide_mesh},
+    prefs::{OpenType, PREFS_SAVE_INTERVAL},
+    rdkit_smiles, reflection,
+    render::{
+        Color, MESH_OTHER_RIBBONS, MESH_PEP_SOLVENT_SURFACE, MESH_SECONDARY_STRUCTURE,
+        set_flashlight,
+    },
+    selection::Selection,
+    sfc_mesh,
+    state::{CamSnapshot, OperatingMode, ResColoring, State, StateUi},
+};
+
+pub const AMU_TO_KG: f64 = 1.660_539e-27;
+const KCAL_PER_MOL_A2_TO_N_PER_M: f64 = 0.694_77;
+const HZ_TO_PS_INV: f64 = 1.0e-12;
+
+/// Serialize a molecular graph with RDKit when it is available, otherwise use Molchanica.
+pub fn create_smiles(molecule: &MoleculeCommon) -> String {
+    if let Ok(python) = crate::external_tools::find_rdkit_python() {
+        match rdkit_smiles::serialize(&python, molecule) {
+            Ok(smiles) => {
+                println!("Created a SMILES string using RDKit.");
+                return smiles;
+            }
+            Err(error) => {
+                println!(
+                    "RDKit could not create a SMILES string ({error}). Falling back to Molchanica."
+                );
+            }
+        }
+    }
+
+    let smiles = molecule.to_smiles();
+    println!("Created a SMILES string using native computations (not RDKit).");
+    smiles
+}
+
+/// Parse user-supplied SMILES with RDKit when it is available, otherwise use Molchanica.
+pub fn parse_smiles(smiles: &str) -> io::Result<MoleculeCommon> {
+    if let Ok(python) = crate::external_tools::find_rdkit_python() {
+        return match rdkit_smiles::parse(&python, smiles) {
+            Ok(molecule) => {
+                println!("Parsed a SMILES string using RDKit.");
+                Ok(molecule)
+            }
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                println!("Attempted to parse a SMILES string using RDKit: {error}");
+                Err(error)
+            }
+            Err(error) => {
+                println!(
+                    "RDKit could not parse a SMILES string ({error}). Falling back to Molchanica."
+                );
+                parse_smiles_natively(smiles)
+            }
+        };
+    }
+
+    parse_smiles_natively(smiles)
+}
+
+fn parse_smiles_natively(smiles: &str) -> io::Result<MoleculeCommon> {
+    let molecule = MoleculeCommon::from_smiles(smiles);
+    if molecule.is_ok() {
+        println!("Parsed a SMILES string using native computations (not RDKit).");
+    } else {
+        println!("Attempted to parse a SMILES string using native computations (not RDKit).");
+    }
+    molecule
+}
+
+/// Used in places where we can redraw one or more of several molecule types.
+#[derive(Default, Debug)]
+pub struct RedrawFlags {
+    pub peptide: bool,
+    pub ligand: bool,
+    pub na: bool,
+    pub lipid: bool,
+    pub pocket: bool,
+}
+
+impl RedrawFlags {
+    pub fn set_all(&mut self) {
+        self.peptide = true;
+        self.ligand = true;
+        self.na = true;
+        self.lipid = true;
+        self.pocket = true;
+    }
+
+    pub fn set(&mut self, mol_type: MolType) {
+        match mol_type {
+            MolType::Peptide => self.peptide = true,
+            MolType::Ligand => self.ligand = true,
+            MolType::NucleicAcid => self.na = true,
+            MolType::Lipid => self.lipid = true,
+            MolType::Pocket => self.pocket = true,
+            _ => unimplemented!(),
+        }
+    }
+
+    pub fn set_from_sel(&mut self, sel: &Selection) {
+        use Selection::*;
+        match sel {
+            Atoms(_) => self.set_all(),
+            AtomPeptide(_) | AtomsPeptide(_) | Residue(_) | Residues(_) | BondPeptide(_) => {
+                self.peptide = true
+            }
+            AtomLig(_) | AtomsLig(_) | BondLig(_) | BondsLig(_) => self.ligand = true,
+            AtomNucleicAcid(_) | BondNucleicAcid(_) | ResiduesNucleicAcid(_) => self.na = true,
+            AtomLipid(_) | BondLipid(_) => self.lipid = true,
+            AtomPocket(_) | BondPocket(_) => self.pocket = true,
+            None | ComponentEditor(_) => (),
+        }
+    }
+}
+
+/// Formats an elapsed time in a suitable unit, e.g. "450ms", "12.3s", "3m 04s", or "1h 02m".
+pub fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+
+    if secs == 0 {
+        format!("{}ms", elapsed.as_millis())
+    } else if secs < 60 {
+        format!("{:.1}s", elapsed.as_secs_f32())
+    } else if secs < 3_600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m", secs / 3_600, (secs % 3_600) / 60)
+    }
+}
+
+/// Saves dirty preferences when their timer expires. A delay is returned only while a save is
+/// pending, so an otherwise idle application does not wake just to discover that nothing changed.
+pub fn check_prefs_save(state: &mut State) -> Option<Duration> {
+    if !state.to_save.save_flag {
+        state.volatile.last_prefs_save_check = None;
+        return None;
+    }
+
+    let interval = Duration::from_secs(PREFS_SAVE_INTERVAL);
+    let now = Instant::now();
+    let Some(last_check) = state.volatile.last_prefs_save_check else {
+        state.volatile.last_prefs_save_check = Some(now);
+        return Some(interval);
+    };
+
+    let elapsed = now.saturating_duration_since(last_check);
+    if elapsed < interval {
+        return Some(interval - elapsed);
+    }
+
+    state.volatile.last_prefs_save_check = Some(now);
+    state.update_save_prefs();
+    if state.to_save.save_flag {
+        // The save failed; retry on the next interval.
+        Some(interval)
+    } else {
+        state.volatile.last_prefs_save_check = None;
+        None
+    }
+}
+// todo: Update this A/R.
+
+// todo: Also calculate the dihedral angle using 3 bonds. (4 atoms).
+/// Bond_0 and bond_1 must share an atom. For now, we assume `bond_0`'s atom_1 is the same as
+/// `bond_1`'s atom_0.
+pub fn _bond_angle(atoms: &[Atom], bond_0: &Bond, bond_1: &Bond) -> f64 {
+    if bond_0.atom_1 != bond_1.atom_0 {
+        eprintln!("Error: bonds do not share an atom.");
+        return 0.;
+    }
+
+    let posit_0 = atoms[bond_0.atom_0].posit;
+    let posit_1 = atoms[bond_0.atom_1].posit; // Same as bond_1.atom_0.
+    let posit_2 = atoms[bond_1.atom_1].posit;
+
+    // Vectors from the central atom
+    let v1 = posit_0 - posit_1;
+    let v2 = posit_2 - posit_1;
+
+    let dot = v1.dot(v2);
+    let mag = v1.magnitude() * v2.magnitude();
+
+    if mag.abs() < 1e-9 {
+        // Avoid division by zero in degenerate cases
+        0.0
+    } else {
+        // Clamp to [-1.0, 1.0] to avoid numerical issues before acos
+        let mut cos_angle = dot / mag;
+        cos_angle = cos_angle.clamp(-1.0, 1.0);
+        cos_angle.acos().to_degrees()
+    }
+}
+
+/// Based on selection status and if a molecule is open, find the center for the orbit camera. This
+/// is generally around a specific atom, or a molecule's centroid.
+pub fn orbit_center(state: &State) -> Vec3F32 {
+    const ZERO: Vec3F32 = Vec3F32::new_zero();
+
+    if state.ui.orbit_selected_atom && state.volatile.operating_mode != OperatingMode::MolEditor {
+        match &state.ui.selection {
+            Selection::Atoms(_) | Selection::ResiduesNucleicAcid(_) => {
+                let points = crate::selection::expression::positions(state);
+                if !points.is_empty() {
+                    let sum = points
+                        .iter()
+                        .fold(Vec3F32::new_zero(), |sum, p| sum + Vec3F32::from(*p));
+                    return sum / points.len() as f32;
+                }
+            }
+            Selection::AtomPeptide(i) => {
+                if let Some(mol) = state
+                    .peptide_for_tools_i()
+                    .and_then(|i| state.peptides.get(i))
+                    && let Some(p) = mol.common.atom_posits.get(*i)
+                {
+                    return (*p).into();
+                }
+            }
+            Selection::AtomLig((i_mol, i_atom)) => {
+                return match state.get_small(*i_mol) {
+                    Some(m) => m.common.atom_posits[*i_atom].into(),
+                    None => {
+                        eprintln!("Error: Invalid lig index for orbit center");
+                        return ZERO;
+                    }
+                };
+            }
+            Selection::AtomsLig((i_mol, is_atom)) => {
+                if i_mol >= &state.ligands.len() {
+                    eprintln!("Error: Invalid lig index for orbit center");
+                    return ZERO;
+                }
+                let mol = &state.ligands[*i_mol];
+
+                let mut ctr = ZERO;
+                for i in is_atom {
+                    if let Some(p) = mol.common.atom_posits.get(*i) {
+                        let p: Vec3F32 = (*p).into();
+                        ctr += p
+                    }
+                }
+                return ctr / is_atom.len() as f32;
+            }
+            Selection::AtomNucleicAcid((i_mol, i_atom)) => {
+                return match state.get_nucleic_acid(*i_mol) {
+                    Some(m) => m.common.atom_posits[*i_atom].into(),
+                    None => {
+                        eprintln!("Error: Invalid nucleic acid index for orbit center");
+                        return ZERO;
+                    }
+                };
+            }
+            Selection::AtomLipid((i_mol, i_atom)) => {
+                return match state.get_lipid(*i_mol) {
+                    Some(l) => l.common.atom_posits[*i_atom].into(),
+                    None => {
+                        eprintln!("Error: Invalid lipid index for orbit center");
+                        return ZERO;
+                    }
+                };
+            }
+            Selection::AtomPocket((i_mol, i_atom)) => {
+                return match state.get_pocket(*i_mol) {
+                    Some(l) => l.common.atom_posits[*i_atom].into(),
+                    None => {
+                        eprintln!("Error: Invalid pocket index for orbit center");
+                        return ZERO;
+                    }
+                };
+            }
+            Selection::Residue(i) => {
+                if let Some(mol) = state
+                    .peptide_for_tools_i()
+                    .and_then(|i| state.peptides.get(i))
+                {
+                    match mol.residues.get(*i) {
+                        Some(res) => {
+                            match mol.common.atom_posits.get(match res.atoms.first() {
+                                Some(a) => *a, // todo: What?
+                                None => return ZERO,
+                            }) {
+                                Some(p) => return (*p).into(),
+                                None => return ZERO,
+                            }
+                        }
+                        None => return ZERO,
+                    }
+                }
+            }
+            Selection::Residues(idxs) => {
+                if let Some(mol) = state
+                    .peptide_for_tools_i()
+                    .and_then(|i| state.peptides.get(i))
+                    && !idxs.is_empty()
+                {
+                    // DRY with single Residue branch.
+                    match mol.residues.get(idxs[0]) {
+                        Some(res) => {
+                            match mol.common.atom_posits.get(match res.atoms.first() {
+                                Some(a) => *a, // todo: What?
+                                None => return ZERO,
+                            }) {
+                                Some(p) => return (*p).into(),
+                                None => return ZERO,
+                            }
+                        }
+                        None => return ZERO,
+                    }
+                }
+            }
+            Selection::AtomsPeptide(is) => {
+                if let Some(mol) = state
+                    .peptide_for_tools_i()
+                    .and_then(|i| state.peptides.get(i))
+                {
+                    let mut ctr = ZERO;
+                    for i in is {
+                        if let Some(p) = mol.common.atom_posits.get(*i) {
+                            let p: Vec3F32 = (*p).into();
+                            ctr += p;
+                        }
+                    }
+                    return ctr / is.len() as f32;
+                }
+            }
+            Selection::BondPeptide(i_atom) => {
+                if let Some(mol) = state
+                    .peptide_for_tools_i()
+                    .and_then(|i| state.peptides.get(i))
+                    && let Some(bond) = mol.common.bonds.get(*i_atom)
+                {
+                    return ((mol.common.atom_posits[bond.atom_0]
+                        + mol.common.atom_posits[bond.atom_1])
+                        / 2.)
+                        .into();
+                }
+            }
+            Selection::BondLig((i_mol, i_bond)) => {
+                let mol = &state.ligands[*i_mol];
+                let bond = &mol.common.bonds[*i_bond];
+
+                return ((mol.common.atom_posits[bond.atom_0]
+                    + mol.common.atom_posits[bond.atom_1])
+                    / 2.)
+                    .into();
+            }
+            Selection::BondsLig((i_mol, is_bond)) => {
+                let mol = &state.ligands[*i_mol];
+
+                let mut ctr = ZERO;
+                for i_bond in is_bond {
+                    if *i_bond >= mol.common.bonds.len() {
+                        eprintln!("Error: Bond out of bounds");
+                        return ZERO;
+                    }
+
+                    let bond = &mol.common.bonds[*i_bond];
+
+                    let bond_ctr: Vec3F32 = ((mol.common.atom_posits[bond.atom_0]
+                        + mol.common.atom_posits[bond.atom_1])
+                        / 2.)
+                        .into();
+
+                    ctr += bond_ctr
+                }
+                return ctr / is_bond.len() as f32;
+            }
+            Selection::BondNucleicAcid((i_mol, i_bond)) => {
+                let mol = &state.nucleic_acids[*i_mol];
+                let bond = &mol.common.bonds[*i_bond];
+                return ((mol.common.atom_posits[bond.atom_0]
+                    + mol.common.atom_posits[bond.atom_1])
+                    / 2.)
+                    .into();
+            }
+            Selection::BondLipid((i_mol, i_bond)) => {
+                let mol = &state.lipids[*i_mol];
+                let bond = &mol.common.bonds[*i_bond];
+                return ((mol.common.atom_posits[bond.atom_0]
+                    + mol.common.atom_posits[bond.atom_1])
+                    / 2.)
+                    .into();
+            }
+            Selection::BondPocket((i_mol, i_bond)) => {
+                let mol = &state.pockets[*i_mol];
+                let bond = &mol.common.bonds[*i_bond];
+                return ((mol.common.atom_posits[bond.atom_0]
+                    + mol.common.atom_posits[bond.atom_1])
+                    / 2.)
+                    .into();
+            }
+            // Fall through to the orbit molecule's centroid.
+            Selection::ComponentEditor(_) | Selection::None => {}
+        }
+    }
+
+    // Orbit around the selected molecule's centroid. Failing that, the origin.
+    let Some((mol_type, i)) = &state.volatile.orbit_center else {
+        return ZERO;
+    };
+
+    match state.get_mol(*mol_type, *i) {
+        Some(m) => m.common().centroid().into(),
+        None => ZERO,
+    }
+}
+
+/// A helper fn. Maps from a global index, to a local atom from a subset.
+pub fn find_atom<'a>(atoms: &'a [Atom], indices: &[usize], i_to_find: usize) -> Option<&'a Atom> {
+    for (i_set, atom) in atoms.iter().enumerate() {
+        if indices[i_set] == i_to_find {
+            return Some(atom);
+        }
+    }
+
+    None
+}
+
+pub fn save_snap(state: &mut State, scene: &Scene, name: &str) {
+    let mut snapshot = CamSnapshot::from_cam(&scene.camera, name.to_owned());
+    snapshot.scene = Some(crate::inspection::SceneState::capture(state, scene));
+    let index = state
+        .cam_snapshots
+        .iter()
+        .position(|s| s.name.eq_ignore_ascii_case(name.trim()));
+    let index = if let Some(index) = index {
+        state.cam_snapshots[index] = snapshot;
+        index
+    } else {
+        state.cam_snapshots.push(snapshot);
+        state.cam_snapshots.len() - 1
+    };
+    state.ui.cam_snapshot_name = String::new();
+
+    state.ui.cam_snapshot = Some(index);
+
+    state.update_save_prefs();
+}
+
+// The snap must be set in state.ui.cam_snapshot ahead of calling this.
+pub fn load_snap(state: &mut State, scene: &mut Scene, engine_updates: &mut EngineUpdates) {
+    if let Some(appearance) = state
+        .ui
+        .cam_snapshot
+        .and_then(|i| state.cam_snapshots.get(i))
+        .and_then(|s| s.scene.clone())
+    {
+        appearance.apply(state, scene, engine_updates);
+        state.volatile.flags.scene_restored = true;
+    }
+    if let Some(snap_i) = state.ui.cam_snapshot {
+        match state.cam_snapshots.get(snap_i) {
+            Some(snap) => {
+                scene.camera.position = snap.position;
+                scene.camera.orientation = snap.orientation;
+                scene.camera.far = snap.far;
+
+                scene.camera.update_proj_mat(); // In case `far` etc changed.
+                engine_updates.camera = true;
+
+                if snap.scene.is_none() {
+                    set_flashlight(scene);
+                }
+                engine_updates.lighting = true;
+            }
+            None => {
+                eprintln!("Error: Could not find snapshot {}", snap_i);
+            }
+        }
+    }
+}
+
+/// Utility function that prints to stderr, and the CLI output. Sets the out flag.
+pub fn handle_err(ui: &mut StateUi, msg: String) {
+    eprintln!("{msg}");
+    ui.cmd_line_output = msg;
+    ui.cmd_line_out_is_err = true;
+}
+
+/// Utility function that prints to stdout, and the CLI output. Sets the out flag.
+pub fn handle_success(ui: &mut StateUi, msg: String) {
+    println!("{msg}");
+    ui.cmd_line_output = msg;
+    ui.cmd_line_out_is_err = false;
+}
+
+pub fn clear_cli_out(ui: &mut StateUi) {
+    ui.cmd_line_output = String::new();
+    ui.cmd_line_out_is_err = false;
+}
+
+pub fn close_peptide(
+    i: usize,
+    state: &mut State,
+    scene: &mut Scene,
+    engine_updates: &mut EngineUpdates,
+) {
+    if i >= state.peptides.len() {
+        eprintln!("Error: Out-of-bounds peptide index when closing");
+        return;
+    }
+
+    let path = state.peptides[i].common.path.clone();
+    let mol = mol_defs::molecules::MolGenericRef::Peptide(&state.peptides[i]);
+    let key = crate::selection::expression::object_key(&mol);
+
+    state.peptides.remove(i);
+    crate::protein_alignment::clear_comparison_view_of(state, &key);
+    clear_peptide_meshes(state, scene, engine_updates);
+    state
+        .volatile
+        .thread_receivers
+        .mol_pending_data_avail
+        .retain(|(peptide_i, _)| *peptide_i != i);
+    for (peptide_i, _) in &mut state.volatile.thread_receivers.mol_pending_data_avail {
+        if *peptide_i > i {
+            *peptide_i -= 1;
+        }
+    }
+    state
+        .volatile
+        .thread_receivers
+        .sifts_mapping_avail
+        .retain(|(peptide_i, _)| *peptide_i != i);
+    for (peptide_i, _) in &mut state.volatile.thread_receivers.sifts_mapping_avail {
+        if *peptide_i > i {
+            *peptide_i -= 1;
+        }
+    }
+    state.volatile.md_local.mol_dynamics = None;
+
+    scene.entities.retain(|ent| {
+        ent.class != EntityClass::Protein as u32
+            && ent.class != EntityClass::DensityPoint as u32
+            && ent.class != EntityClass::DensitySurface as u32
+            && ent.class != EntityClass::SecondaryStructure as u32
+            && ent.class != EntityClass::SaSurface as u32
+            && ent.class != EntityClass::SaSurfaceDots as u32
+    });
+    clear_mol_entity_indices(state, None);
+
+    if let Some(path) = path {
+        for history in &mut state.to_save.open_history {
+            if matches!(history.type_, OpenType::Peptide | OpenType::Map) && history.path == path {
+                history.last_session = false;
+            }
+        }
+    }
+
+    let active_peptide = state.peptides.len().checked_sub(1);
+    state.volatile.active_mol = active_peptide.map(|i| (MolType::Peptide, i));
+    state.volatile.active_peptide = active_peptide;
+    state.volatile.flags.ss_mesh_created = false;
+    state.volatile.flags.sas_mesh_created = false;
+    state.volatile.set_aa_seq(state.peptides.last());
+
+    state.update_save_prefs();
+    engine_updates.entities = EntityUpdate::All;
+
+    let orbit_was_closed =
+        matches!(state.volatile.orbit_center, Some((MolType::Peptide, orbit_i)) if orbit_i == i);
+    if let Some((MolType::Peptide, orbit_i)) = &mut state.volatile.orbit_center
+        && *orbit_i > i
+    {
+        *orbit_i -= 1;
+    }
+    if orbit_was_closed {
+        reset_orbit_center(state, scene);
+    }
+
+    if matches!(
+        state.ui.selection,
+        Selection::AtomPeptide(_)
+            | Selection::AtomsPeptide(_)
+            | Selection::BondPeptide(_)
+            | Selection::Residue(_)
+            | Selection::Residues(_)
+    ) {
+        state.ui.selection = Selection::None;
+    }
+}
+
+fn clear_peptide_meshes(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    for slot in [
+        MESH_PEP_SOLVENT_SURFACE,
+        crate::render::MESH_DENSITY_SURFACE,
+        MESH_SECONDARY_STRUCTURE,
+        MESH_OTHER_RIBBONS,
+    ] {
+        scene.meshes[slot] = graphics::Mesh::default();
+    }
+    state.volatile.flags.ss_mesh_created = false;
+    state.volatile.flags.sas_mesh_created = false;
+    state.volatile.thread_receivers.peptide_mesh_coloring = None;
+    updates.meshes = true;
+}
+
+pub fn release_unused_scene_memory(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+) {
+    if !updates.meshes && !matches!(updates.entities, EntityUpdate::All) {
+        return;
+    }
+
+    let mut occupied = vec![false; scene.meshes.len()];
+    for pocket in state.pockets.iter().chain(
+        state
+            .ligands
+            .iter()
+            .filter_map(|lig| lig.pharmacophore.pocket.as_ref()),
+    ) {
+        if let Some(slot) = occupied.get_mut(crate::render::MESH_POCKET_START + pocket.mesh_i_rel) {
+            *slot = true;
+        }
+    }
+    for entity in &scene.entities {
+        if let Some(slot) = occupied.get_mut(entity.mesh) {
+            *slot = true;
+        }
+    }
+    for (slot, mesh) in scene
+        .meshes
+        .iter_mut()
+        .enumerate()
+        .skip(crate::render::MESH_POCKET_START)
+    {
+        if !occupied[slot] && (mesh.vertices.capacity() != 0 || mesh.indices.capacity() != 0) {
+            *mesh = graphics::Mesh::default();
+            updates.meshes = true;
+        }
+    }
+
+    if state.peptides.is_empty()
+        && [
+            MESH_PEP_SOLVENT_SURFACE,
+            crate::render::MESH_DENSITY_SURFACE,
+            MESH_SECONDARY_STRUCTURE,
+            MESH_OTHER_RIBBONS,
+        ]
+        .iter()
+        .any(|&slot| !scene.meshes[slot].vertices.is_empty())
+    {
+        clear_peptide_meshes(state, scene, updates);
+    }
+
+    if scene.entities.capacity() > scene.entities.len().saturating_mul(4).max(1024) {
+        scene
+            .entities
+            .shrink_to(scene.entities.len().saturating_mul(2));
+    }
+    if scene.gaussians.capacity() > scene.gaussians.len().saturating_mul(4).max(1024) {
+        scene
+            .gaussians
+            .shrink_to(scene.gaussians.len().saturating_mul(2));
+    }
+}
+
+/// Close the active molecule.
+pub fn close_mol(
+    mol_type: MolType,
+    i: usize,
+    state: &mut State,
+    scene: &mut Scene,
+    redraw: &mut RedrawFlags,
+    updates: &mut EngineUpdates,
+) {
+    state.volatile.mol_manip.mode = ManipMode::None;
+    if state.ui.join_ligand.take().is_some() {
+        redraw.ligand = true;
+    }
+
+    let path = {
+        let Some(mol) = state.get_mol(mol_type, i) else {
+            eprintln!("Error: Out of bounds when closing a mol");
+            return;
+        };
+
+        mol.common().path.clone()
+    };
+
+    #[cfg(feature = "sonification")]
+    state.volatile.update_playing_audio_after_close(mol_type, i);
+
+    if let Some(path) = path {
+        for history in &mut state.to_save.open_history {
+            let ot: OpenType = mol_type.into();
+            if ot == history.type_ && history.path == path {
+                history.last_session = false;
+            }
+        }
+    }
+
+    match mol_type {
+        MolType::Peptide => {
+            close_peptide(i, state, scene, updates);
+        }
+        MolType::Ligand => {
+            state.ligands.remove(i);
+            crate::drawing::wrappers::draw_all_pockets(state, scene, updates);
+
+            if state.ligands.is_empty() {
+                state.volatile.active_mol = None;
+            } else {
+                state.volatile.active_mol = Some((MolType::Ligand, state.ligands.len() - 1));
+            }
+
+            state.update_save_prefs();
+        }
+        // todo: DRY
+        MolType::NucleicAcid => {
+            state.nucleic_acids.remove(i);
+
+            if state.nucleic_acids.is_empty() {
+                state.volatile.active_mol = None;
+            } else {
+                state.volatile.active_mol =
+                    Some((MolType::NucleicAcid, state.nucleic_acids.len() - 1));
+            }
+        }
+        MolType::Lipid => {
+            state.lipids.remove(i);
+
+            if state.lipids.is_empty() {
+                state.volatile.active_mol = None;
+            } else {
+                state.volatile.active_mol = Some((MolType::Lipid, state.lipids.len() - 1));
+            }
+        }
+        MolType::Pocket => {
+            state.pockets.remove(i);
+            crate::drawing::wrappers::draw_all_pockets(state, scene, updates);
+
+            if state.pockets.is_empty() {
+                state.volatile.active_mol = None;
+            } else {
+                state.volatile.active_mol = Some((MolType::Pocket, state.pockets.len() - 1));
+            }
+        }
+        MolType::Water => (),
+    }
+
+    state.ui.mol_picker.on_close(mol_type, i);
+    redraw.set(mol_type);
+
+    if let Some((orbit_mol_type, orbit_i)) = &state.volatile.orbit_center
+        && (*orbit_mol_type, *orbit_i) == (mol_type, i)
+    {
+        reset_orbit_center(state, scene);
+    }
+
+    // Prevents out of bounds.
+    // todo: This is overkill, but a safe option for now.
+    // if matches!(self.ui.selection, Selection::AtomPeptide(_) | Selection::AtomsPeptide(_) | Selection::BondPeptide(_)) {
+    state.ui.selection = Selection::None;
+    // }
+}
+
+pub fn reset_orbit_center(state: &mut State, scene: &mut Scene) {
+    // Reset the arc center, if in that camera mode, and molecule was the active one.
+
+    if !state.peptides.is_empty() {
+        state.volatile.orbit_center = Some((MolType::Peptide, state.peptides.len() - 1));
+    } else if !state.ligands.is_empty() {
+        state.volatile.orbit_center = Some((MolType::Ligand, state.ligands.len() - 1));
+    } else if !state.nucleic_acids.is_empty() {
+        state.volatile.orbit_center = Some((MolType::NucleicAcid, state.nucleic_acids.len() - 1));
+    } else if !state.lipids.is_empty() {
+        state.volatile.orbit_center = Some((MolType::Lipid, state.lipids.len() - 1));
+    }
+
+    if let ControlScheme::Arc { center } = &mut scene.input_settings.control_scheme {
+        *center = orbit_center(state);
+    }
+}
+
+/// Code here is activated by flags. It's organized here, where we have access to the Scene.
+/// These flags are set in places that don't have access to the scene.
+pub fn handle_scene_flags(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    // Ribbon colors live on mesh vertices rather than entities. Any selection path (mouse,
+    // keyboard, search, sequence panel, or clear) therefore needs a mesh rebuild when its value
+    // changes.
+    if state.ui.mol_view_peptide == MoleculeView::Ribbon
+        && state.volatile.flags.ss_mesh_selection != state.ui.selection
+        && (state.volatile.flags.ss_mesh_selection.is_peptide() || state.ui.selection.is_peptide())
+    {
+        state.volatile.flags.update_ss_mesh = true;
+    }
+
+    if state.volatile.flags.new_mol_loaded {
+        state.volatile.flags.new_mol_loaded = false;
+
+        set_flashlight(scene);
+        updates.lighting = true;
+    }
+
+    if state.volatile.flags.new_density_loaded {
+        state.volatile.flags.new_density_loaded = false;
+
+        if let Some(mol) = state
+            .peptide_for_tools_i()
+            .and_then(|i| state.peptides.get(i))
+            && !state.ui.visibility.hide_density_point_cloud
+            && let Some(density) = &mol.elec_density
+        {
+            draw_density_point_cloud(&mut scene.entities, density);
+            clear_mol_entity_indices(state, None);
+            updates.entities = EntityUpdate::All;
+            // engine_updates
+            //     .entities
+            //     .push_class(EntityClass::DensityPoint as u32);
+            return;
+        }
+    }
+
+    if state.volatile.flags.clear_density_drawing {
+        state.volatile.flags.clear_density_drawing = false;
+
+        scene.entities.retain(|ent| {
+            ent.class != EntityClass::DensityPoint as u32
+                && ent.class != EntityClass::DensitySurface as u32
+        });
+        clear_mol_entity_indices(state, None);
+    }
+
+    if state.volatile.flags.make_density_iso_mesh {
+        state.volatile.flags.make_density_iso_mesh = false;
+        reflection::make_density_mesh(state, scene, updates);
+    }
+
+    if state.volatile.flags.update_ss_mesh {
+        state.volatile.flags.update_ss_mesh = false;
+        state.volatile.flags.ss_mesh_created = true;
+        state.volatile.mol_manip.ribbon_mesh_transform = PeptideMeshTransform::default();
+
+        let selected_peptide = state.peptide_for_tools_i();
+        state.volatile.flags.ss_mesh_peptide = selected_peptide;
+        state.volatile.flags.ss_mesh_visible = state
+            .peptides
+            .iter()
+            .map(|mol| mol.common.visible())
+            .collect();
+
+        if let Some(mol) = selected_peptide.and_then(|i| state.peptides.get(i)) {
+            scene.meshes[MESH_SECONDARY_STRUCTURE] = build_ribbon_mesh(
+                &mol.secondary_structure,
+                &mol.common.atoms,
+                &mol.common.bonds,
+                &mol.common.atom_posits,
+                &mol.residues,
+                &mol.chains,
+                &mol.hidden_residues,
+                state.ui.res_coloring,
+                state.ui.view_sel_level,
+                &state.ui.selection,
+                &crate::inspection::ribbon_colors(state, mol),
+                mol.sifts_mapping.as_deref(),
+            );
+        } else {
+            scene.meshes[MESH_SECONDARY_STRUCTURE] = graphics::Mesh::default();
+        }
+        state.volatile.flags.ss_mesh_selection = state.ui.selection.clone();
+
+        let mut other_ribbons = graphics::Mesh::default();
+        for (mol_i, mol) in state.peptides.iter().enumerate() {
+            if Some(mol_i) == selected_peptide
+                || !mol.common.visible()
+                || !crate::drawing::representations::default_visible(
+                    state,
+                    &mol_defs::molecules::MolGenericRef::Peptide(mol),
+                )
+                || effective_mol_view_peptide(state, mol_i) != MoleculeView::Ribbon
+            {
+                continue;
+            }
+
+            let mut mesh = build_ribbon_mesh(
+                &mol.secondary_structure,
+                &mol.common.atoms,
+                &mol.common.bonds,
+                &mol.common.atom_posits,
+                &mol.residues,
+                &mol.chains,
+                &mol.hidden_residues,
+                state.ui.res_coloring,
+                state.ui.view_sel_level,
+                &Selection::None,
+                &crate::inspection::ribbon_colors(state, mol),
+                mol.sifts_mapping.as_deref(),
+            );
+            let vertex_offset = other_ribbons.vertices.len();
+            other_ribbons.vertices.append(&mut mesh.vertices);
+            other_ribbons
+                .indices
+                .extend(mesh.indices.into_iter().map(|index| index + vertex_offset));
+        }
+        scene.meshes[MESH_OTHER_RIBBONS] = other_ribbons;
+        updates.meshes = true;
+
+        // The rebuilt mesh is already in current world coordinates. An entity drawn before this
+        // rebuild (e.g. by a selection click's peptide redraw) still carries the accumulated
+        // manipulation transform; reset it, or that transform is applied a second time.
+        let mut entity_changed = false;
+        for entity in &mut scene.entities {
+            if entity.class == EntityClass::SecondaryStructure as u32
+                && entity.mesh == MESH_SECONDARY_STRUCTURE
+            {
+                entity.position = Vec3F32::new_zero();
+                entity.orientation = lin_alg::f32::Quaternion::new_identity();
+                entity.pivot = None;
+                entity_changed = true;
+            }
+        }
+        if entity_changed {
+            updates
+                .entities
+                .push_class(EntityClass::SecondaryStructure as u32);
+        }
+    }
+
+    if state.volatile.flags.update_sas_mesh {
+        state.volatile.flags.update_sas_mesh = false;
+
+        if let Some(mol) = state
+            .peptide_for_tools_i()
+            .and_then(|i| state.peptides.get(i))
+        {
+            let atoms: Vec<(Vec3F32, _)> = mol
+                .common
+                .atoms
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| !a.hetero)
+                .map(|(i, a)| (mol.common.atom_posits[i].into(), a.element.vdw_radius()))
+                .collect();
+
+            if atoms.len() > 20_000 {
+                // Skip surface mesh for large proteins to avoid vertex buffer overflow.
+            } else {
+                state.volatile.flags.sas_mesh_created = true;
+                state.volatile.mol_manip.surface_mesh_transform = PeptideMeshTransform::default();
+
+                scene.meshes[MESH_PEP_SOLVENT_SURFACE] = {
+                    let mut precision = state.to_save.sa_surface_precision;
+
+                    if atoms.len() > 10_000 {
+                        precision = 0.6;
+                    }
+
+                    make_sas_mesh(&atoms, SOLVENT_RAD, precision)
+                };
+
+                {
+                    let (tx, rx) = mpsc::channel();
+                    let mesh_for_thread = scene.meshes[MESH_PEP_SOLVENT_SURFACE].clone();
+                    let mol_for_thread = mol.common.clone();
+                    let coloring = state.ui.mesh_coloring;
+                    let residue_colors = crate::inspection::residue_colors(state, mol);
+                    let atom_colors = crate::inspection::atom_colors(
+                        state,
+                        &mol_defs::molecules::MolGenericRef::Peptide(mol),
+                    );
+
+                    thread::spawn(move || {
+                        let mut updates = EngineUpdates::default();
+                        let colors = sfc_mesh::get_mesh_colors_with_atoms(
+                            &mesh_for_thread,
+                            &mol_for_thread,
+                            coloring,
+                            &residue_colors,
+                            &atom_colors,
+                            &mut updates,
+                        );
+                        let _ = tx.send(colors);
+                    });
+
+                    state.volatile.thread_receivers.peptide_mesh_coloring = Some(rx);
+                }
+
+                // We draw the molecule here
+                if matches!(
+                    state.ui.mol_view_peptide,
+                    MoleculeView::Dots | MoleculeView::Surface
+                ) {
+                    // The dots are drawn from the mesh vertices
+                    draw_peptide(state, scene, updates);
+                }
+
+                updates.meshes = true;
+            } // else (atoms.len() <= 20_000)
+        }
+    }
+
+    if state.volatile.flags.update_sas_coloring
+        && let Some(mol) = state
+            .peptide_for_tools_i()
+            .and_then(|i| state.peptides.get(i))
+    {
+        state.volatile.flags.update_sas_coloring = false;
+
+        let (tx, rx) = mpsc::channel();
+        let mut mesh_for_thread = scene.meshes[MESH_PEP_SOLVENT_SURFACE].clone();
+        transform_peptide_mesh(
+            &mut mesh_for_thread,
+            state.volatile.mol_manip.surface_mesh_transform,
+        );
+        let mol_for_thread = mol.common.clone();
+        let coloring = state.ui.mesh_coloring;
+        let residue_colors = crate::inspection::residue_colors(state, mol);
+        let atom_colors = crate::inspection::atom_colors(
+            state,
+            &mol_defs::molecules::MolGenericRef::Peptide(mol),
+        );
+
+        thread::spawn(move || {
+            let mut eu = EngineUpdates::default();
+            let colors = sfc_mesh::get_mesh_colors_with_atoms(
+                &mesh_for_thread,
+                &mol_for_thread,
+                coloring,
+                &residue_colors,
+                &atom_colors,
+                &mut eu,
+            );
+            let _ = tx.send(colors);
+        });
+
+        state.volatile.thread_receivers.peptide_mesh_coloring = Some(rx);
+    }
+}
+
+pub fn make_egui_color(color: Color) -> Color32 {
+    Color32::from_rgb(
+        (color.0 * 255.) as u8,
+        (color.1 * 255.) as u8,
+        (color.2 * 255.) as u8,
+    )
+}
+
+/// Align the ligand to a residue on a molecule. This is generally a hetero copy of the ligand,
+/// as part of the protein's coordinate file. Attempt to match atoms exactly; this requires the ligand's
+/// atom labels to match that in the residue.. If not,
+/// use a flexible conformation, or match partly.
+///
+/// Return a center suitable for docking.
+pub fn move_mol_to_res(
+    mol: &mut MolGenericRefMut,
+    peptide: &MoleculePeptide,
+    res: &Residue,
+) -> Vec3 {
+    // todo: Pick center-of-mass atom, or better yet, match it to the anchor atom.
+    let posit = peptide.common.atom_posits[res.atoms[0]];
+
+    // todo: YOu need to add hydrogens to hetero atoms.
+
+    for lig_i in 0..mol.common().atoms.len() {
+        let lig_type_in_res = { &mol.common().atoms[lig_i].type_in_res };
+        if lig_type_in_res.is_none() {
+            continue;
+        }
+        let mut found = false;
+
+        for i in &res.atoms {
+            let atom_res = &peptide.common.atoms[*i];
+            if atom_res.type_in_res.is_none() {
+                continue;
+            }
+
+            if atom_res.type_in_res == *lig_type_in_res {
+                mol.common_mut().atom_posits[lig_i] = peptide.common.atom_posits[*i];
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // todo: If it's just a few, automatically position based on geometry to the positioned atoms.
+            eprintln!("Unable to position a ligand atom based on the residue.");
+        }
+    }
+
+    posit
+}
+
+/// A helper used, for example, for orienting double bonds. Finds an arbitrary neighbor to the bond.
+/// Returns neighbor's index. Return the index instead of posit for flexibility, e.g. with lig.common.atom_posits.
+/// Returns (index, if index is from atom 1). This is important for knowing which side we're working with.
+///
+/// Note: We don't take Hydrogens into account, because they confuse the situation of aromatic rings.
+pub fn find_neighbor_posit(
+    adj_list: &[Vec<usize>],
+    atom_0: usize,
+    atom_1: usize,
+    hydrogen_is: &[bool],
+) -> Option<(usize, bool)> {
+    // let neighbors_0 = &mol.adjacency_list[atom_0];
+    let neighbors_0 = &adj_list[atom_0];
+
+    if neighbors_0.len() >= 2 {
+        for neighbor in neighbors_0 {
+            if *neighbor != atom_1 && !hydrogen_is[*neighbor] {
+                return Some((*neighbor, false));
+            }
+        }
+    }
+
+    // let neighbors_1 = &mol.adjacency_list[atom_1];
+    let neighbors_1 = &adj_list[atom_1];
+
+    if neighbors_1.len() >= 2 {
+        for neighbor in neighbors_1 {
+            if *neighbor != atom_0 && !hydrogen_is[*neighbor] {
+                return Some((*neighbor, true));
+            }
+        }
+    }
+
+    None
+}
+
+/// Finds the centroid of atoms forming the smallest ring that contains the bond (atom_0, atom_1).
+/// Uses BFS from atom_1 back to atom_0 while forbidding the direct edge, which traces the ring.
+/// The returned centroid is always inside the ring regardless of substituents or adjacency order.
+/// Returns None if the bond is not part of any ring.
+pub fn aromatic_ring_centroid(
+    adj_list: &[Vec<usize>],
+    atom_posits: &[Vec3],
+    atom_0: usize,
+    atom_1: usize,
+    hydrogen_is: &[bool],
+) -> Option<Vec3> {
+    let n = adj_list.len();
+    let sentinel = n; // "no predecessor" marker
+    let mut prev = vec![sentinel; n];
+    let mut visited = vec![false; n];
+    let mut queue = std::collections::VecDeque::new();
+
+    visited[atom_1] = true;
+    queue.push_back(atom_1);
+
+    let mut found = false;
+    'bfs: while let Some(curr) = queue.pop_front() {
+        for &next in &adj_list[curr] {
+            if hydrogen_is[next] {
+                continue;
+            }
+            // Forbid the direct edge atom_1 → atom_0 so BFS goes around the ring.
+            if curr == atom_1 && next == atom_0 {
+                continue;
+            }
+            if next == atom_0 {
+                prev[next] = curr;
+                found = true;
+                break 'bfs;
+            }
+            if !visited[next] {
+                visited[next] = true;
+                prev[next] = curr;
+                queue.push_back(next);
+            }
+        }
+    }
+
+    if !found {
+        return None;
+    }
+
+    // Backtrack from atom_0 to atom_1 to collect ring atom indices.
+    let mut ring_atoms = Vec::new();
+    let mut curr = atom_0;
+    loop {
+        ring_atoms.push(curr);
+        if curr == atom_1 {
+            break;
+        }
+        curr = prev[curr];
+    }
+
+    let sum = ring_atoms
+        .iter()
+        .fold(Vec3::new_zero(), |acc, &i| acc + atom_posits[i]);
+    Some(sum / ring_atoms.len() as f64)
+}
+
+// /// We use this when moving molecules. We use the same movement logic as Blender, where moving an object
+// /// in 2d with the cursor reflects a 3D movement dependent on camera position.
+// pub fn transform_to_3d(pos_2d: (f32, f32), cam_posit: Vec3F32, cam_or: Quaternion) -> Vec3 {
+//     // todo placeholder!
+//     Vec3::new(motion.0 as f64, 0., motion.1 as f64)
+// }
+
+// todo: Maybe only invalidate indices that come before?
+/// We use this to invalidate indices when removing entities. Only run this when entities are removed.
+pub fn clear_mol_entity_indices(state: &mut State, exempt: Option<MolType>) {
+    // println!("Clearing indices");
+    if exempt != Some(MolType::Peptide) {
+        for pep in &mut state.peptides {
+            pep.common.entity_i_range = None;
+        }
+    }
+    for mol in &mut state.ligands {
+        if let Some(e) = exempt
+            && e == MolType::Ligand
+        {
+            break;
+        }
+        mol.common.entity_i_range = None;
+    }
+    for mol in &mut state.nucleic_acids {
+        if let Some(e) = exempt
+            && e == MolType::NucleicAcid
+        {
+            break;
+        }
+        mol.common.entity_i_range = None;
+    }
+    for mol in &mut state.lipids {
+        if let Some(e) = exempt
+            && e == MolType::Lipid
+        {
+            break;
+        }
+        mol.common.entity_i_range = None;
+    }
+}
+
+/// Create and load a ligand from a residue. I.e., from hetero residues in protein files.
+pub fn make_lig_from_res(
+    state: &mut State,
+    res: &Residue,
+    scene: &mut Scene,
+    engine_updates: &mut EngineUpdates,
+) {
+    let Some(mol) = state
+        .peptide_for_tools_i()
+        .and_then(|i| state.peptides.get(i))
+    else {
+        handle_err(
+            &mut state.ui,
+            "Error: No peptide loaded; can't create a ligand from its res.".to_owned(),
+        );
+
+        return;
+    };
+
+    let mol_fm_res = MoleculeSmall::from_res(res, &mol.common.atoms, &mol.common.bonds);
+
+    state.load_mol_to_state(
+        MoleculeGeneric::Small(mol_fm_res),
+        scene,
+        engine_updates,
+        None,
+    );
+
+    // Make it clear that we've added the ligand by showing it, and hiding hetero (if creating from Hetero)
+    state.ui.visibility.hide_ligand = false;
+}
+
+/// Give a ligand with flat, 2D coordinates (e.g. from a 2D-only SDF) 3D geometry, using energy
+/// minimization.
+pub fn make_lig_3d(
+    state: &mut State,
+    lig_i: usize,
+    scene: &mut Scene,
+    engine_updates: &mut EngineUpdates,
+) {
+    let Some(lig) = state.ligands.get_mut(lig_i) else {
+        handle_err(&mut state.ui, "Error: No ligand to make 3D.".to_owned());
+        return;
+    };
+
+    // FRCMOD files and managed-molecule manifests historically stored upper-case keys, while a
+    // molecule's display/internal identifier can retain mixed case. Parameter discovery already
+    // treats those identifiers case-insensitively, so retrieval must do the same.
+    let specific = state
+        .mol_specific_params
+        .get(&lig.common.ident)
+        .or_else(|| {
+            state
+                .mol_specific_params
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(&lig.common.ident))
+                .map(|(_, params)| params)
+        });
+    let mut prepared = state.force_fields.amber_copy(&lig.common);
+    let result = prepared.make_3d(&state.ff_param_set, specific);
+
+    let ident = lig.common.name(Some(&lig.idents)).into_owned();
+
+    if let Err(e) = result {
+        handle_err(&mut state.ui, format!("Unable to make {ident} 3D: {e}"));
+        return;
+    }
+
+    lig.common = prepared;
+
+    // Geometry-derived properties.
+    lig.update_characterization();
+
+    // A simulation set up with this ligand has its old positions.
+    if lig.common.selected_for_md.is_some() {
+        state.volatile.md_local.mol_dynamics = None;
+    }
+
+    draw_all_ligs(state, scene, engine_updates);
+
+    handle_success(
+        &mut state.ui,
+        format!("Made {ident} 3D. Stereocenters may not match the source's."),
+    );
+}
+
+/// This enables GPU computation if the right compiler flag is set, and there aren't
+/// errors setting up the Cuda stream. It also handles loading cuda kernels used directly
+/// by this application. (Dynamics modules, for example, are handled by that library)
+///
+/// Every step here is fallible on purpose: the CUDA-enabled build is also what we ship to people
+/// with no NVIDIA hardware or driver, so any failure has to degrade to `ComputationDevice::Cpu`
+/// rather than abort. We link CUDA with cudarc's `dynamic-loading`, meaning the driver library is
+/// looked up with `dlopen`/`LoadLibrary` on first use; that keeps the executable startable without
+/// it, but it also means calling into cudarc *before* checking `is_culib_present` would panic
+/// rather than return an error.
+#[cfg(feature = "cuda")]
+pub fn get_computation_device() -> (ComputationDevice, Option<CudaFunction>) {
+    // SAFETY: This only attempts to open the CUDA driver library; it does not call into it.
+    if !unsafe { cudarc::driver::sys::is_culib_present() } {
+        println!("No CUDA driver library found; using the CPU.");
+        return (ComputationDevice::Cpu, None);
+    }
+
+    if let Err(e) = cudarc::driver::result::init() {
+        eprintln!("Unable to init Cuda module: {e:?}");
+        return (ComputationDevice::Cpu, None);
+    }
+
+    // Present but unusable: e.g. a driver with no NVIDIA device attached, or one too old for the
+    // CUDA version we were built against.
+    let ctx = match CudaContext::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Unable to create a CUDA context; using the CPU. Error: {e}");
+            return (ComputationDevice::Cpu, None);
+        }
+    };
+
+    // SPME's reciprocal-space step has no GPU path without cuFFT, which (like the driver) is
+    // resolved at runtime. Check it here so we don't hand the rest of the app a GPU device that
+    // molecular dynamics can't actually use.
+    if !ewald::gpu_fft_available() {
+        eprintln!("The cuFFT library is unavailable; using the CPU.");
+        return (ComputationDevice::Cpu, None);
+    }
+
+    let stream = ctx.default_stream();
+
+    let module_reflections = match ctx.load_module(Ptx::from_src(PTX)) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error loading CUDA module; not using CUDA. Error: {e}");
+            return (ComputationDevice::Cpu, None);
+        }
+    };
+
+    match module_reflections.load_function("make_densities_kernel") {
+        Ok(function) => (ComputationDevice::Gpu(stream), Some(function)),
+        Err(e) => {
+            eprintln!("Error loading the density CUDA kernel; not using CUDA. Error: {e}");
+            (ComputationDevice::Cpu, None)
+        }
+    }
+}
+
+// /// See `find_missing_dihedrals` below. Used in the inference pipeline
+// // todo: Move this and maybe find_missing_diherals? to dynamics?
+// fn find_missing_valance_angles(
+//     mol: &MoleculeSmall,
+//     params: &ForceFieldParams,
+// ) -> io::Result<(
+//     Vec<(String, String,String)>,
+// )> {
+//     use itertools::Itertools; // todo... hmm.
+//
+//     // todo: This is a copy+paste+modify from FFParamsIndexed::new() for now.
+//     let mut result = Vec::new();
+//
+//     let atoms = &mol.common.atoms;
+//
+//     for (ctr, neighbors) in mol.common.adjacency_list.iter().enumerate() {
+//         if neighbors.len() < 2 {
+//             continue;
+//         }
+//         for (&n0, &n1) in neighbors.iter().tuple_combinations() {
+//             let type_n0 = &atoms[n0].force_field_type;
+//             let type_ctr = &atoms[ctr].force_field_type;
+//             let type_n1 = &atoms[n1].force_field_type;
+//
+//             let key = (
+//                 type_n0.clone(),
+//                 type_ctr.clone(),
+//                 type_n1.clone(),
+//             );
+//
+//             if params.get_valence_angle(&key).is_none() {
+//                 result.push(key);
+//             }
+//         }
+//     }
+//
+//     Ok(result)
+// }
+
+// /// Find proper and improper dihedral angles that this molecule has, but are not included in gaff2.dat.
+// /// Overrides are required for these. `params` passed should be from Gaff2.
+// ///
+// /// Returns (dihedral, improper). Force field combinations present in the molecule, but not
+// /// gaff2.dat.
+// /// We may integrate this into our FRCMOD inference pipeline.
+// /// todo: Missing valance and bond params too A/R
+// // todo: Not sure where this will go
+// fn find_missing_dihedrals(
+//     mol: &MoleculeSmall,
+//     params: &ForceFieldParams,
+// ) -> io::Result<(
+//     Vec<(String, String, String, String)>,
+//     Vec<(String, String, String, String)>,
+// )> {
+//     // todo: This is a copy+paste+modify from FFParamsIndexed::new() for now.
+//     // Proper and improper dihedral angles.
+//     let mut seen = HashSet::<(usize, usize, usize, usize)>::new();
+//
+//     let mut result = (Vec::new(), Vec::new());
+//
+//     let atoms = &mol.common.atoms;
+//
+//     // Proper dihedrals: Atoms 1-2-3-4 bonded linearly
+//     for (i1, nbr_j) in mol.common.adjacency_list.iter().enumerate() {
+//         for &i2 in nbr_j {
+//             if i1 >= i2 {
+//                 continue;
+//             } // handle each j-k bond once
+//
+//             for &i0 in mol.common.adjacency_list[i1].iter().filter(|&&x| x != i2) {
+//                 for &i3 in mol.common.adjacency_list[i2].iter().filter(|&&x| x != i1) {
+//                     if i0 == i3 {
+//                         continue;
+//                     }
+//
+//                     // Canonicalise so (i1, i2) is always (min, max)
+//                     let idx_key = if i1 < i2 {
+//                         (i0, i1, i2, i3)
+//                     } else {
+//                         (i3, i2, i1, i0)
+//                     };
+//                     if !seen.insert(idx_key) {
+//                         continue;
+//                     }
+//
+//                     if atoms[i0].force_field_type.is_none()
+//                         || atoms[i1].force_field_type.is_none()
+//                         || atoms[i2].force_field_type.is_none()
+//                         || atoms[i3].force_field_type.is_none()
+//                     {
+//                         eprintln!(
+//                             "Error finding missing dihedrals for param inference: Missing FF type."
+//                         );
+//                         return Err(io::Error::new(io::ErrorKind::Other, "Missing FF type"));
+//                     }
+//
+//                     let type_0 = atoms[i0].force_field_type.as_ref().unwrap();
+//                     let type_1 = atoms[i1].force_field_type.as_ref().unwrap();
+//                     let type_2 = atoms[i2].force_field_type.as_ref().unwrap();
+//                     let type_3 = atoms[i3].force_field_type.as_ref().unwrap();
+//
+//                     let key = (
+//                         type_0.clone(),
+//                         type_1.clone(),
+//                         type_2.clone(),
+//                         type_3.clone(),
+//                     );
+//
+//                     if params.get_dihedral(&key, true).is_none() {
+//                         result.0.push(key);
+//                     }
+//                 }
+//             }
+//         }
+//     }
+//
+//     // Improper dihedrals 2-1-3-4. Atom 3 is the hub, with the other 3 atoms bonded to it.
+//     // The order of the others in the angle calculation affects the sign of the result.
+//     // Generally only for planar configs.
+//     //
+//     // Note: The sattelites are expected to be in alphabetical order, re their FF types.
+//     // So, for the hub of "ca" with sattelites of "ca", "ca", and "os", the correct combination
+//     // to look for in the params is "ca-ca-ca-os"
+//     for (ctr, satellites) in mol.common.adjacency_list.iter().enumerate() {
+//         if satellites.len() < 3 {
+//             continue;
+//         }
+//
+//         // Unique unordered triples of neighbours
+//         for a in 0..satellites.len() - 2 {
+//             for b in a + 1..satellites.len() - 1 {
+//                 for d in b + 1..satellites.len() {
+//                     let (sat0, sat1, sat2) = (satellites[a], satellites[b], satellites[d]);
+//
+//                     let idx_key = (sat0, sat1, ctr, sat2); // order is fixed → no swap
+//                     if !seen.insert(idx_key) {
+//                         continue;
+//                     }
+//
+//                     if atoms[sat0].force_field_type.is_none()
+//                         || atoms[sat1].force_field_type.is_none()
+//                         || atoms[ctr].force_field_type.is_none()
+//                         || atoms[sat2].force_field_type.is_none()
+//                     {
+//                         eprintln!(
+//                             "Error finding missing improper dihedrals for param inference: Missing FF type."
+//                         );
+//                         return Err(io::Error::new(io::ErrorKind::Other, "Missing FF type"));
+//                     }
+//
+//                     let type_0 = atoms[sat0].force_field_type.as_ref().unwrap();
+//                     let type_1 = atoms[sat1].force_field_type.as_ref().unwrap();
+//                     let type_ctr = atoms[ctr].force_field_type.as_ref().unwrap();
+//                     let type_2 = atoms[sat2].force_field_type.as_ref().unwrap();
+//
+//                     // Sort satellites alphabetically; required to ensure we don't miss combinations.
+//                     let mut sat_types = [type_0.clone(), type_1.clone(), type_2.clone()];
+//                     sat_types.sort();
+//
+//                     let key = (
+//                         sat_types[0].clone(),
+//                         sat_types[1].clone(),
+//                         type_ctr.clone(),
+//                         sat_types[2].clone(),
+//                     );
+//
+//                     // todo: Re this note: it may be tough to determine which impropers we need.
+//                     // In the case of improper, unlike all other param types, we are allowed to
+//                     // have missing values. Impropers areonly, by Amber convention, for planar
+//                     // hub and spoke setups, so non-planar ones will be omitted. These may occur,
+//                     // for example, at ring intersections.
+//                     if params.get_dihedral(&key, false).is_none() {
+//                         result.1.push(key);
+//                     }
+//                 }
+//             }
+//         }
+//     }
+//
+//     Ok(result)
+// }
+
+pub fn res_color(
+    res: &Residue,
+    res_coloring: ResColoring,
+    atom_res: Option<usize>,
+    aa_count: usize,
+    chain_count: usize,
+    sifts: Option<&[SiftsUniprotMapping]>,
+    atoms: &[Atom],
+    chains: &[Chain],
+) -> (f32, f32, f32) {
+    match &res.res_type {
+        ResidueType::AminoAcid(aa) => match res_coloring {
+            ResColoring::AminoAcid => aa_color(*aa),
+            ResColoring::Position => match atom_res {
+                Some(res_i) => color_viridis(res_i, 0, aa_count),
+                None => aa_color(*aa),
+            },
+            ResColoring::Hydrophobicity => {
+                color_viridis_float(aa.hydropathicity(), HYDROPHOBICITY_MIN, HYDROPHOBICITY_MAX)
+            }
+            ResColoring::SiftsUniprot => {
+                if let Some(entries) = sifts {
+                    // Color by SIFTS entity_id: all residues sharing an entity_id get the
+                    // same hue, spaced equally along the Viridis scheme for maximum contrast.
+
+                    // Resolve the chain letter for this residue so we can filter by chain_id,
+                    // avoiding false matches when multiple chains share overlapping residue
+                    // number ranges.
+
+                    if res.atoms.is_empty() {
+                        return aa_color(*aa);
+                    }
+
+                    let chain_letter = atoms[res.atoms[0]].chain.map(|i_ch| &chains[i_ch].id);
+
+                    // For now, ignore res SN, and only color by chain.
+                    // Find the entity_id of the mapping that covers this residue's chain+serial.
+                    let entity_id = entries.iter().find_map(|entry| {
+                        entry.mappings.iter().find_map(|m| {
+                            let chain_ok = chain_letter.is_none_or(|cl| m.chain_id == *cl);
+
+                            if chain_ok
+                            // && serial >= m.start.residueF_number
+                            // && serial <= m.end.residue_number
+                            {
+                                Some(m.entity_id)
+                            } else {
+                                None
+                            }
+                        })
+                    });
+
+                    if let Some(eid) = entity_id {
+                        // Collect unique entity_ids in sorted order for a stable mapping.
+                        let mut unique_ids: Vec<u32> = entries
+                            .iter()
+                            .flat_map(|e| e.mappings.iter().map(|m| m.entity_id))
+                            .collect();
+
+                        unique_ids.sort_unstable();
+                        unique_ids.dedup();
+
+                        let rank = unique_ids.iter().position(|&id| id == eid).unwrap_or(0);
+                        color_alternating_contrast(rank, 0, unique_ids.len().saturating_sub(1))
+                    } else {
+                        aa_color(*aa)
+                    }
+                } else {
+                    aa_color(*aa)
+                }
+            }
+            ResColoring::Chain => {
+                if res.atoms.is_empty() {
+                    return aa_color(*aa);
+                }
+
+                match atoms[res.atoms[0]].chain {
+                    Some(chain_i) => {
+                        color_alternating_contrast(chain_i, 0, chain_count.saturating_sub(1))
+                    }
+                    None => aa_color(*aa),
+                }
+            }
+        },
+        _ => COLOR_AA_NON_RESIDUE,
+    }
+}
+
+/// Rotate all positions about `center` using `rotator`.
+pub fn rotate_about_point(posits: &mut [Vec3], pivot: Vec3, rotator: Quaternion) {
+    for p in posits {
+        let rel = *p - pivot;
+        *p = pivot + rotator.rotate_vec(rel);
+    }
+}
+
+/// Different interface to `rotate_about_point`.
+pub fn rotate_atoms_about_point(atoms: &mut [Atom], pivot: Vec3, rotator: Quaternion) {
+    for a in atoms {
+        let rel = a.posit - pivot;
+        a.posit = pivot + rotator.rotate_vec(rel);
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub const PTX: &str = include_str!("../molchanica.ptx");
+
+/// Returns the frequency of a covalent bond, in ps^-1, assuming classical MD params.
+/// `k_b` is in kcal/mol/Å². Masses are in AMU.
+///
+/// Mass may be taken from MD parameters, or the element default.
+pub fn bond_freq(k_b: f32, mass_0: f32, mass_1: f32) -> f64 {
+    let mass_0 = mass_0.max(1.0) as f64;
+    let mass_1 = mass_1.max(1.0) as f64;
+
+    let k_b = k_b as f64;
+
+    let reduced_mass_kg = (mass_0 * mass_1 / (mass_0 + mass_1)) * AMU_TO_KG;
+
+    // Amber bond stretching uses U = k_b(r-r0)^2, so the harmonic curvature is 2*k_b.
+    let spring_n_per_m = 2.0 * k_b * KCAL_PER_MOL_A2_TO_N_PER_M;
+
+    let freq_hz = (spring_n_per_m / reduced_mass_kg).sqrt() / TAU;
+    freq_hz * HZ_TO_PS_INV
+}
+
+pub fn truncate_str(val: &str, len_max: usize) -> String {
+    if val.chars().count() > len_max {
+        let v: String = val.chars().take(len_max).collect();
+        format!("{v}…")
+    } else {
+        val.to_owned()
+    }
+}

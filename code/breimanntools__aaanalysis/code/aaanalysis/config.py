@@ -1,0 +1,336 @@
+"""
+This is a script for setting system level options for AAanalysis.
+# DEV: Settings + option validation are covered by tests/unit/config_tests/
+# (test_options.py, test_n_jobs.py, test_settings_properties.py). Plot/communication
+# side effects are additionally exercised by the example notebooks.
+"""
+from typing import Dict, Any
+import os
+
+from ._utils.check_type import check_bool, check_number_val, check_number_range, check_str, check_dict
+from ._utils.check_data import check_df
+
+# System level options
+_dict_options = {
+    'verbose': "off",
+    'random_state': "off",
+    'n_jobs': "off",
+    'allow_multiprocessing': True,
+    'name_tmd': "TMD",
+    'name_jmd_n': "JMD-N",
+    'name_jmd_c': "JMD-C",
+    'ext_len': 0,
+    'jmd_n_len': None,
+    'jmd_c_len': None,
+    'df_scales': None,
+    'df_cat': None,
+    'auto_font': True,
+    'legend_title_bold': False,
+    'plot_settings': None,
+}
+
+
+# Tracks whether allow_multiprocessing=False set the loky CPU cap, and the user's prior
+# LOKY_MAX_CPU_COUNT value, so re-enabling multiprocessing restores it (never loses it).
+_loky_capped_by_options = False
+_loky_prev_value = None
+
+
+# Check system level (option) parameters or depending on parameters
+def check_verbose(verbose=None):
+    """Check if general verbosity is on or off. Adjusted based on options setting and value provided to object"""
+    global_verbose = options["verbose"]
+    if global_verbose != "off":
+        # System level verbosity
+        check_bool(name="verbose (option)", val=global_verbose)
+        verbose = global_verbose
+    else:
+        check_bool(name="verbose", val=verbose)
+    return verbose
+
+
+def check_random_state(random_state=None):
+    """Adjust random state if global is not 'off' (default)"""
+    global_random_state = options["random_state"]
+    args = dict(min_val=0, accept_none=True, just_int=True)
+    if global_random_state != "off":
+        # System-level random state
+        check_number_range(name="random_state (option)", val=global_random_state, **args)
+        random_state = global_random_state
+    else:
+        check_number_range(name="random_state", val=random_state, **args)
+    return random_state
+
+
+def check_n_jobs(n_jobs=None):
+    """Normalize ``n_jobs`` per the parallelism contract and the global override.
+
+    Contract: ``1`` runs serially; ``-1`` uses all cores (``os.cpu_count()``);
+    ``N > 1`` uses exactly ``N``; ``None`` is deferred to :func:`resolve_n_jobs`
+    (optimized for the job size at the call site). When ``options['n_jobs']`` is
+    set (not ``'off'``) it overrides the per-call value; ``allow_multiprocessing
+    =False`` forces serial and wins over everything.
+    """
+    # System-level override (mirrors verbose / random_state): a concrete option
+    # value wins over the per-call argument.
+    global_n_jobs = options["n_jobs"]
+    if global_n_jobs != "off":
+        n_jobs = global_n_jobs
+    global _loky_capped_by_options, _loky_prev_value
+    allow_multiprocessing = options["allow_multiprocessing"]
+    check_bool(name="allow_multiprocessing (options)", val=allow_multiprocessing)
+    # Cap loky when multiprocessing is disabled, remembering the user's prior value so it is
+    # restored (not lost) once multiprocessing is re-enabled on the next parallel-capable call.
+    if not allow_multiprocessing:
+        n_jobs = 1
+        if not _loky_capped_by_options:
+            _loky_prev_value = os.environ.get('LOKY_MAX_CPU_COUNT')
+            _loky_capped_by_options = True
+        os.environ['LOKY_MAX_CPU_COUNT'] = "1"
+    elif _loky_capped_by_options:
+        # Only undo our own cap if it is still in place. If the user set their own
+        # LOKY_MAX_CPU_COUNT (e.g. for another loky/joblib library) while multiprocessing
+        # was disabled, the value is no longer "1" -> leave it untouched.
+        if os.environ.get('LOKY_MAX_CPU_COUNT') == "1":
+            if _loky_prev_value is None:
+                os.environ.pop('LOKY_MAX_CPU_COUNT', None)
+            else:
+                os.environ['LOKY_MAX_CPU_COUNT'] = _loky_prev_value
+        _loky_capped_by_options = False
+        _loky_prev_value = None
+    # Set n_jobs to maximum number of CPUs
+    if n_jobs == -1:
+        n_jobs = os.cpu_count()
+    # Check which n_jobs are allowed (None is resolved later by resolve_n_jobs)
+    check_number_range(name="n_jobs", val=n_jobs, accept_none=True, just_int=True, min_val=1)
+    return n_jobs
+
+
+def resolve_n_jobs(n_jobs=None, n_work=None):
+    """Resolve ``n_jobs=None`` to an optimized worker count for a job of size ``n_work``.
+
+    Single source of truth for the ``None`` → "optimized" rule shared across the
+    CPP feature-matrix builders and the metrics backend: never more workers than
+    ``os.cpu_count()``, and roughly one worker per 10 units of work, so small
+    jobs stay near-serial and avoid joblib spawn overhead. Any non-``None``
+    ``n_jobs`` (already normalized by :func:`check_n_jobs`) passes through
+    unchanged.
+    """
+    if n_jobs is not None:
+        return n_jobs
+    if n_work is None:
+        n_work = 1
+    return min(os.cpu_count() or 1, max(int(n_work / 10), 1))
+
+
+def check_auto_font():
+    """Return whether package-wide automatic plot sizing/fonts are enabled.
+
+    Global toggle (no per-call argument). When ``True`` (default), dense plots may
+    derive their figure size from the data shape; when ``False`` plots behave
+    exactly as before (byte-identical output).
+    """
+    auto_font = options["auto_font"]
+    check_bool(name="auto_font (option)", val=auto_font)
+    return auto_font
+
+
+def check_legend_title_bold():
+    """Return whether plot-legend titles are drawn bold package-wide.
+
+    Global toggle (no per-call argument). ``False`` (default) matches the house style
+    (frameless, left-aligned, non-bold title); set ``True`` for bold legend titles.
+    """
+    legend_title_bold = options["legend_title_bold"]
+    check_bool(name="legend_title_bold (option)", val=legend_title_bold)
+    return legend_title_bold
+
+
+def check_jmd_n_len(jmd_n_len=None):
+    """Check if general JMD-N length is given and adjust it globally."""
+    global_jmd_n_len = options["jmd_n_len"]
+    if global_jmd_n_len is not None:
+        check_number_range(name="jmd_n_len (option)", val=global_jmd_n_len,
+                           min_val=0, just_int=True)
+        return global_jmd_n_len
+    else:
+        check_number_range(name="jmd_n_len", val=jmd_n_len,
+                           min_val=0, just_int=True)
+        return jmd_n_len
+
+
+def check_jmd_c_len(jmd_c_len=None):
+    """Check if general JMD-C length is given and adjust it globally."""
+    global_jmd_c_len = options["jmd_c_len"]
+    if global_jmd_c_len is not None:
+        check_number_range(name="jmd_c_len (option)", val=global_jmd_c_len,
+                           min_val=0, just_int=True)
+        return global_jmd_c_len
+    else:
+        check_number_range(name="jmd_c_len", val=jmd_c_len,
+                           min_val=0, just_int=True)
+        return jmd_c_len
+
+
+# DEV: Parameters are used as directive to get better documentation style
+# Enables setting of system level variables like in matplotlib
+def _check_option(name_option="", option=None):
+    """Check if option is valid"""
+    if name_option == "verbose":
+        if option != "off":
+            # Validate the incoming candidate directly (check_verbose resolves against
+            # the current global and would skip validating a new value once one is set).
+            check_bool(name=name_option, val=option)
+    if name_option == "random_state":
+        if option != "off":
+            check_number_range(name=name_option, val=option, min_val=0,
+                               accept_none=True, just_int=True)
+    if name_option == "n_jobs":
+        if option != "off":
+            # Concrete override: -1 (all cores) or a positive int. None is not a
+            # valid option value (per-call None means "optimize"; use 'off' to
+            # defer to the per-call argument).
+            if option != -1:
+                check_number_range(name=name_option, val=option, min_val=1,
+                                   accept_none=False, just_int=True)
+    if name_option == "allow_multiprocessing":
+        check_bool(name=name_option, val=option)
+    if name_option == "auto_font":
+        check_bool(name=name_option, val=option)
+    if name_option == "legend_title_bold":
+        check_bool(name=name_option, val=option)
+    if name_option == "plot_settings":
+        # None (default) keeps plotting byte-identical; a dict of plot_settings keyword
+        # arguments is applied lazily by the plot entry points (session-persistent style).
+        check_dict(name=name_option, val=option, accept_none=True)
+    if "jmd" in name_option and "len" in name_option:
+        check_number_range(name=name_option, val=option,
+                           min_val=0, accept_none=True, just_int=True)
+    if "name" in name_option:
+        # Covers name_tmd, name_jmd_n, name_jmd_c
+        check_str(name=name_option, val=option, accept_none=False)
+    if name_option == "ext_len":
+        check_number_range(name=name_option, val=option, min_val=0, accept_none=False, just_int=True)
+    if "df" in name_option:
+        check_df(name=name_option, df=option, accept_none=True)
+
+
+class Settings:
+    """
+     A class for managing system-level settings for AAanalysis.
+
+    This class mimics a dictionary-like interface, allowing the setting and retrieving
+    of system-level options. It is designed to be used as a single global instance, ``options``.
+
+    Parameters
+    ----------
+    The following options can be set:
+
+    verbose : bool or 'off', default='off'
+        Sets verbose mode to ``True`` or ``False`` globally if not 'off'.
+    random_state : int, None, or 'off', default='off'
+        The seed used by the random number generator.
+
+        * If set to a positive integer, results of stochastic processes are consistent, enabling reproducibility.
+        * If set to ``None``, stochastic processes will be truly random.
+        * If set to 'off', no global random state variable will be set, allowing the underlying libraries to use
+          their default random state behavior.
+    n_jobs : int, None, or 'off', default='off'
+        Global override for the per-call ``n_jobs`` of parallel-capable methods.
+
+        * If set to a positive integer, that many CPU cores are used.
+        * If set to ``-1``, all available cores are used.
+        * If set to 'off', the per-call ``n_jobs`` argument is used (where ``None``
+          is optimized automatically for the job size, and ``-1`` uses all cores).
+
+    allow_multiprocessing : bool, default=True
+        Whether multiprocessing is allowed in general. If ``False``, ``n_jobs`` is automatically set to 1.
+    name_tmd : str, default='TMD'
+        Name of target middle domain (TMD) used in CPP plots.
+    name_jmd_n : str, default='JMD_N'
+        Name of N-terminal juxta middle domain (JMD-N) used in CPP plots.
+    name_jmd_c : str, default='JMD_C'
+        Name of C-terminal juxta middle domain (JMD-C) used in CPP plots.
+    ext_len : int, default=0
+        Length of TMD-extending part (starting from C and N terminal part of TMD, >=0). Disabled (set to 0) by default.
+    jmd_n_len: int, default=None
+        Length of N-terminal JMD (JMD-N) in number of amino acids. If ``None``, ``jmd_n_len`` is set locally.
+    jmd_c_len: int, default=None
+        Length of C-terminal JMD (JMD-C) in number of amino acids. If ``None``, ``jmd_c_len`` is set locally.
+    df_scales : DataFrame, optional
+        Scale DataFrame used in CPP algorithm. Adjust on system level if non-default scales are used.
+        If ``None``, AAanalysis framework will use the scale DataFrame loaded by :func:`load_scales` with ``name='scales'``.
+    df_cat : DataFrame, optional
+        Scale category DataFrame used in CPP algorithm. Adjust on system level if non-default scale categories are used.
+        If ``None``, AAanalysis framework will use the scale category DataFrame loaded by :func:`load_scales` with ``name='scales_cat'``.
+    auto_font : bool, default=True
+        Global toggle for automatic, size-stable plot sizing. When ``True`` (default),
+        the composite CPP plots (:meth:`CPPPlot.feature_map`, :meth:`CPPPlot.heatmap`,
+        :meth:`CPPPlot.profile`) hold each grid cell at a constant physical size and grow
+        the *figure* with the data (number of scale subcategories and residue positions),
+        so subcategory labels, position ticks and residue letters stay at a constant,
+        legible font regardless of grid size — no manual ``plot_settings(font_scale=...)``
+        needed. An explicit ``figsize`` always wins (auto-sizing is skipped). When
+        ``False``, plots keep their fixed default figure size, reproducing the previous
+        (pre-auto-font) output.
+    legend_title_bold : bool, default=False
+        Global toggle for the font weight of plot-legend titles. ``False`` (default) matches
+        the house style (frameless, left-aligned, non-bold title); set ``True`` for bold
+        legend titles.
+    plot_settings : dict or None, default=None
+        Opt-in, session-persistent :func:`plot_settings`. When set to a dictionary of
+        :func:`plot_settings` keyword arguments (e.g. ``{'font_scale': 1.2, 'weight_bold': True}``),
+        those publication settings are applied automatically the first time any ``*Plot`` method
+        draws a figure, so :func:`plot_settings` need not be repeated before every plot. The
+        resulting :data:`matplotlib.rcParams` then persist for the rest of the session. When
+        ``None`` (default), no styling is applied implicitly and plot output is byte-identical to
+        the current default (calling :func:`plot_settings` yourself, or not at all). The session
+        style is (re)applied only when this option's value changes, so an explicit
+        :func:`plot_settings` call takes precedence for every figure drawn after it.
+
+    See Also
+    --------
+    * :class:`numpy.random.RandomState` for details on the ``random_state`` variable used to make stochastic processes
+      yielding consistent results.
+    * :class:`SequenceFeature` for definition of sequence ``Parts``.
+    * :func:`load_scales` for details on scale and scale category DataFrames.
+
+    Warnings
+    --------
+    * Multiprocessing Compatibility: Enabling multiprocessing (``allow_multiprocessing=True``)
+      can lead to issues in environments that don't support forking or when interfacing with
+      certain libraries. If encountering errors, consider setting ``allow_multiprocessing=False``.
+      Note that this may affect performance in computation-intensive operations.
+
+    Examples
+    --------
+    .. include:: examples/options.rst
+    """
+    def __init__(self):
+        self._settings: Dict[str, Any] = _dict_options.copy()
+
+    def __getitem__(self, key: str) -> Any:
+        """Retrieve a setting's value using dict-like access."""
+        return self._settings.get(key, None)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Set a setting's value using dict-like access.
+           Prevent adding new keys that are not already in the system options."""
+        if key in self._settings:
+            _check_option(name_option=key, option=value)
+            self._settings[key] = value
+        else:
+            valid_options = list(_dict_options.keys())
+            raise KeyError(f"'{key}' is not valid options. Valid options are: {valid_options}.")
+
+    def __contains__(self, key: str) -> bool:
+        """Check if a key is in the settings."""
+        return key in self._settings
+
+    def __str__(self) -> str:
+        """Return a string representation of the settings dictionary."""
+        return str(self._settings)
+
+
+# Global settings instance
+options = Settings()

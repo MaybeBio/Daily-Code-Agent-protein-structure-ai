@@ -1,0 +1,95 @@
+[project]
+name = "mdclaw"
+version = "0.6.15"
+description = "MDClaw - skills and CLIs for vibe-MD simulations and autonomous scientific investigation"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    # Structure preparation
+    # Note: openmm, pdbfixer, rdkit, ambertools, and pymol-open-source are
+    # conda-only / conda-preferred runtime dependencies.
+    # See environment.yml for full setup.
+    "pdb2pqr>=3.1.0",
+    "propka>=3.5.0",
+    "dimorphite-dl>=2.0",
+    "gemmi>=0.6.0",
+    "pubchempy>=1.0.4",
+    "e3nn==0.5.0",
+    "hpacker @ git+https://github.com/gvisani/hpacker.git",
+
+    # Topology manipulation
+    "parmed>=4.3.0",
+
+    # Data models & validation
+    "pydantic>=2.4",
+
+    # HTTP & networking
+    "httpx>=0.28.1",
+    "requests>=2.31.0",
+    # Molstar MCP Apps transport; installed by Pixi, pip/conda and image builds.
+    "mcp==1.30.0",
+
+    # Utilities
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+
+    # Visualization & analysis
+    "mdtraj>=1.9.0",
+    "MDAnalysis>=2.8,<3",
+    "mdahole2>=0.5,<0.6",
+    "matplotlib",
+    "pymbar>=4.0.3,<5",
+
+    # Numerical
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+mdclaw = "mdclaw._cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# hpacker is declared as a git (direct) reference in project.dependencies.
+# Recent hatchling versions reject direct references during metadata
+# generation unless this is explicitly enabled, which broke fresh
+# `conda env create -f environment.yml` runs (pip's build isolation pulls
+# the latest hatchling). MDClaw is installed editable / via the container,
+# not published to PyPI, so direct references are acceptable here.
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["mdclaw"]
+
+[tool.pytest.ini_options]
+# Bare `pytest` at the repo root would otherwise also collect stray test files
+# left in gitignored agent scratch under benchmark_runs/, and fail collection.
+testpaths = ["tests"]
+markers = [
+    "slow: tests requiring conda scientific packages (deselect with '-m not slow')",
+    "integration: full pipeline tests (deselect with '-m not integration')",
+]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Pin the rule set the code was written under. Without this, `ruff check` uses
+# whatever defaults the ruff in the current container happens to ship, and the
+# 0.15 -> 0.16 bump alone turned a clean tree into ~1500 findings — a lint that
+# always screams is a lint everyone learns to ignore. Widen deliberately, in a
+# commit that also fixes what the new rules find.
+select = ["E4", "E7", "E9", "F"]

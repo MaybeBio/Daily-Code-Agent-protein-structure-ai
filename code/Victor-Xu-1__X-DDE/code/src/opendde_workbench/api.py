@@ -1,0 +1,691 @@
+"""Loopback API: validated requests, same-origin mutations, safe result downloads."""
+
+import asyncio
+import fcntl
+import secrets
+import shutil
+import time
+from contextlib import asynccontextmanager, nullcontext
+from pathlib import Path
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from . import PRODUCT_NAME, __version__
+from .artifacts import contained, list_artifacts, log_tail
+from .asset_routes import register_assets
+from .asset_upload_routes import register_uploads
+from .asset_upload_workers import AssetUploadWorkers
+from .assets import AssetStore
+from .backend_router import BackendRouter
+from .capabilities import register_capabilities
+from .checkpoints import registered, resolve
+from .deployment.manager import DeploymentManager
+from .deployment.provisioners import states as provisioner_states
+from .deployment.routes import register_deployments
+from .diffsbdd.runtime import validate as validate_diffsbdd
+from .disk_space import available_bytes
+from .docking.runtime import validate as validate_docking
+from .drafts.routes import register_drafts
+from .engine import Engine
+from .engine_registry import statuses as engine_statuses
+from .examples.library import ExampleLibrary
+from .examples.routes import register_examples
+from .execution_environment import EnvironmentRecord
+from .harness_routes import register_harness
+from .models import TERMINAL, Job
+from .opendde_limits import OpenDDELimits
+from .operation_routes import register_operations
+from .pockets.runtime import validate as validate_pockets
+from .pose_ensembles.routes import register_pose_explorations
+from .prediction import Prediction
+from .preflight import check
+from .projects import register_projects
+from .readiness_cache import ReadinessCache, ReadinessChanged
+from .requests import BatchRequest, TaskRequest
+from .research.constraint_routes import register_constraints
+from .research.evidence_routes import register_evidence
+from .research.region_routes import register_regions
+from .research.routes import register_research
+from .science_routes import register_science
+from .settings import Settings
+from .sites.routes import register_sites
+from .store import CapacityError, ConflictError, Store
+from .task_history.routes import register_task_history
+from .utility_routes import RECOGNITION_ORIGINS, register_utilities
+from .worker import Worker
+from .workflows import register_workflows
+from .wsl_storage import StorageUnavailable
+
+
+def create_app(settings: Settings | None = None, engine: Engine | None = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    settings.state_dir.mkdir(parents=True, exist_ok=True)
+    store = Store(settings.state_dir / "jobs.sqlite3")
+    engine = engine or BackendRouter(settings)
+    assets = AssetStore(store, settings.state_dir / "assets")
+    example_library = ExampleLibrary(store)
+    worker = Worker(store, engine, settings, assets)
+    deployments = DeploymentManager(
+        settings.state_dir,
+        msa_url=settings.msa_url,
+        resource_limits=OpenDDELimits.configured(settings),
+    )
+    csrf = secrets.token_urlsafe(32)
+    mutations = asyncio.Lock()
+    # The managed router performs expensive native observations. Injected engines
+    # keep their own readiness semantics; coalesce their concurrent reads only.
+    health_cache = ReadinessCache(
+        engine.readiness, ttl=10 if isinstance(engine, BackendRouter) else 0
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        with (settings.state_dir / "worker.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Service bootstrap is isolated from LLM configuration and other environments.
+            try:
+                await asyncio.to_thread(deployments.compute.ensure)
+            except (ValueError, OSError, RuntimeError) as exc:
+                deployments.compute.cached = (
+                    time.monotonic() + 10,
+                    {"configured": True, "running": False, "ready": False, "reason": str(exc)},
+                )
+            loop = asyncio.get_running_loop()
+
+            def admit_deployment(claim):
+                # Called only by the deployment worker thread. Its file lock
+                # remains held, but no manager mutex spans this async probe.
+                return asyncio.run_coroutine_threadsafe(deployment_claim(claim), loop).result()
+
+            deployments.admission = admit_deployment
+            await worker.start()
+            await deployments.start()
+            try:
+                yield
+            finally:
+                await health_cache.close()
+                await close_uploads()
+                await deployments.close()
+                await worker.close()
+
+    app = FastAPI(title=PRODUCT_NAME, version=__version__, lifespan=lifespan)
+    register_utilities(app)
+    app.state.quiescing = False
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": [
+                    {"loc": item["loc"], "msg": item["msg"], "type": item["type"]}
+                    for item in exc.errors()
+                ]
+            },
+        )
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        if request.method in {"POST", "PUT", "PATCH"}:
+            length = request.headers.get("content-length", "")
+            limit = (
+                25 * 1024**2
+                if request.url.path == "/api/assets"
+                else 4 * 1024**2
+                if request.url.path.startswith("/api/assets/uploads/") and request.method == "PUT"
+                else 2 * 1024**2
+                if request.url.path == "/api/batches"
+                else 262144
+            )
+            if not length.isdigit() or int(length) > limit:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "detail": "Request body exceeds the size limit or has no fixed length."
+                    },
+                )
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            # Data transfers own short database transactions and cannot change
+            # tasks/deployments. A multi-GiB final hash must not block cancellation
+            # of an unrelated scientific task; normal CSRF/host/body rules remain.
+            lock = (
+                nullcontext() if request.url.path.startswith("/api/assets/uploads") else mutations
+            )
+            async with lock:
+                if app.state.quiescing:
+                    return JSONResponse(status_code=409, content={"detail": "UI is shutting down."})
+                if (
+                    request.url.path.startswith("/api/harness/")
+                    and request.url.path.endswith("/start")
+                    and any(
+                        r["state"] in {"queued", "running", "pausing"}
+                        and r["package"] not in {"ketcher", "molstar"}
+                        for r in deployments.store.rows()
+                    )
+                ):
+                    return JSONResponse(
+                        status_code=409,
+                        content={"detail": "Wait or pause component deployment first."},
+                    )
+                response = await call_next(request)
+        else:
+            response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        editor = request.url.path.startswith("/tools/") or request.url.path == "/molecular.html"
+        frame_ancestors = "'self'" if request.url.path == "/viewer.html" or editor else "'none'"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "script-src 'self'; worker-src 'self' blob:; style-src-attr 'unsafe-inline'; "
+            f"frame-ancestors {frame_ancestors}; "
+            f"frame-src 'self' {RECOGNITION_ORIGINS}; base-uri 'none'"
+        )
+        if editor:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
+                "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+                "font-src 'self' data:; connect-src 'self' blob:; worker-src 'self' blob:; "
+                "frame-ancestors 'self'; base-uri 'self'"
+            )
+        if request.url.path == "/molecular.html":
+            # Mol* uses generated query functions. Restrict this permission to an opaque-origin
+            # sandbox: it cannot read the parent, session token, uploads or other app state.
+            response.headers["Content-Security-Policy"] = (
+                response.headers["Content-Security-Policy"].replace(
+                    "'wasm-unsafe-eval'", "'unsafe-eval'"
+                )
+                + "; sandbox allow-scripts allow-downloads"
+            )
+        if request.url.path.startswith(("/assets/", "/tools/molstar/")):
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        if request.url.path.startswith("/api") or request.url.path in {
+            "/",
+            "/index.html",
+            "/viewer.html",
+            "/molecular.html",
+            "/theme-init.js",
+        }:
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    def mutation(request: Request, x_workbench_csrf: str = Header(default="")):
+        origin = request.headers.get("origin")
+        if origin and origin not in settings.allowed_origins:
+            raise HTTPException(403, "Origin is not allowed.")
+        if not secrets.compare_digest(csrf, x_workbench_csrf):
+            raise HTTPException(403, "Refresh the page before submitting this request.")
+
+    def required(job_id: UUID) -> Job:
+        job = store.get(str(job_id))
+        if job is None:
+            raise HTTPException(404, "Task not found.")
+        return job
+
+    async def preflight(value: TaskRequest):
+        if any(
+            r["state"] in {"queued", "running", "pausing"}
+            and r["package"] not in {"ketcher", "molstar"}
+            for r in deployments.store.rows()
+        ):
+            raise HTTPException(
+                409,
+                "Compute components are being deployed. Wait or pause deployment "
+                "before submitting a scientific task.",
+            )
+        readiness = await health()
+        if not readiness["worker_ready"]:
+            raise HTTPException(503, worker.error or "Task worker is not available.")
+        try:
+            constraints.check_task(value)
+            from .datasets.contract import DatasetTask
+            from .integrations.contract import IntegratedTask
+
+            if isinstance(value, DatasetTask):
+                from .datasets.runtime import validate
+
+                assets.validate_bindings(value)
+                validate(value, readiness["engine"].get("backends", {}).get(value.payload.kind, {}))
+            elif isinstance(value, IntegratedTask):
+                from .integrations.runtime import validate
+
+                assets.validate_bindings(value)
+                validate(value, readiness["engine"].get("backends", {}).get(value.payload.kind, {}))
+            elif value.operation == "harness":
+                assets.validate_bindings(value)
+                if (
+                    not settings.harness_python
+                    or not settings.harness_python.is_file()
+                    or value.tool != "compare"
+                    and not settings.harness_url
+                ):
+                    raise RuntimeError(
+                        "Configure the Harness interpreter and compute URL in server settings."
+                    )
+                await harness_service.invoke(
+                    {"operation": "validate_tool", "tool": value.tool, "payload": value.payload}
+                )
+            elif value.operation in {"target_research", "reference_import"}:
+                from .discovery.backend import validate
+
+                assets.validate_bindings(value)
+                validate(value, readiness["engine"].get("backends", {}).get("discovery", {}))
+            elif value.operation == "antibody_humanize":
+                from .humanization.runtime import validate
+
+                assets.validate_bindings(value)
+                validate(value, readiness["engine"].get("backends", {}).get("sapiens", {}))
+            elif value.operation == "admet_predict":
+                from .admet.runtime import validate
+
+                assets.validate_bindings(value)
+                validate(value, readiness["engine"].get("backends", {}).get("admet", {}))
+            elif value.operation == "pose_quality":
+                from .quality.runtime import validate
+
+                assets.validate_bindings(value)
+                validate(value, readiness["engine"].get("backends", {}).get("posebusters", {}))
+            elif value.operation == "antibody_number":
+                from .antibodies.runtime import validate
+
+                assets.validate_bindings(value)
+                validate(value, readiness["engine"].get("backends", {}).get("anarcii", {}))
+            elif value.operation == "channel_analysis":
+                from .space.runtime import validate
+
+                assets.validate_bindings(value)
+                validate(value, readiness["engine"].get("backends", {}).get("caver", {}))
+            elif value.operation in {
+                "receptor_ensemble",
+                "structure_prepare",
+                "surface_exposure",
+                "structure_compare",
+            }:
+                from .receptors.runtime import validate
+
+                assets.validate_bindings(value)
+                validate(value, readiness["engine"].get("backends", {}).get("biopython", {}))
+            elif value.operation == "properties" and not isinstance(engine, BackendRouter):
+                # Preserve the existing trusted single-engine injection contract.
+                # Production always uses the registered independent RDKit backend.
+                check(value, readiness["engine"], assets)
+            elif value.operation in {
+                "properties",
+                "molecular_states",
+                "library_screen",
+                "molecule_minimize",
+                "pose_cluster",
+            }:
+                from .chemistry.runtime import validate
+
+                assets.validate_bindings(value)
+                validate(value, readiness["engine"].get("backends", {}).get("chemistry", {}))
+            elif value.operation == "docking":
+                assets.validate_bindings(value)
+                validate_docking(value, readiness["engine"].get("backends", {}).get("gnina", {}))
+            elif value.operation == "pocket_search":
+                assets.validate_bindings(value)
+                validate_pockets(value, readiness["engine"].get("backends", {}).get("p2rank", {}))
+            elif value.operation == "diffsbdd":
+                assets.validate_bindings(value)
+                regions.check_task(value)
+                validate_diffsbdd(
+                    value, readiness["engine"].get("backends", {}).get("diffsbdd", {})
+                )
+            else:
+                check(value, readiness["engine"], assets)
+                if value.operation == "predict" and value.parameters.checkpoint_id:
+                    resolve(settings, value.parameters.checkpoint_id)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except (RuntimeError, OSError, TimeoutError) as exc:
+            raise HTTPException(503, str(exc)) from exc
+        capacity = settings.capacity_dir or settings.state_dir
+        try:
+            free = min(
+                await asyncio.to_thread(available_bytes, settings.state_dir),
+                await asyncio.to_thread(available_bytes, capacity),
+            )
+        except StorageUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+        if free < settings.minimum_free_bytes:
+            raise HTTPException(507, "Not enough free disk space. Free space on the storage drive.")
+        if value.project_id is not None:
+            with store.connect() as db:
+                if not db.execute(
+                    "SELECT 1 FROM projects WHERE id=?", (str(value.project_id),)
+                ).fetchone():
+                    raise HTTPException(422, "Selected project does not exist.")
+
+    async def enqueue(value: TaskRequest, key: UUID, parent: str | None = None):
+        try:
+            existing = store.existing_submission(value, str(key), parent)
+        except ConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if existing is not None:
+            return existing
+        await preflight(value)
+        try:
+            return store.create(value, str(key), settings.max_pending, settings.max_jobs, parent)
+        except ConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except CapacityError as exc:
+            raise HTTPException(429, str(exc)) from exc
+
+    @app.post(
+        "/api/batches", response_model=list[Job], status_code=201, dependencies=[Depends(mutation)]
+    )
+    async def batch(value: BatchRequest, idempotency_key: Annotated[UUID, Header()]):
+        try:
+            existing = store.existing_batch(value.tasks, idempotency_key)
+        except ConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if existing is not None:
+            return existing
+        for task in value.tasks:
+            await preflight(task)
+        try:
+            return store.create_batch(
+                value.tasks, idempotency_key, settings.max_pending, settings.max_jobs
+            )
+        except ConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except CapacityError as exc:
+            raise HTTPException(429, str(exc)) from exc
+
+    @app.get("/api/session")
+    def session():
+        import os
+
+        return {
+            "csrf_token": csrf,
+            "version": __version__,
+            "instance": os.environ.get("WB_INSTANCE", ""),
+        }
+
+    @app.get("/api/checkpoints")
+    def checkpoints():
+        try:
+            return [
+                {"id": identifier, "present": path.is_file()}
+                for identifier, path in registered(settings).items()
+            ]
+        except (ValueError, OSError) as exc:
+            raise HTTPException(
+                503, "Checkpoint registry could not be read. Check server configuration."
+            ) from exc
+
+    @app.get("/api/health")
+    async def health():
+        from .deployment.activation import dynamic_snapshot
+
+        dynamic = dynamic_snapshot(deployments.store.installed())
+        try:
+            readiness = await health_cache.read(dynamic)
+        except ReadinessChanged as exc:
+            raise HTTPException(503, str(exc)) from exc
+        if dynamic_snapshot(deployments.store.installed()) != dynamic:
+            raise HTTPException(503, "Backend configuration changed; recheck availability.")
+        alive = worker.task is not None and not worker.task.done()
+        environments = engine_statuses(readiness)
+        storage_error = None
+        try:
+            free = min(
+                await asyncio.to_thread(available_bytes, settings.state_dir),
+                await asyncio.to_thread(
+                    available_bytes, settings.capacity_dir or settings.state_dir
+                ),
+            )
+        except StorageUnavailable as exc:
+            free, storage_error = None, str(exc)
+        return {
+            "version": __version__,
+            "platform": {"name": PRODUCT_NAME, "ready": alive and not worker.error},
+            "environments": environments,
+            "engines": environments,
+            "provisioners": provisioner_states(deployments.store.installed()),
+            "engine": readiness,
+            "worker_ready": alive and not worker.error,
+            "worker_error": worker.error,
+            "queue_wait_reason": worker.waiting_reason,
+            "disk_total_gib": round(
+                shutil.disk_usage(settings.capacity_dir or settings.state_dir).total / 1024**3, 1
+            ),
+            "free_disk_gib": round(free / 1024**3, 1) if free is not None else None,
+            "storage_error": storage_error,
+            "capabilities": {
+                "prediction": True,
+                "msa": True,
+                "templates": True,
+                "llm": settings.harness_python is not None,
+            },
+        }
+
+    @app.get("/api/jobs", response_model=list[Job])
+    def jobs(limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0, le=10000)):
+        return example_library.personal_jobs(limit, offset)
+
+    @app.post("/api/jobs", response_model=Job, status_code=201, dependencies=[Depends(mutation)])
+    async def submit(prediction: TaskRequest, idempotency_key: Annotated[UUID, Header()]):
+        return await enqueue(prediction, idempotency_key)
+
+    @app.get("/api/jobs/{job_id}/environment", response_model=EnvironmentRecord)
+    def execution_environment(job_id: UUID):
+        required(job_id)
+        record = store.environment(str(job_id))
+        if record is None:
+            raise HTTPException(404, "This task has no recorded environment binding.")
+        return record
+
+    @app.get("/api/jobs/{job_id}", response_model=Job)
+    def detail(job_id: UUID):
+        return required(job_id)
+
+    @app.post("/api/jobs/{job_id}/cancel", response_model=Job, dependencies=[Depends(mutation)])
+    async def cancel(job_id: UUID):
+        job = required(job_id)
+        if job.status == "paused":
+            try:
+                await engine.stop(job.id)
+            except (OSError, RuntimeError, TimeoutError) as exc:
+                raise HTTPException(503, "Native cancellation could not be confirmed.") from exc
+            return store.cancel_paused(job.id)
+        if (
+            job.status == "running"
+            and job.request.operation == "harness"
+            and job.request.tool != "fold"
+        ):
+            raise HTTPException(
+                409,
+                "This native synchronous tool cannot be cancelled after dispatch. "
+                "Wait for its result; queued tasks can be cancelled.",
+            )
+        return store.cancel(str(job_id))
+
+    @app.post(
+        "/api/jobs/{job_id}/retry",
+        response_model=Job,
+        status_code=201,
+        dependencies=[Depends(mutation)],
+    )
+    async def retry(job_id: UUID, idempotency_key: Annotated[UUID, Header()]):
+        job = required(job_id)
+        if job.status not in TERMINAL:
+            raise HTTPException(409, "Only finished tasks can be retried.")
+        return await enqueue(job.request, idempotency_key, job.id)
+
+    @app.get("/api/jobs/{job_id}/logs")
+    def logs(job_id: UUID):
+        required(job_id)
+        return log_tail(settings.state_dir / "jobs" / str(job_id) / "run.log")
+
+    @app.get("/api/jobs/{job_id}/artifacts")
+    def artifacts(job_id: UUID):
+        job = required(job_id)
+        if job.status not in TERMINAL:
+            return []
+        return list_artifacts(settings.state_dir / "jobs" / str(job_id) / "output")
+
+    @app.get("/api/jobs/{job_id}/download")
+    def download(job_id: UUID, name: str = Query(min_length=1, max_length=500)):
+        job = required(job_id)
+        if job.status not in TERMINAL:
+            raise HTTPException(409, "Wait for the task to finish before downloading results.")
+        try:
+            directory = settings.state_dir / "jobs" / str(job_id)
+            if name.startswith("analysis/"):
+                import re
+
+                if job.request.operation != "predict" or not re.fullmatch(
+                    r"analysis/workbench-aligned/[A-Za-z0-9_-]+\.cif", name
+                ):
+                    raise ValueError("Unsupported derived analysis artifact.")
+                path = contained(directory, name)
+            else:
+                path = contained(directory / "output", name)
+        except (ValueError, FileNotFoundError) as error:
+            raise HTTPException(404, "Artifact not found.") from error
+        return FileResponse(path, filename=path.name, media_type="application/octet-stream")
+
+    @app.get("/api/jobs/{job_id}/input")
+    def input_document(job_id: UUID):
+        job = required(job_id)
+        headers = {"Cache-Control": "no-store"}
+        path = settings.state_dir / "jobs" / job.id / "input.json"
+        if path.is_file():
+            try:
+                path = contained(path.parent, "input.json")
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(404, "Input artifact is unavailable.") from exc
+            return FileResponse(
+                path,
+                filename=f"{job.id}-input.json",
+                media_type="application/json",
+                # Historical archives can also have a restored input.json on disk.
+                headers={**headers, "X-XDDE-Input-Source": "stored-document"},
+            )
+        headers["Content-Disposition"] = f'attachment; filename="{job.id}-input.json"'
+        if isinstance(job.request, Prediction):
+            bindings = {
+                identifier: "/job/assets/" + identifier + asset.suffix
+                for identifier, asset in assets.validate_bindings(job.request).items()
+            }
+            return JSONResponse(
+                job.request.inference_input(job.id, bindings),
+                headers={**headers, "X-XDDE-Input-Source": "reconstructed"},
+            )
+        # Preserve the original stored JSON, including fields absent in older requests.
+        with store.connect() as db:
+            authored = db.execute("SELECT request FROM jobs WHERE id=?", (job.id,)).fetchone()
+        if authored is None:
+            raise HTTPException(404, "Task input is unavailable.")
+        return Response(
+            authored["request"],
+            media_type="application/json",
+            headers={**headers, "X-XDDE-Input-Source": "recorded-request"},
+        )
+
+    upload_workers = AssetUploadWorkers()
+    close_uploads = register_assets(
+        app, assets, mutation, settings.minimum_free_bytes, workers=upload_workers
+    )
+    register_uploads(app, assets, settings, mutation, workers=upload_workers)
+    harness_service = register_harness(app, store, assets, settings, mutation)
+
+    async def scientific_busy(*, include_paused=False):
+        statuses = ("queued", "running", "cancelling")
+        if include_paused:
+            statuses += ("paused",)
+        with store.connect() as db:
+            active = db.execute(
+                "SELECT 1 FROM jobs WHERE status IN ("
+                + ",".join("?" for _ in statuses)
+                + ") LIMIT 1",
+                statuses,
+            ).fetchone()
+        if active or workflows_service.records.runs({"running", "cancelling"}, limit=1):
+            return True
+        if include_paused and harness_service.has_unresolved_launch():
+            return True
+        if settings.harness_python and settings.harness_python.is_file():
+            try:
+                return bool(await harness_service.invoke({"operation": "active"}, timeout=15))
+            except (RuntimeError, ValueError, OSError, TimeoutError):
+                raise HTTPException(
+                    503, "Cannot verify native task state; retry after checking Harness."
+                ) from None
+        return False
+
+    async def deployment_claim(claim):
+        # The same lock guards HTTP task and Harness admissions. Release it
+        # after queued -> running, before any long-running installer work.
+        async with mutations:
+            if app.state.quiescing:
+                return None
+            try:
+                if await scientific_busy(include_paused=True):
+                    return None
+            except HTTPException:
+                # Unknown native state must leave deployment queued, never
+                # terminate the worker or authorize component changes.
+                return None
+            return claim()
+
+    @app.get("/api/lifecycle")
+    async def lifecycle():
+        return {
+            "busy": bool(
+                any(
+                    r["state"] in {"queued", "running", "pausing"} for r in deployments.store.rows()
+                )
+            )
+            or await scientific_busy()
+        }
+
+    register_capabilities(app, settings, health)
+    register_task_history(app, example_library)
+    # A retained native pause still owns its component files. Unlike lifecycle
+    # shutdown, deployment must wait for confirmed cancellation of that lifetime.
+    register_deployments(app, deployments, mutation, lambda: scientific_busy(include_paused=True))
+
+    @app.post("/api/lifecycle/stop", dependencies=[Depends(mutation)])
+    async def prepare_shutdown():
+        if (await lifecycle())["busy"]:
+            raise HTTPException(409, "Pause deployments and stop scientific tasks before closing.")
+        app.state.quiescing = True
+        return {"busy": False}
+
+    worker.gate = harness_service.queue_gate
+    from .runtime_controls import register_runtime_controls
+
+    register_runtime_controls(app, store, engine, worker, health, mutation, harness_service)
+    from .discovery.routes import register_discovery
+
+    register_discovery(app, mutation)
+    register_operations(app, store, assets, settings, mutation)
+    register_evidence(app, store, assets, mutation)
+    register_research(app, store, assets, mutation)
+    register_drafts(app, store, mutation)
+    from .research.pose_routes import register_pose_minimization
+
+    register_pose_minimization(app, store, assets, settings, mutation, enqueue)
+    register_examples(app, store, assets, settings, mutation)
+    register_sites(app, store, assets, settings, mutation)
+    register_pose_explorations(app, store, assets, settings, mutation)
+    regions = register_regions(app, store, assets, settings, mutation)
+    constraints = register_constraints(app, store, assets, settings, mutation)
+    workflows_service = register_workflows(
+        app, store, assets, worker, preflight, settings, mutation
+    )
+    register_projects(app, store, mutation)
+    register_science(app, store, engine, settings)
+    web = Path(__file__).parent / "web"
+    if web.is_dir():
+        app.mount("/", StaticFiles(directory=web, html=True), name="web")
+    return app

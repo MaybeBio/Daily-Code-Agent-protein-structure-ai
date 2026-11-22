@@ -1,20 +1,20 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/lammps/lammps
-- 快照日期: 2026-11-18
-- 快照 commit: [`582a54bcaaec`](https://github.com/lammps/lammps/commit/582a54bcaaec568889b5960793d318c1b863ffbc)
+- 快照日期: 2026-11-22
+- 快照 commit: [`06428256f980`](https://github.com/lammps/lammps/commit/06428256f980b63d014d81b9ad973a6141976a1b)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (10793 个文件, 96.4 MB)
+## 保留 (10795 个文件, 96.5 MB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|
-| 源码 | 8054 | 77.7 MB |
-| 文档 | 1159 | 9.3 MB |
-| 构建/配置 | 1310 | 8.9 MB |
+| 源码 | 8055 | 77.7 MB |
+| 文档 | 1159 | 9.4 MB |
+| 构建/配置 | 1311 | 8.9 MB |
 | README | 270 | 524.2 KB |
 
-按后缀: `.cpp` 3639 (47.9 MB)、`.h` 2835 (11.7 MB)、`.hpp` 848 (8.9 MB)、`.rst` 1096 (8.7 MB)、`.yaml` 1186 (8.3 MB)、`.fs` 13 (4.1 MB)、`.py` 200 (1.5 MB)、`.cu` 115 (1.5 MB)、`.md` 94 (682.1 KB)、`.cmake` 153 (469.6 KB)、`无后缀` 221 (448.3 KB)、`.c` 35 (416.6 KB)、`.f90` 22 (309.9 KB)、`CMakeLists.txt` 89 (287.1 KB)、`.html` 25 (271.8 KB)、`.sh` 112 (245.4 KB)、`.cfg` 2 (232.7 KB)、`.pl` 12 (161.2 KB)、`.css` 4 (139.2 KB)、`.f` 9 (85.1 KB)、`.sty` 3 (47.4 KB)、`.pyx` 5 (43.8 KB)、`Makefile` 11 (43.7 KB)、`.ipynb` 6 (34.9 KB)、`.m` 7 (27.5 KB)、`.yml` 14 (26.4 KB)、`.toml` 1 (21.3 KB)、`.txt` 12 (10.5 KB)、`.js` 2 (5.8 KB)、`.mm` 5 (4.6 KB)、`.bash` 4 (3.9 KB)、`configure` 2 (3.3 KB)、`.cc` 2 (2.8 KB)、`setup.py` 2 (2.6 KB)、`.mk` 2 (2.3 KB)、`.cs` 1 (1.6 KB)、`.conf` 1 (481 B)、`.awk` 1 (414 B)、`.tcl` 1 (215 B)、`pyproject.toml` 1 (105 B)
+按后缀: `.cpp` 3640 (47.9 MB)、`.h` 2835 (11.7 MB)、`.hpp` 848 (8.9 MB)、`.rst` 1096 (8.7 MB)、`.yaml` 1187 (8.3 MB)、`.fs` 13 (4.1 MB)、`.py` 200 (1.5 MB)、`.cu` 115 (1.5 MB)、`.md` 94 (682.1 KB)、`.cmake` 153 (469.6 KB)、`无后缀` 221 (448.3 KB)、`.c` 35 (416.6 KB)、`.f90` 22 (309.9 KB)、`CMakeLists.txt` 89 (287.4 KB)、`.html` 25 (271.8 KB)、`.sh` 112 (245.4 KB)、`.cfg` 2 (232.7 KB)、`.pl` 12 (161.2 KB)、`.css` 4 (139.2 KB)、`.f` 9 (85.1 KB)、`.sty` 3 (47.4 KB)、`.pyx` 5 (43.8 KB)、`Makefile` 11 (43.7 KB)、`.ipynb` 6 (34.9 KB)、`.m` 7 (27.5 KB)、`.yml` 14 (26.4 KB)、`.toml` 1 (21.3 KB)、`.txt` 12 (10.5 KB)、`.js` 2 (5.8 KB)、`.mm` 5 (4.6 KB)、`.bash` 4 (3.9 KB)、`configure` 2 (3.3 KB)、`.cc` 2 (2.8 KB)、`setup.py` 2 (2.6 KB)、`.mk` 2 (2.3 KB)、`.cs` 1 (1.6 KB)、`.conf` 1 (481 B)、`.awk` 1 (414 B)、`.tcl` 1 (215 B)、`pyproject.toml` 1 (105 B)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

@@ -1,0 +1,56 @@
+# include the machine dependent configuration
+ifneq ($(MAKECMDGOALS),clean)
+  -include ../Makefile.conf
+endif
+
+.PHONY: all clean
+
+plumed_compiled := $(wildcard ../src/lib/plumed)
+
+# The syntax files are generated with "plumed gen_vim" in the cltools module.
+# cltools is a default-on module, so it is disabled when src/cltools.off exists
+# (see src/maketools/find_modules.sh), e.g. with ./configure --enable-modules=none
+cltools_disabled := $(wildcard ../src/cltools.off)
+
+ifeq ($(strip $(plumed_compiled)),)
+
+all:
+	@echo You must compile plumed before building the VIM syntax file
+
+else
+
+ifneq ($(strip $(cltools_disabled)),)
+
+# files left by a previous build with cltools enabled would be installed otherwise
+all:
+	@echo The cltools module is disabled, so you cannot generate VIM syntax file
+	rm -fr syntax help .syntax.stamp
+
+else
+
+ifeq ($(program_can_run),no)
+
+all:
+	@echo PLUMED cannot run on this machine, so you cannot generate VIM syntax file
+
+else
+
+# The C++ generator writes all syntax and help files in one process.
+# Regenerate when the executable, wrapper, sourced environment, or templates change.
+# The stamp file records when the last generation was completed
+# (the script is also run if it fails half way, since the stamp is not updated).
+all: .syntax.stamp
+
+.syntax.stamp: vimsyntax.sh ../src/lib/plumed ../sourceme.sh templates/plumed.vim.in templates/plumedf.vim
+	rm -f $@
+	./vimsyntax.sh
+	touch $@
+
+endif
+
+endif
+
+endif
+
+clean:
+	rm -fr syntax help .syntax.stamp

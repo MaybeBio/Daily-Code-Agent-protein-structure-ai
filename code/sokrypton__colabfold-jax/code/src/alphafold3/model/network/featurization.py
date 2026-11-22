@@ -1,0 +1,754 @@
+# Copyright 2024 DeepMind Technologies Limited
+#
+# AlphaFold 3 source code is licensed under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with the
+# License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# To request access to the AlphaFold 3 model parameters, follow the process set
+# out at https://github.com/google-deepmind/alphafold3. You may only use these
+# if received directly from Google. Use is subject to terms of use available at
+# https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
+
+"""Model-side of the input features processing."""
+
+import contextlib
+import dataclasses
+import functools
+
+from alphafold3.constants import residue_names
+from alphafold3.model import feat_batch
+from alphafold3.model import features
+from alphafold3.model.components import utils
+import jax
+import jax.numpy as jnp
+
+
+def widen_to_esm_classes(block, is_dna):
+  """An AF3 31-class restype or profile block [..., 31] in ESMFold2's 33 classes, for a layer that keeps their width.
+
+  ESM: 0 unused, 1 the gap, 2..22 the residues and UNK, 23..26 A G C U, 27 N, 28..31 DA DG DC DT, 32 DN. AF3 puts the
+  gap at 21 and N last, after the DNA (converters.esmfold2.esm_class_of_af3 is the same table for weight rows).
+  AF3's 31 classes have no DN: its featuriser writes a DNA chain's unknown residue as N (features.py, UNK_DNA ->
+  UNK_NUCLEIC_ONE_LETTER). ESMFold2 tells them apart (DN for DNA, N for RNA), so a DNA token's N column is DN's:
+  `is_dna` [...] (the tokens' chain type) routes it, as biohub's builder types it.
+  """
+  zero = jnp.zeros_like(block[..., :1])
+  dna = jnp.asarray(is_dna, block.dtype)[..., None]
+  unk = block[..., 30:31]
+  return jnp.concatenate([zero, block[..., 21:22], block[..., :21], block[..., 22:26], unk * (1 - dna),
+                          block[..., 26:30], unk * dna], axis=-1)
+
+
+def widen_s_inputs(feat, is_dna):
+  """AF3's 447-wide s_inputs [restype 31 | profile 31 | the rest] as ESMFold2's 451 (each 31-class block widened,
+  DN routed by `is_dna`), in AF3's block order - the order converters/esmfold2.permute_s_inputs writes its rows in."""
+  n = residue_names.POLYMER_TYPES_NUM_WITH_UNKNOWN_AND_GAP
+  return jnp.concatenate([widen_to_esm_classes(feat[..., :n], is_dna), widen_to_esm_classes(feat[..., n:2 * n], is_dna),
+                          feat[..., 2 * n:]], axis=-1)
+
+
+def _grid_keys(key, shape):
+  """Generate a grid of rng keys that is consistent with different padding.
+
+  Generate random keys such that the keys will be identical, regardless of
+  how much padding is added to any dimension.
+
+  Args:
+    key: A PRNG key.
+    shape: The shape of the output array of keys that will be generated.
+
+  Returns:
+    An array of shape `shape` consisting of random keys.
+  """
+  if not shape:
+    return key
+  new_keys = jax.vmap(functools.partial(jax.random.fold_in, key))(
+      jnp.arange(shape[0])
+  )
+  return jax.vmap(functools.partial(_grid_keys, shape=shape[1:]))(new_keys)
+
+
+def _padding_consistent_rng(f):
+  """Modify any element-wise random function to be consistent with padding.
+
+  Normally if you take a function like jax.random.normal and generate an array,
+  say of size (10,10), you will get a different set of random numbers to if you
+  add padding and take the first (10,10) sub-array.
+
+  This function makes a random function that is consistent regardless of the
+  amount of padding added.
+
+  Note: The padding-consistent function is likely to be slower to compile and
+  run than the function it is wrapping, but these slowdowns are likely to be
+  negligible in a large network.
+
+  Args:
+    f: Any element-wise function that takes (PRNG key, shape) as the first 2
+      arguments.
+
+  Returns:
+    An equivalent function to f, that is now consistent for different amounts of
+    padding.
+  """
+
+  def inner(key, shape, **kwargs):
+    keys = _grid_keys(key, shape)
+    signature = (
+        '()->()'
+        if jax.dtypes.issubdtype(keys.dtype, jax.dtypes.prng_key)
+        else '(2)->()'
+    )
+    return jnp.vectorize(
+        functools.partial(f, shape=(), **kwargs), signature=signature
+    )(keys)
+
+  return inner
+
+
+def gumbel_argsort_sample_idx(
+    key: jnp.ndarray, logits: jnp.ndarray
+) -> jnp.ndarray:
+  """Samples with replacement from a distribution given by 'logits'.
+
+  This uses Gumbel trick to implement the sampling an efficient manner. For a
+  distribution over k items this samples k times without replacement, so this
+  is effectively sampling a random permutation with probabilities over the
+  permutations derived from the logprobs.
+
+  Args:
+    key: prng key
+    logits: logarithm of probabilities to sample from, probabilities can be
+      unnormalized.
+
+  Returns:
+    Sample from logprobs in one-hot form.
+  """
+  gumbel = _padding_consistent_rng(jax.random.gumbel)
+  z = gumbel(key, logits.shape)
+  # This construction is equivalent to jnp.argsort, but using a non stable sort,
+  # since stable sort's aren't supported by jax2tf
+  axis = len(logits.shape) - 1
+  # int32, not int64: these are sort indices over the last axis, and JAX
+  # without x64 truncates the request anyway -- which it says, once per
+  # fold, as a UserWarning from this line. Same values, no warning.
+  iota = jax.lax.broadcasted_iota(jnp.int32, logits.shape, axis)
+  _, perm = jax.lax.sort_key_val(
+      logits + z, iota, dimension=-1, is_stable=False
+  )
+  return perm[::-1]
+
+
+def blend_soft(one_hot: jax.Array, soft_seq, design_mask=None) -> jax.Array:
+  """substitute a soft amino-acid distribution for the leading one-hot block
+
+  ColabDesign2 addition. AF3 takes sequence as an integer aatype, so design needs
+  a continuous relaxation of it; this is where that enters. The soft
+  distribution covers the 20 standard amino acids and is zero-padded to AF3's
+  token alphabet, which says "definitely a standard amino acid" rather than
+  leaving UNK, GAP and the nucleic acid classes free.
+
+  design_mask selects which tokens it applies to. Everything else keeps its true
+  identity, which is what a binder target, a scaffolded motif, and any DNA or
+  ligand token need -- a distribution over amino acids is meaningless on a
+  ligand atom.
+
+  This used to be done by replacing this module's functions at trace time from
+  soft.py. That worked, but the jit cache key then had to hand-encode which
+  patches were live, and when it did not two diffusion modes silently compiled
+  to one graph.
+  """
+  if soft_seq is None:
+    return one_hot
+  # both arrays are aligned from the RIGHT, because the token axis is the last
+  # but one in every caller: target_feat is (tokens, classes) while msa_feat is
+  # (rows, tokens, classes). Aligning by leading dimensions instead put the mask
+  # on the MSA row axis and silently produced (tokens, tokens, classes).
+  n = soft_seq.shape[-1]
+  soft = jnp.pad(soft_seq, [(0, 0)] * (soft_seq.ndim - 1) +
+                 [(0, one_hot.shape[-1] - n)]).astype(one_hot.dtype)
+  if design_mask is None:
+    return jnp.broadcast_to(soft, one_hot.shape)
+  return jnp.where(design_mask[..., None], soft, one_hot)
+
+
+def blend_profile(profile, soft_seq, design_mask):
+  """The profile channel, updated with the designed sequence per PROFILE_MODE.
+
+  `create_target_feat` does this for the AF3 path; the boltz2 and chai-1
+  branches of model.py read `batch.msa.profile` directly and so were handed the
+  PLACEHOLDER's profile for the whole of a design -- the same confidently wrong
+  signal PROFILE_MODE exists to remove. This is that logic, callable from a
+  model branch.
+  """
+  if soft_seq is None:
+    return profile
+  if PROFILE_MODE == 'soft':
+    return _msa_blend(profile, soft_seq, design_mask, channel='profile')
+  if PROFILE_MODE == 'hard':
+    return _msa_blend(profile, hard_seq(soft_seq), design_mask,
+                      channel='profile')
+  if PROFILE_MODE == 'zero':
+    return jnp.zeros_like(profile)
+  if PROFILE_MODE in ('unk', 'gap'):
+    idx = _PROFILE_UNK_INDEX if PROFILE_MODE == 'unk' else _PROFILE_GAP_INDEX
+    return token_profile(profile, idx, design_mask)
+  return profile                       # 'frozen'
+
+
+def hard_seq(soft_seq):
+  """straight-through one-hot(argmax) of a soft distribution, or None.
+
+  ColabDesign2. The profile-hard mode (AF2's pssm_hard=True) feeds the profile a
+  DISCRETE one-hot of the designed sequence rather than its soft distribution.
+  This reconstructs seq['hard'] from soft_seq at the blend site so the profile
+  path needs no extra threading: argmax(softmax(logits)) == argmax(logits), and
+  the straight-through estimator keeps the gradient flowing into soft_seq.
+  """
+  if soft_seq is None:
+    return None
+  one_hot = jax.nn.one_hot(jnp.argmax(soft_seq, axis=-1), soft_seq.shape[-1],
+                           dtype=soft_seq.dtype)
+  return soft_seq + jax.lax.stop_gradient(one_hot - soft_seq)
+
+
+# Profile alphabet indices (residue_names.POLYMER_TYPES_ORDER_WITH_UNKNOWN_AND_GAP):
+# 0..19 = the 20 standard amino acids (0 = ALA), 20 = UNK ("some amino acid,
+# identity unknown"), 21 = GAP ("no residue here"). The current 'frozen'
+# placeholder is a one-hot at 0 -- poly-alanine, a confidently WRONG profile.
+_PROFILE_UNK_INDEX = 20
+_PROFILE_GAP_INDEX = 21
+
+
+def token_profile(profile, token_index, design_mask):
+  """set the profile to a one-hot at token_index on the design positions.
+
+  ColabDesign2. A non-committal 'frozen' profile: rather than asserting
+  poly-alanine (index 0), assert UNK (20, "unknown amino acid") or GAP (21). Off
+  the design_mask -- targets, motifs, ligands -- the real profile is kept.
+  """
+  onehot = jax.nn.one_hot(token_index, profile.shape[-1], dtype=profile.dtype)
+  onehot = jnp.broadcast_to(onehot, profile.shape)
+  if design_mask is None:
+    return onehot
+  return jnp.where(design_mask[..., None], onehot, profile)
+
+
+# ColabDesign2: how create_target_feat derives the MSA profile during design.
+# This is the profile-feature analogue of the SEQUENCE's own soft/hard relaxation
+# (opt['soft']/opt['hard']), and it is the AF3 twin of AF2's opt['pssm_hard'].
+# Unified vocabulary (same words the AF2 runner uses for the profile):
+#   'soft'  (DEFAULT) profile follows the designed sequence as a soft
+#           distribution   == AF2 pssm_hard=False. REQUIRED for design so the
+#           design forward matches the prediction forward; a no-op for prediction
+#           (blend_soft returns the profile unchanged when soft_seq is None).
+#   'hard'  profile follows the designed sequence as a straight-through argmax
+#           one-hot          == AF2 pssm_hard=True -- the mode AF2 MULTIMER design
+#           REQUIRES (a soft profile was not enough there). Untested for AF3; the
+#           reason this knob exists.
+#   'frozen' profile ignores the sequence (stays at the poly-alanine placeholder)
+#           -- AF3's ORIGINAL behaviour, which reintroduces the design/prediction
+#           mismatch. No AF2 analogue; kept only for ablation.
+#   'unk'   profile ignores the sequence but asserts UNK ("some amino acid,
+#           identity unknown") on the design positions instead of poly-alanine --
+#           the HONEST non-committal frozen signal. AF2 never tried this (its
+#           profile always tracks the sequence via pssm_hard).
+#   'gap'   like 'unk' but asserts GAP ("no residue here"). Semantically wrong for
+#           a query that has residues everywhere; the AF2-tried variant.
+#   'zero'  no MSA profile information.
+# Read at trace time, so switching modes recompiles -- an experiment knob, not a
+# per-step option. See colabdesign2/af2/runner.py update_seq (the pssm_hard site).
+# ColabDesign2: does the designed sequence reach the model through the MSA and
+# profile channels WITH A GRADIENT, or only through the target-feature one?
+#
+# Ours says yes on all three paths. BoltzDesign1 says no: it writes the current
+# sequence into batch['msa'] and batch['profile'] with `.detach()`
+# (boltzdesign_utils.py:797-798), so its optimiser only ever sees the
+# target-feature route. Which is better is an empirical question -- an MSA
+# channel that is a softmax over 20 classes is an odd object for a trunk
+# trained on real alignments -- so it is a switch, not a rewrite.
+# 'both' (ours), 'none' (BoltzDesign's), or ONE of the two channels, because
+# they are different objects: the MSA one-hot is a row of an alignment the
+# trunk attends over, while the profile is a per-position frequency vector.
+# Measured (design, 3 seeds, PD1): boltz2 0.935 attached against 0.914
+# detached, so the extra paths help slightly rather than hurting.
+MSA_GRADIENT = 'both'
+MSA_GRADIENT_MODES = ('both', 'msa', 'profile', 'none')
+
+
+def set_msa_gradient(enabled) -> str:
+  '''which channels the designed sequence carries a gradient through.
+
+  True/False keep the original two-valued meaning. Returns the previous
+  setting, so a caller can restore it.
+  '''
+  global MSA_GRADIENT
+  mode = {True: 'both', False: 'none'}.get(enabled, enabled)
+  if mode not in MSA_GRADIENT_MODES:
+    raise ValueError('msa gradient must be one of %s, got %r'
+                     % (', '.join(MSA_GRADIENT_MODES), enabled))
+  previous, MSA_GRADIENT = MSA_GRADIENT, mode
+  return previous
+
+
+def _msa_blend(one_hot, soft_seq, design_mask, channel='msa'):
+  '''blend_soft, with the gradient cut on the channels that are switched off.'''
+  out = blend_soft(one_hot, soft_seq, design_mask)
+  if MSA_GRADIENT in ('both', channel):
+    return out
+  return jax.lax.stop_gradient(out)
+
+
+PROFILE_MODE = 'soft'
+
+PROFILE_MODES = ('soft', 'hard', 'frozen', 'unk', 'gap', 'zero')
+
+
+def set_profile_mode(mode: str) -> str:
+  """Set PROFILE_MODE by name, rejecting a typo instead of silently ignoring it.
+
+  A module global assigned from outside is a global assigned WITHOUT a spell
+  check: `PROFILE_MODE = 'hrad'` is not an error, it just falls through every
+  branch to the default and the caller gets soft profiles while believing it
+  asked for hard ones. Returns the previous value so a caller can restore it.
+  """
+  global PROFILE_MODE
+  if mode not in PROFILE_MODES:
+    raise ValueError(
+        f'unknown profile mode {mode!r}; expected one of '
+        + ', '.join(repr(m) for m in PROFILE_MODES))
+  previous, PROFILE_MODE = PROFILE_MODE, mode
+  return previous
+
+
+@contextlib.contextmanager
+def profile_mode(mode: str):
+  """PROFILE_MODE for the duration of a block, restored on the way out.
+
+  Remember what it costs: the mode is read at TRACE time, so entering and
+  leaving this around traced code buys a recompile each way. It is for setting
+  up a design run, not for wrapping a step.
+  """
+  previous = set_profile_mode(mode)
+  try:
+    yield mode
+  finally:
+    set_profile_mode(previous)
+
+
+def create_msa_feat(msa: features.MSA, soft_seq=None,
+                    design_mask=None, chai1=False, is_ligand=None,
+                    asym_id=None, deletion_scale=2.0 / jnp.pi) -> jax.Array:
+  """Create and concatenate MSA features."""
+  rows = msa.rows
+  if chai1 and is_ligand is not None:
+    # A non-polymer token has no MSA, and chai does NOT mark it as a gap the way
+    # we do. Read off its own features: the QUERY row carries class 20, the
+    # unknown residue, and every other row carries 32, the mask -- where we put
+    # our gap (21, i.e. chai's 31) on all of them. In our vocabulary those are
+    # 20 and 31 respectively. Getting this wrong left the MSA input projection
+    # exact on protein tokens (corr 0.999997) and adrift on ligand ones (0.774).
+    lig = is_ligand.astype(bool)[None, :]
+    query = jnp.arange(rows.shape[0])[:, None] == 0
+    unk = residue_names.POLYMER_TYPES_WITH_UNKNOWN_AND_GAP.index(
+        residue_names.UNK)                                     # 20
+    mask_cls = residue_names.POLYMER_TYPES_NUM_WITH_UNKNOWN_AND_GAP  # 31, mask
+    rows = jnp.where(lig, jnp.where(query, unk, mask_cls), rows)
+  msa_1hot = jax.nn.one_hot(
+      rows, residue_names.POLYMER_TYPES_NUM_WITH_UNKNOWN_AND_GAP + 1
+  )
+  msa_1hot = _msa_blend(msa_1hot, soft_seq, design_mask, channel='msa')
+  deletion_matrix = msa.deletion_matrix
+  has_deletion = jnp.clip(deletion_matrix, 0.0, 1.0)[..., None]
+  deletion_value = (jnp.arctan(deletion_matrix / 3.0) * deletion_scale)[
+      ..., None
+  ]
+
+  msa_feat = [
+      msa_1hot,
+      has_deletion,
+      deletion_value,
+  ]
+
+  if chai1:
+    # chai's MSA stream is 42 columns in ALPHABETICAL feature order --
+    #   IsPairedMSA(1) | MSADataSource(one-hot 6) | MSADeletionValue(1)
+    #   | MSAHasDeletion(1) | MSAOneHot(one-hot 33)
+    # note deletion VALUE precedes HAS-deletion, the opposite of ours -- and
+    # verified against chai's own input_projs.MSA output at corr 0.99999711
+    # (tools/oracles/chai1/cmp_msa_stream.py).
+    #
+    # The one-hot stays in OUR 32-class vocabulary here and the converter
+    # permutes chai's 33 weight columns onto it, so the vocab mapping lives in
+    # one place (converters.chai1.CHAI1_RESTYPE_PERM) instead of two.
+    #
+    # Two features derived rather than carried:
+    #  * IsPairedMSA is chai's pairing key matching the row's first token's, on tokens with a real row: 1 on the
+    #    paired block's homolog rows, and on the query row as chai's ColabFold path keys it (see below), only where
+    #    both that token's chain and the first token's chain have a hit. AF3 lays unpaired rows side by side too, so "covers more than one chain" marked every row
+    #    of every complex paired where native has none (tetr_dimer_dna: 30464/30464 cells wrong).
+    #  * MSADataSource labels which database a row came from: 4 for the query row, and per row what chai's colabfold
+    #    reader synthesises from the a3m header (UniRef* -> UNIREF90 2, anything else -> BFD_UNICLUST 0) when the
+    #    featuriser carried it (msa.source), else 2.
+    n_row = msa_1hot.shape[0]
+    is_paired = jnp.zeros(msa_1hot.shape[:2], msa_1hot.dtype)
+    if asym_id is not None and msa.num_paired is not None:
+      n_ch = 16          # bound: more chains than any complex this runs on
+      oh = jax.nn.one_hot(jnp.clip(asym_id, 0, n_ch - 1), n_ch)
+      hit = (msa.rows != residue_names.POLYMER_TYPES_WITH_UNKNOWN_AND_GAP.index(residue_names.GAP)) & msa.mask.astype(bool)
+      chain_hit = jnp.einsum('rt,tc->rc', hit.astype(jnp.float32), oh) > 0
+      tok_hit = jnp.einsum('rc,tc->rt', chain_hit.astype(jnp.float32), oh) > 0
+      r = jnp.arange(n_row)[:, None]
+      paired = (r > 0) & (r < msa.num_paired) & tok_hit & tok_hit[:, :1] & msa.mask.astype(bool)
+      # The QUERY row too, as chai's ColabFold path writes it (the reference chosen 2026-10-19): the query is
+      # row 0 of each protein chain's pair a3m, pairing key '0', so IsPairedMSA (key == key at the row's first
+      # token, key set) marks it wherever both that token's chain and the first token's chain have a ColabFold MSA
+      # -- i.e. live homolog rows; a chain in chai's single-sequence context has none and stays unpaired.
+      # Stock chai (vendor_native_parity msa): query row paired, our IsPairedMSA column was the whole MSA-stream gap.
+      chain_msa = jnp.einsum('rt,tc->c', (hit & (r > 0)).astype(jnp.float32), oh) > 0
+      tok_msa = jnp.einsum('c,tc->t', chain_msa.astype(jnp.float32), oh) > 0
+      query = (r == 0) & tok_msa[None, :] & tok_msa[None, :1] & msa.mask.astype(bool)
+      is_paired = (paired | query).astype(msa_1hot.dtype)
+    is_paired = is_paired[..., None]
+    src = jnp.where(jnp.arange(n_row) == 0, 4, 2 if msa.source is None else msa.source)
+    # a PADDED cell (masked: a shorter chain's rows past its depth, a chain in single-sequence context) carries
+    # chai's pad source, 4 -- MSAContext.pad fills sequence_source with it; read off stock chai's MSADataSource
+    # (vendor_native_parity chai1 paired_msa)
+    src = jnp.where(msa.mask.astype(bool), src[:, None], 4)
+    src = jax.nn.one_hot(src, 6, dtype=msa_1hot.dtype)
+    return jnp.concatenate(
+        [is_paired, src, deletion_value, has_deletion, msa_1hot], axis=-1)
+
+  return jnp.concatenate(msa_feat, axis=-1)
+
+
+def truncate_msa_batch(msa: features.MSA, num_msa: int) -> features.MSA:
+  # PAD, never gather past the end. A batch shallower than num_msa used to read
+  # rows num_rows..num_msa-1 through JAX's clamped gather -- copies of the last
+  # row, mask 1 included -- so a 2-row MSA reached the trunk as 1024 live rows
+  # and the outer product mean divided by ~1024 instead of 2 (openfold3
+  # heterodimer, trunk pair max|d|/rms 2.06 against stock OF3). Padding rows
+  # are what the featuriser pads with: zeros, mask 0.
+  n = msa.rows.shape[0]
+  if n < num_msa:
+    pad = lambda x: jnp.pad(x, ((0, num_msa - n), (0, 0)))
+    msa = dataclasses.replace(msa, rows=pad(msa.rows), mask=pad(msa.mask),
+                              deletion_matrix=pad(msa.deletion_matrix))
+  indices = jnp.arange(num_msa)
+  return msa.index_msa_rows(indices)
+
+
+def create_target_feat(
+    batch: feat_batch.Batch,
+    append_per_atom_features: bool,
+    soft_seq=None,
+    design_mask=None,
+) -> jax.Array:
+  """Make target feat."""
+  token_features = batch.token_features
+  target_features = []
+  target_features.append(
+      blend_soft(
+          jax.nn.one_hot(
+              token_features.aatype,
+              residue_names.POLYMER_TYPES_NUM_WITH_UNKNOWN_AND_GAP,
+          ),
+          soft_seq,
+          design_mask,
+      )
+  )
+  # ColabDesign2: AF3 builds the profile ONCE from the placeholder sequence, so
+  # left alone ('frozen') it is a hard one-hot of poly-alanine while soft_seq
+  # changes the aatype one-hot and msa_1hot underneath it -- a confidently WRONG
+  # signal, the direct analogue of AF2's pssm_hard problem (a mismatched profile
+  # broke multimer design outright). PROFILE_MODE (see its definition above) is
+  # the profile-feature twin of AF2's pssm_hard: 'soft' == pssm_hard=False,
+  # 'hard' == pssm_hard=True, 'frozen' = ignore the sequence, 'zero' = no info.
+  profile = batch.msa.profile
+  if PROFILE_MODE == 'soft':
+    profile = _msa_blend(profile, soft_seq, design_mask, channel='profile')
+  elif PROFILE_MODE == 'hard':
+    profile = _msa_blend(profile, hard_seq(soft_seq), design_mask,
+                         channel='profile')
+  elif PROFILE_MODE == 'zero':
+    profile = jnp.zeros_like(profile)
+  elif PROFILE_MODE in ('unk', 'gap') and soft_seq is not None:
+    idx = _PROFILE_UNK_INDEX if PROFILE_MODE == 'unk' else _PROFILE_GAP_INDEX
+    profile = token_profile(profile, idx, design_mask)
+  elif PROFILE_MODE not in ('frozen', 'unk', 'gap'):
+    raise ValueError("PROFILE_MODE must be 'soft'/'hard'/'frozen'/'unk'/'gap'/"
+                     f"'zero', got {PROFILE_MODE!r}")
+  target_features.append(profile)
+  target_features.append(batch.msa.deletion_mean[..., None])
+
+  # Reference structure features
+  if append_per_atom_features:
+    ref_mask = batch.ref_structure.mask
+    element_feat = jax.nn.one_hot(batch.ref_structure.element, 128)
+    element_feat = utils.mask_mean(
+        mask=ref_mask[..., None], value=element_feat, axis=-2, eps=1e-6  # pyrefly: ignore[bad-argument-type]
+    )
+    target_features.append(element_feat)
+    pos_feat = batch.ref_structure.positions
+    pos_feat = pos_feat.reshape([pos_feat.shape[0], -1])
+    target_features.append(pos_feat)
+    target_features.append(ref_mask)
+
+  return jnp.concatenate(target_features, axis=-1)
+
+
+def create_relative_encoding(
+    seq_features: features.TokenFeatures,
+    max_relative_idx: int,
+    max_relative_chain: int,
+    chain_bucket_on_same_chain: bool = False,
+    rel_pos_same_residue: bool = False,
+    rows: jax.Array | None = None,
+) -> jax.Array:
+  """Add relative position encodings; `rows` (token indices) builds only those query rows.
+
+  `rel_pos_same_residue` gates the relative-position block on an equal residue
+  index in ANY chain instead of on the same chain (HelixFold3's
+  RelativePositionEncoding; model_config.RELPOS_SAME_RESIDUE_INDEX).
+
+  `chain_bucket_on_same_chain` selects ESMFold2's convention for the relative-
+  chain block, which differs from AF3's in BOTH the predicate and the branch:
+  AF3 keys it on same-ENTITY and sends the mismatch to the 2*c+1 bucket, while
+  ESMFold2 keys it on same-CHAIN and sends the MATCH there. On a monomer that is
+  not a subtle difference -- every pair takes bucket 2*c+1 instead of bucket c --
+  so a single wrong column of the embedding is added everywhere.
+
+  Honours seq_features.cyclic_period when present: the residue offset is wrapped
+  modulo each chain's period before clipping, so a cyclic peptide's termini read
+  as adjacent. Tokens with period 0 fall back to 10000, which is a no-op for any
+  realistic length -- so this is exactly identity when nothing is cyclic.
+  """
+  rel_feats = []
+  token_index = seq_features.token_index
+  residue_index = seq_features.residue_index
+  asym_id = seq_features.asym_id
+  entity_id = seq_features.entity_id
+  sym_id = seq_features.sym_id
+  left = lambda x: (x if rows is None else x[rows])[:, None]
+
+  left_asym_id = left(asym_id)
+  right_asym_id = asym_id[None, :]
+
+  left_residue_index = left(residue_index)
+  right_residue_index = residue_index[None, :]
+
+  left_token_index = left(token_index)
+  right_token_index = token_index[None, :]
+
+  left_entity_id = left(entity_id)
+  right_entity_id = entity_id[None, :]
+
+  left_sym_id = left(sym_id)
+  right_sym_id = sym_id[None, :]
+
+  # Embed relative positions using a one-hot embedding of distance along chain
+  offset = left_residue_index - right_residue_index
+  if seq_features.cyclic_period is not None:
+    # Boltz's RelativePositionEncoder: period broadcasts over the LAST axis, so
+    # the pair (i, j) uses token j's period -- keep that indexing, it is what the
+    # boltz2 checkpoint was trained with.
+    period = jnp.where(seq_features.cyclic_period > 0,
+                       seq_features.cyclic_period,
+                       jnp.full_like(seq_features.cyclic_period, 10000))
+    offset = offset - period[None, :] * jnp.round(offset / period[None, :])
+    offset = offset.astype(left_residue_index.dtype)
+  clipped_offset = jnp.clip(
+      offset + max_relative_idx, min=0, max=2 * max_relative_idx
+  )
+  asym_id_same = left_asym_id == right_asym_id
+  final_offset = jnp.where(
+      (left_residue_index == right_residue_index) if rel_pos_same_residue
+      else asym_id_same,
+      clipped_offset,
+      (2 * max_relative_idx + 1) * jnp.ones_like(clipped_offset),
+  )
+  rel_pos = jax.nn.one_hot(final_offset, 2 * max_relative_idx + 2)
+  rel_feats.append(rel_pos)
+
+  # Embed relative token index as a one-hot embedding of distance along residue
+  token_offset = left_token_index - right_token_index
+  clipped_token_offset = jnp.clip(
+      token_offset + max_relative_idx, min=0, max=2 * max_relative_idx
+  )
+  residue_same = (left_asym_id == right_asym_id) & (
+      left_residue_index == right_residue_index
+  )
+  final_token_offset = jnp.where(
+      residue_same,
+      clipped_token_offset,
+      (2 * max_relative_idx + 1) * jnp.ones_like(clipped_token_offset),
+  )
+  rel_token = jax.nn.one_hot(final_token_offset, 2 * max_relative_idx + 2)
+  rel_feats.append(rel_token)
+
+  # Embed same entity ID
+  entity_id_same = left_entity_id == right_entity_id
+  rel_feats.append(entity_id_same.astype(rel_pos.dtype)[..., None])
+
+  # Embed relative chain ID inside each symmetry class
+  rel_sym_id = left_sym_id - right_sym_id
+
+  max_rel_chain = max_relative_chain
+
+  clipped_rel_chain = jnp.clip(
+      rel_sym_id + max_rel_chain, min=0, max=2 * max_rel_chain
+  )
+
+  special = (2 * max_rel_chain + 1) * jnp.ones_like(clipped_rel_chain)
+  if chain_bucket_on_same_chain:
+    final_rel_chain = jnp.where(asym_id_same, special, clipped_rel_chain)
+  else:
+    final_rel_chain = jnp.where(entity_id_same, clipped_rel_chain, special)
+  rel_chain = jax.nn.one_hot(final_rel_chain, 2 * max_relative_chain + 2)
+
+  rel_feats.append(rel_chain)
+
+  return jnp.concatenate(rel_feats, axis=-1)
+
+
+def relative_encoding_segments(
+    seq_features: features.TokenFeatures,
+    max_relative_idx: int,
+    max_relative_chain: int,
+    chain_bucket_on_same_chain: bool = False,
+    rel_pos_same_residue: bool = False,
+):
+  """The same encoding as INDICES, so a projection of it can be a gather.
+
+  `create_relative_encoding` returns a concatenation of three one-hots and a
+  boolean, and every consumer immediately contracts it with a weight. That
+  product is a row lookup written as a matmul: for a one-hot block,
+  `one_hot(idx, N) @ W == W[idx]`. Building the one-hot first materialises an
+  (num_tokens, num_tokens, 139) float32 array to do it -- 82 MB at 384 tokens,
+  583 MB at 1024, and it grows with the square of the sequence.
+
+  Returns (pos_idx, width), (token_idx, width), same_entity, (chain_idx, width)
+  -- the same order the concatenation used, so a caller can slice one weight
+  along those blocks and gather.
+  """
+  # Deliberately built by calling nothing: the arithmetic below has to stay
+  # identical to create_relative_encoding above, and the cheapest way to keep
+  # them in step is that a test compares the two.
+  token_index = seq_features.token_index
+  residue_index = seq_features.residue_index
+  asym_id = seq_features.asym_id
+  entity_id = seq_features.entity_id
+  sym_id = seq_features.sym_id
+
+  asym_id_same = asym_id[:, None] == asym_id[None, :]
+  entity_id_same = entity_id[:, None] == entity_id[None, :]
+
+  offset = residue_index[:, None] - residue_index[None, :]
+  if seq_features.cyclic_period is not None:
+    period = jnp.where(seq_features.cyclic_period > 0,
+                       seq_features.cyclic_period,
+                       jnp.full_like(seq_features.cyclic_period, 10000))
+    offset = offset - period[None, :] * jnp.round(offset / period[None, :])
+    offset = offset.astype(residue_index.dtype)
+  clipped = jnp.clip(offset + max_relative_idx, min=0, max=2 * max_relative_idx)
+  pos_gate = ((residue_index[:, None] == residue_index[None, :]) if rel_pos_same_residue
+              else asym_id_same)
+  rel_pos_idx = jnp.where(pos_gate, clipped, 2 * max_relative_idx + 1)
+
+  token_offset = token_index[:, None] - token_index[None, :]
+  clipped_token = jnp.clip(
+      token_offset + max_relative_idx, min=0, max=2 * max_relative_idx)
+  residue_same = asym_id_same & (residue_index[:, None] == residue_index[None, :])
+  rel_token_idx = jnp.where(residue_same, clipped_token, 2 * max_relative_idx + 1)
+
+  clipped_chain = jnp.clip(
+      sym_id[:, None] - sym_id[None, :] + max_relative_chain,
+      min=0, max=2 * max_relative_chain)
+  special = 2 * max_relative_chain + 1
+  if chain_bucket_on_same_chain:
+    rel_chain_idx = jnp.where(asym_id_same, special, clipped_chain)
+  else:
+    rel_chain_idx = jnp.where(entity_id_same, clipped_chain, special)
+
+  n_idx = 2 * max_relative_idx + 2
+  n_chain = 2 * max_relative_chain + 2
+  return ((rel_pos_idx, n_idx), (rel_token_idx, n_idx), entity_id_same,
+          (rel_chain_idx, n_chain))
+
+
+def shuffle_msa(
+    key: jax.Array, msa: features.MSA
+) -> tuple[features.MSA, jax.Array]:
+  """Shuffle MSA randomly, return batch with shuffled MSA.
+
+  Args:
+    key: rng key for random number generation.
+    msa: MSA object to sample msa from.
+
+  Returns:
+    Protein with sampled msa.
+  """
+  msa, key, _ = shuffle_msa_with_order(key, msa)
+  return msa, key
+
+
+def shuffle_msa_with_order(key, msa):
+  """`shuffle_msa`, also returning where each new row CAME FROM.
+
+  A per-row feature computed after the shuffle has to be computed from the
+  row's original index, not its new position: boltz2's is_paired marks the
+  QUERY, and assigning it to whatever landed at row 0 flagged a random homolog
+  on every fold with a real MSA (vendor_native_parity.py boltz2 msa: trunk pair
+  max|d|/rms 0.49). Boltz itself attaches the flag before its randperm.
+  Same key split and draw as shuffle_msa, so nothing else moves.
+  """
+  key, sample_key = jax.random.split(key)
+  # Sample uniformly among sequences with at least one non-masked position.
+  logits = (jnp.clip(jnp.sum(msa.mask, axis=-1), 0.0, 1.0) - 1.0) * 1e6
+  index_order = gumbel_argsort_sample_idx(sample_key, logits)
+
+  return msa.index_msa_rows(index_order), key, index_order
+
+
+def subsample_msa_keep_query(
+    key: jax.Array, msa: features.MSA, num_msa: int
+) -> tuple[features.MSA, jax.Array]:
+  """Subsample to num_msa rows KEEPING THE QUERY at row 0, in a3m order.
+
+  ESMFold2's own convention, verbatim from its docstring: "Randomly subsample
+  the MSA to max_depth rows, keeping query row 0" -- and it then does
+  `indices.sort()`, so the rows it keeps stay in the order the alignment gave
+  them (`modeling_esmfold2_common.maybe_subsample_msa`).
+
+  AF3's `shuffle_msa` + `truncate_msa_batch` is a different function: the gumbel
+  shuffle ranks EVERY row including row 0, so the query lands somewhere random
+  and -- because the truncation then keeps only the first num_msa -- is dropped
+  outright with probability 1 - num_msa/depth. On 1STP that is 1 - 1024/2145,
+  about half the time, which is why the experimental line's fold got WORSE the
+  moment it was given a real alignment while native's got better: we were
+  handing the trunk an alignment with no query in it.
+
+  Depth-1 is the case that hides this. A self-MSA has nothing to shuffle and
+  nothing to drop, so every gate that folds from a single sequence agrees.
+  """
+  key, sample_key = jax.random.split(key)
+  logits = (jnp.clip(jnp.sum(msa.mask, axis=-1), 0.0, 1.0) - 1.0) * 1e6
+  # Row 0 is chosen explicitly, so it must not also be drawn into the tail --
+  # otherwise the query occupies two of the num_msa slots and one real sequence
+  # is lost. Pushing it below the padded rows is enough: padding is already at
+  # -1e6 and only the first num_msa - 1 draws are used.
+  logits = logits.at[0].add(-2e6)
+  order = gumbel_argsort_sample_idx(sample_key, logits)
+  idx = jnp.concatenate(
+      [jnp.zeros((1,), order.dtype), order[: num_msa - 1]], axis=0)
+  # Sorted, as native sorts: the alignment's own row order is information (an
+  # a3m is ordered by similarity to the query), and a permutation of it is a
+  # different input to any module that is not row-equivariant.
+  return msa.index_msa_rows(jnp.sort(idx)), key

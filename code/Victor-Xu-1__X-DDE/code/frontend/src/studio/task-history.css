@@ -1,0 +1,448 @@
+.task-history-workspace {
+  width: 100%;
+  min-width: 0;
+}
+.task-result-history {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.task-result-history > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+/* A single result header replaces the separate navigation row on resolved tasks. */
+.task-history-workspace .detail-panel.has-header-navigation {
+  padding-top: 12px;
+}
+.task-history-workspace .has-header-navigation > .task-detail-header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px 20px;
+  margin-bottom: 12px;
+}
+.has-header-navigation .task-detail-navigation {
+  min-width: 0;
+  max-width: 22rem;
+}
+.has-header-navigation .task-result-history {
+  margin: 0;
+  gap: 8px;
+}
+.has-header-navigation .task-result-history > button:first-child {
+  white-space: nowrap;
+}
+.task-history-workspace
+  .has-header-navigation
+  .task-project-filter.is-result-context {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}
+.has-header-navigation .task-detail-header .panel-heading {
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+.has-header-navigation .panel-heading h2 {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.task-result-content .task-detail-header.has-extra-actions > .task-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px 12px;
+  min-width: 0;
+}
+@media (1000px < width < 1200px) and (height <= 820px) and (not (pointer: coarse)) {
+  .task-history-workspace .has-header-navigation > .task-detail-header {
+    grid-template-columns: fit-content(22%) minmax(0, 1fr) fit-content(48%);
+    column-gap: 10px;
+  }
+
+  .has-header-navigation .task-result-history {
+    justify-content: flex-start;
+    gap: 6px;
+  }
+
+  .has-header-navigation .task-result-history > button {
+    justify-content: center;
+    inline-size: 36px;
+    min-inline-size: 36px;
+    min-block-size: 36px;
+    padding-inline: 0;
+  }
+
+  .has-header-navigation .task-result-back-label {
+    display: none;
+  }
+
+  .task-result-content .task-detail-header.has-extra-actions > .task-actions {
+    column-gap: 8px;
+  }
+}
+@media (max-width: 1000px) {
+  .task-history-workspace .has-header-navigation > .task-detail-header {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+  }
+  .has-header-navigation .task-detail-navigation {
+    grid-column: 1 / -1;
+    max-width: none;
+  }
+  .task-history-workspace .has-header-navigation > .has-extra-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .task-result-content .task-detail-header.has-extra-actions {
+    flex-wrap: wrap;
+  }
+  .task-result-content .task-detail-header.has-extra-actions > .task-actions {
+    flex-basis: 100%;
+    justify-content: space-between;
+  }
+  .task-result-content
+    .has-extra-actions
+    > .task-actions
+    > .task-backend-control {
+    margin-inline-start: 0;
+    justify-content: flex-start;
+  }
+}
+@media (max-width: 600px), (pointer: coarse) {
+  .has-header-navigation .task-result-history > button,
+  .has-header-navigation .task-actions > button {
+    min-height: 44px;
+  }
+}
+.task-history-workspace .task-project-filter.is-result-context {
+  margin: 0 0 12px;
+}
+.task-history-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.task-history-title {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+}
+.task-history-count {
+  color: var(--muted);
+  font-size: 12px;
+}
+.task-history-heading h2 {
+  margin: 0;
+  font-size: 21px;
+  letter-spacing: -0.02em;
+}
+.task-history-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.task-history-controls select,
+.task-history-controls input {
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+.task-history-workspace .task-project-filter {
+  margin: -8px 0 16px;
+}
+.task-history-workspace .error-box {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.task-history-controls {
+  display: grid;
+  grid-template-columns:
+    minmax(150px, 1fr) minmax(130px, 224px) minmax(112px, 154px)
+    auto;
+  align-items: end;
+  gap: 8px 12px;
+  margin-bottom: 12px;
+}
+.task-history-controls label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.task-history-controls select {
+  width: 100%;
+  padding: 8px 28px 8px 10px;
+}
+.task-history-filter-actions,
+.task-history-date-controls:not([hidden]) {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.task-history-date-controls {
+  grid-column: 1 / -1;
+  padding-block: 4px;
+}
+.history-date-indicator {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.history-date-trigger,
+.task-history-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  white-space: nowrap;
+  font-size: 12px;
+}
+.task-history-clear {
+  color: var(--accent);
+  border-color: transparent;
+  background: transparent;
+}
+.history-date-dialog {
+  position: fixed;
+  inset: auto;
+  width: 304px;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 16px 48px #15284924;
+}
+.history-date-dialog::backdrop {
+  background: transparent;
+}
+.history-calendar-month {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 80px 28px;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+.task-history-workspace .history-date-dialog .history-calendar-month select,
+.studio-app
+  .task-history-workspace
+  .history-date-dialog
+  .history-calendar-month
+  input[type="number"] {
+  width: 100%;
+  min-height: 32px;
+  padding: 4px;
+  font-size: 12px;
+}
+.history-calendar-week,
+.history-calendar-days {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 2px;
+  text-align: center;
+}
+.history-calendar-week {
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 6px;
+}
+.history-date-dialog button {
+  min-height: 32px;
+  border: 0;
+  border-radius: 8px;
+  padding: 4px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+}
+.history-date-dialog button:hover {
+  background: var(--accent-soft);
+}
+.history-calendar-days button[data-outside="true"] {
+  color: var(--muted);
+}
+.history-calendar-days button[aria-current="date"] {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.history-calendar-days button[aria-pressed="true"] {
+  color: var(--surface);
+  background: var(--accent);
+}
+.history-date-dialog button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.history-date-dialog footer {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+.history-date-dialog footer button {
+  color: var(--accent);
+}
+.task-history-list > .empty-state {
+  min-height: 176px;
+  gap: 8px;
+  padding: 26px 20px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.task-history-list > .empty-state h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 16px;
+}
+.task-history-list > .empty-state p {
+  margin: 0;
+}
+.task-history-list .empty-state-icon {
+  font-size: 22px;
+}
+.task-history-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.task-history-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+.task-history-table th {
+  text-align: left;
+  font-size: 12px;
+  font-weight: 600;
+}
+.task-history-table tbody tr {
+  background: var(--surface);
+}
+.task-history-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+.task-history-table th:first-child {
+  width: 44%;
+}
+.task-history-table th:nth-child(2) {
+  width: 24%;
+}
+.task-history-table th:nth-child(3) {
+  width: 13%;
+}
+.task-history-table th:nth-child(4) {
+  width: 19%;
+}
+.task-history-table td {
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+  overflow-wrap: anywhere;
+}
+.task-history-table button {
+  border: 0;
+  padding: 4px 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font: inherit;
+  font-weight: 500;
+  width: 100%;
+}
+.task-history-table button:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.task-history-table tr[data-selected="true"] {
+  background: var(--accent-soft);
+}
+.task-history-table tr[data-selected="true"] button {
+  color: var(--accent);
+}
+.task-history-table time {
+  color: var(--muted);
+  font-size: 12px;
+}
+.task-history-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 15px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.task-history-pagination > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.task-history-pagination button {
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 7px 11px;
+}
+.task-history-workspace :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+@media (max-width: 700px) {
+  .task-history-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .task-history-heading-actions {
+    width: 100%;
+  }
+  .task-history-controls {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 0.7fr);
+    gap: 12px;
+  }
+  .task-history-search,
+  .task-history-filter-actions {
+    grid-column: 1 / -1;
+  }
+  .task-history-table {
+    min-width: 610px;
+  }
+  .task-history-pagination {
+    flex-wrap: wrap;
+  }
+}
+
+.module-workspace-navigation {
+  display: flex;
+  gap: 4px;
+  margin: 0 0 18px;
+  width: fit-content;
+  max-width: 100%;
+}

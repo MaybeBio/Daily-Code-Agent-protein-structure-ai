@@ -1,0 +1,669 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 Clayton Moore
+"""Lacuna CLI - cryptic binding pocket discovery."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+import click
+from rich.console import Console
+from rich.table import Table
+
+from lacuna import __version__
+
+console = Console()
+#: Warnings go here instead of stdout. A warning a --quiet caller cannot see
+#: is useless, but one landing in a redirected stdout corrupts whatever is
+#: parsing it. stderr satisfies both.
+err_console = Console(stderr=True)
+
+
+#: Exception types that mean the input or the invocation was wrong, rather than
+#: that Lacuna has a defect. These reach the user as one line instead of a stack
+#: trace: a traceback is the right output for a bug and the wrong output for a
+#: file that is not a structure. Every one of these already carries a message
+#: written for a person to read. Set LACUNA_TRACEBACK=1 to get the traceback
+#: back, which is what you want when a message turns out to be hiding a defect.
+_USER_ERRORS = (ValueError, OSError)
+
+
+class _CleanErrors(click.Group):
+    """A click group that reports bad input as a message, not a traceback."""
+
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except click.ClickException:
+            raise
+        except _USER_ERRORS as e:
+            if os.environ.get("LACUNA_TRACEBACK"):
+                raise
+            raise click.ClickException(str(e) or type(e).__name__) from e
+
+
+def _resolve_backend(name: str, msa_server: bool = True):
+    if name == "random":
+        from lacuna.ensemble.random_backend import RandomBackend
+        return RandomBackend()
+    elif name == "nma":
+        from lacuna.ensemble.nma_backend import NMABackend
+        return NMABackend()
+    elif name == "rna-nma":
+        from lacuna.nucleic.anm import RNAAnmBackend
+        return RNAAnmBackend()
+    elif name == "openmm":
+        from lacuna.ensemble.openmm_backend import OpenMMBackend
+        return OpenMMBackend()
+    elif name == "boltz":
+        from lacuna.ensemble.boltz_backend import BoltzBackend
+        return BoltzBackend(use_msa_server=msa_server)
+    else:
+        raise click.BadParameter(
+            f"Unknown backend '{name}'. Choose: random, nma, rna-nma, openmm, boltz")
+
+
+def _installed(module: str) -> bool:
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+#: Third-party modules each backend needs at generation time. nma and random
+#: rely only on numpy/scipy, which are hard dependencies.
+_BACKEND_REQUIRES = {
+    "boltz": ("boltz",),
+    "openmm": ("openmm", "pdbfixer"),
+    "nma": (),
+    "random": (),
+}
+
+
+def _auto_backend(structure=None, msa_server: bool = True):
+    """Pick the best available backend at runtime.
+
+    Nucleic-acid input takes the RNA elastic network, and that routing is the
+    whole bug fix rather than a convenience. ``NMABackend`` builds its network
+    from atoms named CA; RNA has none, so it fell through to ``RandomBackend``
+    and the run still printed a ranked table with crypticity and persistence
+    columns computed from Gaussian noise. On 10 held-out structures whose site is
+    shut, that fallback recovered 0 of them while stretching C1'-C1' spacing 25%.
+    A user asking for `auto` on an RNA structure was getting noise presented as a
+    result, so `auto` now has to look at what it was given.
+
+    Probe the dependency, not the backend module. Every backend module imports
+    cleanly whether or not its heavy dependency is present, because `import
+    boltz` happens inside generate() rather than at module scope. Catching
+    ImportError around _resolve_backend therefore never fired, so auto resolved
+    to boltz on every machine and the rest of the chain was dead code. A plain
+    `pip install lacuna-pockets` followed by `lacuna discover protein.pdb` then
+    failed at generation time with an ImportError, despite nma being available.
+    """
+    if structure is not None:
+        from lacuna.nucleic.chem import classify
+        info = classify([r.name for r in structure.residues])
+        if info["kind"] in ("nucleic", "mixed"):
+            return _resolve_backend("rna-nma")
+    for name in ("boltz", "openmm", "nma", "random"):
+        if all(_installed(m) for m in _BACKEND_REQUIRES[name]):
+            return _resolve_backend(name, msa_server=msa_server)
+    raise RuntimeError("No ensemble backend available.")
+
+
+@click.group(cls=_CleanErrors)
+@click.version_option(version=__version__, prog_name="lacuna")
+def main():
+    """Lacuna - cryptic binding pocket discovery via conformational ensemble analysis.
+
+    \b
+    Typical workflow:
+      lacuna discover protein.pdb            # run with defaults
+      lacuna discover protein.pdb --backend boltz --conformers 30
+      lacuna discover protein.pdb --emit-boltz-constraints --emit-vina-boxes
+    """
+
+
+@main.command()
+@click.argument("input_path",
+                type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--backend", "-b",
+    type=click.Choice(["auto", "random", "nma", "rna-nma", "openmm", "boltz"]),
+    default="auto",
+    show_default=True,
+    help="Ensemble generation backend. 'auto' detects nucleic-acid input and "
+         "uses the RNA elastic network.",
+)
+@click.option(
+    "--ensemble", "ensemble_source",
+    type=click.Path(exists=True, path_type=Path), default=None,
+    help=(
+        "Use a conformational ensemble you already have instead of generating "
+        "one: a multi-model PDB/mmCIF, or a directory of structure files. "
+        "Overrides --backend. Frames are matched to the input by residue "
+        "numbering and atom name, so a frame missing a loop is still usable."
+    ),
+)
+@click.option("--conformers", "-n", default=20, show_default=True,
+              help="Number of conformers to generate.")
+@click.option("--output", "-o",
+              type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Output DIRECTORY, which always receives pocket_report.json "
+                   "(default: <input_stem>_lacuna/).")
+@click.option("--min-druggability", default=0.0, show_default=True,
+              help="Filter: minimum druggability score [0–1].")
+@click.option("--min-persistence", default=0.0, show_default=True,
+              help="Filter: minimum persistence (fraction of conformers).")
+@click.option("--emit-boltz-constraints", is_flag=True, default=False,
+              help="Write Boltz YAML constraint files for each pocket.")
+@click.option("--emit-vina-boxes", is_flag=True, default=False,
+              help="Write AutoDock Vina box config files for each pocket.")
+@click.option("--emit-pocket-pdbs", is_flag=True, default=False,
+              help="Write pocket pseudoatom PDB files for visualization.")
+@click.option("--emit-conformers", is_flag=True, default=False,
+              help="Write the generated conformational ensemble as a multi-model "
+                   "PDB (<input_stem>_ensemble.pdb); model 1 is the input "
+                   "structure, the rest are the generated conformers.")
+@click.option("--msa-server/--no-msa-server", "msa_server", default=True,
+              show_default=True,
+              help="Only affects --backend boltz (including via --backend "
+                   "auto). Boltz-2 builds a multiple sequence alignment by "
+                   "sending the query sequence to the public ColabFold "
+                   "server at https://api.colabfold.com, which needs network "
+                   "access and discloses the sequence to a third party. It "
+                   "improves loop accuracy. --no-msa-server runs Boltz "
+                   "single-sequence instead: local and faster, noisier in "
+                   "loops.")
+@click.option("--top", default=10, show_default=True,
+              help="Maximum number of pockets to report.")
+@click.option(
+    "--rank-by", "rank_by",
+    type=click.Choice(["learned", "learned-plm", "learned-fused", "crypticity",
+                       "druggability", "persistence", "balanced"]),
+    default="learned", show_default=True,
+    help=(
+        "Pocket ranking strategy. 'learned' (default) uses the fitted ranker and "
+        "recovers roughly twice as many known sites as the analytic rules on "
+        "CryptoBench (see benchmarks/train_ranker.py). It is also the right choice "
+        "for always-open/orthosteric sites, where it beats 'druggability' by "
+        "+22.9 points on COACH420 (see docs/BENCHMARKS.md). 'crypticity' ranks "
+        "purely by how much a site opens relative to the input; 'druggability' is "
+        "the legacy pre-model rule ranking by peak open-state druggability, kept "
+        "for reproducibility; 'balanced' adds a mild persistence bonus; "
+        "'persistence' is the legacy persistence x druggability rule."
+    ),
+)
+@click.option("--min-crypticity", default=0.0, show_default=True,
+              help="Filter: minimum crypticity score [0-1].")
+@click.option("--quiet", is_flag=True, default=False, help="Suppress progress output.")
+@click.option(
+    "--homodimer", is_flag=True, default=False,
+    help=(
+        "Analyze the biological assembly rather than the asymmetric unit. "
+        "Reads BIOMT records (PDB) or _pdbx_struct_oper_list (mmCIF) to create "
+        "the full assembly; required to detect pockets at dimer interfaces. "
+        "For best results, use the biological assembly download from RCSB."
+    ),
+)
+@click.option(
+    "--detector",
+    type=click.Choice(["alpha", "surface", "surface-fusion", "p2rank", "fusion"]),
+    default="alpha", show_default=True,
+    help=(
+        "Pocket detector. 'alpha' is Lacuna's built-in geometric detector, which "
+        "only proposes at concavities. 'surface' scores the probe-accessible "
+        "surface with a learned model and has no such filter, reaching sites the "
+        "geometry discards. 'surface-fusion' pools both, which held out on "
+        "CryptoBench takes coverage from 68.5% to 86.4% and top-five recovery "
+        "from 57.1% to 73.9% (measured before 1.5.0); it selects the matching "
+        "ranker automatically. "
+        "'p2rank'/'fusion' use P2Rank instead and need it installed "
+        "(Java 11+; 'prank' on PATH or set LACUNA_P2RANK)."
+    ),
+)
+@click.option(
+    "--no-sequence",
+    is_flag=True, default=False,
+    help=(
+        "Run the surface detector on geometry alone, skipping the ESM-2 pass. "
+        "Sequence roughly doubles the surface detector's gain, so this trades "
+        "accuracy for speed and for not needing the 'plm' extra at all. It is "
+        "what an installation without torch does anyway."
+    ),
+)
+@click.option(
+    "--seed-from-sequence",
+    is_flag=True, default=False,
+    help=(
+        "Also propose pockets at the sequence model's highest-scoring residues, "
+        "for sites too closed for the geometric detector to see. Needs the 'plm' "
+        "extra. Worth pairing with a smaller --conformers: it substitutes for "
+        "ensemble sampling rather than adding to it, and the added coverage stops "
+        "converting once candidates exceed roughly fifteen. Five conformers with "
+        "this flag matched twenty without it on CryptoBench, at a third the time."
+    ),
+)
+def discover(
+    input_path: Path,
+    backend: str,
+    ensemble_source: Path | None,
+    conformers: int,
+    output: Path | None,
+    min_druggability: float,
+    min_persistence: float,
+    emit_boltz_constraints: bool,
+    emit_vina_boxes: bool,
+    emit_pocket_pdbs: bool,
+    emit_conformers: bool,
+    top: int,
+    rank_by: str,
+    msa_server: bool,
+    min_crypticity: float,
+    quiet: bool,
+    homodimer: bool,
+    detector: str,
+    no_sequence: bool,
+    seed_from_sequence: bool,
+):
+    """Discover cryptic binding pockets in a protein structure.
+
+    INPUT_PATH: Path to a PDB or mmCIF file (from AlphaFold, Boltz, Chai, or PDB).
+    """
+    import tempfile
+
+    from lacuna.io.structure import load_structure, coords_array, make_biological_assembly
+    from lacuna.pockets.detector import detect_pockets
+    from lacuna.pockets.clusterer import DEFAULT_RANK_BY, cluster_pockets
+    from lacuna.io.writers import (
+        write_report, write_pocket_pdb, write_boltz_constraint, write_vina_box,
+        write_structure_pdb, write_ensemble_pdb,
+    )
+
+    output_dir = output or Path(f"{input_path.stem}_lacuna")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not quiet:
+        console.print(f"\n[bold cyan]Lacuna[/bold cyan] - cryptic pocket discovery")
+        console.print(f"  Input:    [green]{input_path}[/green]")
+        console.print(f"  Backend:  {backend}")
+        console.print(f"  Output:   {output_dir}\n")
+
+    # Load structure
+    if not quiet:
+        console.print("[dim]Loading structure...[/dim]")
+    structure = load_structure(input_path)
+
+    from lacuna.nucleic import heavy_atoms_only, is_nucleic, is_nucleic_only
+    _nucleic = is_nucleic(structure)
+    # Two different questions, so two different predicates. `_nucleic` (nucleic
+    # or mixed) decides which beads the elastic network needs. `_nucleic_only`
+    # gates the ranker's burial weight, which must not fire on a protein target
+    # carrying an incidental nucleotide; is_nucleic_only explains why.
+    _nucleic_only = is_nucleic_only(structure)
+    if _nucleic and not quiet:
+        console.print(f"[dim]Nucleic acid detected ({len(structure.residues)} residues).[/dim]")
+
+    # Optionally expand to biological assembly for dimer-interface pocket detection
+    effective_path = input_path
+    with tempfile.TemporaryDirectory() as _tmpdir:
+        if homodimer:
+            assembly = make_biological_assembly(input_path, structure)
+            if len(assembly.atoms) > len(structure.atoms):
+                tmp_pdb = Path(_tmpdir) / f"{input_path.stem}_assembly.pdb"
+                write_structure_pdb(assembly, tmp_pdb)
+                structure = assembly
+                effective_path = tmp_pdb
+                if not quiet:
+                    console.print(
+                        f"  [dim]Homodimer: biological assembly built "
+                        f"({len(structure.sequence)} chains, {len(structure.residues)} residues)[/dim]"
+                    )
+            elif not quiet:
+                console.print(
+                    "  [yellow]--homodimer: no BIOMT symmetry records found. "
+                    "For dimer-interface pockets, download the biological assembly "
+                    "PDB from RCSB (use the 'Download Files > Biological Assembly' option).[/yellow]"
+                )
+
+        if not quiet:
+            n_res = len(structure.residues)
+            n_chains = len(structure.sequence)
+            console.print(f"  [dim]{n_res} residues, {n_chains} chain(s)[/dim]")
+
+        # Nucleic input is prepared in exactly one respect: hydrogens are dropped.
+        # mmCIF entries often carry them, they change the van der Waals surface and
+        # so the pocket count (6VUH reads 1062 atoms with them against 702 without,
+        # and 2 pockets against 1), and every nucleic benchmark was measured on
+        # heavy atoms. Protein input is left exactly as it was.
+        #
+        # effective_path has to follow the structure. A backend reloads from the
+        # path, so stripping the Structure while leaving the path pointing at the
+        # original file hands the sampler a different atom count than the detector
+        # scores against, which numpy does not always refuse.
+        if _nucleic:
+            _stripped = heavy_atoms_only(structure)
+            if len(_stripped.atoms) != len(structure.atoms):
+                tmp_nuc = Path(_tmpdir) / f"{input_path.stem}_heavy.pdb"
+                write_structure_pdb(_stripped, tmp_nuc)
+                if not quiet:
+                    console.print(f"  [dim]Dropped {len(structure.atoms) - len(_stripped.atoms)} "
+                                  f"hydrogens; detection was validated on heavy atoms.[/dim]")
+                structure = _stripped
+                effective_path = tmp_nuc
+
+        # Resolve backend. A supplied ensemble wins: the user already has the
+        # conformers, so generating more would be discarded work.
+        if ensemble_source is not None:
+            from lacuna.ensemble.external_backend import ExternalEnsembleBackend
+            be = ExternalEnsembleBackend(ensemble_source)
+            backend = "external"
+            if not quiet:
+                cap = f", first {conformers}" if conformers > 0 else ""
+                console.print(f"\n[dim]Reading ensemble from {ensemble_source}{cap}...[/dim]")
+        elif backend == "auto":
+            be = _auto_backend(structure, msa_server=msa_server)
+            backend = be.name
+        else:
+            be = _resolve_backend(backend, msa_server=msa_server)
+
+        if not quiet and ensemble_source is None:
+            console.print(f"\n[dim]Generating {conformers} conformers with '{backend}' backend...[/dim]")
+
+        coord_sets = be.generate(effective_path, conformers)
+
+    if not quiet:
+        console.print(f"  [dim]Generated {len(coord_sets)} conformers.[/dim]")
+
+    # Every reported quantity is relative to the input structure, so an ensemble
+    # that no longer resembles it makes the whole protein look cryptic without
+    # anything in the output looking wrong. Say so before spending the detection
+    # pass on it. Warn rather than refuse: a genuine large domain motion can trip
+    # the same bars as a broken ensemble.
+    from lacuna.ensemble.sanity import check_ensemble
+
+    _health = check_ensemble(structure, coord_sets)
+    if not _health.ok:
+        # stderr, not stdout: --quiet promises to suppress progress output,
+        # and a caller parsing stdout should not have to tolerate this
+        # appearing in it. A human on a terminal still sees it either way.
+        err_console.print("\n[yellow]This ensemble may not describe the input "
+                          "structure:[/yellow]")
+        for _msg in _health.messages:
+            err_console.print(f"  [yellow]- {_msg}.[/yellow]")
+        err_console.print(f"  [dim]{_health.summary()}[/dim]")
+        err_console.print("  [dim]Results are still written. Treat crypticity and "
+                          "apo volume with suspicion until this is explained.[/dim]")
+    elif not quiet:
+        console.print(f"  [dim]{_health.summary()}[/dim]")
+
+    if not quiet:
+        console.print("\n[dim]Detecting pockets across ensemble...[/dim]")
+
+    # Resolve the per-conformer detector (alpha | p2rank | fusion). p2rank/fusion
+    # require an external JVM tool; if it is missing, fall back to alpha rather
+    # than fail the run.
+    # The fused pool must be ranked by the model fitted on it. Ranking it with
+    # the shipped alpha-only weights costs top-five recovery, because a surface
+    # proposal is a wrong answer that model scores highly. Only override a
+    # ranker the user left at its default.
+    use_surface = detector in ("surface", "surface-fusion")
+    if use_surface:
+        from lacuna.pockets import surface_detector as _sd
+        if not _sd.available():
+            console.print(
+                f"  [yellow]--detector {detector}: the fitted surface model is "
+                "missing from this installation. Falling back to the alpha "
+                "detector.[/yellow]")
+            detector, use_surface = "alpha", False
+        elif rank_by == DEFAULT_RANK_BY:
+            rank_by = "learned-fused"
+            if not quiet:
+                console.print("  [dim]Ranking with 'learned-fused', which was "
+                              "fitted on candidates from both detectors.[/dim]")
+
+    use_p2rank = detector in ("p2rank", "fusion")
+    if use_p2rank:
+        from lacuna.pockets.p2rank_detector import p2rank_available, detect_pockets_p2rank
+        if not p2rank_available():
+            console.print(
+                "  [yellow]--detector "
+                f"{detector}: P2Rank not found (install Java 11+ and put 'prank' on "
+                "PATH or set LACUNA_P2RANK). Falling back to the alpha detector.[/yellow]"
+            )
+            detector, use_p2rank = "alpha", False
+
+    # Sequence-seeded proposals need the residue probabilities *before* detection,
+    # while the ranker needs them after, so resolve them once here and reuse them
+    # below. The embedding is per structure, not per conformer: the sequence does
+    # not move.
+    plm_probs = None
+    want_plm = seed_from_sequence or rank_by == "learned-plm" or (
+        use_surface and not no_sequence)
+    if want_plm:
+        from lacuna.pockets import plm as _plm
+
+        if not _plm.available():
+            if rank_by == "learned-plm":
+                console.print(
+                    '  [yellow]--rank-by learned-plm needs the "plm" extra '
+                    '(pip install "lacuna-pockets[plm]"). '
+                    "Falling back to the geometry ranker.[/yellow]"
+                )
+                rank_by = "learned"
+            if seed_from_sequence:
+                console.print(
+                    '  [yellow]--seed-from-sequence needs the "plm" extra; '
+                    "continuing without sequence-seeded proposals.[/yellow]"
+                )
+                seed_from_sequence = False
+        else:
+            if not quiet:
+                console.print("\n[dim]Embedding sequence...[/dim]")
+            plm_probs = _plm.residue_probabilities(structure)
+            if not plm_probs:
+                console.print(
+                    "  [yellow]sequence embedding did not align with the residue "
+                    "list; falling back to the geometry ranker.[/yellow]"
+                )
+                if rank_by == "learned-plm":
+                    rank_by = "learned"
+                seed_from_sequence = False
+
+    def _detect(coords) -> list:
+        geometric = detector not in ("p2rank", "surface")
+        pockets = detect_pockets(coords, structure) if geometric else []
+        if use_surface:
+            from lacuna.pockets.surface_detector import detect_pockets_surface
+            pockets = list(pockets) + detect_pockets_surface(
+                coords, structure, plm_residue_probs=plm_probs)
+        if use_p2rank:
+            pockets = list(pockets) + detect_pockets_p2rank(coords, structure)
+        if seed_from_sequence and plm_probs:
+            from lacuna.pockets.seeding import seeded_pockets
+            pockets = list(pockets) + seeded_pockets(coords, structure, plm_probs)
+        return pockets
+
+    # Detect pockets in each conformer
+    pocket_lists = []
+    base_coords = coords_array(structure)
+
+    # Always include pockets from the input structure itself (conformer 0)
+    all_coord_sets = [base_coords] + list(coord_sets)
+
+    for ci, coords in enumerate(all_coord_sets):
+        pockets = _detect(coords)
+        for p in pockets:
+            p.conformer_idx = ci
+        pocket_lists.append(pockets)
+        if not quiet and (ci + 1) % 5 == 0:
+            console.print(f"  [dim]{ci + 1}/{len(all_coord_sets)} conformers processed[/dim]")
+
+    total_pockets = sum(len(pl) for pl in pocket_lists)
+    if not quiet:
+        console.print(f"  [dim]Found {total_pockets} raw pockets across ensemble.[/dim]")
+        console.print("\n[dim]Clustering and ranking pockets...[/dim]")
+
+    # Cluster across ensemble. plm_probs was resolved before detection, since
+    # sequence-seeded proposals need it there; the ranker reuses the same values.
+    clusters = cluster_pockets(pocket_lists, n_conformers=len(all_coord_sets),
+                               rank_by=rank_by, plm_residue_probs=plm_probs,
+                               nucleic=_nucleic_only)
+
+    # Apply filters
+    clusters = [
+        c for c in clusters
+        if c.druggability >= min_druggability
+        and c.persistence >= min_persistence
+        and c.crypticity >= min_crypticity
+    ][:top]
+
+    if not quiet:
+        console.print(f"  [dim]{len(clusters)} pocket clusters after filtering.[/dim]\n")
+
+    # Write outputs
+    report_path = write_report(clusters, structure, len(all_coord_sets), output_dir, rank_by=rank_by)
+
+    written: list[str] = [f"[green]{report_path.name}[/green]"]
+
+    if emit_conformers:
+        ensemble_path = output_dir / f"{input_path.stem}_ensemble.pdb"
+        write_ensemble_pdb(structure, all_coord_sets, ensemble_path)
+        written.append(f"[green]{ensemble_path.name}[/green]")
+
+    for i, cluster in enumerate(clusters):
+        if emit_pocket_pdbs:
+            p = write_pocket_pdb(cluster, output_dir, i)
+            written.append(p.name)
+        if emit_boltz_constraints:
+            p = write_boltz_constraint(cluster, structure, output_dir, i)
+            written.append(p.name)
+        if emit_vina_boxes:
+            p = write_vina_box(cluster, output_dir, i)
+            written.append(p.name)
+
+    # Print results table
+    if not quiet:
+        _print_table(clusters)
+        console.print(f"\n[bold]Output written to:[/bold] {output_dir}/")
+        for name in written[:6]:
+            console.print(f"  {name}")
+        if len(written) > 6:
+            console.print(f"  [dim]... and {len(written) - 6} more[/dim]")
+        console.print()
+
+    return clusters
+
+
+@main.command("dock-prep")
+@click.argument("report_path",
+                type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("protein_path",
+                type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--format", "fmt",
+              type=click.Choice(["boltz", "vina", "pdb", "all"]),
+              default="all", show_default=True,
+              help="Docking tool output format.")
+@click.option("--output", "-o",
+              type=click.Path(file_okay=False, path_type=Path), default=None)
+@click.option("--top", default=5, show_default=True,
+              help="Prepare files for top N pockets.")
+def dock_prep(
+    report_path: Path,
+    protein_path: Path,
+    fmt: str,
+    output: Path | None,
+    top: int,
+):
+    """Generate docking input files from a pocket report.
+
+    REPORT_PATH: pocket_report.json from a previous 'lacuna discover' run.
+    PROTEIN_PATH: The protein structure file (PDB or mmCIF).
+    """
+    from lacuna.io.structure import load_structure
+    from lacuna.io.writers import write_boltz_constraint, write_vina_box, write_pocket_pdb
+    from lacuna.models import PocketCluster
+
+    try:
+        report = json.loads(report_path.read_text())
+    except json.JSONDecodeError as e:
+        # Name the file. The bare decoder message is "Expecting value: line 1
+        # column 1 (char 0)", which does not say which of the two path arguments
+        # was wrong, and swapping them is the easy mistake to make.
+        raise ValueError(
+            f"{report_path.name} is not valid JSON ({e}). The first argument is "
+            "the pocket_report.json written by 'lacuna discover', the second is "
+            "the protein structure.") from e
+    structure = load_structure(protein_path)
+
+    output_dir = output or report_path.parent / "docking_inputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    pockets_data = report["pockets"][:top]
+
+    for i, pd in enumerate(pockets_data):
+        cluster = PocketCluster(
+            rank=pd["rank"],
+            centroid=tuple(pd["centroid"]),
+            volume_a3=pd["volume_A3"],
+            druggability=pd["druggability"],
+            persistence=pd["persistence"],
+            cryptic=pd["cryptic"],
+            lining_residues=pd["lining_residues"],
+            appears_in_conformers=pd["appears_in_conformers"],
+        )
+
+        if fmt in ("boltz", "all"):
+            write_boltz_constraint(cluster, structure, output_dir, i)
+        if fmt in ("vina", "all"):
+            write_vina_box(cluster, output_dir, i)
+        if fmt in ("pdb", "all"):
+            write_pocket_pdb(cluster, output_dir, i)
+
+    console.print(f"Docking inputs written to [green]{output_dir}[/green]")
+
+
+def _print_table(clusters: list) -> None:
+    if not clusters:
+        console.print("[yellow]No pockets found.[/yellow]")
+        return
+
+    table = Table(title="Discovered Pockets", show_lines=True)
+    table.add_column("Rank", style="bold", justify="right")
+    table.add_column("Druggability", justify="right")
+    table.add_column("Crypticity", justify="right")
+    table.add_column("Persistence", justify="right")
+    table.add_column("Volume (Å³)", justify="right")
+    table.add_column("Key Residues")
+
+    for c in clusters:
+        drug = max(c.druggability, c.max_druggability)
+        drug_color = "green" if drug > 0.6 else ("yellow" if drug > 0.3 else "red")
+        cryp_color = "bold yellow" if c.crypticity > 0.4 else ("yellow" if c.crypticity > 0.2 else "dim")
+        # Show volume as apo -> open when the pocket breathes meaningfully.
+        if c.volume_max_a3 - c.volume_min_a3 > 50:
+            vol_str = f"{c.apo_volume_a3:.0f} -> {c.volume_max_a3:.0f}"
+        else:
+            vol_str = f"{c.volume_a3:.0f}"
+        key_res = ", ".join(c.lining_residues[:5])
+        if len(c.lining_residues) > 5:
+            key_res += f" (+{len(c.lining_residues) - 5})"
+
+        table.add_row(
+            str(c.rank),
+            f"[{drug_color}]{drug:.3f}[/{drug_color}]",
+            f"[{cryp_color}]{c.crypticity:.2f}[/{cryp_color}]",
+            f"{c.persistence:.0%}",
+            vol_str,
+            key_res,
+        )
+
+    console.print(table)
+
+
+if __name__ == "__main__":
+    main()

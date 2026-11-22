@@ -1,0 +1,91 @@
+"""Initial free-ligand poses reuse scientific versions and the existing Chemistry queue."""
+
+import hashlib
+
+from ..chemistry.minimization_contract import MoleculeMinimizeTask
+from ..chemistry.minimization_options import MinimizationOptions
+from ..chemistry.sdf_io import split_records
+from ..examples.input_geometry import verified_computed_input
+from ..models import Status
+from .pose_sources import PoseSources
+
+# Only operations that compute coordinates qualify. ADMET, descriptors, library
+# import, editing and a file's 3D header alone are not computational evidence.
+COMPUTED_OPERATIONS = {
+    "molecule_minimize",
+    "molecular_states",
+    "docking",
+    "diffsbdd",
+    "reinvent_design",
+    "dataset_dock",
+    "structure_refine",
+    "molecular_dynamics",
+    "gromacs_dynamics",
+}
+
+
+class InitialPosePreparation:
+    def __init__(self, store, assets, settings):
+        self.store, self.assets = store, assets
+        self.sources = PoseSources(store, assets, settings)
+
+    def previous_attempt(self, task, *, exact_method):
+        """Reuse the same initial-pose calculation, including older explicit retries."""
+        request = task.model_dump_json()
+        # Automatic viewing can use a completed conformer from the alternate
+        # force field. An explicit preparation request keeps its selected method.
+        alternate = request
+        if not exact_method:
+            force_field = "UFF" if task.options.force_field == "MMFF94s" else "MMFF94s"
+            options = task.options.model_copy(update={"force_field": force_field})
+            alternate = task.model_copy(update={"options": options}).model_dump_json()
+        with self.store.connect() as db:
+            return self.store.decode(db.execute(
+                """SELECT * FROM jobs WHERE parent_id IS NULL AND (
+                    (request_hash=:digest AND request=:request) OR
+                    (status='succeeded' AND request_hash=:alternate_digest AND request=:alternate)
+                ) ORDER BY (status='succeeded') DESC, (request=:request) DESC,
+                    created_at DESC, id DESC LIMIT 1""",
+                {
+                    "request": request,
+                    "digest": hashlib.sha256(request.encode()).hexdigest(),
+                    "alternate": alternate,
+                    "alternate_digest": hashlib.sha256(alternate.encode()).hexdigest(),
+                },
+            ).fetchone())
+
+    def resolve(self, value):
+        reference = self.sources.resolve(value.source)
+        asset = self.assets.get(reference.asset_id)
+        raw = self.assets.path(asset).read_bytes()
+        record = split_records(raw)[reference.record] if asset.suffix == ".sdf" else raw
+        lines = record.splitlines()
+        valid_record = (
+            (b"@<TRIPOS>MOLECULE" in raw and b"@<TRIPOS>ATOM" in raw)
+            if asset.suffix == ".mol2"
+            else len(lines) >= 4 and any(b"M  END" in line for line in lines)
+        )
+        if not valid_record:
+            raise ValueError("An initial pose requires a valid molecular SDF/MOL record.")
+        is_3d = asset.suffix != ".mol2" and b"3D" in lines[1]
+        version = self.sources.scientific.get(reference.version_id)
+        parent = self.store.get(str(version.source_job)) if version.source_job else None
+        if is_3d and verified_computed_input(asset, raw):
+            # Exact packaged preparation evidence qualifies a precomputed input
+            # without a duplicate optimization job or an experimental-binding claim.
+            return None, version
+        if (
+            is_3d
+            and parent
+            and parent.status == Status.SUCCEEDED
+            and parent.request.operation in COMPUTED_OPERATIONS
+        ):
+            # The source resolver already validates the exact asset/version and
+            # declared native output. Return this pose without changing its frame.
+            return None, version
+        return MoleculeMinimizeTask(
+            name="Initial optimized 3D preview",
+            molecule=reference,
+            options=MinimizationOptions(force_field=value.method, initialize_3d=True),
+            scientific_inputs=[reference],
+        ), None

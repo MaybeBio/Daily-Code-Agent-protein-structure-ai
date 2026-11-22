@@ -1,0 +1,255 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_call:
+    inputs:
+      release_artifacts:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      release_artifacts:
+        description: Build and upload the Linux release files
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  default-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Install TopoPPI with its default Chemistry plugin
+        run: python -m pip install .
+      - name: Verify Core and actual ProLIF detection without task plugins
+        run: python -I tests/core_install_smoke.py
+      - name: Install an independent example plugin
+        run: python -m pip install ./examples/plugin
+      - name: Verify automatic discovery and execution
+        run: python -I tests/core_install_smoke.py --plugin
+
+  core-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - name: Provision only geometry dependencies for the isolation test
+        run: |
+          python -m pip install --no-deps .
+          python - <<'PY'
+          import importlib.metadata
+          import subprocess
+          import sys
+
+          requirements = [
+              requirement for requirement in importlib.metadata.requires("topoppi")
+              if "extra ==" not in requirement
+              and not requirement.lower().startswith(("mdanalysis", "prolif", "rdkit"))
+          ]
+          subprocess.check_call([sys.executable, "-m", "pip", "install", *requirements])
+          PY
+      - name: Verify Core does not import or require the Chemistry backend
+        run: python -I tests/core_install_smoke.py --without-chemistry-deps
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-file: environment.yml
+          environment-name: topoppi-dev
+          cache-environment: true
+
+      - name: Install package
+        shell: bash -el {0}
+        run: pip install -e ".[dev,benchmark,meshio,representation,analysis]"
+
+      - name: Install virtual display
+        run: sudo apt-get update && sudo apt-get install -y xvfb xauth
+
+      - name: Run tests
+        timeout-minutes: 5
+        shell: bash -el {0}
+        run: xvfb-run -a python -m pytest -v -o faulthandler_timeout=60
+
+      - name: Lint
+        shell: bash -el {0}
+        run: python -m ruff check .
+
+      - name: Import and CLI smoke
+        shell: bash -el {0}
+        run: |
+          python -c "import topoppi; print(topoppi.__version__)"
+          python -m topoppi.cli --help
+          python -m topoppi.cli render --help
+          python -m topoppi.install_optcuts --help
+          python -m topoppi.cli plugins list
+          python -c "import topoppi; assert 'chemistry.detect' in topoppi.plugins.info('chemistry').capabilities"
+          python -c "import importlib.util; assert importlib.util.find_spec('topoppi_affinity') is None"
+
+      - name: Full pipeline smoke
+        shell: bash -el {0}
+        env:
+          MPLBACKEND: Agg
+        run: |
+          python -m topoppi.cli tests/fixtures/synthetic_complex.pdb -A A -B B \
+            --interaction-source geometric \
+            --min-points 1 \
+            --optcuts-bin tools/OptCuts/OptCuts_bin \
+            --map-style footprints --export-atlas /tmp/topoppi-ci-interface.npz \
+            -o /tmp/topoppi-ci-interface.png
+          test -s /tmp/topoppi-ci-interface.png
+          python -m topoppi.cli render /tmp/topoppi-ci-interface.npz -o /tmp/topoppi-ci-interface.svg
+          python -m topoppi.cli render /tmp/topoppi-ci-interface.npz \
+            --view surface --map-style footprints --labels highlighted \
+            --export-atlas /tmp/topoppi-ci-surface.npz -o /tmp/topoppi-ci-surface.png
+          test -s /tmp/topoppi-ci-surface.png
+          xvfb-run -a python installer/smoke_footprints.py /tmp/topoppi-ci-interface.npz /tmp/topoppi-ci-desktop
+
+      - name: Build package
+        timeout-minutes: 5
+        shell: bash -el {0}
+        run: |
+          rm -rf dist build src/*.egg-info
+          python -m build
+          python -m twine check dist/*
+          python - <<'PY'
+          import pathlib
+          import os
+          import re
+          import tarfile
+          import zipfile
+
+          archives = sorted(pathlib.Path("dist").iterdir())
+          if len(archives) != 2:
+              raise SystemExit(f"Expected one wheel and one sdist, found: {archives}")
+          blocked_name = re.compile(
+              r"^plugins/|(^|/)(\.internal|build|dist|__pycache__|topoppi/affinity|docs/(release_checklist|reproducibility)\.md|"
+              r"benchmark_(report|summary|checkpoint|manifest|failures|per_patch|per_face_sample|"
+              r"per_residue|provenance|optcuts_executions|artifact_checksums)|"
+              r"sensitivity_(plan|preflight|results|summary)|worker_logs)(/|\.|$)|"
+              r"tools/OptCuts/(OptCuts[^/]*(_bin|\.exe)|[^/]*\.so)|"
+              r"tests/fixtures/.*(_cutoff|\.topoppi\.json)"
+          )
+          blocked_content = (
+              os.environ["GITHUB_WORKSPACE"].encode(),
+              b"github_pat_",
+              b"pypi-AgEI",
+              b"-----BEGIN PRIVATE KEY-----",
+          )
+          private_path = re.compile(
+              rb"(?:/home/[^/\x00]+/|/Users/[^/\x00]+/|"
+              rb"[A-Za-z]:\\Users\\[^\\\x00]+\\|"
+              rb"\\\\wsl\.localhost\\[^\\\x00]+\\home\\[^\\\x00]+\\)"
+          )
+
+          for archive in archives:
+              if archive.suffix == ".whl":
+                  with zipfile.ZipFile(archive) as handle:
+                      members = [(name, handle.read(name)) for name in handle.namelist() if not name.endswith("/")]
+              else:
+                  with tarfile.open(archive, "r:gz") as handle:
+                      members = []
+                      for member in handle.getmembers():
+                          if member.isfile():
+                              extracted = handle.extractfile(member)
+                              members.append((member.name, extracted.read() if extracted else b""))
+              for name, content in members:
+                  normalized = name.split("/", 1)[-1] if archive.suffix != ".whl" else name
+                  if blocked_name.search(normalized):
+                      raise SystemExit(f"Generated or internal file leaked into {archive.name}: {name}")
+                  if any(marker in content for marker in blocked_content):
+                      raise SystemExit(f"Private path or credential marker leaked into {archive.name}: {name}")
+                  if private_path.search(content):
+                      raise SystemExit(f"Private user path leaked into {archive.name}: {name}")
+          PY
+          source_tree="$(mktemp -d)"
+          tar -xzf dist/*.tar.gz -C "$source_tree" --strip-components=1
+          (
+            cd "$source_tree"
+            PYTHONPATH=src xvfb-run -a python -m pytest -v -o faulthandler_timeout=60
+          )
+
+      - name: Audit Linux OptCuts release binary
+        if: inputs.release_artifacts == true
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          import subprocess
+
+          binary = "tools/OptCuts/OptCuts_bin"
+          dynamic = subprocess.check_output(["readelf", "-d", binary], text=True)
+          if "RPATH" in dynamic or "RUNPATH" in dynamic:
+              raise SystemExit("OptCuts contains an embedded runtime search path")
+          for library in ("libstdc++.so.6", "libgcc_s.so.1"):
+              if library in dynamic:
+                  raise SystemExit(f"OptCuts should statically link {library}")
+
+          versions = subprocess.check_output(["readelf", "--version-info", binary], text=True)
+          glibc_versions = [
+              tuple(map(int, match))
+              for match in re.findall(r"GLIBC_(\d+)\.(\d+)", versions)
+          ]
+          if not glibc_versions or max(glibc_versions) > (2, 17):
+              raise SystemExit(f"OptCuts exceeds the glibc 2.17 baseline: {max(glibc_versions)}")
+          if "GLIBCXX_" in versions or "CXXABI_" in versions:
+              raise SystemExit("OptCuts retains a dynamic C++ runtime version requirement")
+
+          metadata = subprocess.check_output(["strings", "-a", binary], text=True)
+          for marker in (
+              "microsoft-standard",
+              "/home/runner/",
+              "/Users/runner/",
+              "runner/work/",
+              "/tmp/topoppi",
+          ):
+              if marker.lower() in metadata.lower():
+                  raise SystemExit(f"OptCuts contains runner-specific metadata: {marker}")
+          if re.search(r"TBB: BUILD_OS\s+.*\d", metadata):
+              raise SystemExit("OptCuts contains a versioned TBB BUILD_OS value")
+          for expected in (
+              "TBB: BUILD_HOST         release-builder",
+              "TBB: BUILD_OS           Linux",
+              "TBB: BUILD_KERNEL       generic",
+              "TBB: BUILD_COMPILER     C++",
+          ):
+              if expected not in metadata:
+                  raise SystemExit(f"OptCuts is missing neutral TBB metadata: {expected}")
+          PY
+
+      - name: Prepare Linux release artifact
+        if: inputs.release_artifacts == true
+        shell: bash -el {0}
+        run: |
+          set -euo pipefail
+          version="$(python -c 'import topoppi; print(topoppi.__version__)')"
+          mkdir release-assets
+          install -m 644 "dist/topoppi-${version}-py3-none-any.whl" release-assets/
+          install -m 644 "dist/topoppi-${version}.tar.gz" release-assets/
+          install -m 755 tools/OptCuts/OptCuts_bin release-assets/OptCuts_bin-linux-x86_64
+          install -m 644 LICENSE release-assets/TopoPPI-LICENSE.txt
+          install -m 644 tools/OptCuts/LICENSE.txt release-assets/OptCuts-LICENSE.txt
+          install -m 644 tools/OptCuts/NOTICE.md release-assets/OptCuts-NOTICE.md
+          install -m 644 tools/OptCuts/THIRD_PARTY_LICENSES.txt release-assets/OptCuts-THIRD-PARTY-LICENSES.txt
+
+      - uses: actions/upload-artifact@v7
+        if: inputs.release_artifacts == true
+        with:
+          name: release-linux
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14

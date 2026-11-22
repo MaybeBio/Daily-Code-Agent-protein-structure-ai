@@ -1,0 +1,214 @@
+import { useState, type Dispatch, type SetStateAction } from "react";
+import { ChoiceCards } from "../guided/ChoiceCards";
+import { Hint } from "../guided/Hint";
+import type { Language } from "../types";
+import type { ScientificTask } from "../integrations/types";
+import type { SimulationPayload } from "./types";
+export function SimulationConditions({
+  fep,
+  payload,
+  update,
+  options,
+  setOptions,
+  language,
+}: {
+  fep: boolean;
+  payload: SimulationPayload;
+  update(change: Partial<SimulationPayload>): void;
+  options: ScientificTask["options"];
+  setOptions: Dispatch<SetStateAction<ScientificTask["options"]>>;
+  language: Language;
+}) {
+  const zh = language === "zh",
+    [expert, setExpert] = useState(false);
+  return (
+    <>
+      {fep && (
+        <ChoiceCards
+          label={zh ? "计算阶段" : "Calculation stage"}
+          value={payload.stage ?? "plan"}
+          onChange={(v) => {
+            update({ stage: v as "plan" | "calculate" });
+            setOptions((o) => ({
+              ...o,
+              device: v === "plan" ? "cpu" : "cuda",
+            }));
+          }}
+          options={[
+            {
+              value: "plan",
+              label: [
+                "先检查变化网络 · 推荐",
+                "Inspect the network first · Recommended",
+              ],
+              note: [
+                "显示原子映射，不报告自由能",
+                "Inspect atom maps without claiming free energies",
+              ],
+            },
+            {
+              value: "calculate",
+              label: ["执行 FEP 计算", "Run FEP calculations"],
+              note: [
+                "两个环境、独立重复与误差分析",
+                "Both thermodynamic legs, independent repeats and uncertainty",
+              ],
+            },
+          ].map((c) => ({
+            value: c.value,
+            title: c.label[zh ? 0 : 1],
+            note: c.note[zh ? 0 : 1],
+          }))}
+        />
+      )}
+      <div className="simulation-condition-row">
+        <label>
+          <span className="simulation-field-heading">
+            {zh ? "温度" : "Temperature"}
+          </span>
+          <select
+            value={payload.temperature_kelvin}
+            onChange={(e) =>
+              update({ temperature_kelvin: Number(e.target.value) })
+            }
+          >
+            {Array.from(new Set([298.15, 300, 310, payload.temperature_kelvin]))
+              .filter(Number.isFinite)
+              .sort((a, b) => a - b)
+              .map((t) => (
+                <option key={t} value={t}>
+                  {t} K
+                </option>
+              ))}
+          </select>
+        </label>
+        <label>
+          <span className="simulation-field-heading">
+            {zh ? "独立重复" : "Independent repeats"}
+            <Hint label={zh ? "独立重复说明" : "About independent repeats"}>
+              {zh
+                ? "独立重复帮助判断结果是否稳健。单次短模拟不能证明收敛。"
+                : "Independent repeats help assess robustness. One short simulation does not establish convergence."}
+            </Hint>
+          </span>
+          <select
+            aria-label={zh ? "独立重复" : "Independent repeats"}
+            value={payload.repeats}
+            onChange={(e) => update({ repeats: Number(e.target.value) })}
+          >
+            {Array.from({ length: fep ? 6 : 3 }, (_, i) => i + 1).map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span className="simulation-field-heading">
+            {zh ? "计算设备" : "Compute device"}
+          </span>
+          <select
+            value={options.device}
+            onChange={(e) =>
+              setOptions((o) => ({
+                ...o,
+                device: e.target.value as "cpu" | "cuda",
+              }))
+            }
+          >
+            <option value="cuda">GPU · CUDA</option>
+            <option value="cpu">CPU</option>
+          </select>
+        </label>
+      </div>
+      <label className="check-row">
+        <input
+          type="checkbox"
+          checked={expert}
+          onChange={(e) => setExpert(e.target.checked)}
+        />
+        {zh ? "专家微调" : "Expert adjustments"}
+      </label>
+      {expert && (
+        <div className="simulation-condition-row">
+          <label>
+            {zh ? "生产采样（ns）" : "Production sampling (ns)"}
+            <input
+              type="number"
+              min={fep ? 0.02 : 0.002}
+              max={fep ? 50 : 500}
+              step="any"
+              value={payload.production_ns}
+              onChange={(e) =>
+                update({ production_ns: Number(e.target.value) })
+              }
+            />
+            {payload.kind === "gromacs" &&
+              Math.round(
+                (payload.production_ns * 1_000_000) /
+                  Number(payload.timestep_fs),
+              ) %
+                Number(payload.frames) !==
+                0 && (
+                <span role="alert">
+                  {zh
+                    ? "请选择与保存帧数匹配的采样时间，或使用推荐方案。"
+                    : "Choose sampling divisible by the saved frame count, or use a recommended plan."}
+                </span>
+              )}
+          </label>
+          <label>
+            {zh ? "平衡采样（ns）" : "Equilibration (ns)"}
+            <input
+              type="number"
+              min={fep ? 0.02 : 0.002}
+              max={5}
+              step="any"
+              value={payload.equilibration_ns}
+              onChange={(e) =>
+                update({ equilibration_ns: Number(e.target.value) })
+              }
+            />
+          </label>
+          {fep && (
+            <label>
+              {zh ? "原子映射方法" : "Atom mapping method"}
+              <select
+                value={String(payload.atom_mapper ?? "lomap")}
+                onChange={(e) => update({ atom_mapper: e.target.value })}
+              >
+                <option value="lomap">LoMap</option>
+                <option value="kartograf">Kartograf</option>
+              </select>
+              <Hint
+                label={
+                  zh ? "如何选择原子映射？" : "How to choose atom mapping?"
+                }
+              >
+                {zh
+                  ? "LoMap 保留当前默认；Kartograf 按对齐的三维几何建立映射。两者都会保留原子身份，不能替代采样与收敛检查。"
+                  : "LoMap retains the current default. Kartograf maps aligned 3D geometry. Both retain atom identities; neither replaces sampling and convergence checks."}
+              </Hint>
+            </label>
+          )}
+          {fep && (
+            <label>
+              {zh ? "变化网络" : "Perturbation network"}
+              <select
+                value={String(payload.network)}
+                onChange={(e) => update({ network: e.target.value })}
+              >
+                <option value="redundant">
+                  {zh ? "包含冗余连接" : "Include redundant connections"}
+                </option>
+                <option value="minimal">
+                  {zh ? "最小连接网络" : "Minimal connected network"}
+                </option>
+              </select>
+            </label>
+          )}
+        </div>
+      )}
+    </>
+  );
+}

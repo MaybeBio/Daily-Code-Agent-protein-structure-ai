@@ -1,0 +1,431 @@
+{
+  "upstream_commit": "cb04aeccdd480fd4db707f0bbafde538397fa2ac",
+  "patch_sha256": "d5a31ed470d7412c47b271b892148859c933e5b9c2c6378d908e125192c7e656",
+  "files": [
+    {
+      "path": "src/boltz/__init__.py",
+      "before_sha256": "17ffaca374b8d2266b499f3d19ee134ba699ab05b2657abf1f801718395b03f8",
+      "after_sha256": "17ffaca374b8d2266b499f3d19ee134ba699ab05b2657abf1f801718395b03f8"
+    },
+    {
+      "path": "src/boltz/data/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/data/const.py",
+      "before_sha256": "d4cfbcf19e8791f298e8c90db6a723ddbf4ffa85fdc445e5ba1dea33fbbc74d5",
+      "after_sha256": "d4cfbcf19e8791f298e8c90db6a723ddbf4ffa85fdc445e5ba1dea33fbbc74d5"
+    },
+    {
+      "path": "src/boltz/data/crop/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/data/crop/affinity.py",
+      "before_sha256": "36a1adbc8f3788eb561839805704e95f2233c5e4920070dab860ab9b1aafb18b",
+      "after_sha256": "36a1adbc8f3788eb561839805704e95f2233c5e4920070dab860ab9b1aafb18b"
+    },
+    {
+      "path": "src/boltz/data/crop/cropper.py",
+      "before_sha256": "0460e017035550fc8166f72a9c9c0fc87fc87d9d4d018099fca3306d07f81cae",
+      "after_sha256": "0460e017035550fc8166f72a9c9c0fc87fc87d9d4d018099fca3306d07f81cae"
+    },
+    {
+      "path": "src/boltz/data/feature/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/data/feature/featurizer.py",
+      "before_sha256": "fb0a7ecbbb42d5e02ef85d26e399a4bbb807773bcb5fbb3149a50923f697f860",
+      "after_sha256": "fb0a7ecbbb42d5e02ef85d26e399a4bbb807773bcb5fbb3149a50923f697f860"
+    },
+    {
+      "path": "src/boltz/data/feature/featurizerv2.py",
+      "before_sha256": "af1f9e6ec0c3d7289eb1f7503c3c1c3ee0d9f03436778dd4a7d412b8f7bd9f94",
+      "after_sha256": "ff2a1929681acc3afede16e261d48475c40c2eab0ed9fcdfe03b5faf80221c4c"
+    },
+    {
+      "path": "src/boltz/data/feature/symmetry.py",
+      "before_sha256": "244ab11b85dc72ceeae14288c4b3d42d7b2fe70622344dc164c0c7d26b0168d0",
+      "after_sha256": "244ab11b85dc72ceeae14288c4b3d42d7b2fe70622344dc164c0c7d26b0168d0"
+    },
+    {
+      "path": "src/boltz/data/module/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/data/module/inference.py",
+      "before_sha256": "3f19e1cc43cb6f2815b8f088ad3b4cdd18903b42c56e4daaa7576c332d6881f7",
+      "after_sha256": "3f19e1cc43cb6f2815b8f088ad3b4cdd18903b42c56e4daaa7576c332d6881f7"
+    },
+    {
+      "path": "src/boltz/data/module/inferencev2.py",
+      "before_sha256": "675235dff103d698dc65f2ebaca85a62b664ab28cd09f4b1c0166e6e56b47db4",
+      "after_sha256": "b82e6751c25683745ab19fe2914e6e8e23b6e9c3d3615d821a4041e5e4c45639"
+    },
+    {
+      "path": "src/boltz/data/mol.py",
+      "before_sha256": "99a3a93c71065f55555c220563aa5034617b8140593c07e04afb8f7f640ed727",
+      "after_sha256": "99a3a93c71065f55555c220563aa5034617b8140593c07e04afb8f7f640ed727"
+    },
+    {
+      "path": "src/boltz/data/msa/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/data/msa/mmseqs2.py",
+      "before_sha256": "7537c23ca2d6863639187b8815011d592ee433bb145e6fdc86082ca836d3a6e7",
+      "after_sha256": "9fcbbc83a12a93fbcfa29f0472af55dee96ab56893a37a851a5668f929a2d611"
+    },
+    {
+      "path": "src/boltz/data/pad.py",
+      "before_sha256": "3b808638e7394f016eb9678fee12a330822c96375f2e3f9526d5d07955c5c7cb",
+      "after_sha256": "3b808638e7394f016eb9678fee12a330822c96375f2e3f9526d5d07955c5c7cb"
+    },
+    {
+      "path": "src/boltz/data/parse/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/data/parse/a3m.py",
+      "before_sha256": "2399c3d7a918556d4d3ca78b10c9bb2381a7110aed664f5b16dc70f3dc262a2d",
+      "after_sha256": "2399c3d7a918556d4d3ca78b10c9bb2381a7110aed664f5b16dc70f3dc262a2d"
+    },
+    {
+      "path": "src/boltz/data/parse/csv.py",
+      "before_sha256": "1dcabcac95b69e37336a112bf237ddfe8fb3c4b68d4a0277608a02f6cac8aa9c",
+      "after_sha256": "1dcabcac95b69e37336a112bf237ddfe8fb3c4b68d4a0277608a02f6cac8aa9c"
+    },
+    {
+      "path": "src/boltz/data/parse/fasta.py",
+      "before_sha256": "63828f22d66a859dcc7a3ecfa3799dcdf6c44f2a472fef494f8d34962b4654f4",
+      "after_sha256": "63828f22d66a859dcc7a3ecfa3799dcdf6c44f2a472fef494f8d34962b4654f4"
+    },
+    {
+      "path": "src/boltz/data/parse/mmcif.py",
+      "before_sha256": "db99045c2931f8eb9a6b002cedc773d1fc5d46ee7f0823b4015d34bbce0fae34",
+      "after_sha256": "db99045c2931f8eb9a6b002cedc773d1fc5d46ee7f0823b4015d34bbce0fae34"
+    },
+    {
+      "path": "src/boltz/data/parse/pdb.py",
+      "before_sha256": "7aa50724cd70fdbd8a4acaeba8ceca0bd76ba9cc95099592a1ddcd1e53081a69",
+      "after_sha256": "7aa50724cd70fdbd8a4acaeba8ceca0bd76ba9cc95099592a1ddcd1e53081a69"
+    },
+    {
+      "path": "src/boltz/data/parse/schema.py",
+      "before_sha256": "c0dae4c89c4c4a22175a433b5a0c68860329d2a292c76224328bdde19b73b743",
+      "after_sha256": "12aafedde6a3d055ccbbad281d71fc5a743e9c188bad10beae42a8824cb56236"
+    },
+    {
+      "path": "src/boltz/data/parse/yaml.py",
+      "before_sha256": "19115132d0c3e0f4383c8a40fd2d638f4bd1684bb62e565dfe0e2b375cd4acda",
+      "after_sha256": "19115132d0c3e0f4383c8a40fd2d638f4bd1684bb62e565dfe0e2b375cd4acda"
+    },
+    {
+      "path": "src/boltz/data/tokenize/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/data/tokenize/boltz.py",
+      "before_sha256": "53c62f3952d95f8d523a258375b0d23431336f0c19db218207ef0c4381f68cd3",
+      "after_sha256": "53c62f3952d95f8d523a258375b0d23431336f0c19db218207ef0c4381f68cd3"
+    },
+    {
+      "path": "src/boltz/data/tokenize/boltz2.py",
+      "before_sha256": "e35aeb4b1c63df7abc402cf71ac3261447fd2374e557ab1aebd57ce4ff054422",
+      "after_sha256": "e35aeb4b1c63df7abc402cf71ac3261447fd2374e557ab1aebd57ce4ff054422"
+    },
+    {
+      "path": "src/boltz/data/tokenize/tokenizer.py",
+      "before_sha256": "f689243bcf40d51bd0779b5c5bd54b20a6424afbd400ba2ccb68ad74dd660c81",
+      "after_sha256": "f689243bcf40d51bd0779b5c5bd54b20a6424afbd400ba2ccb68ad74dd660c81"
+    },
+    {
+      "path": "src/boltz/data/types.py",
+      "before_sha256": "e7e5ede40e0c208bcb966acd04caebb3b017e8a50b85b1aa3cae4cdf83b71707",
+      "after_sha256": "a73a5d632819ad9fdf0157f902a04b36b237b1e2d52d6b3336089ae0b3261abc"
+    },
+    {
+      "path": "src/boltz/data/write/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/data/write/mmcif.py",
+      "before_sha256": "ebf4c5773903bb4f5dbe8121ece2def65855c7f5947157586cca74d26ec3337c",
+      "after_sha256": "ebf4c5773903bb4f5dbe8121ece2def65855c7f5947157586cca74d26ec3337c"
+    },
+    {
+      "path": "src/boltz/data/write/pdb.py",
+      "before_sha256": "a7ec3450deaec04fe4c030a99e778df5ed23a6f483b286d10fed00fa22aa6db9",
+      "after_sha256": "a7ec3450deaec04fe4c030a99e778df5ed23a6f483b286d10fed00fa22aa6db9"
+    },
+    {
+      "path": "src/boltz/data/write/writer.py",
+      "before_sha256": "65b7fd13f6fdd0d06c0f241a9b717529cf1bbe5e2d5fb70e1aa068400ac2f815",
+      "after_sha256": "65b7fd13f6fdd0d06c0f241a9b717529cf1bbe5e2d5fb70e1aa068400ac2f815"
+    },
+    {
+      "path": "src/boltz/main.py",
+      "before_sha256": "b5ded4dac1552af2e079c335d56e64ea580b4d5ca0202a9542385ce3e318c3b3",
+      "after_sha256": "a0b64a1a4052fe322421ca760eee00faba4113d0a511c20fa3e903a355a3a23e"
+    },
+    {
+      "path": "src/boltz/model/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/model/layers/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/model/layers/attention.py",
+      "before_sha256": "ae47793d3228541d644b30e706b65fbade03a041ca1c10b0b836f5a7425f49c9",
+      "after_sha256": "ae47793d3228541d644b30e706b65fbade03a041ca1c10b0b836f5a7425f49c9"
+    },
+    {
+      "path": "src/boltz/model/layers/attentionv2.py",
+      "before_sha256": "ae9bbc1eeb56c8dcd403d49693c84cd616ffd6772226364214ffd61d328cd8da",
+      "after_sha256": "5351c8eb456d97a5b9671e341def9af56d6d6e1e1d26a0f335a98396d390a3b2"
+    },
+    {
+      "path": "src/boltz/model/layers/confidence_utils.py",
+      "before_sha256": "50cc0fe50e6088127c04ae715875e612c0f8a690ee8114b86a5ad41aebc63db7",
+      "after_sha256": "50cc0fe50e6088127c04ae715875e612c0f8a690ee8114b86a5ad41aebc63db7"
+    },
+    {
+      "path": "src/boltz/model/layers/dropout.py",
+      "before_sha256": "cb22161a9683a8d9d16866f4fd3d1ece2cce663e2e4ed738bcd3bd23f47a77b6",
+      "after_sha256": "cb22161a9683a8d9d16866f4fd3d1ece2cce663e2e4ed738bcd3bd23f47a77b6"
+    },
+    {
+      "path": "src/boltz/model/layers/initialize.py",
+      "before_sha256": "2a72bdb547c6bc25a47706dc2ef258a0bf969a5a3d61c21c281b5dad76941b7d",
+      "after_sha256": "2a72bdb547c6bc25a47706dc2ef258a0bf969a5a3d61c21c281b5dad76941b7d"
+    },
+    {
+      "path": "src/boltz/model/layers/outer_product_mean.py",
+      "before_sha256": "c7966c776a9f5b8075f2d75c59ec88cc0ea2ba38694b568167c64ede619a774c",
+      "after_sha256": "c7966c776a9f5b8075f2d75c59ec88cc0ea2ba38694b568167c64ede619a774c"
+    },
+    {
+      "path": "src/boltz/model/layers/pair_averaging.py",
+      "before_sha256": "5d7662a723a5c59bf8411e1493670851ef0ec3f5e9af8e5e102aac5a8b8d015b",
+      "after_sha256": "5d7662a723a5c59bf8411e1493670851ef0ec3f5e9af8e5e102aac5a8b8d015b"
+    },
+    {
+      "path": "src/boltz/model/layers/pairformer.py",
+      "before_sha256": "794efe7648927a1681a236cb54bb65cb3125acc48a89a72cf205bbc551be2f2e",
+      "after_sha256": "2824d937a6e59583a74cb0c0ef74e5c3644bee296588a37141e7b3bec1c39736"
+    },
+    {
+      "path": "src/boltz/model/layers/token_bias.py",
+      "before_sha256": null,
+      "after_sha256": "04ae714e7eb77244eeede91496ac7311d3c31779fba7519460c5f38f1b8d9dde"
+    },
+    {
+      "path": "src/boltz/model/layers/transition.py",
+      "before_sha256": "cc50a51a6aa669455420549de16e29558d7b96f8a7d8da6f69930ab9e738cf37",
+      "after_sha256": "0692e69732bcc2d80ba32a11c1edc657fd30224d7354c58ea99b92f7fdcbfa3b"
+    },
+    {
+      "path": "src/boltz/model/layers/triangular_attention/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/model/layers/triangular_attention/attention.py",
+      "before_sha256": "deaaa0c28d2864d630d83c586d3d6b3f3499909cad01579753ce1c35a9c465c7",
+      "after_sha256": "1e3e81c07863f1c93bd2b0e27838b0535ed78da416ed6272a92a8542b4bdc8d0"
+    },
+    {
+      "path": "src/boltz/model/layers/triangular_attention/primitives.py",
+      "before_sha256": "d7245ffe8eefa580c693967e047da9950ed2b366c3595804e19a4477d789a412",
+      "after_sha256": "d7245ffe8eefa580c693967e047da9950ed2b366c3595804e19a4477d789a412"
+    },
+    {
+      "path": "src/boltz/model/layers/triangular_attention/utils.py",
+      "before_sha256": "1236df24edde965ec06fcbfc006ef3b16f0a9359fa6e519f0b21cf47e34ecdb5",
+      "after_sha256": "1236df24edde965ec06fcbfc006ef3b16f0a9359fa6e519f0b21cf47e34ecdb5"
+    },
+    {
+      "path": "src/boltz/model/layers/triangular_mult.py",
+      "before_sha256": "458319d62723c19a672fa650b11a601feaff8ee195179e37e6a43b34a92b3a94",
+      "after_sha256": "3fda2bdea2a3b136346951e6787c9e95f30a128f867e829a039cdb852fbb9fd4"
+    },
+    {
+      "path": "src/boltz/model/loss/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/model/loss/bfactor.py",
+      "before_sha256": "cd7f4922518011347734c71ba6d0118f34ab870586feb5ab1bca47ac75ab13ff",
+      "after_sha256": "cd7f4922518011347734c71ba6d0118f34ab870586feb5ab1bca47ac75ab13ff"
+    },
+    {
+      "path": "src/boltz/model/loss/confidence.py",
+      "before_sha256": "ca018acad7e8a7ccf05e58dd9625623f45c62816e70a03dc076e5fbf53d47808",
+      "after_sha256": "ca018acad7e8a7ccf05e58dd9625623f45c62816e70a03dc076e5fbf53d47808"
+    },
+    {
+      "path": "src/boltz/model/loss/confidencev2.py",
+      "before_sha256": "3c58b678c5c78735ed3f5d78e74e3fe4ccf0bfc6a46f75e6e1961e1ef07b5a24",
+      "after_sha256": "3c58b678c5c78735ed3f5d78e74e3fe4ccf0bfc6a46f75e6e1961e1ef07b5a24"
+    },
+    {
+      "path": "src/boltz/model/loss/diffusion.py",
+      "before_sha256": "e71b74b36a09a4f31241de704fc31fe4bcca821a0abbef035cf3872f77b81076",
+      "after_sha256": "e71b74b36a09a4f31241de704fc31fe4bcca821a0abbef035cf3872f77b81076"
+    },
+    {
+      "path": "src/boltz/model/loss/diffusionv2.py",
+      "before_sha256": "c7eca07579fde88efb6c232ccd7b3964721cb91c70f17df1583de5f43cbe503b",
+      "after_sha256": "c7eca07579fde88efb6c232ccd7b3964721cb91c70f17df1583de5f43cbe503b"
+    },
+    {
+      "path": "src/boltz/model/loss/distogram.py",
+      "before_sha256": "79006491376335f9e46b480c34570c797fe8ecacec4d8e134d97e6fa80db5ee0",
+      "after_sha256": "79006491376335f9e46b480c34570c797fe8ecacec4d8e134d97e6fa80db5ee0"
+    },
+    {
+      "path": "src/boltz/model/loss/distogramv2.py",
+      "before_sha256": "74580c1b0a5d2cae3eb241c9c2fa44446d7429f1776543754fdfe1523fa25900",
+      "after_sha256": "74580c1b0a5d2cae3eb241c9c2fa44446d7429f1776543754fdfe1523fa25900"
+    },
+    {
+      "path": "src/boltz/model/loss/validation.py",
+      "before_sha256": "818a5b6a0f66ba58391c93d78ce50568c57d5d2617fecd9b210d22623880a30d",
+      "after_sha256": "818a5b6a0f66ba58391c93d78ce50568c57d5d2617fecd9b210d22623880a30d"
+    },
+    {
+      "path": "src/boltz/model/models/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/model/models/boltz1.py",
+      "before_sha256": "dc506b7d313187c1082a7e2f8dcf663a899d43a2cefe499cb2ca7367f0d78754",
+      "after_sha256": "dc506b7d313187c1082a7e2f8dcf663a899d43a2cefe499cb2ca7367f0d78754"
+    },
+    {
+      "path": "src/boltz/model/models/boltz2.py",
+      "before_sha256": "c3f21a4c5e31bdcb81709da131b201944c48d11e00e52aaadd15b3e2512568ab",
+      "after_sha256": "d9c3ec5a173767e87d1cf0fc8a00c319a983f2490c000b5d055ef2727184d4e1"
+    },
+    {
+      "path": "src/boltz/model/modules/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/model/modules/affinity.py",
+      "before_sha256": "164b48db0ae40eab2318724ebafcd5ad92bbf0c38f8d4eb940dd25eac07540f4",
+      "after_sha256": "164b48db0ae40eab2318724ebafcd5ad92bbf0c38f8d4eb940dd25eac07540f4"
+    },
+    {
+      "path": "src/boltz/model/modules/confidence.py",
+      "before_sha256": "b171b29998a232d7d73e452f1e96b62820af358efd0fc8d75c4c7d1b3dab345b",
+      "after_sha256": "b171b29998a232d7d73e452f1e96b62820af358efd0fc8d75c4c7d1b3dab345b"
+    },
+    {
+      "path": "src/boltz/model/modules/confidence_utils.py",
+      "before_sha256": "2b71b1e9b675544d8cfc435b27df2e2adb719319ea44f94fffb806a05359c88c",
+      "after_sha256": "2b71b1e9b675544d8cfc435b27df2e2adb719319ea44f94fffb806a05359c88c"
+    },
+    {
+      "path": "src/boltz/model/modules/confidencev2.py",
+      "before_sha256": "1b48b2194a9361e46a8b67d845d630e92e2e293fd05f93cb4e30413b463eb80f",
+      "after_sha256": "1b48b2194a9361e46a8b67d845d630e92e2e293fd05f93cb4e30413b463eb80f"
+    },
+    {
+      "path": "src/boltz/model/modules/diffusion.py",
+      "before_sha256": "61d13ffd2314fd0520f311c1e63b73fe64b77b86556eba83476fa6e828a6dcbb",
+      "after_sha256": "4d155c19d66ba04ef736726898af75d9c6b6d09aa315fb9de708d596f49d4ba1"
+    },
+    {
+      "path": "src/boltz/model/modules/diffusion_conditioning.py",
+      "before_sha256": "6500f3bd894c27d072581810be5548250eba18f1e400af637d554aebc20ce719",
+      "after_sha256": "6500f3bd894c27d072581810be5548250eba18f1e400af637d554aebc20ce719"
+    },
+    {
+      "path": "src/boltz/model/modules/diffusionv2.py",
+      "before_sha256": "9eacc8cf7daeb62dffa81a09a1f93d2e268a4b7b68b5b88c2058c5ebf5ca4057",
+      "after_sha256": "6af9210c22b19a53a9b3200cbbfc7cd458f07274bd03d80407c929f2b4c9aecc"
+    },
+    {
+      "path": "src/boltz/model/modules/encoders.py",
+      "before_sha256": "cc3aecc74a80a92a65188a0e3211f8856dfb701269fb543a02da2ed5ecd9c18c",
+      "after_sha256": "cc3aecc74a80a92a65188a0e3211f8856dfb701269fb543a02da2ed5ecd9c18c"
+    },
+    {
+      "path": "src/boltz/model/modules/encodersv2.py",
+      "before_sha256": "2938af17252607d056106fc04a3afa0ea96b145fa7485764ebf33d646c99e0d4",
+      "after_sha256": "9528cfcb8e205625a205299cc3e03f21205f1afacb2f9879b992eaf756050826"
+    },
+    {
+      "path": "src/boltz/model/modules/transformers.py",
+      "before_sha256": "2e427fb4940106053a99f4eba9de9966eda3abb1755a93736207a6577fb5b74f",
+      "after_sha256": "2e427fb4940106053a99f4eba9de9966eda3abb1755a93736207a6577fb5b74f"
+    },
+    {
+      "path": "src/boltz/model/modules/transformersv2.py",
+      "before_sha256": "4fbecbe835ec2d7286d5a46e408cb9134b2378bce8dd443df58b80392736f982",
+      "after_sha256": "d1f99853919c56dc55997e141210edf27bd63b36db3133dcd193db35363dc2cd"
+    },
+    {
+      "path": "src/boltz/model/modules/trunk.py",
+      "before_sha256": "44b4e5b73714d1032cd8ae680abcd5715e38b7dd06991f9b3e1692ae5f4e898d",
+      "after_sha256": "44b4e5b73714d1032cd8ae680abcd5715e38b7dd06991f9b3e1692ae5f4e898d"
+    },
+    {
+      "path": "src/boltz/model/modules/trunkv2.py",
+      "before_sha256": "6efdf74176e06237e7a0e601b534a0eb74addc60f42de56609930a2ec8d5dad9",
+      "after_sha256": "cab1281da441eaa819de351b0351ed8885115cbc77633c0fba5e5ea23b86fc43"
+    },
+    {
+      "path": "src/boltz/model/modules/utils.py",
+      "before_sha256": "9752c1ad82549c9cf2638c484f576ce411436130cd1d43265362be38b46bf0f8",
+      "after_sha256": "9752c1ad82549c9cf2638c484f576ce411436130cd1d43265362be38b46bf0f8"
+    },
+    {
+      "path": "src/boltz/model/optim/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/model/optim/ema.py",
+      "before_sha256": "ae3d5df44e53589d84516eb3fca86b80e1007bf8f3077763ecee65c099e9acc7",
+      "after_sha256": "ae3d5df44e53589d84516eb3fca86b80e1007bf8f3077763ecee65c099e9acc7"
+    },
+    {
+      "path": "src/boltz/model/optim/scheduler.py",
+      "before_sha256": "9c1e23cf4099e294789f4f0b427804c4bfe937270875823c0175681cf9d9590f",
+      "after_sha256": "9c1e23cf4099e294789f4f0b427804c4bfe937270875823c0175681cf9d9590f"
+    },
+    {
+      "path": "src/boltz/model/potentials/__init__.py",
+      "before_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "after_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "src/boltz/model/potentials/potentials.py",
+      "before_sha256": "1e4a79f1454e5a71ca5a3eb82fca5451a7dc2bed8a45df9f0a814f62a6219f38",
+      "after_sha256": "e3694abc3c0094cb587a617c12d2036d7edfe1c2dcb3e8e4f43b5abaf63cd866"
+    },
+    {
+      "path": "src/boltz/model/potentials/schedules.py",
+      "before_sha256": "3c4fe0ca97a122e8d3148dc7e5401b2ac1b112f3806a2e98351d719086e9534f",
+      "after_sha256": "3c4fe0ca97a122e8d3148dc7e5401b2ac1b112f3806a2e98351d719086e9534f"
+    }
+  ]
+}

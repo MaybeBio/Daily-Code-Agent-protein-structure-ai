@@ -1,0 +1,28 @@
+#include <iostream>
+
+#include "colvarmodule.h"
+#include "colvarproxy.h"
+#include "colvarscript.h"
+
+
+int main(int argc, char *argv[]) {
+
+  colvarproxy *proxy = new colvarproxy();
+  proxy->cvmodule = new colvarmodule(proxy);
+
+  proxy->backup_file("nonexistent.txt");
+  proxy->remove_file("nonexistent.txt");
+
+  // Produce an (almost) empty state file, twice (uses proxy->backup_file())
+  proxy->cvmodule->write_restart_file("test.colvars.state");
+  proxy->cvmodule->write_restart_file("test.colvars.state");
+
+  proxy->backup_file("test.colvars.state.old");
+
+  proxy->remove_file("test.colvars.state");
+  proxy->remove_file("test.colvars.state.old");
+  proxy->remove_file("test.colvars.state.old.old");
+
+
+  return 0;
+}

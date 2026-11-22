@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# LAUNCH the THREE-WAY A⊕B⊕C sweep as a Vertex AI Custom Job (dev docs/plan/23): 1x H100 (a3-highgpu-1g),
+# on-demand, runs as spa-worker, boots run_threeway_sweep.sh (RFD3±SPA generate + adherence, and — for
+# STAGE=designability — ProteinMPNN→OF3 scRMSD) on the spa-combined image, then AUTO-TERMINATES. Mirrors
+# submit_smoke_job.sh but forwards the three-way sweep knobs. On-demand H100 = 1/region (Spot/Flex quota=0).
+#
+# PREREQUISITES:
+#   - spa-combined:${TAG} pushed to Artifact Registry
+#   - PUBLIC repo pushed to GitHub @ $REPO_REF (the job git-clones it for run_threeway_sweep.sh + the drivers)
+#   - PINNED GCS artifacts: weights/{rfd3_latest.ckpt,of3-p2-155k.pt}, checkpoints/spa-Nx1536-multigran/spa_C_final.pt
+#   - eval/threeway/prep/ staged with the motif-source + target-fold PDBs (scripts/eval/prep_threeway.py)
+#
+# Usage:
+#   DRY_RUN=1 ./submit_threeway_job.sh                                   # print the CustomJobSpec; create NOTHING
+#   STAGE=adherence REGION=us-west1 MOTIFS=... FOLDS=... ./submit_threeway_job.sh   # Stage-1 screen
+#   STAGE=designability WINNERS=... REGION=us-central1 ./submit_threeway_job.sh     # Stage-2 on winners
+set -euo pipefail
+
+PROJECT="${PROJECT:-spa-dev-499900}"
+REGION="${REGION:-us-west1}"
+TAG="${TAG:-0.1.0}"
+IMAGE="${IMAGE:-us-central1-docker.pkg.dev/spa-dev-499900/spa/spa-combined:${TAG}}"
+SA="${SA:-spa-worker@spa-dev-499900.iam.gserviceaccount.com}"
+REPO_URL="${REPO_URL:-https://github.com/GreggHelt2/structure-prompt-adapter}"
+REPO_REF="${REPO_REF:-main}"
+BUCKET="${BUCKET:-gs://genomancer-spa-cache}"
+DISK_GB="${DISK_GB:-150}"                    # image + RFD3 (2.9G) + OF3 (2.3G) + SPA multigran + designs
+STRATEGY="${STRATEGY:-ONDEMAND}"
+NAME="${NAME:-spa-threeway-${STAGE:-adherence}-$(date -u +%Y%m%d-%H%M%S)}"
+GCLOUD="${GCLOUD:-gcloud}"                          # PATH lookup, portable across machines; override to a full path if not on PATH
+
+RUN_SCRIPT="${RUN_SCRIPT:-run_threeway_sweep.sh}"   # in-container runner (run_threeway_sweep.sh | run_of3_batch_bench.sh)
+# Pin the code revision and container digest (see _pin_run_env.sh). Must come AFTER IMAGE /
+# REPO_URL / GCLOUD are set and BEFORE BOOT is built.
+. "$(dirname "${BASH_SOURCE[0]}")/_pin_run_env.sh"
+
+BOOT="set -e; ${BOOT_CHECKOUT} && bash /opt/spa/scripts/cloud/${RUN_SCRIPT}"
+
+CFG="$(mktemp)"   # no --suffix: GNU-only flag, absent on macOS/BSD mktemp; gcloud --config doesn't need the extension
+cat > "${CFG}" <<YAML
+workerPoolSpecs:
+  - machineSpec:
+      machineType: a3-highgpu-1g
+      acceleratorType: NVIDIA_H100_80GB
+      acceleratorCount: 1
+    replicaCount: 1
+    diskSpec:
+      bootDiskType: pd-ssd
+      bootDiskSizeGb: ${DISK_GB}
+    containerSpec:
+      imageUri: ${IMAGE}
+      command: ["bash", "-c"]
+      args: ["${BOOT}"]
+      env:
+YAML
+
+add_env(){ [ -z "${2:-}" ] && return 0; printf '        - name: %s\n          value: "%s"\n' "$1" "$2" >> "${CFG}"; }
+add_env PROJECT "${PROJECT}"
+add_env BUCKET "${BUCKET}"
+add_env REPO_REF "${REPO_REF}"
+# three-way sweep knobs (all omitted-when-empty -> the run script's defaults apply):
+add_env STAGE "${STAGE:-}"
+add_env MOTIFS "${MOTIFS:-}"
+add_env FOLDS "${FOLDS:-}"
+add_env LAYOUTS "${LAYOUTS:-}"
+add_env LAMBDAS "${LAMBDAS:-}"
+add_env ULEN "${ULEN:-}"
+add_env CLEN "${CLEN:-}"
+add_env K "${K:-}"
+add_env NSEQ "${NSEQ:-}"
+add_env SEEDS "${SEEDS:-}"
+add_env WINNERS "${WINNERS:-}"
+add_env OF3_BATCH_SIZE "${OF3_BATCH_SIZE:-}"    # designability OF3 refold batch_size (nokernel; ~2.5x@bs=8; dev 23 §7.8)
+add_env PROTEINMPNN_SEED "${PROTEINMPNN_SEED:-}"
+add_env LEAN_RESULTS "${LEAN_RESULTS:-}"
+# OF3 batch-bench knobs (run_of3_batch_bench.sh):
+add_env DESIGN_ID "${DESIGN_ID:-}"
+add_env N_SEQS "${N_SEQS:-}"
+add_env BATCH_SIZES "${BATCH_SIZES:-}"
+# OF3 attention kernel: triton (default, Hopper perf, but its Evoformer kernel asserts bs=1 — evoformer.py:915)
+# vs nokernel (stock attention, the A5000-verified batched path). Set KERNEL=nokernel to batch bs>1. dev 23 §7.
+add_env KERNEL "${KERNEL:-}"
+# two-steer designability (run_twosteer_designability.sh): which cell arms + candidate cells to score
+add_env ARMS "${ARMS:-}"
+add_env CANDIDATES "${CANDIDATES:-}"
+
+case "${STRATEGY}" in
+  ONDEMAND|STANDARD|on-demand|"") : ;;
+  *) printf 'scheduling:\n  strategy: %s\n' "${STRATEGY}" >> "${CFG}" ;;
+esac
+
+echo ">>> CustomJobSpec (${CFG}):"; sed 's/^/    /' "${CFG}"
+echo ">>> name=${NAME} region=${REGION} sa=${SA} image=${IMAGE} stage=${STAGE:-adherence}"
+
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  echo ">>> DRY_RUN=1 — not submitting. Real command would be:"
+  echo "    ${GCLOUD} ai custom-jobs create --project=${PROJECT} --region=${REGION} --display-name=${NAME} --service-account=${SA} --config=${CFG}"
+  exit 0
+fi
+
+echo ">>> Submitting Vertex Custom Job (provisions the H100) ..."
+exec "${GCLOUD}" ai custom-jobs create \
+  --project="${PROJECT}" --region="${REGION}" \
+  --display-name="${NAME}" \
+  --service-account="${SA}" \
+  --config="${CFG}"

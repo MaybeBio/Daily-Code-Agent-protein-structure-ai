@@ -1,0 +1,178 @@
+@import "tailwindcss";
+
+/* Mol*'s own stylesheet. The package ships compiled CSS, so we use that
+   rather than adding a Sass pipeline for one dependency. */
+@import "molstar/build/viewer/molstar.css";
+
+/* Design tokens. See docs/design.md for the reasoning behind each choice.
+   v2 is light: white paper, ink text, one blue accent. The previous dark +
+   acid-green scheme is one of the documented generated-design tells, and a
+   light surface is also what this product actually is — a document you put
+   findings in. The one dark surface is the 3D viewport (.specimen below),
+   because a specimen is lit against a dark field in every piece of structural
+   software there is. */
+@theme {
+  --color-ground: #ffffff;
+  --color-panel: #ffffff;
+  --color-panel-hi: #f4f5f3;
+  --color-wash: #f7f7f5;
+  --color-line: #e4e4e0;
+  --color-ink: #16181d;
+  --color-muted: #5b6270;
+  --color-faint: #8a909c;
+
+  /* One accent, carrying links, primary actions and focus. */
+  --color-signal: #1f5fae;
+  --color-signal-dim: #e7effa;
+
+  /* Outcome colours, chosen to stay legible as text on white. */
+  --color-caution: #8a5a00;
+  --color-danger: #b4251f;
+  --color-good: #1f7a54;
+
+  /* Chain colours for the 3D viewport and its legend. These stay bright:
+     they sit on the dark specimen field, not on the page. They differ in
+     lightness as well as hue, so binder and target remain distinguishable
+     with deuteranopia. */
+  --color-binder: #2ee6a6;
+  --color-target: #7aa7f5;
+  --color-epitope: #ff6fa3;
+  --color-specimen: #0e1117;
+
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "IBM Plex Serif", ui-serif, Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 10px;
+}
+
+:root {
+  /* UI feedback: fast and precise. */
+  --dur-press: 120ms;
+  --dur-ui: 200ms;
+  --dur-panel: 300ms;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+
+  /* Cinematic: reveals and the landing set-piece. */
+  --dur-reveal: 0.9s;
+  --dur-hero: 1.2s;
+  --ease-expo: cubic-bezier(0.16, 1, 0.3, 1);
+
+  color-scheme: light;
+}
+
+* {
+  border-color: var(--color-line);
+}
+
+html {
+  background: var(--color-ground);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  background: var(--color-ground);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+/* Every number in this product is a measurement, so figures must align.
+   Mono is for things that are counted or compared — sequences, residue
+   numbers, metric columns — never for labels. Labels in mono were a v1 tell. */
+.tnum {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1, "zero" 1;
+}
+
+/* Headlines. A serif on white reads as considered and medical rather than
+   start-up, and it is the one place the page raises its voice. */
+.display {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1.1;
+}
+
+/* --- the specimen field -------------------------------------------------
+   The single dark surface. Text tokens are redefined inside it so shared
+   components keep working without a second set of classes. */
+.specimen {
+  background: var(--color-specimen);
+  --color-ink: #e9eef5;
+  --color-muted: #9aa6b6;
+  --color-faint: #6b7787;
+  --color-line: #232a35;
+  color: var(--color-ink);
+}
+
+/* --- reveal gate -------------------------------------------------------
+   Content is in the DOM and visible without JS. The gate only *delays* a
+   choreographed entrance when JS is present, so there is no FOUC and no
+   blank page if a script fails. */
+[data-reveal] {
+  opacity: 1;
+}
+html.js-ready [data-reveal="pending"] {
+  opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html.js-ready [data-reveal="pending"] {
+    opacity: 1;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Focus is always visible and always the accent. */
+:focus-visible {
+  outline: 2px solid var(--color-signal);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+::selection {
+  background: var(--color-signal-dim);
+  color: var(--color-ink);
+}
+
+/* Mol* brings its own stylesheet and expects its host to give it bounds.
+   Without these it mounts, reports a canvas of width x 0, and spins in a
+   render loop against a zero-height drawing buffer. */
+.msp-plugin,
+.msp-plugin-content.msp-layout-standard {
+  position: absolute;
+  inset: 0;
+  width: auto;
+  height: auto;
+}
+.msp-plugin {
+  --msp-font: var(--font-sans) !important;
+}
+/* Its chrome is hidden in favour of our own controls, which are labelled and
+   sit in our own visual language. */
+.msp-plugin-content {
+  border: none !important;
+}
+.msp-viewport-controls,
+.msp-viewport-top-left-controls,
+.msp-animation-viewport-controls,
+.msp-background-tasks,
+.msp-logo,
+.msp-left-panel-controls,
+.msp-highlight-toast-wrapper {
+  display: none !important;
+}

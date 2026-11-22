@@ -1,0 +1,208 @@
+// -*- mode:c++;tab-width:2;indent-tabs-mode:t;show-trailing-whitespace:t;rm-trailing-spaces:t -*-
+// vi: set ts=2 noet:
+//
+// (c) Copyright Rosetta Commons Member Institutions.
+// (c) This file is part of the Rosetta software suite and is made available under license.
+// (c) The Rosetta software is developed by the contributing members of the Rosetta Commons.
+// (c) For more information, see http://www.rosettacommons.org. Questions about this can be
+// (c) addressed to University of Washington CoMotion, email: license@uw.edu.
+
+/// @brief
+/// @author jk
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <sstream>
+
+#include <devel/init.hh>
+#include <core/pose/Pose.hh>
+#include <core/pose/init_id_map.hh>
+#include <core/pose/PDBInfo.hh>
+#include <basic/options/util.hh>
+#include <basic/options/option.hh>
+#include <basic/options/keys/out.OptionKeys.gen.hh>
+#include <basic/Tracer.hh>
+#include <basic/options/option_macros.hh>
+#include <core/conformation/Residue.hh>
+#include <protocols/simple_moves/SuperimposeMover.hh>
+
+// Utility Headers
+#include <core/id/AtomID.hh>
+#include <core/id/AtomID_Map.hh>
+#include <core/scoring/rms_util.hh>
+
+//Auto Headers
+#include <core/import_pose/import_pose.hh>
+#include <core/conformation/Residue.fwd.hh>
+
+//Protocol Headers
+#include <protocols/pockets/PocketGrid.hh>
+//#include <basic/options/keys/pocket_grid.OptionKeys.gen.hh>
+
+using namespace core;
+using namespace basic::options;
+using namespace std;
+using namespace core::scoring;
+using namespace basic::options::OptionKeys;
+using namespace conformation;
+using namespace core::pose::datacache;
+using namespace core::id;
+using namespace protocols::simple_moves;
+
+
+OPT_KEY( String, comparison_relax_pdb_num )
+OPT_KEY( String, template_pdb_name )
+OPT_KEY( String, contact_list )
+
+static basic::Tracer TR( "apps.pilot.karen_pocket_compare.main" );
+
+//set to store pdb info keys
+std::set <std::string> interface;
+
+bool
+is_interface_heavyatom(
+	core::pose::Pose const & pose,
+	core::pose::Pose const & ,//pose2,
+	core::Size resno,
+	core::Size atomno
+)
+{
+	// ws get residue "key" for set
+	std::ostringstream residuestream;
+	residuestream << pose.pdb_info()->chain(resno) << pose.pdb_info()->number(resno);
+	std::string res_id = residuestream.str();
+
+	core::conformation::Residue const & rsd = pose.residue(resno);
+	if ( interface.count( res_id ) > 0 ) return rsd.is_protein() && !rsd.atom_is_hydrogen(atomno);
+
+	return false;
+}
+
+Real
+iface_pdb_superimpose_pose(
+	pose::Pose & mod_pose,
+	pose::Pose const & ref_pose
+)
+{
+	id::AtomID_Map< id::AtomID > atom_map;
+	core::pose::initialize_atomid_map( atom_map, mod_pose, id::AtomID::BOGUS_ATOM_ID() );
+	for ( Size ii = 1; ii <= mod_pose.size(); ++ii ) {
+		if ( ! mod_pose.residue(ii).has("CA") ) continue;
+		if ( ! mod_pose.residue(ii).is_protein() ) continue;
+		for ( Size jj = 1; jj <= ref_pose.size(); ++jj ) {
+			if ( ! ref_pose.residue(jj).has("CA") ) continue;
+			if ( ! ref_pose.residue(jj).is_protein() ) continue;
+			if ( mod_pose.pdb_info()->chain(ii) != ref_pose.pdb_info()->chain(jj) ) continue;
+			if ( mod_pose.pdb_info()->number(ii) != ref_pose.pdb_info()->number(jj) ) continue;
+			if ( is_interface_heavyatom ( ref_pose, mod_pose, jj, 2) ) {
+				id::AtomID const id1( mod_pose.residue(ii).atom_index("CA"), ii );
+				id::AtomID const id2( ref_pose.residue(jj).atom_index("CA"), jj );
+				atom_map.set( id1, id2 );
+			}
+
+			break;
+		}
+
+	}
+	return superimpose_pose( mod_pose, ref_pose, atom_map );
+}
+
+
+/// General testing code
+int main( int argc, char * argv [] ) {
+
+	try{
+
+		NEW_OPT( comparison_relax_pdb_num, "comparison residue", "-1");
+		NEW_OPT( template_pdb_name, "template pdb", "template.pdb" );
+		NEW_OPT ( contact_list, "File name for optional list of contact residues to check","");
+
+		//initializes Rosetta functions
+		devel::init(argc, argv);
+
+		//allows output when running the program
+		//sets input residue numbers to resid and resid_c
+		std::string const resid_c = option[comparison_relax_pdb_num];
+		TR << "Starting pocket compare" << std::endl;
+
+		//sets template input pdb name
+		std::string const template_fname ( option[ template_pdb_name ] );
+
+		TR << "set template pdb" << template_fname << std::endl;
+		//sets pdb as a Rosetta pose
+		pose::Pose template_pose;
+		core::import_pose::pose_from_file( template_pose, template_fname , core::import_pose::PDB_file);
+		TR << "set template pdb" << "    Number of residues: " << template_pose.size() << std::endl;
+
+		// create pose for comparison pose from pdb
+		std::string const comparison_pdb_name ( basic::options::start_file() );
+		pose::Pose comparison_pose;
+		core::import_pose::pose_from_file( comparison_pose, comparison_pdb_name , core::import_pose::PDB_file);
+		TR << "set comparison pdb"<< "    Number of residues: " << comparison_pose.size() << std::endl;
+
+		std::string tag = "";
+		if ( !option[ OptionKeys::out::output_tag ]().empty() ) {
+			tag = "." + option[ OptionKeys::out::output_tag ]();
+		}
+
+		std::string const cfilename = option[ contact_list ];
+		if ( cfilename != "" ) {
+			std::ifstream ifs(cfilename.c_str(), std::ifstream::in);
+			if ( !ifs.is_open() ) {
+				std::cout<< "Error opening contact list file "<<cfilename<<std::endl;
+				return -100;
+			}
+			//ifb.open (cfilename,std::ios::in);
+			//std::ostream ios(&ifb);
+			std::string intres;
+			while ( ifs.good() ) {
+				ifs >> intres;
+				interface.insert(intres);
+			}
+
+			iface_pdb_superimpose_pose( comparison_pose, template_pose);
+		} else {
+
+
+			// align comparison pose to template pose
+			// protocols::simple_moves::SuperimposeMoverOP sp_mover = new protocols::simple_moves::SuperimposeMover( template_pose );
+			protocols::simple_moves::SuperimposeMoverOP sp_mover( new protocols::simple_moves::SuperimposeMover() );
+			sp_mover->set_reference_pose( template_pose, 1, template_pose.size() );
+			sp_mover->set_target_range( 1, template_pose.size() );
+			sp_mover->apply( comparison_pose );
+		}
+		// call function to make a grid around a target residue (seqpos)
+		std::vector< conformation::ResidueCOP > residues = protocols::pockets::PocketGrid::getRelaxResidues(comparison_pose, resid_c);
+		protocols::pockets::PocketGrid comparison_pg( residues );
+		//call function to define the pocket
+		comparison_pg.autoexpanding_pocket_eval( residues, comparison_pose ) ;
+		//output the pocket in a pdb
+		//comparison_pg.dumpGridToFile();
+		TR << "Comparison pocket defined" << std::endl;
+		//call function to get eggshell using pocket grid
+		protocols::pockets::EggshellGrid comparison_eggshell_grid( comparison_pg );
+		TR << "Comparison pocket eggshell made" << std::endl;
+
+		// dump to file, with name based on input pdb
+		std::stringstream out_fname;
+		out_fname << comparison_pdb_name << tag << ".eggshell";
+		comparison_eggshell_grid.dump_eggshell( out_fname.str() );
+		std::stringstream outpdb_fname;
+		outpdb_fname << comparison_pdb_name << tag << ".eggshell.pdb";
+		comparison_eggshell_grid.write_eggshell_to_pdb( outpdb_fname.str() );
+
+		//utility::io::ozstream fout;
+		//fout.open("distance.txt", std::ios::out);
+		//fout << d1 << std::endl;
+		//fout.close();
+		//  fout.clear();
+
+		TR << "Done!" << std::endl;
+	} catch (utility::excn::Exception const & e ) {
+		e.display();
+		return -1;
+	}
+	return 0;
+
+}
+

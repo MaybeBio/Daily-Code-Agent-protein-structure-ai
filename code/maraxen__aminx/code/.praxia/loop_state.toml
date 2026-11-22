@@ -1,0 +1,65 @@
+# .praxia/loop_state.toml — written by the autonomous-praxia-dev-loop skill
+
+[loop]
+version            = "1.0"
+task_id            = "260618_autonomous-loop"
+current_phase      = "VERIFY"
+last_subphase      = "auditor_dispatched"
+last_artifact_path = ".praxia/sprint_plans/260623_c-d-housekeeping-potts.toml"
+iteration_count    = 12
+last_activation    = "2026-06-23T17:30:00Z"
+autonomy_level     = "L2"
+selected_item_ids  = [1199, 1859, 2488, 1479, 1301]
+selection_mode     = "p1_p2_mixed"
+pcw_template       = "spec_driven_dev"
+brainstorm_needed  = false
+next_phase         = "TRIAGE"
+
+[loop.lock]
+token           = "260623_sprint-cd-verify"
+expiry_ts       = "2026-06-23T20:00:00Z"
+timeout_minutes = 45
+
+[loop.gates]
+spec_confirmed   = true
+spec_path        = ".praxia/docs/audits/260623_sprint-cd-adversarial.md"
+sprint_approved  = true
+sprint_plan_path = ".praxia/sprint_plans/260623_c-d-housekeeping-potts.toml"
+
+[loop.metrics]
+backlog_items_closed_per_iteration   = 5
+consecutive_zero_progress_iterations = 0
+max_zero_progress                    = 3
+last_items_closed                    = 5
+remediate_attempt                    = 0
+
+[loop.fingerprint]
+recent_tool_hashes = []
+stall_threshold    = 3
+
+[run]
+mode            = "hitl_semi_autonomous"
+human_available = true
+
+[model_routing]
+default_policy = "set_explicitly_per_dispatch"
+churn          = "claude-haiku-4-5-20251001"
+review_gate    = "claude-sonnet-4-6"
+synthesis      = "claude-opus-4-8"
+
+[model_routing.roles]
+recon              = "claude-haiku-4-5-20251001"
+fixer              = "claude-haiku-4-5-20251001"
+codemod            = "claude-haiku-4-5-20251001"
+formatters         = "claude-haiku-4-5-20251001"
+reviewer           = "claude-sonnet-4-6"
+auditor            = "claude-sonnet-4-6"
+security-auditor   = "claude-sonnet-4-6"
+plan-auditor       = "claude-sonnet-4-6"
+audit-synthesis    = "claude-opus-4-8"
+oracle             = "claude-opus-4-8"
+staff              = "claude-opus-4-8"
+specification      = "claude-opus-4-8"
+spec-challenger    = "claude-opus-4-8"
+spec-defender      = "claude-opus-4-8"
+sprint-composer    = "claude-opus-4-8"

@@ -1,0 +1,165 @@
+"""Fine-tuning strategies resolve to keys that exist in the shipped checkpoints.
+
+These are the fast counterpart to `tests/test_cli_finetune.py`: they pin the
+strategy -> parameter-key mapping against every bundled model in milliseconds,
+so an off-by-one in `layers_{num_layers - 1}` (or a head that was renamed) is
+caught on every PR without paying for a subprocess training run.
+"""
+import functools
+import json
+import pathlib
+import pickle
+
+import pytest
+
+from so3lr.finetuning_strategies import (
+    FINETUNING_STRATEGY_NAMES,
+    REMOVED_FINETUNING_STRATEGIES,
+    resolve_finetuning_strategy,
+)
+from so3lr.mlff.utils.param_utils import (
+    count_params,
+    count_trainable_params,
+    unmatched_param_keys,
+)
+
+MODELS_DIR = pathlib.Path(__file__).resolve().parent.parent / 'so3lr' / 'models'
+BUNDLED_MODELS = sorted(p.name for p in MODELS_DIR.iterdir() if (p / 'params.pkl').exists())
+
+# `so3lr` is the legacy checkpoint: it has no C6 head, so every strategy naming
+# `observables_3` legitimately selects nothing there.
+_OBS_3_STRATEGIES = {'obs_3', 'obs_23', 'obs_023', 'll_obs_023'}
+
+# (model, strategy) pairs where the whitelist matches *nothing at all*, so the
+# strategy would freeze the entire model. `run_fine_tuning` refuses these
+# outright rather than running a training job that updates nothing.
+UNSUPPORTED = {('so3lr', 'obs_3')}
+
+
+@functools.lru_cache(maxsize=None)
+def _load(model_name):
+    """(params, num_layers) of a bundled model, read once per session; callers only read it."""
+    model_dir = MODELS_DIR / model_name
+    with open(model_dir / 'params.pkl', 'rb') as fp:
+        params = pickle.load(fp)
+    with open(model_dir / 'hyperparameters.json') as fp:
+        num_layers = json.load(fp)['model']['num_layers']
+    return params, num_layers
+
+
+def test_cli_choices_match_the_strategy_table():
+    """`--strategy` accepts exactly the strategies that are implemented.
+
+    The two lists were maintained by hand and had drifted:
+    `freeze_all_but_final_mlp` was implemented but rejected by click.
+    """
+    from so3lr.cli import so3lr_cli
+
+    finetune_cmd = so3lr_cli.cli.commands['finetune']
+    strategy_option = next(p for p in finetune_cmd.params if p.name == 'strategy')
+    assert tuple(strategy_option.type.choices) == FINETUNING_STRATEGY_NAMES
+
+
+def test_unknown_strategy_lists_every_valid_name():
+    with pytest.raises(ValueError) as excinfo:
+        resolve_finetuning_strategy('not_a_strategy', num_layers=3)
+    message = str(excinfo.value)
+    for name in FINETUNING_STRATEGY_NAMES:
+        assert f'`{name}`' in message
+
+
+@pytest.mark.parametrize('strategy', sorted(REMOVED_FINETUNING_STRATEGIES))
+def test_a_removed_strategy_says_what_replaces_it(strategy, tmp_path):
+    """`freeze_long_range` / `forces_only` froze the long-range heads, which read features
+    that keep training, so the charges and ratios drifted anyway. They are gone, and the
+    error names the recipes that do keep the long-range terms."""
+    assert strategy not in FINETUNING_STRATEGY_NAMES
+    with pytest.raises(ValueError, match='was removed') as excinfo:
+        resolve_finetuning_strategy(strategy, num_layers=3)
+    assert 'readout_only' in str(excinfo.value)
+    assert 'long_range_anchor_weights' in str(excinfo.value)
+
+    from click.testing import CliRunner
+    from so3lr.cli.so3lr_cli import cli
+    datafile = tmp_path / 'data.xyz'
+    datafile.write_text('')
+    result = CliRunner().invoke(cli, ['finetune', '--datafile', str(datafile),
+                                      '--workdir', str(tmp_path / 'out'), '--strategy', strategy])
+    assert result.exit_code == 2
+    assert f'{strategy} was removed' in result.output
+    assert f'--strategy {strategy} was removed' not in result.output  # the flag is named once
+    assert 'readout_only' in result.output
+
+
+def test_freeze_parameters_freezes_only_the_named_keys():
+    """The frozen-keys (blacklist) form of freeze_parameters: no strategy uses it since
+    freeze_long_range went, so it is checked here directly. It once froze nothing."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from so3lr.mlff.utils.training_utils import freeze_parameters
+
+    params = {'params': {'layers_0': {'w': jnp.ones(2)}, 'observables_2': {'w': jnp.ones(2)}}}
+    opt = freeze_parameters(optax.sgd(1.0), frozen_subset_keys=['observables_2'])
+    grads = jax.tree_util.tree_map(jnp.ones_like, params)
+    updates, _ = opt.update(grads, opt.init(params), params)
+    assert (updates['params']['observables_2']['w'] == 0).all()
+    assert (updates['params']['layers_0']['w'] == -1).all()
+
+
+@pytest.mark.parametrize('strategy', FINETUNING_STRATEGY_NAMES)
+@pytest.mark.parametrize('model_name', BUNDLED_MODELS)
+def test_strategy_selects_real_parameters(strategy, model_name):
+    """Every strategy trains something, and less than everything (except `full`).
+
+    This is the regression guard for the `layers_{num_layers - 1}` fix: pointing
+    it at the *finetune* config's num_layers, or off by one, yields a key that
+    matches no parameter -- which used to freeze the whole model and still exit
+    0 after a full training run.
+    """
+    params, num_layers = _load(model_name)
+    trainable_keys, frozen_keys = resolve_finetuning_strategy(strategy, num_layers)
+
+    total = count_params(params)
+    trainable = count_trainable_params(
+        params, trainable_keys=trainable_keys, frozen_keys=frozen_keys
+    )
+    unmatched = unmatched_param_keys(params, trainable_keys or frozen_keys or [])
+
+    if (model_name, strategy) in UNSUPPORTED:
+        # No key matches -> everything would be frozen. run_fine_tuning turns
+        # exactly this condition into a ValueError instead of a no-op run.
+        assert trainable == 0
+        assert len(unmatched) == len(trainable_keys)
+        return
+
+    if strategy == 'full':
+        assert trainable_keys is None and frozen_keys is None
+        assert trainable == total
+    else:
+        assert 0 < trainable < total, (
+            f'{strategy} on {model_name} trains {trainable}/{total} parameters'
+        )
+
+    # Every key must select something, so a typo or a renamed head cannot pass
+    # unnoticed. The legacy `so3lr` checkpoint genuinely has no C6 head, and no
+    # shipped checkpoint has the residual readout, which fine-tuning creates.
+    if model_name == 'so3lr' and strategy in _OBS_3_STRATEGIES:
+        assert unmatched == ['observables_3']
+    elif strategy == 'readout_only':
+        assert unmatched == ['observables_0/energy_residual*']
+    else:
+        assert unmatched == [], f'{strategy} on {model_name}: {unmatched} match nothing'
+
+
+def test_aliases_resolve_identically():
+    assert (resolve_finetuning_strategy('freeze_all_but_final_mlp', 3)
+            == resolve_finetuning_strategy('final_mlp', 3))
+
+
+def test_last_layer_strategies_track_num_layers():
+    """The last-layer strategies name the block by index, so they must follow
+    the *pretrained* model's depth rather than a hardcoded number."""
+    for num_layers in (2, 3, 5):
+        trainable, _ = resolve_finetuning_strategy('last_layer', num_layers)
+        assert trainable == [f'layers_{num_layers - 1}']

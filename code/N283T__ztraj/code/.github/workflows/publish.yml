@@ -1,0 +1,235 @@
+name: Build & Publish
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Publish target"
+        required: true
+        default: "testpypi"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+          - none
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build_wheels:
+    name: Wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15-intel, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Setup Zig
+        if: runner.os != 'Linux'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Cache cibuildwheel
+        if: runner.os != 'Linux'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/Library/Caches/cibuildwheel
+            ~/AppData/Local/pypa/cibuildwheel/Cache
+          key: cibw-${{ runner.os }}-${{ hashFiles('python/pyproject.toml') }}
+          restore-keys: cibw-${{ runner.os }}-
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@54a71d3375df80d84b6d4537d04614fec04e637f # v3.4.0
+        with:
+          package-dir: python
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+  build_sdist:
+    name: Source dist
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build
+        run: pip install build
+
+      - name: Build sdist
+        working-directory: python
+        run: python -m build --sdist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: sdist
+          path: python/dist/*.tar.gz
+
+  build_cli:
+    name: CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            binary: ztraj
+          - os: ubuntu-24.04-arm
+            target: linux-aarch64
+            binary: ztraj
+          - os: macos-15-intel
+            target: macos-x86_64
+            binary: ztraj
+          - os: macos-latest
+            target: macos-aarch64
+            binary: ztraj
+          - os: windows-latest
+            target: windows-x86_64
+            binary: ztraj.exe
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build CLI
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Smoke test
+        shell: bash
+        run: ./zig-out/bin/${{ matrix.binary }} --version
+
+      - name: Package binary
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ASSET_NAME="ztraj-${VERSION}-${{ matrix.target }}"
+          mkdir -p dist
+          if [ "${{ matrix.target }}" = "windows-x86_64" ]; then
+            cp "zig-out/bin/${{ matrix.binary }}" "dist/${ASSET_NAME}.exe"
+          else
+            cp "zig-out/bin/${{ matrix.binary }}" "dist/${ASSET_NAME}"
+            chmod +x "dist/${ASSET_NAME}"
+          fi
+
+      - name: Upload CLI binary
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/ztraj-*
+
+  publish:
+    name: Publish
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      || (github.event_name == 'workflow_dispatch' && inputs.target != 'none')
+    permissions:
+      id-token: write
+    environment:
+      name: ${{ github.event_name == 'push' && 'pypi' || inputs.target }}
+      url: ${{ (github.event_name == 'push' || inputs.target == 'pypi') && 'https://pypi.org/p/pyztraj' || 'https://test.pypi.org/p/pyztraj' }}
+
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download sdist artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: sdist
+          path: dist
+          merge-multiple: true
+
+      - name: List distributions
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        if: github.event_name == 'push' || inputs.target == 'pypi'
+        uses: pypa/gh-action-pypi-publish@v1.14.3
+        with:
+          packages-dir: dist/
+
+      - name: Publish to TestPyPI
+        if: github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@v1.14.3
+        with:
+          packages-dir: dist/
+          repository-url: https://test.pypi.org/legacy/
+
+  github_release:
+    name: GitHub Release
+    needs: [publish, build_cli]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES=$(awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
+          echo "$NOTES" > /tmp/release_notes.md
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate CLI checksums
+        run: |
+          cd dist
+          sha256sum ztraj-* > SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/release_notes.md \
+            dist/*

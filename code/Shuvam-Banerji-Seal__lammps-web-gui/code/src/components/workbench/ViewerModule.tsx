@@ -1,0 +1,2051 @@
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import MoleculeCanvas from '../../components/MoleculeCanvas';
+import { detectFileFormat, detectFormatFromContent } from '../../services/fileFormat';
+import { parseInWorker } from '../../services/parserClient';
+import {
+  MoleculeData, VisualizationConfig, VisualizationMode, FileFormat,
+  LightingPreset, CameraPreset, ColorBy, RenderQuality, ToneMappingMode,
+} from '../../types';
+import { COLOR_BY_LABELS, COLOR_MAP_NAMES, colorMapGradient, isContinuous, scalarRange } from '../../services/colorMaps';
+import { DEFAULT_ATOM_COLOR, ELEMENT_DATA } from '../../constants';
+import { applyTypeElements, defaultTypeColor, inheritTypeInfo, withTypeElement } from '../../services/elementTypes';
+import { emitCameraCommand } from '../../services/cameraBus';
+import { useKeyboardShortcuts, SHORTCUT_CATALOG } from '../../hooks/useKeyboardShortcuts';
+import { decodeViewState, encodeViewState, viewStateFromSearch } from '../../services/viewState';
+import { measureSelection, measurementGlyph, MeasurementResult } from '../../services/measure';
+import { startCanvasRecording, RecordingHandle } from '../../services/recorder';
+import { captureActiveCanvas } from '../../services/glRegistry';
+import { getThemeTokens, initialTheme, isDarkTheme, nextTheme, Theme as UITheme } from '../../theme';
+import {
+  Upload, RotateCw, AlertCircle, Info, Settings, Eye, EyeOff, Palette, Box,
+  Sun, Moon, Menu, X, Camera, Atom, Keyboard, Layers, Lightbulb,
+  Grid3x3, Maximize2, Play, Pause, ZoomIn, ZoomOut, FileText, HelpCircle,
+  Link2, Check, ChevronLeft, ChevronRight, Ruler, Circle, Loader2, BarChart3, Activity, TrendingUp, Download, Sparkles,
+} from 'lucide-react';
+import { LineChart, Histogram } from '../charts/SimpleChart';
+import { trajStats } from '../../services/trajectoryAnalysis';
+import { useTrajectoryAnalysis } from '../../hooks/useTrajectoryAnalysis';
+import { downloadTextFile } from '../../lammps/exporter';
+
+/** GitHub mark as inline SVG — lucide 1.x removed brand icons. */
+const GithubIcon: React.FC<{ size?: number }> = ({ size = 16 }) => (
+  <svg width={size} height={size} viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+    <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+  </svg>
+);
+
+type Tab = 'data' | 'view' | 'scene' | 'elements' | 'analysis';
+
+const VIZ_MODES: { value: VisualizationMode; label: string; desc: string; key: string }[] = [
+  { value: 'ball-and-stick', label: 'Ball & Stick', desc: 'Classic molecular view', key: '1' },
+  { value: 'space-fill', label: 'Space Fill', desc: 'Van der Waals radii', key: '2' },
+  { value: 'wireframe', label: 'Wireframe', desc: 'Small point atoms', key: '3' },
+  { value: 'licorice', label: 'Licorice', desc: 'Bond-centric sticks', key: '4' },
+  { value: 'element-balls', label: 'Element balls', desc: 'Sized by covalent radius', key: '6' },
+  { value: 'points', label: 'Points', desc: 'Fast shaded dots, huge systems', key: '0' },
+  { value: 'lines', label: 'Lines', desc: 'Bonds as thin lines, large molecules', key: 'V' },
+  { value: 'cubes', label: 'Cubes', desc: 'A cube per atom, lattices', key: 'V' },
+  { value: 'glass', label: 'Glass', desc: 'See-through space fill', key: 'V' },
+  { value: 'flat', label: 'Flat discs', desc: 'Outlined discs, 2D systems', key: 'V' },
+];
+
+const MATERIALS: { value: VisualizationConfig['materialType']; label: string }[] = [
+  { value: 'realistic', label: 'Realistic' },
+  { value: 'plastic', label: 'Plastic' },
+  { value: 'metallic', label: 'Metallic' },
+  { value: 'toon', label: 'Toon' },
+];
+
+const LIGHTING_PRESETS: LightingPreset[] = ['studio', 'lab', 'outdoor', 'space', 'soft'];
+
+const QUALITIES: { value: RenderQuality; label: string; desc: string }[] = [
+  { value: 'low', label: 'Low', desc: 'Coarse, reduced resolution; shadows to 2k atoms' },
+  { value: 'auto', label: 'Auto', desc: 'Scales with the system; shadows to 8k atoms' },
+  { value: 'high', label: 'High', desc: 'Fine, full resolution; 4k shadows to 20k atoms' },
+  { value: 'ultra', label: 'Ultra', desc: 'Finest, supersampled; shadows to 50k atoms' },
+];
+
+const TONE_MAPPINGS: { value: ToneMappingMode; label: string }[] = [
+  { value: 'aces', label: 'ACES filmic' },
+  { value: 'agx', label: 'AgX' },
+  { value: 'neutral', label: 'Neutral' },
+  { value: 'none', label: 'None (linear)' },
+];
+
+const CAMERA_VIEWS: { preset: CameraPreset; label: string }[] = [
+  { preset: 'iso', label: 'Iso' },
+  { preset: 'front', label: 'Front' },
+  { preset: 'back', label: 'Back' },
+  { preset: 'left', label: 'Left' },
+  { preset: 'right', label: 'Right' },
+  { preset: 'top', label: 'Top' },
+  { preset: 'bottom', label: 'Bottom' },
+];
+
+const EXAMPLES: { file: string; format: FileFormat; label: string }[] = [
+  { file: 'c60.data', format: 'lammps', label: 'C60 · LAMMPS' },
+  { file: 'examples/benzene.pdb', format: 'pdb', label: 'Benzene · PDB' },
+  { file: 'examples/nacl.cif', format: 'cif', label: 'NaCl · CIF' },
+  { file: 'examples/quartz.cif', format: 'cif', label: 'α-quartz · CIF' },
+  { file: 'examples/urea.cif', format: 'cif', label: 'Urea crystal · CIF' },
+  { file: 'examples/ice_ih.cif', format: 'cif', label: 'Ice Ih · CIF' },
+  { file: 'examples/water.xyz', format: 'xyz', label: 'Water · XYZ' },
+  { file: 'examples/water-traj.xyz', format: 'xyz', label: 'Trajectory · XYZ' },
+  { file: 'examples/lj-melt.lammpstrj', format: 'lammpsdump', label: 'LJ melt · Dump' },
+  { file: 'examples/stress-12k.xyz', format: 'xyz', label: 'Stress 12k · XYZ' },
+  { file: 'examples/stress-60k.xyz', format: 'xyz', label: 'Stress 60k · XYZ' },
+];
+
+const prefersLightScheme = (): boolean =>
+  typeof window !== 'undefined' &&
+  !!window.matchMedia?.('(prefers-color-scheme: light)').matches;
+
+/** Sidebar width clamp, shared by the pointer and keyboard resize paths (P9). */
+export const SIDEBAR_MIN_WIDTH = 280;
+export const SIDEBAR_MAX_WIDTH = 560;
+
+export const clampSidebarWidth = (width: number): number =>
+  Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, Math.round(width)));
+
+/** Arrow keys resize in 16px steps inside the clamp; other keys are a no-op. */
+export const stepSidebarWidth = (width: number, key: string): number => {
+  if (key === 'ArrowLeft') return clampSidebarWidth(width - 16);
+  if (key === 'ArrowRight') return clampSidebarWidth(width + 16);
+  return clampSidebarWidth(width);
+};
+
+/**
+ * Roving-tabindex cycling for the sidebar tablist: ArrowRight/ArrowLeft move
+ * cyclically, Home/End jump to the first/last tab, other keys keep the index.
+ */
+export const nextTabIndex = (current: number, count: number, key: string): number => {
+  if (count <= 0) return -1;
+  const i = ((current % count) + count) % count;
+  if (key === 'ArrowRight') return (i + 1) % count;
+  if (key === 'ArrowLeft') return (i - 1 + count) % count;
+  if (key === 'Home') return 0;
+  if (key === 'End') return count - 1;
+  return i;
+};
+
+/**
+ * Format for an uploaded file. Trusted structure extensions keep their
+ * extension mapping; a generic (.txt) or unknown extension is sniffed from
+ * the content so a plain-text XYZ file is not forced through the LAMMPS parser.
+ */
+const KNOWN_STRUCTURE_EXTENSIONS: ReadonlySet<string> = new Set([
+  'xyz', 'pdb', 'ent', 'cif', 'mmcif', 'lammpstrj', 'dump', 'data', 'lammps', 'lmp',
+]);
+
+export const chooseUploadFormat = (filename: string, content: string): FileFormat => {
+  const ext = filename.toLowerCase().split('.').pop() ?? '';
+  if (ext !== '' && KNOWN_STRUCTURE_EXTENSIONS.has(ext)) return detectFileFormat(filename);
+  return detectFormatFromContent(content);
+};
+
+/** Base defaults, optionally overridden by a shared-view ?s= token (P3). */
+const initialConfig = (): VisualizationConfig => ({
+  atomScale: 1.0,
+  bondScale: 1.0,
+  materialType: 'realistic',
+  backgroundColor: prefersLightScheme() ? '#f4f5f7' : '#151515',
+  showBonds: true,
+  customColors: {},
+  visualizationMode: 'ball-and-stick',
+  lightingPreset: 'studio',
+  showBox: false,
+  showAxes: false,
+  showLabels: false,
+  shadowsEnabled: true,
+  autoRotateSpeed: 0.5,
+  fov: 40,
+  colorBy: 'type',
+  colorMap: 'viridis',
+  colorReverse: false,
+  colorAuto: true,
+  quality: 'auto',
+  toneMapping: 'aces',
+  exposure: 1,
+  envLighting: false,
+  depthCue: 0,
+  bondColor: '',
+  boxColor: '#5b8def',
+});
+
+/** The view settings saved in this browser (a share token: validated and clamped on reading), without type colours. */
+const VIEW_STORAGE_KEY = 'm3d.view';
+const savedConfig = (): Partial<VisualizationConfig> => {
+  try {
+    return decodeViewState(localStorage.getItem(VIEW_STORAGE_KEY) ?? '') ?? {};
+  } catch {
+    return {};
+  }
+};
+
+/** A file handed over from another module (the MD Notebook's run output), loaded like an upload. */
+/** A gzipped file: a .gz name whose first two bytes are the gzip magic 1f 8b. */
+const isGzipped = (name: string, b0: number, b1: number): boolean => /\.gz$/i.test(name) && b0 === 0x1f && b1 === 0x8b;
+
+export interface ViewerIncomingFile {
+  name: string;
+  text: string;
+}
+
+const ViewerModule: React.FC<{
+  embedded?: boolean;
+  /** Owned by App when mounted in the workbench; standalone otherwise. */
+  theme?: UITheme;
+  onToggleTheme?: () => void;
+  /** A file to load on arrival (App's inbox); onIncomingFileTaken clears it. */
+  incomingFile?: ViewerIncomingFile | null;
+  onIncomingFileTaken?: () => void;
+}> = ({ embedded = false, theme: themeProp, onToggleTheme, incomingFile = null, onIncomingFileTaken }) => {
+  const [inputText, setInputText] = useState<string>('');
+  const [moleculeData, setMoleculeData] = useState<MoleculeData | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [autoRotate, setAutoRotate] = useState<boolean>(true);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [isMobile, setIsMobile] = useState(false);
+  // Theme: controlled by App when provided, else local (standalone/embedded).
+  const [localTheme, setLocalTheme] = useState<UITheme>(initialTheme);
+  const theme: UITheme = themeProp ?? localTheme;
+  const toggleTheme = useCallback(() => {
+    if (themeProp !== undefined && onToggleTheme) {
+      onToggleTheme();
+      return;
+    }
+    setLocalTheme(currentTheme => {
+      const next = nextTheme(currentTheme);
+      updateConfig('backgroundColor', isDarkTheme(next) ? '#151515' : '#f4f5f7');
+      return next;
+    });
+  }, [themeProp, onToggleTheme]);
+  const [fileFormat, setFileFormat] = useState<FileFormat>('lammps');
+  const [activeTab, setActiveTab] = useState<Tab>('data');
+  const [showHelp, setShowHelp] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  /** Roving-tabindex tab buttons of the sidebar tablist. */
+  const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  /** Help dialog focus management (focus in on open, restore on close). */
+  const helpDialogRef = useRef<HTMLDivElement | null>(null);
+  const helpCloseRef = useRef<HTMLButtonElement | null>(null);
+  const helpReturnFocusRef = useRef<HTMLElement | null>(null);
+  /** Type ids the user manually recolored — survive re-parsing. */
+  const userEditedTypes = useRef<Set<number>>(new Set());
+  /** Elements the user picked for types the file names none for, by type label (applied to later files too). */
+  const userElements = useRef<Map<string, string>>(new Map());
+  /** The loaded file's own type table, before the user's elements: which types the file left unknown. */
+  const parsedTypes = useRef<MoleculeData['atomTypes']>({});
+  /** The last data file the user loaded: a trajectory of the same system takes its type names and elements. */
+  const typeSource = useRef<{ atomTypes: MoleculeData['atomTypes']; natoms: number } | null>(null);
+
+  // Shared view state (P3): ?s=<token> overrides the saved settings, which override the defaults, before first paint.
+  const [vizConfig, setVizConfig] = useState<VisualizationConfig>(() => ({
+    ...initialConfig(),
+    ...(typeof window !== 'undefined'
+      ? { ...savedConfig(), ...(viewStateFromSearch(window.location.search) ?? {}) }
+      : {}),
+  }));
+
+  // Measurement tool (P4)
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+
+  // Trajectory playback (P5)
+  const frameCount = moleculeData?.frames?.length ?? 1;
+  const [frameIdx, setFrameIdx] = useState(0);
+  const [trajPlaying, setTrajPlaying] = useState(false);
+
+  /**
+   * Trajectory analysis runs in a worker, once per loaded structure.
+   * It used to be computed inline in the Analysis panel's JSX, so RDF (then
+   * O(N^2)), MSD and the density profile re-ran on every React render —
+   * including every playback tick.
+   */
+  const analysis = useTrajectoryAnalysis(moleculeData, frameIdx);
+  const [trajFps, setTrajFps] = useState(10);
+
+  // Share-link feedback
+  const [linkCopied, setLinkCopied] = useState(false);
+
+  // Video recording (P8)
+  const recorderRef = useRef<RecordingHandle | null>(null);
+  const autoRotateBeforeRecording = useRef(true);
+  const [isRecording, setIsRecording] = useState(false);
+  const [savingVideo, setSavingVideo] = useState(false);
+  const [recordingMs, setRecordingMs] = useState(0);
+
+  // Resizable desktop sidebar (P9)
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    try {
+      const stored = Number(localStorage.getItem('m3d.sidebarWidth'));
+      return Number.isFinite(stored) && stored >= 280 && stored <= 560 ? stored : 384;
+    } catch {
+      return 384;
+    }
+  });
+  const sidebarWidthRef = useRef(sidebarWidth);
+  sidebarWidthRef.current = sidebarWidth;
+  const resizingRef = useRef(false);
+
+  // New structure → reset transient view state (P4/P5)
+  useEffect(() => {
+    setSelectedIds([]);
+    setFrameIdx(0);
+    setTrajPlaying(false);
+  }, [moleculeData]);
+
+  // Theme flips: keep the canvas default background coherent when the user
+  // has NOT customized it (custom colors and share-link values are untouched).
+  const lastThemeRef = useRef(theme);
+  useEffect(() => {
+    if (lastThemeRef.current === theme) return;
+    const defaultFor = (t: UITheme) => (isDarkTheme(t) ? '#151515' : '#f4f5f7');
+    const prevDefault = defaultFor(lastThemeRef.current);
+    lastThemeRef.current = theme;
+    setVizConfig(prev =>
+      prev.backgroundColor === prevDefault
+        ? { ...prev, backgroundColor: defaultFor(theme) }
+        : prev
+    );
+  }, [theme]);
+
+  // Trajectory playback clock (P5)
+  useEffect(() => {
+    if (!trajPlaying || frameCount <= 1) return;
+    const id = window.setInterval(
+      () => setFrameIdx(i => (i + 1) % frameCount),
+      Math.max(16, Math.round(1000 / trajFps))
+    );
+    return () => window.clearInterval(id);
+  }, [trajPlaying, trajFps, frameCount]);
+
+  // Shareable URL sync (P3): debounced replaceState, never reloads.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const id = window.setTimeout(() => {
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.set('s', encodeViewState(vizConfig));
+        window.history.replaceState(null, '', url.toString());
+      } catch {
+        /* history unavailable (sandboxed iframe etc.) — non-fatal */
+      }
+      try {
+        localStorage.setItem(VIEW_STORAGE_KEY, encodeViewState({ ...vizConfig, customColors: {} }));
+      } catch {
+        /* storage unavailable (private mode etc.) — the settings just are not remembered */
+      }
+    }, 300);
+    return () => window.clearTimeout(id);
+  }, [vizConfig]);
+
+  const toggleSelectAtom = useCallback((id: number) => {
+    setSelectedIds(prev =>
+      prev.includes(id)
+        ? prev.filter(x => x !== id)
+        : [...prev, id].slice(-4) // keep the last four picks
+    );
+  }, []);
+
+  const copyShareLink = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      setLinkCopied(true);
+      window.setTimeout(() => setLinkCopied(false), 1600);
+    } catch {
+      setError('Clipboard unavailable — copy the address bar URL instead.');
+    }
+  }, []);
+
+  useEffect(() => {
+    const checkMobile = () => {
+      const mobile = window.innerWidth < 768;
+      setIsMobile(mobile);
+      if (mobile) setIsSidebarOpen(false);
+    };
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
+  /** The incoming file last taken from App's inbox (see the effect that loads it). */
+  const takenFile = useRef<ViewerIncomingFile | null>(null);
+
+  useEffect(() => {
+    const fetchInitialData = async () => {
+      try {
+        const response = await fetch(`${import.meta.env.BASE_URL}c60.data`);
+        if (!response.ok) throw new Error(String(response.status));
+        const text = await response.text();
+        if (takenFile.current) return; // a file from another module arrived first: keep it
+        handleVisualize(text, 'lammps', false); // the built-in C60 names no types for a later trajectory
+      } catch {
+        setError('Failed to load the built-in C60 example.');
+      }
+    };
+    fetchInitialData();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const [isParsing, setIsParsing] = useState(false);
+
+  const applyParsed = useCallback((parsed: MoleculeData, format?: FileFormat, fromUser = true) => {
+    if (parsed.atoms.length === 0) throw new Error('No atoms found in data. Check the format.');
+    // the elements the user gave before to types this file leaves unknown (a type number is no element)
+    parsedTypes.current = parsed.atomTypes;
+    // a dump that only numbers its types takes their names, elements and masses from the data file loaded before it
+    // (the same system); then the elements the user picked
+    const data = applyTypeElements(format === 'lammps' ? parsed : inheritTypeInfo(parsed, typeSource.current), userElements.current);
+    if (format === 'lammps') typeSource.current = fromUser ? { atomTypes: data.atomTypes, natoms: data.atoms.length } : null;
+
+    // Color assignment: user-edited colors survive; others get CPK by element symbol, or a distinct colour per type
+    // whose element is unknown.
+    const newCustomColors: Record<number, string> = {};
+    for (const info of Object.values(data.atomTypes)) {
+      const edited = userEditedTypes.current.has(info.id);
+      if (edited && vizConfig.customColors[info.id]) {
+        newCustomColors[info.id] = vizConfig.customColors[info.id];
+        continue;
+      }
+      newCustomColors[info.id] = defaultTypeColor(data.atomTypes, info.id);
+    }
+
+    setVizConfig(prev => ({ ...prev, customColors: newCustomColors }));
+    setMoleculeData(data);
+    setError(null);
+    // Very large systems render one static frame instead of spinning —
+    // continuous rotation on huge instanced scenes wastes GPU and can
+    // saturate low-end/software renderers. Users can re-enable rotation.
+    if (data.atoms.length > 20000) setAutoRotate(false);
+    if (isMobile) setIsSidebarOpen(false);
+  }, [isMobile, vizConfig.customColors]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /**
+   * Parse via Web Worker when available (keeps huge files from freezing the
+   * UI); falls back to synchronous parsing otherwise.
+   */
+  const handleVisualize = useCallback((text: string, format?: FileFormat, fromUser = true) => {
+    setError(null);
+    setIsParsing(true);
+    const fmt = format ?? detectFileFormat('pasted.txt');
+    parseInWorker(text, fmt)
+      .catch(err => {
+        if (!(err instanceof Error && /no-worker|worker-crashed/.test(err.message))) throw err;
+        // synchronous fallback, without a worker: the parsers load only then (they stay out of the initial bundle)
+        return import('../../services/fileParser').then((m) => m.parseFile(text, fmt));
+      })
+      .then((d) => applyParsed(d, fmt, fromUser))
+      .then(() => setInputText(text))
+      .catch(e => {
+        // A failed parse must never destroy the structure already on screen:
+        // keep moleculeData and the selection untouched and surface the
+        // message in the banner over the canvas instead.
+        setError(e instanceof Error ? e.message : 'Failed to parse data file.');
+      })
+      .finally(() => setIsParsing(false));
+  }, [applyParsed]);
+
+  const loadExample = useCallback(async (file: string, format: FileFormat) => {
+    try {
+      const response = await fetch(`${import.meta.env.BASE_URL}${file}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const text = await response.text();
+      setFileFormat(format);
+      handleVisualize(text, format, false);
+    } catch {
+      setError(`Failed to fetch example: ${file}`);
+    }
+  }, [handleVisualize]);
+
+  /** The one path for a file's text: uploads, drops and incoming files all come through here. */
+  const handleFileText = useCallback((name: string, content: string) => {
+    setInputText(content);
+    // Known extensions keep their mapping; generic ones (.txt) are detected
+    // from the content so an XYZ file named *.txt parses as XYZ.
+    const detectedFormat = chooseUploadFormat(name, content);
+    setFileFormat(detectedFormat);
+    handleVisualize(content, detectedFormat);
+  }, [handleVisualize]);
+
+  /**
+   * A gzipped file (a .gz name with the gzip magic bytes 1f 8b): decompressed, every member, by the engine's gunzip
+   * (loaded on first use), and shown under its name without .gz. A dump.gz of a LAMMPS run (or of the notebook) opens
+   * like its plain dump.
+   */
+  const openGzipped = useCallback(async (name: string, bytes: Uint8Array) => {
+    try {
+      const { gunzip } = await import('../../engine/gunzip');
+      handleFileText(name.replace(/\.gz$/i, ''), new TextDecoder().decode(gunzip(bytes)));
+    } catch (e) {
+      setError(`Could not decompress ${name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, [handleFileText]);
+
+  const handleFileUpload = useCallback((file: File) => {
+    if (/\.gz$/i.test(file.name)) {
+      void file.arrayBuffer().then((buf) => {
+        const bytes = new Uint8Array(buf);
+        if (isGzipped(file.name, bytes[0], bytes[1])) void openGzipped(file.name, bytes);
+        else handleFileText(file.name, new TextDecoder().decode(bytes));
+      });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = e => handleFileText(file.name, (e.target?.result as string) ?? '');
+    reader.readAsText(file);
+  }, [handleFileText, openGzipped]);
+
+  // A file another module sent over (once per object; the callback clears the inbox)
+  useEffect(() => {
+    if (!incomingFile || takenFile.current === incomingFile) return;
+    takenFile.current = incomingFile;
+    const { name, text } = incomingFile;
+    // a gzipped file from browser storage or a run arrives one character per byte
+    if (isGzipped(name, text.charCodeAt(0), text.charCodeAt(1))) void openGzipped(name, Uint8Array.from(text, (c) => c.charCodeAt(0) & 0xff));
+    else handleFileText(name, text);
+    onIncomingFileTaken?.();
+  }, [incomingFile, handleFileText, openGzipped, onIncomingFileTaken]);
+
+  // Drag & drop anywhere on the window
+  useEffect(() => {
+    const onDragOver = (e: DragEvent) => { e.preventDefault(); setDragActive(true); };
+    const onDragLeave = (e: DragEvent) => {
+      if (e.relatedTarget === null) setDragActive(false);
+    };
+    const onDrop = (e: DragEvent) => {
+      setDragActive(false);
+      // a drop the browser-storage drawer already took (it stores the files) is not also loaded here
+      if (e.defaultPrevented) return;
+      e.preventDefault();
+      const file = e.dataTransfer?.files?.[0];
+      if (file) handleFileUpload(file);
+    };
+    window.addEventListener('dragover', onDragOver);
+    window.addEventListener('dragleave', onDragLeave);
+    window.addEventListener('drop', onDrop);
+    return () => {
+      window.removeEventListener('dragover', onDragOver);
+      window.removeEventListener('dragleave', onDragLeave);
+      window.removeEventListener('drop', onDrop);
+    };
+  }, [handleFileUpload]);
+
+  // Help dialog: move focus into it on open, restore focus to the opener on
+  // close (aria-modal dialogs must manage focus).
+  useEffect(() => {
+    if (!showHelp) return;
+    helpReturnFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    helpCloseRef.current?.focus();
+    return () => {
+      helpReturnFocusRef.current?.focus();
+      helpReturnFocusRef.current = null;
+    };
+  }, [showHelp]);
+
+  // Focus trap + Escape for the help dialog, handled on the dialog itself so
+  // it works whichever element inside currently holds focus.
+  const handleHelpKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Escape') {
+      setShowHelp(false);
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    const root = helpDialogRef.current;
+    if (!root) return;
+    const focusables = Array.from(
+      root.querySelectorAll<HTMLElement>('button, [href], input, select, textarea')
+    );
+    if (focusables.length === 0) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    const inside = active instanceof HTMLElement && root.contains(active);
+    if (e.shiftKey) {
+      if (active === first || !inside) {
+        e.preventDefault();
+        last.focus();
+      }
+    } else if (active === last || !inside) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+
+  const updateConfig = (key: keyof VisualizationConfig, value: unknown) => {
+    setVizConfig(prev => ({ ...prev, [key]: value }));
+  };
+
+  const updateTypeRadius = (typeId: number, scale: number) => {
+    setVizConfig(prev => ({ ...prev, typeRadii: { ...prev.typeRadii, [typeId]: scale } }));
+  };
+
+  /** Every view setting back to its default; the structure's type colours and sizes stay. */
+  const resetView = () => {
+    setVizConfig(prev => ({ ...initialConfig(), customColors: prev.customColors, typeRadii: prev.typeRadii }));
+  };
+
+  /** The Elements tab's element of a type ('X': unknown): colour (unless edited), size and guessed bonds follow. */
+  const setTypeElement = (typeId: number, symbol: string) => {
+    if (!moleculeData) return;
+    const own = parsedTypes.current[typeId];
+    if (own && own.element === 'X') {
+      if (symbol === 'X') userElements.current.delete(own.label); else userElements.current.set(own.label, symbol);
+    }
+    const next = withTypeElement(moleculeData, typeId, symbol);
+    setMoleculeData(next);
+    if (!userEditedTypes.current.has(typeId)) {
+      setVizConfig(prev => ({ ...prev, customColors: { ...prev.customColors, [typeId]: defaultTypeColor(next.atomTypes, typeId) } }));
+    }
+  };
+
+  const updateCustomColor = (typeId: number, color: string) => {
+    userEditedTypes.current.add(typeId);
+    setVizConfig(prev => ({
+      ...prev,
+      customColors: { ...prev.customColors, [typeId]: color },
+    }));
+  };
+
+  const doScreenshot = useCallback(() => {
+    // Explicit render-before-capture (no preserveDrawingBuffer tax).
+    const dataUrl = captureActiveCanvas();
+    if (!dataUrl) {
+      setError('Screenshot failed — canvas not ready.');
+      return;
+    }
+    try {
+      const link = document.createElement('a');
+      link.download = `lammps-web-gui-${Date.now()}.png`;
+      link.href = dataUrl;
+      link.click();
+    } catch {
+      setError('Screenshot failed — canvas not ready.');
+    }
+  }, []);
+
+  // --- Video recording (P8) ---
+  const startRecording = useCallback(() => {
+    const canvas = document.querySelector('canvas');
+    if (!canvas) {
+      setError('No canvas to record yet.');
+      return;
+    }
+    try {
+      autoRotateBeforeRecording.current = autoRotate;
+      setAutoRotate(true); // guarantee motion in the captured video
+      recorderRef.current = startCanvasRecording(canvas as HTMLCanvasElement, { fps: 60 });
+      setRecordingMs(0);
+      setIsRecording(true);
+    } catch (e) {
+      setAutoRotate(autoRotateBeforeRecording.current);
+      setError(e instanceof Error ? e.message : 'Recording failed to start.');
+    }
+  }, [autoRotate]);
+
+  const stopRecording = useCallback(async () => {
+    const rec = recorderRef.current;
+    if (!rec) return;
+    recorderRef.current = null;
+    setIsRecording(false);
+    setSavingVideo(true);
+    try {
+      const result = await rec.stop();
+      const url = URL.createObjectURL(result.blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `lammps-web-gui-${new Date().toISOString().replace(/[:.]/g, '-')}.${result.ext}`;
+      a.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 5000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to save recording.');
+    } finally {
+      setSavingVideo(false);
+      setAutoRotate(autoRotateBeforeRecording.current);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isRecording) return;
+    const id = window.setInterval(() => setRecordingMs(ms => ms + 250), 250);
+    return () => window.clearInterval(id);
+  }, [isRecording]);
+
+  // --- Desktop sidebar resize (P9) ---
+  const startSidebarResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    resizingRef.current = true;
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const moveSidebarResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!resizingRef.current) return;
+    setSidebarWidth(clampSidebarWidth(e.clientX));
+  };
+  const endSidebarResize = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!resizingRef.current) return;
+    resizingRef.current = false;
+    try {
+      localStorage.setItem('m3d.sidebarWidth', String(sidebarWidthRef.current));
+    } catch { /* storage unavailable — non-fatal */ }
+    e.currentTarget.releasePointerCapture(e.pointerId);
+  };
+
+  const cycleLighting = useCallback(() => {
+    setVizConfig(prev => {
+      const idx = LIGHTING_PRESETS.indexOf(prev.lightingPreset);
+      return { ...prev, lightingPreset: LIGHTING_PRESETS[(idx + 1) % LIGHTING_PRESETS.length] };
+    });
+  }, []);
+
+  useKeyboardShortcuts({
+    onToggleRotate: () => setAutoRotate(v => !v),
+    onFit: () => emitCameraCommand({ type: 'fit' }),
+    onViewPreset: preset => emitCameraCommand({ type: 'preset', preset }),
+    onZoom: delta => emitCameraCommand({ type: 'zoom', delta }),
+    onOrbit: (dx, dy) => emitCameraCommand({ type: 'orbit', dx, dy }),
+    onVisualizationMode: idx =>
+      updateConfig('visualizationMode', VIZ_MODES[idx].value),
+    onCycleVisualizationMode: () => setVizConfig(p => {
+      const i = VIZ_MODES.findIndex(m => m.value === p.visualizationMode);
+      return { ...p, visualizationMode: VIZ_MODES[(i + 1) % VIZ_MODES.length].value };
+    }),
+    onToggleBonds: () => setVizConfig(p => ({ ...p, showBonds: !p.showBonds })),
+    onToggleBox: () => setVizConfig(p => ({ ...p, showBox: !p.showBox })),
+    onToggleLabels: () => setVizConfig(p => ({ ...p, showLabels: !p.showLabels })),
+    onCycleLighting: cycleLighting,
+    onToggleTheme: toggleTheme,
+    onToggleSidebar: () => setIsSidebarOpen(v => !v),
+    onScreenshot: doScreenshot,
+    onHelp: () => setShowHelp(v => !v),
+    onEscape: () => {
+      setShowHelp(false);
+      setSelectedIds([]);
+      if (isMobile) setIsSidebarOpen(false);
+    },
+    onClearSelection: () => setSelectedIds([]),
+    onPrevFrame: () => setFrameIdx(i => (i - 1 + frameCount) % frameCount),
+    onNextFrame: () => setFrameIdx(i => (i + 1) % frameCount),
+    onToggleTrajectoryPlay: () => { if (frameCount > 1) setTrajPlaying(v => !v); },
+  });
+
+  // ---- theme tokens (shared warm coffee-green palette, flat, no gradients) ----
+  const shared = getThemeTokens(theme);
+  const ct = {
+    ...shared,
+    sidebar: shared.panel,
+    header: shared.headerText,
+  };
+  const accent = isDarkTheme(theme) ? 'accent-[#7fa66b]' : 'accent-[#4e7a41]';
+
+  /** A labelled on/off switch row of the sidebar. */
+  const toggleRow = (label: React.ReactNode, on: boolean, onClick: () => void, disabled = false, title?: string) => (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-pressed={on}
+      className={`flex items-center justify-between w-full p-2.5 rounded-lg text-xs transition-colors disabled:opacity-40 ${ct.button}`}
+    >
+      <span className="flex items-center gap-2">{label}</span>
+      <span className={`w-8 h-4 rounded-full relative transition-colors ${on ? ct.toggleOn : ct.toggleOff}`}>
+        <span className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${on ? 'left-4' : 'left-0.5'}`} />
+      </span>
+    </button>
+  );
+
+  /** A labelled range slider of the sidebar. */
+  const slider = (label: string, shown: string, value: number, min: number, max: number, step: number, set: (v: number) => void) => (
+    <div className="space-y-1">
+      <div className={`flex justify-between text-[11px] ${ct.muted}`}>
+        <span>{label}</span><span className="font-mono">{shown}</span>
+      </div>
+      <input
+        type="range" min={min} max={max} step={step} value={value}
+        onChange={e => set(parseFloat(e.target.value))}
+        className={`w-full ${accent}`}
+        aria-label={label}
+      />
+    </div>
+  );
+
+  const colorBy: ColorBy = vizConfig.colorBy ?? 'type';
+  const selectClass = `rounded border bg-transparent py-1 px-1.5 text-[11px] ${ct.input}`;
+
+  const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
+    { id: 'data', label: 'Data', icon: <FileText size={14} /> },
+    { id: 'view', label: 'View', icon: <Atom size={14} /> },
+    { id: 'scene', label: 'Scene', icon: <Lightbulb size={14} /> },
+    { id: 'elements', label: 'Elements', icon: <Palette size={14} /> },
+    { id: 'analysis', label: 'Analysis', icon: <BarChart3 size={14} /> },
+  ];
+
+  const atomTypeList = moleculeData ? Object.values(moleculeData.atomTypes) : [];
+
+  // Active frame for trajectory playback (P5): swaps atoms, keeps topology.
+  const activeData: MoleculeData | null = useMemo(() => {
+    if (!moleculeData || !moleculeData.frames || frameCount <= 1) return moleculeData;
+    const frame = moleculeData.frames[Math.min(frameIdx, frameCount - 1)];
+    return frame ? { ...moleculeData, atoms: frame.atoms } : moleculeData;
+  }, [moleculeData, frameIdx, frameCount]);
+
+  /**
+   * This frame's own cell, when the dump carries one per frame. Under NPT the
+   * box breathes, so drawing frame 0's cell for the whole trajectory is simply
+   * wrong. Passed separately from `activeData` so camera framing keeps using
+   * the stable reference box and the view does not pump.
+   */
+  const displayBox = useMemo(
+    () => moleculeData?.frames?.[Math.min(frameIdx, frameCount - 1)]?.box,
+    [moleculeData, frameIdx, frameCount],
+  );
+
+  /** A colour map's range from the data: over every frame, so a trajectory's colours do not rescale while it plays. */
+  const autoColorRange = useMemo(() => {
+    const by = vizConfig.colorBy;
+    if (!moleculeData || !isContinuous(by)) return null;
+    const lists = moleculeData.frames?.length ? moleculeData.frames.map(f => f.atoms) : [moleculeData.atoms];
+    return scalarRange(lists, by!);
+  }, [moleculeData, vizConfig.colorBy]);
+  const canvasConfig = useMemo((): VisualizationConfig => {
+    if (!isContinuous(vizConfig.colorBy) || vizConfig.colorAuto === false) return vizConfig;
+    const r = autoColorRange ?? [0, 1];
+    return { ...vizConfig, colorMin: r[0], colorMax: r[1] };
+  }, [vizConfig, autoColorRange]);
+  const hasVelocities = activeData?.atoms[0]?.vx !== undefined;
+
+  /** The structure export menu (the shown frame as LAMMPS data, extended XYZ or PDB; every frame as XYZ). */
+  const [exportOpen, setExportOpen] = useState(false);
+  const exportStructure = useCallback(async (format: 'data' | 'xyz' | 'pdb' | 'xyz-all') => {
+    if (!activeData) return;
+    const { framesToExtXyz, toExtXyz, toLammpsDataFile, toPdb } = await import('../../lammps/structureExport');
+    const box = displayBox ?? activeData.box;
+    const stem = frameCount > 1 ? `frame_${Math.min(frameIdx, frameCount - 1) + 1}` : 'structure';
+    if (format === 'data') downloadTextFile(`${stem}.data`, toLammpsDataFile(activeData, { box }));
+    else if (format === 'xyz') downloadTextFile(`${stem}.xyz`, toExtXyz(activeData, box));
+    else if (format === 'pdb') downloadTextFile(`${stem}.pdb`, toPdb(activeData, box));
+    else if (moleculeData) downloadTextFile('trajectory.xyz', framesToExtXyz(moleculeData));
+    setExportOpen(false);
+  }, [activeData, displayBox, frameCount, frameIdx, moleculeData]);
+
+  /**
+   * Cell for minimum-image measurements — only for formats whose coordinates
+   * live in a periodic cell (LAMMPS data/dump, CIF, extended XYZ). A PDB
+   * CRYST1 cell is crystallographic: a protein's own atoms can be more than
+   * half a cell apart, so it is never wrapped.
+   */
+  const measureBox = useMemo(() => {
+    const box = displayBox ?? moleculeData?.box;
+    if (!box) return undefined;
+    return fileFormat === 'lammps' || fileFormat === 'lammpsdump' || fileFormat === 'cif' || fileFormat === 'xyz'
+      ? box : undefined;
+  }, [displayBox, moleculeData, fileFormat]);
+
+  const measurement: MeasurementResult | null = useMemo(() => {
+    if (!activeData) return null;
+    const picked = selectedIds
+      .map(id => activeData.atoms.find(a => a.id === id))
+      .filter((a): a is NonNullable<typeof a> => !!a);
+    return measureSelection(picked, measureBox);
+  }, [activeData, selectedIds, measureBox]);
+
+  const measurementHint = useMemo(() => {
+    if (!selectedIds.length) return 'Click 2–4 atoms to measure';
+    return `${selectedIds.length} picked — ${4 - selectedIds.length > 0 ? `pick ${4 - selectedIds.length} more` : 'measurement ready'}`;
+  }, [selectedIds]);
+
+  return (
+    <div className={`flex h-full w-full font-sans overflow-hidden ${ct.bg} ${ct.text}`}>
+      {/* Mobile backdrop */}
+      {isMobile && isSidebarOpen && (
+        <div className="fixed inset-0 bg-black/50 z-20" onClick={() => setIsSidebarOpen(false)} />
+      )}
+
+      {/* Drag overlay */}
+      {dragActive && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-[#22301c]/60 border-4 border-dashed border-[#7fa66b]">
+          <div className="px-6 py-4 rounded-xl bg-[#1e1913] text-[#ede5d8] text-sm font-medium shadow-2xl">
+            Drop a structure file to visualize (.data .xyz .pdb .cif)
+          </div>
+        </div>
+      )}
+
+      <aside
+        className={`
+        flex flex-col transition-[width,transform] duration-300 ease-in-out z-30
+        ${isMobile ? 'fixed inset-y-0 left-0 w-80 max-w-[85vw] shadow-2xl' : 'relative shrink-0'}
+        ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
+        ${!isMobile && !isSidebarOpen ? 'overflow-hidden' : ''}
+        ${isMobile || isSidebarOpen ? `border-r ${ct.sidebar}` : ct.sidebar}
+      `}
+        style={isMobile ? undefined : { width: isSidebarOpen ? sidebarWidth : 0 }}
+        inert={isMobile && !isSidebarOpen}
+      >
+        {/* Desktop resize handle (P9): pointer + keyboard operable separator */}
+        {!isMobile && isSidebarOpen && (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize sidebar"
+            aria-valuenow={sidebarWidth}
+            aria-valuemin={SIDEBAR_MIN_WIDTH}
+            aria-valuemax={SIDEBAR_MAX_WIDTH}
+            tabIndex={0}
+            onPointerDown={startSidebarResize}
+            onPointerMove={moveSidebarResize}
+            onPointerUp={endSidebarResize}
+            onKeyDown={e => {
+              const next = stepSidebarWidth(sidebarWidthRef.current, e.key);
+              if (next === sidebarWidthRef.current) return;
+              e.preventDefault();
+              e.stopPropagation(); // arrows here resize — they must not orbit the camera
+              setSidebarWidth(next);
+              try {
+                localStorage.setItem('m3d.sidebarWidth', String(next));
+              } catch { /* storage unavailable — non-fatal */ }
+            }}
+            className="group absolute top-0 right-[-12px] flex h-full w-6 cursor-col-resize items-center justify-center z-40 touch-none"
+            title="Drag or use arrow keys to resize sidebar"
+          >
+            <div className="h-full w-1.5 transition-colors group-hover:bg-[#7fa66b]/40 group-focus-visible:bg-[#7fa66b]/40" />
+          </div>
+        )}
+        {/* Header */}
+        <div className={`flex items-center justify-between px-4 h-14 border-b ${ct.divider}`}>
+          <div className="flex items-center gap-2.5">
+            <img src={`${import.meta.env.BASE_URL}logo.svg`} alt="LAMMPS Web GUI logo" className="w-8 h-8" />
+            <div className="min-w-0">
+              <h2 className="text-base font-bold tracking-tight">Structure Viewer</h2>
+              <p className={`hidden text-[10px] leading-none sm:block ${ct.muted}`}>Molecular Structure Viewer</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <a
+              href="https://github.com/Shuvam-Banerji-Seal/lammps-web-gui"
+              target="_blank" rel="noopener noreferrer"
+              className={`p-2 rounded-lg ${ct.button}`}
+              title="GitHub repository"
+            >
+              <GithubIcon size={16} />
+            </a>
+            {isMobile && (
+              <button onClick={() => setIsSidebarOpen(false)} className={`p-2 rounded-lg ${ct.button}`} title="Close sidebar">
+                <X size={16} />
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Tabs */}
+        <nav
+          className={`grid grid-cols-5 border-b ${ct.divider}`}
+          role="tablist"
+          aria-label="Sidebar sections"
+          onKeyDown={e => {
+            const next = nextTabIndex(
+              tabs.findIndex(t => t.id === activeTab),
+              tabs.length,
+              e.key
+            );
+            if (next < 0 || tabs[next].id === activeTab) return;
+            e.preventDefault();
+            e.stopPropagation(); // arrows here switch tabs — they must not orbit the camera
+            setActiveTab(tabs[next].id);
+            tabRefs.current[next]?.focus();
+          }}
+        >
+          {tabs.map((tab, i) => (
+            <button
+              key={tab.id}
+              ref={el => { tabRefs.current[i] = el; }}
+              id={`viewer-tab-${tab.id}`}
+              role="tab"
+              aria-selected={activeTab === tab.id}
+              aria-controls="viewer-tabpanel"
+              tabIndex={activeTab === tab.id ? 0 : -1}
+              onClick={() => setActiveTab(tab.id)}
+              className={`flex flex-col items-center gap-1.5 py-3 text-xs font-semibold tracking-wide transition-colors ${
+                activeTab === tab.id
+                  ? `${ct.active} border-b-2`
+                  : `${ct.muted} hover:${isDarkTheme(theme) ? 'text-gray-200' : 'text-gray-700'}`
+              }`}
+            >
+              {tab.icon}
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+
+        <div
+          id="viewer-tabpanel"
+          role="tabpanel"
+          aria-labelledby={`viewer-tab-${activeTab}`}
+          className="flex-1 overflow-y-auto p-4 space-y-6 antialiased"
+        >
+          {/* Improved readability: slightly larger base, better line-height */}
+          {/* ============================== DATA TAB */}
+          {activeTab === 'data' && (
+            <>
+              <section className={`rounded-xl p-4 text-sm border shadow-sm ${ct.card} ${ct.muted} leading-relaxed`}>
+                <div className={`flex items-center gap-2 mb-2.5 font-bold tracking-tight ${ct.accentText}`}>
+                  <Info size={15} /> Supported formats
+                </div>
+                <ul className="space-y-1.5 leading-relaxed">
+                  <li><span className={`font-semibold ${ct.accentText}`}>.data / .lmp</span> — LAMMPS (atomic·charge·molecular·full)</li>
+                  <li><span className={`font-semibold ${isDarkTheme(theme) ? 'text-[#e4b877]' : 'text-[#7a5716]'}`}>.xyz</span> — XYZ structures and multi-frame trajectories (playback)</li>
+                  <li><span className={`font-semibold ${isDarkTheme(theme) ? 'text-[#e4b877]' : 'text-[#7a5716]'}`}>.lammpstrj / .dump</span> — LAMMPS dump trajectories (playback)</li>
+                  <li><span className={`font-semibold ${isDarkTheme(theme) ? "text-[#c9a9d4]" : "text-[#7d5a8c]"}`}>.pdb</span> — Protein Data Bank (+CONECT, CRYST1)</li>
+                  <li><span className={`font-semibold ${isDarkTheme(theme) ? "text-[#cf8b76]" : "text-[#a4502f]"}`}>.cif</span> — Crystallographic Information Framework</li>
+                </ul>
+              </section>
+
+              <section className="space-y-3">
+                <h3 className={`text-sm font-bold tracking-tight ${ct.header}`}>Load structure</h3>
+                <label className={`flex cursor-pointer items-center justify-center gap-2 px-3 py-3 rounded-xl text-sm font-semibold transition-colors shadow-sm hover:shadow ${ct.accent}`}>
+                  <Upload size={14} /> Upload file
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    className="hidden"
+                    accept=".data,.lmp,.lammps,.xyz,.pdb,.ent,.cif,.mmcif,.lammpstrj,.dump,.txt"
+                    onChange={e => {
+                      const f = e.target.files?.[0];
+                      if (f) handleFileUpload(f);
+                      e.target.value = '';
+                    }}
+                  />
+                </label>
+                <div className="grid grid-cols-2 gap-2.5">
+                  {EXAMPLES.map(ex => (
+                    <button
+                      key={ex.file}
+                      onClick={() => loadExample(ex.file, ex.format)}
+                      className={`px-3 py-2.5 rounded-xl text-xs font-semibold transition-colors shadow-sm hover:shadow ${ct.button}`}
+                      title={`Load ${ex.label} example`}
+                    >
+                      {ex.label}
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              <section className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className={`text-sm font-bold tracking-tight ${ct.header}`}>Paste data</h3>
+                  <div className="flex gap-1">
+                    {( ['lammps', 'xyz', 'pdb', 'cif', 'lammpsdump'] as FileFormat[]).map(fmt => (
+                      <button
+                        key={fmt}
+                        onClick={() => setFileFormat(fmt)}
+                        className={`px-2 py-1 rounded text-[10px] uppercase font-bold transition-colors ${
+                          fileFormat === fmt ? ct.accent : ct.chip + ' ' + ct.muted
+                        }`}
+                        title={`Parse pasted text as ${fmt === 'lammpsdump' ? 'LAMMPS dump' : fmt.toUpperCase()}`}
+                      >
+                        {fmt === 'lammps' ? 'lmp' : fmt === 'lammpsdump' ? 'dump' : fmt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <textarea
+                  value={inputText}
+                  onChange={e => setInputText(e.target.value)}
+                  placeholder="# Paste LAMMPS / XYZ / PDB / CIF content here…"
+                  className={`w-full h-44 border rounded-xl p-3.5 text-sm font-mono resize-y focus:outline-none leading-relaxed ${ct.input}`}
+                  spellCheck={false}
+                />
+                <button
+                  onClick={() => handleVisualize(inputText, fileFormat)}
+                  className={`w-full py-3 rounded-xl text-sm font-bold tracking-wide transition-colors shadow-sm hover:shadow ${ct.go}`}
+                >
+                  Visualize
+                </button>
+              </section>
+
+              {moleculeData && (
+                <section className="space-y-2 pt-1">
+                  <h3 className={`text-xs font-semibold ${ct.header}`}>Statistics</h3>
+                  <div className="grid grid-cols-4 gap-2 text-center">
+                    {[
+                      { label: 'Atoms', value: moleculeData.atoms.length },
+                      { label: 'Bonds', value: moleculeData.bonds.length },
+                      { label: 'Types', value: atomTypeList.length },
+                      { label: 'Box', value: moleculeData.box ? 'Yes' : '—' },
+                    ].map(s => (
+                      <div key={s.label} className={`p-2 rounded-lg ${ct.stat}`}>
+                        <div className={`text-[10px] ${ct.muted}`}>{s.label}</div>
+                        <div className="text-sm font-mono font-bold">{s.value}</div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+            </>
+          )}
+
+          {/* ============================== VIEW TAB */}
+          {activeTab === 'view' && (
+            <>
+              <section className="space-y-2">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Representation</h3>
+                <div className="grid grid-cols-2 gap-2">
+                  {VIZ_MODES.map(mode => (
+                    <button
+                      key={mode.value}
+                      onClick={() => updateConfig('visualizationMode', mode.value)}
+                      className={`text-left p-2.5 rounded-lg border text-xs transition-colors ${
+                        vizConfig.visualizationMode === mode.value ? ct.active : ct.button
+                      }`}
+                    >
+                      <div className="font-semibold">{mode.label}</div>
+                      <div className={`text-[10px] mt-0.5 ${ct.muted}`}>{mode.desc}</div>
+                      <kbd className={`inline-block mt-1 px-1 rounded text-[9px] ${ct.chip}`}>{mode.key}</kbd>
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Material</h3>
+                <div className="grid grid-cols-4 gap-2">
+                  {MATERIALS.map(m => (
+                    <button
+                      key={m.value}
+                      onClick={() => updateConfig('materialType', m.value)}
+                      className={`py-2 text-[11px] font-medium rounded-lg border capitalize transition-colors ${
+                        vizConfig.materialType === m.value ? ct.active : ct.button
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Colour</h3>
+                <label className={`flex items-center justify-between text-[11px] ${ct.muted}`}>
+                  <span>Colour by</span>
+                  <select value={colorBy} onChange={e => updateConfig('colorBy', e.target.value)} className={selectClass} aria-label="Colour by">
+                    {Object.entries(COLOR_BY_LABELS).map(([k, label]) => <option key={k} value={k}>{label}</option>)}
+                  </select>
+                </label>
+                {colorBy === 'type' && <p className={`text-[10px] ${ct.muted}`}>Per-type colours and sizes are in the Elements tab.</p>}
+                {colorBy === 'molecule' && <p className={`text-[10px] ${ct.muted}`}>A distinct hue per molecule ID.</p>}
+                {colorBy === 'speed' && moleculeData && !hasVelocities && (
+                  <p className={`text-[10px] ${ct.muted}`}>This structure has no velocities (a dump with vx vy vz has): atoms are grey.</p>
+                )}
+                {isContinuous(colorBy) && (
+                  <>
+                    <div className="grid grid-cols-2 gap-1.5" role="radiogroup" aria-label="Colour map">
+                      {COLOR_MAP_NAMES.map(name => (
+                        <button
+                          key={name}
+                          role="radio"
+                          aria-checked={(vizConfig.colorMap ?? 'viridis') === name}
+                          onClick={() => updateConfig('colorMap', name)}
+                          className={`p-1.5 rounded-lg border text-[10px] capitalize transition-colors ${(vizConfig.colorMap ?? 'viridis') === name ? ct.active : ct.button}`}
+                        >
+                          <div className="h-2 rounded mb-1" style={{ background: colorMapGradient(name, !!vizConfig.colorReverse) }} />
+                          {name}
+                        </button>
+                      ))}
+                    </div>
+                    {toggleRow('Reverse colour map', !!vizConfig.colorReverse, () => updateConfig('colorReverse', !vizConfig.colorReverse))}
+                    {toggleRow('Range from the data (all frames)', vizConfig.colorAuto !== false, () =>
+                      setVizConfig(prev => prev.colorAuto === false
+                        ? { ...prev, colorAuto: true }
+                        : { ...prev, colorAuto: false, colorMin: autoColorRange?.[0] ?? 0, colorMax: autoColorRange?.[1] ?? 1 }))}
+                    {vizConfig.colorAuto === false && (
+                      <div className="grid grid-cols-2 gap-2">
+                        {(['colorMin', 'colorMax'] as const).map(k => (
+                          <label key={k} className={`text-[10px] ${ct.muted}`}>
+                            {k === 'colorMin' ? 'Minimum' : 'Maximum'}
+                            <input
+                              type="number" step="any"
+                              value={vizConfig[k] ?? 0}
+                              onChange={e => { const v = parseFloat(e.target.value); if (Number.isFinite(v)) updateConfig(k, v); }}
+                              className={`mt-0.5 w-full rounded border bg-transparent px-1.5 py-1 font-mono text-[11px] ${ct.input}`}
+                            />
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+                <div className={`flex items-center justify-between text-[11px] ${ct.muted}`}>
+                  <span>Bond colour</span>
+                  <span className="flex items-center gap-2">
+                    <button
+                      onClick={() => updateConfig('bondColor', '')}
+                      className={`px-2 py-1 rounded border text-[10px] transition-colors ${vizConfig.bondColor ? ct.button : ct.active}`}
+                    >
+                      By atom
+                    </button>
+                    <input
+                      type="color"
+                      value={vizConfig.bondColor || '#9aa0a6'}
+                      onChange={e => updateConfig('bondColor', e.target.value)}
+                      className="w-7 h-7 cursor-pointer rounded border-0 bg-transparent p-0"
+                      title="One colour for every bond"
+                      aria-label="Bond colour"
+                    />
+                  </span>
+                </div>
+              </section>
+
+              <section className="space-y-3">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Geometry</h3>
+                {slider('Atom size', `${(vizConfig.atomScale * 100).toFixed(0)}%`, vizConfig.atomScale, 0.1, 3, 0.05, v => updateConfig('atomScale', v))}
+                {slider('Bond thickness', `${(vizConfig.bondScale * 100).toFixed(0)}%`, vizConfig.bondScale, 0.1, 3, 0.05, v => updateConfig('bondScale', v))}
+              </section>
+
+              <section className="space-y-2">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Visibility</h3>
+                {([
+                  { key: 'showBonds' as const, label: 'Bonds', hint: 'B' },
+                  { key: 'showLabels' as const, label: `Element labels${moleculeData && moleculeData.atoms.length > 400 ? ' (≤400 atoms)' : ''}`, hint: 'L' },
+                ]).map(row => (
+                  <button
+                    key={row.key}
+                    onClick={() => updateConfig(row.key, !vizConfig[row.key])}
+                    className={`flex items-center justify-between w-full p-2.5 rounded-lg text-xs transition-colors ${ct.button}`}
+                  >
+                    <span>{row.label} <kbd className={`ml-1 px-1 rounded text-[9px] ${ct.chip}`}>{row.hint}</kbd></span>
+                    {vizConfig[row.key]
+                      ? <Eye size={14} className={ct.accentText} />
+                      : <EyeOff size={14} className={ct.muted} />}
+                  </button>
+                ))}
+              </section>
+            </>
+          )}
+
+          {/* ============================== SCENE TAB */}
+          {activeTab === 'scene' && (
+            <>
+              <section className="space-y-2">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Lighting</h3>
+                <div className="grid grid-cols-3 gap-2">
+                  {LIGHTING_PRESETS.map(p => (
+                    <button
+                      key={p}
+                      onClick={() => updateConfig('lightingPreset', p)}
+                      className={`py-2 text-[11px] font-medium rounded-lg border capitalize transition-colors ${
+                        vizConfig.lightingPreset === p ? ct.active : ct.button
+                      }`}
+                    >
+                      {p}
+                    </button>
+                  ))}
+                </div>
+                <p className={`text-[10px] ${ct.muted}`}>
+                  Shortcut <kbd className={`px-1 rounded text-[9px] ${ct.chip}`}>G</kbd> cycles presets.
+                </p>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Camera views</h3>
+                <div className="grid grid-cols-4 gap-2">
+                  {CAMERA_VIEWS.map(v => (
+                    <button
+                      key={v.preset}
+                      onClick={() => emitCameraCommand({ type: 'preset', preset: v.preset })}
+                      className={`py-2 text-[11px] font-medium rounded-lg border transition-colors ${ct.button}`}
+                      title={`View from ${v.label.toLowerCase()}`}
+                    >
+                      {v.label}
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => emitCameraCommand({ type: 'fit' })}
+                    className={`py-2 text-[11px] font-medium rounded-lg border flex items-center justify-center gap-1 transition-colors ${ct.button}`}
+                    title="Fit to scene (R)"
+                  >
+                    <Maximize2 size={12} /> Fit
+                  </button>
+                </div>
+              </section>
+
+              <section className="space-y-2">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Simulation box & axes</h3>
+                {toggleRow(
+                  <><Grid3x3 size={14} /> Show simulation box <kbd className={`px-1 rounded text-[9px] ${ct.chip}`}>X</kbd></>,
+                  vizConfig.showBox, () => updateConfig('showBox', !vizConfig.showBox), !moleculeData?.box, 'X',
+                )}
+                {vizConfig.showBox && moleculeData?.box && (
+                  <label className={`flex items-center justify-between text-[11px] ${ct.muted}`}>
+                    <span>Box colour</span>
+                    <input
+                      type="color"
+                      value={vizConfig.boxColor || '#5b8def'}
+                      onChange={e => updateConfig('boxColor', e.target.value)}
+                      className="w-7 h-7 cursor-pointer rounded border-0 bg-transparent p-0"
+                      aria-label="Box colour"
+                    />
+                  </label>
+                )}
+                {toggleRow(<><Grid3x3 size={14} /> Show XYZ axes</>, vizConfig.showAxes, () => updateConfig('showAxes', !vizConfig.showAxes))}
+                {!moleculeData?.box && (
+                  <p className={`text-[10px] ${ct.muted}`}>This structure has no cell information (load a LAMMPS/PDB-CRYST1/CIF file).</p>
+                )}
+              </section>
+
+              <section className="space-y-3">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Motion & optics</h3>
+                {slider('Auto-rotate speed', vizConfig.autoRotateSpeed.toFixed(1), vizConfig.autoRotateSpeed, 0.1, 6, 0.1, v => updateConfig('autoRotateSpeed', v))}
+                {slider('Field of view', `${vizConfig.fov.toFixed(0)}°`, vizConfig.fov, 15, 90, 1, v => updateConfig('fov', Math.round(v)))}
+              </section>
+
+              <section className="space-y-3">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Rendering</h3>
+                <div className="grid grid-cols-4 gap-2" role="radiogroup" aria-label="Rendering quality">
+                  {QUALITIES.map(q => (
+                    <button
+                      key={q.value}
+                      role="radio"
+                      aria-checked={(vizConfig.quality ?? 'auto') === q.value}
+                      onClick={() => updateConfig('quality', q.value)}
+                      title={q.desc}
+                      className={`py-2 text-[11px] font-medium rounded-lg border transition-colors ${(vizConfig.quality ?? 'auto') === q.value ? ct.active : ct.button}`}
+                    >
+                      {q.label}
+                    </button>
+                  ))}
+                </div>
+                <p className={`text-[10px] ${ct.muted}`}>{QUALITIES.find(q => q.value === (vizConfig.quality ?? 'auto'))?.desc}</p>
+                {toggleRow('Shadows', vizConfig.shadowsEnabled, () => updateConfig('shadowsEnabled', !vizConfig.shadowsEnabled))}
+                {toggleRow('Environment reflections', !!vizConfig.envLighting, () => updateConfig('envLighting', !vizConfig.envLighting))}
+                <label className={`flex items-center justify-between text-[11px] ${ct.muted}`}>
+                  <span>Tone mapping</span>
+                  <select value={vizConfig.toneMapping ?? 'aces'} onChange={e => updateConfig('toneMapping', e.target.value)} className={selectClass} aria-label="Tone mapping">
+                    {TONE_MAPPINGS.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+                  </select>
+                </label>
+                {slider('Exposure', (vizConfig.exposure ?? 1).toFixed(2), vizConfig.exposure ?? 1, 0.2, 3, 0.05, v => updateConfig('exposure', v))}
+                {slider('Depth cueing', vizConfig.depthCue ? `${Math.round(vizConfig.depthCue * 100)}%` : 'off', vizConfig.depthCue ?? 0, 0, 1, 0.05, v => updateConfig('depthCue', v))}
+              </section>
+
+              <section className="space-y-2">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Appearance</h3>
+                <button
+                  onClick={toggleTheme}
+                  className={`flex items-center justify-center gap-2 w-full py-2.5 rounded-lg text-xs font-medium transition-colors ${ct.button}`}
+                >
+                  {isDarkTheme(theme) ? <Sun size={14} /> : <Moon size={14} />}
+                  Next color theme <kbd className={`px-1 rounded text-[9px] ${ct.chip}`}>T</kbd>
+                </button>
+                <div className="flex gap-2 flex-wrap pt-1">
+                  {(isDarkTheme(theme)
+                    ? ['#151515', '#000000', '#10141c', '#1a1e26']
+                    : ['#f4f5f7', '#ffffff', '#eef2f7', '#e8ecef']
+                  ).map(color => (
+                    <button
+                      key={color}
+                      onClick={() => updateConfig('backgroundColor', color)}
+                      className={`w-7 h-7 rounded-full border-2 transition-transform hover:scale-110 ${
+                        vizConfig.backgroundColor === color ? (isDarkTheme(theme) ? 'border-[#7fa66b] scale-110' : 'border-[#4e7a41] scale-110') : 'border-transparent'
+                      }`}
+                      style={{ backgroundColor: color }}
+                      title={color}
+                      aria-label={`Background colour ${color}`}
+                    />
+                  ))}
+                  <label className={`relative w-7 h-7 rounded-full overflow-hidden border-2 ${ct.chip} cursor-pointer`}>
+                    <input
+                      type="color"
+                      value={vizConfig.backgroundColor}
+                      onChange={e => updateConfig('backgroundColor', e.target.value)}
+                      className="absolute -top-2 -left-2 w-12 h-12 cursor-pointer p-0 border-0"
+                      title="Custom background"
+                      aria-label="Custom background colour"
+                    />
+                  </label>
+                </div>
+                <button
+                  onClick={resetView}
+                  className={`flex items-center justify-center gap-2 w-full py-2.5 rounded-lg text-xs font-medium transition-colors ${ct.button}`}
+                  title="Every view setting back to its default (type colours and sizes stay)"
+                >
+                  <RotateCw size={14} /> Reset view settings
+                </button>
+              </section>
+            </>
+          )}
+
+          {/* ============================== ELEMENTS TAB */}
+          {activeTab === 'elements' && (
+            <>
+              <section className="space-y-2">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>Element types in structure</h3>
+                {atomTypeList.length > 0 ? (
+                  <div className="space-y-1.5">
+                    {atomTypeList.map(typeInfo => {
+                      const meta = ELEMENT_DATA.find(el => el.symbol === typeInfo.element);
+                      return (
+                        <div key={typeInfo.id} className={`flex items-center justify-between p-2.5 rounded-lg border ${ct.card}`}>
+                          <div className="flex items-center gap-2.5">
+                            <div className="relative w-8 h-8 rounded-full overflow-hidden border border-gray-600 shrink-0">
+                              <input
+                                type="color"
+                                value={vizConfig.customColors[typeInfo.id] || DEFAULT_ATOM_COLOR}
+                                onChange={e => updateCustomColor(typeInfo.id, e.target.value)}
+                                className="absolute -top-2 -left-2 w-14 h-14 cursor-pointer p-0 border-0"
+                                title={`Pick color for type ${typeInfo.id}`}
+                                aria-label={`Colour for element type ${typeInfo.id}`}
+                              />
+                            </div>
+                            <div>
+                              <div className="text-[11px] font-bold">
+                                {meta ? `${meta.name} (${meta.symbol})` : typeInfo.label}
+                              </div>
+                              <div className={`text-[9px] ${ct.muted}`}>
+                                {meta
+                                  ? `type ${typeInfo.id}${typeInfo.label && !typeInfo.label.includes(meta.name) && typeInfo.label !== meta.symbol && typeInfo.label !== `Type ${typeInfo.id}` ? ` (${typeInfo.label})` : ''} · Z=${meta.number} · ${meta.mass.toFixed(2)} u`
+                                  : `type ${typeInfo.id} · element unknown${typeInfo.mass ? ` · ${typeInfo.mass.toFixed(2)} u` : ''}`}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex flex-col items-end gap-1">
+                            <div className="flex items-center gap-1">
+                              <select
+                                value={meta ? meta.symbol : ''}
+                                onChange={e => setTypeElement(typeInfo.id, e.target.value || 'X')}
+                                className={`text-[10px] rounded px-1 py-0.5 border ${ct.chip}`}
+                                title={`Element of type ${typeInfo.id}: sets its colour, size and guessed bonds`}
+                                aria-label={`Element of type ${typeInfo.id}`}
+                              >
+                                <option value="">?</option>
+                                {ELEMENT_DATA.map(el => <option key={el.number} value={el.symbol}>{el.symbol}</option>)}
+                              </select>
+                              <div className={`px-2 py-0.5 rounded text-[10px] font-mono ${ct.chip}`}>
+                                ×{typeInfo.count}
+                              </div>
+                            </div>
+                            <input
+                              type="range" min="0.25" max="3" step="0.05"
+                              value={vizConfig.typeRadii?.[typeInfo.id] ?? 1}
+                              onChange={e => updateTypeRadius(typeInfo.id, parseFloat(e.target.value))}
+                              className={`w-20 ${accent}`}
+                              title={`Size of type ${typeInfo.id}: ${Math.round((vizConfig.typeRadii?.[typeInfo.id] ?? 1) * 100)}%`}
+                              aria-label={`Size of element type ${typeInfo.id}`}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className={`text-xs italic ${ct.muted}`}>Load a structure to edit its element colors.</p>
+                )}
+              </section>
+
+              <section className="space-y-2">
+                <h3 className={`text-xs font-semibold ${ct.header}`}>CPK/Jmol reference</h3>
+                <p className={`text-[10px] ${ct.muted}`}>
+                  All 118 elements carry standard CPK/Jmol colors and are resolved by symbol from any
+                  supported format — LAMMPS mass tables, XYZ symbols, PDB element columns and CIF type symbols.
+                </p>
+              </section>
+            </>
+          )}
+
+          {/* ============================== ANALYSIS TAB */}
+          {activeTab === 'analysis' && (
+            <>
+              {!moleculeData || !moleculeData.frames || moleculeData.frames.length <= 1 ? (
+                <section className={`rounded-xl p-4 text-sm border shadow-sm ${ct.card} ${ct.muted} leading-relaxed`}>
+                  <div className={`flex items-center gap-2 mb-2 font-bold ${ct.accentText}`}>
+                    <BarChart3 size={15} /> Trajectory analysis
+                  </div>
+                  <p className="leading-relaxed">
+                    Load a <span className="font-semibold">LAMMPS dump</span> (`.lammpstrj`/`.dump`) or multi-frame <span className="font-semibold">XYZ</span> trajectory to unlock analysis.
+                    Try the bundled <em>LJ melt · Dump</em> or <em>Trajectory · XYZ</em> examples in the Data tab.
+                  </p>
+                  <p className={`mt-2 text-xs ${ct.muted}`}>
+                    Once loaded, this tab shows RDF, MSD, density profiles and velocity histograms — all computed locally, with CSV export.
+                  </p>
+                </section>
+              ) : (
+                <>
+                  {/* Stats */}
+                  {(() => {
+                    const stats = trajStats(moleculeData);
+                    const is2D = stats.box ? (stats.box.zhi - stats.box.zlo) < 2 : false;
+                    return (
+                      <section className={`rounded-xl p-3 border ${ct.card} space-y-2`}>
+                        <h3 className={`text-xs font-bold flex items-center gap-1.5 ${ct.header}`}>
+                          <Activity size={13} className={ct.accentText} /> Trajectory stats
+                        </h3>
+                        <div className="grid grid-cols-3 gap-2 text-center">
+                          {[
+                            { label: 'Frames', value: stats.frames },
+                            { label: 'Atoms', value: stats.atoms },
+                            { label: is2D ? 'Area ρ' : 'Density', value: (is2D ? stats.areaDensity : stats.density)?.toFixed(3) ?? '—' },
+                          ].map(s => (
+                            <div key={s.label} className={`p-2 rounded-lg ${ct.stat}`}>
+                              <div className={`text-[10px] ${ct.muted}`}>{s.label}</div>
+                              <div className="text-sm font-mono font-bold">{s.value}</div>
+                            </div>
+                          ))}
+                        </div>
+                        {stats.box && (
+                          <div className={`text-[10px] font-mono ${ct.muted} leading-relaxed`}>
+                            Box {stats.box.xlo.toFixed(1)}→{stats.box.xhi.toFixed(1)} × {stats.box.ylo.toFixed(1)}→{stats.box.yhi.toFixed(1)} × {stats.box.zlo.toFixed(1)}→{stats.box.zhi.toFixed(1)}
+                            {is2D && ' · 2D (thin z)'}
+                          </div>
+                        )}
+                      </section>
+                    );
+                  })()}
+
+                  {/* Worker status — analyses run off the main thread */}
+                  {analysis.status === 'running' && (
+                    <div className={`flex items-center gap-2 rounded-lg border p-2.5 text-[11px] ${ct.card} ${ct.muted}`} role="status">
+                      <Loader2 size={13} className={`animate-spin ${ct.accentText}`} />
+                      Analysing {analysis.sampledFrames} sampled frames in a background worker…
+                    </div>
+                  )}
+                  {analysis.status === 'error' && (
+                    <div className={`flex items-start gap-2 rounded-lg border p-2.5 text-[11px] ${ct.errorBox}`} role="alert">
+                      <AlertCircle size={13} className="mt-0.5 shrink-0" />
+                      Analysis failed: {analysis.error}
+                    </div>
+                  )}
+
+                  {analysis.result && (
+                    <>
+                      {/* RDF */}
+                      <section className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <h3 className={`text-xs font-semibold flex items-center gap-1.5 ${ct.header}`}>
+                            <TrendingUp size={12} className={ct.accentText} /> Radial distribution g(r)
+                          </h3>
+                          <button
+                            onClick={() => {
+                              const csv = 'r,g(r),count\n' + analysis.result!.rdf
+                                .map(pt => `${pt.r.toFixed(3)},${pt.g.toFixed(4)},${pt.count.toFixed(1)}`)
+                                .join('\n');
+                              downloadTextFile('rdf.csv', csv);
+                            }}
+                            className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium ${ct.button}`}
+                            title="Export RDF as CSV"
+                          >
+                            <Download size={11} /> CSV
+                          </button>
+                        </div>
+                        <div className={`rounded-lg border p-2 ${ct.card}`}>
+                          <LineChart
+                            data={analysis.result.rdf.map(pt => ({ x: pt.r, y: pt.g }))}
+                            xLabel="r (Å / LJ σ)" yLabel="g(r)" theme={theme} height={150} yMin={0}
+                          />
+                        </div>
+                        <p className={`text-[10px] leading-relaxed ${ct.muted}`}>
+                          {analysis.result.rdf.some(pt => pt.g > 1.5)
+                            ? 'Peaks indicate local order (crystal). Flat ~1 = ideal gas / liquid.'
+                            : 'Flat g(r)≈1 — disordered / ideal gas.'}
+                          {' '}Averaged over {analysis.sampledFrames} sampled frames. First peak ≈ nearest-neighbour.
+                        </p>
+                      </section>
+
+                      {/* MSD */}
+                      <section className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <h3 className={`text-xs font-semibold flex items-center gap-1.5 ${ct.header}`}>
+                            <Activity size={12} className={ct.accentText} /> Mean squared displacement
+                          </h3>
+                          <button
+                            onClick={() => {
+                              const csv = 't,msd\n' + analysis.result!.msd
+                                .map(pt => `${pt.t},${pt.msd.toFixed(4)}`)
+                                .join('\n');
+                              downloadTextFile('msd.csv', csv);
+                            }}
+                            className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-medium ${ct.button}`}
+                            title="Export MSD as CSV"
+                          >
+                            <Download size={11} /> CSV
+                          </button>
+                        </div>
+                        <div className={`rounded-lg border p-2 ${ct.card}`}>
+                          <LineChart
+                            data={analysis.result.msd.map(pt => ({ x: pt.t, y: pt.msd }))}
+                            xLabel="lag (frames)" yLabel="MSD (Å²)" theme={theme} height={150} yMin={0}
+                            color={isDarkTheme(theme) ? '#d9a05b' : '#b97f3e'}
+                          />
+                        </div>
+                        <p className={`text-[10px] leading-relaxed ${ct.muted}`}>
+                          {(() => {
+                            const last = analysis.result!.msd[analysis.result!.msd.length - 1];
+                            const slope = last && last.t > 0 ? (last.msd / last.t).toFixed(3) : '—';
+                            return `Slope ≈ ${slope} Å²/frame`;
+                          })()} — linear = diffusive, plateau = caged/crystal. Averaged over time origins.
+                          {' '}
+                          {analysis.result.msdUnwrapped ? (
+                            <span className={ct.accentText}>
+                              Displacements are exact — this dump gives absolute positions
+                              (<code>xu yu zu</code>) or image flags to reconstruct them.
+                            </span>
+                          ) : (
+                            <span className="text-[#d9a05b]">
+                              No <code>ix iy iz</code> in this dump, so displacements use the
+                              minimum-image convention and MSD saturates near (L/2)². Dump{' '}
+                              <code>ix iy iz</code> or <code>xu yu zu</code> for long-time diffusion.
+                            </span>
+                          )}
+                        </p>
+                      </section>
+
+                      {/* Density profile */}
+                      <section className="space-y-2">
+                        <h3 className={`text-xs font-semibold flex items-center gap-1.5 ${ct.header}`}>
+                          <BarChart3 size={12} className={ct.accentText} /> Density profile
+                        </h3>
+                        <div className={`rounded-lg border p-2 ${ct.card}`}>
+                          <Histogram
+                            bins={analysis.result.density.bins}
+                            xLabel={`${analysis.result.density.axis} (Å)`} yLabel="count"
+                            theme={theme} height={140}
+                          />
+                        </div>
+                        <p className={`text-[10px] ${ct.muted}`}>
+                          Histogram of atom counts along <span className="font-mono">{analysis.result.density.axis}</span>{' '}
+                          (averaged over {analysis.sampledFrames} sampled frames) — uniform = homogeneous, peaks = layering.
+                        </p>
+                      </section>
+
+                      {/* Velocity distribution */}
+                      {analysis.speeds && (
+                        <section className="space-y-2">
+                          <h3 className={`text-xs font-semibold flex items-center gap-1.5 ${ct.header}`}>
+                            <Sparkles size={12} className={ct.accentText} /> Speed distribution
+                          </h3>
+                          <div className={`rounded-lg border p-2 ${ct.card}`}>
+                            <Histogram
+                              bins={analysis.speeds} xLabel="|v| (LJ)" yLabel="count" theme={theme}
+                              height={140} color={isDarkTheme(theme) ? '#c9a9d4' : '#7d5a8c'}
+                            />
+                          </div>
+                          <p className={`text-[10px] ${ct.muted}`}>
+                            Frame {Math.min(frameIdx, frameCount - 1) + 1} speed |v| — the Maxwell–Boltzmann peak
+                            shifts with temperature. Requires a dump with vx vy vz.
+                          </p>
+                        </section>
+                      )}
+
+                      <p className={`text-[10px] ${ct.muted}`}>
+                        Computed in {analysis.result.ms} ms
+                        {analysis.result.onMainThread
+                          ? ' on the main thread (Web Workers unavailable here).'
+                          : ' in a background worker — the 3D view keeps rendering while it works.'}
+                      </p>
+                    </>
+                  )}
+
+                  {/* Visuals helper */}
+                  <section className={`rounded-lg border p-3 space-y-2 ${ct.card}`}>
+                    <h3 className={`text-xs font-semibold flex items-center gap-1.5 ${ct.header}`}>
+                      <Palette size={12} className={ct.accentText} /> Trajectory visuals
+                    </h3>
+                    <p className={`text-[10px] leading-relaxed ${ct.muted}`}>
+                      Tip: use <span className="font-semibold">View → Atom size</span> and <span className="font-semibold">Scene → Box / Axes</span> while scrubbing.
+                      For 2D LJ runs the box is thin (z≈1); enable <span className="font-semibold">Box</span> to see it, and use <span className="font-semibold">Top</span> camera for a clear 2D view. Video `● Rec` captures the live canvas at 60 fps.
+                    </p>
+                  </section>
+                </>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <footer className={`px-3 py-2.5 border-t text-[10px] text-center flex items-center justify-between ${ct.divider}`}>
+          <span className={ct.muted}>
+            Created by <span className="font-medium">Shuvam Banerji Seal</span>
+          </span>
+          <button
+            onClick={copyShareLink}
+            className={`flex items-center gap-1 px-2 py-1 rounded ${linkCopied ? ct.accentText : ct.button}`}
+            title="Copy a link that restores this exact view"
+          >
+            {linkCopied ? <Check size={12} /> : <Link2 size={12} />}
+            {linkCopied ? 'Copied' : 'Share'}
+          </button>
+          <button
+            onClick={() => setShowHelp(true)}
+            className={`flex items-center gap-1 px-2 py-1 rounded ${ct.button}`}
+            title="Keyboard shortcuts (H)"
+          >
+            <Keyboard size={12} /> Shortcuts
+          </button>
+        </footer>
+      </aside>
+
+      {/* ============================ MAIN CANVAS AREA */}
+      <main className={`@container relative min-w-0 flex-1 ${ct.bg}`}>
+        {/* Error banner — OUTSIDE the sidebar tab conditional so a failed load
+            is visible (and announced) from any tab. A failed parse keeps the
+            previous structure; the banner auto-clears on the next load. */}
+        {error && (
+          <div
+            role="alert"
+            className={`absolute top-14 left-1/2 z-20 flex max-w-[min(92%,34rem)] -translate-x-1/2 items-start gap-2 rounded-xl border p-3 text-xs shadow-xl backdrop-blur ${ct.errorBox}`}
+          >
+            <AlertCircle size={14} className="mt-0.5 shrink-0" />
+            <span className="leading-relaxed">{error}</span>
+            <button
+              onClick={() => setError(null)}
+              className="shrink-0 rounded p-1"
+              aria-label="Dismiss error"
+              title="Dismiss error"
+            >
+              <X size={16} />
+            </button>
+          </div>
+        )}
+        {/* Top-left controls */}
+        <div className="absolute top-3 left-3 right-3 z-10 flex items-start justify-between pointer-events-none">
+          <div className="pointer-events-auto flex gap-1 sm:gap-2">
+            {!isSidebarOpen && (
+              <button
+                onClick={() => setIsSidebarOpen(true)}
+                className={`rounded-lg p-1.5 shadow-lg backdrop-blur sm:p-2.5 ${ct.sidebar}`}
+                title="Open sidebar (O)"
+              >
+                <Menu size={18} />
+              </button>
+            )}
+            {moleculeData && (
+              <div className={`rounded-lg px-2 py-1.5 text-[10px] shadow-lg backdrop-blur hidden sm:block sm:px-3 sm:py-2 sm:text-[11px] font-mono ${ct.card}`}>
+                {moleculeData.atoms.length.toLocaleString()} atoms
+                {moleculeData.bonds.length > 0 && ` · ${moleculeData.bonds.length.toLocaleString()} bonds`}
+                {moleculeData.box && ' · cell'}
+                {frameCount > 1 && ` · ${frameCount} frames`}
+              </div>
+            )}
+            {isParsing && (
+              <div className={`flex items-center gap-1.5 px-3 py-2 rounded-lg shadow-lg text-[11px] backdrop-blur ${ct.card}`} role="status">
+                <Loader2 size={13} className={`animate-spin ${ct.accentText}`} />
+                Parsing structure…
+              </div>
+            )}
+          </div>
+          <div className="pointer-events-auto flex gap-1 sm:gap-2">
+            <button
+              onClick={() => emitCameraCommand({ type: 'zoom', delta: 1 })}
+              className={`rounded-lg p-1.5 shadow-lg backdrop-blur sm:p-2.5 ${ct.sidebar}`}
+              title="Zoom in (+)"
+            >
+              <ZoomIn size={18} />
+            </button>
+            <button
+              onClick={() => emitCameraCommand({ type: 'zoom', delta: -1 })}
+              className={`rounded-lg p-1.5 shadow-lg backdrop-blur sm:p-2.5 ${ct.sidebar}`}
+              title="Zoom out (−)"
+            >
+              <ZoomOut size={18} />
+            </button>
+            <button
+              onClick={() => setShowHelp(true)}
+              className={`rounded-lg p-1.5 shadow-lg backdrop-blur sm:p-2.5 ${ct.sidebar}`}
+              title="Keyboard shortcuts (H)"
+            >
+              <HelpCircle size={18} />
+            </button>
+          </div>
+        </div>
+
+        {/*
+          BOTTOM DOCK — one absolutely-positioned column holding the hint, the
+          trajectory transport and the tool bar.
+
+          Three things were breaking before and are fixed here:
+           1. The bars were independently `left-1/2 -translate-x-1/2` with no
+              width clamp, so whenever they were wider than <main> they were
+              clipped on BOTH edges and their end buttons became unreachable.
+              They now live in an inset-x-0 column, clamp to the container and
+              scroll horizontally as a last resort.
+           2. Label visibility keyed off the VIEWPORT (`sm:`) while the sidebar
+              is inline from 768px — at 768-1100px the labels were shown inside
+              a much narrower <main>. They now key off the CONTAINER (`@…:`).
+           3. `100vh` sits under the mobile browser's URL bar. The app root is
+              `100dvh` now and the dock adds `env(safe-area-inset-bottom)`.
+        */}
+        <div
+          className="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex flex-col items-center gap-1.5 px-2 sm:gap-2"
+          style={{ paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))' }}
+        >
+          {/* Hint for first-time users */}
+          {moleculeData && frameCount <= 1 && selectedIds.length === 0 && (
+            <div className={`hidden rounded-full px-3 py-1 text-[10px] @2xl:block ${ct.muted}`}>
+              Press <kbd className={`px-1 rounded ${ct.chip}`}>H</kbd> for keyboard shortcuts · drag & drop files anywhere
+            </div>
+          )}
+
+          {/* Trajectory playback bar (P5) */}
+          {frameCount > 1 && (
+            <div className={`pointer-events-auto flex max-w-full items-center gap-1 overflow-x-auto rounded-full border px-2 py-1 shadow-2xl backdrop-blur @lg:gap-2 @lg:px-3 @lg:py-1.5 ${
+              isDarkTheme(theme) ? 'bg-[#1e1913]/95 border-[#3f3526]' : 'bg-white/95 border-[#ddd2bd]'
+            }`}>
+              <button
+                onClick={() => setFrameIdx(i => (i - 1 + frameCount) % frameCount)}
+                className={`shrink-0 rounded-full p-1.5 ${ct.button}`}
+                title="Previous frame (,)"
+                aria-label="Previous frame"
+              >
+                <ChevronLeft size={14} />
+              </button>
+              <button
+                onClick={() => setTrajPlaying(v => !v)}
+                className={`shrink-0 rounded-full p-1.5 ${trajPlaying ? ct.accentText : ct.muted}`}
+                title="Play / pause trajectory (P)"
+                aria-label={trajPlaying ? 'Pause trajectory' : 'Play trajectory'}
+              >
+                {trajPlaying ? <Pause size={14} /> : <Play size={14} />}
+              </button>
+              <button
+                onClick={() => setFrameIdx(i => (i + 1) % frameCount)}
+                className={`shrink-0 rounded-full p-1.5 ${ct.button}`}
+                title="Next frame (.)"
+                aria-label="Next frame"
+              >
+                <ChevronRight size={14} />
+              </button>
+              <input
+                type="range"
+                min="0"
+                max={frameCount - 1}
+                value={Math.min(frameIdx, frameCount - 1)}
+                onChange={e => { setTrajPlaying(false); setFrameIdx(parseInt(e.target.value, 10)); }}
+                className={`w-20 min-w-16 flex-1 @md:w-32 @2xl:w-48 ${accent}`}
+                aria-label="Trajectory frame"
+              />
+              <span className={`shrink-0 text-[10px] font-mono tabular-nums ${ct.muted}`}>
+                {Math.min(frameIdx, frameCount - 1) + 1}/{frameCount}
+              </span>
+              <select
+                value={trajFps}
+                onChange={e => setTrajFps(parseInt(e.target.value, 10))}
+                className={`hidden shrink-0 rounded border bg-transparent py-0.5 text-[10px] @md:block ${ct.input}`}
+                title="Playback speed"
+                aria-label="Playback speed"
+              >
+                {[2, 5, 10, 30].map(f => <option key={f} value={f}>{f} fps</option>)}
+              </select>
+            </div>
+          )}
+
+          {exportOpen && activeData && (
+            <div role="group" aria-label="Export structure" className={`pointer-events-auto flex max-w-full flex-wrap items-center justify-center gap-1 rounded-xl border px-2 py-1.5 text-xs shadow-xl backdrop-blur ${
+              isDarkTheme(theme) ? 'bg-[#1e1913]/95 border-[#3f3526]' : 'bg-white/95 border-[#ddd2bd]'
+            }`}>
+              <span className={`px-1 ${ct.muted}`}>{frameCount > 1 ? 'This frame as' : 'Export as'}</span>
+              <button onClick={() => void exportStructure('data')} className={`rounded px-2 py-1 ${ct.button}`} title="LAMMPS data file (atom_style full) for read_data">LAMMPS data</button>
+              <button onClick={() => void exportStructure('xyz')} className={`rounded px-2 py-1 ${ct.button}`} title="Extended XYZ with the cell">XYZ</button>
+              <button onClick={() => void exportStructure('pdb')} className={`rounded px-2 py-1 ${ct.button}`} title="PDB with CRYST1 for an orthogonal cell">PDB</button>
+              {frameCount > 1 && (
+                <button onClick={() => void exportStructure('xyz-all')} className={`rounded px-2 py-1 ${ct.button}`} title="Every frame as extended XYZ">All {frameCount} frames (XYZ)</button>
+              )}
+              <button onClick={() => setExportOpen(false)} className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded ${ct.muted}`} aria-label="Close export menu">
+                <X size={12} />
+              </button>
+            </div>
+          )}
+
+          {/* Tool dock */}
+          <div className={`pointer-events-auto flex max-w-full items-center gap-0.5 overflow-x-auto rounded-full border px-1 py-1 shadow-2xl backdrop-blur @xl:gap-1 @xl:px-2 @xl:py-1.5 ${
+            isDarkTheme(theme) ? 'bg-[#1e1913]/95 border-[#3f3526]' : 'bg-white/95 border-[#ddd2bd]'
+          }`}>
+            <button
+              onClick={() => setAutoRotate(v => !v)}
+              className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-1.5 text-xs font-medium transition-colors @2xl:gap-1.5 @2xl:px-3 @2xl:py-2 ${
+                autoRotate ? ct.accentText : ct.muted
+              }`}
+              title="Auto-rotate (Space)"
+              aria-label="Toggle auto-rotate"
+            >
+              {autoRotate ? <Pause size={16} /> : <Play size={16} />}
+              <span className="hidden @2xl:inline">Rotate</span>
+            </button>
+            <div className={`h-5 w-px shrink-0 ${isDarkTheme(theme) ? 'bg-gray-700' : 'bg-gray-300'}`} />
+            <button
+              onClick={() => emitCameraCommand({ type: 'fit' })}
+              className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-1.5 text-xs font-medium @2xl:gap-1.5 @2xl:px-3 @2xl:py-2 ${ct.muted}`}
+              title="Fit view (R)"
+              aria-label="Fit view"
+            >
+              <Maximize2 size={16} />
+              <span className="hidden @2xl:inline">Fit</span>
+            </button>
+            <div className={`h-5 w-px shrink-0 ${isDarkTheme(theme) ? 'bg-gray-700' : 'bg-gray-300'}`} />
+            <button
+              onClick={() => updateConfig('showBox', !vizConfig.showBox)}
+              disabled={!moleculeData?.box}
+              className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-1.5 text-xs font-medium disabled:opacity-30 @2xl:gap-1.5 @2xl:px-3 @2xl:py-2 ${
+                vizConfig.showBox ? ct.accentText : ct.muted
+              }`}
+              title="Simulation box (X)"
+              aria-label="Toggle simulation box"
+            >
+              <Box size={16} />
+              <span className="hidden @2xl:inline">Box</span>
+            </button>
+            <div className={`h-5 w-px shrink-0 ${isDarkTheme(theme) ? 'bg-gray-700' : 'bg-gray-300'}`} />
+            <button
+              onClick={() => updateConfig('showLabels', !vizConfig.showLabels)}
+              className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-1.5 text-xs font-medium @2xl:gap-1.5 @2xl:px-3 @2xl:py-2 ${
+                vizConfig.showLabels ? ct.accentText : ct.muted
+              }`}
+              title="Element labels (L)"
+              aria-label="Toggle element labels"
+            >
+              <Layers size={16} />
+              <span className="hidden @2xl:inline">Labels</span>
+            </button>
+            <div className={`h-5 w-px shrink-0 ${isDarkTheme(theme) ? 'bg-gray-700' : 'bg-gray-300'}`} />
+            <button
+              onClick={() => (isRecording ? stopRecording() : startRecording())}
+              disabled={savingVideo}
+              className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-1.5 text-xs font-medium transition-colors @2xl:gap-1.5 @2xl:px-3 @2xl:py-2 ${
+                isRecording ? 'text-red-400' : savingVideo ? 'opacity-50' : ct.muted
+              }`}
+              title={isRecording ? 'Stop recording & save video' : 'Record high-quality video (MP4 where supported)'}
+              aria-label={isRecording ? 'Stop recording' : 'Start recording'}
+            >
+              {isRecording ? (
+                <>
+                  <span className="h-3 w-3 shrink-0 rounded-sm bg-red-500 animate-pulse" />
+                  <span className="hidden font-mono tabular-nums @2xl:inline">
+                    {String(Math.floor(recordingMs / 60000)).padStart(2, '0')}:
+                    {String(Math.floor((recordingMs % 60000) / 1000)).padStart(2, '0')}
+                  </span>
+                </>
+              ) : (
+                <>
+                  <Circle size={13} className="shrink-0 text-red-400" fill="currentColor" />
+                  <span className="hidden @2xl:inline">{savingVideo ? 'Saving…' : 'Rec'}</span>
+                </>
+              )}
+            </button>
+            <div className={`h-5 w-px shrink-0 ${isDarkTheme(theme) ? 'bg-gray-700' : 'bg-gray-300'}`} />
+            <button
+              onClick={doScreenshot}
+              className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-1.5 text-xs font-medium @2xl:gap-1.5 @2xl:px-3 @2xl:py-2 ${ct.muted}`}
+              title="Screenshot (S)"
+              aria-label="Take screenshot"
+            >
+              <Camera size={16} />
+              <span className="hidden @2xl:inline">Shot</span>
+            </button>
+            <button
+              onClick={() => setExportOpen(v => !v)}
+              disabled={!activeData}
+              className={`flex shrink-0 items-center gap-1 rounded-full px-2 py-1.5 text-xs font-medium disabled:opacity-40 @2xl:gap-1.5 @2xl:px-3 @2xl:py-2 ${exportOpen ? ct.accentText : ct.muted}`}
+              title="Export the structure (LAMMPS data, XYZ, PDB)"
+              aria-label="Export structure"
+              aria-expanded={exportOpen}
+            >
+              <Download size={16} />
+              <span className="hidden @2xl:inline">Export</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Measurement panel (P4) */}
+        {selectedIds.length > 0 && activeData && (
+          <div className={`absolute top-16 left-3 z-10 px-3 py-2.5 rounded-xl border shadow-xl backdrop-blur text-xs space-y-1.5 ${
+            isDarkTheme(theme) ? 'bg-[#1e1913]/95 border-[#3f3526]' : 'bg-white/95 border-[#ddd2bd]'
+          }`} role="status">
+            <div className="flex items-center gap-1.5 font-semibold">
+              <Ruler size={13} className={ct.accentText} /> Measurement
+            </div>
+            {measurement ? (
+              <div className="font-mono text-sm">
+                <span className={ct.muted}>{measurementGlyph(measurement.kind)} = </span>
+                <span className={`${ct.accentText} font-bold`}>{measurement.label}</span>
+              </div>
+            ) : (
+              <div className={ct.muted}>{measurementHint}</div>
+            )}
+            <button
+              onClick={() => setSelectedIds([])}
+              className={`w-full py-1 rounded-lg text-[11px] font-medium ${ct.button}`}
+              title="Clear selection (C)"
+            >
+              Clear selection
+            </button>
+          </div>
+        )}
+
+        {activeData ? (
+          <MoleculeCanvas
+            data={activeData}
+            autoRotate={autoRotate}
+            config={canvasConfig}
+            selectedIds={selectedIds}
+            onSelectAtom={toggleSelectAtom}
+            forceContinuousRender={isRecording || savingVideo}
+            displayBox={displayBox}
+            measureBox={measureBox}
+          />
+        ) : (
+          <div className={`w-full h-full flex flex-col items-center justify-center ${ct.muted}`}>
+            <div className={`w-14 h-14 border-4 rounded-full animate-spin mb-4 ${ct.loader}`} />
+            <p>Waiting for structure data…</p>
+          </div>
+        )}
+      </main>
+
+      {/* ============================ HELP OVERLAY */}
+      {showHelp && (
+        <div
+          ref={helpDialogRef}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={() => setShowHelp(false)}
+          onKeyDown={handleHelpKeyDown}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Keyboard shortcuts"
+        >
+          <div
+            className={`max-w-lg w-full rounded-2xl border shadow-2xl p-6 space-y-4 max-h-[85vh] overflow-y-auto ${ct.card}`}
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="text-base font-bold flex items-center gap-2">
+                <Keyboard size={18} /> Keyboard shortcuts
+              </h2>
+              <button
+                ref={helpCloseRef}
+                onClick={() => setShowHelp(false)}
+                className={`p-1.5 rounded-lg ${ct.button}`}
+                aria-label="Close shortcuts dialog"
+                title="Close shortcuts dialog"
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <ul className="divide-y divide-transparent">
+              {SHORTCUT_CATALOG.map(sc => (
+                <li key={sc.keys} className="flex items-center justify-between py-1.5 text-xs">
+                  <kbd className={`px-2 py-1 rounded-md font-mono text-[11px] ${ct.chip}`}>{sc.keys}</kbd>
+                  <span className={`${ct.muted} text-right`}>{sc.action}</span>
+                </li>
+              ))}
+            </ul>
+            <p className={`text-[10px] ${ct.muted} flex items-center gap-1.5`}>
+              <Settings size={11} /> Shortcuts are ignored while typing in the paste box.
+            </p>
+            <div className="flex items-center gap-2">
+              <button onClick={() => { setShowHelp(false); doScreenshot(); }} className={`flex-1 py-2 rounded-lg text-xs font-semibold ${ct.accent}`}>
+                <RotateCw size={12} className="inline mr-1" /> Take screenshot now
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default ViewerModule;

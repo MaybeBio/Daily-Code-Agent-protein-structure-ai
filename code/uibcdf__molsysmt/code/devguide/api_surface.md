@@ -1,0 +1,146 @@
+# Public API Surface and Stability
+
+This document defines how the public surface is identified and how stability
+claims are made. The normative classification is the machine-readable registry
+in `devtools/data/public_api_stability.json`; its generated human-readable view
+is `api_stability_registry.md`.
+
+## What is public
+
+The root public surface is the lazy registry `molsysmt._LAZY_ATTRIBUTES`, exposed
+through `molsysmt.__getattr__()`. It currently includes namespaces, native
+classes, core functions, warm-up helpers, and selected diagnostics.
+
+Public namespace surfaces are defined by the non-private symbols intentionally
+exported from their package `__init__.py` files. A symbol need not be copied into
+the root registry to be public as `molsysmt.structure.<name>` or another public
+namespace.
+
+Modules under `molsysmt/_private` are internal and are excluded from the
+published API reference. Implementation guidance for contributors belongs in
+`devguide/` and `docs/content/developer/`, without turning internal import paths
+into a user contract. `molsysmt.third_party` is a bridge implementation
+namespace and is not a stable user contract unless an individual symbol is
+documented otherwise.
+
+## Normative stability contract
+
+Every export in the root lazy registry and the release-contract namespaces is
+classified as `stable`, `experimental`, or `outside-contract`. The registry is
+validated against source code with the Python AST, without importing MolSysMT
+or optional dependencies. CI fails when an export is added without a decision,
+when a registered export disappears, or when the generated table is stale.
+
+The exact member inventories currently tracked are `molsysmt`, `basic`,
+`structure`, `build`, `pbc`, `physchem`, `topology`, `chemical_states`, `hbonds`, `element.atom`,
+`interactions`, `interactions.hbonds`, `interactions.disulfides`, `interactions.ionic`, and
+`molecular_mechanics`. Group and amino-acid exports under `element.group` are
+also tracked exactly and retain Experimental status. The canonical hydrogen-bond functions live under
+`interactions.hbonds`; `hbonds` retains the same function objects as an
+experimental compatibility path. Disulfide candidate observations live under
+`interactions.disulfides`, while recorded covalent bonds belong to ChemicalStates and
+`build.get_disulfide_bonds` retains its single-structure entry point. Other root namespaces have an explicit subtree policy:
+their members inherit the namespace's Experimental or Outside-contract status
+until that namespace is promoted into exact member tracking.
+
+The method criteria, result shapes, and scientific evidence level of these
+families are specified in [Interaction Analysis API](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/interactions_api.md).
+
+Prepared PDBQT coordinate projection inherits the `molsysmt.form` subtree's
+Experimental classification. Its file/text functions and native
+`PDBQTFileHandler.project_coordinates` method share the bounded
+[prepared-coordinate contract](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/forms_and_conversions.md#prepared-coordinate-projection).
+This addition does not promote the form namespace or canonicalize a partial
+prepared representation into scientifically complete chemistry.
+
+`pre-1.0` in the introduction field means that the symbol was already present
+during pre-release development and that no trustworthy finer-grained public
+release provenance exists. It is not an inferred maturity claim.
+
+Presence in an `__init__.py`, a docstring `versionadded` directive, form tier,
+or test suite still does not establish stability on its own. Only the registry
+does. A previous registry can be passed to the validator as a baseline; Stable
+symbols cannot be demoted or removed and deprecated lifecycle state cannot be
+silently reverted.
+
+## Root compatibility points
+
+Numerical kernels are already compiled in the installed Rust extension. The
+pre-1.0 JIT warm-up helpers were removed with the JIT runtime; ordinary Python
+imports remain the explicit mechanism for applications that want eager module
+loading.
+
+Exceptions re-exported at the root are Stable user-side handling points. Their
+catalog prose may improve, but their import paths and intended exception roles
+belong to the `1.x` compatibility contract.
+
+## Evolution rules
+
+### Shared chemical value tools and conversion queries
+
+`element.group.get_1_letter_code_from_name` is the sole supported public scalar
+code entry. The former amino-acid entry and its independent legacy authority
+were removed under #549 before 1.0; this is an explicit naming-contract
+correction, not a semantics-preserving alias. Use `naming_scheme='legacy'` for
+historical values. The group and amino-acid registries and derived tiers remain
+experimental. Supported profiles, context refusals and source preservation are
+specified in the [naming guide](https://github.com/uibcdf/molsysmt/blob/HEAD/docs/content/user/foundations/molecular_system/naming_schemes.md).
+
+`element.atom.is_atom_type` checks genuine canonical chemical element symbols.
+`element.atom.normalize_atom_types` normalizes explicit D/T hydrogen isotope
+aliases and preserves nullable mass numbers. `atom_type` means a chemical
+element, independently of `atom_name` and `atom_ff_type`; neither tool infers
+elements from atom names or force-field labels. Public wrappers validate scalar
+or one-dimensional inputs. Native readers reuse the private primitive without
+public dispatch. Format-specific conventions such as CTAB reference isotopes
+remain owned by the reader.
+
+`basic.get_conversion_report` (also exported at the root) performs the same
+preflight as `convert` strict/report mode without writing the destination or
+mutating source molecular data. It accepts normal source forms, selections and
+flat target lists, but not converter-specific options. Audit scopes and
+`is_exhaustive` bound its preservation claims; the query does not validate
+converter availability or successful writing.
+
+See [chemical atom-type tools](https://github.com/uibcdf/molsysmt/blob/HEAD/docs/content/user/tools/element/atom/atom_types.md)
+and [conversion report queries](https://github.com/uibcdf/molsysmt/blob/HEAD/docs/content/user/tools/basic/get_conversion_report.md)
+in the User Guide for scalar/collection results and inspection semantics.
+
+### Approved pre-release namespace moves
+
+The accepted #255 separation moves the nine covalent graph tools from
+`molsysmt.topology` to `molsysmt.chemical_states` without old-path aliases.
+`pre_1_0_namespace_moves` records the eight historical pre-1.0 pairs, their owning
+decision, reason and assertion-bearing namespace guard. The ninth tool, experimental
+`get_rotatable_bonds`, retains its planned `1.0.0` introduction and follows the
+ordinary experimental transition policy. Previous and replacement entries
+must both be pre-1.0 introductions, retain the exact callable name and stability,
+and have active lifecycles. The baseline validator continues rejecting removal
+of versioned introductions, demotion, untracked replacements and arbitrary
+renaming. This bounded pre-release decision does not relax the published 1.x
+deprecation policy or certify scientific parity; numerical evidence remains in
+the scientific registry and executable graph tests.
+
+### Public additions
+
+For a new or changed public function:
+
+1. define the intended stability level and lifecycle impact;
+2. follow adjacent naming, arguments, and return conventions;
+3. use `@arg_digest` where public argument validation is appropriate;
+4. do not decorate private helpers;
+5. add behavioral and failure-path tests;
+6. update docstrings, User Guide, Cookbook where relevant, and the Four Paths
+   course as required by the repository lifecycle policy;
+7. add deprecation before removing or breaking an established stable contract.
+
+Not every public callable has the same decorator needs. Classes, predicates,
+compatibility wrappers, and thin namespace helpers must follow their local
+contract rather than a blanket “every public symbol is decorated” rule.
+
+## Unsupported behavior
+
+A public signature must not imply silent partial support. Unsupported engines,
+forms, output types, or argument combinations should raise a catalog-backed,
+typed exception with actionable context. Bare `NotImplementedError` remains
+technical debt and should not be copied into new public paths.

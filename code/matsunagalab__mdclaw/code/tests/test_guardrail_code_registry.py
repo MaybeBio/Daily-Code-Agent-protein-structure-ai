@@ -1,0 +1,109 @@
+"""Guardrail ``code`` drift guard (plan phase 0, tightened in phase B).
+
+MDClaw's weak-agent contract is: branch on stable ``code`` strings, never on
+human-readable messages. That only holds if the set of emitted codes stays
+under control. This test scans the package source for every ``code`` literal
+and compares it to a committed golden set.
+
+Phase 0: detect drift against tests/data/guardrail_codes.json.
+Phase B: additionally require every emitted code to be present in the
+``mdclaw.guardrail_codes`` single-source-of-truth registry (skipped
+automatically until that module exists).
+"""
+
+import json
+import ast
+import sys
+from pathlib import Path
+
+
+# Make the repo-root ``scripts`` package importable regardless of pytest's
+# import mode / rootdir handling.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from scripts.gen_guardrail_codes import iter_guardrail_codes  # noqa: E402
+
+GOLDEN_PATH = Path(__file__).parent / "data" / "guardrail_codes.json"
+
+
+def _load_golden() -> set[str]:
+    return set(json.loads(GOLDEN_PATH.read_text()))
+
+
+def test_guardrail_codes_match_golden():
+    golden = _load_golden()
+    found = iter_guardrail_codes()
+
+    added = sorted(found - golden)
+    removed = sorted(golden - found)
+    assert not added and not removed, (
+        "Guardrail code set drifted. If intentional, regenerate with "
+        "`python scripts/gen_guardrail_codes.py`.\n"
+        f"Added: {added}\nRemoved: {removed}"
+    )
+
+
+def test_emitted_codes_are_registered():
+    """Every emitted code must be registered in the SSOT registry.
+
+    The registry is mandatory, so a missing import is a failure rather than a
+    reason to skip: skipping would turn its disappearance into a silent pass.
+    """
+    from mdclaw.guardrail_codes import GUARDRAIL_CODES
+
+    found = iter_guardrail_codes()
+    unregistered = sorted(found - set(GUARDRAIL_CODES))
+    assert not unregistered, (
+        "These emitted codes are missing from mdclaw.guardrail_codes.GUARDRAIL_CODES: "
+        + ", ".join(unregistered)
+    )
+
+
+def test_registry_has_no_stale_codes():
+    """The SSOT registry must not carry codes the package never emits."""
+    from mdclaw.guardrail_codes import GUARDRAIL_CODES
+
+    found = iter_guardrail_codes()
+    stale = sorted(set(GUARDRAIL_CODES) - found)
+    assert not stale, (
+        "These registry codes are no longer emitted anywhere in mdclaw/. "
+        "Remove them from mdclaw.guardrail_codes.GUARDRAIL_CODES: " + ", ".join(stale)
+    )
+
+
+def test_every_registered_code_has_an_action():
+    from mdclaw.guardrail_codes import GUARDRAIL_CODES
+
+    empty = sorted(code for code, action in GUARDRAIL_CODES.items() if not str(action).strip())
+    assert not empty, "These registered codes have an empty action: " + ", ".join(empty)
+
+
+def test_every_blocking_guardrail_declares_a_concrete_fix():
+    """A registry hint is a fallback, not a substitute for local alternatives.
+
+    In the 2026-08-25 campaign the ff19SB/TIP3P and associated-ligand guards
+    refused correctly but the useful alternative never reached the agent.  A
+    blocking ``create_guardrail_result`` must therefore carry its own
+    ``suggested_fix``; failure manifests now preserve that field verbatim.
+    """
+    missing = []
+    for path in (_REPO_ROOT / "mdclaw").rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = (node.func.id if isinstance(node.func, ast.Name) else
+                    node.func.attr if isinstance(node.func, ast.Attribute) else "")
+            if name != "create_guardrail_result":
+                continue
+            keywords = {item.arg: item.value for item in node.keywords if item.arg}
+            severity = keywords.get("severity")
+            if not (isinstance(severity, ast.Constant) and severity.value == "error"):
+                continue
+            if "suggested_fix" not in keywords:
+                code = keywords.get("code")
+                label = code.value if isinstance(code, ast.Constant) else "unknown"
+                missing.append(f"{path.relative_to(_REPO_ROOT)}:{node.lineno} {label}")
+    assert not missing, "Blocking guardrails without suggested_fix:\n" + "\n".join(missing)

@@ -1,0 +1,742 @@
+"""Composed run configuration (`RunSpec`) and sub-config modules.
+
+See `.agents/REFACTOR_ROADMAP.md` §3.5. This module is the Equinox/pytree representation;
+`run.specs.RunSpecification` remains the public dataclass façade for one minor version.
+
+PlannerTopology (added in RS-2) configures the amino-acid kernel dispatch topology for the
+planner/sampler. Use `topology_hash()` to derive cache keys from PlannerTopology fields.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import field, fields, is_dataclass
+from os import PathLike, fspath
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, Self, cast
+
+import equinox as eqx
+import jax
+import numpy as np
+from xtrax.run import RunSpec as _XtraxRunSpec
+
+from aminx.types.stages import DecodingFusionFn, EncodingFusionFn
+
+if TYPE_CHECKING:
+  from aminx.run.options import (
+    CalibyOptions,
+    FAMPNNOptions,
+    LaserOptions,
+    PottsMPNNOptions,
+    ProtonPottsOptions,
+    ThermoMPNNOptions,
+  )
+
+
+class IOConfig(eqx.Module):
+  """Output / manifest / sink selection (host-side)."""
+
+  output_dir: Path | None = eqx.field(static=True)
+  sink_kind: str = eqx.field(static=True)
+  manifest_path: Path | None = eqx.field(static=True)
+  output_path: Path | None = eqx.field(static=True)
+  cache_path: Path | None = eqx.field(static=True)
+
+  def __init__(
+    self,
+    output_dir: Path | None = None,
+    sink_kind: str = "none",
+    manifest_path: Path | None = None,
+    output_path: Path | None = None,
+    cache_path: Path | None = None,
+    *,
+    output_h5_path: Path | None = None,
+    output_zarr_path: Path | None = None,
+  ) -> None:
+    """Initialize host I/O configuration.
+
+    Parameters
+    ----------
+    output_dir : Path | None, optional
+      Directory for output artifacts.
+    sink_kind : str, default="none"
+      Output sink kind identifier.
+    manifest_path : Path | None, optional
+      Preprocessed index or manifest path.
+    output_path : Path | None, optional
+      Canonical output store path.
+    cache_path : Path | None, optional
+      Optional structure cache path.
+    output_h5_path : Path | None, optional
+      Deprecated alias for ``output_path``.
+    output_zarr_path : Path | None, optional
+      Alias for ``output_path``.
+    """
+    resolved_output = _optional_path(output_path)
+    if resolved_output is None:
+      resolved_output = (
+        _optional_path(output_zarr_path)
+        if output_zarr_path is not None
+        else _optional_path(output_h5_path)
+      )
+    self.output_dir = _optional_path(output_dir)
+    self.sink_kind = sink_kind
+    self.manifest_path = _optional_path(manifest_path)
+    self.output_path = resolved_output
+    self.cache_path = _optional_path(cache_path)
+
+  @property
+  def output_h5_path(self) -> Path | None:
+    """Deprecated alias for output_path (actual storage is Zarr)."""
+    return self.output_path
+
+  @property
+  def output_zarr_path(self) -> Path | None:
+    """Canonical alias for output_path (Zarr store)."""
+    return self.output_path
+
+
+class ResourceConfig(eqx.Module):
+  """Device and batching caps (structure vs sample streams)."""
+
+  n_devices: int = eqx.field(static=True)
+  sample_batch_size: int = eqx.field(static=True)
+  structure_batch_size: int = eqx.field(static=True)
+  max_buffer_size: int | None = eqx.field(static=True)
+
+
+class MultistateConfig(eqx.Module):
+  """Multistate / combine-strategy knobs (registry keys are strings, not int indices)."""
+
+  mode: str = eqx.field(static=True)
+  n_states: int = eqx.field(static=True)
+  combine_strategy: str = eqx.field(static=True)
+
+
+class LigandConfig(eqx.Module):
+  """LigandMPNN-specific options layered on `RunSpecification`."""
+
+  model_family: str = eqx.field(static=True)
+  use_side_chain_context: bool | None = eqx.field(static=True)
+  ligand_conditioning: bool | None = eqx.field(static=True)
+  sidechain_conditioning: bool = eqx.field(static=True)
+  context_path: Path | None = eqx.field(static=True)
+
+
+class GridLineageConfig(eqx.Module):
+  """Grid / campaign lineage metadata (mostly static host fields)."""
+
+  grid_mode: bool = eqx.field(static=True)
+  campaign_mode: bool = eqx.field(static=True)
+  job_id: str | None = eqx.field(static=True)
+  chunk_id: int | None = eqx.field(static=True)
+  sample_start: int | None = eqx.field(static=True)
+  sample_count: int | None = eqx.field(static=True)
+
+
+class PrecisionConfig(eqx.Module):
+  """JAX compute dtype policy for training and inference (mirrors dataclass ``precision`` when set)."""
+
+  compute: Literal["fp32", "fp16", "bf16"] = eqx.field(static=True)
+
+
+class PlannerTopology(eqx.Module):
+  """aminx kernel dispatch topology config.
+
+  Configures planner and sampler dispatch topology knobs for RunSpec. Wraps
+  aminx.tiling.BatchPlanner config fields. Will gain xtrax.ExecutionProfile once
+  xtrax BatchPlanner reaches multi-phase parity (T2.5).
+
+  The `use_unified_driver` field selects between the unified plan-driven sampling
+  dispatch (True) and the legacy fallback sampling dispatch (False). Default is True.
+
+  See `topology_hash()` below for deterministic cache-key derivation from these fields.
+  """
+
+  use_unified_driver: bool = eqx.field(static=True)
+  """Select unified plan-driven dispatch (True) or legacy fallback (False). Default: True."""
+
+
+class SamplingConfig(eqx.Module):
+  """Generic sampling knobs (RS-1 migration map section 4).
+
+  ``sampling_strategy`` through ``structure_mapping`` below were added 260716 (EPIC #1541 P4,
+  the decode-plan-unification pass) so that decode-class resolution (``ConditionalMode`` vs
+  ``AutoregressiveMode`` vs ``STEMode``) and multistate/tie fusion can be driven from ONE place
+  (``spec.run_spec.sampling``) instead of scattered flat-spec reads across ``host/plan.py`` and
+  ``sampling/multistate_poe.py`` independently. See aminx#110/#113 and
+  ``.praxia/docs/specs/260707_xtrax-migration-gap-audit-runspec-scaffolding.md`` for why the
+  prior attempt at this (``TiedPositionsConfig``/``AveragingConfig``/``BatchingConfig``) went
+  100% dead and was deleted (`dd0e952`) rather than fixed -- fields live directly on
+  ``SamplingConfig`` this time, not a separate sub-config, since that's the one that stuck.
+  """
+
+  num_samples: int = eqx.field(static=True)
+  random_seed: int = eqx.field(static=True)
+  return_logits: bool = eqx.field(static=True)
+  compute_pseudo_perplexity: bool = eqx.field(static=True)
+  return_decoding_orders: bool = eqx.field(static=True)
+  return_logit_fingerprint: bool = eqx.field(static=True)
+  backbone_noise: tuple[float, ...] = eqx.field(static=True)
+  temperature: tuple[float | None, ...] = eqx.field(static=True)
+  omit_aa: tuple[str, ...] = eqx.field(static=True, default=())
+  omit_aa_per_position: Mapping[int, str] | None = eqx.field(static=True, default=None)
+  bias: Any = None
+  fixed_mask: Any = None
+  fixed_positions: Any = None
+  fixed_tokens: Any = None
+  sampling_strategy: str = eqx.field(static=True, default="temperature")
+  multi_state_strategy: str = eqx.field(static=True, default="arithmetic_mean")
+  multi_state_temperature: float = eqx.field(static=True, default=1.0)
+  # Logit scale for the "product" strategy. Separate from state_weights on
+  # purpose: weights are mixing proportions, sharpness is concentration. None
+  # means "match a plain product of S experts". See ProductOfProbabilities.
+  multi_state_sharpness: float | None = eqx.field(static=True, default=1.0)
+  use_rolling_state: bool = eqx.field(static=True, default=False)
+  decoding_order_fn: Any = eqx.field(static=True, default=None)
+  decoding_order_seed: int | None = eqx.field(static=True, default=None)
+  fixed_position_context: str = eqx.field(static=True, default="random_order")
+  tie_group_map: Any = None
+  state_position_map: Any = None
+  state_weights: Any = None
+  structure_mapping: Any = None
+  wave: Any = None
+
+
+class RunSpec(_XtraxRunSpec):
+  """Composed configuration for run/prep pipelines."""
+
+  io: IOConfig = field(default_factory=lambda: None)  # type: ignore
+  resource: ResourceConfig = field(default_factory=lambda: None)  # type: ignore
+  multistate: MultistateConfig = field(default_factory=lambda: None)  # type: ignore
+  ligand: LigandConfig = field(default_factory=lambda: None)  # type: ignore
+  grid: GridLineageConfig = field(default_factory=lambda: None)  # type: ignore
+  # Named ``precision_config``, not ``precision``: xtrax >= 0.4.1b1 declares ``RunSpec.precision``
+  # as ``str | None`` and rejects a PrecisionConfig there (xtrax run/spec.py __check_init__).
+  precision_config: PrecisionConfig = field(default_factory=lambda: None)  # type: ignore
+  plan: PlannerTopology = field(default_factory=lambda: None)  # type: ignore
+  sampling: SamplingConfig = field(default_factory=lambda: None)  # type: ignore
+  potts_mpnn: PottsMPNNOptions | None = eqx.field(static=True, default=None)
+  protonpotts: ProtonPottsOptions | None = eqx.field(static=True, default=None)
+  laser: LaserOptions | None = eqx.field(static=True, default=None)
+  caliby: CalibyOptions | None = eqx.field(static=True, default=None)
+  fampnn: FAMPNNOptions | None = eqx.field(static=True, default=None)
+  thermompnn: ThermoMPNNOptions | None = eqx.field(static=True, default=None)
+  encoding_fusion: EncodingFusionFn | None = eqx.field(static=True, default=None)
+  decoding_fusion: DecodingFusionFn | None = eqx.field(static=True, default=None)
+
+
+class Unset:
+  """Sentinel for a sampling temperature the family default has not resolved yet.
+
+  ``__reduce__`` rebuilds this singleton, so ``pickle.loads(pickle.dumps(UNSET)) is UNSET``.
+  """
+
+  _singleton: Unset | None = None
+
+  def __new__(cls) -> Self:
+    existing = cls._singleton
+    if existing is None:
+      created = cast("Self", super().__new__(cls))
+      cls._singleton = created
+      return created
+    return cast("Self", existing)
+
+  def __repr__(self) -> str:
+    return "UNSET"
+
+  def __reduce__(self) -> tuple[object, tuple[()]]:
+    return (_restore_unset, ())
+
+
+def _restore_unset() -> Unset:
+  return UNSET
+
+
+UNSET = Unset()
+
+
+def _as_float_tuple(v: object | None) -> tuple[float, ...]:
+  """Convert scalar or iterable (or None) to tuple of floats."""
+  if v is None:
+    return ()
+  # Handle scalar float/int case
+  if isinstance(v, (int, float)):
+    return (float(v),)
+  # Handle iterable case (guaranteed by elimination)
+  return tuple(float(x) for x in cast("Any", v))
+
+
+def _as_temperature_tuple(value: object, model_family: object) -> tuple[float | None, ...]:
+  """Resolve a sampling temperature to a tuple, keeping LASEr ``None`` (argmax).
+
+  ``UNSET`` becomes ``(0.1,)`` for proteinmpnn / ligandmpnn / membrane / pottsmpnn
+  and ``(None,)`` for lasermpnn. A scalar or explicit ``None`` becomes a 1-tuple.
+  Any ``None`` outside lasermpnn is an error. A lasermpnn element equal to ``0.0``
+  becomes ``None`` (the batch-CLI falsy rule).
+  """
+  family = model_family if isinstance(model_family, str) else "proteinmpnn"
+  if value is UNSET:
+    if family == "lasermpnn":
+      return (None,)
+    return (0.1,)
+  items = _temperature_items(value)
+  resolved: list[float | None] = []
+  for item in items:
+    number = _temperature_element(item, family)
+    if number is None and family != "lasermpnn":
+      msg = (
+        "temperature None is only valid for model_family 'lasermpnn' (argmax); "
+        f"got model_family={family!r}"
+      )
+      raise ValueError(msg)
+    resolved.append(number)
+  return tuple(resolved)
+
+
+def _temperature_items(value: object) -> tuple[object, ...]:
+  if value is None or (isinstance(value, (int, float)) and not isinstance(value, bool)):
+    return (value,)
+  if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+    return tuple(value)
+  msg = f"temperature must be a float, None, or a sequence of those, got {type(value).__name__}"
+  raise TypeError(msg)
+
+
+def _temperature_element(item: object, family: str) -> float | None:
+  if item is None:
+    return None
+  if isinstance(item, bool) or not isinstance(item, (int, float)):
+    msg = f"temperature element must be int, float, or None, got {type(item).__name__}"
+    raise TypeError(msg)
+  number = float(item)
+  if family == "lasermpnn" and number == 0.0:
+    return None
+  return number
+
+
+def _temperature_carries_laser_none(raw: object, family: object) -> bool:
+  """True when ``raw`` still needs the None-preserving temperature resolver."""
+  if isinstance(raw, tuple | list):
+    if any(item is None for item in raw):
+      return True
+    return family == "lasermpnn" and any(_is_temperature_zero(item) for item in raw)
+  return family == "lasermpnn" and _is_temperature_zero(raw)
+
+
+def _is_temperature_zero(item: object) -> bool:
+  return isinstance(item, (int, float)) and not isinstance(item, bool) and float(item) == 0.0
+
+
+def _sampling_temperature_for_run_spec(spec: object) -> tuple[float | None, ...]:
+  """Temperature stored on ``SamplingConfig``.
+
+  Specs with no temperature field (everything except sampling) keep the historical
+  ``_as_float_tuple(None) -> ()`` result. Sampling resolves ``UNSET`` in
+  ``SamplingSpecification._resolve_family_defaults`` before this runs, so ``UNSET``
+  does not arrive here on the public constructor path.
+  """
+  raw = getattr(spec, "temperature", None)
+  family = getattr(spec, "model_family", None)
+  if raw is UNSET or _temperature_carries_laser_none(raw, family):
+    return _as_temperature_tuple(raw, family)
+  return _as_float_tuple(raw)
+
+
+def mpnn_temperatures(run_spec: RunSpec) -> tuple[float, ...]:
+  """Concrete MPNN temperatures. ``None`` (LASEr argmax) raises."""
+  values = run_spec.sampling.temperature
+  concrete: list[float] = []
+  for value in values:
+    if value is None:
+      msg = "MPNN consumers require a concrete temperature; None (argmax) is lasermpnn-only"
+      raise ValueError(msg)
+    concrete.append(float(value))
+  return tuple(concrete)
+
+
+def _optional_bool(value: object | None) -> bool | None:
+  """``bool(value)`` that keeps ``None`` as ``None`` (a tri-state flag's "unset")."""
+  return None if value is None else bool(value)
+
+
+def _optional_path(value: object | None) -> Path | None:
+  if value is None:
+    return None
+  if isinstance(value, Path):
+    return value
+  if isinstance(value, str):
+    return Path(value)
+  return Path(fspath(cast("PathLike[str]", value)))
+
+
+def _output_path(spec: object) -> Path | None:
+  raw = getattr(spec, "output_path", None)
+  if raw is None:
+    raw = getattr(spec, "output_zarr_path", None)
+  if raw is None:
+    raw = getattr(spec, "output_h5_path", None)
+  return _optional_path(raw)
+
+
+def _output_h5_path(spec: object) -> Path | None:
+  """Deprecated alias for _output_path."""
+  return _output_path(spec)
+
+
+def _infer_output_dir(spec: object) -> Path | None:
+  explicit = getattr(spec, "output_dir", None)
+  if explicit is not None:
+    return _optional_path(explicit)
+  out = _output_path(spec)
+  if out is not None:
+    return out.parent
+  cache = getattr(spec, "cache_path", None)
+  if cache is not None:
+    p = _optional_path(cache)
+    return p.parent if p is not None and p.suffix else p
+  # TODO(REFACTOR_ROADMAP §3.5): unify with explicit `output_dir` once call-sites migrate.
+  return None
+
+
+def _run_spec_precision_compute(spec: object) -> Literal["fp32", "fp16", "bf16"]:
+  """Resolve compute precision: training specs use ``precision``; otherwise default fp32."""
+  raw = getattr(spec, "precision", "fp32")
+  if raw in ("fp32", "fp16", "bf16"):
+    return cast("Literal['fp32', 'fp16', 'bf16']", raw)
+  return "fp32"
+
+
+def _coerce_max_buffer_size(spec: object) -> int | None:
+  """Optional positive buffer cap (bytes); ``None`` when unset or invalid."""
+  raw = getattr(spec, "max_buffer_size", None)
+  if raw is None:
+    return None
+  try:
+    v = int(raw.item()) if hasattr(raw, "item") else int(raw)
+  except (TypeError, ValueError):
+    return None
+  return v if v > 0 else None
+
+
+def _infer_sink_kind(spec: object) -> str:
+  if _output_path(spec) is not None:
+    return "zarr"
+  # IOConfig.sink_kind uses "zarr" | "none"; host tensor sinks register under OUTPUT_SINKS
+  # (e.g. "noop", "streaming_tensor_staging" — see aminx.run.output_sinks).
+  return "none"
+
+
+def _serialize_for_run_id(val: object) -> str | None:
+  """Deterministically serialize a spec field value for run_id hashing."""
+  if val is None:
+    return "None"
+  if val is UNSET:
+    return "UNSET"
+  if isinstance(val, bool):
+    return f"bool:{val}"
+  if isinstance(val, (int, np.integer)):
+    return f"int:{int(val)}"
+  if isinstance(val, (float, np.floating)):
+    return f"float:{float(val)!r}"
+  if isinstance(val, (str, Path, PathLike)):
+    return f"str:{fspath(val) if isinstance(val, (Path, PathLike)) else val}"
+  if isinstance(val, bytes):
+    return f"bytes:{val.hex()}"
+  if isinstance(val, io.StringIO):
+    return f"StringIO:{val.getvalue()}"
+  if isinstance(val, io.BytesIO):
+    return f"BytesIO:{val.getvalue().hex()}"
+  if isinstance(val, (np.ndarray, jax.Array)):
+    arr = np.ascontiguousarray(np.asarray(val))
+    arr_digest = hashlib.sha256(arr.tobytes()).hexdigest()
+    return f"array:{arr.dtype.str}:{arr.shape}:{arr_digest}"
+  if isinstance(val, Mapping):
+    items = [
+      f"{_serialize_for_run_id(k)}:{_serialize_for_run_id(v)}"
+      for k, v in sorted(val.items(), key=lambda kv: str(kv[0]))
+    ]
+    return "dict:{" + ",".join(items) + "}"
+  if isinstance(val, (list, tuple)):
+    return "seq:[" + ",".join(str(_serialize_for_run_id(x)) for x in val) + "]"
+  if is_dataclass(val):
+    dc_items = [
+      f"{f.name}:{_serialize_for_run_id(getattr(val, f.name))}"
+      for f in fields(val)
+      if not f.name.startswith("_")
+    ]
+    return f"dc:{val.__class__.__name__}{{" + ",".join(dc_items) + "}"
+  return None
+
+
+_RUN_ID_EXCLUDED_FIELDS: frozenset[str] = frozenset(
+  {
+    "run_id",
+    "output_path",
+    "output_zarr_path",
+    "output_h5_path",
+    "output_dir",
+    "run_spec",
+    "_run_spec_synced",
+  },
+)
+
+
+def _compute_deterministic_run_id(spec: object) -> str:
+  """Compute deterministic run_id from spec or its relevant fields (backlog-5560)."""
+  explicit = getattr(spec, "run_id", None)
+  if explicit:
+    return str(explicit)
+  hasher = hashlib.sha256()
+  hasher.update(spec.__class__.__name__.encode("utf-8") + b"\x00")
+  priority_fields = (
+    "model_name",
+    "model_version",
+    "model_weights",
+    "model_family",
+    "checkpoint_id",
+    "inputs",
+    "random_seed",
+    "seed",
+    "num_samples",
+    "temperature",
+    "sampling_strategy",
+    "spec_hash",
+  )
+  seen: set[str] = set()
+  for field_name in priority_fields:
+    seen.add(field_name)
+    val = getattr(spec, field_name, None)
+    if val is not None:
+      serialized = _serialize_for_run_id(val)
+      if serialized is not None:
+        hasher.update(f"{field_name}={serialized}\x00".encode())
+  all_keys: set[str] = set()
+  if is_dataclass(spec):
+    all_keys.update(f.name for f in fields(spec))
+  if hasattr(spec, "__dict__"):
+    all_keys.update(spec.__dict__.keys())
+  for k in sorted(all_keys):
+    if k.startswith("_") or k in seen or k in _RUN_ID_EXCLUDED_FIELDS:
+      continue
+    v = getattr(spec, k, None)
+    if v is None:
+      continue
+    serialized = _serialize_for_run_id(v)
+    if serialized is not None:
+      hasher.update(f"{k}={serialized}\x00".encode())
+  digest = hasher.hexdigest()
+  return f"run-{digest[:16]}"
+
+
+def _coerce_n_states(spec: object) -> int:
+  cs = getattr(spec, "conformational_states", None)
+  if cs is None:
+    return 1
+  ns = getattr(cs, "n_states", None)
+  if ns is None:
+    return 1
+  try:
+    if hasattr(ns, "item"):
+      return int(ns.item())
+    return int(ns)
+  except (TypeError, ValueError):
+    # TODO(REFACTOR_ROADMAP §3.5): stable int from `ProteinBundle` / stack shape.
+    return 1
+
+
+def _infer_multistate_mode(spec: object) -> str:
+  # TODO(REFACTOR_ROADMAP §3.3 `MULTISTATE_MODES`): replace placeholder with registry key
+  # derived from prep/model capabilities once `multistate_mode` leaves ad-hoc if-ladders.
+  if getattr(spec, "conformational_states", None) is not None:
+    return "conformational_context"
+  if _coerce_n_states(spec) > 1:
+    return "multi_state"
+  return "single"
+
+
+def _infer_n_devices(spec: object) -> int:
+  """Prefer explicit ``n_devices`` on the spec; else ``jax.local_device_count()``; else ``1``."""
+  raw = getattr(spec, "n_devices", None)
+  if raw is not None:
+    try:
+      if hasattr(raw, "item"):
+        return int(raw.item())
+      return int(raw)
+    except (TypeError, ValueError):
+      pass
+  try:
+    return int(jax.local_device_count())
+  except (RuntimeError, OSError, AttributeError, ImportError, ValueError):
+    return 1
+
+
+def topology_hash(plan: PlannerTopology) -> str:
+  """Deterministic 16-char hex hash of PlannerTopology for cache-key derivation.
+
+  Hashes PlannerTopology fields to produce a stable cache key for static-field identity.
+  Used to detect recompile requirements when topology changes between runs.
+
+  The payload dict is derived reflectively from PlannerTopology fields via dataclasses.fields(),
+  so new/removed fields are picked up automatically without manual updates.
+  """
+  payload = {f.name: getattr(plan, f.name) for f in fields(plan)}
+  hash_input = json.dumps(payload, sort_keys=True, default=str).encode()
+  return hashlib.sha256(hash_input).hexdigest()[:16]
+
+
+def _coerce_sharpness(value: object) -> float | None:
+  """Normalise a user-supplied ``multi_state_sharpness`` to ``float | None``.
+
+  ``None`` is a meaningful value here -- "scale by S, matching a plain product of
+  S experts" -- so it must survive rather than being coalesced to the 1.0 default.
+  Anything else is coerced to float, which surfaces a bad type as a TypeError at
+  spec-build time instead of silently reverting to unscaled fusion deep inside a
+  jitted decode.
+  """
+  if value is None:
+    return None
+  return float(value)
+
+
+def build_run_spec(spec: object) -> RunSpec:
+  """Build a :class:`RunSpec` view from a :class:`RunSpecification` (or subclass) instance."""
+  pre_idx = getattr(spec, "preprocessed_index_path", None)
+  io = IOConfig(
+    output_dir=_infer_output_dir(spec),
+    sink_kind=_infer_sink_kind(spec),
+    manifest_path=_optional_path(pre_idx),
+    output_path=_output_path(spec),
+    cache_path=_optional_path(getattr(spec, "cache_path", None)),
+  )
+
+  batch_size = int(getattr(spec, "batch_size", 32))
+  samples_batch = getattr(spec, "samples_batch_size", None)
+  resource = ResourceConfig(
+    n_devices=_infer_n_devices(spec),
+    sample_batch_size=int(samples_batch) if samples_batch is not None else batch_size,
+    structure_batch_size=batch_size,
+    max_buffer_size=_coerce_max_buffer_size(spec),
+  )
+
+  combine = getattr(spec, "multi_state_strategy", "arithmetic_mean")
+  multistate = MultistateConfig(
+    mode=_infer_multistate_mode(spec),
+    n_states=_coerce_n_states(spec),
+    combine_strategy=str(combine),
+  )
+
+  ctx_path = getattr(spec, "ligand_context_path", None)
+  ligand = LigandConfig(
+    model_family=str(getattr(spec, "model_family", "proteinmpnn")),
+    use_side_chain_context=getattr(spec, "ligand_mpnn_use_side_chain_context", None),
+    # Tri-state passes through unchanged: None ("use whatever is present") must not be
+    # collapsed to False ("ablate"). ScoringSpecification's field is a plain bool.
+    ligand_conditioning=_optional_bool(getattr(spec, "ligand_conditioning", None)),
+    sidechain_conditioning=bool(getattr(spec, "sidechain_conditioning", False)),
+    context_path=_optional_path(ctx_path),
+  )
+
+  grid = GridLineageConfig(
+    grid_mode=bool(getattr(spec, "grid_mode", False)),
+    campaign_mode=bool(getattr(spec, "campaign_mode", False)),
+    job_id=getattr(spec, "job_id", None),
+    chunk_id=getattr(spec, "chunk_id", None),
+    sample_start=getattr(spec, "sample_start", None),
+    sample_count=getattr(spec, "sample_count", None),
+  )
+
+  precision_config = PrecisionConfig(compute=_run_spec_precision_compute(spec))
+
+  plan = PlannerTopology(
+    use_unified_driver=bool(getattr(spec, "use_unified_driver", True)),
+  )
+
+  family = getattr(spec, "model_family", None)
+  potts_mpnn = getattr(spec, "potts_mpnn", None)
+  laser = getattr(spec, "laser", None)
+  protonpotts = getattr(spec, "protonpotts", None)
+  if potts_mpnn is not None and family != "pottsmpnn":
+    msg = f"potts_mpnn options require model_family 'pottsmpnn', got {family!r}"
+    raise ValueError(msg)
+  if protonpotts is not None and family != "protonpottsmpnn":
+    msg = f"protonpotts options require model_family 'protonpottsmpnn', got {family!r}"
+    raise ValueError(msg)
+  if laser is not None and family != "lasermpnn":
+    msg = f"laser options require model_family 'lasermpnn', got {family!r}"
+    raise ValueError(msg)
+  caliby = getattr(spec, "caliby", None)
+  fampnn = getattr(spec, "fampnn", None)
+  thermompnn = getattr(spec, "thermompnn", None)
+  if caliby is not None and family != "caliby":
+    msg = f"caliby options require model_family 'caliby', got {family!r}"
+    raise ValueError(msg)
+  if fampnn is not None and family != "fampnn":
+    msg = f"fampnn options require model_family 'fampnn', got {family!r}"
+    raise ValueError(msg)
+  if thermompnn is not None and family != "thermompnn":
+    msg = f"thermompnn options require model_family 'thermompnn', got {family!r}"
+    raise ValueError(msg)
+
+  omit_raw = getattr(spec, "omit_aa", ())
+  omit_aa = tuple(omit_raw) if omit_raw else ()
+
+  sampling = SamplingConfig(
+    num_samples=int(getattr(spec, "num_samples", 1) or 1),
+    random_seed=int(getattr(spec, "random_seed", 42)),
+    return_logits=bool(getattr(spec, "return_logits", False)),
+    compute_pseudo_perplexity=bool(getattr(spec, "compute_pseudo_perplexity", False)),
+    return_decoding_orders=bool(getattr(spec, "return_decoding_orders", False)),
+    return_logit_fingerprint=bool(getattr(spec, "return_logit_fingerprint", False)),
+    backbone_noise=_as_float_tuple(getattr(spec, "backbone_noise", None)),
+    temperature=_sampling_temperature_for_run_spec(spec),
+    omit_aa=omit_aa,
+    omit_aa_per_position=getattr(spec, "omit_aa_per_position", None),
+    bias=getattr(spec, "bias", None),
+    fixed_mask=getattr(spec, "fixed_mask", None),
+    fixed_positions=getattr(spec, "fixed_positions", None),
+    fixed_tokens=getattr(spec, "fixed_tokens", None),
+    sampling_strategy=str(getattr(spec, "sampling_strategy", "temperature") or "temperature"),
+    multi_state_strategy=str(
+      getattr(spec, "multi_state_strategy", "arithmetic_mean") or "arithmetic_mean",
+    ),
+    multi_state_temperature=float(getattr(spec, "multi_state_temperature", 1.0) or 1.0),
+    # `or`-coalescing is WRONG here: sharpness=None is a meaningful value ("use S"),
+    # not a missing one, and 0.0 would be a caller error worth surfacing rather than
+    # silently rewriting to 1.0. Use the sentinel-free getattr default instead.
+    multi_state_sharpness=_coerce_sharpness(getattr(spec, "multi_state_sharpness", 1.0)),
+    use_rolling_state=bool(getattr(spec, "use_rolling_state", False)),
+    decoding_order_fn=getattr(spec, "decoding_order_fn", None),
+    decoding_order_seed=getattr(spec, "decoding_order_seed", None),
+    fixed_position_context=getattr(spec, "fixed_position_context", "random_order"),
+    tie_group_map=getattr(spec, "tie_group_map", None),
+    state_position_map=getattr(spec, "state_position_map", None),
+    state_weights=getattr(spec, "state_weights", None),
+    structure_mapping=getattr(spec, "structure_mapping", None),
+    wave=getattr(spec, "wave", None),
+  )
+
+  return RunSpec(
+    seed=getattr(spec, "seed", 0),
+    axes=getattr(spec, "axes", []),
+    carry_specs=getattr(spec, "carry_specs", []),
+    boundaries=getattr(spec, "boundaries", None),
+    run_id=_compute_deterministic_run_id(spec),
+    io=io,
+    resource=resource,
+    multistate=multistate,
+    ligand=ligand,
+    grid=grid,
+    precision_config=precision_config,
+    plan=plan,
+    sampling=sampling,
+    potts_mpnn=potts_mpnn,
+    protonpotts=protonpotts,
+    laser=laser,
+    caliby=caliby,
+    fampnn=fampnn,
+    thermompnn=thermompnn,
+  )

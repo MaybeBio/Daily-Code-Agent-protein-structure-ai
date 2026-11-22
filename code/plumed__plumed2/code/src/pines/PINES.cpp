@@ -1,0 +1,970 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Copyright (c) 2023 of Nicholas Herringer and Siva Dasetty.
+
+The PINES module is free software: you can redistribute it and/or modify
+it under the terms of the GNU Lesser General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+The PINES module is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Lesser General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public License
+along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#include <string>
+#include <cmath>
+#include <iostream>
+#include <fstream>
+#include <cstdio>
+#include <unordered_map>
+#include <set>
+#include <numeric>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include <unordered_set>
+#include <utility>
+#include <functional>
+#include <vector>
+#include <tuple>
+#include <cstddef>
+
+#include "core/ActionWithVirtualAtom.h"
+#include "core/ActionWithValue.h"
+#include "core/PlumedMain.h"
+#include "tools/Stopwatch.h"
+#include "tools/PDB.h"
+#include "tools/Vector.h"
+#include "tools/AtomNumber.h"
+#include "tools/SwitchingFunction.h"
+#include "tools/Communicator.h"
+#include "tools/Units.h"
+
+#include "colvar/Colvar.h"
+#include "core/ActionRegister.h"
+#include "tools/OpenMP.h"
+
+
+
+namespace PLMD {
+namespace pines {
+
+struct AtomNumberLess {
+  bool operator()(const AtomNumber& a, const AtomNumber& b) const {
+    return a.index() < b.index();
+  }
+};
+
+struct AtomPair {
+  AtomNumber alpha_group;
+  AtomNumber beta_group;
+
+  // equality
+  bool operator==(const AtomPair& o) const noexcept {
+    return alpha_group == o.alpha_group && beta_group == o.beta_group;
+  }
+
+  // lexicographic ordering for std::set/std::map and sorting
+  bool operator<(const AtomPair& o) const noexcept {
+    return std::tie(alpha_group, beta_group) < std::tie(o.alpha_group, o.beta_group);
+  }
+};
+
+// non-member convenience operators
+inline bool operator!=(const AtomPair& a, const AtomPair& b) noexcept {
+  return !(a == b);
+}
+inline bool operator>(const AtomPair& a, const AtomPair& b) noexcept  {
+  return b < a;
+}
+inline bool operator<=(const AtomPair& a, const AtomPair& b) noexcept {
+  return !(b < a);
+}
+inline bool operator>=(const AtomPair& a, const AtomPair& b) noexcept {
+  return !(a < b);
+}
+
+
+class PINES      : public PLMD::colvar::Colvar {
+private:
+  PLMD::Stopwatch timer;
+  int N_Blocks;
+  int total_PIV_length;
+  int inited_step;
+  bool driver_mode;
+  bool freeze_selection;
+  std::vector<int> steps_since_update;
+  std::vector<int> nstride;
+  std::string ref_file;
+  std::vector<SwitchingFunction> sfs;
+  std::vector<std::string> sw;
+  std::vector<double> r00;
+  std::vector<std:: vector<double> > PIV;
+  std::vector<std:: vector<Vector> > ann_deriv;
+
+  std::vector<std:: vector<AtomNumber> > listall;
+  std::vector<std:: vector<AtomNumber> > listreduced;
+  std::set<AtomNumber, AtomNumberLess> listreducedall;
+  std::vector<AtomNumber> listreducedall_vec;
+  std::unordered_map<int,int> atom_ind_hashmap;
+
+  std::vector<bool> stale_tolerance;
+  PDB mypdb;
+  std::vector<std::string> block_params;
+  std::vector<std::array<std::vector<AtomNumber>,2> > block_groups_atom_list;
+  std::vector<int> block_lengths;
+  std::vector<int> Buffer_Pairs;
+  std::vector<int> tot_num_pairs;
+  std::vector<std::array<std::array<bool,3>,2> > input_filters;
+  std::vector<double> delta_pd;
+  std::vector<double> r_tolerance;
+  std::vector<std::vector<Vector> > PL_atoms_ref_coords;
+  std::vector<std::vector<AtomPair > > Exclude_Pairs;
+  std::vector<std::array<std::vector<std::string>, 2>> Name_list;
+  std::vector<std::array<std::vector<AtomNumber>, 2>> ID_list;
+  std::vector<std::array<std::vector<int>, 2>> ResID_list;
+  std::vector<char> all_g1g2_pairs;
+  std::vector<std::vector<std::pair<double, AtomPair > > > vecMaxHeapVecs;
+  std::vector<std::vector<AtomPair > > latched_pairs;
+  std::vector<int> preupdated_block;
+  std::vector<bool> isFirstBuild;
+
+  bool atomMatchesFilters(int n, int g, AtomNumber ind, int resid, const std::string& atom_name);
+  void buildMaxHeapVecBlock(int n, const PDB& refpdb, std::vector<std::pair<double, AtomPair>>& heap);
+  void updateBlockPairList(int n, std::vector<std::pair<double, AtomPair>>& heap);
+  double calculateDistance(int n, const AtomNumber& ind0, const AtomNumber& ind1, const PDB& refpdb);
+  std::ofstream log;
+  bool ensureBlockUpdated(int n);
+  void latchFromCurrentHeaps();
+  void logMsg(const std::string& msg, const std::string& section);
+  void logMsg(const Vector& vec, const std::string& section);
+  void resizeAllContainers(int N);
+
+public:
+  static void registerKeywords( Keywords& keys );
+  explicit PINES(const ActionOptions&);
+  //~PINES();
+  // active methods:
+  struct MinCompareDist {
+    bool operator()(const std::pair<double, AtomPair>& p1, const std::pair<double, AtomPair>& p2) {
+      return p1.first < p2.first; // Min heap
+    }
+  };
+  struct MaxCompareDist {
+    bool operator()(const std::pair<double, AtomPair>& p1, const std::pair<double, AtomPair>& p2) {
+      return p1.first > p2.first; // Max heap
+    }
+  };
+
+  void calculate() override;
+  void checkFieldsAllowed() override {}
+  // -- SD prepare to requestAtoms during simulation
+  void prepare() override;
+};
+//+PLUMEDOC COLVAR PINES
+/*
+Calculate the permutationally invariant PINES features of a configuration.
+
+PINES is a variant of the [PIV](PIV.md) collective variable that is discussed in the paper cited below.
+The input is organized in N_BLOCKS blocks. For each block two groups of atoms, G1 and G2, are selected
+from the atoms in the PDB file given with REF_FILE using any combination of atom indices (ATOMID),
+residue numbers (RESID) and atom names (NAME). PINES then computes the distances between all the atoms in G1 and all the atoms in G2,
+keeps the SIZE shortest distances, transforms them with the switching function given with the corresponding SWITCH keyword
+and sorts them. The output of each block is thus independent of the order of atoms within the two groups.
+
+Each element of the resulting vector is stored in a component called `ELEMENT-n` (with $n$ starting from 0), with
+the elements of block 1 coming first, followed by those of block 2 and so on. These components are typically used as the input of a neural network CV.
+
+To make the calculation cheaper, a pair list containing the SIZE+BUFFER shortest pairs of each block is used and rebuilt every PL_REFRESH steps.
+Pairs that should never be included in a block can be listed in EXCLUDE_PAIRS. When analyzing a trajectory with [driver](driver.md) the
+DRIVERMODE flag should be used so that the pair list is rebuilt at every frame.
+
+The following input computes the PINES features for a solution of NaCl in water, using as features the closest Na-Cl distance,
+the closest Na-water oxygen distance and the two closest Cl-water hydrogen distances.
+
+```plumed
+#SETTINGS INPUTFILES=regtest/pines/rt-pines/md.pdb
+PINES ...
+LABEL=pines
+REF_FILE=regtest/pines/rt-pines/md.pdb
+N_BLOCKS=3
+BLOCK1={
+    G1={NAME=NA}
+    G2={NAME=CL}
+    SIZE=1
+    BUFFER=0
+    PL_REFRESH=1
+}
+BLOCK2={
+    G1={NAME=NA}
+    G2={NAME=OW}
+    SIZE=1
+    BUFFER=20
+    PL_REFRESH=10
+}
+BLOCK3={
+    G1={NAME=CL}
+    G2={NAME={HW1 HW2}}
+    SIZE=2
+    BUFFER=10
+    PL_REFRESH=10
+}
+SWITCH1={RATIONAL R_0=0.38 MM=12 NN=6}
+SWITCH2={RATIONAL R_0=0.35 MM=12 NN=6}
+SWITCH3={RATIONAL R_0=0.28 MM=12 NN=6}
+... PINES
+
+PRINT ARG=pines.* FILE=colvar STRIDE=100
+```
+
+*/
+//+ENDPLUMEDOC
+PLUMED_REGISTER_ACTION(PINES, "PINES")
+constexpr int CACHE_LINE_SIZE = 64;
+
+template<typename T>
+struct alignas(CACHE_LINE_SIZE) Padded {
+  T value;
+
+  // Optional constructors
+  Padded() : value() {}
+  explicit Padded(const T& val) : value(val) {}
+};
+
+void PINES::registerKeywords(Keywords &keys) {
+  Colvar::registerKeywords(keys);
+  keys.add("numbered", "SWITCH", "The switching functions parameter. You must specify a Switching function for all PINES blocks."
+           "Details of the various switching functions you can use are provided in the documentation for LESS_THAN.");
+  keys.add("numbered", "BLOCK", "Each block of the PIV");
+  keys.add("compulsory", "REF_FILE", "PDB file name that contains the information about system connectivity and labels.");
+  keys.add("compulsory", "N_BLOCKS", "Number of blocks in PIV");
+  keys.add("optional", "G1", "The first group of atoms of a BLOCK, selected using ATOMID, RESID and/or NAME (used only inside BLOCK)");
+  keys.add("optional", "G2", "The second group of atoms of a BLOCK, selected using ATOMID, RESID and/or NAME (used only inside BLOCK)");
+  keys.add("compulsory", "BUFFER", "Number of additional pairwise distances to include as a buffer for each PIV block");
+  keys.add("compulsory", "PL_REFRESH", "Upper limit refresh rate for each block pair list");
+  keys.add("compulsory", "SIZE", "Length of each PIV Block");
+  keys.add("optional", "ATOMID", "Zero-based atom indices (ATOMID=0 is the first atom in REF_FILE) used to select the atoms in groups G1 and G2 of a BLOCK");
+  keys.add("optional", "RESID", "Residue numbers used to select the atoms in groups G1 and G2 of a BLOCK");
+  keys.add("optional", "NAME", "Atom names used to select the atoms in groups G1 and G2 of a BLOCK");
+  keys.add("optional", "EXCLUDE_PAIRS", "List of pairs of zero-based atom indices (given as consecutive numbers) whose distance should not be included in a BLOCK");
+  keys.addFlag("DRIVERMODE", false, "Use when post-processing a trajectory. This will force the pair list to be rebuilt at every step (i.e. no pair list)");
+  keys.addFlag("FREEZE_SELECTION", false, "Freeze top-K membership during derivative checks");
+  keys.addOutputComponent("ELEMENT", "default", "scalar", "Elements of the PINES block");
+  keys.addDOI("10.1021/acs.jctc.3c00923");
+  keys.reset_style("SWITCH", "compulsory");
+}
+
+bool PINES::atomMatchesFilters(int n, int g, AtomNumber ind, int resid, const std::string& atom_name) {
+  bool id_check = !input_filters[n][g][0];
+  bool res_check = !input_filters[n][g][1];
+  bool name_check = !input_filters[n][g][2];
+
+  if (input_filters[n][g][0]) {
+    for (auto& atomID : ID_list[n][g]) {
+      if (ind == atomID) {
+        id_check = true;
+        break;
+      }
+    }
+  }
+  if (input_filters[n][g][1]) {
+    for (auto& rID : ResID_list[n][g]) {
+      if (resid == rID) {
+        res_check = true;
+        break;
+      }
+    }
+  }
+  if (input_filters[n][g][2]) {
+    for (auto& name : Name_list[n][g]) {
+      if (atom_name == name) {
+        name_check = true;
+        break;
+      }
+    }
+  }
+  return id_check && res_check && name_check;
+}
+
+void PINES::buildMaxHeapVecBlock(int n, const PDB& refpdb, std::vector<std::pair<double, AtomPair>>& heap) {
+  // the threads of the loop below (see tools/OpenMP.h)
+  const int nthreads = OpenMP::getNumThreads();
+  std::vector<std::vector<std::pair<double, AtomPair>>> thread_heaps(nthreads);
+
+
+  // Rough estimate, tweak as needed
+  int estimated_pairs_per_thread = block_groups_atom_list[n][0].size() * block_groups_atom_list[n][1].size() / nthreads;
+
+  for (int tid = 0; tid < nthreads; ++tid) {
+    thread_heaps[tid].reserve(estimated_pairs_per_thread);
+  }
+
+  heap.clear();
+#ifdef _OPENMP
+  #pragma omp parallel for schedule(dynamic) num_threads(nthreads)
+#endif
+  for (int i = 0; i < static_cast<int>(block_groups_atom_list[n][0].size()); i++) {
+    AtomNumber ind0 = block_groups_atom_list[n][0][i];
+    Vector Pos0 = isFirstBuild[n] ? refpdb.getPosition(ind0) : getPosition(atom_ind_hashmap[ind0.index()]);
+#ifdef _OPENMP
+    int tid = omp_get_thread_num();
+#else
+    int tid = 0;
+#endif
+    auto& local_heap = thread_heaps[tid];
+    std::set<AtomPair> local_unique_pairs;
+
+
+    for (int j = 0; j < static_cast<int>(block_groups_atom_list[n][1].size()); j++) {
+      AtomNumber ind1 = block_groups_atom_list[n][1][j];
+      if (ind1 == ind0) {
+        continue;
+      }
+
+      AtomPair test_pair{ind0, ind1};
+      AtomPair reverse_pair{ind1, ind0};
+
+      if (std::find(Exclude_Pairs[n].begin(), Exclude_Pairs[n].end(), test_pair) != Exclude_Pairs[n].end() ||
+          std::find(Exclude_Pairs[n].begin(), Exclude_Pairs[n].end(), reverse_pair) != Exclude_Pairs[n].end()) {
+        continue;
+      }
+      if (local_unique_pairs.count(reverse_pair)) {
+        continue;
+      }
+      local_unique_pairs.insert(test_pair);
+
+      Vector Pos1 = isFirstBuild[n] ? refpdb.getPosition(ind1) : getPosition(atom_ind_hashmap[ind1.index()]);
+
+      double mag = pbcDistance(Pos0, Pos1).modulo();
+      local_heap.emplace_back(mag, test_pair);
+    }
+  }
+
+  // Flatten all thread-local heaps into one vector
+  std::vector<std::pair<double, AtomPair>> all_pairs;
+  for (auto& th : thread_heaps) {
+    all_pairs.insert(all_pairs.end(), th.begin(), th.end());
+  }
+
+  // Build max-heap from top-K shortest pairs
+  std::sort(all_pairs.begin(), all_pairs.end(), MinCompareDist());
+  size_t K = std::min(static_cast<size_t>(tot_num_pairs[n]), all_pairs.size());
+  heap.assign(all_pairs.begin(), all_pairs.begin() + K);
+
+  std::sort(heap.begin(), heap.end(), MaxCompareDist());
+  int chk1 = 0;
+  int chk2 = Buffer_Pairs[n];
+  delta_pd[n] = heap[chk1].first - heap[chk2].first;
+  r_tolerance[n] = delta_pd[n]/4;
+  listreduced[n].clear();
+  std::set<AtomNumber, AtomNumberLess> uniqueAtoms;
+  for (const auto& pair : heap) {
+    uniqueAtoms.insert(pair.second.alpha_group);  // Atom1
+    uniqueAtoms.insert(pair.second.beta_group); // Atom2
+  }
+  for (const auto& atom : uniqueAtoms) {
+    listreduced[n].push_back(atom);
+  }
+  if(driver_mode || isFirstBuild[n]) {
+    listreduced[n] = listall[n];
+  }
+  PL_atoms_ref_coords[n].resize(listreduced[n].size());
+  for (int i=0; i<static_cast<int>(listreduced[n].size()); i++) {
+    PL_atoms_ref_coords[n][i].zero();
+    PL_atoms_ref_coords[n][i] = isFirstBuild[n] ? refpdb.getPosition(listreduced[n][i]) : getPosition(atom_ind_hashmap[listreduced[n][i].index()]);
+  }
+  isFirstBuild[n] = false;
+
+}
+
+void PINES::updateBlockPairList(int n, std::vector<std::pair<double, AtomPair>>& heap) {
+  // This is separate from staleness, which triggers a refresh instead of an update.
+  // This is simply to update the pair distances in the MaxHeap/Pairlist with the new atom positions
+  // and rearrange the ordering in the MaxHeap/Pairlisat
+
+  plumed_massert((int)heap.size() >= tot_num_pairs[n], "heap too small");
+  plumed_massert(!listreducedall_vec.empty(), "positions requested before requestAtoms");
+
+#ifdef _OPENMP
+  #pragma omp parallel for num_threads(OpenMP::getNumThreads())
+#endif
+  for (int i = 0; i < tot_num_pairs[n]; i++) {
+    AtomNumber ind0 = heap[i].second.alpha_group;
+    AtomNumber ind1 = heap[i].second.beta_group;
+    auto it0 = atom_ind_hashmap.find(ind0.index());
+    auto it1 = atom_ind_hashmap.find(ind1.index());
+    plumed_massert(it0 != atom_ind_hashmap.end() && it1 != atom_ind_hashmap.end(),"updateBlockPairList: atom index not requested");
+    heap[i].first = calculateDistance(n,ind0,ind1,mypdb);
+  }
+  std::nth_element(heap.begin(), heap.begin() + block_lengths[n], heap.end(), MinCompareDist());
+  std::sort(heap.begin(), heap.begin() + block_lengths[n], MaxCompareDist());
+}
+
+double PINES::calculateDistance(int n, const AtomNumber& ind0, const AtomNumber& ind1, const PDB& refpdb) {
+  Vector Pos0 = isFirstBuild[n] ? refpdb.getPosition(ind0) : getPosition(atom_ind_hashmap[ind0.index()]);
+  Vector Pos1 = isFirstBuild[n] ? refpdb.getPosition(ind1) : getPosition(atom_ind_hashmap[ind1.index()]);
+  return pbcDistance(Pos0, Pos1).modulo();
+}
+
+void PINES::resizeAllContainers(int N) {
+  // Outer containers
+  nstride.assign(N,1);
+  steps_since_update.assign(N, 0);
+  block_params.resize(N);
+  block_groups_atom_list.assign(N, std::array<std::vector<PLMD::AtomNumber>, 2> { { {}, {} } });
+  block_lengths.assign(N, 0);
+  Buffer_Pairs.assign(N, 0);
+  tot_num_pairs.assign(N, 0);
+  Exclude_Pairs.resize(N);
+  all_g1g2_pairs.assign(N,false);
+  vecMaxHeapVecs.resize(N);
+  PIV.assign(N, std::vector<double> {});
+  listall.resize(N);
+  listreduced.resize(N);
+  stale_tolerance.assign(N,false);
+  r00.assign(N, 0.0);
+  sw.resize(N);
+  sfs.resize(N);
+  delta_pd.assign(N, 0.0);
+  r_tolerance.assign(N, 0.0);
+  PL_atoms_ref_coords.resize(N);
+  input_filters.assign(N, std::array<std::array<bool,3>, 2> { { {false,false,false}, {false,false,false} } });
+  ID_list.assign(N, std::array<std::vector<PLMD::AtomNumber>, 2> { { {}, {} } });
+  ResID_list.assign(N, std::array<std::vector<int>, 2> { { {}, {} } });
+  Name_list.assign(N, std::array<std::vector<std::string>, 2> { { {}, {} } });
+  atom_ind_hashmap.clear();
+  latched_pairs.resize(N);
+  isFirstBuild.assign(N,true);
+
+  // Per-block inner structures
+  for (int n = 0; n < N; n++) {
+    PL_atoms_ref_coords[n].resize(0);  // will be filled per atom if needed
+  }
+
+  // Final 3D input_filters init
+  for (int n = 0; n < N; n++) {
+    for (int g = 0; g < 2; g++) {
+      input_filters[n][g].fill(false);  // [ID, ResID, Name]
+    }
+  }
+}
+
+// member state
+// static long inited_step = -1;
+// static std::vector<char> preupdated_block;  // size N_Blocks, resets each step
+
+bool PINES::ensureBlockUpdated(int n) {
+  const bool do_update = true; //(plumed.getStep() == 0 || driver_mode);
+  if (!do_update) {
+    return false;  // not an update step
+  }
+  if ((int)vecMaxHeapVecs[n].size() != tot_num_pairs[n]) {
+    buildMaxHeapVecBlock(n, mypdb, vecMaxHeapVecs[n]);  // safe: PDB-based build
+  }
+  if (preupdated_block[n]) {
+    return false;  // already updated this step
+  }
+  updateBlockPairList(n, vecMaxHeapVecs[n]);            // uses getPosition(); safe in calculate()
+  preupdated_block[n] = 1;
+  return true;
+}
+
+void PINES::latchFromCurrentHeaps() {
+  if ((int)latched_pairs.size() != N_Blocks) {
+    latched_pairs.resize(N_Blocks);
+  }
+  for (int n = 0; n < N_Blocks; ++n) {
+    latched_pairs[n].resize(block_lengths[n]);
+    const bool do_update = true; // (plumed.getStep() == 0 || steps_since_update[n] != 1 || driver_mode);
+    if (do_update) {
+      // top-K prefix (already sorted by ensureBlockUpdated if it ran)
+      for (int i = 0; i < block_lengths[n]; ++i) {
+        latched_pairs[n][i] = vecMaxHeapVecs[n][i].second;
+      }
+    } else {
+      // buffered slice
+      for (int i = 0; i < block_lengths[n]; ++i) {
+        latched_pairs[n][i] = vecMaxHeapVecs[n][i + Buffer_Pairs[n]].second;
+      }
+    }
+  }
+}
+
+void PINES::logMsg(const std::string& msg, const std::string& section) {
+  log << "[" << plumed.getStep() << "] "
+      << "[" << section << "] " << msg << std::endl;
+}
+
+void PINES::logMsg(const Vector& vec, const std::string& section) {
+  log << "[" << plumed.getStep() << "] "
+      << "[" << section << "] Vector = ("
+      << vec[0] << ", " << vec[1] << ", " << vec[2] << ")" << std::endl;
+}
+
+PINES::PINES(const ActionOptions &ao) : PLUMED_COLVAR_INIT(ao),
+  N_Blocks(),
+  total_PIV_length(),
+  inited_step(-1),
+  driver_mode(),
+  freeze_selection(),
+  steps_since_update(),
+  nstride(),
+  ref_file(),
+  sfs(),
+  sw(),
+  r00(),
+  PIV(),
+  ann_deriv(),
+  listall(),
+  listreduced(),
+  listreducedall(),
+  listreducedall_vec(),
+  atom_ind_hashmap(),
+  stale_tolerance(),
+  mypdb(),
+  block_params(),
+  block_groups_atom_list(),
+  block_lengths(),
+  Buffer_Pairs(),
+  tot_num_pairs(),
+  input_filters(),
+  delta_pd(),
+  r_tolerance(),
+  PL_atoms_ref_coords(),
+  Exclude_Pairs(),
+  Name_list(),
+  ID_list(),
+  ResID_list(),
+  all_g1g2_pairs(),
+  vecMaxHeapVecs(),
+  latched_pairs(),
+  preupdated_block(),
+  isFirstBuild() {
+  log.open("pines_debug.log", std::ios::out);
+  if (!log.is_open()) {
+    error("Failed to open debug log file.");
+  }
+
+  // Reference PDB file from which atom names, types, ids, and initial positions are determined
+  parse("REF_FILE", ref_file);
+  FILE *fp = fopen(ref_file.c_str(), "r");
+  if (fp != NULL) {
+    mypdb.readFromFilepointer(fp, usingNaturalUnits(), 0.1 / getUnits().getLength());
+    fclose(fp);
+  } else {
+    error("Error in reference PDB file");
+  }
+
+  // Create variable to get number of blocks
+  parse("N_BLOCKS", N_Blocks);
+  parseFlag("DRIVERMODE", driver_mode);
+  parseFlag("FREEZE_SELECTION", freeze_selection);
+  resizeAllContainers(N_Blocks);
+
+
+  // Check that the correct number of Blocks are specified
+  for (int n = 0; n < N_Blocks; n++) {
+    if (!parseNumbered("BLOCK", n + 1, block_params[n])) {
+      break;
+    }
+  }
+
+  // Parse blocks for keywords
+  for (int n = 0; n < N_Blocks; n++) {
+    std::string block_length;
+    std::vector<std::string> ex_pairs_n;
+    std::vector<std::string> g1_ids;
+    std::vector<std::string> g2_ids;
+    std::vector<std::string> g1_resids;
+    std::vector<std::string> g2_resids;
+    std::vector<std::string> g1_names;
+    std::vector<std::string> g2_names;
+
+    std::vector<std::string> block_data = Tools::getWords(block_params[n]);
+
+    std::vector<std::string> G1_data;
+    Tools::parseVector(block_data, "G1", G1_data, -1);
+
+    std::vector<std::string> G2_data;
+    Tools::parseVector(block_data, "G2", G2_data, -1);
+
+    Tools::parseVector(G1_data, "ATOMID", g1_ids, -1);
+
+    for (int i = 0; i < static_cast<int>(g1_ids.size()); i++) {
+      AtomNumber g1i;
+      g1i.setIndex(std::stoi(g1_ids[i]));
+      ID_list[n][0].push_back(g1i);
+    }
+
+    Tools::parseVector(G2_data, "ATOMID", g2_ids, -1);
+
+    for (int i = 0; i < static_cast<int>(g2_ids.size()); i++) {
+      AtomNumber g2i;
+      g2i.setIndex(std::stoi(g2_ids[i]));
+      ID_list[n][1].push_back(g2i);
+    }
+
+    Tools::parseVector(G1_data, "RESID", g1_resids, -1);
+    for (int i = 0; i < static_cast<int>(g1_resids.size()); i++) {
+      ResID_list[n][0].push_back(std::stoi(g1_resids[i]));
+    }
+    Tools::parseVector(G2_data, "RESID", g2_resids, -1);
+    for (int i = 0; i < static_cast<int>(g2_resids.size()); i++) {
+      ResID_list[n][1].push_back(std::stoi(g2_resids[i]));
+    }
+    Tools::parseVector(G1_data, "NAME", g1_names, -1);
+    for (int i = 0; i < static_cast<int>(g1_names.size()); i++) {
+      Name_list[n][0].push_back(g1_names[i]);
+    }
+    Tools::parseVector(G2_data, "NAME", g2_names, -1);
+    for (int i = 0; i < static_cast<int>(g2_names.size()); i++) {
+      Name_list[n][1].push_back(g2_names[i]);
+    }
+
+    Tools::parse(block_data, "SIZE", block_length);
+    block_lengths[n] = std::stoi(block_length);
+
+    Tools::parseVector(block_data, "EXCLUDE_PAIRS", ex_pairs_n, -1);
+    if (!ex_pairs_n.empty()) {
+      for (int i = 0; i < static_cast<int>(ex_pairs_n.size() - 1); i+=2) {
+        AtomNumber atom1;
+        atom1.setIndex(std::stoi(ex_pairs_n[i]));
+        AtomNumber atom2;
+        atom2.setIndex(std::stoi(ex_pairs_n[i+1]));
+
+        AtomPair excluded_pair;
+        excluded_pair = {atom1, atom2};
+        Exclude_Pairs[n].push_back(excluded_pair);
+      }
+    }
+    std::string buffer_pairs;
+    std::string pl_refresh;
+    Tools::parse(block_data, "BUFFER", buffer_pairs);
+    Tools::parse(block_data, "PL_REFRESH", pl_refresh);
+
+    if (!buffer_pairs.empty()) {
+      Buffer_Pairs[n] = std::stoi(buffer_pairs);
+    } else {
+      Buffer_Pairs[n] = 0;
+    }
+
+    if (!pl_refresh.empty()) {
+      nstride[n] = std::stoi(pl_refresh);
+    } else {
+      nstride[n] = 25;
+    }
+    tot_num_pairs[n] = block_lengths[n] + Buffer_Pairs[n];
+  }
+
+  total_PIV_length = std::accumulate(block_lengths.begin(), block_lengths.end(), 0);
+  for (int n = 0; n < N_Blocks; n++) {
+    // pseudo-code ish
+    for (int g = 0; g < 2; g++) {
+      if (ID_list[n][g].size() > 0) {
+        input_filters[n][g][0] = true;
+      }
+      if (ResID_list[n][g].size() > 0) {
+        input_filters[n][g][1] = true;
+      }
+      if (Name_list[n][g].size() > 0) {
+        input_filters[n][g][2] = true;
+      }
+    }
+  }
+
+  for (int n=0; n < N_Blocks; n++) {
+    listall[n].clear();
+  }
+
+  for (int i=0; i < static_cast<int>(mypdb.getAtomNumbers().size()); i++) {
+    AtomNumber ind = mypdb.getAtomNumbers()[i];
+    int resid = mypdb.getResidueNumber(ind);
+    std::string atom_name = mypdb.getAtomName(ind);
+    for (int n = 0; n < N_Blocks; n++) {
+      bool atom_added = false;
+      for (int g = 0; g < 2; g++) {
+        if (atomMatchesFilters(n, g, ind, resid, atom_name)) {
+          block_groups_atom_list[n][g].push_back(ind);
+          atom_added = true;
+        }
+      }
+      if (atom_added) {
+        listall[n].push_back(ind);
+      }
+    }
+  }
+
+  int g1g2_pairs;
+  for (int n = 0; n < N_Blocks; n++) {
+    g1g2_pairs = block_groups_atom_list[n][0].size() * block_groups_atom_list[n][1].size() - Exclude_Pairs[n].size();
+    if (g1g2_pairs == tot_num_pairs[n]) {
+      all_g1g2_pairs[n] = 1;
+    } else {
+      all_g1g2_pairs[n] = 0;
+    }
+  }
+
+  for (int n = 0; n < N_Blocks; n++)
+    if (!parseNumbered("SWITCH", n + 1, sw[n])) {
+      break;
+    }
+
+  std::string errors;
+  for (int n = 0; n < N_Blocks; n++) {
+    sfs[n].set(sw[n], errors);
+    std::string num;
+    Tools::convert(n + 1, num);
+    if (errors.length() != 0) {
+      error("problem reading SWITCH" + num + " keyword : " + errors);
+    }
+    r00[n] = sfs[n].get_r0();
+  }
+  checkRead();
+
+  int total_count = 0;
+  for (int n = 0; n < N_Blocks; n++) {
+    for (int i = 0; i < block_lengths[n]; i++) {
+      std::string comp = "ELEMENT-" + std::to_string(total_count);
+      addComponentWithDerivatives(comp);
+      componentIsNotPeriodic(comp);
+      total_count += 1;
+    }
+  }
+}
+
+void PINES::prepare() {
+  bool heap_refreshed = false;
+  bool stale_refresh_prep = false;
+  for (int n = 0; n < N_Blocks; n++) {
+    if (steps_since_update[n] == 0 || plumed.getStep() == 0 || driver_mode || (int)vecMaxHeapVecs[n].size() != tot_num_pairs[n]) {
+      buildMaxHeapVecBlock(n, mypdb, vecMaxHeapVecs[n]);
+      heap_refreshed = true;
+    } else if((steps_since_update[n] >= nstride[n] || stale_tolerance[n]) && !all_g1g2_pairs[n]) {
+      listreduced[n] = listall[n];
+      stale_refresh_prep = true;
+      steps_since_update[n] = -1;
+      stale_tolerance[n] = false;
+    }
+    steps_since_update[n]+=1;
+  }
+  if (heap_refreshed || stale_refresh_prep) {
+    // Collate all atoms from all lists
+    listreducedall.clear();
+    for (const auto& blockList : listreduced) {        // Loop over each block's vector
+      listreducedall.insert(blockList.begin(), blockList.end()); // Insert all atoms into set
+    }
+    atom_ind_hashmap.clear();
+    listreducedall_vec = std::vector<AtomNumber>(listreducedall.begin(), listreducedall.end());
+    for (int i=0; i < static_cast<int>(listreducedall_vec.size()); i++) {
+      atom_ind_hashmap[listreducedall_vec[i].index()] = i;
+    }
+    requestAtoms(listreducedall_vec);
+    ann_deriv.resize(listreducedall_vec.size());
+
+    for (int i=0; i < static_cast<int>(ann_deriv.size()); i++) {
+      ann_deriv[i].resize(total_PIV_length);
+    }
+
+  }
+}
+
+void PINES::calculate() {
+  const long step = plumed.getStep();
+  if (inited_step == -1) {
+    for (int n =0; n < N_Blocks; n++) {
+      buildMaxHeapVecBlock(n, mypdb, vecMaxHeapVecs[n]);
+    }
+  }
+  if (step != inited_step) {
+    if ((int)preupdated_block.size() != N_Blocks) {
+      preupdated_block.assign(N_Blocks, 0);
+    } else {
+      std::fill(preupdated_block.begin(), preupdated_block.end(), 0);
+    }
+
+    // One pass: ensure any block that should update does so now (once per step)
+    for (int n = 0; n < N_Blocks; n++) {
+      ensureBlockUpdated(n);
+    }
+
+    // Optional: latch here (membership/order frozen for this step)
+    if (freeze_selection) {
+      latchFromCurrentHeaps();
+    }
+
+    for (int n = 0; n < N_Blocks; n++) {
+      logMsg("_________________N: "+std::to_string(n)+"____________________\n","Calculate");
+      for (int p = 0; p < static_cast<int>(vecMaxHeapVecs[n].size()); p++) {
+        logMsg("P: "+std::to_string(vecMaxHeapVecs[n][p].first)+"\n","Calculate");
+      }
+    }
+    inited_step = step;
+  }
+
+  Vector ref_xyz, step_xyz;
+  AtomNumber aID;
+  double delta_r;
+
+
+  for(int n = 0; n < N_Blocks; n++) {
+    if(steps_since_update[n] > 0 && steps_since_update[n] < nstride[n] && r_tolerance[n] > 0.0 && !all_g1g2_pairs[n]) {
+      for(int i = 0; i < static_cast<int>(listreduced[n].size()); i++) {
+        aID = listreduced[n][i];
+        ref_xyz = PL_atoms_ref_coords[n][i];
+        step_xyz = getPosition(atom_ind_hashmap[aID.index()]);
+        delta_r = pbcDistance(ref_xyz, step_xyz).modulo();
+        if(delta_r >= r_tolerance[n]) {
+          stale_tolerance[n] = true;
+        }
+      }
+    }
+  }
+  const Vector zeroVec(0., 0., 0.);
+#ifdef _OPENMP
+  #pragma omp parallel for schedule(static) num_threads(OpenMP::getNumThreads())
+#endif
+  for (unsigned j = 0; j < ann_deriv.size(); j++) {
+    for (unsigned i = 0; i < ann_deriv[j].size(); i++) {
+      ann_deriv[j][i] = zeroVec;
+    }
+  }
+
+#ifdef _OPENMP
+  #pragma omp parallel for schedule(static) num_threads(OpenMP::getNumThreads())
+#endif
+  for (int n = 0; n < N_Blocks; n++) {
+    PIV[n].resize(block_lengths[n]);
+    for (int i = 0; i < block_lengths[n]; i++) {
+      PIV[n][i] = 0.;
+    }
+  }
+
+
+
+
+
+  int PINES_element = 0;
+  if (freeze_selection) {
+    for (int n = 0; n < N_Blocks; ++n) {
+      logMsg("***************N: "+std::to_string(n)+"***************\n","bigCalc");
+      for (int i = 0; i < block_lengths[n]; ++i) {
+        const auto& pr = latched_pairs[n][i];
+        int a0 = atom_ind_hashmap[pr.alpha_group.index()];
+        int a1 = atom_ind_hashmap[pr.beta_group.index()];
+        Vector r0 = getPosition(a0);
+        Vector r1 = getPosition(a1);
+        double mod_dist = pbcDistance(r0, r1).modulo();
+        Vector dr = pbcDistance(r0, r1) / mod_dist;
+        logMsg("P: "+std::to_string(vecMaxHeapVecs[n][i].first)+"\n","bigCalc");
+
+        double dfunc = 0.0;
+        PIV[n][i] = sfs[n].calculate(mod_dist, dfunc);
+        double ds = dfunc * mod_dist;
+        ann_deriv[a0][PINES_element] = -ds * dr;
+        ann_deriv[a1][PINES_element] =  ds * dr;
+        PINES_element += 1;
+      }
+    }
+  } else {
+    for (int n = 0; n < N_Blocks; n++) {
+
+      ensureBlockUpdated(n);
+      bool updated = true;
+      for (int i=0; i < block_lengths[n]; i++) {
+        double ds_element = 0.;
+        double dfunc = 0.;
+        int local_aid0, local_aid1;
+        int piv_ind;
+        if (updated) {
+          piv_ind = i;
+        } else {
+          piv_ind = i + Buffer_Pairs[n];
+        }
+        PIV[n][i] = sfs[n].calculate(vecMaxHeapVecs[n][piv_ind].first, dfunc);
+        local_aid0 = atom_ind_hashmap[vecMaxHeapVecs[n][piv_ind].second.alpha_group.index()];
+        local_aid1 = atom_ind_hashmap[vecMaxHeapVecs[n][piv_ind].second.beta_group.index()];
+        Vector Pos0 = getPosition(local_aid0);
+        Vector Pos1 = getPosition(local_aid1);
+        Vector dr_dcoord = pbcDistance(Pos0, Pos1) / vecMaxHeapVecs[n][piv_ind].first;
+        ds_element = dfunc * vecMaxHeapVecs[n][piv_ind].first;
+        ann_deriv[local_aid0][PINES_element] = -ds_element * dr_dcoord;
+        ann_deriv[local_aid1][PINES_element] = ds_element * dr_dcoord;
+        PINES_element += 1;
+      }
+    }
+  }
+
+
+  // every process computes all the elements (the work is not divided among the processes): no sum over processes
+
+  //timer.start("valuePass");
+  // Pass values and derivates to next stage
+  unsigned total_count = 0;
+  for (int j = 0; j < N_Blocks; j++) {
+    for (int i = 0; i < block_lengths[j]; i++) {
+      std::string comp = "ELEMENT-" + std::to_string(total_count);
+      Value *valueNew = getPntrToComponent(comp);
+      valueNew->set(PIV[j][i]);
+      for (unsigned k = 0; k < ann_deriv.size(); k++) {
+        setAtomsDerivatives(valueNew, k, ann_deriv[k][total_count]);
+      }
+      total_count += 1;
+    }
+  }
+
+  const int Natoms = static_cast<int>(ann_deriv.size());
+
+// Precompute current box and fractional (scaled) coords once per step
+  Tensor box = getPbc().getBox();
+  std::vector<Vector> scaled(Natoms);
+  for (int a = 0; a < Natoms; ++a) {
+    scaled[a] = getPbc().realToScaled(getPosition(a));
+  }
+
+// Build one virial tensor per component (column)
+  std::vector<Tensor> virials(total_PIV_length);
+  for (int col = 0; col < total_PIV_length; ++col) {
+    Tensor dSdB;
+    dSdB.zero();                 // ∂S/∂B at fixed scaled coords
+
+    // dSdB = sum_i  s_i ⊗ g_i  with s_i = scaled (fractional), g_i = ∂S/∂r_i
+    for (int a = 0; a < Natoms; ++a) {
+      const Vector& gi = ann_deriv[a][col];   // atomic gradient for this component
+      if (gi[0]==0.0 && gi[1]==0.0 && gi[2]==0.0) {
+        continue;
+      }
+      const Vector& si = scaled[a];
+
+      // Outer product: (∂S/∂B)_{ik} += s_i[i] * g_i[k]
+      dSdB(0,0) += si[0]*gi[0];
+      dSdB(0,1) += si[0]*gi[1];
+      dSdB(0,2) += si[0]*gi[2];
+      dSdB(1,0) += si[1]*gi[0];
+      dSdB(1,1) += si[1]*gi[1];
+      dSdB(1,2) += si[1]*gi[2];
+      dSdB(2,0) += si[2]*gi[0];
+      dSdB(2,1) += si[2]*gi[1];
+      dSdB(2,2) += si[2]*gi[2];
+    }
+
+    // PLUMED numerical uses: virial = - B^T * (∂S/∂B)
+    virials[col] = - matmul(box.transpose(), dSdB);
+  }
+
+  for (int col = 0; col < total_PIV_length; ++col) {
+    // If you already have the Value* via getPntrToComponent("ELEMENT-<col>"), reuse it.
+    // Otherwise copyOutput(col) is fine here.
+    Value* v = copyOutput(col);
+
+    for (int i = 0; i < 3; ++i) {      // i = column
+      for (int k = 0; k < 3; ++k) {    // k = row
+        v->addDerivative(3*Natoms + 3*k + i, virials[col](k,i));
+      }
+    }
+  }
+}
+}
+}

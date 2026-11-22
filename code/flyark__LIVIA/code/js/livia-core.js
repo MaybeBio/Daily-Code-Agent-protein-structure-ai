@@ -1,0 +1,264 @@
+/**
+ * livia-core.js — Shared core utilities for LIVIA tool pages
+ *
+ * Provides:
+ *   esc()                  — HTML escaping
+ *   ilisColor()            — iLIS FPR coloring with thresholds
+ *   parseResidueRanges()   — parse residue range strings to Set of ints
+ *   resSpec()              — ChimeraX residue spec builder
+ *   fillGaps()             — fill gaps in residue position sets
+ *   filterSmallSegments()  — remove LIR segments below minimum size
+ *   getGapFillValue()      — read gap-fill-input element value
+ *   getMinSegmentValue()   — read min-segment-input element value
+ *   rangesStr()            — compact range string for display
+ *   hexToRgba()            — hex color to rgba string
+ *   lightenColor()         — lighten a hex color by amount
+ *   CORS_PROXIES           — array of CORS proxy URL builders
+ *   skipDirectFetch()      — true for hosts that never send CORS headers (go straight to the proxy)
+ *   fetchTextViaProxy()    — generic proxy-based fetch with direct-first fallback
+ *   fetchStructureTextViaProxy() — PDB/structure fetch that falls back to a gzipped sibling
+ *   AA3TO1                 — amino acid 3-letter to 1-letter mapping
+ *   LIVIA_PROXY            — address of the LIVIA proxy (the only place it is set)
+ */
+
+// ── LIVIA proxy ──
+// The one setting for the proxy address. An independent installation deploys tools/cloudflare-worker/worker.js
+// to its own Cloudflare account (tools/cloudflare-worker/README.md) and puts that worker's address here, or defines
+// window.LIVIA_CONFIG = { proxy: '...' } before this script loads.
+const LIVIA_PROXY = (window.LIVIA_CONFIG && window.LIVIA_CONFIG.proxy) || 'https://livia-proxy.flyark.workers.dev';
+
+// ── HTML escaping ──
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ── iLIS FPR coloring (purple/green/amber/gray thresholds) ──
+function ilisColor(val, isAvg) {
+    // text shades of the band colors, at least 4.5:1 on white and on the table's row highlights
+    const color = isAvg
+        ? (val >= 0.268 ? '#6B21A8' : val >= 0.120 ? '#0C735C' : val >= 0.072 ? '#875F00' : '#5F6771')
+        : (val >= 0.551 ? '#6B21A8' : val >= 0.339 ? '#0C735C' : val >= 0.223 ? '#875F00' : '#5F6771');
+    return '<span style="color:' + color + '; font-weight:700;">' + val.toFixed(3) + '</span>';
+}
+
+// ── Parse residue ranges: '["107-114","117","120-121"]' → Set of ints ──
+function parseResidueRanges(raw) {
+    if (!raw || raw === '[]') return new Set();
+    let items;
+    try { items = JSON.parse(raw); } catch {
+        items = raw.match(/[\d]+-[\d]+|\d+/g) || [];
+    }
+    const positions = new Set();
+    for (const item of items) {
+        const s = String(item).trim();
+        if (s.includes('-')) {
+            const [a, b] = s.split('-').map(Number);
+            for (let i = a; i <= b; i++) positions.add(i);
+        } else {
+            const n = parseInt(s);
+            if (!isNaN(n)) positions.add(n);
+        }
+    }
+    return positions;
+}
+
+// ── Build ChimeraX residue spec ──
+function resSpec(positions, chain) {
+    if (positions.size === 0) return '';
+    const sorted = [...positions].sort((a, b) => a - b);
+    const ranges = [];
+    let start = sorted[0], end = sorted[0];
+    for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i] === end + 1) { end = sorted[i]; }
+        else { ranges.push(start === end ? `${start}` : `${start}-${end}`); start = end = sorted[i]; }
+    }
+    ranges.push(start === end ? `${start}` : `${start}-${end}`);
+    return `/${chain}:${ranges.join(',')}`;
+}
+
+// ── Read gap-fill input value (default 10) ──
+function getGapFillValue() {
+    const el = document.getElementById('gap-fill-input');
+    return el ? parseInt(el.value) || 10 : 10;
+}
+
+// ── Read min-segment input value (default 3) ──
+function getMinSegmentValue() {
+    const el = document.getElementById('min-segment-input');
+    return el ? parseInt(el.value) || 3 : 3;
+}
+
+// ── Remove LIR segments shorter than minSize residues ──
+function filterSmallSegments(positions, minSize) {
+    if (minSize === undefined) minSize = getMinSegmentValue();
+    if (minSize <= 1 || positions.size === 0) return positions;
+    const sorted = [...positions].sort((a, b) => a - b);
+    const segments = [];
+    let seg = [sorted[0]];
+    for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i] === seg[seg.length - 1] + 1) {
+            seg.push(sorted[i]);
+        } else {
+            segments.push(seg);
+            seg = [sorted[i]];
+        }
+    }
+    segments.push(seg);
+    const result = new Set();
+    for (const s of segments) {
+        if (s.length >= minSize) {
+            for (const r of s) result.add(r);
+        }
+    }
+    return result;
+}
+
+// ── Fill gaps for continuous cartoon ──
+function fillGaps(positions, maxGap) {
+    if (maxGap === undefined) maxGap = getGapFillValue();
+    if (positions.size === 0) return new Set();
+    const sorted = [...positions].sort((a, b) => a - b);
+    const filled = new Set(sorted);
+    for (let i = 0; i < sorted.length - 1; i++) {
+        const gap = sorted[i + 1] - sorted[i] - 1;
+        if (gap > 0 && gap <= maxGap) {
+            for (let j = sorted[i] + 1; j < sorted[i + 1]; j++) filled.add(j);
+        }
+    }
+    return filled;
+}
+
+// ── Compact range string for display (merges within 15 residues) ──
+function rangesStr(positions) {
+    if (positions.size === 0) return 'none';
+    const sorted = [...positions].sort((a, b) => a - b);
+    const ranges = [];
+    let start = sorted[0], end = sorted[0];
+    for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i] <= end + 15) { end = sorted[i]; }
+        else { ranges.push(`${start}-${end}`); start = end = sorted[i]; }
+    }
+    ranges.push(`${start}-${end}`);
+    return ranges.join(', ');
+}
+
+// ── Hex color to rgba string ──
+function hexToRgba(hex, alpha) {
+    hex = hex.replace('#', '');
+    if (hex.length === 3) hex = hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2];
+    const r = parseInt(hex.substring(0, 2), 16);
+    const g = parseInt(hex.substring(2, 4), 16);
+    const b = parseInt(hex.substring(4, 6), 16);
+    return `rgba(${r},${g},${b},${alpha})`;
+}
+
+// ── Lighten a hex color by amount (0–1) ──
+function lightenColor(hex, amount) {
+    hex = hex.replace('#', '');
+    if (hex.length === 3) hex = hex[0]+hex[0]+hex[1]+hex[1]+hex[2]+hex[2];
+    const r = parseInt(hex.substring(0, 2), 16);
+    const g = parseInt(hex.substring(2, 4), 16);
+    const b = parseInt(hex.substring(4, 6), 16);
+    return `rgb(${Math.round(r+(255-r)*amount)},${Math.round(g+(255-g)*amount)},${Math.round(b+(255-b)*amount)})`;
+}
+
+// ── CORS proxy URL builders ──
+// The LIVIA proxy, a Cloudflare Worker (source: tools/cloudflare-worker/worker.js; address: LIVIA_PROXY above).
+// Removed: api.codetabs.com / api.allorigins.win — both went offline in 2026.
+const CORS_PROXIES = [
+    url => `${LIVIA_PROXY}/?url=${encodeURIComponent(url)}`,
+];
+
+// ── Hosts that never send CORS headers ──
+// A direct browser fetch to these always fails, and only after their server has done the full
+// work (0.2-1 s per call), so trying direct first just adds that time to every call before the
+// proxy retry. Requests to them go straight to the proxy.
+const NO_CORS_HOSTS = ['www.flyrnai.org', 'flyrnai.org'];
+function skipDirectFetch(url) {
+    try { return NO_CORS_HOSTS.includes(new URL(url, location.href).hostname); } catch { return false; }
+}
+
+// ── Generic proxy fetch (tries direct first, then each proxy) ──
+async function fetchTextViaProxy(url) {
+    // Try direct first, unless the host is known to refuse cross-site requests
+    if (!skipDirectFetch(url)) {
+        try {
+            const resp = await fetch(url);
+            if (resp.ok) return await resp.text();
+        } catch {}
+    }
+    // Try proxies
+    for (const makeProxy of CORS_PROXIES) {
+        try {
+            const resp = await fetch(makeProxy(url), { signal: AbortSignal.timeout(10000) });
+            if (resp.ok) {
+                const text = await resp.text();
+                if (text.length > 100) return text;
+            }
+        } catch {}
+    }
+    return null;
+}
+
+// ── Fetch + gunzip a resource through the same proxy chain as fetchTextViaProxy ──
+// For sources that serve gzip-compressed bytes at a URL, decoded with the browser's built-in
+// DecompressionStream — no external library needed (same technique universal.html uses for
+// dropped .gz files).
+async function fetchGzipTextViaProxy(url) {
+    async function tryDecode(resp) {
+        if (!resp || !resp.ok || !resp.body) return null;
+        try {
+            const ds = new DecompressionStream('gzip');
+            const buf = await new Response(resp.body.pipeThrough(ds)).arrayBuffer();
+            const text = new TextDecoder().decode(buf);
+            return text.length > 100 ? text : null;
+        } catch { return null; }
+    }
+    if (!skipDirectFetch(url)) {
+        try {
+            const text = await tryDecode(await fetch(url));
+            if (text) return text;
+        } catch {}
+    }
+    for (const makeProxy of CORS_PROXIES) {
+        try {
+            const text = await tryDecode(await fetch(makeProxy(url), { signal: AbortSignal.timeout(15000) }));
+            if (text) return text;
+        } catch {}
+    }
+    return null;
+}
+
+// ── Fetch a structure file (PDB/CIF) that may live at <url> or, if the plain path fails, at
+// <url>.gz (gzip-compressed, same content) — tries plain first, falls back to the gz sibling and
+// gunzips client-side. FlyPredictome moved colabfold-output storage to gzip-on-disk in 2026-09
+// without updating the URLs it advertises in its own HTML, so the plain filename now 500s while
+// the .gz sibling still serves the real file — this is the recovery path for that.
+async function fetchStructureTextViaProxy(url) {
+    const direct = await fetchTextViaProxy(url);
+    if (direct && direct.includes('ATOM')) return direct;
+    const gz = await fetchGzipTextViaProxy(url + '.gz');
+    if (gz && gz.includes('ATOM')) return gz;
+    return null;
+}
+
+// ── Amino acid 3-letter to 1-letter code mapping ──
+const AA3TO1 = {ALA:'A',ARG:'R',ASN:'N',ASP:'D',CYS:'C',GLN:'Q',GLU:'E',GLY:'G',HIS:'H',ILE:'I',LEU:'L',LYS:'K',MET:'M',PHE:'F',PRO:'P',SER:'S',THR:'T',TRP:'W',TYR:'Y',VAL:'V'};
+
+// ── Score-table columns with no value in any row ──
+// Hides each column of `table` whose cells are empty in every row (hidden rows included: negative pairs count), and names
+// them in one line after the table ("Not in this file: …"), so a file without those scores does not show blank columns.
+// A column with any value stays, its missing cells shown as they are. Downloads read the data, not the table: unaffected.
+function hideEmptyColumns(table) {
+    if (!table || !table.tHead || !table.tHead.rows[0]) return [];
+    const rows = [...table.tBodies].flatMap((b) => [...b.rows]), blank = (t) => /^[\s—–-]*$/.test(t);
+    const gone = [];
+    [...table.tHead.rows[0].cells].forEach((th, ci) => {
+        const empty = rows.length > 0 && rows.every((r) => !r.cells[ci] || blank(r.cells[ci].textContent));
+        th.style.display = empty ? 'none' : ''; rows.forEach((r) => { if (r.cells[ci]) r.cells[ci].style.display = empty ? 'none' : ''; });
+        if (empty) gone.push(th.textContent.trim());
+    });
+    const host = table.parentElement && table.parentElement.tagName === 'DIV' && table.parentElement.children.length === 1 ? table.parentElement : table;
+    let note = host.nextElementSibling && host.nextElementSibling.classList.contains('empty-cols-note') ? host.nextElementSibling : null;
+    if (!note && gone.length) { note = document.createElement('p'); note.className = 'empty-cols-note'; note.style.cssText = 'font-size:0.78rem; color:#666; margin:0.35rem 0 0;'; host.after(note); }
+    if (note) { note.textContent = gone.length ? `Not in this file: ${gone.join(', ')}.` : ''; note.hidden = !gone.length; }
+    return gone;
+}

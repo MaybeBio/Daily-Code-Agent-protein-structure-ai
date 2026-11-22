@@ -1,0 +1,1 @@
+../../skills/cuequivariance/SKILL.md

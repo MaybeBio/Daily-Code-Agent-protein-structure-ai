@@ -1,0 +1,187 @@
+"""Reproducible isolated images from reviewed source and native dependency locks."""
+
+import hashlib
+import shutil
+from pathlib import Path
+
+from .image_identity import composer_digest
+from .image_installer import prepare_installer
+from .offline_context import stage_archives
+from .specs import PROGRAMS, recipe_digest
+
+# Network stalls must not discard a large verified dependency download after
+# pip's short default read timeout. The enclosing build still has a wall limit.
+PIP_READ_TIMEOUT_SECONDS = 120
+PIP_DOWNLOAD_RETRIES = 3
+
+
+def lock_digest(identifier):
+    root = Path(__file__).parent / "recipes"
+    files = [
+        root / (identifier + suffix)
+        for suffix in (".txt", ".conda.txt", "-engine.conda.txt", "-installer.txt")
+    ]
+    hasher = hashlib.sha256()
+    for file in files:
+        if file.is_file():
+            hasher.update(file.name.encode())
+            hasher.update(file.read_bytes())
+    return hasher.hexdigest()
+
+
+def prepare_context(identifier, destination, source=None, *, extra_sources=None, archives=None):
+    spec = PROGRAMS[identifier]
+    destination.mkdir(parents=True, exist_ok=True)
+    recipes = Path(__file__).parent / "recipes"
+    lines = ["FROM " + spec["base"], "USER root"]
+    runtime_libraries = spec.get("system_packages_after_python") is True
+    system_install = []
+    if spec.get("system_packages"):
+        system_install = [
+            (
+                "RUN apt-get -o APT::Update::Error-Mode=any update"
+                if runtime_libraries
+                else "RUN apt-get update"
+            )
+            + " && apt-get install -y --no-install-recommends "
+            + " ".join(spec["system_packages"])
+            + " && rm -rf /var/lib/apt/lists/*"
+        ]
+    if not runtime_libraries:
+        lines += system_install
+    if spec.get("conda"):
+        locked = recipes / (identifier + ".conda.txt")
+        if not locked.is_file():
+            raise ValueError("The reviewed native conda lock is missing.")
+        shutil.copyfile(locked, destination / "conda-explicit.txt")
+        if identifier == "openfe":
+            stage_archives(archives, destination / "native-packages")
+            expected = [
+                line.strip() for line in locked.read_text().splitlines()[1:] if line.strip()
+            ]
+            if [entry["url"] + "#" + entry["sha256"] for entry in archives] != expected:
+                raise ValueError("Offline dependency archives differ from the reviewed conda lock.")
+            (destination / "conda-offline.txt").write_text(
+                "@EXPLICIT\n"
+                + "\n".join(
+                    "file:///tmp/native-packages/" + entry["file"].name + "#" + entry["sha256"]
+                    for entry in archives
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            lines += [
+                "COPY conda-offline.txt /tmp/conda-offline.txt",
+                "RUN --mount=type=bind,source=native-packages,target=/tmp/native-packages,readonly "
+                "micromamba install --offline -y -n base --file /tmp/conda-offline.txt "
+                "&& micromamba clean --index-cache --yes && rm -rf /opt/conda/pkgs",
+                "ENV PATH=/opt/conda/bin:$PATH",
+            ]
+        else:
+            lines += [
+                "COPY conda-explicit.txt /tmp/conda-explicit.txt",
+                # Retain the reviewed AmberTools link-safe cleanup boundary.
+                "RUN micromamba install -y -n base --file /tmp/conda-explicit.txt "
+                "&& micromamba clean --index-cache --yes && rm -rf /opt/conda/pkgs",
+                "ENV PATH=/opt/conda/bin:$PATH",
+            ]
+    if spec.get("execution_conda"):
+        if identifier != "gromacs":
+            raise ValueError("Only the reviewed GROMACS ABI isolation is supported.")
+        locked = recipes / "gromacs-engine.conda.txt"
+        if not locked.is_file():
+            raise ValueError("The reviewed native GROMACS execution lock is missing.")
+        shutil.copyfile(locked, destination / "engine-conda-explicit.txt")
+        # CUDA profiling libraries and Python/RDKit have incompatible Kerberos ABIs.
+        # Keep them in distinct prefixes, invoked by separate native processes.
+        lines += [
+            "COPY engine-conda-explicit.txt /tmp/engine-conda-explicit.txt",
+            "RUN CONDA_OVERRIDE_CUDA=12.9 micromamba create -y -p /opt/gromacs "
+            "--file /tmp/engine-conda-explicit.txt && micromamba clean --index-cache --yes "
+            "&& rm -rf /opt/conda/pkgs",
+        ]
+    if spec["pip"]:
+        locked = recipes / (identifier + ".txt")
+        if not locked.is_file():
+            raise ValueError("The reviewed native pip lock is missing.")
+        shutil.copyfile(locked, destination / "requirements.txt")
+        lines += [
+            "COPY requirements.txt /tmp/requirements.txt",
+            "ARG XDDE_PYPI_INDEX=https://pypi.org/simple",
+        ]
+        installer, resume = prepare_installer(
+            identifier,
+            spec,
+            destination,
+            recipes,
+            timeout=PIP_READ_TIMEOUT_SECONDS,
+            retries=PIP_DOWNLOAD_RETRIES,
+        )
+        lines += installer
+        lines += [
+            "RUN python -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt "
+            f"--timeout {PIP_READ_TIMEOUT_SECONDS} --retries {PIP_DOWNLOAD_RETRIES} "
+            + resume
+            + '--index-url "$XDDE_PYPI_INDEX" '
+            "&& python -m pip check",
+        ]
+    if source:
+        # Source has already passed the fixed archive checksum and member checks.
+        shutil.copytree(source, destination / "source")
+        for patch in spec.get("source", {}).get("patches", []):
+            relative = Path(patch["file"])
+            file = destination / "source" / relative
+            if relative.is_absolute() or ".." in relative.parts or file.is_symlink():
+                raise ValueError("A reviewed native source patch has an unsafe path.")
+            content = file.read_text(encoding="utf-8")
+            if content.count(patch["old"]) != 1:
+                raise ValueError(
+                    "Reviewed native source differs from the exact compatibility patch."
+                )
+            file.write_text(content.replace(patch["old"], patch["new"]), encoding="utf-8")
+        target = (
+            "/opt/native/" + spec["source"]["prefix"]
+            if spec.get("source", {}).get("package")
+            else "/opt/native"
+        )
+        lines += ["COPY source " + target]
+        if spec.get("source", {}).get("runtime_access") == "readonly_all_users":
+            # Verified downloads are private staging files (0600). Container execution
+            # uses the owning task's UID, so native resources must be readable there.
+            lines += ["RUN chmod -R a+rX " + target]
+        if spec.get("source", {}).get("package"):
+            lines += [
+                "RUN python -m pip install --no-deps --no-build-isolation " + target + " "
+                "&& python -m pip check"
+            ]
+    for entry in spec.get("source_dependencies", []):
+        dependency = (extra_sources or {}).get(entry["id"])
+        if dependency is None or dependency.is_symlink():
+            raise ValueError("A checksum-reviewed native source dependency is missing.")
+        name = entry["id"]
+        if not name.isidentifier():
+            raise ValueError("A reviewed source dependency has an invalid identity.")
+        shutil.copytree(dependency, destination / ("dependency-" + name))
+        target = "/opt/native-dependencies/" + name
+        lines += ["COPY dependency-" + name + " " + target]
+        if entry.get("package"):
+            lines += [
+                "RUN python -m pip install --no-deps --no-build-isolation "
+                + target
+                + " && python -m pip check"
+            ]
+    if spec.get("source", {}).get("python_path"):
+        lines += ["ENV PYTHONPATH=/opt/native"]
+    if runtime_libraries:
+        # Precompiled-wheel drawing libraries need not invalidate the cached
+        # scientific Python/model installation layers when repairing this image.
+        lines += system_install
+    lines += [
+        'LABEL org.xdde.science.program="' + identifier + '" '
+        'org.xdde.science.recipe="' + recipe_digest(identifier) + '" '
+        'org.xdde.science.lock="' + lock_digest(identifier) + '" '
+        'org.xdde.science.composer="' + composer_digest() + '"',
+        "ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1",
+        "WORKDIR /output",
+    ]
+    (destination / "Dockerfile").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")

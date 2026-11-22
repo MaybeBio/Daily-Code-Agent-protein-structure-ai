@@ -1,0 +1,20 @@
+name        = "ProteinMPNN Sequence Design"
+description = "Design amino acid sequences for each RFdiffusion backbone. Designs chain A (binder) while holding chain B (receptor) fixed. Outputs one FASTA per backbone containing num_seq_per_target sequences."
+inputs      = ["backbones"]
+outputs     = ["sequences/design_*.fasta"]
+
+[container]
+image   = "ghcr.io/chiral-data/proteinmpnn:2025_09_10"
+
+[scripts]
+run = "run.sh"
+
+[params.chain_to_design]
+type    = "string"
+default = "A"
+hint    = "Chain to design sequences for (binder chain; always A after RFdiffusion)"
+
+[params.use_soluble_model]
+type    = "boolean"
+default = true
+hint    = "Use SolubleMPNN model — dramatically improves wet-lab expression rates"

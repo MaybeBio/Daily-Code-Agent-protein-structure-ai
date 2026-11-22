@@ -1,0 +1,394 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2012-2023 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#include "IFile.h"
+#include "Exception.h"
+#include "FileTools.h"
+#include "core/Action.h"
+#include "core/PlumedMain.h"
+#include "core/Value.h"
+#include "Tools.h"
+#include "H5Table.h"
+#include <cstdarg>
+#include <cstring>
+#include <cmath>
+
+#include <iostream>
+#include <string>
+#ifdef __PLUMED_HAS_ZLIB
+#include <zlib.h>
+#endif
+
+namespace PLMD {
+
+IFile& IFile::advanceField() {
+  plumed_assert(!inMiddleOfField);
+  std::string line;
+  bool done=false;
+  while(!done) {
+    getline(line);
+// using explicit conversion not to confuse cppcheck 1.86
+    if(!bool(*this)) {
+      return *this;
+    }
+    std::vector<std::string> words=Tools::getWords(line);
+    if(words.size()>=2 && words[0]=="#!" && words[1]=="FIELDS") {
+      fields.clear();
+      for(unsigned i=2; i<words.size(); i++) {
+        Field field;
+        field.name=words[i];
+        fields.push_back(field);
+      }
+    } else if(words.size()==4 && words[0]=="#!" && words[1]=="SET") {
+      Field field;
+      field.name=words[2];
+      field.value=words[3];
+      field.constant=true;
+      fields.push_back(field);
+    } else {
+      unsigned nf=0;
+      for(unsigned i=0; i<fields.size(); i++)
+        if(!fields[i].constant) {
+          nf++;
+        }
+      Tools::trimComments(line);
+      words=Tools::getWords(line);
+      if( words.size()==nf ) {
+        unsigned j=0;
+        for(unsigned i=0; i<fields.size(); i++) {
+          if(fields[i].constant) {
+            continue;
+          }
+          fields[i].value=words[j];
+          fields[i].read=false;
+          j++;
+        }
+        done=true;
+      } else if( !words.empty() ) {
+        plumed_merror("file " + getPath() + ": mismatch between number of fields in file and expected number\n this is the faulty line:\n"+line);
+      }
+    }
+  }
+  inMiddleOfField=true;
+  return *this;
+}
+
+IFile& IFile::open(const std::string&mypath) {
+  plumed_massert(!cloned,"file "+mypath+" appears to be cloned");
+  eof=false;
+  err=false;
+  fp=NULL;
+  gzfp=NULL;
+  if(!FileExist(mypath)) {
+    plumed_error() << "file " << mypath << " cannot be found";
+  }
+  fp=fopenUTF8(path,"r");
+  if(h5table::isH5(path)) {
+    // an HDF5 table, read as the lines of the equivalent text file
+    h5reader=std::make_unique<h5table::Reader>(path);
+  } else if(Tools::extension(path)=="gz") {
+#ifdef __PLUMED_HAS_ZLIB
+    gzfp=gzopenUTF8(path,"r");
+#else
+    plumed_merror("file " + getPath() + ": trying to use a gz file without zlib being linked");
+#endif
+  }
+  if(plumed) {
+    plumed->insertFile(*this);
+  }
+  return *this;
+}
+
+IFile& IFile::scanFieldList(std::vector<std::string>&s) {
+  if(!inMiddleOfField) {
+    advanceField();
+  }
+// using explicit conversion not to confuse cppcheck 1.86
+  if(!bool(*this)) {
+    return *this;
+  }
+  s.clear();
+  for(unsigned i=0; i<fields.size(); i++) {
+    s.push_back(fields[i].name);
+  }
+  return *this;
+}
+
+bool IFile::FieldExist(const std::string& s) {
+  if(!inMiddleOfField) {
+    advanceField();
+  }
+// using explicit conversion not to confuse cppcheck 1.86
+  if(!bool(*this)) {
+    return false;
+  }
+  // compare the names directly, without copying the list of the fields
+  for(const auto & f : fields) {
+    if(f.name==s) {
+      return true;
+    }
+  }
+  return false;
+}
+
+IFile& IFile::scanField(const std::string&name,std::string&str) {
+  if(!inMiddleOfField) {
+    advanceField();
+  }
+// using explicit conversion not to confuse cppcheck 1.86
+  if(!bool(*this)) {
+    return *this;
+  }
+  unsigned i=findField(name);
+  str=fields[i].value;
+  fields[i].read=true;
+  return *this;
+}
+
+IFile& IFile::scanField(const std::string&name,double &x) {
+  std::string str;
+  scanField(name,str);
+  if(*this) {
+    Tools::convert(str,x);
+  }
+  return *this;
+}
+
+IFile& IFile::scanField(const std::string&name,int &x) {
+  std::string str;
+  scanField(name,str);
+  if(*this) {
+    Tools::convert(str,x);
+  }
+  return *this;
+}
+
+IFile& IFile::scanField(const std::string&name,long int &x) {
+  std::string str;
+  scanField(name,str);
+  if(*this) {
+    Tools::convert(str,x);
+  }
+  return *this;
+}
+
+IFile& IFile::scanField(const std::string&name,long long int &x) {
+  std::string str;
+  scanField(name,str);
+  if(*this) {
+    Tools::convert(str,x);
+  }
+  return *this;
+}
+
+IFile& IFile::scanField(const std::string&name,unsigned &x) {
+  std::string str;
+  scanField(name,str);
+  if(*this) {
+    Tools::convert(str,x);
+  }
+  return *this;
+}
+
+IFile& IFile::scanField(const std::string&name,long unsigned &x) {
+  std::string str;
+  scanField(name,str);
+  if(*this) {
+    Tools::convert(str,x);
+  }
+  return *this;
+}
+
+IFile& IFile::scanField(const std::string&name,long long unsigned &x) {
+  std::string str;
+  scanField(name,str);
+  if(*this) {
+    Tools::convert(str,x);
+  }
+  return *this;
+}
+
+IFile& IFile::scanField(Value* val) {
+  double ff=std::numeric_limits<double>::quiet_NaN(); // this is to be sure a NaN value is replaced upon failure
+  scanField(  val->getName(), ff );
+  val->set( ff );
+  if( FieldExist("min_" + val->getName() ) ) {
+    std::string min, max;
+    scanField("min_" + val->getName(), min );
+    scanField("max_" + val->getName(), max );
+    val->setDomain( min, max );
+  } else {
+    val->setNotPeriodic();
+  }
+  return *this;
+}
+
+IFile& IFile::scanField() {
+  if(!ignoreFields) {
+    for(unsigned i=0; i<fields.size(); i++) {
+      plumed_massert(fields[i].read,"field "+fields[i].name+" was not read: all the fields need to be read otherwise you could miss important infos" );
+    }
+  }
+  inMiddleOfField=false;
+  return *this;
+}
+
+IFile::IFile():
+  inMiddleOfField(false),
+  ignoreFields(false),
+  noEOL(false) {
+}
+
+IFile::~IFile() {
+  h5reader.reset();
+  if(inMiddleOfField) {
+    std::cerr<<"WARNING: IFile closed in the middle of reading. seems strange!\n";
+  }
+}
+
+void IFile::closeBackend() {
+  h5reader.reset();
+}
+
+IFile& IFile::getline(std::string &str) {
+  str.clear();
+  if(h5reader) {
+    if(!h5reader->getline(str)) {
+      eof=true;
+      str.clear();
+    }
+    return *this;
+  }
+  // Lines are read in chunks with fgets/gzgets: reading one character at a time
+  // (as done until v2.10) was about 30 times slower on large files.
+  constexpr int chunk=4096;
+  char buffer[chunk];
+  // number of characters taken from the file for this line,
+  // used to go back to the beginning of an incomplete line
+  long consumed=0;
+  bool newline=false;
+  while(true) {
+    char* r=nullptr;
+    if(gzfp) {
+#ifdef __PLUMED_HAS_ZLIB
+      r=gzgets(gzFile(gzfp),buffer,chunk);
+#else
+      plumed_merror("file " + getPath() + ": trying to use a gz file without zlib being linked");
+#endif
+    } else {
+      r=std::fgets(buffer,chunk,fp);
+    }
+    if(!r) {
+      break;
+    }
+    const std::size_t len=std::strlen(buffer);
+    consumed+=len;
+    if(len>0 && buffer[len-1]=='\n') {
+      str.append(buffer,len-1);
+      newline=true;
+      break;
+    }
+    str.append(buffer,len);
+  }
+  if(!newline) {
+    if(gzfp) {
+#ifdef __PLUMED_HAS_ZLIB
+      int errnum=0;
+      gzerror(gzFile(gzfp),&errnum);
+      if(errnum!=Z_OK && errnum!=Z_BUF_ERROR) {
+        err=true;
+      } else {
+        eof=true;
+      }
+#endif
+    } else {
+      if(std::ferror(fp)) {
+        err=true;
+      } else {
+        eof=true;
+      }
+    }
+  }
+  if(newline && !str.empty() && str.back()=='\r') {
+    str.pop_back();
+  }
+  plumed_massert(str.find('\r')==std::string::npos,"plumed only accepts \\n (unix) or \\r\\n (dos) new lines");
+  if(eof && noEOL) {
+    if(str.length()>0) {
+      eof=false;
+    }
+  } else if(eof || err) {
+    eof = true;
+    str.clear();
+    // Go back to the beginning of the incomplete line, so that it can be read
+    // again when it is complete (e.g. a file that is being written by another walker
+    // and is read again after a reset(false)).
+    // This is also necessary so that eof works properly for emacs files
+    // with no endline at end of file.
+    if(!err && consumed>0) {
+      if(gzfp) {
+#ifdef __PLUMED_HAS_ZLIB
+        gzclearerr(gzFile(gzfp));
+        gzseek(gzFile(gzfp),-consumed,SEEK_CUR);
+#endif
+      } else {
+        std::fseek(fp,-consumed,SEEK_CUR);
+      }
+    }
+  }
+  return *this;
+}
+
+unsigned IFile::findField(const std::string&name)const {
+  unsigned i;
+  for(i=0; i<fields.size(); i++)
+    if(fields[i].name==name) {
+      break;
+    }
+  if(i>=fields.size()) {
+    plumed_merror("file " + getPath() + ": field " + name + " cannot be found");
+  }
+  return i;
+}
+
+void IFile::reset(bool reset) {
+  eof = reset;
+  err = reset;
+  if(!reset && fp) {
+    clearerr(fp);
+  }
+#ifdef __PLUMED_HAS_ZLIB
+  if(!reset && gzfp) {
+    gzclearerr(gzFile(gzfp));
+  }
+#endif
+  return;
+}
+
+void IFile::allowIgnoredFields() {
+  ignoreFields=true;
+}
+
+void IFile::allowNoEOL() {
+  noEOL=true;
+}
+
+}

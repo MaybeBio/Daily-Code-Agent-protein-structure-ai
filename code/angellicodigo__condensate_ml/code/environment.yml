@@ -1,0 +1,23 @@
+name: condensate
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python>=3.10
+  - numpy
+  - pandas
+  - matplotlib
+  - gsd
+  - hoomd=*=*gpu*
+  - cuda-version=12.6
+  - python-dotenv
+  - pip
+  - pip:
+    - torch
+    - marimo
+    - pytest
+    - "jax[cuda12]"
+    - jax-md
+    - flax
+    - optax
+    - "microsim[all]"

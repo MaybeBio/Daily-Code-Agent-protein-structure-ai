@@ -1,0 +1,284 @@
+# pantometry, for an agent
+
+Everything needed to write a working pantometry program, on one page. If you are here to
+*modify* pantometry rather than use it, read [CLAUDE.md](https://github.com/YounghyeonPark/pantometry/blob/HEAD/CLAUDE.md) instead.
+
+**pantometry is a Rust library**, with Python bindings. It is not a CLI and there is nothing on
+`PATH`, so `which pantometry` will fail and that is not a broken installation.
+
+From Python, `import pantometry` works — see [`bindings/python`](https://github.com/YounghyeonPark/pantometry/blob/HEAD/bindings/python), built from this
+repository and published as `pantometry` on PyPI. It can *run and audit* the library's physics; it cannot *extend*
+it, because writing a `Domain` in Python is unsupported and the reasons are written down there.
+Everything below describes the Rust API.
+
+```toml
+[dependencies]
+pantometry = "0.24"
+```
+
+API docs: <https://docs.rs/pantometry>. Source: <https://github.com/YounghyeonPark/pantometry>.
+
+---
+
+## Why you might want this specifically
+
+When you write physics in numpy or a general-purpose engine and get it wrong, the code runs
+happily and produces plausible output. There is no signal. You find out when a human notices
+the answer is silly.
+
+pantometry audits conservation on every step and returns a **`Violation` that names what went
+missing and where**:
+
+```
+energy destroyed at simulation: 5.000000e2 became 4.995000e2,
+a relative change of 1.000e-3 against a tolerance of 1.000e-9
+```
+
+`advance` returns `Result<Report, Violation>`, and the fields are machine-readable —
+`quantity`, `site`, `before`, `after`, `scale`, `tolerance`. That is a correctness signal you
+can loop on without asking anyone.
+
+**Be clear about what it does not catch.** It catches quantities appearing or vanishing,
+amounts left unclaimed on the bus, and fluxes that disagree face by face across a shared
+boundary. It does not catch a model that is internally consistent and physically wrong:
+publish a power where a joule was wanted, forgetting the factor of `dt`, and both sides agree
+perfectly about a number that is off by `1/dt`. For that class, check against something the
+code did not compute — a closed form, an exact limit, or a convergence rate.
+
+---
+
+## The whole thing, in three ideas
+
+### 1. Units are types
+
+Dimensions live in the type, so `Length + Time` does not compile. There is exactly one place
+a factor of a thousand may appear — a unit-bearing constructor — and `to_si()` is the only way
+back to a bare `f64`.
+
+```rust
+use pantometry::prelude::*;
+
+let area: Area = Length::mm(10.0) * Length::mm(10.0);
+let absorbed: Power = Irradiance::mw_per_cm2(50.0) * area * 0.02;
+let capacity: HeatCapacity = Mass::g(2.0) * SpecificHeat::j_per_kg_k(858.0);
+let rise: Temperature = (absorbed * Time::s(1.0)) / capacity;
+```
+
+Do not reach for `f64` and a comment. If the algebra does not typecheck, the physics is
+usually wrong.
+
+### 2. A domain is anything that steps
+
+Two methods are required. Everything else has a default.
+
+```rust
+impl Domain for MyThing {
+    fn name(&self) -> &str { &self.name }
+
+    fn step(&mut self, t: Time, dt: Time, bus: &mut Exchange) -> Result<(), Violation> {
+        // advance your state by dt, publish or take on the bus
+        Ok(())
+    }
+}
+```
+
+Worth overriding: `ledger()` (your books — without it the audit has nothing to check),
+`max_stable_dt()` (so a scheduler can subcycle you), `kind()` (`Kind::QuasiStatic` if you have
+no state to march), `as_field()` (so a renderer can sample you without knowing what you are),
+`as_any()` (so callers can downcast back to your concrete type).
+
+Names are data, not constants. Constructors take `impl Into<String>`, so `"my-thing"` and a
+`String` read out of a scene file both work, and `Simulation::with_boxed` takes a
+`Box<dyn Domain>` for when the type is chosen at run time.
+
+### 3. Domains never call each other
+
+They meet on `Exchange`, a bus of named channels carrying **SI amounts, not rates** — joules,
+not watts. A domain steps over an interval, so what crossed is an amount. That is what makes
+the audit an equality rather than an approximation.
+
+```rust
+bus.publish(HEAT, joules);   // publisher, having multiplied by its own dt
+let arrived = bus.take(HEAT); // consumer
+```
+
+**A ledger says what you are holding, not what has passed through you.** Joules you published
+are gone from your books and are being reported by whoever took them. Adding them back is the
+most common way to write a domain that audits green and is wrong.
+
+Anything left unclaimed when the step ends is a `Violation`.
+
+---
+
+## A complete program
+
+[`examples/agents_quickstart.rs`](https://github.com/YounghyeonPark/pantometry/blob/HEAD/crates/pantometry/examples/agents_quickstart.rs) is a runnable
+version of everything above — a publisher, a consumer, the books closing, and then the same
+pair with a deliberate 10% leak so you can see the `Violation` it produces. CI runs it, so it
+cannot drift.
+
+```sh
+cargo run --example agents_quickstart
+```
+
+Read that file before writing your own domain. It is about two hundred and fifty lines, a third
+of them commentary.
+
+---
+
+## What is in the box
+
+`pantometry` is a facade; every name below is re-exported through `pantometry::prelude::*`.
+It holds one module of its own, `pantometry::candidate`, which is not in the prelude: one molecule
+and what was measured about it in, one verdict on absorption and binding out, with the tissue
+partitions beside it. `cargo run --release --example drug_candidate` shows it.
+
+| crate | what it holds |
+| --- | --- |
+| `pantometry-units` | `Length`, `Time`, `Mass`, `Energy`, `Power`, … and the vector forms. Dimensions in the type |
+| `pantometry-core` | The kernel: `Domain`, `Exchange`, `Simulation`, `Schedule`, `Ledger`, `Tolerances` (one per conserved quantity), `Violation`, `Interface`, `Flux`, `Rng`, `Ensemble`, `Pose`, `Bodies` and `Reading` for what a domain offers a viewer, integrators, fields |
+
+A domain that overrides `books_balance` to `true` claims its ledger changes by exactly what it takes from the bus minus what it publishes, and is then checked **on its own scale** every step rather than inside the sum of every ledger. Take the claim if it is true — a small domain's leak is otherwise invisible beside a large one. Decline it if the domain models a boundary the bus does not carry, as `LumpedMass` does with convective loss.
+| `pantometry-optics` | Radiometry, Fresnel and coatings, dispersion, rays, Airy diffraction, MTF, Zernike, PSFs, detector noise |
+| `pantometry-thermal` | `LumpedMass`, `Bar1D` conduction, `Solid3D` conduction in three dimensions on a cubic grid, `ThermalNetwork` of n bodies joined by conductances, radiative and convective loss |
+| `pantometry-mechanics` | `NBody`, `TreeNBody` (Barnes-Hut), `ContactSystem` with friction, `RigidBody` |
+| `pantometry-acoustic` | The wave equation on a staggered grid: `Tube` (1D), `Room` (2D), `Hall` (3D, with the vertical and oblique modes a floor plan cannot have), impedance boundaries |
+| `pantometry-molecular` | `Fluid` with Lennard-Jones, `PeriodicBox`, cell lists, Langevin thermostat, `RadialDistribution` |
+| `pantometry-electrical` | `Winding`: `I²R` onto the heat channel, copper rising 0.393%/K, and `runaway_current` — the exact threshold `√(g/(R₂₀α))` where the feedback overtakes the heat path. `Conductor`: `∇·(σ∇φ)=0` solved on a grid, so a resistance is a property of a *shape* — `ρL/A` exactly for a bar, and whatever a notch gives for a notch |
+| `pantometry-elastic` | `Block`: linear elasticity as a field, `∇·σ = 0` on trilinear elements — what a shape does under load, where `pantometry-mechanics` moves shapes that do not change. `Face` to hold or press one, thermal strain from a temperature field, and `Waves` for the dynamic half on a staggered grid |
+| `pantometry-em` | `Cavity`: Maxwell's curls on the grid Yee built for them, so `∇·B = 0` is an identity of the update rather than a residual to watch. `Wall`, `Boundary`, and `COURANT_3D` — the `1/√3` the three-dimensional stencil costs |
+| `pantometry-fluid` | `Channel`: incompressible Navier–Stokes by projection on a staggered grid, with `Walls` and `CELL_REYNOLDS_LIMIT`. The hardest domain here to trust, and its own documentation says why: few closed forms, schemes that trade conservation for stability, and a divergence that is a statement about the solve rather than about the flow |
+| `pantometry-porous` | `Puck`: Darcy flow through a packed bed, the heat the liquid carries and the dissolution it drives — a coffee puck, and equally a chromatography column, a sand filter or an aquifer. `Basket`, `Shot`, `Observable`, `PuckField` |
+| `pantometry-protein` | `Protein`: a fold's collective motions, from a Protein Data Bank file. `Structure::from_pdb` reads alpha carbons and the crystallographer's B-factors, `Network` joins every pair inside a cutoff, and `Modes` is the Hessian's eigendecomposition — with `spectrum::Symmetric` underneath it, a Jacobi eigensolver that adds no dependency. It predicts **which way** a structure moves and nothing about how tightly anything binds; `correlation` is how it is judged against what was measured |
+| `pantometry-forcefield` | `Molecule`: a small molecule atom by atom, hydrogens included. `Component::from_ccd` reads one wwPDB Chemical Component Dictionary entry strictly — a missing column, an unknown element, a bond to an atom that is not there are each a `CcdError` naming it — and `uff::assign` gives every atom its Universal Force Field type (`UffType`) from its element, bond orders and the dictionary's aromatic flags, with Table I of Rappé et al. (1992) in SI behind `UffType::parameters`. `ForceField` gives all six of UFF's terms — bond stretch, angle bend, torsion, inversion, van der Waals, electrostatics with 1-2 and 1-3 exclusions — and the analytic force on every atom; charges default to zero. `ForceField::minimise` relaxes a geometry (L-BFGS with an Armijo line search, so the energy never rises), and `DihedralRestraint` holds a dihedral while the rest relaxes. **A step of `Molecule` is one minimiser iteration**, so a run is the molecule relaxing frame by frame, drawn as bodies with names and bonds, with its energy and force as readings in kcal/mol. Beyond that: `Qeq` charges, `GeneralizedBorn` water, `MolecularDynamics` (BAOAB, velocity Verlet), `PeriodicForceField` with `Ewald` or `Pme`, a `WaterBox` of rigid TIP3P held by `Settle`, `Shake` for bonds to hydrogen, and free energies through `Alchemical`, `Boresch` and `free_energy::{bar, bennett_chain}`. Checked against aspirin's own formula, valence, and the types a chemist reads off its structure |
+| `pantometry-quantum` | `Well`: a 1D wavefunction between hard walls, marched with the same staggered-leapfrog family the acoustic domain uses. `in_eigenstate(n)`, `with_gaussian(centre, sigma, k0)`, `with_harmonic(omega)`; probability sits on the ledger as an identity of the update |
+| `pantometry-pharmacokinetic` | `CompartmentModel`: *n* well-stirred compartments joined by intercompartmental clearances, with elimination out of the ones that eliminate. `bolus`, `infuse`, `oral` through a `Depot` (first-order absorption `kₐ`, bioavailability `F`, a lag), `perfuse` for a perfusion-limited tissue off one well-stirred blood pool (`Q·(C_b − C_t/K_p)`, elimination on the venous `C_t/K_p` — the well-stirred liver, `extraction_ratio`), and a `Clearance` that is a volume per time rather than a rate constant. Checked against the one- and two-compartment closed forms — `A₀e^{−kt}`, `(R/k)(1−e^{−kt})`, the bi-exponential whose `α` and `β` are the roots of `λ² − (k10+k12+k21)λ + k10k21 = 0`, the Bateman function (`bateman`, finite at `kₐ = k`) and the oral tri-exponential — and, perfused, against `C_t = K_p C_b` at steady state, `V_ss = V_b + ΣK_pV_t`, the bi-exponential with `k21 = Q/(K_pV_t)`, the one-compartment limit as `Q → ∞`, and a first pass of `1 − E`. `K_p = 1` is `link` to the bit. No protein binding and no reference physiology; `partition` gives a tissue's `K_p` from its composition, by Rodgers and Rowland's equation for a neutral molecule. No field and no bodies: `readings` is the whole output — every concentration in mg/L, the books in mg, and the net flow across every vessel in mg/h, `"blood to tissue"` or `"a to b"` |
+| `pantometry-shape` | Designed geometry as input, and the bridge where the physics gets decided: `Mesh::from_stl` reads a surface and measures it, `Voxels` rasterises it onto the structured grid every domain here takes, and `Loss` is what that costs. Depends on `pantometry-units` and nothing else in the workspace — it hands out a predicate and a domain's `fill` takes one |
+| `pantometry-scene` | One layer up. `Placement`, `Extent`, `capture` — where a domain sits and what one instant of a run looks like, as `Frame`, `Panel`, `PanelData`. Names no domain |
+| `pantometry-view` | Two layers up. `svg` filmstrip, `html` report that opens in a browser with nothing installed, `readings_csv`, `to_json`, and `gltf` for Blender/three.js/USD. The view is chosen by the shape of the data, the axes are in metres, and the colour scale is `ramp`'s — built in CIE LCh so a larger value is never darker |
+
+`Schedule` picks how they interact: `OneWay`, `Staggered` (declaration order is execution
+order), `Iterative { max_iter, tol }` for strong coupling, `Multirate` for domains with very
+different stability limits.
+
+### Picking a heat model
+
+Three shapes, and choosing wrong is the most common way to get a plausible number that answers
+the wrong question:
+
+| you want | use | cost |
+| --- | --- | --- |
+| one body, one temperature | `LumpedMass` | one step per frame; check `biot_number() < 0.1` first |
+| a gradient along one thing | `Bar1D` | pays `dt < dx²/2α`; milliseconds in aluminium |
+| several bodies and the **drop between them** | `ThermalNetwork` | one step per frame per node |
+
+The third is the one people reach for too late. A motor, a laser diode on a submount, a die in a
+package: what fails is the winding or the junction, and what you can measure is the case. A
+`LumpedMass` gives you one number for both, and it is the case's.
+
+```rust
+let mut motor = ThermalNetwork::new("motor");
+let winding = motor.node("winding", Substance::copper(), Volume::from_si(18e-6),
+                         Length::mm(2.0), Temperature::celsius(25.0));
+let case = motor.node_losing_to("case", Substance::aluminium_6061(), Volume::from_si(220e-6),
+                                Length::mm(4.0), Temperature::celsius(25.0),
+                                Environment::still_air(Temperature::celsius(25.0),
+                                                       Area::from_si(0.042)));
+motor.link(winding, case, Conductance::w_per_k(0.9))?;
+motor.absorbing(winding)?;                  // where heat off the bus lands
+
+// after stepping — 6 W in, and the joint carries a 6.2 K drop at fifteen minutes:
+motor.temperature(winding);                 // the number that decides survival
+motor.heat_flow(winding, case);
+```
+
+That is `junction_to_case` in `examples/agents_quickstart.rs`, which CI runs — so it is a
+snippet that compiled and produced that number, not one written into a document by hand.
+
+If what you want is the *settled* answer rather than the trajectory, do not march to it:
+
+```rust
+let settled = motor.steady_state(Power::w(6.0))?;   // solves the balance directly
+settled.temperature(winding);
+```
+
+Exact rather than "close enough after enough steps", and it refuses a network where heat has
+nowhere to go — that has no steady state, and a finite number would be the wrong answer to a
+question with none.
+
+Nodes are `Node` handles rather than names on purpose — see below. `node_named` is the way in if
+you are building from a file, and `handles()` walks a network you did not build.
+
+---
+
+## Rules you will otherwise break
+
+These are enforced by CI and by the audit, so breaking them fails loudly rather than quietly.
+They are listed here so it does not have to be loudly.
+
+- **No wall clock, no unseeded randomness.** Results are bit-for-bit reproducible across
+  optimisation levels and thread counts, and across platforms and WebAssembly wherever they pass
+  only through `+ − × ÷`, `sqrt` and `pantometry_core::math`, which every sampler on `Rng` does.
+  `pantometry-forcefield` calls the platform's `sin`, `cos` and more, and says where. Use
+  `Rng::for_index(seed, i)`,
+  which gives the same value for the same index no matter what order you ask in. `Date::now`,
+  `rand::thread_rng`, and reductions over unordered collections all break this.
+- **Domains do not depend on each other.** If your new physics needs to `use pantometry_thermal`,
+  the design is wrong — publish on a channel instead. The kernel depends on no domain either.
+- **Every public item is documented.** `#![deny(missing_docs)]` is set in all **twenty-five** crates —
+  the twenty published ones and the five libraries in `app/`.
+- **MSRV is 1.78**, checked by CI.
+- **Tolerances are earned.** A number in an `assert!` should trace to an effect — an
+  integrator's order, `1/√N` for a sample count, a discretisation. If you cannot say which,
+  it was chosen to make the test pass. See CONTRIBUTING.md.
+
+---
+
+## Two things that will trip you specifically
+
+**A relative tolerance against a quantity that should be zero is meaningless.** A correct
+system's net conserved quantity is usually exactly zero, so `(value - 0.0).abs() / 0.0` is a
+100% error for anything nonzero. Supply a scale from outside — the energy that actually
+crossed, the largest single contribution. `Ledger` records a `scale` beside each total for
+exactly this reason, and `Violation` carries it.
+
+**A conservation check that passes is necessary and nowhere near sufficient.** A flux
+redistributed to the wrong part of a boundary keeps the total exactly right. Ask what class of
+error your check is blind to.
+
+The clearest case in this library is `ThermalNetwork`. A link adds `+q` to one node and `−q` to
+another *in the same sum*, so they cancel identically: a sign error, a transposed index, or a
+link you forgot to add passes the conservation audit at machine precision, and the winding just
+runs at a plausible wrong temperature forever. That is why nodes are handles you cannot forge
+and why every test for it is per node or against a closed form. It is also not hypothetical —
+building it surfaced an `O(h)` bias on the joint next to the heat source that the audit never
+saw, and a series-resistance formula found in one run.
+
+The habit that generalises: after your audit passes, write down one wrong program that would
+also pass it, then go and check *that*.
+
+---
+
+## Where to look next
+
+- **`examples/`** — fifteen worked problems that print their numbers and assert every one of
+  them. `cargo run --example melting`. Give most of them a path and it writes an SVG. Two are
+  specifically about three dimensions: `heat_in_three_dimensions` and `room_in_three_dimensions`.
+  `ligand_binding` is the one whose data somebody measured: two crystal structures of one enzyme,
+  open and closed on its inhibitor, and the model is shown only the open one. `aspirin_relaxes`
+  is the other molecule: every atom of a drug, typed for a force field and minimised out of the
+  clash its dictionary coordinates hold.
+  `busbar_rating` is the one shaped like an engineer's working day rather than a demonstration —
+  geometry to rating to production yield, every step checked. `optical_bench` is the one that
+  draws the *instrument*: a folded doublet drawn as the surfaces its rays are traced against, as a
+  3D layout you rotate in a browser.
+- **[ARCHITECTURE.md](https://github.com/YounghyeonPark/pantometry/blob/HEAD/ARCHITECTURE.md)** — the three layers, what is built and what is missing,
+  and the rules that make "add a physics" cost one crate.
+- **[README.md](https://github.com/YounghyeonPark/pantometry/blob/HEAD/README.md)** — the long version, including what is deliberately *not* here.
+- **[CONTRIBUTING.md](https://github.com/YounghyeonPark/pantometry/blob/HEAD/CONTRIBUTING.md)** — the conventions, and the gate CI runs.
+- **[CLAUDE.md](https://github.com/YounghyeonPark/pantometry/blob/HEAD/CLAUDE.md)** — working on pantometry rather than with it.
+- **[RELEASING.md](https://github.com/YounghyeonPark/pantometry/blob/HEAD/RELEASING.md)** — the twenty crates, the wheel, the nine places a version
+  lives, and the DOI, which was minted at 0.16.0 after failing silently at 0.13.0 and 0.14.0. Read
+  once per release and not otherwise, which is why it is not in `CLAUDE.md`.
+- **[CITATION.cff](https://github.com/YounghyeonPark/pantometry/blob/HEAD/CITATION.cff)** — how to cite this. Co-authorship is not requested and could not be
+  required; `README.md`'s Citation section says why, and what is invited instead.

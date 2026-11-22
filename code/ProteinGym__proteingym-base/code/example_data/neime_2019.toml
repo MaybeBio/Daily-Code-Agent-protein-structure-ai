@@ -1,0 +1,74 @@
+name = "NEIME_2019"
+description = "The NEIME Kennouche 2019 (UniProt id: A0A1I9GEU1) datase"
+version = "1.0.0"
+
+[publication]
+doi = "10.15252/embj.2019102145"
+
+[[ assay_variables ]]
+name = "PH"
+description = "pH level of the samples"
+unit = "pH"
+
+[[ assay_variables ]]
+name = "T"
+description = "Temperature level of the samples"
+unit = "C"
+
+[[ assay_targets ]]
+name = "DMS Score"
+description = "DMS score of the samples"
+unit = "log fold change"
+
+[[ assay_targets ]]
+name = "DMS Score Bin"
+description = "DMS score bin of the samples"
+
+[[ assays ]]
+name = "NEIME_2019"
+path = "./NEIME_2019/Assays/Assay1.csv"
+sequence_alphabet = "AA"
+sequence_alias = "mutated_sequence"
+library_construction_method = "discrete"
+growth_coupled = true
+readout = "dna_sequencing"
+transformation = "non_parametric"
+target_phenotype = "activity"
+has_uncertainty = true
+
+[[ assays.targets ]]
+name = "DMS Score"
+alias = "DMS_score"
+
+[[ assays.targets ]]
+name = "DMS Score Bin"
+alias = "DMS_score_bin"
+
+[[ assays.non_targets ]]
+name = "split"
+
+[ assays.variables ]
+T = 37
+PH = 7
+
+[[ sequences ]]
+path = "./NEIME_2019/sequences/A0A1I9GEU1.fasta"
+type = "wild_type"
+alphabet = "AA"
+uniprot_id = "A0A1I9GEU1"
+pfam_ids = ["PF00114"]
+
+[[ structures ]]
+path = "./NEIME_2019/Structures/computational.pdb"
+name = "A0A1I9GEU1"
+description = "ALPHAFOLD MONOMER V2.0 PREDICTION FOR PILIN"
+
+[structures.metadata]
+source = "alphafold"
+version = "v2.0"
+avg_plddt = "90"
+link = "alphafold.ebi.ac.uk/entry/A0A1I9GEU1"
+
+[[ msas ]]
+path = "./NEIME_2019/MSA/msa.a3m"
+format = "a3m"

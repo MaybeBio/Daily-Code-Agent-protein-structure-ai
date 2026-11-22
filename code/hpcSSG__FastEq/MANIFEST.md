@@ -1,11 +1,11 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/hpcSSG/FastEq
-- 快照日期: 2026-11-18
-- 快照 commit: [`678117b9b8a0`](https://github.com/hpcSSG/FastEq/commit/678117b9b8a0d7928dc6d5b80634cc0d7b59832f)
+- 快照日期: 2026-11-22
+- 快照 commit: [`b28df12d1d08`](https://github.com/hpcSSG/FastEq/commit/b28df12d1d08bd924e2becc793664429a1e0b3ad)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (595 个文件, 4.8 MB)
+## 保留 (595 个文件, 4.9 MB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|

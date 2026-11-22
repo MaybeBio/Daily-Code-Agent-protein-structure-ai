@@ -1,0 +1,179 @@
+from mddb_workflow.utils.pyt_spells import get_pytraj_trajectory, get_reduced_pytraj_trajectory
+from mddb_workflow.utils.auxiliar import reprint, get_auxiliar_filepath
+from mddb_workflow.utils.type_hints import *
+from tqdm import tqdm
+from itertools import islice
+import os
+
+import pytraj as pt
+
+# Build a generator which returns frames along the trajectory in pdb format
+# The frames limit is the maximum number of frames to be iterated
+# Note that the number of frames iterated may be less than the specified number
+def get_pdb_frames (
+    structure : 'Structure',
+    trajectory_filepath : str,
+    snapshots : int,
+    frames_limit : Optional[int] = None,
+    output_frames_prefix : str = 'frame',
+    pbar_bool : bool = False,
+) -> tuple[ Generator[str, None, None], int, int ]:
+    # WARNING: Do not set a pytraj iterload trajectory and read its 'n_frames' to get the snapshots
+    # WARNING: Trying to read the number o frames of a xtc trajectory will read the whole trajectory
+    # WARNING: This may be a lot of time for a huge trajectory. Use the snapshots input instead
+
+    # In case we are missing a frames limit set the limit as the number os snapshots
+    if frames_limit == None:
+        frames_limit = snapshots
+
+    # Make a copy of the structure to be used as a template, so we do not modify the original coordinates
+    reference_structure = structure.copy()
+
+    # Generate an auxiliar structure file to be used to reduce the trajectory
+    reference_structure_sample = get_auxiliar_filepath('.reference.cif')
+    reference_structure.generate_mmcif_file(reference_structure_sample)
+
+    # Set a maximum number of frames
+    # If trajectory has more frames than the limit create a reduced trajectory
+    reduced_trajectory, frames_step, frames_count = get_reduced_pytraj_trajectory(
+        reference_structure_sample,
+        trajectory_filepath,
+        snapshots,
+        frames_limit
+    )
+
+    # Delete the auxiliar structure file sine it is not needed anymore
+    os.remove(reference_structure_sample)
+
+    def frames_generator():
+        # Create a progress bar
+        if pbar_bool: pbar = tqdm(initial=0, desc=' Frames', total=frames_count, unit='frame')
+        # Or print an empty line for the reprint to not delete a previous log
+        else: print()
+        # Extract each frame in pdb format
+        for frame_number, frame in enumerate(reduced_trajectory.iterframe()):
+            # Update the current frame log
+            if pbar_bool: pbar.update(1); pbar.refresh()
+            else: reprint(f'Frame {frame_number+1} ({frame_number} / {frames_count})')
+            current_frame_filepath = get_auxiliar_filepath(f'{output_frames_prefix}{frame_number+1}.pdb')
+            reference_structure.set_new_coordinates(frame.xyz)
+            # Note that frames are used by tools which do not care about chains
+            reference_structure.generate_pdb_file(current_frame_filepath, show_warnings=False, accept_limitations=True)
+            yield current_frame_filepath
+            # Delete current frame file before going for the next frame
+            os.remove(current_frame_filepath)
+
+    return frames_generator(), frames_step, frames_count
+
+
+def get_coordinate_frames(
+    structure: 'Structure',
+    trajectory_filepath: str,
+    snapshots: int,
+    frames_limit: Optional[int] = None,
+) -> tuple[Generator['np.ndarray', None, None], int, int]:
+    """Get the coordinates (Å, one row per atom) of the frames get_pdb_frames gives, without writing PDB files.
+
+    Return a generator of coordinate arrays, the step between frames and the number of frames.
+    """
+    if frames_limit is None:
+        frames_limit = snapshots
+    # Pytraj reads the trajectory with the structure as topology
+    reference_structure_sample = get_auxiliar_filepath('.reference.cif')
+    structure.generate_mmcif_file(reference_structure_sample)
+    reduced_trajectory, frames_step, frames_count = get_reduced_pytraj_trajectory(
+        reference_structure_sample,
+        trajectory_filepath,
+        snapshots,
+        frames_limit
+    )
+    os.remove(reference_structure_sample)
+
+    def frames_generator():
+        # Print an empty line for the reprint to not delete a previous log
+        print()
+        for frame_number, frame in enumerate(reduced_trajectory.iterframe()):
+            reprint(f'Frame {frame_number+1} ({frame_number} / {frames_count})')
+            # Copy the coordinates, since the frame may be reused for the next one
+            yield frame.xyz.copy()
+
+    return frames_generator(), frames_step, frames_count
+
+# Build a generator which returns frames at the start of the trajectory in pdb format
+# The frames limit is the maximum number of frames to be iterated
+# Note that the number of frames iterated may be less than the specified number
+def get_starting_pdb_frames (
+    structure : 'Structure',
+    trajectory_filepath : str,
+    snapshots : int,
+    frames_limit : Optional[int] = None,
+    output_frames_prefix : str = 'frame',
+    pbar_bool : bool = False,
+) -> Generator[str, None, None]:
+
+    # In case we are missing a frames limit set the limit as the number os snapshots
+    if frames_limit == None:
+        frames_limit = snapshots
+    # The limit can not be larger than the number of snapshots, or logs would be missleading
+    frames_limit = min(frames_limit, snapshots)
+
+    # Make a copy of the structure to be used as a template, so we do not modify the original coordinates
+    reference_structure = structure.copy()
+
+    # Generate an auxiliar structure file to be used to reduce the trajectory
+    reference_structure_sample = get_auxiliar_filepath('.reference.cif')
+    reference_structure.generate_mmcif_file(reference_structure_sample)
+
+    # Load the trajectory using pytraj
+    trajectory = get_pytraj_trajectory(reference_structure_sample, trajectory_filepath)
+
+    # Delete the auxiliar structure file sine it is not needed anymore
+    os.remove(reference_structure_sample)
+
+    def frames_generator():
+        # Create a progress bar
+        pbar = tqdm(initial=0, desc=' Frames', total=frames_limit, unit='frame') if pbar_bool else None
+        # Or print an empty line for the reprint to not delete a previous log
+        if pbar is None:
+            print()
+        try:
+            # Extract each frame in pdb format
+            # islice checks exactly the requested number of consecutive frames.
+            for frame_number, frame in enumerate(islice(trajectory.iterframe(), frames_limit), 1):
+                # Update the current frame log
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.refresh()
+                else:
+                    reprint(f'Frame {frame_number} ({frame_number} / {frames_limit})')
+                current_frame_filepath = get_auxiliar_filepath(f'{output_frames_prefix}{frame_number}.pdb')
+                reference_structure.set_new_coordinates(frame.xyz)
+                try:
+                    # Note that frames are used by tools which do not care about chains
+                    reference_structure.generate_pdb_file(current_frame_filepath, show_warnings=False, accept_limitations=True)
+                    yield current_frame_filepath
+                finally:
+                    # Delete current frame file before going for the next frame
+                    # Also clean up when the caller finds a match or raises.
+                    if os.path.exists(current_frame_filepath):
+                        os.remove(current_frame_filepath)
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+    return frames_generator()
+
+# Get a specific trajectory frame in pdb format
+# Return the name of the generated file
+def get_pdb_frame (
+    topology_filename : str,
+    trajectory_filepath : str,
+    frame : int
+) -> str:
+
+    # Load the trajectory using pytraj
+    trajectory = get_pytraj_trajectory(topology_filename, trajectory_filepath)
+    trajectory_frame = trajectory[frame:frame+1]
+    trajectory_frame_filepath = get_auxiliar_filepath(f'frame{frame}.pdb')
+    pt.write_traj(trajectory_frame_filepath, trajectory_frame, overwrite=True)
+    return trajectory_frame_filepath

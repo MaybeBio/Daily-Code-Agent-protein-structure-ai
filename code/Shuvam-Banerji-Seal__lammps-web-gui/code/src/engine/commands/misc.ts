@@ -1,0 +1,379 @@
+import type { Handler } from './args';
+import { inumeric, logical, missingArgs } from './args';
+import { StyleError } from '../force/types';
+import { formatNumber, mapUnquoted, substituteVariables } from '../script';
+import { evaluateScalar } from '../formula';
+import { clearSoftHalt } from '../run/halt';
+import { expandShellPattern, isDirectory, makeDirectories, removeDirectory, shellKey } from '../shellFs';
+
+/*
+ * General-purpose input commands.
+ */
+
+/**
+ * variable name style args — variable.html (see variables.ts). A string variable's text is substituted here, when it
+ * is defined: variable.html "string performs variable substitution even if the string parameter is quoted"; as native
+ * LAMMPS does (src/variable.cpp Variable::set at b332f28), with Input::substitute's rules (quoted parts kept).
+ */
+const variable: Handler = ({ sys }, a) => {
+  if (a.length < 2) throw new StyleError('Illegal variable command: missing argument(s)');
+  if (a[1] === 'string' && a.length === 3) {
+    const env = sys.formulaEnv;
+    const text = mapUnquoted(a[2], (part) => substituteVariables(part, (n) => sys.vars.text(n, env), (f, fmt) => formatNumber(evaluateScalar(f, env), fmt ?? '%.20g')));
+    sys.vars.define(a[0], a[1], [text]);
+    return;
+  }
+  sys.vars.define(a[0], a[1], a.slice(2));
+};
+
+/**
+ * print string [file f | append f | screen yes|no | universe yes|no] —
+ * print.html: "If the text string contains variables, they will be evaluated
+ * and their current values printed." Text inside quotes is substituted here
+ * (the line was substituted outside quotes when it was read).
+ */
+const print: Handler = ({ sys }, a) => {
+  // the keyword checks of native's Input::print (src/input.cpp at b332f28)
+  if (!a.length) throw new StyleError('Illegal print command: missing argument(s)');
+  const env = sys.formulaEnv;
+  const text = substituteVariables(a[0], (n) => sys.vars.text(n, env), (f, fmt) => formatNumber(evaluateScalar(f, env), fmt ?? '%.20g'));
+  let screen = true;
+  for (let k = 1; k < a.length; k += 2) {
+    const key = a[k], v = a[k + 1];
+    if (!['file', 'append', 'screen', 'universe'].includes(key)) throw new StyleError(`Unknown print keyword: ${key}`);
+    if (v === undefined) throw new StyleError(`Illegal print ${key} command: missing argument(s)`);
+    if (key === 'file') sys.writeFile(v, text + '\n', false);
+    else if (key === 'append') sys.writeFile(v, text + '\n', true);
+    else if (key === 'screen') screen = logical(v);
+    else logical(v);
+  }
+  if (screen) sys.log(text);
+};
+
+/**
+ * log file [append] — log.html: "closes the current LAMMPS log file, opens a
+ * new file with the specified name, and begins logging information to it. If
+ * the specified file name is none, then no new log file is opened."
+ */
+const log: Handler = ({ sys }, a) => {
+  // As native LAMMPS does (src/input.cpp Input::log at b332f28)
+  if (a.length < 1 || a.length > 2) throw new StyleError(`Illegal log command: expected 1 or 2 argument(s) but found ${a.length}`);
+  if (a.length === 2 && a[1] !== 'append') throw new StyleError(`Unknown log keyword: ${a[1]}`);
+  sys.setLogFile(a[0] === 'none' ? null : a[0], a[1] === 'append');
+};
+
+/** utils::timespec2seconds: off or unlimited (-1), or up to three ':'-separated numbers; null when one is no number. */
+const timespecSeconds = (spec: string): number | null => {
+  if (spec === 'off' || spec === 'unlimited') return -1;
+  const vals = [0, 0, 0];
+  const parts = spec.split(':');
+  let i = 0;
+  for (; i < 3 && i < parts.length; i++) {
+    if (!/^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(parts[i])) return null;
+    vals[i] = Number(parts[i]);
+  }
+  if (i === 3) return (vals[0] * 60 + vals[1]) * 60 + vals[2];
+  if (i === 2) return vals[0] * 60 + vals[1];
+  return vals[0];
+};
+
+/** timer args — timer.html; the level selects the timing breakdown (timer.ts), timeout is not supported. */
+const timer: Handler = ({ sys }, a) => {
+  // As native LAMMPS does (src/timer.cpp Timer::modify_params at b332f28): the styles and modes, timeout with a time
+  // (utils::timespec2seconds: off, unlimited, or [[HH:]MM:]SS), every with a check frequency (utils::inumeric, > 0); the
+  // messages name the keyword, not the value
+  for (let k = 0; k < a.length; k++) {
+    const w = a[k];
+    if (w === 'off' || w === 'loop' || w === 'normal' || w === 'full') { sys.timer.level = w; continue; }
+    if (w === 'sync' || w === 'nosync') continue;
+    if (w === 'timeout') {
+      if (++k >= a.length) throw missingArgs('timer timeout');
+      const t = timespecSeconds(a[k]);
+      if (t === null) throw new StyleError(`Illegal timeout time: ${w}`);
+      // timer.html: "timer timeout off" and "timer timeout unlimited" clear a timeout; a fix halt with error soft
+      // stops later runs until one of them is given (fix_halt.html). Other timeouts need the wall clock: refused.
+      if (t >= 0) throw new StyleError('timer timeout is not supported by the browser engine (use the Stop button)');
+      clearSoftHalt(sys);
+      continue;
+    }
+    if (w === 'every') {
+      if (++k >= a.length) throw missingArgs('timer every');
+      // the timeout check frequency; the engine has no timeout to check
+      if (inumeric(a[k]) <= 0) throw new StyleError(`Illegal timer every frequency: ${w}`);
+      continue;
+    }
+    throw new StyleError(`Unknown timer keyword ${w}`);
+  }
+  // timer.html: off and loop collect no section times, normal and full print the breakdown after each run (full's
+  // %CPU column needs the CPU time, which the browser does not give: the engine prints the normal table)
+};
+
+/** info [categories] — info.html; prints what the browser engine knows. */
+const info: Handler = ({ sys }, a) => {
+  const cats = a.length ? a : ['system', 'computes', 'fixes', 'groups', 'regions', 'variables'];
+  const out: string[] = ['Info-Info-Info-Info-Info-Info-Info-Info-Info-Info-Info'];
+  for (const c of cats) {
+    switch (c) {
+      case 'system': case 'all': {
+        out.push(`Units = ${sys.units.style}, Atom style = ${sys.atomStyle}, Dimension = ${sys.dimension}`);
+        if (sys.hasBox) {
+          const s = sys.state;
+          out.push(`Atoms = ${s.n}, types = ${s.ntypes}, bonds = ${s.topo.bonds.n}, angles = ${s.topo.angles.n}, dihedrals = ${s.topo.dihedrals.n}, impropers = ${s.topo.impropers.n}`);
+          out.push(`Box = (${s.box.lo.join(' ')}) to (${s.box.hi.join(' ')})${s.box.triclinic ? ` tilt (${s.box.tilt.join(' ')})` : ''}, boundary ${s.box.boundary.map((f) => f[0] + f[1]).join(' ')}`);
+        } else out.push('No simulation box yet');
+        out.push(`Pair style = ${sys.ff.pair?.name ?? 'none'}, Bond style = ${sys.ff.bond?.name ?? 'none'}, Angle style = ${sys.ff.angle?.name ?? 'none'}, Dihedral style = ${sys.ff.dihedral?.name ?? 'none'}, Improper style = ${sys.ff.improper?.name ?? 'none'}, Kspace style = ${sys.ff.kspace?.name ?? 'none'}`);
+        if (c === 'system') break;
+      }
+      // falls through for 'all'
+      case 'computes': out.push('Compute information:', ...sys.computes.map((x) => `  Compute ${x.id}: ${x.style} on group ${x.group}`)); break;
+      case 'fixes': out.push('Fix information:', ...sys.fixes.map((x) => `  Fix ${x.id}: ${x.style} on group ${x.group}`)); break;
+      case 'groups': out.push('Group information:', ...sys.groups.list().map((g) => `  ${g}`)); break;
+      case 'regions': out.push('Region information:', ...[...sys.regions.values()].map((r) => `  Region ${r.id}: ${r.style}${r.interior ? '' : ' (side out)'}`)); break;
+      case 'variables': out.push('Variable information:', ...[...sys.vars.vars.entries()].map(([k, v]) => `  Variable[${k}]: ${v.style} ${v.formula ?? v.values.join(' ')}`)); break;
+      case 'styles': out.push(...Object.entries(sys.registries).map(([k, v]) => `${k}: ${v.join(' ')}`)); break;
+      case 'out': case 'screen': case 'log': case 'append': break;
+      default: throw new StyleError(`unknown info category '${c}'`);
+    }
+  }
+  sys.log(out.join('\n'));
+};
+
+/** Commands that are recognized only to explain why the browser engine cannot run them. */
+export const UNAVAILABLE_COMMANDS = new Set<string>();
+
+const browserOnly = (name: string, why: string): Handler => {
+  UNAVAILABLE_COMMANDS.add(name);
+  return () => {
+    throw new StyleError(`${name} ${why}`);
+  };
+};
+
+/**
+ * shell command args — shell.html: "A few simple file-based shell commands are supported directly, in Unix-style
+ * syntax."; "*cd* arg = dir", "*mkdir* args = dir1 dir2 ...", "*mv* args = old new", "*rm* args = [-f] file1 file2 ...",
+ * "*rmdir* args = dir1 dir2 ...", "*putenv* args = var1=value1 var2=value2"; "anything else is passed as a command to
+ * the shell for direct execution". A browser has no operating-system shell, so every other command is refused, naming it.
+ * The built-ins act on the notebook's virtual file system (shellFs.ts): cd sets the directory that file names are
+ * resolved from (shell.html: "All subsequent LAMMPS commands that read/write files will use the new directory"), mkdir
+ * creates the whole path ("similar to the Unix mkdir -p command"), rmdir removes the contents recursively, rm and mv act
+ * on the session files, and putenv sets environment variables (LAMMPS_POTENTIALS is searched for a file that is not in
+ * the working directory). Like native (src/input.cpp Input::shell at b332f28), a failed cd, mkdir, rmdir, rm, mv or
+ * putenv warns and carries on.
+ *
+ * Measured with native LAMMPS (black box):
+ *   shell rm <file>          deletes it, silently.
+ *   shell rm <missing>       warns once per missing file and continues; the warning reads
+ *                            Shell command 'rm <missing>' failed with error 'No such file or directory'.
+ *   shell rm -f <missing>    silent (no warning); also silent with no file names.
+ *   shell mv <old> <new>     renames old to new, silently overwriting an existing new.
+ *   shell mv <missing> <new> warns and continues; the warning reads
+ *                            Shell command 'mv <missing> <new>' failed with error 'No such file or directory'.
+ *   shell                    is an error (Illegal shell command: missing argument(s)).
+ *   shell rm                 is an error (Illegal shell rm command: missing argument(s)).
+ *   shell mv [a]             is an error (expected 3 argument but found N).
+ */
+const shell: Handler = ({ sys, session }, a) => {
+  const sub = a[0];
+  if (sub === undefined) throw new StyleError('Illegal shell command: missing argument(s)');
+  const NO_SUCH = 'No such file or directory';
+  const failed = (what: string, err: string) => sys.warn(`Shell command '${what}' failed with error '${err}'`);
+  // One quoted word with spaces is not a built-in: native passes the joined words to the system shell (system(cmd); a
+  // non-zero status warns "Shell command {} returned with non-zero status"). The engine runs the sh form of rm [-f]
+  // with its patterns expanded (examples/PACKAGES/colvars: shell "rm -f out*.colvars.*"); other commands are refused.
+  if (a.length === 1 && /\s/.test(sub.trim())) {
+    const words = sub.trim().split(/\s+/);
+    if (words[0] === 'rm' && words.slice(1).every((w) => !w.startsWith('-') || w === '-f')) {
+      const force = words.includes('-f');
+      let status = 0;
+      for (const w of words.slice(1).filter((x) => x !== '-f')) {
+        for (const name of expandShellPattern(sys, w)) {
+          if (sys.files.has(shellKey(sys, name))) session.forEachReplica((r) => r.files.delete(shellKey(r, name)));
+          else if (!force) status = 1;
+        }
+      }
+      if (!force && words.length < 2) status = 1;
+      if (status !== 0) sys.warn(`Shell command ${sub} returned with non-zero status`);
+      return;
+    }
+  }
+  if (sub === 'cd') {
+    // native: narg != 2 is "Illegal shell command: expected 2 argument but found narg" (narg counts the command word)
+    if (a.length !== 2) throw new StyleError(`Illegal shell command: expected 2 argument but found ${a.length}`);
+    if (!isDirectory(sys, shellKey(sys, a[1]))) { failed(`cd ${a[1]}`, NO_SUCH); return; }
+    session.forEachReplica((r) => { r.cwd = shellKey(r, a[1]); });
+    return;
+  }
+  if (sub === 'mkdir') {
+    if (a.length < 2) throw new StyleError('Illegal shell mkdir command: missing argument(s)');
+    for (const dir of a.slice(1)) {
+      if (sys.files.has(shellKey(sys, dir))) { failed(`mkdir ${dir}`, 'File exists'); continue; }
+      session.forEachReplica((r) => makeDirectories(r, shellKey(r, dir)));
+    }
+    return;
+  }
+  if (sub === 'rmdir') {
+    if (a.length < 2) throw new StyleError('shell rmdir: missing argument(s) (usage: shell rmdir dir1 dir2 ...)');
+    for (const dir of a.slice(1)) {
+      if (!isDirectory(sys, shellKey(sys, dir)) || shellKey(sys, dir) === '') { failed(`rmdir ${dir}`, NO_SUCH); continue; }
+      session.forEachReplica((r) => removeDirectory(r, shellKey(r, dir)));
+    }
+    return;
+  }
+  if (sub === 'putenv') {
+    if (a.length < 2) throw new StyleError('shell putenv: missing argument(s) (usage: shell putenv var1=value1 ...)');
+    for (const def of a.slice(1)) {
+      const eq = def.indexOf('=');
+      if (eq <= 0) { failed(`putenv ${def}`, 'Invalid argument'); continue; }
+      const name = def.slice(0, eq), value = def.slice(eq + 1);
+      session.forEachReplica((r) => r.env.set(name, value));
+    }
+    return;
+  }
+  if (sub === 'rm') {
+    let k = 1;
+    let force = false;
+    if (a[k] === '-f') { force = true; k++; }
+    if (k >= a.length && !force) throw new StyleError('shell rm: missing argument(s) (usage: shell rm [-f] file1 file2 ...)');
+    for (; k < a.length; k++) {
+      const name = a[k];
+      if (sys.files.has(shellKey(sys, name))) session.forEachReplica((r) => r.files.delete(shellKey(r, name)));
+      else if (!force) failed(`rm ${name}`, NO_SUCH);
+    }
+    return;
+  }
+  if (sub === 'mv') {
+    if (a.length !== 3) throw new StyleError(`shell mv: expected 2 arguments (old new) but found ${a.length - 1}`);
+    const oldName = a[1], newName = a[2];
+    const from = shellKey(sys, oldName);
+    // native: a destination folder takes the file under its own base name (system("mv old dir"))
+    const toDir = isDirectory(sys, shellKey(sys, newName));
+    if (!sys.files.has(from)) {
+      if (toDir) sys.warn(`Shell command 'mv ${oldName} ${newName}' returned with non-zero status`);
+      else failed(`mv ${oldName} ${newName}`, NO_SUCH);
+      return;
+    }
+    const dest = toDir ? `${newName}/${from.split('/').pop()}` : newName;
+    let text = '';
+    session.forEachReplica((r) => {
+      const t = r.files.get(shellKey(r, oldName));
+      if (t === undefined) return;
+      r.files.delete(shellKey(r, oldName));
+      r.files.set(shellKey(r, dest), t);
+      text = t;
+    });
+    // the current replica also reports the file to the notebook, as a write does
+    sys.writeFile(dest, text, false);
+    return;
+  }
+  // every other command: the browser has no operating-system shell to pass it to
+  throw new StyleError(`shell ${sub}: cannot run 'shell ${a.join(' ')}': a browser has no operating-system shell; only the built-in cd, mkdir, mv, rm, rmdir and putenv are available`);
+};
+
+/*
+ * box: docs.lammps.org/Commands_removed.html: "The *box* command has been removed and the LAMMPS code
+ * changed so it won't be needed.  If present, LAMMPS will ignore the command and print a warning."
+ * Measured with native LAMMPS (black box): box tilt large prints WARNING: The 'box' command has been
+ * removed and will be ignored, and the input carries on (examples/ELASTIC displace.mod uses it).
+ */
+const box: Handler = ({ sys }) => {
+  sys.warn("The 'box' command has been removed and will be ignored");
+};
+
+/**
+ * geturl url keyword args ... — geturl.html: "Download a file from an URL to the local disk."; "*output* filename =
+ * write to *filename* instead of inferring the name from the URL", "*overwrite* yes/no = if *yes* overwrite the output
+ * file in case it exists, do not if *no*", "*timeout* time = stop download if not completed within given time in
+ * seconds", "*verify* yes/no = verify SSL certificate and hostname if *yes*, do not if *no*", "*verbose* yes/no = if
+ * *yes* write verbose debug output from libcurl to screen, do not if *no*"; "By default, the string after the last '/'
+ * is used or 'index.html'."; "The default time value is 300, i.e. 5 minutes.  Setting the timeout to 0 means to wait
+ * forever."
+ *
+ * The checks, the name rules and the messages are native's (src/EXTRA-COMMAND/geturl.cpp GetURL::command at b332f28):
+ * the URL must hold "://", keywords are read in order (logical yes/no values, an integer timeout >= 0), and the output
+ * file is opened before the transfer, so a failed download leaves it empty. The browser engine downloads with fetch into
+ * the notebook's files (bytes kept as an upload keeps them): it cannot turn certificate verification off (verify no is accepted), writes no libcurl trace
+ * (verbose is accepted), and a server must allow cross-origin requests (CORS) for a page to read it.
+ */
+const geturl: Handler = async ({ sys }, a) => {
+  if (a.length < 1) throw missingArgs('geturl');
+  let overwrite = true;
+  let timeout = 300;
+  const url = a[0];
+  if (!url.includes('://')) throw new StyleError(`URL '${url}' is not a supported URL`);
+  let output = '';
+  for (let i = 1; i < a.length; i++) {
+    const kw = a[i];
+    if (kw === 'output') {
+      if (i + 2 > a.length) throw missingArgs('geturl output');
+      output = a[++i];
+    } else if (kw === 'overwrite') {
+      if (i + 2 > a.length) throw missingArgs('geturl overwrite');
+      overwrite = logical(a[++i]);
+    } else if (kw === 'timeout') {
+      if (i + 2 > a.length) throw missingArgs('geturl timeout');
+      timeout = inumeric(a[++i]);
+      if (timeout < 0) throw new StyleError(`Invalid timeout ${timeout} for geturl`);
+    } else if (kw === 'verify') {
+      if (i + 2 > a.length) throw missingArgs('geturl verify');
+      logical(a[++i]);
+    } else if (kw === 'verbose') {
+      if (i + 2 > a.length) throw missingArgs('geturl verbose');
+      logical(a[++i]);
+    } else {
+      throw new StyleError(`Unknown geturl keyword: ${kw}`);
+    }
+  }
+  // "a trailing forward slash represents an index page"; a URL with no '/' past the scheme is a bare domain
+  if (!output) {
+    if (url.endsWith('/')) output = 'index.html';
+    else {
+      const pos = url.lastIndexOf('/');
+      output = pos < 8 ? 'index.html' : url.slice(pos + 1);
+    }
+  }
+  if (!output) throw new StyleError(`Cannot determine output file name from URL '${url}' and 'output' is not used`);
+  if (!overwrite && sys.files.has(sys.resolveFile(output))) return;
+  sys.writeFile(output, '', false);
+  let reason = '', code = 0;
+  let body: Uint8Array | null = null;
+  try {
+    const res = await fetch(url, timeout > 0 ? { signal: AbortSignal.timeout(1000 * timeout) } : {});
+    // CURLOPT_FAILONERROR: an HTTP status of 400 or more is an error with the response code
+    if (res.status >= 400) { reason = 'HTTP response code said error'; code = res.status; }
+    else body = new Uint8Array(await res.arrayBuffer());
+  } catch (e) {
+    reason = (e as Error).name === 'TimeoutError' ? 'Timeout was reached' : "Couldn't connect to server";
+  }
+  if (!body) {
+    const hint = reason === "Couldn't connect to server"
+      ? '\nThe browser engine downloads with fetch: the server must be reachable and allow cross-origin requests (CORS)'
+      : '';
+    throw new StyleError(`Download of ${output} failed with: ${reason} ${code}${hint}`);
+  }
+  // stored as the notebook stores an upload (services/fileStore.ts readInputText): a gzipped file, or one that is not
+  // valid UTF-8, one character per byte; any other file as UTF-8 text
+  const bytes = body;
+  const latin1 = (): string => {
+    let out = '';
+    for (let k = 0; k < bytes.length; k += 8192) out += String.fromCharCode(...bytes.subarray(k, k + 8192));
+    return out;
+  };
+  let text: string;
+  if (output.toLowerCase().endsWith('.gz') || (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b)) text = latin1();
+  else {
+    try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { text = latin1(); }
+  }
+  sys.writeFile(output, text, false);
+};
+
+export const MISC_COMMANDS: Record<string, Handler> = {
+  variable, print, log, timer, info, shell, box,
+  python: browserOnly('python', 'is not available: the browser engine has no Python interpreter'),
+  plugin: browserOnly('plugin', 'is not available: plugins are native shared libraries'),
+  mdi: browserOnly('mdi', 'is not available in the browser engine'),
+  kim: browserOnly('kim', 'is not available: OpenKIM models are native libraries'),
+  // fenix.rst: "This command initializes `Fenix <https://github.com/sandialabs/fenix>`_ for online process recovery.
+  // From this point on, Fenix claims a number of ranks to be used as spares." The browser engine runs no MPI ranks.
+  fenix: browserOnly('fenix', 'is not available: Fenix recovers failed MPI processes, and the browser engine runs no MPI ranks'),
+  geturl,
+};

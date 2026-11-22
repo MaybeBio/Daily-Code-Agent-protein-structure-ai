@@ -1,0 +1,205 @@
+name: CI and release
+
+on:
+  push:
+    branches: [production]
+    tags: ['v*']
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade "pip>=26.2.2"
+      - run: python -m pip install build twine packaging
+      - run: python -m unittest discover -s .github/tests -v
+      - name: Verify release version
+        id: version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: python .github/release.py verify
+      - run: python -m build
+      - run: python .github/release.py artifacts
+      - run: python -m twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error
+
+  wheel:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - name: Install core wheel and exercise it outside the checkout
+        run: |
+          python -m venv "$RUNNER_TEMP/core"
+          "$RUNNER_TEMP/core/bin/python" -m pip install --upgrade "pip>=26.2.2"
+          "$RUNNER_TEMP/core/bin/python" -m pip install dist/*.whl
+          cp docs/examples/plot_protonation.py "$RUNNER_TEMP/smoke.py"
+          cd "$RUNNER_TEMP"
+          core/bin/python -m pip check
+          core/bin/python -c "import importlib.util; assert importlib.util.find_spec('torch') is None"
+          core/bin/python smoke.py
+          if core/bin/aw --help >cli.log 2>&1; then exit 1; fi
+          grep -F "pip install 'atomworks[cli]'" cli.log
+          core/bin/python -m pip install "$GITHUB_WORKSPACE/dist/$(basename "$GITHUB_WORKSPACE"/dist/*.whl)[cli]"
+          core/bin/aw --help
+          core/bin/aw msa --help
+          if core/bin/aw msa >msa.log 2>&1; then exit 1; fi
+          grep -F "pip install 'atomworks[ml]'" msa.log
+
+  science:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - run: |
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system '.[ml,dev,openbabel,ase]'
+          uv pip check --system
+          for command in generate filter find organize; do
+            aw msa "$command" --help
+          done
+      - run: ruff format --check . && ruff check src tests .github
+      - name: Download public test fixtures
+        run: |
+          mkdir -p tests/data
+          curl --fail --location --retry 3 https://github.com/RosettaCommons/atomworks/releases/download/test-data-3.0.0/atomworks-test-data-3.0.0.tar.gz | tar --skip-old-files -xz -C tests/data
+      - name: Run scientific CPU tests, including experimental protonation
+        run: |
+          pytest tests -n 2 --dist=worksteal -m 'not benchmark and not slow and not requires_digs and not requires_pymol_remote and not requires_x3dna' --cov=atomworks --cov-report=xml --junitxml=tests.xml
+          pytest tests -n 1 -m 'slow and not benchmark and not requires_digs and not requires_pymol_remote and not requires_x3dna' --cov=atomworks --cov-append --cov-report=xml --junitxml=slow-tests.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scientific-test-reports
+          path: |
+            *tests.xml
+            coverage.xml
+      - uses: codecov/codecov-action@v5
+        if: success()
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - run: |
+          uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --system '.[ml,docs,ase,openbabel]' -r docs/docs_requirements.txt
+      - name: Build documentation and execute the offline example
+        working-directory: docs
+        run: make html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: docs/_build/html
+          if-no-files-found: error
+
+  publish:
+    needs: [build, wheel, science, docs]
+    if: github.repository == 'RosettaCommons/atomworks' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/atomworks
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+
+  release:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          make_latest: legacy
+          prerelease: ${{ needs.build.outputs.prerelease == 'true' }}
+
+  deploy-docs:
+    needs: [docs, publish]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: atomworks-versioned-docs
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade "pip>=26.2.2"
+      - run: python -m pip install packaging
+      - uses: actions/download-artifact@v4
+        with:
+          name: documentation
+          path: docs/_build/html
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+      - run: python .github/release.py docs
+      - name: Repair archived version switchers
+        run: python .github/repair_docs_switcher.py gh-pages https://rosettacommons.github.io/atomworks
+      - name: Publish versioned documentation
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: gh-pages

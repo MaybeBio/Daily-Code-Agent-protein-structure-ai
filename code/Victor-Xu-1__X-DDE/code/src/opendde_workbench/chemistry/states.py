@@ -1,0 +1,126 @@
+"""Real bounded protonation/tautomer/stereo enumeration, never a population prediction."""
+
+from random import Random
+
+from mapping import correspondence, labelled_smiles, normalize, restore_labels, stereo_preserved
+
+
+def prioritized_tautomers(protomer, variants, enumerator):
+    """Preserve the supplied protomer's form, then use RDKit's structural heuristic."""
+    from rdkit import Chem
+
+    original = Chem.MolToSmiles(normalize(protomer), isomericSmiles=True)
+    unique = {
+        Chem.MolToSmiles(normalize(mol), isomericSmiles=True): mol for mol in variants
+    }
+    unique.setdefault(original, protomer)
+    keys = sorted(
+        unique,
+        key=lambda key: (key != original, -enumerator.ScoreTautomer(unique[key]), key),
+    )
+    return [unique[key] for key in keys]
+
+
+def enumerate_states(source, options):
+    from rdkit import Chem
+    from rdkit.Chem import rdMolDescriptors
+    from rdkit.Chem.EnumerateStereoisomers import EnumerateStereoisomers, StereoEnumerationOptions
+    from rdkit.Chem.MolStandardize import rdMolStandardize
+
+    bounded, protonation_rejected = [], 0
+    if options.protonation:
+        from dimorphite_dl.protonate.run import Protonate
+
+        protonator = Protonate(
+            smiles_input=labelled_smiles(source),
+            ph_min=options.ph_min,
+            ph_max=options.ph_max,
+            precision=options.precision,
+            max_variants=options.max_states + 1,
+            validate_output=True,
+        )
+        values = protonator.to_list()
+        if protonator.stats.fallback_used:
+            raise ValueError(
+                "The protonation method used a fallback instead of valid state enumeration. "
+                "Inspect native logs or retain the supplied chemical state."
+            )
+        protonation_rejected = protonator.stats.variants_rejected
+        bounded = [restore_labels(s, source) for s in values]
+    else:
+        bounded = [Chem.Mol(source)]
+    if not bounded:
+        raise ValueError("The protonation method returned no valid state.")
+    truncated = len(bounded) > options.max_states
+    # Dimorphite 2.1 orders a truncated set using its native ionization model.
+    # Keep that choice; alphabetical SMILES sorting must not change which states survive.
+    bounded = bounded[: options.max_states]
+    enumerator = rdMolStandardize.TautomerEnumerator()
+    enumerator.SetMaxTautomers(options.max_tautomers + 1)
+    enumerator.SetMaxTransforms(512)
+    enumerator.SetRemoveSp3Stereo(False)
+    enumerator.SetRemoveBondStereo(False)
+    enumerator.SetReassignStereo(True)
+    stereo = StereoEnumerationOptions(
+        onlyUnassigned=True,
+        unique=True,
+        maxIsomers=options.max_stereoisomers + 1,
+        rand=Random(options.seed),
+    )
+    states, work, rejected = {}, 0, 0
+    for protomer in bounded:
+        variants = enumerator.Enumerate(protomer) if options.tautomers else [protomer]
+        truncated |= len(variants) > options.max_tautomers
+        if options.tautomers:
+            truncated |= str(variants.status) != "Completed"
+        ordered = prioritized_tautomers(protomer, variants, enumerator)
+        for tautomer in ordered[: options.max_tautomers]:
+            # RDKit 2023 stereo enumeration consumes _ChiralityPossible; tautomer
+            # reassignment clears this computed flag, so discover centers again.
+            Chem.AssignStereochemistry(
+                tautomer, cleanIt=True, force=True, flagPossibleStereoCenters=True
+            )
+            candidates = (
+                list(EnumerateStereoisomers(tautomer, options=stereo))
+                if options.stereoisomers
+                else [tautomer]
+            )
+            truncated |= len(candidates) > options.max_stereoisomers
+            for mol in candidates[: options.max_stereoisomers]:
+                work += 1
+                if work > 512:
+                    truncated = True
+                    break
+                mol = normalize(mol)
+                mapping = correspondence(source, mol)
+                if not stereo_preserved(source, mol, mapping):
+                    rejected += 1
+                    continue
+                smiles = Chem.MolToSmiles(mol, isomericSmiles=True)
+                if smiles not in states:
+                    states[smiles] = {
+                        "molecule": mol,
+                        "smiles": smiles,
+                        "charge": Chem.GetFormalCharge(mol),
+                        "formula": rdMolDescriptors.CalcMolFormula(mol),
+                        "source_to_state_atoms": mapping,
+                    }
+                if len(states) > options.max_states:
+                    truncated = True
+                    break
+            if work > 512 or len(states) > options.max_states:
+                break
+        if work > 512 or len(states) > options.max_states:
+            break
+    # Insertion order retains the reviewed chemical priorities at the state cap.
+    # Alphabetical SMILES ordering can otherwise discard the supplied tautomer.
+    output = list(states.values())[: options.max_states]
+    if not output:
+        raise ValueError("No state retained the defined source stereochemistry.")
+    return output, {
+        "budget_limited": bool(truncated),
+        "enumeration_work": work,
+        "rejected": rejected,
+        "protonation_rejected": protonation_rejected,
+        "population_probabilities": "not_computed",
+    }

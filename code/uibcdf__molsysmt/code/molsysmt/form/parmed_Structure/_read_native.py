@@ -1,0 +1,137 @@
+import numpy as np
+import pandas as pd
+
+from molsysmt._private.name_resolution import (
+    classify_group_name as get_group_type_from_group_name,
+)
+
+
+def read_native(item, atom_indices="all", skip_digestion=False):
+    """
+    Converting from parmed.Structure to molsysmt.Topology.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    atom_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Atom indices (0-based) to include.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    Returns
+    -------
+    molsysmt.Topology
+        Resulting object in molsysmt.Topology form.
+
+
+    .. versionadded:: 1.0.0
+    """
+
+    from parmed.periodic_table import Element
+
+    from molsysmt._private.variables import is_all
+    from molsysmt.native import MolSys
+
+    n_atoms = len(item.atoms)
+    n_groups = len(item.residues)
+    n_bonds = len(item.bonds)
+
+    # ParmEd doesn't have a direct 'chains' attribute like OpenMM,
+    # but residues have a 'chain' attribute.
+    unique_chain_ids = []
+    for residue in item.residues:
+        if residue.chain not in unique_chain_ids:
+            unique_chain_ids.append(residue.chain)
+    n_chains = len(unique_chain_ids)
+    chain_id_to_index = {cid: i for i, cid in enumerate(unique_chain_ids)}
+
+    native = MolSys(n_atoms=n_atoms, n_groups=n_groups, n_chains=n_chains)
+
+    tmp_item = native.topology
+
+    # Atoms
+    atom_id = []
+    atom_name = []
+    atom_type = []
+    group_index_of_atoms = []
+
+    for atom in item.atoms:
+        # ParmEd serials start at 1 usually, number attribute is the serial
+        atom_id.append(str(atom.number))
+        atom_name.append(atom.name)
+        # ParmEd's ``type`` is a force-field label. Stable native atom_type is
+        # the explicitly supplied element; unknown elements are not perceived.
+        number = getattr(atom, "atomic_number", 0)
+        atom_type.append(Element[number] if 0 < number < len(Element) else None)
+        group_index_of_atoms.append(atom.residue.idx)
+
+    tmp_item.atoms["atom_id"] = atom_id
+    tmp_item.atoms["atom_name"] = atom_name
+    tmp_item.atoms["atom_type"] = atom_type
+    tmp_item.atoms["group_index"] = group_index_of_atoms
+
+    # Groups
+    group_id = []
+    group_name = []
+    group_type = []
+    chain_index_of_groups = []
+
+    for residue in item.residues:
+        group_id.append(str(residue.number))
+        group_name.append(residue.name)
+        group_type.append(get_group_type_from_group_name(residue.name))
+        chain_index_of_groups.append(chain_id_to_index[residue.chain])
+
+    tmp_item.groups["group_id"] = group_id
+    tmp_item.groups["group_name"] = group_name
+    tmp_item.groups["group_type"] = group_type
+    # chain_index lives on atoms only
+    _ci_grp = np.array(chain_index_of_groups, dtype=int)
+    _gi_atom = np.array(group_index_of_atoms, dtype=int)
+    tmp_item.atoms["chain_index"] = _ci_grp[_gi_atom]
+
+    # Chains
+    chain_id = []
+    chain_name = []
+    for cid in unique_chain_ids:
+        # An explicit empty external label is still a label, not a request to
+        # generate or rename a chain.
+        chain_id.append(str(cid))
+        chain_name.append(str(cid))
+
+    tmp_item.chains["chain_id"] = chain_id
+    tmp_item.chains["chain_name"] = chain_name
+
+    # Bonds
+    if n_bonds > 0:
+        from ._chemical_state import bond_table_from_structure
+
+        bond_table, omitted_relationship = bond_table_from_structure(item)
+        native.chemical_states._set_chemical_state_bonds(bond_table)
+        native.chemical_states._states[0].connectivity_completeness = (
+            "partial" if omitted_relationship else "complete"
+        )
+
+    formal_charges = [getattr(atom, "formal_charge", None) for atom in item.atoms]
+    if any(value is not None for value in formal_charges):
+        native.chemical_states._set_chemical_state_atom_attribute(
+            "formal_charge", pd.array(formal_charges, dtype="Int16")
+        )
+
+    aromaticities = [getattr(atom, "aromatic", None) for atom in item.atoms]
+    if any(value is not None for value in aromaticities):
+        native.chemical_states._set_chemical_state_atom_attribute(
+            "is_aromatic", pd.array(aromaticities, dtype="boolean")
+        )
+
+    # Rebuild remaining hierarchy
+    native.rebuild_components()
+    native.rebuild_molecules()
+    tmp_item.rebuild_entities()
+
+    if not is_all(atom_indices):
+        native = native.extract(atom_indices=atom_indices, skip_digestion=True)
+
+    return native

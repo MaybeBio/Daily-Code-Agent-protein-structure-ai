@@ -1,0 +1,112 @@
+name: Integration & E2E Tests
+
+# Dedicated home for the cross-component (integration) and protocol-workflow
+# (e2e) tiers — see ADR-0031. These are excluded from the `Unit Tests` matrix
+# (main.yml `-m "not integration and not e2e"`) so they run once, here, as their
+# own PR check. Core-only + tiny + seeded, so this needs no FIMO/cd-hit/mmseqs
+# and no `pro` extra; Python is bracketed at the floor + ceiling on Linux.
+
+on:
+  push:
+    branches:
+      - master
+    # Docs-only changes can't affect test outcomes, so skip these tiers for them.
+    # A commit touching any non-doc file (e.g. *.py, pyproject.toml) still runs.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '**/*.rst'
+  pull_request:
+    branches:
+      - master
+    # NO paths-ignore on the PR trigger: these are REQUIRED status checks, and a
+    # path-skipped workflow never reports its contexts, so a docs-only PR would block
+    # forever. The workflow always runs on PRs; the `changes` job skips the heavy work on
+    # a docs-only diff so the contexts still report success. The `push` trigger keeps its
+    # paths-ignore (a docs-only master push is not merge-gated).
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # On a docs-only PR the required job below runs but skips its heavy steps, reporting
+  # success without the tiers. Fail-safe: anything not purely docs (docs/**, *.md, *.rst),
+  # a non-PR event, or a detection failure, runs the full check.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: filter
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          files="$(git diff --name-only "${BASE}...${HEAD}" || true)"
+          echo "Changed files:"; printf '%s\n' "$files"
+          # Count files that are NOT docs (docs/**, *.md, *.rst). Use -c (a count), not
+          # -vq: BSD and GNU grep disagree on the exit status of `-vq`, but the count is
+          # identical on both. Fail-safe: an empty list, or any doubt, runs the full check.
+          if [ -z "$files" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            n_code=$(printf '%s\n' "$files" | grep -vcE '^(docs/|.*\.md$|.*\.rst$)' || true)
+            if [ "${n_code:-1}" -gt 0 ]; then
+              echo "code=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "code=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  integration-e2e:
+    needs: changes
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ['3.11', '3.14']  # bracket the supported range
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Cache Python dependencies
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-${{ matrix.python-version }}-
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install package and test dependencies
+      if: needs.changes.outputs.code == 'true'
+      # Core install only — the integration/e2e tiers import no `pro` features.
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        pip install pytest hypothesis pytest-xdist
+
+    - name: Run integration & e2e tiers
+      if: needs.changes.outputs.code == 'true'
+      # One combined check over both directories. The network-marked live-endpoint
+      # file (test_online_fetches.py) is skipped by default and would need the `pro`
+      # extra just to import, so it is ignored here; it stays collected (and skipped)
+      # in the Unit Tests matrix and runs on demand / in the nightly.
+      run: >-
+        pytest tests/integration tests/e2e
+        --ignore=tests/integration/test_online_fetches.py
+        -m "not regression" -n auto -c tests/pytest.ini --durations=20
+      env:
+        MPLBACKEND: Agg

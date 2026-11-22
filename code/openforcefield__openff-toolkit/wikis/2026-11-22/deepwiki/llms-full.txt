@@ -1,0 +1,5101 @@
+# Page: Overview
+
+# Overview
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.pre-commit-config.yaml](.pre-commit-config.yaml)
+- [.readthedocs.yaml](.readthedocs.yaml)
+- [MANIFEST.in](MANIFEST.in)
+- [README.md](README.md)
+- [docs/releasehistory.md](docs/releasehistory.md)
+- [openff/toolkit/__init__.py](openff/toolkit/__init__.py)
+- [openff/toolkit/_tests/test_toolkits.py](openff/toolkit/_tests/test_toolkits.py)
+- [openff/toolkit/_tests/test_topology.py](openff/toolkit/_tests/test_topology.py)
+- [openff/toolkit/topology/molecule.py](openff/toolkit/topology/molecule.py)
+- [openff/toolkit/topology/topology.py](openff/toolkit/topology/topology.py)
+- [openff/toolkit/typing/engines/smirnoff/forcefield.py](openff/toolkit/typing/engines/smirnoff/forcefield.py)
+- [openff/toolkit/typing/engines/smirnoff/io.py](openff/toolkit/typing/engines/smirnoff/io.py)
+- [openff/toolkit/typing/engines/smirnoff/parameters.py](openff/toolkit/typing/engines/smirnoff/parameters.py)
+- [openff/toolkit/utils/callback.py](openff/toolkit/utils/callback.py)
+- [openff/toolkit/utils/collections.py](openff/toolkit/utils/collections.py)
+- [openff/toolkit/utils/exceptions.py](openff/toolkit/utils/exceptions.py)
+- [openff/toolkit/utils/openeye_wrapper.py](openff/toolkit/utils/openeye_wrapper.py)
+- [openff/toolkit/utils/rdkit_wrapper.py](openff/toolkit/utils/rdkit_wrapper.py)
+- [openff/toolkit/utils/serialization.py](openff/toolkit/utils/serialization.py)
+- [openff/toolkit/utils/toolkits.py](openff/toolkit/utils/toolkits.py)
+- [openff/toolkit/utils/utils.py](openff/toolkit/utils/utils.py)
+- [setup.cfg](setup.cfg)
+
+</details>
+
+
+
+This document provides a comprehensive overview of the OpenFF toolkit repository architecture, core components, and system design. The OpenFF toolkit is a Python library for developing and applying modern molecular mechanics force fields using the SMIRNOFF (SMIRKS Native Open Force Field) specification.
+
+For information about specific usage patterns and examples, see [User Guide](#3). For development workflows and contribution guidelines, see [Development](#4).
+
+## Purpose and Scope
+
+The OpenFF toolkit serves as the foundational software infrastructure for the Open Force Field Initiative, providing tools for:
+
+- **Chemical system representation** through `Molecule` and `Topology` classes
+- **Force field parameter assignment** using SMIRNOFF format via `ForceField` engine
+- **Cheminformatics toolkit integration** through a plugin-based `ToolkitRegistry` system
+- **Multi-format output generation** supporting OpenMM, GROMACS, Amber, and LAMMPS
+
+The toolkit focuses on direct chemical perception using SMIRKS patterns rather than traditional atom typing, enabling more flexible and extensible force field development.
+
+Sources: [README.md:8-15](), [openff/toolkit/__init__.py:1-4]()
+
+## Core System Architecture
+
+```mermaid
+graph TB
+    subgraph "Chemical System Representation"
+        Molecule["Molecule<br/>Chemical structure with atoms/bonds"]
+        Topology["Topology<br/>Collection of molecules in a system"]
+        Atom["Atom<br/>Individual atomic sites"]
+        Bond["Bond<br/>Chemical bonds between atoms"]
+    end
+    
+    subgraph "SMIRNOFF Force Field Engine"
+        ForceField["ForceField<br/>Main parameter assignment engine"]
+        ParameterHandler["ParameterHandler<br/>Bond/Angle/Torsion handlers"]
+        ParameterType["ParameterType<br/>Individual SMIRKS parameters"]
+    end
+    
+    subgraph "Toolkit Integration Layer"
+        ToolkitRegistry["ToolkitRegistry<br/>Plugin management system"]
+        OpenEyeWrapper["OpenEyeToolkitWrapper<br/>Commercial toolkit"]
+        RDKitWrapper["RDKitToolkitWrapper<br/>Open source toolkit"] 
+        AmberToolsWrapper["AmberToolsToolkitWrapper<br/>Charge calculations"]
+    end
+    
+    subgraph "Output Generation"
+        OpenMMSystem["OpenMM System<br/>Simulation-ready objects"]
+        Interchange["Interchange<br/>Universal format converter"]
+        MDFormats["GROMACS/Amber/LAMMPS<br/>MD engine formats"]
+    end
+    
+    Molecule --> Topology
+    Atom --> Molecule
+    Bond --> Molecule
+    Topology --> ForceField
+    ForceField --> ParameterHandler
+    ParameterHandler --> ParameterType
+    
+    ToolkitRegistry --> OpenEyeWrapper
+    ToolkitRegistry --> RDKitWrapper
+    ToolkitRegistry --> AmberToolsWrapper
+    ToolkitRegistry --> Molecule
+    ToolkitRegistry --> ForceField
+    
+    ForceField --> OpenMMSystem
+    ForceField --> Interchange
+    Interchange --> MDFormats
+```
+
+Sources: [openff/toolkit/topology/molecule.py:865-870](), [openff/toolkit/topology/topology.py:394-431](), [openff/toolkit/typing/engines/smirnoff/forcefield.py:137-223](), [openff/toolkit/utils/toolkits.py:101-110]()
+
+## Core Components
+
+### Chemical System Representation
+
+The toolkit's foundation consists of classes for representing molecular systems:
+
+| Component | Class | Purpose | Key Methods |
+|-----------|-------|---------|-------------|
+| **Chemical Entity** | `Molecule` | Immutable molecular structure | `from_smiles()`, `from_file()`, `to_openmm()` |
+| **System Container** | `Topology` | Collection of molecules | `from_molecules()`, `add_molecule()`, `from_pdb()` |
+| **Atomic Sites** | `Atom` | Individual atoms with properties | `symbol`, `formal_charge`, `partial_charge` |
+| **Connectivity** | `Bond` | Chemical bonds between atoms | `bond_order`, `is_aromatic`, `fractional_bond_order` |
+
+Sources: [openff/toolkit/topology/molecule.py:865-1100](), [openff/toolkit/topology/topology.py:394-554]()
+
+### SMIRNOFF Parameter System
+
+The force field engine implements the SMIRNOFF specification through a hierarchical parameter system:
+
+```mermaid
+graph TD
+    ForceField[ForceField] --> BondHandler[BondHandler]
+    ForceField --> AngleHandler[AngleHandler] 
+    ForceField --> TorsionHandler[ProperTorsionHandler]
+    ForceField --> ImproperHandler[ImproperTorsionHandler]
+    ForceField --> vdWHandler[vdWHandler]
+    ForceField --> ElectrostaticsHandler[ElectrostaticsHandler]
+    
+    BondHandler --> BondType[BondType]
+    AngleHandler --> AngleType[AngleType]
+    TorsionHandler --> TorsionType[ProperTorsionType]
+    ImproperHandler --> ImproperType[ImproperTorsionType]
+    vdWHandler --> vdWType[vdWType]
+    
+    BondType --> SMIRKSPattern["SMIRKS: [#6X4:1]-[#6X4:2]"]
+    BondType --> Parameters["k: 340.0 kcal/mol/A²<br/>length: 1.51 A"]
+```
+
+Each `ParameterHandler` manages a specific force field term type (bonds, angles, torsions, etc.) and contains `ParameterType` objects that define SMIRKS patterns and associated physical parameters.
+
+Sources: [openff/toolkit/typing/engines/smirnoff/parameters.py:1-54](), [openff/toolkit/typing/engines/smirnoff/forcefield.py:137-292]()
+
+### Toolkit Integration Architecture
+
+The toolkit integrates external cheminformatics libraries through a plugin-based registry system:
+
+```mermaid
+graph LR
+    GLOBAL_TOOLKIT_REGISTRY[GLOBAL_TOOLKIT_REGISTRY] --> OpenEyeWrapper[OpenEyeToolkitWrapper]
+    GLOBAL_TOOLKIT_REGISTRY --> RDKitWrapper[RDKitToolkitWrapper]
+    GLOBAL_TOOLKIT_REGISTRY --> AmberToolsWrapper[AmberToolsToolkitWrapper]
+    GLOBAL_TOOLKIT_REGISTRY --> BuiltInWrapper[BuiltInToolkitWrapper]
+    
+    OpenEyeWrapper --> OEChem[openeye.oechem]
+    RDKitWrapper --> RDKit[rdkit.Chem]
+    AmberToolsWrapper --> Antechamber[antechamber/sqm]
+    
+    Operations[Molecule Operations] --> GLOBAL_TOOLKIT_REGISTRY
+    Operations --> from_smiles
+    Operations --> generate_conformers
+    Operations --> assign_partial_charges
+    Operations --> to_inchi
+```
+
+The `GLOBAL_TOOLKIT_REGISTRY` maintains precedence order and automatically falls back to available toolkits when methods are called.
+
+Sources: [openff/toolkit/utils/toolkits.py:101-159](), [openff/toolkit/utils/openeye_wrapper.py:88-162](), [openff/toolkit/utils/rdkit_wrapper.py:73-132]()
+
+## Data Flow and Processing Pipeline
+
+```mermaid
+graph LR
+    subgraph "Input Sources"
+        SMILES[SMILES strings]
+        SDF[SDF/MOL2 files]
+        PDB[PDB files]
+        OFFXML[Force field XML]
+    end
+    
+    subgraph "Processing Core"
+        MoleculeCreation[Molecule.from_*]
+        TopologyAssembly[Topology.from_molecules]
+        ForceFieldLoading[ForceField load]
+        ParameterAssignment[create_openmm_system]
+    end
+    
+    subgraph "Output Targets"
+        OpenMMSim[OpenMM Simulation]
+        InterchangeObj[Interchange object]
+        GromacsFiles[GROMACS .top/.gro]
+        AmberFiles[Amber .prmtop/.inpcrd]
+        LAMMPSFiles[LAMMPS data files]
+    end
+    
+    SMILES --> MoleculeCreation
+    SDF --> MoleculeCreation
+    PDB --> TopologyAssembly
+    OFFXML --> ForceFieldLoading
+    
+    MoleculeCreation --> TopologyAssembly
+    TopologyAssembly --> ParameterAssignment
+    ForceFieldLoading --> ParameterAssignment
+    
+    ParameterAssignment --> OpenMMSim
+    ParameterAssignment --> InterchangeObj
+    InterchangeObj --> GromacsFiles
+    InterchangeObj --> AmberFiles
+    InterchangeObj --> LAMMPSFiles
+```
+
+The typical workflow involves creating `Molecule` objects from chemical representations, assembling them into a `Topology`, loading force field parameters via `ForceField`, and generating simulation-ready outputs through either direct OpenMM `System` creation or via `Interchange` for other MD engines.
+
+Sources: [openff/toolkit/topology/molecule.py:1200-1400](), [openff/toolkit/topology/topology.py:525-554](), [openff/toolkit/typing/engines/smirnoff/forcefield.py:700-900]()
+
+## Plugin and Extension System
+
+The toolkit's extensibility is enabled through entry point-based plugin discovery:
+
+```mermaid
+graph TB
+    subgraph "Core Plugin Infrastructure"
+        ParameterHandlerBase[ParameterHandler base class]
+        PluginRegistry[Plugin discovery via entry points]
+        CustomHandlers[Custom ParameterHandler implementations]
+    end
+    
+    subgraph "Built-in Handlers"
+        BondHandler[BondHandler]
+        AngleHandler[AngleHandler]
+        TorsionHandler[ProperTorsionHandler]
+        vdWHandler[vdWHandler]
+        ElectrostaticsHandler[ElectrostaticsHandler]
+    end
+    
+    subgraph "External Plugins"
+        CustomBuckingham[CustomBuckinghamHandler]
+        VirtualSiteHandler[VirtualSiteHandler]
+        NAGLCharges[NAGLToolkitWrapper]
+    end
+    
+    ParameterHandlerBase --> BondHandler
+    ParameterHandlerBase --> AngleHandler
+    ParameterHandlerBase --> TorsionHandler
+    ParameterHandlerBase --> vdWHandler
+    ParameterHandlerBase --> ElectrostaticsHandler
+    
+    ParameterHandlerBase --> CustomBuckingham
+    ParameterHandlerBase --> VirtualSiteHandler
+    PluginRegistry --> NAGLCharges
+    PluginRegistry --> CustomHandlers
+```
+
+Plugin registration occurs through setuptools entry points in the `openff.toolkit.parameter_handler_plugins` group, allowing external packages to extend the toolkit with custom force field terms.
+
+Sources: [openff/toolkit/typing/engines/smirnoff/forcefield.py:70-96](), [openff/toolkit/typing/engines/smirnoff/parameters.py:2400-2500]()
+
+---
+
+# Page: Core Architecture
+
+# Core Architecture
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.pre-commit-config.yaml](.pre-commit-config.yaml)
+- [The-SMIRNOFF-force-field-format.md](The-SMIRNOFF-force-field-format.md)
+- [docs/releasehistory.md](docs/releasehistory.md)
+- [openff/toolkit/_tests/test_toolkits.py](openff/toolkit/_tests/test_toolkits.py)
+- [openff/toolkit/_tests/test_topology.py](openff/toolkit/_tests/test_topology.py)
+- [openff/toolkit/topology/molecule.py](openff/toolkit/topology/molecule.py)
+- [openff/toolkit/topology/topology.py](openff/toolkit/topology/topology.py)
+- [openff/toolkit/typing/engines/smirnoff/forcefield.py](openff/toolkit/typing/engines/smirnoff/forcefield.py)
+- [openff/toolkit/typing/engines/smirnoff/parameters.py](openff/toolkit/typing/engines/smirnoff/parameters.py)
+- [openff/toolkit/utils/exceptions.py](openff/toolkit/utils/exceptions.py)
+- [openff/toolkit/utils/openeye_wrapper.py](openff/toolkit/utils/openeye_wrapper.py)
+- [openff/toolkit/utils/rdkit_wrapper.py](openff/toolkit/utils/rdkit_wrapper.py)
+- [openff/toolkit/utils/serialization.py](openff/toolkit/utils/serialization.py)
+- [openff/toolkit/utils/toolkits.py](openff/toolkit/utils/toolkits.py)
+- [openff/toolkit/utils/utils.py](openff/toolkit/utils/utils.py)
+- [setup.cfg](setup.cfg)
+
+</details>
+
+
+
+This document describes the fundamental architectural components of the OpenFF Toolkit and how they interact to provide force field parametrization capabilities. It covers the core data models for chemical representation, the SMIRNOFF force field engine, and the toolkit integration layer that enables interoperability with external cheminformatics libraries.
+
+For information about specific parameter handlers and force field implementation details, see [SMIRNOFF Force Field System](#2.2). For toolkit wrapper implementations and usage patterns, see [Toolkit Integration System](#2.3).
+
+## Core Chemical Representation System
+
+The OpenFF Toolkit's chemical representation is built around three fundamental classes that form a hierarchical object model: `Molecule`, `Topology`, and their constituent `Atom` and `Bond` objects.
+
+### Molecule and Atom/Bond Architecture
+
+```mermaid
+graph TB
+    subgraph "Chemical Representation Core"
+        FrozenMolecule["FrozenMolecule<br/>Immutable chemical structure"]
+        Molecule["Molecule<br/>Extends FrozenMolecule"]
+        Atom["Atom<br/>Chemical atom representation"]
+        Bond["Bond<br/>Chemical bond representation"]
+        
+        FrozenMolecule --> Atom
+        FrozenMolecule --> Bond
+        Molecule --> FrozenMolecule
+        
+        Atom --> |"bonded_atoms"| Atom
+        Bond --> |"atoms"| Atom
+    end
+    
+    subgraph "Metadata and Properties"
+        AtomMetadataDict["AtomMetadataDict<br/>Atom-level metadata"]
+        HierarchyElement["HierarchyElement<br/>Residue/chain info"]
+        
+        Atom --> AtomMetadataDict
+        Atom --> HierarchyElement
+    end
+    
+    subgraph "Conformer and Charge Data"
+        Conformers["_conformers: list[Quantity]<br/>3D coordinates"]
+        PartialCharges["_partial_charges: Quantity<br/>Atomic charges"]
+        
+        FrozenMolecule --> Conformers
+        FrozenMolecule --> PartialCharges
+    end
+```
+
+The `FrozenMolecule` class [openff/toolkit/topology/molecule.py:865-908]() serves as the immutable base class containing atoms, bonds, and molecular properties. The `Molecule` class extends this to provide mutable operations for building and modifying chemical structures.
+
+### Topology System Architecture
+
+```mermaid
+graph TB
+    subgraph "Topology Container"
+        Topology["Topology<br/>System-level container"]
+        molecules["_molecules: list[MoleculeLike]<br/>Component molecules"]
+        
+        Topology --> molecules
+    end
+    
+    subgraph "Valence Dictionaries"
+        ValenceDict["ValenceDict<br/>Bond/angle indexing"]
+        ImproperDict["ImproperDict<br/>Improper torsion indexing"]  
+        TagSortedDict["TagSortedDict<br/>Tagged parameter ordering"]
+        SortedDict["SortedDict<br/>General sorted indexing"]
+        
+        Topology --> ValenceDict
+        Topology --> ImproperDict
+        Topology --> TagSortedDict
+    end
+    
+    subgraph "System Properties"
+        BoxVectors["box_vectors: Quantity<br/>Periodic boundary conditions"]
+        ConstrainedPairs["constrained_atom_pairs<br/>Distance constraints"]
+        
+        Topology --> BoxVectors
+        Topology --> ConstrainedPairs
+    end
+    
+    subgraph "Molecule Types"
+        MoleculeLike["MoleculeLike<br/>Union type"]
+        RegularMolecule["Molecule"]
+        SimpleMolecule["_SimpleMolecule<br/>Lightweight representation"]
+        
+        MoleculeLike --> RegularMolecule
+        MoleculeLike --> SimpleMolecule
+        molecules --> MoleculeLike
+    end
+```
+
+The `Topology` class [openff/toolkit/topology/topology.py:394-431]() acts as a container for one or more molecules, managing system-level properties like periodic boundary conditions and constraints. It uses specialized dictionary classes to efficiently handle valence term indexing with proper symmetry considerations.
+
+Sources: [openff/toolkit/topology/molecule.py:865-908](), [openff/toolkit/topology/topology.py:394-431](), [openff/toolkit/topology/topology.py:160-392]()
+
+## SMIRNOFF Force Field Engine
+
+The SMIRNOFF force field system implements a modular, plugin-based architecture for parameter assignment using SMIRKS pattern matching.
+
+### ForceField and ParameterHandler Architecture
+
+```mermaid
+graph TB
+    subgraph "Force Field Core"
+        ForceField["ForceField<br/>Main force field class"]
+        ParameterIOHandler["ParameterIOHandler<br/>Serialization interface"]
+        
+        ForceField --> ParameterIOHandler
+    end
+    
+    subgraph "Parameter Handler System"
+        ParameterHandler["ParameterHandler<br/>Base parameter class"]
+        BondHandler["BondHandler<br/>Bond parameters"]
+        AngleHandler["AngleHandler<br/>Angle parameters"] 
+        ProperTorsionHandler["ProperTorsionHandler<br/>Torsion parameters"]
+        vdWHandler["vdWHandler<br/>van der Waals parameters"]
+        ElectrostaticsHandler["ElectrostaticsHandler<br/>Electrostatic methods"]
+        
+        ForceField --> ParameterHandler
+        ParameterHandler --> BondHandler
+        ParameterHandler --> AngleHandler
+        ParameterHandler --> ProperTorsionHandler
+        ParameterHandler --> vdWHandler
+        ParameterHandler --> ElectrostaticsHandler
+    end
+    
+    subgraph "Parameter Types"
+        ParameterType["ParameterType<br/>Individual parameter"]
+        BondType["BondType"]
+        AngleType["AngleType"]
+        ProperTorsionType["ProperTorsionType"]
+        vdWType["vdWType"]
+        
+        BondHandler --> BondType
+        AngleHandler --> AngleType
+        ProperTorsionHandler --> ProperTorsionType
+        vdWHandler --> vdWType
+        ParameterType --> BondType
+        ParameterType --> AngleType
+        ParameterType --> ProperTorsionType
+        ParameterType --> vdWType
+    end
+```
+
+The `ForceField` class [openff/toolkit/typing/engines/smirnoff/forcefield.py:137-223]() serves as the main entry point for SMIRNOFF parameter assignment. It manages a collection of `ParameterHandler` objects that each handle specific types of interactions through SMIRKS pattern matching.
+
+### Parameter Attribute System
+
+```mermaid
+graph TB
+    subgraph "Parameter Descriptors"
+        ParameterAttribute["ParameterAttribute<br/>Basic parameter descriptor"]
+        IndexedParameterAttribute["IndexedParameterAttribute<br/>Multiple term parameters"]
+        MappedParameterAttribute["MappedParameterAttribute<br/>Key-value parameters"]
+        IndexedMappedParameterAttribute["IndexedMappedParameterAttribute<br/>Sequence of mappings"]
+        
+        ParameterAttribute --> IndexedParameterAttribute
+        ParameterAttribute --> MappedParameterAttribute
+        ParameterAttribute --> IndexedMappedParameterAttribute
+    end
+    
+    subgraph "Validation and Conversion"
+        UnitValidation["Unit validation<br/>_validate_units()"]
+        CustomConverter["Custom converter<br/>_call_converter()"]
+        ValidatedList["ValidatedList<br/>Sequence validation"]
+        ValidatedDict["ValidatedDict<br/>Mapping validation"]
+        
+        ParameterAttribute --> UnitValidation
+        ParameterAttribute --> CustomConverter
+        IndexedParameterAttribute --> ValidatedList
+        MappedParameterAttribute --> ValidatedDict
+    end
+    
+    subgraph "Usage in Parameter Types"
+        smirks["smirks: ParameterAttribute<br/>SMIRKS pattern"]
+        length["length: ParameterAttribute<br/>Bond length parameter"]
+        k["k: IndexedParameterAttribute<br/>Force constants"]
+        
+        ParameterType --> smirks
+        BondType --> length
+        ProperTorsionType --> k
+    end
+```
+
+The parameter system uses descriptor classes [openff/toolkit/typing/engines/smirnoff/parameters.py:225-436]() to provide automatic unit validation, type conversion, and constraints on parameter values.
+
+Sources: [openff/toolkit/typing/engines/smirnoff/forcefield.py:137-223](), [openff/toolkit/typing/engines/smirnoff/parameters.py:225-436](), [openff/toolkit/typing/engines/smirnoff/parameters.py:438-585]()
+
+## Toolkit Integration Layer
+
+The toolkit integration system provides a unified interface to multiple cheminformatics libraries through a registry pattern and wrapper classes.
+
+### ToolkitRegistry and Wrapper Architecture
+
+```mermaid
+graph TB
+    subgraph "Registry System"
+        ToolkitRegistry["ToolkitRegistry<br/>Manages toolkit precedence"]
+        GLOBAL_TOOLKIT_REGISTRY["GLOBAL_TOOLKIT_REGISTRY<br/>Default global instance"]
+        toolkit_registry_manager["toolkit_registry_manager<br/>Context manager"]
+        
+        GLOBAL_TOOLKIT_REGISTRY --> ToolkitRegistry
+        toolkit_registry_manager --> ToolkitRegistry
+    end
+    
+    subgraph "Base Wrapper System"
+        ToolkitWrapper["ToolkitWrapper<br/>Abstract base class"]
+        toolkit_name["_toolkit_name: str"]
+        toolkit_version["_toolkit_version: str"]
+        is_available["is_available(): bool"]
+        
+        ToolkitWrapper --> toolkit_name
+        ToolkitWrapper --> toolkit_version
+        ToolkitWrapper --> is_available
+    end
+    
+    subgraph "Concrete Wrappers"
+        OpenEyeToolkitWrapper["OpenEyeToolkitWrapper<br/>Commercial toolkit"]
+        RDKitToolkitWrapper["RDKitToolkitWrapper<br/>Open source toolkit"]
+        AmberToolsToolkitWrapper["AmberToolsToolkitWrapper<br/>Charge calculation"]
+        NAGLToolkitWrapper["NAGLToolkitWrapper<br/>Neural network charges"]
+        BuiltInToolkitWrapper["BuiltInToolkitWrapper<br/>Basic operations"]
+        
+        ToolkitWrapper --> OpenEyeToolkitWrapper
+        ToolkitWrapper --> RDKitToolkitWrapper
+        ToolkitWrapper --> AmberToolsToolkitWrapper
+        ToolkitWrapper --> NAGLToolkitWrapper
+        ToolkitWrapper --> BuiltInToolkitWrapper
+        
+        ToolkitRegistry --> OpenEyeToolkitWrapper
+        ToolkitRegistry --> RDKitToolkitWrapper
+        ToolkitRegistry --> AmberToolsToolkitWrapper
+    end
+```
+
+The `ToolkitRegistry` class [openff/toolkit/utils/toolkit_registry.py]() manages the precedence order of available toolkits and dispatches method calls to the first capable toolkit. The `GLOBAL_TOOLKIT_REGISTRY` [openff/toolkit/utils/toolkits.py:102-110]() provides a default instance used throughout the codebase.
+
+### Toolkit Method Dispatch
+
+```mermaid
+graph TB
+    subgraph "Method Categories"
+        MoleculeIO["Molecule I/O<br/>from_file, to_file"]
+        ConformerGen["Conformer Generation<br/>generate_conformers"]
+        ChargeCalc["Charge Calculation<br/>assign_partial_charges"]
+        Stereochemistry["Stereochemistry<br/>assign_stereochemistry_from_3d"]
+        Aromaticity["Aromaticity<br/>assign_aromaticity"]
+    end
+    
+    subgraph "Dispatch Pattern"
+        RegistryCall["registry.call(method_name, *args)"]
+        FirstAvailable["Find first available toolkit"]
+        MethodExecution["Execute toolkit method"]
+        FallbackLogic["Try next toolkit on failure"]
+        
+        RegistryCall --> FirstAvailable
+        FirstAvailable --> MethodExecution
+        MethodExecution --> FallbackLogic
+    end
+    
+    subgraph "Supported File Formats"
+        toolkit_file_read_formats["_toolkit_file_read_formats<br/>Input format list"]
+        toolkit_file_write_formats["_toolkit_file_write_formats<br/>Output format list"]
+        
+        OpenEyeToolkitWrapper --> toolkit_file_read_formats
+        RDKitToolkitWrapper --> toolkit_file_write_formats
+    end
+```
+
+Each toolkit wrapper implements a standard interface for common operations, with the registry automatically selecting the appropriate toolkit based on availability and method support.
+
+Sources: [openff/toolkit/utils/toolkits.py:102-110](), [openff/toolkit/utils/openeye_wrapper.py:89-227](), [openff/toolkit/utils/rdkit_wrapper.py:73-132]()
+
+## Data Flow and System Integration
+
+The OpenFF Toolkit follows a clear data flow from input molecular representations through force field parametrization to simulation-ready output.
+
+### Parametrization Pipeline
+
+```mermaid
+graph LR
+    subgraph "Input Sources"
+        SMILES["SMILES strings"]
+        SDF["SDF files"]
+        PDB["PDB files"] 
+        OtherFormats["Other formats"]
+    end
+    
+    subgraph "Chemical Representation"
+        from_smiles["Molecule.from_smiles()"]
+        from_file["Molecule.from_file()"]
+        from_pdb["Topology.from_pdb()"]
+        
+        SMILES --> from_smiles
+        SDF --> from_file
+        PDB --> from_pdb
+        OtherFormats --> from_file
+    end
+    
+    subgraph "Force Field Application"
+        create_interchange["ForceField.create_interchange()"]
+        parameter_assignment["Parameter assignment via SMIRKS"]
+        
+        from_smiles --> create_interchange
+        from_file --> create_interchange
+        from_pdb --> create_interchange
+        create_interchange --> parameter_assignment
+    end
+    
+    subgraph "Output Generation"
+        Interchange["Interchange object"]
+        to_openmm["to_openmm()"]
+        to_gromacs["to_gromacs()"]
+        to_amber["to_amber()"]
+        
+        parameter_assignment --> Interchange
+        Interchange --> to_openmm
+        Interchange --> to_gromacs
+        Interchange --> to_amber
+    end
+```
+
+### Component Interaction Flow
+
+```mermaid
+graph TB
+    subgraph "User Interface Layer"
+        UserCode["User application code"]
+        HighLevelAPI["High-level API calls"]
+    end
+    
+    subgraph "Core Processing"
+        MoleculeCreation["Molecule/Topology creation"]
+        ToolkitDispatch["Toolkit method dispatch"]
+        ParameterMatching["SMIRKS pattern matching"]
+        ForceFieldAssignment["Parameter assignment"]
+    end
+    
+    subgraph "External Dependencies"
+        CheminformaticsToolkits["RDKit, OpenEye, etc."]
+        SimulationPackages["OpenMM, GROMACS, Amber"]
+    end
+    
+    UserCode --> HighLevelAPI
+    HighLevelAPI --> MoleculeCreation
+    MoleculeCreation --> ToolkitDispatch
+    ToolkitDispatch --> CheminformaticsToolkits
+    ToolkitDispatch --> ParameterMatching
+    ParameterMatching --> ForceFieldAssignment
+    ForceFieldAssignment --> SimulationPackages
+```
+
+The system maintains clear separation between chemical representation, force field logic, and external toolkit integration, enabling modularity and extensibility while providing a unified user interface.
+
+Sources: [openff/toolkit/topology/molecule.py:865-908](), [openff/toolkit/typing/engines/smirnoff/forcefield.py:137-223](), [openff/toolkit/utils/toolkits.py:102-110]()
+
+---
+
+# Page: Molecule and Topology System
+
+# Molecule and Topology System
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.pre-commit-config.yaml](.pre-commit-config.yaml)
+- [docs/releasehistory.md](docs/releasehistory.md)
+- [openff/toolkit/_tests/_stale_tests.py](openff/toolkit/_tests/_stale_tests.py)
+- [openff/toolkit/_tests/test_energies.py](openff/toolkit/_tests/test_energies.py)
+- [openff/toolkit/_tests/test_examples.py](openff/toolkit/_tests/test_examples.py)
+- [openff/toolkit/_tests/test_links.py](openff/toolkit/_tests/test_links.py)
+- [openff/toolkit/_tests/test_mm_molecule.py](openff/toolkit/_tests/test_mm_molecule.py)
+- [openff/toolkit/_tests/test_nagl.py](openff/toolkit/_tests/test_nagl.py)
+- [openff/toolkit/_tests/test_toolkits.py](openff/toolkit/_tests/test_toolkits.py)
+- [openff/toolkit/_tests/test_topology.py](openff/toolkit/_tests/test_topology.py)
+- [openff/toolkit/_tests/test_utils_serialization.py](openff/toolkit/_tests/test_utils_serialization.py)
+- [openff/toolkit/_tests/utils.py](openff/toolkit/_tests/utils.py)
+- [openff/toolkit/topology/_mm_molecule.py](openff/toolkit/topology/_mm_molecule.py)
+- [openff/toolkit/topology/molecule.py](openff/toolkit/topology/molecule.py)
+- [openff/toolkit/topology/topology.py](openff/toolkit/topology/topology.py)
+- [openff/toolkit/typing/engines/smirnoff/forcefield.py](openff/toolkit/typing/engines/smirnoff/forcefield.py)
+- [openff/toolkit/typing/engines/smirnoff/parameters.py](openff/toolkit/typing/engines/smirnoff/parameters.py)
+- [openff/toolkit/utils/exceptions.py](openff/toolkit/utils/exceptions.py)
+- [openff/toolkit/utils/nagl_wrapper.py](openff/toolkit/utils/nagl_wrapper.py)
+- [openff/toolkit/utils/openeye_wrapper.py](openff/toolkit/utils/openeye_wrapper.py)
+- [openff/toolkit/utils/rdkit_wrapper.py](openff/toolkit/utils/rdkit_wrapper.py)
+- [openff/toolkit/utils/serialization.py](openff/toolkit/utils/serialization.py)
+- [openff/toolkit/utils/toolkits.py](openff/toolkit/utils/toolkits.py)
+- [openff/toolkit/utils/utils.py](openff/toolkit/utils/utils.py)
+- [setup.cfg](setup.cfg)
+
+</details>
+
+
+
+This document covers the core molecular representation and system modeling components of the OpenFF toolkit. The Molecule and Topology system provides the fundamental data structures for representing individual molecules and larger chemical systems containing multiple molecules. This includes atomic and bond connectivity, molecular properties, hierarchical organization (residues, chains), and integration with cheminformatics toolkits.
+
+For information about force field parameter assignment to these molecular systems, see [SMIRNOFF Force Field System](#2.2). For toolkit integration details, see [Toolkit Integration System](#2.3).
+
+## Core Architecture
+
+The system is built around a hierarchical set of classes that represent chemical systems at different levels of granularity:
+
+```mermaid
+graph TB
+    subgraph "Particle Level"
+        Particle["Particle<br/>(Base class)"]
+        Atom["Atom<br/>(Chemical atoms)"]
+        Bond["Bond<br/>(Chemical bonds)"]
+    end
+    
+    subgraph "Molecule Level"
+        FrozenMolecule["FrozenMolecule<br/>(Immutable molecule)"]
+        Molecule["Molecule<br/>(Mutable molecule)"]
+        SimpleMolecule["_SimpleMolecule<br/>(Lightweight representation)"]
+    end
+    
+    subgraph "System Level"
+        Topology["Topology<br/>(Collection of molecules)"]
+        ValenceDict["ValenceDict<br/>(Bond/angle indexing)"]
+        ImproperDict["ImproperDict<br/>(Improper torsion indexing)"]
+    end
+    
+    subgraph "Properties & Metadata"
+        AtomMetadata["AtomMetadataDict<br/>(Residue/chain info)"]
+        HierarchyScheme["HierarchyScheme<br/>(Organizational schemes)"]
+        Conformers["Conformers<br/>(3D coordinates)"]
+    end
+    
+    Particle --> Atom
+    Particle --> Bond
+    Atom --> FrozenMolecule
+    Bond --> FrozenMolecule
+    FrozenMolecule --> Molecule
+    FrozenMolecule --> SimpleMolecule
+    Molecule --> Topology
+    SimpleMolecule --> Topology
+    
+    Topology --> ValenceDict
+    Topology --> ImproperDict
+    Atom --> AtomMetadata
+    FrozenMolecule --> HierarchyScheme
+    FrozenMolecule --> Conformers
+```
+
+**Sources:** [openff/toolkit/topology/molecule.py:120-865](), [openff/toolkit/topology/topology.py:394-431](), [openff/toolkit/topology/_mm_molecule.py:38-44]()
+
+## Molecule Representation System
+
+### Core Molecule Classes
+
+The molecule representation system uses a composition-based approach where molecules contain atoms and bonds as distinct objects:
+
+```mermaid
+graph TB
+    subgraph "FrozenMolecule Core"
+        FrozenMol["FrozenMolecule<br/>(_partial_charges, _conformers, _properties)"]
+        AtomList["atoms: list[Atom]"]
+        BondList["bonds: list[Bond]"]
+        Properties["_properties: dict"]
+        Conformers["_conformers: list[Quantity]"]
+        PartialCharges["_partial_charges: Quantity"]
+    end
+    
+    subgraph "Atom Properties"
+        AtomicNumber["atomic_number: int"]
+        FormalCharge["formal_charge: Quantity"]
+        IsAromatic["is_aromatic: bool"]
+        Stereochemistry["stereochemistry: str"]
+        AtomName["name: str"]
+        AtomMetadata["metadata: AtomMetadataDict"]
+    end
+    
+    subgraph "Bond Properties"
+        BondOrder["bond_order: int"]
+        BondAromatic["is_aromatic: bool"]
+        FractionalOrder["fractional_bond_order: float"]
+        BondStereo["stereochemistry: str"]
+    end
+    
+    FrozenMol --> AtomList
+    FrozenMol --> BondList
+    FrozenMol --> Properties
+    FrozenMol --> Conformers
+    FrozenMol --> PartialCharges
+    
+    AtomList --> AtomicNumber
+    AtomList --> FormalCharge
+    AtomList --> IsAromatic
+    AtomList --> Stereochemistry
+    AtomList --> AtomName
+    AtomList --> AtomMetadata
+    
+    BondList --> BondOrder
+    BondList --> BondAromatic
+    BondList --> FractionalOrder
+    BondList --> BondStereo
+```
+
+**Sources:** [openff/toolkit/topology/molecule.py:915-964](), [openff/toolkit/topology/molecule.py:208-588](), [openff/toolkit/topology/molecule.py:649-858]()
+
+### Molecule Creation and Manipulation
+
+The `Molecule` class provides multiple factory methods for creating molecular objects from different sources:
+
+| Creation Method | Purpose | Key Parameters |
+|----------------|---------|----------------|
+| `from_smiles()` | Create from SMILES string | `smiles`, `allow_undefined_stereo`, `toolkit_registry` |
+| `from_file()` | Load from molecular file formats | `file_path`, `file_format`, `toolkit_registry` |
+| `from_rdkit()` | Convert from RDKit molecule | `rdmol`, `allow_undefined_stereo`, `hydrogens_are_explicit` |
+| `from_openeye()` | Convert from OpenEye molecule | `oemol`, `allow_undefined_stereo` |
+| `from_polymer_pdb()` | Load protein from PDB | `file_path`, Includes residue perception |
+
+**Sources:** [openff/toolkit/topology/molecule.py:1238-1399](), [openff/toolkit/topology/molecule.py:1541-1616](), [openff/toolkit/topology/molecule.py:2485-2619]()
+
+### SimpleMolecule System
+
+The `_SimpleMolecule` class provides a lightweight alternative representation for specific use cases:
+
+```mermaid
+graph LR
+    subgraph "SimpleMolecule Components"
+        SimpleMol["_SimpleMolecule"]
+        SimpleAtom["_SimpleAtom<br/>(atomic_number, name)"]
+        SimpleBond["_SimpleBond<br/>(atom1, atom2)"]
+        SimpleConformers["conformers: list[Quantity]"]
+    end
+    
+    subgraph "Conversion Methods"
+        FromMolecule["from_molecule()<br/>(Copy from Molecule)"]
+        ToTopology["to_topology()<br/>(Create single-molecule topology)"]
+        ToDict["to_dict()<br/>(Serialization)"]
+    end
+    
+    SimpleMol --> SimpleAtom
+    SimpleMol --> SimpleBond
+    SimpleMol --> SimpleConformers
+    SimpleMol --> FromMolecule
+    SimpleMol --> ToTopology
+    SimpleMol --> ToDict
+```
+
+**Sources:** [openff/toolkit/topology/_mm_molecule.py:38-159](), [openff/toolkit/topology/_mm_molecule.py:469-481]()
+
+## Topology System
+
+### Topology Structure
+
+The `Topology` class represents complete chemical systems containing multiple molecules:
+
+```mermaid
+graph TB
+    subgraph "Topology Core"
+        TopologyClass["Topology"]
+        MoleculeList["_molecules: list[MoleculeLike]"]
+        BoxVectors["_box_vectors: Quantity"]
+        Constraints["_constrained_atom_pairs: dict"]
+        AromaticityModel["_aromaticity_model: str"]
+    end
+    
+    subgraph "Molecule Management"
+        AddMolecule["add_molecule()<br/>(Returns molecule index)"]
+        AddMolecules["add_molecules()<br/>(Batch addition)"]
+        UniqueMolecules["unique_molecules<br/>(Property)"]
+        IdenticalGroups["identical_molecule_groups<br/>(Property)"]
+    end
+    
+    subgraph "System Properties"
+        Periodic["is_periodic: bool"]
+        NAtoms["n_atoms: int"]
+        NBonds["n_bonds: int"]
+        NMolecules["n_molecules: int"]
+    end
+    
+    TopologyClass --> MoleculeList
+    TopologyClass --> BoxVectors
+    TopologyClass --> Constraints
+    TopologyClass --> AromaticityModel
+    
+    TopologyClass --> AddMolecule
+    TopologyClass --> AddMolecules
+    TopologyClass --> UniqueMolecules
+    TopologyClass --> IdenticalGroups
+    
+    TopologyClass --> Periodic
+    TopologyClass --> NAtoms
+    TopologyClass --> NBonds
+    TopologyClass --> NMolecules
+```
+
+**Sources:** [openff/toolkit/topology/topology.py:394-460](), [openff/toolkit/topology/topology.py:689-713](), [openff/toolkit/topology/topology.py:1250-1312]()
+
+### Topology Creation Methods
+
+| Factory Method | Purpose | Key Parameters |
+|---------------|---------|----------------|
+| `from_molecules()` | Create from molecule list | `molecules` |
+| `from_openmm()` | Convert from OpenMM topology | `openmm_topology`, `unique_molecules` |
+| `from_mdtraj()` | Convert from MDTraj topology | `mdtraj_topology`, `unique_molecules` |
+| `from_pdb()` | Load directly from PDB file | `file_path`, `_custom_substructures` |
+
+**Sources:** [openff/toolkit/topology/topology.py:525-553](), [openff/toolkit/topology/topology.py:1618-1730](), [openff/toolkit/topology/topology.py:1970-2025]()
+
+## Connectivity and Valence Handling
+
+### Specialized Dictionary Classes
+
+The system uses several specialized dictionary classes to handle molecular connectivity efficiently:
+
+```mermaid
+graph TB
+    subgraph "Dictionary Hierarchy"
+        TransformedDict["_TransformedDict<br/>(Base class with key transformation)"]
+        ValenceDict["ValenceDict<br/>(Bond/angle ordering)"]
+        ImproperDict["ImproperDict<br/>(Improper torsion handling)"]
+        TagSortedDict["TagSortedDict<br/>(Tagged parameter mapping)"]
+        SortedDict["SortedDict<br/>(Sorted key access)"]
+    end
+    
+    subgraph "Key Transformation Logic"
+        ValenceTransform["key_transform()<br/>(Reverse if first > last)"]
+        ImproperTransform["key_transform()<br/>(Sort connected atoms)"]
+        TaggedTransform["__keytransform__()<br/>(Maintain tagged order)"]
+    end
+    
+    TransformedDict --> ValenceDict
+    TransformedDict --> ImproperDict
+    TransformedDict --> TagSortedDict
+    TransformedDict --> SortedDict
+    
+    ValenceDict --> ValenceTransform
+    ImproperDict --> ImproperTransform
+    TagSortedDict --> TaggedTransform
+```
+
+**Sources:** [openff/toolkit/topology/topology.py:95-131](), [openff/toolkit/topology/topology.py:160-211](), [openff/toolkit/topology/topology.py:330-391](), [openff/toolkit/topology/topology.py:235-328]()
+
+### Valence Term Indexing
+
+Each dictionary class provides specialized indexing for different types of molecular connectivity:
+
+| Dictionary Type | Use Case | Key Format | Ordering Rule |
+|----------------|----------|------------|---------------|
+| `ValenceDict` | Bonds, angles | `(atom1, atom2)` | Reverse if first > last |
+| `ImproperDict` | Improper torsions | `(atom1, center, atom3, atom4)` | Sort connected atoms, preserve center |
+| `TagSortedDict` | Tagged parameters | `(atom1, atom2, ...)` | Maintain original tag order |
+
+**Sources:** [openff/toolkit/topology/topology.py:163-170](), [openff/toolkit/topology/topology.py:334-347](), [openff/toolkit/topology/topology.py:274-328]()
+
+## Hierarchy and Metadata Systems
+
+### Hierarchy Schemes
+
+The system supports hierarchical organization of atoms within molecules:
+
+```mermaid
+graph TB
+    subgraph "Hierarchy System"
+        HierarchyScheme["HierarchyScheme<br/>(Organizational scheme)"]
+        HierarchyElement["HierarchyElement<br/>(Individual elements)"]
+        IteratorName["iterator_name: str<br/>(residues, chains, etc.)"]
+        ElementIdentifier["identifier: str<br/>(Unique within scheme)"]
+    end
+    
+    subgraph "Default Schemes"
+        ResidueScheme["residue hierarchy<br/>(Based on metadata)"]
+        ChainScheme["chain hierarchy<br/>(Based on metadata)"]
+        DefaultIterators["Default iterators:<br/>residues, chains"]
+    end
+    
+    subgraph "Atom Metadata"
+        AtomMetadataDict["AtomMetadataDict"]
+        ResidueNumber["residue_number"]
+        ResidueName["residue_name"]
+        ChainID["chain_id"]
+        InsertionCode["insertion_code"]
+    end
+    
+    HierarchyScheme --> HierarchyElement
+    HierarchyScheme --> IteratorName
+    HierarchyElement --> ElementIdentifier
+    
+    HierarchyScheme --> ResidueScheme
+    HierarchyScheme --> ChainScheme
+    ResidueScheme --> DefaultIterators
+    ChainScheme --> DefaultIterators
+    
+    AtomMetadataDict --> ResidueNumber
+    AtomMetadataDict --> ResidueName
+    AtomMetadataDict --> ChainID
+    AtomMetadataDict --> InsertionCode
+```
+
+**Sources:** [openff/toolkit/topology/molecule.py:4840-4933](), [openff/toolkit/topology/molecule.py:4950-5050](), [openff/toolkit/topology/molecule.py:190-206]()
+
+## Integration with External Systems
+
+### Cheminformatics Toolkit Integration
+
+The molecule and topology systems integrate seamlessly with external cheminformatics toolkits:
+
+```mermaid
+graph LR
+    subgraph "Molecule Conversion Flow"
+        ExternalMol["External Molecule<br/>(RDKit/OpenEye)"]
+        ToolkitWrapper["ToolkitWrapper<br/>(from_object method)"]
+        OFFMolecule["OpenFF Molecule<br/>(Internal representation)"]
+        TopologySystem["Topology<br/>(System level)"]
+    end
+    
+    subgraph "Supported Operations"
+        ConformerGen["Conformer generation"]
+        ChargeAssign["Partial charge assignment"]
+        StereoPerception["Stereochemistry perception"]
+        AromaticityModel["Aromaticity perception"]
+    end
+    
+    ExternalMol --> ToolkitWrapper
+    ToolkitWrapper --> OFFMolecule
+    OFFMolecule --> TopologySystem
+    
+    ToolkitWrapper --> ConformerGen
+    ToolkitWrapper --> ChargeAssign
+    ToolkitWrapper --> StereoPerception
+    ToolkitWrapper --> AromaticityModel
+```
+
+**Sources:** [openff/toolkit/topology/molecule.py:1541-1616](), [openff/toolkit/topology/molecule.py:1238-1326](), [openff/toolkit/utils/openeye_wrapper.py:279-325](), [openff/toolkit/utils/rdkit_wrapper.py:134-179]()
+
+### Serialization and Persistence
+
+The system provides comprehensive serialization capabilities:
+
+| Format | Method | Use Case |
+|--------|--------|----------|
+| Dictionary | `to_dict()` / `from_dict()` | Internal serialization |
+| JSON | `to_json()` / `from_json()` | Human-readable storage |
+| File formats | `to_file()` / `from_file()` | Standard chemical formats |
+| OpenMM | `to_openmm()` / `from_openmm()` | Simulation integration |
+
+**Sources:** [openff/toolkit/topology/molecule.py:5565-5625](), [openff/toolkit/topology/topology.py:2892-2957](), [openff/toolkit/utils/serialization.py:23-122]()
+
+---
+
+# Page: SMIRNOFF Force Field System
+
+# SMIRNOFF Force Field System
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [The-SMIRNOFF-force-field-format.md](The-SMIRNOFF-force-field-format.md)
+- [docs/typing.rst](docs/typing.rst)
+- [openff/toolkit/_tests/test_forcefield.py](openff/toolkit/_tests/test_forcefield.py)
+- [openff/toolkit/_tests/test_molecule.py](openff/toolkit/_tests/test_molecule.py)
+- [openff/toolkit/_tests/test_parameters.py](openff/toolkit/_tests/test_parameters.py)
+
+</details>
+
+
+
+## Purpose and Scope
+
+The SMIRNOFF Force Field System is the core parameterization engine of the OpenFF toolkit, responsible for applying molecular mechanics parameters to chemical systems using SMIRKS-based pattern matching. This system implements the SMIRNOFF (SMIRks Native Open Force Field) specification, which uses chemical perception via SMIRKS patterns rather than atom types for parameter assignment.
+
+This document covers the force field architecture, parameter handlers, SMIRKS pattern matching, and the parameter application process. For information about the underlying molecule and topology representations, see [Molecule and Topology System](#2.1). For details about cheminformatics toolkit integration, see [Toolkit Integration System](#2.3).
+
+## Core Architecture
+
+The SMIRNOFF system is built around three main components: the `ForceField` class that orchestrates parameter assignment, `ParameterHandler` classes that manage specific types of parameters, and `ParameterType` classes that represent individual parameter definitions.
+
+### ForceField Class Structure
+
+```mermaid
+graph TD
+    FF["ForceField"] --> PH1["BondHandler"]
+    FF --> PH2["AngleHandler"] 
+    FF --> PH3["ProperTorsionHandler"]
+    FF --> PH4["ImproperTorsionHandler"]
+    FF --> PH5["vdWHandler"]
+    FF --> PH6["ElectrostaticsHandler"]
+    FF --> PH7["LibraryChargeHandler"]
+    FF --> PH8["ToolkitAM1BCCHandler"]
+    
+    PH1 --> PT1["BondType parameters"]
+    PH2 --> PT2["AngleType parameters"]
+    PH3 --> PT3["ProperTorsionType parameters"]
+    PH4 --> PT4["ImproperTorsionType parameters"]
+    PH5 --> PT5["vdWType parameters"]
+    PH6 --> PT6["Electrostatics settings"]
+    PH7 --> PT7["LibraryChargeType parameters"]
+    PH8 --> PT8["AM1BCC settings"]
+```
+
+**Core ForceField Architecture**
+
+The `ForceField` class serves as the central coordinator, maintaining a registry of `ParameterHandler` instances. Each handler manages parameters for a specific energy term (bonds, angles, etc.) and contains a list of `ParameterType` objects that define the actual parameter values and their associated SMIRKS patterns.
+
+Sources: [openff/toolkit/_tests/test_forcefield.py:782-901](), [docs/typing.rst:16-31]()
+
+### Parameter Handler Registration
+
+```mermaid
+graph LR
+    FF["ForceField"] --> Registry["_parameter_handlers dict"]
+    Registry --> BH["'Bonds': BondHandler"]
+    Registry --> AH["'Angles': AngleHandler"]
+    Registry --> TH["'ProperTorsions': ProperTorsionHandler"]
+    Registry --> VH["'vdW': vdWHandler"]
+    
+    FF --> Classes["_parameter_handler_classes dict"]
+    Classes --> BC["'Bonds': BondHandler class"]
+    Classes --> AC["'Angles': AngleHandler class"]
+    Classes --> TC["'ProperTorsions': ProperTorsionHandler class"]
+    Classes --> VC["'vdW': vdWHandler class"]
+```
+
+**Parameter Handler Registration System**
+
+Parameter handlers are registered by their `TAGNAME` attribute and can be accessed using the `get_parameter_handler()` method or dictionary-style lookup. The force field maintains both handler instances and handler classes for dynamic instantiation.
+
+Sources: [openff/toolkit/_tests/test_forcefield.py:653-683](), [openff/toolkit/_tests/test_forcefield.py:1672-1702]()
+
+## SMIRKS Pattern Matching System
+
+The SMIRNOFF system uses SMIRKS (SMILES arbitrary target specification) patterns to identify chemical environments for parameter assignment. Each parameter includes a SMIRKS pattern that defines which molecular substructures it applies to.
+
+### Pattern Hierarchy and Precedence
+
+```mermaid
+graph TD
+    Mol["Molecule topology"] --> Match["SMIRKS pattern matching"]
+    Match --> Generic["[*:1]~[*:2] (generic bonds)"]
+    Match --> Specific1["[#6:1]-[#6:2] (C-C bonds)"]
+    Match --> Specific2["[#6X4:1]-[#6X4:2] (sp3 C-C bonds)"]
+    
+    Generic --> Apply1["Lower precedence"]
+    Specific1 --> Apply2["Higher precedence"]
+    Specific2 --> Apply3["Highest precedence"]
+    
+    Apply3 --> Result["Final parameter assignment"]
+    Apply2 -.-> Result
+    Apply1 -.-> Result
+```
+
+**SMIRKS Pattern Precedence System**
+
+Parameters are applied in order of specificity, with more specific patterns overriding more general ones. The last matching parameter in the handler's parameter list is used for each chemical environment.
+
+Sources: [openff/toolkit/_tests/test_forcefield.py:1725-1741](), [openff/toolkit/_tests/test_parameters.py:826-913]()
+
+### Tagged Atom System
+
+SMIRKS patterns use numbered tags (`:1`, `:2`, etc.) to identify specific atoms that receive parameters. Each parameter type defines how many tagged atoms it expects and what parameters apply to each.
+
+```mermaid
+graph LR
+    SMIRKS["[#6X4:1]-[#6X4:2]"] --> Atom1[":1 tagged atom"]
+    SMIRKS --> Atom2[":2 tagged atom"]
+    
+    Atom1 --> Param1["BondType.length"]
+    Atom1 --> Param2["BondType.k"]
+    Atom2 --> Param1
+    Atom2 --> Param2
+```
+
+**Tagged Atom Parameter Assignment**
+
+Sources: [openff/toolkit/_tests/test_parameters.py:1098-1140]()
+
+## Parameter Types and Handlers
+
+The SMIRNOFF system includes handlers for all major molecular mechanics energy terms, each with specialized parameter types and validation logic.
+
+### Core Parameter Handlers
+
+| Handler | Purpose | Parameter Attributes |
+|---------|---------|---------------------|
+| `BondHandler` | Harmonic bond potentials | `length`, `k`, bond order interpolation |
+| `AngleHandler` | Harmonic angle potentials | `angle`, `k` |
+| `ProperTorsionHandler` | Proper dihedral terms | `periodicity`, `phase`, `k`, `idivf` |
+| `ImproperTorsionHandler` | Improper dihedral terms | `periodicity`, `phase`, `k`, `idivf` |
+| `vdWHandler` | van der Waals parameters | `sigma`, `epsilon`, combining rules |
+| `ElectrostaticsHandler` | Electrostatic settings | `method`, `cutoff`, scaling factors |
+
+Sources: [docs/typing.rst:56-81](), [openff/toolkit/_tests/test_parameters.py:1183-1201]()
+
+### Parameter Attributes and Validation
+
+```mermaid
+graph TD
+    ParamType["ParameterType"] --> PA["ParameterAttribute"]
+    ParamType --> IPA["IndexedParameterAttribute"]
+    
+    PA --> Unit["Unit validation"]
+    PA --> Convert["Type conversion"]
+    PA --> Default["Default values"]
+    
+    IPA --> Sequence["Sequence validation"]
+    IPA --> Index["Indexed access (k1, k2, etc.)"]
+    IPA --> Length["Length constraints"]
+```
+
+**Parameter Attribute System**
+
+The `ParameterAttribute` and `IndexedParameterAttribute` descriptors provide automatic validation, unit checking, and type conversion for parameter values. Indexed attributes support multiple values (e.g., `k1`, `k2`, `k3` for torsions).
+
+Sources: [openff/toolkit/_tests/test_parameters.py:52-181](), [openff/toolkit/_tests/test_parameters.py:184-267]()
+
+### Advanced Parameter Features
+
+#### Fractional Bond Order Interpolation
+
+```mermaid
+graph LR
+    Bond["Bond"] --> FBO["Fractional bond order"]
+    FBO --> Interp["Linear interpolation"]
+    
+    Param["Parameter"] --> K1["k_bondorder1"]
+    Param --> K2["k_bondorder2"]
+    
+    K1 --> Interp
+    K2 --> Interp
+    Interp --> Final["Final parameter value"]
+```
+
+**Fractional Bond Order Parameter Interpolation**
+
+Bond and torsion parameters can be interpolated based on fractional bond order values computed by quantum chemistry methods, allowing for more accurate representation of conjugated systems.
+
+Sources: [openff/toolkit/_tests/test_parameters.py:269-322](), [openff/toolkit/_tests/test_forcefield.py:289-309]()
+
+#### Charge Assignment Methods
+
+The system supports multiple charge assignment methods:
+
+- **Library charges**: Pre-computed charges for specific molecular fragments
+- **Toolkit-based methods**: AM1-BCC, Gasteiger, etc. via external toolkits
+- **Charge increment models**: Systematic charge adjustments based on chemical environment
+
+Sources: [openff/toolkit/_tests/test_forcefield.py:1935-2023](), [openff/toolkit/_tests/test_forcefield.py:2084-2333]()
+
+## Force Field Application Process
+
+### Parameter Assignment Workflow
+
+```mermaid
+graph TD
+    Top["Topology"] --> Mol["Extract molecules"]
+    Mol --> Match["SMIRKS pattern matching"]
+    Match --> Assign["Parameter assignment"]
+    Assign --> Validate["Validation"]
+    Validate --> System["OpenMM System"]
+    
+    FF["ForceField"] --> Handlers["ParameterHandlers"]
+    Handlers --> Match
+    
+    Charges["Charge assignment"] --> System
+    Assign --> Charges
+```
+
+**Force Field Application Pipeline**
+
+The `create_openmm_system()` method orchestrates the complete parameterization process, calling each registered parameter handler to assign parameters and generate the final OpenMM System object.
+
+Sources: [openff/toolkit/_tests/test_forcefield.py:1284-1325]()
+
+### Parameter Lookup and Precedence
+
+```mermaid
+graph TD
+    Handler["ParameterHandler"] --> List["ParameterList"]
+    List --> P1["Parameter 1 (generic)"]
+    List --> P2["Parameter 2 (specific)"]
+    List --> P3["Parameter 3 (very specific)"]
+    
+    Env["Chemical environment"] --> Match1["Matches P1"]
+    Env --> Match2["Matches P2"]
+    Env --> Match3["Matches P3"]
+    
+    Match3 --> Use["Use P3 (last match wins)"]
+```
+
+**Parameter Precedence Resolution**
+
+When multiple parameters match the same chemical environment, the last (most specific) parameter in the list is used. This allows general parameters to be overridden by more specific ones.
+
+Sources: [openff/toolkit/_tests/test_parameters.py:826-870]()
+
+## File Format and I/O
+
+### OFFXML Structure
+
+The SMIRNOFF specification is implemented through OFFXML files with a hierarchical structure:
+
+```mermaid
+graph TD
+    SMIRNOFF["SMIRNOFF root"] --> Meta["Metadata (Author, Date)"]
+    SMIRNOFF --> Bonds["Bonds section"]
+    SMIRNOFF --> Angles["Angles section"]
+    SMIRNOFF --> Torsions["ProperTorsions section"]
+    SMIRNOFF --> VDW["vdW section"]
+    
+    Bonds --> Bond1["Bond parameter 1"]
+    Bonds --> Bond2["Bond parameter 2"]
+    
+    Bond1 --> Attrs["smirks, length, k, id"]
+```
+
+**OFFXML File Structure**
+
+Each section corresponds to a parameter handler, and individual parameter elements contain SMIRKS patterns and parameter values with units.
+
+Sources: [openff/toolkit/_tests/test_forcefield.py:64-194]()
+
+### XML Serialization and Cosmetic Attributes
+
+```mermaid
+graph LR
+    FF["ForceField"] --> Serialize["to_string()/to_file()"]
+    Serialize --> Keep["Keep cosmetic attributes"]
+    Serialize --> Discard["Discard cosmetic attributes"]
+    
+    Keep --> XML1["Full XML with comments"]
+    Discard --> XML2["Clean XML"]
+```
+
+**XML Serialization Options**
+
+The force field supports round-trip serialization with optional preservation of cosmetic attributes (comments, formatting, etc.) that don't affect parameterization but aid human readability.
+
+Sources: [openff/toolkit/_tests/test_forcefield.py:1002-1056](), [openff/toolkit/_tests/test_forcefield.py:1159-1214]()
+
+## Advanced Features
+
+### Plugin System
+
+The force field system supports dynamic loading of custom parameter handler plugins, allowing extension with new parameter types without modifying core code.
+
+```mermaid
+graph TD
+    FF["ForceField"] --> Core["Core handlers"]
+    FF --> Plugin["Plugin handlers"]
+    
+    Plugin --> Load["load_handler_plugins()"]
+    Load --> Custom["Custom ParameterHandler"]
+    Custom --> Register["Auto-registration"]
+```
+
+**Parameter Handler Plugin Architecture**
+
+Sources: [openff/toolkit/_tests/test_forcefield.py:1911-1925]()
+
+### Virtual Sites
+
+The system supports virtual sites for representing lone pairs, bond charge sites, and other off-atom charge distributions.
+
+```mermaid
+graph TD
+    VH["VirtualSiteHandler"] --> BC["BondCharge"]
+    VH --> ML["MonovalentLonePair"]
+    VH --> DL["DivalentLonePair"]
+    VH --> TL["TrivalentLonePair"]
+    
+    BC --> Params1["distance, charge_increment"]
+    ML --> Params2["distance, inPlaneAngle, outOfPlaneAngle"]
+```
+
+**Virtual Site Types**
+
+Sources: [openff/toolkit/_tests/test_forcefield.py:437-661]()
+
+### Version Management and Compatibility
+
+The system includes comprehensive version checking for both the overall SMIRNOFF specification version and individual parameter handler section versions.
+
+```mermaid
+graph TD
+    Load["Load OFFXML"] --> Check["Version validation"]
+    Check --> Compatible["Compatible version"]
+    Check --> Error["SMIRNOFFVersionError"]
+    
+    Compatible --> Handlers["Handler initialization"]
+    Handlers --> SectionCheck["Section version check"]
+```
+
+**Version Validation System**
+
+Sources: [openff/toolkit/_tests/test_parameters.py:657-708](), [openff/toolkit/_tests/test_forcefield.py:842-854]()
+
+---
+
+# Page: Toolkit Integration System
+
+# Toolkit Integration System
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.pre-commit-config.yaml](.pre-commit-config.yaml)
+- [docs/releasehistory.md](docs/releasehistory.md)
+- [openff/toolkit/_tests/test_toolkits.py](openff/toolkit/_tests/test_toolkits.py)
+- [openff/toolkit/_tests/test_topology.py](openff/toolkit/_tests/test_topology.py)
+- [openff/toolkit/topology/molecule.py](openff/toolkit/topology/molecule.py)
+- [openff/toolkit/topology/topology.py](openff/toolkit/topology/topology.py)
+- [openff/toolkit/typing/engines/smirnoff/forcefield.py](openff/toolkit/typing/engines/smirnoff/forcefield.py)
+- [openff/toolkit/typing/engines/smirnoff/parameters.py](openff/toolkit/typing/engines/smirnoff/parameters.py)
+- [openff/toolkit/utils/ambertools_wrapper.py](openff/toolkit/utils/ambertools_wrapper.py)
+- [openff/toolkit/utils/base_wrapper.py](openff/toolkit/utils/base_wrapper.py)
+- [openff/toolkit/utils/builtin_wrapper.py](openff/toolkit/utils/builtin_wrapper.py)
+- [openff/toolkit/utils/exceptions.py](openff/toolkit/utils/exceptions.py)
+- [openff/toolkit/utils/openeye_wrapper.py](openff/toolkit/utils/openeye_wrapper.py)
+- [openff/toolkit/utils/rdkit_wrapper.py](openff/toolkit/utils/rdkit_wrapper.py)
+- [openff/toolkit/utils/serialization.py](openff/toolkit/utils/serialization.py)
+- [openff/toolkit/utils/toolkits.py](openff/toolkit/utils/toolkits.py)
+- [openff/toolkit/utils/utils.py](openff/toolkit/utils/utils.py)
+- [setup.cfg](setup.cfg)
+
+</details>
+
+
+
+## Purpose and Scope
+
+The Toolkit Integration System provides a standardized interface for integrating external cheminformatics toolkits (OpenEye, RDKit, AmberTools) into the OpenFF Toolkit. This system enables the OpenFF Toolkit to leverage specialized functionality from different toolkits while maintaining a consistent API. For information about the SMIRNOFF force field parameter system, see [2.2](#2.2). For details about the core molecular data structures, see [2.1](#2.1).
+
+The system consists of wrapper classes that normalize toolkit-specific APIs, a registry system for managing multiple toolkits with priority-based selection, and integration points throughout the codebase where external toolkit functionality is required.
+
+## Core Architecture
+
+### ToolkitWrapper Base Class
+
+The foundation of the integration system is the `ToolkitWrapper` base class, which defines a common interface that all toolkit implementations must follow.
+
+**ToolkitWrapper Class Hierarchy**
+```mermaid
+classDiagram
+    class ToolkitWrapper {
+        +toolkit_name: str
+        +toolkit_version: str
+        +is_available(): bool
+        +from_file()
+        +assign_partial_charges()
+        +generate_conformers()
+        +toolkit_file_read_formats: list
+        +supported_charge_methods: list
+    }
+    
+    class OpenEyeToolkitWrapper {
+        +from_openeye()
+        +to_openeye()
+        +from_iupac()
+        +_supported_charge_methods: dict
+    }
+    
+    class RDKitToolkitWrapper {
+        +from_rdkit()
+        +to_rdkit()
+        +from_pdb_and_smiles()
+        +_supported_charge_methods: dict
+    }
+    
+    class AmberToolsToolkitWrapper {
+        +assign_partial_charges()
+        +assign_fractional_bond_orders()
+        +_rdkit_toolkit_wrapper: RDKitToolkitWrapper
+    }
+    
+    class BuiltInToolkitWrapper {
+        +assign_partial_charges()
+        +_supported_charge_methods: dict
+    }
+    
+    class NAGLToolkitWrapper {
+        +assign_partial_charges()
+        +_supported_charge_methods: dict
+    }
+    
+    ToolkitWrapper <|-- OpenEyeToolkitWrapper
+    ToolkitWrapper <|-- RDKitToolkitWrapper
+    ToolkitWrapper <|-- AmberToolsToolkitWrapper
+    ToolkitWrapper <|-- BuiltInToolkitWrapper
+    ToolkitWrapper <|-- NAGLToolkitWrapper
+```
+
+Sources: [openff/toolkit/utils/base_wrapper.py:36-158](), [openff/toolkit/utils/openeye_wrapper.py:89-277](), [openff/toolkit/utils/rdkit_wrapper.py:73-132](), [openff/toolkit/utils/ambertools_wrapper.py:29-101](), [openff/toolkit/utils/builtin_wrapper.py:19-140]()
+
+### Toolkit Capabilities and Specialization
+
+Each toolkit wrapper provides specific capabilities and maintains metadata about what it can do:
+
+| Toolkit | Primary Capabilities | Charge Methods | File Formats |
+|---------|---------------------|----------------|--------------|
+| `OpenEyeToolkitWrapper` | Comprehensive cheminformatics, IUPAC names | am1bcc, gasteiger, mmff94 | SDF, MOL2, PDB, SMI, OEB |
+| `RDKitToolkitWrapper` | Open-source cheminformatics, basic operations | gasteiger, mmff94 | SDF, MOL, SMI, PDB |
+| `AmberToolsToolkitWrapper` | Quantum chemistry charge calculations | am1bcc, am1-mulliken, gasteiger | Uses RDKit for I/O |
+| `BuiltInToolkitWrapper` | Basic fallback operations | zeros, formal_charge | None |
+| `NAGLToolkitWrapper` | Neural network charge assignment | nagl | None |
+
+Sources: [openff/toolkit/utils/openeye_wrapper.py:117-162](), [openff/toolkit/utils/rdkit_wrapper.py:86-88](), [openff/toolkit/utils/ambertools_wrapper.py:41-62](), [openff/toolkit/utils/builtin_wrapper.py:31-36]()
+
+## Registry System
+
+### ToolkitRegistry Architecture
+
+The `ToolkitRegistry` class manages multiple toolkit wrappers and provides priority-based method resolution.
+
+**ToolkitRegistry Method Resolution Flow**
+```mermaid
+flowchart TD
+    A["call(method_name, *args, **kwargs)"] --> B["Iterate through registered toolkits"]
+    B --> C{"Does toolkit have method?"}
+    C -->|No| D["Next toolkit"]
+    C -->|Yes| E{"Is toolkit available?"}
+    E -->|No| D
+    E -->|Yes| F["Try method execution"]
+    F --> G{"Method succeeds?"}
+    G -->|No| H["Log warning, next toolkit"]
+    G -->|Yes| I["Return result"]
+    D --> J{"More toolkits?"}
+    J -->|Yes| C
+    J -->|No| K["Raise ToolkitUnavailableException"]
+    H --> J
+```
+
+Sources: [openff/toolkit/utils/toolkit_registry.py:1-400]()
+
+### Global Toolkit Registry
+
+The system provides a default global registry with predefined toolkit precedence:
+
+```python
+GLOBAL_TOOLKIT_REGISTRY = ToolkitRegistry(
+    toolkit_precedence=[
+        OpenEyeToolkitWrapper,
+        RDKitToolkitWrapper, 
+        AmberToolsToolkitWrapper,
+        BuiltInToolkitWrapper,
+    ]
+)
+```
+
+This allows the system to automatically fall back to available toolkits when the preferred toolkit is unavailable.
+
+Sources: [openff/toolkit/utils/toolkits.py:102-110]()
+
+## Toolkit Integration Points
+
+### Molecule Class Integration
+
+The `Molecule` class integrates with toolkits through several key patterns:
+
+**Molecule-Toolkit Integration Pattern**
+```mermaid
+sequenceDiagram
+    participant User
+    participant Molecule
+    participant ToolkitRegistry
+    participant SpecificWrapper
+    participant ExternalToolkit
+    
+    User->>Molecule: from_smiles("CCO")
+    Molecule->>ToolkitRegistry: call("from_smiles", "CCO")
+    ToolkitRegistry->>SpecificWrapper: from_smiles("CCO")
+    SpecificWrapper->>ExternalToolkit: parse_smiles("CCO")
+    ExternalToolkit-->>SpecificWrapper: toolkit_molecule
+    SpecificWrapper-->>ToolkitRegistry: openff_molecule
+    ToolkitRegistry-->>Molecule: openff_molecule
+    Molecule-->>User: Molecule instance
+```
+
+Sources: [openff/toolkit/topology/molecule.py:1000-1100](), [openff/toolkit/utils/toolkit_registry.py:200-300]()
+
+### Key Integration Methods
+
+The toolkit system integrates with `Molecule` operations through these primary methods:
+
+1. **Molecule Creation**: `from_smiles()`, `from_file()`, `from_iupac()`
+2. **Format Conversion**: `to_rdkit()`, `to_openeye()`, `to_file()`
+3. **Property Calculation**: `assign_partial_charges()`, `generate_conformers()`
+4. **Chemical Operations**: `enumerate_stereoisomers()`, `enumerate_tautomers()`
+
+Sources: [openff/toolkit/topology/molecule.py:1000-2000](), [openff/toolkit/utils/base_wrapper.py:146-200]()
+
+## Toolkit Availability and Licensing
+
+### Availability Checking System
+
+Each toolkit wrapper implements availability checking to handle optional dependencies:
+
+**Toolkit Availability Check Flow**
+```mermaid
+flowchart TD
+    A["ToolkitWrapper.is_available()"] --> B{"Toolkit installed?"}
+    B -->|No| C["Return False"]
+    B -->|Yes| D{"Licensed (if required)?"}
+    D -->|No| E["Return False"]
+    D -->|Yes| F["Return True"]
+    
+    G["OpenEyeToolkitWrapper specific"] --> H["Check each OE module"]
+    H --> I{"Any module licensed?"}
+    I -->|Yes| J["Available = True"]
+    I -->|No| K["Available = False"]
+```
+
+Sources: [openff/toolkit/utils/base_wrapper.py:118-129](), [openff/toolkit/utils/openeye_wrapper.py:247-277](), [openff/toolkit/utils/rdkit_wrapper.py:114-132]()
+
+### Error Handling for Unavailable Toolkits
+
+The system provides graceful degradation when toolkits are unavailable:
+
+- `ToolkitUnavailableException` for missing required functionality
+- `LicenseError` for licensing issues (primarily OpenEye)
+- Automatic fallback through the registry system
+- Informative error messages with installation instructions
+
+Sources: [openff/toolkit/utils/exceptions.py:44-52](), [openff/toolkit/utils/openeye_wrapper.py:213-227]()
+
+## Charge Method Management
+
+### Charge Method Registry
+
+Each toolkit maintains its own registry of supported charge calculation methods:
+
+```python
+# OpenEye example
+_supported_charge_methods = {
+    "am1bcc": {
+        "oe_charge_method": "OEAM1BCCCharges",
+        "min_confs": 1, "max_confs": 1, "rec_confs": 1
+    },
+    "gasteiger": {
+        "oe_charge_method": "OEGasteigerCharges", 
+        "min_confs": 0, "max_confs": 0, "rec_confs": 0
+    }
+}
+```
+
+Sources: [openff/toolkit/utils/openeye_wrapper.py:117-160](), [openff/toolkit/utils/rdkit_wrapper.py:86-88](), [openff/toolkit/utils/ambertools_wrapper.py:41-62]()
+
+### Method Resolution and Validation
+
+The system validates charge method availability and conformer requirements before execution:
+
+**Charge Method Resolution**
+```mermaid
+flowchart TD
+    A["assign_partial_charges(method)"] --> B{"Method supported by any toolkit?"}
+    B -->|No| C["Raise ChargeMethodUnavailableError"]
+    B -->|Yes| D["Check conformer requirements"]
+    D --> E{"Correct number of conformers?"}
+    E -->|No| F{"strict_n_conformers=True?"}
+    F -->|Yes| G["Raise IncorrectNumConformersError"]
+    F -->|No| H["Issue warning, continue"]
+    E -->|Yes| I["Execute charge calculation"]
+    H --> I
+```
+
+Sources: [openff/toolkit/utils/base_wrapper.py:160-200](), [openff/toolkit/topology/molecule.py:4000-4200]()
+
+## Plugin and Extension System
+
+### Entry Point Registration
+
+The toolkit system supports plugin registration through Python entry points, allowing external packages to register custom toolkit wrappers:
+
+```python
+# Example entry point registration
+"openff.toolkit.plugins" = [
+    "custom_toolkit = my_package.toolkit:CustomToolkitWrapper"
+]
+```
+
+Sources: [openff/toolkit/typing/engines/smirnoff/plugins.py:1-50](), [openff/toolkit/typing/engines/smirnoff/forcefield.py:23-24]()
+
+### Extending the System
+
+New toolkit wrappers can be added by:
+
+1. Inheriting from `ToolkitWrapper`
+2. Implementing required abstract methods
+3. Registering with the `ToolkitRegistry`
+4. Optionally using entry points for automatic discovery
+
+Sources: [openff/toolkit/utils/base_wrapper.py:36-200](), [openff/toolkit/utils/toolkit_registry.py:100-200]()
+
+---
+
+# Page: User Guide
+
+# User Guide
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.github/workflows/release.yml](.github/workflows/release.yml)
+- [.readthedocs.yaml](.readthedocs.yaml)
+- [MANIFEST.in](MANIFEST.in)
+- [README.md](README.md)
+- [examples/README.md](examples/README.md)
+- [examples/SMIRNOFF_simulation/README.md](examples/SMIRNOFF_simulation/README.md)
+- [examples/conformer_energies/README.md](examples/conformer_energies/README.md)
+- [examples/forcefield_modification/README.md](examples/forcefield_modification/README.md)
+- [examples/inspect_assigned_parameters/README.md](examples/inspect_assigned_parameters/README.md)
+- [examples/toolkit_showcase/README.md](examples/toolkit_showcase/README.md)
+- [examples/using_smirnoff_in_amber_or_gromacs/README.md](examples/using_smirnoff_in_amber_or_gromacs/README.md)
+- [examples/using_smirnoff_with_amber_protein_forcefield/README.md](examples/using_smirnoff_with_amber_protein_forcefield/README.md)
+- [examples/visualization/README.md](examples/visualization/README.md)
+- [openff/toolkit/__init__.py](openff/toolkit/__init__.py)
+- [openff/toolkit/typing/engines/smirnoff/io.py](openff/toolkit/typing/engines/smirnoff/io.py)
+- [openff/toolkit/utils/callback.py](openff/toolkit/utils/callback.py)
+- [openff/toolkit/utils/collections.py](openff/toolkit/utils/collections.py)
+
+</details>
+
+
+
+This guide provides comprehensive documentation for users of the OpenFF toolkit, covering core concepts, workflows, and practical usage patterns. The toolkit is designed for molecular mechanics force field development and application using the SMIRNOFF format and direct chemical perception methods.
+
+This guide covers practical usage of the toolkit's core functionality. For detailed architectural information, see [Core Architecture](#2). For development and contribution guidelines, see [Development](#4). For specific installation instructions and getting started steps, see [Getting Started](#3.1).
+
+## Purpose and Scope
+
+The OpenFF toolkit serves two main purposes:
+- **SMIRNOFF Force Field Application**: Tools for using SMIRKS Native Open Force Field (SMIRNOFF) force fields to parameterize molecular systems
+- **Chemical Perception and Manipulation**: Direct chemical environment perception and molecular graph manipulation capabilities
+
+The toolkit provides a unified interface for molecular mechanics workflows while supporting multiple backend cheminformatics libraries through a plugin architecture.
+
+**Sources**: [README.md:10-15](), [openff/toolkit/__init__.py:1-4]()
+
+## Core Concepts
+
+### Primary Data Structures
+
+The toolkit centers around three main data structures that represent different aspects of molecular systems:
+
+```mermaid
+graph TD
+    A["Molecule"] --> B["Topology"]
+    B --> C["ForceField"]
+    C --> D["OpenMM System"]
+    C --> E["Interchange"]
+    
+    A1["Chemical Structure"] --> A
+    A2["Bond Orders"] --> A
+    A3["Conformers"] --> A
+    
+    B1["Collection of Molecules"] --> B
+    B2["Intermolecular Interactions"] --> B
+    
+    C1["SMIRNOFF Parameters"] --> C
+    C2["Parameter Handlers"] --> C
+    
+    E --> F["GROMACS Files"]
+    E --> G["Amber Files"]
+    E --> H["LAMMPS Files"]
+```
+
+**Sources**: [README.md:58-77](), [openff/toolkit/__init__.py:15-19]()
+
+### Core Classes and Their Roles
+
+| Class | Module | Purpose |
+|-------|--------|---------|
+| `Molecule` | `openff.toolkit.topology` | Represents individual chemical structures with connectivity and properties |
+| `Topology` | `openff.toolkit.topology` | Contains collections of molecules and their spatial relationships |
+| `ForceField` | `openff.toolkit.typing.engines.smirnoff` | Manages SMIRNOFF parameter sets and applies them to systems |
+| `ToolkitRegistry` | `openff.toolkit.utils.toolkits` | Manages integration with external cheminformatics libraries |
+| `Interchange` | External package | Converts parameterized systems to various simulation formats |
+
+**Sources**: [openff/toolkit/__init__.py:31-45](), [README.md:55-76]()
+
+## Basic Workflow
+
+### Standard Parameterization Workflow
+
+The typical workflow for parameterizing a molecular system follows this pattern:
+
+```mermaid
+graph LR
+    A["Input Structure"] --> B["Molecule.from_file()"]
+    B --> C["Topology.from_molecules()"]
+    C --> D["ForceField.create_openmm_system()"]
+    C --> E["ForceField.create_interchange()"]
+    
+    D --> F["OpenMM Simulation"]
+    E --> G["Format Export"]
+    
+    H["SMILES"] --> B
+    I["SDF File"] --> B
+    J["PDB File"] --> B
+    
+    K["OpenMM"] --> F
+    L["GROMACS"] --> G
+    M["Amber"] --> G
+    N["LAMMPS"] --> G
+```
+
+### Code Example: Basic Usage
+
+The following example demonstrates the standard workflow for parameterizing a small molecule:
+
+```python
+# Load a molecule into the OpenFF Molecule object
+from openff.toolkit import Molecule
+from openff.toolkit.utils import get_data_file_path
+sdf_file_path = get_data_file_path('molecules/ethanol.sdf')
+molecule = Molecule.from_file(sdf_file_path)
+
+# Create an OpenFF Topology object from the molecule
+from openff.toolkit import Topology
+topology = Topology.from_molecules(molecule)
+
+# Load the latest OpenFF force field release: version 2.1.0, codename "Sage"
+from openff.toolkit import ForceField
+forcefield = ForceField('openff-2.1.0.offxml')
+
+# Create an OpenMM system representing the molecule with SMIRNOFF-applied parameters
+openmm_system = forcefield.create_openmm_system(topology)
+
+# Create an Interchange object for representations in other formats
+interchange = forcefield.create_interchange(topology)
+```
+
+**Sources**: [README.md:57-77]()
+
+## Usage Patterns
+
+### Available Example Categories
+
+The toolkit provides comprehensive examples organized by use case:
+
+```mermaid
+graph TB
+    A["Examples"] --> B["toolkit_showcase"]
+    A --> C["forcefield_modification"]
+    A --> D["conformer_energies"]
+    A --> E["SMIRNOFF_simulation"]
+    A --> F["using_smirnoff_in_amber_or_gromacs"]
+    A --> G["using_smirnoff_with_amber_protein_forcefield"]
+    A --> H["visualization"]
+    A --> I["inspect_assigned_parameters"]
+    
+    B --> B1["Protein-ligand system parameterization"]
+    B --> B2["Mixed force field workflows"]
+    B --> B3["Simulation and visualization"]
+    
+    C --> C1["Parameter modification"]
+    C --> C2["Energy evaluation"]
+    C --> C3["Force field optimization"]
+    
+    D --> D1["Small molecule energies"]
+    D --> D2["Conformer comparison"]
+    
+    E --> E1["Gas phase simulation"]
+    E --> E2["SMIRNOFF format usage"]
+    
+    F --> F1["Format conversion"]
+    F --> F2["Multi-engine compatibility"]
+    
+    G --> G1["Protein-ligand complexes"]
+    G --> G2["Mixed parameter sets"]
+    
+    H --> H1["Jupyter notebook integration"]
+    H --> H2["3D visualization"]
+    
+    I --> I1["Parameter assignment inspection"]
+    I --> I2["Usage statistics"]
+```
+
+**Sources**: [examples/README.md:7-21]()
+
+### Common Use Cases
+
+#### 1. Protein-Ligand System Parameterization
+Combines OpenFF parameters for ligands with traditional force fields for proteins, as demonstrated in the toolkit showcase example.
+
+**Sources**: [examples/toolkit_showcase/README.md:1-4]()
+
+#### 2. Force Field Parameter Modification
+Allows users to modify force field parameters and evaluate energy changes, useful for force field development and optimization.
+
+**Sources**: [examples/forcefield_modification/README.md:1-4]()
+
+#### 3. Conformer Energy Calculations
+Computes energies for different conformers of molecules using SMIRNOFF force fields, supporting both interactive and command-line usage.
+
+**Sources**: [examples/conformer_energies/README.md:1-7]()
+
+#### 4. Format Interoperability
+Converts OpenMM systems to GROMACS, Amber, and LAMMPS formats through the Interchange interface, enabling use across different simulation engines.
+
+**Sources**: [examples/using_smirnoff_in_amber_or_gromacs/README.md:1-8]()
+
+## Integration Capabilities
+
+### Toolkit Registry System
+
+The toolkit integrates with multiple cheminformatics libraries through a registry system:
+
+```mermaid
+graph TD
+    A["ToolkitRegistry"] --> B["OpenEyeToolkitWrapper"]
+    A --> C["RDKitToolkitWrapper"]
+    A --> D["AmberToolsToolkitWrapper"]
+    A --> E["BuiltInToolkitWrapper"]
+    
+    B --> B1["Commercial toolkit"]
+    B --> B2["Advanced chemistry operations"]
+    
+    C --> C1["Open source toolkit"]
+    C --> C2["Standard chemistry operations"]
+    
+    D --> D1["Charge calculation"]
+    D --> D2["Antechamber integration"]
+    
+    E --> E1["Basic operations"]
+    E --> E2["No external dependencies"]
+    
+    F["GLOBAL_TOOLKIT_REGISTRY"] --> A
+    G["Custom toolkit selection"] --> A
+```
+
+**Sources**: [openff/toolkit/__init__.py:20-27](), [openff/toolkit/__init__.py:53-58]()
+
+### Force Field Ecosystem
+
+The toolkit integrates with the broader OpenFF force field ecosystem:
+
+| Component | Repository | Purpose |
+|-----------|------------|---------|
+| Sage Force Fields | openff-forcefields | Latest OpenFF parameter sets |
+| smirnoff99Frosst | smirnoff99Frosst | AMBER-compatible SMIRNOFF conversion |
+| Plugin Architecture | Various | Third-party force field distribution |
+
+**Sources**: [README.md:34-41]()
+
+## Input and Output Formats
+
+### Supported Input Formats
+
+The toolkit accepts multiple input formats for molecular structures:
+
+- **SMILES strings**: Direct chemical notation
+- **SDF files**: Structure data format with 3D coordinates
+- **PDB files**: Protein Data Bank format (requires additional processing)
+- **MOL files**: MDL Molfile format
+
+### Output Capabilities
+
+Through the Interchange system, parameterized systems can be exported to:
+
+- **OpenMM System**: Native simulation format
+- **GROMACS**: Topology and coordinate files
+- **Amber**: Parameter and coordinate files
+- **LAMMPS**: Input files for molecular dynamics
+
+**Sources**: [README.md:55-76]()
+
+## SMIRNOFF Format Support
+
+### Force Field File Handling
+
+The toolkit provides comprehensive support for SMIRNOFF format force fields:
+
+```mermaid
+graph LR
+    A["OFFXML Files"] --> B["XMLParameterIOHandler"]
+    B --> C["ForceField Object"]
+    C --> D["ParameterHandler Objects"]
+    
+    D --> E["BondHandler"]
+    D --> F["AngleHandler"]
+    D --> G["TorsionHandler"]
+    D --> H["vdWHandler"]
+    D --> I["ElectrostaticsHandler"]
+    
+    J["SMIRNOFF Specification"] --> A
+    K["Parameter Assignment"] --> C
+    L["Chemical Perception"] --> C
+```
+
+**Sources**: [openff/toolkit/typing/engines/smirnoff/io.py:97-236](), [README.md:45-51]()
+
+### Parameter Inspection and Modification
+
+The toolkit allows detailed inspection and modification of force field parameters, supporting:
+
+- Parameter assignment tracking
+- Usage statistics generation
+- Dynamic parameter modification
+- Custom parameter handler development
+
+**Sources**: [examples/inspect_assigned_parameters/README.md:1-4]()
+
+## Visualization and Analysis
+
+### Built-in Visualization Support
+
+The toolkit provides rich visualization capabilities in Jupyter notebooks:
+
+- **RDKit backend**: 2D molecular structure rendering
+- **OpenEye backend**: Professional-grade molecular visualization
+- **NGLView backend**: 3D molecular visualization (requires conformers)
+
+**Sources**: [examples/visualization/README.md:1-30]()
+
+### Analysis Tools
+
+Integration with analysis tools enables:
+
+- Conformer energy comparison
+- Parameter usage statistics
+- Force field performance evaluation
+- Chemical environment analysis
+
+**Sources**: [examples/conformer_energies/README.md:1-7](), [examples/inspect_assigned_parameters/README.md:1-4]()
+
+---
+
+# Page: Getting Started
+
+# Getting Started
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.readthedocs.yaml](.readthedocs.yaml)
+- [FAQ.md](FAQ.md)
+- [MANIFEST.in](MANIFEST.in)
+- [README.md](README.md)
+- [docs/api/toolkits.md](docs/api/toolkits.md)
+- [docs/conf.py](docs/conf.py)
+- [docs/environment.yml](docs/environment.yml)
+- [docs/examples.md](docs/examples.md)
+- [docs/index.md](docs/index.md)
+- [docs/installation.md](docs/installation.md)
+- [docs/users/developing.md](docs/users/developing.md)
+- [docs/users/molecule_cookbook.ipynb](docs/users/molecule_cookbook.ipynb)
+- [docs/users/pdb_cookbook/index.ipynb](docs/users/pdb_cookbook/index.ipynb)
+- [docs/utils.rst](docs/utils.rst)
+- [openff/toolkit/__init__.py](openff/toolkit/__init__.py)
+- [openff/toolkit/typing/engines/smirnoff/io.py](openff/toolkit/typing/engines/smirnoff/io.py)
+- [openff/toolkit/utils/callback.py](openff/toolkit/utils/callback.py)
+- [openff/toolkit/utils/collections.py](openff/toolkit/utils/collections.py)
+- [openff/toolkit/utils/toolkit_registry.py](openff/toolkit/utils/toolkit_registry.py)
+
+</details>
+
+
+
+This page provides installation instructions, introduces the core concepts of the OpenFF Toolkit, and demonstrates basic usage patterns. It serves as an entry point for new users who want to start working with molecular force fields using the SMIRNOFF specification.
+
+For advanced usage patterns and complex scenarios, see [Advanced Usage](#3.3). For detailed examples and tutorials, see [Examples and Tutorials](#3.2). For information about the core architectural components, see [Core Architecture](#2).
+
+## Installation
+
+The OpenFF Toolkit can be installed via the Mamba package manager, which is the recommended approach as it automatically handles all dependencies.
+
+### Installing via Mamba
+
+Create a new environment with the toolkit:
+
+```shell
+mamba create -n openff-toolkit -c conda-forge openff-toolkit
+mamba activate openff-toolkit
+```
+
+### Platform Support
+
+The toolkit is pure Python and supports:
+- Linux (x86_64)
+- macOS (x86_64) 
+- Python 3.11, 3.12, 3.13
+
+Sources: [docs/installation.md:33-36](), [README.md:28]()
+
+### Optional Dependencies
+
+The toolkit integrates with multiple cheminformatics libraries through a plugin system. The base installation includes RDKit and AmberTools by default. OpenEye Toolkit can be optionally installed for users with a license.
+
+#### Installation Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph "Core Installation"
+        A["openff-toolkit package"]
+        B["openff-toolkit-base"]
+        C["RDKit (default)"]
+        D["AmberTools (default)"]
+    end
+    
+    subgraph "Optional Toolkits"
+        E["OpenEye Toolkit (licensed)"]
+        F["NAGLToolkitWrapper"]
+        G["BuiltInToolkitWrapper"]
+    end
+    
+    subgraph "Registry System"
+        H["GLOBAL_TOOLKIT_REGISTRY"]
+        I["ToolkitRegistry"]
+    end
+    
+    A --> C
+    A --> D
+    B --> I
+    E --> I
+    F --> I
+    G --> I
+    C --> I
+    D --> I
+    I --> H
+```
+
+Sources: [docs/installation.md:49-61](), [openff/toolkit/utils/toolkit_registry.py:110-116]()
+
+## Core Concepts
+
+The OpenFF Toolkit is built around several key classes that work together to apply molecular force fields:
+
+### Primary Classes Overview
+
+```mermaid
+graph LR
+    subgraph "Input"
+        A["Molecule class"]
+        B["SMILES/SDF/PDB"]
+    end
+    
+    subgraph "System Building"
+        C["Topology class"]
+        D["ForceField class"]
+    end
+    
+    subgraph "Output"
+        E["OpenMM System"]
+        F["Interchange object"]
+    end
+    
+    B --> A
+    A --> C
+    C --> D
+    D --> E
+    D --> F
+    F --> G["GROMACS/Amber/LAMMPS"]
+```
+
+Sources: [README.md:57-77](), [openff/toolkit/__init__.py:48-52]()
+
+### Molecule Class
+
+The `Molecule` class represents individual chemical species with complete chemical information including:
+- Atomic composition and connectivity
+- Bond orders and formal charges  
+- Stereochemistry
+- Conformations (3D coordinates)
+
+### Topology Class
+
+The `Topology` class represents a complete molecular system containing one or more `Molecule` instances. It maintains:
+- Collection of molecules
+- Box vectors for periodic systems
+- Metadata about the system
+
+### ForceField Class
+
+The `ForceField` class implements the SMIRNOFF specification for parameter assignment. It contains:
+- Parameter handlers for different force types
+- SMIRKS patterns for chemical perception
+- Parameter values and functional forms
+
+Sources: [README.md:12-14](), [docs/users/molecule_cookbook.ipynb:16-22]()
+
+## Basic Usage Examples
+
+### Creating a Molecule from SMILES
+
+The most common way to create a molecule is from a SMILES string:
+
+```python
+from openff.toolkit import Molecule
+
+# Create a molecule from SMILES
+molecule = Molecule.from_smiles("CCO")  # ethanol
+```
+
+### Building a Topology
+
+Combine molecules into a topology for system parameterization:
+
+```python
+from openff.toolkit import Topology
+
+# Create topology from a single molecule
+topology = Topology.from_molecules([molecule])
+
+# Or from multiple molecules
+water = Molecule.from_smiles("O")
+topology = Topology.from_molecules([molecule, water, water])
+```
+
+### Applying a Force Field
+
+Load a force field and create an OpenMM system:
+
+```python
+from openff.toolkit import ForceField
+
+# Load the latest Sage force field
+forcefield = ForceField('openff-2.1.0.offxml')
+
+# Create OpenMM system
+openmm_system = forcefield.create_openmm_system(topology)
+
+# Or create Interchange for other MD engines
+interchange = forcefield.create_interchange(topology)
+```
+
+Sources: [README.md:57-77](), [docs/users/molecule_cookbook.ipynb:181-184]()
+
+### Complete Workflow Example
+
+```mermaid
+graph TB
+    subgraph "Step 1: Molecule Creation"
+        A["Molecule.from_smiles()"]
+        B["Molecule.from_file()"]
+        C["Topology.from_pdb()"]
+    end
+    
+    subgraph "Step 2: System Assembly"
+        D["Topology.from_molecules()"]
+    end
+    
+    subgraph "Step 3: Parameterization"
+        E["ForceField('openff-2.1.0.offxml')"]
+        F["forcefield.create_openmm_system()"]
+        G["forcefield.create_interchange()"]
+    end
+    
+    subgraph "Step 4: Simulation/Export"
+        H["OpenMM Simulation"]
+        I["GROMACS files"]
+        J["Amber files"]
+    end
+    
+    A --> D
+    B --> D
+    C --> D
+    D --> E
+    E --> F
+    E --> G
+    F --> H
+    G --> I
+    G --> J
+```
+
+Sources: [README.md:57-77](), [docs/users/molecule_cookbook.ipynb:16-22]()
+
+## Toolkit Integration
+
+The OpenFF Toolkit uses a registry system to integrate with multiple cheminformatics libraries:
+
+### Toolkit Registry System
+
+```mermaid
+graph TB
+    subgraph "ToolkitRegistry Class"
+        A["GLOBAL_TOOLKIT_REGISTRY"]
+        B["registered_toolkits property"]
+        C["call() method"]
+    end
+    
+    subgraph "Available Wrappers"
+        D["OpenEyeToolkitWrapper"]
+        E["RDKitToolkitWrapper"] 
+        F["AmberToolsToolkitWrapper"]
+        G["BuiltInToolkitWrapper"]
+    end
+    
+    subgraph "Method Resolution"
+        H["First available toolkit"]
+        I["Exception handling"]
+        J["Fallback to next toolkit"]
+    end
+    
+    D --> A
+    E --> A
+    F --> A
+    G --> A
+    A --> C
+    C --> H
+    H --> I
+    I --> J
+```
+
+### Checking Available Toolkits
+
+```python
+from openff.toolkit import GLOBAL_TOOLKIT_REGISTRY
+
+# Check which toolkits are available
+print(GLOBAL_TOOLKIT_REGISTRY.registered_toolkit_versions)
+# Output: {'The RDKit': '2022.03.5', 'AmberTools': '22.0', 'Built-in Toolkit': None}
+```
+
+Sources: [openff/toolkit/utils/toolkit_registry.py:25-76](), [docs/installation.md:91-98](), [docs/api/toolkits.md:53-60]()
+
+## Error Handling
+
+The toolkit enforces strict chemical specification to avoid ambiguous parameterization:
+
+### Stereochemistry Requirements
+
+```python
+# This will raise UndefinedStereochemistryError
+try:
+    molecule = Molecule.from_smiles("CC([NH3+])C(=O)[O-]")  # Missing stereochemistry
+except UndefinedStereochemistryError:
+    print("Stereochemistry must be defined")
+
+# This works - stereochemistry is explicit
+molecule = Molecule.from_smiles("C[C@H]([NH3+])C(=O)[O-]")
+```
+
+Sources: [docs/users/molecule_cookbook.ipynb:380-387]()
+
+## Loading Complex Systems
+
+### PDB Files with Small Molecules
+
+For PDB files containing ligands, you must provide the chemical information:
+
+```python
+# Define the ligand chemistry
+ligand = Molecule.from_smiles("CCCC1=CC=CC=C1O")
+
+# Load PDB with ligand information
+topology = Topology.from_pdb("complex.pdb", unique_molecules=[ligand])
+```
+
+Sources: [docs/users/pdb_cookbook/index.ipynb:264-267](), [docs/users/pdb_cookbook/index.ipynb:296-298]()
+
+## Next Steps
+
+- **For detailed examples**: See [Examples and Tutorials](#3.2) for comprehensive notebooks and workflows
+- **For advanced features**: See [Advanced Usage](#3.3) for custom parameter handlers and complex systems  
+- **For core concepts**: See [Molecule and Topology System](#2.1) and [SMIRNOFF Force Field System](#2.2) for architectural details
+- **For development**: See [Development](#4) for contributing guidelines and testing frameworks
+
+Sources: [README.md:78-86](), [docs/index.md:18-31]()
+
+---
+
+# Page: Examples and Tutorials
+
+# Examples and Tutorials
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.github/workflows/release.yml](.github/workflows/release.yml)
+- [examples/QCArchive_interface/QCarchive_interface.ipynb](examples/QCArchive_interface/QCarchive_interface.ipynb)
+- [examples/README.md](examples/README.md)
+- [examples/SMIRNOFF_simulation/README.md](examples/SMIRNOFF_simulation/README.md)
+- [examples/SMIRNOFF_simulation/run_simulation.ipynb](examples/SMIRNOFF_simulation/run_simulation.ipynb)
+- [examples/conformer_energies/README.md](examples/conformer_energies/README.md)
+- [examples/conformer_energies/conformer_energies.ipynb](examples/conformer_energies/conformer_energies.ipynb)
+- [examples/forcefield_modification/README.md](examples/forcefield_modification/README.md)
+- [examples/forcefield_modification/forcefield_modification.ipynb](examples/forcefield_modification/forcefield_modification.ipynb)
+- [examples/inspect_assigned_parameters/README.md](examples/inspect_assigned_parameters/README.md)
+- [examples/inspect_assigned_parameters/inspect_assigned_parameters.ipynb](examples/inspect_assigned_parameters/inspect_assigned_parameters.ipynb)
+- [examples/toolkit_showcase/README.md](examples/toolkit_showcase/README.md)
+- [examples/toolkit_showcase/toolkit_showcase.ipynb](examples/toolkit_showcase/toolkit_showcase.ipynb)
+- [examples/using_smirnoff_in_amber_or_gromacs/README.md](examples/using_smirnoff_in_amber_or_gromacs/README.md)
+- [examples/using_smirnoff_in_amber_or_gromacs/export_with_interchange.ipynb](examples/using_smirnoff_in_amber_or_gromacs/export_with_interchange.ipynb)
+- [examples/using_smirnoff_with_amber_protein_forcefield/BRD4_inhibitor_benchmark.ipynb](examples/using_smirnoff_with_amber_protein_forcefield/BRD4_inhibitor_benchmark.ipynb)
+- [examples/using_smirnoff_with_amber_protein_forcefield/README.md](examples/using_smirnoff_with_amber_protein_forcefield/README.md)
+- [examples/virtual_sites/vsite_showcase.ipynb](examples/virtual_sites/vsite_showcase.ipynb)
+- [examples/visualization/README.md](examples/visualization/README.md)
+- [examples/visualization/visualization.ipynb](examples/visualization/visualization.ipynb)
+
+</details>
+
+
+
+This document provides a comprehensive guide to the example notebooks and tutorial materials in the OpenFF Toolkit repository. These examples demonstrate practical usage patterns, from basic molecular parameterization to advanced force field modification and multi-engine workflows. The examples serve as both learning materials for new users and reference implementations for common computational chemistry tasks.
+
+For basic installation and simple usage, see [Getting Started](#3.1). For complex scenarios including custom parameter handlers and specialized workflows, see [Advanced Usage](#3.3).
+
+## Example Organization and Categories
+
+The OpenFF Toolkit examples are organized into distinct categories based on their primary focus and complexity level. Each example includes comprehensive documentation, executable code, and validation outputs.
+
+```mermaid
+graph TB
+    subgraph "Basic Examples"
+        A["toolkit_showcase.ipynb<br/>Complete protein-ligand workflow"]
+        B["SMIRNOFF_simulation.ipynb<br/>Basic MD simulation"]
+        C["conformer_energies.ipynb<br/>Energy calculations"]
+    end
+    
+    subgraph "Parameterization Examples"
+        D["inspect_assigned_parameters.ipynb<br/>Parameter analysis"]
+        E["forcefield_modification.ipynb<br/>Parameter tuning"]
+        F["virtual_sites/vsite_showcase.ipynb<br/>Virtual site implementation"]
+    end
+    
+    subgraph "Integration Examples"
+        G["using_smirnoff_in_amber_or_gromacs/<br/>Engine export workflows"]
+        H["using_smirnoff_with_amber_protein_forcefield/<br/>Mixed force field systems"]
+        I["QCArchive_interface.ipynb<br/>External data integration"]
+    end
+    
+    subgraph "Visualization Examples"
+        J["visualization.ipynb<br/>Molecule and topology rendering"]
+    end
+    
+    A --> D
+    A --> G
+    B --> E
+    C --> F
+    
+    style A fill:#e1f5fe
+    style G fill:#f3e5f5
+    style D fill:#e8f5e8
+    style J fill:#fff3e0
+```
+
+Sources: [examples/README.md:7-21](), [examples/toolkit_showcase/README.md:1-4](), [examples/SMIRNOFF_simulation/README.md:1-4]()
+
+## Core Workflow Examples
+
+### Toolkit Showcase: Complete Protein-Ligand Pipeline
+
+The `toolkit_showcase.ipynb` example demonstrates the complete workflow from raw structural data to simulation-ready systems. This example combines multiple OpenFF Toolkit components with external tools to create a comprehensive molecular dynamics preparation pipeline.
+
+```mermaid
+graph LR
+    A["receptor.pdb<br/>ligand.sdf"] --> B["Topology.from_pdb"]
+    B --> C["insert_molecule_and_remove_clashes"]
+    C --> D["ForceField.create_interchange"]
+    D --> E["Interchange.to_openmm_simulation"]
+    E --> F["simulation.step"]
+    F --> G["trajectory.pdb<br/>data.csv"]
+    
+    H["Molecule.from_file"] --> B
+    I["ForceField('openff-2.2.0.offxml')"] --> D
+    
+    subgraph "Key Classes"
+        J["PDBFixer"]
+        K["Topology"]
+        L["Interchange"]
+        M["ForceField"]
+    end
+    
+    B -.-> K
+    D -.-> L
+    I -.-> M
+```
+
+The workflow begins with structure preparation using `PDBFixer` for solvation and then creates an OpenFF `Topology` from the PDB file and `Molecule` objects. The system is parametrized using the Sage force field through `ForceField.create_interchange`, which produces a complete `Interchange` object ready for simulation.
+
+Key implementation details include the clash removal function [examples/toolkit_showcase/toolkit_showcase.ipynb:353-417]() and the visualization setup [examples/toolkit_showcase/toolkit_showcase.ipynb:484-487]().
+
+Sources: [examples/toolkit_showcase/toolkit_showcase.ipynb:9-11](), [examples/toolkit_showcase/toolkit_showcase.ipynb:177-182](), [examples/toolkit_showcase/README.md:1-4]()
+
+### Basic Simulation Workflow
+
+The `SMIRNOFF_simulation` example demonstrates the fundamental steps for setting up and running molecular dynamics simulations with OpenFF force fields.
+
+```mermaid
+graph TB
+    A["Molecule.from_smiles"] --> B["Topology.from_pdb"]
+    B --> C["ForceField.create_interchange"]
+    C --> D["interchange.to_openmm_simulation"]
+    D --> E["simulation.step"]
+    
+    F["unique_molecules=['CCO', 'C1CCCCC1']"] --> B
+    G["ForceField('openff-2.2.0.offxml')"] --> C
+    H["LangevinIntegrator"] --> D
+    
+    E --> I["PDBReporter"]
+    E --> J["StateDataReporter"]
+    
+    subgraph "Output Files"
+        K["trajectory.pdb"]
+        L["data.csv"]
+    end
+    
+    I --> K
+    J --> L
+```
+
+The example shows how to create molecules from SMILES strings, combine them into a topology with coordinate data from PDB files, and parametrize with SMIRNOFF force fields. The resulting `Interchange` object handles the conversion to OpenMM format for simulation execution.
+
+Sources: [examples/SMIRNOFF_simulation/run_simulation.ipynb:26-137](), [examples/SMIRNOFF_simulation/README.md:1-4]()
+
+## Parameterization and Analysis Examples
+
+### Parameter Assignment Inspection
+
+The `inspect_assigned_parameters.ipynb` example provides tools for understanding which SMIRNOFF parameters are applied to molecules and analyzing parameter usage across datasets.
+
+The example demonstrates the `ForceField.label_molecules` method [examples/inspect_assigned_parameters/inspect_assigned_parameters.ipynb:135-148]() which returns detailed parameter assignments for each force term. This includes bond parameters with atom indices, parameter IDs, and matching SMIRKS patterns.
+
+The utility function `get_molecule_parameterIDs` processes molecule sets to identify parameter usage patterns, which is valuable for force field development and validation.
+
+Sources: [examples/inspect_assigned_parameters/inspect_assigned_parameters.ipynb:8-13](), [examples/inspect_assigned_parameters/README.md:1-3]()
+
+### Force Field Modification
+
+The `forcefield_modification.ipynb` example shows how to systematically modify SMIRNOFF parameters and evaluate the effects on molecular energies and geometries.
+
+```mermaid
+graph LR
+    A["ForceField.label_molecules"] --> B["Parameter identification"]
+    B --> C["Parameter modification"]
+    C --> D["minimize_and_visualize"]
+    D --> E["Energy comparison"]
+    
+    F["deepcopy(forcefield)"] --> C
+    G["BondType.length *= 1.1"] --> C
+    H["AngleType.angle += 20°"] --> C
+    
+    subgraph "Modification Types"
+        I["Bond length scaling"]
+        J["Angle modification"]
+        K["Torsion barriers"]
+        L["vdW parameters"]
+    end
+    
+    C -.-> I
+    C -.-> J
+    C -.-> K
+    C -.-> L
+```
+
+The example includes a `minimize_and_visualize` function [examples/forcefield_modification/forcefield_modification.ipynb:42-76]() that performs energy minimization and provides visual feedback on parameter changes.
+
+Sources: [examples/forcefield_modification/forcefield_modification.ipynb:7-10](), [examples/forcefield_modification/README.md:1-3]()
+
+### Virtual Sites Implementation
+
+The `vsite_showcase.ipynb` example demonstrates the specification and use of virtual sites in SMIRNOFF force fields, including custom virtual site definitions and comparison with OpenMM implementations.
+
+The example shows how to define virtual sites in OFFXML format [examples/virtual_sites/vsite_showcase.ipynb:144-184]() and includes a numerical comparison between OpenFF and OpenMM TIP5P implementations [examples/virtual_sites/vsite_showcase.ipynb:419-443]().
+
+Sources: [examples/virtual_sites/vsite_showcase.ipynb:13-15](), [examples/virtual_sites/vsite_showcase.ipynb:127-131]()
+
+## Multi-Engine Integration Examples
+
+### AMBER and GROMACS Export
+
+The `using_smirnoff_in_amber_or_gromacs` examples demonstrate how to export OpenFF-parametrized systems to other molecular dynamics engines using the Interchange framework.
+
+```mermaid
+graph LR
+    A["ForceField.create_interchange"] --> B["Interchange object"]
+    B --> C["interchange.to_openmm"]
+    B --> D["interchange.to_amber"]
+    B --> E["interchange.to_gromacs"]
+    
+    D --> F["complex.prmtop<br/>complex.inpcrd<br/>complex.in"]
+    E --> G["complex.top<br/>complex.gro<br/>complex.mdp"]
+    
+    subgraph "Validation"
+        H["Energy comparison"]
+        I["Force comparison"]
+    end
+    
+    C --> H
+    D --> H
+    E --> H
+```
+
+The `Interchange.to_amber` method [examples/using_smirnoff_in_amber_or_gromacs/export_with_interchange.ipynb:162]() generates complete AMBER parameter, coordinate, and input files, while `Interchange.to_gromacs` [examples/using_smirnoff_in_amber_or_gromacs/export_with_interchange.ipynb:194]() produces equivalent GROMACS files.
+
+Sources: [examples/using_smirnoff_in_amber_or_gromacs/export_with_interchange.ipynb:7-10](), [examples/using_smirnoff_in_amber_or_gromacs/README.md:1-8]()
+
+### Mixed Force Field Systems
+
+The `using_smirnoff_with_amber_protein_forcefield` examples show how to combine SMIRNOFF small molecule parameters with traditional protein force fields using `Interchange.combine`.
+
+```mermaid
+graph TB
+    A["ForceField('openff-2.2.0.offxml')"] --> B["ligand_system"]
+    C["ForceField('ff14sb_off_impropers_0.0.4.offxml')"] --> D["receptor_system"]
+    
+    B --> E["receptor_system.combine(ligand_system)"]
+    D --> E
+    E --> F["complex_system"]
+    
+    F --> G["complex_system.to_openmm"]
+    F --> H["complex_system.to_amber"]
+    F --> I["complex_system.to_gromacs"]
+    
+    subgraph "Warning"
+        J["InterchangeCombinationWarning<br/>Use with caution"]
+    end
+    
+    E -.-> J
+```
+
+The combination process [examples/using_smirnoff_with_amber_protein_forcefield/BRD4_inhibitor_benchmark.ipynb:95]() requires careful validation as noted in the warning message about experimental nature of this functionality.
+
+Sources: [examples/using_smirnoff_with_amber_protein_forcefield/BRD4_inhibitor_benchmark.ipynb:9-11](), [examples/using_smirnoff_with_amber_protein_forcefield/BRD4_inhibitor_benchmark.ipynb:48-51]()
+
+## Visualization and Data Integration
+
+### Molecular Visualization
+
+The `visualization.ipynb` example demonstrates the rich representation capabilities for `Molecule` and `Topology` objects in Jupyter notebooks.
+
+```mermaid
+graph LR
+    A["Molecule object"] --> B["molecule.visualize()"]
+    A --> C["Implicit evaluation"]
+    
+    B --> D["RDKit backend"]
+    B --> E["OpenEye backend"]
+    B --> F["NGLview backend"]
+    
+    C --> G["Auto-selection:<br/>nglview > rdkit > openeye"]
+    
+    H["Topology object"] --> I["topology.visualize()"]
+    I --> J["NGLview 3D representation"]
+    
+    subgraph "Requirements"
+        K["Conformers needed for NGLview"]
+        L["License needed for OpenEye"]
+    end
+    
+    F -.-> K
+    E -.-> L
+```
+
+The visualization system automatically selects backends based on availability and molecule properties [examples/visualization/visualization.ipynb:81-82](), with NGLview preferred for molecules with conformers.
+
+Sources: [examples/visualization/visualization.ipynb:14-32](), [examples/visualization/README.md:1-29]()
+
+### QCArchive Integration
+
+The `QCArchive_interface.ipynb` example shows how to create OpenFF molecules from quantum chemistry data using CMILES identifiers and the `canonical_isomeric_explicit_hydrogen_mapped_smiles` field.
+
+The example demonstrates safe molecule creation from QCArchive data [examples/QCArchive_interface/QCarchive_interface.ipynb:7-12]() by leveraging the standardized molecular identifiers to ensure consistent chemical representation.
+
+Sources: [examples/QCArchive_interface/QCarchive_interface.ipynb:7-12]()
+
+## Example Execution and Testing
+
+All examples are automatically tested as part of the continuous integration system to ensure they remain functional with toolkit updates. The examples use standardized molecule datasets and include expected output validation where appropriate.
+
+The examples leverage the `get_data_file_path` utility [examples/SMIRNOFF_simulation/run_simulation.ipynb:31]() to access bundled test molecules and systems, ensuring reproducible execution across different environments.
+
+Sources: [examples/README.md:1-21](), [examples/SMIRNOFF_simulation/run_simulation.ipynb:38-40]()
+
+---
+
+# Page: Advanced Usage
+
+# Advanced Usage
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [examples/deprecated/mixedFF_structure/README.md](examples/deprecated/mixedFF_structure/README.md)
+- [examples/deprecated/mixedFF_structure/generate_mixedFF_complex.py](examples/deprecated/mixedFF_structure/generate_mixedFF_complex.py)
+- [openff/toolkit/_tests/test_parameter_plugins.py](openff/toolkit/_tests/test_parameter_plugins.py)
+- [openff/toolkit/data/proteins/MainChain_CYM.pdb](openff/toolkit/data/proteins/MainChain_CYM.pdb)
+- [openff/toolkit/data/proteins/aa_residues_substructures_explicit_bond_orders_with_caps.json](openff/toolkit/data/proteins/aa_residues_substructures_explicit_bond_orders_with_caps.json)
+- [openff/toolkit/data/proteins/aa_residues_substructures_explicit_bond_orders_with_caps_explicit_connectivity.json](openff/toolkit/data/proteins/aa_residues_substructures_explicit_bond_orders_with_caps_explicit_connectivity.json)
+- [openff/toolkit/data/proteins/aa_residues_substructures_with_caps.json](openff/toolkit/data/proteins/aa_residues_substructures_with_caps.json)
+- [openff/toolkit/data/proteins/ace-ala-nh2.pdb](openff/toolkit/data/proteins/ace-ala-nh2.pdb)
+- [openff/toolkit/data/systems/test_systems/PE.pdb](openff/toolkit/data/systems/test_systems/PE.pdb)
+- [openff/toolkit/typing/engines/smirnoff/plugins.py](openff/toolkit/typing/engines/smirnoff/plugins.py)
+- [utilities/make_substructure_dict/_cif_to_substructure_dict.py](utilities/make_substructure_dict/_cif_to_substructure_dict.py)
+- [utilities/make_substructure_dict/_make_chemical_substructures.py](utilities/make_substructure_dict/_make_chemical_substructures.py)
+- [utilities/make_substructure_dict/_make_metadata_assignment_substructures.py](utilities/make_substructure_dict/_make_metadata_assignment_substructures.py)
+- [utilities/test_plugins/custom_plugins/handler_plugins.py](utilities/test_plugins/custom_plugins/handler_plugins.py)
+- [utilities/test_plugins/setup.py](utilities/test_plugins/setup.py)
+
+</details>
+
+
+
+This page covers advanced usage patterns in the OpenFF toolkit, including custom parameter handlers, mixed force field workflows, and complex molecular system preparation. This material is intended for users who need to extend the toolkit's functionality beyond standard force field application scenarios.
+
+For basic force field usage, see [Getting Started](#3.1). For plugin development details, see [Plugin Development](#4.3). For core architecture concepts, see [Core Architecture](#2).
+
+## Custom Parameter Handlers and Plugin System
+
+The OpenFF toolkit supports a plugin system that allows users to create custom parameter handlers for specialized force field terms or novel potential functions. This system uses Python's entry point mechanism to dynamically load custom handlers at runtime.
+
+### Plugin Architecture
+
+```mermaid
+graph TB
+    subgraph "Entry Point System"
+        A["setup.py entry_points"] 
+        B["openff.toolkit.plugins.handlers"]
+    end
+    
+    subgraph "Plugin Loading"
+        C["load_handler_plugins()"]
+        D["_load_handler_plugins()"]
+        E["entry_points().select()"]
+    end
+    
+    subgraph "Custom Handlers"
+        F["CustomHandler"]
+        G["FOOBuckinghamHandler"] 
+        H["WrongSubclass"]
+    end
+    
+    subgraph "Validation"
+        I["issubclass(ParameterHandler)"]
+        J["Skip invalid plugins"]
+    end
+    
+    subgraph "ForceField Integration"
+        K["ForceField(load_plugins=True)"]
+        L["_plugin_parameter_handler_classes"]
+    end
+    
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    E --> G
+    E --> H
+    
+    F --> I
+    G --> I
+    H --> J
+    
+    I --> K
+    K --> L
+```
+
+The plugin system loads custom parameter handlers through the entry point mechanism. Plugins must inherit from `ParameterHandler` to be considered valid, and invalid plugins are automatically skipped with logging.
+
+**Sources:** [openff/toolkit/typing/engines/smirnoff/plugins.py:35-94](), [openff/toolkit/_tests/test_parameter_plugins.py:48-59](), [utilities/test_plugins/setup.py:12-18]()
+
+### Creating Custom Parameter Handlers
+
+Custom parameter handlers extend the base `ParameterHandler` class and define specialized parameter types. The following example shows the structure of a custom Buckingham potential handler:
+
+```mermaid
+graph TB
+    subgraph "Base Classes"
+        A["ParameterHandler"]
+        B["_NonbondedHandler"]
+        C["ParameterType"]
+    end
+    
+    subgraph "Custom Implementation"
+        D["FOOBuckinghamHandler"]
+        E["FOOBuckinghamType"]
+    end
+    
+    subgraph "Parameter Attributes"
+        F["a: ParameterAttribute"]
+        G["b: ParameterAttribute"] 
+        H["c: ParameterAttribute"]
+    end
+    
+    subgraph "Configuration"
+        I["_TAGNAME = 'FOOBuckingham'"]
+        J["_INFOTYPE = FOOBuckinghamType"]
+        K["_ELEMENT_NAME = 'Atom'"]
+    end
+    
+    A --> D
+    B --> D
+    C --> E
+    
+    D --> I
+    D --> J
+    E --> K
+    E --> F
+    E --> G
+    E --> H
+```
+
+Custom parameter types define attributes with units and default values. The handler manages collections of these parameter types and provides methods for parameter assignment and validation.
+
+**Sources:** [utilities/test_plugins/custom_plugins/handler_plugins.py:22-49](), [openff/toolkit/_tests/test_parameter_plugins.py:76-92]()
+
+### Plugin Registration and Testing
+
+Plugins are registered through `setup.py` entry points and can be tested using the standard force field loading mechanism:
+
+```python
+# In setup.py
+entry_points={
+    "openff.toolkit.plugins.handlers": [
+        "CustomHandler = custom_plugins.handler_plugins:CustomHandler",
+        "FOOBuckinghamHandler = custom_plugins.handler_plugins:FOOBuckinghamHandler",
+    ]
+}
+```
+
+The testing framework verifies that plugins load correctly and integrate with the force field system. Force fields can explicitly enable plugin loading using the `load_plugins=True` parameter.
+
+**Sources:** [utilities/test_plugins/setup.py:8-19](), [openff/toolkit/_tests/test_parameter_plugins.py:14-46]()
+
+## Mixed Force Field Workflows
+
+The toolkit supports combining SMIRNOFF-parameterized small molecules with traditionally parameterized proteins using ParmEd as an integration layer. This enables hybrid simulations where different force field methodologies are applied to different components of the system.
+
+### Mixed Force Field Architecture
+
+```mermaid
+graph LR
+    subgraph "Small Molecule Path"
+        A["Molecule.from_file()"]
+        B["SMIRNOFF ForceField"]
+        C["create_parmed_structure()"]
+    end
+    
+    subgraph "Protein Path"
+        D["app.PDBFile()"]
+        E["app.ForceField(amber99sbildn.xml)"]
+        F["createSystem()"]
+        G["parmed.openmm.load_topology()"]
+    end
+    
+    subgraph "Integration"
+        H["ParmEd Structure Addition"]
+        I["protein_structure + molecule_structure"]
+        J["Combined System"]
+    end
+    
+    subgraph "Export Options"
+        K["AMBER"]
+        L["CHARMM"] 
+        M["OpenMM"]
+        N["GROMACS"]
+    end
+    
+    A --> B
+    B --> C
+    
+    D --> E
+    E --> F
+    F --> G
+    
+    C --> H
+    G --> H
+    H --> I
+    I --> J
+    
+    J --> K
+    J --> L
+    J --> M
+    J --> N
+```
+
+The workflow creates separate ParmEd structures for each component, then combines them through structure concatenation. The ordering matters - typically the protein structure is added first to preserve box vectors.
+
+**Sources:** [examples/deprecated/mixedFF_structure/README.md:1-46](), [examples/deprecated/mixedFF_structure/generate_mixedFF_complex.py:1-57]()
+
+### Implementation Details
+
+The mixed force field approach requires careful coordination between different parameterization engines:
+
+1. **Small Molecule Processing**: SMIRNOFF force fields parameterize the ligand using chemical perception and SMIRKS patterns
+2. **Protein Processing**: Traditional force fields (AMBER, CHARMM) parameterize the protein using residue templates
+3. **Structure Combination**: ParmEd provides the infrastructure to merge force field parameters from different sources
+4. **System Validation**: The combined system maintains consistent energy units and parameter compatibility
+
+Key considerations include solvent treatment, periodic boundary conditions, and ensuring no parameter conflicts between the different force field components.
+
+**Sources:** [examples/deprecated/mixedFF_structure/generate_mixedFF_complex.py:11-56]()
+
+## Advanced Molecular Structure Handling
+
+The toolkit provides sophisticated support for complex molecular structures, particularly protein systems with extensive amino acid variant handling and chemical substructure libraries.
+
+### Protein Substructure System
+
+```mermaid
+graph TB
+    subgraph "Data Sources"
+        A["aa-variants-v1.cif"]
+        B["Chemical Component Dictionary"]
+        C["PDB Structures"]
+    end
+    
+    subgraph "Processing Pipeline"
+        D["CifSubstructures"]
+        E["_fill_substructure_data()"]
+        F["_add_substructure_data_entry()"]
+        G["_recursive_prepare_atom_bond_info()"]
+    end
+    
+    subgraph "Chemical Processing"
+        H["remove_charge_and_bond_order_from_guanidinium()"]
+        I["remove_charge_and_bond_order_from_imidazole()"]
+        J["_get_subrdmol()"]
+        K["_get_smiles()"]
+    end
+    
+    subgraph "Output Formats"
+        L["aa_residues_substructures_with_caps.json"]
+        M["aa_residues_substructures_explicit_bond_orders_with_caps.json"]
+        N["aa_residues_substructures_explicit_connectivity.json"]
+    end
+    
+    A --> D
+    B --> D
+    C --> D
+    
+    D --> E
+    E --> F
+    F --> G
+    
+    E --> H
+    E --> I
+    E --> J
+    J --> K
+    
+    G --> L
+    G --> M
+    G --> N
+```
+
+The system processes crystallographic data to generate comprehensive libraries of amino acid substructures with explicit chemical connectivity and multiple protonation states.
+
+**Sources:** [utilities/make_substructure_dict/_cif_to_substructure_dict.py:79-606](), [utilities/make_substructure_dict/_make_chemical_substructures.py:21-46]()
+
+### Chemical Perception Enhancements
+
+The substructure processing includes specialized handling for problematic chemical groups:
+
+1. **Resonance State Management**: Guanidinium and imidazole groups have their formal charges and bond orders modified to handle resonance ambiguity
+2. **Leaving Atom Processing**: The system generates multiple variants by systematically removing "leaving" atoms to create chemically relevant derivatives
+3. **Connectivity Specification**: Explicit bond order and connectivity information ensures unambiguous chemical matching
+
+The processing generates SMARTS patterns with atom mapping that can be used for precise substructure identification in complex molecular systems.
+
+**Sources:** [utilities/make_substructure_dict/_cif_to_substructure_dict.py:24-77](), [utilities/make_substructure_dict/_cif_to_substructure_dict.py:316-362]()
+
+### Substructure Data Formats
+
+The toolkit maintains multiple substructure libraries with different levels of chemical detail:
+
+| Format | Purpose | Chemical Detail |
+|--------|---------|----------------|
+| `aa_residues_substructures_with_caps.json` | Basic residue matching | SMILES with leaving atoms |
+| `aa_residues_substructures_explicit_bond_orders_with_caps.json` | Precise chemical matching | Explicit bond orders and stereochemistry |
+| `aa_residues_substructures_explicit_connectivity.json` | Maximum specificity | Full connectivity with neighbor specifications |
+
+These libraries support increasingly sophisticated chemical perception requirements, from basic residue identification to precise force field parameter assignment.
+
+**Sources:** [openff/toolkit/data/proteins/aa_residues_substructures_with_caps.json:1-50](), [openff/toolkit/data/proteins/aa_residues_substructures_explicit_bond_orders_with_caps.json:1-50]()
+
+## Complex System Preparation
+
+Advanced usage often involves preparing complex molecular systems with specialized requirements such as non-standard residues, custom modifications, or unusual chemical environments.
+
+### Automated Processing Workflows
+
+The toolkit provides utilities for automated processing of complex chemical data:
+
+```mermaid
+graph TB
+    subgraph "Data Acquisition"
+        A["requests.get(CCD_URL)"]
+        B["ReadCif(cif_file)"]
+        C["File Validation"]
+    end
+    
+    subgraph "Structure Processing" 
+        D["_gather_atoms_information()"]
+        E["_gather_bonds_information()"]
+        F["Molecule.add_atom()"]
+        G["Molecule.add_bond()"]
+    end
+    
+    subgraph "Chemical Correction"
+        H["_patch_known_problems()"]
+        I["_add_common_substructures()"]
+        J["_add_common_linkages()"]
+        K["_reformat_substructs()"]
+    end
+    
+    subgraph "Output Generation"
+        L["to_json_file()"]
+        M["get_data_file_path()"]
+    end
+    
+    A --> B
+    B --> C
+    C --> D
+    C --> E
+    
+    D --> F
+    E --> G
+    
+    F --> H
+    G --> H
+    H --> I
+    I --> J
+    J --> K
+    
+    K --> L
+    L --> M
+```
+
+The automated pipeline handles data acquisition, chemical processing, error correction, and output generation without manual intervention.
+
+**Sources:** [utilities/make_substructure_dict/_make_chemical_substructures.py:7-46](), [utilities/make_substructure_dict/_make_metadata_assignment_substructures.py:7-35]()
+
+### Error Handling and Validation
+
+The system includes comprehensive error handling for chemical data processing:
+
+1. **Import Error Management**: Failed plugin imports are logged but don't stop processing
+2. **Chemical Validation**: Invalid chemical structures are identified and either corrected or skipped
+3. **Compatibility Checking**: Parameter handler compatibility is verified before integration
+4. **Data Integrity**: Output files are validated for chemical consistency and completeness
+
+This robust error handling ensures that complex processing pipelines can handle real-world chemical data with its inherent inconsistencies and edge cases.
+
+**Sources:** [openff/toolkit/typing/engines/smirnoff/plugins.py:63-82](), [utilities/make_substructure_dict/_cif_to_substructure_dict.py:608-683]()
+
+---
+
+# Page: Development
+
+# Development
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.github/workflows/CI.yml](.github/workflows/CI.yml)
+- [.github/workflows/beta_rc.yaml](.github/workflows/beta_rc.yaml)
+- [.github/workflows/conda.yml](.github/workflows/conda.yml)
+- [.github/workflows/examples.yml](.github/workflows/examples.yml)
+- [.github/workflows/installer.yml](.github/workflows/installer.yml)
+- [devtools/conda-envs/conda.yaml](devtools/conda-envs/conda.yaml)
+- [devtools/conda-envs/conda_oe.yaml](devtools/conda-envs/conda_oe.yaml)
+- [devtools/conda-envs/openeye-examples.yaml](devtools/conda-envs/openeye-examples.yaml)
+- [devtools/conda-envs/openeye.yaml](devtools/conda-envs/openeye.yaml)
+- [devtools/conda-envs/rdkit-examples.yaml](devtools/conda-envs/rdkit-examples.yaml)
+- [devtools/conda-envs/rdkit.yaml](devtools/conda-envs/rdkit.yaml)
+- [devtools/conda-envs/test_env.yaml](devtools/conda-envs/test_env.yaml)
+- [docs/typing.rst](docs/typing.rst)
+- [openff/toolkit/_tests/test_forcefield.py](openff/toolkit/_tests/test_forcefield.py)
+- [openff/toolkit/_tests/test_molecule.py](openff/toolkit/_tests/test_molecule.py)
+- [openff/toolkit/_tests/test_parameters.py](openff/toolkit/_tests/test_parameters.py)
+
+</details>
+
+
+
+This document provides a comprehensive guide for developers contributing to the OpenFF toolkit repository. It covers the testing infrastructure, development workflows, environment setup, and quality assurance processes that ensure the toolkit maintains high standards across multiple platforms and toolkit combinations.
+
+For information about the core toolkit architecture and design patterns, see [Core Architecture](#2). For user-focused guidance on installation and usage, see [Getting Started](#3.1).
+
+## Overview
+
+The OpenFF toolkit development process is built around a robust continuous integration system that validates code changes across multiple dimensions: operating systems, Python versions, and cheminformatics toolkit combinations. The development workflow ensures compatibility with both open-source (RDKit, AmberTools) and commercial (OpenEye) backend toolkits while maintaining comprehensive test coverage.
+
+Sources: [.github/workflows/CI.yml:1-183](), [devtools/conda-envs/test_env.yaml:1-51]()
+
+## Continuous Integration Architecture
+
+The CI system forms the backbone of the development process, orchestrating testing across multiple configurations and ensuring code quality before integration.
+
+### CI Workflow Matrix
+
+```mermaid
+graph TD
+    A["CI Trigger"] --> B["Matrix Strategy"]
+    B --> C["OS Matrix"]
+    B --> D["Python Matrix"] 
+    B --> E["Toolkit Matrix"]
+    
+    C --> C1["ubuntu-latest"]
+    C --> C2["macos-latest"]
+    
+    D --> D1["Python 3.11"]
+    D --> D2["Python 3.12"]
+    D --> D3["Python 3.13"]
+    
+    E --> E1["RDKit + AmberTools"]
+    E --> E2["OpenEye Only"]
+    E --> E3["RDKit Only"]
+    
+    C1 --> F["Environment Setup"]
+    C2 --> F
+    D1 --> F
+    D2 --> F
+    D3 --> F
+    E1 --> F
+    E2 --> F
+    E3 --> F
+    
+    F --> G["Test Execution"]
+    G --> H["Quality Checks"]
+    H --> I["Coverage Report"]
+```
+
+Sources: [.github/workflows/CI.yml:18-37](), [.github/workflows/CI.yml:49-70]()
+
+### Environment Configuration System
+
+```mermaid
+graph LR
+    A["Environment Files"] --> B["test_env.yaml"]
+    A --> C["rdkit.yaml"]
+    A --> D["openeye.yaml"]
+    A --> E["rdkit-examples.yaml"]
+    A --> F["openeye-examples.yaml"]
+    
+    B --> G["Full Testing"]
+    C --> H["RDKit Testing"]
+    D --> I["OpenEye Testing"]
+    E --> J["RDKit Examples"]
+    F --> K["OpenEye Examples"]
+    
+    G --> L["Core Test Suite"]
+    H --> L
+    I --> L
+    J --> M["Example Validation"]
+    K --> M
+    
+    L --> N["Unit Tests"]
+    L --> O["Integration Tests"]
+    M --> P["Notebook Tests"]
+    M --> Q["Script Tests"]
+```
+
+Sources: [devtools/conda-envs/test_env.yaml:1-51](), [devtools/conda-envs/rdkit.yaml:1-42](), [devtools/conda-envs/openeye.yaml:1-53]()
+
+## Testing Framework
+
+The testing system is organized around comprehensive validation of molecular representations, force field parameterization, and toolkit integrations.
+
+### Test Organization Structure
+
+```mermaid
+graph TD
+    A["Test Suite"] --> B["Core Tests"]
+    A --> C["Integration Tests"]
+    A --> D["Example Tests"]
+    A --> E["Documentation Tests"]
+    
+    B --> B1["test_molecule.py"]
+    B --> B2["test_parameters.py"]
+    B --> B3["test_forcefield.py"]
+    B --> B4["test_topology.py"]
+    
+    C --> C1["test_toolkits.py"]
+    C --> C2["test_links.py"]
+    C --> C3["Cross-toolkit validation"]
+    
+    D --> D1["test_examples.py"]
+    D --> D2["Notebook validation"]
+    D --> D3["Script execution"]
+    
+    E --> E1["Docstring examples"]
+    E --> E2["RST/MD doctests"]
+    E --> E3["API documentation"]
+    
+    B1 --> F["Molecule serialization"]
+    B1 --> G["SMILES parsing"]
+    B1 --> H["Conformer handling"]
+    
+    B2 --> I["Parameter validation"]
+    B2 --> J["Handler behavior"]
+    B2 --> K["SMIRNOFF compliance"]
+    
+    B3 --> L["System creation"]
+    B3 --> M["Force assignment"]
+    B3 --> N["Charge methods"]
+```
+
+Sources: [openff/toolkit/_tests/test_molecule.py:1-50](), [openff/toolkit/_tests/test_parameters.py:1-50](), [openff/toolkit/_tests/test_forcefield.py:1-50]()
+
+### Test Execution Pipeline
+
+```mermaid
+graph LR
+    A["pytest"] --> B["PYTEST_ARGS"]
+    B --> C["-r fE --tb=short -nauto"]
+    C --> D["Test Discovery"]
+    
+    D --> E["Unit Tests"]
+    D --> F["Integration Tests"]
+    D --> G["Slow Tests"]
+    
+    E --> H["Fast Validation"]
+    F --> I["Toolkit Integration"]
+    G --> J["--runslow marker"]
+    
+    H --> K["Coverage Collection"]
+    I --> K
+    J --> K
+    
+    K --> L["COV"]
+    L --> M["--cov=openff/toolkit/"]
+    M --> N["coverage.xml"]
+    
+    N --> O["Codecov Upload"]
+```
+
+Sources: [.github/workflows/CI.yml:41-42](), [.github/workflows/CI.yml:149-158](), [.github/workflows/CI.yml:176-182]()
+
+## Environment Management
+
+The development environment system supports multiple toolkit combinations and testing scenarios through carefully configured conda environments.
+
+### Dependency Resolution Matrix
+
+| Environment | RDKit | OpenEye | AmberTools | Purpose |
+|-------------|--------|---------|------------|---------|
+| `test_env.yaml` | ✓ | ✓ | ✓ | Full testing matrix |
+| `rdkit.yaml` | ✓ | ✗ | ✓ | RDKit-only validation |
+| `openeye.yaml` | ✗ | ✓ | ✗ | OpenEye-only validation |
+| `rdkit-examples.yaml` | ✓ | ✗ | ✓ | Example notebooks (RDKit) |
+| `openeye-examples.yaml` | ✗ | ✓ | ✗ | Example notebooks (OpenEye) |
+
+Sources: [devtools/conda-envs/test_env.yaml:25-31](), [devtools/conda-envs/rdkit.yaml:25-27](), [devtools/conda-envs/openeye.yaml:26-26]()
+
+### Toolkit Validation System
+
+```mermaid
+graph TD
+    A["Toolkit Setup"] --> B["Environment Variables"]
+    B --> C["TOOLKIT_CHECKS"]
+    B --> D["PACKAGES_TO_REMOVE"]
+    
+    C --> E["RDKIT_AVAILABLE"]
+    C --> F["OPENEYE_AVAILABLE"]
+    
+    D --> G["Package Removal"]
+    G --> H["micromamba remove --force"]
+    
+    E --> I["Validation Check"]
+    F --> I
+    I --> J["python -c 'from openff.toolkit.utils.toolkits import ...'"]
+    
+    J --> K["Assert Available"]
+    J --> L["Assert Not Available"]
+    
+    K --> M["Test Execution"]
+    L --> M
+```
+
+Sources: [.github/workflows/CI.yml:109-122](), [.github/workflows/CI.yml:97-103]()
+
+## Quality Assurance Pipeline
+
+The quality assurance system ensures code correctness, style compliance, and comprehensive validation across all supported configurations.
+
+### Code Quality Checks
+
+```mermaid
+graph LR
+    A["Code Quality"] --> B["Type Checking"]
+    A --> C["Test Coverage"]
+    A --> D["Link Validation"]
+    A --> E["Documentation Tests"]
+    
+    B --> B1["mypy -p openff.toolkit"]
+    C --> C1["pytest --cov"]
+    D --> D1["test_links.py"]
+    E --> E1["doctest-glob"]
+    
+    B1 --> F["Static Analysis"]
+    C1 --> G["Coverage Report"]
+    D1 --> H["URL Validation"]
+    E1 --> I["Example Validation"]
+    
+    F --> J["Type Safety"]
+    G --> K["codecov/codecov-action"]
+    H --> L["Documentation Integrity"]
+    I --> M["Code Snippet Testing"]
+```
+
+Sources: [.github/workflows/CI.yml:140-147](), [.github/workflows/CI.yml:136-138](), [.github/workflows/CI.yml:159-175]()
+
+### Testing Specialization
+
+```mermaid
+graph TD
+    A["Specialized Testing"] --> B["Examples Workflow"]
+    A --> C["Beta/RC Testing"]
+    A --> D["Conda Testing"]
+    A --> E["Installer Testing"]
+    
+    B --> B1[".github/workflows/examples.yml"]
+    C --> C1[".github/workflows/beta_rc.yaml"]
+    D --> D2[".github/workflows/conda.yml"]
+    E --> E1[".github/workflows/installer.yml"]
+    
+    B1 --> F["Notebook Validation"]
+    B1 --> G["Script Execution"]
+    
+    C1 --> H["RC Channel Testing"]
+    C1 --> I["Beta Dependency Testing"]
+    
+    D2 --> J["Release Validation"]
+    D2 --> K["Conda Package Testing"]
+    
+    E1 --> L["Single-File Installer"]
+    E1 --> M["Standalone Distribution"]
+```
+
+Sources: [.github/workflows/examples.yml:1-140](), [.github/workflows/beta_rc.yaml:1-87](), [.github/workflows/conda.yml:1-132](), [.github/workflows/installer.yml:1-112]()
+
+## Development Workflow
+
+The development process integrates multiple validation stages to ensure code quality and compatibility across the supported ecosystem.
+
+### Contribution Pipeline
+
+```mermaid
+graph LR
+    A["Code Changes"] --> B["Pre-commit Hooks"]
+    B --> C["Local Testing"]
+    C --> D["Pull Request"]
+    
+    D --> E["CI Triggers"]
+    E --> F["Matrix Testing"]
+    F --> G["Quality Checks"]
+    
+    G --> H["Unit Tests"]
+    G --> I["Integration Tests"]
+    G --> J["Example Tests"]
+    
+    H --> K["Core Validation"]
+    I --> L["Toolkit Integration"]
+    J --> M["Documentation Validation"]
+    
+    K --> N["Coverage Analysis"]
+    L --> N
+    M --> N
+    
+    N --> O["Merge Approval"]
+```
+
+Sources: [.github/workflows/CI.yml:4-11](), [.github/workflows/examples.yml:4-11]()
+
+### Package Installation Process
+
+```mermaid
+graph TD
+    A["Installation Steps"] --> B["Environment Setup"]
+    B --> C["micromamba remove --force openff-toolkit"]
+    C --> D["python -m pip install ."]
+    
+    D --> E["Test Plugin Installation"]
+    E --> F["python -m pip install utilities/test_plugins"]
+    
+    F --> G["Toolkit Validation"]
+    G --> H["Check installed toolkits"]
+    G --> I["Check uninstalled toolkits"]
+    
+    H --> J["TOOLKIT_CHECKS loop"]
+    I --> K["PACKAGES_TO_REMOVE validation"]
+    
+    J --> L["Assert toolkit availability"]
+    K --> M["Assert toolkit absence"]
+    
+    L --> N["Test Execution"]
+    M --> N
+```
+
+Sources: [.github/workflows/CI.yml:84-96](), [.github/workflows/CI.yml:94-96](), [.github/workflows/CI.yml:109-122]()
+
+This development infrastructure ensures that the OpenFF toolkit maintains high quality standards while supporting a diverse ecosystem of cheminformatics backends and deployment environments. The comprehensive testing matrix validates functionality across all supported configurations, while the quality assurance pipeline ensures code correctness and documentation integrity.
+
+---
+
+# Page: Testing Framework
+
+# Testing Framework
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.github/workflows/CI.yml](.github/workflows/CI.yml)
+- [.github/workflows/beta_rc.yaml](.github/workflows/beta_rc.yaml)
+- [.github/workflows/conda.yml](.github/workflows/conda.yml)
+- [.github/workflows/examples.yml](.github/workflows/examples.yml)
+- [.github/workflows/installer.yml](.github/workflows/installer.yml)
+- [devtools/conda-envs/conda.yaml](devtools/conda-envs/conda.yaml)
+- [devtools/conda-envs/conda_oe.yaml](devtools/conda-envs/conda_oe.yaml)
+- [devtools/conda-envs/openeye-examples.yaml](devtools/conda-envs/openeye-examples.yaml)
+- [devtools/conda-envs/openeye.yaml](devtools/conda-envs/openeye.yaml)
+- [devtools/conda-envs/rdkit-examples.yaml](devtools/conda-envs/rdkit-examples.yaml)
+- [devtools/conda-envs/rdkit.yaml](devtools/conda-envs/rdkit.yaml)
+- [devtools/conda-envs/test_env.yaml](devtools/conda-envs/test_env.yaml)
+- [docs/typing.rst](docs/typing.rst)
+- [openff/toolkit/_tests/test_forcefield.py](openff/toolkit/_tests/test_forcefield.py)
+- [openff/toolkit/_tests/test_molecule.py](openff/toolkit/_tests/test_molecule.py)
+- [openff/toolkit/_tests/test_parameters.py](openff/toolkit/_tests/test_parameters.py)
+
+</details>
+
+
+
+This document describes the comprehensive testing infrastructure used to ensure code quality and reliability in the OpenFF toolkit. It covers the automated testing pipeline, test environment management, test organization, and how to run tests during development.
+
+For information about building and packaging the toolkit, see [Build and Packaging](#4.2). For details on developing custom plugins, see [Plugin Development](#4.3).
+
+## Overview
+
+The OpenFF toolkit employs a multi-tiered testing strategy that validates functionality across different platforms, Python versions, and cheminformatics toolkit combinations. The testing framework ensures compatibility with various dependency configurations and validates both core functionality and real-world usage scenarios.
+
+```mermaid
+graph TB
+    subgraph "Testing Infrastructure"
+        A["GitHub Actions CI"] --> B["Test Matrix Execution"]
+        B --> C["Core Unit Tests"]
+        B --> D["Integration Tests"] 
+        B --> E["Example Validation"]
+        B --> F["Documentation Tests"]
+    end
+    
+    subgraph "Test Environments"
+        G["test_env.yaml<br/>Full Environment"] 
+        H["rdkit.yaml<br/>RDKit Only"]
+        I["openeye.yaml<br/>OpenEye Only"] 
+        J["examples environments"]
+    end
+    
+    subgraph "Test Categories"
+        K["openff/toolkit/_tests/<br/>Core Tests"]
+        L["Notebook Tests<br/>docs/ and examples/"]
+        M["Docstring Tests<br/>API Documentation"]
+        N["Plugin Tests<br/>utilities/test_plugins"]
+    end
+    
+    A --> G
+    A --> H  
+    A --> I
+    A --> J
+    
+    C --> K
+    E --> L
+    F --> M
+    E --> N
+```
+
+**Testing Infrastructure Overview**
+
+Sources: [.github/workflows/CI.yml:1-183](), [devtools/conda-envs/test_env.yaml:1-51](), [openff/toolkit/_tests/test_molecule.py:1-50]()
+
+## CI/CD Pipeline Architecture
+
+The continuous integration system uses GitHub Actions to orchestrate testing across multiple dimensions of the software stack. The primary workflow is defined in `CI.yml` and executes a comprehensive test matrix.
+
+```mermaid
+graph LR
+    subgraph "Trigger Events"
+        A["Push to main"] 
+        B["Pull Request"]
+        C["Scheduled Run<br/>Daily 00:21 UTC"]
+    end
+    
+    subgraph "Test Matrix"
+        D["OS Matrix<br/>ubuntu-latest<br/>macos-latest"]
+        E["Python Matrix<br/>3.11, 3.12, 3.13"]
+        F["Toolkit Matrix<br/>RDKit + OpenEye<br/>RDKit Only<br/>OpenEye Only"]
+    end
+    
+    subgraph "Test Execution Steps"
+        G["Environment Setup<br/>micromamba"]
+        H["Package Installation<br/>pip install ."]
+        I["Test Plugin Install<br/>utilities/test_plugins"]
+        J["Toolkit Verification"]
+        K["Core Test Suite<br/>pytest"]
+        L["Coverage Report<br/>codecov"]
+    end
+    
+    A --> D
+    B --> D  
+    C --> D
+    
+    D --> G
+    E --> G
+    F --> G
+    
+    G --> H
+    H --> I
+    I --> J
+    J --> K
+    K --> L
+```
+
+**CI/CD Pipeline Flow**
+
+The test matrix systematically excludes invalid combinations, such as configurations with neither RDKit nor OpenEye, and limits OpenEye testing to Python 3.13 due to licensing constraints.
+
+Sources: [.github/workflows/CI.yml:18-43](), [.github/workflows/CI.yml:49-104](), [.github/workflows/CI.yml:149-158]()
+
+## Test Environment Management
+
+The testing framework uses conda environment files to manage dependencies across different testing scenarios. Each environment is tailored for specific testing needs and toolkit combinations.
+
+| Environment File | Purpose | Key Dependencies |
+|------------------|---------|------------------|
+| `test_env.yaml` | Full testing with all toolkits | `rdkit`, `openeye-toolkits`, `ambertools`, `pytest=8` |
+| `rdkit.yaml` | RDKit-only testing | `rdkit`, `ambertools`, `mypy=1.15` |
+| `openeye.yaml` | OpenEye-only testing | `openeye-toolkits`, type stubs |
+| `rdkit-examples.yaml` | Example testing with RDKit | Additional dependencies for notebooks |
+| `openeye-examples.yaml` | Example testing with OpenEye | GROMACS, visualization tools |
+
+```mermaid
+graph TB
+    subgraph "Environment Selection Logic"
+        A["Matrix Configuration"] --> B{"Toolkit Selection"}
+        B -->|"rdkit=true, openeye=true"| C["test_env.yaml<br/>ENVFILE=test_env"]
+        B -->|"rdkit=false, openeye=true"| D["openeye.yaml<br/>ENVFILE=openeye"] 
+        B -->|"rdkit=true, openeye=false"| E["rdkit.yaml<br/>ENVFILE=rdkit"]
+    end
+    
+    subgraph "Package Removal"
+        F["Remove Conflicting Packages"] --> G["micromamba remove --force"]
+        G --> H["Toolkit Verification"]
+    end
+    
+    C --> F
+    D --> F
+    E --> F
+```
+
+**Test Environment Selection and Configuration**
+
+Sources: [.github/workflows/CI.yml:49-71](), [devtools/conda-envs/test_env.yaml:1-51](), [devtools/conda-envs/rdkit.yaml:1-42](), [devtools/conda-envs/openeye.yaml:1-53]()
+
+## Test Categories and Organization
+
+The test suite is organized into distinct categories that validate different aspects of the toolkit functionality:
+
+```mermaid
+graph TB
+    subgraph "Core Unit Tests"
+        A["test_molecule.py<br/>Molecule and Topology"]
+        B["test_parameters.py<br/>SMIRNOFF Parameters"] 
+        C["test_forcefield.py<br/>ForceField Engine"]
+        D["test_toolkits.py<br/>Toolkit Integration"]
+    end
+    
+    subgraph "Specialized Tests"
+        E["test_examples.py<br/>Script Validation"]
+        F["test_links.py<br/>URL Validation"]
+        G["Plugin Tests<br/>utilities/test_plugins"]
+    end
+    
+    subgraph "Documentation Tests" 
+        H["Docstring Examples<br/>--doctest-modules"]
+        I["RST/MD Code Blocks<br/>--doctest-glob"]
+        J["Jupyter Notebooks<br/>--nbval-lax"]
+    end
+    
+    subgraph "Integration Tests"
+        K["System Creation<br/>OpenMM Integration"]
+        L["File I/O<br/>Multiple Formats"]
+        M["Parameterization<br/>End-to-End Workflows"]
+    end
+```
+
+**Test Organization and Categories**
+
+### Core Test Execution
+
+The main test execution excludes certain test files that require special handling:
+
+```bash
+PYTEST_ARGS+=" --ignore=openff/toolkit/_tests/test_examples.py"
+PYTEST_ARGS+=" --ignore=openff/toolkit/_tests/test_links.py"
+python -m pytest -x --durations=20 $PYTEST_ARGS $COV openff/toolkit/_tests
+```
+
+Sources: [.github/workflows/CI.yml:150-158](), [openff/toolkit/_tests/test_molecule.py:1-100](), [openff/toolkit/_tests/test_parameters.py:1-50](), [openff/toolkit/_tests/test_forcefield.py:1-100]()
+
+## Specialized Testing Workflows
+
+Beyond the main CI pipeline, the toolkit includes specialized testing workflows for different scenarios:
+
+### Example and Notebook Testing
+
+The `examples.yml` workflow specifically validates example scripts and Jupyter notebooks:
+
+```mermaid
+graph LR
+    subgraph "Example Testing Matrix"
+        A["OS: ubuntu, macos"] --> B["Python: 3.11, 3.12"]
+        B --> C["Toolkit: RDKit OR OpenEye<br/>(Not Both)"]
+    end
+    
+    subgraph "Test Execution"
+        D["Example Scripts<br/>test_examples.py"] 
+        E["Jupyter Notebooks<br/>--nbval-lax"]
+        F["Ignore Deprecated<br/>examples/deprecated"]
+    end
+    
+    C --> D
+    C --> E
+    E --> F
+```
+
+**Example Testing Pipeline**
+
+### Beta/RC Testing
+
+The `beta_rc.yaml` workflow tests against pre-release versions of dependencies:
+
+- Tests against conda-forge release candidate channels
+- Validates compatibility with upcoming dependency versions
+- Uses specific micromamba version (`1.5.10-0`) for stability
+
+### Deployment Testing
+
+The `conda.yml` workflow validates conda package installations:
+
+- Tests installation from conda packages rather than source
+- Verifies version matching between git tags and installed packages
+- Validates toolkit availability in conda-installed environments
+
+Sources: [.github/workflows/examples.yml:1-140](), [.github/workflows/beta_rc.yaml:1-87](), [.github/workflows/conda.yml:1-132]()
+
+## Test Configuration and Quality Assurance
+
+The testing framework includes several quality assurance mechanisms:
+
+### Coverage Reporting
+- Uses `pytest-cov` with `--cov=openff/toolkit/` 
+- Uploads results to Codecov with token authentication
+- Fails CI if coverage upload fails
+
+### Type Checking
+- MyPy validation runs on OpenEye-only builds (RDKit builds often have stub issues)
+- Validates type annotations in the `openff.toolkit` package
+
+### Performance Monitoring
+- `--durations=20` flag reports the 20 slowest tests
+- Helps identify performance regressions
+
+### Parallel Execution
+- Uses `pytest-xdist` with `-nauto` for parallel test execution
+- Includes special handling for Pint cross-interaction issues
+
+```mermaid
+graph TB
+    subgraph "Quality Gates"
+        A["Type Checking<br/>mypy -p openff.toolkit"] --> B["Unit Tests<br/>pytest with coverage"]
+        B --> C["Integration Tests<br/>Examples and Notebooks"] 
+        C --> D["Link Validation<br/>test_links.py"]
+        D --> E["Coverage Upload<br/>codecov"]
+    end
+    
+    subgraph "Test Markers"
+        F["@pytest.mark.slow<br/>Long-running tests"]
+        G["@pytest.mark.wip<br/>Work in progress"]  
+        H["@pytest.mark.xfail<br/>Expected failures"]
+    end
+    
+    B --> F
+    B --> G
+    B --> H
+```
+
+**Quality Assurance Pipeline**
+
+Sources: [.github/workflows/CI.yml:140-147](), [.github/workflows/CI.yml:176-183](), [.github/workflows/CI.yml:133-135]()
+
+## Running Tests Locally
+
+For local development, tests can be run using the same environment configurations as CI:
+
+1. **Set up test environment:**
+   ```bash
+   micromamba env create -f devtools/conda-envs/test_env.yaml
+   micromamba activate openff-toolkit-test
+   ```
+
+2. **Install toolkit in development mode:**
+   ```bash
+   pip install -e .
+   ```
+
+3. **Install test plugins:**
+   ```bash
+   pip install utilities/test_plugins
+   ```
+
+4. **Run specific test categories:**
+   ```bash
+   # Core unit tests
+   pytest openff/toolkit/_tests/
+   
+   # With coverage
+   pytest --cov=openff/toolkit/ openff/toolkit/_tests/
+   
+   # Examples only
+   pytest openff/toolkit/_tests/test_examples.py
+   
+   # Notebooks
+   pytest --nbval-lax docs/ examples/
+   ```
+
+The test framework supports various pytest markers for controlling test execution, including `@pytest.mark.slow` for time-intensive tests and `@pytest.mark.wip` for work-in-progress functionality.
+
+Sources: [.github/workflows/CI.yml:84-96](), [devtools/conda-envs/test_env.yaml:32-43](), [openff/toolkit/_tests/test_molecule.py:175-236]()
+
+---
+
+# Page: Build and Packaging
+
+# Build and Packaging
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.github/workflows/CI.yml](.github/workflows/CI.yml)
+- [.github/workflows/beta_rc.yaml](.github/workflows/beta_rc.yaml)
+- [.github/workflows/conda.yml](.github/workflows/conda.yml)
+- [.github/workflows/examples.yml](.github/workflows/examples.yml)
+- [.github/workflows/installer.yml](.github/workflows/installer.yml)
+- [devtools/conda-envs/conda.yaml](devtools/conda-envs/conda.yaml)
+- [devtools/conda-envs/conda_oe.yaml](devtools/conda-envs/conda_oe.yaml)
+- [devtools/conda-envs/openeye-examples.yaml](devtools/conda-envs/openeye-examples.yaml)
+- [devtools/conda-envs/openeye.yaml](devtools/conda-envs/openeye.yaml)
+- [devtools/conda-envs/rdkit-examples.yaml](devtools/conda-envs/rdkit-examples.yaml)
+- [devtools/conda-envs/rdkit.yaml](devtools/conda-envs/rdkit.yaml)
+- [devtools/conda-envs/release-build.yaml](devtools/conda-envs/release-build.yaml)
+- [devtools/conda-envs/test_env.yaml](devtools/conda-envs/test_env.yaml)
+
+</details>
+
+
+
+This document explains the build and packaging infrastructure for the OpenFF toolkit, including continuous integration workflows, environment management, testing matrices, and distribution processes. The system ensures code quality across multiple platforms, Python versions, and optional dependencies through automated testing and packaging.
+
+For information about the actual testing framework and test organization, see [Testing Framework](#4.1). For plugin development and extension mechanisms, see [Plugin Development](#4.3).
+
+## CI/CD Architecture
+
+The OpenFF toolkit uses a comprehensive GitHub Actions-based CI/CD system that validates code across multiple dimensions: operating systems, Python versions, and optional toolkit dependencies.
+
+```mermaid
+graph TB
+    subgraph "GitHub Actions Workflows"
+        CI["CI.yml<br/>Primary testing workflow"]
+        CONDA["conda.yml<br/>Conda package validation"]
+        EXAMPLES["examples.yml<br/>Example notebook testing"]
+        INSTALLER["installer.yml<br/>Single-file installer creation"]
+        BETA["beta_rc.yaml<br/>Beta/RC dependency testing"]
+    end
+    
+    subgraph "Trigger Events"
+        PUSH["Push to main branch"]
+        PR["Pull requests"]
+        SCHEDULE["Nightly scheduled runs"]
+        RELEASE["Release events"]
+        MANUAL["Manual workflow dispatch"]
+    end
+    
+    subgraph "Testing Matrix"
+        OS["ubuntu-latest<br/>macos-latest"]
+        PYTHON["Python 3.11, 3.12, 3.13"]
+        RDKIT["RDKit true/false"]
+        OPENEYE["OpenEye true/false"]
+    end
+    
+    PUSH --> CI
+    PR --> CI
+    SCHEDULE --> CI
+    PUSH --> EXAMPLES
+    PR --> EXAMPLES
+    SCHEDULE --> EXAMPLES
+    RELEASE --> CONDA
+    SCHEDULE --> CONDA
+    MANUAL --> INSTALLER
+    SCHEDULE --> BETA
+    MANUAL --> BETA
+    
+    CI --> OS
+    CI --> PYTHON
+    CI --> RDKIT
+    CI --> OPENEYE
+```
+
+The primary workflow excludes invalid combinations where both RDKit and OpenEye are disabled, and restricts OpenEye testing to Python 3.11 due to licensing constraints.
+
+**Sources:** [.github/workflows/CI.yml:1-183](), [.github/workflows/conda.yml:1-132](), [.github/workflows/examples.yml:1-140](), [.github/workflows/installer.yml:1-112](), [.github/workflows/beta_rc.yaml:1-87]()
+
+## Environment Management
+
+The toolkit uses conda environment files to manage complex dependency combinations across different testing scenarios.
+
+```mermaid
+graph TB
+    subgraph "Core Environment Files"
+        TEST_ENV["test_env.yaml<br/>Full testing environment<br/>RDKit + OpenEye + AmberTools"]
+        RDKIT_ENV["rdkit.yaml<br/>RDKit-only environment"]
+        OPENEYE_ENV["openeye.yaml<br/>OpenEye-only environment"]
+    end
+    
+    subgraph "Example Environment Files"
+        RDKIT_EX["rdkit-examples.yaml<br/>RDKit + example dependencies"]
+        OPENEYE_EX["openeye-examples.yaml<br/>OpenEye + example dependencies"]
+    end
+    
+    subgraph "Deployment Environment Files"
+        CONDA_DEPLOY["conda.yaml<br/>Conda package testing"]
+        CONDA_OE["conda_oe.yaml<br/>Conda + OpenEye testing"]
+        INSTALLER_ENV["installer.yaml<br/>Single-file installer"]
+        RELEASE_BUILD["release-build.yaml<br/>Release building tools"]
+    end
+    
+    subgraph "Common Dependencies"
+        CORE["Core: numpy, networkx, openmm<br/>openff-forcefields, openff-units"]
+        TESTING["Testing: pytest, pytest-cov<br/>pytest-xdist, nbval"]
+        OPTIONAL["Optional: qcelemental, qcportal<br/>mdtraj, nglview"]
+    end
+    
+    TEST_ENV --> CORE
+    RDKIT_ENV --> CORE
+    OPENEYE_ENV --> CORE
+    RDKIT_EX --> CORE
+    OPENEYE_EX --> CORE
+    
+    TEST_ENV --> TESTING
+    RDKIT_ENV --> TESTING
+    OPENEYE_ENV --> TESTING
+    
+    TEST_ENV --> OPTIONAL
+    RDKIT_EX --> OPTIONAL
+    OPENEYE_EX --> OPTIONAL
+```
+
+### Environment Configuration Matrix
+
+| Environment | RDKit | OpenEye | AmberTools | Primary Use |
+|-------------|-------|---------|------------|-------------|
+| `test_env.yaml` | ✓ | ✓ | ✓ | Full CI testing |
+| `rdkit.yaml` | ✓ | ✗ | ✓ | RDKit-only CI |
+| `openeye.yaml` | ✗ | ✓ | ✗ | OpenEye-only CI |
+| `rdkit-examples.yaml` | ✓ | ✗ | ✓ | Example notebooks |
+| `openeye-examples.yaml` | ✗ | ✓ | ✗ | Example notebooks |
+| `conda.yaml` | ✓ | ✗ | ✓ | Conda deployment |
+| `conda_oe.yaml` | ✗ | ✓ | ✗ | Conda + OpenEye |
+
+**Sources:** [devtools/conda-envs/test_env.yaml:1-53](), [devtools/conda-envs/rdkit.yaml:1-42](), [devtools/conda-envs/openeye.yaml:1-53](), [devtools/conda-envs/rdkit-examples.yaml:1-45](), [devtools/conda-envs/openeye-examples.yaml:1-44]()
+
+## Testing Matrix and Workflow Logic
+
+The CI system implements sophisticated logic to handle different toolkit combinations and their dependencies.
+
+```mermaid
+graph TB
+    subgraph "Matrix Strategy"
+        MATRIX_DEF["Strategy Matrix<br/>os: ubuntu-latest, macos-latest<br/>python-version: 3.11, 3.12, 3.13<br/>rdkit: true, false<br/>openeye: true, false"]
+    end
+    
+    subgraph "Environment Selection Logic"
+        CONDITION1["rdkit=true && openeye=true<br/>→ ENVFILE=test_env<br/>→ TOOLKIT_CHECKS=RDKIT OPENEYE"]
+        CONDITION2["rdkit=false && openeye=true<br/>→ ENVFILE=openeye<br/>→ TOOLKIT_CHECKS=OPENEYE<br/>→ PACKAGES_TO_REMOVE=ambertools rdkit"]
+        CONDITION3["rdkit=true && openeye=false<br/>→ ENVFILE=rdkit<br/>→ TOOLKIT_CHECKS=RDKIT<br/>→ PACKAGES_TO_REMOVE=openeye-toolkits"]
+    end
+    
+    subgraph "Package Management"
+        INSTALL["python -m pip install ."]
+        REMOVE["micromamba remove --force<br/>openff-toolkit openff-toolkit-base"]
+        SELECTIVE_REMOVE["Remove packages in PACKAGES_TO_REMOVE"]
+        NAGL_REMOVE["Remove NAGL if no RDKit"]
+    end
+    
+    subgraph "Validation Steps"
+        TOOLKIT_CHECK["Check installed toolkits<br/>Assert toolkit availability"]
+        TOOLKIT_UNCHECK["Check uninstalled toolkits<br/>Assert toolkit unavailability"]
+        MYPY["mypy -p openff.toolkit<br/>Only with OpenEye-only builds"]
+    end
+    
+    MATRIX_DEF --> CONDITION1
+    MATRIX_DEF --> CONDITION2
+    MATRIX_DEF --> CONDITION3
+    
+    CONDITION1 --> INSTALL
+    CONDITION2 --> INSTALL
+    CONDITION3 --> INSTALL
+    
+    INSTALL --> REMOVE
+    REMOVE --> SELECTIVE_REMOVE
+    SELECTIVE_REMOVE --> NAGL_REMOVE
+    NAGL_REMOVE --> TOOLKIT_CHECK
+    TOOLKIT_CHECK --> TOOLKIT_UNCHECK
+    TOOLKIT_UNCHECK --> MYPY
+```
+
+The workflow implements several exclusion rules:
+- Excludes combinations where both `rdkit=false` and `openeye=false`
+- Restricts OpenEye testing to Python 3.11 only
+- Conditionally runs MyPy type checking only on OpenEye-only builds due to RDKit stub issues
+
+**Sources:** [.github/workflows/CI.yml:22-36](), [.github/workflows/CI.yml:49-122](), [.github/workflows/CI.yml:140-147]()
+
+## Package Distribution
+
+The toolkit supports multiple distribution mechanisms to accommodate different user needs and deployment scenarios.
+
+```mermaid
+graph TB
+    subgraph "Source Code"
+        REPO["GitHub Repository<br/>openforcefield/openff-toolkit"]
+        RELEASE_TAG["Release Tags<br/>Version tagging"]
+    end
+    
+    subgraph "Build Artifacts"
+        WHEEL["Python Wheel<br/>pip installable"]
+        CONDA_PKG["Conda Package<br/>conda installable"]
+        SINGLE_INSTALLER["Single-file Installer<br/>Standalone executable"]
+    end
+    
+    subgraph "Distribution Channels"
+        PYPI["PyPI<br/>pip install openff-toolkit"]
+        CONDA_FORGE["conda-forge<br/>conda install openff-toolkit"]
+        GITHUB_RELEASES["GitHub Releases<br/>Installer downloads"]
+    end
+    
+    subgraph "Validation Workflows"
+        CONDA_VALIDATION["conda.yml<br/>Validates conda packages<br/>against latest releases"]
+        INSTALLER_BUILD["installer.yml<br/>Creates and tests<br/>single-file installers"]
+    end
+    
+    REPO --> RELEASE_TAG
+    RELEASE_TAG --> WHEEL
+    RELEASE_TAG --> CONDA_PKG
+    RELEASE_TAG --> SINGLE_INSTALLER
+    
+    WHEEL --> PYPI
+    CONDA_PKG --> CONDA_FORGE
+    SINGLE_INSTALLER --> GITHUB_RELEASES
+    
+    CONDA_PKG --> CONDA_VALIDATION
+    SINGLE_INSTALLER --> INSTALLER_BUILD
+```
+
+### Single-file Installer Process
+
+The single-file installer workflow creates standalone executables that bundle the toolkit with all dependencies:
+
+1. **Version Detection**: Automatically detects latest release tag using `git ls-remote`
+2. **Constructor Integration**: Uses `toolkit-installer-constructor` repository for build configuration
+3. **Build Process**: Generates platform-specific installers via `run.py`
+4. **Validation**: Installs and tests the generated installer
+
+**Sources:** [.github/workflows/installer.yml:46-112](), [.github/workflows/conda.yml:34-132]()
+
+## Release Processes
+
+The release workflow ensures quality and consistency across all distribution channels.
+
+```mermaid
+graph TB
+    subgraph "Release Triggers"
+        RELEASE_EVENT["GitHub Release<br/>released/prereleased events"]
+        SCHEDULE_NIGHTLY["Nightly Schedule<br/>0 20 * * *"]
+        MANUAL_DISPATCH["Manual Workflow Dispatch"]
+    end
+    
+    subgraph "Version Management"
+        TAG_DETECTION["Latest Tag Detection<br/>git ls-remote --tags<br/>grep -E '([0-9]+)\.([0-9]+)\.([0-9]+)$'"]
+        VERSION_VALIDATION["Version Validation<br/>Compare installed vs expected"]
+    end
+    
+    subgraph "Quality Assurance"
+        CONDA_INSTALL["Fresh Conda Install<br/>Test against conda-forge"]
+        FULL_TEST_SUITE["Full Test Suite<br/>Core + Examples + Notebooks"]
+        PLUGIN_TESTING["Plugin Testing<br/>utilities/test_plugins"]
+        CROSS_PLATFORM["Cross-platform Testing<br/>ubuntu-latest, macos-latest"]
+    end
+    
+    subgraph "Beta/RC Testing"
+        BETA_CHANNELS["Beta Channel Testing<br/>conda-forge/label/openmm_rc<br/>conda-forge/label/openff-toolkit_rc<br/>openeye/label/rc"]
+        DEPENDENCY_VALIDATION["Dependency Validation<br/>Test against upstream betas"]
+    end
+    
+    RELEASE_EVENT --> TAG_DETECTION
+    SCHEDULE_NIGHTLY --> TAG_DETECTION
+    MANUAL_DISPATCH --> TAG_DETECTION
+    
+    TAG_DETECTION --> VERSION_VALIDATION
+    VERSION_VALIDATION --> CONDA_INSTALL
+    CONDA_INSTALL --> FULL_TEST_SUITE
+    FULL_TEST_SUITE --> PLUGIN_TESTING
+    PLUGIN_TESTING --> CROSS_PLATFORM
+    
+    SCHEDULE_NIGHTLY --> BETA_CHANNELS
+    BETA_CHANNELS --> DEPENDENCY_VALIDATION
+```
+
+### Release Validation Steps
+
+The conda workflow performs comprehensive validation of released packages:
+
+1. **Environment Setup**: Creates clean conda environment with released package
+2. **Version Verification**: Ensures installed version matches expected release tag
+3. **Toolkit Validation**: Confirms proper toolkit availability/unavailability
+4. **Test Execution**: Runs core test suite and example notebooks
+5. **Cross-platform Testing**: Validates on both Ubuntu and macOS
+
+**Sources:** [.github/workflows/conda.yml:71-132](), [.github/workflows/beta_rc.yaml:29-87]()
+
+## Build Tools and Dependencies
+
+The build system relies on specific tools and configurations for different aspects of the packaging process.
+
+| Tool | Purpose | Configuration |
+|------|---------|---------------|
+| `micromamba` | Conda environment management | `mamba-org/setup-micromamba@v2` |
+| `pytest` | Test execution | `pytest=8` with various plugins |
+| `versioningit` | Version management | Dynamic versioning from git |
+| `constructor` | Single-file installer creation | External repository integration |
+| `anaconda-client` | Conda package upload | Release build environment |
+
+### Environment Pinning Strategy
+
+The toolkit uses careful dependency pinning to ensure reproducible builds:
+
+- **NumPy**: Pinned to `<2.3` due to downstream compatibility issues
+- **OpenMM**: Minimum version `>=7.6` for API compatibility
+- **RDKit**: Excludes specific versions with known issues (`!=2024.03.6,!=2024.09.1`)
+- **Python**: Supports 3.11, 3.12, and 3.13 with matrix testing
+
+**Sources:** [devtools/conda-envs/test_env.yaml:10-53](), [devtools/conda-envs/release-build.yaml:1-10]()
+
+---
+
+# Page: Plugin Development
+
+# Plugin Development
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [docs/typing.rst](docs/typing.rst)
+- [openff/toolkit/_tests/test_forcefield.py](openff/toolkit/_tests/test_forcefield.py)
+- [openff/toolkit/_tests/test_molecule.py](openff/toolkit/_tests/test_molecule.py)
+- [openff/toolkit/_tests/test_parameter_plugins.py](openff/toolkit/_tests/test_parameter_plugins.py)
+- [openff/toolkit/_tests/test_parameters.py](openff/toolkit/_tests/test_parameters.py)
+- [openff/toolkit/data/proteins/MainChain_CYM.pdb](openff/toolkit/data/proteins/MainChain_CYM.pdb)
+- [openff/toolkit/data/proteins/aa_residues_substructures_explicit_bond_orders_with_caps.json](openff/toolkit/data/proteins/aa_residues_substructures_explicit_bond_orders_with_caps.json)
+- [openff/toolkit/data/proteins/aa_residues_substructures_explicit_bond_orders_with_caps_explicit_connectivity.json](openff/toolkit/data/proteins/aa_residues_substructures_explicit_bond_orders_with_caps_explicit_connectivity.json)
+- [openff/toolkit/data/proteins/aa_residues_substructures_with_caps.json](openff/toolkit/data/proteins/aa_residues_substructures_with_caps.json)
+- [openff/toolkit/data/proteins/ace-ala-nh2.pdb](openff/toolkit/data/proteins/ace-ala-nh2.pdb)
+- [openff/toolkit/data/systems/test_systems/PE.pdb](openff/toolkit/data/systems/test_systems/PE.pdb)
+- [openff/toolkit/typing/engines/smirnoff/plugins.py](openff/toolkit/typing/engines/smirnoff/plugins.py)
+- [utilities/make_substructure_dict/_cif_to_substructure_dict.py](utilities/make_substructure_dict/_cif_to_substructure_dict.py)
+- [utilities/make_substructure_dict/_make_chemical_substructures.py](utilities/make_substructure_dict/_make_chemical_substructures.py)
+- [utilities/make_substructure_dict/_make_metadata_assignment_substructures.py](utilities/make_substructure_dict/_make_metadata_assignment_substructures.py)
+- [utilities/test_plugins/custom_plugins/handler_plugins.py](utilities/test_plugins/custom_plugins/handler_plugins.py)
+- [utilities/test_plugins/setup.py](utilities/test_plugins/setup.py)
+
+</details>
+
+
+
+This document explains how to create and register custom parameter handlers for the OpenFF toolkit using the plugin system. It covers the architecture of the plugin system, how to develop custom parameter handlers, and how to integrate them into force fields.
+
+For information about the core parameter handler system that plugins extend, see [SMIRNOFF Force Field System](#2.2). For details about testing plugin functionality, see [Testing Framework](#4.1).
+
+## Plugin System Architecture
+
+The OpenFF toolkit uses Python's entrypoint plugin system to allow external packages to register custom parameter handlers that can be dynamically loaded and used in force fields.
+
+```mermaid
+graph TB
+    subgraph "Plugin Registration"
+        A["setup.py<br/>Entry Points"] --> B["openff.toolkit.plugins.handlers<br/>Group"]
+        B --> C["CustomHandler = myapp:CustomHandler<br/>Entry Point"]
+    end
+    
+    subgraph "Plugin Loading"
+        D["load_handler_plugins()"] --> E["_load_handler_plugins()"]
+        E --> F["entry_points().select()"]
+        F --> G["entry_point.load()"]
+        G --> H["Validate ParameterHandler<br/>Inheritance"]
+    end
+    
+    subgraph "Force Field Integration"
+        I["ForceField(load_plugins=True)"] --> J["_register_parameter_handler_classes()"]
+        J --> K["Plugin Parameter Handlers<br/>Available"]
+    end
+    
+    A --> D
+    H --> I
+    
+    style A fill:#e1f5fe
+    style D fill:#f3e5f5
+    style I fill:#e8f5e8
+```
+
+**Plugin Discovery and Loading Workflow**
+
+Sources: [openff/toolkit/typing/engines/smirnoff/plugins.py:35-94](), [utilities/test_plugins/setup.py:8-19]()
+
+## Core Plugin Components
+
+### Plugin Loading Infrastructure
+
+The plugin system is built around several key functions and constants:
+
+```mermaid
+graph LR
+    subgraph "Plugin Constants"
+        A["SUPPORTED_PLUGIN_NAMES<br/>['handlers']"]
+    end
+    
+    subgraph "Loading Functions"
+        B["load_handler_plugins()"] --> C["_load_handler_plugins()"]
+        C --> D["Entry Point Discovery"]
+        C --> E["Type Validation"]
+    end
+    
+    subgraph "Validation"
+        F["issubclass(plugin, ParameterHandler)"] --> G["Valid Plugin Registry"]
+        E --> F
+    end
+    
+    A --> C
+    D --> F
+    
+    style B fill:#fff3e0
+    style F fill:#e8f5e8
+```
+
+**Plugin Loading Components**
+
+The `SUPPORTED_PLUGIN_NAMES` constant currently only includes `"handlers"`, indicating that only parameter handler plugins are supported. The loading process validates that discovered plugins inherit from `ParameterHandler`.
+
+Sources: [openff/toolkit/typing/engines/smirnoff/plugins.py:32](), [openff/toolkit/typing/engines/smirnoff/plugins.py:72-82]()
+
+## Creating Custom Parameter Handlers
+
+### Basic Custom Handler
+
+To create a custom parameter handler, inherit from `ParameterHandler` and define the required attributes:
+
+```mermaid
+graph TB
+    subgraph "Base Classes"
+        A["ParameterHandler"] --> B["CustomHandler"]
+        A --> C["_NonbondedHandler"] 
+        C --> D["FOOBuckinghamHandler"]
+    end
+    
+    subgraph "Required Attributes"
+        E["_TAGNAME<br/>XML tag name"]
+        F["_INFOTYPE<br/>Parameter type class"]
+    end
+    
+    subgraph "Parameter Types"
+        G["ParameterType"] --> H["FOOBuckinghamType"]
+        H --> I["ParameterAttribute<br/>a, b, c parameters"]
+    end
+    
+    B --> E
+    D --> E
+    D --> F
+    F --> G
+    
+    style A fill:#e1f5fe
+    style E fill:#fff3e0
+    style G fill:#f3e5f5
+```
+
+**Custom Handler Class Hierarchy**
+
+A minimal custom handler requires defining `_TAGNAME` for the XML element name. More complex handlers like `FOOBuckinghamHandler` also define custom parameter types with specific attributes.
+
+Sources: [utilities/test_plugins/custom_plugins/handler_plugins.py:10-13](), [utilities/test_plugins/custom_plugins/handler_plugins.py:22-49]()
+
+### Advanced Parameter Handler Example
+
+The `FOOBuckinghamHandler` demonstrates a complete custom parameter handler with its own parameter type:
+
+| Component | Purpose | Implementation |
+|-----------|---------|----------------|
+| `FOOBuckinghamHandler` | Main handler class | Inherits from `_NonbondedHandler` |
+| `FOOBuckinghamType` | Parameter type | Defines `a`, `b`, `c` attributes with units |
+| `_TAGNAME` | XML element name | `"FOOBuckingham"` |
+| `_INFOTYPE` | Parameter type class | `FOOBuckinghamType` |
+
+The parameter type defines three attributes with different unit specifications:
+- `a`: Uses `unit.kilojoule_per_mole`
+- `b`: Uses string notation `"nanometer**-1"`
+- `c`: Uses compound units `unit.kilojoule_per_mole * unit.nanometer**6`
+
+Sources: [utilities/test_plugins/custom_plugins/handler_plugins.py:22-49]()
+
+## Plugin Registration
+
+### Entry Point Configuration
+
+Plugins are registered using Python's setuptools entry points system in the package's `setup.py`:
+
+```mermaid
+graph LR
+    subgraph "Entry Points Group"
+        A["openff.toolkit.plugins.handlers"]
+    end
+    
+    subgraph "Plugin Mappings"
+        B["CustomHandler = custom_plugins.handler_plugins:CustomHandler"]
+        C["FOOBuckinghamHandler = custom_plugins.handler_plugins:FOOBuckinghamHandler"]
+        D["WrongSubclass = custom_plugins.handler_plugins:WrongSubclass"]
+    end
+    
+    A --> B
+    A --> C
+    A --> D
+    
+    subgraph "Validation Results"
+        E["✓ Valid Plugin"] 
+        F["✓ Valid Plugin"]
+        G["✗ Invalid - Wrong Base Class"]
+    end
+    
+    B --> E
+    C --> F
+    D --> G
+    
+    style E fill:#e8f5e8
+    style F fill:#e8f5e8
+    style G fill:#ffebee
+```
+
+**Entry Point Registration and Validation**
+
+The entry points map plugin names to their corresponding class paths. During loading, the plugin system validates that each discovered plugin inherits from the expected base class.
+
+Sources: [utilities/test_plugins/setup.py:12-18]()
+
+### Package Structure
+
+A typical plugin package structure:
+```
+my_plugin_package/
+├── setup.py
+├── my_plugins/
+│   ├── __init__.py
+│   └── handler_plugins.py
+```
+
+The `setup.py` must include the entry points configuration:
+```python
+entry_points={
+    "openff.toolkit.plugins.handlers": [
+        "MyHandler = my_plugins.handler_plugins:MyHandler",
+    ]
+}
+```
+
+Sources: [utilities/test_plugins/setup.py:8-19]()
+
+## Using Plugins in Force Fields
+
+### Plugin Integration Workflow
+
+```mermaid
+graph TB
+    subgraph "Force Field Creation"
+        A["ForceField(ff_content,<br/>load_plugins=True)"] --> B["_register_parameter_handler_classes()"]
+        B --> C["load_handler_plugins()"]
+    end
+    
+    subgraph "Plugin Discovery"
+        C --> D["Discover Entry Points"]
+        D --> E["Load Plugin Classes"]
+        E --> F["Validate Plugin Types"]
+    end
+    
+    subgraph "Handler Registration"
+        F --> G["Add to _plugin_parameter_handler_classes"]
+        G --> H["Available for XML Processing"]
+    end
+    
+    subgraph "XML Processing"
+        I["<CustomHandler version='0.3'></CustomHandler>"] --> J["get_parameter_handler()"]
+        J --> K["Plugin Handler Instance"]
+    end
+    
+    H --> I
+    
+    style A fill:#e1f5fe
+    style F fill:#fff3e0
+    style K fill:#e8f5e8
+```
+
+**Plugin Loading and Registration in Force Fields**
+
+When `load_plugins=True` is specified, the force field automatically discovers and registers all available plugin handlers, making them available for use in SMIRNOFF XML files.
+
+Sources: [openff/toolkit/_tests/test_parameter_plugins.py:39-46]()
+
+### Error Handling
+
+When plugins are not enabled, attempting to use a custom handler results in a clear error:
+
+| Scenario | Error Type | Message |
+|----------|------------|---------|
+| Plugin not loaded | `KeyError` | "Cannot find a registered parameter handler class for tag 'CustomHandler'" |
+| Wrong inheritance | Logged warning | "does not inherit from ParameterHandler. This plugin will be skipped." |
+| Import failure | Logged exception | "Could not load the {entry_point} plugin" |
+
+Sources: [openff/toolkit/_tests/test_parameter_plugins.py:30-36](), [openff/toolkit/typing/engines/smirnoff/plugins.py:73-77]()
+
+## Plugin Validation and Testing
+
+### Plugin Discovery Testing
+
+The plugin system includes comprehensive validation:
+
+```mermaid
+graph LR
+    subgraph "Discovery Tests"
+        A["test_load_handler_plugins()"] --> B["Verify Plugin Count"]
+        B --> C["Check Plugin Names"]
+    end
+    
+    subgraph "Validation Tests"
+        D["test_do_not_load_other_type()"] --> E["Reject Invalid Plugin Types"]
+        F["test_skip_wrong_subclass()"] --> G["Skip Non-ParameterHandler Classes"]
+    end
+    
+    subgraph "Integration Tests"
+        H["test_force_field_custom_handler()"] --> I["Plugin in Force Field"]
+        I --> J["Handler Instance Creation"]
+    end
+    
+    A --> D
+    D --> F
+    F --> H
+    
+    style B fill:#e8f5e8
+    style E fill:#fff3e0
+    style I fill:#f3e5f5
+```
+
+**Plugin Testing Strategy**
+
+The test suite validates plugin discovery, type checking, and integration with force fields.
+
+Sources: [openff/toolkit/_tests/test_parameter_plugins.py:48-74]()
+
+### Parameter Type Validation
+
+Custom parameter types are validated for proper unit handling:
+
+```python
+# Example from test_buckingham_type()
+parameter = FOOBuckinghamHandler.FOOBuckinghamType(
+    smirks="[*:1]",
+    a="2 kilojoule_per_mole",
+    b="1/nanometer", 
+    c="-0.5 kilojoule_per_mole * nanometer**6",
+)
+```
+
+The test verifies that all parameters are properly converted to `Quantity` objects with correct units.
+
+Sources: [openff/toolkit/_tests/test_parameter_plugins.py:76-93]()
+
+## Limitations and Future Development
+
+### Current Limitations
+
+| Limitation | Description | Future Possibility |
+|------------|-------------|-------------------|
+| Handler Types Only | Only `ParameterHandler` plugins supported | `ParameterIOHandler` plugins possible |
+| Single Plugin Group | Only `"handlers"` group implemented | Additional groups for other components |
+| Entry Point Only | Only setuptools entry points supported | Alternative discovery mechanisms |
+
+The plugin system is marked as experimental and may be modified in future versions.
+
+Sources: [openff/toolkit/typing/engines/smirnoff/plugins.py:5-9](), [openff/toolkit/typing/engines/smirnoff/plugins.py:32]()
+
+### Extension Points
+
+The architecture supports future expansion through:
+- Additional plugin types via `SUPPORTED_PLUGIN_NAMES`
+- Alternative parameter handler base classes
+- Custom validation logic for different plugin categories
+
+Sources: [openff/toolkit/typing/engines/smirnoff/plugins.py:50-54]()
+
+---
+
+# Page: Documentation System
+
+# Documentation System
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.github/workflows/CI.yml](.github/workflows/CI.yml)
+- [.github/workflows/beta_rc.yaml](.github/workflows/beta_rc.yaml)
+- [.github/workflows/conda.yml](.github/workflows/conda.yml)
+- [.github/workflows/examples.yml](.github/workflows/examples.yml)
+- [.github/workflows/installer.yml](.github/workflows/installer.yml)
+- [FAQ.md](FAQ.md)
+- [devtools/conda-envs/conda.yaml](devtools/conda-envs/conda.yaml)
+- [devtools/conda-envs/conda_oe.yaml](devtools/conda-envs/conda_oe.yaml)
+- [devtools/conda-envs/openeye-examples.yaml](devtools/conda-envs/openeye-examples.yaml)
+- [devtools/conda-envs/openeye.yaml](devtools/conda-envs/openeye.yaml)
+- [devtools/conda-envs/rdkit-examples.yaml](devtools/conda-envs/rdkit-examples.yaml)
+- [devtools/conda-envs/rdkit.yaml](devtools/conda-envs/rdkit.yaml)
+- [devtools/conda-envs/test_env.yaml](devtools/conda-envs/test_env.yaml)
+- [docs/api/toolkits.md](docs/api/toolkits.md)
+- [docs/conf.py](docs/conf.py)
+- [docs/environment.yml](docs/environment.yml)
+- [docs/examples.md](docs/examples.md)
+- [docs/index.md](docs/index.md)
+- [docs/installation.md](docs/installation.md)
+- [docs/users/developing.md](docs/users/developing.md)
+- [docs/users/molecule_cookbook.ipynb](docs/users/molecule_cookbook.ipynb)
+- [docs/users/pdb_cookbook/index.ipynb](docs/users/pdb_cookbook/index.ipynb)
+- [docs/utils.rst](docs/utils.rst)
+- [openff/toolkit/utils/toolkit_registry.py](openff/toolkit/utils/toolkit_registry.py)
+
+</details>
+
+
+
+The OpenFF Toolkit documentation system is responsible for generating, testing, and deploying comprehensive documentation from multiple sources including docstrings, Jupyter notebooks, and hand-written guides. This page covers the technical infrastructure that transforms source code and documentation files into the published documentation site.
+
+For information about the testing framework that validates the documentation, see [Testing Framework](#4.1). For details about the build and packaging systems that support documentation deployment, see [Build and Packaging](#4.2).
+
+## Documentation Architecture
+
+The documentation system follows a multi-source, multi-format architecture that combines automated API generation with curated user content:
+
+```mermaid
+graph TD
+    subgraph "Source Content"
+        A["Docstrings in Python code"]
+        B["docs/*.rst files"]
+        C["docs/*.md files"] 
+        D["docs/*.ipynb notebooks"]
+        E["examples/*.ipynb notebooks"]
+    end
+    
+    subgraph "Sphinx Build System"
+        F["docs/conf.py configuration"]
+        G["sphinx.ext.autodoc"]
+        H["myst_nb extension"]
+        I["openff_sphinx_theme"]
+    end
+    
+    subgraph "Generated Content"
+        J["API reference pages"]
+        K["User guide pages"]
+        L["Example galleries"]
+        M["HTML documentation site"]
+    end
+    
+    subgraph "Testing Components"
+        N["pytest --doctest-glob"]
+        O["pytest --nbval-lax"]
+        P["pytest --doctest-modules"]
+    end
+    
+    A --> G
+    B --> F
+    C --> H
+    D --> H
+    E --> H
+    
+    F --> J
+    F --> K
+    F --> L
+    G --> J
+    H --> K
+    H --> L
+    I --> M
+    
+    J --> M
+    K --> M
+    L --> M
+    
+    B --> N
+    C --> N
+    D --> O
+    A --> P
+```
+
+Sources: [docs/conf.py:1-299](), [.github/workflows/CI.yml:159-175]()
+
+## Content Generation Pipeline
+
+The documentation generation process transforms multiple input formats into a unified documentation site through several processing stages:
+
+```mermaid
+graph LR
+    subgraph "Input Processing"
+        A["conf.py"]
+        B["autodoc_default_options"]
+        C["myst_enable_extensions"]
+        D["nb_execution_mode"]
+    end
+    
+    subgraph "Extensions Pipeline"
+        E["sphinx.ext.autodoc"]
+        F["sphinx.ext.napoleon"]
+        G["sphinx.ext.autosummary"]
+        H["myst_nb"]
+        I["sphinx.ext.intersphinx"]
+    end
+    
+    subgraph "Output Generation"
+        J["API documentation"]
+        K["User guides"]
+        L["Cross-references"]
+        M["ReadTheDocs deployment"]
+    end
+    
+    A --> E
+    B --> E
+    C --> H
+    D --> H
+    
+    E --> J
+    F --> J
+    G --> J
+    H --> K
+    I --> L
+    
+    J --> M
+    K --> M
+    L --> M
+```
+
+The `conf.py` configuration file orchestrates this pipeline through several key settings:
+
+- **Autodoc Configuration**: `autodoc_default_options` controls API documentation generation
+- **MyST Extensions**: `myst_enable_extensions` enables Markdown features like math and code fences  
+- **Notebook Execution**: `nb_execution_mode = "off"` prevents re-execution during builds
+- **Theme Configuration**: `openff_sphinx_theme` provides consistent styling
+
+Sources: [docs/conf.py:51-70](), [docs/conf.py:111-125](), [docs/conf.py:191-217]()
+
+## Content Types and Organization
+
+The documentation system supports multiple content types, each with specific processing requirements:
+
+| Content Type | Source Location | Processing | Output |
+|--------------|-----------------|------------|---------|
+| API Reference | Python docstrings | `sphinx.ext.autodoc` | `api/generated/` |
+| User Guides | `docs/*.md`, `docs/*.rst` | `myst_parser` | Direct rendering |
+| Cookbooks | `docs/users/*.ipynb` | `myst_nb` | Interactive examples |
+| Examples | `examples/*.ipynb` | `myst_nb` + `nbval` | Tested tutorials |
+
+### API Documentation Generation
+
+API documentation is automatically generated from docstrings using Sphinx's autodoc system:
+
+```mermaid
+graph TD
+    A["Python source files"]
+    B["Docstring extraction"]
+    C["Napoleon processing"]
+    D["Autosummary generation"]
+    E["API reference pages"]
+    
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    
+    F["autodoc_default_options"]
+    G["napoleon_numpy_docstring"]
+    H["autosummary_generate"]
+    
+    F --> B
+    G --> C
+    H --> D
+```
+
+The system uses NumPy-style docstrings (`napoleon_numpy_docstring = True`) and automatically generates summary tables (`autosummary_generate = True`).
+
+Sources: [docs/conf.py:51-70](), [docs/conf.py:65-70]()
+
+### Interactive Content Processing
+
+Jupyter notebooks are processed through the MyST-NB extension with special handling for execution and validation:
+
+- **Execution Control**: `nb_execution_mode = "off"` prevents re-execution during documentation builds
+- **Widget State**: Notebooks must save widget state for proper rendering
+- **Cross-references**: MyST syntax enables linking between notebooks and API docs
+
+Sources: [docs/conf.py:121-125](), [docs/conf.py:112-119]()
+
+## Testing and Validation Infrastructure
+
+The documentation system includes comprehensive testing to ensure accuracy and functionality:
+
+```mermaid
+graph TD
+    subgraph "Documentation Testing"
+        A["pytest --doctest-glob docs/*.rst"]
+        B["pytest --doctest-glob docs/*.md"] 
+        C["pytest --nbval-lax docs/"]
+        D["pytest --doctest-modules openff/"]
+    end
+    
+    subgraph "Test Scope"
+        E["Code snippets in guides"]
+        F["Markdown examples"]
+        G["Notebook execution"]
+        H["Docstring examples"]
+    end
+    
+    subgraph "CI Integration"
+        I["GitHub Actions CI.yml"]
+        J["RDKit + OpenEye builds"]
+        K["Documentation validation"]
+    end
+    
+    A --> E
+    B --> F
+    C --> G
+    D --> H
+    
+    E --> I
+    F --> I
+    G --> I
+    H --> I
+    
+    I --> J
+    J --> K
+```
+
+Testing occurs in multiple phases:
+- **Code snippets**: Executed via `pytest --doctest-glob` for RST and Markdown files
+- **Notebooks**: Validated using `pytest --nbval-lax` to ensure they run without errors
+- **Docstring examples**: Tested via `pytest --doctest-modules` across the codebase
+
+Sources: [.github/workflows/CI.yml:159-175](), [.github/workflows/CI.yml:163-165](), [.github/workflows/CI.yml:167-174]()
+
+## Deployment and Hosting
+
+Documentation deployment follows an automated pipeline from source to published documentation:
+
+```mermaid
+graph LR
+    subgraph "Source Control"
+        A["Git repository"]
+        B["docs/ directory"]
+        C["GitHub Actions"]
+    end
+    
+    subgraph "Build Environment"
+        D["docs/environment.yml"]
+        E["ReadTheDocs build"]
+        F["Sphinx compilation"]
+    end
+    
+    subgraph "Deployment"
+        G["ReadTheDocs hosting"]
+        H["Version management"]
+        I["Search indexing"]
+    end
+    
+    A --> C
+    B --> D
+    C --> E
+    D --> F
+    
+    F --> G
+    G --> H
+    G --> I
+```
+
+### ReadTheDocs Configuration
+
+The `docs/environment.yml` file specifies the build environment for ReadTheDocs:
+
+- **Python version**: Constrained to `<3.13` for compatibility
+- **Core dependencies**: Includes `myst-nb`, `sphinx`, and scientific libraries
+- **Theme installation**: Custom OpenFF theme installed via pip from GitHub
+
+The configuration includes special handling for CUDA toolkit dependencies and uses specific channel priorities to ensure reproducible builds.
+
+Sources: [docs/environment.yml:1-42](), [docs/conf.py:130-148]()
+
+### Cross-Reference System
+
+The documentation maintains extensive cross-references through Sphinx's intersphinx extension:
+
+```python
+intersphinx_mapping = {
+    "python": ("https://docs.python.org/3.7", None),
+    "numpy": ("https://numpy.org/doc/stable", None),
+    "openmm": ("http://docs.openmm.org/latest/api-python/", None),
+    "openff.interchange": ("https://docs.openforcefield.org/projects/interchange/en/stable/", None),
+    # ... additional mappings
+}
+```
+
+This enables seamless linking to external documentation and maintains consistency across the OpenFF ecosystem.
+
+Sources: [docs/conf.py:72-102]()
+
+---
+
+# Page: Repository Structure
+
+# Repository Structure
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.gitignore](.gitignore)
+- [.readthedocs.yaml](.readthedocs.yaml)
+- [MANIFEST.in](MANIFEST.in)
+- [README.md](README.md)
+- [openff/toolkit/__init__.py](openff/toolkit/__init__.py)
+- [openff/toolkit/typing/engines/smirnoff/io.py](openff/toolkit/typing/engines/smirnoff/io.py)
+- [openff/toolkit/utils/callback.py](openff/toolkit/utils/callback.py)
+- [openff/toolkit/utils/collections.py](openff/toolkit/utils/collections.py)
+
+</details>
+
+
+
+This page provides an overview of the OpenFF toolkit repository organization, detailing the key directories, files, and their purposes within the codebase. It serves as a guide for understanding how the repository is structured and where different components are located.
+
+For information about the core architectural components and how they interact, see [Core Architecture](#2). For details about the development workflow and testing infrastructure, see [Development](#4).
+
+## Repository Organization
+
+The OpenFF toolkit repository follows a standard Python package structure with additional directories for documentation, examples, and configuration files. The main source code is organized under the `openff/toolkit/` directory, with supporting files at the repository root level.
+
+### High-Level Directory Structure
+
+```mermaid
+graph TB
+    root["Repository Root"]
+    
+    subgraph "Core Package"
+        openff["openff/"]
+        toolkit["openff/toolkit/"]
+        topology["openff/toolkit/topology/"]
+        typing["openff/toolkit/typing/"]
+        utils["openff/toolkit/utils/"]
+        data["openff/toolkit/data/"]
+    end
+    
+    subgraph "Documentation"
+        docs["docs/"]
+        examples["examples/"]
+    end
+    
+    subgraph "Testing"
+        test_dir["openff/toolkit/tests/"]
+    end
+    
+    subgraph "Configuration"
+        config_files["Configuration Files<br/>(.readthedocs.yaml, pyproject.toml, etc.)"]
+        ci_files["CI Configuration<br/>(.github/workflows/)"]
+    end
+    
+    subgraph "Build & Packaging"
+        manifest["MANIFEST.in"]
+        gitignore[".gitignore"]
+        readme["README.md"]
+    end
+    
+    root --> openff
+    root --> docs
+    root --> examples
+    root --> config_files
+    root --> ci_files
+    root --> manifest
+    root --> gitignore
+    root --> readme
+    
+    openff --> toolkit
+    toolkit --> topology
+    toolkit --> typing
+    toolkit --> utils
+    toolkit --> data
+    toolkit --> test_dir
+```
+
+**Sources:** [README.md:1-91](), [MANIFEST.in:1-6](), [.gitignore:1-83](), [openff/toolkit/__init__.py:1-100]()
+
+## Core Package Structure
+
+The main package is organized under `openff/toolkit/` with several key modules that implement the core functionality described in the architectural overview.
+
+### Main Package Initialization
+
+The package's public API is defined in the main `__init__.py` file, which uses lazy loading to optimize import performance:
+
+```mermaid
+graph TB
+    init["openff/toolkit/__init__.py"]
+    
+    subgraph "Lazy Imports - Objects"
+        ff["ForceField"]
+        mol["Molecule"]
+        top["Topology"]
+        registry["ToolkitRegistry"]
+        wrappers["Toolkit Wrappers<br/>(RDKit, OpenEye, AmberTools)"]
+    end
+    
+    subgraph "Lazy Imports - Modules"
+        topology_mod["topology module"]
+        typing_mod["typing module"]
+        utils_mod["utils module"]
+    end
+    
+    init --> ff
+    init --> mol
+    init --> top
+    init --> registry
+    init --> wrappers
+    init --> topology_mod
+    init --> typing_mod
+    init --> utils_mod
+```
+
+**Sources:** [openff/toolkit/__init__.py:47-70]()
+
+### Key Module Organization
+
+The toolkit is organized into several main modules, each with specific responsibilities:
+
+| Module | Purpose | Key Components |
+|--------|---------|----------------|
+| `topology/` | Molecular structure representation | `Molecule`, `Topology`, `Atom`, `Bond` |
+| `typing/` | Force field assignment and SMIRNOFF | `ForceField`, `ParameterHandler`, `ParameterType` |
+| `utils/` | Utility functions and toolkit wrappers | `ToolkitRegistry`, collection classes, exceptions |
+| `data/` | Test data, force fields, and molecules | Force field XML files, test molecules |
+| `tests/` | Test suite | Unit tests, integration tests |
+
+**Sources:** [openff/toolkit/__init__.py:48-62]()
+
+## SMIRNOFF Force Field System Structure
+
+The SMIRNOFF force field implementation is organized under the `typing/engines/smirnoff/` directory, with specialized modules for different aspects of force field handling:
+
+```mermaid
+graph TB
+    smirnoff["typing/engines/smirnoff/"]
+    
+    subgraph "Core Components"
+        ff_module["forcefield.py<br/>ForceField class"]
+        params["parameters.py<br/>ParameterHandler classes"]
+        io_module["io.py<br/>XML I/O handling"]
+    end
+    
+    subgraph "Parameter Handlers"
+        bonds["BondHandler"]
+        angles["AngleHandler"] 
+        torsions["TorsionHandler"]
+        vdw["vdWHandler"]
+        electro["ElectrostaticsHandler"]
+    end
+    
+    subgraph "I/O System"
+        xml_io["XMLParameterIOHandler"]
+        param_io["ParameterIOHandler"]
+    end
+    
+    smirnoff --> ff_module
+    smirnoff --> params
+    smirnoff --> io_module
+    
+    params --> bonds
+    params --> angles
+    params --> torsions
+    params --> vdw
+    params --> electro
+    
+    io_module --> xml_io
+    io_module --> param_io
+```
+
+**Sources:** [openff/toolkit/typing/engines/smirnoff/io.py:1-236]()
+
+## Utility and Support Systems
+
+The `utils/` directory contains essential support classes and functions used throughout the toolkit:
+
+### Collections and Validation
+
+```mermaid
+graph TB
+    utils["utils/"]
+    
+    subgraph "Collection Classes"
+        collections["collections.py"]
+        vlist["ValidatedList"]
+        vdict["ValidatedDict"]
+    end
+    
+    subgraph "Callback System"
+        callback["callback.py"]
+        callbackable["Callbackable"]
+        callback_method["callback_method decorator"]
+    end
+    
+    subgraph "Toolkit Integration"
+        toolkits["toolkits.py"]
+        registry["ToolkitRegistry"]
+        rdkit_wrapper["RDKitToolkitWrapper"]
+        openeye_wrapper["OpenEyeToolkitWrapper"]
+        amber_wrapper["AmberToolsToolkitWrapper"]
+    end
+    
+    utils --> collections
+    utils --> callback
+    utils --> toolkits
+    
+    collections --> vlist
+    collections --> vdict
+    
+    callback --> callbackable
+    callback --> callback_method
+    
+    toolkits --> registry
+    toolkits --> rdkit_wrapper
+    toolkits --> openeye_wrapper
+    toolkits --> amber_wrapper
+```
+
+**Sources:** [openff/toolkit/utils/collections.py:1-252](), [openff/toolkit/utils/callback.py:1-190]()
+
+## Configuration and Build Files
+
+The repository root contains several important configuration files that control various aspects of the project:
+
+### Documentation Configuration
+
+The documentation system is configured through several files:
+
+| File | Purpose |
+|------|---------|
+| `.readthedocs.yaml` | ReadTheDocs build configuration |
+| `docs/conf.py` | Sphinx configuration |
+| `docs/environment.yml` | Conda environment for documentation builds |
+
+**Sources:** [.readthedocs.yaml:1-22]()
+
+### Package Configuration
+
+```mermaid
+graph TB
+    root["Repository Root"]
+    
+    subgraph "Package Management"
+        manifest["MANIFEST.in<br/>Package file inclusion"]
+        pyproject["pyproject.toml<br/>Build system configuration"]
+    end
+    
+    subgraph "Version Control"
+        gitignore[".gitignore<br/>Excluded files and directories"]
+    end
+    
+    subgraph "Documentation"
+        readme["README.md<br/>Project overview and installation"]
+        faq["FAQ.md<br/>Frequently asked questions"]
+    end
+    
+    root --> manifest
+    root --> pyproject
+    root --> gitignore
+    root --> readme
+    root --> faq
+```
+
+**Sources:** [MANIFEST.in:1-6](), [.gitignore:1-83](), [README.md:1-91]()
+
+## Data and Test Files Organization
+
+The repository includes structured data and test files:
+
+### Data Directory Structure
+
+Based on the `.gitignore` file, the data organization includes:
+
+| Directory | Contents |
+|-----------|----------|
+| `openff/toolkit/data/test_forcefields/` | Test force field XML files |
+| `openff/toolkit/data/molecules/` | Test molecule files (SDF, MOL2, etc.) |
+| `openff/toolkit/tests/` | Test suite with unit and integration tests |
+
+### Generated and Excluded Files
+
+The `.gitignore` file reveals the build artifacts and generated files that are excluded from version control:
+
+```mermaid
+graph TB
+    excluded["Excluded Files"]
+    
+    subgraph "Build Artifacts"
+        pycache["__pycache__/<br/>Compiled Python bytecode"]
+        dist["dist/, build/<br/>Package distribution files"]
+        eggs["*.egg-info/<br/>Package metadata"]
+    end
+    
+    subgraph "Test Artifacts"
+        coverage["coverage files<br/>(.coverage, htmlcov/)"]
+        pytest[".cache/<br/>Pytest cache"]
+    end
+    
+    subgraph "Documentation"
+        docs_build["docs/_build/<br/>Generated documentation"]
+        api_gen["docs/api/generated<br/>Auto-generated API docs"]
+    end
+    
+    subgraph "Development"
+        vscode[".vscode<br/>VS Code settings"]
+        idea["*.idea/<br/>PyCharm settings"]
+        notebooks["*.ipynb_checkpoints/<br/>Jupyter notebook checkpoints"]
+    end
+    
+    excluded --> pycache
+    excluded --> dist
+    excluded --> eggs
+    excluded --> coverage
+    excluded --> pytest
+    excluded --> docs_build
+    excluded --> api_gen
+    excluded --> vscode
+    excluded --> idea
+    excluded --> notebooks
+```
+
+**Sources:** [.gitignore:1-83]()
+
+## Examples and Documentation Structure
+
+The repository includes comprehensive examples and documentation:
+
+### Examples Organization
+
+Based on the `.gitignore` exclusions, the examples are organized as:
+
+| Directory | Contents |
+|-----------|----------|
+| `examples/` | Jupyter notebooks and example scripts |
+| `examples/testing/` | Test examples and system conversion examples |
+
+### Documentation Integration
+
+The documentation system integrates with the main package structure through:
+
+- Automatic API documentation generation from docstrings
+- ReadTheDocs integration for hosted documentation
+- Jupyter notebook examples that are tested as part of CI
+
+**Sources:** [README.md:18-25](), [.readthedocs.yaml:16-18]()
+
+## Plugin and Extension Points
+
+The repository structure supports extensibility through:
+
+### Plugin Architecture
+
+The toolkit supports external plugins through:
+
+- Entry points in `setup.py`/`pyproject.toml` for parameter handlers
+- Modular toolkit wrapper system in `utils/toolkits.py`
+- Force field distribution through conda packages
+
+### Extension Directories
+
+The structure allows for:
+
+- Custom parameter handlers in the `typing/engines/smirnoff/` hierarchy
+- Additional toolkit wrappers in `utils/toolkits.py`
+- Plugin force fields discoverable through the package system
+
+**Sources:** [README.md:41-42](), [openff/toolkit/__init__.py:47-70]()

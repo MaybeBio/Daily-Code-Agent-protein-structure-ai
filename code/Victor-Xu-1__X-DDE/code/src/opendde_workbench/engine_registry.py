@@ -1,0 +1,183 @@
+"""Integrated scientific environments managed by the X-DDE platform server.
+
+This registry owns task-to-engine identity. BackendRouter remains the sole execution
+and recovery authority; a registration never downloads or executes software.
+"""
+
+from dataclasses import asdict, dataclass
+from types import MappingProxyType
+from typing import Literal
+
+from .datasets.contract import OPERATIONS as DATA_OPERATIONS
+from .integrations.contract import OPERATIONS as INTEGRATED_OPERATIONS
+from .integrations.labels import public_name
+from .integrations.specs import PROGRAMS
+
+
+@dataclass(frozen=True)
+class ScientificEngine:
+    id: str
+    name: str
+    description: str
+    execution_backend: Literal["docker", "local_process", "harness_process"]
+    operations: tuple[str, ...]
+    role: Literal["integrated_environment", "public_data_service"] = "integrated_environment"
+
+
+_DEFINITIONS = (
+    ScientificEngine(
+        "caver",
+        "CAVER 3.0.2",
+        "口袋通道与几何瓶颈 / Pocket channels and geometric bottlenecks",
+        "docker",
+        ("channel_analysis",),
+    ),
+    ScientificEngine(
+        "sapiens",
+        "Sapiens / ANARCII / Promb",
+        "抗体序列人源参考评估与框架建议 / "
+        "Human antibody reference evaluation and framework proposals",
+        "docker",
+        ("antibody_humanize",),
+    ),
+    ScientificEngine(
+        "admet",
+        "ADMET-AI",
+        "小分子 ADMET 与早期安全性预测 / Early molecular ADMET and safety predictions",
+        "docker",
+        ("admet_predict",),
+    ),
+    ScientificEngine(
+        "posebusters",
+        "PoseBusters",
+        "分子构象与结合姿势独立质控 / Independent molecular pose plausibility",
+        "docker",
+        ("pose_quality",),
+    ),
+    ScientificEngine(
+        "anarcii",
+        "ANARCII",
+        "抗体序列编号、链型和结构域 / Antibody numbering, chain types and domains",
+        "docker",
+        ("antibody_number",),
+    ),
+    ScientificEngine(
+        "discovery",
+        "Open Targets / UniProt / ChEMBL",
+        "早期靶点、疾病、序列、结构索引与已知活性证据 / Early discovery evidence",
+        "local_process",
+        ("target_research", "reference_import"),
+        role="public_data_service",
+    ),
+    ScientificEngine(
+        "biopython",
+        "Biopython",
+        "受体构象解析、对应与刚体对齐 / Receptor conformation parsing and rigid alignment",
+        "docker",
+        ("receptor_ensemble", "structure_prepare", "surface_exposure", "structure_compare"),
+    ),
+    ScientificEngine(
+        "chemistry",
+        "RDKit + Dimorphite-DL",
+        "化学状态、构象与早期分子库筛选 / Molecular states, conformers and early library selection",
+        "docker",
+        (
+            "properties",
+            "molecular_states",
+            "library_screen",
+            "molecule_minimize",
+            "pose_cluster",
+            "library_prepare",
+            "library_subset",
+        ),
+    ),
+    ScientificEngine(
+        "gnina",
+        "GNINA",
+        "受体内的分子对接、姿势评分与局部最小化 / Docking, pose scoring and minimization",
+        "docker",
+        ("docking", "screening_dock"),
+    ),
+    ScientificEngine(
+        "p2rank",
+        "P2Rank",
+        "蛋白位点候选与残基评分 / Protein-site hypotheses and residue scores",
+        "docker",
+        ("pocket_search",),
+    ),
+    ScientificEngine(
+        "opendde",
+        "OpenDDE",
+        "结构与复合物预测、特征准备和原生化学工具 / Structures, features and native chemical tools",
+        "docker",
+        ("predict", "msa", "mt", "prep", "inspect", "json", "doctor", "resources"),
+    ),
+    ScientificEngine(
+        "diffsbdd",
+        "DiffSBDD",
+        (
+            "小分子生成、局部重设计、多样化和优化 / "
+            "Small-molecule generation, inpainting and optimization"
+        ),
+        "local_process",
+        ("diffsbdd",),
+    ),
+    ScientificEngine(
+        "harness",
+        "OpenDDE Harness",
+        (
+            "原生科学工具与设计代理；计算服务和模型另行配置 / "
+            "Native tools and design agents; configure services and models separately"
+        ),
+        "harness_process",
+        ("harness",),
+    ),
+)
+_DEFINITIONS += tuple(
+    ScientificEngine(
+        identifier,
+        public_name(identifier, spec["name"]),
+        "独立科学程序、原生结果与不可覆盖输入 / Native software and immutable inputs",
+        "docker",
+        tuple(
+            operation for operation, owner in INTEGRATED_OPERATIONS.items() if owner == identifier
+        )
+        + tuple(
+            operation for operation, (owner, _) in DATA_OPERATIONS.items() if owner == identifier
+        ),
+    )
+    for identifier, spec in PROGRAMS.items()
+)
+ENGINES = MappingProxyType({engine.id: engine for engine in _DEFINITIONS})
+_OPERATIONS = MappingProxyType(
+    {operation: engine.id for engine in _DEFINITIONS for operation in engine.operations}
+)
+if len(_OPERATIONS) != sum(len(engine.operations) for engine in _DEFINITIONS):
+    raise RuntimeError("Each scientific task operation must belong to exactly one engine.")
+
+
+def engine_for(operation: str) -> ScientificEngine:
+    try:
+        return ENGINES[_OPERATIONS[operation]]
+    except KeyError as exc:
+        raise ValueError("Unregistered scientific operation: " + operation) from exc
+
+
+def catalogue() -> dict[str, dict]:
+    return {identifier: asdict(engine) for identifier, engine in ENGINES.items()}
+
+
+def statuses(readiness: dict) -> dict[str, dict]:
+    # The historical 'engine' health field is OpenDDE's snapshot, not platform health.
+    states = readiness.get("backends", {"opendde": readiness})
+    return {
+        identifier: {
+            "ready": False,
+            "reason": None
+            if identifier in states
+            else "This engine does not report runtime state in this deployment.",
+            **states.get(identifier, {}),
+            **definition,
+        }
+        for identifier, definition in catalogue().items()
+    }

@@ -1,0 +1,4587 @@
+"""
+Structure Server - PDB retrieval and structure cleaning tools.
+
+Provides tools for:
+- Automatic retrieval of structure files from PDB/AlphaFold/PDB-REDO (prefers mmCIF)
+- Chain separation and classification using gemmi
+- Structure cleaning, missing residue modeling, water/heterogen removal, and protonation using PDBFixer
+- Automatic detection of disulfide bonds and CYS->CYX renaming
+- Mutation modeling with HPacker
+- Ligand chemistry preparation with SMILES/SDF template matching
+- LLM-friendly structure validation and error reporting at each step
+"""
+
+# Configure logging early to suppress noisy third-party logs
+import os
+import shutil
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from mdclaw._common import create_choice_error, installed_version, setup_logger  # noqa: E402
+
+logger = setup_logger(__name__)
+
+import re  # noqa: E402
+import math  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Optional, Dict, Any  # noqa: E402
+
+from pdbfixer import PDBFixer  # noqa: E402
+from openmm.app import PDBFile  # noqa: E402
+from mdclaw._common import (  # noqa: E402
+    BaseToolWrapper,
+    sha256_file,
+)
+from mdclaw.forcefield_templates import nucleic_residue_name_map  # noqa: E402
+from mdclaw.chemistry_constants import PROTEIN_RESNAMES  # noqa: E402
+from mdclaw.research.nucleic import (  # noqa: E402
+    MODIFIED_NUCLEIC_UNSUPPORTED_MESSAGE,
+    classify_nucleic_residues,
+)
+
+# Default working directory for prepare_complex when output_dir is not specified
+WORKING_DIR = Path(".")
+PDB_CHAIN_ID_POOL = (
+    list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    + list("abcdefghijklmnopqrstuvwxyz")
+    + list("0123456789")
+)
+_DEUTERIUM_FALLBACK_ATOM_NAME_RE = re.compile(r"^D[0-9]*$")
+DEFAULT_TERMINAL_CAP_FORCEFIELD = "ff19SB"
+SUPPORTED_N_TERMINAL_CAPS = {"ACE"}
+SUPPORTED_C_TERMINAL_CAPS = {"NME"}
+TERMINAL_CAP_RESIDUES = SUPPORTED_N_TERMINAL_CAPS | SUPPORTED_C_TERMINAL_CAPS
+SUPPORTED_PREP_SOLVENT_TYPES = {"explicit", "implicit", "vacuum"}
+PDBFIXER_MAX_INTERNAL_MISSING_RESIDUES = 10
+PDBFIXER_MAX_MISSING_RESIDUE_SEGMENT_LENGTH = 5
+# Terminal segments have only one structural anchor. Keep their policy separate
+# from internal loops: the first 1CTF validation exposed that a six-residue
+# N-terminal tail was being reported as an over-limit *internal* PDBFixer gap.
+PDBFIXER_MAX_TERMINAL_MISSING_RESIDUE_SEGMENT_LENGTH = 5
+# Planning failures of an *automatic* MODELLER escalation that leave the gap
+# open with a warning instead of failing the node; an explicit request still fails.
+AUTO_REPAIR_SKIPPABLE_CODES = frozenset({
+    "modeller_repair_numbering_unresolvable",
+    "modeller_terminal_numbering_unresolvable",
+})
+MODELLER_MAX_TERMINAL_MISSING_RESIDUE_SEGMENT_LENGTH = 10
+
+# Initialize tool wrappers
+pdb2pqr_wrapper = BaseToolWrapper("pdb2pqr")
+pdb4amber_wrapper = BaseToolWrapper("pdb4amber")
+
+PDB_ATOM_RECORD_PREFIXES = ("ATOM  ", "HETATM")
+_NUCLEIC_5P_TERMINAL_PHOSPHATE_ATOMS = {
+    "P",
+    "OP1",
+    "OP2",
+    "OP3",
+    "O1P",
+    "O2P",
+    "O3P",
+    "HOP1",
+    "HOP2",
+    "HOP3",
+    "H1P",
+    "H2P",
+    "H3P",
+}
+_NUCLEIC_5P_TERMINAL_PHOSPHATE_OXYGENS = {
+    "OP1",
+    "OP2",
+    "OP3",
+    "O1P",
+    "O2P",
+    "O3P",
+}
+
+from mdclaw.structure.pdb_utils import _pdb_atom_count, _pdb_hydrogen_count, _pdb_residue_names, _read_pdb_unique_residues, resolve_residue_site, restore_residue_numbering_from_reference, restore_resnames_by_residue_key  # noqa: E402
+from mdclaw.structure.protonation import _apply_protonation_states_with_modeller, _extract_histidine_states, _extract_input_protonation_state_overrides, _extract_non_default_protonation_states, _merge_input_protonation_state_overrides, _merge_protonation_states, _normalize_protonation_state_overrides  # noqa: E402
+from mdclaw.structure.terminal_caps import _complete_terminal_cap_hydrogens_with_modeller, _prepare_terminal_caps_for_pdb2pqr, _resolve_terminal_cap_settings, detect_input_terminal_caps, strip_input_terminal_caps  # noqa: E402
+
+
+def _pdb_atom_name(line: str) -> str:
+    return line[12:16].strip()
+
+
+def _pdb_residue_name(line: str) -> str:
+    return line[17:20].strip().upper()
+
+
+def _pdb_chain_residue_key(line: str) -> tuple[str, str, str]:
+    return (line[21:22], line[22:26], line[26:27])
+
+
+def _normalize_nucleic_input_for_openmm(
+    input_path: Path,
+    forcefield_xml: str,
+) -> tuple[Path, dict[str, Any]]:
+    """Normalize standard nucleic termini to templates shipped with OpenMM.
+
+    OpenMM's Amber DNA/RNA XML bundles provide unphosphorylated 5' terminal
+    variants (A5/G5/...) and ordinary internal variants, but not a standalone
+    5'-phosphorylated terminal residue whose P atom lacks a previous-residue
+    O3' external bond. Many experimental PDB/mmCIF entries include that
+    terminal phosphate. Remove only that unsupported terminal phosphate group,
+    leaving residue identity/order intact, so Modeller can add hydrogens and
+    downstream topology generation can use standard templates.
+    """
+    report: dict[str, Any] = {
+        "applied": False,
+        "normalized_file": None,
+        "removed_atom_count": 0,
+        "removed_atoms": [],
+        "code": None,
+    }
+    lines = input_path.read_text(encoding="utf-8").splitlines()
+    template_resnames = set(nucleic_residue_name_map(forcefield_xml))
+    first_residue_keys: set[tuple[str, str, str]] = set()
+    first_residue_names: dict[tuple[str, str, str], str] = {}
+    first_residue_atoms: dict[tuple[str, str, str], set[str]] = {}
+    segment_chain: str | None = None
+    segment_first: tuple[str, str, str] | None = None
+
+    for line in lines:
+        if line.startswith("TER"):
+            segment_chain = None
+            segment_first = None
+            continue
+        if not line.startswith(PDB_ATOM_RECORD_PREFIXES):
+            continue
+        key = _pdb_chain_residue_key(line)
+        chain_id = key[0]
+        if segment_first is None or chain_id != segment_chain:
+            segment_chain = chain_id
+            segment_first = key
+            first_residue_keys.add(key)
+            first_residue_names[key] = _pdb_residue_name(line)
+        if segment_first == key:
+            first_residue_atoms.setdefault(key, set()).add(_pdb_atom_name(line).upper())
+
+    residues_to_normalize = {
+        key
+        for key, atom_names in first_residue_atoms.items()
+        if key in first_residue_keys
+        and first_residue_names.get(key) in template_resnames
+        and "P" in atom_names
+        and bool(atom_names & _NUCLEIC_5P_TERMINAL_PHOSPHATE_OXYGENS)
+    }
+    if not residues_to_normalize:
+        return input_path, report
+
+    normalized_lines: list[str] = []
+    removed_atoms: list[dict[str, str]] = []
+    for line in lines:
+        if line.startswith(PDB_ATOM_RECORD_PREFIXES):
+            key = _pdb_chain_residue_key(line)
+            atom_name = _pdb_atom_name(line).upper()
+            if (
+                key in residues_to_normalize
+                and atom_name in _NUCLEIC_5P_TERMINAL_PHOSPHATE_ATOMS
+            ):
+                removed_atoms.append({
+                    "chain": key[0].strip(),
+                    "resnum": key[1].strip(),
+                    "icode": key[2].strip(),
+                    "resname": _pdb_residue_name(line),
+                    "atom_name": atom_name,
+                })
+                continue
+        normalized_lines.append(line)
+
+    if not removed_atoms:
+        return input_path, report
+
+    normalized_path = input_path.with_name(f"{input_path.stem}.openmm_nucleic_input.pdb")
+    normalized_path.write_text("\n".join(normalized_lines) + "\n", encoding="utf-8")
+    report.update({
+        "applied": True,
+        "normalized_file": str(normalized_path),
+        "removed_atom_count": len(removed_atoms),
+        "removed_atoms": removed_atoms,
+        "code": "removed_unsupported_5prime_terminal_phosphate",
+    })
+    return normalized_path, report
+
+
+def _remove_heterogens_preserving_caps(fixer, keep_water: bool) -> dict:
+    """Remove heterogens like ``PDBFixer.removeHeterogens`` but keep terminal
+    caps (ACE/NME).
+
+    ``PDBFixer.removeHeterogens`` keeps only standard protein/nucleic residues
+    (+ water), so it deletes ACE/NME caps as heterogens — silently turning a
+    capped peptide into a charged free terminus. This mirrors that logic with
+    the terminal caps added to the keep set. Returns a summary with the number
+    of removed residues and the preserved cap names.
+    """
+    from openmm import app as _app
+    from pdbfixer.pdbfixer import dnaResidues, proteinResidues, rnaResidues
+
+    keep = set(proteinResidues) | set(dnaResidues) | set(rnaResidues)
+    keep |= {"N", "UNK"} | TERMINAL_CAP_RESIDUES
+    if keep_water:
+        keep.add("HOH")
+
+    to_delete = [r for r in fixer.topology.residues() if r.name not in keep]
+    preserved_caps = [
+        r.name for r in fixer.topology.residues() if r.name in TERMINAL_CAP_RESIDUES
+    ]
+    modeller = _app.Modeller(fixer.topology, fixer.positions)
+    modeller.delete(to_delete)
+    fixer.topology = modeller.topology
+    fixer.positions = modeller.positions
+    return {"removed_count": len(to_delete), "preserved_caps": preserved_caps}
+
+
+def _internal_missing_residue_records(
+    missing_residues: dict,
+    chains: list,
+) -> list[dict]:
+    records: list[dict] = []
+    for (chain_idx, res_idx), residues in sorted(missing_residues.items()):
+        residue_names = [str(residue) for residue in residues]
+        if residue_names in (["ACE"], ["NME"]):
+            continue
+        chain = chains[chain_idx] if 0 <= chain_idx < len(chains) else None
+        chain_id = str(getattr(chain, "id", chain_idx))
+        records.append({
+            "chain_index": chain_idx,
+            "chain_id": chain_id,
+            "position": res_idx,
+            "residues": residue_names,
+            "residue_count": len(residue_names),
+        })
+    return records
+
+
+def _classified_missing_residue_records(
+    missing_residues: dict,
+    chains: list,
+    terminal_keys: dict,
+) -> dict[str, list[dict]]:
+    """Missing segments split by structural constraint, never by name.
+
+    Internal gaps have two anchors; terminal segments have one. Keeping that
+    distinction in the record prevents the PDBFixer internal guard from
+    accidentally refusing a requested terminus and gives downstream provenance
+    enough information to refuse one-anchor predicted coordinates.
+    """
+    grouped = {"internal": [], "n_terminal": [], "c_terminal": []}
+    for (chain_idx, res_idx), residues in sorted(missing_residues.items()):
+        residue_names = [str(residue) for residue in residues]
+        if residue_names in (["ACE"], ["NME"]):
+            continue
+        chain = chains[chain_idx] if 0 <= chain_idx < len(chains) else None
+        terminal_kind = terminal_keys.get((chain_idx, res_idx))
+        location = (
+            "n_terminal" if terminal_kind == "N"
+            else "c_terminal" if terminal_kind == "C"
+            else "internal"
+        )
+        grouped[location].append({
+            "chain_index": chain_idx,
+            "chain_id": str(getattr(chain, "id", chain_idx)),
+            "position": res_idx,
+            "residues": residue_names,
+            "residue_count": len(residue_names),
+            "location": location,
+            "anchor_count": 1 if terminal_kind else 2,
+            "coordinate_provenance": "predicted",
+        })
+    return grouped
+
+
+def _missing_residue_summary(records: list[dict]) -> dict:
+    total_residues = sum(int(record.get("residue_count") or 0) for record in records)
+    max_segment_length = max(
+        (int(record.get("residue_count") or 0) for record in records),
+        default=0,
+    )
+    return {
+        "segment_count": len(records),
+        "total_residues": total_residues,
+        "max_segment_length": max_segment_length,
+        "segments": records,
+    }
+
+
+MISSING_RESIDUE_METHODS = ("auto", "pdbfixer", "modeller", "none")
+
+
+# MODELLER loop generation is stochastic. A fixed seed keeps a re-run of the
+# same node producing the same loops; without one, re-running a job quietly
+# changes the structure the whole study rests on. MODELLER wants a negative
+# seed in [-50000, -2].
+MODELLER_REPAIR_RANDOM_SEED = -8123
+
+
+def _missing_residue_terminal_keys(fixer, chains) -> dict[tuple[int, int], str]:
+    """Classify PDBFixer missing-residue keys at observed chain termini.
+
+    PDBFixer keys are alignment positions, not necessarily topology lengths.
+    When an observed insertion-code residue is absent from SEQRES, a trailing
+    gap can be keyed at ``len(observed)-n_insertions``.  1CEB therefore reports
+    its genuine C-terminal gap at position 79 although its topology contains
+    80 residues.  Account for observed residues unmatched by SEQRES before
+    deciding which key is the trailing terminus.
+    """
+    sequences = list(getattr(fixer, "sequences", None) or [])
+    terminal: dict[tuple[int, int], str] = {}
+    for chain_idx, chain in enumerate(chains):
+        observed_length = len(list(chain.residues()))
+        chain_missing = {
+            key: residues
+            for key, residues in fixer.missingResidues.items()
+            if key[0] == chain_idx
+        }
+        if not chain_missing:
+            continue
+        sequence = next(
+            (
+                item
+                for item in sequences
+                if str(getattr(item, "chainId", "")) == str(chain.id)
+            ),
+            sequences[chain_idx] if chain_idx < len(sequences) else None,
+        )
+        reference_length = (
+            len(list(sequence.residues)) if sequence is not None else None
+        )
+        missing_count = sum(len(residues) for residues in chain_missing.values())
+        unmatched_observed = (
+            max(0, observed_length + missing_count - reference_length)
+            if reference_length is not None
+            else 0
+        )
+        trailing_position = observed_length - unmatched_observed
+        for key in chain_missing:
+            if key[1] == 0:
+                terminal[key] = "N"
+            elif key[1] == trailing_position:
+                terminal[key] = "C"
+    return terminal
+
+
+def _probe_internal_missing_residue_summary(input_path: Path) -> dict:
+    """Measure internal gaps without changing the structure."""
+    return _probe_missing_residue_summaries(input_path)["internal"]
+
+
+def _probe_missing_residue_summaries(
+    input_path: Path,
+    build_window=None,
+) -> dict:
+    """Measure internal and terminal gaps after applying the requested window."""
+    probe = PDBFixer(filename=str(input_path))
+    probe.findMissingResidues()
+    chains = list(probe.topology.chains())
+    if build_window is not None:
+        _restrict_missing_to_window(probe, chains, build_window)
+    terminal_keys = _missing_residue_terminal_keys(probe, chains)
+    grouped = _classified_missing_residue_records(
+        probe.missingResidues, chains, terminal_keys)
+    terminal_records = grouped["n_terminal"] + grouped["c_terminal"]
+    return {
+        "internal": _missing_residue_summary(grouped["internal"]),
+        "terminal": _missing_residue_summary(terminal_records),
+        "n_terminal": _missing_residue_summary(grouped["n_terminal"]),
+        "c_terminal": _missing_residue_summary(grouped["c_terminal"]),
+    }
+
+
+def _modeller_repair_usability() -> dict:
+    """Require both a MODELLER key and an importable package."""
+    import subprocess
+    import sys
+
+    from mdclaw.genesis.modeller import _has_modeller_license_env
+
+    license_env_present = _has_modeller_license_env()
+    import_error = None
+    modeller_importable = False
+    if license_env_present:
+        # MODELLER's installed config may contain a placeholder key. Probe in
+        # an isolated interpreter, injecting the environment key the same way
+        # the real runner does, so this checks an actual import without
+        # contaminating this process's module cache.
+        try:
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import importlib.util, os, re, sys, types\n"
+                        "from pathlib import Path\n"
+                        "key = next(v for k, v in os.environ.items() "
+                        "if k.startswith('KEY_MODELLER') and v)\n"
+                        "spec = importlib.util.find_spec('modeller')\n"
+                        "if spec is None: raise ModuleNotFoundError('modeller')\n"
+                        "locations = list(spec.submodule_search_locations or [])\n"
+                        "install_dir = None\n"
+                        "if locations:\n"
+                        " p = Path(locations[0]) / 'config.py'\n"
+                        " if p.exists():\n"
+                        "  m = re.search(r\"install_dir\\s*=\\s*r?['\\\"]"
+                        "([^'\\\"]+)['\\\"]\", p.read_text())\n"
+                        "  install_dir = m.group(1) if m else None\n"
+                        "cfg = types.ModuleType('modeller.config')\n"
+                        "cfg.license = key\n"
+                        "if install_dir: cfg.install_dir = install_dir\n"
+                        "sys.modules['modeller.config'] = cfg\n"
+                        "import modeller\n"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if probe.returncode == 0:
+                modeller_importable = True
+            else:
+                import_error = (probe.stderr or probe.stdout).strip()[-1000:]
+        except Exception as exc:  # noqa: BLE001 - returned as structured context
+            import_error = f"{type(exc).__name__}: {exc}"
+    return {
+        "usable": license_env_present and modeller_importable,
+        "license_env_present": license_env_present,
+        "modeller_importable": modeller_importable,
+        "import_error": import_error,
+    }
+
+
+def _missing_residue_auto_recommendation(
+    summary: dict,
+    usability: dict,
+) -> dict:
+    export_command = "export KEY_MODELLER10v8=<your license key>"
+    return {
+        "reason": "auto_missing_residue_repair_requires_usable_modeller",
+        "recommended_next_action": "export_modeller_license_and_create_new_prep_node",
+        "restart_stage": "prep",
+        "next_commands": [
+            export_command,
+            (
+                "mdclaw create_node --job-dir <job_dir> --node-type prep "
+                "--parent-node-ids <completed_parent_node_id>"
+            ),
+            (
+                "mdclaw --job-dir <job_dir> --node-id <new_prep_node_id> "
+                "prepare_complex"
+            ),
+        ],
+        "options": [
+            {
+                "option": "provide_modeller_license_and_create_new_prep_node",
+                "next_skill": "skills/md-prepare/SKILL.md",
+                "command": export_command,
+                "when": (
+                    "Allow the default auto method to rebuild the out-of-scope "
+                    "gaps with MODELLER."
+                ),
+            },
+            {
+                "option": "pin_pdbfixer_strictly",
+                "next_skill": "skills/md-prepare/SKILL.md",
+                "flag": "--missing-residue-method pdbfixer",
+                "when": (
+                    "Predicted loop coordinates are deliberately prohibited; "
+                    "prep will retain the strict out-of-scope failure."
+                ),
+            },
+        ],
+        "modeller_usability": usability,
+        "missing_residue_summary": summary,
+    }
+
+
+def _validate_modeller_repair_model(
+    template_path: Path,
+    model_path: Path,
+    target_sequence: str,
+    template_frame: dict | None,
+    target_residue_sites: list | None = None,
+    terminal_segments: list[dict] | None = None,
+) -> dict:
+    """Verify that an in-place MODELLER repair is a complete drop-in replacement."""
+    import gemmi
+
+    from mdclaw.genesis.modeller import _pdb_residue_order
+
+    result = {
+        "success": False,
+        "errors": [],
+        "expected_residue_count": len(target_sequence),
+        "observed_residue_count": 0,
+        "missing_observed_residues": [],
+        "target_sequence_matches": False,
+        "residues_renumbered": (
+            int(template_frame.get("residues_renumbered") or 0)
+            if isinstance(template_frame, dict)
+            else 0
+        ),
+    }
+    result["template_numbering_restored"] = (
+        result["residues_renumbered"] == len(target_sequence)
+    )
+    if not result["template_numbering_restored"]:
+        result["errors"].append(
+            "MODELLER did not restore template author numbering for every target "
+            f"residue: expected {len(target_sequence)}, restored "
+            f"{result['residues_renumbered']}"
+        )
+
+    template_chains, template_residues, _ = _pdb_residue_order(Path(template_path))
+    model_chains, model_residues, _ = _pdb_residue_order(Path(model_path))
+    template_keys = {
+        (chain, resnum, icode)
+        for chain in template_chains
+        for resnum, icode in template_residues[chain]
+    }
+    model_order = [
+        (chain, resnum, icode)
+        for chain in model_chains
+        for resnum, icode in model_residues[chain]
+    ]
+    expected_order = (
+        [(str(chain)[:1], int(number), str(icode or " ")[:1])
+         for chain, number, icode in target_residue_sites]
+        if target_residue_sites is not None else None
+    )
+    result["target_residue_sites_match"] = (
+        expected_order is None or model_order == expected_order
+    )
+    if expected_order is not None and model_order != expected_order:
+        result["errors"].append(
+            "MODELLER output author residue identities do not match the exact "
+            f"target map: expected {expected_order}, observed {model_order}"
+        )
+    model_keys = set(model_order)
+    missing_observed = sorted(template_keys - model_keys)
+    result["missing_observed_residues"] = [
+        {"chain": chain, "resnum": resnum, "icode": icode.strip()}
+        for chain, resnum, icode in missing_observed
+    ]
+    if missing_observed:
+        result["errors"].append(
+            "MODELLER output lost observed template residue identities: "
+            f"{result['missing_observed_residues']}"
+        )
+
+    result["observed_residue_count"] = len(model_order)
+    if len(model_order) != len(target_sequence):
+        result["errors"].append(
+            "MODELLER output residue count does not match the requested target span: "
+            f"expected {len(target_sequence)}, observed {len(model_order)}"
+        )
+
+    residue_names: dict[tuple[str, int, str], str] = {}
+    for line in Path(model_path).read_text().splitlines():
+        if line.startswith(("ATOM", "HETATM")):
+            key = (line[21], int(line[22:26]), line[26])
+            residue_names.setdefault(key, line[17:20].strip())
+    model_sequence = gemmi.one_letter_code(
+        [residue_names[key] for key in model_order if key in residue_names]
+    ).upper()
+    result["observed_sequence"] = model_sequence
+    result["target_sequence_matches"] = model_sequence == target_sequence
+    if not result["target_sequence_matches"]:
+        result["errors"].append(
+            "MODELLER output sequence does not match the requested target span: "
+            f"expected {target_sequence}, observed {model_sequence}"
+        )
+
+    terminal_geometry = _validate_terminal_repair_geometry(
+        template_path,
+        model_path,
+        terminal_segments or [],
+        expected_order or model_order,
+    )
+    result["terminal_geometry"] = terminal_geometry
+    result["errors"].extend(terminal_geometry["errors"])
+
+    result["success"] = not result["errors"]
+    return result
+
+
+def _pdb_heavy_atom_coordinates(path: Path) -> dict:
+    """Read one coordinate per named heavy atom from a MODELLER PDB."""
+    atoms = {}
+    for line in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")) or len(line) < 54:
+            continue
+        altloc = line[16]
+        if altloc not in (" ", "A"):
+            continue
+        element = line[76:78].strip().upper() if len(line) >= 78 else ""
+        if not element:
+            element = re.sub(r"[^A-Za-z]", "", line[12:16]).upper()[:1]
+        if element in {"H", "D"}:
+            continue
+        try:
+            site = (line[21], int(line[22:26]), line[26])
+            xyz = tuple(float(line[start:start + 8]) for start in (30, 38, 46))
+        except (TypeError, ValueError):
+            continue
+        atoms[(site, line[12:16].strip())] = xyz
+    return atoms
+
+
+def _validate_terminal_repair_geometry(
+    template_path: Path,
+    model_path: Path,
+    terminal_segments: list[dict],
+    target_residue_sites: list[tuple[str, int, str]],
+) -> dict:
+    """Validate attachment, finite coordinates, and gross fixed-atom clashes.
+
+    A one-anchor tail has no experimental target conformation to compare with.
+    The defensible postconditions are therefore deliberately narrow: the exact
+    requested sites exist, the peptide junction is covalent, and the new heavy
+    atoms do not sit essentially on top of atoms retained from the template.
+    """
+    result = {
+        "success": True,
+        "errors": [],
+        "junctions": [],
+        "minimum_fixed_heavy_atom_distance_angstrom": None,
+        "finite_coordinates": True,
+    }
+    if not terminal_segments:
+        return result
+
+    model_atoms = _pdb_heavy_atom_coordinates(model_path)
+    template_atoms = _pdb_heavy_atom_coordinates(template_path)
+    nonfinite = [key for key, xyz in model_atoms.items()
+                 if not all(math.isfinite(value) for value in xyz)]
+    if nonfinite:
+        result["finite_coordinates"] = False
+        result["errors"].append(
+            f"MODELLER terminal repair contains non-finite coordinates: {nonfinite[:5]}"
+        )
+
+    ordered_sites = [
+        (str(chain)[:1], int(number), str(icode or " ")[:1])
+        for chain, number, icode in target_residue_sites
+    ]
+    position = {site: index for index, site in enumerate(ordered_sites)}
+    template_sites = {site for site, _atom_name in template_atoms}
+    terminal_sites: set[tuple[str, int, str]] = set()
+
+    for segment in terminal_segments:
+        sites = [
+            (str(site["chain"])[:1], int(site["resnum"]),
+             str(site.get("icode") or " ")[:1])
+            for site in segment.get("sites", [])
+        ]
+        terminal_sites.update(sites)
+        if not sites:
+            result["errors"].append(
+                f"terminal segment {segment.get('chain_id')} has no exact residue sites"
+            )
+            continue
+        location = segment.get("location")
+        edge = position.get(sites[-1] if location == "n_terminal" else sites[0])
+        neighbor_index = (
+            edge + 1 if location == "n_terminal" and edge is not None
+            else edge - 1 if location == "c_terminal" and edge is not None
+            else None
+        )
+        if neighbor_index is None or not 0 <= neighbor_index < len(ordered_sites):
+            result["errors"].append(
+                f"terminal segment {segment.get('chain_id')} has no observed peptide anchor"
+            )
+            continue
+        neighbor = ordered_sites[neighbor_index]
+        if neighbor not in template_sites:
+            result["errors"].append(
+                f"terminal segment {segment.get('chain_id')} is not adjacent to an "
+                "observed template residue"
+            )
+            continue
+        if location == "n_terminal":
+            first_key, second_key = (sites[-1], "C"), (neighbor, "N")
+        else:
+            first_key, second_key = (neighbor, "C"), (sites[0], "N")
+        if first_key not in model_atoms or second_key not in model_atoms:
+            result["errors"].append(
+                f"terminal peptide junction lacks C/N atoms at {first_key[0]} and "
+                f"{second_key[0]}"
+            )
+            continue
+        distance = math.dist(model_atoms[first_key], model_atoms[second_key])
+        result["junctions"].append({
+            "location": location,
+            "tail_site": {
+                "chain": (sites[-1] if location == "n_terminal" else sites[0])[0],
+                "resnum": (sites[-1] if location == "n_terminal" else sites[0])[1],
+                "icode": (sites[-1] if location == "n_terminal" else sites[0])[2].strip(),
+            },
+            "anchor_site": {
+                "chain": neighbor[0], "resnum": neighbor[1],
+                "icode": neighbor[2].strip(),
+            },
+            "c_n_distance_angstrom": round(distance, 3),
+        })
+        if not 1.1 <= distance <= 1.6:
+            result["errors"].append(
+                f"MODELLER terminal peptide junction is {distance:.2f} A; expected "
+                "a covalent C-N distance of 1.1-1.6 A"
+            )
+
+    # This is intentionally a gross-overlap test, not a force-field energy
+    # judgment. Exclude the directly bonded anchor residue; a sub-0.75 A heavy
+    # atom distance anywhere else means two atoms are effectively coincident.
+    minimum = None
+    clashes = []
+    for (tail_site, tail_atom), tail_xyz in model_atoms.items():
+        if tail_site not in terminal_sites:
+            continue
+        tail_index = position.get(tail_site)
+        for (fixed_site, fixed_atom), fixed_xyz in template_atoms.items():
+            fixed_index = position.get(fixed_site)
+            if (
+                tail_index is not None
+                and fixed_index is not None
+                and tail_site[0] == fixed_site[0]
+                and abs(tail_index - fixed_index) == 1
+            ):
+                continue
+            distance = math.dist(tail_xyz, fixed_xyz)
+            minimum = distance if minimum is None else min(minimum, distance)
+            if distance < 0.75:
+                clashes.append((tail_site, tail_atom, fixed_site, fixed_atom, distance))
+    result["minimum_fixed_heavy_atom_distance_angstrom"] = (
+        round(minimum, 3) if minimum is not None else None
+    )
+    if clashes:
+        result["errors"].append(
+            "MODELLER terminal repair introduced gross heavy-atom overlaps "
+            f"(<0.75 A) against the fixed template: {clashes[:5]}"
+        )
+    result["success"] = not result["errors"]
+    return result
+
+
+def _template_alignment_row(target_sequences, gaps, chains) -> str:
+    """The template row of a repair alignment: observed residues, gaps as dashes.
+
+    ``gaps`` is PDBFixer's ``missingResidues`` restricted to the segments the
+    caller requested, including terminal segments only when explicitly enabled,
+    keyed by ``(chain_index, residue_index)`` where the residue index counts
+    *observed* residues in that chain and says where the missing run is
+    inserted. Walking the observed residues and emitting one dash per missing
+    residue at each insertion point reproduces the template row exactly, with no
+    inference about where a gap boundary falls.
+
+    ``target_sequences`` is one target span per chain, in ``chains`` order. The
+    row is built per chain and joined with ``/``, which is MODELLER's chain
+    break; a single-chain repair therefore yields a row with no separator.
+    """
+    rows = []
+    for chain_index, chain in enumerate(chains):
+        observed = len(list(chain.residues()))
+        target = target_sequences[chain_index]
+        inserts = {
+            int(res_index): len(residues)
+            for (ci, res_index), residues in gaps.items()
+            if ci == chain_index
+        }
+        skeleton = []
+        for position in range(observed + 1):
+            skeleton.append("-" * inserts.get(position, 0))
+            if position < observed:
+                skeleton.append("?")  # placeholder; filled from target below
+        skeleton = "".join(skeleton)
+
+        # Overlay this chain's own letters on the non-dash columns. Its target
+        # span is the complete one, so letters at dash columns belong to the gap
+        # and are dropped here by construction.
+        out, ti = [], 0
+        for ch in skeleton:
+            if ch == "-":
+                out.append("-")
+            else:
+                out.append(target[ti] if ti < len(target) else "X")
+            ti += 1
+        rows.append("".join(out))
+    return "/".join(rows)
+
+
+def _write_repair_alignment(
+    path,
+    *,
+    target_code: str,
+    target_sequence: str,
+    template_code: str,
+    template_row: str,
+    first_chain: str = "@",
+    last_chain: str = "@",
+) -> None:
+    """Write a fully specified PIR alignment for a self-template repair.
+
+    ``first_chain`` / ``last_chain`` name the span MODELLER reads out of the
+    template. ``@`` means "wherever it starts/ends", which is right for a single
+    chain but stops at the first chain break: given a two-chain template it
+    reads only the first chain and then rejects the alignment for having more
+    residues than the structure. A multi-chain repair must name the chains.
+    """
+    if len(template_row) != len(target_sequence):
+        raise ValueError(
+            "repair alignment rows differ in length: "
+            f"template {len(template_row)} vs target {len(target_sequence)}"
+        )
+    from mdclaw.genesis.modeller import _wrap_modeller_sequence
+
+    path.write_text(
+        "\n".join([
+            f">P1;{target_code}",
+            f"sequence:{target_code}:::::target:synthetic:-1.00:-1.00",
+            f"{_wrap_modeller_sequence(target_sequence)}*",
+            f">P1;{template_code}",
+            f"structureX:{template_code}:FIRST:{first_chain}:LAST:{last_chain}"
+            ":template:synthetic:-1.00:-1.00",
+            f"{_wrap_modeller_sequence(template_row)}*",
+            "",
+        ])
+    )
+
+
+# Failures raised before MODELLER is ever invoked. They say the fused complex
+# could not be described, not that the modelling went wrong, and the per-chain
+# path can still repair the chains that are well described.
+_COMPLEX_REPAIR_PREFLIGHT_CODES = frozenset({
+    "modeller_repair_reference_sequence_unavailable",
+})
+
+
+def repair_complex_missing_residues(
+    protein_files,
+    method: str = "auto",
+    work_dir=None,
+    disulfide_pairs: list | None = None,
+    build_terminal_missing_residues: bool = False,
+    build_windows_by_source: dict | None = None,
+    replace_nonstandard_residues: bool = True,
+    nonpolymer_context_files: list | None = None,
+    nonpolymer_in_template: bool = True,
+) -> dict:
+    """Rebuild every chain's requested gaps in one MODELLER pass over the complex.
+
+    ``nonpolymer_context_files`` are the split ligand / ion files: they ride
+    along as BLK residues in the MODELLER template (``nonpolymer_in_template``)
+    so no loop is built through them, and the model is measured against them
+    either way (``nonpolymer_clearance`` in the outcome).
+
+    Repairing chain by chain models each loop as if it were alone: a gap at a
+    chain-chain interface then gets built straight through space the partner
+    chain occupies, and nothing downstream looks. Given the chains that are
+    about to be merged, the assembly is not a guess -- it is the caller's own
+    chain selection -- so the whole complex goes to MODELLER together and each
+    loop is built with its neighbours present.
+
+    The per-chain PDBFixer/MODELLER thresholds are applied per chain, exactly as
+    the single-chain path applies them, and the complex pass runs when any one
+    chain resolves to MODELLER. Returns ``{"applied", "success", "outputs",
+    "chain_ids", "summary", "errors", "warnings", "code"}``; ``applied`` is
+    False when no chain needs MODELLER, which leaves the normal per-chain path
+    in charge.
+    """
+    outcome = {
+        "applied": False,
+        "success": True,
+        "outputs": {},
+        "outputs_by_source": {},
+        "chain_ids": [],
+        "summary": None,
+        "model_file": None,
+        "nonpolymer_clearance": None,
+        "nonpolymer_in_template": None,
+        "errors": [],
+        "warnings": [],
+        "code": None,
+    }
+    paths = [Path(path) for path in protein_files]
+    if len(paths) < 2:
+        return outcome
+
+    # Deciding and fusing happen before any per-chain error handling exists, so
+    # a structure that cannot even be read here must not take the whole
+    # preparation down: defer, and let the per-chain pass report it the way it
+    # always has, one chain at a time.
+    try:
+        per_chain = []
+        for path in paths:
+            window = (build_windows_by_source or {}).get(str(path))
+            if build_terminal_missing_residues or window is not None:
+                decision = _resolve_missing_residue_method(
+                    method,
+                    path,
+                    build_terminal_missing_residues=(
+                        build_terminal_missing_residues),
+                    build_window=window,
+                )
+            else:
+                # Preserve the established private-call contract for callers
+                # and tests that replace the resolver with a two-argument probe.
+                decision = _resolve_missing_residue_method(method, path)
+            per_chain.append(decision)
+    except Exception as exc:  # noqa: BLE001 - deferring, not swallowing
+        outcome["warnings"].append(
+            "Could not decide the missing-residue method for the complex "
+            f"({type(exc).__name__}: {exc}); falling back to per-chain repair"
+        )
+        return outcome
+    if not any(decision["method"] == "modeller" for decision in per_chain):
+        return outcome
+
+    work = Path(work_dir) if work_dir else paths[0].parent
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+        combined = work / "complex_repair_input.pdb"
+        fused = _combine_chains_for_repair(paths, combined)
+    except Exception as exc:  # noqa: BLE001 - deferring, not swallowing
+        outcome["warnings"].append(
+            f"Could not fuse the chains for a complex repair ({type(exc).__name__}: "
+            f"{exc}); falling back to per-chain repair"
+        )
+        return outcome
+    if not fused["success"]:
+        outcome["warnings"].append(
+            "Chains could not be fused for a complex-wide repair "
+            f"({'; '.join(fused['errors'])}); falling back to per-chain repair"
+        )
+        return outcome
+
+    terminal_refusal = next(
+        (decision for decision in per_chain
+         if decision.get("terminal_out_of_scope")),
+        None,
+    )
+    if terminal_refusal:
+        outcome["success"] = False
+        outcome["code"] = "modeller_terminal_missing_residues_out_of_scope"
+        summary = terminal_refusal["terminal_summary"]
+        outcome["errors"].append(
+            "Requested terminal segment exceeds the MODELLER repair scope: "
+            f"max segment length {summary['max_segment_length']}, limit "
+            f"{MODELLER_MAX_TERMINAL_MISSING_RESIDUE_SEGMENT_LENGTH}."
+        )
+        return outcome
+
+    windows_by_chain = {
+        chain_id: (build_windows_by_source or {}).get(str(path))
+        for chain_id, path in zip(fused["chain_ids"], paths)
+        if (build_windows_by_source or {}).get(str(path))
+    }
+
+    repair = _repair_missing_residues_with_modeller(
+        combined,
+        disulfide_pairs=disulfide_pairs,
+        build_terminal_missing_residues=build_terminal_missing_residues,
+        build_windows_by_chain=windows_by_chain,
+        replace_nonstandard_residues=replace_nonstandard_residues,
+        nonpolymer_context_files=nonpolymer_context_files,
+        nonpolymer_in_template=nonpolymer_in_template,
+    )
+    outcome["warnings"].extend(repair["warnings"])
+    outcome["nonpolymer_clearance"] = repair.get("nonpolymer_clearance")
+    outcome["nonpolymer_in_template"] = repair.get("nonpolymer_in_template")
+    if not repair["success"]:
+        if repair["code"] in _COMPLEX_REPAIR_PREFLIGHT_CODES:
+            # Nothing was modeled: the fused complex simply did not describe
+            # itself well enough to try, typically because a partner chain
+            # carries no SEQRES. Chain by chain, the chains that *do* have a
+            # reference sequence are still repairable, so this is a reason to
+            # step aside rather than to fail the node. A MODELLER run that
+            # started and failed is a different thing and stays hard below.
+            outcome["warnings"].append(
+                "Complex-wide missing-residue repair could not start "
+                f"({'; '.join(repair['errors'])}); falling back to per-chain repair"
+            )
+            return outcome
+        outcome["success"] = False
+        outcome["code"] = repair["code"] or "complex_missing_residue_repair_failed"
+        outcome["errors"].extend(repair["errors"])
+        return outcome
+    if not repair["applied"]:
+        # Window restriction can leave no requested gap in the fused input;
+        # leave the established per-chain path in charge in that case.
+        return outcome
+
+    chain_to_source = dict(zip(fused["chain_ids"], (str(path) for path in paths)))
+    split = _split_repaired_complex(repair["model_file"], chain_to_source)
+    if not split["success"]:
+        outcome["success"] = False
+        outcome["code"] = "complex_missing_residue_repair_failed"
+        outcome["errors"].extend(split["errors"])
+        return outcome
+
+    outcome["applied"] = True
+    outcome["input_residue_names_restored"] = split.get("input_residue_names_restored", 0)
+    outcome["outputs"] = split["outputs"]
+    # Keyed by the caller's own input path so it never has to re-derive which
+    # chain came from which file.
+    outcome["outputs_by_source"] = {
+        chain_to_source[chain_id]: output
+        for chain_id, output in split["outputs"].items()
+    }
+    outcome["chain_ids"] = fused["chain_ids"]
+    outcome["summary"] = repair["summary"]
+    outcome["model_file"] = repair["model_file"]
+    outcome["operation"] = repair["operation"]
+    outcome["validation"] = repair["validation"]
+    outcome["warnings"].append(
+        f"Internal missing residues were rebuilt for all {len(paths)} chain(s) in a "
+        "single MODELLER pass over the complex, so each loop was modeled with the "
+        "other chains present"
+    )
+    return outcome
+
+
+def _combine_chains_for_repair(input_paths, out_path) -> dict:
+    """Fuse per-chain split files into one multi-chain PDB for a complex repair.
+
+    SEQRES is carried over from every input because that is what tells PDBFixer
+    a residue is missing at all; the ATOM records follow in input order, one TER
+    per chain. Returns ``{"success", "chain_ids", "errors"}``. Chain ids must be
+    distinct across the inputs -- the fused file addresses chains by that single
+    column, so a reused id would silently merge two chains into one.
+    """
+    seqres: list[str] = []
+    atoms: list[str] = []
+    chain_ids: list[str] = []
+    errors: list[str] = []
+    for path in input_paths:
+        lines = Path(path).read_text(encoding="utf-8", errors="ignore").splitlines()
+        chain_atoms = [line for line in lines if line.startswith(("ATOM", "HETATM"))]
+        if not chain_atoms:
+            errors.append(f"{Path(path).name} has no ATOM records")
+            continue
+        ids = sorted({line[21] for line in chain_atoms})
+        if len(ids) != 1:
+            errors.append(f"{Path(path).name} holds {len(ids)} chain ids {ids}, expected 1")
+            continue
+        if ids[0] in chain_ids:
+            errors.append(f"chain id {ids[0]!r} appears in more than one input file")
+            continue
+        chain_ids.append(ids[0])
+        seqres.extend(line for line in lines if line.startswith("SEQRES"))
+        atoms.extend(chain_atoms)
+        atoms.append("TER")
+    if errors:
+        return {"success": False, "chain_ids": chain_ids, "errors": errors}
+    Path(out_path).write_text("\n".join(seqres + atoms + ["END", ""]))
+    return {"success": True, "chain_ids": chain_ids, "errors": []}
+
+
+def _split_repaired_complex(model_path, chain_to_source: dict) -> dict:
+    """Cut a repaired complex back into per-chain files.
+
+    Each output keeps its source file's SEQRES so the later per-chain pass still
+    sees the reference sequence -- without it the terminal handling downstream
+    would read the repaired chain as having no unresolved residues at all.
+    Returns ``{"success", "outputs": {chain_id: path}, "errors"}``.
+    """
+    model_lines = Path(model_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    by_chain: dict[str, list[str]] = {}
+    for line in model_lines:
+        if line.startswith(("ATOM", "HETATM")):
+            by_chain.setdefault(line[21], []).append(line)
+    outputs: dict[str, str] = {}
+    errors: list[str] = []
+    restored_names = 0
+    for chain_id, source in chain_to_source.items():
+        chain_atoms = by_chain.get(chain_id)
+        if not chain_atoms:
+            errors.append(f"repaired complex has no atoms for chain {chain_id!r}")
+            continue
+        source_path = Path(source)
+        source_lines = source_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        seqres = [line for line in source_lines if line.startswith("SEQRES")]
+
+        # MODELLER builds its model from a one-letter sequence, so every residue
+        # comes back with a standard name: an ASH is an ASP again, a LYN a LYS, a
+        # HID a HIS. The observed residues' own names are in the input, and
+        # dropping them here would silently undo an explicit protonation choice
+        # the deposit or an earlier tool had already made -- which is exactly
+        # what `preserve_input_protonation` exists to keep. Restored by residue
+        # key, so only residues the input actually held are touched; the rebuilt
+        # ones keep the standard name MODELLER gave them. Do not restore general
+        # modified residues such as MSE: the target sequence deliberately uses
+        # PDBFixer's requested standard replacement (MET), and changing only
+        # the residue name back would pair MSE with MODELLER's MET atom graph.
+        preservable_names = {
+            "ASH", "GLH", "LYN", "HID", "HIE", "HIP", "CYM", "CYX",
+        }
+        source_names = {
+            (line[21], line[22:26], line[26]): line[17:21]
+            for line in source_lines
+            if line.startswith(("ATOM  ", "HETATM"))
+            and len(line) >= 27
+            and line[17:21].strip() in preservable_names
+        }
+        rewritten = []
+        for line in chain_atoms:
+            if len(line) >= 27:
+                name = source_names.get((line[21], line[22:26], line[26]))
+                if name is not None and name != line[17:21]:
+                    line = line[:17] + name + line[21:]
+                    restored_names += 1
+            rewritten.append(line)
+
+        out_path = source_path.with_suffix(".complex_repaired.pdb")
+        out_path.write_text("\n".join(seqres + rewritten + ["TER", "END", ""]))
+        outputs[chain_id] = str(out_path)
+    return {
+        "success": not errors,
+        "outputs": outputs,
+        "errors": errors,
+        "input_residue_names_restored": restored_names,
+    }
+
+
+def _resolve_missing_residue_method(
+    method: str,
+    input_path: Path,
+    *,
+    build_terminal_missing_residues: bool = False,
+    build_window=None,
+) -> dict:
+    """Decide whether requested gaps go to PDBFixer or MODELLER.
+
+    Split out of ``clean_protein`` so a complex-wide repair can ask the same
+    question about each chain without restating the thresholds. Returns the
+    resolved ``method``, whether that was an escalation from ``auto``, and the
+    ``summary``/``usability`` the caller needs to explain a refusal. An
+    ``out_of_scope`` result with method ``pdbfixer`` means the gaps exceed what
+    PDBFixer can do and MODELLER is not available -- the caller decides whether
+    that is an error.
+    """
+    summaries = None
+    if method == "auto" or build_terminal_missing_residues:
+        summaries = _probe_missing_residue_summaries(input_path, build_window)
+    terminal_summary = (
+        summaries["terminal"] if build_terminal_missing_residues and summaries
+        else _missing_residue_summary([])
+    )
+    terminal_too_long_for_modeller = (
+        terminal_summary["max_segment_length"]
+        > MODELLER_MAX_TERMINAL_MISSING_RESIDUE_SEGMENT_LENGTH
+    )
+    if method != "auto":
+        return {
+            "method": method,
+            "escalated": False,
+            "out_of_scope": False,
+            "summary": summaries["internal"] if summaries else None,
+            "terminal_summary": terminal_summary,
+            # A caller that pinned PDBFixer gets its own five-residue policy
+            # and remedy below. The MODELLER ceiling is not its failure code.
+            "terminal_out_of_scope": (
+                method == "modeller" and terminal_too_long_for_modeller),
+            "usability": None,
+        }
+    summary = summaries["internal"]
+    internal_out_of_scope = (
+        summary["total_residues"] > PDBFIXER_MAX_INTERNAL_MISSING_RESIDUES
+        or summary["max_segment_length"]
+        > PDBFIXER_MAX_MISSING_RESIDUE_SEGMENT_LENGTH
+    )
+    terminal_out_of_pdbfixer_scope = (
+        terminal_summary["max_segment_length"]
+        > PDBFIXER_MAX_TERMINAL_MISSING_RESIDUE_SEGMENT_LENGTH
+    )
+    out_of_scope = internal_out_of_scope or terminal_out_of_pdbfixer_scope
+    if terminal_too_long_for_modeller:
+        return {
+            "method": "modeller",
+            "escalated": True,
+            "out_of_scope": True,
+            "summary": summary,
+            "terminal_summary": terminal_summary,
+            "terminal_out_of_scope": True,
+            "usability": None,
+        }
+    if not out_of_scope:
+        return {
+            "method": "pdbfixer",
+            "escalated": False,
+            "out_of_scope": False,
+            "summary": summary,
+            "terminal_summary": terminal_summary,
+            "terminal_out_of_scope": False,
+            "usability": None,
+        }
+    usability = _modeller_repair_usability()
+    if not usability["usable"]:
+        return {
+            "method": "pdbfixer",
+            "escalated": False,
+            "out_of_scope": True,
+            "summary": summary,
+            "terminal_summary": terminal_summary,
+            "terminal_out_of_scope": False,
+            "usability": usability,
+        }
+    return {
+        "method": "modeller",
+        "escalated": True,
+        "out_of_scope": True,
+        "summary": summary,
+        "terminal_summary": terminal_summary,
+        "terminal_out_of_scope": False,
+        "usability": usability,
+    }
+
+
+def _disulfide_pair_sites(pair) -> list | None:
+    """``[(chain, resnum, icode), ...]`` from either disulfide pair shape.
+
+    The public ``disulfide_pairs`` argument is nested (``cys1``/``cys2``);
+    ``prepare_complex`` flattens it to ``chain1``/``resnum1``/``chain2``/
+    ``resnum2`` for the cleaning path. Returns None when the record is neither.
+    """
+    if not isinstance(pair, dict):
+        return None
+    if pair.get("form_bond") is False:
+        return None
+
+    def site(chain, resnum, icode):
+        # str(None)[:1] is "N", which is a real chain id -- a missing chain must
+        # not silently become one. An icode key of None means "not stated";
+        # an explicit blank stays "" and addresses the residue with no code.
+        if chain is None:
+            raise KeyError("chain")
+        text = str(chain).strip()
+        if not text:
+            raise KeyError("chain")
+        return (text[:1], int(resnum),
+                None if icode is None else str(icode).strip())
+
+    try:
+        if "cys1" in pair and "cys2" in pair:
+            one, two = pair["cys1"], pair["cys2"]
+            return [site(one["chain"], one["resnum"], one.get("icode")),
+                    site(two["chain"], two["resnum"], two.get("icode"))]
+        if "chain1" in pair and "chain2" in pair:
+            return [site(pair["chain1"], pair["resnum1"], pair.get("icode1")),
+                    site(pair["chain2"], pair["resnum2"], pair.get("icode2"))]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
+# A disulfide is 2.05 A; the window is wide enough for a strained but real bond
+# and narrow enough to catch the two failures actually measured -- a bond built
+# without its restraint (11.65 A) and one pulled open by refinement (3.53 A).
+from mdclaw.structure.disulfide import (  # noqa: E402
+    DISULFIDE_BOND_MAX_ANGSTROM,
+    DISULFIDE_BOND_MIN_ANGSTROM,
+    disulfide_geometry,
+)
+
+
+def _validate_declared_disulfides(model_path, disulfide_pairs, present_chains) -> dict:
+    """Check that every declared disulfide is actually bonded in the model.
+
+    Declaring a bond and getting one are different things: MODELLER applied its
+    own DISU patch to CYS59-CYS102 on 9UT9 and still returned it 3.53 A apart,
+    and the schema defect that dropped every patch passed 51 tests without this.
+    Every declared pair whose chains are here is checked -- a pair quietly
+    treated as out of scope is the failure mode this exists to stop.
+    """
+    import math
+
+    result = {"success": True, "checked": 0, "errors": [], "warnings": [],
+              "warning_records": [], "distances": []}
+    if not disulfide_pairs:
+        return result
+
+    sg: dict[tuple[str, int, str], tuple[float, float, float]] = {}
+    for line in Path(model_path).read_text(errors="ignore").splitlines():
+        if line.startswith(("ATOM  ", "HETATM")) and line[12:16].strip() == "SG":
+            try:
+                key = (line[21], int(line[22:26]), line[26].strip())
+            except ValueError:
+                continue
+            sg[key] = (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+
+    for pair in disulfide_pairs:
+        sites = _disulfide_pair_sites(pair)
+        if sites is None:
+            continue
+        if any(chain_id not in present_chains for chain_id, _, _ in sites):
+            continue                      # another run's bond; checked when merged
+        result["checked"] += 1
+        sites = [(c, n, i if i is not None else "") for c, n, i in sites]
+        missing = [f"{c}:{n}{i}" for c, n, i in sites if (c, n, i) not in sg]
+        if missing:
+            result["errors"].append(
+                f"declared disulfide {sites[0][0]}:{sites[0][1]}-"
+                f"{sites[1][0]}:{sites[1][1]} has no SG atom for {', '.join(missing)}"
+            )
+            continue
+        one, two = (sg[site] for site in sites)
+        distance = math.dist(one, two)
+        geometry = disulfide_geometry(distance)
+        result["distances"].append({
+            "chain1": sites[0][0], "resnum1": sites[0][1],
+            "chain2": sites[1][0], "resnum2": sites[1][1],
+            "sg_sg_angstrom": round(distance, 3),
+            "geometry": geometry,
+        })
+        label = f"{sites[0][0]}:{sites[0][1]}-{sites[1][0]}:{sites[1][1]}"
+        if geometry == "not_formed":
+            # Longer than a bond: the sulfurs were left apart, which is the
+            # failure this check exists for (MODELLER's DISU patch alone did
+            # exactly this on 9UT9).
+            result["errors"].append(
+                f"declared disulfide {label} came back at {distance:.2f} A, "
+                f"longer than {DISULFIDE_BOND_MAX_ANGSTROM} A: the bond was not formed"
+            )
+        elif geometry == "overlap":
+            # Shorter than a bond: the two sulfurs sit on top of each other.
+            # Loop repair keeps observed atoms fixed, so this is the deposit's
+            # geometry (9OQ1 has A59-A102 at 1.30 A and B236-B522 at 1.47 A),
+            # and auto-detection accepts the same pair without comment. The
+            # bond is declared and formed; a harmonic S-S term relaxes it at
+            # minimization. Reported, not refused.
+            result["warnings"].append(
+                f"declared disulfide {label} is {distance:.2f} A apart, shorter "
+                f"than an S-S bond ({DISULFIDE_BOND_MIN_ANGSTROM} A): the deposit "
+                "overlaps the two sulfurs; the bond is formed and minimization "
+                "relaxes it (code disulfide_sg_overlap)"
+            )
+            result["warning_records"].append({
+                "code": "disulfide_sg_overlap",
+                "pair": label,
+                "sg_sg_angstrom": round(distance, 3),
+            })
+    result["success"] = not result["errors"]
+    return result
+
+
+def _resolve_target_residue_sites(
+    chains,
+    chain_spans,
+    gaps,
+    build_windows_by_chain: dict | None = None,
+) -> dict:
+    """Resolve every target position to one exact author residue identifier.
+
+    Walking the alignment is the only way to get this right in general.
+    ``resnum - first_observed`` happens to work on a deposit whose numbering runs
+    straight through, and silently addresses the *wrong* residue as soon as it
+    does not: an insertion code, a jump in the author numbering, a residue the
+    reference sequence does not carry. For a covalent bond a wrong index is
+    worse than no index, so anything ambiguous is left out here and refused by
+    the caller rather than guessed at.
+
+    Terminal runs use their one observed anchor and, when present, the caller's
+    requested build window. They fail closed at insertion-coded anchors or on a
+    collision rather than leaving MODELLER's synthetic 1..N numbering in the
+    output. Returns ordered ``sites`` plus the inverse ``index_by_key``.
+    """
+    build_windows_by_chain = build_windows_by_chain or {}
+    all_sites: list[tuple[str, int, str]] = []
+    gap_sites: dict[tuple[int, int], list[tuple[str, int, str]]] = {}
+    errors: list[str] = []
+    sources: set[str] = set()
+
+    for chain_index, (chain, span) in enumerate(zip(chains, chain_spans)):
+        chain_id = str(chain.id)[:1]
+        observed = list(chain.residues())
+        inserts = {
+            int(res_index): len(residues)
+            for (ci, res_index), residues in gaps.items()
+            if ci == chain_index
+        }
+        walk: list[tuple[str, int, str] | None] = []
+        gap_slices: dict[tuple[int, int], tuple[int, int]] = {}
+        for observed_index, residue in enumerate(observed):
+            count = inserts.get(observed_index, 0)
+            start = len(walk)
+            for _ in range(count):
+                walk.append(None)
+            if count:
+                gap_slices[(chain_index, observed_index)] = (start, len(walk))
+            try:
+                resnum = int(str(residue.id).strip())
+            except (TypeError, ValueError):
+                errors.append(
+                    f"chain {chain_id} residue {residue.id!r} has no integer "
+                    "number; MODELLER target positions cannot be restored"
+                )
+                walk.append(None)
+                continue
+            icode = str(getattr(residue, "insertionCode", "") or "").strip()
+            walk.append((chain_id, resnum, icode))
+        count = inserts.get(len(observed), 0)
+        start = len(walk)
+        for _ in range(count):
+            walk.append(None)
+        if count:
+            gap_slices[(chain_index, len(observed))] = (start, len(walk))
+
+        if len(walk) != len(span):
+            errors.append(
+                f"chain {chain_id}: {len(observed)} observed + "
+                f"{sum(inserts.values())} rebuilt residue(s) do not fill the "
+                f"{len(span)}-residue target span"
+            )
+            continue
+
+        windows = build_windows_by_chain.get(chain_id)
+        windows = [windows] if windows and isinstance(windows[0], int) else windows
+
+        offset = 0
+        while offset < len(walk):
+            if walk[offset] is not None:
+                offset += 1
+                continue
+            run_start = offset
+            while offset < len(walk) and walk[offset] is None:
+                offset += 1
+            run_end = offset
+            left = walk[run_start - 1] if run_start else None
+            right = walk[run_end] if run_end < len(walk) else None
+            length = run_end - run_start
+            if left is not None and right is not None:
+                # Joined ranges (join_range_groups) bond A:10-323 to A:384-418
+                # across the omitted span, so the unobserved 313-323 and
+                # 384-414 of the request are one inserted run between the
+                # anchors 312 and 415 whose numbers are not consecutive. The
+                # windows name them: the numbers between the anchors that lie
+                # in a requested window, when they account for the whole run
+                # (008_membrane_6i53, campaign v2: "positions in the
+                # 42-residue internal gap are not determined").
+                in_windows = ([number for number in range(left[1] + 1, right[1])
+                               if any(min(low, high) <= number <= max(low, high)
+                                      for low, high in windows)]
+                              if windows and not left[2] and not right[2] else [])
+                if right[1] - left[1] - 1 == length:
+                    numbers = list(range(left[1] + 1, right[1]))
+                    source = "two_anchor"
+                elif len(in_windows) == length:
+                    numbers = in_windows
+                    source = "joined_range_windows"
+                else:
+                    errors.append(
+                        f"chain {chain_id}: positions in the {length}-residue "
+                        "internal gap are not determined by the flanking "
+                        f"residues {left[1]}{left[2]} and {right[1]}{right[2]}"
+                    )
+                    continue
+            elif right is not None:
+                if right[2]:
+                    errors.append(
+                        f"chain {chain_id}: N-terminal gap is anchored at "
+                        f"{right[1]}{right[2]}; insertion-coded one-anchor "
+                        "numbering is ambiguous"
+                    )
+                    continue
+                numbers = list(range(right[1] - length, right[1]))
+                source = "requested_window" if windows else "one_anchor_inference"
+            elif left is not None:
+                if left[2]:
+                    errors.append(
+                        f"chain {chain_id}: C-terminal gap is anchored at "
+                        f"{left[1]}{left[2]}; insertion-coded one-anchor "
+                        "numbering is ambiguous"
+                    )
+                    continue
+                numbers = list(range(left[1] + 1, left[1] + 1 + length))
+                source = "requested_window" if windows else "one_anchor_inference"
+            else:
+                errors.append(
+                    f"chain {chain_id}: missing run has no observed anchor"
+                )
+                continue
+            if windows and not all(
+                any(min(low, high) <= number <= max(low, high)
+                    for low, high in windows)
+                for number in numbers
+            ):
+                errors.append(
+                    f"chain {chain_id}: inferred terminal sites {numbers} lie "
+                    f"outside requested window(s) {windows}"
+                )
+                continue
+            for index, number in enumerate(numbers, start=run_start):
+                walk[index] = (chain_id, number, "")
+            sources.add(source)
+
+        unresolved = [index for index, site in enumerate(walk) if site is None]
+        if unresolved:
+            errors.append(
+                f"chain {chain_id}: target positions {unresolved} have no exact "
+                "author residue identifier"
+            )
+            continue
+        if len(set(walk)) != len(walk):
+            errors.append(
+                f"chain {chain_id}: restored target residue identifiers collide"
+            )
+            continue
+        for key, (start, end) in gap_slices.items():
+            gap_sites[key] = list(walk[start:end])
+        all_sites.extend(walk)
+
+    index_by_key = {site: index for index, site in enumerate(all_sites)}
+    by_number: dict[tuple[str, int], list] = {}
+    for site in all_sites:
+        by_number.setdefault((site[0], site[1]), []).append(site)
+    for (chain_id, resnum), sites in by_number.items():
+        if len(sites) > 1:
+            index_by_key[(chain_id, resnum, "*ambiguous*")] = -1
+    return {
+        "sites": all_sites,
+        "index_by_key": index_by_key,
+        "gap_sites": gap_sites,
+        "errors": errors,
+        "numbering_source": "+".join(sorted(sources)) if sources else "template",
+    }
+
+
+def _target_index_by_author_key(chains, chain_spans, gaps) -> tuple[dict, list]:
+    """Compatibility view used by focused callers and older tests."""
+    resolved = _resolve_target_residue_sites(chains, chain_spans, gaps)
+    return resolved["index_by_key"], resolved["errors"]
+
+
+def _disulfide_patch_positions(
+    chains,
+    chain_spans,
+    gaps,
+    disulfide_pairs,
+    target_resolution: dict | None = None,
+) -> dict:
+    """Declared disulfides as 0-based positions in the model MODELLER will build.
+
+    Positions, not author numbers: while modelling, residues are numbered over
+    the target sequence and the deposit's numbering is restored only afterwards.
+
+    The endpoints are looked up in the *target* span, not the template. Screening
+    against the observed residues drops exactly the bonds that need declaring --
+    a disulfide whose cysteines sit inside a gap is the case MODELLER cannot work
+    out for itself.
+
+    Returns ``{"positions", "errors"}``. An endpoint that cannot be resolved is
+    an error, never a silent omission: a missing patch is a missing covalent
+    bond, and the run should stop rather than quietly produce a different
+    molecule.
+    """
+    if not disulfide_pairs:
+        return {"positions": [], "errors": []}
+
+    target_resolution = target_resolution or _resolve_target_residue_sites(
+        chains, chain_spans, gaps)
+    index_by_key = target_resolution["index_by_key"]
+    errors = target_resolution["errors"]
+    if errors:
+        return {"positions": [], "errors": errors}
+
+    modelled_chains = {str(chain.id)[:1] for chain in chains}
+    positions, problems = [], []
+    for pair in disulfide_pairs:
+        sites = _disulfide_pair_sites(pair)
+        if sites is None:
+            continue
+        # A bond reaching a chain this run does not hold belongs to another
+        # chain's run, or to the check on the recombined complex. Skipping is
+        # right there; refusing would break the per-chain path on any complex
+        # with an inter-chain disulfide.
+        if any(chain_id not in modelled_chains for chain_id, _, _ in sites):
+            continue
+        resolved = []
+        for chain_id, resnum, icode in sites:
+            # icode None means the caller did not say; "" means they said the
+            # residue with no insertion code. Only the first is ambiguous where
+            # several codes share a number.
+            if icode is None and (chain_id, resnum, "*ambiguous*") in index_by_key:
+                problems.append(
+                    f"{chain_id}:{resnum} matches more than one residue "
+                    "(insertion codes present); name the insertion code"
+                )
+                break
+            index = index_by_key.get((chain_id, resnum, icode if icode is not None else ""))
+            if index is None:
+                problems.append(
+                    f"{chain_id}:{resnum}{icode or ''} is not a residue of the "
+                    "modelled span, or its position inside a rebuilt gap is not "
+                    "determined by the flanking residues"
+                )
+                break
+            resolved.append(index)
+        if len(resolved) == 2:
+            positions.append(tuple(resolved))
+    return {"positions": positions, "errors": problems}
+
+
+# A rebuilt loop closer than this to a ligand or ion heavy atom went through it:
+# on 9OPZ (Wang 2025, sucralose compact) the ligand-blind rebuild put the trigger
+# loop 45-57 at 0.25 A from sucralose, with twenty loop atoms inside 2.5 A, and
+# nothing reported it. Below CLASH the model is refused; below WARN it is flagged.
+MODELLER_LOOP_NONPOLYMER_CLASH_ANGSTROM = 2.2
+MODELLER_LOOP_NONPOLYMER_WARN_ANGSTROM = 3.0
+_NONPOLYMER_SKIP_RESNAMES = frozenset({"HOH", "WAT", "TIP", "TIP3", "SOL", "DOD", "H2O"})
+
+
+def _pdb_heavy_atom_records(path: Path) -> list[dict]:
+    """Every heavy atom of a PDB file with its residue identity."""
+    records = []
+    for line in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")) or len(line) < 54:
+            continue
+        if line[16] not in (" ", "A"):
+            continue
+        element = line[76:78].strip().upper() if len(line) >= 78 else ""
+        if not element:
+            element = re.sub(r"[^A-Za-z]", "", line[12:16]).upper()[:1]
+        if element in {"H", "D"}:
+            continue
+        try:
+            records.append({
+                "resname": line[17:20].strip(),
+                "chain": line[21],
+                "resnum": int(line[22:26]),
+                "icode": line[26].strip(),
+                "name": line[12:16].strip(),
+                "element": element,
+                "xyz": tuple(float(line[start:start + 8]) for start in (30, 38, 46)),
+            })
+        except (TypeError, ValueError):
+            continue
+    return records
+
+
+def _nonpolymer_context_atoms(files, openmm_context=None) -> list[dict]:
+    """Heavy atoms of the non-polymer components a loop must be built around.
+
+    ``files`` are the split ligand / ion PDBs (heavy atoms, pre-cleaning);
+    ``openmm_context`` is the PDBFixer topology of non-polymer chains that
+    arrived inside the protein files. Waters are left out: they are removed
+    before topology and would only pad the check.
+    """
+    atoms = []
+    for path in files or []:
+        for record in _pdb_heavy_atom_records(Path(path)):
+            if record["resname"] in _NONPOLYMER_SKIP_RESNAMES:
+                continue
+            atoms.append({**record, "source": Path(path).name})
+    if openmm_context is not None:
+        from openmm import unit as _unit
+
+        positions = openmm_context.positions.value_in_unit(_unit.angstrom)
+        for atom in openmm_context.topology.atoms():
+            if atom.element is None or atom.element.symbol in {"H", "D"}:
+                continue
+            residue = atom.residue
+            if residue.name in _NONPOLYMER_SKIP_RESNAMES:
+                continue
+            pos = positions[atom.index]
+            atoms.append({
+                "resname": residue.name, "chain": str(residue.chain.id)[:1],
+                "resnum": int(residue.id), "icode": str(getattr(residue, "insertionCode", "") or "").strip(),
+                "name": atom.name, "element": atom.element.symbol.upper(),
+                "xyz": (float(pos[0]), float(pos[1]), float(pos[2])),
+                "source": "input_nonpolymer_chains",
+            })
+    return atoms
+
+
+def _spare_chain_id(taken) -> str:
+    taken = {str(t)[:1] for t in taken}
+    for candidate in "ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210":
+        if candidate not in taken:
+            return candidate
+    raise RuntimeError("no spare chain id for the non-polymer block")
+
+
+def _write_template_with_nonpolymer(polymer_template_path: Path, atoms: list[dict],
+                                    chain_id: str, out_path: Path) -> int:
+    """The polymer template plus the context residues as HETATM on one spare chain.
+
+    MODELLER reads them as BLK residues (``.`` in the alignment): rigid bodies at
+    their template coordinates that every loop is built around. Returns the
+    number of residues written, which is the number of ``.`` the alignment needs.
+    """
+    lines = [
+        line for line in polymer_template_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if not line.startswith(("END", "CONECT", "MASTER"))
+    ]
+    serial = max((int(line[6:11]) for line in lines
+                  if line.startswith(("ATOM", "HETATM")) and line[6:11].strip().isdigit()),
+                 default=0)
+    residues: dict[tuple, list[dict]] = {}
+    for atom in atoms:
+        residues.setdefault((atom["source"], atom["chain"], atom["resnum"], atom["icode"], atom["resname"]), []).append(atom)
+    for index, (key, members) in enumerate(residues.items(), start=1):
+        resname = key[4][:3].rjust(3)
+        for atom in members:
+            serial += 1
+            name = atom["name"]
+            name_field = f" {name:<3}" if len(name) < 4 else name[:4]
+            x, y, z = atom["xyz"]
+            lines.append(
+                f"HETATM{serial % 100000:5d} {name_field}{'':1}{resname} {chain_id}{index % 10000:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {atom['element'][:2]:>2}"
+            )
+    lines.append("TER")
+    lines.append("END")
+    out_path.write_text("\n".join(lines) + "\n")
+    return len(residues)
+
+
+def _nonpolymer_clearance(model_path: Path, context_atoms: list[dict], records: list[dict]) -> dict:
+    """Closest approach of every rebuilt segment to the non-polymer context.
+
+    Annotates each record in place (``min_distance_to_nonpolymer_angstrom``,
+    ``nearest_nonpolymer``, ``nearest_rebuilt_atom``, ``nonpolymer_verdict``)
+    and returns the summary. With no context atoms the check reports
+    ``checked=False`` rather than a misleading clearance.
+    """
+    import numpy as np
+
+    summary = {
+        "checked": bool(context_atoms) and bool(records),
+        "nonpolymer_atoms": len(context_atoms),
+        "clash_angstrom": MODELLER_LOOP_NONPOLYMER_CLASH_ANGSTROM,
+        "warn_angstrom": MODELLER_LOOP_NONPOLYMER_WARN_ANGSTROM,
+        "min_distance_angstrom": None,
+        "clash": False,
+        "segments": [],
+    }
+    if not summary["checked"]:
+        return summary
+    model_atoms = _pdb_heavy_atom_records(model_path)
+    context_xyz = np.array([atom["xyz"] for atom in context_atoms], dtype=float)
+    overall = None
+    for record in records:
+        sites = {
+            (str(site.get("chain"))[:1], int(site.get("resnum")), str(site.get("icode") or "").strip())
+            for site in record.get("sites") or []
+        }
+        segment_atoms = [atom for atom in model_atoms
+                         if (atom["chain"], atom["resnum"], atom["icode"]) in sites]
+        entry = {
+            "chain": record.get("chain_id"),
+            "residue_count": record.get("residue_count"),
+            "first_resnum": min((int(site.get("resnum")) for site in record.get("sites") or []), default=None),
+            "last_resnum": max((int(site.get("resnum")) for site in record.get("sites") or []), default=None),
+            "min_distance_angstrom": None,
+            "nearest_nonpolymer": None,
+            "nearest_rebuilt_atom": None,
+            "verdict": "not_checked",
+        }
+        if segment_atoms:
+            seg_xyz = np.array([atom["xyz"] for atom in segment_atoms], dtype=float)
+            dist = np.linalg.norm(seg_xyz[:, None, :] - context_xyz[None, :, :], axis=-1)
+            i, j = np.unravel_index(int(dist.argmin()), dist.shape)
+            best = float(dist[i, j])
+            near, own = context_atoms[j], segment_atoms[i]
+            entry.update({
+                "min_distance_angstrom": round(best, 2),
+                "nearest_nonpolymer": f"{near['resname']} {near['chain']}{near['resnum']} {near['name']}",
+                "nearest_rebuilt_atom": f"{own['resname']} {own['chain']}{own['resnum']} {own['name']}",
+                "verdict": ("clash" if best < MODELLER_LOOP_NONPOLYMER_CLASH_ANGSTROM
+                            else "close" if best < MODELLER_LOOP_NONPOLYMER_WARN_ANGSTROM
+                            else "clear"),
+            })
+            overall = best if overall is None else min(overall, best)
+        record["min_distance_to_nonpolymer_angstrom"] = entry["min_distance_angstrom"]
+        record["nearest_nonpolymer"] = entry["nearest_nonpolymer"]
+        record["nearest_rebuilt_atom"] = entry["nearest_rebuilt_atom"]
+        record["nonpolymer_verdict"] = entry["verdict"]
+        summary["segments"].append(entry)
+    summary["min_distance_angstrom"] = round(overall, 2) if overall is not None else None
+    summary["clash"] = any(entry["verdict"] == "clash" for entry in summary["segments"])
+    return summary
+
+
+def _repair_missing_residues_with_modeller(
+    input_path: Path,
+    random_seed: int = MODELLER_REPAIR_RANDOM_SEED,
+    disulfide_pairs: list | None = None,
+    build_terminal_missing_residues: bool = False,
+    build_window=None,
+    build_windows_by_chain: dict | None = None,
+    replace_nonstandard_residues: bool = True,
+    nonpolymer_context_files: list | None = None,
+    nonpolymer_in_template: bool = True,
+) -> dict:
+    """Rebuild requested missing residues with MODELLER loop modeling.
+
+    PDBFixer builds missing residues geometrically and is reliable only for
+    short gaps; the caller asked for MODELLER instead. Everything MODELLER
+    needs is already here: the template is this very structure, and the target
+    sequence is its own SEQRES, which is also what told PDBFixer the residues
+    were missing in the first place.
+
+    Terminal tails remain excluded unless explicitly requested. When requested,
+    MODELLER treats them as terminal insertions with one observed anchor; those
+    coordinates are a deterministic prediction, not experimental evidence.
+
+    Returns ``{applied, success, model_file, summary, operation, errors,
+    warnings, code}``. ``applied`` is False when there is no requested gap to
+    fill, including when the structure carries no reference sequence: that is
+    not an error, it just leaves the normal PDBFixer path in charge.
+    """
+    from pdbfixer import PDBFixer
+
+    input_path = Path(input_path)
+    outcome: dict = {
+        "applied": False,
+        "success": True,
+        "model_file": None,
+        "summary": None,
+        "operation": None,
+        "detection": None,
+        "template": None,
+        "validation": None,
+        "nonpolymer_clearance": None,
+        "random_seed": random_seed,
+        "errors": [],
+        "warnings": [],
+        "code": None,
+    }
+
+    probe = PDBFixer(filename=str(input_path))
+    probe.findMissingResidues()
+    probe.findNonstandardResidues()
+    nonstandard_replacements = [
+        {
+            "chain": str(residue.chain.id),
+            "resnum": int(residue.id),
+            "icode": str(getattr(residue, "insertionCode", "") or "").strip(),
+            "input_resname": str(residue.name),
+            "replacement_resname": str(replacement),
+            "residue_index": int(residue.index),
+        }
+        for residue, replacement in probe.nonstandardResidues
+    ]
+    standard_name_by_residue_index = {
+        record["residue_index"]: record["replacement_resname"]
+        for record in nonstandard_replacements
+    }
+    if standard_name_by_residue_index and not replace_nonstandard_residues:
+        outcome["success"] = False
+        outcome["code"] = "modeller_nonstandard_residue_preservation_unsupported"
+        outcome["errors"].append(
+            "MODELLER missing-residue repair cannot preserve observed "
+            "non-standard polymer residues while constructing a standard "
+            "one-letter target sequence. Enable non-standard residue replacement "
+            "or provide a separately prepared template."
+        )
+        return outcome
+    all_chains = list(probe.topology.chains())
+    polymer_chain_indices = [
+        index
+        for index, chain in enumerate(all_chains)
+        if any(
+            str(residue.name).strip().upper() in PROTEIN_RESNAMES
+            for residue in chain.residues()
+        )
+    ]
+    # PDBFixer creates separate topology chains for deposit solvent and ions.
+    # Those chains have no SEQRES row and are not MODELLER alignment targets.
+    old_to_polymer = {
+        old_index: new_index
+        for new_index, old_index in enumerate(polymer_chain_indices)
+    }
+    probe.missingResidues = {
+        (old_to_polymer[chain_index], residue_index): residues
+        for (chain_index, residue_index), residues in probe.missingResidues.items()
+        if chain_index in old_to_polymer
+    }
+    chains = [all_chains[index] for index in polymer_chain_indices]
+    modeller_template_path = input_path
+    nonpolymer_context = None
+    if len(chains) != len(all_chains):
+        from openmm import app as _app
+
+        nonpolymer_chains = [
+            chain
+            for index, chain in enumerate(all_chains)
+            if index not in old_to_polymer
+        ]
+        polymer_template = _app.Modeller(probe.topology, probe.positions)
+        polymer_template.delete(nonpolymer_chains)
+        modeller_template_path = input_path.with_name(
+            f"{input_path.stem}.modeller_polymer.pdb"
+        )
+        with modeller_template_path.open("w") as handle:
+            PDBFile.writeFile(
+                polymer_template.topology,
+                polymer_template.positions,
+                handle,
+                keepIds=True,
+            )
+        restored = restore_resnames_by_residue_key(
+            modeller_template_path.read_text(), input_path
+        )
+        if restored is not None:
+            modeller_template_path.write_text(restored)
+
+        nonpolymer_context = _app.Modeller(probe.topology, probe.positions)
+        nonpolymer_context.delete(chains)
+    # Everything a loop must not be built through: the split ligands and ions
+    # the caller handed over, plus any non-polymer chain that came in with the
+    # protein files. Used twice -- as BLK residues in the template so MODELLER
+    # builds around them, and afterwards to measure what it actually did.
+    context_atoms = _nonpolymer_context_atoms(nonpolymer_context_files, nonpolymer_context)
+    if build_windows_by_chain is None and build_window is not None:
+        build_windows_by_chain = {
+            str(chain.id)[:1]: build_window for chain in chains
+        }
+    if build_windows_by_chain:
+        _restrict_missing_to_window(probe, chains, build_windows_by_chain)
+    terminal_keys = _missing_residue_terminal_keys(probe, chains)
+
+    internal: dict = {}
+    terminal: dict = {}
+    # Terminal tails are counted per chain: each chain's reference sequence is
+    # trimmed by its own unresolved head and tail, so a shared counter would
+    # crop the wrong span as soon as there is more than one chain.
+    lead_by_chain = dict.fromkeys(range(len(chains)), 0)
+    trail_by_chain = dict.fromkeys(range(len(chains)), 0)
+    for (chain_idx, res_idx), residues in probe.missingResidues.items():
+        if not 0 <= chain_idx < len(chains):
+            continue
+        terminal_kind = terminal_keys.get((chain_idx, res_idx))
+        if terminal_kind == "N":
+            lead_by_chain[chain_idx] += len(residues)
+            if build_terminal_missing_residues:
+                terminal[(chain_idx, res_idx)] = residues
+            continue
+        if terminal_kind == "C":
+            trail_by_chain[chain_idx] += len(residues)
+            if build_terminal_missing_residues:
+                terminal[(chain_idx, res_idx)] = residues
+            continue
+        internal[(chain_idx, res_idx)] = residues
+    leading_terminal = sum(lead_by_chain.values())
+    trailing_terminal = sum(trail_by_chain.values())
+
+    grouped = _classified_missing_residue_records(
+        {**internal, **terminal}, chains, terminal_keys)
+    records = grouped["internal"] + grouped["n_terminal"] + grouped["c_terminal"]
+    if not records:
+        return outcome
+    summary = _missing_residue_summary(records)
+    terminal_summary = _missing_residue_summary(
+        grouped["n_terminal"] + grouped["c_terminal"])
+    gaps_to_model = {**internal, **terminal}
+    if (
+        terminal_summary["max_segment_length"]
+        > MODELLER_MAX_TERMINAL_MISSING_RESIDUE_SEGMENT_LENGTH
+    ):
+        outcome["success"] = False
+        outcome["code"] = "modeller_terminal_missing_residues_out_of_scope"
+        outcome["errors"].append(
+            "Requested terminal segment exceeds the MODELLER repair scope: "
+            f"max segment length {terminal_summary['max_segment_length']}, "
+            "limit "
+            f"{MODELLER_MAX_TERMINAL_MISSING_RESIDUE_SEGMENT_LENGTH}."
+        )
+        return outcome
+    outcome["summary"] = summary
+    # Describe the structure as it was BEFORE repair. The model MODELLER writes
+    # carries no SEQRES, so detection run on it afterwards would report
+    # "not checked" directly under a line saying 40 residues were rebuilt.
+    outcome["detection"] = {
+        "reference_sequence_available": True,
+        "reference_sequence_chains": len(getattr(probe, "sequences", None) or []),
+        "modeled_residues": sum(len(list(chain.residues())) for chain in chains),
+        "status": "detected",
+        "terminal_excluded": ({
+            "total_residues": leading_terminal + trailing_terminal,
+            "n_terminal_residues": leading_terminal,
+            "c_terminal_residues": trailing_terminal,
+        } if not build_terminal_missing_residues else {
+            "total_residues": 0,
+            "n_terminal_residues": 0,
+            "c_terminal_residues": 0,
+        }),
+    }
+    polymer_chain_ids = {str(chain.id) for chain in chains}
+    sequences = [
+        sequence
+        for sequence in (getattr(probe, "sequences", None) or [])
+        if str(getattr(sequence, "chainId", "")) in polymer_chain_ids
+    ]
+    # One reference sequence per chain, matched by chain id. A complex is
+    # repaired in one pass so that every rebuilt loop is built with the other
+    # chains present; done chain by chain, a loop at an interface is modeled
+    # into space the partner chain actually occupies.
+    sequence_by_chain: dict[str, object] = {}
+    for sequence in sequences:
+        chain_id = getattr(sequence, "chainId", None)
+        if chain_id is not None:
+            sequence_by_chain[str(chain_id)] = sequence
+    missing_reference = [
+        chain.id for chain in chains if str(chain.id) not in sequence_by_chain
+    ]
+    if missing_reference or len(sequences) != len(chains):
+        outcome["success"] = False
+        outcome["code"] = "modeller_repair_reference_sequence_unavailable"
+        outcome["errors"].append(
+            "MODELLER missing-residue repair needs one reference sequence per "
+            f"chain for {input_path.name}: {len(chains)} chain(s), "
+            f"{len(sequences)} sequence(s)"
+            + (f", no sequence for chain(s) {missing_reference}" if missing_reference else "")
+        )
+        return outcome
+
+    import gemmi
+
+    # Build each target span from the observed residues plus exactly the gap
+    # records left after window restriction. Slicing SEQRES itself is wrong for
+    # a cropped range: it still describes residues outside the requested window.
+    chain_spans = []
+    reference_length_total = 0
+    for chain_index, chain in enumerate(chains):
+        reference_residues = list(sequence_by_chain[str(chain.id)].residues)
+        reference_length_total += len(reference_residues)
+        observed = list(chain.residues())
+        span = []
+        for position in range(len(observed) + 1):
+            span.extend(gaps_to_model.get((chain_index, position), []))
+            if position < len(observed):
+                span.append(
+                    standard_name_by_residue_index.get(
+                        int(observed[position].index), observed[position].name)
+                )
+        chain_spans.append(span)
+    span = [residue for chain_span in chain_spans for residue in chain_span]
+    if (leading_terminal or trailing_terminal) and not build_terminal_missing_residues:
+        outcome["warnings"].append(
+            f"Left {leading_terminal + trailing_terminal} unresolved terminal "
+            f"residue(s) out of the MODELLER repair ({leading_terminal} N, "
+            f"{trailing_terminal} C); only the {len(span)}-residue observed span "
+            "was rebuilt"
+        )
+    outcome["detection"]["reference_sequence_length"] = reference_length_total
+    # Per chain for the alignment rows; concatenated for validation, which
+    # compares against the model's residues in chain order and so must not see
+    # the chain-break separator.
+    target_sequences = [
+        gemmi.one_letter_code(chain_span).upper() for chain_span in chain_spans
+    ]
+    target_sequence = "".join(target_sequences)
+    if "X" in target_sequence:
+        outcome["warnings"].append(
+            f"{target_sequence.count('X')} residue(s) in the reference sequence "
+            "have no one-letter code and were passed to MODELLER as X"
+        )
+
+    from mdclaw.genesis.modeller import modeller_from_alignment
+
+    out_dir = input_path.parent / f"{input_path.stem}.modeller_repair"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write the alignment instead of letting auto_align infer it. For a repair
+    # the correspondence is not a guess: PDBFixer already located every gap, so
+    # the template row is the observed residues with a dash per missing one, at
+    # exactly those positions.
+    #
+    # auto_align gets this wrong where a gap boundary is ambiguous. On 9UT9
+    # chain A the observed sequence runs ...S L H A N | gap | M C K E Y...,
+    # and auto_align placed that M *before* the gap, which is an equally good
+    # sequence alignment and the wrong structural one. Every gap-filled residue
+    # then inherited a number one past where it belongs, colliding with the
+    # observed residues after the gap, and the collision check -- correctly --
+    # refused to renumber anything at all.
+    # Resolve the declared disulfides to model positions before modelling.
+    # A patch that cannot be placed is a covalent bond that would go missing, so
+    # this refuses rather than building a different molecule quietly.
+    target_resolution = _resolve_target_residue_sites(
+        chains,
+        chain_spans,
+        gaps_to_model,
+        build_windows_by_chain=build_windows_by_chain,
+    )
+    if target_resolution["errors"]:
+        outcome["success"] = False
+        outcome["code"] = (
+            "modeller_terminal_numbering_unresolvable"
+            if terminal_summary["total_residues"]
+            else "modeller_repair_numbering_unresolvable"
+        )
+        outcome["errors"].extend(target_resolution["errors"])
+        return outcome
+    for record in records:
+        exact_sites = target_resolution["gap_sites"].get(
+            (record["chain_index"], record["position"]), [])
+        record["method"] = "modeller"
+        record["sites"] = [
+            {"chain": chain, "resnum": number, "icode": icode}
+            for chain, number, icode in exact_sites
+        ]
+    patch_resolution = _disulfide_patch_positions(
+        chains, chain_spans, gaps_to_model, disulfide_pairs,
+        target_resolution=target_resolution)
+    if patch_resolution["errors"]:
+        outcome["success"] = False
+        outcome["code"] = "modeller_disulfide_position_unresolvable"
+        outcome["errors"].extend(
+            f"Cannot place a declared disulfide for MODELLER: {problem}"
+            for problem in patch_resolution["errors"]
+        )
+        return outcome
+
+    template_row = _template_alignment_row(target_sequences, gaps_to_model, chains)
+    alignment_path = out_dir / f"{input_path.stem}_repair.ali"
+    # The row carries one '/' per chain break; the target row needs them at the
+    # same columns or MODELLER reads the two rows as different lengths.
+    target_row = "/".join(target_sequences)
+    outcome["alignment_file"] = str(alignment_path)
+
+    # The ligands and ions go into the template as BLK residues: one HETATM
+    # block on a spare chain, one '.' per residue on both alignment rows.
+    # MODELLER keeps BLK residues where the template has them and its
+    # non-bonded restraints keep every loop out of them. Without this the
+    # complex pass fused protein chains only, and on 9OPZ the trigger loop
+    # 45-57 was built through sucralose (0.25 A). If the run with the block
+    # fails, it is tried once more without, and the clearance check below
+    # then says whether that model is usable.
+    hetero_block = bool(nonpolymer_in_template and context_atoms)
+    hetero_chain_id = _spare_chain_id([str(chain.id) for chain in chains]) if hetero_block else None
+    outcome["nonpolymer_in_template"] = hetero_block
+    attempts = [True, False] if hetero_block else [False]
+    model_result = None
+    model_file = None
+    for with_hetero in attempts:
+        if with_hetero:
+            run_template = out_dir / f"{input_path.stem}.modeller_template_with_nonpolymer.pdb"
+            n_hetero = _write_template_with_nonpolymer(
+                modeller_template_path, context_atoms, hetero_chain_id, run_template)
+            block = "/" + "." * n_hetero
+            run_last_chain = hetero_chain_id
+        else:
+            run_template = modeller_template_path
+            block = ""
+            run_last_chain = str(chains[-1].id)
+        _write_repair_alignment(
+            alignment_path,
+            target_code=f"{input_path.stem}_filled",
+            target_sequence=target_row + block,
+            template_code=input_path.stem,
+            template_row=template_row + block,
+            first_chain=str(chains[0].id),
+            last_chain=run_last_chain,
+        )
+        # A loop model with a folded aromatic ring or overlapping atoms is rejected by
+        # modeller_from_alignment (modeller_models_geometry_invalid). Two models are
+        # usually enough; when both fail, build eight more with another seed once.
+        geometry_tries = ((2, random_seed, out_dir), (8, random_seed - 1, out_dir / "geometry_retry"))
+        for geometry_try_models, geometry_try_seed, geometry_try_dir in geometry_tries:
+            model_result = modeller_from_alignment(
+                template_pdb=str(run_template),
+                alignment_file=str(alignment_path),
+                template_code=input_path.stem,
+                target_code=f"{input_path.stem}_filled",
+                num_models=1,
+                loop_refinement=True,
+                loop_models=geometry_try_models,
+                # The split protein file can carry polymer modifications as HETATM
+                # (1A62 has three observed MSE residues). Excluding HETATM makes
+                # MODELLER drop those template positions and reject its otherwise
+                # identical alignment before the later PDBFixer MSE->MET conversion.
+                # It is also what makes the BLK block above visible to MODELLER.
+                hetatm=True,
+                # The default ceiling is 30; raise it so the largest gap present is
+                # actually refined rather than silently left as built.
+                loop_max_length=max(30, int(summary["max_segment_length"])),
+                # The repaired chain has to stay superposed on the structure it came
+                # from, or a membrane orientation or partner chain kept from the
+                # original lands in the wrong place.
+                template_frame=True,
+                # A disulfide whose cysteines fall inside a gap is invisible to MODELLER:
+                # it reads its restraints off the template, where those residues are not
+                # there at all. On 9UT9 chain A that left CYS363 and CYS366 -- bonded at
+                # 2.04 A where 9UTC resolves them -- 11.65 A apart. Declaring the bond
+                # downstream cannot undo that; it only hands minimisation a bond nine
+                # angstroms past equilibrium.
+                disulfide_patches=patch_resolution["positions"],
+                target_residue_sites=target_resolution["sites"],
+                random_seed=geometry_try_seed,
+                output_dir=str(geometry_try_dir),
+            )
+            if model_result.get("code") != "modeller_models_geometry_invalid":
+                break
+            outcome["warnings"].append(
+                f"modeller_models_geometry_invalid with {geometry_try_models} loop model(s) "
+                f"(seed {geometry_try_seed}): {'; '.join(model_result.get('errors') or [])[:400]}")
+        outcome["loop_models_used"] = geometry_try_models
+        outcome["random_seed_used"] = geometry_try_seed
+        outcome["warnings"].extend(model_result.get("warnings", []))
+        model_file = (model_result.get("selected_model") or {}).get("path")
+        if model_result.get("success") and model_file and Path(model_file).is_file():
+            if with_hetero:
+                # The block did its job; the model keeps the BLK residues as
+                # MODELLER wrote them (on whatever chain letter it chose), and
+                # the original coordinates are put back below. Everything
+                # downstream expects a polymer-only model: after the template
+                # frame is restored the polymer residues carry exactly the
+                # target identities, so everything else is the block.
+                keep = {
+                    (str(chain)[:1], int(number), (str(icode or "").strip() or " "))
+                    for chain, number, icode in target_resolution["sites"]
+                }
+                polymer_only = Path(model_file).with_name(
+                    f"{Path(model_file).stem}.polymer.pdb")
+                kept_lines = []
+                for line in Path(model_file).read_text().splitlines():
+                    if line.startswith(("ATOM", "HETATM")) and len(line) > 26:
+                        if (line[21], int(line[22:26]), line[26] or " ") not in keep:
+                            continue
+                    kept_lines.append(line)
+                polymer_only.write_text("\n".join(kept_lines) + "\n")
+                model_file = str(polymer_only)
+            break
+        if with_hetero:
+            outcome["warnings"].append(
+                "MODELLER did not produce a model with the non-polymer block in the "
+                f"template ({'; '.join(model_result.get('errors') or ['no model'])}); "
+                "retried without it -- read nonpolymer_clearance before using the result"
+            )
+            outcome["nonpolymer_in_template"] = False
+            continue
+
+    if not model_result.get("success"):
+        outcome["success"] = False
+        outcome["errors"].extend(
+            model_result.get("errors") or ["MODELLER missing-residue repair failed"]
+        )
+        outcome["code"] = model_result.get("code") or "modeller_missing_residue_repair_failed"
+        return outcome
+
+    if not model_file or not Path(model_file).is_file():
+        outcome["success"] = False
+        outcome["code"] = "modeller_missing_residue_repair_failed"
+        outcome["errors"].append(
+            "MODELLER reported success but produced no readable model file"
+        )
+        return outcome
+
+    validation = _validate_modeller_repair_model(
+        modeller_template_path,
+        Path(model_file),
+        target_sequence,
+        (model_result.get("selected_model") or {}).get("template_frame"),
+        target_residue_sites=target_resolution["sites"],
+        terminal_segments=(grouped["n_terminal"] + grouped["c_terminal"]),
+    )
+    outcome["validation"] = validation
+    if not validation["success"]:
+        outcome["success"] = False
+        outcome["code"] = "modeller_missing_residue_repair_validation_failed"
+        outcome["errors"].extend(validation["errors"])
+        return outcome
+
+    disulfide_check = _validate_declared_disulfides(
+        Path(model_file), disulfide_pairs,
+        {str(chain.id)[:1] for chain in chains},
+    )
+    outcome["disulfide_validation"] = disulfide_check
+    outcome["warnings"].extend(disulfide_check.get("warnings") or [])
+    if not disulfide_check["success"]:
+        outcome["success"] = False
+        outcome["code"] = "modeller_disulfide_not_formed"
+        outcome["errors"].extend(disulfide_check["errors"])
+        return outcome
+
+    # Measured whether or not the block was in the template: the number is the
+    # evidence that a rebuilt loop stays out of the ligand, and it is what the
+    # receipt reports. A clash is refused -- it is not a model of the complex.
+    clearance = _nonpolymer_clearance(Path(model_file), context_atoms, records)
+    outcome["nonpolymer_clearance"] = clearance
+    if clearance["checked"]:
+        for entry in clearance["segments"]:
+            if entry["verdict"] == "close":
+                outcome["warnings"].append(
+                    f"rebuilt loop {entry['chain']}{entry['first_resnum']}-{entry['last_resnum']} "
+                    f"comes within {entry['min_distance_angstrom']} A of "
+                    f"{entry['nearest_nonpolymer']} ({entry['nearest_rebuilt_atom']})"
+                )
+        if clearance["clash"]:
+            outcome["success"] = False
+            outcome["code"] = "modeller_loop_nonpolymer_clash"
+            outcome["errors"].extend(
+                f"rebuilt loop {entry['chain']}{entry['first_resnum']}-{entry['last_resnum']} "
+                f"was built through {entry['nearest_nonpolymer']}: "
+                f"{entry['min_distance_angstrom']} A at {entry['nearest_rebuilt_atom']} "
+                f"(limit {MODELLER_LOOP_NONPOLYMER_CLASH_ANGSTROM} A)"
+                for entry in clearance["segments"] if entry["verdict"] == "clash"
+            )
+            return outcome
+
+    if nonpolymer_context is not None:
+        from openmm import app as _app
+
+        repaired = PDBFile(str(model_file))
+        combined = _app.Modeller(repaired.topology, repaired.positions)
+        combined.add(nonpolymer_context.topology, nonpolymer_context.positions)
+        combined_path = Path(model_file).with_name(
+            f"{Path(model_file).stem}.with_nonpolymer.pdb"
+        )
+        with combined_path.open("w") as handle:
+            PDBFile.writeFile(
+                combined.topology,
+                combined.positions,
+                handle,
+                keepIds=True,
+            )
+        restored = restore_resnames_by_residue_key(
+            combined_path.read_text(), input_path
+        )
+        if restored is not None:
+            combined_path.write_text(restored)
+        model_file = str(combined_path)
+
+    outcome["applied"] = True
+    outcome["model_file"] = model_file
+    outcome["template"] = {
+        # For a repair the template is the input structure itself, and that is
+        # part of the scientific record of the model: it says which coordinates
+        # the rebuilt loops were grown from.
+        "file": str(modeller_template_path),
+        "sha256": sha256_file(modeller_template_path),
+        "role": "self_template_repair",
+    }
+    outcome["operation"] = {
+        "step": "missing_residues",
+        "status": "modeled_with_modeller",
+        "method": "modeller",
+        "count": len(records),
+        "segment_count": summary["segment_count"],
+        "total_residues": summary["total_residues"],
+        "max_segment_length": summary["max_segment_length"],
+        "segments": records,
+        "model_file": model_file,
+        "random_seed": random_seed,
+        "template": outcome["template"],
+        "reference_sequence_length": len(target_sequence),
+        "validation": validation,
+        "contains_predicted_terminal_residues": bool(
+            terminal_summary["total_residues"]),
+        "numbering_source": target_resolution["numbering_source"],
+        "nonstandard_residue_replacements": nonstandard_replacements,
+        "details": (
+            f"Rebuilt {summary['total_residues']} missing residue(s) in "
+            f"{summary['segment_count']} segment(s) with MODELLER loop modeling; "
+            f"{terminal_summary['total_residues']} were terminal one-anchor "
+            "predictions"
+        ),
+    }
+    if terminal_summary["total_residues"]:
+        outcome["detection"]["terminal_built"] = {
+            "method": "modeller",
+            **terminal_summary,
+        }
+        outcome["warnings"].append(
+            f"MODELLER rebuilt {terminal_summary['total_residues']} terminal "
+            f"residue(s) in {terminal_summary['segment_count']} one-anchor "
+            "segment(s); these deterministic coordinates are predicted, not "
+            "experimental evidence that the terminus is ordered"
+        )
+    return outcome
+
+
+def _missing_residue_regeneration_recommendation(summary: dict) -> dict:
+    return {
+        "reason": "internal_missing_residues_exceed_pdbfixer_scope",
+        # The failed prep node is terminal and sealed. Repair the same source
+        # structure in a new sibling prep node with the same completed parent.
+        "recommended_next_action": "create_new_prep_node_with_modeller_missing_residue_method",
+        "restart_stage": "prep",
+        "next_commands": [
+            (
+                "mdclaw create_node --job-dir <job_dir> --node-type prep "
+                "--parent-node-ids <completed_parent_node_id>"
+            ),
+            (
+                "mdclaw --job-dir <job_dir> --node-id <new_prep_node_id> "
+                "prepare_complex --missing-residue-method modeller"
+            ),
+        ],
+        "options": [
+            {
+                "option": "repair_gaps_in_new_prep_node",
+                "next_skill": "skills/md-prepare/SKILL.md",
+                "tool": "prepare_complex",
+                "flag": "--missing-residue-method modeller",
+                "when": (
+                    "The structure itself is the right starting point and only "
+                    "its gaps need rebuilding. Create a new prep node with the "
+                    "failed node's same completed parent; failed nodes are sealed."
+                ),
+                "required_inputs": [],
+            },
+            {
+                "option": "use_modeller_template_modeling",
+                "next_skill": "skills/modeller-predict/SKILL.md",
+                "tool": "modeller_from_alignment",
+                "when": "The target is a different sequence from the template, so a new source structure has to be modeled rather than repaired.",
+                "required_inputs": [
+                    "template_pdb",
+                    "target_sequence or alignment_file",
+                ],
+            },
+            {
+                "option": "use_boltz2_structure_prediction",
+                "next_skill": "skills/boltz-predict/SKILL.md",
+                "tool": "boltz2_protein_from_seq",
+                "when": "No reliable template/alignment is available, or missing segments are too extensive for template repair.",
+                "required_inputs": ["amino_acid_sequence_list"],
+            },
+            {
+                "option": "provide_more_complete_source_structure",
+                "next_skill": "skills/md-prepare/SKILL.md",
+                "tool": "fetch_structure or register_local_structure",
+                "when": "A better experimental structure, biological assembly, or curated local model is available.",
+            },
+        ],
+        "missing_residue_summary": summary,
+    }
+
+
+def _spell(windows) -> str:
+    """``18-214 and 383-458`` -- the windows as a report says them."""
+    written = [f"{low}-{high}" for low, high in windows]
+    if len(written) < 2:
+        return written[0] if written else "empty"
+    return " and ".join([", ".join(written[:-1]), written[-1]])
+
+
+def _restrict_missing_to_window(fixer, chains, window) -> dict:
+    """Drop the parts of each missing-residue segment that fall outside a range.
+
+    PDBFixer reports a segment as "these residues belong between residue i-1 and
+    residue i", with no numbers of their own until they are built.  Their numbers
+    follow from the chain: the leading segment counts backwards from the first
+    resolved residue, a trailing segment counts forwards from the last, and an
+    internal segment lies between two known ones.
+
+    A chain may be cropped to more than one window -- a GPCR fusion construct is
+    kept as 18-214 and 383-458, with the crystallisation partner between them
+    left out.  An internal segment is then no longer safe by construction: the
+    gap between the two windows has an anchor on each side, and building it back
+    rebuilds exactly what the ranges removed.  Every segment is therefore
+    bounded, and one spanning from one window into another is dropped whole even
+    when its numbers cannot be derived.
+    """
+    windows_by_chain = window if isinstance(window, dict) else None
+    shared_windows = None
+    if windows_by_chain is None:
+        shared_windows = (
+            [window] if window and isinstance(window[0], int) else list(window)
+        )
+
+    trimmed = {}
+
+    def _number(residue):
+        """The residue's author number, or None when it carries an insertion code.
+
+        A chain numbered 100, 100A, 100B has no arithmetic to do, so a segment
+        anchored on one is left alone rather than trimmed on a wrong number.
+        """
+        try:
+            return int(str(residue.id).strip())
+        except (TypeError, ValueError):
+            return None
+
+    for key in list(fixer.missingResidues.keys()):
+        chain_idx, res_idx = key
+        chain_id = str(getattr(chains[chain_idx], "id", chain_idx))
+        windows = (
+            windows_by_chain.get(chain_id) if windows_by_chain is not None
+            else shared_windows
+        )
+        if not windows:
+            continue
+        windows = [windows] if isinstance(windows[0], int) else list(windows)
+
+        def _held(number):
+            return any(min(low, high) <= number <= max(low, high)
+                       for low, high in windows)
+
+        def _same_window(left, right):
+            return any(min(low, high) <= left <= max(low, high)
+                       and min(low, high) <= right <= max(low, high)
+                       for low, high in windows)
+
+        residues = list(chains[chain_idx].residues())
+        if not residues:
+            continue
+        segment = fixer.missingResidues[key]
+        left = right = None
+        if res_idx == 0:
+            anchor = _number(residues[0])
+            numbers = (None if anchor is None
+                       else list(range(anchor - len(segment), anchor)))
+        elif res_idx == len(residues):
+            anchor = _number(residues[-1])
+            numbers = (None if anchor is None
+                       else list(range(anchor + 1, anchor + 1 + len(segment))))
+        else:
+            # Internal segments are bounded by both of their anchors, so they
+            # cannot leave a window that holds the anchors -- but only while
+            # cropping has already removed everything outside it, and only while
+            # there is one window. Trimming them from the anchors as well means
+            # the two do not have to agree.
+            left, right = _number(residues[res_idx - 1]), _number(residues[res_idx])
+            numbers = (None if left is None or right is None
+                       or right - left - 1 != len(segment)
+                       else list(range(left + 1, right)))
+        if numbers is None:
+            # Undeducible numbers are left alone -- unless the segment bridges
+            # two windows, where the anchors alone say it is the piece the
+            # ranges deleted and no arithmetic is needed to refuse it.
+            spans = (0 < res_idx < len(residues)
+                     and left is not None and right is not None
+                     and not _same_window(left, right))
+            trimmed[f"chain {chain_idx} position {res_idx}"] = {
+                "requested_window": _spell(windows),
+                "segment_residues": len(segment),
+                "kept": 0 if spans else len(segment),
+                "note": ("dropped: the segment lies between two requested ranges"
+                         if spans else
+                         "left alone: the anchoring residue numbers are not plain "
+                         "integers, so the segment's numbers cannot be derived"),
+            }
+            if spans:
+                del fixer.missingResidues[key]
+            continue
+        keep = [name for name, number in zip(segment, numbers) if _held(number)]
+        if len(keep) == len(segment):
+            continue
+        trimmed[f"chain {chain_idx} position {res_idx}"] = {
+            "requested_window": _spell(windows),
+            "segment_residues": len(segment),
+            "kept": len(keep),
+        }
+        if keep:
+            fixer.missingResidues[key] = keep
+        else:
+            del fixer.missingResidues[key]
+    return trimmed
+
+
+PROTONATION_METHODS = ("propka", "no-prediction")
+
+# Earlier releases called the no-prediction path "standard". Campaign agents
+# read that name as "the standard method" and reached for ``--ph 7.0``
+# instead; the name now says what the path does. The alias stays accepted so
+# recorded commands and older skills keep working.
+DEPRECATED_PROTONATION_METHODS = {"standard": "no-prediction"}
+
+
+def normalize_protonation_method(value):
+    """``(canonical_value, warning_or_None)`` for a protonation method name.
+
+    Unknown values pass through unchanged so the caller's choice error still
+    lists them; only the deprecated alias is rewritten.
+    """
+    canonical = DEPRECATED_PROTONATION_METHODS.get(value)
+    if canonical is None:
+        return value, None
+    return canonical, (f"protonation_method '{value}' is deprecated; use "
+                       f"'{canonical}'")
+
+
+def _protonation_method_label(no_prediction: bool) -> str:
+    """Recorded on the node so the choice is visible after the fact."""
+    return "pdb2pqr_no_prediction" if no_prediction else "pdb2pqr+propka"
+
+
+_CONTEXT_CHAIN_POOL = "zyxwvutsrqponmlkjihgfedcba9876543210ZYXWVUTSRQPONMLKJIHGFEDCBA"
+
+
+def _without_noncap_hydrogens(pdb_path: Path):
+    """``(path, count)`` of a copy without hydrogens outside ACE/NME caps, or None.
+
+    None when the file has no such hydrogen (every crystal structure), so the
+    caller keeps handing pdb2pqr the file it always did.
+    """
+    from mdclaw.structure.terminal_caps import TERMINAL_CAP_RESIDUES
+
+    kept, removed = [], 0
+    for line in Path(pdb_path).read_text(errors="ignore").splitlines():
+        if line.startswith(("ATOM  ", "HETATM")) and len(line) > 20:
+            element = line[76:78].strip().upper() if len(line) >= 78 else ""
+            name = line[12:16].strip().upper()
+            is_h = element in ("H", "D") or (not element and name[:1] in ("H", "D")
+                                              and not name.startswith(("HG", "HO", "HF")))
+            if is_h and line[17:20].strip().upper() not in TERMINAL_CAP_RESIDUES:
+                removed += 1
+                continue
+        kept.append(line)
+    if not removed:
+        return None
+    target = Path(pdb_path).with_name(Path(pdb_path).stem + ".heavy.pdb")
+    target.write_text("\n".join(kept) + "\n")
+    return target, removed
+
+
+def _residues_within(records, piece_xyz, radius: float) -> set:
+    """Residue keys ``(chain, resnum+icode)`` of ``records`` near the piece."""
+    import numpy as np
+
+    if not records or not piece_xyz:
+        return set()
+    keys = [(line[21], line[22:27]) for line in records]
+    xyz = np.asarray([(float(line[30:38]), float(line[38:46]), float(line[46:54])) for line in records])
+    piece = np.asarray(piece_xyz)
+    close = np.zeros(len(records), dtype=bool)
+    try:
+        from scipy.spatial import cKDTree
+
+        distances, _ = cKDTree(piece).query(xyz, distance_upper_bound=radius)
+        close = np.isfinite(distances)
+    except Exception:  # noqa: BLE001 - scipy is optional here
+        for start in range(0, len(records), 256):
+            block = xyz[start:start + 256]
+            close[start:start + 256] = (
+                np.linalg.norm(block[:, None, :] - piece[None, :, :], axis=-1).min(axis=1) <= radius
+            )
+    return {key for key, near in zip(keys, close) if near}
+
+
+def _atom_key(atom) -> tuple:
+    residue = atom.residue
+    return (residue.chain.id, residue.id, residue.insertionCode, atom.name)
+
+
+def _place_missing_atoms_against_context(fixer, is_context, attempts: int = 4) -> dict:
+    """Place the missing atoms a few times and keep the placement with the fewest clashes.
+
+    PDBFixer relaxes the new atoms in a soft potential whose minimiser is not
+    deterministic across threads: on the 6KUY TRP99 ring the closest heavy-atom
+    contact with the neighbouring piece measured 0.7-2.0 A over seven identical
+    calls with the same seed. Every attempt restarts from the pre-completion
+    topology (``missingAtoms`` is keyed by its residues and is not consumed),
+    and the attempt whose new heavy atoms keep the largest distance from every
+    other heavy atom is kept -- the neighbouring pieces and the piece itself,
+    except the atom's own residue and its chain neighbours, which bonds and
+    angles place. Scoring against the context alone kept a ring that the
+    context avoided but its own piece did not (6KUX: TRP A99 NE1 0.72 A from
+    PHE A101 CE1), which pdb2pqr no longer debumps for such pieces. Both the
+    overall and the context-only closest contacts travel with the result.
+    """
+    import numpy as np
+    from openmm import unit
+
+    topology, positions = fixer.topology, fixer.positions
+    before = {_atom_key(atom) for atom in topology.atoms()}
+    xyz = np.asarray(positions.value_in_unit(unit.angstrom), dtype=float)
+    obstacles = [atom for atom in topology.atoms()
+                 if atom.element is not None and atom.element.symbol != "H"]
+    obstacle_xyz = xyz[[atom.index for atom in obstacles]] if obstacles else np.zeros((0, 3))
+    obstacle_context = np.array([bool(is_context(atom.residue.chain)) for atom in obstacles], dtype=bool)
+    obstacle_chain = [atom.residue.chain.index for atom in obstacles]
+    obstacle_residue = np.array([atom.residue.index for atom in obstacles])
+    best: dict = {}
+    for seed in range(max(1, attempts)):
+        fixer.topology, fixer.positions = topology, positions
+        fixer.addMissingAtoms(seed=seed)
+        placed = np.asarray(fixer.positions.value_in_unit(unit.angstrom), dtype=float)
+        new_atoms = [atom for atom in fixer.topology.atoms()
+                     if _atom_key(atom) not in before
+                     and atom.element is not None and atom.element.symbol != "H"]
+        closest = closest_context = float("inf")
+        pair = None
+        if new_atoms and len(obstacle_xyz):
+            # residue indices of the pre-completion topology, by (chain, id, icode)
+            index_of = {(r.chain.index, r.id, r.insertionCode): r.index for r in topology.residues()}
+            for atom in new_atoms:
+                residue = atom.residue
+                own = index_of.get((residue.chain.index, residue.id, residue.insertionCode))
+                distances = np.linalg.norm(obstacle_xyz - placed[atom.index], axis=1)
+                if own is not None:
+                    # bonds and angles place the atom against its own residue
+                    # and its chain neighbours; only farther atoms can clash
+                    same_chain = np.array([c == residue.chain.index for c in obstacle_chain])
+                    distances = np.where(same_chain & (np.abs(obstacle_residue - own) <= 1),
+                                         np.inf, distances)
+                j = int(np.argmin(distances))
+                if distances[j] < closest:
+                    closest = float(distances[j])
+                    b = obstacles[j]
+                    pair = (f"{residue.name} {residue.chain.id}{residue.id} {atom.name}",
+                            f"{b.residue.name} {b.residue.id} {b.name}")
+                if obstacle_context.any():
+                    closest_context = min(closest_context,
+                                          float(np.min(np.where(obstacle_context, distances, np.inf))))
+        if not best or closest > best["closest_contact_angstrom"]:
+            best = {"seed": seed, "closest_contact_angstrom": closest,
+                    "closest_context_contact_angstrom": closest_context,
+                    "closest_pair": pair, "topology": fixer.topology, "positions": fixer.positions}
+        if closest >= 2.5 or not new_atoms:
+            break
+    fixer.topology, fixer.positions = best.pop("topology"), best.pop("positions")
+    best["attempts"] = seed + 1
+    for key in ("closest_contact_angstrom", "closest_context_contact_angstrom"):
+        if best[key] == float("inf"):
+            best[key] = None
+    return best
+
+
+def _input_with_completion_context(input_path: Path, context_pdb_files, *, radius: float = 12.0) -> tuple[Path, list[str]]:
+    """Write ``input_path`` plus the heavy atoms of the other pieces as extra chains.
+
+    Returns the combined file and the chain ids the context received (never one
+    the piece uses), so the caller can keep PDBFixer's fixes to the piece and
+    strip the context afterwards. ``radius`` keeps only context residues with
+    a heavy atom within that many angstroms of the piece.
+    """
+    piece_lines = Path(input_path).read_text(errors="ignore").splitlines()
+    used = {line[21] for line in piece_lines if line.startswith(("ATOM  ", "HETATM")) and len(line) > 21}
+    pool = [c for c in _CONTEXT_CHAIN_POOL if c not in used]
+    out = [line for line in piece_lines if not line.startswith(("END", "MASTER", "CONECT"))]
+    if out and not out[-1].startswith("TER"):
+        out.append("TER")
+
+    def _heavy_records(lines):
+        for line in lines:
+            if not line.startswith(("ATOM  ", "HETATM")) or len(line) < 54:
+                continue
+            element = line[76:78].strip().upper() if len(line) >= 78 else ""
+            if (element or line[12:16].strip()[:1].upper()) == "H":
+                continue
+            yield line
+
+    piece_xyz = [(float(line[30:38]), float(line[38:46]), float(line[46:54]))
+                 for line in _heavy_records(piece_lines)]
+    context_ids: list[str] = []
+    for path in context_pdb_files or []:
+        path = Path(path)
+        if not path.is_file():
+            continue
+        records = list(_heavy_records(path.read_text(errors="ignore").splitlines()))
+        # Only the neighbourhood matters, and it bounds the cost: every piece
+        # of a ten-chain complex would otherwise carry the whole complex
+        # through PDBFixer's soft minimisation and pdb2pqr/propka.
+        nearby = _residues_within(records, piece_xyz, radius)
+        mapping: dict[str, str] = {}
+        added = 0
+        for line in records:
+            if (line[21], line[22:27]) not in nearby:
+                continue
+            original = line[21]
+            if original not in mapping:
+                if not pool:
+                    break
+                mapping[original] = pool.pop(0)
+                context_ids.append(mapping[original])
+            out.append(line[:21] + mapping[original] + line[22:])
+            added += 1
+        if added:
+            out.append("TER")
+    if not context_ids:
+        return Path(input_path), []
+    out.append("END")
+    combined = Path(input_path).with_name(Path(input_path).stem + ".with_context.pdb")
+    combined.write_text("\n".join(out) + "\n")
+    return combined, context_ids
+
+
+
+def clean_protein(
+    pdb_file: str,
+    ignore_terminal_missing_residues: bool = True,
+    build_terminal_missing_residues: bool = False,
+    build_window: Optional[tuple] = None,
+    cap_termini: bool = False,
+    n_terminal_cap: str | None = None,
+    c_terminal_cap: str | None = None,
+    terminal_cap_forcefield: str | None = None,
+    replace_nonstandard_residues: bool = True,
+    remove_heterogens: bool = True,
+    keep_water: bool = False,
+    add_missing_atoms: bool = True,
+    add_hydrogens: bool = True,
+    ph: float = 7.4,
+    disulfide_pairs: list[dict] | None = None,
+    histidine_states: dict[str, str] | None = None,
+    protonation_states: Optional[Dict[str, Any]] = None,
+    protonation_method: str = "propka",
+    preserve_input_protonation: bool = False,
+    strip_input_caps: bool = False,
+    missing_residue_method: str = "auto",
+    context_pdb_files: Optional[list[str]] = None,
+) -> dict:
+    """Clean a monomer protein PDB/mmCIF file for MD simulation using PDBFixer.
+
+    This tool processes a single-chain protein structure (from split_molecules output)
+    and prepares it for MD simulation by fixing missing residues, atoms, and adding
+    proper protonation.
+
+    Args:
+        pdb_file: Input protein PDB or mmCIF file path (single chain from split_molecules)
+        ignore_terminal_missing_residues: Ignore missing residues at chain termini
+                                          instead of modeling them (default: True)
+        build_terminal_missing_residues: Explicitly build requested terminal
+                                          segments. This positive switch overrides
+                                          ``ignore_terminal_missing_residues``.
+        build_window: Author-number range, or ranges, that bound what may be built.
+        cap_termini: Backward-compatible shortcut for adding ACE at the
+                     N terminus and NME at the C terminus (default: False).
+        n_terminal_cap: Optional one-sided N-terminal cap. Currently supports
+                        ``"ACE"`` or an explicit none-like value.
+        c_terminal_cap: Optional one-sided C-terminal cap. Currently supports
+                        ``"NME"`` or an explicit none-like value.
+        terminal_cap_forcefield: Protein force field used only for OpenMM
+                                 Modeller cap-hydrogen completion. Defaults
+                                 to ff19SB; pass the planned topology protein
+                                 force field when it differs.
+        missing_residue_method: How to rebuild requested missing residues.
+            ``"none"`` records but does not rebuild internal gaps;
+            ``"auto"`` routes short gaps to PDBFixer and longer gaps to
+            MODELLER, while ``"pdbfixer"`` and ``"modeller"`` pin one method.
+            Terminal gaps participate only when
+            ``build_terminal_missing_residues`` is true; PDBFixer accepts at
+            most 5 and MODELLER at most 10 residues per terminal segment.
+        replace_nonstandard_residues: Replace non-standard residues with standard ones (default: True)
+        remove_heterogens: Remove heteroatoms (ligands, ions, etc.) (default: True)
+        keep_water: Keep water molecules when removing heterogens (default: False)
+        add_missing_atoms: Add missing heavy atoms (default: True)
+        add_hydrogens: Add hydrogen atoms using the selected baseline (default: True)
+        ph: pH for propka (default: 7.4); ignored by no-prediction.
+        disulfide_pairs: Pre-defined disulfide bond pairs from Phase 1 analysis.
+                        List of dicts with chain1, resnum1, chain2, resnum2, form_bond.
+                        If provided, skips auto-detection and uses these pairs instead.
+        histidine_states: Pre-defined histidine protonation states from Phase 1 analysis.
+                         Dict mapping "chain:resnum" to state ("HID", "HIE", "HIP").
+                         If provided, overlays these states after the selected baseline.
+        protonation_method: propka (default) predicts each titratable side
+                         chain's state from its environment at `ph`;
+                         no-prediction skips the prediction and keeps the force
+                         field's fixed states (Asp-/Glu-/Lys+/Arg+, His and Cys
+                         neutral; the His tautomer is still chosen from hydrogen
+                         bonding). A request for 'standard states' means
+                         no-prediction, not --ph 7.0. 'standard' is a deprecated
+                         alias of no-prediction.
+        preserve_input_protonation: Overlay explicit input ASH/GLH/LYN and
+                         histidine variants on the selected baseline. False by
+                         default, so ``standard`` means all-standard. CYX and
+                         metal-coordinating CYM are structural chemistry and
+                         are handled independently of this switch.
+        strip_input_caps: Remove ACE/NME caps the structure arrived with. Kept
+                         by default and counted as protein residues, since a
+                         deposit that ships a cap normally means it.
+        protonation_states: User-specified residue protonation states. Accepts
+                         either a dict mapping "chain:resnum" to Amber variant
+                         names, or a list of dicts with chain, resnum, state,
+                         and optional icode. Supports ASP/ASH, GLU/GLH,
+                         HID/HIE/HIP, LYS/LYN, and CYS/CYX/CYM.
+
+    Returns:
+        Dict with:
+            - success: bool - True if cleaning completed without critical errors
+            - output_file: str - Path to the cleaned PDB file (*.clean.pdb)
+            - input_file: str - Original input file path
+            - cap_termini_required: bool - True if ACE/NME caps still need to be
+              added before openmmforcefields can build the System (PDBFixer cannot
+              add caps directly).
+            - n_terminal_cap: str | None - Applied/requested N-terminal cap.
+            - c_terminal_cap: str | None - Applied/requested C-terminal cap.
+            - terminal_cap_hydrogen_completion: dict - OpenMM Modeller cap-H
+              completion report when ACE/NME caps are present.
+            - operations: list[dict] - Details of each operation performed
+            - warnings: list[str] - Non-critical issues encountered
+            - errors: list[str] - Critical errors (empty if success=True)
+            - statistics: dict - Summary counts (chains, residues, atoms, etc.)
+            - disulfide_bonds: list[dict] - Detected disulfide bonds with residue info
+              (CYS residues renamed to CYX for Amber compatibility)
+    """
+    logger.info(f"Cleaning protein structure: {pdb_file}")
+
+    protonation_method, deprecated_method_warning = normalize_protonation_method(
+        protonation_method)
+    if protonation_method not in PROTONATION_METHODS:
+        return create_choice_error(
+            "protonation_method", protonation_method, PROTONATION_METHODS,
+            hints=["'propka' predicts pKa-based states at `ph`; 'no-prediction' keeps "
+                   "the force field's fixed states (a request for standard states). "
+                   "Ligand protonation is a separate prepare_complex option."],
+        )
+    standard_state_protonation = protonation_method == "no-prediction"
+    input_terminal_caps = detect_input_terminal_caps(pdb_file)
+    
+    # Initialize result structure for LLM error handling
+    result = {
+        "success": False,
+        "output_file": None,
+        "input_file": str(pdb_file),
+        "cap_termini_required": False,
+        "n_terminal_cap": None,
+        "c_terminal_cap": None,
+        "terminal_caps": {},
+        "input_terminal_caps": input_terminal_caps,
+        "input_terminal_caps_removed": [],
+        "terminal_cap_forcefield": terminal_cap_forcefield or DEFAULT_TERMINAL_CAP_FORCEFIELD,
+        "terminal_cap_hydrogen_completion": None,
+        "operations": [],
+        "warnings": [],
+        "errors": [],
+        "statistics": {},
+        "disulfide_bonds": [],
+        "protonation_method": None,
+        "protonation_baseline_method": None,
+        "protonation_override_method": None,
+        "preserve_input_protonation": bool(preserve_input_protonation),
+    }
+    if deprecated_method_warning:
+        result.setdefault("warnings", [])
+        result["warnings"].append(deprecated_method_warning)
+
+    if input_terminal_caps:
+        described = ", ".join(f"{c['chain']}:{c['resnum']} {c['resname']}"
+                              for c in input_terminal_caps)
+        if strip_input_caps:
+            stripped = Path(str(pdb_file)).with_name(
+                Path(str(pdb_file)).stem + ".uncapped.pdb")
+            removal = strip_input_terminal_caps(pdb_file, stripped,
+                                                input_terminal_caps)
+            result["input_terminal_caps_removed"] = removal["removed"]
+            pdb_file = removal["output_file"]
+            logger.info(f"Removed input terminal cap(s): {described}")
+        else:
+            logger.info(f"Structure arrived with terminal cap(s): {described}")
+            result["warnings"].append(
+                f"Input carries terminal cap(s) {described}; they are kept and "
+                "counted as protein residues. Pass strip_input_caps=true to "
+                "simulate the chain uncapped.")
+
+    try:
+        explicit_protonation_states = _normalize_protonation_state_overrides(
+            protonation_states=protonation_states,
+            histidine_states=histidine_states,
+        )
+        resolved_n_terminal_cap, resolved_c_terminal_cap = _resolve_terminal_cap_settings(
+            cap_termini=cap_termini,
+            n_terminal_cap=n_terminal_cap,
+            c_terminal_cap=c_terminal_cap,
+        )
+    except ValueError as exc:
+        result["errors"].append(str(exc))
+        result["code"] = (
+            "invalid_terminal_cap"
+            if "terminal cap" in str(exc)
+            else "invalid_protonation_state"
+        )
+        return result
+    result["n_terminal_cap"] = resolved_n_terminal_cap
+    result["c_terminal_cap"] = resolved_c_terminal_cap
+    result["terminal_caps"] = {
+        "n_terminal": resolved_n_terminal_cap,
+        "c_terminal": resolved_c_terminal_cap,
+    }
+    
+    # Validate input file
+    input_path = Path(pdb_file)
+    if not input_path.is_file():
+        result["errors"].append(f"Input file not found: {pdb_file}")
+        logger.error(f"Input file not found: {pdb_file}")
+        return result
+    original_input_path = input_path
+    
+    # Generate output filenames:
+    # - *.pdbfixer.pdb: intermediate heavy-atom PDBFixer output.
+    # - *.clean.pdb: final agent-facing cleaned output, after Amber/protonation.
+    stem = input_path.stem
+    final_output_file = input_path.parent / f"{stem}.clean.pdb"
+    output_file = input_path.parent / f"{stem}.pdbfixer.pdb"
+    result["output_file"] = str(output_file)
+    result["final_output_file"] = str(final_output_file)
+    
+    method = str(missing_residue_method or "auto").strip().lower()
+    if method not in MISSING_RESIDUE_METHODS:
+        result["errors"].append(
+            f"missing_residue_method must be one of {list(MISSING_RESIDUE_METHODS)}, "
+            f"got {missing_residue_method!r}"
+        )
+        result["code"] = "invalid_missing_residue_method"
+        return result
+    if method == "none" and build_terminal_missing_residues:
+        result["errors"].append(
+            "missing_residue_method='none' cannot be combined with "
+            "build_terminal_missing_residues=True"
+        )
+        result["code"] = "invalid_missing_residue_method"
+        return result
+    # The positive request is authoritative. Keeping the legacy negative flag
+    # true at the same time previously made direct clean_protein callers ask for
+    # a tail and then silently delete it; prepare_complex already normalizes the
+    # pair this way.
+    if build_terminal_missing_residues:
+        ignore_terminal_missing_residues = False
+    result["missing_residue_method"] = method
+    result["missing_residue_method_requested"] = method
+
+    try:
+        decision = _resolve_missing_residue_method(
+            method,
+            input_path,
+            build_terminal_missing_residues=build_terminal_missing_residues,
+            build_window=build_window,
+        )
+        effective_method = decision["method"]
+        escalated_to_modeller = decision["escalated"]
+        repair_skipped_reason: Optional[str] = None
+        if decision.get("terminal_out_of_scope"):
+            terminal_summary = decision["terminal_summary"]
+            result["missing_residue_method_used"] = effective_method
+            result["code"] = "modeller_terminal_missing_residues_out_of_scope"
+            result["missing_residue_repair"] = {
+                "method": "modeller",
+                "method_requested": method,
+                "method_used": "modeller",
+                "status": "out_of_scope",
+                **terminal_summary,
+            }
+            result["errors"].append(
+                "Requested terminal segment exceeds the MODELLER repair scope: "
+                f"max segment length {terminal_summary['max_segment_length']}, "
+                "limit "
+                f"{MODELLER_MAX_TERMINAL_MISSING_RESIDUE_SEGMENT_LENGTH}. "
+                "Leave the terminus unresolved, narrow the requested range, or "
+                "provide a separately justified structural model."
+            )
+            return result
+        if method == "auto":
+            auto_summary = decision["summary"]
+            if decision["out_of_scope"]:
+                usability = decision["usability"]
+                if not usability["usable"]:
+                    reason_summary = (
+                        decision.get("terminal_summary")
+                        if (decision.get("terminal_summary") or {}).get(
+                            "total_residues")
+                        else auto_summary
+                    )
+                    recommendation = _missing_residue_auto_recommendation(
+                        reason_summary,
+                        usability,
+                    )
+                    result["missing_residue_method_used"] = "pdbfixer"
+                    result["missing_residue_method_escalated"] = False
+                    result["missing_residue_repair"] = {
+                        "method": "pdbfixer",
+                        "method_requested": "auto",
+                        "method_used": "pdbfixer",
+                        "escalated": False,
+                        "status": "out_of_scope",
+                        **reason_summary,
+                    }
+                    result["workflow_recommendation"] = recommendation
+                    result["recommended_next_action"] = recommendation[
+                        "recommended_next_action"
+                    ]
+                    result["recommended_next_skills"] = [
+                        "skills/md-prepare/SKILL.md",
+                    ]
+                    result["code"] = "missing_residues_require_modeller_license"
+                    result["errors"].append(
+                        "Requested missing residues exceed the PDBFixer repair "
+                        f"scope ({reason_summary['total_residues']} residue(s), "
+                        f"max segment {reason_summary['max_segment_length']}). "
+                        "Automatic MODELLER escalation is unavailable; run "
+                        "'export KEY_MODELLER10v8=<your license key>' in an "
+                        "MDClaw runtime with the modeller package installed, "
+                        "then create a new prep node with the same completed parent."
+                    )
+                    return result
+        result["missing_residue_method_used"] = effective_method
+        result["missing_residue_method_escalated"] = escalated_to_modeller
+
+        input_protonation_states = (
+            _extract_input_protonation_state_overrides(original_input_path)
+            if preserve_input_protonation else []
+        )
+        requested_protonation_states = _merge_input_protonation_state_overrides(
+            input_protonation_states,
+            explicit_protonation_states,
+        )
+        result["input_protonation_states_promoted"] = [
+            state
+            for state in requested_protonation_states
+            if state.get("input_state_preserved")
+        ]
+        result["preserve_input_protonation"] = bool(preserve_input_protonation)
+
+        # Rebuild internal gaps with MODELLER first when asked, so the rest of
+        # the cleaning runs on a chain that no longer has any. Doing it here
+        # rather than mid-flow keeps the terminal-cap bookkeeping below working
+        # on a single, final PDBFixer instance.
+        if effective_method == "modeller":
+            # Not only genuinely single-chain inputs reach here: a complex whose
+            # pre-pass could not probe or fuse falls back to this path chain by
+            # chain, and the declared bonds have to come with it. CYX naming and
+            # the MODELLER restraints are the same chemical contract, not two
+            # different intents.
+            repair = _repair_missing_residues_with_modeller(
+                input_path,
+                disulfide_pairs=disulfide_pairs,
+                build_terminal_missing_residues=build_terminal_missing_residues,
+                build_window=build_window,
+                replace_nonstandard_residues=replace_nonstandard_residues,
+            )
+            result["warnings"].extend(repair["warnings"])
+            if not repair["success"]:
+                if escalated_to_modeller and repair.get("code") in AUTO_REPAIR_SKIPPABLE_CODES:
+                    # Nobody asked for MODELLER: ``auto`` reached for it because
+                    # the gap exceeded PDBFixer's scope. When the repair cannot
+                    # even be numbered (1CEB: six SEQRES residues between author
+                    # 78 and 79), the honest result is the gap left open with a
+                    # warning, not a failed node the agent has to redo with
+                    # --missing-residue-method none.
+                    repair_skipped_reason = str(repair.get("code"))
+                    result["warnings"].append(
+                        "Automatic MODELLER repair was not applied: "
+                        + "; ".join(repair["errors"])
+                        + ". The internal gap is left open. To insist on the repair, pass "
+                        "--missing-residue-method modeller with a residue mapping that "
+                        "resolves the numbering."
+                    )
+                    result["missing_residue_method_used"] = "none"
+                    result["missing_residue_method_escalated"] = False
+                    effective_method = "none"
+                else:
+                    result["errors"].extend(repair["errors"])
+                    result["code"] = repair["code"]
+                    return result
+            if repair["applied"]:
+                if escalated_to_modeller:
+                    escalation_warning = (
+                        "Automatic missing-residue repair escalated from PDBFixer "
+                        "to MODELLER because the internal gaps exceeded the "
+                        "PDBFixer scope; the rebuilt coordinates are predicted."
+                    )
+                    result["warnings"].append(escalation_warning)
+                    repair["operation"]["warning"] = escalation_warning
+                repair["operation"].update({
+                    "method_requested": method,
+                    "method_used": "modeller",
+                    "escalated": escalated_to_modeller,
+                })
+                result["operations"].append(repair["operation"])
+                result["missing_residue_detection"] = repair["detection"]
+                result["missing_residue_repair"] = {
+                    "method": "modeller",
+                    "method_requested": method,
+                    "method_used": "modeller",
+                    "escalated": escalated_to_modeller,
+                    "status": "modeled",
+                    "model_file": repair["model_file"],
+                    "random_seed": repair["random_seed"],
+                    "template": repair["template"],
+                    "validation": repair["validation"],
+                    "contains_predicted_terminal_residues": bool(
+                        repair["operation"].get(
+                            "contains_predicted_terminal_residues")),
+                    **repair["summary"],
+                }
+                input_path = Path(repair["model_file"])
+                logger.info("Continuing from the MODELLER-repaired chain %s", input_path)
+
+        # Load structure
+        logger.info("Loading structure with PDBFixer")
+        # The other pieces of the selection ride along as extra chains while
+        # missing atoms are placed: PDBFixer minimizes the atoms it adds against
+        # everything it can see, and a piece cleaned alone cannot see the piece
+        # next to it (6KUY: TRP99's rebuilt indole landed 0.5 A from GLU185/
+        # PRO186 of the neighbouring range, 1e10 kJ/mol before minimization).
+        context_chain_ids: list[str] = []
+        # Set only when missing atoms were placed with the context in view; a
+        # piece with nothing missing still reports the context it was given.
+        context_placement = None
+        load_path = input_path
+        if context_pdb_files and input_path.suffix.lower() == ".pdb":
+            load_path, context_chain_ids = _input_with_completion_context(
+                input_path, context_pdb_files
+            )
+        fixer = PDBFixer(filename=str(load_path))
+
+        def _is_context(chain) -> bool:
+            return getattr(chain, "id", None) in context_chain_ids
+
+        # Get initial statistics
+        initial_chains = [c for c in fixer.topology.chains() if not _is_context(c)]
+        initial_residues = [r for r in fixer.topology.residues() if not _is_context(getattr(r, "chain", None))]
+        result["statistics"]["initial_chains"] = len(initial_chains)
+        result["statistics"]["initial_residues"] = len(initial_residues)
+        
+        result["operations"].append({
+            "step": "load_structure",
+            "status": "success",
+            "details": f"Loaded {len(initial_chains)} chain(s), {len(initial_residues)} residue(s)"
+        })
+        
+        # Step 1: Handle missing residues and terminal caps
+        logger.info("Finding missing residues")
+        fixer.findMissingResidues()
+        if context_chain_ids:
+            _chains = list(fixer.topology.chains())
+            fixer.missingResidues = {
+                key: residues for key, residues in fixer.missingResidues.items()
+                if not (isinstance(key, tuple) and key and isinstance(key[0], int)
+                        and key[0] < len(_chains) and _is_context(_chains[key[0]]))
+            }
+        num_missing_residues = len(fixer.missingResidues)
+        
+        # Get chain information for terminal handling
+        chains = list(fixer.topology.chains())
+        terminal_keys = _missing_residue_terminal_keys(fixer, chains)
+        
+        # Record what the reference sequence made visible. Without SEQRES
+        # PDBFixer has nothing to compare coordinates against and reports zero
+        # missing residues — indistinguishable, in the result, from a complete
+        # chain. Say which of the two it is.
+        reference_sequences = list(getattr(fixer, "sequences", None) or [])
+        reference_length = (
+            len(list(reference_sequences[0].residues))
+            if len(reference_sequences) == 1
+            else None
+        )
+        result.setdefault("missing_residue_detection", {
+            "reference_sequence_available": bool(reference_sequences),
+            "reference_sequence_chains": len(reference_sequences),
+            "reference_sequence_length": reference_length,
+            "modeled_residues": len(initial_residues),
+        })
+        if not reference_sequences and result["missing_residue_detection"].get(
+            "status"
+        ) != "detected":
+            result["missing_residue_detection"]["status"] = "not_detectable"
+            result["warnings"].append(
+                f"{input_path.name} carries no reference sequence (SEQRES), so "
+                "missing residues cannot be detected: a report of zero gaps here "
+                "means 'not checked', not 'none present'"
+            )
+            result["operations"].append({
+                "step": "missing_residues",
+                "status": "not_detectable",
+                "details": (
+                    "No reference sequence in the input; PDBFixer cannot tell "
+                    "modeled residues from missing ones"
+                ),
+            })
+        elif reference_sequences:
+            result["missing_residue_detection"]["status"] = "detected"
+
+        # The residue range, when one was requested, bounds what may be built:
+        # asking for 4-315 of a chain whose SEQRES runs to 317 must add residue
+        # 315 and not 316 or 317. Without the window the terminal switch rebuilds
+        # the whole overhang -- measured on 6W9C, 1-317 instead of the 4-315 that
+        # was asked for.
+        #
+        # Outside the terminal branch, because a chain cropped to several ranges
+        # has an internal gap that must be refused whatever the terminal switch
+        # says: the space between two ranges is the crystallisation partner the
+        # ranges took out, it has an anchor on each side, and building it back is
+        # what a fusion crop exists to prevent. Inside the branch this ran only
+        # when a terminus was being built, which is off by default.
+        if build_window is not None:
+            _trimmed = _restrict_missing_to_window(fixer, chains, build_window)
+            if _trimmed:
+                result["missing_residue_detection"]["window_trimmed"] = _trimmed
+
+        # Step 1a: Handle terminal missing residues
+        terminal_caps_requested = bool(resolved_n_terminal_cap or resolved_c_terminal_cap)
+        terminal_build_records = []
+        if not (ignore_terminal_missing_residues and not terminal_caps_requested):
+            # Building them is the requested branch; say so and say how many.
+            # Otherwise "the terminus was rebuilt" would have to be inferred
+            # from the absence of the warning that says it was not.
+            for key in list(fixer.missingResidues.keys()):
+                chain_idx, res_idx = key
+                chain = chains[chain_idx]
+                terminal_kind = terminal_keys.get(key)
+                if terminal_kind and build_terminal_missing_residues:
+                    terminal_build_records.append({
+                        "chain_index": chain_idx,
+                        "chain_id": str(getattr(chain, "id", chain_idx)),
+                        "position": res_idx,
+                        "location": (
+                            "n_terminal" if terminal_kind == "N"
+                            else "c_terminal"
+                        ),
+                        "anchor_count": 1,
+                        "coordinate_provenance": "predicted",
+                        "method": "pdbfixer",
+                        "residues": [str(name) for name in fixer.missingResidues[key]],
+                        "residue_count": len(fixer.missingResidues[key]),
+                    })
+        if ignore_terminal_missing_residues and not terminal_caps_requested:
+            # Remove terminal missing residues from the dictionary
+            keys_to_remove = []
+            terminal_records = []
+            for key in list(fixer.missingResidues.keys()):
+                chain_idx, res_idx = key
+                chain = chains[chain_idx]
+                terminal_kind = terminal_keys.get(key)
+                if terminal_kind:
+                    keys_to_remove.append(key)
+                    terminal_records.append({
+                        "chain_index": chain_idx,
+                        "chain_id": str(getattr(chain, "id", chain_idx)),
+                        "terminus": terminal_kind,
+                        "residue_count": len(fixer.missingResidues[key]),
+                    })
+            
+            for key in keys_to_remove:
+                del fixer.missingResidues[key]
+            
+            if keys_to_remove:
+                # Segments and residues are different numbers, and the second
+                # is the one that matters: 2 unresolved termini can be 77
+                # residues. Report both so an empty internal-gap list is not
+                # read as "the structure was complete".
+                terminal_residue_total = sum(
+                    record["residue_count"] for record in terminal_records
+                )
+                result["missing_residue_detection"]["terminal_excluded"] = {
+                    "segment_count": len(terminal_records),
+                    "total_residues": terminal_residue_total,
+                    "segments": terminal_records,
+                }
+                result["operations"].append({
+                    "step": "missing_residues",
+                    "status": "modified",
+                    "segment_count": len(terminal_records),
+                    "total_residues": terminal_residue_total,
+                    "segments": terminal_records,
+                    "details": (
+                        f"Found {num_missing_residues} missing residue segment(s); "
+                        f"left {terminal_residue_total} residue(s) in "
+                        f"{len(terminal_records)} unresolved terminus/termini unmodeled"
+                    ),
+                })
+                result["warnings"].append(
+                    f"Left {terminal_residue_total} terminal residue(s) in "
+                    f"{len(terminal_records)} segment(s) unmodeled; an unresolved "
+                    "terminus is disorder, not a gap to bridge"
+                )
+
+        if (method == "none" or repair_skipped_reason) and fixer.missingResidues:
+            skipped_records = _internal_missing_residue_records(
+                fixer.missingResidues,
+                chains,
+            )
+            skipped_summary = _missing_residue_summary(skipped_records)
+            fixer.missingResidues.clear()
+            skipped_status = "skipped_by_request" if method == "none" else "skipped_unresolvable"
+            result["missing_residue_repair"] = {
+                "method": "none",
+                "method_requested": method,
+                "method_used": "none",
+                "escalated": bool(repair_skipped_reason),
+                "status": skipped_status,
+                **({"reason_code": repair_skipped_reason} if repair_skipped_reason else {}),
+                **skipped_summary,
+            }
+            result["operations"].append({
+                "step": "missing_residues",
+                "status": skipped_status,
+                "details": (
+                    f"Left {skipped_summary['total_residues']} internal missing "
+                    + ("residue(s) unbuilt because missing_residue_method='none'"
+                       if method == "none" else
+                       f"residue(s) unbuilt because the automatic MODELLER repair could "
+                       f"not number them ({repair_skipped_reason})")
+                ),
+                **skipped_summary,
+            })
+            result["warnings"].append(
+                f"Left {skipped_summary['total_residues']} internal missing "
+                "residue(s) unbuilt by explicit request; the prepared topology "
+                "may contain separate polymer segments"
+            )
+        
+        # Step 1b: Add requested terminal caps. ``cap_termini=True`` resolves
+        # to the historical ACE+NME pair; explicit one-sided cap arguments
+        # can request only one terminus.
+        if terminal_caps_requested:
+            capped_chains = []
+            for chain_idx, chain in enumerate(chains):
+                chain_length = len(list(chain.residues()))
+                # A cap normally takes the terminal slot outright: asking for
+                # caps is asking for ACE/NME at the end of what was resolved,
+                # not for the unresolved tail to be modelled first. When the
+                # tail was asked for in its own right the two are both honoured
+                # instead, with the cap on the outside of the residues it caps
+                # -- otherwise a request to build residue 315 and cap the
+                # terminus would quietly build NME in its place.
+                keep_tail = build_terminal_missing_residues
+                if resolved_n_terminal_cap:
+                    tail = fixer.missingResidues.get((chain_idx, 0), []) if keep_tail else []
+                    fixer.missingResidues[chain_idx, 0] = [resolved_n_terminal_cap] + list(tail)
+                if resolved_c_terminal_cap:
+                    tail = (fixer.missingResidues.get((chain_idx, chain_length), [])
+                            if keep_tail else [])
+                    fixer.missingResidues[chain_idx, chain_length] = (
+                        list(tail) + [resolved_c_terminal_cap])
+                capped_chains.append(chain.id)
+            
+            result["operations"].append({
+                "step": "terminal_caps",
+                "status": "added_to_missing",
+                "n_terminal_cap": resolved_n_terminal_cap,
+                "c_terminal_cap": resolved_c_terminal_cap,
+                "details": (
+                    "Added requested terminal caps as missing residues for "
+                    f"{len(capped_chains)} chain(s): {capped_chains}"
+                ),
+            })
+            logger.info(
+                "Added terminal caps to missingResidues for chains %s: N=%s C=%s",
+                capped_chains,
+                resolved_n_terminal_cap,
+                resolved_c_terminal_cap,
+            )
+        
+        # Report remaining missing residues (excluding caps)
+        remaining_grouped = _classified_missing_residue_records(
+            fixer.missingResidues, chains, terminal_keys)
+        internal_missing_records = remaining_grouped["internal"]
+        terminal_missing_records = (
+            remaining_grouped["n_terminal"]
+            + remaining_grouped["c_terminal"]
+        )
+        missing_summary = _missing_residue_summary(internal_missing_records)
+        terminal_missing_summary = _missing_residue_summary(
+            terminal_missing_records)
+        internal_missing = [
+            f"Chain {record['chain_index']}, position {record['position']}: {record['residues']}"
+            for record in internal_missing_records
+        ]
+        
+        if (
+            effective_method == "pdbfixer"
+            and terminal_missing_summary["max_segment_length"]
+            > PDBFIXER_MAX_TERMINAL_MISSING_RESIDUE_SEGMENT_LENGTH
+        ):
+            result["missing_residue_repair"] = {
+                "method": "pdbfixer",
+                "method_requested": method,
+                "method_used": "pdbfixer",
+                "status": "out_of_scope",
+                "max_terminal_missing_residue_segment_length": (
+                    PDBFIXER_MAX_TERMINAL_MISSING_RESIDUE_SEGMENT_LENGTH),
+                **terminal_missing_summary,
+            }
+            result["code"] = "pdbfixer_terminal_missing_residues_out_of_scope"
+            result["errors"].append(
+                "Terminal missing residues exceed the PDBFixer repair scope: "
+                f"max segment length {terminal_missing_summary['max_segment_length']}, "
+                "limit "
+                f"{PDBFIXER_MAX_TERMINAL_MISSING_RESIDUE_SEGMENT_LENGTH}."
+            )
+            return result
+
+        if internal_missing:
+            result["operations"].append({
+                "step": "missing_residues",
+                "status": "will_model",
+                "count": len(internal_missing),
+                "segment_count": missing_summary["segment_count"],
+                "total_residues": missing_summary["total_residues"],
+                "max_segment_length": missing_summary["max_segment_length"],
+                "residues": internal_missing,
+                "segments": internal_missing_records,
+                "details": f"Found {len(internal_missing)} internal missing residue(s) to be modeled"
+            })
+            result.setdefault("missing_residue_repair", {}).update({
+                "method": "pdbfixer",
+                "method_requested": method,
+                "method_used": "pdbfixer",
+                "escalated": False,
+                "status": "within_scope",
+                "max_internal_missing_residues": PDBFIXER_MAX_INTERNAL_MISSING_RESIDUES,
+                "max_missing_residue_segment_length": PDBFIXER_MAX_MISSING_RESIDUE_SEGMENT_LENGTH,
+                **missing_summary,
+            })
+            if (
+                missing_summary["total_residues"] > PDBFIXER_MAX_INTERNAL_MISSING_RESIDUES
+                or missing_summary["max_segment_length"] > PDBFIXER_MAX_MISSING_RESIDUE_SEGMENT_LENGTH
+            ):
+                recommendation = _missing_residue_regeneration_recommendation(missing_summary)
+                result["missing_residue_repair"]["status"] = "out_of_scope"
+                result["missing_residue_repair"]["reason"] = recommendation["reason"]
+                result["workflow_recommendation"] = recommendation
+                result["recommended_next_action"] = recommendation["recommended_next_action"]
+                result["recommended_next_skills"] = [
+                    "skills/md-prepare/SKILL.md",
+                    "skills/modeller-predict/SKILL.md",
+                    "skills/boltz-predict/SKILL.md",
+                ]
+                result["code"] = "pdbfixer_missing_residues_out_of_scope"
+                result["errors"].append(
+                    "Internal missing residues exceed the PDBFixer repair scope: "
+                    f"{missing_summary['total_residues']} residue(s) total, "
+                    f"max segment length {missing_summary['max_segment_length']}."
+                )
+                return result
+        elif num_missing_residues == 0 and not terminal_caps_requested:
+            result["operations"].append({
+                "step": "missing_residues",
+                "status": "none_found",
+                "details": "No missing residues found"
+            })
+        
+        # Step 2: Handle non-standard residues
+        logger.info("Finding non-standard residues")
+        fixer.findNonstandardResidues()
+        num_nonstandard = len(fixer.nonstandardResidues)
+        
+        if num_nonstandard > 0:
+            # PDBFixer's nonstandardResidues is a list of (Residue, replacement_name)
+            # tuples, not a list of Residue objects — unpacking is mandatory.
+            nonstandard_info = [
+                f"{res.name}->{repl} (chain {res.chain.id}, pos {res.index})"
+                for res, repl in fixer.nonstandardResidues
+            ]
+            
+            if replace_nonstandard_residues:
+                fixer.replaceNonstandardResidues()
+                result["operations"].append({
+                    "step": "nonstandard_residues",
+                    "status": "replaced",
+                    "details": f"Replaced {num_nonstandard} non-standard residue(s): {nonstandard_info}"
+                })
+                logger.info(f"Replaced {num_nonstandard} non-standard residues")
+            else:
+                result["operations"].append({
+                    "step": "nonstandard_residues",
+                    "status": "kept",
+                    "details": f"Kept {num_nonstandard} non-standard residue(s): {nonstandard_info}"
+                })
+                result["warnings"].append(f"Non-standard residues kept: {nonstandard_info}")
+        else:
+            result["operations"].append({
+                "step": "nonstandard_residues",
+                "status": "none_found",
+                "details": "No non-standard residues found"
+            })
+        
+        # Step 3: Remove heterogens (preserving ACE/NME terminal caps, which
+        # PDBFixer.removeHeterogens would otherwise silently delete).
+        if remove_heterogens:
+            logger.info(f"Removing heterogens (keep_water={keep_water})")
+            het_summary = _remove_heterogens_preserving_caps(fixer, keep_water)
+            water_status = "kept" if keep_water else "removed"
+            details = (
+                f"Removed {het_summary['removed_count']} heterogen residue(s), "
+                f"water {water_status}"
+            )
+            if het_summary["preserved_caps"]:
+                details += (
+                    f"; preserved terminal caps {het_summary['preserved_caps']}"
+                )
+                result["preserved_terminal_caps"] = het_summary["preserved_caps"]
+            result["operations"].append({
+                "step": "remove_heterogens",
+                "status": "success",
+                "details": details,
+            })
+        else:
+            result["operations"].append({
+                "step": "remove_heterogens",
+                "status": "skipped",
+                "details": "Heterogen removal skipped"
+            })
+            result["warnings"].append("Heterogens not removed - may cause issues in MD simulation")
+        
+        # Step 4: Add missing atoms and residues (including ACE/NME caps)
+        if add_missing_atoms:
+            logger.info("Finding and adding missing atoms")
+            fixer.findMissingAtoms()
+            if context_chain_ids:
+                fixer.missingAtoms = {
+                    res: atoms for res, atoms in fixer.missingAtoms.items()
+                    if not _is_context(getattr(res, "chain", None))
+                }
+                fixer.missingTerminals = {
+                    res: atoms for res, atoms in fixer.missingTerminals.items()
+                    if not _is_context(getattr(res, "chain", None))
+                }
+            
+            num_missing_atoms = sum(len(atoms) for atoms in fixer.missingAtoms.values())
+            num_missing_terminals = sum(len(atoms) for atoms in fixer.missingTerminals.values())
+            num_missing_residues = len(fixer.missingResidues)
+            
+            # Always call addMissingAtoms if there are missing atoms OR missing residues (caps)
+            if num_missing_atoms > 0 or num_missing_terminals > 0 or num_missing_residues > 0:
+                # A fixed seed: PDBFixer places new atoms from random starts,
+                # and a prep must be reproducible from its arguments. With the
+                # other pieces in view the placement is chosen among a few
+                # seeds by its distance from them (see the helper).
+                if context_chain_ids:
+                    context_placement = _place_missing_atoms_against_context(fixer, _is_context)
+                else:
+                    fixer.addMissingAtoms(seed=0)
+                details_parts = []
+                if num_missing_atoms > 0:
+                    details_parts.append(f"{num_missing_atoms} missing atom(s)")
+                if num_missing_terminals > 0:
+                    details_parts.append(f"{num_missing_terminals} terminal atom(s)")
+                if num_missing_residues > 0:
+                    details_parts.append(f"{num_missing_residues} missing residue(s)")
+                result["operations"].append({
+                    "step": "missing_atoms",
+                    "status": "added",
+                    "details": f"Added {', '.join(details_parts)}"
+                })
+                logger.info(f"Added missing atoms/residues: {', '.join(details_parts)}")
+
+                if terminal_build_records:
+                    built_chains = {chain.id: list(chain.residues())
+                                    for chain in fixer.topology.chains()}
+                    for record in terminal_build_records:
+                        residues = [
+                            residue for residue in built_chains.get(record["chain_id"], [])
+                            if residue.name not in TERMINAL_CAP_RESIDUES
+                        ]
+                        count = record["residue_count"]
+                        selected = (
+                            residues[:count]
+                            if record["location"] == "n_terminal"
+                            else residues[-count:]
+                        )
+                        record["sites"] = [
+                            {
+                                "chain": record["chain_id"],
+                                "resnum": int(residue.id),
+                                "icode": str(
+                                    getattr(residue, "insertionCode", "") or ""
+                                ).strip(),
+                            }
+                            for residue in selected
+                        ]
+                    terminal_summary = _missing_residue_summary(
+                        terminal_build_records)
+                    result["missing_residue_detection"]["terminal_built"] = {
+                        "method": "pdbfixer",
+                        **terminal_summary,
+                    }
+                    combined_records = (
+                        internal_missing_records + terminal_build_records)
+                    combined_summary = _missing_residue_summary(combined_records)
+                    result.setdefault("missing_residue_repair", {}).update({
+                        "method": "pdbfixer",
+                        "method_requested": method,
+                        "method_used": "pdbfixer",
+                        "escalated": False,
+                        "status": "modeled",
+                        "contains_predicted_terminal_residues": True,
+                        **combined_summary,
+                    })
+                    result["warnings"].append(
+                        f"PDBFixer rebuilt {terminal_summary['total_residues']} "
+                        "terminal residue(s) in "
+                        f"{terminal_summary['segment_count']} one-anchor segment(s); "
+                        "these coordinates are predicted rather than measured"
+                    )
+            else:
+                result["operations"].append({
+                    "step": "missing_atoms",
+                    "status": "none_found",
+                    "details": "No missing atoms or residues found"
+                })
+        else:
+            result["operations"].append({
+                "step": "missing_atoms",
+                "status": "skipped",
+                "details": "Missing atom addition skipped"
+            })
+            result["warnings"].append("Missing atoms not added - structure may be incomplete")
+        
+        if context_chain_ids:
+            from openmm import app as _app
+            modeller = _app.Modeller(fixer.topology, fixer.positions)
+            modeller.delete([chain for chain in modeller.topology.chains() if _is_context(chain)])
+            fixer.topology, fixer.positions = modeller.topology, modeller.positions
+            operation = {
+                "step": "completion_context",
+                "status": "used",
+                "details": (
+                    f"{len(context_chain_ids)} chain(s) from the other pieces were present "
+                    "while missing atoms were placed, then removed"
+                ),
+            }
+            if context_placement:
+                operation.update(context_placement)
+                closest = context_placement["closest_contact_angstrom"]
+                if closest is not None and closest < 2.0:
+                    new_atom, other_atom = context_placement["closest_pair"]
+                    result["warnings"].append(
+                        f"Rebuilt atom {new_atom} sits {closest:.2f} A from {other_atom} after "
+                        f"{context_placement['attempts']} placement attempt(s); minimization "
+                        "has to resolve this contact"
+                    )
+            result["operations"].append(operation)
+
+        # Step 5: Detect and handle disulfide bonds
+        logger.info("Detecting disulfide bonds")
+        try:
+            # Collect CYS residues before creating disulfide bonds
+            cys_residues = set()
+            # Keyed with the insertion code: a bare (chain, resnum) makes A52 and
+            # A52A one entry, so the second overwrites the first and a declared
+            # bond can be formed on -- and CYX-named -- the wrong cysteine.
+            cys_by_chain_resnum = {}
+            for residue in fixer.topology.residues():
+                if residue.name == 'CYS':
+                    cys_residues.add(residue)
+                    try:
+                        residue_number = int(residue.id)
+                    except (TypeError, ValueError):
+                        residue_number = residue.index
+                    icode = str(getattr(residue, "insertionCode", "") or "").strip()
+                    cys_by_chain_resnum[(residue.chain.id, residue_number, icode)] = residue
+
+            disulfide_info = []
+            cyx_residues = set()  # Track residues to rename
+
+            if disulfide_pairs is not None:
+                # Use pre-defined disulfide pairs from Phase 1 analysis
+                logger.info(f"Using {len(disulfide_pairs)} pre-defined disulfide pair(s) from Phase 1")
+                for pair in disulfide_pairs:
+                    # Skip pairs marked as "don't form bond"
+                    if not pair.get("form_bond", True):
+                        logger.info(f"Skipping user-excluded disulfide: {pair}")
+                        continue
+
+                    sites = _disulfide_pair_sites(pair)
+                    if sites is None:
+                        raise ValueError(f"Invalid disulfide pair: {pair}")
+                    (chain1, resnum1, icode1), (chain2, resnum2, icode2) = sites
+
+                    # Shared resolver, so an artifact written without insertion
+                    # codes still resolves wherever only one residue answers to
+                    # the number, and an ambiguous one is refused rather than
+                    # guessed at.
+                    site1, why1 = resolve_residue_site(
+                        cys_by_chain_resnum, chain1, resnum1, icode1)
+                    site2, why2 = resolve_residue_site(
+                        cys_by_chain_resnum, chain2, resnum2, icode2)
+                    for problem in (why1, why2):
+                        if problem:
+                            result["warnings"].append(
+                                f"Declared disulfide endpoint unresolved: {problem}")
+                    res1 = cys_by_chain_resnum.get(site1) if site1 else None
+                    res2 = cys_by_chain_resnum.get(site2) if site2 else None
+
+                    if res1 and res2:
+                        sg1 = next(a for a in res1.atoms() if a.name == "SG")
+                        sg2 = next(a for a in res2.atoms() if a.name == "SG")
+                        if not any({a, b} == {sg1, sg2} for a, b in fixer.topology.bonds()):
+                            fixer.topology.addBond(sg1, sg2)
+                        bond_info = {
+                            "residue1": {
+                                "name": res1.name,
+                                "chain": res1.chain.id,
+                                "index": res1.index
+                            },
+                            "residue2": {
+                                "name": res2.name,
+                                "chain": res2.chain.id,
+                                "index": res2.index
+                            },
+                            "source": "user_specified"
+                        }
+                        disulfide_info.append(bond_info)
+                        cyx_residues.add(res1)
+                        cyx_residues.add(res2)
+                    else:
+                        result["warnings"].append(
+                            f"Could not find CYS pair: {chain1}:{resnum1} - {chain2}:{resnum2}"
+                        )
+
+                result["operations"].append({
+                    "step": "disulfide_bonds",
+                    "status": "user_specified",
+                    "details": f"Applied {len(disulfide_info)} user-specified disulfide bond(s)"
+                })
+            else:
+                # Auto-detect disulfide bonds using PDBFixer
+                # createDisulfideBonds() modifies topology in place and returns None
+                # It adds bonds between SG atoms of CYS residues that are close enough
+                fixer.topology.createDisulfideBonds(fixer.positions)
+
+                # Find disulfide bonds by scanning topology bonds for S-S bonds between CYS
+                for bond in fixer.topology.bonds():
+                    atom1, atom2 = bond
+                    # Check if this is an S-S bond between two CYS residues
+                    if (atom1.element.symbol == 'S' and atom2.element.symbol == 'S' and
+                        atom1.residue in cys_residues and atom2.residue in cys_residues):
+
+                        res1 = atom1.residue
+                        res2 = atom2.residue
+
+                        # Avoid duplicate entries (bond may be listed once)
+                        bond_key = tuple(sorted([res1.index, res2.index]))
+                        if any(tuple(sorted([d["residue1"]["index"], d["residue2"]["index"]])) == bond_key
+                               for d in disulfide_info):
+                            continue
+
+                        # Record bond information before renaming
+                        bond_info = {
+                            "residue1": {
+                                "name": res1.name,
+                                "chain": res1.chain.id,
+                                "index": res1.index
+                            },
+                            "residue2": {
+                                "name": res2.name,
+                                "chain": res2.chain.id,
+                                "index": res2.index
+                            },
+                            "source": "auto_detected"
+                        }
+                        disulfide_info.append(bond_info)
+                        cyx_residues.add(res1)
+                        cyx_residues.add(res2)
+
+                if disulfide_info:
+                    result["operations"].append({
+                        "step": "disulfide_bonds",
+                        "status": "detected",
+                        "details": f"Auto-detected {len(disulfide_info)} disulfide bond(s)"
+                    })
+                else:
+                    result["operations"].append({
+                        "step": "disulfide_bonds",
+                        "status": "none_found",
+                        "details": "No disulfide bonds detected"
+                    })
+
+            # Rename CYS -> CYX for Amber compatibility
+            for res in cyx_residues:
+                res.name = 'CYX'
+            # Renaming alone leaves an impossible CYX with a thiol proton.
+            # Remove both HG atoms and their bonds, retaining the new S-S bond.
+            thiol_hydrogens = [a for res in cyx_residues for a in res.atoms() if a.name == "HG"]
+            if thiol_hydrogens:
+                from openmm.app import Modeller
+                modeller = Modeller(fixer.topology, fixer.positions)
+                modeller.delete(thiol_hydrogens)
+                fixer.topology, fixer.positions = modeller.topology, modeller.positions
+
+            if disulfide_info:
+                result["disulfide_bonds"] = disulfide_info
+                logger.info(f"Applied {len(disulfide_info)} disulfide bonds, renamed {len(cyx_residues)} residues to CYX")
+            else:
+                logger.info("No disulfide bonds to apply")
+
+        except Exception as e:
+            result["warnings"].append(f"Disulfide bond detection failed: {str(e)}")
+            result["operations"].append({
+                "step": "disulfide_bonds",
+                "status": "error",
+                "details": f"Detection failed: {str(e)}"
+            })
+            logger.warning(f"Disulfide bond detection failed: {e}")
+        
+        # Step 6: Add hydrogens (protonation)
+        # NOTE: We skip PDBFixer hydrogen addition here and let the selected
+        # pdb2pqr baseline handle it instead. This prevents
+        # duplicate/conflicting hydrogens, especially at N-termini of internal
+        # chain breaks (e.g., NALA, NVAL, NGLN) which can fail Amber residue
+        # template matching at openmmforcefields build time.
+        if add_hydrogens:
+            logger.info(
+                "Skipping PDBFixer hydrogen addition; %s will handle it",
+                _protonation_method_label(standard_state_protonation),
+            )
+            result["operations"].append({
+                "step": "protonation",
+                "status": "deferred",
+                "details": (
+                    "Hydrogen addition deferred to "
+                    f"{_protonation_method_label(standard_state_protonation)} "
+                    f"(pH {ph} requested)"
+                )
+            })
+            # Store pH for potential future use
+            result["requested_ph"] = ph
+        else:
+            result["operations"].append({
+                "step": "protonation",
+                "status": "skipped",
+                "details": "Hydrogen addition skipped"
+            })
+            result["warnings"].append("Hydrogens not added - required for most MD simulations")
+        
+        # Step 7: Record if terminal caps were requested
+        result["cap_termini_required"] = terminal_caps_requested
+        
+        # Step 8: Write output file
+        logger.info(f"Writing cleaned structure to {output_file}")
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_file, 'w') as f:
+            PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
+        
+        # Get final statistics
+        final_residues = list(fixer.topology.residues())
+        final_atoms = list(fixer.topology.atoms())
+        result["statistics"]["final_residues"] = len(final_residues)
+        result["statistics"]["final_atoms"] = len(final_atoms)
+        
+        result["operations"].append({
+            "step": "write_output",
+            "status": "success",
+            "details": f"Wrote {len(final_atoms)} atoms to {output_file}"
+        })
+        
+        # Step 9: requested protonation baseline + Amber naming conversion.
+        # pdb2pqr is mandatory whenever hydrogens are requested; substituting
+        # pdb4amber+reduce would silently discard standard-versus-propka
+        # semantics. With hydrogen addition disabled, pdb4amber remains a
+        # naming-only path. Explicit residue variants are overlaid last.
+        logger.info(
+            "Applying requested protonation baseline: %s",
+            protonation_method,
+        )
+        amber_output_file = input_path.parent / f"{stem}.amber.pdb"
+        pdb2pqr_success = False
+        user_protonation_applied: list[dict[str, str]] = []
+
+        try:
+            # Primary method: pdb2pqr provides Amber naming and complete atom
+            # lists in both modes. Propka is opt-in through the selected
+            # baseline; leaving the titration flag unset keeps force-field
+            # standard states. User overrides are applied after either baseline.
+            if add_hydrogens and not pdb2pqr_wrapper.is_available():
+                result["code"] = "protonation_method_unavailable"
+                result["errors"].append(
+                    f"Requested protonation_method={protonation_method!r} requires "
+                    "pdb2pqr, but pdb2pqr is unavailable. The method was not "
+                    "applied; MDClaw will not substitute pdb4amber+reduce because "
+                    "that path ignores the requested protonation semantics."
+                )
+                return result
+
+            if pdb2pqr_wrapper.is_available() and add_hydrogens:
+                pqr_output = input_path.parent / f"{stem}.pqr"
+                # A failed retry must not validate a PDB left by an earlier
+                # invocation. Success means this invocation produced both
+                # outputs, not merely that the conventional filename exists.
+                pqr_output.unlink(missing_ok=True)
+                amber_output_file.unlink(missing_ok=True)
+
+                # Leaving --titration-state-method unset is pdb2pqr's own
+                # default, and is what standard state means: titratable side
+                # chains keep the force field's charge state rather than one
+                # predicted per residue. With propka on, "charged Asp/Glu/Lys/
+                # Arg, neutral His/Cys" can only be reached by naming every
+                # residue it moved, one at a time, through protonation_states.
+                #
+                # Built in one piece on purpose. Splicing the titration flags
+                # into this list by index put them between --ffout and its
+                # value, which silently changed the output format and left CYX
+                # residues without their hydrogens.
+                if standard_state_protonation:
+                    logger.info("Using pdb2pqr standard states (propka not run)")
+                    titration_args = []
+                else:
+                    logger.info(f"Using pdb2pqr with propka for pH {ph}")
+                    titration_args = ["--titration-state-method", "propka",
+                                      "--with-ph", str(ph)]
+
+                # Deposit hydrogens (NMR models) come through PDBFixer, and one
+                # pdb2pqr has no template for aborts the whole structure: 1AH9's
+                # GLU 3 carries a carboxyl HE2 ("Found gap in biomolecule
+                # structure for atom HE2 GLU 3", 092_soluble_1ah9, campaign
+                # v2). pdb2pqr rebuilds every hydrogen and propka ignores them;
+                # input protonation, when preserved, was read from the original
+                # input above and is re-applied afterwards. Cap hydrogens are
+                # completed below and stay.
+                pdb2pqr_input_file = output_file
+                heavy_only = _without_noncap_hydrogens(output_file)
+                if heavy_only is not None:
+                    pdb2pqr_input_file, removed_h = heavy_only
+                    result["operations"].append({
+                        "step": "input_hydrogens_removed_for_pdb2pqr",
+                        "status": "success",
+                        "details": f"{removed_h} deposit hydrogen(s) removed; pdb2pqr rebuilds them",
+                    })
+
+                # pdb2pqr cannot complete ACE/NME hydrogens itself and
+                # refuses the whole structure over the non-integral cap charge
+                # that leaves behind. Hand it caps it can charge to zero.
+                cap_prep = _prepare_terminal_caps_for_pdb2pqr(
+                    pdb2pqr_input_file,
+                    forcefield_name=terminal_cap_forcefield,
+                    ph=ph,
+                )
+                result["warnings"].extend(cap_prep.get("warnings", []))
+                if not cap_prep.get("success"):
+                    # Running pdb2pqr anyway would abort on the cap charge and
+                    # report it as a protonation failure, hiding the real cause.
+                    result["errors"].extend(cap_prep.get("errors", []))
+                    result["code"] = cap_prep.get(
+                        "code", "terminal_cap_hydrogen_completion_failed")
+                    result["operations"].append({
+                        "step": "terminal_cap_pdb2pqr_preparation",
+                        "status": "error",
+                        "details": "; ".join(cap_prep.get("errors", [])),
+                    })
+                    return result
+                if cap_prep.get("output_file"):
+                    pdb2pqr_input_file = Path(cap_prep["output_file"])
+                    result["operations"].append({
+                        "step": "terminal_cap_pdb2pqr_preparation",
+                        "status": "success",
+                        "cap_hydrogens_added": cap_prep["cap_hydrogens_added"],
+                        "cap_atoms_renamed": cap_prep["cap_atoms_renamed"],
+                        "resnames_restored": cap_prep.get("resnames_restored"),
+                    })
+
+                # pdb2pqr's debumping rotates the side chain of any residue
+                # whose added hydrogens bump, and sees only this piece: it
+                # turned the TRP99 ring that PDBFixer had placed clear of the
+                # neighbouring range straight back into it (an 8 A move, 1.3 A
+                # from GLU185; 6KUY). When missing atoms were placed with the
+                # other pieces in view, the placement stands and the remaining
+                # hydrogen bumps are left to minimization. Handing pdb2pqr the
+                # neighbours instead fails on a low-resolution deposit's own
+                # truncated side chains ("Couldn't rebuild HD1 in TYR 98").
+                keep_placement = bool(context_placement)
+                pdb2pqr_args = [
+                    str(pdb2pqr_input_file),
+                    str(pqr_output),
+                    "--ff", "AMBER",
+                    "--ffout", "AMBER",
+                    *titration_args,
+                    "--pdb-output", str(amber_output_file),
+                    "--keep-chain",
+                    "--drop-water",
+                    *(["--nodebump"] if keep_placement else []),
+                ]
+
+                try:
+                    pdb2pqr_wrapper.run(pdb2pqr_args)
+
+                    if keep_placement:
+                        result["operations"].append({
+                            "step": "protonation_debump",
+                            "status": "skipped",
+                            "details": (
+                                "pdb2pqr ran with --nodebump: missing atoms were placed with "
+                                "the neighbouring pieces in view, which pdb2pqr cannot see"
+                            ),
+                        })
+
+                    if amber_output_file.exists():
+                        if requested_protonation_states:
+                            protonation_result = _apply_protonation_states_with_modeller(
+                                amber_output_file,
+                                requested_protonation_states,
+                                ph=ph,
+                            )
+                            if not protonation_result["success"]:
+                                result["errors"].extend(protonation_result["errors"])
+                                result["warnings"].extend(protonation_result["warnings"])
+                                result["code"] = "protonation_state_override_failed"
+                                return result
+                            user_protonation_applied = protonation_result["applied_states"]
+                            his_states = _extract_histidine_states(amber_output_file)
+                            detected_protonation = _extract_non_default_protonation_states(
+                                amber_output_file
+                            )
+                            reported_protonation = _merge_protonation_states(
+                                detected_protonation,
+                                user_protonation_applied,
+                            )
+                            baseline_method = _protonation_method_label(
+                                standard_state_protonation)
+                            result["operations"].append({
+                                "step": "protonation",
+                                "status": "success",
+                                "method": baseline_method,
+                                "baseline_method": baseline_method,
+                                "override_method": "openmm_modeller_user_states",
+                                "ph": ph,
+                                "preserve_input_protonation": bool(
+                                    preserve_input_protonation),
+                                "histidine_states": his_states,
+                                "protonation_states": reported_protonation,
+                            })
+                            result["protonation_method"] = baseline_method
+                            result["protonation_baseline_method"] = baseline_method
+                            result["protonation_override_method"] = (
+                                "openmm_modeller_user_states")
+                            result["protonation_states"] = reported_protonation
+                            logger.info(
+                                f"Applied {len(user_protonation_applied)} user-specified "
+                                "residue protonation state(s)"
+                            )
+                        else:
+                            his_states = _extract_histidine_states(amber_output_file)
+                            detected_protonation = _extract_non_default_protonation_states(
+                                amber_output_file
+                            )
+                            result["operations"].append({
+                                "step": "protonation",
+                                "status": "success",
+                                "method": _protonation_method_label(standard_state_protonation),
+                                "baseline_method": _protonation_method_label(
+                                    standard_state_protonation),
+                                "override_method": None,
+                                "ph": ph,
+                                "preserve_input_protonation": bool(
+                                    preserve_input_protonation),
+                                "histidine_states": his_states,
+                                "protonation_states": detected_protonation,
+                            })
+                            result["protonation_method"] = _protonation_method_label(
+                                standard_state_protonation)
+                            result["protonation_baseline_method"] = (
+                                result["protonation_method"])
+                            result["protonation_states"] = detected_protonation
+                            logger.info(
+                                "%s protonation complete: %d histidine states determined",
+                                protonation_method,
+                                len(his_states),
+                            )
+
+                        result["output_file"] = str(amber_output_file)
+                        result["pdbfixer_output"] = str(output_file)
+                        result["histidine_states"] = his_states
+                        pdb2pqr_success = True
+                        if his_states:
+                            logger.info(f"Histidine states: {his_states}")
+                    else:
+                        raise RuntimeError("pdb2pqr did not create output PDB file")
+
+                except Exception as pdb2pqr_error:
+                    result["code"] = "protonation_method_failed"
+                    result["errors"].append(
+                        f"Requested protonation_method={protonation_method!r} "
+                        f"failed in pdb2pqr: {pdb2pqr_error}. MDClaw will not "
+                        "substitute pdb4amber+reduce because it ignores the "
+                        "requested protonation semantics."
+                    )
+                    return result
+
+            # With hydrogen rebuilding explicitly disabled, pdb4amber is only
+            # an Amber-name converter. A requested protonation method never
+            # reaches this branch: unavailable/failed pdb2pqr returns above
+            # rather than silently substituting geometry-based ``reduce``.
+            if not pdb2pqr_success:
+                reduce_flag = []
+
+                if not pdb4amber_wrapper.is_available():
+                    raise RuntimeError("Neither pdb2pqr nor pdb4amber available for Amber conversion")
+
+                pdb4amber_wrapper.run([
+                    "-i", str(output_file),
+                    "-o", str(amber_output_file),
+                    *reduce_flag,
+                    "-l", str(input_path.parent / f"{stem}.pdb4amber.log")
+                ])
+
+                if amber_output_file.exists():
+                    # pdb4amber renumbers residues (it makes numbering continuous
+                    # across chains, e.g. chain B 1-99 -> 215-430). That silently
+                    # invalidates every site-keyed input (protonation_states /
+                    # histidine_states keyed by chain:resnum, detected PTM resnum).
+                    # The PDBFixer output (output_file) still carries the original
+                    # numbering and the same residue order, so restore it before
+                    # any site-keyed step runs. Atoms/coords/H are untouched.
+                    restored = restore_residue_numbering_from_reference(
+                        amber_output_file, output_file
+                    )
+                    if restored is None:
+                        result["warnings"].append(
+                            "Could not restore original residue numbering after "
+                            "pdb4amber (residue count changed); site-keyed inputs "
+                            "may not match."
+                        )
+                    op = {
+                        "step": "protonation",
+                        "status": "success",
+                        "method": "disabled",
+                        "baseline_method": "disabled",
+                        "override_method": None,
+                        "details": "Hydrogen/protonation assignment was disabled",
+                    }
+                    if requested_protonation_states:
+                        protonation_result = _apply_protonation_states_with_modeller(
+                            amber_output_file,
+                            requested_protonation_states,
+                            ph=ph,
+                        )
+                        if not protonation_result["success"]:
+                            result["errors"].extend(protonation_result["errors"])
+                            result["warnings"].extend(protonation_result["warnings"])
+                            result["code"] = "protonation_state_override_failed"
+                            return result
+                        user_protonation_applied = protonation_result["applied_states"]
+                        his_states = _extract_histidine_states(amber_output_file)
+                        detected_protonation = _extract_non_default_protonation_states(
+                            amber_output_file
+                        )
+                        reported_protonation = _merge_protonation_states(
+                            detected_protonation,
+                            user_protonation_applied,
+                        )
+                        op.update({
+                            "override_method": "openmm_modeller_user_states",
+                            "ph": ph,
+                            "histidine_states": his_states,
+                            "protonation_states": reported_protonation,
+                        })
+                        result["protonation_method"] = "disabled"
+                        result["protonation_baseline_method"] = "disabled"
+                        result["protonation_override_method"] = (
+                            "openmm_modeller_user_states")
+                        result["protonation_states"] = reported_protonation
+                        result["histidine_states"] = his_states
+                    else:
+                        detected_protonation = _extract_non_default_protonation_states(
+                            amber_output_file
+                        )
+                        op["protonation_states"] = detected_protonation
+                        result["protonation_states"] = detected_protonation
+                    result["operations"].append(op)
+                    result["output_file"] = str(amber_output_file)
+                    result["pdbfixer_output"] = str(output_file)
+                    if not requested_protonation_states:
+                        result["protonation_method"] = "disabled"
+                        result["protonation_baseline_method"] = "disabled"
+                    logger.info(f"pdb4amber conversion successful: {amber_output_file}")
+                else:
+                    raise RuntimeError("pdb4amber did not create output file")
+
+        except Exception as e:
+            error_msg = f"Amber conversion failed: {str(e)}"
+            result["warnings"].append(error_msg)
+            result["operations"].append({
+                "step": "protonation",
+                "status": "error",
+                "details": error_msg
+            })
+            logger.warning(error_msg)
+            # Keep the PDBFixer output as the final output if conversion fails
+            result["warnings"].append("Using PDBFixer output without Amber naming convention conversion")
+
+        # Step 10: Complete terminal-cap hydrogens, scoped to ACE/NME caps.
+        # Topology generation intentionally does no generic H repair; capped
+        # peptides must be hydrogen-complete before they leave prep.
+        output_for_cap_completion = result.get("output_file")
+        if output_for_cap_completion:
+            expected_caps = {
+                cap
+                for cap in (resolved_n_terminal_cap, resolved_c_terminal_cap)
+                if cap
+            }
+            cap_residues_present = (
+                _pdb_residue_names(output_for_cap_completion) & TERMINAL_CAP_RESIDUES
+            )
+            if expected_caps or cap_residues_present:
+                cap_h_result = _complete_terminal_cap_hydrogens_with_modeller(
+                    output_for_cap_completion,
+                    expected_caps=expected_caps,
+                    forcefield_name=terminal_cap_forcefield,
+                    ph=ph,
+                )
+                result["terminal_cap_hydrogen_completion"] = cap_h_result
+                result["warnings"].extend(cap_h_result.get("warnings", []))
+                if not cap_h_result["success"]:
+                    result["errors"].extend(cap_h_result.get("errors", []))
+                    result["code"] = cap_h_result.get(
+                        "code",
+                        "terminal_cap_hydrogen_completion_failed",
+                    )
+                    return result
+                if not cap_h_result.get("skipped"):
+                    result["output_file"] = cap_h_result["output_file"]
+                    result["terminal_cap_forcefield"] = cap_h_result.get("forcefield")
+                    result["operations"].append({
+                        "step": "terminal_cap_hydrogen_completion",
+                        "status": "success",
+                        "method": "openmm_modeller",
+                        "forcefield": cap_h_result.get("forcefield"),
+                        "forcefield_xml": cap_h_result.get("forcefield_xml"),
+                        "n_terminal_cap": resolved_n_terminal_cap,
+                        "c_terminal_cap": resolved_c_terminal_cap,
+                        "cap_residues_present": cap_h_result.get("cap_residues_present", []),
+                        "cap_hydrogens_added": cap_h_result.get("cap_hydrogens_added", 0),
+                    })
+
+        current_output = Path(str(result.get("output_file") or ""))
+        if current_output.is_file() and current_output.resolve() != final_output_file.resolve():
+            shutil.copy2(current_output, final_output_file)
+            result["published_from"] = str(current_output)
+            result["output_file"] = str(final_output_file)
+            result["statistics"]["final_atoms"] = _pdb_atom_count(final_output_file)
+            result["statistics"]["final_hydrogens"] = _pdb_hydrogen_count(
+                final_output_file
+            )
+
+        # Build structured provenance summary at top level
+        # (operations[] is kept for full detail, summary for quick access)
+        operations = result.get("operations", [])
+        # The structure was loaded, completed and written through PDBFixer
+        # above; a report cites the software it can see recorded here.
+        provenance = {"pdbfixer_version": installed_version("pdbfixer")}
+        for op in operations:
+            step = op.get("step", "")
+            if step == "missing_residues" and op.get("status") == "will_model":
+                provenance["missing_residues_modeled"] = op.get("residues", [])
+                provenance["missing_residues_count"] = op.get("count", 0)
+            elif step == "nonstandard_residues" and op.get("status") == "replaced":
+                provenance["nonstandard_residues_replaced"] = op.get("details", "")
+            elif step == "protonation" and op.get("status") == "success":
+                provenance["protonation_method"] = op.get("method", "")
+                provenance["protonation_baseline_method"] = op.get(
+                    "baseline_method", op.get("method", ""))
+                provenance["protonation_override_method"] = op.get(
+                    "override_method")
+                provenance["preserve_input_protonation"] = bool(
+                    op.get("preserve_input_protonation", False))
+                provenance["protonation_ph"] = op.get("ph")
+                if op.get("histidine_states"):
+                    provenance["histidine_states"] = op["histidine_states"]
+                if op.get("protonation_states"):
+                    provenance["protonation_states"] = op["protonation_states"]
+            elif step == "disulfide_bonds":
+                if op.get("status") in ("success", "modified"):
+                    provenance["disulfide_bonds_applied"] = True
+                    provenance["disulfide_bonds_details"] = op.get("details", "")
+                elif op.get("status") == "none_found":
+                    provenance["disulfide_bonds_applied"] = False
+            elif step == "terminal_caps" and op.get("status") == "added_to_missing":
+                provenance["n_terminal_cap"] = op.get("n_terminal_cap")
+                provenance["c_terminal_cap"] = op.get("c_terminal_cap")
+                provenance["terminal_capping_recorded"] = True
+            elif step == "terminal_cap_hydrogen_completion" and op.get("status") == "success":
+                provenance["terminal_cap_hydrogen_completion_method"] = op.get("method")
+                provenance["terminal_cap_forcefield"] = op.get("forcefield")
+                provenance["terminal_cap_forcefield_xml"] = op.get("forcefield_xml")
+                provenance["terminal_cap_hydrogens_added"] = op.get("cap_hydrogens_added", 0)
+        result["provenance"] = provenance
+
+        result["success"] = True
+        logger.info(f"Successfully cleaned protein structure: {result['output_file']}")
+        
+    except Exception as e:
+        error_msg = f"Error during protein cleaning: {type(e).__name__}: {str(e)}"
+        result["errors"].append(error_msg)
+        logger.error(error_msg)
+        
+        # Try to provide helpful context for common errors
+        if "topology" in str(e).lower():
+            result["errors"].append("Hint: The input file may have structural issues. Try using split_molecules first.")
+        elif "residue" in str(e).lower():
+            result["errors"].append("Hint: There may be unusual residues in the structure. Check for modified amino acids.")
+        elif "atom" in str(e).lower():
+            result["errors"].append("Hint: Atom naming or connectivity issues detected. Verify the input structure.")
+    
+    return result
+
+
+def _complete_nucleic_heavy_atoms(input_path) -> tuple[Path, dict]:
+    """Add the heavy atoms a nucleotide is missing; never build residues.
+
+    Returns the file to continue from (the input when nothing was missing)
+    and ``{"added": {"DG201": ["O5'", "C5'"], ...}, "completed_file": ...}``.
+    """
+    input_path = Path(input_path)
+    fixer = PDBFixer(filename=str(input_path))
+    fixer.findMissingResidues()
+    fixer.missingResidues = {}
+    fixer.findMissingAtoms()
+    added = {
+        f"{residue.name}{residue.id}": sorted(atom.name for atom in atoms)
+        for residue, atoms in fixer.missingAtoms.items()
+    }
+    if not added:
+        return input_path, {"added": {}}
+    fixer.missingTerminals = {}
+    fixer.addMissingAtoms(seed=0)
+    completed = input_path.with_name(f"{input_path.stem}.completed.pdb")
+    with completed.open("w") as handle:
+        PDBFile.writeFile(fixer.topology, fixer.positions, handle, keepIds=True)
+    return completed, {"added": added, "completed_file": str(completed)}
+
+
+def _prepare_standard_nucleic(
+    nucleic_file: str,
+    *,
+    nucleic_subtype: str | None,
+    ph: float,
+) -> dict:
+    """Rebuild hydrogens for a standard DNA/RNA chain with OpenMM Modeller."""
+    input_path = Path(nucleic_file).resolve()
+    output_file = input_path.with_name(f"{input_path.stem}.nucleic_h.pdb")
+    result: dict[str, Any] = {
+        "success": False,
+        "input_file": str(input_path),
+        "output_file": str(output_file),
+        "nucleic_subtype": nucleic_subtype,
+        "hydrogen_rebuild_method": "openmm_modeller",
+        "nucleic_forcefield_xml": None,
+        "hydrogens_added": 0,
+        "atom_count_before": 0,
+        "atom_count_after": 0,
+        "hydrogen_count_before": 0,
+        "hydrogen_count_after": 0,
+        "warnings": [],
+        "errors": [],
+        "operations": [],
+    }
+
+    residues_before = _read_pdb_unique_residues(input_path)
+    residue_names = {str(r["resname"]).upper() for r in residues_before}
+    nucleic_info = classify_nucleic_residues(residue_names)
+    subtype = (nucleic_subtype or nucleic_info.get("subtype") or "").lower()
+    result["nucleic_subtype"] = subtype or nucleic_subtype
+
+    if nucleic_info.get("modified_residue_names") or subtype not in {"dna", "rna"}:
+        result["code"] = "unsupported_modified_nucleic_residue"
+        result["errors"].append(
+            f"{MODIFIED_NUCLEIC_UNSUPPORTED_MESSAGE} "
+            f"Residues={sorted(residue_names)} subtype={subtype or 'unknown'}."
+        )
+        return result
+
+    if subtype == "dna":
+        forcefield_xml = "amber/DNA.OL15.xml"
+    else:
+        forcefield_xml = "amber/RNA.OL3.xml"
+    result["nucleic_forcefield_xml"] = forcefield_xml
+
+    try:
+        from openmm.app import ForceField, Modeller
+    except Exception as exc:  # noqa: BLE001
+        result["code"] = "nucleic_hydrogen_rebuild_unavailable"
+        result["errors"].append(
+            f"OpenMM Modeller/ForceField is required for standard nucleic "
+            f"hydrogen rebuild: {type(exc).__name__}: {exc}"
+        )
+        return result
+
+    try:
+        result["atom_count_before"] = _pdb_atom_count(input_path)
+        result["hydrogen_count_before"] = _pdb_hydrogen_count(input_path)
+        modeller_input_path, normalization_report = _normalize_nucleic_input_for_openmm(
+            input_path,
+            forcefield_xml,
+        )
+        result["input_normalization"] = normalization_report
+        if normalization_report.get("applied"):
+            result["operations"].append({
+                "step": "nucleic_input_normalization",
+                "status": "success",
+                "method": "openmm_terminal_template_compatibility",
+                "code": normalization_report.get("code"),
+                "removed_atom_count": normalization_report.get("removed_atom_count", 0),
+                "normalized_file": normalization_report.get("normalized_file"),
+            })
+            result["warnings"].append(
+                "Removed unsupported 5' terminal phosphate atom(s) from standard "
+                "nucleic input to match OpenMM Amber terminal templates."
+            )
+        # A deposit's terminal nucleotide can be truncated (1QN5 chain C
+        # starts at a DG without C5'/O5'); OpenMM's DG5 template then matches
+        # nothing and the rebuild dies with "No template found for residue 0"
+        # (053_nucleic_1qn5, campaign v2: six prep nodes). PDBFixer knows the
+        # nucleotide templates, so missing heavy atoms are completed first.
+        modeller_input_path, completion = _complete_nucleic_heavy_atoms(modeller_input_path)
+        result["missing_atom_completion"] = completion
+        if completion.get("added"):
+            result["operations"].append({
+                "step": "nucleic_missing_atoms",
+                "status": "added",
+                "details": f"Added missing heavy atoms: {completion['added']}",
+                "completed_file": completion.get("completed_file"),
+            })
+            result["warnings"].append(
+                "Completed missing heavy atoms before the hydrogen rebuild: "
+                + "; ".join(f"{res} {atoms}" for res, atoms in completion["added"].items())
+            )
+        pdb = PDBFile(str(modeller_input_path))
+        forcefield = ForceField(forcefield_xml)
+        modeller = Modeller(pdb.topology, pdb.positions)
+        variants = modeller.addHydrogens(forcefield, pH=ph)
+        with output_file.open("w") as handle:
+            PDBFile.writeFile(
+                modeller.topology,
+                modeller.positions,
+                handle,
+                keepIds=True,
+            )
+    except ValueError as exc:
+        result["code"] = "nucleic_hydrogen_rebuild_failed"
+        result["errors"].append(
+            f"Standard nucleic hydrogen rebuild failed: {type(exc).__name__}: {exc}"
+        )
+        return result
+    except Exception as exc:  # noqa: BLE001
+        code = (
+            "nucleic_hydrogen_rebuild_unavailable"
+            if "Could not locate file" in str(exc)
+            else "nucleic_hydrogen_rebuild_failed"
+        )
+        result["code"] = code
+        result["errors"].append(
+            f"Standard nucleic hydrogen rebuild failed: {type(exc).__name__}: {exc}"
+        )
+        return result
+
+    result["atom_count_after"] = _pdb_atom_count(output_file)
+    result["hydrogen_count_after"] = _pdb_hydrogen_count(output_file)
+    result["hydrogens_added"] = max(
+        0,
+        result["hydrogen_count_after"] - result["hydrogen_count_before"],
+    )
+    result["variants"] = [
+        str(v) if v is not None else None
+        for v in variants
+    ]
+
+    residues_after = _read_pdb_unique_residues(output_file)
+    if residues_after != residues_before:
+        result["code"] = "nucleic_hydrogen_rebuild_failed"
+        result["errors"].append(
+            "Nucleic hydrogen rebuild changed residue identity/order."
+        )
+        return result
+    removed_atom_count = int(
+        (result.get("input_normalization") or {}).get("removed_atom_count") or 0
+    )
+    min_expected_atom_count = result["atom_count_before"] - removed_atom_count
+    if result["atom_count_after"] < min_expected_atom_count:
+        result["code"] = "nucleic_hydrogen_rebuild_failed"
+        result["errors"].append(
+            "Nucleic hydrogen rebuild removed atom records unexpectedly."
+        )
+        return result
+    if (
+        result["hydrogen_count_before"] == 0
+        and result["hydrogen_count_after"] == 0
+    ):
+        result["code"] = "nucleic_hydrogen_rebuild_failed"
+        result["errors"].append(
+            "Nucleic hydrogen rebuild completed without adding hydrogens."
+        )
+        return result
+
+    result["operations"].append({
+        "step": "nucleic_hydrogen_rebuild",
+        "status": "success",
+        "method": "openmm_modeller",
+        "forcefield_xml": forcefield_xml,
+        "ph": ph,
+        "hydrogens_added": result["hydrogens_added"],
+    })
+    result["success"] = True
+    return result

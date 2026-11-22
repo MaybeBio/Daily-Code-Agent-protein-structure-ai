@@ -1,0 +1,245 @@
+"""Use the existing bounded container lifecycle, queue, recovery and scientific snapshots."""
+
+import json
+from pathlib import Path
+
+from ..prepared_container import PreparedContainerBackend
+from ..store import Store
+from .bindings import trained_model
+from .cache_environment import torch_cache_arguments
+from .runtime import configuration, readiness
+from .specs import PROGRAMS
+
+FILES = (
+    "runner.py",
+    "native_io.py",
+    "native_resources.py",
+    "native_deepternary.py",
+    "native_boltz.py",
+    "native_reinvent.py",
+    "native_ligandmpnn.py",
+    "native_boltzgen.py",
+    "native_scaffold.py",
+    "native_structure.py",
+    "native_openmm.py",
+    "native_apbs.py",
+    "native_chemprop.py",
+    "native_validation.py",
+    "native_plip.py",
+    "native_protein_interface.py",
+    "plip_interface_source.py",
+    "plip_coordinates.py",
+    "plip_contacts.py",
+    "recipes.json",
+)
+
+
+class ScientificBackend(PreparedContainerBackend):
+    def network_mode(self, job):
+        if self.program == "mol1" and job.request.payload.allow_network:
+            return "bridge"
+        return super().network_mode(job)
+
+    def __init__(self, settings, identifier):
+        self.program = identifier
+        root = Path(__file__).parent.parent
+        shared = {}
+        if identifier == "mol1":
+            shared.update(
+                {
+                    "native_mol1.py": Path(__file__).with_name("native_mol1.py"),
+                    "native_mol1_bonds.py": Path(__file__).with_name("native_mol1_bonds.py"),
+                    "native_mol1_results.py": Path(__file__).with_name("native_mol1_results.py"),
+                    "native_mol1_confidence.py": Path(__file__).with_name(
+                        "native_mol1_confidence.py"
+                    ),
+                }
+            )
+        if identifier == "boltzgen":
+            shared["native_binder_checkpoint.py"] = Path(__file__).with_name(
+                "native_binder_checkpoint.py"
+            )
+        if identifier == "boltz":
+            shared["native_alignment_files.py"] = root / "alignment_files.py"
+            shared["native_boltz_inputs.py"] = Path(__file__).with_name("native_boltz_inputs.py")
+        if identifier in {"plip", "apbs", "openmm", "ligandmpnn"}:
+            shared["receptor_native_io.py"] = root / "receptors/native_io.py"
+        if identifier == "ligandmpnn":
+            shared["native_components.py"] = Path(__file__).with_name("native_components.py")
+            shared["ligandmpnn_review.py"] = Path(__file__).with_name("ligandmpnn_review.py")
+        if identifier == "reinvent":
+            shared["native_reinvent_scope.py"] = Path(__file__).with_name(
+                "native_reinvent_scope.py"
+            )
+            shared["native_generated_molecule.py"] = Path(__file__).with_name(
+                "native_generated_molecule.py"
+            )
+            shared["molfile_stereo.py"] = root / "chemistry/molfile_stereo.py"
+        if identifier in {"openmm", "openfe", "gromacs"}:
+            names = {
+                "openmm": (
+                    "md_input",
+                    "md_system",
+                    "md_analysis",
+                    "dynamics",
+                    "md_outputs",
+                    "restraints",
+                ),
+                "openfe": ("md_input", "fep_input", "openfe", "fep_plan", "fep_result", "fep_leg"),
+                "gromacs": (
+                    "md_input",
+                    "md_system",
+                    "restraints",
+                    "md_analysis",
+                    "md_outputs",
+                    "gromacs",
+                    "gromacs_protocol",
+                    "gromacs_files",
+                ),
+            }[identifier]
+            shared.update(
+                {
+                    "native_" + name + ".py": root / "simulations" / ("native_" + name + ".py")
+                    for name in names
+                }
+            )
+        if identifier == "deepternary":
+            shared = {
+                "native_proximity_" + name + ".py": root / "proximity" / ("native_" + name + ".py")
+                for name in (
+                    "chemistry",
+                    "regions",
+                    "partners",
+                    "graphs",
+                    "frames",
+                    "prediction",
+                    "quality",
+                    "outputs",
+                )
+            }
+            shared.update(
+                {
+                    "native_proximity_options.py": root / "proximity/options.py",
+                    "native_proximity_graph_identity.py": root / "proximity/graph_identity.py",
+                    "native_selection.py": root / "receptors/native_selection.py",
+                    "preparation_options.py": root / "receptors/preparation_options.py",
+                }
+            )
+        super().__init__(
+            settings,
+            identifier,
+            Path(__file__).parent,
+            FILES,
+            lambda config: configuration(config, identifier)[0],
+            lambda config: readiness(config, identifier),
+            shared_sources=shared,
+        )
+
+    def process_limit(self, job):
+        if self.program == "openfe" and job.request.payload.stage == "calculate":
+            # Native HREX minimization holds multiple CPU contexts. Budget both
+            # context/PME thread pools per window plus fixed library/runner overhead.
+            # Typed inputs cap this at 832, while CPU/memory/time limits still apply.
+            return 64 + 2 * job.request.payload.lambda_windows * job.request.options.cpu
+        return super().process_limit(job)
+
+    def execution_arguments(self, job, directory):
+        args = [
+            "--env",
+            "XDDE_PROGRAM=" + self.program,
+            "--env",
+            "WANDB_MODE=disabled",
+            "--env",
+            "HF_HUB_OFFLINE=1",
+            "--env",
+            "TRANSFORMERS_OFFLINE=1",
+            "--env",
+            "MPLCONFIGDIR=/tmp/matplotlib",
+            "--env",
+            "NUMBA_CACHE_DIR=/tmp/numba",
+        ]
+        if self.program == "mol1":
+            source = directory / "input.json"
+            if source.is_symlink() or not source.is_file() or "," in str(source):
+                raise ValueError("Mol-1 requires its exact compiled input snapshot.")
+            args += [
+                "--mount",
+                f"type=bind,source={source},target=/input/specification.json,readonly",
+            ]
+            args += [
+                "--env",
+                "LAYERNORM_TYPE=torch",
+                "--env",
+                "TORCHINDUCTOR_CACHE_DIR=/tmp/torch-inductor",
+            ]
+        if self.program == "boltzgen" and job.request.payload.continuation:
+            from ..container_runtime import RECEIPT, document, read
+            from .binder_checkpoints import validate_continuation
+
+            source, manifest = validate_continuation(
+                job.request,
+                self.settings.state_dir,
+                Store(self.settings.state_dir / "jobs.sqlite3"),
+            )
+            # The shared lifecycle already froze the image used by docker create.
+            # Re-reading a mutable installation/lease selection here could approve
+            # a different image if configuration changed between these operations.
+            read(directory)
+            if document(directory / RECEIPT).get("image") != manifest["image"]:
+                raise ValueError("Continue with the exact original native binder image.")
+            receipt = directory / "binder-checkpoint.json"
+            receipt.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+            for host, target in (
+                (source / "output/native/designs", "/input/binder-checkpoint"),
+                (receipt, "/input/binder-checkpoint.json"),
+            ):
+                if host.is_symlink() or "," in str(host):
+                    raise ValueError("Binder checkpoint mounts must be exact managed paths.")
+                args += ["--mount", f"type=bind,source={host},target={target},readonly"]
+        # Native CLI imports must also work for a UID absent from the image passwd.
+        args += torch_cache_arguments(self.program)
+        if self.program in {"openfe", "gromacs"}:
+            args += ["--env", "OPENMM_CPU_THREADS=" + str(job.request.options.cpu)]
+        if self.program == "openfe":
+            # Replica contexts own the allocated CPU budget; BLAS/NumExpr must
+            # not independently size their thread pools from the host core count.
+            args += [
+                "--env",
+                "OPENBLAS_NUM_THREADS=1",
+                "--env",
+                "MKL_NUM_THREADS=1",
+                "--env",
+                "NUMEXPR_NUM_THREADS=1",
+                "--env",
+                "NUMBA_NUM_THREADS=" + str(job.request.options.cpu),
+            ]
+        if job.request.options.device == "cuda":
+            args += ["--gpus", "device=0"]
+        if PROGRAMS[self.program]["models"]:
+            _, metadata = configuration(self.settings, self.program)
+            root = Path(metadata["models"])
+            if root.is_symlink() or "," in str(root):
+                raise ValueError("Native model directories must be real managed paths.")
+            args += [
+                "--mount",
+                f"type=bind,source={root},target=/models,readonly",
+                "--env",
+                "HF_HOME=/models/huggingface",
+                "--env",
+                "BOLTZ_CACHE=/models",
+            ]
+        if job.request.operation == "chemprop_predict":
+            model = trained_model(
+                self.settings.state_dir,
+                Store(self.settings.state_dir / "jobs.sqlite3"),
+                job.request.payload,
+            )
+            if "," in str(model):
+                raise ValueError(
+                    "Trained model path cannot be represented by the native mount contract."
+                )
+            args += [
+                "--mount",
+                f"type=bind,source={model},target=/input/property-model.pt,readonly",
+            ]
+        return args

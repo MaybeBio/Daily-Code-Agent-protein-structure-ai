@@ -1,0 +1,686 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 ayuroy01. See LICENSE and NOTICE.
+"""Python bindings for ChemLarp via the C ABI (include/chemlarp/chemlarp_c.h).
+
+No compiled extension is needed: the shared library is loaded with ctypes.
+Set CHEMLARP_LIB to override the library path.
+
+    >>> import chemlarp
+    >>> chemlarp.parse("CCO")["structure"]["species"][0]["formula"]
+    'C2H6O'
+    >>> sys = chemlarp.System()
+    >>> sys.add("CCO")
+    0
+    >>> sys.atom_x()        # zero-copy numpy view into the SoA column
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+import platform
+from pathlib import Path
+from typing import Sequence
+
+__all__ = ["parse", "canonical", "depict", "inchi", "iupac_name", "read_molecules", "smarts_match", "similarity", "search", "qc", "embed", "flash", "vapor_pressure", "vle", "pure_component", "flowsheet", "solution", "molecular_dynamics", "lennard_jones", "mbar", "lj_solvation", "water_box", "hydration_free_energy", "lab_mix", "titrate", "lab_reagents", "ghs", "mmff", "protein", "dock", "kinetics", "check_reaction", "equilibrate", "System", "ChemLarpError", "library_path", "set_threads", "threads"]
+
+
+class ChemLarpError(RuntimeError):
+    def __init__(self, diagnostics: list[dict]):
+        self.diagnostics = diagnostics
+        lines = [f"{d['code']} @ {d.get('position')}: {d['message']}" for d in diagnostics if d["severity"] == "error"]
+        super().__init__("\n".join(lines) or "ChemLarp error")
+
+
+def _candidate_libraries() -> list[Path]:
+    here = Path(__file__).resolve().parent
+    build = here.parents[1] / "build"
+    system = platform.system()
+    if system == "Windows":
+        names = ["chemlarp.dll", "libchemlarp.dll"]
+    elif system == "Darwin":
+        names = ["libchemlarp.dylib"]
+    else:
+        names = ["libchemlarp.so"]
+    # Installed from a wheel: the library sits next to this file. From a source checkout: the build output,
+    # where CMake multi-config generators (Visual Studio, Xcode) add a per-config subfolder.
+    dirs = [here, build, build / "Release", build / "RelWithDebInfo", build / "Debug"]
+    return [d / n for d in dirs for n in names]
+
+
+def library_path() -> Path:
+    """Shared library to load: $CHEMLARP_LIB, else the copy in the package (wheel), else a build output."""
+    env = os.environ.get("CHEMLARP_LIB")
+    if env:
+        return Path(env)
+    candidates = _candidate_libraries()
+    for c in candidates:
+        if c.exists():
+            return c
+    raise OSError("ChemLarp shared library not found; build it first (scripts/build.sh or scripts\\build.ps1) "
+                  "or set CHEMLARP_LIB. Looked in:\n  " + "\n  ".join(str(c) for c in candidates))
+
+
+def _load() -> ctypes.CDLL:
+    path = library_path()
+    if platform.system() == "Windows" and hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(str(path.parent))  # dependent DLLs next to chemlarp.dll
+    return ctypes.CDLL(str(path))
+
+
+_lib = _load()
+_c_char_pp = ctypes.POINTER(ctypes.c_char_p)
+
+
+def _sig(name, restype, *argtypes):
+    fn = getattr(_lib, name)
+    fn.restype = restype
+    fn.argtypes = list(argtypes)
+    return fn
+
+
+_cl_free_string = _sig("cl_free_string", None, ctypes.c_void_p)
+_cl_version = _sig("cl_version", ctypes.c_char_p)
+_cl_parse = _sig("cl_parse_smiles_json", ctypes.c_void_p, ctypes.c_char_p)
+_cl_canon = _sig("cl_canonical_smiles_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint64)
+_cl_kinetics = _sig("cl_kinetics_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+                    ctypes.c_char_p, ctypes.c_double,
+                    ctypes.c_double, _c_char_pp, ctypes.POINTER(ctypes.c_double), ctypes.c_size_t, ctypes.c_double,
+                    ctypes.c_size_t, ctypes.c_double)
+_cl_embed = _sig("cl_embed_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_int, ctypes.c_int)
+_cl_inchi = _sig("cl_inchi_json", ctypes.c_void_p, ctypes.c_char_p)
+_cl_iupac = _sig("cl_iupac_name_json", ctypes.c_void_p, ctypes.c_char_p)
+_cl_smarts = _sig("cl_smarts_match_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int)
+_cl_similarity = _sig("cl_similarity_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int)
+_cl_search = _sig("cl_search_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int)
+_cl_qc = _sig("cl_qc_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_double)
+_cl_read = _sig("cl_read_molecules_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int)
+_cl_depict = _sig("cl_depict_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double, ctypes.c_int)
+_cl_flash = _sig("cl_flash_text_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double, ctypes.c_double, ctypes.c_char_p)
+_cl_props = _sig("cl_pure_component_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double, ctypes.c_double)
+_cl_vle = _sig("cl_vle_text_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_double)
+_cl_flowsheet = _sig("cl_flowsheet_json", ctypes.c_void_p, ctypes.c_char_p)
+_cl_aqueous = _sig("cl_aqueous_json", ctypes.c_void_p, ctypes.c_char_p)
+_cl_md = _sig("cl_md_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double, ctypes.c_uint, ctypes.c_double,
+              ctypes.c_char_p, ctypes.c_double, ctypes.c_uint, ctypes.c_uint, ctypes.c_int, ctypes.c_char_p)
+_cl_mmff = _sig("cl_mmff_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int)
+_cl_protein = _sig("cl_protein_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double)
+_cl_set_threads = _sig("cl_set_threads", None, ctypes.c_int)
+_cl_threads = _sig("cl_threads", ctypes.c_int)
+_cl_protein_opts = _sig("cl_protein_json_opts", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double, ctypes.c_int)
+_cl_dock = _sig("cl_dock_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_double,
+                ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_double, ctypes.c_uint, ctypes.c_int)
+_cl_mbar = _sig("cl_mbar_json", ctypes.c_void_p, ctypes.c_char_p)
+_cl_lab_mix = _sig("cl_lab_mix_json", ctypes.c_void_p, ctypes.c_char_p)
+_cl_lab_titration = _sig("cl_lab_titration_json", ctypes.c_void_p, ctypes.c_char_p)
+_cl_lab_reagents = _sig("cl_lab_reagents_json", ctypes.c_void_p)
+_cl_ghs = _sig("cl_ghs_json", ctypes.c_void_p, ctypes.c_char_p)
+_cl_ljsolv = _sig("cl_lj_solvation_json", ctypes.c_void_p, ctypes.c_int, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+                  ctypes.c_double, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_int)
+_cl_water = _sig("cl_water_box_json", ctypes.c_void_p, ctypes.c_int, ctypes.c_double, ctypes.c_double,
+                 ctypes.c_double, ctypes.c_double, ctypes.c_uint)
+_cl_hydration = _sig("cl_hydration_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_double,
+                     ctypes.c_double, ctypes.c_double, ctypes.c_uint)
+_cl_lj = _sig("cl_lj_json", ctypes.c_void_p, ctypes.c_int, ctypes.c_double, ctypes.c_double, ctypes.c_double,
+              ctypes.c_double, ctypes.c_uint, ctypes.c_uint, ctypes.c_char_p, ctypes.c_uint)
+_cl_psat = _sig("cl_saturation_pressure_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double, ctypes.c_char_p)
+_cl_reaction = _sig("cl_check_reaction_json", ctypes.c_void_p, ctypes.c_char_p, ctypes.c_double)
+_cl_equil = _sig("cl_equilibrate_json", ctypes.c_void_p, _c_char_pp, ctypes.POINTER(ctypes.c_double),
+                 ctypes.c_size_t, ctypes.c_double, ctypes.c_double)
+
+_sys_new = _sig("cl_system_new", ctypes.c_void_p)
+_sys_free = _sig("cl_system_free", None, ctypes.c_void_p)
+_sys_add = _sig("cl_system_add_smiles", ctypes.c_int32, ctypes.c_void_p, ctypes.c_char_p)
+_sys_set_moles = _sig("cl_system_set_moles", ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_double)
+_sys_set_cond = _sig("cl_system_set_conditions", ctypes.c_int, ctypes.c_void_p, ctypes.c_double, ctypes.c_double)
+_sys_equil = _sig("cl_system_equilibrate", ctypes.c_int, ctypes.c_void_p)
+_sys_atoms = _sig("cl_system_atom_count", ctypes.c_size_t, ctypes.c_void_p)
+_sys_bonds = _sig("cl_system_bond_count", ctypes.c_size_t, ctypes.c_void_p)
+_sys_species = _sig("cl_system_species_count", ctypes.c_size_t, ctypes.c_void_p)
+_sys_struct = _sig("cl_system_structure_json", ctypes.c_void_p, ctypes.c_void_p)
+_sys_thermo = _sig("cl_system_thermo_json", ctypes.c_void_p, ctypes.c_void_p)
+_sys_diag = _sig("cl_system_diagnostics_json", ctypes.c_void_p, ctypes.c_void_p)
+
+_columns = {
+    "atom_element": (ctypes.c_uint8, "atoms"),
+    "atom_charge": (ctypes.c_int8, "atoms"),
+    "atom_implicit_h": (ctypes.c_uint8, "atoms"),
+    "atom_x": (ctypes.c_double, "atoms"),
+    "atom_y": (ctypes.c_double, "atoms"),
+    "atom_z": (ctypes.c_double, "atoms"),
+    "bond_begin": (ctypes.c_uint32, "bonds"),
+    "bond_end": (ctypes.c_uint32, "bonds"),
+    "bond_order": (ctypes.c_uint8, "bonds"),
+    "moles": (ctypes.c_double, "species"),
+}
+_column_fns = {k: _sig(f"cl_system_{k}", ctypes.POINTER(t), ctypes.c_void_p) for k, (t, _) in _columns.items()}
+
+
+def _take_json(ptr: int | None) -> dict | list:
+    if not ptr:
+        raise MemoryError("ChemLarp returned NULL")
+    try:
+        return json.loads(ctypes.string_at(ptr).decode("utf-8"))
+    finally:
+        _cl_free_string(ptr)
+
+
+def version() -> str:
+    return _cl_version().decode()
+
+
+def parse(smiles: str) -> dict:
+    """Parse one SMILES; returns {'ok', 'structure', 'diagnostics'}."""
+    return _take_json(_cl_parse(smiles.encode()))
+
+
+def canonical(smiles: str, n_random: int = 0, seed: int = 1) -> dict:
+    """Canonical SMILES, CIP labels, and optionally `n_random` randomised equivalent SMILES.
+
+    Raises ChemLarpError if the SMILES is invalid.
+    """
+    r = _take_json(_cl_canon(smiles.encode(), n_random, seed))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def embed(smiles: str, seed: int = 42, candidates: int = 5, minimize: bool = True) -> dict:
+    """3D structure with explicit hydrogens (distance geometry + UFF).
+
+    Returns {'canonical', 'sdf', 'xyz', 'energy_kcal_mol', 'converged', 'attempts', 'stereo',
+    'diagnostics', 'elements', 'coordinates'} where coordinates is a list of (x, y, z) in Å.
+    Raises ChemLarpError if the SMILES cannot be embedded.
+    """
+    r = _take_json(_cl_embed(smiles.encode(), seed, candidates, 1 if minimize else 0))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    rows = r["xyz"].splitlines()[2:]
+    r["elements"] = [row.split()[0] for row in rows]
+    r["coordinates"] = [tuple(float(v) for v in row.split()[1:4]) for row in rows]
+    return r
+
+
+def depict(smiles: str, bond_px: float = 30.0, color: bool = True, cip: bool = False, numbers: bool = False) -> dict:
+    """2D structure drawing: {'svg', 'molfile', 'width', 'height', 'atoms', 'bonds', 'stereo', 'diagnostics'}.
+
+    The SVG uses currentColor for bonds, so it follows the surrounding text colour; the molfile is
+    MDL V2000 with wedge/hash bonds. Raises ChemLarpError if the SMILES cannot be read.
+    """
+    flags = (1 if color else 0) | (2 if cip else 0) | (4 if numbers else 0)
+    r = _take_json(_cl_depict(smiles.encode(), bond_px, flags))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def inchi(smiles: str) -> dict:
+    """Standard InChI and InChIKey: {'inchi', 'key', 'diagnostics'}.
+
+    Generated by ChemLarp's own implementation, not the IUPAC reference library; warnings in
+    'diagnostics' flag structures outside its validated scope. Raises ChemLarpError on bad SMILES.
+    """
+    r = _take_json(_cl_inchi(smiles.encode()))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def iupac_name(smiles: str) -> str:
+    """Systematic IUPAC name (2013 Recommendations) of a SMILES string.
+
+    Raises ChemLarpError with a NamingUnsupported diagnostic when the structure needs a
+    nomenclature rule ChemLarp does not implement; the namer never guesses.
+    """
+    r = _take_json(_cl_iupac(smiles.encode()))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r["name"]
+
+
+def read_molecules(source, format: str = "", keep_hydrogens: bool = False, max_records: int = 0) -> list[dict]:
+    """Records of a MOL/SDF, PDB or CML file.
+
+    `source` is the file's text, or a path (str or os.PathLike) to read. `format` is "mol", "sdf", "pdb",
+    "cml" or "" (from the file extension, else the content). Each record is a dict with 'ok', 'title',
+    'smiles' (canonical), 'formula', 'molar_mass', 'atoms', 'dimensions', 'line' and 'properties'
+    (SDF data items as a dict). Raises ChemLarpError when no record could be read.
+    """
+    import os
+
+    text = source
+    if isinstance(source, os.PathLike) or (isinstance(source, str) and "\n" not in source and os.path.isfile(source)):
+        path = os.fspath(source)
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        format = format or path
+    r = _take_json(_cl_read(text.encode(), format.encode(), int(keep_hydrogens), max_records))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    for rec in r["records"]:
+        rec["properties"] = dict(rec["properties"])
+    return r["records"]
+
+
+def smarts_match(smiles: str, smarts: str, use_chirality: bool = False, max_matches: int = 1000) -> list[tuple[int, ...]]:
+    """Matches of a SMARTS pattern: one tuple of atom indices (SMILES order) per match, in query-atom order.
+
+    Matches are unique by atom set. Raises ChemLarpError on an invalid SMILES or SMARTS.
+    """
+    r = _take_json(_cl_smarts(smiles.encode(), smarts.encode(), int(use_chirality), max_matches))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return [tuple(m) for m in r["matches"]]
+
+
+def similarity(smiles_a: str, smiles_b: str, radius: int = 2, bits: int = 2048) -> dict:
+    """Morgan (ECFP) fingerprint similarity: {'tanimoto', 'dice', 'bits_a', 'bits_b', 'diagnostics'}."""
+    r = _take_json(_cl_similarity(smiles_a.encode(), smiles_b.encode(), radius, bits))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def search(smiles: list[str], smarts: str = "", query: str = "", radius: int = 2, bits: int = 2048) -> list[dict]:
+    """Screens a list of SMILES: per entry {'ok', 'count' (SMARTS matches), 'similarity' (Tanimoto to query)}."""
+    r = _take_json(_cl_search("\n".join(smiles).encode(), smarts.encode(), query.encode(), radius, bits))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    out = [{"ok": False} for _ in smiles]
+    for x in r["results"]:
+        out[x["line"] - 1] = {k: v for k, v in x.items() if k != "line"}
+    return out
+
+
+def qc(structure: str, method: str = "hf", basis: str = "STO-3G", multiplicity: int = 0, grid: int = 2,
+       memory_mb: float = 0) -> dict:
+    """Hartree-Fock or DFT single point (methods hf, svwn, pbe, b3lyp; bases STO-3G, 3-21G, 6-31G, 6-31G*).
+
+    `structure` is a SMILES (embedded to 3D first) or the text of a 3D molfile/SDF record with
+    hydrogens. Energies in hartree, coordinates in angstrom, dipole in debye. Raises ChemLarpError.
+    """
+    r = _take_json(_cl_qc(structure.encode(), method.encode(), basis.encode(), multiplicity, grid, memory_mb))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def flash(feed: dict[str, float], temperature_K: float, pressure_Pa: float, eos: str = "pr") -> dict:
+    """Isothermal vapour-liquid flash. `feed` maps SMILES -> mole fraction; eos is "pr" or "srk"."""
+    lines = "\n".join(f"{s} {v}" for s, v in feed.items())
+    r = _take_json(_cl_flash(lines.encode(), temperature_K, pressure_Pa, eos.encode()))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def vapor_pressure(smiles: str, temperature_K: float, eos: str = "pr") -> float:
+    """Pure-component vapour pressure in Pa from the cubic equation of state."""
+    r = _take_json(_cl_psat(smiles.encode(), temperature_K, eos.encode()))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r["pressure_Pa"]
+
+
+def pure_component(smiles: str, temperature_K: float = 0.0, pressure_Pa: float = 0.0) -> dict:
+    """Pure-component constants from published compilations; with a temperature, also ideal-gas Cp, H, S,
+    enthalpy of vaporization, saturated liquid volume and density, liquid and low-pressure vapour viscosity
+    and thermal conductivity, and surface tension under "at" (SI units). Missing values are None."""
+    r = _take_json(_cl_props(smiles.encode(), temperature_K, pressure_Pa))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def vle(composition: dict[str, float], mode: str, value: float) -> dict:
+    """UNIFAC + Antoine vapour-liquid equilibrium (modified Raoult). `composition` maps SMILES -> mole
+    fraction (liquid for bubble points, vapour for dew points); mode "bubble-T"/"dew-T" takes a pressure
+    in Pa, "bubble-P"/"dew-P" a temperature in K."""
+    lines = "\n".join(f"{s} {v}" for s, v in composition.items())
+    r = _take_json(_cl_vle(lines.encode(), mode.encode(), value))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def flowsheet(text: str, *, allow_unconverged: bool = False) -> dict:
+    """Solve a steady-state flowsheet (units connected by named streams; recycles converged by Wegstein or
+    direct substitution). `text` is the flowsheet itself or a path to a file in the format documented in
+    include/chemlarp/flowsheet.hpp. Returns streams, units, tear streams, residual history and the overall
+    mass and energy balance. Raises ChemLarpError on errors, and on non-convergence unless
+    allow_unconverged is set (the last iterate is then returned with "converged": False)."""
+    r = _take_json(_cl_flowsheet(_text_or_file(text)))
+    if not r["ok"] and not (allow_unconverged and "streams" in r):
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def solution(text: str) -> dict:
+    """Aqueous speciation, pH and solubility with PHREEQC's phreeqc.dat data. `text` is the solution
+    description (or a path to a file) in the format documented in include/chemlarp/aqueous.hpp, e.g.
+    "temperature 25\nadd NaHCO3 2\nequilibrium Calcite 0\nequilibrium CO2(g) -3.5". Returns pH, ionic
+    strength, species, saturation indices and phase amounts; raises ChemLarpError on errors."""
+    r = _take_json(_cl_aqueous(_text_or_file(text)))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def molecular_dynamics(smiles: str, temperature_K: float = 300.0, steps: int = 2000, dt_fs: float = 0.5,
+                       thermostat: str = "bussi", tau_fs: float = 100.0, sample_every: int = 10, seed: int = 1,
+                       normal_modes: bool = False, force_field: str = "uff") -> dict:
+    """Molecular dynamics of one molecule (embedded in 3D with explicit hydrogens and minimized) with
+    force_field "uff", "mmff94" or "mmff94s".
+    thermostat: "bussi", "langevin" or "none" (NVE). Returns energies per stored frame, positions (Å),
+    harmonic frequencies (cm-1) when normal_modes is set, a velocity spectrum and a multi-frame XYZ."""
+    r = _take_json(_cl_md(smiles.encode(), temperature_K, steps, dt_fs, thermostat.encode(), tau_fs, sample_every,
+                          seed, 1 if normal_modes else 0, force_field.encode()))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def mmff(smiles: str, variant: str = "MMFF94", minimize: bool = True) -> dict:
+    """MMFF94 (or "MMFF94s") atom types, partial charges and energy terms (kcal/mol) for a SMILES embedded
+    in 3D with explicit hydrogens, minimized with MMFF unless minimize is False; includes the SDF."""
+    r = _take_json(_cl_mmff(smiles.encode(), variant.encode(), 1 if minimize else 0))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def set_threads(n: int = 0) -> None:
+    """Threads for the parallel kernels (quantum chemistry); results do not depend on the number.
+    0 restores the default (CHEMLARP_THREADS, else the number of processors)."""
+    _cl_set_threads(int(n))
+
+
+def threads() -> int:
+    """Threads the parallel kernels currently use."""
+    return _cl_threads()
+
+
+def protein(pdb: str, pH: float = 7.4, repair: bool = True, loops: bool = True, termini: bool = False,
+            flips: bool = True, structure_pka: bool = True) -> dict:
+    """Read a protein from PDB or mmCIF text (or a path to a .pdb, .ent or .cif file): chain sequences,
+    isoelectric points and molecular weights, disulfides, the pKa of each titratable group predicted from
+    the structure ("pka"), protonation states at the pH with the hydrogen-bond network optimised, and the
+    structure with all hydrogens rebuilt ("pdb", or "cif" when the PDB format cannot hold it; see "format").
+
+    repair completes side chains with missing atoms; loops builds residues the file lists as missing inside
+    a chain and termini those at chain ends (both are predictions: "repair"["built_residues"]); flips allows
+    Asn/Gln/His side chains to turn by 180 degrees ("flipped"); structure_pka=False uses reference pKa values.
+    "undetermined" lists the groups whose orientation or tautomer the structure does not decide."""
+    if "\n" not in pdb and pdb.lower().endswith((".pdb", ".ent", ".cif", ".mmcif")):
+        with open(pdb) as f:
+            pdb = f.read()
+    flags = (0 if repair else 1) | (0 if loops else 2) | (4 if termini else 0) | (0 if flips else 8) | (0 if structure_pka else 16)
+    r = _take_json(_cl_protein_opts(pdb.encode(), pH, flags))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def lennard_jones(cells: int = 3, density: float = 0.8, temperature: float = 1.0, cutoff: float = 2.5,
+                  dt: float = 0.004, equilibration: int = 2000, production: int = 10000, thermostat: str = "bussi",
+                  seed: int = 1) -> dict:
+    """Lennard-Jones fluid by molecular dynamics in reduced units (4 cells^3 particles, potential truncated
+    and shifted at the cutoff): mean potential energy per particle and pressure with block errors."""
+    r = _take_json(_cl_lj(cells, density, temperature, cutoff, dt, equilibration, production, thermostat.encode(), seed))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def mbar(u_kn, N_k) -> dict:
+    """MBAR (Shirts & Chodera 2008) on reduced potentials: u_kn[k][n] is sample n evaluated in state k (kT
+    units), the samples grouped by the state they were drawn from, N_k[k] of state k. Returns the free
+    energies f (f[0] = 0), df[i][j] = f_j - f_i with standard errors ddf, and the overlap matrix."""
+    K = len(N_k)
+    if len(u_kn) != K:
+        raise ValueError("u_kn must have one row per state")
+    lines = [" ".join(str(int(n)) for n in N_k)]
+    for row in u_kn:
+        lines.append(" ".join(repr(float(x)) for x in row))
+    r = _take_json(_cl_mbar("\n".join(lines).encode()))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def lj_solvation(cells: int = 3, density: float = 0.8, temperature: float = 1.2, cutoff: float = 2.5,
+                 dt: float = 0.004, equilibration: int = 4000, production: int = 40000, insertions: int = 200,
+                 seed: int = 1, keep_matrix: bool = False) -> dict:
+    """Excess chemical potential of a Lennard-Jones particle in the LJ fluid (reduced units) by soft-core
+    alchemical coupling over lambda windows (MBAR, BAR, TI, exponential averaging) and by Widom insertion
+    in the pure fluid. keep_matrix returns the subsampled u_kn and N_k given to MBAR."""
+    r = _take_json(_cl_ljsolv(cells, density, temperature, cutoff, dt, equilibration, production, insertions, seed,
+                              1 if keep_matrix else 0))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def water_box(waters: int = 400, temperature: float = 298.15, pressure_atm: float = 1.0,
+              equilibration_ps: float = 20.0, production_ps: float = 100.0, seed: int = 1) -> dict:
+    """TIP3P water at constant temperature and pressure (PME electrostatics, Langevin dynamics, Monte Carlo
+    barostat): density, potential energy per molecule (kcal/mol), O-O radial distribution. pressure_atm=None
+    runs at constant volume."""
+    r = _take_json(_cl_water(waters, temperature, -1.0 if pressure_atm is None else pressure_atm,
+                             equilibration_ps, production_ps, seed))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def hydration_free_energy(solute: str, waters: int = 400, temperature: float = 298.15,
+                          equilibration_ps: float = 20.0, production_ps: float = 100.0, seed: int = 1) -> dict:
+    """Hydration free energy (kcal/mol) of a neutral molecule (SMILES) or "water" in explicit TIP3P water by
+    alchemical decoupling over lambda windows, analysed with MBAR (BAR and TI as checks). Slow: about a
+    quarter of an hour for a small molecule on 8 cores at the defaults."""
+    r = _take_json(_cl_hydration(solute.encode(), waters, temperature, equilibration_ps, production_ps, seed))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def dock(receptor: str, ligand: str, reference: str = "", centre=None, size=None, margin: float = 4.0,
+         runs: int = 8, steps: int = 0, modes: int = 9, pH: float = 7.4, seed: int = 42,
+         remove_waters: bool = False, repair: bool = False, file_hydrogens: bool = False) -> dict:
+    """Dock a flexible ligand into a rigid receptor and return the poses, best first, with their affinity in
+    kcal/mol (an empirical score in the style of AutoDock Vina; see include/chemlarp/docking.hpp).
+
+    `receptor` is PDB or mmCIF text, or a path to a .pdb, .ent or .cif file. `ligand` is a SMILES string (the
+    conformation is generated), or MOL/SDF text or a path to a .mol or .sdf file (the conformation is kept).
+    `reference` is optional and is either the name of a hetero residue of the receptor file ("MK1") or a known
+    pose as MOL/SDF text or a file: it places the search box, clears the hetero groups sharing that site, and
+    as a structure is the pose each result's "rmsd" is measured against.
+
+    `centre` and `size` are (x, y, z) in angstrom; leave them out to take the box from the reference ligand
+    plus `margin` on every side. `runs` is how many independent Monte Carlo runs to make (the usual
+    exhaustiveness knob), `steps` their length (0: 200 plus 100 per rotatable bond), `modes` how many poses
+    to report. Seconds to minutes of computation. A negative or absurd argument raises ChemLarpError rather
+    than falling back to the default. The waters a structure resolves are kept unless `remove_waters` is
+    set: they are part of the site, and dropping them costs accuracy (docs/ARCHITECTURE.md). `repair`
+    completes missing side chains first; `file_hydrogens` takes the donors from the hydrogens already in the
+    file instead of predicting the protonation at `pH`."""
+    def _text(arg, suffixes):
+        if arg and "\n" not in arg and arg.lower().endswith(suffixes):
+            with open(arg) as f:
+                return f.read()
+        return arg
+    receptor = _text(receptor, (".pdb", ".ent", ".cif", ".mmcif"))
+    ligand = _text(ligand, (".mol", ".sdf", ".smi"))
+    reference = _text(reference, (".mol", ".sdf"))
+    cx, cy, cz = centre if centre else (0.0, 0.0, 0.0)
+    sx, sy, sz = size if size else (0.0, 0.0, 0.0)
+    if size is None and not reference:
+        raise ChemLarpError("give size=(x, y, z), or a reference ligand to place the box around")
+    if margin < 0:
+        raise ChemLarpError("margin cannot be negative")
+    flags = (1 if remove_waters else 0) | (2 if repair else 0) | (4 if file_hydrogens else 0)
+    r = _take_json(_cl_dock(receptor.encode(), ligand.encode(), reference.encode(), cx, cy, cz, sx, sy, sz,
+                            runs, steps, modes, pH, seed, flags))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def lab_mix(portions) -> dict:
+    """Mixes aqueous solutions: `portions` is a list of (volume_mL, {reagent id or formula: mol/L}) or
+    (volume_mL, {...}, T_C), or the text format of include/chemlarp/lab.hpp. Returns pH, heat, temperature,
+    precipitates, gases and safety findings (computed, NRC incompatibility rules, GHS)."""
+    text = portions if isinstance(portions, str) else "".join(
+        "portion p%d %r %r\n" % (i, float(p[0]), float(p[2]) if len(p) > 2 else 25.0) +
+        "".join("%s %r\n" % (k, float(v)) for k, v in p[1].items()) for i, p in enumerate(portions))
+    r = _take_json(_cl_lab_mix(text.encode()))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def titrate(analyte_mL: float, analyte: dict, titrant: str, titrant_molarity: float, max_mL: float,
+            points: int = 100, temperature_C: float = 25.0) -> dict:
+    """Titration curve (pH against added volume) and equivalence points."""
+    text = "analyte %r %r\n" % (float(analyte_mL), float(temperature_C))
+    text += "".join("%s %r\n" % (k, float(v)) for k, v in analyte.items())
+    text += "titrant %s %r\nmax %r\npoints %d\n" % (titrant, float(titrant_molarity), float(max_mL), int(points))
+    r = _take_json(_cl_lab_titration(text.encode()))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def lab_reagents() -> list[dict]:
+    """The virtual lab's reagent catalogue (ids, formulas, reactive groups, GHS data)."""
+    return _take_json(_cl_lab_reagents())["reagents"]
+
+
+def ghs(smiles: str) -> dict:
+    """GHS classification of a structure from the bundled PubChem table ({"found": False} when absent)."""
+    r = _take_json(_cl_ghs(smiles.encode()))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def _text_or_file(value: str | None) -> bytes | None:
+    if value is None:
+        return None
+    if "\n" not in value and os.path.exists(value):
+        return Path(value).read_bytes()
+    return value.encode()
+
+
+def kinetics(mechanism: str, feed: dict[str, float], temperature_K: float, pressure_Pa: float = 101325.0,
+             t_end: float = 1e-3, model: str = "adiabatic-v", samples: int = 50, rtol: float = 1e-8,
+             thermo: str | None = None, smiles: str | None = None) -> dict:
+    """Integrate a batch reactor.
+
+    `mechanism` is .ocm, CHEMKIN-II or Cantera YAML (text or a file path; format detected
+    from content). For CHEMKIN, `thermo` is therm.dat and `smiles` an optional NAME SMILES map
+    (both text or paths).
+
+    Returns {'species', 'samples': [{'t','T','P','n'}], 'ignition_time', 'stats', 'diagnostics'}.
+    Raises ChemLarpError on invalid mechanisms or setups.
+    """
+    names = (ctypes.c_char_p * len(feed))(*[k.encode() for k in feed])
+    moles = (ctypes.c_double * len(feed))(*[float(v) for v in feed.values()])
+    r = _take_json(_cl_kinetics(_text_or_file(mechanism), _text_or_file(thermo), _text_or_file(smiles), model.encode(),
+                                temperature_K, pressure_Pa, names, moles,
+                                len(feed), t_end, samples, rtol))
+    if not r["ok"]:
+        raise ChemLarpError(r["diagnostics"])
+    return r
+
+
+def check_reaction(equation: str, temperature_K: float = 298.15) -> dict:
+    """Validate stoichiometry (and compute ΔrG°, K when balanced)."""
+    return _take_json(_cl_reaction(equation.encode(), temperature_K))
+
+
+def equilibrate(species: dict[str, float] | Sequence[tuple[str, float]], temperature_K: float,
+                pressure_Pa: float = 1e5) -> dict:
+    """Gibbs-minimise an ideal-gas mixture. `species` maps SMILES -> initial moles."""
+    items = list(species.items()) if isinstance(species, dict) else list(species)
+    smi = (ctypes.c_char_p * len(items))(*[s.encode() for s, _ in items])
+    mol = (ctypes.c_double * len(items))(*[float(n) for _, n in items])
+    return _take_json(_cl_equil(smi, mol, len(items), temperature_K, pressure_Pa))
+
+
+class System:
+    """Owning handle around a ChemicalSystemState with zero-copy column access."""
+
+    def __init__(self) -> None:
+        self._h = _sys_new()
+        if not self._h:
+            raise MemoryError("cl_system_new failed")
+
+    def close(self) -> None:
+        if self._h:
+            _sys_free(self._h)
+            self._h = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def __enter__(self) -> "System":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def add(self, smiles: str, moles: float = 0.0) -> int:
+        idx = _sys_add(self._h, smiles.encode())
+        if idx < 0:
+            raise ChemLarpError(self.diagnostics())
+        if moles:
+            _sys_set_moles(self._h, idx, moles)
+        return idx
+
+    def set_moles(self, species: int, moles: float) -> None:
+        if not _sys_set_moles(self._h, species, moles):
+            raise ValueError("invalid species index or amount")
+
+    def set_conditions(self, temperature_K: float, pressure_Pa: float = 1e5) -> None:
+        if not _sys_set_cond(self._h, temperature_K, pressure_Pa):
+            raise ValueError("temperature and pressure must be positive")
+
+    def equilibrate(self) -> bool:
+        ok = bool(_sys_equil(self._h))
+        if not ok:
+            raise ChemLarpError(self.diagnostics())
+        return ok
+
+    def diagnostics(self) -> list[dict]:
+        return _take_json(_sys_diag(self._h))  # type: ignore[return-value]
+
+    def structure(self) -> dict:
+        return _take_json(_sys_struct(self._h))  # type: ignore[return-value]
+
+    def thermo(self) -> dict:
+        return _take_json(_sys_thermo(self._h))  # type: ignore[return-value]
+
+    def _count(self, kind: str) -> int:
+        return {"atoms": _sys_atoms, "bonds": _sys_bonds, "species": _sys_species}[kind](self._h)
+
+    def column(self, name: str):
+        """Zero-copy view of a SoA column (numpy array if numpy is installed, else ctypes array).
+
+        The view is invalidated by the next add() on this system.
+        """
+        ctype, kind = _columns[name]
+        n = self._count(kind)
+        ptr = _column_fns[name](self._h)
+        try:
+            import numpy as np  # noqa: PLC0415
+            return np.ctypeslib.as_array(ptr, shape=(n,)) if n else np.empty(0, dtype=np.dtype(ctype))
+        except ImportError:
+            return ctypes.cast(ptr, ctypes.POINTER(ctype * n)).contents if n else (ctype * 0)()
+
+    def __getattr__(self, name: str):
+        if name in _columns:
+            return lambda: self.column(name)
+        raise AttributeError(name)

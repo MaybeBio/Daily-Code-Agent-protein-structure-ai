@@ -1,0 +1,2029 @@
+// What a run writes: the log, files of columns, the trajectory, and
+// checkpoints (D149, docs/driver.md, Section 2.8).
+
+#include "mdir/Driver/Output.h"
+
+#include "mdir/Driver/H5MD.h"
+#include "mdir/Driver/ModelTerm.h"
+
+#include "mlir/ExecutionEngine/CRunnerUtils.h"
+
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/DynamicLibrary.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/Path.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdarg>
+#include <cstdlib>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <fstream>
+#include <limits>
+#include <mutex>
+#include <thread>
+#include <utility>
+#include <unistd.h>
+#include <vector>
+
+using namespace mdir::driver;
+
+//===----------------------------------------------------------------------===//
+// The log and files of columns
+//===----------------------------------------------------------------------===//
+
+Log::~Log() { close(); }
+
+void Log::print(const char *format, ...) {
+  va_list arguments;
+  va_start(arguments, format);
+  va_list copy;
+  va_copy(copy, arguments);
+  int size = std::vsnprintf(nullptr, 0, format, arguments);
+  va_end(arguments);
+  std::string text(std::max(size, 0), '\0');
+  if (size > 0)
+    std::vsnprintf(text.data(), size + 1, format, copy);
+  va_end(copy);
+  if (quiet)
+    return;
+  std::fputs(text.c_str(), stdout);
+  // Kept for the file, while one may open.
+  if (file)
+    std::fputs(text.c_str(), file);
+  else if (keeps)
+    pending += text;
+}
+
+void Log::keepNothing() {
+  keeps = false;
+  // `clear` would keep the allocation.
+  std::string().swap(pending);
+}
+
+llvm::Error Log::open(const std::string &path, bool appends) {
+  close();
+  file = std::fopen(path.c_str(), appends ? "a" : "w");
+  if (!file)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "cannot write the log '%s'", path.c_str());
+  std::fputs(pending.c_str(), file);
+  // The file has the text from here on, and after it closes none is kept.
+  keepNothing();
+  std::fflush(file);
+  return llvm::Error::success();
+}
+
+void Log::flush() {
+  std::fflush(stdout);
+  if (file)
+    std::fflush(file);
+}
+
+void Log::close() {
+  if (file)
+    std::fclose(file);
+  file = nullptr;
+}
+
+ColumnFile::~ColumnFile() { close(); }
+
+std::string ColumnFile::getHeader(llvm::ArrayRef<Column> columns) {
+  std::string names = "#", units = "#";
+  for (const Column &column : columns) {
+    names += " " + column.name;
+    units += " " + column.unit;
+  }
+  return names + "\n" + units + "\n";
+}
+
+llvm::Error ColumnFile::open(const std::string &path,
+                             std::vector<Column> given,
+                             std::optional<int64_t> keepThrough) {
+  close();
+  columns = std::move(given);
+  std::string header = getHeader(columns);
+  // A continued run keeps the rows up to its checkpoint; those after it
+  // the run computes again.
+  std::string kept;
+  if (keepThrough && llvm::sys::fs::exists(path)) {
+    std::ifstream old(path);
+    std::string first, second;
+    std::getline(old, first);
+    std::getline(old, second);
+    if (first + "\n" + second + "\n" != header)
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "'%s' does not begin with the columns that the run writes, '%s'; "
+          "it is not the output of this run",
+          path.c_str(), llvm::StringRef(header).rtrim().str().c_str());
+    for (std::string line; std::getline(old, line);) {
+      if (std::strtoll(line.c_str(), nullptr, 10) > *keepThrough)
+        break;
+      kept += line + "\n";
+    }
+  }
+  file = std::fopen(path.c_str(), "w");
+  if (!file)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "cannot write '%s'", path.c_str());
+  std::fputs(header.c_str(), file);
+  std::fputs(kept.c_str(), file);
+  std::fflush(file);
+  return llvm::Error::success();
+}
+
+void ColumnFile::write(int64_t step, llvm::ArrayRef<double> values) {
+  if (!file)
+    return;
+  std::fprintf(file, "%lld", static_cast<long long>(step));
+  for (size_t i = 0, e = values.size(); i != e; ++i) {
+    if (i + 1 < columns.size() && columns[i + 1].integer)
+      std::fprintf(file, " %lld", static_cast<long long>(values[i]));
+    else
+      std::fprintf(file, " %.6f", values[i]);
+  }
+  std::fprintf(file, "\n");
+  std::fflush(file);
+}
+
+void ColumnFile::close() {
+  if (file)
+    std::fclose(file);
+  file = nullptr;
+}
+
+std::string mdir::driver::getPartPath(llvm::StringRef path, int64_t part) {
+  llvm::StringRef extension = llvm::sys::path::extension(path);
+  return (path.drop_back(extension.size()) +
+          llvm::formatv(".part{0:D4}", part) + extension)
+      .str();
+}
+
+std::string mdir::driver::getBackupPath(llvm::StringRef path) {
+  llvm::StringRef directory = llvm::sys::path::parent_path(path);
+  llvm::StringRef name = llvm::sys::path::filename(path);
+  for (int n = 1; n <= MaxBackups; ++n) {
+    llvm::SmallString<256> backup(directory);
+    llvm::sys::path::append(backup, "#" + name + "." + llvm::Twine(n) + "#");
+    if (!llvm::sys::fs::exists(backup))
+      return std::string(backup);
+  }
+  return "";
+}
+
+llvm::Error mdir::driver::checkBackup(const std::string &path) {
+  if (!llvm::sys::fs::exists(path) || !getBackupPath(path).empty())
+    return llvm::Error::success();
+  std::string name = llvm::sys::path::filename(path).str();
+  return llvm::createStringError(
+      llvm::inconvertibleErrorCode(),
+      "'%s' exists, and its directory holds %d backups of it already, "
+      "'#%s.1#' to '#%s.%d#'; remove some of them, or continue the run "
+      "with --continue",
+      path.c_str(), MaxBackups, name.c_str(), name.c_str(), MaxBackups);
+}
+
+llvm::Expected<std::string> mdir::driver::backUpOutput(const std::string &path) {
+  if (!llvm::sys::fs::exists(path))
+    return "";
+  if (llvm::Error error = checkBackup(path))
+    return std::move(error);
+  std::string backup = getBackupPath(path);
+  if (std::error_code error = llvm::sys::fs::rename(path, backup))
+    return llvm::createStringError(error, "cannot back up '%s' as '%s': %s",
+                                   path.c_str(), backup.c_str(),
+                                   error.message().c_str());
+  return backup;
+}
+
+//===----------------------------------------------------------------------===//
+// The log
+//===----------------------------------------------------------------------===//
+
+static Output *current = nullptr;
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+/// The times of the outputs that `MDIR_CHECKPOINT_TIMES=1` prints to the
+/// standard error (#548, docs/environment.md): of each checkpoint and frame
+/// of `mdir run`, in parts, and of each interval between two rows of the
+/// log. A part that the program does before a call of the host, the copy
+/// of the buffers of a device, is the time since the last call returned.
+struct OutputTimes {
+  bool enabled = false;
+  /// When the last call of the host for an output returned.
+  Clock::time_point lastReturn;
+  /// When the last row of the log was taken, and at which step.
+  Clock::time_point lastRow;
+  int64_t lastRowStep = -1;
+  /// The time in s spent in frames and checkpoints since that row.
+  double written = 0.0;
+};
+
+OutputTimes &getTimes() {
+  static OutputTimes times = [] {
+    OutputTimes times;
+    const char *value = std::getenv("MDIR_CHECKPOINT_TIMES");
+    times.enabled = value && std::strcmp(value, "1") == 0;
+    times.lastReturn = Clock::now();
+    return times;
+  }();
+  return times;
+}
+
+double getMilliseconds(Clock::time_point from, Clock::time_point to) {
+  return 1.0e3 * std::chrono::duration<double>(to - from).count();
+}
+
+/// Marks the return of a call of the host for an output.
+struct ReturnMark {
+  ~ReturnMark() {
+    OutputTimes &times = getTimes();
+    if (times.enabled)
+      times.lastReturn = Clock::now();
+  }
+};
+
+/// A copy of a buffer of three numbers per particle as the program holds
+/// it, in its order, rows of three contiguous numbers of `element`, which
+/// the thread of checkpoints puts into the order of the input
+/// (D336): the call of the host then copies memory and
+/// leaves the scattered writes of the order to the thread.
+struct RawVectors {
+  Element element = Element::F64;
+  int64_t count = 0;
+  std::vector<char> bytes;
+
+  /// Copies the buffer of `descriptor`.
+  RawVectors(void *descriptor, Element element) : element(element) {
+    auto *buffer = static_cast<StridedMemRefType<char, 2> *>(descriptor);
+    count = buffer->sizes[0];
+    size_t size = element == Element::F32 ? sizeof(float) : sizeof(double);
+    bytes.resize(3 * count * size);
+    const char *data = buffer->data + buffer->offset * size;
+    if (buffer->strides[0] == 3 && buffer->strides[1] == 1) {
+      std::memcpy(bytes.data(), data, bytes.size());
+      return;
+    }
+    for (int64_t i = 0; i != count; ++i)
+      for (int64_t c = 0; c != 3; ++c)
+        std::memcpy(bytes.data() + (3 * i + c) * size,
+                    data + (i * buffer->strides[0] + c * buffer->strides[1]) *
+                               size,
+                    size);
+  }
+
+  /// The values in the order of the numbers of the particles, `ids`, as
+  /// readVectors gives them.
+  std::vector<double> order(const std::vector<int32_t> &ids) const {
+    std::vector<double> values(3 * count);
+    for (int64_t i = 0; i != count; ++i) {
+      int64_t place = ids[i];
+      for (int64_t c = 0; c != 3; ++c)
+        values[3 * place + c] =
+            element == Element::F32
+                ? reinterpret_cast<const float *>(bytes.data())[3 * i + c]
+                : reinterpret_cast<const double *>(bytes.data())[3 * i + c];
+    }
+    return values;
+  }
+};
+
+/// The numbers of the particles at each place of the program.
+std::vector<int32_t> copyIds(void *ids) {
+  auto *numbers = static_cast<StridedMemRefType<int32_t, 1> *>(ids);
+  std::vector<int32_t> copy(numbers->sizes[0]);
+  for (int64_t i = 0; i != numbers->sizes[0]; ++i)
+    copy[i] = numbers->data[numbers->offset + i * numbers->strides[0]];
+  return copy;
+}
+
+/// The checkpoint that a thread of its own writes while the steps go on
+/// (D336, #548). There is one writer, `writeState`, and at
+/// most one write at a time. A checkpoint passes three events, kept apart:
+///
+///   1. The copy from the device ends. The program copies its buffers to
+///      buffers of the host before it calls `writeState`; that copy has
+///      ended when the call begins. The call copies those buffers into the
+///      staging buffers of the write (RawState, or the snapshot), which the
+///      write owns: the program may overwrite its own buffers once the call
+///      returns.
+///   2. The write no longer borrows its staging buffers: the thread has put
+///      the state into the order of the input and released them
+///      (`released`). Only the thread releases them; no later checkpoint
+///      takes them, since each has staging buffers of its own.
+///   3. The commit: the file is complete, on stable storage, and under its
+///      name (`.partial`, `fsync`, `.prev`, rename, `fsync` of the
+///      directory), with the mutex of the library (#262) around its part
+///      in the library alone (`ended`).
+///
+/// The waits (waitForCheckpoint, which joins the thread): the next
+/// checkpoint waits for 2 and 3 of the one before, before it stages its
+/// own state; a stop on a signal or the wall time, the end of the run, and
+/// the exit of the process wait for all three. A write that failed stops
+/// the run at the next of them, with its error.
+struct CheckpointThread {
+  std::thread thread;
+  /// Written by the thread, read after it is joined.
+  std::string path;
+  std::string failure;
+  CheckpointWriteTimes parts;
+  /// The time in s that the thread took to order the state, if it did,
+  /// and when it released its staging buffers (event 2).
+  double order = 0.0;
+  Clock::time_point released;
+  int64_t step = 0;
+  Clock::time_point started, ended;
+};
+
+/// Never destroyed: a thread that is still joinable when the process ends
+/// is joined by the handler of the exit, not by a destructor.
+CheckpointThread &getCheckpointThread() {
+  static CheckpointThread *writer = new CheckpointThread;
+  return *writer;
+}
+
+/// Joins the thread that writes a checkpoint, if one runs, and returns its
+/// failure, or an empty string.
+std::string joinCheckpointThread() {
+  CheckpointThread &writer = getCheckpointThread();
+  if (!writer.thread.joinable())
+    return "";
+  Clock::time_point waited = Clock::now();
+  writer.thread.join();
+  OutputTimes &times = getTimes();
+  if (times.enabled) {
+    Clock::time_point now = Clock::now();
+    const CheckpointWriteTimes &parts = writer.parts;
+    std::fprintf(stderr,
+                 "MDIR: times of the write of the checkpoint at step %lld: "
+                 "order %.1f ms, hash %.1f ms, file %.1f ms, file sync %.1f "
+                 "ms, names %.1f ms, directory sync %.1f ms; %.1f ms on its "
+                 "thread, of which the steps waited %.1f ms\n",
+                 static_cast<long long>(writer.step), 1.0e3 * writer.order,
+                 1.0e3 * parts.hash,
+                 1.0e3 * parts.file, 1.0e3 * parts.fileSync,
+                 1.0e3 * parts.names, 1.0e3 * parts.directorySync,
+                 getMilliseconds(writer.started, writer.ended),
+                 getMilliseconds(waited, now));
+    times.written += 1.0e-3 * getMilliseconds(waited, now);
+  }
+  return std::move(writer.failure);
+}
+
+/// The state of a checkpoint as the program holds it, which the thread
+/// puts into the order of the input before it writes; empty where the call
+/// has ordered it.
+struct RawState {
+  std::vector<int32_t> ids;
+  std::vector<RawVectors> fields;
+};
+
+/// Starts the write of `snapshot` to `path` on the thread of checkpoints,
+/// with its positions, velocities, and forces from `raw` if it holds them.
+void startCheckpointThread(const std::string &path, int64_t step,
+                           Checkpoint snapshot, RawState raw) {
+  static bool registered = [] {
+    // The library's handler of the exit runs after this one, which waits
+    // for a write under way: the handlers run in the reverse order of
+    // their registration.
+    openCheckpointLibrary();
+    std::atexit([] {
+      std::string failure = joinCheckpointThread();
+      if (!failure.empty())
+        std::fprintf(stderr, "mdir: %s\n", failure.c_str());
+    });
+    return true;
+  }();
+  (void)registered;
+  CheckpointThread &writer = getCheckpointThread();
+  writer.path = path;
+  writer.step = step;
+  writer.failure.clear();
+  writer.parts = CheckpointWriteTimes();
+  writer.order = 0.0;
+  writer.started = Clock::now();
+  static const long delay = [] {
+    const char *value = std::getenv("MDIR_CHECKPOINT_WRITE_DELAY");
+    return value ? std::strtol(value, nullptr, 10) : 0L;
+  }();
+  writer.thread = std::thread([&writer, snapshot = std::move(snapshot),
+                               raw = std::move(raw)]() mutable {
+    // A write held back on purpose, for a test of the staging buffers
+    // (MDIR_CHECKPOINT_WRITE_DELAY, test/Driver/checkpoint-staging.test).
+    if (delay > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+    if (!raw.fields.empty()) {
+      Clock::time_point from = Clock::now();
+      snapshot.positions = raw.fields[0].order(raw.ids);
+      snapshot.velocities = raw.fields[1].order(raw.ids);
+      if (raw.fields.size() > 2)
+        snapshot.forces = raw.fields[2].order(raw.ids);
+      writer.order =
+          std::chrono::duration<double>(Clock::now() - from).count();
+    }
+    // Event 2: the staging buffers are released.
+    raw = RawState();
+    writer.released = Clock::now();
+    // Event 3: the commit.
+    if (llvm::Error error =
+            writeCheckpoint(writer.path, snapshot, &writer.parts))
+      writer.failure = llvm::toString(std::move(error));
+    writer.ended = Clock::now();
+  });
+}
+
+/// The functions of the runtime of a device that stage the copies of a
+/// frame (D400, runtime/mdrt_cuda.c), from the library that the
+/// run has loaded.
+struct StagingFunctions {
+  void *(*create)() = nullptr;
+  void *(*copy)(void *, int32_t, const void *, uint64_t) = nullptr;
+  void (*end)(void *) = nullptr;
+  int32_t (*wait)(void *, const char **) = nullptr;
+  void (*destroy)(void *) = nullptr;
+  void (*fail)(int32_t, const char *) = nullptr;
+  void (*setFailureHook)(void (*)()) = nullptr;
+
+  bool isComplete() const {
+    return create && copy && end && wait && destroy && fail && setFailureHook;
+  }
+};
+
+void drainFramesOnFailure();
+
+const StagingFunctions &getStagingFunctions() {
+  static StagingFunctions functions;
+  if (!functions.isComplete()) {
+    auto find = [](const char *name) {
+      return llvm::sys::DynamicLibrary::SearchForAddressOfSymbol(name);
+    };
+    functions.create = reinterpret_cast<void *(*)()>(find("mdrtStagingCreate"));
+    functions.copy = reinterpret_cast<void *(*)(void *, int32_t, const void *,
+                                                uint64_t)>(
+        find("mdrtStagingCopy"));
+    functions.end = reinterpret_cast<void (*)(void *)>(find("mdrtStagingEnd"));
+    // MDIR_STAGING_INCOMPLETE=1, for the tests: the wait is not looked
+    // up, as if the runtime lacked it (docs/environment.md).
+    static const bool incomplete = [] {
+      const char *value = std::getenv("MDIR_STAGING_INCOMPLETE");
+      return value && *value && std::strcmp(value, "0") != 0;
+    }();
+    functions.wait = incomplete
+                         ? nullptr
+                         : reinterpret_cast<int32_t (*)(void *, const char **)>(
+                               find("mdrtStagingWait"));
+    functions.destroy =
+        reinterpret_cast<void (*)(void *)>(find("mdrtStagingDestroy"));
+    functions.fail =
+        reinterpret_cast<void (*)(int32_t, const char *)>(
+            find("mdrtStagingFail"));
+    functions.setFailureHook = reinterpret_cast<void (*)(void (*)())>(
+        find("mdrtSetFailureHook"));
+    // Before a failure of the device ends the process, the frames whose
+    // copies had arrived are written, as the run wrote them before the
+    // failure when the frames had no thread.
+    if (functions.isComplete())
+      functions.setFailureHook(&drainFramesOnFailure);
+  }
+  return functions;
+}
+
+/// The copy of the buffers of one frame that the thread of the frames
+/// reads: on a device, a slot of the runtime's staging (the copies arrive
+/// in its pinned memory of the host once its event has passed); on the
+/// host, copies that the call made. The views describe the copies as the
+/// descriptors of the program described the buffers.
+struct FrameSlot {
+  void *staging = nullptr;
+  std::vector<char> positions;
+  std::vector<char> ids;
+  StridedMemRefType<char, 2> positionView{};
+  StridedMemRefType<int32_t, 1> idView{};
+};
+
+/// What a work of the thread of the frames failed with: the error of a
+/// write, which the run stops with (stopRun), or the error of the device
+/// that the wait for the copies of a frame met (`device`), which the
+/// runtime reports and ends the process with, as it ends it at a failure
+/// of the device on the thread of the steps (mdrtStagingFail).
+struct FrameFailure {
+  std::string message;
+  int32_t device = 0;
+  /// The call of the driver that returned `device`.
+  const char *call = "";
+
+  bool empty() const { return message.empty() && device == 0; }
+};
+
+/// The thread of the frames (D400, #113): one thread, which
+/// runs the writes of the frames and the changes of the cell of the
+/// trajectory in the order in which the steps queue them. A frame holds a
+/// slot of a ring of at most `MaxSlots`; the call of a frame that finds
+/// them all taken waits for the thread (back-pressure), so the memory of
+/// the copies stays bounded. A work that fails records its error; the
+/// works after it are dropped, as the run that stopped at the failure did
+/// not do them, and the next call of a frame or wait reports it.
+class FrameThread {
+public:
+  static constexpr size_t MaxSlots = 3;
+
+  /// A free slot, waiting while the thread holds all of them.
+  FrameSlot *takeSlot() {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (available.empty() && slots.size() < MaxSlots) {
+      slots.push_back(std::make_unique<FrameSlot>());
+      return slots.back().get();
+    }
+    freed.wait(lock, [&] { return !available.empty(); });
+    FrameSlot *slot = available.back();
+    available.pop_back();
+    return slot;
+  }
+
+  /// Gives back a slot that the call took and did not queue.
+  void returnSlot(FrameSlot *slot) {
+    std::lock_guard<std::mutex> lock(mutex);
+    available.push_back(slot);
+    freed.notify_all();
+  }
+
+  /// Queues `work`, which returns its error or an empty string; `slot`,
+  /// if any, is free again once it has run.
+  void post(std::function<FrameFailure()> work, FrameSlot *slot = nullptr) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!thread.joinable()) {
+      // The library's handler of the exit runs after this one, which
+      // waits for the frames still queued (an H5MD trajectory is written
+      // by the library): the handlers run in the reverse order of their
+      // registration.
+      openCheckpointLibrary();
+      static bool registered = [] {
+        // At the exit the frames still queued are written. A run that
+        // ends by its end or by stopRun has waited for them and reported
+        // their failures; an exit of another failure, which has been
+        // reported (waitForCheckpoint), adds none of theirs.
+        std::atexit([] { (void)FrameThread::getFrameThread().wait(); });
+        return true;
+      }();
+      (void)registered;
+      thread = std::thread([this] { run(); });
+    }
+    jobs.push_back({std::move(work), slot});
+    wake.notify_one();
+  }
+
+  /// Waits until every work queued has run; returns the error of the first
+  /// that failed since the last wait, and forgets it.
+  FrameFailure wait() {
+    std::unique_lock<std::mutex> lock(mutex);
+    idle.wait(lock, [&] { return jobs.empty() && !busy; });
+    return std::exchange(failure, FrameFailure());
+  }
+
+  /// Whether a work has failed since the last wait.
+  bool hasFailed() {
+    std::lock_guard<std::mutex> lock(mutex);
+    return !failure.empty();
+  }
+
+  /// After a wait: the slots, which `release` gives back to the runtime.
+  std::vector<std::unique_ptr<FrameSlot>> takeSlots() {
+    std::lock_guard<std::mutex> lock(mutex);
+    available.clear();
+    return std::move(slots);
+  }
+
+  static FrameThread &getFrameThread() {
+    // Never destroyed: the thread waits for work until the process ends.
+    static FrameThread *frames = new FrameThread;
+    return *frames;
+  }
+
+private:
+  struct Job {
+    std::function<FrameFailure()> work;
+    FrameSlot *slot;
+  };
+
+  void run() {
+    std::unique_lock<std::mutex> lock(mutex);
+    for (;;) {
+      wake.wait(lock, [&] { return !jobs.empty(); });
+      Job job = std::move(jobs.front());
+      jobs.pop_front();
+      busy = true;
+      bool skip = !failure.empty();
+      lock.unlock();
+      FrameFailure error = skip ? FrameFailure() : job.work();
+      job.work = nullptr;
+      lock.lock();
+      if (!error.empty() && failure.empty())
+        failure = std::move(error);
+      if (job.slot) {
+        available.push_back(job.slot);
+        freed.notify_all();
+      }
+      busy = false;
+      if (jobs.empty())
+        idle.notify_all();
+    }
+  }
+
+  std::mutex mutex;
+  std::condition_variable wake, idle, freed;
+  std::deque<Job> jobs;
+  bool busy = false;
+  FrameFailure failure;
+  std::thread thread;
+  std::vector<std::unique_ptr<FrameSlot>> slots;
+  std::vector<FrameSlot *> available;
+};
+
+FrameThread &getFrameThread() { return FrameThread::getFrameThread(); }
+
+/// The runtime's hook before a failure of the device ends the process
+/// (mdrtSetFailureHook): the frames queued before it are written, those
+/// whose copies had arrived, and the error of the device that a wait met is
+/// left to the runtime, which reports its own.
+void drainFramesOnFailure() { (void)getFrameThread().wait(); }
+
+} // namespace
+
+void mdir::driver::waitForCheckpoint() {
+  std::string failure = joinCheckpointThread();
+  if (failure.empty())
+    return;
+  std::fprintf(stderr, "mdir: %s\n", failure.c_str());
+  std::exit(1);
+}
+
+volatile std::sig_atomic_t mdir::driver::stopSignal = 0;
+
+void mdir::driver::setOutput(Output *output) { current = output; }
+
+/// Ends the run on a failure: the process exits, or an embedding program
+/// is told and the segment goes on to its end (D196).
+static void stopOnFailure(const Output &output, const std::string &message) {
+  if (output.fail) {
+    output.fail(message);
+    return;
+  }
+  // The frames queued before the failure are written first, as a run
+  // wrote them before it failed; one whose write failed reports its own
+  // error, which came first (D400).
+  FrameFailure earlier = getFrameThread().wait();
+  if (earlier.device)
+    getStagingFunctions().fail(earlier.device, earlier.call);
+  std::fprintf(stderr, "mdir: %s\n",
+               (earlier.message.empty() ? message : earlier.message).c_str());
+  std::exit(1);
+}
+
+Output *mdir::driver::getOutput() { return current; }
+
+void mdir::driver::stopRun(const std::string &message) {
+  if (current) {
+    stopOnFailure(*current, message);
+    return;
+  }
+  std::fprintf(stderr, "mdir: %s\n", message.c_str());
+  std::exit(1);
+}
+
+void mdir::driver::writeLogHeader(Output &output) {
+  if (output.minimizes) {
+    output.log.print("INFO: %9s %14s %14s %14s %9s %14s\n", "STEP",
+                 "POTENTIAL_ENE", "RMS_FORCE", "MAX_FORCE", "MAX_ATOM",
+                 "STEP_SIZE");
+    return;
+  }
+  if (output.overdamped)
+    output.log.print("INFO: %9s %14s %14s %14s", "STEP", "TIME",
+                     "POTENTIAL_ENE", "VIRIAL");
+  else
+    output.log.print("INFO: %9s %14s %14s %14s %14s %14s %14s",
+                 "STEP", "TIME", "TOTAL_ENE", "POTENTIAL_ENE", "KINETIC_ENE",
+                 "TEMPERATURE", "VIRIAL");
+  // Without a periodic cell, the cell around the particles has no pressure
+  // (D142).
+  if (output.periodic)
+    output.log.print(" %14s", "PRESSURE");
+  if (output.couples)
+    output.log.print(" %14s", "CONSERVED");
+  if (output.changesCell)
+    output.log.print(" %14s %14s", "VOLUME", "AREA_XY");
+  output.log.print("\n");
+}
+
+std::vector<ColumnFile::Column>
+mdir::driver::getEnergyColumns(const Output &output) {
+  using Column = ColumnFile::Column;
+  if (output.minimizes)
+    return {{"step", "-", true},          {"potential", "kcal/mol"},
+            {"rms_force", "kcal/mol/Å"}, {"max_force", "kcal/mol/Å"},
+            {"max_atom", "-", true},      {"step_size", "Å"}};
+  std::vector<Column> columns = {
+      {"step", "-", true},       {"time", "ps"},
+      {"total", "kcal/mol"},     {"potential", "kcal/mol"},
+      {"kinetic", "kcal/mol"},   {"temperature", "K"},
+      {"virial", "kcal/mol"}};
+  if (output.overdamped)
+    columns = {{"step", "-", true},
+               {"time", "ps"},
+               {"potential", "kcal/mol"},
+               {"virial", "kcal/mol"}};
+  if (output.periodic)
+    columns.push_back({"pressure", "atm"});
+  if (output.couples)
+    columns.push_back({"conserved", "kcal/mol"});
+  if (output.changesCell) {
+    columns.push_back({"volume", "Å^3"});
+    columns.push_back({"area_xy", "Å^2"});
+  }
+  // The version of the values of tunable parameters (D213).
+  if (output.tunablesVersion >= 0)
+    columns.push_back({"tunables_version", "-", true});
+  return columns;
+}
+
+void _mlir_ciface_mdrtWriteVirial(double xx, double yy, double zz) {
+  Output &output = *current;
+  // The virials of the correction for the dispersion and of the background
+  // of a net charge are isotropic: a third of each on each axis.
+  double constant =
+      (output.getDispersionVirial() + output.getCoulombConstantVirial()) / 3.0;
+  output.log.print(
+               "MDIR: the diagonal of the virial at the start, without the "
+               "constraints, in kcal/mol:\nMDIR:   %16.6f %16.6f %16.6f\n",
+               (xx + constant) / units::energy, (yy + constant) / units::energy,
+               (zz + constant) / units::energy);
+}
+
+void _mlir_ciface_mdrtWriteFrameForces(void *forces, void *ids) {
+  Output &output = *current;
+  if (!output.frameGradient)
+    return;
+  // dU/dx = -F, in the order of the input and in the type of the forces:
+  // nothing is converted.
+  auto *buffer = static_cast<StridedMemRefType<char, 2> *>(forces);
+  auto *numbers = static_cast<StridedMemRefType<int32_t, 1> *>(ids);
+  int64_t count = buffer->sizes[0];
+  auto fill = [&](auto *from, auto *to) {
+    for (int64_t i = 0; i != count; ++i) {
+      int64_t place = numbers->data[numbers->offset + i * numbers->strides[0]];
+      for (int64_t c = 0; c != 3; ++c)
+        to[3 * place + c] = -from[buffer->offset + i * buffer->strides[0] +
+                                  c * buffer->strides[1]];
+    }
+  };
+  if (output.force == Element::F32)
+    fill(reinterpret_cast<const float *>(buffer->data),
+         static_cast<float *>(output.frameGradient));
+  else
+    fill(reinterpret_cast<const double *>(buffer->data),
+         static_cast<double *>(output.frameGradient));
+  output.frameGradientWritten = true;
+}
+
+void _mlir_ciface_mdrtWriteFrameProductForces(void *forces, void *tangentForces,
+                                              void *ids) {
+  Output &output = *current;
+  auto *numbers = static_cast<StridedMemRefType<int32_t, 1> *>(ids);
+  auto take = [&](void *values, std::vector<double> &to) {
+    auto *buffer = static_cast<StridedMemRefType<char, 2> *>(values);
+    int64_t count = buffer->sizes[0];
+    to.assign(static_cast<size_t>(3 * count), 0.0);
+    auto fill = [&](auto *from) {
+      for (int64_t i = 0; i != count; ++i) {
+        int64_t place = numbers->data[numbers->offset + i * numbers->strides[0]];
+        for (int64_t c = 0; c != 3; ++c)
+          to[3 * place + c] = -static_cast<double>(
+              from[buffer->offset + i * buffer->strides[0] + c * buffer->strides[1]]);
+      }
+    };
+    if (output.force == Element::F32)
+      fill(reinterpret_cast<const float *>(buffer->data));
+    else
+      fill(reinterpret_cast<const double *>(buffer->data));
+  };
+  take(forces, output.frameProductGradient);
+  take(tangentForces, output.frameProductHessian);
+  output.frameProductForcesWritten = true;
+}
+
+void _mlir_ciface_mdrtWriteFrameVirial(double xx, double xy, double xz,
+                                       double yx, double yy, double yz,
+                                       double zx, double zy, double zz) {
+  Output &output = *current;
+  // W = Σ d ⊗ F, and dU/dε_ab = Σ (dU/dx_a) x_b = -W_ba under x -> (1 + ε) x
+  // of the positions and the cell vectors. What the host adds at the volume
+  // of the frame is added by the one who reads this (Output::getFrameStrain).
+  output.frameStrain = {-xx, -yx, -zx, -xy, -yy, -zy, -xz, -yz, -zz};
+  output.frameStrainWritten = true;
+}
+
+void _mlir_ciface_mdrtWriteTerms(void *terms) {
+  Output &output = *current;
+  auto *values = static_cast<StridedMemRefType<double, 1> *>(terms);
+  static const char *names[] = {
+      "Lennard-Jones", "Coulomb", "bonds", "angles", "dihedrals",
+      "Lennard-Jones 1-4", "Coulomb 1-4", "CMAP", "Coulomb excluded",
+      "Coulomb reciprocal", "Urey-Bradley", "harmonic impropers",
+      "Lennard-Jones excluded", "Lennard-Jones reciprocal", "restraints"};
+  // CMAP, Urey–Bradley, and harmonic impropers only where the topology has
+  // them, and the terms of particle mesh Ewald only with it; with it
+  // "Coulomb" is the direct sum, and with that of the dispersion (D162)
+  // "Lennard-Jones" is.
+  const Topology *topology =
+      output.system ? output.system->topology.get() : nullptr;
+  bool cmap = topology && !topology->cmaps.empty();
+  bool ureyBradley = topology && !topology->ureyBradleys.empty();
+  bool impropers = topology && !topology->harmonicImpropers.empty();
+  output.log.print("MDIR: the terms at the start, in kcal/mol:\n");
+  double total = output.getDispersionEnergy() +
+                 output.getCoulombConstantEnergy() + output.ljpmeSelfEnergy;
+  // The terms given by expressions follow those of the topology under
+  // their names, those over tuples (D136) and then those over pairs (D137),
+  // generalized Born (D144), and those of the positions (D148), and the
+  // restraints come last.
+  int custom = topology ? static_cast<int>(topology->tupleTerms.size()) : 0;
+  int pairs = topology ? static_cast<int>(output.system->pairTermNames.size())
+                       : 0;
+  int born = topology ? static_cast<int>(output.system->bornTermNames.size())
+                      : 0;
+  int external =
+      topology ? static_cast<int>(topology->externalTerms.size()) : 0;
+  for (int i = 0, e = static_cast<int>(values->sizes[0]); i != e; ++i) {
+    if ((i == 7 && !cmap) ||
+        (i == 8 && !output.pme && !output.reactionField) ||
+        (i == 9 && !output.pme) ||
+        (i == 10 && !ureyBradley) || (i == 11 && !impropers) ||
+        ((i == 12 || i == 13) && !output.ljpme))
+      continue;
+    std::string name =
+        i < 14            ? names[i]
+        : i < 14 + custom ? topology->tupleTerms[i - 14].name
+        : i < 14 + custom + pairs
+            ? output.system->pairTermNames[i - 14 - custom]
+        : i < 14 + custom + pairs + born
+            ? output.system->bornTermNames[i - 14 - custom - pairs]
+        : i < 14 + custom + pairs + born + external
+            ? topology->externalTerms[i - 14 - custom - pairs - born].name
+            : names[14];
+    double value = values->data[i * values->strides[0]];
+    total += value;
+    output.log.print("MDIR:   %-22s %16.6f\n", name.c_str(),
+                 value / units::energy);
+  }
+  // A learned potential (D270), evaluated with the forces of
+  // the start; ML1 takes one.
+  if (output.models) {
+    double energy;
+    std::array<double, 9> tensor;
+    output.models->read(energy, tensor);
+    std::string name = "MODEL " + output.models->getNames().front();
+    total += energy;
+    output.log.print("MDIR:   %-22s %16.6f\n", name.c_str(),
+                     energy / units::energy);
+  }
+  if (output.pme || output.reactionField)
+    output.log.print("MDIR:   %-22s %16.6f\n", "Coulomb self",
+                 output.getCoulombConstantEnergy() / units::energy);
+  if (output.ljpme)
+    output.log.print("MDIR:   %-22s %16.6f\n", "Lennard-Jones self",
+                     output.ljpmeSelfEnergy / units::energy);
+  else
+    output.log.print("MDIR:   %-22s %16.6f\n", "dispersion",
+                     output.getDispersionEnergy() / units::energy);
+  output.log.print("MDIR:   %-22s %16.6f\n", "total",
+               total / units::energy);
+}
+
+void _mlir_ciface_mdrtWritePull(int64_t step, void *coordinates,
+                                void *terms) {
+  Output &output = *current;
+  if (!output.pull.isOpen())
+    return;
+  // For each term its coordinates, then its energy and the forces along
+  // them, in the order of the header, in kcal/mol and per Å or radian.
+  auto *q = static_cast<StridedMemRefType<double, 1> *>(coordinates);
+  auto *e = static_cast<StridedMemRefType<double, 1> *>(terms);
+  std::vector<double> row = {output.getTime(step)};
+  int64_t column = 0, slot = 0;
+  for (int64_t count : output.pullCounts) {
+    for (int64_t k = 0; k != count; ++k)
+      row.push_back(q->data[(column + k) * q->strides[0]]);
+    for (int64_t k = 0; k != count + 1; ++k)
+      row.push_back(e->data[(slot + k) * e->strides[0]]);
+    column += count;
+    slot += count + 1;
+  }
+  output.pull.write(step, row);
+}
+
+void _mlir_ciface_mdrtWriteFreeEnergy(int64_t step, void *values) {
+  Output &output = *current;
+  if (!output.freeEnergy.isOpen())
+    return;
+  // The derivative of `@alchemical` in each component of λ, then its
+  // energy at every state, in kJ/mol; the constant terms follow at the
+  // volume of the cell (D161). The row: dH/dλ of each component, then
+  // U(λ_k) − U(λ of the run) for each state k, in kcal/mol. With one state
+  // the values hold the derivatives alone (D190).
+  auto *v = static_cast<StridedMemRefType<double, 1> *>(values);
+  auto at = [&](size_t k) { return v->data[k * v->strides[0]]; };
+  double scale = output.firstVolume / output.volume;
+  size_t components = output.lambdaFixedDerivatives.size();
+  size_t states = output.stateFixedEnergies.size();
+  std::vector<double> row = {output.getTime(step)};
+  for (size_t c = 0; c != components; ++c)
+    row.push_back((at(c) + output.lambdaFixedDerivatives[c] +
+                   output.lambdaVolumeDerivatives[c] * scale) /
+                  units::energy);
+  auto energy = [&](size_t k) {
+    return at(components + k) + output.stateFixedEnergies[k] +
+           output.stateVolumeEnergies[k] * scale;
+  };
+  if (states > 1) {
+    double own = energy(static_cast<size_t>(output.freeEnergyState));
+    for (size_t k = 0; k != states; ++k)
+      row.push_back((energy(k) - own) / units::energy);
+  }
+  output.freeEnergy.write(step, row);
+}
+
+void _mlir_ciface_mdrtWriteObservables(int64_t step, void *values) {
+  Output &output = *current;
+  if (!output.observables.isOpen() && !output.embedded)
+    return;
+  auto *v = static_cast<StridedMemRefType<double, 1> *>(values);
+  std::vector<double> row = {output.getTime(step)};
+  // The tails of the observed pair terms at the volume of the cell
+  // (D209).
+  double scale = output.firstVolume / output.volume;
+  std::vector<double> taken;
+  for (int64_t k = 0; k != v->sizes[0]; ++k) {
+    double value = v->data[k * v->strides[0]];
+    if (static_cast<size_t>(k) < output.observableVolumeConstants.size())
+      value += output.observableVolumeConstants[k] * scale;
+    if (static_cast<size_t>(k) < output.observableFixedConstants.size())
+      value += output.observableFixedConstants[k];
+    taken.push_back(value);
+    row.push_back(value / units::energy);
+  }
+  // A program that embeds the run takes the values of every step of
+  // energy, and its file the rows that are due (D232); a
+  // step whose energies are evaluated anew has its row already (D213).
+  if (output.embedded) {
+    output.lastObservables = {step, std::move(taken)};
+    if (step == output.quietStep || output.observablesPeriod <= 0 ||
+        (step - output.firstStep) % output.observablesPeriod != 0)
+      return;
+    if (output.tunablesVersion >= 0)
+      row.push_back(static_cast<double>(output.tunablesVersion));
+  }
+  output.observables.write(step, row);
+}
+
+void _mlir_ciface_mdrtWriteTunableGradient(void *values) {
+  Output &output = *current;
+  auto *v = static_cast<StridedMemRefType<double, 1> *>(values);
+  output.tunableGradient.assign(static_cast<size_t>(v->sizes[0]), 0.0);
+  for (int64_t k = 0; k != v->sizes[0]; ++k)
+    output.tunableGradient[k] = v->data[v->offset + k * v->strides[0]];
+  output.tunableGradientVolume = output.volume;
+  output.tunableGradientWritten = true;
+}
+
+void _mlir_ciface_mdrtWriteTunableGradientField(int64_t index, void *values,
+                                                void *ids) {
+  Output &output = *current;
+  auto *buffer = static_cast<StridedMemRefType<double, 1> *>(values);
+  auto *numbers = static_cast<StridedMemRefType<int32_t, 1> *>(ids);
+  if (output.tunableGradientFields.size() <= static_cast<size_t>(index))
+    output.tunableGradientFields.resize(index + 1);
+  std::vector<double> &field = output.tunableGradientFields[index];
+  int64_t count = buffer->sizes[0];
+  field.assign(static_cast<size_t>(count), 0.0);
+  for (int64_t i = 0; i != count; ++i)
+    field[numbers->data[numbers->offset + i * numbers->strides[0]]] =
+        buffer->data[buffer->offset + i * buffer->strides[0]];
+}
+
+void _mlir_ciface_mdrtAddBath(double energy) { current->bath += energy; }
+
+double Output::getChainEnergy() const {
+  size_t m = chainMasses.size();
+  double energy = 0.0;
+  for (size_t j = 0; j != m; ++j) {
+    double v = chain[m + j];
+    energy += 0.5 * chainMasses[j] * v * v +
+              (j == 0 ? chainFreedom : 1.0) * chainKT * chain[j];
+  }
+  return energy;
+}
+
+/// The Suzuki-Yoshida weights of order 6 of Martyna, Tuckerman, Tobias,
+/// and Klein (1996), which sum to 1.
+static const double chainWeights[7] = {
+    0.784513610477560, 0.235573213359357, -1.17767998417887,
+    1.31518632068391,  -1.17767998417887, 0.235573213359357,
+    0.784513610477560};
+
+/// The action of a Nose-Hoover chain over the time h of a period of
+/// coupling in `parts` equal parts, factorized as in Martyna, Tuckerman,
+/// Tobias, and Klein, Mol. Phys. 87, 1117 (1996): by the Suzuki-Yoshida
+/// weights of order 6 (seven parts w_k h / parts, which sum to h / parts),
+/// each a symmetric sequence of half-steps of the velocities v_j of the
+/// thermostats from the end of the chain to the first, a scaling of the
+/// particle velocities by exp(-v_1 s), and the reverse. The forces on the
+/// thermostats are G_1 = (2K - N_f k_B T) / Q_1 and G_j = (Q_{j-1}
+/// v_{j-1}^2 - k_B T) / Q_j (Martyna, Klein, and Tuckerman, J. Chem. Phys.
+/// 97, 2635 (1992), eq. 2.9). Returns the factor of the particle
+/// velocities; `largest` is the largest |s v_j| that the action met.
+static double moveChain(const Output &output, double *xi, double *v,
+                        double kinetic, int parts, double &largest) {
+  const std::vector<double> &q = output.chainMasses;
+  size_t m = q.size();
+  double kT = output.chainKT, freedom = output.chainFreedom;
+  auto force = [&](size_t j, double k) {
+    if (j == 0)
+      return (2.0 * k - freedom * kT) / q[0];
+    return (q[j - 1] * v[j - 1] * v[j - 1] - kT) / q[j];
+  };
+  auto meet = [&](double s) {
+    for (size_t j = 0; j != m; ++j) {
+      // Not std::max, which would drop a NaN.
+      if (!(std::fabs(s * v[j]) <= largest))
+        largest = std::fabs(s * v[j]);
+    }
+  };
+  largest = 0.0;
+  double scale = 1.0, k = kinetic;
+  for (int part = 0; part != parts; ++part) {
+    for (double weight : chainWeights) {
+      double s = weight * output.chainTime / parts;
+      meet(s);
+      // The velocities of the thermostats over s / 2 on each side of the
+      // scaling, from the end of the chain to its start and back, each damped
+      // by the one after it.
+      v[m - 1] += 0.5 * s * force(m - 1, k);
+      for (size_t j = m - 1; j-- > 0;) {
+        double damp = std::exp(-0.25 * s * v[j + 1]);
+        v[j] = (v[j] * damp + 0.5 * s * force(j, k)) * damp;
+      }
+      meet(s);
+      double factor = std::exp(-s * v[0]);
+      scale *= factor;
+      k *= factor * factor;
+      for (size_t j = 0; j != m; ++j)
+        xi[j] += s * v[j];
+      for (size_t j = 0; j + 1 < m; ++j) {
+        double damp = std::exp(-0.25 * s * v[j + 1]);
+        v[j] = (v[j] * damp + 0.5 * s * force(j, k)) * damp;
+      }
+      v[m - 1] += 0.5 * s * force(m - 1, k);
+      meet(s);
+    }
+  }
+  return scale;
+}
+
+/// The largest |s v_j| that an action of a Nose-Hoover chain may meet, s
+/// a part w_k h / n_c and v_j the velocity of thermostat j (D206).
+/// Near equilibrium it is about 0.2. On identical harmonic wells (#117),
+/// the action of 11 parts gave the potential energy within 0.015 kJ/mol of
+/// one of 1000 parts while it met at most 2.9, 0.3 kJ/mol beyond 3.3, and
+/// kJ/mol beyond 4; at about 6 the chain ran to infinity within an action.
+static constexpr double largestChainStep = 3.0;
+
+void Output::setChain(const Control &control, const System &system) {
+  chain.clear();
+  chainMasses.clear();
+  checkpoint.thermostatState.clear();
+  if (!control.isNoseHoover())
+    return;
+  // The masses of Martyna, Klein, and Tuckerman (1992),
+  // Q_1 = N_f k_B T / ω² and Q_j = k_B T / ω², with ω = 2π / τ, the
+  // frequency of the period τ; the chain at rest, or as the checkpoint
+  // left it.
+  double kT = units::boltzmann * control.temperature;
+  double omega = 2.0 * M_PI / control.tauT;
+  size_t m = static_cast<size_t>(control.chainLength);
+  chainKT = kT;
+  chainFreedom = system.getDegreesOfFreedom();
+  chainTime =
+      static_cast<double>(control.getCouplingPeriod()) * control.timestep;
+  // The action of the chain over the period is split into equal parts of
+  // at most τ / 50: with one part, a period of 10 steps of 4 fs and
+  // τ = 0.5 ps, a liquid far from the temperature of the bath drove the
+  // later thermostats beyond what the factorization follows, and the run
+  // failed.
+  chainSubsteps = std::max<int>(
+      1, static_cast<int>(std::ceil(50.0 * chainTime / control.tauT - 1e-9)));
+  chainMasses.assign(m, kT / (omega * omega));
+  chainMasses[0] *= chainFreedom;
+  chain.assign(2 * m, 0.0);
+  if (system.thermostatState.size() == 2 * m)
+    chain = system.thermostatState;
+  checkpoint.thermostatState = chain;
+}
+
+double mdrtNoseHooverFactor(int64_t step, double kinetic) {
+  Output &output = *current;
+  std::vector<double> &chain = output.chain;
+  size_t m = output.chainMasses.size();
+  if (m == 0 || !(kinetic > 0.0))
+    return 1.0;
+  // The action is that of the canonical scheme in a fixed number of parts,
+  // chainSubsteps, chosen before the run. A part of length s with a
+  // negative weight turns the damping exp(-s v_{j+1} / 4) into a growth,
+  // undone only to the order of the factorization, so the scheme follows
+  // the chain only while every |s v_j| is small. A chain driven far beyond
+  // its thermal velocities 2 pi / tau_T leaves that range: the run then
+  // stops, on a copy of the chain and before the velocities are scaled,
+  // rather than continue with an action that no longer follows the chain
+  // or, as on identical harmonic wells (#117), with NaN (D206). The
+  // guard reads the action and changes nothing in it.
+  std::vector<double> moved = chain;
+  double largest = 0.0;
+  double scale = moveChain(output, moved.data(), moved.data() + m, kinetic,
+                           output.chainSubsteps, largest);
+  bool finite = std::isfinite(scale);
+  for (double value : moved)
+    finite = finite && std::isfinite(value);
+  if (!finite || !(largest <= largestChainStep)) {
+    // The velocities of the chain before the action, and their thermal
+    // size sqrt(k_B T / Q_M) = 2 pi / tau_T.
+    std::string velocities;
+    double fastest = 0.0;
+    for (size_t j = 0; j != m; ++j) {
+      char value[32];
+      std::snprintf(value, sizeof value, "%s%.3g", j ? ", " : "",
+                    chain[m + j]);
+      velocities += value;
+      fastest = std::max(fastest, std::fabs(chain[m + j]));
+    }
+    double omega = std::sqrt(output.chainKT *
+                             (m > 1 ? 1.0 : output.chainFreedom) /
+                             output.chainMasses[m - 1]);
+    char message[1024];
+    std::snprintf(
+        message, sizeof message,
+        "at step %lld the Nose-Hoover chain no longer follows its "
+        "factorization in %d parts: a part moved it by |s v_j| = %.3g%s, "
+        "above %g, from velocities (%s)/ps, %.3g times their thermal size "
+        "2 pi / time_constant, with a kinetic energy %.3g times that of the "
+        "bath; the run stops. The chain is driven far from equilibrium; give "
+        "a shorter 'interval' in [thermostat], a larger 'time_constant', or "
+        "another thermostat",
+        static_cast<long long>(step), output.chainSubsteps, largest,
+        finite ? "" : " and values that are not numbers", largestChainStep,
+        velocities.c_str(), fastest / omega,
+        2.0 * kinetic / (output.chainFreedom * output.chainKT));
+    stopOnFailure(output, message);
+    return 1.0;
+  }
+  chain = std::move(moved);
+  // The chain is driven by the kinetic energy of the optimal temperature
+  // while its scaling acts on the velocities (D263), so the
+  // energy of the system and of the chain is not conserved: the bath counts
+  // what the scaling takes from the particles, exactly, in the program, as
+  // under velocity rescaling.
+  output.checkpoint.thermostatState = chain;
+  return scale;
+}
+
+void mdrtWriteSolvent(double kinetic, double half) {
+  Output &output = *current;
+  output.hasSolvent = true;
+  output.solventKinetic = kinetic;
+  output.solventHalf = half;
+}
+
+void _mlir_ciface_mdrtSetBarostatState(double w0, double w1, double w2,
+                                       double g0, double g1, double g2,
+                                       double k0, double k1, double k2) {
+  current->checkpoint.barostatState = {w0, w1, w2, g0, g1, g2, k0, k1, k2};
+}
+
+void _mlir_ciface_mdrtSetBox(double lx, double ly, double lz) {
+  Output &output = *current;
+  double before[3] = {output.box[0], output.box[1], output.box[2]};
+  output.box[0] = lx;
+  output.box[1] = ly;
+  output.box[2] = lz;
+  output.volume = lx * ly * lz;
+  double edges[3] = {lx / units::length, ly / units::length,
+                     lz / units::length};
+  // The thread of the frames changes the cell of the trajectory between
+  // the frames queued before and after (D400).
+  if (output.trajectory) {
+    std::array<double, 3> scaled = {edges[0], edges[1], edges[2]};
+    std::array<double, 3> exact = {output.box[0], output.box[1],
+                                   output.box[2]};
+    getFrameThread().post([trajectory = output.trajectory.get(), scaled,
+                           exact] {
+      trajectory->setBox(scaled.data());
+      trajectory->setExactEdges(exact.data());
+      return FrameFailure();
+    });
+  }
+  output.checkpoint.box[0] = lx;
+  output.checkpoint.box[1] = ly;
+  output.checkpoint.box[2] = lz;
+  static const char axes[] = "xyz";
+  // A cell that is not finite, or that one coupling has scaled by more
+  // than a factor of 2, comes from a pressure that is not a number or has
+  // blown up: the run has failed. The builds of the neighbor structures
+  // would take the cell as it is (#168, D225).
+  for (int k = 0; k != 3; ++k) {
+    char message[320];
+    if (!std::isfinite(output.box[k])) {
+      std::snprintf(message, sizeof message,
+                    "the barostat has made the cell %s along %c; the run "
+                    "has failed (a time step too long, a bad contact, or a "
+                    "defect of mdir)",
+                    std::isnan(output.box[k]) ? "not a number" : "infinite",
+                    axes[k]);
+      stopOnFailure(output, message);
+      return;
+    }
+    double ratio = output.box[k] / before[k];
+    if (before[k] > 0.0 && !(ratio >= 0.5 && ratio <= 2.0)) {
+      std::snprintf(message, sizeof message,
+                    "the barostat has scaled the cell by %.4g along %c at "
+                    "one coupling, from %.4f Ang to %.4g Ang; the run has "
+                    "failed (a time step too long, a bad contact, or a "
+                    "defect of mdir)",
+                    ratio, axes[k], before[k] / units::length,
+                    output.box[k] / units::length);
+      stopOnFailure(output, message);
+      return;
+    }
+  }
+  for (int k = 0; k != 3; ++k)
+    if (output.box[k] < output.leastEdge) {
+      char message[256];
+      std::snprintf(message, sizeof message,
+                    "the barostat has made the cell %.4f Ang along %c, "
+                    "less than twice the cutoff, %.4f Ang; the run needs a "
+                    "larger cell",
+                    output.box[k] / units::length, axes[k],
+                    0.5 * output.leastEdge / units::length);
+      stopOnFailure(output, message);
+      return;
+    }
+  for (int k = 0; k != 3; ++k)
+    if (output.box[k] < output.leastReachEdge) {
+      char message[320];
+      std::snprintf(message, sizeof message,
+                    "the barostat has made the cell %.4f Ang along %c, less "
+                    "than the pairlist distance over 0.999, %.4f Ang, below "
+                    "which the groups do not hold every pair; the run needs "
+                    "a larger cell or a shorter 'pairlist_distance'",
+                    output.box[k] / units::length, axes[k],
+                    output.leastReachEdge / units::length);
+      stopOnFailure(output, message);
+      return;
+    }
+}
+
+void _mlir_ciface_mdrtSetTilt(double bx, double cx, double cy) {
+  Output &output = *current;
+  double tilts[3] = {bx / units::length, cx / units::length,
+                     cy / units::length};
+  if (output.trajectory) {
+    std::array<double, 3> scaled = {tilts[0], tilts[1], tilts[2]};
+    std::array<double, 3> exact = {bx, cx, cy};
+    getFrameThread().post([trajectory = output.trajectory.get(), scaled,
+                           exact] {
+      trajectory->setTilt(scaled.data());
+      trajectory->setExactTilt(exact.data());
+      return FrameFailure();
+    });
+  }
+  output.checkpoint.tilt[0] = bx;
+  output.checkpoint.tilt[1] = cx;
+  output.checkpoint.tilt[2] = cy;
+}
+
+void _mlir_ciface_mdrtWriteEnergies(int64_t step, double potential,
+                                    double kinetic, double excess,
+                                    double virial, double pressureKinetic) {
+  Output &output = *current;
+  ReturnMark returns;
+  // A step of energy that is not a row of the log keeps no temperatures of
+  // the solvent and the solute, as for `mdir run`; an embedded program
+  // (D196) still takes its energies, without a row.
+  // The energies evaluated anew after an update of tunable parameters
+  // (D213) are of a step that has its row already.
+  bool isRow = step != output.quietStep &&
+               (output.energyPeriod <= 0 ||
+                (step - output.firstStep) % output.energyPeriod == 0);
+  if (!isRow) {
+    output.hasSolvent = false;
+    if (!output.embedded)
+      return;
+  }
+  if (OutputTimes &times = getTimes(); times.enabled && isRow) {
+    Clock::time_point now = Clock::now();
+    if (times.lastRowStep >= 0 && step > times.lastRowStep)
+      std::fprintf(stderr,
+                   "MDIR: times of the row at step %lld: %.1f ms since the "
+                   "row at step %lld, %.1f ms of it in frames and "
+                   "checkpoints\n",
+                   static_cast<long long>(step),
+                   getMilliseconds(times.lastRow, now),
+                   static_cast<long long>(times.lastRowStep),
+                   1.0e3 * times.written);
+    times.lastRow = now;
+    times.lastRowStep = step;
+    times.written = 0.0;
+  }
+  // `kinetic` is that of the velocities at the step. The total energy has
+  // it, because that sum varies least.
+  // The correction for the dispersion is a number of the volume.
+  potential += output.getDispersionEnergy() +
+               output.getCoulombConstantEnergy() + output.ljpmeSelfEnergy;
+  virial += output.getDispersionVirial() + output.getCoulombConstantVirial();
+  double total = potential + kinetic;
+
+  // The mean of the kinetic energies half a step before and after,
+  // K_half, exceeds `kinetic` by `excess`: (dt^2 / 8) sum F^2 / m without
+  // constraints, measured from the velocities of the half steps with them.
+  // The temperature takes the optimal estimate (2 K_half + K) / 3 (D45,
+  // D203), which the thermostats control (D263); the
+  // pressure takes the kinetic energy of the centers of the groups at the
+  // half steps, `pressureKinetic`, with the virial of the groups
+  // (D264). See Jung et al., J. Chem. Phys. 148,
+  // 164109 (2018), J. Chem. Theory Comput. 15, 84 (2019), and Jung and
+  // Sugita, J. Chem. Phys. 153, 234115 (2020).
+  double half = pressureKinetic;
+  // Under Langevin dynamics the friction and the noise act on the
+  // velocities of the middle of the step, between its drifts, which sample
+  // the temperature of the bath where the configurations do (BAOAB
+  // [Leimkuhler2013]; g-BAOAB [Leimkuhler2016]): the temperature takes the
+  // kinetic energy of the half steps, K_half (D265).
+  double optimal = output.halfTemperature ? kinetic + excess
+                                          : kinetic + 2.0 * excess / 3.0;
+  double temperature =
+      2.0 * optimal / (output.degreesOfFreedom * units::boltzmann);
+  // The temperatures of the solvent, the rigid waters, and of the solute,
+  // the rest, each with its own degrees of freedom (D203): their sums,
+  // for the summary at the end of `mdir run`, and no row (#300).
+  if (output.hasSolvent) {
+    output.hasSolvent = false;
+    double solvent = output.solventFreedom;
+    double solute = output.degreesOfFreedom - solvent;
+    bool halfOnly = output.halfTemperature;
+    auto get = [halfOnly](double k, double h, double freedom) {
+      double estimate = halfOnly ? h : (k + 2.0 * h) / 3.0;
+      return 2.0 * estimate / (freedom * units::boltzmann);
+    };
+    double k = output.solventKinetic, h = output.solventHalf;
+    if (solvent > 0.0) {
+      output.solventOptimal.add(get(k, h, solvent));
+      output.solventFull.add(2.0 * k / (solvent * units::boltzmann));
+    }
+    if (solute > 0.5) {
+      double atomicHalf = kinetic + excess;
+      output.soluteOptimal.add(get(kinetic - k, atomicHalf - h, solute));
+      output.soluteFull.add(2.0 * (kinetic - k) /
+                                  (solute * units::boltzmann));
+    }
+  }
+  // Brownian dynamics has no momenta: the pressure takes those of the
+  // bath (D163b).
+  if (output.overdamped)
+    half = output.bathKinetic;
+  // `virial` is the trace of W, the sum of d (x) K over the pairs (B8).
+  double pressure = (2.0 * half + virial) / (3.0 * output.volume);
+  // The columns of the log, and of the file of the energies (D149).
+  std::vector<double> row = {output.getTime(step),
+                             total / units::energy,
+                             potential / units::energy,
+                             kinetic / units::energy,
+                             temperature,
+                             virial / units::energy};
+  if (output.overdamped)
+    row = {output.getTime(step), potential / units::energy,
+           virial / units::energy};
+  if (output.periodic)
+    row.push_back(pressure * units::pressure);
+  if (output.couples) {
+    total += output.bath;
+    row.push_back(total / units::energy);
+  }
+  if (output.changesCell) {
+    row.push_back(output.volume /
+                  (units::length * units::length * units::length));
+    // The reduced cell has a = (Lx, 0, 0), b = (bx, Ly, 0), so
+    // |a × b| = Lx Ly even with a tilt (D170).
+    row.push_back(output.box[0] * output.box[1] /
+                  (units::length * units::length));
+  }
+  if (output.tunablesVersion >= 0)
+    row.push_back(static_cast<double>(output.tunablesVersion));
+  // The total here has the energy of the bath if the run couples: the
+  // conserved energy (D196 reports both).
+  output.lastEnergies = {step,
+                         potential,
+                         kinetic,
+                         potential + kinetic,
+                         temperature,
+                         virial,
+                         // Convert kJ/mol/nm^3 to bar with the native coefficient.
+                         pressure * mdir::physical::pressureBar,
+                         potential + kinetic + (output.couples ? output.bath : 0.0),
+                         output.volume};
+  if (!isRow)
+    return;
+  output.log.print("INFO: %9lld", static_cast<long long>(step));
+  for (double value : row)
+    output.log.print(" %14.4f", value);
+  output.log.print("\n");
+  output.log.flush();
+  output.energies.write(step, row);
+
+  if (!output.hasEnergies)
+    output.firstTotal = total;
+  output.hasEnergies = true;
+  output.lastTotal = total;
+  // For the rate at the end of `mdir run`: the first row at or after the
+  // middle of the run and the last one (#300).
+  std::pair<int64_t, double> time = {
+      step, std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count()};
+  ++output.numEnergyTimes;
+  if (!output.rateFrom && step >= output.rateStep)
+    output.rateFrom = time;
+  output.rateLast = time;
+}
+
+/// The values of a buffer with three numbers per particle, scaled, in the
+/// order of the numbers of the particles, which `ids` holds. `element` is
+/// the type that the buffer holds.
+static std::vector<double> readVectors(void *descriptor, void *ids,
+                                       Element element, double scale = 1.0) {
+  auto *buffer = static_cast<StridedMemRefType<char, 2> *>(descriptor);
+  auto *numbers = static_cast<StridedMemRefType<int32_t, 1> *>(ids);
+  int64_t count = buffer->sizes[0];
+  std::vector<double> values(3 * count);
+  for (int64_t i = 0; i != count; ++i) {
+    int64_t place =
+        numbers->data[numbers->offset + i * numbers->strides[0]];
+    for (int64_t c = 0; c != 3; ++c) {
+      int64_t index =
+          buffer->offset + i * buffer->strides[0] + c * buffer->strides[1];
+      double value;
+      if (element == Element::F32)
+        value = reinterpret_cast<float *>(buffer->data)[index];
+      else
+        value = reinterpret_cast<double *>(buffer->data)[index];
+      values[3 * place + c] = scale * value;
+    }
+  }
+  return values;
+}
+
+bool mdir::driver::isMinimizationStalled(const Output &output,
+                                         double stepSize) {
+  return stepSize < output.minimizeStepFloor &&
+         stepSize < output.minimizeFirstStep;
+}
+
+void _mlir_ciface_mdrtWriteMinimization(int64_t step, double energy,
+                                        double size, void *forces,
+                                        void *ids) {
+  Output &output = *current;
+  output.lastMinimizationStep = step;
+  std::vector<double> values = readVectors(forces, ids, output.force);
+  const std::vector<double> &masses = output.system->masses;
+  double square = 0.0, largest = 0.0;
+  size_t counted = 0, where = 0;
+  for (size_t i = 0, e = masses.size(); i != e; ++i) {
+    if (masses[i] == 0.0)
+      continue;
+    double f2 = values[3 * i] * values[3 * i] +
+                values[3 * i + 1] * values[3 * i + 1] +
+                values[3 * i + 2] * values[3 * i + 2];
+    square += f2;
+    ++counted;
+    if (f2 > largest) {
+      largest = f2;
+      where = i;
+    }
+  }
+  double scale = units::energy / units::length;
+  double rms = counted ? std::sqrt(square / counted) : 0.0;
+  energy += output.getDispersionEnergy() +
+            output.getCoulombConstantEnergy() + output.ljpmeSelfEnergy;
+  output.lastMinimization = {step, energy, rms, std::sqrt(largest), size,
+                             static_cast<int64_t>(where)};
+  output.log.print("INFO: %9lld %14.4f %14.4f %14.4f %9zu %14.6f\n",
+               static_cast<long long>(step), energy / units::energy,
+               rms / scale, std::sqrt(largest) / scale, where + 1,
+               size / units::length);
+  output.log.flush();
+  output.energies.write(step, {energy / units::energy, rms / scale,
+                               std::sqrt(largest) / scale,
+                               static_cast<double>(where + 1),
+                               size / units::length});
+  if (!output.hasEnergies)
+    output.firstTotal = energy;
+  output.hasEnergies = true;
+  output.lastTotal = energy;
+}
+
+void _mlir_ciface_mdrtCheckMinimization(void *state) {
+  // The criterion is the largest force of the row, that of the log
+  // (D219): the minimization has converged once no
+  // particle feels a force above the tolerance.
+  Output &output = *current;
+  auto *flags = static_cast<StridedMemRefType<int64_t, 1> *>(state);
+  int64_t *values = flags->data + flags->offset;
+  if (values[0] != 0)
+    return;
+  const Output::MinimizationRow &row = output.lastMinimization;
+  if (output.minimizeTolerance > 0.0 &&
+      row.maxForce < output.minimizeTolerance) {
+    values[0] = 1;
+    values[1] = output.lastMinimizationStep;
+    output.convergedStep = output.lastMinimizationStep;
+    return;
+  }
+  // A step that has shrunk below the floor (D274): the
+  // trials no longer lower the energy by more than its rounding, or its
+  // noise, and are taken or not at random, each rejection shrinking the
+  // step by 0.2 against 1.2 for an acceptance, until it is 0 (#369). A
+  // first step below the floor ends the run only once it has shrunk.
+  if (isMinimizationStalled(output, row.stepSize)) {
+    values[0] = 1;
+    values[1] = output.lastMinimizationStep;
+    output.stalledStep = output.lastMinimizationStep;
+  }
+}
+
+/// Without a periodic cell (D142), stops the run if the particles have
+/// spread so far along an axis that an image could come within the reach
+/// of the neighbor structures: farther than the cell less that reach.
+static void checkSpread(const Output &output, const std::vector<double> &x,
+                        int64_t step) {
+  if (output.periodic)
+    return;
+  static const char axes[] = "xyz";
+  for (int k = 0; k != 3; ++k) {
+    double least = x[k], most = x[k];
+    for (size_t i = k; i < x.size(); i += 3) {
+      least = std::min(least, x[i]);
+      most = std::max(most, x[i]);
+    }
+    if (most - least > output.box[k] - output.listReach) {
+      char message[512];
+      std::snprintf(message, sizeof message,
+                    "at step %lld the particles spread %.4f Ang along "
+                    "%c, more than the cell around them less the reach of "
+                    "the neighbor structures, %.4f Ang; images of the "
+                    "particles would interact. The run stops; begin it "
+                    "again with a larger 'pairlist_distance', which places "
+                    "a larger cell (D142)",
+                    static_cast<long long>(step),
+                    (most - least) / units::length, axes[k],
+                    (output.box[k] - output.listReach) / units::length);
+      stopOnFailure(output, message);
+      return;
+    }
+  }
+}
+
+void mdir::driver::checkParticleSpread(const Output &output,
+                                       const std::vector<double> &x,
+                                       int64_t step) {
+  checkSpread(output, x, step);
+}
+
+void _mlir_ciface_mdrtCheckSpread(int64_t step, void *positions, void *ids) {
+  Output &output = *current;
+  checkSpread(output, readVectors(positions, ids, output.state), step);
+}
+
+void mdir::driver::writeExactFrame(Output &output, const double *positions,
+                                   const double *velocities,
+                                   const double *forces, int64_t step,
+                                   double time) {
+  auto &writer = static_cast<H5MDWriter &>(*output.trajectory);
+  H5MDExtras extras;
+  if (output.lastEnergies.step == step)
+    extras.potential = output.lastEnergies.potential;
+  extras.tunablesVersion = std::max<int64_t>(output.tunablesVersion, 0);
+  if (!writer.writeState(positions, velocities, forces, step, time, extras))
+    stopOnFailure(output, writer.getFailure());
+}
+
+void _mlir_ciface_mdrtWriteFrame(int64_t step, void *positions, void *ids) {
+  Output &output = *current;
+  if (!output.hasTrajectory)
+    return;
+  // After the frames and the changes of the cell that the thread of the
+  // frames still holds (D400).
+  waitForFrames(output);
+  ReturnMark returns;
+  // With MDIR_CHECKPOINT_TIMES, the time of the frame when it returns.
+  struct FrameTimes {
+    int64_t step;
+    Clock::time_point entered = Clock::now();
+    ~FrameTimes() {
+      OutputTimes &times = getTimes();
+      if (!times.enabled)
+        return;
+      Clock::time_point now = Clock::now();
+      times.written += 1.0e-3 * getMilliseconds(entered, now);
+      std::fprintf(stderr,
+                   "MDIR: times of the frame at step %lld: copy %.1f ms, "
+                   "write %.1f ms\n",
+                   static_cast<long long>(step),
+                   getMilliseconds(times.lastReturn, entered),
+                   getMilliseconds(entered, now));
+    }
+  } frameTimes{step};
+  if (output.trajectory->isExact()) {
+    // The state as the run has it, in nm (D239): a buffer of
+    // f32 (the single mode) widens to f64 without loss.
+    std::vector<double> exact = readVectors(positions, ids, output.state);
+    checkSpread(output, exact, step);
+    writeExactFrame(output, exact.data(), nullptr, nullptr, step,
+                    output.getTime(step));
+    return;
+  }
+  std::vector<double> values =
+      readVectors(positions, ids, output.state, 1.0 / units::length);
+  checkSpread(output, readVectors(positions, ids, output.state), step);
+  std::vector<float> narrow(values.begin(), values.end());
+  output.trajectory->writeFrame(narrow.data(), step, output.getTime(step));
+}
+
+namespace {
+
+/// The number of elements of a buffer of `count` rows that a descriptor
+/// of strides `rows` and `columns` (0 for a buffer of one dimension)
+/// spans, from its offset.
+int64_t getSpan(int64_t count, int64_t rows, int64_t columns, int64_t width) {
+  if (count == 0)
+    return 0;
+  return 1 + (count - 1) * rows + (width - 1) * columns;
+}
+
+/// MDIR_FRAME_WRITE_DELAY=<ms>: the thread of the frames waits that long
+/// before it reads the copies of each frame, so that a test can fill the
+/// ring and make a checkpoint, a stop, or the end wait for it
+/// (docs/environment.md).
+long getFrameWriteDelay() {
+  static const long delay = [] {
+    const char *value = std::getenv("MDIR_FRAME_WRITE_DELAY");
+    return value ? std::strtol(value, nullptr, 10) : 0L;
+  }();
+  return delay;
+}
+
+/// Stages the positions `positions`, of `element`, and the numbers `ids`
+/// of a frame in `slot`: on a device, copies issued in the order of the
+/// stream, which have arrived once the slot's wait returns; on the host,
+/// copies made here. The views of the slot describe the copies. False if
+/// the run has stopped instead (an embedding program goes on, D196).
+bool stageFrame(const Output &output, FrameSlot &slot, void *positions,
+                void *ids, Element element) {
+  auto *x = static_cast<StridedMemRefType<char, 2> *>(positions);
+  auto *n = static_cast<StridedMemRefType<int32_t, 1> *>(ids);
+  int64_t count = x->sizes[0];
+  size_t size = element == Element::F32 ? sizeof(float) : sizeof(double);
+  size_t xBytes = size * getSpan(count, x->strides[0], x->strides[1], 3);
+  size_t nBytes =
+      sizeof(int32_t) * getSpan(n->sizes[0], n->strides[0], 0, 1);
+  const char *xData = x->data + x->offset * size;
+  const char *nData = reinterpret_cast<const char *>(n->data + n->offset);
+  char *xCopy, *nCopy;
+  if (output.onDevice) {
+    const StagingFunctions &staging = getStagingFunctions();
+    if (!staging.isComplete()) {
+      stopRun("the runtime of the device has no copies of the frames; "
+              "this is a defect of mdir");
+      return false;
+    }
+    if (!slot.staging)
+      slot.staging = staging.create();
+    xCopy = static_cast<char *>(staging.copy(slot.staging, 0, xData, xBytes));
+    nCopy = static_cast<char *>(staging.copy(slot.staging, 1, nData, nBytes));
+    staging.end(slot.staging);
+  } else {
+    slot.positions.assign(xData, xData + xBytes);
+    slot.ids.assign(nData, nData + nBytes);
+    xCopy = slot.positions.data();
+    nCopy = slot.ids.data();
+  }
+  slot.positionView = *x;
+  slot.positionView.basePtr = xCopy;
+  slot.positionView.data = xCopy;
+  slot.positionView.offset = 0;
+  slot.idView = *n;
+  slot.idView.basePtr = reinterpret_cast<int32_t *>(nCopy);
+  slot.idView.data = reinterpret_cast<int32_t *>(nCopy);
+  slot.idView.offset = 0;
+  return true;
+}
+
+/// Waits until the copies of `slot` have arrived; the error of the device
+/// if they have not and will not (a kernel failed before they arrived),
+/// with the call that returned it in `failure`, or 0.
+int32_t waitForSlot(FrameSlot &slot, FrameFailure &failure) {
+  if (!slot.staging)
+    return 0;
+  failure.device = getStagingFunctions().wait(slot.staging, &failure.call);
+  return failure.device;
+}
+
+/// MDIR_FRAME_COPY_FAIL=<step>, for the tests: the thread of the frames
+/// takes the wait for the copies of the frame of that step as failed with
+/// CUDA_ERROR_LAUNCH_FAILED (719), with the device well
+/// (docs/environment.md).
+int64_t getFailingCopy() {
+  static const int64_t step = [] {
+    const char *value = std::getenv("MDIR_FRAME_COPY_FAIL");
+    return value && *value ? std::strtoll(value, nullptr, 10)
+                           : std::numeric_limits<int64_t>::min();
+  }();
+  return step;
+}
+
+} // namespace
+
+void mdir::driver::waitForFrames(Output &output) {
+  FrameFailure failure = getFrameThread().wait();
+  // The runtime reports an error of the device and ends the process, as at
+  // a failure of the device on this thread.
+  if (failure.device)
+    getStagingFunctions().fail(failure.device, failure.call);
+  if (!failure.message.empty())
+    stopOnFailure(output, failure.message);
+}
+
+void mdir::driver::finishFrames(Output &output) {
+  waitForFrames(output);
+  std::vector<std::unique_ptr<FrameSlot>> slots =
+      getFrameThread().takeSlots();
+  for (const std::unique_ptr<FrameSlot> &slot : slots)
+    if (slot->staging)
+      getStagingFunctions().destroy(slot->staging);
+}
+
+void _mlir_ciface_mdrtStageFrame(int64_t step, void *positions, void *ids) {
+  Output &output = *current;
+  if (!output.hasTrajectory)
+    return;
+  ReturnMark returns;
+  Clock::time_point entered = Clock::now();
+  FrameThread &frames = getFrameThread();
+  // A frame whose write failed stops the run here, at the next frame,
+  // with the error that its call would have stopped the run with.
+  if (frames.hasFailed())
+    waitForFrames(output);
+  FrameSlot *slot = frames.takeSlot();
+  Clock::time_point taken = Clock::now();
+  if (!stageFrame(output, *slot, positions, ids, output.state)) {
+    frames.returnSlot(slot);
+    return;
+  }
+  // Without a periodic cell the spread of the particles may stop the run
+  // at this step (D142): the call waits for the copies and checks them
+  // here, before the steps go on.
+  if (!output.periodic) {
+    FrameFailure copy;
+    if (waitForSlot(*slot, copy)) {
+      frames.returnSlot(slot);
+      getStagingFunctions().fail(copy.device, copy.call);
+      return;
+    }
+    checkSpread(output, readVectors(&slot->positionView, &slot->idView,
+                                    output.state),
+                step);
+  }
+  TrajectoryWriter *trajectory = output.trajectory.get();
+  bool exact = trajectory->isExact();
+  double time = output.getTime(step);
+  Element element = output.state;
+  H5MDExtras extras;
+  if (exact) {
+    if (output.lastEnergies.step == step)
+      extras.potential = output.lastEnergies.potential;
+    extras.tunablesVersion = std::max<int64_t>(output.tunablesVersion, 0);
+  }
+  bool timed = getTimes().enabled;
+  frames.post(
+      [slot, trajectory, exact, step, time, element, extras, timed] {
+        if (long delay = getFrameWriteDelay())
+          std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        Clock::time_point begun = Clock::now();
+        FrameFailure failure;
+        // A kernel failed before the copies arrived: the frame is not
+        // written, and the runtime reports the failure.
+        if (slot->staging && step == getFailingCopy()) {
+          failure.device = 719;
+          failure.call = "cuEventSynchronize (MDIR_FRAME_COPY_FAIL)";
+          return failure;
+        }
+        if (waitForSlot(*slot, failure))
+          return failure;
+        Clock::time_point arrived = Clock::now();
+        if (exact) {
+          // The state as the run has it, in nm (D239): a buffer of f32
+          // (the single mode) widens to f64 without loss.
+          std::vector<double> values =
+              readVectors(&slot->positionView, &slot->idView, element);
+          auto &writer = static_cast<H5MDWriter &>(*trajectory);
+          if (!writer.writeState(values.data(), nullptr, nullptr, step, time,
+                                 extras))
+            failure.message = writer.getFailure();
+        } else {
+          std::vector<double> values =
+              readVectors(&slot->positionView, &slot->idView, element,
+                          1.0 / units::length);
+          std::vector<float> narrow(values.begin(), values.end());
+          trajectory->writeFrame(narrow.data(), step, time);
+        }
+        if (timed)
+          std::fprintf(stderr,
+                       "MDIR: times of the write of the frame at step %lld: "
+                       "copy %.1f ms, write %.1f ms\n",
+                       static_cast<long long>(step),
+                       getMilliseconds(begun, arrived),
+                       getMilliseconds(arrived, Clock::now()));
+        return failure;
+      },
+      slot);
+  OutputTimes &times = getTimes();
+  if (times.enabled) {
+    Clock::time_point now = Clock::now();
+    times.written += 1.0e-3 * getMilliseconds(entered, now);
+    std::fprintf(stderr,
+                 "MDIR: times of the frame at step %lld: copy %.1f ms, "
+                 "wait %.1f ms, stage %.1f ms\n",
+                 static_cast<long long>(step),
+                 getMilliseconds(times.lastReturn, entered),
+                 getMilliseconds(entered, taken),
+                 getMilliseconds(taken, now));
+  }
+}
+
+void _mlir_ciface_mdrtFinish(void *positions, void *velocities,
+                             void *ids) {
+  Output &output = *current;
+  if (!output.system)
+    return;
+  output.system->positions = readVectors(positions, ids, output.state);
+  checkSpread(output, output.system->positions, output.endStep);
+  output.system->velocities = readVectors(velocities, ids, output.state);
+}
+
+/// Writes the state as a checkpoint. `forces` is null if the state has
+/// none. The state in the order of the input is copied, and a thread of its
+/// own writes the file while the steps go on (D336); this
+/// call first waits for the write of the checkpoint before.
+static void writeState(int64_t step, void *positions, void *velocities,
+                       void *forces, void *ids) {
+  Output &output = *current;
+  if (output.checkpointPath.empty())
+    return;
+  ReturnMark returns;
+  OutputTimes &times = getTimes();
+  Clock::time_point entered = Clock::now();
+  // The frames queued before the checkpoint are in the trajectory before
+  // it counts them (D130, D400).
+  waitForFrames(output);
+  // The wait of a checkpoint: for events 2 and 3 of the one before (the
+  // release of its staging buffers and its commit), before this one stages
+  // its state (CheckpointThread). A failed write stops the run here, with
+  // its error.
+  waitForCheckpoint();
+  Clock::time_point waited = Clock::now();
+  Checkpoint &checkpoint = output.checkpoint;
+  checkpoint.step = step;
+  checkpoint.time = output.getTime(step);
+  // In a periodic cell the call copies the buffers as they are and the
+  // thread orders them. Without one the positions in the order of the
+  // input are checked here, where a spread that is too wide stops the run
+  // (D142), and the call orders the state.
+  std::vector<double> x, v, f;
+  RawState raw;
+  if (output.periodic) {
+    raw.ids = copyIds(ids);
+    raw.fields.emplace_back(positions, output.state);
+    raw.fields.emplace_back(velocities, output.state);
+    if (forces)
+      raw.fields.emplace_back(forces, output.force);
+  } else {
+    x = readVectors(positions, ids, output.state);
+    checkSpread(output, x, step);
+    v = readVectors(velocities, ids, output.state);
+    if (forces)
+      f = readVectors(forces, ids, output.force);
+  }
+  Clock::time_point ordered = Clock::now();
+
+  checkpoint.frames = output.hasTrajectory ? output.trajectory->getNumFrames()
+                                           : 0;
+  checkpoint.bath = output.bath;
+  // The snapshot that the thread writes: the state, which the program
+  // overwrites after this call, moved; the rest, which later calls of the
+  // host change (the cell, the bath, the states of the coupling), copied.
+  checkpoint.positions.clear();
+  checkpoint.velocities.clear();
+  checkpoint.forces.clear();
+  Checkpoint snapshot = checkpoint;
+  snapshot.positions = std::move(x);
+  snapshot.velocities = std::move(v);
+  snapshot.forces = std::move(f);
+  Clock::time_point copied = Clock::now();
+  startCheckpointThread(output.checkpointPath, step, std::move(snapshot),
+                        std::move(raw));
+  ++output.numCheckpoints;
+  if (times.enabled) {
+    Clock::time_point now = Clock::now();
+    times.written += 1.0e-3 * getMilliseconds(entered, now);
+    std::fprintf(stderr,
+                 "MDIR: times of the checkpoint at step %lld: copy %.1f ms, "
+                 "wait %.1f ms, state %.1f ms, snapshot %.1f ms; %.1f ms in "
+                 "the call\n",
+                 static_cast<long long>(step),
+                 getMilliseconds(times.lastReturn, entered),
+                 getMilliseconds(entered, waited),
+                 getMilliseconds(waited, ordered),
+                 getMilliseconds(ordered, copied),
+                 getMilliseconds(entered, now));
+  }
+
+  // A stop that a signal or the wall time asks for is taken here, once the
+  // file is written, where the run continues exactly from it (D131), and
+  // not at the last step, where the run ends anyway. The wall time must
+  // leave room for one more interval between checkpoints, as long as the
+  // longest so far.
+  if (step >= output.endStep)
+    return;
+  auto now = std::chrono::steady_clock::now();
+  double segment =
+      std::chrono::duration<double>(now - output.lastCheckpoint).count();
+  output.lastCheckpoint = now;
+  output.longestSegment = std::max(output.longestSegment, segment);
+  double elapsed = std::chrono::duration<double>(now - output.began).count();
+  const char *reason = nullptr;
+  if (stopSignal == SIGTERM)
+    reason = "SIGTERM";
+  else if (stopSignal == SIGINT)
+    reason = "SIGINT";
+  else if (output.maxWalltime > 0.0 &&
+           elapsed + output.longestSegment > output.maxWalltime)
+    reason = "the wall time";
+  if (!reason)
+    return;
+  // The wait of a stop: for all three events of this checkpoint.
+  waitForCheckpoint();
+  waitForFrames(output);
+  if (output.trajectory)
+    output.trajectory->close();
+  output.log.print(
+               "MDIR: stopped after step %lld on %s; '%s' holds the state, "
+               "and `mdir run --continue` goes on from it\n",
+               static_cast<long long>(step), reason,
+               output.checkpointPath.c_str());
+  output.log.flush();
+  std::fprintf(stderr, "mdir: stopped after step %lld of %lld on %s\n",
+               static_cast<long long>(step),
+               static_cast<long long>(output.endStep), reason);
+  if (output.recordStop)
+    if (llvm::Error error = output.recordStop(step, reason)) {
+      std::fprintf(stderr, "mdir: %s\n", llvm::toString(std::move(error)).c_str());
+      std::exit(1);
+    }
+  std::exit(StoppedStatus);
+}
+
+void _mlir_ciface_mdrtWriteCheckpoint(int64_t step, void *positions,
+                                      void *velocities, void *ids) {
+  writeState(step, positions, velocities, nullptr, ids);
+}
+
+void _mlir_ciface_mdrtWriteCheckpointWithForces(int64_t step,
+                                                void *positions,
+                                                void *velocities,
+                                                void *forces, void *ids) {
+  writeState(step, positions, velocities, forces, ids);
+}

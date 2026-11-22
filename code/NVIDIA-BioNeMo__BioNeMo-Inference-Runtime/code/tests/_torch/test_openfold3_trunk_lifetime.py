@@ -1,0 +1,735 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import weakref
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import bionemo_ir.models.openfold3.modeling as openfold3_modeling
+from bionemo_ir._torch.graph_optimization import GraphRegion
+from bionemo_ir._torch.layers.transformers.pairformer import PairformerLayerV1
+from bionemo_ir._torch.layers.triangle_nodes import TriangleMultiplicationMetadata
+from bionemo_ir._torch.utils import ChunkPolicy
+from bionemo_ir.models.openfold3.modeling import OpenFold3
+
+
+class _ScaledPairUpdate(torch.nn.Module):
+    def __init__(self, scale: float) -> None:
+        super().__init__()
+        self.scale = scale
+        # Hold the output so its storage cannot be recycled into a later
+        # tensor and make the pointer comparisons below coincide.
+        self.last_output: torch.Tensor | None = None
+
+    def forward(self, value: torch.Tensor, *_args, **kwargs) -> torch.Tensor:
+        output = value * self.scale
+        # The triangle nodes take ``residual=True`` to add their own input.
+        if kwargs.get("residual", False):
+            output = value.add_(output) if kwargs.get("inplace_residual", False) else value + output
+        self.last_output = output
+        return output
+
+
+class _ScaledPairTransition(_ScaledPairUpdate):
+    """A pair transition that, like ``Transition``, adds its own residual and may do so in place."""
+
+    def forward(self, value: torch.Tensor, *_args, residual: bool = False, inplace: bool = False, **_kwargs):
+        update = super().forward(value)
+        if not residual:
+            return update
+        return value.add_(update) if inplace else value + update
+
+
+def _make_pair_residual_probe() -> PairformerLayerV1:
+    layer = PairformerLayerV1.__new__(PairformerLayerV1)
+    torch.nn.Module.__init__(layer)
+    layer.dtype = torch.float32
+    layer.pair_mask_left_aligned = False
+    layer.tri_mul_out = _ScaledPairUpdate(1)
+    layer.tri_mul_in = _ScaledPairUpdate(2)
+    layer.tri_attn_start = _ScaledPairUpdate(3)
+    layer.tri_attn_end = _ScaledPairUpdate(4)
+    layer.transition_z = _ScaledPairTransition(5)
+    return layer
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "default",
+        "inference",
+        pytest.param("capture", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")),
+    ],
+)
+def test_pairformer_reuses_owned_pair_storage_only_when_safe(mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    device = torch.device("cuda" if mode == "capture" else "cpu")
+    z = torch.randn(2, 3, 3, 4, device=device)
+    original = z.clone()
+    pair_mask = torch.ones(2, 3, 3, device=device)
+    layer = _make_pair_residual_probe().to(device)
+    trimul_metadata = TriangleMultiplicationMetadata()
+    if mode == "capture":
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with torch.inference_mode():
+        expected = layer._transform_z(original.clone(), pair_mask, trimul_metadata)
+
+    def transform() -> torch.Tensor:
+        return layer._transform_z(z, pair_mask, trimul_metadata, inplace_safe=mode != "default")
+
+    with torch.inference_mode():
+        actual = transform()
+
+    assert torch.equal(actual, expected)
+    trimul_output = layer.tri_mul_in.last_output
+    assert trimul_output is not None
+    if mode == "inference":
+        assert actual.data_ptr() == trimul_output.data_ptr()
+    else:
+        assert actual.data_ptr() != trimul_output.data_ptr()
+    assert actual.data_ptr() != z.data_ptr()
+    assert torch.equal(z, original)
+
+
+class _TrunkLifetimeProbe:
+    forward = OpenFold3.forward
+    _pair_preparation = OpenFold3._pair_preparation
+
+    def __init__(self, device: torch.device | str = "cpu", *, pair_min_size: int = 6) -> None:
+        self.device = torch.device(device)
+        # The probe's trunk pair has 3 tokens; above ``pair_min_size`` prediction stages it on host.
+        self.diffusion_module = SimpleNamespace(
+            dtype=torch.float32,
+            diffusion_conditioning=SimpleNamespace(pair_projection_chunk_policy=ChunkPolicy(min_size=pair_min_size)),
+        )
+        self.diffusion_sampler = SimpleNamespace(use_conditioning=True, frame_reuse_period="auto")
+        self.trunk_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+        self.expected: tuple[torch.Tensor, ...] = ()
+
+    def generate_attn_metadata(self, batch: dict[str, torch.Tensor]) -> None:
+        return None
+
+    def feature_extraction(
+        self, batch: dict[str, torch.Tensor], num_cycles: int, attn_metadata: None, sampling_seed: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        values = tuple(
+            torch.randn(shape, dtype=torch.bfloat16, device=self.device)
+            for shape in ((1, 3, 4), (1, 3, 4), (1, 3, 3, 4))
+        )
+        self.trunk_refs = [weakref.ref(value) for value in values]
+        self.expected = tuple(value.float().unsqueeze(1) for value in values)
+        return values
+
+    def prediction(
+        self, si_input: torch.Tensor, si_trunk: torch.Tensor, zij_trunk: torch.Tensor, **kwargs: object
+    ) -> dict[str, torch.Tensor]:
+        # Unsqueezed views keep their original tensor alive: this fails when
+        # forward retains its bf16 locals while passing temporary fp32 casts.
+        assert all(reference() is None for reference in self.trunk_refs)
+        for actual, expected in zip((si_input, si_trunk, zij_trunk), self.expected, strict=True):
+            assert actual.dtype == torch.float32
+            assert torch.equal(actual, expected)
+        return {"zij_trunk": zij_trunk}
+
+
+def _reject_cuda_memory_calls(monkeypatch: pytest.MonkeyPatch, reason: str) -> None:
+    def reject(name: str) -> object:
+        def fail(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError(f"{name} is not needed {reason}")
+
+        return fail
+
+    for name in ("empty_cache", "mem_get_info", "memory_reserved", "memory_allocated"):
+        monkeypatch.setattr(torch.cuda, name, reject(name))
+
+
+def test_prediction_releases_superseded_trunk_precision(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _TrunkLifetimeProbe()
+    # A CPU trunk pair neither queries nor releases CUDA memory.
+    _reject_cuda_memory_calls(monkeypatch, "for a CPU trunk pair")
+    output = probe.forward({"token_mask": torch.ones(1, 3)})
+    assert torch.equal(output["zij_trunk"], probe.expected[2])
+
+
+_MIB = 1 << 20
+
+
+_MEMORY_QUERIES = ["free", "reserved", "allocated"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("max_tokens", "pair_min_size", "free_bytes", "expected_events", "expected_queries"),
+    [
+        pytest.param(3, 6, 511 * _MIB, ["empty_cache", "prediction"], ["cap", *_MEMORY_QUERIES], id="short-memory"),
+        pytest.param(3, 6, 512 * _MIB, ["prediction"], ["cap", *_MEMORY_QUERIES], id="cache-fits"),
+        pytest.param(2, 6, 64 * 1024 * _MIB, ["empty_cache", "prediction"], ["cap"], id="above-token-cap"),
+        # A lowered pair chunk threshold that still keeps the pair on device does not lower the cap.
+        pytest.param(3, 4, 512 * _MIB, ["prediction"], ["cap", *_MEMORY_QUERIES], id="pair-min-size-ignored"),
+        pytest.param(3, 2, 0, ["prediction"], [], id="pair-staged-on-host"),
+    ],
+)
+def test_prediction_reclaims_dead_cuda_cache_for_long_inputs_or_short_memory(
+    max_tokens: int,
+    pair_min_size: int,
+    free_bytes: int,
+    expected_events: list[str],
+    expected_queries: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    queried: list[tuple[str, torch.device]] = []
+
+    def query(name: str, value: object) -> object:
+        def answer(device: torch.device) -> object:
+            queried.append((name, device))
+            return value
+
+        return answer
+
+    # The cap is half the memory-scaled auto-chunk threshold.
+    monkeypatch.setattr(openfold3_modeling, "default_autochunk_min", query("cap", 2 * max_tokens))
+    probe = _TrunkLifetimeProbe("cuda", pair_min_size=pair_min_size)
+    original_prediction = probe.prediction
+
+    def record_prediction(**kwargs: object) -> dict[str, torch.Tensor]:
+        events.append("prediction")
+        return original_prediction(**kwargs)
+
+    # The allocator caches 768 - 256 = 512 MiB it is not using.
+    monkeypatch.setattr(probe, "prediction", record_prediction)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", query("free", (free_bytes, 1 << 40)))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", query("reserved", 768 * _MIB))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", query("allocated", 256 * _MIB))
+
+    with torch.inference_mode():
+        output = probe.forward({"token_mask": torch.ones(1, 3, device="cuda")})
+
+    device = probe.expected[2].device
+    assert events == expected_events
+    assert queried == [(name, device) for name in expected_queries]
+    assert torch.equal(output["zij_trunk"], probe.expected[2])
+
+
+_GIB = 1 << 30
+
+
+@pytest.mark.parametrize(
+    ("total_bytes", "expected_tokens"),
+    [
+        pytest.param(int(179.06 * _GIB), 1920, id="b200-180gb"),
+        pytest.param(85_064_286_208, 1280, id="h100-80gb"),
+        pytest.param(int(39.39 * _GIB), 896, id="a100-40gb"),
+        pytest.param(24 * _GIB, 512, id="24gb"),
+        pytest.param(int(14.6 * _GIB), 512, id="16gb"),
+        pytest.param(268 * _GIB, 2048, id="b300-288gb-limit"),
+    ],
+)
+def test_trunk_cache_cap_scales_with_device_memory(
+    total_bytes: int, expected_tokens: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read: list[torch.device] = []
+
+    def device_properties(device: torch.device) -> SimpleNamespace:
+        read.append(device)
+        return SimpleNamespace(total_memory=total_bytes)
+
+    device = torch.device("cuda", 3)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", device_properties)
+    openfold3_modeling.default_autochunk_min.cache_clear()
+    try:
+        assert openfold3_modeling._keep_trunk_cache_max_tokens(device) == expected_tokens
+    finally:
+        openfold3_modeling.default_autochunk_min.cache_clear()
+    assert read == [device]
+
+
+_CUDA = torch.device("cuda", 0)
+
+
+@pytest.mark.parametrize(
+    ("device", "capturing", "num_tokens", "free_bytes", "released", "expected_queries"),
+    [
+        pytest.param(torch.device("cpu"), False, 0, 0, False, [], id="cpu"),
+        pytest.param(_CUDA, True, 0, 0, False, [], id="capturing"),
+        pytest.param(_CUDA, False, 9, 1 << 40, True, ["cap"], id="above-token-cap"),
+        pytest.param(_CUDA, False, 8, 511 * _MIB, True, ["cap", *_MEMORY_QUERIES], id="cache-crowds-device"),
+        pytest.param(_CUDA, False, 8, 512 * _MIB, False, ["cap", *_MEMORY_QUERIES], id="cache-fits"),
+    ],
+)
+def test_release_trunk_cache(
+    device: torch.device,
+    capturing: bool,
+    num_tokens: int,
+    free_bytes: int,
+    released: bool,
+    expected_queries: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def query(name: str, value: object) -> object:
+        def answer(queried: torch.device) -> object:
+            assert queried == device
+            events.append(name)
+            return value
+
+        return answer
+
+    # The cap is 8 tokens, and the allocator caches 768 - 256 = 512 MiB it is not using.
+    monkeypatch.setattr(openfold3_modeling, "_keep_trunk_cache_max_tokens", query("cap", 8))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", query("free", (free_bytes, 1 << 40)))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", query("reserved", 768 * _MIB))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", query("allocated", 256 * _MIB))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+
+    assert openfold3_modeling._release_trunk_cache(device, num_tokens) is released
+    assert events == expected_queries + ["empty_cache"] * released
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_prediction_keeps_cache_during_cuda_graph_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = _TrunkLifetimeProbe("cuda")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    # Capture keeps the cache without querying memory.
+    _reject_cuda_memory_calls(monkeypatch, "during capture")
+    with torch.inference_mode():
+        output = probe.forward({"token_mask": torch.ones(1, 3, device="cuda")})
+
+    assert torch.equal(output["zij_trunk"], probe.expected[2])
+
+
+class _PairInputProbe:
+    def __init__(self, values: tuple[torch.Tensor, torch.Tensor, torch.Tensor], *, min_size: int) -> None:
+        self.values = values
+        self.pair_build_chunk_policy = ChunkPolicy(chunk_size=2, min_size=min_size)
+
+    def __call__(self, **_kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.values
+
+
+class _RecycleUpdateProbe:
+    _update_recycle_pair = OpenFold3._update_recycle_pair
+
+    def __init__(self, device: torch.device, dtype: torch.dtype, *, min_size: int) -> None:
+        channels = 8
+        self.recycle_pair_update_chunk_policy = ChunkPolicy(chunk_size=3, min_size=min_size)
+        self.layer_norm_z = torch.nn.LayerNorm(channels, device=device, dtype=dtype)
+        self.linear_z = torch.nn.Linear(channels, channels, bias=False, device=device, dtype=dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_recycle_pair_update_chunks_owned_rows_match_dense(dtype: torch.dtype) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    torch.manual_seed(42)
+    probe = _RecycleUpdateProbe(device, dtype, min_size=1)
+    z_init = torch.randn(1, 8, 8, 8, device=device, dtype=dtype)
+    z = torch.randn_like(z_init)
+    original_z_init = z_init.clone()
+
+    with torch.inference_mode():
+        expected = z_init + probe.linear_z(probe.layer_norm_z(z))
+
+    normalized_rows: list[int] = []
+    handle = probe.layer_norm_z.register_forward_pre_hook(
+        lambda _module, inputs: normalized_rows.append(inputs[0].shape[-3])
+    )
+    original_ptr = z.data_ptr()
+    try:
+        with torch.inference_mode():
+            actual = probe._update_recycle_pair(z_init, z)
+    finally:
+        handle.remove()
+
+    assert normalized_rows == [3, 3, 2]
+    assert actual.data_ptr() == original_ptr
+    if dtype == torch.bfloat16:
+        assert torch.equal(actual, expected)
+    else:
+        # Hopper can select different FP32 GEMM tilings for the dense and
+        # row-chunked linear calls. Production BF16 remains bitwise exact.
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    assert torch.equal(z_init, original_z_init)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_recycle_pair_update_releases_copied_rows_before_next_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    probe = _RecycleUpdateProbe(device, torch.float32, min_size=1)
+    z_init = torch.randn(1, 8, 8, 8, device=device)
+    z = torch.randn_like(z_init)
+    update_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def assert_previous_update_released(_module: torch.nn.Module, _inputs: tuple[torch.Tensor, ...]) -> None:
+        assert all(reference() is None for reference in update_refs)
+
+    original_copy = torch.Tensor.copy_
+
+    def record_copy(destination: torch.Tensor, source: torch.Tensor, *args, **kwargs):
+        update_refs.append(weakref.ref(source))
+        return original_copy(destination, source, *args, **kwargs)
+
+    handle = probe.layer_norm_z.register_forward_pre_hook(assert_previous_update_released)
+    monkeypatch.setattr(torch.Tensor, "copy_", record_copy)
+    try:
+        with torch.inference_mode():
+            probe._update_recycle_pair(z_init, z)
+    finally:
+        handle.remove()
+
+    assert len(update_refs) == 3
+
+
+@pytest.mark.parametrize(
+    ("mode", "min_size"),
+    [
+        pytest.param("short", 16, marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")),
+        pytest.param("capture", 1, marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")),
+        ("cpu", 1),
+    ],
+)
+def test_recycle_pair_update_keeps_dense_fallbacks(
+    mode: str,
+    min_size: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cpu" if mode == "cpu" else "cuda", torch.cuda.current_device() if mode != "cpu" else 0)
+    probe = _RecycleUpdateProbe(device, torch.float32, min_size=min_size)
+    z_init = torch.randn(1, 8, 8, 8, device=device)
+    z = torch.randn_like(z_init)
+    original = z.clone()
+    if mode == "capture":
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with torch.inference_mode():
+        actual = probe._update_recycle_pair(z_init, z)
+
+    assert actual.data_ptr() != z.data_ptr()
+    assert torch.equal(z, original)
+
+
+class _FeatureExtractionCacheProbe:
+    feature_extraction = OpenFold3.feature_extraction
+    _recycle_step = OpenFold3._recycle_step
+    _update_recycle_pair = OpenFold3._update_recycle_pair
+
+    def __init__(self, device: torch.device, *, min_size: int = 1) -> None:
+        tokens, channels = 4, 2
+        self.config = SimpleNamespace(trunk=SimpleNamespace(pairformer=SimpleNamespace(torch_dtype=torch.float32)))
+        # This probe's batch/stub embedders don't model token-count padding
+        # (OpenFold3.feature_extraction's new trunk-level padding); it's
+        # testing cache-reclaim lifetime, not padding, and tokens=4 isn't
+        # 8-aligned anyway.
+        self.enable_token_pad = False
+        input_values = (
+            torch.randn(1, tokens, channels, device=device),
+            torch.randn(1, tokens, channels, device=device),
+            torch.randn(1, tokens, tokens, channels, device=device),
+        )
+        self.input_embedder = _PairInputProbe(input_values, min_size=min_size)
+        self.layer_norm_z = lambda value: value
+        self.linear_z = lambda value: value
+        self.template_embedder = lambda **kwargs: torch.zeros_like(kwargs["z"])
+        self.msa_module_embedder = SimpleNamespace(
+            prepare_msa_indices=lambda _batch: None,
+            prepare_msa=lambda _batch, **_kwargs: (
+                torch.zeros(1, 1, tokens, channels, device=device),
+                torch.ones(1, 1, tokens, device=device),
+            ),
+            embed_prepared_msa=lambda msa_feat, _s_input: msa_feat,
+        )
+        self.msa_module = lambda _m, z, **_kwargs: z
+        self.layer_norm_s = lambda value: value
+        self.linear_s = lambda value: value
+        self.pairformer_stack = lambda *, s, z, **_kwargs: (s, z)
+        self.trunk_graph = GraphRegion(self, "_recycle_step", None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("mode", "min_size", "expected_calls"),
+    [
+        ("inference", 1, 4),
+        ("short", 8, 0),
+        ("capture", 1, 0),
+    ],
+)
+def test_row_built_input_reclaims_cache_between_recycles(
+    mode: str,
+    min_size: int,
+    expected_calls: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    probe = _FeatureExtractionCacheProbe(device, min_size=min_size)
+    cache_calls = 0
+
+    def record_empty_cache() -> None:
+        nonlocal cache_calls
+        cache_calls += 1
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", record_empty_cache)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: mode == "capture")
+    with torch.inference_mode():
+        probe.feature_extraction(
+            batch={"token_mask": torch.ones(1, 4, device=device)},
+            num_cycles=4,
+        )
+
+    assert cache_calls == expected_calls
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_request_msa_stream(device: str) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    probe = _FeatureExtractionCacheProbe(torch.device(device), min_size=8)
+    original = probe.msa_module_embedder.prepare_msa
+    draws: list[torch.Tensor] = []
+
+    def record_msa(
+        batch: dict[str, torch.Tensor],
+        *,
+        generator: torch.Generator,
+        prepared_indices: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        draws.append(torch.rand(2, device=device, generator=generator))
+        return original(batch, prepared_indices=prepared_indices)
+
+    probe.msa_module_embedder.prepare_msa = record_msa
+    state = torch.cuda.get_rng_state() if device == "cuda" else torch.get_rng_state()
+    with torch.inference_mode():
+        probe.feature_extraction(batch={"token_mask": torch.ones(1, 4, device=device)}, num_cycles=4, sampling_seed=17)
+    generator = torch.Generator(device=device).manual_seed(17)
+    expected = [torch.rand(2, device=device, generator=generator) for _ in range(4)]
+    assert len(draws) == len(expected)
+    assert all(torch.equal(actual, reference) for actual, reference in zip(draws, expected, strict=True))
+    after = torch.cuda.get_rng_state() if device == "cuda" else torch.get_rng_state()
+    assert torch.equal(state, after)
+
+
+def test_request_msa_indices_are_prepared_once() -> None:
+    probe = _FeatureExtractionCacheProbe(torch.device("cpu"), min_size=8)
+    batch = {"token_mask": torch.ones(1, 4)}
+    indices = (torch.tensor([0]), torch.empty(0, dtype=torch.int64))
+    preparation_calls = []
+    reuse_calls = []
+    original = probe.msa_module_embedder.prepare_msa
+
+    def prepare_indices(request: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        preparation_calls.append(request)
+        return indices
+
+    def prepare_msa(
+        request: dict[str, torch.Tensor],
+        *,
+        generator: torch.Generator | None = None,
+        prepared_indices: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        reuse_calls.append(prepared_indices)
+        return original(request)
+
+    probe.msa_module_embedder.prepare_msa_indices = prepare_indices
+    probe.msa_module_embedder.prepare_msa = prepare_msa
+    with torch.inference_mode():
+        probe.feature_extraction(batch=batch, num_cycles=4)
+    assert len(preparation_calls) == 1
+    assert preparation_calls[0] is batch
+    assert len(reuse_calls) == 4
+    assert all(value is indices for value in reuse_calls)
+    assert set(batch) == {"token_mask"}
+
+
+class _PairCacheConditioning:
+    def __init__(self, events: list[str], *, min_size: int) -> None:
+        self.events = events
+        self.pair_projection_chunk_policy = ChunkPolicy(chunk_size=2, min_size=min_size, dim=2, min_rank=5)
+        self.prepared_refs: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def prepare_pair(self, *, batch: dict[str, torch.Tensor], zij_trunk: torch.Tensor) -> torch.Tensor:
+        self.events.append(f"prepare_pair:{zij_trunk.device.type}")
+        prepared = zij_trunk.to(device=batch["token_mask"].device) * 2
+        self.prepared_refs.append(weakref.ref(prepared))
+        return prepared
+
+
+class _PairCacheSampler:
+    use_conditioning = True
+
+    def __init__(
+        self, events: list[str], expected_pair: torch.Tensor, *, expect_prepared: bool, expect_offload: bool
+    ) -> None:
+        self.events = events
+        self.expected_pair = expected_pair
+        self.expect_prepared = expect_prepared
+        self.expect_offload = expect_offload
+
+    def __call__(
+        self,
+        *,
+        batch: dict[str, torch.Tensor],
+        zij_trunk: torch.Tensor,
+        prepared_zij: torch.Tensor | None,
+        **_kwargs,
+    ) -> torch.Tensor:
+        self.events.append("sample")
+        if self.expect_prepared:
+            assert prepared_zij is not None
+            assert torch.equal(prepared_zij, self.expected_pair * 2)
+            assert (prepared_zij.data_ptr() == zij_trunk.data_ptr()) == self.expect_offload
+        else:
+            assert prepared_zij is None
+        assert zij_trunk.is_cuda
+        expected_trunk = self.expected_pair * 2 if self.expect_offload else self.expected_pair
+        assert torch.equal(zij_trunk, expected_trunk)
+        return torch.zeros((*batch["atom_mask"].shape, 3), device=zij_trunk.device)
+
+
+class _PairCacheAuxHeads:
+    def __init__(self, events: list[str], expected_pair: torch.Tensor) -> None:
+        self.events = events
+        self.expected_pair = expected_pair
+
+    def __call__(self, *, output: dict[str, torch.Tensor], **_kwargs) -> dict[str, torch.Tensor]:
+        self.events.append("aux_heads")
+        assert output["zij_trunk"].is_cuda
+        assert torch.equal(output["zij_trunk"], self.expected_pair)
+        return {}
+
+
+class _PairCachePredictionProbe:
+    prediction = OpenFold3.prediction
+    _pair_preparation = OpenFold3._pair_preparation
+
+    def __init__(
+        self,
+        events: list[str],
+        expected_pair: torch.Tensor,
+        *,
+        min_size: int,
+        expect_prepared: bool,
+        expect_offload: bool = False,
+    ) -> None:
+        conditioning = _PairCacheConditioning(events, min_size=min_size)
+        self.diffusion_module = SimpleNamespace(diffusion_conditioning=conditioning)
+        self.diffusion_sampler = _PairCacheSampler(
+            events, expected_pair, expect_prepared=expect_prepared, expect_offload=expect_offload
+        )
+        self.aux_heads = _PairCacheAuxHeads(events, expected_pair)
+        self.no_rollout_steps = 2
+        self.no_rollout_samples = 1
+        self.noise_schedule = SimpleNamespace(sigma_data=16.0, s_max=160.0, s_min=4e-4, p=7.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("mode", "min_size", "expect_prepared", "expect_offload", "expected_events"),
+    [
+        (
+            "inference",
+            1,
+            True,
+            True,
+            ["empty_cache", "prepare_pair:cpu", "empty_cache", "sample", "empty_cache", "aux_heads"],
+        ),
+        ("short", 8, True, False, ["prepare_pair:cuda", "sample", "aux_heads"]),
+        ("no_policy", 1, True, False, ["prepare_pair:cuda", "sample", "aux_heads"]),
+        ("disabled_policy", 1, True, False, ["prepare_pair:cuda", "sample", "aux_heads"]),
+        ("unconditioned", 1, False, False, ["sample", "aux_heads"]),
+        (
+            "grad",
+            1,
+            True,
+            True,
+            ["empty_cache", "prepare_pair:cpu", "empty_cache", "sample", "empty_cache", "aux_heads"],
+        ),
+        ("grad", 8, True, False, ["prepare_pair:cuda", "sample", "aux_heads"]),
+        ("capture", 1, False, False, ["sample", "aux_heads"]),
+    ],
+)
+def test_prediction_stages_trunk_pair_around_cached_rollout(
+    mode: str,
+    min_size: int,
+    expect_prepared: bool,
+    expect_offload: bool,
+    expected_events: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    events: list[str] = []
+    tokens, channels = 4, 2
+    expected_pair = torch.randn(1, 1, tokens, tokens, channels, device=device)
+    probe = _PairCachePredictionProbe(
+        events,
+        expected_pair,
+        min_size=min_size,
+        expect_prepared=expect_prepared,
+        expect_offload=expect_offload,
+    )
+    conditioning = probe.diffusion_module.diffusion_conditioning
+    if mode == "no_policy":
+        conditioning.pair_projection_chunk_policy = None
+    elif mode == "disabled_policy":
+        conditioning.pair_projection_chunk_policy = conditioning.pair_projection_chunk_policy.replace(enabled=False)
+    probe.diffusion_sampler.use_conditioning = mode != "unconditioned"
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: mode == "capture")
+    batch = {
+        "token_mask": torch.ones(1, 1, tokens, device=device),
+        "atom_mask": torch.ones(1, 1, tokens, device=device),
+    }
+    with torch.inference_mode(mode != "grad"), torch.set_grad_enabled(mode == "grad"):
+        output = probe.prediction(
+            batch=batch,
+            si_input=torch.randn(1, 1, tokens, channels, device=device),
+            si_trunk=torch.randn(1, 1, tokens, channels, device=device),
+            zij_trunk=expected_pair.clone(),
+        )
+
+    assert events == expected_events
+    assert torch.equal(output["zij_trunk"], expected_pair)
+    assert all(reference() is None for reference in conditioning.prepared_refs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_prediction_refreshes_conditioning_for_each_rollout() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    events: list[str] = []
+    pair = torch.randn(1, 1, 4, 4, 2, device=device)
+    probe = _PairCachePredictionProbe(events, pair, min_size=8, expect_prepared=True)
+    with torch.inference_mode():
+        for tokens in (4, 4, 5):
+            pair = torch.randn(1, 1, tokens, tokens, 2, device=device)
+            probe.diffusion_sampler.expected_pair = pair.clone()
+            probe.aux_heads.expected_pair = pair.clone()
+            probe.prediction(
+                batch={
+                    "token_mask": torch.ones(1, 1, tokens, device=device),
+                    "atom_mask": torch.ones(1, 1, tokens, device=device),
+                },
+                si_input=torch.randn(1, 1, tokens, 2, device=device),
+                si_trunk=torch.randn(1, 1, tokens, 2, device=device),
+                zij_trunk=pair,
+            )
+            pair.add_(1)
+            assert all(reference() is None for reference in probe.diffusion_module.diffusion_conditioning.prepared_refs)
+    assert events == ["prepare_pair:cuda", "sample", "aux_heads"] * 3

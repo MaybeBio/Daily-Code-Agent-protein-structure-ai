@@ -1,0 +1,103 @@
+import numpy as np
+
+from molsysmt._private.smonitor import ArgumentError
+from molsysmt._private.variables import is_iterable
+
+
+def digest_selection(selection, syntax="MolSysMT", caller=None):
+    """Checks if a given selection has the correct type and syntax
+
+    Parameters
+    ----------
+    item : str or list of int
+        An instance of one of the forms supported by MolSysMT.
+    syntax : str, default="MolSysMT"
+        Name of the syntax used in the selection.
+    caller: str, optional
+        Name of the function or method that is being digested.
+
+    Raises
+    ------
+    WrongSelectionError or WrongSelectionSyntaxError or WrongSyntaxError
+        A WrongSelectionError is raised if the selection object is not in deed a selection.
+        A WrongSelectionSyntaxError is raised if the selection is not using the expected
+        syntax.
+        A WrongSyntaxError is raised if the syntax given is not in deed a syntax.
+
+    """
+
+    from ._correspondence_axes import CALLERS, flat_axis
+
+    if caller in {
+        "molsysmt.molecular_mechanics.get_forces.get_forces",
+        "molsysmt.build.add_missing_terminal_cappings.add_missing_terminal_cappings",
+    }:
+        return flat_axis(selection, "selection", caller, allow_boolean=True)
+
+    if caller == "molsysmt.build.mutate.mutate" and not isinstance(selection, str):
+        try:
+            array = np.asarray(selection)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ArgumentError("selection", value=selection, caller=caller) from error
+        if array.ndim == 0 and array.dtype.kind in "iu":
+            return [int(array)]
+        mixed_boolean = (
+            isinstance(selection, (list, tuple))
+            and any(isinstance(value, (bool, np.bool_)) for value in selection)
+            and not all(isinstance(value, (bool, np.bool_)) for value in selection)
+        )
+        if (
+            array.ndim == 1
+            and not mixed_boolean
+            and (array.size == 0 or array.dtype.kind in "biu")
+        ):
+            return array
+        raise ArgumentError("selection", value=selection, caller=caller)
+
+    if (
+        caller == "molsysmt.structure.least_rmsd_align.least_rmsd_align"
+        and selection is not None
+        and not isinstance(selection, str)
+    ):
+        try:
+            array = np.asarray(selection)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ArgumentError("selection", value=selection, caller=caller) from error
+        if array.ndim == 1 and array.dtype.kind == "b":
+            return array
+
+    if caller in CALLERS and selection is not None and not isinstance(selection, str):
+        return flat_axis(selection, "selection", caller).tolist()
+
+    if syntax == "MolSysMT":
+        if isinstance(selection, str):
+            return selection
+        elif isinstance(selection, (int, np.int64, np.int32)):
+            return [selection]
+        elif is_iterable(selection):
+            if all([isinstance(ii, (int, np.int64, np.int32)) for ii in selection]):
+                return list(selection)
+            else:
+                return list(
+                    [
+                        digest_selection(ii, syntax=syntax, caller=caller)
+                        for ii in selection
+                    ]
+                )
+        elif isinstance(selection, range):
+            return list(selection)
+        elif selection is None:
+            return None
+    else:
+        if isinstance(selection, str):
+            return selection
+        elif isinstance(selection, (int, np.int64, np.int32)):
+            return np.array([selection], dtype="int64")
+        elif isinstance(selection, (np.ndarray, list, tuple, range)):
+            return np.array(selection, dtype="int64")
+        elif isinstance(selection, range):
+            return list(selection)
+        elif selection is None:
+            return None
+
+    raise ArgumentError("selection", value=selection, caller=caller, message=None)

@@ -1,0 +1,865 @@
+"""
+This is a script for the frontend of the SeqOpt class: multi-objective directed-evolution
+optimization over sequence variants of one wild-type, reusing a model-bound SeqMut as its
+fitness engine. SeqOpt is a core class; only its SHAP-guided ``mode="impact"`` (per-generation
+ShapModel refit) needs the optional ``aaanalysis[pro]`` dependency, imported lazily.
+"""
+from typing import Optional, List, Any, Callable, Tuple, Dict, Literal, Union
+import numpy as np
+import pandas as pd
+
+import aaanalysis.utils as ut
+from aaanalysis.template_classes import Tool
+from aaanalysis.feature_engineering._sequence_feature import SequenceFeature
+from ._seqmut import SeqMut, check_region, check_to_aa_set
+from ._design_constraints import DesignConstraints, resolve_constraints
+from ._backend.design_constraints import filter_search_space, has_sequence_limits
+from ._candidate_lineage import (resolve_lineage, check_lineage, build_lineage,
+                                 check_match_lineage_candidate_id)
+from ._backend.candidate_lineage import trace_records
+# ShapModel (and its heavy SHAP dependency) is imported lazily inside mode="impact" only, so
+# SeqOpt stays importable in a base install; mode="impact" then needs aaanalysis[pro].
+from ._backend.seqopt.genome import canonical, apply_genome, variant_label
+from ._backend.seqopt.run import evolve_nsga2, evolve_greedy
+from ._backend.seqopt.nsga2 import normalize_objectives_, rank_and_crowding
+from ._backend.seqopt.metrics import hypervolume, spread, convergence
+from ._backend.seqopt.penalty import apply_penalty
+
+
+# I Helper Functions
+def check_mode(mode=None):
+    """Check the guidance mode."""
+    ut.check_str_options(name="mode", val=mode, list_str_options=ut.LIST_SEQOPT_MODES)
+    return mode
+
+
+def check_match_df_seq_single(df_seq=None):
+    """Check that df_seq is a single-entry, position-based wild-type frame."""
+    ut.check_df_seq(df_seq=df_seq)
+    missing = [c for c in ut.COLS_SEQ_POS if c not in df_seq.columns]
+    if len(missing) > 0:
+        raise ValueError(f"'df_seq' ({missing}) should be in the position-based format with "
+                         f"columns {ut.COLS_SEQ_POS}; SeqOpt mutates residues and recomputes parts.")
+    if len(df_seq) != 1:
+        raise ValueError(f"'df_seq' (n={len(df_seq)}) should contain exactly one wild-type "
+                         f"sequence; SeqOpt optimizes variants of a single sequence per run.")
+
+
+def check_objectives(objectives=None, model=None):
+    """Check the objectives spec and split it into names, goals and sources.
+
+    ``objectives`` is a list of ``(name, goal, source)`` with ``goal`` in {'max','min'} and
+    ``source`` a built-in column name (delta_pred / delta_cpp / shift_score / n_mut) or a
+    callable. At least two objectives are required for a Pareto run.
+    """
+    objectives = ut.check_list_like(name="objectives", val=objectives, accept_none=False)
+    if len(objectives) < 2:
+        raise ValueError(f"'objectives' (n={len(objectives)}) should list at least two "
+                         f"(name, goal, source) objectives for a Pareto run.")
+    names, goals, sources = [], [], []
+    for i, obj in enumerate(objectives):
+        if not (isinstance(obj, (tuple, list)) and len(obj) == 3):
+            raise ValueError(f"'objectives[{i}]' ({obj}) should be a (name, goal, source) triple.")
+        name, goal, source = obj
+        ut.check_str(name="objective name", val=name, accept_none=False)
+        if goal not in ut.LIST_OBJECTIVE_GOALS:
+            raise ValueError(f"'objectives[{i}]' goal ({goal}) should be one of "
+                             f"{ut.LIST_OBJECTIVE_GOALS}.")
+        if not (callable(source) or source in ut.LIST_OBJECTIVE_SOURCES):
+            raise ValueError(f"'objectives[{i}]' source ({source}) should be a callable or one "
+                             f"of {ut.LIST_OBJECTIVE_SOURCES}.")
+        if source == ut.COL_DELTA_PRED and model is None:
+            raise ValueError(f"'objectives[{i}]' uses '{ut.COL_DELTA_PRED}' but no 'model' was "
+                             f"bound to SeqMut; pass a fitted model to the SeqOpt constructor.")
+        names.append(name)
+        goals.append(goal)
+        sources.append(source)
+    if len(set(names)) != len(names):
+        raise ValueError(f"'objectives' names ({names}) should be unique (one df_pareto column each).")
+    return names, goals, sources
+
+
+def residue_weights_(df_feat, col, base):
+    """Aggregate |df_feat[col]| per residue (window->full via base) into a position-weight dict.
+
+    Parameters
+    ----------
+    df_feat : pd.DataFrame
+        Feature set carrying ``positions`` (1-based window positions) and ``col``.
+    col : str
+        Attribution column to aggregate (``feat_importance`` or a ``feat_impact*`` column).
+    base : int
+        Full-sequence position of window index 1 (``tmd_start - jmd_n_len``).
+
+    Returns
+    -------
+    weights : dict or None
+        ``{full_position: weight}``; None when the column is absent or sums to zero.
+    """
+    if col is None or col not in df_feat.columns or ut.COL_POSITION not in df_feat.columns:
+        return None
+    weights: Dict[int, float] = {}
+    for pos_str, val in zip(df_feat[ut.COL_POSITION], df_feat[col]):
+        v = abs(float(val))
+        if v == 0:
+            continue
+        for tok in str(pos_str).split(","):
+            tok = tok.strip()
+            if tok:
+                full = base + int(tok) - 1
+                weights[full] = weights.get(full, 0.0) + v
+    return weights or None
+
+
+# II Main Functions
+class SeqOpt(Tool):
+    """
+    Sequence Optimizer (SeqOpt) class for multi-objective directed evolution over sequence
+    variants [Breimann24a]_. Core class; only the SHAP-guided ``mode="impact"`` needs
+    ``aaanalysis[pro]`` (``mode="importance"`` and everything else run in a base install).
+
+    ``SeqOpt`` performs **protein engineering**, not **de novo protein design**. The two are
+    distinct paradigms: *de novo design* builds **new proteins from the ground up** rather than
+    repurposing an existing one -- typically a structure-first deep-learning pipeline such as
+    **RFdiffusion** [Watson23]_ (backbone generation) -> **ProteinMPNN** [Dauparas22]_ (sequence
+    design) -> **AlphaFold** [Jumper21]_ (in-silico validation), reviewed in [Yang26]_. *Protein
+    engineering* instead **optimizes an existing sequence** through iterative mutation and
+    selection (directed evolution). ``SeqOpt`` is the **machine-learning-guided** flavour
+    [Yang19]_, [Wittmann21]_: a model predicts variant fitness so the search prioritizes which
+    mutations to make -- here as a multi-objective evolutionary search.
+
+    ``SeqOpt`` is the **search/optimization** counterpart of :class:`SeqMut`: where ``SeqMut``
+    *scores* mutations, ``SeqOpt`` *searches* the space of multi-mutation variants of a single
+    wild-type for the trade-off (Pareto) front that best satisfies several objectives at once.
+    It runs a re-implementation of NSGA-II [Deb02]_ using a model-bound :class:`SeqMut` as the
+    fitness engine, guided each generation by residue-level model attribution: ``mode="impact"``
+    refits :class:`ShapModel` under fuzzy labeling, ``mode="importance"`` uses the static
+    ``feat_importance`` ranking.
+
+    The evolutionary machinery is a **pure-Python re-implementation of DEAP** (a dev/test-only
+    parity oracle; the shipped runtime never imports DEAP). Each ``run`` setting selects the
+    equivalent DEAP function:
+
+    .. list-table:: SeqOpt setting -> DEAP function
+       :header-rows: 1
+       :widths: 45 55
+
+       * - SeqOpt (method / parameter = value)
+         - DEAP
+       * - ``run(...)`` driver
+         - ``algorithms.eaMuPlusLambda`` / ``eaMuCommaLambda`` / ``eaSimple``
+       * - ``algorithm="nsga2"``
+         - ``tools.selNSGA2`` (``sortNondominated`` + ``assignCrowdingDist``)
+       * - mating selection
+         - ``tools.selTournamentDCD``
+       * - ``survival="mu_plus_lambda" / "mu_comma_lambda" / "ea_simple"``
+         - ``eaMuPlusLambda`` / ``eaMuCommaLambda`` / ``eaSimple``
+       * - ``variation="and" / "or"``
+         - ``algorithms.varAnd`` / ``algorithms.varOr``
+       * - ``crossover="uniform" / "one_point" / "two_point"``
+         - ``tools.cxUniform`` / ``cxOnePoint`` / ``cxTwoPoint``
+       * - ``mutation="substitution"``
+         - ``tools.mutUniformInt`` (categorical resampling analogue)
+       * - ``constraints=[...], penalty="delta" / "closest_valid"``
+         - ``tools.DeltaPenalty`` / ``tools.ClosestValidPenalty``
+       * - ``objectives=[(name, "max"/"min", src)]``
+         - ``base.Fitness`` ``weights`` (+1 / -1 per objective) + ``toolbox.register("evaluate")``
+       * - ``df_pareto`` output / ``hall_of_fame_`` / ``trajectory_``
+         - ``tools.ParetoFront`` / ``tools.HallOfFame`` / ``tools.Logbook``
+       * - ``eval`` hypervolume / convergence / spread
+         - ``deap.benchmarks.tools.hypervolume`` / ``convergence`` / ``diversity``
+
+    Rows with no DEAP analogue are the aaanalysis value-add: the SHAP / ``feat_importance``
+    residue guidance (``mode``), the sequence genome + domain constraints (``n_mut_max``,
+    ``region``, ``to_aa``), the ``algorithm="greedy"`` baseline, and any ``callable(sequence)``
+    objective.
+
+    .. warning::
+
+        **Experimental.** This class is part of the new v1.1.0 protein-design/optimization layer and is
+        under active development; its API (signatures, defaults, return objects) may change between minor
+        releases without the usual deprecation cycle. Pin a version if you depend on the current behaviour.
+
+    .. versionadded:: 1.1.0
+
+    """
+    def __init__(self,
+                 *, mode: Literal["importance", "impact"] = "importance",
+                 model: Optional[Any] = None,
+                 target_class: Optional[Any] = None,
+                 df_seq_ref: Optional[pd.DataFrame] = None,
+                 labels: Optional[ut.ArrayLike1D] = None,
+                 df_scales: Optional[pd.DataFrame] = None,
+                 random_state: Optional[int] = None,
+                 verbose: bool = False,
+                 ):
+        """
+        Parameters
+        ----------
+        mode : {'importance', 'impact'}, default='importance'
+            Residue-guidance mode:
+
+            - ``'importance'``: uses the static ``feat_importance`` ranking from ``df_feat`` (no
+              SHAP, no refit) and walks positions highest-first. It needs no pro dependency, and is
+              the default so that a bare ``SeqOpt()`` constructs in a base install.
+            - ``'impact'``: the headline mode, refits :class:`ShapModel` every generation under
+              fuzzy labeling (the new variant's prediction score as a soft label vs. the balanced
+              reference) and mutates the strongest-``feat_impact`` residues. It is the only SeqOpt
+              feature that needs ``aaanalysis[pro]`` (SHAP), imported lazily, and requires
+              ``model``, ``df_seq_ref`` and ``labels``.
+
+            .. versionchanged:: 1.2.0
+               The default is ``'importance'`` (was ``'impact'``), so ``SeqOpt()`` constructs in a
+               base install; ``'impact'`` stays the documented headline mode.
+        model : object, optional
+            A fitted classifier exposing ``predict_proba`` used as the fitness engine (the
+            ``delta_pred`` objective) and, in ``mode='impact'``, as the model whose attribution
+            guides the search. Required when an objective uses ``delta_pred`` or ``mode='impact'``.
+        target_class : int or str, optional
+            Class whose predicted probability the fitness tracks. ``None`` selects the positive class.
+        df_seq_ref : pd.DataFrame, optional
+            Labeled, balanced **reference** sequences (position-based format) the per-generation
+            ``ShapModel`` refit is anchored on. Required for ``mode='impact'``.
+        labels : array-like, shape (n_ref,), optional
+            Binary class labels (1=positive, 0=negative) aligned to ``df_seq_ref``. Required for
+            ``mode='impact'``.
+        df_scales : pd.DataFrame, optional
+            Amino acid scales. Default from :func:`load_scales`.
+        random_state : int, optional
+            Seed threaded through the evolutionary RNG and :class:`ShapModel`.
+        verbose : bool, default=False
+            If ``True``, verbose outputs are enabled.
+
+        Raises
+        ------
+        ValueError
+            If ``mode``, ``df_scales``, or ``random_state`` is invalid; if the model arguments are
+            invalid; or if ``mode='impact'`` lacks ``model``, ``df_seq_ref``, or ``labels``.
+        ImportError
+            If ``mode='impact'`` is selected without the optional ``aaanalysis[pro]`` dependency.
+
+        See Also
+        --------
+        * :class:`SeqMut` whose ``combine`` scores the variants (the fitness engine).
+        * :class:`ShapModel` whose fuzzy-labeled SHAP values drive ``mode='impact'`` guidance.
+        """
+        # Validate
+        self._verbose = ut.check_verbose(verbose)
+        self._mode = check_mode(mode)
+        ut.check_df(name="df_scales", df=df_scales, accept_none=True)
+        if random_state is not None:
+            ut.check_number_range(name="random_state", val=random_state, min_val=0, just_int=True)
+        # Resolve the scale set
+        self._random_state = random_state
+        if df_scales is None:
+            df_scales = ut.load_default_scales()
+        self.df_scales = df_scales
+        self._sf = SequenceFeature(verbose=False)
+        # Fitness engine (model-bound SeqMut); validation of model/target_class is reused there.
+        self._seqmut = SeqMut(verbose=False, df_scales=df_scales, model=model,
+                              target_class=target_class)
+        self._model = model
+        self._target_class = target_class
+        # mode='impact' needs the labeled reference set + the (pro) ShapModel for the
+        # per-generation refit. ShapModel is imported lazily so SeqOpt stays core-importable.
+        self._ShapModel = None
+        if self._mode == "impact":
+            if model is None or df_seq_ref is None or labels is None:
+                raise ValueError("mode='impact' requires 'model', 'df_seq_ref' and 'labels' "
+                                 "(the balanced reference the per-generation ShapModel refit is "
+                                 "anchored on); use mode='importance' for a SHAP-free run.")
+            try:
+                from aaanalysis.explainable_ai_pro import ShapModel
+            except ImportError as e:
+                raise ImportError(
+                    "SeqOpt mode='impact' needs the SHAP-based ShapModel. Install via:\n"
+                    "\n\tpip install 'aaanalysis[pro]'\n\n"
+                    "or use mode='importance' (feature-importance-guided; no pro dependency)."
+                ) from e
+            self._ShapModel = ShapModel
+            ut.check_df_seq(df_seq=df_seq_ref)
+            labels = ut.check_labels(labels=labels, len_required=len(df_seq_ref))
+        self._df_seq_ref = df_seq_ref
+        self._labels = labels
+        # Set by run(lineage=...): one plain, JSON-serializable record per returned variant.
+        self.lineage_: Optional[List[Dict[str, Any]]] = None
+
+    # Helper methods
+    def _scannable(self, df_seq, df_feat, region, to_aa, jmd_n_len, jmd_c_len):
+        """Return (wt_entry, wt_seq, positions, alphabet, base) via a SeqMut scan."""
+        df_scan = self._seqmut.scan(df_seq=df_seq, df_feat=df_feat, region=region, to_aa=to_aa,
+                                    jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        positions = sorted(int(p) for p in df_scan[ut.COL_POS].unique())
+        alphabet = sorted(str(a) for a in df_scan[ut.COL_TO_AA].unique())
+        wt_entry = df_seq[ut.COL_ENTRY].iloc[0]
+        wt_seq = df_seq[ut.COL_SEQ].iloc[0]
+        base = int(df_seq[ut.COL_TMD_START].iloc[0]) - jmd_n_len
+        return wt_entry, wt_seq, positions, alphabet, base
+
+    def _build_fitness(self, df_seq, df_feat, names, sources, goals, constraints, penalty,
+                       jmd_n_len, jmd_c_len):
+        """Build a cached fitness_fn(genomes)->objective matrix backed by SeqMut.combine."""
+        wt_entry = df_seq[ut.COL_ENTRY].iloc[0]
+        wt_seq = df_seq[ut.COL_SEQ].iloc[0]
+        combine_cols = {ut.COL_DELTA_PRED, ut.COL_DELTA_CPP, ut.COL_SHIFT_SCORE}
+        need_combine = any(s in combine_cols for s in sources)
+        cache: Dict[Tuple, Dict[str, float]] = {}
+        # Per-(objective, variant) cache for callable objectives so a slow external predictor /
+        # API is queried once per distinct variant sequence, not once per generation.
+        call_cache: Dict[Tuple, float] = {}
+
+        def _score_uniq(genomes):
+            uniq = {}
+            for g in genomes:
+                key = canonical(g)
+                if key not in cache and len(g) > 0:
+                    uniq[key] = g
+            if not (need_combine and uniq):
+                return
+            rows = []
+            for g in uniq.values():
+                label = variant_label(wt_seq, g)
+                for pos, to_aa in sorted(g.items()):
+                    rows.append((wt_entry, label, int(pos), to_aa))
+            variants = pd.DataFrame(rows, columns=[ut.COL_ENTRY, ut.COL_VARIANT,
+                                                   ut.COL_POS, ut.COL_TO_AA])
+            df_var = self._seqmut.combine(df_seq=df_seq, variants=variants, df_feat=df_feat,
+                                          jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+            by_label = df_var.set_index(ut.COL_VARIANT)
+            for g in uniq.values():
+                row = by_label.loc[variant_label(wt_seq, g)]
+                sc = {ut.COL_DELTA_CPP: float(row[ut.COL_DELTA_CPP]),
+                      ut.COL_SHIFT_SCORE: float(row[ut.COL_SHIFT_SCORE])}
+                if ut.COL_DELTA_PRED in by_label.columns:
+                    sc[ut.COL_DELTA_PRED] = float(row[ut.COL_DELTA_PRED])
+                cache[canonical(g)] = sc
+
+        def fitness_fn(genomes):
+            _score_uniq(genomes)
+            F = []
+            for g in genomes:
+                sc = cache.get(canonical(g), {})
+                vec = []
+                for src in sources:
+                    if src == ut.COL_N_MUT:
+                        vec.append(float(len(g)))
+                    elif callable(src):
+                        key = (id(src), canonical(g))
+                        if key not in call_cache:
+                            call_cache[key] = float(src(apply_genome(wt_seq, g)))
+                        vec.append(call_cache[key])
+                    elif len(g) == 0:
+                        vec.append(0.0)
+                    else:
+                        vec.append(float(sc[src]))
+                F.append(vec)
+            F = np.asarray(F, dtype=float)
+            if constraints:
+                F = apply_penalty(F, genomes, constraints, goals, penalty=penalty)
+            return F
+
+        return fitness_fn, wt_entry, wt_seq
+
+    def _impact_weights(self, df_seq, df_feat, best_genome, wt_seq, base, jmd_n_len, jmd_c_len):
+        """Refit ShapModel under fuzzy labeling on the best variant; aggregate |feat_impact|."""
+        mut_seq = apply_genome(wt_seq, best_genome)
+        ts = int(df_seq[ut.COL_TMD_START].iloc[0])
+        te = int(df_seq[ut.COL_TMD_STOP].iloc[0])
+        # Keep only the position-based columns (the reference may carry jmd_n/tmd/jmd_c/label
+        # etc. that would NaN-out for the appended variant row and trip check_df_seq).
+        pos_cols = [ut.COL_ENTRY] + list(ut.COLS_SEQ_POS)
+        df_ref = self._df_seq_ref[pos_cols].copy()
+        var_row = {ut.COL_ENTRY: "__variant__", ut.COL_SEQ: mut_seq,
+                   ut.COL_TMD_START: ts, ut.COL_TMD_STOP: te}
+        df_all = pd.concat([df_ref, pd.DataFrame([var_row])[pos_cols]], ignore_index=True)
+        df_parts = self._sf.get_df_parts(df_seq=df_all, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        features = list(df_feat[ut.COL_FEATURE])
+        X = np.asarray(self._sf.feature_matrix(features=features, df_parts=df_parts,
+                                               df_scales=self.df_scales), dtype=float)
+        proba = self._model.predict_proba(X[-1:].astype(float))
+        proba = np.asarray(proba, dtype=float).ravel()
+        p_var = float(proba[-1]) if proba.ndim == 1 and len(proba) else float(np.ravel(proba)[-1])
+        p_var = min(max(p_var, 0.0), 1.0)
+        labels_fuzzy = list(np.asarray(self._labels, dtype=float)) + [p_var]
+        sm = self._ShapModel(random_state=self._random_state, verbose=False)
+        sm.fit(X, labels_fuzzy, fuzzy_labeling=True)
+        df_imp = sm.add_feat_impact(df_feat.copy(), samples=int(len(X) - 1), names="var", drop=True)
+        impact_cols = [c for c in df_imp.columns if c.startswith(ut.COL_FEAT_IMPACT)
+                       and c not in (ut.COL_FEAT_IMPACT, ut.COL_FEAT_IMPACT_STD)]
+        col = impact_cols[0] if impact_cols else ut.COL_FEAT_IMPACT
+        return residue_weights_(df_imp, col, base)
+
+    def _build_guide(self, df_seq, df_feat, fitness_fn, goals, wt_seq, base, jmd_n_len, jmd_c_len):
+        """Build guide_fn(population)->position-weight dict for the configured mode."""
+        if self._mode == "importance":
+            static = residue_weights_(df_feat, ut.COL_FEAT_IMPORT, base)
+            return lambda pop: static
+        # mode == "impact": initial prior from df_feat, then per-generation ShapModel refit.
+        initial = (residue_weights_(df_feat, ut.COL_FEAT_IMPACT, base)
+                   or residue_weights_(df_feat, ut.COL_FEAT_IMPORT, base))
+
+        def guide_fn(pop):
+            if pop is None or len(pop) == 0:
+                return initial
+            F = fitness_fn(pop)
+            W = normalize_objectives_(F, goals)
+            best = pop[int(np.argmax(W[:, 0]))]
+            if len(best) == 0:
+                return initial
+            return self._impact_weights(df_seq, df_feat, best, wt_seq, base,
+                                        jmd_n_len, jmd_c_len) or initial
+
+        return guide_fn
+
+    # Main methods
+    def run(self,
+            df_seq: pd.DataFrame,
+            df_feat: pd.DataFrame,
+            objectives: List[Tuple[str, str, Any]],
+            *, algorithm: str = "nsga2",
+            pop_size: int = 50,
+            n_gen: int = 20,
+            crossover: str = "uniform",
+            mutation: str = "substitution",
+            cx_prob: float = 0.5,
+            mut_prob: float = 0.2,
+            survival: str = "mu_plus_lambda",
+            variation: str = "and",
+            constraints: Optional[Union[List[Callable], DesignConstraints]] = None,
+            penalty: str = "delta",
+            hof_size: int = 10,
+            n_mut_max: int = 5,
+            region: Optional[Any] = None,
+            to_aa: Optional[List[str]] = None,
+            init: str = "random",
+            seed: Optional[int] = None,
+            jmd_n_len: int = 10,
+            jmd_c_len: int = 10,
+            lineage: Union[bool, Dict[str, Any]] = False,
+            ) -> pd.DataFrame:
+        """
+        Run multi-objective directed evolution and return the Pareto front of variants.
+
+        A population of multi-mutation variants of the single wild-type ``df_seq`` is evolved by
+        NSGA-II (``algorithm='nsga2'``) or an importance-ordered greedy walk
+        (``algorithm='greedy'``), scored on every objective, and reduced to the non-dominated
+        trade-off front.
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (1, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein identifiers, in the
+            **position-based** format (``sequence``, ``tmd_start``, ``tmd_stop``). See
+            :meth:`SequenceFeature.get_df_parts` for the full ``df_seq`` format specification.
+            Must hold **exactly one** wild-type sequence (SeqOpt optimizes one sequence per run).
+        df_feat : pd.DataFrame
+            CPP feature set (output of :meth:`CPP.run`) defining the features and the residue
+            attribution (``feat_importance`` / ``feat_impact``, ``positions``) the search reads.
+        objectives : list of (str, str, object)
+            ``(name, goal, source)`` per objective; ``goal`` in ``{'max','min'}`` and ``source``
+            in ``{'delta_pred','delta_cpp','shift_score','n_mut'}`` or a ``callable(sequence) ->
+            float``. The callable receives the **variant sequence** and returns a scalar, so any
+            external predictor (scikit / torch model, or a sequence-level tool / web API such as
+            a topology or signal-peptide predictor) can be optimized as an objective; its result
+            is cached per distinct variant. At least two objectives.
+        algorithm : str, default='nsga2'
+            ``'nsga2'`` (population) or ``'greedy'`` (importance-ordered single path).
+        pop_size : int, default=50
+            Population size (NSGA-II only).
+        n_gen : int, default=20
+            Number of generations (NSGA-II only).
+        crossover : str, default='uniform'
+            Crossover operator: ``'uniform'`` / ``'one_point'`` / ``'two_point'``.
+        mutation : str, default='substitution'
+            Mutation operator: ``'substitution'`` or ``'shift'``.
+        cx_prob : float, default=0.5
+            Per-pair crossover probability.
+        mut_prob : float, default=0.2
+            Per-individual mutation probability.
+        survival : str, default='mu_plus_lambda'
+            Survival scheme: ``'mu_plus_lambda'`` (elitist), ``'mu_comma_lambda'`` or
+            ``'ea_simple'`` (generational replacement).
+        variation : str, default='and'
+            Variation scheme: ``'and'`` (varAnd — crossover *and* mutation) or ``'or'`` (varOr —
+            each offspring is crossover *or* mutation *or* reproduction; needs cx_prob+mut_prob<=1).
+        constraints : list of callable or DesignConstraints, optional
+            Design limits, in either of two forms. A **list of callables** is the published form:
+            feasibility predicates ``genome -> bool`` (``True`` = feasible) over the internal
+            ``{1-based position: target amino acid}`` genome; infeasible variants are penalized so
+            the search avoids them. A :class:`DesignConstraints` **object** is the shared,
+            declarative form: its ``mutable_positions`` / ``permitted_substitutions`` /
+            ``n_mut_max`` are the object form of ``region`` / ``to_aa`` / ``n_mut_max`` and
+            restrict the search space directly, while its sequence-level limits (immutable
+            positions, forbidden substitutions, identity bounds, motifs) are turned into one
+            feasibility predicate via :meth:`DesignConstraints.as_predicate` and penalized the
+            same way. Passing the object together with a ``region`` / ``to_aa`` / non-default
+            ``n_mut_max`` that sets the same limit differently raises. ``None`` (default) applies
+            no limit.
+
+            .. versionchanged:: 1.2.0
+               Also accepts a :class:`DesignConstraints` object; the list-of-callables form is
+               unchanged.
+        penalty : str, default='delta'
+            Penalty applied to infeasible variants: ``'delta'`` (fixed worst objective) or
+            ``'closest_valid'`` (penalty scaled by the number of violated constraints).
+        hof_size : int, default=10
+            Size of the single-objective Hall of Fame (``SeqOpt.hall_of_fame_``) accumulated
+            across generations.
+        n_mut_max : int, default=5
+            Maximum number of point mutations per variant. Shorthand for the ``n_mut_max`` of
+            ``constraints``, which it builds internally.
+        region : str or list of int, optional
+            Restrict the mutable span (see :meth:`SeqMut.scan`). Shorthand for the
+            ``mutable_positions`` of ``constraints``, which it builds internally.
+        to_aa : list of str, optional
+            Substitution alphabet (see :meth:`SeqMut.scan`). Shorthand for the
+            ``permitted_substitutions`` of ``constraints``, which it builds internally.
+        init : str, default='random'
+            Population initialization: ``'random'`` or ``'suggest'`` (warm start from the top
+            single mutations).
+        seed : int, optional
+            Per-call seed; overrides the constructor ``random_state``.
+        jmd_n_len : int, default=10
+            Length of JMD-N in number of amino acids.
+        jmd_c_len : int, default=10
+            Length of JMD-C in number of amino acids.
+        lineage : bool or dict, default=False
+            Opt in to the candidate-lineage record: the thin, JSON-serializable record of how
+            each returned variant was made (its content-hash ``candidate_id``, its parent, the
+            ordered wild-type-relative mutations, the generating method and algorithm, the
+            objective values, the effective seed, and a digest of the applied design limits).
+            ``False`` (default) builds nothing and leaves the returned table exactly as
+            documented below. ``True`` builds one record per returned variant, treating the
+            wild-type as the root of the chain. Passing a **lineage record** (one element of a
+            previous ``SeqOpt.lineage_`` or ``SeqMut.lineage_``) opts in *and* declares that
+            parent: its ``candidate_id`` becomes the ``parent_id`` of every record built here,
+            which is how the rounds of a multi-generation design chain up -- one run optimizes
+            one wild-type, so a candidate that becomes the next round's ``df_seq`` is linked
+            through its record, not through the internal ``n_gen`` counter. When opted in, the
+            records are stored in ``SeqOpt.lineage_``, row-aligned with the returned table, and
+            the ``candidate_id`` column is appended.
+
+            .. versionadded:: 1.2.0
+
+        Returns
+        -------
+        df_pareto : pd.DataFrame
+            One row per final-population variant with ``entry``, ``variant``, ``n_mut``,
+            ``sequence_mut``, one column per objective (named by ``objectives``), the
+            non-dominated ``rank`` (0 = best front) and the ``crowding`` distance, sorted by
+            ``rank`` then descending ``crowding``. When ``lineage`` is opted in, the
+            ``candidate_id`` column is appended.
+
+        Raises
+        ------
+        ValueError
+            If ``df_seq`` does not hold exactly one position-based wild-type, if ``objectives``
+            or any option string is invalid, if ``constraints`` is neither a list of callables nor
+            a :class:`DesignConstraints` object, if it conflicts with ``region`` / ``to_aa`` /
+            ``n_mut_max``, if ``lineage`` is neither a bool nor a lineage record, or if the
+            resulting search space is empty.
+
+        See Also
+        --------
+        * :meth:`SeqOpt.trace_lineage`: which walks the lineage records back to their root.
+
+        Examples
+        --------
+        .. include:: examples/seqo_run.rst
+        """
+        # Validate
+        check_match_df_seq_single(df_seq=df_seq)
+        df_feat = ut.check_df_feat(df_feat=df_feat)
+        names, goals, sources = check_objectives(objectives=objectives, model=self._model)
+        # Remember the objective directions so eval() can maximization-normalize df_pareto.
+        self._obj_meta_ = dict(zip(names, goals))
+        ut.check_str_options(name="algorithm", val=algorithm,
+                             list_str_options=ut.LIST_SEQOPT_ALGORITHMS)
+        ut.check_str_options(name="crossover", val=crossover,
+                             list_str_options=ut.LIST_SEQOPT_CROSSOVER)
+        ut.check_str_options(name="mutation", val=mutation,
+                             list_str_options=ut.LIST_SEQOPT_MUTATION)
+        ut.check_str_options(name="survival", val=survival,
+                             list_str_options=ut.LIST_SEQOPT_SURVIVAL)
+        ut.check_str_options(name="variation", val=variation,
+                             list_str_options=ut.LIST_SEQOPT_VARIATION)
+        ut.check_str_options(name="penalty", val=penalty, list_str_options=ut.LIST_SEQOPT_PENALTY)
+        ut.check_str_options(name="init", val=init, list_str_options=ut.LIST_SEQOPT_INIT)
+        ut.check_number_range(name="pop_size", val=pop_size, min_val=2, just_int=True)
+        ut.check_number_range(name="n_gen", val=n_gen, min_val=1, just_int=True)
+        ut.check_number_range(name="n_mut_max", val=n_mut_max, min_val=1, just_int=True)
+        ut.check_number_range(name="hof_size", val=hof_size, min_val=1, just_int=True)
+        ut.check_number_range(name="cx_prob", val=cx_prob, min_val=0, max_val=1, just_int=False)
+        ut.check_number_range(name="mut_prob", val=mut_prob, min_val=0, max_val=1, just_int=False)
+        # 'constraints' is either the published list of genome->bool predicates or one shared
+        # DesignConstraints object; the region / to_aa / n_mut_max shorthands fold into the latter,
+        # so every design limit has exactly one definition.
+        dc_arg = None
+        if isinstance(constraints, DesignConstraints):
+            dc_arg, constraints = constraints, None
+        elif constraints is not None:
+            constraints = ut.check_list_like(name="constraints", val=constraints)
+            for i, c in enumerate(constraints):
+                if not callable(c):
+                    raise ValueError(f"'constraints[{i}]' ({c}) should be a callable "
+                                     f"genome->bool feasibility predicate, or 'constraints' "
+                                     f"should be a DesignConstraints object.")
+        region = check_region(region=region)
+        to_aa = None if to_aa is None else check_to_aa_set(to_aa=to_aa)
+        # The resolved cap keeps its own local: 'n_mut_max' is the caller's int argument, while
+        # the resolved value comes back out of the merged constraint object.
+        design_constraints, region, to_aa, n_mut_max_resolved = resolve_constraints(
+            constraints=dc_arg, region=region, to_aa=to_aa, n_mut_max=n_mut_max,
+            n_mut_max_default=5)
+        # resolve_constraints leaves the cap open when neither side sets one; here the argument
+        # always carries a value (validated above), so the search always has an integer cap.
+        n_mut_max_resolved = n_mut_max if n_mut_max_resolved is None else int(n_mut_max_resolved)
+        if variation == ut.LIST_SEQOPT_VARIATION[1] and cx_prob + mut_prob > 1:
+            raise ValueError(f"variation='or' requires cx_prob + mut_prob <= 1 "
+                             f"(got {cx_prob} + {mut_prob}).")
+        if seed is not None:
+            ut.check_number_range(name="seed", val=seed, min_val=0, just_int=True)
+        with_lineage, parent_record = resolve_lineage(lineage=lineage)
+        # Resolve RNG + scannable space
+        import random as _random
+        resolved_seed = seed if seed is not None else self._random_state
+        rng = _random.Random(resolved_seed)
+        wt_entry, wt_seq, positions, alphabet, base = self._scannable(
+            df_seq, df_feat, region, to_aa, jmd_n_len, jmd_c_len)
+        if len(positions) == 0:
+            raise ValueError("No scannable positions for the given 'region'.")
+        # Structural enforcement: the genome operators never propose an excluded move.
+        positions, alphabet = filter_search_space(positions=positions, alphabet=alphabet,
+                                                  spec=design_constraints.to_dict())
+        if len(positions) == 0 or len(alphabet) == 0:
+            raise ValueError(f"'constraints' ({design_constraints}) should leave at least one "
+                             f"position and one target amino acid; the search space is empty.")
+        # Sequence-level limits cannot be guaranteed by the operators (they depend on the whole
+        # variant), so they ride the existing feasibility-penalty path as one predicate.
+        constraints = list(constraints) if constraints else []
+        if has_sequence_limits(spec=design_constraints.to_dict()):
+            constraints.append(design_constraints.as_predicate(parent=wt_seq))
+        # Fitness + guidance
+        fitness_fn, _, _ = self._build_fitness(df_seq, df_feat, names, sources, goals,
+                                               constraints, penalty, jmd_n_len, jmd_c_len)
+        guide_fn = self._build_guide(df_seq, df_feat, fitness_fn, goals, wt_seq, base,
+                                     jmd_n_len, jmd_c_len)
+        suggest_seeds = None
+        if init == "suggest":
+            df_sug = self._seqmut.suggest(df_seq=df_seq, df_feat=df_feat, n=pop_size,
+                                          region=region, to_aa=to_aa,
+                                          jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+            suggest_seeds = [{int(p): a} for p, a in zip(df_sug[ut.COL_POS], df_sug[ut.COL_TO_AA])]
+        # Evolve
+        if algorithm == ut.LIST_SEQOPT_ALGORITHMS[1]:       # "greedy"
+            res = evolve_greedy(wt_seq, positions, alphabet, goals, fitness_fn, guide_fn,
+                                n_mut_max=n_mut_max_resolved)
+        else:                                               # "nsga2"
+            res = evolve_nsga2(wt_seq, positions, alphabet, goals, fitness_fn, guide_fn, rng,
+                               pop_size=pop_size, n_gen=n_gen, n_mut_max=n_mut_max_resolved,
+                               crossover=crossover, mutation=mutation, cx_prob=cx_prob,
+                               mut_prob=mut_prob, survival=survival, variation=variation,
+                               hof_size=hof_size, suggest_seeds=suggest_seeds)
+        self.trajectory_ = list(res["trajectory"])
+        # Hall of Fame: best-k single-objective variants (labels) across all generations.
+        self.hall_of_fame_ = [variant_label(wt_seq, g) for g in res.get("hall_of_fame", [])]
+        # Per-generation history (hypervolume + spread + per-objective best front value).
+        self.history_ = self._build_history(res, names)
+        df_pareto = self._build_output(res, wt_entry, wt_seq, names, goals)
+        if with_lineage:
+            # Built from the returned table, so the records are row-aligned with it.
+            cols_obj = [str(name) for name in names]
+            list_obj = [list(df_pareto[col]) for col in cols_obj]
+            list_objective_values = [dict(zip(cols_obj, values)) for values in zip(*list_obj)]
+            self.lineage_ = build_lineage(
+                list_source_seq=[wt_seq] * len(df_pareto),
+                list_candidate_seq=list(df_pareto[ut.COL_SEQ_MUT]),
+                method=f"SeqOpt.run:{algorithm}",
+                list_objective_values=list_objective_values,
+                seed=resolved_seed,
+                spec=design_constraints.to_dict(),
+                parent=parent_record)
+            df_pareto[ut.COL_CANDIDATE_ID] = [record["candidate_id"]
+                                              for record in self.lineage_]
+        if self._verbose:
+            n_front = int((df_pareto[ut.COL_RANK] == 0).sum())
+            ut.print_out(f"SeqOpt ({self._mode}/{algorithm}) returned {len(df_pareto)} variants "
+                         f"({n_front} on the Pareto front).")
+        return df_pareto
+
+    def _build_output(self, res, wt_entry, wt_seq, names, goals):
+        """Assemble df_pareto from the evolve result (final population + cumulative archive).
+
+        The cumulative non-dominated archive is merged into the final population before fronts
+        are recomputed, so the returned ``rank=0`` front is the **best-ever** non-dominated set
+        (no solution lost to per-generation crowding), not just the final population's front.
+        """
+        genomes = list(res["genomes"])
+        F = np.asarray(res["F"], dtype=float)
+        arch_g, arch_F = res.get("pareto_archive", ([], np.empty((0, len(names)))))
+        if len(arch_g):
+            genomes = genomes + list(arch_g)
+            F = np.vstack([F, np.asarray(arch_F, dtype=float)])
+        # Deduplicate genomes, then recompute rank/crowding over the merged set.
+        seen, keep = set(), []
+        for i, g in enumerate(genomes):
+            key = canonical(g)
+            if key not in seen:
+                seen.add(key)
+                keep.append(i)
+        genomes = [genomes[i] for i in keep]
+        F = F[keep]
+        W = normalize_objectives_(F, goals)
+        rank, crowding = rank_and_crowding(W)
+        data = {ut.COL_ENTRY: [wt_entry] * len(genomes),
+                ut.COL_VARIANT: [variant_label(wt_seq, g) for g in genomes],
+                ut.COL_N_MUT: [len(g) for g in genomes],
+                ut.COL_SEQ_MUT: [apply_genome(wt_seq, g) for g in genomes]}
+        for j, name in enumerate(names):
+            data[name] = F[:, j]
+        data[ut.COL_RANK] = [int(r) for r in rank]
+        data[ut.COL_CROWDING] = [float(c) for c in crowding]
+        df_pareto = pd.DataFrame(data)
+        df_pareto = df_pareto.sort_values([ut.COL_RANK, ut.COL_CROWDING],
+                                          ascending=[True, False])
+        # One row per distinct variant (the population may carry duplicate genomes); the sort
+        # keeps the best-crowding copy of each.
+        df_pareto = df_pareto.drop_duplicates(subset=[ut.COL_VARIANT]).reset_index(drop=True)
+        return df_pareto
+
+    def _build_history(self, res, names):
+        """Per-generation convergence history (one row per generation)."""
+        hv = list(res.get("trajectory", []))
+        sp = list(res.get("spread_trajectory", [np.nan] * len(hv)))
+        best = res.get("best_trajectory")
+        data = {ut.COL_GENERATION: list(range(len(hv))),
+                ut.COL_HYPERVOLUME: hv, ut.COL_SPREAD: sp}
+        mean = res.get("mean_trajectory")
+        worst = res.get("worst_trajectory")
+        if best is not None and len(best):
+            best = np.asarray(best, dtype=float)
+            mean = np.asarray(mean, dtype=float) if mean is not None and len(mean) else None
+            worst = np.asarray(worst, dtype=float) if worst is not None and len(worst) else None
+            for j, name in enumerate(names):
+                data[f"best_{name}"] = best[:, j]
+                if mean is not None:
+                    data[f"mean_{name}"] = mean[:, j]
+                if worst is not None:
+                    data[f"worst_{name}"] = worst[:, j]
+        return pd.DataFrame(data)
+
+    def eval(self,
+             df_pareto: pd.DataFrame,
+             *, ref_point: Optional[ut.ArrayLike1D] = None,
+             ref_front: Optional[ut.ArrayLike2D] = None,
+             ) -> pd.DataFrame:
+        """
+        Evaluate a Pareto front: hypervolume, front size, spread and (optionally) convergence.
+
+        Summarizes the quality of the front returned by :meth:`run` as one row of metrics: the
+        dominated hypervolume (how much objective space the front covers above the reference point),
+        the number of non-dominated variants, their spread along the front and, when a reference
+        front is given, the convergence distance to it. Use it to compare runs (objectives, budgets,
+        ``mode``) or to check that a longer run still improves the front.
+
+        Parameters
+        ----------
+        df_pareto : pd.DataFrame
+            Output of :meth:`SeqOpt.run`.
+        ref_point : array-like, shape (n_objectives,), optional
+            Reference (nadir) point for the hypervolume. If ``None``, the per-objective minimum
+            (minus a small margin) of the front is used.
+        ref_front : array-like, shape (n_ref, n_objectives), optional
+            A reference (target) front in raw objective space. When given, a ``convergence``
+            column (generational distance to this front; lower = closer) is added.
+
+        Returns
+        -------
+        df_eval : pd.DataFrame, shape (1, 3 or 4)
+            One row with ``hypervolume``, ``n_front`` (rank-0 size) and ``spread`` (plus
+            ``convergence`` when ``ref_front`` is given).
+
+        Examples
+        --------
+        .. include:: examples/seqo_eval.rst
+        """
+        # Validate
+        ut.check_df(df=df_pareto, name="df_pareto",
+                    cols_required=[ut.COL_RANK, ut.COL_CROWDING])
+        obj_cols = [c for c in df_pareto.columns if c not in
+                    (ut.COLS_PARETO_BASE + [ut.COL_RANK, ut.COL_CROWDING])]
+        if len(obj_cols) < 2:
+            raise ValueError(f"'df_pareto' should carry at least two objective columns; found "
+                             f"{obj_cols}.")
+        # Evaluate on the first (rank=0) front
+        front = df_pareto[df_pareto[ut.COL_RANK] == 0]
+        F = front[obj_cols].to_numpy(dtype=float)
+        # Maximization-normalize using the goals remembered from the last run() (every objective
+        # flipped to max-is-better); fall back to all-max for a front from an unknown run.
+        obj_meta = getattr(self, "_obj_meta_", {})
+        eval_goals = [obj_meta.get(c, ut.LIST_OBJECTIVE_GOALS[0]) for c in obj_cols]
+        W = normalize_objectives_(F, eval_goals)
+        ref = None if ref_point is None else np.asarray(ref_point, dtype=float)
+        record = {ut.COL_HYPERVOLUME: hypervolume(W, ref=ref),
+                  ut.COL_N_FRONT: int(len(front)), ut.COL_SPREAD: spread(W)}
+        if ref_front is not None:
+            ref_W = normalize_objectives_(np.asarray(ref_front, dtype=float), eval_goals)
+            record[ut.COL_CONVERGENCE] = convergence(W, ref_W)
+        df_eval = pd.DataFrame([record])
+        return df_eval
+
+    @staticmethod
+    def trace_lineage(lineage: List[Dict[str, Any]],
+                      candidate_id: str,
+                      ) -> List[Dict[str, Any]]:
+        """
+        Reconstruct the chain of lineage records that leads to one designed candidate.
+
+        Directed evolution over several rounds is a chain: the candidate picked from one run
+        becomes the wild-type of the next, and each record names its parent by content hash.
+        This walks those links backwards from ``candidate_id`` to the root the export still
+        contains, so the full parent-to-candidate path is recovered from the records alone --
+        including after a JSON round trip, and including records from different runs.
+
+        Parameters
+        ----------
+        lineage : list of dict
+            Lineage records collected over one or more design rounds, as produced by
+            :meth:`SeqOpt.run` or :meth:`SeqMut.combine` with ``lineage`` opted in (read from
+            ``SeqOpt.lineage_`` / ``SeqMut.lineage_``, or reloaded from JSON). Records of
+            unrelated candidates may be present; only the traced chain is returned.
+        candidate_id : str
+            Identifier of the candidate to trace, as found in the ``candidate_id`` column of the
+            returned table or in the ``candidate_id`` field of a record.
+
+        Returns
+        -------
+        list_lineage : list of dict
+            The records from the root ancestor to ``candidate_id``, root first, so concatenating
+            their ``mutations`` replays the design from the root sequence to the candidate. The
+            chain holds one record when the candidate descends directly from its wild-type.
+
+        Raises
+        ------
+        ValueError
+            If ``lineage`` is not a non-empty list of lineage records, or if ``candidate_id`` is
+            not the identifier of one of them.
+        RuntimeError
+            If the records are cyclic, so a candidate would be its own ancestor.
+
+        See Also
+        --------
+        * :meth:`SeqOpt.run`: whose ``lineage`` parameter produces the records.
+        * :meth:`SeqMut.trace_lineage`: the same tracer on the mutation class.
+
+        .. versionadded:: 1.2.0
+
+        Examples
+        --------
+        .. include:: examples/seqo_trace_lineage.rst
+        """
+        # Validate
+        lineage = check_lineage(name="lineage", val=lineage)
+        check_match_lineage_candidate_id(lineage=lineage, candidate_id=candidate_id)
+        # Walk the parent links back to the root of the exported chain
+        return trace_records(lineage=lineage, candidate_id=candidate_id)

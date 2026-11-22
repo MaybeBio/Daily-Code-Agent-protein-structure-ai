@@ -1,0 +1,324 @@
+% This file is part of the Collective Variables module (Colvars).
+% The original version of Colvars and its updates are located at:
+% https://github.com/Colvars/colvars
+% Please update all Colvars source files before making any changes.
+% If you wish to distribute your changes, please submit them to the
+% Colvars repository at GitHub.
+
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+
+\usepackage[english]{babel}
+
+\usepackage{catchfile}
+\CatchFileEdef{\cvreleaselabel}{|kpsewhich -var-value=COLVARS_RELEASE}{\endlinechar=-1}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{bbm}
+\usepackage{mathrsfs}
+
+\usepackage[T1]{fontenc}
+\usepackage{mathptmx}
+\usepackage{helvet}
+\renewcommand{\familydefault}{\sfdefault}
+
+\usepackage{calc}
+
+\usepackage{natbib}
+
+\usepackage{graphicx}
+\usepackage{color}
+\definecolor{background-color}{gray}{0.84}
+\usepackage{transparent}
+
+% Example code blocks
+\usepackage{xcolor} % Needed for HTML version
+\usepackage{mdframed}
+
+\definecolor{cvexample-border-color}{rgb}{0.5,0.0,0.5}
+\definecolor{cvexample-background-color}{rgb}{1.0,0.95,1.0}
+\definecolor{cvkeyword-background-color}{rgb}{0.95,0.8,0.95}
+
+\newenvironment{cvexampleinput}{%
+  \begin{mdframed}[%
+      linecolor=cvexample-border-color,linewidth=2pt,%
+      backgroundcolor=cvexample-background-color]
+  \ifdefined\HCode\HCode{<pre>}\else\begin{ttfamily}\fi}{%
+  \ifdefined\HCode\HCode{</pre>}\else\end{ttfamily}\fi
+  \end{mdframed}
+}
+
+\definecolor{mdexample-border-color}{rgb}{1.0,0.6,0.1}
+\definecolor{mdexample-background-color}{rgb}{1.0,0.96,0.9}
+\newenvironment{mdexampleinput}{%
+  \begin{mdframed}[%
+      linecolor=mdexample-border-color,linewidth=2pt,%
+      backgroundcolor=mdexample-background-color]
+  \ifdefined\HCode\HCode{<pre>}\else\begin{ttfamily}\fi}{%
+  \ifdefined\HCode\HCode{</pre>}\else\end{ttfamily}\fi
+  \end{mdframed}
+}
+
+\definecolor{datafileexample-border-color}{rgb}{0.05,0.2,0.0}
+\definecolor{datafileexample-background-color}{rgb}{0.95,1.0,0.8}
+\newenvironment{datafileexample}{%
+  \begin{mdframed}[%
+      linecolor=datafileexample-border-color,linewidth=2pt,%
+      backgroundcolor=datafileexample-background-color]
+  \ifdefined\HCode\HCode{<pre>}\else\begin{ttfamily}\fi}{%
+  \ifdefined\HCode\HCode{</pre>}\else\end{ttfamily}\fi
+  \end{mdframed}
+}
+
+% Note: the Python version is currently not built yet
+\newcommand{\cvscriptexampleinputcv}[2]{%
+% CLI interface
+\def\cvscriptargsep{~}
+\ifdefined\cvscriptpyapi%
+\textbf{With the ``\texttt{\cvscriptcmd{}}'' command:}\\\fi
+\begin{mdexampleinput}
+\noindent\cvscriptcmd{}~#1~#2
+\end{mdexampleinput}
+% Python interface
+\ifdefined\cvscriptpyapi%
+\textbf{With the Python interface:}\\
+\def\cvscriptargsep{,~}
+\begin{mdexampleinput}
+from colvars import Colvarscript\\
+cv = Colvarscript()\\
+cv.#1(#2)
+\end{mdexampleinput}\fi % end \ifdefined\cvscriptpyapi
+}
+
+\newcommand{\cvscriptexampleinputcolvar}[3]{%
+\def\cvscriptargsep{~}
+\begin{mdexampleinput}
+\noindent\cvscriptcmd{}~colvar~#3~#1~#2
+\end{mdexampleinput}
+}
+
+\newcommand{\cvscriptexampleinputbias}[3]{%
+\def\cvscriptargsep{~}
+\begin{mdexampleinput}{}
+\noindent\cvscriptcmd{}~bias~#3~#1~#2
+\end{mdexampleinput}
+}
+
+
+
+% for code-specific macros
+\usepackage{comment}
+
+\usepackage{makeidx}
+\makeindex
+
+\usepackage[stable]{footmisc}
+
+\usepackage[pagebackref,colorlinks,citecolor=blue,hyperfootnotes=false]{hyperref}
+
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{booktabs}
+
+\setcounter{secnumdepth}{3}
+\setcounter{tocdepth}{5}
+
+\begin{document}
+
+\ifdefined\HCode
+\input{colvars-refman-css.tex}
+\fi
+
+\input{cv_version.tex}
+
+\ifdefined\HCode
+\HCode{<div id="container">
+<div class="inner">
+}
+\fi
+
+\begin{titlepage}
+
+  \noindent\colorbox{background-color}{
+    \begin{minipage}{1.0\textwidth}
+
+        $\,$\\
+
+        \noindent\textsf{\bfseries\Huge COLLECTIVE VARIABLES MODULE\\}
+
+        \noindent\textsf{\bfseries\Huge Reference manual for \MDENGINE{}\\}
+
+        \noindent\textsf{\\Code version: \cvversion\\}
+
+        \noindent\textsf{Updated versions of this manual:
+          \ifdefined\HCode
+          [\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-gromacs.html}{GROMACS}]
+          \else
+          [\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-gromacs.pdf}{GROMACS}]
+          \fi
+          \ifdefined\HCode
+          [\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-lammps.html}{LAMMPS}]
+          \else
+          [\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-lammps.pdf}{LAMMPS}]
+          \fi
+          \ifdefined\HCode
+          [\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-namd.html}{NAMD}]
+          \else
+          [\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-namd.pdf}{NAMD}]
+          \fi
+          \ifdefined\HCode
+          [\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-tinkerhp.html}{Tinker-HP}]
+          \else
+          [\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-tinkerhp.pdf}{Tinker-HP}]
+          \fi
+          \ifdefined\HCode
+          [\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-vmd.html}{VMD}]
+          \else
+          [\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-vmd.pdf}{VMD}]
+          \fi
+        }
+
+      \end{minipage}}
+%  \noindent\rule{\textwidth}{2pt}
+
+  \ifdefined\HCode
+  \HCode{<img class="cover_picture" src="cover-512px.jpg" alt="Colvars logo">}
+  \\
+  \else
+  \includegraphics[width=0.9\textwidth]{cover.jpg}\\
+  \fi
+  \textsf{\large Alejandro Bernardin, Haochuan Chen, Jeffrey R.{} Comer, Giacomo Fiorin, Haohao Fu, J\'er\^ome H\'enin, Axel Kohlmeyer, Fabrizio Marinelli, Hubert Santuz, Joshua V.{} Vermaas, Andrew D.{} White, Wei Zhang}
+
+\ifdefined\HCode
+\noindent{}(\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-\mdengine.pdf}{PDF version})
+\else
+\par
+\noindent{}(\href{https://colvars.github.io/\cvreleaselabel/colvars-refman-\mdengine.html}{HTML version})
+\fi
+
+
+
+\end{titlepage}
+
+
+\newpage
+\label{sec:toc}%
+\ifdefined\HCode\HCode{<selfref>}\ref{sec:toc}\HCode{</selfref>}\fi%
+\tableofcontents
+\newpage
+
+% compiling the standalone reference manual
+
+% use macros with context field to document keywords
+\newcommand{\key}[5]{%
+  \colorbox{cvkeyword-background-color}{\index{#2!\texttt{#1}}\texttt{#1}} --- \emph{#3}\vspace{1ex}\\%
+  $[$~#4, context: #2~$]$\vspace{1ex}\\%
+  #5}
+
+\newcommand{\keydef}[6]{%
+  \colorbox{cvkeyword-background-color}{\index{#2!\texttt{#1}}\texttt{#1}} --- \emph{#3}\vspace{1ex}\\%
+  Default: #5\ $[$~#4, context: #2~$]$\vspace{1ex}\\%
+  #6}
+
+\newcommand{\labelkey}[1]{\hypertarget{#1}{}\label{#1}}
+\newcommand{\refkey}[2]{\hyperlink{#2}{\texttt{#1}}}
+\newcommand{\dupkey}[4]{%
+  \colorbox{cvkeyword-background-color}{\index{#2!\texttt{#1}}\texttt{#1}} --- same definition as \hyperlink{#3}{\texttt{#1}} (#4)%
+}
+\newcommand{\simkey}[3]{%
+  \colorbox{cvkeyword-background-color}{\index{#2!\texttt{#1}}\texttt{#1}} --- analogous to \texttt{#3}%
+}
+
+\newcommand{\gradx}{\mbox{\boldmath$\nabla_{\!\!x}\,$}}
+\newcommand{\vx}{{\mbox{\boldmath{$x$}}}}
+\newcommand{\bm}[1]{{\mbox{\boldmath{$#1$}}}}
+
+\newenvironment{cvcoptions}{%
+  \noindent\textbf{List of keywords} (see also \ref{sec:cvc_pbcs}, \ref{sec:cvc_common}, \ref{sec:cvc_periodic} and \ref{sec:cvc_superp} for additional options):
+  \begin{itemize}
+  }{%
+  \item %
+    \colorbox{cvkeyword-background-color}{\texttt{forceNoPBC}} --- \emph{Use absolute rather than minimum-image distances?} (see \hyperlink{colvar|cvc|forceNoPBC}{description})\\
+    Default: \texttt{no}
+  \end{itemize}
+}
+
+\newcommand{\pagetoplink}{\ifdefined\HCode
+  \begin{flushright}
+    \HCode{<a href="\#sec:toc" style="text-decoration: none; background-color: white;  color: gray;">(Go to Contents)</a><br>}
+  \end{flushright}
+  \fi}
+
+\newcommand{\cvsec}[2]{%
+  \newpage
+  \ifdefined\HCode
+  \pagetoplink
+  \HCode{<selfref>}\ref{#2}\HCode{</selfref>}
+  \HCode{<div class="heading">} % Use CSS, mdframed won't work for this
+  \else
+  \begin{mdframed}[backgroundcolor=background-color,linewidth=2pt]
+  \fi
+  \hypertarget{#2}{\section{#1}}\label{#2}
+  \ifdefined\HCode
+  \HCode{</div>}
+  \else
+  \end{mdframed}
+  \fi
+}
+
+\newcommand{\cvsubsec}[2]{%
+  \ifdefined\HCode
+  \pagetoplink
+  \HCode{<selfref>}\ref{#2}\HCode{</selfref>}
+  \HCode{<div class="heading">}
+  \else
+  \begin{mdframed}[backgroundcolor=background-color,linewidth=2pt]
+  \fi
+  \hypertarget{#2}{\subsection{#1}}\label{#2}
+  \ifdefined\HCode
+  \HCode{</div>}
+  \else
+  \end{mdframed}
+  \fi
+}
+
+\newcommand{\cvsubsubsec}[2]{%
+  \ifdefined\HCode
+  \pagetoplink
+  \HCode{<selfref>}\ref{#2}\HCode{</selfref>}
+  \HCode{<div class="heading">}
+  \else
+  \begin{mdframed}[backgroundcolor=background-color,linewidth=2pt]
+  \fi
+  \hypertarget{#2}{\subsubsection{#1}}\label{#2}
+  \ifdefined\HCode
+  \HCode{</div>}
+  \else
+  \end{mdframed}
+  \fi
+}
+
+\input{colvars-engine-flags}
+
+\input{colvars-refman-main}
+
+\ifdefined\HCode
+\else
+\newpage
+\printindex
+\fi
+
+\newpage
+%\addtocontents{toc}{\contentsline {section}{References}{\thepage}}
+\bibliographystyle{unsrt}
+\bibliography{colvars-refman,colvars-code-refs}
+
+\ifdefined\HCode
+\HCode{</div>
+</div>
+}
+\fi
+
+
+\end{document}

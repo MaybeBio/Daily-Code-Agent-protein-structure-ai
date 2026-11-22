@@ -1,0 +1,69 @@
+// mdir-opt: parses, verifies, transforms, and prints MDIR modules. It
+// knows every pass and dialect of MLIR as well, so that it replays the
+// pipeline of `mdir run` from a reproducer (docs/debugging.md).
+
+#include "mdir/Compiler/CompileCache.h"
+#include "mdir/Conversion/Passes.h"
+#include "mdir/Dialect/Dyn/DynDialect.h"
+#include "mdir/Dialect/MD/MDDialect.h"
+#include "mdir/Dialect/MD/Transforms/DerivativeInterface.h"
+#include "mdir/Dialect/MDAlg/MDAlgDialect.h"
+#include "mdir/Dialect/MDDist/MDDistDialect.h"
+#include "mdir/Dialect/MDExec/MDExecDialect.h"
+#include "mdir/Dialect/MDExec/Transforms/Passes.h"
+#include "mdir/Dialect/MDRT/MDRTDialect.h"
+#include "mdir/Dialect/MD/Transforms/Passes.h"
+
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/InitAllDialects.h"
+#include "mlir/InitAllExtensions.h"
+#include "mlir/InitAllPasses.h"
+#include "mlir/Tools/mlir-opt/MlirOptMain.h"
+
+namespace mdir {
+namespace test {
+void registerTestOutlineKernels();
+void registerTestLoopEffects();
+void registerTestStageAdjoint();
+void registerTestTranspose();
+void registerTestSegmentWindows();
+void registerTestWarpHelpers();
+void registerTestPrintCollections();
+void registerTestPrintStorageLiveness();
+void registerTestSegmentCoverage();
+} // namespace test
+} // namespace mdir
+
+int main(int argc, char **argv) {
+  mlir::registerAllPasses();
+  mdir::md::registerMDPasses();
+  mdir::registerMDIRConversionPasses();
+  mdir::registerGpuLowerToNVVMPipeline();
+  mdir::md_exec::registerMDExecPasses();
+  mdir::test::registerTestOutlineKernels();
+  mdir::test::registerTestLoopEffects();
+  mdir::test::registerTestStageAdjoint();
+  mdir::test::registerTestTranspose();
+  mdir::test::registerTestSegmentWindows();
+  mdir::test::registerTestWarpHelpers();
+  mdir::test::registerTestPrintCollections();
+  mdir::test::registerTestPrintStorageLiveness();
+  mdir::test::registerTestSegmentCoverage();
+
+  mlir::DialectRegistry registry;
+  mlir::registerAllDialects(registry);
+  mlir::registerAllExtensions(registry);
+  mdir::md::registerDerivativeInterfaces(registry);
+  registry.insert<mdir::dyn::DynDialect, mdir::md::MDDialect,
+                  mdir::md_exec::MDExecDialect, mdir::mdrt::MDRTDialect,
+                  mdir::md_dist::MDDistDialect, mdir::md_alg::MDAlgDialect>();
+
+  auto [input, output] = mlir::registerAndParseCLIOptions(
+      argc, argv, "MDIR optimizer driver\n", registry);
+  // The LLVM options given, with their values, are part of every key of
+  // the compile cache, which `--mdir-gpu-module-to-binary` uses
+  // (D397).
+  mdir::compiler::recordCommandLineOptions(argc, argv);
+  return mlir::asMainReturnCode(
+      mlir::MlirOptMain(argc, argv, input, output, registry));
+}

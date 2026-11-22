@@ -1,0 +1,139 @@
+[package]
+name = "flowmatch"
+version = "0.1.10"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+authors = ["Arc <attobop@gmail.com>"]
+description = "Train conditional vector fields with flow matching"
+repository = "https://github.com/arclabs561/flowmatch"
+homepage = "https://github.com/arclabs561/flowmatch"
+documentation = "https://docs.rs/flowmatch"
+keywords = ["flow-matching", "diffusion", "ot", "generative-modeling"]
+categories = ["science", "mathematics"]
+exclude = ["/.github", "/.gitignore", "/.agents"]
+
+[workspace]
+
+[features]
+# Default build stays `ndarray`-only; `burn` is an opt-in training backend path.
+default = []
+# Gates the sheaf-based evaluation examples, tests and bench. sheaf is a
+# dev-dependency, so library users never build it.
+sheaf-evals = []
+## Enable experimental hyperbolic manifold ODE tests (requires compatible `hyperball` + `skel` APIs).
+riemannian = ["dep:skel"]
+burn = [
+    "dep:burn-core",
+    "dep:burn-autodiff",
+    "dep:burn-ndarray",
+    "dep:burn-nn",
+    "dep:burn-optim",
+]
+
+[dependencies]
+thiserror = "2.0"
+ndarray = "0.16"
+rand = "0.9"
+rand_chacha = "0.9"
+rand_distr = "0.5"
+logp = "0.2"
+wass = "0.2.2"
+skel = { version = "0.1", optional = true }
+burn-core = { version = "0.20.0", default-features = false, features = ["std"], optional = true }
+burn-autodiff = { version = "0.20.0", default-features = false, features = ["std"], optional = true }
+burn-ndarray = { version = "0.20.0", default-features = true, optional = true }
+burn-nn = { version = "0.20.0", default-features = false, features = ["std"], optional = true }
+burn-optim = { version = "0.20.0", default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+proptest = "1.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+petgraph = "0.6"
+hyperball = "0.1"
+rkhs = "0.3.0"
+infogeom = { version = "0.2.1", features = ["manifold"] }
+fynch = { version = "0.2.2", features = ["logp"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sheaf = { version = "0.1.9", default-features = false, features = ["cluster", "community", "knn-graph", "metrics", "wass"] }
+
+[[example]]
+name = "ode_comparison"
+path = "examples/ode_comparison.rs"
+
+[[example]]
+name = "rfm_usgs_earthquakes_cluster_mass"
+path = "examples/rfm_usgs_earthquakes_cluster_mass.rs"
+required-features = ["sheaf-evals"]
+
+[[example]]
+name = "rfm_usgs_knn_leiden"
+path = "examples/rfm_usgs_knn_leiden.rs"
+required-features = ["sheaf-evals"]
+
+[[example]]
+name = "rfm_usgs_full_pipeline_report"
+path = "examples/rfm_usgs_full_pipeline_report.rs"
+required-features = ["sheaf-evals"]
+
+[[example]]
+name = "riemannian_fm_poincare"
+path = "examples/riemannian_fm_poincare.rs"
+required-features = ["riemannian"]
+
+[[example]]
+name = "rfm_poincare_geodesic_ode"
+path = "examples/rfm_poincare_geodesic_ode.rs"
+required-features = ["riemannian"]
+
+[[example]]
+name = "rfm_fisher_simplex"
+path = "examples/rfm_fisher_simplex.rs"
+required-features = ["riemannian"]
+
+[[example]]
+name = "burn_sd_fm_semidiscrete_linear"
+path = "examples/burn_sd_fm_semidiscrete_linear.rs"
+required-features = ["burn"]
+
+[[example]]
+name = "burn_rfm_minibatch_ot_linear"
+path = "examples/burn_rfm_minibatch_ot_linear.rs"
+required-features = ["burn"]
+
+[[example]]
+name = "mmd_flow_eval"
+path = "examples/mmd_flow_eval.rs"
+
+[[example]]
+name = "fynch_bregman_energy"
+path = "examples/fynch_bregman_energy.rs"
+
+[[bench]]
+name = "realdata_torsions"
+harness = false
+
+[[bench]]
+name = "pairing"
+harness = false
+
+[[bench]]
+name = "realdata_usgs"
+harness = false
+required-features = ["sheaf-evals"]
+
+[[test]]
+name = "rfm_usgs_cluster_mass_e2e"
+path = "tests/rfm_usgs_cluster_mass_e2e.rs"
+required-features = ["sheaf-evals"]
+
+[[test]]
+name = "rfm_usgs_leiden_exact_knn_e2e"
+path = "tests/rfm_usgs_leiden_exact_knn_e2e.rs"
+required-features = ["sheaf-evals"]
+
+[[test]]
+name = "fisher_flow_rfm"
+path = "tests/fisher_flow_rfm.rs"
+required-features = ["riemannian"]

@@ -1,0 +1,58 @@
+# Shared settings for all arms. Arm files only override what differs.
+
+data:
+  raw_dir: data/raw/thermompnn
+  pdb_dir: data/raw/megascale_pdbs/AlphaFold_model_PDBs
+  processed_dir: data/processed
+  # Checked 2026-11-20 with scripts/inspect_megascale.py:
+  #   Stabilizing_mut=True has mean ddG_ML +1.40, 77% of values < 0.
+  # So positive = stabilizing, negative = destabilizing (kcal/mol).
+  # We keep this convention and never flip it.
+  ddg_sign: positive_stabilizing
+
+graph:
+  k_neighbours: 16
+
+encoder:
+  dim: 128
+  layers: 4
+  dropout: 0.1
+
+ddg_head:
+  hidden: 256
+  layers: 2
+  aa_dim: 32
+
+pretrain:
+  corpus: scope         # scope | alphafold
+  mask_rate: 0.2
+  lr: 3.0e-4
+  weight_decay: 0.01
+  batch_proteins: 32
+  epochs: 100
+  warmup_frac: 0.05     # then cosine decay
+  val_fraction: 0.05    # held out to measure letter accuracy on unseen structures
+  # Effective rank is computed on this many residues, drawn from the validation slice.
+  # Rank measured on more samples is not comparable with rank measured on fewer, and the
+  # slice grows with the corpus: 80,275 residues for SCOPe, about 205,000 for AlphaFold.
+  rank_sample: 80000
+  save_every: 10        # epochs between resume points
+  predictor_layers: 2
+  ema_start: 0.99       # the teacher moves freely early
+  ema_end: 0.9999       # and barely at all by the end
+  checkpoint_dir: results/checkpoints
+
+finetune:
+  mode: full            # full | frozen
+  lr: 3.0e-4
+  weight_decay: 0.01
+  batch_proteins: 8
+  max_epochs: 100
+  patience: 10          # epochs without a better validation Spearman
+
+eval:
+  min_mutations_per_protein: 10   # proteins below this are left out of the per-protein median
+
+seed: 0
+results_dir: results
+results_csv: results/runs.csv

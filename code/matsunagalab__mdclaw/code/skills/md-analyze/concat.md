@@ -1,0 +1,50 @@
+# Concatenate Production Trajectories
+
+Use this for production-chain data scope analysis: combine one continuous
+Production Chain into a compact analysis trajectory. For segment data scope
+analysis, parent the analyze node to the specific Production Segment and make
+the requested scope explicit in the node label or conditions.
+
+## Locate The Leaf Production Node
+
+Read `progress.json` and identify the target leaf `prod` node. For production
+continuation chains, analyze the deepest leaf unless the user asks otherwise.
+
+## Create The Analyze Node
+
+```bash
+mdclaw create_node --job-dir <job_dir> --node-type analyze \
+  --parent-node-ids <leaf_prod_id> \
+  --label "chain_protein_only" \
+  --conditions '{"analysis_data_scope": "production_chain"}'
+```
+
+## Run `concat_trajectory`
+
+```bash
+mdclaw --job-dir <job_dir> --node-id <analyze_node_id> concat_trajectory \
+  --selection "protein" \
+  --output-name combined \
+  --stride 1 \
+  --chunk 1000
+```
+
+`trajectory_files` and `system_xml_file` are auto-resolved from the DAG.
+
+Key parameters:
+
+- `selection`: mdtraj VMD-like selection. Default is `"protein"`.
+- `stride`: keep every Nth frame.
+- `chunk`: frames per streaming read; this controls peak memory.
+
+For a **display copy**, follow [trajectory display](https://github.com/matsunagalab/mdclaw/blob/HEAD/skills/common/trajectory-display.md)
+instead of blindly applying the protein-only example: production views keep
+lipids and ligands, long overviews use a stated stride, and PBC correction must
+be handled separately before stripping. Concat itself does not perform imaging.
+
+Outputs under `nodes/<analyze_node_id>/artifacts/` include combined DCD, reference
+PDB, selection JSON, and combined energy CSV when every source has energy data.
+When the production lineage also records `timestep_fs`, concat writes
+`frame_times_ns` from each retained energy row's `Step`. The time array follows
+the same `stride` as the DCD and remains correct across continuation segments
+with different output cadences.

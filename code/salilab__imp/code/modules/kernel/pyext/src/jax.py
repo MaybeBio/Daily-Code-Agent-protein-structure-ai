@@ -1,0 +1,294 @@
+"""@namespace IMP.jax
+   @brief Support for the JAX Python library.
+
+   IMP currently has rudimentary support for running on a graphics
+   processing unit (GPU) or similar systems such as
+   Tensor Processing Units (TPUs). This support uses the
+   [JAX](https://docs.jax.dev/) Python library.
+"""
+
+import numpy as np
+import jax.numpy as jnp
+import jax.random
+import jax.tree_util
+import IMP
+
+
+def _vector_length(dr, min_dist):
+    """Get the length of each vector in `dr`, optionally clamped to be no
+       less than `min_dist`. The squared length is clamped before taking the
+       square root, so that the gradient is zero, rather than NaN, for
+       zero-length vectors."""
+    if min_dist is None:
+        return jnp.linalg.norm(dr, axis=-1)
+    else:
+        return jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(dr), axis=-1),
+                                    min_dist * min_dist))
+
+
+class Space:
+    """The space in which restraints are evaluated. See FreeSpace for the
+       default unbounded space, or PeriodicSpace for a space that implements
+       periodic boundary conditions."""
+
+    def distance(dr, min_dist=None):
+        """If given an array of particle-particle vectors, return an array
+           of distances. If given a single particle-particle vector, return
+           a single distance.
+
+           If `min_dist` is given, every returned distance is clamped to be
+           no less than `min_dist`. The gradient is zero (rather than NaN,
+           as for the unclamped distance of a zero-length vector) wherever
+           the clamp applies."""
+        pass
+
+    def displacement(dr):
+        """If given an array of particle-particle vectors, return an array
+           of the corresponding displacement vectors in this space (e.g. the
+           vectors between the closest periodic images of the particles).
+           If given a single particle-particle vector, return a single
+           displacement vector."""
+        pass
+
+    def shift(r, dr):
+        """Shift r by dr and return new r"""
+        pass
+
+    def shift_indexes(r, indexes, dr):
+        """Modify r[indexes] in place by adding dr"""
+        pass
+
+
+class FreeSpace(Space):
+    """An unbounded space with no periodic boundary conditions."""
+
+    @staticmethod
+    def distance(dr, min_dist=None):
+        return _vector_length(dr, min_dist)
+
+    @staticmethod
+    def displacement(dr):
+        return dr
+
+    @staticmethod
+    def shift(r, dr):
+        return r + dr
+
+    @staticmethod
+    def shift_indexes(r, indexes, dr):
+        return r.at[..., indexes, :].add(dr)
+
+
+class PeriodicSpace(Space):
+    """A space with periodic boundary conditions.
+
+       @param side A 3D vector of the periodic boundary box dimensions.
+    """
+
+    def __init__(self, side):
+        self.side = jnp.asarray(side)
+
+    def distance(self, dr, min_dist=None):
+        return _vector_length(self.displacement(dr), min_dist)
+
+    def displacement(self, dr):
+        return jnp.mod(dr + self.side * 0.5, self.side) - 0.5 * self.side
+
+    def shift(self, r, dr):
+        return jnp.mod(r + dr, self.side)
+
+    def shift_indexes(self, r, indexes, dr):
+        newr = jnp.mod(r[..., indexes, :] + dr, self.side)
+        return r.at[..., indexes, :].set(newr)
+
+
+def get_random_key():
+    """Get a new JAX random key seeded from IMP's random number generator"""
+    return jax.random.key(IMP.random_number_generator())
+
+
+class _Remap:
+    """A mapping from full particle indexes to and from the compact array.
+       This is used in _CompactArray, below. It is hashed by identity so
+       that it (unlike the arrays it contains) can be used as pytree aux data.
+
+       @param full_view A NumPy view of the entire IMP Model.
+       @param indexes A NumPy array of indexes of the particles that
+              have the attribute.
+       @param mapping A NumPy array that maps original Particle indexes
+              to indexes into the `data` array.
+       """
+    def __init__(self, full_view, indexes, mapping):
+        self.full_view, self.indexes = full_view, indexes
+        self.mapping = mapping
+
+
+@jax.tree_util.register_pytree_node_class
+class _CompactArray:
+    """Access an IMP Model Float attribute as a compacted or sparse array.
+       An IMP attribute array (returned by Model.get_numpy()) can be sparsely
+       populated. Compact it down to a flat array of only the particles that
+       have the attribute. Original Particle indexes are mapped to indexes
+       into the compacted array at JAX trace time. This should make JAX code
+       more performant since only the compacted array needs to be transferred
+       to and from the GPU.
+
+       @param data Compact array of only the used particles.
+       @param remap A _Remap object that maps full particle indexes to and
+              from the compact array.
+       """
+
+    def __init__(self, data, remap):
+        self.data, self.remap = data, remap
+
+    shape = property(lambda s: s.remap.full_view.shape)
+
+    @classmethod
+    def from_model(cls, m, fk):
+        """Create a new CompactArray for the given FloatKey `fk` in the
+           given IMP Model `m`."""
+        full_view = m.get_numpy(fk)
+        # IMP uses infinity to represent particles without the attribute
+        if full_view.ndim == 2:
+            # If we are using multiple attribute sets, get indexes
+            # over all sets
+            indexes = np.unique(np.nonzero(full_view != np.inf)[-1])
+        else:
+            indexes = np.nonzero(full_view != np.inf)[0]
+        # Any particle not in `indexes` is mapped to the last element,
+        # which is inf (just as in the original full view)
+        len_map = full_view.shape[-1]
+        mapping = np.full(len_map, len_map + 1, dtype=np.int32)
+        mapping[indexes] = np.arange(len(indexes), dtype=np.int32)
+        remap = _Remap(full_view, indexes, mapping)
+        infpad = np.array([np.inf])
+        if full_view.ndim == 2:
+            infpad = np.broadcast_to(infpad, (full_view.shape[0], 1))
+        concat = np.concatenate((full_view[..., indexes], infpad), axis=-1)
+        return cls(concat, remap)
+
+    def tree_flatten(self):
+        # Convert to JAX. Only `data` is sent to the device; everything
+        # else is static (aux data)
+        return (self.data,), self.remap
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(data=children[0], remap=aux_data)
+
+    def _map(self, idx):
+        return self.remap.mapping[idx]
+
+    def _full_map(self, idx):
+        if isinstance(idx, tuple):
+            return idx[:-1] + (self._map(idx[-1]),)
+        else:
+            return self._map(idx)
+
+    def __getitem__(self, idx):
+        """Lookup by particle index"""
+        return self.data[self._full_map(idx)]
+
+    @property
+    def at(self):
+        """Like jax.Array.at; allow in-place array modification"""
+        return _AtCompactArray(self)
+
+    def sync(self):
+        """Copy the JAX data back to the IMP Model"""
+        self.remap.full_view[self.remap.indexes] = self.data[:-1]
+
+
+class _AtCompactArray:
+    """Helper class for _CompactArray.at"""
+    def __init__(self, arr):
+        self.arr = arr
+
+    def __getitem__(self, idx):
+        return _AtIdxCompactArray(self.arr, self.arr._full_map(idx))
+
+
+class _AtIdxCompactArray:
+    """Helper class for _CompactArray.at[idx]"""
+    def __init__(self, arr, rows):
+        self.arr, self.rows = arr, rows
+
+    def _new(self, data):
+        return _CompactArray(data, self.arr.remap)
+
+    def set(self, v):
+        return self._new(self.arr.data.at[self.rows].set(v))
+
+    def add(self, v):
+        return self._new(self.arr.data.at[self.rows].add(v))
+
+
+@jax.tree_util.register_pytree_node_class
+class _JAXModel:
+    """JAX equivalent of an IMP Model.
+       This acts like a regular Python dict.
+       @see IMP._jax_util._get_jax_model
+    """
+    def __init__(self, multi_attr_keys=None, **kwargs):
+        self._d = dict(**kwargs)
+        self.multi_attr_keys = frozenset(multi_attr_keys or ())
+
+    def __getitem__(self, k):
+        return self._d[k]
+
+    def __setitem__(self, k, v):
+        self._d[k] = v
+
+    def __contains__(self, k):
+        return k in self._d
+
+    def keys(self):
+        return self._d.keys()
+
+    def items(self):
+        return self._d.items()
+
+    def values(self):
+        return self._d.values()
+
+    def copy(self):
+        m = _JAXModel(multi_attr_keys=self.multi_attr_keys)
+        m._d = self._d.copy()
+        return m
+
+    def __str__(self):
+        return str(self._d)
+
+    def tree_flatten(self):
+        # Treat None as a leaf otherwise we cannot use JAXModel objects
+        # with None values as input to jax.vmap's in_axes:
+        d_leaves, d_treedef = jax.tree.flatten(
+            self._d, is_leaf=lambda x: x is None)
+        return (d_leaves, (d_treedef, self.multi_attr_keys))
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        d_leaves = children
+        d_treedef, multi_attr_keys = aux_data
+        c = cls()
+        c._d = jax.tree.unflatten(d_treedef, d_leaves)
+        c.multi_attr_keys = multi_attr_keys
+        return c
+
+    def get_vmap_axes(self):
+        """Return a suitable value for jax.vmap's in_axes.
+           If multiple attribute sets are being used, jax.vmap should
+           be used on restraints, scores, etc. to extend the functions
+           (that act on a single attribute set) to work on all sets.
+           This method returns a suitable value for in_axes for the JAX
+           model itself. If no attribute sets are being used, return None."""
+        if not self.multi_attr_keys:
+            return None
+        d = _JAXModel(multi_attr_keys=self.multi_attr_keys)
+        for k, v in self.items():
+            val = 0 if k in self.multi_attr_keys else None
+            # Need to match pytree of the original CompactArray
+            if isinstance(v, _CompactArray):
+                val = _CompactArray(val, v.remap)
+            d[k] = val
+        return d

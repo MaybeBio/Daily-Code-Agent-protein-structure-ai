@@ -1,0 +1,415 @@
+import contextlib
+import logging
+import pathlib
+import pickle
+import random
+from typing import Literal, Sequence
+from urllib.parse import urlparse
+
+try:
+    from biglist import Biglist
+    HAVE_BIGLIST = True
+except ImportError:
+    HAVE_BIGLIST = False
+from Bio.Data.PDBData import protein_letters_3to1
+from biotite.structure import alphabet
+from datasets import Dataset
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from proxyz.data.utils import lines, opener, semaphore
+from proxyz.utils import cache, env
+
+logger = logging.getLogger(__name__)
+
+
+cle_vocab_size = len(alphabet.I3DSequence.alphabet)
+
+
+def line_iterator(file_paths: Sequence[str], batch_size=64):
+    batch = []
+
+    i = 0
+    for file_path in file_paths:
+        with opener(file_path) as f:  # pylint: disable=contextmanager-generator-missing-cleanup
+            for line in lines(f):
+                batch.append({"id": i, "text": line})
+                i += 1
+                if len(batch) >= batch_size:
+                    yield batch
+                    batch = []
+    if batch:
+        yield batch
+
+
+def fasta_parse(file_path: str):
+    with opener(file_path) as f:  # pylint: disable=contextmanager-generator-missing-cleanup
+        description, text = "", ""
+        for line in lines(f):
+            if line.startswith(">"):
+                if text:
+                    yield description, text
+                description, text = line[1:], ""
+            else:
+                text += line
+        if text:
+            yield description, text
+
+
+def fasta_wrap(seq: str, width: int = 60) -> str:
+    """Wrap a sequence string to FASTA line width."""
+    return "\n".join(seq[i:i + width] for i in range(0, len(seq), width))
+
+
+def fasta_iterator(file_paths: Sequence[str], batch_size: int = 64):
+    batch = []
+    for file_path in tqdm(file_paths, desc="fasta_iterator"):
+        for description, text in fasta_parse(file_path):
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+
+            batch.append({"id": description, "text": text})
+    if batch:
+        yield batch
+
+
+def pdb_iterator(file_paths: Sequence[str], batch_size: int = 64):
+    for file_path in tqdm(file_paths, desc="pdb_iterator"):
+        data = Dataset.from_csv(file_path)
+        for batch in data.iter(batch_size=batch_size):
+            batch["dataset"] = [file_path] * len(batch["id"])
+            yield [dict(zip(batch, v)) for v in zip(*batch.values())]
+
+
+def pdb_transform(examples: dict, **kwargs):
+    batch = []
+    for pid, file_path in zip(examples["id"], examples["dataset"]):
+        processed_dir = pathlib.Path(file_path).parent / "processed"
+        graph = torch.load(processed_dir / f"{pid}.pt", weights_only=False)
+
+        # NOTE: swap CB and O atoms
+        o_idx, cb_idx = 4, 3
+        o = graph.coords[:, o_idx, :]
+        graph.coords[:, o_idx, :] = graph.coords[:, cb_idx, :]
+        graph.coords[:,cb_idx, :] = o
+        o = graph.coord_mask[:, o_idx]
+        graph.coord_mask[:, o_idx] = graph.coord_mask[:, cb_idx]
+        graph.coord_mask[:,cb_idx] = o
+
+        batch.append(graph)
+    return pyg_transform(batch, **kwargs)
+
+
+@cache
+def foldcomp_dataset(file_path: str):
+    # pylint: disable=import-outside-toplevel
+    import foldcomp
+    from graphein.ml.datasets.foldcomp_dataset import FoldCompDataset as FCDatasetBase
+    import lmdb
+    from loguru import logger as log
+    # pylint: enable=import-outside-toplevel
+
+    class FoldCompDataset(FCDatasetBase):
+        def _get_indices(self):
+            """Get indices for the dataset."""
+            # Read in look up file
+            LOOKUP_FILE = pathlib.Path(self.root) / f"{self.database}.lookup"  # pylint: disable=invalid-name
+            if not LOOKUP_FILE.exists():
+                self.download()
+
+            # Read in id_to_idx file
+            ID2IDX_FILE = pathlib.Path(self.root) / f"{self.database}.id_to_idx"  # pylint: disable=invalid-name
+            with semaphore("proxyz_dataset_foldcomp_database_lookup", 1):
+                class Protein2Idx:
+                    def __init__(self):
+                        if ID2IDX_FILE.exists():
+                            self.env = lmdb.open(f"{ID2IDX_FILE}", readonly=True)
+                        else:
+                            self.env = lmdb.open(f"{ID2IDX_FILE}", map_size=1<<36)
+                            with self.env.begin(write=True) as txn:
+                                with open(LOOKUP_FILE, "r") as f:
+                                    for idx, line in tqdm(
+                                        enumerate(lines(f)), desc="protein_to_idx"
+                                    ):
+                                        txn.put(
+                                            pickle.dumps(line.split("\t")[1]),
+                                            pickle.dumps(idx),
+                                        )
+
+                    def __len__(self):
+                        with self.env.begin() as txn:
+                            return txn.stat()["entries"]
+
+                    def __getitem__(self, key):
+                        with self.env.begin() as txn:
+                            return pickle.loads(txn.get(pickle.dumps(key)))
+
+                    def __contains__(self, key):
+                        with self.env.begin() as txn:
+                            return txn.get(pickle.dumps(key)) is not None
+
+                    def keys(self):
+                        with self.env.begin() as txn:
+                            with txn.cursor() as cursor:
+                                for key in cursor.iternext(keys=True, values=False):
+                                    yield pickle.loads(key)
+
+                    def close(self):
+                        self.env.close()
+
+                self.protein_to_idx = Protein2Idx()
+
+            self._stack = contextlib.ExitStack()
+            self._stack.callback(self.protein_to_idx.close)
+
+            # with open(LOOKUP_FILE, "r") as f:
+            #     accessions = f.readlines()
+            # # Extract accessions
+            # accessions = [x.strip().split("\t")[1] for x in tqdm(accessions)]
+            # Get indices
+            if self.ids is None:  # pylint: disable=access-member-before-definition
+                self.ids = list(self.protein_to_idx.keys())
+            # Exclude indices
+            if self.exclude_ids is not None:
+                log.info(f"Excluding {len(self.exclude_ids)} chains...")
+                self.ids = [
+                    acc for acc in tqdm(self.ids) if acc not in self.exclude_ids
+                ]
+            # Sub sample
+            if self.fraction < 1:
+                log.info(f"Sampling fraction: {self.fraction}...")
+                self.ids = random.sample(
+                    self.ids, int(len(self.ids) * self.fraction)
+                )
+            log.info("Creating index...")
+            # indices = dict(enumerate(accessions))
+            # self.idx_to_protein = indices
+            # self.protein_to_idx = {v: k for k, v in indices.items()}
+            log.info(f"Dataset contains {len(self.protein_to_idx)} chains.")
+
+        def process(self):
+            """Initialises the database."""
+            # Open the database
+            log.info("Opening database...")
+            self.db = foldcomp.open(
+                self.root / self.database, decompress=False
+            )  # type: ignore
+
+            assert hasattr(self, "_stack")
+            self._stack.callback(self.db.close)
+
+        def len(self) -> int:
+            """Returns length of the dataset"""
+            return len(self.ids)
+
+        def get(self, idx):
+            """Retrieves a protein from the dataset. Can idx on either the protein
+            ID or its index."""
+            if isinstance(idx, int):
+                idx = self.ids[idx]
+            name = idx
+            idx = self.protein_to_idx[name]
+            data = foldcomp.get_data(self.db[idx])  # type: ignore
+            return self.fc_to_pyg(data, name)
+
+        def __del__(self):
+            if hasattr(self, "_stack"):
+                self._stack.close()
+
+
+    o = urlparse(file_path)
+    if o.fragment:
+        with opener(o.fragment) as f:  # pylint: disable=contextmanager-generator-missing-cleanup
+            if HAVE_BIGLIST and env("proxyz_dataset_foldcomp_biglist_enabled", True):
+                ids = Biglist.new(batch_size=4096)
+                ids.extend(line for line in lines(f) if not line.startswith("#"))
+                ids.flush()
+            else:
+                ids = [line for line in lines(f) if not line.startswith("#")]
+    else:
+        ids = None
+    file_path = pathlib.Path(o.path)
+    with semaphore(
+        "proxyz_dataset_foldcomp_parallel", env("proxyz_dataset_foldcomp_parallel", -1)
+    ):
+        return FoldCompDataset(
+            root=file_path.parent,
+            database=file_path.name,
+            ids=ids,
+            fraction=1,
+        )
+
+
+def foldcomp_iterator(file_paths: Sequence[str], batch_size: int = 64):
+    batch = []
+
+    for file_path in tqdm(file_paths, desc="foldcomp_iterator"):
+        data = foldcomp_dataset(file_path, use_cache=False)
+        for pid in data.ids:
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+            batch.append({"id": pid, "dataset": file_path})
+        del data  # gc
+
+    if batch:
+        yield batch
+
+def foldcomp_transform(examples: dict, **kwargs):
+    bfactor_min = env("proxyz_dataset_foldcomp_bfactor_min", .0)
+
+    batch = []
+    for pid, file_path in zip(examples["id"], examples["dataset"]):
+        # load from foldcomp db
+        data = foldcomp_dataset(file_path)
+        graph = data.get(pid)
+        assert pid == graph.id
+
+        if not hasattr(graph, "coord_mask"):
+            graph.coord_mask = (graph.coords != graph.fill_value)[:, :, 0]
+        if hasattr(graph, "b_factor"):
+            graph.coord_mask = (
+                graph.coord_mask & (graph.b_factor[:, None] >= bfactor_min)
+            )
+        if not hasattr(graph, "residue_pdb_idx"):
+            graph.residue_pdb_idx = torch.tensor(
+                [int(s.split(":")[2]) for s in graph.residue_id], dtype=torch.long
+            )
+        batch.append(graph)
+    return pyg_transform(batch, gly_idx=6, **kwargs)
+
+
+def pyg_dropout(
+    graph,
+    *,
+    p: float = 0,
+    window_size: int = 4,
+    span_min: int = 1,
+    span_max: int = 10,
+    ca_idx: int = 1,
+):
+    assert span_min <= span_max, (
+        f"span_min={span_min} should be less than or equal span_max={span_max}"
+    )
+    if p > 0 and graph.coord_mask.size(-2) > span_max:
+        if random.random() < p and (~graph.coord_mask[:, ca_idx]).any():
+            w = (~graph.coord_mask[:, ca_idx]).unfold(-1, window_size, 1).sum(-1)
+            idx = (w + 1e-8).multinomial(num_samples=1).item()
+            span = random.randint(span_min, span_max)
+
+            # Apply crop
+            graph.coords = torch.cat((graph.coords[:idx], graph.coords[idx + span:]))
+            graph.coord_mask = torch.cat(
+                (graph.coord_mask[:idx], graph.coord_mask[idx + span:])
+            )
+            graph.residue_pdb_idx = torch.cat(
+                (graph.residue_pdb_idx[:idx], graph.residue_pdb_idx[idx + span:])
+            )
+            graph.residue_type = torch.cat(
+                (graph.residue_type[:idx], graph.residue_type[idx + span:])
+            )
+            graph.residues = graph.residues[:idx] + graph.residues[idx + span:]
+    return graph
+
+
+def pyg_transform(batch: list, gly_idx: int = 7, **kwargs) -> dict:
+    from graphein.protein.resi_atoms import ATOM_NUMBERING  # pylint: disable=import-outside-toplevel
+
+    dropout_p = env("proxyz_dataset_pyg_dropout_p", .0)
+    window_size = env("proxyz_dataset_pyg_dropout_window_size", 4)
+    span_min = env("proxyz_dataset_pyg_dropout_span_min", 1)
+    span_max = env("proxyz_dataset_pyg_dropout_span_max", 10)
+
+    pid_list = []
+    coord, coord_mask, residue_idx, seq = [], [], [], []
+    cle, pseudo_beta, pseudo_beta_mask = [], [], []
+
+    # NOTE: Atom indices; Consider making this explicit/configurable
+    n_idx, ca_idx, c_idx, cb_idx = map(
+        lambda atom: ATOM_NUMBERING[atom], ("N", "CA", "C", "CB")
+    )
+
+    for graph in batch:
+        graph = pyg_dropout(
+            graph,
+            p=dropout_p,
+            window_size=window_size,
+            span_min=span_min,
+            span_max=span_max,
+            ca_idx=ca_idx,
+        )
+
+        pid_list.append(graph.id)
+        coord.append(graph.coords)
+        coord_mask.append(graph.coord_mask)
+        residue_idx.append(graph.residue_pdb_idx - graph.residue_pdb_idx[0] + 1)  # 1...
+        seq.append("".join(protein_letters_3to1.get(r, "A") for r in graph.residues))
+
+        # pseudo_beta
+        is_gly = graph.residue_type == gly_idx
+        pseudo_beta.append(
+            torch.where(
+                is_gly[:, None], graph.coords[:, ca_idx, :], graph.coords[:, cb_idx, :]
+            )
+        )
+        pseudo_beta_mask.append(
+            torch.where(
+                is_gly, graph.coord_mask[:, ca_idx], graph.coord_mask[:, cb_idx]
+            )
+        )
+
+        # 3di
+        nan = torch.full((3, ), torch.nan)
+        bbxyz = torch.stack(
+            (
+                torch.where(
+                    graph.coord_mask[:, ca_idx, None], graph.coords[:, ca_idx, :], nan
+                ),
+                torch.where(
+                    graph.coord_mask[:, cb_idx, None], graph.coords[:, cb_idx, :], nan
+                ),
+                torch.where(
+                    graph.coord_mask[:,  n_idx, None], graph.coords[:,  n_idx, :], nan
+                ),
+                torch.where(
+                    graph.coord_mask[:,  c_idx, None], graph.coords[:,  c_idx, :], nan
+                ),
+            )
+        )
+        cle.append(
+            torch.from_numpy(
+                alphabet.i3d.Encoder().encode(*bbxyz.numpy()).astype(np.int64).filled(
+                    fill_value=kwargs.get("ignore_index", -100)
+                )
+            )
+        )
+
+    return {
+        "id": pid_list,
+        "text": seq,
+        "residue_idx": residue_idx,
+        "coord": coord,
+        "coord_mask": coord_mask,
+        "distogram_labels": (pseudo_beta, pseudo_beta_mask),
+        "cle_labels": cle,
+    }
+
+
+def data_iterator(data_format: Literal["line", "fasta", "foldcomp", "pdb"]):
+    iterators = {
+        "line": line_iterator,
+        "fasta": fasta_iterator,
+        "foldcomp": foldcomp_iterator,
+        "pdb": pdb_iterator,
+    }
+    return iterators[data_format]
+
+
+def data_transform(data_format: Literal["line", "fasta", "foldcomp", "pdb"]):
+    transform = {
+        "foldcomp": foldcomp_transform,
+        "pdb": pdb_transform,
+    }
+    return transform.get(data_format)

@@ -1,0 +1,144 @@
+from molsysmt import pyunitwizard as puw
+from molsysmt.native import MolSysBuilder
+
+
+def _materialize_derived_components(builder):
+    builder.chemical_states.rebuild_components(
+        topology=builder.topology, skip_digestion=True
+    )
+
+
+def _set_stored_structures(builder, structures):
+    if structures.get("coordinates", None) is not None:
+        builder.set_coordinates(
+            puw.quantity(structures["coordinates"], "nm"), skip_digestion=True
+        )
+    if structures.get("box", None) is not None:
+        builder.set_box(puw.quantity(structures["box"], "nm"), skip_digestion=True)
+    if structures.get("time", None) is not None:
+        builder.set_time(puw.quantity(structures["time"], "ps"), skip_digestion=True)
+    if structures.get("structure_id", None) is not None:
+        builder.set_structure_id(structures["structure_id"], skip_digestion=True)
+
+
+def build_molsys_builder_from_molsys_dict(item):
+    """
+    Performing build molsys builder from molsys dict on form molsysmt.MolSysDict.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+
+    Returns
+    -------
+    object
+        Resulting object in object form.
+
+
+    .. versionadded:: 1.0.0
+    """
+
+    if item.data.get("version", "0.1") == "0.2":
+        from molsysmt.form._native_dict import decode_molsys
+
+        return MolSysBuilder(decode_molsys(item.data), skip_digestion=True)
+
+    data = item.to_dict(copy=True)
+    topology = data.get("topology", {}) or {}
+    structures = data.get("structures", {}) or {}
+
+    builder = MolSysBuilder(skip_digestion=True)
+
+    atoms = topology.get("atoms", []) or []
+    builder._preserve_absent_groups = "groups" in topology and not topology["groups"]
+    if not atoms:
+        from molsysmt.native._group_records import from_records
+
+        builder.topology = from_records(topology)
+        _set_stored_structures(builder, structures)
+        return builder
+    for atom in atoms:
+        builder.add_atom(
+            atom_id=atom.get("atom_id", None),
+            atom_name=atom.get("atom_name", None),
+            atom_type=atom.get("atom_type", None),
+            skip_digestion=True,
+        )
+
+    for group in topology.get("groups", []) or []:
+        builder.add_group(
+            group.get("atom_indices", []),
+            group_id=group.get("group_id", None),
+            group_name=group.get("group_name", None),
+            group_type=group.get("group_type", None),
+            skip_digestion=True,
+        )
+
+    for bond in topology.get("bonds", []) or []:
+        builder.add_bond(
+            bond["atom_index_1"],
+            bond["atom_index_2"],
+            bond_order=bond.get("bond_order", None),
+            bond_type=bond.get("bond_type", None),
+            skip_digestion=True,
+        )
+
+    for chain in topology.get("chains", []) or []:
+        builder.add_chain(
+            chain.get("group_indices", []),
+            chain_id=chain.get("chain_id", None),
+            chain_name=chain.get("chain_name", None),
+            chain_type=chain.get("chain_type", None),
+            skip_digestion=True,
+        )
+
+    group_free = "groups" in topology and not topology["groups"]
+    builder._preserve_absent_groups = group_free
+    molecules = topology.get("molecules", []) or []
+    if group_free and molecules:
+        builder.topology.reset_molecules(n_molecules=len(molecules))
+        for column in ("molecule_id", "molecule_name", "molecule_type"):
+            builder.topology.molecules[column] = [
+                molecule.get(column) for molecule in molecules
+            ]
+    for molecule in [] if group_free else molecules:
+        builder.add_molecule(
+            molecule.get("group_indices", []),
+            molecule_id=molecule.get("molecule_id", None),
+            molecule_name=molecule.get("molecule_name", None),
+            molecule_type=molecule.get("molecule_type", None),
+            skip_digestion=True,
+        )
+
+    for entity in topology.get("entities", []) or []:
+        builder.add_entity(
+            entity.get("molecule_indices", []),
+            entity_id=entity.get("entity_id", None),
+            entity_name=entity.get("entity_name", None),
+            entity_type=entity.get("entity_type", None),
+            skip_digestion=True,
+        )
+
+    if any(atom.get("isotope", None) is not None for atom in atoms):
+        builder.topology.atoms["isotope"] = [
+            atom.get("isotope", None) for atom in atoms
+        ]
+
+    _set_stored_structures(builder, structures)
+
+    _materialize_derived_components(builder)
+
+    if (
+        group_free
+        and molecules
+        and len(molecules) != builder.chemical_states.get(n_components=True)
+    ):
+        from molsysmt._private.smonitor import StructuralInconsistencyError
+
+        raise StructuralInconsistencyError(
+            reason="Group-free molecule records must match the reference component partition."
+        )
+
+    return builder

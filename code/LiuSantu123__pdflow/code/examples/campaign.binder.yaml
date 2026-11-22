@@ -1,0 +1,30 @@
+# Full campaign: design a binder against a trimmed target, then predict with
+# the full-length target + target MSA.
+campaign: pdflow_demo_binder
+task: protein_binder
+
+design:
+  engine: rfd4
+  input: inputs/binder.yaml
+  num_designs: 10
+  seed: 0
+  # quickstart = one design, metrics off, no torch.compile warm-up.
+  # For real runs remove quickstart and use extra: ["~metrics"].
+  extra: ["inference_experiment=quickstart"]
+
+targets:
+  T1:
+    full: inputs/target_full.cif
+    trimmed: inputs/target_trim.cif
+    msa: inputs/target.a3m
+    templates: []
+    design_chain: A          # target chain in the RFD4 output
+    predict_chain: A         # target chain in the prediction job
+ligands: []
+
+score:
+  predictors: [af3, boltz2, protenix2, opendde, mol1, esmfold2]
+  default: af3
+  align_chains: [B]          # binder chain compared to the design backbone
+  motif: null
+  tmol: true

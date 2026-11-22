@@ -1,0 +1,802 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>ChemLarp</title>
+  <meta name="description" content="Chemistry workbench: structure properties, 3D models, reactions, equilibrium, kinetics and phase behaviour. Runs offline on your device.">
+  <meta name="theme-color" content="#eef2f6" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0b0d11" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <!-- Everything is same-origin: scripts, styles, the engine and its worker. WebAssembly needs
+       'wasm-unsafe-eval'; inline styles are set by the DOM helper in app.js; the only outside host is
+       RCSB, for downloading a protein structure in the Protein view. frame-ancestors and sandbox are
+       ignored in a meta element, so they are not listed here. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' https://files.rcsb.org; worker-src 'self' blob:; manifest-src 'self'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Line icons (24px grid, 1.6 stroke), drawn once and reused. -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-structure" viewBox="0 0 24 24"><path d="M12 3.5 19.4 7.75v8.5L12 20.5l-7.4-4.25v-8.5Z"/><circle cx="12" cy="12" r="3.4"/></symbol>
+    <symbol id="i-3d" viewBox="0 0 24 24"><path d="M12 3.5 19.5 7.7v8.6L12 20.5l-7.5-4.2V7.7Z"/><path d="M4.5 7.7 12 12l7.5-4.3M12 12v8.5"/></symbol>
+    <symbol id="i-reaction" viewBox="0 0 24 24"><path d="M3.5 9h13m-3.5-3.5L16.5 9 13 12.5M20.5 15h-13m3.5 3.5L7.5 15l3.5-3.5"/></symbol>
+    <symbol id="i-equilibrium" viewBox="0 0 24 24"><path d="M12 4v16M5 8h14M7.5 8 4.5 14.5a3 3 0 0 0 6 0Zm9 0-3 6.5a3 3 0 0 0 6 0ZM8 20h8"/></symbol>
+    <symbol id="i-kinetics" viewBox="0 0 24 24"><circle cx="12" cy="13" r="7.5"/><path d="M12 9v4l2.8 2.2M9.5 3h5"/></symbol>
+    <symbol id="i-phases" viewBox="0 0 24 24"><path d="M6 3.5h12M7.5 3.5v6.2L4.2 17a2.4 2.4 0 0 0 2.2 3.5h11.2a2.4 2.4 0 0 0 2.2-3.5l-3.3-7.3V3.5"/><path d="M5.6 14h12.8"/><circle cx="10" cy="17.3" r=".7"/><circle cx="14" cy="16.6" r=".7"/></symbol>
+    <symbol id="i-roadmap" viewBox="0 0 24 24"><path d="M4 20V5m0 0h11l-1.8 3.2L15 11.5H4"/><path d="M4 20h16"/></symbol>
+    <symbol id="i-open" viewBox="0 0 24 24"><path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2.2h7a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z"/><path d="M12 11v5m-2.3-2.3L12 11l2.3 2.7"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/><path d="M8 10.5h5M10.5 8v5"/></symbol>
+    <symbol id="i-draw" viewBox="0 0 24 24"><path d="M4 18.5 9 9.8l5 2.9 5-8.7"/><circle cx="4" cy="18.5" r="1.3"/><path d="M14 12.7v6.3"/></symbol>
+    <symbol id="i-ed-select" viewBox="0 0 24 24"><path d="M5 4l13 7-6 1.5L9.5 19Z"/></symbol>
+    <symbol id="i-ed-single" viewBox="0 0 24 24"><path d="M5 18 19 6"/></symbol>
+    <symbol id="i-ed-double" viewBox="0 0 24 24"><path d="M4 16.5 17 5.5M7 18.5l13-11"/></symbol>
+    <symbol id="i-ed-triple" viewBox="0 0 24 24"><path d="M3.5 15 16 4.5M5.5 17.5 18 7M7.5 20 20 9.5"/></symbol>
+    <symbol id="i-ed-wedge" viewBox="0 0 24 24"><path d="M5 18 17.6 5.2 19.4 7.2Z" fill="currentColor"/></symbol>
+    <symbol id="i-ed-hash" viewBox="0 0 24 24"><path d="M6.5 16.5l.8.8M9 13.4l1.8 1.8M11.6 10.4l2.8 2.8M14.2 7.4l3.8 3.8M16.8 4.4l4.8 4.8"/></symbol>
+    <symbol id="i-ed-chain" viewBox="0 0 24 24"><path d="M3 15l4.5-6 4.5 6 4.5-6 4.5 6"/></symbol>
+    <symbol id="i-ed-erase" viewBox="0 0 24 24"><path d="m8 19-4-4 9.5-9.5 6 6L13 18H20"/><path d="m9 10.5 6 6"/></symbol>
+    <symbol id="i-ed-undo" viewBox="0 0 24 24"><path d="M9 7 4.5 11.5 9 16"/><path d="M5 11.5h9a5 5 0 0 1 0 10h-2"/></symbol>
+    <symbol id="i-ed-redo" viewBox="0 0 24 24"><path d="m15 7 4.5 4.5L15 16"/><path d="M19 11.5h-9a5 5 0 0 0 0 10h2"/></symbol>
+    <symbol id="i-ed-clean" viewBox="0 0 24 24"><path d="M12 3.5v3M12 17.5v3M3.5 12h3M17.5 12h3M6 6l2 2M16 16l2 2M6 18l2-2M16 8l2-2"/><circle cx="12" cy="12" r="2.6"/></symbol>
+    <symbol id="i-quantum" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1.8"/><ellipse cx="12" cy="12" rx="9" ry="3.6"/><ellipse cx="12" cy="12" rx="9" ry="3.6" transform="rotate(60 12 12)"/><ellipse cx="12" cy="12" rx="9" ry="3.6" transform="rotate(-60 12 12)"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2.4"/><path d="M15.5 8.5V6.9A2.4 2.4 0 0 0 13.1 4.5H6.9A2.4 2.4 0 0 0 4.5 6.9v6.2a2.4 2.4 0 0 0 2.4 2.4h1.6"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m-4.5-4.5L12 15l4.5-4.5M5 19.5h14"/></symbol>
+    <symbol id="i-inspector" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="3"/><path d="M14.5 4.5v15"/></symbol>
+    <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3M4.5 4.5v4h4"/></symbol>
+    <symbol id="i-flowsheet" viewBox="0 0 24 24"><rect x="2.5" y="9" width="6" height="6" rx="1.5"/><rect x="15.5" y="4" width="6" height="6" rx="1.5"/><rect x="15.5" y="14" width="6" height="6" rx="1.5"/><path d="M8.5 12h3.5V7h3.5M12 12v5h3.5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M7 7l10 10M17 7 7 17"/></symbol>
+    <symbol id="i-lab" viewBox="0 0 24 24"><path d="M9.5 3.5h5M10.5 3.5v5.2L5.4 17.6A2 2 0 0 0 7.1 20.5h9.8a2 2 0 0 0 1.7-2.9l-5.1-8.9V3.5"/><path d="M7.6 14.5h8.8"/></symbol>
+    <symbol id="i-aqueous" viewBox="0 0 24 24"><path d="M12 3.5c3.2 4.3 6 7.6 6 10.9a6 6 0 0 1-12 0c0-3.3 2.8-6.6 6-10.9Z"/><path d="M9 15.2a3 3 0 0 0 3 2.8"/></symbol>
+    <symbol id="i-dynamics" viewBox="0 0 24 24"><circle cx="8" cy="12" r="2.6"/><circle cx="17" cy="9" r="2.1"/><path d="M10.5 11.3 15 9.6"/><path d="M3.5 18.5c2-1.5 4-1.5 6 0s4 1.5 6 0 4-1.5 5 0M3.5 5.5c2 1.3 3.5 1.2 5 0"/></symbol>
+    <symbol id="i-protein" viewBox="0 0 24 24"><path d="M6 3.5c6 1.5 6 4.5 0 6s-6 4.5 0 6 6 4.5 0 6"/><path d="M18 3.5c-6 1.5-6 4.5 0 6s6 4.5 0 6-6 4.5 0 6"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 4 21 19.5H3Z"/><path d="M12 10v4.5M12 17.2v.3"/></symbol>
+    <symbol id="i-install" viewBox="0 0 24 24"><rect x="5" y="3.5" width="14" height="17" rx="3"/><path d="M12 8v7m-3-3 3 3 3-3"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="m8.5 7.5-5 4.5 5 4.5m7-9 5 4.5-5 4.5M13.5 5l-3 14"/></symbol>
+  </svg>
+
+  <div class="app">
+    <!-- Sidebar (source list) -->
+    <aside class="sidebar glass" aria-label="Tools">
+      <div class="brand">
+        <img src="icons/icon.svg" alt="" width="30" height="30">
+        <div>
+          <div class="brand-name">ChemLarp</div>
+          <div class="brand-sub" id="engine-status">Starting engine…</div>
+        </div>
+      </div>
+      <nav class="tool-list">
+        <div class="list-heading">Compound</div>
+        <a href="#structure" data-tool="structure" data-key="1"><svg><use href="#i-structure"/></svg><span>Structure</span><kbd>⌘1</kbd></a>
+        <a href="#model3d" data-tool="model3d" data-key="2"><svg><use href="#i-3d"/></svg><span>3D Model</span><kbd>⌘2</kbd></a>
+        <a href="#dynamics" data-tool="dynamics"><svg><use href="#i-dynamics"/></svg><span>Molecular Dynamics</span></a>
+        <a href="#draw" data-tool="draw" data-key="8"><svg><use href="#i-draw"/></svg><span>Draw</span><kbd>⌘8</kbd></a>
+        <a href="#search" data-tool="search" data-key="7"><svg><use href="#i-search"/></svg><span>Search</span><kbd>⌘7</kbd></a>
+        <div class="list-heading">Thermodynamics</div>
+        <a href="#reaction" data-tool="reaction" data-key="3"><svg><use href="#i-reaction"/></svg><span>Reaction</span><kbd>⌘3</kbd></a>
+        <a href="#equilibrium" data-tool="equilibrium" data-key="4"><svg><use href="#i-equilibrium"/></svg><span>Equilibrium</span><kbd>⌘4</kbd></a>
+        <a href="#phases" data-tool="phases" data-key="5"><svg><use href="#i-phases"/></svg><span>Phase Behaviour</span><kbd>⌘5</kbd></a>
+        <a href="#aqueous" data-tool="aqueous"><svg><use href="#i-aqueous"/></svg><span>Aqueous Chemistry</span></a>
+        <div class="list-heading">Biomolecules</div>
+        <a href="#protein" data-tool="protein"><svg><use href="#i-protein"/></svg><span>Protein</span></a>
+        <div class="list-heading">Quantum</div>
+        <a href="#quantum" data-tool="quantum" data-key="9"><svg><use href="#i-quantum"/></svg><span>Quantum Chemistry</span><kbd>⌘9</kbd></a>
+        <div class="list-heading">Kinetics</div>
+        <a href="#kinetics" data-tool="kinetics" data-key="6"><svg><use href="#i-kinetics"/></svg><span>Batch Reactor</span><kbd>⌘6</kbd></a>
+        <a href="#lab" data-tool="lab"><svg><use href="#i-lab"/></svg><span>Virtual Lab</span></a>
+        <div class="list-heading">Process</div>
+        <a href="#flowsheet" data-tool="flowsheet" data-key="0"><svg><use href="#i-flowsheet"/></svg><span>Flowsheet</span><kbd>⌘0</kbd></a>
+      </nav>
+      <div class="recents">
+        <div class="list-heading">Recent compounds</div>
+        <ul id="recent-list"></ul>
+      </div>
+      <div class="sidebar-foot">
+        <a href="#roadmap" data-tool="roadmap" class="foot-link"><svg><use href="#i-roadmap"/></svg><span>Roadmap</span><span class="foot-pct" id="roadmap-pct"></span></a>
+        <a href="https://github.com/ayuroy01/ChemLarp" class="foot-link" target="_blank" rel="noopener" title="Source code (GNU AGPL-3.0)"><svg><use href="#i-code"/></svg><span>Source code</span></a>
+        <button type="button" class="foot-link" id="install-btn" hidden><svg><use href="#i-install"/></svg><span>Install ChemLarp</span></button>
+      </div>
+    </aside>
+
+    <!-- Compound toolbar -->
+    <header class="toolbar glass">
+      <form class="compound-field" id="compound-form" autocomplete="off">
+        <label for="compound" class="field-label">Compound</label>
+        <input id="compound" spellcheck="false" placeholder="Enter SMILES, e.g. CC(=O)Oc1ccccc1C(=O)O" aria-describedby="compound-hint">
+        <button type="submit" class="btn btn-primary">Open</button>
+      </form>
+      <span id="compound-hint" class="sr-only">Press Command K to focus. The compound you open is used by every tool.</span>
+      <div class="toolbar-actions">
+        <button type="button" class="icon-btn" id="open-file" title="Open a structure file (MOL, SDF, PDB, CML) — or drop one on the window" aria-label="Open a structure file"><svg><use href="#i-open"/></svg></button>
+        <input type="file" id="file-input" accept=".mol,.sdf,.sd,.mdl,.pdb,.ent,.cml,.xml,chemical/x-mdl-molfile,chemical/x-mdl-sdfile,chemical/x-pdb,chemical/x-cml" hidden>
+        <button type="button" class="icon-btn" id="copy-smiles" title="Copy canonical SMILES" aria-label="Copy canonical SMILES"><svg><use href="#i-copy"/></svg></button>
+        <button type="button" class="icon-btn" id="toggle-inspector" title="Show or hide properties" aria-label="Show or hide properties" aria-pressed="true"><svg><use href="#i-inspector"/></svg></button>
+      </div>
+    </header>
+
+    <!-- Content -->
+    <main class="content" id="content">
+
+      <!-- Structure -->
+      <section class="view" id="structure" hidden>
+        <header class="view-head">
+          <h1>Structure</h1>
+          <p>Validation, identifiers and stereochemistry for the open compound.</p>
+        </header>
+        <div class="samples" role="group" aria-label="Sample compounds">
+          <span class="samples-label">Samples</span>
+          <button type="button" class="chip" data-compound="CC(=O)Oc1ccccc1C(=O)O">Aspirin</button>
+          <button type="button" class="chip" data-compound="Cn1cnc2c1c(=O)n(C)c(=O)n2C">Caffeine</button>
+          <button type="button" class="chip" data-compound="CC(C)Cc1ccc(cc1)[C@@H](C)C(=O)O">(S)-Ibuprofen</button>
+          <button type="button" class="chip" data-compound="C[C@]12CC[C@H]3[C@H]([C@@H]1CC[C@@H]2O)CCC4=CC(=O)CC[C@]34C">Testosterone</button>
+          <button type="button" class="chip" data-compound="F/C=C/F">(E)-1,2-Difluoroethene</button>
+        </div>
+        <div class="stack" id="structure-out"></div>
+      </section>
+
+      <!-- 3D -->
+      <section class="view" id="model3d" hidden>
+        <header class="view-head">
+          <h1>3D Model</h1>
+          <p>Distance-geometry embedding refined with the Universal Force Field or MMFF94, with MMFF partial charges. Drag to rotate, scroll or pinch to zoom.</p>
+        </header>
+        <div class="viewport glass-dark">
+          <canvas id="viewer" aria-label="3D model of the open compound"></canvas>
+          <div class="viewport-empty" id="viewer-empty"><div class="spinner" aria-hidden="true"></div><span>Building 3D model…</span></div>
+          <div class="viewport-bar glass">
+            <div class="segmented" role="radiogroup" aria-label="Display">
+              <button type="button" role="radio" aria-checked="true" data-style="ballstick">Ball &amp; Stick</button>
+              <button type="button" role="radio" aria-checked="false" data-style="labels">Labels</button>
+            </div>
+            <button type="button" class="icon-btn" id="d3-reset" title="Reset view" aria-label="Reset view"><svg><use href="#i-reset"/></svg></button>
+            <button type="button" class="icon-btn" id="d3-sdf" title="Export SDF" aria-label="Export SDF" disabled><svg><use href="#i-download"/></svg></button>
+          </div>
+        </div>
+        <div class="d3-ff-row">
+          <span class="samples-label">Force field</span>
+          <div class="segmented small" role="radiogroup" aria-label="Force field" id="d3-ff">
+            <button type="button" role="radio" aria-checked="true" data-ff="uff">UFF</button>
+            <button type="button" role="radio" aria-checked="false" data-ff="MMFF94">MMFF94</button>
+            <button type="button" role="radio" aria-checked="false" data-ff="MMFF94s">MMFF94s</button>
+          </div>
+        </div>
+        <div class="stack" id="d3-out"></div>
+      </section>
+
+      <!-- Molecular dynamics -->
+      <section class="view" id="dynamics" hidden>
+        <header class="view-head">
+          <h1>Molecular Dynamics</h1>
+          <p>Classical dynamics of the open compound with MMFF94 or the Universal Force Field, at constant energy or temperature, with its harmonic vibrational frequencies.</p>
+        </header>
+        <div class="split">
+          <form class="panel glass-card" id="md-form">
+            <div class="field-row">
+              <div class="field narrow"><label for="md-t">Temperature</label><div class="unit-input"><input id="md-t" type="number" value="300" min="0" max="5000" step="any"><span>K</span></div></div>
+              <div class="field narrow"><label for="md-time">Duration</label><div class="unit-input"><input id="md-time" type="number" value="2" min="0.01" max="200" step="any"><span>ps</span></div></div>
+            </div>
+            <div class="field-row">
+              <div class="field narrow"><label for="md-dt">Time step</label><div class="unit-input"><input id="md-dt" type="number" value="0.5" min="0.05" max="2" step="any"><span>fs</span></div></div>
+              <div class="field narrow"><label for="md-tau">Coupling time</label><div class="unit-input"><input id="md-tau" type="number" value="100" min="1" step="any"><span>fs</span></div></div>
+            </div>
+            <div class="field">
+              <label for="md-ff">Force field</label>
+              <select id="md-ff">
+                <option value="mmff94">MMFF94 (organic molecules, with charges)</option>
+                <option value="uff">UFF (any element it covers)</option>
+                <option value="mmff94s">MMFF94s (planar-amine variant)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="md-thermo">Ensemble</label>
+              <select id="md-thermo">
+                <option value="bussi">Constant temperature · Bussi thermostat</option>
+                <option value="langevin">Constant temperature · Langevin dynamics</option>
+                <option value="none">Constant energy (NVE)</option>
+              </select>
+            </div>
+            <label class="check"><input type="checkbox" id="md-modes" checked> Normal-mode frequencies</label>
+            <div class="form-actions"><button type="submit" class="btn btn-primary">Run</button></div>
+          </form>
+          <div class="stack" id="md-out"><p class="muted">Press Run to simulate the open compound. A few picoseconds take a second or two.</p></div>
+        </div>
+        <div class="stack" id="md-results" hidden>
+          <div class="viewport glass-dark md-viewport">
+            <canvas id="md-viewer" aria-label="Trajectory of the open compound"></canvas>
+            <div class="viewport-bar glass">
+              <button type="button" class="icon-btn" id="md-play" title="Play or pause" aria-label="Play or pause">▶</button>
+              <input type="range" id="md-frame" min="0" max="0" value="0" aria-label="Frame">
+              <span class="md-time" id="md-tlabel">0 fs</span>
+              <button type="button" class="icon-btn" id="md-xyz" title="Export trajectory (XYZ)" aria-label="Export trajectory"><svg><use href="#i-download"/></svg></button>
+            </div>
+          </div>
+          <div class="glass-card chart-card">
+            <div class="card-head"><h2>Energies</h2><span class="meta">kcal/mol; conserved: total minus the thermostat's heat</span></div>
+            <canvas class="chart" id="md-chart-e" data-height="240"></canvas>
+          </div>
+          <div class="glass-card chart-card">
+            <div class="card-head"><h2>Temperature</h2><span class="meta">instantaneous kinetic temperature</span></div>
+            <canvas class="chart" id="md-chart-t" data-height="200"></canvas>
+          </div>
+          <div class="glass-card chart-card">
+            <div class="card-head"><h2>Vibrational spectrum</h2><span class="meta">velocity autocorrelation; dots: harmonic normal modes</span></div>
+            <canvas class="chart" id="md-chart-s" data-height="240"></canvas>
+          </div>
+          <div class="glass-card card" id="md-modes-card" hidden>
+            <div class="card-head"><h2>Harmonic frequencies</h2><span class="meta">cm⁻¹, UFF</span></div>
+            <div class="md-modes" id="md-modes-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Reaction -->
+      <section class="view" id="reaction" hidden>
+        <header class="view-head">
+          <h1>Reaction</h1>
+          <p>Stoichiometry check and standard reaction thermodynamics. Write species as SMILES with coefficients, separated by spaces.</p>
+        </header>
+        <form class="panel glass-card" id="rx-form">
+          <div class="field">
+            <label for="rx-eq">Equation</label>
+            <input id="rx-eq" class="mono" spellcheck="false" value="1 C + 2 O=O -> 1 O=C=O + 2 O">
+          </div>
+          <div class="field-row">
+            <div class="field narrow">
+              <label for="rx-t">Temperature</label>
+              <div class="unit-input"><input id="rx-t" type="number" value="298.15" min="1" step="any"><span>K</span></div>
+            </div>
+            <button type="submit" class="btn btn-primary">Calculate</button>
+          </div>
+          <div class="samples compact">
+            <span class="samples-label">Examples</span>
+            <button type="button" class="chip" data-fill="rx-eq" data-value="1 C + 2 O=O -> 1 O=C=O + 2 O">Methane combustion</button>
+            <button type="button" class="chip" data-fill="rx-eq" data-value="[C-]#[O+] + O -> O=C=O + [H][H]">Water–gas shift</button>
+            <button type="button" class="chip" data-fill="rx-eq" data-value="C + O=O -> O=C=O + O">Unbalanced</button>
+          </div>
+        </form>
+        <div class="stack" id="rx-out"></div>
+      </section>
+
+      <!-- Equilibrium -->
+      <section class="view" id="equilibrium" hidden>
+        <header class="view-head">
+          <h1>Equilibrium</h1>
+          <p>Gibbs energy minimisation for an ideal-gas mixture. List every species that may form, one per line as <code>SMILES moles</code>.</p>
+        </header>
+        <div class="split">
+          <form class="panel glass-card" id="eq-form">
+            <div class="field">
+              <label for="eq-species">Species and initial amounts</label>
+              <textarea id="eq-species" class="mono" rows="8" spellcheck="false">C 1
+O=O 2
+O=C=O 0
+O 0
+[C-]#[O+] 0
+[H][H] 0
+[OH] 0</textarea>
+            </div>
+            <div class="field-row">
+              <div class="field narrow"><label for="eq-t">Temperature</label><div class="unit-input"><input id="eq-t" type="number" value="2500" min="1" step="any"><span>K</span></div></div>
+              <div class="field narrow"><label for="eq-p">Pressure</label><div class="unit-input"><input id="eq-p" type="number" value="1" min="0.0001" step="any"><span>bar</span></div></div>
+            </div>
+            <div class="form-actions">
+              <button type="button" class="btn" data-add-compound="eq-species" data-amount="0">Add open compound</button>
+              <button type="submit" class="btn btn-primary">Solve</button>
+            </div>
+          </form>
+          <div class="stack" id="eq-out"></div>
+        </div>
+      </section>
+
+      <!-- Phase behaviour -->
+      <section class="view" id="phases" hidden>
+        <header class="view-head">
+          <h1>Phase Behaviour</h1>
+          <p>Vapour–liquid equilibrium from a cubic equation of state (stability test and flash), or bubble and dew points from UNIFAC activity coefficients.</p>
+        </header>
+        <div class="split">
+          <form class="panel glass-card" id="ph-form">
+            <div class="field">
+              <label>Model</label>
+              <div class="segmented" role="radiogroup" aria-label="Model" id="ph-model">
+                <button type="button" role="radio" aria-checked="true" data-model="eos">Equation of state</button>
+                <button type="button" role="radio" aria-checked="false" data-model="unifac">Activity (UNIFAC)</button>
+              </div>
+            </div>
+            <div class="field-row" id="ph-act-fields" hidden>
+              <div class="field">
+                <label>Calculation</label>
+                <div class="segmented" role="radiogroup" aria-label="Calculation" id="ph-kind">
+                  <button type="button" role="radio" aria-checked="true" data-kind="bubble">Bubble point</button>
+                  <button type="button" role="radio" aria-checked="false" data-kind="dew">Dew point</button>
+                </div>
+              </div>
+              <div class="field">
+                <label>Given</label>
+                <div class="segmented" role="radiogroup" aria-label="Given variable" id="ph-given">
+                  <button type="button" role="radio" aria-checked="true" data-given="P">Pressure</button>
+                  <button type="button" role="radio" aria-checked="false" data-given="T">Temperature</button>
+                </div>
+              </div>
+            </div>
+            <div class="field">
+              <label for="ph-mix" id="ph-mix-label">Mixture, one per line as <code>SMILES mole_fraction</code></label>
+              <textarea id="ph-mix" class="mono" rows="5" spellcheck="false">C 0.5
+CCC 0.3
+CCCCC 0.2</textarea>
+            </div>
+            <div class="field-row">
+              <div class="field narrow"><label for="ph-t">Temperature</label><div class="unit-input"><input id="ph-t" type="number" value="300" min="1" step="any"><span>K</span></div></div>
+              <div class="field narrow"><label for="ph-p">Pressure</label><div class="unit-input"><input id="ph-p" type="number" value="30" min="0.0001" step="any"><span>bar</span></div></div>
+            </div>
+            <div class="field" id="ph-eos-field">
+              <label>Equation of state</label>
+              <div class="segmented" role="radiogroup" aria-label="Equation of state" id="ph-eos">
+                <button type="button" role="radio" aria-checked="true" data-eos="pr">Peng–Robinson</button>
+                <button type="button" role="radio" aria-checked="false" data-eos="srk">Soave–Redlich–Kwong</button>
+              </div>
+            </div>
+            <div class="samples compact" id="ph-act-samples" hidden>
+              <span class="samples-label">Examples</span>
+              <button type="button" class="chip" data-fill="ph-mix" data-value="CCO 0.3&#10;O 0.7">Ethanol + water</button>
+              <button type="button" class="chip" data-fill="ph-mix" data-value="CC(C)=O 0.5&#10;ClC(Cl)Cl 0.5">Acetone + chloroform</button>
+              <button type="button" class="chip" data-fill="ph-mix" data-value="CO 0.4&#10;c1ccccc1 0.6">Methanol + benzene</button>
+              <button type="button" class="chip" data-fill="ph-mix" data-value="CC(C)=O 0.3&#10;CO 0.3&#10;O 0.4">Acetone + methanol + water</button>
+            </div>
+            <div class="samples compact" id="ph-eos-samples">
+              <span class="samples-label">Examples</span>
+              <button type="button" class="chip" data-fill="ph-mix" data-value="C 0.5&#10;CCC 0.3&#10;CCCCC 0.2">Gas condensate</button>
+              <button type="button" class="chip" data-fill="ph-mix" data-value="CCO 0.4&#10;O 0.6">Ethanol + water</button>
+              <button type="button" class="chip" data-fill="ph-mix" data-value="O=C=O 0.7&#10;C 0.3">CO₂ + methane</button>
+            </div>
+            <div class="form-actions">
+              <button type="button" class="btn" data-add-compound="ph-mix" data-amount="0.1">Add open compound</button>
+              <button type="submit" class="btn btn-primary" id="ph-submit">Flash</button>
+            </div>
+          </form>
+          <div class="stack" id="ph-out"></div>
+        </div>
+        <div class="stack" id="ph-charts" hidden>
+          <div class="glass-card chart-card">
+            <div class="card-head"><h2 id="ph-chart-title">Phase diagram</h2><span class="meta" id="ph-chart-meta"></span></div>
+            <canvas class="chart" id="ph-chart" data-height="320"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <!-- Protein -->
+      <section class="view" id="protein" hidden>
+        <header class="view-head">
+          <h1>Protein</h1>
+          <p>Read a PDB or mmCIF structure: missing side chains and loops built, pKa of every titratable group from the structure, protonation states at a pH, and all hydrogens placed with the hydrogen-bond network optimised.</p>
+        </header>
+        <div class="split">
+          <form class="panel glass-card" id="pr-form">
+            <div class="field">
+              <label for="pr-id">PDB ID</label>
+              <div class="row-input">
+                <input id="pr-id" class="mono" spellcheck="false" autocapitalize="characters" autocomplete="off" maxlength="4" placeholder="1CRN">
+                <button type="button" class="btn" id="pr-fetch">Fetch</button>
+              </div>
+              <span class="hint">Downloads from RCSB, or open a PDB or mmCIF file:</span>
+              <input type="file" id="pr-file" accept=".pdb,.ent,.cif,.mmcif,.txt">
+            </div>
+            <div class="field">
+              <label for="pr-ph">pH</label>
+              <input id="pr-ph" type="number" min="0" max="14" step="0.1" value="7.4">
+            </div>
+            <div class="pr-opts">
+              <span class="field-label-block">Build and optimise</span>
+              <label class="check"><input type="checkbox" id="pr-repair" checked> Missing side-chain atoms</label>
+              <label class="check"><input type="checkbox" id="pr-loops" checked> Missing loops (predicted)</label>
+              <label class="check"><input type="checkbox" id="pr-termini"> Missing chain ends (predicted)</label>
+              <label class="check"><input type="checkbox" id="pr-flips" checked> Asn, Gln, His flips</label>
+            </div>
+            <div class="form-actions"><button type="submit" class="btn btn-primary">Protonate</button></div>
+          </form>
+          <div class="stack" id="pr-out"></div>
+        </div>
+        <div class="stack" id="pr-results" hidden>
+          <div class="viewport glass-dark md-viewport">
+            <canvas id="pr-viewer" aria-label="Protein structure with hydrogens"></canvas>
+            <div class="viewport-bar glass">
+              <div class="segmented small" role="radiogroup" aria-label="Atoms shown" id="pr-show">
+                <button type="button" role="radio" aria-checked="true" data-h="0">Heavy atoms</button>
+                <button type="button" role="radio" aria-checked="false" data-h="1">With hydrogens</button>
+              </div>
+              <button type="button" class="icon-btn" id="pr-save" title="Save protonated structure" aria-label="Save protonated structure"><svg><use href="#i-download"/></svg></button>
+            </div>
+          </div>
+          <div class="glass-card card">
+            <div class="card-head"><h2>Chains</h2><span class="meta">pI and average mass from the sequence (Bjellqvist pKa set)</span></div>
+            <div id="pr-chains"></div>
+          </div>
+          <div class="glass-card chart-card">
+            <div class="card-head"><h2>Net charge with pH</h2><span class="meta">all chains: from the structure (predicted pKa values) and from the sequence</span></div>
+            <canvas class="chart" id="pr-titration" data-height="240"></canvas>
+          </div>
+          <div class="glass-card card">
+            <div class="card-head"><h2>Titratable residues</h2><span class="meta">pKa predicted from the structure (cross-validated error about 1 unit); state at the pH</span></div>
+            <div id="pr-notes"></div>
+            <div class="table-wrap" id="pr-residues"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Aqueous chemistry -->
+      <section class="view" id="lab" hidden>
+        <header class="view-head">
+          <h1>Virtual Lab</h1>
+          <p>Mix solutions or run a titration: pH, heat, precipitates and gases from the USGS PHREEQC database, with safety checks from the result, from the National Research Council's <em>Prudent Practices in the Laboratory</em> and from GHS classifications in PubChem.</p>
+        </header>
+        <div class="split">
+          <form class="panel glass-card" id="lab-form">
+            <div class="segmented" role="radiogroup" aria-label="Experiment type" id="lab-mode">
+              <button type="button" role="radio" aria-checked="true" data-mode="mix">Mix</button>
+              <button type="button" role="radio" aria-checked="false" data-mode="titrate">Titration</button>
+            </div>
+            <div class="field">
+              <label for="lab-preset">Experiment</label>
+              <select id="lab-preset"></select>
+            </div>
+            <div id="lab-editor" class="lab-editor"></div>
+            <div class="form-actions"><button type="submit" class="btn btn-primary">Run</button></div>
+          </form>
+          <div class="stack" id="lab-out"></div>
+        </div>
+        <div class="stack" id="lab-results" hidden>
+          <div class="glass-card card" id="lab-chart-card" hidden>
+            <div class="card-head"><h2>Titration curve</h2><span class="meta" id="lab-eq"></span></div>
+            <canvas id="lab-chart" data-height="300" role="img" aria-label="pH against added titrant volume"></canvas>
+          </div>
+          <div class="glass-card card" id="lab-products-card" hidden>
+            <div class="card-head"><h2>Precipitates and gases</h2></div>
+            <div class="table-wrap" id="lab-products"></div>
+          </div>
+          <div class="glass-card card">
+            <div class="card-head"><h2>Safety</h2><span class="meta">Not a risk assessment: no finding here does not mean safe.</span></div>
+            <div class="hazards" id="lab-safety"></div>
+          </div>
+          <div class="glass-card card" id="lab-species-card" hidden>
+            <div class="card-head"><h2>Main species</h2><span class="meta">mol per kg water</span></div>
+            <div class="table-wrap" id="lab-species"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" id="aqueous" hidden>
+        <header class="view-head">
+          <h1>Aqueous Chemistry</h1>
+          <p>pH, speciation, saturation indices and mineral and gas equilibria in water, 0–100 °C, with the USGS PHREEQC database (phreeqc.dat).</p>
+        </header>
+        <div class="split">
+          <form class="panel glass-card" id="aq-form">
+            <div class="field">
+              <label for="aq-example">Example</label>
+              <select id="aq-example"></select>
+            </div>
+            <div class="field">
+              <label for="aq-text">Solution</label>
+              <textarea id="aq-text" class="mono fs-text" rows="10" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+            </div>
+            <details class="fs-help">
+              <summary>Syntax</summary>
+              <pre class="mono">temperature 25          °C, 0–100
+units mmol/kgw          or mol/kgw
+pH 7 charge             charge balance (default)
+pH 8.2                  fixed pH
+Ca 1.2                  component totals:
+C(4) 2                    Na K Ca Mg Fe(2) Fe(3) Al
+N(-3) 0.5                 Cl C(4) S(6) S(-2) N(5) P F …
+add NaHCO3 2            a salt, acid or base by formula
+equilibrium Calcite 0   phase, target SI [, moles]
+equilibrium CO2(g) -3.5 gas: log10 partial pressure (atm)</pre>
+            </details>
+            <div class="form-actions"><button type="submit" class="btn btn-primary">Solve</button></div>
+          </form>
+          <div class="stack" id="aq-out"></div>
+        </div>
+        <div class="stack" id="aq-results" hidden>
+          <div class="glass-card card">
+            <div class="card-head"><h2>Species</h2>
+              <div class="segmented small" role="radiogroup" aria-label="Species shown" id="aq-all">
+                <button type="button" role="radio" aria-checked="true" data-all="0">Main</button>
+                <button type="button" role="radio" aria-checked="false" data-all="1">All</button>
+              </div>
+            </div>
+            <div class="table-wrap" id="aq-species"></div>
+          </div>
+          <div class="glass-card card" id="aq-phases-card" hidden>
+            <div class="card-head"><h2>Equilibrium phases</h2><span class="meta">mol per kg water; negative: precipitated</span></div>
+            <div class="table-wrap" id="aq-phases"></div>
+          </div>
+          <div class="glass-card card">
+            <div class="card-head"><h2>Saturation indices</h2><span class="meta">SI = log IAP − log K; above 0 supersaturated</span></div>
+            <div class="table-wrap" id="aq-si"></div>
+          </div>
+          <div class="glass-card chart-card">
+            <div class="card-head"><h2>Distribution with pH</h2><select id="aq-dist-comp" aria-label="Component"></select></div>
+            <canvas class="chart" id="aq-dist" data-height="280"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <!-- Draw -->
+      <section class="view" id="draw" hidden>
+        <header class="view-head">
+          <h1>Draw</h1>
+          <p>Draw or edit a structure. ChemLarp checks it as you draw, reads stereo from wedges, and opens it in every tool.</p>
+        </header>
+        <div class="editor-shell glass-card">
+          <div class="editor-toolbar" role="toolbar" aria-label="Drawing tools">
+            <div class="ed-group"><button type="button" class="ed-btn" data-ed="select" title="Select and move (drag a box to select)" aria-label="Select and move (drag a box to select)"><svg><use href="#i-ed-select"/></svg></button></div>
+            <div class="ed-group"><button type="button" class="ed-btn" data-ed="bond" data-order="1" aria-pressed="true" title="Single bond (click a bond to raise its order)" aria-label="Single bond (click a bond to raise its order)"><svg><use href="#i-ed-single"/></svg></button><button type="button" class="ed-btn" data-ed="bond" data-order="2" title="Double bond" aria-label="Double bond"><svg><use href="#i-ed-double"/></svg></button><button type="button" class="ed-btn" data-ed="bond" data-order="3" title="Triple bond" aria-label="Triple bond"><svg><use href="#i-ed-triple"/></svg></button><button type="button" class="ed-btn" data-ed="bond" data-stereo="1" title="Wedge bond (click again to flip)" aria-label="Wedge bond (click again to flip)"><svg><use href="#i-ed-wedge"/></svg></button><button type="button" class="ed-btn" data-ed="bond" data-stereo="6" title="Hashed bond (click again to flip)" aria-label="Hashed bond (click again to flip)"><svg><use href="#i-ed-hash"/></svg></button><button type="button" class="ed-btn" data-ed="chain" title="Chain (drag)" aria-label="Chain (drag)"><svg><use href="#i-ed-chain"/></svg></button></div>
+            <div class="ed-group"><button type="button" class="ed-btn" data-ed="ring" data-size="3" title="Cyclopropane" aria-label="Cyclopropane"><svg viewBox="0 0 24 24"><polygon class="ed-ring-icon" data-n="3"/></svg></button><button type="button" class="ed-btn" data-ed="ring" data-size="4" title="Cyclobutane" aria-label="Cyclobutane"><svg viewBox="0 0 24 24"><polygon class="ed-ring-icon" data-n="4"/></svg></button><button type="button" class="ed-btn" data-ed="ring" data-size="5" title="Cyclopentane" aria-label="Cyclopentane"><svg viewBox="0 0 24 24"><polygon class="ed-ring-icon" data-n="5"/></svg></button><button type="button" class="ed-btn" data-ed="ring" data-size="6" title="Cyclohexane" aria-label="Cyclohexane"><svg viewBox="0 0 24 24"><polygon class="ed-ring-icon" data-n="6"/></svg></button><button type="button" class="ed-btn" data-ed="ring" data-size="6" data-aromatic title="Benzene" aria-label="Benzene"><svg viewBox="0 0 24 24"><polygon class="ed-ring-icon" data-n="6"/></svg></button><button type="button" class="ed-btn" data-ed="ring" data-size="7" title="Cycloheptane" aria-label="Cycloheptane"><svg viewBox="0 0 24 24"><polygon class="ed-ring-icon" data-n="7"/></svg></button><button type="button" class="ed-btn" data-ed="ring" data-size="8" title="Cyclooctane" aria-label="Cyclooctane"><svg viewBox="0 0 24 24"><polygon class="ed-ring-icon" data-n="8"/></svg></button></div>
+            <div class="ed-group ed-elements"><button type="button" class="ed-btn ed-el" data-ed="element" data-el="C" title="C (or hover an atom and press C)">C</button><button type="button" class="ed-btn ed-el" data-ed="element" data-el="N" title="N (or hover an atom and press N)">N</button><button type="button" class="ed-btn ed-el" data-ed="element" data-el="O" title="O (or hover an atom and press O)">O</button><button type="button" class="ed-btn ed-el" data-ed="element" data-el="S" title="S (or hover an atom and press S)">S</button><button type="button" class="ed-btn ed-el" data-ed="element" data-el="P" title="P (or hover an atom and press P)">P</button><button type="button" class="ed-btn ed-el" data-ed="element" data-el="F" title="F (or hover an atom and press F)">F</button><button type="button" class="ed-btn ed-el" data-ed="element" data-el="Cl" title="Cl (or hover an atom and press L)">Cl</button><button type="button" class="ed-btn ed-el" data-ed="element" data-el="Br" title="Br (or hover an atom and press B)">Br</button><button type="button" class="ed-btn ed-el" data-ed="element" data-el="I" title="I (or hover an atom and press I)">I</button><button type="button" class="ed-btn ed-el" data-ed="element" data-el="H" title="H (or hover an atom and press H)">H</button><button type="button" class="ed-btn ed-el" data-ed="other" title="Other element">…</button></div>
+            <div class="ed-group"><button type="button" class="ed-btn ed-el" data-ed="charge" data-delta="1" title="Raise charge (or hover an atom and press +)">+</button><button type="button" class="ed-btn ed-el" data-ed="charge" data-delta="-1" title="Lower charge (or hover an atom and press −)">−</button><button type="button" class="ed-btn" data-ed="erase" title="Eraser (or hover and press Delete)" aria-label="Eraser (or hover and press Delete)"><svg><use href="#i-ed-erase"/></svg></button></div>
+            <div class="ed-group ed-actions"><button type="button" class="ed-btn" data-ed="undo" title="Undo (⌘Z)" aria-label="Undo (⌘Z)"><svg><use href="#i-ed-undo"/></svg></button><button type="button" class="ed-btn" data-ed="redo" title="Redo (⇧⌘Z)" aria-label="Redo (⇧⌘Z)"><svg><use href="#i-ed-redo"/></svg></button><button type="button" class="ed-btn" data-ed="clean" title="Clean up layout" aria-label="Clean up layout"><svg><use href="#i-ed-clean"/></svg></button><button type="button" class="ed-btn ed-text" data-ed="clear" title="Clear the canvas">Clear</button></div>
+          </div>
+          <div class="editor-body">
+            <div class="editor-host" id="ed-host"></div>
+            <aside class="editor-side" id="ed-side" aria-live="polite"></aside>
+          </div>
+        </div>
+      </section>
+
+      <!-- Search -->
+      <section class="view" id="search" hidden>
+        <header class="view-head">
+          <h1>Search</h1>
+          <p>Find substructures in the open compound with SMARTS, compare compounds by fingerprint similarity, and screen an opened SD file.</p>
+        </header>
+        <div class="split">
+          <form class="panel glass-card" id="sr-form">
+            <div class="field">
+              <label for="sr-smarts">Substructure (SMARTS)</label>
+              <input id="sr-smarts" class="mono" spellcheck="false" value="[CX3]=[OX1]" placeholder="e.g. [CX3](=O)[OX2H1]">
+            </div>
+            <div class="samples compact">
+              <span class="samples-label">Examples</span>
+              <button type="button" class="chip" data-fill="sr-smarts" data-value="[CX3](=O)[OX2H1]">Carboxylic acid</button>
+              <button type="button" class="chip" data-fill="sr-smarts" data-value="[NX3;H2,H1;!$(NC=O)]">Amine</button>
+              <button type="button" class="chip" data-fill="sr-smarts" data-value="a1aaaaa1">Aromatic 6-ring</button>
+              <button type="button" class="chip" data-fill="sr-smarts" data-value="[F,Cl,Br,I]">Halogen</button>
+              <button type="button" class="chip" data-fill="sr-smarts" data-value="[#6][CX3](=O)[OX2][#6]">Ester</button>
+              <button type="button" class="chip" data-fill="sr-smarts" data-value="[CX4;!R;H2,H3]">Chain CH2/CH3</button>
+            </div>
+            <div class="field">
+              <label>Stereochemistry in the pattern</label>
+              <div class="segmented" role="radiogroup" aria-label="Stereochemistry in the pattern" id="sr-chiral">
+                <button type="button" role="radio" aria-checked="true" data-chiral="0">Ignore</button>
+                <button type="button" role="radio" aria-checked="false" data-chiral="1">Match @ / @@</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="sr-like">Compare with (SMILES, optional)</label>
+              <input id="sr-like" class="mono" spellcheck="false" placeholder="e.g. OC(=O)c1ccccc1O">
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">Search</button>
+            </div>
+          </form>
+          <div class="stack" id="sr-out"></div>
+        </div>
+      </section>
+
+      <!-- Quantum chemistry -->
+      <section class="view" id="quantum" hidden>
+        <header class="view-head">
+          <h1>Quantum Chemistry</h1>
+          <p>Hartree–Fock and density-functional energies, orbitals, charges and dipole for the open compound, at its 3D structure.</p>
+        </header>
+        <div class="split">
+          <form class="panel glass-card" id="qc-form">
+            <div class="field">
+              <label>Method</label>
+              <div class="segmented" role="radiogroup" aria-label="Method" id="qc-method">
+                <button type="button" role="radio" aria-checked="true" data-method="hf">HF</button>
+                <button type="button" role="radio" aria-checked="false" data-method="svwn">SVWN5</button>
+                <button type="button" role="radio" aria-checked="false" data-method="pbe">PBE</button>
+                <button type="button" role="radio" aria-checked="false" data-method="b3lyp">B3LYP</button>
+              </div>
+            </div>
+            <div class="field-row">
+              <div class="field narrow"><label for="qc-basis">Basis set</label>
+                <select id="qc-basis"><option>STO-3G</option><option>3-21G</option><option selected>6-31G</option><option>6-31G*</option></select></div>
+              <div class="field narrow"><label for="qc-mult">Multiplicity</label>
+                <select id="qc-mult"><option value="0" selected>Lowest</option><option value="1">Singlet</option><option value="2">Doublet</option><option value="3">Triplet</option><option value="4">Quartet</option></select></div>
+            </div>
+            <p class="muted small">Elements H to Ar. The 3D structure comes from ChemLarp's embedder (distance geometry + UFF). Larger molecules and basis sets take longer; the calculation runs in the background.</p>
+            <div class="form-actions"><button type="submit" class="btn btn-primary">Calculate</button></div>
+          </form>
+          <div class="stack" id="qc-out"></div>
+        </div>
+      </section>
+
+      <!-- Kinetics -->
+      <section class="view" id="kinetics" hidden>
+        <header class="view-head">
+          <h1>Batch Reactor</h1>
+          <p>Stiff kinetics of a reaction mechanism. Use the hydrogen–oxygen example or open your own .ocm, CHEMKIN or Cantera YAML file.</p>
+        </header>
+        <div class="split">
+          <form class="panel glass-card" id="kin-form">
+            <div class="field">
+              <label for="kin-mech">Mechanism</label>
+              <select id="kin-mech">
+                <option value="data/mechanisms/h2o2.ocm">Hydrogen–oxygen · 9 species, 23 reactions</option>
+                <option value="data/mechanisms/h2o2.yaml">Hydrogen–oxygen · Cantera YAML</option>
+                <option value="custom">Open a file…</option>
+              </select>
+            </div>
+            <div class="custom-files" id="kin-custom" hidden>
+              <div class="field"><label for="kin-file">Mechanism file</label><input type="file" id="kin-file" accept=".ocm,.inp,.dat,.yaml,.yml,.txt"></div>
+              <div class="field"><label for="kin-thermo">Thermo file (CHEMKIN, optional)</label><input type="file" id="kin-thermo" accept=".dat,.txt,.thermo"></div>
+            </div>
+            <div class="field">
+              <label for="kin-model">Reactor</label>
+              <select id="kin-model">
+                <option value="adiabatic-v">Adiabatic · constant volume</option>
+                <option value="adiabatic-p">Adiabatic · constant pressure</option>
+                <option value="iso-v">Isothermal · constant volume</option>
+                <option value="iso-p">Isothermal · constant pressure</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="kin-feed">Initial composition, <code>NAME=moles</code></label>
+              <textarea id="kin-feed" class="mono" rows="3" spellcheck="false">H2=2
+O2=1
+AR=7</textarea>
+            </div>
+            <div class="field-row">
+              <div class="field narrow"><label for="kin-t">Temperature</label><div class="unit-input"><input id="kin-t" type="number" value="1000" min="1" step="any"><span>K</span></div></div>
+              <div class="field narrow"><label for="kin-p">Pressure</label><div class="unit-input"><input id="kin-p" type="number" value="1" min="0.0001" step="any"><span>bar</span></div></div>
+              <div class="field narrow"><label for="kin-time">End time</label><div class="unit-input"><input id="kin-time" type="number" value="1" min="0.000001" step="any"><span>ms</span></div></div>
+            </div>
+            <div class="form-actions"><button type="submit" class="btn btn-primary">Run</button></div>
+          </form>
+          <div class="stack" id="kin-out"></div>
+        </div>
+        <div class="stack" id="kin-charts" hidden>
+          <div class="glass-card chart-card">
+            <div class="card-head"><h2>Temperature</h2></div>
+            <canvas class="chart" id="kin-chart-t" data-height="230"></canvas>
+          </div>
+          <div class="glass-card chart-card">
+            <div class="card-head">
+              <h2>Mole fractions</h2>
+              <div class="segmented small" role="radiogroup" aria-label="Scale" id="kin-scale">
+                <button type="button" role="radio" aria-checked="true" data-log="1">Log</button>
+                <button type="button" role="radio" aria-checked="false" data-log="0">Linear</button>
+              </div>
+            </div>
+            <canvas class="chart" id="kin-chart-x" data-height="320"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <!-- Flowsheet -->
+      <section class="view" id="flowsheet" hidden>
+        <header class="view-head">
+          <h1>Flowsheet</h1>
+          <p>Steady-state process simulation: unit operations joined by named streams, with recycle loops converged by Wegstein acceleration. Start from an example or write your own.</p>
+        </header>
+        <div class="split fs-split">
+          <form class="panel glass-card" id="fs-form">
+            <div class="field">
+              <label for="fs-example">Example</label>
+              <select id="fs-example"></select>
+            </div>
+            <div class="field">
+              <label for="fs-text">Flowsheet</label>
+              <textarea id="fs-text" class="mono fs-text" rows="14" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+            </div>
+            <details class="fs-help">
+              <summary>Syntax</summary>
+              <pre class="mono">components &lt;SMILES&gt; …
+model ideal | unifac
+feed &lt;stream&gt; T=300 P=1bar flows &lt;SMILES&gt;=&lt;mol/s&gt; …
+guess &lt;stream&gt; T= P= flows …     (start value of a recycle)
+method wegstein | direct
+
+mixer      M  a b -&gt; c [P=]
+splitter   S  a -&gt; b c fractions=0.6,0.4
+heater     H  a -&gt; b T=350 | Q=20kW [P=]
+valve      V  a -&gt; b P=2bar
+flash      D  a -&gt; vap liq T= P= | P= (adiabatic)
+separator  X  a -&gt; top bot [T=] [P=] split &lt;SMILES&gt;=0.99 …
+pump       P  a -&gt; b P= [eff=0.75]
+compressor C  a -&gt; b P= [eff=0.72]
+exchanger  E  hot cold -&gt; hot' cold' Thot= | Tcold= | Q=
+reactor    R  a -&gt; b key=&lt;SMILES&gt; X=0.5 [T=] nu &lt;SMILES&gt;=-1 …
+column     T  f -&gt; dist bot stages=15 feed=8 R=2 D=50 | B=
+              P=1atm [Pbot=] [condenser=total|partial]
+
+Units: T in K or C (80C), P in Pa, kPa, bar, atm,
+Q in W, kW, MW; flows in mol/s.</pre>
+            </details>
+            <div class="form-actions"><button type="submit" class="btn btn-primary">Solve</button></div>
+          </form>
+          <div class="stack" id="fs-out"></div>
+        </div>
+        <div class="stack" id="fs-results" hidden>
+          <div class="glass-card card">
+            <div class="card-head"><h2>Process flow diagram</h2><span class="meta">dashed: tear stream (recycle)</span></div>
+            <div class="fs-diagram" id="fs-diagram"></div>
+          </div>
+          <div class="glass-card card">
+            <div class="card-head"><h2>Streams</h2>
+              <div class="segmented small" role="radiogroup" aria-label="Flow basis" id="fs-basis">
+                <button type="button" role="radio" aria-checked="true" data-basis="mol">mol/s</button>
+                <button type="button" role="radio" aria-checked="false" data-basis="frac">mole fraction</button>
+              </div>
+            </div>
+            <div class="table-wrap" id="fs-streams"></div>
+          </div>
+          <div class="glass-card card">
+            <div class="card-head"><h2>Units</h2><span class="meta">duty and work added from outside</span></div>
+            <div class="table-wrap" id="fs-units"></div>
+          </div>
+          <div class="glass-card chart-card" id="fs-col-card" hidden>
+            <div class="card-head"><h2 id="fs-col-title">Column profile</h2><span class="meta">stage 1 is the condenser</span></div>
+            <canvas class="chart" id="fs-col-t" data-height="200"></canvas>
+            <canvas class="chart" id="fs-col-x" data-height="240"></canvas>
+          </div>
+          <div class="glass-card chart-card" id="fs-conv-card">
+            <div class="card-head"><h2>Recycle convergence</h2><span class="meta">largest relative change of a tear stream</span></div>
+            <canvas class="chart" id="fs-chart" data-height="220"></canvas>
+          </div>
+        </div>
+      </section>
+
+      <!-- Roadmap -->
+      <section class="view" id="roadmap" hidden>
+        <header class="view-head">
+          <h1>Roadmap</h1>
+          <p>How much of ChemLarp is built, weighted by module size (S = 1, M = 2.5, L = 5).</p>
+        </header>
+        <div class="stack" id="roadmap-out"></div>
+      </section>
+    </main>
+
+    <!-- Inspector -->
+    <aside class="inspector glass" id="inspector" aria-label="Chemical properties">
+      <div class="inspector-head">Chemical Properties</div>
+      <div id="inspector-body" class="inspector-body">
+        <p class="muted">Open a compound to see its properties.</p>
+      </div>
+    </aside>
+
+    <!-- Phone tab bar -->
+    <nav class="tabbar glass" aria-label="Tools">
+      <a href="#structure" data-tool="structure"><svg><use href="#i-structure"/></svg><span>Structure</span></a>
+      <a href="#model3d" data-tool="model3d"><svg><use href="#i-3d"/></svg><span>3D</span></a>
+      <a href="#dynamics" data-tool="dynamics"><svg><use href="#i-dynamics"/></svg><span>Dynamics</span></a>
+      <a href="#draw" data-tool="draw"><svg><use href="#i-draw"/></svg><span>Draw</span></a>
+      <a href="#search" data-tool="search"><svg><use href="#i-search"/></svg><span>Search</span></a>
+      <a href="#reaction" data-tool="reaction"><svg><use href="#i-reaction"/></svg><span>Reaction</span></a>
+      <a href="#equilibrium" data-tool="equilibrium" aria-label="Equilibrium"><svg><use href="#i-equilibrium"/></svg><span>Equil.</span></a>
+      <a href="#phases" data-tool="phases"><svg><use href="#i-phases"/></svg><span>Phases</span></a>
+      <a href="#aqueous" data-tool="aqueous"><svg><use href="#i-aqueous"/></svg><span>Aqueous</span></a>
+      <a href="#protein" data-tool="protein"><svg><use href="#i-protein"/></svg><span>Protein</span></a>
+      <a href="#quantum" data-tool="quantum"><svg><use href="#i-quantum"/></svg><span>Quantum</span></a>
+      <a href="#kinetics" data-tool="kinetics"><svg><use href="#i-kinetics"/></svg><span>Kinetics</span></a>
+      <a href="#lab" data-tool="lab"><svg><use href="#i-lab"/></svg><span>Lab</span></a>
+      <a href="#flowsheet" data-tool="flowsheet"><svg><use href="#i-flowsheet"/></svg><span>Flowsheet</span></a>
+      <a href="#roadmap" data-tool="roadmap"><svg><use href="#i-roadmap"/></svg><span>Roadmap</span></a>
+    </nav>
+  </div>
+
+  <div class="toast glass" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="viewer.js"></script>
+  <script src="editor.js"></script>
+  <script src="chart.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

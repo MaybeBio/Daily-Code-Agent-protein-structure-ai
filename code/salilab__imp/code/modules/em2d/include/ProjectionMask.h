@@ -1,0 +1,223 @@
+/**
+ *  \file IMP/em2d/ProjectionMask.h
+ *  \brief projection masks
+ *  Copyright 2007-2026 IMP Inventors. All rights reserved.
+*/
+
+#ifndef IMPEM2D_PROJECTION_MASK_H
+#define IMPEM2D_PROJECTION_MASK_H
+
+#include <IMP/em2d/em2d_config.h>
+#include "IMP/em2d/Matrix.h"
+#include "IMP/atom/Mass.h"
+#include "IMP/em/exp.h"
+#include "IMP/algebra/Vector3D.h"
+#include "IMP/algebra/Vector2D.h"
+#include "IMP/algebra/Rotation3D.h"
+#include "IMP/algebra/SphericalVector3D.h"
+#include "IMP/em/KernelParameters.h"
+#include "IMP/core/XYZR.h"
+#include "IMP/Particle.h"
+#include "IMP/exception.h"
+#include <complex>
+#include <memory>
+#include <cereal/access.hpp>
+
+IMPEM2D_BEGIN_NAMESPACE
+
+class ProjectionMask;
+class MasksManager;
+
+typedef std::shared_ptr<ProjectionMask> ProjectionMaskPtr;
+typedef std::shared_ptr<MasksManager> MasksManagerPtr;
+
+//! Mask that contains the projection of a given particles. This matrices
+//! speed up projecting because the only have to be computed once for a model
+class IMPEM2DEXPORT ProjectionMask {
+ public:
+  ProjectionMask() {}
+#if !defined(DOXYGEN) && !defined(SWIG)
+  ProjectionMask(const em::KernelParameters& kparams,
+                 double voxelsize, double mass = 1.0);
+
+  //! Generates the mask
+  /*!
+    \param[in] kparams Kernel parameters to employ. See the EM module
+    \param[in] mass Mass to give to the mask
+  */
+  void create(const em::KernelParameters& kparams,
+              double mass = 1.0);
+#endif
+
+  //! Adds the values of the mask to a matrix at the given pixel
+  /*!
+    \param[out] m matrix where the values of the mask are added.
+    \param[in] v pixel where to apply the values. Currently used as integer.
+  */
+  void apply(DoubleMatrix &m, const algebra::Vector2D &v);
+
+  void show(std::ostream &out = std::cout) const;
+
+  ~ProjectionMask();
+
+ protected:
+  int dim_;              // dimension of the mask
+  double sq_pixelsize_;  // Used to save multiplications
+  DoubleMatrix data_;         // actual matrix with the mask
+private:
+  friend class cereal::access;
+
+  template<class Archive> void serialize(Archive &ar) {
+    ar(dim_, sq_pixelsize_, data_);
+  }
+};
+
+IMP_VALUES(ProjectionMask, ProjectionMasks);
+
+IMPEM2D_END_NAMESPACE
+
+namespace cereal {
+  template<class Archive> inline void save(
+       Archive &ar, const std::map<double,
+                               IMP::em2d::ProjectionMaskPtr> &m) {
+    size_t sz = m.size();
+    ar(sz);
+    for (const auto &p : m) {
+      ar(p.first);
+      ar(*(p.second));
+    }
+  }
+
+  template<class Archive> inline void load(
+       Archive &ar, std::map<double, IMP::em2d::ProjectionMaskPtr> &m) {
+    m.clear();
+    size_t sz;
+    ar(sz);
+    for (size_t i = 0; i < sz; ++i) {
+      double mass;
+      IMP::em2d::ProjectionMaskPtr ptr(new IMP::em2d::ProjectionMask());
+      ar(mass);
+      ar(*ptr);
+      m[mass] = ptr;
+    }
+  }
+}
+
+IMPEM2D_BEGIN_NAMESPACE
+
+// Place a matrix in another
+// Very ugly but very fast projecting function
+
+/*!
+  \param[in] mask matrix to place in m
+  \param[in] m matrix
+  \param[in] v Pixel of the matrix dest where the center of m is put.
+*/
+inline void do_place(DoubleMatrix &mask, DoubleMatrix &m,
+                     const algebra::Vector2D &v) {
+
+  // v is the vector of coordinates respect to the center of the matrix m
+  int vi = algebra::get_rounded(v[0]);
+  int vj = algebra::get_rounded(v[1]);
+
+  // Centers for the matrix
+  int center[2];
+  center[0] = static_cast<int>(0.5 * m.rows());
+  center[1] = static_cast<int>(0.5 * m.cols());
+
+  int start[2], end[2];
+  start[0] = -center[0];
+  start[1] = -center[1];
+  end[0] = m.rows() - 1 - center[0];
+  end[1] = m.cols() - 1 - center[1];
+
+  // Check range: If the vector is outside the matrix, don't do anything.
+  if (vi < start[0] || vi > end[0]) return;
+  if (vj < start[1] || vj > end[1]) return;
+
+  // Centers for the mask
+  int mcenter[2];
+  mcenter[0] = static_cast<int>(0.5 * mask.rows());
+  mcenter[1] = static_cast<int>(0.5 * mask.cols());
+
+  int mstart[2], mend[2];
+  mstart[0] = -mcenter[0];
+  mstart[1] = -mcenter[1];
+  mend[0] = mask.rows() - 1 - mcenter[0];
+  mend[1] = mask.cols() - 1 - mcenter[1];
+
+  // Get the admissible range for the mask
+  int start_i = std::max(start[0] - vi, mstart[0]);
+  int start_j = std::max(start[1] - vj, mstart[1]);
+  int end_i = std::min(end[0] - vi, mend[0]);
+  int end_j = std::min(end[1] - vj, mend[1]);
+
+  int row = vi + center[0];
+  int col = vj + center[1];
+
+  if (end_i < start_i || end_j < start_j) return;
+  int n_rows = end_i - start_i + 1, n_cols = end_j - start_j + 1;
+  m.block(start_i + row, start_j + col, n_rows, n_cols) +=
+      mask.block(start_i + mcenter[0], start_j + mcenter[1], n_rows, n_cols);
+}
+
+//! Management of projection masks
+class IMPEM2DEXPORT MasksManager {
+ public:
+  MasksManager() {
+    is_setup_ = false;
+  };
+
+  MasksManager(double resolution, double pixelsize) {
+    setup_kernel(resolution, pixelsize);
+  }
+
+  //! Initializes the kernel
+  inline void setup_kernel(double resolution, double pixelsize) {
+    kernel_params_ = em::KernelParameters((float)resolution);
+    pixelsize_ = pixelsize;
+    is_setup_ = true;
+  }
+
+  //! Generates all the masks for a set of particles. This is the function
+  //! you typically want to use
+  void create_masks(const ParticlesTemp &ps);
+
+  //! Creates the adequate mask for a particle of given mass
+  /*!
+    \param[in] mass of the particle
+  */
+  void create_mask(double mass);
+
+  //! Returns the adequate mask for a particle of given mass
+  ProjectionMaskPtr find_mask(double mass);
+
+  void show(std::ostream &out = std::cout) const;
+
+  unsigned int get_number_of_masks() const { return mass2mask_.size(); }
+
+  ~MasksManager();
+
+ protected:
+  // A map to store the masks
+  std::map<double, ProjectionMaskPtr> mass2mask_;
+  // Kernel Params for the particles
+  em::KernelParameters kernel_params_;
+  // Pixel size for the masks
+  double pixelsize_;
+  bool is_setup_;
+
+private:
+  friend class cereal::access;
+
+  template<class Archive> void serialize(Archive &ar) {
+    ar(mass2mask_, kernel_params_, pixelsize_, is_setup_);
+  }
+
+};
+
+IMP_VALUES(MasksManager, MasksManagers);
+
+IMPEM2D_END_NAMESPACE
+
+#endif /* IMPEM2D_PROJECTION_MASK_H */

@@ -1,0 +1,1574 @@
+"""RDKit parser-readability diagnostics over canonical structures."""
+
+from collections import defaultdict
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from math import dist, isfinite
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Protocol
+
+from protrepair.chemistry import ComponentLibrary, build_default_component_library
+from protrepair.diagnostics.events import ValidationIssue
+from protrepair.diagnostics.kinds import IssueSeverity, ValidationIssueKind
+from protrepair.errors import ModelInvariantError, RdkitUnavailableError
+from protrepair.io.pdb_projection import (
+    RDKitNoConectPDBBlockProjector,
+    RDKitNoConectPDBInput,
+    RDKitPDBProjectionUnavailable,
+    pdb_without_conect,
+    prepare_rdkit_no_conect_pdb_input,
+    rdkit_pdb_projection_unavailability,
+)
+from protrepair.structure.aggregate import ProteinStructure
+from protrepair.structure.constitution import StructureConstitution
+from protrepair.structure.element import ElementIdentity
+from protrepair.structure.labels import AtomRef, ResidueId
+from protrepair.structure.topology import (
+    BondProvenance,
+    StructureTopology,
+    TopologyBond,
+    is_covalent_like_relationship,
+)
+
+if TYPE_CHECKING:
+    from rdkit.Chem.rdchem import Conformer
+
+try:
+    from rdkit import Chem, rdBase
+except ImportError:  # pragma: no cover - exercised by RDKit import-guard checks
+    Chem = None
+    rdBase = None
+
+
+def _require_rdkit_parser_backend(context: str) -> None:
+    """Raise when the required RDKit parser backend is unavailable."""
+
+    if Chem is None or rdBase is None:
+        raise RdkitUnavailableError(
+            f"{context} requires an operational RDKit installation"
+        )
+
+
+class _RDKitResidueInfo(Protocol):
+    """PDB residue metadata surface consumed from RDKit atoms."""
+
+    def GetSerialNumber(self) -> int:
+        """Return the serial carried by the emitted PDB atom record."""
+        ...
+
+    def GetName(self) -> str:
+        """Return the PDB atom name."""
+        ...
+
+
+class _RDKitBond(Protocol):
+    """RDKit bond surface needed for parser witnesses."""
+
+    def GetBeginAtom(self) -> "_RDKitAtom":
+        """Return the first atom in this bond."""
+        ...
+
+    def GetEndAtom(self) -> "_RDKitAtom":
+        """Return the second atom in this bond."""
+        ...
+
+
+class _RDKitAtom(Protocol):
+    """RDKit atom surface needed for parser witnesses."""
+
+    def GetIdx(self) -> int:
+        """Return this atom's index in the current native molecule."""
+        ...
+
+    def GetIsotope(self) -> int:
+        """Return isotope mass, or zero for an unspecified isotope."""
+        ...
+
+    def GetPDBResidueInfo(self) -> _RDKitResidueInfo | None:
+        """Return PDB residue metadata if present."""
+        ...
+
+    def GetBonds(self) -> Sequence[_RDKitBond]:
+        """Return bonds adjacent to this atom."""
+        ...
+
+    def GetSymbol(self) -> str:
+        """Return the atomic element symbol."""
+        ...
+
+    def GetAtomicNum(self) -> int:
+        """Return the canonical atomic number."""
+        ...
+
+
+class _RDKitMol(Protocol):
+    """RDKit molecule surface needed for parser witnesses."""
+
+    def GetAtomWithIdx(self, atom_index: int) -> _RDKitAtom:
+        """Return an atom by RDKit atom index."""
+        ...
+
+    def GetAtoms(self) -> Sequence[_RDKitAtom]:
+        """Return atoms in the parsed molecule."""
+        ...
+
+    def GetConformer(self) -> "Conformer":
+        """Return the coordinates read from the rendered PDB."""
+        ...
+
+
+@contextmanager
+def _expected_rdkit_parser_probe_logs_blocked() -> Iterator[None]:
+    """Suppress expected RDKit parser diagnostics during no-CONECT probes."""
+
+    if rdBase is None:
+        yield
+        return
+
+    with rdBase.BlockLogs():
+        yield
+
+
+@dataclass(frozen=True, slots=True)
+class RDKitProximityBondWitness:
+    """One RDKit-inferred no-CONECT proximity bond."""
+
+    atom_ref_1: AtomRef
+    atom_ref_2: AtomRef
+    element_1: str
+    element_2: str
+    is_known_component_bond: bool
+    element_1_is_hydrogen: bool = field(init=False, repr=False, compare=False)
+    element_2_is_hydrogen: bool = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "element_1", self.element_1.strip().upper())
+        object.__setattr__(self, "element_2", self.element_2.strip().upper())
+        object.__setattr__(
+            self,
+            "element_1_is_hydrogen",
+            ElementIdentity(self.element_1).is_hydrogen(),
+        )
+        object.__setattr__(
+            self,
+            "element_2_is_hydrogen",
+            ElementIdentity(self.element_2).is_hydrogen(),
+        )
+
+    def display_token(self) -> str:
+        """Return a compact human-readable bond token."""
+
+        return f"{self.atom_ref_1.display_token()}-{self.atom_ref_2.display_token()}"
+
+    def is_heavy_heavy(self) -> bool:
+        """Return whether both witness atoms are non-hydrogen atoms."""
+
+        return not self.element_1_is_hydrogen and not self.element_2_is_hydrogen
+
+    def residue_ids(self) -> tuple[ResidueId, ...]:
+        """Return residue ids touched by this witness bond."""
+
+        if self.atom_ref_1.residue_id == self.atom_ref_2.residue_id:
+            return (self.atom_ref_1.residue_id,)
+
+        return tuple(
+            sorted(
+                (self.atom_ref_1.residue_id, self.atom_ref_2.residue_id),
+                key=lambda residue_id: residue_id.display_token(),
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RDKitParserProblemWitness:
+    """RDKit parser failure enriched with local proximity-bond witnesses."""
+
+    residue_id: ResidueId
+    atom_names: tuple[str, ...]
+    messages: tuple[str, ...]
+    proximity_bonds: tuple[RDKitProximityBondWitness, ...]
+
+    def extra_proximity_bonds(self) -> tuple[RDKitProximityBondWitness, ...]:
+        """Return inferred bonds unknown to ProtRepair topology."""
+
+        return tuple(
+            witness
+            for witness in self.proximity_bonds
+            if not witness.is_known_component_bond
+        )
+
+    def extra_heavy_proximity_bonds(self) -> tuple[RDKitProximityBondWitness, ...]:
+        """Return extra inferred heavy-heavy proximity bonds."""
+
+        return tuple(
+            witness
+            for witness in self.extra_proximity_bonds()
+            if witness.is_heavy_heavy()
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RDKitProximityBondCluster:
+    """Connected component of RDKit-inferred extra heavy-heavy proximity bonds."""
+
+    residue_ids: tuple[ResidueId, ...]
+    bonds: tuple[RDKitProximityBondWitness, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "residue_ids",
+            tuple(
+                sorted(
+                    self.residue_ids,
+                    key=lambda residue_id: residue_id.display_token(),
+                )
+            ),
+        )
+        object.__setattr__(
+            self,
+            "bonds",
+            tuple(
+                sorted(
+                    self.bonds,
+                    key=lambda bond: bond.display_token(),
+                )
+            ),
+        )
+
+    def display_token(self) -> str:
+        """Return a compact residue-cluster token."""
+
+        return ",".join(residue_id.display_token() for residue_id in self.residue_ids)
+
+
+@dataclass(frozen=True, slots=True)
+class RDKitNoConectSanitizeReadabilityMetrics:
+    """Compact no-CONECT RDKit parser-readability burden metrics."""
+
+    sanitize_readable: bool | None
+    extra_proximity_bond_count: int = 0
+    extra_heavy_proximity_bond_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.extra_proximity_bond_count < 0:
+            raise ValueError("extra proximity-bond count must be non-negative")
+        if self.extra_heavy_proximity_bond_count < 0:
+            raise ValueError("extra heavy proximity-bond count must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class RDKitProjectedHydrogenAttachment:
+    """No-CONECT graph and projected distance to an independently assigned parent."""
+
+    hydrogen: AtomRef
+    neighbors: tuple[AtomRef, ...]
+    parent_distance_angstrom: float
+
+
+@dataclass(frozen=True, slots=True)
+class RDKitNoConectParserReadabilityProbe:
+    """Sanitation outcome with separate failure and H-attachment evidence.
+
+    Parameters
+    ----------
+    sanitize_readable : bool or None
+        Whether sanitation succeeds, or unknown when no H is present.
+    residue_problem_witnesses : tuple[RDKitParserProblemWitness, ...]
+        Localized native sanitation failures and their neighboring bonds.
+    structure_messages : tuple[str, ...]
+        Nonlocalized sanitation failures or unsupported PDB projection causes.
+    hydrogen_attachment_witnesses : tuple[RDKitProximityBondWitness, ...], default=()
+        Observed attachments outside declared canonical H/D/T parents, even
+        when sanitation succeeds. Undeclared parents are not inferred here.
+    projected_hydrogen_attachments : tuple[RDKitProjectedHydrogenAttachment, ...], default=()
+        Native neighbors and PDB-precision lengths for requested pairs.
+        Missing rows have no usable projection.
+    """
+
+    sanitize_readable: bool | None
+    residue_problem_witnesses: tuple[RDKitParserProblemWitness, ...]
+    structure_messages: tuple[str, ...]
+    hydrogen_attachment_witnesses: tuple[RDKitProximityBondWitness, ...] = ()
+    projected_hydrogen_attachments: tuple[RDKitProjectedHydrogenAttachment, ...] = ()
+
+    def extra_proximity_bonds(self) -> tuple[RDKitProximityBondWitness, ...]:
+        """Return unique noncanonical bonds independently of sanitation success.
+
+        Returns
+        -------
+        tuple[RDKitProximityBondWitness, ...]
+            Failure and attachment witnesses, deduplicated by unordered endpoints.
+        """
+
+        return tuple(
+            {
+                _atom_ref_endpoint_pair(bond.atom_ref_1, bond.atom_ref_2): bond
+                for bond in (
+                    *_extra_proximity_bonds_from_problem_witnesses(
+                        self.residue_problem_witnesses
+                    ),
+                    *self.hydrogen_attachment_witnesses,
+                )
+            }.values()
+        )
+
+    def metrics(self) -> RDKitNoConectSanitizeReadabilityMetrics:
+        """Return compact parser-readability burden metrics for this probe."""
+
+        extra_bonds = self.extra_proximity_bonds()
+        return RDKitNoConectSanitizeReadabilityMetrics(
+            sanitize_readable=self.sanitize_readable,
+            extra_proximity_bond_count=len(extra_bonds),
+            extra_heavy_proximity_bond_count=sum(
+                1 for bond in extra_bonds if bond.is_heavy_heavy()
+            ),
+        )
+
+    def issues(self) -> tuple[ValidationIssue, ...]:
+        """Return typed parser-readability issues for this probe."""
+
+        if self.structure_messages[:1] == ("_pdb_projection_unavailable",):
+            return (
+                ValidationIssue(
+                    kind=ValidationIssueKind.PARSER_READABILITY,
+                    severity=IssueSeverity.ERROR,
+                    message=(
+                        "RDKit could not observe the no-CONECT PDB surface: "
+                        + "; ".join(self.structure_messages[1:])
+                    ),
+                ),
+            )
+
+        if self.structure_messages == ("_pdb_parse_failed_before_sanitize",):
+            return (
+                ValidationIssue(
+                    kind=ValidationIssueKind.PARSER_READABILITY,
+                    severity=IssueSeverity.ERROR,
+                    message=(
+                        "RDKit could not parse the no-CONECT hydrogenated PDB surface "
+                        "before sanitize"
+                    ),
+                ),
+            )
+
+        if (
+            not self.residue_problem_witnesses
+            and not self.structure_messages
+            and not self.hydrogen_attachment_witnesses
+        ):
+            return ()
+
+        issues: list[ValidationIssue] = []
+        for problem_witness in sorted(
+            self.residue_problem_witnesses,
+            key=lambda item: item.residue_id.display_token(),
+        ):
+            atom_names = problem_witness.atom_names
+            messages = problem_witness.messages
+            message = (
+                "no-CONECT RDKit sanitize would fail around atoms "
+                f"{', '.join(atom_names)}: {messages[0]}"
+            )
+            if len(messages) > 1:
+                message += (
+                    f" (+{len(messages) - 1} additional parser chemistry problems)"
+                )
+            extra_bond_tokens = tuple(
+                witness.display_token()
+                for witness in problem_witness.extra_proximity_bonds()
+            )
+            if extra_bond_tokens:
+                message += (
+                    "; RDKit proximity witness extra bond(s): "
+                    f"{', '.join(extra_bond_tokens[:3])}"
+                )
+                if len(extra_bond_tokens) > 3:
+                    message += f" (+{len(extra_bond_tokens) - 3} more)"
+
+            issues.append(
+                ValidationIssue.for_residue(
+                    kind=ValidationIssueKind.PARSER_READABILITY,
+                    severity=IssueSeverity.ERROR,
+                    message=message,
+                    residue_id=problem_witness.residue_id,
+                )
+            )
+
+        if self.structure_messages:
+            summary = self.structure_messages
+            message = (
+                "no-CONECT RDKit sanitize would fail with non-localized parser "
+                f"chemistry problems: {summary[0]}"
+            )
+            if len(summary) > 1:
+                message += (
+                    f" (+{len(summary) - 1} additional parser chemistry problems)"
+                )
+
+            issues.append(
+                ValidationIssue(
+                    kind=ValidationIssueKind.PARSER_READABILITY,
+                    severity=IssueSeverity.ERROR,
+                    message=message,
+                )
+            )
+
+        for witness in self.hydrogen_attachment_witnesses:
+            issues.append(
+                ValidationIssue.for_residue(
+                    kind=ValidationIssueKind.PARSER_READABILITY,
+                    severity=IssueSeverity.WARNING,
+                    message=(
+                        "no-CONECT RDKit inferred a hydrogen attachment outside "
+                        f"canonical topology: {witness.display_token()}; "
+                        "successful sanitation does not establish H-parent fidelity"
+                    ),
+                    residue_id=witness.atom_ref_1.residue_id,
+                )
+            )
+
+        return tuple(issues)
+
+    def parser_problem_witnesses(self) -> tuple[RDKitParserProblemWitness, ...]:
+        """Return residue-local parser problem witnesses in stable order."""
+
+        return tuple(
+            sorted(
+                self.residue_problem_witnesses,
+                key=lambda item: item.residue_id.display_token(),
+            )
+        )
+
+    def extra_proximity_bond_clusters(self) -> tuple[RDKitProximityBondCluster, ...]:
+        """Return connected clusters of extra heavy-heavy parser witnesses."""
+
+        extra_heavy_bonds = tuple(
+            bond
+            for bond in _extra_proximity_bonds_from_problem_witnesses(
+                self.residue_problem_witnesses
+            )
+            if bond.is_heavy_heavy()
+        )
+        return _extra_proximity_bond_clusters_from_witnesses(extra_heavy_bonds)
+
+
+@dataclass(frozen=True, slots=True)
+class _RDKitNoConectProblemSurface:
+    """Private parsed RDKit problem surface before ProtRepair-specific projections."""
+
+    molecule: _RDKitMol | None
+    atom_refs_by_native_index: Mapping[int, AtomRef]
+    residue_atom_names: Mapping[ResidueId, frozenset[str]]
+    residue_messages: Mapping[ResidueId, frozenset[str]]
+    residue_problem_atom_indices: Mapping[ResidueId, frozenset[int]]
+    structure_messages: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "atom_refs_by_native_index",
+            MappingProxyType(dict(self.atom_refs_by_native_index)),
+        )
+        object.__setattr__(
+            self,
+            "residue_atom_names",
+            MappingProxyType(dict(self.residue_atom_names)),
+        )
+        object.__setattr__(
+            self,
+            "residue_messages",
+            MappingProxyType(dict(self.residue_messages)),
+        )
+        object.__setattr__(
+            self,
+            "residue_problem_atom_indices",
+            MappingProxyType(dict(self.residue_problem_atom_indices)),
+        )
+
+    def project_hydrogen_attachments(
+        self, assigned_parents: Mapping[AtomRef, AtomRef]
+    ) -> tuple[RDKitProjectedHydrogenAttachment, ...]:
+        molecule = self.molecule
+        if molecule is None or not assigned_parents:
+            return ()
+
+        native_indices = {
+            ref: index for index, ref in self.atom_refs_by_native_index.items()
+        }
+        if not native_indices:
+            return ()
+        conformer = molecule.GetConformer()
+        result = []
+        for hydrogen, parent in assigned_parents.items():
+            child_idx = native_indices.get(hydrogen)
+            parent_idx = native_indices.get(parent)
+            if child_idx is None or parent_idx is None:
+                continue
+            child_pos = conformer.GetAtomPosition(child_idx)
+            parent_pos = conformer.GetAtomPosition(parent_idx)
+            distance = dist(
+                (child_pos.x, child_pos.y, child_pos.z),
+                (parent_pos.x, parent_pos.y, parent_pos.z),
+            )
+            if not isfinite(distance):
+                continue
+
+            neighbors = []
+            for bond in molecule.GetAtomWithIdx(child_idx).GetBonds():
+                first = bond.GetBeginAtom().GetIdx()
+                second = bond.GetEndAtom().GetIdx()
+                neighbors.append(
+                    _require_native_atom_ref(
+                        second if first == child_idx else first,
+                        self.atom_refs_by_native_index,
+                    )
+                )
+            result.append(
+                RDKitProjectedHydrogenAttachment(
+                    hydrogen, tuple(sorted(neighbors)), distance
+                )
+            )
+        return tuple(result)
+
+
+@dataclass(frozen=True, slots=True)
+class RDKitKnownBondLookup:
+    """Coordinate-invariant topology lookup for no-CONECT parser projections.
+
+    Parameters
+    ----------
+    component_library : ComponentLibrary
+        Definitions used to prepare template-derived pairs.
+    constitution : StructureConstitution
+        Atom identities for which the lookup was prepared.
+    topology : StructureTopology
+        Bond and charge snapshot used during preparation.
+    component_id_by_residue_id : Mapping[ResidueId, str]
+        Component identities for polymer-link interpretation.
+    known_atom_name_pairs_by_residue_id : Mapping
+        Template-derived residue-local pairs.
+    topology_atom_name_pairs_by_residue_id : Mapping
+        Topology-derived residue-local pairs.
+    topology_inter_residue_endpoint_pairs : frozenset
+        Known cross-residue endpoint pairs.
+    hydrogen_parent_refs : Mapping
+        Declared covalent heavy parents, keyed by canonical H/D/T identity.
+    """
+
+    component_library: ComponentLibrary
+    constitution: StructureConstitution = field(repr=False)
+    topology: StructureTopology = field(repr=False)
+    component_id_by_residue_id: Mapping[ResidueId, str]
+    known_atom_name_pairs_by_residue_id: Mapping[
+        ResidueId,
+        frozenset[tuple[str, str]],
+    ]
+    topology_atom_name_pairs_by_residue_id: Mapping[
+        ResidueId,
+        frozenset[tuple[str, str]],
+    ]
+    topology_inter_residue_endpoint_pairs: frozenset[tuple[AtomRef, AtomRef]]
+    hydrogen_parent_refs: Mapping[AtomRef, frozenset[AtomRef]]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "component_id_by_residue_id",
+            MappingProxyType(dict(self.component_id_by_residue_id)),
+        )
+        object.__setattr__(
+            self,
+            "known_atom_name_pairs_by_residue_id",
+            MappingProxyType(dict(self.known_atom_name_pairs_by_residue_id)),
+        )
+        object.__setattr__(
+            self,
+            "topology_atom_name_pairs_by_residue_id",
+            MappingProxyType(dict(self.topology_atom_name_pairs_by_residue_id)),
+        )
+        object.__setattr__(
+            self,
+            "topology_inter_residue_endpoint_pairs",
+            frozenset(self.topology_inter_residue_endpoint_pairs),
+        )
+        object.__setattr__(
+            self,
+            "hydrogen_parent_refs",
+            MappingProxyType(dict(self.hydrogen_parent_refs)),
+        )
+
+    def require_context(
+        self,
+        structure: ProteinStructure,
+        *,
+        component_library: ComponentLibrary | None,
+    ) -> None:
+        """Reject reuse with different graph or chemistry definitions.
+
+        Parameters
+        ----------
+        structure : ProteinStructure
+            Coordinates may differ, but constitution and topology must match.
+        component_library : ComponentLibrary or None
+            Active definitions, or the default library.
+
+        Raises
+        ------
+        ValueError
+            The prepared lookup belongs to different derivation inputs.
+        """
+
+        if (
+            structure.constitution is not self.constitution
+            and structure.constitution != self.constitution
+        ) or (
+            structure.topology is not self.topology
+            and structure.topology != self.topology
+        ):
+            raise ValueError("parser bond lookup requires its original graph")
+
+        active_library = (
+            build_default_component_library()
+            if component_library is None
+            else component_library
+        )
+        if active_library is not self.component_library:
+            raise ValueError(
+                "parser bond lookup requires its original component library"
+            )
+
+    def is_known_bond(self, atom_ref_1: AtomRef, atom_ref_2: AtomRef) -> bool:
+        """Return whether one RDKit-inferred bond exists in ProtRepair topology."""
+
+        for hydrogen, partner in ((atom_ref_1, atom_ref_2), (atom_ref_2, atom_ref_1)):
+            if hydrogen in self.hydrogen_parent_refs:
+                return partner in self.hydrogen_parent_refs[hydrogen]
+
+        if atom_ref_1.residue_id != atom_ref_2.residue_id:
+            endpoint_pair = _atom_ref_endpoint_pair(atom_ref_1, atom_ref_2)
+            if endpoint_pair in self.topology_inter_residue_endpoint_pairs:
+                return True
+
+            return _is_known_polymer_backbone_link(
+                atom_ref_1,
+                atom_ref_2,
+                component_id_by_residue_id=self.component_id_by_residue_id,
+                component_library=self.component_library,
+            )
+
+        atom_name_pair = _sorted_atom_name_pair(
+            atom_ref_1.atom_name,
+            atom_ref_2.atom_name,
+        )
+        if atom_name_pair in self.topology_atom_name_pairs_by_residue_id.get(
+            atom_ref_1.residue_id,
+            frozenset(),
+        ):
+            return True
+
+        return atom_name_pair in self.known_atom_name_pairs_by_residue_id.get(
+            atom_ref_1.residue_id,
+            frozenset(),
+        )
+
+
+def probe_rdkit_no_conect_parser_readability(
+    structure: ProteinStructure,
+    *,
+    component_library: ComponentLibrary | None = None,
+    pdb_block_projector: RDKitNoConectPDBBlockProjector | None = None,
+    known_bond_lookup: RDKitKnownBondLookup | None = None,
+    assigned_hydrogen_parents: Mapping[AtomRef, AtomRef] | None = None,
+) -> RDKitNoConectParserReadabilityProbe:
+    """Parse current coordinates and localize no-CONECT chemistry failures.
+
+    Parameters
+    ----------
+    structure : ProteinStructure
+        Candidate to serialize and parse, including its hydrogens.
+    component_library : ComponentLibrary or None
+        Active definitions, or defaults.
+    pdb_block_projector : RDKitNoConectPDBBlockProjector or None
+        Optional serialization preparation; incompatible inputs use full writing.
+    known_bond_lookup : RDKitKnownBondLookup or None
+        Optional graph preparation bound to this structure and library.
+    assigned_hydrogen_parents : Mapping[AtomRef, AtomRef] or None
+        Optional independently assigned pairs whose rendered distances and
+        all native neighbors should be reported, not used to change the graph.
+
+    Returns
+    -------
+    RDKitNoConectParserReadabilityProbe
+        Fresh geometry-dependent results; readability is unknown without H.
+
+    Raises
+    ------
+    ValueError
+        A supplied bond lookup has different derivation inputs.
+    RdkitUnavailableError
+        The required parser backend is unavailable.
+    ModelInvariantError
+        Emitted records or native metadata cannot identify source atoms uniquely.
+    """
+
+    _require_rdkit_parser_backend("RDKit no-CONECT parser-readability probe")
+    if known_bond_lookup is not None:
+        known_bond_lookup.require_context(
+            structure, component_library=component_library
+        )
+    if not _structure_contains_hydrogens(structure):
+        return RDKitNoConectParserReadabilityProbe(
+            sanitize_readable=None,
+            residue_problem_witnesses=(),
+            structure_messages=(),
+        )
+
+    problem_surface = _rdkit_no_conect_problem_surface(
+        structure, pdb_block_projector=pdb_block_projector
+    )
+    residue_problem_witnesses, structure_messages, attachments = (
+        _rdkit_no_conect_problem_witnesses(
+            structure,
+            problem_surface=problem_surface,
+            component_library=component_library,
+            known_bond_lookup=known_bond_lookup,
+        )
+    )
+    return RDKitNoConectParserReadabilityProbe(
+        sanitize_readable=not (residue_problem_witnesses or structure_messages),
+        residue_problem_witnesses=tuple(residue_problem_witnesses.values()),
+        structure_messages=structure_messages,
+        hydrogen_attachment_witnesses=attachments,
+        projected_hydrogen_attachments=(
+            ()
+            if assigned_hydrogen_parents is None
+            else problem_surface.project_hydrogen_attachments(assigned_hydrogen_parents)
+        ),
+    )
+
+
+def measure_rdkit_no_conect_extra_heavy_proximity_bond_count(
+    structure: ProteinStructure,
+    *,
+    component_library: ComponentLibrary | None = None,
+    known_bond_lookup: RDKitKnownBondLookup | None = None,
+    pdb_block_projector: RDKitNoConectPDBBlockProjector | None = None,
+) -> int:
+    """Return the extra heavy-heavy parser witness count without clustering."""
+
+    _require_rdkit_parser_backend("RDKit no-CONECT parser proximity-bond count")
+    if known_bond_lookup is not None:
+        known_bond_lookup.require_context(
+            structure, component_library=component_library
+        )
+    if not _structure_contains_hydrogens(structure):
+        return 0
+
+    problem_surface = _rdkit_no_conect_problem_surface(
+        structure,
+        pdb_block_projector=pdb_block_projector,
+    )
+    if (
+        problem_surface.molecule is None
+        or not problem_surface.residue_problem_atom_indices
+    ):
+        return 0
+
+    active_known_bond_lookup = known_bond_lookup
+    if active_known_bond_lookup is None:
+        active_known_bond_lookup = prepare_rdkit_no_conect_known_bond_lookup(
+            structure,
+            component_library=component_library,
+        )
+
+    atom_indices = {
+        atom_index
+        for atom_indices_for_residue in (
+            problem_surface.residue_problem_atom_indices.values()
+        )
+        for atom_index in atom_indices_for_residue
+    }
+    extra_heavy_pairs: set[tuple[AtomRef, AtomRef]] = set()
+    for atom_index in sorted(atom_indices):
+        atom = problem_surface.molecule.GetAtomWithIdx(atom_index)
+        for bond in atom.GetBonds():
+            begin_atom = bond.GetBeginAtom()
+            end_atom = bond.GetEndAtom()
+            if begin_atom.GetAtomicNum() == 1 or end_atom.GetAtomicNum() == 1:
+                continue
+
+            begin_ref = _require_native_atom_ref(
+                begin_atom.GetIdx(), problem_surface.atom_refs_by_native_index
+            )
+            end_ref = _require_native_atom_ref(
+                end_atom.GetIdx(), problem_surface.atom_refs_by_native_index
+            )
+
+            left_ref, right_ref = sorted((begin_ref, end_ref))
+            pair = (left_ref, right_ref)
+            if pair in extra_heavy_pairs:
+                continue
+
+            if active_known_bond_lookup.is_known_bond(begin_ref, end_ref):
+                continue
+
+            extra_heavy_pairs.add(pair)
+
+    return len(extra_heavy_pairs)
+
+
+def measure_rdkit_no_conect_sanitize_readability(
+    structure: ProteinStructure,
+) -> bool | None:
+    """Return whether hydrogenated structure geometry survives no-CONECT RDKit sanitize.
+
+    The result stays in the acceptance layer. It must not be promoted into
+    canonical state facts because it reflects one parser-visible geometry check,
+    not an authoritative structure truth.
+    """
+
+    _require_rdkit_parser_backend("RDKit no-CONECT sanitize readability")
+    assert Chem is not None
+    if not _structure_contains_hydrogens(structure):
+        return None
+
+    if rdkit_pdb_projection_unavailability(structure) is not None:
+        return False
+
+    pdb_block = pdb_without_conect(structure)
+    with _expected_rdkit_parser_probe_logs_blocked():
+        try:
+            molecule = Chem.MolFromPDBBlock(
+                pdb_block,
+                sanitize=True,
+                removeHs=False,
+                proximityBonding=True,
+            )
+        except Exception:  # pragma: no cover - backend-specific failure path  # noqa: BLE001 - Backend failures are collected as diagnostic results.
+            return False
+
+    return molecule is not None
+
+
+def measure_rdkit_no_conect_sanitize_readability_metrics(
+    structure: ProteinStructure,
+    *,
+    component_library: ComponentLibrary | None = None,
+    pdb_block_projector: RDKitNoConectPDBBlockProjector | None = None,
+    known_bond_lookup: RDKitKnownBondLookup | None = None,
+) -> RDKitNoConectSanitizeReadabilityMetrics:
+    """Measure no-CONECT readability and parser-visible bond burden.
+
+    Parameters
+    ----------
+    structure : ProteinStructure
+        Current candidate geometry and graph.
+    component_library : ComponentLibrary or None
+        Active chemistry definitions, or defaults.
+    pdb_block_projector : RDKitNoConectPDBBlockProjector or None
+        Optional coordinate serialization preparation.
+    known_bond_lookup : RDKitKnownBondLookup or None
+        Optional preparation for the same graph and library.
+
+    Returns
+    -------
+    RDKitNoConectSanitizeReadabilityMetrics
+        Metrics derived from a fresh parser probe.
+
+    Raises
+    ------
+    ValueError
+        A supplied lookup has different derivation inputs.
+    RdkitUnavailableError
+        The required parser backend is unavailable.
+    ModelInvariantError
+        Emitted records or native metadata cannot identify source atoms uniquely.
+    """
+
+    return probe_rdkit_no_conect_parser_readability(
+        structure,
+        component_library=component_library,
+        pdb_block_projector=pdb_block_projector,
+        known_bond_lookup=known_bond_lookup,
+    ).metrics()
+
+
+def diagnose_rdkit_no_conect_sanitize_readability(
+    structure: ProteinStructure,
+    *,
+    component_library: ComponentLibrary | None = None,
+    pdb_block_projector: RDKitNoConectPDBBlockProjector | None = None,
+) -> tuple[ValidationIssue, ...]:
+    """Return typed parser-readability issues over one hydrogenated structure."""
+
+    return probe_rdkit_no_conect_parser_readability(
+        structure,
+        component_library=component_library,
+        pdb_block_projector=pdb_block_projector,
+    ).issues()
+
+
+def rdkit_no_conect_parser_failing_residue_ids(
+    structure: ProteinStructure,
+    *,
+    component_library: ComponentLibrary | None = None,
+    pdb_block_projector: RDKitNoConectPDBBlockProjector | None = None,
+) -> tuple[ResidueId, ...]:
+    """Return residues that fail no-CONECT RDKit sanitize under proximity bonding."""
+
+    return tuple(
+        problem_witness.residue_id
+        for problem_witness in probe_rdkit_no_conect_parser_readability(
+            structure,
+            component_library=component_library,
+            pdb_block_projector=pdb_block_projector,
+        ).parser_problem_witnesses()
+    )
+
+
+def rdkit_no_conect_parser_problem_witnesses(
+    structure: ProteinStructure,
+    *,
+    component_library: ComponentLibrary | None = None,
+    pdb_block_projector: RDKitNoConectPDBBlockProjector | None = None,
+) -> tuple[RDKitParserProblemWitness, ...]:
+    """Return residue-local RDKit parser problem witnesses."""
+
+    return probe_rdkit_no_conect_parser_readability(
+        structure,
+        component_library=component_library,
+        pdb_block_projector=pdb_block_projector,
+    ).parser_problem_witnesses()
+
+
+def rdkit_no_conect_extra_proximity_bond_clusters(
+    structure: ProteinStructure,
+    *,
+    component_library: ComponentLibrary | None = None,
+    pdb_block_projector: RDKitNoConectPDBBlockProjector | None = None,
+) -> tuple[RDKitProximityBondCluster, ...]:
+    """Return clusters of extra heavy-heavy RDKit proximity bonds."""
+
+    return probe_rdkit_no_conect_parser_readability(
+        structure,
+        component_library=component_library,
+        pdb_block_projector=pdb_block_projector,
+    ).extra_proximity_bond_clusters()
+
+
+def prepare_rdkit_no_conect_known_bond_lookup(
+    structure: ProteinStructure,
+    *,
+    component_library: ComponentLibrary | None = None,
+) -> RDKitKnownBondLookup:
+    """Return topology facts reused across coordinate-only parser probes."""
+
+    active_component_library = (
+        build_default_component_library()
+        if component_library is None
+        else component_library
+    )
+    return RDKitKnownBondLookup(
+        component_library=active_component_library,
+        constitution=structure.constitution,
+        topology=structure.topology,
+        component_id_by_residue_id={
+            residue_site.residue_id: residue_site.component_id
+            for residue_site in structure.constitution.iter_residues(
+                include_ligands=True,
+            )
+        },
+        known_atom_name_pairs_by_residue_id={
+            residue_site.residue_id: _known_atom_name_pairs_for_residue(
+                residue_site.component_id,
+                residue_site.atom_site_names(),
+                component_library=active_component_library,
+            )
+            for residue_site in structure.constitution.iter_residues(
+                include_ligands=True,
+            )
+        },
+        topology_atom_name_pairs_by_residue_id=(
+            _topology_known_atom_name_pairs_by_residue_id(structure)
+        ),
+        topology_inter_residue_endpoint_pairs=(
+            _topology_known_inter_residue_endpoint_pairs(structure)
+        ),
+        hydrogen_parent_refs=_canonical_hydrogen_parent_refs(structure),
+    )
+
+
+def _canonical_hydrogen_parent_refs(
+    structure: ProteinStructure,
+) -> dict[AtomRef, frozenset[AtomRef]]:
+    parents: dict[AtomRef, set[AtomRef]] = defaultdict(set)
+    constitution = structure.constitution
+    for bond in structure.topology.bonds:
+        if not is_covalent_like_relationship(bond):
+            continue
+        first, second = bond.atom_index_1, bond.atom_index_2
+        first_is_h = constitution.atom_site_at(first).is_hydrogen()
+        second_is_h = constitution.atom_site_at(second).is_hydrogen()
+        if first_is_h == second_is_h:
+            continue
+        hydrogen, parent = (first, second) if first_is_h else (second, first)
+        parents[constitution.atom_ref_at(hydrogen)].add(
+            constitution.atom_ref_at(parent)
+        )
+    return {hydrogen: frozenset(partners) for hydrogen, partners in parents.items()}
+
+
+def _structure_contains_hydrogens(structure: ProteinStructure) -> bool:
+    """Return whether one canonical structure contains any hydrogen atoms."""
+
+    return any(
+        atom_site.is_hydrogen()
+        for residue_site in structure.constitution.residue_slots
+        for atom_site in residue_site.atom_sites
+    )
+
+
+def _rdkit_no_conect_problem_witnesses(
+    structure: ProteinStructure,
+    *,
+    problem_surface: _RDKitNoConectProblemSurface,
+    component_library: ComponentLibrary | None,
+    known_bond_lookup: RDKitKnownBondLookup | None = None,
+) -> tuple[
+    dict[ResidueId, RDKitParserProblemWitness],
+    tuple[str, ...],
+    tuple[RDKitProximityBondWitness, ...],
+]:
+    """Return residue-localized parser chemistry problems and bond witnesses."""
+
+    if problem_surface.molecule is None:
+        return ({}, problem_surface.structure_messages, ())
+
+    if known_bond_lookup is None:
+        known_bond_lookup = prepare_rdkit_no_conect_known_bond_lookup(
+            structure,
+            component_library=component_library,
+        )
+    attachments = _unexpected_hydrogen_attachments(
+        problem_surface.molecule,
+        known_bond_lookup,
+        problem_surface.atom_refs_by_native_index,
+    )
+    if not problem_surface.residue_problem_atom_indices:
+        return ({}, problem_surface.structure_messages, attachments)
+    residue_problem_witnesses = {
+        residue_id: RDKitParserProblemWitness(
+            residue_id=residue_id,
+            atom_names=tuple(sorted(problem_surface.residue_atom_names[residue_id])),
+            messages=tuple(sorted(problem_surface.residue_messages[residue_id])),
+            proximity_bonds=_problem_proximity_bond_witnesses(
+                problem_surface.molecule,
+                residue_id=residue_id,
+                atom_indices=set(
+                    problem_surface.residue_problem_atom_indices[residue_id]
+                ),
+                known_bond_lookup=known_bond_lookup,
+                atom_refs_by_native_index=problem_surface.atom_refs_by_native_index,
+            ),
+        )
+        for residue_id in problem_surface.residue_atom_names
+    }
+    return (
+        residue_problem_witnesses,
+        problem_surface.structure_messages,
+        attachments,
+    )
+
+
+def _unexpected_hydrogen_attachments(
+    molecule: _RDKitMol,
+    lookup: RDKitKnownBondLookup,
+    atom_refs_by_native_index: Mapping[int, AtomRef],
+) -> tuple[RDKitProximityBondWitness, ...]:
+    if not lookup.hydrogen_parent_refs:
+        return ()
+
+    witnesses = []
+    for hydrogen in molecule.GetAtoms():
+        if hydrogen.GetAtomicNum() != 1:
+            continue
+        hydrogen_ref = _require_native_atom_ref(
+            hydrogen.GetIdx(), atom_refs_by_native_index
+        )
+        if hydrogen_ref not in lookup.hydrogen_parent_refs:
+            continue
+        for bond in hydrogen.GetBonds():
+            first, second = bond.GetBeginAtom(), bond.GetEndAtom()
+            parent = second if first.GetAtomicNum() == 1 else first
+            parent_ref = _require_native_atom_ref(
+                parent.GetIdx(), atom_refs_by_native_index
+            )
+            if lookup.is_known_bond(hydrogen_ref, parent_ref):
+                continue
+            witnesses.append(
+                RDKitProximityBondWitness(
+                    atom_ref_1=hydrogen_ref,
+                    atom_ref_2=parent_ref,
+                    element_1=hydrogen.GetSymbol(),
+                    element_2=parent.GetSymbol(),
+                    is_known_component_bond=False,
+                )
+            )
+    return tuple(witnesses)
+
+
+def _rdkit_no_conect_problem_surface(
+    structure: ProteinStructure,
+    *,
+    pdb_block_projector: RDKitNoConectPDBBlockProjector | None = None,
+) -> _RDKitNoConectProblemSurface:
+    """Return parsed RDKit problem data before witness projection."""
+
+    _require_rdkit_parser_backend("RDKit no-CONECT parser problem surface")
+    assert Chem is not None
+    if not _structure_contains_hydrogens(structure):
+        return _RDKitNoConectProblemSurface(
+            molecule=None,
+            atom_refs_by_native_index={},
+            residue_atom_names={},
+            residue_messages={},
+            residue_problem_atom_indices={},
+            structure_messages=(),
+        )
+
+    parser_input = prepare_rdkit_no_conect_pdb_input(
+        structure,
+        pdb_block_projector,
+    )
+    if isinstance(parser_input, RDKitPDBProjectionUnavailable):
+        return _RDKitNoConectProblemSurface(
+            molecule=None,
+            atom_refs_by_native_index={},
+            residue_atom_names={},
+            residue_messages={},
+            residue_problem_atom_indices={},
+            structure_messages=("_pdb_projection_unavailable", parser_input.reason),
+        )
+
+    with _expected_rdkit_parser_probe_logs_blocked():
+        molecule = Chem.MolFromPDBBlock(
+            parser_input.pdb_block,
+            sanitize=False,
+            removeHs=False,
+            proximityBonding=True,
+        )
+        if molecule is None:
+            return _RDKitNoConectProblemSurface(
+                molecule=None,
+                atom_refs_by_native_index={},
+                residue_atom_names={},
+                residue_messages={},
+                residue_problem_atom_indices={},
+                structure_messages=("_pdb_parse_failed_before_sanitize",),
+            )
+
+        # Detection omits organometallic cleanup and is not the sanitation oracle.
+        # Keep the partially cleaned native graph to localize only surviving errors.
+        try:
+            Chem.SanitizeMol(molecule)
+        except Exception as error:  # noqa: BLE001 - Backend failures are collected as diagnostic results.
+            error_lines = str(error).splitlines()
+            sanitation_message = (
+                error_lines[0].strip() if error_lines else "RDKit sanitation failed"
+            ) or "RDKit sanitation failed"
+        else:
+            return _RDKitNoConectProblemSurface(
+                molecule=molecule,
+                atom_refs_by_native_index=_bind_native_atom_references(
+                    molecule, parser_input
+                ),
+                residue_atom_names={},
+                residue_messages={},
+                residue_problem_atom_indices={},
+                structure_messages=(),
+            )
+
+        atom_refs_by_native_index = _bind_native_atom_references(molecule, parser_input)
+        try:
+            chemistry_problems = Chem.DetectChemistryProblems(molecule)
+        except Exception:  # noqa: BLE001 - Backend failures are collected as diagnostic results.
+            chemistry_problems = ()
+    if not chemistry_problems:
+        return _RDKitNoConectProblemSurface(
+            molecule=molecule,
+            atom_refs_by_native_index=atom_refs_by_native_index,
+            residue_atom_names={},
+            residue_messages={},
+            residue_problem_atom_indices={},
+            structure_messages=(sanitation_message,),
+        )
+
+    residue_atom_names: dict[ResidueId, set[str]] = defaultdict(set)
+    residue_messages: dict[ResidueId, set[str]] = defaultdict(set)
+    residue_problem_atom_indices: dict[ResidueId, set[int]] = defaultdict(set)
+    structure_messages: set[str] = set()
+
+    for problem in chemistry_problems:
+        message = problem.Message().splitlines()[0].strip()
+        atom_index = problem.GetAtomIdx() if hasattr(problem, "GetAtomIdx") else None
+        if atom_index is None:
+            structure_messages.add(message)
+            continue
+
+        atom_ref = _require_native_atom_ref(atom_index, atom_refs_by_native_index)
+        residue_id = atom_ref.residue_id
+        residue_atom_names[residue_id].add(atom_ref.atom_name)
+        residue_messages[residue_id].add(message)
+        residue_problem_atom_indices[residue_id].add(atom_index)
+
+    return _RDKitNoConectProblemSurface(
+        molecule=molecule,
+        atom_refs_by_native_index=atom_refs_by_native_index,
+        residue_atom_names={
+            residue_id: frozenset(atom_names)
+            for residue_id, atom_names in residue_atom_names.items()
+        },
+        residue_messages={
+            residue_id: frozenset(messages)
+            for residue_id, messages in residue_messages.items()
+        },
+        residue_problem_atom_indices={
+            residue_id: frozenset(atom_indices)
+            for residue_id, atom_indices in residue_problem_atom_indices.items()
+        },
+        structure_messages=tuple(sorted(structure_messages)),
+    )
+
+
+def _problem_proximity_bond_witnesses(
+    molecule: _RDKitMol,
+    *,
+    residue_id: ResidueId | None,
+    atom_indices: set[int],
+    known_bond_lookup: RDKitKnownBondLookup,
+    atom_refs_by_native_index: Mapping[int, AtomRef],
+) -> tuple[RDKitProximityBondWitness, ...]:
+    """Return RDKit-inferred bonds adjacent to the failing atom indices."""
+
+    witnesses: list[RDKitProximityBondWitness] = []
+    for atom_index in sorted(atom_indices):
+        atom = molecule.GetAtomWithIdx(atom_index)
+        for bond in atom.GetBonds():
+            begin_atom = bond.GetBeginAtom()
+            end_atom = bond.GetEndAtom()
+            begin_ref = _require_native_atom_ref(
+                begin_atom.GetIdx(), atom_refs_by_native_index
+            )
+            end_ref = _require_native_atom_ref(
+                end_atom.GetIdx(), atom_refs_by_native_index
+            )
+            if residue_id is not None and residue_id not in (
+                begin_ref.residue_id,
+                end_ref.residue_id,
+            ):
+                continue
+            witness = RDKitProximityBondWitness(
+                atom_ref_1=begin_ref,
+                atom_ref_2=end_ref,
+                element_1=begin_atom.GetSymbol(),
+                element_2=end_atom.GetSymbol(),
+                is_known_component_bond=known_bond_lookup.is_known_bond(
+                    begin_ref,
+                    end_ref,
+                ),
+            )
+            if witness not in witnesses:
+                witnesses.append(witness)
+
+    return tuple(witnesses)
+
+
+def _extra_proximity_bonds_from_problem_witnesses(
+    problem_witnesses: Sequence[RDKitParserProblemWitness],
+) -> tuple[RDKitProximityBondWitness, ...]:
+    """Return unique extra proximity bonds from residue-local problem witnesses."""
+
+    return tuple(
+        dict.fromkeys(
+            bond
+            for witness in problem_witnesses
+            for bond in witness.extra_proximity_bonds()
+        )
+    )
+
+
+def _extra_proximity_bond_clusters_from_witnesses(
+    extra_heavy_bonds: Sequence[RDKitProximityBondWitness],
+) -> tuple[RDKitProximityBondCluster, ...]:
+    """Return connected clusters of extra heavy-heavy parser witnesses."""
+
+    if not extra_heavy_bonds:
+        return ()
+
+    residue_graph: dict[ResidueId, set[ResidueId]] = defaultdict(set)
+    bonds_by_residue_id: dict[ResidueId, list[RDKitProximityBondWitness]] = defaultdict(
+        list
+    )
+    for bond in extra_heavy_bonds:
+        bond_residue_ids = bond.residue_ids()
+        for residue_id in bond_residue_ids:
+            bonds_by_residue_id[residue_id].append(bond)
+
+        if len(bond_residue_ids) == 1:
+            residue_graph[bond_residue_ids[0]].add(bond_residue_ids[0])
+            continue
+
+        left, right = bond_residue_ids
+        residue_graph[left].add(right)
+        residue_graph[right].add(left)
+
+    clusters: list[RDKitProximityBondCluster] = []
+    visited: set[ResidueId] = set()
+    for seed in sorted(
+        residue_graph,
+        key=lambda residue_id: residue_id.display_token(),
+    ):
+        if seed in visited:
+            continue
+
+        stack = [seed]
+        component_residue_ids: set[ResidueId] = set()
+        component_bonds: set[RDKitProximityBondWitness] = set()
+        while stack:
+            residue_id = stack.pop()
+            if residue_id in visited:
+                continue
+
+            visited.add(residue_id)
+            component_residue_ids.add(residue_id)
+            component_bonds.update(bonds_by_residue_id[residue_id])
+            for neighbor in residue_graph[residue_id]:
+                if neighbor not in visited:
+                    stack.append(neighbor)
+
+        clusters.append(
+            RDKitProximityBondCluster(
+                residue_ids=tuple(component_residue_ids),
+                bonds=tuple(component_bonds),
+            )
+        )
+
+    return tuple(
+        sorted(
+            clusters,
+            key=lambda cluster: (
+                -len(cluster.bonds),
+                len(cluster.residue_ids),
+                cluster.display_token(),
+            ),
+        )
+    )
+
+
+def _bind_native_atom_references(
+    molecule: _RDKitMol, parser_input: RDKitNoConectPDBInput
+) -> dict[int, AtomRef]:
+    """Verify native serial/signature evidence before canonical attribution."""
+
+    atom_refs: dict[int, AtomRef] = {}
+    seen_serials: set[int] = set()
+    for atom in molecule.GetAtoms():
+        index = atom.GetIdx()
+        try:
+            info = atom.GetPDBResidueInfo()
+        except ValueError as error:
+            raise ModelInvariantError(
+                "PDB atom correspondence requires native PDB residue metadata"
+            ) from error
+        if info is None:
+            raise ModelInvariantError(
+                "PDB atom correspondence requires native serial metadata"
+            )
+        serial = info.GetSerialNumber()
+        if serial in seen_serials or index in atom_refs:
+            raise ModelInvariantError(
+                "PDB atom correspondence has duplicate native atom identity"
+            )
+        atom_refs[index] = parser_input.correspondence.require_atom_ref(
+            serial,
+            atom_name=info.GetName(),
+            element_symbol=atom.GetSymbol(),
+            isotope_mass_number=atom.GetIsotope(),
+        )
+        seen_serials.add(serial)
+    return atom_refs
+
+
+def _require_native_atom_ref(
+    index: int, atom_refs_by_native_index: Mapping[int, AtomRef]
+) -> AtomRef:
+    """Reject native indices outside the verified current correspondence."""
+
+    ref = atom_refs_by_native_index.get(index)
+    if ref is None:
+        raise ModelInvariantError(
+            f"PDB atom correspondence has unknown native atom index {index}"
+        )
+    return ref
+
+
+def _known_atom_name_pairs_for_residue(
+    component_id: str,
+    atom_names: tuple[str, ...],
+    *,
+    component_library: ComponentLibrary,
+) -> frozenset[tuple[str, str]]:
+    """Return known intra-residue atom-name pairs for one residue topology."""
+
+    template = component_library.get(component_id)
+    if template is None:
+        return frozenset()
+
+    present_atom_names = frozenset(atom_names)
+    atom_name_pairs: set[tuple[str, str]] = set()
+    for atom_name in present_atom_names:
+        atom_name_pairs.update(
+            _sorted_atom_name_pair(atom_name, bonded_atom_name)
+            for bonded_atom_name in template.definition.bonded_atom_names(atom_name)
+            if bonded_atom_name in present_atom_names
+        )
+
+    hydrogen_anchor_by_name = template.template_hydrogen_anchor_by_name(
+        tuple(sorted(present_atom_names)),
+    )
+    atom_name_pairs.update(
+        _sorted_atom_name_pair(hydrogen_atom_name, anchor_atom_name)
+        for hydrogen_atom_name, anchor_atom_name in hydrogen_anchor_by_name.items()
+        if hydrogen_atom_name in present_atom_names
+        and anchor_atom_name in present_atom_names
+    )
+    return frozenset(atom_name_pairs)
+
+
+def _sorted_atom_name_pair(atom_name_1: str, atom_name_2: str) -> tuple[str, str]:
+    """Return a deterministic atom-name pair key."""
+
+    if atom_name_1 <= atom_name_2:
+        return atom_name_1, atom_name_2
+
+    return atom_name_2, atom_name_1
+
+
+def _topology_known_atom_name_pairs_by_residue_id(
+    structure: ProteinStructure,
+) -> Mapping[ResidueId, frozenset[tuple[str, str]]]:
+    """Return residue-local parser-known topology bonds by residue id."""
+
+    atom_name_pairs_by_residue_id: dict[
+        ResidueId,
+        set[tuple[str, str]],
+    ] = defaultdict(set)
+    for bond in structure.topology.bonds:
+        if not _topology_bond_is_parser_known(bond):
+            continue
+
+        residue_index_1 = structure.constitution.residue_index_for_atom_index(
+            bond.atom_index_1
+        )
+        residue_index_2 = structure.constitution.residue_index_for_atom_index(
+            bond.atom_index_2
+        )
+        if residue_index_1 != residue_index_2:
+            continue
+
+        atom_site_1 = structure.constitution.atom_site_at(bond.atom_index_1)
+        atom_site_2 = structure.constitution.atom_site_at(bond.atom_index_2)
+        residue_id = structure.constitution.residue_site_at(residue_index_1).residue_id
+        atom_name_pairs_by_residue_id[residue_id].add(
+            _sorted_atom_name_pair(atom_site_1.name, atom_site_2.name)
+        )
+
+    return {
+        residue_id: frozenset(atom_name_pairs)
+        for residue_id, atom_name_pairs in atom_name_pairs_by_residue_id.items()
+    }
+
+
+def _topology_known_inter_residue_endpoint_pairs(
+    structure: ProteinStructure,
+) -> frozenset[tuple[AtomRef, AtomRef]]:
+    """Return inter-residue parser-known topology bonds in atom-ref address space."""
+
+    endpoint_pairs: set[tuple[AtomRef, AtomRef]] = set()
+    for bond in structure.topology.bonds:
+        if not _topology_bond_is_parser_known(bond):
+            continue
+
+        residue_index_1 = structure.constitution.residue_index_for_atom_index(
+            bond.atom_index_1
+        )
+        residue_index_2 = structure.constitution.residue_index_for_atom_index(
+            bond.atom_index_2
+        )
+        if residue_index_1 == residue_index_2:
+            continue
+
+        atom_ref_1 = structure.constitution.atom_ref_at(bond.atom_index_1)
+        atom_ref_2 = structure.constitution.atom_ref_at(bond.atom_index_2)
+        endpoint_pairs.add(_atom_ref_endpoint_pair(atom_ref_1, atom_ref_2))
+
+    return frozenset(endpoint_pairs)
+
+
+def _topology_bond_is_parser_known(bond: TopologyBond) -> bool:
+    """Return whether RDKit parser burden should treat a bond as known topology."""
+
+    return (
+        is_covalent_like_relationship(bond)
+        or bond.provenance is BondProvenance.SOURCE_EXPLICIT
+    )
+
+
+def _atom_ref_endpoint_pair(
+    atom_ref_1: AtomRef,
+    atom_ref_2: AtomRef,
+) -> tuple[AtomRef, AtomRef]:
+    """Return one canonical atom-ref endpoint pair."""
+
+    left, right = sorted((atom_ref_1, atom_ref_2))
+    return left, right
+
+
+def _is_known_polymer_backbone_link(
+    atom_ref_1: AtomRef,
+    atom_ref_2: AtomRef,
+    *,
+    component_id_by_residue_id: Mapping[ResidueId, str],
+    component_library: ComponentLibrary,
+) -> bool:
+    """Return whether one inferred inter-residue bond is a peptide backbone link."""
+
+    left, right = sorted(
+        (atom_ref_1, atom_ref_2),
+        key=lambda atom_ref: (
+            atom_ref.residue_id.chain_id,
+            atom_ref.residue_id.seq_num,
+            atom_ref.residue_id.insertion_code or "",
+            atom_ref.atom_name,
+        ),
+    )
+    if left.residue_id.chain_id != right.residue_id.chain_id:
+        return False
+    if left.residue_id.insertion_code or right.residue_id.insertion_code:
+        return False
+    if right.residue_id.seq_num != left.residue_id.seq_num + 1:
+        return False
+    if (left.atom_name, right.atom_name) != ("C", "N"):
+        return False
+
+    left_component_id = component_id_by_residue_id.get(left.residue_id)
+    right_component_id = component_id_by_residue_id.get(right.residue_id)
+    if left_component_id is None or right_component_id is None:
+        return False
+
+    return (
+        component_library.get(left_component_id) is not None
+        and component_library.get(right_component_id) is not None
+    )

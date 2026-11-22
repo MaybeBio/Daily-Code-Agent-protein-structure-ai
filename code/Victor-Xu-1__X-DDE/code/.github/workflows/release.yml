@@ -1,0 +1,91 @@
+name: Release installers
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact numeric release tag matching the selected revision
+        required: true
+        type: string
+      runner:
+        description: Hosted Linux runner for wheel packaging
+        type: choice
+        default: ubuntu-24.04
+        options: [ubuntu-24.04, ubuntu-22.04]
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+permissions:
+  contents: write
+jobs:
+  release:
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify and build exact release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          cd frontend
+          npm ci
+          python ../scripts/generate-plotly-css.py --check
+          npm run build
+          cd ..
+          uv sync --locked --group dev
+          uv run --locked python scripts/release-version.py check
+          uv run --locked pytest -q tests/test_versioning.py
+          uv build --wheel
+          test "$RELEASE_TAG" = "v$(uv run python -c 'from opendde_workbench import __version__; print(__version__)')"
+          cp install.sh install.ps1 scripts/opendde.ps1 dist/
+          uv run --locked python scripts/stage-release-examples.py --tag "$RELEASE_TAG" --destination dist
+          cd dist
+          shopt -s nullglob
+          sha256sum *.whl *.zip *.pdb *.sdf install.sh install.ps1 opendde.ps1 > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-installers
+          path: dist/*
+  windows-entrypoints:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify installer and command aliases in isolated fixtures
+        shell: pwsh
+        run: ./tests/test_windows_installer.ps1
+
+  publish:
+    needs: [release, windows-entrypoints]
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-installers
+          path: dist
+      - name: Publish verified version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # GITHUB_TOKEN creates the matching tag without recursively starting feature suites.
+          if gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" > /dev/null; then
+            # Resolve the exact tag to its commit: annotated refs point to tag objects.
+            gh api "repos/$GH_REPO/commits/refs%2Ftags%2F$RELEASE_TAG" --jq '.sha' > existing-tag.txt
+            test "$(cat existing-tag.txt)" = "$GITHUB_SHA"
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA"
+          fi
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "X-DDE $RELEASE_TAG" --generate-notes

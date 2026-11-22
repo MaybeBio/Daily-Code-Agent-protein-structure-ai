@@ -1,0 +1,321 @@
+"""Real analysis, machine-readable candidates, and downloadable reports."""
+
+import asyncio
+import csv
+import hashlib
+import html
+import io
+import json
+from threading import BoundedSemaphore, Event
+from typing import Literal
+from uuid import UUID
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
+
+from .analysis import AnalysisService
+from .backend_router import BackendRouter
+from .boltz_confidence import boltz_confidence_view
+from .boltz_confidence_sources import boltz_sources
+from .confidence import confidence_view
+from .engine import DockerEngine, Engine
+from .examples.pins import ExamplePins
+from .models import Status
+from .prediction_archive import BLOCK, prediction_archive
+from .prediction_sample_export import OPERATIONS, UnsealedPredictionSource, sample_zip
+from .settings import Settings
+from .store import Store
+
+
+class PredictionArchiveResponse(StreamingResponse):
+    def __init__(self, archive, length, filename, release):
+        self.archive = archive
+        self.release = release
+        super().__init__(
+            iter(lambda: archive.read(BLOCK), b""),
+            media_type="application/zip",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Length": str(length),
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                self.archive.close()
+            finally:
+                self.release()
+
+
+def register_science(app: FastAPI, store: Store, engine: Engine, settings: Settings):
+    analysis_engine = engine.opendde if isinstance(engine, BackendRouter) else engine
+    service = (
+        AnalysisService(analysis_engine, settings.state_dir / "jobs")
+        if isinstance(analysis_engine, DockerEngine)
+        else None
+    )
+
+    prediction_pins = ExamplePins(store, settings.state_dir)
+    capabilities = {
+        "predict": "predict",
+        "boltz_predict": "boltz.predict",
+        "mol1_predict": "mol1.predict",
+    }
+    archive_slot = BoundedSemaphore(1)
+    confidence_slot = BoundedSemaphore(1)
+
+    async def result(job_id: UUID):
+        job = store.get(str(job_id))
+        if not job:
+            raise HTTPException(404, "Task not found.")
+        if job.status != Status.SUCCEEDED or job.request.operation != "predict":
+            raise HTTPException(409, "Analysis requires a completed prediction.")
+        if service is None:
+            raise HTTPException(503, "Scientific analysis requires the Docker runtime.")
+        try:
+            return job, await service.get(job)
+        except (OSError, ValueError, RuntimeError, TimeoutError) as error:
+            raise HTTPException(
+                503,
+                "Analysis could not complete. Prediction files are preserved; "
+                "check the task analysis log.",
+            ) from error
+
+    @app.get("/api/jobs/{job_id}/analysis")
+    async def analysis(job_id: UUID):
+        _, data = await result(job_id)
+        return data
+
+    @app.get("/api/jobs/{job_id}/confidence")
+    async def confidence(
+        job_id: UUID,
+        candidate: str = Query(min_length=1, max_length=100),
+        metric: Literal["pae", "pde", "contacts"] = "pae",
+        download: bool = False,
+        source_sha256: str | None = Query(default=None, pattern=r"^[a-f0-9]{64}$"),
+    ):
+        job = store.get(str(job_id))
+        if job and job.request.operation == "boltz_predict":
+            if job.status != Status.SUCCEEDED:
+                raise HTTPException(409, "Choose a completed structure prediction.")
+
+            def read_native_confidence():
+                if not confidence_slot.acquire(blocking=False):
+                    raise HTTPException(
+                        429, "Another confidence view is being prepared. Try again."
+                    )
+                try:
+                    with store.connect() as db:
+                        authored = db.execute(
+                            "SELECT request FROM jobs WHERE id=?", (job.id,)
+                        ).fetchone()
+                    if authored is None:
+                        raise FileNotFoundError("The original task is unavailable.")
+                    pin = prediction_pins.for_job("boltz.predict", job_id)
+                    authored_sha = hashlib.sha256(authored["request"].encode()).hexdigest()
+                    if download:
+                        if source_sha256 is None or metric not in ("pae", "pde"):
+                            raise HTTPException(422, "Choose a displayed native confidence file.")
+                        source = boltz_sources(
+                            settings.state_dir / "jobs" / job.id,
+                            job.request,
+                            candidate,
+                            authored_sha,
+                            pin.artifact_sha256 if pin else {},
+                        )
+                        if metric not in source["bytes"]:
+                            raise FileNotFoundError("The native confidence file is unavailable.")
+                        if source["hashes"][metric] != source_sha256:
+                            raise HTTPException(
+                                409, "This confidence file changed. Reload its preview."
+                            )
+                        filename = source["names"][metric].rsplit("/", 1)[-1]
+                        return Response(
+                            source["bytes"][metric],
+                            media_type="application/octet-stream",
+                            headers={
+                                "Cache-Control": "no-store",
+                                "Content-Disposition": f'attachment; filename="{filename}"',
+                            },
+                        )
+                    return boltz_confidence_view(
+                        settings.state_dir / "jobs" / job.id,
+                        job.request,
+                        candidate,
+                        metric,
+                        authored_sha,
+                        pin.artifact_sha256 if pin else {},
+                    )
+                except FileNotFoundError as error:
+                    raise HTTPException(
+                        404, "This structure has no retained native matrix for the selected view."
+                    ) from error
+                except (OSError, ValueError, TypeError, KeyError) as error:
+                    raise HTTPException(
+                        422, "The selected structure's native confidence could not be verified."
+                    ) from error
+                finally:
+                    confidence_slot.release()
+
+            # Parsing retained arrays never calls AnalysisService or starts a container.
+            # The bounded worker keeps its own slot until it ends, including after disconnect.
+            return await asyncio.to_thread(read_native_confidence)
+        if download:
+            raise HTTPException(422, "Choose a displayed native confidence file.")
+        _, data = await result(job_id)
+        selected = next((c for c in data["candidates"] if c["id"] == candidate), None)
+        if selected is None:
+            raise HTTPException(404, "Candidate not found.")
+        try:
+            return confidence_view(
+                settings.state_dir / "jobs" / str(job_id) / "output", selected["artifact"], metric
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                404,
+                "This prediction has no atom-level confidence artifact. "
+                "Enable it in expert parameters for a new run.",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/jobs/{job_id}/prediction-sample.zip")
+    def download_sample(
+        job_id: UUID,
+        candidate: str = Query(pattern=r"^[A-Za-z0-9_.-]{1,100}$"),
+    ):
+        job = store.get(str(job_id))
+        if not job:
+            raise HTTPException(404, "Task not found.")
+        if job.status != Status.SUCCEEDED or job.request.operation not in OPERATIONS:
+            raise HTTPException(409, "Choose a completed structure prediction.")
+        try:
+            pin = prediction_pins.for_job(capabilities[job.request.operation], job_id)
+            sealed = pin.artifact_sha256 if pin else None
+            archive = sample_zip(settings.state_dir / "jobs" / job.id, job, candidate, sealed)
+        except UnsealedPredictionSource as error:
+            raise HTTPException(
+                409, {"code": "legacy_unsealed_structure", "message": str(error)}
+            ) from error
+        except FileNotFoundError as error:
+            raise HTTPException(
+                404, "The selected sample or source file is unavailable."
+            ) from error
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            raise HTTPException(422, "The selected sample could not be verified.") from error
+        return Response(
+            archive,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{job_id}-{candidate}.zip"'},
+        )
+
+    @app.get("/api/jobs/{job_id}/prediction-results.zip")
+    async def download_prediction_results(job_id: UUID, request: Request):
+        job = store.get(str(job_id))
+        if not job:
+            raise HTTPException(404, "Task not found.")
+        if job.status != Status.SUCCEEDED or job.request.operation not in OPERATIONS:
+            raise HTTPException(409, "Choose a completed structure prediction.")
+        if not archive_slot.acquire(blocking=False):
+            raise HTTPException(429, "Another prediction archive is being downloaded.")
+        cancelled = Event()
+
+        def prepare():
+            with store.connect() as db:
+                authored = db.execute("SELECT request FROM jobs WHERE id=?", (job.id,)).fetchone()
+            if authored is None:
+                raise FileNotFoundError("The retained request is unavailable.")
+            request_sha256 = hashlib.sha256(authored["request"].encode()).hexdigest()
+            pin = prediction_pins.for_job(capabilities[job.request.operation], job_id)
+            return prediction_archive(
+                settings.state_dir / "jobs" / job.id,
+                job,
+                request_sha256,
+                pin.artifact_sha256 if pin else {},
+                cancelled.is_set,
+            )
+
+        worker = asyncio.create_task(asyncio.to_thread(prepare))
+
+        def discard(completed):
+            try:
+                archive, _ = completed.result()
+                archive.close()
+            except (Exception, asyncio.CancelledError):
+                # The request was discarded. The completed result is no longer usable.
+                pass
+            finally:
+                archive_slot.release()
+
+        try:
+            while not worker.done():
+                await asyncio.wait((worker,), timeout=0.1)
+                if await request.is_disconnected():
+                    raise HTTPException(499, "The download was closed.")
+            archive, length = worker.result()
+        except FileNotFoundError as error:
+            archive_slot.release()
+            raise HTTPException(404, "A retained scientific file is unavailable.") from error
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            archive_slot.release()
+            raise HTTPException(422, "The retained prediction could not be packaged.") from error
+        except BaseException:
+            cancelled.set()
+            worker.add_done_callback(discard)
+            raise
+
+        return PredictionArchiveResponse(
+            archive, length, f"{job.id}-prediction-results.zip", archive_slot.release
+        )
+
+    @app.get("/api/jobs/{job_id}/candidates.csv")
+    async def candidates_csv(job_id: UUID):
+        _, data = await result(job_id)
+        buffer = io.StringIO()
+        fields = [
+            "id",
+            "ranking_score",
+            "plddt",
+            "ptm",
+            "iptm",
+            "rmsd_to_first",
+            "atom_count",
+        ]
+        writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(data["candidates"])
+        return Response(
+            buffer.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{job_id}-candidates.csv"'},
+        )
+
+    @app.get("/api/jobs/{job_id}/report")
+    async def report(job_id: UUID):
+        job, data = await result(job_id)
+        escape = html.escape
+        rows = "".join(
+            f"<tr><td>{escape(candidate['id'])}</td><td>{candidate['ranking_score']}</td><td>{candidate['plddt']}</td><td>{candidate['iptm']}</td><td>{candidate['atom_count']}</td></tr>"
+            for candidate in data["candidates"]
+        )
+        page = f"""<!doctype html><html lang="en"><meta charset="utf-8">
+            <title>{escape(job.request.name)} — OpenDDE report</title>
+            <h1>{escape(job.request.name)}</h1><p>Task: {job.id}</p>
+            <p>Created: {escape(job.created_at)}; completed: {escape(job.finished_at or "")}</p>
+            <p>Structural predictions and computational descriptors are not measured potency.</p>
+            <table border="1" cellpadding="8"><tr><th>Candidate</th><th>Ranking score</th>
+            <th>pLDDT</th><th>ipTM</th><th>Atoms</th></tr>{rows}</table>
+            <h2>Molecular descriptors (RDKit)</h2>
+            <pre>{escape(json.dumps(data["ligands"], indent=2))}</pre>
+            <h2>Metric definitions</h2>
+            <pre>{escape(json.dumps(data["metric_notes"], indent=2))}</pre>
+            <h2>Reproducible input</h2><pre>{escape(job.request.model_dump_json(indent=2))}</pre>
+            <p>Generated by the independent MIT X-DDE. Engine: OpenDDE (Apache-2.0).</p>
+            </html>"""
+        return HTMLResponse(
+            page, headers={"Content-Disposition": f'attachment; filename="{job_id}-report.html"'}
+        )

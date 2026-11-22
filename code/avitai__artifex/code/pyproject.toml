@@ -1,0 +1,777 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = [
+  "hatchling>=1.18"
+]
+
+[dependency-groups]
+dev = [
+  "nbqa>=1.9.1",
+  "pre-commit>=4.2",
+  "types-psutil>=5.10.10",
+  "types-tqdm>=4.67.0.20250809"
+]
+
+[project]
+authors = [
+  {email = "mahdi@avitai.bio", name = "Mahdi Shafiei"}
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Natural Language :: English",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Topic :: Scientific/Engineering :: Mathematics"
+]
+dependencies = [
+  "blackjax>=1.6.2",
+  # The Avitai siblings (calibrax, datarax, substrax) are pinned exactly at their latest
+  # releases, so the latest versions always install together; a sibling release is followed
+  # by an artifex release that only moves these pins.
+  "calibrax==0.1.21",
+  "dacite>=1.8.0",
+  "datarax==0.1.17",
+  # 0.1.7 calls jax.core.is_concrete and jax.core.valid_jaxtype, which jax deprecated in
+  # 0.10 and removed in 0.11; every distrax-backed distribution raises AttributeError on
+  # the jax this project now resolves. 0.1.9 no longer references either.
+  "distrax>=0.1.9",
+  # 0.12.9 added is_causal to nnx.MultiHeadAttention.__call__ and forwards it to
+  # attention_fn. FlashMultiHeadAttention relies on that pass-through; on earlier releases
+  # the argument does not exist and causal masking would depend on a partial that 0.12.9
+  # overrides. 0.12.1 is separately the first release with flax.nnx.Variable.set_value,
+  # which datarax calls from its pipeline iteration path. 0.12.11 stops forwarding
+  # is_causal during decode (flax c3721a25): before it, a causal decode step built
+  # tril((1, max_length)) and attended to cached position 0 only, so any causal decoder
+  # on nnx.MultiHeadAttention decoded every token after the first from the wrong context.
+  "flax>=0.12.11",
+  "grain>=0.2.18",
+  # 0.11.1 is the floor every sibling tests and the version the cuda12 extra pins.
+  "jax>=0.11.1",
+  "jaxtyping>=0.2.20",
+  "matplotlib>=3.8",
+  # The ceiling is substrax's: 0.1.7 declares numpy<2.6.0, so artifex admits the same releases.
+  "numpy<2.6.0,>=1.24",
+  # Below 0.2.8 optax calls jax.config.update("jax_pmap_shmap_merge") at import time and
+  # jax removed that option in 0.10, so importing optax -- which flax does -- raises
+  # AttributeError and takes out collection for the whole suite.
+  "optax>=0.2.8",
+  "orbax-checkpoint>=0.11.33",
+  "pyasn1>=0.6.4",
+  "pydantic>=2",
+  "requests>=2.33.0",
+  "python-dotenv>=1.1",
+  "scikit-learn>=1.6.1",
+  "scipy>=1.12.1",
+  # Device identity, meshes, SPMD helpers, checkpoint store, callbacks and trackers
+  # shared across the Avitai libraries.
+  "substrax==0.1.33",
+  "tqdm>=4.67",
+  "psutil>=5.9.5",
+  "typing_extensions>=4.5"
+]
+description = "Generative modeling for JAX/Flax NNX: VAEs, GANs, diffusion, normalizing flows, energy-based, autoregressive and geometric models across image, text, audio, molecular, protein, tabular and time-series modalities, with a shared Trainer and evaluation through calibrax"
+keywords = [
+  "deep-learning",
+  "flax",
+  "generative-models",
+  "jax"
+]
+license = {file = "LICENSE"}
+name = "avitai-artifex"
+readme = "README.md"
+requires-python = ">=3.12"
+version = "0.1.15"
+
+[project.optional-dependencies]
+# Platform-specific installation:
+# - Linux with GPU: uv pip install "avitai-artifex[cuda12]"
+# - macOS (Apple Silicon): uv pip install avitai-artifex[all-macos]
+# - macOS/Linux CPU-only: uv pip install avitai-artifex[all-cpu]
+all = [
+  "avitai-artifex[cuda-dev,docs]"
+]
+all-cpu = [
+  # CPU-only installation (no GPU acceleration)
+  # Use this for macOS or Linux without CUDA
+  "avitai-artifex[dev,docs,test]"
+]
+all-macos = [
+  # macOS with Metal acceleration (Apple Silicon M1/M2/M3+)
+  "avitai-artifex[dev,docs,metal,test]"
+]
+analysis = [
+  # artifex.generative_models.utils.code_analysis renders import graphs with graphviz.
+  "graphviz>=0.20"
+]
+benchmarks = [
+  # Only artifex.benchmarks needs these. datasets and huggingface-hub are imported lazily;
+  # the mesh datasets and the benchmark CLI import trimesh and typer at module level.
+  "avitai-artifex[cli,geometric]",
+  "datasets>=2.14.0",
+  "huggingface-hub>=0.25.0"
+]
+cli = [
+  # The `artifex` console script and the benchmark runner are Typer applications.
+  "typer>=0.7"
+]
+cuda-dev = [
+  # Complete Linux CUDA development environment
+  "avitai-artifex[dev,test,cuda12]"
+]
+cuda12 = [
+  # Linux CUDA runtime managed through the official JAX extra.
+  # jax, jaxlib and the NVIDIA wheels are pinned together because this extra exists to freeze
+  # one validated stack, not to set a floor. Loosening any single line breaks that guarantee.
+  #
+  # These pins are not confined to GPU installs. uv resolves ONE universal lockfile across
+  # every extra, so the jax named here is the jax that dev, test, docs and CI receive as
+  # well; while this said 0.9.1 the whole repository resolved jax 0.9.1, flax 0.12.3 and
+  # optax 0.2.6 no matter which extra was installed. Moving it moves everything.
+  #
+  # Validated 2026-08-28 on an RTX 4090 (sm_89, driver 595.84, CUDA 13.2): this stack installs
+  # through `./setup.sh --backend cuda12`, scripts/verify_gpu_setup.py reports the device, and
+  # 4143 generative-model and convolution tests pass on GPU in 775s. One pre-existing GPU-only
+  # failure remains and is not from this stack: test_flash_attention_compatibility.py::
+  # TestTransformations::test_jit_is_stable compares a jitted call against an eager one at
+  # atol=1e-6 and they differ by about 7e-6 on GPU; it fails identically on the previous jax.
+  #
+  # CI cannot re-check any of this. Every runner is GitHub-hosted with no GPU, this extra is
+  # installed by no workflow, and the GPU-only tests carry the `accelerator` marker, so they
+  # skip there. The pin is therefore held by manual validation alone: re-run the check above on
+  # comparable hardware before moving any version here, and record the new date.
+  "jax[cuda12]==0.11.1; sys_platform == 'linux'",
+  "jaxlib==0.11.1; sys_platform == 'linux'",
+  "nvidia-cublas-cu12==12.9.2.10; sys_platform == 'linux'",
+  "nvidia-cuda-cccl-cu12==12.9.27; sys_platform == 'linux'",
+  "nvidia-cuda-cupti-cu12==12.9.79; sys_platform == 'linux'",
+  "nvidia-cuda-nvcc-cu12==12.9.86; sys_platform == 'linux'",
+  "nvidia-cuda-nvrtc-cu12==12.9.86; sys_platform == 'linux'",
+  "nvidia-cuda-runtime-cu12==12.9.79; sys_platform == 'linux'",
+  "nvidia-cudnn-cu12==9.24.0.43; sys_platform == 'linux'",
+  "nvidia-cufft-cu12==11.4.1.4; sys_platform == 'linux'",
+  "nvidia-cusolver-cu12==11.7.5.82; sys_platform == 'linux'",
+  "nvidia-cusparse-cu12==12.5.10.65; sys_platform == 'linux'",
+  "nvidia-nccl-cu12==2.31.2; sys_platform == 'linux'",
+  "nvidia-nvjitlink-cu12==12.9.86; sys_platform == 'linux'",
+  "nvidia-nvshmem-cu12==3.7.2; sys_platform == 'linux'"
+]
+dev = [
+  "avitai-artifex[analysis]",
+  "build>=1.0.3",
+  "coverage>=7",
+  "bandit[toml]>=1.8.6",
+  "deadcode>=2.4",
+  "deptry>=0.23",
+  "flake8>=7.0",
+  "flake8-functions-names>=0.4",
+  "import-linter>=2.0",
+  "interrogate>=1.5",
+  "ipykernel>=6.29.5",
+  "jupyter>=1.1.1",
+  "jupytext>=1.16.6",
+  "nbconvert>=7.16.4",
+  "pydeps>=1.12.17",
+  "pyright>=1.1.336",
+  "pylint>=3.3",
+  "pytest>=8.3.5",
+  "pytest-asyncio>=0.23",
+  "pytest-benchmark>=4",
+  "pytest-cov>=6.1.1",
+  "pytest-env>=1.0.1",
+  "pytest-json-report>=1.5.0",
+  "pytest-randomly>=3.15",
+  "pytest-timeout>=2.1",
+  "pytest-xdist>=3.6",
+  "python-dotenv>=1",
+  "radon>=6.0",
+  "ruff>=0.1.5",
+  "tensorboard>=2.16",
+  "vulture>=2.14",
+  "wemake-python-styleguide>=1.0",
+  "twine>=4.0.2",
+  "xenon>=0.9.3",
+  "pydoclint>=0.9.1",
+  "detect-secrets>=1.5.0"
+]
+docs = [
+  "griffe>=1.7.3",
+  "hippogriffe>=0.2",
+  "mkdocs>=1.6.1,<2",
+  "mkdocs-include-exclude-files>=0.1",
+  "mkdocs-ipynb>=0.1",
+  "mkdocs-jupyter>=0.24",
+  "mkdocs-material>=9.6.7,<10",
+  "mkdocstrings>=0.28.3",
+  "mkdocstrings-python>=1.1.2",
+  "pymdown-extensions>=10.14.3"
+]
+geometric = [
+  # ShapeNet-style mesh datasets under artifex.benchmarks.datasets.
+  "trimesh>=3.30.1"
+]
+logging = [
+  "mlflow>=2",
+  "tensorboard>=2.16",
+  "wandb>=0.15"
+]
+metal = [
+  # Metal acceleration for Apple Silicon Macs (M1/M2/M3+)
+  # Provides GPU-like acceleration on macOS
+  "jax-metal>=0.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'"
+]
+test = [
+  # The tracker callback tests patch `wandb.init`, and patching an attribute imports the real
+  # module, so the suite needs the logging stack even though src/ imports it lazily. Declared
+  # here rather than in a workflow so `uv sync --extra test` is enough to run the tests
+  # anywhere, and so the macOS jobs get it through all-cpu/all-macos.
+  "avitai-artifex[analysis,cli,geometric]",
+  "avitai-artifex[logging]",
+  "beartype>=0.14.1",
+  "mock>=5.2",
+  "coverage>=7",
+  "hypothesis>=6.100",
+  "pytest>=8.3.5",
+  "pytest-asyncio>=0.23",
+  "pytest-benchmark>=4",
+  "pytest-cov>=6.1.1",
+  "pytest-env>=1.0.1",
+  "pytest-json-report>=1.5.0",
+  "pytest-split>=0.11",
+  "pytest-timeout>=2.1",
+  "pytest-xdist>=3.6",
+  # The substrax pytest plugin, fresh-interpreter helpers and NNX checks the suite runs on.
+  "substrax[testing]==0.1.33"
+]
+
+[project.scripts]
+artifex = "artifex.cli.__main__:main"
+
+[project.urls]
+repository = "https://github.com/avitai/artifex"
+
+[tool.artifex.ci]
+blocking_workflows = [
+  ".github/workflows/ci.yml",
+  ".github/workflows/build-verification.yml",
+  ".github/workflows/security.yml"
+]
+compatibility_python = ["3.12", "3.13"]
+informational_workflows = [
+  ".github/workflows/quality-checks.yml",
+  ".github/workflows/upstream-compat.yml"
+]
+pyright_enforcement = "blocking"
+smoke_exports = ["generative_models"]
+smoke_package = "artifex"
+tooling_python = "3.12"
+
+[tool.artifex.repo_standards]
+line_length = 100
+
+[tool.artifex.repo_standards.coverage]
+# The repo-wide floor stays honest about current enforcement while new work
+# is still expected to meet the stronger per-change target.
+new_code_target = 80
+project_fail_under = 80
+
+[tool.artifex.repo_standards.docs]
+development_strict = false
+main_strict = true
+rtd_fail_on_warning = true
+
+[tool.artifex.repo_standards.interpreter]
+docs = "3.12"
+minimum_supported = "3.12"
+tooling = "3.12"
+
+[tool.artifex.repo_standards.typing]
+pyright_mode = "standard"
+
+[tool.bandit]
+exclude_dirs = ["tests", "examples", "notebooks", "scripts"]
+skips = ["B101", "B404", "B603", "B607", "B110"]
+
+[tool.coverage.html]
+directory = "htmlcov"
+skip_covered = false
+skip_empty = false
+
+[tool.coverage.paths]
+source = [
+  "src",
+  "*/work/artifex/artifex/src"
+]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "def __repr__",
+  "if self.debug:",
+  "if settings.DEBUG",
+  "raise AssertionError",
+  "raise NotImplementedError",
+  "if 0:",
+  "if __name__ == .__main__.:",
+  "class .*\\bProtocol\\):",
+  "@(abc\\.)?abstractmethod",
+  "pass",
+  "raise ImportError"
+]
+# Canonical values live in [tool.artifex.repo_standards.coverage].
+fail_under = 80
+precision = 2
+show_missing = true
+skip_covered = false
+
+[tool.coverage.run]
+branch = true
+omit = [
+  "*/tests/*",
+  "*/conftest.py",
+  "*/__pycache__/*",
+  "*/scripts/*",
+  "*/examples/*",
+  "*/benchmark/*"
+]
+parallel = true
+relative_files = true
+source = ["src"]
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/artifex",
+  "README.md",
+  "LICENSE",
+  "pyproject.toml"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/artifex"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.importlinter]
+root_packages = ["artifex"]
+
+[[tool.importlinter.contracts]]
+forbidden_modules = ["artifex.generative_models.models"]
+name = "Core config must not import concrete models"
+source_modules = ["artifex.generative_models.core.configuration"]
+type = "forbidden"
+
+[[tool.importlinter.contracts]]
+forbidden_modules = ["artifex.generative_models.models"]
+name = "Backbone layers must not import concrete models"
+source_modules = ["artifex.generative_models.core.layers"]
+type = "forbidden"
+
+[tool.interrogate]
+exclude = ["tests", "scripts", "examples", "notebooks"]
+fail-under = 80
+ignore-init-method = true
+ignore-init-module = true
+ignore-magic = true
+
+[tool.pydoclint]
+allow-init-docstring = true
+arg-type-hints-in-docstring = false
+# Instance attributes are documented under Attributes per the Google style; pydoclint would
+# compare them with class-level attributes only.
+check-class-attributes = false
+# Annotations are the source of truth for types; docstrings carry the prose.
+check-return-types = false
+check-yield-types = false
+# `# noqa: DOC...` is read from the def line, where propagated exceptions are annotated.
+native-mode-noqa-location = "definition"
+skip-checking-short-docstrings = true
+style = "google"
+
+[tool.pyright]
+exclude = ["tests"]
+include = ["src"]
+# Canonical values live in [tool.artifex.repo_standards.interpreter] and
+# [tool.artifex.repo_standards.typing].
+pythonVersion = "3.12"
+reportFunctionMemberAccess = false
+reportIncompatibleMethodOverride = false
+reportIncompatibleVariableOverride = false # Incompatible with eqx.AbstractVar
+reportMissingImports = false
+reportMissingTypeStubs = false
+typeCheckingMode = "standard"
+
+[tool.pytest.ini_options]
+# Configuration with smart parallel execution and coverage
+# Note: -n auto removed to prevent GPU conflicts. Removed --maxfail=1 to run all tests
+# Canonical coverage values live in [tool.artifex.repo_standards.coverage].
+addopts = "--strict-markers --strict-config --verbose --tb=short --color=yes --durations=10 --disable-warnings --cov=src/artifex --cov-report=term-missing --cov-report=html --cov-fail-under=80 --timeout=300 --json-report --json-report-file=temp/test-results.json --json-report-indent=2"
+cache_dir = ".pytest_cache"
+# Additional settings
+console_output_style = "progress"
+filterwarnings = [
+  "ignore::DeprecationWarning:pkg_resources.*",
+  "ignore::DeprecationWarning:jax.*",
+  "ignore:jax.interpreters.xla.pytype_aval_mappings is deprecated:DeprecationWarning",
+  "ignore::pytest.PytestCollectionWarning:cannot collect test class 'TestFileAnalysis'",
+  "ignore::pytest.PytestCollectionWarning:cannot collect test class 'TestStructureAnalyzer'",
+  # CUDA-related warnings (automatically handled by conftest.py)
+  "ignore::UserWarning:jax._src.xla_bridge",
+  "ignore:.*cuSPARSE.*",
+  "ignore:.*CUDA-enabled jaxlib.*"
+]
+log_cli = true
+log_cli_level = "INFO"
+markers = [
+  "blackjax: marks tests that use BlackJAX integration",
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+  "integration: marks tests as integration tests",
+  "unit: marks tests as unit tests",
+  "e2e: marks tests as end-to-end tests",
+  "benchmark: marks tests as performance benchmarks (requires pytest-benchmark)",
+  "performance: marks tests as performance tests (alias for benchmark)",
+  "contract: marks tests as contract tests"
+]
+# Minimum version
+minversion = "6.0"
+python_classes = "Test*"
+python_files = "test_*.py"
+python_functions = "test_*"
+# Main pytest configuration
+testpaths = ["tests"]
+
+[tool.pytest-benchmark]
+compare = [
+  "last",
+  "base"
+]
+disable_gc = true
+histogram = "histogram.svg"
+min_rounds = 5
+min_time = 0.1
+save = "benchmark-results"
+save_data = true
+warmup = true
+warmup_iterations = 3
+
+[tool.pytest_env]
+JAX_ENABLE_X64 = "0"
+PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION = "python"
+TF_CPP_MIN_LOG_LEVEL = "1"
+XLA_CLIENT_MEM_FRACTION = "0.75"
+XLA_PYTHON_CLIENT_PREALLOCATE = {skip_if_set = true, value = "false"}
+
+[tool.ruff]
+extend-include = ["*.ipynb"]
+# Canonical value lives in [tool.artifex.repo_standards].
+line-length = 100
+src = []
+target-version = "py312"
+
+[tool.ruff.format]
+exclude = ["*.ipynb"]
+indent-style = "space"
+line-ending = "auto"
+quote-style = "double"
+skip-magic-trailing-comma = false
+
+[tool.ruff.lint]
+# Add W291, W292, W293 to fixable to handle whitespace issues
+fixable = ["I001", "F401", "E", "W", "W291", "W292", "W293", "F841", "UP006", "UP007", "UP035"]
+ignore = [
+  "E402", # Module level import not at top of file
+  "E721", # Do not compare types directly
+  "E731", # Do not assign a lambda expression, use a def (we can refactor these later)
+  "E741", # Ambiguous variable name
+  "F722", # Forward annotation syntax error
+  "W391", # Blank line at end of file
+  "E203", # Whitespace before ':'
+  # --- Documented exemptions from the adopted rule set (shared with datarax) ---
+  "ANN401", # `Any` is legitimate for JAX pytree leaves and dynamic data payloads
+  "TRY003", # inline exception messages are the established, readable style here
+  "TRY300", # return-in-`else` restructuring adds no safety to guard-heavy flow
+  "TRY004", # validation intentionally raises ValueError for structural incompatibility
+  "PLR2004" # magic-value comparisons pervade numeric/array/scientific code
+]
+# The shared rule set. C90 (mccabe, max-complexity 10) is active; files that carried
+# findings when the set was adopted are listed in the generated per-file-ignores table
+# below, which scripts/check_ruff_baseline.py keeps shrinking.
+select = [
+  "E",
+  "F",
+  "I",
+  "W",
+  "D",
+  "F841",
+  "UP006",
+  "UP007",
+  "UP035",
+  "BLE001",
+  "T201",
+  "ANN",
+  "ARG",
+  "B",
+  "C90",
+  "PLR",
+  "PTH",
+  "RET",
+  "TRY"
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+# Policy exemptions. The families ANN/ARG/B/C90/PLR/PTH/RET/TRY are enforced on the
+# library under src/; tests, examples, scripts, docs, deployment probes and notebooks
+# keep the correctness rules (E/F/I/W) and drop production-only strictness.
+"*.ipynb" = ["D", "F821", "F541", "T201", "UP006", "UP035", "BLE001", "ANN", "ARG", "B", "C90", "PLR", "PTH", "RET", "TRY"] # Notebooks are generated tutorial artifacts with markdown cells and cross-cell context
+"conftest.py" = ["ANN", "ARG", "B", "C90", "PLR", "PTH", "RET", "TRY"]
+"deploy/**/*.py" = ["T201", "BLE001", "ANN", "ARG", "B", "C90", "PLR", "PTH", "RET", "TRY"] # Remote GPU launchers and probes report to stdout and deliberately catch whatever a backend raises
+"docs/**/*.py" = ["D", "T201", "ANN", "ARG", "B", "C90", "PLR", "PTH", "RET", "TRY"] # Docs examples are tutorial sources; Ruff D is enforced on maintained src/ APIs
+"examples/**/*.py" = ["D", "T201", "BLE001", "ANN", "ARG", "B", "C90", "PLR", "PTH", "RET", "TRY"] # Examples are executable tutorials with user-facing output and demo error wrappers
+"scripts/**/*.py" = ["ANN", "ARG", "B", "C90", "PLR", "PTH", "RET", "TRY"] # Developer tooling; not shipped as library API
+"tests/**/*.py" = ["D", "E501", "T201", "BLE001", "ANN", "ARG", "B", "C90", "PLR", "PTH", "RET", "TRY"] # Tests allow readable fixture names, debugging output, broad assertion wrappers, and long fixtures
+"tests/*.py" = ["D", "E501", "T201", "BLE001", "ANN", "ARG", "B", "C90", "PLR", "PTH", "RET", "TRY"] # Tests allow readable fixture names, debugging output, broad assertion wrappers, and long fixtures
+"tests/artifex/generative_models/core/sampling/test_blackjax_samplers.py" = ["E501", "E402", "T201", "BLE001"] # BlackJAX tests use custom imports and debug-style assertions
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+extra-standard-library = ["typing_extensions"]
+known-first-party = ["artifex"]
+lines-after-imports = 2
+order-by-type = false
+
+[tool.ruff.lint.mccabe]
+# Rule 2 (SRP/KISS): cyclomatic complexity ceiling; matches the radon rank-B boundary
+# behind quality/complexity_baseline.json.
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+# Rendered by scripts/check_ruff_baseline.py from quality/ruff_baseline.json; regenerate with --write-baseline, never edit by hand.
+"src/artifex/benchmarks/__init__.py" = ["PLR0402"]
+"src/artifex/benchmarks/core/foundation.py" = ["ANN001", "ANN003", "ANN204", "B024", "B027"]
+"src/artifex/benchmarks/core/nnx.py" = ["ANN204", "PLR0402"]
+"src/artifex/benchmarks/core/runner.py" = ["ANN204"]
+"src/artifex/benchmarks/datasets/celeba.py" = ["ANN202", "ANN204", "C901", "PLR0912", "PLR0913", "PLR0915", "RET505"]
+"src/artifex/benchmarks/datasets/crossdocked.py" = ["ANN202", "ANN204"]
+"src/artifex/benchmarks/datasets/ffhq.py" = ["ANN202", "ANN204", "PLR0402", "PLR0913", "RET504"]
+"src/artifex/benchmarks/datasets/geometric.py" = ["ANN202", "ANN204", "ANN206", "B009", "PLR0402", "PTH123", "RET505", "TRY301", "TRY400"]
+"src/artifex/benchmarks/datasets/protein_dataset.py" = ["ANN202", "ARG002", "RET504"]
+"src/artifex/benchmarks/datasets/qm9.py" = ["ANN202", "ANN204", "B007"]
+"src/artifex/benchmarks/datasets/synthetic_datasets.py" = ["B007", "RET504"]
+"src/artifex/benchmarks/metrics/audio.py" = ["ANN001", "ANN003", "ANN202", "ANN204", "ARG002", "PLR0913", "RET504"]
+"src/artifex/benchmarks/metrics/core.py" = ["PLR0402", "PLR0913"]
+"src/artifex/benchmarks/metrics/disentanglement.py" = ["ANN204", "PLR0402", "PLR0913", "RET504"]
+"src/artifex/benchmarks/metrics/geometric.py" = ["ANN001", "ANN003", "ANN202", "ANN204", "ARG002", "PLR0402", "RET504"]
+"src/artifex/benchmarks/metrics/image.py" = ["ANN001", "ANN003", "ANN202", "ANN204", "ARG002", "PLR0402", "PLR0913", "RET504"]
+"src/artifex/benchmarks/metrics/molecular_flows.py" = ["ANN001", "ANN003", "ANN204", "ARG002", "PLR1714", "PLR5501", "RET505"]
+"src/artifex/benchmarks/metrics/precision_recall.py" = ["PLR0402", "PLR0913"]
+"src/artifex/benchmarks/metrics/protein_ligand.py" = ["ANN001", "ANN003", "ARG002"]
+"src/artifex/benchmarks/metrics/style_metrics.py" = ["ANN001", "ANN003", "ARG002", "B905", "PLR0402", "PLR0913", "RET504"]
+"src/artifex/benchmarks/metrics/text.py" = ["ANN001", "ANN003", "ANN204", "ARG002", "B905", "PLR0402", "PLR0913", "RET504", "RET505"]
+"src/artifex/benchmarks/model_adapters/generative.py" = ["PLR0402"]
+"src/artifex/benchmarks/model_adapters/protein_adapters.py" = ["C901", "PLR0402", "PLR0912"]
+"src/artifex/benchmarks/performance/latency.py" = ["PLR0913"]
+"src/artifex/benchmarks/performance/optimization.py" = ["C901", "PLR0402", "PLR0912", "PLR0913", "PLR0915"]
+"src/artifex/benchmarks/suites/geometric_suite.py" = ["ANN001", "ANN204", "RET504"]
+"src/artifex/benchmarks/suites/multi_beta_vae_suite.py" = ["ANN001", "ANN003", "ANN202", "ANN204", "ARG002", "B004"]
+"src/artifex/benchmarks/suites/protein_benchmarks.py" = ["ARG002", "B905", "C901", "RET505"]
+"src/artifex/benchmarks/suites/protein_ligand_suite.py" = ["ANN001", "ANN003", "ANN204"]
+"src/artifex/benchmarks/suites/se3_molecular_flows_suite.py" = ["ANN003", "ANN204", "ARG002", "B007", "C901", "RET504", "TRY400"]
+"src/artifex/benchmarks/suites/stylegan3_suite.py" = ["ANN201", "ANN204", "PLR0402"]
+"src/artifex/benchmarks/visualization/optimization_plots.py" = ["PLR0913"]
+"src/artifex/cli/config.py" = ["B008"]
+"src/artifex/configs/utils/config_loader.py" = ["C901", "PLR0911", "PLR0912", "PTH123"]
+"src/artifex/configs/utils/error_handling.py" = ["ANN204"]
+"src/artifex/data/protein/dataset.py" = ["PLR0402", "PTH123"]
+"src/artifex/generative_models/core/base.py" = ["ANN001", "ANN002", "ANN003", "ANN201", "ANN202", "ANN204", "PLR0913", "RET506"]
+"src/artifex/generative_models/core/cli/config_commands.py" = ["ANN001", "ANN201", "C901", "PLR0911", "PLR0912", "PTH123", "T201"]
+"src/artifex/generative_models/core/configuration/base_dataclass.py" = ["PTH123", "RET505"]
+"src/artifex/generative_models/core/configuration/distributed_config.py" = ["C901"]
+"src/artifex/generative_models/core/configuration/energy_config.py" = ["B007", "RET504"]
+"src/artifex/generative_models/core/configuration/gan_config.py" = ["C901", "PLR0912"]
+"src/artifex/generative_models/core/configuration/management/templates.py" = ["ANN204", "C901", "PLR0912", "TRY301"]
+"src/artifex/generative_models/core/configuration/management/versioning.py" = ["ANN204", "PTH103", "PTH123"]
+"src/artifex/generative_models/core/distributions/base.py" = ["ANN001", "ANN002", "ANN003", "ANN202", "ANN204", "ANN205", "B905", "C901"]
+"src/artifex/generative_models/core/distributions/continuous.py" = ["ANN204"]
+"src/artifex/generative_models/core/distributions/discrete.py" = ["ANN204", "RET505"]
+"src/artifex/generative_models/core/distributions/mixture.py" = ["ANN204", "B007", "B905"]
+"src/artifex/generative_models/core/distributions/transformations.py" = ["ANN204"]
+"src/artifex/generative_models/core/layers/attention_backend.py" = ["PLR0913"]
+"src/artifex/generative_models/core/layers/causal.py" = ["RET505"]
+"src/artifex/generative_models/core/layers/clifford/_functional.py" = ["PLR0913", "RET504"]
+"src/artifex/generative_models/core/layers/clifford/conv.py" = ["ARG002", "C901", "PLR0912", "PLR0913"]
+"src/artifex/generative_models/core/layers/clifford/linear.py" = ["ARG002", "RET504"]
+"src/artifex/generative_models/core/layers/clifford/norm.py" = ["ARG002", "PLR0913"]
+"src/artifex/generative_models/core/layers/clifford/spectral.py" = ["ANN001", "ANN202", "ARG002", "PLR0913", "PLR0915", "RET504"]
+"src/artifex/generative_models/core/layers/egnn.py" = ["PLR0913"]
+"src/artifex/generative_models/core/layers/flash_attention.py" = ["PLR0913"]
+"src/artifex/generative_models/core/layers/kan/_utils.py" = ["C901", "PLR0913", "PLR0915"]
+"src/artifex/generative_models/core/layers/kan/basis_layers.py" = ["ARG002", "B010", "PLR0913"]
+"src/artifex/generative_models/core/layers/kan/conv.py" = ["ARG002", "PLR0913", "RET504"]
+"src/artifex/generative_models/core/layers/kan/grids.py" = ["PLR0913"]
+"src/artifex/generative_models/core/layers/kan/spline.py" = ["ARG002", "PLR0913"]
+"src/artifex/generative_models/core/layers/positional.py" = ["ANN204", "B008"]
+"src/artifex/generative_models/core/layers/residual.py" = ["ANN003", "ANN204", "ARG002", "PLR0913", "RET505"]
+"src/artifex/generative_models/core/layers/resnet.py" = ["ANN003", "ANN204", "ARG002", "B008", "C901", "PLR0913", "RET504", "RET505"]
+"src/artifex/generative_models/core/layers/transformers.py" = ["ANN204", "ARG002", "B008", "PLR0913", "RET504"]
+"src/artifex/generative_models/core/losses/adversarial.py" = ["PLR0913"]
+"src/artifex/generative_models/core/losses/divergence.py" = ["ANN001", "ANN202", "PLR0913"]
+"src/artifex/generative_models/core/losses/geometric.py" = ["ANN003", "ANN204", "ARG001", "PLR0913", "RET505"]
+"src/artifex/generative_models/core/losses/perceptual.py" = ["ANN001", "ANN202", "ANN204", "B004", "B905", "C901", "PLR0912", "PLR0913"]
+"src/artifex/generative_models/core/losses/reconstruction.py" = ["PLR0913"]
+"src/artifex/generative_models/core/losses/regularization.py" = ["ANN001", "ANN202", "ANN204", "ARG001", "ARG002", "ARG005", "PLR0913", "PLR1714", "RET505"]
+"src/artifex/generative_models/core/losses/vae.py" = ["PLR0913"]
+"src/artifex/generative_models/core/noise_schedule.py" = ["ANN204", "ARG002"]
+"src/artifex/generative_models/core/protocols/metrics.py" = ["ANN002", "ANN003", "PLR0402"]
+"src/artifex/generative_models/core/sampling/blackjax_samplers.py" = ["ANN001", "ANN202", "ANN204", "C901", "PLR0913", "PLR5501"]
+"src/artifex/generative_models/core/sampling/diffusion.py" = ["ANN001", "ANN201", "ANN204", "PLR0913"]
+"src/artifex/generative_models/core/sampling/mcmc.py" = ["PLR0913"]
+"src/artifex/generative_models/core/sampling/ode.py" = ["PLR0913"]
+"src/artifex/generative_models/core/sampling/sde.py" = ["ANN002", "ARG001", "C901", "PLR0912", "PLR0913"]
+"src/artifex/generative_models/extensions/audio_processing/spectral.py" = ["ANN204", "ARG002", "RET504", "RET505"]
+"src/artifex/generative_models/extensions/audio_processing/temporal.py" = ["ANN204", "ARG002", "RET504", "RET505"]
+"src/artifex/generative_models/extensions/base/extensions.py" = ["ARG002", "PLR0911", "RET505"]
+"src/artifex/generative_models/extensions/chemical/constraints.py" = ["ANN202", "ANN204", "ARG002", "RET504", "RET505"]
+"src/artifex/generative_models/extensions/chemical/features.py" = ["ANN202", "ANN204", "ARG002", "RET504"]
+"src/artifex/generative_models/extensions/nlp/embeddings.py" = ["ANN204", "C901", "RET504"]
+"src/artifex/generative_models/extensions/nlp/tokenization.py" = ["ANN202", "ANN204", "C901", "PLR0912", "RET504", "RET505"]
+"src/artifex/generative_models/extensions/protein/backbone.py" = ["ARG002", "RET504"]
+"src/artifex/generative_models/extensions/protein/constraints.py" = ["ANN001", "ANN003", "ANN202", "ANN204", "ARG002", "C901", "PLR0915", "RET504", "RET505"]
+"src/artifex/generative_models/extensions/protein/mixin.py" = ["ARG002", "RET504", "RET505"]
+"src/artifex/generative_models/extensions/registry.py" = ["ANN201", "ANN202", "ANN204", "PLR0913"]
+"src/artifex/generative_models/extensions/vision/augmentation.py" = ["ANN204", "ARG002", "RET504"]
+"src/artifex/generative_models/factory/builders/autoregressive.py" = ["RET505"]
+"src/artifex/generative_models/factory/builders/diffusion.py" = ["RET505"]
+"src/artifex/generative_models/factory/builders/ebm.py" = ["RET505"]
+"src/artifex/generative_models/factory/builders/flow.py" = ["RET505"]
+"src/artifex/generative_models/factory/builders/gan.py" = ["RET505"]
+"src/artifex/generative_models/factory/builders/geometric.py" = ["RET505"]
+"src/artifex/generative_models/factory/builders/vae.py" = ["RET505"]
+"src/artifex/generative_models/factory/core.py" = ["ANN003", "ANN202", "ANN204", "PLR0911"]
+"src/artifex/generative_models/factory/registry.py" = ["ANN003"]
+"src/artifex/generative_models/inference/optimization/production.py" = ["ARG002", "B004", "PLR0402"]
+"src/artifex/generative_models/modalities/audio/base.py" = ["ANN003", "ANN204", "ARG002", "RET505"]
+"src/artifex/generative_models/modalities/audio/datasets.py" = ["RET505"]
+"src/artifex/generative_models/modalities/audio/evaluation.py" = ["ANN204"]
+"src/artifex/generative_models/modalities/audio/representations.py" = ["ANN001", "ANN202", "ANN204", "ARG002", "RET504", "RET505"]
+"src/artifex/generative_models/modalities/base.py" = ["ANN003", "ANN201", "ANN202", "ANN204", "ARG002", "B905"]
+"src/artifex/generative_models/modalities/image/adapters.py" = ["ANN003", "ANN204", "ARG002"]
+"src/artifex/generative_models/modalities/image/base.py" = ["ANN003", "ANN204", "ARG002", "RET505"]
+"src/artifex/generative_models/modalities/image/datasets.py" = ["RET505"]
+"src/artifex/generative_models/modalities/image/evaluation.py" = ["ANN204", "ARG002"]
+"src/artifex/generative_models/modalities/image/representations.py" = ["ANN001", "ANN202", "ANN204", "B905", "PLR0913", "RET504", "RET505"]
+"src/artifex/generative_models/modalities/molecular/adapters.py" = ["ANN001", "ANN204", "ARG002"]
+"src/artifex/generative_models/modalities/molecular/modality.py" = ["ARG002"]
+"src/artifex/generative_models/modalities/multi_modal/adapters.py" = ["ANN003", "ANN202", "ANN204", "ARG002", "C901", "PLR0912", "RET505"]
+"src/artifex/generative_models/modalities/multi_modal/base.py" = ["ANN202", "ANN204", "ARG002", "RET505"]
+"src/artifex/generative_models/modalities/multi_modal/datasets.py" = ["ARG001", "PLR0913", "RET504"]
+"src/artifex/generative_models/modalities/multi_modal/evaluation.py" = ["ANN003", "ANN202", "ANN204", "ARG002", "C901", "PLR0912", "PLR0915", "RET505"]
+"src/artifex/generative_models/modalities/multi_modal/representations.py" = ["ANN204", "B905", "PLR0913", "RET504", "RET505"]
+"src/artifex/generative_models/modalities/protein/adapters.py" = ["ARG002"]
+"src/artifex/generative_models/modalities/protein/config.py" = ["RET505"]
+"src/artifex/generative_models/modalities/protein/losses.py" = ["RET504"]
+"src/artifex/generative_models/modalities/protein/modality.py" = ["ANN003", "PLR1714", "RET505"]
+"src/artifex/generative_models/modalities/protein/utils.py" = ["PLR0911", "RET505"]
+"src/artifex/generative_models/modalities/registry.py" = ["ANN003"]
+"src/artifex/generative_models/modalities/tabular/base.py" = ["ANN204"]
+"src/artifex/generative_models/modalities/tabular/datasets.py" = ["ARG001", "C901", "PLR0913"]
+"src/artifex/generative_models/modalities/tabular/evaluation.py" = ["ANN003", "ANN204", "ARG002", "RET504"]
+"src/artifex/generative_models/modalities/tabular/representations.py" = ["ANN204", "ARG002", "RET505"]
+"src/artifex/generative_models/modalities/text/base.py" = ["ANN003", "ANN204", "ARG002", "PLR0913", "RET504", "RET507"]
+"src/artifex/generative_models/modalities/text/datasets.py" = ["PLR0913", "RET505"]
+"src/artifex/generative_models/modalities/text/evaluation.py" = ["ANN204", "RET504", "RET505"]
+"src/artifex/generative_models/modalities/text/representations.py" = ["ANN003", "ANN202", "ANN204", "B007", "PLR5501", "RET505", "RET507"]
+"src/artifex/generative_models/modalities/timeseries/adapters.py" = ["ANN204", "ARG002", "B010"]
+"src/artifex/generative_models/modalities/timeseries/base.py" = ["ANN204", "ARG002", "BLE001", "C901", "PLR0911", "PLR0912", "RET504"]
+"src/artifex/generative_models/modalities/timeseries/datasets.py" = ["PLR0913"]
+"src/artifex/generative_models/modalities/timeseries/evaluation.py" = ["ANN003", "ANN204", "ARG002", "RET504", "RET505"]
+"src/artifex/generative_models/modalities/timeseries/representations.py" = ["ANN003", "ANN204", "ARG002", "RET504", "RET505"]
+"src/artifex/generative_models/models/audio/base.py" = ["ANN003", "ANN204", "ARG002", "RET504", "RET505"]
+"src/artifex/generative_models/models/audio/diffusion.py" = ["ANN204", "ARG002", "PLR0913"]
+"src/artifex/generative_models/models/audio/wavenet.py" = ["ANN003", "ANN204", "ARG002", "RET504"]
+"src/artifex/generative_models/models/autoregressive/base.py" = ["ARG002", "PLR0913", "RET504"]
+"src/artifex/generative_models/models/autoregressive/pixel_cnn.py" = ["ANN003", "ANN204", "ARG002", "RET504"]
+"src/artifex/generative_models/models/autoregressive/transformer.py" = ["ANN002", "ANN003", "ANN204", "ARG002", "C901", "PLR0912", "PLR0913", "RET504"]
+"src/artifex/generative_models/models/autoregressive/wavenet.py" = ["ANN003", "ANN204", "ARG002", "B007", "RET504"]
+"src/artifex/generative_models/models/backbones/dit.py" = ["ANN204", "PLR0913", "RET504"]
+"src/artifex/generative_models/models/backbones/unet.py" = ["ANN003", "ANN204", "B905", "RET504"]
+"src/artifex/generative_models/models/backbones/unet_1d.py" = ["ANN204", "ARG002", "B905", "RET504"]
+"src/artifex/generative_models/models/backbones/unet_cross_attention.py" = ["ANN003", "ANN204", "B905", "PLR0913", "RET504"]
+"src/artifex/generative_models/models/base.py" = ["ANN003"]
+"src/artifex/generative_models/models/diffusion/base.py" = ["ANN204", "RET504", "RET505"]
+"src/artifex/generative_models/models/diffusion/clip_text_encoder.py" = ["ANN204", "PLR0913"]
+"src/artifex/generative_models/models/diffusion/ddim.py" = ["ANN204", "PLR0913", "RET504", "RET505"]
+"src/artifex/generative_models/models/diffusion/ddpm.py" = ["ANN204", "PLR0913", "RET504", "RET505"]
+"src/artifex/generative_models/models/diffusion/dit.py" = ["ANN204", "PLR0913"]
+"src/artifex/generative_models/models/diffusion/guidance.py" = ["ANN001", "ANN003", "ANN204", "B004", "B009", "RET504", "RET505"]
+"src/artifex/generative_models/models/diffusion/latent.py" = ["ANN201", "ANN204", "C901", "PLR5501", "RET505"]
+"src/artifex/generative_models/models/diffusion/score.py" = ["ANN204", "RET505"]
+"src/artifex/generative_models/models/diffusion/stable_diffusion.py" = ["ANN204", "RET504"]
+"src/artifex/generative_models/models/diffusion/stable_diffusion_pipeline.py" = ["ANN201", "ANN204", "PLR0913", "RET504"]
+"src/artifex/generative_models/models/energy/base.py" = ["ANN001", "ANN003", "ANN202", "ANN204", "ARG002", "PLR0913", "RET504"]
+"src/artifex/generative_models/models/energy/ebm.py" = ["ARG002", "PLR0913", "RET504"]
+"src/artifex/generative_models/models/energy/mcmc.py" = ["ANN204", "PLR0913"]
+"src/artifex/generative_models/models/flow/base.py" = ["ANN003", "ANN204", "ARG002", "C901", "RET504"]
+"src/artifex/generative_models/models/flow/conditional.py" = ["ANN001", "ANN003", "ARG002"]
+"src/artifex/generative_models/models/flow/glow.py" = ["ANN003", "ANN202", "ANN204", "ARG002"]
+"src/artifex/generative_models/models/flow/iaf.py" = ["ANN002", "ANN003", "ANN204", "ARG002"]
+"src/artifex/generative_models/models/flow/made.py" = ["ANN003", "ANN202", "ANN204", "ARG002", "PLR0913"]
+"src/artifex/generative_models/models/flow/maf.py" = ["ANN002", "ANN003", "ANN204", "ARG002"]
+"src/artifex/generative_models/models/flow/neural_spline.py" = ["ANN204", "ARG002", "PLR0913", "RET504"]
+"src/artifex/generative_models/models/flow/real_nvp.py" = ["ANN003", "ANN201", "ANN202", "ANN204", "ARG002"]
+"src/artifex/generative_models/models/flow/se3_molecular.py" = ["ANN003", "ANN204", "ARG002", "PLR0913", "RET504"]
+"src/artifex/generative_models/models/gan/base.py" = ["ANN204", "ARG002"]
+"src/artifex/generative_models/models/gan/conditional.py" = ["ANN204", "ARG002", "B007", "PLR0402", "RET504"]
+"src/artifex/generative_models/models/gan/cyclegan.py" = ["ANN003", "ANN204", "ARG002", "B007", "B905", "C901", "PLR0402", "PLR0915", "RET504", "RET505"]
+"src/artifex/generative_models/models/gan/dcgan.py" = ["ANN204", "PLR0402", "RET504"]
+"src/artifex/generative_models/models/gan/lsgan.py" = ["ANN202", "ANN204", "PLR0402", "RET504", "RET505"]
+"src/artifex/generative_models/models/gan/patchgan.py" = ["ANN204"]
+"src/artifex/generative_models/models/gan/stylegan3.py" = ["ANN003", "ANN204", "B007", "PLR0402", "RET504"]
+"src/artifex/generative_models/models/gan/wgan.py" = ["ANN001", "ANN202", "ANN204", "ARG002", "PLR0402", "RET504"]
+"src/artifex/generative_models/models/geometric/base.py" = ["ANN003", "ANN204"]
+"src/artifex/generative_models/models/geometric/graph.py" = ["ANN003", "ANN204", "B009", "C901", "PLR0912", "RET504"]
+"src/artifex/generative_models/models/geometric/mesh.py" = ["ANN001", "ANN003", "ANN202", "ANN204", "ARG002", "PLR5501"]
+"src/artifex/generative_models/models/geometric/point_cloud.py" = ["ANN003", "ANN204", "ARG002", "B007", "C901", "PLR0912", "PLR0915", "RET504", "TRY400"]
+"src/artifex/generative_models/models/geometric/protein_graph.py" = ["ANN003", "ANN204", "B007", "RET504"]
+"src/artifex/generative_models/models/geometric/protein_point_cloud.py" = ["ANN204", "ARG002", "B007", "C901", "RET504"]
+"src/artifex/generative_models/models/geometric/voxel.py" = ["ANN001", "ANN003", "ANN204", "ARG002", "B007", "B905"]
+"src/artifex/generative_models/models/vae/base.py" = ["ARG002", "RET505"]
+"src/artifex/generative_models/models/vae/conditional.py" = ["ANN003", "ANN204", "ARG002", "RET505"]
+"src/artifex/generative_models/models/vae/decoders.py" = ["ANN001", "ANN204", "RET504"]
+"src/artifex/generative_models/models/vae/encoders.py" = ["ANN001", "ANN204", "ARG002", "C901"]
+"src/artifex/generative_models/models/vae/spatial_autoencoder.py" = ["ANN001", "ANN204", "RET504"]
+"src/artifex/generative_models/models/vae/vq_vae.py" = ["ANN003", "ANN204", "ARG002", "RET504", "RET505"]
+"src/artifex/generative_models/training/callbacks/logging.py" = ["ANN204"]
+"src/artifex/generative_models/training/callbacks/profiling.py" = ["PTH123"]
+"src/artifex/generative_models/training/loops/staged.py" = ["PLR0913"]
+"src/artifex/generative_models/training/loops/streaming.py" = ["PLR0913"]
+"src/artifex/generative_models/training/rl/dpo.py" = ["ANN201", "PLR0913"]
+"src/artifex/generative_models/training/rl/grpo.py" = ["ANN201", "PLR0913"]
+"src/artifex/generative_models/training/rl/ppo.py" = ["ANN001", "ANN201", "ANN202"]
+"src/artifex/generative_models/training/rl/reinforce.py" = ["ANN201"]
+"src/artifex/generative_models/training/rl/rewards.py" = ["B905", "RET505"]
+"src/artifex/generative_models/training/rl/types.py" = ["PLR0913"]
+"src/artifex/generative_models/training/schedulers/factory.py" = ["ANN001", "ANN202", "C901", "PLR0911", "PLR0912", "PLR1714", "RET505"]
+"src/artifex/generative_models/training/trainer.py" = ["ANN204", "B004", "C901", "PLR0912", "PLR0913"]
+"src/artifex/generative_models/training/trainers/autoregressive_trainer.py" = ["PLR0913"]
+"src/artifex/generative_models/training/trainers/energy_trainer.py" = ["PLR0913", "RET504"]
+"src/artifex/generative_models/training/trainers/gan_trainer.py" = ["PLR0913"]
+"src/artifex/generative_models/utils/code_analysis/dependency_analyzer.py" = ["ANN204", "C901", "PLR0912", "PTH123", "PTH201"]
+"src/artifex/generative_models/utils/code_analysis/test_structure_analyzer.py" = ["ANN204", "C901", "PLR0912", "PTH123"]
+"src/artifex/generative_models/utils/logging/metrics.py" = ["ANN003", "ANN204", "BLE001", "C901", "RET505", "TRY400"]
+"src/artifex/visualization/protein_viz.py" = ["ANN205", "B028", "B905", "C901", "PLR0913", "PTH123"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.uv]
+python-preference = "only-managed"

@@ -1,20 +1,20 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/rcsb/foldmatch
-- 快照日期: 2026-11-18
-- 快照 commit: [`554acacace93`](https://github.com/rcsb/foldmatch/commit/554acacace931d8a8278b3869209b2169258e124)
+- 快照日期: 2026-11-22
+- 快照 commit: [`912624e19af0`](https://github.com/rcsb/foldmatch/commit/912624e19af0304a3635f71201e1c50d8c7054ca)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (147 个文件, 3.7 MB)
+## 保留 (151 个文件, 4.1 MB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|
-| 源码 | 139 | 3.1 MB |
-| 构建/配置 | 5 | 478.2 KB |
-| 文档 | 2 | 109.9 KB |
-| README | 1 | 38.3 KB |
+| 源码 | 143 | 3.4 MB |
+| 构建/配置 | 5 | 478.5 KB |
+| 文档 | 2 | 128.4 KB |
+| README | 1 | 50.0 KB |
 
-按后缀: `.py` 135 (3.1 MB)、`.lock` 1 (462.1 KB)、`.md` 3 (148.2 KB)、`.c` 2 (46.9 KB)、`.h` 2 (21.0 KB)、`.yaml` 2 (11.9 KB)、`Dockerfile` 1 (2.6 KB)、`pyproject.toml` 1 (1.7 KB)
+按后缀: `.py` 139 (3.4 MB)、`.lock` 1 (462.1 KB)、`.md` 3 (178.5 KB)、`.c` 2 (46.9 KB)、`.h` 2 (21.0 KB)、`.yaml` 2 (11.9 KB)、`Dockerfile` 1 (2.6 KB)、`pyproject.toml` 1 (2.0 KB)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

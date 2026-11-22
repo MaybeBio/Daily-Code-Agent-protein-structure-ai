@@ -1,0 +1,1779 @@
+# T0.4 shipped no rows. Each stage task appends its own [[branch]] entries.
+#
+# For a sidecar-backed vehicle the row `id` MUST equal the mutant name:
+# _coverage.py:427 collects sidecar_ids[slug] from the `id` field, and :309
+# requires that set to equal _argv_mutants(run.argv). So a row whose id differs
+# from the mutant it names silently fails step 1c with no other symptom.
+#
+# A row only grades once its vehicle has a run that is outcome == 'pass',
+# status 'completed', NOT git_dirty, at a commit that is an ancestor of HEAD and
+# does not touch scoped paths, whose sidecar_sha256 still matches the sidecar on
+# disk, and whose --output-paths include /<slug>/<git sha8>/branch_controls.json.
+
+[[branch]]
+family = "laser"
+id = "reversed_order"
+stage = "B5b"
+fixture = "laser_decode_e2e_examples"
+mutant = "reversed_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_decode_e2e"
+
+[[branch]]
+family = "laser"
+id = "chi_bin_plus_one"
+stage = "B5b"
+fixture = "laser_decode_e2e_examples"
+mutant = "chi_bin_plus_one"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_decode_e2e"
+
+[[branch]]
+family = "laser"
+id = "offset_zero"
+stage = "B5b"
+fixture = "laser_decode_e2e_examples"
+mutant = "offset_zero"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_decode_e2e"
+
+[[branch]]
+family = "laser"
+id = "chi2_equals_chi1"
+stage = "B5b"
+fixture = "laser_decode_e2e_examples"
+mutant = "chi2_equals_chi1"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_decode_e2e"
+
+[[branch]]
+family = "laser"
+id = "lambda_on_logits"
+stage = "B5b"
+fixture = "laser_decode_e2e_examples"
+mutant = "lambda_on_logits"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_decode_e2e"
+
+[[branch]]
+family = "potts"
+id = "ar_mask_present_chain_m_pos"
+stage = "A5"
+fixture = "potts_example_pdbs"
+mutant = "ar_mask_present_chain_m_pos"
+[branch.vehicle]
+kind = "sidecar"
+slug = "potts_ar_decode"
+
+[[branch]]
+family = "potts"
+id = "permute_etab_out_rows"
+stage = "A5"
+fixture = "potts_example_pdbs"
+mutant = "permute_etab_out_rows"
+[branch.vehicle]
+kind = "sidecar"
+slug = "potts_energy_parity"
+
+# B7 laser_proofread_parity. FOUR rows, the four negative controls.
+# scalar_both_off is the POSITIVE control and deliberately has no row here:
+# every row above must report "failed" (_coverage.py:328) and a positive
+# control must pass. It must also stay out of the graded run's --mutants,
+# because :309 compares the raw argv string to exactly this set of ids.
+
+[[branch]]
+family = "laser"
+id = "reduction_swap"
+stage = "B7"
+fixture = "laser_proofread_examples"
+mutant = "reduction_swap"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_proofread_parity"
+
+[[branch]]
+family = "laser"
+id = "ddof_0"
+stage = "B7"
+fixture = "laser_proofread_examples"
+mutant = "ddof_0"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_proofread_parity"
+
+[[branch]]
+family = "laser"
+id = "scalar_off"
+stage = "B7"
+fixture = "laser_proofread_examples"
+mutant = "scalar_off"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_proofread_parity"
+
+[[branch]]
+family = "laser"
+id = "vector_on"
+stage = "B7"
+fixture = "laser_proofread_examples"
+mutant = "vector_on"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_proofread_parity"
+
+# B7 laser_proofread_unconditional_parity. THREE rows, the three negative
+# controls. unc_both_off is the POSITIVE control and deliberately has no row
+# here: every row must report "failed" (_coverage.py:328) and a positive
+# control must pass. It must also stay out of the graded run's --mutants,
+# because :309 compares the raw argv string to exactly this set of ids.
+
+[[branch]]
+family = "laser"
+id = "unc_no_dropout"
+stage = "B7"
+fixture = "laser_proofread_examples"
+mutant = "unc_no_dropout"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_proofread_unconditional_parity"
+
+[[branch]]
+family = "laser"
+id = "unc_scalar_off"
+stage = "B7"
+fixture = "laser_proofread_examples"
+mutant = "unc_scalar_off"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_proofread_unconditional_parity"
+
+[[branch]]
+family = "laser"
+id = "unc_vector_on"
+stage = "B7"
+fixture = "laser_proofread_examples"
+mutant = "unc_vector_on"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_proofread_unconditional_parity"
+
+# A6 potts_ar_refine_exact. Three rows. ar_mask_present_chain_m_pos is also a
+# potts_ar_decode mutant, but the id lives under this slug's own set: :427
+# keys sidecar_ids by slug, so the same mutant name under two slugs is two
+# independent rows and each slug's --mutants must match its own set.
+
+[[branch]]
+family = "potts"
+id = "ar_mask_present_chain_m_pos"
+stage = "A6"
+fixture = "potts_example_pdbs"
+mutant = "ar_mask_present_chain_m_pos"
+[branch.vehicle]
+kind = "sidecar"
+slug = "potts_ar_refine_exact"
+
+[[branch]]
+family = "potts"
+id = "wrong_partition_sign"
+stage = "A6"
+fixture = "potts_ar_refine_examples"
+mutant = "wrong_partition_sign"
+[branch.vehicle]
+kind = "sidecar"
+slug = "potts_ar_refine_exact"
+
+[[branch]]
+family = "potts"
+id = "ntoc_refine_order"
+stage = "A6"
+fixture = "potts_ar_refine_examples"
+mutant = "ntoc_refine_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "potts_ar_refine_exact"
+
+# B4 laser_score_parity. This vehicle was built, pre-registered and run to a
+# clean pass with its control firing (run at f11f2bf1: clean "pass",
+# permute_decoder_layer "failed") and then never listed here, so the gate did
+# not require it. Listed now; it needs a re-run at the frozen tree because the
+# f11f2bf1 controls carry an absolute weights key (trap 3).
+
+[[branch]]
+family = "laser"
+id = "permute_decoder_layer"
+stage = "B4"
+fixture = "laser_score_examples"
+mutant = "permute_decoder_layer"
+[branch.vehicle]
+kind = "sidecar"
+slug = "laser_score_parity"
+
+# A6 potts_ddg_megascale. Listed 261002, after being run for the first time:
+# run 90f945fc-49fc-4474-af22-124f817188db at e3bc540e, outcome pass, 202804
+# rows across 371 per-PDB resumable units per arm, finished in ~25 minutes.
+#
+#   clean                      pass  max_abs_delta 1.2207e-4   (band <= 5e-4)
+#   skip_transpose_merge_pair  fail  max_abs_delta 11.6458     (fail above 5e-3)
+#
+# The control misses by more than three orders of magnitude above its own fail
+# threshold, against a clean arm four times inside the pass band, so the vehicle
+# separates by a wide margin on the largest fixture in the sprint.
+#
+# The note that used to sit here said to run it before listing it, because
+# listing a vehicle nobody had exercised would make the gate red on it. That has
+# now happened in the stated order.
+
+[[branch]]
+family = "potts"
+id = "skip_transpose_merge_pair"
+stage = "A6"
+fixture = "megascale_test_subset"
+mutant = "skip_transpose_merge_pair"
+[branch.vehicle]
+kind = "sidecar"
+slug = "potts_ddg_megascale"
+
+# STILL UNLISTED, deliberately, one spec-listed sidecar vehicle:
+#
+#   potts_refine         clean arm FAILS at match 0.9539 (debt #2417, P1), and
+#                        it sits in the spec's WAVE table rather than the
+#                        sidecar table, so whether it owes a row here is a
+#                        genuine question rather than an oversight. Its control
+#                        unmasked_x_logit returns a result bit-identical to the
+#                        clean arm, which is ambiguous while clean is failing
+#                        (see #2370) -- it can mean the control is inert OR
+#                        that one defect swamps both. Resolve #2417 first.
+
+# P10 protonpotts_parity (spec 261007 section 50). 98 rows: every negative control of the thirteen ProtonPottsMPNN waves, named
+# <wave>.<control>. Each must report 'failed'. The ids are the --mutants string launch_wave.sh passes, by exact equality.
+
+[[branch]]
+family = "protonpotts"
+id = "features.backbone_threshold_0_5"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "features.backbone_threshold_0_5"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "features.atom_threshold_just_below_half"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "features.atom_threshold_just_below_half"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "features.backbone_without_o"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "features.backbone_without_o"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "features.no_arginine_fix"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "features.no_arginine_fix"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "features.no_keep_last_by_number"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "features.no_keep_last_by_number"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "features.atom_threshold_0_8"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "features.atom_threshold_0_8"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "features.r_idx_last_plus_one"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "features.r_idx_last_plus_one"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "features.s_first_token_changed"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "features.s_first_token_changed"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "features.chain_labels_inverted"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "features.chain_labels_inverted"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "features.x_m_first_atom_flipped"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "features.x_m_first_atom_flipped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "features.x_nudged_by_1e-4"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "features.x_nudged_by_1e-4"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "encoder.pair_order_not_permuted"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "encoder.pair_order_not_permuted"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "encoder.pair_order_inverse_permutation"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "encoder.pair_order_inverse_permutation"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "encoder.token_order_not_permuted"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "encoder.token_order_not_permuted"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "encoder.etab_not_permuted"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "encoder.etab_not_permuted"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "encoder.etab_first_axis_only"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "encoder.etab_first_axis_only"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "encoder.output_nudged_1e-6_f64"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "encoder.output_nudged_1e-6_f64"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "encoder.output_nudged_4x_band_f32"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "encoder.output_nudged_4x_band_f32"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "energy.double_merge"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "energy.double_merge"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "energy.no_merge"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "energy.no_merge"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "energy.merge_without_transpose"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "energy.merge_without_transpose"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "energy.upstream_token_order"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "energy.upstream_token_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "energy.energy_halved"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "energy.energy_halved"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "energy.energy_nudged_just_outside_f64"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "energy.energy_nudged_just_outside_f64"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "energy.energy_nudged_4x_band_f32"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "energy.energy_nudged_4x_band_f32"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "driver.token_names_in_upstream_order"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "driver.token_names_in_upstream_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "driver.candidate_rows_reversed"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "driver.candidate_rows_reversed"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "driver.energy_nudged_4x_band"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "driver.energy_nudged_4x_band"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_block.uniforms_shifted_by_one"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_block.uniforms_shifted_by_one"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_block.combined_lambda_0p4"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_block.combined_lambda_0p4"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_block.block_size_2"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_block.block_size_2"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_block.forbidden_tokens_not_applied"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_block.forbidden_tokens_not_applied"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_block.repetitive_window_off"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_block.repetitive_window_off"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_block.wrong_contrast_token"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_block.wrong_contrast_token"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_block.zscale_nudged_outside_f64"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_block.zscale_nudged_outside_f64"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_block.energy_nudged_outside_f64"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_block.energy_nudged_outside_f64"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_greedy.uniforms_shifted_by_one"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_greedy.uniforms_shifted_by_one"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_greedy.block_size_2"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_greedy.block_size_2"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_greedy.forbidden_tokens_not_applied"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_greedy.forbidden_tokens_not_applied"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_greedy.repetitive_window_off"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_greedy.repetitive_window_off"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_greedy.cdf_in_aminx_token_order"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_greedy.cdf_in_aminx_token_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_greedy.energy_nudged_outside_f64"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_greedy.energy_nudged_outside_f64"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_driver.combined_lambda_0p6"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_driver.combined_lambda_0p6"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_driver.block_size_2"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_driver.block_size_2"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_driver.forbidden_tokens_reduced_to_unk"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_driver.forbidden_tokens_reduced_to_unk"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_driver.repetitive_window_off"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_driver.repetitive_window_off"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_driver.wrong_contrast_token"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_driver.wrong_contrast_token"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "decoder.bias_ignored"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "decoder.bias_ignored"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "decoder.scalar_temperature"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "decoder.scalar_temperature"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "decoder.x_not_zeroed"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "decoder.x_not_zeroed"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "decoder.fixed_treated_as_designed"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "decoder.fixed_treated_as_designed"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "decoder.token_order_upstream"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "decoder.token_order_upstream"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "decoder.cms_uses_conditional_mask"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "decoder.cms_uses_conditional_mask"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "decoder.uniforms_shifted_one_step"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "decoder.uniforms_shifted_one_step"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "decoder.cdf_in_aminx_order"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "decoder.cdf_in_aminx_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "decoder.nudged_4x_band"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "decoder.nudged_4x_band"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ddg.ddg_sign_flipped"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ddg.ddg_sign_flipped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ddg.token_names_in_upstream_order"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ddg.token_names_in_upstream_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ddg.mutant_rows_reversed"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ddg.mutant_rows_reversed"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ddg.energies_without_reference_subtracted"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ddg.energies_without_reference_subtracted"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ddg.ddg_nudged_4x_band"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ddg.ddg_nudged_4x_band"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "sample.shared_order_across_rows"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "sample.shared_order_across_rows"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "sample.uniforms_rows_swapped"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "sample.uniforms_rows_swapped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "sample.all_residues_designed"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "sample.all_residues_designed"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "sample.cdf_in_aminx_order"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "sample.cdf_in_aminx_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "sample.uniforms_shifted_one_step"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "sample.uniforms_shifted_one_step"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "sample.single_row_repeated"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "sample.single_row_repeated"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "sample.temperature_one"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "sample.temperature_one"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "sample.nudged_4x_band"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "sample.nudged_4x_band"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.cdf_in_aminx_order"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.cdf_in_aminx_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.uniforms_shifted_one"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.uniforms_shifted_one"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.randints_shifted_one"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.randints_shifted_one"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.permutations_reversed"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.permutations_reversed"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.field_untempered"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.field_untempered"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.zscales_sample_std"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.zscales_sample_std"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.temperature_doubled"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.temperature_doubled"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.combined_lambda_wrong"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.combined_lambda_wrong"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.two_phase_frac_wrong"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.two_phase_frac_wrong"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.selective_flipped"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.selective_flipped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.backend_swapped"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.backend_swapped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.selective_source_swapped"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.selective_source_swapped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.valid_mask_all_true"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.valid_mask_all_true"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.pin_contrast_wrong"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.pin_contrast_wrong"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.centre_among_designable"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.centre_among_designable"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.scan_unmasked"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.scan_unmasked"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.scan_selective_formula"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.scan_selective_formula"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.gibbs_outgoing_only"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.gibbs_outgoing_only"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.cv_cap_wrong"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.cv_cap_wrong"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_methods.nudged_4x_band"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_methods.nudged_4x_band"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_knobs.position_knn"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_knobs.position_knn"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_knobs.position_energy"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_knobs.position_energy"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_knobs.swapped"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_knobs.swapped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_knobs.shifted"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_knobs.shifted"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_objective_knobs.ignore_global"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_objective_knobs.ignore_global"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_objective_knobs.flip_global"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_objective_knobs.flip_global"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_objective_knobs.ignore_adjrep"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_objective_knobs.ignore_adjrep"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_objective_knobs.ignore_self"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_objective_knobs.ignore_self"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_objective_knobs.shifted"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_objective_knobs.shifted"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+[[branch]]
+family = "protonpotts"
+id = "ph_objective_knobs.block_zscales"
+stage = "P10"
+fixture = "protonpotts_dumps"
+mutant = "ph_objective_knobs.block_zscales"
+[branch.vehicle]
+kind = "sidecar"
+slug = "protonpotts_parity"
+
+# ==============================================================================
+# Phase 3: Tier 1 & Tier 2 MPNN Variant Vehicles
+# ==============================================================================
+
+[[branch]]
+family = "ab_mpnn"
+id = "tier1_reversed_hidden"
+stage = "P3"
+fixture = "1ubq.pdb"
+mutant = "tier1_reversed_hidden"
+[branch.vehicle]
+kind = "sidecar"
+slug = "tier1_variants_parity"
+
+[[branch]]
+family = "ab_mpnn"
+id = "tier1_zero_edge_features"
+stage = "P3"
+fixture = "1ubq.pdb"
+mutant = "tier1_zero_edge_features"
+[branch.vehicle]
+kind = "sidecar"
+slug = "tier1_variants_parity"
+
+[[branch]]
+family = "ab_mpnn"
+id = "tier1_permuted_output_weights"
+stage = "P3"
+fixture = "1ubq.pdb"
+mutant = "tier1_permuted_output_weights"
+[branch.vehicle]
+kind = "sidecar"
+slug = "tier1_variants_parity"
+
+[[branch]]
+family = "ab_mpnn"
+id = "tier1_shifted_decoding_order"
+stage = "P3"
+fixture = "1ubq.pdb"
+mutant = "tier1_shifted_decoding_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "tier1_variants_parity"
+
+[[branch]]
+family = "cyclic_mpnn"
+id = "tier1_linear_offsets_on_cyclic"
+stage = "P3"
+fixture = "1ubq.pdb"
+mutant = "tier1_linear_offsets_on_cyclic"
+[branch.vehicle]
+kind = "sidecar"
+slug = "tier1_variants_parity"
+
+[[branch]]
+family = "ca_only"
+id = "ca_quaternion_sign_flip"
+stage = "P3"
+fixture = "1ubq.pdb"
+mutant = "ca_quaternion_sign_flip"
+[branch.vehicle]
+kind = "sidecar"
+slug = "ca_only_parity_v2"
+
+[[branch]]
+family = "ca_only"
+id = "ca_rbf_block_swap"
+stage = "P3"
+fixture = "1ubq.pdb"
+mutant = "ca_rbf_block_swap"
+[branch.vehicle]
+kind = "sidecar"
+slug = "ca_only_parity_v2"
+
+[[branch]]
+family = "ca_only"
+id = "ca_zero_edge_features"
+stage = "P3"
+fixture = "1ubq.pdb"
+mutant = "ca_zero_edge_features"
+[branch.vehicle]
+kind = "sidecar"
+slug = "ca_only_parity_v2"
+
+[[branch]]
+family = "ca_only"
+id = "ca_permuted_output_weights"
+stage = "P3"
+fixture = "1ubq.pdb"
+mutant = "ca_permuted_output_weights"
+[branch.vehicle]
+kind = "sidecar"
+slug = "ca_only_parity_v2"
+
+# ==============================================================================
+# Phase 2: ThermoMPNN / ThermoMPNN-D Parity Vehicle
+# ==============================================================================
+
+[[branch]]
+family = "thermo"
+id = "reversed_hidden"
+stage = "P2"
+fixture = "1ubq.pdb"
+mutant = "reversed_hidden"
+[branch.vehicle]
+kind = "sidecar"
+slug = "thermo_mpnn_parity_v2"
+
+[[branch]]
+family = "thermo"
+id = "omit_seq_subtraction"
+stage = "P2"
+fixture = "1ubq.pdb"
+mutant = "omit_seq_subtraction"
+[branch.vehicle]
+kind = "sidecar"
+slug = "thermo_mpnn_parity_v2"
+
+[[branch]]
+family = "thermo"
+id = "zero_edge_features"
+stage = "P2"
+fixture = "1ubq.pdb"
+mutant = "zero_edge_features"
+[branch.vehicle]
+kind = "sidecar"
+slug = "thermo_mpnn_parity_v2"
+
+[[branch]]
+family = "thermo"
+id = "permuted_output_weights"
+stage = "P2"
+fixture = "1ubq.pdb"
+mutant = "permuted_output_weights"
+[branch.vehicle]
+kind = "sidecar"
+slug = "thermo_mpnn_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "rbf_range_shrunk"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "rbf_range_shrunk"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "virtual_cb_sign_flipped"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "virtual_cb_sign_flipped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "neighbors_farthest"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "neighbors_farthest"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "neighbor_gather_off_by_one"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "neighbor_gather_off_by_one"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "gap_embedding_row_swapped"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "gap_embedding_row_swapped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "masked_atoms_not_ca_filled"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "masked_atoms_not_ca_filled"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "potts_unsymmetrized"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "potts_unsymmetrized"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "alphabet_unpermuted"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "alphabet_unpermuted"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "energy_pair_term_doubled"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "energy_pair_term_doubled"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "ensemble_sum_not_mean"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "ensemble_sum_not_mean"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+# Caliby v2 (261104_p4-review-fixes): six added mutants. Four reintroduce the shared-model fixes in
+# families/caliby/{features,potts}.py; two are packer-arm (caliby_packer_010/float32) mutants.
+[[branch]]
+family = "caliby"
+id = "slot4_virtual_cb_written"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "slot4_virtual_cb_written"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "potts_scale_single_factor"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "potts_scale_single_factor"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "potts_j_right_transposed_read"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "potts_j_right_transposed_read"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "k_neighbors_potts_truncated"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "k_neighbors_potts_truncated"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "packer_sigma_scaled"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "packer_sigma_scaled"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+[[branch]]
+family = "caliby"
+id = "packer_selfcond_dropped"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "packer_selfcond_dropped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "caliby_parity_v2"
+
+# ==============================================================================
+# Phase 4 fix (261104_p4-review-fixes): AntiBMPNN v2. Nine perturbations, each must push its designated stage above
+# 1e-3 against the sealed real-upstream dump. Seven are CODE-level (aminx behaviour perturbed); zero_edge_embedding and
+# swap_checkpoint_noise are WEIGHT-level controls (they edit loaded parameters and show the comparison is sensitive to
+# the weights, not that aminx code is exercised). Vehicle: scripts/parity/antibmpnn_parity_v3.py (v2 + finiteness rule; supersedes antibmpnn_parity_v2.py,
+# antibmpnn_parity.py). EMPTY ledger shard until a real wave.
+# ==============================================================================
+
+[[branch]]
+family = "antibmpnn"
+id = "reversed_ar_mask"
+stage = "P4-logits"
+fixture = "HuJ3"
+mutant = "reversed_ar_mask"
+[branch.vehicle]
+kind = "sidecar"
+slug = "antibmpnn_parity_v3"
+
+[[branch]]
+family = "antibmpnn"
+id = "offset_shift"
+stage = "P4-features"
+fixture = "HuJ3"
+mutant = "offset_shift"
+[branch.vehicle]
+kind = "sidecar"
+slug = "antibmpnn_parity_v3"
+
+[[branch]]
+family = "antibmpnn"
+id = "entry_ar_mask_transposed"
+stage = "P4-entry"
+fixture = "HuJ3"
+mutant = "entry_ar_mask_transposed"
+[branch.vehicle]
+kind = "sidecar"
+slug = "antibmpnn_parity_v3"
+
+[[branch]]
+family = "antibmpnn"
+id = "omit_penalty_dropped"
+stage = "P4-sampler"
+fixture = "HuJ3"
+mutant = "omit_penalty_dropped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "antibmpnn_parity_v3"
+
+[[branch]]
+family = "antibmpnn"
+id = "lehninger_pka_shifted"
+stage = "P4-descriptors"
+fixture = "HuJ3"
+mutant = "lehninger_pka_shifted"
+[branch.vehicle]
+kind = "sidecar"
+slug = "antibmpnn_parity_v3"
+
+[[branch]]
+family = "antibmpnn"
+id = "barley_tables_swapped"
+stage = "P4-descriptors"
+fixture = "HuJ3"
+mutant = "barley_tables_swapped"
+[branch.vehicle]
+kind = "sidecar"
+slug = "antibmpnn_parity_v3"
+
+[[branch]]
+family = "antibmpnn"
+id = "parser_wrong_atom_order"
+stage = "P4-parse"
+fixture = "HuJ3"
+mutant = "parser_wrong_atom_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "antibmpnn_parity_v3"
+
+[[branch]]
+family = "antibmpnn"
+id = "zero_edge_embedding"
+stage = "P4-features"
+fixture = "HuJ3"
+mutant = "zero_edge_embedding"
+[branch.vehicle]
+kind = "sidecar"
+slug = "antibmpnn_parity_v3"
+
+[[branch]]
+family = "antibmpnn"
+id = "swap_checkpoint_noise"
+stage = "P4-logits"
+fixture = "HuJ3"
+mutant = "swap_checkpoint_noise"
+[branch.vehicle]
+kind = "sidecar"
+slug = "antibmpnn_parity_v3"
+
+# ==============================================================================
+# Phase 4: FAMPNN parity vehicle (redo 261104; sealed upstream oracle, real weights)
+# ==============================================================================
+
+[[branch]]
+family = "fampnn"
+id = "sigma_min_old_default"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "sigma_min_old_default"
+[branch.vehicle]
+kind = "sidecar"
+slug = "fampnn_parity_v3"
+
+[[branch]]
+family = "fampnn"
+id = "cosine_unmask_schedule"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "cosine_unmask_schedule"
+[branch.vehicle]
+kind = "sidecar"
+slug = "fampnn_parity_v3"
+
+[[branch]]
+family = "fampnn"
+id = "rank_decoding_order"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "rank_decoding_order"
+[branch.vehicle]
+kind = "sidecar"
+slug = "fampnn_parity_v3"
+
+[[branch]]
+family = "fampnn"
+id = "selfcond_off"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "selfcond_off"
+[branch.vehicle]
+kind = "sidecar"
+slug = "fampnn_parity_v3"
+
+[[branch]]
+family = "fampnn"
+id = "step_scale_one"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "step_scale_one"
+[branch.vehicle]
+kind = "sidecar"
+slug = "fampnn_parity_v3"
+
+[[branch]]
+family = "fampnn"
+id = "conf_bins_0_8"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "conf_bins_0_8"
+[branch.vehicle]
+kind = "sidecar"
+slug = "fampnn_parity_v3"
+
+[[branch]]
+family = "fampnn"
+id = "ghost_atoms_to_origin"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "ghost_atoms_to_origin"
+[branch.vehicle]
+kind = "sidecar"
+slug = "fampnn_parity_v3"
+
+[[branch]]
+family = "fampnn"
+id = "chain_embedding_off"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "chain_embedding_off"
+[branch.vehicle]
+kind = "sidecar"
+slug = "fampnn_parity_v3"
+
+[[branch]]
+family = "fampnn"
+id = "categorical_reversed_cdf"
+stage = "P4"
+fixture = "1ubq.pdb"
+mutant = "categorical_reversed_cdf"
+[branch.vehicle]
+kind = "sidecar"
+slug = "fampnn_parity_v3"
+
+# ==============================================================================
+# Phase 2 / Task 261105: FrustraMPNN Parity Vehicle
+# ==============================================================================
+
+[[branch]]
+family = "frustrampnn"
+id = "reversed_hidden"
+stage = "P2"
+fixture = "1ubq.pdb"
+mutant = "reversed_hidden"
+[branch.vehicle]
+kind = "sidecar"
+slug = "frustrampnn_parity"
+
+[[branch]]
+family = "frustrampnn"
+id = "permuted_output_weights"
+stage = "P2"
+fixture = "1ubq.pdb"
+mutant = "permuted_output_weights"
+[branch.vehicle]
+kind = "sidecar"
+slug = "frustrampnn_parity"
+
+[[branch]]
+family = "frustrampnn"
+id = "refinement_bypass"
+stage = "P2"
+fixture = "1ubq.pdb"
+mutant = "refinement_bypass"
+[branch.vehicle]
+kind = "sidecar"
+slug = "frustrampnn_parity"
+
+[[branch]]
+family = "frustrampnn"
+id = "subtract_mut_inverted"
+stage = "P2"
+fixture = "1ubq.pdb"
+mutant = "subtract_mut_inverted"
+[branch.vehicle]
+kind = "sidecar"
+slug = "frustrampnn_parity"

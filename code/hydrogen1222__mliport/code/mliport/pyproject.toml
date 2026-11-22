@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mliport"
+version = "2.0.0b5"
+description = "Backend-neutral CLI/TUI/Python workflows for MLIP models (MACE, DPA, GRACE, UMA)"
+readme = "README.md"
+license = { text = "MIT License" }
+requires-python = ">=3.10, <3.14"
+dependencies = [
+    "ase>=3.26.0",
+    "numpy",
+    "packaging",
+    "tqdm",
+    # Textual 8.x is the verified baseline for the TUI; the upper bound keeps
+    # untested major releases (v9+) out until they pass the TUI suite.
+    "textual>=8.2.8,<9",
+]
+
+[project.optional-dependencies]
+# NOTE: there is deliberately no `uma` extra. UMA is installed by the
+# compatibility-matrix-driven installer (scripts/install_mliport.sh), which pins
+# the fairchem-core version in mliport/install/compatibility.py. A PyPI extra
+# would drift from the matrix and conflicts with fairchem-core's own Python
+# requirement.
+# DFT-D3 dispersion correction (--d3). Install into an existing backend
+# environment; it needs PyTorch, which the MACE/DPA/UMA environments provide.
+d3 = [
+    "torch-dftd>=0.4",
+]
+analysis = [
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+]
+transport = [
+    "kinisi>=2.0.5,<3",
+    # Imported directly by mliport/analysis/transport.py (``import scipp``);
+    # kinisi requires it, so this only makes the direct import explicit.
+    "scipp>=24.8",
+]
+electrolyte = [
+    "gemdat>=1.7.3,<2",
+    # Imported directly by mliport/analysis/electrolyte.py
+    # (``from pymatgen.core import Species, Structure``); gemdat requires it.
+    "pymatgen>=2024.1.26",
+]
+analysis-all = [
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+    "kinisi>=2.0.5,<3",
+    "scipp>=24.8",
+    "gemdat>=1.7.3,<2",
+    "pymatgen>=2024.1.26",
+]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    # exercised via ase.spacegroup.symmetrize (fix-symmetry contract tests)
+    "spglib",
+    "ruff",
+    "mypy",
+    # GitHub Actions workflow hygiene tests parse .github/workflows/*.yml
+    "pyyaml",
+    # ase.ga.ofp_comparator (the confsearch fingerprint known-answer test)
+    # imports scipy and matplotlib at module level; the bounds match the
+    # `analysis` extra so the confsearch known-answer test runs on every CI
+    # Python instead of skipping.
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+]
+
+[project.scripts]
+mliport = "mliport.cli:main"
+
+[project.urls]
+repository = "https://github.com/hydrogen1222/mliport"
+documentation = "https://github.com/hydrogen1222/mliport/blob/main/README.md"
+
+[tool.setuptools.packages.find]
+where = ["."]
+# Explicit include list: auto-discovery would pick up stale setuptools build
+# caches (build/lib/**) and other repository artifacts as packages.
+include = ["mliport", "mliport.*"]
+namespaces = false
+
+
+# Packaged read-only data (GPU architecture table) ships inside the wheel.
+[tool.setuptools.package-data]
+mliport = ["data/compatibility/*.json"]

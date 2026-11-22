@@ -1,0 +1,193 @@
+﻿# MDCheck
+
+[![CI](https://github.com/sircalch/mdcheck/actions/workflows/test.yml/badge.svg)](https://github.com/sircalch/mdcheck/actions)
+[![PyPI version](https://img.shields.io/pypi/v/mdcheck.svg?color=blue)](https://pypi.org/project/mdcheck/)
+[![Python versions](https://img.shields.io/pypi/pyversions/mdcheck.svg)](https://pypi.org/project/mdcheck/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22217568.svg)](https://doi.org/10.5281/zenodo.22217568)
+
+> **Automated Convergence, Statistical Inefficiency, and Reproducibility Assessment for Molecular Dynamics Simulations.**
+
+---
+
+## Overview
+
+**MDCheck** is an open-source scientific toolkit that solves a universal methodological need in biomolecular and materials simulations: **certifying whether a molecular dynamics trajectory has converged, reached equilibrium, and accumulated sufficient statistically independent observations for publication.**
+
+Instead of manually inspecting plots or guessing equilibration cutoffs, `mdcheck` analyzes raw timeseries (GROMACS `.xvg`, LAMMPS `log.lammps`, OpenMM/AMBER/NAMD logs, `.csv`, `.dat`) with a single command and delivers:
+
+- 🎯 **Automated Equilibration Detection ($t_{\text{eq}}$)** via statistical inefficiency minimization.
+- ⏱️ **Integrated Autocorrelation Time ($\tau_{\text{int}}$)** & **Statistical Inefficiency ($g$)** using Madras-Sokal self-consistent windowing.
+- 🔢 **Effective Sample Size ($N_{\text{eff}} = N / g$)** and a **95% confidence interval of the mean corrected for autocorrelation** ($\bar{x} \pm t_{N_{\text{eff}}-1}\, s\sqrt{g/N}$), validated for nominal coverage on AR(1) processes and OpenMM trajectories (see `validation/`).
+- 🔄 **Multi-Replica Consistency Test**: Cochran's $Q$ heterogeneity test of replica means with autocorrelation-corrected standard errors (calibrated false-alarm rate), plus descriptive Jensen-Shannon, Kolmogorov-Smirnov and Wasserstein distances.
+- 📉 **Linear drift and Geweke stationarity diagnostics** and Flyvbjerg-Petersen block-averaging curves.
+- 🚦 **Quality Certification Badges (`PASS` / `WARNING` / `FAIL`)** with unambiguous diagnostic messages.
+- 📑 **Publication-Ready Outputs**: Interactive self-contained `report.html`, vector plots (SVG/PDF/PNG 300 DPI), LaTeX summary tables (`.tex`), and a draft **Methods & Supporting Information** text snippet with automated **BibTeX citations**.
+
+```
+  Simulations (.xvg, .csv, .dat)
+               │
+               ▼
+  ┌───────────────────────────────────────────────────────────┐
+  │                         MDCheck                           │
+  │  ├── Auto Equilibration (max N_eff)                       │
+  │  ├── Autocorrelation & Inefficiency (tau_int, g)          │
+  │  ├── Multi-Replica Consistency (Cochran Q; JSD/KS/W1)     │
+  │  └── Drift Detection & Block Averaging                    │
+  └───────────────────────────────────────────────────────────┘
+               │
+               ▼
+  ┌───────────────────────────────────────────────────────────┐
+  │                   Publication Deliverables                │
+  │  ├── report.html (Interactive Dashboard & Badges)         │
+  │  ├── mdcheck_convergence_overview.pdf/svg/png             │
+  │  ├── mdcheck_summary_table.tex / .csv                     │
+  │  ├── methods_snippet.txt (Ready for Manuscript)           │
+  │  └── citation.bib (BibTeX Reference)                      │
+  └───────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Installation
+
+### From PyPI
+```bash
+pip install mdcheck
+```
+
+### From Source (Development Mode)
+```bash
+git clone https://github.com/sircalch/mdcheck.git
+cd mdcheck
+pip install -e .[dev]
+```
+
+---
+
+## Quickstart (CLI)
+
+### 1. Test Demo Mode (Instant Synthetic Multi-Replica Simulation)
+```bash
+mdcheck demo -o my_demo_results/
+```
+Open `my_demo_results/report.html` in any web browser to see the interactive report!
+
+### 2. Assess GROMACS XVG Trajectory
+```bash
+mdcheck assess -i rmsd.xvg gyrate.xvg energy.xvg -o md_quality_report/
+```
+
+### 3. Assess Multi-Replica Convergence (R1, R2, R3)
+```bash
+mdcheck assess -i rep1_rmsd.xvg -r rep2_rmsd.xvg rep3_rmsd.xvg -o replica_assessment/
+```
+
+---
+
+## Python API Usage
+
+```python
+import numpy as np
+from mdcheck import assess_trajectory_quality
+from mdcheck.reporters import generate_publication_figures, generate_manuscript_assets, generate_html_report
+
+# Load or define your timeseries (e.g. Backbone RMSD over 100 ns)
+time_coords = np.linspace(0, 100, 2000)  # ns
+rmsd_series = ... # 1D numpy array
+
+# Assess simulation quality
+report = assess_trajectory_quality(
+    timeseries_dict={"Backbone_RMSD": rmsd_series},
+    time_coords=time_coords
+)
+
+print(f"Overall Quality Status: {report.overall_status}")
+print(f"Equilibration Time: {report.observables['Backbone_RMSD'].t_eq_time:.2f} ns")
+print(f"Effective Sample Size (N_eff): {report.observables['Backbone_RMSD'].n_eff:.0f}")
+
+# Export publication figures and LaTeX tables
+generate_publication_figures({"Backbone_RMSD": rmsd_series}, time_coords, report, "output_dir/")
+generate_manuscript_assets(report, "output_dir/")
+generate_html_report(report, "output_dir/report.html")
+```
+
+---
+
+## Scientific Foundations & Methodology
+
+### 1. Automated Equilibration Detection ($t_{\text{eq}}$)
+The initial non-equilibrium transient phase is automatically identified by maximizing the total effective sample size in the subsequent production interval:
+$$\hat{t}_{\text{eq}} = \arg\max_{t_0} N_{\text{eff}}(t_0) = \arg\max_{t_0} \frac{N - t_0}{g(t_0)}$$
+
+### 2. Autocorrelation & Statistical Inefficiency ($g$)
+MD frames are temporally correlated. MDCheck computes the integrated autocorrelation time $\tau_{\text{int}}$ using the Madras-Sokal self-consistent cutoff window:
+$$\tau_{\text{int}} = \frac{1}{2} + \sum_{k=1}^{M} C(k), \quad M \ge 6 \tau_{\text{int}}$$
+$$g = 2\tau_{\text{int}} = 1 + 2\sum_{k=1}^{M} C(k), \quad N_{\text{eff}} = \frac{N_{\text{prod}}}{g}$$
+
+The 95% confidence interval of the production mean is $\bar{x} \pm t_{0.975,\,N_{\text{eff}}-1}\, s \sqrt{g / N_{\text{prod}}}$.
+
+### 3. Multi-Replica Consistency
+Replica means $m_i$ with autocorrelation-corrected standard errors $SE_i = s_i\sqrt{g_i/n_i}$ are compared with Cochran's heterogeneity statistic
+$$Q = \sum_i w_i (m_i - \bar{m}_w)^2, \quad w_i = SE_i^{-2}, \quad Q \sim \chi^2_{k-1}$$
+Status is `PASS` for $p \ge 0.05$, `WARNING` for $0.01 \le p < 0.05$ and `FAIL` for $p < 0.01$. Histogram Jensen-Shannon distances are reported as descriptors only: between finite, autocorrelated samples of the same ensemble they are biased upwards (in the OpenMM validation every replica group exceeded the former 0.15 threshold). An RMSIP function for essential-subspace overlap is available in the API (`subspace_overlap_rmsip`).
+
+---
+
+## Validation
+
+`validation/` reproduces a benchmark against pymbar 4.0.3, pyblock and ArviZ on two kinds of data: AR(1) processes,
+where g and the mean are known exactly, and 108 OpenMM trajectories of Lennard-Jones argon and TIP3P water
+(see `validation/README.md`).
+
+| Check | Result |
+|---|---|
+| Statistical inefficiency, g = 1–199 | matches the exact value and pymbar |
+| 95% CI coverage, AR(1) | 0.90–0.99 (naive s/√N: 0.09–0.97; 1.0.0 bootstrap: 0.82–0.90) |
+| Coverage vs. effective sample size | nominal for N_eff ≳ 50; 0.87–0.93 below |
+| Equilibration time vs. pymbar | median difference 1–2 samples |
+| Coverage on OpenMM replicas | LJ 0.90; TIP3P 0.71–0.79 (100 ps) and 0.92–0.96 (300 ps) |
+| Replica test, false alarms (LJ, 300 ps water) | Cochran Q 3–15%; R̂ > 1.01 19–47%; JSD > 0.15 (1.0.0) 29–100% |
+| Replica test, shift of 6 SE | Cochran Q detects 98–99% |
+
+The one case below nominal coverage, 100 ps water replicas, happens because short runs underestimate g. Every
+estimator that uses only the series itself shares this limitation, and the replica test flags these cases. The
+changes made in response to the validation are listed in `CHANGELOG.md`.
+
+## Documentation and help
+
+- Full documentation, tutorials and API reference: <https://sircalch.github.io/mdcheck/>
+- Questions and bug reports: [issue tracker](https://github.com/sircalch/mdcheck/issues)
+- Support, contribution and governance: [`CONTRIBUTING.md`](https://github.com/sircalch/mdcheck/blob/HEAD/CONTRIBUTING.md) · [`CODE_OF_CONDUCT.md`](https://github.com/sircalch/mdcheck/blob/HEAD/CODE_OF_CONDUCT.md) · [`SECURITY.md`](https://github.com/sircalch/mdcheck/blob/HEAD/SECURITY.md)
+
+---
+
+## Citation
+
+If you use MDCheck to evaluate trajectory convergence, equilibration, statistical inefficiency, or replica reproducibility in your research, please cite:
+
+```bibtex
+@software{monreal2026mdcheck,
+  author = {Monreal-Hernández, Andrés},
+  title = {{MDCheck: Automated Convergence, Statistical Inefficiency, and Reproducibility Assessment for Molecular Dynamics Simulations}},
+  year = {2026},
+  version = {1.2.2},
+  publisher = {Zenodo},
+  doi = {10.5281/zenodo.22217568},
+  url = {https://github.com/sircalch/mdcheck}
+}
+```
+
+The DOI above always resolves to the latest archived version. The repository's [`CITATION.cff`](https://github.com/sircalch/mdcheck/blob/HEAD/CITATION.cff) is the canonical citation record; GitHub's "Cite this repository" button uses it.
+
+### Project page
+
+Release record and related tools: [mdcheck on the author's site](https://sircalch.github.io/software/mdcheck/) · [quality-control and reproducibility family](https://sircalch.github.io/software/quality-control/).
+
+
+---
+
+## License
+
+This project is licensed under the **MIT License** - see the [LICENSE](https://github.com/sircalch/mdcheck/blob/HEAD/LICENSE) file for details.
+

@@ -1,0 +1,916 @@
+/* BlindSpot — 변이 감별력 사전 검정
+ *
+ * 실제로 동작하는 부분:
+ *   · UniProt REST 조회 및 잔기 대조 검증  → 임의 accession 가능
+ *   · 변이 서열 생성 및 입력 파일 배포
+ *   · CSV 원자료 기반 순열검정 재계산
+ *   · Mol* 로 실측 구조 로드
+ * 미구현: 구조 예측 실행 (GPU 필요)
+ */
+
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+
+/* ────────────── 사례 정의 (사전 산출) ────────────── */
+const CASES = {
+  CD33:  {acc:'P20138', len:364, pos:69, wt:'R', mut:'G', rsid:'rs2455069',
+          domain:[19,135], gene:'CD33',
+          wtCif:'cd33_full_wt', mutCif:'cd33_full_r69g', img:'CD33_zoom.png'},
+  PILRA: {acc:'Q9UKJ1', len:303, pos:78, wt:'R', mut:'G', rsid:'rs1859788',
+          domain:[32,150], gene:'PILRA',
+          wtCif:'pilra_full_wt', mutCif:'pilra_full_r78g', img:'PILRA_zoom.png'},
+  TREM2: {acc:'Q9NZC2', len:230, pos:62, wt:'R', mut:'H', rsid:'rs143332484',
+          domain:[29,112], gene:'TREM2',
+          wtCif:'trem2_full_wt', mutCif:'trem2_full_r62h', img:'TREM2_zoom.png'},
+};
+
+/** 사례 식별 라벨 — 두 축이 같은 문자열을 쓰도록 단일 출처로 둔다.
+    ⚠️ UniProt 정본 기준 표기다. PILRA 는 정본이 R78 이므로 R78G 가 되는데,
+       결합 축 데이터는 방향이 반대로 G78 을 정상형·R78 을 변이형으로 다룬다
+       (문헌 표기 G78R). 같은 변이 rs1859788 을 가리킨다 — 리포트 화면 각주 참조. */
+const caseLabel = g => `${CASES[g].wt}${CASES[g].pos}${CASES[g].mut}`;
+
+/* ────────────── 통계 ────────────── */
+const median = a => {const s=[...a].sort((x,y)=>x-y), m=s.length>>1;
+  return s.length%2 ? s[m] : (s[m-1]+s[m])/2;};
+
+/** Mann–Whitney U — 정규근사, 동순위 보정 포함 */
+function mannWhitneyU(a, b, alternative='greater'){
+  const n1=a.length, n2=b.length;
+  const all=[...a.map(v=>({v,g:0})), ...b.map(v=>({v,g:1}))].sort((x,y)=>x.v-y.v);
+  // 동순위 평균 순위 부여
+  const ranks=new Array(all.length); const tieGroups=[];
+  for(let i=0;i<all.length;){
+    let j=i; while(j+1<all.length && all[j+1].v===all[i].v) j++;
+    const r=(i+j)/2+1;
+    for(let k=i;k<=j;k++) ranks[k]=r;
+    if(j>i) tieGroups.push(j-i+1);
+    i=j+1;
+  }
+  let R1=0; all.forEach((o,i)=>{ if(o.g===0) R1+=ranks[i]; });
+  const U1=R1-n1*(n1+1)/2, U2=n1*n2-U1;
+  const mu=n1*n2/2;
+  const N=n1+n2;
+  const tieCorr=tieGroups.reduce((s,t)=>s+(t*t*t-t),0);
+  const sd=Math.sqrt((n1*n2/12)*((N+1)-tieCorr/(N*(N-1))));
+  if(sd===0) return {U:U1, p:1};
+  const U = alternative==='greater' ? U1 : U1;
+  let z=(U-mu)/sd;
+  // 연속성 보정
+  z = z>0 ? (U-mu-0.5)/sd : (U-mu+0.5)/sd;
+  const p1 = 1-normCdf(z);                     // 단측 (a > b)
+  const p = alternative==='two-sided'
+      ? Math.min(1, 2*Math.min(p1, 1-p1)) : p1;
+  return {U:U1, U2, z, p};
+}
+function normCdf(z){ // Abramowitz–Stegun 26.2.17
+  const t=1/(1+0.2316419*Math.abs(z));
+  const d=0.3989422804014327*Math.exp(-z*z/2);
+  let p=d*t*(0.319381530+t*(-0.356563782+t*(1.781477937+t*(-1.821255978+t*1.330274429))));
+  return z>0 ? 1-p : p;
+}
+const fmtP = p => p<1e-4 ? p.toExponential(1).replace('e','×10^').replace('^-','⁻')
+                         : p.toPrecision(2);
+
+/* ────────────── 순열검정 엔진 (두 축 공용) ──────────────
+   음성 대조군 설계 — 같은 조건 안의 쌍 = 노이즈(모델 진동), 조건 간 쌍 = 신호.
+   통계량 = median(신호) − median(노이즈).
+
+   ⚠️ 쌍은 서로 독립이 아니다. 같은 구조가 여러 쌍에 재사용되므로
+      Mann–Whitney 의 p 는 과소평가된다 (예: PILRA 구조 축 6e-9 → 0.0079).
+      라벨을 뒤섞어 얻은 경험 분포로 교정한다.
+
+   분할 수가 적으면 전수 열거(정확), 많으면 고정 시드 표본 — 둘 다 결정적이다.
+   src/detectability.py 가 같은 알고리즘·같은 PRNG 를 쓴다 (p 가 자릿수까지 일치). */
+const PERM_EXACT_LIMIT = 20000;   // 분할 수가 이하이면 전수 열거
+const PERM_N = 20000;             // 초과하면 표본 순열 횟수
+const PERM_SEED = 1;
+
+const medFast = a => {            // 순열 루프 안에서만 쓰는 빠른 중앙값
+  const s = Float64Array.from(a).sort();
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m-1] + s[m]) / 2;
+};
+
+/** 라벨(inA)에 따라 쌍을 노이즈/신호로 가른다 */
+function splitPairs(D, N, inA){
+  const noise = [], signal = [];
+  for(let i=0;i<N;i++) for(let j=i+1;j<N;j++)
+    (inA[i]===inA[j] ? noise : signal).push(D[i*N+j]);
+  return {noise, signal};
+}
+function pairStat(D, N, inA){
+  const {noise, signal} = splitPairs(D, N, inA);
+  return medFast(signal) - medFast(noise);
+}
+
+/** mulberry32 — 결정적 PRNG. 파이썬 포팅본과 난수열이 동일하다. */
+function mulberry32(seed){
+  let a = seed|0;
+  return function(){
+    a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a>>>15, 1|a);
+    t = t + Math.imul(t ^ t>>>7, 61|t) ^ t;
+    return ((t ^ t>>>14) >>> 0) / 4294967296;
+  };
+}
+const nChooseK = (n,k) => { let r=1; for(let i=1;i<=k;i++) r = r*(n-k+i)/i; return Math.round(r); };
+
+/** 라벨 순열검정 -> {p, method:'exact'|'sample', nPerm} */
+function permutationP(D, N, n1){
+  const inA = new Uint8Array(N); for(let i=0;i<n1;i++) inA[i]=1;
+  const obs = pairStat(D, N, inA);
+
+  if(nChooseK(N, n1) <= PERM_EXACT_LIMIT){
+    // 전수 열거. 통계량이 A/B 라벨 교환에 불변이므로 0번을 A 에 고정해 여집합 대칭을 없앤다.
+    let cnt=0, tot=0; const pick=new Array(n1);
+    (function rec(start, depth){
+      if(depth===n1){
+        const lab=new Uint8Array(N); for(const i of pick) lab[i]=1;
+        tot++; if(pairStat(D,N,lab) >= obs) cnt++; return;
+      }
+      for(let i=start; i<=N-(n1-depth); i++){
+        if(depth===0 && i>0) break;              // 0 고정
+        pick[depth]=i; rec(i+1, depth+1);
+      }
+    })(0,0);
+    return {p: cnt/tot, method:'exact', nPerm: tot};
+  }
+
+  const rnd = mulberry32(PERM_SEED), ord = [...Array(N).keys()];
+  let cnt = 0;
+  for(let k=0;k<PERM_N;k++){
+    for(let i=N-1;i>0;i--){ const j=(rnd()*(i+1))|0; const t=ord[i]; ord[i]=ord[j]; ord[j]=t; }
+    const lab=new Uint8Array(N); for(let i=0;i<n1;i++) lab[ord[i]]=1;
+    if(pairStat(D,N,lab) >= obs) cnt++;
+  }
+  return {p:(cnt+1)/(PERM_N+1), method:'sample', nPerm: PERM_N};
+}
+
+/* ────────────── CSV ────────────── */
+async function loadCsv(path){
+  const txt = await (await fetch(path)).text();
+  const [head, ...lines] = txt.trim().split('\n');
+  const cols = head.split(',');
+  return lines.map(l=>{
+    const v=l.split(','); const o={};
+    cols.forEach((c,i)=>o[c.trim()]=v[i]);
+    return o;
+  });
+}
+
+/* ────────────── 화면 2 · UniProt 조회 및 검증 (실제 동작) ────────────── */
+let currentSeq = null, currentAcc = null;
+
+async function fetchUniProt(acc){
+  const r = await fetch(`https://rest.uniprot.org/uniprotkb/${acc}.json`);
+  if(!r.ok) throw new Error(`조회 실패 (HTTP ${r.status})`);
+  const d = await r.json();
+  const feats = (d.features||[]).filter(f=>['Signal','Domain','Transmembrane','Natural variant'].includes(f.type));
+  return {
+    acc: d.primaryAccession,
+    id: d.uniProtkbId,
+    name: d.proteinDescription?.recommendedName?.fullName?.value || '',
+    seq: d.sequence.value,
+    len: d.sequence.length,
+    feats
+  };
+}
+
+async function doLookup(){
+  const acc = $('#acc').value.trim().toUpperCase();
+  const box = $('#accBox'), info = $('#accInfo');
+  if(!acc) return;
+  box.className='input'; info.className='msg'; info.innerHTML='<span class="spin"></span> <span class="muted">조회 중…</span>';
+  $('#lookup').disabled=true;
+  try{
+    const p = await fetchUniProt(acc);
+    currentSeq = p.seq; currentAcc = p.acc;
+    box.className='input ok';
+    $('#accMeta').textContent = `${p.id} · ${p.len} aa`;
+    const sig = p.feats.find(f=>f.type==='Signal');
+    const dom = p.feats.filter(f=>f.type==='Domain');
+    const tm  = p.feats.find(f=>f.type==='Transmembrane');
+    const parts=[];
+    if(sig) parts.push(`신호펩타이드 ${sig.location.start.value}–${sig.location.end.value}`);
+    dom.slice(0,2).forEach(d=>parts.push(`${d.description} ${d.location.start.value}–${d.location.end.value}`));
+    if(tm) parts.push(`TM ${tm.location.start.value}–${tm.location.end.value}`);
+    info.className='msg ok';
+    info.innerHTML = `<b>${p.name||p.id}</b><br>${parts.join(' · ')||'주석 없음'}`;
+    window._feats = p.feats;
+    $('#lookup').disabled=false;
+    validateMut();
+  }catch(e){
+    box.className='input warn';
+    info.className='msg warn';
+    info.textContent = `${acc} 를 찾지 못했습니다 (${e.message}). accession 형식을 확인해 주세요 — 예: Q9NZC2`;
+    currentSeq=null; $('#lookup').disabled=false;
+  }
+}
+
+function validateMut(){
+  const raw = $('#mut').value.trim().toUpperCase();
+  const box = $('#mutBox'), out = $('#mutResult'), gen = $('#genBox');
+  gen.innerHTML=''; $('#dl').style.display='none';
+  const rw=$('#runWrap'); if(rw) rw.style.display='none';
+  const rm=$('#runMsg'); if(rm){ rm.style.display='none'; rm.innerHTML=''; }
+  const m = raw.match(/^([A-Z])(\d+)([A-Z])$/);
+  if(!m){ box.className='input'; out.className='msg';
+    out.textContent='형식에 맞게 입력해 주세요 — 예: R62H'; return; }
+  if(!currentSeq){ out.className='msg'; out.textContent='accession 을 먼저 조회해 주세요'; return; }
+
+  const [,wt,posS,mut] = m, pos=+posS;
+  if(pos<1 || pos>currentSeq.length){
+    box.className='input warn'; out.className='msg warn';
+    out.innerHTML=`위치 ${pos}가 서열 범위(1–${currentSeq.length})를 벗어납니다`; return;
+  }
+  const actual = currentSeq[pos-1];
+
+  if(actual !== wt){
+    box.className='input warn'; out.className='msg warn';
+    // 역방향인지 확인 — 흔한 오류 패턴
+    const reversed = actual===mut;
+    out.innerHTML = `<b>서열 불일치</b> — 입력하신 변이의 기준 잔기(${AA[wt]||wt})가 `
+      + `야생형 서열 ${pos}번 잔기(<b>${AA[actual]||actual}</b>)와 다릅니다.`
+      + (reversed ? `<br>표기 방향이 반대일 수 있습니다. <code>${actual}${pos}${wt}</code> 인지 확인해 주세요.` : '')
+      + `<br><span class="muted">전구체(precursor) 번호 기준으로 입력했는지 확인해 주세요.</span>`;
+    return;
+  }
+
+  box.className='input ok'; out.className='msg ok';
+  const rs = (window._feats||[]).find(f=>f.type==='Natural variant'
+      && f.location.start.value===pos
+      && (f.alternativeSequence?.alternativeSequences||[]).includes(mut));
+  const rsid = rs?.featureCrossReferences?.[0]?.id;
+  out.innerHTML = `<b>확인됨</b> — 야생형 서열 ${pos}번이 ${AA[wt]}(${wt})로 일치합니다`
+    + (rsid ? ` · dbSNP <b>${rsid}</b>` : '');
+
+  buildSequences(pos, wt, mut);
+}
+
+const AA={A:'Ala',R:'Arg',N:'Asn',D:'Asp',C:'Cys',Q:'Gln',E:'Glu',G:'Gly',H:'His',
+  I:'Ile',L:'Leu',K:'Lys',M:'Met',F:'Phe',P:'Pro',S:'Ser',T:'Thr',W:'Trp',Y:'Tyr',V:'Val',
+  U:'Sec',O:'Pyl',X:'Xaa',B:'Asx',Z:'Glx'};
+
+function buildSequences(pos, wt, mut){
+  const full = currentSeq;
+  const mutSeq = full.slice(0,pos-1) + mut + full.slice(pos);
+  const label = `${wt}${pos}${mut}`;
+
+  // 구간 선택
+  const useDom = $('#useDom').checked;
+  const dom = (window._feats||[]).filter(f=>f.type==='Domain')
+              .find(d=>d.location.start.value<=pos && pos<=d.location.end.value);
+  let a=1, b=full.length, note='전장';
+  if(useDom && dom){ a=dom.location.start.value; b=dom.location.end.value;
+    note=`${dom.description} ${a}–${b}`; }
+  else if(useDom && !dom){ note='전장 — 해당 위치를 포함하는 도메인 주석이 없습니다'; }
+  const sW = full.slice(a-1,b), sM = mutSeq.slice(a-1,b), idx = pos-a;
+
+  // 비표준 잔기(셀레노시스테인 U, 피롤라이신 O)는 예측 도구가 처리하지 못한다
+  const NONSTD = {U:'셀레노시스테인(Sec)', O:'피롤라이신(Pyl)'};
+  const found = [...new Set([...sW].filter(c=>NONSTD[c]))];
+  const nsWarn = found.length ? `
+    <div class="msg warn" style="margin-top:11px"><b>비표준 잔기 포함</b> —
+      ${found.map(c=>`${NONSTD[c]} <code>${c}</code>`).join(', ')} 가 서열에 존재합니다.
+      AlphaFold·Boltz-2 는 표준 20종 아미노산만 처리하므로 치환이 필요합니다
+      (예: Sec → Cys). 결정구조 다수도 같은 이유로 치환체를 사용합니다.</div>` : '';
+
+  const hl = (s,i,c)=>s.slice(0,i)+`<b class="hl">${c}</b>`+s.slice(i+1);
+  $('#genBox').innerHTML = `
+    <div class="chipline"><span class="tag">구간</span> <span class="mono">${note} · ${sW.length} aa</span></div>
+    <div class="seqlbl">야생형</div><div class="seq">${hl(sW,idx,wt)}</div>
+    <div class="seqlbl">변이형 ${label}</div><div class="seq">${hl(sM,idx,mut)}</div>
+    <div class="chipline"><span class="tag">상이 잔기</span> <span class="mono">1개 (위치 ${pos})</span></div>${nsWarn}`;
+
+  $('#dl').style.display='flex';
+  $('#runWrap').style.display='block';
+  window._out = {acc:currentAcc, label, a, b, sW, sM, n:+$('#nsamp').value, seed:+$('#seed').value};
+}
+
+/* 입력 파일 배포 — 실제 다운로드 */
+function download(name, text){
+  const u=URL.createObjectURL(new Blob([text],{type:'text/plain'}));
+  const a=document.createElement('a'); a.href=u; a.download=name; a.click();
+  URL.revokeObjectURL(u);
+}
+function dlFasta(){
+  const o=window._out;
+  download(`${o.acc}_${o.label}.fasta`,
+    `>${o.acc}_WT ${o.a}-${o.b}\n${o.sW}\n>${o.acc}_${o.label} ${o.a}-${o.b}\n${o.sM}\n`);
+}
+function dlAf(){
+  const o=window._out, jobs=[];
+  [['WT',o.sW],[o.label,o.sM]].forEach(([tag,seq])=>{
+    jobs.push({name:`${o.acc}_${tag}`, modelSeeds:[o.seed],
+      sequences:[{proteinChain:{sequence:seq,count:1}}],
+      dialect:'alphafoldserver', version:1});
+  });
+  download(`af_jobs_${o.acc}_${o.label}.json`, JSON.stringify(jobs,null,2));
+}
+function dlBoltz(){
+  const o=window._out;
+  const y=s=>`version: 1\nsequences:\n  - protein:\n      id: A\n      sequence: "${s}"\n`;
+  download(`boltz_${o.acc}_WT.yaml`, y(o.sW));
+  setTimeout(()=>download(`boltz_${o.acc}_${o.label}.yaml`, y(o.sM)), 250);
+}
+
+/* ────────────── 판정 계산 (순수 함수 · 단일 출처) ──────────────
+   화면 3·4·5 가 모두 이 두 함수만 쓴다. 검정 로직의 복사본을 만들지 않는다.
+   검정 방향은 축마다 다르다 — 구조는 단측(신호 > 노이즈), 결합은 양측.
+   두 축은 귀무가설이 다르므로 det 를 합성하지 않고 나란히 읽는다. */
+let RMSD=null, IPTM=null;
+const VERDICT_CACHE = {};          // 순열 2만 회를 렌더마다 돌리지 않는다
+
+/** 구조 축 — 변이 잔기 8 Å 이내 Cα 국소 RMSD, 재현 노이즈 바닥 대비 */
+async function computeStructureVerdict(gene){
+  const key = 'S:'+gene; if(VERDICT_CACHE[key]) return VERDICT_CACHE[key];
+  if(!RMSD) RMSD = await loadCsv('data/rmsd_pairs.csv');
+  const rows  = RMSD.filter(r=>r.gene===gene);
+  const noise = rows.filter(r=>r.comparison.startsWith('noise')).map(r=>+r.rmsd_local8A);
+  const sig   = rows.filter(r=>r.comparison==='signal_WT_vs_MUT').map(r=>+r.rmsd_local8A);
+
+  // 쌍 목록에서 거리 행렬을 복원한다 (0..k-1 = 야생형 모델, k..2k-1 = 변이형 모델)
+  const k = Math.max(...rows.map(r=>+r.model_b)) + 1;
+  const N = 2*k, D = new Float64Array(N*N);
+  let filled = 0;
+  for(const r of rows){
+    const i=+r.model_a, j=+r.model_b, v=+r.rmsd_local8A;
+    const [a,b] = r.comparison==='noise_WT'  ? [i, j]
+                : r.comparison==='noise_MUT' ? [k+i, k+j]
+                :                              [i, k+j];
+    if(!D[a*N+b]) filled++;
+    D[a*N+b] = D[b*N+a] = v;
+  }
+  const {p:pMW} = mannWhitneyU(sig, noise, 'greater');
+  // 행렬이 불완전하면 순열을 돌릴 수 없으므로 근사값으로 후퇴한다
+  const perm = filled === N*(N-1)/2 ? permutationP(D, N, k)
+                                    : {p:pMW, method:'mw', nPerm:0};
+  const mn=median(noise), ms=median(sig);
+  return (VERDICT_CACHE[key] = {
+    axis:'structure', gene, noise, sig, p:perm.p, pMW, det:perm.p<0.05,
+    method:perm.method, nPerm:perm.nPerm,
+    mn, ms, d:ms-mn, ratio:ms/mn});
+}
+
+/* 결합 축 원자료의 사례별 대립형질 라벨과 결합 파트너.
+   ⚠️ PILRA 는 UniProt 정본이 이미 R78 이라 정상형이 G78 이다 (문헌 표기는 G78R).
+      inputs/boltz/README_NPDC1.md 의 명명 규칙과 같다. */
+const BIND_ALLELES = {
+  TREM2: {wt:'WT',  mut:'R62H', lig:'Aβ42'},
+  PILRA: {wt:'G78', mut:'R78',  lig:'NPDC1'},
+};
+
+/** 결합 축 — 복합체 ipTM. 구조 축과 같은 음성 대조군 설계를 쓴다.
+    ipTM 은 구조당 스칼라이므로 쌍 차이 |ipTM_i − ipTM_j| 로 바꿔 쌍 설계에 맞춘다.
+    같은 대립형질 안의 쌍 = 모델 진동(노이즈) · 대립형질 간 쌍 = 변이 신호. */
+async function computeBindingVerdict(gene){
+  const key = 'B:'+gene; if(VERDICT_CACHE[key]) return VERDICT_CACHE[key];
+  if(!IPTM) IPTM = await loadCsv('data/boltz_iptm.csv');
+  const al = BIND_ALLELES[gene];
+  if(!al) return null;                        // 결합 축 원자료가 없는 사례
+  const pick = a => IPTM.filter(r=>r.gene===gene && r.allele===a).map(r=>+r.iptm);
+  const wt = pick(al.wt), mut = pick(al.mut);
+  if(!wt.length || !mut.length) return null;
+
+  const vals = [...wt, ...mut], N = vals.length, D = new Float64Array(N*N);
+  for(let i=0;i<N;i++) for(let j=0;j<N;j++) D[i*N+j] = Math.abs(vals[i]-vals[j]);
+  const inA = new Uint8Array(N); for(let i=0;i<wt.length;i++) inA[i]=1;
+  const {noise, signal} = splitPairs(D, N, inA);
+
+  const {p:pMW} = mannWhitneyU(signal, noise, 'greater');
+  const perm = permutationP(D, N, wt.length);
+  const mn=median(noise), ms=median(signal), mw=median(wt), mm=median(mut);
+  return (VERDICT_CACHE[key] = {
+    axis:'binding', gene, wt, mut, noise, signal,
+    p:perm.p, pMW, det:perm.p<0.05, method:perm.method, nPerm:perm.nPerm,
+    mn, ms, dPair:ms-mn, ratio:ms/mn,
+    // 원시 ipTM 기술통계 — 화면 4 가 아직 쓴다 (커밋 2 에서 쌍 차이 표시로 교체)
+    mw, mm, d:mm-mw, spread:Math.max(...wt)-Math.min(...wt)});
+}
+
+/* ────────────── 화면 3·4 · 검정 결과 표시 ────────────── */
+
+async function renderStructureAxis(gene){
+  const v = await computeStructureVerdict(gene);
+  const c = CASES[gene];
+  const {p, det, mn, ms, d, noise, sig} = v;
+
+  $('#sTitle').innerHTML = `${gene} · ${caseLabel(gene)} <span class="muted mono">${c.rsid}</span>`;
+
+  $('#sScore').innerHTML = `
+   <div class="score ${det?'sig':'ns'}">
+    <div class="top">
+      <div class="verdict">${det?'재현 변동성 초과':'재현 변동성 내'}</div>
+      <div class="vsub">${det
+        ? '변이로 인한 편차가 모델 재현 변동을 통계적으로 초과합니다'
+        : '변이로 인한 편차가 모델 재현 변동과 구분되지 않습니다'}</div>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><div class="kl">p-value</div>
+        <div class="kv mono">${fmtP(p)}</div>
+        <div class="kn">${methodNote(v)}</div></div>
+      <div class="kpi"><div class="kl">편차 Δ</div>
+        <div class="kv mono">${d>=0?'+':''}${d.toFixed(3)} <span style="font-size:15px">Å</span></div>
+        <div class="kn">${det?`Cα–Cα 결합거리의 약 ${Math.round(Math.abs(d)/1.5*100)}%`:'기준 변동 범위 이내'}</div></div>
+    </div>
+    <div class="rows">
+      ${row('기준 반복 변동 (n='+noise.length+')', mn.toFixed(3)+' Å')}
+      ${row('범위', Math.min(...noise).toFixed(3)+' – '+Math.max(...noise).toFixed(3), 1)}
+      ${row('변이 비교 편차 (n='+sig.length+')', ms.toFixed(3)+' Å')}
+      ${row('비율', (ms/mn).toFixed(2)+'×')}
+    </div>
+    <div class="foot">${det
+      ? '귀무가설을 기각합니다. 다만 효과크기를 함께 확인하십시오.'
+      : '귀무가설을 기각하지 못했습니다. 구조 불변이 아니라 본 모델의 감별 한계를 의미합니다.'}${floorNote(v)}</div>
+   </div>`;
+
+  $('#sCond').innerHTML = `
+    <tr><td>모델</td><td class="mono">AlphaFold Server (AF3)</td></tr>
+    <tr><td>입력 구간</td><td class="mono">UniProt ${c.acc} 전장 (${c.len} aa)</td></tr>
+    <tr><td>시드 / 샘플</td><td class="mono">seed 1 · n = 5</td></tr>
+    <tr><td>정렬 구간</td><td class="mono">도메인 ${c.domain[0]}–${c.domain[1]} Cα</td></tr>
+    <tr><td>컷오프</td><td class="mono">8 Å (변이 잔기 기준)</td></tr>
+    <tr><td>검정</td><td class="mono">라벨 순열검정 · ${v.method==='exact'
+        ? `정확 ${v.nPerm}분할 · 최소 가능 p ${pFloor(v).toFixed(4)}`
+        : `표본 ${v.nPerm.toLocaleString()}회`}</td></tr>`;
+
+  drawStrip('#sPlot', [
+    {label:'기준 반복', vals:noise, color:'#2a78d6'},
+    {label:'변이 비교', vals:sig,   color:'#eb6834'}],
+    '국소 RMSD (Å)');
+
+  loadViewer([`data/structures/${c.wtCif}.cif`, `data/structures/${c.mutCif}.cif`],
+             ['#2a4fd8','#e03a3a'], '#sViewer', c.img);
+  window._curGene = gene;
+}
+
+async function renderBindingAxis(){
+  const v = await computeBindingVerdict('TREM2');   // s4 화면은 TREM2 전용
+  const {p, det, mn, ms, ratio, noise, signal, mw, mm, wt, mut} = v;
+
+  $('#bScore').innerHTML = `
+   <div class="score ${det?'sig':'ns'}">
+    <div class="top">
+      <div class="verdict">${det?'재현 변동성 초과':'재현 변동성 내'}</div>
+      <div class="vsub">${det
+        ? '변이로 인한 ipTM 편차가 모델 재현 변동을 통계적으로 초과합니다'
+        : '변이로 인한 ipTM 편차가 모델 재현 변동과 구분되지 않습니다'}</div>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><div class="kl">p-value</div>
+        <div class="kv mono">${fmtP(p)}</div>
+        <div class="kn">${methodNote(v)}</div></div>
+      <div class="kpi"><div class="kl">신호 / 노이즈 비</div>
+        <div class="kv mono">${ratio.toFixed(2)}×</div>
+        <div class="kn">${ratio < 1
+          ? '1.0 미만 — 변이 쌍 차이가 같은 서열 쌍 차이보다도 작습니다'
+          : '1.0 초과 — 변이 쌍 차이가 더 큽니다'}</div></div>
+    </div>
+    <div class="rows">
+      ${row('기준 반복 변동 (n='+noise.length+'쌍)', mn.toFixed(3))}
+      ${row('범위', Math.min(...noise).toFixed(3)+' – '+Math.max(...noise).toFixed(3), 1)}
+      ${row('변이 비교 편차 (n='+signal.length+'쌍)', ms.toFixed(3))}
+      ${row('비율', ratio.toFixed(2)+'×')}
+      ${row('원시 ipTM 중앙값', '야생형 '+mw.toFixed(3)+' / 변이형 '+mm.toFixed(3), 1)}
+    </div>
+    <div class="foot">구조 축과 같은 음성 대조군 설계입니다 — 같은 서열끼리의 ipTM 쌍 차이가
+      모델 진동(노이즈), 대립형질 간 쌍 차이가 변이 신호입니다.
+      ${det ? '' : `신호가 노이즈를 넘지 못했습니다. 결합 변화가 없다는 뜻이 아니라
+      <b>이 모델이 변이를 감지하지 못한다</b>는 뜻입니다.`}
+      Bret et al. (2026) 이 보고한 결합부위 변이 둔감성과 부합합니다.</div>
+   </div>`;
+
+  drawStrip('#bPlot', [
+    {label:'기준 반복', vals:noise,  color:'#2a78d6'},
+    {label:'변이 비교', vals:signal, color:'#eb6834'}],
+    'ipTM 쌍 차이 |Δ|');
+
+  loadViewer(['data/structures/trem2_ab42_wt.cif','data/structures/trem2_ab42_r62h.cif'],
+             ['#2a4fd8','#e03a3a'], '#bViewer', 'TREM2_overlay.png');
+}
+
+const row=(k,v,sub,cls)=>`<div class="row${sub?' sub':''}">
+  <span class="k">${k}</span><span class="v mono ${cls||''}">${v}</span></div>`;
+
+/* 검정 방식 표기. 전수 열거면 분할 수, 표본이면 순열 횟수를 함께 적는다. */
+const methodNote = v => v.method === 'exact'
+  ? `순열검정 · 단측 · α = 0.05 · 정확 ${v.nPerm}분할`
+  : `순열검정 · 단측 · α = 0.05 · 표본 ${v.nPerm.toLocaleString()}회`;
+
+/* 전수 열거에서 도달 가능한 최소 p. 판정이 이 값에 붙어 있으면 그렇게 밝힌다. */
+const pFloor = v => v.method === 'exact' ? 1 / v.nPerm : null;
+const floorNote = v => {
+  const f = pFloor(v);
+  return (f !== null && v.p <= f + 1e-12)
+    ? ` 이 값은 표본 크기가 허용하는 <b>최소 p (1/${v.nPerm} = ${f.toFixed(4)})</b> 입니다 —
+       더 작은 p 를 주장하려면 조건당 모델 수를 늘려야 합니다.`
+    : '';
+};
+
+/* ────────────── 분포 도표 (SVG 직접 생성) ────────────── */
+function drawStrip(sel, groups, xlabel){
+  const W=760, H=groups.length*88+64, L=132, R=36, T=18;
+  const all=groups.flatMap(g=>g.vals);
+  const lo=0, hi=Math.max(...all)*1.08;
+  const x=v=>L+(v-lo)/(hi-lo)*(W-L-R);
+  let s=`<svg viewBox="0 0 ${W} ${H}" width="100%">`;
+  // 격자
+  const ticks=5;
+  for(let i=0;i<=ticks;i++){
+    const v=lo+(hi-lo)*i/ticks, px=x(v);
+    s+=`<line x1="${px}" y1="${T}" x2="${px}" y2="${H-44}" stroke="#e6e5e1"/>`;
+    s+=`<text x="${px}" y="${H-26}" font-size="11" fill="#52514e" text-anchor="middle">${v.toFixed(2)}</text>`;
+  }
+  groups.forEach((g,gi)=>{
+    const cy=T+34+gi*88;
+    s+=`<text x="${L-12}" y="${cy+4}" font-size="12" fill="#52514e" text-anchor="end">${g.label}</text>`;
+    s+=`<text x="${L-12}" y="${cy+19}" font-size="10.5" fill="#8a8a86" text-anchor="end">n = ${g.vals.length}</text>`;
+    g.vals.forEach((v,i)=>{
+      const jy=cy+((i*37)%25)-12;
+      s+=`<circle cx="${x(v)}" cy="${jy}" r="4.4" fill="${g.color}" fill-opacity=".55" stroke="#fff" stroke-width="1.1"/>`;
+    });
+    const m=median(g.vals);
+    s+=`<line x1="${x(m)}" y1="${cy-24}" x2="${x(m)}" y2="${cy+24}" stroke="${g.color}" stroke-width="2.8"/>`;
+    s+=`<text x="${x(m)}" y="${cy-30}" font-size="11.5" font-weight="700" fill="${g.color}" text-anchor="middle">${m.toFixed(3)}</text>`;
+  });
+  s+=`<text x="${(L+W-R)/2}" y="${H-6}" font-size="11.5" fill="#52514e" text-anchor="middle">${xlabel}</text></svg>`;
+  $(sel).innerHTML=s;
+}
+
+/* ────────────── Mol* 뷰어 ────────────── */
+let viewers={};
+function webglOk(){
+  try{const c=document.createElement('canvas');
+      return !!(c.getContext('webgl2')||c.getContext('webgl'));}catch(e){return false;}
+}
+
+async function loadViewer(files, colors, sel='#sViewer', fallbackImg=null){
+  const el=$(sel); if(!el) return;
+  // WebGL 이 없는 환경(헤드리스 캡처 등)에서는 사전 렌더 이미지로 대체한다
+  if(!webglOk() || typeof molstar==='undefined'){
+    el.innerHTML = fallbackImg
+      ? `<img src="data/img/${fallbackImg}" style="width:100%;height:100%;object-fit:contain">
+         <div class="vnote">사전 렌더 이미지 · 대화형 3D는 WebGL 지원 브라우저에서 표시된다</div>`
+      : `<div class="vfallback">WebGL 미지원 환경</div>`;
+    return;
+  }
+  try{
+    if(!viewers[sel]){
+      viewers[sel] = await molstar.Viewer.create(el.id, {
+        layoutIsExpanded:false, layoutShowControls:false, layoutShowSequence:false,
+        layoutShowLog:false, layoutShowLeftPanel:false, viewportShowExpand:true,
+        viewportShowSelectionMode:false, viewportShowAnimation:false, pdbProvider:'rcsb'
+      });
+    }
+    const v=viewers[sel];
+    await v.plugin.clear();
+    for(let i=0;i<files.length;i++){
+      await v.loadStructureFromUrl(new URL(files[i], location.href).href, 'mmcif', false,
+        {representationParams:{theme:{globalName:'uniform',
+          globalColorParams:{value: parseInt(colors[i].slice(1),16)}}}});
+    }
+  }catch(e){
+    el.innerHTML=`<div class="vfallback">3D 뷰어를 초기화하지 못했습니다.<br>
+      <span class="muted">${e.message}</span><br>
+      <span class="muted">로컬 파일(file://)로 열면 CORS로 차단됩니다 — HTTP 서버로 여십시오.</span></div>`;
+  }
+}
+
+/* ────────────── 초기화 ────────────── */
+function initNav(){
+  $$('nav a').forEach(a=>a.onclick=e=>{
+    e.preventDefault();
+    $$('nav a').forEach(x=>x.classList.remove('on'));
+    $$('.screen').forEach(x=>x.classList.remove('on'));
+    a.classList.add('on'); $('#'+a.dataset.s).classList.add('on');
+    window.scrollTo(0,0);
+    if(a.dataset.s==='s3'){ if(window._curGene==='__USER__') renderUserResult();
+                            else renderStructureAxis(window._curGene||'CD33'); }
+    if(a.dataset.s==='s4') renderBindingAxis();
+    if(a.dataset.s==='s5') renderReport();
+  });
+}
+
+async function renderReport(){
+  let html='';
+  const sv={};                       // 사례별 구조 축 판정 — 매트릭스에서 재사용한다
+  for(const g of Object.keys(CASES)){
+    const c=CASES[g];
+    const v = await computeStructureVerdict(g); sv[g]=v;
+    const {p, det, mn, ms} = v;
+    html+=`<tr><td><b>${g}</b> <span class="mono muted">${caseLabel(g)}</span></td>
+      <td class="mono">구조</td><td class="n mono">${mn.toFixed(3)} Å</td>
+      <td class="n mono">${ms.toFixed(3)} Å</td>
+      <td class="n mono">${(ms/mn).toFixed(2)}×</td>
+      <td class="n mono">${fmtP(p)}</td>
+      <td><span class="badge ${det?'sig':'ns'}">${det?'변동성 초과':'변동성 내'}</span></td></tr>`;
+  }
+  const bv={};                       // 사례별 결합 축 판정 — 매트릭스에서 재사용한다
+  for(const g of BIND_MEASURED){
+    const b = await computeBindingVerdict(g);
+    if(!b) continue;
+    bv[g]=b;
+    const al=BIND_ALLELES[g];
+    html+=`<tr><td><b>${g}</b> <span class="mono muted">${caseLabel(g)} + ${al.lig}</span></td>
+      <td class="mono">인터페이스</td><td class="n mono">${b.mn.toFixed(3)}</td>
+      <td class="n mono">${b.ms.toFixed(3)}</td>
+      <td class="n mono">${b.ratio.toFixed(2)}×</td><td class="n mono">${fmtP(b.p)}</td>
+      <td><span class="badge ${b.det?'sig':'ns'}">${b.det?'변동성 초과':'변동성 내'}</span></td></tr>`;
+  }
+  $('#rTable').innerHTML=html;
+  renderVerdictMatrix(sv, bv);       // 위에서 구한 판정을 그대로 넘긴다 (재계산 없음)
+}
+
+/* ────────────── 종합 판정 매트릭스 (2×2) ──────────────
+   두 축의 det 를 AND/OR 로 합성하지 않는다. 구조는 단측(신호 > 노이즈),
+   결합은 양측이라 귀무가설이 다르다 — 교차 배치해 나란히 읽는 표다.
+
+   결합 축 원자료(boltz_iptm.csv)는 gene 칼럼이 없는 TREM2 단일 사례 전제다.
+   CD33·PILRA 는 '결합 미측정' 으로 매트릭스 밖에 둔다.
+   미측정과 미감별은 다른 상태이므로 빈칸을 '차이 없음' 으로 표시하지 않는다. */
+const BIND_MEASURED = ['TREM2', 'PILRA'];   // 결합 축 예측을 실제로 돌린 사례
+const CELL_HINT = {                  // 빈칸에 표시할 향후 배치 후보
+  // 남은 미측정 사례는 CD33 하나이고 구조 축이 변동성 내이므로 아래 행에만 후보가 된다
+  'false|true' : 'CD33 결합 예측 시 후보',
+  'false|false': 'CD33 결합 예측 시 후보',
+};
+const CELL_NOTE = {                  // 칸 안에 함께 표시할 추정 — 단정하지 않는다
+  PILRA: 'PILRA 결합은 시알산 매개인데 Boltz-2 단백질–단백질 예측에는 글리칸이 없어 '
+       + '그 효과를 볼 수 없습니다. 모델의 감별 한계와 글리칸 부재를 이 결과만으로는 구분할 수 없습니다. '
+       + '<span class="mono">Rathore 2018, PLoS Genet 14:e1007427</span> — R78 이 리간드 결합 50% 이상 감소',
+};
+
+function renderVerdictMatrix(sv, bv){
+  // 어느 칸인지는 실측 판정에서 유도한다 — 위치를 하드코딩하지 않는다.
+  // 결합 예측이 추가되거나 판정이 바뀌면 칸도 따라 움직인다.
+  const placed={};
+  BIND_MEASURED.forEach(g=>{
+    if(!sv[g] || !bv[g]) return;
+    (placed[`${sv[g].det}|${bv[g].det}`] ||= []).push(g);
+  });
+
+  const cell = key => {
+    const occ = placed[key] || [];
+    if(!occ.length) return `<td class="mcell"><span class="muted">해당 사례 없음</span>${
+      CELL_HINT[key] ? `<div class="mhint">${CELL_HINT[key]}</div>` : ''}</td>`;
+    return `<td class="mcell on">${occ.map(g=>{
+      const al=BIND_ALLELES[g];
+      return `<div class="mcase"><b>${g}</b> <span class="mono">${caseLabel(g)}</span> ✔</div>
+        <div class="mhint">구조 p = ${fmtP(sv[g].p)} · 결합 p = ${fmtP(bv[g].p)} <span class="muted">(+ ${al.lig})</span></div>${
+        CELL_NOTE[g] ? `<div class="mnote"><b>추정</b> — ${CELL_NOTE[g]}</div>` : ''}`;
+    }).join('')}</td>`;
+  };
+
+  const miss = Object.keys(CASES).filter(g=>!BIND_MEASURED.includes(g))
+    .map(g=>`${g} ${CASES[g].wt}${CASES[g].pos}${CASES[g].mut}`);
+
+  $('#rMatrix').innerHTML = `
+    <table class="matrix">
+      <tr><th style="width:26%"></th>
+          <th>결합 축 — 변동성 초과</th><th>결합 축 — 변동성 내</th></tr>
+      <tr><th>구조 축 — 변동성 초과</th>${cell('true|true')}${cell('true|false')}</tr>
+      <tr><th>구조 축 — 변동성 내</th>${cell('false|true')}${cell('false|false')}</tr>
+    </table>
+    <div class="mfoot"><b>결합 축 미측정</b> — ${miss.join(' · ')}
+      <span class="muted">· 결합 파트너를 문헌으로 확정한 뒤 Boltz-2 예측이 필요하여
+      매트릭스에 배치하지 않았습니다. 미측정은 미감별과 다른 상태입니다.</span></div>`;
+}
+
+function gotoScreen(id){
+  if(!document.getElementById(id)) return;
+  $$('nav a').forEach(x=>x.classList.remove('on'));
+  $$('.screen').forEach(x=>x.classList.remove('on'));
+  document.getElementById(id).classList.add('on');
+  const na=$(`nav a[data-s="${id}"]`); if(na) na.classList.add('on');
+  if(id==='s3'){ if(window._curGene==='__USER__') renderUserResult();
+                 else renderStructureAxis(window._curGene||'CD33'); }
+  if(id==='s4') renderBindingAxis();
+  if(id==='s5') renderReport();
+}
+
+window.addEventListener('DOMContentLoaded', ()=>{
+  initNav();
+  $('#lookup').onclick = doLookup;
+  $('#acc').addEventListener('keydown', e=>{ if(e.key==='Enter') doLookup(); });
+  $('#mut').addEventListener('input', validateMut);
+  $('#useDom').addEventListener('change', validateMut);
+  $('#dlFasta').onclick=dlFasta; $('#dlAf').onclick=dlAf; $('#dlBoltz').onclick=dlBoltz;
+  $$('[data-goto]').forEach(b=>b.onclick=()=>gotoScreen(b.dataset.goto));
+  const rb=$('#runBtn'); if(rb) rb.onclick=()=>{
+    const g=Object.keys(CASES).find(k=>CASES[k].acc===currentAcc);
+    if(g){ window._curGene=g; gotoScreen('s3'); return; }
+    // 사전 산출 결과가 없는 입력 — 다른 사례의 결과를 보여주지 않는다
+    $('#runMsg').innerHTML =
+      `<b>사전 산출 결과가 없습니다.</b><br>`
+      + `구조 예측 실행은 GPU 가 필요하여 본 데모에 포함되지 않았습니다. `
+      + `위 입력 파일을 내려받아 AlphaFold Server 또는 Boltz-2 에서 예측한 뒤 결과를 분석하십시오.`
+      + `<br><span class="muted">수록 사례: CD33 P20138 · PILRA Q9UKJ1 · TREM2 Q9NZC2</span>`;
+    $('#runMsg').style.display='block';
+  };
+  $$('.casebtn').forEach(b=>b.onclick=()=>{
+    $$('.casebtn').forEach(x=>x.classList.remove('on')); b.classList.add('on');
+    window._curGene=b.dataset.g;
+    if(b.dataset.g==='__USER__') renderUserResult(); else renderStructureAxis(b.dataset.g);
+  });
+  initUpload();
+  // ?s=s3 또는 #s3 으로 특정 화면 진입 (캡처·딥링크용)
+  const want=new URLSearchParams(location.search).get('s')
+            || (location.hash||'').replace('#','');
+  if(want) gotoScreen(want);
+  const qp=new URLSearchParams(location.search);
+  if(qp.get('acc')) $('#acc').value=qp.get('acc').toUpperCase();
+  if(qp.get('mut')) $('#mut').value=qp.get('mut').toUpperCase();
+  // 화면 2 진입 시 기본 사례를 자동 조회 (첫 화면이 빈 상태로 보이지 않게)
+  if(want==='s2' || !want) doLookup();
+
+  // 사례 프리셋
+  $$('[data-preset]').forEach(b=>b.onclick=()=>{
+    const c=CASES[b.dataset.preset];
+    $('#acc').value=c.acc; $('#mut').value=`${c.wt}${c.pos}${c.mut}`;
+    $$('nav a').forEach(x=>x.classList.remove('on'));
+    $$('.screen').forEach(x=>x.classList.remove('on'));
+    $('nav a[data-s="s2"]').classList.add('on'); $('#s2').classList.add('on');
+    window.scrollTo(0,0); doLookup();
+  });
+});
+
+/* ══════════════════════════════════════════════════════════════
+   결과 업로드 → 브라우저에서 편차 계산 및 검정
+   ══════════════════════════════════════════════════════════════ */
+let UPLOAD = null;   // {groups, keys}
+
+function initUpload(){
+  const drop=$('#drop'), inp=$('#zipInput');
+  if(!drop) return;
+  drop.onclick = ()=>inp.click();
+  drop.ondragover = e=>{e.preventDefault(); drop.classList.add('over');};
+  drop.ondragleave = ()=>drop.classList.remove('over');
+  drop.ondrop = e=>{e.preventDefault(); drop.classList.remove('over');
+    if(e.dataTransfer.files[0]) handleZip(e.dataTransfer.files[0]);};
+  inp.onchange = ()=>{ if(inp.files[0]) handleZip(inp.files[0]); };
+  $('#calcBtn').onclick = runUserAnalysis;
+}
+
+async function handleZip(file){
+  const msg=$('#zipMsg');
+  msg.className='msg'; msg.innerHTML=`<span class="spin"></span> ${file.name} 읽는 중…`;
+  $('#pickWrap').style.display='none';
+  try{
+    const groups = await readZip(file);
+    const keys = Object.keys(groups).filter(k=>groups[k].length>=2);
+    if(keys.length < 2){
+      msg.className='msg warn';
+      msg.innerHTML = `<b>구조 그룹이 부족합니다.</b> 야생형과 변이형 각각 2개 이상의 모델이 필요합니다.`
+        + `<br><span class="muted">인식된 그룹: ${Object.keys(groups).map(k=>`${k}(${groups[k].length})`).join(', ')||'없음'}</span>`;
+      return;
+    }
+    UPLOAD = {groups, keys};
+    const opts = keys.map(k=>`<option value="${k}">${k} — 모델 ${groups[k].length}개</option>`).join('');
+    $('#selWt').innerHTML = opts;
+    $('#selMut').innerHTML = opts;
+    // 이름으로 야생형/변이형 자동 추정
+    const wtGuess = keys.find(k=>/_wt|wild/i.test(k));
+    const mutGuess = keys.find(k=>k!==wtGuess);
+    if(wtGuess) $('#selWt').value = wtGuess;
+    if(mutGuess) $('#selMut').value = mutGuess;
+
+    msg.className='msg ok';
+    msg.innerHTML = `<b>${Object.values(groups).flat().length}개 구조를 읽었습니다.</b>`
+      + ` 그룹 ${keys.length}개 — ${keys.join(', ')}`;
+    $('#pickWrap').style.display='block';
+    $('#fs1').classList.add('done');
+  }catch(e){
+    msg.className='msg warn';
+    msg.innerHTML = `<b>읽지 못했습니다.</b> ${e.message}<br>
+      <span class="muted">ZIP 안에 .cif 파일이 있는지 확인해 주세요.</span>`;
+  }
+}
+
+function runUserAnalysis(){
+  const msg=$('#zipMsg');
+  const wtKey=$('#selWt').value, mutKey=$('#selMut').value;
+  if(wtKey===mutKey){
+    msg.className='msg warn';
+    msg.innerHTML='<b>같은 그룹을 선택했습니다.</b> 야생형과 변이형을 서로 다른 그룹으로 지정해 주세요.';
+    return;
+  }
+  const m=$('#mut').value.trim().toUpperCase().match(/^([A-Z])(\d+)([A-Z])$/);
+  if(!m){ msg.className='msg warn'; msg.innerHTML='<b>변이 표기를 먼저 입력해 주세요.</b> 국소 편차 측정에 위치가 필요합니다.'; return; }
+  const pos=+m[2];
+
+  msg.className='msg'; msg.innerHTML='<span class="spin"></span> 편차 계산 중…';
+  setTimeout(()=>{
+    const wtSet=UPLOAD.groups[wtKey].map(o=>o.struct);
+    const mutSet=UPLOAD.groups[mutKey].map(o=>o.struct);
+    const r=runDetectability(wtSet, mutSet, pos);
+    if(r.error){ msg.className='msg warn'; msg.innerHTML=`<b>${r.error}</b>`; return; }
+    if(!r.baseline.length){ msg.className='msg warn';
+      msg.innerHTML=`<b>${pos}번 잔기 주변에서 비교할 Cα 를 찾지 못했습니다.</b> 위치와 구간을 확인해 주세요.`; return; }
+
+    window._userResult = {...r, pos, label:`${m[1]}${pos}${m[3]}`,
+      acc:currentAcc||'—', wtKey, mutKey,
+      nWt:wtSet.length, nMut:mutSet.length};
+    msg.className='msg ok';
+    msg.innerHTML=`<b>계산 완료.</b> 구조 검증 화면에서 결과를 확인하세요.`;
+    $('#userTab').style.display='inline-block';
+    window._curGene='__USER__';
+    gotoScreen('s3');
+  }, 30);
+}
+
+/* 업로드 결과를 구조 검증 화면에 표시 */
+function renderUserResult(){
+  const u=window._userResult;
+  if(!u){ $('#sScore').innerHTML='<div class="msg">업로드된 결과가 없습니다.</div>'; return; }
+  const mn=median(u.baseline), ms=median(u.signal), d=ms-mn, det=u.detected;
+
+  $('#sTitle').innerHTML = `${u.acc} · ${u.label} <span class="muted mono">업로드 결과</span>`;
+  $('#sScore').innerHTML = `
+   <div class="score ${det?'sig':'ns'}">
+    <div class="top">
+      <div class="verdict">${det?'재현 변동성 초과':'재현 변동성 내'}</div>
+      <div class="vsub">${det
+        ? '변이로 인한 편차가 모델 재현 변동을 통계적으로 초과합니다'
+        : '변이로 인한 편차가 모델 재현 변동과 구분되지 않습니다'}</div>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><div class="kl">p-value</div><div class="kv mono">${fmtP(u.p)}</div>
+        <div class="kn">${u.method ? methodNote(u) : '순열검정 · 단측 · α = 0.05'}</div></div>
+      <div class="kpi"><div class="kl">편차 Δ</div>
+        <div class="kv mono">${d>=0?'+':''}${d.toFixed(3)} <span style="font-size:15px">Å</span></div>
+        <div class="kn">${det?`Cα–Cα 결합거리의 약 ${Math.round(Math.abs(d)/1.5*100)}%`:'기준 변동 범위 이내'}</div></div>
+    </div>
+    <div class="rows">
+      ${row('기준 반복 변동 (n='+u.baseline.length+')', mn.toFixed(3)+' Å')}
+      ${row('범위', Math.min(...u.baseline).toFixed(3)+' – '+Math.max(...u.baseline).toFixed(3), 1)}
+      ${row('변이 비교 편차 (n='+u.signal.length+')', ms.toFixed(3)+' Å')}
+      ${row('비율', (ms/mn).toFixed(2)+'×')}
+    </div>
+    <div class="foot">${det
+      ? '귀무가설을 기각합니다. 효과크기를 함께 확인하십시오.'
+      : '귀무가설을 기각하지 못했습니다. 구조 불변이 아니라 본 모델의 감별 한계를 의미합니다.'}</div>
+   </div>`;
+
+  $('#sCond').innerHTML = `
+    <tr><td>입력</td><td class="mono">사용자 업로드</td></tr>
+    <tr><td>야생형 그룹</td><td class="mono">${u.wtKey} · 모델 ${u.nWt}개</td></tr>
+    <tr><td>변이형 그룹</td><td class="mono">${u.mutKey} · 모델 ${u.nMut}개</td></tr>
+    <tr><td>정렬 구간</td><td class="mono">${u.nFit} 잔기 ${u.usedCore?'(pLDDT ≥ 70)':'(전체 — 고신뢰 잔기 부족)'}</td></tr>
+    <tr><td>컷오프</td><td class="mono">8 Å (${u.pos}번 기준)</td></tr>
+    <tr><td>검정</td><td class="mono">${u.method==='exact'
+        ? `라벨 순열검정 · 정확 ${u.nPerm}분할 · 최소 가능 p ${(1/u.nPerm).toFixed(4)}`
+        : u.method==='sample' ? `라벨 순열검정 · 표본 ${u.nPerm.toLocaleString()}회`
+        : 'Mann–Whitney U (쌍 일부 결측으로 순열 불가)'}</td></tr>`;
+
+  drawStrip('#sPlot', [
+    {label:'기준 반복', vals:u.baseline, color:'#2a78d6'},
+    {label:'변이 비교', vals:u.signal,   color:'#eb6834'}], '국소 RMSD (Å)');
+
+  $('#sViewer').innerHTML = `<div class="vfallback">업로드된 결과에는 3D 미리보기를 제공하지 않습니다.<br>
+    <span class="muted">구조 파일은 원본 ZIP 에서 확인하십시오.</span></div>`;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   문서 모드 (?doc=1) — 슬라이드·기획서용 번호 콜아웃
+   실제 사용 화면에는 표시되지 않는다.
+   ══════════════════════════════════════════════════════════════ */
+const DOC_CALLOUTS = {
+  s1: [['.hero .eyebrow',1],['.hero h1',2],['.hero p',3],['.herolinks',4],
+       ['.how',5],['.seclabel',6],['.disclaimer',7]],
+  s2: [['#accBox',1],['#accInfo',2],['#mutBox',3],['#mutResult',4],
+       ['#genBox',5],['#dl',6],['.flow',7]],
+  s3: [['.tabs',1],['#sScore .top',2],['#sScore .kpis',3],['#sScore .rows',4],
+       ['#sViewer',5],['#sPlot',6],['#sCond',7]],
+  s4: [['#bScore .top',1],['#bScore .kpis',2],['#bViewer',3],
+       ['#bPlot',4],['.disclaimer',5]],
+  s5: [['#rMatrix',1],['#rTable',2],['.g2b .panel',3],['.disclaimer',4]],
+  s6: [['.panel',1],['.g2b',2],['.disclaimer',3]],
+};
+
+function applyDocMode(screenId){
+  const list = DOC_CALLOUTS[screenId]; if(!list) return;
+  const st = document.createElement('style');
+  st.textContent = `.docmark{position:absolute;z-index:60;width:26px;height:26px;border-radius:50%;
+    background:#1e3a5f;color:#fff;font:700 13px/26px -apple-system,sans-serif;text-align:center;
+    box-shadow:0 2px 7px rgba(0,0,0,.28);margin:-13px 0 0 -13px}`;
+  document.head.appendChild(st);
+  const seen = new Set();
+  list.forEach(([sel,n])=>{
+    const els=[...document.querySelectorAll(`#${screenId} ${sel}`)].filter(e=>!seen.has(e));
+    const el=els[0]; if(!el) return; seen.add(el);
+    const r=el.getBoundingClientRect();
+    const b=document.createElement('div');
+    b.className='docmark'; b.textContent=n;
+    b.style.left=(r.left+window.scrollX+9)+'px';
+    b.style.top=(r.top+window.scrollY+9)+'px';
+    document.body.appendChild(b);
+  });
+}
+
+if(new URLSearchParams(location.search).get('doc')==='1'){
+  window.addEventListener('load',()=>setTimeout(()=>{
+    const cur=[...document.querySelectorAll('.screen')].find(s=>s.classList.contains('on'));
+    if(cur) applyDocMode(cur.id);
+  }, 1200));
+}

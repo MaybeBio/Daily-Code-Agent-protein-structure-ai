@@ -1,0 +1,468 @@
+from mddb_workflow.tools.get_pdb_frames import get_pdb_frames, get_starting_pdb_frames
+from mddb_workflow.utils.auxiliar import load_json, warn, MISSING_TOPOLOGY, is_standard_topology
+from mddb_workflow.utils.auxiliar import MISSING_BONDS, JSON_SERIALIZABLE_MISSING_BONDS, MISSING_VALUE
+from mddb_workflow.utils.constants import MISSING_BONDS_FLAG
+from mddb_workflow.utils.vmd_spells import get_covalent_bonds
+from mddb_workflow.utils.gmx_spells import get_tpr_bonds as get_tpr_bonds_gromacs
+from mddb_workflow.utils.gmx_spells import get_tpr_atom_count
+from mddb_workflow.utils.mda_spells import get_tpr_bonds_mdanalysis
+from mddb_workflow.utils.type_hints import *
+import pytraj as pt
+from collections import Counter
+from math import ceil
+from os import stat
+
+FAILED_BOND_MINING_EXCEPTION = Exception('Failed to mine bonds')
+
+
+def get_bond_clashes(
+    bonds_1: list[list[int]],
+    bonds_2: list[list[int]],
+    excluded_atom_indices: set[int],
+    reference_bond_sets: Optional[list[Optional[frozenset[int]]]] = None,
+) -> list[tuple[int, tuple[int, ...], tuple[int, ...]]]:
+    """Return every atom whose bond set differs between two structures."""
+    # If the number of atoms in both lists is not matching then there is something very wrong
+    if len(bonds_1) != len(bonds_2):
+        raise ValueError(f'The number of atoms is not matching in both bond lists ({len(bonds_1)} and {len(bonds_2)})')
+    if reference_bond_sets is None:
+        # Create a set of bonds for each atom in the second list
+        reference_bond_sets = [
+            None if atom_index in excluded_atom_indices else frozenset(atom_bonds) - excluded_atom_indices
+            for atom_index, atom_bonds in enumerate(bonds_2)
+        ]
+
+    if len(reference_bond_sets) != len(bonds_2):
+        raise ValueError('The reference bond cache must contain one entry per atom')
+
+    clashes = []
+    for atom_index, expected_bonds in enumerate(reference_bond_sets):
+        if expected_bonds is None or atom_index in excluded_atom_indices:
+            continue
+        actual_bonds = set(bonds_1[atom_index]) - excluded_atom_indices
+        if actual_bonds != expected_bonds:
+            # Sort only mismatches, giving stable keys for counts across frames.
+            clashes.append((atom_index, tuple(sorted(actual_bonds)), tuple(sorted(expected_bonds))))
+    return clashes
+
+
+def do_bonds_match(
+    bonds_1: list[list[int]],
+    bonds_2: list[list[int]],
+    # A selection of atoms whose bonds are not evaluated
+    excluded_atom_indices: set[int],
+    # Set verbose as true to show which are the atoms preventing the match
+    verbose: bool = False,
+    # The rest of inputs are just for logs and debug
+    atoms: Optional[list['Atom']] = None,
+    reference_bond_sets: Optional[list[Optional[frozenset[int]]]] = None,
+) -> bool:
+    """Check the whole frame and optionally collect every atom mismatch.
+
+    A counter accumulates mismatch frequencies; a list retains each occurrence.
+    Cached reference sets must use the same reference bonds and exclusions.
+    """
+    clashes = get_bond_clashes(bonds_1, bonds_2, excluded_atom_indices, reference_bond_sets)
+    if clashes and verbose:
+        print(f' Found {len(clashes)} atoms with bond mismatches')
+        atom_index, actual_bonds, expected_bonds = clashes[0]
+        if atoms:
+            mismatch_atom_label = atoms[atom_index].label
+            print(f' First one in atom {mismatch_atom_label}:')
+            it_is_atom_labels = ', '.join(atoms[index].label for index in actual_bonds)
+            if it_is_atom_labels:
+                print(f'    It is bonded to atoms {it_is_atom_labels}')
+            else:
+                print(f'    It is not bonded to any atom')
+            it_should_be_atom_labels = ', '.join(atoms[index].label for index in expected_bonds)
+            print(f'    It should be bonded to atoms {it_should_be_atom_labels}')
+        else:
+            print(f' First one in atom with index {atom_index}:')
+            print(f"    It is bonded to atoms with indices {','.join(map(str, actual_bonds))}")
+            print(f"    It should be bonded to atoms with indices {','.join(map(str, expected_bonds))}")
+    return not clashes
+
+
+def get_most_stable_bonds(
+    structure: 'Structure',
+    trajectory_filepath: str,
+    snapshots: int,
+    frames_limit: int = 10
+) -> list[list[int]]:
+    """Get covalent bonds using VMD along different frames.
+    This way we avoid having false positives because 2 atoms are very close in one frame by accident.
+    This way we avoid having false negatives because 2 atoms are very far in one frame by accident.
+    """
+    # Get each frame in pdb format to run VMD
+    print('Finding most stable bonds')
+    frames, step, count = get_pdb_frames(structure, trajectory_filepath,
+                                         snapshots, frames_limit, pbar_bool=True)
+
+    # Track bonds along frames
+    frame_bonds = [get_covalent_bonds(frame_pdb) for frame_pdb in frames]
+
+    # Then keep those bonds which are respected in the majority of frames
+    # Usually wrongs bonds (both false positives and negatives) are formed only one frame
+    # It should not happend that a bond is formed around half of times
+    majority_cut = count / 2
+    atom_count = len(frame_bonds[0])
+    most_stable_bonds = []
+    for atom in range(atom_count):
+        total_bonds = []
+        # Accumulate all bonds
+        for frame in frame_bonds:
+            atom_bonds = frame[atom]
+            total_bonds += atom_bonds
+        # Keep only those bonds with more occurrences than half the number of frames
+        unique_bonds = set(total_bonds)
+        atom_most_stable_bonds = []
+        for bond in unique_bonds:
+            occurrences = total_bonds.count(bond)
+            if occurrences > majority_cut:
+                atom_most_stable_bonds.append(bond)
+        # Add current atom safe bonds to the total
+        most_stable_bonds.append(atom_most_stable_bonds)
+
+    return most_stable_bonds
+
+
+def get_bonds_reference_frame(
+    structure: 'Structure',
+    trajectory_file: 'File',
+    snapshots: int,
+    reference_bonds: list[list[int]],
+    excluded_atom_indices: set[int],
+    ignore_bonds: bool = False,
+    patience: int = 100,  # Limit of frames to check before we surrender
+    # Minimum ratio of checked frames where the same atom must fail to consider the test as failed
+    atom_failure_ratio: float = 0.2,
+    # Minimum number of frames where the same atom must fail to consider the test as failed
+    min_atom_failure_frames: int = 5,
+) -> tuple[int, bool]:
+    """Return a reference frame number where all bonds are exactly as they should (by VMD standards).
+    This is the frame used when representing the MD.
+    Also return a boolean saying if bonds are fine.
+    See find_bonds_reference_frame for more details.
+    """
+    reference_frame, bonds_are_fine, _ = find_bonds_reference_frame(structure, trajectory_file, snapshots,
+        reference_bonds, excluded_atom_indices, ignore_bonds, patience, atom_failure_ratio, min_atom_failure_frames)
+    return reference_frame, bonds_are_fine
+
+
+def find_bonds_reference_frame(
+    structure: 'Structure',
+    trajectory_file: 'File',
+    snapshots: int,
+    reference_bonds: list[list[int]],
+    excluded_atom_indices: set[int],
+    ignore_bonds: bool = False,
+    patience: int = 100,  # Limit of frames to check before we surrender
+    # Minimum ratio of checked frames where the same atom must fail to consider the test as failed
+    atom_failure_ratio: float = 0.2,
+    # Minimum number of frames where the same atom must fail to consider the test as failed
+    min_atom_failure_frames: int = 3,
+) -> tuple[int, bool, Optional[tuple[tuple[int, tuple[int, ...], tuple[int, ...]], int, int, int]]]:
+    """Return a reference frame number where all bonds are exactly as they should (by VMD standards).
+    This is the frame used when representing the MD.
+    Also return a boolean saying if bonds are fine.
+
+    If no frame respects all bonds then we check how often every atom fails.
+    If any atom fails in the atom failure ratio of checked frames or more then bonds are wrong.
+    If failures are spread along different atoms then bonds are considered fine.
+    In this case the frame with the fewest mismatches is returned as reference frame.
+
+    When bonds are wrong, also return the most frequent mismatch (i.e. the first row of the mismatches table)
+    along with the number of frames where it happens, the number of checked frames and the first frame where it happens.
+    Otherwise return None.
+    """
+    # If bonds were ignored then the reference frame makes no sense
+    if ignore_bonds: return 0, True, None
+
+    # If all atoms are to be excluded then set the first frame as the reference frame and stop here
+    if len(excluded_atom_indices) == len(structure.atoms):
+        print(' All atoms are excluded from bond checks -> Setting frame 1 as reference frame')
+        return 0, True, None
+
+    # Now that we have the reference bonds, we must find a frame where bonds are exactly the reference ones
+    frames_limit = min(patience, snapshots)
+    frames = get_starting_pdb_frames(structure, trajectory_file.path, snapshots, frames_limit)
+    print(f'Searching the reference frame for the bonds. Only first {frames_limit} frames will be checked.')
+    # We check all frames but we stop as soon as we find a match
+    bonds_reference_frame = None
+    clash_counts = Counter()
+    # Count the number of frames where every atom has a mismatch, no matter the bonds
+    atom_clash_counts = Counter()
+    checked_frames = 0
+    frame_clash_counts = []
+    # First frame where every mismatch happens
+    clash_first_frames = {}
+    # Cache the reference bond sets so do_bonds_match does not have to create them for every frame
+    reference_bond_sets = [
+        None if atom_index in excluded_atom_indices else frozenset(atom_bonds) - excluded_atom_indices
+        for atom_index, atom_bonds in enumerate(reference_bonds)
+    ]
+    try:
+        for frame_number, frame_pdb in enumerate(frames):
+            # Get the actual frame number
+            bonds = get_covalent_bonds(frame_pdb)
+            checked_frames += 1
+            frame_clashes = get_bond_clashes(
+                bonds,
+                reference_bonds,
+                excluded_atom_indices,
+                reference_bond_sets=reference_bond_sets,
+            )
+            # Track every atom mismatch in this frame and its frequency across frames.
+            frame_clash_counts.append(len(frame_clashes))
+            for clash in frame_clashes: clash_first_frames.setdefault(clash, frame_number)
+            clash_counts.update(frame_clashes)
+            atom_clash_counts.update(atom_index for atom_index, _, _ in frame_clashes)
+            if not frame_clashes:
+                bonds_reference_frame = frame_number
+                break
+    finally:
+        frames.close()
+    # If we found a frame with the reference bonds then we are done
+    if bonds_reference_frame is not None:
+        print(f' Got it -> Frame {bonds_reference_frame + 1}')
+        return bonds_reference_frame, True, None
+    # Summarize mismatching atoms per frame, not distinct undirected bonds.
+    print(
+        f' Atom mismatches per frame: min={min(frame_clash_counts)}, '
+        f'average={sum(frame_clash_counts) / checked_frames:.2f}, '
+        f'max={max(frame_clash_counts)}, '
+        f'total={sum(frame_clash_counts)}'
+    )
+    # Use the frame with the fewest mismatches as reference frame
+    bonds_reference_frame = frame_clash_counts.index(min(frame_clash_counts))
+    # Find atoms which fail too often
+    # If failures are spread along different atoms then they are likely random clashes/overstretches
+    failure_cut = ceil(checked_frames * atom_failure_ratio)
+    # With a few frames the cut would be too small and a few random failures would fail the test
+    # Thus we set a minimum of frames
+    if failure_cut < min_atom_failure_frames:
+        failure_cut = min_atom_failure_frames
+        warn(f'Only {checked_frames} frames were checked. With such a reduced sampling this test may fail.')
+    recurrent_atoms = [ atom_index for atom_index, n in atom_clash_counts.items() if n >= failure_cut ]
+    if not recurrent_atoms:
+        print(f' No atom fails in {failure_cut} or more of the {checked_frames} checked frames -> Bonds are considered fine')
+        print(f' Using the frame with the fewest mismatches -> Frame {bonds_reference_frame + 1}')
+        return bonds_reference_frame, True, None
+    print(f' {len(recurrent_atoms)} atoms fail in {failure_cut} or more of the {checked_frames} checked frames')
+    worst_atom_index, worst_atom_failures = atom_clash_counts.most_common(1)[0]
+    print(f' The most failing atom is {structure.atoms[worst_atom_index].label}'
+        f' which fails in {worst_atom_failures} frames')
+    # Print the most frequent clashes table
+    # Each count is the number of frames with this atom and bond-set mismatch.
+    print(f' Top 10 atom mismatches:')
+    headers = ['Frames', 'Atom', 'Label', 'Is bonding with', 'Should bond with']
+    count = clash_counts.most_common(10)
+    # Calculate column widths
+    table_data = []
+    for (at, bond, should), n in count:
+        label = structure.atoms[at].label
+        table_data.append([n, at, label, bond, should])
+    col_widths = [max(len(str(item)) for item in col) for col in zip(*table_data, headers)]
+
+    def format_row(row):
+        return " | ".join(f"{str(item):>{col_widths[i]}}" for i, item in enumerate(row))
+    # Print table
+    print(format_row(headers))
+    print("-+-".join('-' * width for width in col_widths))
+    for row in table_data:
+        print(format_row(row))
+    # Report the most frequent mismatch
+    worst_clash, worst_clash_frames = count[0]
+    return bonds_reference_frame, False, (worst_clash, worst_clash_frames, checked_frames, clash_first_frames[worst_clash])
+
+
+# Bonds mined the last time, together with the file they were mined from
+# Thus bonds are not mined again from the same file (e.g. to guess coarse grain atoms and then in the refbonds task)
+_last_mined_bonds = (None, None)
+
+def mine_topology_bonds(bonds_source_file: Union['File', Exception]) -> list[list[int]]:
+    """Extract bonds from a source file and format them per atom.
+    If bonds were already mined from the same file then reuse them.
+    """
+    global _last_mined_bonds
+    # If there is no topology then return no bonds at all
+    if bonds_source_file == MISSING_TOPOLOGY or not bonds_source_file.exists:
+        return None
+    # The file is identified by its path, last modification time and size, so a rewritten file is mined again
+    file_stat = stat(bonds_source_file.path)
+    file_key = (bonds_source_file.absolute_path, file_stat.st_mtime_ns, file_stat.st_size)
+    last_file_key, last_bonds = _last_mined_bonds
+    if file_key == last_file_key:
+        atom_bonds = last_bonds
+    else:
+        atom_bonds = _mine_topology_bonds(bonds_source_file)
+        _last_mined_bonds = (file_key, atom_bonds)
+    if atom_bonds is None: return None
+    # Return a copy, since bonds may be modified further (e.g. coarse grain bonds are discarded)
+    return [ bonds if bonds is MISSING_BONDS else list(bonds) for bonds in atom_bonds ]
+
+
+def _mine_topology_bonds(bonds_source_file: 'File') -> list[list[int]]:
+    """Extract bonds from a source file and format them per atom."""
+    print('Mining atom bonds from topology file')
+    # If we have the standard topology then get bonds from it
+    if is_standard_topology(bonds_source_file):
+        print(f' Bonds in the "{bonds_source_file.filename}" file will be used')
+        standard_topology = load_json(bonds_source_file.path)
+        standard_atom_bonds = standard_topology.get('atom_bonds', [])
+        # Convert missing bonds flags
+        # These come from coarse grain (CG) simulations with no topology
+        atom_bonds = []
+        for bonds in standard_atom_bonds:
+            if bonds == JSON_SERIALIZABLE_MISSING_BONDS:
+                atom_bonds.append(MISSING_BONDS)
+                continue
+            atom_bonds.append(list(bonds))
+        # Every bond is listed only once in the standard topology (e.g. if A-B is listed then B-A is not)
+        # Add the opposite bonds so every atom has all its bonds
+        # Old topologies may already list both so we make sure not to repeat them
+        for atom_index, bonds in enumerate(atom_bonds):
+            if bonds == MISSING_BONDS: continue
+            for bonded_atom_index in bonds:
+                bonded_atom_bonds = atom_bonds[bonded_atom_index]
+                if atom_index in bonded_atom_bonds: continue
+                bonded_atom_bonds.append(atom_index)
+        if atom_bonds: return atom_bonds
+        print('  There were no bonds in the topology file. Is this an old file?')
+    # In some ocasions, bonds may come inside a topology which can be parsed through pytraj
+    elif bonds_source_file.is_pytraj_supported():
+        print(f' Bonds will be mined from "{bonds_source_file.path}"')
+        pt_topology = pt.load_topology(filename=bonds_source_file.path)
+        raw_bonds = [bonds.indices for bonds in pt_topology.bonds]
+        # Sort bonds
+        atom_count = pt_topology.n_atoms
+        atom_bonds = sort_bonds(raw_bonds, atom_count)
+        # Select hydrogens with a cpptraj element mask, which is much faster than iterating atoms
+        hydrogens = set(pt_topology.select('@/H').tolist())
+        discard_rigid_hydrogen_bonds(atom_bonds, hydrogens)
+        # If there is any bonding data then return atom bonds
+        if any(len(bonds) > 0 for bonds in atom_bonds): return atom_bonds
+    # If we have a TPR then use our own tool
+    elif bonds_source_file.format == 'tpr':
+        print(f' Bonds will be mined from TPR file "{bonds_source_file.path}"')
+        raw_bonds = get_tpr_bonds(bonds_source_file.path)
+        if raw_bonds != FAILED_BOND_MINING_EXCEPTION:
+            # Sort bonds
+            atom_count = get_tpr_atom_count(bonds_source_file.path)
+            atom_bonds = sort_bonds(raw_bonds, atom_count)
+            return atom_bonds
+    # If we failed to mine bonds then return None and they will be guessed further
+    print(' Failed to mine bonds -> They will be guessed from atom distances and radius')
+    return None
+
+
+def get_tpr_bonds(tpr_filepath: str) -> list[tuple[int, int]]:
+    """Get TPR bonds.
+    Try 2 different methods and hope 1 of them works.
+    """
+    try:
+        bonds = get_tpr_bonds_gromacs(tpr_filepath)
+    except:
+        print(' Our tool failed to extract bonds. Using MDAnalysis extraction...')
+        try:
+            bonds = get_tpr_bonds_mdanalysis(tpr_filepath)
+            # This happens when the filter selection is what we want to exclude, and not to keep
+            if len(bonds) == 0:
+                warn('Bonds were mined successfully but it looks like there are no bonds. Is it all ions or CG solvent?')
+        except Exception as err:
+            print(f' MDAnalysis failed to extract bonds: {err}. Relying on guess...')
+            bonds = FAILED_BOND_MINING_EXCEPTION
+    return bonds
+
+
+def sort_bonds(source_bonds: list[tuple[int, int]], atom_count: int) -> list[list[int]]:
+    """Sort bonds according to our format: a list with the bonded atom indices for each atom.
+    Source data is the usual format to store bonds: a list of tuples with every pair of bonded atoms.
+    """
+    # Set a list of lists with an empty list for every atom
+    atom_bonds = [[] for i in range(atom_count)]
+    for bond in source_bonds:
+        a, b = bond
+        # Make sure atom indices are regular integers so they are JSON serializables
+        atom_bonds[a].append(int(b))
+        atom_bonds[b].append(int(a))
+    return atom_bonds
+
+
+def discard_rigid_hydrogen_bonds(atom_bonds: list[list[int]], hydrogens: set[int]):
+    """Remove the bonds between two hydrogens which are bonded to the same atom.
+    Rigid water models also bond both hydrogens of every water (e.g. TIP3 in CHARMM PSF files), but they are not covalently bonded.
+    Hydrogens with no bonded atom in common (e.g. a H2 molecule) keep their bond.
+    """
+    for hydrogen in hydrogens:
+        partners = set(atom_bonds[hydrogen])
+        atom_bonds[hydrogen] = [atom for atom in atom_bonds[hydrogen]
+            if not (atom in hydrogens and partners & set(atom_bonds[atom]))]
+
+
+def find_safe_bonds(
+    topology_file: Union['File', Exception],
+    trajectory_file: 'File',
+    must_check_stable_bonds: bool,
+    snapshots: int,
+    structure: 'Structure',
+    register: 'Register',
+    cg_selection: 'Selection',
+    guess_bonds: bool = False,
+    ignore_bonds: bool = False,
+    # Optional file with bonds sorted according a new atom order
+    resorted_bonds_file: Optional['File'] = None,
+    # Bonds already mined from the topology file, so they are not mined again
+    topology_bonds: Optional[list[list[int]]] = MISSING_VALUE,
+) -> list[list[int]]:
+    """Find reference safe bonds in the system.
+    First try to mine bonds from a topology files.
+    If the mining fails then search for the most stable bonds.
+    If we trust in stable bonds then simply return the structure bonds.
+    """
+    # If bonds are to be ignored then set all bonds as missing bonds already
+    register.remove_warnings(MISSING_BONDS_FLAG)
+    if ignore_bonds:
+        register.add_warning(MISSING_BONDS_FLAG, 'Bonds were ignored')
+        return [MISSING_BONDS for atom in range(structure.atom_count)]
+    # If we have a resorted file then use it
+    # Note that this is very excepcional
+    if resorted_bonds_file != None and resorted_bonds_file.exists:
+        warn('Using resorted safe bonds')
+        return load_json(resorted_bonds_file.path)
+    # Try to get bonds from the topology before guessing
+    if guess_bonds:
+        print('Bonds were forced to be guessed, so bonds in the topology file will be ignored')
+    else:
+        safe_bonds = mine_topology_bonds(topology_file) if topology_bonds is MISSING_VALUE else topology_bonds
+        if safe_bonds:
+            return safe_bonds
+    # If all bonds are in coarse grain then set all bonds "wrong" already
+    if len(cg_selection) == structure.atom_count:
+        register.add_warning(MISSING_BONDS_FLAG, 'Bonds were missing')
+        safe_bonds = [MISSING_BONDS for atom in range(structure.atom_count)]
+        return safe_bonds
+    # If failed to mine topology bonds then guess stable bonds
+    print('Bonds will be guessed by atom distances and radii along different frames in the trajectory')
+    # Find stable bonds if necessary
+    if must_check_stable_bonds:
+        # Using the trajectory, find the most stable bonds
+        print('Checking bonds along trajectory to determine which are stable')
+        safe_bonds = get_most_stable_bonds(structure, trajectory_file.path, snapshots)
+        discard_coarse_grain_bonds(safe_bonds, cg_selection)
+        return safe_bonds
+    # If we trust stable bonds then simply use structure bonds
+    print('Default structure bonds will be used since they have been marked as trusted')
+    safe_bonds = structure.bonds
+    discard_coarse_grain_bonds(safe_bonds, cg_selection)
+    return safe_bonds
+
+
+def discard_coarse_grain_bonds(bonds: list, cg_selection: 'Selection'):
+    """Given a list of bonds, discard the ones in the coarse grain selection.
+    Note that the input list will be mutated.
+    """
+    # For every atom in CG, replace its bonds with a class which will raise and error when read
+    # Thus we make sure using these wrong bonds anywhere further will result in failure
+    for atom_index in cg_selection.atom_indices:
+        bonds[atom_index] = MISSING_BONDS

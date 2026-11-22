@@ -1,0 +1,475 @@
+"""Optimizer and learning rate scheduler construction."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, cast
+
+import torch
+import torch.distributed as dist
+from torch.optim._muon import _adjust_lr
+from torch.optim.lr_scheduler import LambdaLR
+
+from oplm.training.mup import mup_lr_multiplier
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    from torch import nn
+
+    from oplm.config import TrainConfig
+    from oplm.model.configuration_oplm import OplmConfig
+
+
+@dataclass(frozen=True)
+class AdamwParamGroup:
+    """AdamW parameters sharing weight decay, its target, and a width/depth LR multiplier.
+
+    ``decay_target`` is the value weight decay pulls toward (``0.0``: ordinary decay).
+    """
+
+    params: list[torch.nn.Parameter]
+    weight_decay: float
+    lr_mult: float
+    decay_target: float = 0.0
+
+
+@dataclass(frozen=True)
+class MuonParamGroup:
+    """Muon parameters sharing one depth LR multiplier."""
+
+    params: list[torch.nn.Parameter]
+    lr_mult: float
+
+
+@dataclass(frozen=True)
+class OptimizerParamGroups:
+    """Partitioned model parameters for AdamW or Muon training.
+
+    Muon params are split into one :class:`MuonParamGroup` per distinct depth
+    LR multiplier. At depth exponent zero, every Muon parameter stays in one
+    group with multiplier ``1.0``.
+
+    AdamW params are split into one :class:`AdamwParamGroup` per distinct
+    ``(decay knob, decay_target, composed width/depth LR multiplier)``. With μP off (or
+    at the base width), depth exponent zero, and ``embedding_weight_decay`` and
+    ``weight_decay_to_init`` at 0, there are at most the usual two groups (decay +
+    no-decay) and the optimizer is identical to the pre-μP path.
+    """
+
+    muon_groups: list[MuonParamGroup]
+    adamw_groups: list[AdamwParamGroup]
+
+    @property
+    def adamw_decay_params(self) -> list[torch.nn.Parameter]:
+        """Every weight-decayed AdamW param (union across μP LR sub-groups)."""
+        return [p for g in self.adamw_groups if g.weight_decay != 0.0 for p in g.params]
+
+    @property
+    def adamw_no_decay_params(self) -> list[torch.nn.Parameter]:
+        """Every no-weight-decay AdamW param (by default norms, biases, gates, embeddings)."""
+        return [p for g in self.adamw_groups if g.weight_decay == 0.0 for p in g.params]
+
+
+def _init_value(name: str, model_config: OplmConfig) -> float | None:
+    """The initial value ``weight_decay_to_init`` pulls a 1-D param back to (None: never)."""
+    if name.endswith(".bias"):
+        return 0.0
+    if name.endswith("norm.weight"):  # every norm module's attribute name ends in "norm"
+        return 1.0
+    if name.endswith(("attn_gate", "ffn_gate")):
+        return float(getattr(model_config, "residual_gate_init", 1.0))
+    return None  # value-residual lambdas, L2 QK scales
+
+
+def _depth_lr_multiplier(name: str, model_config: OplmConfig, cfg: TrainConfig) -> float:
+    """Return the repeated-block depth correction for one named parameter."""
+    if not name.startswith("oplm.backbone.layers."):
+        return 1.0
+    return (
+        cfg.mup_depth_reference_layers / model_config.num_hidden_layers
+    ) ** cfg.mup_depth_lr_exponent
+
+
+def partition_optimizer_params(model: nn.Module, cfg: TrainConfig) -> OptimizerParamGroups:
+    """Split model parameters into depth-aware Muon and width/depth-aware AdamW groups.
+
+    The AdamW path preserves the existing OPLM grouping rules. The Muon path
+    follows PyTorch's recommendation to use Muon only for eligible 2D hidden
+    weights and keep embeddings, biases, norms, classifier weights, and other
+    non-2D parameters on AdamW. Repeated-block parameters receive the configured
+    depth LR multiplier, composed with μP width scaling for AdamW parameters.
+
+    Args:
+        model: The model whose parameters should be partitioned.
+        cfg: Training configuration.
+
+    Returns:
+        Partitioned optimizer parameter groups.
+
+    Raises:
+        ValueError: If ``cfg.optimizer="muon"`` but no eligible Muon parameters
+            are found.
+        RuntimeError: If the partitioning misses or duplicates parameters.
+    """
+    # `model.config` is the OplmConfig carrying the μP knobs; mup_lr_multiplier is
+    # a no-op (returns 1.0) whenever μP is disabled, so the non-μP path is intact.
+    model_config = cast("OplmConfig", model.config)
+
+    # Preserve first-seen order of multiplier keys for determinism.
+    muon_buckets: dict[float, list[torch.nn.Parameter]] = {}
+    # Keyed by the TrainConfig field supplying the decay ("": none), not its value, so the
+    # group structure (which checkpoints must match) depends only on which knobs are on.
+    adamw_buckets: dict[tuple[str, float, float], list[torch.nn.Parameter]] = {}
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        depth_mult = _depth_lr_multiplier(name, model_config, cfg)
+        source, target = "", 0.0
+        if param.ndim <= 1:  # norm gains and biases, residual gates, lambdas, scales
+            init = _init_value(name, model_config)
+            if init is not None and cfg.weight_decay_to_init:
+                source, target = "weight_decay_to_init", init
+        elif "embed" in name:
+            if cfg.embedding_weight_decay:
+                source = "embedding_weight_decay"
+        elif cfg.optimizer == "muon" and param.ndim == 2 and not name.startswith("lm_head."):
+            muon_buckets.setdefault(depth_mult, []).append(param)
+            continue
+        elif cfg.weight_decay:
+            source = "weight_decay"
+
+        lr_mult = mup_lr_multiplier(name, param, model_config) * depth_mult
+        adamw_buckets.setdefault((source, target, lr_mult), []).append(param)
+
+    muon_groups = [
+        MuonParamGroup(params=params, lr_mult=mult) for mult, params in muon_buckets.items()
+    ]
+    adamw_groups = [
+        AdamwParamGroup(
+            params=params,
+            weight_decay=getattr(cfg, source) if source else 0.0,
+            lr_mult=mult,
+            decay_target=target,
+        )
+        for (source, target, mult), params in adamw_buckets.items()
+    ]
+
+    grouped = [
+        *(param for group in muon_groups for param in group.params),
+        *(param for group in adamw_groups for param in group.params),
+    ]
+    grouped_ids = [id(param) for param in grouped]
+    model_ids = [id(param) for param in model.parameters() if param.requires_grad]
+    if len(grouped_ids) != len(set(grouped_ids)):
+        raise RuntimeError("Optimizer parameter partition duplicated one or more parameters")
+    if set(grouped_ids) != set(model_ids):
+        raise RuntimeError("Optimizer parameter partition did not cover all trainable parameters")
+    if cfg.optimizer == "muon" and not muon_groups:
+        raise ValueError("Muon optimizer requires at least one eligible 2D hidden weight")
+
+    return OptimizerParamGroups(muon_groups=muon_groups, adamw_groups=adamw_groups)
+
+
+class AdamW(torch.optim.AdamW):
+    """``torch.optim.AdamW`` whose param groups may decay toward ``decay_target``, not 0.
+
+    Decoupled decay toward ``c`` is decay toward 0 of ``p - c``, and Adam's update reads only
+    gradients and its own state. So shifting a group's params by ``-c`` around the base step
+    gives exactly ``p <- c + (p - c) * (1 - lr * wd) - lr * update``.
+    """
+
+    @torch.no_grad()
+    def step(self, closure=None):  # untyped like torch.optim.Adam.step (overloaded in Optimizer)
+        if closure is not None:
+            raise NotImplementedError("closures would see the shifted params")
+        shifted = [
+            (group["params"], group["decay_target"])
+            for group in self.param_groups
+            if group.get("decay_target", 0.0) and group["weight_decay"]
+        ]
+        for params, target in shifted:
+            torch._foreach_sub_(params, target)
+        super().step()
+        for params, target in shifted:
+            torch._foreach_add_(params, target)
+        return None
+
+
+def _newton_schulz(
+    x: torch.Tensor, coefficients: tuple[float, float, float], steps: int, eps: float
+) -> torch.Tensor:
+    """Batched form of torch's Muon Newton-Schulz over a ``(k, rows, cols)`` bf16 stack."""
+    a, b, c = coefficients
+    tall = x.size(1) > x.size(2)
+    if tall:
+        x = x.mT
+    x = x / x.norm(dim=(1, 2), keepdim=True).clamp(min=eps)
+    for _ in range(steps):
+        gram = x @ x.mT
+        gram_update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+        x = torch.baddbmm(x, gram_update, x, beta=a)
+    return x.mT if tall else x
+
+
+class Muon(torch.optim.Muon):
+    """``torch.optim.Muon`` with batched Newton-Schulz, split across DDP ranks.
+
+    Same update and same state (one ``momentum_buffer`` per parameter) as the base class,
+    so checkpoints are interchangeable with it. Every rank updates every momentum buffer,
+    but orthogonalizes only the matrices it owns (round-robin), stacked by shape. Each
+    rank writes its results into a buffer that is zero elsewhere and one sum all-reduce
+    per shape fills in the rest, so every rank applies bit-identical updates. This relies
+    on DDP: full, identical gradients on every rank. A single process owns every matrix
+    and communicates nothing.
+    """
+
+    @torch.no_grad()
+    def step(self, closure=None):  # untyped like torch.optim.Muon.step
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        world, rank = (dist.get_world_size(), dist.get_rank()) if distributed else (1, 0)
+
+        for group in self.param_groups:
+            params: list[torch.Tensor] = []
+            grads: list[torch.Tensor] = []
+            bufs: list[torch.Tensor] = []
+            self._init_group(group, params, grads, bufs)
+            lr, momentum = group["lr"], group["momentum"]
+
+            by_shape: dict[torch.Size, list[int]] = {}
+            for i, (param, grad, buf) in enumerate(zip(params, grads, bufs, strict=True)):
+                buf.lerp_(grad, 1 - momentum)
+                by_shape.setdefault(param.shape, []).append(i)
+
+            for shape, indices in by_shape.items():
+                updates = torch.zeros(
+                    (len(indices), *shape), dtype=torch.bfloat16, device=params[indices[0]].device
+                )
+                # Ownership counts across the whole group, so a shape with fewer matrices
+                # than ranks does not pile onto rank 0.
+                owned = [slot for slot, i in enumerate(indices) if i % world == rank]
+                if owned:
+                    stack = torch.stack(
+                        [
+                            (
+                                grads[indices[slot]].lerp(bufs[indices[slot]], momentum)
+                                if group["nesterov"]
+                                else bufs[indices[slot]]
+                            ).bfloat16()
+                            for slot in owned
+                        ]
+                    )
+                    updates[owned] = _newton_schulz(
+                        stack, group["ns_coefficients"], group["ns_steps"], group["eps"]
+                    )
+                if distributed:
+                    dist.all_reduce(updates)
+                adjusted_lr = _adjust_lr(lr, group["adjust_lr_fn"], shape)
+                for slot, i in enumerate(indices):
+                    params[i].mul_(1 - lr * group["weight_decay"])
+                    params[i].add_(updates[slot], alpha=-adjusted_lr)
+        return loss
+
+
+def _build_adamw_optimizer(
+    adamw_groups: Sequence[AdamwParamGroup],
+    cfg: TrainConfig,
+) -> torch.optim.AdamW:
+    """Build AdamW with groups keyed by weight decay and composed width/depth LR mult.
+
+    Each group's base LR is ``cfg.lr * cfg.adamw_lr_mult * lr_mult``; with μP off,
+    depth exponent zero, and ``adamw_lr_mult=1`` every multiplier is ``1.0``, so this
+    reduces to the original two-group (decay/no-decay) optimizer at ``cfg.lr``.
+    LambdaLR captures each group's ``initial_lr`` and scales them all by the same
+    schedule λ, so the heterogeneous base LRs compose correctly.
+    """
+    base_lr = cfg.lr * cfg.adamw_lr_mult
+    param_groups = [
+        {
+            "params": list(g.params),
+            "weight_decay": g.weight_decay,
+            "lr": base_lr * g.lr_mult,
+            "decay_target": g.decay_target,
+        }
+        for g in adamw_groups
+    ]
+    return AdamW(
+        param_groups,
+        lr=base_lr,
+        betas=(cfg.adam_beta1, cfg.adam_beta2),
+        eps=cfg.adam_eps,
+    )
+
+
+def build_optimizer(model: nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
+    """Build the primary optimizer for the configured training mode.
+
+    For ``optimizer="adamw"``, this is the single AdamW optimizer. For
+    ``optimizer="muon"``, this returns the primary Muon optimizer; use
+    :func:`build_optimizers` when the caller needs the complete optimizer set.
+
+    Args:
+        model: The model whose parameters to optimize.
+        cfg: Training configuration.
+
+    Returns:
+        The primary optimizer instance.
+    """
+    return build_optimizers(model, cfg)[0]
+
+
+def build_optimizers(model: nn.Module, cfg: TrainConfig) -> list[torch.optim.Optimizer]:
+    """Build all optimizers required by the configured training mode.
+
+    Args:
+        model: The model whose parameters to optimize.
+        cfg: Training configuration.
+
+    Returns:
+        A list containing one AdamW optimizer for the default path, or a Muon
+        optimizer plus an auxiliary AdamW optimizer for ``optimizer="muon"``.
+    """
+    # μP+Muon requires the aspect-ratio-only "original" adjust-lr fn: the default
+    # "match_rms_adamw" scales like √width and breaks LR transfer (see docs/mup-lr.md).
+    if (
+        cfg.optimizer == "muon"
+        and cfg.muon_adjust_lr_fn == "match_rms_adamw"
+        and getattr(model.config, "mup_enable", False)
+    ):
+        raise ValueError(
+            "μP with Muon requires muon_adjust_lr_fn='original' (the default; got "
+            "'match_rms_adamw', which scales like √width and does not transfer). Set "
+            "train.muon_adjust_lr_fn=original (see docs/mup-lr.md)."
+        )
+
+    param_groups = partition_optimizer_params(model, cfg)
+    if cfg.optimizer == "adamw":
+        return [_build_adamw_optimizer(param_groups.adamw_groups, cfg)]
+
+    # The distributed step needs full, replicated matrices; HSDP shards them (#128).
+    muon_cls = torch.optim.Muon if cfg.parallelism == "hsdp" else Muon
+    muon_optimizer = muon_cls(
+        [
+            {"params": list(group.params), "lr": cfg.lr * group.lr_mult}
+            for group in param_groups.muon_groups
+        ],
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+        momentum=cfg.muon_momentum,
+        nesterov=cfg.muon_nesterov,
+        ns_steps=cfg.muon_ns_steps,
+        adjust_lr_fn=cfg.muon_adjust_lr_fn,
+    )
+    auxiliary_adamw = _build_adamw_optimizer(param_groups.adamw_groups, cfg)
+    return [muon_optimizer, auxiliary_adamw]
+
+
+def get_schedule_fn(
+    scheduler_name: str,
+    warmup_steps: int,
+    total_steps: int,
+    min_ratio: float = 0.0,
+    stable_steps: int = 0,
+) -> Callable[[int], float]:
+    """Return a step -> lr_multiplier function for LambdaLR.
+
+    All schedule variants follow a three-phase structure:
+    warmup (linear 0->1) -> stable (1.0) -> decay (1.0 -> min_ratio).
+
+    For non-WSD schedules, the stable phase has zero length.
+
+    Args:
+        scheduler_name: One of ``warmup_linear``, ``warmup_cosine``,
+            ``wsd_linear``, ``wsd_cosine``, ``wsd_sqrt``.
+        warmup_steps: Number of linear warmup steps.
+        total_steps: Total training steps.
+        min_ratio: Minimum LR as a fraction of peak LR (min_lr / lr).
+        stable_steps: Number of steps at peak LR after warmup
+            (only meaningful for WSD schedules).
+
+    Returns:
+        A callable mapping step number to LR multiplier.
+    """
+    is_wsd = scheduler_name.startswith("wsd_")
+    is_cosine = scheduler_name.endswith("_cosine")
+    is_sqrt = scheduler_name.endswith("_sqrt")
+
+    stable_steps = stable_steps if is_wsd else 0
+    decay_steps = max(1, total_steps - warmup_steps - stable_steps)
+
+    def schedule_fn(current_step: int) -> float:
+        # Warmup phase: linear ramp from 0 to 1
+        if current_step < warmup_steps:
+            return current_step / max(1, warmup_steps)
+
+        # Stable phase (WSD only): hold at peak
+        if current_step < warmup_steps + stable_steps:
+            return 1.0
+
+        # Decay phase
+        progress = (current_step - warmup_steps - stable_steps) / decay_steps
+        progress = min(progress, 1.0)
+
+        if is_cosine:
+            decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        elif is_sqrt:
+            decay = 1.0 - math.sqrt(progress)
+        else:
+            decay = 1.0 - progress
+
+        return min_ratio + (1.0 - min_ratio) * decay
+
+    return schedule_fn
+
+
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: TrainConfig,
+    total_steps: int,
+) -> LambdaLR:
+    """Build a learning rate scheduler from config.
+
+    Args:
+        optimizer: The optimizer to schedule.
+        cfg: Training configuration.
+        total_steps: Total number of training steps.
+
+    Returns:
+        A LambdaLR scheduler.
+    """
+    min_ratio = cfg.min_lr / cfg.lr if cfg.lr > 0 else 0.0
+
+    schedule_fn = get_schedule_fn(
+        scheduler_name=cfg.scheduler,
+        warmup_steps=cfg.warmup_steps,
+        total_steps=total_steps,
+        min_ratio=min_ratio,
+        stable_steps=cfg.stable_steps,
+    )
+
+    return LambdaLR(optimizer, schedule_fn)
+
+
+def build_schedulers(
+    optimizers: Sequence[torch.optim.Optimizer],
+    cfg: TrainConfig,
+    total_steps: int,
+) -> list[LambdaLR]:
+    """Build one scheduler per optimizer.
+
+    Args:
+        optimizers: Optimizers to schedule.
+        cfg: Training configuration.
+        total_steps: Total number of training steps.
+
+    Returns:
+        A list of LambdaLR schedulers in the same order as ``optimizers``.
+    """
+    return [build_scheduler(optimizer, cfg, total_steps) for optimizer in optimizers]

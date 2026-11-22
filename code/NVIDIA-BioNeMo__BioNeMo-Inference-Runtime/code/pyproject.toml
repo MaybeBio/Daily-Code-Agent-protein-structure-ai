@@ -1,0 +1,334 @@
+####################################################################################################
+###############################  BUILD CONFIGURATION  ##############################################
+####################################################################################################
+[build-system]
+# CUTLASS headers come from the 3rdparty/cutlass submodule, not a wheel.
+requires = ["cmake>=3.27", "nanobind==2.10.2", "setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+
+[tool.setuptools]
+include-package-data = true
+package-dir = { "" = "." }
+
+# version is supplied by setup.py so the CUDA local segment (e.g. 0.4.0+cu131)
+# lands in the wheel METADATA — see setup.py. It stays in [project].dynamic below.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bionemo_ir*"]
+# Every shipped Python package has an __init__.py. Regular package discovery
+# prunes unrelated checkout directories before descending into them; implicit
+# namespace discovery walks the entire workspace, including ignored build trees.
+namespaces = false
+
+[tool.setuptools.package-data]
+"bionemo_ir" = [
+  "_torch/custom_ops/*/configs/*.json",
+  "_torch/attention_backend/*/configs/*.json",
+]
+
+[project]
+name = "bionemo-ir"
+description = "BioNeMo Inference Runtime: GPU accelerated framework for protein folding"
+requires-python = ">=3.12,<3.15"
+authors = [{ name = "NVIDIA-BioNeMo team" }]
+dependencies = [
+  "cuda-python>=13",
+  "torch>=2.11",
+  "cuequivariance>=0.11.1,<0.14",
+  "cuequivariance-ops-cu13>=0.11.1,<0.14",
+  "cuequivariance-ops-torch-cu13>=0.11.1,<0.14",
+  "triton>=3.6.0,<3.9",
+  "biopython>=1.87",
+  "ray[serve,data]==2.56.1",  # Installs pandas and pyarrow.
+  # Security floors for transitive runtime dependencies.
+  "aiohttp>=3.14.5,<4",
+  "certifi>=2026.10.23",
+  "filelock>=3.32.7,<4",
+  "fsspec>=2026.6.0",
+  "multidict>=6.9.1",
+  "opentelemetry-api>=1.45.1",
+  "urllib3>=2.8.0",
+  "virtualenv>=21.14.5",
+  # uvloop 0.22 breaks Ray Serve: https://github.com/ray-project/ray/issues/57992
+  # 0.21.0 has no cp314 wheels; Python 3.14 takes the release the wheel jobs test.
+  "uvloop==0.21.0; python_version < '3.14'",
+  "uvloop==0.23.0; python_version >= '3.14'",
+  "modelcif==1.6",  # Needed for CIFWriter.
+  "rdkit==2025.9.6",  # Needed for the Boltz2 data pipeline.
+  "biotite==1.6.0",
+  # https://github.com/huggingface/datasets/issues/7344
+  "datasets==5.0.1",
+  # hf_hub_download(), currently transitive through datasets.
+  "huggingface_hub>=0.25,<2",
+  "PyYAML>=6.0.1,<7",  # The NGC PyTorch image's apt copy is 6.0.1 and pip cannot uninstall it.
+  "lru-dict==1.4.1",
+  "kalign-python==3.6.0",
+  "scipy>=1.13.1,<2",
+  "gemmi==0.7.5",  # First release with cp313/cp314 and aarch64 wheels; README links its source.
+  "einops>=0.8",  # rearrange() and einsum() are imported directly.
+  "pydantic>=2,<3",
+]
+# readme is dynamic because setup.py rewrites it for a package index: an index
+# renders it standalone, resolving no relative path and stripping no frontmatter.
+dynamic = ["version", "readme"]
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "LICENSES/*.txt"]
+
+# Rendered as the sidebar links on the PyPI project page, which is built from
+# this metadata alone -- a published version's page cannot be edited afterwards.
+[project.urls]
+Homepage = "https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime"
+Documentation = "https://docs.nvidia.com/bionemo/inference-runtime"
+Changelog = "https://docs.nvidia.com/bionemo/inference-runtime/latest/release-notes/overview"
+Repository = "https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime"
+Issues = "https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/issues"
+
+[dependency-groups]
+build = [
+  # PEP 517 build environments are independent of project dependencies. Keep
+  # the native build reproducible without narrowing the package's compatible
+  # build-system floors below.
+  "cmake==4.4.2",
+  "nanobind==2.10.2",
+  "setuptools==81.0.0",
+]
+coverage = [
+  "coverage[toml]>=7.10.6",
+]
+# The CuTeDSL compiler and its TVM-FFI launcher. Only kernel source builds and
+# CUBIN generation use them; the package launches the embedded CUBINs without.
+cutedsl = [
+  "nvidia-cutlass-dsl[cu13]==4.8.0",
+  "apache-tvm-ffi>=0.1.6,<0.2",
+]
+lint = [
+  "prek==0.4.12",  # Pinned for reproducible hook runs.
+]
+release = [
+  { include-group = "build" },
+  # Tools used after the build stay here rather than in the default developer
+  # environment. Release CI syncs this complete group from uv.lock.
+  "abi3audit==0.0.26",
+  "auditwheel==6.8.0",
+  "build==1.5.0",
+  # Match the digest-pinned NGC base: DALI 2.1.0 requires packaging<=26.0.
+  "packaging==26.0",
+  "pip==26.2.2",
+  "wheel==0.47.0",
+]
+sbom = [
+  # Isolated CI tool for inventorying the packages actually installed in NGC.
+  "cyclonedx-bom==7.4.0",
+]
+test = [
+  "pytest>=9.0.3,<10",  # Older releases contain PYSEC-2026-1845.
+  "pytest-cov>=7.1.0,<8",
+  "pytest-xdist>=3.8.0,<4",
+  # tests/contract runs setup.py.
+  "setuptools>=77,<82",
+  "parameterized>=0.9,<1",
+  "biotraj==1.2.2",
+  "ml_collections==1.1.0",
+  # Import closure of the 3rdparty/RFD4-Proteina package that the RFProteina
+  # parity tests load. The model stack itself (torch, numpy, einops) is already
+  # present; the sources are not installed.
+  "atomworks>=3.0.4,<4",
+  "environs>=11.0.0,<12",
+  "hydra-core>=1.3.0,<1.4",
+  "lightning>=2.6.0,<3",
+  "peft>=0.21.2,<0.22",
+  "rootutils>=1.0.7,<1.1",
+  "loguru>=0.7,<1",
+  "jaxtyping>=0.2.17,<1",
+  "beartype>=0.18.0,<1",
+  "toolz>=1.0,<2",
+  "fire>=0.7,<1",
+  "anarcii>=2.0.8,<3",
+  "assertpy>=1.1,<2",
+]
+dev = [
+  { include-group = "cutedsl" },
+  { include-group = "lint" },
+  { include-group = "test" },
+]
+
+[tool.uv]
+required-version = ">=0.13.0,<0.14"
+default-groups = ["dev"]
+# nvidia-cutlass-dsl always depends on the CUDA 12 compiler wheel. 4.8.0
+# installs that beside the cu13 extra as separate _cutlass_ir.cu12 and
+# _cutlass_ir.cu13 modules; the loader picks the newest flavor the driver
+# supports. Drop the CUDA 12 wheel so this CUDA 13.4 image cannot compile
+# with its embedded ptxas 12.9.
+exclude-dependencies = ["nvidia-cutlass-dsl-libs-cu12"]
+# Keep uv's isolated editable builds on the same internal toolchain as the
+# locked build group without narrowing the published PEP 517 compatibility
+# floors in build-system.requires.
+build-constraint-dependencies = [
+  "cmake==4.4.2",
+  "nanobind==2.10.2",
+  "setuptools==81.0.0",
+]
+# BioIR only supports Linux. Keep both release architectures in every lock
+# update so an x86_64 developer cannot silently break aarch64 resolution.
+environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+  "sys_platform == 'linux' and platform_machine == 'aarch64' and python_version == '3.12'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.13'",
+  "sys_platform == 'linux' and platform_machine == 'aarch64' and python_version == '3.13'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.14'",
+  "sys_platform == 'linux' and platform_machine == 'aarch64' and python_version == '3.14'",
+]
+required-environments = [
+  "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+  "sys_platform == 'linux' and platform_machine == 'aarch64' and python_version == '3.12'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.13'",
+  "sys_platform == 'linux' and platform_machine == 'aarch64' and python_version == '3.13'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.14'",
+  "sys_platform == 'linux' and platform_machine == 'aarch64' and python_version == '3.14'",
+]
+# Lock-only floors: the first NumPy and SciPy releases with wheels for each
+# newer Python. Without them, uv reuses the Python 3.12 versions, which need a
+# Fortran source build there. .gitlab/ci/scripts/source_builds.py checks this.
+constraint-dependencies = [
+  "numpy>=2.1.0; python_version == '3.13'",
+  "numpy>=2.3.2; python_version >= '3.14'",
+  "scipy>=1.14.1; python_version == '3.13'",
+  "scipy>=1.16.1; python_version >= '3.14'",
+]
+# uv otherwise notices only Python packaging metadata. These inputs and
+# environment variables also determine the editable native extension.
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "setup.py" },
+  { file = "build.env" },
+  { file = "cpp/**/CMakeLists.txt" },
+  { file = "cpp/cmake/**/*.cmake" },
+  { file = "cpp/cmake/**/*.py" },
+  { file = "cpp/kernels/**/*.cpp" },
+  { file = "cpp/kernels/**/*.cu" },
+  { file = "cpp/kernels/**/*.cuh" },
+  { file = "cpp/kernels/**/*.h" },
+  { file = "cpp/kernels/cutedsl_*/cubins/index.json" },
+  { file = "cpp/kernels/cutedsl_*/cubins/packs/*.tar.xz" },
+  # Rebuild when the CUTLASS submodule's headers change, or when the
+  # environment points the build at other CUTLASS headers.
+  { file = "3rdparty/cutlass/include/cutlass/version.h" },
+  { file = "3rdparty/cutlass/include/**/*.h" },
+  { env = "BIOIR_CUTLASS_INCLUDE_DIR" },
+  { env = "CUTLASS_PATH" },
+  { env = "CUTLASS_ROOT" },
+  { env = "BIOIR_CUBIN_ARTIFACT_ROOT" },
+  { env = "BIOIR_BUILD_CUTEDSL_KERNELS" },
+  { env = "BIOIR_VERSION_LOCAL" },
+  { env = "CUDA_TAG" },
+  { env = "CC" },
+  { env = "CXX" },
+]
+
+####################################################################################################
+###############################  LINTING, FORMATTING AND TESTING CONFIGURATION  ####################
+####################################################################################################
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+# 3rdparty is vendored and never linted. Vendored vocabularies are transcribed
+# data, one long row per residue class, so formatting them helps nobody.
+extend-exclude = ["3rdparty", "bionemo_ir/data/schemas/vocabularies"]
+
+[tool.ruff.lint]
+# Enforced on changed files only, so the set stays low-noise: rules with little
+# existing debt and mostly auto-fixable, to avoid bloating small MRs.
+select = [
+  # pycodestyle errors — PEP 8 violations (indentation, syntax-y style).
+  # https://docs.astral.sh/ruff/rules/#pycodestyle-e-w
+  "E",
+  # Pyflakes — real bugs: unused imports/vars, undefined names, f-string issues.
+  # https://docs.astral.sh/ruff/rules/#pyflakes-f
+  "F",
+  # pycodestyle warnings — whitespace, blank lines, deprecated constructs.
+  # https://docs.astral.sh/ruff/rules/#pycodestyle-e-w
+  "W",
+  # isort — import ordering and grouping (auto-fixed).
+  # https://docs.astral.sh/ruff/rules/#isort-i
+  "I",
+  # pyupgrade — modernize syntax for the target Python (e.g. `list` over `List`).
+  # https://docs.astral.sh/ruff/rules/#pyupgrade-up
+  "UP",
+  # flake8-bugbear — likely bugs and footguns (mutable defaults, `raise` from).
+  # https://docs.astral.sh/ruff/rules/#flake8-bugbear-b
+  "B",
+  # flake8-debugger — leftover `breakpoint()` / `pdb` calls.
+  # https://docs.astral.sh/ruff/rules/#flake8-debugger-t10
+  "T10",
+  # flake8-comprehensions — simpler, faster list/dict/set comprehensions.
+  # https://docs.astral.sh/ruff/rules/#flake8-comprehensions-c4
+  "C4",
+  # flake8-pie — remove redundant/dead constructs (dup dict keys, no-op code).
+  # https://docs.astral.sh/ruff/rules/#flake8-pie-pie
+  "PIE",
+  # flynt — prefer f-strings over `str.join` / `%` / `.format`.
+  # https://docs.astral.sh/ruff/rules/#flynt-fly
+  "FLY",
+  # pygrep-hooks — ban blanket `# noqa` / `# type: ignore` (enforces the
+  # "avoid # type: ignore" rule in docs/coding.md).
+  # https://docs.astral.sh/ruff/rules/#pygrep-hooks-pgh
+  "PGH",
+]
+# The formatter owns line wrapping; long strings/URLs/comments shouldn't fail lint.
+# E741: single-letter names like B/I/J/H/D and l are the domain's tensor
+# shape-dim convention here; renaming would obscure the math and ripple across
+# call sites for no readability gain.
+# E731: assigning a lambda to a name is used deliberately for small local
+# helpers; rewriting to def is low-value churn.
+# UP042: rewriting `class X(str, Enum)` to `enum.StrEnum` is a behaviour change,
+# not a style fix. New enums should still subclass `enum.StrEnum`.
+# https://docs.astral.sh/ruff/rules/replace-str-enum/
+ignore = ["E501", "E741", "E731", "UP042"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bionemo_ir"]
+
+# Branch coverage over the shipped package. The test job runs two pytest phases
+# (see scripts/run_tests.sh) and phase 1 fans out over xdist workers,
+# so the data has to merge across processes and across runs.
+[tool.coverage.run]
+branch = true
+# One data file per process (xdist worker, phase), combined before reporting.
+parallel = true
+# Store paths relative to the measurement root, so data files produced by
+# different processes merge cleanly.
+# https://coverage.readthedocs.io/en/latest/config.html#run-relative-files
+relative_files = true
+# The repo root, NOT ["bionemo_ir"]: coverage strips the configured source
+# root from the Cobertura filenames, and CI only maps coverage onto the review
+# diff when those filenames are repo-relative (bionemo_ir/foo.py). What
+# actually gets measured is narrowed to the package by `--cov=bionemo_ir`
+# in scripts/run_tests.sh; the omits below keep a bare
+# `pytest --cov` honest too.
+source = ["."]
+omit = [
+  # Vendored third-party trees (mirrors ruff's extend-exclude and prek.toml).
+  "*/3rdparty/*",
+  # The suite measures the shipped package, not itself.
+  "tests/*",
+  # Packaging script, not shipped package code.
+  "setup.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+precision = 2
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "@(abc\\.)?abstractmethod",
+  "if __name__ == .__main__.:",
+]
+
+[tool.commitizen]
+# Conventional Commits. Used now only to lint commit/MR titles (`cz check`).
+# Changelog generation (`cz changelog`) and version bumps (`cz bump`) are a
+# follow-up — that's why the version config below is intentionally minimal.
+name = "cz_conventional_commits"

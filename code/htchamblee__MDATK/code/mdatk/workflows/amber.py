@@ -1,0 +1,2976 @@
+"""Amber generators: system build (tleap / ParmEd / L-RNA renaming), helix
+distance restraints and MD stages (pmemd, pmemd.cuda, pmemd.MPI).
+
+The defaults reproduce a working RNA protocol: OL3 + CP force field, NBfix19 and
+0BPh Lennard-Jones pair modifications applied with ParmEd, SPC/E water in a
+15 Å truncated octahedron, helix-preserving DISANG restraints, and the stage
+sequence min1 (solute restrained) -> min2 -> heat (Langevin, 0 -> 300 K) ->
+NPT equilibration -> NPT equilibration without positional restraints ->
+production.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+from .. import PROJECT_ABBREV, __version__, pdbtools
+from . import mg_params, rna
+from .cluster import CLUSTER_SECTION
+from .base import (SEPARATE_CONDA, WAITING_EXIT, PortValue, StepContext, Tool, env_section, extra_lines,
+                   fortran_float, require_file, script_header, separate_check, shell_quote, skip_when_done,
+                   waiting_done, waiting_file)
+from .budget import Resources, gpu_ids, gpu_step
+from .naming import sanitize_tag
+from .registry import register
+from .schema import GeneratedFile, Issue, Option, Port, Section
+from .scripts import cp_retype as _cp_retype
+from .scripts import embed
+from .scripts import helix_dist as _helix_dist
+from .scripts import prep_pdb as _prep_pdb
+from .scripts import tip4p2005 as _tip4p2005
+from .scripts import lrna_lib as _lrna_lib
+from .scripts import lrna_names as _lrna_names
+from .scripts import topcheck as _topcheck
+
+# ---------------------------------------------------------------------------
+# force fields, water models, ions
+# ---------------------------------------------------------------------------
+
+# id -> (label, leaprc, short ASCII name used in generated files)
+FORCE_FIELDS: Dict[str, Tuple[str, str, str]] = {
+    "ol3cp": ("OL3 + CP (bsc0 χOL3, Steinbrecher phosphate vdW)", "leaprc.RNA.OL3", "OL3+CP"),
+    "ol3": ("OL3 (bsc0 χOL3)", "leaprc.RNA.OL3", "OL3"),
+    "ljbb": ("LJbb (Bergonzo & Cheatham 2015)", "leaprc.RNA.LJbb", "LJbb"),
+    "roc": ("ROC-RNA (Aytenfisu et al. 2017)", "leaprc.RNA.ROC", "ROC-RNA"),
+    "yil": ("YIL (Yildirim et al. 2010)", "leaprc.RNA.YIL", "YIL"),
+    "shaw": ("DESRES RNA (Tan et al. 2018)", "leaprc.RNA.Shaw", "DESRES-RNA"),
+}
+NO_RNA = "none"  # the 'RNA force field' choice of a system without RNA: no RNA leaprc, nothing RNA-only is written
+
+# DNA force fields of AmberTools 26 (the Olomouc series): id -> (label, leaprc, short name, D library and the
+# parameter files its leaprc loads, in load order - what the L-DNA helper mirrors)
+DNA_FORCE_FIELDS: Dict[str, Tuple[str, str, str, str, Tuple[str, ...]]] = {
+    "ol24": ("OL24 (OL21 + δ, sugar τ1, χOL3)", "leaprc.DNA.OL24", "OL24", "ff-nucleic-OL24.lib",
+             ("parm10.dat", "frcmod.ff14SB", "ff-nucleic-OL24.frcmod")),
+    "ol21": ("OL21 (bsc0 + OL15 + αγ OL21)", "leaprc.DNA.OL21", "OL21", "ff-nucleic-OL21.lib",
+             ("parm10.dat", "ff-nucleic-OL21.frcmod")),
+    "ol15": ("OL15 (bsc0 + εζ OL1 + χ OL4 + β OL1)", "leaprc.DNA.OL15", "OL15", "DNA.OL15.lib",
+             ("parm10.dat", "frcmod.DNA.OL15")),
+}
+# L-DNA: every type of the sugar / backbone oxygens O5', O4', O3' (bridging OS, terminal OH) gets a twin whose
+# dihedral phases are mirrored; every handedness-dependent term of OL15 / OL21 / OL24 (alpha to zeta, chi and the
+# OL24 sugar terms) contains one of these oxygens.  Distinct from the L-RNA twins (LD LH LE), whose chi differs.
+LDNA_TWINS = {"OS": "LS", "OH": "LT"}
+LDNA_SETTINGS = {"KIND": "L-DNA", "NUCLEOTIDE_PATTERN": r"^D[ACGT][35N]?$", "TWIN_ATOMS": ("O5'", "O4'", "O3'"),
+                 "LIB_NAME": "LDNA.lib", "FRCMOD_NAME": "frcmod.ldna", "TWIN_NAMES": LDNA_TWINS}
+# L-DNA residues at the 5' (0) / 3' (1) end of a chain get their terminal units (tleap reads 3 characters of a
+# PDB residue name, so a PDB's LDG3 is read as LDG)
+LDNA_TERMINAL_MAP = "addPdbResMap { " + " ".join(f'{{ {end} "LD{b}" "LD{b}{suffix}" }}' for b in "ACGT"
+                                                  for end, suffix in ((0, "5"), (1, "3"))) + " }"
+POL_1264 = "lj_1264_pol_mdatk.dat"  # the 12-6-4 polarizabilities with the twin types (ParmEd needs every type)
+
+# id -> (label, leaprc, solvent box, ParmEd add12_6_4 water model, 12-6-4 ion frcmod)
+# (box and frcmod names checked against AmberTools 26 dat/leap)
+WATERS: Dict[str, Tuple[str, str, str, str, str]] = {
+    "spce": ("SPC/E", "leaprc.water.spce", "SPCBOX", "SPCE", "frcmod.ions234lm_1264_spce"),
+    "tip3p": ("TIP3P", "leaprc.water.tip3p", "TIP3PBOX", "TIP3P", "frcmod.ions234lm_1264_tip3p"),
+    "opc": ("OPC", "leaprc.water.opc", "OPCBOX", "OPC", "frcmod.ionslm_1264_opc"),
+    "opc3": ("OPC3", "leaprc.water.opc3", "OPC3BOX", "OPC3", "frcmod.ionslm_1264_opc3"),
+    "tip4pew": ("TIP4P-Ew", "leaprc.water.tip4pew", "TIP4PEWBOX", "TIP4PEW", "frcmod.ions234lm_1264_tip4pew"),
+    "fb3": ("TIP3P-FB", "leaprc.water.fb3", "FB3BOX", "FB3", "frcmod.ionslm_1264_fb3"),
+    "tip4pd": ("TIP4P-D", "leaprc.water.tip4pd", "TIP4PDBOX", "", ""),
+    # AmberTools has no TIP4P/2005 files: the build script derives them from the TIP4P-Ew ones
+    "tip4p2005": ("TIP4P/2005", "leaprc.water.tip4pew", "TIP4P2005BOX", "", ""),
+    "none": ("none (no solvent box)", "", "", "", ""),
+}
+FOUR_SITE_WATERS = ("opc", "tip4pew", "tip4pd", "tip4p2005")
+
+SOLVATED = tuple(k for k in WATERS if k != "none")
+DEFAULT_STRIP = ":WAT,HOH,Na+,Cl-,K+,MG"
+SOLVENT_MASK = "!:WAT,HOH,Na+,Cl-,K+,MG"
+
+NBFIX19_LINES = [
+    "#",
+    "# Off-diagonal Lennard-Jones parameters replacing the external gHBfix19 H-bond correction",
+    "# potential (Kuehrova & Mlynsky et al., JCTC 2019) with the NBfix19 modification;",
+    "# for details, see Mlynsky V., Kuehrova P., Bussi G., Otyepka M., Sponer J., and Banas P., 2026",
+    "#",
+    "# IMPORTANT: this assumes that the topology was built with the OL3 RNA force field (Zgarbova et al.,",
+    "# JCTC 2011) further adjusted by the phosphate oxygen van der Waals correction (CP) by Steinbrecher",
+    "# et al., JCTC 2012; other force fields may have different atom types and need different atom masks",
+    "#",
+    "# NBfix modification of -NH...N- interactions according to the gHBfix19 potential",
+    "# all A_N6(H61/H62), C_N4(H41/H42), G_N2(H21/H22), G_N1(H1), and U_N3(H3) hydrogens share same and",
+    "# unique atom type H",
+    "# A(N1), A(N3), A(N7), C(N3), G(N3), and G(N7) share same NB and NC atom types, but these are also share",
+    "# with, e.g., N, NA, N2 .., so we need to split it",
+    "addLJType @%NB,NC",
+    "changeLJPair @%NB,NC @%H 2.1 0.63",
+    "#",
+    "# NBfix modification of -OH...bO/nbO- interactions according to the gHBfix19 potential",
+    "# all 2'-OH hydrogens (i.e., HO2', HO3', and HO5') share same and unique atom type HO",
+    "# all bridging (bO; O5' and O3') and nonbridging (nbO; O1P and O2P) phosphate oxygens share same and",
+    "# unique atom types OR and OP",
+    "changeLJPair @%HO @%O2 2.73 0.01",
+    "changeLJPair @%HO @%OS 3.03 0.01",
+]
+BPH0_LINES = [
+    "#",
+    "# Additional parameters from 0BPh",
+    "changeLJPair @%H5 @%OS 2.8808 0.0505",
+    "changeLJPair @%H4 @%OS 2.9308 0.0505",
+]
+LRNA_NOTE = [
+    "#",
+    "# L-RNA pairs (e.g. changeLJPair @%HO @%LD 3.03 0.01) are not included; add them under",
+    "# 'Extra ParmEd commands' when the topology contains L-RNA residues.",
+]
+
+
+def lrna_pair_lines(nbfix19: bool, bph0: bool, bridging: str = "LD") -> List[str]:
+    """NBfix19 / 0BPh pairs for the L-RNA library, whose bridging phosphate oxygens (O3'/O5') have their
+    own type (LD) instead of OS / OR; the base types (NB, NC, H) are shared with D-RNA, so the -NH...N-
+    pair above already covers L residues.  ParmEd skips the lines when no atom has the type."""
+    t = f"@%{bridging}"
+    out = ["#", f"# L-RNA pairs: bridging phosphate oxygens of the L-RNA library have the type {bridging}"]
+    if nbfix19:
+        out.append(f"changeLJPair @%HO {t} 3.03 0.01")
+    if bph0:
+        out += [f"changeLJPair @%H5 {t} 2.8808 0.0505", f"changeLJPair @%H4 {t} 2.9308 0.0505"]
+    return out
+
+
+# DNA residue names in a topology the Amber build writes (D-DNA of the DNA force fields, MDATK's L-DNA units)
+DNA_RESIDUES = tuple(h + b + end for h in ("D", "LD") for b in "ACGT" for end in ("", "5", "3", "N"))
+
+
+def nbfix_without_dna(nbfix: List[str], bph: List[str], lrna: List[str], cp: bool) -> List[str]:
+    """NBfix19 kept off DNA: ParmEd changes Lennard-Jones pairs by LJ type, which DNA atoms share with RNA, so
+    the DNA atoms of the NBfix19 types (base NB / NC and H, terminal HO; with the plain types also phosphate
+    O2 and bridging OS, with the L-DNA twin LS that tleap merges with OS) get LJ types of their own first, and
+    every NBfix19 pair (and the L-RNA ones) addresses the RNA atoms only.  0BPh keeps acting on DNA: a 0BPh
+    line on a type split this way is written for the RNA and for the DNA type."""
+    dna = ":" + ",".join(DNA_RESIDUES)
+    split = {"@%NB,NC": "@%NB,NC", "@%H": "@%H", "@%HO": "@%HO"}
+    if not cp:
+        split.update({"@%O2": "@%O2", "@%OS": "@%OS,LS"})
+
+    # no parentheses: ParmEd's argument parser would join a parenthesised mask with the rest of the line;
+    # '!' binds tighter than '&' in Amber masks
+    def rna(mask):
+        return f"{mask}&!{dna}" if mask in split else mask
+
+    def dna_mask(mask):
+        return f"{dna}&{split[mask]}"
+
+    def pair(ln):
+        f = ln.split()
+        return f[0], f[1], f[2], f[3:]
+
+    out = ["#", "# NBfix19 is fitted for RNA and kept off DNA: the DNA atoms of its types get LJ types of their own",
+           "# (ParmEd changes pairs by LJ type, which DNA shares with RNA), and its pairs name the RNA atoms"]
+    for ln in nbfix:
+        if ln.startswith("addLJType"):
+            out.append(ln)
+            if ln.split()[1] == "@%NB,NC":
+                out += [f"addLJType {dna_mask(m)}" for m in split]
+        elif ln.startswith("changeLJPair"):
+            cmd, m1, m2, rest = pair(ln)
+            out.append(" ".join([cmd, rna(m1), rna(m2)] + rest))
+        else:
+            out.append(ln)
+    for ln in bph:
+        if ln.startswith("changeLJPair"):
+            cmd, m1, m2, rest = pair(ln)
+            out.append(" ".join([cmd, rna(m1), rna(m2)] + rest))
+            if m1 in split or m2 in split:  # the same pair for the DNA atoms (0BPh is not switched off)
+                out.append(" ".join([cmd, dna_mask(m1) if m1 in split else m1,
+                                     dna_mask(m2) if m2 in split else m2] + rest))
+        else:
+            out.append(ln)
+    for ln in lrna:
+        if ln.startswith("changeLJPair"):
+            cmd, m1, m2, rest = pair(ln)
+            ln = " ".join([cmd, rna(m1), rna(m2)] + rest)
+        out.append(ln)
+    return out
+
+# ---------------------------------------------------------------------------
+# shared option builders
+# ---------------------------------------------------------------------------
+
+
+def restraint_options() -> List[Option]:
+    return [
+        Option("sequence", "Sequence", "multiline", "",
+               "RNA sequence in topology order; chains separated by spaces, '&' or new lines "
+               "(optionally 'A: GGCAC...'). Not needed when a secondary-structure file is connected.",
+               placeholder="GGGCAC... GUGCCC..."),
+        Option("dotbracket", "Secondary structure", "multiline", "",
+               "Dot-bracket notation for the whole sequence; '()', '[]', '{}' and '<>' pairs are "
+               "restrained. Strand separators (spaces, '&') are ignored.",
+               placeholder="((((((....)))))) ..."),
+        Option("res_offset", "Residue offset", "int", 0,
+               "Topology residue number = position in the sequence + offset (use when the "
+               "topology has extra residues before the RNA).", minimum=-100000, maximum=100000),
+        Option("wobble", "Restrain G·U wobble pairs", "bool", False,
+               "Also restrain G·U pairs (G O6–U N3, G N1–U O2). Off: only Watson–Crick G–C and A–U "
+               "pairs are restrained."),
+        Option("r1", "r1", "float", 2.3, "Lower distance where the linear restraint wall starts (Å).",
+               minimum=0.0, maximum=50.0, step=0.1, digits=2, unit="Å"),
+        Option("r2", "r2", "float", 2.7, "Start of the flat bottom (Å).", minimum=0.0, maximum=50.0,
+               step=0.1, digits=2, unit="Å"),
+        Option("r3", "r3", "float", 3.2, "End of the flat bottom (Å).", minimum=0.0, maximum=50.0,
+               step=0.1, digits=2, unit="Å"),
+        Option("r4", "r4", "float", 3.7, "Upper distance where the restraint turns linear (Å).",
+               minimum=0.0, maximum=50.0, step=0.1, digits=2, unit="Å"),
+        Option("rk2", "rk2", "float", 10.0, "Force constant below r2 (kcal/mol/Å²).", minimum=0.0,
+               maximum=1000.0, step=0.5, digits=2),
+        Option("rk3", "rk3", "float", 10.0, "Force constant above r3 (kcal/mol/Å²).", minimum=0.0,
+               maximum=1000.0, step=0.5, digits=2),
+    ]
+
+
+def restraint_window(s: Dict[str, Any]) -> str:
+    return (f"r1={fortran_float(s['r1'])}, r2={fortran_float(s['r2'])}, r3={fortran_float(s['r3'])}, "
+            f"r4={fortran_float(s['r4'])}, rk2={fortran_float(s['rk2'])}, rk3={fortran_float(s['rk3'])},")
+
+
+def secondary_structure(s: Dict[str, Any], ctx: StepContext,
+                        port: str = "secstruct") -> Tuple[Optional[rna.RNAModel], str, List[Issue]]:
+    """Secondary structure for restraints: a connected / chosen file wins over typed fields.
+
+    Returns (model or None, source description, issues)."""
+    issues: List[Issue] = []
+    value = ctx.value(port)
+    if value is not None and value.paths:
+        model = value.data.get("rna_model")
+        if model is not None:
+            return model, f"{value.source_label or 'connected file'}", issues
+        path = ctx.existing(port)
+        if not path:
+            issues.append(Issue("error", "the secondary-structure file must exist when the files are "
+                                         "written (or connect a step that knows it)", (f"input:{port}",)))
+            return None, "", issues
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith(">")]
+            seq_text = s.get("sequence", "")
+            if len(lines) >= 2 and not seq_text.strip():
+                seq_text = lines[1]
+            model = rna.build_model(seq_text, lines[0] if lines else "")
+        except (OSError, ValueError) as exc:
+            issues.append(Issue("error", f"cannot read {os.path.basename(path)}: {exc}", (f"input:{port}",)))
+            return None, "", issues
+        if not model.chains:  # the dot-bracket alone, and no sequence typed
+            issues.append(Issue("error", "the secondary-structure file has no sequence line: type the sequence",
+                                ("sequence", f"input:{port}")))
+            return None, "", issues
+        return model, os.path.basename(path), issues
+    if not (s.get("dotbracket") or "").strip():
+        return None, "", issues
+    try:
+        model = rna.build_model(s.get("sequence", ""), s.get("dotbracket", ""))
+    except ValueError as exc:
+        issues.append(Issue("error", str(exc), ("sequence", "dotbracket")))
+        return None, "", issues
+    if not model.chains:
+        issues.append(Issue("error", "enter the sequence for the secondary structure", ("sequence",)))
+        return None, "", issues
+    return model, "typed secondary structure", issues
+
+
+def restraint_pairs(model: rna.RNAModel, s: Dict[str, Any]) -> Tuple[List[Tuple[int, int, str]], List[Issue]]:
+    keep, skip = rna.classify_pairs(model, s.get("wobble", False))
+    issues: List[Issue] = []
+    if skip:
+        kinds = sorted({k for _i, _j, k in skip})
+        wob = [p for p in skip if p[2] in rna.WOBBLE]
+        msg = f"{len(skip)} base pair(s) not restrained ({', '.join(kinds)})"
+        if wob and not s.get("wobble"):
+            msg += "; tick 'Restrain G·U wobble pairs' to include G·U"
+        issues.append(Issue("info", msg, ("wobble",) if wob else ("dotbracket",)))
+    if not keep:
+        issues.append(Issue("warning", "the secondary structure contains no restrainable base pairs",
+                            ("dotbracket",)))
+    r = [s["r1"], s["r2"], s["r3"], s["r4"]]
+    if any(r[k] > r[k + 1] for k in range(3)):
+        issues.append(Issue("error", "restraint distances must satisfy r1 ≤ r2 ≤ r3 ≤ r4",
+                            ("r1", "r2", "r3", "r4")))
+    return keep, issues
+
+
+def helix_script(pairs, s: Dict[str, Any], source: str) -> str:
+    bonds = {k: v for k, v in rna.HBOND_ATOMS.items() if any(p[2] == k for p in pairs)}
+    doc = (f"Helix-preserving distance restraints (Amber DISANG) - written by {PROJECT_ABBREV} "
+           f"{__version__}.\n\nPairs come from: {source}.  Usage:\n"
+           "    python3 THIS_SCRIPT TOPOLOGY.parm7 OUTPUT.dist\n"
+           "Needs only Python 3 (no ParmEd).  Atom indices are looked up by residue number and atom "
+           "name, so run it on the final topology (after solvation / ParmEd).")
+    return embed(_helix_dist, {"PAIRS": [tuple(p) for p in pairs], "BONDS": bonds,
+                               "WINDOW": restraint_window(s), "OFFSET": int(s.get("res_offset", 0))},
+                 "main(sys.argv[1:], PAIRS, BONDS, WINDOW, OFFSET)", doc)
+
+
+def count_solute_residues(pdb_path: str, drop_virtual: bool = False) -> Optional[int]:
+    """Residues in a PDB that are not water or ions (None if unreadable), counted as tleap reads them: a new
+    residue wherever the name, chain or number changes or a TER intervenes, so strands that share a chain id
+    and their numbers (blank chain ids, every strand numbered from 1) are not counted once.  ``drop_virtual``:
+    Rosetta's virtual residues (VRT / XXX) do not count - the preparation removes them."""
+    skip = {"HOH", "WAT", "SOL", "NA", "NA+", "CL", "CL-", "K", "K+", "MG", "MG2", "ZN", "CA"} | _prep_pdb.WATERS
+    count, last = 0, None
+    try:
+        with open(pdb_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("ENDMDL"):
+                    break
+                if line.startswith("TER"):
+                    last = None
+                elif line.startswith(("ATOM  ", "HETATM")) and len(line) >= 26:
+                    name = line[17:21].strip().upper()
+                    if name in skip or (drop_virtual and line[17:20].strip().upper() in _prep_pdb.VIRTUAL):
+                        continue
+                    key = (name, line[21], line[22:27])
+                    if key != last:
+                        count += 1
+                        last = key
+    except OSError:
+        return None
+    return count or None
+
+
+# ---------------------------------------------------------------------------
+# Amber system build
+# ---------------------------------------------------------------------------
+
+
+@register
+class AmberBuildTool(Tool):
+    name = "amber-build"
+    label = "Amber · system build"
+    category = "Amber"
+    tag = "amber-build"
+    description = ("tleap topology and coordinates from a PDB: RNA force field, water box and ions, "
+                   "ParmEd NBfix19 / 0BPh / HMR / 12-6-4, optional two-pass build with L-RNA renaming.")
+    inputs = [Port("structure", "Starting structure (PDB)", ("pdb",),
+                   tooltip="RNA model to parameterise, e.g. the best FARFAR2 cluster centre.")]
+    sections = [
+        Section("prep", "Input structure", [
+            Option("prep", "Prepare the PDB for tleap", "bool", True,
+                   "Write a cleaned copy of the input first: hydrogens removed (tleap rebuilds them), "
+                   "TER records between chains, first MODEL only. Rosetta / FARFAR2 models need this."),
+            Option("strip_5p", "Remove 5′-terminal phosphates", "bool", True,
+                   "Drop P/OP1/OP2 of each chain's first residue: Amber's 5′-terminal residues (G5, "
+                   "A5 ...) have no phosphate.", requires={"prep": True}),
+            Option("gap_ter", "Break chains at numbering gaps", "bool", True,
+                   "Insert a TER record where residue numbers jump, so tleap does not bond across "
+                   "a gap.", requires={"prep": True}),
+            Option("strip_water", "Remove waters from the input", "bool", True,
+                   "Crystal waters are dropped; the solvent box is built by tleap.",
+                   requires={"prep": True}),
+            Option("drop_virtual", "Remove Rosetta virtual residues (VRT/XXX)", "bool", True,
+                   "Drop the virtual residues Rosetta writes into density-scored models (VRT: the root of "
+                   "the fold tree, atoms ORIG / X / Y; XXX). They are no atoms of the molecule, and tleap "
+                   "has no unit for them: it cannot type their atoms and fails to save the topology.",
+                   requires={"prep": True}),
+            Option("link_check", "Check O3′–P links before tleap", "radio", "off",
+                   "Measure O3′(i)–P(i+1) of consecutive nucleotides in every TER segment of the PDB tleap "
+                   "reads (after the preparation and the L-RNA naming), as the first thing the script does "
+                   "with it: before the force-field helpers and every tleap run. tleap bonds them by name "
+                   "whatever the distance, so a chain break left in a model (Rosetta numbers across its "
+                   "cutpoints) becomes a strained bond that the first minimisation has to relax. Links "
+                   "longer than the longest unstrained link are listed with that strain, E = k(r − r0)², "
+                   "k and r0 of the P–O3′ bond read from the force field tleap loads. Warn: list every link "
+                   "outside the limits and build anyway. Stop: list the strained links and end the script "
+                   "before tleap when a link is a break (or too short, or unmeasurable).",
+                   choices=[("off", "off"), ("warn", "warn"), ("stop", "stop")]),
+            Option("link_min", "Shortest O3′–P link", "float", 1.4,
+                   "Shorter links are overlaps (ideal 1.60 Å).", minimum=0.5, maximum=3.0, step=0.05,
+                   digits=2, unit="Å", requires={"link_check": ("warn", "stop")}),
+            Option("link_max", "Longest unstrained O3′–P link", "float", 2.0,
+                   "Longer links are bonded under strain, reported with it (Amber's OS–P: about 35 kcal/mol "
+                   "at 2.0 Å, 180 at 2.5 Å, 440 at 3.0 Å) but not a reason to stop.",
+                   minimum=1.0, maximum=10.0, step=0.1, digits=2, unit="Å",
+                   requires={"link_check": ("warn", "stop")}),
+            Option("link_fail", "Longest O3′–P link before a break", "float", 3.0,
+                   "Longer links are breaks (the chain is usually in two pieces): 'Stop' ends the script "
+                   "before tleap.", minimum=1.0, maximum=20.0, step=0.1, digits=2, unit="Å",
+                   requires={"link_check": ("warn", "stop")}),
+        ], tooltip="How the starting PDB is cleaned before tleap reads it."),
+        Section("forcefield", "Force field", [
+            Option("rna_ff", "RNA force field", "choice", "ol3cp",
+                   "leaprc file for RNA. 'OL3 + CP' adds the phosphate oxygen vdW correction of "
+                   "Steinbrecher et al. (JCTC 2012) from the frcmod below; NBfix19 / 0BPh assume it. None: no RNA "
+                   "leaprc is sourced, for a system without RNA (e.g. DNA only, with the DNA force field below); "
+                   "the RNA-only settings (NBfix19, 0BPh, a generated L-RNA library) must be off then.",
+                   choices=[(k, v[0]) for k, v in FORCE_FIELDS.items()] + [(NO_RNA, "None (no RNA in the system)")]),
+            Option("cp_source", "CP parameters", "radio", "lib",
+                   "Retyped library: the build script writes RNA_CP.lib (AmberTools' RNA.lib with the "
+                   "phosphate oxygens retyped OP / OR) and frcmod.cp (the CP Lennard-Jones values plus "
+                   "the parm10.dat bonded terms for the new types), so only phosphate oxygens change "
+                   "and the NBfix19 / 0BPh masks address them as @%OP / @%OR. Own frcmod: load a CP "
+                   "parameter file you provide (masks stay @%O2 / @%OS).",
+                   choices=[("lib", "Retyped library (generated)"), ("frcmod", "Own frcmod file")],
+                   requires={"rna_ff": "ol3cp"}),
+            Option("cp_frcmod", "CP frcmod file", "file", "frcmod.99bsc0-chiol3-CaseP",
+                   "Parameter file with the CP phosphate correction: a name in leap's search path / "
+                   "the step folder, or an absolute path.", requires={"rna_ff": "ol3cp", "cp_source": "frcmod"}),
+            Option("dna_ff", "DNA force field", "choice", "ol24",
+                   "leaprc file for DNA, sourced after the RNA one when the structure has DNA (from the structure "
+                   "builder, or residues DA/DC/DG/DT or L-DNA LDA ... in an existing input PDB); a structure "
+                   "without DNA is built as before. The DNA types (C7, CJ, C1, C2; chi on CK / CM / C1 / C2) are "
+                   "not RNA's, so RNA and DNA in one structure each keep their own terms. OL24 (Zgarbová et al. "
+                   "JCTC 2025): OL21 with refined delta and deoxyribose tau1 and chiOL3; OL21 (JCTC 2021): bsc0 + "
+                   "OL15 with refined alpha / gamma.",
+                   choices=[(k, v[0]) for k, v in DNA_FORCE_FIELDS.items()] + [("none", "None (no DNA force field)")]),
+            Option("ldna_library", "L-DNA library", "radio", "auto",
+                   "Generated: the build script writes LDNA.lib and frcmod.ldna from the DNA force field (its D "
+                   "library and parameter files): the D units mirrored, named LDA LDC LDG LDT (chain ends: LDA5 / LDA3 units, chosen by tleap from the position; residue names stay three characters), "
+                   "with O5' / O4' / O3' given the types LS (OS) and LT (OH), whose dihedral phases are mirrored, "
+                   "so a D molecule and its mirror image have the same energy term by term. Automatic: generated "
+                   "when the structure has L-DNA. Own: L-DNA units from the libraries listed under Force field.",
+                   choices=[("auto", "Automatic"), ("generated", "Generated by MDATK"), ("own", "My own files")],
+                   requires={"dna_ff": tuple(DNA_FORCE_FIELDS)}),
+            Option("extra_frcmod", "Extra parameter files", "multiline", "",
+                   "One frcmod file per line, loaded with loadamberparams after the force field "
+                   "(e.g. frcmod.LRNA).", placeholder="frcmod.LRNA"),
+            Option("extra_libs", "Extra residue libraries", "multiline", "",
+                   "One library (.lib / .off) per line, loaded with loadOff (e.g. LRNA.lib).",
+                   placeholder="LRNA.lib"),
+            Option("leap_before_params", "Leap commands before parameter files", "multiline", "",
+                   "Inserted right after the leaprc files, e.g. addAtomTypes for new atom types.",
+                   placeholder='addAtomTypes { { "LD" "O" "sp3" } }'),
+            Option("leap_before_load", "Leap commands before loadpdb", "multiline", "",
+                   "Inserted before the PDB is read, e.g. addPdbResMap entries.",
+                   placeholder='addPdbResMap { { "LG" "G0" } }'),
+            Option("leap_after_load", "Leap commands after loadpdb", "multiline", "",
+                   "Inserted after the PDB is read and before solvation, e.g. bond commands."),
+        ], tooltip="RNA force field and extra parameters / libraries / leap commands."),
+        Section("solvent", "Solvent & ions", [
+            Option("water", "Water model", "choice", "spce",
+                   "Water model; its leaprc also loads the matching monovalent / divalent ion "
+                   "parameters.", choices=[(k, v[0]) for k, v in WATERS.items()]),
+            Option("box", "Box shape", "radio", "oct",
+                   "Truncated octahedron (solvateoct) needs ~30 % less water than a rectangular box.",
+                   choices=[("oct", "Truncated octahedron"), ("rect", "Rectangular"), ("cubic", "Cubic")],
+                   requires={"water": SOLVATED}),
+            Option("buffer", "Buffer", "float", 15.0,
+                   "Minimum distance between the RNA and the box edge.", minimum=5.0, maximum=50.0,
+                   step=0.5, digits=1, unit="Å",
+                   requires={"water": SOLVATED}),
+            Option("neutralize", "Neutralise with monovalent cations", "bool", True,
+                   "addIonsRand <cation> 0 neutralises the RNA's phosphate charge.",
+                   requires={"water": SOLVATED}),
+            Option("cation", "Cation", "radio", "Na+", "Monovalent cation for neutralisation and salt.",
+                   choices=[("Na+", "Na⁺"), ("K+", "K⁺")],
+                   requires={"water": SOLVATED}),
+            Option("mg_count", "Mg²⁺ ions", "int", 0, "Number of Mg²⁺ ions (residue MG) added at random "
+                   "positions.", minimum=0, maximum=10000,
+                   requires={"water": SOLVATED}),
+            Option("mg_balance", "Balance Mg²⁺ with Cl⁻", "bool", True,
+                   "Add two Cl⁻ per Mg²⁺ so the box stays neutral.",
+                   requires={"water": SOLVATED}),
+            Option("salt_pairs", "Extra salt pairs", "int", 0,
+                   "Additional cation/Cl⁻ pairs (≈ concentration [M] × number of waters / 55.5).",
+                   minimum=0, maximum=100000,
+                   requires={"water": SOLVATED}),
+            Option("mg_model", "Mg²⁺ Lennard-Jones model", "radio", "126",
+                   "12-6: the Li & Merz parameters loaded with the water model. 12-6-4 (Li & Merz): "
+                   "loads frcmod.ions234lm_1264_<water> and adds the C4 terms with ParmEd add12_6_4 "
+                   "(Amber only; GROMACS cannot represent C4). microMg / nanoMg (Grotz, Cruz-León & "
+                   "Schwierz): optimised 12-6 Mg²⁺ with explicit Mg²⁺-RNA pair terms tuned to phosphate "
+                   "binding - written as a frcmod plus ParmEd changeLJPair lines, and carried into "
+                   "GROMACS as [ nonbond_params ]. microMg keeps the experimental (µs) water exchange; "
+                   "nanoMg exchanges water faster for better sampling of ion binding.",
+                   choices=[("126", "12-6 (default)"), ("1264", "12-6-4 (Li & Merz)"),
+                            ("micro", "microMg"), ("nano", "nanoMg")],
+                   requires={"water": SOLVATED}),
+            Option("mg_cl_pair", "Mg²⁺-Cl⁻ pair term", "bool", True,
+                   "Apply the authors' Mg²⁺-Cl⁻ pair term (optimised with their Cl⁻ model; Amber's Cl⁻ "
+                   "parameters are kept for everything else). Without it Mg²⁺-Cl⁻ follows the combination "
+                   "rule with the optimised Mg²⁺, which is not a published combination and gives much too "
+                   "strong Mg²⁺-Cl⁻ contacts.",
+                   requires={"water": SOLVATED, "mg_model": ("micro", "nano")}),
+            Option("mg_types", "Extra Mg²⁺ pair types", "text", "",
+                   "Atom types from extra residue libraries or parameter files that need Mg²⁺ pair terms, "
+                   "each as TYPE:REFERENCE - the published parmBSC0χOL3 type (or CP OP / OR) it is "
+                   "chemically equivalent to, e.g. 'XO:OS XH:OH'. With microMg / nanoMg a solute type "
+                   "without a pair term keeps the combination rule, which binds Mg²⁺ several times too "
+                   "strongly. Choose the reference with the same Lennard-Jones terms (its LJ twin): tleap "
+                   "merges types with equal terms and the pair applies to all of them. L-RNA types are "
+                   "covered under L-RNA; the topology check after the build lists any type still missing.",
+                   placeholder="XO:OS XH:OH", requires={"water": SOLVATED, "mg_model": ("micro", "nano")}),
+        ], tooltip="Water box and ions (tleap solvateoct / solvatebox and addIonsRand)."),
+        Section("parmed", "ParmEd", [
+            Option("nbfix19", "NBfix19 (gHBfix19 as LJ pairs)", "bool", True,
+                   "Off-diagonal Lennard-Jones terms for -NH...N- and -OH...O(phosphate) pairs "
+                   "(Kuehrova & Mlynsky JCTC 2019; Mlynsky et al. 2026). The masks assume OL3 + CP."),
+            Option("bph0", "0BPh pairs", "bool", True,
+                   "Extra H5/H4 – O5' Lennard-Jones pairs of the 0BPh modification (Mlýnský et al. 2023): "
+                   "masks @%OR with the CP library, @%OS otherwise."),
+            Option("split_types", "Separate HO and O2 Lennard-Jones types first", "bool", True,
+                   "addLJType @%HO and @%O2 before the pair changes. tleap merges atom types with equal "
+                   "LJ parameters: HO shares its LJ type with water HW and O2 with base carbonyl O, so "
+                   "without this the HO-O2 / HO-OS pairs also change water-H and carbonyl-O interactions.",
+                   requires={"nbfix19": True}),
+            Option("hmr", "Hydrogen mass repartitioning", "bool", False,
+                   "ParmEd HMassRepartition (hydrogens 3.024 Da) so MD can use a 4 fs time step "
+                   "with SHAKE."),
+            Option("parmed_extra", "Extra ParmEd commands", "multiline", "",
+                   "Added after the NBfix19 / 0BPh lines and before the Mg²⁺ pair terms and outparm. "
+                   "The L-RNA NBfix19 / 0BPh pairs and (microMg / nanoMg) the Mg²⁺ pair terms of the "
+                   "L-RNA types are written automatically (L-RNA atom types); use this for anything else. "
+                   "tleap merges atom types with equal Lennard-Jones terms into one LJ type, so a pair set "
+                   "with @%TYPE applies to every type sharing them (addLJType @%TYPE separates one first).",
+                   placeholder="changeLJPair @%XX @%YY 3.0 0.1"),
+        ], tooltip="Topology edits applied with ParmEd after tleap (leap cannot reload a prmtop)."),
+        Section("lrna", "L-RNA", [
+            Option("lrna", "Name L-nucleotides for leap", "bool", True,
+                   "Before tleap, residues whose sugar chirality (C1'/C3'/C4') is L get L-RNA names "
+                   "(Dudek & Trylska: LA LC LG LU, terminals LA5/LA3 ...), the other RNA residues Amber "
+                   "names. Runs the PDB tools that MDATK copies into the step folder (replaces "
+                   "to_lrna.sh); a structure without L residues is only checked."),
+            Option("lrna_ranges", "Force L for", "text", "",
+                   "Residues that are L whatever their geometry says (overrides the detection), e.g. "
+                   "'C:45-73', 'A:45-73, A:80-90' or 'C' for a whole chain.",
+                   placeholder="C:45-73", requires={"lrna": True}),
+            Option("lrna_terminals", "5'/3' terminal names", "bool", True,
+                   "LA5/LA3 ... at chain ends as in nucleic12_LRNA.lib. Off: plain LA/LC/LG/LU at the ends "
+                   "(as to_lrna.sh wrote), for libraries that map terminals with addPdbResMap.",
+                   requires={"lrna": True}),
+            Option("lrna_library", "L-RNA library", "radio", "auto",
+                   "Generated: MDATK writes LRNA.lib and frcmod.lrna from the force field in use (OL3 or OL3 + "
+                   "CP): the D units mirrored, named LA LC LG LU / LA5 LA3 ..., with O5' / O4' given their own "
+                   "types (LD, LE, LH) whose dihedral phases are mirrored - a D molecule and its mirror image then "
+                   "have the same energy, term by term. Automatic: generated when the structure is known to have L "
+                   "residues when planning (an existing input PDB, 'Force L for', or an L helix from the builder) "
+                   "and no own L-RNA files are listed or loaded; for a structure an earlier step makes, choose "
+                   "Generated. Own: the libraries listed under Force field.",
+                   choices=[("auto", "Automatic"), ("generated", "Generated by MDATK"), ("own", "My own files")],
+                   requires={"lrna": True}),
+            Option("lrna_fixes", "NBfix19 / 0BPh / CP for L-RNA", "bool", True,
+                   "Declare the L-RNA library's atom types for tleap (addAtomTypes) and add the NBfix19 / "
+                   "0BPh pairs for its bridging-oxygen type (HO, H5, H4 against LD, as for OS / OR in "
+                   "D-RNA). ParmEd skips them when the structure has no L residues. The CP correction of "
+                   "L residues comes with the L-RNA parameter file (e.g. frcmod.LRNA)."),
+            Option("lrna_types", "L-RNA atom types", "text", "LD LH LE",
+                   "Oxygen atom types of the L-RNA library, declared as sp3 oxygens before it is loaded; "
+                   "the first one is the bridging phosphate oxygen used in the NBfix19 / 0BPh pairs. With "
+                   "microMg / nanoMg each type also gets the Mg²⁺ pair term of its D-RNA twin: LD (O3'/O5') "
+                   "and LE (O4') as OS, LH (O2' / terminal OH) as OH; write TYPE:REFERENCE for other "
+                   "types or another twin, e.g. 'LD LH LE LX:OS'.",
+                   requires={"lrna_fixes": True}),
+            Option("two_pass", "Two-pass build", "bool", False,
+                   "L-RNA naming -> dry tleap -> ParmEd -> ambpdb -> solvated tleap -> ParmEd. The ambpdb "
+                   "PDB keeps the dry topology's residue names (Amber terminal names are re-applied)."),
+        ], tooltip="L-RNA residue names for leap (the library and parameters go under Force field)."),
+        Section("outputs", "Outputs", [
+            Option("save_pdb", "Also save a PDB of the built system", "bool", True,
+                   "tleap savepdb after solvation - handy for a visual check."),
+            Option("check_topology", "Check the final topology", "bool", True,
+                   "After the build, a small Python check reads the final parm7 and stops the script when "
+                   "the box is not neutral (when it should be: neutralised, Mg²⁺ balanced), a Mg²⁺ ion does "
+                   "not carry +2, or (microMg / nanoMg) the ion "
+                   "lacks the published Lennard-Jones terms or a solute atom type has no Mg²⁺ pair term.",
+                   requires={"water": SOLVATED}),
+        ]),
+        env_section("source /opt/amber26/amber.sh   or   module load Amber/24"),
+    ]
+
+    def output_ports(self, s):
+        ports = [Port("topology", "Topology (parm7)", ("parm7",)),
+                 Port("coordinates", "Coordinates (rst7)", ("rst7",))]
+        if s.get("save_pdb"):
+            ports.append(Port("pdb", "System PDB", ("pdb",)))
+        if s.get("two_pass"):
+            ports.append(Port("dry_topology", "Dry topology (parm7)", ("parm7",)))
+            ports.append(Port("dry_pdb", "Dry PDB (after renaming)", ("pdb",)))
+        return ports
+
+    # names ------------------------------------------------------------
+    @staticmethod
+    def _solvated(s) -> bool:
+        return s["water"] != "none"
+
+    @staticmethod
+    def _lj_mods(s) -> bool:
+        return bool(s["nbfix19"] or s["bph0"] or extra_lines(s["parmed_extra"]))
+
+    @staticmethod
+    def _mg_pairs(s) -> bool:
+        """microMg / nanoMg: frcmod for the ion + ParmEd pair terms (solvated builds only)."""
+        return (s["water"] != "none" and s["mg_model"] in mg_params.MODELS
+                and (s["mg_model"], s["water"]) in mg_params.MG_SETS)
+
+    def _pair_refs(self, s) -> Dict[str, List[float]]:
+        """Atom type -> the Mg2+ pair (Rmin_ij, epsilon) MDATK writes for it, for the topology check."""
+        p = mg_params.get_set(s["mg_model"], s["water"])
+        out = {t: [round(v, 6) for v in mg_params.amber_pair(*pair)] for t, pair in p.rna.items()}
+        for t, ref in list(mg_params.CP_ALIASES.items()) + list(self._mg_type_map(s)[0].items()):
+            out[t] = [round(v, 6) for v in mg_params.amber_pair(*p.rna[mg_params.CP_ALIASES.get(ref, ref)])]
+        return out
+
+    def _wet_parmed(self, s) -> bool:
+        return bool(self._lj_mods(s) or s["hmr"] or self._mg_pairs(s)
+                    or (self._solvated(s) and s["mg_model"] == "1264"))
+
+    def _final_topology(self, s, ctx) -> str:
+        return ctx.name("parmed" if self._wet_parmed(s) else "tleap", "parm7")
+
+    def programs(self, s):
+        return [(p, r"(^|[\s;(&|])" + p + r"\s") for p in ("tleap", "parmed", "ambpdb", "cpptraj", "python3")]
+
+    @staticmethod
+    def _effective(s):
+        """The settings a build is written from.  Without an RNA force field ('RNA force field: None') nothing
+        RNA-only is written, whatever its box says (the check reports NBfix19 / 0BPh left on as errors): no
+        NBfix19 / 0BPh pairs and no L-RNA atom types.  (The CP library and the generated L-RNA library follow
+        the force field themselves: _cp_lib, lrna_generated.)"""
+        if s["rna_ff"] != NO_RNA:
+            return s
+        return dict(s, nbfix19=False, bph0=False, lrna_fixes=False)
+
+    def resources(self, s):
+        s = self._effective(s)
+        out = ["ambertools"] + {"ol3cp": ["ol3", "cp"], "ol3": ["ol3"], "ljbb": ["ol3", "ljbb"], "roc": ["roc"],
+                                "yil": ["yil"], "shaw": ["shaw"]}.get(s["rna_ff"], [])
+        if self._solvated(s):
+            out.append("water_" + s["water"])
+            if s["neutralize"] or s["salt_pairs"] or (s["mg_balance"] and s["mg_count"]):
+                out.append("ions_jc")
+            if s["mg_count"] and s["mg_model"] == "126":
+                out.append("ions_lm126")
+            elif s["mg_model"] == "1264":
+                out.append("ions_lm1264")
+            elif self._mg_pairs(s):
+                out.append(mg_params.RESOURCES[(s["mg_model"], s["water"])])
+        if self._wet_parmed(s) or (s["two_pass"] and self._lj_mods(s)):
+            out.append("parmed")
+        out += [r for r, on in (("nbfix19", s["nbfix19"]), ("bph0", s["bph0"]), ("hmr", s["hmr"])) if on]
+        libs = (s["extra_libs"] + s["extra_frcmod"]).lower()
+        if s["lrna"] and (s["lrna_ranges"].strip() or "lrna" in libs):
+            out.append("lrna")
+        return out
+
+    def describe(self, s):
+        s = self._effective(s)
+        if s["rna_ff"] == NO_RNA:
+            parts = [DNA_FORCE_FIELDS[s["dna_ff"]][2] if s["dna_ff"] in DNA_FORCE_FIELDS else "no RNA force field"]
+        else:
+            parts = [FORCE_FIELDS[s["rna_ff"]][2]]
+        if self._solvated(s):
+            parts.append(WATERS[s["water"]][0])
+        mods = [m for m, on in (("NBfix19", s["nbfix19"]), ("0BPh", s["bph0"]), ("HMR", s["hmr"]))
+                if on]
+        if mods:
+            parts.append("+".join(mods))
+        if self._solvated(s) and s["mg_model"] != "126":
+            parts.append(mg_params.MODELS.get(s["mg_model"], "12-6-4 Mg"))
+        if s["two_pass"]:
+            parts.append("two-pass")
+        if s["lrna"] and s["lrna_ranges"].strip():
+            parts.append("L-RNA " + s["lrna_ranges"].strip())
+        return ", ".join(parts)
+
+    @staticmethod
+    def _lrna_tokens(s) -> List[Tuple[str, str]]:
+        """(type, reference or '') of the L-RNA types ([] when the L-RNA fixes are off). Independent of
+        the L-nucleotide naming: an input PDB may already carry L names. tleap accepts declared types
+        no atom has, and ParmEd skips pair lines for them."""
+        if not s["lrna_fixes"]:
+            return []
+        return [tuple(t.split(":", 1)) if ":" in t else (t, "")
+                for t in re.split(r"[\s,]+", s["lrna_types"].strip()) if t]
+
+    @classmethod
+    def _lrna_types(cls, s) -> List[str]:
+        """L-RNA atom types to declare / pair ([] when the L-RNA fixes are off)."""
+        return [t for t, _ref in cls._lrna_tokens(s)]
+
+    @classmethod
+    def _mg_type_map(cls, s) -> Tuple[Dict[str, str], List[str]]:
+        """Non-standard atom type -> reference type for the Mg2+ pair terms, and the L-RNA types
+        that have no reference (unknown name, none given)."""
+        out: Dict[str, str] = {}
+        missing: List[str] = []
+        for t, ref in cls._lrna_tokens(s):
+            ref = ref or mg_params.LRNA_DEFAULT_REFS.get(t, "")
+            if ref:
+                out[t] = ref
+            else:
+                missing.append(t)
+        for tok in re.split(r"[\s,]+", s["mg_types"].strip()):
+            if tok:
+                t, _, ref = tok.partition(":")
+                out[t] = ref
+                if t in missing:
+                    missing.remove(t)
+        return out, missing
+
+    def _ff_names(self, s, ctx) -> str:
+        """The force fields the tleap inputs source, as the titles of the generated files name them: 'OL3+CP',
+        with the DNA force field 'OL3+CP + OL24'."""
+        names = [FORCE_FIELDS[s["rna_ff"]][2]] if s["rna_ff"] != NO_RNA else []
+        if self.dna_loaded(s, ctx):
+            names.append(DNA_FORCE_FIELDS[s["dna_ff"]][2])
+        return " + ".join(names) or "no RNA or DNA force field"
+
+    @staticmethod
+    def _cp_lib(s) -> bool:
+        return s["rna_ff"] == "ol3cp" and s["cp_source"] == "lib"
+
+    @staticmethod
+    def _cp_frcmod(s) -> bool:
+        return s["rna_ff"] == "ol3cp" and s["cp_source"] == "frcmod"
+
+    def _check_water(self, s) -> List[Issue]:
+        out: List[Issue] = []
+        if s["water"] != "tip4p2005":
+            return out
+        out.append(Issue("info", "TIP4P/2005 (Abascal & Vega 2005): AmberTools has no files for it; the build "
+                                 "script derives frcmod.tip4p2005 and tip4p2005box.off from the TIP4P-Ew files "
+                                 "(residue WAT, extra point at 0.1546 Å)", ("water",)))
+        cations = s["neutralize"] or s["salt_pairs"]
+        if cations:
+            out.append(Issue("warning", f"no {s['cation']} parameters exist for TIP4P/2005; leaprc.water.tip4pew "
+                                        "loads the TIP4P-Ew (Joung-Cheatham) ones", ("cation", "water")))
+        has_cl = bool(s["mg_balance"] and s["mg_count"] or s["salt_pairs"])
+        if s["mg_model"] in mg_params.MODELS:
+            if has_cl:
+                out.append(Issue("info", "Cl⁻ gets the authors' TIP4P/2005 parameters (Grotz & Schwierz 2022, "
+                                         "Table 2) together with the Mg²⁺ set", ("water",)))
+        else:
+            if s["mg_count"]:
+                out.append(Issue("warning", "with TIP4P/2005 the 12-6 Mg²⁺ comes from the TIP4P-Ew Li & Merz "
+                                            "set; microMg / nanoMg were optimised for TIP4P/2005",
+                                 ("mg_model", "water")))
+            if has_cl:
+                out.append(Issue("warning", "Cl⁻ uses the TIP4P-Ew (Joung-Cheatham) parameters; choose microMg / "
+                                            "nanoMg to get the authors' TIP4P/2005 Cl⁻", ("mg_model", "water")))
+        return out
+
+    @staticmethod
+    def _lrna_args(s, src: str, dst: str, dna: bool = False) -> str:
+        args = ["clean", src, "-o", dst, "--scheme", "amber"] + (["--dna"] if dna else [])
+        if s["lrna_ranges"].strip():
+            args += ["--l-ranges", s["lrna_ranges"].strip()]
+        if not s["lrna_terminals"]:
+            args.append("--no-terminal-names")
+        return " ".join(shell_quote(a) for a in args)
+
+    @staticmethod
+    def _lrna_args_dry(s, src: str, dst: str, dna: bool = False) -> str:
+        """After ambpdb: residue numbers and chains changed, the names come from the topology."""
+        args = ["clean", src, "-o", dst, "--scheme", "amber", "--no-detect"] + (["--dna"] if dna else [])
+        if not s["lrna_terminals"]:
+            args.append("--no-terminal-names")
+        return " ".join(shell_quote(a) for a in args)
+
+    @staticmethod
+    def _has_l(s, ctx) -> bool:
+        """Whether the structure is known to have L-RNA residues: forced ranges, a structure from the builder with
+        L-RNA (port data 'l_rna': an L-RNA helix, a chimera with L-RNA segments; a producer that does not say:
+        the hand L or mixed), or an existing input PDB with L sugars of RNA.  L-DNA does not count: the L-RNA
+        library has no units for it."""
+        data = ctx.data("structure")
+        if s["lrna_ranges"].strip() or data.get("l_rna", data.get("chirality") in ("L", "mixed")):
+            return True
+        path = ctx.existing("structure")
+        if not path:
+            return False
+        try:
+            struct = pdbtools.read_pdb(path)
+            pdbtools.assign_chirality(struct, detect=True, l_ranges=None)
+        except (OSError, pdbtools.PDBError):
+            return False
+        return any(r.chirality == "L" and pdbtools.nucleotide(r).sugar != "dna" for r in struct.residues())
+
+    @staticmethod
+    def nucleic_content(s, ctx) -> Dict[str, bool]:
+        """What planning knows of the structure's nucleic acids: {'dna', 'l_dna', 'rna'} from the structure
+        builder's data, else from an existing input PDB (all False when neither tells)."""
+        data = ctx.data("structure")
+        if "dna" in data:
+            return {"dna": bool(data["dna"]), "l_dna": bool(data.get("l_dna")),
+                    "rna": bool(data.get("rna", not data["dna"]))}
+        out = {"dna": False, "l_dna": False, "rna": False}
+        path = ctx.existing("structure")
+        if not path:
+            return out
+        try:
+            struct = pdbtools.read_pdb(path)
+            pdbtools.assign_chirality(struct, detect=True, l_ranges=s.get("lrna_ranges") or None)
+        except (OSError, pdbtools.PDBError):
+            return out
+        for r in struct.residues():
+            nt = pdbtools.nucleotide(r)
+            if nt is None:
+                continue
+            if nt.sugar == "dna":
+                out["dna"] = True
+                out["l_dna"] = out["l_dna"] or r.chirality == "L"
+            else:
+                out["rna"] = True
+        return out
+
+    def dna_loaded(self, s, ctx) -> bool:
+        """Whether the build sources the DNA force field (the structure has DNA, or L-DNA is to be generated)."""
+        return s["dna_ff"] in DNA_FORCE_FIELDS and (self.nucleic_content(s, ctx)["dna"] or s["ldna_library"] ==
+                                                    "generated")
+
+    def ldna_generated(self, s, ctx) -> bool:
+        """Whether the build writes its own L-DNA library (LDNA.lib + frcmod.ldna)."""
+        if s["dna_ff"] not in DNA_FORCE_FIELDS or s["ldna_library"] == "own":
+            return False
+        return s["ldna_library"] == "generated" or self.nucleic_content(s, ctx)["l_dna"]
+
+    def twin_refs(self, s, ctx) -> Dict[str, str]:
+        """The twin atom types the topology carries -> the D type whose 12-6-4 polarizability they take: the
+        L-RNA types when the structure has L-RNA (known when planning), and the generated L-DNA types.  (ParmEd
+        add12_6_4 looks up the types of the atoms only, so a declared type no atom has needs no entry.)"""
+        out: Dict[str, str] = {}
+        if self.lrna_generated(s, ctx) or (s["lrna"] and self._has_l(s, ctx)):
+            out = {t: ref for t, ref in self._mg_type_map(s)[0].items() if t in self._lrna_types(s)}
+            if self.lrna_generated(s, ctx):
+                for t in self._lrna_twins(s):
+                    out.setdefault(t, mg_params.LRNA_DEFAULT_REFS.get(t, "OS"))
+        if self.ldna_generated(s, ctx):
+            out.update({twin: d for d, twin in LDNA_TWINS.items()})
+        return out
+
+    def lrna_generated(self, s, ctx) -> bool:
+        """Whether the build writes its own L-RNA library (LRNA.lib + frcmod.lrna)."""
+        if not s["lrna"] or s["lrna_library"] == "own" or s["rna_ff"] == NO_RNA:
+            return False
+        if s["lrna_library"] == "generated":
+            return True
+        return (s["rna_ff"] in ("ol3", "ol3cp") and not self._own_lrna(s, ctx) and self._has_l(s, ctx))
+
+    @staticmethod
+    def _own_lrna(s, ctx) -> bool:
+        """Residue libraries or parameters of the user's own that could carry L units: listed under Force field
+        or loaded by leap commands (automatic then leaves the build as it was)."""
+        loads = re.compile(r"^\s*(loadoff|loadamberprep|loadmol2|loadamberparams)\b", re.IGNORECASE | re.MULTILINE)
+        return bool(extra_lines(s["extra_libs"]) or loads.search(s["leap_before_params"] + "\n" + s["leap_before_load"])
+                    or AmberBuildTool._frcmods_define_l(s, ctx))
+
+    @staticmethod
+    def _own_libs(s) -> List[str]:
+        """Residue libraries of the user's own: listed under Force field or loaded with loadOff by the leap
+        commands before loadpdb."""
+        libs = _lrna_names.leap_sources(s["leap_before_params"] + "\n" + s["leap_before_load"])[0]
+        return [f.strip() for f in extra_lines(s["extra_libs"])] + libs
+
+    def _lrna_setup(self, s, ctx) -> bool:
+        """Whether the L residue names are worth checking against the own libraries (planner warning for a
+        structure from an earlier step, check in the build script): 'My own files' chosen, an own library
+        that looks like an L-RNA one, or a structure known to have L residues.  A D build with, say, a
+        ligand library is written as before 0.0.10."""
+        return s["lrna_library"] == "own" or self._has_l(s, ctx) or _lrna_like_libs(self._own_libs(s), ctx)
+
+    @staticmethod
+    def _frcmods_define_l(s, ctx) -> bool:
+        """An extra parameter file that defines one of the generated types (LD LH LE) - an own L-RNA set."""
+        for f in extra_lines(s["extra_frcmod"]):
+            try:
+                with open(ctx.abspath(f.strip()), encoding="utf-8", errors="replace") as fh:
+                    if re.search(r"^\s*(LD|LH|LE)\s", fh.read(), re.MULTILINE):
+                        return True
+            except OSError:
+                continue
+        return False
+
+    @staticmethod
+    def _lrna_twins(s) -> List[str]:
+        return ["LD", "LH", "LE"] if AmberBuildTool._cp_lib(s) else ["LD", "LH"]
+
+    def step_resources(self, s, ctx) -> List[str]:
+        out = self.resources(s)
+        if self.dna_loaded(s, ctx):
+            out.append("dna_" + s["dna_ff"])
+        if self.lrna_generated(s, ctx) and "lrna" not in out:
+            out.append("lrna")  # the L-RNA type scheme of Dudek & Trylska
+        return out
+
+    def _check_lrna_names(self, s, ctx, path) -> List[Issue]:
+        """The residue names written for the L residues must be units of the own libraries or mapped onto
+        them (addPdbResMap): tleap resolves an unknown name to any unit of that name, and AmberTools'
+        atomic_ions.lib defines LA (lanthanum) and LU (lutetium) - silently.  Without the input PDB (``path``
+        empty: an earlier step makes it) every name MDATK may write is checked, as a warning; the build
+        script then checks the names it wrote before tleap runs."""
+        if path:
+            try:
+                named = pdbtools.clean(path, scheme="amber", l_ranges=s["lrna_ranges"] or None,
+                                       terminal_names=s["lrna_terminals"]).structure
+            except (OSError, pdbtools.PDBError):
+                return []
+            names = sorted({r.name for r in named.residues() if r.chirality == "L"})
+        else:
+            terms = ("", "5", "3", "N") if s["lrna_terminals"] else ("",)
+            names = sorted({pdbtools.scheme_name(b, "L", t, "amber") for b in "ACGU" for t in terms})
+        leap = s["leap_before_params"] + "\n" + s["leap_before_load"]
+        units, unread = _lib_units(self._own_libs(s), ctx)
+        units |= _lrna_names.leap_sources(leap)[3]  # units the leap commands assign (LA = copy A0)
+        missing = _lrna_names.unmapped(names, units, _lrna_names.pdb_res_maps(leap))
+        if not missing or (unread and not path):  # (no input PDB: the build script reads them where it runs)
+            return []
+        if unread:
+            return [Issue("warning", f"cannot check that the L residue names ({', '.join(names)}) are units of "
+                                     f"{', '.join(unread)} until the file can be read (a name in leap's search path "
+                                     "is not read)", ("extra_libs",))]
+        fix = f"Add under 'Leap commands before loadpdb': {_lrna_names.map_suggestion(missing, units)}"
+        if not path:
+            return [Issue("warning", f"the L-RNA library does not define {', '.join(missing)}, names MDATK "
+                                     "writes for L residues, and no addPdbResMap maps them onto its units "
+                                     f"({_lrna_names.unit_list(units)}). The structure comes from an earlier "
+                                     f"step; if it has L residues, {_lrna_names.consequence(missing)}. {fix} "
+                                     "(the build script also checks the names it writes, before tleap runs)",
+                          ("leap_before_load", "extra_libs"))]
+        return [Issue("error", f"the L-RNA library does not define {', '.join(missing)}, the names MDATK writes for "
+                               f"the L residues, and no addPdbResMap maps them onto its units "
+                               f"({_lrna_names.unit_list(units)}). {_lrna_names.consequence(missing)}. {fix}",
+                      ("leap_before_load", "extra_libs"))]
+
+    def _check_lrna(self, s, ctx) -> List[Issue]:
+        out: List[Issue] = []
+        if not s["lrna"]:
+            return out
+        try:
+            pdbtools.parse_ranges(s["lrna_ranges"] or None)
+        except pdbtools.PDBError as exc:
+            out.append(Issue("error", f"L ranges: {exc}", ("lrna_ranges",)))
+            return out
+        libs = extra_lines(s["extra_libs"]) or extra_lines(s["extra_frcmod"])
+        path = ctx.existing("structure")
+        n_l = 0
+        if path:
+            try:
+                struct = pdbtools.read_pdb(path)
+                notes = pdbtools.assign_chirality(struct, detect=True, l_ranges=s["lrna_ranges"] or None)
+            except (OSError, pdbtools.PDBError) as exc:
+                out.append(Issue("warning", f"could not check the input PDB: {exc}", ("lrna",)))
+                return out
+            hands = [pdbtools.nucleotide(r) for r in struct.residues() if r.chirality == "L"]
+            n_ldna = sum(1 for nt in hands if nt is not None and nt.sugar == "dna")
+            n_l = len(hands) - n_ldna  # L-RNA: the residues the L-RNA library is for
+            for note in notes:
+                if note.startswith("WARNING:"):
+                    out.append(Issue("warning", note[len("WARNING:"):].strip(), ("lrna_ranges",)))
+            if n_l or n_ldna:
+                out.append(Issue("info", f"{os.path.basename(path)}: {notes[0]}", ("lrna",)))
+            if n_ldna and not self.ldna_generated(s, ctx) and s["ldna_library"] != "own":
+                out.append(Issue("error", f"{os.path.basename(path)}: {n_ldna} L-DNA residue(s) need a DNA force "
+                                          "field to mirror: choose one under Force field (AmberTools has no L-DNA "
+                                          "library)", ("dna_ff",)))
+            elif n_ldna and s["ldna_library"] == "own" and not extra_lines(s["extra_libs"]):
+                out.append(Issue("error", f"{os.path.basename(path)}: {n_ldna} L-DNA residue(s): list your own "
+                                          "L-DNA library (units named as MDATK's Amber scheme: LDA ..., ends LDA5 / LDA3 ...) "
+                                          "under Force field, or choose 'Generated by MDATK'", ("ldna_library",
+                                                                                              "extra_libs")))
+        elif s["lrna_ranges"].strip():
+            n_l = 1
+        if self.lrna_generated(s, ctx):
+            if s["rna_ff"] not in ("ol3", "ol3cp"):
+                out.append(Issue("error", "MDATK generates L-RNA libraries for OL3 and OL3 + CP; for this force field "
+                                          "list your own library under Force field and choose 'My own files'",
+                                 ("lrna_library", "rna_ff")))
+            else:
+                out.append(Issue("info", "MDATK generates the L-RNA library (LRNA.lib, frcmod.lrna) from "
+                                         f"{FORCE_FIELDS[s['rna_ff']][0]}: mirrored units with Dudek names and types "
+                                         f"{', '.join(self._lrna_twins(s))} with mirrored dihedral phases",
+                                 ("lrna_library",)))
+            if self._cp_frcmod(s) and extra_lines(s["extra_libs"]):
+                out.append(Issue("error", "the generated L-RNA library mirrors AmberTools' RNA.lib, not the own CP "
+                                          "residue library listed under Force field: the L strand would miss the CP "
+                                          "types. Choose 'Retyped library' for CP, or use your own L-RNA files",
+                                 ("lrna_library", "cp_source", "extra_libs")))
+            if not s["lrna_terminals"]:
+                out.append(Issue("error", "the generated library names chain ends LA5 / LA3 ... (as RNA.lib does "
+                                          "A5 / A3): turn '5'/3' terminal names' on", ("lrna_terminals",)))
+            if extra_lines(s["extra_libs"]):
+                out.append(Issue("warning", "own residue libraries are listed as well: a unit they define with an L "
+                                            "name replaces the generated one", ("lrna_library", "extra_libs")))
+        elif n_l and not libs:
+            out.append(Issue("error" if path else "warning",
+                             "L-RNA residues need their library and parameters: choose 'Generated by MDATK' "
+                             "under L-RNA library, or add your own under Force field (e.g. Dudek & Trylska's "
+                             "nucleic12_LRNA.lib with parm10_LRNA.dat)", ("lrna_library", "extra_libs", "extra_frcmod")))
+        elif n_l and path and self._own_libs(s):
+            out += self._check_lrna_names(s, ctx, path)
+        elif not path and ctx.has("structure") and self._own_libs(s) and self._lrna_setup(s, ctx):
+            out += self._check_lrna_names(s, ctx, "")
+        if n_l and "LD" not in s["leap_before_params"] and not s["lrna_fixes"] and not self.lrna_generated(s, ctx):
+            out.append(Issue("info", "L-RNA libraries use the atom types LD / LH; if leap reports unknown types, "
+                                     "add  addAtomTypes { { \"LD\" \"O\" \"sp3\" } { \"LH\" \"O\" \"sp3\" } }  "
+                                     "under 'Leap commands before parameters'", ("leap_before_params",)))
+        bad = [f"{t}:{r}" if r else t for t, r in self._lrna_tokens(s)
+               if not re.fullmatch(r"[A-Za-z0-9*+-]{1,4}", t) or (r and not re.fullmatch(r"[A-Za-z0-9*+-]{1,4}", r))]
+        if bad:
+            out.append(Issue("error", f"L-RNA atom types {', '.join(bad)}: 1-4 letters / digits each (TYPE or "
+                                      "TYPE:REFERENCE)", ("lrna_types",)))
+        elif s["lrna"] and s["lrna_fixes"] and not self._lrna_types(s) and (s["nbfix19"] or s["bph0"]):
+            out.append(Issue("warning", "no L-RNA atom type given: the NBfix19 / 0BPh pairs miss L residues",
+                             ("lrna_types",)))
+        if not path and ctx.has("structure"):
+            out.append(Issue("info", "L-nucleotides are detected from the sugar geometry when the script runs "
+                                     "(the input PDB does not exist yet)", ("lrna",)))
+        return out
+
+    def _check_dna(self, s, ctx) -> List[Issue]:
+        """The DNA force field and the generated L-DNA library."""
+        out: List[Issue] = []
+        content = self.nucleic_content(s, ctx)
+        if content["dna"] and s["dna_ff"] not in DNA_FORCE_FIELDS:
+            out.append(Issue("error", "the structure has DNA but no DNA force field is chosen", ("dna_ff",)))
+            return out
+        if not self.dna_loaded(s, ctx):
+            return out
+        ff = DNA_FORCE_FIELDS[s["dna_ff"]]
+        out.append(Issue("info", f"DNA: {ff[0]} ({ff[1]}" + (", sourced after the RNA force field"
+                                                              if s["rna_ff"] != NO_RNA else "") + ")", ("dna_ff",)))
+        if self._cp_frcmod(s):
+            out.append(Issue("warning", "the own CP frcmod changes the O2 / OS types for every residue: the DNA "
+                                        "phosphates and O4' get the correction too (the retyped CP library changes "
+                                        "RNA only)", ("cp_source",)))
+        if s["nbfix19"]:
+            out.append(Issue("info", "NBfix19 is fitted for RNA and kept off the DNA: ParmEd gives the DNA atoms of "
+                                     "its types (base NB / NC and H, terminal HO" + ("" if self._cp_lib(s) else
+                                     ", phosphate O2, OS") + ") LJ types of their own, and its pairs name the RNA "
+                                     "atoms (RNA-DNA contacts keep the standard terms)", ("nbfix19",)))
+        if s["bph0"] and not self._cp_lib(s):
+            out.append(Issue("warning", "0BPh is fitted for RNA and addresses H5 / H4 with OS, which DNA shares: its "
+                                        "pairs act on the DNA too", ("bph0",)))
+        if self.ldna_generated(s, ctx) and not s["lrna"]:
+            out.append(Issue("warning", "L-nucleotide naming is off: the input must already name the L-DNA "
+                                        "residues LDA ... and end units LDA5, LDA3 ... (as the generated library does)", ("lrna",)))
+        if self.ldna_generated(s, ctx):
+            out.append(Issue("info", f"MDATK generates the L-DNA library (LDNA.lib, frcmod.ldna) from {ff[2]}: "
+                                     "mirrored units LDA LDC LDG LDT (end units LDA5 LDA3 LDAN ..., residue names of three characters) with O5' / O4' / O3' typed "
+                                     f"{' / '.join(LDNA_TWINS.values())} and their dihedral phases mirrored",
+                             ("ldna_library",)))
+            if extra_lines(s["extra_libs"]):
+                out.append(Issue("warning", "own residue libraries are listed as well: a unit they define with an "
+                                            "L-DNA name replaces the generated one", ("ldna_library", "extra_libs")))
+            single = self._single_ldna_chains(s, ctx)
+            if single:
+                units = ", ".join(sorted({unit for _where, unit in single}))
+                out.append(Issue("warning", f"{os.path.basename(ctx.existing('structure'))}: a chain of a single "
+                                            f"L-DNA residue ({', '.join(where for where, _unit in single)}). The "
+                                            "generated library maps an L-DNA residue at a chain's 5' end to its "
+                                            "5' unit and at a 3' end to its 3' unit; a residue that is both ends "
+                                            f"needs the nucleoside unit ({units}), which that map does not name, "
+                                            "and MDATK has not tested which unit tleap gives it: check the residue "
+                                            "in the tleap log and the built PDB (a nucleoside has HO5' and HO3' "
+                                            "and no phosphate)", ("ldna_library", "input:structure")))
+        return out
+
+    @staticmethod
+    def _single_ldna_chains(s, ctx) -> List[Tuple[str, str]]:
+        """(chain:number, nucleoside unit) of every L-DNA residue that is a chain of its own in an existing input
+        PDB as tleap will read it, i.e. alone between two TER records after the preparation the script applies."""
+        path = ctx.existing("structure")
+        if not path:
+            return []
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+            if s["prep"]:
+                lines = _prep_pdb.prepare(lines, True, s["strip_5p"], s["gap_ter"], s["strip_water"], True,
+                                          s["drop_virtual"])[0]
+            struct = pdbtools.read_pdb("\n".join(lines) + "\n")
+            pdbtools.assign_chirality(struct, detect=True, l_ranges=s.get("lrna_ranges") or None)
+        except (OSError, pdbtools.PDBError):
+            return []
+        out = []
+        for seg in struct.segments:
+            nts = [(r, nt) for r, nt in ((r, pdbtools.nucleotide(r)) for r in seg) if nt is not None]
+            if len(nts) == 1 and nts[0][1].sugar == "dna" and nts[0][0].chirality == "L":
+                res, nt = nts[0]
+                out.append((f"{res.chain.strip() or '_'}:{res.resseq}{res.icode.strip()}", f"LD{nt.base}N"))
+        return out
+
+    # checks -----------------------------------------------------------
+    def _check_no_rna(self, s, ctx) -> List[Issue]:
+        """'RNA force field: None': RNA in the structure and RNA-only settings left on are errors (nothing of
+        them is written)."""
+        out: List[Issue] = []
+        if self.nucleic_content(s, ctx)["rna"]:
+            out.append(Issue("error", "the structure has RNA but no RNA force field is chosen", ("rna_ff",)))
+        on = [name for name, value in (("NBfix19", s["nbfix19"]), ("0BPh", s["bph0"])) if value]
+        if on:
+            out.append(Issue("error", f"{' / '.join(on)} {'modifies' if len(on) == 1 else 'modify'} RNA atom types "
+                                      "and cannot be applied without an RNA force field: switch "
+                                      f"{'it' if len(on) == 1 else 'them'} off, or choose an RNA force field",
+                             ("rna_ff",) + tuple(k for k in ("nbfix19", "bph0") if s[k])))
+        if s["lrna"] and s["lrna_library"] == "generated":
+            out.append(Issue("error", "the generated L-RNA library mirrors the RNA force field, and none is "
+                                      "chosen: set 'L-RNA library' to Automatic, or choose an RNA force field",
+                             ("rna_ff", "lrna_library")))
+        out.append(Issue("info", "no RNA force field: no leaprc.RNA file is sourced, and nothing RNA-only is "
+                                 "written (CP library, NBfix19 / 0BPh pairs, L-RNA atom types and library)",
+                         ("rna_ff",)))
+        return out
+
+    def check(self, s, ctx):
+        out: List[Issue] = []
+        if s["rna_ff"] == NO_RNA:
+            out += self._check_no_rna(s, ctx)
+            s = self._effective(s)  # the checks below see what is written
+        if (s["nbfix19"] or s["bph0"]) and s["rna_ff"] != "ol3cp":
+            out.append(Issue("error", "NBfix19 / 0BPh masks assume the OL3 + CP force field; choose "
+                                      "'OL3 + CP' or switch the modifications off",
+                             ("rna_ff", "nbfix19", "bph0")))
+        if self._cp_frcmod(s) and not s["cp_frcmod"].strip():
+            out.append(Issue("error", "OL3 + CP needs the CP frcmod file", ("cp_frcmod",)))
+        if self._cp_lib(s):
+            out.append(Issue("info", "the CP library and parameters are generated from AmberTools' RNA.lib and "
+                                     "parm10.dat when the script runs (AMBERHOME or tleap on PATH)",
+                             ("cp_source",)))
+        if self._cp_frcmod(s) and not extra_lines(s["extra_libs"]):
+            new_types = _frcmod_new_types(s["cp_frcmod"].strip(), ctx)
+            if new_types:
+                out.append(Issue("warning", f"the CP frcmod defines atom types {', '.join(new_types)} that the "
+                                            "standard RNA library (RNA.lib: O2 / OS) does not use, so the CP "
+                                            "correction has no effect; add a CP residue library under 'Extra "
+                                            "residue libraries'", ("cp_frcmod", "extra_libs")))
+        if s["rna_ff"] == "shaw" and s["water"] not in ("tip4pd", "none"):
+            out.append(Issue("warning", "the DESRES RNA force field was parameterised with TIP4P-D "
+                                        "water", ("rna_ff", "water")))
+        solvated = self._solvated(s)
+        if not solvated:
+            out.append(Issue("warning", "no solvent box: the topology is for gas-phase / implicit "
+                                        "solvent use; periodic MD stages will not run", ("water",)))
+        else:
+            if s["mg_model"] == "1264" and not WATERS[s["water"]][4]:
+                out.append(Issue("error", f"AmberTools has no 12-6-4 ion parameters for "
+                                          f"{WATERS[s['water']][0]}", ("mg_model", "water")))
+            if s["mg_model"] == "1264" and s["mg_count"] == 0:
+                out.append(Issue("warning", "12-6-4 is selected but no Mg²⁺ is added; it only matters "
+                                            "when the input already contains MG ions",
+                                 ("mg_model", "mg_count")))
+            if s["mg_model"] in mg_params.MODELS:
+                out += self._check_mg_pairs(s, ctx)
+            if s["buffer"] < 10.0:
+                out.append(Issue("warning", "a buffer below 10 Å can let periodic images of the RNA "
+                                            "interact", ("buffer",)))
+            if not s["neutralize"] and s["mg_count"] and not s["mg_balance"]:
+                out.append(Issue("warning", "the box is not neutralised and Mg²⁺ is not balanced: "
+                                            "PME will use a net-charge background", ("neutralize",)))
+        if s["two_pass"]:
+            out.append(Issue("info", "the L-RNA names are applied before tleap, so a single pass gives the "
+                                     "same topology; the two-pass build is kept for set-ups that need the "
+                                     "dry intermediate files", ("two_pass",)))
+        out += self._check_lrna(s, ctx)
+        out += self._check_dna(s, ctx)
+        if s["link_check"] != "off" and s["link_fail"] < s["link_max"]:
+            out.append(Issue("error", "the O3′–P break length must not be below the longest unstrained link",
+                             ("link_fail", "link_max")))
+        if s["link_check"] != "off" and s["link_min"] >= s["link_max"]:  # the helper refuses it at run time
+            out.append(Issue("error", "the shortest O3′–P link must be below the longest unstrained link",
+                             ("link_min", "link_max")))
+        out += self._check_input_backbone(s, ctx)
+        slot = pdbtools.empty_slot(ctx.existing("structure")) if ctx.existing("structure") else ""
+        if slot:
+            out.append(Issue("warning", f"the structure is an empty slot of a model check ({slot}): the "
+                                        "build script stops before tleap", ("input:structure",)))
+        if not s["prep"] and ctx.value("structure") and ctx.value("structure").source:
+            src = ctx.value("structure").source_label
+            out.append(Issue("info", f"the PDB from {src} is used as is; models from Rosetta usually "
+                                     "need 'Prepare the PDB for tleap'", ("prep",)))
+        if s["hmr"]:
+            out.append(Issue("info", "with hydrogen mass repartitioning the MD stages can use "
+                                     "dt = 0.004 ps", ("hmr",)))
+        out += self._check_water(s)
+        if s["nbfix19"] and not s["split_types"] and self._solvated(s):
+            out.append(Issue("warning", "tleap gives HO the same Lennard-Jones type as water HW (both zero) and "
+                                        "O2 the same as carbonyl O, so the NBfix19 'changeLJPair @%HO ...' lines "
+                                        "also apply to every water hydrogen (and carbonyl O) for the whole run; "
+                                        "tick 'Separate HO and O2 Lennard-Jones types first' unless you reproduce "
+                                        "a protocol that did not separate them", ("split_types",)))
+        return out
+
+    @staticmethod
+    def _check_input_backbone(s, ctx) -> List[Issue]:
+        """An existing input PDB: Rosetta virtual residues, and (with the link check) its O3'-P links as tleap
+        will see them, i.e. after the preparation the script applies."""
+        from .. import modelcheck
+
+        path = ctx.existing("structure")
+        if not path:
+            return []
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            return []
+        out: List[Issue] = []
+        virtual = {(ln[21:22], ln[22:27]) for ln in lines if ln.startswith(("ATOM", "HETATM"))
+                   and ln[17:20].strip().upper() in _prep_pdb.VIRTUAL}
+        dropped = s["prep"] and s["drop_virtual"]
+        name = os.path.basename(path)
+        if virtual and dropped:
+            out.append(Issue("info", f"{name}: {len(virtual)} Rosetta virtual residue(s) (VRT / XXX) are "
+                                     "removed before tleap", ("drop_virtual",)))
+        elif virtual:
+            out.append(Issue("warning", f"{name} has {len(virtual)} Rosetta virtual residue(s) (VRT / XXX): "
+                                        "tleap cannot type their atoms; tick 'Remove Rosetta virtual "
+                                        "residues'", ("drop_virtual", "prep")))
+        if s["link_check"] == "off":
+            return out
+        if s["prep"]:
+            lines = _prep_pdb.prepare(lines, True, s["strip_5p"], s["gap_ter"], s["strip_water"], True,
+                                      s["drop_virtual"])[0]
+        try:
+            links = modelcheck.check_backbone(pdbtools.read_pdb("\n".join(lines) + "\n"), s["link_min"],
+                                              s["link_max"], link_fail=s["link_fail"])
+        except pdbtools.PDBError as exc:
+            return out + [Issue("warning", f"cannot check the O3′–P links: {exc}", ("link_check",))]
+        strained = links.strained
+        if strained:  # (k, r0 here: MDATK's default; the script reads them from the force field it loads)
+            shown = ", ".join(f"{k.first}-{k.second} {k.distance:.2f} Å ({k.strain:.0f} kcal/mol)"
+                              for k in strained[:6])
+            more = f" and {len(strained) - 6} more" if len(strained) > 6 else ""
+            out.append(Issue("warning", f"{name}: {len(strained)} O3′–P link(s) of {s['link_max']:g}–"
+                                        f"{s['link_fail']:g} Å ({shown}{more}): tleap bonds them and the "
+                                        f"first minimisation starts with that strain, E = k(r − r0)² with "
+                                        f"Amber's OS–P term (k {links.bond.k:g} kcal/mol/Å², r0 "
+                                        f"{links.bond.r0:g} Å)", ("link_check", "link_max")))
+        bad = links.problems
+        if bad:
+            shown = ", ".join(f"{k.first}-{k.second} " + (f"{k.distance:.2f} Å" if k.distance is not None
+                                                          else k.status) for k in bad[:6])
+            more = f" and {len(bad) - 6} more" if len(bad) > 6 else ""
+            then = ("the build script stops before tleap" if s["link_check"] == "stop" else
+                    "tleap bonds them anyway")
+            out.append(Issue("warning", f"{name}: {len(bad)} O3′–P link(s) longer than {s['link_fail']:g} Å "
+                                        f"(a break), shorter than {s['link_min']:g} Å or unmeasurable "
+                                        f"({shown}{more}); {then}",
+                             ("link_check", "link_fail")))
+        return out
+
+    def _check_mg_pairs(self, s, ctx=None) -> List[Issue]:
+        out: List[Issue] = []
+        model, water = s["mg_model"], s["water"]
+        name, wlabel = mg_params.MODELS[model], WATERS[water][0]
+        if (model, water) in mg_params.UNAVAILABLE:
+            out.append(Issue("error", f"{name} is not available for {wlabel}: "
+                                      f"{mg_params.UNAVAILABLE[(model, water)]}", ("mg_model", "water")))
+            return out
+        if (model, water) not in mg_params.MG_SETS:
+            have = sorted({WATERS[w][0] for m, w in mg_params.MG_SETS if m == model})
+            out.append(Issue("error", f"no published {name} parameters for {wlabel} (available: "
+                                      f"{', '.join(have)})", ("mg_model", "water")))
+            return out
+        if s["mg_count"] == 0:
+            out.append(Issue("warning", f"{name} is selected but no Mg²⁺ is added; it only matters when "
+                                        "the input already contains MG ions", ("mg_model", "mg_count")))
+        if s["rna_ff"] not in ("ol3", "ol3cp", NO_RNA):
+            out.append(Issue("warning", f"the {name} Mg²⁺-RNA pair terms were fitted with parmBSC0χOL3 "
+                                        "atom types; RNA atom types of this force field outside that set "
+                                        "get no pair term - map them under 'Extra Mg²⁺ pair types'"
+                                        + (", otherwise the topology check stops the build" if s["check_topology"]
+                                           else ""), ("mg_model", "rna_ff", "mg_types")))
+        mg_extra = [ln for ln in extra_lines(s["parmed_extra"])
+                    if re.search(r":MG\b|Mg2\+", ln, re.IGNORECASE)]
+        if mg_extra:
+            mapped = set(self._mg_type_map(s)[0]) | set(mg_params.reference_types(model, water)) \
+                if (model, water) in mg_params.MG_SETS else set()
+            dup = sorted({m.group(1).replace("\\", "") for ln in mg_extra
+                          for m in [re.search(r":MG\s+@%(\S+)", ln)] if m and m.group(1).replace("\\", "") in mapped})
+            out.append(Issue("warning", f"the {name} pair terms are applied after the extra ParmEd commands "
+                                        "and replace any Mg²⁺ pair terms set there"
+                                        + (f"; MDATK now writes the Mg²⁺ pairs of {', '.join(dup)} itself, so "
+                                           "those extra lines can be removed" if dup else ""),
+                             ("parmed_extra",)))
+        p = mg_params.get_set(model, water)
+        has_cl = bool(s["mg_balance"] and s["mg_count"] or s["salt_pairs"])
+        if s["mg_cl_pair"] and has_cl:
+            out.append(Issue("info", f"{name} for {wlabel} was optimised with the {p.chloride} Cl⁻ model; "
+                                     "the Mg²⁺-Cl⁻ pair term is applied, other Cl⁻ interactions use Amber's "
+                                     "Cl⁻", ("mg_cl_pair",)))
+        if not s["mg_cl_pair"] and has_cl:
+            out.append(Issue("warning", f"without the pair term, Mg²⁺-Cl⁻ uses the combination rule with the "
+                                        f"optimised {name} parameters - not a published combination (the "
+                                        f"authors' pair: σ {p.mg_cl[0]:.3f} nm, ε {p.mg_cl[1]:.2f} kJ/mol) and "
+                                        "far too strong Mg²⁺-Cl⁻ contacts", ("mg_cl_pair",)))
+        refs = set(mg_params.reference_types(model, water))
+        mapping, missing = self._mg_type_map(s)
+        bad = [f"{t}:{r}" for t, r in mapping.items() if r not in refs or not re.fullmatch(r"[A-Za-z0-9*+-]{1,4}", t)]
+        if bad:
+            out.append(Issue("error", f"Mg²⁺ pair types {', '.join(bad)}: write TYPE:REFERENCE with a reference "
+                                      f"among {', '.join(sorted(refs))}", ("mg_types", "lrna_types")))
+        if missing:
+            out.append(Issue("error", f"L-RNA atom type{'s' if len(missing) > 1 else ''} {', '.join(missing)} "
+                                      f"{'have' if len(missing) > 1 else 'has'} no Mg²⁺ pair reference: without one "
+                                      f"{name} binds those atoms several times too strongly; write e.g. "
+                                      f"{missing[0]}:OS under L-RNA atom types", ("lrna_types",)))
+        if mapping and not bad:
+            out.append(Issue("info", f"Mg²⁺ pair terms for non-standard atom types: "
+                                     f"{', '.join(f'{t} as {r}' for t, r in mapping.items())}",
+                             ("mg_types", "lrna_types")))
+        if self._cp_lib(s):
+            out.append(Issue("info", "phosphate oxygens retyped by the CP library (OP, OR) get the authors' O2 / "
+                                     "OS terms - a choice by MDATK, since the authors fitted Mg²⁺ against plain "
+                                     "OL3 phosphate oxygens", ("mg_model", "cp_source")))
+        unknown = [t for t in _lib_types(extra_lines(s["extra_libs"]), ctx)
+                   if t not in refs and t not in mapping and t not in missing and not t.startswith("H")]
+        if unknown and not bad:
+            out.append(Issue("warning", f"atom type{'s' if len(unknown) > 1 else ''} {', '.join(unknown)} of the "
+                                        f"extra residue libraries {'have' if len(unknown) > 1 else 'has'} no Mg²⁺ "
+                                        f"pair reference; map {'them' if len(unknown) > 1 else 'it'} under 'Extra "
+                                        f"Mg²⁺ pair types' or L-RNA atom types (TYPE:REFERENCE, e.g. {unknown[0]}:OS)"
+                                        + ("; otherwise the topology check stops the build if the type has "
+                                           "Lennard-Jones terms" if s["check_topology"] else ""),
+                             ("mg_types", "lrna_types")))
+        if extra_lines(s["extra_libs"]) or extra_lines(s["extra_frcmod"]):
+            out.append(Issue("warning" if not s["check_topology"] else "info",
+                             "atom types from extra libraries or parameter files need Mg²⁺ pair terms "
+                             "('Extra Mg²⁺ pair types', L-RNA atom types); "
+                             + ("the topology check after the build lists any type still missing"
+                                if s["check_topology"] else
+                                "with the topology check off, a missing one goes unnoticed"),
+                             ("mg_types", "check_topology")))
+        out.append(Issue("info", f"{name} ({mg_params.CITATIONS[water]}): Mg²⁺-water uses the "
+                                 "Lorentz-Berthelot rule, Mg²⁺-RNA the authors' pair terms; GROMACS "
+                                 "conversion keeps them as [ nonbond_params ]", ("mg_model",)))
+        return out
+
+    def output_values(self, s, ctx):
+        s = self._effective(s)
+        nres = None
+        path = ctx.existing("structure")
+        if path:
+            nres = count_solute_residues(path, bool(s["prep"] and s["drop_virtual"]))
+        data = {"nbfix": bool(s["nbfix19"] or s["bph0"]), "hmr": bool(s["hmr"]),
+                "c4": bool(self._solvated(s) and s["mg_model"] == "1264"),
+                "mg_pairs": mg_params.MODELS[s["mg_model"]] if self._mg_pairs(s) else "",
+                "box": self._solvated(s), "solute_residues": nres,
+                "forcefield": s["rna_ff"], "water": s["water"],
+                "four_site_water": s["water"] in FOUR_SITE_WATERS,
+                "box_shape": s["box"] if self._solvated(s) else ""}
+        out = {"topology": PortValue([ctx.from_own(self._final_topology(s, ctx))], "parm7", dict(data)),
+               "coordinates": PortValue([ctx.own("tleap", "rst7")], "rst7", dict(data, velocities=False))}
+        if s["save_pdb"]:
+            out["pdb"] = PortValue([ctx.own("tleap", "pdb")], "pdb", dict(data))
+        if s["two_pass"]:
+            dry_top = "parmed-dry" if self._lj_mods(s) else "tleap-dry"
+            out["dry_topology"] = PortValue([ctx.own(dry_top, "parm7")], "parm7",
+                                            dict(data, box=False, c4=False, hmr=False, mg_pairs=""))
+            out["dry_pdb"] = PortValue([ctx.own("lrna-dry" if s["lrna"] else "ambpdb", "pdb")], "pdb",
+                                       dict(data, box=False))
+        return out
+
+    # files ------------------------------------------------------------
+    def _leap(self, s, ctx, title, pdb_in, stem, wet, save_pdb) -> str:
+        lines = [f"# {title}", f"# written by {PROJECT_ABBREV} {__version__}"]
+        if s["rna_ff"] != NO_RNA:
+            lines.append(f"source {FORCE_FIELDS[s['rna_ff']][1]}")
+        if self.dna_loaded(s, ctx):
+            lines.append(f"source {DNA_FORCE_FIELDS[s['dna_ff']][1]}")
+        solvated = wet and self._solvated(s)
+        if solvated:
+            lines.append(f"source {WATERS[s['water']][1]}")
+            if s["water"] == "tip4p2005":
+                lines += ["loadamberparams frcmod.tip4p2005", "loadOff tip4p2005box.off",
+                          "WAT = TIP4P2005", "HOH = TIP4P2005"]
+        lines += extra_lines(s["leap_before_params"])
+        types = self._lrna_types(s)
+        if self.lrna_generated(s, ctx):
+            types += [t for t in self._lrna_twins(s) if t not in types]
+        if self.ldna_generated(s, ctx):
+            types += [t for t in LDNA_TWINS.values() if t not in types]
+        if types and not any("addAtomTypes" in ln and types[0] in ln for ln in extra_lines(s["leap_before_params"])):
+            lines.append("addAtomTypes { " + " ".join(f'{{ "{t}" "O" "sp3" }}' for t in types) + " }")
+        if self._cp_frcmod(s):
+            lines.append(f"loadamberparams {s['cp_frcmod'].strip()}")
+        if self._cp_lib(s):
+            lines += ['addAtomTypes { { "OR" "O" "sp3" } }', "loadamberparams frcmod.cp", "loadOff RNA_CP.lib"]
+        lines += [f"loadamberparams {f.strip()}" for f in extra_lines(s["extra_frcmod"])]
+        if solvated and s["mg_model"] == "1264" and WATERS[s["water"]][4]:
+            lines.append(f"loadamberparams {WATERS[s['water']][4]}")
+        if solvated and self._mg_pairs(s):
+            lines.append(f"loadamberparams {self._mg_frcmod(ctx)}")
+        if self.lrna_generated(s, ctx):
+            lines += ["loadamberparams frcmod.lrna", "loadOff LRNA.lib"]
+        if self.ldna_generated(s, ctx):
+            # tleap reads three characters of a PDB residue name: LDG3 / LDC5 arrive as LDG / LDC, the internal
+            # units, which tleap then leaves unbonded at the chain end; map them to the terminal units, as
+            # leaprc.DNA maps DG to DG5 / DG3
+            lines += ["loadamberparams frcmod.ldna", "loadOff LDNA.lib", LDNA_TERMINAL_MAP]
+        lines += [f"loadOff {f.strip()}" for f in extra_lines(s["extra_libs"])]
+        lines += extra_lines(s["leap_before_load"])
+        lines.append(f'mol = loadpdb "{pdb_in}"')
+        lines += extra_lines(s["leap_after_load"])
+        if solvated:
+            box = WATERS[s["water"]][2]
+            buf = fortran_float(s["buffer"])
+            if s["box"] == "oct":
+                lines.append(f"solvateoct mol {box} {buf}")
+            elif s["box"] == "rect":
+                lines.append(f"solvatebox mol {box} {buf}")
+            else:
+                lines.append(f"solvatebox mol {box} {buf} iso")
+            lines.append("")
+            ions = []
+            if s["neutralize"]:
+                ions.append(f"addIonsRand mol {s['cation']} 0")
+            if s["mg_count"]:
+                ions.append(f"addIonsRand mol MG {s['mg_count']}")
+            n_cl = (2 * s["mg_count"] if s["mg_balance"] else 0) + s["salt_pairs"]
+            if s["salt_pairs"]:
+                ions.append(f"addIonsRand mol {s['cation']} {s['salt_pairs']}")
+            if n_cl:
+                ions.append(f"addIonsRand mol Cl- {n_cl}")
+            lines += ions
+            lines.append("")
+        lines.append("check mol")
+        lines.append(f"saveamberparm mol {stem}.parm7 {stem}.rst7")
+        if save_pdb:
+            lines.append(f"savepdb mol {stem}.pdb")
+        lines.append("quit")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _mg_frcmod(ctx) -> str:
+        return ctx.name("mg", "frcmod")
+
+    def _parmed(self, s, title, out_parm, wet, ctx=None) -> str:
+        lines = ["#", f"# {title}", f"# ParmEd input written by {PROJECT_ABBREV} {__version__}"]
+        cp = self._cp_lib(s)
+        if s["nbfix19"] and s["split_types"]:
+            lines += ["#", "# Give HO and O2 their own Lennard-Jones types so the pair changes below do not also",
+                      "# apply to atom types tleap merged with them (water HW, carbonyl O)",
+                      "addLJType @%HO"] + ([] if cp else ["addLJType @%O2"])
+        nb = (_cp_masks(NBFIX19_LINES) if cp else NBFIX19_LINES) if s["nbfix19"] else []
+        bph = (_cp_masks(BPH0_LINES) if cp else BPH0_LINES) if s["bph0"] else []
+        lrna = (lrna_pair_lines(s["nbfix19"], s["bph0"], self._lrna_types(s)[0]) if self._lrna_types(s)
+                else LRNA_NOTE) if (s["nbfix19"] or s["bph0"]) else []
+        if s["nbfix19"] and ctx is not None and self.dna_loaded(s, ctx):
+            lines += nbfix_without_dna(nb, bph, lrna, cp)
+        else:
+            lines += nb + bph + lrna
+        if wet and self._solvated(s) and s["mg_model"] == "1264":
+            lines += ["#", "# 12-6-4 Lennard-Jones terms for Mg2+ (Li & Merz)",
+                      f"add12_6_4 :MG watermodel {WATERS[s['water']][3]}"
+                      + (f" polfile {POL_1264}" if ctx is not None and self.twin_refs(s, ctx) else
+                         " polfile lj_1264_pol_cp.dat" if self._cp_lib(s) else "")]
+        if wet and s["hmr"]:
+            lines += ["#", "# Hydrogen mass repartitioning (4 fs time steps with SHAKE)",
+                      "HMassRepartition"]
+        extra = extra_lines(s["parmed_extra"])
+        if not wet:  # the dry topology has no ions: Mg2+ lines would select nothing
+            extra = [ln for ln in extra if not re.search(r":MG\b", ln, re.IGNORECASE)]
+        if extra:
+            lines += ["#", "# Extra commands"] + extra
+        if wet and self._mg_pairs(s):
+            extra = dict(self._mg_type_map(s)[0])
+            if ctx is not None and self.ldna_generated(s, ctx):
+                extra.update({twin: d for d, twin in LDNA_TWINS.items()})
+            lines += mg_params.parmed_lines(s["mg_model"], s["water"], WATERS[s["water"]][0],
+                                            self._mg_frcmod(ctx), s["mg_cl_pair"], extra)
+        lines += ["#", f"outparm {out_parm}"]
+        return "\n".join(lines) + "\n"
+
+    def _lrna_names_check(self, s, ctx, files: List[GeneratedFile], named: str) -> List[str]:
+        """The helper that checks the L residue names of ``named`` against the libraries the first tleap
+        input loads and its addPdbResMap lines, and the script lines that run it."""
+        names_py = ctx.name("lrna-names", "py")
+        leap_in = ctx.name("tleap-dry" if s["two_pass"] else "tleap", "leap")
+        files.append(GeneratedFile(names_py, embed(
+            _lrna_names, {}, "main(sys.argv[1:])",
+            f"L residue names against the residue libraries tleap loads - written by {PROJECT_ABBREV} "
+            f"{__version__}.\n\nUsage: python3 THIS_SCRIPT NAMED.pdb TLEAP_INPUT.leap"), "helper",
+            "checks that the L residue names are units of the own libraries or mapped onto them"))
+        return ["# The L residue names must be units of the libraries loaded before loadpdb or mapped onto",
+                "# them (addPdbResMap): tleap would read LA / LU as lanthanum / lutetium (atomic_ions.lib)",
+                "# and solvate around the atoms it invents near the origin",
+                f"python3 {names_py} {named} {leap_in} || {{ echo \"ERROR: the L residue names do not match "
+                "the residue libraries (see above); tleap was not run\" >&2; exit 1; }", ""]
+
+    @staticmethod
+    def _link_check(s, ctx, files: List[GeneratedFile], pdb: str) -> List[str]:
+        """The helper (MDATK's PDB tools and model checks) that measures the O3'-P links of the PDB tleap
+        reads, and the script lines that run it (warn: report; stop: end before tleap when a link is a
+        break).  k and r0 of the strain come from the force field the first tleap input loads (its leaprc and
+        parameter files under $AMBERHOME, its frcmods), O3' typed OR in the CP force field, else OS."""
+        from .modelcheck import helper_source  # (a step module of its own: imported when needed)
+
+        links_py = ctx.name("links", "py")
+        files.append(GeneratedFile(links_py, helper_source(
+            f"O3'-P links of the PDB tleap reads - written by {PROJECT_ABBREV} {__version__} (mdatk.pdbtools "
+            "and mdatk.modelcheck).\n\nUsage: python3 THIS_SCRIPT MODEL.pdb --checks links --link-min 1.4 "
+            "--link-max 2.0 --link-fail 3.0 [--link-params TLEAP.leap --amberhome DIR] [--on-fail stop]"),
+            "helper", "checks the O3'-P links before tleap"))
+        leap_in = ctx.name("tleap-dry" if s["two_pass"] else "tleap", "leap")
+        types = "OR,OS" if s["rna_ff"] == "ol3cp" else "OS"
+        limits = f"--link-min {s['link_min']:g} --link-max {s['link_max']:g} --link-fail {s['link_fail']:g}"
+        lines = ["# O3'-P links of consecutive nucleotides in every TER segment of the PDB tleap reads,",
+                 "# before anything else is done with it: tleap bonds them by name whatever the distance, so",
+                 "# a chain break left in the model becomes a strained bond (E = k (r - r0)^2, k and r0 of",
+                 "# the P-O3' bond read from the force field the tleap input loads)"]
+        run = (f"python3 {links_py} {shell_quote(pdb)} --checks links {limits} --link-params {leap_in} "
+               f'--link-types {types} --amberhome "$AMBERHOME"')
+        if s["link_check"] == "stop":
+            lines.append(f"{run} --on-fail stop || {{ echo \"ERROR: O3'-P links longer than "
+                         f"{s['link_fail']:g} A (a break), shorter than {s['link_min']:g} A or unmeasurable "
+                         "(see above); tleap was not run\" >&2; exit 1; }")
+        else:
+            lines.append(f"{run} --on-fail report || echo \"WARNING: the O3'-P link check could not read the "
+                         "PDB\" >&2")
+        return lines + [""]
+
+    @staticmethod
+    def _empty_slot_guard(pdb: str) -> List[str]:
+        """Script lines that stop the build when its structure is an empty slot of a model check (one that
+        passed on fewer models than it has slots), before any helper or tleap runs."""
+        q = shell_quote(pdb)
+        name = re.sub(r"[\"$`\\]", "_", os.path.basename(pdb))
+        return ["# The structure comes from a model check's slots: a slot no model fills is a file with an",
+                "# 'empty slot' REMARK 951 and no atoms: there is nothing to build from it",
+                f"if grep -q '^REMARK 951 .*empty slot' {q}; then",
+                f"    echo \"ERROR: {name} is an empty slot of the model check ($(grep -m1 '^REMARK 951' {q} "
+                "| cut -c12-)): no model to build; tleap was not run\" >&2",
+                "    exit 1",
+                "fi", ""]
+
+    def generate(self, s, ctx):
+        s = self._effective(s)
+        files: List[GeneratedFile] = []
+        n = ctx.name
+        script_name = n(self.tag, "sh")
+        ff = self._ff_names(s, ctx)
+        sh = script_header(f"Amber system build ({ff}) - tleap / ParmEd", ctx, s, script_name)
+        pdb_in = ctx.inp("structure")
+        existing = ctx.existing("structure")
+        if ctx.data("structure").get("empty_slots") or (existing and pdbtools.is_empty_slot(existing)):
+            sh += self._empty_slot_guard(pdb_in)  # a model check's slot, which may hold no model at all
+        gen = self.lrna_generated(s, ctx)
+        links = s["link_check"] != "off"
+        # (the L-DNA helper and the 12-6-4 table of the twin types read AmberTools' files as well)
+        pol_twins = bool(self._solvated(s) and s["mg_model"] == "1264" and self.twin_refs(s, ctx))
+        if (self._cp_lib(s) or gen or (self._solvated(s) and s["water"] == "tip4p2005") or links
+                or self.ldna_generated(s, ctx) or pol_twins):
+            sh += ["# AmberTools data folder (from tleap on PATH when AMBERHOME is not set)",
+                   'AMBERHOME="${AMBERHOME:-$(dirname "$(dirname "$(readlink -f "$(command -v tleap)")")")}"',
+                   '[ -f "$AMBERHOME/dat/leap/lib/RNA.lib" ] || { echo "ERROR: AmberTools data not found under '
+                   '$AMBERHOME; set AMBERHOME" >&2; exit 1; }', ""]
+        helpers_at = len(sh)  # the force-field helpers (CP, L-RNA, TIP4P/2005) start here
+        if self._cp_lib(s):
+            cp_py = n("cp-lib", "py")
+            files.append(GeneratedFile(cp_py, embed(
+                _cp_retype, {}, "main(sys.argv[1:])",
+                f"OL3 + CP library and parameters - written by {PROJECT_ABBREV} {__version__}.\n\n"
+                "Usage: python3 THIS_SCRIPT AMBERHOME OUTPUT_DIR"), "helper",
+                "writes RNA_CP.lib and frcmod.cp from AmberTools' RNA.lib / parm10.dat"))
+            sh += ["# CP phosphate oxygen types (Steinbrecher et al. 2012): RNA_CP.lib + frcmod.cp",
+                   f'python3 {cp_py} "$AMBERHOME" .', require_file("RNA_CP.lib", "the CP helper"), ""]
+        if gen:
+            lib_py = n("lrna-lib", "py")
+            files.append(GeneratedFile(lib_py, embed(
+                _lrna_lib, {}, "main(sys.argv[1:])",
+                f"L-RNA library and parameters from the D-RNA force field - written by {PROJECT_ABBREV} "
+                f"{__version__}.\n\nUsage: python3 THIS_SCRIPT D_LIBRARY PARM.dat [FRCMOD ...] OUTPUT_DIR"),
+                "helper", "writes LRNA.lib and frcmod.lrna: the D units mirrored, phases of the new types mirrored"))
+            d_lib = "RNA_CP.lib" if self._cp_lib(s) else '"$AMBERHOME/dat/leap/lib/RNA.lib"'
+            parms = ['"$AMBERHOME/dat/leap/parm/parm10.dat"'] + (["frcmod.cp"] if self._cp_lib(s) else [])
+            extra = ([s["cp_frcmod"].strip()] if self._cp_frcmod(s) else []) + extra_lines(s["extra_frcmod"])
+            sh += ["# L-RNA library and parameters: the D force field mirrored (LRNA.lib + frcmod.lrna)"]
+            for k, f in enumerate(extra):  # a name in leap's search path or a file here
+                sh.append(f'P{k}={shell_quote(f.strip())}; [ -f "$P{k}" ] || P{k}="$AMBERHOME/dat/leap/parm/$P{k}"')
+                parms.append(f'"$P{k}"')
+            sh += [f"python3 {lib_py} {d_lib} {' '.join(parms)} .", require_file("LRNA.lib", "the L-RNA helper"), ""]
+        if self.ldna_generated(s, ctx):
+            dff = DNA_FORCE_FIELDS[s["dna_ff"]]  # (not 'ff': the titles of the files below name the force fields)
+            lib_py = n("ldna-lib", "py")
+            files.append(GeneratedFile(lib_py, embed(
+                _lrna_lib, LDNA_SETTINGS, "main(sys.argv[1:])",
+                f"L-DNA library and parameters from the D-DNA force field {dff[2]} - written by {PROJECT_ABBREV} "
+                f"{__version__}.\n\nUsage: python3 THIS_SCRIPT D_LIBRARY PARM.dat [FRCMOD ...] OUTPUT_DIR"),
+                "helper", "writes LDNA.lib and frcmod.ldna: the D-DNA units mirrored, phases of the new types mirrored"))
+            parms = [f'"$AMBERHOME/dat/leap/parm/{f}"' for f in dff[4]]
+            sh += [f"# L-DNA library and parameters: {dff[2]} mirrored (LDNA.lib + frcmod.ldna; O5' / O4' / O3' "
+                   "typed LS / LT with mirrored dihedral phases)",
+                   f'python3 {lib_py} "$AMBERHOME/dat/leap/lib/{dff[3]}" {" ".join(parms)} .',
+                   require_file("LDNA.lib", "the L-DNA helper"), ""]
+        twins = self.twin_refs(s, ctx)
+        if self._solvated(s) and s["mg_model"] == "1264" and twins:
+            base = "lj_1264_pol_cp.dat" if self._cp_lib(s) else '"$AMBERHOME/dat/leap/parm/lj_1264_pol.dat"'
+            pairs = " ".join(f"{t}={ref}" for t, ref in sorted(twins.items()))
+            sh += [f"# 12-6-4 polarizabilities with the twin atom types ({pairs}): ParmEd add12_6_4 stops on a type",
+                   "# that its table lacks; each twin takes the value of its D type",
+                   f"cp {base} {POL_1264}",
+                   f"for pair in {pairs}; do",
+                   '  awk -v t="${pair%%=*}" -v r="${pair#*=}" \'$1 == r && !done { printf "%-6s%s    copied from %s by '
+                   f'{PROJECT_ABBREV}\\n", t, $2, r; done = 1 }}\' {base} >> {POL_1264}',
+                   "done", require_file(POL_1264, "the 12-6-4 polarizability table"), ""]
+        if self._solvated(s) and s["water"] == "tip4p2005":
+            w_py = n("tip4p2005", "py")
+            files.append(GeneratedFile(w_py, embed(
+                _tip4p2005, {}, "main(sys.argv[1:])",
+                f"TIP4P/2005 water files for tleap - written by {PROJECT_ABBREV} {__version__}.\n\n"
+                "Usage: python3 THIS_SCRIPT AMBERHOME OUTPUT_DIR"), "helper",
+                "writes frcmod.tip4p2005 and tip4p2005box.off from AmberTools' TIP4P-Ew files"))
+            sh += ["# TIP4P/2005 water (Abascal & Vega 2005), derived from AmberTools' TIP4P-Ew box",
+                   f'python3 {w_py} "$AMBERHOME" .', require_file("tip4p2005box.off", "the TIP4P/2005 helper"), ""]
+        helpers = sh[helpers_at:]
+        del sh[helpers_at:]
+        if s["prep"]:
+            prep_py, prep_pdb = n("prep", "py"), n("prep", "pdb")
+            files.append(GeneratedFile(prep_py, embed(
+                _prep_pdb, {}, "main(sys.argv[1:], strip_h=True, strip_5p=%r, gap_ter=%r, "
+                "strip_water=%r, drop_virtual=%r)" % (s["strip_5p"], s["gap_ter"], s["strip_water"],
+                                                      s["drop_virtual"]),
+                f"Prepare an RNA PDB for tleap - written by {PROJECT_ABBREV} {__version__}.\n\n"
+                "Usage: python3 THIS_SCRIPT INPUT.pdb OUTPUT.pdb"), "helper",
+                "cleans the starting PDB for tleap"))
+            sh += ["# Prepare the starting structure for tleap (hydrogens, 5'-phosphates, TER records)",
+                   f"python3 {prep_py} {shell_quote(pdb_in)} {prep_pdb}", ""]
+            pdb_in = prep_pdb
+        if s["lrna"]:
+            tools_py = n("pdbtools", "py")
+            files.append(GeneratedFile(tools_py, embed(
+                pdbtools, {}, "main()",
+                f"PDB hygiene for D- and L-RNA structures - copied by {PROJECT_ABBREV} {__version__}.\n\n"
+                "Usage: python3 THIS_SCRIPT clean IN.pdb -o OUT.pdb --scheme amber [--l-ranges C:45-73]\n"
+                "       python3 THIS_SCRIPT check IN.pdb"), "helper",
+                "L-RNA detection and Amber residue names (mdatk pdb)"))
+            named = n("lrna", "pdb")
+            dna = self.dna_loaded(s, ctx)
+            sh += ["# L-RNA residue names from the sugar chirality (C1'/C3'/C4'): LA/LC/LG/LU, LA5/LA3 ..."
+                   + (" (DNA too: DA5 / DA3 ..., L-DNA LDA ... at every position)" if dna else ""),
+                   f"python3 {tools_py} {self._lrna_args(s, pdb_in, named, dna)}", require_file(named, "pdbtools"), ""]
+            pdb_in = named
+            # before the first tleap, so a mismatch costs seconds
+            if not gen and self._own_libs(s) and self._lrna_setup(s, ctx):
+                sh += self._lrna_names_check(s, ctx, files, named)
+        if links:
+            # the PDB tleap reads is checked first, before the helpers and every tleap run (the dry one of a
+            # two-pass build included): what stops a build must stop it before tleap
+            sh += self._link_check(s, ctx, files, pdb_in) + helpers
+        else:
+            sh[helpers_at:helpers_at] = helpers  # the order of builds without the check, unchanged
+        lj = self._lj_mods(s)
+        mods = " + ".join(m for m, on in (("NBfix19", s["nbfix19"]), ("0BPh", s["bph0"]),
+                                          ("extra commands", bool(extra_lines(s["parmed_extra"]))))
+                          if on)
+        if s["two_pass"]:
+            dry = n("tleap-dry")
+            files.append(GeneratedFile(n("tleap-dry", "leap"), self._leap(
+                s, ctx, f"Dry build ({ff}) for project {ctx.project}, step {ctx.step:02d}", pdb_in, dry,
+                wet=False, save_pdb=False), "input", "dry tleap input"))
+            sh += [f"# First parameterisation (dry), {ff}",
+                   f"rm -f {dry}.parm7 {dry}.rst7",
+                   f"tleap -f {dry}.leap | tee {dry}.log",
+                   require_file(f"{dry}.parm7", "tleap (dry)"), ""]
+            dry_top = f"{dry}.parm7"
+            if lj:
+                pm = n("parmed-dry")
+                files.append(GeneratedFile(n("parmed-dry", "in"), self._parmed(
+                    s, f"{mods} on the dry topology", f"{pm}.parm7", wet=False, ctx=ctx), "input"))
+                sh += [f"# Edit parameters: {mods}",
+                       f"parmed -O {dry}.parm7 -i {pm}.in 2>&1 | tee {pm}.log",
+                       require_file(f"{pm}.parm7", "ParmEd"), ""]
+                dry_top = f"{pm}.parm7"
+            amb = n("ambpdb", "pdb")
+            sh += ["# PDB of the dry system (ambpdb writes standard D-RNA residue names)",
+                   f"ambpdb -p {dry_top} -c {dry}.rst7 > {amb}", require_file(amb, "ambpdb"), ""]
+            pdb_in = amb
+            if s["lrna"]:
+                out_pdb = n("lrna-dry", "pdb")
+                sh += ["# Amber names of the dry topology (ambpdb renumbers residues and drops chain ids)",
+                       f"python3 {n('pdbtools', 'py')} "
+                       f"{self._lrna_args_dry(s, amb, out_pdb, self.dna_loaded(s, ctx))}",
+                       require_file(out_pdb, "pdbtools"), ""]
+                pdb_in = out_pdb
+        if self._mg_pairs(s):
+            name = mg_params.MODELS[s["mg_model"]]
+            files.append(GeneratedFile(self._mg_frcmod(ctx), mg_params.frcmod_text(
+                s["mg_model"], s["water"], WATERS[s["water"]][0], chloride=s["water"] == "tip4p2005"), "input",
+                f"{name} Mg2+ Lennard-Jones parameters (replace Li & Merz 12-6)"))
+        wet = n("tleap")
+        what = "Solvate and add ions" if self._solvated(s) else "Build the topology"
+        files.append(GeneratedFile(n("tleap", "leap"), self._leap(
+            s, ctx, f"{what} ({ff}) for project {ctx.project}, step {ctx.step:02d}", pdb_in, wet,
+            wet=True, save_pdb=s["save_pdb"]), "input", "tleap input"))
+        sh += [f"# {what}", f"rm -f {wet}.parm7 {wet}.rst7",
+               f"tleap -f {wet}.leap | tee {wet}.log", require_file(f"{wet}.parm7", "tleap"), ""]
+        final = f"{wet}.parm7"
+        if self._wet_parmed(s):
+            pm = n("parmed")
+            mg = ("12-6-4" if self._solvated(s) and s["mg_model"] == "1264" else
+                  mg_params.MODELS[s["mg_model"]] + " pairs" if self._mg_pairs(s) else "")
+            wet_mods = [m for m in (mods, mg, "HMR" if s["hmr"] else "") if m]
+            files.append(GeneratedFile(n("parmed", "in"), self._parmed(
+                s, f"{' + '.join(wet_mods)} on the solvated topology", f"{pm}.parm7", wet=True, ctx=ctx),
+                "input"))
+            sh += [f"# {'Re-apply' if s['two_pass'] and lj else 'Apply'} {' + '.join(wet_mods)}",
+                   f"parmed -O {wet}.parm7 -i {pm}.in 2>&1 | tee {pm}.log",
+                   require_file(f"{pm}.parm7", "ParmEd"), ""]
+            final = f"{pm}.parm7"
+        if s["check_topology"] and (self._solvated(s) or s["lrna"]):  # dry L-RNA builds: the residue check
+            chk = n("check", "py")
+            pairs = self._mg_pairs(s)
+            p = mg_params.get_set(s["mg_model"], s["water"]) if pairs else None
+            neutral = bool(self._solvated(s) and s["neutralize"] and (s["mg_balance"] or not s["mg_count"]))
+            files.append(GeneratedFile(chk, embed(
+                _topcheck, {"MG_RESIDUE": "MG", "NEUTRAL": neutral, "MG_COUNT": s["mg_count"],
+                            "ION_LJ": (round(p.rmin_half, 6), round(p.eps_kcal, 6)) if p else None,
+                            "PAIRS": pairs, "MODEL": mg_params.MODELS.get(s["mg_model"], ""),
+                            "PAIR_REFS": self._pair_refs(s) if pairs else {},
+                            **({"L_TYPES": self._lrna_twins(s)} if gen else {})},
+                "main(sys.argv[1:])",
+                f"Checks of the built topology - written by {PROJECT_ABBREV} {__version__}.\n\n"
+                "Usage: python3 THIS_SCRIPT TOPOLOGY.parm7"), "helper",
+                "net charge, Mg2+ charge" + (", Mg2+ Lennard-Jones and pair terms" if pairs else "")))
+            sh += ["# Check the final topology (net charge, Mg2+ charge"
+                   + (", Mg2+ Lennard-Jones and pair coverage" if pairs else "") + ")",
+                   f'python3 {chk} {final}{" " + shell_quote(pdb_in) if gen else ""} | tee {n("check", "log")} || '
+                   f'{{ echo "ERROR: the topology check failed '
+                   f'(see {n("check", "log")}); the topology is not safe to simulate" >&2; exit 1; }}', ""]
+        sh += [f'echo "Topology: {final}  Coordinates: {wet}.rst7"', ""]
+        files.append(GeneratedFile(script_name, "\n".join(sh), "run", "runs tleap / ParmEd"))
+        return files
+
+
+def _cp_masks(lines: List[str]) -> List[str]:
+    """NBfix19 / 0BPh lines for a topology with the CP types: phosphate O2 -> OP, bridging OS -> OR."""
+    return [ln.replace("@%O2", "@%OP").replace("@%OS", "@%OR") if ln.startswith("changeLJPair") else ln
+            for ln in lines]
+
+
+RNA_LIB_TYPES = {"C", "C4", "C5", "CA", "CB", "CI", "CP", "CQ", "CS", "CT", "H", "H1", "H2", "H4", "H5",
+                 "HA", "HO", "N*", "N2", "NA", "NB", "NC", "O", "O2", "OH", "OS", "P"}
+
+
+def _lib_paths(paths: List[str], ctx) -> Tuple[List[str], List[str]]:
+    """(readable files, entries that could not be read) of library lines."""
+    found, unread = [], []
+    for path in paths:
+        path = path.strip()
+        here = os.path.join(ctx.root, ctx.folder, path) if getattr(ctx, "root", "") else ""  # script's folder
+        for cand in (path, os.path.join(ctx.folder, path) if getattr(ctx, "folder", "") else "", here):
+            if cand and os.path.isfile(cand):
+                found.append(cand)
+                break
+        else:
+            unread.append(path)
+    return found, unread
+
+
+def _lib_units(paths: List[str], ctx) -> Tuple[set, List[str]]:
+    """Unit names defined by OFF libraries (the readable ones), and the entries that could not be read."""
+    found, unread = _lib_paths(paths, ctx)
+    units = set()
+    for cand in found:
+        try:
+            with open(cand, encoding="utf-8", errors="replace") as fh:
+                units |= _lrna_names.lib_units(fh.read())
+        except OSError:
+            unread.append(cand)
+    return units, unread
+
+
+# unit names of the L-RNA lineages: Dudek's (LA, LA5 ...), the older A0 / A05 / A03 and the CCD-like 0A;
+# other nucleotide names (A, DA, modified nucleotides such as PSU or 1MA) are D units
+_L_UNIT = re.compile(r"(L[ACGU]|[ACGU]0|0[ACGU])[35N]?")
+_L_TYPES = {"LD", "LH", "LE"}  # the L-RNA oxygen types (Dudek & Trylska, MDATK's generated library)
+
+
+def _lrna_like_libs(paths: List[str], ctx) -> bool:
+    """Whether a readable OFF library looks like an L-RNA one: it uses an L-RNA atom type, or it has
+    nucleotide units (sugar atoms C1' and O4') named the way L-RNA libraries name them (LA, A0, 0A ...).
+    A ligand or modified-nucleotide library has neither; one that cannot be read tells nothing."""
+    for cand in _lib_paths(paths, ctx)[0]:
+        try:
+            with open(cand, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        units = re.findall(r"^!entry\.([^.\s]+)\.unit\.atoms table[^\n]*\n(.*?)(?=^!)", text + "\n!",
+                           re.MULTILINE | re.DOTALL)
+        for unit, block in units:
+            atoms = re.findall(r'^\s*"([^"]*)"\s+"([^"]+)"', block, re.MULTILINE)
+            if any(t in _L_TYPES for _a, t in atoms):
+                return True
+            sugar = {a.replace("*", "'") for a, _t in atoms} >= {"C1'", "O4'"}  # (C1* in older libraries)
+            if sugar and _L_UNIT.fullmatch(unit):
+                return True
+    return False
+
+
+def _lib_types(paths: List[str], ctx) -> List[str]:
+    """Atom types used by OFF residue libraries (the readable ones), in order of appearance."""
+    found: List[str] = []
+    for path in paths:
+        path = path.strip()
+        for cand in (path, os.path.join(ctx.folder, path) if getattr(ctx, "folder", "") else ""):
+            if cand and os.path.isfile(cand):
+                break
+        else:
+            continue
+        try:
+            with open(cand, encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        for block in re.findall(r"^!entry\.[^\n]*\.unit\.atoms table[^\n]*\n(.*?)(?=^!)", text + "\n!",
+                                re.MULTILINE | re.DOTALL):
+            for line in block.splitlines():
+                m = re.match(r'\s*"[^"]*"\s+"([^"]+)"', line)
+                if m and m.group(1) not in found:
+                    found.append(m.group(1))
+    return found
+
+
+def _frcmod_new_types(path: str, ctx) -> List[str]:
+    """Atom types with NONB parameters in a frcmod that RNA.lib does not use ([] if unreadable)."""
+    if not path:
+        return []
+    for cand in (path, os.path.join(ctx.folder, path) if getattr(ctx, "folder", "") else ""):
+        if cand and os.path.isfile(cand):
+            break
+    else:
+        return []
+    found, section = [], ""
+    try:
+        with open(cand, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()[1:]
+    except OSError:
+        return []
+    for line in lines:
+        head = line.strip().upper()
+        if head in ("MASS", "BOND", "ANGLE", "ANGL", "DIHE", "IMPROPER", "IMPR", "NONB", "NONBON", "HBON",
+                    "HBOND", "CMAP"):
+            section = head
+            continue
+        if section.startswith("NONB") and line.strip():
+            t = line.split()[0]
+            if t not in RNA_LIB_TYPES and t not in found:
+                found.append(t)
+    return found
+
+
+# ---------------------------------------------------------------------------
+# helix restraints
+# ---------------------------------------------------------------------------
+
+
+@register
+class AmberRestraintsTool(Tool):
+    name = "amber-restraints"
+    label = "Amber · helix restraints"
+    category = "Amber"
+    tag = "amber-restraints"
+    description = ("Helix-preserving DISANG distance restraints for the hydrogen bonds of every "
+                   "base pair in the secondary structure (looked up in the final topology).")
+    inputs = [Port("topology", "Topology (parm7)", ("parm7",),
+                   tooltip="The solvated (and ParmEd-modified) topology the MD runs with."),
+              Port("secstruct", "Secondary structure", ("secstruct",), optional=True,
+                   tooltip="Optional: a dot-bracket file or a FARFAR2 step; otherwise type it below.")]
+    outputs = [Port("restraints", "DISANG restraints", ("dist",))]
+    sections = [Section("restraints", "Base pairs", restraint_options(),
+                        tooltip="Each G–C pair gets three, each A–U pair two distance restraints "
+                                "(flat-bottom window r1–r4)."),
+                env_section("module load python   (only python3 is needed)")]
+
+    def check(self, s, ctx):
+        model, _src, out = secondary_structure(s, ctx)
+        if model is None:
+            if not out:
+                out.append(Issue("error", "enter the secondary structure (dot-bracket and sequence) or "
+                                          "connect a secondary-structure file", ("dotbracket",)))
+            return out
+        _pairs, more = restraint_pairs(model, s)
+        out += more
+        if ctx.existing("topology"):
+            try:
+                self._direct(s, ctx, model)
+            except (OSError, ValueError) as exc:
+                out.append(Issue("error", f"topology check: {exc}", ("res_offset", "sequence")))
+        return out
+
+    def _direct(self, s, ctx, model) -> str:
+        pairs, _ = restraint_pairs(model, s)
+        names, labels, pointers = _helix_dist.read_parm7_names(ctx.existing("topology"))
+        bonds = rna.HBOND_ATOMS
+        return _helix_dist.restraint_text(names, labels, pointers, pairs, bonds, restraint_window(s),
+                                          int(s["res_offset"]))
+
+    def describe(self, s):
+        if not (s.get("dotbracket") or "").strip():
+            return "pairs from the secondary-structure input"
+        try:
+            model = rna.build_model(s.get("sequence", ""), s.get("dotbracket", ""))
+            return f"{len(model.pairs)} base pairs"
+        except ValueError:
+            return "check the secondary structure"
+
+    def output_values(self, s, ctx):
+        model, _src, _ = secondary_structure(s, ctx)
+        data = {"pairs": len(model.pairs)} if model else {}
+        return {"restraints": PortValue([ctx.own("helix", "dist")], "dist", data)}
+
+    def resources(self, s):
+        return ["ambertools"]
+
+    def generate(self, s, ctx):
+        model, source, _ = secondary_structure(s, ctx)
+        pairs, _ = restraint_pairs(model, s)
+        n = ctx.name
+        files = [GeneratedFile(n("helix", "py"), helix_script(pairs, s, source), "helper",
+                               "writes the DISANG file from the topology")]
+        top = ctx.inp("topology")
+        dist = n("helix", "dist")
+        if ctx.existing("topology"):
+            files.append(GeneratedFile(dist, self._direct(s, ctx, model), "input",
+                                       "restraints (topology already exists)"))
+        script_name = n(self.tag, "sh")
+        sh = script_header("Helix-preserving distance restraints (DISANG)", ctx, s, script_name)
+        sh += [f"# {len(pairs)} base pairs from the {source}",
+               f"python3 {n('helix', 'py')} {shell_quote(top)} {dist}", require_file(dist, "the restraint script"), ""]
+        files.append(GeneratedFile(script_name, "\n".join(sh), "run", "writes the DISANG file"))
+        return files
+
+
+# ---------------------------------------------------------------------------
+# Amber MD stages
+# ---------------------------------------------------------------------------
+
+_MD_KIND = {"kind": "md"}
+_MIN_KIND = {"kind": "min"}
+FINISHED_PATTERN = r"Total wall time|Run +done at"  # pmemd / sander print it when a run has finished
+# the shell test of 'Skip finished stages' (and of a step waiting for its separately run production)
+FINISHED_FN = ["# a stage counts as finished when its output has the final timing lines",
+               '# (pmemd: "Total wall time", sander: "Run   done at")',
+               f'finished() {{ [ -s "$1" ] && grep -qE "{FINISHED_PATTERN}" "$1"; }}', ""]
+_AUTO_YES_NO = [("auto", "Auto"), ("yes", "Yes"), ("no", "No")]
+# the dry label of the step's dry production trajectory (dry-prod.nc, output 'dry_trajectory')
+DRY_PROD = "prod"
+DRY_LABEL = re.compile(r"[A-Za-z0-9_-]+")
+# labels whose output name dry_<label> belongs to another dry output: dry_pdb, dry_topology, dry_trajectory
+# and the stages' dry PDBs dry_pdb_<stage>
+RESERVED_DRY_LABELS = ("pdb", "topology", "trajectory")
+RESERVED_DRY_PREFIX = "pdb_"
+# what a true / false value reads as when it is written as text (dry = "false"): never a label
+BOOLEAN_WORDS = ("true", "false", "yes", "no", "on", "off")
+# set by the pmemd runs of a main script's stages before its separate script (when they run, not when they
+# are skipped as finished): the dry copies of those stages are made again
+STAGES_RAN = "STAGES_RAN"
+OUT_OF_DATE_FN = ["# a dry copy is out of date when it is missing or older than the output of one of its runs",
+                  'dry_out_of_date() { [ -s "$1" ] || return 0; local f="$1" o; shift; '
+                  'for o in "$@"; do [ "$f" -ot "$o" ] && return 0; done; return 1; }', ""]
+# cpptraj writes a stage's dry copy as <file>.part, renamed once complete: a copy cut off (a stopped run, a
+# wall-time limit) never carries the name the scripts' checks look for
+PART_EXT = ".part"
+
+
+def dry_label_problem(label: str) -> str:
+    """Why ``label`` (a stage's dry label, not empty) cannot be one: the end of the check's message, or ""
+    when it can.  A label with a problem is no label (:meth:`AmberMDTool.roles`)."""
+    if not DRY_LABEL.fullmatch(label):
+        return "may hold only letters, digits, '-' and '_'"
+    if label in RESERVED_DRY_LABELS or label.startswith(RESERVED_DRY_PREFIX):
+        return ("is reserved: dry_pdb, dry_topology, dry_trajectory and dry_pdb_<stage> name the step's other dry "
+                "outputs")
+    if label.lower() in BOOLEAN_WORDS:
+        return "reads as a true/false value: give a name (e.g. the stage's) or leave it empty"
+    return ""
+
+
+@dataclass
+class StageRoles:
+    """What the stages of an amber-md step do besides running, from the stage options ('Production stage'
+    and its Auto settings) and the step's: indices into the step's stages."""
+
+    separate: List[bool]  # per stage: runs in the separately run script
+    exported: List[int]  # stages whose trajectory goes out on the 'trajectory' output
+    dry: Dict[str, List[int]]  # dry label -> the stages dried into its file, in stage order (DRY_PROD: dry-prod)
+    dry_pdbs: List[int]  # stages with a dry PDB of their last frame
+
+    @property
+    def split(self) -> bool:
+        """Some stage runs in the separate script."""
+        return any(self.separate)
+
+    @property
+    def main(self) -> List[int]:
+        """The stages of the main script."""
+        return [k for k, sep in enumerate(self.separate) if not sep]
+
+
+STAGE_OPTIONS = [
+    Option("name", "Name", "text", "stage", "Short stage name used in file names (letters, digits, "
+           "hyphens), e.g. min1, heat, eq, prod."),
+    Option("title", "Title", "text", "", "First line of the mdin file (a free comment)."),
+    Option("kind", "Type", "radio", "md", "Energy minimisation (imin=1) or molecular dynamics (imin=0).",
+           choices=[("min", "Minimisation"), ("md", "MD")]),
+    # minimisation
+    Option("maxcyc", "Cycles (maxcyc)", "int", 2000, "Total minimisation cycles.", minimum=1,
+           maximum=10_000_000, requires=_MIN_KIND),
+    Option("ncyc", "Steepest-descent cycles (ncyc)", "int", 500,
+           "With ntmin=1: cycles of steepest descent before switching to conjugate gradient.",
+           minimum=0, maximum=10_000_000, requires=_MIN_KIND),
+    Option("ntmin", "Method (ntmin)", "radio", "1", "Minimisation algorithm.",
+           choices=[("1", "SD then CG"), ("2", "SD only"), ("0", "CG only")], requires=_MIN_KIND),
+    # dynamics
+    Option("nstlim", "Steps (nstlim)", "int", 50000, "Number of MD steps.", minimum=1,
+           maximum=10_000_000_000, requires=_MD_KIND),
+    Option("dt", "Time step (dt)", "float", 0.002, "Time step in ps (0.002 with SHAKE; 0.004 needs "
+           "hydrogen mass repartitioning).", minimum=0.0001, maximum=0.01, step=0.001, digits=4,
+           unit="ps", requires=_MD_KIND),
+    Option("restart", "Velocities", "radio", "auto",
+           "auto: new velocities (irest=0, ntx=1) after a minimisation or at the start, otherwise "
+           "continue the previous stage (irest=1, ntx=5).",
+           choices=[("auto", "Auto"), ("new", "New (irest=0)"), ("continue", "Continue (irest=1)")],
+           requires=_MD_KIND),
+    Option("ensemble", "Ensemble", "radio", "nvt", "Constant volume (ntb=1) or constant pressure "
+           "(ntb=2, ntp>0).", choices=[("nvt", "NVT"), ("npt", "NPT")], requires=_MD_KIND),
+    Option("thermostat", "Thermostat", "radio", "langevin", "Temperature control (ntt).",
+           choices=[("langevin", "Langevin (ntt=3)"), ("berendsen", "Berendsen (ntt=1)"),
+                    ("andersen", "Andersen (ntt=2)")], requires=_MD_KIND),
+    Option("gamma_ln", "Collision frequency (gamma_ln)", "float", 1.0, "Langevin collision "
+           "frequency in ps⁻¹.", minimum=0.0, maximum=100.0, step=0.5, digits=2,
+           requires={"kind": "md", "thermostat": "langevin"}),
+    Option("tautp", "Coupling time (tautp)", "float", 1.0, "Berendsen thermostat time constant (ps).",
+           minimum=0.0, maximum=100.0, step=0.1, digits=2,
+           requires={"kind": "md", "thermostat": "berendsen"}),
+    Option("vrand", "Randomisation interval (vrand)", "int", 1000, "Andersen: steps between velocity "
+           "randomisations.", minimum=1, maximum=10_000_000,
+           requires={"kind": "md", "thermostat": "andersen"}),
+    Option("tempi", "Initial temperature (tempi)", "float", 0.0, "Temperature of the new velocities (K).",
+           minimum=0.0, maximum=1000.0, step=10.0, digits=1, unit="K", requires=_MD_KIND),
+    Option("temp0", "Temperature (temp0)", "float", 300.0, "Reference temperature (K).",
+           minimum=0.0, maximum=1000.0, step=1.0, digits=1, unit="K", requires=_MD_KIND),
+    Option("ramp", "Ramp the temperature", "bool", False,
+           "Raise temp0 linearly from tempi with an nmropt TEMP0 schedule instead of jumping to "
+           "temp0 at once.", requires=_MD_KIND),
+    Option("ramp_steps", "Ramp length (steps)", "int", 20000, "Steps over which the temperature rises; "
+           "the rest of the stage runs at temp0.", minimum=1, maximum=10_000_000_000,
+           requires={"kind": "md", "ramp": True}),
+    Option("barostat", "Barostat", "radio", "berendsen", "Pressure control in NPT.",
+           choices=[("berendsen", "Berendsen (default)"), ("mc", "Monte Carlo (barostat=2)")],
+           requires={"kind": "md", "ensemble": "npt"}),
+    Option("pres0", "Pressure (pres0)", "float", 1.0, "Reference pressure (bar).", minimum=0.0,
+           maximum=10000.0, step=0.1, digits=2, unit="bar", requires={"kind": "md", "ensemble": "npt"}),
+    Option("taup", "Relaxation time (taup)", "float", 1.0, "Berendsen barostat time constant (ps).",
+           minimum=0.0, maximum=100.0, step=0.1, digits=2,
+           requires={"kind": "md", "ensemble": "npt", "barostat": "berendsen"}),
+    Option("mcbarint", "MC volume moves every (mcbarint)", "int", 100, "Steps between Monte Carlo "
+           "volume moves.", minimum=1, maximum=100000,
+           requires={"kind": "md", "ensemble": "npt", "barostat": "mc"}),
+    Option("ntp", "Pressure scaling (ntp)", "radio", "1", "Isotropic (ntp=1) or anisotropic (ntp=2).",
+           choices=[("1", "Isotropic"), ("2", "Anisotropic")], requires={"kind": "md", "ensemble": "npt"}),
+    Option("shake", "SHAKE bonds to hydrogen", "bool", True, "ntc=2, ntf=2 (needed for dt > 0.001 ps).",
+           requires=_MD_KIND),
+    Option("tol", "SHAKE tolerance (tol)", "float", None, "Relative SHAKE tolerance; empty uses "
+           "Amber's default (1.0e-5).", optional=True, digits=8, requires={"kind": "md", "shake": True}),
+    Option("ig", "Random seed (ig)", "int", None, "Empty: a new seed each run (ig=-1).", optional=True,
+           minimum=-1, maximum=2**31 - 1, requires=_MD_KIND),
+    # shared
+    Option("cut", "Cutoff (cut)", "float", 10.0, "Direct-space non-bonded cutoff (Å).", minimum=6.0,
+           maximum=30.0, step=0.5, digits=1, unit="Å"),
+    Option("posres", "Positional restraints", "bool", False,
+           "Harmonic restraints to the reference coordinates (ntr=1, restraint_wt, restraintmask)."),
+    Option("posres_mask", "Restraint mask", "text", "",
+           "Amber mask of restrained atoms; empty restrains the solute (':1-N' when the residue count "
+           "is known, otherwise everything except water and ions).", requires={"posres": True},
+           placeholder=":1-73"),
+    Option("posres_wt", "Restraint weight", "float", 10.0, "restraint_wt in kcal/mol/Å².", minimum=0.0,
+           maximum=10000.0, step=1.0, digits=2, requires={"posres": True}),
+    Option("distres", "Helix distance restraints", "bool", False,
+           "nmropt=1 with DISANG=<restraint file> (the step's restraint input)."),
+    Option("listout", "Print restraint violations (LISTOUT=POUT)", "bool", False,
+           "Writes the restraint violation summary to the output file.", requires={"distres": True}),
+    Option("ntpr", "Energy output every (ntpr)", "int", 500, "Steps between energy printouts.",
+           minimum=1, maximum=100_000_000),
+    Option("ntwx", "Trajectory frame every (ntwx)", "int", 500, "Steps between trajectory frames "
+           "(0: no trajectory).", minimum=0, maximum=100_000_000, requires=_MD_KIND),
+    Option("ntwr", "Restart file every (ntwr)", "int", 5000, "Steps between restart-file updates.",
+           minimum=1, maximum=1_000_000_000, requires=_MD_KIND),
+    Option("netcdf", "NetCDF trajectory (ioutfm=1)", "bool", True, "Binary NetCDF instead of ASCII.",
+           requires=_MD_KIND),
+    Option("iwrap", "Wrap into the box (iwrap=1)", "bool", False, "Wrap molecules into the primary box "
+           "in the output.", requires=_MD_KIND),
+    Option("segments", "Split into segments", "int", 1, "Run this stage as N consecutive pmemd runs "
+           "(e.g. to fit cluster wall-time limits); file names get -001, -002 ...", minimum=1,
+           maximum=1000, requires=_MD_KIND),
+    Option("production", "Production stage", "bool", False, "Shorthand for a production run, through the "
+           "Auto settings below: the stage goes into the separate production script (with the step's "
+           "'Separate production script'), its trajectory is passed on to analysis / visualisation steps, and "
+           "with the step's 'Dry, imaged production trajectory' it is dried into dry-prod.nc unless it has a "
+           "dry label of its own. 'Run in the separate script' and 'Pass the trajectory on' set to Yes or No "
+           "override it.", requires=_MD_KIND),
+    Option("separate", "Run in the separate script", "choice", "auto",
+           "Auto: in the step's separately run script (e.g. on a cluster) when it is a 'Production stage' and "
+           "the step's 'Separate production script' is on, otherwise in the main script. Yes: in the separate "
+           "script, also when it is no production stage or that step option is off. No: in the main script. "
+           "The main script runs the stages before the first separate one, waits for the separate script, then "
+           "runs the rest, so the separately run stages must follow one another (a stage of the main script "
+           "between two of them is an error).", choices=_AUTO_YES_NO, requires=_MD_KIND),
+    Option("export", "Pass the trajectory on", "choice", "auto",
+           "Whether the stage's trajectory goes out on the step's 'Trajectory' output to analysis / "
+           "visualisation steps. Auto: when it is a 'Production stage' (with Auto on every stage and no "
+           "production stage with frames, the last MD stage with a trajectory goes out, as before). Yes / No: "
+           "always / never, whatever 'Production stage' says; once a stage says Yes or No, no other stage goes "
+           "out in place of the ones asked for. Yes needs trajectory frames (ntwx > 0).",
+           choices=_AUTO_YES_NO, requires=_MD_KIND),
+    Option("dry", "Dry trajectory label", "text", "",
+           "A label of letters, digits, '-' and '_' (empty: none): cpptraj autoimages this stage's trajectory, "
+           "strips the step's 'Strip mask (trajectory)' and writes <project>_<step>_dry-<label>.nc (and the dry "
+           "topology) right after the stage, in its script; stages with the same label are concatenated, in "
+           "stage order, into one file with an output of its own. Needs trajectory frames (ntwx > 0). The label "
+           "'prod' joins the step's dry production trajectory (dry-prod.nc). A label takes precedence over the "
+           "step's 'Dry, imaged production trajectory', which covers the production stages without one. "
+           "Reserved: pdb, topology, trajectory and labels starting with pdb_ (names of the step's other dry "
+           "outputs). In a project file, dry = true names it after the stage (false: none).",
+           placeholder="e.g. relax1", requires=_MD_KIND),
+    Option("dry_pdb", "Dry PDB of its last frame", "bool", False,
+           "Right after the stage, cpptraj strips the step's 'Strip mask' from its final restart and writes "
+           "<project>_<step>_dry-<stage>.pdb, with an output of its own - e.g. the structure at the top of a "
+           "heating ramp. Independent of the step's 'Dry PDB before production'; needs no trajectory frames.",
+           requires=_MD_KIND),
+    Option("extra_cntrl", "Extra &cntrl settings", "multiline", "", "Additional name=value settings "
+           "added inside &cntrl (they override generated values with the same name).",
+           placeholder="nscm=1000,"),
+    Option("extra_namelists", "Extra namelists", "multiline", "", "Text added after &cntrl, e.g. an "
+           "&ewald namelist.", placeholder="&ewald\n  skinnb=2.0,\n/"),
+]
+
+_STAGE_TEMPLATES = [
+    ("min1", "Minimisation, solute restrained", dict(
+        name="min1", title="Minimize water/ions, RNA restrained", kind="min", maxcyc=2000, ncyc=500,
+        posres=True, posres_wt=10.0, ntpr=100)),
+    ("min2", "Minimisation, helix pairs held", dict(
+        name="min2", title="Unrestrained min, helix pairs held", kind="min", maxcyc=2000, ncyc=500,
+        distres=True, ntpr=100)),
+    ("heat", "Heating (NVT, Langevin)", dict(
+        name="heat", title="Heat 0 -> 300 K, helix pairs held", kind="md", nstlim=25000, dt=0.002,
+        ensemble="nvt", tempi=0.0, temp0=300.0, tol=1.0e-6, distres=True)),
+    ("heat-ramp", "Heating with a temperature ramp", dict(
+        name="heat", title="Heat 0 -> 300 K (ramp), helix pairs held", kind="md", nstlim=25000,
+        ensemble="nvt", tempi=0.0, temp0=300.0, ramp=True, ramp_steps=20000, tol=1.0e-6,
+        distres=True)),
+    ("eq", "NPT equilibration", dict(
+        name="eq", title="NPT eq, light restraint", kind="md", nstlim=50000, ensemble="npt",
+        distres=True)),
+    ("eq-free", "NPT equilibration (no positional restraints)", dict(
+        name="eq-free", title="Unrestrained NPT eq", kind="md", nstlim=50000, ensemble="npt",
+        distres=True, listout=True)),
+    ("prod", "Production (NPT, helix pairs held)", dict(
+        name="prod", title="Production, helix pairs held", kind="md", nstlim=150_000_000,
+        ensemble="npt", distres=True, ntwx=5000, ntwr=50000, production=True)),
+    ("prod-free", "Production (NPT, unrestrained)", dict(
+        name="prod", title="Production", kind="md", nstlim=150_000_000, ensemble="npt",
+        ntwx=5000, ntwr=50000, production=True)),
+    ("min-all", "Minimisation, no restraints", dict(
+        name="min", title="Minimisation", kind="min", maxcyc=2000, ncyc=500, ntpr=100)),
+]
+
+
+@register
+class AmberMDTool(Tool):
+    name = "amber-md"
+    label = "Amber · MD stages"
+    category = "Amber"
+    tag = "amber-md"
+    description = ("pmemd input files (minimisation, heating, equilibration, production) and the "
+                   "scripts that run them with pmemd, pmemd.cuda or pmemd.MPI.")
+    inputs = [Port("topology", "Topology (parm7)", ("parm7",)),
+              Port("coordinates", "Coordinates (rst7)", ("rst7",)),
+              Port("restraints", "Restraints (DISANG)", ("dist",), optional=True,
+                   tooltip="Needed by stages with 'Helix distance restraints'.")]
+    sections = [
+        Section("engine", "Engine", [
+            Option("amber_version", "Amber version", "radio", "26",
+                   "Version the files target (local Amber 26 or cluster Amber 24); the input format is "
+                   "the same, the version is recorded in the scripts.",
+                   choices=[("26", "Amber 26 (local)"), ("24", "Amber 24 (cluster)")]),
+            Option("engine", "MD engine", "radio", "pmemd.cuda", "Program for the MD stages.",
+                   choices=[("pmemd.cuda", "pmemd.cuda (GPU)"), ("pmemd", "pmemd (1 CPU core)"),
+                            ("pmemd.MPI", "pmemd.MPI (CPU cores)")]),
+            Option("nproc", "MPI processes", "int", 8, "Processes for pmemd.MPI.", minimum=1,
+                   maximum=100000, requires={"engine": "pmemd.MPI"}),
+            Option("mpi_launcher", "MPI launcher", "text", "mpirun -np {n}",
+                   "Command placed before pmemd.MPI; {n} is replaced by the process count (srun on "
+                   "SLURM clusters).", requires={"engine": "pmemd.MPI"}),
+            Option("gpu", "GPU (CUDA_VISIBLE_DEVICES)", "text", "", "Optional GPU index for pmemd.cuda.",
+                   requires={"engine": "pmemd.cuda"}, placeholder="0"),
+            Option("min_engine", "Minimisation engine", "radio", "same",
+                   "pmemd.cuda can stop on bad initial contacts; the CPU pmemd is more forgiving.",
+                   choices=[("same", "Same as MD"), ("pmemd", "pmemd (CPU)")]),
+            Option("input_velocities", "Input coordinates have velocities", "bool", False,
+                   "Tick when the starting rst7 is a restart of an earlier MD run, so the first MD "
+                   "stage can continue it (irest=1)."),
+            Option("restraint_ref", "Positional restraint reference", "radio", "previous",
+                   "Coordinates used as -ref for positional restraints.",
+                   choices=[("previous", "Previous stage"), ("initial", "Starting coordinates")]),
+            Option("separate_production", "Separate production script", "bool", True,
+                   "Production stages go into their own script (e.g. to run them on a cluster). A stage's "
+                   "'Run in the separate script' set to Yes or No takes precedence for that stage."),
+            WAITING_EXIT,
+            Option("resume", "Skip finished stages", "bool", True,
+                   "When the script is re-run, stages whose output file already has pmemd's final "
+                   "timing lines are skipped (resumes an interrupted run)."),
+        ], tooltip="Which pmemd binary runs the stages and how."),
+        Section("stages", "Stages", STAGE_OPTIONS, repeat=True, item_label="name",
+                templates=_STAGE_TEMPLATES,
+                default_items=("min1", "min2", "heat", "eq", "eq-free", "prod"),
+                tooltip="Stages run in order; each starts from the previous stage's restart file."),
+        Section("final", "Final structure", [
+            Option("dry_pdb", "Dry PDB before production", "bool", True,
+                   "cpptraj strips water and ions from the last restart of the main script (before "
+                   "the production script) - for a visual check of the equilibrated structure. Any MD stage "
+                   "can write one of its own as well ('Dry PDB of its last frame')."),
+            Option("strip_mask", "Strip mask", "text", DEFAULT_STRIP, "cpptraj mask of atoms removed "
+                   "in the dry PDBs (this one and those of stages)."),
+            Option("dry_traj", "Dry, imaged production trajectory", "bool", False,
+                   "cpptraj autoimage + strip of the production trajectories (and the matching dry "
+                   "topology) for visualisation, concatenated into dry-prod.nc. A production stage with a "
+                   "dry label of its own goes into that label's file instead; a stage labelled 'prod' joins "
+                   "this one."),
+            Option("dry_mask", "Strip mask (trajectory)", "text", DEFAULT_STRIP,
+                   "cpptraj mask removed from the dry trajectories (the production one and those of stage "
+                   "dry labels)."),
+        ]),
+        env_section("source /opt/amber26/amber.sh   or   module load Amber/24", [SEPARATE_CONDA]),
+        CLUSTER_SECTION,
+    ]
+
+    # ----------------------------------------------------------- helpers
+    @staticmethod
+    def stage_tag(stage: Dict[str, Any], k: int) -> str:
+        return sanitize_tag(stage.get("name") or f"stage{k + 1}")
+
+    @staticmethod
+    def _choice(st: Dict[str, Any], key: str) -> str:
+        """A stage's Auto / Yes / No option; only MD stages have them (a minimisation stage: Auto)."""
+        value = st.get(key, "auto")
+        return value if st.get("kind") == "md" and value in ("yes", "no") else "auto"
+
+    @staticmethod
+    def dry_label(st: Dict[str, Any]) -> str:
+        """The stage's own dry label as given ("": none; only MD stages have one)."""
+        value = st.get("dry")
+        return value.strip() if st.get("kind") == "md" and isinstance(value, str) else ""
+
+    def normalise(self, settings, issues=None):
+        """As every step's, and a stage's dry label, 'Run in the separate script' and 'Pass the trajectory on'
+        written as true / false in a project file (the flags the feature request proposed) read as: a dry label
+        named after the stage (its own file) or none, and Yes or No."""
+        settings = dict(settings or {})
+        raw = settings.get("stages")
+        named: List[int] = []  # the stage records (index among them) whose dry label is true
+        if isinstance(raw, list):
+            records: List[Any] = []
+            kept = 0  # the records that are objects: only they become stages
+            for rec in raw:
+                if isinstance(rec, dict):
+                    if any(isinstance(rec.get(key), bool) for key in ("dry", "separate", "export")):
+                        rec = dict(rec)
+                        for key in ("separate", "export"):
+                            if isinstance(rec.get(key), bool):
+                                rec[key] = "yes" if rec[key] else "no"
+                        if isinstance(rec.get("dry"), bool):
+                            if rec["dry"]:
+                                named.append(kept)
+                            rec["dry"] = ""
+                    kept += 1
+                records.append(rec)
+            settings["stages"] = records
+        out = super().normalise(settings, issues)
+        for k in named:
+            out["stages"][k]["dry"] = self.stage_tag(out["stages"][k], k)
+        return out
+
+    def roles(self, s: Dict[str, Any]) -> StageRoles:
+        """What each stage does besides running.  'Production stage' is the shorthand the Auto settings
+        follow: separate script (with the step's 'Separate production script'), trajectory passed on, and
+        with the step's 'Dry, imaged production trajectory' dried into dry-prod.nc unless the stage has a dry
+        label of its own (the label 'prod' joins that file).  With 'Pass the trajectory on' on Auto everywhere
+        and no production stage with frames, the last MD stage with a trajectory goes out (as before); once a
+        stage says Yes or No, only the stages asked for do.  A label the check refuses (invalid characters,
+        reserved, a true/false word) is no label: its output would take the name of one of the step's own."""
+        stages = s.get("stages", [])
+        separate = []
+        for st in stages:
+            mode = self._choice(st, "separate")
+            separate.append(bool(s.get("separate_production") and st.get("production")) if mode == "auto"
+                            else mode == "yes")
+        traj = [k for k, st in enumerate(stages) if st.get("kind") == "md" and st.get("ntwx", 0) > 0]
+        export = [self._choice(st, "export") for st in stages]
+        exported = [k for k in traj if (stages[k].get("production") if export[k] == "auto" else export[k] == "yes")]
+        if not exported and all(e == "auto" for e in export):
+            # as before: the last MD stage with a trajectory.  Once a stage says Yes or No, only the stages that say
+            # Yes and the production stages on Auto go out: a stage nobody asked for (a hot stage of an annealing
+            # cycle whose relaxation says No) never takes their place
+            exported = traj[-1:]
+        dry: Dict[str, List[int]] = {}
+        for k in traj:
+            label = self.dry_label(stages[k])
+            if label and dry_label_problem(label):
+                label = ""
+            if not label and s.get("dry_traj") and stages[k].get("production"):
+                label = DRY_PROD
+            if label:
+                dry.setdefault(label, []).append(k)
+        dry_pdbs = [k for k, st in enumerate(stages) if st.get("kind") == "md" and st.get("dry_pdb")]
+        return StageRoles(separate, exported, dry, dry_pdbs)
+
+    def output_ports(self, s):
+        roles = self.roles(s)
+        tags = [self.stage_tag(st, k) for k, st in enumerate(s.get("stages", []))]
+        ports = [Port("topology", "Topology (parm7)", ("parm7",)),
+                 Port("restart", "Final restart (rst7)", ("rst7",))]
+        if roles.exported:
+            ports.append(Port("trajectory", "Trajectory", ("nc",), multiple=True))
+        if s.get("dry_pdb") and roles.main:
+            ports.append(Port("dry_pdb", "Dry final PDB", ("pdb",)))
+        if roles.dry:
+            ports.append(Port("dry_topology", "Dry topology", ("parm7",)))
+        if DRY_PROD in roles.dry:
+            ports.append(Port("dry_trajectory", "Dry trajectory", ("nc",)))
+        for label, members in roles.dry.items():
+            if label != DRY_PROD:
+                names = [tags[k] for k in members]
+                ports.append(Port(f"dry_{label}", f"Dry trajectory {label}" + (
+                    f" ({', '.join(names)})" if names != [label] else ""), ("nc",),
+                    tooltip=f"Dry, imaged trajectory of {_stage_list(names)} (dry label {label})"))
+        for k in roles.dry_pdbs:
+            ports.append(Port(f"dry_pdb_{tags[k]}", f"Dry PDB of {tags[k]}", ("pdb",),
+                              tooltip=f"Dry PDB of the last frame of stage {tags[k]}"))
+        # one port per name, as output_values has one value (two stages of one name are an error)
+        return [p for i, p in enumerate(ports) if p.name not in {q.name for q in ports[:i]}]
+
+    def _segments(self, s, ctx) -> List[Dict[str, Any]]:
+        """Expand stages into runs: name, tag, stage, index, segment, files."""
+        runs = []
+        for k, st in enumerate(s["stages"]):
+            tag = self.stage_tag(st, k)
+            nseg = st["segments"] if st["kind"] == "md" else 1
+            for seg in range(1, nseg + 1):
+                rtag = f"{tag}-{seg:03d}" if nseg > 1 else tag
+                runs.append({"stage": st, "index": k, "seg": seg, "nseg": nseg, "tag": tag, "rtag": rtag,
+                             "out": ctx.name(rtag, "out"), "rst": ctx.name(rtag, "rst7"),
+                             "nc": ctx.name(rtag, "nc") if st["kind"] == "md" and st["ntwx"] > 0 else "",
+                             "inf": ctx.name(rtag, "mdinfo")})
+        return runs
+
+    def _restart_modes(self, s, ctx) -> List[Tuple[int, int]]:
+        """(irest, ntx) for every stage (minimisation stages get (0, 1))."""
+        has_vel = bool(ctx.data("coordinates").get("velocities", s["input_velocities"]))
+        modes = []
+        for st in s["stages"]:
+            if st["kind"] == "min":
+                modes.append((0, 1))
+                has_vel = False
+                continue
+            mode = st["restart"]
+            if mode == "auto":
+                mode = "continue" if has_vel else "new"
+            modes.append((1, 5) if mode == "continue" else (0, 1))
+            has_vel = True
+        return modes
+
+    def _solute_mask(self, ctx) -> str:
+        nres = ctx.data("topology").get("solute_residues")
+        return f":1-{nres}" if nres else SOLVENT_MASK
+
+    # ------------------------------------------------------------ checks
+    def check(self, s, ctx):
+        out: List[Issue] = []
+        stages = s["stages"]
+        if not stages:
+            return [Issue("error", "add at least one stage", ("stages",))]
+        tags = [self.stage_tag(st, k) for k, st in enumerate(stages)]
+        for k, st in enumerate(stages):
+            if tags.count(tags[k]) > 1:
+                out.append(Issue("error", f"stage name '{tags[k]}' is used twice", (f"stages.{k}.name",)))
+            if st["name"] and tags[k] != st["name"]:
+                out.append(Issue("info", f"stage '{st['name']}' is written as '{tags[k]}' in file names",
+                                 (f"stages.{k}.name",)))
+        top = ctx.data("topology")
+        if top.get("box") is False:
+            out.append(Issue("error", "the topology has no periodic box; these stages need one (ntb>0)",
+                             ("input:topology",)))
+        needs = [k for k, st in enumerate(stages) if st["distres"]]
+        if needs and not ctx.has("restraints"):
+            out.append(Issue("error", f"stages {', '.join(tags[k] for k in needs)} use helix distance "
+                                      "restraints but no DISANG file is connected or chosen (an 'Amber · "
+                                      "helix restraints' step writes one)",
+                             tuple(f"stages.{k}.distres" for k in needs) + ("input:restraints",)))
+        modes = self._restart_modes(s, ctx)
+        prev_kind = None
+        temps = []
+        jumps = False  # an MD stage changes the temperature without a ramp from the previous one's
+        # the temperature a continued run starts at: the previous MD stage's temp0, for the first stage the
+        # one the input restart was run at when its step says so (an amber-md step's restart output)
+        crd = ctx.data("coordinates")
+        prev_temp = crd.get("temp0") if crd.get("velocities", s["input_velocities"]) else None
+        prev_name = "the input restart"
+        no_frames = []  # production stages on Auto without trajectory frames
+        for k, st in enumerate(stages):
+            key = f"stages.{k}."
+            label = f"stage {tags[k]}"
+            if st["posres"] and st["posres_wt"] <= 0:
+                out.append(Issue("error", f"{label}: positional restraints need a positive weight",
+                                 (key + "posres_wt",)))
+            if st["kind"] == "min":
+                if st["ncyc"] > st["maxcyc"] and st["ntmin"] == "1":
+                    out.append(Issue("warning", f"{label}: ncyc exceeds maxcyc, so conjugate gradient never "
+                                                "starts", (key + "ncyc",)))
+                prev_kind = "min"
+                prev_temp = None
+                continue
+            irest, _ntx = modes[k]
+            if st["restart"] == "continue" and prev_kind == "min":
+                out.append(Issue("error", f"{label}: cannot continue velocities after a minimisation "
+                                          "(use Auto or New)", (key + "restart",)))
+            if st["restart"] == "continue" and prev_kind is None and not (
+                    ctx.data("coordinates").get("velocities", s["input_velocities"])):
+                out.append(Issue("error", f"{label}: the starting coordinates have no velocities to "
+                                          "continue (tick 'Input coordinates have velocities' or use New)",
+                                 (key + "restart", "input_velocities")))
+            if st["dt"] > 0.001 and not st["shake"]:
+                out.append(Issue("error", f"{label}: dt > 0.001 ps needs SHAKE", (key + "dt", key + "shake")))
+            if st["dt"] > 0.0025 and not top.get("hmr"):
+                lvl = "warning" if top.get("hmr") is None else "error"
+                out.append(Issue(lvl, f"{label}: dt = {st['dt']:g} ps needs hydrogen mass "
+                                      "repartitioning in the topology", (key + "dt",)))
+            if st["dt"] > 0.0045:
+                out.append(Issue("error", f"{label}: dt above 0.004 ps is unstable", (key + "dt",)))
+            if st["thermostat"] == "langevin" and st["gamma_ln"] <= 0:
+                out.append(Issue("error", f"{label}: Langevin needs gamma_ln > 0", (key + "gamma_ln",)))
+            if st["ensemble"] == "npt" and irest == 0 and st["tempi"] < 50:
+                out.append(Issue("warning", f"{label}: heating from {st['tempi']:g} K at constant "
+                                            "pressure can collapse the box; heat in NVT first",
+                                 (key + "ensemble",)))
+            if st["ramp"]:
+                if st["ramp_steps"] > st["nstlim"]:
+                    out.append(Issue("error", f"{label}: the ramp is longer than the stage",
+                                     (key + "ramp_steps",)))
+                # a continued run is at the previous temperature: fine when the ramp starts there (tempi), else
+                # the thermostat's target jumps at the start; when that temperature is not known, only a heating
+                # ramp is warned (a cooling ramp, tempi above temp0, starts above its target by design)
+                if irest == 1 and (st["tempi"] <= st["temp0"] if prev_temp is None
+                                   else abs(st["tempi"] - prev_temp) >= 1e-6):
+                    if prev_temp is None:
+                        out.append(Issue("warning", f"{label}: a ramp from tempi on a continued run starts "
+                                                    "below the current temperature", (key + "ramp",)))
+                    else:
+                        out.append(Issue("warning", f"{label}: the ramp starts at tempi = {st['tempi']:g} K, but "
+                                                    f"{prev_name} ended at {prev_temp:g} K", (key + "ramp",
+                                                                                              key + "tempi")))
+            if irest == 1 and not st["ramp"] and st["tempi"] not in (0.0, st["temp0"]) and st["restart"] != "new":
+                out.append(Issue("info", f"{label}: tempi is ignored when velocities are continued",
+                                 (key + "tempi",)))
+            export = self._choice(st, "export")
+            if st["ntwx"] == 0 and export == "yes":
+                # (not 'or Auto': with Auto everywhere and no production stage with frames, the last MD stage with
+                # frames would go out in its place, an annealing cycle's cooling ramp instead of its relaxation)
+                out.append(Issue("error", f"{label}: its trajectory is to be passed on ('Pass the trajectory on': "
+                                          "Yes), but it writes none (ntwx=0): set ntwx above 0, or 'Pass the "
+                                          "trajectory on' to No", (key + "ntwx", key + "export")))
+            elif st["ntwx"] == 0 and export == "auto" and st["production"]:
+                no_frames.append(k)  # warned below, with what goes out instead
+            dry = self.dry_label(st)
+            if dry:
+                problem = dry_label_problem(dry)
+                if problem:
+                    out.append(Issue("error", f"{label}: the dry label '{dry}' {problem}", (key + "dry",)))
+                if st["ntwx"] == 0:
+                    out.append(Issue("error", f"{label}: the dry label '{dry}' needs a trajectory: set "
+                                              "'Trajectory frame every (ntwx)' above 0", (key + "dry", key + "ntwx")))
+            if st["ntwx"] and st["nstlim"] % st["ntwx"]:
+                out.append(Issue("info", f"{label}: nstlim is not a multiple of ntwx", (key + "ntwx",)))
+            if not st["netcdf"] and st["ntwx"]:
+                out.append(Issue("warning", f"{label}: ASCII trajectories are large and slow; NetCDF "
+                                            "(ioutfm=1) is recommended", (key + "netcdf",)))
+            if st["ig"] not in (None, -1) and st["segments"] > 1 and st["thermostat"] == "langevin":
+                out.append(Issue("warning", f"{label}: a fixed Langevin seed repeats the same random "
+                                            "forces in every segment (use ig=-1)", (key + "ig",)))
+            if st["ensemble"] == "npt" and st["barostat"] == "mc" and st["taup"] != 1.0:
+                out.append(Issue("info", f"{label}: taup has no effect with the Monte Carlo barostat",
+                                 (key + "taup",)))
+            # a change of temperature from the previous MD stage is deliberate when the stage ramps from there
+            if temps and abs(st["temp0"] - temps[-1][2]) >= 1e-6 and not (
+                    st["ramp"] and abs(st["tempi"] - temps[-1][2]) < 1e-6):
+                jumps = True
+            temps.append((k, tags[k], st["temp0"]))
+            prev_kind = "md"
+            prev_temp, prev_name = st["temp0"], label
+            dup = _duplicated_keys(st["extra_cntrl"])
+            if dup:
+                out.append(Issue("warning", f"{label}: extra &cntrl settings override generated ones: "
+                                            f"{', '.join(dup)}", (key + "extra_cntrl",)))
+        roles = self.roles(s)
+        # a production stage without frames: say what the 'Trajectory' output carries instead (0.0.12 passed on
+        # the last MD stage with a trajectory, which it still does when every stage's 'Pass the trajectory on'
+        # is Auto)
+        asked = [j for j in roles.exported if stages[j]["production"] or self._choice(stages[j], "export") == "yes"]
+        for k in no_frames:
+            instead = ("" if asked else f": the 'Trajectory' output carries stage {tags[roles.exported[0]]} instead"
+                       if roles.exported else ": the step passes no trajectory on")
+            out.append(Issue("warning", f"stage {tags[k]}: production stage without trajectory output (ntwx=0)"
+                             + instead, (f"stages.{k}.ntwx",)))
+        # the fallback of Auto everywhere passes on an earlier stage when the last MD stages write no frames: say
+        # so (scripts are unchanged; a production stage without frames above already names it)
+        md_stages = [j for j, x in enumerate(stages) if x["kind"] == "md"]
+        if roles.exported and not asked and not no_frames and roles.exported[-1] != md_stages[-1]:
+            fell = roles.exported[-1]
+            later = [j for j in md_stages if j > fell]
+            out.append(Issue("warning", f"{_stage_list([tags[j] for j in later])} "
+                                        f"{'writes' if len(later) == 1 else 'write'} no trajectory frames "
+                                        f"(ntwx=0), so the 'Trajectory' output carries stage {tags[fell]} "
+                                        "instead: set ntwx above 0, or say with 'Pass the trajectory on' which "
+                                        "stage goes out (No on every stage: none)",
+                             tuple(f"stages.{j}.ntwx" for j in later) + (f"stages.{fell}.export",)))
+        # a stage in segments writes the runs <stage>-001 ... and, when its first segment starts differently (new
+        # velocities, a ramp), the input <stage>-cont.in: a stage of that very name would write the same files
+        for k, st in enumerate(stages):
+            nseg = st["segments"] if st["kind"] == "md" else 1
+            if nseg < 2 or tags.count(tags[k]) > 1:
+                continue
+            parts = [(f"{tags[k]}-{seg:03d}", f"segment {seg}", False) for seg in range(1, nseg + 1)]
+            if modes[k][0] == 0 or st["ramp"]:
+                parts.append((f"{tags[k]}-cont", f"its input for segments 2-{nseg}", True))
+            for tag, what, is_input in parts:
+                for j, other in enumerate(stages):
+                    # (the other stage's runs carry its own name only when it is not split itself; its input does)
+                    one_run = other["kind"] != "md" or other["segments"] < 2
+                    if tags[j] == tag and (is_input or one_run):
+                        out.append(Issue("error", f"stages {tags[k]} ({what}) and {tag} would write the same files "
+                                                  f"({ctx.project}_{ctx.step:02d}_{tag}_…): rename one of them",
+                                         (f"stages.{k}.name", f"stages.{j}.name")))
+        files: Dict[str, List[str]] = {}  # dry trajectory file tag -> the labels that write it
+        for dry in roles.dry:  # (a label the check refuses is none)
+            files.setdefault(sanitize_tag(f"dry-{dry}"), []).append(dry)
+        # the stages' own trajectories (per run): a dry copy must not take one's name (a stage named dry-relax)
+        raw = {r["rtag"]: r for r in self._segments(s, ctx) if r["nc"]}
+        for ftag, labels in files.items():
+            ks = [k for dry in labels for k in roles.dry[dry]]
+            if len(labels) > 1:
+                out.append(Issue("error", f"the dry labels {', '.join(repr(d) for d in labels)} would write the "
+                                          f"same file ({ctx.name(ftag, 'nc')}); give them one label or "
+                                          "distinct ones", tuple(f"stages.{k}.dry" for k in ks)))
+            if ftag in raw:
+                r = raw[ftag]
+                what = ("the dry production trajectory" if labels == [DRY_PROD] else
+                        f"the dry label{'s' * (len(labels) > 1)} {', '.join(repr(d) for d in labels)}")
+                seg = f" (segment {r['seg']})" if r["nseg"] > 1 else ""
+                out.append(Issue("error", f"{what} would write {ctx.name(ftag, 'nc')}, the trajectory of stage "
+                                          f"{tags[r['index']]}{seg}: rename one of them",
+                                 tuple(f"stages.{k}.dry" for k in ks) + (f"stages.{r['index']}.name",)
+                                 + (("dry_traj",) if DRY_PROD in labels and s["dry_traj"] else ())))
+        # the separate script runs its stages one after the other, each from the previous one's restart: a stage
+        # of the main script between two of them would make the later one wait for the main script, which runs
+        # the stages after the separate ones only once the separate script has finished
+        seps = [k for k, x in enumerate(roles.separate) if x]
+        between = [k for k in range(seps[0], seps[-1] + 1) if not roles.separate[k]] if seps else []
+        if between:
+            one = len(between) == 1
+            later = next(k for k in seps if k > between[0])
+            if all(stages[k]["kind"] == "min" for k in between):
+                fix = (f"move {'it' if one else 'them'} before or after the separately run stages (a minimisation "
+                       "always runs in the main script)")
+            else:
+                fix = (f"set 'Run in the separate script' to Yes for {'it' if one else 'them'}, or move "
+                       f"{'it' if one else 'them'} before or after the separately run stages" +
+                       (" (a minimisation always runs in the main script)"
+                        if any(stages[k]["kind"] == "min" for k in between) else ""))
+            out.append(Issue("error", f"{_stage_list([tags[k] for k in between])} {'runs' if one else 'run'} in the "
+                                      "main script between stages of the separate script: stage "
+                                      f"{tags[later]} would start from a restart that the main script writes only "
+                                      f"once the separate script has finished, so neither could finish; {fix}",
+                             tuple(f"stages.{k}.{'kind' if stages[k]['kind'] == 'min' else 'separate'}"
+                                   for k in between)))
+        if jumps:  # changes of temperature through ramps from the previous stage's are deliberate
+            listing = ", ".join(f"{n} {t:g} K" for _k, n, t in temps)
+            out.append(Issue("warning", f"MD stages use different temperatures ({listing})",
+                             tuple(f"stages.{k}.temp0" for k, _n, _t in temps)))
+        if s["engine"] == "pmemd.MPI" and "{n}" not in s["mpi_launcher"] and str(s["nproc"]) not in s["mpi_launcher"]:
+            out.append(Issue("warning", "the MPI launcher does not contain {n}; the process count is not "
+                                        "passed", ("mpi_launcher",)))
+        if s["engine"] == "pmemd" and any(st["kind"] == "md" and st["nstlim"] * st["dt"] > 10_000
+                                          for st in stages):
+            out.append(Issue("info", "single-core pmemd is slow for long runs; consider pmemd.cuda or "
+                                     "pmemd.MPI", ("engine",)))
+        if s["separate_production"] and not roles.split:
+            if not any(st.get("production") for st in stages if st["kind"] == "md"):
+                out.append(Issue("info", "no stage is marked as production; everything runs in one script",
+                                 ("separate_production",)))
+            else:
+                out.append(Issue("info", "every production stage runs in the main script ('Run in the separate "
+                                         "script': No); everything runs in one script", ("separate_production",)))
+        if not env_has_amber(s):
+            out.append(Issue("info", "no environment setup: pmemd and cpptraj must be on PATH when the "
+                                     "script runs", ("env_setup",)))
+        return out
+
+    def describe(self, s):
+        names = [self.stage_tag(st, k) for k, st in enumerate(s.get("stages", []))]
+        return f"{s.get('engine')}: " + " → ".join(names)
+
+    def output_values(self, s, ctx):
+        runs = self._segments(s, ctx)
+        out: Dict[str, PortValue] = {}
+        top = ctx.value("topology")
+        if top is not None and top.paths:
+            out["topology"] = PortValue(list(top.paths), "parm7", dict(top.data))
+        if runs:
+            last = runs[-1]["stage"]
+            data = {"velocities": last["kind"] == "md"}
+            if last["kind"] == "md":  # the temperature it ends at (a ramp ends at temp0): continued runs start there
+                data["temp0"] = last["temp0"]
+            out["restart"] = PortValue([ctx.own(runs[-1]["rtag"], "rst7")], "rst7", data)
+        roles = self.roles(s)
+        tags = [self.stage_tag(st, k) for k, st in enumerate(s["stages"])]
+        if roles.exported:
+            out["trajectory"] = PortValue([ctx.from_own(r["nc"]) for r in runs if r["index"] in roles.exported],
+                                          "nc", {"stages": [tags[k] for k in roles.exported]})
+        if s["dry_pdb"] and roles.main:
+            out["dry_pdb"] = PortValue([ctx.own("dry", "pdb")], "pdb")
+        if roles.dry:
+            out["dry_topology"] = PortValue([ctx.own("dry", "parm7")], "parm7", {"box": False})
+        if DRY_PROD in roles.dry:
+            out["dry_trajectory"] = PortValue([ctx.own("dry-prod", "nc")], "nc",
+                                              {"stages": [tags[k] for k in roles.dry[DRY_PROD]]})
+        for label, members in roles.dry.items():
+            if label != DRY_PROD:
+                out[f"dry_{label}"] = PortValue([ctx.own(f"dry-{label}", "nc")], "nc",
+                                                {"stages": [tags[k] for k in members], "label": label})
+        for k in roles.dry_pdbs:
+            out[f"dry_pdb_{tags[k]}"] = PortValue([ctx.own(f"dry-{tags[k]}", "pdb")], "pdb", {"stage": tags[k]})
+        return out
+
+    # ------------------------------------------------------------- files
+    def mdin(self, st: Dict[str, Any], irest: int, ntx: int, disang: str, solute_mask: str) -> str:
+        cntrl: List[str] = []
+        if st["kind"] == "min":
+            cntrl.append(f"imin=1, maxcyc={st['maxcyc']}, ncyc={st['ncyc']},")
+            cntrl.append(f"ntmin={st['ntmin']},")
+            cntrl.append(f"ntb=1, ntp=0, cut={fortran_float(st['cut'])},")
+            cntrl.append("ntc=1, ntf=1,")
+        else:
+            cntrl.append(f"imin=0, irest={irest}, ntx={ntx},")
+            cntrl.append(f"nstlim={st['nstlim']}, dt={fortran_float(st['dt'])},")
+            if st["shake"]:
+                tol = f", tol={fortran_float(st['tol'])}" if st["tol"] is not None else ""
+                cntrl.append(f"ntc=2, ntf=2{tol},")
+            else:
+                cntrl.append("ntc=1, ntf=1,")
+            if st["ensemble"] == "npt":
+                baro = f", barostat=2, mcbarint={st['mcbarint']}" if st["barostat"] == "mc" else ""
+                taup = f", taup={fortran_float(st['taup'])}" if st["barostat"] == "berendsen" else ""
+                wrap = ", iwrap=1" if st["iwrap"] else ""
+                cntrl.append(f"ntb=2, ntp={st['ntp']}{baro}, pres0={fortran_float(st['pres0'])}{taup}, "
+                             f"cut={fortran_float(st['cut'])}{wrap},")
+            else:
+                wrap = ", iwrap=1" if st["iwrap"] else ""
+                cntrl.append(f"ntb=1, ntp=0, cut={fortran_float(st['cut'])}{wrap},")
+            thermo = {"langevin": f"ntt=3, gamma_ln={fortran_float(st['gamma_ln'])}",
+                      "berendsen": f"ntt=1, tautp={fortran_float(st['tautp'])}",
+                      "andersen": f"ntt=2, vrand={st['vrand']}"}[st["thermostat"]]
+            tempi = f", tempi={fortran_float(st['tempi'])}" if irest == 0 else ""
+            temp0 = st["tempi"] if st["ramp"] else st["temp0"]
+            seed = f", ig={st['ig']}" if st["ig"] is not None else ""
+            cntrl.append(f"{thermo}{tempi}, temp0={fortran_float(temp0)}{seed},")
+        if st["posres"]:
+            mask = (st["posres_mask"] or "").strip() or solute_mask
+            cntrl.append(f"ntr=1, restraint_wt={fortran_float(st['posres_wt'])},")
+            cntrl.append(f"restraintmask='{mask}',")
+        else:
+            cntrl.append("ntr=0,")
+        nmr = st["distres"] or (st["kind"] == "md" and st["ramp"])
+        if nmr:
+            cntrl.append("nmropt=1,")
+        if st["kind"] == "min":
+            cntrl.append(f"ntpr={st['ntpr']},")
+        else:
+            cntrl.append(f"ntpr={st['ntpr']}, ntwx={st['ntwx']}, ntwr={st['ntwr']},")
+            if st["netcdf"]:
+                cntrl.append("ioutfm=1,")
+        for line in extra_lines(st["extra_cntrl"]):
+            line = line.strip()
+            cntrl.append(line if line.endswith(",") else line + ",")
+        lines = [st["title"] or st["name"] or "stage", "&cntrl"] + [f"  {c}" for c in cntrl] + ["/"]
+        lines += extra_lines(st["extra_namelists"])
+        if nmr:
+            if st["kind"] == "md" and st["ramp"]:
+                n1 = st["ramp_steps"]
+                lines.append(f"&wt type='TEMP0', istep1=0, istep2={n1}, value1={fortran_float(st['tempi'])}, "
+                             f"value2={fortran_float(st['temp0'])} /")
+                if n1 < st["nstlim"]:
+                    lines.append(f"&wt type='TEMP0', istep1={n1 + 1}, istep2={st['nstlim']}, "
+                                 f"value1={fortran_float(st['temp0'])}, value2={fortran_float(st['temp0'])} /")
+            lines.append("&wt type='END' /")
+            if st["distres"]:
+                lines.append(f"DISANG={disang}")
+                if st["listout"]:
+                    lines.append("LISTOUT=POUT")
+        return "\n".join(lines) + "\n"
+
+    def resources(self, s):
+        stages = [st for st in s.get("stages", []) if st.get("kind") == "md"]
+        dry = s.get("dry_pdb") or s.get("dry_traj") or any(self.dry_label(st) or st.get("dry_pdb") for st in stages)
+        return ["ambertools", "pmemd"] + (["cpptraj"] if dry else [])
+
+    def programs(self, s):
+        out = []
+        if s["engine"] == "pmemd.MPI":
+            launcher = s["mpi_launcher"].replace("{n}", str(s["nproc"])).split()
+            if launcher:
+                out.append((launcher[0], r"(^|[\s;(&|])\$PMEMD\s"))
+        return out + [(s["engine"], r"(^|[\s;(&|])\$PMEMD\s"), ("pmemd", r"(^|[\s;(&|])pmemd\s+-O\b"),
+                      ("cpptraj", r"(^|[\s;(&|])cpptraj\b")]
+
+    # cluster job scripts (mdatk.workflows.cluster): the input whose file gives the system's atoms
+    cluster_atoms_port = "topology"
+
+    def cluster_work(self, s, separate_only: bool):
+        """What a cluster job of the step runs, for its wall time: the MD stages as (ns, time step in ps), and the
+        number of minimisations; None when MDATK cannot estimate it (an engine other than pmemd.cuda)."""
+        if not str(s.get("engine", "")).startswith("pmemd.cuda"):
+            return None
+        separate = self.roles(s).separate
+        md, minimisations = [], 0
+        for k, st in enumerate(s.get("stages", [])):
+            if separate_only and not separate[k]:
+                continue
+            if st.get("kind") == "min":
+                minimisations += 1
+                continue
+            dt = float(st.get("dt") or 0.002)
+            md.append((st.get("nstlim", 0) * max(1, int(st.get("segments") or 1)) * dt / 1000.0, dt))
+        return md, minimisations
+
+    def cluster_outputs(self, s, ctx) -> List[str]:
+        """The .out files (in the step folder) of the MD runs of its separate script: in a cluster job these ran on
+        the cluster, and their speeds are learnt for its profile."""
+        separate = self.roles(s).separate
+        return [r["out"] for r in self._segments(s, ctx) if separate[r["index"]] and r["stage"]["kind"] == "md"]
+
+    def run_resources(self, s):
+        # pmemd.cuda: one GPU (its GPU option names it) and the core that drives it; pmemd.MPI: its MPI
+        # processes; pmemd: one core
+        if s["engine"] == "pmemd.MPI":
+            return Resources(int(s["nproc"]))
+        if s["engine"] == "pmemd.cuda":
+            return gpu_step(1, 1, s, gpu_ids(s["gpu"]))
+        return Resources()
+
+    def _separate_done(self, s, ctx, runs, roles: StageRoles) -> List[str]:
+        """Shell tests that succeed once the separate script has finished: its stages, then the dry copies it
+        makes, in its order (the dry production trajectory last)."""
+        tags = [self.stage_tag(st, k) for k, st in enumerate(s["stages"])]
+        tests = [f"finished {r['out']}" for r in runs if roles.separate[r["index"]]]
+        for k in sorted({r["index"] for r in runs if roles.separate[r["index"]]}):
+            for label, members in roles.dry.items():
+                if label != DRY_PROD and members[-1] == k:
+                    tests.append(f"[ -s {ctx.name(f'dry-{label}', 'nc')} ]")
+            if k in roles.dry_pdbs:
+                tests.append(f"[ -s {ctx.name(f'dry-{tags[k]}', 'pdb')} ]")
+        prod = roles.dry.get(DRY_PROD)
+        if prod and roles.separate[prod[-1]]:
+            tests.append(f'[ -s {ctx.name("dry-prod", "nc")} ]')
+        return tests
+
+    def finish_marks(self, s, ctx):
+        return [(ctx.own(r["rtag"], "out"), FINISHED_PATTERN) for r in self._segments(s, ctx)]
+
+    def generate(self, s, ctx):
+        files: List[GeneratedFile] = []
+        runs = self._segments(s, ctx)
+        modes = self._restart_modes(s, ctx)
+        disang = ctx.inp("restraints")
+        solute = self._solute_mask(ctx)
+        # (the coordinates as a word of the pmemd command lines: a file chosen by hand may have spaces in its path)
+        top, crd = ctx.inp("topology"), shell_quote(ctx.inp("coordinates"))
+        # one mdin per stage (plus one for the first segment when its restart mode differs)
+        mdin_of: Dict[Tuple[int, int], str] = {}
+        for k, st in enumerate(s["stages"]):
+            irest, ntx = modes[k]
+            tag = self.stage_tag(st, k)
+            name = ctx.name(tag, "in")
+            files.append(GeneratedFile(name, self.mdin(st, irest, ntx, disang, solute), "input",
+                                       f"pmemd input of stage {tag}"))
+            nseg = st["segments"] if st["kind"] == "md" else 1
+            for seg in range(1, nseg + 1):
+                mdin_of[(k, seg)] = name
+            if nseg > 1 and (irest == 0 or st["ramp"]):
+                # segments 2-N continue the first one: its velocities, and after its ramp (which the check keeps
+                # within a segment's nstlim) at temp0 - never through the TEMP0 schedule again
+                cont = ctx.name(f"{tag}-cont", "in")
+                files.append(GeneratedFile(cont, self.mdin(dict(st, ramp=False), 1, 5, disang, solute), "input",
+                                           f"pmemd input of stage {tag}, segments 2-{nseg}"))
+                for seg in range(2, nseg + 1):
+                    mdin_of[(k, seg)] = cont
+        engine = s["engine"]
+        if engine == "pmemd.MPI":
+            launcher = s["mpi_launcher"].replace("{n}", str(s["nproc"])).strip()
+            pmemd = f"{launcher} pmemd.MPI".strip()
+        else:
+            pmemd = engine
+        min_pmemd = "pmemd" if s["min_engine"] == "pmemd" else "$PMEMD"
+        roles = self.roles(s)
+        sep = roles.separate
+        prod_split = roles.split  # some stage runs in the separate script
+        tags = [self.stage_tag(st, k) for k, st in enumerate(s["stages"])]
+
+        def preamble(title, script, separate=False):
+            lines = script_header(title, ctx, s, script, [
+                f"Amber {s['amber_version']}; engine {engine}."], separate=separate)
+            if engine == "pmemd.cuda" and s["gpu"].strip():
+                lines += [f"export CUDA_VISIBLE_DEVICES={s['gpu'].strip()}", ""]
+            lines += [f'PMEMD="{pmemd}"', f'TOP="{top}"', ""]
+            if s["resume"]:
+                lines += FINISHED_FN
+            return lines
+
+        main_name = ctx.name(self.tag, "sh")
+        prod_name = ctx.name("amber-prod", "sh")
+        what = ("the production stages" if all(st["production"] for k, st in enumerate(s["stages"]) if sep[k])
+                else "the separately run stages")
+        main = preamble("Amber MD stages", main_name)
+        prod = preamble("Amber production" if what == "the production stages" else "Amber MD stages run separately",
+                        prod_name, separate=True) if prod_split else main
+        flag = waiting_file(main_name) if prod_split and s["waiting_exit"] == "file" else ""
+        waiting: List[str] = []
+        # split production: the main script's stages before it (production starts from them) and after it
+        before: List[str] = []
+        after: List[str] = []
+        if prod_split:  # the main script must not report success while production has not run
+            head, waiting = separate_check(prod_name, self._separate_done(s, ctx, runs, roles), what, flag)
+            main += ([] if s["resume"] else FINISHED_FN) + head
+        strip_mask = re.sub(r"[ ]+", "", s["strip_mask"])
+        dry_mask = re.sub(r"[ ]+", "", s["dry_mask"])
+        parm_written = set()  # the scripts whose first dry trajectory writes the dry topology (parmout)
+
+        def made(path: str) -> List[str]:
+            """The lines after cpptraj wrote ``path`` + PART_EXT: renamed once complete, so a copy cut off never
+            carries the name the checks look for (the waiting check, a held copy's, 'Check previous runs')."""
+            return [require_file(path + PART_EXT, "cpptraj"), f"mv -f {path}{PART_EXT} {path}", ""]
+
+        def dry_copies(k: int, script: str) -> List[Tuple[str, List[str], List[str]]]:
+            """(file, the output files of the runs it is made from, cpptraj lines) of the dry copies made right
+            after stage ``k``: the dry trajectories whose last stage it is (the dry production trajectory comes
+            at the end) and its dry PDB."""
+            out = []
+            for label, members in roles.dry.items():
+                if label == DRY_PROD or members[-1] != k:
+                    continue
+                nc = ctx.name(f"dry-{label}", "nc")
+                parm = script not in parm_written
+                parm_written.add(script)
+                made_from = [r for r in runs if r["index"] in members]
+                lines = [f"# Dry, imaged copy of the trajectory of {_stage_list([tags[m] for m in members])} "
+                         f"(dry label {label})" + (" and the dry topology" if parm else ""),
+                         "cpptraj << EOF", 'parm "$TOP"', *[f"trajin {r['nc']}" for r in made_from], "autoimage",
+                         f"strip {dry_mask}" + (f" parmout {ctx.name('dry', 'parm7')}" if parm else ""),
+                         f"trajout {nc}{PART_EXT} netcdf", "run", "EOF"] + made(nc)
+                out.append((nc, [r["out"] for r in made_from], lines))
+            if k in roles.dry_pdbs:
+                last = [r for r in runs if r["index"] == k][-1]
+                pdb = ctx.name(f"dry-{tags[k]}", "pdb")
+                lines = [f"# Strip a dry PDB of the last frame of {tags[k]} for visual checks",
+                         "cpptraj << EOF", 'parm "$TOP"', f"trajin {last['rst']}", f"strip {strip_mask}",
+                         f"trajout {pdb}{PART_EXT} pdb", "run", "EOF"] + made(pdb)
+                out.append((pdb, [last["out"]], lines))
+            return out
+
+        # the dry copies of the stages before the separate script come after them, outside the part that is
+        # not run again once it has finished: made when one of those stages' pmemd runs ran (not when it was
+        # skipped as finished), and when missing (asked for later) or older than the output of one of its runs
+        # (one that ran again in an interrupted run)
+        held: List[Tuple[str, List[str], List[str]]] = []
+        first_sep = next((k for k, x in enumerate(sep) if x), len(sep))
+        prod_group = roles.dry.get(DRY_PROD)
+        prod_held = bool(prod_split and prod_group and prod_group[-1] < first_sep)
+        mark_runs = prod_split and any(k < first_sep for k in [m[-1] for m in roles.dry.values()] + roles.dry_pdbs)
+        prev_rst = crd
+        seen_prod = False
+        for r in runs:
+            st = r["stage"]
+            if prod_split and sep[r["index"]]:
+                target, seen_prod = prod, True
+            else:
+                target = (after if seen_prod else before) if prod_split else main
+            ref = crd if s["restraint_ref"] == "initial" else prev_rst
+            exe = min_pmemd if st["kind"] == "min" else "$PMEMD"
+            seg = f" (segment {r['seg']}/{r['nseg']})" if r["nseg"] > 1 else ""
+            cmd = (f'{exe} -O -i {mdin_of[(r["index"], r["seg"])]} -p "$TOP" -c {prev_rst} -ref {ref} '
+                   f'-o {r["out"]} -r {r["rst"]}' + (f" -x {r['nc']}" if r["nc"] else "") +
+                   f' -inf {r["inf"]}')
+            target.append(f"# {r['rtag']}{seg}: {st['title'] or st['name']}")
+            ran = [f"{STAGES_RAN}=1"] if mark_runs and target is before else []
+            if s["resume"]:
+                target += [f"if finished {r['out']}; then",
+                           f'  echo "{r["rtag"]}: already finished - skipping"',
+                           "else", f"  {cmd}", *[f"  {x}" for x in ran], "fi"]
+            else:
+                target += [cmd, *ran]
+            target += [require_file(r["rst"], f"pmemd ({r['rtag']})"), ""]
+            prev_rst = r["rst"]
+            if r["seg"] == r["nseg"]:  # after the stage's last segment: its dry copies, in its script part
+                in_sep = prod_split and sep[r["index"]]
+                copies = dry_copies(r["index"], "separate" if in_sep else "main")
+                if prod_split and not in_sep and not seen_prod:
+                    held += copies
+                else:
+                    target += [line for _f, _outs, lines in copies for line in lines]
+        prod_lines = (["# Dry, imaged copy of the production trajectory (and its topology)", "cpptraj << EOF",
+                       'parm "$TOP"'] + [f"trajin {r['nc']}" for r in runs if r["index"] in prod_group]
+                      + ["autoimage", f"strip {dry_mask} parmout {ctx.name('dry', 'parm7')}"]) if prod_group else []
+        if prod_held:  # its stages run before the separate script: made with their other dry copies
+            dry_prod = ctx.name("dry-prod", "nc")
+            held.append((dry_prod, [r["out"] for r in runs if r["index"] in prod_group],
+                         prod_lines + [f"trajout {dry_prod}{PART_EXT} netcdf", "run", "EOF"] + made(dry_prod)))
+        if prod_split:  # before production; then wait for it; then the stages that continue from it
+            main += skip_when_done(before, what)
+            if held:
+                main += OUT_OF_DATE_FN
+            for path, outs, lines in held:
+                main += [f'if [ -n "${{{STAGES_RAN}:-}}" ] || dry_out_of_date {path} {" ".join(outs)}; then']
+                main += lines[:-1] + ["fi", ""]
+            if after:
+                main += waiting + after
+                waiting = []
+        main_runs = [r for r in runs if not (prod_split and sep[r["index"]])]
+        if main_runs and s["dry_pdb"]:
+            dry = ctx.name("dry", "pdb")
+            main += [f"# Strip a dry PDB of {main_runs[-1]['rtag']} for visual checks",
+                     "cpptraj << EOF", 'parm "$TOP"', f"trajin {main_runs[-1]['rst']}",
+                     f"strip {strip_mask}", f"trajout {dry} pdb", "run",
+                     "EOF", require_file(dry, "cpptraj"), ""]
+        if prod_group and not prod_held:  # where it always was (as written before): at the end of the script
+            # that runs its last stage
+            last = prod if prod_split and sep[prod_group[-1]] else main
+            last += prod_lines + [f"trajout {ctx.name('dry-prod', 'nc')} netcdf", "run", "EOF",
+                                  require_file(ctx.name("dry-prod", "nc"), "cpptraj"), ""]
+        main += waiting + waiting_done(flag)
+        files.append(GeneratedFile(main_name, "\n".join(main), "run", "runs the MD stages"))
+        if prod_split:
+            files.append(GeneratedFile(prod_name, "\n".join(prod), "run-separate",
+                                       f"runs {what}"))
+        return files
+
+
+def env_has_amber(s: Dict[str, Any]) -> bool:
+    return bool(s.get("conda_env", "").strip() or s.get("env_setup", "").strip())
+
+
+def _stage_list(names: List[str]) -> str:
+    """'stage relax1', 'stages heat1, hold1'."""
+    return ("stage " if len(names) == 1 else "stages ") + ", ".join(names)
+
+
+def _duplicated_keys(extra: str) -> List[str]:
+    generated = {"imin", "irest", "ntx", "nstlim", "dt", "ntc", "ntf", "tol", "ntb", "ntp", "pres0",
+                 "taup", "barostat", "mcbarint", "cut", "ntt", "gamma_ln", "tautp", "vrand", "tempi",
+                 "temp0", "ig", "ntr", "restraint_wt", "restraintmask", "nmropt", "ntpr", "ntwx", "ntwr",
+                 "ioutfm", "iwrap", "maxcyc", "ncyc", "ntmin"}
+    keys = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*=", extra or "")
+    return sorted({k for k in keys if k.lower() in generated})

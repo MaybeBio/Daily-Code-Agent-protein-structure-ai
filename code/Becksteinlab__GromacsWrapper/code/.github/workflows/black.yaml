@@ -1,0 +1,24 @@
+name: Lint (black)
+
+# Style checks (replaces the retired pytest-pep8 plugin; see #313).
+# Black is the project's code-formatting standard.
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - "main"
+
+concurrency:
+  group: "black-${{ github.ref }}-${{ github.head_ref }}"
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check code formatting with black
+        uses: psf/black@stable

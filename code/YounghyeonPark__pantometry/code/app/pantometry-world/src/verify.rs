@@ -1,0 +1,2279 @@
+//! The `verify` verb: the measurements a passing audit does not make.
+//!
+//! Every entry in this battery exists because of an error this workspace actually shipped and
+//! the audit passed. A 10 ms coupling window delivered exactly the right joules and read a peak
+//! temperature 12% low; a wall-weighting defect sat inside a 1.4% error that looked like
+//! discretisation until refinement *halved* it instead of quartering it; and a run that
+//! reproduces bit for bit is a claim no other tool can check because no other stack is
+//! deterministic. None of those is visible in one run — which is the point of this module: it
+//! runs the scene **again**, differently, and reports what moved.
+//!
+//! What it measures:
+//!
+//! - **Margins, not verdicts.** All **three** of `advance`'s refusals against their tolerances,
+//!   and each evolving domain's stability limit against the coupling window. A pass with no
+//!   margin left is a different fact from a pass.
+//!
+//!   Two of the three were unmeasurable from here until the kernel reported them, and this
+//!   module's own documentation said so: the transfer audit reads the bus before it is drained,
+//!   and the per-domain books check snapshots one domain's ledger across its own turn. Both are
+//!   gone by the time `advance` returns. `Report::transfer` and `Report::books` carry them out.
+//! - **Determinism.** The same scene run twice must produce byte-identical frames. A digest
+//!   over the run is printed so "this reproduces" is checkable rather than claimed.
+//! - **Window sensitivity.** The scene rerun with the coupling window halved. What moves is
+//!   the error the window was hiding — the one error class no conservation check can see,
+//!   because a ledger has no representation for *when*.
+//! - **Resolution sensitivity.** The scene rerun with every discretised domain refined 2×.
+//!   What moves is discretisation error, measured rather than assumed.
+//! - **Rasterisation loss.** What each designed part cost the grid it was rasterised onto, and
+//!   a finding for the ones the grid could not hold. This is the only entry that needs no
+//!   second run, and the only one whose subject has no symptom at all: a rib finer than the
+//!   cell does not fail, it disappears. `--check` has printed the measurement since parts
+//!   existed; a printed number is one somebody has to read, and this is the pass that reads it.
+//!
+//! `--deep` adds a third run to each sweep (window quartered, resolution 4×) and measures the
+//! **order**: `p = log2(d1/d2)` where `d1` and `d2` are successive differences of the same
+//! reading. A first-order coupling error reads `p ≈ 1`; a healthy second-order scheme reads
+//! `p ≈ 2`; a second-order scheme with a first-order boundary reads between, falling toward 1
+//! as the grid refines — which is exactly the signature that found both acoustic boundary
+//! defects.
+//!
+//! # What the measured order actually is
+//!
+//! The order of the **reading**, sampling included — not of the scheme in the abstract. A peak
+//! read at a cell centre moves with the cell, geometry quantised to a grid (a hall's ceiling, a
+//! basket's radius) shifts by a fraction of a cell between resolutions, and both contaminate
+//! the measurement toward first order. That is not a defect of the battery: the reading is what
+//! a person believes, so its convergence is the one that matters. A contaminated order is a
+//! true statement about the number being read.
+//!
+//! The **window** orders carry one more contaminant: a multirate domain's substep count is a
+//! ceiling, so its inner step moves non-smoothly as the window halves, and a subcycled
+//! domain's window order can read as almost anything small (a bar's peak measured 0.331 from
+//! the ceiling alone). A window order means what it says for the quantities the *window*
+//! governs — a coupling taken per frame, a feedback closed between frames — and the report
+//! prints a reminder above those lines rather than leaving this paragraph to be found later.
+//!
+//! # What is refused rather than measured
+//!
+//! A refinement must state the **same physical problem** on a finer grid, and two things in this
+//! format cannot: a [`HotSpot`](crate::HotSpot) is one cell, so refining halves its physical size
+//! and divides its energy by eight, and a channelled [`DomainSpec::Puck`]'s ring is one cell wide
+//! by construction. Refining either would compare two different problems and call the difference
+//! discretisation error, so the sweep is skipped and the report says which domain and why —
+//! loudly, because a check that silently skipped is this workspace's oldest failure shape.
+//!
+//! **It was three, and a [`DomainSpec::Conductor`]'s blocked cells did not belong.** A blocked
+//! cell is a **box**: each becomes its eight children, and the notch keeps its millimetres. What
+//! the refusal cost was the measurement — `17-a-busbar-with-a-notch` turns out to be 4.65% above
+//! the answer its shape has, converging at `h^(4/3)` because a re-entrant corner sets the rate.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::{CoolingSpec, DissipationSpec, DomainSpec, OnDisk, Parts, Rasterised, Scene, World};
+use pantometry::core::{Margin, Reading};
+use pantometry::prelude::*;
+
+/// FNV-1a over the run's JSON, which is every panel, body and reading of every frame.
+///
+/// A digest and not a checksum-grade hash: its job is to make "these two runs are identical"
+/// and "this run reproduced on another machine" checkable at a glance, not to resist an
+/// adversary. Written out here in five lines rather than taken from a crate, because the
+/// library's dependency count is a promise and this is not worth a dependency.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// One instrumented run: what [`World::run`] does, with the margins recorded.
+#[derive(Debug)]
+pub struct Measured {
+    /// The final frame's readings — the scalars each domain chose to report, which are the
+    /// observables the sweeps compare.
+    pub readings: Vec<Reading>,
+    /// Which of those `(domain, label)` pairs the domains themselves called statements about the
+    /// solve rather than about the world. Collected here because a sweep compares two `Measured`
+    /// after both worlds are gone. See [`diagnostics_of`].
+    pub diagnostic: BTreeSet<(String, String)>,
+    /// The range every reading of one unit covered in one domain over the whole run, keyed by
+    /// `(domain, unit)`.
+    ///
+    /// **The denominator a sensitivity belongs over.** A sweep asks "did the answer move", and
+    /// dividing that by the reading's own magnitude answers a different question — for a
+    /// temperature the magnitude is dominated by 273.15, so halving the window on
+    /// `15-a-hot-spot-in-a-block` moved the peak by 0.579 K and reported **0.212%** while the
+    /// run's whole rise was 7.03 K. The shift was 8.2% of everything that happened and read as
+    /// converged. Measured against the true answer, that scene is 14% out at its shipped frame
+    /// count.
+    pub span: BTreeMap<(String, &'static str), f64>,
+    /// How far past its own yield strain each structure was driven, as `(domain, ratio, element)`.
+    ///
+    /// **One is a physical boundary, not a chosen threshold.** `pantometry-elastic` has no
+    /// plasticity and says so: past yield it "returns a displacement that is arithmetically
+    /// correct and physically meaningless, and nothing in the answer says which". This is what
+    /// says which.
+    pub past_yield: Vec<(String, f64, [usize; 3])>,
+    /// How far short of its own steady state each thermal block stopped, as `(domain, kelvin,
+    /// the range its readings covered)`.
+    ///
+    /// **"Did it arrive" was a judgement and this makes it a measurement.** A design answer is a
+    /// steady-state answer, and the only way to know a run had reached one was to look at the last
+    /// two frames and decide. `Solid3D::steady_state` solves the balance the march converges to —
+    /// the same operator, not a second one — so the distance between them is a number.
+    ///
+    /// Empty for a domain that has no steady state to be short of: one that melts, or one with
+    /// heat coming in and nowhere for it to go.
+    pub arrival: Vec<(String, f64, f64)>,
+    /// Each **connected body** in the last frame, as `(domain, cells, peak - coldest)`.
+    ///
+    /// **Per body, not per domain, and that distinction is load-bearing.** A domain's `peak` and
+    /// `coldest` are the extremes of everything in it, so two separate objects at different
+    /// temperatures read as a large spread and a flat field reads as a small one — and the two
+    /// are indistinguishable from the readings. `30-two-phases-crossing-at-a-clearance` states two
+    /// busbars, each of which is a lump; written as two domains the flatness measurement names
+    /// them, and merging them into one block to give them a radiative path would have made it stop
+    /// firing without either bar gaining a field.
+    ///
+    /// Six-connected over the cells a field panel reports as finite, which is what void is not.
+    pub bodies: Vec<(String, usize, f64)>,
+    /// FNV-1a digest over the frames' JSON. Two runs of one scene must agree on this exactly,
+    /// on every platform, at every optimisation level.
+    pub digest: u64,
+    /// Per conserved quantity: the worst relative drift any single `advance` showed, and the
+    /// tolerance it was judged against — measured with the **whole-simulation** audit's own
+    /// scale rule, so these margins are against that check exactly.
+    ///
+    /// That is one of `advance`'s three refusal points, not all of them. The bus transfer
+    /// audit has its own absolute tolerance, and a `books_balance` domain is additionally
+    /// checked on its own scale — a small domain can sit an ulp from *that* refusal while
+    /// these rows read comfortable, which is the very blindness that made the per-domain
+    /// Both are measured now, by the kernel — see [`pantometry::core::Report::transfer`] and
+    /// [`pantometry::core::Report::books`], and the two rows the report prints beneath this one.
+    pub drift: Vec<(String, f64, f64)>,
+    /// Quantities that were on a ledger and **never rose above the audit's scale floor**, so no
+    /// step ever audited them. The audit's own rule — two denormals are equal for every purpose
+    /// a simulation has — and the right rule; but a margins table that simply omitted the row
+    /// would read as "every quantity has margin", which is the shape of a check that turned
+    /// itself off. A flat orbit's `momentum_z` is the live example.
+    pub unaudited: Vec<String>,
+    /// Ledger arithmetic that stopped being arithmetic: a non-finite total or drift. The audit
+    /// could not see these until it refused a total that is not finite — `NaN > tol` is false —
+    /// and for that time this battery saw all but one shape of them: a quantity NaN at both ends
+    /// with nothing finite beside it was dropped by `f64::max` into a scale of zero and listed as
+    /// unaudited instead. It still
+    /// checks, because a mirror of the audit's arithmetic is the wrong place to assume the
+    /// original is right. Each entry becomes a finding.
+    pub anomalies: Vec<String>,
+    /// Per evolving domain: the smallest stability limit it reported at any frame boundary, in
+    /// seconds, and the largest substep count one advance asked of it.
+    pub stability: Vec<(String, f64, u32)>,
+    /// The closest `advance`'s **other two** refusals came, over the run.
+    ///
+    /// These used to be the hole this struct's own documentation named: the whole-simulation
+    /// audit can be redone from outside `advance`, and the transfer audit and the per-domain
+    /// books check cannot — the first reads the bus before it is drained, the second snapshots
+    /// one domain's ledger across its own turn. Both are gone by the time `advance` returns, so
+    /// the kernel reports them and this keeps the worst.
+    ///
+    /// `.0` is the transfer audit, an absolute amount left on a channel. `.1` is the books check,
+    /// a ratio on the domain's own scale. They are not in the same units and the report says so.
+    pub margins: (Option<Margin>, Option<Margin>),
+}
+
+/// Run a scene the way [`World::run`] does, measuring as it goes.
+///
+/// The loop is `World::run`'s — advance, close the feedback, capture — with the ledger read
+/// before and after each advance and the stability limits read before each. A violation aborts
+/// with the kernel's own message, because a run the audit refused has no margins to report.
+/// `arrival` says whether to solve each block's steady state afterwards.
+///
+/// **Only the run under test needs it.** A sweep runs the scene again with a knob moved, to see
+/// what the knob was hiding; how far *that* run stopped from its own balance is not a question
+/// anyone asked, and solving it costs a full relaxation per block per run. Four runs a battery,
+/// so leaving it on cost four times what it bought.
+fn run_measured(scene: &Scene, files: &dyn Parts, arrival: bool) -> Result<Measured, String> {
+    let mut world = World::build_with(scene.clone(), files)?;
+    // **The steps `World::run` would take, not one per frame.** This computed its own
+    // `duration / frames`, which was the same number until `window_s` existed and is not now —
+    // so with a window stated the battery marched a different scene from the one the CLI runs,
+    // and its window sweep reported the shift a *frame* change makes on a scene whose frames no
+    // longer touch the physics. The doc above says the loop is `World::run`'s; this is what makes
+    // that true.
+    let steps = world.steps();
+    let dt = Time::from_si(scene.duration_s / steps as f64);
+
+    let mut drift: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut poisoned: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut anomalies: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut stability: BTreeMap<String, (f64, u32)> = BTreeMap::new();
+    let mut worst_transfer: Option<Margin> = None;
+    let mut worst_books: Option<Margin> = None;
+
+    let mut frames = Vec::with_capacity(scene.frames + 1);
+    frames.push(world.capture());
+    let mut taken = 0usize;
+    for frame_index in 1..=scene.frames {
+        let want = (frame_index * steps).div_ceil(scene.frames);
+        for _ in taken..want {
+            for d in world.sim.domains() {
+                if d.kind() == Kind::Evolving {
+                    let limit = d.max_stable_dt(world.sim.time()).to_si();
+                    let entry = stability
+                        .entry(d.name().to_string())
+                        .or_insert((f64::INFINITY, 0));
+                    entry.0 = entry.0.min(limit);
+                }
+            }
+
+            let before = world.sim.ledger();
+            // **`World::advance`, not `Simulation::advance`.** This reached past the world to the
+            // simulation inside it, which does one of the five things an advance is: it steps the
+            // domains. It does not apply a [`stages`](crate::Scene::stages) profile, hand each
+            // structure the strain its block's temperature implies, or solve the structure
+            // afterwards — so the battery marched a scene with no load profile and a body frozen
+            // at the strain it was built with.
+            //
+            // Measured on `11-motor-thermal-network`, which states a profile: the battery reported
+            // its winding at **44.80 °C** where the run the CLI performs ends at **59.64**. The
+            // element ran at its start-up 36 W for the whole run, emptied its tank at 800 s and
+            // cooled from there — an entirely self-consistent run of a scene nobody wrote.
+            //
+            // This is the third time this loop has drifted from `World::run`: it computed its own
+            // `duration / frames` until `window_s` existed, and its doc has said "the loop is
+            // `World::run`'s" throughout. A loop that *is* the other one is the only version of
+            // that sentence which cannot go stale.
+            let report = world.advance(dt).map_err(|v| {
+                format!(
+                    "the audit stopped the run at t = {:.4} s: {v}",
+                    world.sim.time().to_si()
+                )
+            })?;
+            let after = world.sim.ledger();
+
+            for (name, n) in &report.substeps {
+                if let Some(entry) = stability.get_mut(name) {
+                    entry.1 = entry.1.max(*n);
+                }
+            }
+
+            // The two margins only this step can see. Kept by how close each came to refusing —
+            // `worst / tolerance` — because the transfer audit's number is an absolute amount and the
+            // books check's is a ratio, and ranking them by raw size would compare a joule to a
+            // fraction.
+            let closer = |held: &Option<Margin>, seen: &Option<Margin>| -> bool {
+                match (held, seen) {
+                    (_, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(h), Some(s)) => {
+                        s.worst / s.tolerance.max(f64::MIN_POSITIVE)
+                            > h.worst / h.tolerance.max(f64::MIN_POSITIVE)
+                    }
+                }
+            };
+            if closer(&worst_transfer, &report.transfer) {
+                worst_transfer = report.transfer.clone();
+            }
+            if closer(&worst_books, &report.books) {
+                worst_books = report.books.clone();
+            }
+
+            // The audit's own arithmetic, run on a step it passed: same scale rule, same
+            // tolerance lookup, recording the worst instead of refusing over a line.
+            let mut names: Vec<&str> = before.quantities().map(|(q, _)| q).collect();
+            for (q, _) in after.quantities() {
+                if !names.contains(&q) {
+                    names.push(q);
+                }
+            }
+            names.sort_unstable();
+            for name in names {
+                seen.insert(name.to_string());
+                let b = before.get(name).unwrap_or(0.0);
+                let a = after.get(name).unwrap_or(0.0);
+                // **Before the scale, not after it.** The audit refuses a total that is not
+                // finite, so a step that reached here should not have one, and this mirror checks
+                // anyway. It took the scale first and tested the ratio, and `f64::max` drops a
+                // NaN: a quantity NaN at both ends with no finite entry beside it had a scale of
+                // zero, was skipped below as too small to judge, and came out *unaudited* rather
+                // than poisoned — the one case the ratio test existed for. Recorded as an anomaly rather than folded into
+                // the maximum, which `f64::max` would silently discard it from.
+                if !(b.is_finite() && a.is_finite()) {
+                    poisoned.insert(name.to_string());
+                    anomalies.insert(format!(
+                        "the {name} ledger is not a number ({b} to {a}) — arithmetic upstream \
+                         is poisoned, on a step the audit passed"
+                    ));
+                    continue;
+                }
+                let scale = b
+                    .abs()
+                    .max(a.abs())
+                    .max(before.scale_of(name).unwrap_or(0.0))
+                    .max(after.scale_of(name).unwrap_or(0.0));
+                if scale < 1e-300 {
+                    continue;
+                }
+                let rel = (a - b).abs() / scale;
+                let tol = world.sim.tolerances().for_quantity(name);
+                let entry = drift.entry(name.to_string()).or_insert((0.0, tol));
+                entry.0 = entry.0.max(rel);
+            }
+        }
+        taken = want;
+        frames.push(world.capture());
+    }
+    pantometry::scene::settle_framing(&mut frames);
+
+    let json = pantometry::view::to_json(scene.title.as_str(), &frames);
+    let readings = frames
+        .last()
+        .map(|f| f.readings.clone())
+        .unwrap_or_default();
+    let unaudited: Vec<String> = seen
+        .iter()
+        .filter(|q| !drift.contains_key(*q) && !poisoned.contains(*q))
+        .cloned()
+        .collect();
+    // How far each reading travelled, from the frames rather than from the last one.
+    // **Per domain and unit, not per reading.** A block's `peak`, `mean` and `coldest` are three
+    // views of one temperature field and share a scale; judging each against its own travel makes
+    // them incomparable and floods the report — measured, `mean` on `15-a-hot-spot-in-a-block`
+    // barely moves because the energy is fixed, so a 1e-5 K rounding difference read as **9.2%**
+    // beside two printed values that were identical.
+    let mut span: BTreeMap<(String, &'static str), (f64, f64)> = BTreeMap::new();
+    for frame in &frames {
+        for r in &frame.readings {
+            if !r.value.is_finite() {
+                continue;
+            }
+            let e = span
+                .entry((r.domain.clone(), r.unit))
+                .or_insert((r.value, r.value));
+            e.0 = e.0.min(r.value);
+            e.1 = e.1.max(r.value);
+        }
+    }
+    Ok(Measured {
+        diagnostic: diagnostics_of(&world.sim),
+        past_yield: world.past_yield(),
+        arrival: if arrival {
+            how_far_from_settled(&mut world, &span)
+        } else {
+            Vec::new()
+        },
+        bodies: frames.last().map(connected_bodies).unwrap_or_default(),
+        readings,
+        span: span.into_iter().map(|(k, (lo, hi))| (k, hi - lo)).collect(),
+        digest: fnv1a(json.as_bytes()),
+        drift: drift.into_iter().map(|(q, (d, t))| (q, d, t)).collect(),
+        unaudited,
+        anomalies: anomalies.into_iter().collect(),
+        stability: stability.into_iter().map(|(n, (l, s))| (n, l, s)).collect(),
+        margins: (worst_transfer, worst_books),
+    })
+}
+
+/// One reading compared across two runs of the same problem.
+#[derive(Debug)]
+pub struct Shift {
+    /// Which domain reported it.
+    pub domain: String,
+    /// The reading's own label.
+    pub label: String,
+    /// Its unit, for the report.
+    pub unit: &'static str,
+    /// The value in the base run.
+    pub base: f64,
+    /// The value in the comparison run.
+    pub other: f64,
+    /// `|other − base|` judged against `max(|base|, |other|)` — zero when both are zero.
+    ///
+    /// A reading sitting near zero exaggerates this ratio; the absolute pair is beside it in
+    /// the report for exactly that case.
+    pub relative: f64,
+    /// A statement about the solve rather than about the world — see
+    /// [`Domain::diagnostics`]. Its
+    /// `relative` is not a discretisation and is left out of [`Sweep::worst`]; the report prints
+    /// the two values instead of a percentage.
+    pub diagnostic: bool,
+}
+
+/// A measured convergence order, or the honest reason there is none.
+#[derive(Debug)]
+pub enum Order {
+    /// `log2(d1/d2)` of successive differences of one reading.
+    Measured(f64),
+    /// The differences are at the rounding floor, so the reading has converged below what this
+    /// battery can measure — which is a good outcome stated as one, not a number invented from
+    /// noise.
+    BelowFloor,
+    /// The **coarser** pair's difference is at the rounding floor while the finer pair's is
+    /// not: the differences grew as the knob refined, which no asymptotic error does. Without
+    /// this arm the ratio's logarithm printed `order -inf` — a number fabricated from rounding
+    /// wearing the name of a measurement — and it is not [`Order::BelowFloor`], whose
+    /// documentation calls it a good outcome; this one says the readings are not in any
+    /// regime an order describes.
+    NotAsymptotic,
+}
+
+/// The scale a reading's rounding actually lives on.
+///
+/// For most readings that is its magnitude. For a temperature it is not: the workspace's one
+/// deliberate non-SI convention displays celsius, so the stored number is a kelvin quantity
+/// displaced by 273.15 and its rounding sits at `~300·ε` **regardless of the displayed
+/// value**. Judged on its displayed magnitude, a bar cooling through 0 °C reads a 3 mK
+/// discretisation shift as 13.8% and an order fabricated from kelvin rounding as "does not
+/// converge" — measured before this function existed. Keyed on the unit string because the
+/// celsius convention is itself keyed there: `Reading::value`'s documentation states it, so
+/// this is reading a contract rather than guessing from a name.
+fn representation_scale(unit: &str, magnitude: f64) -> f64 {
+    if unit == "C" {
+        magnitude.max(273.15)
+    } else {
+        magnitude
+    }
+}
+
+/// Public because  pins the set of shipped scenes this names, and a pin against a second
+/// copy of the walk would agree with itself while the two drifted apart.
+///
+/// How far short of its own steady state each thermal block stopped, in kelvin.
+///
+/// Solves each block where it stands and reports how far the solve had to move it. A block that
+/// arrived moves by nothing; one stopped halfway moves by what is left. Domains with no steady
+/// state — melting, or heat with nowhere to go — are left out rather than reported as zero, which
+/// is the difference between "it arrived" and "the question does not apply".
+///
+/// Called after the run, on the world the run left behind, so the block is at the last frame.
+fn how_far_from_settled(
+    world: &mut World,
+    span: &BTreeMap<(String, &'static str), (f64, f64)>,
+) -> Vec<(String, f64, f64)> {
+    let names: Vec<String> = world
+        .simulation()
+        .domains()
+        .map(|d| d.name().to_string())
+        .collect();
+    let mut out = Vec::new();
+    for name in names {
+        let travel = span
+            .get(&(name.clone(), "C"))
+            .map(|(lo, hi)| hi - lo)
+            .unwrap_or(0.0);
+        let Some(block) = world
+            .simulation_mut()
+            .domain_as_mut::<pantometry::thermal::Solid3D>(&name)
+        else {
+            continue;
+        };
+        if let Ok(moved) = block.settle() {
+            out.push((name, moved, travel));
+        }
+    }
+    out
+}
+
+/// Each connected body in a frame's field panels, as `(domain, cells, peak - coldest)`.
+///
+/// Six-connected over the cells whose value is finite — a void cell has no temperature and a
+/// panel reports it as `NaN`, so the mask is the object and the walk is the object's shape. An
+/// iterative flood fill rather than recursion: a 128³ block is two million cells and a stack that
+/// deep is not a stack.
+pub fn connected_bodies(frame: &pantometry::scene::Frame) -> Vec<(String, usize, f64)> {
+    let mut out = Vec::new();
+    for panel in &frame.panels {
+        let Some((nx, ny, nz)) = panel.grid() else {
+            continue;
+        };
+        let v = panel.values();
+        if v.len() != nx * ny * nz {
+            continue;
+        }
+        let mut seen = vec![false; v.len()];
+        let at = |i: usize, j: usize, k: usize| i + nx * (j + ny * k);
+        for k0 in 0..nz {
+            for j0 in 0..ny {
+                for i0 in 0..nx {
+                    let start = at(i0, j0, k0);
+                    if seen[start] || !v[start].is_finite() {
+                        continue;
+                    }
+                    let (mut lo, mut hi) = (v[start], v[start]);
+                    let mut cells = 0usize;
+                    let mut stack = vec![(i0, j0, k0)];
+                    seen[start] = true;
+                    while let Some((i, j, k)) = stack.pop() {
+                        cells += 1;
+                        let x = v[at(i, j, k)];
+                        lo = lo.min(x);
+                        hi = hi.max(x);
+                        let mut push = |i: usize, j: usize, k: usize, stack: &mut Vec<_>| {
+                            let c = at(i, j, k);
+                            if !seen[c] && v[c].is_finite() {
+                                seen[c] = true;
+                                stack.push((i, j, k));
+                            }
+                        };
+                        if i > 0 {
+                            push(i - 1, j, k, &mut stack);
+                        }
+                        if i + 1 < nx {
+                            push(i + 1, j, k, &mut stack);
+                        }
+                        if j > 0 {
+                            push(i, j - 1, k, &mut stack);
+                        }
+                        if j + 1 < ny {
+                            push(i, j + 1, k, &mut stack);
+                        }
+                        if k > 0 {
+                            push(i, j, k - 1, &mut stack);
+                        }
+                        if k + 1 < nz {
+                            push(i, j, k + 1, &mut stack);
+                        }
+                    }
+                    out.push((panel.name.clone(), cells, hi - lo));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// How much a halved coupling window may move a reading before it is a finding.
+///
+/// **A chosen number, and the corpus it was chosen against is written down** — the same standing
+/// this workspace gives `crop_to_content`'s magnification cap. Measured over all thirty-four
+/// shipped scenes: twenty-three move by exactly 0.000%, five by 0.001–0.008% (three of them kelvin
+/// rounding, and the doses of `32` and `34`, whose explicit Euler step is first order — `34`'s fat
+/// moves 0.001% and converges at order 1.00 under `--deep`), and the rest by 0.144, 0.238, 0.275,
+/// 0.608, 0.674 and 0.966%. The gap between 0.275 and 0.608 is where this sits. It said thirty-two
+/// scenes over a list that added up to thirty-one, until `33` was measured and `32` with it: a
+/// minimiser does not move once converged, so halving the window changes nothing.
+///
+/// The argument for half a percent rather than the gap being convenient: the report prints six
+/// decimals, and the shipped scenes assert their own closed forms to 0.02%, 1.6e-4 and 0.3%. A
+/// time error of half a percent swamps every one of those, so a scene carrying one is quoting
+/// digits it has not earned.
+///
+/// **It is a shift, not a convergence order.** For a first-order scheme one halving reveals about
+/// the whole remaining error, which is why this is a usable estimate at all. For an oscillatory
+/// domain it is neither: `27-a-cavity-ringing-at-its-own-frequency` measures 0.608, 0.000, 0.916
+/// and 0.467% at one, two, four and eight times its frames, because what moves is the phase the
+/// sampling lands on. The finding still means what it says there — the answer depends on
+/// `frames` — but it is not an error estimate, and `--deep`'s measured order is what tells the
+/// two apart.
+const WINDOW_SHIFT: f64 = 0.005;
+
+/// How flat a field may be before the grid under it is not carrying the answer.
+///
+/// `(peak − coldest)` at the last frame, over the range that domain's readings covered across
+/// the whole run. A block whose cells all hold the same number is a **lumped node** written as a
+/// grid: the answer is one ordinary differential equation, and every cell beyond the first is
+/// arithmetic that changes nothing.
+///
+/// **A chosen number, and the corpus it was chosen against is written down** — the same standing
+/// `WINDOW_SHIFT` above has. Measured over all thirty-four shipped scenes, of which eleven domains
+/// report both a peak and a coldest:
+///
+/// ```text
+///   0.00000  20-melting-a-block-of-ice        ice
+///   0.00000  21-a-wax-thermal-buffer          wax
+///   0.00000  22-wax-in-an-aluminium-matrix    buffer
+///   0.00000  30-two-phases-crossing           phase_a
+///   0.00000  30-two-phases-crossing           phase_b
+///   0.00134  19-a-coating-stops-the-heat      joint
+///   0.02108  29-a-designed-bracket            bracket
+///   ----------------------------------------------- 0.05
+///   0.10645  24-a-power-module                module
+///   0.13411  15-a-hot-spot-in-a-block         block
+///   0.25896  25-what-140-kelvin-does          module
+///   0.79150  23-a-part-radiating-to-its-lid   housing
+/// ```
+///
+/// The gap between 0.021 and 0.106 is a factor of five and this sits in it. The argument for a
+/// twentieth rather than the gap being convenient: a field flat to 5% of what the run did is
+/// within the discretisation error of most of these scenes, so the structure it holds is not a
+/// structure it has earned the right to report.
+///
+/// **The table is the corpus this was chosen against, not the state of the tree**, and it was
+/// taken per *domain* before this was measured per body. Three of its rows have moved since. The
+/// coating scene reads 0.1062: its pulse was one cell at +60 K and is the whole heated face now.
+/// The bracket reads well clear of the line: it carries a module's watts to a bolt pad instead of
+/// shedding over its whole footprint. And the lid scene's 0.79 was two bodies rather than a
+/// gradient — measured apart, both of them are flat, which is what per-body measurement found and
+/// per-domain could not. `scene.rs` pins what is currently named; this records why the line sits
+/// where it does.
+///
+/// # What it is not evidence of
+///
+/// **A uniform temperature is not always an idle grid.** A melting block sits at its melting point
+/// everywhere that is mushy, and carries its answer in the melt *fraction* instead — a field this
+/// cannot see, because a domain reports the melted volume as a total. The finding says what it
+/// measured and leaves that reading to a person, which is why it is worded as a measurement.
+/// Public because `scene.rs` pins the set of shipped scenes this names, and a pin against a
+/// second copy of the number would agree with itself while the two drifted apart.
+pub const UNIFORM_FIELD: f64 = 0.05;
+
+/// Which `(domain, label)` readings of a built world describe the **solve** rather than the world.
+///
+/// # This was a list here, and the list was the defect
+///
+/// The battery's resolution sweep says "what moved is discretisation", and for a solver residual
+/// that is false in a way no denominator repairs. `17-a-busbar-with-a-notch` printed
+///
+/// ```text
+///   busbar   residual   0.000000 -> 0.000000  (281492.026%)
+/// ```
+///
+/// — two converged residuals, 7.793e-13 and 6.644e-13, divided by the **4.08e-17** one of them
+/// wobbled by between two frames of the *base* run, which is conjugate gradients stopping at a
+/// different iterate and not a span.
+///
+/// The first repair was a constant in this file naming five labels. It worked, and it was a second
+/// copy of something only the domain knows: it needed three pins to keep it honest, and it keyed on
+/// the **label alone**, so a new domain reporting `norm` as its *answer* would have been swallowed
+/// by it. [`Domain::diagnostics`] puts the statement where
+/// the knowledge is, and asking a built world turns it into `(domain, label)` pairs — which is
+/// what the ambiguity needed and what a list could not give.
+/// Public because [`Measured::diagnostic`] is, and a field whose documentation points at a private
+/// function is a field whose documentation a reader cannot follow.
+pub fn diagnostics_of(sim: &Simulation) -> BTreeSet<(String, String)> {
+    sim.domains()
+        .flat_map(|d| {
+            d.diagnostics()
+                .iter()
+                .map(move |l| (d.name().to_string(), (*l).to_string()))
+        })
+        .collect()
+}
+
+/// One sweep: the scene rerun with one knob moved, and what each reading did.
+#[derive(Debug)]
+pub struct Sweep {
+    /// Every reading matched across the runs, in the base run's order.
+    pub shifts: Vec<Shift>,
+    /// The largest [`Shift::relative`] — the one-number summary of how much the knob was
+    /// hiding.
+    pub worst: f64,
+    /// With `--deep`, the measured order per reading: `(domain, label, order)`. Empty without.
+    pub orders: Vec<(String, String, Order)>,
+    /// Readings present in one run and not the other — including, under `--deep`, the finest
+    /// run, which is compared against the base for presence exactly so a reading cannot vanish
+    /// between the middle and finest runs without a trace. Should be empty; every entry
+    /// becomes a finding.
+    pub unmatched: Vec<String>,
+    /// Readings whose comparison stopped being arithmetic: a non-finite value, or two readings
+    /// sharing one `(domain, label)` key so that `find` silently matched only the first. Both
+    /// are unreachable with today's domains and both become findings if they ever happen,
+    /// because each is a way for a row to lie while looking routine.
+    pub broken: Vec<String>,
+}
+
+/// What became of one sweep — ran, was honestly out of scope, or **failed**.
+///
+/// The distinction `Skipped`/`Failed` is the whole point of this enum existing. A scene with
+/// nothing to refine and a refined run the audit refused both used to fold into one error
+/// string rendered as `SKIPPED:`, and the second is about the most alarming thing this battery
+/// can learn — a scene that passes at its own settings and fails when a knob moves is a scene
+/// one knob away from wrong. A skip is a fact about the scene; a failure is a finding, and it
+/// carries the exit code.
+#[derive(Debug)]
+pub enum SweepOutcome {
+    /// The sweep ran and compared.
+    Ran(Sweep),
+    /// The sweep does not apply to this scene, and this is why.
+    Skipped(String),
+    /// A run inside the sweep was refused, and this is what the kernel said.
+    Failed(String),
+}
+
+fn compare(
+    base: &[Reading],
+    other: &[Reading],
+    span: &BTreeMap<(String, &'static str), f64>,
+    diagnostic: &BTreeSet<(String, String)>,
+) -> Sweep {
+    let mut shifts = Vec::new();
+    let mut unmatched = Vec::new();
+    let mut broken = Vec::new();
+
+    // A duplicated key would make `find` silently match only the first holder, so the row
+    // would look routine while comparing half the data. No domain emits one today; the check
+    // is here because the failure would be invisible by construction if one ever did.
+    for side in [base, other] {
+        for (i, r) in side.iter().enumerate() {
+            if side[..i]
+                .iter()
+                .any(|s| s.domain == r.domain && s.label == r.label)
+            {
+                broken.push(format!(
+                    "{}/{}: two readings under one name — only the first was compared",
+                    r.domain, r.label
+                ));
+            }
+        }
+    }
+
+    for r in base {
+        match other
+            .iter()
+            .find(|o| o.domain == r.domain && o.label == r.label)
+        {
+            Some(o) => {
+                if !r.value.is_finite() || !o.value.is_finite() {
+                    broken.push(format!(
+                        "{}/{}: reads {} against {} — not arithmetic, and a percentage of it \
+                         would be a lie",
+                        r.domain, r.label, r.value, o.value
+                    ));
+                    continue;
+                }
+                // **Against what the run did, not against where the origin is.** A sweep asks
+                // whether the answer moved, and the reading's own magnitude answers something
+                // else: for a temperature it is dominated by the 273.15 that celsius carries, so
+                // `15-a-hot-spot-in-a-block` reported 0.212% for a shift that was 8.2% of its
+                // entire 7.03 K rise — and that scene is 14% from converged at its shipped frame
+                // count. A reader saw 0.212% and stopped.
+                //
+                // `representation_scale` stays as the floor, and its own reason still holds: a
+                // reading that never moved has no span to divide by, and a bar cooling *through*
+                // 0 °C would otherwise read a 3 mK shift against a magnitude near zero. So the
+                // denominator is the larger of what happened and what the representation can
+                // resolve, which answers both questions with one number honestly.
+                // Two regimes, stated rather than blended. A reading that moved is judged
+                // against how far it moved; one that never moved has no span to divide by, and
+                // falls back to the representation scale — which is what every reading used
+                // before and is why a bar cooling *through* 0 °C does not read a 3 mK shift
+                // against a magnitude near zero.
+                let travelled = span
+                    .get(&(r.domain.clone(), r.unit))
+                    .copied()
+                    .unwrap_or(0.0);
+                let scale = if travelled > 0.0 {
+                    travelled
+                } else {
+                    representation_scale(r.unit, r.value.abs().max(o.value.abs()))
+                };
+                let relative = if scale > 0.0 {
+                    (o.value - r.value).abs() / scale
+                } else {
+                    0.0
+                };
+                shifts.push(Shift {
+                    domain: r.domain.clone(),
+                    label: r.label.clone(),
+                    unit: r.unit,
+                    base: r.value,
+                    other: o.value,
+                    relative,
+                    diagnostic: diagnostic.contains(&(r.domain.clone(), r.label.clone())),
+                });
+            }
+            None => unmatched.push(format!("{}/{}", r.domain, r.label)),
+        }
+    }
+    for o in other {
+        if !base
+            .iter()
+            .any(|r| r.domain == o.domain && r.label == o.label)
+        {
+            unmatched.push(format!("{}/{}", o.domain, o.label));
+        }
+    }
+    // **Diagnostics are left out of the summary, not merely out of the print.** `worst` is what
+    // the window sweep raises a finding on, and a residual that moved between two runs would fire
+    // it with a message about the scene's answer depending on `frames`. It has not yet, because
+    // the window sweep re-solves the same system and gets the same residual to the bit; the
+    // resolution sweep is where it moves, and that one raises nothing. One knob away.
+    let worst = shifts
+        .iter()
+        .filter(|s| !s.diagnostic)
+        .fold(0.0f64, |m, s| m.max(s.relative));
+    Sweep {
+        shifts,
+        worst,
+        orders: Vec::new(),
+        unmatched,
+        broken,
+    }
+}
+
+/// The order of each reading from three runs at successive halvings of one knob.
+///
+/// `d1 = f1 − f2` and `d2 = f2 − f4` are differences of the *same* reading, so the unknown
+/// exact answer cancels and no closed form is needed — which is what lets this run on any
+/// scene. The floor guards the division: differences below `1e-12` of the reading's
+/// representation scale are rounding, and an order computed from rounding would be a number
+/// that means nothing wearing the name of one that means a lot.
+///
+/// The `1e-12` is chosen, not derived, and here is what stands behind it: it is ~4.5e3 ulps,
+/// which measured ~200× above the accumulated summation noise of the scenes probed
+/// (`bar/mean` differences at 5.6e-15 relative) and ~10⁸ below the smallest real
+/// discretisation differences the sweeps produce (~1e-4). A scene whose accumulated rounding
+/// approached it from below — many more cells over many more substeps — would defeat it, and
+/// the number that would fix it lives with the domain, not here; if that day comes, the floor
+/// becomes something the domain reports, the way `Ledger` carries `scale` for the same
+/// reason.
+fn orders_of(
+    f1: &[Reading],
+    f2: &[Reading],
+    f4: &[Reading],
+    diagnostic: &BTreeSet<(String, String)>,
+) -> Vec<(String, String, Order)> {
+    let mut out = Vec::new();
+    for r1 in f1 {
+        // A diagnostic has no order because it is not converging to anything: the notch's
+        // residual measured **-0.77**, a rate at which nothing happens, printed in a column of
+        // real ones. See [`diagnostics_of`].
+        if diagnostic.contains(&(r1.domain.clone(), r1.label.clone())) {
+            continue;
+        }
+        let find = |rs: &[Reading]| {
+            rs.iter()
+                .find(|o| o.domain == r1.domain && o.label == r1.label)
+                .map(|o| o.value)
+        };
+        let (Some(v2), Some(v4)) = (find(f2), find(f4)) else {
+            continue;
+        };
+        let scale = representation_scale(r1.unit, r1.value.abs().max(v2.abs()).max(v4.abs()));
+        let floor = 1e-12 * scale.max(1e-300);
+        let d1 = (r1.value - v2).abs();
+        let d2 = (v2 - v4).abs();
+        let order = if d1 <= floor && d2 <= floor {
+            Order::BelowFloor
+        } else if d2 <= floor {
+            // d1 above the floor with d2 below it is a reading that stopped moving between
+            // the finer pair — converged, but the ratio would be infinite and say nothing.
+            Order::BelowFloor
+        } else if d1 <= floor {
+            // The mirror case is not convergence at all: the coarser pair agreed to the bit
+            // and the finer pair moved, which no asymptotic error does. The ratio's logarithm
+            // here is -inf, and printing it was the fabrication this function's documentation
+            // promises not to commit.
+            Order::NotAsymptotic
+        } else {
+            Order::Measured((d1 / d2).log2())
+        };
+        out.push((r1.domain.clone(), r1.label.clone(), order));
+    }
+    out
+}
+
+/// The whole battery, ready to render.
+#[derive(Debug)]
+pub struct Battery {
+    /// The base run's measurements.
+    pub base: Measured,
+    /// Whether a second identical run produced the identical digest.
+    pub deterministic: bool,
+    /// The coupling window halved (and quartered under `--deep`).
+    pub window: SweepOutcome,
+    /// Every discretised domain refined 2× (and 4× under `--deep`).
+    pub resolution: SweepOutcome,
+    /// Scene domains that report no readings at all, so the sweeps have nothing of theirs to
+    /// compare. Rendered as a row inside each sweep — "no readings, not swept" — because a
+    /// sweep section listing every *other* domain looks complete, and an absence a reader can
+    /// see beats one they cannot. The same lesson `main.rs` learned about undrawable domains.
+    pub unread: Vec<String>,
+    /// What each designed part cost the grid it was rasterised onto — empty for a scene with no
+    /// `parts`, which is most of them.
+    ///
+    /// Printed whole rather than only when something went wrong, because a section that appears
+    /// only on failure cannot be told apart from a check that did not run.
+    pub rasterised: Vec<Rasterised>,
+    /// Structural defects found. Any entry here is an exit-code failure: a run that is not
+    /// deterministic, a staggered schedule past a stability limit, a sweep whose run the audit
+    /// refused, a reading that vanished under a sweep, arithmetic that stopped being
+    /// arithmetic, or a designed part the grid could not hold.
+    pub findings: Vec<String>,
+}
+
+/// What one **built, unrun** world already says, before any of it is stepped.
+///
+/// Two questions, one construction. Building twice to ask them separately would be a second
+/// build that can differ from the first — and the second question here is precisely about what
+/// the build did to the geometry.
+struct BeforeTheRun {
+    /// Stability limits a non-subcycling schedule would overrun.
+    /// What every designed part cost the grid, kept whole rather than reduced to findings: the
+    /// rows a reader checks a finding against, and — on a scene where nothing was lost — the
+    /// evidence that this pass ran at all.
+    rasterised: Vec<Rasterised>,
+}
+
+/// Build the scene once and ask both.
+fn before_the_run(scene: &Scene, files: &dyn Parts) -> Result<BeforeTheRun, String> {
+    let world = World::build_with(scene.clone(), files)?;
+    Ok(BeforeTheRun {
+        rasterised: world.rasterised().to_vec(),
+    })
+}
+
+/// Designed parts whose rasterisation lost something the grid cannot give back.
+///
+/// **This is the one check here whose subject never fails on its own.** A stability hazard ends
+/// in a crash, a non-deterministic run ends in two digests, a poisoned ledger ends in a `NaN` —
+/// each has a symptom somewhere. A rib finer than the cell has none: it does not error, it does
+/// not `NaN`, it does not move the audit by a joule, because the joules it would have held are
+/// simply not in the problem. The run is well behaved about a different object, and
+/// `ARCHITECTURE.md` names that as the shape of error this workspace is organised around not
+/// having.
+///
+/// The verdict is [`pantometry::shape::Loss::is_clean`]'s, not a second opinion invented here —
+/// so the bar is stated in one place and the message quotes it rather than restating it. What is
+/// added is the case `is_clean` cannot see, because it is about a part rather than about a
+/// rasterisation: **zero cells filled**. [`World::build`] refuses only the assembly where *every*
+/// part vanished; one of several coming out absent builds, runs and conserves.
+fn rasterisation_loss(rasterised: &[Rasterised]) -> Vec<String> {
+    use pantometry::shape::Loss;
+
+    let mut out = Vec::new();
+    for r in rasterised {
+        if r.filled == 0 {
+            out.push(format!(
+                "{}: {} filled no cells at {} mm — the part is not coarse at this grid, it is \
+                 absent, and nothing downstream will say so: the run is well behaved about an \
+                 assembly with a piece missing",
+                r.site, r.stl, r.cell_mm
+            ));
+            continue;
+        }
+        if r.loss.is_clean() {
+            continue;
+        }
+        let mut why = Vec::new();
+        if r.loss.volume_error.abs() >= Loss::CLEAN_VOLUME_ERROR {
+            why.push(format!(
+                "volume {:+.2}% against the {:.0}% `Loss::is_clean` allows",
+                r.loss.volume_error * 100.0,
+                Loss::CLEAN_VOLUME_ERROR * 100.0
+            ));
+        }
+        if r.loss.thin_runs > 0 {
+            why.push(format!(
+                "{} solid run(s) one or two cells thick, which no scheme here resolves — a \
+                 seven-point stencil has no interior in one and a trilinear element has one \
+                 element",
+                r.loss.thin_runs
+            ));
+        }
+        if r.loss.ambiguous_rows > 0 {
+            why.push(format!(
+                "{} row(s) no ray could decide, left empty",
+                r.loss.ambiguous_rows
+            ));
+        }
+        if why.is_empty() {
+            // `is_clean` said unclean and none of its clauses explained why, which means it
+            // grew one this function does not know about. Printing the whole measurement is the
+            // one answer that cannot be wrong, and a finding with no reason is the failure shape
+            // this module exists to refuse.
+            why.push(format!(
+                "`Loss::is_clean` is false for a reason this report does not enumerate: {:?}",
+                r.loss
+            ));
+        }
+        out.push(format!(
+            "{}: {} at {} mm — {}",
+            r.site,
+            r.stl,
+            r.cell_mm,
+            why.join("; ")
+        ));
+    }
+    out
+}
+
+/// Run the battery.
+///
+/// The base scene runs twice (determinism), the window sweep once or twice more, and the
+/// resolution sweep once or twice more — five to seven runs, the finest of which can cost
+/// `2³ × 4` the base for a three-dimensional multirate domain. That cost is the price of the
+/// measurements; a battery that only read the one run could only repeat what the audit said.
+pub fn verify(scene: &Scene, deep: bool) -> Result<Battery, String> {
+    verify_with(scene, deep, &OnDisk)
+}
+
+/// The battery, with `parts` taken from `files` rather than from a disk.
+///
+/// The same battery. A scene assembled from uploaded CAD has to be verifiable or the browser is
+/// a viewer rather than an IDE — the refinement runs need the same bytes the base run had, and
+/// there is nowhere in a page to put them.
+pub fn verify_with(scene: &Scene, deep: bool, files: &dyn Parts) -> Result<Battery, String> {
+    let before = before_the_run(scene, files)?;
+    // The stability hazard used to arrive here, from a copy of the rule that lived in this file.
+    // `World::build` refuses that scene now, so a world this battery is handed cannot carry it and
+    // there is nothing to seed the findings with.
+    let mut findings: Vec<String> = Vec::new();
+
+    let base = match run_measured(scene, files, true) {
+        Ok(b) => b,
+        Err(e) => {
+            let mut context = String::new();
+            // A base run the audit refused still gets the hazard reported, because the hazard is
+            // usually *why*: an over-limit staggered window amplifies until the books cannot
+            // close.
+            if !findings.is_empty() {
+                context.push_str(&format!("\n  likely why: {}", findings.join("; ")));
+            }
+            // Rasterisation loss is never *why* — a part that vanished takes its joules with it
+            // and the books close over what is left. It is carried anyway, because a defect only
+            // this pass can see must not be swallowed by an unrelated failure of the run.
+            let lost = rasterisation_loss(&before.rasterised);
+            if !lost.is_empty() {
+                context.push_str(&format!("\n  also: {}", lost.join("; ")));
+            }
+            return Err(format!("{e}{context}"));
+        }
+    };
+    findings.extend(rasterisation_loss(&before.rasterised));
+    let again = run_measured(scene, files, false)?;
+    let deterministic = base.digest == again.digest;
+
+    if !deterministic {
+        findings.push(format!(
+            "two runs of this scene produced different bytes ({:016x} then {:016x}) — \
+             something consults a clock, a shared generator, or an unordered reduction",
+            base.digest, again.digest
+        ));
+    }
+
+    findings.extend(base.anomalies.iter().cloned());
+
+    // **A body asked to go where the model cannot follow.** Unlike every other threshold in this
+    // battery, one is not a number anybody chose: `pantometry-elastic` is a linear model with no
+    // plasticity, and it documents in its own words that a solve past yield "returns a
+    // displacement that is arithmetically correct and physically meaningless, and nothing in the
+    // answer says which". The crate knew its limit; nothing checked a scene against it.
+    //
+    // The free strain is an **upper bound** on what an element carries — fully constrained it
+    // takes all of it, free it takes none — so under one is a body certainly inside the model, and
+    // over it is a body that may not be. That asymmetry is the useful direction for a warning, and
+    // it is why the finding says "up to".
+    for (domain, ratio, at) in &base.past_yield {
+        if *ratio > 1.0 {
+            findings.push(format!(
+                "{domain}: an element at {at:?} is asked for up to {ratio:.2}x the strain its own \
+                 material comes back from — `pantometry-elastic` is linear with no plasticity, so \
+                 past yield it returns a displacement that is arithmetically correct and \
+                 physically meaningless, and nothing else in this report would say which this is"
+            ));
+        }
+    }
+
+    // **A grid that is not carrying the answer.** Every finding above this one is about
+    // arithmetic; this one is about whether the scene needed the arithmetic. A block whose cells
+    // all hold the same number has been solved as a field and answered as a lump, and nothing in
+    // the report said so.
+    //
+    // **Per connected body, not per domain.** A domain's `peak` and `coldest` are the extremes of
+    // everything in it, so two separate objects at different temperatures read as a large spread
+    // and are indistinguishable from one object with a gradient. That is not a nicety: the two
+    // busbars of `30-two-phases-crossing-at-a-clearance` are each a lump, and merging them into
+    // one block — which is what gives them a radiative path across their clearance — would have
+    // made this stop firing with neither bar gaining a field. A measurement that a refactor can
+    // silence is not measuring what it says.
+    //
+    // The denominator is the same `span` the sweeps divide by, so a flatness and a sensitivity
+    // are judged against one scale, and `representation_scale` guards a run that barely moved
+    // from making its own flatness look meaningful.
+    for reading in &base.readings {
+        if reading.label != "peak" {
+            continue;
+        }
+        let Some(coldest) = base
+            .readings
+            .iter()
+            .find(|r| r.domain == reading.domain && r.label == "coldest" && r.unit == reading.unit)
+        else {
+            continue;
+        };
+        let Some(travel) = base.span.get(&(reading.domain.clone(), reading.unit)) else {
+            continue;
+        };
+        if *travel <= representation_scale(reading.unit, reading.value.abs()) * 1e-9 {
+            continue;
+        }
+        // Bodies where the domain drew a field, and the domain's own extremes where it did not —
+        // a network reports a peak and a coldest and has no grid under them.
+        let bodies: Vec<(usize, f64)> = base
+            .bodies
+            .iter()
+            .filter(|(name, _, _)| *name == reading.domain)
+            .map(|(_, cells, spread)| (*cells, *spread))
+            .collect();
+        let measured: Vec<(usize, f64)> = if bodies.is_empty() {
+            vec![(0, reading.value - coldest.value)]
+        } else {
+            bodies
+        };
+        for (n, (cells, spread)) in measured.iter().enumerate() {
+            if !spread.is_finite() || spread / travel >= UNIFORM_FIELD {
+                continue;
+            }
+            // A body of one cell has no field to have, and saying so of it is noise.
+            if *cells == 1 {
+                continue;
+            }
+            let which = if measured.len() > 1 {
+                format!("{} body {} of {}", reading.domain, n + 1, measured.len())
+            } else {
+                reading.domain.clone()
+            };
+            let size = if *cells > 0 {
+                format!(" across its {cells} cells")
+            } else {
+                String::new()
+            };
+            findings.push(format!(
+                "{which}: the field is flat to {:.3}% of the {:.4} {} this run covered{size} \
+                 — every cell holds within {:.2e} {} of every other, so a single lumped node \
+                 answers it and the grid is not carrying the answer. If the structure is in a \
+                 phase fraction rather than in the temperature, this cannot see it and says so",
+                spread / travel * 100.0,
+                travel,
+                reading.unit,
+                spread.abs(),
+                reading.unit
+            ));
+        }
+    }
+
+    // Which of the scene's domains contributed nothing for the sweeps to compare. A battery
+    // that measured nothing must not look like one that measured everything and found it
+    // still, so an empty reading set skips both sweeps *as* a finding rather than running
+    // scenes to compare zero numbers.
+    let unread: Vec<String> = scene
+        .domains
+        .iter()
+        .map(|d| d.name().to_string())
+        .filter(|n| !base.readings.iter().any(|r| &r.domain == n))
+        .collect();
+    let (window, resolution) = if base.readings.is_empty() {
+        findings.push(
+            "no domain in this scene reports a reading, so the sweeps have nothing to \
+             measure — nothing here was verified, and running the sweeps would only have \
+             compared zero numbers twice"
+                .to_string(),
+        );
+        let why = "no domain reports a reading — nothing to compare".to_string();
+        (
+            SweepOutcome::Skipped(why.clone()),
+            SweepOutcome::Skipped(why),
+        )
+    } else {
+        (
+            window_sweep(scene, &base, deep, files),
+            resolution_sweep(scene, &base, deep, files),
+        )
+    };
+
+    for (name, outcome) in [("window", &window), ("resolution", &resolution)] {
+        match outcome {
+            SweepOutcome::Ran(s) => {
+                for missing in &s.unmatched {
+                    findings.push(format!(
+                        "{missing}: reported in one run of the {name} sweep and not another — \
+                         a reading that appears or vanishes with a knob is itself a defect"
+                    ));
+                }
+                for b in &s.broken {
+                    findings.push(format!("{name} sweep: {b}"));
+                }
+                // **A shift the reader has to act on, rather than a row they may skim.**
+                //
+                // The window sweep has always measured this and always reported it as prose.
+                // `15-a-hot-spot-in-a-block` ships at `frames: 11` and is **14% below** its own
+                // grid's converged answer — measured by running it at 2, 5, 11, 26, 51, 101, 201,
+                // 401, 801 and 1601 frames, where the peak goes 5.177, 5.714, 7.027, 7.696,
+                // 7.940, 8.065, 8.129, 8.161, 8.177, 8.186 K. Textbook first order: the error
+                // halves with the step. Its window row said 0.212% and nobody acted.
+                //
+                // The 0.212% was the denominator, fixed above. What is left is that a report
+                // is not a refusal: a scene whose answer moves when you ask for more pictures
+                // has an answer that depends on how many pictures you asked for, and that is a
+                // defect in the scene whatever the number turns out to be.
+                if name == "window" && s.worst > WINDOW_SHIFT {
+                    findings.push(format!(
+                        "halving the coupling window moved a reading by {:.3}% of its own range: this scene's answer depends on `frames`, which is a count of pictures. Raise `frames` until it settles, or say why it cannot",
+                        s.worst * 100.0
+                    ));
+                }
+            }
+            SweepOutcome::Failed(why) => {
+                findings.push(format!(
+                    "the {name} sweep's run was refused: {why} — a scene that passes at its \
+                     own settings and fails when a knob moves is one knob away from wrong, \
+                     which is a finding and not a skip"
+                ));
+            }
+            SweepOutcome::Skipped(_) => {}
+        }
+    }
+
+    Ok(Battery {
+        base,
+        deterministic,
+        window,
+        resolution,
+        unread,
+        rasterised: before.rasterised,
+        findings,
+    })
+}
+
+/// Fold the finest run into a sweep: measure the orders, and presence-check the finest run
+/// against the base so a reading cannot vanish between the middle and finest runs without a
+/// trace — `orders_of` skips a reading it cannot find in all three, and a skip with nothing
+/// counting it is how a list comes up one row short and looks complete.
+fn deepen(sweep: &mut Sweep, base: &Measured, middle: &Measured, finest: &Measured) {
+    sweep.orders = orders_of(
+        &base.readings,
+        &middle.readings,
+        &finest.readings,
+        &base.diagnostic,
+    );
+    let presence = compare(
+        &base.readings,
+        &finest.readings,
+        &base.span,
+        &base.diagnostic,
+    );
+    for entry in presence.unmatched {
+        if !sweep.unmatched.contains(&entry) {
+            sweep.unmatched.push(entry);
+        }
+    }
+    for entry in presence.broken {
+        if !sweep.broken.contains(&entry) {
+            sweep.broken.push(entry);
+        }
+    }
+    // The finest run's own ledger anomalies. The middle run's are the caller's to carry —
+    // splitting it this way rather than "everyone adds everything" is what keeps an anomaly
+    // from being reported twice and read as two.
+    for a in &finest.anomalies {
+        sweep.broken.push(format!("in the finest run: {a}"));
+    }
+}
+
+fn window_sweep(scene: &Scene, base: &Measured, deep: bool, files: &dyn Parts) -> SweepOutcome {
+    // **Halve the window, whichever way the scene states it.** This multiplied `frames`, which
+    // was the same thing until `window_s` existed: a scene that states one has a step the frame
+    // count does not touch, so multiplying frames swept a knob that no longer moves anything and
+    // the sweep reported whatever it had reported before. The physics knob is the window.
+    let halve = |s: &Scene, factor: usize| {
+        let mut finer = s.clone();
+        match finer.window_s {
+            Some(w) => finer.window_s = Some(w / factor as f64),
+            None => finer.frames *= factor,
+        }
+        finer
+    };
+    let half = match run_measured(&halve(scene, 2), files, false) {
+        Ok(m) => m,
+        Err(e) => return SweepOutcome::Failed(format!("with the window halved, {e}")),
+    };
+    let mut sweep = compare(&base.readings, &half.readings, &base.span, &base.diagnostic);
+    for a in &half.anomalies {
+        sweep.broken.push(format!("in the halved-window run: {a}"));
+    }
+    if deep {
+        match run_measured(&halve(scene, 4), files, false) {
+            Ok(quarter) => deepen(&mut sweep, base, &half, &quarter),
+            Err(e) => return SweepOutcome::Failed(format!("with the window quartered, {e}")),
+        }
+    }
+    SweepOutcome::Ran(sweep)
+}
+
+fn resolution_sweep(scene: &Scene, base: &Measured, deep: bool, files: &dyn Parts) -> SweepOutcome {
+    let twice = match scene.refined() {
+        Ok(s) => s,
+        Err(why) => return SweepOutcome::Skipped(why),
+    };
+    let fine = match run_measured(&twice, files, false) {
+        Ok(m) => m,
+        Err(e) => return SweepOutcome::Failed(format!("refined 2x, {e}")),
+    };
+    let mut sweep = compare(&base.readings, &fine.readings, &base.span, &base.diagnostic);
+    for a in &fine.anomalies {
+        sweep.broken.push(format!("in the refined run: {a}"));
+    }
+    if deep {
+        // A second refinement can only refuse if the first could, and the first was checked —
+        // but "can only" is an argument, so the refusal path stays a skip rather than a panic.
+        let four = match twice.refined() {
+            Ok(s) => s,
+            Err(why) => return SweepOutcome::Skipped(why),
+        };
+        match run_measured(&four, files, false) {
+            Ok(finer) => deepen(&mut sweep, base, &fine, &finer),
+            Err(e) => return SweepOutcome::Failed(format!("refined 4x, {e}")),
+        }
+    }
+    SweepOutcome::Ran(sweep)
+}
+
+impl Scene {
+    /// The same physical problem with every discretised domain refined 2×.
+    ///
+    /// Domains without a grid pass through unchanged — a heater's tank, an orbit's radii and a
+    /// molecular fluid's atom count are the *system*, not a discretisation of one. Domains
+    /// whose grid carries one-cell features refuse, naming the feature: see
+    /// [`DomainSpec::refined`].
+    pub fn refined(&self) -> Result<Scene, String> {
+        let mut finer = self.clone();
+        let mut refined_any = false;
+        // **Two passes, because a structure that follows a block is refinable only with it.**
+        // A structure's elements have to be that block's cells — `World::build` refuses the pair
+        // otherwise — so doubling one without the other is not a finer statement of the same
+        // problem, it is a scene that will not build. [`DomainSpec::refined`] sees one domain and
+        // is right to refuse; this sees all of them, so it can double the pair and check that it
+        // did.
+        //
+        // What the refusal cost was the measurement. `25-what-140-kelvin-does-to-the-solder` has
+        // skipped its resolution sweep since it shipped, and its strain energy moves **4.09%**
+        // between 512 elements and 4096 — 0.0274238 J against 0.0263010 — a number nobody could
+        // ask for. The strain the whole scene is about moves 1.48% in `z`.
+        //
+        // A first pass at that measurement said 5.31%, from a refinement written by hand that
+        // doubled the cells and the regions and left the block's `contact` faces and
+        // `dissipation` boxes where they were. The number that matters is the one the sweep
+        // makes, because the sweep is what a reader runs.
+        let mut doubled: std::collections::BTreeSet<String> = Default::default();
+        for spec in &mut finer.domains {
+            if matches!(spec, DomainSpec::Structure { .. }) {
+                continue;
+            }
+            if let Some(f) = spec.refined()? {
+                doubled.insert(f.name().to_string());
+                *spec = f;
+                refined_any = true;
+            }
+        }
+        for spec in &mut finer.domains {
+            let DomainSpec::Structure { name, follows, .. } = spec else {
+                continue;
+            };
+            if let Some(block) = follows {
+                if !doubled.contains(block) {
+                    return Err(format!(
+                        "{name}: follows {block:?}, which did not refine — a structure's elements \
+                         have to be that block's cells, so refining one without the other is a \
+                         scene that will not build"
+                    ));
+                }
+            }
+            *spec = spec.structure_refined();
+            refined_any = true;
+        }
+        if !refined_any {
+            return Err(
+                "nothing in this scene is a discretisation — every domain *is* its own \
+                 resolution, so there is no finer statement of the same problem to compare \
+                 against"
+                    .to_string(),
+            );
+        }
+        Ok(finer)
+    }
+}
+
+impl DomainSpec {
+    /// This structure at doubled resolution.
+    ///
+    /// The same arithmetic a [`DomainSpec::Block`] uses — cells doubled, the cell halved, region
+    /// bounds doubled — because a structure's elements *are* a block's cells and the two have to
+    /// stay the same box. `held` and `pressed` name **faces**, which do not scale with a grid.
+    ///
+    /// Not public, and called only from [`Scene::refined`], because a structure that follows a
+    /// block refines only with it and this function cannot see the block.
+    fn structure_refined(&self) -> DomainSpec {
+        let DomainSpec::Structure {
+            name,
+            cells,
+            cell_mm,
+            material,
+            regions,
+            held,
+            pressed,
+            follows,
+            reference_c,
+        } = self
+        else {
+            return self.clone();
+        };
+        DomainSpec::Structure {
+            name: name.clone(),
+            cells: [cells[0] * 2, cells[1] * 2, cells[2] * 2],
+            cell_mm: cell_mm / 2.0,
+            material: material.clone(),
+            regions: regions
+                .iter()
+                .map(|r| crate::Region {
+                    material: r.material.clone(),
+                    from: [r.from[0] * 2, r.from[1] * 2, r.from[2] * 2],
+                    to: [r.to[0] * 2, r.to[1] * 2, r.to[2] * 2],
+                    initial_c: r.initial_c,
+                })
+                .collect(),
+            held: held.clone(),
+            pressed: pressed.clone(),
+            follows: follows.clone(),
+            reference_c: *reference_c,
+        }
+    }
+
+    /// This domain at doubled resolution, `Ok(None)` if it has no resolution, or the reason
+    /// doubling would change the problem rather than refine it.
+    ///
+    /// The rule for what refines: the physical problem must be identical, only the grid finer.
+    /// A bar doubles its cells and halves each exposed face's area, and the beam that lands on
+    /// it doubles its faces to match — total area and total watts unchanged. A block doubles
+    /// its counts, halves its cell, and doubles its region bounds, which lands every material
+    /// boundary on the same physical plane.
+    ///
+    /// The rule for what refuses: any feature whose physical size is *defined* in cells. A
+    /// [`HotSpot`](crate::HotSpot) is one cell of excess temperature, so at half the cell it
+    /// holds an eighth of the joules, and a puck's channel ring is one cell wide by
+    /// construction. A conductor's blocked cell was on this list and is not one: a blocked cell
+    /// is a **box**, so it refines into its eight children and the notch keeps its millimetres.
+    /// Each is a different problem at a
+    /// different resolution, and a comparison across them would report the difference as
+    /// discretisation error — a number that means nothing wearing the name of one that means a
+    /// lot.
+    pub fn refined(&self) -> Result<Option<DomainSpec>, String> {
+        let spec = match self {
+            // **A structure is not refined here.** Halving the element size doubles the node
+            // count in every direction, so an elliptic vector solve costs eight times as much and
+            // converges more slowly with it.
+            //
+            // # "Reported as unswept" is what this said, and it was not what happened
+            //
+            // Passing a structure through unchanged is right only while nothing else in the scene
+            // moves with it. One that `follows` a block does: the block doubles, the structure
+            // does not, and `World::build` refuses the pair because an element and a cell have to
+            // be the same box. So the sweep did not report the structure as unswept — it reported
+            // the whole refined scene as **refused**, and `25-what-140-kelvin-does-to-the-solder`
+            // has been failing its own resolution sweep since it shipped.
+            //
+            // Refusing here says why, once, instead of building a scene that cannot stand. What
+            // it costs is a real measurement: a coupled scene is exactly where discretisation
+            // error is worth knowing, and refining the two in step is a statement this per-domain
+            // method cannot make — `Scene::refined` sees every domain and could.
+            // **A structure is refined by [`Scene::refined`], not here.** One that follows a
+            // block is refinable only together with it, and that is a statement about two
+            // domains at once, which a function seeing one cannot make. One that follows nothing
+            // could be refined here — but then a scene would refine its structures in two
+            // different places depending on a field, so both go through the scene.
+            DomainSpec::Structure { name, .. } => {
+                return Err(format!(
+                    "{name}: a structure is refined with the block it follows, which is a \
+                     statement about two domains at once — `Scene::refined` makes it"
+                ))
+            }
+            // **A well refines and its eigenstate number does not.** `n` names which standing
+            // shape, not a wavelength in cells, so doubling the grid keeps the same state and the
+            // discrete eigenvalue converges on the continuum one from below — which is the thing
+            // the sweep should see. Scaling `n` with the grid would have been asking about a
+            // different state at every resolution.
+            DomainSpec::Well {
+                name,
+                cells,
+                width_nm,
+                electron_masses,
+                start,
+            } => Some(DomainSpec::Well {
+                name: name.clone(),
+                cells: cells * 2,
+                width_nm: *width_nm,
+                electron_masses: *electron_masses,
+                start: start.clone(),
+            }),
+            // **A cavity's resonances are a property of the box**, so refining halves the cell and
+            // doubles the counts and the frequency does not move — which is exactly what the sweep
+            // should find, and what a mode number scaled with the grid would have destroyed. The
+            // mode is `(m, p)` and stays `(m, p)`: it names a shape, not a wavelength in cells.
+            DomainSpec::Cavity {
+                name,
+                cells,
+                cell_mm,
+                medium,
+                mode,
+                amplitude_v_per_m,
+            } => Some(DomainSpec::Cavity {
+                name: name.clone(),
+                cells: [cells[0] * 2, cells[1] * 2, cells[2] * 2],
+                cell_mm: cell_mm / 2.0,
+                medium: medium.clone(),
+                mode: *mode,
+                amplitude_v_per_m: *amplitude_v_per_m,
+            }),
+            // **A channel refines, and its drive does not.** Halving the cell doubles the counts
+            // and leaves the body force alone: `g` is an acceleration and the closed forms are
+            // written in it, so scaling it would change the problem rather than resolve it. The
+            // viscous limit falls as `dx²` with the refinement, which is the cost the sweep is
+            // measuring and not a fault.
+            DomainSpec::Channel {
+                name,
+                cells,
+                cell_mm,
+                fluid,
+                walls,
+                drive_m_per_s2,
+            } => Some(DomainSpec::Channel {
+                name: name.clone(),
+                cells: [cells[0] * 2, cells[1] * 2, cells[2] * 2],
+                cell_mm: cell_mm / 2.0,
+                fluid: fluid.clone(),
+                walls: *walls,
+                drive_m_per_s2: *drive_m_per_s2,
+            }),
+            // A room's samples sit on the walls — `width` is `(n − 1)·dx` — so halving the
+            // spacing is `2n − 1`, exactly as for a hall below. The height is then quantised
+            // to whole cells of the *new* spacing, and for a height not commensurate with the
+            // width's cell that quantisation converges at first order; the module
+            // documentation names it as the contaminant it is.
+            DomainSpec::Room {
+                name,
+                width_m,
+                height_m,
+                cells_across,
+                release,
+            } => {
+                // The domain clamps to 3 samples, so "refining" 2 gives 2·2−1 = 3 — the same
+                // clamped grid, and the sweep would compare a run to itself and print the
+                // cleanest convergence in the report. Refused for the same reason a scene
+                // with nothing to refine is.
+                if *cells_across < 3 {
+                    return Err(format!(
+                        "{name}: {cells_across} samples across is clamped to 3 by the domain, \
+                         so a refinement would land on the same grid and compare the run to \
+                         itself"
+                    ));
+                }
+                Some(DomainSpec::Room {
+                    name: name.clone(),
+                    width_m: *width_m,
+                    height_m: *height_m,
+                    cells_across: cells_across * 2 - 1,
+                    release: release.clone(),
+                })
+            }
+            // `nodes_across` counts nodes, so halving the spacing is `2n − 1`, not `2n`:
+            // the width holds `n − 1` intervals and must hold twice as many, each half the
+            // size. `2n` would be a spacing of `(n−1)/(2n−1)` times the old one — close to
+            // half, not half, and the residue would read as discretisation error.
+            DomainSpec::Hall {
+                name,
+                width_m,
+                height_m,
+                depth_m,
+                nodes_across,
+                mode,
+                amplitude_pa,
+            } => {
+                // The same clamp guard as the room's: the hall clamps to 2 nodes, and
+                // 2·1 − 1 = 1 clamps straight back.
+                if *nodes_across < 2 {
+                    return Err(format!(
+                        "{name}: {nodes_across} node(s) across is clamped to 2 by the domain, \
+                         so a refinement would land on the same grid and compare the run to \
+                         itself"
+                    ));
+                }
+                Some(DomainSpec::Hall {
+                    name: name.clone(),
+                    width_m: *width_m,
+                    height_m: *height_m,
+                    depth_m: *depth_m,
+                    nodes_across: nodes_across * 2 - 1,
+                    mode: *mode,
+                    amplitude_pa: *amplitude_pa,
+                })
+            }
+            DomainSpec::Bar {
+                name,
+                length_mm,
+                cells,
+                area_mm2,
+                initial_c,
+                exposes,
+            } => Some(DomainSpec::Bar {
+                name: name.clone(),
+                length_mm: *length_mm,
+                cells: cells * 2,
+                area_mm2: *area_mm2,
+                initial_c: *initial_c,
+                exposes: exposes.as_ref().map(|b| crate::Boundary {
+                    name: b.name.clone(),
+                    face_area_mm2: b.face_area_mm2 / 2.0,
+                }),
+            }),
+            DomainSpec::Beam {
+                name,
+                onto,
+                faces,
+                face_area_mm2,
+                watts,
+                reserve_j,
+                waist_fraction,
+            } => Some(DomainSpec::Beam {
+                name: name.clone(),
+                onto: onto.clone(),
+                faces: faces * 2,
+                face_area_mm2: face_area_mm2 / 2.0,
+                watts: *watts,
+                reserve_j: *reserve_j,
+                waist_fraction: *waist_fraction,
+            }),
+            DomainSpec::Block {
+                name,
+                cells,
+                cell_mm,
+                initial_c,
+                material,
+                regions,
+                hot_spot,
+                parts,
+                grid_origin,
+                cooling,
+                dissipation,
+                contact,
+                air,
+                device,
+            } => {
+                if hot_spot.is_some() {
+                    return Err(format!(
+                        "{name}: a hot spot is one cell, so refining halves its physical size \
+                         and divides its energy by eight — a different problem, not a finer \
+                         one. Verify this scene without the hot spot, or state the initial \
+                         condition as a region"
+                    ));
+                }
+                Some(DomainSpec::Block {
+                    name: name.clone(),
+                    // A refinement runs where the original ran: a sweep that changed device
+                    // halfway would be comparing two arithmetics and calling it a grid study.
+                    device: *device,
+                    cells: [cells[0] * 2, cells[1] * 2, cells[2] * 2],
+                    cell_mm: cell_mm / 2.0,
+                    initial_c: *initial_c,
+                    material: material.clone(),
+                    regions: regions
+                        .iter()
+                        .map(|r| crate::Region {
+                            material: r.material.clone(),
+                            from: [r.from[0] * 2, r.from[1] * 2, r.from[2] * 2],
+                            to: [r.to[0] * 2, r.to[1] * 2, r.to[2] * 2],
+                            // A temperature is not a length: the same box starts at the same
+                            // degrees whatever the grid.
+                            initial_c: r.initial_c,
+                        })
+                        .collect(),
+                    hot_spot: None,
+                    // The same meshes, re-voxelised at the finer cell — which is the whole
+                    // reason a part is stated as geometry rather than as cells. A feature
+                    // thinner than the coarse grid appears at the fine one, and the sweep
+                    // reporting that as discretisation error is correct: it *is* the error,
+                    // and it is the kind with no other symptom.
+                    parts: parts.clone(),
+                    // Where the grid starts is a length, not a count, so it does not double: the
+                    // finer grid covers the same box from the same corner.
+                    grid_origin: *grid_origin,
+                    // The **area** is carried through unchanged, and that is the point of
+                    // stating a face's whole area rather than a cell's: the same part, exposed
+                    // the same way, on a finer grid. A per-cell area would have to be halved here
+                    // and the sweep would be comparing two different problems.
+                    //
+                    // A **patch** is stated in cells, so it doubles like a region's bounds. The
+                    // first version of this cloned the whole entry, and the bracket's bolt pad
+                    // came out a quarter of its own area at twice the grid: the sweep reported
+                    // **5.593%** on the peak, which reads as a discretisation error and was a
+                    // changed boundary condition. The same mistake the dissipation box below is
+                    // commented against, in the key next to it.
+                    cooling: cooling
+                        .iter()
+                        .map(|c| CoolingSpec {
+                            from: c.from.map(|f| [f[0] * 2, f[1] * 2]),
+                            to: c.to.map(|t| [t[0] * 2, t[1] * 2]),
+                            ..*c
+                        })
+                        .collect(),
+                    // The box doubles with the grid and the **watts do not**: a die dissipating
+                    // 45 W dissipates 45 W at any resolution. Getting this backwards is the
+                    // mistake the resolution sweep exists to catch, and it would have looked like
+                    // a physics finding rather than a refinement bug.
+                    dissipation: dissipation
+                        .iter()
+                        .map(|d| DissipationSpec {
+                            watts: d.watts,
+                            from: [d.from[0] * 2, d.from[1] * 2, d.from[2] * 2],
+                            to: [d.to[0] * 2, d.to[1] * 2, d.to[2] * 2],
+                        })
+                        .collect(),
+                    // **The place doubles and the conductance does not**, which is the
+                    // whole claim a contact makes: a joint is a resistance per unit area
+                    // with no thickness, so the finer grid puts the same joint on the same
+                    // physical plane and the answer must not move. A one-cell region of
+                    // poor material written to mean the same thing gives back half its
+                    // resistance here, and the sweep reports that as discretisation error
+                    // because that is exactly what it is.
+                    contact: contact
+                        .iter()
+                        .map(|c| crate::ContactSpec {
+                            axis: c.axis,
+                            at: c.at * 2,
+                            w_per_m2_k: c.w_per_m2_k,
+                            from: c.from.map(|f| [f[0] * 2, f[1] * 2]),
+                            to: c.to.map(|t| [t[0] * 2, t[1] * 2]),
+                        })
+                        .collect(),
+                    // The film and the temperature are properties of the air, not of the grid it
+                    // fills, so a refinement carries them through as they are — the same reason a
+                    // `cooling` entry's `area_cm2` is carried and its patch is doubled.
+                    air: *air,
+                })
+            }
+            DomainSpec::Conductor {
+                name,
+                cells,
+                cell_mm,
+                resistivity_ohm_m,
+                volts,
+                blocked,
+            } => {
+                // **A blocked cell is a box, and a box keeps its bounds.** This refused, on the
+                // reasoning that "a blocked cell is a one-cell notch, so refining shrinks it — a
+                // different geometry, not a finer one". That is true only of a refinement that
+                // keeps the *indices*: a cell at `(6, 0, 0)` of a 1 mm grid occupies
+                // `x ∈ [6, 7] mm`, and at 0.5 mm the same millimetres are indices 12 and 13. Each
+                // blocked cell becomes its **eight children** and the notch is the same notch.
+                //
+                // What it cost was the measurement: `17-a-busbar-with-a-notch` has a ligament two
+                // cells wide, current crowds at a notch root the way stress does, and nobody could
+                // ask whether two cells resolve it because the sweep would not run.
+                let finer: Vec<[usize; 3]> = blocked
+                    .iter()
+                    .flat_map(|c| {
+                        (0..8).map(move |n| {
+                            [
+                                c[0] * 2 + (n & 1),
+                                c[1] * 2 + ((n >> 1) & 1),
+                                c[2] * 2 + ((n >> 2) & 1),
+                            ]
+                        })
+                    })
+                    .collect();
+                Some(DomainSpec::Conductor {
+                    name: name.clone(),
+                    cells: [cells[0] * 2, cells[1] * 2, cells[2] * 2],
+                    cell_mm: cell_mm / 2.0,
+                    resistivity_ohm_m: *resistivity_ohm_m,
+                    volts: *volts,
+                    blocked: finer,
+                })
+            }
+            DomainSpec::Puck {
+                name,
+                cells,
+                cell_mm,
+                radius_mm,
+                grind_um,
+                porosity,
+                bar,
+                brew_c,
+                wall_c,
+                channel_porosity,
+            } => {
+                if channel_porosity.is_some() {
+                    return Err(format!(
+                        "{name}: the channel ring is one cell wide by construction, so refining \
+                         halves the channel — a different fault, not a finer statement of it"
+                    ));
+                }
+                Some(DomainSpec::Puck {
+                    name: name.clone(),
+                    cells: [cells[0] * 2, cells[1] * 2, cells[2] * 2],
+                    cell_mm: cell_mm / 2.0,
+                    radius_mm: *radius_mm,
+                    grind_um: *grind_um,
+                    porosity: *porosity,
+                    bar: *bar,
+                    brew_c: *brew_c,
+                    wall_c: *wall_c,
+                    channel_porosity: None,
+                })
+            }
+            // The system, not a discretisation of one. A heater is a tank, an orbit is its
+            // radii, a fluid is its atoms, a network is its nodes; twice as many atoms is a
+            // different piece of matter.
+            DomainSpec::Heater { .. }
+            | DomainSpec::Lump { .. }
+            | DomainSpec::Light { .. }
+            | DomainSpec::Winding { .. }
+            | DomainSpec::Network { .. }
+            | DomainSpec::Orbit { .. }
+            | DomainSpec::Bounce { .. }
+            | DomainSpec::Atoms { .. }
+            // A compartment model is a graph of volumes, like `Network`: there is no grid, and
+            // halving a volume states a different problem rather than the same one more finely.
+            | DomainSpec::Compartments { .. }
+            // **A protein has no resolution to halve.** Every other spatial domain here states a
+            // grid and the sweep asks whether the answer is the problem's or the grid's. A
+            // structure is not a discretisation of anything: it is where the atoms were measured
+            // to be, and there is nothing between two of them to subdivide. The parameter that
+            // *could* be doing the work is the cutoff, and `a_protein_sweeps_its_cutoff` sweeps
+            // that instead — a motion that moved with the cutoff would be a statement about the
+            // cutoff rather than about the fold.
+            | DomainSpec::Protein { .. }
+            // A molecule is the same: its atoms are the data, and a minimiser's steps are not a
+            // discretisation of anything — the minimum it reaches is the force field's, at
+            // whatever step count gets there.
+            | DomainSpec::Molecule { .. } => None,
+        };
+        Ok(spec)
+    }
+}
+
+impl Battery {
+    /// The report, as deterministic text.
+    ///
+    /// Fixed orderings and fixed formats throughout, because this output is a promise the same
+    /// scene prints the same report — and because the digest line is only worth printing from a
+    /// tool whose own bytes reproduce.
+    pub fn render(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        let _ = writeln!(out, "digest          {:016x}", self.base.digest);
+        let _ = writeln!(
+            out,
+            "determinism     {}",
+            if self.deterministic {
+                "two runs, identical bytes"
+            } else {
+                "FAILED: two runs differed — see findings"
+            }
+        );
+
+        let _ = writeln!(
+            out,
+            "\nconservation margins (whole-simulation audit, worst step)"
+        );
+        if self.base.drift.is_empty() {
+            let _ = writeln!(out, "  nothing on any ledger — no margins to have");
+        }
+        for (q, worst, tol) in &self.base.drift {
+            let headroom = if *worst > 0.0 {
+                format!("{:.1} digits in hand", (tol / worst).log10())
+            } else {
+                "no drift measured".to_string()
+            };
+            let _ = writeln!(out, "  {q:<10} {worst:.3e} of {tol:.1e} — {headroom}");
+        }
+        // The row the audit's scale floor would otherwise erase: a quantity that never rose
+        // above denormal was never audited, and a table that omitted it would read as "every
+        // quantity has margin" — the shape of a check that turned itself off.
+        for q in &self.base.unaudited {
+            let _ = writeln!(out, "  {q:<10} never above the scale floor — not audited");
+        }
+
+        // `advance` refuses in three places and the table above is one of them. These are the
+        // other two, which nothing outside the kernel could measure until it reported them.
+        let _ = writeln!(
+            out,
+            "
+the other two refusals (worst step; not comparable to each other — the first is an amount, the second a ratio on a domain's own scale)"
+        );
+        let row = |out: &mut String, label: &str, m: &Option<Margin>, absent: &str| match m {
+            Some(m) => {
+                let headroom = if m.worst > 0.0 {
+                    format!("{:.1} digits in hand", (m.tolerance / m.worst).log10())
+                } else {
+                    "exact".to_string()
+                };
+                let _ = writeln!(
+                    out,
+                    "  {label:<10} {:<24} {:.3e} of {:.1e} — {headroom}",
+                    m.what, m.worst, m.tolerance
+                );
+            }
+            None => {
+                let _ = writeln!(out, "  {label:<10} {absent}");
+            }
+        };
+        row(
+            &mut out,
+            "bus",
+            &self.base.margins.0,
+            "nothing was published — no transfer to audit",
+        );
+        row(
+            &mut out,
+            "own books",
+            &self.base.margins.1,
+            "no domain claims exact books — nothing to check on its own scale",
+        );
+
+        let _ = writeln!(out, "\nstability margins (limit vs the coupling window)");
+        if self.base.stability.is_empty() {
+            let _ = writeln!(out, "  no evolving domain — nothing has a limit");
+        }
+        for (name, limit, substeps) in &self.base.stability {
+            let _ = writeln!(
+                out,
+                "  {name:<14} limit {limit:.3e} s, {substeps} substep(s) per window"
+            );
+        }
+
+        let render_sweep = |out: &mut String, title: &str, sweep: &SweepOutcome, window: bool| {
+            let _ = writeln!(out, "\n{title}");
+            match sweep {
+                SweepOutcome::Ran(s) => {
+                    if window && !s.orders.is_empty() {
+                        let _ = writeln!(
+                            out,
+                            "  (a subcycled domain's window order includes substep-ceiling \
+                             rounding; it is meaningful for what the window itself governs)"
+                        );
+                    }
+                    if s.shifts.is_empty() {
+                        // Reachable only if every matched reading was broken, but a heading
+                        // with nothing under it reads as "swept, nothing moved" — the exact
+                        // misreading this line exists to prevent.
+                        let _ = writeln!(out, "  nothing was compared — see findings");
+                    }
+                    for shift in &s.shifts {
+                        // A diagnostic gets its values and no percentage. Printed in exponent
+                        // form because that is the only form they are readable in: `{:.6}` on a
+                        // residual is `0.000000`, which is how one of these rows managed to show
+                        // two zeros and a five-digit percentage between them.
+                        if shift.diagnostic {
+                            let _ = writeln!(
+                                out,
+                                "  {:<14} {:<14} {:.3e} -> {:.3e} {} (a solver diagnostic, not a discretisation)",
+                                shift.domain, shift.label, shift.base, shift.other, shift.unit
+                            );
+                            continue;
+                        }
+                        let _ = writeln!(
+                            out,
+                            "  {:<14} {:<14} {:.6} -> {:.6} {} ({:.3}%)",
+                            shift.domain,
+                            shift.label,
+                            shift.base,
+                            shift.other,
+                            shift.unit,
+                            shift.relative * 100.0
+                        );
+                    }
+                    for (domain, label, order) in &s.orders {
+                        match order {
+                            Order::Measured(p) => {
+                                let _ = writeln!(
+                                    out,
+                                    "  {domain:<14} {label:<14} converges at order {p:.2}"
+                                );
+                            }
+                            Order::BelowFloor => {
+                                let _ = writeln!(
+                                    out,
+                                    "  {domain:<14} {label:<14} differences at the rounding \
+                                     floor — converged below measurement"
+                                );
+                            }
+                            Order::NotAsymptotic => {
+                                let _ = writeln!(
+                                    out,
+                                    "  {domain:<14} {label:<14} differences grew as the knob \
+                                     refined — not in a regime an order describes"
+                                );
+                            }
+                        }
+                    }
+                    // The domains this sweep could not see. Without these rows a section
+                    // listing every other domain looks complete, and a reader concludes the
+                    // absent one was insensitive when in fact it was never measured.
+                    for name in &self.unread {
+                        let _ = writeln!(out, "  {name:<14} no readings — not swept");
+                    }
+                }
+                SweepOutcome::Skipped(why) => {
+                    let _ = writeln!(out, "  SKIPPED: {why}");
+                }
+                SweepOutcome::Failed(why) => {
+                    let _ = writeln!(out, "  FAILED: {why}");
+                }
+            }
+        };
+        render_sweep(
+            &mut out,
+            "window sensitivity (the window halved; what moved was hiding in it)",
+            &self.window,
+            true,
+        );
+        render_sweep(
+            &mut out,
+            "resolution sensitivity (every grid refined 2x; what moved is discretisation)",
+            &self.resolution,
+            false,
+        );
+
+        // **How far each body was asked past the linear model.** Printed whenever a structure
+        // follows a block, clean or not, so a body inside the model is visibly measured rather
+        // than merely unmentioned.
+        if !self.base.past_yield.is_empty() {
+            let _ = writeln!(
+                out,
+                "\nyield (the free strain against what each element comes back from; over 1 is \
+                 outside the linear model)"
+            );
+            for (domain, ratio, at) in &self.base.past_yield {
+                let _ = writeln!(out, "  {domain:<14} up to {ratio:>8.3}x at element {at:?}");
+            }
+        }
+
+        // **How far each block stopped from its own balance.** Printed whenever there is one to
+        // print, clean or not, so "it arrived" is visibly a measurement rather than a section that
+        // never ran.
+        //
+        // # Why this is not a finding, which it was for an afternoon
+        //
+        // Every reading a *design* asks for is a steady-state one — a junction temperature, a
+        // margin, a rise above ambient — so a run that stopped on the way there is quoting a
+        // number its own length chose, and that reads like a finding. It was written as one, at a
+        // percent, and then measured against the shipped scenes:
+        //
+        // ```text
+        //    0.000%  24-a-power-module              0.000041 K
+        //    0.020%  30-two-phases-crossing         0.004503 K
+        //    0.211%  29-a-designed-bracket          0.046502 K
+        //    0.540%  25-what-140-kelvin-does        0.757912 K
+        //   10.385%  19-a-coating-stops-the-heat   18.693843 K
+        //   13.256%  15-a-hot-spot-in-a-block       7.953824 K
+        //   63.596%  23-a-part-radiating-to-its-lid 178.069152 K
+        // ```
+        //
+        // The last three are transient **on purpose**. `19`'s whole claim is the interface step
+        // before the front reaches the glass, and running it to steady state moves the steepest
+        // step off the interface and breaks it; `15` is a spot spreading; `23` is a part cooling
+        // from 300 °C, and the number it reports is how much it shed. There is no threshold that
+        // separates those from a run that stopped early, because what separates them is the
+        // *question the scene is asking*, and this format does not carry one.
+        //
+        // So it reports the number and leaves the judgement to a person, which is what a battery
+        // that measures rather than asserts should do when it cannot tell.
+        if !self.base.arrival.is_empty() {
+            let _ = writeln!(
+                out,
+                "\narrival (the balance solved where the run stopped; what moved was still to come)"
+            );
+            for (domain, moved, travel) in &self.base.arrival {
+                let share = if *travel > 0.0 {
+                    format!("{:.3}%", moved / travel * 100.0)
+                } else {
+                    "—".to_string()
+                };
+                let _ = writeln!(
+                    out,
+                    "  {domain:<14} {moved:>12.6} K still to come, {share} of the {travel:.4} C it covered"
+                );
+            }
+        }
+
+        // Only for a scene that states `parts`. A heading over an empty list would be this
+        // report claiming to have checked geometry a scene does not have; a scene that *does*
+        // have it gets every row, clean or not, so "no finding" is visibly a measurement rather
+        // than a section that never ran.
+        if !self.rasterised.is_empty() {
+            let _ = writeln!(
+                out,
+                "\nrasterisation (what the grid could not hold; zero cells is absent, not coarse)"
+            );
+            for r in &self.rasterised {
+                let _ = writeln!(
+                    out,
+                    "  {:<18} {:<14} at {} mm: {} cells, volume {:+.2}%, {:.0}% boundary, {} thin, {} undecided",
+                    r.site,
+                    r.stl,
+                    r.cell_mm,
+                    r.filled,
+                    r.loss.volume_error * 100.0,
+                    r.loss.boundary_fraction * 100.0,
+                    r.loss.thin_runs,
+                    r.loss.ambiguous_rows,
+                );
+            }
+        }
+
+        if self.findings.is_empty() {
+            let _ = writeln!(out, "\nno structural findings");
+        } else {
+            let _ = writeln!(out, "\nFINDINGS");
+            for f in &self.findings {
+                let _ = writeln!(out, "  ! {f}");
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The digest is pinned so a platform that rounded differently — or a formatting change
+    /// that reordered the JSON — fails here rather than quietly re-stamping every report.
+    #[test]
+    fn the_digest_is_fnv1a() {
+        assert_eq!(fnv1a(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a(b"a"), 0xaf63dc4c8601ec8c);
+    }
+
+    /// The floor guard: an order computed from rounding noise is refused in every arm — both
+    /// differences below, the denominator below, and the **numerator** below, which is the arm
+    /// that was missing: `order(1.0, 1.0+1e-16, 1.001)` printed "converges at order -inf", a
+    /// number fabricated from rounding wearing the name of a measurement.
+    #[test]
+    fn an_order_is_not_invented_from_the_rounding_floor() {
+        let r = |v: f64| Reading::new("d", "x", v, "");
+        // Differences at 1e-16 of the scale: below the floor on both.
+        let o = orders_of(
+            &[r(1.0)],
+            &[r(1.0 + 1e-16)],
+            &[r(1.0 + 2e-16)],
+            &BTreeSet::new(),
+        );
+        assert!(matches!(o[0].2, Order::BelowFloor));
+        // A real coarse difference over a rounding-level fine one: converged, not infinite.
+        let o = orders_of(&[r(1.01)], &[r(1.0)], &[r(1.0 + 1e-16)], &BTreeSet::new());
+        assert!(matches!(o[0].2, Order::BelowFloor));
+        // The mirror: a rounding-level coarse difference under a real fine one is not an
+        // order of -inf, it is no order at all.
+        let o = orders_of(&[r(1.0)], &[r(1.0 + 1e-16)], &[r(1.001)], &BTreeSet::new());
+        assert!(matches!(o[0].2, Order::NotAsymptotic));
+        let o = orders_of(&[r(1.0)], &[r(1.0)], &[r(1.001)], &BTreeSet::new());
+        assert!(matches!(o[0].2, Order::NotAsymptotic));
+        // Clean halving reads first order.
+        let o = orders_of(&[r(1.4)], &[r(1.2)], &[r(1.1)], &BTreeSet::new());
+        match o[0].2 {
+            Order::Measured(p) => assert!((p - 1.0).abs() < 1e-12),
+            _ => panic!("a clean ratio was refused"),
+        }
+    }
+
+    /// A temperature's rounding lives on the kelvin scale whatever celsius it displays: a
+    /// 3 mK shift on a bar near 0 C must not read as 14%, and kelvin-rounding differences
+    /// must not acquire an order. Measured before the fix: `bar/mean` at a −0.258 C datum
+    /// reported a 13.8% resolution shift and `Measured(0.000)` where the 20 C datum reported
+    /// 1.6e-4 and BelowFloor — identical physics, different offsets.
+    #[test]
+    fn a_celsius_reading_is_judged_on_the_kelvin_scale() {
+        let c = |v: f64| Reading::new("bar", "mean", v, "C");
+        // A 3.2 mK shift near 0 C: relative to the representation, not to the tiny display.
+        // The bar cooled through about 30 K to get to 0 °C, which is the denominator a
+        // sensitivity belongs over: 3.2 mK of it is 1.1e-4, not the 13.8% its *displayed*
+        // magnitude near zero would have given.
+        let travelled: BTreeMap<(String, &'static str), f64> =
+            [(("bar".to_string(), "C"), 30.0)].into();
+        let s = compare(&[c(0.00035)], &[c(0.00355)], &travelled, &BTreeSet::new());
+        assert!(
+            s.shifts[0].relative < 1e-3,
+            "a millikelvin of a 30 K cooldown read as {:.3}",
+            s.shifts[0].relative
+        );
+        // And with no span at all — a reading that never moved — the old representation scale
+        // is the fallback, so the same pair still does not read as a fraction of nothing.
+        let s = compare(
+            &[c(0.00035)],
+            &[c(0.00355)],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert!(
+            s.shifts[0].relative < 1e-4,
+            "a millikelvin on a still reading read as {:.3}",
+            s.shifts[0].relative
+        );
+        // Kelvin-rounding differences (~6e-14 absolute) sit below the kelvin-scale floor
+        // (~2.7e-10) and stay refused rather than becoming an order of zero.
+        let o = orders_of(&[c(0.0)], &[c(6e-14)], &[c(1.2e-13)], &BTreeSet::new());
+        assert!(matches!(o[0].2, Order::BelowFloor));
+    }
+
+    /// **A residual must not be able to set the summary.** [`Sweep::worst`] is the one number a
+    /// finding is raised on, and a diagnostic's `relative` is a percentage of noise — the notch's
+    /// read **281492%**. The filter that keeps them out was measured to be unreachable: removing it
+    /// entirely left every test in both workspaces green, because only the *window* sweep's `worst`
+    /// is read and only the *resolution* sweep moves a residual. A guard aimed at a path no input
+    /// reaches is a guard nothing holds, so this reaches it directly.
+    #[test]
+    fn a_diagnostic_cannot_set_the_worst_shift() {
+        let r = |l: &str, v: f64, u: &'static str| Reading::new("d", l, v, u);
+        // The notch's own numbers: a residual that halved, beside a reading that moved 0.1%.
+        // The pair the *domain* declared, which is what this asks about now. Keyed on
+        // `(domain, label)`, so a different domain's `residual` is a different question.
+        let declared: BTreeSet<(String, String)> = [("d".to_string(), "residual".to_string())]
+            .into_iter()
+            .collect();
+        let s = compare(
+            &[r("residual", 7.793e-13, ""), r("peak", 1.0, "C")],
+            &[r("residual", 6.644e-13, ""), r("peak", 1.001, "C")],
+            &BTreeMap::new(),
+            &declared,
+        );
+        assert!(
+            s.shifts.iter().any(|x| x.diagnostic),
+            "the residual was not recognised as a diagnostic"
+        );
+        assert!(
+            s.shifts.iter().any(|x| !x.diagnostic),
+            "the temperature was miscounted as a diagnostic"
+        );
+        // Without the filter this is the residual's own ratio against its magnitude, ~0.15.
+        assert!(
+            s.worst < 0.01,
+            "a solver residual set the summary at {:.4}",
+            s.worst
+        );
+    }
+
+    /// The broken channel: a NaN and a duplicated key must each surface as a broken row
+    /// rather than becoming a routine-looking shift or vanishing from the comparison.
+    #[test]
+    fn a_broken_reading_is_reported_rather_than_compared() {
+        let r = |d: &str, l: &str, v: f64| Reading::new(d, l, v, "");
+        let s = compare(
+            &[r("d", "x", f64::NAN)],
+            &[r("d", "x", 1.0)],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert!(s.shifts.is_empty(), "a NaN was compared as arithmetic");
+        assert_eq!(s.broken.len(), 1);
+
+        let s = compare(
+            &[r("d", "x", 1.0), r("d", "x", 2.0)],
+            &[r("d", "x", 1.0)],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert!(
+            s.broken
+                .iter()
+                .any(|b| b.contains("two readings under one name")),
+            "{:?}",
+            s.broken
+        );
+    }
+}

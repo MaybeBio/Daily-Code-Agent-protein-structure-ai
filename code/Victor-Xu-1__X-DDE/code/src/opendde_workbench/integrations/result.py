@@ -1,0 +1,211 @@
+"""Scientific outputs are typed and bound to original requests and actual artifact bytes."""
+
+import hashlib
+import json
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from ..artifacts import contained
+from ..proximity.result_models import TernaryResult
+from ..scientific_objects import MoleculeRef
+from ..simulations.results import DynamicsResult, FreeEnergyResult, validate_simulation
+from .binder_result import BinderQuality
+from .boltz_result import BoltzEvidence, validate_boltz_result
+from .mol1_result import Mol1Evidence, validate_mol1_result
+from .sequence_design_result import SequenceDesignResult, validate_sequence_design
+
+
+class NativeMetric(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=80)
+    value: float = Field(allow_inf_nan=False)
+    unit: str = Field(min_length=1, max_length=60)
+    method: str = Field(min_length=1, max_length=120)
+    meaning: Literal["score", "confidence", "descriptor", "energy", "validation"]
+
+
+class NativeCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,80}$")
+    artifact: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,160}$")
+    smiles: str | None = Field(default=None, max_length=5000)
+    sequence: str | None = Field(default=None, max_length=10000)
+    metrics: list[NativeMetric] = Field(default_factory=list, max_length=40)
+    geometry: Literal["predicted_structure", "unbound_conformer", "source_frame", "none"] = "none"
+
+
+class NativeResult(BaseModel):
+    boltz: BoltzEvidence | None = Field(default=None, exclude_if=lambda value: value is None)
+    mol1: Mol1Evidence | None = Field(default=None, exclude_if=lambda value: value is None)
+    model_config = ConfigDict(extra="forbid")
+    operation: str
+    schema_version: Literal[1] = 1
+    complete: Literal[True] = True
+    request_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    program: str
+    version: str
+    candidates: list[NativeCandidate] = Field(default_factory=list, max_length=1000)
+    metrics: list[NativeMetric] = Field(default_factory=list, max_length=40)
+    artifact_sha256: dict[str, str] = Field(min_length=1, max_length=1100)
+    model_artifact: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,160}$")
+    potential_artifact: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,160}$")
+    proximity: TernaryResult | None = None
+    dynamics: DynamicsResult | None = None
+    free_energy: FreeEnergyResult | None = None
+    sequence_design: SequenceDesignResult | None = None
+    binder_quality: BinderQuality | None = None
+    structure_artifact: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,160}$")
+    potential_unit: Literal["kBT/e"] | None = None
+    interactions: list["NativeInteraction"] = Field(default_factory=list, max_length=1000)
+    protein_interfaces: list["ProteinInterfaceResult"] | None = Field(
+        default=None, min_length=1, max_length=3, exclude_if=lambda value: value is None
+    )
+    validation_points: list["ValidationPoint"] = Field(default_factory=list, max_length=500)
+    scope: Literal["native_computation_not_experimental_measurement"] = (
+        "native_computation_not_experimental_measurement"
+    )
+
+
+class NativeInteraction(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    kind: Literal[
+        "hydrogen_bond",
+        "hydrophobic",
+        "salt_bridge",
+        "pi_stack",
+        "pi_cation",
+        "halogen_bond",
+        "water_bridge",
+        "metal_complex",
+    ]
+    chain: str = Field(min_length=1, max_length=8)
+    number: int = Field(ge=-99999, le=999999)
+    residue: str = Field(min_length=1, max_length=8)
+    protein_position: tuple[float, float, float]
+    ligand_position: tuple[float, float, float]
+    distance: float = Field(ge=0, le=20, allow_inf_nan=False)
+    bridge_position: tuple[float, float, float] | None = None
+
+
+class InterfaceResidue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    chain: str = Field(pattern=r"^[A-Za-z0-9]$")
+    number: int = Field(ge=-9999, le=99999)
+    residue: str = Field(min_length=1, max_length=8)
+    insertion_code: str = Field(default="", max_length=1)
+
+
+class InterfaceInteraction(NativeInteraction):
+    insertion_code: str = Field(default="", max_length=1)
+    partner: InterfaceResidue
+    partner_role: Literal["partner", "cofactor"] = "partner"
+
+
+class ProteinInterfaceResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=80)
+    source: MoleculeRef
+    structure_artifact: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,160}$")
+    xml_artifact: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,160}$")
+    text_artifact: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,160}$")
+    table_artifact: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,160}$")
+    interactions: list[InterfaceInteraction] = Field(max_length=10000)
+    polymer_residues: int = Field(ge=2, le=50000)
+
+
+class ValidationPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    smiles: str = Field(min_length=1, max_length=5000)
+    observed: float
+    predicted: float
+
+
+def validate_result(value, request, output):
+    result = NativeResult.model_validate(value)
+    validate_boltz_result(result, request)
+    validate_sequence_design(result, request)
+    from .protein_interface_result import validate_interface_result
+
+    validate_interface_result(result, request, output)
+    expected = hashlib.sha256(request.model_dump_json().encode()).hexdigest()
+    if (
+        result.operation != request.operation
+        or result.program != request.payload.kind
+        or result.request_sha256 != expected
+    ):
+        raise ValueError("Native result differs from its exact task snapshot.")
+    identities = [item.id for item in result.candidates]
+    if len(identities) != len(set(identities)):
+        raise ValueError("Native candidate identities must be unique.")
+    required = {item.artifact for item in result.candidates if item.artifact}
+    required.update(
+        name
+        for name in (result.model_artifact, result.potential_artifact, result.structure_artifact)
+        if name
+    )
+    if not required <= result.artifact_sha256.keys():
+        raise ValueError("Native scientific files are missing their exact byte identities.")
+    for name, expected_digest in result.artifact_sha256.items():
+        if not name or "/" in name or "\\" in name or name in {".", "..", "result.json"}:
+            raise ValueError("Native output identities must refer to direct scientific files.")
+        file = contained(output, name)
+        if not 0 < file.stat().st_size <= 1024**3:
+            raise ValueError("Native scientific file is empty or exceeds its size budget.")
+        with file.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        if digest != expected_digest:
+            raise ValueError("Native scientific artifact bytes changed.")
+    if request.operation == "chemprop_train" and not result.model_artifact:
+        raise ValueError("Property training produced no reusable native checkpoint.")
+    if request.operation == "boltzgen_design" and request.payload.continuation:
+        name = "binder-continuation-source.json"
+        if name not in result.artifact_sha256:
+            raise ValueError("The continued binder result has no sealed source checkpoint receipt.")
+        receipt = contained(output, name)
+        if receipt.stat().st_size > 2 * 1024**2:
+            raise ValueError("The binder continuation receipt exceeds its size boundary.")
+        manifest = json.loads(receipt.read_bytes())
+        digest = hashlib.sha256(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if digest != request.payload.continuation.sha256 or manifest.get("job_id") != str(
+            request.payload.continuation.job_id
+        ):
+            raise ValueError("Continued binder output belongs to a different source checkpoint.")
+    if request.operation == "electrostatics" and not (
+        result.potential_artifact and result.structure_artifact and result.potential_unit == "kBT/e"
+    ):
+        raise ValueError("Electrostatic calculation produced no coordinate-bound potential map.")
+    if (
+        request.operation
+        in {
+            "boltz_predict",
+            "reinvent_design",
+            "ligandmpnn_design",
+            "boltzgen_design",
+            "structure_refine",
+            "chemprop_predict",
+        }
+        and not result.candidates
+    ):
+        raise ValueError("The scientific program produced no usable native candidates.")
+    if request.operation == "ternary_model":
+        from ..proximity.result import validate_ternary
+
+        validate_ternary(result, request, output)
+    elif result.proximity is not None:
+        raise ValueError("Ternary evidence belongs only to its exact native operation.")
+    validate_simulation(result, request)
+    validate_mol1_result(result, request, output)
+    from ..simulations.restraint_result import validate_restraint_result
+
+    validate_restraint_result(result, request, output)
+    from .binder_evidence import binder_evidence
+
+    quality = binder_evidence(output, request, result.candidates)
+    expected_quality = BinderQuality.model_validate(quality) if quality is not None else None
+    if result.binder_quality is not None and result.binder_quality != expected_quality:
+        raise ValueError("Binder quality differs from its retained native report.")
+    result.binder_quality = expected_quality
+    return result

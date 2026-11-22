@@ -1,0 +1,79 @@
+.scientific-input-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+  align-items: start;
+}
+.scientific-component-input {
+  min-width: 0;
+  padding: 12px 0;
+  display: grid;
+  gap: 14px;
+}
+.scientific-component-input > label {
+  display: grid;
+  gap: 6px;
+}
+.scientific-component-input .inline-fields {
+  display: flex;
+  gap: 12px;
+  align-items: start;
+}
+.scientific-component-input .inline-fields label {
+  display: grid;
+  gap: 6px;
+}
+.scientific-component-input .questionnaire-choices input[type="radio"] {
+  width: auto;
+  flex: 0 0 auto;
+}
+.scientific-component-input .questionnaire-choices label {
+  min-height: 58px;
+  padding: 14px;
+}
+.scientific-component-input .questionnaire-choices span {
+  min-width: 0;
+  flex: 1;
+}
+.scientific-component-input textarea {
+  min-height: 90px;
+  resize: vertical;
+}
+.scientific-component-input .text-button {
+  justify-self: start;
+}
+.scientific-expert-toggle {
+  display: block;
+  margin-top: 18px;
+}
+.design-fragment-previews {
+  display: grid;
+  gap: 20px;
+}
+.design-fragment-previews figure {
+  margin: 0;
+  min-width: 0;
+}
+.design-fragment-previews figcaption {
+  color: var(--muted);
+  font-size: 12px;
+}
+.molecule-design-review .molecule-drawing-style select {
+  width: 190px;
+  max-width: 100%;
+  font-size: 12px;
+}
+.molecule-design-review.is-submission-review
+  .molecule-inspection-view
+  .figure-preview-sheet {
+  height: clamp(240px, 28svh, 320px);
+}
+.scientific-input-grid > .secondary-button {
+  grid-column: 1/-1;
+  justify-self: start;
+}
+@media (max-width: 900px) {
+  .scientific-input-grid {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,1455 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2011-2023 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+
+#include "Grid.h"
+#include "Tools.h"
+#include "core/Value.h"
+#include "File.h"
+#include "Exception.h"
+#include "Checkpoint.h"
+#include "small_vector/small_vector.h"
+
+#include <vector>
+#include <limits>
+#include <cstdlib>
+#include <cmath>
+#include <iostream>
+#include <sstream>
+#include <cstdio>
+#include <cfloat>
+#include <array>
+
+namespace PLMD {
+
+constexpr std::size_t GridBase::maxdim;
+
+template<unsigned dimension_>
+class Accelerator final:
+  public Grid::AcceleratorBase {
+
+public:
+
+  unsigned getDimension() const override {
+    return dimension_;
+  }
+
+  std::vector<GridBase::index_t> getNeighbors(const GridBase& grid, const std::vector<unsigned> & nbin_,const std::vector<bool> & pbc_,const unsigned* indices,std::size_t indices_size,const std::vector<unsigned> &nneigh)const override {
+    plumed_dbg_assert(indices_size==dimension_ && nneigh.size()==dimension_);
+
+    std::vector<Grid::index_t> neighbors;
+    std::array<unsigned,dimension_> small_bin;
+    std::array<unsigned,dimension_> small_indices;
+    std::array<unsigned,dimension_> tmp_indices;
+
+    unsigned small_nbin=1;
+    for(unsigned j=0; j<dimension_; ++j) {
+      small_bin[j]=(2*nneigh[j]+1);
+      // along a periodic direction a neighborhood larger than the grid would visit
+      // some points more than once: visit each point of the grid exactly once instead
+      if(pbc_[j] && small_bin[j]>nbin_[j]) {
+        small_bin[j]=nbin_[j];
+      }
+      small_nbin*=small_bin[j];
+    }
+    neighbors.reserve(small_nbin);
+
+    for(unsigned j=0; j<dimension_; j++) {
+      small_indices[j]=0;
+    }
+
+    for(unsigned index=0; index<small_nbin; ++index) {
+      unsigned ll=0;
+      for(unsigned i=0; i<dimension_; ++i) {
+        int i0=small_indices[i]-nneigh[i]+indices[i];
+        if(!pbc_[i] && i0<0) {
+          continue;
+        }
+        if(!pbc_[i] && i0>=static_cast<int>(nbin_[i])) {
+          continue;
+        }
+        if( pbc_[i] ) {
+          const int n=nbin_[i];
+          i0=((i0%n)+n)%n;
+        }
+        tmp_indices[ll]=static_cast<unsigned>(i0);
+        ll++;
+      }
+      if(ll==dimension_) {
+        neighbors.push_back(getIndex(grid,nbin_,&tmp_indices[0],dimension_));
+      }
+
+      small_indices[0]++;
+      for(unsigned j=0; j<dimension_-1; j++)
+        if(small_indices[j]==small_bin[j]) {
+          small_indices[j]=0;
+          small_indices[j+1]++;
+        }
+    }
+    return neighbors;
+  }
+
+  // we are flattening arrays using a column-major order
+  GridBase::index_t getIndex(const GridBase& grid, const std::vector<unsigned> & nbin_,const unsigned* indices,std::size_t indices_size) const override {
+    for(unsigned int i=0; i<dimension_; i++)
+      if(indices[i]>=nbin_[i]) {
+        plumed_error() << "Looking for a value outside the grid along the " << i << " dimension (arg name: "<<grid.getArgNames()[i]<<")";
+      }
+    auto index=indices[dimension_-1];
+    for(unsigned int i=dimension_-1; i>0; --i) {
+      index=index*nbin_[i-1]+indices[i-1];
+    }
+    return index;
+  }
+
+  // The points are computed as min+i*dx with two roundings, also when the compiler
+  // would contract the expression into a fused multiply-add (clang does by default on arm64,
+  // gcc on any architecture with FMA). With a single rounding the last point of a grid
+  // from -4 to 4 with 300 bins is 4.000000000000001, i.e. outside the grid boundary.
+#if defined(__GNUC__) && !defined(__clang__)
+  __attribute__((optimize("fp-contract=off")))
+#endif
+  void getPoint(const std::vector<double> & min_,const std::vector<double> & dx_, const unsigned* indices,std::size_t indices_size,double* point,std::size_t point_size) const override {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    for(unsigned int i=0; i<dimension_; ++i) {
+      point[i]=min_[i]+(double)(indices[i])*dx_[i];
+    }
+  }
+
+  void getIndices(const std::vector<double> & min_,const std::vector<double> & dx_, const std::vector<double> & x, unsigned* rindex_data,std::size_t rindex_size) const override {
+    plumed_dbg_assert(x.size()==dimension_);
+    plumed_dbg_assert(rindex_size==dimension_);
+    for(unsigned int i=0; i<dimension_; ++i) {
+      const double f=std::floor((x[i]-min_[i])/dx_[i]);
+      // converting a negative (or too large) double to unsigned is undefined behavior:
+      // on x86 it gave a huge index (and getIndex raised an error), on arm64 it gives 0
+      // (i.e. the value of the first bin). Map it explicitly to an invalid index.
+      rindex_data[i] = (f>=0.0 && f<double(std::numeric_limits<unsigned>::max())) ?
+                       static_cast<unsigned>(f) : std::numeric_limits<unsigned>::max();
+    }
+  }
+
+
+  // we are flattening arrays using a column-major order
+  void getIndices(const std::vector<unsigned> & nbin_, GridBase::index_t index, unsigned* indices, std::size_t indices_size) const override {
+    plumed_assert(indices_size==dimension_)<<indices_size;
+    for(unsigned int i=0; i<dimension_-1; ++i) {
+      indices[i]=index%nbin_[i];
+      index/=nbin_[i];
+    }
+    indices[dimension_-1]=index;
+  }
+
+};
+
+std::unique_ptr<Grid::AcceleratorBase> Grid::AcceleratorBase::create(unsigned dim) {
+// I do this by enumeration.
+// Maybe can be simplified using the preprocessor, but I am not sure it's worth it
+  if(dim==1) {
+    return std::make_unique<Accelerator<1>>();
+  }
+  if(dim==2) {
+    return std::make_unique<Accelerator<2>>();
+  }
+  if(dim==3) {
+    return std::make_unique<Accelerator<3>>();
+  }
+  if(dim==4) {
+    return std::make_unique<Accelerator<4>>();
+  }
+  if(dim==5) {
+    return std::make_unique<Accelerator<5>>();
+  }
+  if(dim==6) {
+    return std::make_unique<Accelerator<6>>();
+  }
+  if(dim==7) {
+    return std::make_unique<Accelerator<7>>();
+  }
+  if(dim==8) {
+    return std::make_unique<Accelerator<8>>();
+  }
+  if(dim==9) {
+    return std::make_unique<Accelerator<9>>();
+  }
+  if(dim==10) {
+    return std::make_unique<Accelerator<10>>();
+  }
+  if(dim==11) {
+    return std::make_unique<Accelerator<11>>();
+  }
+  if(dim==12) {
+    return std::make_unique<Accelerator<12>>();
+  }
+  if(dim==13) {
+    return std::make_unique<Accelerator<13>>();
+  }
+  if(dim==14) {
+    return std::make_unique<Accelerator<14>>();
+  }
+  if(dim==15) {
+    return std::make_unique<Accelerator<15>>();
+  }
+  if(dim==16) {
+    return std::make_unique<Accelerator<16>>();
+  }
+// no need to go beyond this
+  plumed_error();
+}
+
+GridBase::GridBase(const std::string& funcl, const std::vector<Value*> & args, const std::vector<std::string> & gmin,
+                   const std::vector<std::string> & gmax, const std::vector<unsigned> & nbin, bool dospline, bool usederiv) {
+// various checks
+  plumed_assert(args.size()<=maxdim) << "grid dim cannot exceed "<<maxdim;
+  plumed_massert(args.size()==gmin.size(),"grid min dimensions in input do not match number of arguments");
+  plumed_massert(args.size()==nbin.size(),"number of bins on input do not match number of arguments");
+  plumed_massert(args.size()==gmax.size(),"grid max dimensions in input do not match number of arguments");
+  unsigned dim=gmax.size();
+  std::vector<std::string> names;
+  std::vector<bool> isperiodic;
+  std::vector<std::string> pmin,pmax;
+  names.resize( dim );
+  isperiodic.resize( dim );
+  pmin.resize( dim );
+  pmax.resize( dim );
+  for(unsigned int i=0; i<dim; ++i) {
+    names[i]=args[i]->getName();
+    if( args[i]->isPeriodic() ) {
+      isperiodic[i]=true;
+      args[i]->getDomain( pmin[i], pmax[i] );
+    } else {
+      isperiodic[i]=false;
+      pmin[i]="0.";
+      pmax[i]="0.";
+    }
+  }
+// this is a value-independent initializator
+  Init(funcl,names,gmin,gmax,nbin,dospline,usederiv,isperiodic,pmin,pmax);
+}
+
+GridBase::GridBase(const std::string& funcl, const std::vector<std::string> &names, const std::vector<std::string> & gmin,
+                   const std::vector<std::string> & gmax, const std::vector<unsigned> & nbin, bool dospline, bool usederiv,
+                   const std::vector<bool> &isperiodic, const std::vector<std::string> &pmin, const std::vector<std::string> &pmax ) {
+// this calls the initializator
+  Init(funcl,names,gmin,gmax,nbin,dospline,usederiv,isperiodic,pmin,pmax);
+}
+
+void GridBase::Init(const std::string& funcl, const std::vector<std::string> &names, const std::vector<std::string> & gmin,
+                    const std::vector<std::string> & gmax, const std::vector<unsigned> & nbin, bool dospline, bool usederiv,
+                    const std::vector<bool> &isperiodic, const std::vector<std::string> &pmin, const std::vector<std::string> &pmax ) {
+  fmt_="%14.9f";
+// various checks
+  plumed_assert(names.size()<=maxdim) << "grid size cannot exceed "<<maxdim;
+  plumed_massert(names.size()==gmin.size(),"grid dimensions in input do not match number of arguments");
+  plumed_massert(names.size()==nbin.size(),"grid dimensions in input do not match number of arguments");
+  plumed_massert(names.size()==gmax.size(),"grid dimensions in input do not match number of arguments");
+  dimension_=gmax.size();
+  accelerator=AcceleratorHandler(dimension_);
+  str_min_=gmin;
+  str_max_=gmax;
+  argnames.resize( dimension_ );
+  min_.resize( dimension_ );
+  max_.resize( dimension_ );
+  pbc_.resize( dimension_ );
+  for(unsigned int i=0; i<dimension_; ++i) {
+    argnames[i]=names[i];
+    if( isperiodic[i] ) {
+      pbc_[i]=true;
+      str_min_[i]=pmin[i];
+      str_max_[i]=pmax[i];
+    } else {
+      pbc_[i]=false;
+    }
+    Tools::convert(str_min_[i],min_[i]);
+    Tools::convert(str_max_[i],max_[i]);
+    funcname=funcl;
+    plumed_massert(max_[i]>min_[i],"maximum in grid must be larger than minimum");
+    plumed_massert(nbin[i]>0,"number of grid points must be greater than zero");
+  }
+  nbin_=nbin;
+  dospline_=dospline;
+  usederiv_=usederiv;
+  if(dospline_) {
+    plumed_assert(dospline_==usederiv_);
+  }
+  maxsize_=1;
+  for(unsigned int i=0; i<dimension_; ++i) {
+    dx_.push_back( (max_[i]-min_[i])/static_cast<double>( nbin_[i] ) );
+    if( !pbc_[i] ) {
+      max_[i] += dx_[i];
+      nbin_[i] += 1;
+    }
+    maxsize_*=nbin_[i];
+  }
+}
+
+bool GridBase::isInside(const std::vector<double> & x) const {
+  plumed_dbg_assert(x.size()==dimension_);
+  for(unsigned i=0; i<dimension_; ++i) {
+    if(!pbc_[i]) {
+      // same arithmetic as getIndices (false also for a NaN)
+      const double k=std::floor((x[i]-min_[i])/dx_[i]);
+      if(!(k>=0.0 && k<static_cast<double>(nbin_[i]))) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+namespace {
+/// bound of a resized grid as a string: 12 significant digits, so that the files do not depend on the last digits of
+/// the bounds, which can differ between platforms (e.g. with fused multiply-add); when a grid is read from a file
+/// its lattice is compared with a tolerance
+std::string boundString(double x) {
+  char buffer[64];
+  std::snprintf(buffer,sizeof(buffer),"%.12g",x);
+  return buffer;
+}
+}
+
+void GridBase::resize(const std::vector<long long> & lower, const std::vector<long long> & upper) {
+  plumed_assert(lower.size()==dimension_ && upper.size()==dimension_);
+  const std::vector<unsigned> oldnbin(nbin_);
+  std::vector<unsigned> newnbin(nbin_);
+  double newsize=1.0;
+  for(unsigned i=0; i<dimension_; ++i) {
+    if(lower[i]!=0 || upper[i]!=0) {
+      plumed_massert(!pbc_[i],"periodic directions of a grid cannot be resized");
+      const long long n=static_cast<long long>(nbin_[i])+lower[i]+upper[i];
+      plumed_massert(n>=2 && n<=static_cast<long long>(std::numeric_limits<unsigned>::max()),"invalid number of grid points after resizing");
+      newnbin[i]=static_cast<unsigned>(n);
+    }
+    newsize*=newnbin[i];
+  }
+  plumed_massert(newsize<static_cast<double>(std::numeric_limits<index_t>::max()),"too many grid points after resizing");
+  for(unsigned i=0; i<dimension_; ++i) {
+    if(lower[i]!=0 || upper[i]!=0) {
+      min_[i]-=static_cast<double>(lower[i])*dx_[i];
+      max_[i]+=static_cast<double>(upper[i])*dx_[i];
+      nbin_[i]=newnbin[i];
+      // as in the input of a non-periodic grid, the maximum is the last point
+      str_min_[i]=boundString(min_[i]);
+      str_max_[i]=boundString(max_[i]-dx_[i]);
+    }
+  }
+  maxsize_=1;
+  for(unsigned i=0; i<dimension_; ++i) {
+    maxsize_*=nbin_[i];
+  }
+  resizeData(oldnbin,lower);
+}
+
+void GridBase::forEachStoredPoint(const std::function<void(index_t,double)> & f) const {
+  const index_t n=getSize();
+  for(index_t i=0; i<n; ++i) {
+    f(i,getValue(i));
+  }
+}
+
+void SparseGrid::forEachStoredPoint(const std::function<void(index_t,double)> & f) const {
+  for(const auto & it : map_) {
+    f(it.first,it.second);
+  }
+}
+
+void GridBase::resizeData(const std::vector<unsigned> & oldnbin, const std::vector<long long> & shift) {
+  plumed_merror("this kind of grid cannot be resized");
+}
+
+std::vector<std::string> GridBase::getMin() const {
+  return str_min_;
+}
+
+std::vector<std::string> GridBase::getMax() const {
+  return str_max_;
+}
+
+std::vector<double> GridBase::getDx() const {
+  return dx_;
+}
+
+double GridBase::getDx(index_t j) const {
+  return dx_[j];
+}
+
+double GridBase::getBinVolume() const {
+  double vol=1.;
+  for(unsigned i=0; i<dx_.size(); ++i) {
+    vol*=dx_[i];
+  }
+  return vol;
+}
+
+std::vector<bool> GridBase::getIsPeriodic() const {
+  return pbc_;
+}
+
+std::vector<unsigned> GridBase::getNbin() const {
+  return nbin_;
+}
+
+std::vector<std::string> GridBase::getArgNames() const {
+  return argnames;
+}
+
+unsigned GridBase::getDimension() const {
+  return dimension_;
+}
+
+unsigned GridBase::getSplineNeighbors(const unsigned* indices, std::size_t indices_size, index_t* neighbors, std::size_t neighbors_size)const {
+  plumed_assert(indices_size==dimension_);
+  unsigned nneigh=1<<dimension_; // same as unsigned(pow(2.0,dimension_));
+  plumed_assert(neighbors_size==nneigh);
+
+  unsigned nneighbors = 0;
+
+  std::array<unsigned,maxdim> nindices;
+  unsigned inind;
+  for(unsigned int i=0; i<nneigh; ++i) {
+    unsigned tmp=i;
+    inind=0;
+    for(unsigned int j=0; j<dimension_; ++j) {
+      unsigned i0=tmp%2+indices[j];
+      tmp/=2;
+      if(!pbc_[j] && i0==nbin_[j]) {
+        continue;
+      }
+      if( pbc_[j] && i0==nbin_[j]) {
+        i0=0;
+      }
+      nindices[inind++]=i0;
+    }
+    if(inind==dimension_) {
+      neighbors[nneighbors++]=getIndex(nindices.data(),dimension_);
+    }
+  }
+  return nneighbors;
+}
+
+std::vector<GridBase::index_t> GridBase::getNearestNeighbors(const index_t index) const {
+  std::vector<index_t> nearest_neighs = std::vector<index_t>();
+  for (unsigned i = 0; i < dimension_; i++) {
+    std::vector<unsigned> neighsneeded = std::vector<unsigned>(dimension_, 0);
+    neighsneeded[i] = 1;
+    std::vector<index_t> singledim_nearest_neighs = getNeighbors(index, neighsneeded);
+    for (unsigned j = 0; j < singledim_nearest_neighs.size(); j++) {
+      index_t neigh = singledim_nearest_neighs[j];
+      if (neigh != index) {
+        nearest_neighs.push_back(neigh);
+      }
+    }
+  }
+  return nearest_neighs;
+}
+
+std::vector<GridBase::index_t> GridBase::getNearestNeighbors(const std::vector<unsigned> &indices) const {
+  plumed_dbg_assert(indices.size() == dimension_);
+  return getNearestNeighbors(getIndex(indices));
+}
+
+double GridBase::getValue(const std::vector<unsigned> & indices) const {
+  return getValue(getIndex(indices));
+}
+
+double GridBase::getValue(const std::vector<double> & x) const {
+  if(!dospline_) {
+    return getValue(getIndex(x));
+  } else {
+    std::vector<double> der(dimension_);
+    return getValueAndDerivatives(x,der);
+  }
+}
+
+double GridBase::getValueAndDerivatives(index_t index, std::vector<double>& der) const {
+  plumed_dbg_assert(index<maxsize_ && usederiv_ && der.size()==dimension_);
+  der.resize(dimension_);
+  return getValueAndDerivatives(index,der.data(),der.size());
+}
+
+double GridBase::getValueAndDerivatives(const std::vector<unsigned> & indices, std::vector<double>& der) const {
+  return getValueAndDerivatives(getIndex(indices),der);
+}
+
+double GridBase::getValueAndDerivatives(const std::vector<double> & x, std::vector<double>& der) const {
+  plumed_dbg_assert(der.size()==dimension_ && usederiv_);
+
+  if(dospline_) {
+    double X,X2,X3,value;
+    std::array<double,maxdim> fd, C, D;
+    std::array<double,maxdim> dder;
+// reset
+    value=0.0;
+    for(unsigned int i=0; i<dimension_; ++i) {
+      der[i]=0.0;
+    }
+
+    std::array<unsigned,maxdim> indices;
+    getIndices(x, indices.data(),dimension_);
+    std::array<double,maxdim> xfloor;
+    getPoint(indices.data(), dimension_, xfloor.data(),dimension_);
+    gch::small_vector<index_t,16> neigh(1<<dimension_); // pow(2,dimension_); up to dimension 4 will stay on stack
+    auto nneigh = getSplineNeighbors(indices.data(),dimension_, neigh.data(), neigh.size());
+
+// loop over neighbors
+    std::array<unsigned,maxdim> nindices;
+    for(unsigned int ipoint=0; ipoint<nneigh; ++ipoint) {
+      double grid=getValueAndDerivatives(neigh[ipoint],dder.data(),dimension_);
+      getIndices(neigh[ipoint], nindices.data(), dimension_);
+      double ff=1.0;
+
+      for(unsigned j=0; j<dimension_; ++j) {
+        int x0=1;
+        if(nindices[j]==indices[j]) {
+          x0=0;
+        }
+        double dx=getDx(j);
+        X=std::abs((x[j]-xfloor[j])/dx-(double)x0);
+        X2=X*X;
+        X3=X2*X;
+        double yy;
+        if(std::abs(grid)<0.0000001) {
+          yy=0.0;
+        } else {
+          yy=-dder[j]/grid;
+        }
+        C[j]=(1.0-3.0*X2+2.0*X3) - (x0?-1.0:1.0)*yy*(X-2.0*X2+X3)*dx;
+        D[j]=( -6.0*X +6.0*X2) - (x0?-1.0:1.0)*yy*(1.0-4.0*X +3.0*X2)*dx;
+        D[j]*=(x0?-1.0:1.0)/dx;
+        ff*=C[j];
+      }
+      for(unsigned j=0; j<dimension_; ++j) {
+        fd[j]=D[j];
+        for(unsigned i=0; i<dimension_; ++i)
+          if(i!=j) {
+            fd[j]*=C[i];
+          }
+      }
+      value+=grid*ff;
+      for(unsigned j=0; j<dimension_; ++j) {
+        der[j]+=grid*fd[j];
+      }
+    }
+    return value;
+  } else {
+    return getValueAndDerivatives(getIndex(x),der);
+  }
+}
+
+void GridBase::setValue(const std::vector<unsigned> & indices, double value) {
+  setValue(getIndex(indices),value);
+}
+
+void GridBase::setValueAndDerivatives(const std::vector<unsigned> & indices, double value, std::vector<double>& der) {
+  setValueAndDerivatives(getIndex(indices),value,der);
+}
+
+void GridBase::addValue(const std::vector<unsigned> & indices, double value) {
+  addValue(getIndex(indices),value);
+}
+
+void GridBase::addValueAndDerivatives(const std::vector<unsigned> & indices, double value, std::vector<double>& der) {
+  addValueAndDerivatives(getIndex(indices),value,der);
+}
+
+void GridBase::addValueAndDerivatives(index_t index, double value, const double* der, std::size_t der_size) {
+  std::vector<double> d(der,der+der_size);
+  addValueAndDerivatives(index,value,d);
+}
+
+void GridBase::writeHeader(OFile& ofile) {
+  for(unsigned i=0; i<dimension_; ++i) {
+    ofile.addConstantField("min_" + argnames[i]);
+    ofile.addConstantField("max_" + argnames[i]);
+    ofile.addConstantField("nbins_" + argnames[i]);
+    ofile.addConstantField("periodic_" + argnames[i]);
+  }
+}
+
+void Grid::clear() {
+  grid_.assign(maxsize_,0.0);
+  if(usederiv_) {
+    der_.assign(maxsize_*dimension_,0.0);
+  }
+}
+
+void Grid::writeToFile(OFile& ofile) {
+  std::vector<double> xx(dimension_);
+  std::vector<double> der(dimension_);
+  double f;
+  writeHeader(ofile);
+  for(index_t i=0; i<getSize(); ++i) {
+    xx=getPoint(i);
+    if(usederiv_) {
+      f=getValueAndDerivatives(i,der);
+    } else {
+      f=getValue(i);
+    }
+    if(i>0 && dimension_>1 && getIndices(i)[dimension_-2]==0) {
+      ofile.printf("\n");
+    }
+    for(unsigned j=0; j<dimension_; ++j) {
+      ofile.printField("min_" + argnames[j], str_min_[j] );
+      ofile.printField("max_" + argnames[j], str_max_[j] );
+      ofile.printField("nbins_" + argnames[j], static_cast<int>(nbin_[j]) );
+      if( pbc_[j] ) {
+        ofile.printField("periodic_" + argnames[j], "true" );
+      } else {
+        ofile.printField("periodic_" + argnames[j], "false" );
+      }
+    }
+    for(unsigned j=0; j<dimension_; ++j) {
+      ofile.fmtField(" "+fmt_);
+      ofile.printField(argnames[j],xx[j]);
+    }
+    ofile.fmtField(" "+fmt_);
+    ofile.printField(funcname,f);
+    if(usederiv_)
+      for(unsigned j=0; j<dimension_; ++j) {
+        ofile.fmtField(" "+fmt_);
+        ofile.printField("der_" + argnames[j],der[j]);
+      }
+    ofile.printField();
+  }
+}
+
+std::unique_ptr<GridBase> GridBase::create(const std::string& funcl, const std::vector<Value*> & args, IFile& ifile,
+    const std::vector<std::string> & gmin,const std::vector<std::string> & gmax,
+    const std::vector<unsigned> & nbin,bool dosparse, bool dospline, bool doder) {
+  std::unique_ptr<GridBase> grid=GridBase::create(funcl,args,ifile,dosparse,dospline,doder);
+  std::vector<unsigned> cbin( grid->getNbin() );
+  std::vector<std::string> cmin( grid->getMin() ), cmax( grid->getMax() );
+  for(unsigned i=0; i<args.size(); ++i) {
+    plumed_massert( cmin[i]==gmin[i], "mismatched grid min" );
+    plumed_massert( cmax[i]==gmax[i], "mismatched grid max" );
+    if( args[i]->isPeriodic() ) {
+      plumed_massert( cbin[i]==nbin[i], "mismatched grid nbins" );
+    } else {
+      plumed_massert( (cbin[i]-1)==nbin[i], "mismatched grid nbins");
+    }
+  }
+  return grid;
+}
+
+std::unique_ptr<GridBase> GridBase::create(const std::string& funcl, const std::vector<Value*> & args, IFile& ifile, bool dosparse, bool dospline, bool doder) {
+  std::unique_ptr<GridBase> grid;
+  unsigned nvar=args.size();
+  bool hasder=false;
+  std::string pstring;
+  std::vector<int> gbin1(nvar);
+  std::vector<unsigned> gbin(nvar);
+  std::vector<std::string> labels(nvar),gmin(nvar),gmax(nvar);
+  std::vector<std::string> fieldnames;
+  ifile.scanFieldList( fieldnames );
+
+// Retrieve names for fields
+  for(unsigned i=0; i<args.size(); ++i) {
+    labels[i]=args[i]->getName();
+    bool found=false;
+    for(unsigned j=0; j<fieldnames.size(); ++j) {
+      if( labels[i]==fieldnames[j] ) {
+        found=true;
+        break;
+      }
+    }
+    // This is a change to ensure that we can deal with old style names for multicolvars
+    std::size_t und = labels[i].find_first_of("_");
+    if( !found && und!=std::string::npos ) {
+      labels[i] = labels[i].substr(0,und) + "." + labels[i].substr(und+1);
+      for(unsigned j=0; j<fieldnames.size(); ++j) {
+        if( labels[i]==fieldnames[j] ) {
+          found=true;
+          break;
+        }
+      }
+    }
+  }
+// And read the stuff from the header
+  if( !ifile.FieldExist( funcl ) ) {
+    std::string fields;
+    for(const auto & f : fieldnames) {
+      fields += " " + f;
+    }
+    plumed_merror("there is no column labelled " + funcl + " in the grid file " + ifile.getPath() + " (its columns are:" + fields + "). "
+                  "The column is named after the label of the action that wrote the grid: check that the action has the same label");
+  }
+  for(unsigned i=0; i<args.size(); ++i) {
+    ifile.scanField( "min_" + labels[i], gmin[i]);
+    ifile.scanField( "max_" + labels[i], gmax[i]);
+    ifile.scanField( "periodic_" + labels[i], pstring );
+    ifile.scanField( "nbins_" + labels[i], gbin1[i]);
+    plumed_assert( gbin1[i]>0 );
+    if( args[i]->isPeriodic() ) {
+      plumed_massert( pstring=="true", "input value is periodic but grid is not");
+      std::string pmin, pmax;
+      args[i]->getDomain( pmin, pmax );
+      gbin[i]=gbin1[i];
+      if( pmin!=gmin[i] || pmax!=gmax[i] ) {
+        plumed_merror("mismatch between grid boundaries and periods of values");
+      }
+    } else {
+      gbin[i]=gbin1[i]-1;  // Note header in grid file indicates one more bin that there should be when data is not periodic
+      plumed_massert( pstring=="false", "input value is not periodic but grid is");
+    }
+    hasder=ifile.FieldExist( "der_" + labels[i] );
+    if( doder && !hasder ) {
+      plumed_merror("missing derivatives from grid file");
+    }
+    for(unsigned j=0; j<fieldnames.size(); ++j) {
+      for(unsigned k=i+1; k<args.size(); ++k) {
+        if( fieldnames[j]==labels[k] ) {
+          plumed_merror("arguments in input are not in same order as in grid file");
+        }
+      }
+      if( fieldnames[j]==labels[i] ) {
+        break;
+      }
+    }
+  }
+
+  if(!dosparse) {
+    grid=Tools::make_unique<Grid>(funcl,args,gmin,gmax,gbin,dospline,doder);
+  } else {
+    grid=Tools::make_unique<SparseGrid>(funcl,args,gmin,gmax,gbin,dospline,doder);
+  }
+
+  std::vector<double> xx(nvar),dder(nvar);
+  std::vector<double> dx=grid->getDx();
+  double f,x;
+  while( ifile.scanField(funcl,f) ) {
+    for(unsigned i=0; i<nvar; ++i) {
+      ifile.scanField(labels[i],x);
+      xx[i]=x+dx[i]/2.0;
+      ifile.scanField( "min_" + labels[i], gmin[i]);
+      ifile.scanField( "max_" + labels[i], gmax[i]);
+      ifile.scanField( "nbins_" + labels[i], gbin1[i]);
+      ifile.scanField( "periodic_" + labels[i], pstring );
+    }
+    if(hasder) {
+      for(unsigned i=0; i<nvar; ++i) {
+        ifile.scanField( "der_" + labels[i], dder[i] );
+      }
+    }
+    index_t index=grid->getIndex(xx);
+    if(doder) {
+      grid->setValueAndDerivatives(index,f,dder);
+    } else {
+      grid->setValue(index,f);
+    }
+    ifile.scanField();
+  }
+  return grid;
+}
+
+double Grid::getMinValue() const {
+  double minval;
+  minval=DBL_MAX;
+  for(index_t i=0; i<grid_.size(); ++i) {
+    if(grid_[i]<minval) {
+      minval=grid_[i];
+    }
+  }
+  return minval;
+}
+
+double Grid::getMaxValue() const {
+  double maxval;
+  maxval=DBL_MIN;
+  for(index_t i=0; i<grid_.size(); ++i) {
+    if(grid_[i]>maxval) {
+      maxval=grid_[i];
+    }
+  }
+  return maxval;
+}
+
+void Grid::scaleAllValuesAndDerivatives( const double& scalef ) {
+  if(usederiv_) {
+    for(index_t i=0; i<grid_.size(); ++i) {
+      grid_[i]*=scalef;
+      for(unsigned j=0; j<dimension_; ++j) {
+        der_[i*dimension_+j]*=scalef;
+      }
+    }
+  } else {
+    for(index_t i=0; i<grid_.size(); ++i) {
+      grid_[i]*=scalef;
+    }
+  }
+}
+
+void Grid::setMinToZero() {
+  double min=grid_[0];
+  for(index_t i=1; i<grid_.size(); ++i)
+    if(grid_[i]<min) {
+      min=grid_[i];
+    }
+  for(index_t i=0; i<grid_.size(); ++i) {
+    grid_[i] -= min;
+  }
+}
+
+void Grid::applyFunctionAllValuesAndDerivatives( double (*func)(double val), double (*funcder)(double valder) ) {
+  if(usederiv_) {
+    for(index_t i=0; i<grid_.size(); ++i) {
+      grid_[i]=func(grid_[i]);
+      for(unsigned j=0; j<dimension_; ++j) {
+        der_[i*dimension_+j]=funcder(der_[i*dimension_+j]);
+      }
+    }
+  } else {
+    for(index_t i=0; i<grid_.size(); ++i) {
+      grid_[i]=func(grid_[i]);
+    }
+  }
+}
+
+double Grid::getDifferenceFromContour( const std::vector<double>& x, std::vector<double>& der ) const {
+  return getValueAndDerivatives( x, der ) - contour_location;
+}
+
+/// OVERRIDES ARE BELOW
+
+Grid::index_t Grid::getSize() const {
+  return maxsize_;
+}
+
+double Grid::getValue(index_t index) const {
+  plumed_dbg_assert(index<maxsize_);
+  return grid_[index];
+}
+
+double Grid::getValueAndDerivatives(index_t index, double* der,std::size_t der_size) const {
+  plumed_dbg_assert(index<maxsize_ && usederiv_ && der_size==dimension_);
+  for(unsigned i=0; i<dimension_; i++) {
+    der[i]=der_[dimension_*index+i];
+  }
+  return grid_[index];
+}
+
+void Grid::setValue(index_t index, double value) {
+  plumed_dbg_assert(index<maxsize_ && !usederiv_);
+  grid_[index]=value;
+}
+
+void Grid::setValueAndDerivatives(index_t index, double value, std::vector<double>& der) {
+  plumed_dbg_assert(index<maxsize_ && usederiv_ && der.size()==dimension_);
+  grid_[index]=value;
+  for(unsigned i=0; i<dimension_; i++) {
+    der_[dimension_*index+i]=der[i];
+  }
+}
+
+void Grid::addValue(index_t index, double value) {
+  plumed_dbg_assert(index<maxsize_ && !usederiv_);
+  grid_[index]+=value;
+}
+
+void Grid::addValueAndDerivatives(index_t index, double value, std::vector<double>& der) {
+  plumed_dbg_assert(index<maxsize_ && usederiv_ && der.size()==dimension_);
+  grid_[index]+=value;
+  for(unsigned int i=0; i<dimension_; ++i) {
+    der_[index*dimension_+i]+=der[i];
+  }
+}
+
+void Grid::addValueAndDerivatives(index_t index, double value, const double* der, std::size_t der_size) {
+  plumed_dbg_assert(index<maxsize_ && usederiv_ && der_size==dimension_);
+  grid_[index]+=value;
+  for(unsigned int i=0; i<dimension_; ++i) {
+    der_[index*dimension_+i]+=der[i];
+  }
+}
+
+void Grid::resizeData(const std::vector<unsigned> & oldnbin, const std::vector<long long> & shift) {
+  std::vector<double> newgrid(maxsize_,0.0);
+  std::vector<double> newder;
+  if(usederiv_) {
+    newder.assign(maxsize_*dimension_,0.0);
+  }
+  index_t oldsize=1;
+  for(unsigned i=0; i<dimension_; ++i) {
+    oldsize*=oldnbin[i];
+  }
+  // loop over the old points in column-major order
+  std::vector<unsigned> k(dimension_,0);
+  for(index_t old=0; old<oldsize; ++old) {
+    bool kept=true;
+    index_t index=0;
+    for(unsigned i=dimension_; i-->0;) {
+      const long long knew=static_cast<long long>(k[i])+shift[i];
+      if(knew<0 || knew>=static_cast<long long>(nbin_[i])) {
+        kept=false;
+        break;
+      }
+      index=index*nbin_[i]+static_cast<index_t>(knew);
+    }
+    if(kept) {
+      newgrid[index]=grid_[old];
+      if(usederiv_) {
+        for(unsigned i=0; i<dimension_; ++i) {
+          newder[index*dimension_+i]=der_[old*dimension_+i];
+        }
+      }
+    }
+    for(unsigned i=0; i<dimension_; ++i) {
+      if(++k[i]<oldnbin[i]) {
+        break;
+      }
+      k[i]=0;
+    }
+  }
+  grid_.swap(newgrid);
+  der_.swap(newder);
+}
+
+void SparseGrid::resizeData(const std::vector<unsigned> & oldnbin, const std::vector<long long> & shift) {
+  // new index of the point with index old before resizing, false if it was removed
+  auto newIndex=[&](index_t old, index_t & index) {
+    std::vector<long long> k(dimension_);
+    for(unsigned i=0; i<dimension_; ++i) {
+      k[i]=static_cast<long long>(old%oldnbin[i])+shift[i];
+      old/=oldnbin[i];
+      if(k[i]<0 || k[i]>=static_cast<long long>(nbin_[i])) {
+        return false;
+      }
+    }
+    index=0;
+    for(unsigned i=dimension_; i-->0;) {
+      index=index*nbin_[i]+static_cast<index_t>(k[i]);
+    }
+    return true;
+  };
+  std::map<index_t,double> newmap;
+  for(const auto & it : map_) {
+    index_t index;
+    if(newIndex(it.first,index)) {
+      newmap[index]=it.second;
+    }
+  }
+  std::map<index_t,std::vector<double>> newder;
+  for(auto & it : der_) {
+    index_t index;
+    if(newIndex(it.first,index)) {
+      newder[index].swap(it.second);
+    }
+  }
+  map_.swap(newmap);
+  der_.swap(newder);
+}
+
+void GridBase::writeCheckpoint(CheckpointWriter& w) const {
+  w.write("dimension",dimension_);
+  w.write("usederiv",usederiv_);
+  w.write("nbin",nbin_);
+  w.write("min",min_);
+  w.write("max",max_);
+  w.write("dx",dx_);
+  for(unsigned i=0; i<dimension_; ++i) {
+    w.write("strmin"+std::to_string(i),str_min_[i]);
+    w.write("strmax"+std::to_string(i),str_max_[i]);
+  }
+  writeCheckpointData(w);
+}
+
+void GridBase::readCheckpoint(CheckpointReader& r) {
+  plumed_massert(r.get<unsigned>("dimension")==dimension_,"checkpoint: the grid "+funcname+" has a different dimension");
+  plumed_massert(r.get<bool>("usederiv")==usederiv_,"checkpoint: the grid "+funcname+" has a different setting for derivatives");
+  std::vector<unsigned> nbin;
+  std::vector<double> min,max,dx;
+  r.read("nbin",nbin);
+  r.read("min",min);
+  r.read("max",max);
+  r.read("dx",dx);
+  plumed_massert(nbin.size()==dimension_ && min.size()==dimension_ && max.size()==dimension_ && dx.size()==dimension_,
+                 "checkpoint: wrong size of the range of grid "+funcname);
+  index_t size=1;
+  for(unsigned i=0; i<dimension_; ++i) {
+    // the periodic directions cannot change
+    plumed_massert(!pbc_[i] || nbin[i]==nbin_[i],"checkpoint: the grid "+funcname+" has a different number of points along a periodic direction");
+    size*=nbin[i];
+  }
+  nbin_=nbin;
+  min_=min;
+  max_=max;
+  dx_=dx;
+  maxsize_=size;
+  for(unsigned i=0; i<dimension_; ++i) {
+    r.read("strmin"+std::to_string(i),str_min_[i]);
+    r.read("strmax"+std::to_string(i),str_max_[i]);
+  }
+  readCheckpointData(r);
+}
+
+void GridBase::writeCheckpointData(CheckpointWriter& w) const {
+  plumed_merror("this kind of grid cannot be stored in a checkpoint");
+}
+
+void GridBase::readCheckpointData(CheckpointReader& r) {
+  plumed_merror("this kind of grid cannot be read from a checkpoint");
+}
+
+void Grid::writeCheckpointData(CheckpointWriter& w) const {
+  w.write("values",grid_);
+  if(usederiv_) {
+    w.write("derivatives",der_);
+  }
+}
+
+void Grid::readCheckpointData(CheckpointReader& r) {
+  r.read("values",grid_);
+  plumed_massert(grid_.size()==maxsize_,"checkpoint: wrong number of values in grid "+funcname);
+  der_.clear();
+  if(usederiv_) {
+    r.read("derivatives",der_);
+    plumed_massert(der_.size()==maxsize_*dimension_,"checkpoint: wrong number of derivatives in grid "+funcname);
+  }
+}
+
+void SparseGrid::writeCheckpointData(CheckpointWriter& w) const {
+  // the points with a value, and those with derivatives (in principle a different set)
+  std::vector<index_t> index;
+  std::vector<double> value;
+  for(const auto & it : map_) {
+    index.push_back(it.first);
+    value.push_back(it.second);
+  }
+  w.write("index",index);
+  w.write("values",value);
+  if(usederiv_) {
+    index.clear();
+    value.clear();
+    for(const auto & it : der_) {
+      index.push_back(it.first);
+      value.insert(value.end(),it.second.begin(),it.second.end());
+    }
+    w.write("derindex",index);
+    w.write("derivatives",value);
+  }
+}
+
+void SparseGrid::readCheckpointData(CheckpointReader& r) {
+  std::vector<index_t> index;
+  std::vector<double> value;
+  r.read("index",index);
+  r.read("values",value);
+  plumed_massert(index.size()==value.size(),"checkpoint: wrong number of values in grid "+funcname);
+  map_.clear();
+  for(std::size_t k=0; k<index.size(); ++k) {
+    plumed_massert(index[k]<maxsize_,"checkpoint: point out of grid "+funcname);
+    map_[index[k]]=value[k];
+  }
+  der_.clear();
+  if(usederiv_) {
+    r.read("derindex",index);
+    r.read("derivatives",value);
+    plumed_massert(value.size()==index.size()*dimension_,"checkpoint: wrong number of derivatives in grid "+funcname);
+    for(std::size_t k=0; k<index.size(); ++k) {
+      plumed_massert(index[k]<maxsize_,"checkpoint: point out of grid "+funcname);
+      der_[index[k]].assign(value.begin()+k*dimension_,value.begin()+(k+1)*dimension_);
+    }
+  }
+}
+
+Grid::index_t SparseGrid::getSize() const {
+  return map_.size();
+}
+
+double SparseGrid::getValue(index_t index)const {
+  plumed_assert(index<maxsize_);
+  double value=0.0;
+  const auto it=map_.find(index);
+  if(it!=map_.end()) {
+    value=it->second;
+  }
+  return value;
+}
+
+double SparseGrid::getValueAndDerivatives(index_t index, double* der, std::size_t der_size)const {
+  plumed_assert(index<maxsize_ && usederiv_ && der_size==dimension_);
+  double value=0.0;
+  for(unsigned int i=0; i<dimension_; ++i) {
+    der[i]=0.0;
+  }
+  const auto it=map_.find(index);
+  if(it!=map_.end()) {
+    value=it->second;
+  }
+  const auto itder=der_.find(index);
+  if(itder!=der_.end()) {
+    const auto & second(itder->second);
+    for(unsigned i=0; i<second.size(); i++) {
+      der[i]=itder->second[i];
+    }
+  }
+  return value;
+}
+
+void SparseGrid::setValue(index_t index, double value) {
+  plumed_assert(index<maxsize_ && !usederiv_);
+  map_[index]=value;
+}
+
+void SparseGrid::setValueAndDerivatives(index_t index, double value, std::vector<double>& der) {
+  plumed_assert(index<maxsize_ && usederiv_ && der.size()==dimension_);
+  map_[index]=value;
+  der_[index]=der;
+}
+
+void SparseGrid::addValue(index_t index, double value) {
+  plumed_assert(index<maxsize_ && !usederiv_);
+  map_[index]+=value;
+}
+
+void SparseGrid::addValueAndDerivatives(index_t index, double value, std::vector<double>& der) {
+  plumed_assert(index<maxsize_ && usederiv_ && der.size()==dimension_);
+  map_[index]+=value;
+  der_[index].resize(dimension_);
+  for(unsigned int i=0; i<dimension_; ++i) {
+    der_[index][i]+=der[i];
+  }
+}
+
+void SparseGrid::addValueAndDerivatives(index_t index, double value, const double* der, std::size_t der_size) {
+  plumed_assert(index<maxsize_ && usederiv_ && der_size==dimension_);
+  map_[index]+=value;
+  der_[index].resize(dimension_);
+  for(unsigned int i=0; i<dimension_; ++i) {
+    der_[index][i]+=der[i];
+  }
+}
+
+void SparseGrid::writeToFile(OFile& ofile) {
+  std::vector<double> xx(dimension_);
+  std::vector<double> der(dimension_);
+  double f;
+  writeHeader(ofile);
+  ofile.fmtField(" "+fmt_);
+  for(const auto & it : map_) {
+    index_t i=it.first;
+    xx=getPoint(i);
+    if(usederiv_) {
+      f=getValueAndDerivatives(i,der);
+    } else {
+      f=getValue(i);
+    }
+    if(i>0 && dimension_>1 && getIndices(i)[dimension_-2]==0) {
+      ofile.printf("\n");
+    }
+    for(unsigned j=0; j<dimension_; ++j) {
+      ofile.printField("min_" + argnames[j], str_min_[j] );
+      ofile.printField("max_" + argnames[j], str_max_[j] );
+      ofile.printField("nbins_" + argnames[j], static_cast<int>(nbin_[j]) );
+      if( pbc_[j] ) {
+        ofile.printField("periodic_" + argnames[j], "true" );
+      } else {
+        ofile.printField("periodic_" + argnames[j], "false" );
+      }
+    }
+    for(unsigned j=0; j<dimension_; ++j) {
+      ofile.printField(argnames[j],xx[j]);
+    }
+    ofile.printField(funcname, f);
+    if(usederiv_) {
+      for(unsigned j=0; j<dimension_; ++j) {
+        ofile.printField("der_" + argnames[j],der[j]);
+      }
+    }
+    ofile.printField();
+  }
+}
+
+double SparseGrid::getMinValue() const {
+  double minval;
+  minval=0.0;
+  for(auto const & i : map_) {
+    if(i.second<minval) {
+      minval=i.second;
+    }
+  }
+  return minval;
+}
+
+double SparseGrid::getMaxValue() const {
+  double maxval;
+  maxval=0.0;
+  for(auto const & i : map_) {
+    if(i.second>maxval) {
+      maxval=i.second;
+    }
+  }
+  return maxval;
+}
+
+void Grid::projectOnLowDimension(double &val, std::vector<int> &vHigh, WeightBase * ptr2obj ) {
+  unsigned i=0;
+  for(i=0; i<vHigh.size(); i++) {
+    if(vHigh[i]<0) { // this bin needs to be integrated out
+      // parallelize here???
+      for(unsigned j=0; j<(getNbin())[i]; j++) {
+        vHigh[i]=int(j);
+        projectOnLowDimension(val,vHigh,ptr2obj); // recursive function: this is the core of the mechanism
+        vHigh[i]=-1;
+      }
+      return; //
+    }
+  }
+  // when there are no more bin to dig in then retrieve the value
+  if(i==vHigh.size()) {
+    std::vector<unsigned> vv(vHigh.size());
+    for(unsigned j=0; j<vHigh.size(); j++) {
+      vv[j]=unsigned(vHigh[j]);
+    }
+    //
+    // this is the real assignment !!!!! (hack this to have bias or other stuff)
+    //
+
+    // this case: produce fes
+    //val+=exp(beta*getValue(vv)) ;
+    double myv=getValue(vv);
+    val=ptr2obj->projectInnerLoop(val,myv) ;
+    // to be added: bias (same as before without negative sign)
+    //std::cerr<<" VAL: "<<val <<endl;
+  }
+}
+
+Grid Grid::project(const std::vector<std::string> & proj, WeightBase *ptr2obj ) {
+  // find extrema only for the projection
+  std::vector<std::string>   smallMin,smallMax;
+  std::vector<unsigned> smallBin;
+  std::vector<unsigned> dimMapping;
+  std::vector<bool> smallIsPeriodic;
+  std::vector<std::string> smallName;
+
+  // check if the two key methods are there
+  WeightBase* pp = dynamic_cast<WeightBase*>(ptr2obj);
+  if (!pp) {
+    plumed_merror("This WeightBase is not complete: you need a projectInnerLoop and projectOuterLoop ");
+  }
+
+  for(unsigned j=0; j<proj.size(); j++) {
+    for(unsigned i=0; i<getArgNames().size(); i++) {
+      if(proj[j]==getArgNames()[i]) {
+        unsigned offset;
+        // note that at sizetime the non periodic dimension get a bin more
+        if(getIsPeriodic()[i]) {
+          offset=0;
+        } else {
+          offset=1;
+        }
+        smallMax.push_back(getMax()[i]);
+        smallMin.push_back(getMin()[i]);
+        smallBin.push_back(getNbin()[i]-offset);
+        smallIsPeriodic.push_back(getIsPeriodic()[i]);
+        dimMapping.push_back(i);
+        smallName.push_back(getArgNames()[i]);
+        break;
+      }
+    }
+  }
+  Grid smallgrid("projection",smallName,smallMin,smallMax,smallBin,false,false,smallIsPeriodic,smallMin,smallMax);
+  // check that the two grids are commensurate
+  for(unsigned i=0; i<dimMapping.size(); i++) {
+    plumed_massert(  (smallgrid.getMax())[i] == (getMax())[dimMapping[i]],  "the two input grids are not compatible in max"   );
+    plumed_massert(  (smallgrid.getMin())[i] == (getMin())[dimMapping[i]],  "the two input grids are not compatible in min"   );
+    plumed_massert(  (smallgrid.getNbin())[i]== (getNbin())[dimMapping[i]], "the two input grids are not compatible in bin"   );
+  }
+  std::vector<unsigned> toBeIntegrated;
+  for(unsigned i=0; i<getArgNames().size(); i++) {
+    bool doappend=true;
+    for(unsigned j=0; j<dimMapping.size(); j++) {
+      if(dimMapping[j]==i) {
+        doappend=false;
+        break;
+      }
+    }
+    if(doappend) {
+      toBeIntegrated.push_back(i);
+    }
+  }
+
+  // loop over all the points in the Grid, find the corresponding fixed index, rotate over all the other ones
+  for(unsigned i=0; i<smallgrid.getSize(); i++) {
+    std::vector<unsigned> v;
+    v=smallgrid.getIndices(i);
+    std::vector<int> vHigh((getArgNames()).size(),-1);
+    for(unsigned j=0; j<dimMapping.size(); j++) {
+      vHigh[dimMapping[j]]=int(v[j]);
+    }
+    // the vector vhigh now contains at the beginning the index of the low dimension and -1 for the values that need to be integrated
+    double initval=0.;
+    projectOnLowDimension(initval,vHigh, ptr2obj);
+    smallgrid.setValue(i,ptr2obj->projectOuterLoop(initval));
+  }
+
+  return smallgrid;
+}
+
+
+bool indexed_lt(std::pair<Grid::index_t, double> const &x, std::pair<Grid::index_t, double> const   &y) {
+  return x.second < y.second;
+}
+
+double GridBase::findMaximalPathMinimum(const std::vector<double> &source, const std::vector<double> &sink) {
+  plumed_dbg_assert(source.size() == dimension_);
+  plumed_dbg_assert(sink.size() == dimension_);
+  // Start and end indices
+  index_t source_idx = getIndex(source);
+  index_t sink_idx = getIndex(sink);
+  // Path cost
+  double maximal_minimum = 0;
+  // In one dimension, path searching is very easy--either go one way if it's not periodic,
+  // or go both ways if it is periodic. There's no reason to pay the cost of Dijkstra.
+  if (dimension_ == 1) {
+    // Do a search from the grid source to grid sink that does not
+    // cross the grid boundary.
+    double curr_min_bias = getValue(source_idx);
+    // Either search from a high source to a low sink.
+    if (source_idx > sink_idx) {
+      for (index_t i = source_idx; i >= sink_idx; i--) {
+        if (curr_min_bias == 0.0) {
+          break;
+        }
+        curr_min_bias = fmin(curr_min_bias, getValue(i));
+      }
+      // Or search from a low source to a high sink.
+    } else if (source_idx < sink_idx) {
+      for (index_t i = source_idx; i <= sink_idx; i++) {
+        if (curr_min_bias == 0.0) {
+          break;
+        }
+        curr_min_bias = fmin(curr_min_bias, getValue(i));
+      }
+    }
+    maximal_minimum = curr_min_bias;
+    // If the grid is periodic, also do the search that crosses
+    // the grid boundary.
+    if (pbc_[0]) {
+      double c_min_bias = getValue(source_idx);
+      // Either go from a high source to the upper boundary and
+      // then from the bottom boundary to the sink
+      if (source_idx > sink_idx) {
+        for (index_t i = source_idx; i < maxsize_; i++) {
+          if (c_min_bias == 0.0) {
+            break;
+          }
+          c_min_bias = fmin(c_min_bias, getValue(i));
+        }
+        for (index_t i = 0; i <= sink_idx; i++) {
+          if (c_min_bias == 0.0) {
+            break;
+          }
+          c_min_bias = fmin(c_min_bias, getValue(i));
+        }
+        // Or go from a low source to the bottom boundary and
+        // then from the high boundary to the sink
+      } else if (source_idx < sink_idx) {
+        for (index_t i = source_idx; i > 0; i--) {
+          if (c_min_bias == 0.0) {
+            break;
+          }
+          c_min_bias = fmin(c_min_bias, getValue(i));
+        }
+        c_min_bias = fmin(c_min_bias, getValue(0));
+        for (index_t i = maxsize_ - 1; i <= sink_idx; i--) {
+          if (c_min_bias == 0.0) {
+            break;
+          }
+          c_min_bias = fmin(c_min_bias, getValue(i));
+        }
+      }
+      // If the boundary crossing paths was more biased, it's
+      // minimal bias replaces the non-boundary-crossing path's
+      // minimum.
+      maximal_minimum = fmax(maximal_minimum, c_min_bias);
+    }
+    // The one dimensional path search is complete.
+    return maximal_minimum;
+    // In two or more dimensions, path searching isn't trivial and we really
+    // do need to use a path search algorithm. Dijkstra is the simplest decent
+    // one. Using it we've never found the path search to be performance
+    // limiting in any solvated biomolecule test system, but faster options are
+    // easy to imagine if they become necessary. NB-In this case, we're actually
+    // using a greedy variant of Dijkstra's algorithm where the first possible
+    // path to a point always controls the path cost to that point. The structure
+    // of the cost function in this case guarantees that the calculated costs will
+    // be correct using this variant even though fine details of the paths may not
+    // match a normal Dijkstra search.
+  } else if (dimension_ > 1) {
+    // Prepare calculation temporaries for Dijkstra's algorithm.
+    // Minimal path costs from source to a given grid point
+    std::vector<double> mins_from_source = std::vector<double>(maxsize_, -1.0);
+    // Heap for tracking available steps, steps are recorded as std::pairs of
+    // an index and a value.
+    std::vector< std::pair<index_t, double> > next_steps;
+    std::pair<index_t, double> curr_indexed_val;
+    std::make_heap(next_steps.begin(), next_steps.end(), indexed_lt);
+    // The search begins at the source index.
+    next_steps.push_back(std::pair<index_t, double>(source_idx, getValue(source_idx)));
+    std::push_heap(next_steps.begin(), next_steps.end(), indexed_lt);
+    // At first no points have been examined and the optimal path has not been found.
+    bool path_not_found = true;
+    // Until a path is found,
+    while (path_not_found) {
+      // Examine the grid point currently most accessible from
+      // the set of all previously explored grid points by popping
+      // it from the top of the heap.
+      std::pop_heap(next_steps.begin(), next_steps.end(), indexed_lt);
+      curr_indexed_val = next_steps.back();
+      next_steps.pop_back();
+      // Check if this point is the sink point, and if so
+      // finish the loop.
+      if (curr_indexed_val.first == sink_idx) {
+        path_not_found = false;
+        maximal_minimum = curr_indexed_val.second;
+        break;
+        // Check if this point has reached the worst possible
+        // value, and if so stop looking for paths.
+      } else if (curr_indexed_val.second == 0.0) {
+        maximal_minimum = 0.0;
+        break;
+      }
+      // If the search is not over, add this grid point's neighbors to the
+      // possible next points to search for the sink.
+      std::vector<index_t> neighs = getNearestNeighbors(curr_indexed_val.first);
+      for (unsigned k = 0; k < neighs.size(); k++) {
+        index_t i = neighs[k];
+        // If the neighbor has not already been added to the list of possible next steps,
+        if (mins_from_source[i] == -1.0) {
+          // Set the cost to reach it via a path through the current point being examined.
+          mins_from_source[i] = fmin(curr_indexed_val.second, getValue(i));
+          // Add the neighboring point to the heap of potential next steps.
+          next_steps.push_back(std::pair<index_t, double>(i, mins_from_source[i]));
+          std::push_heap(next_steps.begin(), next_steps.end(), indexed_lt);
+        }
+      }
+      // Move on to the next best looking step along any of the paths
+      // growing from the source.
+    }
+    // The multidimensional path search is now complete.
+    return maximal_minimum;
+  }
+  return 0.0;
+}
+
+}

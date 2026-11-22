@@ -1,0 +1,646 @@
+name: Scientific figure and interaction checks
+on:
+  workflow_dispatch:
+  push:
+    paths: &figure_paths
+      - "frontend/src/publication/**"
+      - "frontend/src/presentation/useReveal*"
+      - "frontend/src/presentation/WorkspaceFullscreenControl*"
+      - "frontend/src/presentation/useWorkspaceFullscreen.ts"
+      - "frontend/src/presentation/workspace-expansion.ts"
+      - "frontend/src/presentation/workspace-fullscreen.css"
+      - "frontend/src/presentation/workspace-structure-focus.ts"
+      - "frontend/src/presentation/ResearchTabs.tsx"
+      - "frontend/src/presentation/ResearchTabs.test.tsx"
+      - "frontend/src/presentation/research-tabs.css"
+      - "scripts/research-tabs-scope.py"
+      - "tests/test_research_tabs_scope.py"
+      - "server_tests/test_research_tabs_browser.py"
+      - "frontend/src/presentation/ActiveIndicator*"
+      - "frontend/src/presentation/active-indicator.css"
+      - "frontend/src/presentation/MetricBars.tsx"
+      - "frontend/src/presentation/InteractionDiagram*"
+      - "frontend/src/presentation/MoleculeImage*"
+      - "frontend/src/presentation/hidden-frame-focus*"
+      - "frontend/src/presentation/molecule-image.css"
+      - "frontend/src/examples/StudyInputPreview.tsx"
+      - "frontend/src/examples/guide.ts"
+      - "frontend/src/examples/guide.test.ts"
+      - "src/opendde_workbench/examples/stat6/guidance.py"
+      - "tests/test_stat6_guidance.py"
+      # Task availability and source review use task-readiness-checks.yml.
+      - "frontend/src/guided/questionnaire.css"
+      - "frontend/src/studio/method-switch.css"
+      - "frontend/src/viewer/capture*"
+      - "frontend/src/viewer/useViewerSnapshot*"
+      - "frontend/src/viewer/StructureViewer.tsx"
+      - "frontend/src/viewer/StructureViewport.tsx"
+      - "frontend/src/viewer/ViewerExportActions.tsx"
+      - "frontend/src/viewer/ViewerToolGroup.tsx"
+      - "frontend/src/viewer/viewer-tool-group.css"
+      - "frontend/src/chemistry/states.css"
+      - "frontend/src/pockets/pocket-results.css"
+      - "frontend/src/presentation/prediction-inspection.css"
+      - "frontend/src/receptors/prepared-structure.css"
+      - "frontend/src/receptors/receptors.css"
+      - "frontend/src/viewer/frame.ts"
+      - "frontend/src/viewer/viewer.css"
+      - "frontend/src/viewer/contact-labels.ts"
+      - "frontend/src/viewer/contact-labels.test.ts"
+      - "frontend/src/viewer/native-labels*"
+      - "frontend/src/viewer/native-label-layout*"
+      - "frontend/src/viewer/contact-label-layout*"
+      - "frontend/src/viewer/figure-occupancy.ts"
+      - "frontend/src/viewer/figure-label-leaders.ts"
+      - "frontend/src/viewer/contacts.ts"
+      - "frontend/src/viewer/scientific-overlay.ts"
+      - "frontend/src/viewer/scene.ts"
+      - "frontend/src/viewer/style.ts"
+      - "frontend/src/viewer/channel-geometry*"
+      - "frontend/src/viewer/channel-input*"
+      - "frontend/src/viewer/source-layout.ts"
+      - "frontend/src/viewer/attachment-geometry*"
+      - "frontend/src/poses/ClusterMatrix.tsx"
+      - "frontend/src/space/ChannelProfile.tsx"
+      - "frontend/src/simulations/InteractivePlot.tsx"
+      - "server_tests/*publication*"
+      - "server_tests/test_figure_framing_browser.py"
+      - "server_tests/test_compact_figure_dialog_browser.py"
+      - "server_tests/test_mobile_viewer_toolbar_browser.py"
+      - "server_tests/test_split_viewer_toolbar_browser.py"
+      - "server_tests/test_contact_print_layout_browser.py"
+      - "server_tests/test_prediction_workspace_browser.py"
+      - "server_tests/*native_annotation*"
+      - "server_tests/test_workspace_fullscreen_browser.py"
+      - "server_tests/fullscreen_browser_helpers.py"
+      - ".github/workflows/publication-checks.yml"
+      - ".github/workflows/stat6-template-checks.yml"
+      - ".github/workflows/examples-checks.yml"
+      - "src/opendde_workbench/examples/catalogue-profiles.json"
+      # Dynamics/FEP-specific consumers now have simulation-view-checks.yml.
+      # Shared interactive charts and appearance use chart-quality-checks.yml.
+      - "!frontend/src/publication/embedded-raster.test.ts"
+      - "!frontend/src/publication/embedded-raster.ts"
+      - "!frontend/src/publication/svg.ts"
+      - "!frontend/src/publication/plotly*"
+      # Selected-ligand camera changes affect only native MD/FEP result views.
+      - "!frontend/src/simulations/molstar-controller.ts"
+      # Selected-pocket controls/camera have native exports in pocket-result-checks.yml.
+      - "!frontend/src/viewer/frame.ts"
+      # Simulation instructions are inspected with their questionnaires; no figure
+      # geometry or shared interaction changed. Routing-only edits do not execute figures.
+      - "!src/opendde_workbench/examples/stat6/guidance.py"
+      - "!tests/test_stat6_guidance.py"
+      - "!.github/workflows/publication-checks.yml"
+      - "!.github/workflows/stat6-template-checks.yml"
+      - "!.github/workflows/examples-checks.yml"
+      # Fixed-case rendering leaves publication capture unchanged; stage gate checks the viewer.
+      - "!frontend/src/viewer/StructureViewer.tsx"
+      # Cluster selection and its native SVG export use pose-cluster-checks.yml.
+      - "!frontend/src/poses/ClusterMatrix.tsx"
+      # Embedded 2D startup, native Kekule drawings, focus and their export
+      # consumers have ketcher-depiction-checks.yml. Other figure changes still
+      # execute the shared publication regression set below.
+      - "!frontend/src/presentation/MoleculeImage*"
+      - "!frontend/src/presentation/hidden-frame-focus*"
+  pull_request:
+    paths: *figure_paths
+permissions:
+  contents: read
+jobs:
+  framing-scope:
+    uses: ./.github/workflows/figure-framing-scope.yml
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      native_receptor_only: ${{ steps.change.outputs.native_receptor_only }}
+      prediction_result_layout: ${{ steps.prediction_scope.outputs.prediction_publication_layout }}
+      research_tabs_only: ${{ steps.tabs.outputs.research_tabs_only }}
+      native_viewer_changed: ${{ steps.native_viewer.outputs.changed }}
+      print_labels_changed: ${{ steps.print_labels.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: prediction_scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/prediction-workspace-scope.py
+      - id: change
+        env:
+          BASE: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: python3 scripts/case-data-scope.py
+      - id: tabs
+        env:
+          BASE: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: python3 scripts/research-tabs-scope.py
+      - id: native_viewer
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          changed=false
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            BASE=$(git merge-base HEAD origin/main)
+          fi
+          if git cat-file -e "${BASE}^{commit}" 2>/dev/null && ! git diff --quiet "$BASE" HEAD -- \
+            frontend/src/viewer/StructureViewport.tsx frontend/src/viewer/ViewerToolGroup.tsx \
+            frontend/src/viewer/ViewerExportActions.tsx frontend/src/viewer/viewer-tool-group.css \
+            frontend/src/viewer/viewer.css frontend/src/publication/FigureExport.tsx \
+            frontend/src/presentation/workspace-expansion.ts \
+            frontend/src/chemistry/states.css frontend/src/pockets/pocket-results.css \
+            frontend/src/presentation/prediction-inspection.css \
+            frontend/src/receptors/prepared-structure.css frontend/src/receptors/receptors.css \
+            server_tests/test_mobile_viewer_toolbar_browser.py \
+            server_tests/test_split_viewer_toolbar_browser.py \
+            server_tests/test_prediction_workspace_browser.py; then
+            changed=true
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+      - id: print_labels
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            BASE=$(git merge-base HEAD origin/main)
+          fi
+          changed=false
+          paths=(
+            'frontend/src/viewer/capture*'
+            'frontend/src/viewer/contact-label*'
+            'frontend/src/viewer/native-label*'
+            frontend/src/viewer/figure-occupancy.ts
+            frontend/src/viewer/figure-label-leaders.ts
+            server_tests/publication_raster_metrics.py
+            server_tests/test_contact_print_layout_browser.py
+          )
+          if ! git diff --quiet "$BASE" HEAD -- "${paths[@]}"; then
+            changed=true
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+  research-tabs:
+    needs: scope
+    if: needs.scope.outputs.research_tabs_only == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolated tab control state
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-tab-controls" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-tab-controls/state" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev --group browser
+      - name: Tab lifecycle, shared indicator and direct result consumers; no model execution
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/ResearchTabs.test.tsx
+          src/presentation/ActiveIndicator.test.tsx src/presentation/useReveal.test.tsx
+          src/discovery/TargetResearchResults.test.tsx src/admet/AdmetResults.test.tsx
+          src/examples/CampaignCasePreview.test.tsx src/diffsbdd/DesignInputContext.test.tsx
+          src/viewer/capture.test.ts src/proximity/Results.test.tsx
+          src/presentation/plots/InteractivePlot.test.tsx src/operations/CandidateSequenceResults.test.tsx
+          src/integrations/ScientificResults.test.tsx src/simulations/SimulationResults.test.tsx
+          src/operations/PreparedInputResults.test.tsx
+          src/viewer/useViewerSnapshot.test.ts
+      - name: Closed routing boundaries
+        run: |
+          uv run --locked python -m pytest -q tests/test_research_tabs_scope.py
+          uv run --locked ruff check scripts/research-tabs-scope.py tests/test_research_tabs_scope.py server_tests/test_research_tabs_browser.py
+      - name: Reuse sealed STAT6 outputs and native chemical drawing; never start a model
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive_path="$(uv run --locked python - <<'PY'
+          import os
+          from pathlib import Path
+          from server_tests.prepare_quality_context_cases import download_archive
+          print(download_archive(Path(os.environ['RUNNER_TEMP']) / 'reviewed-stat6-data'))
+          PY
+          )"
+          echo "WB_REVIEWED_STAT6_ARCHIVE=$archive_path" >> "$GITHUB_ENV"
+          gh release download examples-v1 --repo "$GITHUB_REPOSITORY" --pattern x-dde-public-cases-v1.zip --dir "$RUNNER_TEMP"
+          uv run --locked python server_tests/prepare_layout_cases.py "$RUNNER_TEMP/x-dde-public-cases-v1.zip"
+          uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked playwright install chromium --with-deps
+      - name: Bilingual actual result resize, keyboard, retained native view and filter
+        run: >-
+          uv run --locked python -m pytest -x -q
+          server_tests/test_publication_controls_browser.py::test_shared_steps_models_and_result_tabs_retain_user_choices
+          server_tests/test_research_tabs_browser.py
+          --basetemp "$RUNNER_TEMP/research-tabs-browser"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: research-tabs-evidence
+          path: |
+            outputs/research-tabs/**
+            outputs/publication-browser/controls/**
+          if-no-files-found: error
+  desktop-structure-focus:
+    needs: utility-scope
+    if: needs.utility-scope.outputs.desktop_structure_focus_only == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Workspace focus and unchanged native export controls
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/WorkspaceFullscreenControl.test.tsx
+          src/viewer/StructureViewer.test.tsx src/publication/FigureExport.test.tsx
+      - name: Read retained structures, exercise focus and download the actual figure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WB_HOME: ${{ runner.temp }}/x-dde-desktop-structure-focus
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-desktop-structure-focus/state
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_workspace_fullscreen_browser.py
+          uv run --locked python -m pytest -q tests/test_molecular_utility_scope.py
+          archive="$(uv run --locked python - <<'PY'
+          import os
+          from pathlib import Path
+          from server_tests.prepare_quality_context_cases import download_archive
+          print(download_archive(Path(os.environ["RUNNER_TEMP"]) / "reviewed-stat6-data"))
+          PY
+          )"
+          export WB_REVIEWED_STAT6_ARCHIVE="$archive"
+          uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked python -m pytest -xq server_tests/test_workspace_fullscreen_browser.py -k desktop_structure_focus
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-structure-focus-evidence
+          path: outputs/workspace-fullscreen/focus/
+          if-no-files-found: warn
+
+  mobile-native-viewer:
+    needs: [scope, utility-scope]
+    if: >-
+      needs.scope.outputs.native_viewer_changed == 'true' &&
+      needs.utility-scope.outputs.desktop_header_only != 'true' &&
+      needs.utility-scope.outputs.spatial_desktop_only != 'true' &&
+      needs.utility-scope.outputs.short_structure_review_only != 'true' &&
+      needs.utility-scope.outputs.proximity_desktop_only != 'true' &&
+      needs.utility-scope.outputs.aligned_comparison_only != 'true' &&
+      needs.utility-scope.outputs.paired_figure_only != 'true' &&
+      needs.utility-scope.outputs.native_color_figure_only != 'true' &&
+      needs.utility-scope.outputs.desktop_structure_focus_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Direct viewer and figure controls
+        working-directory: frontend
+        run: >-
+          npx vitest run src/viewer/StructureViewer.test.tsx
+          src/viewer/useViewerSnapshot.test.ts src/publication/FigureExport.test.tsx
+          src/presentation/WorkspaceFullscreenControl.test.tsx
+      - run: uv sync --locked --group dev --group browser
+      - name: Scope and archived native viewer with PNG export in Chrome
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv run --locked ruff check scripts/molecular-utility-scope.py \
+            tests/test_molecular_utility_scope.py server_tests/test_mobile_viewer_toolbar_browser.py \
+            server_tests/test_split_viewer_toolbar_browser.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          google-chrome --version
+          readarray -t source < <(uv run --locked python -c 'from opendde_workbench.examples.stat6_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          test "${#source[@]}" -eq 2
+          [[ "${source[0]}" =~ ^examples-v[0-9]+$ ]]
+          [[ "${source[1]}" =~ ^stat6-reviewed-results-v[0-9]+\.zip$ ]]
+          gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+          WB_REVIEWED_STAT6_ARCHIVE="$RUNNER_TEMP/${source[1]}" uv run --locked python -m pytest -x -q \
+            server_tests/test_mobile_viewer_toolbar_browser.py server_tests/test_split_viewer_toolbar_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compact-native-viewer-evidence
+          path: outputs/compact-native-viewer/
+  native-print-labels:
+    needs: [scope, utility-scope]
+    if: needs.scope.outputs.print_labels_changed == 'true' && needs.utility-scope.outputs.ligand_camera_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Native annotation layout, print capture and direct annotation consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/viewer/capture.test.ts src/viewer/contact-label-layout.test.ts
+          src/viewer/native-label-layout.test.ts src/viewer/native-labels.test.ts
+          src/viewer/contact-labels.test.ts src/viewer/native-contact-labels.test.ts
+          src/viewer/channel-geometry.test.ts src/viewer/attachment-geometry.test.ts
+          src/publication/png-resolution.test.ts
+      - run: uv sync --locked --group dev --group browser
+      - name: Scope boundary and archived 300 and 600 dpi desktop figures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/publication_raster_metrics.py server_tests/test_contact_print_layout_browser.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          google-chrome --version
+          readarray -t source < <(uv run --locked python -c 'from opendde_workbench.examples.stat6_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          test "${#source[@]}" -eq 2
+          [[ "${source[0]}" =~ ^examples-v[0-9]+$ ]]
+          [[ "${source[1]}" =~ ^stat6-reviewed-results-v[0-9]+\.zip$ ]]
+          gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+          WB_REVIEWED_STAT6_ARCHIVE="$RUNNER_TEMP/${source[1]}" uv run --locked python -m pytest -q server_tests/test_contact_print_layout_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-print-labels-evidence
+          path: outputs/contact-print-layout/
+
+  native-color-key:
+    needs: utility-scope
+    if: needs.utility-scope.outputs.native_color_figure_only == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Applied color ranges, snapshot and print contracts
+        working-directory: frontend
+        run: >-
+          npx vitest run src/viewer/scientific-color-keys.test.ts
+          src/viewer/StructureViewer.test.tsx src/viewer/useViewerSnapshot.test.ts src/viewer/style.test.ts
+          src/viewer/capture.test.ts src/publication/FigureExport.test.tsx
+          src/publication/png-resolution.test.ts src/operations/ConfidencePanel.test.tsx
+      - run: uv sync --locked --group dev --group browser
+      - name: Verify archived scientific color keys in native Chrome exports
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export WB_HOME="$RUNNER_TEMP/x-dde-native-color-key"
+          export WB_STATE_DIR="$WB_HOME/state"
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_native_color_key_publication_browser.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          readarray -t source < <(uv run --locked python -c 'from opendde_workbench.examples.stat6_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          test "${#source[@]}" -eq 2
+          [[ "${source[0]}" =~ ^examples-v[0-9]+$ ]]
+          [[ "${source[1]}" =~ ^stat6-reviewed-results-v[0-9]+\.zip$ ]]
+          gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+          uv run --locked python server_tests/prepare_reviewed_stat6_cases.py "$RUNNER_TEMP/${source[1]}"
+          uv run --locked python -m pytest -x -q server_tests/test_native_color_key_publication_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-color-key-evidence
+          path: outputs/native-color-key/
+  publication:
+    needs: [scope, utility-scope, framing-scope]
+    # Exact original-file menu bounds and real downloads use the retained-stage gate.
+    if: needs.framing-scope.outputs.framing_only != 'true' && needs.framing-scope.outputs.compact_only != 'true' && needs.utility-scope.outputs.utility_only != 'true' && needs.scope.outputs.research_tabs_only != 'true' && (needs.scope.outputs.native_receptor_only != 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && python scripts/generate-plotly-css.py --check && npm run build --prefix frontend
+      - run: uv sync --locked --group dev --group browser
+      - name: Physical figures, native capture restoration and direct questionnaire/chart consumers
+        if: needs.scope.outputs.prediction_result_layout != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/publication/settings-svg.test.ts src/publication/png-resolution.test.ts
+          src/presentation/WorkspaceFullscreenControl.test.tsx
+          src/publication/molecular-vector.test.ts
+          src/publication/render-deadline.test.ts
+          src/publication/figure-render-queue.test.ts
+          src/publication/FigureExport.test.tsx src/presentation/useReveal.test.tsx
+          src/presentation/ActiveIndicator.test.tsx src/presentation/ResearchTabs.test.tsx
+          src/presentation/MetricScatter.test.tsx src/presentation/InteractionDiagram.test.tsx
+          src/presentation/depiction-renderer.test.ts
+          src/presentation/MoleculeImage.test.tsx
+          src/viewer/capture.test.ts src/viewer/useViewerSnapshot.test.ts src/viewer/StructureViewer.test.tsx
+          src/viewer/contact-labels.test.ts src/viewer/native-contact-labels.test.ts
+          src/viewer/native-labels.test.ts src/viewer/style.test.ts
+          src/viewer/native-label-layout.test.ts
+          src/viewer/channel-geometry.test.ts src/viewer/attachment-geometry.test.ts
+          src/viewer/source-layout.test.ts
+          src/examples/guide.test.ts src/examples/TemplateStepHelp.test.tsx
+          src/viewer/donor-hydrogens.test.ts src/viewer/contacts.test.ts
+      - name: Prediction figure resolution, scene capture and workspace focus
+        if: needs.scope.outputs.prediction_result_layout == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/publication/FigureExport.test.tsx src/publication/png-resolution.test.ts
+          src/viewer/useViewerSnapshot.test.ts src/viewer/capture.test.ts
+          src/presentation/WorkspaceFullscreenControl.test.tsx src/viewer/StructureViewer.test.tsx
+      - name: Existing bootstrap and request-origin security contracts
+        if: needs.scope.outputs.prediction_result_layout != 'true'
+        run: >-
+          uv run --locked pytest -q
+          tests/test_api_security.py::test_ui_bootstrap_is_not_stored_across_releases
+          tests/test_api_security.py::test_csrf_origin_and_host_boundaries
+          tests/test_stat6_guidance.py
+      - name: Native browser runtime for the changed workspace and retained exports
+        run: uv run --locked playwright install chromium --with-deps
+      - name: Current sealed STAT6 examples for native workspace fullscreen, without calculation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WB_HOME: ${{ runner.temp }}/x-dde-fullscreen
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-fullscreen/state
+        run: |
+          archive_path="$(uv run --locked python - <<'PY'
+          import os
+          from pathlib import Path
+          from server_tests.prepare_quality_context_cases import download_archive
+          print(download_archive(Path(os.environ['RUNNER_TEMP']) / 'reviewed-stat6-data'))
+          PY
+          )"
+          echo "WB_REVIEWED_STAT6_ARCHIVE=$archive_path" >> "$GITHUB_ENV"
+          if [[ '${{ needs.scope.outputs.prediction_result_layout }}' != 'true' ]]; then
+            uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          fi
+      - name: Real desktop and narrow structure, candidate controls, native exit and figure downloads
+        if: needs.scope.outputs.prediction_result_layout != 'true'
+        env:
+          WB_HOME: ${{ runner.temp }}/x-dde-fullscreen
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-fullscreen/state
+        run: uv run --locked python -m pytest -q server_tests/test_workspace_fullscreen_browser.py
+      - name: Compact prediction structure, camera continuity and native research PNG
+        if: needs.scope.outputs.prediction_result_layout == 'true'
+        run: >-
+          uv run --locked python -m pytest -x -q server_tests/test_native_confidence_browser.py
+          -k 'short_prediction_result_stage and not 320'
+      - name: Restore archival native annotation results; no scientific execution
+        if: needs.scope.outputs.prediction_result_layout != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-figures" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-figures/state" >> "$GITHUB_ENV"
+          .venv/bin/python server_tests/download_publication_cases.py --annotations
+          gh release download examples-v1 --repo "$GITHUB_REPOSITORY" --pattern x-dde-public-cases-v1.zip --dir "$RUNNER_TEMP"
+      - name: Restore case data and managed editor in isolated CI state
+        if: needs.scope.outputs.prediction_result_layout != 'true'
+        run: |
+          .venv/bin/python server_tests/prepare_layout_cases.py "$RUNNER_TEMP/x-dde-public-cases-v1.zip"
+          .venv/bin/python server_tests/prepare_visual_components.py --components ketcher public-pose-examples
+          .venv/bin/python server_tests/restore_publication_cases.py --annotations
+      - name: Bilingual native figure downloads, retained views and responsive questionnaires
+        if: needs.scope.outputs.prediction_result_layout != 'true'
+        run: >-
+          uv run --locked python -m pytest -x -q server_tests/test_native_annotation_browser.py
+          server_tests/test_publication_browser.py
+          server_tests/test_molecular_publication_browser.py server_tests/test_publication_controls_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scientific-figure-evidence
+          path: |
+            outputs/publication-browser/**
+            outputs/workspace-fullscreen/**
+            outputs/native-confidence/stage-*/**
+
+  molecular-framing:
+    needs: framing-scope
+    if: needs.framing-scope.outputs.framing_only == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolate the archived test state
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-molecular-framing" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-molecular-framing/state" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Native figure settings, capture restoration and matched downloads
+        working-directory: frontend
+        run: >-
+          npx vitest run src/viewer/capture.test.ts src/viewer/useViewerSnapshot.test.ts
+          src/publication/settings-svg.test.ts src/publication/FigureExport.test.tsx
+          src/publication/figure-render-queue.test.ts
+      - name: Restore archived STAT6 results without calculation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check server_tests/test_figure_framing_browser.py
+          uv run --locked python server_tests/prepare_quality_context_cases.py
+          uv run --locked playwright install chromium --with-deps
+      - name: Actual 3D PNG framing, stable live camera and original structure bytes
+        run: uv run --locked python -m pytest -x -q server_tests/test_figure_framing_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-molecular-framing
+          path: outputs/publication-browser/framing
+
+  compact-figure-dialog:
+    needs: framing-scope
+    if: needs.framing-scope.outputs.compact_changed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - name: Isolate retained outputs
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-compact-figure" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-compact-figure/state" >> "$GITHUB_ENV"
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Real PNG and SVG, focus, visible download and short-screen scrolling
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv sync --locked --group dev --group browser
+          google-chrome --version
+          uv run --locked ruff check server_tests/test_compact_figure_dialog_browser.py
+          uv run --locked python server_tests/prepare_quality_context_cases.py
+          uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked python -m pytest -x -q server_tests/test_compact_figure_dialog_browser.py
+      - name: Shared figure and molecular drawing controls
+        working-directory: frontend
+        run: npx vitest run src/publication/FigureExport.test.tsx src/presentation/MoleculeImage.test.tsx
+      - name: Shared export of scientific color keys
+        run: |
+          uv run --locked playwright install chromium --with-deps
+          uv run --locked python -m pytest -x -q \
+            server_tests/test_native_color_key_publication_browser.py::test_retained_native_figure_includes_applied_color_key
+      - name: Shared export from saved research files
+        env:
+          WB_HOME: ${{ runner.temp }}/x-dde-compact-files
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-compact-files/state
+        run: |
+          uv run --locked python server_tests/prepare_workspace_preview_cases.py
+          uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked python -m pytest -x -q \
+            server_tests/test_workspace_preview_browser.py::test_native_selected_file_previews_and_exact_record_switching
+      - name: Archival Ketcher drawing and export settings
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WB_HOME: ${{ runner.temp }}/x-dde-compact-archive
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-compact-archive/state
+        run: |
+          gh release download examples-v1 --repo "$GITHUB_REPOSITORY" \
+            --pattern x-dde-public-cases-v1.zip --dir "$RUNNER_TEMP"
+          uv run --locked python server_tests/prepare_layout_cases.py "$RUNNER_TEMP/x-dde-public-cases-v1.zip"
+          uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked python -m pytest -x -q \
+            server_tests/test_publication_controls_browser.py::test_ketcher_preview_matches_download_and_mobile_settings
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compact-figure-dialog-evidence
+          path: |
+            outputs/publication-browser/
+            outputs/native-color-key/
+            outputs/workspace-preview/

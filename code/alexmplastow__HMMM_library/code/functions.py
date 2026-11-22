@@ -1,0 +1,977 @@
+import objects
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import MDAnalysis
+from MDAnalysis.analysis import contacts
+from MDAnalysis.lib.distances import capped_distance
+from scipy.special import expit
+import re
+import os
+import pandas as pd
+import copy
+
+from fastparquet import write
+from fastparquet import ParquetFile
+import pyarrow
+
+def getProteinCOMandLeafletZs(proteinInstance, membraneInstance):
+
+        T = proteinInstance.getTinNs()
+        R_z = proteinInstance.getCOM_R_z()
+        membraneMax_R_z = np.ones(len(T)) * membraneInstance.maxZ
+        membraneMin_R_z = np.ones(len(T)) * membraneInstance.minZ
+        return T, R_z, membraneMax_R_z, membraneMin_R_z
+
+def findEuclidianDistance(a, b):
+    return np.linalg.norm(a - b)
+
+def checkFrameResidueContacts(proteinInstance, membraneInstance, contactCutoff = 8, collectLipidTypeCounts = False, determineSingleContact = False):
+	lipids = membraneInstance.lipids
+	residues = proteinInstance.residues
+
+	D_ij = np.zeros((len(lipids), len(residues)))
+	C_ij = np.zeros((len(lipids), len(residues)))
+	residue_C_j = np.zeros((len(residues)))
+
+	residue_C_j_DPPC = np.zeros((len(residues)))
+	residue_C_j_SSM = np.zeros((len(residues)))
+	residue_C_j_CHL1 = np.zeros((len(residues)))
+
+	for i, lipid in enumerate(lipids):
+		for j, residue in enumerate(residues):
+
+			d = findEuclidianDistance(lipid.r, residue.r)
+			D_ij[i][j] = d
+
+			if d < contactCutoff:
+				C_ij[i][j] = 1
+				residue_C_j[j] += 1
+
+				#NOTE: it's difficult to see, but this routine is for cases where
+					#NOTE: I just want to determine if any part of the protein
+					#NOTE: is interacting with any part of the membrane
+				if determineSingleContact:
+					return 1
+
+				if collectLipidTypeCounts:
+					if lipid.lipidType == "DPPC":
+						residue_C_j_DPPC[j] += 1
+					elif lipid.lipidType == "SSM":
+						residue_C_j_SSM[j] += 1
+					elif lipid.lipidType == "CHL1":
+						residue_C_j_CHL1[j] += 1
+					else:
+						raise Exception("not seeing the lipid type...")
+
+	#NOTE: one final check to determine if none of the residues are actively contacting a
+		#NOTE: a lipid
+	if determineSingleContact:
+
+		#NOTE: innocent until proven guilty
+		PL_contact = False
+		for i, _ in enumerate(lipids):
+			for j, _ in enumerate(residues):
+
+				if C_ij[i][j] == 1:
+					PL_contact == True
+
+
+		if PL_contact:
+			return 1
+		else:
+			return 0
+
+
+	if collectLipidTypeCounts:
+		return D_ij, C_ij, residue_C_j, residue_C_j_DPPC, residue_C_j_SSM, residue_C_j_CHL1
+	else:
+		return D_ij, C_ij, residue_C_j
+
+
+def SanityCheckSimulationResidueContacts(proteinInstance, membraneInstance, contactCutoff = 8, dynamicSanityCheck = False, sanityCheckPlotSaveDir = "/home/alpal/projects/vacAstudies/analyticalSolutions/residueContactSaveDir"):
+        trajectoryIndices = proteinInstance.getTrajectoryIndices()
+        #NOTE: I am trusting proteinInstance, membraneInstance = 
+                #NOTE:proteinInstance(i), membraneInstance(i)
+        residueIdentifiers = [f"{residue.resnum}:{residue.aminoAcidLetter}" for residue in proteinInstance.residues]
+        for i in tqdm(trajectoryIndices):
+                proteinInstance.goto(i)
+                D_ij, C_ij, residue_C_j = checkFrameResidueContacts(proteinInstance, membraneInstance, contactCutoff = contactCutoff)
+
+                if dynamicSanityCheck:
+                        fig, ax = plt.subplots(figsize=(10, 4))
+
+                        hbars = ax.bar(residueIdentifiers, residue_C_j, align='center')
+
+                        ax.set_title(f"Residue contacts at frame {i}")
+                        ax.set_xlabel("Residue Identifier (amino acid + index)")
+                        ax.set_ylabel("Total number of lipid contacts")
+
+
+                        ax.tick_params(axis='x', labelrotation=90, labelsize=6)
+
+                        ax.set_ylim([0, 10])
+
+                        plt.tight_layout()
+                        plt.savefig(f"{sanityCheckPlotSaveDir}/frame_{i:04d}.png", dpi=300)
+                        plt.close()
+
+#NOTE: the specimenTitle variable is integrated in the line:
+	#NOTE: ax.set_title(f"Residue contacts (sampled every {sample_stride} frames)")
+	#NOTE: if a specimen Title is entered, then:
+	#NOTE: ax.set_title(f"{specimenTitle}: residue contacts (sampled every {sample_stride} frames)")
+
+	
+	
+
+def getCompleteContactCount(
+		proteinInstance,
+		membraneInstance,
+		contactCutoff = 8,
+		plot = True,
+		sample_stride = 10,
+		lipidTypeVisualization = False,
+		specimenTitle = None
+):
+	trajectoryIndices = proteinInstance.getTrajectoryIndices()
+	sampledTrajectoryIndices = trajectoryIndices[::sample_stride]
+
+	residues = proteinInstance.residues
+	residueIdentifiers = [
+		f"{res.resnum}:{res.aminoAcidLetter}"
+		for res in residues
+	]
+
+	total_residue_C_j = np.zeros(len(residues))
+
+	if lipidTypeVisualization:
+		total_residue_C_j_DPPC = np.zeros(len(residues))
+		total_residue_C_j_SSM = np.zeros(len(residues))
+		total_residue_C_j_CHL1 = np.zeros(len(residues))
+
+	for i in tqdm(sampledTrajectoryIndices):
+		proteinInstance.goto(i)
+
+		if not lipidTypeVisualization:
+			_, _, residue_C_j = checkFrameResidueContacts(
+				proteinInstance,
+				membraneInstance,
+				contactCutoff = contactCutoff,
+				collectLipidTypeCounts = False
+			)
+			total_residue_C_j += residue_C_j
+
+		else:
+			_, _, _, residue_C_j_DPPC, residue_C_j_SSM, residue_C_j_CHL1 = \
+				checkFrameResidueContacts(
+					proteinInstance,
+					membraneInstance,
+					contactCutoff = contactCutoff,
+					collectLipidTypeCounts = True
+				)
+
+			total_residue_C_j_DPPC += residue_C_j_DPPC
+			total_residue_C_j_SSM += residue_C_j_SSM
+			total_residue_C_j_CHL1 += residue_C_j_CHL1
+
+	if plot:
+		fig, ax = plt.subplots(figsize=(12, 4))
+
+		if not lipidTypeVisualization:
+			ax.bar(residueIdentifiers, total_residue_C_j)
+			ax.set_ylabel("Total contacts")
+
+		else:
+			colors = {
+				"DPPC": "tab:blue",
+				"SSM": "tab:orange",
+				"CHL1": "tab:green"
+			}
+
+			bottom = np.zeros(len(residues))
+
+			ax.bar(
+				residueIdentifiers,
+				total_residue_C_j_DPPC,
+				bottom = bottom,
+				color = colors["DPPC"],
+				label = "DPPC"
+			)
+			bottom += total_residue_C_j_DPPC
+
+			ax.bar(
+				residueIdentifiers,
+				total_residue_C_j_SSM,
+				bottom = bottom,
+				color = colors["SSM"],
+				label = "SSM"
+			)
+			bottom += total_residue_C_j_SSM
+
+			ax.bar(
+				residueIdentifiers,
+				total_residue_C_j_CHL1,
+				bottom = bottom,
+				color = colors["CHL1"],
+				label = "CHL1"
+			)
+
+			ax.set_ylabel("Contacts (stacked by lipid type)")
+			ax.legend(title="Lipid Type")
+
+		if specimenTitle == None:
+			ax.set_title(f"Residue contacts (sampled every {sample_stride} frames)")
+		else:
+			ax.set_title(f"{specimenTitle}: residue contacts (sampled every "
+					f"{sample_stride} frames)")
+
+		ax.set_xlabel("Residue (letter:index)")
+		ax.tick_params(axis='x', labelrotation=90, labelsize=6)
+
+		plt.tight_layout()
+		plt.show()
+
+	if lipidTypeVisualization:
+		return (
+			total_residue_C_j_DPPC,
+			total_residue_C_j_SSM,
+			total_residue_C_j_CHL1
+		)
+	else:
+		return total_residue_C_j
+
+def removeEquilibration(topology, trajectory):
+
+        u = MDAnalysis.Universe(topology, trajectory)
+
+        u.select_atoms("all").write(f"{trajectory}.nonEquilibrated.dcd", frames = u.trajectory[500:])
+
+#NOTE: this is a slight departure from previous functions which employ the use of membrane
+	#NOTE: and protein objects. I think this is sensable in situations where I am making
+	#NOTE: comparisons accross mutliple trajectories
+
+	#NOTE: I do get to employ such instances all the same
+def getInteractionFraction(topology, trajectory, contactCutoff = 8):
+	
+	u = MDAnalysis.Universe(topology, trajectory)
+	
+	proteinInstance = objects.protein(u)
+	membraneInstance = objects.membrane(u)
+
+	trajectoryIndices = proteinInstance.getTrajectoryIndices()
+	totalFrames = len(trajectoryIndices)
+
+	contactCount = 0
+
+	for i in tqdm(trajectoryIndices):
+		proteinInstance.goto(i)
+		contactBoolean = checkFrameResidueContacts(proteinInstance, membraneInstance, contactCutoff = contactCutoff, determineSingleContact = True)
+		contactCount+=contactBoolean
+
+	return contactCount/totalFrames
+
+def getInteractionFraction(topology, trajectory, contactCutoff=8, stride=1):
+
+	u = MDAnalysis.Universe(topology, trajectory)
+
+	proteinInstance = objects.protein(u)
+	membraneInstance = objects.membrane(u)
+
+	trajectoryIndices = proteinInstance.getTrajectoryIndices()
+
+	sampledIndices = trajectoryIndices[::stride]
+	totalFrames = len(sampledIndices)
+
+	contactCount = 0
+
+	for i in tqdm(sampledIndices):
+		proteinInstance.goto(i)
+		contactBoolean = checkFrameResidueContacts(proteinInstance, membraneInstance,
+							contactCutoff=contactCutoff,
+							determineSingleContact=True)
+		contactCount += contactBoolean
+
+	contactFraction = contactCount / totalFrames
+	n = totalFrames
+
+	return contactFraction, n
+
+#TODO: define a function for defining contacts using the paper Emad so thoughtfully shared with you
+#TODO: devise a way to plug the distance matrices into this function
+#TODO: output the resulting file for analysis in R
+
+#NOTE: in the OG paper by Best-Hummer-Eaton β is the an arbitrary value, but is typically
+    #NOTE: 5 Å^-1, λ is set to 1.8 for the paper, but Hale went with 4 so......
+
+#NOTE: ref is "Native contacts determine protein folding mechanisms in atomistic simulations"
+    #NOTE: or https://www.pnas.org/doi/10.1073/pnas.1311599110
+
+def computeContact(d):
+    return 1/(1+np.exp(5*(d-4)))
+
+_TOKEN_RE = re.compile(r"[{}()]|,|[^\s{}(),]+")
+
+#Author: chatGPT
+def tokenize_colvars(text):
+	tokens = []
+
+	for line in text.splitlines():
+		line = line.split("#", 1)[0].strip()
+
+		if not line:
+			continue
+
+		tokens.extend(_TOKEN_RE.findall(line))
+		tokens.append("\n")
+
+	return tokens
+
+#Author: chatGPT
+def atom(token):
+	if re.fullmatch(r"[-+]?\d+", token):
+		return int(token)
+
+	if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?", token):
+		return float(token)
+
+	return token
+
+#Author: chatGPT
+def clean_values(values):
+	values = [v for v in values if v not in ("\n", ",", "(", ")")]
+	values = [atom(v) for v in values]
+
+	if len(values) == 1:
+		return values[0]
+
+	return values
+
+#Author: chatGPT
+def add_entry(d, key, value):
+	if key in d:
+		if not isinstance(d[key], list):
+			d[key] = [d[key]]
+
+		d[key].append(value)
+	else:
+		d[key] = value
+
+#Author: chatGPT
+def find_matching_brace(tokens, start):
+	depth = 0
+
+	for i in range(start, len(tokens)):
+		if tokens[i] == "{":
+			depth += 1
+		elif tokens[i] == "}":
+			depth -= 1
+
+			if depth == 0:
+				return i
+
+	raise ValueError("Unclosed brace")
+
+#Author: chatGPT
+def block_is_value_list(tokens, start):
+	end = find_matching_brace(tokens, start - 1)
+	inner = [t for t in tokens[start:end] if t != "\n"]
+
+	if not inner:
+		return False
+
+	if "{" in inner or "}" in inner:
+		return False
+
+	if inner[0] in ("atomNumbers", "atomNumbersRange"):
+		return False
+
+	return True
+	
+#Author: chatGPT
+def parse_block(tokens, index):
+	result = {}
+
+	while index < len(tokens):
+		token = tokens[index]
+
+		if token == "\n":
+			index += 1
+			continue
+
+		if token == "}":
+			return result, index + 1
+
+		key = token
+		index += 1
+
+		while index < len(tokens) and tokens[index] == "\n":
+			index += 1
+
+		if index < len(tokens) and tokens[index] == "{":
+			index += 1
+
+			if block_is_value_list(tokens, index):
+				values = []
+
+				while tokens[index] != "}":
+					values.append(tokens[index])
+					index += 1
+
+				index += 1
+				add_entry(result, key, clean_values(values))
+			else:
+				value, index = parse_block(tokens, index)
+				add_entry(result, key, value)
+
+		else:
+			values = []
+
+			while index < len(tokens) and tokens[index] not in ("\n", "}"):
+				values.append(tokens[index])
+				index += 1
+
+			add_entry(result, key, clean_values(values))
+
+	return result, index
+
+#Author: chatGPT
+def parse_colvars_file(text):
+	tokens = tokenize_colvars(text)
+
+	parsed = {}
+	index = 0
+
+	while index < len(tokens):
+		if tokens[index] == "\n":
+			index += 1
+			continue
+
+		block_type = tokens[index]
+		index += 1
+
+		while index < len(tokens) and tokens[index] == "\n":
+			index += 1
+
+		if index >= len(tokens) or tokens[index] != "{":
+			raise ValueError(f"Expected '{{' after {block_type!r}; got {tokens[index]!r}")
+
+		index += 1
+		block, index = parse_block(tokens, index)
+
+		if block_type == "colvar" and "name" in block:
+			parsed.setdefault("colvar", {})[block["name"]] = block
+
+		elif block_type in ("harmonic", "harmonicWalls") and "colvars" in block:
+			parsed.setdefault(block_type, {})[block["colvars"]] = block
+
+		else:
+			parsed.setdefault(block_type, []).append(block)
+
+	return parsed
+
+def col2Colvar(colvarFile, debug1 = False, debug2 = False):
+
+	colvarText = open(colvarFile).read()
+	CH_dict = parse_colvars_file(colvarText)
+
+	'''
+	#NOTE: output is: 
+		#colvar
+		#harmonic
+	for key in colvarDict.keys():
+		print(key)
+	'''
+
+	colvarDict = CH_dict['colvar']
+	if debug1:
+	
+		exampleKey = list(colvarDict.keys())[0]
+			
+		print("////////////////////////////////////////")
+		print("ColvarDict")
+		print(colvarDict[exampleKey])
+		print("////////////////////////////////////////")
+
+	colvarInstances = []
+	colvarNames = colvarDict.keys()
+	for colvarName in colvarNames:
+		colvarInstances.append(objects.colvar(colvarDict[colvarName]))
+
+	if debug2:
+		exampleColvar = colvarInstances[0]
+
+		print("////////////////////////////////////////")
+		print('colvar attributes')
+		print(dir(exampleColvar))
+		print("////////////////////////////////////////")
+
+	harmonicInstances = []
+	harmonicDict = CH_dict['harmonic']
+	for harmonicDictKey in harmonicDict.keys():
+		harmonicInstances.append(objects.harmonic(harmonicDict[harmonicDictKey]))
+	
+	for colvarInstance in colvarInstances:
+		for harmonicInstance in harmonicInstances:
+			if colvarInstance.name == harmonicInstance.colvarName:
+				colvarInstance.addHarmonic(harmonicInstance)
+
+	return colvarInstances
+
+
+def colvarTypeSanityCheck(colvarInstances):
+        
+        print("***************************************")
+
+        for colvarInstance in colvarInstances:
+                
+                colvarInstance.determineType()
+
+                if colvarInstance.type == 1:
+                        
+                        colvarInstance.determineTypeSanityCheck()
+
+                        break
+
+        print("***************************************")
+
+        for colvarInstance in colvarInstances:
+                
+                colvarInstance.determineType()
+
+                if colvarInstance.type == 2:
+
+                        colvarInstance.determineTypeSanityCheck()
+
+                        break
+
+        print("***************************************")
+
+def dataStructureSanityCheck(colvarInstances):
+        for colvarInstance in colvarInstances:
+                colvarType = colvarInstance.determineType()
+                if colvarType == 1:
+                        print("********************************")
+                        print(colvarInstance.harmonic.forceConstant)
+                        print(type(colvarInstance.harmonic.forceConstant))
+                        print("********************************")
+                elif colvarType == 2:
+                        print("********************************")
+                        print(type(colvarInstance.lowerwallconstant))
+                        print(type(colvarInstance.upperwallconstant))
+                        print("********************************")
+                        print(dir(colvarInstance))
+                        raise Exception("Stop here")
+
+
+'''
+def modColvarSprings(colvarFile,
+                                forceConstant,
+                                upperWallConstant,
+                                lowerWallConstant,
+                                sanityCheck = False):
+
+                colvarInstances = col2Colvar(colvarFile)
+
+                for colvarInstance in colvarInstances:
+                        colvarType = colvarInstance.determineType()
+
+                        if colvarType == 1:
+
+                                colvarInstance.harmonic.forceConstant = forceConstant
+
+                                if sanityCheck:
+                                        print("type 1 exec")
+
+                        elif colvarType == 2:
+
+                                colvarInstance.lowerwallconstant = lowerWallConstant
+                                colvarInstance.upperwallconstant = upperWallConstant
+
+                                if sanityCheck:
+                                        print("!!!")
+                                        print("type 2 exec")
+                                        raise Exception("No point in proceeding")
+'''
+
+def modColvarSprings(colvarInstance,
+                                forceConstant,
+                                upperWallConstant,
+                                lowerWallConstant):
+
+    colvarType = colvarInstance.determineType()
+
+    if colvarType == 1:
+
+        colvarInstance.harmonic.forceConstant = forceConstant
+
+    elif colvarType == 2:
+
+        colvarInstance.lowerwallconstant = lowerWallConstant
+        colvarInstance.upperwallconstant = upperWallConstant
+
+
+def colvarInstances2ColvarFile(colvarInstances, outputColvarFile):
+
+        blockStrings = []
+
+        for colvarInstance in colvarInstances:
+
+                blockStrings.append(colvarInstance.constructBlock())
+
+        with open(outputColvarFile, "w") as outputFile:
+                outputFile.write("\n".join(blockStrings) + "\n")
+
+
+def modifyColvarParametersWithCSVParameters(springParametersCSV, colvarFile, sanityCheck = False):
+
+
+	df = pd.read_csv(springParametersCSV)
+	colvarInstances = col2Colvar(colvarFile)
+        
+	for i in df.index:
+		forceConstant = df.at[i, 'forceConstant']
+		upperWallConstant = df.at[i, 'upperWallConstant']
+		lowerWallConstant = df.at[i, 'lowerWallConstant']
+
+		for colvarInstance in colvarInstances:
+
+			modColvarSprings(colvarInstance,
+					forceConstant,
+					upperWallConstant,
+					lowerWallConstant)
+
+		colvarInstances2ColvarFile(colvarInstances, 
+			f"membrane_hmmm_restraint_fixed_{forceConstant}_"
+			f"{upperWallConstant}_{lowerWallConstant}.namd.col")
+
+
+def colvarAtomIndexSanityCheck(exampleColvars):
+        type1Collected = False
+        type2Collected = False
+        for colvar in exampleColvars:
+                colvar.determineType()
+                if colvar.type == 1 and not type1Collected:
+                        type1Collected = True
+                        type1ColvarInstance = colvar
+
+                elif colvar.type == 2 and not type2Collected:
+                        type2Collected = True
+                        type2ColvarInstance = colvar
+
+                elif type1Collected and type2Collected:
+                        break
+
+        print(type1ColvarInstance.constructBlock())
+        print("///////////////////////")
+        print(type2ColvarInstance.constructBlock())
+
+        print(type1ColvarInstance.atomNumbersString)
+        print(type2ColvarInstance.atomNumbersString)
+
+def checkHMMMUniverseConstraintAtomsSanityCheck(hmmmMembrane):
+
+	hmmmMembrane.addConstraintIndicesToEachLipid()
+	hmmmMembrane.addConstraintIndicesToEachSolventResidue()
+
+	for lipid in hmmmMembrane.lipids:
+		print(lipid.colvarIndices)
+		print('sanity check cleared, assuming there are indices here')
+		break
+
+	for solventResidue in hmmmMembrane.solventResidues:
+		print(solventResidue.colvarIndices)
+		print('sanity check cleared, assuming there are indices here')
+		break
+
+	#One more detail to check if the colvarIndices are correctly matched with their residues
+
+	exampleLipidIndices = [atom.index for atom in hmmmMembrane.lipids[0].atoms]
+	exampleLipidColvarIndices = hmmmMembrane.lipids[0].colvarIndices
+
+	print("Example lipid indices")
+	print(exampleLipidIndices)
+	print("Example colvarIndices")
+	print(exampleLipidColvarIndices)
+
+	exampleSolventResidueIndices = [atom.index for atom in hmmmMembrane.solventResidues[0].atoms]
+	exampleSolventResidueColvarIndices = hmmmMembrane.solventResidues[0].colvarIndices
+
+	print("Example solvent indices")
+	print(exampleSolventResidueIndices)
+	print("Example solvent colvarIndices")
+	print(exampleSolventResidueColvarIndices)
+
+def translateCharmmColvarFileToSCSEColvars(exampleColvars, 
+						scseHmmmMembraneInstance, 
+						restrainCholesterol = True):
+
+	#Collecting a type 1 colvar, type 2 colvars, and type3 colvars
+	def collectColvar(typeNO, exampleColvars = exampleColvars):
+		for exampleColvar in exampleColvars:
+			if exampleColvar.colvarType == typeNO:
+				return exampleColvar
+
+	type1Colvar = collectColvar(typeNO = 1)
+	type2Colvar = collectColvar(typeNO = 2)
+	
+	#Adding the usefull indices to scseHmmmMembraneInstance
+	scseHmmmMembraneInstance.addConstraintIndicesToEachLipid(SSMname = ['C6S', 'C6F'],
+								DPPCname = ['C26', 'C36'],
+								restrainCholesterol = restrainCholesterol)
+
+	scseHmmmMembraneInstance.labelLipidsWithLeafletLabels()
+
+	#Now, collecting the lipids from the scseHmmmMembraneInstance
+
+	lipidColvars = []
+	ctlIndex = 0
+
+	#Adding lipid details to determine lipid subtype
+	scseHmmmMembraneInstance.labelLipidsWithLeafletLabels()
+
+	for lipid in scseHmmmMembraneInstance.lipids:
+
+		#I will not be adding constraints to the lipids in this implementation
+		if lipid.lipidType == 'CHL1' and not restrainCholesterol:
+			continue
+
+		else:
+
+			#Collecting usefull meta-data
+			colvarIndices = lipid.colvarIndices
+			nameIndex = ctlIndex
+
+			#Creating a copy of my colvar instance
+			templateColvar = copy.deepcopy(type1Colvar)
+
+			#I have this set to over overide the atomNumbersString attribute
+				#Not that it makes much difference other than readability
+			templateColvar.manualAtomNumbersString = ' '.join(colvarIndices)
+			templateColvar.name = f'ctl{ctlIndex}'
+
+			#I neglected to add harmonic mods the first time and that !@#$ed my implementation
+			templateColvar.harmonic.colvarName = f'ctl{ctlIndex}'
+		
+			#Incrementing for the subsequent residue
+			ctlIndex += 1
+
+			#Checking the lipid type before adjusting the residue center
+			if lipid.leaflet == 'upper':
+				templateColvar.harmonic.centers = templateColvar.harmonic.centers
+			elif lipid.leaflet == 'lower':
+				templateColvar.harmonic.centers = -templateColvar.harmonic.centers	
+
+			#Now adding that pesky colvar
+			lipidColvars.append(templateColvar)
+
+	#Adding constraint indices to the solvent
+	scseHmmmMembraneInstance.addConstraintIndicesToEachSolventResidue()
+
+	#Now for the solvent
+	hmmmSolventColvars = []
+	for solventResidue in scseHmmmMembraneInstance.solventResidues:
+
+		#Collecting usefull meta-data
+		colvarIndices = solventResidue.colvarIndices
+		colvarName = f"SCSE{solventResidue.resID}"
+
+		#Creating a copy of my colvar instance
+		templateColvar = copy.deepcopy(type2Colvar)
+
+		#I have this set to over overide the atomNumbersString attribute
+		#Not that it makes much difference other than readability
+		templateColvar.manualAtomNumbersString = ' '.join(colvarIndices)
+		templateColvar.name = colvarName
+
+		#Now adding the colvar
+		hmmmSolventColvars.append(templateColvar)
+
+	#These colvars are a package deal 👬
+	return lipidColvars + hmmmSolventColvars
+
+
+
+def generateProteinMembraneInteractionColvar(proteinInstance, 
+						membraneInstance,
+						membraneLipidSamplingStride = 1):
+	residueOfInterestIndices = proteinInstance.getAtomIndicesFromResiduesOfInterest()
+	leafletRepAtomIndices = \
+		membraneInstance.getLeafletRepAtomIndices(samplingStride = membraneLipidSamplingStride)
+
+	residuesOfInterestIndices_string = " ".join([str(i) for i in residueOfInterestIndices])
+	leafletRepAtoms_string = " ".join([str(i) for i in leafletRepAtomIndices])
+
+	#NOTE: I need to check the distance between the membrane and the protein and
+		#NOTE: enforce that
+
+	proteinInstanceResidueOfInterestAtoms = proteinInstance.getAtomsFromResiduesOfInterest()
+	membraneInstanceResiduesOfInterestAtoms = membraneInstance.getLeafletRepAtoms()
+
+	def getAtomGeometricCenter(atoms):
+		N = len(atoms)
+		Σ = sum(np.array([atom.r for atom in atoms]))
+		return Σ/N
+
+	proteinResiduesOfInterestGeometricCenter = getAtomGeometricCenter(
+						proteinInstanceResidueOfInterestAtoms)
+	membraneInstanceResiduesOfInterestGeometricCenter = getAtomGeometricCenter(
+						membraneInstanceResiduesOfInterestAtoms)
+
+	Zdistance = abs(membraneInstanceResiduesOfInterestGeometricCenter[-1]
+			- proteinResiduesOfInterestGeometricCenter[-1])
+
+	proteinMembraneColvar = (
+		f"colvar {{\n"
+		f"    name protein_membrane_Z\n"
+		f"\n"
+		f"    distanceZ {{\n"
+		f"        main {{\n"
+		f"            atomNumbers {residuesOfInterestIndices_string}\n"
+		f"        }}\n"
+		f"        ref {{\n"
+		f"            atomNumbers {leafletRepAtoms_string}\n"
+		f"        }}\n"
+		f"    }}\n"
+		f"}}\n"
+		f"\n"
+		f"harmonicWalls {{\n"
+		f"    name protein_membrane_Z_upper_wall\n"
+		f"    colvars protein_membrane_Z\n"
+		f"    upperWalls {Zdistance}\n"
+		f"    forceConstant 5.0\n"
+		f"}}\n"
+	)
+	
+	#NOTE: don't ever use chatGPT to handle parsing again
+	CH_dict = parse_colvars_file(proteinMembraneColvar)
+	colvarDict = CH_dict['colvar']
+	harmonicWallsDict = CH_dict['harmonicWalls']
+
+	colvar = objects.colvar(colvarDict)
+	harmonicWalls = objects.harmonicWalls(harmonicWallsDict)
+
+	colvar.addHarmonicWalls(harmonicWalls)
+
+	return colvar
+
+def protein_membraneContacts(protein, membrane, frameNum):
+
+    universe = protein.universe
+    universe.trajectory[frameNum]
+
+    mdaProtein = universe.select_atoms("protein")
+    mdaMembrane = universe.select_atoms("segid MEMB")
+
+    pairs, distances = capped_distance(
+        reference=mdaProtein.positions,
+        configuration=mdaMembrane.positions,
+        max_cutoff=4.5,
+        box=universe.dimensions,
+        method="nsgrid",
+        return_distances=True,
+    )
+
+    contact_weights = expit(-5.0 * (distances - 4.5))
+
+    return {
+        "frame": universe.trajectory.ts.frame,
+        "contact_i": mdaProtein.indices[pairs[:, 0]],
+        "contact_j": mdaMembrane.indices[pairs[:, 1]],
+        "distances": distances,
+        "contact_weights": contact_weights
+    }
+
+
+def proteinMembraneContacts2Parquet(protein,
+                                        membrane,
+                                        parquetPath,
+                                        sanityCheck = True):
+
+        #I embeded the universe inside both the protein and membrane
+        universe = protein.universe
+
+        #I prefer not to grab indices from elsewhere to keep my code clean
+        trajIndices = list(range(0, len(universe.trajectory)))
+
+        #Checking for the presence of the parquet file
+        if not os.path.isfile(parquetPath):
+                print('parquet not found, writing a new one with intial frame')
+                contactsDict = protein_membraneContacts(
+                                        protein,
+                                        membrane,
+                                        0)
+
+                df = pd.DataFrame([contactsDict]).reset_index()
+
+                df.to_parquet(
+                        parquetPath,
+                        engine="pyarrow")
+
+
+        completedParquet_pf = ParquetFile(parquetPath)
+
+        completedParquet_df = completedParquet_pf.to_pandas()
+
+        completedParquetIndices = list(completedParquet_df['frame'])
+
+        for index in tqdm(trajIndices):
+
+                if index in completedParquetIndices:
+
+                        continue
+
+                else:
+
+                        contactsDict = protein_membraneContacts(
+                                        protein,
+                                        membrane,
+                                        index)
+
+                        newContactRow = pd.DataFrame([contactsDict]).reset_index()
+
+                        completedParquet_df = \
+                                pd.concat([completedParquet_df, newContactRow])
+
+                        completedParquet_df.to_parquet(
+                                parquetPath[:-5] + 'tmp.parq',
+                                                        engine="pyarrow")
+
+                        completedParquet_df.to_parquet(parquetPath,
+                                                        engine="pyarrow")
+
+
+
+        if sanityCheck:
+
+                completedParquetIndices = list(completedParquet_df['frame'])
+
+                contactLengths = []
+                for index in completedParquetIndices:
+                        contactLengths.append(
+                        len(completedParquet_df.iloc[index]['contact_i']))
+
+        #I don't currently have quibbles about checking the parquet each
+                #time I iterate through an index
+        #for traj_i in trajIndices:
+
+def getSetOfObserved_atom_atomContactsFromParquet(parquetPath):
+
+
+        completedParquet_pf = ParquetFile(parquetPath)
+
+        completedParquet_df = completedParquet_pf.to_pandas()
+
+        observedContacts = set()
+        for row in tqdm(completedParquet_df.itertuples()):
+
+                iContacts = row.contact_i
+                jContacts = row.contact_j
+
+                for i, j in zip(iContacts, jContacts):
+                        observedContacts.add(str(i) + '_' + str(j))
+
+        return observedContacts
+
+def getSetOfMacro_atom_atomContactsFromParquet(parquetPath, pdb):
+
+	observedContacts

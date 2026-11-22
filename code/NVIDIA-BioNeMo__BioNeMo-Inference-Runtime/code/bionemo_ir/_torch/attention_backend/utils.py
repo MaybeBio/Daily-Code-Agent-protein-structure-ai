@@ -1,0 +1,518 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+import torch
+
+from bionemo_ir.utils import DEBUG_ASSERTS, get_sm_version
+
+from .interface import AttentionBackend, AttentionType
+from .pairwise_attention import PairwiseAttentionCuTeLeftMask, SDPAPairwiseAttention, VanillaPairwiseAttention
+from .triangle_attention import (
+    ClaudeKitTriangleAttentionSM90D32,
+    CuEquivAttention,
+    HeuristicTriangleAttention,
+    SDPATriangleAttention,
+    TriangleAttentionCuTeLeftMask,
+    VanillaTriangleAttention,
+)
+from .triangle_attention.cuequiv import cuequiv_supports
+from .window_attention import window_attention, window_attention_supported
+
+
+def auto_select_triangle_attention_backend(
+    dtype: torch.dtype = torch.float32,
+    head_dim: int | None = None,
+) -> str:
+    """Return the fastest available triangle attention backend name.
+
+    Selection priority (highest to lowest):
+      1. **Heuristic** — optimized router on
+         SM80/SM86/SM89/SM90/SM100/SM103/SM107, fp16/bf16 only. It selects
+         ``ClaudeKit`` for SM90 BF16 D=32 calls of at least 23M attention
+         scores and CuTeDSL otherwise. A layer whose head dimension CuTeDSL
+         cannot pad to falls through to the backends below, as here.
+      2. **CUEQUIV** — all SKUs and dtypes, for head dims up to 128 in
+         fp16/bf16 and up to 32 in fp32.
+      3. **SDPA** — PyTorch scaled-dot-product attention, all SKUs/dtypes.
+
+    Args:
+        dtype: Input tensor dtype.
+        head_dim: Optional logical head dimension. Supplying it prevents
+            selection of a backend whose kernels cannot take it.
+    """
+    sm = get_sm_version()
+    is_half = dtype in (torch.float16, torch.bfloat16)
+    if head_dim is not None and head_dim < 1:
+        raise ValueError(f"head_dim must be positive; got {head_dim}")
+    padded_head_dim = None if head_dim is None else ((head_dim + 31) // 32) * 32
+    supported_head_dims = {32, 64, 128} if sm in (100, 103, 107) else {32, 64, 128, 256}
+    supports_head_dim = padded_head_dim is None or padded_head_dim in supported_head_dims
+
+    if sm in (80, 86, 89, 90, 100, 103, 107) and is_half and supports_head_dim:
+        return "Heuristic"
+    if cuequiv_supports(dtype, head_dim):
+        return "CUEQUIV"
+    return "SDPA"
+
+
+_LEFT_MASK_TRIANGLE_BACKENDS = frozenset({"CuTeDSL", "ClaudeKit", "Heuristic"})
+
+
+def backend_uses_preallocated_buffers(backend_name: str) -> bool:
+    """Return whether an attention backend reuses output and LSE buffers."""
+    return backend_name in _LEFT_MASK_TRIANGLE_BACKENDS
+
+
+def backend_uses_left_mask(backend_name: str) -> bool:
+    """Return whether triangle attention consumes precomputed KV lengths."""
+    return backend_name in _LEFT_MASK_TRIANGLE_BACKENDS
+
+
+def triangle_bias_pad_multiple(backend_name: str) -> int:
+    """Return the key-axis alignment for optimized triangle pair bias."""
+    return 8 if backend_uses_left_mask(backend_name) else -1
+
+
+def auto_select_pairwise_attention_backend(
+    dtype: torch.dtype = torch.float32,
+) -> str:
+    """Return the fastest available pairwise attention backend name.
+
+    Selection priority (highest to lowest):
+      1. **CuTeDSL** — SM80/SM86/SM89/SM90/SM100/SM103/SM107, fp16/bf16 only.
+      2. **SDPA** — PyTorch scaled-dot-product attention, all SKUs/dtypes.
+      3. **VANILLA** — pure-PyTorch reference.
+    """
+    sm = get_sm_version()
+    is_half = dtype in (torch.float16, torch.bfloat16)
+
+    if sm in (80, 86, 89, 90, 100, 103, 107) and is_half:
+        return "CuTeDSL"
+
+    return "SDPA"
+
+
+def auto_select_window_attention_backend(
+    dtype: torch.dtype,
+    head_dim: int,
+    n_queries: int,
+    n_keys: int,
+    device: torch.device | None = None,
+) -> str | None:
+    """Return the windowed attention backend for this configuration, or ``None`` to keep the pairwise backend.
+
+    **CuTeDSL** serves fp16 and bf16 ``D=32`` heads in 32-query windows over 128 keys on SM80/86/89/90/100/103/107.
+    Its kernel is loaded here, so the forward pass neither compiles nor loads it.
+
+    Args:
+        dtype: Operand dtype.
+        head_dim: Head dimension.
+        n_queries: Query window size.
+        n_keys: Key window size.
+        device: Operand device; defaults to the current CUDA device.
+    """
+    if device is not None and device.type != "cuda":
+        return None
+    if window_attention_supported(dtype, head_dim, n_queries, n_keys, None if device is None else device.index):
+        return "CuTeDSL"
+    return None
+
+
+def get_attention_backend(
+    backend_name: str, attention_type: AttentionType = AttentionType.TRIANGLE
+) -> type[AttentionBackend]:
+    """Get the attention backend class based on the backend name and attention type."""
+    if attention_type == AttentionType.TRIANGLE:
+        backends = {
+            "VANILLA": VanillaTriangleAttention,
+            "SDPA": SDPATriangleAttention,
+            "CUEQUIV": CuEquivAttention,
+            "CuTeDSL": TriangleAttentionCuTeLeftMask,
+            "ClaudeKit": ClaudeKitTriangleAttentionSM90D32,
+            "Heuristic": HeuristicTriangleAttention,
+        }
+    elif attention_type == AttentionType.PAIRWISE:
+        backends = {
+            "VANILLA": VanillaPairwiseAttention,
+            "SDPA": SDPAPairwiseAttention,
+            "CuTeDSL": PairwiseAttentionCuTeLeftMask,
+        }
+    else:
+        raise ValueError(f"Invalid attention type: {attention_type}")
+
+    try:
+        return backends[backend_name]
+    except KeyError as error:
+        raise ValueError(
+            f"Invalid {attention_type.value} attention backend {backend_name!r}; available: {sorted(backends)}"
+        ) from error
+
+
+def create_attention(
+    backend_name: str,
+    layer_idx: int,
+    num_heads: int,
+    head_dim: int,
+    num_kv_heads: int | None = None,
+    attention_type: AttentionType = AttentionType.TRIANGLE,
+) -> AttentionBackend:
+    """Create an attention backend based on the backend name and attention type."""
+    attn_cls = get_attention_backend(backend_name, attention_type)
+    return attn_cls(layer_idx, num_heads, head_dim, num_kv_heads)
+
+
+def create_window_attention(backend_name: str, n_queries: int, n_keys: int) -> Callable[..., torch.Tensor]:
+    """Bind a windowed attention backend to one window shape; the result takes ``(q, k, v, bias, scale=None)``."""
+    backends = {"CuTeDSL": window_attention}
+    try:
+        backend = backends[backend_name]
+    except KeyError as error:
+        raise ValueError(f"Invalid window attention backend {backend_name!r}; available: {sorted(backends)}") from error
+
+    def bound_window_attention(
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, scale: float | None = None
+    ) -> torch.Tensor:
+        return backend(q, k, v, bias, n_queries=n_queries, n_keys=n_keys, scale=scale)
+
+    return bound_window_attention
+
+
+# ---------------------------------------------------------------------------
+# Precomputed pair-mask registry
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PrecomputedPairMasks:
+    """Precomputed per-row attention masks for triangle attention nodes.
+
+    Computing the per-row mask from ``pair_mask`` is identical across layers,
+    so doing it once before the layer loop avoids redundant work. The exact
+    representation depends on the active triangle attention backend.
+
+    Attributes:
+        pair_mask: Original ``[B, I, J]`` mask for TriangleMultiplicationNode.
+        mask_bias: Per-row mask payload for TriangleAttentionStartingNode.
+            Shape / semantics depend on the backend:
+              * default backends (VANILLA / SDPA / CUEQUIV): additive
+                bias of shape ``[B, I, 1, 1, J]``;
+              * CuTeDSL / ``ClaudeKit`` / ``Heuristic`` left-mask kernels:
+                ``int32`` count of valid KV
+                positions per row (``actual_s_kv``), shape ``[B, I]``,
+                ``mask_bias[b, i] = (pair_mask[b, i, :] > 0.5).sum()``.
+                Assumes a left-aligned ``1...1 0...0`` mask, which holds when
+                ``pair_mask`` is the outer product of a left-aligned
+                ``seq_mask``.
+
+            For the CuTeDSL backend, this tensor doubles as the dual_gemm_x_x
+            ``actual_seqlen`` consumed by ``TriangleMultiplicationNode``
+            (OUTGOING / ``tri_mul_out``): the LM dual_gemm kernel treats each
+            ``(b, i)`` pair-tensor row as a separate kernel batch of length
+            ``J`` and masks row ``g_m`` via
+            ``g_m % J < mask_bias[g_m // J]``.
+        mask_bias_transposed: Per-row mask payload for TriangleAttentionEndingNode
+            (whose input is transposed before the kernel call).
+            Shape / semantics depend on the backend:
+              * default backends: additive bias of shape ``[B, J, 1, 1, I]``;
+              * CuTeDSL left-mask kernel: ``int32`` count along the
+                transposed axis (``actual_s_kv``), shape ``[B, J]``,
+                ``mask_bias_transposed[b, j] = (pair_mask[b, :, j] > 0.5).sum()``.
+
+            For the CuTeDSL backend, this tensor doubles as the dual_gemm_x_x
+            ``actual_seqlen`` consumed by ``TriangleMultiplicationNode``
+            (INCOMING / ``tri_mul_in``) -- the per-column counterpart of
+            ``mask_bias``. For the typical outer-product symmetric pair mask
+            ``mask_bias`` and ``mask_bias_transposed`` are numerically equal,
+            but threading the transposed view through ``tri_mul_in`` keeps
+            the wiring symmetric with the rest of the precompute consumers
+            and handles non-square pair tensors correctly.
+        value_mask: ``pair_mask`` as ``[B, I, J, 1]`` in the activation
+            dtype, for blocks that multiply or accumulate pair activations
+            under it; ``None`` unless requested.
+    """
+
+    pair_mask: torch.Tensor
+    mask_bias: torch.Tensor
+    mask_bias_transposed: torch.Tensor
+    value_mask: torch.Tensor | None = None
+
+
+PrecomputePairMasksFn = Callable[[torch.Tensor, float, torch.dtype | None], PrecomputedPairMasks]
+
+_PRECOMPUTE_PAIR_MASKS_REGISTRY: dict[str, PrecomputePairMasksFn] = {}
+
+
+def register_precompute_pair_masks(
+    backend_name: str,
+    fn: PrecomputePairMasksFn,
+) -> None:
+    """Register a precompute-pair-masks callable for *backend_name*."""
+    _PRECOMPUTE_PAIR_MASKS_REGISTRY[backend_name] = fn
+
+
+def precompute_pair_masks(
+    backend_name: str,
+    pair_mask: torch.Tensor,
+    inf: float = 1e9,
+    dtype: torch.dtype | None = None,
+    activation_dtype: torch.dtype | None = None,
+) -> PrecomputedPairMasks:
+    """Dispatch to the registered precompute function for *backend_name*.
+
+    Args:
+        backend_name: Triangle attention backend identifier (e.g. ``"CUEQUIV"``).
+        pair_mask: ``[B, I, J]`` mask tensor.
+        inf: Large value used to mask out invalid positions.
+        dtype: Target dtype for the mask bias tensors.
+        activation_dtype: Also precompute ``value_mask`` in this dtype.
+
+    Returns:
+        A :class:`PrecomputedPairMasks` bundle ready to be passed through
+        pairformer / evoformer layers.
+    """
+    fn = _PRECOMPUTE_PAIR_MASKS_REGISTRY.get(backend_name)
+    if fn is None:
+        raise ValueError(
+            f"No precompute_pair_masks registered for backend '{backend_name}'. "
+            f"Available: {sorted(_PRECOMPUTE_PAIR_MASKS_REGISTRY.keys())}"
+        )
+    result = fn(pair_mask, inf, dtype)
+    if activation_dtype is not None:
+        result.value_mask = pair_mask.unsqueeze(-1).to(activation_dtype)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Default implementation (shared by VANILLA / SDPA / CUEQUIV)
+# ---------------------------------------------------------------------------
+
+
+def _default_precompute_pair_masks(
+    pair_mask: torch.Tensor,
+    inf: float = 1e9,
+    dtype: torch.dtype | None = None,
+) -> PrecomputedPairMasks:
+    mask_typed = pair_mask.to(dtype) if dtype is not None and pair_mask.dtype != dtype else pair_mask
+    bias = (inf * (mask_typed - 1))[..., :, None, None, :]
+    bias_transposed = (inf * (mask_typed.transpose(-2, -1) - 1))[..., :, None, None, :].contiguous()
+    return PrecomputedPairMasks(
+        pair_mask=pair_mask,
+        mask_bias=bias,
+        mask_bias_transposed=bias_transposed,
+    )
+
+
+register_precompute_pair_masks("VANILLA", _default_precompute_pair_masks)
+register_precompute_pair_masks("SDPA", _default_precompute_pair_masks)
+register_precompute_pair_masks("CUEQUIV", _default_precompute_pair_masks)
+
+# ---------------------------------------------------------------------------
+# CuTeDSL implementation — left-mask kernel (int32 ``actual_s_kv`` per row)
+# ---------------------------------------------------------------------------
+#
+# The CuTeDSL triangle-attention kernel takes a per-row count of leading 1s
+# (``actual_s_kv``) instead of a binary mask tensor.  This is valid whenever
+# ``pair_mask[b, i, :]`` is left-aligned (``1...1 0...0``), which holds for
+# OpenFold/Boltz-style ``pair_mask = seq_mask[..., None] * seq_mask[..., None, :]``
+# with a left-aligned ``seq_mask``.
+#
+# Under that assumption, the leading-1s count is simply ``sum(>0.5)`` along
+# the masked axis.  No padding is needed: the kernel handles the partial tail
+# block via a column-index compare against ``actual_s_kv``.
+
+
+def _cutedsl_precompute_pair_masks(
+    pair_mask: torch.Tensor,
+    inf: float = 1e9,
+    dtype: torch.dtype | None = None,
+) -> PrecomputedPairMasks:
+    """Build ``actual_s_kv`` tensors for the CuTeDSL left-mask kernel.
+
+    For the start node the masked axis is the last dim (J); for the end node
+    the input is transposed first, so the masked axis is the second-to-last
+    dim (I) of the original ``pair_mask``.  Both reductions are computed on
+    the original ``pair_mask`` (no explicit transpose) and returned as
+    contiguous int32 tensors.
+    """
+    del inf, dtype  # unused by the left-mask kernel
+    mask_bool = pair_mask > 0.5
+    # The CuTeDSL left-mask kernel assumes each row along the masked axis is
+    # ``1...1 0...0``. Equivalently, the row must be non-increasing. Verify
+    # this along both axes since we reduce over each independently below.
+    # ``torch.all(...)`` in a bool context forces a device->host sync: illegal
+    # while a CUDA graph is capturing and a launch-queue drain on every eager
+    # call (this precompute runs per pairformer block). The mask is
+    # left-aligned by construction in inference, so the check is debug-only
+    # (``BIOIR_DEBUG_ASSERTS=1``).
+    if DEBUG_ASSERTS and not torch.cuda.is_current_stream_capturing():
+        if not (
+            torch.all(mask_bool[..., :-1] >= mask_bool[..., 1:])
+            and torch.all(mask_bool[..., :-1, :] >= mask_bool[..., 1:, :])
+        ):
+            raise ValueError(
+                "CuTeDSL precompute_pair_masks requires a left-aligned "
+                "(``1...1 0...0``) pair_mask along both the last and "
+                "second-to-last dims (e.g. the outer product of a left-aligned "
+                "seq_mask). Got a pair_mask with interior zeros."
+            )
+    # ``actual_s_kv`` (per-row valid J count, int32 ``[B, I]``) doubles as
+    # the dual_gemm_x_x ``actual_seqlen`` for ``tri_mul_out`` -- the LM
+    # dual_gemm kernel masks row ``g_m`` via
+    # ``g_m % J < actual_s_kv[g_m // J]``. Likewise ``actual_s_kv_t``
+    # (``[B, J]``) is the ``tri_mul_in`` counterpart. The two are exposed
+    # through ``mask_bias`` / ``mask_bias_transposed`` directly so no
+    # separate field is needed.
+    actual_s_kv = mask_bool.sum(dim=-1).to(dtype=torch.int32).contiguous()
+    actual_s_kv_t = mask_bool.sum(dim=-2).to(dtype=torch.int32).contiguous()
+    return PrecomputedPairMasks(
+        pair_mask=pair_mask,
+        mask_bias=actual_s_kv,
+        mask_bias_transposed=actual_s_kv_t,
+    )
+
+
+register_precompute_pair_masks("CuTeDSL", _cutedsl_precompute_pair_masks)
+register_precompute_pair_masks("ClaudeKit", _cutedsl_precompute_pair_masks)
+register_precompute_pair_masks("Heuristic", _cutedsl_precompute_pair_masks)
+
+# ---------------------------------------------------------------------------
+# Precomputed single-mask registry (for pairwise / DiffusionTransformer)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PrecomputedSingleMasks:
+    """Precomputed mask tensors for pairwise attention (AttentionPairBias).
+
+    In DiffusionTransformer / AtomTransformer layers the single mask ``[*, I]``
+    is converted to an additive bias identically in every layer.  Precomputing
+    it once before the layer loop avoids redundant work.
+
+    Attributes:
+        single_mask: Original ``[*, I]`` mask.
+        mask_bias: Mask payload ready for the attention kernel. Default
+            backends take an additive bias ``[*, 1, 1, I]``; the CuTeDSL
+            left-mask kernel takes the ``int32`` count of valid keys, one per
+            row of the flattened leading dims.
+        mask_bias_local: ``mask_bias`` after ``query_to_keys``
+            transformation for sequence-local atom attention.
+            ``None`` when ``query_to_keys`` is not used.
+        excluded: ``[*, I, 1]`` bool, true where ``single_mask`` excludes the
+            token, for filling activations in place; ``None`` unless requested.
+        value_mask: ``single_mask`` as ``[*, I, 1]`` in the activation dtype,
+            for masked residuals; ``None`` unless requested.
+    """
+
+    single_mask: torch.Tensor
+    mask_bias: torch.Tensor
+    mask_bias_local: torch.Tensor | None = None
+    excluded: torch.Tensor | None = None
+    value_mask: torch.Tensor | None = None
+
+
+PrecomputeSingleMasksFn = Callable[[torch.Tensor, float], PrecomputedSingleMasks]
+
+_PRECOMPUTE_SINGLE_MASKS_REGISTRY: dict[str, PrecomputeSingleMasksFn] = {}
+
+
+def register_precompute_single_masks(
+    backend_name: str,
+    fn: PrecomputeSingleMasksFn,
+) -> None:
+    """Register a precompute-single-masks callable for *backend_name*."""
+    _PRECOMPUTE_SINGLE_MASKS_REGISTRY[backend_name] = fn
+
+
+def precompute_single_masks(
+    backend_name: str,
+    single_mask: torch.Tensor,
+    inf: float = 1e9,
+    query_to_keys: Callable | None = None,
+    activation_dtype: torch.dtype | None = None,
+) -> PrecomputedSingleMasks:
+    """Dispatch to the registered precompute function for *backend_name*.
+
+    Args:
+        backend_name: Pairwise attention backend identifier
+            (e.g. ``"VANILLA"``, ``"SDPA"``).
+        single_mask: ``[*, I]`` mask tensor (1 = valid, 0 = masked-out).
+        inf: Large value used to mask out invalid positions.
+        query_to_keys: Optional callable that transforms the mask for
+            sequence-local atom attention.  When provided, the transformed
+            mask bias is also precomputed and stored in
+            ``mask_bias_local``.
+        activation_dtype: Also precompute ``excluded`` and ``value_mask``,
+            with ``value_mask`` in this dtype, for layers that mask their
+            activations.
+
+    Returns:
+        A :class:`PrecomputedSingleMasks` bundle ready to be passed through
+        DiffusionTransformer / AtomTransformer layers.
+    """
+    fn = _PRECOMPUTE_SINGLE_MASKS_REGISTRY.get(backend_name)
+    if fn is None:
+        raise ValueError(
+            f"No precompute_single_masks registered for backend '{backend_name}'. "
+            f"Available: {sorted(_PRECOMPUTE_SINGLE_MASKS_REGISTRY.keys())}"
+        )
+    result = fn(single_mask, inf)
+    if query_to_keys is not None:
+        local_mask = query_to_keys(single_mask.unsqueeze(-1)).squeeze(-1)
+        local_mask = (local_mask > 0).to(local_mask.dtype)
+        local_result = fn(local_mask, inf)
+        result.mask_bias_local = local_result.mask_bias
+    if activation_dtype is not None:
+        valid = single_mask.unsqueeze(-1)
+        result.excluded = ~valid.to(torch.bool)
+        result.value_mask = valid.to(activation_dtype)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Default implementation (shared by VANILLA / SDPA)
+# ---------------------------------------------------------------------------
+
+
+def _default_precompute_single_masks(
+    single_mask: torch.Tensor,
+    inf: float = 1e9,
+) -> PrecomputedSingleMasks:
+    mask_bias = (1 - single_mask.float()) * -inf
+    mask_bias = mask_bias[..., None, None, :]
+    return PrecomputedSingleMasks(
+        single_mask=single_mask,
+        mask_bias=mask_bias,
+    )
+
+
+def _cutedsl_precompute_single_masks(
+    single_mask: torch.Tensor,
+    inf: float = 1e9,
+) -> PrecomputedSingleMasks:
+    # The left-mask kernel takes each row's count of valid keys; counting once
+    # here spares every layer the reduction.
+    mask_bias = (single_mask.float() > 0.5).sum(dim=-1, dtype=torch.int32).reshape(-1)
+    return PrecomputedSingleMasks(
+        single_mask=single_mask,
+        mask_bias=mask_bias,
+    )
+
+
+register_precompute_single_masks("VANILLA", _default_precompute_single_masks)
+register_precompute_single_masks("SDPA", _default_precompute_single_masks)
+register_precompute_single_masks("CuTeDSL", _cutedsl_precompute_single_masks)

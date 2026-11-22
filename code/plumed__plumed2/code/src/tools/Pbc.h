@@ -1,0 +1,218 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2011-2023 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#ifndef __PLUMED_tools_Pbc_h
+#define __PLUMED_tools_Pbc_h
+
+#include "Vector.h"
+#include "Tensor.h"
+#include "View.h"
+#include "View2D.h"
+#include "Tools.h"
+#include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+
+namespace PLMD {
+
+template <std::size_t N=3>
+using MemoryView=View<double,N>;
+
+template < std::size_t N=helpers::dynamic_extent, std::size_t STRIDE=3>
+using mdMemoryView = View2D<double,N,STRIDE>;
+
+using VectorView = mdMemoryView<helpers::dynamic_extent, 3>;
+
+/*
+Tool to deal with periodic boundary conditions.
+
+This class is useful to apply periodic boundary conditions on interatomic
+distances. It stores privately information about reduced lattice vectors
+*/
+class Pbc {
+/// Type of box
+  enum {unset,orthorombic,generic} type;
+/// Maximum number of shifts to be tried for a given octant.
+/// This is an exact bound: buildShifts only keeps shifts whose nonzero
+/// components have the sign opposite to the octant, and with one or two
+/// nonzero components (out of three) there are 3+3=6 such shifts.
+  static constexpr unsigned maxshiftsize=6;
+/// Box
+  Tensor box;
+/// Inverse box
+  Tensor invBox;
+/// Reduced box.
+/// This is a set of lattice vectors generating the same lattice
+/// but "minimally skewed". Useful to optimize image search.
+  Tensor reduced;
+/// Inverse of the reduced box
+  Tensor invReduced;
+/// List of shifts that should be attempted.
+/// Depending on the sign of the scaled coordinates representing
+/// a distance vector, a different set of shifts must be tried.
+/// Fixed-size arrays (rather than a container with a pointer to its data)
+/// are used so that a bitwise copy of the object, as done by OpenACC,
+/// is also valid on the device.
+  Vector shifts[2][2][2][maxshiftsize];
+/// Number of valid entries in each list of shifts
+  unsigned nShiftsPerOctant[2][2][2];
+/// The two lattices for which the minimum image is found without a search: face centered
+/// cubic (the rhombic dodecahedron box) and body centered cubic (the truncated octahedron box).
+/// They are the most compact boxes for a solute in solution. See fccLatticeVector and bccLatticeVector
+  enum {notCubic,fcc,bcc} cubic=notCubic;
+/// For the fcc and bcc lattices: half of the three edges of the cubic cell (rows), and the inverse.
+/// The lattice vectors are the combinations of the rows with integer coefficients that
+/// have an even sum (fcc) or are all even or all odd (bcc)
+  Tensor cubicHalf;
+  Tensor toCubic;
+/// The largest relative deviation of a lattice from fcc or bcc for which it is taken as such
+  static constexpr double cubicTolerance=1e-5;
+/// fccLatticeVector and bccLatticeVector leave to the general search the vectors for which
+/// another image is longer by less than this (in squared length, units of 2 cubicHalf^2).
+/// It is much larger than cubicTolerance, so the image is the minimum one also for a lattice
+/// that is cubic only within the tolerance, and the vectors with two images at the same
+/// distance are treated as in the other boxes
+  static constexpr double cubicMargin=1e-3;
+/// Finds out if the lattice is fcc or bcc and sets cubic, cubicHalf and toCubic. Called by setBox for generic boxes
+  void findCubic();
+/// Minimum image of a vector d in an fcc lattice, with the algorithm for the closest point
+/// of the lattice D3 (J. H. Conway and N. J. A. Sloane, IEEE Trans. Inf. Theory 28, 227 (1982)):
+/// in the coordinates of the cubic cell, round to the closest integers and, if their sum is
+/// odd, round the other way the coordinate that was farther from an integer. There is no
+/// search, so it is faster than searchImage for the vectors that are not short.
+/// This function finds the lattice vector to be subtracted, as the three coefficients of
+/// the rows of cubicHalf. It returns false in the rare cases that must be left to searchImage
+  template <typename T>
+  bool fccLatticeVector(const VectorTyped<T,3>& d, int& n0, int& n1, int& n2) const;
+/// The same for a bcc lattice, where the closest lattice point is the closer of two:
+/// the one with the closest even integers and the one with the closest odd integers
+/// as coordinates in the cubic cell
+  template <typename T>
+  bool bccLatticeVector(const VectorTyped<T,3>& d, int& n0, int& n1, int& n2) const;
+/// Changes at every setBox, and is unique among all the Pbc objects: a copy of a Pbc
+/// has the same version as the original until one of the two is changed
+  std::uint64_t version=0;
+/// Build list of shifts.
+/// This is expensive, and must be called only when box is
+/// reset. It allows building a minimal set of shifts
+/// depending on the sign of the scaled coordinates representing
+/// a distance vector.
+  void buildShifts();
+/// Minimum image of the vector d in a generic (not orthorhombic) box.
+/// It is the only implementation of the search: all the versions of distance and apply
+/// use it (it is defined and inlined in Pbc.cpp).
+/// If nshifts is not null, the number of attempted shifts is added to it
+  template <typename T>
+  VectorTyped<T,3> searchImage(const VectorTyped<T,3>& d, int* nshifts) const;
+/// Computes v2-v1, using minimal image convention, when the box is not orthorhombic
+/// (generic, or not set): the part of distance that is not inline
+#pragma acc routine seq
+  Vector distanceNotOrthorhombic(const Vector&, const Vector&)const;
+public:
+///Helper function for moving the class to an openacc device
+  void toACCDevice()const ;
+///Helper function for cleaning the memory of the class from an openacc device
+  void removeFromACCDevice() const;
+/// Constructor
+  Pbc();
+/// Compute modulo of (v2-v1), using or not pbc depending on bool pbc.
+  double distance( const bool pbc, const Vector& v1, const Vector& v2 ) const;
+/// Computes v2-v1, using minimal image convention.
+/// Orthorhombic boxes, the most common case, are done inline
+#pragma acc routine seq
+  Vector distance(const Vector&, const Vector&)const;
+#pragma acc routine seq
+  Vector3f distance(const Vector3f&, const Vector3f&)const;
+/// Computes v2-v1, using minimal image convention,
+/// and adds to nshifts (if not null) the number of attempted shifts
+  Vector distance(const Vector&, const Vector&,int*nshifts)const;
+/// Apply PBC to a set of positions or distance vectors
+#pragma acc routine seq
+  void apply(VectorView dlist, unsigned max_index=0) const;
+#pragma acc routine seq
+  void apply(std::vector<Vector>&dlist, unsigned max_index=0) const;
+/// Set the lattice vectors.
+/// b[i][j] is the j-th component of the i-th vector
+  void setBox(const Tensor&b);
+/// Returns the box
+#pragma acc routine seq
+  const Tensor& getBox()const;
+/// Version of the box (see version)
+  std::uint64_t getVersion()const {
+    return version;
+  }
+/// Returns the inverse matrix of box.
+/// Thus: pbc.getInvBox() == inverse(pbc.getBox()).
+#pragma acc routine seq
+  const Tensor& getInvBox()const;
+/// Transform a vector in real space to a vector in scaled coordinates.
+/// Thus:pbc.realToScaled(v) == matmul(transpose(inverse(pbc.getBox(),v)));
+#pragma acc routine seq
+  Vector realToScaled(const Vector&)const;
+#pragma acc routine seq
+  Vector3f realToScaled(const Vector3f&)const;
+/// Transform a vector in scaled coordinates to a vector in real space.
+/// Thus:pbc.scaledToRead(v) == matmul(transpose(pbc.getBox()),v);
+#pragma acc routine seq
+  Vector scaledToReal(const Vector&)const;
+#pragma acc routine seq
+  Vector3f scaledToReal(const Vector3f&)const;
+/// Returns true if the box vectors are orthogonal
+#pragma acc routine seq
+  bool isOrthorombic()const;
+/// Moves atoms by lattice vectors so that, for each link l in order, atom child[l]
+/// is at its minimum image distance from atom parent[l] (already placed: the parent
+/// of a link is the first atom or the child of an earlier link). The images are the
+/// same as with pos[child]=pos[parent]+distance(pos[parent],pos[child]) done link by
+/// link, but the shifts are computed independently for each link and summed as
+/// integers, so most of the work is done with OpenMP threads, and the atoms that do
+/// not move keep their positions exactly. With parent and child null the links are
+/// (l,l+1). Nothing is done without a box.
+  void makeWhole(std::vector<Vector>& pos, std::size_t nlinks,
+                 const unsigned* parent=nullptr, const unsigned* child=nullptr)const;
+/// Full search (for testing).
+/// Perform a full search on vector
+  void fullSearch(Vector&)const;
+/// Returns true if box is set and non zero
+  bool isSet()const;
+};
+
+inline
+Vector Pbc::distance(const Vector&v1,const Vector&v2)const {
+  if(type==orthorombic) {
+    Vector d=delta(v1,v2);
+    for(int i=0; i<3; i++) {
+      d[i]=Tools::pbc(d[i]*invBox(i,i))*box(i,i);
+    }
+    return d;
+  }
+  return distanceNotOrthorhombic(v1,v2);
+}
+
+inline
+bool Pbc::isSet()const {
+  return type!=unset;
+}
+
+}
+
+#endif

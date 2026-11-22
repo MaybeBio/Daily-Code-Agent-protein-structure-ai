@@ -1,0 +1,102 @@
+name: Native library member review checks
+on:
+  workflow_dispatch:
+  push:
+    paths: &member_paths
+      - "src/opendde_workbench/datasets/member_structure.py"
+      - "src/opendde_workbench/datasets/member_inspection.py"
+      - "src/opendde_workbench/datasets/native_library.py"
+      - "frontend/src/datasets/IndexedLibraryResults*"
+      - "frontend/src/datasets/useIndexedMember*"
+      - "frontend/src/datasets/DatasetResults*"
+      - "frontend/src/datasets/ResearchTable*"
+      - "frontend/src/datasets/member-page-export*"
+      - "frontend/src/datasets/supplier-label*"
+      - "tests/test_dataset_member_inspection.py"
+      - "server_tests/test_library_member*"
+      - ".github/workflows/library-member-checks.yml"
+      # Read-only example propagation has direct member contracts in the stage gate.
+      - "!frontend/src/datasets/DatasetResults*"
+      - "!frontend/src/datasets/IndexedLibraryResults*"
+      - "!.github/workflows/library-member-checks.yml"
+  pull_request:
+    paths: *member_paths
+permissions:
+  contents: read
+jobs:
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      del_only: ${{ steps.change.outputs.del_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: change
+        env:
+          BASE: ${{ github.event.before || github.event.pull_request.base.sha }}
+        run: python3 scripts/del-ci-scope.py
+  contracts:
+    needs: [scope, utility-scope]
+    if: needs.scope.outputs.del_only != 'true' && needs.utility-scope.outputs.del_desktop_only != 'true' && needs.utility-scope.outputs.candidate_desktop_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Member inspection, selection and direct routing consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/datasets/IndexedLibraryResults.test.tsx
+          src/datasets/DatasetResults.test.tsx src/datasets/ResearchTable.test.tsx
+          src/datasets/member-page-export.test.ts
+      - name: Shared row keyboard, pointer and independent nested controls
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/ResearchTable.test.tsx
+          -t "selects a whole row|preserves disabled record"
+      - name: Exact immutable member reads, saves and pagination
+        run: uv run --locked pytest -q tests/test_dataset_member_inspection.py tests/test_dataset_member_view.py
+  native:
+    needs: [scope, utility-scope]
+    if: needs.scope.outputs.del_only != 'true' && needs.utility-scope.outputs.del_desktop_only != 'true' && needs.utility-scope.outputs.candidate_desktop_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      WB_TEST_LIBRARY_MEMBERS: "1"
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --python 3.12 --group dev --group browser
+      - name: Matching reviewed RDKit for real source-to-subset chemistry only
+        run: uv pip install --python .venv/bin/python rdkit==2026.3.6 numpy==1.26.4
+      - name: Isolated native member-review state
+        run: echo "WB_HOME=$RUNNER_TEMP/x-dde-library-member-review" >> "$GITHUB_ENV"
+      - name: Actual frozen STAT6 library and portable three-member subsets
+        run: uv run --locked pytest -q server_tests/test_library_member_native.py
+      - run: uv run --locked playwright install chromium --with-deps
+      - name: Native drawing assets only, without unrelated case packages or engines
+        run: uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+      - name: Real STAT6 SQLite, member switching, native MOL and full-precision page export
+        run: uv run --locked pytest -x -q server_tests/test_library_members_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: library-member-native-review
+          path: server_tests/evidence/library-members
+          if-no-files-found: warn

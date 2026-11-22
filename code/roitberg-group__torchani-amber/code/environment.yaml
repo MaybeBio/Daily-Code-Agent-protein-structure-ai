@@ -1,0 +1,62 @@
+name: ani-amber
+channels:
+  - nodefaults
+  - https://conda.anaconda.org/nvidia
+  - https://conda.anaconda.org/conda-forge
+dependencies:
+  ## Required dependencies to run TorchANI ##
+  - conda-forge::python=3.11
+  - conda-forge::pip>=26.0
+  - conda-forge::numpy=1.26  # This is required by netcdf-fortran=4.6.1=mpi_openmpi_...
+  - conda-forge::h5py  # HDF5 backend for datasets
+  - conda-forge::tqdm  # progress bar util
+  - conda-forge::typer  # CLI support
+  - conda-forge::rich  # CLI support
+  - conda-forge::huggingface_hub  # Datasets
+
+  # Optional dependencies follow:
+
+  ## ASE interface ##
+  # Used for molecular dynamics and for tests/tools/docs
+  - conda-forge::ase
+
+  ## cuAEV and MNP ##
+  # For more details consult the "developer notes" section in README.md
+  # If installing on macOS, or if CUDA GPU support is **disabled**, comment all lines on this block
+  - conda-forge::setuptools>=75.6
+  - conda-forge::setuptools-scm>=8
+  - conda-forge::packaging>=25
+  - conda-forge::gxx_linux-64=12.2
+  - conda-forge::gcc_linux-64=12.2
+  - conda-forge::gfortran_linux-64=12.2
+  # Amber dependencies
+  - conda-forge::fftw=3.3.10=mpi_openmpi_hdeb57f9_6  # For Sander / Pmemd
+  # NetCDF-fortran *requires* numpy 1.26 (!) only if compiled with mpi_openmpi
+  - conda-forge::netcdf-fortran=4.6.1=mpi_openmpi_hc2a85ae_1  # For Sander / Pmemd
+  - conda-forge::openmpi=4.1.6  # For MNP, Sander-MPI, and Pmemd-MPI
+  - conda-forge::ucx=1.20  # For openmpi
+
+  ## Running torchani-amber/tests ##
+  - conda-forge::netcdf4
+  ## Running torchani/tests ##
+  - conda-forge::black  # formatter
+  - conda-forge::flake8  # linter
+  - conda-forge::mypy  # type checking
+  - conda-forge::pytest  # tests runner
+  - conda-forge::pre_commit  # run pre commit hooks
+  - conda-forge::parameterized  # parametrize test classes
+  - conda-forge::expecttest  # indirect dependency of torch.testing
+  # Extra data backends for tests:
+  - conda-forge::pandas  # Parquet backend
+  - conda-forge::pyarrow  # Parquet backend
+  ## Running scripts in torchani/tools ##
+  - conda-forge::jinja2  # Templating engine to build generated code and docs
+
+  # TorchANI-Amber specific
+  - conda-forge::cmake=3.31.1
+  - conda-forge::pyyaml
+  - nvidia::cuda-toolkit=13.0
+  - pip:
+    - --index-url https://download.pytorch.org/whl/cu130
+    - --extra-index-url https://pypi.python.org/simple
+    - torch==2.13.*

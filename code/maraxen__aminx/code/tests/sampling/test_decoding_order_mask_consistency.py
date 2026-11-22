@@ -1,0 +1,251 @@
+"""The sampler's ar_mask and wave schedule must describe the same decoding order (debt #1982).
+
+``make_sample_sequences`` used to build ``ar_mask`` with ``generate_ar_mask(decoding_order)``
+while the bundle kept its default N->C wave. Two things were wrong at once:
+
+* the kernel drew positions N->C, but each position saw a context chosen by a different
+  permutation -- so it read undrawn slots and missed drawn ones;
+* (Before Defect 9) ``generate_ar_mask``'s untied branch read a RANK array, but
+  ``decoding_order_fn`` returns an ORDER array. It now reads an ORDER array, so the rank
+  hazard is pinned explicitly below rather than assumed away.
+
+For a uniformly random permutation neither is visible in distribution, which is why it
+survived. These tests use a deliberate, non-involutive order so that both would show.
+"""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from aminx.model import Aminx
+from aminx.sampling import make_sample_sequences
+from aminx.types.bundles import WaveScheduleBundle
+from aminx.utils.autoregression import (
+  ar_mask_from_decoding_order,
+  decoding_order_from_wave,
+  generate_ar_mask,
+  generate_wave_ar_mask,
+)
+
+L = 7
+
+
+def _rotated_order(n: int, shift: int = 3) -> jnp.ndarray:
+  # A rotation by 3 of 7 is not an involution, so order != argsort(order) -- the case where
+  # confusing the two conventions changes the mask.
+  return jnp.roll(jnp.arange(n, dtype=jnp.int32), shift)
+
+
+def test_rotated_order_is_not_its_own_rank():
+  order = np.asarray(_rotated_order(L))
+  assert not np.array_equal(order, np.argsort(order))
+
+
+def test_mask_from_order_matches_generate_ar_mask_untied():
+  order = _rotated_order(L)
+  ours = np.asarray(ar_mask_from_decoding_order(order))
+  ref = np.asarray(generate_ar_mask(order=order))
+  np.testing.assert_array_equal(ours, ref)
+
+
+def test_a_rank_array_named_as_order_is_still_misread_by_design():
+  """The residual hazard, pinned: naming a RANK array as ``order=`` is the caller's explicit statement.
+
+  ``argsort(order)`` is the rank array of ``order``. Handed to generate_ar_mask it is read as
+  an order, so the mask is the one for the inverse permutation. Nothing raises: both are
+  permutations of 0..L-1. A caller holding a rank array must invert it first. What changed is
+  that a caller can no longer reach this by accident: see the two tests below.
+  """
+  order = _rotated_order(L)
+  rank = jnp.argsort(order).astype(jnp.int32)
+  misread = np.asarray(generate_ar_mask(order=rank))
+  np.testing.assert_array_equal(misread, np.asarray(ar_mask_from_decoding_order(rank)))
+  assert not np.array_equal(misread, np.asarray(ar_mask_from_decoding_order(order)))
+
+
+def test_positional_order_raises_instead_of_silently_misreading_a_rank():
+  """The old call form ``generate_ar_mask(array)`` is refused loudly, with the order/rank contract in the message."""
+  order = _rotated_order(L)
+  rank = jnp.argsort(order).astype(jnp.int32)
+  for array in (order, rank):
+    with pytest.raises(TypeError, match="RANK array"):
+      generate_ar_mask(array)
+    with pytest.raises(TypeError, match="RANK array"):
+      generate_ar_mask(array, tie_group_map=jnp.zeros(L, dtype=jnp.int32))
+
+
+def test_decoding_order_keyword_raises_and_order_is_required():
+  """The old keyword ``decoding_order=`` and a missing ``order`` are refused; unknown keywords are named."""
+  order = _rotated_order(L)
+  with pytest.raises(TypeError, match="keyword-only argument `order`"):
+    generate_ar_mask(decoding_order=order)
+  with pytest.raises(TypeError, match="missing required keyword-only argument `order`"):
+    generate_ar_mask()
+  with pytest.raises(TypeError, match="unexpected keyword arguments"):
+    generate_ar_mask(order=order, nonsense=1)
+
+
+def test_mask_from_order_matches_generate_ar_mask_tied():
+  tie_group_map = jnp.array([0, 0, 1, 2, 3, 3, 4], dtype=jnp.int32)
+  order = jnp.array([6, 0, 1, 4, 2, 5, 3], dtype=jnp.int32)
+  ours = np.asarray(ar_mask_from_decoding_order(order, tie_group_map))
+  ref = np.asarray(generate_ar_mask(order=order, tie_group_map=tie_group_map))
+  np.testing.assert_array_equal(ours, ref)
+
+
+def test_tie_map_is_not_treated_as_chain_index():
+  """Pin the positional-argument trap the STE paths fell into.
+
+  A tie map passed positionally to ``generate_ar_mask`` would bind to ``chain_idx`` (its
+  second parameter before it became keyword-only), hiding every position of a different
+  tie group -- i.e. almost all context. ``ar_mask_from_decoding_order``'s second parameter
+  IS the tie map, so a
+  position must see earlier positions of OTHER groups.
+  """
+  tie_group_map = jnp.array([0, 0, 1, 1, 2, 2, 3], dtype=jnp.int32)
+  order = jnp.array([0, 1, 2, 3, 4, 5, 6], dtype=jnp.int32)
+  ours = np.asarray(ar_mask_from_decoding_order(order, tie_group_map))
+  # The last-decoded position (6, its own group) sees all six earlier positions.
+  assert ours[6].sum() == 6  # noqa: PLR2004
+  # Passed explicitly as chain_idx: generate_ar_mask's chain_idx is keyword-only, so the
+  # positional form no longer binds here at all; this pins what the misbinding would do.
+  trap = np.asarray(generate_ar_mask(order=order, chain_idx=tie_group_map))
+  assert trap[6].sum() == 0, "premise: the positional call hides other groups entirely"
+
+
+def test_from_decoding_order_matches_host_side_from_tie_groups_mask():
+  tie_group_map = jnp.array([0, 0, 1, 2, 3, 3, 4], dtype=jnp.int32)
+  order = jnp.array([6, 0, 1, 4, 2, 5, 3], dtype=jnp.int32)
+  traced = generate_wave_ar_mask(WaveScheduleBundle.from_decoding_order(order, tie_group_map), tie_group_map)
+  host = generate_wave_ar_mask(WaveScheduleBundle.from_tie_groups(tie_group_map, order), tie_group_map)
+  np.testing.assert_array_equal(np.asarray(traced), np.asarray(host))
+
+
+def test_from_decoding_order_is_traceable():
+  """The sampler draws its order inside jit, so the constructor must accept a tracer."""
+
+  @jax.jit
+  def build(key: jax.Array) -> jax.Array:
+    order = jax.random.permutation(key, L).astype(jnp.int32)
+    return ar_mask_from_decoding_order(order)
+
+  mask = np.asarray(build(jax.random.PRNGKey(0)))
+  assert mask.shape == (L, L)
+  assert np.all(np.diag(mask) == 0)
+  # A causal mask over a total order: exactly one position sees nothing, one sees all others.
+  assert sorted(mask.sum(axis=1).tolist()) == list(range(L))
+
+
+@pytest.fixture
+def small_model(rng_key):
+  # dropout_rate=0: a freshly constructed Aminx runs encoder dropout even at inference
+  # (Aminx.__call__ does not forward `inference` to the encoder), which would make the
+  # logits key-dependent for reasons unrelated to the mask. Pretrained checkpoints are
+  # unaffected -- verified deterministic across keys.
+  return Aminx(
+    dropout_rate=0.0,
+    node_features=32,
+    edge_features=32,
+    hidden_features=32,
+    num_encoder_layers=1,
+    num_decoder_layers=2,
+    k_neighbors=8,
+    key=rng_key,
+  )
+
+
+def _fixed_order_fn(order: jnp.ndarray):
+  def fn(key, num_residues, tie_group_map=None, num_groups=None):  # noqa: ARG001
+    return order, key
+
+  return fn
+
+
+def test_sampler_first_decoded_position_sees_no_sequence_context(small_model, model_inputs):
+  """The first-decoded position has no drawn neighbours, so its logits cannot depend on the draw.
+
+  Under the old wiring the kernel decoded N->C with a mask from an unrelated permutation, so
+  the position the ORDER put first still saw positions the N->C sweep had already drawn, and
+  its logits moved with the sampling key.
+  """
+  n = model_inputs["mask"].shape[0]
+  order = _rotated_order(n, shift=max(1, n // 3))
+  assert not np.array_equal(np.asarray(order), np.argsort(np.asarray(order)))
+  sample_fn = make_sample_sequences(small_model, decoding_order_fn=_fixed_order_fn(order))
+
+  first = int(order[0])
+  seqs, first_logits = [], []
+  for seed in range(4):
+    seq, logits, returned_order = sample_fn(
+      jax.random.PRNGKey(100 + seed),
+      model_inputs["structure_coordinates"],
+      model_inputs["mask"],
+      model_inputs["residue_index"],
+      model_inputs["chain_index"],
+      backbone_noise=0.0,
+      temperature=5.0,
+    )
+    np.testing.assert_array_equal(np.asarray(returned_order), np.asarray(order))
+    seqs.append(np.asarray(seq))
+    first_logits.append(np.asarray(logits[first]))
+
+  # The draws must actually differ, or invariance of the first position is vacuous.
+  assert any(not np.array_equal(seqs[0], s) for s in seqs[1:])
+  for other in first_logits[1:]:
+    np.testing.assert_allclose(other, first_logits[0], rtol=0, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# The order a schedule decodes (code-review finding on sample.py)
+# ---------------------------------------------------------------------------
+
+
+def test_decoding_order_from_wave_round_trips_untied():
+  order = _rotated_order(L)
+  wave = WaveScheduleBundle.from_decoding_order(order)
+  got = decoding_order_from_wave(wave, jnp.arange(L, dtype=jnp.int32))
+  np.testing.assert_array_equal(np.asarray(got), np.asarray(order))
+
+
+def test_decoding_order_from_wave_tied_uses_step_then_position():
+  tie_group_map = jnp.array([0, 0, 1, 2, 3, 3, 4], dtype=jnp.int32)
+  order = jnp.array([6, 5, 1, 4, 2, 0, 3], dtype=jnp.int32)
+  wave = WaveScheduleBundle.from_decoding_order(order, tie_group_map)
+  got = np.asarray(decoding_order_from_wave(wave, tie_group_map))
+  # Groups by first appearance: g4 {6}, g3 {4, 5}, g0 {0, 1}, g1 {2}, g2 {3};
+  # a tied group decodes together, members ordered by position.
+  np.testing.assert_array_equal(got, [6, 4, 5, 0, 1, 2, 3])
+
+
+def test_decoding_order_from_wave_puts_unscheduled_positions_last():
+  tie_group_map = jnp.arange(6, dtype=jnp.int32)
+  wave = WaveScheduleBundle.from_tie_groups(tie_group_map, jnp.array([4, 1, 2], dtype=jnp.int32))
+  got = np.asarray(decoding_order_from_wave(wave, tie_group_map))
+  np.testing.assert_array_equal(got[:3], [4, 1, 2])
+  assert sorted(got[3:].tolist()) == [0, 3, 5]
+
+
+def test_decoding_order_from_wave_multi_group_waves_sorted_by_wave_then_position():
+  tie_group_map = jnp.arange(4, dtype=jnp.int32)
+  # colors: groups 1 and 3 in wave 0, groups 0 and 2 in wave 1 (G = 2 slots per wave).
+  wave = WaveScheduleBundle.from_colors(jnp.array([1, 0, 1, 0], dtype=jnp.int32), tie_group_map)
+  got = np.asarray(decoding_order_from_wave(wave, tie_group_map))
+  np.testing.assert_array_equal(got, [1, 3, 0, 2])
+
+
+def test_sampler_reports_the_order_of_a_caller_supplied_schedule(small_model, model_inputs):
+  n = model_inputs["mask"].shape[0]
+  drawn = jnp.arange(n, dtype=jnp.int32)  # what decoding_order_fn would say
+  scheduled = _rotated_order(n, shift=max(1, n // 3))  # what the caller asks to decode
+  sample_fn = make_sample_sequences(small_model, decoding_order_fn=_fixed_order_fn(drawn))
+  _, _, returned = sample_fn(
+    jax.random.PRNGKey(0),
+    model_inputs["structure_coordinates"],
+    model_inputs["mask"],
+    model_inputs["residue_index"],
+    model_inputs["chain_index"],
+    backbone_noise=0.0,
+    wave_schedule=WaveScheduleBundle.from_decoding_order(scheduled),
+  )
+  np.testing.assert_array_equal(np.asarray(returned), np.asarray(scheduled))

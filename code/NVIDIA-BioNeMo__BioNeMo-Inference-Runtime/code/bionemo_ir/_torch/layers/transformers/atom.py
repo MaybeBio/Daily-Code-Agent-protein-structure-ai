@@ -1,0 +1,567 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from typing import Any
+
+import torch
+import torch.nn as nn
+
+from bionemo_ir._torch.attention_backend import AttentionMetadata
+from bionemo_ir._torch.layers.linear import Linear
+from bionemo_ir._torch.layers.sequence_local_atom import prepare_atom_reduction
+from bionemo_ir.configs import BaseConfig
+from bionemo_ir.dsl_kernels.triton.atom_gather_kernel import reduce_atom_slots
+from bionemo_ir.runtime.buffers import PreallocatedBuffers
+
+
+def prepare_atom_to_token(atom_to_token: torch.Tensor) -> dict[str, torch.Tensor] | None:
+    """Derive ordered per-token atom slots from a one-hot ``[B, N_atoms, N_res]`` map once per rollout.
+
+    Args:
+        atom_to_token: The one-hot atom-to-token map :class:`AtomAttentionEncoder` and
+            :class:`AtomAttentionDecoder` receive, with zero rows for padded atoms.
+
+    Returns:
+        Gather slots for :func:`reduce_atom_slots`, the owning token per atom and the
+        atom mask, or ``None`` when the map is not a one-hot of token-contiguous atoms
+        on CUDA, in which case both modules keep the dense contraction.
+    """
+    if atom_to_token.ndim != 3 or not atom_to_token.is_cuda or torch.cuda.is_current_stream_capturing():
+        return None
+    atoms_per_row = atom_to_token.sum(dim=-1)
+    one_hot = ((atom_to_token == 0) | (atom_to_token == 1)).all() & (atoms_per_row <= 1).all()
+    if not bool(one_hot):
+        return None
+    counts = atom_to_token.sum(dim=1).long()
+    owners = atom_to_token.argmax(dim=-1)
+    atom_mask = atoms_per_row > 0
+    prepared = prepare_atom_reduction(
+        {
+            "num_atoms_per_token": counts,
+            "start_atom_index": counts.cumsum(dim=-1) - counts,
+            "atom_mask": atom_mask,
+            "atom_to_token_index": owners,
+            "token_mask": counts > 0,
+        }
+    )
+    if "atom_gather_index" not in prepared:
+        return None
+    return {
+        "gather_index": prepared["atom_gather_index"].unsqueeze(1),
+        "gather_mask": prepared["atom_gather_mask"].unsqueeze(1),
+        "gather_counts": prepared["atom_gather_counts"].unsqueeze(1),
+        "atom_to_token_index": owners,
+        "atom_mask": atom_mask,
+    }
+
+
+class AtomTransformer(nn.Module):
+    def __init__(
+        self,
+        attn_window_queries: int = None,
+        attn_window_keys: int = None,
+        diffusion_transformer_config: BaseConfig = None,
+        diffusion_transformer_cls: Any = None,
+    ):
+        """
+        Args:
+            attn_window_queries: int
+                The number of atoms per window for queries.
+            attn_window_keys: int
+                The number of atoms per window for keys.
+            diffusion_transformer_config: BaseConfig
+                The configuration for the DiffusionTransformer.
+            diffusion_transformer_cls: nn.Module
+                The implementation class of the DiffusionTransformer.
+        """
+        super().__init__()
+        self.attn_window_queries = attn_window_queries
+        self.attn_window_keys = attn_window_keys
+        # Force SDPA for atom transformer: the windowed batch layout
+        # [B, mult, NW, ...] is incompatible with the CuTeDSL kernel's
+        # multiplicity broadcast (batch_b = flat_idx // mult assumes mult
+        # is the innermost batch dim, but NW is innermost here).
+        if getattr(diffusion_transformer_config, "pairwise_attention_backend", "") == "CuTeDSL":
+            diffusion_transformer_config.pairwise_attention_backend = "SDPA"
+        self.diffusion_transformer: nn.Module = diffusion_transformer_cls(diffusion_transformer_config)
+        self.diffusion_transformer.enable_window_attention(attn_window_queries, attn_window_keys)
+
+    def load_weights(self, weights: dict):
+        self.diffusion_transformer.load_weights(weights["diffusion_transformer"])
+
+    def prepare_pair_biases(
+        self, bias: torch.Tensor, mask: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> list[torch.Tensor]:
+        """Lay out a rollout-invariant bias and its key mask per layer once.
+
+        Args:
+            bias: The rollout-invariant bias :meth:`forward` would receive,
+                ``[B, N, H, L * heads]`` or Boltz-2's windowed ``[B, N // W, W, H, L * heads]``.
+            mask: The ``[B, N]`` mask :meth:`forward` would receive, fixed for as long as
+                the biases are used.
+            attn_metadata: Metadata whose ``query_to_keys`` gathers the key windows.
+        """
+        # The mask, not the bias, gives the atom count, as the query does in forward.
+        B, N = mask.shape[:2]
+        W, H = self.attn_window_queries, self.attn_window_keys
+        z = bias.view((B, 1, N // W, W, H, -1))
+        return self.diffusion_transformer.prepare_pair_biases(z, mask.view(B, 1, N // W, W), attn_metadata)
+
+    def prepare_transition_conds(self, c: torch.Tensor) -> list[torch.Tensor | None] | None:
+        """Each layer's fused transition table of a rollout-invariant ``c`` ``[B, (1), N, D]``, laid out as
+        :meth:`forward` lays out ``c``; ``None`` where no layer runs fused."""
+        B, N, D = c.shape[0], c.shape[-2], c.shape[-1]
+        W = self.attn_window_queries
+        return self.diffusion_transformer.prepare_transition_conds(c.reshape(B, 1, N // W, W, D))
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        c: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        attn_metadata: AttentionMetadata | None = None,
+        buffers: PreallocatedBuffers | None = None,
+        prepared_pair_biases: list[torch.Tensor] | None = None,
+        prepared_transition_conds: list[torch.Tensor | None] | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            q: torch.Tensor
+                The query tensor. Shape [B, multiplicity, N, D]
+            c: torch.Tensor
+                The condition tensor. Shape [B, N, D]
+            bias: torch.Tensor
+                The bias tensor. Shape [B, N, H, D]
+            mask: torch.Tensor
+                The mask tensor. Shape [B, N]
+            prepared_pair_biases: list[torch.Tensor]
+                Biases from :meth:`prepare_pair_biases`; they replace ``bias`` and
+                carry the key mask.
+            prepared_transition_conds: list[torch.Tensor | None]
+                Tables from :meth:`prepare_transition_conds` of ``c``; each layer's
+                transition then runs as one kernel.
+        Returns:
+            torch.Tensor
+                The output tensor. Shape [B, multiplicity, N, D]
+        Usage: Example for Boltz1x AtomTransformer:
+        >>> W = 32; H = 128;
+        >>> batch_size = 2; n_atoms = 928; multiplicity = 1;
+        >>> K = n_atoms // W
+        >>> keys_indexing_matrix = create_indexing_matrix(K, W, H, device=torch.device("cuda"))
+        >>> query_to_keys = partial(
+        >>>     query_to_keys, keys_indexing_matrix=keys_indexing_matrix, W=W, H=H
+        >>> )
+        >>> atom_transformer = AtomTransformer(
+        >>>     attn_window_queries=32,
+        >>>     attn_window_keys=128,
+        >>>     diffusion_transformer_config=config,
+        >>>     diffusion_transformer_cls=BoltzDiffusionTransformer
+        >>> )
+        >>> q = torch.randn(batch_size, multiplicity, n_atoms, 128, device=torch.device("cuda"))
+        >>> c = torch.randn(batch_size, n_atoms, 128, device=torch.device("cuda"))
+        >>> bias = torch.randn(batch_size, n_atoms, 128, 16, device=torch.device("cuda"))
+        >>> mask = torch.randint(0, 2, (batch_size, n_atoms), device=torch.device("cuda"), dtype=torch.float32)
+        >>> attn_metadata = AttentionMetadata(
+        >>>     query_to_keys=query_to_keys,
+        >>>     bias_cache={},
+        >>> )
+        >>> output = atom_transformer(q, c, bias, mask, attn_metadata)
+        """
+        assert attn_metadata is not None, "Attention metadata is required for Boltz1AtomTransformer"
+        W = self.attn_window_queries
+        H = self.attn_window_keys
+        B, multiplicity, N, _ = q.shape
+        NW = N // W
+
+        # reshape tokens
+        q = q.view((B, multiplicity, NW, W, -1))
+        c = c.view((B, 1, NW, W, -1))  # expand dim 1 for broadcasting
+        mask = mask.view(B, 1, NW, W)  # expand dim 1 for broadcasting
+
+        # Broadcast over dim 1 (multiplicity) instead of materializing a
+        # repeated copy, unlike the upstream Boltz implementation.
+        if prepared_pair_biases is None:
+            bias = bias.view((B, 1, NW, W, H, -1))  # expand dim 1 for broadcasting
+
+        # q: [B, multiplicity, NW, W, D]
+        # c: [B, 1, NW, W, D]
+        # bias: [B, 1, NW, W, H, D]
+        # mask: [B, 1, NW, W]
+        a = self.diffusion_transformer(
+            a=q,
+            s=c,
+            z=None if prepared_pair_biases is not None else bias,
+            mask=None if prepared_pair_biases is not None else mask,
+            attn_metadata=attn_metadata,
+            buffers=buffers,
+            prepared_pair_biases=prepared_pair_biases,
+            prepared_transition_conds=prepared_transition_conds,
+        )
+        a = a.view((B, multiplicity, N, -1))
+        return a
+
+
+class AtomAttentionEncoder(nn.Module):
+    def __init__(
+        self,
+        atom_s: int,
+        token_s: int,
+        atoms_per_window_queries: int,
+        atoms_per_window_keys: int,
+        diffusion_transformer_config: BaseConfig = None,
+        diffusion_transformer_cls: Any = None,
+        structure_prediction=True,
+        version: str = "v1",
+        dtype: torch.dtype | None = None,
+        skip_create_weights: bool = False,
+    ):
+        """
+        Args:
+            token_s: int
+                The token single representation dimension.
+            atoms_per_window_queries: int
+                The number of atoms per window for queries.
+            atoms_per_window_keys: int
+                The number of atoms per window for keys.
+            diffusion_transformer_config: BaseConfig
+                The configuration for the DiffusionTransformer.
+            diffusion_transformer_cls: nn.Module
+                The implementation class of the DiffusionTransformer.
+        """
+        super().__init__()
+        self.structure_prediction = structure_prediction
+        self.dtype = dtype
+        self.version = version
+        atom_s = atom_s or diffusion_transformer_config.dim
+
+        if self.structure_prediction:
+            self.r_to_q_trans = Linear(
+                10 if self.version == "v1" else 3,  # v1 uses 10, v2 uses 3
+                atom_s,
+                bias=False,
+                dtype=dtype,
+                skip_create_weights=skip_create_weights,
+            )
+
+        self.atom_encoder_dtype = diffusion_transformer_config.torch_dtype
+        self.atom_encoder = AtomTransformer(
+            attn_window_queries=atoms_per_window_queries,
+            attn_window_keys=atoms_per_window_keys,
+            diffusion_transformer_config=diffusion_transformer_config,
+            diffusion_transformer_cls=diffusion_transformer_cls,
+        )
+        self.structure_prediction = structure_prediction
+        # Fill config values if not provided.
+        self.atom_to_token_trans = nn.Sequential(
+            Linear(
+                atom_s,
+                2 * token_s if structure_prediction else token_s,
+                bias=False,
+                dtype=torch.float32,
+                skip_create_weights=skip_create_weights,
+            ),
+            nn.ReLU(),
+        )
+
+    def load_weights(self, weights: dict):
+        self.atom_to_token_trans[0].load_weights(weights["atom_to_token_trans.0"])
+        self.atom_encoder.load_weights(weights["atom_encoder"])
+        if hasattr(self, "r_to_q_trans"):
+            self.r_to_q_trans.load_weights(weights["r_to_q_trans"])
+
+    def prepare_pair_biases(
+        self, bias: torch.Tensor, atom_pad_mask: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> list[torch.Tensor]:
+        """Lay out a rollout-invariant ``bias`` and its key mask per atom-transformer layer once, for :meth:`forward`.
+
+        Args:
+            bias: The rollout-invariant bias :meth:`forward` would receive.
+            atom_pad_mask: The ``[B, N_atoms]`` mask :meth:`forward` would receive, fixed
+                for as long as the biases are used.
+            attn_metadata: Metadata whose ``query_to_keys`` gathers the key windows.
+        """
+        mask = atom_pad_mask.bool().to(self.atom_encoder_dtype)
+        return self.atom_encoder.prepare_pair_biases(bias.to(self.atom_encoder_dtype), mask, attn_metadata)
+
+    def prepare_transition_conds(self, c: torch.Tensor) -> list[torch.Tensor | None] | None:
+        """Each atom-transformer layer's fused transition table of the rollout-invariant ``c`` :meth:`forward` would
+        receive, projected once; ``None`` where no layer runs fused."""
+        return self.atom_encoder.prepare_transition_conds(c.to(self.atom_encoder_dtype))
+
+    def forward(
+        self,
+        atom_to_token: torch.Tensor,
+        atom_pad_mask: torch.Tensor,
+        q: torch.Tensor,
+        c: torch.Tensor,
+        bias: torch.Tensor | None,
+        r: torch.Tensor = None,
+        attn_metadata: AttentionMetadata | None = None,
+        buffers: PreallocatedBuffers | None = None,
+        prepared_pair_biases: list[torch.Tensor] | None = None,
+        prepared_atom_to_token: dict[str, torch.Tensor] | None = None,
+        prepared_transition_conds: list[torch.Tensor | None] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            atom_to_token: torch.Tensor
+                The atom to token mapping. Shape [B, N_atoms, N_res]
+            atom_pad_mask: torch.Tensor
+                The atom pad mask. Shape [B, N_atoms]
+            q: torch.Tensor
+                The query tensor. Shape [B, N_atoms, D]
+            c: torch.Tensor
+                The condition tensor. Shape [B, N_atoms, D]
+            bias: torch.Tensor
+                The bias tensor. Shape [B, N_atoms, H, D]; ``None`` with ``prepared_pair_biases``.
+            r: torch.Tensor
+                The residue coordinates. Shape [B, multiplicity, N_atoms, 3]
+            prepared_pair_biases: list[torch.Tensor]
+                Biases from :meth:`prepare_pair_biases`; they replace ``bias`` and carry the key mask.
+            prepared_atom_to_token: dict[str, torch.Tensor]
+                Slots from :func:`prepare_atom_to_token`; they replace the dense
+                contraction over ``atom_to_token`` with an ordered per-token reduction.
+            prepared_transition_conds: list[torch.Tensor | None]
+                Tables from :meth:`prepare_transition_conds` of ``c``.
+        Returns:
+            a: torch.Tensor
+                The atom feature tensor. Shape [B, multiplicity, N_res, 2 * token_s]
+            q: torch.Tensor
+                The query tensor. Shape [B, multiplicity, N_atoms, atom_s]
+            c: torch.Tensor
+                The condition tensor. Shape [B, 1, N_atoms, D]
+        """
+        if self.structure_prediction:
+            B, multiplicity, N, _ = r.shape
+            # Sanity check the shape of the r tensor, and attention metadata.
+            assert r.ndim == 4, "r must be 4D, shape: (B, multiplicity, N_atoms, 3)"
+        else:
+            multiplicity = 1
+        assert attn_metadata is not None, "Attention metadata is required for AtomAttentionEncoder"
+        assert attn_metadata.query_to_keys is not None, "Query to keys is required for AtomAttentionEncoder"
+
+        atom_mask = atom_pad_mask.bool()
+        q = q.unsqueeze(1)
+
+        if self.structure_prediction:
+            # r_to_q: [B, multiplicity, N_atoms, atom_s]
+            r_input = r
+            if self.version == "v1":
+                # Matches ``AtomAttentionEncoder.forward`` in the upstream
+                # Boltz repository (not vendored here), which zero-pads
+                # the 7 trailing feature channels for the v1 structure
+                # path.
+                r_input = torch.cat(
+                    [r, r.new_zeros((B, multiplicity, N, 7))],
+                    dim=-1,
+                )
+            r_to_q = self.r_to_q_trans(r_input)
+            # q: [B, multiplicity, N_atoms, atom_s]
+            q = q + r_to_q
+
+        q = self.atom_encoder(
+            q=q.to(self.atom_encoder_dtype),
+            c=c.to(self.atom_encoder_dtype),
+            bias=bias if prepared_pair_biases is not None else bias.to(self.atom_encoder_dtype),
+            mask=atom_mask.to(self.atom_encoder_dtype),
+            attn_metadata=attn_metadata,
+            buffers=buffers,
+            prepared_pair_biases=prepared_pair_biases,
+            prepared_transition_conds=prepared_transition_conds,
+        )
+        q = q.to(self.dtype)
+        with torch.autocast("cuda", enabled=False):
+            # [B, multiplicity, N_atoms, 2 * token_s]
+            q_to_a = self.atom_to_token_trans(q.float())
+            if prepared_atom_to_token is not None:
+                a = reduce_atom_slots(
+                    q_to_a,
+                    prepared_atom_to_token["gather_index"],
+                    prepared_atom_to_token["gather_mask"],
+                    prepared_atom_to_token["gather_counts"],
+                    atom_to_token.shape[-1],
+                    1e-6,
+                )  # [B, multiplicity, N_res, D]
+            else:
+                atom_to_token_mean = atom_to_token.float() / (atom_to_token.sum(dim=1, keepdim=True) + 1e-6)
+                atom_to_token_mean = atom_to_token_mean.unsqueeze(1)
+                atom_to_token_mean = atom_to_token_mean.repeat_interleave(
+                    multiplicity, 1
+                )  # [B, multiplicity, N_atoms, N_res]
+
+                a = torch.einsum("bijd,bijk->bikd", q_to_a, atom_to_token_mean)  # [B, multiplicity, N_res, D]
+
+        a = a.to(q)
+        return a, q, c
+
+
+class AtomAttentionDecoder(nn.Module):
+    def __init__(
+        self,
+        token_s: int,
+        atom_s: int,
+        atoms_per_window_queries: int,
+        atoms_per_window_keys: int,
+        diffusion_transformer_config: BaseConfig,
+        diffusion_transformer_cls: Any = None,
+        structure_prediction=True,
+        dtype: torch.dtype | None = None,
+        skip_create_weights: bool = False,
+    ):
+        """
+        Args:
+            token_s: int
+                The token single representation dimension.
+            atoms_per_window_queries: int
+                The number of atoms per window for queries.
+            atoms_per_window_keys: int
+                The number of atoms per window for keys.
+            diffusion_transformer_config: BaseConfig
+                The configuration for the DiffusionTransformer.
+            diffusion_transformer_cls: nn.Module
+                The implementation class of the DiffusionTransformer.
+        """
+        super().__init__()
+
+        self.dtype = dtype
+        skip_create_weights = skip_create_weights or diffusion_transformer_config.skip_create_weights
+
+        self.token_s = token_s
+        self.atom_s = atom_s
+        self.a_to_q_trans = Linear(
+            token_s * 2, atom_s, bias=False, dtype=torch.float32, skip_create_weights=skip_create_weights
+        )
+
+        self.atom_decoder_dtype = diffusion_transformer_config.torch_dtype
+        self.atom_decoder = AtomTransformer(
+            attn_window_queries=atoms_per_window_queries,
+            attn_window_keys=atoms_per_window_keys,
+            diffusion_transformer_config=diffusion_transformer_config,
+            diffusion_transformer_cls=diffusion_transformer_cls,
+        )
+
+        self.atom_feat_to_atom_pos_update = nn.Sequential(
+            nn.LayerNorm(atom_s, dtype=dtype, eps=diffusion_transformer_config.norm_epsilon),
+            Linear(atom_s, 3, bias=False, dtype=dtype, skip_create_weights=skip_create_weights),
+        )
+
+    def load_weights(self, weights: dict):
+        self.a_to_q_trans.load_weights(weights["a_to_q_trans"])
+        self.atom_decoder.load_weights(weights["atom_decoder"])
+
+        self.atom_feat_to_atom_pos_update[0].weight.data.copy_(weights["atom_feat_to_atom_pos_update.0"][0]["weight"])
+        self.atom_feat_to_atom_pos_update[0].bias.data.copy_(weights["atom_feat_to_atom_pos_update.0"][0]["bias"])
+
+        self.atom_feat_to_atom_pos_update[1].load_weights(weights["atom_feat_to_atom_pos_update.1"])
+
+    def prepare_pair_biases(
+        self, bias: torch.Tensor, atom_pad_mask: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> list[torch.Tensor]:
+        """Lay out a rollout-invariant ``bias`` and its key mask per atom-transformer layer once, for :meth:`forward`.
+
+        Args:
+            bias: The rollout-invariant bias :meth:`forward` would receive.
+            atom_pad_mask: The ``[B, N_atoms]`` mask :meth:`forward` would receive, fixed
+                for as long as the biases are used.
+            attn_metadata: Metadata whose ``query_to_keys`` gathers the key windows.
+        """
+        mask = atom_pad_mask.bool().to(self.atom_decoder_dtype)
+        return self.atom_decoder.prepare_pair_biases(bias.to(self.atom_decoder_dtype), mask, attn_metadata)
+
+    def prepare_transition_conds(self, c: torch.Tensor) -> list[torch.Tensor | None] | None:
+        """Each atom-transformer layer's fused transition table of the rollout-invariant ``c`` :meth:`forward` would
+        receive, projected once; ``None`` where no layer runs fused."""
+        return self.atom_decoder.prepare_transition_conds(c.to(self.atom_decoder_dtype))
+
+    def forward(
+        self,
+        atom_to_token: torch.Tensor,
+        atom_pad_mask: torch.Tensor,
+        a: torch.Tensor,
+        q: torch.Tensor,
+        c: torch.Tensor,
+        bias: torch.Tensor | None,
+        attn_metadata: AttentionMetadata | None = None,
+        buffers: PreallocatedBuffers | None = None,
+        prepared_pair_biases: list[torch.Tensor] | None = None,
+        prepared_atom_to_token: dict[str, torch.Tensor] | None = None,
+        prepared_transition_conds: list[torch.Tensor | None] | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            atom_to_token: torch.Tensor
+                The atom to token mapping. Shape [B, N_atoms, N_res]
+            atom_pad_mask: torch.Tensor
+                The atom pad mask. Shape [B, N_atoms]
+            a: torch.Tensor
+                The atom feature tensor. Shape [B, multiplicity, N_res, 2 * token_s]
+            q: torch.Tensor
+                The query tensor. Shape [B, N_atoms, atom_s], or [B, multiplicity, N_atoms, atom_s]
+            c: torch.Tensor
+                The condition tensor. Shape [B, 1, N_atoms, D]
+            bias: torch.Tensor
+                The bias tensor. Shape [B, N_atoms, H, D]; ``None`` with ``prepared_pair_biases``.
+            multiplicity: int
+                The multiplicity that used for the structure prediction.
+            prepared_pair_biases: list[torch.Tensor]
+                Biases from :meth:`prepare_pair_biases`; they replace ``bias`` and carry the key mask.
+            prepared_atom_to_token: dict[str, torch.Tensor]
+                Slots from :func:`prepare_atom_to_token`; they replace the dense
+                contraction over ``atom_to_token`` with a per-atom gather.
+            prepared_transition_conds: list[torch.Tensor | None]
+                Tables from :meth:`prepare_transition_conds` of ``c``.
+        """
+        assert a.ndim == 4, "a must be 4D, shape: (B, multiplicity, N_res, 2 * token_s)"
+        assert attn_metadata is not None, "Attention metadata is required for AtomAttentionDecoder"
+        assert attn_metadata.query_to_keys is not None, "Query to keys is required for AtomAttentionDecoder"
+        _, multiplicity, _, _ = a.shape
+
+        with torch.autocast("cuda", enabled=False):
+            # [B, multiplicity, N_res, 2*token_s]
+            a_to_q = self.a_to_q_trans(a.float())
+
+            # [B, multiplicity, N_atoms, 2*token_s]
+            if prepared_atom_to_token is not None:
+                owners = prepared_atom_to_token["atom_to_token_index"][:, None, :, None]
+                a_to_q = a_to_q.gather(2, owners.expand(-1, multiplicity, -1, a_to_q.shape[-1]))
+                a_to_q = a_to_q * prepared_atom_to_token["atom_mask"][:, None, :, None]
+            else:
+                atom_to_token = atom_to_token.unsqueeze(1)
+                # [B, multiplicity, N_atoms, N_res]
+                atom_to_token = atom_to_token.repeat_interleave(multiplicity, 1)
+                a_to_q = torch.einsum("bikj,bijd->bikd", atom_to_token.float(), a_to_q)
+
+        # Auto broadcast the q and a_to_q
+        if q.ndim == 3:
+            # Make the multiplicity dimension
+            q = q.unsqueeze(1)
+        q = q + a_to_q.to(q)
+        atom_mask = atom_pad_mask.bool()
+
+        # [B, multiplicity, N_atoms, atom_s]
+        q = self.atom_decoder(
+            q=q.to(self.atom_decoder_dtype),
+            c=c.to(self.atom_decoder_dtype),
+            bias=bias if prepared_pair_biases is not None else bias.to(self.atom_decoder_dtype),
+            mask=atom_mask.to(self.atom_decoder_dtype),
+            attn_metadata=attn_metadata,
+            buffers=buffers,
+            prepared_pair_biases=prepared_pair_biases,
+            prepared_transition_conds=prepared_transition_conds,
+        )
+        q = q.to(self.dtype)
+        # [B, multiplicity, N_atoms, 3]
+        r_update = self.atom_feat_to_atom_pos_update(q)
+        return r_update

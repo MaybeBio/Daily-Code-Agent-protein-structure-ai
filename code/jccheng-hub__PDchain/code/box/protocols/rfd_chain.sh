@@ -1,0 +1,1104 @@
+#!/usr/bin/env bash
+pixiroot="$PIXI_PROJECT_ROOT"
+pixitoml="$pixiroot/pixi.toml"
+pixirun="pixi run -m $pixitoml -e"
+[[ -n $pixiroot ]] || {
+    echo 'Need $PIXI_PROJECT_ROOT to be defined.' >&2
+    exit 1
+}
+
+usage () { cat << EOF
+Usage: rfd_chain [CONTIGS]
+Run RFdiffusion and LigandMPNN with Rosetta refinement
+
+Parameters:
+    CONTIGS                 RFdiffusion contigs.
+                            E.g. 180-180
+                            E.g. 20-30/A5-76/20-30
+                            If CONTIGS is not provided, then one will be
+                            generated using the contigs options.
+                            To skip RFdiffusion, input SKIP as your contigs.
+
+General options:
+  --inpdb [str]             Input PDB path.
+  --indir [str]             Input directory with PDBs. A random PDB will be
+                            pulled from this directory if specified.
+  --ligname [str]           Ligand name (3-letter code).
+                            Can specify multiple ligands.
+                            If using custom ligand, make sure to make a params
+                            file with smiles_to_params.
+  --outprefix [str]         Output prefix, including output path and basename
+                            prefix.
+  --randsuffix              Generate a random string for the suffix.
+  --persistent              If a design fails to generate, keep trying.
+  --cyclize_chain [str]     Specify chain for cyclization.
+                            Affects RFdiffusion and Rosetta.
+                            Note that the RFdiffusion in PDchain will always put
+                            chain A as the de novo backbone.
+  --help                    Display this help and exit.
+
+Contigs options:
+  --fixbbres [str]          Residues that will have their backbones fixed during
+                            diffusion (chain+residue format).
+                            E.g. --fixbbres A7-10 A39 A72
+  --random_order            If --fixbbres (or --fixedres) is provided, then the
+                            order of the fixed residues are shuffled during
+                            contigs generation.
+  --gap_range [str]         If generating contigs, keep linker length within
+                            this specified range.
+                            E.g. --gap_range 20-100
+  --tot_range [str]         If generating contigs, keep total residue length
+                            within this specified range.
+                            E.g. --tot_range 180-220
+  --vary_linkers [int]      Allow diffusable regions to vary by this number.
+  --inc_only                If --vary_linkers is provided, then the diffusable
+                            regions cannot decrease in length.
+  --dec_only                If --vary_linkers is provided, then the diffusable
+                            regions cannot increase in length.
+  --ss_to_contigs           Converts secondary structure in input PDB to contigs
+                            used for RFdiffusion. Secondary structure residues
+                            are fixed, and loops are rediffused.
+  --ss_trim [int]           If --ss_to_contigs is used, allows the specified
+                            number of ss residues neighboring loops to be
+                            rediffused by RFdiffusion.
+                            E.g. If DSSP string is LLHHHHHLL with --ss_trim 2,
+                            then it would be treated as LLLLHLLLL for
+                            RFdiffusion.
+  --nterm_add [int]         Number of residues to add to N-terminus.
+  --cterm_add [int]         Number of residues to add to C-terminus.
+  --nterm_trim [int]        Trim specified number of residues from N terminus.
+  --cterm_trim [int]        Trim specified number of residues from C terminus.
+  --helix_cap [int]         If an alpha helix length exceeds this value, mask
+                            the entire helix from RFdiffusion.
+  --seg_rmv_chance [float]  Percent chance of removing ss segment when invoking
+                            --ss_to_contigs.
+
+RFdiffusion options:
+  --timesteps [int]         Number of timesteps for RFdiffusion.
+                            Can specify range (e.g. --timesteps 1-3).
+  --rog_cut [float]         Cutoff for poly-ala ROG metric. Lower values are
+                            more compact and globular. For a 200-residue
+                            protein, --rog_cut 16 is a good start. Adjust value
+                            for larger/smaller proteins.
+  --loop_cut [float]        Cutoff for percent loop. Lower values have more
+                            alpha helices and beta sheets. Range from 0-100.
+                            Recommend --loop_cut 30 for most applications.
+  --clash_cut [int]         Cutoff for clashes with ligand. If not provided,
+                            will use number of non-H ligand atoms divided by 2.
+  --backrub [int]           After running RFdiffusion, rerun RFdiffusion again
+                            with partial diffusion. This specifies the number
+                            of timesteps for this partial diffusion rerun.
+  --partial                 Use partial diffusion.
+  --monomer_ROG             Apply monomer radius of gyration potential.
+  --inpaint_seq [str]       Mask the specified sequence from RFdiffusion.
+  --inpaint_str [str]       Mask the specified structure from RFdiffusion.
+  --inpaint_seq_ch [str]    Mask specified chain's sequence from RFdiffusion.
+  --inpaint_str_ch [str]    Mask specified chain's structure from RFdiffusion.
+  --noise_scale [float]     Noise scale (0-1) for RFdiffusion. Higher values
+                            result in more diversity but lower quality.
+  --rfd_ckpt [str]          Specify model checkpoint for RFdiffusion.
+                            Available checkpoints:
+                              Base                    ActiveSite
+                              Complex_base            Complex_Fold_base
+                              InpaintSeq              InpaintSeq_Fold
+                              Complex_beta
+                            See RFdiffusion documentation for more details on
+                            model checkpoints.
+  --ppi_hotspots [str]      Hotspots for protein-protein interactions.
+
+LigandMPNN + PyRosetta options:
+  --design_cycles [int]     Number of MPNN-FastRelax cycles. Acceptance of new
+                            design depends on --select_met.
+  --addmets [str]           List of additional scripts (in box/addmets) to
+                            calculate metrics for selection.
+  --select_met [str]        Selection metric. The specified metric is used to
+                            accept/reject new designs in between design cycles.
+                            If not specified, then will default to Rosetta and
+                            MPNN scores.
+                            Specify with the following formats:
+                            min:metric, max:metric, or val:metric=ideal_val
+                            E.g. --select_met min:ddg
+                            E.g. --select_met val:dsasa=0.75
+  --mpnn_model [str]        MPNN model. Available models:
+                              protein_mpnn    soluble_mpnn    ligand_mpnn
+  --temperature [float]     MPNN temperature.
+  --fixedres [str]          Residues to fix (exclusive with --redesres).
+  --redesres [str]          Residues to redesign (exclusive with --fixedres)
+  --natbias [float]         Bias design towards each residue at each position
+                            found in the input PDB. A value of 1.0 is a good
+                            start. Values 3.0 and above tend to just fix the
+                            residues entirely.
+  --biasjson [str]          MPNN json for biasing residues.
+  --omitjson [str]          MPNN json for omitting residues.
+  --relax_repeats [int]     Number of relax repeats to use.
+  --cstfile [str]           Path to cst file.
+  --fix_stdev [float]       Strength of constraints for fixed residues.
+  --ca_stdev [float]        Strength of constraints for CA atoms.
+  --fix_ca_stdev [float]    Strength of constraints for CA toms of fixed
+                            residues.
+  --no_ca_csts              Do not add CA constraints.
+  --lig_stdev [float]       Strength of constraints for ligand atoms.
+                            Need to invoke --ligname
+  --ap_stdev [float]        Strength of constraints between fixed residue atoms
+                            and ligand atoms (using AtomPair).
+                            Need both --ligname and --fixedres.
+  --threads [int]           Number of threads to use for PyRosetta.
+  --nbr_dist [float]        Neighbor distance for LigandMPNN redesign around
+                            ligands.
+  --disallow_cys            Disallow cysteines during design.
+  --sc_context              Use side chain atoms as ligands during LigandMPNN.
+  --rosetta_lig_nbr         Use RosettaDesign on residues within --nbr_dist of
+                            ligands. Cysteines are prohibited.
+  --nbr_resfile_cmd [str]   Resfile command for ligand neighbors when invoking
+                            --rosetta_lig_nbr.
+  --ignore_metals           Do not set up covalent connections with metals
+  --fix_bb                  Fix backbones.
+  --fix_chi                 Fix chi angles.
+  --skip_idealize           Skip idealizing bond lengths and bond angles.
+  --skip_relax              Skip FastRelax.
+  --skip_mpnn               Skip MPNN.
+EOF
+}
+
+# --- Defaults --- # {{{
+args=($(echo $0 $@ | sed "s/--.*//"))
+opts=($(echo $0 $@ | sed "s/--/\n--/" | sed "1d"))
+optchk () {
+    [[ " ${opts[*]} " =~ " $1 " ]] && echo 1 || echo 0
+}
+optarg () {
+    sed "s/--/\n--/g" <<< "${opts[*]}" |
+    sed -n "1,/^$1 /s/^$1 //p" | sed 's/ \+$//'
+}
+
+val_opts=(
+    addmets             ap_stdev            backrub             biasjson            
+    ca_stdev            clash_cut           cstfile             cterm_add           
+    cterm_trim          cyclize_chain       design_cycles       fix_ca_stdev        
+    fix_stdev           fixbbres            fixedres            gap_range           
+    helix_cap           indir               inpaint_seq         inpaint_seq_ch      
+    inpaint_str         inpaint_str_ch      inpdb               lig_stdev           
+    ligname             loop_cut            mpnn_model          natbias             
+    nbr_dist            nbr_resfile_cmd     noise_scale         nterm_add           
+    nterm_trim          numdes              omitjson            outprefix           
+    ppi_hotspots        redesres            relax_repeats       rfd_ckpt            
+    rog_cut             seg_rmv_chance      select_met          ss_trim             
+    temperature         threads             timesteps           tot_range           
+    vary_linkers                                                                    
+)
+
+bool_opts=(
+    dec_only            disallow_cys        fix_bb              fix_chi             
+    help                ignore_metals       inc_only            monomer_ROG         
+    no_ca_csts          partial             persistent          random_order        
+    randsuffix          relax               rosetta_lig_nbr     sc_context          
+    skip_idealize       skip_mpnn           skip_relax          ss_to_contigs
+)
+
+ca_stdev="1"
+cterm_add="0"
+cterm_trim="1"
+design_cycles="3"
+gap_range="20-100"
+loop_cut="9999"
+mpnn_model="protein_mpnn"
+noise_scale="0.5"
+nterm_add="0"
+nterm_trim="1"
+numdes="1"
+outprefix="outputs/rfd_des"
+paramsdir="$pixiroot/box/params"
+relax_repeats="1"
+rog_cut="9999"
+select_met="min:fin_reu"
+ss_trim="2"
+temperature="0.1"
+threads="1"
+timesteps="15"
+tot_range="180-220"
+vary_linkers="0"
+
+default_vals () {
+    [[ ${#val_opts[@]} -ge 1 ]] && {
+        echo -e "\nDefaults:"
+        for opt in ${val_opts[@]} ; do
+            [[ -n ${!opt} ]] && echo "  --${opt} ${!opt}" || echo "  --${opt} NONE"
+        done | sort | xargs printf "  %-19s %-19s %-19s %-s\n"
+    }
+    [[ ${#bool_opts[@]} -ge 1 ]] && {
+        echo -e "\nFlags:"
+        sed 's/ /\n/g' <<< "${bool_opts[@]}" |
+        sed 's/^/--/g' | xargs printf "  %-39s %-s\n"
+    }
+}
+
+all_opts=()
+for opt in ${bool_opts[@]} ; do
+    [[ $(optchk --$opt) == 1 ]] && all_opts+=(--$opt)
+    declare "$opt=$(optchk --$opt)"
+done
+for opt in ${val_opts[@]} ; do
+    val=$(optarg --${opt})
+    [[ -n $val ]] && declare "$opt=$val"
+    [[ ${!opt} == REQUIRED ]] && help="1"
+    [[ -n ${!opt} ]] && all_opts+=(--$opt ${!opt})
+done
+[[ $help == 1 ]] && { usage ; default_vals ; exit ;}
+# }}}
+
+shopt -s nullglob
+echo "Executing command:" "$0" "$@"
+
+# >>> General functions >>> {{{
+expand_res_range () {
+    [[ $# == 0 ]] && return
+    echo $@ | sed 's/ /\n/g' | awk -F '-' '{
+        ch = substr($0,1,1) ; sub(/^[A-Z]/,"",$0) ; $2 = (!$2)? $1 : $2
+        for (i=$1+0; i<=$2+0; i++) print ch i
+    }' | paste -sd ' '
+}
+
+# Convert chainresi format to pymol selection (e.g. A73 to (///A/73))
+res_to_sel () {
+    sed 's|[A-Z]|/&/|g' <<< $@ |
+    awk '{for(i=1;i<=NF-1;i++)printf"(//%s) or ",$i;printf"(//%s)\n",$NF}'
+}
+
+# Take input contigs and oldres list and gets new resi | format oldres:newres
+get_newres () {
+
+    # If contigs is SKIP, then execute this block (requires inpdb defined)
+    [[ $1 == SKIP ]] && {
+        awk -v oldres="${*:2}" '
+            BEGIN {
+                n = split(oldres, a, " ")
+                for (i=1; i<=n; i++) {
+                    split(a[i], b, "-")     ; ch_o = substr(b[1], 1, 1)
+                    sub(/^[A-Z]/, "", b[1]) ; if (b[2]=="") b[2]=b[1]
+                    for (j=b[1]+0; j<=b[2]+0; j++) res_o[ch_o j] = 1
+                }
+            }
+
+            $1~/^(ATOM|HETATM)$/ && $3=="CA" && $NF!~/CA/ {
+                if (oldres!="" && !($5 $6 in res_o)) next
+                print $5 $6 ":" $5 $6
+            }
+        ' $inpdb
+        return
+    }
+
+    # For all other contigs, run the following
+    local contigs=$(
+        sed 's|/0 | |' <<< $1 | sed 's/ /\n/g' |
+        sort | awk '$0!~/^[ ]*$/ {a[++n]=$0} END {
+            for (i=1; i<n; i++) {
+                print a[i]"/0 "
+            }
+            print a[n]
+        }' | paste -sd ' '
+    )
+
+    sed -e 's| \+| |' -e 's|/|\n|g' -e 's/ /\n/g' <<< "$contigs" |
+    awk -v oldres="${*:2}" -F '-' '
+        BEGIN {
+            n = split(oldres, a, " ")
+            for (i=1; i<=n; i++) {
+                split(a[i], b, "-")     ; ch_o = substr(b[1], 1, 1)
+                sub(/^[A-Z]/, "", b[1]) ; if (b[2]=="") b[2]=b[1]
+                for (j=b[1]+0; j<=b[2]+0; j++) res_o[ch_o j] = 1
+            }
+            s = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            split(s, ch, "") ; ch_i = 1 ; resi = 1
+        }
+        $1 == 0 || $1 == "0" { ch_i++ ; next }
+        $1 ~ /^[0-9]/ { resi += $1 ; next }
+        $1 ~ /^[A-Z]/ {
+            ch_o = substr($1, 1, 1)  ;  sub(/^[A-Z]/, "", $1)
+            for (i=$1+0; i<=$2+0; i++) {
+                if ( oldres && !(ch_o i in res_o) ) { resi++ ; continue }
+                print ch_o i ":" ch[ch_i] resi++
+            }
+        }
+    '
+}
+
+get_newres_awk_array () {
+    get_newres "$@" | sed 's/:/ /' |
+    awk '{printf "nres[\"%s\"]=\"%s\"\n", $1, $2}' | paste -sd ';'
+}
+
+calc_perc_loop () {
+    local inpdb=($@)
+    dss_disicl ${inpdb[0]} --append --fixedres ${inpdb[@]:1}
+    grep -h "^perc_loop " $inpdb
+}
+
+collapse_contigs () {
+    local contigs="$@"
+    echo $contigs | sed 's/ /\n/g' | awk '
+        BEGIN { srand() } {
+            contigs = ""
+            n = split($0, a, "/") 
+            for (i=1; i<=n; i++) {
+                m = split(a[i], b, "-")
+                if (b[1] == 0) {
+                    contigs = contigs "/0" ; continue
+                }
+                if (match(a[i], /^[0-9]/)) {
+                    r = get_rand_int(b[1], b[2])
+                    contigs = contigs == "" ? r "-" r : contigs "/" r "-" r
+                } else {
+                    contigs = contigs == "" ? a[i] : contigs "/" a[i]
+                }
+            }
+            print contigs
+        }
+    
+        function get_rand_int(min, max) {
+            return int(rand() * (max - min + 1)) + min
+        }
+    ' | paste -sd ' '
+}
+# <<< General functions <<< }}}
+
+# Initialize
+mkdir -p $(dirname $outprefix)
+contigs=${args[@]:1}
+outdir=$(realpath $outprefix | xargs dirname)
+tmpdir=$(mktemp -d ${TMPDIR:-/tmp}/tmp_${USER}_XXXXXX) ; trap 'rm -r $tmpdir' EXIT
+
+# >>> rfd_chain () >>> {{{
+rfd_chain () {
+    local contigs=$1 outprefix=$2
+    local tmpdir=$tmpdir
+    local inpdb=$inpdb
+    local redesres=$redesres
+    local fixedres=$fixedres
+    local fixbbres=$fixbbres
+    local contigs_opts=()
+    local all_opts=(${all_opts[@]})
+
+    # Clean input PDB if it is provided
+    [[ -n $inpdb ]] && {
+        echo "Cleaning input PDB..."
+        clean_pdb $inpdb --outdir $tmpdir
+        local inpdb_ori="$inpdb"
+        local inpdb="$tmpdir/$(basename ${inpdb%.*}).pdb"
+        mv ${inpdb%.pdb}_clean.pdb $inpdb
+    }
+
+    # Generate fixbbres if not provided
+    [[ -z $fixbbres && -n $contigs && $contigs != SKIP ]] && {
+        local fixbbres=$(
+            sed -e 's|/| |g' -e 's| |\n|g' <<< $contigs | grep '^[A-Z]' | paste -sd ' '
+        )
+    }
+    [[ -z $fixbbres && -n $fixedres ]] && local fixbbres="$fixedres"
+
+    # Collapse input contigs if it is provided
+    [[ -n $contigs && $contigs != SKIP ]] && {
+        local contigs=$(collapse_contigs "$contigs")
+    }
+    
+    # Convert redesres to fixedres
+    [[ -n $redesres && -n $inpdb ]] && {
+        local redesres=$(expand_res_range $redesres)
+        local fixedres=$(awk '
+            $1=="ATOM" && $3=="CA" && $5$6!~/^('${redesres// /|}')$/ {print$5$6}
+        ' $inpdb | paste -sd ' ')
+    }
+    
+    # Get data from previous runs
+    [[ -n $inpdb ]] && {
+        [[ -z $contigs ]] && local oldcontigs=$(sed -n "s/^contigs //p" $inpdb_ori)
+        local oldfixed=$(sed -n "s/^fixedres //p" $inpdb_ori)
+        local oldlig=$(sed -n "s/^ligname //p" $inpdb_ori)
+        local oldcsts=$(sed -n 's/^#CST //p' $inpdb_ori)
+        local oldcyc=$(sed -n 's/^cyclize_chain //p' $inpdb_ori)
+        local oldppi=$(sed -n 's/^ppi_hotspots //p' $inpdb_ori)
+
+        [[ -z $fixedres && -n $oldfixed ]] && {
+            echo "Using fixedres residues found in input PDB: $oldfixed"
+            local fixedres="$oldfixed"
+            local all_opts+=("--fixedres $fixedres")
+        }
+        [[ -z $fixbbres && -n $oldcontigs ]] && {
+            echo "Using contigs found in input PDB for fixbbres: $oldcontigs"
+            local oldfixbb=$(
+                echo $oldcontigs | sed -E 's;(/| );\n;g' | sed -n '/^[A-Z]/p' | paste -sd ' '
+            )
+            local fixbbres=$(get_newres "$oldcontigs" $oldfixbb | cut -d: -f2 | paste -sd ' ')
+            local contigs_opts+=("--ss_to_contigs")
+        }
+        [[ -z $ligname && -n $oldlig ]] && {
+            echo "Using ligands found in input PDB: $oldlig"
+            local ligname=($oldlig)
+            local all_opts+=("--ligname ${ligname[*]}")
+        }
+        [[ -z $cyclize_chain && -n $oldcyc ]] && {
+            echo "Cyclizing chain $oldcyc due to input PDB data"
+            local cyclize_chain="$oldcyc"
+            local all_opts+=("--cyclize_chain $cyclize_chain")
+        }
+        [[ -z $ppi_hotspots && -n $oldppi ]] && {
+            echo "Using hotspots found in input PDB: $oldppi"
+            local ppi_hotspots="$oldppi"
+        }
+    }
+
+    # Generate contigs if one isn't provided
+    [[ -z $contigs ]] && {
+        echo "No contigs were provided. Generating contigs..."
+        [[ -n $inpdb && $partial == 1 ]] && {
+            local contigs_opts+=("--ss_to_contigs" "--ss_trim 100" "--vary_linkers 0")
+        }
+        echo "Executing command: gen_contigs $fixbbres ${contigs_opts[@]} ${all_opts[@]}"
+        local contigs=$(gen_contigs $fixbbres ${contigs_opts[@]} ${all_opts[@]})
+        [[ $contigs == FAILED ]] && {
+            sleep 1 ; echo "Failed to find contigs" ; return
+        }
+        [[ -z $fixbbres ]] && {
+            local fixbbres=$(
+                echo $contigs | sed -E 's;(/| );\n;g' | sed -n '/^[A-Z]/p' | paste -sd ' '
+            )
+        }
+    }
+    echo "Using the following contigs for RFdiffusion: $contigs"
+    
+    # Generate fused ligands input PDB if ligands are provided
+    [[ -n $inpdb ]] && {
+        local ligstr=${ligname[*]}
+        local tmpdat=$(awk '
+            $NF=="H" { next }
+            $1=="ATOM" { print $0 ; next }
+            $1=="HETATM" && $4~/^'"${ligstr// /|}"'$/ {
+                print substr($0, 1, 17) "LIG X   1" substr($0, 27)
+                next
+            }
+        ' $inpdb)
+        echo "$tmpdat" > ${inpdb%.pdb}_fusion.pdb
+    }
+    
+    # Prepare options for RFdiffusion
+    local rfd_opts=()
+    local rfd_opts=("denoiser.noise_scale_ca=$noise_scale" "denoiser.noise_scale_frame=$noise_scale")
+    [[ -n $inpdb ]] && local rfd_opts+=("inference.input_pdb=${inpdb%.pdb}_fusion.pdb")
+    
+    # Extract timesteps
+    local timesteps=$(
+        a=($(awk -v t="$timesteps" '
+            BEGIN {split(t, a, "-") ; a[2]=a[2]?a[2]:a[1] ; print a[1], a[2]}
+        '))
+        seq ${a[0]} ${a[1]} | shuf -n1
+    )
+    if [[ $partial == 1 ]] ; then
+        local rfd_opts+=("diffuser.partial_T=$timesteps")
+    else
+        local rfd_opts+=("diffuser.T=$timesteps")
+    fi
+    
+    local ligname=(${ligname[@]})
+    local contigs_fixbb=$(sed -e 's|/| |g' -e 's| |\n|g' <<< "$contigs" | grep '^[A-Z]' | paste -sd ' ')
+
+    # Ligand potential
+    [[ -n $ligname && $partial == 0 ]] && {
+        echo "Adding substrate_contacts guiding potential"
+        local rfd_opts+=(
+            "potentials.substrate=LIG"
+            "potentials.guide_scale=1"
+            "'potentials.guiding_potentials=[\"type:substrate_contacts,s:1,r_0:8,rep_r_0:5.0,rep_s:2,rep_r_min:1\"]'"
+        )
+    }
+    
+    # Monomer ROG potential
+    [[ $monomer_ROG == 1 && $partial == 0 ]] && {
+        echo "Adding monomer_ROG guiding potential"
+        local rfd_opts+=("'potentials.guiding_potentials=[\"type:monomer_ROG,weight:1,min_dist:10\"]'")
+        local rfd_opts+=("potentials.guide_scale=2 potentials.guide_decay=\"quadratic\"")
+    }
+    
+    # Hotspot residues
+    [[ -n $ppi_hotspots ]] && {
+        echo "Adding hotspot residues $ppi_hotspots"
+        local ppi_hotspots=$(expand_res_range $ppi_hotspots)
+        local rfd_opts+=("'ppi.hotspot_res=[${ppi_hotspots// /,}]'")
+    }
+
+    # Inpainting
+    [[ -n $inpaint_seq_ch && -n $inpdb ]] && {
+        local inpaint_seq=$(
+            for ch in $inpaint_seq_ch ; do
+                awk -v ch="$ch" '$1~/ATOM/ && $3=="CA" && $5==ch { print $5 $6 }' $inpdb
+            done | paste -sd ' '
+        )
+    }
+    [[ -n $inpaint_str_ch && -n $inpdb ]] && {
+        local inpaint_str=$(
+            for ch in $inpaint_str_ch ; do
+                awk -v ch="$ch" '$1~/ATOM/ && $3=="CA" && $5==ch { print $5 $6 }' $inpdb
+            done | paste -sd ' '
+        )
+    }
+    [[ -n $inpaint_seq ]] && {
+        echo "Masking the following residues with --inpaint_seq: ${inpaint_seq}"
+        local rfd_opts+=("'contigmap.inpaint_seq=[${inpaint_seq// //}]'")
+    }
+    [[ -n $inpaint_str ]] && {
+        echo "Masking the following structures with --inpaint_str: ${inpaint_str}"
+        local rfd_opts+=("'contigmap.inpaint_str=[${inpaint_str// //}]'")
+    }
+
+    # Cyclize chain
+    [[ -n $cyclize_chain ]] && {
+        echo "Cyclizing chain $cyclize_chain for RFdiffusion"
+        local rfd_opts+=("inference.cyclic=True" "inference.cyc_chains='$cyclize_chain'")
+    }
+
+    # Model Checkpoint
+    [[ -n $rfd_ckpt ]] && {
+        echo "Using ${rfd_ckpt}_ckpt.pt model for RFdiffusion"
+        local rfd_opts+=("inference.ckpt_override_path=$pixiroot/models/${rfd_ckpt}_ckpt.pt")
+    }
+    
+    # Input check
+    [[ -n $inpdb && ! -e $inpdb ]] && {
+        echo "Input PDB does not exist..."
+        return
+    }
+
+    # Run RFdiffusion
+    local step1="$tmpdir/step1" ; mkdir -p $step1
+    local rfd_suppress_logs=(
+        "hydra.output_subdir=null"
+        "'hydra.job_logging.root.handlers=[console]'"
+        "~hydra.job_logging.handlers.file"
+        "hydra/hydra_logging=disabled"
+        "hydra.run.dir=."
+    )
+    if [[ -n $inpdb && $contigs == SKIP ]] ; then
+        echo "Input pdb detected and contigs set to SKIP. Skipping diffusion."
+        clean_pdb $inpdb --renumber --outdir $step1 &&
+        mv $step1/$(basename ${inpdb%.pdb})_clean.pdb $step1/Diffused_0.pdb
+        awk -i inplace '$1!="HETATM"' $step1/Diffused_0.pdb
+        [[ -z $fixbbres ]] && {
+            local fixbbres=$(awk '
+                $1=="ATOM" && !check[$5$6] { check[$5$6]++ }
+                END { for (chri in check) { print chri } }
+            ' $inpdb | sort -k1,1.1 -k1.2n | paste -sd ' ')
+        }
+        local contigs=$(gen_contigs $fixbbres --inpdb $inpdb --ss_trim 100 --ss_to_contigs --vary_linkers 0)
+    else
+        eval "
+            $pixirun rfdiffusion rfdiffusion \
+                'contigmap.contigs=[$contigs]' \
+                inference.output_prefix=$step1/Diffused \
+                inference.num_designs=1 \
+                denoiser.noise_scale_ca=$noise_scale \
+                denoiser.noise_scale_frame=$noise_scale \
+                ${rfd_opts[*]} ${rfd_suppress_logs[*]}
+        "
+    fi
+    
+    # Rerun RFdiffusion if --backrub was enabled
+    [[ -n $inpdb && -n $backrub ]] && {
+        echo "The option --backrub $backrub was enabled."
+        local backrub=$(
+            a=($(awk -v t="$backrub" '
+                BEGIN {split(t, a, "-") ; a[2]=a[2]?a[2]:a[1] ; print a[1], a[2]}
+            '))
+            seq ${a[0]} ${a[1]} | shuf -n1
+        )
+        echo "Running partial diffusion with $backrub timesteps..."
+        if [[ -n $fixedres ]] ; then
+            local newfixbb=$(get_newres "$contigs" $fixbbres | cut -d: -f2 | paste -sd ' ')
+            local re_contigs=$( 
+                gen_contigs $newfixbb --ss_to_contigs --ss_trim 100 --vary_linkers 0 --inpdb $step1/Diffused_0.pdb
+            )
+        else
+            # Without fixed residues, get contigs string that matches the exact length of the first chain
+            re_contigs=$(
+                awk '$1=="ATOM" && $3=="CA"' $step1/Diffused_0.pdb |
+                awk '
+                    ch == "" { ch = $5 }
+                    ch { ri[NR] = $6 }
+                    END { len = ri[NR] - ri[1] + 1 ; print len "-" len }
+                '
+            )
+        fi
+        eval "
+            $pixirun rfdiffusion rfdiffusion \
+                'contigmap.contigs=[$re_contigs]' \
+                inference.input_pdb=$step1/Diffused_0.pdb \
+                inference.output_prefix=$step1/ReDiffused \
+                inference.num_designs=1 \
+                diffuser.partial_T=${backrub} \
+                ${rfd_suppress_logs[*]}
+        "
+        mv $step1/ReDiffused_0.pdb $step1/Diffused_0.pdb
+    }
+    
+    # If inpaint_seq is used, fill in the glycines with the original sequence
+    [[ -n $inpaint_seq ]] && {
+        echo "Replacing inpainted glycines with their original AA..."
+        local nres_array=$(get_newres_awk_array "$contigs")
+        awk '
+        BEGIN {
+            '"$nres_array"'
+            for (chri in nres) { ores[nres[chri]] = chri }
+        }
+        NR == FNR {
+            if ($1=="ATOM" && $3=="CA") { resn[$5$6] = $4 }
+            next
+        }
+        NR > FNR {
+            if ($1=="ATOM" && ores[$5$6] in resn) {
+                sub("GLY", resn[ores[$5$6]], $0)
+            }
+            print $0
+        }
+        ' $inpdb $step1/Diffused_0.pdb > $step1/tmp.pdb
+        mv $step1/tmp.pdb $step1/Diffused_0.pdb
+    }
+
+    local diffused=($step1/Diffused_*.pdb)
+    [[ -s $diffused ]] || return
+
+    # If --skip_idealize is not used, then idealize diffused backbone
+    [[ $skip_idealize != 1 ]] && {
+        echo "Idealizing scaffold with Rosetta. Use --skip_idealize to turn this off."
+        mpros $diffused --idealize --inplace --skip_mpnn --skip_mpnn_score >/dev/null
+    }
+
+    # Align diffused output to original input PDB
+    [[ -n $inpdb ]] && {
+        if [[ -z $fixedres && -z $fixbbres ]] ; then
+            local pf_fixed=$(awk '$1=="ATOM" && !a[$5$6]++ {print $5$6}' $inpdb | paste -sd ' ')
+            local pf_contigs=$(gen_contigs $pf_fixed --inpdb $inpdb --ss_to_contigs)
+            local restab=$(get_newres "$pf_contigs" $pf_fixed)
+        else
+            local restab=$(get_newres "$contigs" $fixedres)
+        fi
+        local orires_list=$(echo "$restab" | cut -d: -f1 | paste -sd ' ')
+        
+        # Write pair fit string
+        local fit_str=$(echo "$restab" | awk -F ':' '
+            {
+                ch[NR][1] = ri[NR][1] = $1
+                ch[NR][2] = ri[NR][2] = $2
+                sub(/[^A-Z]+$/, "", ch[NR][1])
+                sub(/[^A-Z]+$/, "", ch[NR][2])
+                sub(/^[^0-9]+/, "", ri[NR][1])
+                sub(/^[^0-9]+/, "", ri[NR][2])
+            }
+            END {
+                for (i=1; i<=NR; i++) {
+                    for (j=i; j<=NR; j++) {
+                        if (ch[j+1][1] != ch[j][1] || ch[j+1][2] != ch[j][2]) break
+                        if (ri[j+1][1]-ri[j][1] != 1 || ri[j+1][2]-ri[j][2] != 1) break
+                    }
+                    
+                    printf "!/diffused//%s/%s-%s/N+CA+C!,", ch[i][2], ri[i][2], ri[j][2]
+                    printf "!/inpdb//%s/%s-%s/N+CA+C!\n",  ch[i][1], ri[i][1], ri[j][1]
+                    i=j
+                }
+            }
+        ' | sed "s/!/'/g" | paste -sd ',')
+
+        # Add ligand
+        local ligstr=${ligname[*]}
+        [[ -n $ligname ]] && local add_ligand="or (inpdb and resn ${ligstr// /+})"
+
+        # Pair fit
+        sed -E 's/^ {12}//' << EOF | python
+            import glob
+            from pymol import cmd
+            diffused = '$diffused'
+            cmd.load('$inpdb', 'inpdb')
+            cmd.load(diffused, 'diffused')
+            pf = cmd.pair_fit($fit_str)
+            cmd.create('obj01', 'diffused $add_ligand')
+            cmd.save(diffused, 'obj01')
+            cmd.delete('diffused')
+            cmd.delete('obj01')
+            with open(diffused, 'a') as f:
+                f.write(f'\npf_rmsd {pf:.4f}')
+EOF
+
+        grep -h '^pf_rmsd ' $diffused || {
+            echo "Pair fitting failed... Maybe due to input PDB format?"
+            exit
+        }
+    }
+    
+    # Get fixed residues for scafscore
+    local scafscore_opts=()
+    if [[ -n $ligname ]] ; then
+        local scafscore_opts+=("--resn ${ligname[@]}")
+    elif [[ -n $ppi_hotspots ]] ; then
+        local hspots=$(get_newres "$contigs" | cut -d: -f2 | paste -sd ' ')
+        local scafscore_opts+=("--chri $hspots")
+    elif [[ -n $fixedres ]] ; then
+        local fixednew=$(get_newres "$contigs" $fixedres | cut -d: -f2 | paste -sd ' ')
+        local scafscore_opts+=("--chri $fixednew")
+    fi
+
+    # Calculate scafscore
+    local diffused=($step1/Diffused_*.pdb)
+    calc_perc_loop $diffused
+    calc_scafscore $diffused ${scafscore_opts[@]}
+
+    # Automatically calculate clash_cut
+    [[ -n $ligname ]] && {
+        if [[ -z $clash_cut ]] ; then
+            local clash_cut_true=$(awk '
+                $1=="HETATM" && $NF!="H" { n++ } END { m = int(n/2) ? int(n/2) : 1 ; print m }
+            ' $diffused)
+            echo "Using --clash_cut $clash_cut_true (half of all non-hydrogen ligand atoms)"
+        else
+            local clash_cut_true="$clash_cut"
+            echo "Using --clash_cut $clash_cut_true"
+        fi
+    }
+
+    # Filter out
+    local perc_loop=$(awk '$1=="perc_loop"{print$2}' $diffused)
+    local rog_ala=$(awk '$1=="rog_ala"{print$2}' $diffused)
+    [[ -n $ligname ]] && local clash=$(awk '$1=="clash"{print$2}' $diffused)
+    if [[ $(echo "$rog_ala > $rog_cut" | bc) == 1 ]] ; then
+        echo "Failed rog_ala cutoff of $rog_cut"
+        rm $diffused && return
+    elif [[ $(echo "$perc_loop > $loop_cut" | bc) == 1 ]] ; then
+        echo "Failed perc_loop cutoff of $loop_cut"
+        rm $diffused && return
+    elif [[ -n $ligname && $(echo "$clash > $clash_cut_true" | bc) == 1 ]] ; then
+        echo "Failed clash cutoff of $clash_cut_true"
+        rm $diffused && return
+    fi
+    
+    local diffused=($step1/Diffused_*.pdb)
+    [[ -s "$diffused" ]] || {
+        echo "No scaffolds passed filters. Exiting." && return
+    }
+    
+    # Prepare MPNN options ; add --repack, and remove all stdev except CA
+    local mpnn_opts=(${all_opts[*]} "--repack")
+    local mpnn_opts=($(
+        sed 's/--/\n--/g' <<< "${mpnn_opts[@]}" |
+        grep -v -E "^(--idealize|--fix_stdev|--fix_ca_stdev|--lig_stdev|--ap_stdev|--cstfile)( |$)"
+    ))
+
+    # Add flags if --skip_... was not used
+    [[ $skip_relax != 1 ]] && {
+        local mpnn_opts+=(--relax)
+        echo "Added --relax ; use the option --skip_relax to turn this off."
+    }
+    [[ $no_ca_csts != 1 && -n $ca_stdev ]] && {
+        local mpnn_opts+=(--ca_stdev $ca_stdev)
+        echo "Added --ca_stdev $ca_stdev ; use the option --no_ca_csts to turn this off."
+    }
+
+    # Generate cstfile
+    local tmpcst="$tmpdir/constraints.cst" ; echo -n > $tmpcst
+
+    [[ -n $cstfile ]] && cat $cstfile >> $tmpcst
+
+    if [[ -n $inpdb && -n $fixedres && -n $fix_stdev ]] ; then
+        gen_coord_csts $inpdb --chri $fixedres --crd_stdev $fix_stdev >> $tmpcst
+        echo "Generated coordinate constraints for $fixedres"
+    elif [[ -n $inpdb && -n $fixedres && -n $fix_ca_stdev ]] ; then
+        gen_coord_csts $inpdb \
+            --chri $fixedres \
+            --name CA \
+            --crd_stdev $fix_ca_stdev >> $tmpcst
+        echo "Generated CA coordinate constraints for $fixedres"
+    fi  
+
+    [[ -n $inpdb && -n $ligname && -n $lig_stdev ]] && {
+        gen_coord_csts $inpdb --resn ${ligname[*]} --crd_stdev $lig_stdev >> $tmpcst
+        echo "Generated coordinate constraints for ${ligname[*]}"
+    }
+
+    [[ -n $inpdb && -n $fixedres && -n $ligname && -n $ap_stdev ]] && {
+        local ligchri=$(
+            awk -v ligname="${ligname[*]}" '
+                BEGIN {
+                    n = split(ligname, a, " ")
+                    for (i=1; i<=n; i++) lig_key[a[i]] = 1
+                }
+                $4 in lig_key { print $5 $6 }
+            ' $inpdb | sort -u | paste -sd ' '
+        )
+        gen_atompair_csts $inpdb \
+            --anchors $ligchri   \
+            --targets $fixedres  \
+            --ap_stdev $ap_stdev >> $tmpcst
+        echo "Generated atompair constraints between ${ligname[*]} and $fixedres"
+    }
+
+    # Deprioritize old constraints
+    [[ -n $oldcsts ]] && {
+        echo "Adding old constraints found in input PDB: $(wc -l <<< "$oldcsts") constraints"
+        echo "$oldcsts" >> $tmpcst
+    }
+    
+    # Update cstfile with new residue numbering
+    [[ -s $tmpcst ]] && {
+
+        # Remove additional constraints applied to the same atom or atompair
+        awk -i inplace '
+            $1=="CoordinateConstraint" && crd[$3][$2]++ { next }
+            $1=="AtomPair" && atm[$3][$2][$5][$4]++ {
+                atm[$5][$4][$3][$2]++ ; next
+            }
+            $1=="AtomPair" && atm[$5][$4][$3][$2]++ {
+                atm[$3][$2][$5][$4]++ ; next
+            }
+            { print }
+        ' $tmpcst
+
+        echo "Updating cstfile with new residue numbering"
+        local garr=$(get_newres "$contigs" $fixedres | awk -F ':' -v dq='"' '{
+            ch1 = substr($1,1,1) ; ch2 = substr($2,1,1)
+            sub(/^[A-Z]/,"",$1)  ; sub(/^[A-Z]/,"",$2)
+            printf "a[%s]=%s\n", dq $1 ch1 dq, dq $2 ch2 dq
+        }' | paste -sd ';')
+    
+        awk -i inplace '
+            BEGIN{'"$garr"'}
+            $1=="CoordinateConstraint" { $3 = a[$3]!="" ? a[$3] : $3 }
+            $1=="AtomPair" { $3 = a[$3]!="" ? a[$3] : $3 ; $5 = a[$5]!="" ? a[$5] : $5 }
+            { print }
+        ' $tmpcst
+        
+        echo "Adding a total of $(wc -l < $tmpcst) constraints as a cstfile..."
+        local mpnn_opts=("--cstfile $tmpcst" ${mpnn_opts[@]})
+    }
+
+    # Update fixedres
+    [[ -n $fixedres ]] && {
+        local fixednew=$(get_newres "$contigs" $fixedres | cut -d: -f2 | paste -sd ' ')
+        local mpnn_opts=("--fixedres $fixednew" ${mpnn_opts[@]})
+        echo "Updated fixed residues with new residue numbering: $fixednew"
+    }
+
+    # Update hotspot residues
+    [[ -n $ppi_hotspots ]] && {
+        local ppi_hotspots_new=$(get_newres "$contigs" $ppi_hotspots | cut -d: -f2 | paste -sd ' ')
+        echo "Updated hotspot residues with new residue numbering: $ppi_hotspots_new"
+    }
+    
+    # Update biasjson and omitjson
+    [[ -n $biasjson ]] && {
+        echo "Updating biasjson with new residue numbering"
+        local nres_array=$(get_newres_awk_array "$contigs")
+        local jsonstr=$(
+            jq '.' $biasjson |
+            awk '
+                BEGIN { '"$nres_array"' }
+                $1~/[A-Z][0-9]/ {
+                    chri = $1 ; gsub(/[^A-Z0-9]/, "", chri)
+                    if (chri in nres) sub(chri, nres[chri], $0)
+                } 1
+            '
+        )
+        local biasjson="$tmpdir/bias.json"
+        echo "$jsonstr" > $biasjson
+        local mpnn_opts=("--biasjson $biasjson" ${mpnn_opts[@]})
+    }
+    [[ -n $omitjson ]] && {
+        echo "Updating omitjson with new residue numbering"
+        local nres_array=$(get_newres_awk_array "$contigs")
+        local jsonstr=$(
+            jq '.' $omitjson |
+            awk '
+                BEGIN { '"$nres_array"' }
+                $1~/[A-Z][0-9]/ {
+                    chri = $1 ; gsub(/[^A-Z0-9]/, "", chri)
+                    if (chri in nres) sub(chri, nres[chri], $0)
+                } 1
+            '
+        )
+        local omitjson="$tmpdir/omit.json"
+        echo "$jsonstr" > $omitjson
+        local mpnn_opts=("--omitjson $omitjson" ${mpnn_opts[@]})
+    }
+
+    # Add native biasjson
+    [[ -n $natbias && -z $biasjson ]] && {
+        echo "Adding biasjson with new residue numbering"
+        local biasjson="$tmpdir/natbias.json"
+        local newres=$(get_newres "$contigs" | cut -d: -f2 | paste -sd ' ')
+        gen_natbiasjson ${diffused[0]} \
+            --focus_set $newres \
+            --global_weight $natbias > $biasjson
+        local mpnn_opts=("--biasjson $biasjson" ${mpnn_opts[@]})
+    }
+    
+    # Run MPNN-FastRelax
+    local step2="$tmpdir/step2" ; mkdir -p $step2
+    local i
+    for i in $(seq 1 $design_cycles) ; do
+
+        # Run MPNN-Rosetta
+        mpros $diffused --batch_size 1 --outdir $step2 ${mpnn_opts[@]}
+        local design="$step2/$(basename ${diffused%.*})_0001.pdb"
+        [[ -s $design ]] || continue
+    
+        # Append constraints
+        local bn=$(basename ${design%.*})
+        [[ -s $tmpcst && $(grep '^#END_POSE_ENERGIES_TABLE' $design | wc -l) != 0 ]] && {
+            local blockfile="$tmpdir/block.txt"
+            sed 's/^/#CST /' $tmpcst > $blockfile
+            sed -i "/^#END_POSE_ENERGIES_TABLE/r $blockfile" $design
+            calc_cst_rmsd $design --append ; grep -h '^cst_rmsd ' $design
+        }
+
+        # Append metadata
+        if [[ -n $oldcontigs ]] ; then
+            local contigs_f=$(update_contigs --oldcontigs $oldcontigs --newcontigs $contigs)
+        else
+            local contigs_f="$contigs"
+        fi
+        echo "contigs $contigs_f" | tee -a $design
+        [[ -n $inpdb ]] && echo "inpdb $(basename ${inpdb%.*})" | tee -a $design
+        [[ -n $fixednew ]] && echo "fixedres $fixednew" | tee -a $design
+        [[ -n $ppi_hotspots_new ]] && echo "ppi_hotspots $ppi_hotspots_new" | tee -a $design
+        [[ -n $ligname ]] && echo "ligname ${ligname[*]}" | tee -a $design
+        [[ -n $cyclize_chain ]] && echo "cyclize_chain $cyclize_chain" | tee -a $design
+
+        # Calculate default metrics
+        calc_perc_loop $design $fixednew
+        calc_scafscore $design ${scafscore_opts[@]}
+
+        # Calculate additional metrics
+        [[ -n $addmets ]] && {
+            local bn_addmet
+            for bn_addmet in $addmets ; do
+                local metscript="$pixiroot/box/addmets/$bn_addmet"
+                [[ -x "$metscript" ]] && {
+                    echo "Running $(basename $metscript) on $(basename $design)..."
+                    local metout=$($metscript $design)
+                    [[ $(echo $metout | wc -w) == 0 ]] && continue
+                    local mets=$(echo "$metout" | awk '{print$1}' | paste -sd ' ')
+                    awk -i inplace '$1!~/^('"${mets// /|}"')$/' $design
+                    echo "$metout" | tee -a $design
+                }
+            done
+        }
+
+        # Check for selection metric
+        local metpass="0"
+        echo "Processing the option: --select_met $select_met"
+        local metarr=($(sed 's/[:|=]/ /g' <<< $select_met))  # (min/max/val metname ideal_val)
+        if [[ ! ${metarr[0]} =~ ^(min|max|val)$ ]] ; then
+            echo "WARNING: Could not parse selection logic! Refer to format in --help."
+        elif [[ ${metarr[0]} == val && -z ${metarr[2]} ]] ; then
+            echo "WARNING: Selection logic 'val' was invoked without an ideal value. Refer to format in --help."
+        elif [[ -z ${metarr[1]} ]] ; then
+            echo "WARNING: No metric detected! Refer to format in --help."
+        elif ! grep "^${metarr[1]} " $design &>/dev/null ; then
+            echo "WARNING: Could not find the metric ${metarr[1]} in $design"
+            echo "List of available metrics:"
+            awk '$1~/^[a-z]/ && $2==$2+0 {print$1}' $design
+        else
+            echo "Found the metric ${metarr[1]}" in $design.
+            local metpass="1"
+        fi
+        [[ $metpass == 0 ]] && {
+            echo "Defaulting to --select_met min:fin_reu"
+            local select_met="min:fin_reu"
+        }
+
+        # Store best design
+        if [[ $i == 1 ]] ; then
+            local topdes=$(cat $design)
+            mv $design $diffused
+        else
+            echo "Accepting/rejecting designs using --select_met ${select_met}"
+            local orimet=$(echo "$topdes" | awk -v met=${metarr[1]} '$1==met{print$2}')
+            local finmet=$(awk -v met=${metarr[1]} '$1==met{print$2}' $design)
+            echo "${metarr[1]} $orimet => $finmet"
+            if [[ ${metarr[0]} == "min" ]] ; then
+                echo "Selecting for lower values of ${metarr[1]}"
+                if [[ $(echo "$finmet < $orimet" | bc) == 1 ]] ; then
+                    echo "Score improved. Accepting new design."
+                    local topdes=$(cat $design)
+                    mv $design $diffused
+                else
+                    echo "Score worsened. Rejecting new design."
+                fi
+            elif [[ ${metarr[0]} == "max" ]] ; then
+                echo "Selecting for higher values of ${metarr[1]}"
+                if [[ $(echo "$finmet > $orimet" | bc) == 1 ]] ; then
+                    echo "Score improved. Accepting new design."
+                    local topdes=$(cat $design)
+                    mv $design $diffused
+                else
+                    echo "Score worsened. Rejecting new design."
+                fi
+            elif [[ ${metarr[0]} == "val" ]] ; then
+                echo "Selecting for values of ${metarr[1]} closest to ${metarr[2]}"
+                local oridiff=$(awk "BEGIN{print ($orimet) - (${metarr[2]}) }" | sed 's/^-//')
+                local findiff=$(awk "BEGIN{print ($finmet) - (${metarr[2]}) }" | sed 's/^-//')
+                echo "diff ${metarr[1]} $oridiff => $findiff"
+                if [[ $(echo "$findiff < $oridiff" | bc) == 1 ]] ; then
+                    echo "Score improved. Accepting new design."
+                    local topdes=$(cat $design)
+                    mv $design $diffused
+                else
+                    echo "Score worsened. Rejecting new design."
+                fi
+            else
+                echo "Something went wrong... Because John sucks at coding. Rejecting new design."
+            fi
+        fi
+    done
+    echo "$topdes" > $design
+    grep "^ATOM" $design >/dev/null && cp $design ${outprefix}.pdb
+}
+# <<< rfd_chain () <<< }}}
+
+# Generate ids
+if [[ $randsuffix == 1 ]] ; then
+    i=$(awk "BEGIN{print(($numdes + 1) * 6)}")
+    id=($(tr -cd 'a-z' </dev/urandom 2>/dev/null | head -c ${i} | fold -w 6))
+else
+    id=($(seq -w 0 9999))
+fi
+
+# Loop through main function
+i=1
+while [[ $i -le $numdes ]] ; do
+
+    # If output file already exists, skip to next round
+    [[ -s ${outprefix}_${id[i]}.pdb ]] && {
+        echo "${outprefix}_${id[i]}.pdb already exists, skipping..."
+        ((i++)) ; continue
+    }
+
+    # Check for input directory
+    [[ -n $indir ]] && {
+        echo "Input directory (--indir) was specified."
+        inpdb=$(shuf -e -n1 ${indir%/}/*.pdb)
+        if [[ -z $inpdb ]] ; then
+            echo "No PDBs detected in input directory." && break
+        else
+            echo "Random pull as input PDB: $inpdb"
+        fi
+    }
+
+    # Run rfd_chain function
+    rfd_chain "$contigs" "${outprefix}_${id[i]}" ; rm -r $tmpdir/*
+
+    # Check outputs
+    if [[ -s ${outprefix}_${id[i]}.pdb ]] ; then
+        echo "${outprefix}_${id[i]}.pdb was generated successfully." && ((i++))
+    else
+        echo "${outprefix}_${id[i]}.pdb failed to generate."
+        [[ $persistent == 1 ]] || ((i++))
+    fi
+done
+
+runtime=($(awk "BEGIN{print($SECONDS/60,$SECONDS/60/$numdes)}"))
+echo "Total runtime for $numdes designs: $runtime minutes"
+echo "Total runtime per design: ${runtime[1]} minutes"

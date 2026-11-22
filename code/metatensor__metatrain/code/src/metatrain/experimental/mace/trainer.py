@@ -1,0 +1,914 @@
+import argparse
+import copy
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Union, cast
+
+import torch
+from mace.tools.scripts_utils import (
+    LRScheduler,
+    get_optimizer,
+    get_params_options,
+)
+from torch.utils.data import DistributedSampler
+
+from metatrain.composition import CompositionModel, train_or_load_composition_model
+from metatrain.scaler import Scaler, train_or_load_scaler
+from metatrain.utils.abc import (
+    TrainerInterface,
+    common_upgrade_checkpoint,
+)
+from metatrain.utils.additive import get_remove_additive_transform
+from metatrain.utils.architectures import get_default_hypers
+from metatrain.utils.data import (
+    CollateFn,
+    CombinedDataLoader,
+    Dataset,
+    DatasetInfo,
+    build_train_dataloaders,
+    build_val_dataloaders,
+    get_num_workers,
+    unpack_batch,
+    validate_num_workers,
+)
+from metatrain.utils.data.atomic_basis_helpers import (
+    densify_atomic_basis_dataset_info,
+    get_prepare_atomic_basis_targets_transform,
+)
+from metatrain.utils.distributed.distributed_data_parallel import (
+    DistributedDataParallel,
+)
+from metatrain.utils.distributed.slurm import (
+    initialize_slurm_nccl_process_group,
+    resolve_distributed,
+)
+from metatrain.utils.evaluate_model import evaluate_model
+from metatrain.utils.extenders.helpers import restart_extenders
+from metatrain.utils.io import check_file_extension
+from metatrain.utils.logging import ROOT_LOGGER, MetricLogger
+from metatrain.utils.loss import LossAggregator, LossSpecification
+from metatrain.utils.metrics import MAEAccumulator, RMSEAccumulator, get_selected_metric
+from metatrain.utils.neighbor_lists import (
+    get_requested_neighbor_lists,
+    get_system_with_neighbor_lists_transform,
+)
+from metatrain.utils.per_atom import average_by_num_atoms
+from metatrain.utils.scaler import get_remove_scale_transform
+from metatrain.utils.transfer import batch_to
+from metatrain.utils.wrapper import MetatrainModel
+
+from . import checkpoints
+from .documentation import ModelHypers, TrainerHypers
+from .model import MetaMACE
+from .modules.finetuning import apply_finetuning_strategy
+
+
+def get_optimizer_and_scheduler(
+    trainer_hypers: TrainerHypers,
+    model: MetatrainModel[MetaMACE, Scaler],
+    has_new_targets: bool,
+    optimizer_state_dict: Optional[dict[str, Any]] = None,
+    scheduler_state_dict: Optional[dict[str, Any]] = None,
+    is_distributed: bool = False,
+) -> tuple[torch.optim.Optimizer, LRScheduler]:
+    """Initialize the optimizer and scheduler as implemented in MACE.
+
+    It just uses the functions from mace.tools.scripts_utils to create them.
+
+    :param trainer_hypers: The trainer hyperparameters as provided in metatrain.yaml
+    :param model: The MetaMACE model to optimize.
+    :param has_new_targets: Whether the model has new targets compared to the previous
+        training session.
+    :param optimizer_state_dict: The state dict of the optimizer to resume from, if any.
+    :param scheduler_state_dict: The state dict of the scheduler to resume from, if any.
+    :param is_distributed: Whether the training is distributed over GPUs or not.
+
+    :return: A tuple with the optimizer and the scheduler.
+    """
+    opt_args = argparse.Namespace(
+        lr=trainer_hypers["learning_rate"],
+        weight_decay=trainer_hypers["weight_decay"],
+        amsgrad=trainer_hypers["amsgrad"],
+        beta=trainer_hypers["beta"],
+        optimizer=trainer_hypers["optimizer"],
+        scheduler=trainer_hypers["lr_scheduler"],
+        lr_scheduler_gamma=trainer_hypers["lr_scheduler_gamma"],
+        lr_factor=trainer_hypers["lr_factor"],
+        scheduler_patience=trainer_hypers["lr_scheduler_patience"],
+    )
+
+    # Take into account distributed training
+    model = model.module if is_distributed else model
+
+    opt_options = get_params_options(opt_args, model.core.mace_model)
+
+    # Add the heads' parameters to the optimizer.
+    # Get them for all heads except the wrapper for the internal MACE head
+    head_parameters = []
+    for k, v in model.core.heads.items():
+        if k != model.core.hypers["mace_head_target"]:
+            head_parameters.extend(v.parameters())
+
+    opt_options["params"].append(
+        {
+            "name": "heads",
+            "params": head_parameters,
+        }
+    )
+
+    if len(model.extenders) > 0:
+        opt_options["params"].append(
+            {
+                "name": "extenders",
+                "params": model.extenders.parameters(),
+            }
+        )
+
+    optimizer = get_optimizer(opt_args, opt_options)
+
+    is_finetune = "finetune" in trainer_hypers
+
+    if optimizer_state_dict is not None and not is_finetune:
+        # try to load the optimizer state dict, but this is only possible
+        # if there are no new targets in the model (new parameters)
+        if not has_new_targets:
+            optimizer.load_state_dict(optimizer_state_dict)
+
+    scheduler = LRScheduler(optimizer, opt_args)
+
+    if scheduler_state_dict is not None and not is_finetune:
+        # same as the optimizer, try to load the scheduler state dict
+        if not has_new_targets:
+            scheduler.load_state_dict(scheduler_state_dict)
+
+    return optimizer, scheduler
+
+
+class Trainer(TrainerInterface[TrainerHypers, ModelHypers]):
+    __checkpoint_version__ = 5
+
+    def __init__(self, hypers: TrainerHypers) -> None:
+        super().__init__(hypers)
+
+        self.optimizer_state_dict: Optional[Dict[str, Any]] = None
+        self.scheduler_state_dict: Optional[Dict[str, Any]] = None
+        self.epoch: Optional[int] = None
+        self.best_epoch: Optional[int] = None
+        self.best_metric: Optional[float] = None
+        self.best_model_state_dict: Optional[Dict[str, Any]] = None
+        self.best_optimizer_state_dict: Optional[Dict[str, Any]] = None
+        self.has_new_targets: bool = False
+
+    def setup(
+        self, model_hypers: ModelHypers, dataset_info: DatasetInfo
+    ) -> MetatrainModel[MetaMACE]:
+        dense_dataset_info = densify_atomic_basis_dataset_info(dataset_info)
+
+        from metatrain.utils.extenders import setup_extenders
+
+        extenders, model_targets = setup_extenders(
+            dense_dataset_info, self.hypers["extenders"]
+        )
+
+        core_dataset_info = DatasetInfo(
+            length_unit=dense_dataset_info.length_unit,
+            atomic_types=dense_dataset_info.atomic_types,
+            targets=model_targets,
+            extra_data=dense_dataset_info.extra_data,
+        )
+
+        model = MetaMACE(hypers=model_hypers, dataset_info=core_dataset_info)
+
+        # If a MACE model has been loaded from a checkpoint, the atomic types
+        # that it supports have been loaded from the checkpoint. So get back
+        # the dataset info from the model.
+        core_dataset_info = model.dataset_info
+        # Also update the atomic types for the wrapper
+        dataset_info = DatasetInfo(
+            length_unit=dataset_info.length_unit,
+            atomic_types=core_dataset_info.atomic_types,
+            targets=dataset_info.targets,
+            extra_data=dataset_info.extra_data,
+        )
+
+        dense_dataset_info = DatasetInfo(
+            length_unit=dense_dataset_info.length_unit,
+            atomic_types=core_dataset_info.atomic_types,
+            targets=dense_dataset_info.targets,
+            extra_data=dense_dataset_info.extra_data,
+        )
+
+        # Set up additive models
+        composition_model = CompositionModel.from_valid_targets(
+            dense_dataset_info, dense_dataset_info.atomic_types
+        )
+        additive_models = [composition_model]
+
+        # Initialize scaler
+        scaler_hypers = get_default_hypers("scaler")["model"]
+        scaler = Scaler.from_valid_targets(
+            hypers=scaler_hypers,
+            dataset_info=dense_dataset_info,
+        )
+
+        return MetatrainModel(
+            core=model,
+            additive_models=additive_models,
+            scaler=scaler,
+            dataset_info=dataset_info,
+            extenders=extenders,
+        )
+
+    def restart(
+        self,
+        model: MetatrainModel[MetaMACE],
+        dataset_info: DatasetInfo,
+        model_hypers: ModelHypers,
+    ) -> MetatrainModel[MetaMACE]:
+
+        # -------------------------------------------------
+        #        Find out what are the new targets
+        # --------------------------------------------------
+        merged_info = model.dataset_info.union(dataset_info)
+        new_targets = {
+            key: value
+            for key, value in merged_info.targets.items()
+            if key not in model.dataset_info.targets
+        }
+        self.has_new_targets = len(new_targets) > 0
+
+        # ------------------------------------------------------
+        #  Ask the models to restart with the new dataset info
+        # -------------------------------------------------------
+        dense_dataset_info = densify_atomic_basis_dataset_info(dataset_info)
+
+        if self.has_new_targets:
+            # Only re-run the extender setup when the targets changed;
+            # ``restart_extenders`` does not support rebuilding
+            # already-instantiated extenders.
+            extenders, model_outs, new_extenders_hypers = restart_extenders(
+                list(model.extenders),
+                dense_dataset_info,
+                self.hypers["extenders"],
+            )
+            self.hypers["extenders"] = new_extenders_hypers
+
+            model.extenders = torch.nn.ModuleList(extenders)
+            core_dataset_info = DatasetInfo(
+                length_unit=dense_dataset_info.length_unit,
+                atomic_types=dense_dataset_info.atomic_types,
+                targets=model_outs,
+                extra_data=dense_dataset_info.extra_data,
+            )
+        else:
+            core_dataset_info = DatasetInfo(
+                length_unit=dense_dataset_info.length_unit,
+                atomic_types=dense_dataset_info.atomic_types,
+                targets=model.core.dataset_info.targets,
+                extra_data=dense_dataset_info.extra_data,
+            )
+
+        comp_model_info = DatasetInfo(
+            length_unit=dense_dataset_info.length_unit,
+            atomic_types=dense_dataset_info.atomic_types,
+            targets={
+                target_name: target_info
+                for target_name, target_info in dense_dataset_info.targets.items()
+                if model.additive_models[0].is_valid_target(target_name, target_info)
+            },
+        )
+
+        scaler_info = DatasetInfo(
+            length_unit=dense_dataset_info.length_unit,
+            atomic_types=dense_dataset_info.atomic_types,
+            targets={
+                target_name: target_info
+                for target_name, target_info in dense_dataset_info.targets.items()
+                if Scaler.is_valid_target(target_name, target_info)
+            },
+            extra_data=dense_dataset_info.extra_data,
+        )
+
+        model.restart(
+            dataset_info,
+            core_dataset_info,
+            additive_models_dataset_info=[comp_model_info]
+            + [dense_dataset_info] * (len(model.additive_models) - 1),
+            scaler_dataset_info=scaler_info,
+            model_hypers=model_hypers,
+        )
+
+        return model
+
+    def train(
+        self,
+        model: MetaMACE,
+        dtype: torch.dtype,
+        devices: List[torch.device],
+        train_datasets: List[Union[Dataset, torch.utils.data.Subset]],
+        val_datasets: List[Union[Dataset, torch.utils.data.Subset]],
+        checkpoint_dir: str,
+    ) -> None:
+        assert dtype in MetaMACE.__supported_dtypes__
+        assert isinstance(model, MetatrainModel)
+        mace_model = model.core
+        assert isinstance(mace_model, MetaMACE)
+
+        is_distributed = resolve_distributed(self.hypers.get("distributed"))
+        is_finetune = "finetune" in self.hypers
+
+        if is_distributed:
+            if len(devices) > 1:
+                raise ValueError(
+                    "Requested distributed training with the `multi-gpu` device. "
+                    " If you want to run distributed training with MetaMACE, please "
+                    "set `device` to cuda."
+                )
+            # the calculation of the device number works both when GPUs on different
+            # processes are not visible to each other and when they are
+            device, world_size, rank = initialize_slurm_nccl_process_group(
+                self.hypers["distributed_port"]
+            )
+        else:
+            rank = 0
+            world_size = 1
+            device = devices[0]
+            # only one device, as we don't support non-distributed multi-gpu for now
+
+        if is_distributed:
+            logging.info(f"Training on {world_size} devices with dtype {dtype}")
+        else:
+            logging.info(f"Training on device {device} with dtype {dtype}")
+
+        # Apply fine-tuning strategy if provided
+        if is_finetune:
+            model = apply_finetuning_strategy(model, self.hypers["finetune"])
+            method = self.hypers["finetune"]["method"]
+            num_params = sum(p.numel() for p in model.parameters())
+            num_trainable_params = sum(
+                p.numel() for p in model.parameters() if p.requires_grad
+            )
+
+            logging.info(f"Applied finetuning strategy: {method}")
+            logging.info(
+                f"Number of trainable parameters: {num_trainable_params} "
+                f"[{num_trainable_params / num_params:.2%} %]"
+            )
+
+        # Set up transformations
+        dataset_info = model.dataset_info
+        train_targets = dataset_info.targets
+        requested_neighbor_lists = get_requested_neighbor_lists(model)
+        atomic_basis_transform, atomic_basis_reverse_transform = (
+            get_prepare_atomic_basis_targets_transform(
+                model.dataset_info,
+                model.internal_dataset_info(),
+            )
+        )
+
+        atomic_baseline = self.hypers["atomic_baseline"]
+        if isinstance(atomic_baseline, str):
+            if mace_model.get_fixed_composition_weights():
+                raise ValueError(
+                    "The loaded MACE model provides its own atomic baselines, "
+                    "which cannot be combined with a composition model "
+                    "checkpoint passed as `atomic_baseline`. Use the dict form "
+                    "of `atomic_baseline` instead."
+                )
+        else:
+            atomic_baseline = {
+                **mace_model.get_fixed_composition_weights(),
+                **atomic_baseline,
+            }
+        train_or_load_composition_model(
+            composition_model=MetatrainModel(
+                core=model.additive_models[0],
+                additive_models=[],
+                scaler=None,
+                dataset_info=model.dataset_info,
+            ),
+            atomic_baseline=atomic_baseline,
+            train_datasets=train_datasets,
+            other_additive_models=list(model.additive_models[1:]),
+            device=device,
+            batch_size=self.hypers["batch_size"],
+            is_distributed=is_distributed,
+            checkpoint_dir=checkpoint_dir,
+        )
+        scaling_weights = self.hypers["fixed_scaling_weights"]
+        if isinstance(scaling_weights, str):
+            if mace_model.get_fixed_scaling_weights():
+                raise ValueError(
+                    "The loaded MACE model provides its own scaling weights, "
+                    "which cannot be combined with a scaler checkpoint passed as "
+                    "`fixed_scaling_weights`. Use the dict form of "
+                    "`fixed_scaling_weights` instead."
+                )
+        else:
+            scaling_weights = {
+                **mace_model.get_fixed_scaling_weights(),
+                **scaling_weights,
+            }
+
+        if self.hypers["scale_targets"]:
+            if isinstance(self.hypers["fixed_scaling_weights"], str) and not isinstance(
+                self.hypers["atomic_baseline"], str
+            ):
+                raise ValueError(
+                    "Can't use a checkpoint for the scaler without providing"
+                    "a checkpoint also for the composition model."
+                )
+            train_or_load_scaler(
+                scaler=MetatrainModel(
+                    core=model.scaler,
+                    additive_models=[],
+                    scaler=None,
+                    dataset_info=model.dataset_info,
+                ),
+                train_datasets=train_datasets,
+                additive_models=model.additive_models,
+                device=device,
+                batch_size=self.hypers["batch_size"],
+                is_distributed=is_distributed,
+                fixed_weights=scaling_weights,
+                per_structure_targets=self.hypers["per_structure_targets"],
+                checkpoint_dir=checkpoint_dir,
+            )
+
+        logging.info("Setting up data loaders")
+
+        if is_distributed:
+            train_samplers = [
+                DistributedSampler(
+                    train_dataset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=True,
+                    drop_last=True,
+                )
+                for train_dataset in train_datasets
+            ]
+            val_samplers = [
+                DistributedSampler(
+                    val_dataset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                    drop_last=False,
+                )
+                for val_dataset in val_datasets
+            ]
+        else:
+            train_samplers = [None] * len(train_datasets)
+            val_samplers = [None] * len(val_datasets)
+
+        # Extract additive models and scaler and move them to CPU/float64 so they
+        # can be used in the collate function.
+        additive_models = copy.deepcopy(model.additive_models).to(
+            dtype=torch.float64, device="cpu"
+        )
+        scaler = copy.deepcopy(model.scaler).to(dtype=torch.float64, device="cpu")
+
+        # Create a collate function:
+        collate_fn = CollateFn(
+            target_keys=list(train_targets.keys()),
+            callables=[
+                get_system_with_neighbor_lists_transform(requested_neighbor_lists),
+                atomic_basis_transform,
+                get_remove_additive_transform(additive_models, train_targets),
+                get_remove_scale_transform(scaler),
+            ],
+        )
+
+        # Now move the whole model (including the composition model and scaler,
+        # which were trained in float64 above) to the training device and dtype.
+        model.to(device=device, dtype=dtype)
+
+        if self.hypers["num_workers"] is None:
+            num_workers = get_num_workers()
+            logging.info(
+                "Number of workers for data-loading not provided and chosen "
+                f"automatically. Using {num_workers} workers."
+            )
+        else:
+            num_workers = self.hypers["num_workers"]
+            validate_num_workers(num_workers)
+
+        max_atoms = self.hypers["max_atoms_per_batch"]
+
+        # Create dataloader for the training datasets:
+        train_dataloaders, epoch_samplers = build_train_dataloaders(
+            train_datasets=train_datasets,
+            train_distributed_samplers=train_samplers,
+            collate_fn_train=collate_fn,
+            batch_size=self.hypers["batch_size"],
+            max_atoms_per_batch=max_atoms,
+            min_atoms_per_batch=self.hypers["min_atoms_per_batch"],
+            num_workers=num_workers,
+        )
+        train_dataloader = CombinedDataLoader(train_dataloaders, shuffle=True)
+
+        # Create dataloader for the validation datasets:
+        val_dataloaders = build_val_dataloaders(
+            val_datasets=val_datasets,
+            val_distributed_samplers=val_samplers,
+            collate_fn_val=collate_fn,
+            batch_size=self.hypers["batch_size"],
+            max_atoms_per_batch=max_atoms,
+            num_workers=num_workers,
+        )
+        val_dataloader = CombinedDataLoader(val_dataloaders, shuffle=False)
+
+        if is_distributed:
+            model = DistributedDataParallel(model, device_ids=[device])
+
+        outputs_list = []
+        for target_name, target_info in train_targets.items():
+            outputs_list.append(target_name)
+            for gradient_name in target_info.gradients:
+                outputs_list.append(f"{target_name}_{gradient_name}_gradients")
+
+        # Create a loss function:
+        loss_hypers = cast(dict[str, LossSpecification], self.hypers["loss"])  # mypy
+        loss_fn = LossAggregator(
+            targets=train_targets,
+            config=loss_hypers,
+        )
+        logging.info("Using the following loss functions:")
+        for name, info in loss_fn.metadata.items():
+            logging.info(f"{name}:")
+            main = {k: v for k, v in info.items() if k != "gradients"}
+            logging.info(main)
+            if "gradients" not in info or len(info["gradients"]) == 0:
+                continue
+            logging.info("With gradients:")
+            for grad, ginfo in info["gradients"].items():
+                logging.info(f"\t{name}::{grad}: {ginfo}")
+
+        optimizer, lr_scheduler = get_optimizer_and_scheduler(
+            self.hypers,
+            model,
+            self.has_new_targets,
+            self.optimizer_state_dict,
+            self.scheduler_state_dict,
+            is_distributed,
+        )
+
+        per_structure_targets = self.hypers["per_structure_targets"]
+
+        # Log the initial learning rate:
+        logging.info(f"Base learning rate: {self.hypers['learning_rate']}")
+
+        start_epoch = 0 if self.epoch is None else self.epoch + 1
+
+        # Train the model:
+        if self.best_metric is None:
+            self.best_metric = float("inf")
+        logging.info("Starting training")
+        epoch = start_epoch
+
+        for epoch in range(start_epoch, start_epoch + self.hypers["num_epochs"]):
+            for sampler in epoch_samplers:
+                sampler.set_epoch(epoch)
+            train_rmse_calculator = RMSEAccumulator(self.hypers["log_separate_blocks"])
+            val_rmse_calculator = RMSEAccumulator(self.hypers["log_separate_blocks"])
+            if self.hypers["log_mae"]:
+                train_mae_calculator = MAEAccumulator(
+                    self.hypers["log_separate_blocks"]
+                )
+                val_mae_calculator = MAEAccumulator(self.hypers["log_separate_blocks"])
+
+            train_loss = 0.0
+            for batch in train_dataloader:
+                optimizer.zero_grad()
+
+                systems, targets, extra_data = unpack_batch(batch)
+                systems, targets, extra_data = batch_to(
+                    systems, targets, extra_data, dtype=dtype, device=device
+                )
+                predictions = evaluate_model(
+                    model,
+                    systems,
+                    {key: train_targets[key] for key in targets.keys()},
+                    is_training=True,
+                )
+
+                # average by the number of atoms
+                predictions = average_by_num_atoms(
+                    predictions, systems, per_structure_targets
+                )
+                targets = average_by_num_atoms(targets, systems, per_structure_targets)
+
+                # Apply per-property scales to the predictions before loss computation.
+                # The targets from the dataloader have only been scaled per-target, and
+                # not per-property. This transformation only applies to targets with
+                # per-property scales (i.e. multiple blocks or multiple properties), and
+                # leaves the others unchanged.
+                predictions = (
+                    model.module if is_distributed else model
+                ).scaler.apply_scales(
+                    systems,
+                    predictions,
+                    remove=False,
+                    use_per_target_scales=False,  # never before loss
+                    use_per_property_scales=True,
+                )
+
+                train_loss_batch = loss_fn(predictions, targets, extra_data)
+
+                if is_distributed:
+                    # make sure all parameters contribute to the gradient calculation
+                    # to make torch DDP happy
+                    for param in model.parameters():
+                        train_loss_batch += 0.0 * param.sum()
+
+                train_loss_batch.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), self.hypers["grad_clip_norm"]
+                )
+                optimizer.step()
+
+                if is_distributed:
+                    # sum the loss over all processes
+                    torch.distributed.all_reduce(train_loss_batch)
+                train_loss += train_loss_batch.item()
+
+                # Reapply scales and accumulate quantities for computing train metrics,
+                # but only if this is an epoch to log
+                if epoch == start_epoch or epoch % self.hypers["log_interval"] == 0:
+                    scaled_predictions = (
+                        model.module if is_distributed else model
+                    ).scaler.apply_scales(
+                        systems,
+                        predictions,
+                        remove=False,
+                        use_per_target_scales=True,
+                        use_per_property_scales=False,
+                    )
+                    scaled_targets = (
+                        model.module if is_distributed else model
+                    ).scaler.apply_scales(
+                        systems,
+                        targets,
+                        remove=False,
+                        use_per_target_scales=True,
+                        use_per_property_scales=False,
+                    )
+
+                    if self.hypers["log_separate_blocks"]:
+                        # if any atomic basis outputs are present and metrics are to be
+                        # reported per-block, reverse the transform (i.e. sparsify)
+                        # before calculating metrics
+                        systems, scaled_targets, extra_data = (
+                            atomic_basis_reverse_transform(
+                                systems, scaled_targets, extra_data
+                            )
+                        )
+                        systems, scaled_predictions, _ = atomic_basis_reverse_transform(
+                            systems, scaled_predictions, {}
+                        )
+
+                    train_rmse_calculator.update(
+                        scaled_predictions, scaled_targets, extra_data
+                    )
+                    if self.hypers["log_mae"]:
+                        train_mae_calculator.update(
+                            scaled_predictions, scaled_targets, extra_data
+                        )
+
+            # Compute train metrics if they are to be logged this epoch:
+            if epoch == start_epoch or epoch % self.hypers["log_interval"] == 0:
+                finalized_train_info = train_rmse_calculator.finalize(
+                    not_per_atom=["positions_gradients"] + per_structure_targets,
+                    is_distributed=is_distributed,
+                    device=device,
+                )
+                if self.hypers["log_mae"]:
+                    finalized_train_info.update(
+                        train_mae_calculator.finalize(
+                            not_per_atom=["positions_gradients"]
+                            + per_structure_targets,
+                            is_distributed=is_distributed,
+                            device=device,
+                        )
+                    )
+
+            with torch.set_grad_enabled(
+                any(target_info.gradients for target_info in train_targets.values())
+            ):  # keep gradients on if any of the targets require them
+                val_loss = 0.0
+                for batch in val_dataloader:
+                    systems, targets, extra_data = unpack_batch(batch)
+                    systems, targets, extra_data = batch_to(
+                        systems, targets, extra_data, dtype=dtype, device=device
+                    )
+                    predictions = evaluate_model(
+                        model,
+                        systems,
+                        {key: train_targets[key] for key in targets.keys()},
+                        is_training=False,
+                    )
+
+                    # average by the number of atoms
+                    predictions = average_by_num_atoms(
+                        predictions, systems, per_structure_targets
+                    )
+                    targets = average_by_num_atoms(
+                        targets, systems, per_structure_targets
+                    )
+
+                    # Apply per-property scales to the predictions before loss
+                    # computation. The targets from the dataloader have only been scaled
+                    # per-target, and not per-property. This transformation only applies
+                    # to targets with per-property scales (i.e. multiple blocks or
+                    # multiple properties), and leaves the others unchanged.
+                    predictions = (
+                        model.module if is_distributed else model
+                    ).scaler.apply_scales(
+                        systems,
+                        predictions,
+                        remove=False,
+                        use_per_target_scales=False,
+                        use_per_property_scales=True,
+                    )
+
+                    val_loss_batch = loss_fn(predictions, targets, extra_data)
+
+                    if is_distributed:
+                        # sum the loss over all processes
+                        torch.distributed.all_reduce(val_loss_batch)
+                    val_loss += val_loss_batch.item()
+
+                    # Reapply scales and accumulate quantities for computing val
+                    # metrics. This is done for every epoch as validation metrics are
+                    # needed for model selection
+                    scaled_predictions = (
+                        model.module if is_distributed else model
+                    ).scaler.apply_scales(
+                        systems,
+                        predictions,
+                        remove=False,
+                        use_per_target_scales=True,
+                        use_per_property_scales=False,
+                    )
+                    scaled_targets = (
+                        model.module if is_distributed else model
+                    ).scaler.apply_scales(
+                        systems,
+                        targets,
+                        remove=False,
+                        use_per_target_scales=True,
+                        use_per_property_scales=False,
+                    )
+
+                    if self.hypers["log_separate_blocks"]:
+                        # if any atomic basis outputs are present and metrics are to be
+                        # reported per-block, reverse the transform (i.e. sparsify)
+                        # before calculating metrics
+                        systems, scaled_targets, extra_data = (
+                            atomic_basis_reverse_transform(
+                                systems, scaled_targets, extra_data
+                            )
+                        )
+                        systems, scaled_predictions, _ = atomic_basis_reverse_transform(
+                            systems, scaled_predictions, {}
+                        )
+
+                    val_rmse_calculator.update(
+                        scaled_predictions, scaled_targets, extra_data
+                    )
+                    if self.hypers["log_mae"]:
+                        val_mae_calculator.update(
+                            scaled_predictions, scaled_targets, extra_data
+                        )
+
+            lr_scheduler.step(metrics=val_loss)
+
+            # Compute val metrics:
+            finalized_val_info = val_rmse_calculator.finalize(
+                not_per_atom=["positions_gradients"] + per_structure_targets,
+                is_distributed=is_distributed,
+                device=device,
+            )
+            if self.hypers["log_mae"]:
+                finalized_val_info.update(
+                    val_mae_calculator.finalize(
+                        not_per_atom=["positions_gradients"] + per_structure_targets,
+                        is_distributed=is_distributed,
+                        device=device,
+                    )
+                )
+
+            # Now we log the information:
+            if epoch == start_epoch or epoch % self.hypers["log_interval"] == 0:
+                finalized_train_info = {
+                    "loss": train_loss,
+                    **finalized_train_info,
+                }
+            finalized_val_info = {
+                "loss": val_loss,
+                **finalized_val_info,
+            }
+
+            if epoch == start_epoch:
+                metric_logger = MetricLogger(
+                    log_obj=ROOT_LOGGER,
+                    dataset_info=(
+                        model.module if is_distributed else model
+                    ).dataset_info,
+                    initial_metrics=[finalized_train_info, finalized_val_info],
+                    names=["training", "validation"],
+                )
+            if epoch % self.hypers["log_interval"] == 0:
+                metric_logger.log(
+                    metrics=[finalized_train_info, finalized_val_info],
+                    epoch=epoch,
+                    rank=rank,
+                    learning_rate=optimizer.param_groups[0]["lr"],
+                )
+
+            val_metric = get_selected_metric(
+                finalized_val_info, self.hypers["best_model_metric"]
+            )
+            if val_metric < self.best_metric:
+                self.best_metric = val_metric
+                self.best_model_state_dict = copy.deepcopy(
+                    (model.module if is_distributed else model).state_dict()
+                )
+                self.best_epoch = epoch
+                self.best_optimizer_state_dict = copy.deepcopy(optimizer.state_dict())
+
+            if epoch % self.hypers["checkpoint_interval"] == 0:
+                if is_distributed:
+                    torch.distributed.barrier()
+                self.optimizer_state_dict = optimizer.state_dict()
+                self.scheduler_state_dict = lr_scheduler.state_dict()
+                self.epoch = epoch
+                if rank == 0:
+                    self.save_checkpoint(
+                        (model.module if is_distributed else model),
+                        Path(checkpoint_dir) / f"model_{epoch}.ckpt",
+                    )
+
+        # prepare for the checkpoint that will be saved outside the function
+        self.epoch = epoch
+        self.optimizer_state_dict = optimizer.state_dict()
+        self.scheduler_state_dict = lr_scheduler.state_dict()
+
+        if is_distributed:
+            torch.distributed.destroy_process_group()
+
+    def save_checkpoint(
+        self, model: MetatrainModel[MetaMACE], path: Union[str, Path]
+    ) -> None:
+        checkpoint = model.get_checkpoint(self.best_model_state_dict)
+        checkpoint["core"]["epoch"] = self.epoch
+        checkpoint["core"]["best_epoch"] = self.best_epoch
+        checkpoint.update(
+            {
+                "trainer_ckpt_version": self.__checkpoint_version__,
+                "train_hypers": self.hypers,
+                "epoch": self.epoch,
+                "optimizer_state_dict": self.optimizer_state_dict,
+                "scheduler_state_dict": self.scheduler_state_dict,
+                "best_epoch": self.best_epoch,
+                "best_metric": self.best_metric,
+                "best_optimizer_state_dict": self.best_optimizer_state_dict,
+            }
+        )
+        torch.save(
+            checkpoint,
+            check_file_extension(path, ".ckpt"),
+        )
+
+    @classmethod
+    def load_checkpoint(
+        cls,
+        checkpoint: Dict[str, Any],
+        hypers: TrainerHypers,
+        context: Literal["restart", "finetune"],
+    ) -> "Trainer":
+        trainer = cls(hypers)
+        trainer.optimizer_state_dict = checkpoint["optimizer_state_dict"]
+        trainer.scheduler_state_dict = checkpoint["scheduler_state_dict"]
+        if context == "restart":
+            trainer.epoch = checkpoint["epoch"]
+        else:
+            assert context == "finetune"
+            trainer.epoch = None  # interpreted as zero in the training loop
+        trainer.best_epoch = checkpoint["best_epoch"]
+        trainer.best_metric = checkpoint["best_metric"]
+        trainer.best_model_state_dict = MetatrainModel.get_state_dict_from_checkpoint(
+            checkpoint, "best_model_state_dict"
+        )
+        trainer.best_optimizer_state_dict = checkpoint["best_optimizer_state_dict"]
+
+        return trainer
+
+    @classmethod
+    def upgrade_checkpoint(
+        cls, checkpoint: dict[str, Any], version: Optional[int] = None
+    ) -> dict[str, Any]:
+        return common_upgrade_checkpoint(
+            checkpoint, version, cls.__checkpoint_version__, "trainer", checkpoints
+        )

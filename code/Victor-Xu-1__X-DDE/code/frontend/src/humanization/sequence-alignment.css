@@ -1,0 +1,74 @@
+.sequence-alignment {
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: var(--surface);
+  min-width: 0;
+  box-shadow: none;
+}
+.sequence-alignment header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.sequence-alignment header h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.sequence-alignment header span,
+.sequence-alignment footer,
+.alignment-row-key {
+  font-size: 12px;
+  color: var(--muted);
+}
+.alignment-row-key {
+  margin: 0 0 12px;
+}
+.alignment-scroll {
+  max-height: 360px;
+  overflow: auto;
+}
+.alignment-pairs {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(28px, 1fr));
+  gap: 10px 3px;
+}
+.alignment-pair {
+  display: grid;
+  gap: 3px;
+  align-content: start;
+  text-align: center;
+  min-width: 0;
+}
+.alignment-pair small {
+  color: var(--muted);
+  font: 9px var(--font);
+}
+.alignment-pair button {
+  display: grid;
+  place-items: center;
+  min-height: 30px;
+  color: var(--ink);
+  background: var(--surface-muted);
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 4px 1px;
+  font: 13px var(--mono);
+}
+.alignment-pair .is-cdr {
+  border-bottom: 2px solid var(--accent);
+}
+.alignment-pair .is-modified {
+  background: var(--success-soft);
+  color: var(--teal);
+  font-weight: 700;
+}
+.alignment-pair .is-selected {
+  border-color: var(--accent);
+}
+.sequence-alignment footer {
+  margin-top: 12px;
+}

@@ -1,0 +1,1538 @@
+/**
+ *  \file internal/attribute_tables.h
+ *  \brief Access to particle attributes.
+ *
+ *  Copyright 2007-2026 IMP Inventors. All rights reserved.
+ *
+ */
+
+#ifndef IMPKERNEL_INTERNAL_ATTRIBUTE_TABLES_H
+#define IMPKERNEL_INTERNAL_ATTRIBUTE_TABLES_H
+
+#include <IMP/kernel_config.h>
+#include <boost/dynamic_bitset.hpp>
+#include <cereal/access.hpp>
+#include <algorithm>
+#include "../Key.h"
+#include "../utility.h"
+#include "../FloatIndex.h"
+#include "input_output_exception.h"
+#include "KeyVector.h"
+#include <IMP/exception.h>
+#include <IMP/check_macros.h>
+#include <IMP/log.h>
+#include <IMP/set_map_macros.h>
+#include <IMP/algebra/Sphere3D.h>
+
+#define IMP_ATTRIBUTE_CHECKED_PARAM checked
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+//! parameter in function call
+#define IMP_CHECK_MASK(mask, particle_index, key, operation, entity)           \
+  IMP_USAGE_CHECK(!mask || mask->size() > get_as_unsigned_int(particle_index), \
+                  "For some reason the mask is too small.");                   \
+  if (mask && !(*mask)[get_as_unsigned_int(particle_index)]) {                 \
+    handle_error("bad particle read or written");                        \
+    throw InputOutputException(                                                \
+        particle_index.get_index(), InputOutputException::operation,           \
+        InputOutputException::entity, key.get_string());                       \
+  }
+#define IMP_CHECK_MASK_IF_CHECKED(mask, particle_index, key, operation, entity) \
+  if( IMP_ATTRIBUTE_CHECKED_PARAM ){								\
+    IMP_CHECK_MASK(mask, particle_index, key, operation, entity);	\
+  }
+#else
+#define IMP_CHECK_MASK(mask, particle_index, key, operation, entity)
+#define IMP_CHECK_MASK_IF_CHECKED(mask, particle_index, key, operation, entity)
+#endif
+
+#ifdef _OPENMP
+#define IMP_ACCUMULATE(dest, increment) \
+  {                                     \
+    double &val = (dest);               \
+    double pv = (increment);            \
+    IMP_PRAGMA(omp atomic) val += pv;   \
+  }
+#else
+#define IMP_ACCUMULATE(dest, increment) dest += increment
+#endif
+
+IMPKERNEL_BEGIN_INTERNAL_NAMESPACE
+
+typedef boost::dynamic_bitset<> Mask;
+
+/** a template for storing a table that holds the values of multiple attributes
+    for multiple particles, following
+
+    The basic attribute table is templated for
+    one type of attribute value and an associated type of attribute key,
+    which are in turn specified by the Traits class (see AttributeTable.h)
+*/
+template <class Traits>
+class BasicAttributeTable {
+ public:
+  typedef typename Traits::Key Key;
+
+ private:
+  KeyVector<typename Traits::Key, typename Traits::Container> data_;
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+  Mask *read_mask_, *write_mask_, *add_remove_mask_;
+#endif
+  IMP_KERNEL_SMALL_UNORDERED_SET<Key> caches_;
+
+  friend class cereal::access;
+
+  template<class Archive> void serialize(Archive &ar) {
+    // Note that we don't serialize masks; they are handled by Model
+    ar(caches_, data_);
+  }
+
+  void do_add_attribute(Key k, ParticleIndex particle,
+                        typename Traits::PassValue value) {
+    IMP_USAGE_CHECK(Traits::get_is_valid(value),
+                    "Can't set to invalid value: " << value << " for attribute "
+                                                   << k);
+    if (data_.size() <= k.get_index()) {
+      data_.resize(k.get_index() + 1);
+    }
+    resize_to_fit(data_[k.get_index()], particle, Traits::get_invalid());
+    data_[k.get_index()][particle] = value;
+  }
+
+ public:
+  void swap_with(BasicAttributeTable<Traits> &o) {
+    IMP_SWAP_MEMBER(data_);
+    IMP_SWAP_MEMBER(caches_);
+  }
+
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+  void set_masks(Mask *read_mask, Mask *write_mask, Mask *add_remove_mask) {
+    read_mask_ = read_mask;
+    write_mask_ = write_mask;
+    add_remove_mask_ = add_remove_mask;
+  }
+#endif
+
+  BasicAttributeTable()
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+      : read_mask_(nullptr),
+        write_mask_(nullptr),
+        add_remove_mask_(nullptr)
+#endif
+  {
+  }
+
+  void add_attribute(Key k, ParticleIndex particle,
+                     typename Traits::PassValue value) {
+    IMP_CHECK_MASK(add_remove_mask_, particle, k, ADD, ATTRIBUTE);
+    do_add_attribute(k, particle, value);
+  }
+  void add_cache_attribute(Key k, ParticleIndex particle,
+                           typename Traits::PassValue value) {
+    IMP_OMP_PRAGMA(critical(imp_cache)) {
+      caches_.insert(k);
+      do_add_attribute(k, particle, value);
+    }
+  }
+  void clear_caches(ParticleIndex particle) {
+    IMP_OMP_PRAGMA(critical(imp_cache))
+    for (typename IMP_KERNEL_SMALL_UNORDERED_SET<Key>::const_iterator it =
+             caches_.begin();
+         it != caches_.end(); ++it) {
+      if (data_.size() > it->get_index() &&
+          data_[it->get_index()].size() > get_as_unsigned_int(particle)) {
+        data_[it->get_index()][particle] = Traits::get_invalid();
+      }
+    }
+  }
+  void remove_attribute(Key k, ParticleIndex particle) {
+    IMP_CHECK_MASK(add_remove_mask_, particle, k, REMOVE, ATTRIBUTE);
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Can't remove attribute if it isn't there");
+    data_[k.get_index()][particle] = Traits::get_invalid();
+  }
+
+  //! Get the size of the attribute table for the given key.
+  //! 0 is returned if the attribute does not exist in the model.
+  unsigned get_attribute_size(Key k) const {
+    if (data_.size() <= k.get_index()) {
+      return 0;
+    } else {
+      return data_[k.get_index()].size();
+    }
+  }
+
+  bool get_has_attribute(Key k, ParticleIndex particle) const {
+    if (data_.size() <= k.get_index())
+      return false;
+    else if (data_[k.get_index()].size() <= get_as_unsigned_int(particle))
+      return false;
+    else
+      return Traits::get_is_valid(data_[k.get_index()][particle]);
+  }
+  void set_attribute(Key k, ParticleIndex particle,
+                     typename Traits::PassValue value) {
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+    if (caches_.find(k) == caches_.end()) {
+      IMP_CHECK_MASK(write_mask_, particle, k, SET, ATTRIBUTE);
+    }
+#endif
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Setting invalid attribute: " << k << " of particle "
+                                                  << particle);
+    IMP_USAGE_CHECK(!Traits::is_equal(value, Traits::get_invalid()),
+                    "Cannot set attribute to value of "
+                        << Traits::get_invalid()
+                        << " as it is reserved for a null value.");
+    data_[k.get_index()][particle] = value;
+  }
+
+  typename Traits::PassValue get_attribute(Key k, ParticleIndex particle
+					    , bool IMP_ATTRIBUTE_CHECKED_PARAM=true) const
+    {
+      IMP_INTERNAL_CHECK_VARIABLE(IMP_ATTRIBUTE_CHECKED_PARAM);
+      IMP_CHECK_MASK_IF_CHECKED(read_mask_, particle, k, GET, ATTRIBUTE );
+      IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                      "Can't get attribute that is not there: "
+                        << k.get_string() << " on particle " << particle);
+      return data_[k.get_index()][particle];
+    }
+
+  //! const-access to internally stored data table
+  Vector<typename Traits::Container> const& access_data() const
+  {
+    return data_;
+  }
+
+    //! access to internally stored data table
+  Vector<typename Traits::Container>& access_data(){
+    return data_;
+  }
+
+  //! fast access for batch operations - for advanced users only
+  typename Traits::ContainerConstDataAccess access_attribute_data
+    (Key k) const
+  {
+    unsigned int ki=k.get_index();
+    IMP_USAGE_CHECK(ki < data_.size(),
+                    "trying to access an attribute that was not added to this model");
+    return Traits::access_container_data(data_[ki]);
+  }
+
+  // fast access for batch operations - for advanced users only
+  typename Traits::ContainerDataAccess access_attribute_data
+    (Key k)
+  {
+    unsigned int ki= k.get_index();
+    IMP_USAGE_CHECK(ki < data_.size(),
+                    "trying to access an attribute that was not added to this model");
+    return Traits::access_container_data(data_[ki]);
+  }
+
+  typename Traits::ContainerDataAccess access_full_attribute_data(Key k) {
+    unsigned int ki = k.get_index();
+    IMP_USAGE_CHECK(ki < data_.size(),
+         "trying to access an attribute that was not added to this model");
+    return Traits::access_full_container_data(data_[ki]);
+  }
+
+  typename Traits::Container::reference access_attribute(
+      Key k, ParticleIndex particle) {
+    IMP_CHECK_MASK(write_mask_, particle, k, SET, ATTRIBUTE);
+    return data_[k.get_index()][particle];
+  }
+  std::pair<typename Traits::Value, typename Traits::Value> get_range_internal(
+      Key k) const {
+    std::pair<typename Traits::Value, typename Traits::Value> ret;
+    IMP_USAGE_CHECK(
+        data_.size() > k.get_index() && data_[k.get_index()].size() != 0,
+        "Cannot request range of an unused key.");
+    bool init = false;
+    for (unsigned int i = 0; i < data_[k.get_index()].size(); ++i) {
+      if (Traits::get_is_valid(data_[k.get_index()][ParticleIndex(i)])) {
+        if (!init) {
+          ret.first = data_[k.get_index()][ParticleIndex(i)];
+          ret.second = data_[k.get_index()][ParticleIndex(i)];
+          init = true;
+        } else {
+          ret.first =
+              Traits::min(ret.first, data_[k.get_index()][ParticleIndex(i)]);
+          ret.second =
+              Traits::max(ret.second, data_[k.get_index()][ParticleIndex(i)]);
+        }
+      }
+    }
+    return ret;
+  }
+  void clear_attributes(ParticleIndex particle) {
+    IMP_CHECK_MASK(add_remove_mask_, particle, Key(0), REMOVE, ATTRIBUTE);
+    for (unsigned int i = 0; i < data_.size(); ++i) {
+      if (data_[i].size() > get_as_unsigned_int(particle)) {
+        data_[i][particle] = Traits::get_invalid();
+      }
+    }
+  }
+
+  IMP::Vector<Key> get_attribute_keys(ParticleIndex particle) const {
+    Vector<Key> ret;
+    for (unsigned int i = 0; i < data_.size(); ++i) {
+      if (data_[i].size() > get_as_unsigned_int(particle) &&
+          Traits::get_is_valid(data_[i][particle])) {
+        ret.push_back(Key(i));
+      }
+    }
+    return ret;
+  }
+  void fill(typename Traits::PassValue value) {
+    for (unsigned int i = 0; i < data_.size(); ++i) {
+      std::fill(data_[i].begin(), data_[i].end(), value);
+    }
+  }
+  unsigned int size() const { return data_.size(); }
+  unsigned int size(unsigned int i) const { return data_[i].size(); }
+};
+IMP_SWAP_1(BasicAttributeTable);
+
+/** A template for storing a table that holds multiple attribute sets for
+    the attribute
+*/
+template <class Traits>
+class MultiBasicAttributeTable : public BasicAttributeTable<Traits> {
+ public:
+  typedef typename Traits::Key Key;
+  typedef BasicAttributeTable<Traits> P;
+
+  MultiBasicAttributeTable() : BasicAttributeTable<Traits>() {}
+
+  void set_number_of_attribute_sets(Key k, int nsets) {
+    unsigned ind = k.get_index();
+    if (P::size() <= ind) {
+      P::access_data().resize(ind + 1);
+    }
+    P::access_data()[ind].set_number_of_sets(nsets, Traits::get_invalid());
+  }
+
+  void set_attribute_sets_external(Key k, bool external) {
+    unsigned ind = k.get_index();
+    if (P::size() <= ind) {
+      P::access_data().resize(ind + 1);
+    }
+    P::access_data()[ind].set_sets_external(external);
+  }
+
+  bool get_attribute_sets_external(Key k) const {
+    unsigned ind = k.get_index();
+    if (P::size() <= ind) {
+      return false;
+    } else {
+      return P::access_data()[ind].get_sets_external();
+    }
+  }
+
+  int get_number_of_attribute_sets(Key k) const {
+    unsigned ind = k.get_index();
+    if (P::size() <= ind) {
+      return 1;
+    } else {
+      return P::access_data()[ind].get_number_of_sets();
+    }
+  }
+
+  void set_active_attribute_set(Key k, int set) {
+    unsigned ind = k.get_index();
+    if (P::size() <= ind) {
+      P::access_data().resize(ind + 1);
+    }
+    P::access_data()[ind].set_active_set(set);
+  }
+
+  typename Traits::ContainerDataAccess access_full_attribute_data(Key k) {
+    unsigned int ki = k.get_index();
+    IMP_USAGE_CHECK(ki < P::size(),
+             "trying to access an attribute that was not added to this model");
+    return Traits::access_full_container_data(P::access_data()[ki]);
+  }
+};
+IMP_SWAP_1(MultiBasicAttributeTable);
+
+/** a template for storing a table that holds the values of multiple attributes
+    for multiple particles, using sparse storage.
+*/
+template <class Traits>
+class SparseBasicAttributeTable {
+ public:
+  typedef typename Traits::Key Key;
+
+ private:
+  KeyVector<typename Traits::Key, typename Traits::Container> data_;
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+  Mask *read_mask_, *write_mask_, *add_remove_mask_;
+#endif
+
+  friend class cereal::access;
+
+  template<class Archive> void serialize(Archive &ar) {
+    // Note that we don't serialize masks; they are handled by Model
+    ar(data_);
+  }
+
+  void do_add_attribute(Key k, ParticleIndex particle,
+                        typename Traits::PassValue value) {
+    if (data_.size() <= k.get_index()) {
+      data_.resize(k.get_index() + 1);
+    }
+    data_[k.get_index()][particle] = value;
+  }
+
+ public:
+  void swap_with(SparseBasicAttributeTable<Traits> &o) {
+    IMP_SWAP_MEMBER(data_);
+  }
+
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+  void set_masks(Mask *read_mask, Mask *write_mask, Mask *add_remove_mask) {
+    read_mask_ = read_mask;
+    write_mask_ = write_mask;
+    add_remove_mask_ = add_remove_mask;
+  }
+#endif
+
+  SparseBasicAttributeTable()
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+      : read_mask_(nullptr),
+        write_mask_(nullptr),
+        add_remove_mask_(nullptr)
+#endif
+  {
+  }
+
+  void add_attribute(Key k, ParticleIndex particle,
+                     typename Traits::PassValue value) {
+    IMP_CHECK_MASK(add_remove_mask_, particle, k, ADD, ATTRIBUTE);
+    do_add_attribute(k, particle, value);
+  }
+  void remove_attribute(Key k, ParticleIndex particle) {
+    IMP_CHECK_MASK(add_remove_mask_, particle, k, REMOVE, ATTRIBUTE);
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Can't remove attribute if it isn't there");
+    data_[k.get_index()].erase(particle);
+  }
+
+  //! Get the size of the attribute table for the given key.
+  //! 0 is returned if the attribute does not exist in the model.
+  unsigned get_attribute_size(Key k) const {
+    if (data_.size() <= k.get_index()) {
+      return 0;
+    } else {
+      return data_[k.get_index()].size();
+    }
+  }
+
+  bool get_has_attribute(Key k, ParticleIndex particle) const {
+    if (data_.size() <= k.get_index()) {
+      return false;
+    } else {
+      return data_[k.get_index()].count(particle) > 0;
+    }
+  }
+  void set_attribute(Key k, ParticleIndex particle,
+                     typename Traits::PassValue value) {
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Setting invalid attribute: " << k << " of particle "
+                                                  << particle);
+    data_[k.get_index()][particle] = value;
+  }
+
+  typename Traits::PassValue get_attribute(Key k, ParticleIndex particle
+					    , bool IMP_ATTRIBUTE_CHECKED_PARAM=true) const
+    {
+      IMP_INTERNAL_CHECK_VARIABLE(IMP_ATTRIBUTE_CHECKED_PARAM);
+      IMP_CHECK_MASK_IF_CHECKED(read_mask_, particle, k, GET, ATTRIBUTE );
+      return data_[k.get_index()].at(particle);
+    }
+
+  void clear_attributes(ParticleIndex particle) {
+    IMP_CHECK_MASK(add_remove_mask_, particle, Key(0), REMOVE, ATTRIBUTE);
+    for (unsigned int i = 0; i < data_.size(); ++i) {
+      data_[i].erase(particle);
+    }
+  }
+
+  unsigned int size() const { return data_.size(); }
+  unsigned int size(unsigned int i) const { return data_[i].size(); }
+};
+IMP_SWAP_1(SparseBasicAttributeTable);
+
+class FloatAttributeTable {
+  // vector<algebra::Sphere3D> spheres_;
+  // vector<algebra::Sphere3D> sphere_derivatives_;
+  MultiIndexVector<ParticleIndexTag, algebra::Sphere3D,
+              IMP_VECTOR_ALLOCATOR<algebra::Sphere3D>,
+              sphere_equal<algebra::Sphere3D>> spheres_;
+  IndexVector<ParticleIndexTag, algebra::Sphere3D,
+              IMP_VECTOR_ALLOCATOR<algebra::Sphere3D>,
+              sphere_equal<algebra::Sphere3D>> sphere_derivatives_;
+  MultiIndexVector<ParticleIndexTag, Vector3D,
+              std::allocator<Vector3D>,
+              vector_equal<Vector3D>> internal_coordinates_;
+  IndexVector<ParticleIndexTag, Vector3D,
+              std::allocator<Vector3D>,
+              vector_equal<Vector3D>>
+      internal_coordinate_derivatives_;
+  BasicAttributeTable<internal::FloatAttributeTableTraits> data_;
+  BasicAttributeTable<internal::FloatAttributeTableTraits> derivatives_;
+  // make use bitset
+  BasicAttributeTable<internal::BoolAttributeTableTraits> optimizeds_;
+  FloatRanges ranges_;
+  // For external storage, XYZ and R can have different numbers of
+  // attribute sets (for internal, they must match the number of spheres)
+  int n_xyz_sets_, n_radius_sets_;
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+  Mask *read_mask_, *write_mask_, *add_remove_mask_, *read_derivatives_mask_,
+      *write_derivatives_mask_;
+#endif
+
+  friend class cereal::access;
+
+  template<class Archive> void serialize(Archive &ar) {
+    // Note that we don't serialize masks; they are handled by Model
+    ar(spheres_, sphere_derivatives_, internal_coordinates_);
+    ar(internal_coordinate_derivatives_, data_, derivatives_, optimizeds_);
+    ar(n_xyz_sets_, n_radius_sets_);
+  }
+
+  algebra::Sphere3D get_invalid_sphere() const {
+    double iv = internal::FloatAttributeTableTraits::get_invalid();
+    algebra::Sphere3D ivs(Vector3D(iv, iv, iv), iv);
+    return ivs;
+  }
+
+ public:
+  typedef FloatKey Key;
+
+  void swap_with(FloatAttributeTable &o) {
+    using std::swap;
+    IMP_SWAP_MEMBER(spheres_);
+    IMP_SWAP_MEMBER(sphere_derivatives_);
+    IMP_SWAP_MEMBER(data_);
+    IMP_SWAP_MEMBER(derivatives_);
+    IMP_SWAP_MEMBER(optimizeds_);
+    IMP_SWAP_MEMBER(internal_coordinates_);
+    IMP_SWAP_MEMBER(internal_coordinate_derivatives_);
+    IMP_SWAP_MEMBER(n_xyz_sets_);
+    IMP_SWAP_MEMBER(n_radius_sets_);
+  }
+  FloatAttributeTable()
+      : n_xyz_sets_(1), n_radius_sets_(1)
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+      , read_mask_(nullptr),
+        write_mask_(nullptr),
+        add_remove_mask_(nullptr),
+        read_derivatives_mask_(nullptr),
+        write_derivatives_mask_(nullptr)
+#endif
+  {
+  }
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+  void set_masks(Mask *read_mask, Mask *write_mask, Mask *add_remove_mask,
+                 Mask *read_derivatives_mask, Mask *write_derivatives_mask) {
+    data_.set_masks(read_mask, write_mask, add_remove_mask);
+    derivatives_.set_masks(read_derivatives_mask, write_derivatives_mask,
+                           add_remove_mask);
+    optimizeds_.set_masks(read_mask, write_mask, add_remove_mask);
+    read_mask_ = read_mask;
+    write_mask_ = write_mask;
+    add_remove_mask_ = add_remove_mask;
+    read_derivatives_mask_ = read_derivatives_mask;
+    write_derivatives_mask_ = write_derivatives_mask;
+  }
+#endif
+
+  // make sure you know what you are doing
+  algebra::Sphere3D &get_sphere(ParticleIndex particle) {
+    IMP_CHECK_MASK(read_mask_, particle, FloatKey(0), GET, ATTRIBUTE);
+    return spheres_[particle];
+  }
+
+  Vector3D &get_internal_coordinates(ParticleIndex particle) {
+    IMP_CHECK_MASK(read_mask_, particle, FloatKey(5), GET, ATTRIBUTE);
+    IMP_USAGE_CHECK(internal_coordinates_[particle][0] !=
+                        internal::FloatAttributeTableTraits::get_invalid(),
+                    "No internal coordinates: " << particle);
+    IMP_USAGE_CHECK(internal_coordinates_[particle][1] !=
+                        internal::FloatAttributeTableTraits::get_invalid(),
+                    "No internal coordinates: " << particle);
+    IMP_USAGE_CHECK(internal_coordinates_[particle][2] !=
+                        internal::FloatAttributeTableTraits::get_invalid(),
+                    "No internal coordinates: " << particle);
+    return internal_coordinates_[particle];
+  }
+
+  /**  Expert function to add derivatives in v directly to xyzr_deriv[0..2],
+       after transforming the derivative using da (static cause does not depend
+       on model instance)
+
+   NOTE: this variant of add_to_coordinate_derivatives is for expert
+         usage only since input is explicit pointer to derivative
+         storage location, and lacks checks, but may be used for
+         faster implementations of evaluate_index() etc.
+  */
+  static void add_to_coordinate_derivatives(algebra::Sphere3D& xyzr_deriv,
+                                     const Vector3D &v,
+                                     const DerivativeAccumulator &da) {
+    IMP_ACCUMULATE(xyzr_deriv[0], da(v[0]));
+    IMP_ACCUMULATE(xyzr_deriv[1], da(v[1]));
+    IMP_ACCUMULATE(xyzr_deriv[2], da(v[2]));
+  }
+
+  //! add derivatives in v to xyz derivative of particle, after
+  //! transforming the derivative using da
+  void add_to_coordinate_derivatives(ParticleIndex particle,
+                                     const Vector3D &v,
+                                     const DerivativeAccumulator &da) {
+    IMP_CHECK_MASK(write_derivatives_mask_, particle, FloatKey(0), SET,
+                   DERIVATIVE);
+    IMP_USAGE_CHECK(get_has_attribute(FloatKey(0), particle),
+                    "Particle does not have coordinates: " << particle);
+    add_to_coordinate_derivatives(sphere_derivatives_[particle], v, da);
+  }
+
+  void add_to_internal_coordinate_derivatives(ParticleIndex particle,
+                                              const Vector3D &v,
+                                              const DerivativeAccumulator &da) {
+    IMP_CHECK_MASK(write_derivatives_mask_, particle, FloatKey(4), SET,
+                   DERIVATIVE);
+    IMP_USAGE_CHECK(get_has_attribute(FloatKey(0), particle),
+                    "Particle does not have coordinates");
+    IMP_ACCUMULATE(internal_coordinate_derivatives_[particle][0], da(v[0]));
+    IMP_ACCUMULATE(internal_coordinate_derivatives_[particle][1], da(v[1]));
+    IMP_ACCUMULATE(internal_coordinate_derivatives_[particle][2], da(v[2]));
+  }
+
+  const Vector3D &get_coordinate_derivatives(ParticleIndex particle)
+      const {
+    IMP_CHECK_MASK(read_derivatives_mask_, particle, FloatKey(0), GET,
+                   DERIVATIVE);
+    IMP_USAGE_CHECK(get_has_attribute(FloatKey(0), particle),
+                    "Particle does not have coordinates: " << particle);
+    return sphere_derivatives_[particle].get_center();
+  }
+  void zero_derivatives() {
+    /*std::fill(sphere_derivatives_.begin(), sphere_derivatives_.end(),
+      algebra::Sphere3D(Vector3D(0,0,0), 0));*/
+    // make more efficient
+    std::fill(sphere_derivatives_.begin(), sphere_derivatives_.end(),
+              algebra::Sphere3D(Vector3D(0, 0, 0), 0));
+    std::fill(internal_coordinate_derivatives_.begin(),
+              internal_coordinate_derivatives_.end(),
+              Vector3D(0, 0, 0));
+    derivatives_.fill(0);
+  }
+  void clear_caches(ParticleIndex) {}
+  void add_cache_attribute(FloatKey, ParticleIndex, double) {
+    IMP_NOT_IMPLEMENTED;
+  }
+  void remove_attribute(FloatKey k, ParticleIndex particle) {
+    IMP_CHECK_MASK(add_remove_mask_, particle, k, REMOVE, ATTRIBUTE);
+    if (k.get_index() < 4) {
+      IMP_CHECK_MASK(add_remove_mask_, particle, k, REMOVE, ATTRIBUTE);
+      spheres_[particle][k.get_index()] =
+          internal::FloatAttributeTableTraits::get_invalid();
+      sphere_derivatives_[particle][k.get_index()] =
+          internal::FloatAttributeTableTraits::get_invalid();
+    } else if (k.get_index() < 7) {
+      IMP_CHECK_MASK(add_remove_mask_, particle, k, REMOVE, ATTRIBUTE);
+      internal_coordinates_[particle][k.get_index() - 4] =
+          internal::FloatAttributeTableTraits::get_invalid();
+      internal_coordinate_derivatives_[particle][k.get_index() - 4] =
+          internal::FloatAttributeTableTraits::get_invalid();
+    } else {
+      data_.remove_attribute(FloatKey(k.get_index() - 7), particle);
+      derivatives_.remove_attribute(FloatKey(k.get_index() - 7), particle);
+    }
+    if (optimizeds_.get_has_attribute(k, particle)) {
+      optimizeds_.remove_attribute(k, particle);
+    }
+  }
+  bool get_is_optimized(FloatKey k, ParticleIndex particle) const {
+    return optimizeds_.get_has_attribute(k, particle);
+  }
+  // check NOT_EVALUATING
+  void set_is_optimized(FloatKey k, ParticleIndex particle, bool tf) {
+    if (tf && !optimizeds_.get_has_attribute(k, particle)) {
+      optimizeds_.add_attribute(k, particle, true);
+    } else if (!tf && optimizeds_.get_has_attribute(k, particle)) {
+      optimizeds_.remove_attribute(k, particle);
+    }
+  }
+  // check AFTER_EVALUATE, NOT_EVALUATING
+  double get_derivative
+    (FloatKey k, ParticleIndex particle,
+     bool IMP_ATTRIBUTE_CHECKED_PARAM=true ) const
+  {
+    IMP_INTERNAL_CHECK_VARIABLE(IMP_ATTRIBUTE_CHECKED_PARAM);
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Can't get derivative that isn't there");
+    if (k.get_index() < 4) {
+      IMP_CHECK_MASK_IF_CHECKED(read_derivatives_mask_, particle, k, GET, DERIVATIVE );
+      return sphere_derivatives_[particle][k.get_index()];
+    } else if (k.get_index() < 7) {
+      IMP_CHECK_MASK_IF_CHECKED(read_derivatives_mask_, particle, k, GET, DERIVATIVE );
+      return internal_coordinate_derivatives_[particle][k.get_index() - 4];
+    } else {
+      return derivatives_.get_attribute(FloatKey(k.get_index() - 7), particle,
+					IMP_ATTRIBUTE_CHECKED_PARAM );
+    }
+  }
+  // check can change EVALUATE, AFTER_EVALUATE< NOT_EVALUATING
+  void add_to_derivative(FloatKey k, ParticleIndex particle, double v,
+                         const DerivativeAccumulator &da) {
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Can't get derivative that isn't there: "
+                        << k.get_string() << " on particle " << particle);
+    if (k.get_index() < 4) {
+      IMP_CHECK_MASK(write_derivatives_mask_, particle, k, SET, DERIVATIVE);
+      sphere_derivatives_[particle][k.get_index()] += da(v);
+      ;
+    } else if (k.get_index() < 7) {
+      IMP_CHECK_MASK(write_derivatives_mask_, particle, k, SET, DERIVATIVE);
+      internal_coordinate_derivatives_[particle][k.get_index() - 4] += da(v);
+      ;
+    } else {
+      FloatKey nk(k.get_index() - 7);
+      IMP_ACCUMULATE(derivatives_.access_attribute(nk, particle), da(v));
+    }
+  }
+
+  void add_attribute(FloatKey k, ParticleIndex particle, double v,
+                     bool opt = false) {
+    IMP_CHECK_MASK(add_remove_mask_, particle, k, ADD, ATTRIBUTE);
+    IMP_USAGE_CHECK(!get_has_attribute(k, particle),
+                    "Can't add attribute that is there: "
+                        << k.get_string() << " on particle " << particle);
+    IMP_USAGE_CHECK(FloatAttributeTableTraits::get_is_valid(v),
+                    "Can't set float attribute to "
+                        << v << " that is a special value.");
+    if (k.get_index() < 4) {
+      if (spheres_.size() <= get_as_unsigned_int(particle)) {
+        spheres_.resize(get_as_unsigned_int(particle) + 1,
+                        get_invalid_sphere());
+        sphere_derivatives_.resize(get_as_unsigned_int(particle) + 1,
+                                   get_invalid_sphere());
+      }
+      spheres_[particle][k.get_index()] = v;
+    } else if (k.get_index() < 7) {
+      if (internal_coordinates_.size() <= get_as_unsigned_int(particle)) {
+        internal_coordinates_.resize(get_as_unsigned_int(particle) + 1,
+                                     get_invalid_sphere().get_center());
+        internal_coordinate_derivatives_.resize(
+            get_as_unsigned_int(particle) + 1,
+            get_invalid_sphere().get_center());
+      }
+      internal_coordinates_[particle][k.get_index() - 4] = v;
+    } else {
+      FloatKey nk(k.get_index() - 7);
+      data_.add_attribute(nk, particle, v);
+      derivatives_.add_attribute(nk, particle, 0);
+    }
+    if (opt) optimizeds_.add_attribute(k, particle, true);
+    ranges_.resize(
+        std::max(ranges_.size(), static_cast<size_t>(k.get_index() + 1)),
+        FloatRange(-std::numeric_limits<double>::max(),
+                   std::numeric_limits<double>::max()));
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Can't attribute was not added");
+  }
+  bool get_has_attribute(FloatKey k, ParticleIndex particle) const {
+    if (k.get_index() < 4) {
+      if (spheres_.size() <= get_as_unsigned_int(particle))
+        return false;
+      else if (!internal::FloatAttributeTableTraits::get_is_valid(
+                    spheres_[particle][k.get_index()])) {
+        return false;
+      }
+      return true;
+    } else if (k.get_index() < 7) {
+      if (internal_coordinates_.size() <= get_as_unsigned_int(particle)) {
+        return false;
+      } else if (!internal::FloatAttributeTableTraits::get_is_valid(
+                      internal_coordinates_[particle][k.get_index() - 4])) {
+        return false;
+      }
+      return true;
+    } else {
+      return data_.get_has_attribute(FloatKey(k.get_index() - 7), particle);
+    }
+  }
+  void set_attribute(FloatKey k, ParticleIndex particle, double v) {
+    IMP_CHECK_MASK(write_mask_, particle, k, SET, ATTRIBUTE);
+    IMP_USAGE_CHECK(internal::FloatAttributeTableTraits::get_is_valid(v),
+                    "Can't set attribute to invalid value: "
+                        << k.get_string() << " on particle " << particle
+                        << " with value " << v);
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Can't set attribute that is not there: "
+                        << k.get_string() << " on particle " << particle);
+    if (k.get_index() < 4) {
+      spheres_[particle][k.get_index()] = v;
+    } else if (k.get_index() < 7) {
+      internal_coordinates_[particle][k.get_index() - 4] = v;
+    } else {
+      data_.set_attribute(FloatKey(k.get_index() - 7), particle, v);
+    }
+  }
+
+  //! return attribute k of specified particle
+  double get_attribute(FloatKey k, ParticleIndex particle,
+		       bool IMP_ATTRIBUTE_CHECKED_PARAM=true ) const
+  {
+    IMP_INTERNAL_CHECK_VARIABLE(IMP_ATTRIBUTE_CHECKED_PARAM);
+    IMP_CHECK_MASK_IF_CHECKED(read_mask_, particle, k, GET, ATTRIBUTE );
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Can't get attribute that is not there: "
+                        << k.get_string() << " on particle " << particle);
+    if (k.get_index() < 4) {
+      return spheres_[particle][k.get_index()];
+    } else if (k.get_index() < 7) {
+      return internal_coordinates_[particle][k.get_index() - 4];
+    } else {
+      return data_.get_attribute(FloatKey(k.get_index() - 7), particle,
+				 IMP_ATTRIBUTE_CHECKED_PARAM );
+    }
+  }
+  double &access_attribute(FloatKey k, ParticleIndex particle) {
+    IMP_CHECK_MASK(write_mask_, particle, k, SET, ATTRIBUTE);
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Can't get attribute that is not there: "
+                        << k.get_string() << " on particle " << particle);
+    if (k.get_index() < 4) {
+      return spheres_[particle][k.get_index()];
+    } else if (k.get_index() < 7) {
+      return internal_coordinates_[particle][k.get_index() - 4];
+    } else {
+      return data_.access_attribute(FloatKey(k.get_index() - 7), particle);
+    }
+  }
+  FloatIndexes get_optimized_attributes() const {
+    FloatIndexes ret;
+    for (unsigned int i = 0; i < optimizeds_.size(); ++i) {
+      for (unsigned int j = 0; j < optimizeds_.size(i); ++j) {
+        if (optimizeds_.get_has_attribute(FloatKey(i), ParticleIndex(j))) {
+          ret.push_back(FloatIndex(ParticleIndex(j), FloatKey(i)));
+        }
+      }
+    }
+    return ret;
+  }
+
+  /** \name Accessing internal float attribute data tables
+      \anchor direct_access_float_attribute,
+
+      The following expert methods enable direct access to the
+      internally-stored data array of a specified key. Use particle
+      indexes to access the data attribute of a specific particle,
+      e.g. data[pi.get_index()].
+
+      @note These expert-only methods are not part of the official
+      interface, they include limited checks if any, and they should
+      be used most sparingly (typically, only if fast memory access
+      time is of the utmost essence at a running time bottleneck, and
+      requires scanning or caching of a contiguous block of memory).
+
+      Also note that not all particles are valid, but this could be
+      tested for a specific particle using
+      FloatAttributeTableTraits::get_is_valid(), for individual float
+      values.
+      @{
+  */
+  unsigned get_spheres_size() const {
+    return spheres_.size();
+  }
+  algebra::Sphere3D const* access_spheres_data() const{
+    return spheres_.data();
+  }
+  algebra::Sphere3D* access_spheres_data(){
+    return spheres_.data();
+  }
+  algebra::Sphere3D const* access_full_spheres_data() const {
+    return spheres_.full_data();
+  }
+  algebra::Sphere3D* access_full_spheres_data() {
+    return spheres_.full_data();
+  }
+  unsigned get_sphere_derivatives_size() const {
+    return sphere_derivatives_.size();
+  }
+  algebra::Sphere3D const* access_sphere_derivatives_data() const{
+    return sphere_derivatives_.data();
+  }
+  algebra::Sphere3D* access_sphere_derivatives_data(){
+    return sphere_derivatives_.data();
+  }
+  unsigned get_internal_coordinates_size() const {
+    return internal_coordinates_.size();
+  }
+  Vector3D const* access_internal_coordinates_data() const{
+    return internal_coordinates_.data();
+  }
+  Vector3D * access_internal_coordinates_data() {
+    return internal_coordinates_.data();
+  }
+  unsigned get_internal_coordinate_derivatives_size() const {
+    return internal_coordinate_derivatives_.size();
+  }
+  Vector3D const* access_internal_coordinate_derivatives_data() const{
+    return internal_coordinate_derivatives_.data();
+  }
+  Vector3D * access_internal_coordinate_derivatives_data() {
+    return internal_coordinate_derivatives_.data();
+  }
+  //! Get the size of the attribute table for the given key.
+  //! 0 is returned if the attribute does not exist in the model.
+  unsigned get_attribute_size(FloatKey k) const {
+    IMP_USAGE_CHECK(k.get_index()>=7,
+		    "coordinates and radius should be accessed by specialized methods");
+    unsigned int ki=k.get_index() - 7;
+    if (data_.access_data().size() <= ki) {
+      return 0;
+    } else {
+      return data_.access_data()[ki].size();
+    }
+  }
+  double const* access_attribute_data(FloatKey k) const{
+    IMP_USAGE_CHECK(k.get_index()>=7,
+		    "coordinates and radius should be accessed by specialized methods");
+    unsigned int ki=k.get_index() - 7;
+    IMP_USAGE_CHECK(ki < (data_.access_data()).size(),
+                    "trying to access an attribute that was not added to this model");
+    return internal::FloatAttributeTableTraits::access_container_data
+      ((data_.access_data())[ki]);
+  }
+  double* access_attribute_data(FloatKey k){
+    IMP_USAGE_CHECK(k.get_index()>=7,
+		    "coordinates and radius should be accessed by specialized methods");
+    unsigned int ki= k.get_index()-7;
+    IMP_USAGE_CHECK(ki < (data_.access_data()).size(),
+                    "trying to access an attribute that was not added to this model");
+    return internal::FloatAttributeTableTraits::access_container_data
+      ((data_.access_data())[ki]);
+  }
+  double* access_full_attribute_data(FloatKey k){
+    IMP_USAGE_CHECK(k.get_index()>=7,
+		    "coordinates and radius should be accessed by specialized methods");
+    unsigned int ki= k.get_index()-7;
+    return internal::FloatAttributeTableTraits::access_full_container_data
+      ((data_.access_data())[ki]);
+  }
+  //! Get the size of the derivative table for the given key.
+  //! 0 is returned if the derivative does not exist in the model.
+  unsigned get_derivative_size(FloatKey k) const {
+    IMP_USAGE_CHECK(k.get_index()>=7,
+		    "coordinates and radius should be accessed by specialized methods");
+    unsigned int ki=k.get_index() - 7;
+    if (derivatives_.access_data().size() <= ki) {
+      return 0;
+    } else {
+      return derivatives_.access_data()[ki].size();
+    }
+  }
+  double const* access_derivative_data(FloatKey k) const{
+    IMP_USAGE_CHECK(k.get_index()>=7,
+		    "coordinates and radius should be accessed by specialized methods");
+    unsigned int ki= k.get_index()-7;
+    IMP_USAGE_CHECK(ki < (derivatives_.access_data()).size(),
+                    "trying to access an attribute that was not added to this model");
+    return internal::FloatAttributeTableTraits::access_container_data
+      (derivatives_.access_data()[ki]);
+  }
+  double* access_derivative_data(FloatKey k){
+    IMP_USAGE_CHECK(k.get_index()>=7,
+		    "coordinates and radius should be accessed by specialized methods");
+    unsigned int ki= k.get_index()-7;
+    IMP_USAGE_CHECK(ki < (derivatives_.access_data()).size(),
+                    "trying to access an attribute that was not added to this model");
+    return internal::FloatAttributeTableTraits::access_container_data
+      (derivatives_.access_data()[ki]);
+  }
+  BoolAttributeTableTraits::Container const&
+    access_optimizeds_data(FloatKey k) const{
+    IMP_USAGE_CHECK(k.get_index() < (optimizeds_.access_data()).size(),
+                    "trying to access an attribute that was not added to this model");
+    return optimizeds_.access_data()[k.get_index()];
+  }
+  BoolAttributeTableTraits::Container&
+    access_optimizeds_data(FloatKey k){
+    IMP_USAGE_CHECK(k.get_index() < (optimizeds_.access_data()).size(),
+                    "trying to access an attribute that was not added to this model");
+    return optimizeds_.access_data()[k.get_index()];
+  }
+  //! to verify that an attribute actually exists in the model
+  //! before its table is being accessed
+  bool get_has_attribute(FloatKey k) const{
+    int ki=k.get_index()-7;
+    if(ki<0) {
+      return true; // coordinate or radius are special and always exist in the model
+    }
+    return ki < int((data_.access_data()).size())
+           && (data_.access_data())[ki].size() > 0;
+  }
+  //! to verify that an attribute derivative actually exists
+  //! in the model before its table is being accessed
+  bool get_has_attribute_derivative(FloatKey k) const{
+    int ki=k.get_index()-7;
+    if(ki<0) {
+      return true; // coordinate or radius are special and always exist in the model
+    }
+    return ki < int((derivatives_.access_data()).size())
+           && (data_.access_data())[ki].size() > 0;
+  }
+  //! to verify that an attribute optimizeds actually exists in the model
+  //! before its table is being accessed
+  bool get_has_attribute_optimizeds(FloatKey k) const{
+    int ki=k.get_index()-7;
+    if(ki<0) {
+      return true; // coordinate or radius are special and always exist in the model
+    }
+    return ki < int((optimizeds_.access_data()).size())
+           && (data_.access_data())[ki].size() > 0;
+  }
+  /** @} */
+
+  int get_number_of_attribute_sets(FloatKey k) const {
+    if (k.get_index() >= 7) {
+      unsigned ind = k.get_index() - 7;
+      if (data_.size() <= ind) {
+        return 1;
+      } else {
+        return data_.access_data()[ind].get_number_of_sets();
+      }
+    } else {
+      IMP_THROW("Use specialized methods for xyz, radii, internal coordinates",
+                TypeException);
+    }
+  }
+
+  int get_number_of_sphere_attribute_sets() const {
+    IMP_USAGE_CHECK(!spheres_.get_sets_external(),
+                    "Only supported for internal storage");
+    return spheres_.get_number_of_sets();
+  }
+
+  void set_sphere_attribute_sets_external(bool external) {
+    spheres_.set_sets_external(external);
+  }
+
+  bool get_sphere_attribute_sets_external() const {
+    return spheres_.get_sets_external();
+  }
+
+  int get_number_of_internal_coordinate_attribute_sets() const {
+    return internal_coordinates_.get_number_of_sets();
+  }
+
+  void set_internal_coordinate_attribute_sets_external(bool external) {
+    internal_coordinates_.set_sets_external(external);
+  }
+
+  bool get_internal_coordinate_attribute_sets_external() const {
+    return internal_coordinates_.get_sets_external();
+  }
+
+  void set_number_of_attribute_sets(FloatKey k, int nsets) {
+    if (k.get_index() >= 7) {
+      unsigned ind = k.get_index() - 7;
+      if (data_.size() <= ind) {
+        data_.access_data().resize(ind + 1);
+      }
+      data_.access_data()[ind].set_number_of_sets(
+          nsets, internal::FloatAttributeTableTraits::get_invalid());
+    } else {
+      IMP_THROW("Use specialized methods for xyz, radii, internal coordinates",
+                TypeException);
+    }
+  }
+
+  void set_attribute_sets_external(FloatKey k, bool external) {
+    if (k.get_index() >= 7) {
+      unsigned ind = k.get_index() - 7;
+      if (data_.size() <= ind) {
+        data_.access_data().resize(ind + 1);
+      }
+      data_.access_data()[ind].set_sets_external(external);
+    } else {
+      IMP_THROW("Use specialized methods for xyz, radii, internal coordinates",
+                TypeException);
+    }
+  }
+
+  bool get_attribute_sets_external(FloatKey k) const {
+    if (k.get_index() >= 7) {
+      unsigned ind = k.get_index() - 7;
+      if (data_.size() <= ind) {
+        return false;
+      } else {
+        return data_.access_data()[ind].get_sets_external();
+      }
+    } else {
+      IMP_THROW("Use specialized methods for xyz, radii, internal coordinates",
+                TypeException);
+    }
+  }
+
+  int get_number_of_xyz_attribute_sets() const {
+    IMP_USAGE_CHECK(spheres_.get_sets_external(),
+                    "Only supported for external storage");
+    return n_xyz_sets_;
+  }
+
+  void set_number_of_xyz_attribute_sets(int nsets) {
+    IMP_USAGE_CHECK(spheres_.get_sets_external(),
+                    "Only supported for external storage");
+    IMP_USAGE_CHECK(nsets >= 1, "Cannot have less than 1 set");
+    n_xyz_sets_ = nsets;
+  }
+
+  int get_number_of_radius_attribute_sets() const {
+    IMP_USAGE_CHECK(spheres_.get_sets_external(),
+                    "Only supported for external storage");
+    return n_radius_sets_;
+  }
+
+  void set_number_of_radius_attribute_sets(int nsets) {
+    IMP_USAGE_CHECK(spheres_.get_sets_external(),
+                    "Only supported for external storage");
+    IMP_USAGE_CHECK(nsets >= 1, "Cannot have less than 1 set");
+    n_radius_sets_ = nsets;
+  }
+
+  void set_number_of_sphere_attribute_sets(int nsets) {
+    IMP_USAGE_CHECK(!spheres_.get_sets_external(),
+                    "Only supported for internal storage");
+    spheres_.set_number_of_sets(nsets, get_invalid_sphere());
+  }
+
+  void set_number_of_internal_coordinate_attribute_sets(int nsets) {
+    internal_coordinates_.set_number_of_sets(
+                     nsets, get_invalid_sphere().get_center());
+  }
+
+  void set_active_attribute_set(FloatKey k, int set) {
+    if (k.get_index() >= 7) {
+      unsigned ind = k.get_index() - 7;
+      if (data_.size() <= ind) {
+        data_.access_data().resize(ind + 1);
+      }
+      data_.access_data()[ind].set_active_set(set);
+    } else {
+      IMP_THROW("Use specialized methods for xyz, radii, internal coordinates",
+                TypeException);
+    }
+  }
+
+  void set_active_sphere_attribute_set(int set) {
+    spheres_.set_active_set(set);
+  }
+
+  void set_active_internal_coordinate_attribute_set(int set) {
+    internal_coordinates_.set_active_set(set);
+  }
+
+  void set_range(FloatKey k, FloatRange fr) { ranges_[k.get_index()] = fr; }
+  FloatRange get_range(FloatKey k) {
+    FloatRange ret = ranges_[k.get_index()];
+    if (ret.first == -std::numeric_limits<double>::max()) {
+      if (k.get_index() < 4) {
+        std::swap(ret.first, ret.second);
+        for (unsigned int i = 0; i < spheres_.size(); ++i) {
+          if (internal::FloatAttributeTableTraits::get_is_valid(
+                  spheres_[ParticleIndex(i)][k.get_index()])) {
+            ret.first =
+                std::min(ret.first, spheres_[ParticleIndex(i)][k.get_index()]);
+            ret.second =
+                std::max(ret.second, spheres_[ParticleIndex(i)][k.get_index()]);
+          }
+        }
+        return ret;
+      } else if (k.get_index() < 7) {
+        std::swap(ret.first, ret.second);
+        for (unsigned int i = 0; i < internal_coordinates_.size(); ++i) {
+          if (internal::FloatAttributeTableTraits::get_is_valid(
+                  internal_coordinates_[ParticleIndex(i)][k.get_index() - 4])) {
+            ret.first = std::min(
+                ret.first,
+                internal_coordinates_[ParticleIndex(i)][k.get_index() - 4]);
+            ret.second = std::max(
+                ret.second,
+                internal_coordinates_[ParticleIndex(i)][k.get_index() - 4]);
+          }
+        }
+        return ret;
+
+      } else {
+        return data_.get_range_internal(FloatKey(k.get_index() - 7));
+      }
+    } else {
+      return ret;
+    }
+  }
+  void clear_attributes(ParticleIndex particle) {
+    if (spheres_.size() > get_as_unsigned_int(particle)) {
+      spheres_[particle] = get_invalid_sphere();
+      sphere_derivatives_[particle] = get_invalid_sphere();
+    }
+    if (internal_coordinates_.size() > get_as_unsigned_int(particle)) {
+      internal_coordinates_[particle] = get_invalid_sphere().get_center();
+      internal_coordinate_derivatives_[particle] =
+          get_invalid_sphere().get_center();
+    }
+    data_.clear_attributes(particle);
+    derivatives_.clear_attributes(particle);
+    optimizeds_.clear_attributes(particle);
+  }
+  FloatKeys get_attribute_keys(ParticleIndex particle) const {
+    FloatKeys ret = data_.get_attribute_keys(particle);
+    for (unsigned int i = 0; i < ret.size(); ++i) {
+      ret[i] = FloatKey(ret[i].get_index() + 7);
+    }
+    for (unsigned int i = 0; i < 7; ++i) {
+      if (get_has_attribute(FloatKey(i), particle)) {
+        ret.push_back(FloatKey(i));
+      }
+    }
+    return ret;
+  }
+  unsigned int size() const { return data_.size() + 7; }
+  unsigned int size(int i) const {
+
+    if (i < 4) {
+      return spheres_.size();
+    } else if (i < 7) {
+      return internal_coordinates_.size();
+    } else {
+      return data_.size(i - 7);
+    }
+  }
+};
+
+IMP_SWAP(FloatAttributeTable);
+
+template<unsigned D, class K>
+class VectorDDerivAttributeTable {
+  BasicAttributeTable<internal::VectorDAttributeTableTraits<D, K>> data_;
+  BasicAttributeTable<internal::VectorDAttributeTableTraits<D, K>> derivatives_;
+  // make use bitset
+  BasicAttributeTable<internal::GenericBoolAttributeTableTraits<K>> optimizeds_;
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+  Mask *read_mask_, *write_mask_, *add_remove_mask_, *read_derivatives_mask_,
+       *write_derivatives_mask_;
+#endif
+
+  friend class cereal::access;
+
+  template<class Archive> void serialize(Archive &ar) {
+    // Note that we don't serialize masks; they are handled by Model
+    ar(data_, derivatives_, optimizeds_);
+  }
+
+ public:
+  typedef K Key;
+
+  void swap_with(VectorDDerivAttributeTable<D, K> &o) {
+    IMP_SWAP_MEMBER(data_);
+    IMP_SWAP_MEMBER(derivatives_);
+    IMP_SWAP_MEMBER(optimizeds_);
+  }
+
+  VectorDDerivAttributeTable()
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+      : read_mask_(nullptr), write_mask_(nullptr), add_remove_mask_(nullptr),
+        read_derivatives_mask_(nullptr), write_derivatives_mask_(nullptr)
+#endif
+  {}
+
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+  void set_masks(Mask *read_mask, Mask *write_mask, Mask *add_remove_mask,
+                 Mask *read_derivatives_mask, Mask *write_derivatives_mask) {
+    data_.set_masks(read_mask, write_mask, add_remove_mask);
+    derivatives_.set_masks(read_derivatives_mask, write_derivatives_mask,
+                           add_remove_mask);
+    optimizeds_.set_masks(read_mask, write_mask, add_remove_mask);
+    read_mask_ = read_mask;
+    write_mask_ = write_mask;
+    add_remove_mask_ = add_remove_mask;
+    read_derivatives_mask_ = read_derivatives_mask;
+    write_derivatives_mask_ = write_derivatives_mask;
+  }
+#endif
+
+  void zero_derivatives() {
+    VectorD<D> zero;
+    std::fill(zero.begin(), zero.end(), 0.0);
+    derivatives_.fill(zero);
+  }
+
+  void clear_caches(ParticleIndex p) {
+    data_.clear_caches(p);
+  }
+
+  void add_cache_attribute(Key k, ParticleIndex p,
+                           const VectorD<D> &value) {
+    data_.add_cache_attribute(k, p, value);
+  }
+
+  void remove_attribute(Key k, ParticleIndex particle) {
+    IMP_CHECK_MASK(add_remove_mask_, particle, k, REMOVE, ATTRIBUTE);
+    data_.remove_attribute(k, particle);
+    derivatives_.remove_attribute(k, particle);
+    if (optimizeds_.get_has_attribute(k, particle)) {
+      optimizeds_.remove_attribute(k, particle);
+    }
+  }
+
+  bool get_is_optimized(Key k, ParticleIndex particle) const {
+    return optimizeds_.get_has_attribute(k, particle);
+  }
+
+  void set_is_optimized(Key k, ParticleIndex particle, bool tf) {
+    if (tf && !optimizeds_.get_has_attribute(k, particle)) {
+      optimizeds_.add_attribute(k, particle, true);
+    } else if (!tf && optimizeds_.get_has_attribute(k, particle)) {
+      optimizeds_.remove_attribute(k, particle);
+    }
+  }
+
+  VectorD<D> get_derivative(Key k, ParticleIndex particle,
+                            bool IMP_ATTRIBUTE_CHECKED_PARAM=true) const {
+    IMP_INTERNAL_CHECK_VARIABLE(IMP_ATTRIBUTE_CHECKED_PARAM);
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Can't get derivative that isn't there");
+    return derivatives_.get_attribute(k, particle, IMP_ATTRIBUTE_CHECKED_PARAM);
+  }
+
+  void add_to_derivative(Key k, ParticleIndex particle,
+                         const VectorD<D> &v,
+                         const DerivativeAccumulator &da) {
+    IMP_USAGE_CHECK(get_has_attribute(k, particle),
+                    "Can't get derivative that isn't there: "
+                    << k.get_string() << " on particle " << particle);
+    auto dit = derivatives_.access_attribute(k, particle).begin();
+    auto vit = v.begin();
+    while (vit != v.end()) {
+      IMP_ACCUMULATE(*dit, da(*vit));
+      dit++;
+      vit++;
+    }
+  }
+
+  void add_attribute(Key k, ParticleIndex particle,
+                     const VectorD<D> &value, bool opt=false) {
+    data_.add_attribute(k, particle, value);
+    VectorD<D> zero;
+    std::fill(zero.begin(), zero.end(), 0.0);
+    derivatives_.add_attribute(k, particle, zero);
+    if (opt) {
+      optimizeds_.add_attribute(k, particle, true);
+    }
+  }
+
+  bool get_has_attribute(Key k, ParticleIndex particle) const {
+    return data_.get_has_attribute(k, particle);
+  }
+
+  void set_attribute(Key k, ParticleIndex particle,
+                     const VectorD<D> &v) {
+    data_.set_attribute(k, particle, v);
+  }
+
+  VectorD<D> get_attribute(Key k, ParticleIndex particle,
+                           bool IMP_ATTRIBUTE_CHECKED_PARAM=true) const {
+    return data_.get_attribute(k, particle, IMP_ATTRIBUTE_CHECKED_PARAM);
+  }
+
+  VectorD<D> &access_attribute(Key k, ParticleIndex particle) {
+    return data_.access_attribute(k, particle);
+  }
+
+  VectorD<D> const* access_attribute_data(Key k) const {
+    return data_.access_attribute_data(k);
+  }
+
+  VectorD<D>* access_attribute_data(Key k) {
+    return data_.access_attribute_data(k);
+  }
+
+  VectorD<D>* access_full_attribute_data(Key k) {
+    return data_.access_full_attribute_data(k);
+  }
+
+  VectorD<D> const* access_derivative_data(Key k) const {
+    return derivatives_.access_attribute_data(k);
+  }
+
+  VectorD<D>* access_derivative_data(Key k) {
+    return derivatives_.access_attribute_data(k);
+  }
+
+  unsigned get_attribute_size(Key k) const {
+    return data_.get_attribute_size(k);
+  }
+
+  unsigned get_derivative_size(Key k) const {
+    return derivatives_.get_attribute_size(k);
+  }
+
+  void clear_attributes(ParticleIndex particle) {
+    data_.clear_attributes(particle);
+    derivatives_.clear_attributes(particle);
+    optimizeds_.clear_attributes(particle);
+  }
+
+  void set_number_of_attribute_sets(Key k, int nsets) {
+    unsigned ind = k.get_index();
+    if (data_.size() <= ind) {
+      data_.access_data().resize(ind + 1);
+    }
+    data_.access_data()[ind].set_number_of_sets(
+        nsets, internal::VectorDAttributeTableTraits<D, K>::get_invalid());
+  }
+
+  int get_number_of_attribute_sets(Key k) const {
+    unsigned ind = k.get_index();
+    if (data_.size() <= ind) {
+      return 1;
+    } else {
+      return data_.access_data()[ind].get_number_of_sets();
+    }
+  }
+
+  void set_attribute_sets_external(Key k, bool external) {
+    unsigned ind = k.get_index();
+    if (data_.size() <= ind) {
+      data_.access_data().resize(ind + 1);
+    }
+    data_.access_data()[ind].set_sets_external(external);
+  }
+
+  bool get_attribute_sets_external(Key k) const {
+    unsigned ind = k.get_index();
+    if (data_.size() <= ind) {
+      return false;
+    } else {
+      return data_.access_data()[ind].get_sets_external();
+    }
+  }
+
+  void set_active_attribute_set(Key k, int set) {
+    unsigned ind = k.get_index();
+    if (data_.size() <= ind) {
+      data_.access_data().resize(ind + 1);
+    }
+    data_.access_data()[ind].set_active_set(set);
+  }
+
+  IMP::Vector<Key> get_attribute_keys(ParticleIndex particle) const {
+    return data_.get_attribute_keys(particle);
+  }
+
+  unsigned int size() const { return data_.size(); }
+  unsigned int size(unsigned int i) const { return data_.size(i); }
+
+  FloatIndexes get_optimized_vector_attributes() const {
+    FloatIndexes ret;
+    for (unsigned int i = 0; i < optimizeds_.size(); ++i) {
+      for (unsigned int j = 0; j < optimizeds_.size(i); ++j) {
+        if (optimizeds_.get_has_attribute(Key(i), ParticleIndex(j))) {
+          for (unsigned int k = 0; k < D; ++k) {
+            ret.push_back(FloatIndex(ParticleIndex(j), Key(i), k));
+	  }
+        }
+      }
+    }
+    return ret;
+  }
+};
+
+typedef BasicAttributeTable<internal::StringAttributeTableTraits>
+    StringAttributeTable;
+typedef BasicAttributeTable<internal::IntAttributeTableTraits>
+    IntAttributeTable;
+typedef BasicAttributeTable<internal::ObjectAttributeTableTraits>
+    ObjectAttributeTable;
+typedef BasicAttributeTable<internal::WeakObjectAttributeTableTraits>
+    WeakObjectAttributeTable;
+typedef BasicAttributeTable<internal::IntsAttributeTableTraits>
+    IntsAttributeTable;
+typedef BasicAttributeTable<internal::FloatsAttributeTableTraits>
+    FloatsAttributeTable;
+typedef BasicAttributeTable<internal::ObjectsAttributeTableTraits>
+    ObjectsAttributeTable;
+typedef BasicAttributeTable<internal::ParticleAttributeTableTraits>
+    ParticleAttributeTable;
+typedef BasicAttributeTable<internal::ParticlesAttributeTableTraits>
+    ParticlesAttributeTable;
+typedef MultiBasicAttributeTable<internal::VectorDAttributeTableTraits<3, Vector3DKey>>
+    Vector3DAttributeTable;
+typedef VectorDDerivAttributeTable<3, Vector3DDerivKey>
+    Vector3DDerivAttributeTable;
+typedef MultiBasicAttributeTable<internal::VectorDAttributeTableTraits<4, Vector4DKey>>
+    Vector4DAttributeTable;
+typedef VectorDDerivAttributeTable<4, Vector4DDerivKey>
+    Vector4DDerivAttributeTable;
+
+typedef SparseBasicAttributeTable<internal::SparseStringAttributeTableTraits>
+    SparseStringAttributeTable;
+typedef SparseBasicAttributeTable<internal::SparseIntAttributeTableTraits>
+    SparseIntAttributeTable;
+typedef SparseBasicAttributeTable<internal::SparseFloatAttributeTableTraits>
+    SparseFloatAttributeTable;
+typedef SparseBasicAttributeTable<internal::SparseParticleAttributeTableTraits>
+    SparseParticleAttributeTable;
+
+struct Masks {
+#if IMP_HAS_CHECKS >= IMP_INTERNAL
+  mutable Mask read_mask_, write_mask_, add_remove_mask_,
+      read_derivatives_mask_, write_derivatives_mask_;
+#endif
+};
+IMPKERNEL_END_INTERNAL_NAMESPACE
+
+#ifndef SWIG
+#define IMP_MODEL_IMPORT(Base)     \
+  using Base::add_attribute;       \
+  using Base::add_cache_attribute; \
+  using Base::get_attribute_size;   \
+  void remove_attribute(Base::Key k, ParticleIndex particle) {  \
+    Base::remove_attribute(k, particle);                        \
+    removed_particles_attributes_age_ = age_counter_;           \
+  }                                \
+  using Base::get_has_attribute;   \
+  using Base::set_attribute;       \
+  using Base::get_attribute;       \
+  using Base::access_attribute
+#define IMP_MODEL_DERIV_IMPORT(Base)     \
+  IMP_MODEL_IMPORT(Base);                \
+  using Base::get_derivative;            \
+  using Base::get_derivative_size;       \
+  using Base::access_derivative_data;    \
+  using Base::set_is_optimized;          \
+  using Base::get_is_optimized;          \
+  using Base::add_to_derivative
+#define IMP_MODEL_SPARSE_IMPORT(Base)     \
+  using Base::add_attribute;       \
+  using Base::remove_attribute;    \
+  using Base::get_attribute_size;   \
+  using Base::get_has_attribute;   \
+  using Base::set_attribute;       \
+  using Base::get_attribute
+#define IMP_MODEL_ATTRIBUTE_SET_IMPORT(Base)     \
+  using Base::get_number_of_attribute_sets;   \
+  using Base::set_number_of_attribute_sets;   \
+  using Base::set_attribute_sets_external;   \
+  using Base::get_attribute_sets_external;   \
+  using Base::set_active_attribute_set
+#else
+#define IMP_MODEL_IMPORT(Base)
+#define IMP_MODEL_SPARSE_IMPORT(Base)
+#define IMP_MODEL_ATTRIBUTE_SET_IMPORT(Base)
+#endif
+
+#endif /* IMPKERNEL_INTERNAL_ATTRIBUTE_TABLES_H */

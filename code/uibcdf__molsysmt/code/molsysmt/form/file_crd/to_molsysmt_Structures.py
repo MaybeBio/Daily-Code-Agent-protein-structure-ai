@@ -1,0 +1,103 @@
+import numpy as np
+
+from molsysmt import pyunitwizard as puw
+from molsysmt._private.argdigest import arg_digest
+from molsysmt._private.smonitor import (
+    InternalAlgorithmError,
+)
+
+
+@arg_digest(form="file:crd")
+def to_molsysmt_Structures(
+    item, atom_indices="all", structure_indices="all", skip_digestion=False
+):
+    """
+    Converting from file:crd to molsysmt.Structures.
+
+
+    Parameters
+    ----------
+    item : file:crd
+        Input CHARMM coordinate file in standard or extended format.
+    atom_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Source atom positions to retain, in the requested order.
+    structure_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Structure indices to retain from the single available structure.
+        An empty selection returns zero structures.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    Returns
+    -------
+    molsysmt.Structures
+        Resulting object in molsysmt.Structures form.
+
+
+    Notes
+    -----
+    The coordinate file stores angstroms. Output coordinates are unit-bearing
+    quantities standardized with PyUnitWizard; no box or time is inferred.
+
+    Examples
+    --------
+    >>> import molsysmt as msm
+    >>> molsys = msm.systems['POPC']['popc.crd']
+    >>> converted = to_molsysmt_Structures(molsys, atom_indices=[2, 0])
+    >>> converted.n_atoms
+    2
+
+    .. versionadded:: 1.0.0
+    """
+
+    # EXT:
+    #      (i10,2x,a)  natoms,'EXT'
+    #      (2I10,2X,A8,2X,A8,3F20.10,2X,A8,2X,A8,F20.10)
+    #      iatom,ires,resn,typr,x,y,z,segid,rid,wmain
+    # standard:
+    #      (i5) natoms
+    #      (2I5,1X,A4,1X,A4,3F10.5,1X,A4,1X,A4,F10.5)
+    #      iatom,ires,resn,typr,x,y,z,segid,orig_resid,wmain
+
+    from molsysmt.native.structures import Structures
+
+    tmp_item = Structures()
+
+    x = []
+    y = []
+    z = []
+
+    with open(item) as fff:
+        for line in fff:
+            if line.strip().startswith("*") or line.strip() == "":
+                continue
+            field = line.split()
+            if len(field) == 1:
+                n_atoms = int(field[0])
+            elif len(field) == 2:
+                n_atoms = int(field[0])
+            else:
+                x.append(float(field[4]))
+                y.append(float(field[5]))
+                z.append(float(field[6]))
+
+    if len(x) != n_atoms:
+        raise InternalAlgorithmError(
+            "Unexpected empty state",
+            caller="molsysmt.form.file_crd.to_molsysmt_Structures",
+        )
+    coordinates = puw.quantity(
+        np.expand_dims(np.column_stack([x, y, z]), axis=0),
+        unit="angstroms",
+        standardized=True,
+    )
+
+    tmp_item.append(structure_id=[0], coordinates=coordinates)
+
+    del (x, y, z, coordinates)
+
+    return tmp_item.extract(
+        atom_indices=atom_indices,
+        structure_indices=structure_indices,
+        copy_if_all=False,
+        skip_digestion=True,
+    )

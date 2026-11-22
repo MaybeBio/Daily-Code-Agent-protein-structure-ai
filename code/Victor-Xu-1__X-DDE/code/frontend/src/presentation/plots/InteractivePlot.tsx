@@ -1,0 +1,254 @@
+import { useEffect, useRef, useState } from "react";
+import type * as Plotly from "plotly.js";
+import type { Language } from "../../types";
+import "./plotly-native.css";
+import "./plots.css";
+import { FigureExport } from "../../publication/FigureExport";
+import { plotlyFigure } from "../../publication/plotly";
+import { nativeTraces, type ChartTrace } from "./types";
+import { usePlotFrame } from "./usePlotFrame";
+
+export function InteractivePlot({
+  title,
+  data,
+  layout,
+  language,
+  onPoint,
+  onRange,
+  selectable = false,
+  height = 280,
+  sourceKey,
+}: {
+  title: string;
+  data: ChartTrace[];
+  layout?: Partial<Plotly.Layout>;
+  language: Language;
+  onPoint?(point: Plotly.PlotDatum): void;
+  onRange?(range: { x: number[]; y: number[] }): void;
+  selectable?: boolean;
+  height?: number;
+  /** Opt in only when the caller owns the exact scientific source identity. */
+  sourceKey?: string;
+}) {
+  const element = useRef<(HTMLDivElement & Plotly.PlotlyHTMLElement) | null>(
+    null,
+  );
+  const callback = useRef(onPoint);
+  callback.current = onPoint;
+  const rangeCallback = useRef(onRange);
+  rangeCallback.current = onRange;
+  const queue = useRef(Promise.resolve());
+  const [error, setError] = useState(false);
+  const [dragMode, setDragMode] = useState<"zoom" | "pan" | "select">("zoom");
+  const plot = useRef<typeof Plotly | null>(null);
+  const zh = language === "zh";
+  const effectiveDragMode =
+    dragMode === "select" && !selectable ? "zoom" : dragMode;
+  const signature = JSON.stringify({
+    sourceKey,
+    data,
+    layout,
+    height,
+    title,
+    effectiveDragMode,
+    selectable,
+  });
+  // Scientific values and labels must match as well as the caller's identity.
+  // Default consumers retain the original hide-until-current behavior.
+  const frame = usePlotFrame(
+    sourceKey === undefined
+      ? signature
+      : JSON.stringify({ sourceKey, title, data }),
+    signature,
+  );
+  const currentSignature = useRef(signature);
+  currentSignature.current = signature;
+  useEffect(() => {
+    const target = element.current!;
+    let disposed = false;
+    const observer = new ResizeObserver(() => {
+      if (plot.current && target.data && target.offsetWidth > 0)
+        void plot.current.Plots.resize(target);
+    });
+    observer.observe(target);
+    const ready = import("plotly.js-cartesian-dist-min").then(
+      ({ default: library }) => {
+        if (!disposed) plot.current = library;
+        return library;
+      },
+    );
+    queue.current = ready.then(() => {});
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      // Active import failures are reported by the render queue; cleanup has no renderer to purge.
+      void ready.then(
+        (p) => p.purge(target),
+        () => {},
+      );
+      plot.current = null;
+    };
+  }, []);
+  useEffect(() => {
+    let active = true;
+    setError(false);
+    queue.current = queue.current
+      .then(async () => {
+        const target = element.current,
+          p = plot.current;
+        if (!active || !target || !p) return;
+        frame.begin();
+        await p.react(
+          target,
+          // Plotly normalizes input objects in place. Keep native scene state
+          // separate from immutable React/scientific inputs and render signatures.
+          structuredClone(nativeTraces(data)),
+          structuredClone({
+            autosize: true,
+            height,
+            margin: { l: 58, r: 18, t: 16, b: 56 },
+            font: { family: "Inter, sans-serif", size: 11, color: "#526079" },
+            paper_bgcolor: "transparent",
+            plot_bgcolor: "transparent",
+            hovermode: "closest",
+            dragmode: effectiveDragMode,
+            uirevision: title,
+            legend: { orientation: "h", y: -0.26, x: 0 },
+            ...layout,
+          }),
+          {
+            responsive: true,
+            displaylogo: false,
+            scrollZoom: true,
+            displayModeBar: false,
+          },
+        );
+        target.removeAllListeners("plotly_click");
+        target.on("plotly_click", (event) => {
+          if (
+            active &&
+            currentSignature.current === signature &&
+            event.points[0]
+          )
+            callback.current?.(event.points[0]);
+        });
+        target.removeAllListeners("plotly_selected");
+        target.on("plotly_selected", (event) => {
+          const range = event?.range;
+          if (
+            active &&
+            currentSignature.current === signature &&
+            selectable &&
+            range &&
+            [range.x, range.y].every(
+              (axis) =>
+                Array.isArray(axis) &&
+                axis.length === 2 &&
+                axis.every(Number.isFinite),
+            )
+          )
+            rangeCallback.current?.({
+              x: range.x as number[],
+              y: range.y as number[],
+            });
+        });
+        // Even a superseded render changed the native canvas. Record that fact,
+        // rather than reviving an older ready signature during A-B-A navigation.
+        frame.complete();
+        if (active) setError(false);
+      })
+      .catch(() => {
+        frame.invalidate();
+        if (active) setError(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [signature]);
+  return (
+    <section className="research-plot">
+      <header>
+        <h3>{title}</h3>
+        <div className="research-chart-controls">
+          <select
+            aria-label={zh ? "图表操作" : "Chart interaction"}
+            value={effectiveDragMode}
+            onChange={(event) =>
+              setDragMode(event.target.value as "zoom" | "pan" | "select")
+            }
+          >
+            <option value="zoom">{zh ? "缩放" : "Zoom"}</option>
+            <option value="pan">{zh ? "平移" : "Pan"}</option>
+            {selectable && (
+              <option value="select">{zh ? "选择" : "Select"}</option>
+            )}
+          </select>
+          <button
+            type="button"
+            className="text-button"
+            disabled={!frame.ready || error}
+            onClick={() => {
+              if (plot.current && element.current)
+                void plot.current.relayout(element.current, {
+                  "xaxis.autorange": !layout?.xaxis?.range,
+                  ...(layout?.xaxis?.range
+                    ? {
+                        "xaxis.range": [
+                          layout.xaxis.range[0],
+                          layout.xaxis.range[1],
+                        ] as [Plotly.Datum, Plotly.Datum],
+                      }
+                    : {}),
+                  "yaxis.autorange": !layout?.yaxis?.range,
+                  ...(layout?.yaxis?.range
+                    ? {
+                        "yaxis.range": [
+                          layout.yaxis.range[0],
+                          layout.yaxis.range[1],
+                        ] as [Plotly.Datum, Plotly.Datum],
+                      }
+                    : {}),
+                });
+            }}
+          >
+            {zh ? "重置" : "Reset"}
+          </button>
+          <FigureExport
+            sourceKey={signature}
+            sourceReady={frame.ready && !error}
+            language={language}
+            filename={title}
+            format="svg"
+            disabled={!frame.ready || error}
+            render={async (settings) => {
+              if (!plot.current || !element.current)
+                throw new Error("Chart is not ready.");
+              return plotlyFigure(plot.current, element.current, settings);
+            }}
+          />
+        </div>
+      </header>
+      {error && (
+        <p role="alert">
+          {zh
+            ? "交互图表加载失败，请刷新页面。"
+            : "Interactive chart could not load. Please refresh the page."}
+        </p>
+      )}
+      {!error && !frame.visible && (
+        <p role="status" className="research-plot-status">
+          {zh ? "正在加载交互图表…" : "Loading interactive chart…"}
+        </p>
+      )}
+      <div
+        ref={element}
+        className="research-plot-canvas"
+        role="application"
+        aria-label={title}
+        aria-busy={!frame.ready || error}
+        data-frame-current={frame.visible && !error}
+        style={{ minHeight: height }}
+      />
+    </section>
+  );
+}

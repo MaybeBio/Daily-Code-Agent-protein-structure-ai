@@ -1,0 +1,4970 @@
+[
+  {
+    "full_name": "Biohub/esm",
+    "score": 10,
+    "one_liner": "该仓库发布ESMC蛋白语言模型、ESMFold2结构预测模型及ESM Atlas，提供可运行的代码、权重和教程，核心聚焦蛋白质结构预测、设计与互作建模，与课题高度契合。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "RosettaCommons/foundry",
+    "score": 10,
+    "one_liner": "Foundry 是 RosettaCommons 推出的蛋白质设计工具包，集成了 RFD3 结构生成、ProteinMPNN 序列设计和 RF3 结构预测等核心 AI 模型，直接命中蛋白质结构计算与设计课题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "ok",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "RosettaCommons/rosetta",
+    "score": 10,
+    "one_liner": "Rosetta是蛋白质结构计算建模的经典软件套件，涵盖结构预测、设计、对接和模拟，与课题高度契合。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "sokrypton/colabfold-jax",
+    "score": 10,
+    "one_liner": "这是一个集成AlphaFold 3及多种蛋白质结构预测模型（如OpenFold3、Boltz-2、RoseTTAFold3等）的推理实现仓库，核心聚焦蛋白质结构预测与构象采样，方法上包含深度学习与扩散模型，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "aqlaboratory/openfold",
+    "score": 9,
+    "one_liner": "OpenFold 是 AlphaFold2 的可训练 PyTorch 复现，提供蛋白质结构预测的完整代码、模型与训练流程，是蛋白质结构计算与 AI 方法的核心工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "ok",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "chaidiscovery/chai-lab",
+    "score": 9,
+    "one_liner": "Chai-1 是一个多模态基础模型，用于蛋白质、小分子、DNA/RNA 等分子结构预测，提供可运行的代码和权重，与蛋白质结构计算方向高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "microsoft/foldingdiff",
+    "score": 9,
+    "one_liner": "foldingdiff 是一个基于扩散模型生成蛋白质主链结构的工具，直接命中蛋白质结构生成这一核心课题，并提供了完整的训练、采样和评估代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Graylab/IgFold",
+    "score": 9,
+    "one_liner": "IgFold 是基于深度学习的抗体结构预测工具，提供可运行的代码和预训练模型，直接命中蛋白质结构预测核心课题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "haddocking/haddock3",
+    "score": 9,
+    "one_liner": "HADDOCK3 是蛋白质-蛋白质对接的模块化计算平台，整合实验数据与生物物理信息进行结构建模，与课题高度相关且提供可运行代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "HardyLaboratory/proteindj",
+    "score": 9,
+    "one_liner": "ProteinDJ 是一个整合多种 AI 蛋白设计工具（RFdiffusion、ProteinMPNN、AlphaFold2 等）的 Nextflow 流水线，用于蛋白质结构设计与结合剂生成，与课题高度相关且提供可运行代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mooreneural/lacuna",
+    "score": 9,
+    "one_liner": "Lacuna 是一个通过构象系综分析在蛋白质、RNA 和 DNA 中发现隐蔽结合口袋的计算工具，结合了弹性网络 NMA、MD 和扩散采样等物理/AI 方法，直接服务于蛋白质结构相关的构象采样与功能位点发现。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "sokrypton/localfold",
+    "score": 9,
+    "one_liner": "LocalFold 是一个在浏览器中本地运行 AlphaFold 2/3 的蛋白质结构预测工具，支持复合物、配体、核酸等，无需上传序列，直接命中蛋白质结构预测核心问题，且提供可运行的代码和模型。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "kaist-ai-bio/kfold",
+    "score": 9,
+    "one_liner": "K-Fold 是一个生物分子基础模型，通过 apo-to-holo 扩散桥预测结合诱导的构象变化，专注于抗体-抗原和分子胶降解剂等蛋白复合物结构预测，与蛋白质结构计算建模课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mjendrusch/flexcraft",
+    "score": 9,
+    "one_liner": "flexcraft 是一个 JAX 库，整合生成式蛋白骨架模型、序列设计和结构预测器，构建端到端的蛋白设计流程，核心聚焦蛋白质结构计算与设计。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "tiwarylab/antioch-vs",
+    "score": 9,
+    "one_liner": "ANTIOCH-VS 是一个从蛋白序列到候选配体的端到端集合虚拟筛选框架，整合了结构预测、构象采样、口袋检测、对接和元动力学后处理，核心围绕蛋白质结构计算建模，方法上结合了AI（ColabFold、AF2RAVE）与物理模拟（MD、对接、CTMD），且提供了可运行的模块化代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "WangGroup-AI/AI2BMD",
+    "score": 9,
+    "one_liner": "AI2BMD 是一个基于 ViSNet 机器学习势能面的从头算生物分子动力学模拟工具，直接针对蛋白质结构进行 MD 模拟，方法上结合 AI 与物理模拟，代码可运行，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "flatironinstitute/CyclicCAE_public",
+    "score": 9,
+    "one_liner": "CyclicCAE 是一个基于构象自编码器的宏环肽骨架结构生成与采样工具，通过隐空间实现构象生成、MCMC 搜索和能量最小化，直接命中蛋白质结构生成与设计课题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "prescient-design/boltz-jump",
+    "score": 9,
+    "one_liner": "Boltz-Jump 基于 Boltz-2 扩散模型实现加速构象系综采样与结构精修，直接命中蛋白质构象采样与生成核心问题，且提供完整可运行代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "sokrypton/rfd4-proteina-webgpu",
+    "score": 9,
+    "one_liner": "将 RFD4-Proteina 全原子流匹配蛋白设计模型移植到浏览器 WebGPU 运行,是蛋白质结构设计方法的可运行实现,与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "aurekaresearch/OpenBench",
+    "score": 9,
+    "one_liner": "OpenBench 是一个面向全原子生物分子结构预测的基准测试，涵盖蛋白-蛋白、抗体-抗原、蛋白-核酸及蛋白-配体等任务，提供标准化输入、MSA 和评估脚本，与蛋白质结构计算建模课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "scbirlab/yunta",
+    "score": 9,
+    "one_liner": "yunta 是一个集成 DCA、RoseTTAFold 和 AlphaFold2 的蛋白质-蛋白质相互作用预测与复合物结构预测工具，直接命中蛋白质结构计算与 AI 方法核心方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Linmj-Judy/BioDynaSpec",
+    "score": 9,
+    "one_liner": "BioDynaSpec 是一个面向蛋白质动力学轨迹生成的频域自回归扩散模型，通过窗口傅里叶分解和结构先验实现长时程全原子 MD 轨迹的高效生成与构象采样，与课题高度契合。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "newturing/pifold",
+    "score": 9,
+    "one_liner": "π-Fold 基于 Protenix/AlphaFold 3 架构，用 GRPO 强化学习和 Rosetta/Vina 物理奖励微调生物分子共折叠模型，生成物理上合理的蛋白质结构，是蛋白质结构预测与物理模拟结合的可运行工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "t-whitfield/OmegaPulldown",
+    "score": 9,
+    "one_liner": "基于Boltz-2和AlphaFold 3的蛋白质-蛋白质相互作用结构筛选Nextflow流水线，直接命中蛋白质结构预测与PPI计算建模核心方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "DeepFoldProtein/deepfold3-dev",
+    "score": 9,
+    "one_liner": "DeepFold3 是 AlphaFold 3 的 PyTorch 复现，实现基于扩散模型的生物分子复合物结构预测，包含 MSA 搜索、模板嵌入、置信度评估和训练流程，是蛋白质结构预测领域的核心工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "vv137/deepfold3-dev",
+    "score": 9,
+    "one_liner": "DeepFold3 是一个基于 PyTorch 的 AlphaFold 3 架构复现，专注于生物分子复合物结构预测，采用扩散模型和 Evoformer，提供完整的训练与推理工具，与蛋白质结构计算课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mjendrusch/rfd4fx",
+    "score": 9,
+    "one_liner": "rfd4fx 是 RFD4-Proteina 的 JAX/Equinox 移植版，实现基于流匹配的蛋白质结合物与基序结构生成，直接服务于蛋白质结构设计课题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "InigoSerjeant/PGEL_local_repo",
+    "score": 9,
+    "one_liner": "PGEL 是一个基于嵌入学习的蛋白质扩散模型控制框架，通过冻结 RFdiffusion 并优化 motif 嵌入实现基序多样化生成，直接命中蛋白质结构生成与设计课题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "GreggHelt2/structure-prompt-adapter",
+    "score": 9,
+    "one_liner": "SPA 是一个为 RFdiffusion3 设计的参数高效侧车适配器，通过解耦交叉注意力实现蛋白质结构生成的软条件控制，核心聚焦蛋白质结构生成与设计，提供完整代码、模型和验证流程。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "OliverLaboratory/UNICORNE-BENCH",
+    "score": 9,
+    "one_liner": "该仓库提供UNICORNE-BENCH基准，用于评估序列到构象集合预测器，核心聚焦蛋白质构象采样与生成，并包含可运行的评估代码和数据集，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pvaras8/drug-repurposing",
+    "score": 9,
+    "one_liner": "Boltz是开源蛋白质-配体复合物结构预测与结合亲和力预测的深度学习模型，直接命中蛋白质结构计算与AI方法核心方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "forxhunter/PI-mamba",
+    "score": 9,
+    "one_liner": "PI-Mamba 是一个基于物理启发的状态空间模型，用于蛋白质骨架生成，结合流匹配与 Rouse 谱，提供完整训练、评估与诊断代码，直接命中蛋白质结构生成与设计课题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "lammps/lammps",
+    "score": 8,
+    "one_liner": "LAMMPS 是经典分子动力学模拟软件，支持蛋白质等生物大分子的结构模拟，是蛋白质结构计算研究的重要工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "openmm/openmm",
+    "score": 8,
+    "one_liner": "OpenMM 是一个高性能分子动力学模拟库，为蛋白质结构计算模拟提供核心物理方法支持，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "plumed/plumed2",
+    "score": 8,
+    "one_liner": "PLUMED 是一个用于增强采样分子动力学模拟的开源插件库，核心支持蛋白质等生物分子的构象采样与自由能计算，与蛋白质结构计算方向高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "NVIDIA-BioNeMo/bionemo-agent-toolkit",
+    "score": 8,
+    "one_liner": "NVIDIA BioNeMo Agent Toolkit 将蛋白质结构预测、对接、设计等生命科学工具封装为 AI Agent 技能，核心覆盖蛋白质结构计算建模，方法上提供可运行的 NIM 服务与工作流，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "JuliaMolSim/Molly.jl",
+    "score": 8,
+    "one_liner": "Molly.jl 是一个纯 Julia 的分子动力学模拟包，支持蛋白质体系模拟、力场读取、GPU 加速和可微模拟，与蛋白质结构计算方向高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "RosettaCommons/atomworks",
+    "score": 8,
+    "one_liner": "AtomWorks 是 RosettaCommons 开发的生物分子建模开源平台，提供结构解析/清洗工具和深度学习特征化库，直接支持蛋白质结构相关的计算建模与ML流程。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "choderalab/openmmtools",
+    "score": 8,
+    "one_liner": "OpenMMTools 是面向 OpenMM 的分子模拟工具包，提供增强采样、自由能计算和 MCMC 框架，直接支持蛋白质结构的物理模拟计算。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Colvars/colvars",
+    "score": 8,
+    "one_liner": "Colvars 是一个用于分子模拟的集体变量库，支持增强采样和自由能计算，是蛋白质构象采样和 MD 模拟的重要工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "cytokineking/FreeBindCraft",
+    "score": 8,
+    "one_liner": "FreeBindCraft 是 BindCraft 的改进版，提供无 PyRosetta 的蛋白质-蛋白对接与设计评分/松弛引擎（tmol/OpenMM），并集成 ipSAE 界面质量评估，核心聚焦蛋白质结构计算与 AI/物理模拟方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "David-OConnor/molchanica",
+    "score": 8,
+    "one_liner": "Molchanica 是一个集成了分子可视化、编辑、MD模拟及多种AI蛋白结构/序列预测与设计工具（如RFDiffusion3、OpenFold3、ProteinMPNN等）的综合性计算平台，直接覆盖蛋白质结构预测、设计、对接和MD模拟等核心课题方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "aai-research-lab/FastMDXplora",
+    "score": 8,
+    "one_liner": "FastMDXplora 是一个从 PDB 代码一键完成分子动力学模拟、分析与报告的全流程自动化工具，核心聚焦蛋白质结构及其配体/膜环境的 MD 计算，方法上提供可运行的 CLI/GUI/API 与 Agent 接口，但更偏工程化封装而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "locbp-uzh/biopipelines",
+    "score": 8,
+    "one_liner": "BioPipelines 是一个面向蛋白质与配体计算设计的 Python 工作流框架，集成了 ProteinMPNN、AlphaFold、RFdiffusion、Boltz2 等 AI 工具，覆盖序列设计、结构预测、构象采样与结合优化，与课题高度相关且提供可运行代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "KULL-Centre/CALVADOS",
+    "score": 8,
+    "one_liner": "CALVADOS 是一个基于 OpenMM 的粗粒化隐式溶剂模拟工具，专注于无序蛋白和多结构域蛋白的结构与相分离行为，属于蛋白质结构相关的物理模拟方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "rcedgar/reseek",
+    "score": 8,
+    "one_liner": "Reseek 是一个蛋白质结构搜索与比对算法，通过将蛋白质骨架编码为大规模字母表进行序列比对，显著提升同源检测灵敏度，属于蛋白质结构计算领域的高价值工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "NVIDIA-BioNeMo/BioNeMo-Inference-Runtime",
+    "score": 8,
+    "one_liner": "NVIDIA 的 BioNeMo Inference Runtime 是面向蛋白质、核酸和配体结构预测的 GPU 加速推理库，提供从 FASTA/MSA 到 PDB/mmCIF 的高效结构预测管线，与蛋白质结构计算课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "salilab/imp",
+    "score": 8,
+    "one_liner": "IMP 是一个用于整合结构建模的 C++/Python 库，支持蛋白质等生物大分子的结构建模与计算，与蛋白质结构计算方向高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "gnina/OMTRA",
+    "score": 8,
+    "one_liner": "OMTRA 是一个基于流匹配的多任务生成模型，用于基于结构的药物设计，涵盖蛋白口袋条件下的配体生成、对接和药效团条件生成，核心涉及蛋白质-配体结构建模，与蛋白质结构计算方向高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "smiles724/ProtMD",
+    "score": 8,
+    "one_liner": "ProtMD 用等变图神经网络在分子动力学轨迹上预训练，并迁移到配体结合亲和力与药效预测，核心涉及蛋白质-配体结构建模与AI方法，但下游任务偏向配体而非纯蛋白质结构。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "hgbrian/foldism",
+    "score": 8,
+    "one_liner": "基于Modal serverless的多算法蛋白质结构预测平台，集成AlphaFold2、ESMFold2等工具并提供置信度评分，直接命中蛋白质结构预测方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Pranavkhade/PACKMAN",
+    "score": 8,
+    "one_liner": "PACKMAN 是一个蛋白质结构、堆积与运动分析工具包，实现铰链预测、ANM/hdANM、GNM、堆积熵和动态社区识别等结构计算方法，与蛋白质结构计算建模课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "nec-research/DIMOS",
+    "score": 8,
+    "one_liner": "DIMOS 是一个基于 PyTorch 的可微分子动力学/蒙特卡洛模拟框架，支持经典力场与机器学习势能，可应用于蛋白质结构相关的 MD 模拟与增强采样。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "rvhonorato/gdock",
+    "score": 8,
+    "one_liner": "gdock 是一个基于遗传算法和物理能量评分的信息驱动蛋白-蛋白对接工具，直接命中蛋白质结构计算中的对接问题，提供可运行的 Rust 实现。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "matsunagalab/mdclaw",
+    "score": 8,
+    "one_liner": "MDClaw 是一个由 AI 编码代理驱动的分子动力学模拟工具，基于 AmberTools 和 OpenMM，支持蛋白质体系的准备、平衡、生产模拟与分析，属于蛋白质结构计算方向的高价值工具仓库。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "prism-science/WaterFlow",
+    "score": 8,
+    "one_liner": "WaterFlow 是一个基于流匹配和置信度模型的深度学习工具，用于预测蛋白质结构上有序水分子的位置，属于蛋白质结构相关的计算建模，方法上提供了可运行的代码和预训练模型。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "yliust/Calpha",
+    "score": 8,
+    "one_liner": "Calpha 是一个将蛋白质折叠集成到通用语言模型中的开源项目，通过语言模型隐藏状态驱动结构生成器，实现从序列到全原子坐标的蛋白质结构预测，并提供了完整的代码、权重和基准测试。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "roitberg-group/torchani-amber",
+    "score": 8,
+    "one_liner": "TorchANI-Amber 将 ANI 类神经网络势能集成到 Amber MD 引擎中，实现蛋白质等生物分子的 AI 力场分子动力学模拟，是蛋白质结构计算模拟方向的高价值工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "BioKT/MasterMSM",
+    "score": 8,
+    "one_liner": "MasterMSM 是一个从分子动力学轨迹构建马尔可夫状态模型（MSM）的 Python 包，用于蛋白质构象动力学和速率分析，属于蛋白质结构计算模拟方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "salilab/pmi",
+    "score": 8,
+    "one_liner": "PMI 是 IMP 集成建模平台的高层 Python 模块，用于构建、评分、采样和分析蛋白质复合物结构模型，支持多尺度表示、分子动力学和副本交换采样，与蛋白质结构计算建模高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "TCPUniLU/mars",
+    "score": 8,
+    "one_liner": "MARS 是一个基于机器学习的力场框架，用于自动化构象采样、振动光谱和微溶剂化，核心聚焦于分子（含蛋白质）构象的结构计算建模，方法上结合了多种 ML 势函数与物理模拟，且提供可运行的代码和 GUI。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "maraxen/aminx",
+    "score": 8,
+    "one_liner": "Aminx 是 ProteinMPNN/LigandMPNN 的 JAX 高性能重实现，提供蛋白质序列设计的采样与打分 API，核心聚焦蛋白质结构计算与序列设计，方法上实现了可运行的 AI 模型代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "temple-compute/pantheon",
+    "score": 8,
+    "one_liner": "这是一个面向蛋白质结构计算（MD、对接、虚拟筛选、构象分析等）的科学工作流仓库，封装了多种AI与物理模拟工具，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "bigict/ProFOLD2",
+    "score": 8,
+    "one_liner": "ProFOLD2 是一个蛋白质3D结构预测应用，提供训练和推理代码，直接命中蛋白质结构预测核心课题，但README未展示具体方法创新细节。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "KamyarZeinalipour/protein-design-LLMs",
+    "score": 8,
+    "one_liner": "该仓库利用微调的大型语言模型（如Mistral、Llama等）生成蛋白质序列，并通过AlphaFold等工具评估结构质量，属于蛋白质序列设计方向的AI方法实现，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ssiddhantsharma/binderqc",
+    "score": 8,
+    "one_liner": "binderqc 是一个针对设计蛋白结合子的质量控制与标签位点评分工具，通过几何与物理指标评估蛋白-蛋白复合物界面、姿态、可开发性等，直接服务于蛋白结构计算与设计流程。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "coqylight/boltz_dap",
+    "score": 8,
+    "one_liner": "Boltz-DAP 是一个面向大型蛋白复合物结构预测的多GPU并行推理工具，基于Boltz-2实现动态轴向并行，核心聚焦蛋白质结构预测问题，方法上提供可运行的分布式推理代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "vv137/mdir",
+    "score": 8,
+    "one_liner": "MDIR 是一个基于 MLIR 的分子动力学编译器，支持蛋白质体系的全原子模拟，提供可运行的 CPU/GPU 代码，与蛋白质结构计算中的 MD 模拟高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Scigantic/scigantic-msa",
+    "score": 8,
+    "one_liner": "该仓库构建蛋白质序列的MSA并生成AlphaFold 3、Boltz等结构预测器的输入文件，整合公开MSA数据，直接服务于蛋白质结构预测流程。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Gabriel-QIN/unZipro",
+    "score": 8,
+    "one_liner": "unZipro 是一个基于GNN的无监督零样本逆折叠框架，用于蛋白质进化与高适应度突变预测，直接以蛋白质结构为输入，结合AI方法解决蛋白质序列设计与功能预测问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "DannyJPark/TheSelective",
+    "score": 8,
+    "one_liner": "该仓库实现了一个基于扩散模型的3D配体选择性生成框架，通过双亲和力引导最大化目标与脱靶蛋白的结合亲和力差距，核心对象是蛋白-配体结构建模与生成，方法上提供了可运行的训练、采样和对接评估代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pritampanda15/PandaProtein",
+    "score": 8,
+    "one_liner": "PandaProtein 是一个面向蛋白质结构准备、晶体学验证、MD 模拟与对接的全栈工作台，提供可运行的代码工具，与蛋白质结构计算建模高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "bigict/ProXYZ",
+    "score": 8,
+    "one_liner": "ProXYZ 是一个基于 U-Net 双粒度架构的蛋白质语言模型预训练框架，通过 CLE 和 distogram 结构感知辅助头联合学习序列与结构信息，并支持 FIM 训练和 ESMFold 评估，直接服务于蛋白质结构相关的计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "wwwtalalahmed98-collab/ph-switch-binders",
+    "score": 8,
+    "one_liner": "该仓库是蛋白质从头设计竞赛项目，使用AlphaFold2幻觉、ProteinMPNN和BoltzGen等方法设计条件性蛋白结合物，并包含结构预测、几何验证和负结果分析，与蛋白质结构计算建模高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "yoonalimsuwan/REAL-FOLD-ONE",
+    "score": 8,
+    "one_liner": "该仓库实现了一个基于OpenMM和PyTorch的蛋白质结构精修与高通量突变扫描框架，支持MD模拟和结构设计，与蛋白质结构计算课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pablo-arantes/boltz2-webgpu",
+    "score": 8,
+    "one_liner": "基于Boltz-2的WebGPU浏览器端虚拟筛选工具，通过共折叠和亲和力模块对蛋白质-配体复合物进行结构预测与打分排序，核心聚焦蛋白质-配体结合的结构计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "jccheng-hub/PDchain",
+    "score": 8,
+    "one_liner": "PDchain 是一个跨平台命令行工具链，整合 RFdiffusion、LigandMPNN 和 PyRosetta 进行蛋白质设计、结合物设计与连续进化优化，直接命中蛋白质结构计算与 AI 方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "bpwhite/crvscience-beofold",
+    "score": 8,
+    "one_liner": "BeoFold 是一个纯 Rust 实现的分布式蛋白质折叠引擎，集成了分子动力学模拟、副本交换采样和马尔可夫状态模型，直接命中蛋白质结构计算的核心问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ZengLLQ/chemi-verlet",
+    "score": 8,
+    "one_liner": "ChemiVerlet 是一个纯 Python 的原子级分子动力学模拟引擎，涵盖 PME 静电、LINCS 约束、FEP/MBAR 自由能计算、伞形采样和马尔可夫态模型，虽非直接针对蛋白质结构预测，但其 MD 模拟和自由能方法可迁移用于蛋白质构象采样与结合自由能计算，与课题方向高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "PranavNagaraji/GTE-PPIS-Baseline",
+    "score": 8,
+    "one_liner": "该仓库提供GTE-PPIS蛋白-蛋白互作位点预测模型的可复现基线实现，包含图Transformer与等变GNN双分支结构，并修正了原版代码缺陷，属于蛋白质结构相关AI建模工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "hernandezhdd/fiumd",
+    "score": 8,
+    "one_liner": "FiuMD 是一个基于 TorchMD 的粗粒化蛋白质分子动力学模拟工具，支持异构批量 GPU 计算和神经网络势能修正，直接服务于蛋白质结构计算模拟。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "erezaajdinaj/AI-Based-Protein-Structure-Prediction-and-Optimization",
+    "score": 8,
+    "one_liner": "该仓库实现多种蛋白质结构预测与优化算法（如模拟退火、遗传算法、束搜索等），聚焦于蛋白质结构计算建模，方法上提供可运行代码，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Abdulrahman-Neamah/kras-g12d-pmhc-binder",
+    "score": 8,
+    "one_liner": "该仓库针对KRAS G12D新抗原pMHC复合物进行从头设计蛋白结合物，结合RFD4、ProteinMPNN和Boltz-2等AI结构预测与设计工具，并深入分析结合界面与选择性，属于蛋白质结构计算设计方向的高价值工作。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pablo-arantes/rainmd",
+    "score": 8,
+    "one_liner": "RainMD 是一个在浏览器中通过 WebGPU 运行分子动力学模拟的工具，支持 AMBER 拓扑文件，可进行 NPT 模拟并输出轨迹，与蛋白质结构计算中的 MD 模拟直接相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "lplpibp/HKU5_binder_design",
+    "score": 8,
+    "one_liner": "该仓库实现了一个基于RFdiffusion、ProteinMPNN、AlphaFold2和Rosetta的蛋白质从头设计流水线，用于设计靶向病毒RBD的微型蛋白结合剂，核心对象和问题均聚焦于蛋白质结构计算设计，方法为可运行的AI与物理模拟工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "UW-Madison-CBML/SPINET",
+    "score": 8,
+    "one_liner": "SPINET 是一个基于层丛神经网络（Sheaf NN）的蛋白质逆折叠模型，利用分子动力学特征进行序列设计，直接命中蛋白质结构计算与AI方法结合的核心方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Umbriona/THOR",
+    "score": 8,
+    "one_liner": "THOR 是一个基于 CycleGAN 的蛋白质序列生成工具，通过未配对的中温/嗜热序列学习热稳定性改造，结合 ESM-1v 和温度回归器，并提供可运行的代码、预训练权重和 Colab 演示，核心聚焦蛋白质序列设计以提升热稳定性，与蛋白质结构计算方向高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Immunochem/bioemu2-benchmark",
+    "score": 8,
+    "one_liner": "该仓库对BioEmu2蛋白质构象生成模型进行系统基准测试，评估其结构准确性、动力学滞后和对接能力，核心聚焦蛋白质结构计算建模，并附带可运行的预检工具与脚本。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "draarivpatel-ui/fold-lattice",
+    "score": 8,
+    "one_liner": "这是一个零依赖的粗粒化蛋白质折叠工具包，实现晶格模型、副本交换蒙特卡洛、Ramachandran分析和PDB导出，核心聚焦蛋白质结构计算，方法上提供可运行的代码实现。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ha9160034-create/Bio_V2",
+    "score": 8,
+    "one_liner": "这是一个面向蛋白质突变体与药物对接的分子建模与模拟平台，集成结构分析、AutoDock Vina对接、GROMACS MD模拟及MM-PBSA评估，核心围绕蛋白质结构计算建模，方法实现完整。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Han5332/calpha-folding-lab",
+    "score": 8,
+    "one_liner": "浏览器内运行的蛋白质折叠实验室，结合MSA+AI网络预测与Langevin动力学模拟，实现Cα粗粒化结构预测与基准评估。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "KrajTechne/Inceptive",
+    "score": 8,
+    "one_liner": "基于BindCraft2和RFDiffusion的蛋白结合物设计流水线，集成Optimus验证，聚焦蛋白质结构设计与互作计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pedro-tulio/pyadmd",
+    "score": 8,
+    "one_liner": "pyAdMD 是一个实现 aMDeNM 增强采样分子动力学方法的 Python 包，通过激发简正模式加速蛋白质构象采样，直接服务于蛋白质结构计算研究。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "adonaytetemke-wq/cofolding-benchmark",
+    "score": 8,
+    "one_liner": "该仓库系统评估AI共折叠模型（Boltz）与经典对接（AutoDock Vina）在COX酶-药物结合预测上的表现，核心聚焦蛋白质-配体结构计算建模，方法实现完整且结果详实。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "maraxen/prolix",
+    "score": 8,
+    "one_liner": "Prolix 是一个基于 JAX 的蛋白质力场与分子动力学模拟库，专注于蛋白质物理模拟，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "JavierGarcia-Ruiz/protein-function-gnn",
+    "score": 8,
+    "one_liner": "该仓库实现基于3D残基图神经网络的酶功能预测，以蛋白质结构为核心，结合GNN方法解决功能预测问题，代码完整可运行。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "sahithik117/project_abag_interaction",
+    "score": 8,
+    "one_liner": "该仓库复现并实现了基于CNN的抗体-抗原界面结构相互作用分析工具，聚焦蛋白质-蛋白质互作的结构计算建模，方法可运行且与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "nagesh123-geek/Diffusion_Flow_sampling_dynamics",
+    "score": 8,
+    "one_liner": "该仓库实现扩散模型与整流流模型用于Trp-cage蛋白构象采样的训练与采样代码，核心聚焦蛋白质结构构象生成，方法为AI生成模型，三轴齐备。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "N-S8990/molscope",
+    "score": 8,
+    "one_liner": "MolScope 是一个面向蛋白质分子动力学模拟、构象状态发现与机器学习特征优先排序的端到端平台，核心聚焦蛋白质结构计算与构象采样，方法上结合物理模拟（OpenMM MD）与统计机器学习，对蛋白质结构计算方向有较高价值。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "AI-PD-Lab/ProteinPilot",
+    "score": 8,
+    "one_liner": "ProteinPilot 是一个基于浏览器的图形界面，用于通过拓扑图生成 RFdiffusion 系列模型的邻接条件输入，直接支持蛋白质结构设计，并配套 HARMONIA 权重，属于蛋白质结构生成设计方向的高价值工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mervynzwkoh/AraPPLM",
+    "score": 8,
+    "one_liner": "该仓库对植物蛋白-蛋白互作预测的配对蛋白语言模型进行基准测试与微调，核心聚焦蛋白质互作的结构计算建模，并提供了可运行的代码、训练与评估流程。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "JieWei-H/GRACE",
+    "score": 8,
+    "one_liner": "GRACE 将蛋白质复合物预测建模为基于 PPI 网络的图条件自回归生成问题，融合 ESM-2 序列语义与图结构嵌入，属于蛋白质互作结构计算建模的 AI 方法，代码完整可运行。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "YUStulinu/Verlet",
+    "score": 8,
+    "one_liner": "从零实现的分子动力学引擎，支持蛋白质体系模拟，与OpenMM对比验证，属于蛋白质结构计算中的物理模拟方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Thinnil/metflow",
+    "score": 8,
+    "one_liner": "MET Flow 是一个面向蛋白质构象系综生成、热力学能量评估和降维分析的集成计算管线，直接服务于蛋白质结构计算与构象采样课题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "bellcheddar/AlphaFraud",
+    "score": 8,
+    "one_liner": "AlphaFraud 自动对比新沉积的人类蛋白结构与 AlphaFold 盲预测，量化预测错误并识别高置信度错误案例，是蛋白质结构预测评估的实用工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ninaphatak/binder-bench",
+    "score": 8,
+    "one_liner": "该仓库通过AlphaFold2-multimer接口置信度指标对设计蛋白结合剂进行基准测试，评估其预测结合能力，属于蛋白质结构计算与AI方法在蛋白-蛋白互作预测中的应用，但更偏向于基准评估而非新方法开发。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "aishahodzic/all-atom-protein-jepas",
+    "score": 8,
+    "one_liner": "该仓库实现并评估了基于JEPA的全原子蛋白质表示学习模型，包含训练代码、评估流程和结构重建结果，直接涉及蛋白质结构表征与生成，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Lambda-Biolab/biolab-runners",
+    "score": 8,
+    "one_liner": "这是一个面向蛋白质结构预测、MD模拟、骨架生成、序列设计等任务的模块化计算工具库，封装了Boltz-2、OpenMM、RFdiffusion、ProteinMPNN、Rosetta等主流方法，与课题高度相关且提供可运行代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ZengLLQ/solvato-dyne",
+    "score": 8,
+    "one_liner": "SolvatoDyne 是一个自包含的分子模拟引擎，实现经典与 Drude 极化力场、隐式溶剂、增强采样自由能计算等，虽非直接针对蛋白质结构预测/设计，但可迁移用于蛋白质构象采样与 MD 模拟，方法轴扎实。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "bshreyakamath/EHC-Net_PPI_Prediction",
+    "score": 8,
+    "one_liner": "EHC-Net 是一个基于 ESM2 与超图学习的蛋白质-蛋白质相互作用预测深度学习框架，直接命中 PPI 结构计算建模课题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "minghao-sun-sc/proteindiff",
+    "score": 8,
+    "one_liner": "该仓库实现了一个基于扩散模型的蛋白质结构预测工具，从氨基酸序列生成蛋白质骨架结构，直接命中蛋白质结构生成与AI方法核心方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "sepehrskysh1376/jiggle_wiggle_of_atoms",
+    "score": 8,
+    "one_liner": "一个可扩展的分子动力学模拟引擎，专注于经典粒子的牛顿运动模拟，与蛋白质结构计算中的MD模拟方法直接相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "AtharvaTilewale/ConformAtlas",
+    "score": 8,
+    "one_liner": "ConformAtlas 是一个将分子动力学轨迹转化为构象自由能景观、亚稳态和动力学的计算工具，核心针对蛋白质构象采样与结构分析，方法上提供可运行的 PCA、自由能计算、MSM 和增强采样重加权等物理模拟分析功能。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "FidanKarimli/graph-jepa-protein-stability",
+    "score": 8,
+    "one_liner": "该仓库系统比较了不同预训练目标（掩码残基预测 vs JEPA向量预测）对蛋白质稳定性突变效应（ΔΔG）预测的影响，核心是蛋白质结构图网络与AI方法，但问题聚焦于稳定性预测而非结构生成/采样。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "CSB-KaracaLab/bioemu2-colab",
+    "score": 8,
+    "one_liner": "该仓库提供在Colab上运行BioEmu2的笔记本，用于蛋白质结构预测、平衡构象采样和时间传播，并包含蛋白-蛋白复合物示例及与MD参考的对比，直接服务于蛋白质结构计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "LiuSantu123/pdflow",
+    "score": 8,
+    "one_liner": "pdflow 是一个可复现的蛋白质设计工作流，整合 RFdiffusion、AlphaFold3、Boltz2 等结构预测与评分工具，覆盖从骨架生成到序列设计、结构预测和指标评估的完整流程，与蛋白质结构计算方向高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Aditya-galaxy/protein-binder-design",
+    "score": 8,
+    "one_liner": "该仓库实现了一个端到端的计算流水线，用于针对PD-L1等靶点从头设计微型蛋白结合物，涵盖骨架生成、序列设计（ProteinMPNN）和生物物理筛选，与蛋白质结构计算设计高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "LeonardoSilvaH/boltz2-mutation-screening",
+    "score": 8,
+    "one_liner": "该仓库利用Boltz-2对癌症相关蛋白突变体与药物进行共折叠和结合亲和力预测，是蛋白质-配体互作结构计算建模的实用工具，但偏工程应用而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pablo-arantes/tmol-mutscan",
+    "score": 8,
+    "one_liner": "基于TMol的GPU加速蛋白质复合物界面突变扫描(ΔΔG)工具,通过构象系综和Rosetta能量函数计算突变对结合自由能的影响,直接服务于蛋白质-蛋白质/肽/配体互作的结构计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "rkibler88/EVODYN",
+    "score": 8,
+    "one_liner": "EVODYN 是一个将蛋白质家族与结构转化为多层级数据集（共进化耦合、残基互作网络、分子动力学及相关性）的流水线工具，核心聚焦蛋白质变构的结构计算分析，并集成 MD 模拟与网络分析，对蛋白质结构计算研究有较高价值。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "chowdhurylab-studio/ipro-agent",
+    "score": 8,
+    "one_liner": "该仓库是IPRO迭代蛋白质再设计与优化方法的独立可运行实现，通过MILP、对接和能量优化进行蛋白质序列设计，核心对象、问题和方法均与蛋白质结构计算相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ZengLLQ/clade-fold",
+    "score": 8,
+    "one_liner": "CladeFold 是一个将进化序列分析、共进化接触推断、弹性网络动力学与贝叶斯系统发育整合到蛋白质结构计算中的 Python 工具包，覆盖结构预测、构象折叠与动力学模拟，方法上包含 AI 式统计模型（DCA）与物理模拟（GNM/ANM），与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "QntmSeer/Somasays",
+    "score": 8,
+    "one_liner": "该仓库是一个基于ESM3的蛋白质序列与结构生成、微调及优化引擎，涵盖结构预测、序列设计、定向进化和生物物理评估，与课题高度相关且提供可运行代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pasangpythondiary/NbFold",
+    "score": 8,
+    "one_liner": "NbFold 是一个基于蛋白语言模型和 OpenMM/Rosetta 精修的纳米抗体结构预测工具，直接命中蛋白质结构预测与 AI+物理模拟结合的核心方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pritampanda15/PandaX",
+    "score": 8,
+    "one_liner": "PandaX 是一个实时多算法分子对接工作台，提供活体诱导契合柔性侧链对接、多蛋白竞技场对接、PLIF 指纹和 17 引擎基准套件，核心聚焦蛋白质-配体结构计算，方法上实现了可运行的 AI/物理模拟对接工具。",
+    "copy_ok": false,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "raynalei/Torch-Harness",
+    "score": 8,
+    "one_liner": "OpenDDE Harness 是一个面向抗体设计的智能体工具，通过LLM推理和OpenDDE结构预测优化CDR序列，支持VHH/scFv等，核心聚焦蛋白质结构计算与序列设计。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "YJ-Zhang-Bioinfo/SEPAL-PPI",
+    "score": 8,
+    "one_liner": "SEPAL-PPI 是一个结合蛋白语言模型与多模态结构特征进行蛋白-蛋白相互作用预测的完整研究代码库，核心对象为蛋白质互作，方法上实现了可运行的 AI 训练与预测流程，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "anweshpandey/mlff_mmgbsa",
+    "score": 8,
+    "one_liner": "该仓库实现了一个基于机器学习力场(MACE)的MMGBSA结合自由能计算工具,用于蛋白质-配体结合亲和力预测和残基分解,属于蛋白质结构相关的计算建模方法,具有可运行的代码和工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ytworks/cuFEP",
+    "score": 8,
+    "one_liner": "cuFEP 是一个基于 OpenMM 和 REST2 副本交换的蛋白质-配体绝对结合自由能计算工具，直接服务于蛋白质结构相关的物理模拟计算。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "MDAnalysis/mdanalysis",
+    "score": 7,
+    "one_liner": "MDAnalysis 是分子动力学模拟轨迹分析工具库，虽非直接做结构预测或生成，但为蛋白质结构计算提供核心分析基础设施，与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "steineggerlab/foldseek",
+    "score": 7,
+    "one_liner": "Foldseek 是蛋白质结构快速比对与搜索工具，核心对象为蛋白质结构，但主要解决结构比较而非预测/生成/模拟问题，方法上提供可运行的CPU/GPU工具，与课题方向部分相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "NVIDIA/cuEquivariance",
+    "score": 7,
+    "one_liner": "NVIDIA 的 cuEquivariance 提供等变神经网络的高性能 CUDA 内核与 PyTorch/JAX 绑定，虽非直接针对蛋白质结构，但其等变张量积和分段多项式方法可高效支持蛋白质结构预测与构象建模中的几何神经网络。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "OpenFreeEnergy/openfe",
+    "score": 7,
+    "one_liner": "openfe 是一个用于执行炼金术自由能计算的 Python 包，属于分子模拟和药物发现领域，与蛋白质结构计算相关，但主要聚焦于配体结合自由能而非蛋白质结构本身。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "general-molecular-simulations/so3lr",
+    "score": 7,
+    "one_liner": "SO3LR 是一个预训练的机器学习力场，用于生物分子模拟，支持分子动力学和几何优化，与蛋白质结构计算相关但非直接针对蛋白质结构预测或设计。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Becksteinlab/GromacsWrapper",
+    "score": 7,
+    "one_liner": "GromacsWrapper 是一个围绕 GROMACS 的 Python 封装库，用于便捷地设置和运行分子动力学模拟，属于蛋白质结构计算中的 MD 模拟工具，但主要是工程化封装而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "OpenBioSim/biosimspace",
+    "score": 7,
+    "one_liner": "BioSimSpace 是一个用于生物分子模拟的 Python 框架，支持分子动力学等物理模拟，与蛋白质结构计算相关，但更偏向于通用模拟工作流而非特定蛋白质结构预测或设计方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "westlake-repl/SaprotHub",
+    "score": 7,
+    "one_liner": "SaprotHub 提供无需编码即可微调与共享蛋白质语言模型的平台，聚焦蛋白功能预测，与蛋白质结构计算方向相关但以功能预测为主，结构建模成分较弱。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "marrink-lab/vermouth-martinize",
+    "score": 7,
+    "one_liner": "Martinize2/vermouth 是用于将原子结构转换为 Martini 粗粒化拓扑的工具，属于蛋白质结构相关的分子动力学模拟前处理，但非 AI 方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mqcomplab/MDANCE",
+    "score": 7,
+    "one_liner": "MDANCE 是一个用于分子动力学轨迹聚类的工具库，通过 n-ary 相似性实现线性时间聚类，帮助分析蛋白质构象采样数据，虽不直接做结构预测或生成，但为 MD 模拟的构象分析提供了高效可用的计算方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "FeNNol-tools/FeNNol",
+    "score": 7,
+    "one_liner": "FeNNol 是一个基于 JAX 的神经网络势库，用于构建、训练和运行分子模拟的力场增强神经网络势，可应用于蛋白质等分子体系的能量和力预测及 MD 模拟，但并非专门针对蛋白质结构问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "bioexcel/biobb",
+    "score": 7,
+    "one_liner": "BioBB 是生物分子模拟工具（含 MD、对接、构象分析等）的 Python 封装库，为蛋白质结构计算提供可复用的工作流组件，但本身不实现新方法，偏工程化集成。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pritampanda15/Molecular-Dynamics",
+    "score": 7,
+    "one_liner": "该仓库提供GROMACS分子动力学模拟的脚本、指南和工具，覆盖蛋白质、蛋白-配体、膜蛋白等体系，属于蛋白质结构相关的物理模拟方法，但以工程化应用和教程为主，缺乏方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "flyark/LIVIA",
+    "score": 7,
+    "one_liner": "LIVIA 是一个基于浏览器的蛋白质-蛋白质互作预测结果分析与可视化工具，专注于从结构预测文件中提取相互作用残基和置信度指标，属于蛋白质结构计算方向的应用型工具，但更偏分析可视化而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "rafwiewiora/molarium",
+    "score": 7,
+    "one_liner": "Molarium 是一个本地优先的分子查看、构建与模拟工作台，支持蛋白质结构查看、MD 模拟、构象搜索和基于 LocalFold 的结构预测，但核心更偏向通用分子工具而非蛋白质结构计算专精。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "rcsb/foldmatch",
+    "score": 7,
+    "one_liner": "FoldMatch 是一个将蛋白质等大分子三维结构编码为向量嵌入、用于大规模结构相似性搜索和聚类的 Python 工具包，基于 ESM3 蛋白语言模型和 Transformer 聚合器，属于蛋白质结构计算建模的工程化应用，但更偏检索/聚类而非结构预测或生成。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "JaafarMehrez/GPUMD-PySAGES",
+    "score": 7,
+    "one_liner": "该仓库提供GPUMD与PySAGES的GPU原生接口，用于机器学习势上的增强采样分子动力学模拟，虽非直接针对蛋白质，但MD增强采样方法可迁移至蛋白质构象采样研究。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "tiwarylab/mahler",
+    "score": 7,
+    "one_liner": "MAHLER 是一个用于预测抗体解离速率的命令行工具，通过重加权 IfMetaD 轨迹并结合 MD 模拟与 RAVE 表示学习，核心对象为蛋白质（抗体）结构相关计算，但方法偏重物理模拟与重加权，AI 成分有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "hpcSSG/FastEq",
+    "score": 7,
+    "one_liner": "FastEq 是面向等变神经网络的高性能 GPU 算子库，加速原子机器学习中的张量积、球谐函数等核心计算，虽非直接解决蛋白质结构问题，但其算子可支撑蛋白质结构预测/力场计算等模型训练。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "GENTEL-lab/PhaseFlow",
+    "score": 7,
+    "one_liner": "PhaseFlow 是一个面向相分离蛋白的多模态生成模型，结合序列、相图、结构特征与流匹配等方法，用于 LLPS 预测、DPR 定位和突变效应评估，与蛋白质结构计算建模相关但侧重相分离功能而非经典结构预测/采样。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "AI4PDLab/Mol2Pro",
+    "score": 7,
+    "one_liner": "该仓库提供配体条件蛋白序列生成的数据集、T5示例与评估工具，聚焦蛋白序列生成与泛化性基准，与蛋白质结构计算方向相关但以序列为主、结构建模为辅。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "wangziting111/EAlign_clean",
+    "score": 7,
+    "one_liner": "EAlign 是一个基于 CPU 的蛋白质结构比对工具，结合序列与结构信息进行成对结构比对，属于蛋白质结构计算领域，但主要解决比对而非预测/生成/对接等核心问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "hemeai/ToxBind",
+    "score": 7,
+    "one_liner": "基于BindCraft的蛇毒毒素蛋白结合剂从头设计项目，聚焦蛋白质结构计算与AI设计，但偏应用且未实验验证。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "chiral-data/collab-workflows",
+    "score": 7,
+    "one_liner": "该仓库是药物发现与分子分析的科学计算工作流集合，包含多个蛋白质结构预测、对接、口袋检测、结合剂设计等AI/物理模拟流程，虽非单一核心方法库，但覆盖了蛋白质结构计算的关键任务。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "kon-218/ligand-x-launcher",
+    "score": 7,
+    "one_liner": "Ligand-X 是一个本地化药物发现平台，整合了蛋白质准备、分子对接、MD模拟、结合自由能计算和生成设计等结构计算工具，虽以药物发现为应用导向，但核心方法覆盖蛋白质结构相关计算，且提供可运行代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Victor-Xu-1/X-DDE",
+    "score": 7,
+    "one_liner": "X-DDE 是一个面向早期药物发现的可视化研究平台，集成结构预测、对接、分子动力学和 FEP 等蛋白质结构计算工具，但更偏工程化平台而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "npechl/pandora",
+    "score": 7,
+    "one_liner": "Pandora 是一个用于构建结构生物学 ML 数据集的 Python 工具包，专注于 mmCIF 解析、规范化、去重和防泄漏划分，虽不直接做蛋白质结构预测或模拟，但为蛋白质结构相关的 AI 建模提供关键的数据基础设施，方法上以数据处理工具为主而非核心建模方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "databio/awesome-bio-foundation-models",
+    "score": 7,
+    "one_liner": "该仓库是生物基础模型（含蛋白质语言模型与结构预测模型）的精选列表，虽覆盖蛋白质结构相关工具，但本身仅为资源清单，未实现方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "bdelabarreC/bdelabarreC-OpenADMET-Cyp3A4-Structure-Challenge",
+    "score": 7,
+    "one_liner": "该仓库是作者参与CYP3A4蛋白结构预测挑战赛的完整工作流记录，使用OpenFold3/ESMFold2进行共折叠、OpenMM优化和OrbMol/PoseBusters打分选择，核心聚焦蛋白-配体结构预测与后处理，但以个人参赛记录为主，方法创新和通用工具封装有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "jkantorow/glycographer",
+    "score": 7,
+    "one_liner": "Glycographer 通过片段化对接和体积表征生成受体-糖配体结合亲和力图谱，聚焦糖蛋白互作的结构计算建模，方法可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Westenhoff-Lab/XSSDense",
+    "score": 7,
+    "one_liner": "XSSDense 使用 β-VAE 和遗传算法从 X 射线溶液散射数据重建蛋白质三维电子密度图，属于蛋白质结构计算建模，但主要聚焦于密度图重建而非直接的结构预测或构象采样。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Felixdadsas/binder-selectivity-",
+    "score": 7,
+    "one_liner": "该仓库评估生成式蛋白设计模型（BoltzGen）对同源靶标（BNP vs ANP）的选择性，核心是蛋白质结构计算与AI设计方法，但当前处于早期阶段且无实验验证。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "DrCiroSmith/DrNemo-Caries-Foundry",
+    "score": 7,
+    "one_liner": "该仓库是一个针对龋齿致病菌GtfB蛋白的环状二硫键大环抑制剂计算设计流水线，结合对接、分子动力学和严格筛选，属于蛋白质结构计算建模方向，但对象为特定靶标且方法为工程化应用，创新性有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "holehouse-lab/PIMMS",
+    "score": 7,
+    "one_liner": "PIMMS 是一个基于格点的粗粒化蒙特卡洛模拟引擎，用于研究聚合物（包括蛋白质相关生物分子凝聚体）的相行为和构象性质，属于蛋白质构象采样的物理模拟工具，但非直接针对蛋白质结构预测或设计。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "wdc19981006-cell/easy-MD",
+    "score": 7,
+    "one_liner": "该仓库是一个面向Windows的蛋白质-小分子自动化对接工作流，封装了Vina、PLIP、PyMOL等工具，核心是蛋白质-配体对接而非结构预测或构象采样，方法为物理对接工具链，对象和问题轴相关但方法创新有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "MarcelRochera00/identification-of-candidate-pockets-at-the-myc-max-interface",
+    "score": 7,
+    "one_liner": "该仓库提供针对MYC-MAX蛋白复合物及其单体分子动力学模拟的分析脚本，涵盖结构稳定性、结合界面、口袋识别与验证，属于蛋白质结构计算分析工具，但偏重分析而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "JMB-Scripts/HotSpots_Finder",
+    "score": 7,
+    "one_liner": "这是一个PyMOL插件，用于检测和可视化蛋白质界面热点残基，支持RFdiffusion等AI蛋白设计工作流，属于蛋白质结构计算与设计方向，但方法偏传统几何/物理描述符，非AI方法本身。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "sircalch/mdcheck",
+    "score": 7,
+    "one_liner": "MDCheck 是一个用于分子动力学模拟轨迹收敛性、统计效率和可重复性评估的开源工具，虽不直接预测或生成蛋白质结构，但为 MD 模拟的结构计算研究提供关键的质量控制方法，与课题方向紧密相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "grizzledtroubadour/poor_benchmark",
+    "score": 7,
+    "one_liner": "这是一个蛋白质任务分布外泛化基准测试套件，提供9个任务（含结构文件）用于评估深度学习模型在蛋白质结构相关任务上的鲁棒性，与蛋白质结构计算建模直接相关但本身不实现预测/生成方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "QinguiSun/ShallowMD",
+    "score": 7,
+    "one_liner": "ShallowMD 是 DeePMD-kit 的纯 PyTorch 简化重实现，专注于机器学习分子动力学势能模型的透明教学与可修改性，与蛋白质结构计算中的 MD 模拟方法高度相关，但当前尚未提供完整可运行代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "jimburtoft/boltz-neuron",
+    "score": 7,
+    "one_liner": "该仓库将Boltz-2蛋白质结构预测模型移植到AWS Inferentia2/Trainium2硬件上，通过编译优化和NKI内核加速推理，核心是蛋白质结构预测的工程化部署与性能优化。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "SreeVasthav-Upputoori/WaweDock",
+    "score": 7,
+    "one_liner": "WaweDock 是一个面向 Windows 的分子对接工作台，集成了蛋白/配体准备、AutoDock Vina 对接和 3D 可视化，属于蛋白质结构计算中的对接工具，但更偏工程化应用而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "rpinho/adaptyv-challenges",
+    "score": 7,
+    "one_liner": "该仓库是蛋白质设计竞赛的参赛代码，使用RFdiffusion、BoltzGen等AI工具进行TfR1和KRAS pMHC结合物设计，核心是蛋白质结构生成与打分，但更多是工具链集成而非新方法开发。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "leblanclucy/openmm-moleculardynamics",
+    "score": 7,
+    "one_liner": "该仓库提供基于OpenMM的蛋白质-配体分子动力学模拟及MM/PBSA等下游分析流程，聚焦酶-底物结合机制的结构计算，但以工程化脚本为主，缺乏方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "MichaelFirstAC/Sequence-Aware-GNN",
+    "score": 7,
+    "one_liner": "该仓库用GCN结合ESM-2序列嵌入和经典生物物理特征进行蛋白质-蛋白质相互作用预测，并严格评估冷蛋白泛化，属于蛋白质互作的结构计算建模，但方法创新性一般且偏工程化。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Oleg-Nedina/BML",
+    "score": 7,
+    "one_liner": "该仓库是一个课程项目，用MD模拟和多种计算工具（FoldX、Rosetta、ProteinMPNN等）设计肌养蛋白的热稳定突变体，核心是蛋白质结构计算与稳定性设计，但作为课程作业而非通用工具，方法实现和可复用性有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "njweiss/pimd-rs",
+    "score": 7,
+    "one_liner": "一个用 Rust 实现的路径积分分子动力学引擎，支持量子系综采样和机器学习势（如 MACE），虽非直接针对蛋白质结构，但其 MD 模拟框架可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "2020chenjinkui-cloud/dockstudio",
+    "score": 7,
+    "one_liner": "DockStudio 是一个跨平台分子对接平台，封装了 AutoDock Vina、smina 等对接引擎，提供批量虚拟筛选、相互作用分析和可复现审计功能，直接服务于蛋白质-配体对接这一蛋白质结构计算核心问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ssvassiliev/MD-ML-Workshop-Exercises",
+    "score": 7,
+    "one_liner": "面向分子动力学模拟的机器学习势能训练与实操练习仓库，聚焦ML/MM混合模拟与GPU性能，与蛋白质结构计算中的MD模拟方法直接相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "lijingbai2009/PyRAI3MD",
+    "score": 7,
+    "one_liner": "PyRAI3MD 是一个面向 AI 增强的从头算分子动力学（AIMD）的模块化计算框架，集成多种量子化学引擎和神经网络势，支持结构优化、MD/NAMD 等计算，虽非直接聚焦蛋白质结构，但其 MD/构象采样与 NN 势方法可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "platforma-open/3d-structure-clustering",
+    "score": 7,
+    "one_liner": "该仓库是一个基于Foldseek的抗体3D结构聚类工具，用于按结合位点形状而非序列对抗体候选进行分组，属于蛋白质结构计算分析的应用工具，但更偏工程化应用而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "SanggeunParrk/geis",
+    "score": 7,
+    "one_liner": "Geis 是一个蛋白质结构可视化与预测工作台，支持结构查看、交互式分析、渲染和本地/远程结构预测，与蛋白质结构计算方向高度相关，但更偏工程化工具而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "PGB-LIV/GeneStructor",
+    "score": 7,
+    "one_liner": "GeneStructor 利用 AlphaFold2/Protenix 预测蛋白结构并结合 Foldseek、InterProScan 等证据对基因模型进行排序，核心是蛋白质结构预测与结构比对在基因注释中的应用，与课题方向相关但更偏基因组注释而非蛋白质结构计算本身。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "onescience-ai/OneScience-examples",
+    "score": 7,
+    "one_liner": "OneScience 官方维护的多领域 AI 模型示例仓库，包含 AlphaFold3、ESMFold、ProteinMPNN、RFdiffusion 等蛋白质结构预测与设计工具，并提供可运行代码，但覆盖范围广、非专注蛋白质方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "grant-diefenderfer/crem-dock_dual_target",
+    "score": 7,
+    "one_liner": "CReM-dock 是一个基于分子对接引导的片段生长工具，用于生成化学合理的配体分子，虽以配体为中心，但其对接和生成方法可迁移至蛋白质结构相关计算研究。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ZnO-210306/rnase-h2-md-analysis",
+    "score": 7,
+    "one_liner": "该仓库提供RNase H2–DNA复合物分子动力学模拟数据的分析工具，包含WHAM求解和PMF计算，聚焦蛋白质-DNA相互作用的结构计算，但偏重数据分析而非新方法开发。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "embryo-zero/embryo-molecular-dynamics",
+    "score": 7,
+    "one_liner": "该仓库是 GROMACS 的 fork，核心是分子动力学模拟工具，可用于蛋白质结构计算，但作为 fork 缺乏针对蛋白质结构课题的方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "11117777907/Affinygat",
+    "score": 7,
+    "one_liner": "AffinyGAT 是一个基于异构图注意力网络的蛋白-配体结合亲和力预测工具，聚焦蛋白质结构相关的计算建模，但仅提供推理代码，缺少训练实现，方法创新有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "marxy-karly/mutation-stability",
+    "score": 7,
+    "one_liner": "该仓库是一个机器学习课程项目，利用AlphaFold结构特征预测单点突变的蛋白质折叠稳定性变化（ΔΔG），属于蛋白质结构相关的计算建模，但方法以传统机器学习为主，缺乏深度学习或物理模拟创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "annemcq/annemcq",
+    "score": 7,
+    "one_liner": "个人主页展示多个蛋白质结构相关计算项目，涵盖机器学习粗粒化力场、TCR-pMHC结合预测、自由能估计和模拟稳定性分析，方法涉及GNN、MD和统计力学，但仓库本身为个人简介而非单一工具，整体价值较高但分散。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mohan-rr/PSSP",
+    "score": 7,
+    "one_liner": "该仓库实现蛋白质二级结构预测，涵盖HMM、CNN及蛋白语言模型嵌入方法，直接命中蛋白质结构计算与AI方法，但问题较基础且未涉及更复杂的结构建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mondalkinjal/Smlt1473-Mutation-study",
+    "score": 7,
+    "one_liner": "该仓库提供分子动力学模拟与对接分析代码，研究Smlt1473蛋白突变对底物结合的影响，聚焦蛋白质-配体相互作用的结构计算，但缺少完整轨迹且方法为应用型而非创新工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "FZWINGEL-UBT/LoupMD",
+    "score": 7,
+    "one_liner": "LoupMD 是一个基于 MACE 预训练势函数的高性能 GPU 分子动力学引擎，专注于蛋白质等体系的 MD 模拟，但 README 未明确以蛋白质结构为核心对象。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "danicrg/protein-fitness-rl",
+    "score": 7,
+    "one_liner": "该项目用蛋白语言模型（ESM2）做零样本适应度预测，并计划用偏好优化/强化学习对齐实验适应度，核心是蛋白质序列-功能关系建模，但当前主要聚焦序列适应度而非结构计算。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "appliedCL/interseek-35m",
+    "score": 7,
+    "one_liner": "InterSeek 是一个基于 ESM-2 微调的蛋白质-蛋白质相互作用预测工具，直接命中蛋白互作的结构计算建模问题，但主要聚焦序列级互作预测而非三维结构建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "BalajiKannappan-hub/PACE-Bind",
+    "score": 7,
+    "one_liner": "PACE-Bind 是一个物理感知的深度学习框架，用于配体条件下的蛋白质结合位点预测，结合构象系综与不确定性估计，与蛋白质结构计算和AI方法高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "RamiMusharrafieh/Ep2Format",
+    "score": 7,
+    "one_liner": "Ep2Format 是一个基于抗原结构几何特征和 ESM-2 序列特征预测抗体格式（单域/常规）的推理工具，与蛋白质结构计算和 AI 方法相关，但聚焦于抗体格式选择而非核心结构预测或设计。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "njustMD/Polymer-Protein-Adsorption",
+    "score": 7,
+    "one_liner": "该仓库用物理信息生成模型（VAE+GNN）从MD数据学习并生成聚合物-蛋白质吸附构象，核心对象是蛋白质表面介导的吸附结构，方法为AI生成建模，但问题侧重聚合物吸附而非纯蛋白质结构预测/设计，故给7分。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "LiuSantu123/claude-blackwell-protein-accel-kit",
+    "score": 7,
+    "one_liner": "这是一个为蛋白质设计/结构预测模型（AlphaFold3、Boltz、RFdiffusion等）提供NVIDIA Blackwell GPU加速优化和运行封装的工具包，核心对象和问题均与蛋白质结构计算相关，但主要贡献是工程化加速而非新方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Aditya-galaxy/gb1-fitness",
+    "score": 7,
+    "one_liner": "该仓库用神经网络和ESM-2蛋白语言模型预测GB1蛋白突变体的适应度，研究外推与置信度问题，属于蛋白质功能预测的结构计算建模，但未涉及结构预测或构象采样。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "AlbertCS/AlbertCS",
+    "score": 7,
+    "one_liner": "该仓库是计算蛋白设计研究者的个人主页，展示多目标序列设计、PELE采样等工具，但多为私有或外部链接，缺乏可直接运行的代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "raozeng/PRISM-CPI",
+    "score": 7,
+    "one_liner": "PRISM-CPI 是一个基于几何深度学习的化合物-蛋白质相互作用预测框架，利用蛋白质结构信息（Foldseek 3Di、SaProt）和口袋感知模块进行 CPI 预测，并包含 AutoDock Vina 3D 验证，属于蛋白质结构相关的计算建模，但核心是 CPI 预测而非纯蛋白质结构预测/设计。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "samirdarouich/samirdarouich",
+    "score": 7,
+    "one_liner": "该仓库是研究者主页，展示其用生成式AI（流匹配/扩散模型）预测分子三维结构（含过渡态）的工作，与蛋白质结构计算方向相关但非直接以蛋白质为核心，且无独立可运行代码仓库。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "PCtryhard/OrthCom",
+    "score": 7,
+    "one_liner": "该仓库设计针对非天然氨基酸的蛋白口袋，结合RFdiffusionAA、LigandMPNN和AF2等AI工具进行结构计算，但尚未完成口袋设计，核心贡献在形状分析与流程搭建。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "eboczko/smad4-r361h-repro",
+    "score": 7,
+    "one_liner": "该仓库提供SMAD4突变体与SMAD3复合物的分子动力学模拟重现数据与流程，聚焦蛋白质结构计算，但以数据/复现为主，方法创新有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "zubayern/RIN-Research",
+    "score": 7,
+    "one_liner": "该仓库对蛋白质折叠MD轨迹进行时间分辨的残基相互作用网络分析，计算多种中心性指标，属于蛋白质结构动态计算建模，但偏重分析而非预测或生成方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "abuyukgungor/kulustur-md",
+    "score": 7,
+    "one_liner": "该仓库是一个MD轨迹分析与自由能景观(FEL)自动化工具,专注于蛋白质结构构象采样分析,但主要依赖cpptraj和传统物理模拟,缺乏AI/深度学习方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "RojhanGenomics/tp53-prima1-md-simulation",
+    "score": 7,
+    "one_liner": "该仓库提供TP53-PRIMA-1体系的分子动力学模拟脚本、拓扑与分析流程，聚焦蛋白质-配体结合机制，方法上使用GROMACS、Vina等物理模拟工具，但对象为小分子配体与蛋白互作，非纯蛋白结构预测或设计，且为特定案例研究，方法创新性有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Zahra-Alavi/ESMfluc",
+    "score": 7,
+    "one_liner": "ESMfluc 利用 ESM 蛋白语言模型预测残基的局部构象状态（Protein Block），属于蛋白质结构相关的 AI 计算建模工具，但问题聚焦于局部构象分类而非结构预测/生成/对接等核心方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "MikDurr/Protein_Mutation_Impact",
+    "score": 7,
+    "one_liner": "基于ESM2嵌入和零样本分数预测GFP突变功能影响的机器学习流程，属于蛋白质突变效应预测的结构计算建模，但对象为单一荧光蛋白且方法为监督回归，创新性有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Trista1208/protein_design",
+    "score": 7,
+    "one_liner": "该仓库提供面向计算蛋白设计的可移植Agent Skills与黑客松计划，覆盖RFD4-Proteina、PROTEAN、ProteinMPNN等工具，虽非直接代码实现，但为AI蛋白设计流程提供实用指导。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "nikhildehariya/ProteoPredict",
+    "score": 7,
+    "one_liner": "ProteoPredict 是一个基于 ESM-2 蛋白语言模型与多模态特征融合的蛋白质功能预测深度学习框架，虽不直接做结构预测/采样/对接，但以蛋白质序列为核心、涉及功能位点结构验证，与课题方向部分相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "sciadopitys/CrysFormer_model_completion",
+    "score": 7,
+    "one_liner": "该仓库用混合3D视觉Transformer和卷积网络，结合Patterson图和AlphaFold部分结构预测电子密度图，辅助晶体学结构解析与补全，属于蛋白质结构计算建模的AI方法，但聚焦于晶体学特定场景，方法可迁移性有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "psolsson/ito_algosb_tutorial",
+    "score": 7,
+    "one_liner": "该仓库是AlgoSB 2026实践教程，提供隐式转移算子（ITO）在蛋白质构象采样中的应用代码与预训练模型TITO-3M，核心聚焦蛋白质结构动力学计算，但以教学材料为主，方法创新有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mhmdvjn/Protein-Generation-with-RFdiffusion",
+    "score": 7,
+    "one_liner": "学生项目仓库，基于RFdiffusion进行蛋白质从头生成与设计，包含多个设计项目及上游实现副本，方法可用但创新性有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "AshebirTsehayeAbebe/protein_dynamics_project_dp",
+    "score": 7,
+    "one_liner": "该仓库实现了一个基于MD轨迹的蛋白质动力学深度学习预测流水线，用RNN/LSTM/Transformer预测下一时刻的原子坐标、速度和力，属于蛋白质结构相关的计算建模，但更偏时间序列预测而非结构生成或采样。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "qkrvlfg123/AD-AlphaFold3-Reproduction",
+    "score": 7,
+    "one_liner": "该仓库复现并检验AlphaFold3/Boltz-2对阿尔茨海默病蛋白错义突变的结构与结合效应预测能力，核心是蛋白质结构预测与变异效应评估，方法上使用AI结构预测模型与统计检验，但偏重验证而非新方法开发。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Gleghorn-Lab/plm_interpretability",
+    "score": 7,
+    "one_liner": "该仓库复现了在ESM蛋白语言模型中定位生物概念（包括结构相关注释）的探针与神经元分析，属于蛋白语言模型可解释性研究，与蛋白质结构计算间接相关，但核心是模型内部表征而非结构预测或生成。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pb3lab/ibm3410",
+    "score": 7,
+    "one_liner": "提供基于Google Colab的AI蛋白质设计教程，涵盖RFDiffusion3、ProteinMPNN、AlphaFold3等工具，用于蛋白质结构设计与序列设计，但以教学资源为主，非原创方法实现。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "stackSentinel-32/variantScout",
+    "score": 7,
+    "one_liner": "该仓库是一个突变优先级排序工具，利用AlphaFold结构、ESM-2蛋白语言模型和MSA等信号预测单点突变的功能影响，属于蛋白质结构相关的功能预测计算建模，但主要聚焦于突变效应排序而非结构生成或构象采样。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ankdeshm/torchtpu-bio-protein-serving",
+    "score": 7,
+    "one_liner": "该仓库在TPU上对ESM-2、ESMFold和Boltz-2等蛋白质结构模型进行基准测试，提供可复现的代码和性能数据，但主要聚焦于硬件加速而非新方法开发。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "angellicodigo/condensate_ml",
+    "score": 7,
+    "one_liner": "基于JAX的可微分布朗动力学模拟库，用于Rubisco-EPYC1蛋白凝聚体的液-液相分离模拟，支持端到端梯度反传，属于蛋白质结构相关的物理模拟方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "brucefan1983/GPUMD",
+    "score": 6,
+    "one_liner": "GPUMD 是一个 GPU 加速的通用分子动力学软件包，支持神经演化势（NEP）训练与模拟，虽非直接针对蛋白质结构，但其 MD 与机器学习势方法可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "biojava/biojava",
+    "score": 6,
+    "one_liner": "BioJava 是一个 Java 生物信息学库，提供序列和 3D 结构处理功能，虽涉及蛋白质结构但非 AI/物理模拟方法，作为工具库对结构计算有基础支持价值。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "aiqm/torchani",
+    "score": 6,
+    "one_liner": "TorchANI 2 是用于训练和使用 ANI 风格神经网络原子间势（NN-IP）的库，可计算分子能量和力并支持 MD 模拟，虽非直接针对蛋白质结构，但其势函数方法可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "TorchSim/torch-sim",
+    "score": 6,
+    "one_liner": "TorchSim 是一个基于 PyTorch 的原子级模拟引擎，支持 MLIP 和经典势的 MD 模拟与结构弛豫，虽非蛋白质专用，但其 GPU 加速的 MD 框架可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "ok",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "glotzerlab/hoomd-blue",
+    "score": 6,
+    "one_liner": "HOOMD-blue 是一个通用的粒子系统分子动力学和蒙特卡洛模拟引擎，虽非蛋白质专用，但其MD模拟方法可迁移用于蛋白质结构计算研究。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "openforcefield/openff-toolkit",
+    "score": 6,
+    "one_liner": "OpenFF Toolkit 是分子力学力场开发与应用的 Python 工具包，支持 SMIRNOFF 力场和化学环境感知，虽非直接针对蛋白质结构预测或采样，但为蛋白质 MD 模拟提供力场参数化基础，与课题相关但非核心。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "m3g/packmol",
+    "score": 6,
+    "one_liner": "Packmol 是用于构建分子动力学模拟初始构象的打包工具，虽非直接针对蛋白质结构预测或设计，但其构象生成方法可迁移至蛋白质体系建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "jewettaij/moltemplate",
+    "score": 6,
+    "one_liner": "Moltemplate 是一个用于构建 LAMMPS 分子模拟体系的通用分子构建工具，支持粗粒化和全原子模型，虽非蛋白质专用，但可迁移用于蛋白质 MD 模拟的体系搭建。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pb3lab/ibm3202",
+    "score": 6,
+    "one_liner": "提供基于Google Colab的结构生物信息学教学教程，涵盖蛋白质结构预测、对接、MD模拟等，但以教学资源为主，非核心方法开发。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Amber-MD/cpptraj",
+    "score": 6,
+    "one_liner": "CPPTRAJ 是分子动力学轨迹分析工具，虽不直接做结构预测或生成，但为蛋白质结构计算中的 MD 模拟提供关键分析支持，属于工程化工具而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "dralgroup/mlatom",
+    "score": 6,
+    "one_liner": "MLatom 是一个面向原子级模拟的机器学习与量子化学开源平台，虽非蛋白质结构专用，但其 ML 势能、AIQM 方法和 MD 模拟等工具可迁移用于蛋白质结构计算。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "carlocamilloni/Structural-Bioinformatics",
+    "score": 6,
+    "one_liner": "这是一个结构生物信息学课程仓库，提供蛋白质结构预测、分子动力学、对接和蛋白设计等教学笔记与Colab实践，虽非研究工具但内容与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "metatensor/metatrain",
+    "score": 6,
+    "one_liner": "metatrain 是一个用于训练和评估原子级机器学习势能的 CLI 工具，支持多种架构并可与 MD 引擎对接，虽非直接针对蛋白质结构，但其原子级建模方法可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "lab-cosmo/torch-pme",
+    "score": 6,
+    "one_liner": "torch-pme 提供 PyTorch 中长程相互作用（如静电）的高效可微计算，虽非直接针对蛋白质结构，但其物理模拟方法可迁移至蛋白质体系的结构计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Valdes-Tresanco-MS/AMDock",
+    "score": 6,
+    "one_liner": "AMDock 是一个辅助蛋白-配体分子对接的图形化工具，封装了 AutoDock Vina 和 AutoDock4，虽聚焦蛋白-配体而非蛋白结构预测/采样，但对接属于蛋白质结构计算相关方法，且提供可运行代码。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ericmjl/protein-interaction-network",
+    "score": 6,
+    "one_liner": "该仓库将蛋白质结构转化为分子图并支持转换为图神经网络输入张量，是面向蛋白质结构图表示的工具包，但未实现具体AI模型或结构计算任务。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Tomasz-Lab/Metagenomic-DeepFRI",
+    "score": 6,
+    "one_liner": "Metagenomic-DeepFRI 是一个利用 DeepFRI 深度学习模型和 FoldComp 结构数据库对宏基因组蛋白序列进行功能注释（GO/EC）的流水线，虽涉及蛋白质结构信息但核心是功能预测而非结构计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "dkoes/md-scripts",
+    "score": 6,
+    "one_liner": "该仓库提供基于OpenFE的蛋白质-配体绝对结合自由能计算和普通MD模拟脚本，聚焦于蛋白质-配体结合自由能计算，属于蛋白质结构相关的物理模拟方法，但功能较单一且依赖外部工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "kfuku52/csubst",
+    "score": 6,
+    "one_liner": "CSUBST 是一个分析系统发育树上密码子序列组合替换（趋同氨基酸替换）的工具，可映射到蛋白质结构，但核心是进化序列分析而非蛋白质结构计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "m3g/Packmol.jl",
+    "score": 6,
+    "one_liner": "Packmol.jl 是用于分子动力学模拟初始构型构建的打包工具，虽非直接针对蛋白质结构预测或设计，但其构象打包方法可迁移至蛋白质体系的结构建模与模拟准备。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "qrefine/qrefine",
+    "score": 6,
+    "one_liner": "该仓库提供基于量子化学和机器学习加速的蛋白质结构精修工具，聚焦于利用量子化学约束改进生物大分子结构，与蛋白质结构计算建模相关，但主要面向实验结构精修而非预测、采样或设计。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Shuvam-Banerji-Seal/lammps-web-gui",
+    "score": 6,
+    "one_liner": "这是一个在浏览器中运行LAMMPS分子动力学模拟的Web GUI工具，支持蛋白质等体系的MD模拟和结构可视化，但主要面向通用MD而非蛋白质结构计算的核心问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Sbolivar16/MolecularDocking",
+    "score": 6,
+    "one_liner": "提供分子对接、虚拟筛选、MM/GBSA重打分和药效团分析的Colab工作流，属于蛋白质-配体对接计算，但偏工程化应用而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "KaneGreen/GROMACS-Windows-Builder",
+    "score": 6,
+    "one_liner": "该仓库提供GROMACS在Windows x64上的预编译二进制包（CPU/GPU版），是MD模拟工具的分发渠道，虽直接支持蛋白质结构计算，但本身无方法创新或代码实现，属于工程化资源。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "glotzerlab/hoomd-rs",
+    "score": 6,
+    "one_liner": "hoomd-rs 是一个 Rust 实现的粒子模拟库，支持硬形状和相互作用粒子的蒙特卡洛及分子动力学模拟，虽非蛋白质专用，但其通用粒子模拟框架可迁移至蛋白质构象采样等结构计算问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "OpenFreeEnergy/openfe_analysis",
+    "score": 6,
+    "one_liner": "该仓库为OpenFE自由能模拟结果提供MDAnalysis读取器，用于分析蛋白质配体体系的模拟轨迹，属于蛋白质结构相关的MD模拟分析工具，但更偏工程化应用而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Ojas-Singh/ReGlyco",
+    "score": 6,
+    "one_liner": "ReGlyco 是一个用 Rust 构建糖蛋白结构、进行构象搜索与精修的软件，聚焦于糖基化位点的结构建模与力场优化，与蛋白质结构计算相关但对象侧重糖蛋白修饰而非核心蛋白质结构预测/设计。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "uibcdf/molsysmt",
+    "score": 6,
+    "one_liner": "MolSysMT 是一个分子系统多工具包，提供统一的 API 用于构建、准备、查询、转换、分析和可视化分子系统（包括蛋白质），支持结构准备、分析和与 MD 模拟工具（如 OpenMM）的互操作，但并非专注于蛋白质结构预测、构象采样或 AI 驱动的结构建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mmb-irb/MDDB-workflow",
+    "score": 6,
+    "one_liner": "该仓库是分子动力学模拟数据的标准化、验证与分析工作流，面向蛋白质等生物大分子结构，但主要侧重数据整理与QA，而非结构预测或采样方法本身。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "ok",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "CCPBioSim/CodeEntropy",
+    "score": 6,
+    "one_liner": "CodeEntropy 是一个基于 MD 模拟力计算大分子构象熵的 Python 工具，虽不直接做蛋白质结构预测或生成，但为蛋白质构象采样与热力学分析提供计算建模支持。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "submitted"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ProteinGym/proteingym-base",
+    "score": 6,
+    "one_liner": "ProteinGym Base 是蛋白质突变效应预测基准的数据与模型标准化工具包，提供数据集、模型卡片和评估指标，但本身不实现新的结构计算方法，而是为下游模型提供基础设施。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "GAIR-NLP/DrugEvolve",
+    "score": 6,
+    "one_liner": "DrugEvolve 是一个用于药物开发中算法自主进化的 AI 框架，涵盖分子对接、蛋白-肽结合剂设计等蛋白质结构相关任务，但核心是算法进化而非直接的结构计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "askforarun/AMBER2LAMMPS",
+    "score": 6,
+    "one_liner": "这是一个将AMBER拓扑转换为LAMMPS格式的分子动力学模拟工具，涉及蛋白质结构模拟但主要聚焦于格式转换而非结构预测或生成。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "YounghyeonPark/pantometry",
+    "score": 6,
+    "one_liner": "一个通用物理模拟内核，包含蛋白质运动、配体结合等结构相关模拟域，但非专门针对蛋白质结构计算，方法为物理模拟而非AI。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ccdc-opensource/science-paper-protac-conformer-generator-2025",
+    "score": 6,
+    "one_liner": "该仓库提供PROTAC分子构象生成与三元复合物建模的代码，虽聚焦嵌合体小分子而非纯蛋白质结构，但其构象采样和对接评分方法可迁移至蛋白质相关计算研究。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "arclabs561/flowmatch",
+    "score": 6,
+    "one_liner": "这是一个用 Rust 实现的 flow matching 训练库，包含蛋白质主链二面角在环面上的生成示例，但核心是通用生成模型而非专门的蛋白质结构计算工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "cytokineking/ariax-cli",
+    "score": 6,
+    "one_liner": "Ariax CLI 是蛋白质设计工作流的命令行工具，封装了 BindCraft、BoltzGen 等结构设计引擎，但本身不实现算法，而是调用云端平台，属于工程化工具而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "MolSimGroup/rotationaldiffusion",
+    "score": 6,
+    "one_liner": "该仓库提供从MD轨迹分析蛋白质旋转扩散的Python工具，聚焦蛋白质结构动态计算，但问题轴偏向动力学性质分析而非结构预测/生成/对接等核心方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "haddocking/whiscy",
+    "score": 6,
+    "one_liner": "WHISCY 是一个基于序列保守性和结构信息预测蛋白-蛋白相互作用界面的工具，属于蛋白质结构计算建模范畴，但方法为传统评分而非AI或物理模拟。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Open-Athena/pdbthink",
+    "score": 6,
+    "one_liner": "pdbthink 是一个评估大语言模型仅凭坐标推理蛋白质结构的基准测试仓库，虽不提供结构预测或模拟方法，但聚焦蛋白质结构解析与推理，对结构计算方向有间接参考价值。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "IRL2/nanover-server-py",
+    "score": 6,
+    "one_liner": "NanoVer Server 是一个用于实时交互式分子动力学模拟的 Python 服务器框架，支持 VR 客户端，虽以 MD 模拟为核心但更侧重交互与可视化，而非蛋白质结构预测或设计等核心计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "lfs119/SynDual",
+    "score": 6,
+    "one_liner": "SynDual 是一个基于蛋白-配体结构口袋条件的小分子生成与合成路线预测框架，虽涉及蛋白口袋结构，但核心是配体分子生成而非蛋白质结构计算建模，算法思路可部分迁移。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Tsutayaaa/PlaszymeX",
+    "score": 6,
+    "one_liner": "PlaszymeGNN 是一个用 GNN/GVP 预测酶-塑料相互作用的深度学习框架，虽以塑料降解酶为对象，但其蛋白结构表示与相互作用预测方法可迁移至蛋白质-配体/蛋白-蛋白互作的结构计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "htchamblee/MDATK",
+    "score": 6,
+    "one_liner": "MDATK 是面向 RNA 系统的分子动力学模拟分析工具包，包含轨迹分析和从序列到 MD 模拟的工作流规划器，虽聚焦 RNA 而非蛋白质，但其 MD 模拟与结构分析框架可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "LucoDevro/cfoldseeker",
+    "score": 6,
+    "one_liner": "cfoldseeker 利用 Foldseek 进行蛋白质结构相似性搜索来挖掘同源基因簇，属于结构计算在基因簇发现中的应用，但核心问题偏向基因组学而非蛋白质结构预测/模拟。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "reused",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "SOG-AITech/rbmd",
+    "score": 6,
+    "one_liner": "RBMD 是一个GPU加速的分子动力学软件包，采用随机批处理算法，支持大规模蛋白质等分子体系的模拟，但README未明确聚焦蛋白质结构计算，更多面向通用MD模拟。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "GeraltZeroZhong/TopoPPI",
+    "score": 6,
+    "one_liner": "TopoPPI 是一个用于蛋白质-蛋白质相互作用界面可视化和分析的桌面应用，提供2D/3D界面图谱、结合亲和力预测和热点残基排名，但主要侧重界面可视化和分析，而非结构预测或构象采样等核心计算建模方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "TCGxDreams/biogenesis",
+    "score": 6,
+    "one_liner": "一个浏览器端生物信息学套件，集成3D蛋白查看和基于GNN的配体结合位点预测，但核心是通用序列分析，蛋白结构计算贡献有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Torben2907/AstraFold",
+    "score": 6,
+    "one_liner": "AstraFold 是面向 RNA 结构预测的 SE(3) flow matching 模型,提供训练与推理代码,虽对象为 RNA 而非蛋白质,但其结构生成与采样方法可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "srcacahuate619/moldesign-app",
+    "score": 6,
+    "one_liner": "MolDesign 是一个桌面工具，用于审计和记录蛋白质-配体对接（AutoDock Vina）等结构计算证据，强调可重复性和不确定性声明，但主要聚焦于流程管理而非新方法开发。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ELELAB/mavisp_accessory_tools",
+    "score": 6,
+    "one_liner": "该仓库提供MAVISp相关的辅助工具，涵盖蛋白质结构分析、突变效应评估、AlphaFold结构处理等，但多为辅助性脚本而非核心方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "realmichaelhoffert/adenylate_kinase_ogt",
+    "score": 6,
+    "one_liner": "该仓库利用AlphaFold预测的腺苷酸激酶结构信息，结合MSA Transformer嵌入和回归模型预测细菌最适生长温度，属于蛋白质结构功能预测的应用，但对象和问题偏离核心结构计算方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "izgys/decodec",
+    "score": 6,
+    "one_liner": "DecodEC 用 ESM-2 蛋白语言模型预测酶 EC 亚类，虽涉及蛋白序列功能预测，但核心是序列而非结构计算，且方法为微调与基线比较，非结构建模工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "RathanPaida/Drug_discovery_research",
+    "score": 6,
+    "one_liner": "该仓库是一个针对TNK1激酶的AI药物发现平台，包含深度学习活性预测、强化学习分子生成和基于AlphaFold结构的分子对接，核心对象是激酶-小分子结合而非蛋白质结构本身，但结构对接和蛋白口袋建模与课题相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "yaniguan/WignerFlow",
+    "score": 6,
+    "one_liner": "WignerFlow 是一个用 E(3) 等变网络直接生成分子动力学轨迹的 AI 方法仓库，目前仅验证于氩气体系，算法思路可迁移到蛋白质 MD 模拟，但尚未涉及蛋白质结构。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Eswar-mse/visualmd",
+    "score": 6,
+    "one_liner": "VisualMD 是一个本地优先的分子动力学可视化与分析工作台，专注于蛋白质结构、轨迹和 MD 分析（RMSD、PCA 等），但主要提供可视化与工程化工具，而非 AI/物理模拟方法本身。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "forxhunter/ProtCompass",
+    "score": 6,
+    "one_liner": "ProtCompass 是一个蛋白质表示学习基准，系统评估蛋白质编码器在结构探测、下游预测和概念擦除中的表现，与蛋白质结构计算相关但侧重评估而非新方法开发。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "laserchemist/MD_MLPES",
+    "score": 6,
+    "one_liner": "该仓库实现了一个基于KRR的机器学习势能面框架，用于加速小分子（CH₂OO）的分子动力学模拟，方法可迁移到蛋白质体系但当前对象非蛋白。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Jorwalzzz/bionemo-nim-benchmark",
+    "score": 6,
+    "one_liner": "该仓库是NVIDIA BioNeMo/NIM推理基准测试套件，评估ESM-2、ESMFold、DiffDock等蛋白质结构预测与对接工具的性能，虽涉及蛋白质结构计算但核心是基准测试而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "BunsreePatel/multispecific_Abs",
+    "score": 6,
+    "one_liner": "该仓库构建了多特异性抗体序列数据库，用ColabFold折叠结构并提取生物物理特征用于ML可开发性预测，属于蛋白质结构计算应用，但方法创新和代码完整性有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Bibhuprasadbehera/PPI-Predictor",
+    "score": 6,
+    "one_liner": "该仓库用LSTM从氨基酸序列预测蛋白质相互作用，属于蛋白质互作预测的AI方法，但未涉及结构信息，且实现较基础。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ESS-MimerAI/SQUIP",
+    "score": 6,
+    "one_liner": "SQUIP 是一个从肽分子动力学模拟轨迹计算动态结构因子 S(q,ω) 的验证性工作流，涉及蛋白质（肽）体系的 MD 模拟与结构分析，但核心是 QENS 谱学分析而非结构预测/设计/对接等主流课题方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "jessierich22/Nonbonded-Energy",
+    "score": 6,
+    "one_liner": "该仓库是一个计算MD轨迹中两组原子间短程非键相互作用能的Python工具，虽涉及蛋白质体系的MD分析，但仅实现能量计算而非结构预测/采样/生成等核心课题问题，方法为物理模拟但功能较窄。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "van-richard/amberassist",
+    "score": 6,
+    "one_liner": "这是一个AMBER/QM/MM分子动力学模拟与自由能分析的工作流模板工具箱，涉及蛋白质结构相关的物理模拟方法，但非独立可安装软件包，且未聚焦于AI方法或结构预测/生成。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "stfc/aiida-dlpoly",
+    "score": 6,
+    "one_liner": "这是一个AiiDA插件，用于将DL_POLY分子动力学模拟软件集成到自动化工作流中，虽涉及蛋白质结构相关的MD模拟，但主要贡献是工程化集成而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "sircalch/dockcert",
+    "score": 6,
+    "one_liner": "DockCert 是一个用于分子对接和虚拟筛选结果统计验证与可重复性评估的工具包，虽涉及对接但非蛋白质结构预测/生成/采样核心，属于对接验证的工程化工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "N283T/ztraj",
+    "score": 6,
+    "one_liner": "ztraj 是一个高性能的分子动力学轨迹分析库和 CLI，专注于蛋白质结构轨迹的几何与结构分析，虽不涉及 AI 或结构生成/预测，但为 MD 模拟结果分析提供实用工具，与课题方向相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "srikth/Protein-structure-prediction-using-deep-learning",
+    "score": 6,
+    "one_liner": "该项目实现了一个基于深度学习的蛋白质二级结构预测框架，属于蛋白质结构计算建模，但仅覆盖二级结构预测，未涉及更核心的三维结构预测或构象采样等高级任务。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "avitai/artifex",
+    "score": 6,
+    "one_liner": "Artifex 是一个基于 JAX/Flax 的通用生成模型库，涵盖蛋白质结构生成等几何模型，但并非专门针对蛋白质结构计算，且处于不稳定开发阶段。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "leozippon/plm-capability-boundaries",
+    "score": 6,
+    "one_liner": "该仓库测量蛋白质、文本及联合生成模型的能力，涉及蛋白质序列的似然、读出与生成评估，但并非直接开发蛋白质结构预测或构象采样方法，而是能力评测框架。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "briney/oplm",
+    "score": 6,
+    "one_liner": "OPLM 是一个开放蛋白质语言模型，提供序列嵌入和氨基酸 logits，并计划推出基于该模型的结构预测工具 OPLMFold，但目前结构预测功能尚未实现，主要贡献在序列表示层面。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Leo-T-Zang/Leo-T-Zang",
+    "score": 6,
+    "one_liner": "该仓库是个人主页，展示了作者在蛋白质设计、肽结合物生成、RNA结构预测等领域的代码贡献，虽非独立工具但相关项目与课题高度相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "saihardhikreddy/Lammps-AI",
+    "score": 6,
+    "one_liner": "LAMMPS-AI 是一个将 LAMMPS 分子动力学与机器学习势函数结合的框架，侧重液态体系输运性质模拟，虽涉及 MD 和 AI 方法，但核心对象为液态小分子/金属而非蛋白质结构，算法可迁移但非直接针对蛋白质。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "kaitaruk14-sudo/protein-structure-ml",
+    "score": 6,
+    "one_liner": "该仓库是一个蛋白质结构机器学习项目，基于PDB数据训练模型预测蛋白质结构相关属性，但问题轴偏向分类/回归而非核心结构计算任务，方法为通用ML而非专门的结构建模工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "alexmplastow/HMMM_library",
+    "score": 6,
+    "one_liner": "该仓库是面向蛋白质-膜体系MD模拟轨迹分析的MDAnalysis封装库，提供接触、距离、RMSF等分析工具，虽非AI/结构预测方法，但直接服务于蛋白质结构相关的分子动力学模拟分析，具有实用价值。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Dev-Maidul/Protein-Function-Agent-V-1",
+    "score": 6,
+    "one_liner": "这是一个基于LLM的蛋白质功能预测智能体，通过整合序列/结构同源搜索和GO注释工具来推断蛋白质功能，属于蛋白质功能预测的结构计算建模方向，但更侧重功能注释而非结构预测/采样/生成等核心结构计算问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "RidaHayat/ddls-week4",
+    "score": 6,
+    "one_liner": "该仓库对KRAS G12D突变体进行AlphaFold结构置信度分析并识别药物设计锚点，属于蛋白质结构计算应用，但偏工程化分析而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "gdellorl/FAP_CO2_cavity_analysis",
+    "score": 6,
+    "one_liner": "该仓库提供MD轨迹分析脚本，用于研究CO2在脂肪酸光脱羧酶中的迁移与释放，聚焦蛋白质内部腔体和出口位点，属于蛋白质结构相关的计算分析，但非AI方法且为特定体系分析工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "isty2e/protrepair",
+    "score": 6,
+    "one_liner": "ProtRepair 是一个蛋白质结构文件修复工具，用于补齐缺失原子和加氢，为下游建模做准备，虽不直接做结构预测或采样，但作为结构建模的前处理工具与课题相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Abdullah-webd/biostruct",
+    "score": 6,
+    "one_liner": "Antidote 是一个将蛋白质序列折叠为3D结构并进行分子对接筛选的药物发现工具，核心涉及蛋白质结构预测与对接，但更偏向应用集成而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "123lai1234-create/ddd",
+    "score": 6,
+    "one_liner": "这是一个端到端的蛋白质序列优化流水线，结合ESM-2、贝叶斯优化、强化学习和简化ProteinMPNN，但主要作为技术演示项目，方法简化且依赖演示数据，创新性有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "atong01/atong01",
+    "score": 6,
+    "one_liner": "这是 Alex Tong 的个人主页仓库，展示其生成模型（流匹配、蛋白质设计、玻尔兹曼采样）研究，并链接到多个蛋白质结构相关开源项目，但仓库本身无实质代码或方法实现。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ZainaAH-223/graphlet-protein-structure",
+    "score": 6,
+    "one_liner": "该仓库用图let特征对残基接触网络进行无比对蛋白质结构比较，并探索AlphaFold模型中的无序区域，属于蛋白质结构计算分析，但更偏重结构比较而非预测/生成/对接等核心方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "MTVarman/pdb-data-audits",
+    "score": 6,
+    "one_liner": "该仓库系统审计PDB蛋白质结构数据中的共价键记录、标签和突变标注错误，虽不直接提供AI/模拟方法，但为蛋白质结构计算建模的数据质量提供关键修正，对依赖PDB训练的模型有间接价值。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "huseyincavusbi/biointerp",
+    "score": 6,
+    "one_liner": "该仓库提供蛋白质语言模型的机制可解释性分析工具（错误神经元提取、探针、因果干预、变异效应分析），与蛋白质结构计算相关但侧重模型内部机制而非结构预测/采样/对接等核心问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "andreasdh/Protein-Structure-Prediction",
+    "score": 6,
+    "one_liner": "该仓库是围绕Boltz-2的CCTX2蛋白结构预测与评估的封装脚本工具包，聚焦于结构预测结果与冷冻电镜结构的比较，属于蛋白质结构计算方向但偏工程化应用，缺乏方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "hhsabc/protein-design-bootcamp",
+    "score": 6,
+    "one_liner": "这是一个本科生学习AI蛋白质设计的个人项目记录，实际运行了RFdiffusion、ProteinMPNN和AlphaFold等工具，完成了从骨架生成到序列设计再到结构验证的完整流程，但缺乏方法创新和系统性，更多是学习实践而非研究贡献。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "articlesmli/omniSpatial_multiscale",
+    "score": 6,
+    "one_liner": "这是一个多尺度生物模拟框架，整合了蛋白质结构预测、对接、MD模拟与单细胞扩散模型，但核心聚焦于细胞状态预测，蛋白质结构计算仅作为辅助模块。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Tahsin-uv/protein-tools-mcp",
+    "score": 6,
+    "one_liner": "这是一个面向蛋白质表征的MCP服务器工具包，提供PDB验证、序列分析、MD轨迹指标和金属位点分析等实用工具，虽非核心算法创新，但直接服务于蛋白质结构计算研究。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "hydrogen1222/mliport",
+    "score": 6,
+    "one_liner": "mliport 是一个统一多种机器学习原子间势能（MLIP）后端的工作流层，支持结构弛豫、分子动力学、NEB 等计算，但主要面向材料体系而非蛋白质结构，算法可迁移但非本课题核心。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "aditiggowda26-alt/Mutation-Map",
+    "score": 6,
+    "one_liner": "一个交互式计算平台，用于探索氨基酸突变对蛋白质结构和功能的影响，涉及结构计算建模但方法细节有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "SummerTypo/GridBoxBuilder",
+    "score": 6,
+    "one_liner": "这是一个用于分子对接中定义和优化网格盒参数的PyMOL插件，虽不直接进行蛋白质结构预测或模拟，但为对接计算提供关键工具支持，与课题相关但方法贡献较浅。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "platforma-open/3D-Structure-Based-Liabilities",
+    "score": 6,
+    "one_liner": "该仓库基于预测的抗体/纳米抗体3D结构评估可开发性，利用溶剂可及表面积和表面指标计算结构层面的风险，属于蛋白质结构相关的计算工具，但聚焦于抗体开发性评估而非核心结构预测或生成方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "JanaShenLab/Amber_split_kernel_CpHMD",
+    "score": 6,
+    "one_liner": "该仓库提供 Amber 中 split-kernel PME-CpHMD 方法的补丁、参数文件和模拟输入数据，属于蛋白质分子动力学模拟的工程化资源，但缺少完整可运行代码和核心方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ccccy666/plm-window-position",
+    "score": 6,
+    "one_liner": "该仓库研究蛋白语言模型中窗口位置对残基表征的影响，提供基准与评估工具，属于蛋白质结构相关计算建模但偏重模型行为分析而非结构预测/生成。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "javierbq/rfd4-proteina-mlx",
+    "score": 6,
+    "one_liner": "该仓库是RFD4-Proteina（蛋白质序列与全原子结构联合设计的流匹配模型）的Swift/MLX移植，目标是在Apple芯片上运行，但当前处于早期阶段，尚未生成结构，方法实现不完整。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "iclr2027revised/constructed-negatives-ppi-eval",
+    "score": 6,
+    "one_liner": "该仓库是PPI序列模型评估基准，聚焦负样本构建对模型评估的影响，涉及蛋白-蛋白互作预测但非结构计算建模，方法为评估工具而非新模型。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Menzisk/ANT-MDS-Pipelines",
+    "score": 6,
+    "one_liner": "该仓库提供针对ANT(3″)-Ia蛋白的MD轨迹处理与分析流水线（dPCA、FEL、DCCM），属于蛋白质结构相关的计算分析，但偏重轨迹后处理而非结构预测/生成/对接等核心方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "HyuntaeKR/openmm-pcff",
+    "score": 6,
+    "one_liner": "该仓库为OpenMM实现PCFF力场参数化与系统构建工具，专注于分子动力学模拟的力场复现，虽涉及蛋白质结构计算但非核心对象，方法为物理模拟且代码可用。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "zidan0x266/BondFlux",
+    "score": 6,
+    "one_liner": "BondFlux 为 LAMMPS 提供动态共价键/可逆键的 MD 模拟工具，聚焦聚合物网络中的键交换与断裂形成，虽非直接蛋白质结构预测，但其键交换与可逆键模拟方法可迁移至蛋白质动态互作或构象采样研究。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "nunziati/sadic-tcbb",
+    "score": 6,
+    "one_liner": "该仓库提供蛋白质原子深度计算的实现，属于蛋白质结构几何特征计算工具，与结构预测/采样/对接等核心计算建模问题关联较弱，但方法可迁移。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "AmirSedaghaati/alphafold-cadd-workflow",
+    "score": 6,
+    "one_liner": "该仓库将AlphaFold预测的TREM2蛋白结构用于AutoDock Vina虚拟筛选，构建了自动化CADD流程，涉及蛋白质结构预测与分子对接，但偏工程化应用且规模较小。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "KELI-Kekeli-Christ/protein-structure-rnn-lstm",
+    "score": 6,
+    "one_liner": "这是一个用双向LSTM/GRU进行蛋白质二级结构预测的教学项目，属于蛋白质结构计算方向，但规模小、方法较基础，且为课程作业而非成熟工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mantiswriter/higgsfold",
+    "score": 6,
+    "one_liner": "该仓库实现并验证了基于离散Frenet框架和孤子模型的蛋白质骨架局部拓扑分析工具，虽非主流AI/物理模拟方法，但提供了可运行的结构分析代码，并包含对MD轨迹的拓扑统计，与蛋白质结构计算相关但方法创新性有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "KELI-Kekeli-Christ/protein-secondary-structure-prediction",
+    "score": 6,
+    "one_liner": "这是一个用MLP和BiLSTM从氨基酸序列预测蛋白质二级结构的课程项目，属于蛋白质结构预测的经典任务，但方法较基础、规模较小，缺乏创新性。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ishida-titech/ist-dock",
+    "score": 6,
+    "one_liner": "IST-Dock 是一个无机器学习、基于几何与物理化学的分子对接与虚拟筛选引擎，虽非蛋白质结构预测或生成，但作为可运行的对接工具，对蛋白质-配体结合机制的结构计算建模有直接价值。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "shomiyazaki-ai/historical-2prime-5prime-rna-md",
+    "score": 6,
+    "one_liner": "该仓库记录了一项关于含2',5'连接RNA双链的分子动力学模拟历史研究，涉及RNA结构动力学与压力效应，但仅提供方法描述而无代码或数据，属于可迁移的物理模拟方法但非直接可用的工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "anishlewis08-sketch/AI-Protein-Research",
+    "score": 6,
+    "one_liner": "该仓库聚焦AI驱动的蛋白质设计与抗体工程，但README内容过于简略，缺乏具体方法实现或代码细节，价值有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Cooljoes/protein-function-prediction-submission",
+    "score": 6,
+    "one_liner": "该仓库是蛋白质功能预测竞赛的提交与验证仓库，使用同源检索、蛋白语言模型和集成方法预测GO标签，虽涉及蛋白功能预测但非结构计算核心，且以结果和验证为主，方法实现有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "BioJazz-Lab/BioJazz_tools",
+    "score": 6,
+    "one_liner": "该仓库是BioJazz实验室维护的AI/ML模型清单，涵盖蛋白质结构预测、MD模拟、对接等工具，但本质是资源列表而非实现，对蛋白质结构计算方向有参考价值但缺乏方法贡献。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "AparnaSreeenivasan/AllergenAI",
+    "score": 6,
+    "one_liner": "AllergenAI 用 3D CNN 对蛋白质结构体素化表示进行过敏原/非过敏原二分类，属于蛋白质结构相关的 AI 分类应用，但问题轴偏向功能预测而非核心结构计算建模，且缺少训练脚本，方法创新有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "chingkheinganba231005/Biotech-bioinfo-projects",
+    "score": 6,
+    "one_liner": "这是一个包含14个计算生物学教学项目的仓库，其中涉及蛋白质结构、共进化分析和分子动力学模拟，但以教学演示为主，方法创新和深度有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Gyasu/HuSC",
+    "score": 6,
+    "one_liner": "HuSC 结合 AlphaFold 结构与 gnomAD 人群变异量化蛋白质错义变异的空间约束，并用于微调蛋白语言模型以改进变异效应预测，属于蛋白质结构相关的计算建模，但核心是变异约束而非结构预测/生成/对接等经典结构计算问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "SynBioExplorer/SynBioExplorer",
+    "score": 6,
+    "one_liner": "该仓库是个人研究项目汇总，其中EnzymeForge等涉及蛋白质结构预测、序列设计和对接，但整体以合成生物学和基因组学为主，蛋白质结构计算非核心。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "nrflynn2/generate-then-verify",
+    "score": 6,
+    "one_liner": "这是一个面向分子设计的教学课程，涵盖生成模型与验证器配对，包括配体生成和蛋白质设计，但以教学为主，非核心方法开发。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "YOOZOY/peptide-ap-prediction",
+    "score": 6,
+    "one_liner": "该仓库用序列级机器学习模型（LSTM/Transformer等）预测短肽聚集倾向，标签来自粗粒化MD模拟，属于蛋白质序列-功能预测，但未涉及结构预测/构象采样/对接等核心结构计算问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ZengLLQ/mol-alembic",
+    "score": 6,
+    "one_liner": "MolAlembic 是一个基于 Python/NumPy/SciPy 的计算药物发现平台，涵盖分子图感知、QSAR、ADME/PBPK 模拟、3D 构象嵌入和 Vina/GBSA 对接，但核心对象是小分子药物而非蛋白质结构，且未涉及蛋白质结构预测、构象采样或蛋白-蛋白互作等本课题核心问题，算法框架部分可迁移到蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "lossofgenerality/polymer-neural-nets",
+    "score": 6,
+    "one_liner": "该仓库用图神经网络学习聚合物链的力场并驱动模拟，虽对象为通用聚合物而非蛋白质，但结构建模与AI+MD方法可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "biotunnel-simulation/texc-cg-sim",
+    "score": 6,
+    "one_liner": "该仓库提供核糖体出口隧道提取与粗粒化MD模拟工作流，聚焦核糖体RNA/蛋白隧道结构而非蛋白质结构本身，但MD模拟方法可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "JZJZJZ33/polySIM_RBMD",
+    "score": 6,
+    "one_liner": "RBMD 是一个GPU加速的分子动力学软件包，专注于大规模MD模拟，虽非直接针对蛋白质结构，但其MD算法和工具可迁移至蛋白质体系的结构计算研究。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Vesagrainca/Vesa-Grainca-AI-Based-Protein-Structure-Prediction-and-Optimization",
+    "score": 6,
+    "one_liner": "这是一个基于简化三维格点模型的蛋白质折叠启发式优化项目，实现了GA、SA及混合算法，虽非高精度结构预测工具，但涉及蛋白质结构计算建模，方法可运行且可迁移。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "leonismorina/Leonis-Morina---AI-Based-Protein-Structure-Prediction-and-Optimization",
+    "score": 6,
+    "one_liner": "该仓库实现并比较了多种启发式算法求解2D HP格点模型蛋白质折叠问题，属于蛋白质结构预测的简化计算建模，但未涉及AI或现代结构预测方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "t8f7zgp88z-arch/NexusForge",
+    "score": 6,
+    "one_liner": "NexusForge 是一个以证据优先的研究工程平台，当前实现为蛋白质结构置信度探索器，通过比对 UniProt、AlphaFold 与 PDB 数据计算 RMSD、lDDT-Cα 和 pLDDT 统计，但更侧重数据溯源与可复现性，而非结构预测或生成方法本身。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "adonaytetemke-wq/remedy-structure-explorer",
+    "score": 6,
+    "one_liner": "该仓库通过Colab笔记本演示了阿司匹林等药物与COX-1/COX-2蛋白的对接和分子动力学模拟，属于蛋白质-配体结构计算的应用型教学项目，方法上使用了AutoDock Vina和OpenMM，但缺乏方法创新且规模较小。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ktwyw/engsim",
+    "score": 6,
+    "one_liner": "该仓库是一本从零实现分子动力学与蒙特卡洛模拟的Python开源书，核心是通用分子模拟算法（LJ、恒温器、MC等），虽非直接针对蛋白质结构，但其MD/采样方法可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "SHEDOOMTC/Basic_Moco_2",
+    "score": 6,
+    "one_liner": "这是一个面向初学者的分子动力学模拟教学课程仓库，涵盖AmberTools和Gromacs的力场、MD模拟及自由能计算，虽以蛋白质等生物分子为对象，但主要提供教学材料和示例，而非创新的计算方法或工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "soheiltorklarki/vhl-md-structural-analysis",
+    "score": 6,
+    "one_liner": "该仓库是VHL蛋白复合物的GROMACS分子动力学模拟与结构稳定性分析项目，聚焦癌症突变的结构影响，属于蛋白质结构计算方向，但为个人研究项目且方法为常规MD流程，创新性有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "vonstrucker77-dotcom/CYP51-heme-MD",
+    "score": 6,
+    "one_liner": "该仓库是一个针对白色念珠菌CYP51蛋白-血红素-配体体系的分子动力学模拟工作流，聚焦于血红素配位建模与抑制剂结合稳定性，属于蛋白质结构相关的MD模拟方向，但当前仍处于规划阶段，尚未提供可运行的代码或结果。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "vahid-nateghi/AI4MD",
+    "score": 6,
+    "one_liner": "这是一个分子建模与模拟的教程仓库，包含机器学习应用示例，与蛋白质结构计算相关但以教学为主，缺乏方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "vimalavalli14-wq/gromacs-lysozyme-md",
+    "score": 6,
+    "one_liner": "该仓库用GROMACS对溶菌酶进行标准分子动力学模拟并分析蛋白柔性，是蛋白质结构计算模拟的工程化示例，但缺乏方法创新且为进行中项目。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Visn0/adaptyv-protein-design-2026",
+    "score": 6,
+    "one_liner": "这是一个蛋白质设计竞赛的工作区，记录了针对多个靶点的设计流程和提交结果，但主要侧重实验记录与文档整理，而非提供可复用的计算方法或工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "di-omics/ml-design-loops",
+    "score": 6,
+    "one_liner": "该仓库包含三个闭环机器学习系统，其中两个涉及蛋白质序列设计（ESM-2 零样本突变扫描和模拟进化），但核心是评估门控而非蛋白质结构计算，且无结构建模或物理模拟方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Nithinkumarseeloju/CPI",
+    "score": 6,
+    "one_liner": "Bindsight CPI 是一个化合物-蛋白质结合亲和力预测与3D结合构象生成工具，结合了Perceiver模型、ESMFold、P2Rank和AutoDock Vina，虽聚焦小分子-蛋白对接，但其结构建模流程对蛋白质结构计算有参考价值。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Fudenberg-Research-Group/sister-cohesin-dynamics",
+    "score": 6,
+    "one_liner": "该仓库提供多尺度框架，将cohesin调控与姐妹染色单体折叠的3D聚合物模拟结合，虽涉及染色体结构建模和MD模拟，但核心对象是染色质而非蛋白质结构，算法可部分迁移。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "brdahmer/martini3-tutorials",
+    "score": 6,
+    "one_liner": "该仓库是Martini 3粗粒化MD教程的复现，涵盖脂质膜和蛋白质结构建模，与蛋白质结构计算相关但以教程复现为主，缺乏方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "DannyJPark/ChIEDiff",
+    "score": 6,
+    "one_liner": "ChIEDiff 是一个口袋条件3D分子生成扩散模型，结合Vina能量和亲和力梯度，虽聚焦小分子生成而非蛋白质结构本身，但其结构生成方法可迁移至蛋白质配体结合场景。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "CalzaAlessandro/cationize-protein",
+    "score": 6,
+    "one_liner": "该仓库提供蛋白质渐进阳离子化修饰的结构构建与力场参数导出工具，面向Amber/OpenMM/GROMACS模拟，属于蛋白质结构修饰与MD模拟的工程化工具，但非核心AI/结构预测方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "wonmor/orchfold-models",
+    "score": 6,
+    "one_liner": "该仓库提供ESMFold蛋白质结构预测模型的量化权重文件，用于Apple设备上的推理，属于蛋白质结构预测工具的资源分发，但无新方法实现。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "73sowmya/Maize-FAW--GCMS-DOCKING-MD",
+    "score": 6,
+    "one_liner": "该仓库是玉米抗虫挥发物组学与昆虫化学感受蛋白分子对接/MD模拟的配套数据与脚本，涉及蛋白质-配体结构计算但以昆虫嗅觉蛋白为对象，非核心蛋白质结构方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "nguoithamdo/CoAna",
+    "score": 6,
+    "one_liner": "CoAna 是一个分析分子动力学模拟中蛋白质寡聚体聚集路径与谱系的工具，聚焦蛋白质聚集机制的结构计算分析，但非结构预测/生成/设计类方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "pipi0616/hears-lm",
+    "score": 6,
+    "one_liner": "HEARS-LM 是一个针对听力损失相关基因错义变异进行致病性评分的蛋白语言模型工具，虽涉及蛋白质序列与结构特征，但核心是变异解读而非蛋白质结构计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "leepusp/ppigFinder-v1",
+    "score": 6,
+    "one_liner": "ppigFinder 是一个桌面应用，从细菌基因组出发设计蛋白-蛋白互作候选并导出 AlphaFold 3 结构预测任务，但核心是基因组注释与候选筛选，而非直接实现结构预测或采样方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ansamubasher/rna-3d",
+    "score": 6,
+    "one_liner": "该仓库是RNA 3D结构预测的模板检索、选择与候选验证流水线，核心对象为RNA而非蛋白质，但结构建模与AI/物理模拟方法（LambdaRank、gRNAde、RNAPro）可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "M-Malek-Ht/clinvar-pathogenicity",
+    "score": 6,
+    "one_liner": "该仓库用ESM-2蛋白语言模型和经典机器学习预测错义变异致病性，聚焦蛋白质序列层面的功能影响，但未涉及结构预测、构象采样或对接等结构计算建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "TeamSuman/Publication_Data",
+    "score": 6,
+    "one_liner": "该仓库是课题组发表论文的代码与数据汇总，涉及蛋白质折叠构象景观、PDZ2变构等结构计算研究，但多为论文配套资源，缺乏统一工具或方法实现。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "BI4AP-Group/BI4AP",
+    "score": 6,
+    "one_liner": "BI4AP 是一个基于知识蒸馏的蛋白-配体结合亲和力预测框架，通过多模态教师模型将结构信息蒸馏到仅需 SMILES 的轻量学生模型，用于超大规模虚拟筛选，与蛋白质结构计算相关但侧重配体亲和力预测而非蛋白质结构本身。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mariano-fernandes/Docking-Multilevel-Analysis",
+    "score": 6,
+    "one_liner": "CALS 是用于分析 AutoDock Vina 分子对接结果的本地工具，聚焦蛋白-配体相互作用与构象分析，虽涉及蛋白质结构计算但主要面向小分子配体对接后处理，方法为传统计算而非 AI/深度学习。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "0xcvaliente/biology-antibodies-skills",
+    "score": 6,
+    "one_liner": "该仓库提供面向抗体工程与设计的 Claude Code 技能集，涵盖序列分析、结构预测与结合剂设计流程，但以技能/知识封装为主，非独立可运行的结构计算工具或模型。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ViktorVanVaughn/phytyl-tail-builder",
+    "score": 6,
+    "one_liner": "该仓库是一个针对叶绿素蛋白中截断的植醇尾巴进行结构重建的工具，利用tleap日志和模板通过扭转角扫描与冲突评分来修复缺失原子，属于蛋白质结构相关的计算建模工具，但对象为叶绿素配体而非核心蛋白质结构，且方法为经典几何重建而非AI或MD模拟。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "meenu974/HCV-NS5B-Antiviral-Drug-Discovery",
+    "score": 6,
+    "one_liner": "该仓库利用分子对接和ADMET分析筛选针对HCV NS5B聚合酶的潜在抗病毒分子，属于蛋白质-配体对接计算，但对象为病毒聚合酶且方法较常规，与蛋白质结构计算方向相关但创新性一般。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "anweshpandey/FlexSolvMD",
+    "score": 6,
+    "one_liner": "FlexSolvMD 是一个用于制备混合溶剂分子动力学体系并进行能量最小化的终端工具，聚焦于蛋白质-配体体系的 MD 前处理流程，但当前仅实现最小化，尚未覆盖完整 MD 模拟或结构预测/生成等核心计算建模任务。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "swg-lwqw/PFP-DSGBL",
+    "score": 6,
+    "one_liner": "该仓库实现了一个结合ESM-2序列分支和PPI图分支的蛋白质功能预测方法，属于蛋白质功能的结构计算建模，但未直接涉及结构预测或构象采样。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "kheefuiyong/protein-function-predictor",
+    "score": 6,
+    "one_liner": "该仓库实现了一个基于ESM2嵌入和逻辑回归的蛋白质GO分子功能预测Web应用，属于蛋白质功能预测的结构计算建模方向，但未涉及结构预测、构象采样或对接等核心结构计算问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "dhedhialy/tb-resistance-discovery",
+    "score": 6,
+    "one_liner": "该仓库用机器学习（XGBoost）结合AlphaFold结构、ESM-2和分子对接（AutoDock Vina）预测结核分枝杆菌耐药突变，核心是蛋白质结构相关的突变效应建模，但对象为细菌蛋白而非通用蛋白质结构计算，且方法偏应用而非创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "MDSYN2019/FerrumMD",
+    "score": 6,
+    "one_liner": "这是一个用Rust编写的高性能分子动力学引擎，实现了LJ相互作用、恒温器等基础MD功能，并支持小分子体系，可作为蛋白质MD模拟的底层工具，但当前示例仅涉及H₂和水分子，尚未直接面向蛋白质结构计算。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "muhammadabdulw01-blip/ai-drug-discovery-platform",
+    "score": 6,
+    "one_liner": "这是一个本地优先的AI药物发现平台，集成了ADMET预测、AutoDock Vina分子对接、从头药物设计和临床试验分析，其中分子对接模块涉及蛋白质-配体相互作用的结构计算，但核心对象偏向小分子药物而非蛋白质结构本身。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "davismerighi-max/interface-analysis",
+    "score": 6,
+    "one_liner": "该仓库是一个蛋白质复合物界面分析工具，测量埋藏面积、化学相互作用和形状互补性，虽不涉及AI或MD模拟，但直接针对蛋白质结构互作的计算分析，对结构功能研究有实用价值。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "aleff-ferreira/SOZLab",
+    "score": 6,
+    "one_liner": "SOZLab 是一个用于分子动力学轨迹溶剂占据区分析的 GUI/CLI 工具，聚焦水合壳层统计，虽涉及蛋白质周围溶剂结构，但非核心蛋白质结构计算建模，方法为物理模拟分析而非 AI 或结构预测/设计。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "project-gemmi/gemmi",
+    "score": 5,
+    "one_liner": "GEMMI 是用于处理大分子晶体学数据（如 mmCIF、PDB、密度图）的 C++ 库和工具集，虽涉及蛋白质结构文件解析和操作，但核心是数据格式处理而非结构预测、采样或 AI/物理模拟方法，与课题方向部分相关但方法轴较弱。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "ok"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "scanberg/viamd",
+    "score": 5,
+    "one_liner": "VIAMD 是分子动力学轨迹的可视化交互分析工具，虽涉及蛋白质结构相关MD分析，但主要贡献在可视化与交互，而非结构预测、采样或生成等核心计算建模方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "ok",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mosdef-hub/mbuild",
+    "score": 5,
+    "one_liner": "mBuild 是一个用于构建分子系统拓扑的组件化工具，主要面向 MD 模拟的体系搭建，虽非蛋白质结构预测或生成，但其分子构建方法可迁移至蛋白质体系建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "breimanntools/aaanalysis",
+    "score": 5,
+    "one_liner": "AAanalysis 是一个基于序列的蛋白质可解释预测框架，提供特征工程、PU学习和聚类工具，但核心是序列特征而非蛋白质结构计算，与结构预测/模拟方向关联较弱。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "HECBioSim/Longbow",
+    "score": 5,
+    "one_liner": "Longbow 是一个面向生物分子模拟的远程作业提交与监控工具，支持 AMBER、GROMACS 等 MD 软件，虽非直接做蛋白质结构计算，但为 MD 模拟提供自动化基础设施，与课题相关但方法贡献较弱。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "UAMCAntwerpen/2040FBDBIC",
+    "score": 5,
+    "one_liner": "这是一门化学信息学与计算药物设计课程材料，包含蛋白质处理、小分子、机器学习、药效团搜索和分子对接等notebook，涉及蛋白质结构计算但以教学为主，方法实现有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "UCLOrengoGroup/domain-annotation-pipeline",
+    "score": 5,
+    "one_liner": "该仓库是一个蛋白质结构域注释的自动化数据流水线，整合Chainsaw、Merizo和UniDoc等工具进行结构域划分，虽涉及蛋白质结构分析但非核心计算建模方法开发。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "XzzX/mrmd",
+    "score": 5,
+    "one_liner": "MRMD 是一个实现多分辨率分子动力学模拟的 C++ 工具包，虽非直接针对蛋白质结构，但其 MD 模拟方法可迁移至蛋白质体系。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ayuroy01/ChemLarp",
+    "score": 5,
+    "one_liner": "ChemLarp 是一个开源化学工作台，涵盖分子绘制、量子化学、分子动力学和蛋白质准备等功能，但蛋白质结构计算并非其核心，且方法为传统物理模拟而非AI/深度学习，故与课题方向部分相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "IRL2/nanover-imd-xr",
+    "score": 5,
+    "one_liner": "该仓库是用于虚拟现实环境中的交互式分子动力学模拟应用，基于NanoVer框架，虽涉及蛋白质等分子体系的MD模拟，但核心是XR交互界面而非结构计算建模方法本身。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "BarakHirshberg/MolecularSimulations",
+    "score": 5,
+    "one_liner": "这是一门分子模拟课程的教学笔记仓库，涵盖MD和MC模拟的Python实现，与蛋白质结构计算方向相关但非专门针对蛋白质，且以教学为主而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Aneesh495/asterion",
+    "score": 5,
+    "one_liner": "该仓库研究几何张量表示对分子力学习与轨迹可靠性的影响，涉及等变模型和分子动力学模拟，但对象为小分子而非蛋白质，算法思路可迁移但非直接相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "mj72git/PDB-Analyzer",
+    "score": 5,
+    "one_liner": "这是一个基于Streamlit的PDB文件分析工具，用于可视化和分析蛋白质设计结果（如AlphaFold/BindCraft输出），但主要聚焦于结构后处理与界面指标统计，而非核心的结构预测或生成方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Ata-gith/CADDack",
+    "score": 5,
+    "one_liner": "CADDack 是一个计算药物设计工具包，包含分子特征化、结合亲和力预测和对接，但核心对象是小分子配体而非蛋白质结构，问题轴偏向小分子QSAR而非蛋白质结构计算，方法轴有可用代码但非蛋白质结构建模核心。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "EricBoittier/LongRangeBench",
+    "score": 5,
+    "one_liner": "LongRangeBench 是一个评估机器学习势函数长程物理行为的基准测试工具，虽非直接针对蛋白质结构，但其对分子间长程相互作用的评估方法可迁移至蛋白质体系的结构建模与模拟。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "jasimjaleel2004/pymol-snp-protein-structure-comparison",
+    "score": 5,
+    "one_liner": "该仓库提供PyMOL脚本，用于比较野生型与SNP突变蛋白的局部结构差异，涉及结构比对、RMSD和二面角计算，但功能较简单，偏向工程化应用而非方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Leokong-C/joi-bio",
+    "score": 5,
+    "one_liner": "该仓库是面向肾脏疾病靶点的虚拟筛选与验证流程，核心是评估分子对接（AutoDock Vina）在蛋白质结构上的可靠性，并构建了严格的验证门控，但主要聚焦于小分子对接而非蛋白质结构预测/生成/设计等核心课题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "patrickallanfaustino/patrickallanfaustino.github.io",
+    "score": 5,
+    "one_liner": "该仓库提供生物分子分子动力学模拟的教程和工作流，面向学生，属于蛋白质结构计算模拟的教学资源，但缺乏可运行的代码工具或方法创新。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "abdullah-pharmd/CD36-FFAR4-GLP1-Discovery",
+    "score": 5,
+    "one_liner": "该仓库是面向CD36/FFAR4/DPP-4靶点的分子对接与ADMET筛选流程，虽涉及蛋白结构对接但偏重药物发现应用，方法为传统对接而非AI/增强采样，且非蛋白结构预测/生成核心方向。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "sreeved-prasad/drug-repurposing-mtb-ai",
+    "score": 5,
+    "one_liner": "该仓库是一个AI驱动的药物重定位流程，包含DTI预测和分子对接，但蛋白质仅以序列特征表示，未涉及结构预测、构象采样或结构生成等核心蛋白质结构计算问题。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "ArbnorDragaj/ArbnorDragaj-AI-Based-Protein-Structure-Prediction-and-Optimization",
+    "score": 5,
+    "one_liner": "该仓库实现了一个基于HP简化模型和立方格网格的蛋白质结构预测与优化教学项目，比较模拟退火与束搜索算法，但模型过于简化，非真实生物结构预测，且无AI/深度学习或物理模拟方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "sudo-CuriousLad/MolecularDynamics",
+    "score": 5,
+    "one_liner": "这是一个简化的3D粒子运动模拟项目，采用分子动力学思路和NumPy实现，但对象为通用粒子而非蛋白质结构，问题和方法与蛋白质结构计算课题仅部分相关。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "AAdisriMenon/ProtMind-AI_3step",
+    "score": 5,
+    "one_liner": "ProtMind AI 是一个整合蛋白质突变、结构、功能与互作数据的生物信息学平台，涉及结构预测与稳定性分析，但主要依赖外部数据库和工具，自身方法实现有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "wbw176-netizen/MAGC-DTI",
+    "score": 5,
+    "one_liner": "该仓库实现药物-靶点相互作用预测模型，结合药物与蛋白质表示进行跨模态交互，虽涉及蛋白质序列特征但非结构计算核心，方法为AI预测而非结构建模。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "YOOZOY/YOOZOY",
+    "score": 5,
+    "one_liner": "该仓库是个人主页，核心项目用MD和ML预测短肽聚集，涉及蛋白质序列-聚集关系建模，但方法较基础且非完整工具。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "koziarskilab/DREAM_Challenge_2025",
+    "score": 5,
+    "one_liner": "该仓库是DREAM药物发现挑战赛的解决方案，结合AutoML与3D对接预测WDR91小分子结合剂，虽涉及蛋白-配体结构建模，但核心是药物筛选而非蛋白质结构计算本身。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Almer-FW/protein-allergen-prediction",
+    "score": 5,
+    "one_liner": "该仓库实现基于ProtT5和GNN/Transformer的蛋白质过敏原预测模型，涉及蛋白质序列表示与结构相关建模，但核心是功能预测而非结构计算，且缺少结构预测/采样/对接等核心方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "romy555/computationalbiology",
+    "score": 5,
+    "one_liner": "这是一个涵盖14个计算生物学教学项目的仓库，其中包含蛋白质结构、共进化分析和分子动力学模拟等与课题相关的模块，但整体以教学演示为主，方法创新性和深度有限。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Love-sea/md-traj-kit",
+    "score": 5,
+    "one_liner": "一个面向MD轨迹分析的模块化工具包，聚焦于MSD等分析，与蛋白质结构计算相关但当前仅为脚手架，尚未实现蛋白质特定结构建模或AI/物理模拟方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "valeste/SERT-ML-Tox",
+    "score": 5,
+    "one_liner": "该仓库开发整合同源建模、分子对接和机器学习的计算流程，用于优先筛选水生环境中的抗抑郁药，核心对象是SERT蛋白结构，但当前处于开发阶段且方法多为现有工具集成，缺乏原创代码实现。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Sanika0711/MAO-B-Inhibitors-for-Parkinson-s-Disease",
+    "score": 5,
+    "one_liner": "该仓库用机器学习预测MAO-B抑制剂活性并结合分子对接设计类似物，涉及蛋白-配体对接但非蛋白质结构核心建模，方法可迁移但对象偏小分子药物设计。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "trasneaiulian/ProteinStruct-ML",
+    "score": 5,
+    "one_liner": "这是一个基于CASP数据集用机器学习回归预测蛋白质结构偏差(RMSD)的数据科学项目，涉及蛋白质结构质量评估但非结构预测/生成/对接等核心计算建模方法。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "Jaspreetsukheeja04/autoanalog",
+    "score": 5,
+    "one_liner": "这是一个面向小分子类似物设计的自动化药物发现流水线，虽涉及蛋白结构准备、对接和MD模拟，但核心对象是小分子药物而非蛋白质结构计算本身，算法可部分迁移但非本课题核心。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "choairyz/407-ProteinFolding",
+    "score": 5,
+    "one_liner": "这是一个课程项目，用2D格点模型和模拟退火蒙特卡洛模拟简化蛋白质折叠，属于蛋白质结构计算但模型过于简化，方法为经典物理模拟而非AI。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  },
+  {
+    "full_name": "regmi-sijan/cafa6-protein-function",
+    "score": 5,
+    "one_liner": "该仓库用ESM2嵌入和MLP/kNN混合模型预测蛋白质的Gene Ontology功能注释，属于蛋白质功能预测但非结构计算建模，方法为AI但对象和问题轴偏离结构核心。",
+    "copy_ok": true,
+    "wikis": {
+      "deepwiki": "not_indexed",
+      "codewiki": "not_indexed",
+      "zread": "not_indexed"
+    },
+    "copy": "code"
+  }
+]

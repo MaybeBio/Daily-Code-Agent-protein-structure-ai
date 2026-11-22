@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "27 3 * * 1"  # weekly Monday 03:27 UTC
+
+jobs:
+  docker-build:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch engine binaries
+        run: bash scripts/fetch_engines.sh
+      - name: Build backend image
+        run: docker build -f docker/Dockerfile -t dockstudio .
+      - name: Smoke test container
+        run: |
+          docker run -d --name smoke -p 8000:8000 dockstudio
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/api/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs smoke
+          exit 1
+
+  golden:
+    # opt-in: manual trigger or weekly schedule only
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch engine binaries
+        run: bash scripts/fetch_engines.sh
+      - name: Install backend
+        run: pip install -e "server[dev]"
+      - name: Golden redocking regression
+        env:
+          DOCKSTUDIO_GOLDEN: "1"
+        run: pytest server/tests/golden -m golden -q
+
+  server-test:
+    # 常规 push/PR：只跑 ubuntu 快检（省高价 mac/win 分钟）
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch engine binaries
+        run: bash scripts/fetch_engines.sh
+      - name: Install backend
+        run: pip install -e "server[dev]"
+      - name: Lint
+        run: ruff check server/dockstudio
+      - name: Format check
+        run: ruff format --check server/dockstudio
+      - name: Test (含真实 vina e2e)
+        run: pytest server/tests -q
+
+  server-test-full:
+    # 全矩阵只在手动 dispatch 或周任务时跑（验证 win/mac 不被日常消耗拖累）
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch engine binaries
+        run: bash scripts/fetch_engines.sh
+      - name: Install backend
+        run: pip install -e "server[dev]"
+      - name: Lint
+        run: ruff check server/dockstudio
+      - name: Format check
+        run: ruff format --check server/dockstudio
+      - name: Test (含真实 vina e2e)
+        run: pytest server/tests -q
+
+  web-build:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: cd apps/web && npm ci && npm run build
+
+  package-backend:
+    # 冻结后端产物上传占配额存储，只在手动 dispatch 时产出（Release 走 release.yml）
+    if: github.event_name == 'workflow_dispatch'
+    needs: [server-test, web-build]
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: bash scripts/fetch_engines.sh
+      - run: pip install -e "server[dev]" pyinstaller
+      - run: pyinstaller scripts/backend.spec --noconfirm --clean
+      - name: Smoke test frozen binary
+        run: bash scripts/smoke_e2e.sh "${{ github.workspace }}/dist/dockstudio-backend/dockstudio-backend${{ matrix.os == 'windows-latest' && '.exe' || '' }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dockstudio-backend-${{ matrix.os }}
+          path: dist/dockstudio-backend/
+          retention-days: 3
+
+  desktop-build:
+    # 日常不跑完整安装包构建（Release.yml 管 tag；手动 dispatch 才需要）
+    if: github.event_name == 'workflow_dispatch'
+    needs: [server-test, web-build]
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          cache: workspaces -> apps/desktop/src-tauri
+      - name: Linux WebKitGTK 依赖
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - run: bash scripts/fetch_engines.sh
+      - run: pip install -e "server[dev]" pyinstaller
+      - run: pyinstaller scripts/backend_onefile.spec --noconfirm --clean
+      - name: Rename sidecar per target triple
+        run: bash scripts/stage_sidecar.sh
+      - run: cd apps/web && npm ci && npm run build
+      - run: cd apps/desktop && npm ci
+      - name: Tauri Build (bundle=true)
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: apps/desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.os }}
+          retention-days: 3
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
+            apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+            apps/desktop/src-tauri/target/release/bundle/deb/*.deb

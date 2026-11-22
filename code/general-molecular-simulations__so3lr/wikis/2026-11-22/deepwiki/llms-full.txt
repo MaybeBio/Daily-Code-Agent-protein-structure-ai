@@ -1,0 +1,4660 @@
+# Page: Overview
+
+# Overview
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [examples/data/sapt10k.zip](examples/data/sapt10k.zip)
+- [pyproject.toml](pyproject.toml)
+
+</details>
+
+
+
+This document provides a comprehensive overview of SO3LR (pronounced "Solar"), a pretrained machine-learned force field for molecular simulations. SO3LR combines the SO3krates neural network architecture with universal pairwise force fields to enable accurate and efficient molecular dynamics simulations across diverse chemical systems.
+
+For specific implementation details of core components, see [Core Components](#5). For usage examples and tutorials, see [Examples and Tutorials](#4). For command-line usage, see [Command Line Interface](#2), and for programmatic integration, see [Python API](#3).
+
+## System Architecture
+
+SO3LR implements a hybrid force field architecture that integrates two complementary computational approaches: neural network-based semi-local interactions through SO3krates and classical universal pairwise force fields for long-range interactions.
+
+### High-Level System Components
+
+```mermaid
+graph TB
+    subgraph "User Interfaces"
+        CLI["so3lr CLI<br/>so3lr_cli.py"]
+        ASECalc["So3lrCalculator<br/>ASE Integration"]
+        JAXMDInteg["to_jax_md()<br/>JAX-MD Integration"] 
+        DirectAPI["So3lrPotential<br/>Direct API"]
+    end
+    
+    subgraph "Core SO3LR System"
+        Graph["Graph<br/>Molecular Representation"]
+        Potential["So3lrPotential<br/>Energy Function"]
+        SO3krates["SO3krates Neural Network<br/>Semi-local Interactions"]
+        UPF["Universal Pairwise Force Fields<br/>Long-range Interactions"]
+    end
+    
+    subgraph "External Dependencies"
+        JAX["JAX/JAXLib<br/>Numerical Computing"]
+        MLFF["MLFF<br/>ML Force Field Framework"]
+        JAXMD["JAX-MD<br/>MD Simulation Engine"]
+        ASE["ASE<br/>Atomic Simulation Environment"]
+    end
+    
+    CLI --> Potential
+    ASECalc --> Potential
+    JAXMDInteg --> Potential
+    DirectAPI --> Potential
+    
+    Potential --> Graph
+    Potential --> SO3krates
+    Potential --> UPF
+    
+    SO3krates --> MLFF
+    UPF --> MLFF
+    Potential --> JAX
+    JAXMDInteg --> JAXMD
+    ASECalc --> ASE
+    JAXMD --> JAX
+    MLFF --> JAX
+```
+
+Sources: [README.md:1-303](), [pyproject.toml:1-31]()
+
+## Core Architecture Components
+
+SO3LR's architecture centers around three primary computational components that work together to provide accurate molecular force field predictions.
+
+### Force Field Hybrid Design
+
+```mermaid
+graph LR
+    subgraph "Input Molecular System"
+        Atoms["Atomic Positions<br/>Atomic Numbers<br/>Charges"]
+        Box["Simulation Box<br/>Periodic Conditions"]
+    end
+    
+    subgraph "Graph Construction"
+        GraphBuilder["Graph Constructor<br/>system_to_graph()"]
+        GraphDS["Graph Data Structure<br/>namedtuple"]
+    end
+    
+    subgraph "Force Field Components"
+        SO3Net["SO3krates Network<br/>Semi-local Interactions<br/>Neural Network"]
+        Pairwise["Universal Pairwise<br/>Long-range Forces<br/>Electrostatics + Dispersion"]
+    end
+    
+    subgraph "Energy Computation"
+        EnergyFn["So3lrPotential()<br/>Energy Function<br/>JAX Compatible"]
+        Forces["jax.grad()<br/>Force Calculation"]
+    end
+    
+    Atoms --> GraphBuilder
+    Box --> GraphBuilder
+    GraphBuilder --> GraphDS
+    
+    GraphDS --> SO3Net
+    GraphDS --> Pairwise
+    
+    SO3Net --> EnergyFn
+    Pairwise --> EnergyFn
+    EnergyFn --> Forces
+```
+
+Sources: [README.md:256-275]()
+
+## Integration Interfaces
+
+SO3LR provides multiple integration pathways to accommodate different simulation workflows and computational frameworks.
+
+### API Integration Points
+
+| Interface | Primary Use Case | Key Functions | Target Users |
+|-----------|------------------|---------------|--------------|
+| CLI | Production simulations | `so3lr nvt`, `so3lr npt`, `so3lr opt` | End users, HPC workflows |
+| ASE Calculator | Standard workflows | `So3lrCalculator()` | Computational chemists |
+| JAX-MD Integration | Large-scale simulations | `to_jax_md()` | Performance-critical applications |
+| Direct API | Custom applications | `So3lrPotential()`, `Graph()` | Developers, method development |
+
+```mermaid
+graph TB
+    subgraph "Integration Layer"
+        BaseCalc["make_so3lr()<br/>base_calculator.py"]
+        ASEUtils["make_ase_calculator()<br/>ase_utils.py"]  
+        JAXMDUtils["to_jax_md()<br/>jaxmd_utils.py"]
+        CLIEntry["main()<br/>so3lr_cli.py"]
+    end
+    
+    subgraph "Core Potential System"
+        PotentialFn["So3lrPotential<br/>potential.py"]
+        GraphSystem["Graph<br/>Molecular Representation"]
+        EnergyCalc["Energy Calculation<br/>JAX JIT Compiled"]
+    end
+    
+    subgraph "External Frameworks"
+        ASEFramework["ASE<br/>atoms.get_forces()"]
+        JAXMDFramework["JAX-MD<br/>Large Scale MD"]
+        CLIFramework["Command Line<br/>Production Workflows"]
+        CustomCode["Custom Applications<br/>Direct Integration"]
+    end
+    
+    CLIEntry --> BaseCalc
+    ASEUtils --> BaseCalc
+    JAXMDUtils --> BaseCalc
+    
+    BaseCalc --> PotentialFn
+    PotentialFn --> GraphSystem
+    PotentialFn --> EnergyCalc
+    
+    CLIEntry --> CLIFramework
+    ASEUtils --> ASEFramework
+    JAXMDUtils --> JAXMDFramework
+    BaseCalc --> CustomCode
+```
+
+Sources: [README.md:38-255](), [pyproject.toml:29-30]()
+
+## Performance and Computational Framework
+
+SO3LR is built on the JAX ecosystem to provide high-performance molecular simulations with automatic differentiation and JIT compilation capabilities.
+
+### Computational Backend
+
+```mermaid
+graph TD
+    subgraph "JAX Ecosystem"
+        JAXCore["JAX Core<br/>Automatic Differentiation"]
+        JAXJIT["JAX JIT<br/>Performance Optimization"] 
+        JAXLib["JAXLib<br/>XLA Backend"]
+    end
+    
+    subgraph "SO3LR Performance Features"
+        JITCompiled["JIT Compiled Functions<br/>energy_fn, force_fn"]
+        GPUSupport["GPU Acceleration<br/>CUDA Support"]
+        Vectorization["Batch Processing<br/>jax.vmap"]
+    end
+    
+    subgraph "Hardware Targets"
+        CPU["CPU Execution<br/>Development/Testing"]
+        GPU["GPU Execution<br/>Production Simulations"]
+    end
+    
+    JAXCore --> JITCompiled
+    JAXJIT --> JITCompiled
+    JAXLib --> GPUSupport
+    JAXCore --> Vectorization
+    
+    JITCompiled --> CPU
+    JITCompiled --> GPU
+    GPUSupport --> GPU
+    Vectorization --> GPU
+```
+
+### Key Performance Characteristics
+
+- **GPU Acceleration**: Optimized for CUDA-enabled GPUs with significant performance improvements over CPU execution
+- **JIT Compilation**: Energy and force functions are JIT-compiled for optimal performance
+- **Automatic Differentiation**: Forces computed via automatic differentiation of energy functions
+- **Scalable Simulations**: Integration with JAX-MD enables large-scale molecular dynamics
+
+Sources: [README.md:16-30](), [README.md:182-254](), [pyproject.toml:14-21]()
+
+## Dependencies and Requirements
+
+SO3LR relies on a carefully curated set of dependencies to provide its full functionality:
+
+### Core Dependencies
+
+- **JAX/JAXLib (==0.5.3)**: Numerical computing and automatic differentiation
+- **MLFF**: Machine learning force field framework (custom fork)
+- **JAX-MD**: Molecular dynamics simulation engine (custom fork) 
+- **ASE**: Atomic Simulation Environment integration
+- **JAX-PME**: Particle mesh Ewald for long-range electrostatics
+
+### Installation Requirements
+
+- **Python >=3.12**: Modern Python version required
+- **GPU Support**: Optional but recommended for production simulations
+- **CUDA 12**: Required for GPU acceleration
+
+The system supports both CPU and GPU execution modes, with GPU providing significantly better performance for large-scale simulations.
+
+Sources: [pyproject.toml:9-22](), [README.md:15-36]()
+
+---
+
+# Page: Installation and Setup
+
+# Installation and Setup
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.github/workflows/CI.yml](.github/workflows/CI.yml)
+- [pyproject.toml](pyproject.toml)
+- [so3lr/__init__.py](so3lr/__init__.py)
+
+</details>
+
+
+
+This document provides comprehensive instructions for installing SO3LR and its dependencies, configuring the development environment, and verifying that the installation works correctly. It covers both user installations for running simulations and developer setups for contributing to the codebase.
+
+For information about using SO3LR's command line interface after installation, see [Command Line Interface](#2). For Python API usage, see [Python API](#3).
+
+## Prerequisites
+
+SO3LR requires Python 3.12 or higher and depends on several scientific computing libraries. The system integrates with multiple external frameworks for molecular simulation and machine learning.
+
+### System Requirements
+
+| Component | Requirement | Notes |
+|-----------|-------------|-------|
+| Python | ≥ 3.12 | Required for all SO3LR functionality |
+| JAX/JAXLib | 0.5.3 | Exact version required for compatibility |
+| Operating System | Linux/macOS | Windows support not officially tested |
+
+**Installation Dependencies Flow**
+```mermaid
+graph TD
+    Python["python>=3.12"] --> CoreDeps["Core Dependencies"]
+    CoreDeps --> numpy["numpy"]
+    CoreDeps --> ase["ase"]
+    CoreDeps --> h5py["h5py"]
+    CoreDeps --> jax["jax==0.5.3"]
+    CoreDeps --> jaxlib["jaxlib==0.5.3"]
+    CoreDeps --> setuptools["setuptools<81"]
+    
+    GitDeps["Git Dependencies"] --> mlff["mlff<br/>(kabylda/mlff)"]
+    GitDeps --> jraph["jraph<br/>(kabylda/jraph)"]
+    GitDeps --> jaxmd["jax-md<br/>(kabylda/jax-md)"]
+    GitDeps --> glp["glp<br/>(kabylda/glp)"]
+    GitDeps --> jaxpme["jax-pme<br/>(lab-cosmo/jax-pme)"]
+    
+    jax --> GitDeps
+    jaxlib --> GitDeps
+    
+    SO3LR["SO3LR Package"] --> Python
+    SO3LR --> CoreDeps
+    SO3LR --> GitDeps
+```
+
+Sources: [pyproject.toml:9-21](), [.github/workflows/CI.yml:18-20]()
+
+## Installation Methods
+
+### Standard Installation
+
+The recommended installation method uses pip to install SO3LR directly from the repository:
+
+```bash
+pip install git+https://github.com/general-molecular-simulations/so3lr.git
+```
+
+This will automatically install all dependencies specified in the project configuration.
+
+### Development Installation
+
+For development work or to access the latest features, clone the repository and install in editable mode:
+
+```bash
+git clone https://github.com/general-molecular-simulations/so3lr.git
+cd so3lr
+pip install -e .
+```
+
+The editable installation allows changes to the source code to be immediately reflected without reinstalling.
+
+Sources: [.github/workflows/CI.yml:36](), [pyproject.toml:24-26]()
+
+## Dependency Architecture
+
+SO3LR's dependency structure reflects its role as an integration layer between multiple scientific computing frameworks.
+
+**SO3LR Dependency Architecture**
+```mermaid
+graph LR
+    subgraph "External Frameworks"
+        ASE["ase<br/>Atomic Simulation Environment"]
+        JAXMD["jax-md<br/>Molecular Dynamics"]
+        MLFF["mlff<br/>Machine Learning Force Fields"]
+        JAX["jax/jaxlib<br/>Numerical Computing"]
+    end
+    
+    subgraph "Specialized Libraries"
+        JRAPH["jraph<br/>Graph Neural Networks"]
+        GLP["glp<br/>Gaussian Learning Potentials"]
+        JAXPME["jax-pme<br/>Particle Mesh Ewald"]
+    end
+    
+    subgraph "SO3LR Core"
+        AseUtils["ase_utils.py<br/>So3lrCalculator"]
+        JaxmdUtils["jaxmd_utils.py<br/>to_jax_md"]
+        Potential["potential.py<br/>So3lrPotential"]
+        BaseCalc["base_calculator.py<br/>So3lr"]
+        Graph["graph.py<br/>Graph"]
+    end
+    
+    subgraph "Data Handling"
+        H5PY["h5py<br/>HDF5 Files"]
+        NUMPY["numpy<br/>Array Operations"]
+        SETUPTOOLS["setuptools<br/>Build System"]
+    end
+    
+    ASE --> AseUtils
+    JAXMD --> JaxmdUtils
+    MLFF --> Potential
+    MLFF --> BaseCalc
+    JAX --> JaxmdUtils
+    JAX --> Potential
+    JAX --> BaseCalc
+    
+    JRAPH --> Graph
+    GLP --> Potential
+    JAXPME --> Potential
+    
+    H5PY --> AseUtils
+    H5PY --> JaxmdUtils
+    NUMPY --> Graph
+    NUMPY --> Potential
+    
+    SETUPTOOLS --> BaseCalc
+```
+
+Sources: [pyproject.toml:11-21](), [so3lr/__init__.py:3-7]()
+
+### Git Dependencies
+
+SO3LR depends on several forked versions of scientific libraries that include specific features or modifications:
+
+| Package | Repository | Branch | Purpose |
+|---------|------------|---------|---------|
+| `mlff` | kabylda/mlff | v1.0-tfds-pme | Machine learning force fields with PME support |
+| `jraph` | kabylda/jraph | master | Graph neural network operations |
+| `jax-md` | kabylda/jax-md | main | Molecular dynamics with JAX |
+| `glp` | kabylda/glp | electrostatics_neighbourlist | Gaussian learning potentials |
+| `jax-pme` | lab-cosmo/jax-pme | main | Particle mesh Ewald implementation |
+
+These dependencies are installed automatically during SO3LR installation.
+
+Sources: [pyproject.toml:17-21]()
+
+## Command Line Interface Setup
+
+After installation, SO3LR provides a command line interface accessible via the `so3lr` command. The CLI entry point is configured in the project setup.
+
+**CLI Command Structure**
+```mermaid
+graph TD
+    so3lr["so3lr<br/>(main entry point)"] --> opt["so3lr opt<br/>Geometry Optimization"]
+    so3lr --> nvt["so3lr nvt<br/>NVT Dynamics"]
+    so3lr --> npt["so3lr npt<br/>NPT Dynamics"]
+    so3lr --> nve["so3lr nve<br/>NVE Dynamics"]
+    so3lr --> eval["so3lr eval<br/>Model Evaluation"]
+    
+    EntryPoint["poetry.scripts<br/>so3lr_cli:main"] --> so3lr
+```
+
+Sources: [pyproject.toml:29-30]()
+
+## Installation Verification
+
+### Testing Core Functionality
+
+Verify the installation by testing the main components:
+
+```bash
+# Test CLI availability
+so3lr --help
+
+# Test Python imports
+python -c "from so3lr import So3lrCalculator, Graph, So3lrPotential; print('Import successful')"
+
+# Run test suite (development installation)
+pytest tests/
+```
+
+### Component Verification
+
+Test individual SO3LR components to ensure proper installation:
+
+```python
+# Test ASE integration
+from so3lr import So3lrCalculator
+
+# Test JAX-MD integration  
+from so3lr import to_jax_md
+
+# Test direct API
+from so3lr import So3lr
+
+# Test graph functionality
+from so3lr import Graph
+
+# Test potential functions
+from so3lr import So3lrPotential
+```
+
+Sources: [so3lr/__init__.py:3-7](), [.github/workflows/CI.yml:34-37]()
+
+### JAX Backend Verification
+
+Since SO3LR relies heavily on JAX for numerical computations, verify JAX installation:
+
+```python
+import jax
+import jax.numpy as jnp
+
+# Check JAX version
+print(f"JAX version: {jax.__version__}")  # Should be 0.5.3
+
+# Test basic JAX functionality
+x = jnp.array([1.0, 2.0, 3.0])
+print(f"JAX array operations work: {jnp.sum(x)}")
+
+# Test JIT compilation
+@jax.jit
+def square(x):
+    return x ** 2
+
+print(f"JIT compilation works: {square(5.0)}")
+```
+
+## Troubleshooting
+
+### Common Installation Issues
+
+| Issue | Symptoms | Solution |
+|-------|----------|----------|
+| JAX version conflict | Import errors, compilation failures | Ensure `jax==0.5.3` and `jaxlib==0.5.3` |
+| Git dependency failures | Network errors during install | Check internet connection, Git access |
+| Python version mismatch | Syntax errors, import failures | Use Python ≥ 3.12 |
+| CUDA/GPU issues | JAX GPU detection failures | Install appropriate JAXLib CUDA version |
+
+### Dependency Resolution
+
+If dependency conflicts occur, create a clean virtual environment:
+
+```bash
+python -m venv so3lr_env
+source so3lr_env/bin/activate  # Linux/macOS
+# or
+so3lr_env\Scripts\activate     # Windows
+
+pip install --upgrade pip
+pip install git+https://github.com/general-molecular-simulations/so3lr.git
+```
+
+### Development Environment Setup
+
+For development work, ensure testing capabilities:
+
+```bash
+pip install -e .
+pip install pytest  # If not included in dependencies
+pytest tests/ -v
+```
+
+Sources: [.github/workflows/CI.yml:15-37](), [pyproject.toml:14-16]()
+
+The installation process integrates SO3LR with the broader ecosystem of molecular simulation tools, providing interfaces to ASE, JAX-MD, and other frameworks while maintaining precise dependency versioning for reproducible scientific computing.
+
+---
+
+# Page: Command Line Interface
+
+# Command Line Interface
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [examples/data/sapt10k.zip](examples/data/sapt10k.zip)
+- [so3lr/cli/so3lr_cli.py](so3lr/cli/so3lr_cli.py)
+
+</details>
+
+
+
+The SO3LR Command Line Interface (CLI) provides a unified interface for running molecular dynamics simulations, geometry optimization, and model evaluation using SO3LR force fields. The CLI abstracts the complexity of the underlying JAX-MD simulation engine and SO3LR potential system into simple, intuitive commands.
+
+This document covers the CLI architecture, available commands, parameter system, and configuration options. For information about the underlying Python API that the CLI uses, see [Python API](#3). For examples of using the CLI in practice, see [Examples and Tutorials](#4).
+
+## CLI Architecture Overview
+
+The SO3LR CLI is built using the Click framework and provides five main commands through a unified interface. The CLI handles parameter validation, default value management, hardware detection, and logging configuration before delegating to the appropriate simulation engines.
+
+```mermaid
+graph TD
+    subgraph "CLI Entry Points"
+        so3lr["so3lr<br/>(main command)"]
+        opt["so3lr opt<br/>(geometry optimization)"]
+        nvt["so3lr nvt<br/>(NVT dynamics)"]
+        npt["so3lr npt<br/>(NPT dynamics)"]
+        nve["so3lr nve<br/>(NVE dynamics)"]
+        eval["so3lr eval<br/>(model evaluation)"]
+    end
+    
+    subgraph "Click Framework Layer"
+        cli_func["cli()"]
+        fire_optimization["fire_optimization()"]
+        nvt_md["nvt_md()"]
+        npt_md["npt_md()"]
+        nve_md["nve_md()"]
+        eval_model["eval_model()"]
+    end
+    
+    subgraph "Configuration System"
+        param_map["PARAM_MAP"]
+        defaults["DEFAULT_* constants"]
+        settings_dict["settings_dict"]
+        yaml_config["YAML configuration"]
+    end
+    
+    subgraph "Execution Engines"
+        run_func["run()"]
+        perform_min["perform_min()"]
+        evaluate_so3lr_on["evaluate_so3lr_on()"]
+    end
+    
+    so3lr --> cli_func
+    opt --> fire_optimization
+    nvt --> nvt_md
+    npt --> npt_md
+    nve --> nve_md
+    eval --> eval_model
+    
+    cli_func --> param_map
+    fire_optimization --> param_map
+    nvt_md --> param_map
+    npt_md --> param_map
+    nve_md --> param_map
+    eval_model --> param_map
+    
+    param_map --> settings_dict
+    defaults --> settings_dict
+    yaml_config --> settings_dict
+    
+    settings_dict --> run_func
+    settings_dict --> perform_min
+    settings_dict --> evaluate_so3lr_on
+```
+
+Sources: [so3lr/cli/so3lr_cli.py:1-1814]()
+
+## Command Structure and Functions
+
+The CLI implements a hierarchical command structure where each simulation type is implemented as a Click subcommand with its own parameter set and validation logic.
+
+```mermaid
+graph LR
+    subgraph "Main CLI Group"
+        cli_decorator["@cli.group()"]
+        cli_function["cli()"]
+    end
+    
+    subgraph "Subcommands"
+        opt_cmd["@cli.command(name='opt')"]
+        nvt_cmd["@cli.command(name='nvt')"]
+        npt_cmd["@cli.command(name='npt')"]
+        nve_cmd["@cli.command(name='nve')"]
+        eval_cmd["@cli.command(name='eval')"]
+    end
+    
+    subgraph "Command Functions"
+        fire_func["fire_optimization()"]
+        nvt_func["nvt_md()"]
+        npt_func["npt_md()"]
+        nve_func["nve_md()"]
+        eval_func["eval_model()"]
+    end
+    
+    subgraph "Backend Engines"
+        perform_min_engine["perform_min()"]
+        md_engine["run()"]
+        eval_engine["evaluate_so3lr_on()"]
+    end
+    
+    cli_decorator --> cli_function
+    
+    opt_cmd --> fire_func
+    nvt_cmd --> nvt_func
+    npt_cmd --> npt_func
+    nve_cmd --> nve_func
+    eval_cmd --> eval_func
+    
+    fire_func --> perform_min_engine
+    nvt_func --> md_engine
+    npt_func --> md_engine
+    nve_func --> md_engine
+    eval_func --> eval_engine
+```
+
+Sources: [so3lr/cli/so3lr_cli.py:499-585](), [so3lr/cli/so3lr_cli.py:865-925](), [so3lr/cli/so3lr_cli.py:1022-1113](), [so3lr/cli/so3lr_cli.py:1243-1338](), [so3lr/cli/so3lr_cli.py:1476-1551](), [so3lr/cli/so3lr_cli.py:1674-1715]()
+
+## Parameter System and Configuration
+
+The CLI uses a sophisticated parameter mapping system that translates command-line arguments into internal settings dictionaries. This system supports both direct CLI parameters and YAML configuration files.
+
+| CLI Parameter | Internal Setting | Default Value | Description |
+|---------------|------------------|---------------|-------------|
+| `--input` | `input_file` | None | Input geometry file |
+| `--output` | `output_file` | None | Output trajectory file |
+| `--temperature` | `md_T` | 300 | Simulation temperature (K) |
+| `--pressure` | `md_P` | None | Simulation pressure (atm) |
+| `--dt` | `md_dt` | 0.5 | MD timestep (fs) |
+| `--md-cycles` | `md_cycles` | 100 | Number of MD cycles |
+| `--md-steps` | `md_steps` | 100 | Steps per MD cycle |
+| `--lr-cutoff` | `lr_cutoff` | 12.0 | Long-range cutoff (Å) |
+| `--nhc-chain` | `nhc_chain_length` | 3 | Nose-Hoover chain length |
+| `--nhc-thermo` | `nhc_thermo` | 100.0 | Thermostat damping factor |
+
+The parameter mapping is defined in the `PARAM_MAP` dictionary and processed by the `update_settings_from_defaults()` method:
+
+```mermaid
+flowchart TD
+    subgraph "Parameter Sources"
+        cli_args["CLI Arguments"]
+        yaml_file["YAML Configuration"]
+        defaults["Default Constants"]
+    end
+    
+    subgraph "Processing Pipeline"
+        param_map["PARAM_MAP<br/>Translation"]
+        validation["Parameter<br/>Validation"]
+        settings_dict["settings_dict<br/>Creation"]
+    end
+    
+    subgraph "Default Constants"
+        DEFAULT_PRECISION["DEFAULT_PRECISION = 'float32'"]
+        DEFAULT_LR_CUTOFF["DEFAULT_LR_CUTOFF = 12.0"]
+        DEFAULT_TEMPERATURE["DEFAULT_TEMPERATURE = 300"]
+        DEFAULT_MD_CYCLES["DEFAULT_MD_CYCLES = 100"]
+    end
+    
+    cli_args --> param_map
+    yaml_file --> settings_dict
+    defaults --> settings_dict
+    param_map --> validation
+    validation --> settings_dict
+    
+    DEFAULT_PRECISION --> defaults
+    DEFAULT_LR_CUTOFF --> defaults
+    DEFAULT_TEMPERATURE --> defaults
+    DEFAULT_MD_CYCLES --> defaults
+```
+
+Sources: [so3lr/cli/so3lr_cli.py:325-358](), [so3lr/cli/so3lr_cli.py:97-125](), [so3lr/cli/so3lr_cli.py:466-481]()
+
+## Simulation Commands
+
+### Geometry Optimization (`so3lr opt`)
+
+The `opt` command performs geometry optimization using the FIRE algorithm implemented in JAX-MD. It supports convergence-based stopping criteria or fixed iteration limits.
+
+**Key Parameters:**
+- `--force-conv`: Force convergence threshold (eV/Å)
+- `--min-cycles`: Number of optimization cycles
+- `--min-start-dt`: Initial timestep for FIRE algorithm
+- `--min-max-dt`: Maximum timestep for FIRE algorithm
+
+**Function Flow:**
+1. `fire_optimization()` validates inputs and creates settings dictionary
+2. `perform_min()` executes the optimization using JAX-MD FIRE implementation
+3. Results saved to specified output file
+
+Sources: [so3lr/cli/so3lr_cli.py:865-925](), [so3lr/cli/so3lr_cli.py:903-1020]()
+
+### Molecular Dynamics Commands
+
+The MD commands (`nvt`, `npt`, `nve`) share a common implementation through the `run()` function but differ in their ensemble-specific parameters and thermostat/barostat configuration.
+
+#### NVT Ensemble (`so3lr nvt`)
+Constant volume and temperature simulation using Nose-Hoover chain thermostat.
+
+**Key Parameters:**
+- `--temperature`: Target temperature (K)
+- `--nhc-chain`: Nose-Hoover chain length
+- `--nhc-thermo`: Thermostat damping factor
+
+#### NPT Ensemble (`so3lr npt`) 
+Constant pressure and temperature simulation using Nose-Hoover chain thermostat and barostat.
+
+**Key Parameters:**
+- `--temperature`: Target temperature (K)
+- `--pressure`: Target pressure (atm)
+- `--nhc-baro`: Barostat damping factor
+
+#### NVE Ensemble (`so3lr nve`)
+Constant volume and energy simulation with no thermostat.
+
+**Key Parameters:**
+- `--temperature`: Initial temperature for velocity initialization (K)
+
+```mermaid
+graph TD
+    subgraph "MD Command Processing"
+        md_input["MD Command Input"]
+        ensemble_detect["Ensemble Detection<br/>canonicalize_ensemble()"]
+        settings_create["Settings Dictionary<br/>Creation"]
+        run_engine["run() Engine"]
+    end
+    
+    subgraph "Ensemble-Specific Logic"
+        nvt_logic["NVT Logic<br/>md_T set, md_P = None"]
+        npt_logic["NPT Logic<br/>md_T and md_P set"]
+        nve_logic["NVE Logic<br/>init_T set, md_T = None"]
+    end
+    
+    subgraph "JAX-MD Integration"
+        jaxmd_setup["JAX-MD Setup"]
+        thermostat["Nose-Hoover<br/>Thermostat"]
+        barostat["Nose-Hoover<br/>Barostat"]
+        integrator["Velocity Verlet<br/>Integrator"]
+    end
+    
+    md_input --> ensemble_detect
+    ensemble_detect --> nvt_logic
+    ensemble_detect --> npt_logic
+    ensemble_detect --> nve_logic
+    
+    nvt_logic --> settings_create
+    npt_logic --> settings_create
+    nve_logic --> settings_create
+    
+    settings_create --> run_engine
+    run_engine --> jaxmd_setup
+    jaxmd_setup --> thermostat
+    jaxmd_setup --> barostat
+    jaxmd_setup --> integrator
+```
+
+Sources: [so3lr/cli/so3lr_cli.py:1022-1113](), [so3lr/cli/so3lr_cli.py:1243-1338](), [so3lr/cli/so3lr_cli.py:1476-1551](), [so3lr/cli/so3lr_cli.py:483-497]()
+
+### Model Evaluation (`so3lr eval`)
+
+The `eval` command evaluates SO3LR model performance on molecular datasets, computing metrics for energy, forces, dipole moments, and Hirshfeld ratios.
+
+**Key Parameters:**
+- `--datafile`: Input dataset file (EXTXYZ format)
+- `--save-to`: Output file for predictions
+- `--targets`: Comma-separated list of properties to evaluate
+- `--batch-size`: Number of molecules per batch
+- `--jit-compile`: Enable JIT compilation for performance
+
+**Function Flow:**
+1. `eval_model()` validates inputs and creates evaluation settings
+2. `evaluate_so3lr_on()` processes the dataset in batches
+3. Metrics computed and predictions optionally saved
+
+Sources: [so3lr/cli/so3lr_cli.py:1674-1715](), [so3lr/cli/so3lr_cli.py:1700-1801]()
+
+## Hardware Detection and Logging
+
+The CLI includes comprehensive hardware detection and logging functionality to provide users with information about their computational environment and simulation progress.
+
+```mermaid
+graph LR
+    subgraph "Hardware Detection"
+        get_hardware_info["get_hardware_info()"]
+        jax_devices["jax.devices()"]
+        jax_backend["jax.default_backend()"]
+    end
+    
+    subgraph "Device Types"
+        cpu_info["CPU Information<br/>cores, processor"]
+        gpu_info["GPU Information<br/>memory, device name"]
+        other_devices["Other Devices<br/>TPU, etc."]
+    end
+    
+    subgraph "Logging System"
+        setup_logger["setup_logger()"]
+        log_output["Log File Output"]
+        console_output["Console Output"]
+    end
+    
+    get_hardware_info --> jax_devices
+    get_hardware_info --> jax_backend
+    
+    jax_devices --> cpu_info
+    jax_devices --> gpu_info
+    jax_devices --> other_devices
+    
+    setup_logger --> log_output
+    setup_logger --> console_output
+```
+
+The `get_hardware_info()` function detects the computational backend and provides detailed information about available devices, including memory usage for GPU systems.
+
+Sources: [so3lr/cli/so3lr_cli.py:42-94]()
+
+## Error Handling and Validation
+
+The CLI implements comprehensive error handling and input validation to provide clear feedback to users:
+
+1. **File Validation**: Checks for input file existence and output path validity
+2. **Parameter Validation**: Ensures parameter values are within valid ranges
+3. **Ensemble Validation**: Prevents conflicting ensemble specifications
+4. **Hardware Validation**: Warns about potential hardware limitations
+
+Sources: [so3lr/cli/so3lr_cli.py:757-761](), [so3lr/cli/so3lr_cli.py:769-782](), [so3lr/cli/so3lr_cli.py:485-486]()
+
+---
+
+# Page: Simulation Commands
+
+# Simulation Commands
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [so3lr/cli/md_settings.yaml](so3lr/cli/md_settings.yaml)
+- [so3lr/cli/so3lr_md.py](so3lr/cli/so3lr_md.py)
+
+</details>
+
+
+
+This page documents the core simulation commands available in the SO3LR command-line interface for performing molecular dynamics simulations and geometry optimization. These commands provide the primary interface for running production simulations with the SO3LR machine learning force field.
+
+For information about model evaluation workflows, see [Model Evaluation](#2.2). For programming interfaces that bypass the CLI, see [Python API](#3).
+
+## Overview
+
+SO3LR provides four main simulation commands that map directly to computational chemistry simulation types:
+
+| Command | Purpose | Ensemble | Implementation Function |
+|---------|---------|----------|----------------------|
+| `so3lr opt` | Geometry optimization | - | `perform_min()` |
+| `so3lr nve` | Microcanonical dynamics | NVE | `perform_md()` |
+| `so3lr nvt` | Canonical dynamics | NVT | `perform_md()` |
+| `so3lr npt` | Isothermal-isobaric dynamics | NPT | `perform_md()` |
+
+All commands share a common parameter system based on settings files and command-line overrides, with simulation-specific parameters controlled through the `ensemble` setting.
+
+**Command to Implementation Mapping**
+```mermaid
+graph TD
+    CLI["so3lr CLI Commands"]
+    OptCmd["so3lr opt"]
+    NVECmd["so3lr nve"] 
+    NVTCmd["so3lr nvt"]
+    NPTCmd["so3lr npt"]
+    
+    RunFunc["run()"]
+    PerformMD["perform_md()"]
+    PerformMin["perform_min()"]
+    
+    SettingsDict["all_settings dict"]
+    EnsembleKey["ensemble: 'opt'/'nve'/'nvt'/'npt'"]
+    
+    CLI --> OptCmd
+    CLI --> NVECmd
+    CLI --> NVTCmd  
+    CLI --> NPTCmd
+    
+    OptCmd --> SettingsDict
+    NVECmd --> SettingsDict
+    NVTCmd --> SettingsDict
+    NPTCmd --> SettingsDict
+    
+    SettingsDict --> EnsembleKey
+    EnsembleKey --> RunFunc
+    
+    RunFunc --> PerformMin
+    RunFunc --> PerformMD
+    
+    PerformMin --> FIREAlg["FIRE Algorithm"]
+    PerformMD --> NVEInteg["NVE Integration"]
+    PerformMD --> NHCThermo["Nose-Hoover Thermostat"] 
+    PerformMD --> NHCBaro["Nose-Hoover Barostat"]
+```
+
+Sources: [so3lr/cli/so3lr_md.py:2322-2372](), [so3lr/cli/so3lr_md.py:1402-1838](), [so3lr/cli/so3lr_md.py:1932-2173]()
+
+## Geometry Optimization
+
+The `so3lr opt` command performs energy minimization using the FIRE (Fast Inertial Relaxation Engine) algorithm to find local energy minima of molecular structures.
+
+### FIRE Algorithm Implementation
+
+The optimization uses FIRE minimization with configurable parameters:
+
+```mermaid
+graph TD
+    OptCmd["so3lr opt"]
+    Settings["Optimization Settings"]
+    PerformMin["perform_min()"]
+    
+    LoadModel["load_model() / So3lrPotential"]
+    ProcessModel["process_model()"]
+    CreateFIRE["create_fire_fn()"]
+    
+    NeighborFn["neighbor_fn"]
+    NeighborFnLR["neighbor_fn_lr"] 
+    EnergyFn["energy_fn"]
+    ForceFn["force_fn"]
+    
+    FIREInit["fire_init"]
+    FIREApply["fire_apply"]
+    StepMinFn["step_min_fn"]
+    
+    MinLoop["Minimization Loop"]
+    ConvCheck["Convergence Check"]
+    SaveTraj["Save Trajectory"]
+    
+    OptCmd --> Settings
+    Settings --> PerformMin
+    PerformMin --> LoadModel
+    PerformMin --> ProcessModel
+    ProcessModel --> NeighborFn
+    ProcessModel --> NeighborFnLR
+    ProcessModel --> EnergyFn
+    EnergyFn --> ForceFn
+    
+    PerformMin --> CreateFIRE
+    CreateFIRE --> FIREInit
+    CreateFIRE --> FIREApply
+    CreateFIRE --> StepMinFn
+    
+    StepMinFn --> MinLoop
+    MinLoop --> ConvCheck
+    ConvCheck --> SaveTraj
+    ConvCheck --> MinLoop
+```
+
+Key optimization parameters:
+
+| Parameter | Setting Key | Default | Description |
+|-----------|-------------|---------|-------------|
+| Cycles | `min_cycles` | 10 | Maximum optimization cycles |
+| Steps per cycle | `min_steps` | 10 | FIRE steps per cycle |
+| Initial timestep | `min_start_dt` | 0.05 | Starting FIRE timestep factor |
+| Maximum timestep | `min_max_dt` | 0.1 | Maximum FIRE timestep factor |
+| Force convergence | `force_convergence` | null | Convergence threshold (eV/Å) |
+
+Sources: [so3lr/cli/so3lr_md.py:1932-2173](), [so3lr/cli/so3lr_md.py:1891-1929](), [so3lr/cli/md_settings.yaml:26-33]()
+
+### Optimization Workflow
+
+The optimization process follows this sequence:
+
+1. **Initialize System**: Load geometry, validate cell, setup potential
+2. **Create Functions**: Generate neighbor lists, energy/force functions
+3. **FIRE Setup**: Initialize FIRE state and step functions  
+4. **Optimization Loop**: Run cycles until convergence or max cycles
+5. **Output**: Save trajectory and final optimized geometry
+
+Sources: [so3lr/cli/so3lr_md.py:1972-2173]()
+
+## Molecular Dynamics Commands
+
+The molecular dynamics commands (`nve`, `nvt`, `npt`) all use the same underlying `perform_md()` function but with different ensemble-specific integrators and thermostats/barostats.
+
+### Ensemble-Specific Integration
+
+**MD Integration Function Creation**
+```mermaid
+graph TD
+    PerformMD["perform_md()"]
+    EnsembleCheck{"ensemble type"}
+    
+    CreateNVE["create_nve_fn()"]
+    CreateNHC["create_nhc_fn()"] 
+    CreateNPT["create_npt_nhc_fn()"]
+    
+    NVEInit["nve init_fn"]
+    NVTInit["nvt_nose_hoover init_fn"]
+    NPTInit["npt_nose_hoover init_fn"]
+    
+    NVEStep["create_nve_step_fn()"]
+    NVTStep["create_nvt_step_fn()"]
+    NPTStep["create_npt_step_fn()"]
+    
+    StepMDFn["step_md_fn"]
+    MDLoop["MD Simulation Loop"]
+    
+    PerformMD --> EnsembleCheck
+    EnsembleCheck -->|"nve"| CreateNVE
+    EnsembleCheck -->|"nvt"| CreateNHC
+    EnsembleCheck -->|"npt"| CreateNPT
+    
+    CreateNVE --> NVEInit
+    CreateNHC --> NVTInit  
+    CreateNPT --> NPTInit
+    
+    CreateNVE --> NVEStep
+    CreateNHC --> NVTStep
+    CreateNPT --> NPTStep
+    
+    NVEStep --> StepMDFn
+    NVTStep --> StepMDFn
+    NPTStep --> StepMDFn
+    
+    StepMDFn --> MDLoop
+```
+
+Sources: [so3lr/cli/so3lr_md.py:1631-1662](), [so3lr/cli/so3lr_md.py:998-1032](), [so3lr/cli/so3lr_md.py:1034-1072](), [so3lr/cli/so3lr_md.py:1075-1099]()
+
+### NVE (Microcanonical) Dynamics
+
+NVE simulations conserve total energy using basic Verlet integration:
+
+- **Energy**: Constant total energy (E)
+- **Volume**: Constant volume (V) 
+- **Particles**: Constant number (N)
+- **Integration**: `jax_md.simulate.nve()`
+- **Thermostat**: None (initial temperature from velocities)
+
+Key NVE parameters:
+
+| Parameter | Setting Key | Description |
+|-----------|-------------|-------------|
+| Timestep | `md_dt` | Integration timestep (fs) |
+| Initial temperature | `md_T` | For velocity initialization only |
+
+Sources: [so3lr/cli/so3lr_md.py:998-1032](), [so3lr/cli/so3lr_md.py:1101-1158]()
+
+### NVT (Canonical) Dynamics  
+
+NVT simulations maintain constant temperature using Nosé-Hoover chain thermostats:
+
+- **Temperature**: Constant temperature (T) 
+- **Volume**: Constant volume (V)
+- **Particles**: Constant number (N)
+- **Integration**: `jax_md.simulate.nvt_nose_hoover()`
+- **Thermostat**: Nosé-Hoover chain
+
+NVT-specific parameters:
+
+| Parameter | Setting Key | Default | Description |
+|-----------|-------------|---------|-------------|
+| Temperature | `md_T` | 300.0 | Target temperature (K) |
+| Chain length | `nhc_chain_length` | 3 | Thermostat chain length |
+| Chain steps | `nhc_steps` | 2 | Integration steps per MD step |
+| Thermostat timescale | `nhc_thermo` | 100.0 | Damping factor (τ = dt × factor) |
+
+Sources: [so3lr/cli/so3lr_md.py:1034-1072](), [so3lr/cli/so3lr_md.py:1160-1216](), [so3lr/cli/md_settings.yaml:40-44]()
+
+### NPT (Isothermal-Isobaric) Dynamics
+
+NPT simulations maintain constant temperature and pressure using coupled Nosé-Hoover thermostats and barostats:
+
+- **Pressure**: Constant pressure (P)
+- **Temperature**: Constant temperature (T)  
+- **Particles**: Constant number (N)
+- **Integration**: `jax_md.simulate.npt_nose_hoover()`
+- **Thermostat**: Nosé-Hoover chain for temperature
+- **Barostat**: Nosé-Hoover chain for pressure
+
+NPT-specific parameters:
+
+| Parameter | Setting Key | Default | Description |
+|-----------|-------------|---------|-------------|
+| Pressure | `md_P` | 1.0 | Target pressure (atm) |
+| Barostat timescale | `nhc_baro` | 1000.0 | Barostat damping factor |
+| SY steps | `nhc_sy_steps` | 3 | Suzuki-Yoshida integration steps |
+
+Sources: [so3lr/cli/so3lr_md.py:1075-1099](), [so3lr/cli/so3lr_md.py:1218-1288](), [so3lr/cli/md_settings.yaml:46-49]()
+
+## Simulation Workflow
+
+All simulation commands follow a common computational workflow:
+
+**Complete Simulation Pipeline**
+```mermaid
+flowchart TD
+    Start["Command Execution"]
+    LoadSettings["Load Settings"]
+    SetupLogger["setup_logger()"]
+    LoadGeom["Load Initial Geometry"]
+    
+    CheckRestart{"Restart?"}
+    LoadRestart["load_state()"]
+    
+    LoadModel["Load Model"]
+    ProcessModel["process_model()"]
+    HandleBox["handle_box()"]
+    
+    AllocateNbrs["Allocate Neighbor Lists"]
+    HandleUnits["handle_units()"]
+    SetupKSpace["setup_kspace_grid()"]
+    
+    InitSim["Initialize Simulation"]
+    SimLoop["Simulation Loop"]
+    
+    CheckOverflow["check_overflow()"]
+    ComputeQuant["compute_quantities()"]
+    WriteOutput["Write Output"]
+    SaveRestart["save_state()"]
+    
+    Start --> LoadSettings
+    LoadSettings --> SetupLogger
+    SetupLogger --> LoadGeom
+    LoadGeom --> CheckRestart
+    
+    CheckRestart -->|"Yes"| LoadRestart
+    CheckRestart -->|"No"| LoadModel
+    LoadRestart --> LoadModel
+    
+    LoadModel --> ProcessModel
+    ProcessModel --> HandleBox
+    HandleBox --> AllocateNbrs
+    AllocateNbrs --> HandleUnits
+    HandleUnits --> SetupKSpace
+    SetupKSpace --> InitSim
+    
+    InitSim --> SimLoop
+    SimLoop --> CheckOverflow
+    CheckOverflow --> ComputeQuant
+    ComputeQuant --> WriteOutput
+    WriteOutput --> SaveRestart
+    SaveRestart --> SimLoop
+```
+
+Sources: [so3lr/cli/so3lr_md.py:1402-1838](), [so3lr/cli/so3lr_md.py:2322-2372]()
+
+### Critical Simulation Components
+
+The simulation workflow depends on several key computational components:
+
+**Neighbor List Management**: 
+- Short-range: `neighbor_fn` with model cutoff
+- Long-range: `neighbor_fn_lr` with `lr_cutoff` 
+- Overflow detection: `check_overflow()` reallocates on buffer overflow
+
+**Energy and Force Functions**:
+- Energy calculation: `energy_fn` from `process_model()`
+- Force calculation: `jax_md.quantity.force(energy_fn)`
+- k-space electrostatics: `setup_kspace_grid()` for Ewald/PME
+
+**Output and Restart**:
+- Trajectory formats: HDF5 (`write_to_hdf5()`) or EXTXYZ (`write_to_extxyz()`)
+- State persistence: `save_state()` and `load_state()` for NPZ restart files
+- Observable tracking: partial charges, forces, energies
+
+Sources: [so3lr/cli/so3lr_md.py:831-872](), [so3lr/cli/so3lr_md.py:573-601](), [so3lr/cli/so3lr_md.py:1370-1400](), [so3lr/cli/so3lr_md.py:307-366](), [so3lr/cli/so3lr_md.py:2175-2234](), [so3lr/cli/so3lr_md.py:2237-2319]()
+
+---
+
+# Page: Model Evaluation
+
+# Model Evaluation
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [examples/evaluate_so3lr_on_dataset.ipynb](examples/evaluate_so3lr_on_dataset.ipynb)
+- [so3lr/cli/so3lr_eval.py](so3lr/cli/so3lr_eval.py)
+
+</details>
+
+
+
+This document covers the SO3LR model evaluation system, which provides functionality to assess model performance on molecular datasets through the `so3lr eval` command. The evaluation system calculates accuracy metrics (MAE, MSE, RMSE) for various targets including forces, energies, dipole moments, and Hirshfeld charge ratios.
+
+For information about running molecular dynamics simulations, see [Simulation Commands](#2.1). For practical evaluation examples, see [Model Evaluation Examples](#4.3).
+
+## Overview
+
+The SO3LR evaluation system is built around the `evaluate_so3lr_on()` function in [so3lr/cli/so3lr_eval.py:141-410](), which provides a comprehensive framework for assessing model performance on molecular datasets. The system supports batch processing with JAX JIT compilation for efficient evaluation of large datasets.
+
+### Evaluation Architecture
+
+```mermaid
+graph TD
+    subgraph "Input Processing"
+        DataFile["datafile<br/>(XYZ/EXTXYZ)"]
+        ModelPath["model_path<br/>(Optional Custom Model)"]
+        Config["CLI Parameters<br/>(batch_size, lr_cutoff, targets)"]
+    end
+    
+    subgraph "Data Loading"
+        AseLoader["AseDataLoaderSparse<br/>ASE-based data loading"]
+        GraphConv["Graph Conversion<br/>Molecular → jraph.GraphsTuple"]
+        BatchGen["jraph.dynamically_batch<br/>Fixed-size batching"]
+    end
+    
+    subgraph "Model Evaluation"
+        ModelLoad["make_so3lr<br/>Model initialization"]
+        JITComp["jax.jit<br/>JIT compilation"]
+        BatchEval["Batch Processing<br/>evaluate_so3lr_on()"]
+    end
+    
+    subgraph "Output Processing"
+        MetricsCalc["calculate_metrics<br/>MAE/MSE/RMSE"]
+        PredSave["process_predictions<br/>Optional prediction saving"]
+        ResultAgg["Result Aggregation<br/>Final metrics"]
+    end
+    
+    DataFile --> AseLoader
+    ModelPath --> ModelLoad
+    Config --> BatchGen
+    
+    AseLoader --> GraphConv
+    GraphConv --> BatchGen
+    
+    ModelLoad --> JITComp
+    JITComp --> BatchEval
+    BatchGen --> BatchEval
+    
+    BatchEval --> MetricsCalc
+    BatchEval --> PredSave
+    MetricsCalc --> ResultAgg
+    PredSave --> ResultAgg
+```
+
+**Sources:** [so3lr/cli/so3lr_eval.py:141-410](), [so3lr/cli/so3lr_eval.py:20-21]()
+
+## Command Interface
+
+The evaluation system is accessed through the `so3lr eval` command, which accepts the following key parameters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `datafile` | str | Required | Path to dataset file (XYZ/EXTXYZ format) |
+| `batch_size` | int | 1 | Number of molecules per batch |
+| `lr_cutoff` | float | 12.0 | Long-range cutoff in Ångströms |
+| `dispersion_damping` | float | 2.0 | Damping for long-range interactions |
+| `jit_compile` | bool | True | Enable JAX JIT compilation |
+| `save_to` | str | None | Output path for predictions (EXTXYZ format) |
+| `model_path` | str | None | Path to custom model (uses default if None) |
+| `precision` | str | 'float32' | Numerical precision |
+| `targets` | str | 'forces,dipole_vec,hirshfeld_ratios' | Comma-separated evaluation targets |
+
+**Sources:** [so3lr/cli/so3lr_eval.py:141-190]()
+
+## Evaluation Workflow
+
+### Data Processing Pipeline
+
+```mermaid
+flowchart TD
+    subgraph "Input Validation"
+        FileCheck["File Existence Check<br/>datafile.exists()"]
+        OutputValid["Output Path Validation<br/>save_to validation"]
+        ParamParse["Parameter Parsing<br/>targets.split(',')"]
+    end
+    
+    subgraph "Data Loading Phase"
+        LoadData["AseDataLoaderSparse.load()<br/>cutoff, cutoff_lr parameters"]
+        CalcStats["Statistics Calculation<br/>max_num_of_nodes, max_num_of_edges"]
+        BatchSetup["Batch Configuration<br/>n_node, n_edge, n_graph, n_pairs"]
+    end
+    
+    subgraph "Model Initialization"
+        DefaultModel["make_so3lr()<br/>Default SO3LR model"]
+        CustomModel["make_so3lr(workdir)<br/>Custom model loading"]
+        JITSetup["jax.jit() compilation<br/>Dummy batch for warmup"]
+    end
+    
+    subgraph "Batch Processing Loop"
+        BatchIter["jraph.dynamically_batch<br/>Iterator over batches"]
+        GraphToBatch["jraph_utils.graph_to_batch_fn<br/>Convert to input dict"]
+        ModelRun["so3lr_calc(inputs)<br/>Model evaluation"]
+        MetricsCalc["calculate_metrics()<br/>Per-batch metrics"]
+        PredProcess["process_predictions()<br/>Optional saving"]
+    end
+    
+    subgraph "Result Aggregation"
+        MetricsAgg["Metrics Aggregation<br/>MAE/MSE/RMSE calculation"]
+        TimingCalc["Timing Statistics<br/>Per-batch, per-structure times"]
+        FinalOutput["Final Results<br/>Dictionary with all metrics"]
+    end
+    
+    FileCheck --> LoadData
+    OutputValid --> BatchSetup
+    ParamParse --> BatchSetup
+    
+    LoadData --> CalcStats
+    CalcStats --> BatchSetup
+    
+    DefaultModel --> JITSetup
+    CustomModel --> JITSetup
+    
+    BatchSetup --> BatchIter
+    JITSetup --> ModelRun
+    
+    BatchIter --> GraphToBatch
+    GraphToBatch --> ModelRun
+    ModelRun --> MetricsCalc
+    ModelRun --> PredProcess
+    
+    MetricsCalc --> MetricsAgg
+    PredProcess --> TimingCalc
+    MetricsAgg --> FinalOutput
+    TimingCalc --> FinalOutput
+```
+
+**Sources:** [so3lr/cli/so3lr_eval.py:201-261](), [so3lr/cli/so3lr_eval.py:271-291](), [so3lr/cli/so3lr_eval.py:322-364]()
+
+### Metrics Calculation System
+
+The evaluation system calculates metrics using the `calculate_metrics()` function, which supports multiple targets with appropriate masking:
+
+```mermaid
+graph LR
+    subgraph "Target Types"
+        EnergyTarget["energy<br/>(per-structure)"]
+        ForcesTarget["forces<br/>(per-atom)"]
+        DipoleTarget["dipole_vec<br/>(per-structure)"]
+        HirshfeldTarget["hirshfeld_ratios<br/>(per-atom)"]
+    end
+    
+    subgraph "Masking System"
+        GraphMask["graph_mask<br/>assign_mask()"]
+        NodeMask["node_mask<br/>assign_mask()"]
+    end
+    
+    subgraph "Metric Calculation"
+        AbsError["Absolute Error<br/>|y_pred - y_true|"]
+        SqError["Squared Error<br/>(y_pred - y_true)²"]
+        Counting["Valid Sample Count<br/>mask.sum()"]
+    end
+    
+    subgraph "Aggregation"
+        MAE["MAE = abs_sum / count"]
+        MSE["MSE = sq_sum / count"]
+        RMSE["RMSE = sqrt(MSE)"]
+    end
+    
+    EnergyTarget --> GraphMask
+    DipoleTarget --> GraphMask
+    ForcesTarget --> NodeMask
+    HirshfeldTarget --> NodeMask
+    
+    GraphMask --> AbsError
+    NodeMask --> AbsError
+    AbsError --> Counting
+    AbsError --> SqError
+    
+    Counting --> MAE
+    Counting --> MSE
+    MSE --> RMSE
+```
+
+**Sources:** [so3lr/cli/so3lr_eval.py:68-108](), [so3lr/cli/so3lr_eval.py:417-449]()
+
+## Output Formats and Saving
+
+### Prediction Saving Workflow
+
+The evaluation system can optionally save predictions to EXTXYZ format through the `process_predictions()` and `save_to_file()` functions:
+
+```mermaid
+sequenceDiagram
+    participant Eval as "evaluate_so3lr_on()"
+    participant Process as "process_predictions()"
+    participant Unbatch as "unbatch_np()"
+    participant Convert as "jraph_to_ase_atoms()"
+    participant Save as "save_to_file()"
+    participant ASE as "ase.io.write()"
+    
+    Eval->>Process: graph_batch, predictions
+    Process->>Process: Add predictions to graph nodes/globals
+    Process->>Unbatch: Unbatch graph structures
+    Process->>Process: Filter out padding with graph_mask
+    Process-->>Eval: List of processed graphs
+    
+    Eval->>Save: predicted_graphs, save_to
+    loop For each predicted graph
+        Save->>Convert: Convert jraph to ASE atoms
+        Save->>ASE: write(save_to, atoms, append=True)
+    end
+    Save-->>Eval: Completed
+```
+
+**Sources:** [so3lr/cli/so3lr_eval.py:27-66](), [so3lr/cli/so3lr_eval.py:111-138]()
+
+### Output Data Structure
+
+The evaluation function returns a comprehensive metrics dictionary:
+
+| Metric Category | Keys | Description |
+|----------------|------|-------------|
+| **Accuracy Metrics** | `{target}_mae`, `{target}_mse`, `{target}_rmse` | Mean Absolute/Squared Error and Root MSE for each target |
+| **Timing Metrics** | `time_per_batch`, `time_per_structure`, `time_evaluation`, `time_compile` | Performance timing information |
+| **Metadata** | `datafile` | URI of the evaluated dataset |
+
+**Sources:** [so3lr/cli/so3lr_eval.py:384-394](), [so3lr/cli/so3lr_eval.py:396-410]()
+
+## Performance Considerations
+
+### JAX JIT Compilation
+
+The evaluation system leverages JAX JIT compilation for performance optimization. The compilation process includes:
+
+1. **Dummy Batch Compilation**: Uses a representative batch for initial compilation [so3lr/cli/so3lr_eval.py:284-305]()
+2. **Static Shape Requirements**: Ensures consistent tensor shapes through batching [so3lr/cli/so3lr_eval.py:271-278]()
+3. **Compilation Timing**: Measures and reports compilation overhead [so3lr/cli/so3lr_eval.py:294-303]()
+
+### Batch Processing Strategy
+
+The system uses `jraph.dynamically_batch()` to ensure efficient processing:
+
+- **Fixed Shapes**: All batches have consistent tensor dimensions for JIT compatibility
+- **Padding Handling**: Automatically filters out padded structures using masks
+- **Memory Efficiency**: Balances batch size with memory constraints
+
+**Sources:** [so3lr/cli/so3lr_eval.py:263-278](), [examples/evaluate_so3lr_on_dataset.ipynb:275-295]()
+
+### Progress Tracking
+
+The evaluation includes comprehensive progress tracking using `tqdm`:
+
+- **Structure-level Progress**: Tracks individual structures rather than batches [so3lr/cli/so3lr_eval.py:324-332]()
+- **Timing Information**: Provides detailed timing breakdowns for optimization [so3lr/cli/so3lr_eval.py:381-388]()
+- **Memory Monitoring**: Logs batch size parameters for memory planning [so3lr/cli/so3lr_eval.py:269]()
+
+**Sources:** [so3lr/cli/so3lr_eval.py:319-363](), [so3lr/cli/so3lr_eval.py:133-137]()
+
+---
+
+# Page: Python API
+
+# Python API
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [examples/data/sapt10k.zip](examples/data/sapt10k.zip)
+- [tests/test_ase.py](tests/test_ase.py)
+- [tests/test_readme.py](tests/test_readme.py)
+
+</details>
+
+
+
+This document covers the three main Python programming interfaces for integrating SO3LR into your applications: ASE integration via `So3lrCalculator`, JAX-MD integration via `to_jax_md`, and direct API usage via `So3lrPotential`. For command-line usage, see [Command Line Interface](#2). For implementation details of core components, see [Core Components](#5).
+
+## API Overview
+
+SO3LR provides three distinct programming interfaces that cater to different use cases and integration requirements:
+
+```mermaid
+graph TB
+    subgraph "Python API Interfaces"
+        ASECalc["So3lrCalculator<br/>ASE Integration"]
+        JAXMDFunc["to_jax_md()<br/>JAX-MD Integration"] 
+        DirectAPI["So3lrPotential<br/>Direct API"]
+    end
+    
+    subgraph "Use Cases"
+        ASEWorkflow["Standard ASE Workflows<br/>atoms.get_forces()"]
+        JAXMDSim["Large-scale MD<br/>GPU-optimized simulations"]
+        CustomApp["Custom Applications<br/>Direct potential evaluation"]
+    end
+    
+    subgraph "Core Components"
+        Graph["Graph<br/>Molecular representation"]
+        Potential["So3lrPotential<br/>Energy function"]
+        MLFFSparse["mlffCalculatorSparse<br/>MLFF backend"]
+    end
+    
+    subgraph "External Libraries"
+        ASE["ASE Library"]
+        JAXMD["JAX-MD Library"] 
+        JAX["JAX/JAXLib"]
+    end
+    
+    ASECalc --> ASEWorkflow
+    JAXMDFunc --> JAXMDSim
+    DirectAPI --> CustomApp
+    
+    ASECalc --> MLFFSparse
+    JAXMDFunc --> Potential
+    DirectAPI --> Potential
+    
+    Potential --> Graph
+    MLFFSparse --> Graph
+    
+    ASECalc --> ASE
+    JAXMDFunc --> JAXMD
+    DirectAPI --> JAX
+    
+    JAXMD --> JAX
+```
+
+**Python API Interface Architecture**
+Sources: [README.md:155-275](), [tests/test_ase.py:97-173](), [tests/test_readme.py:15-103]()
+
+## API Comparison
+
+| Interface | Primary Use Case | Performance | Complexity | External Dependencies |
+|-----------|------------------|-------------|------------|----------------------|
+| `So3lrCalculator` | Standard molecular simulations | Moderate | Low | ASE |
+| `to_jax_md()` | Large-scale GPU simulations | High | Moderate | JAX-MD, JAX |
+| `So3lrPotential` | Custom applications | High | High | JAX |
+
+## Key Classes and Functions
+
+The main entry points for the SO3LR Python API are:
+
+```mermaid
+graph LR
+    subgraph "Import Sources"
+        SO3LRPackage["so3lr package"]
+    end
+    
+    subgraph "Core Classes"
+        So3lrCalculator["So3lrCalculator<br/>ASE calculator class"]
+        So3lrPotential["So3lrPotential<br/>Pure function potential"]
+        Graph["Graph<br/>Molecular data structure"]
+    end
+    
+    subgraph "Integration Functions"
+        ToJaxMD["to_jax_md()<br/>JAX-MD setup function"]
+        MakeSo3lr["make_so3lr()<br/>Direct API setup"]
+    end
+    
+    SO3LRPackage --> So3lrCalculator
+    SO3LRPackage --> So3lrPotential
+    SO3LRPackage --> Graph
+    SO3LRPackage --> ToJaxMD
+    SO3LRPackage --> MakeSo3lr
+```
+
+**SO3LR Python API Components**
+Sources: [README.md:157-275](), [tests/test_ase.py:98](), [tests/test_readme.py:10-12]()
+
+## Constructor Parameters
+
+### So3lrCalculator Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `calculate_stress` | `bool` | `False` | Enable stress tensor calculation |
+| `lr_cutoff` | `float` | `12.0` | Long-range cutoff distance |
+| `dtype` | `numpy.dtype` | `np.float32` | Numerical precision |
+
+### So3lrPotential Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `lr_cutoff` | `float` | `12.0` | Long-range cutoff distance |
+| `dtype` | `numpy.dtype` | `np.float32` | Numerical precision |
+
+### to_jax_md Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `potential` | `So3lrPotential` | SO3LR potential instance |
+| `displacement_or_metric` | `function` | JAX-MD displacement function |
+| `box_size` | `array` or `None` | Simulation box dimensions |
+| `species` | `array` | Atomic numbers |
+| `capacity_multiplier` | `float` | Neighbor list buffer size |
+
+Sources: [README.md:166-221](), [tests/test_ase.py:106-108](), [tests/test_readme.py:25-73]()
+
+## Common Usage Patterns
+
+### Error Handling
+
+All SO3LR Python APIs will raise appropriate exceptions for:
+- Invalid molecular structures (missing atomic numbers, positions)
+- Incompatible data types or shapes  
+- Missing charge information for systems requiring it
+- Cutoff distances that are too small or large
+
+### Performance Considerations
+
+- **JIT Compilation**: JAX-based interfaces (`to_jax_md`, `So3lrPotential`) benefit from JIT compilation
+- **Data Types**: Use `np.float32` for better GPU performance, `np.float64` for higher precision
+- **Cutoff Selection**: Use `lr_cutoff=1000` for gas-phase systems, `lr_cutoff=12.0` for condensed phase
+
+### Memory Management
+
+- Neighbor lists in JAX-MD are allocated once and reused
+- Graph objects are lightweight and can be created frequently
+- Large systems benefit from batching when possible
+
+Sources: [README.md:168-221](), [tests/test_ase.py:145-173](), [tests/test_readme.py:39-103]()
+
+---
+
+# Page: ASE Integration
+
+# ASE Integration
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [so3lr/ase_utils.py](so3lr/ase_utils.py)
+- [tests/test_ase.py](tests/test_ase.py)
+- [tests/test_readme.py](tests/test_readme.py)
+
+</details>
+
+
+
+This page documents how to use SO3LR with the Atomic Simulation Environment (ASE) framework through the `So3lrCalculator` class. ASE integration provides a standardized interface for energy and force calculations that works seamlessly with existing ASE workflows and tools.
+
+For JAX-MD integration for large-scale simulations, see [JAX-MD Integration](#3.2). For direct API usage without framework dependencies, see [Direct API Usage](#3.3).
+
+## Overview
+
+The SO3LR ASE integration enables users to perform molecular simulations using the standard ASE calculator interface. The `So3lrCalculator` class implements ASE's calculator protocol, allowing SO3LR to be used as a drop-in replacement for other ASE calculators in existing workflows.
+
+## ASE Calculator Architecture
+
+```mermaid
+graph TB
+    subgraph "ASE Framework"
+        ASEAtoms["ase.Atoms<br/>Molecular Structure"]
+        ASECalcInterface["ASE Calculator Interface<br/>get_potential_energy()<br/>get_forces()<br/>get_stress()"]
+    end
+    
+    subgraph "SO3LR ASE Integration"
+        So3lrCalculator["So3lrCalculator<br/>Main ASE Interface"]
+        make_ase_calculator["make_ase_calculator()<br/>Factory Function"]
+        mlffCalculatorSparse["mlffCalculatorSparse<br/>Backend Calculator"]
+    end
+    
+    subgraph "SO3LR Core"
+        SO3LRParams["SO3LR Parameters<br/>so3lr/params/"]
+        PotentialCore["SO3LR Potential<br/>Graph + Neural Network"]
+    end
+    
+    ASEAtoms --> ASECalcInterface
+    ASECalcInterface --> So3lrCalculator
+    make_ase_calculator --> mlffCalculatorSparse
+    So3lrCalculator --> mlffCalculatorSparse
+    mlffCalculatorSparse --> SO3LRParams
+    mlffCalculatorSparse --> PotentialCore
+    
+    ASEAtoms --> So3lrCalculator
+```
+
+Sources: [tests/test_ase.py:96-143](), [so3lr/ase_utils.py:7-26](), [tests/test_readme.py:16-37]()
+
+## Using So3lrCalculator
+
+The primary interface for ASE integration is the `So3lrCalculator` class, which implements the standard ASE calculator protocol.
+
+### Basic Usage Pattern
+
+```python
+from so3lr import So3lrCalculator
+from ase.io import read
+
+# Load molecular structure
+atoms = read('molecule.xyz')
+atoms.cell = None  # Remove periodic boundary conditions
+atoms.pbc = False
+
+# Create SO3LR calculator
+calc = So3lrCalculator(dtype=np.float64)
+atoms.calc = calc
+
+# Calculate properties
+energy = atoms.get_potential_energy()
+forces = atoms.get_forces()
+```
+
+### Calculator Parameters
+
+The `So3lrCalculator` supports the following key parameters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `dtype` | `numpy.dtype` | `np.float32` | Numerical precision for calculations |
+| `calculate_stress` | `bool` | `False` | Enable stress tensor calculations |
+
+## Calculation Workflow
+
+```mermaid
+flowchart TD
+    ASEAtoms["ase.Atoms Object<br/>Positions + Species"]
+    So3lrCalc["So3lrCalculator<br/>ASE Interface"]
+    GraphConv["Graph Conversion<br/>Molecular → Graph Structure"]
+    SO3LRPot["SO3LR Potential<br/>Energy Calculation"]
+    Results["ASE Results<br/>Energy, Forces, Stress"]
+    
+    ASEAtoms --> So3lrCalc
+    So3lrCalc --> GraphConv
+    GraphConv --> SO3LRPot
+    SO3LRPot --> Results
+    Results --> ASEAtoms
+    
+    ASEAtoms -.-> EnergyCall["atoms.get_potential_energy()"]
+    ASEAtoms -.-> ForceCall["atoms.get_forces()"]
+    ASEAtoms -.-> StressCall["atoms.get_stress()"]
+```
+
+Sources: [tests/test_ase.py:106-130](), [tests/test_readme.py:25-36]()
+
+## Stress Tensor Calculations
+
+Stress tensor calculations are controlled by the `calculate_stress` parameter and must be enabled at calculator creation time:
+
+```python
+# Enable stress calculations
+calc = So3lrCalculator(calculate_stress=True)
+atoms.calc = calc
+
+# Calculate stress tensor (Voigt notation, shape=(6,))
+stress = atoms.get_stress()
+```
+
+If `calculate_stress=False`, calling `atoms.get_stress()` will raise a `NotImplementedError`.
+
+Sources: [tests/test_ase.py:145-172]()
+
+## Backend Calculator Details
+
+Internally, `So3lrCalculator` uses the `mlffCalculatorSparse` backend through the `make_ase_calculator` factory function. This backend handles:
+
+- Loading SO3LR model parameters from `so3lr/params/`
+- Managing long-range cutoff distances (`lr_cutoff=12.0`)
+- Dispersion energy calculations (`dispersion_energy_cutoff_lr_damping=2.0`)
+- Numerical precision control
+
+### Internal Architecture
+
+```mermaid
+graph LR
+    UserAPI["So3lrCalculator<br/>User Interface"]
+    Factory["make_ase_calculator()<br/>ase_utils.py"]
+    Backend["mlffCalculatorSparse<br/>MLFF Backend"]
+    Params["Model Parameters<br/>so3lr/params/"]
+    
+    UserAPI --> Backend
+    Factory --> Backend
+    Backend --> Params
+    
+    Backend --> GraphProc["Graph Processing"]
+    Backend --> EnergyCalc["Energy Calculation"]
+    Backend --> ForceCalc["Force Calculation"]
+```
+
+Sources: [so3lr/ase_utils.py:7-26](), [tests/test_ase.py:17-25]()
+
+## Molecular System Compatibility
+
+The ASE integration supports both molecular and periodic systems:
+
+### Molecular Systems (No PBC)
+- Set `atoms.cell = None` and `atoms.pbc = False`
+- Suitable for isolated molecules and clusters
+- No periodic boundary condition handling required
+
+### Periodic Systems
+- Maintain `atoms.cell` and `atoms.pbc` settings
+- Supports periodic boundary conditions for bulk materials
+- Automatic handling of long-range interactions across cell boundaries
+
+Sources: [tests/test_ase.py:27-29](), [tests/test_ase.py:112-114]()
+
+## Performance Considerations
+
+### Numerical Precision
+- `dtype=np.float32`: Faster computation, reduced memory usage
+- `dtype=np.float64`: Higher precision for sensitive calculations
+
+### System Size Scaling
+- Short-range interactions: Linear scaling with system size
+- Long-range interactions: Managed through efficient cutoff schemes
+- Memory usage scales with neighbor list size
+
+### JIT Compilation
+The underlying JAX implementation benefits from just-in-time compilation, with performance improvements after initial compilation overhead.
+
+Sources: [tests/test_ase.py:107-108](), [tests/test_ase.py:155-158]()
+
+## Integration with ASE Workflows
+
+The `So3lrCalculator` works seamlessly with standard ASE tools:
+
+- **Geometry Optimization**: Compatible with ASE optimizers (`BFGS`, `FIRE`, etc.)
+- **Molecular Dynamics**: Works with ASE MD classes (`VelocityVerlet`, `Langevin`, etc.)
+- **Property Analysis**: Supports vibrational analysis, equation of state calculations
+- **I/O Operations**: Standard ASE trajectory writing and structure manipulation
+
+The calculator follows ASE conventions for units (eV for energy, eV/Å for forces, eV/Å³ for stress) and coordinate systems.
+
+Sources: [tests/test_ase.py:31-32](), [tests/test_ase.py:116-117]()
+
+---
+
+# Page: JAX-MD Integration
+
+# JAX-MD Integration
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [so3lr/jaxmd_utils.py](so3lr/jaxmd_utils.py)
+- [tests/test_jaxmd.py](tests/test_jaxmd.py)
+
+</details>
+
+
+
+This page documents the integration between SO3LR potentials and the JAX-MD molecular dynamics library. The integration enables the use of SO3LR's hybrid SO3krates neural network and universal pairwise force fields within JAX-MD's high-performance simulation framework.
+
+For information about direct API usage of SO3LR potentials, see [Direct API Usage](#3.3). For ASE integration, see [ASE Integration](#3.1).
+
+## Purpose and Scope
+
+The JAX-MD integration provides a bridge that converts SO3LR's `MLFFPotentialSparse` or `So3lrPotential` objects into JAX-MD compatible energy functions. This enables users to leverage JAX-MD's optimized simulation infrastructure while utilizing SO3LR's machine learning force fields for both short-range and long-range interactions.
+
+## Integration Architecture
+
+The integration follows a three-layer architecture that transforms JAX-MD data structures into SO3LR's Graph representation:
+
+```mermaid
+graph TB
+    subgraph "JAX-MD Layer"
+        jaxmd_pos["R (positions)"]
+        jaxmd_nbr["neighbor lists"]
+        jaxmd_nbr_lr["neighbor_lr lists"]
+        jaxmd_box["box parameters"]
+    end
+    
+    subgraph "Integration Layer"
+        to_jax_md["to_jax_md()"]
+        featurizer["neighbor_list_featurizer()"]
+        neighbor_fn["neighbor_fn"]
+        neighbor_fn_lr["neighbor_fn_lr"]
+        energy_fn["energy_fn"]
+    end
+    
+    subgraph "SO3LR Layer"
+        graph_obj["Graph object"]
+        potential["MLFFPotentialSparse"]
+        energy_forces["energy/forces"]
+    end
+    
+    jaxmd_pos --> featurizer
+    jaxmd_nbr --> featurizer
+    jaxmd_nbr_lr --> featurizer
+    jaxmd_box --> featurizer
+    
+    to_jax_md --> neighbor_fn
+    to_jax_md --> neighbor_fn_lr
+    to_jax_md --> energy_fn
+    
+    featurizer --> graph_obj
+    energy_fn --> featurizer
+    graph_obj --> potential
+    potential --> energy_forces
+    
+    style to_jax_md fill:#f9f,stroke:#333,stroke-width:2px
+    style featurizer fill:#bbf,stroke:#333,stroke-width:2px
+    style graph_obj fill:#bfb,stroke:#333,stroke-width:2px
+```
+
+Sources: [so3lr/jaxmd_utils.py:80-143](), [so3lr/jaxmd_utils.py:11-77]()
+
+## Core Integration Functions
+
+### to_jax_md Function
+
+The primary integration function `to_jax_md()` converts SO3LR potentials into JAX-MD compatible components:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `potential` | `MLFFPotentialSparse` | The SO3LR potential to integrate |
+| `displacement_or_metric` | `DisplacementOrMetricFn` | JAX-MD displacement function |
+| `box_size` | `Box` | Simulation box parameters |
+| `species` | `jnp.ndarray` | Atomic species array |
+| `dr_threshold` | `float` | Neighbor list update threshold |
+| `capacity_multiplier` | `float` | Memory allocation multiplier |
+| `fractional_coordinates` | `bool` | Use fractional coordinates |
+
+The function returns three components:
+- `neighbor_fn`: Short-range neighbor list function
+- `neighbor_fn_lr`: Long-range neighbor list function  
+- `energy_fn`: JAX-MD compatible energy function
+
+Sources: [so3lr/jaxmd_utils.py:80-94](), [so3lr/jaxmd_utils.py:129-143]()
+
+### Neighbor List Processing
+
+The integration handles both short-range and long-range neighbor lists through separate neighbor functions:
+
+```mermaid
+graph LR
+    subgraph "Short-Range Processing"
+        sr_cutoff["potential.cutoff"]
+        sr_neighbor["neighbor_fn"]
+        sr_format["NeighborListFormat(1)"]
+    end
+    
+    subgraph "Long-Range Processing"
+        lr_cutoff["potential.long_range_cutoff"]
+        lr_neighbor["neighbor_fn_lr"]
+        lr_format["NeighborListFormat(2)"]
+    end
+    
+    subgraph "Graph Construction"
+        featurizer["neighbor_list_featurizer()"]
+        graph_creation["Graph object creation"]
+    end
+    
+    sr_cutoff --> sr_neighbor
+    sr_neighbor --> sr_format
+    lr_cutoff --> lr_neighbor
+    lr_neighbor --> lr_format
+    
+    sr_format --> featurizer
+    lr_format --> featurizer
+    featurizer --> graph_creation
+```
+
+Sources: [so3lr/jaxmd_utils.py:95-107](), [so3lr/jaxmd_utils.py:109-121]()
+
+## Graph Object Construction
+
+The `neighbor_list_featurizer()` function transforms JAX-MD neighbor lists into SO3LR's Graph representation:
+
+```mermaid
+graph TB
+    subgraph "Input Processing"
+        idx_i["idx_i (centers)"]
+        idx_j["idx_j (others)"]
+        idx_i_lr["idx_i_lr (LR centers)"]
+        idx_j_lr["idx_j_lr (LR others)"]
+        positions_R["R (positions)"]
+    end
+    
+    subgraph "Displacement Calculation"
+        Ra["Ra = R[idx_i]"]
+        Rb["Rb = R[idx_j]"]
+        Ra_lr["Ra_lr = R[idx_i_lr]"]
+        Rb_lr["Rb_lr = R[idx_j_lr]"]
+        displacement_fn["displacement_fn"]
+    end
+    
+    subgraph "Graph Assembly"
+        dR["dR (short-range edges)"]
+        dR_lr["dR_lr (long-range edges)"]
+        graph_obj["Graph object"]
+    end
+    
+    idx_i --> Ra
+    idx_j --> Rb
+    idx_i_lr --> Ra_lr
+    idx_j_lr --> Rb_lr
+    positions_R --> Ra
+    positions_R --> Rb
+    positions_R --> Ra_lr
+    positions_R --> Rb_lr
+    
+    Ra --> displacement_fn
+    Rb --> displacement_fn
+    Ra_lr --> displacement_fn
+    Rb_lr --> displacement_fn
+    
+    displacement_fn --> dR
+    displacement_fn --> dR_lr
+    dR --> graph_obj
+    dR_lr --> graph_obj
+```
+
+Sources: [so3lr/jaxmd_utils.py:11-77]()
+
+## Configuration Parameters
+
+### Buffer and Capacity Settings
+
+The integration provides several parameters to control memory allocation and performance:
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `capacity_multiplier` | 1.25 | Overall memory allocation factor |
+| `buffer_size_multiplier_sr` | 1.25 | Short-range buffer sizing |
+| `buffer_size_multiplier_lr` | 1.25 | Long-range buffer sizing |
+| `minimum_cell_size_multiplier_sr` | 1.0 | Minimum cell size for short-range |
+| `minimum_cell_size_multiplier_lr` | 1.0 | Minimum cell size for long-range |
+
+### Coordinate Systems
+
+The integration supports both fractional and Cartesian coordinate systems through the `fractional_coordinates` parameter:
+
+- `fractional_coordinates=True`: Positions are treated as fractions of the box dimensions
+- `fractional_coordinates=False`: Positions are in absolute units
+
+Sources: [so3lr/jaxmd_utils.py:85-93](), [tests/test_jaxmd.py:64-66](), [tests/test_jaxmd.py:215-218]()
+
+## Usage Examples
+
+### Basic Setup for Periodic Systems
+
+```python
+# Set up displacement function and box
+displacement, shift = space.periodic_general(box, fractional_coordinates=True)
+
+# Create JAX-MD integration
+neighbor_fn, neighbor_fn_lr, energy_fn = jaxmd_utils.to_jax_md(
+    potential=mlff_potential,
+    displacement_or_metric=displacement, 
+    box_size=box,
+    species=species
+)
+
+# Allocate neighbor lists and compute energy
+nbrs = neighbor_fn.allocate(R0, box=box)
+nbrs_lr = neighbor_fn_lr.allocate(R0, box=box)
+energy = energy_fn(R0, neighbor=nbrs.idx, neighbor_lr=nbrs_lr.idx, box=box)
+```
+
+### Free Boundary Conditions
+
+```python
+# Set up free space
+displacement, shift = space.free()
+
+# Integration works identically for free systems
+neighbor_fn, neighbor_fn_lr, energy_fn = jaxmd_utils.to_jax_md(
+    potential=mlff_potential,
+    displacement_or_metric=displacement,
+    box_size=None,  # No box for free systems
+    species=species
+)
+```
+
+Sources: [tests/test_jaxmd.py:63-78](), [tests/test_jaxmd.py:138-150]()
+
+## Energy Function Interface
+
+The generated `energy_fn` provides a JAX-MD compatible interface:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `R` | `jnp.ndarray` | Atomic positions |
+| `neighbor` | neighbor indices | Short-range neighbor list |
+| `neighbor_lr` | neighbor indices | Long-range neighbor list |
+| `has_aux` | `bool` | Return auxiliary data |
+| `**energy_fn_kwargs` | dict | Additional parameters (box, k_grid, etc.) |
+
+The function returns either a scalar energy (default) or energy with auxiliary data when `has_aux=True`.
+
+Sources: [so3lr/jaxmd_utils.py:129-142]()
+
+## Performance Considerations
+
+### JIT Compilation
+
+JAX-MD integration is designed to work with JIT compilation for optimal performance:
+
+```python
+energy_fn = jax.jit(energy_fn)
+force_fn = jax.jit(quantity.force(energy_fn))
+```
+
+### Cell List Management
+
+The integration supports disabling cell lists for small systems through the `disable_cell_list` parameter, which can improve performance for molecular systems where cell lists provide no benefit.
+
+Sources: [tests/test_jaxmd.py:80-82](), [tests/test_jaxmd.py:231-232](), [so3lr/jaxmd_utils.py:91]()
+
+---
+
+# Page: Direct API Usage
+
+# Direct API Usage
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [examples/data/sapt10k.zip](examples/data/sapt10k.zip)
+- [so3lr/base_calculator.py](so3lr/base_calculator.py)
+
+</details>
+
+
+
+This page documents how to use SO3LR potential functions directly for custom applications and workflows. This approach provides the lowest-level interface to SO3LR, allowing maximum flexibility for developers building custom molecular simulation tools.
+
+For standard molecular simulation workflows, see [ASE Integration](#3.1) or [JAX-MD Integration](#3.2). For details on the underlying data structures, see [Graph Data Structure](#5.1) and [Potential Functions](#5.2).
+
+## Core Function: make_so3lr
+
+The primary entry point for direct API usage is the `make_so3lr` function, which creates a JAX-compatible potential energy function that can be integrated into custom simulation frameworks.
+
+### Function Signature and Parameters
+
+The `make_so3lr` function accepts several configuration parameters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `lr_cutoff` | float | 12.0 | Long-range interaction cutoff distance in Ångström |
+| `dispersion_energy_cutoff_lr_damping` | float | 2.0 | Damping parameter for dispersion energy cutoff |
+| `calculate_forces` | bool | True | Whether to enable automatic force calculation via autograd |
+| `workdir` | str/Path | None | Custom model parameter directory (uses default if None) |
+
+### Basic Usage Pattern
+
+```python
+from so3lr.base_calculator import make_so3lr
+
+# Create the potential function
+so3lr_fn = make_so3lr(
+    lr_cutoff=12.0,
+    calculate_forces=True
+)
+
+# Use with input dictionary
+inputs = {
+    'positions': positions_array,
+    'atomic_numbers': atomic_numbers_array,
+    # ... other required inputs
+}
+
+output = so3lr_fn(inputs)
+```
+
+Sources: [so3lr/base_calculator.py:8-124](), [README.md:256-275]()
+
+## API Function Architecture
+
+```mermaid
+graph TD
+    subgraph "make_so3lr Function"
+        Entry["make_so3lr()"]
+        LoadModel["load_model_from_workdir()"]
+        CreateForward["forward() function"]
+        CreateWrapper["so3lr_fn() wrapper"]
+    end
+    
+    subgraph "Internal Components"
+        MLFFModel["MLFF Model<br/>(so3krates)"]
+        Params["Model Parameters"]
+        AutoDiff["JAX Autograd<br/>jax.value_and_grad()"]
+    end
+    
+    subgraph "User Application"
+        InputDict["Input Dictionary<br/>{positions, atomic_numbers, ...}"]
+        OutputDict["Output Dictionary<br/>{energy, forces, ...}"]
+        CustomCode["Custom Simulation Code"]
+    end
+    
+    Entry --> LoadModel
+    LoadModel --> MLFFModel
+    LoadModel --> Params
+    Entry --> CreateForward
+    CreateForward --> CreateWrapper
+    
+    MLFFModel --> CreateForward
+    Params --> CreateForward
+    AutoDiff --> CreateWrapper
+    
+    CustomCode --> so3lr_fn
+    InputDict --> so3lr_fn["so3lr_fn()"]
+    so3lr_fn --> OutputDict
+    OutputDict --> CustomCode
+    
+    style Entry fill:#fff3e0
+    style so3lr_fn fill:#e8f5e8
+    style MLFFModel fill:#ffcdd2
+```
+
+Sources: [so3lr/base_calculator.py:57-123]()
+
+## Input Data Structure Requirements
+
+The `so3lr_fn` function expects a dictionary with specific keys and data formats:
+
+### Required Inputs
+
+| Key | Type | Shape | Description |
+|-----|------|-------|-------------|
+| `positions` | jax.Array | `(n_atoms, 3)` | Atomic coordinates in Ångström |
+| `atomic_numbers` | jax.Array | `(n_atoms,)` | Atomic numbers (integers) |
+
+### Optional Inputs
+
+| Key | Type | Shape | Description |
+|-----|------|-------|-------------|
+| `batch_segments` | jax.Array | `(n_atoms,)` | Batch segmentation for multiple molecules |
+| `graph_mask` | jax.Array | `(n_graphs,)` | Boolean mask for valid graphs in batch |
+| `residue_segments` | jax.Array | `(n_atoms,)` | Residue segmentation for dimer calculations |
+| `residue_charge` | jax.Array | `(n_residues,)` | Charges for each residue |
+
+### Automatic Batch Handling
+
+When batch information is not provided, the function automatically creates single-molecule batching:
+
+```python
+# For single molecules, these are created automatically:
+batch_segments = jnp.zeros((num_atoms,), dtype=jnp.int32)
+graph_mask = jnp.array([True])
+```
+
+Sources: [so3lr/base_calculator.py:61-71](), [so3lr/base_calculator.py:74-86]()
+
+## Output Structure and Force Calculation
+
+The returned potential function produces a dictionary containing computed properties:
+
+### Standard Output
+
+| Key | Type | Shape | Description |
+|-----|------|-------|-------------|
+| `energy` | jax.Array | `(n_graphs,)` | Potential energy per graph in eV |
+
+### With Force Calculation
+
+When `calculate_forces=True`, the output additionally contains:
+
+| Key | Type | Shape | Description |
+|-----|------|-------|-------------|
+| `forces` | jax.Array | `(n_atoms, 3)` | Atomic forces in eV/Ångström |
+
+### Force Calculation Implementation
+
+Forces are computed automatically using JAX's reverse-mode automatic differentiation:
+
+```python
+(_, output), forces = jax.value_and_grad(
+    forward,
+    has_aux=True,
+    argnums=0
+)(positions, other_inputs)
+
+output['forces'] = forces
+```
+
+Sources: [so3lr/base_calculator.py:100-112]()
+
+## JAX Transformations and Performance
+
+The returned `so3lr_fn` function is designed to be compatible with JAX's transformation system for high-performance computing:
+
+### Supported Transformations
+
+```mermaid
+graph LR
+    subgraph "JAX Transformations"
+        JIT["jax.jit<br/>Just-In-Time Compilation"]
+        VMAP["jax.vmap<br/>Vectorized Mapping"]
+        GRAD["jax.grad<br/>Automatic Differentiation"]
+        PMAP["jax.pmap<br/>Parallel Mapping"]
+    end
+    
+    subgraph "so3lr_fn Applications"
+        SingleMol["Single Molecule<br/>Energy/Forces"]
+        BatchMol["Batch Processing<br/>Multiple Molecules"]
+        Derivatives["Higher-order Derivatives<br/>Hessians, etc."]
+        ParallelComp["Parallel Computation<br/>Multi-GPU"]
+    end
+    
+    JIT --> SingleMol
+    VMAP --> BatchMol
+    GRAD --> Derivatives
+    PMAP --> ParallelComp
+    
+    style JIT fill:#e3f2fd
+    style VMAP fill:#e3f2fd
+    style GRAD fill:#e3f2fd
+    style PMAP fill:#e3f2fd
+```
+
+### Performance Optimization Example
+
+```python
+import jax
+
+# Create and optimize the potential function
+so3lr_fn = make_so3lr(lr_cutoff=12.0)
+so3lr_fn_jit = jax.jit(so3lr_fn)
+
+# For batch processing
+so3lr_fn_vmap = jax.vmap(so3lr_fn_jit)
+
+# For higher-order derivatives
+hessian_fn = jax.hessian(lambda pos, other: so3lr_fn_jit({
+    'positions': pos, **other
+})['energy'])
+```
+
+Sources: [README.md:271-272]()
+
+## Custom Integration Patterns
+
+### Pattern 1: Single Molecule Energy Evaluation
+
+```python
+def evaluate_single_molecule(positions, atomic_numbers):
+    so3lr_fn = make_so3lr(calculate_forces=False)
+    
+    inputs = {
+        'positions': jnp.array(positions),
+        'atomic_numbers': jnp.array(atomic_numbers)
+    }
+    
+    output = so3lr_fn(inputs)
+    return output['energy']
+```
+
+### Pattern 2: Custom MD Integration
+
+```python
+def custom_md_step(positions, velocities, atomic_numbers, dt):
+    so3lr_fn = make_so3lr(calculate_forces=True)
+    
+    inputs = {
+        'positions': positions,
+        'atomic_numbers': atomic_numbers
+    }
+    
+    output = so3lr_fn(inputs)
+    forces = output['forces']
+    
+    # Custom integrator implementation
+    velocities = velocities + forces * dt
+    positions = positions + velocities * dt
+    
+    return positions, velocities
+```
+
+### Pattern 3: System-to-Graph Transformation
+
+For integration with custom molecular representations:
+
+```mermaid
+graph TD
+    subgraph "Custom System Representation"
+        CustomAtoms["Custom Atoms Object"]
+        CustomBonds["Custom Bond Information"]
+        CustomProperties["Custom Properties"]
+    end
+    
+    subgraph "Transformation Layer"
+        ExtractPositions["Extract Positions<br/>positions = system.coords"]
+        ExtractNumbers["Extract Atomic Numbers<br/>atomic_numbers = system.Z"]
+        CreateInputs["Create Input Dictionary<br/>{positions, atomic_numbers, ...}"]
+    end
+    
+    subgraph "SO3LR Processing"
+        So3lrFn["so3lr_fn()"]
+        EnergyForces["Energy & Forces Output"]
+    end
+    
+    CustomAtoms --> ExtractPositions
+    CustomAtoms --> ExtractNumbers
+    CustomProperties --> CreateInputs
+    
+    ExtractPositions --> CreateInputs
+    ExtractNumbers --> CreateInputs
+    CreateInputs --> So3lrFn
+    So3lrFn --> EnergyForces
+    
+    style CreateInputs fill:#fff3e0
+    style So3lrFn fill:#e8f5e8
+```
+
+Sources: [README.md:272-275]()
+
+## Error Handling and Validation
+
+### Input Validation Requirements
+
+The direct API requires careful attention to input shapes and types:
+
+- Positions must be float arrays with shape `(n_atoms, 3)`
+- Atomic numbers must be integer arrays with shape `(n_atoms,)`
+- All JAX arrays should use consistent dtypes (typically `float32` for performance)
+
+### Common Integration Issues
+
+1. **Batch Dimension Mismatch**: Ensure batch_segments and graph_mask are consistent when provided
+2. **Dtype Consistency**: Use consistent JAX array dtypes throughout the computation
+3. **Memory Management**: Consider JAX device memory constraints for large systems
+
+Sources: [so3lr/base_calculator.py:61-86]()
+
+---
+
+# Page: Examples and Tutorials
+
+# Examples and Tutorials
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [examples/npt_jaxmd.ipynb](examples/npt_jaxmd.ipynb)
+- [examples/nvt_jaxmd.ipynb](examples/nvt_jaxmd.ipynb)
+
+</details>
+
+
+
+This page provides practical examples demonstrating how to use SO3LR for molecular dynamics simulations. The examples cover basic NVT and NPT simulations using JAX-MD integration, structure relaxation workflows, and efficient data handling for production runs. These tutorials bridge the gap between the high-level SO3LR concepts and their implementation in working simulation code.
+
+For information about the Python API interfaces, see [Python API](#3). For details about the CLI tools, see [Command Line Interface](#2). For technical documentation of the core components, see [Core Components](#5).
+
+## Example Workflow Overview
+
+The SO3LR examples demonstrate three main simulation workflows: structure relaxation, canonical (NVT) dynamics, and isothermal-isobaric (NPT) dynamics. Each workflow follows a common pattern of system setup, potential initialization, neighbor list allocation, and iterative simulation steps.
+
+### Basic Simulation Workflow
+
+```mermaid
+flowchart TD
+    subgraph "Input Preparation"
+        XYZ["XYZ/EXTXYZ Files<br/>Molecular Structures"]
+        ASERead["ase.io.read()<br/>Structure Loading"]
+        Arrays["JAX Arrays<br/>positions, species, masses"]
+    end
+    
+    subgraph "SO3LR Setup"
+        Potential["So3lrPotential<br/>Model Initialization"]
+        JAXMDConv["to_jax_md()<br/>JAX-MD Integration"]
+        EnergyFn["energy_fn<br/>JIT Compiled"]
+        ForceFn["force_fn<br/>jax_md.quantity.force()"]
+    end
+    
+    subgraph "Neighbor Management"
+        NbrAlloc["neighbor_fn.allocate()<br/>Short-range Neighbors"]
+        NbrLRAlloc["neighbor_fn_lr.allocate()<br/>Long-range Neighbors"]
+        NbrUpdate["nbrs.update()<br/>Dynamic Updates"]
+    end
+    
+    subgraph "Simulation Execution"
+        StructRelax["fire_descent()<br/>Structure Relaxation"]
+        MDInit["init_fn()<br/>NVT/NPT Initialization"]
+        MDStep["apply_fn()<br/>Time Integration"]
+        Trajectory["positions_md<br/>Trajectory Storage"]
+    end
+    
+    XYZ --> ASERead
+    ASERead --> Arrays
+    Arrays --> Potential
+    Potential --> JAXMDConv
+    JAXMDConv --> EnergyFn
+    JAXMDConv --> ForceFn
+    JAXMDConv --> NbrAlloc
+    JAXMDConv --> NbrLRAlloc
+    
+    EnergyFn --> StructRelax
+    ForceFn --> StructRelax
+    StructRelax --> MDInit
+    MDInit --> MDStep
+    NbrUpdate --> MDStep
+    MDStep --> Trajectory
+    
+    style Potential fill:#fff3e0
+    style JAXMDConv fill:#fff3e0
+    style StructRelax fill:#e8f5e8
+    style MDStep fill:#e8f5e8
+```
+
+Sources: [examples/nvt_jaxmd.ipynb:1-606](), [examples/npt_jaxmd.ipynb:1-737]()
+
+### Code Entity Mapping
+
+```mermaid
+graph TB
+    subgraph "High-Level Concepts"
+        NVT["NVT Simulation<br/>(Canonical Ensemble)"]
+        NPT["NPT Simulation<br/>(Isothermal-Isobaric)"]
+        Relax["Structure Relaxation<br/>(Energy Minimization)"]
+        PBC["Periodic Boundaries<br/>(Box Constraints)"]
+    end
+    
+    subgraph "JAX-MD Functions"
+        NVTFunc["jax_md.simulate.nvt_nose_hoover()"]
+        NPTFunc["jax_md.simulate.npt_nose_hoover()"]
+        FIREFunc["jax_md.minimize.fire_descent()"]
+        SpaceFunc["jax_md.space.periodic_general()"]
+    end
+    
+    subgraph "SO3LR Integration"
+        So3lrPot["So3lrPotential<br/>dtype=jnp.float64"]
+        ToJAXMD["to_jax_md()<br/>displacement_or_metric"]
+        NbrFn["neighbor_fn<br/>Short-range"]
+        NbrLRFn["neighbor_fn_lr<br/>Long-range"]
+    end
+    
+    subgraph "Execution Pattern"
+        InitFn["init_fn<br/>State Initialization"]
+        ApplyFn["apply_fn<br/>JIT Compiled Step"]
+        ForiLoop["jax.lax.fori_loop<br/>Batch Processing"]
+        BlockReady["jax.block_until_ready<br/>Synchronization"]
+    end
+    
+    NVT --> NVTFunc
+    NPT --> NPTFunc
+    Relax --> FIREFunc
+    PBC --> SpaceFunc
+    
+    NVTFunc --> So3lrPot
+    NPTFunc --> So3lrPot
+    FIREFunc --> So3lrPot
+    SpaceFunc --> ToJAXMD
+    
+    So3lrPot --> ToJAXMD
+    ToJAXMD --> NbrFn
+    ToJAXMD --> NbrLRFn
+    
+    NVTFunc --> InitFn
+    NPTFunc --> InitFn
+    InitFn --> ApplyFn
+    ApplyFn --> ForiLoop
+    ForiLoop --> BlockReady
+    
+    style So3lrPot fill:#ffeb3b
+    style ToJAXMD fill:#ffeb3b
+    style ApplyFn fill:#c8e6c9
+    style ForiLoop fill:#c8e6c9
+```
+
+Sources: [examples/nvt_jaxmd.ipynb:21-33](), [examples/nvt_jaxmd.ipynb:138-151](), [examples/npt_jaxmd.ipynb:186-199]()
+
+## Basic Molecular Dynamics Examples
+
+### NVT Simulation in Vacuum
+
+The NVT (canonical ensemble) example demonstrates molecular dynamics simulation of a small molecule in vacuum without periodic boundary conditions. This workflow is suitable for isolated molecular systems.
+
+**Key Components:**
+- **Structure Loading**: Uses `ase.io.read()` to load molecular geometry from XYZ files
+- **Vacuum Simulation**: Employs `jax_md.space.free()` for unbounded space
+- **Temperature Control**: Implements Nosé-Hoover chain thermostat via `jax_md.simulate.nvt_nose_hoover()`
+
+**Critical Code Pattern:**
+```python
+displacement, shift = jax_md.space.free()
+neighbor_fn, neighbor_fn_lr, energy_fn = to_jax_md(
+    potential=So3lrPotential(dtype=jnp.float64),
+    displacement_or_metric=displacement,
+    disable_cell_list=True
+)
+```
+
+The example includes structure relaxation using the FIRE algorithm before starting dynamics, demonstrating the typical workflow of optimizing initial configurations.
+
+Sources: [examples/nvt_jaxmd.ipynb:88-101](), [examples/nvt_jaxmd.ipynb:134-151](), [examples/nvt_jaxmd.ipynb:227-233]()
+
+### NPT Simulation with Periodic Boundaries
+
+The NPT (isothermal-isobaric ensemble) example shows simulation of a water box with periodic boundary conditions and pressure control. This represents the most common production simulation scenario.
+
+**Key Components:**
+- **Periodic Boundaries**: Uses `jax_md.space.periodic_general()` with fractional coordinates
+- **Pressure Control**: Implements Nosé-Hoover chain barostat alongside thermostat
+- **Box Updates**: Handles dynamic simulation box changes via `jax_md.simulate.npt_box()`
+
+**Critical Code Pattern:**
+```python
+box = jnp.array([lattice_parameter])
+displacement, shift = jax_md.space.periodic_general(
+    box=box, 
+    fractional_coordinates=True
+)
+```
+
+The example demonstrates proper handling of both short-range and long-range neighbor list updates as the simulation box fluctuates during NPT dynamics.
+
+Sources: [examples/npt_jaxmd.ipynb:84-91](), [examples/npt_jaxmd.ipynb:127-141](), [examples/npt_jaxmd.ipynb:509-520]()
+
+## Neighbor List Management
+
+Both examples showcase the dual neighbor list architecture required by SO3LR's hybrid potential design:
+
+**Neighbor List Allocation:**
+```python
+nbrs = neighbor_fn.allocate(positions_init, box=box)
+nbrs_lr = neighbor_fn_lr.allocate(positions_init, box=box)
+```
+
+**Dynamic Updates:**
+```python
+nbrs = nbrs.update(state.position, neighbor=nbrs.idx, box=box)
+nbrs_lr = nbrs_lr.update(state.position, neighbor_lr=nbrs_lr.idx, box=box)
+```
+
+**Overflow Handling:**
+The examples include proper overflow detection and reallocation logic to handle cases where neighbor lists exceed their allocated capacity during simulation.
+
+Sources: [examples/nvt_jaxmd.ipynb:157-165](), [examples/npt_jaxmd.ipynb:205-213](), [examples/npt_jaxmd.ipynb:605-617]()
+
+## Structure Relaxation Workflow
+
+Both examples begin with FIRE algorithm optimization to relax initial structures:
+
+### FIRE Implementation Pattern
+
+```mermaid
+flowchart LR
+    subgraph "FIRE Setup"
+        FireInit["fire_init<br/>jax_md.minimize.fire_descent()"]
+        FireApply["fire_apply<br/>JIT Compiled"]
+        FireState["fire_state<br/>Initial Configuration"]
+    end
+    
+    subgraph "Iterative Loop"
+        StepFn["step_fire_fn<br/>Custom Step Function"]
+        ForiLoop["jax.lax.fori_loop<br/>Batch Steps"]
+        NbrUpdate["Neighbor Updates<br/>nbrs.update()"]
+    end
+    
+    subgraph "Convergence Check"
+        EnergyCalc["energy_fn<br/>Energy Evaluation"]
+        ForceCalc["force_fn<br/>Force Evaluation"]
+        MaxForce["np.abs(F).max()<br/>Convergence Criterion"]
+    end
+    
+    FireInit --> FireState
+    FireApply --> StepFn
+    FireState --> StepFn
+    StepFn --> ForiLoop
+    ForiLoop --> NbrUpdate
+    NbrUpdate --> EnergyCalc
+    EnergyCalc --> ForceCalc
+    ForceCalc --> MaxForce
+    
+    style FireState fill:#fff3e0
+    style StepFn fill:#e8f5e8
+    style MaxForce fill:#f3e5f5
+```
+
+**Typical Parameters:**
+- `dt_start = 0.05` - Initial time step
+- `dt_max = 0.1` - Maximum time step
+- `n_min = 2` - Minimum steps before acceleration
+
+Sources: [examples/nvt_jaxmd.ipynb:227-233](), [examples/npt_jaxmd.ipynb:299-305](), [examples/nvt_jaxmd.ipynb:243-265]()
+
+## Production Simulation Considerations
+
+The examples demonstrate several patterns important for production simulations:
+
+### Performance Optimization
+- **JIT Compilation**: All simulation functions are wrapped with `jax.jit()` for optimal performance
+- **Batch Processing**: Uses `jax.lax.fori_loop()` for efficient batched time stepping
+- **Memory Management**: Includes `jax.clear_caches()` to prevent memory accumulation
+
+### Data Management
+- **Trajectory Storage**: Simple list accumulation for short runs: `positions_md.append(np.array(state.position))`
+- **Synchronization**: Uses `jax.block_until_ready()` for accurate timing measurements
+- **Unit Conversion**: Proper handling of JAX-MD metal unit system
+
+### Error Handling
+- **Buffer Overflow**: Automatic detection and reallocation of neighbor lists
+- **State Recovery**: Proper state management during neighbor list reallocation
+
+Sources: [examples/nvt_jaxmd.ipynb:460-532](), [examples/npt_jaxmd.ipynb:594-601](), [examples/npt_jaxmd.ipynb:659-660]()
+
+## Visualization and Output
+
+Both examples include patterns for trajectory visualization and file output:
+
+**ASE Integration for Visualization:**
+```python
+atoms_traj = []
+for positions in positions_md:
+    atoms_traj.append(
+        Atoms(numbers=species, positions=positions)
+    )
+nv.show_asetraj(atoms_traj)
+```
+
+**XYZ File Output:**
+```python
+for frame in atoms_traj:
+    write('trajectory.xyz', frame, append=True)
+```
+
+The examples note that for production runs, HDF5 format should be used instead of XYZ for efficient I/O operations with large systems.
+
+Sources: [examples/nvt_jaxmd.ipynb:556-562](), [examples/npt_jaxmd.ipynb:684-693](), [examples/npt_jaxmd.ipynb:670-671]()
+
+---
+
+# Page: Basic Molecular Dynamics
+
+# Basic Molecular Dynamics
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [examples/npt_jaxmd.ipynb](examples/npt_jaxmd.ipynb)
+- [examples/nvt_jaxmd.ipynb](examples/nvt_jaxmd.ipynb)
+
+</details>
+
+
+
+This document provides step-by-step tutorials for running molecular dynamics simulations using SO3LR with JAX-MD integration. It covers NVT (canonical ensemble) and NPT (isothermal-isobaric ensemble) simulations, including structure relaxation and simulation monitoring. For information about production-scale simulations with efficient data handling, see [Production Simulations](#4.2). For ASE-based workflow examples, see [ASE Integration](#3.1).
+
+## Simulation Workflow Overview
+
+The following diagram shows the complete workflow for running molecular dynamics simulations with SO3LR:
+
+```mermaid
+flowchart TD
+    subgraph "Input"
+        XYZ["XYZ File<br/>Molecular Structure"]
+        Params["Simulation Parameters<br/>T, P, timestep, cycles"]
+    end
+    
+    subgraph "System Setup"
+        ASERead["ase.io.read()"]
+        Species["species = atoms.get_atomic_numbers()"]
+        Masses["masses = atoms.get_masses()"]
+        Positions["positions = atoms.get_positions()"]
+    end
+    
+    subgraph "JAX-MD Integration"
+        Space["jax_md.space.free()<br/>or periodic_general()"]
+        Potential["So3lrPotential()"]
+        ToJAXMD["to_jax_md()"]
+        EnergyFn["energy_fn"]
+        NeighborFn["neighbor_fn, neighbor_fn_lr"]
+    end
+    
+    subgraph "Structure Relaxation"
+        FIRE["jax_md.minimize.fire_descent()"]
+        FireState["fire_state.position"]
+    end
+    
+    subgraph "MD Simulation"
+        NVT["jax_md.simulate.nvt_nose_hoover()"]
+        NPT["jax_md.simulate.npt_nose_hoover()"]
+        StepFn["step_fn with neighbor updates"]
+        ForiLoop["jax.lax.fori_loop()"]
+    end
+    
+    subgraph "Output"
+        Trajectory["positions_md[]<br/>Trajectory Data"]
+        Analysis["Energy, Temperature<br/>Pressure Analysis"]
+        Files["XYZ Files<br/>or HDF5 Output"]
+    end
+    
+    XYZ --> ASERead
+    Params --> NVT
+    Params --> NPT
+    
+    ASERead --> Species
+    ASERead --> Masses  
+    ASERead --> Positions
+    
+    Species --> ToJAXMD
+    Positions --> Space
+    Space --> ToJAXMD
+    Potential --> ToJAXMD
+    
+    ToJAXMD --> EnergyFn
+    ToJAXMD --> NeighborFn
+    
+    EnergyFn --> FIRE
+    NeighborFn --> FIRE
+    Positions --> FIRE
+    FIRE --> FireState
+    
+    FireState --> NVT
+    FireState --> NPT
+    EnergyFn --> StepFn
+    NeighborFn --> StepFn
+    
+    NVT --> ForiLoop
+    NPT --> ForiLoop
+    StepFn --> ForiLoop
+    
+    ForiLoop --> Trajectory
+    ForiLoop --> Analysis
+    Trajectory --> Files
+```
+
+**Sources:** [examples/nvt_jaxmd.ipynb:1-605](), [examples/npt_jaxmd.ipynb:1-737]()
+
+## System Setup and Initialization
+
+### Loading Molecular Structures
+
+The first step involves loading a molecular structure and extracting essential atomic properties:
+
+| Property | Code | Purpose |
+|----------|------|---------|
+| Atomic positions | `atoms.get_positions()` | Initial coordinates |
+| Atomic numbers | `atoms.get_atomic_numbers()` | Species identification |
+| Atomic masses | `atoms.get_masses()` | Dynamics calculations |
+
+### Boundary Conditions Setup
+
+Different simulation scenarios require different spatial treatments:
+
+```mermaid
+graph LR
+    subgraph "Vacuum Simulations"
+        FreeSpace["jax_md.space.free()"]
+        NoBox["box = None"]
+        DisableCL["disable_cell_list = True"]
+    end
+    
+    subgraph "Periodic Simulations"
+        PeriodicSpace["jax_md.space.periodic_general()"]
+        BoxSize["box = jnp.array([L])"]
+        FracCoords["fractional_coordinates = True"]
+        CellList["disable_cell_list = False"]
+    end
+    
+    subgraph "Common Output"
+        Displacement["displacement function"]
+        Shift["shift function"]
+    end
+    
+    FreeSpace --> Displacement
+    FreeSpace --> Shift
+    PeriodicSpace --> Displacement
+    PeriodicSpace --> Shift
+    
+    NoBox --> DisableCL
+    BoxSize --> CellList
+```
+
+**Sources:** [examples/nvt_jaxmd.ipynb:135-136](), [examples/npt_jaxmd.ipynb:136-140]()
+
+### SO3LR Potential Integration
+
+The `to_jax_md()` function converts SO3LR potentials into JAX-MD compatible format:
+
+```mermaid
+graph TD
+    subgraph "Input Parameters"
+        Potential["So3lrPotential(dtype=jnp.float64)"]
+        Displacement["displacement function"]
+        BoxSize["box_size"]
+        Species["species array"]
+        Multipliers["capacity_multiplier<br/>buffer_size_multiplier_sr/lr"]
+    end
+    
+    subgraph "to_jax_md Function"
+        ToJAXMD["to_jax_md()"]
+    end
+    
+    subgraph "Output"
+        NeighborFn["neighbor_fn<br/>(short-range)"]
+        NeighborFnLR["neighbor_fn_lr<br/>(long-range)"]
+        EnergyFn["energy_fn<br/>(JIT compiled)"]
+    end
+    
+    Potential --> ToJAXMD
+    Displacement --> ToJAXMD
+    BoxSize --> ToJAXMD
+    Species --> ToJAXMD
+    Multipliers --> ToJAXMD
+    
+    ToJAXMD --> NeighborFn
+    ToJAXMD --> NeighborFnLR
+    ToJAXMD --> EnergyFn
+```
+
+**Sources:** [examples/nvt_jaxmd.ipynb:138-151](), [examples/npt_jaxmd.ipynb:186-199]()
+
+## Structure Relaxation with FIRE Algorithm
+
+Before running dynamics, structures are typically relaxed using the FIRE (Fast Inertial Relaxation Engine) algorithm:
+
+### FIRE Implementation Pattern
+
+```mermaid
+graph TD
+    subgraph "FIRE Setup"
+        FireInit["fire_init, fire_apply = jax_md.minimize.fire_descent()"]
+        FireParams["dt_start=0.05<br/>dt_max=0.1<br/>n_min=2"]
+    end
+    
+    subgraph "State Management"
+        InitState["fire_state = fire_init()"]
+        StepFn["step_fire_fn()"]
+        NeighborUpdate["nbrs.update()<br/>nbrs_lr.update()"]
+    end
+    
+    subgraph "Optimization Loop"
+        ForiLoop["jax.lax.fori_loop()"]
+        MinCycles["min_cycles iterations"]
+        MinSteps["min_steps per cycle"]
+    end
+    
+    subgraph "Monitoring"
+        Energy["energy_fn()"]
+        Forces["force_fn()"]
+        Convergence["Monitor Fmax"]
+    end
+    
+    FireInit --> InitState
+    FireParams --> FireInit
+    InitState --> StepFn
+    StepFn --> NeighborUpdate
+    StepFn --> ForiLoop
+    MinCycles --> ForiLoop
+    MinSteps --> ForiLoop
+    ForiLoop --> Energy
+    ForiLoop --> Forces
+    Energy --> Convergence
+    Forces --> Convergence
+```
+
+**Sources:** [examples/nvt_jaxmd.ipynb:227-293](), [examples/npt_jaxmd.ipynb:299-367]()
+
+## NVT Simulations (Canonical Ensemble)
+
+NVT simulations maintain constant number of particles, volume, and temperature using Nosé-Hoover thermostats.
+
+### Key NVT Components
+
+| Component | Function | Purpose |
+|-----------|----------|---------|
+| Thermostat | `jax_md.simulate.nvt_nose_hoover()` | Temperature control |
+| Chain parameters | `default_nhc_kwargs()` | Thermostat configuration |
+| Time integration | `apply_fn()` | State evolution |
+| Invariant monitoring | `nvt_nose_hoover_invariant()` | Energy conservation |
+
+### NVT Simulation Loop Structure
+
+The simulation follows a standard pattern with JIT-compiled step functions and neighbor list management:
+
+```python
+@jax.jit
+def step_nvt_fn(i, state):
+    state, nbrs, nbrs_lr, box, temp_i = state
+    
+    state = apply_fn(state, neighbor=nbrs.idx, neighbor_lr=nbrs_lr.idx, kT=temp_i, box=box)
+    
+    nbrs = nbrs.update(state.position, neighbor=nbrs.idx, box=box)
+    nbrs_lr = nbrs_lr.update(state.position, neighbor_lr=nbrs_lr.idx, box=box)
+    
+    return state, nbrs, nbrs_lr, box, temp_i
+```
+
+**Sources:** [examples/nvt_jaxmd.ipynb:410-532]()
+
+## NPT Simulations (Isothermal-Isobaric Ensemble)
+
+NPT simulations maintain constant number of particles, pressure, and temperature, allowing volume fluctuations.
+
+### NPT-Specific Features
+
+```mermaid
+graph LR
+    subgraph "NPT Components"
+        Barostat["Barostat<br/>Pressure Control"]
+        Thermostat["Thermostat<br/>Temperature Control"]
+        BoxUpdate["jax_md.simulate.npt_box()"]
+    end
+    
+    subgraph "Additional Monitoring"
+        Invariant["npt_nose_hoover_invariant()"]
+        EnergyDrift["Energy drift calculation"]
+        PressureCalc["Pressure monitoring"]
+    end
+    
+    subgraph "Dynamic Updates"
+        NeighborUpdate["Neighbor list updates<br/>with changing box"]
+        FracCoords["Fractional coordinate<br/>transformations"]
+    end
+    
+    Barostat --> BoxUpdate
+    Thermostat --> BoxUpdate
+    BoxUpdate --> NeighborUpdate
+    BoxUpdate --> FracCoords
+    Invariant --> EnergyDrift
+    BoxUpdate --> PressureCalc
+```
+
+### Periodic Boundary Conditions in NPT
+
+NPT simulations typically use periodic boundary conditions with fractional coordinates:
+
+| Aspect | Implementation | Purpose |
+|--------|----------------|---------|
+| Box representation | `box = jnp.array([L])` | Cubic cell |
+| Coordinate system | `fractional_coordinates=True` | Handle box changes |
+| Position scaling | `positions_init / box` | Normalize to [0,1] |
+| Real space conversion | `jax_md.space.transform()` | Output processing |
+
+**Sources:** [examples/npt_jaxmd.ipynb:509-661]()
+
+## Key Classes and Functions
+
+The following diagram maps the primary code entities used in MD simulations:
+
+```mermaid
+graph TB
+    subgraph "SO3LR Core Classes"
+        So3lrPotential["So3lrPotential<br/>Main potential class"]
+        ToJaxMD["to_jax_md()<br/>Integration function"]
+    end
+    
+    subgraph "JAX-MD Simulation Functions"
+        NVTNoseHoover["jax_md.simulate.nvt_nose_hoover()"]
+        NPTNoseHoover["jax_md.simulate.npt_nose_hoover()"]
+        FireDescent["jax_md.minimize.fire_descent()"]
+    end
+    
+    subgraph "Space and Neighbor Management"
+        SpaceFree["jax_md.space.free()"]
+        SpacePeriodic["jax_md.space.periodic_general()"]
+        NeighborFn["neighbor_fn.allocate()<br/>neighbor_fn.update()"]
+    end
+    
+    subgraph "Quantity Calculations"
+        KineticEnergy["jax_md.quantity.kinetic_energy()"]
+        Temperature["jax_md.quantity.temperature()"]
+        Force["jax_md.quantity.force()"]
+    end
+    
+    subgraph "Control Flow"
+        ForiLoop["jax.lax.fori_loop()"]
+        JaxJit["@jax.jit decorators"]
+        BlockUntilReady["jax.block_until_ready()"]
+    end
+    
+    So3lrPotential --> ToJaxMD
+    ToJaxMD --> NeighborFn
+    
+    SpaceFree --> ToJaxMD
+    SpacePeriodic --> ToJaxMD
+    
+    ToJaxMD --> NVTNoseHoover
+    ToJaxMD --> NPTNoseHoover
+    ToJaxMD --> FireDescent
+    
+    NVTNoseHoover --> ForiLoop
+    NPTNoseHoover --> ForiLoop
+    FireDescent --> ForiLoop
+    
+    ForiLoop --> JaxJit
+    ForiLoop --> BlockUntilReady
+    
+    KineticEnergy --> Temperature
+    Force --> FireDescent
+```
+
+**Sources:** [examples/nvt_jaxmd.ipynb:1-605](), [examples/npt_jaxmd.ipynb:1-737]()
+
+---
+
+# Page: Production Simulations
+
+# Production Simulations
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [examples/production_run.ipynb](examples/production_run.ipynb)
+- [examples/so3lr_colab_example.ipynb](examples/so3lr_colab_example.ipynb)
+
+</details>
+
+
+
+This document covers production-scale molecular dynamics simulations using SO3LR, focusing on efficient data handling, performance optimization, and large-scale simulation workflows. For basic molecular dynamics concepts and CLI usage, see [Basic Molecular Dynamics](#4.1). For model evaluation on datasets, see [Model Evaluation Examples](#4.3).
+
+## Purpose and Scope
+
+Production simulations involve running long-duration molecular dynamics simulations with thousands of atoms, requiring specialized approaches for data storage, memory management, and computational efficiency. The primary challenges addressed include:
+
+- Efficient trajectory data storage using HDF5 format
+- Batched I/O operations to minimize disk access overhead  
+- JAX-MD integration for high-performance computation
+- Neighbor list management for extended simulations
+- Memory-efficient buffer strategies
+
+Sources: [examples/production_run.ipynb:360-364]()
+
+## HDF5-Based Trajectory Storage
+
+### Storage Architecture
+
+Production simulations use HDF5 format instead of traditional XYZ files to achieve efficient I/O performance. The storage system is built around `DataSetEntry` and `HDF5Store` classes from the MLFF package.
+
+```mermaid
+graph TB
+    subgraph "Production Simulation Workflow"
+        MDLoop["MD Simulation Loop<br/>step_npt_fn"]
+        Buffer["In-Memory Buffers<br/>positions, velocities, boxes"]
+        BatchCheck["Batch Size Check<br/>hdf5_buffer_size"]
+        HDF5Store["HDF5Store<br/>init_hdf5_store()"]
+    end
+    
+    subgraph "Data Flow"
+        Positions["positions.append()"]
+        Velocities["velocities.append()"] 
+        Boxes["boxes.append()"]
+        Stack["jnp.stack(axis=0)"]
+        Convert["jax.tree.map(np.asarray)"]
+        Flush["hdf5_store.append()"]
+    end
+    
+    MDLoop --> Positions
+    MDLoop --> Velocities  
+    MDLoop --> Boxes
+    
+    Positions --> Buffer
+    Velocities --> Buffer
+    Boxes --> Buffer
+    
+    Buffer --> BatchCheck
+    BatchCheck --> Stack
+    Stack --> Convert
+    Convert --> Flush
+    Flush --> HDF5Store
+```
+
+Sources: [examples/production_run.ipynb:373-414](), [examples/production_run.ipynb:519-561]()
+
+### Buffer Management Strategy
+
+The system implements a batching strategy where multiple simulation frames are collected in memory before writing to disk. This reduces I/O overhead significantly compared to writing each frame individually.
+
+| Component | Purpose | Configuration |
+|-----------|---------|---------------|
+| `hdf5_buffer_size` | Frames per flush operation | Typically 100 for long runs |
+| `batch_size` | DataSetEntry chunk size | Same as buffer size |
+| `chunk_length` | HDF5 chunking parameter | Set to 1 for time series |
+
+```python
+# Buffer accumulation pattern
+velocities.append(jnp.divide(state.momentum, state.mass))
+positions.append(jax_md.space.transform(box=box, R=state.position))
+boxes.append(box)
+
+# Flush when buffer is full
+if (len(positions) % hdf5_buffer_size == 0) and (len(positions) > 0):
+    step_data = dict(
+        velocities=jnp.stack(velocities, axis=0),
+        positions=jnp.stack(positions, axis=0), 
+        box=jnp.stack(boxes, axis=0)
+    )
+    hdf5_store.append(step_data)
+    velocities, positions, boxes = [], [], []
+```
+
+Sources: [examples/production_run.ipynb:422-436](), [examples/production_run.ipynb:544-559]()
+
+## JAX-MD Integration for Performance
+
+### High-Performance Simulation Loop
+
+Production simulations leverage JAX-MD's optimized simulation functions with JIT compilation for maximum performance. The integration provides both short-range and long-range neighbor list management.
+
+```mermaid
+graph LR
+    subgraph "JAX-MD Integration Components"
+        So3lrPotential["So3lrPotential<br/>dtype=jnp.float64"]
+        ToJaxMD["to_jax_md()<br/>displacement, species"]
+        NeighborFns["neighbor_fn, neighbor_fn_lr<br/>allocate(), update()"]
+        EnergyFn["energy_fn<br/>jax.jit compiled"]
+        SimulateFn["simulate functions<br/>npt_nose_hoover()"]
+    end
+    
+    subgraph "Performance Optimizations"
+        JITCompile["JAX JIT Compilation<br/>@jax.jit decorators"]
+        CellLists["Cell List Optimization<br/>capacity_multiplier"]
+        BufferMgmt["Buffer Management<br/>buffer_size_multiplier"]
+        Precision["Precision Control<br/>float64/float32"]
+    end
+    
+    So3lrPotential --> ToJaxMD
+    ToJaxMD --> NeighborFns
+    ToJaxMD --> EnergyFn
+    NeighborFns --> SimulateFn
+    
+    EnergyFn --> JITCompile
+    NeighborFns --> CellLists
+    NeighborFns --> BufferMgmt
+    So3lrPotential --> Precision
+```
+
+Sources: [examples/production_run.ipynb:179-192](), [examples/production_run.ipynb:302-325]()
+
+### Neighbor List Management
+
+Production simulations require robust neighbor list overflow detection and reallocation to handle structural changes during long runs.
+
+```python
+# Neighbor list overflow handling
+if nbrs.did_buffer_overflow:
+    print('Neighbor list overflowed, reallocating.')
+    nbrs = neighbor_fn.allocate(state.position, box=box)
+    if nbrs_lr.did_buffer_overflow:
+        print('Long-range neighbor list also overflowed, reallocating.')
+        nbrs_lr = neighbor_fn_lr.allocate(state.position, box=box)
+elif nbrs_lr.did_buffer_overflow:
+    print('Long-range neighbor list overflowed, reallocating.')
+    nbrs_lr = neighbor_fn_lr.allocate(state.position, box=box)
+```
+
+Sources: [examples/production_run.ipynb:504-515]()
+
+## Performance Optimization Strategies
+
+### Computational Efficiency
+
+| Optimization | Implementation | Impact |
+|--------------|----------------|---------|
+| Precision Control | `jax.config.update('jax_enable_x64', True)` | Memory vs accuracy trade-off |
+| JIT Compilation | `@jax.jit` decorators on step functions | Significant speedup |
+| Cell List Tuning | `capacity_multiplier=1.25` | Neighbor search efficiency |
+| Buffer Sizing | `buffer_size_multiplier_sr/lr=1.25` | Memory allocation optimization |
+
+### Memory Management
+
+The production workflow implements several memory management strategies:
+
+- **Batch Processing**: Accumulate multiple frames before I/O operations
+- **Buffer Reallocation**: Dynamic neighbor list resizing based on overflow detection  
+- **JAX Array Conversion**: Convert JAX arrays to NumPy before HDF5 storage
+- **Cache Clearing**: `jax.clear_caches()` to prevent memory accumulation
+
+Sources: [examples/production_run.ipynb:33-35](), [examples/production_run.ipynb:587-589]()
+
+## Data Postprocessing
+
+### HDF5 Trajectory Analysis
+
+Production simulations generate HDF5 files with hierarchical data structure that can be efficiently accessed for analysis:
+
+```python
+import h5py
+file = h5py.File('hdf5/trajectory.hdf5', mode='r')
+
+# Load and reshape trajectory data
+velocities = np.array(file['velocities'])
+# Shape: (num_flushes, hdf5_buffer_size, num_atoms, 3)
+
+# Reshape for analysis
+velocities = velocities.reshape(-1, *file['velocities'].shape[-2:])
+# Shape: (total_frames, num_atoms, 3)
+```
+
+The HDF5 format provides:
+- **Efficient Random Access**: Direct frame access without loading entire trajectory
+- **Compressed Storage**: Automatic compression for large datasets  
+- **Metadata Preservation**: Simulation parameters stored as attributes
+- **Cross-Platform Compatibility**: Standard HDF5 format readable by multiple tools
+
+Sources: [examples/production_run.ipynb:615-629]()
+
+### Performance Monitoring
+
+Production simulations include timing and performance monitoring:
+
+```python
+# Per-cycle timing
+old_time = time.time()
+new_state, nbrs, nbrs_lr, new_box = jax.block_until_ready(
+    jax.lax.fori_loop(0, npt_steps, step_npt_fn, (state, nbrs, nbrs_lr, box))
+)
+new_time = time.time()
+
+print(f'{(new_time - old_time) / npt_steps:.2f}')  # seconds per step
+```
+
+This enables optimization of simulation parameters and identification of performance bottlenecks during long production runs.
+
+Sources: [examples/production_run.ipynb:488-502](), [examples/production_run.ipynb:582-583]()
+
+---
+
+# Page: Model Evaluation Examples
+
+# Model Evaluation Examples
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [examples/evaluate_so3lr_on_dataset.ipynb](examples/evaluate_so3lr_on_dataset.ipynb)
+- [so3lr/cli/so3lr_eval.py](so3lr/cli/so3lr_eval.py)
+
+</details>
+
+
+
+This page provides practical examples of evaluating SO3LR model performance on molecular datasets. It demonstrates how to use both the command-line interface and Python API to assess model accuracy and computational performance. For documentation of the CLI `eval` command parameters, see [Model Evaluation](#2.2). For technical details about SO3LR's internal potential functions, see [Potential Functions](#5.2).
+
+## Evaluation Workflow Overview
+
+The SO3LR evaluation system processes molecular datasets to compute error metrics and optionally save predictions. The workflow involves data loading, batching for efficient computation, model inference, and metrics calculation.
+
+### Evaluation Architecture
+
+```mermaid
+flowchart TD
+    Input["Input Dataset<br/>(XYZ/EXTXYZ/NPZ)"] --> DataLoader["AseDataLoaderSparse<br/>mlff.data"]
+    DataLoader --> Batching["jraph.dynamically_batch<br/>Graph Padding"]
+    Batching --> Model["SO3LR Potential<br/>make_so3lr()"]
+    Model --> Metrics["calculate_metrics()<br/>MAE/MSE/RMSE"]
+    Model --> Predictions["process_predictions()<br/>Forces/Energy/Dipole"]
+    Predictions --> Output["save_to_file()<br/>EXTXYZ Output"]
+    Metrics --> Results["Evaluation Results<br/>JSON/Console"]
+    
+    subgraph "Evaluation Targets"
+        Forces["forces"]
+        Energy["energy"] 
+        Dipole["dipole_vec"]
+        Hirshfeld["hirshfeld_ratios"]
+    end
+    
+    Metrics --> Forces
+    Metrics --> Energy
+    Metrics --> Dipole
+    Metrics --> Hirshfeld
+```
+
+Sources: [so3lr/cli/so3lr_eval.py:141-414](), [examples/evaluate_so3lr_on_dataset.ipynb:58-68]()
+
+### Core Evaluation Function Architecture
+
+```mermaid
+graph TB
+    subgraph "evaluate_so3lr_on Function"
+        Setup["setup_logger()<br/>Parameter Validation"]
+        LoadData["AseDataLoaderSparse.load()<br/>Neighbor Calculation"]
+        InitModel["make_so3lr()<br/>Model Initialization"]
+        JITComp["jax.jit()<br/>Compilation"]
+        BatchLoop["Batch Processing Loop"]
+        MetricsCalc["calculate_metrics()<br/>Per-batch Aggregation"]
+        SavePreds["save_to_file()<br/>EXTXYZ Export"]
+    end
+    
+    Setup --> LoadData
+    LoadData --> InitModel
+    InitModel --> JITComp
+    JITComp --> BatchLoop
+    BatchLoop --> MetricsCalc
+    BatchLoop --> SavePreds
+    
+    subgraph "Batch Processing"
+        GraphBatch["graph_batch<br/>jraph.GraphsTuple"]
+        Inputs["jraph_utils.graph_to_batch_fn()<br/>Input Dictionary"]
+        ModelCall["so3lr_calc(inputs)<br/>Prediction"]
+        MaskApply["assign_mask()<br/>Target-specific Masking"]
+    end
+    
+    BatchLoop --> GraphBatch
+    GraphBatch --> Inputs
+    Inputs --> ModelCall
+    ModelCall --> MaskApply
+    MaskApply --> MetricsCalc
+```
+
+Sources: [so3lr/cli/so3lr_eval.py:141-414](), [so3lr/cli/so3lr_eval.py:68-108](), [so3lr/cli/so3lr_eval.py:417-449]()
+
+## Command Line Evaluation Examples
+
+### Basic Evaluation
+
+Evaluate the default SO3LR model on a dataset:
+
+```bash
+so3lr eval data/ethanol.xyz --save-to predictions.extxyz
+```
+
+This command loads `data/ethanol.xyz`, evaluates the default SO3LR potential, and saves predictions to `predictions.extxyz`. The evaluation targets default to `forces,dipole_vec,hirshfeld_ratios`.
+
+### Custom Model Evaluation
+
+Evaluate a custom trained model:
+
+```bash
+so3lr eval dataset.xyz \
+    --model-path /path/to/model/workdir \
+    --lr-cutoff 15.0 \
+    --dispersion-damping 3.0 \
+    --batch-size 4 \
+    --targets forces,energy,dipole_vec
+```
+
+### Performance Evaluation
+
+For performance benchmarking without saving predictions:
+
+```bash
+so3lr eval large_dataset.xyz \
+    --batch-size 8 \
+    --jit-compile \
+    --log-file evaluation.log
+```
+
+Sources: [so3lr/cli/so3lr_eval.py:141-184]()
+
+## Python API Evaluation Examples
+
+### Basic Evaluation with Default Model
+
+```python
+from so3lr.cli.so3lr_eval import evaluate_so3lr_on
+
+# Evaluate using default SO3LR potential
+metrics = evaluate_so3lr_on(
+    datafile="data/ethanol.xyz",
+    batch_size=1,
+    lr_cutoff=12.0,
+    save_to="predictions.extxyz"
+)
+
+print(f"Forces MAE: {metrics['forces_mae']:.3e} eV/Å")
+print(f"Energy MAE: {metrics['energy_mae']:.3e} eV")
+```
+
+### Custom Model Evaluation
+
+```python
+# Evaluate custom trained model
+metrics = evaluate_so3lr_on(
+    datafile="validation_set.xyz",
+    model_path="/path/to/trained/model",
+    batch_size=4,
+    lr_cutoff=15.0,
+    dispersion_damping=2.5,
+    targets="forces,energy,dipole_vec,hirshfeld_ratios",
+    jit_compile=True
+)
+```
+
+### Low-level API Usage
+
+For more control over the evaluation process:
+
+```python
+import jax
+import jraph
+import numpy as np
+from mlff.data import AseDataLoaderSparse
+from mlff.utils import jraph_utils
+from so3lr.base_calculator import make_so3lr
+
+# Load data
+loader = AseDataLoaderSparse("dataset.xyz")
+data, stats = loader.load(cutoff=4.5, cutoff_lr=12.0)
+
+# Initialize model
+so3lr_calc = make_so3lr(lr_cutoff=12.0, calculate_forces=True)
+so3lr_calc = jax.jit(so3lr_calc)
+
+# Batch and evaluate
+batch_size = 2
+batched_graphs = jraph.dynamically_batch(
+    data,
+    n_node=stats['max_num_of_nodes'] * batch_size + 1,
+    n_edge=stats['max_num_of_edges'] * batch_size + 1,
+    n_graph=batch_size + 1,
+    n_pairs=stats['max_num_of_nodes'] * (stats['max_num_of_nodes'] - 1) * batch_size + 1
+)
+
+for graph_batch in batched_graphs:
+    inputs = jraph_utils.graph_to_batch_fn(graph_batch)
+    predictions = so3lr_calc(inputs)
+    # Process predictions...
+```
+
+Sources: [examples/evaluate_so3lr_on_dataset.ipynb:134-164](), [examples/evaluate_so3lr_on_dataset.ipynb:185-234]()
+
+## Metrics and Output Interpretation
+
+### Available Evaluation Targets
+
+| Target | Description | Units | Mask Type |
+|--------|-------------|-------|-----------|
+| `forces` | Atomic forces | eV/Å | `node_mask` |
+| `energy` | Total energy | eV | `graph_mask` |
+| `dipole_vec` | Dipole moment vector | e·Å | `graph_mask` |
+| `hirshfeld_ratios` | Hirshfeld charge ratios | dimensionless | `node_mask` |
+
+### Computed Metrics
+
+For each target, the evaluation system computes:
+
+- **MAE (Mean Absolute Error)**: `sum(|pred - true|) / count`
+- **MSE (Mean Squared Error)**: `sum((pred - true)²) / count`  
+- **RMSE (Root Mean Squared Error)**: `sqrt(MSE)`
+
+### Sample Output
+
+```json
+{
+  "forces_mae": 2.456e-02,
+  "forces_mse": 1.234e-03,
+  "forces_rmse": 3.512e-02,
+  "energy_mae": 1.789e-03,
+  "energy_mse": 5.432e-06,
+  "energy_rmse": 2.331e-03,
+  "time_per_structure": 0.125,
+  "time_compile": 2.341,
+  "datafile": "file:///path/to/dataset.xyz"
+}
+```
+
+Sources: [so3lr/cli/so3lr_eval.py:68-108](), [so3lr/cli/so3lr_eval.py:384-410](), [so3lr/cli/so3lr_eval.py:417-449]()
+
+## Batch Processing and Performance
+
+### JIT Compilation Benefits
+
+The evaluation system supports JIT compilation for significant performance improvements:
+
+```python
+# Without JIT: ~33 seconds for 50 structures
+# With JIT: ~0.1 seconds after compilation (2 seconds compile time)
+```
+
+### Optimal Batch Sizing
+
+Batch size affects memory usage and computational efficiency:
+
+```python
+# Memory-efficient for large datasets
+batch_size = 1
+
+# Better throughput for medium datasets  
+batch_size = 4
+
+# Maximum efficiency for small datasets
+batch_size = 8
+```
+
+### Graph Padding Strategy
+
+The system uses `jraph.dynamically_batch()` to pad graphs to consistent sizes, enabling JIT compilation:
+
+```python
+# Padding parameters based on dataset statistics
+n_node = stats['max_num_of_nodes'] * batch_size + 1
+n_edge = stats['max_num_of_edges'] * batch_size + 1  
+n_graph = batch_size + 1
+n_pairs = stats['max_num_of_nodes'] * (stats['max_num_of_nodes'] - 1) * batch_size + 1
+```
+
+The `+1` accounts for a padding graph used to collect outputs from padded nodes/edges.
+
+Sources: [examples/evaluate_so3lr_on_dataset.ipynb:134-164](), [examples/evaluate_so3lr_on_dataset.ipynb:185-234](), [examples/evaluate_so3lr_on_dataset.ipynb:275-295](), [so3lr/cli/so3lr_eval.py:264-278]()
+
+## Prediction Output Handling
+
+### EXTXYZ Format Output
+
+When `save_to` is specified, predictions are saved in extended XYZ format with additional properties:
+
+```
+9
+Lattice="10.0 0.0 0.0 0.0 10.0 0.0 0.0 0.0 10.0" Properties=species:S:1:pos:R:3:forces_so3lr:R:3:hirshfeld_ratios_so3lr:R:1 energy_so3lr=-14.779261 dipole_vec_so3lr="-0.154 -0.287 -0.022"
+C  -0.371  -0.453  -0.199  -3.286  -2.342   2.047   0.795
+C  -0.730   0.684   0.796   2.517   1.576  -0.607   0.768
+...
+```
+
+### Prediction Processing Flow
+
+```mermaid
+flowchart LR
+    ModelOutput["Model Predictions<br/>JAX Arrays"] --> AddToGraph["Add to graph_batch.nodes<br/>Forces, Hirshfeld ratios"]
+    ModelOutput --> AddToGlobals["Add to graph_batch.globals<br/>Energy, Dipole"]
+    AddToGraph --> Unbatch["unbatch_np()<br/>Separate Structures"]
+    AddToGlobals --> Unbatch
+    Unbatch --> FilterPadding["Filter graph_mask<br/>Remove Padding"]
+    FilterPadding --> ConvertASE["jraph_to_ase_atoms()<br/>ASE Atoms Objects"]
+    ConvertASE --> WriteFile["ase.io.write()<br/>EXTXYZ Format"]
+```
+
+Sources: [so3lr/cli/so3lr_eval.py:27-66](), [so3lr/cli/so3lr_eval.py:111-138]()
+
+---
+
+# Page: Core Components
+
+# Core Components
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [so3lr/graph.py](so3lr/graph.py)
+- [so3lr/potential.py](so3lr/potential.py)
+
+</details>
+
+
+
+This document provides technical documentation of SO3LR's internal architecture, focusing on the core data structures and computational components that enable molecular simulation. It covers the fundamental building blocks that interface with external libraries and enable the CLI and API functionality.
+
+For detailed usage patterns with external frameworks, see [Python API](#3). For practical implementation examples, see [Examples and Tutorials](#4).
+
+## Architecture Overview
+
+SO3LR's core architecture combines two primary computational approaches: semi-local interactions through the SO3krates neural network and long-range interactions via universal pairwise force fields. The system is built around a central graph data structure that represents molecular systems and a potential evaluation framework that computes energies and forces.
+
+```mermaid
+graph TB
+    subgraph "Core Data Layer"
+        GraphDS["Graph"]
+        Positions["positions"]
+        Edges["edges"]
+        Nodes["nodes"]
+        LREdges["edges_lr"]
+    end
+    
+    subgraph "Potential Computation"
+        MLFFPot["MLFFPotentialSparse"]
+        SO3Net["SO3krates Network"]
+        LRForces["Long-Range Forces"]
+        PotentialFn["make_potential_fn"]
+    end
+    
+    subgraph "External Integration"
+        MLFFLib["MLFF Library"]
+        JAXRuntime["JAX Runtime"]
+        ParamStore["params/ Directory"]
+    end
+    
+    GraphDS --> Positions
+    GraphDS --> Edges  
+    GraphDS --> Nodes
+    GraphDS --> LREdges
+    
+    PotentialFn --> MLFFPot
+    MLFFPot --> SO3Net
+    MLFFPot --> LRForces
+    MLFFPot --> MLFFLib
+    
+    PotentialFn --> ParamStore
+    MLFFPot --> JAXRuntime
+    
+    GraphDS --> MLFFPot
+```
+
+Sources: [so3lr/graph.py:1-36](), [so3lr/potential.py:1-30]()
+
+## Core Data Structures
+
+The SO3LR system centers around the `Graph` class, which provides a structured representation of molecular systems optimized for both local and long-range interactions. This data structure serves as the primary interface between molecular configurations and the computational backend.
+
+| Component | Type | Purpose |
+|-----------|------|---------|
+| `positions` | Array | Atomic coordinates in 3D space |
+| `edges` | Array | Local neighbor connectivity |
+| `nodes` | Array | Atomic species and properties |
+| `edges_lr` | Array | Long-range interaction pairs |
+| `idx_i_lr`, `idx_j_lr` | Arrays | Long-range edge indices |
+| `cell` | Array | Periodic boundary conditions |
+| `mask` | Array | Valid atom indicators |
+
+```mermaid
+graph LR
+    subgraph "Molecular System"
+        Atoms["Atomic Positions"]
+        Species["Element Types"]
+        Bonds["Chemical Bonds"]
+        Cell["Unit Cell"]
+    end
+    
+    subgraph "Graph Representation"
+        GraphClass["Graph"]
+        PosField["positions"]
+        NodesField["nodes"]
+        EdgesField["edges"]
+        CellField["cell"]
+        LREdgesField["edges_lr"]
+        MaskField["mask"]
+    end
+    
+    subgraph "Computational Backend"
+        LocalCalc["Local Interactions"]
+        LRCalc["Long-Range Interactions"]
+        MLFFBackend["MLFF Processing"]
+    end
+    
+    Atoms --> PosField
+    Species --> NodesField
+    Bonds --> EdgesField
+    Cell --> CellField
+    
+    GraphClass --> PosField
+    GraphClass --> NodesField
+    GraphClass --> EdgesField
+    GraphClass --> CellField
+    GraphClass --> LREdgesField
+    GraphClass --> MaskField
+    
+    EdgesField --> LocalCalc
+    LREdgesField --> LRCalc
+    GraphClass --> MLFFBackend
+```
+
+Sources: [so3lr/graph.py:3-36]()
+
+## Potential System Architecture
+
+The potential evaluation system is built around the `MLFFPotentialSparse` class from the MLFF library, configured specifically for SO3LR's hybrid local/long-range approach. The `make_potential_fn` function serves as the primary factory for creating configured potential instances.
+
+```mermaid
+graph TB
+    subgraph "Potential Factory"
+        MakePotFn["make_potential_fn()"]
+        LRCutoff["lr_cutoff=12.0"]
+        DispCutoff["dispersion_energy_cutoff_lr_damping=2.0"]
+        EwaldConfig["coulomb_kspace_do_ewald"]
+    end
+    
+    subgraph "MLFF Integration"
+        MLFFClass["MLFFPotentialSparse"]
+        CreateMethod["create_from_workdir()"]
+        ParamsDir["so3lr/params/"]
+        LRKwargs["long_range_kwargs"]
+    end
+    
+    subgraph "Runtime Configuration"
+        NeighborFormat["neighborlist_format_lr='ordered_sparse'"]
+        InterpNodes["coulomb_kspace_interp_nodes=4"]
+        DTypeCfg["dtype=np.float32"]
+    end
+    
+    MakePotFn --> LRCutoff
+    MakePotFn --> DispCutoff
+    MakePotFn --> EwaldConfig
+    MakePotFn --> CreateMethod
+    
+    CreateMethod --> MLFFClass
+    CreateMethod --> ParamsDir
+    CreateMethod --> LRKwargs
+    
+    LRKwargs --> NeighborFormat
+    LRKwargs --> InterpNodes
+    LRKwargs --> DTypeCfg
+```
+
+Sources: [so3lr/potential.py:7-29]()
+
+## Data Flow and Processing
+
+The core components work together to transform molecular configurations into energy and force predictions through a structured computational pipeline. The Graph data structure provides the molecular representation, while the potential system handles the actual computation.
+
+| Stage | Input | Processing | Output |
+|-------|--------|------------|---------|
+| Graph Construction | Atomic positions, species | Neighbor list generation | `Graph` object |
+| Local Interactions | Graph edges | SO3krates neural network | Local energy/forces |
+| Long-Range Interactions | Graph edges_lr | Universal pairwise forces | Long-range energy/forces |
+| Aggregation | Component energies/forces | Sum and combine | Total energy/forces |
+
+## Integration Points
+
+The core components provide well-defined interfaces for integration with external frameworks and user applications:
+
+```mermaid
+graph LR
+    subgraph "External APIs"
+        ASECalc["So3lrCalculator"]
+        JAXMDPot["So3lrPotential"] 
+        DirectAPI["make_so3lr()"]
+    end
+    
+    subgraph "Core Interface"
+        PotentialFn["make_potential_fn()"]
+        GraphConv["Graph Construction"]
+        ForceEval["Force Evaluation"]
+    end
+    
+    subgraph "Internal Components"
+        GraphClass["Graph"]
+        MLFFPot["MLFFPotentialSparse"]
+        ParamData["Parameter Data"]
+    end
+    
+    ASECalc --> PotentialFn
+    JAXMDPot --> PotentialFn
+    DirectAPI --> PotentialFn
+    
+    PotentialFn --> GraphConv
+    PotentialFn --> ForceEval
+    
+    GraphConv --> GraphClass
+    ForceEval --> MLFFPot
+    MLFFPot --> ParamData
+```
+
+Sources: [so3lr/potential.py:7-29](), [so3lr/graph.py:26-36]()
+
+## Component Relationships
+
+The core components maintain specific dependencies and data flow patterns that ensure efficient computation while supporting the hybrid local/long-range interaction model:
+
+- The `Graph` class provides structured molecular data with separate representations for local and long-range interactions
+- The `make_potential_fn` function configures `MLFFPotentialSparse` instances with SO3LR-specific parameters
+- Long-range cutoffs and computational parameters are centralized in the potential factory function
+- Parameter data is loaded from the `so3lr/params/` directory during potential initialization
+
+For detailed technical specifications of the Graph data structure, see [Graph Data Structure](#5.1). For comprehensive documentation of potential function implementation, see [Potential Functions](#5.2).
+
+---
+
+# Page: Graph Data Structure
+
+# Graph Data Structure
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [so3lr/graph.py](so3lr/graph.py)
+- [so3lr/jraph_utils.py](so3lr/jraph_utils.py)
+- [so3lr/prepare_dimer_xyz.py](so3lr/prepare_dimer_xyz.py)
+
+</details>
+
+
+
+This document covers the Graph data structure used in SO3LR to represent molecular systems internally. The Graph class serves as the primary data container for atomic positions, connectivity, and molecular properties required for energy and force calculations. For information about the potential functions that operate on graphs, see [Potential Functions](#5.2).
+
+## Purpose and Core Structure
+
+The SO3LR Graph class is a namedtuple-based data structure that encapsulates all molecular information needed for ML force field evaluation. It bridges the gap between external molecular representations (ASE Atoms, XYZ files) and the internal format required by SO3krates neural networks and universal pairwise force fields.
+
+```mermaid
+classDiagram
+    class Graph {
+        +ndarray positions
+        +dict edges
+        +dict nodes  
+        +dict centers
+        +dict others
+        +ndarray mask
+        +float total_charge
+        +int num_unpaired_electrons
+        +dict edges_lr
+        +ndarray idx_i_lr
+        +ndarray idx_j_lr
+        +ndarray cell
+        +ndarray k_grid
+        +float k_smearing
+        +ndarray theory_mask
+        +ndarray residue_segments
+        +ndarray residue_charge
+        +__new__()
+    }
+    
+    class _GraphBase {
+        <<namedtuple>>
+        +tuple fields
+    }
+    
+    Graph --|> _GraphBase
+    
+    note for Graph "Immutable data structure\nfor molecular representation"
+```
+
+The Graph class inherits from a namedtuple base class defined in [so3lr/graph.py:3-24](), making it immutable and memory-efficient. The core constructor accepts both required and optional parameters, with several fields supporting specialized calculations like QM/MM hybrid methods and dimer binding energy evaluation.
+
+Sources: [so3lr/graph.py:1-36]()
+
+## Graph Fields and Data Organization
+
+The Graph structure organizes molecular data into several categories of fields:
+
+| Field Category | Fields | Purpose |
+|---|---|---|
+| **Geometric** | `positions`, `cell` | Atomic coordinates and periodic boundary conditions |
+| **Connectivity** | `edges`, `edges_lr`, `idx_i_lr`, `idx_j_lr` | Short-range and long-range interaction definitions |
+| **Atomic Properties** | `nodes`, `centers`, `others` | Per-atom features and embeddings |
+| **System Properties** | `total_charge`, `num_unpaired_electrons` | Global molecular properties |
+| **Computational** | `mask`, `k_grid`, `k_smearing` | Masking and k-space sampling parameters |
+| **Specialized** | `theory_mask`, `residue_segments`, `residue_charge` | QM/MM and dimer calculation support |
+
+```mermaid
+graph TB
+    subgraph "Graph Data Structure"
+        pos["positions<br/>Atomic Coordinates"]
+        edges["edges<br/>Short-range Connectivity"]
+        nodes["nodes<br/>Atomic Features"]
+        centers["centers<br/>Local Environments"] 
+        others["others<br/>Additional Properties"]
+        mask["mask<br/>Valid Atom Mask"]
+        
+        subgraph "Long-range Interactions"
+            edges_lr["edges_lr<br/>LR Edge Features"]
+            idx_i_lr["idx_i_lr<br/>LR Source Indices"]
+            idx_j_lr["idx_j_lr<br/>LR Target Indices"]
+        end
+        
+        subgraph "System Properties"
+            total_charge["total_charge<br/>Net Molecular Charge"]
+            unpaired["num_unpaired_electrons<br/>Spin Multiplicity Info"]
+            cell["cell<br/>Unit Cell Vectors"]
+        end
+        
+        subgraph "Optional Features"
+            k_grid["k_grid<br/>k-space Sampling"]
+            k_smearing["k_smearing<br/>Broadening Parameter"]
+            theory_mask["theory_mask<br/>QM/MM Region Mask"]
+            residue_segments["residue_segments<br/>Molecular Segments"]
+            residue_charge["residue_charge<br/>Per-segment Charges"]
+        end
+    end
+```
+
+Sources: [so3lr/graph.py:26-36]()
+
+## Graph Construction and Conversion
+
+The SO3LR system provides utilities for converting between different molecular representations through the `jraph_utils` module. The primary conversion pathway transforms ASE Atoms objects into jraph GraphsTuple format, which is then used to construct SO3LR Graph instances.
+
+```mermaid
+flowchart LR
+    subgraph "External Formats"
+        ase["ASE Atoms<br/>Standard Chemistry Format"]
+        xyz["XYZ/EXTXYZ Files<br/>Coordinate Files"]
+        jraph_in["jraph.GraphsTuple<br/>Input Format"]
+    end
+    
+    subgraph "Conversion Functions"
+        jraph_to_ase["jraph_to_ase_atoms()<br/>Extract molecular data"]
+        unbatch_fn["unbatch()<br/>Separate batched graphs"]
+        unbatch_np["unbatch_np()<br/>NumPy implementation"]
+    end
+    
+    subgraph "SO3LR Core"
+        graph["Graph<br/>SO3LR Data Structure"]
+        potential["Potential Functions<br/>Energy/Force Calculation"]
+    end
+    
+    xyz --> ase
+    jraph_in --> jraph_to_ase
+    jraph_in --> unbatch_fn
+    jraph_in --> unbatch_np
+    
+    jraph_to_ase --> ase
+    unbatch_fn --> graph
+    unbatch_np --> graph
+    ase --> graph
+    
+    graph --> potential
+```
+
+The `jraph_to_ase_atoms` function demonstrates the rich information preserved during conversion, extracting not only basic molecular properties but also SO3LR-specific computed quantities like forces, energies, and Hirshfeld ratios from the graph structure back to ASE format.
+
+Sources: [so3lr/jraph_utils.py:14-40](), [so3lr/jraph_utils.py:43-57]()
+
+## Batching and Unbatching Operations
+
+SO3LR implements sophisticated batching operations to handle multiple molecular systems efficiently. The unbatching functionality separates batched graphs while preserving the integrity of specialized fields used in dimer binding energy calculations.
+
+```mermaid
+flowchart TD
+    subgraph "Batched Graph Processing"
+        batched["Batched GraphsTuple<br/>Multiple molecules combined"]
+        
+        subgraph "Unbatching Strategy"
+            split_nodes["_map_split()<br/>Split node arrays"]
+            split_edges["_map_split()<br/>Split edge arrays"] 
+            split_globals["_map_split_globals()<br/>Handle global features"]
+        end
+        
+        subgraph "Index Correction"
+            node_offsets["node_offsets<br/>Cumulative node counts"]
+            edge_offsets["edge_offsets<br/>Cumulative edge counts"]
+            pairs_offsets["pairs_offsets<br/>Long-range pair offsets"]
+        end
+        
+        subgraph "Special Handling"
+            skip_fields["Skip Fields<br/>residue_charge, residue_segments"]
+            replicate["Replicate vs Split<br/>Dimer-specific logic"]
+        end
+    end
+    
+    subgraph "Output Graphs"
+        graph1["Graph 1<br/>Individual molecule"]
+        graph2["Graph 2<br/>Individual molecule"]
+        graphN["Graph N<br/>Individual molecule"]
+    end
+    
+    batched --> split_nodes
+    batched --> split_edges
+    batched --> split_globals
+    
+    split_nodes --> node_offsets
+    split_edges --> edge_offsets
+    split_globals --> skip_fields
+    
+    node_offsets --> graph1
+    edge_offsets --> graph2
+    skip_fields --> graphN
+```
+
+The unbatching process includes special logic for handling dimer binding energy calculations, where certain global fields like `residue_charge` and `residue_segments` are replicated rather than split across individual graphs. This ensures that molecular fragment information is preserved correctly when separating dimers into individual components.
+
+Sources: [so3lr/jraph_utils.py:60-133](), [so3lr/jraph_utils.py:78-102](), [so3lr/jraph_utils.py:112-114]()
+
+## Integration with Molecular Data Pipelines
+
+The Graph data structure integrates seamlessly with SO3LR's molecular data processing pipelines, particularly for specialized calculations like dimer binding energies. The system maintains molecular segment information through dedicated fields that support multi-fragment calculations.
+
+```mermaid
+graph TB
+    subgraph "Dimer Processing Pipeline"
+        dimer_xyz["Dimer XYZ Input<br/>selection_a, selection_b"]
+        monomer_info["get_monomer_info()<br/>Extract fragment data"]
+        translate["create_translated_dimer()<br/>10000 Å separation"]
+        properties["add_dimer_properties()<br/>Charge and segment info"]
+    end
+    
+    subgraph "Graph Construction"
+        atoms_orig["Original Atoms<br/>structure_type: dimer_original"]
+        atoms_trans["Translated Atoms<br/>structure_type: dimer_translated"]
+        graph_batch["Batched Graph<br/>Both configurations"]
+    end
+    
+    subgraph "Graph Fields for Dimers"
+        res_seg["residue_segments<br/>Fragment membership"]
+        res_charge["residue_charge<br/>Per-fragment charges"]
+        theory_mask_field["theory_mask<br/>Optional QM/MM regions"]
+    end
+    
+    dimer_xyz --> monomer_info
+    monomer_info --> translate
+    translate --> properties
+    properties --> atoms_orig
+    properties --> atoms_trans
+    
+    atoms_orig --> graph_batch
+    atoms_trans --> graph_batch
+    
+    graph_batch --> res_seg
+    graph_batch --> res_charge
+    graph_batch --> theory_mask_field
+```
+
+This integration supports SO3LR's ability to calculate dimer binding energies by maintaining fragment identity and charge information throughout the computational pipeline, enabling accurate interaction energy evaluation between molecular components.
+
+Sources: [so3lr/prepare_dimer_xyz.py:107-137](), [so3lr/prepare_dimer_xyz.py:49-81](), [so3lr/graph.py:29-36]()
+
+---
+
+# Page: Potential Functions
+
+# Potential Functions
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [so3lr/potential.py](so3lr/potential.py)
+- [tests/test_potential.py](tests/test_potential.py)
+
+</details>
+
+
+
+This page documents the SO3LR potential function system, which provides the core interface for creating and configuring molecular potentials. The potential functions combine SO3krates neural networks with universal pairwise force fields to enable energy and force calculations for molecular systems.
+
+For information about how potentials are used in molecular dynamics simulations, see [Command Line Interface](#2). For integration with external frameworks, see [Python API](#3).
+
+## Architecture Overview
+
+The SO3LR potential system is built around a factory function that creates `MLFFPotentialSparse` instances configured with SO3LR-specific parameters. This design allows for consistent potential creation across different usage contexts.
+
+### Potential Function Architecture
+
+```mermaid
+graph TB
+    subgraph "User Interfaces"
+        ASECalc["So3lrCalculator"]
+        JAXMDPot["So3lrPotential"]
+        DirectAPI["Direct API Usage"]
+    end
+    
+    subgraph "Potential Factory"
+        makePotentialFn["make_potential_fn()"]
+        ParamConfig["Parameter Configuration"]
+    end
+    
+    subgraph "MLFF Framework"
+        MLFFPotentialSparse["MLFFPotentialSparse"]
+        WorkdirLoader["Workdir Parameter Loader"]
+    end
+    
+    subgraph "SO3LR Parameters"
+        ParamsDir["so3lr/params/"]
+        SO3kratesWeights["SO3krates Neural Network Weights"]
+        UPFParams["Universal Pairwise Force Field Parameters"]
+    end
+    
+    subgraph "Long-range Configuration"
+        LRCutoff["lr_cutoff"]
+        DispersionDamping["dispersion_energy_cutoff_lr_damping"]
+        CoulombConfig["Coulomb/Ewald Settings"]
+    end
+    
+    ASECalc --> makePotentialFn
+    JAXMDPot --> makePotentialFn
+    DirectAPI --> makePotentialFn
+    
+    makePotentialFn --> ParamConfig
+    ParamConfig --> MLFFPotentialSparse
+    MLFFPotentialSparse --> WorkdirLoader
+    
+    WorkdirLoader --> ParamsDir
+    ParamsDir --> SO3kratesWeights
+    ParamsDir --> UPFParams
+    
+    ParamConfig --> LRCutoff
+    ParamConfig --> DispersionDamping
+    ParamConfig --> CoulombConfig
+```
+
+Sources: [so3lr/potential.py:1-30]()
+
+## Potential Function Factory
+
+The `make_potential_fn` function serves as the primary entry point for creating SO3LR potentials. It abstracts the complexity of parameter loading and configuration from end users.
+
+### Function Signature and Parameters
+
+The function accepts several key parameters for customizing potential behavior:
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `lr_cutoff` | 12.0 | Long-range interaction cutoff distance |
+| `dispersion_energy_cutoff_lr_damping` | 2.0 | Damping factor for dispersion energy cutoff |
+| `dtype` | `np.float32` | Numerical precision for calculations |
+| `coulomb_kspace_do_ewald` | `False` | Enable Ewald summation for Coulomb interactions |
+| `coulomb_kspace_interp_nodes` | 4 | Interpolation nodes for k-space Coulomb calculations |
+
+### Implementation Details
+
+The function implementation follows a straightforward pattern:
+
+1. **Parameter Directory Resolution**: Locates the SO3LR parameter directory relative to the package installation
+2. **MLFF Potential Creation**: Delegates to `MLFFPotentialSparse.create_from_workdir()` with SO3LR-specific configuration
+3. **Long-range Parameter Configuration**: Sets up long-range interaction parameters through the `long_range_kwargs` dictionary
+
+Sources: [so3lr/potential.py:7-29]()
+
+## Parameter Loading Mechanism
+
+The potential function relies on pre-trained parameters stored in the package directory structure. This design ensures that SO3LR potentials are immediately usable after installation without requiring separate parameter downloads.
+
+### Parameter Loading Flow
+
+```mermaid
+graph LR
+    subgraph "Package Structure"
+        PackageRoot["SO3LR Package Root"]
+        ParamsDir["so3lr/params/"]
+    end
+    
+    subgraph "Parameter Resolution"
+        PathResolution["pathlib.Path(__file__).parent.parent.resolve()"]
+        WorkdirPath["package_dir / 'so3lr' / 'params'"]
+    end
+    
+    subgraph "MLFF Loading"
+        CreateFromWorkdir["MLFFPotentialSparse.create_from_workdir()"]
+        FromFileFlag["from_file=True"]
+    end
+    
+    subgraph "Configuration"
+        LongRangeKwargs["long_range_kwargs"]
+        DtypeConfig["dtype configuration"]
+        AdditionalKwargs["**kwargs passthrough"]
+    end
+    
+    PackageRoot --> PathResolution
+    PathResolution --> WorkdirPath
+    WorkdirPath --> ParamsDir
+    
+    ParamsDir --> CreateFromWorkdir
+    CreateFromWorkdir --> FromFileFlag
+    
+    CreateFromWorkdir --> LongRangeKwargs
+    CreateFromWorkdir --> DtypeConfig
+    CreateFromWorkdir --> AdditionalKwargs
+```
+
+Sources: [so3lr/potential.py:15-18]()
+
+## Long-range Interaction Configuration
+
+The potential function configures several aspects of long-range interactions through the `long_range_kwargs` dictionary. This configuration is critical for proper handling of electrostatic and dispersion interactions beyond the neural network's local scope.
+
+### Long-range Parameter Mapping
+
+The function maps input parameters to the MLFF framework's expected configuration:
+
+- **`cutoff_lr`**: Maps from `lr_cutoff` parameter, controls the distance at which long-range interactions are truncated
+- **`dispersion_energy_cutoff_lr_damping`**: Direct passthrough for dispersion energy damping
+- **`neighborlist_format_lr`**: Fixed to `'ordered_sparse'` for efficient sparse matrix operations
+- **`coulomb_kspace_do_ewald`**: Controls whether Ewald summation is used for Coulomb interactions
+- **`coulomb_kspace_interp_nodes`**: Sets interpolation grid density for k-space calculations
+
+Sources: [so3lr/potential.py:20-26]()
+
+## Integration with MLFF Framework
+
+The SO3LR potential system builds upon the MLFF (Machine Learning Force Fields) framework, specifically using the `MLFFPotentialSparse` class for sparse matrix-based potential evaluation.
+
+### MLFF Integration Architecture
+
+```mermaid
+graph TB
+    subgraph "SO3LR Layer"
+        MakePotentialFn["make_potential_fn()"]
+        SO3LRParams["SO3LR-specific Parameters"]
+    end
+    
+    subgraph "MLFF Framework"
+        MLFFPotentialSparse["MLFFPotentialSparse"]
+        CreateFromWorkdir["create_from_workdir()"]
+        WorkdirLoader["Parameter Loading System"]
+    end
+    
+    subgraph "JAX Backend"
+        JAXArrays["JAX Arrays"]
+        JITCompilation["JIT Compilation"]
+        AutoDiff["Automatic Differentiation"]
+    end
+    
+    subgraph "Computational Graph"
+        EnergyCalc["Energy Calculation"]
+        ForceCalc["Force Calculation (via autodiff)"]
+        StressCalc["Stress Calculation"]
+    end
+    
+    MakePotentialFn --> SO3LRParams
+    SO3LRParams --> CreateFromWorkdir
+    CreateFromWorkdir --> MLFFPotentialSparse
+    MLFFPotentialSparse --> WorkdirLoader
+    
+    MLFFPotentialSparse --> JAXArrays
+    JAXArrays --> JITCompilation
+    JITCompilation --> AutoDiff
+    
+    AutoDiff --> EnergyCalc
+    AutoDiff --> ForceCalc
+    AutoDiff --> StressCalc
+```
+
+Sources: [so3lr/potential.py:4](), [so3lr/potential.py:17-29]()
+
+## Usage Patterns
+
+The potential function is designed to be used across different computational contexts, from interactive ASE calculations to large-scale JAX-MD simulations. The consistent interface allows for seamless integration regardless of the specific use case.
+
+### Common Usage Pattern
+
+```python
+# Basic potential creation
+potential = make_potential_fn()
+
+# Custom long-range cutoff
+potential = make_potential_fn(lr_cutoff=15.0)
+
+# High-precision calculations
+potential = make_potential_fn(dtype=np.float64)
+
+# Ewald summation enabled
+potential = make_potential_fn(coulomb_kspace_do_ewald=True)
+```
+
+The returned potential object provides the standard MLFF interface for energy and force evaluation, making it compatible with various molecular simulation frameworks.
+
+Sources: [so3lr/potential.py:7-29](), [tests/test_potential.py:4-5]()
+
+---
+
+# Page: Development and Testing
+
+# Development and Testing
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.github/workflows/CI.yml](.github/workflows/CI.yml)
+- [so3lr/__init__.py](so3lr/__init__.py)
+- [tests/test_ase.py](tests/test_ase.py)
+- [tests/test_readme.py](tests/test_readme.py)
+
+</details>
+
+
+
+This page covers the testing infrastructure, continuous integration pipeline, and development workflows for the SO3LR codebase. It provides guidance for contributors on running tests, understanding the test suite structure, and following development best practices.
+
+For information about the core SO3LR components being tested, see [Core Components](#5). For details about the API interfaces that tests validate, see [Python API](#3).
+
+## Testing Framework Overview
+
+SO3LR uses pytest as its primary testing framework, with tests organized to validate different integration points and core functionality. The test suite ensures correctness across ASE integration, JAX-MD compatibility, and direct API usage.
+
+### Test Suite Architecture
+
+```mermaid
+graph TB
+    subgraph "Test Categories"
+        ASETests["test_ase.py<br/>ASE Integration Tests"]
+        ReadmeTests["test_readme.py<br/>Documentation Example Tests"]
+        UnitTests["Unit Tests<br/>(Core Components)"]
+    end
+    
+    subgraph "Test Data"
+        MoleculeData["Test Molecules<br/>atat, dha, bb"]
+        WaterData["Water System<br/>water_64.xyz"]
+        ReferenceData["Reference Predictions<br/>.npz files"]
+    end
+    
+    subgraph "Integration Points"
+        ASECalc["So3lrCalculator<br/>ASE Interface"]
+        JAXMDPot["So3lrPotential<br/>JAX-MD Interface"]
+        DirectAPI["make_so3lr<br/>Direct API"]
+        MLFFCalc["mlffCalculatorSparse<br/>MLFF Integration"]
+    end
+    
+    subgraph "Validation Types"
+        EnergyVal["Energy Validation<br/>rtol=1e-6"]
+        ForceVal["Force Validation<br/>atol=1e-4"]
+        StressVal["Stress Validation<br/>Voigt notation"]
+    end
+    
+    ASETests --> ASECalc
+    ASETests --> MLFFCalc
+    ReadmeTests --> ASECalc
+    ReadmeTests --> JAXMDPot
+    
+    ASETests --> MoleculeData
+    ASETests --> WaterData
+    ReadmeTests --> MoleculeData
+    
+    ASECalc --> EnergyVal
+    ASECalc --> ForceVal
+    ASECalc --> StressVal
+    JAXMDPot --> EnergyVal
+    JAXMDPot --> ForceVal
+    MLFFCalc --> EnergyVal
+    MLFFCalc --> ForceVal
+    
+    MoleculeData --> ReferenceData
+    WaterData --> ReferenceData
+```
+
+**Sources:** [tests/test_ase.py:1-173](), [tests/test_readme.py:1-103](), [so3lr/__init__.py:1-8]()
+
+## Test Suite Components
+
+### ASE Integration Tests
+
+The ASE integration tests validate the `So3lrCalculator` class against reference data and ensure compatibility with the Atomic Simulation Environment.
+
+```mermaid
+graph LR
+    subgraph "Test Functions"
+        test_molecules["test_molecules()<br/>Parametrized: atat, dha, bb"]
+        test_water["test_water()<br/>Water 64 system"]
+        test_so3lr_ase["test_so3lr_ase_calculator()<br/>Direct SO3LR calculator"]
+        test_stress["test_so3lr_ase_calculator_stress()<br/>Stress calculation validation"]
+    end
+    
+    subgraph "Calculator Types"
+        MLFFCalc["mlffCalculatorSparse<br/>create_from_ckpt_dir()"]
+        So3lrCalc["So3lrCalculator<br/>Direct instantiation"]
+    end
+    
+    subgraph "Test Data Sources"
+        TestXYZ["test_data/*.xyz<br/>Molecular structures"]
+        RefNPZ["test_data/*_ase.npz<br/>Reference predictions"]
+        ParamsDir["so3lr/params/<br/>Model checkpoints"]
+    end
+    
+    subgraph "Assertions"
+        EnergyCheck["Energy: atol=1e-5, rtol=1e-6"]
+        ForceCheck["Forces: atol=1e-4"]
+        StressCheck["Stress: shape=(6,) Voigt"]
+        NonZeroCheck["Non-zero validation"]
+    end
+    
+    test_molecules --> MLFFCalc
+    test_water --> MLFFCalc
+    test_so3lr_ase --> So3lrCalc
+    test_stress --> So3lrCalc
+    
+    MLFFCalc --> ParamsDir
+    So3lrCalc --> ParamsDir
+    
+    test_molecules --> TestXYZ
+    test_water --> TestXYZ
+    test_so3lr_ase --> TestXYZ
+    test_stress --> TestXYZ
+    
+    test_molecules --> RefNPZ
+    test_water --> RefNPZ
+    test_so3lr_ase --> RefNPZ
+    
+    MLFFCalc --> EnergyCheck
+    MLFFCalc --> ForceCheck
+    So3lrCalc --> EnergyCheck
+    So3lrCalc --> ForceCheck
+    So3lrCalc --> StressCheck
+    So3lrCalc --> NonZeroCheck
+```
+
+**Sources:** [tests/test_ase.py:9-173]()
+
+#### Key Test Parameters
+
+| Test Function | Molecules | Tolerances | Special Features |
+|---------------|-----------|------------|------------------|
+| `test_molecules` | atat, dha, bb | Energy: rtol=1e-6, Forces: atol=1e-4 | Parametrized across molecules |
+| `test_water` | water_64 replicated 2x2x2 | Energy: rtol=1e-6, Forces: atol=5e-4 | Large system validation |
+| `test_so3lr_ase_calculator` | atat, dha, bb | Energy: atol=2e-5, Forces: atol=1e-4 | Direct SO3LR calculator |
+| `test_so3lr_ase_calculator_stress` | water_64 replicated | Stress shape: (6,) | Stress tensor validation |
+
+### Documentation Example Tests
+
+The README tests ensure that code examples in documentation remain functional and produce expected results.
+
+| Test Function | Purpose | Integration Point |
+|---------------|---------|-------------------|
+| `test_ase_example` | Validate ASE usage examples | `So3lrCalculator` |
+| `test_jax_md_example` | Validate JAX-MD usage examples | `So3lrPotential`, `to_jax_md` |
+
+**Sources:** [tests/test_readme.py:15-103]()
+
+## Continuous Integration Pipeline
+
+The CI pipeline runs on GitHub Actions and validates the codebase across different scenarios.
+
+```mermaid
+graph TD
+    subgraph "Trigger Events"
+        PushMain["Push to main branch"]
+        PullRequest["Pull request to main"]
+        ManualDispatch["Manual workflow dispatch"]
+    end
+    
+    subgraph "CI Environment"
+        UbuntuRunner["ubuntu-latest"]
+        Python312["Python 3.12"]
+        PipCache["Pip cache optimization"]
+    end
+    
+    subgraph "Build Steps"
+        Checkout["actions/checkout@v2"]
+        SetupPython["actions/setup-python@v2"]
+        CacheSetup["Cache pip dependencies"]
+        InstallDeps["pip install ."]
+        RunTests["pytest tests/"]
+    end
+    
+    subgraph "Test Execution"
+        AllTests["Execute full test suite"]
+        TestReport["Generate test reports"]
+    end
+    
+    PushMain --> UbuntuRunner
+    PullRequest --> UbuntuRunner
+    ManualDispatch --> UbuntuRunner
+    
+    UbuntuRunner --> Checkout
+    Checkout --> SetupPython
+    SetupPython --> Python312
+    Python312 --> CacheSetup
+    CacheSetup --> PipCache
+    PipCache --> InstallDeps
+    InstallDeps --> RunTests
+    
+    RunTests --> AllTests
+    AllTests --> TestReport
+```
+
+**Sources:** [.github/workflows/CI.yml:1-39]()
+
+### CI Configuration Details
+
+| Component | Configuration | Purpose |
+|-----------|---------------|---------|
+| Operating System | `ubuntu-latest` | Standard Linux environment |
+| Python Version | `3.12` | Latest supported Python |
+| Strategy | `fail-fast: false` | Continue testing other configurations on failure |
+| Cache | Pip cache with `setup.py` hash key | Accelerate dependency installation |
+| Test Command | `pytest tests/` | Execute full test suite |
+
+## Package Structure and Exports
+
+The main package initialization defines the public API surface that tests validate.
+
+```mermaid
+graph TB
+    subgraph "Package Exports"
+        So3lrCalculator["So3lrCalculator<br/>from ase_utils.make_ase_calculator"]
+        Graph["Graph<br/>from graph.Graph"]
+        to_jax_md["to_jax_md<br/>from jaxmd_utils.to_jax_md"]
+        So3lrPotential["So3lrPotential<br/>from potential.make_potential_fn"]
+        So3lr["So3lr<br/>from base_calculator.make_so3lr"]
+    end
+    
+    subgraph "Internal Modules"
+        ase_utils["ase_utils.py"]
+        graph_module["graph.py"]
+        jaxmd_utils["jaxmd_utils.py"]
+        potential_module["potential.py"]
+        base_calculator["base_calculator.py"]
+    end
+    
+    subgraph "Test Coverage"
+        ASETests["ASE Integration Tests"]
+        JAXMDTests["JAX-MD Integration Tests"]
+        GraphTests["Graph Data Structure Tests"]
+        PotentialTests["Potential Function Tests"]
+    end
+    
+    So3lrCalculator --> ase_utils
+    Graph --> graph_module
+    to_jax_md --> jaxmd_utils
+    So3lrPotential --> potential_module
+    So3lr --> base_calculator
+    
+    So3lrCalculator --> ASETests
+    to_jax_md --> JAXMDTests
+    Graph --> GraphTests
+    So3lrPotential --> PotentialTests
+    So3lr --> PotentialTests
+```
+
+**Sources:** [so3lr/__init__.py:1-8]()
+
+## Test Data Management
+
+### Reference Data Structure
+
+The test suite uses pre-computed reference data to validate model predictions:
+
+| Data Type | File Pattern | Contents | Usage |
+|-----------|--------------|----------|-------|
+| Molecular Structures | `test_data/{name}.xyz` | Atomic coordinates | Input for calculations |
+| Reference Predictions | `test_data/{name}_ase.npz` | Energy and force arrays | Validation targets |
+| Model Parameters | `so3lr/params/` | Trained model checkpoints | Calculator initialization |
+
+### Test Molecules
+
+| Molecule | Description | Test Coverage |
+|----------|-------------|---------------|
+| `atat` | Small organic molecule | ASE and JAX-MD integration |
+| `dha` | Molecular system | ASE and JAX-MD integration |
+| `bb` | Test structure | ASE and JAX-MD integration |
+| `water_64` | Water cluster (64 molecules) | Large system validation, stress testing |
+
+**Sources:** [tests/test_ase.py:13-15](), [tests/test_ase.py:58-62](), [tests/test_readme.py:21-22]()
+
+## Development Workflow
+
+### Running Tests Locally
+
+```bash
+# Install package in development mode
+pip install -e .
+
+# Run full test suite
+pytest tests/
+
+# Run specific test categories
+pytest tests/test_ase.py
+pytest tests/test_readme.py
+
+# Run with verbose output
+pytest tests/ -v
+
+# Run specific test function
+pytest tests/test_ase.py::test_molecules -v
+```
+
+### Test Validation Tolerances
+
+The test suite uses carefully chosen tolerances to balance numerical precision with practical robustness:
+
+| Property | Absolute Tolerance | Relative Tolerance | Context |
+|----------|-------------------|-------------------|---------|
+| Energy | 1e-5 to 2e-5 | 1e-6 | Single precision calculations |
+| Forces | 1e-4 to 5e-4 | - | Force accuracy requirements |
+| Stress | - | - | Shape validation (6,) Voigt notation |
+
+### Adding New Tests
+
+When contributing new functionality:
+
+1. **Add test data**: Place molecular structures in `tests/test_data/`
+2. **Generate references**: Create corresponding `.npz` files with expected outputs
+3. **Write test functions**: Follow existing patterns in `test_ase.py` or `test_readme.py`
+4. **Validate tolerances**: Use appropriate numerical tolerances for the test case
+5. **Update CI**: Ensure new tests are covered by the CI pipeline
+
+**Sources:** [tests/test_ase.py:34-45](), [tests/test_ase.py:119-130](), [.github/workflows/CI.yml:34-37]()

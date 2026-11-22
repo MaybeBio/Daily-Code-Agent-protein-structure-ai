@@ -1,0 +1,179 @@
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { expect, it, vi } from "vitest";
+import type { Health } from "../types";
+import { RuntimeStatus } from "./RuntimeStatus";
+
+const health: Health = {
+  version: "test",
+  platform: { name: "X-DDE", ready: true },
+  worker_ready: true,
+  worker_error: null,
+  engine: { ready: false, gpu: null, reason: "OpenDDE missing" },
+  engines: {
+    opendde: {
+      id: "opendde",
+      name: "OpenDDE",
+      description: "结构预测 / Structures",
+      execution_backend: "docker",
+      operations: ["predict"],
+      ready: false,
+      reason: "OpenDDE missing",
+    },
+    diffsbdd: {
+      id: "diffsbdd",
+      name: "DiffSBDD",
+      description: "分子设计 / Molecular design",
+      execution_backend: "local_process",
+      operations: ["diffsbdd"],
+      ready: true,
+      models: { model1: true, model2: false },
+    },
+    harness: {
+      id: "harness",
+      name: "OpenDDE Harness",
+      description: "科学工具 / Scientific tools",
+      execution_backend: "harness_process",
+      operations: ["harness"],
+      ready: true,
+      compute_configured: false,
+    },
+  },
+  free_disk_gib: 100,
+  disk_total_gib: 200,
+  capabilities: { prediction: true, msa: true, templates: true, llm: false },
+};
+
+it("shows an available X-DDE server independently of its scientific engines", () => {
+  const setup = vi.fn();
+  render(
+    <RuntimeStatus
+      language="zh"
+      health={health}
+      connectionError={false}
+      onRefresh={vi.fn()}
+      onSetup={setup}
+    />,
+  );
+  expect(screen.getByRole("heading", { name: "工作台服务" })).toBeVisible();
+  expect(screen.getByText("平台服务就绪", { exact: true })).toBeVisible();
+  const open = screen.getByRole("row", { name: /结构与复合物预测/ });
+  const diff = screen.getByRole("row", { name: /小分子生成与优化/ });
+  expect(within(open).getByText("环境未就绪", { exact: true })).toBeVisible();
+  expect(within(diff).getByText("环境检查通过", { exact: true })).toBeVisible();
+  expect(within(diff).getByText("1 / 2", { exact: true })).toBeInTheDocument();
+  expect(screen.queryByText("OpenDDE 后端", { exact: true })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "管理集成环境" }));
+  expect(setup).toHaveBeenCalledOnce();
+});
+
+it("does not confuse the Harness client with its remote compute service", () => {
+  render(
+    <RuntimeStatus
+      language="en"
+      health={health}
+      connectionError={false}
+      onRefresh={vi.fn()}
+      onSetup={vi.fn()}
+    />,
+  );
+  const harness = screen.getByRole("row", { name: /Protein & antibody tools/ });
+  expect(
+    within(harness).getByText("Compute setup required", { exact: true }),
+  ).toBeVisible();
+  expect(within(harness).getByText("Compute setup required")).toHaveClass(
+    "failed",
+  );
+  expect(
+    screen.getAllByRole("button", { name: "Manage integrated environments" }),
+  ).toHaveLength(1);
+  expect(screen.getByText("Workbench service", { exact: true })).toBeVisible();
+});
+
+it("shows a loading state before the server responds", () => {
+  render(
+    <RuntimeStatus
+      language="zh"
+      health={null}
+      connectionError={false}
+      onRefresh={vi.fn()}
+      onSetup={vi.fn()}
+    />,
+  );
+  expect(screen.getByText("正在连接 X-DDE…", { exact: true })).toBeVisible();
+  expect(screen.queryByText("平台服务就绪", { exact: true })).toBeNull();
+  expect(screen.queryByRole("searchbox")).toBeNull();
+});
+
+it("marks stale readiness after disconnection and provides reconnect", () => {
+  const refresh = vi.fn();
+  render(
+    <RuntimeStatus
+      language="en"
+      health={health}
+      connectionError
+      onRefresh={refresh}
+      onSetup={vi.fn()}
+    />,
+  );
+  expect(
+    screen
+      .getAllByRole("alert")
+      .some((node) => node.textContent?.includes("Connection to X-DDE lost")),
+  ).toBe(true);
+  expect(
+    screen.queryByText("Platform service ready", { exact: true }),
+  ).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Reconnect" }));
+  expect(refresh).toHaveBeenCalledOnce();
+});
+
+it("can inspect existing server snapshots without inventing engine availability", () => {
+  render(
+    <RuntimeStatus
+      language="zh"
+      health={{ ...health, engines: undefined, platform: undefined }}
+      connectionError={false}
+      onRefresh={vi.fn()}
+      onSetup={vi.fn()}
+    />,
+  );
+  expect(screen.getByText("平台服务就绪", { exact: true })).toBeVisible();
+  expect(screen.getByRole("row", { name: /结构与复合物预测/ })).toBeVisible();
+  expect(screen.queryByRole("row", { name: /小分子生成与优化/ })).toBeNull();
+});
+
+it.each([
+  [
+    "en",
+    "Search integrated environments",
+    " DIFFSBDD ",
+    "No matching environments.",
+  ],
+  ["zh", "搜索集成环境", "小分子生成", "没有匹配的集成环境。"],
+] as const)(
+  "filters the runtime catalogue by software or research use in %s",
+  (language, name, query, empty) => {
+    render(
+      <RuntimeStatus
+        language={language}
+        health={health}
+        connectionError={false}
+        onRefresh={vi.fn()}
+        onSetup={vi.fn()}
+      />,
+    );
+    const search = screen.getByRole("searchbox", { name });
+    fireEvent.change(search, { target: { value: query } });
+    const rows = screen.getAllByRole("row");
+    expect(rows).toHaveLength(2);
+    expect(within(rows[1]).getByRole("rowheader")).toHaveTextContent(
+      "DiffSBDD",
+    );
+    expect(within(rows[1]).getByText("1 / 2")).toBeVisible();
+    fireEvent.change(search, { target: { value: "no-such-environment" } });
+    expect(screen.queryByRole("table")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(empty);
+    fireEvent.change(search, { target: { value: "" } });
+    expect(screen.getAllByRole("row")).toHaveLength(4);
+  },
+);

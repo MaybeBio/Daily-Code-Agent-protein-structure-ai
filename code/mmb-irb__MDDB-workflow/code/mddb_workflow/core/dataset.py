@@ -1,0 +1,2046 @@
+from mddb_workflow.utils.auxiliar import InputError, load_yaml, load_json, save_yaml, save_json, is_glob, get_available_cpus
+from mddb_workflow.utils.cache import Cache
+from mddb_workflow.utils.file import File
+from mddb_workflow.utils.constants import CACHE_FILENAME, ACCEPTED_INPUT_FILENAMES, REGISTER_FILENAME
+from mddb_workflow.utils.loader import Loader
+from mddb_workflow.utils.type_hints import *
+import pandas as pd
+import subprocess
+import jinja2
+import yaml
+import time
+import os
+import tempfile
+import hashlib
+import glob
+import fnmatch
+import sqlite3
+import sys
+import threading
+import shutil
+from pathlib import Path
+from collections import deque
+from enum import Enum
+from contextlib import contextmanager
+import importlib.util
+import random
+
+JOB_SCRIPT_FILENAME = 'mwf_slurm_job.sh'
+
+
+def _stream_output(stream, log_file_handle, output_stream):
+    """Stream output from subprocess to both log file and terminal."""
+    for line in stream:
+        output_stream.write(line)
+        output_stream.flush()
+        log_file_handle.write(line)
+        log_file_handle.flush()
+
+
+# Substrings of sqlite3 errors that can be transient when several processes (possibly on different
+# nodes of a parallel filesystem like BeeGFS/NFS) access the same database at the same time
+_TRANSIENT_SQLITE_ERRORS = (
+    'database is locked',
+    'unable to open database file',
+    'database disk image is malformed',
+    'disk i/o error',
+)
+
+
+def _is_transient_sqlite_error(error: Exception) -> bool:
+    """Return whether a sqlite3 error is likely caused by concurrent access and worth retrying."""
+    if not isinstance(error, sqlite3.DatabaseError):
+        return False
+    message = str(error).lower()
+    return any(transient in message for transient in _TRANSIENT_SQLITE_ERRORS)
+
+
+class State(Enum):
+    """Enumeration of possible workflow states."""
+    NEW = 'new'
+    WAITING = 'waiting'
+    RUNNING = 'running'
+    ERROR = 'error'
+    DONE = 'done'
+
+
+class DatabaseLock:
+    """Directory-based locking for SQLite database access on distributed filesystems.
+
+    Uses os.mkdir() which is atomic across distributed filesystems like NFS and BeeGFS.
+    This provides reliable locking where fcntl.flock() fails on network filesystems.
+    The lock directory is created next to the database so all nodes share it. Only when that
+    directory is not writable it falls back to the node-local temporary directory.
+
+    Note: This implementation uses exclusive locking for both read and write operations
+    to ensure consistency on distributed filesystems. While this is more conservative
+    than true reader-writer locks, it guarantees correctness across all nodes.
+    """
+
+    def __init__(self, db_path: str | Path, timeout: float = 30.0, retry_interval: float = 0.1):
+        """Initialize the database lock.
+
+        Args:
+            db_path: Path to the SQLite database file.
+            timeout: Maximum time to wait for lock acquisition (seconds).
+            retry_interval: Time between lock acquisition attempts (seconds).
+
+        """
+        self.db_path = Path(db_path).resolve()
+        self.lock_dir = self._path_to_lock_dir(self.db_path)
+        self.timeout = timeout
+        self.retry_interval = retry_interval
+        self._lock_count = 0  # For reentrant locking
+        self._current_lock_type = None
+
+    @staticmethod
+    def _path_to_lock_dir(db_path: str | Path) -> Path:
+        """Get the lock directory path for a given database path."""
+        db_path = Path(db_path).resolve()
+        # Save the lock next to the database so it is shared by all nodes of a distributed filesystem
+        # This is what keeps concurrent SLURM jobs running in different nodes from corrupting each other's reads
+        if os.access(db_path.parent, os.W_OK):
+            return db_path.with_name('.lock_' + db_path.name)
+        # Otherwise save the lock in the /tmp directory, which is local to this node
+        # This allows to use the dataset command in directories you don't have writting permissions
+        # And this is useful if you want to make a 'mwf dataset status' in the directory of a coworker
+        path_hash = hashlib.md5(str(db_path).encode()).hexdigest()[:8]
+        lock_name = f".lock_{db_path.name}_{path_hash}"
+        return Path(tempfile.gettempdir()) / lock_name
+
+    def acquire(self) -> bool:
+        """Acquire the database lock using atomic directory creation."""
+        # Handle reentrant locking
+        if self._lock_count > 0:
+            self._lock_count += 1
+            return True
+
+        start_time = time.time()
+        while True:
+            try:
+                # os.mkdir is atomic across distributed filesystems
+                os.mkdir(self.lock_dir)
+                self._lock_count = 1
+                break
+            except FileExistsError:
+                if time.time() - start_time >= self.timeout:
+                    raise TimeoutError(f"Could not acquire lock on {self.lock_dir} within {self.timeout} seconds")
+                time.sleep(self.retry_interval)
+            except OSError as e:
+                # Handle other OS errors (permission denied, etc.)
+                raise RuntimeError(f"Failed to acquire lock: {e}") from e
+
+    def release(self):
+        """Release the database lock by removing the lock directory."""
+        if self._lock_count > 0:
+            self._lock_count -= 1
+            if self._lock_count == 0:
+                try:
+                    os.rmdir(self.lock_dir)
+                except FileNotFoundError:
+                    pass  # Lock was already released (shouldn't happen normally)
+                except OSError as e:
+                    # Log warning but don't raise - lock file might be stale
+                    import warnings
+                    warnings.warn(f"Failed to release lock directory {self.lock_dir}: {e}")
+                self._current_lock_type = None
+
+    def force_release(self):
+        """Force release the lock, useful for cleaning up stale locks.
+
+        Use with caution - only call this if you're sure no other process holds the lock.
+        """
+        try:
+            os.rmdir(self.lock_dir)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        self._lock_count = 0
+        self._current_lock_type = None
+
+    def is_locked(self) -> bool:
+        """Check if the lock is currently held by any process."""
+        return self.lock_dir.exists()
+
+    def close(self):
+        """Release any held locks."""
+        while self._lock_count > 0:
+            self.release()
+
+    def __del__(self):
+        """Ensure lock is released on garbage collection."""
+        self.close()
+
+    @contextmanager
+    def lock_file(self):
+        """Context manager for acquiring an exclusive lock."""
+        self.acquire()
+        try:
+            yield
+        finally:
+            self.release()
+
+
+class Dataset:
+    """Class to manage and process a dataset of MDDB projects and their MDs (replicas/subprojects) using a central SQLite database."""
+    common_columns = ['state', 'message', 'process_id', 'slurm_job_id', 'last_modified']
+    project_columns = ['uuid', 'rel_path', 'num_mds'] + common_columns
+    md_columns = ['uuid', 'project_uuid', 'rel_path'] + common_columns
+    date_format = "%H:%M:%S %d-%m-%Y"
+    # Retries when opening the database fails due to concurrent access (jittered exponential backoff)
+    open_retries = 8
+    open_retry_base_delay = 0.2
+    open_retry_max_delay = 10.0
+
+    def __init__(self, dataset_path: str = 'mwf_ds.sql', lock_timeout: float = 30.0, create: bool = False):
+        """Initialize the Dataset object and connect to SQLite DB.
+
+        Args:
+            dataset_path (str): Path to the dataset storage file, normally an .db file.
+            lock_timeout (float): Maximum time to wait for database lock (seconds).
+            create (bool): Create the dataset file if it does not exist yet.
+
+        """
+        self.dataset_path = Path(dataset_path).resolve()
+        self.root_path = self.dataset_path.parent
+        if not self.root_path.is_dir():
+            raise InputError(f'Dataset file not found at {self.dataset_path}\n'
+                f'  The directory {self.root_path} does not exist')
+        if not create and not self.dataset_path.exists():
+            raise InputError(f'Dataset file not found at {self.dataset_path}')
+        self._lock = DatabaseLock(self.dataset_path, timeout=lock_timeout)
+        self.conn = None
+        self._retry_transient(self._open)
+
+    def _open(self):
+        """(Re)connect to the database and make sure the schema is up to date."""
+        # Always start from a fresh connection so no stale page cache survives a failed attempt
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+        self.conn = sqlite3.connect(self.dataset_path, check_same_thread=False)
+        # Enable foreign key constraints (disabled by default in SQLite)
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self._ensure_tables()
+
+    def _retry_transient(self, func):
+        """Call func, retrying with jittered exponential backoff on transient sqlite3 errors."""
+        for attempt in range(self.open_retries + 1):
+            try:
+                return func()
+            except sqlite3.DatabaseError as e:
+                if attempt == self.open_retries or not _is_transient_sqlite_error(e):
+                    raise
+                delay = min(self.open_retry_base_delay * 2 ** attempt, self.open_retry_max_delay)
+                time.sleep(delay * random.uniform(0.5, 1.5))
+
+    @property
+    def locked_storage_file(self):
+        """Context manager for shared (read/write) database access."""
+        return self._lock.lock_file()
+
+    def close(self):
+        """Close the database connection and release locks."""
+        self._lock.close()
+        if self.conn:
+            self.conn.close()
+
+    def _abs_to_rel(self, abs_path: str | Path) -> str:
+        """Convert any path to relative path from root_path."""
+        abs_path = Path(abs_path).resolve()
+        return os.path.relpath(str(abs_path), start=str(self.root_path))
+
+    def _rel_to_abs(self, rel_path: str | Path) -> str:
+        """Convert any path to absolute path from root_path."""
+        rel_path = Path(rel_path)
+        return str((self.root_path / rel_path).resolve())
+
+    def _ensure_tables(self):
+        """Create tables if they do not exist."""
+        with self.locked_storage_file:
+            cur = self.conn.cursor()
+            # Create projects table
+            # - uuid allows to track projects even if they are moved
+            # - rel_path is unique so in case of collision we update the uuid
+            #   This can happen when ressetting the cache
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS projects (
+                    uuid TEXT PRIMARY KEY NOT NULL,
+                    rel_path TEXT UNIQUE NOT NULL,
+                    num_mds INTEGER DEFAULT 0,
+                    state TEXT,
+                    message TEXT,
+                    process_id INTEGER,
+                    slurm_job_id TEXT,
+                    last_modified TEXT
+                )
+            ''')
+            # Create mds table
+            # MDs are linked to projects via project_uuid foreign key
+            # ON DELETE CASCADE ensures MDs are deleted when project is deleted
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS mds (
+                    uuid TEXT PRIMARY KEY NOT NULL,
+                    project_uuid TEXT NOT NULL,
+                    rel_path TEXT UNIQUE NOT NULL,
+                    state TEXT,
+                    message TEXT,
+                    process_id INTEGER,
+                    slurm_job_id TEXT,
+                    last_modified TEXT,
+                    FOREIGN KEY (project_uuid) REFERENCES projects(uuid) ON DELETE CASCADE
+                )
+            ''')
+            # Create settings table
+            # Values passed once to the dataset commands are saved here so they do not have to be passed again
+            cur.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT
+                )
+            ''')
+
+            # Backward compatibility: add runtime tracking columns to existing databases.
+            self._ensure_column_exists(cur, 'projects', 'process_id', 'INTEGER')
+            self._ensure_column_exists(cur, 'projects', 'slurm_job_id', 'TEXT')
+            self._ensure_column_exists(cur, 'mds', 'process_id', 'INTEGER')
+            self._ensure_column_exists(cur, 'mds', 'slurm_job_id', 'TEXT')
+
+            # Create triggers to automatically maintain num_mds count
+            # Trigger on INSERT: increment num_mds when a new MD is added
+            cur.execute('''
+                CREATE TRIGGER IF NOT EXISTS increment_num_mds
+                AFTER INSERT ON mds
+                BEGIN
+                    UPDATE projects
+                    SET num_mds = num_mds + 1
+                    WHERE uuid = NEW.project_uuid;
+                END
+            ''')
+
+            # Trigger on DELETE: decrement num_mds when an MD is removed
+            cur.execute('''
+                CREATE TRIGGER IF NOT EXISTS decrement_num_mds
+                AFTER DELETE ON mds
+                BEGIN
+                    UPDATE projects
+                    SET num_mds = num_mds - 1
+                    WHERE uuid = OLD.project_uuid;
+                END
+            ''')
+
+            self.conn.commit()
+
+    def _get_setting(self, key: str) -> str | None:
+        """Get a value saved in the dataset settings, or None if it was never saved."""
+        with self.locked_storage_file:
+            cur = self.conn.cursor()
+            cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cur.fetchone()
+        return row[0] if row else None
+
+    def _set_setting(self, key: str, value: str):
+        """Save a value in the dataset settings."""
+        with self.locked_storage_file:
+            cur = self.conn.cursor()
+            cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+            self.conn.commit()
+
+    @staticmethod
+    def _ensure_column_exists(cur: sqlite3.Cursor, table: str, column: str, column_type: str):
+        """Add a column to an existing table if it doesn't exist."""
+        cur.execute(f"PRAGMA table_info({table})")
+        columns = {row[1] for row in cur.fetchall()}
+        if column not in columns:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+    @staticmethod
+    def _is_pid_running(process_id: int | str | None) -> bool | None:
+        """Return whether a PID is alive in the current host namespace."""
+        if process_id in (None, ''):
+            return None
+        try:
+            pid = int(process_id)
+        except (TypeError, ValueError):
+            return None
+        if pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _check_active_slurm_jobs(job_ids: list[str]) -> dict[str, bool]:
+        """Check active SLURM jobs with a single squeue call.
+
+        Returns an empty dict if squeue is unavailable or fails.
+        """
+        unique_job_ids = sorted({str(job_id).strip() for job_id in job_ids if str(job_id).strip()})
+        if not unique_job_ids:
+            return {}
+        if shutil.which('squeue') is None:
+            return {}
+
+        cmd = ['squeue', '-h', '-o', '%A', '-j', ','.join(unique_job_ids)]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return {}
+
+        if result.returncode != 0:
+            # When none of the requested jobs is known anymore squeue fails with this error
+            if 'invalid job id' in result.stderr.lower():
+                return {job_id: False for job_id in unique_job_ids}
+            return {}
+
+        active_jobs = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        return {job_id: job_id in active_jobs for job_id in unique_job_ids}
+
+    def _is_running_entry_active(self, process_id: int | str | None, slurm_job_id: str | None, active_slurm_jobs: dict[str, bool]) -> bool | None:
+        """Determine whether a RUNNING entry is still active."""
+        slurm_value = str(slurm_job_id).strip() if slurm_job_id else ''
+        if slurm_value and slurm_value in active_slurm_jobs:
+            return active_slurm_jobs[slurm_value]
+
+        pid_state = self._is_pid_running(process_id)
+        if pid_state is not None:
+            return pid_state
+
+        return None
+
+    @staticmethod
+    def _stale_waiting_message(slurm_job_id: str) -> str:
+        """Build a clear status message for submitted jobs which never started the workflow."""
+        return (
+            f"SLURM job {slurm_job_id} is no longer in the queue but the workflow never started. "
+            "Likely cancelled while pending or failed before running the workflow (check the logs)."
+        )
+
+    @staticmethod
+    def _stale_running_message(process_id: int | str | None, slurm_job_id: str | None) -> str:
+        """Build a clear status message for externally terminated jobs."""
+        details = []
+        if process_id not in (None, ''):
+            details.append(f"pid={process_id}")
+        if slurm_job_id not in (None, ''):
+            details.append(f"slurm_job_id={slurm_job_id}")
+        details_text = f" ({', '.join(details)})" if details else ''
+        return (
+            f"Workflow process is no longer running{details_text}. "
+            "Likely terminated externally (e.g. SLURM time limit, OOM, or manual cancellation)."
+        )
+
+    def _refresh_running_entries(self, scopes: list[str] | None = None):
+        """Mark stale RUNNING/WAITING entries as ERROR when backing process/job no longer exists."""
+        scopes = scopes or ['projects', 'mds']
+        running_entries: list[tuple[str, dict]] = []
+
+        for table in scopes:
+            cols = self.project_columns if table == 'projects' else self.md_columns
+            for row in self.query_table(table, query_state=[State.RUNNING.value, State.WAITING.value]):
+                running_entries.append((table, dict(zip(cols, row))))
+
+        if not running_entries:
+            return
+
+        slurm_job_ids = [entry['slurm_job_id'] for _, entry in running_entries if entry.get('slurm_job_id')]
+        active_slurm_jobs = self._check_active_slurm_jobs(slurm_job_ids)
+
+        for table, entry in running_entries:
+            is_active = self._is_running_entry_active(
+                entry.get('process_id'),
+                entry.get('slurm_job_id'),
+                active_slurm_jobs,
+            )
+            if is_active is False:
+                if entry['state'] == State.WAITING.value:
+                    message = self._stale_waiting_message(entry['slurm_job_id'])
+                else:
+                    message = self._stale_running_message(entry.get('process_id'), entry.get('slurm_job_id'))
+                self.update_status(
+                    uuid=entry['uuid'],
+                    project_uuid=entry.get('project_uuid') if table == 'mds' else None,
+                    state=State.ERROR,
+                    message=message,
+                )
+
+    def get_registered_uuids(self, rel_path: str, is_md: bool) -> tuple[str, str | None] | None:
+        """Get the UUID (and project UUID for MDs) registered in the database for a relative path.
+
+        Returns None if the path is not registered.
+        """
+        with self.locked_storage_file:
+            cur = self.conn.cursor()
+            if is_md:
+                cur.execute("SELECT uuid, project_uuid FROM mds WHERE rel_path=?", (rel_path,))
+                row = cur.fetchone()
+                return (row[0], row[1]) if row else None
+            cur.execute("SELECT uuid FROM projects WHERE rel_path=?", (rel_path,))
+            row = cur.fetchone()
+            return (row[0], None) if row else None
+
+    def _read_uuid_from_cache(self, directory: str, make_uuid: bool = False, project_uuid: str = None) -> tuple[str, str | None]:
+        """Read UUID and project_uuid from cache file in the given directory."""
+        directory = Path(directory).resolve()
+        if not directory.exists():
+            raise ValueError(f"Directory {directory} does not exist.")
+        cache_file = directory / CACHE_FILENAME
+        if cache_file.exists():
+            cache = load_json(cache_file)
+            uuid = cache.get('uuid')
+            project_uuid = cache.get('project_uuid')
+            if uuid:
+                return uuid, project_uuid
+        if make_uuid:
+            # If the cache was lost but the directory is already registered then keep its UUID
+            # Otherwise a new UUID would replace the registered entry and its MDs
+            registered = self.get_registered_uuids(self._abs_to_rel(directory), is_md=project_uuid is not None)
+            registered_uuid = None
+            if registered:
+                registered_uuid, registered_project_uuid = registered
+                if project_uuid is not None and registered_project_uuid != project_uuid:
+                    raise ValueError(f"MD {self._abs_to_rel(directory)} is registered under project UUID "
+                                     f"'{registered_project_uuid}' but its parent project has UUID '{project_uuid}'")
+            cache = Cache(File(str(cache_file)), project_uuid=project_uuid, uuid=registered_uuid)
+            uuid = cache.retrieve('uuid')
+            project_uuid = cache.retrieve('project_uuid')
+            return uuid, project_uuid
+        return None, None
+
+    def add_project(self, directory: str, make_uuid: bool = False, verbose: bool = False):
+        """Add a single project entry to the database."""
+        uuid, _ = self._read_uuid_from_cache(directory, make_uuid=make_uuid)
+        rel_path = self._abs_to_rel(directory)
+        if not self.get_uuid_status(uuid):
+            if verbose:
+                print(f"Adding project: {rel_path} (UUID: {uuid})")
+            self.update_status(uuid, state=State.NEW, message='No information recorded yet.', rel_path=rel_path)
+
+    def add_md(self, directory: str, make_uuid: bool = False, verbose: bool = False):
+        """Add a single MD entry to the database."""
+        # Get the project UUID from the parent directory in case is not already cached
+        project_uuid, _ = self._read_uuid_from_cache(Path(directory).parent.as_posix())
+        if not project_uuid:
+            raise ValueError(f"Directory '{Path(directory).name}' is not inside a valid project directory")
+        # Ensure the parent project exists in the DB before adding MD
+        if not self.get_uuid_status(project_uuid):
+            raise ValueError(f"Project with UUID '{project_uuid}' does not exist in the database. Add the project first.")
+        # Get MD UUID and add the project_uuid
+        uuid, _ = self._read_uuid_from_cache(directory, make_uuid, project_uuid)
+        rel_path = self._abs_to_rel(directory)
+        if not project_uuid:
+            raise ValueError(f"Directory '{directory}' does not appear to be an MD")
+        if not self.get_uuid_status(uuid, project_uuid):
+            if verbose:
+                print(f"Adding MD: {rel_path} (UUID: {uuid}, Project UUID: {project_uuid})")
+            self.update_status(uuid, state=State.NEW, message='No information recorded yet.', project_uuid=project_uuid, rel_path=rel_path)
+
+    def add_entries(self,
+        paths_or_globs: list[str] | str,
+        ignore_dirs: list[str] | str = [],
+        md_dirs: list[str] | str = [],
+        verbose: bool = True,
+    ):
+        """Add multiple project and MD entries to the database from given paths or glob patterns.
+
+        Args:
+            paths_or_globs (list[str]): List of directory paths or glob patterns to search for projects.
+            ignore_dirs (list[str]): List of directory paths or glob patterns to ignore.
+            md_dirs (list[str]): List of directory paths or glob patterns to identify MDs within each project.
+            verbose (bool): Whether to print verbose output.
+
+        """
+        # Normalize str inputs to lists
+        paths_or_globs = _type_check_dir_list(paths_or_globs)
+        ignore_dirs = _type_check_dir_list(ignore_dirs)
+        md_dirs = _type_check_dir_list(md_dirs)
+
+        project_directories = _resolve_directory_patterns(paths_or_globs)
+        ignore_dirs = _resolve_directory_patterns(ignore_dirs)
+        for project_dir in project_directories:
+            rel_path = self._abs_to_rel(project_dir)
+            if project_dir in ignore_dirs:
+                if verbose: print(f"Ignoring project: {rel_path}")
+                continue
+            if not project_dir.exists():
+                if verbose: print(f"Warning: Project directory {rel_path} does not exist. Skipping.")
+                continue
+            # Add project row (num_mds will be set automatically by triggers when MDs are added)
+            self.add_project(project_dir, make_uuid=True, verbose=verbose)
+            # Count MDs in this project
+            project_md_dirs = [md for md in _resolve_directory_patterns(md_dirs, root_path=project_dir) if md.is_dir()]
+            # Add MDs (replicas/subprojects) rows (triggers will auto-increment num_mds)
+            for md_dir_path in project_md_dirs:
+                self.add_md(md_dir_path, make_uuid=True, verbose=verbose)
+
+    def get_uuid_status(self, uuid: str, project_uuid: str = None):
+        """Retrieve a project or MD's status from the database by UUID."""
+        status = None
+        with self.locked_storage_file:
+            cur = self.conn.cursor()
+            if project_uuid:
+                # This is an MD entry
+                cur.execute("SELECT * FROM mds WHERE uuid=?", (uuid,))
+                row = cur.fetchone()
+                if row:
+                    columns = [desc[0] for desc in cur.description]
+                    status = dict(zip(columns, row))
+                    status['scope'] = 'MD'
+            else:
+                # This is a project entry
+                cur.execute("SELECT * FROM projects WHERE uuid=?", (uuid,))
+                row = cur.fetchone()
+                if row:
+                    columns = [desc[0] for desc in cur.description]
+                    status = dict(zip(columns, row))
+                    status['scope'] = 'Project'
+
+        if status and status.get('state') == State.RUNNING.value:
+            active_slurm_jobs = self._check_active_slurm_jobs([status.get('slurm_job_id')])
+            is_active = self._is_running_entry_active(
+                status.get('process_id'),
+                status.get('slurm_job_id'),
+                active_slurm_jobs,
+            )
+            if is_active is False:
+                self.update_status(
+                    uuid=uuid,
+                    project_uuid=project_uuid,
+                    state=State.ERROR,
+                    message=self._stale_running_message(status.get('process_id'), status.get('slurm_job_id')),
+                )
+                return self.get_uuid_status(uuid, project_uuid)
+        return status
+
+    def get_status(self, directory: str | Path):
+        """Retrieve a project or MD's status from the database by directory path."""
+        if isinstance(directory, Path):
+            directory = directory.resolve().as_posix()
+        uuid, project_uuid = self._read_uuid_from_cache(directory)
+        return self.get_uuid_status(uuid, project_uuid)
+
+    def update_status(self,
+        uuid: str,
+        state: State | str,
+        message: str,
+        project_uuid: str = None,
+        rel_path: str = None,
+        slurm_job_id: str = None,
+    ):
+        """Update or insert (upsert) a project or MD's status in the database.
+
+        Args:
+            uuid: UUID of the project or MD
+            state: State enum or string
+            message: Status message
+            project_uuid: If provided, this is an MD entry (requires rel_path)
+            rel_path: Relative path to the directory (required for new entries)
+            slurm_job_id: SLURM job ID to store with non-running states (e.g. WAITING).
+                For RUNNING it is always taken from the SLURM_JOB_ID environment variable.
+
+        """
+        with self.locked_storage_file:
+            cur = self.conn.cursor()
+            if isinstance(state, State):
+                state = state.value
+            last_modified = time.strftime(self.date_format, time.localtime())
+
+            if state == State.RUNNING.value:
+                process_id = os.getpid()
+                slurm_job_id = os.environ.get('SLURM_JOB_ID')
+            else:
+                process_id = None
+
+            if project_uuid:
+                # This is an MD entry
+                if rel_path is None:
+                    # Try to get existing rel_path (lock already held, call internal)
+                    cur.execute("SELECT rel_path FROM mds WHERE uuid=?", (uuid,))
+                    row = cur.fetchone()
+                    if row:
+                        rel_path = row[0]
+                    else:
+                        raise ValueError("rel_path is required for new MD entries")
+
+                try:
+                    cur.execute('''
+                        INSERT INTO mds (uuid, project_uuid, rel_path, state, message, process_id, slurm_job_id, last_modified)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(uuid) DO UPDATE SET
+                            state=excluded.state,
+                            message=excluded.message,
+                            process_id=excluded.process_id,
+                            slurm_job_id=excluded.slurm_job_id,
+                            last_modified=excluded.last_modified,
+                            rel_path=excluded.rel_path
+                    ''', (uuid, project_uuid, rel_path, state, message, process_id, slurm_job_id, last_modified))
+                except sqlite3.IntegrityError as e:
+                    if 'UNIQUE constraint failed: mds.rel_path' in str(e):
+                        cur.execute("SELECT uuid FROM mds WHERE rel_path=?", (rel_path,))
+                        raise ValueError(self._rel_path_collision_message('MD', rel_path, uuid, cur.fetchone()[0])) from e
+                    raise
+            else:
+                # This is a project entry
+                if rel_path is None:
+                    # Try to get existing rel_path (lock already held, call internal)
+                    cur.execute("SELECT rel_path FROM projects WHERE uuid=?", (uuid,))
+                    row = cur.fetchone()
+                    if row:
+                        rel_path = row[0]
+                    else:
+                        raise ValueError("rel_path is required for new project entries")
+                try:
+                    cur.execute('''
+                        INSERT INTO projects (uuid, rel_path, state, message, process_id, slurm_job_id, last_modified, num_mds)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                        ON CONFLICT(uuid) DO UPDATE SET
+                            state=excluded.state,
+                            message=excluded.message,
+                            process_id=excluded.process_id,
+                            slurm_job_id=excluded.slurm_job_id,
+                            last_modified=excluded.last_modified,
+                            rel_path=excluded.rel_path
+                    ''', (uuid, rel_path, state, message, process_id, slurm_job_id, last_modified))
+                except sqlite3.IntegrityError as e:
+                    if 'UNIQUE constraint failed: projects.rel_path' in str(e):
+                        cur.execute("SELECT uuid FROM projects WHERE rel_path=?", (rel_path,))
+                        raise ValueError(self._rel_path_collision_message('Project', rel_path, uuid, cur.fetchone()[0])) from e
+                    raise
+
+            self.conn.commit()
+
+    @staticmethod
+    def _rel_path_collision_message(scope: str, rel_path: str, uuid: str, registered_uuid: str) -> str:
+        """Explain why a path cannot be registered with a different UUID.
+
+        Replacing the registered entry would silently delete it (and, for projects, all its MDs).
+        """
+        return (
+            f"{scope} '{rel_path}' is already registered with UUID '{registered_uuid}' "
+            f"but its cache has UUID '{uuid}'. The registered entry is not replaced to avoid losing it. "
+            f"If the cache was regenerated, write the UUID '{registered_uuid}' back to its {CACHE_FILENAME}. "
+            f"If this is really a different {scope.lower()}, remove the old entry first with 'mwf ds remove'."
+        )
+
+    def remove_entry(self, query_path: str | list[str], query_scope: str = "projects", verbose: bool = True):
+        """Remove a single project or MD entry from the database by directory."""
+        query_path = _type_check_dir_list(query_path)
+        entries = self.query_table(query_scope, query_path=query_path)
+        for entry in entries:
+            uuid = entry[0]  # uuid is the first column in projects
+            project_uuid = entry[1] if query_scope == 'mds' else None  # project_uuid is the second column in mds
+            self.remove_entry_by_uuid(uuid, project_uuid=project_uuid, verbose=verbose)
+
+    def remove_entry_by_uuid(self, uuid: str, project_uuid: str = None, verbose: bool = False):
+        """Remove a single project or MD entry from the database by UUID."""
+        with self.locked_storage_file:
+            cur = self.conn.cursor()
+            if project_uuid:
+                # Remove from MDs
+                cur.execute("DELETE FROM mds WHERE uuid=?", (uuid,))
+            else:
+                # Remove from projects
+                cur.execute("DELETE FROM projects WHERE uuid=?", (uuid,))
+            if verbose:
+                if cur.rowcount > 0:
+                    print(f"Deleted {'MD' if project_uuid else 'project'} with UUID '{uuid}'")
+                else:
+                    print(f"No entry found for UUID '{uuid}' to delete")
+            self.conn.commit()
+
+    def generate_inputs_yaml(self,
+            inputs_template_path: str,
+            inputs_generator: Optional[Callable | str] = None,
+            overwrite: bool = False,
+            inputs_filename: str = 'inputs.yaml',
+            query_path: list[str] = ['*'],
+            query_state: list[str] = [],
+            query_message: list[str] = [],
+            query_inputs: list[tuple[str, str]] = None,
+            query_name: list[str] = [],
+            query_warnings: list[str] = [],
+        ):
+        """Generate an inputs.yaml file for the project directory based on a Jinja2 template.
+
+        Args:
+            inputs_template_path (str):
+                Path to the inputs Jinja2 template file to be used for generating the inputs files.
+            inputs_generator (callable):
+                A callable function intended for generating input values or a string path
+                to a generator file with a inputs_generator(project_dir) function.
+                Accepts the project directory name (DIR) as an argument and returns a
+                dictionary of the key-value pairs to be used in the template.
+            overwrite (bool):
+                Whether to overwrite existing inputs.yaml files.
+            inputs_filename (str):
+                The name of the inputs YAML file to be generated.
+            query_path (list[str]):
+                List of directory glob patterns to filter the projects from the dataset.
+            query_state (list[str]):
+                List of states to filter the projects from the dataset.
+            query_message (list[str]):
+                List of glob patterns to filter the projects by message field (e.g., 'URLError*').
+            query_inputs (list[tuple[str, str]]):
+                List of field and value pairs to filter the projects by their inputs file (e.g. [('pdb_ids', '1ABC')]).
+                Projects must match all pairs. Values are parsed as YAML.
+                If the field is a list, it is enough for the value to be one of its items.
+            query_name (list[str]):
+                List of glob patterns to filter the projects by the name in their inputs file (e.g. '*kinase*').
+                Case is ignored. Projects without a name are left out.
+            query_warnings (list[str]):
+                List of glob patterns to filter the projects by the tags of their current warnings (e.g. 'pbcontacts').
+                Warnings in the MDs of the project count as well. Use '*' to get projects with any warning.
+
+
+        """
+        # Query projects directly from database with filters
+        query_path = _type_check_dir_list(query_path)
+        query_state = _type_check_dir_list(query_state)
+        query_message = _type_check_dir_list(query_message)
+        filtered_projects = self.query_table('projects', query_path, query_state, query_message, query_inputs, query_name, query_warnings)
+        if len(filtered_projects) == 0:
+            print(_no_projects_message(query_path, query_state, query_message, query_inputs, query_name, query_warnings))
+            return
+
+        # Load the template
+        with open(inputs_template_path, 'r') as f:
+            template_str = f.read()
+
+        # Generate input values using the provided generator function if any
+        if type(inputs_generator) is str:
+            print(f"Loading inputs generator from file: {inputs_generator}")
+            # Load the generator module
+            spec = importlib.util.spec_from_file_location("generator", inputs_generator)
+            generator_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(generator_module)
+            # Call the inputs_generator function
+            if not hasattr(generator_module, 'inputs_generator'):
+                raise ValueError(f"Generator file '{inputs_generator}' must define a inputs_generator(project_dir) function")
+
+            inputs_generator = generator_module.inputs_generator
+
+        # Generate inputs.yaml for each project directory
+        for project_entry in filtered_projects:
+            project_dict = dict(zip(self.project_columns, project_entry))
+            project_dir = self._rel_to_abs(project_dict['rel_path'])
+
+            template = jinja2.Template(template_str)
+            inputs_yaml_path = os.path.join(project_dir, inputs_filename)
+            if os.path.exists(inputs_yaml_path) and not overwrite:
+                print(f"{inputs_yaml_path} already exists and overwrite is set to False. Skipping.")
+                continue
+            generated_input = {}
+            if inputs_generator:
+                # If generator returned None, use empty dict
+                generated_input = inputs_generator(project_dir) or {}
+            # Render the template with project defaults
+            rendered_yaml = template.render(DIR=Path(project_dir).name,
+                                            PATH=Path(project_dir),
+                                            DATASET=os.path.relpath(self.dataset_path, start=project_dir),
+                                            project_status=project_dict,
+                                            **generated_input)
+            # Write the rendered YAML to inputs.yaml
+            print(f"Generating {inputs_yaml_path} for project {project_dict['rel_path']}")
+            with open(inputs_yaml_path, 'w') as f:
+                f.write(rendered_yaml)
+
+    def _find_inputs_file(self, rel_path: str) -> str | None:
+        """Find the inputs file of a project as the Project class does.
+        Return None if there is no inputs file.
+        """
+        project_dir = self._rel_to_abs(rel_path)
+        candidates = []
+        for filename in ACCEPTED_INPUT_FILENAMES:
+            candidates += glob.glob(os.path.join(glob.escape(str(project_dir)), '*' + filename))
+        if len(candidates) == 0: return None
+        if len(candidates) > 1:
+            raise ValueError(f'Multiple files could be the inputs file in {rel_path}: {", ".join(candidates)}')
+        return candidates[0]
+
+    def get_inputs_field(self,
+            field: str,
+            query_path: list[str] = ['*'],
+            query_state: list[str] = [],
+            query_message: list[str] = [],
+            query_inputs: list[tuple[str, str]] = None,
+            query_name: list[str] = [],
+            query_warnings: list[str] = [],
+        ):
+        """Print the value of a single field in the inputs files of the selected projects.
+
+        Args:
+            field (str):
+                Name of the field to be shown. Use dots to access nested fields and
+                integers to access list items (e.g. 'mds.0.name').
+            query_path (list[str]):
+                List of directory glob patterns to filter the projects from the dataset.
+            query_state (list[str]):
+                List of states to filter the projects from the dataset.
+            query_message (list[str]):
+                List of glob patterns to filter the projects by message field (e.g., 'URLError*').
+            query_inputs (list[tuple[str, str]]):
+                List of field and value pairs to filter the projects by their inputs file (e.g. [('pdb_ids', '1ABC')]).
+                Projects must match all pairs. Values are parsed as YAML.
+                If the field is a list, it is enough for the value to be one of its items.
+            query_name (list[str]):
+                List of glob patterns to filter the projects by the name in their inputs file (e.g. '*kinase*').
+                Case is ignored. Projects without a name are left out.
+            query_warnings (list[str]):
+                List of glob patterns to filter the projects by the tags of their current warnings (e.g. 'pbcontacts').
+                Warnings in the MDs of the project count as well. Use '*' to get projects with any warning.
+
+        """
+        query_path = _type_check_dir_list(query_path)
+        query_state = _type_check_dir_list(query_state)
+        query_message = _type_check_dir_list(query_message)
+        filtered_projects = self.query_table('projects', query_path, query_state, query_message, query_inputs, query_name, query_warnings)
+        if len(filtered_projects) == 0:
+            print(_no_projects_message(query_path, query_state, query_message, query_inputs, query_name, query_warnings))
+            return
+        keys = field.split('.')
+        for project_entry in filtered_projects:
+            project_dict = dict(zip(self.project_columns, project_entry))
+            rel_path = project_dict['rel_path']
+            inputs_filepath = self._find_inputs_file(rel_path)
+            if inputs_filepath is None:
+                print(f'{rel_path}: (no inputs file)')
+                continue
+            found, value = _read_inputs_field(inputs_filepath, keys)
+            print(f'{rel_path}: ' + (repr(value) if found else '(missing)'))
+
+    def show_inputs_files(self,
+            query_path: list[str] = ['*'],
+            query_state: list[str] = [],
+            query_message: list[str] = [],
+            query_inputs: list[tuple[str, str]] = None,
+            query_name: list[str] = [],
+            query_warnings: list[str] = [],
+        ):
+        """Print the whole content of the inputs files of the selected projects.
+
+        Args:
+            query_path (list[str]):
+                List of directory glob patterns to filter the projects from the dataset.
+            query_state (list[str]):
+                List of states to filter the projects from the dataset.
+            query_message (list[str]):
+                List of glob patterns to filter the projects by message field (e.g., 'URLError*').
+            query_inputs (list[tuple[str, str]]):
+                List of field and value pairs to filter the projects by their inputs file (e.g. [('pdb_ids', '1ABC')]).
+                Projects must match all pairs. Values are parsed as YAML.
+                If the field is a list, it is enough for the value to be one of its items.
+            query_name (list[str]):
+                List of glob patterns to filter the projects by the name in their inputs file (e.g. '*kinase*').
+                Case is ignored. Projects without a name are left out.
+            query_warnings (list[str]):
+                List of glob patterns to filter the projects by the tags of their current warnings (e.g. 'pbcontacts').
+                Warnings in the MDs of the project count as well. Use '*' to get projects with any warning.
+
+        """
+        query_path = _type_check_dir_list(query_path)
+        query_state = _type_check_dir_list(query_state)
+        query_message = _type_check_dir_list(query_message)
+        filtered_projects = self.query_table('projects', query_path, query_state, query_message, query_inputs, query_name, query_warnings)
+        if len(filtered_projects) == 0:
+            print(_no_projects_message(query_path, query_state, query_message, query_inputs, query_name, query_warnings))
+            return
+        for project_entry in filtered_projects:
+            project_dict = dict(zip(self.project_columns, project_entry))
+            rel_path = project_dict['rel_path']
+            inputs_filepath = self._find_inputs_file(rel_path)
+            if inputs_filepath is None:
+                print(f'{rel_path}: (no inputs file)')
+                continue
+            print(f'===== {inputs_filepath} =====')
+            with open(inputs_filepath, 'r') as f:
+                print(f.read())
+
+    def show_logs(self,
+            error: bool = False,
+            n_projects: int = 50,
+            tail: int = 0,
+            query_path: list[str] = ['*'],
+            query_state: list[str] = [],
+            query_message: list[str] = [],
+            query_inputs: list[tuple[str, str]] = None,
+            query_name: list[str] = [],
+            query_warnings: list[str] = [],
+        ):
+        """Print the most recent output or error logs of the selected projects.
+
+        Args:
+            error (bool):
+                Show the most recent error logs instead of the output logs.
+            n_projects (int):
+                Number of projects to show, the most recently modified ones. 0 for all projects.
+            tail (int):
+                Number of lines to show from the end of each log. 0 for the whole log.
+            query_path (list[str]):
+                List of directory glob patterns to filter the projects from the dataset.
+            query_state (list[str]):
+                List of states to filter the projects from the dataset.
+            query_message (list[str]):
+                List of glob patterns to filter the projects by message field (e.g., 'URLError*').
+            query_inputs (list[tuple[str, str]]):
+                List of field and value pairs to filter the projects by their inputs file (e.g. [('pdb_ids', '1ABC')]).
+                Projects must match all pairs. Values are parsed as YAML.
+                If the field is a list, it is enough for the value to be one of its items.
+            query_name (list[str]):
+                List of glob patterns to filter the projects by the name in their inputs file (e.g. '*kinase*').
+                Case is ignored. Projects without a name are left out.
+            query_warnings (list[str]):
+                List of glob patterns to filter the projects by the tags of their current warnings (e.g. 'pbcontacts').
+                Warnings in the MDs of the project count as well. Use '*' to get projects with any warning.
+
+        """
+        query_path = _type_check_dir_list(query_path)
+        query_state = _type_check_dir_list(query_state)
+        query_message = _type_check_dir_list(query_message)
+        filtered_projects = self.query_table('projects', query_path, query_state, query_message, query_inputs, query_name, query_warnings)
+        if len(filtered_projects) == 0:
+            print(_no_projects_message(query_path, query_state, query_message, query_inputs, query_name, query_warnings))
+            return
+        projects = [dict(zip(self.project_columns, project_entry)) for project_entry in filtered_projects]
+        # Sort projects as in 'ds show', so the most recently modified ones are printed last
+        projects.sort(key=lambda project: pd.to_datetime(project['last_modified'], format=self.date_format))
+        if n_projects != 0: projects = projects[-n_projects:]
+        log_type = 'error' if error else 'output'
+        width = shutil.get_terminal_size((80, 20)).columns
+        for project in projects:
+            rel_path = project['rel_path']
+            latest_out, latest_err = self._get_latest_log_files(rel_path)
+            log_path = latest_err if error else latest_out
+            print('=' * width)
+            print(f"Project: {rel_path} ({project['state']}, {project['last_modified']})")
+            print(f"Log file: {log_path}" if log_path else f"No {log_type} logs found")
+            print('=' * width)
+            if log_path is None: continue
+            with open(log_path) as file:
+                # Keep only the last lines when a tail is requested
+                if tail == 0: print(file.read(), end='')
+                else: print(''.join(deque(file, maxlen=tail)), end='')
+
+    def set_inputs_field(self,
+            field: str,
+            value: str,
+            query_path: list[str] = ['*'],
+            query_state: list[str] = [],
+            query_message: list[str] = [],
+            query_inputs: list[tuple[str, str]] = None,
+            query_name: list[str] = [],
+            query_warnings: list[str] = [],
+        ):
+        """Set a single field in the existing inputs files of the selected projects.
+        Note that comments in the inputs files are lost.
+
+        Args:
+            field (str):
+                Name of the field to be set. Use dots to access nested fields and
+                integers to access list items (e.g. 'mds.0.name').
+                Missing fields are added, but list items must already exist.
+            value (str):
+                New value of the field. It is parsed as YAML, so '310' becomes an integer,
+                'true' a boolean, '[a, b]' a list and 'null' an empty value.
+            query_path (list[str]):
+                List of directory glob patterns to filter the projects from the dataset.
+            query_state (list[str]):
+                List of states to filter the projects from the dataset.
+            query_message (list[str]):
+                List of glob patterns to filter the projects by message field (e.g., 'URLError*').
+            query_inputs (list[tuple[str, str]]):
+                List of field and value pairs to filter the projects by their inputs file (e.g. [('pdb_ids', '1ABC')]).
+                Projects must match all pairs. Values are parsed as YAML.
+                If the field is a list, it is enough for the value to be one of its items.
+            query_name (list[str]):
+                List of glob patterns to filter the projects by the name in their inputs file (e.g. '*kinase*').
+                Case is ignored. Projects without a name are left out.
+            query_warnings (list[str]):
+                List of glob patterns to filter the projects by the tags of their current warnings (e.g. 'pbcontacts').
+                Warnings in the MDs of the project count as well. Use '*' to get projects with any warning.
+
+        """
+        # Query projects directly from database with filters
+        query_path = _type_check_dir_list(query_path)
+        query_state = _type_check_dir_list(query_state)
+        query_message = _type_check_dir_list(query_message)
+        filtered_projects = self.query_table('projects', query_path, query_state, query_message, query_inputs, query_name, query_warnings)
+        if len(filtered_projects) == 0:
+            print(_no_projects_message(query_path, query_state, query_message, query_inputs, query_name, query_warnings))
+            return
+        parsed_value = yaml.safe_load(value)
+        keys = field.split('.')
+        # Find and load every inputs file before editing any of them
+        # Thus we do not end up with half of the projects edited if something fails
+        missing_inputs = []
+        inputs_files = []
+        for project_entry in filtered_projects:
+            project_dict = dict(zip(self.project_columns, project_entry))
+            inputs_filepath = self._find_inputs_file(project_dict['rel_path'])
+            if inputs_filepath is None:
+                missing_inputs.append(project_dict['rel_path'])
+                continue
+            inputs = load_json(inputs_filepath) if inputs_filepath.endswith('.json') else load_yaml(inputs_filepath)
+            # Find the parent of the target field
+            # Missing dict fields are created, but list items must exist
+            parent = inputs
+            for i, key in enumerate(keys):
+                if type(parent) is list:
+                    key = int(key)
+                    if key >= len(parent):
+                        raise ValueError(f'Field "{".".join(keys[:i + 1])}" not found in {inputs_filepath}')
+                elif type(parent) is not dict:
+                    raise ValueError(f'Field "{".".join(keys[:i])}" in {inputs_filepath} is not a dict or a list')
+                if i == len(keys) - 1: break
+                # Create missing or empty intermediate fields as dicts
+                if type(parent) is dict and parent.get(key) is None:
+                    parent[key] = {}
+                parent = parent[key]
+            inputs_files.append((inputs_filepath, inputs, parent, key))
+        if len(missing_inputs) > 0:
+            raise FileNotFoundError(f'There is no inputs file in {len(missing_inputs)} projects: {", ".join(missing_inputs)}\n' +
+                ' Generate them first with "mwf ds inputs -it <template>"')
+        # Now set the new value and write the inputs files
+        for inputs_filepath, inputs, parent, key in inputs_files:
+            parent[key] = parsed_value
+            print(f'Setting {field} = {parsed_value!r} in {inputs_filepath}')
+            if inputs_filepath.endswith('.json'):
+                save_json(inputs, inputs_filepath, indent=4)
+            else:
+                save_yaml(inputs, inputs_filepath)
+
+    def load(self,
+            loader_path: str = None,
+            node: str = None,
+            overwrite: bool = False,
+            include: list[str] = None,
+            exclude: list[str] = None,
+            skip_trajectories: bool = False,
+            skip_files: bool = False,
+            skip_analyses: bool = False,
+            md_directories: list[str] = None,
+            query_path: list[str] = ['*'],
+            query_state: list[str] = [State.DONE.value],
+            query_message: list[str] = [],
+            query_inputs: list[tuple[str, str]] = None,
+            query_name: list[str] = [],
+            query_warnings: list[str] = [],
+        ):
+        """Upload the selected projects to the database using the MDDB loader.
+
+        Args:
+            loader_path (str):
+                Path to the loader directory or to its index.js file.
+                It is remembered in the dataset, so it only has to be passed the first time.
+            node (str):
+                Alias of the node whose database receives the projects, as in the loader nodes config file.
+                It is remembered in the dataset, so it only has to be passed the first time.
+            overwrite (bool):
+                Overwrite the data already in the database. Otherwise only new data is uploaded.
+            include (list[str]):
+                Load only these files, as paths or wildcards relative to every project directory (e.g. '*/mda.rmsf.json').
+            exclude (list[str]):
+                Load all files but these, as paths or wildcards relative to every project directory.
+                It can not be combined with include.
+            skip_trajectories (bool):
+                Do not load the main trajectory of every MD.
+            skip_files (bool):
+                Do not load any file (e.g. structures, trajectories).
+            skip_analyses (bool):
+                Do not load any analysis.
+            md_directories (list[str]):
+                Load only these MD directories, as names relative to every project directory.
+                By default all MD directories are loaded.
+            query_path (list[str]):
+                List of directory glob patterns to filter the projects from the dataset.
+            query_state (list[str]):
+                List of states to filter the projects from the dataset. Only finished projects (done) by default.
+            query_message (list[str]):
+                List of glob patterns to filter the projects by message field (e.g., 'URLError*').
+            query_inputs (list[tuple[str, str]]):
+                List of field and value pairs to filter the projects by their inputs file (e.g. [('pdb_ids', '1ABC')]).
+                Projects must match all pairs. Values are parsed as YAML.
+                If the field is a list, it is enough for the value to be one of its items.
+            query_name (list[str]):
+                List of glob patterns to filter the projects by the name in their inputs file (e.g. '*kinase*').
+                Case is ignored. Projects without a name are left out.
+            query_warnings (list[str]):
+                List of glob patterns to filter the projects by the tags of their current warnings (e.g. 'pbcontacts').
+                Warnings in the MDs of the project count as well. Use '*' to get projects with any warning.
+
+        """
+        # The loader would complain anyway, but we stop before connecting
+        if include and exclude:
+            raise InputError('Include and exclude can not be combined')
+        query_path = _type_check_dir_list(query_path)
+        query_state = _type_check_dir_list(query_state)
+        query_message = _type_check_dir_list(query_message)
+        filtered_projects = self.query_table('projects', query_path, query_state, query_message, query_inputs, query_name, query_warnings)
+        if len(filtered_projects) == 0:
+            print(_no_projects_message(query_path, query_state, query_message, query_inputs, query_name, query_warnings))
+            return
+        # If the loader or the node are not passed then use the ones saved in the dataset the last time
+        if loader_path:
+            # The user may pass the index.js file instead of the loader directory
+            if os.path.basename(loader_path) == 'index.js': loader_path = os.path.dirname(loader_path)
+            loader_directory = os.path.abspath(loader_path)
+        else:
+            loader_directory = self._get_setting('loader_directory')
+        if not loader_directory:
+            raise InputError('Missing the loader directory (-ld). Please pass it once and it will be remembered in this dataset.')
+        node = node or self._get_setting('loader_node')
+        if not node:
+            raise InputError('Missing the loader node (-nd). Please pass it once and it will be remembered in this dataset.')
+        loader = Loader(loader_directory, node)
+        # Remember the loader settings once we know they work
+        self._set_setting('loader_directory', loader_directory)
+        self._set_setting('loader_node', node)
+        projects_count = len(filtered_projects)
+        # Updating the option counters takes a while, so we skip it in every load and do it once at the end
+        for p, project_entry in enumerate(filtered_projects, 1):
+            rel_path = dict(zip(self.project_columns, project_entry))['rel_path']
+            print(f'--- Loading {rel_path} ({p}/{projects_count}) ---')
+            if not loader.load(self._rel_to_abs(rel_path), overwrite=overwrite,
+                include=include, exclude=exclude, skip_trajectories=skip_trajectories,
+                skip_files=skip_files, skip_analyses=skip_analyses, md_directories=md_directories,
+                skip_counters=True):
+                # Update the counters anyway, since the previous projects were loaded already
+                if not loader.count():
+                    raise RuntimeError(f'Something went wrong when loading {rel_path} and then when updating the option counters')
+                raise RuntimeError(f'Something went wrong when loading {rel_path}')
+        if not loader.count():
+            raise RuntimeError('Something went wrong when updating the option counters')
+        # This is not necessary since the SSH connection is closed anyway when the workflow ends
+        loader.close_ssh_connection()
+
+    def scan(self,
+        root_dir: str = None,
+        ignore_dirs: list[str] = [],
+        verbose: bool = False,
+    ):
+        """Scan directory tree for projects and MDs by finding CACHE_FILENAME files.
+
+        This function walks the directory tree starting from root_dir (or self.root_path),
+        looks for CACHE_FILENAME files, reads their UUIDs and project_uuids, and adds entries to the database.
+        Projects are identified by the absence of project_uuid in their cache.
+        MDs are identified by the presence of project_uuid in their cache.
+
+        Args:
+            root_dir: Root directory to scan (defaults to self.root_path)
+            ignore_dirs: List of directory names to ignore
+            verbose: Whether to print verbose output
+
+        """
+        root_path = Path(root_dir) if root_dir else self.root_path
+        root_dir = root_path.resolve()
+        ignore_dirs_set = set(ignore_dirs)
+
+        # Separate projects and MDs based on presence of project_uuid in cache
+        projects = {}  # {rel_path: uuid}
+        mds = {}  # {rel_path: (uuid, project_uuid)}
+
+        # Walk directory tree and find all cache files
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            # Skip ignored directories
+            dirnames[:] = [d for d in dirnames if d not in ignore_dirs_set]
+
+            if CACHE_FILENAME in filenames:
+                dir_path = Path(dirpath)
+                uuid, project_uuid = self._read_uuid_from_cache(dir_path)
+
+                if not uuid:
+                    if verbose:
+                        print(f"Warning: No UUID found in {dir_path}. Skipping.")
+                    continue
+
+                rel_path = self._abs_to_rel(dir_path)
+                if project_uuid:
+                    # This is an MD (has project_uuid in cache)
+                    mds[rel_path] = (uuid, project_uuid)
+                else:
+                    # This is a Project (no project_uuid in cache)
+                    projects[rel_path] = uuid
+
+        # Add all projects first
+        for rel_path, uuid in projects.items():
+            status = self.get_uuid_status(uuid)
+            if not status:
+                if verbose:
+                    print(f"Adding project: {rel_path} (UUID: {uuid})")
+                self.update_status(uuid, state=State.NEW, message='No information recorded yet.', rel_path=rel_path)
+            elif status['rel_path'] != rel_path:
+                if verbose:
+                    print(f"Updating project path: {rel_path} (UUID: {uuid}) from {status['rel_path']} to {rel_path}")
+                self.update_status(uuid, state=status['state'], message=status['message'], rel_path=rel_path)
+            elif verbose:
+                print(f"Project already exists: {rel_path} (UUID: {uuid})")
+
+        # Then add all MDs
+        for rel_path, (uuid, project_uuid) in mds.items():
+            if not self.get_uuid_status(uuid, project_uuid):
+                if verbose:
+                    print(f"  Adding MD: {rel_path} (UUID: {uuid}, Project UUID: {project_uuid})")
+                self.update_status(uuid, state=State.NEW, message='No information recorded yet.', project_uuid=project_uuid, rel_path=rel_path)
+            elif verbose:
+                print(f"  MD already exists: {rel_path} (UUID: {uuid})")
+
+    def _build_where_clause(self, query_path: list[str] = None, query_state: list[str] = None, query_message: list[str] = None) -> tuple[str, list]:
+        """Build a SQL WHERE clause from query parameters.
+
+        Args:
+            query_path: List of glob patterns to filter rel_path by (uses GLOB with OR)
+            query_state: List of states to filter by (uses IN clause)
+            query_message: List of glob patterns to filter message by (uses GLOB with OR)
+
+        Returns:
+            Tuple of (where_clause_string, parameters_list)
+
+        """
+        conditions = []
+        params = []
+
+        if query_state:
+            placeholders = ','.join('?' * len(query_state))
+            conditions.append(f"state IN ({placeholders})")
+            params.extend(query_state)
+
+        if query_path:
+            # Filter out '*' patterns and convert glob patterns to SQL GLOB patterns
+            # Python glob uses ** for recursive, SQL GLOB uses * for any chars
+            glob_conditions = []
+            for pattern in query_path:
+                if pattern and pattern != '*':
+                    # Stored paths have no trailing slash or leading './' so remove them from the pattern too
+                    pattern = os.path.normpath(pattern)
+                    sql_pattern = pattern.replace('**/', '*').replace('**', '*')
+                    glob_conditions.append("rel_path GLOB ?")
+                    params.append(sql_pattern)
+            if glob_conditions:
+                conditions.append(f"({' OR '.join(glob_conditions)})")
+
+        if query_message:
+            # Use GLOB pattern matching for message field
+            # Supports wildcards: * (any chars), ? (single char)
+            message_conditions = []
+            for pattern in query_message:
+                if pattern and pattern != '*':
+                    message_conditions.append("message GLOB ?")
+                    params.append(pattern)
+            if message_conditions:
+                conditions.append(f"({' OR '.join(message_conditions)})")
+
+        where_clause = " AND ".join(conditions) if conditions else ""
+        return where_clause, params
+
+    def query_table(self, table: str, query_path: list[str] = None, query_state: list[str] = None, query_message: list[str] = None,
+            query_inputs: list[tuple[str, str]] = None, query_name: list[str] = None, query_warnings: list[str] = None) -> list[tuple]:
+        """Query an available table with optional filters.
+
+        Args:
+            table: Table name to query ('projects' or 'mds')
+            query_path: List of glob patterns to filter rel_path by
+            query_state: List of states to filter by
+            query_message: List of glob patterns to filter message by (e.g., 'URLError*')
+            query_inputs: List of field and value pairs to filter projects by their inputs file, all of them must match (e.g., [('pdb_ids', '1ABC')])
+            query_name: List of glob patterns to filter projects by the name in their inputs file, ignoring case (e.g., '*kinase*')
+            query_warnings: List of glob patterns to filter by the tags of the current warnings (e.g., 'pbcontacts')
+                Projects also match when one of their MDs has the warning
+
+        Returns:
+            List of tuples with project data
+
+        """
+        rows = self._query_table_sql(table, query_path, query_state, query_message)
+        if query_inputs or query_name:
+            rows = self._filter_by_inputs(table, rows, query_inputs, query_name)
+        if query_warnings:
+            rows = self._filter_by_warnings(table, rows, query_warnings)
+        return rows
+
+    def _filter_by_inputs(self, table: str, rows: list[tuple], query_inputs: list[tuple[str, str]], query_name: list[str]) -> list[tuple]:
+        """Keep the rows whose project inputs file matches the inputs and name filters."""
+        # MDs are filtered by the inputs file of their project
+        if table == 'mds':
+            matching_projects = self.query_table('projects', query_inputs=query_inputs, query_name=query_name)
+            matching_uuids = set(project[0] for project in matching_projects)
+            project_uuid_index = self.md_columns.index('project_uuid')
+            return [row for row in rows if row[project_uuid_index] in matching_uuids]
+        conditions = [(field.split('.'), yaml.safe_load(value)) for field, value in query_inputs or []]
+        rel_path_index = self.project_columns.index('rel_path')
+        filtered_rows = []
+        for row in rows:
+            inputs_filepath = self._find_inputs_file(row[rel_path_index])
+            if inputs_filepath is None: continue
+            if not all(_inputs_field_matches(inputs_filepath, keys, value) for keys, value in conditions): continue
+            if query_name and not _inputs_name_matches(inputs_filepath, query_name): continue
+            filtered_rows.append(row)
+        return filtered_rows
+
+    def _filter_by_warnings(self, table: str, rows: list[tuple], query_warnings: list[str]) -> list[tuple]:
+        """Keep the rows with a current warning whose tag matches any of the glob patterns.
+        Projects are kept also when one of their MDs has a matching warning.
+        """
+        if table == 'mds':
+            rel_path_index = self.md_columns.index('rel_path')
+            return [row for row in rows if self._has_warnings(row[rel_path_index], query_warnings)]
+        # Find the projects with at least one MD with a matching warning
+        md_rel_path_index = self.md_columns.index('rel_path')
+        project_uuid_index = self.md_columns.index('project_uuid')
+        warned_project_uuids = set(md_row[project_uuid_index] for md_row in self._query_table_sql('mds')
+            if self._has_warnings(md_row[md_rel_path_index], query_warnings))
+        rel_path_index = self.project_columns.index('rel_path')
+        return [row for row in rows if row[0] in warned_project_uuids or self._has_warnings(row[rel_path_index], query_warnings)]
+
+    def _has_warnings(self, rel_path: str, patterns: list[str]) -> bool:
+        """Check if the register of a project or MD has a current warning whose tag matches any of the glob patterns.
+        Directories which were never run have no register and thus no warnings.
+        """
+        register_filepath = os.path.join(self._rel_to_abs(rel_path), REGISTER_FILENAME)
+        if not os.path.exists(register_filepath): return False
+        entries = load_json(register_filepath)
+        if len(entries) == 0: return False
+        # The last entry holds the current warnings
+        # Old warnings with no tag are ignored, as the register does
+        tags = [warning['tag'] for warning in entries[-1]['warnings'] if warning.get('tag')]
+        return any(fnmatch.fnmatchcase(tag, pattern) for tag in tags for pattern in patterns)
+
+    def _query_table_sql(self, table: str, query_path: list[str] = None, query_state: list[str] = None, query_message: list[str] = None) -> list[tuple]:
+        """Query an available table with the filters which are stored in the database."""
+        if table not in ['projects', 'mds']:
+            raise ValueError("Table must be either 'projects' or 'mds'")
+        with self.locked_storage_file:
+            cur = self.conn.cursor()
+            where_clause, params = self._build_where_clause(query_path, query_state, query_message)
+            cols = self.project_columns if table == 'projects' else self.md_columns
+            query = f"SELECT {', '.join(cols)} FROM {table}"
+            if where_clause:
+                query += f" WHERE {where_clause}"
+            query += " ORDER BY rel_path"
+            cur.execute(query, params)
+            return cur.fetchall()
+
+    @property
+    def projects_table(self) -> list[tuple]:
+        """Retrieve all project status from the SQLite database as a list of tuples."""
+        return self.query_table('projects')
+
+    @property
+    def mds_table(self) -> list[tuple]:
+        """Retrieve all MD status from the SQLite database as a list of tuples."""
+        return self.query_table('mds')
+
+    def list_projects(self,
+            sort_by: str = 'last_modified',
+            asc: bool = True,
+            n_projects: int = 50,
+            include_logs: bool = False,
+            query_path: list[str] = ['*'],
+            query_state: list[str] = [],
+            query_message: list[str] = [],
+            query_inputs: list[tuple[str, str]] = None,
+            query_name: list[str] = [],
+            query_warnings: list[str] = [],
+        ):
+        """Print each selected project in its own block, with full paths and messages and the name in its inputs file.
+
+        Args:
+            sort_by (str):
+                Column name to sort the projects by.
+            asc (bool):
+                Sort in ascending order.
+            n_projects (int):
+                Number of projects to show, the last ones after sorting. 0 for all projects.
+            include_logs (bool):
+                Show the paths to the most recent output and error logs of each project.
+            query_path (list[str]):
+                List of directory glob patterns to filter the projects from the dataset.
+            query_state (list[str]):
+                List of states to filter the projects from the dataset.
+            query_message (list[str]):
+                List of glob patterns to filter the projects by message field (e.g., 'URLError*').
+            query_inputs (list[tuple[str, str]]):
+                List of field and value pairs to filter the projects by their inputs file (e.g. [('pdb_ids', '1ABC')]).
+                Projects must match all pairs. Values are parsed as YAML.
+                If the field is a list, it is enough for the value to be one of its items.
+            query_name (list[str]):
+                List of glob patterns to filter the projects by the name in their inputs file (e.g. '*kinase*').
+                Case is ignored. Projects without a name are left out.
+            query_warnings (list[str]):
+                List of glob patterns to filter the projects by the tags of their current warnings (e.g. 'pbcontacts').
+                Warnings in the MDs of the project count as well. Use '*' to get projects with any warning.
+
+        """
+        projects = self.get_dataframe(show_id=True, sort_by=sort_by, asc=asc, query_path=query_path,
+            query_state=query_state, query_message=query_message, query_inputs=query_inputs, query_name=query_name,
+            query_warnings=query_warnings, query_scope='projects')
+        if len(projects) == 0:
+            print(_no_projects_message(_type_check_dir_list(query_path), _type_check_dir_list(query_state),
+                _type_check_dir_list(query_message), query_inputs, query_name, query_warnings))
+            return
+        total = len(projects)
+        if n_projects != 0: projects = projects.tail(n_projects)
+        # Show the MDs of each project inside its block, whatever their state
+        md_project_uuid_index = self.md_columns.index('project_uuid')
+        mds_per_project = {}
+        for md_entry in self.query_table('mds'):
+            mds_per_project.setdefault(md_entry[md_project_uuid_index], []).append(dict(zip(self.md_columns, md_entry)))
+        width = shutil.get_terminal_size((80, 20)).columns
+        for uuid, project in projects.iterrows():
+            rel_path = project['rel_path']
+            inputs_filepath = self._find_inputs_file(rel_path)
+            if inputs_filepath is None:
+                name = '(no inputs file)'
+            else:
+                found, name = _read_inputs_field(inputs_filepath, ['name'])
+                if not found: name = '(missing)'
+            print('=' * width)
+            print(f'Project:       {rel_path}')
+            print(f'Name:          {name}')
+            print(f'State:         {project["state"]}')
+            print(f'Last modified: {project["last_modified"]}')
+            # The loader leaves this file in the project once it is uploaded to the database
+            loaded = os.path.exists(os.path.join(self._rel_to_abs(rel_path), '.project_id'))
+            print(f'Loaded:        {"yes" if loaded else "no"}')
+            if project['message']: print(f'Message:       {project["message"]}')
+            if include_logs:
+                latest_out, latest_err = self._get_latest_log_files(rel_path)
+                print(f'Output log:    {latest_out or "(none)"}')
+                print(f'Error log:     {latest_err or "(none)"}')
+            mds = mds_per_project.get(uuid, [])
+            print(f'MDs:           {len(mds)}')
+            for md in mds:
+                print(f'  - {md["rel_path"]} ({md["state"]}, {md["last_modified"]})')
+                if md['message']: print(f'    {md["message"]}')
+        print('=' * width)
+        if len(projects) < total: print(f'Showing the last {len(projects)} of {total} projects')
+
+    def get_dataframe(self,
+            show_id=False,
+            sort_by='last_modified',
+            asc=False,
+            include_logs: bool = False,
+            query_path: list[str] | str = [],
+            query_state: list[str] | str = [],
+            query_message: list[str] | str = [],
+            query_inputs: list[tuple[str, str]] = None,
+            query_name: list[str] = [],
+            query_warnings: list[str] = [],
+            query_scope: str = None,
+    ) -> 'pd.DataFrame':
+        """Retrieve a joined view of projects and MDs as a single DataFrame
+        with empty values for the not matching columns.
+        Adds a 'scope' column to indicate if the row is from a project or an MD.
+
+        Args:
+            show_id (bool, optional): If provided, shows 'uuid' and 'project_uuid' columns.
+            root_path (str, optional): If provided, show the absolute paths relative to this root path.
+            sort_by (str, optional): Column name to sort the final DataFrame by. Defaults to 'rel_path'.
+            asc (bool, optional): Whether to sort in ascending order. Defaults to True.
+            include_logs (bool, optional): If True, adds 'log_file' and 'err_file' columns with HTML links to the latest log files.
+            query_path (list[str] | str): If provided, filters rows whose 'rel_path' matches these glob patterns.
+            query_state (list[str] | str): If provided, filters rows whose 'state' matches this value/list of values.
+            query_message (list[str] | str): If provided, filters rows whose 'message' matches these glob patterns (e.g., 'URLError*').
+            query_inputs (list[tuple[str, str]], optional): If provided, filters rows whose project inputs file has all these field and value pairs (e.g. [('pdb_ids', '1ABC')]).
+            query_name (list[str], optional): If provided, filters rows whose project inputs file name matches these glob patterns ignoring case (e.g. '*kinase*').
+            query_warnings (list[str], optional): If provided, filters rows with a current warning whose tag matches these glob patterns (e.g. 'pbcontacts', or '*' for any warning). Projects also match when one of their MDs has the warning.
+            query_scope (str, optional): If provided, filters rows whose 'scope' matches this value ('project'/'p' or 'md'/'m').
+
+        """
+        query_path = _type_check_dir_list(query_path)
+        query_state = _type_check_dir_list(query_state)
+        query_message = _type_check_dir_list(query_message)
+
+        if query_scope:
+            query_scope = query_scope.lower()
+            if query_scope in ('p', 'project', 'projects'):
+                scopes_to_query = ['projects']
+            elif query_scope in ('m', 'md', 'mds'):
+                scopes_to_query = ['mds']
+            else:
+                raise ValueError("query_scope must be either 'project'/'p' or 'md'/'m'")
+        else:
+            scopes_to_query = ['projects', 'mds']
+
+        # Keep persisted status in sync with real process state before displaying.
+        if shutil.which('squeue') is not None:
+            self._refresh_running_entries(scopes=scopes_to_query)
+
+        # Query data directly from SQLite with filters applied
+        dataframes = []
+        for scope in scopes_to_query:
+            cols = self.project_columns if scope == 'projects' else self.md_columns
+            data = self.query_table(scope, query_path, query_state, query_message, query_inputs, query_name, query_warnings)
+            df = pd.DataFrame(data, columns=cols)
+            df['scope'] = scope
+            if len(df) > 0:
+                dataframes.append(df)
+
+        if dataframes:
+            df_joined = pd.concat(dataframes, ignore_index=True) if len(dataframes) > 1 else dataframes[0]
+        else:
+            # Return empty DataFrame with all possible columns if no data matches the filters
+            all_columns = list(set(self.project_columns + self.md_columns + ['scope']))
+            df_joined = pd.DataFrame(columns=all_columns)
+
+        # Sort the DataFrame
+        if sort_by == 'last_modified':
+            df_joined['last_modified'] = pd.to_datetime(df_joined['last_modified'], format=self.date_format, errors='coerce')
+        df_joined = df_joined.sort_values([sort_by], ascending=asc, na_position='first')
+        if sort_by == 'last_modified':
+            df_joined['last_modified'] = df_joined['last_modified'].dt.strftime(self.date_format)
+
+        # Replace NaN with empty string for display
+        df_joined = df_joined.fillna('')
+        df_joined.set_index('uuid', inplace=True)
+        # Convert num_mds from float to int if present
+        if 'num_mds' in df_joined.columns:
+            df_joined['num_mds'] = df_joined['num_mds'].apply(lambda x: int(x) if isinstance(x, float) and not pd.isna(x) else x)
+        # Optionally make rel_path relative to root_path
+        # if root_path is not None:
+        #     root_path = os.path.abspath(root_path)
+        #     df_joined['rel_path'] = df_joined['rel_path'].apply(
+        #         lambda x: os.path.relpath(Path(x).resolve(), root_path)
+        #     )
+
+        if not show_id:
+            df_joined.reset_index(inplace=True)
+            df_joined = df_joined.drop(columns=['uuid', 'project_uuid'], errors='ignore')
+
+        # Optionally add log file columns with HTML links
+        if include_logs:
+            def make_log_link(log_path: str | None, link_text: str) -> str:
+                """Create an HTML link for a log file."""
+                if log_path and Path(log_path).exists():
+                    file_url = f"file://{log_path}"
+                    return f'<a href="{file_url}" target="_blank">{link_text}</a>'
+                return ''
+
+            log_files = []
+            err_files = []
+            for idx, row in df_joined.iterrows():
+                rel_path = row['rel_path']
+                latest_out, latest_err = self._get_latest_log_files(rel_path)
+
+                out_name = Path(latest_out).name if latest_out else ''
+                err_name = Path(latest_err).name if latest_err else ''
+
+                log_files.append(make_log_link(latest_out, out_name))
+                err_files.append(make_log_link(latest_err, err_name))
+
+            df_joined['log_file'] = log_files
+            df_joined['err_file'] = err_files
+
+        # Remove internal runtime tracking columns from display (kept in DB for reconciliation)
+        cols_to_drop = ['process_id', 'slurm_job_id']
+        df_joined = df_joined.drop(columns=[c for c in cols_to_drop if c in df_joined.columns])
+
+        # Change the order of the columns to have 'scope' first
+        cols = df_joined.columns.tolist()
+        if not query_scope:
+            cols.insert(0, cols.pop(cols.index('scope')))
+            if 'project_uuid' in cols:
+                cols.insert(0, cols.pop(cols.index('project_uuid')))
+        else:
+            cols.remove('scope')
+
+        df_joined = df_joined[cols]
+        return df_joined
+
+    @property
+    def dataframe(self) -> 'pd.DataFrame':
+        """Retrieve the joined DataFrame view of projects and MDs with log file links."""
+        return self.get_dataframe()
+
+    def summary(self) -> pd.DataFrame:
+        """Return a summary DataFrame with the count of projects in each state."""
+        df = self.get_dataframe(
+                    query_scope='project',
+        )
+        # Group by state and count
+        summary = df.groupby("state").size().reset_index(name="count")
+        # Sort by state order:
+        state_order = {state: index for index, state in enumerate(State)}
+        summary['state_order'] = summary['state'].apply(lambda x: state_order.get(State(x), -1))
+        summary = summary.sort_values('state_order').drop(columns=['state_order']).reset_index(drop=True)
+        return summary
+
+    def error_summary(self) -> pd.DataFrame:
+        """Return a summary of error messages for projects."""
+        df = self.dataframe
+        return (df.loc[(df['state'] == 'error') & (df['scope'] == 'projects')]
+                .groupby('message').size()
+                .reset_index(name='count')
+                .sort_values('count', ascending=False)
+                .reset_index(drop=True)
+                )
+
+    def _get_latest_log_files(self, rel_path: str) -> tuple[str | None, str | None]:
+        """Find the most recent .out and .err log files in the rel_path/logs directory."""
+        logs_dir = Path(self._rel_to_abs(rel_path)) / 'logs'
+        if not logs_dir.exists():
+            return None, None
+
+        out_files = sorted(logs_dir.glob('*.out'), key=lambda f: f.stat().st_mtime, reverse=True)
+        err_files = sorted(logs_dir.glob('*.err'), key=lambda f: f.stat().st_mtime, reverse=True)
+
+        latest_out = str(out_files[0]) if out_files else None
+        latest_err = str(err_files[0]) if err_files else None
+
+        return latest_out, latest_err
+
+    def display(self, **kwargs):
+        """Display the dataframe with clickable log links in Jupyter."""
+        from IPython.display import HTML, display
+        # Ensure include_logs is True for display
+        kwargs.setdefault('include_logs', True)
+        df = self.get_dataframe(**kwargs)
+        html = df.to_html(escape=False)
+        display(HTML(html))
+
+    def _repr_html_(self) -> str:
+        """Return HTML representation for automatic Jupyter notebook display."""
+        return self.dataframe.to_html(escape=False)
+
+    def launch(self,
+        cmd: str = None,
+        n_jobs: int = 0,
+        pool_size: int = 1,
+        slurm: bool = False,
+        job_template: str = None,
+        query_path: list[str] | str = [],
+        query_state: list[str] | str = [],
+        query_message: list[str] | str = [],
+        query_inputs: list[tuple[str, str]] = None,
+        query_name: list[str] = [],
+        query_warnings: list[str] = [],
+        debug: bool = False,
+    ):
+        """Launch a command for each project directory in the dataset.
+
+        Args:
+            cmd (str):
+                Custom command to run the workflow or any other command/script.
+            n_jobs (int):
+                Number of jobs to launch. If 0, all jobs are launched.
+            pool_size (int):
+                Number of parallel jobs to run using subprocess. Default is 1.
+            slurm (bool):
+                Whether to submit the workflow to SLURM.
+            job_template (str):
+                Path to the bash script or SLURM job template file. You can use Jinja2
+                templating to customize the job script using the fields of
+                the input YAML, the project directory, and whether SLURM is used.
+                If not provided, the job script generated by a previous run in each project is reused.
+            query_path (list[str] | str):
+                If provided, filters rows whose 'rel_path' matches these glob patterns.
+            query_state (list[str] | str):
+                If provided, filters rows whose 'state' matches this value/list of values.
+            query_message (list[str] | str):
+                If provided, filters rows whose 'message' matches these glob patterns (e.g., 'URLError*').
+            query_inputs (list[tuple[str, str]]):
+                If provided, filters projects whose inputs file has all these field and value pairs (e.g. [('pdb_ids', '1ABC')]).
+            query_name (list[str]):
+                If provided, filters projects whose inputs file name matches these glob patterns ignoring case (e.g. '*kinase*').
+            query_warnings (list[str]):
+                If provided, filters projects with a current warning whose tag matches these glob patterns (e.g. 'pbcontacts', or '*' for any warning).
+                Warnings in the MDs of the project count as well.
+            debug (bool):
+                Only print the commands without executing them.
+
+        """
+        # Validation: ensure proper parameters are provided
+        if slurm and cmd:
+            raise InputError("Custom command execution is not implemented for SLURM mode. Please provide a job_template that includes the necessary commands.")
+
+        # Load job template if provided
+        template_str = None
+        if job_template:
+            with open(job_template, 'r') as f:
+                template_str = f.read()
+
+        # Determine pool size for parallel execution
+        pool_size = min(pool_size, get_available_cpus())
+        if pool_size <= 0 and not slurm:
+            pool_size = get_available_cpus()
+        parallel = pool_size > 1 and not slurm
+        jobs_to_run = []
+
+        # Query projects directly from database with filters
+        query_path = _type_check_dir_list(query_path)
+        query_state = _type_check_dir_list(query_state)
+        query_message = _type_check_dir_list(query_message)
+        filtered_projects = self.query_table('projects', query_path, query_state, query_message, query_inputs, query_name, query_warnings)
+
+        if debug:
+            print(f"DEBUG: Found {len(filtered_projects)} projects matching the query filters.")
+            if len(filtered_projects) > 0 and slurm:
+                print("DEBUG: Job will not be submitted to SLURM in debug mode, but the job script will be generated.")
+        if n_jobs > 0:
+            filtered_projects = filtered_projects[:n_jobs]
+
+        # Without a template nor a command, reuse the job scripts from a previous run
+        # Check all of them before launching anything so we do not launch only a part of the projects
+        if not job_template and not cmd:
+            missing_scripts = []
+            for project_entry in filtered_projects:
+                rel_path = dict(zip(self.project_columns, project_entry))['rel_path']
+                if not os.path.exists(os.path.join(self._rel_to_abs(rel_path), JOB_SCRIPT_FILENAME)):
+                    missing_scripts.append(rel_path)
+            if missing_scripts:
+                raise InputError(f"Missing job script ({JOB_SCRIPT_FILENAME}) from a previous run in {len(missing_scripts)} projects: "
+                    + ", ".join(missing_scripts) + "\nPlease provide a command (-c) or a job template (-jt).")
+
+        for project_entry in filtered_projects:
+            project_dict = dict(zip(self.project_columns, project_entry))
+            rel_path = project_dict['rel_path']
+            project_dir = self._rel_to_abs(rel_path)
+            job_script_path = os.path.join(project_dir, JOB_SCRIPT_FILENAME)
+            # Generate job script from template if provided
+            if template_str:
+                inputs_yaml_path = os.path.join(project_dir, 'inputs.yaml')
+                inputs_config = load_yaml(inputs_yaml_path) if os.path.exists(inputs_yaml_path) else {}
+                template = jinja2.Template(template_str)
+                rendered_script = template.render(**inputs_config,
+                                                project_status=project_dict,
+                                                DIR=Path(project_dir).name,
+                                                PATH=Path(project_dir),
+                                                slurm=slurm)
+
+                with open(job_script_path, 'w') as f:
+                    f.write(rendered_script)
+                os.chmod(job_script_path, 0o755)
+            command_to_run = cmd if cmd else f"bash {os.path.basename(job_script_path)}"
+            # Create logs directory if it doesn't exist
+            log_dir = os.path.join(project_dir, 'logs')
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f'mwf_{int(time.time())}.out')
+            err_file = os.path.join(log_dir, f'mwf_{int(time.time())}.err')
+            # Launch workflow
+            if slurm:
+                # SLURM execution
+                if debug:
+                    print(f'Submitting SLURM job script: {job_script_path}')
+                    # print(f"In directory {project_dir}")
+                    # print("sbatch --output=logs/mwf_%j.out --error=logs/mwf_%j.err mwf_slurm_job.sh ")
+                else:
+                    print(f"Submitting SLURM job for {project_dir}")
+                    result = subprocess.run(['sbatch',
+                                    '--parsable',
+                                    '--output=logs/mwf_%j.out',
+                                    '--error=logs/mwf_%j.err',
+                                    job_script_path],
+                                cwd=project_dir, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"sbatch failed for {project_dir}:\n{result.stderr.strip()}")
+                    # With --parsable the output is 'jobid' or 'jobid;cluster'
+                    slurm_job_id = result.stdout.strip().split(';')[0]
+                    print(f"Submitted batch job {slurm_job_id}")
+                    self.update_status(project_dict['uuid'], state=State.WAITING,
+                                       message='Job submitted to SLURM', slurm_job_id=slurm_job_id)
+            elif parallel:
+                # Parallel execution - collect jobs to run later
+                if debug:
+                    print(f"[parallel] cd {project_dir}")
+                    print(f"[parallel] bash {job_script_path} > {log_file} 2> {err_file}")
+                else:
+                    jobs_to_run.append({
+                        'project_dir': project_dir,
+                        'rel_path': rel_path,
+                        'command_to_run': command_to_run,
+                        'log_file': log_file,
+                        'err_file': err_file
+                    })
+            else:
+                # Sequential execution
+                if debug:
+                    print(f"cd {project_dir}")
+                    print(f"{command_to_run}")
+                    continue
+                print(f"Running job for dataset entry {rel_path}")
+                self._run_sequential_job(command_to_run, project_dir, log_file, err_file)
+
+        # Execute parallel jobs if any
+        if parallel and jobs_to_run and not debug:
+            self._run_parallel_jobs(jobs_to_run, max_concurrent=pool_size)
+
+    def _run_sequential_job(self, command_to_run: str, project_dir: str, log_file: str, err_file: str):
+        """Run a single job sequentially with real-time output to both terminal and log files."""
+        proc = subprocess.Popen(
+            command_to_run,
+            cwd=project_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+            bufsize=1
+        )
+
+        with open(log_file, 'w') as out_f, open(err_file, 'w') as err_f:
+            # Create threads to handle stdout and stderr
+            stdout_thread = threading.Thread(
+                target=_stream_output,
+                args=(proc.stdout, out_f, sys.stdout)
+            )
+            stderr_thread = threading.Thread(
+                target=_stream_output,
+                args=(proc.stderr, err_f, sys.stderr)
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+            # Wait for threads to complete
+            stdout_thread.join()
+            stderr_thread.join()
+
+        proc.wait()
+
+    def _run_parallel_jobs(self, jobs: list[dict], max_concurrent: int):
+        """Run jobs in parallel and report progress.
+
+        Args:
+            jobs (list[dict]): List of job dictionaries with keys:
+                - project_dir: Full path to project directory
+                - rel_path: Relative path for display
+                - command_to_run: Command to run for the job
+                - log_file: Path to the log file
+                - err_file: Path to the error file
+            max_concurrent (int): Maximum number of concurrent jobs.
+
+        """
+        print(f"Launching {len(jobs)} jobs in parallel (max {max_concurrent} concurrent)...")
+
+        running_processes = {}
+        pending_jobs = list(jobs)
+        completed = 0
+        total = len(jobs)
+        open_files = {}  # Track open file handles (tuple of log_f, err_f)
+
+        while pending_jobs or running_processes:
+            # Start new jobs if we have capacity
+            while pending_jobs and len(running_processes) < max_concurrent:
+                job = pending_jobs.pop(0)
+                print(f"Starting job for {job['rel_path']}")
+                log_f = open(job['log_file'], 'w')
+                err_f = open(job['err_file'], 'w')
+                proc = subprocess.Popen(
+                    job['command_to_run'],
+                    cwd=job['project_dir'],
+                    stdout=log_f,
+                    stderr=err_f,
+                    shell=True
+                )
+                running_processes[proc] = job
+                open_files[proc] = (log_f, err_f)
+
+            # Check for completed jobs
+            for proc in list(running_processes.keys()):
+                retcode = proc.poll()
+                if retcode is not None:
+                    job = running_processes.pop(proc)
+                    log_f, err_f = open_files.pop(proc)
+                    log_f.close()
+                    err_f.close()
+                    completed += 1
+                    status = "DONE" if retcode == 0 else f"FAILED (exit code {retcode})"
+                    print(f"[{completed}/{total}] {job['rel_path']}: {status}")
+
+            if running_processes:
+                time.sleep(1)  # Avoid busy waiting
+
+        print(f"All {total} jobs completed.")
+
+    def recount_all_mds(self, verbose: bool = False):
+        """Count all MDs for each project and update the num_mds field in the projects table."""
+        with self.locked_storage_file:
+            cur = self.conn.cursor()
+            # Get all project UUIDs
+            cur.execute("SELECT uuid FROM projects")
+            project_uuids = [row[0] for row in cur.fetchall()]
+            for project_uuid in project_uuids:
+                # Count MDs for this project
+                cur.execute("SELECT COUNT(*) FROM mds WHERE project_uuid=?", (project_uuid,))
+                count = cur.fetchone()[0]
+                # Update num_mds
+                cur.execute("UPDATE projects SET num_mds=? WHERE uuid=?", (count, project_uuid))
+                if verbose:
+                    print(f"Project {project_uuid}: num_mds set to {count}")
+            self.conn.commit()
+
+
+def _resolve_directory_patterns(dir_patterns: list[str], root_path: Path = Path('.')) -> list[Path]:
+    """Resolve directory patterns (glob or absolute/relative paths)."""
+    directories = []
+    for dir_pattern in dir_patterns:
+        if is_glob(dir_pattern):
+            if Path(dir_pattern).is_absolute():
+                matched_dirs = [Path(p) for p in glob.glob(dir_pattern)]
+            else:
+                matched_dirs = list(root_path.glob(dir_pattern))
+            directories.extend([p.absolute() for p in matched_dirs if p.is_dir()])
+        elif not Path(dir_pattern).is_dir():
+            continue
+        else:
+            p = Path(dir_pattern)
+            p = p.absolute() if not p.is_absolute() else p
+            directories.append(p)
+    return directories
+
+
+def _no_projects_message(query_path: list[str], query_state: list[str], query_message: list[str], query_inputs: list[tuple[str, str]],
+        query_name: list[str], query_warnings: list[str]) -> str:
+    """Build the message for a query with no matching projects, mentioning only the filters in use."""
+    filters = []
+    query_path = [pattern for pattern in query_path if pattern and pattern != '*']
+    if query_path: filters.append(f'path {" or ".join(query_path)}')
+    if query_state: filters.append(f'state {" or ".join(query_state)}')
+    if query_message: filters.append(f'message {" or ".join(query_message)}')
+    for field, value in query_inputs or []: filters.append(f'inputs {field} = {value}')
+    if query_name: filters.append(f'name {" or ".join(query_name)}')
+    if query_warnings: filters.append(f'warnings {" or ".join(query_warnings)}')
+    if not filters: return 'No projects found in the dataset.'
+    return 'No projects found matching ' + ' and '.join(filters) + '.'
+
+
+def _inputs_name_matches(inputs_filepath: str, patterns: list[str]) -> bool:
+    """Check if the name in an inputs file matches any of the glob patterns, ignoring case."""
+    found, name = _read_inputs_field(inputs_filepath, ['name'])
+    if not found or name is None: return False
+    return any(fnmatch.fnmatch(str(name).lower(), pattern.lower()) for pattern in patterns)
+
+
+def _inputs_field_matches(inputs_filepath: str, keys: list[str], value: Any) -> bool:
+    """Check if a field in an inputs file has a value.
+    If the field is a list it is enough for the value to be one of its items.
+    """
+    found, inputs_value = _read_inputs_field(inputs_filepath, keys)
+    if not found: return False
+    return inputs_value == value or (type(inputs_value) is list and value in inputs_value)
+
+
+def _read_inputs_field(inputs_filepath: str, keys: list[str]) -> tuple[bool, Any]:
+    """Read a field from an inputs file following a list of keys.
+    Return whether the field was found and its value.
+    """
+    value = load_json(inputs_filepath) if inputs_filepath.endswith('.json') else load_yaml(inputs_filepath)
+    for i, key in enumerate(keys):
+        if type(value) is list:
+            key = int(key)
+            if key >= len(value): return False, None
+        elif type(value) is dict:
+            if key not in value: return False, None
+        else:
+            raise ValueError(f'Field "{".".join(keys[:i])}" in {inputs_filepath} is not a dict or a list')
+        value = value[key]
+    return True, value
+
+
+def _type_check_dir_list(dir_list: list[str] | str) -> list[str]:
+    """Ensure the input is a list of strings."""
+    if isinstance(dir_list, str):
+        dir_list = [dir_list]
+    return dir_list

@@ -1,0 +1,103 @@
+[project]
+name = "proteingym-base"
+description = "Infrastructure for protein variant effect prediction. Dataset class and tools to facilitate benchmarking."
+readme = "README.md"
+authors = [  
+    { name = "ProteinGym team", email = "proteingym@googlegroups.com" }  
+]  
+dynamic = ["version"]  # Dynamically set hatch version using git tags
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.16.0,<1.0.0",
+    "toml>=0.10.2,<1.0.0",
+    "pydantic>=2.11.4,<3.0.0",
+    "semver>=3.0.4,<4.0.0",
+    "biopython>=1.85.0,<2.0.0",
+    "biotite>=1.6.0,<2.0.0",
+    "msgpack>=1.2.1,<2.0.0",
+    "polars[pyarrow]>=1.30.0,<2.0.0",
+    "python-frontmatter>=1.1.0",
+    "scikit-learn>=1.5.0,<2.0.0",
+    "scipy>=1.16.2,<2.0.0",
+    "requests>=2.32.3",
+]
+
+[project.scripts]
+proteingym-base = "proteingym.base.__main__:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "jupyterlab>=4.5.10",
+    "pre-commit>=4.2.0",
+    "pytest>=9.0.3",
+    "pytest-cov>=6.2.1",
+    "ruff>=0.11.7",
+    "scikit-learn>=1.7.2",
+    "mkdocs-material",
+    "mkdocstrings-python",
+    "mkdocs-autoapi",
+    "mkdocs-jupyter",
+    "pyrefly>=1.1.1",
+    "types-toml",
+    "types-requests",
+]
+
+[tool.hatch.version]
+path = "src/proteingym/base/__about__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/proteingym/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "README.md", "src"]
+addopts = "--doctest-modules --doctest-glob='*.md' --cov=proteingym.base --cov-branch --cov-report xml --cov-fail-under=80"
+filterwarnings = [
+    'ignore:.*Aggregation applied.*:UserWarning',
+]
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+# Ignore rules that require docstrings to be present
+# Only check format/style of existing docstrings
+ignore = [
+    "N805",
+    "D100",  # Missing docstring in public module
+    "D101",  # Missing docstring in public class
+    "D102",  # Missing docstring in public method
+    "D103",  # Missing docstring in public function
+    "D104",  # Missing docstring in public package
+    "D105",  # Missing docstring in magic method
+    "D106",  # Missing docstring in public nested class
+    "D107",  # Missing docstring in __init__
+]
+select = [
+    "E", # pycodestyle errors
+    "W", # pycodestyle warnings
+    "F", # pyflakes
+    "N", # pep8 naming
+    "I", # isort
+    # "C", # flake8-comprehensions
+    "B", # flake8-bugbear
+    "A", # flake8-builtins
+    "D", # pydocstyle
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+ignore-decorators = ["typing.overload"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D"]  # Ignore all docstring rules in tests
+
+[tool.ruff.lint.pep8-naming]
+extend-ignore-names = ["X"]
+
+[tool.pyrefly]
+project-includes = [
+    "src/**/*.py",
+]

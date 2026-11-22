@@ -1,0 +1,1408 @@
+import inspect
+
+import numpy as np
+
+from molsysmt._private.argdigest import arg_digest
+from molsysmt._private.smonitor import (
+    NotCompatibleConversionError,
+    NotImplementedConversionError,
+    warn,
+)
+from molsysmt._private.variables import is_all
+from molsysmt.configure import default_attribute
+
+
+def _convert_one_to_one(
+    molecular_system,
+    from_form,
+    to_form="molsysmt.MolSys",
+    selection="all",
+    structure_indices="all",
+    syntax="MolSysMT",
+    **kwargs,
+):
+    """Internal helper: convert a single input from one form to another (one-to-one path)."""
+
+    from molsysmt.attribute import attributes
+    from molsysmt.element import _element_index, _element_indices
+    from molsysmt.form import _dict_modules, is_file, is_item, load_converter
+
+    from . import get, get_form, has_attribute, select
+
+    output = None
+
+    # Conversion arguments
+
+    conversion_arguments = {}
+
+    # If to_form is a file
+
+    if is_item(to_form):
+        if is_file(to_form):
+            conversion_arguments["output_filename"] = to_form
+            to_form = get_form(to_form)
+
+    # Straight conversion
+
+    if to_form in _dict_modules[from_form]._convert_to:
+        function = _dict_modules[from_form]._convert_to[to_form]
+
+        function = load_converter(_dict_modules[from_form], function)
+
+        input_arguments = set(inspect.signature(function).parameters)
+
+        if "structure_indices" in input_arguments:
+            conversion_arguments["structure_indices"] = structure_indices
+
+        for element, element_index in _element_index.items():
+            if _element_indices[element] in input_arguments:
+                if _element_indices[element] in kwargs:
+                    if not is_all(selection):
+                        from molsysmt._private.smonitor import ArgumentError
+
+                        raise ArgumentError(
+                            _element_indices[element],
+                            caller="molsysmt.convert",
+                            message="Use either selection or explicit element indices, not both.",
+                        )
+                    break
+                if not is_all(selection):
+                    conversion_arguments[_element_indices[element]] = select(
+                        molecular_system,
+                        element=element,
+                        selection=selection,
+                        syntax=syntax,
+                        skip_digestion=True,
+                    )
+                else:
+                    conversion_arguments[_element_indices[element]] = "all"
+                break
+
+        kwargs["skip_digestion"] = True
+
+        missing_arguments = input_arguments - (
+            set(conversion_arguments) | set(kwargs) | {"item", "copy_if_all"}
+        )
+
+        from molsysmt._private.mechanical_model import (
+            CONSTRUCTION_TARGETS,
+            PARAMETERIZED,
+            requested,
+        )
+
+        model_defaults = (
+            requested(
+                molecular_system, overrides=kwargs, caller="molsysmt.basic.convert"
+            )[0]
+            if to_form in CONSTRUCTION_TARGETS and from_form not in PARAMETERIZED
+            else {}
+        )
+        stored_mechanics = False
+        for missing_argument in missing_arguments:
+            if attributes.get(missing_argument, {}).get(
+                "mechanical", False
+            ) and has_attribute(
+                molecular_system, missing_argument, skip_digestion=True
+            ):
+                kwargs[missing_argument] = get(
+                    molecular_system,
+                    element="system",
+                    skip_digestion=True,
+                    **{missing_argument: True},
+                )
+                stored_mechanics = True
+            elif missing_argument in default_attribute:
+                kwargs[missing_argument] = (
+                    model_defaults[missing_argument]["value"]
+                    if missing_argument in model_defaults
+                    else default_attribute[missing_argument]
+                )
+
+        if stored_mechanics:
+            # Stored settings are new inputs, not previously validated keywords.
+            kwargs["skip_digestion"] = False
+
+        missing_arguments = input_arguments - (
+            set(conversion_arguments) | set(kwargs) | {"item", "copy_if_all"}
+        )
+
+        if "get_missing_bonds" in kwargs and "get_missing_bonds" not in input_arguments:
+            del kwargs["get_missing_bonds"]
+
+        if len(missing_arguments) > 0:
+            if hasattr(_dict_modules[from_form], "_conversion_opt_kwargs"):
+                if to_form in _dict_modules[from_form]._conversion_opt_kwargs:
+                    for opt_kwarg in _dict_modules[from_form]._conversion_opt_kwargs[
+                        to_form
+                    ]:
+                        if opt_kwarg in missing_arguments:
+                            missing_arguments.discard(opt_kwarg)
+
+            missing_arguments.discard("compression")
+            missing_arguments.discard("compression_opts")
+            missing_arguments.discard("int_precision")
+            missing_arguments.discard("float_precision")
+            missing_arguments.discard("get_missing_bonds")
+            missing_arguments.discard("from_naming_scheme")
+
+            if len(missing_arguments) > 0:
+                raise NotCompatibleConversionError(
+                    from_form, to_form, missing_arguments
+                )
+
+        output = function(molecular_system, **conversion_arguments, **kwargs)
+
+    elif ("molsysmt.MolSys" in _dict_modules[from_form]._convert_to) and (
+        to_form in _dict_modules["molsysmt.MolSys"]._convert_to
+    ):
+        intermediate_function = _dict_modules[from_form]._convert_to["molsysmt.MolSys"]
+        intermediate_function = load_converter(
+            _dict_modules[from_form], intermediate_function
+        )
+
+        intermediate_signature = inspect.signature(intermediate_function)
+        accepts_arbitrary_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in intermediate_signature.parameters.values()
+        )
+        if accepts_arbitrary_kwargs:
+            intermediate_kwargs = kwargs
+        else:
+            intermediate_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key in intermediate_signature.parameters
+            }
+
+        output = _convert_one_to_one(
+            molecular_system,
+            from_form,
+            to_form="molsysmt.MolSys",
+            selection=selection,
+            structure_indices=structure_indices,
+            syntax=syntax,
+            **intermediate_kwargs,
+        )
+        output = _convert_one_to_one(
+            output, "molsysmt.MolSys", to_form=to_form, **kwargs
+        )
+
+    return output
+
+
+def _convert_multiple_to_one_with_shortcuts(
+    molecular_system,
+    from_forms,
+    to_form="molsysmt.MolSys",
+    selection="all",
+    structure_indices="all",
+    syntax="MolSysMT",
+    **kwargs,
+):
+    """Internal helper: convert a list/tuple of inputs to one output using conversion shortcuts."""
+
+    from molsysmt._private.conversion_shortcuts import _multiple_conversion_shortcuts
+    from molsysmt.element import _element_index, _element_indices
+    from molsysmt.form import _dict_modules, is_file, is_item
+
+    from . import get_form, select
+
+    output = None
+
+    # Conversion arguments
+
+    conversion_arguments = {}
+
+    # If to_form is a file
+
+    if is_item(to_form):
+        if is_file(to_form):
+            conversion_arguments["output_filename"] = to_form
+            to_form = get_form(to_form)
+
+    # Conversion
+    sorted_forms = tuple(sorted(from_forms))
+
+    if to_form in _multiple_conversion_shortcuts[sorted_forms]:
+        function = _multiple_conversion_shortcuts[sorted_forms][to_form]
+
+        input_arguments = set(inspect.signature(function).parameters)
+
+        if "structure_indices" in input_arguments:
+            conversion_arguments["structure_indices"] = structure_indices
+
+        if "get_missing_bonds" in kwargs and "get_missing_bonds" not in input_arguments:
+            del kwargs["get_missing_bonds"]
+
+        for element, element_index in _element_index.items():
+            if _element_indices[element] in input_arguments:
+                if not is_all(selection):
+                    conversion_arguments[_element_indices[element]] = select(
+                        molecular_system,
+                        element=element,
+                        selection=selection,
+                        syntax=syntax,
+                        skip_digestion=True,
+                    )
+                else:
+                    conversion_arguments[_element_indices[element]] = "all"
+                break
+
+        output = function(molecular_system, **conversion_arguments, **kwargs)
+
+    elif ("molsysmt.MolSys" in _multiple_conversion_shortcuts[sorted_forms]) and (
+        to_form in _dict_modules["molsysmt.MolSys"]._convert_to
+    ):
+        output = _convert_multiple_to_one_with_shortcuts(
+            molecular_system,
+            sorted_forms,
+            to_form="molsysmt.MolSys",
+            selection=selection,
+            structure_indices=structure_indices,
+            syntax=syntax,
+            **kwargs,
+        )
+        output = _convert_one_to_one(output, "molsysmt.MolSys", to_form=to_form)
+
+    return output
+
+
+def _prune_structural_attributes_off_the_axis(
+    molecular_system, from_forms, from_attributes
+):
+    """Removing structural attributes from items that do not span the structure axis.
+
+    An item holding a single reference conformation beside a trajectory contributes
+    identity and topology, not structures. Leaving its structural series in place would
+    let item order decide how many structures the converted system has.
+    """
+
+    from molsysmt._private.smonitor import StructuralAttributeOffAxisWarning
+    from molsysmt._private.structure_axis import structure_axis
+    from molsysmt.attribute import is_structural_attribute
+
+    axis, counts = structure_axis(
+        molecular_system, from_forms, caller="molsysmt.convert"
+    )
+    if axis is None:
+        return {}
+
+    dropped = set()
+    for index, count in enumerate(counts):
+        if count is None or count == axis:
+            continue
+        off_axis = {
+            attribute
+            for attribute in from_attributes[index]
+            if is_structural_attribute(attribute)
+            and not attribute.startswith("n_")
+            # Positional indices are regenerated below, not copied observations.
+            and attribute not in {"atom_index", "structure_index"}
+        }
+        from_attributes[index] -= off_axis
+        dropped |= off_axis
+
+    # Only report what no item on the axis can supply: otherwise the attribute is
+    # delivered, just by the trajectory instead of by the reference conformation.
+    on_axis = set()
+    for index, count in enumerate(counts):
+        if count == axis:
+            on_axis |= from_attributes[index]
+    dropped -= on_axis
+
+    if dropped:
+        warn(
+            StructuralAttributeOffAxisWarning(
+                attributes=sorted(dropped), caller="molsysmt.convert"
+            ),
+            stacklevel=2,
+        )
+    return {
+        index: count
+        for index, count in enumerate(counts)
+        if count is not None and count != axis
+    }
+
+
+def _convert_multiple_to_one(
+    molecular_system,
+    from_forms,
+    to_form="molsysmt.MolSys",
+    selection="all",
+    structure_indices="all",
+    syntax="MolSysMT",
+    **kwargs,
+):
+    """Internal helper: convert a list/tuple of inputs to one output via plain graph resolution."""
+
+    from molsysmt.attribute import attributes as _attributes
+    from molsysmt.basic import has_attribute
+    from molsysmt.element import _element_index, _element_indices
+    from molsysmt.form import _dict_modules, is_file, is_item, load_converter
+
+    from . import get_form, select
+
+    n_items = len(from_forms)
+
+    # Conversion arguments
+
+    conversion_arguments = {}
+
+    # If to_form is a file
+
+    if is_item(to_form):
+        if is_file(to_form):
+            conversion_arguments["output_filename"] = to_form
+            to_form = get_form(to_form)
+
+    from molsysmt._private.native_composition import compose_with_coordinate_source
+
+    composed = compose_with_coordinate_source(
+        molecular_system, from_forms, structure_indices
+    )
+    if composed is not None:
+        return _convert_one_to_one(
+            composed,
+            "molsysmt.MolSys",
+            to_form=to_form,
+            selection=selection,
+            structure_indices="all",
+            syntax=syntax,
+            **conversion_arguments,
+            **kwargs,
+        )
+
+    #### Checking attributes sets for straight and indirect conversion
+
+    to_attributes = set(
+        [ii for ii, jj in _dict_modules[to_form].attributes.items() if jj]
+    )
+
+    from_attributes = []
+    for from_form, from_item in zip(from_forms, molecular_system):
+        aux_set = set()
+        for ii, jj in _dict_modules[from_form].attributes.items():
+            if jj:
+                if _dict_modules[from_form].has_attribute(from_item, ii):
+                    aux_set.add(ii)
+        from_attributes.append(aux_set)
+
+    # Only items spanning the structure axis of the system may contribute structural
+    # attributes. Pruning them here, once, keeps the three provider searches below --
+    # which all walk the items from last to first -- from choosing a reference
+    # conformation over the trajectory just because it was listed later.
+    off_axis_items = _prune_structural_attributes_off_the_axis(
+        molecular_system, from_forms, from_attributes
+    )
+
+    attributes_to_be_discarded = []
+    for attribute in to_attributes:
+        if attribute.startswith("n_"):
+            attributes_to_be_discarded.append(attribute)
+    for attributes in from_attributes:
+        for attribute in attributes:
+            if attribute.startswith("n_"):
+                attributes_to_be_discarded.append(attribute)
+
+    attributes_to_be_discarded += [
+        "box_volume",
+        "box_shape",
+        "box_angles",
+        "box_lengths",
+    ]
+    attributes_to_be_discarded += ["atom_index", "structure_index"]
+
+    for attribute in attributes_to_be_discarded:
+        to_attributes.discard(attribute)
+        for ii in from_attributes:
+            ii.discard(attribute)
+
+    all_from_attributes = set()
+    all_from_attributes = all_from_attributes.union(*from_attributes)
+
+    #### straight conversion
+
+    straight_conversions = {}
+
+    for item_index in range(n_items):
+        from_form = from_forms[item_index]
+        aux_set = from_attributes[item_index]
+        if from_form in _dict_modules:
+            if to_form in _dict_modules[from_form]._convert_to:
+                function = _dict_modules[from_form]._convert_to[to_form]
+
+                function = load_converter(_dict_modules[from_form], function)
+
+                input_arguments = set(inspect.signature(function).parameters)
+                for ii in [
+                    "atom_indices",
+                    "group_indices",
+                    "component_indices",
+                    "chain_indices",
+                    "molecule_indices",
+                    "entity_indices",
+                    "structure_indices",
+                    "molecular_system",
+                    "copy_if_all",
+                ]:
+                    input_arguments.discard(ii)
+
+                attributes_in_other_forms = {}
+
+                for aux_attribute in (all_from_attributes - aux_set) & to_attributes:
+                    for ii in range(n_items - 1, -1, -1):
+                        if aux_attribute in from_attributes[ii]:
+                            attributes_in_other_forms[aux_attribute] = [
+                                molecular_system[ii],
+                                from_forms[ii],
+                            ]
+                            break
+
+                repeated_attributes = {}
+                for aux_attribute in aux_set:
+                    for ii in range(n_items - 1, item_index, -1):
+                        if aux_attribute in from_attributes[ii]:
+                            if has_attribute(molecular_system[ii], aux_attribute):
+                                repeated_attributes[aux_attribute] = [
+                                    molecular_system[ii],
+                                    from_forms[ii],
+                                ]
+                                break
+
+                input_attributes = {}
+                set_attributes = {}
+
+                for aux_attribute, aux_value in attributes_in_other_forms.items():
+                    if _dict_modules[from_form].attributes[aux_attribute]:
+                        set_attributes[aux_attribute] = aux_value
+                    else:
+                        if aux_attribute in input_arguments:
+                            input_attributes[aux_attribute] = aux_value
+                        else:
+                            set_attributes[aux_attribute] = aux_value
+
+                for aux_attribute, aux_value in repeated_attributes.items():
+                    set_attributes[aux_attribute] = aux_value
+
+                status_set_attributes = True
+
+                for aux_attribute in set_attributes:
+                    set_to = _attributes[aux_attribute]["set_to"]
+                    if not hasattr(
+                        _dict_modules[to_form], f"set_{aux_attribute}_to_{set_to}"
+                    ):
+                        status_set_attributes = False
+                        break
+
+                straight_conversions[item_index] = {
+                    "item": molecular_system[item_index],
+                    "form": from_form,
+                    "input_arguments": input_arguments,
+                    "attributes_in_form": aux_set,
+                    "attributes_in_other_forms": attributes_in_other_forms,
+                    "repeated_attributes": repeated_attributes,
+                    "input_attributes": input_attributes,
+                    "set_attributes": set_attributes,
+                    "status_set_attributes": status_set_attributes,
+                }
+
+    if False:
+        for ii in straight_conversions:
+            print(ii, straight_conversions[ii])
+            print("----")
+        print("@@@@")
+
+    basic_index = None
+    n_set_attributes = np.inf
+
+    for aux_index, aux_dict in straight_conversions.items():
+        if aux_dict["status_set_attributes"]:
+            if n_set_attributes > len(aux_dict["set_attributes"]):
+                basic_index = aux_index
+                n_set_attributes = len(aux_dict["set_attributes"])
+
+    if basic_index is not None:
+        aux_dict = straight_conversions[basic_index]
+
+        for aux_attribute, aux_item_form in aux_dict["input_attributes"].items():
+            aux_item = aux_item_form[0]
+            aux_form = aux_item_form[1]
+            get_from = _attributes[aux_attribute]["get_from"][0]
+            get_function = getattr(
+                _dict_modules[aux_form], f"get_{aux_attribute}_from_{get_from}"
+            )
+            get_arguments = {}
+            input_arguments = set(inspect.signature(get_function).parameters)
+            if "structure_indices" in input_arguments:
+                get_arguments["structure_indices"] = structure_indices
+            if "indices" in input_arguments:
+                if not is_all(selection):
+                    get_arguments["indices"] = select(
+                        molecular_system,
+                        element=get_from,
+                        selection=selection,
+                        syntax=syntax,
+                        skip_digestion=True,
+                    )
+                else:
+                    get_arguments["indices"] = "all"
+            conversion_arguments[aux_attribute] = get_function(
+                aux_item, **get_arguments
+            )
+        conversion_function = _dict_modules[aux_dict["form"]]._convert_to[to_form]
+
+        conversion_function = load_converter(
+            _dict_modules[aux_dict["form"]], conversion_function
+        )
+
+        input_arguments = set(inspect.signature(conversion_function).parameters)
+        if "structure_indices" in input_arguments:
+            # A reference contributes inventory, not positions on the trajectory
+            # axis. Read its one representative, never trajectory indices.
+            conversion_arguments["structure_indices"] = (
+                ([0] if off_axis_items[basic_index] else "all")
+                if basic_index in off_axis_items
+                else structure_indices
+            )
+        for element, element_index in _element_index.items():
+            if _element_indices[element] in input_arguments:
+                if not is_all(selection):
+                    conversion_arguments[_element_indices[element]] = select(
+                        molecular_system,
+                        element=element,
+                        selection=selection,
+                        syntax=syntax,
+                        skip_digestion=True,
+                    )
+                else:
+                    conversion_arguments[_element_indices[element]] = "all"
+                break
+        output = conversion_function(aux_dict["item"], **conversion_arguments, **kwargs)
+
+        if basic_index in off_axis_items:
+            from molsysmt.native import MolSys, Structures
+
+            domain = output.structures if isinstance(output, MolSys) else output
+            if isinstance(output, MolSys) and output.interactions:
+                from molsysmt._private.smonitor import StructuralInconsistencyError
+
+                raise StructuralInconsistencyError(
+                    reason=(
+                        "Off-axis reference interaction analyses need an explicit "
+                        "structure mapping; detach them or supply aligned domains "
+                        "before conversion."
+                    ),
+                    caller="molsysmt.convert",
+                )
+            if isinstance(domain, Structures):
+                # Discard the off-axis reference series as one complete payload.
+                # On-axis contributors below supply the selected observations.
+                domain._assign_frame_payload({})
+                if isinstance(output, MolSys):
+                    states = output.chemical_states
+                    if states is not None and states.n_chemical_states > 1:
+                        import pandas as pd
+
+                        # Stage an empty association on the retired reference axis.
+                        # Final reconciliation supplies unknowns on the new axis,
+                        # even when its selected cardinality happens to be one.
+                        output._structure_chemical_state_indices = pd.array(
+                            [], dtype="Int64"
+                        )
+                    else:
+                        output._structure_chemical_state_indices = None
+
+        for aux_attribute, aux_item_form in aux_dict["set_attributes"].items():
+            aux_item = aux_item_form[0]
+            aux_form = aux_item_form[1]
+            get_from = _attributes[aux_attribute]["get_from"][0]
+            get_function = getattr(
+                _dict_modules[aux_form], f"get_{aux_attribute}_from_{get_from}"
+            )
+            get_arguments = {}
+            input_arguments = set(inspect.signature(get_function).parameters)
+            if "structure_indices" in input_arguments:
+                get_arguments["structure_indices"] = structure_indices
+            if "indices" in input_arguments:
+                if not is_all(selection):
+                    get_arguments["indices"] = select(
+                        molecular_system,
+                        element=get_from,
+                        selection=selection,
+                        syntax=syntax,
+                    )
+                else:
+                    get_arguments["indices"] = "all"
+            value_to_set = get_function(aux_item, **get_arguments)
+            if _set_composed_structure_attribute(
+                output,
+                aux_attribute,
+                value_to_set,
+            ):
+                continue
+            set_to = _attributes[aux_attribute]["set_to"]
+            set_function = getattr(
+                _dict_modules[to_form], f"set_{aux_attribute}_to_{set_to}"
+            )
+            set_function(output, value=value_to_set)
+
+    elif to_form == "molsysmt.MolSys" and basic_index is None:
+        print("The conversion needs to include new set functions:")
+
+        for aux_index, aux_dict in straight_conversions.items():
+            print("   ")
+            print("To ", aux_dict["form"], ":")
+            print("   ")
+            for att, mm in aux_dict["set_attributes"].items():
+                set_to = _attributes[att]["set_to"]
+                if not hasattr(_dict_modules[to_form], f"set_{att}_to_{set_to}"):
+                    print(att, "from", mm[1], "to", set_to)
+
+            print("   ")
+
+        from molsysmt._private.smonitor import InternalAlgorithmError
+
+        raise InternalAlgorithmError(
+            reason="The conversion needs to include new set functions.",
+            caller="molsysmt.basic.convert",
+        )
+
+    elif to_form != "molsysmt.MolSys":
+        output = _convert_multiple_to_one(
+            molecular_system,
+            from_forms,
+            to_form="molsysmt.MolSys",
+            selection=selection,
+            structure_indices=structure_indices,
+            syntax=syntax,
+            **kwargs,
+        )
+        if output is not None:
+            output = _convert_one_to_one(output, "molsysmt.MolSys", to_form=to_form)
+
+    if to_form == "molsysmt.MolSys" and output is not None:
+        _reconcile_composed_structure_state_association(output)
+
+    return output
+
+
+def _set_composed_structure_attribute(item, attribute, value):
+    """Replace one complete structure-aligned series during composition."""
+
+    canonical_units = {
+        "time": "ps",
+        "coordinates": "nm",
+        "velocities": "nm/ps",
+        "box": "nm",
+        "b_factor": "nm**2",
+        "temperature": "K",
+        "potential_energy": "kJ/mol",
+        "kinetic_energy": "kJ/mol",
+    }
+    structure_attributes = {
+        "structure_id",
+        "time",
+        "coordinates",
+        "velocities",
+        "box",
+        "b_factor",
+        "alternate_location",
+        "occupancy",
+        "temperature",
+        "potential_energy",
+        "kinetic_energy",
+    }
+    if attribute not in structure_attributes:
+        return False
+    if value is None:
+        return False
+
+    from molsysmt.native import Structures
+
+    if isinstance(item, Structures):
+        structures = item
+    elif hasattr(item, "structures") and isinstance(item.structures, Structures):
+        structures = item.structures
+    else:
+        return False
+
+    if attribute in canonical_units:
+        from molsysmt.native.structures import _raw_value
+
+        value = _raw_value(value, canonical_units[attribute])
+
+    candidate = structures._frame_payload()
+    candidate[attribute] = value
+    n_structures = len(value)
+    for name, current in candidate.items():
+        if current is not None and len(current) != n_structures:
+            candidate[name] = None
+    structures._assign_frame_payload(candidate)
+    return True
+
+
+def _reconcile_composed_structure_state_association(item):
+    """Align explicit chemical-state associations after composite conversion."""
+
+    explicit = item._structure_chemical_state_indices
+    if explicit is None:
+        return
+
+    n_structures = item.structures.n_structures
+    if len(explicit) == n_structures:
+        return
+
+    if item.chemical_states is not None and item.chemical_states.n_chemical_states == 1:
+        item._structure_chemical_state_indices = None
+    else:
+        import pandas as pd
+
+        item._structure_chemical_state_indices = pd.array(
+            [pd.NA] * n_structures,
+            dtype="Int64",
+        )
+
+
+def _convert_to_h5msm(
+    molecular_system,
+    from_form,
+    output_filename,
+    selection,
+    structure_indices,
+    syntax,
+    kwargs,
+):
+    """Write an explicitly selected modular schema through its owned codec."""
+    from molsysmt import h5msm
+    from molsysmt.form import _dict_modules
+
+    if output_filename is None:
+        raise ValueError("output_filename is required for H5MSM conversion.")
+    if from_form == "file:h5msm":
+        from pathlib import Path
+
+        source_path = Path(molecular_system)
+        target_path = Path(output_filename)
+        if target_path.exists() and source_path.samefile(target_path):
+            from molsysmt._private.smonitor import ArgumentError
+
+            raise ArgumentError(
+                "output_filename",
+                value=output_filename,
+                caller="molsysmt.convert",
+            )
+
+    options = dict(kwargs)
+    from molsysmt._private.h5msm_storage.versions import (
+        DEFAULT_WRITE_VERSION,
+        write_version,
+    )
+
+    version = write_version(options.pop("format_version", DEFAULT_WRITE_VERSION))
+    for name in ("int_precision", "float_precision"):
+        if name in options:
+            from molsysmt._private.smonitor import ArgumentConflictError
+
+            raise ArgumentConflictError(
+                name,
+                "format_version",
+                reason=(
+                    f"H5MSM {version} uses field-specific stored dtypes and does "
+                    "not implement legacy global precision overrides. Omit "
+                    f"{name}; structural floating series use float64 and typed "
+                    "domain data keep their declared encoding."
+                ),
+                caller="molsysmt.convert",
+            )
+    for name, default in (
+        ("compression", "gzip"),
+        ("compression_opts", 4),
+    ):
+        value = options.pop(name, default)
+        if value != default:
+            raise ValueError(
+                f"H5MSM {version} does not support the {name} conversion option yet."
+            )
+
+    if (
+        version == "1.0"
+        and from_form == "file:h5msm"
+        and is_all(selection)
+        and is_all(structure_indices)
+        and not options
+    ):
+        from molsysmt._private.h5msm_storage.modular import rewrite_as_v1
+
+        if rewrite_as_v1(molecular_system, output_filename):
+            return output_filename
+
+    if isinstance(from_form, str):
+        routes = _dict_modules[from_form]._convert_to
+        if from_form == "molsysmt.Structures" or (
+            "molsysmt.MolSys" not in routes and "molsysmt.Structures" in routes
+        ):
+            target = "molsysmt.Structures"
+        elif from_form == "molsysmt.ChemicalStates" or (
+            "molsysmt.MolSys" not in routes and "molsysmt.ChemicalStates" in routes
+        ):
+            target = "molsysmt.ChemicalStates"
+        else:
+            target = "molsysmt.MolSys"
+    else:
+        target = "molsysmt.MolSys"
+
+    if (
+        from_form == target
+        and is_all(selection)
+        and is_all(structure_indices)
+        and not options
+    ):
+        native = molecular_system
+    else:
+        native = convert(
+            molecular_system,
+            to_form=target,
+            selection=selection,
+            structure_indices=structure_indices,
+            syntax=syntax,
+            skip_digestion=True,
+            **options,
+        )
+    structures = (
+        native
+        if target == "molsysmt.Structures"
+        else getattr(native, "structures", None)
+    )
+    if (
+        not is_all(selection)
+        and structures is not None
+        and structures.bioassembly is not None
+    ):
+        raise ValueError(
+            f"H5MSM {version} cannot write an atom selection with bioassembly until "
+            "its chain indices can be remapped."
+        )
+    if target == "molsysmt.Structures":
+        return h5msm.write_layers(
+            output_filename, structures=native, format_version=version
+        )
+    if target == "molsysmt.ChemicalStates":
+        return h5msm.write_layers(
+            output_filename, chemical_states=native, format_version=version
+        )
+    return h5msm.write(native, output_filename, format_version=version)
+
+
+# Keep the decorator import beside the public conversion boundary.
+from smonitor import signal  # noqa: E402
+
+
+@signal(tags=["api", "conversion"])
+@arg_digest()
+def convert(
+    molecular_system,
+    to_form="molsysmt.MolSys",
+    selection="all",
+    structure_indices="all",
+    syntax="MolSysMT",
+    strict=False,
+    return_report=False,
+    skip_digestion=False,
+    *,
+    from_naming_scheme=None,
+    **kwargs,
+):
+    """
+    Converting a molecular system into another form or set of forms.
+
+    This function converts a molecular system from its current form into one target form, or into
+    multiple target forms. Optionally, a subset of atoms and/or structures can be selected using
+    `selection` and `structure_indices` before the conversion takes place.
+
+
+    Parameters
+    ----------
+    molecular_system : molecular system
+        Molecular system in any supported MolSysMT format.
+    to_form : str, list of str, or None, default='molsysmt.MolSys'
+        Target form or forms for the conversion output.
+    selection : str, list, tuple, or numpy.ndarray, default='all'
+        Selection string or boolean/integer array specifying elements.
+    structure_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Structure indices (0-based) to include or process.
+    syntax : str, default='MolSysMT'
+        Selection syntax used to evaluate `selection` (e.g., 'MolSysMT', 'MDTraj').
+    strict : bool, default=False
+        Whether conversion warnings and fidelity losses are promoted to errors.
+    return_report : bool, default=False
+        Whether to return the conversion report together with the converted system.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+    from_naming_scheme : str or none, default=None
+        Explicit source group vocabulary: 'sequence', 'amber', 'ccd' or 'legacy'.
+        None uses stored declarations and assessed unambiguous names. An explicit
+        convention must agree with known declarations in the selected groups.
+        Topology, MolSys, their typed dictionaries and H5MSM outputs retain the
+        declaration; the input is unchanged.
+        Native GRO and PDB readers apply an explicit declaration before initial group
+        classification and candidate bond inference. This supplies reading
+        context, not a chemical-state assignment or force-field validation.
+        Semantic selections on these readers use that interpreted inventory;
+        existing native types are not recomputed merely by adding metadata.
+
+    Returns
+    -------
+    molecular system or list of molecular systems or tuple
+        The converted molecular system in the requested `to_form`. If `to_form` is a list,
+        a list of converted systems is returned. With `return_report=True`, returns
+        ``(output, report)`` or ``(outputs, reports)`` for multiple targets.
+
+
+    Raises
+    ------
+    FormatError
+        If a modular H5MSM 0.5/0.6 file is requested as
+        ``molsysmt.H5MSMFileHandler``. This handler supports only 0.3/0.4;
+        load modular files as resident MolSys objects.
+    NotSupportedFormError
+        If the input system or the requested target form is not supported.
+    NotCompatibleConversionError
+        If `strict=True` and the preflight classifies the conversion as lossy.
+    ArgumentError
+        If any input argument is invalid or inconsistent, including an
+        out-of-range structure index.
+    ArgumentConflictError
+        If a legacy global int_precision or float_precision override is
+        supplied for modular H5MSM 0.5/0.6. These schemas use field-specific
+        encodings; omit those overrides rather than requesting a global cast.
+    MolecularSystemVerificationError
+        If form loading, detection or complementary-system inspection cannot
+        finish because of an operational failure. The original exception chain
+        is retained; this does not declare the molecular input malformed.
+
+
+    Notes
+    -----
+    - Supported molecular-system forms are summarized in :ref:`Introduction_Forms`.
+    - Selection strings must follow one of the syntaxes described in
+      :ref:`Introduction_Selection`.
+    - Explicit structure indices are validated before a conversion adapter is called.
+    - In a reference-plus-trajectory composition, structure indices address the
+      trajectory axis. The off-axis reference contributes inventory, not
+      broadcast observations; its own representative is never indexed using
+      the requested trajectory positions.
+      Multiple chemical states acquire unknown trajectory associations. Named
+      analyses on that reference require an explicit structure mapping and
+      otherwise reject; matching selected counts do not establish correspondence.
+    - For declared mechanical arguments, explicit conversion keywords take
+      precedence over supported stored source settings, then library defaults.
+      Explicit None remains an override, for example to disable a stored
+      implicit-solvent request. Newly read source settings pass the adapter's
+      argument boundary. This neither edits the source nor certifies support
+      for arbitrary mechanics fields absent from that adapter's signature.
+    - Conversion reports audit stored and explicitly supplied group-name
+      declarations as topology metadata. Targets that retain labels alone report
+      this loss; strict=True rejects it before creating or replacing a target.
+      Default conversion retains its existing policy of permitting detected loss.
+      Reports also expose omitted named analyses and invalidated evaluated
+      interaction coverage when a source declaration is added to the result.
+    - Source naming interpretation never renames groups or changes their chemical
+      state. Explicit declarations are checked on selected groups before writing
+      a target. Native one-letter projection reads topology directly without
+      copying coordinates. Explicit group_indices preserve order/repetitions for
+      that projection and new group construction from sequence text. Existing
+      group-only inventories retain the unique-index extraction contract. These
+      indices cannot compete with a non-all selection; no atomic axis is invented.
+    - Reports classify semantics only within their ``audited_scopes``. Inspect
+      ``is_exhaustive`` before treating an ``equivalent`` outcome as a claim
+      about the complete represented source state. Strict lossy conversions
+      are rejected before target creation.
+    - Missing source information is not a loss. A report issue is created only
+      for an attribute available on the source instance or for an audited
+      adapter limitation.
+    - Ordinary conversions do not construct a preflight report. This keeps the
+      reporting layer opt-in when neither `strict` nor `return_report` is used.
+    - Converting to ``file:h5msm`` writes H5MSM 1.0 by default and preserves
+      stored mechanics without recalculating or rebinding assignments.
+      Explicit ``format_version="0.5"`` selects the mechanics-free schema;
+      ``format_version="0.6"`` selects the experimental schema. With a single
+      modular source file, all atoms and structures, and ordinary conversion
+      options, writing 1.0 re-encodes independent layers directly. It retains
+      absent and present-empty layers, axis links, and the original 0.5/0.6
+      root metadata. Use a new destination. This migration loads the stored
+      layers into memory. Legacy 0.3 and 0.4 files remain readable and can be
+      converted to a new H5MSM path. Version-specific migration helpers keep
+      their named 0.5 destination.
+    - Modular H5MSM writing uses field-specific stored dtypes. Structural
+      floating series use float64; typed chemistry/mechanics payloads retain
+      their declared encodings. Explicit ``int_precision`` or
+      ``float_precision`` controls are rejected before file publication,
+      including their legacy 'single'/'double' values. Omitting those controls
+      preserves the default codec and does not round stored assignments.
+    - Loading one H5MSM 0.5 path as one MolSys uses the reader's fresh resident
+      graph without a second eager snapshot by default. Repeated loads remain
+      independent; explicit ``copy_if_all=True`` still requests that snapshot.
+      Existing resident inputs retain their independent-copy default. This
+      optimization does not provide lazy or selective file-backed coordinates.
+    - Converting a single H5MSM 0.5 path to ``molsysmt.Topology`` reads only
+      its stored Topology layer with all atoms/structures, default MolSysMT
+      syntax and no strict/report, source-naming or extra converter options.
+      The result is an independent resident inventory. Static tables may load
+      in full; unrequested layers are neither loaded nor fully validated.
+      Other conversion contexts retain their existing loading behavior.
+    - A native Topology and Structures pair accepts explicit ``copy_if_all``.
+      Topology always detaches; False can adopt unowned Structures for an all-axis
+      request, while an already owned Structures still detaches. Subsets use the
+      same ascending source atom order for inventory and coordinates; structure
+      order/repetitions remain unchanged. Missing chemical states stay absent.
+    - A native ChemicalStates (or ChemicalStatesDict) and Structures pair can
+      compose a topology-free MolSys, in either item order. Supplying the pair
+      declares that their atom indices correspond; full axis counts must agree.
+      Atom and structure index selections remap the two domains together.
+      The reference chemical state is preserved, but multiple states acquire
+      no inferred per-structure assignment. The default result is independent;
+      ``copy_if_all=False`` shares native domains only for full-axis conversion.
+    - Standalone native Topology, ChemicalStates (or ChemicalStatesDict),
+      Structures and MolecularMechanics providers can compose one system.
+      The chemical provider owns all states; pure Topology supplies stable
+      inventory only. Complete atom axes must agree before selection, and
+      repeated explicit domains are rejected. Mechanical values,
+      settings and assignment provenance are transported without recalculation
+      or certification. Existing stale assignments stay stale on projection.
+      Structures receive no inferred assignment when several chemical states
+      exist. The default output is independent. ``copy_if_all=False`` suppresses
+      the final full-axis snapshot, but existing single-owner rules still detach
+      attached Topology, ChemicalStates and Structures domains; unowned structures
+      and the supplied mechanics can be shared. Selections produce a new subset.
+    - An explicit ChemicalStates (or ChemicalStatesDict) provider can also join
+      standalone native domains and one coordinate-only source, such as a DCD.
+      Only requested structures are loaded before assembling the common atom
+      axis and applying atom selection. Sources that also declare inventory or
+      chemistry are not silently projected to coordinates by this route.
+    - Complementary partial MolSys objects or H5MSM 0.5 files are composed
+      before selections. Supplying their list declares positional atom and
+      structure correspondence; matching counts do not establish origin.
+      Each topology, chemistry and Structures domain must have one provider;
+      interaction names must be distinct and full axes must agree. Missing
+      domains and unknown structure-to-state assignments stay absent/unknown.
+      The default output is independent. Topology is always copied for its
+      single-owner contract, even with ``copy_if_all=False``. This route loads
+      stored arrays and permits one nonempty mechanical provider with matching
+      atom rows. Original reports, including report-only storage, are preserved
+      without recalculation. Repeated nonempty mechanical providers are refused.
+
+
+    See Also
+    --------
+    :func:`molsysmt.basic.select`
+        Select elements of a molecular system.
+    :func:`molsysmt.basic.get_form`
+        Retrieve the form of a molecular system.
+    :func:`molsysmt.basic.extract`
+        Extract a subset of a molecular system.
+
+
+    Examples
+    --------
+    >>> import molsysmt as msm
+    >>> molsys_A = msm.systems['T4 lysozyme L99A']['181l.bcif.gz']
+    >>> msm.get_form(molsys_A)
+    'file:bcif.gz'
+    >>> molsys_B = msm.convert(molsys_A, to_form='molsysmt.MolSys')
+    >>> msm.get_form(molsys_B)
+    'molsysmt.MolSys'
+    >>> _, report = msm.convert(molsys_B, to_form='molsysmt.Topology', return_report=True)
+    >>> report.outcome in {'exact', 'equivalent', 'lossy'}
+    True
+
+    Interpreting source group names without changing their chemical state:
+
+    >>> msm.convert('amino_acids_3:GlhHid', to_form='string:amino_acids_1',
+    ...             from_naming_scheme='amber')
+    'EH'
+
+    Composing separately held chemical and structural domains:
+
+    >>> import numpy as np
+    >>> from molsysmt.native import ChemicalStates, Structures
+    >>> states = ChemicalStates(n_atoms=2)
+    >>> states.append_state()
+    0
+    >>> structures = Structures()
+    >>> structures.append(coordinates=msm.pyunitwizard.quantity(np.zeros((1, 2, 3)), 'nm'))
+    >>> partial = msm.convert([states, structures], selection=[1, 0])
+    >>> partial.topology is None
+    True
+    >>> msm.get(partial, n_atoms=True, n_structures=True)
+    [2, 1]
+
+    Migrating a modular file with a present-empty interaction layer:
+
+    >>> from pathlib import Path
+    >>> from tempfile import TemporaryDirectory
+    >>> with TemporaryDirectory() as directory:
+    ...     source = Path(directory) / 'analysis_05.h5msm'
+    ...     target = Path(directory) / 'analysis_10.h5msm'
+    ...     _ = msm.h5msm.write_layers(source, interactions={})
+    ...     _ = msm.convert(source, to_form=target, format_version='1.0')
+    ...     msm.h5msm.read_layers(target, layers='interactions')
+    {'interactions': {}}
+
+
+    .. admonition:: Tutorial with more examples
+
+       See the following tutorial for a practical demonstration of how to use this function,
+       along with additional examples:
+       :ref:`Tutorial_Convert`.
+
+    .. versionadded:: 1.0.0
+    """
+
+    from molsysmt._private.conversion_shortcuts import _multiple_conversion_shortcuts
+    from molsysmt._private.h5msm import (
+        has_h5msm_path,
+        maybe_read_modular_h5msm,
+        validate_h5msm_handler_target,
+    )
+    from molsysmt._private.h5msm_storage.versions import DEFAULT_WRITE_VERSION
+
+    from . import get_form
+
+    output = None
+
+    incoming_system = molecular_system
+    validate_h5msm_handler_target(molecular_system, to_form)
+    # A complete static target needs neither trajectory payloads nor joins to
+    # other stored axes. Context-sensitive selections/reports keep their route.
+    topology_only = (
+        to_form == "molsysmt.Topology"
+        and not isinstance(molecular_system, (list, tuple))
+        and is_all(selection)
+        and is_all(structure_indices)
+        and syntax == "MolSysMT"
+        and not strict
+        and not return_report
+        and from_naming_scheme is None
+        and not kwargs
+    )
+    mechanics_only = (
+        to_form == "molsysmt.MolecularMechanics"
+        and not isinstance(molecular_system, (list, tuple))
+        and is_all(selection)
+        and is_all(structure_indices)
+        and syntax == "MolSysMT"
+        and not strict
+        and not return_report
+        and from_naming_scheme is None
+        and not kwargs
+    )
+    # A whole-file rewrite can preserve independent layers and their maps even
+    # when no single native MolSys can represent the stored composition.
+    independent_h5msm_write = (
+        kwargs.get("format_version", DEFAULT_WRITE_VERSION) == "1.0"
+        and not isinstance(to_form, (list, tuple))
+        and (to_form == "file:h5msm" or has_h5msm_path(to_form))
+        and not isinstance(molecular_system, (list, tuple))
+        and has_h5msm_path(molecular_system)
+        and is_all(selection)
+        and is_all(structure_indices)
+        and from_naming_scheme is None
+        and not strict
+        and not return_report
+        and kwargs.keys()
+        <= {"format_version", "output_filename", "compression", "compression_opts"}
+    )
+    if not independent_h5msm_write:
+        molecular_system = maybe_read_modular_h5msm(
+            molecular_system, topology_only=topology_only, mechanics_only=mechanics_only
+        )
+    fresh_file_result = molecular_system is not incoming_system and not isinstance(
+        incoming_system, (list, tuple)
+    )
+    from molsysmt._private.native_composition import compose_partial_molsys
+
+    molecular_system = compose_partial_molsys(molecular_system)
+    from_form = get_form(molecular_system)
+
+    if isinstance(from_form, (list, tuple)):
+        if len(from_form) == 1:
+            molecular_system = molecular_system[0]
+            from_form = from_form[0]
+
+    from ._index_validation import validate_structure_indices
+
+    structure_indices = validate_structure_indices(
+        molecular_system, structure_indices, "molsysmt.convert"
+    )
+
+    # If to_form is a list, convert is invoked iteratively
+
+    if isinstance(to_form, (list, tuple)):
+        output = []
+        reports = []
+        for item_out in to_form:
+            converted = convert(
+                molecular_system,
+                to_form=item_out,
+                selection=selection,
+                structure_indices=structure_indices,
+                syntax=syntax,
+                strict=strict,
+                return_report=return_report,
+                skip_digestion=True,
+                from_naming_scheme=from_naming_scheme,
+                **kwargs,
+            )
+            if return_report:
+                item_output, item_report = converted
+                output.append(item_output)
+                reports.append(item_report)
+            else:
+                output.append(converted)
+        return (output, reports) if return_report else output
+
+    from molsysmt._private.mechanical_model import (
+        CONSTRUCTION_TARGETS,
+        reject_unsupported,
+    )
+
+    if to_form in CONSTRUCTION_TARGETS:
+        reject_unsupported(
+            molecular_system, caller="molsysmt.basic.convert", overrides=kwargs
+        )
+
+    report = None
+    if strict or return_report:
+        from molsysmt._private.conversion_report import build_conversion_report
+
+        report = build_conversion_report(
+            molecular_system,
+            from_form,
+            to_form,
+            selection=selection,
+            structure_indices=structure_indices,
+            syntax=syntax,
+            converter_options=kwargs,
+            from_naming_scheme=from_naming_scheme,
+        )
+        if strict and report.is_lossy:
+            raise NotCompatibleConversionError(
+                report.from_form,
+                report.to_form,
+                {issue.attribute for issue in report.issues},
+                caller="molsysmt.convert",
+                message=(
+                    "Strict conversion rejected supplied semantics that the target "
+                    f"cannot preserve: {[issue.attribute for issue in report.issues]}"
+                ),
+            )
+
+    if from_naming_scheme is not None:
+        from molsysmt._private.naming_conversion import (
+            convert_with_source_scheme,
+            source_reader_accepts_scheme,
+        )
+
+        if source_reader_accepts_scheme(from_form, to_form) and (
+            not isinstance(selection, str) or is_all(selection)
+        ):
+            # Preserve the reader's coordinate/selection route while supplying
+            # naming context before any source chemistry is reconstructed.
+            # Semantic selections below instead need that context on native
+            # inventory before they can choose the source atom population.
+            kwargs = {**kwargs, "from_naming_scheme": from_naming_scheme}
+        else:
+            output = convert_with_source_scheme(
+                molecular_system,
+                from_form,
+                to_form,
+                selection,
+                structure_indices,
+                syntax,
+                from_naming_scheme,
+                kwargs,
+            )
+            if isinstance(output, (list, tuple)) and len(output) == 1:
+                output = output[0]
+            return (output, report) if return_report else output
+
+    if to_form == "file:h5msm" or str(to_form).endswith(".h5msm"):
+        options = dict(kwargs)
+        output_filename = options.pop("output_filename", None)
+        if to_form != "file:h5msm":
+            output_filename = to_form
+        output = _convert_to_h5msm(
+            molecular_system,
+            from_form,
+            output_filename,
+            selection,
+            structure_indices,
+            syntax,
+            options,
+        )
+        return (output, report) if return_report else output
+
+    # If one to one
+    if not isinstance(from_form, (list, tuple)):
+        conversion_options = kwargs
+        if (
+            fresh_file_result
+            and from_form == "molsysmt.MolSys"
+            and to_form == "molsysmt.MolSys"
+        ):
+            # The reader already owns this new resident graph. Preserve explicit
+            # copy choices while avoiding a second full snapshot by default.
+            conversion_options = {"copy_if_all": False, **kwargs}
+        output = _convert_one_to_one(
+            molecular_system,
+            from_form,
+            to_form=to_form,
+            selection=selection,
+            structure_indices=structure_indices,
+            syntax=syntax,
+            skip_digestion=True,
+            **conversion_options,
+        )
+
+    # If multiple to one
+
+    else:
+        # conversions in private shortcuts
+        if tuple(sorted(from_form)) in _multiple_conversion_shortcuts:
+            output = _convert_multiple_to_one_with_shortcuts(
+                molecular_system,
+                from_form,
+                to_form=to_form,
+                selection=selection,
+                structure_indices=structure_indices,
+                syntax=syntax,
+                skip_digestion=True,
+                **kwargs,
+            )
+
+        # general conversion
+        if output is None:
+            output = _convert_multiple_to_one(
+                molecular_system,
+                from_form,
+                to_form=to_form,
+                selection=selection,
+                structure_indices=structure_indices,
+                syntax=syntax,
+                skip_digestion=True,
+                **kwargs,
+            )
+
+    # Returning the output
+
+    if output is None:
+        from_form = get_form(molecular_system)
+        if len(from_form) == 1:
+            from_form = from_form[0]
+        raise NotImplementedConversionError(from_form, to_form)
+
+    if isinstance(output, (list, tuple)):
+        if len(output) == 1:
+            output = output[0]
+
+    return (output, report) if return_report else output

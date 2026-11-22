@@ -1,0 +1,9 @@
+# Arm B: predict the teacher's embedding of the hidden residue, never the letter.
+# The JEPA arm, and the one the project is really about.
+
+arm: B
+pretrain:
+  target: vector
+
+finetune:
+  mode: frozen

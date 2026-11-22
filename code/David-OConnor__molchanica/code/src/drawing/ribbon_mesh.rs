@@ -1,0 +1,874 @@
+//! Cartoon ("ribbon") mesh generation for protein secondary structure.
+//!
+//! 1. Extract Cα and backbone-O positions per residue from each SecondaryStructure segment.
+//! 2. Fit a Catmull-Rom spline through the Cα positions and sample it at
+//!    `SPLINE_DIVS` points per residue pair.
+//! 3. At each sample point, build a local Frenet-like frame whose orientation is
+//!    anchored by the backbone carbonyl oxygen (the "guide" vector).  The guide
+//!    is interpolated/smoothed between residue frames and then re-orthogonalised
+//!    against the current spline tangent to keep it perpendicular.
+//! 4. Extrude a cross-section profile appropriate to the secondary structure:
+//!    - **Coil / loop** – circular tube
+//!    - **α-helix**     – flat oval ribbon (wide face shows the helical spiral)
+//!    - **β-strand**    – flat rectangular ribbon with an arrowhead at the C-terminus
+//! 5. Stitch consecutive cross-sections into quads, compute per-vertex normals, and
+//!    add end-caps.
+//!
+//! Coil/loop regions are identified as residues *not* covered by any `BackboneSS` entry
+//! and rendered as a thin tube, extended by one residue into each adjacent SS segment
+//! for a seamless join.
+
+use std::{
+    collections::{HashMap, HashSet},
+    f32::consts::TAU,
+};
+
+use bio_apis::pdbe::SiftsUniprotMapping;
+use bio_files::{BackboneSS, ResidueType, SecondaryStructure};
+use graphics::{Mesh, Vertex};
+use lin_alg::{f32::Vec3 as Vec3F32, f64::Vec3 as Vec3F64};
+use mol_defs::molecules::{Atom, AtomRole, Bond, Chain, Residue, aa_color};
+
+use crate::{
+    drawing::{
+        COLOR_SELECTED, HYDROPHOBICITY_MAX, HYDROPHOBICITY_MIN, color_alternating_contrast,
+        color_viridis, color_viridis_float,
+    },
+    selection::{Selection, ViewSelLevel},
+    state::ResColoring,
+};
+
+// ── Dimensions (Å) ────────────────────────────────────────────────────────────
+
+/// Half-width of helix ribbon along the guide direction (radially in/out from helix axis).
+const HELIX_HALF_W: f32 = 1.0;
+/// Half-thickness of helix ribbon along the binormal direction.
+const HELIX_HALF_H: f32 = 0.2;
+
+/// Half-width of β-strand ribbon.
+const SHEET_HALF_W: f32 = 1.0;
+/// Half-thickness of β-strand ribbon.
+const SHEET_HALF_H: f32 = 0.15;
+/// Half-width of the β-strand arrowhead at its widest point.
+const SHEET_ARROW_HALF_W: f32 = 1.5;
+/// Number of residues the arrowhead spans before the tip.
+const SHEET_ARROW_RES: usize = 1;
+
+/// Radius of the coil / loop tube.
+const COIL_RADIUS: f32 = 0.25;
+
+/// Coil / loop tubes are broken wherever the step between adjacent Cα positions exceeds this (Å).
+/// This suppresses artificially long connecting tubes across structural gaps (e.g. missing
+/// residues or discontinuous chain fragments), while still drawing the coil on either side of
+/// the gap. Consecutive Cα atoms are ~3.8 Å apart.
+const MAX_COIL_STEP_ANG: f32 = 5.0;
+
+// ── Tessellation ──────────────────────────────────────────────────────────────
+
+/// Spline sample subdivisions per residue pair (between consecutive Cα atoms).
+const SPLINE_DIVS: usize = 8;
+
+/// Number of vertices around one cross-section ring.
+const N_PROFILE: usize = 8;
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+/// Per-residue data extracted from the atom list.
+#[derive(Clone)]
+struct ResidueFrame {
+    /// Cα position.
+    ca: Vec3F32,
+    /// Backbone oxygen position (used for ribbon orientation).
+    /// None when the atom is missing from the structure.
+    o: Option<Vec3F32>,
+    /// The residue's index in the full atom list, used for Viridis coloring.
+    res_idx: usize,
+}
+
+// ── Catmull-Rom spline ────────────────────────────────────────────────────────
+
+/// Evaluate a Catmull-Rom spline at `t ∈ [0, 1]` between `p1` and `p2`.
+/// Returns 2× the true value; caller must multiply by 0.5.
+fn catmull_rom(p0: Vec3F32, p1: Vec3F32, p2: Vec3F32, p3: Vec3F32, t: f32) -> Vec3F32 {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    p1 * 2.0
+        + (p2 - p0) * t
+        + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2
+        + (p0 * (-1.0) + p1 * 3.0 - p2 * 3.0 + p3) * t3
+}
+
+/// Derivative of the Catmull-Rom spline at `t` (unnormalised tangent direction).
+fn catmull_rom_tangent(p0: Vec3F32, p1: Vec3F32, p2: Vec3F32, p3: Vec3F32, t: f32) -> Vec3F32 {
+    let t2 = t * t;
+    (p2 - p0)
+        + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * (2.0 * t)
+        + (p0 * (-1.0) + p1 * 3.0 - p2 * 3.0 + p3) * (3.0 * t2)
+}
+
+// ── Guide-vector helpers ──────────────────────────────────────────────────────
+
+/// Project the Cα→O vector perpendicular to `tangent` to get the ribbon guide.
+fn compute_guide(ca: Vec3F32, o: Vec3F32, tangent: Vec3F32) -> Vec3F32 {
+    let raw = (o - ca).to_normalized();
+    let proj = tangent * raw.dot(tangent);
+    let perp = raw - proj;
+    if perp.magnitude() < 1e-6 {
+        fallback_perp(tangent)
+    } else {
+        perp.to_normalized()
+    }
+}
+
+/// Smooth a sequence of unit guide vectors with `passes` of weighted 3-point averaging.
+fn smooth_guides(guides: &[Vec3F32], passes: usize) -> Vec<Vec3F32> {
+    let n = guides.len();
+    let mut g = guides.to_vec();
+    for _ in 0..passes {
+        let prev = g.clone();
+        for i in 0..n {
+            let a = if i > 0 { prev[i - 1] } else { prev[i] };
+            let c = if i < n - 1 { prev[i + 1] } else { prev[i] };
+            let sum = a + prev[i] * 2.0 + c;
+            let len = sum.magnitude();
+            g[i] = if len < 1e-8 {
+                prev[i]
+            } else {
+                sum * (1.0 / len)
+            };
+        }
+    }
+    g
+}
+
+/// Smooth a sequence of positions with `passes` of weighted 3-point averaging.
+/// Reduces the per-residue Cα zigzag in beta strands.
+fn smooth_positions(positions: &[Vec3F32], passes: usize) -> Vec<Vec3F32> {
+    let n = positions.len();
+    let mut p = positions.to_vec();
+    for _ in 0..passes {
+        let prev = p.clone();
+        // Skip i=0 and i=n-1 so the endpoints stay pinned at their original positions.
+        for i in 1..n - 1 {
+            p[i] = (prev[i - 1] + prev[i] * 2.0 + prev[i + 1]) * 0.25;
+        }
+    }
+    p
+}
+
+/// Return an arbitrary unit vector perpendicular to `v`.
+fn fallback_perp(v: Vec3F32) -> Vec3F32 {
+    let helper = if v.z.abs() < 0.9 {
+        Vec3F32::new(0.0, 0.0, 1.0)
+    } else {
+        Vec3F32::new(0.0, 1.0, 0.0)
+    };
+    v.cross(helper).to_normalized()
+}
+
+#[derive(Clone, Copy)]
+struct Profile {
+    half_width: f32,  // half-width along binormal
+    half_height: f32, // half-height along guide
+}
+
+impl Profile {
+    fn coil() -> Self {
+        Self {
+            half_width: COIL_RADIUS,
+            half_height: COIL_RADIUS,
+        }
+    }
+    fn helix() -> Self {
+        // Wide in guide direction (radially outward), thin in binormal.
+        Self {
+            half_width: HELIX_HALF_H,
+            half_height: HELIX_HALF_W,
+        }
+    }
+    fn sheet(half_w: f32) -> Self {
+        // Wide along guide (across-strand, in the sheet plane), thin along binormal (sheet normal).
+        Self {
+            half_width: SHEET_HALF_H,
+            half_height: half_w,
+        }
+    }
+}
+
+/// Emit `N_PROFILE` (position, outward-normal) pairs for one cross-section ellipse.
+fn cross_section(
+    center: Vec3F32,
+    guide: Vec3F32,
+    binormal: Vec3F32,
+    p: Profile,
+) -> [(Vec3F32, Vec3F32); N_PROFILE] {
+    let mut out = [(Vec3F32::new(0., 0., 0.), Vec3F32::new(0., 0., 0.)); N_PROFILE];
+    for k in 0..N_PROFILE {
+        let theta = TAU * (k as f32) / (N_PROFILE as f32);
+        let cos_t = theta.cos();
+        let sin_t = theta.sin();
+        let pos = center + binormal * (p.half_width * cos_t) + guide * (p.half_height * sin_t);
+        // Exact normal via gradient of the ellipse equation.
+        let nx = cos_t / p.half_width;
+        let ny = sin_t / p.half_height;
+        let len = (nx * nx + ny * ny).sqrt().max(1e-8);
+        let normal = (binormal * (nx / len) + guide * (ny / len)).to_normalized();
+        out[k] = (pos, normal);
+    }
+    out
+}
+
+// ── Mesh assembly helpers ─────────────────────────────────────────────────────
+
+fn append_ring_and_stitch(
+    verts: &mut Vec<Vertex>,
+    indices: &mut Vec<usize>,
+    ring_a_base: usize,
+    cross: &[(Vec3F32, Vec3F32); N_PROFILE],
+    color: Option<(u8, u8, u8, u8)>,
+) -> usize {
+    let ring_b_base = verts.len();
+    for &(pos, norm) in cross.iter() {
+        let mut v = Vertex::new(pos.to_arr(), norm);
+        v.color = color;
+        verts.push(v);
+    }
+    for k in 0..N_PROFILE {
+        let k1 = (k + 1) % N_PROFILE;
+        let a0 = ring_a_base + k;
+        let a1 = ring_a_base + k1;
+        let b0 = ring_b_base + k;
+        let b1 = ring_b_base + k1;
+        indices.push(a0);
+        indices.push(b1);
+        indices.push(b0);
+        indices.push(a0);
+        indices.push(a1);
+        indices.push(b1);
+    }
+    ring_b_base
+}
+
+fn emit_cap(
+    verts: &mut Vec<Vertex>,
+    indices: &mut Vec<usize>,
+    ring_base: usize,
+    center: Vec3F32,
+    cap_normal: Vec3F32,
+    color: Option<(u8, u8, u8, u8)>,
+    inward: bool,
+) {
+    let center_idx = verts.len();
+    let mut cv = Vertex::new(center.to_arr(), cap_normal);
+    cv.color = color;
+    verts.push(cv);
+    for k in 0..N_PROFILE {
+        let k1 = (k + 1) % N_PROFILE;
+        let (i0, i1) = if inward {
+            (ring_base + k1, ring_base + k)
+        } else {
+            (ring_base + k, ring_base + k1)
+        };
+        indices.push(center_idx);
+        indices.push(i0);
+        indices.push(i1);
+    }
+}
+
+// ── Main segment builder ──────────────────────────────────────────────────────
+
+fn build_segment_mesh(
+    frames: &[ResidueFrame],
+    ss: SecondaryStructure,
+    aa_count: usize,
+    residues: &[Residue],
+    atoms: &[Atom],
+    bonds: &[Bond],
+    res_coloring: ResColoring,
+    view_sel_level: ViewSelLevel,
+    selection: &Selection,
+    residue_colors: &[Option<(f32, f32, f32)>],
+    sifts: Option<&[SiftsUniprotMapping]>,
+    chain_count: usize,
+    chains: &[Chain],
+    verts: &mut Vec<Vertex>,
+    indices: &mut Vec<usize>,
+) {
+    if frames.len() < 2 {
+        return;
+    }
+    let n = frames.len();
+
+    // ── 1. Per-residue tangents (central difference over Cα) ─────────────────
+    let mut tangents: Vec<Vec3F32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let prev = if i == 0 {
+            frames[0].ca
+        } else {
+            frames[i - 1].ca
+        };
+        let next = if i == n - 1 {
+            frames[n - 1].ca
+        } else {
+            frames[i + 1].ca
+        };
+        let t = (next - prev).to_normalized();
+        tangents.push(if t.magnitude() < 1e-8 {
+            Vec3F32::new(0., 1., 0.)
+        } else {
+            t
+        });
+    }
+
+    // ── 2. Guide vectors ──────────────────────────────────────────────────────
+    let mut guides_raw: Vec<Vec3F32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let g = match frames[i].o {
+            Some(o) => compute_guide(frames[i].ca, o, tangents[i]),
+            None => fallback_perp(tangents[i]),
+        };
+        guides_raw.push(g);
+    }
+
+    // Sign-normalise: flip each guide that disagrees with the previous.
+    let mut guides: Vec<Vec3F32> = Vec::with_capacity(n);
+    guides.push(guides_raw[0]);
+    for i in 1..n {
+        let prev = guides[i - 1];
+        let g = if guides_raw[i].dot(prev) < 0.0 {
+            guides_raw[i] * (-1.0)
+        } else {
+            guides_raw[i]
+        };
+        guides.push(g);
+    }
+
+    // Stabilise per SS type.
+    let guides: Vec<Vec3F32> = match ss {
+        SecondaryStructure::Sheet => {
+            // Use the segment-wide average direction: eliminates all per-residue twist.
+            let sum = guides
+                .iter()
+                .fold(Vec3F32::new(0., 0., 0.), |acc, &g| acc + g);
+            vec![sum.to_normalized(); n]
+        }
+        SecondaryStructure::Helix => smooth_guides(&guides, 3),
+        SecondaryStructure::Coil => smooth_guides(&guides, 1),
+    };
+
+    // ── 3. Smoothed Cα positions (for sheets, reduces the backbone zigzag) ───
+    let spline_ca: Vec<Vec3F32> = if ss == SecondaryStructure::Sheet {
+        smooth_positions(&frames.iter().map(|f| f.ca).collect::<Vec<_>>(), 3)
+    } else {
+        frames.iter().map(|f| f.ca).collect()
+    };
+
+    let ca_ext = |i: isize| -> Vec3F32 {
+        if i < 0 {
+            spline_ca[0] + (spline_ca[0] - spline_ca[1])
+        } else if i as usize >= n {
+            spline_ca[n - 1] + (spline_ca[n - 1] - spline_ca[n - 2])
+        } else {
+            spline_ca[i as usize]
+        }
+    };
+
+    // ── 4. Arrow parameters ───────────────────────────────────────────────────
+    let arrow_start_res = if ss == SecondaryStructure::Sheet && n > SHEET_ARROW_RES {
+        n - 1 - SHEET_ARROW_RES
+    } else {
+        n // disabled
+    };
+
+    // Color helper ───────────────────────────────────────────────────────
+    let res_color = |res_f: f32| -> Option<(u8, u8, u8, u8)> {
+        let res_i = (res_f.round() as usize).min(residues.len().saturating_sub(1));
+        let fallback = || color_viridis(res_i, 0, aa_count);
+
+        if selection.includes_peptide_residue(res_i, atoms, bonds) {
+            return Some((
+                (COLOR_SELECTED.0 * 255.0) as u8,
+                (COLOR_SELECTED.1 * 255.0) as u8,
+                (COLOR_SELECTED.2 * 255.0) as u8,
+                255,
+            ));
+        }
+
+        if let Some(Some((r, g, b))) = residue_colors.get(res_i) {
+            return Some(((r * 255.) as u8, (g * 255.) as u8, (b * 255.) as u8, 255));
+        }
+
+        // Ribbons use residue-position colors in Atom/Bond mode.
+        if view_sel_level == ViewSelLevel::AtomBond {
+            let (cr, cg, cb) = color_viridis(res_i, 0, aa_count);
+            return Some((
+                (cr * 255.0) as u8,
+                (cg * 255.0) as u8,
+                (cb * 255.0) as u8,
+                255,
+            ));
+        }
+
+        // Helper: get chain index for this residue via its first atom's chain field,
+        // matching util.rs::res_color which uses atoms[res.atoms[0]].chain.
+        let res_chain_i = || -> Option<usize> {
+            residues
+                .get(res_i)?
+                .atoms
+                .first()
+                .and_then(|&ai| atoms.get(ai))
+                .and_then(|a| a.chain)
+        };
+
+        let (cr, cg, cb) = match res_coloring {
+            ResColoring::Position => color_viridis(res_i, 0, aa_count),
+            ResColoring::AminoAcid => match residues.get(res_i) {
+                Some(res) => match res.res_type {
+                    ResidueType::AminoAcid(aa) => aa_color(aa),
+                    _ => fallback(),
+                },
+                None => fallback(),
+            },
+            ResColoring::Hydrophobicity => match residues.get(res_i) {
+                Some(res) => match res.res_type {
+                    ResidueType::AminoAcid(aa) => color_viridis_float(
+                        aa.hydropathicity(),
+                        HYDROPHOBICITY_MIN,
+                        HYDROPHOBICITY_MAX,
+                    ),
+                    _ => fallback(),
+                },
+                None => fallback(),
+            },
+            ResColoring::SiftsUniprot => match (sifts, residues.get(res_i)) {
+                (Some(entries), Some(_res)) => {
+                    // Match util.rs::res_color: look up chain letter via atom.chain.
+                    let chain_letter: Option<&str> = res_chain_i()
+                        .and_then(|ci| chains.get(ci))
+                        .map(|c| c.id.as_str());
+                    let entity_id = entries.iter().find_map(|entry| {
+                        entry.mappings.iter().find_map(|m| {
+                            let chain_ok = chain_letter.is_none_or(|cl| m.chain_id == cl);
+                            if chain_ok { Some(m.entity_id) } else { None }
+                        })
+                    });
+                    match entity_id {
+                        Some(eid) => {
+                            let mut unique_ids: Vec<u32> = entries
+                                .iter()
+                                .flat_map(|e| e.mappings.iter().map(|m| m.entity_id))
+                                .collect();
+                            unique_ids.sort_unstable();
+                            unique_ids.dedup();
+                            let rank = unique_ids.iter().position(|&id| id == eid).unwrap_or(0);
+                            color_alternating_contrast(rank, 0, unique_ids.len().saturating_sub(1))
+                        }
+                        None => fallback(),
+                    }
+                }
+                _ => fallback(),
+            },
+            ResColoring::Chain => match res_chain_i() {
+                Some(chain_i) => {
+                    color_alternating_contrast(chain_i, 0, chain_count.saturating_sub(1))
+                }
+                None => fallback(),
+            },
+        };
+
+        Some((
+            (cr * 255.0) as u8,
+            (cg * 255.0) as u8,
+            (cb * 255.0) as u8,
+            255,
+        ))
+    };
+
+    // ── 6. Sample spline and emit geometry ───────────────────────────────────
+    let total_samples = (n - 1) * SPLINE_DIVS + 1;
+    let mut ring_base: Option<usize> = None;
+    let mut last_pos = spline_ca[0];
+
+    for s in 0..total_samples {
+        let seg_idx = ((s / SPLINE_DIVS) as isize).min((n - 2) as isize);
+        let local_t = (s % SPLINE_DIVS) as f32 / SPLINE_DIVS as f32;
+        let (seg_idx, t) = if s == total_samples - 1 {
+            ((n - 2) as isize, 1.0_f32)
+        } else {
+            (seg_idx, local_t)
+        };
+        let i = seg_idx as usize;
+
+        let p0 = ca_ext(seg_idx - 1);
+        let p1 = ca_ext(seg_idx);
+        let p2 = ca_ext(seg_idx + 1);
+        let p3 = ca_ext(seg_idx + 2);
+
+        let pos = catmull_rom(p0, p1, p2, p3, t) * 0.5;
+        let tan_raw = catmull_rom_tangent(p0, p1, p2, p3, t);
+        let tan = if tan_raw.magnitude() < 1e-8 {
+            Vec3F32::new(0., 1., 0.)
+        } else {
+            tan_raw.to_normalized()
+        };
+
+        let g0 = guides[i];
+        let g1 = guides[(i + 1).min(n - 1)];
+        let g_lerp = g0 + (g1 - g0) * t;
+        let g_proj = tan * g_lerp.dot(tan);
+        let g_perp = g_lerp - g_proj;
+        let guide = if g_perp.magnitude() < 1e-8 {
+            fallback_perp(tan)
+        } else {
+            g_perp.to_normalized()
+        };
+        let binormal = tan.cross(guide).to_normalized();
+
+        let res_f = {
+            let r0 = frames[i].res_idx as f32;
+            let r1 = frames[(i + 1).min(n - 1)].res_idx as f32;
+            r0 + (r1 - r0) * t
+        };
+        let color = res_color(res_f);
+
+        let profile = match ss {
+            SecondaryStructure::Coil => Profile::coil(),
+            SecondaryStructure::Helix => Profile::helix(),
+            SecondaryStructure::Sheet => {
+                let global_res = i as f32 + t;
+                if global_res >= arrow_start_res as f32 {
+                    let arrow_t = ((global_res - arrow_start_res as f32) / SHEET_ARROW_RES as f32)
+                        .clamp(0.0, 1.0);
+                    Profile::sheet((SHEET_ARROW_HALF_W * (1.0 - arrow_t)).max(0.01))
+                } else {
+                    Profile::sheet(SHEET_HALF_W)
+                }
+            }
+        };
+
+        let ring = cross_section(pos, guide, binormal, profile);
+
+        match ring_base {
+            None => {
+                let base = verts.len();
+                for &(p, nm) in ring.iter() {
+                    let mut v = Vertex::new(p.to_arr(), nm);
+                    v.color = color;
+                    verts.push(v);
+                }
+                emit_cap(verts, indices, base, pos, tan * (-1.0), color, true);
+                ring_base = Some(base);
+            }
+            Some(prev_base) => {
+                let new_base = append_ring_and_stitch(verts, indices, prev_base, &ring, color);
+                ring_base = Some(new_base);
+            }
+        }
+
+        last_pos = pos;
+    }
+
+    if let Some(last_base) = ring_base {
+        let end_tan = (spline_ca[n - 1] - spline_ca[n - 2]).to_normalized();
+        let end_color = res_color(frames[n - 1].res_idx as f32);
+        emit_cap(
+            verts, indices, last_base, last_pos, end_tan, end_color, false,
+        );
+    }
+}
+
+// ── Data extraction ───────────────────────────────────────────────────────────
+
+fn extract_frames(seg: &BackboneSS, atoms: &[Atom], atom_posits: &[Vec3F64]) -> Vec<ResidueFrame> {
+    let mut ca_map: HashMap<usize, Vec3F32> = HashMap::new();
+    let mut o_map: HashMap<usize, Vec3F32> = HashMap::new();
+
+    for (atom_i, atom) in atoms.iter().enumerate() {
+        if atom.serial_number < seg.start_sn || atom.serial_number > seg.end_sn {
+            continue;
+        }
+        let res_idx = match atom.residue {
+            Some(r) => r,
+            None => continue,
+        };
+        match atom.role {
+            Some(AtomRole::C_Alpha) => {
+                ca_map.insert(res_idx, atom_posit(atom_i, atom, atom_posits));
+            }
+            Some(AtomRole::O_Backbone) => {
+                o_map.insert(res_idx, atom_posit(atom_i, atom, atom_posits));
+            }
+            _ => {}
+        }
+    }
+
+    if ca_map.is_empty() {
+        return Vec::new();
+    }
+
+    let mut res_indices: Vec<usize> = ca_map.keys().copied().collect();
+    res_indices.sort_unstable();
+    res_indices
+        .into_iter()
+        .map(|ri| ResidueFrame {
+            ca: ca_map[&ri],
+            o: o_map.get(&ri).copied(),
+            res_idx: ri,
+        })
+        .collect()
+}
+
+/// Read the molecule's current position for an atom, falling back to the atom's local position
+/// only if the dynamic position array is unexpectedly incomplete.
+#[inline]
+fn atom_posit(atom_i: usize, atom: &Atom, atom_posits: &[Vec3F64]) -> Vec3F32 {
+    let posit = atom_posits.get(atom_i).unwrap_or(&atom.posit);
+    Vec3F32::new(posit.x as f32, posit.y as f32, posit.z as f32)
+}
+
+// ── Coil-region helpers ───────────────────────────────────────────────────────
+
+/// Group a sorted list of residue indices into consecutive runs. Runs are also broken at chain
+/// boundaries: residues from different chains can be adjacent by index, but must not be joined
+/// into one coil.
+fn group_consecutive(sorted: &[usize], res_to_chain: &HashMap<usize, usize>) -> Vec<Vec<usize>> {
+    if sorted.is_empty() {
+        return Vec::new();
+    }
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current = vec![sorted[0]];
+    for &r in &sorted[1..] {
+        let prev = *current.last().unwrap();
+        let same_chain = res_to_chain.get(&r) == res_to_chain.get(&prev);
+        if r == prev + 1 && same_chain {
+            current.push(r);
+        } else {
+            groups.push(std::mem::replace(&mut current, vec![r]));
+        }
+    }
+    groups.push(current);
+    groups
+}
+
+/// Split a coil run wherever the distance between adjacent Cα atoms is too large to be a real
+/// peptide bond, so a structural gap breaks the tube instead of drawing a long spurious
+/// connection across it.
+fn split_at_gaps(frames: &[ResidueFrame]) -> Vec<&[ResidueFrame]> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+
+    for i in 1..frames.len() {
+        if (frames[i].ca - frames[i - 1].ca).magnitude() > MAX_COIL_STEP_ANG {
+            runs.push(&frames[start..i]);
+            start = i;
+        }
+    }
+    if start < frames.len() {
+        runs.push(&frames[start..]);
+    }
+
+    runs
+}
+
+/// Extend a coil run by one residue into each adjacent SS segment so the tube
+/// meets the ribbon/helix without a gap.
+fn extend_run(
+    run: &[usize],
+    covered: &HashSet<usize>,
+    ca_map: &HashMap<usize, Vec3F32>,
+    res_to_chain: &HashMap<usize, usize>,
+) -> Vec<usize> {
+    let mut ext = Vec::with_capacity(run.len() + 2);
+
+    // Only extend within the run's own chain.
+    let same_chain = |a: usize, b: usize| res_to_chain.get(&a) == res_to_chain.get(&b);
+
+    if let Some(&first) = run.first()
+        && first >= 1
+    {
+        let p1 = first - 1;
+        if covered.contains(&p1) && ca_map.contains_key(&p1) && same_chain(p1, first) {
+            ext.push(p1);
+        }
+    }
+
+    ext.extend_from_slice(run);
+
+    if let Some(&last) = run.last() {
+        let n1 = last + 1;
+        if covered.contains(&n1) && ca_map.contains_key(&n1) && same_chain(n1, last) {
+            ext.push(n1);
+        }
+    }
+
+    ext
+}
+
+pub fn build_ribbon_mesh(
+    backbone: &[BackboneSS],
+    atoms: &[Atom],
+    bonds: &[Bond],
+    atom_posits: &[Vec3F64],
+    residues: &[Residue],
+    chains: &[Chain],
+    hidden_residues: &HashSet<usize>,
+    res_coloring: ResColoring,
+    view_sel_level: ViewSelLevel,
+    selection: &Selection,
+    residue_colors: &[Option<(f32, f32, f32)>],
+    sifts: Option<&[SiftsUniprotMapping]>,
+) -> Mesh {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    let aa_count = residues
+        .iter()
+        .filter(|r| matches!(r.res_type, ResidueType::AminoAcid(_)))
+        .count();
+
+    // Build residue-index → chain-index map from atoms (atom.chain is authoritative;
+    // chain.residues can be incomplete for some structures).
+    let res_to_chain: HashMap<usize, usize> = atoms
+        .iter()
+        .filter_map(|a| match (a.residue, a.chain) {
+            (Some(r), Some(c)) => Some((r, c)),
+            _ => None,
+        })
+        .collect();
+
+    let chain_count = chains.len();
+
+    // ── 1. Collect all Cα positions ───────────────────────────────────────────
+    let mut all_ca: HashMap<usize, Vec3F32> = HashMap::new();
+    for (atom_i, atom) in atoms.iter().enumerate() {
+        if atom.role == Some(AtomRole::C_Alpha)
+            && let Some(r) = atom.residue
+            && !hidden_residues.contains(&r)
+        {
+            all_ca
+                .entry(r)
+                .or_insert_with(|| atom_posit(atom_i, atom, atom_posits));
+        }
+    }
+
+    // ── 2. Render helix / sheet segments; track covered residues ─────────────
+    let mut covered: HashSet<usize> = HashSet::new();
+
+    for seg in backbone {
+        let frames = extract_frames(seg, atoms, atom_posits);
+        if frames.len() < 2 {
+            continue;
+        }
+        // Always mark residues covered to prevent coil renderer from picking them up.
+        for f in &frames {
+            covered.insert(f.res_idx);
+        }
+
+        let chain_visible = frames
+            .first()
+            .and_then(|f| res_to_chain.get(&f.res_idx))
+            .is_none_or(|&ci| chains[ci].visible);
+
+        if !chain_visible {
+            continue;
+        }
+
+        let frames: Vec<_> = frames
+            .into_iter()
+            .filter(|f| !hidden_residues.contains(&f.res_idx))
+            .collect();
+
+        // A selection may remove residues from the middle of a secondary-structure
+        // segment. Never bridge that hole, another chain, or a structural gap.
+        for run in frames.chunk_by(|a, b| {
+            b.res_idx == a.res_idx + 1
+                && res_to_chain.get(&a.res_idx) == res_to_chain.get(&b.res_idx)
+        }) {
+            for sub in split_at_gaps(run) {
+                if sub.len() < 2 {
+                    continue;
+                }
+                build_segment_mesh(
+                    sub,
+                    seg.sec_struct,
+                    aa_count,
+                    residues,
+                    atoms,
+                    bonds,
+                    res_coloring,
+                    view_sel_level,
+                    selection,
+                    residue_colors,
+                    sifts,
+                    chain_count,
+                    chains,
+                    &mut vertices,
+                    &mut indices,
+                );
+            }
+        }
+    }
+
+    // ── 3. Render coil / loop regions ─────────────────────────────────────────
+    // Any Cα residue not covered by an SS segment is a coil.
+    let mut coil_residues: Vec<usize> = all_ca
+        .keys()
+        .copied()
+        .filter(|r| !covered.contains(r))
+        // Respect chain visibility.
+        .filter(|r| res_to_chain.get(r).is_none_or(|&ci| chains[ci].visible))
+        .collect();
+    coil_residues.sort_unstable();
+
+    for run in group_consecutive(&coil_residues, &res_to_chain) {
+        // Extend by 1 into adjacent SS segments for a seamless join.
+        let ext = extend_run(&run, &covered, &all_ca, &res_to_chain);
+        if ext.len() < 2 {
+            continue;
+        }
+
+        let frames: Vec<ResidueFrame> = ext
+            .iter()
+            .filter_map(|&r| {
+                all_ca.get(&r).map(|&ca| ResidueFrame {
+                    ca,
+                    o: None,
+                    res_idx: r,
+                })
+            })
+            .collect();
+
+        // Break the run at structural gaps, and draw each side of the gap. A whole chain is a
+        // single run when the structure has no secondary-structure records (e.g. many predicted
+        // and designed models); it must still render as a continuous Cα trace.
+        for sub in split_at_gaps(&frames) {
+            if sub.len() < 2 {
+                continue;
+            }
+
+            build_segment_mesh(
+                sub,
+                SecondaryStructure::Coil,
+                aa_count,
+                residues,
+                atoms,
+                bonds,
+                res_coloring,
+                view_sel_level,
+                selection,
+                residue_colors,
+                sifts,
+                chain_count,
+                chains,
+                &mut vertices,
+                &mut indices,
+            );
+        }
+    }
+
+    Mesh {
+        vertices,
+        indices,
+        material: 0,
+    }
+}

@@ -1,0 +1,3199 @@
+# Overview
+
+
+
+FoldingDiff is a **diffusion model for protein backbone generation** that leverages transformer architecture to create novel protein structures. This innovative approach uses **angle-based protein representation** combined with **BERT-style transformers** and **diffusion noise scheduling** to generate biologically plausible protein backbones.
+
+![Animation of diffusion model protein folds over timesteps](https://github.com/microsoft/foldingdiff/blob/main/plots/generated_0.gif?raw=true)
+
+## Architecture Overview
+
+The system implements a sophisticated pipeline that transforms protein structures into angular representations, applies diffusion processes, and reconstructs 3D coordinates. The core architecture integrates multiple specialized components working in concert:
+
+```mermaid
+graph TB
+    A[Protein PDB Files] --> B[Angle Extraction]
+    B --> C[Canonical Angles Dataset]
+    C --> D[Noised Dataset]
+    D --> E[BERT Diffusion Model]
+    E --> F[Sampling Pipeline]
+    F --> G[Angle to Coordinate Conversion]
+    G --> H[Generated PDB Structures]
+    
+    subgraph "Core Model Components"
+        E --> I[Time Encoding]
+        E --> J[BERT Embeddings]
+        E --> K[Angle Predictor]
+    end
+    
+    subgraph "Data Processing"
+        B --> L[Phi/Psi/Omega]
+        B --> M[Tau/CA:C:1N/C:1N:1CA]
+        D --> N[Beta Schedules]
+        N --> O[Linear/Cosine/Quadratic]
+    end
+```
+
+## Key Components
+
+### Core Model Architecture
+The system centers around `BertForDiffusion` [foldingdiff/modelling.py#L487], which combines HuggingFace's BERT architecture with diffusion-specific modifications:
+
+- **Time Encoding**: Supports both Gaussian Fourier projections and sinusoidal embeddings for timesteps [foldingdiff/modelling.py#L42-L78]
+- **Angular Loss Functions**: Specialized loss handling for angular data including radian-aware L1 and smooth L1 variants [foldingdiff/modelling.py#L224-L237]
+- **Multi-head Architecture**: BERT-style transformer with attention mechanisms for sequence modeling
+
+### Dataset System
+The data pipeline supports multiple dataset variants with different feature sets [foldingdiff/datasets.py#L75-L566]:
+
+| Dataset Type | Features | Angular Components | Use Case |
+|--------------|----------|-------------------|----------|
+| `CathCanonicalAnglesOnlyDataset` | 6 angles | All angular | Standard training |
+| `CathCanonicalMinimalAnglesDataset` | 4 angles | All angular | Minimal reconstruction |
+| `CathCanonicalCoordsDataset` | XYZ coordinates | Non-angular | Cartesian baseline |
+
+### Angle Representation System
+Proteins are represented using **canonical dihedral angles** [foldingdiff/angles_and_coords.py#L23-L27]:
+- **Dihedral angles**: φ (phi), ψ (psi), ω (omega) - backbone torsion angles
+- **Non-dihedral angles**: τ (tau), CA:C:1N, C:1N:1CA - geometric constraints
+- **Coordinate conversion**: NERF (Neural Radiance Fields) based reconstruction from angles to 3D coordinates
+
+### Diffusion Process
+The system implements multiple **noise scheduling strategies** [foldingdiff/beta_schedules.py#L20-L41]:
+
+- **Linear schedule**: Simple linear interpolation
+- **Cosine schedule**: Cosine-based scheduling for better performance
+- **Quadratic schedule**: Quadratic interpolation for different noise dynamics
+
+## Project Structure
+
+```
+foldingdiff/
+├── Core Modules
+│   ├── modelling.py          # BERT diffusion model architecture
+│   ├── datasets.py           # Dataset loading and processing
+│   ├── sampling.py           # Generation and sampling pipeline
+│   ├── angles_and_coords.py  # Angle-coordinate conversion
+│   └── beta_schedules.py     # Noise scheduling functions
+├── Analysis Tools
+│   ├── lddt.py              # Local Distance Difference Test
+│   ├── tmalign.py           # TM-score calculation
+│   ├── custom_metrics.py    # Evaluation metrics
+│   └── plotting.py          # Visualization utilities
+└── Utilities
+    ├── utils.py             # Helper functions
+    ├── nerf.py              # Neural radiance fields
+    └── vdw_clashes.py       # Van der Waals clash detection
+```
+
+## Key Features
+
+### Pre-trained Models
+The project provides **pre-trained models** on HuggingFace [README.md#L65-L82], enabling immediate use without training:
+
+```python
+from foldingdiff import modelling
+from huggingface_hub import snapshot_download
+
+# Load pre-trained model
+model = modelling.BertForDiffusion.from_dir(
+    snapshot_download("wukevin/foldingdiff_cath")
+)
+```
+
+### Flexible Sampling
+The sampling pipeline supports [foldingdiff/sampling.py#L135-L145]:
+- **Variable length generation**: Generate proteins of different lengths
+- **Batch processing**: Efficient generation of multiple structures
+- **Configurable timesteps**: Control diffusion process granularity
+
+### Evaluation Pipeline
+Comprehensive evaluation includes [README.md#L139-L175]:
+- **Self-consistency TM scores**: Measure structural stability
+- **Inverse folding**: Test designability with ProteinMPNN and ESM-IF1
+- **Structure prediction**: Validate with AlphaFold/OmegaFold
+
+## Technical Highlights
+
+> [!TIP]
+> The architecture uses **angular representations** instead of Cartesian coordinates, which provides better invariance to rotation and translation while maintaining the essential geometric constraints of protein structures.
+
+> [!TIP]
+> The integration of **BERT transformers** with **diffusion models** creates a powerful combination that leverages both the sequence modeling capabilities of transformers and the generative quality of diffusion processes.
+
+## Next Steps
+
+To get started with FoldingDiff:
+
+1. **Quick Start**: [Quick Start](2-quick-start) - Basic usage examples and immediate results
+2. **Installation**: [Installation and Environment Setup](3-installation-and-environment-setup) - Detailed setup instructions
+3. **Data Preparation**: [Downloading and Preparing Datasets](4-downloading-and-preparing-datasets) - Get training and test data
+4. **Pre-trained Models**: [Using Pre-trained Models for Sampling](5-using-pre-trained-models-for-sampling) - Start generating immediately
+
+For deeper understanding of the architecture, explore the **Deep Dive** section starting with [Diffusion Model Architecture and BERT Integration](6-diffusion-model-architecture-and-bert-integration).
+
+# Quick Start
+
+
+
+Welcome to the **foldingdiff** quick start guide! This repository provides a powerful diffusion model for generating novel protein backbone structures using internal angle representations. Whether you're a computational biologist, machine learning researcher, or protein engineer, this guide will get you up and running quickly.
+
+## What is foldingdiff?
+
+foldingdiff is a PyTorch-based implementation that applies diffusion models to protein backbone generation. Instead of working with Cartesian coordinates, it uses internal angles (φ, ψ, ω, and additional geometric features) which provide better representation for protein structures and enable more realistic generation.
+
+![Protein folding animation visualization](https://github.com/microsoft/foldingdiff/blob/main/plots/generated_0.gif?raw=true)
+
+## System Architecture Overview
+
+The foldingdiff system follows a modular architecture that separates concerns across data processing, model training, sampling, and evaluation:
+
+```mermaid
+graph TB
+    A[Raw Protein Data] --> B[Angle Extraction]
+    B --> C[Noise Injection]
+    C --> D[BERT-based Diffusion Model]
+    D --> E[Denoising Process]
+    E --> F[Generated Angles]
+    F --> G[Coordinate Reconstruction]
+    G --> H[Protein Structures]
+    
+    I[Pre-trained Models] --> D
+    J[Configuration Files] --> D
+    K[Evaluation Metrics] --> H
+```
+
+## Installation and Setup
+
+### Prerequisites
+
+- Python 3.8 or higher
+- Conda or Mamba package manager
+- CUDA-capable GPU (recommended for sampling)
+
+### Step 1: Clone and Install
+
+```bash
+# Clone the repository
+git clone https://github.com/microsoft/foldingdiff.git
+cd foldingdiff
+
+# Create conda environment
+conda env create -f environment.yml
+conda activate foldingdiff
+
+# Install the package in development mode
+pip install -e ./
+```
+
+The environment includes key dependencies like PyTorch, PyTorch Lightning, HuggingFace transformers, and specialized bioinformatics libraries.
+
+### Step 2: Download Pre-trained Models (Optional)
+
+For quick sampling without training, you can use the pre-trained model from HuggingFace:
+
+```python
+from huggingface_hub import snapshot_download
+from foldingdiff import modelling
+
+# Automatically downloads and caches the model
+model = modelling.BertForDiffusion.from_dir(
+    snapshot_download("wukevin/foldingdiff_cath")
+)
+```
+
+## Quick Sampling Example
+
+### Generate Protein Backbones
+
+The fastest way to get started is by sampling from the pre-trained model:
+
+```bash
+# Generate 10 protein backbones per length from 50-127 residues
+python bin/sample.py -l 50 128 -n 10 -b 512 --device cuda:0
+```
+
+This command produces:
+- **sampled_angles/**: CSV files with generated internal angles
+- **sampled_pdb/**: PDB files with 3D coordinates
+- **plots/**: Distribution comparisons with training data
+
+### Performance Expectations
+
+| Device | Sampling Time (512 structures) |
+|--------|------------------------------|
+| NVIDIA RTX 2080Ti | ~7 minutes |
+| 16-core CPU | ~2 hours |
+
+### Python API Sampling
+
+For programmatic access:
+
+```python
+from foldingdiff import modelling, sampling
+from huggingface_hub import snapshot_download
+import torch
+
+# Load pre-trained model
+model = modelling.BertForDiffusion.from_dir(
+    snapshot_download("wukevin/foldingdiff_cath")
+)
+model.eval()
+
+# Generate samples
+with torch.no_grad():
+    samples = sampling.sample(model, n_samples=10, length=64)
+    
+print(f"Generated {samples.shape[0]} protein structures")
+```
+
+## Key Components Overview
+
+### Data Representation
+
+foldingdiff uses internal angle representations rather than Cartesian coordinates:
+
+| Feature Type | Description | Angular? |
+|--------------|-------------|----------|
+| φ, ψ, ω | Standard backbone dihedral angles | ✅ |
+| θ₁, θ₂, θ₃ | Additional geometric angles | ✅ |
+| Bond lengths | Distance measurements | ❌ |
+
+### Model Architecture
+
+The core model combines:
+- **BERT-style transformer** for sequence modeling
+- **Gaussian Fourier projections** for time encoding
+- **Diffusion process** with cosine noise schedule
+
+### Configuration System
+
+Models are configured via JSON files in [`config_jsons/`](config_jsons):
+
+- `cath_full_angles_cosine.json`: Full training configuration
+- `mini_model.json`: Lightweight testing configuration
+- `cath_raw_coordinates.json`: Cartesian coordinate baseline
+
+## Next Steps
+
+Once you've completed this quick start, you may want to:
+
+1. **[Installation and Environment Setup](3-installation-and-environment-setup)** - Detailed installation troubleshooting
+2. **[Downloading and Preparing Datasets](4-downloading-and-preparing-datasets)** - Set up training data
+3. **[Using Pre-trained Models for Sampling](5-using-pre-trained-models-for-sampling)** - Advanced sampling techniques
+4. **[Diffusion Model Architecture and BERT Integration](6-diffusion-model-architecture-and-bert-integration)** - Deep dive into model internals
+
+## Common Use Cases
+
+### Research Applications
+- Generate novel protein scaffolds for design
+- Study protein folding landscapes
+- Benchmark structure prediction methods
+
+### Development Workflow
+```mermaid
+flowchart LR
+    A[Setup Environment] --> B[Load Pre-trained Model]
+    B --> C[Generate Samples]
+    C --> D[Visualize Results]
+    D --> E[Evaluate Quality]
+    E --> F[Iterate Parameters]
+```
+
+### Troubleshooting Tips
+
+> [!TIP]
+> **GPU Memory Issues**: If you encounter CUDA out-of-memory errors, reduce the batch size with `-b` parameter or use CPU sampling with `--device cpu`.
+
+> [!TIP]
+> **Missing Data Warnings**: You may see warnings about "Illegal values for omega" - these are normal and indicate the system is filtering invalid protein structures.
+
+## Resources
+
+- **Documentation**: Full API documentation in the source code
+- **Examples**: Jupyter notebooks in [`jupyter/`](jupyter) directory
+- **Tests**: Run `python -m unittest -v` to verify installation
+- **Community**: GitHub issues for questions and bug reports
+
+The foldingdiff system is designed to be extensible - you can modify configurations, add new evaluation metrics, or integrate with downstream protein design pipelines. Happy protein folding!
+
+# Installation and Environment Setup
+
+
+
+This guide provides comprehensive instructions for setting up the foldingdiff environment, a diffusion model for protein backbone generation. We'll cover system requirements, environment configuration, and data preparation to ensure a smooth installation experience.
+
+## System Requirements
+
+Before proceeding with installation, ensure your system meets these prerequisites:
+
+**Operating System**: Linux, macOS, or Windows (with WSL2)
+**Python Version**: 3.8 or higher
+**Package Manager**: Anaconda/Miniconda (recommended) or pip
+**Hardware**: GPU support recommended for training (CUDA-compatible)
+**Storage**: Minimum 10GB free space for datasets and models
+
+## Environment Setup Methods
+
+You have two primary methods for setting up the foldingdiff environment:
+
+### Method 1: Conda Environment (Recommended)
+
+The conda approach provides isolated environment management with optimized package versions:
+
+```bash
+# Clone the repository
+git clone https://github.com/microsoft/foldingdiff.git
+cd foldingdiff
+
+# Create conda environment from configuration file
+conda env create -f environment.yml
+
+# Activate the environment
+conda activate foldingdiff
+
+# Install the package in development mode
+pip install -e ./
+```
+
+### Method 2: pip Installation
+
+For users preferring pip-based installation:
+
+```bash
+# Clone the repository
+git clone https://github.com/microsoft/foldingdiff.git
+cd foldingdiff
+
+# Create virtual environment
+python -m venv foldingdiff-env
+source foldingdiff-env/bin/activate  # On Windows: foldingdiff-env\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Install the package
+pip install -e ./
+```
+
+## Package Dependencies Overview
+
+The foldingdiff project relies on several key scientific computing and deep learning libraries:
+
+| Category | Package | Version | Purpose |
+|----------|---------|---------|---------|
+| **Core ML** | PyTorch | 1.12 | Neural network framework |
+| | PyTorch Lightning | 1.6.4 | Training orchestration |
+| | Transformers | 4.11.3 | BERT model integration |
+| **Data Processing** | NumPy | 1.22.3 | Numerical computations |
+| | Pandas | 1.1.5 | Data manipulation |
+| | SciPy | 1.9.1 | Scientific computing |
+| **Bioinformatics** | Biotite | 0.34 | Protein structure analysis |
+| | TM-align | - | Structure alignment |
+| **Visualization** | Seaborn | - | Statistical plotting |
+| | mpl-scatter-density | - | Density plots |
+| | Astropy | 5.1 | Scientific visualization |
+
+> [!TIP]
+> The conda environment file [environment.yml](environment.yml) specifies exact versions to ensure reproducibility. Using the conda method is highly recommended for avoiding dependency conflicts, especially with PyTorch CUDA configurations.
+
+## Architecture Overview
+
+The foldingdiff installation creates a modular environment with the following key components:
+
+```mermaid
+graph TB
+    A[foldingdiff Package] --> B[Core Modules]
+    A --> C[Data Processing]
+    A --> D[Training Pipeline]
+    A --> E[Evaluation Tools]
+    
+    B --> B1[modelling.py]
+    B --> B2[nerf.py]
+    B --> B3[beta_schedules.py]
+    
+    C --> C1[datasets.py]
+    C --> C2[angles_and_coords.py]
+    C --> C3[utils.py]
+    
+    D --> D1[losses.py]
+    D --> D2[sampling.py]
+    D --> D3[custom_metrics.py]
+    
+    E --> E1[tmalign.py]
+    E --> E2[lddt.py]
+    E --> E3[plotting.py]
+```
+
+## Verification and Testing
+
+After installation, verify your setup by running the test suite:
+
+```bash
+# Run all tests
+python -m pytest tests/
+
+# Run specific test categories
+python -m pytest tests/test_model_subparts.py
+python -m pytest tests/test_sampling.py
+python -m pytest tests/test_utils.py
+```
+
+> [!TIP]
+> If you encounter import errors, ensure you've installed the package in development mode using `pip install -e ./` from the repository root directory. This makes the package modules available in your Python path.
+
+## Data Preparation (Optional)
+
+For training your own models, you'll need to download the CATH dataset:
+
+```bash
+# Navigate to data directory
+cd data
+
+# Make download script executable
+chmod +x download_cath.sh
+
+# Download and extract dataset
+./download_cath.sh
+```
+
+The dataset includes approximately 10GB of protein structures and is required only for training, not for sampling with pre-trained models.
+
+## Troubleshooting Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| CUDA errors | Incompatible PyTorch version | Reinstall with correct CUDA version: `conda install pytorch torchvision torchaudio pytorch-cuda=11.6 -c pytorch -c nvidia` |
+| Import errors | Package not installed in development mode | Run `pip install -e ./` from repository root |
+| Memory errors | Insufficient RAM for large datasets | Use smaller dataset variants or increase system memory |
+| Permission errors | Insufficient file permissions | Use `chmod +x` for shell scripts or run with appropriate permissions |
+
+## Next Steps
+
+After successful installation, you can proceed to:
+
+1. **[Downloading and Preparing Datasets](4-downloading-and-preparing-datasets)** - Set up training data
+2. **[Using Pre-trained Models for Sampling](5-using-pre-trained-models-for-sampling)** - Generate protein structures immediately
+3. **[Quick Start](2-quick-start)** - Get familiar with basic usage patterns
+
+The foldingdiff environment is now ready for protein structure generation using diffusion models. For detailed usage examples and advanced configurations, continue with the next documentation sections.
+
+# Downloading and Preparing Datasets
+
+
+
+This guide covers the complete process of downloading and preparing protein structure datasets for use with FoldingDiff. The system supports two primary datasets: CATH (a curated protein structure database) and AlphaFold predictions for SwissProt proteins.
+
+## Dataset Overview
+
+FoldingDiff operates on protein structures represented as angular features and coordinates. The system provides several dataset variants optimized for different modeling approaches:
+
+| Dataset Class | Features | Angular Features | Use Case |
+|---------------|----------|------------------|----------|
+| `CathCanonicalAnglesDataset` | 9 features (3 distances + 6 angles) | 6 angular features | Full canonical representation |
+| `CathCanonicalAnglesOnlyDataset` | 6 angles only | 6 angular features | Angle-only modeling |
+| `CathCanonicalMinimalAnglesDataset` | 4 angles (φ, ψ, ω, τ) | 4 angular features | Minimal angle set |
+| `CathCanonicalCoordsDataset` | XYZ coordinates | 0 angular features | Cartesian coordinate modeling |
+
+## Downloading Datasets
+
+### CATH Dataset
+
+The CATH dataset provides high-quality, non-redundant protein structures with 40% sequence identity cutoff:
+
+```bash
+# Navigate to the data directory
+cd data
+
+# Execute the download script
+./download_cath.sh
+```
+
+The download script performs the following operations [download_cath.sh](data/download_cath.sh#L1-L9):
+
+1. Downloads the CATH non-redundant S40 dataset from the official FTP server
+2. Verifies file integrity using MD5 checksum
+3. Extracts the PDB files to the `cath/domains/` directory
+
+> [!TIP]
+> The CATH dataset is approximately 2GB compressed and contains ~30,000 protein domains. Ensure sufficient disk space and stable internet connection before downloading.
+
+### AlphaFold Dataset
+
+For AlphaFold predictions of all SwissProt proteins:
+
+```bash
+# Navigate to the data directory  
+cd data
+
+# Execute the download script (requires aria2c)
+./download_alphafold.sh
+```
+
+The AlphaFold download uses `aria2c` for parallel downloading [download_alphafold.sh](data/download_alphafold.sh#L4) and retrieves the complete SwissProt predictions (~50GB compressed).
+
+## Dataset Processing Pipeline
+
+Once downloaded, datasets are processed through a multi-stage pipeline:
+
+```mermaid
+flowchart TD
+    A[Raw PDB Files] --> B[Feature Extraction]
+    B --> C[Angular & Distance Computation]
+    C --> D[Quality Filtering]
+    D --> E[Length Processing]
+    E --> F[Train/Val/Test Split]
+    F --> G[Caching]
+    
+    subgraph "Feature Types"
+        H[Distances: 0C:1N, N:CA, CA:C]
+        I[Angles: φ, ψ, ω, τ, CA:C:1N, C:1N:1CA]
+    end
+    
+    C --> H
+    C --> I
+```
+
+### Feature Extraction
+
+The system extracts two types of features from each protein structure [angles_and_coords.py](foldingdiff/angles_and_coords.py#L23-L26):
+
+**Distance Features:**
+- `0C:1N`: Distance between consecutive carbonyl carbon and amide nitrogen
+- `N:CA`: Distance between amide nitrogen and alpha carbon  
+- `CA:C`: Distance between alpha carbon and carbonyl carbon
+
+**Angular Features:**
+- `φ` (phi): Backbone dihedral angle (C<sub>i-1</sub>-N<sub>i</sub>-C<sub>αi</sub>-C<sub>i</sub>)
+- `ψ` (psi): Backbone dihedral angle (N<sub>i</sub>-C<sub>αi</sub>-C<sub>i</sub>-N<sub>i+1</sub>)
+- `ω` (omega): Backbone dihedral angle (C<sub>αi</sub>-C<sub>i</sub>-N<sub>i+1</sub>-C<sub>αi+1</sub>)
+- `τ` (tau): Bond angle (N<sub>i</sub>-C<sub>αi</sub>-C<sub>i</sub>)
+- `CA:C:1N`: Virtual angle between consecutive residues
+- `C:1N:1CA`: Virtual angle for geometric constraints
+
+### Dataset Configuration
+
+The dataset class provides extensive configuration options [datasets.py](foldingdiff/datasets.py#L44-L66):
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pdbs` | str/dict | "cath" | Dataset source ("cath", "alphafold", or custom path) |
+| `split` | str | None | Dataset split ("train", "validation", "test") |
+| `pad` | int | 512 | Maximum sequence length for padding |
+| `min_length` | int | 40 | Minimum sequence length filter |
+| `trim_strategy` | str | "leftalign" | How to handle sequences > pad length |
+| `toy` | int | 0 | Use subset for testing (0 = full dataset) |
+| `zero_center` | bool | True | Center angular features around zero mean |
+| `use_cache` | bool | True | Enable/disable feature caching |
+
+### Length Processing Strategies
+
+For proteins exceeding the maximum length, three strategies are available [datasets.py](foldingdiff/datasets.py#L440-L460):
+
+| Strategy | Behavior | Use Case |
+|----------|----------|----------|
+| `"leftalign"` | Keep first `pad` residues | Preserves N-terminal structure |
+| `"randomcrop"` | Randomly crop to `pad` residues | Increases training diversity |
+| `"discard"` | Remove sequences > `pad` length | Ensures uniform length |
+
+> [!TIP]
+> The default 80/10/10 train/validation/test split uses a fixed random seed (6489) for reproducibility across experiments.
+
+## Caching System
+
+To accelerate repeated dataset loading, FoldingDiff implements an intelligent caching system:
+
+1. **Feature Caching**: Computed angular and distance features are cached to avoid reprocessing
+2. **Hash Validation**: Cache integrity is verified using codebase MD5 hashes [datasets.py](foldingdiff/datasets.py#L85-L95)
+3. **Automatic Cleanup**: Mismatched cache files are automatically removed and regenerated
+
+Cache files are stored with descriptive names including dataset source and filename hash for easy identification.
+
+## Quick Start Examples
+
+### Basic CATH Dataset Loading
+
+```python
+from foldingdiff.datasets import CathCanonicalAnglesDataset
+
+# Load full CATH dataset with default settings
+dataset = CathCanonicalAnglesDataset(
+    pdbs="cath",
+    split="train",
+    pad=512,
+    min_length=40
+)
+
+print(f"Loaded {len(dataset)} protein structures")
+print(f"Feature names: {dataset.feature_names}")
+print(f"Length range: {min(dataset.all_lengths)}-{max(dataset.all_lengths)}")
+```
+
+### Minimal Angle Dataset
+
+```python
+from foldingdiff.datasets import CathCanonicalMinimalAnglesDataset
+
+# Load minimal angle set (φ, ψ, ω, τ only)
+minimal_dataset = CathCanonicalMinimalAnglesDataset(
+    pdbs="cath",
+    split="train",
+    pad=256,  # Shorter sequences for faster training
+    trim_strategy="randomcrop"  # Increase diversity
+)
+```
+
+### Custom Dataset from Directory
+
+```python
+# Load PDB files from custom directory
+custom_dataset = CathCanonicalAnglesDataset(
+    pdbs="/path/to/my/pdbs",  # Directory containing .pdb or .pdb.gz files
+    pad=128,
+    min_length=20,
+    zero_center=True
+)
+```
+
+## Next Steps
+
+After preparing your datasets, you can:
+
+- **[Using Pre-trained Models for Sampling](5-using-pre-trained-models-for-sampling)**: Load pre-trained models to generate new protein structures
+- **[CATH Dataset Integration](9-cath-dataset-integration)**: Deep dive into CATH-specific processing and features
+- **[Dataset Variants and Feature Sets](11-dataset-variants-and-feature-sets)**: Explore different feature representations
+
+The modular dataset system allows easy experimentation with different protein representations and training configurations, making it straightforward to adapt the pipeline for specific research needs.
+
+# Using Pre-trained Models for Sampling
+
+
+
+This guide demonstrates how to use pre-trained FoldingDiff models to generate novel protein backbone structures through diffusion sampling. The sampling pipeline converts random noise into valid protein angles using the trained reverse diffusion process.
+
+## Overview of the Sampling Architecture
+
+The sampling system implements a reverse diffusion process that progressively denoises random tensors into valid protein backbone angles. The core components work together to generate protein structures with proper angular constraints and biological validity.
+
+```mermaid
+flowchart TD
+    A[Random Noise] --> B[p_sample_loop]
+    B --> C[Reverse Diffusion Process]
+    C --> D[Angular Wrapping]
+    D --> E[Valid Protein Angles]
+    
+    F[Pre-trained Model] --> B
+    G[Beta Schedule] --> B
+    H[Sequence Lengths] --> B
+    
+    subgraph "Sampling Pipeline"
+        B --> I[p_sample - Single Timestep]
+        I --> J[Model Prediction]
+        J --> K[Noise Correction]
+        K --> L[Next Timestep]
+        L --> I
+    end
+```
+
+## Quick Start with Pre-trained Models
+
+The simplest way to start generating proteins is using the `sample_simple` function, which handles model loading, dataset preparation, and sampling automatically.
+
+### Basic Usage
+
+```python
+from foldingdiff.sampling import sample_simple
+
+# Generate 10 protein structures with lengths 50-128
+samples = sample_simple(
+    model_dir="wukevin/foldingdiff_cath",  # HuggingFace model ID
+    n=10,                                 # Number of samples per length
+    sweep_lengths=(50, 128)               # Length range
+)
+
+# samples is a list of DataFrames with angle values
+for i, sample_df in enumerate(samples):
+    print(f"Sample {i}: shape {sample_df.shape}")
+    print(sample_df.head())
+```
+
+The function automatically downloads the model from HuggingFace Hub if needed and returns DataFrames containing the generated angles [foldingdiff/sampling.py#L227-L266](foldingdiff/sampling.py#L227-L266).
+
+### Available Pre-trained Models
+
+| Model ID | Description | Feature Set |
+|----------|-------------|-------------|
+| `wukevin/foldingdiff_cath` | Full CATH-trained model | 4 angles (phi, psi, omega, tau) |
+| Local model directory | Custom trained models | Depends on training config |
+
+## Advanced Sampling Pipeline
+
+For more control over the sampling process, you can use the lower-level `sample` function directly.
+
+### Complete Pipeline Setup
+
+```python
+import torch
+from foldingdiff import modelling, datasets, sampling
+
+# Load pre-trained model
+model = modelling.BertForDiffusionBase.from_dir("path/to/model")
+if torch.cuda.is_available():
+    model = model.to("cuda:0")
+
+# Create dummy dataset for sampling configuration
+dummy_dset = datasets.AnglesEmptyDataset.from_dir("path/to/model")
+noised_dset = datasets.NoisedAnglesDataset(
+    dset=dummy_dset,
+    dset_key="angles",
+    timesteps=250,
+    beta_schedule="linear",
+    angular_variance=1.0
+)
+
+# Generate samples
+samples = sampling.sample(
+    model=model,
+    train_dset=noised_dset,
+    n=10,
+    sweep_lengths=(50, 128),
+    batch_size=512
+)
+```
+
+### Key Sampling Parameters
+
+| Parameter | Description | Default | Range |
+|-----------|-------------|---------|-------|
+| `n` | Number of samples per length | 10 | 1-∞ |
+| `sweep_lengths` | Length range (min, max) | (50, 128) | Any valid range |
+| `batch_size` | Batch size for generation | 512 | 1-1024 |
+| `trim_to_length` | Remove padding to save memory | True | Boolean |
+
+## Understanding the Sampling Process
+
+The sampling process consists of two main functions that work together:
+
+### 1. p_sample_loop - Main Sampling Loop
+
+This function orchestrates the reverse diffusion process across all timesteps [foldingdiff/sampling.py#L78-L134](foldingdiff/sampling.py#L78-L134):
+
+```python
+@torch.no_grad()
+def p_sample_loop(
+    model: nn.Module,
+    lengths: Sequence[int],
+    noise: torch.Tensor,
+    timesteps: int,
+    betas: torch.Tensor,
+    is_angle: Union[bool, List[bool]] = [False, True, True, True],
+    disable_pbar: bool = False,
+) -> torch.Tensor:
+```
+
+Key features:
+- Processes timesteps in reverse order (from T to 0)
+- Applies angular wrapping for periodic features
+- Returns tensor of shape (timesteps, batch_size, seq_len, n_ft)
+
+### 2. p_sample - Single Timestep Denoising
+
+This function performs the actual denoising for a single timestep [foldingdiff/sampling.py#L27-L77](foldingdiff/sampling.py#L27-L77):
+
+```python
+@torch.no_grad()
+def p_sample(
+    model: nn.Module,
+    x: torch.Tensor,
+    t: torch.Tensor,
+    seq_lens: Sequence[int],
+    t_index: torch.Tensor,
+    betas: torch.Tensor,
+) -> torch.Tensor:
+```
+
+> [!TIP]
+> The angular wrapping is crucial for protein generation. After each timestep, angular features are wrapped back to the [-π, π] range to maintain valid protein geometry [foldingdiff/sampling.py#L95-L105](foldingdiff/sampling.py#L95-L105).
+
+## Model Loading and Configuration
+
+### Loading from Different Sources
+
+The system supports loading models from both local directories and HuggingFace Hub:
+
+```python
+# From HuggingFace Hub
+model = modelling.BertForDiffusionBase.from_dir("wukevin/foldingdiff_cath")
+
+# From local directory
+model = modelling.BertForDiffusionBase.from_dir("./local_model_directory")
+```
+
+The `from_dir` method automatically handles:
+- Loading training configuration from `training_args.json`
+- Loading model weights from appropriate checkpoint files
+- Setting up the model architecture with correct parameters [foldingdiff/modelling.py#L297-L313](foldingdiff/modelling.py#L297-L313)
+
+### Dataset Configuration
+
+For sampling, you need a dataset that provides the noise schedule and feature configuration:
+
+```python
+# Create empty dataset with correct configuration
+dummy_dset = datasets.AnglesEmptyDataset.from_dir(model_directory)
+
+# Wrap with noise schedule
+noised_dset = datasets.NoisedAnglesDataset(
+    dset=dummy_dset,
+    timesteps=250,                    # Must match training
+    beta_schedule="linear",            # Must match training
+    angular_variance=1.0              # Must match training
+)
+```
+
+> [!TIP]
+> The dataset configuration must exactly match the training configuration, including timesteps, beta schedule, and variance parameters. Mismatches will lead to poor generation quality [foldingdiff/datasets.py#L695-L705](foldingdiff/datasets.py#L695-L705).
+
+## Output Processing and Analysis
+
+### Understanding the Output Format
+
+The sampling functions return structured data in different formats:
+
+1. **Raw samples**: List of numpy arrays with shape (timesteps, seq_len, n_features)
+2. **Final samples**: Last timestep from each trajectory
+3. **DataFrame format**: Pandas DataFrames with named columns
+
+```python
+# Raw output includes all timesteps
+raw_samples = sampling.sample(...)  # List of arrays
+
+# Get only final structures
+final_samples = [s[-1] for s in raw_samples]
+
+# Convert to DataFrames with feature names
+sample_dfs = [
+    pd.DataFrame(s, columns=feature_names)
+    for s in final_samples
+]
+```
+
+### Feature Naming and Interpretation
+
+The generated angles follow standard protein backbone conventions:
+
+| Feature | Description | Range | Angular |
+|---------|-------------|-------|---------|
+| phi | N-CA-C-N dihedral | [-π, π] | Yes |
+| psi | CA-C-N-CA dihedral | [-π, π] | Yes |
+| omega | C-N-CA-C dihedral | [-π, π] | Yes |
+| tau | N-CA-C bond angle | [-π, π] | Yes |
+
+## Performance Considerations
+
+### Memory Optimization
+
+For large-scale generation, consider these optimizations:
+
+1. **Batch size tuning**: Adjust based on GPU memory
+2. **Length trimming**: Enable `trim_to_length=True` to reduce memory usage
+3. **Sequence length**: Shorter sequences require significantly less memory
+
+### Sampling Speed
+
+The sampling speed depends on:
+- Number of timesteps (typically 250)
+- Batch size
+- Sequence length
+- Model architecture size
+
+```python
+# Faster sampling for quick prototyping
+samples = sampling.sample(
+    model=model,
+    train_dset=noised_dset,
+    n=10,
+    sweep_lengths=(50, 64),    # Shorter sequences
+    batch_size=256             # Smaller batch size
+)
+```
+
+## Next Steps
+
+After generating protein angles, you'll want to convert them to 3D coordinates and evaluate their quality:
+
+- **[Angle-to-Coordinate Conversion System](10-angle-to-coordinate-conversion-system)**: Convert generated angles to 3D atomic coordinates
+- **[Visualization and Analysis Tools](17-visualization-and-analysis-tools)**: Visualize and analyze the generated structures
+- **[Self-Consistency TM Score Calculation](18-self-consistency-tm-score-calculation)**: Evaluate the quality of generated structures
+
+The generated angles can also be used for downstream tasks like inverse folding with tools such as ProteinMPNN and ESM-IF1, as described in **[Inverse Folding with ProteinMPNN and ESM-IF1](19-inverse-folding-with-proteinmpnn-and-esm-if1)**.
+
+# Diffusion Model Architecture and BERT Integration
+
+
+
+The FoldingDiff framework implements a sophisticated diffusion model architecture that leverages BERT's transformer backbone for protein structure generation. This architecture combines the power of diffusion processes with the sequence modeling capabilities of transformers to predict protein backbone angles through a denoising approach.
+
+## Core Architecture Components
+
+### BERT-Based Diffusion Model
+
+The primary model architecture is built upon the `BertForDiffusion` class, which extends both `BertPreTrainedModel` and `pl.LightningModule` to integrate HuggingFace's BERT implementation with PyTorch Lightning for training orchestration [foldingdiff/modelling.py#L487-L490].
+
+The model's initialization reveals the key architectural decisions:
+
+```python
+def __init__(
+    self,
+    config,
+    ft_is_angular: List[bool] = [False, True, True, True],  # Feature type indicators
+    time_encoding: TIME_ENCODING = "gaussian_fourier",  # Time embedding strategy
+    decoder: DECODER_HEAD = "mlp",  # Output decoder type
+) -> None:
+```
+
+This configuration shows the model processes 4 features where the first is non-angular (likely sequence position) and the remaining three are angular features (phi, psi, omega angles) [foldingdiff/modelling.py#L242].
+
+### Input Processing Pipeline
+
+The forward pass demonstrates the model's sophisticated processing pipeline:
+
+1. **Input Projection**: Low-dimensional angle inputs are projected to the hidden dimension using `inputs_to_hidden_dim` [foldingdiff/modelling.py#L267-L269]
+2. **BERT Embeddings**: Standard BERT positional and token embeddings are applied [foldingdiff/modelling.py#L270]
+3. **Time Encoding Integration**: Diffusion timestep information is encoded and added to the embeddings [foldingdiff/modelling.py#L471-L472]
+4. **Transformer Processing**: The BERT encoder processes the time-augmented embeddings [foldingdiff/modelling.py#L473-L480]
+5. **Angle Prediction**: A specialized decoder predicts the denoised angles [foldingdiff/modelling.py#L483]
+
+## Time Encoding Mechanisms
+
+The diffusion process requires sophisticated time encoding to inform the model about the noise level at each timestep. Two primary encoding strategies are implemented:
+
+### Gaussian Fourier Projection
+
+The default time encoding uses Gaussian random features, following score-based model best practices [foldingdiff/modelling.py#L42-L71]:
+
+```python
+class GaussianFourierProjection(nn.Module):
+    def __init__(self, embed_dim: int, scale: float = 2 * torch.pi):
+        w = torch.randn(embed_dim // 2) * scale
+        self.register_buffer("W", w)  # Fixed during optimization
+```
+
+This approach randomly samples weights during initialization and keeps them fixed, providing a rich representation of temporal information through sinusoidal projections at different frequencies.
+
+### Sinusoidal Position Embeddings
+
+An alternative sinusoidal encoding is also available, using the classic transformer positional encoding approach [foldingdiff/modelling.py#L74-L93]. This method provides a deterministic time representation based on geometric progression of frequencies.
+
+## Angle Prediction Architecture
+
+The model employs a specialized `AnglesPredictor` head that follows BERT's masked language modeling pattern [foldingdiff/modelling.py#L173-L208]:
+
+```python
+d_model -> dense -> d_model -> activation -> layernorm -> dense -> d_output
+```
+
+This two-layer architecture with intermediate layer normalization ensures stable prediction of angular values while maintaining compatibility with BERT's pretraining objectives.
+
+## Model Configuration and Variants
+
+The framework supports multiple model configurations through JSON files. The mini model configuration reveals typical hyperparameters [config_jsons/mini_model.json]:
+
+- **Transformer Architecture**: 6 layers, 192 hidden size, 6 attention heads
+- **Diffusion Parameters**: 250 timesteps, cosine variance schedule
+- **Training Configuration**: Learning rate 5e-5, smooth L1 loss, batch size 128
+
+### Autoregressive Variant
+
+Beyond diffusion, the framework implements an autoregressive variant through `BertForAutoregressive` that predicts next angles given current angles, enabling sequential protein generation [foldingdiff/modelling.py#L896-L901].
+
+## Integration with Protein Structure
+
+The architecture is specifically designed for protein angle prediction, with careful consideration of angular data properties:
+
+1. **Angular Loss Functions**: Specialized loss functions handle the circular nature of angular data
+2. **Feature Type Awareness**: The model tracks which features are angular vs. non-angular for appropriate processing
+3. **Coordinate Conversion**: Integration with NERF (Natural Extension Reference Frame) for angle-to-coordinate conversion [foldingdiff/nerf.py]
+
+## Training Pipeline Integration
+
+The Lightning module integration provides comprehensive training infrastructure [foldingdiff/modelling.py#L487]:
+
+- **Loss Computation**: Multi-feature loss calculation with angular considerations
+- **Optimization**: Configurable optimizers and learning rate schedules
+- **Validation**: Comprehensive validation metrics and logging
+- **Checkpointing**: Model saving and loading capabilities
+
+This architecture represents a sophisticated fusion of diffusion models and transformer technology, specifically adapted for the challenges of protein structure generation while maintaining flexibility for different experimental configurations and research objectives.
+
+# Angle-based Protein Representation
+
+
+
+The FoldingDiff framework employs an angle-based representation system for protein structures that provides a mathematically robust and computationally efficient alternative to traditional Cartesian coordinates. This approach captures the essential geometric information of protein backbones through a carefully selected set of internal coordinates, enabling more stable diffusion modeling and better generalization across protein lengths.
+
+## Core Angular Features
+
+The representation system defines three distinct feature sets, each optimized for different modeling requirements:
+
+| Feature Set | Components | Angularity | Description |
+|-------------|------------|------------|-------------|
+| **canonical** | ["0C:1N", "N:CA", "CA:C", "phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"] | [False, False, False, True, True, True, True, True, True] | Complete canonical representation with distances and angles |
+| **canonical-full-angles** | ["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"] | [True, True, True, True, True, True] | All angular features without distances |
+| **canonical-minimal-angles** | ["phi", "psi", "omega", "tau"] | [True, True, True, True] | Minimal reconstructable angle set |
+
+Sources: [foldingdiff/datasets.py](foldingdiff/datasets.py#L44-L56)
+
+### Dihedral Angles
+
+The three canonical dihedral angles form the backbone of the representation:
+
+- **φ (phi)**: N-CA-C-N dihedral angle, describing rotation around the N-CA bond
+- **ψ (psi)**: CA-C-N-CA dihedral angle, describing rotation around the C-N bond  
+- **ω (omega)**: C-N-CA-C dihedral angle, typically constrained near π (180°) for trans peptide bonds
+
+These angles capture the primary degrees of freedom in protein backbone conformation and are sufficient to define the secondary structure elements (α-helices, β-sheets, coils).
+
+### Internal Bond Angles
+
+Three additional internal angles provide geometric constraints for accurate reconstruction:
+
+- **τ (tau)**: N-CA-C bond angle, approximately 109°
+- **CA:C:1N**: C-N bond angle between adjacent residues
+- **C:1N:1CA**: N-CA bond angle between adjacent residues
+
+Sources: [foldingdiff/angles_and_coords.py](foldingdiff/angles_and_coords.py#L23)
+
+## NERF Coordinate Reconstruction
+
+The angle-based representation utilizes the NERF (Natural Extension of the Reference Frame) algorithm for converting internal coordinates back to Cartesian space. This mathematical framework ensures lossless reconstruction when all angles and distances are provided.
+
+### NERF Builder Architecture
+
+```mermaid
+flowchart TD
+    A[Initial N-CA-C Coordinates] --> B[Iterative Atom Placement]
+    B --> C[Calculate Next N Position]
+    C --> D[Calculate Next CA Position]
+    D --> E[Calculate Next C Position]
+    E --> F{More Residues?}
+    F -->|Yes| B
+    F -->|No| G[Complete Backbone]
+    
+    H[Input Angles] --> I[φ/ψ/ω Dihedrals]
+    H --> J[Bond Angles τ/CA:C:1N/C:1N:1CA]
+    H --> K[Bond Distances]
+    
+    I --> C
+    J --> C
+    K --> C
+```
+
+The NERFBuilder class implements this reconstruction process using a systematic approach:
+
+1. **Initialization**: Start with fixed N-CA-C coordinates for the first residue
+2. **Iterative Placement**: For each subsequent residue, place N, CA, and C atoms using the `place_dihedral` function
+3. **Geometric Constraints**: Apply bond lengths, bond angles, and dihedral angles to ensure proper geometry
+
+Sources: [foldingdiff/nerf.py](foldingdiff/nerf.py#L27-L144)
+
+### Mathematical Foundation
+
+The `place_dihedral` function implements the core geometric transformation:
+
+```python
+def place_dihedral(
+    a: np.ndarray, b: np.ndarray, c: np.ndarray,
+    bond_angle: float, bond_length: float, torsion_angle: float
+) -> np.ndarray:
+    # Place point d such that geometric constraints are satisfied
+    # for the series a, b, c, d
+```
+
+This function uses vector mathematics to compute the position of atom `d` given three preceding atoms and the desired geometric parameters, ensuring exact satisfaction of bond angles, lengths, and torsion angles.
+
+Sources: [foldingdiff/nerf.py](foldingdiff/nerf.py#L145-L157)
+
+## Dataset Integration and Processing
+
+The angle-based representation is seamlessly integrated into the dataset loading pipeline through specialized dataset classes:
+
+### Canonical Angles Dataset
+
+The `CathCanonicalAnglesDataset` class handles the extraction and processing of angular features from PDB structures:
+
+- **Feature Extraction**: Uses `canonical_distances_and_dihedrals` to parse PDB files and extract specified angles and distances
+- **Validation**: Ensures all angle values fall within [-π, π] range to maintain mathematical consistency
+- **Caching**: Implements efficient caching to avoid redundant computations across training runs
+
+Sources: [foldingdiff/datasets.py](foldingdiff/datasets.py#L75-L463), [foldingdiff/angles_and_coords.py](foldingdiff/angles_and_coords.py#L30-L111)
+
+### Minimal Angle Subset
+
+For efficient modeling, the framework supports a minimal angle subset that maintains reconstruction quality:
+
+```python
+MINIMAL_ANGLES = ["phi", "psi", "omega", "tau"]
+```
+
+This subset represents the minimal set of angles required for reasonable protein reconstruction while reducing model complexity and training time.
+
+Sources: [foldingdiff/angles_and_coords.py](foldingdiff/angles_and_coords.py#L26), [foldingdiff/datasets.py](foldingdiff/datasets.py#L557-L567)
+
+## Angular Data Processing
+
+### Angular Loss Functions
+
+The representation includes specialized loss functions that respect the circular nature of angular data:
+
+- **radian_l1_loss**: Computes L1 loss with proper angular wraparound handling
+- **radian_smooth_l1_loss**: Smooth L1 loss variant for angular data with optional circle penalty
+
+These functions ensure that angular differences are computed correctly across the -π to π boundary, preventing artificial large losses for values near the wraparound point.
+
+Sources: [foldingdiff/losses.py](foldingdiff/losses.py#L12-L65)
+
+### Zero-Centering and Normalization
+
+Angular features are automatically zero-centered to improve training stability:
+
+```python
+# Centers angular features around zero mean
+zero_center: bool = True
+```
+
+This preprocessing step ensures that the diffusion model learns to predict deviations from the mean rather than absolute angles, improving convergence and generalization.
+
+Sources: [foldingdiff/datasets.py](foldingdiff/datasets.py#L111)
+
+## Conversion Pipeline
+
+The complete angle-to-coordinate conversion pipeline follows this workflow:
+
+```mermaid
+sequenceDiagram
+    participant P as PDB File
+    participant E as Angle Extractor
+    participant D as Dataset
+    participant M as Diffusion Model
+    participant N as NERF Builder
+    participant C as Cartesian Output
+    
+    P->>E: Parse Structure
+    E->>D: Extract φ, ψ, ω, τ, etc.
+    D->>M: Provide Angular Features
+    M->>M: Generate/Sample Angles
+    M->>N: Pass Predicted Angles
+    N->>C: Reconstruct Cartesian Coordinates
+```
+
+This pipeline enables bidirectional conversion between angular and Cartesian representations, supporting both training on angular features and evaluation on reconstructed structures.
+
+Sources: [foldingdiff/angles_and_coords.py](foldingdiff/angles_and_coords.py#L112-L186)
+
+> [!TIP]
+> The angle-based representation provides superior invariance to global rotations and translations compared to Cartesian coordinates, making it ideal for diffusion-based generative modeling of protein structures.
+
+> [!TIP]
+> When using the minimal angle set ["phi", "psi", "omega", "tau"], the framework maintains reconstruction quality while significantly reducing model complexity and training time.
+
+## Next Steps
+
+To understand how these angular representations integrate with the diffusion model architecture, continue to [Diffusion Model Architecture and BERT Integration](6-diffusion-model-architecture-and-bert-integration). For details on the conversion process back to Cartesian coordinates, see [Angle-to-Coordinate Conversion System](10-angle-to-coordinate-conversion-system).
+
+# Time Encoding and Noise Schedules
+
+
+
+This page explores the temporal aspects of FoldingDiff's diffusion model architecture, focusing on how time information is encoded and how noise is scheduled throughout the denoising process. These components are fundamental to the diffusion model's ability to generate protein structures through gradual denoising.
+
+## Time Encoding Mechanisms
+
+The diffusion model employs sophisticated time encoding strategies to inform the network about the current timestep in the denoising process. FoldingDiff implements two primary time encoding approaches:
+
+### Gaussian Fourier Projection
+
+The default and recommended time encoding method uses Gaussian random features to project timesteps into a high-dimensional space [foldingdiff/modelling.py#L42-L65](foldingdiff/modelling.py#L42-65). This approach is particularly well-suited for score-based models and provides rich temporal representations:
+
+```python
+class GaussianFourierProjection(nn.Module):
+    def __init__(self, embed_dim: int, scale: float = 2 * torch.pi):
+        super().__init__()
+        # Randomly sample weights during initialization, fixed during optimization
+        w = torch.randn(embed_dim // 2) * scale
+        self.register_buffer("W", w)
+
+    def forward(self, x: torch.Tensor):
+        x_proj = x[:, None] * self.W[None, :] * 2 * torch.pi
+        embed = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+        return embed
+```
+
+The Gaussian Fourier projection creates time embeddings by projecting timesteps through randomly sampled frequencies, then applying sine and cosine transformations. This creates a smooth, continuous representation of time that helps the model understand the progression of the denoising process.
+
+### Sinusoidal Position Embeddings
+
+An alternative time encoding method uses sinusoidal embeddings [foldingdiff/modelling.py#L74-L95](foldingdiff/modelling.py#L74-95), similar to those used in transformer architectures:
+
+```python
+class SinusoidalPositionEmbeddings(nn.Module):
+    def forward(self, time: torch.Tensor) -> torch.Tensor:
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+```
+
+This method provides a deterministic way to encode time information using exponentially spaced frequencies, creating unique embeddings for each timestep.
+
+### Integration with Model Architecture
+
+Time embeddings are integrated into the model through additive combination with input embeddings [foldingdiff/modelling.py#L470-L475](foldingdiff/modelling.py#L470-475):
+
+```python
+# timestep is (batch, 1), squeeze to (batch,)
+# embedding gets to (batch, embed_dim) -> unsqueee to (batch, 1, dim)
+time_encoded = self.time_embed(timestep.squeeze(dim=-1)).unsqueeze(1)
+inputs_with_time = inputs_upscaled + time_encoded
+```
+
+> [!TIP]
+> The time encoding is added to the input embeddings rather than concatenated, allowing the model to learn how temporal information modulates the protein representation at each denoising step.
+
+## Noise Schedules
+
+Noise schedules control how much noise is added at each timestep during the forward diffusion process and consequently guide the denoising during sampling. FoldingDiff implements three distinct noise schedule strategies:
+
+### Linear Schedule
+
+The linear schedule provides a straightforward progression of noise levels [foldingdiff/beta_schedules.py#L32-L37](foldingdiff/beta_schedules.py#L32-37):
+
+```python
+def linear_beta_schedule(timesteps: int, beta_start=1e-4, beta_end=0.02) -> torch.Tensor:
+    return torch.linspace(beta_start, beta_end, timesteps)
+```
+
+This creates a uniform progression from minimal noise at the beginning to maximum noise at the end of the diffusion process.
+
+### Cosine Schedule
+
+The cosine schedule implements the approach from "Improved Denoising Diffusion Probabilistic Models" [foldingdiff/beta_schedules.py#L20-L30](foldingdiff/beta_schedules.py#L20-30):
+
+```python
+def cosine_beta_schedule(timesteps: int, s: float = 8e-3) -> torch.Tensor:
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0.0001, 0.9999)
+```
+
+The cosine schedule provides more nuanced control over noise progression, with slower changes in the middle of the process and more aggressive changes near the beginning and end.
+
+### Quadratic Schedule
+
+The quadratic schedule uses a sigmoid-based approach for noise progression [foldingdiff/beta_schedules.py#L38-L43](foldingdiff/beta_schedules.py#L38-43):
+
+```python
+def quadratic_beta_schedule(timesteps: int, beta_start=1e-4, beta_end=0.02) -> torch.Tensor:
+    betas = torch.linspace(-6, 6, timesteps)
+    return torch.sigmoid(betas) * (beta_end - beta_start) + beta_start
+```
+
+This creates an S-shaped curve for noise progression, potentially providing better balance between early and late diffusion stages.
+
+## Computational Framework
+
+### Alpha Computations
+
+The system computes comprehensive alpha values from beta schedules to support the diffusion process [foldingdiff/beta_schedules.py#L45-L64](foldingdiff/beta_schedules.py#L45-64):
+
+```python
+def compute_alphas(betas: torch.Tensor) -> Dict[str, torch.Tensor]:
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+    posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+    return {
+        "betas": betas,
+        "alphas": alphas,
+        "alphas_cumprod": alphas_cumprod,
+        "sqrt_alphas_cumprod": sqrt_alphas_cumprod,
+        "sqrt_one_minus_alphas_cumprod": sqrt_one_minus_alphas_cumprod,
+        "posterior_variance": posterior_variance,
+    }
+```
+
+This comprehensive set of values supports both the forward diffusion process and the reverse sampling process, providing all necessary statistical parameters for noise manipulation.
+
+### Schedule Selection Interface
+
+The system provides a unified interface for selecting and configuring noise schedules [foldingdiff/beta_schedules.py#L65-L80](foldingdiff/beta_schedules.py#L65-80):
+
+```python
+def get_variance_schedule(keyword: SCHEDULES, timesteps: int, **kwargs) -> torch.Tensor:
+    logging.info(f"Getting {keyword} variance schedule with {timesteps} timesteps")
+    if keyword == "cosine":
+        return cosine_beta_schedule(timesteps, **kwargs)
+    elif keyword == "linear":
+        return linear_beta_schedule(timesteps, **kwargs)
+    elif keyword == "quadratic":
+        return quadratic_beta_schedule(timesteps, **kwargs)
+    else:
+        raise ValueError(f"Unrecognized variance schedule: {keyword}")
+```
+
+## Sampling Integration
+
+The time encoding and noise schedules work together during the sampling process to guide protein structure generation. The sampling loop uses the computed schedules to progressively denoise random noise into meaningful protein angle representations [foldingdiff/sampling.py#L78-L91](foldingdiff/sampling.py#L78-91).
+
+```mermaid
+graph TD
+    A[Random Noise] --> B[Timestep T]
+    B --> C[Time Encoding]
+    C --> D[Model Prediction]
+    D --> E[Noise Schedule Application]
+    E --> F[Denosed State]
+    F --> G{More Timesteps?}
+    G -->|Yes| H[T = T-1]
+    H --> B
+    G -->|No| I[Final Protein Structure]
+```
+
+> [!TIP]
+> The choice of noise schedule significantly impacts generation quality. The cosine schedule generally provides better performance for protein structure generation due to its more balanced approach to noise progression across timesteps.
+
+## Configuration and Usage
+
+Time encoding and noise schedules are configurable through the model initialization parameters [foldingdiff/modelling.py#L244](foldingdiff/modelling.py#L244):
+
+- `time_encoding`: Choose between "gaussian_fourier" (default) or "sinusoidal"
+- Noise schedules are selected during training configuration
+- Timesteps are typically set to 1000 for standard diffusion processes
+
+The system also provides visualization tools for understanding noise schedule behavior [foldingdiff/beta_schedules.py#L81-L104](foldingdiff/beta_schedules.py#L81-104), allowing researchers to analyze and compare different scheduling strategies.
+
+## Next Steps
+
+To understand how these temporal components integrate with the broader architecture, explore:
+
+- [Diffusion Model Architecture and BERT Integration](6-diffusion-model-architecture-and-bert-integration) - Learn how time encoding fits into the overall model design
+- [Protein Backbone Sampling Pipeline](15-protein-backbone-sampling-pipeline) - See how these schedules are used during protein generation
+- [Loss Functions for Angular Data](12-loss-functions-for-angular-data) - Understand how temporal information affects training objectives
+
+The temporal encoding and noise scheduling systems form the backbone of FoldingDiff's ability to generate protein structures through controlled denoising, providing the temporal context necessary for meaningful protein structure generation.
+
+# CATH Dataset Integration
+
+
+
+The CATH dataset integration in foldingdiff provides a comprehensive framework for loading, processing, and featurizing protein structures from the CATH (Class, Architecture, Topology, Homologous superfamily) database. This integration serves as the primary data source for training protein structure generation models using diffusion-based approaches.
+
+## Dataset Architecture Overview
+
+The CATH dataset integration follows a hierarchical architecture that separates data loading, featurization, and preprocessing concerns. The core dataset classes extend PyTorch's Dataset interface while providing specialized functionality for protein structure data.
+
+```mermaid
+graph TD
+    A[CATH Dataset Files] --> B[download_cath.sh]
+    B --> C[dompdb/*.pdb files]
+    C --> D[CathCanonicalAnglesDataset]
+    D --> E[Feature Extraction]
+    E --> F[canonical_distances_and_dihedrals]
+    F --> G[Angle/Distance Features]
+    G --> H[Dataset Variants]
+    
+    H --> I[CathCanonicalCoordsDataset]
+    H --> J[CathCanonicalAnglesOnlyDataset]
+    H --> K[CathCanonicalMinimalAnglesDataset]
+    
+    D --> L[Preprocessing]
+    L --> M[Padding/Trimming]
+    L --> N[Zero-centering]
+    L --> O[Caching]
+```
+
+## Data Acquisition and Setup
+
+The CATH dataset is automatically downloaded and processed through a dedicated shell script that fetches the non-redundant S40 dataset from the official CATH repository [download_cath.sh](data/download_cath.sh#L1-L9). The dataset contains protein domain structures organized by structural classification, providing a diverse training set for protein structure modeling.
+
+The script downloads the compressed PDB files and extracts them to the `data/cath/dompdb/` directory, where they become accessible to the dataset classes. An MD5 checksum verification ensures data integrity during the download process.
+
+## Core Dataset Class: CathCanonicalAnglesDataset
+
+The primary dataset class, [CathCanonicalAnglesDataset](foldingdiff/datasets.py#L75-L482), serves as the foundation for all CATH-based data loading. It implements comprehensive protein structure featurization with the following key characteristics:
+
+### Feature Sets and Angularity
+
+The dataset supports multiple feature configurations through predefined mappings [datasets.py#L44-L70]:
+
+- **canonical**: 9 features including 3 bond distances and 6 angles
+- **canonical-full-angles**: 6 angular features (phi, psi, omega, tau, CA:C:1N, C:1N:1CA)
+- **canonical-minimal-angles**: 4 essential angles (phi, psi, omega, tau)
+- **cart-coords**: 3 Cartesian coordinates for alpha carbons
+
+Each feature is classified by its angularity, determining whether it requires special handling for periodic boundary conditions during training and inference.
+
+### Data Loading and Processing
+
+The dataset initialization [datasets.py#L101-L120] supports flexible configuration options:
+
+- **Source selection**: Choose between "cath", "alphafold", or custom directory paths
+- **Sequence length control**: Configure minimum (40 residues) and maximum (512 residues) lengths
+- **Trimming strategies**: "leftalign", "randomcrop", or "discard" for handling sequences exceeding maximum length
+- **Zero-centering**: Automatic mean subtraction for improved training stability
+- **Caching**: Optional caching of computed features for faster subsequent loading
+
+The dataset automatically discovers PDB files through the [__get_pdb_fnames](foldingdiff/datasets.py#L235-L260) method, which handles both keyword-based and directory-based data sources.
+
+### Feature Computation Pipeline
+
+Protein structure featurization occurs through a parallelized pipeline [datasets.py#L304-L340]:
+
+1. **Parallel processing**: Uses multiprocessing to extract features from all PDB files
+2. **Angle calculation**: Computes backbone dihedral angles (phi, psi, omega) and geometric angles
+3. **Distance measurement**: Extracts bond distances between consecutive atoms
+4. **Coordinate extraction**: Generates alpha carbon coordinates for structural reference
+5. **Quality filtering**: Removes structures with parsing errors or missing data
+
+The featurization leverages the [canonical_distances_and_dihedrals](foldingdiff/angles_and_coords.py#L34-L50) function from the angles_and_coords module, which uses biotite for robust PDB parsing and geometric calculations.
+
+## Dataset Variants
+
+The CATH integration provides specialized dataset variants for different modeling requirements:
+
+### CathCanonicalCoordsDataset
+
+This variant [datasets.py#L483-L497] returns XYZ coordinates of alpha carbon atoms instead of angular features. It's particularly useful for coordinate-based modeling approaches and direct structure comparison tasks.
+
+### CathCanonicalAnglesOnlyDataset
+
+Focusing exclusively on angular features [datasets.py#L502-L540], this variant returns the 6 canonical angles (3 dihedral and 3 non-dihedral) without distance information. This is ideal for pure angular diffusion models.
+
+### CathCanonicalMinimalAnglesDataset
+
+The most streamlined variant [datasets.py#L557-L566] returns only the essential 4 angles (phi, psi, omega, tau) required for reasonable protein reconstruction. This minimal representation reduces computational complexity while maintaining structural fidelity.
+
+## Data Preprocessing and Augmentation
+
+The dataset implements sophisticated preprocessing to handle variable-length sequences and improve training efficiency:
+
+### Padding and Masking
+
+Sequences are padded to a fixed length (default 512 residues) with special attention masks [datasets.py#L364-L460] that distinguish real residues from padding. This enables efficient batch processing while preserving sequence boundaries.
+
+### Length-based Trimming Strategies
+
+For sequences exceeding the maximum length, three strategies are available:
+
+- **leftalign**: Truncate from the C-terminus, preserving N-terminal structure
+- **randomcrop**: Randomly select a contiguous segment within the sequence
+- **discard**: Exclude sequences that are too long
+
+### Zero-Centering and Angular Wrapping
+
+Angular features are automatically zero-centered by subtracting feature means [datasets.py#L410-L420]. Angular values are wrapped to the [-π, π] range using modulo operations to maintain proper periodicity.
+
+## Configuration Integration
+
+The CATH dataset integrates seamlessly with the configuration system through JSON files like [cath_full_angles.json](config_jsons/cath_full_angles.json#L1-L31). These configurations specify:
+
+- Feature set definitions ("canonical-full-angles")
+- Sequence length constraints (min: 40, max: 128)
+- Preprocessing parameters (trim_strategy: "randomcrop")
+- Training hyperparameters (batch_size: 64, timesteps: 1000)
+
+This integration allows reproducible dataset configuration across different experiments and modeling approaches.
+
+## Performance Optimizations
+
+The CATH dataset implementation includes several performance optimizations:
+
+- **Multiprocessing**: Parallel feature extraction across all CPU cores
+- **Caching**: Optional on-disk caching of computed features to avoid recomputation
+- **Memory efficiency**: Lazy loading of structures to minimize memory footprint
+- **Batch-friendly design**: Consistent tensor shapes and efficient masking strategies
+
+These optimizations enable training on large-scale CATH datasets while maintaining reasonable computational requirements.
+
+> [!TIP]
+> The dataset's modular design allows easy extension to additional protein structure databases. By implementing the same interface as CathCanonicalAnglesDataset, new data sources can be integrated with minimal changes to the training pipeline.
+
+> [!TIP]
+> For optimal training performance, enable caching and use the "randomcrop" trimming strategy. This combination provides both computational efficiency and data augmentation benefits through random segment selection.
+
+## Next Steps
+
+After understanding the CATH dataset integration, explore the [Angle-to-Coordinate Conversion System](10-angle-to-coordinate-conversion-system) to learn how angular features are converted back to 3D protein structures, or examine the [Dataset Variants and Feature Sets](11-dataset-variants-and-feature-sets) for detailed comparisons of different feature configurations.
+
+# Angle-to-Coordinate Conversion System
+
+
+
+The Angle-to-Coordinate Conversion System is a critical component that transforms internal coordinate representations (angles and distances) into 3D Cartesian coordinates for protein structures. This system bridges the gap between the diffusion model's angular predictions and the physical protein geometry required for downstream analysis and visualization.
+
+## Core Architecture
+
+The conversion system operates through a two-stage pipeline: **extraction** of angular parameters from existing structures and **reconstruction** of coordinates from predicted angles. The system leverages the Natural Extension Reference Frame (NERF) algorithm, which iteratively builds protein backbones using geometric constraints.
+
+```mermaid
+flowchart TD
+    A[PDB Structure] --> B[canonical_distances_and_dihedrals]
+    B --> C[Angular DataFrame<br/>φ, ψ, ω, τ, distances]
+    C --> D[create_new_chain_nerf]
+    D --> E[NERFBuilder]
+    E --> F[Cartesian Coordinates]
+    F --> G[write_coords_to_pdb]
+    G --> H[Reconstructed PDB]
+    
+    I[Diffusion Model] --> J[Predicted Angles]
+    J --> D
+    
+    style B fill:#e1f5fe
+    style D fill:#f3e5f5
+    style E fill:#fff3e0
+```
+
+## Angular Parameter Extraction
+
+### Canonical Angles and Distances
+
+The system defines two parameter sets for different use cases:
+
+- **MINIMAL_ANGLES**: `["phi", "psi", "omega"]` - Essential backbone dihedral angles
+- **EXHAUSTIVE_ANGLES**: `["phi", "psi", "omega", "tau", "CA:C:1N", "C:1N:1CA"]` - Complete geometric description
+
+The `canonical_distances_and_dihedrals` function parses PDB files to extract these parameters using biotite's structure analysis capabilities [angles_and_coords.py#L30-L111](foldingdiff/angles_and_coords.py#L30-L111). It handles:
+
+- **Dihedral angles**: φ (phi), ψ (psi), ω (omega) using `struc.dihedral_backbone()`
+- **Bond angles**: τ (N-CA-C), CA:C:1N, C:1N:1CA using `struc.index_angle()`
+- **Bond distances**: N:CA, CA:C, 0C:1N using `struc.index_distance()`
+
+### Data Validation
+
+The extraction process includes rigorous validation:
+
+```python
+# Angle range validation (-π to π)
+for k, v in calc_angles.items():
+    if not (np.nanmin(v) >= -np.pi and np.nanmax(v) <= np.pi):
+        logging.warning(f"Illegal values for {k} in {fname} -- skipping")
+        return None
+```
+
+> [!TIP]
+> The system automatically pads inter-residue measurements (like 0C:1N distances) with null values to maintain consistent array dimensions with intra-residue measurements, ensuring compatibility with downstream processing.
+
+## NERF-Based Coordinate Reconstruction
+
+### NERF Algorithm Implementation
+
+The NERF (Natural Extension Reference Frame) algorithm reconstructs protein coordinates by iteratively placing atoms using geometric constraints. The core `place_dihedral` function calculates the position of atom D given three preceding atoms (A, B, C) and specified bond parameters [nerf.py#L145-L206](foldingdiff/nerf.py#L145-L206):
+
+```python
+def place_dihedral(a, b, c, bond_angle, bond_length, torsion_angle):
+    # Creates local coordinate system from a-b-c
+    # Places d using bond length, angle, and torsion constraints
+    bc = unit_vec(c - b)
+    n = unit_vec(cross(ab, bc))
+    nbc = cross(n, bc)
+    # Transform to global coordinates
+    d = m.dot([bond_length * cos/sin components])
+    return d + c
+```
+
+### NERFBuilder Class
+
+The `NERFBuilder` class orchestrates the reconstruction process [nerf.py#L27-L144](foldingdiff/nerf.py#L27-L144):
+
+- **Initialization**: Accepts dihedral angles and optional bond parameters
+- **Coordinate Building**: Iteratively places N-CA-C atoms for each residue
+- **Centering**: Provides centered coordinates for consistent positioning
+
+The reconstruction follows a specific atom placement sequence for each residue:
+
+1. **N atom**: Uses C-N bond length/angle + ψ dihedral
+2. **CA atom**: Uses N-CA bond length/angle + ω dihedral  
+3. **C atom**: Uses CA-C bond length/angle + φ dihedral
+
+### Integration Pipeline
+
+The `create_new_chain_nerf` function serves as the main interface for coordinate reconstruction [angles_and_coords.py#L112-L186](foldingdiff/angles_and_coords.py#L112-L186):
+
+```python
+def create_new_chain_nerf(out_fname, dists_and_angles, angles_to_set=None, dists_to_set=None):
+    # Auto-detect parameters if not specified
+    # Validate required dihedrals (phi, psi, omega)
+    # Map parameters to NERF builder kwargs
+    nerf_builder = nerf.NERFBuilder(**nerf_build_kwargs)
+    coords = nerf_builder.centered_cartesian_coords if center_coords else nerf_builder.cartesian_coords
+    return write_coords_to_pdb(coords, out_fname)
+```
+
+## Sidechain Reconstruction
+
+### Relative Positioning System
+
+Beyond backbone reconstruction, the system supports sidechain attachment using a library-based approach [angles_and_coords.py#L301-L387](foldingdiff/angles_and_coords.py#L301-L387):
+
+- **SideChainAtomRelative**: Named tuple defining relative geometry (bond_angle, bond_dist, dihedral_angle)
+- **AA Library**: Pre-computed sidechain geometries for all 20 amino acids
+- **Reconstruction**: Places sidechain atoms relative to backbone N-CA-C frame
+
+The `add_sidechains_to_backbone` function grafts sidechains onto reconstructed backbones [angles_and_coords.py#L378-L435](foldingdiff/angles_and_coords.py#L378-L435):
+
+```python
+for rel_atom in aa_library[res_aa]:
+    d = nerf.place_dihedral(a, b, c, rel_atom.bond_angle, rel_atom.bond_dist, rel_atom.dihedral_angle)
+    # Create atom with proper residue and element information
+```
+
+## PDB Output Generation
+
+### Structure Writing
+
+The `write_coords_to_pdb` function converts NumPy coordinate arrays to standard PDB format [angles_and_coords.py#L187-L255](foldingdiff/angles_and_coords.py#L187-L255):
+
+- **Atom Creation**: Generates N, CA, C atoms with proper metadata
+- **Bond Assignment**: Creates peptide bond connectivity
+- **File Output**: Uses biotite's PDBFile for standards compliance
+
+### Output Validation
+
+The system includes comprehensive validation:
+
+```python
+assert coords.shape == (int(dists_and_angles.shape[0] * 3), 3)
+if np.any(np.isnan(coords)):
+    logging.warning(f"Found NaN values, not writing pdb file {out_fname}")
+    return ""
+```
+
+> [!TIP]
+> The system uses cached properties for coordinate computation to avoid redundant calculations when multiple coordinate representations (centered vs. original) are needed for the same angular parameters.
+
+## System Integration
+
+The Angle-to-Coordinate Conversion System serves as the bridge between the diffusion model's angular predictions and downstream structural analysis tools. It enables:
+
+- **Training Data Preparation**: Converting known structures to angular representations
+- **Generation Output**: Transforming sampled angles into valid protein structures  
+- **Evaluation Pipeline**: Providing coordinates for TM-score, lDDT, and other metrics
+- **Visualization**: Generating PDB files for molecular visualization tools
+
+This system ensures that the abstract angular representations produced by the diffusion model can be grounded in physically realistic 3D protein structures for comprehensive analysis and validation.
+
+For understanding how these converted coordinates integrate with the broader protein generation pipeline, see [Protein Backbone Sampling Pipeline](15-protein-backbone-sampling-pipeline). For details on the angular representations used by the diffusion model, refer to [Angle-based Protein Representation](7-angle-based-protein-representation).
+
+# Dataset Variants and Feature Sets
+
+
+
+The foldingdiff framework supports multiple dataset variants and feature representations, each optimized for different aspects of protein structure generation. This comprehensive system allows researchers to choose the most appropriate representation for their specific use case, from minimal angle-based models to full Cartesian coordinate approaches.
+
+## Feature Set Architecture
+
+The framework implements a hierarchical feature set system with four primary variants, each defined by their angular composition and dimensional characteristics:
+
+```mermaid
+graph TD
+    A[Feature Set Selection] --> B[cart-coords]
+    A --> C[canonical-minimal-angles]
+    A --> D[canonical-full-angles]
+    A --> E[canonical]
+    
+    B --> B1[3 Cartesian Features]
+    B --> B2[x, y, z coordinates]
+    B --> B3[Non-angular representation]
+    
+    C --> C1[4 Angular Features]
+    C --> C2[phi, psi, omega, tau]
+    C --> C3[Minimal dihedral set]
+    
+    D --> D1[6 Angular Features]
+    D --> D2[phi, psi, omega, tau, CA:C:1N, C:1N:1CA]
+    D --> D3[Complete dihedral angles]
+    
+    E --> E1[9 Mixed Features]
+    E --> E2[3 distances + 6 angles]
+    E --> E3[Hybrid representation]
+```
+
+### Core Feature Definitions
+
+The system defines four distinct feature sets through the `FEATURE_SET_NAMES_TO_ANGULARITY` mapping in [`datasets.py`](foldingdiff/datasets.py#L25-L34):
+
+| Feature Set | Dimensionality | Angular Features | Non-angular Features | Use Case |
+|-------------|----------------|------------------|---------------------|----------|
+| `cart-coords` | 3 | 0 | 3 | Direct coordinate prediction |
+| `canonical-minimal-angles` | 4 | 4 | 0 | Basic backbone geometry |
+| `canonical-full-angles` | 6 | 6 | 0 | Complete angular representation |
+| `canonical` | 9 | 6 | 3 | Hybrid distance-angle model |
+
+The angularity mapping precisely defines which features require circular statistics handling during zero-centering and loss computation: `[False, False, False, True, True, True, True, True, True]` for the canonical set, where the first three are distance features and the remaining six are angular features.
+
+### Detailed Feature Composition
+
+**Canonical Full Angles (`canonical-full-angles`)**: This represents the most comprehensive angular representation, including:
+- **Backbone dihedrals**: φ (phi), ψ (psi), ω (omega) - defining the protein backbone conformation
+- **Internal angles**: τ (tau) - N-CA-C bond angle
+- **Inter-residue angles**: CA:C:1N, C:1N:1CA - capturing geometric relationships between consecutive residues
+
+**Canonical Minimal Angles (`canonical-minimal-angles`)**: A focused subset containing only the essential backbone dihedrals (φ, ψ, ω, τ), suitable for rapid prototyping and reduced computational overhead.
+
+**Cartesian Coordinates (`cart-coords`)**: Direct 3D coordinate representation using backbone CA atom positions, bypassing angular transformations entirely.
+
+**Canonical Hybrid (`canonical`)**: Combines distance measurements (0C:1N, N:CA, CA:C) with the full angular set, providing both local and geometric constraints.
+
+## Dataset Processing Pipeline
+
+The dataset loading system implements a sophisticated processing pipeline with multiple configuration options:
+
+```mermaid
+flowchart LR
+    A[PDB Files] --> B[Structure Parsing]
+    B --> C[Feature Extraction]
+    C --> D[Quality Filtering]
+    D --> E[Length Processing]
+    E --> F[Split Assignment]
+    F --> G[Zero-Centering]
+    G --> H[Final Dataset]
+    
+    subgraph Processing Options
+        I[Trim Strategies]
+        J[Length Constraints]
+        K[Split Ratios]
+    end
+    
+    E --> I
+    E --> J
+    F --> K
+```
+
+### Trim Strategies
+
+The system supports three sequence length handling strategies defined in [`datasets.py`](foldingdiff/datasets.py#L24):
+
+| Strategy | Behavior | Best For |
+|----------|----------|-----------|
+| `leftalign` | Pads sequences to max length with left alignment | Preserving N-terminal context |
+| `randomcrop` | Randomly crops sequences to target length | Data augmentation |
+| `discard` | Removes sequences exceeding max length | Quality control |
+
+### Dataset Sources
+
+The framework supports multiple protein structure databases:
+
+- **CATH**: Curated structural classification database with domain-level annotations
+- **AlphaFold**: Comprehensive predicted structure database covering the proteome
+- **Custom directories**: User-provided PDB files for specialized applications
+
+Each source undergoes the same featurization pipeline, ensuring consistent representation across different data origins.
+
+## Configuration Variants
+
+The system provides pre-configured dataset variants optimized for different experimental scenarios:
+
+### Research-Grade Configurations
+
+**Full Angles Model** ([`cath_full_angles.json`](config_jsons/cath_full_angles.json#L1)): Uses the canonical-full-angles feature set with 1000 timesteps and linear variance scheduling. This configuration represents the standard research setup with comprehensive angular representation.
+
+**Cosine Schedule Variant** ([`cath_full_angles_cosine.json`](config_jsons/cath_full_angles_cosine.json#L1)): Identical to the full angles model but employs cosine variance scheduling, which can improve training stability and generation quality.
+
+### Cartesian Coordinate Approach
+
+**Raw Coordinates Model** ([`cath_raw_coordinates.json`](config_jsons/cath_raw_coordinates.json#L1)): Implements direct coordinate prediction using the cart-coords feature set with cosine scheduling. This approach bypasses angular transformations entirely, suitable for applications requiring precise spatial positioning.
+
+### Development and Testing
+
+**Mini Model** ([`mini_model.json`](config_jsons/mini_model.json#L1)): A lightweight configuration for rapid development and testing, featuring reduced model dimensions (6 layers, 192 hidden size) and shorter training duration (20 epochs). This variant maintains the full angular feature set while significantly reducing computational requirements.
+
+## Feature Processing and Normalization
+
+### Zero-Centering with Circular Statistics
+
+The system implements sophisticated zero-centering that respects the circular nature of angular features. When `zero_center: true` is enabled, the system:
+
+1. Computes means for each feature using `wrapped_mean` for angular features
+2. Subtracts means with appropriate modulo operations for angular features
+3. Preserves linear scaling for distance features
+
+This approach is implemented in the `CathCanonicalAnglesDataset` class where angular features are identified using the `FEATURE_SET_NAMES_TO_ANGULARITY` mapping and processed accordingly.
+
+### Quality Control and Filtering
+
+The dataset pipeline includes multiple quality control mechanisms:
+
+- **Structure validation**: Filters malformed PDB files and structures with invalid angle ranges
+- **Length constraints**: Enforces minimum and maximum sequence length requirements
+- **Value range validation**: Ensures all angular features remain within [-π, π] bounds
+- **Missing data handling**: Replaces NaN values with appropriate defaults
+
+## Usage Integration
+
+Dataset variants are seamlessly integrated with the training and sampling pipelines through the configuration system. The `angles_definitions` parameter in each configuration file specifies which feature set to use, automatically configuring the appropriate model architecture and processing pipeline.
+
+> [!TIP]
+> The choice of feature set significantly impacts both model performance and computational requirements. Angular representations (`canonical-full-angles`) are more parameter-efficient but require careful handling of circular statistics, while Cartesian coordinates (`cart-coords`) are computationally heavier but avoid angular complexities.
+
+> [!TIP]
+> For new applications, start with the `canonical-minimal-angles` feature set to establish baseline performance before progressing to more complex representations. This incremental approach allows for systematic evaluation of feature importance.
+
+## Next Steps
+
+To understand how these dataset variants integrate with the model architecture, see [Diffusion Model Architecture and BERT Integration](6-diffusion-model-architecture-and-bert-integration). For details on angular feature computation and coordinate conversion, refer to [Angle-to-Coordinate Conversion System](10-angle-to-coordinate-conversion-system).
+
+# Loss Functions for Angular Data
+
+
+
+The foldingdiff library implements specialized loss functions designed to handle the unique challenges of angular data in protein structure prediction. Unlike traditional Euclidean coordinates, angular values exist on a circular manifold where the shortest distance between two angles must account for periodic wrapping around the unit circle.
+
+## Angular Loss Functions
+
+The core challenge with angular data is that standard loss functions fail to recognize that angles separated by 2π are equivalent. The library provides two primary angular loss functions that address this fundamental issue.
+
+### Radian L1 Loss
+
+The `radian_l1_loss` function computes the minimal angular distance between input and target angles by normalizing both to the range [0, 2π) and then calculating the wrapped difference [foldingdiff/losses.py#L12-L28](foldingdiff/losses.py#L12-L28):
+
+```python
+def radian_l1_loss(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    target = target % (2 * torch.pi)
+    input = input % (2 * torch.pi)
+    d = target - input
+    d = (d + torch.pi) % (2 * torch.pi) - torch.pi
+    retval = torch.abs(d)
+    return torch.mean(retval)
+```
+
+This implementation ensures that the difference between 0.1 and 2π-0.1 is correctly computed as 0.2, rather than the naive difference of ~6.08.
+
+### Radian Smooth L1 Loss
+
+The `radian_smooth_l1_loss` extends the Smooth L1 loss concept to angular data, providing better gradient properties for optimization [foldingdiff/losses.py#L29-L65](foldingdiff/losses.py#L29-L65):
+
+```python
+def radian_smooth_l1_loss(
+    input: torch.Tensor,
+    target: torch.Tensor,
+    beta: float = 1.0,
+    circle_penalty: float = 0.0,
+) -> torch.Tensor:
+    d = target - input
+    d = utils.modulo_with_wrapped_range(d, -torch.pi, torch.pi)
+    
+    abs_d = torch.abs(d)
+    retval = torch.where(abs_d < beta, 0.5 * (d**2) / beta, abs_d - 0.5 * beta)
+```
+
+The function uses quadratic loss for small differences (|δ| < β) and linear loss for larger differences, with the modulo operation ensuring proper angular wrapping. An optional `circle_penalty` term regularizes against excessive rotations around the circle.
+
+> [!TIP]
+> The angular loss functions rely on the `modulo_with_wrapped_range` utility function [foldingdiff/utils.py#L84-L107](foldingdiff/utils.py#L84-L107), which handles negative ranges correctly—a critical requirement for angular computations where the range is typically [-π, π].
+
+## Pairwise Distance Loss
+
+For structural validation, the library implements a rotation and translation invariant loss based on pairwise distances between 3D coordinates [foldingdiff/losses.py#L101-L151](foldingdiff/losses.py#L101-L151):
+
+```python
+def pairwise_dist_loss(
+    input: torch.Tensor,
+    target: torch.Tensor,
+    lengths: Optional[torch.Tensor] = None,
+    weights: Optional[torch.Tensor] = None,
+):
+    input_dists, input_mask = _get_pairwise_dist_batch(input, lengths)
+    target_dists, target_mask = _get_pairwise_dist_batch(target, lengths)
+    
+    loss = F.mse_loss(
+        input_dists[torch.where(input_mask)],
+        target_dists[torch.where(target_mask)],
+        reduction="none",
+    )
+```
+
+This function computes all pairwise distances within each protein structure and compares them using MSE loss. Since distances are invariant to rotation and translation, this loss provides a robust measure of structural similarity independent of coordinate system.
+
+## Integration with Training Pipeline
+
+The loss functions are integrated into the training pipeline through the `BertForDiffusion` class, which maintains dictionaries mapping loss keys to appropriate functions [foldingdiff/modelling.py#L224-L237](foldingdiff/modelling.py#L224-L237):
+
+```python
+nonangular_loss_fn_dict = {
+    "l1": F.l1_loss,
+    "smooth_l1": F.smooth_l1_loss,
+}
+
+angular_loss_fn_dict = {
+    "l1": losses.radian_l1_loss,
+    "smooth_l1": functools.partial(
+        losses.radian_smooth_l1_loss, beta=torch.pi / 10
+    ),
+}
+```
+
+The model automatically selects between angular and non-angular loss functions based on the `ft_is_angular` parameter, which specifies which features represent angular values. This allows the same training pipeline to handle mixed data types seamlessly.
+
+## Loss Function Characteristics
+
+| Loss Function | Data Type | Invariance Properties | Use Case |
+|---------------|-----------|----------------------|----------|
+| `radian_l1_loss` | Angular | Periodic wrapping | Basic angular regression |
+| `radian_smooth_l1_loss` | Angular | Periodic wrapping + smooth gradients | Training stability |
+| `pairwise_dist_loss` | 3D Coordinates | Rotation + translation | Structural validation |
+
+> [!TIP]
+> The angular loss functions are extensively tested for periodic invariance. The test suite verifies that adding any integer multiple of 2π to either input or target produces identical loss values [tests/test_losses.py#L67-L95](tests/test_losses.py#L67-L95).
+
+## Implementation Details
+
+The angular loss implementations handle several edge cases critical for robust training:
+
+1. **Periodic Boundary**: All angular differences are wrapped to the range [-π, π] using the modulo operation
+2. **Numerical Stability**: The smooth L1 loss includes assertions to prevent negative loss values
+3. **Batch Processing**: Functions support batch operations with proper masking for variable-length sequences
+4. **Gradient Flow**: The smooth L1 variant provides well-behaved gradients near zero differences
+
+These specialized loss functions enable effective training of diffusion models on angular protein representations, ensuring that the geometric constraints of angular data are properly respected during the learning process.
+
+For understanding how these loss functions integrate with the broader training architecture, see [Lightning Training Pipeline](13-lightning-training-pipeline). The angular data representation that these losses operate on is described in [Angle-based Protein Representation](7-angle-based-protein-representation).
+
+# Lightning Training Pipeline
+
+
+
+The Lightning Training Pipeline in FoldingDiff provides a structured framework for training diffusion and autoregressive models on protein angle data using PyTorch Lightning. This implementation abstracts away the complexity of training loops, optimization, and validation while maintaining flexibility for different training configurations.
+
+## Core Lightning Module Architecture
+
+The training pipeline centers around two main Lightning modules that inherit from the BERT-based diffusion models:
+
+### BertForDiffusion Lightning Module
+
+The `BertForDiffusion` class extends both `BertForDiffusionBase` and `pl.LightningModule` to provide a complete training interface for diffusion models [foldingdiff/modelling.py#L487-L490](foldingdiff/modelling.py#L487-490). Key initialization parameters include:
+
+- **Learning Rate**: Default `5e-5` with configurable scheduler support
+- **Loss Functions**: Support for `l1` and `smooth_l1` losses with angular variants
+- **Regularization**: L1 and L2 regularization terms with configurable weights
+- **Pairwise Distance Loss**: Optional additional loss term for structural constraints
+- **Training Configuration**: Epoch count, steps per epoch, and learning rate scheduling
+
+```python
+def __init__(
+    self,
+    lr: float = 5e-5,
+    loss: Union[Callable, LOSS_KEYS] = "smooth_l1",
+    use_pairwise_dist_loss: Union[float, Tuple[float, float, int]] = 0.0,
+    l2: float = 0.0,
+    l1: float = 0.0,
+    circle_reg: float = 0.0,
+    epochs: int = 1,
+    steps_per_epoch: int = 250,
+    lr_scheduler: LR_SCHEDULE = None,
+    write_preds_to_dir: Optional[str] = None,
+    **kwargs,
+):
+```
+
+### BertForAutoregressive Lightning Module
+
+The autoregressive variant `BertForAutoregressive` follows a similar pattern but is specifically designed for sequential angle prediction tasks [foldingdiff/modelling.py#L896-L901](foldingdiff/modelling.py#L896-901). It implements causal language modeling objectives for protein structure generation.
+
+## Training Pipeline Components
+
+### Loss Computation System
+
+The training pipeline uses a sophisticated loss computation system that handles both angular and non-angular features differently:
+
+```python
+def _get_loss_terms(self, batch, write_preds: Optional[str] = None) -> List[torch.Tensor]:
+    """
+    Returns the loss terms for the model. Length of the returned list
+    is equivalent to the number of features we are fitting to.
+    """
+    known_noise = batch["known_noise"]
+    predicted_noise = self.forward(
+        batch["corrupted"],
+        batch["t"],
+        attention_mask=batch["attn_mask"],
+        position_ids=batch["position_ids"],
+    )
+```
+
+The system automatically applies appropriate loss functions based on feature angularity, using angular variants of standard losses for dihedral angles and standard losses for non-angular features [foldingdiff/modelling.py#L553-L580](foldingdiff/modelling.py#L553-580).
+
+### Training Step Implementation
+
+Each training step processes a batch through the following pipeline:
+
+1. **Forward Pass**: Generate noise predictions for corrupted angles
+2. **Loss Calculation**: Compute feature-specific loss terms
+3. **Regularization**: Apply L1/L2 penalties if configured
+4. **Logging**: Record detailed loss metrics for monitoring
+
+```python
+def training_step(self, batch, batch_idx):
+    """
+    Training step, runs once per batch
+    """
+    loss_terms = self._get_loss_terms(batch)
+    avg_loss = torch.mean(loss_terms)
+
+    # L1 loss implementation
+    if self.l1_lambda > 0:
+        l1_penalty = sum(torch.linalg.norm(p, 1) for p in self.parameters())
+        avg_loss += self.l1_lambda * l1_penalty
+
+    # Detailed logging of all loss components
+    pseudo_ft_names = (
+        (self.ft_names + ["pairwise_dist_loss"])
+        if self.use_pairwise_dist_loss
+        else self.ft_names
+    )
+    loss_dict = {
+        f"train_loss_{val_name}": val
+        for val_name, val in zip(pseudo_ft_names, loss_terms)
+    }
+    loss_dict["train_loss"] = avg_loss
+    self.log_dict(loss_dict)
+
+    return avg_loss
+```
+
+### Validation Pipeline
+
+The validation step mirrors the training pipeline but with gradient disabled and optional prediction writing for analysis [foldingdiff/modelling.py#L720-L751](foldingdiff/modelling.py#L720-751):
+
+```python
+def validation_step(self, batch, batch_idx) -> Dict[str, torch.Tensor]:
+    """
+    Validation step
+    """
+    with torch.no_grad():
+        loss_terms = self._get_loss_terms(
+            batch,
+            write_preds=os.path.join(
+                self.write_preds_to_dir, f"{self.write_preds_counter}_preds.json"
+            )
+            if self.write_preds_to_dir
+            else None,
+        )
+        self.write_preds_counter += 1
+    # ... loss computation and logging
+```
+
+## Optimizer Configuration
+
+The training pipeline supports multiple optimization strategies through the `configure_optimizers` method [foldingdiff/modelling.py#L762-L804](foldingdiff/modelling.py#L762-804):
+
+### Base Optimizer
+- **AdamW**: Default optimizer with configurable learning rate and weight decay
+- **Weight Decay**: Applied through L2 regularization parameter
+
+### Learning Rate Schedulers
+
+Two main scheduler options are supported:
+
+| Scheduler | Configuration | Use Case |
+|-----------|---------------|----------|
+| **OneCycleLR** | `max_lr=1e-2`, frequency per step | General training with cyclical learning rates |
+| **LinearWarmup** | 10% warmup steps, frequency per epoch | Transformer-style training with gradual warmup |
+
+```python
+if self.lr_scheduler == "OneCycleLR":
+    retval["lr_scheduler"] = {
+        "scheduler": torch.optim.lr_scheduler.OneCycleLR(
+            optim,
+            max_lr=1e-2,
+            epochs=self.epochs,
+            steps_per_epoch=self.steps_per_epoch,
+        ),
+        "monitor": "val_loss",
+        "frequency": 1,
+        "interval": "step",
+    }
+elif self.lr_scheduler == "LinearWarmup":
+    warmup_steps = int(self.epochs * 0.1)
+    retval["lr_scheduler"] = {
+        "scheduler": get_linear_schedule_with_warmup(
+            optim,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=self.epochs,
+        ),
+        "frequency": 1,
+        "interval": "epoch",
+    }
+```
+
+## Dataset Integration
+
+The training pipeline seamlessly integrates with the dataset classes from `foldingdiff.datasets`:
+
+### Noise Dataset Integration
+- **NoisedAnglesDataset**: Adds controlled noise to training data following beta schedules
+- **Beta Schedule Support**: Linear, cosine, and quadratic variance schedules [foldingdiff/beta_schedules.py#L20-L41](foldingdiff/beta_schedules.py#L20-41)
+- **Angular Variance**: Separate variance control for angular vs non-angular features
+
+### Autoregressive Dataset Support
+- **AutoregressiveCausalDataset**: Provides causal language modeling format for sequential prediction
+- **Mask Generation**: Automatic creation of causal attention masks for sequential training
+
+## Training Workflow
+
+```mermaid
+flowchart TD
+    A[Dataset Loading] --> B[Batch Sampling]
+    B --> C[Noise Injection]
+    C --> D[Forward Pass]
+    D --> E[Loss Computation]
+    E --> F[Backpropagation]
+    F --> G[Optimizer Step]
+    G --> H[Validation Check]
+    H --> I{Epoch Complete?}
+    I -->|No| B
+    I -->|Yes| J[Model Checkpointing]
+    J --> K[Learning Rate Update]
+    K --> L[Training Continuation]
+```
+
+## Monitoring and Logging
+
+The pipeline provides comprehensive logging capabilities:
+
+### Training Metrics
+- **Feature-specific Losses**: Individual loss tracking for each angular feature
+- **Regularization Terms**: Separate logging for L1/L2 penalties
+- **Timing Information**: Epoch duration and processing speed metrics
+
+### Validation Metrics
+- **Per-feature Validation Losses**: Detailed validation loss breakdown
+- **Prediction Export**: Optional saving of model predictions for analysis
+- **Distributed Training Support**: Proper handling of multi-GPU scenarios
+
+## Configuration Management
+
+Training configurations are managed through JSON files in the `hyperparam_jsons/` directory, enabling systematic hyperparameter sweeps. The `scripts/scripts_from_hyper_json.py` utility provides automated script generation for different parameter combinations [scripts/scripts_from_hyper_json.py#L1-L4](scripts/scripts_from_hyper_json.py#L1-4).
+
+> [!TIP]
+> The Lightning training pipeline automatically handles distributed training scenarios, including proper gradient synchronization and loss aggregation across multiple GPUs. This enables seamless scaling from single-GPU development to multi-GPU training without code changes.
+
+> [!TIP]
+> For optimal performance with angular data, ensure that the `ft_is_angular` parameter correctly identifies which features are angular (True) versus non-angular (False). This enables the automatic selection of appropriate loss functions and variance schedules for each feature type.
+
+## Next Steps
+
+To understand the complete training ecosystem, explore:
+- [Loss Functions for Angular Data](12-loss-functions-for-angular-data) - Detailed explanation of angular loss implementations
+- [Configuration Management](14-configuration-management) - Comprehensive guide to training configuration
+- [Time Encoding and Noise Schedules](8-time-encoding-and-noise-schedules) - Understanding the diffusion process components
+
+# Configuration Management
+
+
+
+The FoldingDiff repository employs a sophisticated configuration management system that separates model architectures, training parameters, and hyperparameter sweeps into distinct JSON-based configuration files. This approach enables reproducible experiments, systematic hyperparameter optimization, and flexible model configuration across different use cases.
+
+## Configuration Architecture
+
+The configuration system is organized into two primary directories: `config_jsons/` for complete model configurations and `hyperparam_jsons/` for hyperparameter sweep definitions. This separation allows researchers to maintain stable baseline configurations while exploring parameter variations systematically.
+
+```mermaid
+graph TD
+    A[config_jsons/] --> B[Complete Model Configs]
+    A --> C[Training Presets]
+    D[hyperparam_jsons/] --> E[Parameter Sweeps]
+    D --> F[Grid Search Definitions]
+    
+    B --> G[mini_model.json]
+    B --> H[cath_full_angles.json]
+    B --> I[cath_full_angles_cosine.json]
+    B --> J[cath_raw_coordinates.json]
+    
+    E --> K[bert_angle_diffusion_configs.json]
+    E --> L[small_model_params.json]
+    
+    M[scripts_from_hyper_json.py] --> N[CLI Generation]
+    M --> O[Script Automation]
+    
+    K --> N
+    L --> N
+    N --> P[Training Scripts]
+```
+
+## Model Configuration Files
+
+The `config_jsons/` directory contains complete configuration files that define all aspects of model architecture, training parameters, and data processing. Each configuration file represents a self-contained experiment setup.
+
+### Core Configuration Parameters
+
+Every model configuration follows a standardized structure with these key parameter categories:
+
+**Data Configuration:**
+- `angles_definitions`: Specifies the protein representation scheme (e.g., "canonical-full-angles", "cart-coords")
+- `max_seq_len` and `min_seq_len`: Define sequence length bounds for training
+- `trim_strategy`: Determines how sequences longer than `max_seq_len` are handled ("discard" or "randomcrop")
+- `zero_center`: Boolean flag for angle centering
+
+**Diffusion Parameters:**
+- `timesteps`: Number of diffusion steps (typically 250-1000)
+- `variance_schedule`: Noise schedule type ("linear", "cosine", "quadratic")
+- `variance_scale`: Scaling factor for noise variance
+- `time_encoding`: Time embedding method ("gaussian_fourier")
+
+**Model Architecture:**
+- `num_hidden_layers`: Number of transformer layers
+- `hidden_size`: Dimension of hidden representations
+- `intermediate_size`: Feed-forward network dimension
+- `num_heads`: Multi-head attention heads
+- `position_embedding_type`: Position encoding strategy ("relative_key")
+- `decoder`: Output decoder type ("mlp")
+
+**Training Configuration:**
+- `lr`: Learning rate (typically 5e-5)
+- `batch_size`: Training batch size
+- `gradient_clip`: Gradient clipping threshold
+- `loss`: Loss function type ("smooth_l1")
+- `lr_scheduler`: Learning rate scheduler ("LinearWarmup")
+- `max_epochs` and `min_epochs`: Training epoch bounds
+- `dropout_p`: Dropout probability
+
+### Configuration Variants
+
+The repository provides several pre-configured variants optimized for different scenarios:
+
+**Mini Model Configuration** ([`mini_model.json`](config_jsons/mini_model.json#L1-L31)):
+- Designed for rapid prototyping and testing
+- Reduced architecture: 6 layers, 192 hidden size, 6 attention heads
+- Lower timestep count (250) for faster training
+- Smaller batch size (128) for memory efficiency
+
+**Full CATH Configuration** ([`cath_full_angles.json`](config_jsons/cath_full_angles.json#L1-L31)):
+- Production-ready model with full architecture
+- 12 transformer layers, 384 hidden size, 12 attention heads
+- 1000 diffusion timesteps for high-quality generation
+- Uses linear variance schedule
+
+**Cosine Schedule Configuration** ([`cath_full_angles_cosine.json`](config_jsons/cath_full_angles_cosine.json#L1-L30)):
+- Identical to full CATH configuration but with cosine variance schedule
+- Cosine schedule often provides better training stability
+- Maintains same architectural parameters for direct comparison
+
+**Coordinate-based Configuration** ([`cath_raw_coordinates.json`](config_jsons/cath_raw_coordinates.json#L1-L30)):
+- Uses Cartesian coordinates instead of angular representation
+- Sets `angles_definitions` to "cart-coords"
+- Enables direct comparison between angular and coordinate approaches
+
+## Hyperparameter Sweep System
+
+The `hyperparam_jsons/` directory contains parameter sweep definitions that enable systematic exploration of hyperparameter combinations. These files define parameter grids for automated experimentation.
+
+### Sweep Configuration Structure
+
+Each sweep file defines arrays of values for different parameters, allowing the system to generate all possible combinations:
+
+**BERT Angle Diffusion Sweep** ([`bert_angle_diffusion_configs.json`](hyperparam_jsons/bert_angle_diffusion_configs.json#L1-L25)):
+```json
+{
+    "timesteps": [250, 500, 750, 1000],
+    "variance_schedule": ["linear", "cosine", "quadratic"],
+    "batch_size": [128, 64],
+    "lr": [1e-3, 1e-4],
+    "gradient_clip": [0.0, 0.5]
+}
+```
+
+**Small Model Parameter Sweep** ([`small_model_params.json`](hyperparam_jsons/small_model_params.json#L1-L25)):
+```json
+{
+    "timesteps": [500, 1000],
+    "variance_schedule": ["linear", "cosine", "quadratic"],
+    "num_hidden_layers": [6, 8, 10],
+    "lr": [0.001, 0.0001],
+    "batch_size": [64, 128, 256]
+}
+```
+
+## Automated Script Generation
+
+The repository includes a sophisticated script generation system ([`scripts_from_hyper_json.py`](scripts/scripts_from_hyper_json.py#L1-L151)) that converts hyperparameter sweep definitions into executable training scripts.
+
+### Parameter Processing Functions
+
+The system provides two key utility functions for parameter handling:
+
+**CLI Argument Conversion** ([`params_to_cli_args`](scripts/scripts_from_hyper_json.py#L16-L31)):
+```python
+def params_to_cli_args(param_dict: Dict[str, Any]) -> str:
+    """Format the params to CLI arguments"""
+    tokens = []
+    for k, v in param_dict.items():
+        prefix = "-" if len(k) == 1 else "--"
+        if isinstance(v, bool):  # For booleans, treat as flags
+            if v:
+                tokens.append(f"{prefix}{k}")
+        else:
+            tokens.append(f"{prefix}{k} {v}")
+    # Manually add this since we can't provide this in the json
+    tokens.append(f"--outdir {params_to_filename(param_dict)}")
+    retval = " ".join(tokens)
+    return retval
+```
+
+**Filename Generation** ([`params_to_filename`](scripts/scripts_from_hyper_json.py#L32-L52)):
+```python
+def params_to_filename(
+    param_dict: Dict[str, Any],
+    blacklist_tokens: Collection[str] = {"model", "blacklist", "config", "pretrained"},
+) -> str:
+    """Format the params (in key-value pairs (param, arg)) into a filename"""
+    tokens = []
+    for k, v in param_dict.items():
+        if k in blacklist_tokens:
+            logging.warning(f"Excluding {k}: {v} from generated fname")
+            continue
+        assert " " not in k, f"Parameter cannot have space: {k}"
+        if isinstance(v, str) and " " in v:  # Replace spaces in value
+            v = v.replace(" ", "_")
+        # This is (value, key) for historical readability reasons
+        tokens.append(f"{v}_{k}")
+    return "_".join(tokens)
+```
+
+### Script Generation Pipeline
+
+The main generation function ([`main`](scripts/scripts_from_hyper_json.py#L85-L110)) orchestrates the creation of training scripts for all parameter combinations:
+
+1. **Parameter Combination Generation**: Uses `itertools.product` to create all possible parameter combinations from the sweep definition
+2. **Script Template Integration**: Incorporates optional template scripts for consistent initialization
+3. **Output Directory Management**: Automatically creates organized output directories based on parameter combinations
+4. **CLI Argument Formatting**: Converts parameter dictionaries to command-line arguments for execution
+
+## Configuration Best Practices
+
+### Parameter Selection Guidelines
+
+**Model Architecture**:
+- Use smaller models (6 layers, 192 hidden) for development and testing
+- Scale to full models (12 layers, 384 hidden) for production training
+- Adjust `num_hidden_layers` and `hidden_size` proportionally to maintain model capacity
+
+**Training Stability**:
+- Start with cosine variance schedule for better convergence
+- Use gradient clipping (0.5-1.0) to prevent training instability
+- Implement learning rate warmup with `LinearWarmup` scheduler
+
+**Data Processing**:
+- Choose `trim_strategy` based on dataset characteristics:
+  - "discard" for maintaining sequence integrity
+  - "randomcrop" for data augmentation
+- Set appropriate `max_seq_len` based on available GPU memory
+
+### Hyperparameter Sweep Strategy
+
+**Systematic Exploration**:
+1. **Coarse Grid**: Start with broad parameter ranges (learning rates, batch sizes)
+2. **Focused Refinement**: Narrow ranges based on initial results
+3. **Final Tuning**: Fine-tune around best-performing parameter combinations
+
+**Efficiency Considerations**:
+- Use smaller timesteps (250-500) for initial sweeps
+- Increase to 1000 timesteps for final model training
+- Leverage the mini model configuration for rapid iteration
+
+## Integration with Training Pipeline
+
+The configuration system seamlessly integrates with the Lightning training pipeline described in the [Lightning Training Pipeline](13-lightning-training-pipeline) documentation. Configuration files are loaded and processed using utility functions like [`update_dict_nonnull`](foldingdiff/utils.py#L124-L135) for parameter merging and validation.
+
+The modular configuration design enables:
+- **Reproducible Research**: Complete experiment specifications stored in version-controlled JSON files
+- **Systematic Optimization**: Automated hyperparameter exploration through sweep generation
+- **Flexible Experimentation**: Easy modification of individual parameters without code changes
+- **Scalable Training**: Configuration variants for different computational budgets
+
+For practical implementation details and training execution, refer to the [Lightning Training Pipeline](13-lightning-training-pipeline) documentation, which demonstrates how these configurations are integrated into the complete training workflow.
+
+# Protein Backbone Sampling Pipeline
+
+
+
+The protein backbone sampling pipeline in FoldingDiff implements a sophisticated diffusion-based approach for generating novel protein structures by iteratively denoising angular representations. This pipeline transforms random noise into biologically plausible protein backbone conformations through a carefully orchestrated sequence of sampling steps.
+
+## Core Sampling Architecture
+
+The sampling process centers around two fundamental functions that implement the reverse diffusion process: `p_sample` for individual timestep sampling and `p_sample_loop` for the complete generation sequence [sampling.py#L28-L91](foldingdiff/sampling.py#L28-L91).
+
+### Single Timestep Sampling
+
+The `p_sample` function implements the core reverse diffusion step using the mathematical framework from Equation 11 of the original diffusion paper:
+
+```python
+# Calculate alphas and betas from variance schedule
+alpha_beta_values = beta_schedules.compute_alphas(betas)
+sqrt_recip_alphas = 1.0 / torch.sqrt(alpha_beta_values["alphas"])
+
+# Model mean calculation using noise predictor
+model_mean = sqrt_recip_alphas_t * (
+    x - betas_t * model(x, t, attention_mask=attn_mask) / sqrt_one_minus_alphas_cumprod_t
+)
+```
+
+This implementation follows the standard DDPM formulation where the model predicts noise rather than the clean data directly, with attention masks ensuring proper handling of variable sequence lengths [sampling.py#L27-L77](foldingdiff/sampling.py#L27-L77).
+
+### Complete Sampling Loop
+
+The `p_sample_loop` function orchestrates the full reverse diffusion process, iteratively applying `p_sample` across all timesteps in reverse order. A critical feature is the angular wrapping mechanism that maintains valid angular ranges throughout the sampling process:
+
+```python
+# Wrap angular features to maintain [-π, π] range
+if isinstance(is_angle, bool):
+    if is_angle:
+        img = utils.modulo_with_wrapped_range(
+            img, range_min=-torch.pi, range_max=torch.pi
+        )
+```
+
+This wrapping ensures that generated angles remain within the mathematically valid range for dihedral angles, preventing sampling artifacts that could arise from boundary violations [sampling.py#L91-L134](foldingdiff/sampling.py#L91-L134).
+
+## Sampling Pipeline Flow
+
+```mermaid
+flowchart TD
+    A[Noise Initialization] --> B[Length Sampling]
+    B --> C[Batch Processing]
+    C --> D[Reverse Diffusion Loop]
+    D --> E[Timestep Sampling]
+    E --> F[Angular Wrapping]
+    F --> G{Final Timestep?}
+    G -->|No| D
+    G -->|Yes| H[Mean Shift Application]
+    H --> I[Final Angular Wrapping]
+    I --> J[Generated Protein]
+    
+    subgraph "Per-Timestep Operations"
+        E --> K[Noise Prediction]
+        K --> L[Mean Calculation]
+        L --> M[Posterior Sampling]
+    end
+```
+
+## Noise Generation and Variance Scheduling
+
+The pipeline employs sophisticated noise generation strategies that adapt to the angular nature of protein representations. The `NoisedAnglesDataset.sample_noise` method implements variance scaling based on feature type:
+
+```python
+# Scale noise by angular/non-angular variance
+for j in range(noise.shape[-1]):
+    s = (
+        self.angular_var_scale
+        if self.dset.feature_is_angular[self.dset_key][j]
+        else self.nonangular_var_scale
+    )
+    noise[..., j] *= s
+```
+
+This adaptive scaling ensures appropriate noise levels for different feature types, with angular features receiving specialized treatment to maintain their circular properties [datasets.py#L772-L795](foldingdiff/datasets.py#L772-L795).
+
+### Beta Schedule Computation
+
+The variance schedule is computed through the `beta_schedules.compute_alphas` function, which generates all necessary terms for the diffusion process:
+
+- **alphas**: `1.0 - betas`
+- **alphas_cumprod**: Cumulative product of alphas
+- **posterior_variance**: Computed for sampling variance
+- **sqrt_alphas_cumprod**: For forward process scaling
+
+These terms enable both the forward noising process and the reverse sampling process with mathematically consistent transformations [beta_schedules.py#L45-L64](foldingdiff/beta_schedules.py#L45-L64).
+
+## High-Level Sampling Interface
+
+The `sample` function provides the primary interface for protein generation, supporting both single-length and sweep sampling across multiple sequence lengths:
+
+```python
+def sample(
+    model: nn.Module,
+    train_dset: dsets.NoisedAnglesDataset,
+    n: int = 10,
+    sweep_lengths: Optional[Tuple[int, int]] = (50, 128),
+    batch_size: int = 512,
+    feature_key: str = "angles",
+    disable_pbar: bool = False,
+    trim_to_length: bool = True,
+) -> List[np.ndarray]:
+```
+
+This function orchestrates the entire sampling workflow, from length sampling through batch processing to final result compilation [sampling.py#L135-L201](foldingdiff/sampling.py#L135-L201).
+
+### Batch Processing and Memory Optimization
+
+The pipeline implements intelligent batch processing with optional length trimming to optimize memory usage:
+
+```python
+# Trim padding regions to reduce memory
+if trim_to_length:
+    noise = noise[:, : max(this_lengths), :]
+```
+
+This optimization is particularly important for generating long protein sequences where memory constraints could otherwise limit sampling capabilities [sampling.py#L175-L179](foldingdiff/sampling.py#L175-L179).
+
+## Angular Range Management
+
+A critical aspect of the pipeline is the management of angular ranges throughout the sampling process. The `utils.modulo_with_wrapped_range` function handles the circular nature of angular data:
+
+```python
+def modulo_with_wrapped_range(
+    vals, range_min: float = -np.pi, range_max: float = np.pi
+):
+    # Shift to [0, range_max-range_min), perform modulo, shift back
+    top_end = range_max - range_min
+    vals_shifted = vals - range_min
+    vals_shifted_mod = vals_shifted % top_end
+    retval = vals_shifted_mod + range_min
+    return retval
+```
+
+This implementation properly handles negative range bounds and ensures that all angular values remain within the valid [-π, π] range throughout the sampling process [utils.py#L87-L110](foldingdiff/utils.py#L87-L110).
+
+## Post-Processing and Mean Adjustment
+
+After sampling completion, the pipeline applies mean adjustments to restore the original feature distributions:
+
+```python
+if train_dset.dset.get_masked_means() is not None:
+    retval = [s + train_dset.dset.get_masked_means() for s in retval]
+    # Re-wrap after shifting
+    angular_idx = np.where(train_dset.dset.feature_is_angular[feature_key])[0]
+    for s in retval:
+        s[..., angular_idx] = utils.modulo_with_wrapped_range(
+            s[..., angular_idx], range_min=-np.pi, range_max=np.pi
+        )
+```
+
+This two-step process ensures that generated proteins maintain the statistical properties of the training distribution while respecting angular constraints [sampling.py#L201-L218](foldingdiff/sampling.py#L201-L218).
+
+## Integration with Coordinate Conversion
+
+The generated angular representations can be converted to Cartesian coordinates through the angle-to-coordinate conversion system, enabling downstream structural analysis and visualization. The `angles_and_coords.py` module provides the necessary tools for this transformation, including NERF-based coordinate reconstruction [angles_and_coords.py#L112-L186](foldingdiff/angles_and_coords.py#L112-L186).
+
+> [!TIP]
+> The sampling pipeline's strength lies in its careful handling of angular data throughout the diffusion process, maintaining mathematically valid ranges while enabling efficient batch processing and memory optimization.
+
+> [!TIP]
+> The modular design allows for easy integration with different variance schedules (linear, cosine, quadratic) and feature sets, providing flexibility for various protein generation scenarios.
+
+## Next Steps
+
+For comprehensive understanding of the sampling pipeline, explore the [Autoregressive Generation](16-autoregressive-generation) approach for sequential protein generation, or examine the [Visualization and Analysis Tools](17-visualization-and-analysis-tools) to analyze generated structures. The [Angle-based Protein Representation](7-angle-based-protein-representation) page provides deeper insight into the angular features used throughout this pipeline.
+
+# Autoregressive Generation
+
+
+
+Autoregressive generation in FoldingDiff represents an alternative approach to protein structure generation that sequentially predicts backbone angles one residue at a time, rather than using the diffusion-based denoising process. This method leverages causal language modeling principles adapted for protein geometry prediction.
+
+## Architecture Overview
+
+The autoregressive generation system is built around two core components: the `BertForAutoregressive` model and the `AutoregressiveCausalDataset` data preparation pipeline. Unlike the diffusion approach that adds and removes noise across timesteps, autoregressive generation treats protein backbone generation as a sequential prediction problem where each angle set depends only on previously generated angles.
+
+### Model Architecture
+
+The autoregressive model extends the base BERT architecture with modifications for protein angle prediction:
+
+```python
+class BertForAutoregressiveBase(BertForDiffusionBase):
+    """
+    Overrides the previous model's forward function to not handle noise or timesteps
+    """
+```
+
+The key architectural differences from the diffusion model include:
+
+- **No timestep handling**: The forward pass removes timestep encoding entirely, focusing purely on sequence position information
+- **Length embedding**: Reuses the time embedding mechanism to encode sequence lengths, providing context about the target protein length [foldingdiff/modelling.py#L818-L821](foldingdiff/modelling.py#L818-L821)
+- **Causal attention masking**: Implements strict left-to-right attention patterns to enforce autoregressive constraints
+
+### Data Processing Pipeline
+
+The autoregressive training uses the `AutoregressiveCausalDataset` wrapper to convert standard angle datasets into causal language modeling format:
+
+```python
+def __getitem__(self, index: int):
+    """Get the ith item with a randomly chosen sub-mask"""
+    # Sample a causal length uniformly between 1 and original length
+    causal_len = torch.randint(low=1, high=orig_len, size=(1,)).item()
+    
+    # Create causal mask for left-to-right attention
+    causal_attn_mask = torch.zeros_like(return_dict["attn_mask"])
+    causal_attn_mask[:causal_len] = 1.0
+    
+    # Target is the next angle at position causal_len
+    return_dict["causal_target"] = return_dict[self.dset_key][causal_len]
+    return_dict["causal_idx"] = causal_len
+```
+
+This approach randomly truncates sequences during training, forcing the model to learn to predict the next angle set given varying amounts of context [foldingdiff/datasets.py#L650-L680](foldingdiff/datasets.py#L650-L680).
+
+## Generation Process
+
+### Sequential Sampling
+
+The autoregressive generation process uses the `sample()` method to generate complete protein backbones from initial seed angles:
+
+```python
+@torch.no_grad()
+def sample(
+    self,
+    seed_angles: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    num_seed: int = 2,
+    pbar: bool = True,
+) -> List[torch.Tensor]:
+```
+
+The generation follows this iterative process:
+
+1. **Initialization**: Start with seed angles (typically first 2 residues) [foldingdiff/modelling.py#L864-L877](foldingdiff/modelling.py#L864-L877)
+2. **Iterative prediction**: For each position from `num_seed` to `max(seq_lengths)`:
+   - Create attention mask covering generated positions
+   - Predict next angle set using current context
+   - Append prediction to generated sequence
+3. **Angle wrapping**: Ensure all generated angles remain within valid ranges [-π, π]
+
+### Causal Attention Mechanism
+
+The attention mechanism enforces autoregressive constraints through careful mask construction:
+
+```python
+# Create causal attention mask during generation
+attention_mask[:, :i] = 1.0  # Only attend to positions <= current
+```
+
+This ensures that angle predictions at position `i` can only depend on angles at positions `0` through `i-1`, maintaining the causal property essential for sequential generation [foldingdiff/modelling.py#L882-L886](foldingdiff/modelling.py#L882-L886).
+
+## Training Configuration
+
+### Loss Function
+
+The autoregressive model uses angular-aware loss functions adapted for sequential prediction:
+
+```python
+def _get_loss(self, batch) -> torch.Tensor:
+    # Get predictions for all positions
+    preds = self.forward(
+        batch["angles"],
+        attention_mask=batch["causal_attn_mask"],
+        seq_lengths=batch["lengths"],
+        position_ids=batch["position_ids"],
+    )
+    
+    # Extract prediction at causal position and compare with target
+    l = self.loss(
+        preds[torch.arange(batch["lengths"].shape[0]), batch["causal_idx"]],
+        batch["causal_target"],
+    )
+```
+
+The loss is computed only at the randomly sampled causal positions, making training efficient while providing comprehensive coverage of the sequence space [foldingdiff/modelling.py#L921-L932](foldingdiff/modelling.py#L921-L932).
+
+### Training Pipeline
+
+The `BertForAutoregressive` class wraps the base model in a PyTorch Lightning module with:
+
+- **Standard training/validation loops**: Using the causal loss computation
+- **Learning rate scheduling**: Support for various scheduler strategies
+- **Regularization**: L2 regularization and angular loss functions
+
+## Comparison with Diffusion Generation
+
+| Aspect | Autoregressive | Diffusion |
+|--------|----------------|-----------|
+| Generation Method | Sequential prediction | Iterative denoising |
+| Training Objective | Next-angle prediction | Noise prediction |
+| Generation Speed | Linear in sequence length | Linear in timesteps |
+| Parallelism | Limited (sequential) | High (parallel denoising) |
+| Quality Control | Per-angle constraints | Global noise schedule |
+
+> [!TIP]
+> The autoregressive approach is particularly useful for controlled generation scenarios where you want to influence the generation process step-by-step, or when computational resources are limited and you need faster generation for shorter sequences.
+
+## Integration with Existing Pipeline
+
+The autoregressive generation system is designed to integrate seamlessly with the existing FoldingDiff infrastructure:
+
+- **Dataset compatibility**: Works with all angle datasets through the wrapper pattern
+- **Coordinate conversion**: Uses the same angle-to-coordinate conversion systems as diffusion models
+- **Evaluation metrics**: Compatible with SCTM, TM-score, and other evaluation methods
+- **Visualization**: Integrates with existing plotting and analysis tools
+
+The modular design allows you to switch between autoregressive and diffusion generation depending on your specific requirements, while maintaining consistent data formats and evaluation pipelines.
+
+## Next Steps
+
+For practical implementation of autoregressive generation:
+
+1. **Model Training**: Use the `[Lightning Training Pipeline](13-lightning-training-pipeline)` with autoregressive configuration
+2. **Dataset Preparation**: Wrap your angle datasets with `AutoregressiveCausalDataset`
+3. **Generation**: Use the `sample()` method with appropriate seed angles
+4. **Evaluation**: Apply `[Self-Consistency TM Score](18-self-consistency-tm-score-calculation)` and other metrics
+5. **Visualization**: Utilize `[Visualization and Analysis Tools](17-visualization-and-analysis-tools)` for result analysis
+
+The autoregressive approach provides a complementary method to diffusion-based generation, offering different trade-offs in terms of generation quality, speed, and controllability.
+
+# Visualization and Analysis Tools
+
+
+
+The foldingdiff repository provides a comprehensive suite of visualization and analysis tools designed to evaluate and interpret protein structure generation results. These tools span from molecular visualization to statistical analysis, enabling researchers to assess the quality and characteristics of generated protein structures.
+
+## Molecular Visualization Tools
+
+### PyMOL Integration for Structure Rendering
+
+The `pymol_vis.py` module provides sophisticated molecular visualization capabilities through PyMOL integration, enabling high-quality rendering of protein structures for publication and analysis [foldingdiff/pymol_vis.py](foldingdiff/pymol_vis.py).
+
+**Key Functions:**
+- **Individual Structure Rendering**: The `pdb2png()` function converts PDB files to high-resolution PNG images with customizable visualization options including secondary structure annotation and rainbow coloring schemes [foldingdiff/pymol_vis.py#L50-L67].
+- **Batch Processing**: `pdb2png_dir_from_args()` enables parallel processing of entire directories of PDB files, significantly accelerating visualization workflows for large datasets [foldingdiff/pymol_vis.py#L74-L84].
+- **Animation Creation**: The `images_to_gif()` function creates animated GIFs from series of structure images, perfect for visualizing conformational changes or generation processes [foldingdiff/pymol_vis.py#L93-L112].
+
+**Command Line Usage:**
+```bash
+# Convert single PDB to PNG
+python pymol_vis.py pdb2png -i structure.pdb -o structure.png --psea
+
+# Batch convert directory
+python pymol_vis.py pdb2png_dir -i pdbs/ -o images/
+
+# Create animation from series
+python pymol_vis.py images_to_gif -i images/*.png -o animation.gif
+```
+
+> [!TIP]
+> The module supports both secondary structure annotation via PSEA and generation of PSE session files for further interactive analysis in PyMOL.
+
+## Statistical Analysis and Plotting
+
+### Joint Distribution Analysis
+
+The `plotting.py` module provides comprehensive statistical visualization tools for analyzing angular distributions and training metrics [foldingdiff/plotting.py](foldingdiff/plotting.py).
+
+**Ramachandran Plot Analysis:**
+The `plot_joint_kde()` function creates kernel density estimation plots specifically designed for analyzing backbone angle distributions, making it ideal for Ramachandran plot analysis [foldingdiff/plotting.py#L26-L45]:
+
+```python
+# Create Ramachandran plot
+plot_joint_kde(phi_angles, psi_angles, 
+               xlabel="Phi (φ)", ylabel="Psi (ψ)",
+               fname="ramachandran.pdf")
+```
+
+**Training Progress Visualization:**
+The `plot_losses()` function provides comprehensive training loss visualization with support for multiple loss types and automatic median calculation for epochs with multiple recordings [foldingdiff/plotting.py#L93-L125].
+
+### Custom Metrics for Distribution Analysis
+
+The `custom_metrics.py` module implements specialized metrics for comparing empirical distributions, particularly useful for evaluating noise schedules and generation quality [foldingdiff/custom_metrics.py](foldingdiff/custom_metrics.py).
+
+**Kullback-Leibler Divergence Analysis:**
+- `kl_from_empirical()` computes KL divergence between empirical distributions with configurable binning and pseudocount options [foldingdiff/custom_metrics.py#L15-L38].
+- `kl_from_dset()` performs comprehensive KL analysis across timesteps for diffusion processes [foldingdiff/custom_metrics.py#L66-L84].
+
+> [!TIP]
+> The wrapped mean function handles angular data correctly by implementing circular statistics for [-π, π] ranges.
+
+## Structure Quality Assessment
+
+### TM-score Analysis
+
+The `tmalign.py` module provides comprehensive structure similarity assessment using the TM-align algorithm [foldingdiff/tmalign.py](foldingdiff/tmalign.py).
+
+**Core Capabilities:**
+- **Pairwise Comparison**: `run_tmalign()` executes TM-align between query and reference structures with fast mode option for large-scale analyses [foldingdiff/tmalign.py#L22-L55].
+- **Batch Processing**: `max_tm_across_refs()` enables parallel comparison against multiple reference structures, returning the best match and corresponding score [foldingdiff/tmalign.py#L57-L85].
+
+**Usage Example:**
+```python
+# Single comparison
+score = run_tmalign("generated.pdb", "reference.pdb", fast=True)
+
+# Find best match among references
+best_score, best_ref = max_tm_across_refs("query.pdb", references_list)
+```
+
+### lDDT Scoring
+
+The `lddt.py` module implements local Distance Difference Test (lDDT) scoring through Docker-based OpenStructure integration [foldingdiff/lddt.py](foldingdiff/lddt.py).
+
+**Features:**
+- Containerized computation ensures reproducible results using the specified Docker image [foldingdiff/lddt.py#L26-L27].
+- `lddt_sampled_folded()` provides batch analysis comparing generated structures against folded variants [foldingdiff/lddt.py#L59-L102].
+
+### Van der Waals Clash Detection
+
+The `vdw_clashes.py` module identifies and quantifies steric clashes in protein structures using established van der Waals radii [foldingdiff/vdw_clashes.py](foldingdiff/vdw_clashes.py).
+
+**Implementation Details:**
+- Uses scientifically validated van der Waals radii from published literature [foldingdiff/vdw_clashes.py#L9-L13].
+- Implements configurable clash detection with adjustable alpha parameter for distance thresholds [foldingdiff/vdw_clashes.py#L35-L50].
+
+## Analysis Workflow Integration
+
+### Jupyter Notebooks for Comprehensive Analysis
+
+The repository includes specialized Jupyter notebooks that demonstrate integrated analysis workflows:
+
+| Notebook | Purpose | Key Analyses |
+|----------|---------|--------------|
+| `git_umap.ipynb` | Dimensionality reduction | UMAP visualization of structure space |
+| `scissor_effect_plots.ipynb` | Structural effects | Analysis of local modifications |
+| `sctm_by_len.ipynb` | Length-dependent analysis | Self-consistency TM-score by protein length |
+| `generation_time.ipynb` | Performance metrics | Generation time analysis |
+
+### Visualization Pipeline Architecture
+
+```mermaid
+graph TD
+    A[Generated Structures] --> B[Quality Assessment]
+    A --> C[Statistical Analysis]
+    A --> D[Molecular Visualization]
+    
+    B --> B1[TM-score Analysis]
+    B --> B2[lDDT Scoring]
+    B --> B3[Clash Detection]
+    
+    C --> C1[Angular Distributions]
+    C --> C2[Loss Tracking]
+    C --> C3[KL Divergence]
+    
+    D --> D1[PyMOL Rendering]
+    D --> D2[Animation Creation]
+    D --> D3[Publication Figures]
+    
+    B1 --> E[Comprehensive Reports]
+    B2 --> E
+    B3 --> E
+    C1 --> E
+    C2 --> E
+    C3 --> E
+    D1 --> E
+    D2 --> E
+    D3 --> E
+```
+
+## Best Practices for Analysis
+
+### Reproducible Visualization
+
+- Use the standardized plot directory defined in `plotting.py` for consistent output organization [foldingdiff/plotting.py#L21].
+- Leverage parallel processing capabilities for large-scale analyses to ensure efficient computation.
+- Document analysis parameters and random seeds for reproducible results.
+
+### Quality Assessment Pipeline
+
+1. **Initial Screening**: Use van der Waals clash detection to identify problematic structures [foldingdiff/vdw_clashes.py].
+2. **Similarity Assessment**: Apply TM-score and lDDT analysis for quantitative quality metrics [foldingdiff/tmalign.py](foldingdiff/tmalign.py), [foldingdiff/lddt.py](foldingdiff/lddt.py).
+3. **Distribution Analysis**: Evaluate angular distributions using KL divergence and Ramachandran plots [foldingdiff/custom_metrics.py](foldingdiff/custom_metrics.py), [foldingdiff/plotting.py](foldingdiff/plotting.py).
+4. **Visual Validation**: Create high-quality molecular images for publication and presentation [foldingdiff/pymol_vis.py](foldingdiff/pymol_vis.py).
+
+These visualization and analysis tools provide a comprehensive framework for evaluating protein structure generation results, enabling both quantitative assessment and qualitative validation through sophisticated molecular visualization capabilities.
+
+For detailed implementation of specific analysis workflows, refer to the [Self-Consistency TM Score Calculation](18-self-consistency-tm-score-calculation) documentation, which builds upon these foundational tools for specialized evaluation metrics.
+
+# Self-Consistency TM Score Calculation
+
+
+
+The Self-Consistency TM (scTM) score is a critical evaluation metric for assessing the structural quality and novelty of generated protein structures in the foldingdiff framework. This metric quantifies how consistently a generated structure folds when subjected to different structure prediction methods, providing insights into the structural plausibility of the generated proteins.
+
+## Core Architecture
+
+The scTM calculation framework integrates multiple components to provide comprehensive structural evaluation:
+
+```mermaid
+graph TD
+    A[Generated Protein] --> B[Structure Prediction Methods]
+    B --> C[OmegaFold Predictions]
+    B --> D[Alternative Predictors]
+    C --> E[Multiple Sequence Variants]
+    D --> E
+    E --> F[TM-align Comparison]
+    F --> G[scTM Score Calculation]
+    G --> H[Quality Assessment]
+    
+    I[Reference Structures] --> F
+    J[CATH Dataset] --> I
+```
+
+## TM-align Integration
+
+The foundation of scTM calculation relies on the TM-align wrapper implementation in [`foldingdiff/tmalign.py`](foldingdiff/tmalign.py#L22-L56). The core function `run_tmalign()` executes TM-align comparisons between protein structures and parses the output to extract TM-scores normalized by reference length [source](foldingdiff/tmalign.py#L22-L56).
+
+> [!TIP]
+> The wrapper uses `Chain_2` TM-score values which normalize by the reference structure length, ensuring consistent comparisons across proteins of different sizes.
+
+Key features of the TM-align integration:
+
+- **Parallel Processing**: The `max_tm_across_refs()` function enables efficient comparison against multiple reference structures using multiprocessing [source](foldingdiff/tmalign.py#L57-L85)
+- **Error Handling**: Robust error management returns NaN values for failed comparisons rather than crashing the evaluation pipeline [source](foldingdiff/tmalign.py#L39-L42)
+- **File Matching Strategies**: Flexible matching system supports exact, prefix, and suffix strategies for pairing query and reference files [source](foldingdiff/tmalign.py#L86-L114)
+
+## scTM Calculation Pipeline
+
+The scTM evaluation process involves comparing multiple structure predictions of the same sequence to assess structural consistency:
+
+### Structure Prediction Integration
+Based on the analysis in [`jupyter/sctm_by_len.ipynb`](jupyter/sctm_by_len.ipynb), the pipeline integrates with OmegaFold predictions enhanced by ProteinMPNN sequence design:
+
+1. **Sequence Generation**: Generated protein sequences are processed through ProteinMPNN for sequence optimization
+2. **Structure Prediction**: Multiple structure predictions are generated using OmegaFold
+3. **Cross-Comparison**: TM-align compares all predicted structures to calculate consistency scores
+
+### Data Structure and Metrics
+The evaluation results are organized in a comprehensive dataframe structure [source](jupyter/sctm_by_len.ipynb#L50-L80):
+
+| Metric | Description | Purpose |
+|--------|-------------|---------|
+| scTM | Self-consistency TM score | Primary quality metric |
+| max training TM | Maximum TM-score to training structures | Novelty assessment |
+| length_int | Protein length in residues | Length-based analysis |
+| alpha_counts/beta_counts | Secondary structure composition | Structural classification |
+| designable | Designability flag | Functional potential |
+| mean_bfactor_omegafold | Average B-factor from predictions | Confidence measure |
+
+## Statistical Analysis Framework
+
+The scTM evaluation incorporates sophisticated statistical analysis to understand relationships between protein properties and structural quality:
+
+### Length-Dependent Analysis
+The pipeline performs Spearman correlation analysis between protein length and scTM scores [source](jupyter/sctm_by_len.ipynb#L300-L320):
+
+```python
+corr, pval = stats.spearmanr(sctm_table['length_int'], sctm_table['scTM'])
+```
+
+> [!TIP]
+> The analysis reveals a significant positive correlation (ρ ≈ 0.56, p < 10⁻⁶⁴) between protein length and scTM scores, indicating that longer generated proteins tend to achieve higher structural consistency.
+
+### Visualization and Reporting
+Results are visualized using seaborn plots with error bars showing min-max ranges across length categories [source](jupyter/sctm_by_len.ipynb#L300-L330). The plotting integrates with the framework's visualization utilities in [`foldingdiff/plotting.py`](foldingdiff/plotting.py).
+
+## Quality Assessment Criteria
+
+The scTM framework provides multiple dimensions for evaluating generated protein quality:
+
+### Structural Consistency
+- **scTM Score**: Values closer to 1.0 indicate higher structural consistency across predictions
+- **Threshold Analysis**: The 0.5 threshold serves as a benchmark for acceptable structural quality [source](foldingdiff/tmalign.py#L148-L149)
+
+### Novelty Assessment
+- **Training TM Comparison**: Maximum TM-score against CATH training structures identifies potentially novel folds
+- **Designability**: Integration with inverse folding methods assesses functional potential
+
+### Confidence Metrics
+- **B-factor Analysis**: Mean B-factors from OmegaFold predictions provide per-residue confidence estimates [source](jupyter/sctm_by_len.ipynb#L300-L330)
+- **Secondary Structure**: Alpha/beta content analysis informs structural classification
+
+## Implementation Considerations
+
+### Computational Efficiency
+The scTM calculation is optimized for large-scale evaluation:
+- **Parallel Processing**: Multiprocessing support for batch TM-score calculations
+- **Memory Management**: Efficient file handling for large protein datasets
+- **Chunked Processing**: Configurable chunk sizes for optimal resource utilization
+
+### Integration Points
+The scTM framework connects with multiple evaluation components:
+- **Structure Prediction**: OmegaFold and alternative predictors
+- **Sequence Design**: ProteinMPNN integration for sequence optimization
+- **Dataset Management**: CATH dataset integration for reference structures
+
+## Validation and Testing
+
+The TM-align wrapper includes comprehensive test coverage in [`tests/test_tmalign.py`](tests/test_tmalign.py):
+
+- **Reproducibility**: Ensures consistent results across multiple runs
+- **Self-comparison**: Validates that comparing a structure to itself yields perfect scores
+- **Cross-validation**: Confirms that different structures produce scores < 1.0
+
+## Usage Patterns
+
+The scTM calculation is typically used in these contexts:
+- **Model Evaluation**: Assessing the quality of generated protein structures
+- **Hyperparameter Optimization**: Comparing different model configurations
+- **Research Analysis**: Understanding relationships between generation parameters and structural quality
+
+The framework provides both programmatic APIs through the tmalign module and command-line interfaces for batch processing, enabling flexible integration into different research workflows.
+
+For comprehensive protein generation evaluation, the scTM metric should be considered alongside other quality measures discussed in [Structure Prediction Integration](20-structure-prediction-integration) and [Inverse Folding with ProteinMPNN and ESM-IF1](19-inverse-folding-with-proteinmpnn-and-esm-if1).
+
+# Inverse Folding with ProteinMPNN and ESM-IF1
+
+
+
+The **inverse folding** evaluation pipeline in foldingdiff assesses the designability of generated protein backbones by predicting amino acid sequences that would fold into the target structures. This process leverages two state-of-the-art inverse folding models: **ProteinMPNN** for sequence design and **ESM-IF1** for validation, providing a comprehensive assessment of structural plausibility.
+
+## Inverse Folding Pipeline Architecture
+
+The inverse folding workflow follows a systematic approach to evaluate generated protein structures:
+
+```mermaid
+flowchart TD
+    A[Generated Backbone] --> B[ProteinMPNN Sequence Design]
+    B --> C[Multiple Sequence Samples]
+    C --> D[OmegaFold Structure Prediction]
+    D --> E[TM-score Calculation]
+    E --> F[Self-Consistency TM-score]
+    F --> G[Designability Assessment]
+    
+    H[Side Chain Grafting] --> I[PyRosetta Relaxation]
+    I --> J[Relaxation TM-score]
+    J --> K[Structure Validation]
+```
+
+## ProteinMPNN Integration
+
+ProteinMPNN serves as the primary sequence design engine, taking generated backbone coordinates as input and predicting compatible amino acid sequences. The integration process involves:
+
+- **Multiple sampling**: For each generated backbone, ProteinMPNN generates multiple sequence candidates (typically 8 samples) to explore sequence space diversity
+- **Structure prediction**: Each designed sequence is fed to OmegaFold for structure prediction, creating corresponding 3D models
+- **Similarity assessment**: TM-scores are calculated between the original generated backbone and each predicted structure to evaluate consistency
+
+The self-consistency TM-score (scTM) represents the maximum TM-score across all sequence samples, with higher values indicating better designability. Based on the analysis in [`graft_and_relax.ipynb`](jupyter/graft_and_relax.ipynb), the pipeline processes 780 generated structures with comprehensive metrics tracking.
+
+## ESM-IF1 Validation Framework
+
+ESM-IF1 provides an independent validation mechanism for the inverse folding results:
+
+- **Cross-model validation**: ESM-IF1 predictions serve as an additional check on sequence-structure compatibility
+- **Benchmark comparison**: Results are compared against training set structures to assess novelty
+- **Designability classification**: Structures are classified as designable based on established TM-score thresholds
+
+The validation framework tracks multiple metrics including secondary structure composition (alpha/beta counts), protein length categories, and maximum training TM-scores for contextual assessment.
+
+## Side Chain Integration and Relaxation
+
+A critical component of the evaluation involves adding side chains to the backbone-only structures:
+
+- **PyRosetta relaxation**: The [`run_pyrosetta_relax.py`](scripts/run_pyrosetta_relax.py) script performs full-atom relaxation using PyRosetta's energy minimization protocols
+- **Clash detection**: Van der Waals clashes are identified and quantified using the [`vdw_clashes`](foldingdiff/vdw_clashes.py) module
+- **Structure preservation**: TM-scores before and after relaxation measure structural integrity during side chain addition
+
+The relaxation analysis reveals that approximately 50% of structures maintain high similarity (TM-score > 0.5) after side chain integration, indicating robust backbone generation.
+
+## Performance Metrics and Analysis
+
+The inverse folding evaluation produces several key performance indicators:
+
+| Metric | Description | Typical Range |
+|--------|-------------|---------------|
+| scTM | Self-consistency TM-score | 0.2-0.8 |
+| Relaxation TM-score | Pre/post-relaxation similarity | 0.3-0.8 |
+| Designability rate | Fraction with scTM > 0.5 | ~30-40% |
+| Clash rate | Structures with steric conflicts | ~15-20% |
+
+Statistical analysis shows a **Spearman correlation of ρ ≈ 0.82** between scTM scores and relaxation TM-scores, indicating that high designability scores generally correlate with robust structural integrity during side chain addition.
+
+## Implementation Details
+
+The inverse folding pipeline is implemented through several key components:
+
+- **Custom metrics**: The [`custom_metrics.py`](foldingdiff/custom_metrics.py) module provides specialized functions for KL divergence calculation and wrapped mean operations for angular data
+- **Visualization tools**: Comprehensive plotting capabilities in [`plotting.py`](foldingdiff/plotting.py) generate histograms and scatter plots for result analysis
+- **Data management**: Structured output organization with separate directories for different processing stages
+
+The pipeline supports batch processing of multiple generated structures and maintains detailed logs for reproducibility and debugging.
+
+## Integration with Training Pipeline
+
+The inverse folding evaluation integrates seamlessly with the main training workflow through the AMLT configuration system. The [`amlt.yaml`](scripts/amlt.yaml) file orchestrates the execution on distributed computing resources, ensuring scalable evaluation of large protein structure datasets.
+
+This comprehensive evaluation framework provides robust validation of generated protein structures, combining sequence design, structure prediction, and physical validation to assess the practical utility of diffusion-generated protein backbones for real-world applications.
+
+For further details on structure generation and sampling, see [Protein Backbone Sampling Pipeline](15-protein-backbone-sampling-pipeline). To understand the underlying representation system, refer to [Angle-based Protein Representation](7-angle-based-protein-representation).
+
+# Structure Prediction Integration
+
+
+
+The FoldingDiff framework integrates comprehensive structure prediction and validation tools to evaluate and refine generated protein structures. This integration encompasses multiple complementary approaches: **TM-score alignment**, **lDDT calculation**, **structure relaxation**, and **side-chain packing**. These tools form a complete pipeline for assessing structural quality and optimizing generated protein backbones.
+
+## TM-Score Structural Alignment
+
+The TM-score integration provides robust structural similarity assessment through the `run_tmalign` function, which wraps the TMalign executable for comparing protein structures. This implementation supports both standard and fast alignment modes, with parallel processing capabilities for batch comparisons [foldingdiff/tmalign.py](foldingdiff/tmalign.py#L22-L56).
+
+The core alignment process executes TMalign with configurable parameters and parses the output to extract normalized TM-scores. The implementation includes error handling for failed alignments and returns NaN values when comparisons fail, ensuring robust batch processing [foldingdiff/tmalign.py](foldingdiff/tmalign.py#L47-L56).
+
+For large-scale evaluations, the `max_tm_across_refs` function enables efficient parallel comparison against multiple reference structures, returning the maximum TM-score and corresponding reference [foldingdiff/tmalign.py](foldingdiff/tmalign.py#L57-L85). This is particularly useful for assessing generated structures against structural databases.
+
+```mermaid
+flowchart TD
+    A[Generated PDB] --> B[TMalign Execution]
+    C[Reference PDB] --> B
+    B --> D[Parse TM-score Output]
+    D --> E[Normalized TM-score]
+    F[Multiple References] --> G[Parallel TMalign]
+    A --> G
+    G --> H[Maximum TM-score Selection]
+```
+
+## lDDT Distance-Based Assessment
+
+The lDDT (Local Distance Difference Test) integration provides local structural quality assessment through Docker-based OpenStructure execution. The `lddt` function computes distance-based similarity metrics between query and reference structures, offering complementary information to global alignment scores [foldingdiff/lddt.py](foldingdiff/lddt.py#L32-L58).
+
+The implementation leverages a containerized approach with the `run_docker_ost` script, ensuring consistent computational environments across different systems [foldingdiff/lddt.py](foldingdiff/lddt.py#L28). The lDDT calculation is performed in temporary directories to maintain clean execution environments, with proper cleanup and error handling.
+
+For evaluating generated structures against folded variants, the `lddt_sampled_folded` function provides batch processing capabilities, automatically matching sampled structures with their corresponding folded counterparts and computing comprehensive lDDT matrices [foldingdiff/lddt.py](foldingdiff/lddt.py#L59-L75).
+
+## Structure Relaxation with PyRosetta
+
+The PyRosetta integration enables energy-based structure refinement through the `relax_pdb` function. This implementation uses the FastRelax protocol with the full-atom score function to optimize protein structures while maintaining realistic geometry [scripts/run_pyrosetta_relax.py](scripts/run_pyrosetta_relax.py#L18-L27).
+
+The relaxation process loads structures into PyRosetta poses, applies the FastRelax protocol with the default full-atom scoring function, and outputs refined structures. This integration is essential for removing steric clashes and optimizing hydrogen bonding networks in generated backbones.
+
+> [!TIP]
+> PyRosetta initialization occurs at module import time, ensuring the Rosetta environment is properly configured before any relaxation operations [scripts/run_pyrosetta_relax.py](scripts/run_pyrosetta_relax.py#L14).
+
+## Side-Chain Packing with FASPR
+
+The FASPR (Fast and Accurate Side-chain Packing) integration provides efficient side-chain reconstruction for backbone-only structures. The `run_faspr` function processes backbone coordinates with amino acid sequences to generate complete atomic models [scripts/faspr.py](scripts/faspr.py#L40-L60).
+
+The implementation handles sequence formatting requirements, converting FASTA inputs to the single-line format expected by FASPR. The side-chain packing process is executed in temporary directories to maintain clean execution environments, with proper file management and error handling.
+
+For comprehensive side-chain reconstruction, the `add_sidechains_to_backbone` function provides a complete pipeline that combines backbone coordinates with amino acid sequences using pre-computed side-chain rotamer libraries [foldingdiff/angles_and_coords.py](foldingdiff/angles_and_coords.py#L378-L387).
+
+## Angle-to-Coordinate Conversion Pipeline
+
+The structure prediction integration heavily relies on the angle-to-coordinate conversion system, which transforms internal angular representations into Cartesian coordinates. The `create_new_chain_nerf` function implements the NERF (Natural Extension Reference Frame) algorithm for reconstructing 3D coordinates from angular parameters [foldingdiff/angles_and_coords.py](foldingdiff/angles_and_coords.py#L112-L122).
+
+This conversion system supports both minimal and exhaustive angle representations, enabling flexible reconstruction strategies based on the available angular information. The pipeline handles coordinate centering and validation, ensuring structurally sound outputs suitable for downstream analysis.
+
+> [!TIP]
+> The angle-to-coordinate conversion system maintains consistency between the angular representation used by the diffusion model and the Cartesian coordinates required by structure prediction tools.
+
+## Integration Workflow
+
+The complete structure prediction integration follows a systematic workflow that combines all available tools for comprehensive evaluation and optimization:
+
+```mermaid
+flowchart LR
+    A[Angular Representation] --> B[NERF Conversion]
+    B --> C[Backbone PDB]
+    C --> D[Side-chain Packing]
+    D --> E[Complete Structure]
+    E --> F[PyRosetta Relaxation]
+    F --> G[Final Structure]
+    G --> H[TM-score Assessment]
+    G --> I[lDDT Calculation]
+    H --> J[Quality Metrics]
+    I --> J
+```
+
+This integrated approach enables thorough validation of generated protein structures, providing both global similarity measures through TM-scores and local quality assessments through lDDT. The relaxation and side-chain packing steps ensure that generated backbones are transformed into physically realistic complete structures suitable for downstream applications.
+
+The modular design allows for selective application of different tools based on specific evaluation needs, while maintaining consistency across the entire pipeline. This integration forms the foundation for reliable assessment of the FoldingDiff model's protein generation capabilities.

@@ -1,0 +1,1734 @@
+#[cfg(feature = "adme")]
+use std::{
+    collections::HashMap,
+    sync::mpsc::{self, Receiver},
+    thread,
+};
+use std::{
+    fs,
+    fs::File,
+    io,
+    io::{ErrorKind, Read},
+    path::{Path, PathBuf},
+    time::Instant,
+};
+
+#[cfg(feature = "adme")]
+use adme::{DatasetTdc, TherapeuticProperties, infer::Infer, infer_therapeutic_props};
+use bio_files::{
+    DensityMap, MmCif, Mol2, Pdbqt, SdfFormat, Xyz,
+    gromacs::gro::{AtomGro, Gro},
+    md_params::ForceFieldParams,
+    sdf::Sdf,
+};
+use chrono::Utc;
+use dynamics::params::amber::ProtFfChargeMapSet;
+use egui_file_dialog::{FileDialog, FileDialogConfig};
+use graphics::{ControlScheme, EngineUpdates, Scene};
+use lin_alg::f64::Vec3;
+use mol_defs::{
+    molecules::{
+        Atom, Bond, MolGenericRef, MolIdent, MolType, MoleculeGeneric,
+        PHARMACOPHORE_POCKET_ATOMS_KEY, POCKET_METADATA_KEY,
+        common::{MoleculeCommon, bonds_avail},
+        lipid::MoleculeLipid,
+        nucleic_acid::{MoleculeNucleicAcid, NucleicAcidType},
+        peptide::MoleculePeptide,
+        small::MoleculeSmall,
+    },
+    reflection::{DENSITY_CELL_MARGIN, DENSITY_MAX_DIST, DensityPt, DensityRect},
+    screening::pharmacophore::Pharmacophore,
+};
+use na_seq::{Element, Sequence};
+
+use crate::{
+    cam,
+    cam::place_mol_in_view,
+    drawing::{
+        MolTypeExt,
+        peptide::draw_peptide,
+        wrappers::{draw_all_ligs, draw_all_lipids, draw_all_nucleic_acids, draw_all_pockets},
+    },
+    external_tools::{Tool, find_executable},
+    file_io::managed_mols::{
+        MOL_TYPE_KEY, MOL_TYPE_LIPID, ManagedMolManifest, NUCLEIC_ACID_TYPE_KEY,
+    },
+    md::{
+        mdposit,
+        trajectory::Trajectory,
+        viewer::{SnapshotViewer, ViewerMolSet},
+    },
+    mol_db::ParquetMolDb,
+    nucleic_acid_creation::nucleotide,
+    pocket_render::PocketRender,
+    prefs::{OpenHistory, OpenType},
+    reflection::DensityRectExt,
+    selection::Selection,
+    state::State,
+    util::{handle_err, handle_success},
+};
+
+pub mod download_mols;
+pub mod ff_params;
+pub(crate) mod managed_mols;
+pub mod sequence;
+
+#[cfg(feature = "adme")]
+/// Prepare one molecule once before running the bundled ADME models. The ADME crate repairs
+/// missing or untrusted 3D geometry with RDKit; doing that here makes the backend choice visible
+/// and prevents every model from repeating the same preparation.
+fn spawn_therapeutic_inference(
+    mol: &MoleculeSmall,
+    models: &mut HashMap<DatasetTdc, Infer>,
+    ff_params: &ForceFieldParams,
+    therapeutic_properties_avail: &mut Option<Receiver<(usize, TherapeuticProperties)>>,
+    mol_i: usize,
+) {
+    if !adme::embedded_models_available() {
+        return;
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let mol_for_thread = mol.clone();
+    let ff_params_for_thread = ff_params.clone();
+    let mut models_for_thread = std::mem::take(models);
+
+    thread::spawn(move || {
+        let prepared = adme::geometry::prepare_molecule(&mol_for_thread, &ff_params_for_thread);
+        let mol_for_inference = match &prepared {
+            Ok(std::borrow::Cow::Borrowed(mol)) => *mol,
+            Ok(std::borrow::Cow::Owned(mol)) => {
+                println!("Prepared 3D molecular geometry for ADME inference using RDKit.");
+                mol
+            }
+            Err(error) => {
+                // Let inference report any remaining geometry or model error to the caller.
+                println!(
+                    "Attempted 3D molecular preparation for ADME inference using RDKit, \
+                     but it failed: {error}"
+                );
+                &mol_for_thread
+            }
+        };
+
+        match infer_therapeutic_props(
+            mol_for_inference,
+            &mut models_for_thread,
+            &ff_params_for_thread,
+        ) {
+            Ok(properties) => {
+                println!(
+                    "Computed native descriptor features for bundled ADME inference. This is \
+                     separate from SMILES parsing, which uses RDKit when available."
+                );
+                let _ = tx.send((mol_i, properties));
+            }
+            Err(error) => eprintln!("Error inferring therapeutic properties: {error}"),
+        }
+    });
+
+    *therapeutic_properties_avail = Some(rx);
+}
+
+/// CPU/file result produced while restoring one item from the previous session. Parsing stays on
+/// the worker; application and graphics state are updated later on the UI thread.
+pub(crate) enum SessionRestorePayload {
+    Molecule {
+        molecule: MoleculeGeneric,
+        specific_params: Option<(String, ForceFieldParams)>,
+    },
+    Density(DensityMap),
+    GeneralForceField(ForceFieldParams),
+    SpecificForceField(String, ForceFieldParams),
+    Trajectory(Trajectory, Option<ViewerMolSet>),
+    ParquetDb(ParquetMolDb),
+    MdMols(SnapshotViewer),
+    MdParams,
+    /// Every sequence in one file.
+    Sequences(Vec<Sequence>),
+}
+
+pub(crate) struct SessionRestoreItem {
+    pub history: OpenHistory,
+    pub payload: SessionRestorePayload,
+}
+
+/// Load a Mol2. A nucleic acid or lipid if it's from a creation panel, either managed or saved by
+/// the user; otherwise a small molecule or pocket.
+fn mol_from_mol2(
+    mol2: Mol2,
+    manifest: Option<&ManagedMolManifest>,
+    path: &Path,
+) -> io::Result<MoleculeGeneric> {
+    // A user-saved file has no manifest; its metadata marks the type.
+    let created_type = manifest.and_then(|m| m.created_mol_type()).or_else(|| {
+        if mol2.metadata.contains_key(NUCLEIC_ACID_TYPE_KEY) {
+            Some(MolType::NucleicAcid)
+        } else if mol2.metadata.get(MOL_TYPE_KEY).map(String::as_str) == Some(MOL_TYPE_LIPID) {
+            Some(MolType::Lipid)
+        } else {
+            None
+        }
+    });
+
+    if let Some(mol_type) = created_type {
+        return created_mol_from_mol2(mol2, mol_type, manifest.map(|m| m.query.as_str()), path);
+    }
+
+    let mut m: MoleculeSmall = mol2.try_into()?;
+    m.common.update_path(path);
+
+    Ok(if m.common.metadata.contains_key(POCKET_METADATA_KEY) {
+        MoleculeGeneric::Pocket(m.common.into())
+    } else {
+        MoleculeGeneric::Small(m)
+    })
+}
+
+/// Load a nucleic acid or lipid from a creation panel's Mol2. `query` is the managed manifest's;
+/// for nucleic acids, the sequence stored in the file supersedes it.
+fn created_mol_from_mol2(
+    mol2: Mol2,
+    mol_type: MolType,
+    query: Option<&str>,
+    path: &Path,
+) -> io::Result<MoleculeGeneric> {
+    let mut atoms: Vec<Atom> = mol2.atoms.iter().map(|a| a.into()).collect();
+    // Their templates name atoms here; Mol2 loads names as `type_in_res`.
+    for atom in &mut atoms {
+        atom.type_in_res_general = atom.type_in_res.take().map(|t| t.to_string());
+    }
+
+    let bonds = mol2
+        .bonds
+        .iter()
+        .map(|b| Bond::from_generic(b, &atoms))
+        .collect::<Result<_, _>>()?;
+
+    let common = MoleculeCommon::new(
+        mol2.ident,
+        atoms,
+        bonds,
+        mol2.metadata,
+        Some(path.to_owned()),
+    );
+
+    Ok(match mol_type {
+        MolType::NucleicAcid => {
+            // Set by `MoleculeNucleicAcid::from_seq`.
+            let na_type = match common
+                .metadata
+                .get(NUCLEIC_ACID_TYPE_KEY)
+                .map(String::as_str)
+            {
+                Some("rna") => NucleicAcidType::Rna,
+                _ => NucleicAcidType::Dna,
+            };
+
+            let mut mol = MoleculeNucleicAcid {
+                na_type,
+                common,
+                seq: query
+                    .unwrap_or_default()
+                    .chars()
+                    .filter_map(|ch| nucleotide(ch, na_type))
+                    .collect(),
+                ..Default::default()
+            };
+            managed_mols::restore_nucleic_acid_residues(&mut mol)?;
+
+            MoleculeGeneric::NucleicAcid(mol)
+        }
+        _ => {
+            let mut mol = MoleculeLipid {
+                common,
+                ..Default::default()
+            };
+            mol.populate_db_ids();
+
+            MoleculeGeneric::Lipid(mol)
+        }
+    })
+}
+
+/// Parse one previous-session item without borrowing `State` or touching the scene. This function
+/// is intentionally self-contained so `threads.rs` can run it on its startup worker.
+pub(crate) fn parse_session_history(
+    history: OpenHistory,
+    prefs_dir: &Path,
+    peptide_ff_q_map: Option<&ProtFfChargeMapSet>,
+    ph: f32,
+) -> io::Result<SessionRestoreItem> {
+    let path = &history.path;
+    let payload = match history.type_ {
+        OpenType::Peptide
+        | OpenType::Ligand
+        | OpenType::NucleicAcid
+        | OpenType::Lipid
+        | OpenType::Pocket => {
+            let manifest = managed_mols::read_manifest(prefs_dir, path)?;
+            let specific_params = if let Some(manifest) = &manifest
+                && let Some(filename) = &manifest.frcmod_file
+            {
+                let entry_dir = path.parent().ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "Managed molecule path has no parent",
+                    )
+                })?;
+                Some((
+                    manifest.query.to_uppercase(),
+                    ForceFieldParams::load_frcmod(&entry_dir.join(filename))?,
+                ))
+            } else {
+                None
+            };
+
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let mut molecule = match extension.as_str() {
+                "sdf" | "mol" => {
+                    let mut molecule: MoleculeSmall = Sdf::load(path)?.try_into()?;
+                    molecule.common.update_path(path);
+                    if molecule.common.metadata.contains_key(POCKET_METADATA_KEY) {
+                        MoleculeGeneric::Pocket(molecule.common.into())
+                    } else {
+                        MoleculeGeneric::Small(molecule)
+                    }
+                }
+                "mol2" => mol_from_mol2(Mol2::load(path)?, manifest.as_ref(), path)?,
+                "xyz" => MoleculeGeneric::Small(MoleculeSmall::from_xyz(Xyz::load(path)?, path)?),
+                "pdbqt" => {
+                    let mut molecule: MoleculeSmall = Pdbqt::load(path)?.try_into()?;
+                    molecule.common.update_path(path);
+                    MoleculeGeneric::Small(molecule)
+                }
+                "cif" => {
+                    let data = fs::read_to_string(path)?;
+                    let cif = MmCif::new(&data)?;
+                    let ff_map = peptide_ff_q_map.ok_or_else(|| {
+                        io::Error::other("Missing FF map when opening a protein; can't validate H")
+                    })?;
+                    let mut molecule =
+                        MoleculePeptide::from_mmcif(cif, ff_map, Some(path.to_owned()), ph)?;
+                    molecule.set_source_cif(data)?;
+                    MoleculeGeneric::Peptide(molecule)
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "Invalid molecule file extension",
+                    ));
+                }
+            };
+
+            if let Some(manifest) = &manifest
+                && manifest.provider == "geostd"
+                && let MoleculeGeneric::Small(molecule) = &mut molecule
+            {
+                let geostd_ident = MolIdent::PdbeAmber(manifest.query.clone());
+                if !molecule.idents.contains(&geostd_ident) {
+                    molecule.idents.push(geostd_ident);
+                }
+                if let Some(cid) = manifest.pubchem_cid
+                    && !molecule.idents.contains(&MolIdent::PubChem(cid))
+                {
+                    molecule.idents.push(MolIdent::PubChem(cid));
+                }
+            }
+            if let Some(name) = manifest.as_ref().and_then(|m| m.name.clone()) {
+                molecule.common_mut().name = Some(name);
+            }
+            molecule
+                .common_mut()
+                .metadata
+                .remove(PHARMACOPHORE_POCKET_ATOMS_KEY);
+
+            SessionRestorePayload::Molecule {
+                molecule,
+                specific_params,
+            }
+        }
+        OpenType::Map => {
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let density = if matches!(extension.as_str(), "mtz" | "cif") {
+                DensityMap::load_sf_or_mtz(path, Some(&gemmi_dir()?))?
+            } else {
+                DensityMap::load(path)?
+            };
+            SessionRestorePayload::Density(density)
+        }
+        OpenType::Frcmod => {
+            let extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            match extension.as_str() {
+                "dat" => {
+                    SessionRestorePayload::GeneralForceField(ForceFieldParams::load_dat(path)?)
+                }
+                "frcmod" => {
+                    let name = path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .ok_or_else(|| {
+                            io::Error::new(ErrorKind::InvalidInput, "Invalid frcmod filename")
+                        })?
+                        .to_uppercase();
+                    SessionRestorePayload::SpecificForceField(
+                        name,
+                        ForceFieldParams::load_frcmod(path)?,
+                    )
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidFilename,
+                        "Attempting to parse a non-dat/frcmod file as a force field",
+                    ));
+                }
+            }
+        }
+        OpenType::Trajectory => {
+            let (trajectory, set) = mdposit::open_trajectory(path, prefs_dir)?;
+
+            SessionRestorePayload::Trajectory(trajectory, set)
+        }
+        OpenType::MdParams => SessionRestorePayload::MdParams,
+        OpenType::ParquetDb => SessionRestorePayload::ParquetDb(ParquetMolDb::new(path)?),
+        OpenType::MdMols => {
+            let mut viewer = SnapshotViewer::default();
+            viewer.load_gro(path)?;
+            SessionRestorePayload::MdMols(viewer)
+        }
+        OpenType::Sequence => {
+            SessionRestorePayload::Sequences(sequence::load_sequences(path)?.records)
+        }
+    };
+
+    Ok(SessionRestoreItem { history, payload })
+}
+
+/// Shared between loading protein from file, and from RCSB.
+pub(in crate::file_io) fn load_peptide(
+    state: &mut State,
+    scene: &mut Scene,
+    mol: MoleculePeptide,
+    updates: &mut EngineUpdates,
+    draw_now: bool,
+) -> (String, Vec3) {
+    state.volatile.set_aa_seq(Some(&mol));
+
+    state.volatile.flags.ss_mesh_created = false;
+    state.volatile.flags.sas_mesh_created = false;
+    state.volatile.flags.clear_density_drawing = true;
+
+    let centroid = mol.common.centroid();
+    let ident = mol.common.ident.clone();
+    let peptide_i = state.peptides.len();
+    state.peptides.push(mol);
+    state.volatile.active_mol = Some((MolType::Peptide, peptide_i));
+    state.volatile.active_peptide = Some(peptide_i);
+    state.volatile.orbit_center = Some((MolType::Peptide, peptide_i));
+
+    if draw_now {
+        draw_peptide(state, scene, updates);
+    }
+
+    (ident, centroid)
+}
+
+impl State {
+    /// Load any files that belong to an application-managed molecule bundle.
+    ///
+    /// Most managed molecules have only their main source file. GeoStd molecules may also carry
+    /// molecule-specific force-field parameters, which must be present before the Mol2 is parsed.
+    fn load_managed_mol_companions(
+        &mut self,
+        path: &Path,
+    ) -> io::Result<Option<ManagedMolManifest>> {
+        let Some(manifest) = managed_mols::read_manifest(&self.volatile.prefs_dir, path)? else {
+            return Ok(None);
+        };
+
+        if let Some(filename) = &manifest.frcmod_file {
+            let entry_dir = path.parent().ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "Managed molecule path has no parent",
+                )
+            })?;
+            let params = ForceFieldParams::load_frcmod(&entry_dir.join(filename))?;
+            self.mol_specific_params
+                .insert(manifest.query.to_uppercase(), params);
+        }
+
+        Ok(Some(manifest))
+    }
+
+    /// A single endpoint to open a number of file types. Delegates to functions that handle
+    /// specific classes of file to open.
+    pub fn open_file(
+        &mut self,
+        path: &Path,
+        scene: &mut Scene,
+        engine_updates: &mut EngineUpdates,
+    ) -> io::Result<()> {
+        let ext = path
+            .extension()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .to_str()
+            .unwrap_or_default()
+            .to_owned();
+
+        // Reports its own result, including any residues it couldn't represent.
+        if sequence::is_seq_ext(&ext) {
+            return self.open_sequences(path);
+        }
+
+        match ext.as_str() {
+            "mcproj" => crate::project::load(self, scene, engine_updates, path)?,
+            // The cif branch here also handles 2fo-fc mmCIF files.
+            // Note: `mol` is ChEBI's SDF; same or similar in most or all cases?
+            "sdf" | "mol" | "mol2" | "xyz" | "pdbqt" | "pdb" | "cif" => {
+                self.open_mol_from_file(path, scene, engine_updates)?
+            }
+            "gro" => {
+                self.volatile.md_local.viewer.load_gro(path)?;
+
+                self.update_history(path, OpenType::MdMols, None);
+            }
+            "prmtop" => {
+                // todo
+            }
+            "map" => self.open_map(path)?,
+            "mtz" => self.open_mtz(path)?,
+            // todo: lib, .dat etc as required. Using Amber force fields and its format
+            // todo to start. We assume it'll be generalizable later.
+            "frcmod" | "dat" => self.open_force_field(path)?,
+            "trr" | "xtc" | "dcd" => self.open_trajectory(path)?,
+            "mdp" => self.open_mdp(path)?,
+            // "pmp" => self.open_pharmacophore(path)?,
+            "parquet" => self.load_parquet_db(path),
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "Unsupported file extension when opening",
+                ));
+            }
+        }
+
+        handle_success(
+            &mut self.ui,
+            format!(
+                "Loaded file {}",
+                Path::new(&path)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("<unknown>")
+            ),
+        );
+
+        Ok(())
+    }
+
+    /// For opening molecule files: Proteins, small organic molecules, nucleic acids etc.
+    pub fn open_mol_from_file(
+        &mut self,
+        path: &Path,
+        scene: &mut Scene,
+        engine_updates: &mut EngineUpdates,
+    ) -> io::Result<()> {
+        let managed_manifest = self.load_managed_mol_companions(path)?;
+
+        let binding = path.extension().unwrap_or_default().to_ascii_lowercase();
+        let extension = binding;
+
+        let molecule = match extension.to_str().unwrap() {
+            // Note: We handle loading pockets from these files downstream,
+            // by parsing their metadata.
+            "sdf" | "mol" => {
+                let mut m: MoleculeSmall = Sdf::load(path)?.try_into()?;
+                m.common.update_path(path);
+
+                if m.common.metadata.contains_key(POCKET_METADATA_KEY) {
+                    Ok(MoleculeGeneric::Pocket(m.common.into()))
+                } else {
+                    Ok(MoleculeGeneric::Small(m))
+                }
+            }
+            "mol2" => mol_from_mol2(Mol2::load(path)?, managed_manifest.as_ref(), path),
+            "xyz" => {
+                let mut m = MoleculeSmall::from_xyz(Xyz::load(path)?, path)?;
+                m.common.update_path(path);
+                Ok(MoleculeGeneric::Small(m))
+            }
+            "pdbqt" => {
+                let mut m: MoleculeSmall = Pdbqt::load(path)?.try_into()?;
+                m.common.update_path(path);
+                Ok(MoleculeGeneric::Small(m))
+            }
+            "cif" => {
+                // If a 2fo-fc CIF, use gemmi to convert it to Map data.
+                // Using the filename to determine if this is a 2fo-fc file, vice atom coordinates,
+                // is rough here, but good enough for now.
+                // todo: This isn't really opening a molecule, so is out of place. Good enough for now.
+                if let Some(name) = path.file_name().and_then(|os| os.to_str()) {
+                    // Note: This isn't the ideal place to handle 2fo-fc files, but they're in mmCIF format,
+                    // so we handle here. We handle map and MTZ files elsewhere, even though they use a
+                    // similar pipeline.
+                    if name.contains("2fo") && name.contains("fc") {
+                        let dm = DensityMap::load_sf_or_mtz(path, Some(&gemmi_dir()?))?;
+
+                        // let mut fft_planner = FftPlanner::new();
+                        // let data = CifStructureFactors::new_from_path(path)?;
+
+                        // let dm = density_map_from_mmcif(&data, &mut fft_planner)?;
+
+                        self.load_density(dm);
+
+                        self.update_history(path, OpenType::Map, None);
+                        // Save the open history.
+                        self.update_save_prefs();
+
+                        return Ok(());
+                    }
+                }
+
+                let data_str = fs::read_to_string(path)?;
+                let cif_data = MmCif::new(&data_str)?;
+
+                let Some(ff_map) = &self.ff_param_set.amber().unwrap().peptide_ff_q_map else {
+                    return Err(io::Error::other(
+                        "Missing FF map when opening a protein; can't validate H",
+                    ));
+                };
+
+                let mut mol = MoleculePeptide::from_mmcif(
+                    cif_data,
+                    ff_map,
+                    Some(path.to_owned()),
+                    self.to_save.ph,
+                )?;
+                mol.set_source_cif(data_str)?;
+
+                Ok(MoleculeGeneric::Peptide(mol))
+            }
+            _ => Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "Invalid file extension",
+            )),
+        };
+
+        match molecule {
+            Ok(mut mol_gen) => {
+                if let Some(manifest) = &managed_manifest
+                    && manifest.provider == "geostd"
+                    && let MoleculeGeneric::Small(mol) = &mut mol_gen
+                {
+                    let geostd_ident = MolIdent::PdbeAmber(manifest.query.clone());
+                    if !mol.idents.contains(&geostd_ident) {
+                        mol.idents.push(geostd_ident);
+                    }
+                    if let Some(cid) = manifest.pubchem_cid
+                        && !mol.idents.contains(&MolIdent::PubChem(cid))
+                    {
+                        mol.idents.push(MolIdent::PubChem(cid));
+                    }
+                }
+                if let Some(name) = managed_manifest.as_ref().and_then(|m| m.name.clone()) {
+                    mol_gen.common_mut().name = Some(name);
+                }
+
+                mol_gen
+                    .common_mut()
+                    .metadata
+                    .remove(PHARMACOPHORE_POCKET_ATOMS_KEY);
+
+                self.load_mol_to_state(mol_gen, scene, engine_updates, Some(path));
+            }
+            Err(e) => return Err(e),
+        }
+
+        Ok(())
+    }
+
+    pub fn load_density(&mut self, dens_map: DensityMap) {
+        let dev = self.computation_device();
+        #[cfg(feature = "cuda")]
+        let kernel = self.computation_resources().kernel_reflections.clone();
+        let peptide_i = self.peptide_for_tools_i();
+        if let Some(mol) = peptide_i.and_then(|i| self.peptides.get_mut(i)) {
+            // Sample atoms, so we know where to draw the (periodic) density data.
+            // We are filtering for backbone atoms of one type for now, for performance reasons. This is
+            // a sample. Good enough?
+
+            let atom_posits: Vec<_> = mol
+                .common
+                .atoms
+                .iter()
+                .filter(|a| a.element != Element::Hydrogen)
+                .map(|a| a.posit)
+                .collect();
+
+            let dens_rect = DensityRect::new(&atom_posits, &dens_map, DENSITY_CELL_MARGIN);
+
+            #[cfg(feature = "cuda")]
+            let dens = dens_rect.make_densities(
+                &dev,
+                &kernel,
+                &atom_posits,
+                &dens_map.hdr.inner.cell,
+                DENSITY_MAX_DIST,
+            );
+
+            #[cfg(not(feature = "cuda"))]
+            let dens = dens_rect.make_densities(
+                &dev,
+                &atom_posits,
+                &dens_map.hdr.inner.cell,
+                DENSITY_MAX_DIST,
+            );
+
+            let elec_dens: Vec<_> = dens
+                .iter()
+                .map(|d| DensityPt {
+                    coords: d.coords,
+                    density: d.density,
+                })
+                .collect();
+
+            // println!("Rect: {:?}", dens_rect);
+
+            mol.density_map = Some(dens_map);
+            mol.density_rect = Some(dens_rect);
+            mol.elec_density = Some(elec_dens);
+
+            self.volatile.flags.new_density_loaded = true;
+            self.volatile.flags.make_density_iso_mesh = true;
+        }
+    }
+
+    /// An electron density map file, e.g. a .map file.
+    pub fn open_map(&mut self, path: &Path) -> io::Result<()> {
+        let dm = DensityMap::load(path)?;
+        self.load_density(dm);
+
+        self.update_history(path, OpenType::Map, None);
+        // Save the open history.
+        self.update_save_prefs();
+
+        Ok(())
+    }
+
+    /// An electron density MTZ file. We use Gemmi's sf2map functionality, as we do for 2fo-fc files.
+    pub fn open_mtz(&mut self, path: &Path) -> io::Result<()> {
+        let dm = DensityMap::load_sf_or_mtz(path, Some(&gemmi_dir()?))?;
+        self.load_density(dm);
+
+        self.update_history(path, OpenType::Map, None);
+        // Save the open history.
+        self.update_save_prefs();
+
+        Ok(())
+    }
+
+    /// Open Amber force field parameters, e.g. dat and frcmod.
+    pub fn open_force_field(&mut self, path: &Path) -> io::Result<()> {
+        let binding = path.extension().unwrap_or_default().to_ascii_lowercase();
+        let extension = binding;
+
+        match extension.to_str().unwrap() {
+            "dat" => {
+                self.ff_param_set.amber_mut().unwrap().small_mol =
+                    Some(ForceFieldParams::load_dat(path)?);
+
+                println!("\nLoaded forcefields:");
+                let v = &self
+                    .ff_param_set
+                    .amber()
+                    .unwrap()
+                    .small_mol
+                    .as_ref()
+                    .unwrap();
+                println!("Lin");
+                for di in v.bond.values().take(20) {
+                    println!("Lin: {:?}, {}, {}", di.atom_types, di.k_b, di.r_0);
+                }
+
+                println!("Angle");
+                for di in v.angle.values().take(20) {
+                    println!("Angle: {:?}, {}, {}", di.atom_types, di.k, di.theta_0);
+                }
+
+                println!("Dihe:");
+                for di in v.dihedral.values().take(20) {
+                    for d in di {
+                        println!("DH: {:?}, {}, {}", d.atom_types, d.barrier_height, d.phase);
+                    }
+                }
+
+                println!("Dihedral, improper:");
+                for di in v.improper.values().take(20) {
+                    for d in di {
+                        println!("Imp: {:?}, {}, {}", d.atom_types, d.barrier_height, d.phase);
+                    }
+                }
+
+                // todo: Get VDW loading working.
+                println!("Vdw");
+                for di in v.lennard_jones.values().take(20) {
+                    println!("Vdw: {:?}, {}, {}", di.atom_type, di.sigma, di.eps);
+                }
+
+                println!("Loaded general Ligand force fields.");
+            }
+            "frcmod" => {
+                // Good enough for now; works for amber params.
+                // todo: Not general though. Could alternatively assume whatever you load is
+                // todo for the current molecule.
+                // Filename without path or extension.
+                let mol_name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            ErrorKind::InvalidInput,
+                            format!("Invalid frcmod filename: {:?}", path),
+                        )
+                    })?
+                    .to_string();
+
+                self.mol_specific_params.insert(
+                    mol_name.to_uppercase(),
+                    ForceFieldParams::load_frcmod(path)?,
+                );
+
+                // Update the lig's FRCMOD status A/R, if the ligand is opened already.
+                for lig in &mut self.ligands {
+                    if lig.common.ident.to_uppercase() == mol_name.to_uppercase() {
+                        lig.frcmod_loaded = true;
+                    }
+                }
+
+                // self.to_save.last_frcmod_opened = Some(path.to_owned());
+                // self.update_history(path, OpenType::Frcmod, mol_name.as_str());
+                self.update_history(path, OpenType::Frcmod, None);
+                // Save the open history.
+                self.update_save_prefs();
+
+                println!("Loaded molecule-specific force fields.");
+            }
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidFilename,
+                    "Attempting to parse non-dat or frcmod mod file as a force field.",
+                ));
+            }
+        };
+
+        Ok(())
+    }
+
+    /// Open a MD trajectory. E.g. TRR, DCD, XTC file. This is a trajectory of a MD run.
+    pub fn open_trajectory(&mut self, path: &Path) -> io::Result<()> {
+        let (trajectory, set) = mdposit::open_trajectory(path, &self.volatile.prefs_dir)?;
+        mdposit::register(self, trajectory, set);
+
+        self.update_history(path, OpenType::Trajectory, None);
+        self.update_save_prefs();
+
+        Ok(())
+    }
+
+    /// Open a GROMACS MD params file. This configures MD run params.
+    pub fn open_mdp(&mut self, path: &Path) -> io::Result<()> {
+        self.volatile.md_local.gromacs_setup.load_mdp(path)?;
+        self.to_save.md.backend = crate::md::MdBackend::Gromacs;
+        self.ui.ui_vis.dynamics = true;
+
+        self.update_history(path, OpenType::MdParams, None);
+        self.update_save_prefs();
+
+        Ok(())
+    }
+
+    /// A pharmacophore that is stored independently, i.e. without an associated ligand file.
+    /// todo: FOr now at least, deprecated as a dedicated file type, in favor of Mol2 or SDF annotations.
+    pub fn _open_pharmacophore(&mut self, path: &Path) -> io::Result<()> {
+        let mut file = File::open(path)?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+
+        let ph = Pharmacophore::from_bytes(&buf);
+
+        println!("Loaded pharmacophore: {:?}", ph.features);
+        if let Some(p) = &ph.pocket {
+            println!(
+                "Pocket loaded with pharmacophore, based on {} atoms",
+                p.volume.spheres.len()
+            )
+        }
+
+        // self.pharmacophores.push(ph);
+
+        self.update_history(path, OpenType::Map, Some(ph.name));
+        // Save the open history.
+        self.update_save_prefs();
+
+        Ok(())
+    }
+
+    /// A single endpoint to save a number of file types
+    pub fn save(&mut self, path: &Path) -> io::Result<()> {
+        let binding = path.extension().unwrap_or_default().to_ascii_lowercase();
+        let extension = binding.to_str().unwrap_or_default();
+
+        // These formats drop the atom names and FF types that nucleic acids and lipids need.
+        if matches!(extension, "sdf" | "mol" | "xyz" | "pdbqt")
+            && matches!(
+                self.active_mol(),
+                Some(MolGenericRef::NucleicAcid(_) | MolGenericRef::Lipid(_))
+            )
+        {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "Nucleic acids and lipids can only be saved as Mol2",
+            ));
+        }
+
+        let open_type = match extension {
+            "mdp" => {
+                let setup = &self.volatile.md_local.gromacs_setup;
+                let mdp = setup.mdp.clone().unwrap_or_else(|| {
+                    if setup.uses_files() {
+                        String::new()
+                    } else {
+                        crate::gromacs::generated_mdp(&self.to_save.md)
+                    }
+                });
+                fs::write(path, mdp)?;
+
+                return Ok(());
+            }
+            "pdb" | "cif" => {
+                // todo: Eval how you want to handle this. For now, the raw CIF or PDB.
+                // if let Some(pdb) = &mut self.pdb {
+                //     save_pdb(pdb, path)?;
+                //     self.to_save.last_opened = Some(path.to_owned());
+                //     self.update_save_prefs()
+                // }
+                // Save the active peptide's mmCIF: as loaded, with any ligands added or removed
+                // since.
+                let Some(mol) = self
+                    .peptide_for_tools_i()
+                    .and_then(|i| self.peptides.get(i))
+                else {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "No peptide to save"));
+                };
+                let Some(data) = &mol.source_cif else {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "The active peptide has no source CIF data to save",
+                    ));
+                };
+                fs::write(path, data)?;
+                OpenType::Peptide
+            }
+            "sdf" | "mol" => match self.active_mol() {
+                Some(mol) => {
+                    // V2000 only for now. Allow configuring, eventually.
+                    mol.to_sdf()?.save(path, SdfFormat::V2000)?;
+
+                    if mol.common().metadata.contains_key(POCKET_METADATA_KEY) {
+                        OpenType::Pocket
+                    } else {
+                        OpenType::Ligand
+                    }
+                }
+                None => return Err(io::Error::new(ErrorKind::InvalidData, "No ligand to save")),
+            },
+            "mol2" => match self.active_mol() {
+                Some(mol @ MolGenericRef::NucleicAcid(_)) => {
+                    managed_mols::created_mol_to_mol2(&mol)?.save(path)?;
+                    OpenType::NucleicAcid
+                }
+                Some(mol @ MolGenericRef::Lipid(_)) => {
+                    managed_mols::created_mol_to_mol2(&mol)?.save(path)?;
+                    OpenType::Lipid
+                }
+                Some(mol) => {
+                    mol.to_mol2()?.save(path)?;
+
+                    if mol.common().metadata.contains_key(POCKET_METADATA_KEY) {
+                        OpenType::Pocket
+                    } else {
+                        OpenType::Ligand
+                    }
+                }
+                None => return Err(io::Error::new(ErrorKind::InvalidData, "No ligand to save")),
+            },
+            "xyz" => match self.active_mol() {
+                Some(mol) => {
+                    mol.to_xyz()?.save(path)?;
+                    OpenType::Ligand
+                }
+                None => return Err(io::Error::new(ErrorKind::InvalidData, "No ligand to save")),
+            },
+            "prmtop" => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "Prmptop saving unimplemented",
+                ));
+            }
+            "pdbqt" => match self.active_mol() {
+                Some(mol) => {
+                    mol.to_pdbqt()?.save(path)?;
+                    OpenType::Ligand
+                }
+                None => return Err(io::Error::new(ErrorKind::InvalidData, "No ligand to save")),
+            },
+            // todo: Consider if you want to store the original map bytes, as you do with
+            // todo mmCIF files, instead of saving what you parsed.
+            "map" | "mtz" => {
+                let Some(mol) = self
+                    .peptide_for_tools_i()
+                    .and_then(|i| self.peptides.get(i))
+                else {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "No molecule open; can't save a density Map.",
+                    ));
+                };
+                let Some(dm) = &mol.density_map else {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "No density map loaded for this molecule; can't save it.",
+                    ));
+                };
+                match extension {
+                    "map" => dm.save(path)?,
+                    "mtz" => dm.save_sf_or_mtz(path, Some(&gemmi_dir()?))?,
+                    _ => unreachable!(),
+                }
+                OpenType::Map
+            }
+            "dcd" | "xtc" | "trr" => {
+                if self.volatile.md_local.mol_dynamics.is_some() {
+                    //
+                    // // This function in the `dynamics` lib will handle saving in the appropriate format
+                    // // for the given file extension.
+                    // if md.save_snapshots_to_file(path).is_err() {
+                    //     return Err(io::Error::new(
+                    //         ErrorKind::InvalidData,
+                    //         "Probably saving the MD trajectory to a file.",
+                    //     ));
+                    // }
+                    return Err(io::Error::other(
+                        "Manually saving snapshots removed for now at least.",
+                    ));
+                } else {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "No dynamics state; can't save a trajectory",
+                    ));
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "Unsupported file extension when saving",
+                ));
+            }
+        };
+
+        // Saving an application-managed molecule promotes the user-selected file to its source.
+        // Remove the managed history entry and update the live molecule's path so a subsequent
+        // close marks the correct entry inactive and a restart cannot open both copies.
+        let previous_managed_path = match open_type {
+            OpenType::Peptide => self
+                .peptide_for_tools()
+                .and_then(|mol| mol.common.path.clone()),
+            OpenType::Ligand | OpenType::Pocket | OpenType::NucleicAcid | OpenType::Lipid => {
+                self.active_mol().and_then(|mol| mol.common().path.clone())
+            }
+            _ => None,
+        }
+        .filter(|old_path| {
+            old_path != path && managed_mols::is_managed_path(&self.volatile.prefs_dir, old_path)
+        });
+
+        if let Some(old_path) = &previous_managed_path {
+            self.to_save
+                .open_history
+                .retain(|history| history.path != *old_path);
+
+            match open_type {
+                OpenType::Peptide => {
+                    if let Some(mol) = self.peptide_for_tools_mut() {
+                        mol.common.update_path(path);
+                    }
+                }
+                OpenType::Ligand | OpenType::Pocket | OpenType::NucleicAcid | OpenType::Lipid => {
+                    if let Some(mut mol) = self.active_mol_mut() {
+                        mol.common_mut().update_path(path);
+                    }
+                }
+                _ => (),
+            }
+        }
+
+        // For molecule file types (Mol2, SDF, XYZ, PDBQT, some CIF variants etc.), record the
+        // molecule's identifier in the open history.
+        let ident = match open_type {
+            OpenType::Peptide => self.peptide_for_tools().map(|mol| mol.common.ident.clone()),
+            OpenType::Ligand | OpenType::Pocket | OpenType::NucleicAcid | OpenType::Lipid => {
+                self.active_mol().map(|m| m.common().ident.clone())
+            }
+            _ => None,
+        };
+
+        self.update_history(path, open_type, ident);
+        // Save the open history.
+        self.update_save_prefs();
+
+        Ok(())
+    }
+
+    /// Load Mol2 and optionally, FRCMOD data from our Amber Geostd database into state.
+    pub fn load_geostd_mol_data(
+        &mut self,
+        ident: &str,
+        load_mol2: bool,
+        load_frcmod: bool,
+        engine_updates: &mut EngineUpdates,
+        scene: &mut Scene,
+    ) {
+        let start = Instant::now();
+        println!("Loading mol files from Amber Geostd...");
+
+        let ident = ident.trim().to_owned();
+        download_mols::load_geostd2(self, scene, &ident, load_mol2, load_frcmod, engine_updates);
+
+        let elapsed = start.elapsed().as_millis();
+        println!("Loaded Amber Geostd in {elapsed:.1}ms");
+    }
+
+    /// Add a history event, or update its timestamp and restor the list.
+    pub fn update_history(&mut self, path: &Path, type_: OpenType, ident: Option<String>) {
+        let mut first_i = None;
+        let mut to_delete = Vec::new();
+
+        for (i, item) in self.to_save.open_history.iter_mut().enumerate() {
+            if item.path == *path {
+                if first_i.is_none() {
+                    item.last_session = true;
+                    item.timestamp = Utc::now();
+                    // The file may hold a different molecule now, e.g. one rewritten by the editor.
+                    if ident.is_some() {
+                        item.ident = ident.clone();
+                    }
+                    first_i = Some(i);
+                }
+                to_delete.push(i);
+            }
+        }
+
+        to_delete.sort_unstable_by(|a, b| b.cmp(a));
+
+        let mut moved_item = None;
+        for i in to_delete {
+            let item = self.to_save.open_history.remove(i);
+            if Some(i) == first_i {
+                moved_item = Some(item);
+            }
+        }
+
+        if let Some(item) = moved_item {
+            self.to_save.open_history.push(item);
+        } else {
+            self.to_save
+                .open_history
+                .push(OpenHistory::new(path, type_, ident));
+        }
+    }
+
+    /// This is a central point for loading a molecule into state. It handles the cases
+    /// of loading from file, and online sources. All cases of opening a molecule pass through this.
+    ///
+    /// It centralizes steps that should be completed upon molecule open, and attempts to consolidate
+    /// between different molecule types.
+    pub fn load_mol_to_state(
+        &mut self,
+        mol: MoleculeGeneric,
+        scene: &mut Scene,
+        updates: &mut EngineUpdates,
+        path: Option<&Path>,
+    ) {
+        self.load_mol_to_state_inner(mol, scene, updates, path, true, false);
+    }
+
+    /// Like [`Self::load_mol_to_state`], but leaves a small molecule where it is instead of moving
+    /// it in front of the camera. E.g. for a ligand detached from a protein.
+    pub fn load_mol_to_state_in_place(
+        &mut self,
+        mol: MoleculeGeneric,
+        scene: &mut Scene,
+        updates: &mut EngineUpdates,
+    ) {
+        self.load_mol_to_state_inner(mol, scene, updates, None, true, true);
+    }
+
+    /// Add a molecule parsed by the startup worker without repeatedly rebuilding all render
+    /// entities or rewriting preferences. Session restoration performs those operations once,
+    /// after every streamed item has been applied.
+    pub(crate) fn restore_mol_to_state(
+        &mut self,
+        mol: MoleculeGeneric,
+        scene: &mut Scene,
+        updates: &mut EngineUpdates,
+        path: &Path,
+    ) {
+        self.load_mol_to_state_inner(mol, scene, updates, Some(path), false, false);
+    }
+
+    fn load_mol_to_state_inner(
+        &mut self,
+        mut mol: MoleculeGeneric,
+        scene: &mut Scene,
+        updates: &mut EngineUpdates,
+        path: Option<&Path>,
+        draw_now: bool,
+        keep_posit: bool,
+    ) {
+        if let Some(path) = path {
+            mol.common_mut().update_path(path);
+        }
+
+        let mol_type = mol.mol_type();
+
+        let entity_class = mol_type.entity_type() as u32;
+        let open_type = mol_type.to_open_type();
+
+        // The pre-push index.
+        let mol_i = match mol_type {
+            MolType::Peptide => self.peptides.len(),
+            MolType::Ligand => self.ligands.len(),
+            MolType::NucleicAcid => self.nucleic_acids.len(),
+            MolType::Lipid => self.lipids.len(),
+            MolType::Pocket => self.pockets.len(),
+            MolType::Water => unreachable!(),
+        };
+
+        let (ident, centroid) = match mol {
+            MoleculeGeneric::Peptide(m) => {
+                // Shared fn, as this is shared with loading mol from RCSB.
+                load_peptide(self, scene, m, updates, draw_now)
+            }
+            MoleculeGeneric::Small(mut mol) => {
+                // Before adding hydrogens: they're placed in 3D, even around flat atoms.
+                mol.common.is_2d = mol.common.posits_are_2d();
+
+                // Some 2D Molfiles include only stereochemical hydrogens. GAFF2 typing
+                // needs the remaining H atoms too, or e.g. an alkene CH looks like c1.
+                let has_hydrogens = mol
+                    .common
+                    .atoms
+                    .iter()
+                    .any(|a| a.element == Element::Hydrogen);
+                // Use carbon as the signal for partial hydrogenation: neutral-valence
+                // deficits on heteroatoms alone can instead represent charged centres.
+                let missing_carbon_h = mol.common.atoms.iter().enumerate().any(|(i, a)| {
+                    a.element == Element::Carbon && bonds_avail(i, &mol.common, a.element) > 0
+                });
+
+                if !has_hydrogens || missing_carbon_h {
+                    println!(
+                        "Small molecule {} missing hydrogens; adding.",
+                        mol.common.ident
+                    );
+                    mol.common.populate_hydrogens()
+                }
+
+                if !keep_posit {
+                    place_mol_in_view(&mut mol.common, self, &scene.camera);
+                }
+
+                if let Some(p) = &self.ff_param_set.amber().unwrap().small_mol {
+                    if self.force_fields.family == dynamics::ForceFieldFamily::Amber {
+                        mol.update_ff_related(&mut self.mol_specific_params, p, false);
+                    }
+
+                    mol.update_aux(
+                        &self.to_save.pubchem_properties_map,
+                        &mut self.volatile.thread_receivers.pubchem_properties_avail,
+                        self.ff_param_set
+                            .amber()
+                            .unwrap()
+                            .small_mol
+                            .as_ref()
+                            .unwrap(),
+                    );
+
+                    #[cfg(feature = "adme")]
+                    spawn_therapeutic_inference(
+                        &mol,
+                        &mut self.volatile.inference_models,
+                        self.ff_param_set
+                            .amber()
+                            .unwrap()
+                            .small_mol
+                            .as_ref()
+                            .unwrap(),
+                        &mut self.volatile.thread_receivers.therapeutic_properties_avail,
+                        mol_i,
+                    );
+                } else {
+                    handle_err(
+                        &mut self.ui,
+                        "Error: Unable to update a molecule's params due to missing GAFF2."
+                            .to_string(),
+                    )
+                }
+
+                let centroid = mol.common.centroid();
+                let ident = mol.common.ident.clone();
+
+                if let Some(p) = &mut mol.pharmacophore.pocket {
+                    // Slot offset: standalone pockets occupy 0..pockets.len(),
+                    // ligand pharmacophore pockets start immediately after.
+                    p.mesh_i_rel = self.pockets.len() + self.ligands.len();
+                    p.regen_mesh_vol(&mut scene.meshes, updates);
+                }
+
+                self.ligands.push(mol);
+
+                if draw_now {
+                    draw_all_ligs(self, scene, updates);
+                }
+
+                (ident, centroid)
+            }
+            MoleculeGeneric::NucleicAcid(mut mol) => {
+                place_mol_in_view(&mut mol.common, self, &scene.camera);
+
+                let centroid = mol.common.centroid();
+                let ident = mol.common.ident.clone();
+
+                self.nucleic_acids.push(mol);
+
+                if draw_now {
+                    draw_all_nucleic_acids(self, scene, updates);
+                }
+
+                (ident, centroid)
+            }
+            MoleculeGeneric::Lipid(mut mol) => {
+                place_mol_in_view(&mut mol.common, self, &scene.camera);
+
+                let centroid = mol.common.centroid();
+                let ident = mol.common.ident.clone();
+
+                self.lipids.push(mol);
+
+                // if let Some(ref mut s) = scene {
+                //     draw_all_lipids(self, s);
+                if draw_now {
+                    draw_all_lipids(self, scene, updates);
+                }
+                // }
+
+                (ident, centroid)
+            }
+            MoleculeGeneric::Pocket(mut mol) => {
+                place_mol_in_view(&mut mol.common, self, &scene.camera);
+
+                let centroid = mol.common.centroid();
+                let ident = mol.common.ident.clone();
+
+                mol.mesh_i_rel = self.pockets.len();
+                mol.reset_post_manip(&mut scene.meshes, self.ui.mesh_coloring, updates);
+
+                self.pockets.push(mol);
+
+                // todo temp to ts
+                let pocket = &self.pockets[self.pockets.len() - 1];
+                println!(
+                    "Pocket atom posit: {} atom_posits: {}, mesh: {:?}, spheres: {}",
+                    pocket.common.atoms[0].posit,
+                    pocket.common.atom_posits[0],
+                    pocket.surface_mesh.vertices[0].position,
+                    pocket.volume.spheres[0].center
+                );
+
+                if draw_now {
+                    draw_all_pockets(self, scene, updates);
+                }
+
+                (ident, centroid)
+            }
+        };
+
+        if draw_now {
+            updates.entities.push_class(entity_class);
+        }
+
+        self.volatile.active_mol = Some((mol_type, mol_i));
+        if mol_type == MolType::Peptide {
+            self.volatile.active_peptide = Some(mol_i);
+        }
+        self.volatile.orbit_center = Some((mol_type, mol_i));
+
+        if let ControlScheme::Arc { center } = &mut scene.input_settings.control_scheme {
+            *center = centroid.into();
+        }
+
+        // Show the new molecule. Not for one split off in place, which is already in view, or
+        // for session restoration, which frames the whole session once done.
+        if draw_now && !keep_posit {
+            cam::frame_mol(self, scene, (mol_type, mol_i), updates);
+        }
+
+        cam::set_fog(self, &mut scene.camera);
+
+        if mol_type == MolType::Peptide {
+            // Prevents an old peptide-relative selection from being applied to the new active peptide.
+            if matches!(
+                self.ui.selection,
+                Selection::AtomPeptide(_)
+                    | Selection::AtomsPeptide(_)
+                    | Selection::BondPeptide(_)
+                    | Selection::Residue(_)
+                    | Selection::Residues(_)
+            ) {
+                self.ui.selection = Selection::None;
+            }
+
+            let mut pending_data = None;
+            if let Some(mol) = self.peptides.get_mut(mol_i) {
+                // Only after updating from prefs (to prevent unnecessary loading) do we update data avail.
+                mol.updates_rcsb_data(&mut pending_data);
+            }
+            if let Some(rx) = pending_data {
+                self.volatile
+                    .thread_receivers
+                    .mol_pending_data_avail
+                    .push((mol_i, rx));
+            }
+        }
+
+        if draw_now {
+            if let Some(p) = path {
+                self.update_history(p, open_type, Some(ident.clone()));
+            }
+
+            // Save the open history.
+            self.update_save_prefs();
+
+            // Now, save prefs: This is to save last opened. Note that anomalies happen
+            // if we update the molecule here, e.g. with docking site posit.
+            self.update_save_prefs_no_mol();
+        }
+
+        if draw_now {
+            self.volatile.flags.new_mol_loaded = true;
+        }
+
+        // Note: This may be overwritten by `load_file` with the full file path.
+        if draw_now {
+            handle_success(&mut self.ui, format!("Loaded molecule {ident}"));
+        }
+    }
+}
+
+/// The directory holding the `gemmi` executable, which opens structure-factor mmCIF and MTZ files.
+/// Installed from the Tools panel, like other external tools.
+pub fn gemmi_dir() -> io::Result<PathBuf> {
+    let exe = find_executable(Tool::Gemmi)?;
+
+    exe.parent().map(Path::to_path_buf).ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::NotFound,
+            format!("{} has no parent directory", exe.display()),
+        )
+    })
+}
+
+/// Save a molecule to disk, prompting for a location.
+///
+/// A free function rather than a method on `MoleculeCommon`: the type is defined in `mol_defs`, and
+/// the file dialog is ours.
+pub fn save_mol(
+    mol: &MoleculeCommon,
+    mol_type: MolType,
+    dialog: &mut FileDialog,
+) -> io::Result<()> {
+    let fname_default = {
+        let name = if mol.ident.is_empty() {
+            "molecule".to_string()
+        } else {
+            mol.ident.clone()
+        };
+        format!("{name}.{}", mol_type.default_file_ext())
+    };
+
+    dialog.config_mut().default_file_name = fname_default.to_string();
+    dialog.config_mut().default_file_filter = Some("Molecule (small)".to_owned());
+
+    dialog.save_file();
+
+    Ok(())
+}
+
+/// Convert a `ViewerMolSet` to a `Gro` and write it to `path`.
+/// Positions stored in the mol set are in Å; GRO requires nm, so we divide by 10.
+pub fn save_mol_set_as_gro(
+    mol_set: &crate::md::viewer::ViewerMolSet,
+    path: &Path,
+) -> io::Result<()> {
+    fn gro_name(name: &str) -> String {
+        name.chars()
+            .take(5)
+            .map(|c| if c.is_ascii() { c } else { '_' })
+            .collect()
+    }
+
+    const ANGSTROM_TO_NM: f64 = 0.1;
+
+    let mut atoms: Vec<AtomGro> = Vec::new();
+    let mut serial = 1;
+
+    for (mol_i, mol) in mol_set.mols.iter().enumerate() {
+        let mol_id = (mol_i + 1) as u32;
+
+        for (atom_i, atom) in mol.mol.atoms.iter().enumerate() {
+            let posit = mol.mol.atom_posits[atom_i];
+
+            let atom_type = atom
+                .type_in_res_general
+                .clone()
+                .unwrap_or_else(|| atom.element.to_letter().to_string());
+
+            atoms.push(AtomGro {
+                mol_id,
+                mol_name: gro_name(&mol.mol.ident),
+                element: atom.element,
+                atom_type: gro_name(&atom_type),
+                serial_number: serial,
+                posit: posit * ANGSTROM_TO_NM,
+                velocity: None,
+            });
+            serial += 1;
+        }
+    }
+
+    Gro {
+        atoms,
+        head_text: "Generated by Bio Files".to_owned(),
+        box_vec: lin_alg::f64::Vec3::default(),
+    }
+    .save(path)
+}
+
+/// Save Snapshots (a MD trajectory) to disk.
+pub fn save_trajectory(dialog: &mut FileDialog) -> io::Result<()> {
+    let fname_default = {
+        let ext_default = "dcd";
+
+        let name = "molchanica_traj".to_string();
+        format!("{name}.{ext_default}")
+    };
+
+    dialog.config_mut().default_file_name = fname_default.to_string();
+    dialog.config_mut().default_file_filter = Some("DCD (trajectory)".to_owned());
+
+    dialog.save_file();
+
+    Ok(())
+}
+
+pub struct FileDialogs {
+    pub load: FileDialog,
+    pub save: FileDialog,
+    pub project_load: FileDialog,
+    pub project_save: FileDialog,
+    /// This is for selecting a folder containing molecule files. This is for workflows that don't involve
+    /// a database. Note: Currently unused and being deprecated in favor of databases (e.g. Parquet)
+    pub screening: FileDialog,
+    /// Creating and updating Parquet molecule databases.
+    pub parquet_db_load: FileDialog,
+    pub parquet_db_save: FileDialog,
+    pub parquet_mols_dir: FileDialog,
+    /// Adding a single molecule file (SDF or Mol2) to a Parquet database.
+    pub parquet_mol_file: FileDialog,
+    /// E.g. GROMACS files ready to be run in a sim. (.top, .mdp, .gro); choose a folder to save these in.
+    pub save_md: FileDialog,
+    pub open_md_run: FileDialog,
+    pub open_gromacs: FileDialog,
+    pub gromacs_file: Option<crate::gromacs::InputFile>,
+    /// Save an MD mol set as a GRO file.
+    pub save_gro: FileDialog,
+    /// Index of the mol set queued for GRO export.
+    pub save_gro_mol_set_i: Option<usize>,
+    /// Save a sequence as FASTA, GenBank, or SnapGene.
+    pub save_seq: FileDialog,
+    /// Index into `State::sequences` of the sequence queued for saving.
+    pub save_seq_i: Option<usize>,
+    /// Loading or saving general force field parameters. Configured for the parameter set each
+    /// time it opens; see `ui::popup::ff_params`.
+    pub ff_params: FileDialog,
+    pub ff_params_op: Option<ff_params::ParamsFileOp>,
+}
+
+impl Default for FileDialogs {
+    fn default() -> Self {
+        let parquet_descrip = "Parquet mol DB".to_owned();
+
+        let mut exts_all = vec![
+            "mcproj", "cif", "mol", "mol2", "sdf", "xyz", "pdbqt", "gro", "map", "mtz", "frcmod",
+            "dat", "prmtop", "pmp", "parquet", "trr", "xtc", "dcd", "mdp",
+        ];
+        exts_all.extend(sequence::seq_exts_open());
+
+        let cfg_all = FileDialogConfig::default()
+            .add_file_filter_extensions("Molchanica project", vec!["mcproj"])
+            .add_file_filter_extensions("All", exts_all)
+            .add_file_filter_extensions(
+                "Molecule (small)",
+                vec!["mol", "mol2", "sdf", "xyz", "pdbqt", "prmtop"],
+            )
+            .add_file_filter_extensions("GROMACS molecule input", vec!["gro"])
+            .add_file_filter_extensions("Protein (CIF)", vec!["cif"])
+            .add_file_filter_extensions("Density", vec!["map", "mtz", "cif"])
+            .add_file_filter_extensions("Mol dynamics", vec!["frcmod", "dat", "lib", "prmtop"])
+            //
+            .add_file_filter_extensions("TRR (trajectory)", vec!["trr"])
+            .add_file_filter_extensions("XTC (trajectory)", vec!["xtc"])
+            .add_file_filter_extensions("DCD (trajectory)", vec!["dcd"])
+            //
+            .add_file_filter_extensions("PMP (Pharmacophore)", vec!["pmp"])
+            .add_file_filter_extensions(&parquet_descrip, vec!["parquet"])
+            .add_file_filter_extensions("MDP (MD params)", vec!["mdp"])
+            .add_file_filter_extensions(
+                "Sequence (FASTA, GenBank, SnapGene, AB1)",
+                sequence::seq_exts_open(),
+            )
+            //
+            .add_save_extension("Protein (CIF)", "cif")
+            .add_save_extension("Mol2", "mol2")
+            .add_save_extension("SDF", "sdf")
+            .add_save_extension("XYZ", "xyz")
+            .add_save_extension("Pdbqt", "pdbqt")
+            .add_save_extension("GRO", "gro")
+            .add_save_extension("Map", "map")
+            .add_save_extension("MTZ", "mtz")
+            .add_save_extension("Prmtop", "prmtop")
+            //
+            .add_save_extension("TRR", "trr")
+            .add_save_extension("XTC", "xtc")
+            .add_save_extension("DCD", "dcd")
+            .add_save_extension("MDP (MD params)", "mdp")
+            //
+            .add_save_extension("Pharmacophore", "pmp"); // Our own phormacophore format
+
+        let load = FileDialog::with_config(cfg_all.clone()).default_file_filter("All");
+        let save = FileDialog::with_config(cfg_all).default_save_extension("Protein");
+
+        let cfg_screening = FileDialogConfig {
+            title: Some("Select screening folder".to_string()),
+            ..Default::default()
+        };
+
+        let screening = FileDialog::with_config(cfg_screening.clone());
+        let parquet_mols_dir = FileDialog::with_config(cfg_screening);
+
+        let mol_file_descrip = "Molecule (SDF, Mol2)".to_owned();
+
+        let cfg_parquet_mol_file = FileDialogConfig {
+            title: Some("Select a molecule file".to_string()),
+            ..Default::default()
+        }
+        .add_file_filter_extensions(&mol_file_descrip, vec!["sdf", "mol2", "mol"]);
+
+        let parquet_mol_file =
+            FileDialog::with_config(cfg_parquet_mol_file).default_file_filter(&mol_file_descrip);
+
+        let cfg_parquet_db = FileDialogConfig::default()
+            .add_file_filter_extensions(&parquet_descrip, vec!["parquet"])
+            .add_save_extension(&parquet_descrip, "parquet");
+
+        let parquet_db_load =
+            FileDialog::with_config(cfg_parquet_db.clone()).default_file_filter(&parquet_descrip);
+
+        let parquet_db_save =
+            FileDialog::with_config(cfg_parquet_db).default_save_extension(&parquet_descrip);
+
+        let cfg_save_md = FileDialogConfig {
+            title: Some("Select a folder to save MD files".to_string()),
+            ..Default::default()
+        };
+        let save_md = FileDialog::with_config(cfg_save_md.clone());
+
+        let cfg_save_gro = FileDialogConfig::default().add_save_extension("GRO", "gro");
+        let save_gro = FileDialog::with_config(cfg_save_gro).default_save_extension("GRO");
+
+        let cfg_save_seq = FileDialogConfig::default()
+            .add_save_extension("FASTA", "fasta")
+            .add_save_extension("GenBank", "gb")
+            .add_save_extension("SnapGene (DNA)", "dna");
+        let save_seq = FileDialog::with_config(cfg_save_seq).default_save_extension("FASTA");
+
+        Self {
+            load,
+            save,
+            project_load: FileDialog::with_config(
+                FileDialogConfig::default()
+                    .add_file_filter_extensions("Molchanica project", vec!["mcproj"]),
+            ),
+            project_save: FileDialog::with_config(
+                FileDialogConfig::default().add_save_extension("Molchanica project", "mcproj"),
+            )
+            .default_save_extension("Molchanica project"),
+            screening,
+            parquet_db_save,
+            parquet_db_load,
+            parquet_mols_dir,
+            parquet_mol_file,
+            save_md,
+            open_md_run: FileDialog::with_config(FileDialogConfig {
+                title: Some("Open MD run".into()),
+                initial_directory: std::env::current_dir()
+                    .ok()
+                    .map(|dir| dir.join(crate::md::runs::OUTPUT_DIR))
+                    .filter(|dir| dir.is_dir())
+                    .unwrap_or_else(|| FileDialogConfig::default().initial_directory),
+                ..Default::default()
+            }),
+            open_gromacs: FileDialog::new()
+                .add_file_filter_extensions(
+                    "GROMACS inputs",
+                    vec!["mdp", "gro", "top", "itp", "ndx", "cpt", "trr", "tng"],
+                )
+                .add_file_filter_extensions("MDP", vec!["mdp"])
+                .add_file_filter_extensions("GRO", vec!["gro"])
+                .add_file_filter_extensions("TOP", vec!["top"])
+                .add_file_filter_extensions("NDX", vec!["ndx"])
+                .add_file_filter_extensions("CPT / TRR / TNG", vec!["cpt", "trr", "tng"]),
+            gromacs_file: None,
+            save_gro,
+            save_gro_mol_set_i: None,
+            save_seq,
+            save_seq_i: None,
+            ff_params: FileDialog::new(),
+            ff_params_op: None,
+        }
+    }
+}

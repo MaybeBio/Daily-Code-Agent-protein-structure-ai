@@ -1,0 +1,294 @@
+"""Tests for autoregression utilities."""
+
+import chex
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from aminx.run.specs import RunSpecification
+from aminx.utils.autoregression import (
+  ar_mask_from_decoding_order,
+  full_context_ar_mask,
+  generate_ar_mask,
+  generate_wave_ar_mask,
+  resolve_tie_groups,
+)
+from aminx.utils.data_structures import Protein
+from aminx.types.bundles import WaveScheduleBundle
+
+
+def make_input(chain_id, residue_index):
+  """Create a minimal Protein with batch_dim=1 for testing resolve_tie_groups."""
+  n = len(chain_id)
+  return Protein(
+    coordinates=jnp.zeros((1, n, 4, 3)),  # batch_dim=1
+    aatype=jnp.zeros((1, n), dtype=jnp.int32),  # Dummy amino acid types
+    one_hot_sequence=jnp.zeros((1, n, 21), dtype=jnp.float32),  # Dummy one-hot
+    mask=jnp.ones((1, n), dtype=jnp.bool_),
+    chain_index=jnp.array(chain_id, dtype=jnp.int32)[None, :],  # Add batch dim
+    residue_index=jnp.array(residue_index, dtype=jnp.int32)[None, :],  # Add batch dim
+  )
+
+
+def test_resolve_tie_groups_none():
+  """Test resolve_tie_groups with tied_positions=None."""
+  inp = make_input([0, 0, 1], [1, 2, 3])
+  spec = RunSpecification(inputs=["dummy"], tied_positions=None)
+  out = resolve_tie_groups(spec, inp)
+  assert (out == jnp.arange(3)).all()
+
+
+def test_resolve_tie_groups_direct():
+  """Test resolve_tie_groups with tied_positions='direct'."""
+  # N=6, L=3, K=2
+  # Chain IDs [0,0,0, 1,1,1] indicate 2 chains
+  # Mapping [0,0,0, 1,1,1] indicates 2 structures
+  inp = make_input([0, 0, 0, 1, 1, 1], [0, 1, 2, 0, 1, 2])
+  # Add structure mapping: [0,0,0, 1,1,1] for 2 structures
+  inp = inp.replace(mapping=jnp.array([[0, 0, 0, 1, 1, 1]], dtype=jnp.int32))
+  spec = RunSpecification(inputs=["dummy"], tied_positions="direct", pass_mode="inter")
+  out = resolve_tie_groups(spec, inp)
+  assert (out == jnp.array([0, 1, 2, 0, 1, 2])).all()
+
+
+def test_resolve_tie_groups_auto():
+  """Test resolve_tie_groups with tied_positions='auto'."""
+  inp = make_input([0, 0, 1, 1], [0, 1, 0, 1])
+  spec = RunSpecification(inputs=["dummy"], tied_positions="auto", pass_mode="inter")
+  # structure_mappings: seq_pos 0 -> [0,2], seq_pos 1 -> [1,3]
+  structure_mappings = [[0, 2], [1, 3]]
+  out = resolve_tie_groups(spec, inp, structure_mappings)
+  # Should assign same group to 0,2 and to 1,3
+  assert out[0] == out[2]
+  assert out[1] == out[3]
+  assert len(jnp.unique(out)) == 2  # noqa: PLR2004
+
+
+def test_resolve_tie_groups_explicit():
+  """Test resolve_tie_groups with explicit tied positions."""
+  inp = make_input([10000, 10001, 10000, 10001], [5, 10, 6, 11])
+  spec = RunSpecification(inputs=["dummy"], tied_positions=[[(10000, 5), (10001, 10)]])
+  out = resolve_tie_groups(spec, inp)
+  chain_ids = inp.chain_index[0]
+  residue_indices = inp.residue_index[0]
+  idx0 = jnp.where((chain_ids == 10000) & (residue_indices == 5))[0][0]  # noqa: PLR2004
+  idx1 = jnp.where((chain_ids == 10001) & (residue_indices == 10))[0][0]  # noqa: PLR2004
+  assert out[idx0] == out[idx1]
+  # The other indices should be in different groups
+  assert len(jnp.unique(out)) == 3  # noqa: PLR2004
+
+
+@pytest.mark.parametrize(
+    "decoding_order, expected_mask",
+    [
+        # Diagonals are 0: no position reads its own slot.
+        # Defect 9 retired the rank-vs-order split hazard: `decoding_order` is consistently
+        # an ORDER array (`decoding_order[t]` is the position decoded at step t).
+        # For [0, 1, 2]: pos 0 decodes first, pos 1 second (sees pos 0), pos 2 last (sees both).
+        (
+            jnp.array([0, 1, 2]),
+            jnp.array([[0, 0, 0], [1, 0, 0], [1, 1, 0]], dtype=jnp.int8),
+        ),
+        # For [2, 0, 1]: step 0 decodes pos 2, step 1 decodes pos 0 (sees pos 2),
+        # step 2 decodes pos 1 (sees pos 2 and pos 0).
+        (
+            jnp.array([2, 0, 1]),
+            jnp.array([[0, 0, 1], [1, 0, 1], [0, 0, 0]], dtype=jnp.int8),
+        ),
+        # For [1, 2, 0]: step 0 decodes pos 1, step 1 decodes pos 2 (sees pos 1),
+        # step 2 decodes pos 0 (sees pos 1 and pos 2).
+        (
+            jnp.array([1, 2, 0]),
+            jnp.array([[0, 1, 1], [0, 0, 0], [0, 1, 0]], dtype=jnp.int8),
+        ),
+    ],
+)
+def test_generate_ar_mask(decoding_order, expected_mask):
+    """Test the generation of the autoregressive mask.
+
+    Args:
+        decoding_order: The order in which atoms are decoded.
+        expected_mask: The expected autoregressive mask.
+
+    Raises:
+        AssertionError: If the output does not match the expected value.
+
+    """
+    mask = generate_ar_mask(order=decoding_order)
+    chex.assert_trees_all_equal(mask, expected_mask)
+    chex.assert_shape(mask, (len(decoding_order), len(decoding_order)))
+    chex.assert_type(mask, jnp.int8)
+
+
+def test_generate_wave_ar_mask_matches_generate_ar_mask_for_g1_schedules():
+  """G=1 schedules (from_tie_groups) must reduce exactly to generate_ar_mask's semantics."""
+  tie_group_map = jnp.array([0, 0, 1, 2, 3, 3, 4, 5], dtype=jnp.int32)
+  decoding_order = jnp.array([6, 0, 1, 4, 2, 7, 3, 5], dtype=jnp.int32)
+  wave = WaveScheduleBundle.from_tie_groups(tie_group_map, decoding_order)
+  new_mask = generate_wave_ar_mask(wave, tie_group_map)
+  old_mask = generate_ar_mask(order=decoding_order, tie_group_map=tie_group_map)
+  chex.assert_trees_all_equal(new_mask, old_mask)
+
+
+def test_generate_wave_ar_mask_partial_schedule_does_not_leak_omitted_positions():
+  """A *partial* decoding order (some positions never assigned a wave) must not make
+  the omitted positions falsely visible to real (scheduled) positions.
+
+  Regression test: the wave-index sentinel for "never scheduled" was originally -1,
+  which is *smaller* than every real wave index, so `earlier_wave = pos_wave_index[i]
+  > pos_wave_index[j]` made every omitted position `j` look earlier than everything
+  real -- silently leaking its (never-decoded, all-zero) value as false context.
+  Caught empirically: truncating a sequential reference schedule to only the positions
+  that matter changed the sampled output relative to the full schedule.
+  """
+  tie_group_map = jnp.arange(6, dtype=jnp.int32)
+  partial_order = jnp.array([0, 1, 2], dtype=jnp.int32)  # positions 3, 4, 5 never scheduled
+  wave = WaveScheduleBundle.from_tie_groups(tie_group_map, partial_order)
+  mask = generate_wave_ar_mask(wave, tie_group_map)
+
+  # Real, scheduled position 2 (wave index 2, the last real wave) must not see any
+  # omitted position as "earlier" -- omitted positions were never decoded.
+  chex.assert_trees_all_equal(mask[2, 3:6], jnp.zeros(3))
+  # And the omitted positions must not be treated as visible to earlier real waves either.
+  chex.assert_trees_all_equal(mask[0, 3:6], jnp.zeros(3))
+  chex.assert_trees_all_equal(mask[1, 3:6], jnp.zeros(3))
+  # Real positions still see each other exactly as a normal sequential schedule would.
+  # k=-1: STRICTLY lower-triangular, since as of 2026-08-27 no position reads its own slot.
+  # The leak this test guards is unrelated to the diagonal and is unaffected by that change.
+  chex.assert_trees_all_equal(mask[:3, :3], jnp.tril(jnp.ones((3, 3)), k=-1))
+
+
+def test_generate_wave_ar_mask_padding_tolerant():
+  """pad_bundle-style zero-padded waves (group_valid=False) must not perturb the mask."""
+  tie_group_map = jnp.array([0, 0, 1, 2, 3, 3, 4, 5], dtype=jnp.int32)
+  decoding_order = jnp.array([6, 0, 1, 4, 2, 7, 3, 5], dtype=jnp.int32)
+  wave = WaveScheduleBundle.from_tie_groups(tie_group_map, decoding_order)
+  unpadded_mask = generate_wave_ar_mask(wave, tie_group_map)
+
+  padded_wave = WaveScheduleBundle(
+    group_ids=jnp.pad(wave.group_ids, ((0, 2), (0, 0))),
+    group_positions=jnp.pad(wave.group_positions, ((0, 2), (0, 0), (0, 0))),
+    group_valid=jnp.pad(wave.group_valid, ((0, 2), (0, 0))),
+    position_valid=jnp.pad(wave.position_valid, ((0, 2), (0, 0), (0, 0))),
+  )
+  padded_mask = generate_wave_ar_mask(padded_wave, tie_group_map)
+  chex.assert_trees_all_equal(padded_mask, unpadded_mask)
+
+
+# --------------------------------------------------------------------------------------
+# Jaxpr walker for the sort-free guard below. The tied-branch sort tests that used to sit
+# here reimplemented a formula that no longer exists in production (Defect 9 removed the
+# sort), so they guarded nothing and were deleted rather than reworded.
+# --------------------------------------------------------------------------------------
+
+
+def _walk_eqns(jaxpr):
+  """Every equation in `jaxpr`, descending into sub-jaxprs (cond/scan/pjit bodies)."""
+  from jax.extend.core import ClosedJaxpr, Jaxpr
+
+  for eqn in jaxpr.eqns:
+    yield eqn
+    for value in eqn.params.values():
+      candidates = value if isinstance(value, (tuple, list)) else [value]
+      for candidate in candidates:
+        if isinstance(candidate, ClosedJaxpr):
+          yield from _walk_eqns(candidate.jaxpr)
+        elif isinstance(candidate, Jaxpr):
+          yield from _walk_eqns(candidate)
+
+
+def test_generate_ar_mask_traces_no_sort() -> None:
+  """generate_ar_mask's mask path traces NO sort primitive, tied or untied.
+
+  The mask is built by scatter (``.at[].min`` / ``.at[].set``) over the wave schedule, not by
+  sorting, so there is no sort whose stability could differ between XLA and IREE. This
+  recurses into every nested jaxpr (the ``jit`` wrapper, custom-jvp and ``cond`` bodies) so
+  a sort hidden inside a sub-computation is still seen. A future sort on this path must be
+  justified against the export stability rule and this test updated with it.
+
+  Non-vacuity: the traced program must contain a scatter, the primitive the mask is built
+  with. Without that, an empty sort list would prove nothing.
+  """
+  length = 8
+  decoding_order = jnp.arange(length, dtype=jnp.int32)
+  # Two real multi-member groups plus singletons, so the tied path is exercised.
+  tie_group_map = jnp.array([0, 0, 2, 3, 3, 5, 6, 7], dtype=jnp.int32)
+
+  jaxpr = jax.make_jaxpr(
+    lambda order, ties: generate_ar_mask(order=order, tie_group_map=ties),
+  )(decoding_order, tie_group_map)
+
+  eqns = list(_walk_eqns(jaxpr.jaxpr))
+  primitive_names = {str(eqn.primitive) for eqn in eqns}
+  assert any("scatter" in name for name in primitive_names), (
+    f"no scatter primitive traced (saw {sorted(primitive_names)}); this test would be vacuous"
+  )
+  sorts = [eqn for eqn in eqns if str(eqn.primitive) == "sort"]
+  assert not sorts, (
+    f"generate_ar_mask's mask path traced {len(sorts)} sort primitive(s); it must stay "
+    "sort-free so no stable-vs-unstable tie order can reach the exported graph"
+  )
+
+
+def _brute_force_mask(order: np.ndarray, tie: np.ndarray) -> np.ndarray:
+  """Independent NumPy reference: i sees j iff j's decode wave is earlier than i's, or they
+  share a tie group; a group decodes at the step of its earliest member; diagonal is 0."""
+  length = order.shape[0]
+  step = np.empty(length, dtype=np.int64)
+  step[order] = np.arange(length)
+  first_step = {g: step[tie == g].min() for g in np.unique(tie)}
+  wave = np.array([first_step[tie[i]] for i in range(length)])
+  mask = np.zeros((length, length), dtype=np.float32)
+  for i in range(length):
+    for j in range(length):
+      if i == j:
+        continue
+      if wave[i] > wave[j] or tie[i] == tie[j]:
+        mask[i, j] = 1.0
+  return mask
+
+
+@pytest.mark.parametrize("length", [5, 8])
+def test_generate_ar_mask_matches_brute_force_for_random_orders(length: int) -> None:
+  """Random (non-involution) ORDER arrays, untied and tied, against an independent reference.
+
+  Before Defect 9 the untied branch read its argument as a RANK array, so for any
+  non-identity permutation this mask was the mask of the inverse order. This test fails
+  on that code and passes on the ORDER contract.
+  """
+  rng = np.random.default_rng(7 + length)
+  for _ in range(6):
+    order = rng.permutation(length).astype(np.int32)
+    untied = np.asarray(generate_ar_mask(order=jnp.asarray(order)))
+    np.testing.assert_array_equal(untied, _brute_force_mask(order, np.arange(length)))
+
+    tie = rng.integers(0, 3, size=length).astype(np.int32)
+    tied = np.asarray(generate_ar_mask(order=jnp.asarray(order), tie_group_map=jnp.asarray(tie)))
+    np.testing.assert_array_equal(tied, _brute_force_mask(order, tie))
+
+
+def test_generate_ar_mask_equals_ar_mask_from_decoding_order() -> None:
+  """generate_ar_mask (no chain_idx) and ar_mask_from_decoding_order are one function now."""
+  order = jnp.asarray([3, 1, 0, 2, 4], dtype=jnp.int32)
+  ties = jnp.asarray([0, 1, 0, 2, 2], dtype=jnp.int32)
+  np.testing.assert_array_equal(
+    np.asarray(generate_ar_mask(order=order)), np.asarray(ar_mask_from_decoding_order(order))
+  )
+  np.testing.assert_array_equal(
+    np.asarray(generate_ar_mask(order=order, tie_group_map=ties)),
+    np.asarray(ar_mask_from_decoding_order(order, ties)),
+  )
+
+
+def test_all_mask_helpers_return_int8() -> None:
+  """Pin the contract: all mask helpers return int8."""
+  order = jnp.array([2, 0, 1], dtype=jnp.int32)
+  tie = jnp.array([0, 1, 0], dtype=jnp.int32)
+  wave = WaveScheduleBundle.from_decoding_order(order, tie)
+
+  assert generate_ar_mask(order=order).dtype == jnp.int8
+  assert generate_ar_mask(order=order, tie_group_map=tie).dtype == jnp.int8
+  assert ar_mask_from_decoding_order(order, tie_group_map=tie).dtype == jnp.int8
+  assert generate_wave_ar_mask(wave, tie).dtype == jnp.int8
+  assert full_context_ar_mask(3).dtype == jnp.int8

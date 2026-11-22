@@ -1,0 +1,43 @@
+"""Keep raw SDF record identities even when the native parser yields no molecule."""
+
+import re
+from io import BytesIO
+from itertools import islice
+
+RECORD_END = re.compile(rb"(?:^|(?<=[\r\n]))[ \t\v\f]*\$\$\$\$[ \t\v\f]*(?:\r\n|\r|\n|$)")
+
+
+def iter_records(raw):
+    """Yield original record bytes without materializing the remaining records."""
+    if not raw or len(raw) > 25 * 1024**2:
+        raise ValueError("Choose a nonempty SDF file no larger than 25 MiB.")
+    start = 0
+    for delimiter in RECORD_END.finditer(raw):
+        yield raw[start : delimiter.start()]
+        start = delimiter.end()
+    tail = raw[start:]
+    if tail.strip():
+        yield tail
+
+
+def split_records(raw):
+    blocks = list(islice(iter_records(raw), 501))
+    if not 1 <= len(blocks) <= 500:
+        raise ValueError("Split this SDF into one to 500 input records.")
+    return blocks
+
+
+def read_records(raw):
+    from rdkit import Chem
+
+    molecules = []
+    for block in split_records(raw):
+        # A single detail record can end at EOF. Framing affects parser input only;
+        # source bytes/digest remain untouched and full SD properties are retained.
+        records = list(
+            Chem.ForwardSDMolSupplier(
+                BytesIO(block + b"\n$$$$\n"), removeHs=False, strictParsing=True
+            )
+        )
+        molecules.append(records[0] if len(records) == 1 else None)
+    return molecules

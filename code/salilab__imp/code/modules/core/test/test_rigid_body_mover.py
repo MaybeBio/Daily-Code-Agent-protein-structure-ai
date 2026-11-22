@@ -1,0 +1,213 @@
+import IMP.test
+import IMP.core
+import IMP.atom
+import IMP.algebra
+import pickle
+from math import sqrt, acos
+try:
+    import jax
+    import jax.random
+    import IMP.jax
+except ImportError:
+    jax = None
+
+
+def get_axis_and_angle(q):
+    angle = 2 * acos(q[0])
+    if angle != 0:
+        x = q[1] / sqrt(1-q[0]*q[0])
+        y = q[2] / sqrt(1-q[0]*q[0])
+        z = q[3] / sqrt(1-q[0]*q[0])
+        return (angle,(x,y,z))
+    else:
+        return (0,None)
+
+
+def make_system():
+    m = IMP.Model()
+    mol = IMP.atom.Hierarchy(IMP.Particle(m))
+    for c in [(100, 100, 100), (5, 100, 100), (10, 5, 100)]:
+        p = IMP.Particle(m)
+        dr = IMP.core.XYZR.setup_particle(p)
+        dr.set_coordinates(c)
+        dr.set_radius(1.0)
+        IMP.atom.Mass.setup_particle(p, 1.0)
+        h = IMP.atom.Hierarchy(p)
+        mol.add_child(h)
+    rb = IMP.atom.create_rigid_body(IMP.atom.get_leaves(mol))
+    rb_mover = IMP.core.RigidBodyMover(m, rb, 1.0, 2.0)
+    rb_mover.set_name("foo")
+    return m, rb_mover
+
+
+class Tests(IMP.test.TestCase):
+
+    def test_zeros(self):
+        m = IMP.Model()
+        pi = m.add_particle("p")
+        xyzr = IMP.core.XYZR.setup_particle(m, pi)
+        rb = IMP.core.RigidBody.setup_particle(
+            m, pi, IMP.algebra.ReferenceFrame3D())
+        rb.set_coordinates_are_optimized(True)
+        print("0")
+        rbmt0 = IMP.core.RigidBodyMover(m, pi, 0, 1)
+        self.assertEqual(rbmt0.get_index(), pi)
+        rbmt0.propose()
+        rbmt0.accept()
+        print("1")
+        rbmr0 = IMP.core.RigidBodyMover(m, pi, 1, 0)
+        rbmr0.propose()
+        rbmr0.accept()
+
+    def setup_mv_mover_test(self,trans=None,rot=None):
+        mdl = IMP.Model()
+        mol=IMP.atom.Hierarchy(IMP.Particle(mdl))
+        root=IMP.atom.Hierarchy(IMP.Particle(mdl))
+        root.add_child(mol)
+        ps=[]
+        for c in [(100,100,100),(5,100,100),(10,5,100)]:
+            p=IMP.Particle(mdl)
+            dr=IMP.core.XYZR.setup_particle(p)
+            dr.set_coordinates(c)
+            dr.set_radius(1.0)
+            IMP.atom.Mass.setup_particle(p,1.0)
+            h=IMP.atom.Hierarchy(p)
+            mol.add_child(h)
+            ps.append(p)
+
+        rb = IMP.atom.create_rigid_body(IMP.atom.get_leaves(mol))
+        rb.set_coordinates_are_optimized(True)
+        rb_mover = IMP.core.RigidBodyMover(rb.get_model(),rb,trans,rot)
+
+        ssps = IMP.core.SoftSpherePairScore(1.0)
+        lsa = IMP.container.ListSingletonContainer(mdl)
+        lsa.add(IMP.get_indexes(IMP.atom.get_leaves(root)))
+        rbcpf = IMP.core.RigidClosePairsFinder()
+        cpc = IMP.container.ClosePairContainer(lsa, 0.0, rbcpf, 10.0)
+        evr = IMP.container.PairsRestraint(ssps, cpc)
+
+        sf = IMP.core.RestraintsScoringFunction([evr])
+        mc = IMP.core.MonteCarlo(mdl)
+        mc.set_scoring_function(sf)
+
+        sm = IMP.core.SerialMover([rb_mover])
+        mc.add_mover(sm)
+        mc.set_return_best(False)
+        mc.set_kt(1.0)
+        return mdl, root, mc, rb, rb_mover
+
+    def test_mc_mover_translate(self):
+        mdl,root,mc,rb,_=self.setup_mv_mover_test(1.0,0.0)
+        r0=rb.get_coordinates()
+        rot0=rb.get_rotation()
+        mc.optimize(1)
+        r1=rb.get_coordinates()
+        rot1=rb.get_rotation()
+        transm=(r1-r0).get_magnitude()
+        q=(rot1/rot0).get_quaternion()
+        self.assertAlmostEqual(get_axis_and_angle(q)[0],0.0,places=6)
+        self.assertLessEqual(transm,1.0)
+
+    def test_mc_mover_rotate(self):
+        for i in range(200):
+            mdl,root,mc,rb,_=self.setup_mv_mover_test(0.0,1.0)
+            r0=rb.get_coordinates()
+            rot0=rb.get_rotation()
+            mc.optimize(1)
+            r1=rb.get_coordinates()
+            rot1=rb.get_rotation()
+            transm=(r1-r0).get_magnitude()
+            q=(rot1/rot0).get_quaternion()
+            self.assertLessEqual(abs(get_axis_and_angle(q)[0]),1.0)
+            self.assertAlmostEqual(transm,0.0,places=6)
+
+    def test_mc_mover_rotate_translate(self):
+        mdl,root,mc,rb,_=self.setup_mv_mover_test(1.0,1.0)
+        r0=rb.get_coordinates()
+        rot0=rb.get_rotation()
+        mc.optimize(1)
+        r1=rb.get_coordinates()
+        rot1=rb.get_rotation()
+        transm=(r1-r0).get_magnitude()
+        q=(rot1/rot0).get_quaternion()
+        self.assertLessEqual(abs(get_axis_and_angle(q)[0]),1.0)
+        self.assertLessEqual(transm,1.0)
+
+    def _get_jax_rb_transform(self, jm, body_index):
+        """Convert JAX rigid body transform to IMP coordinates and rotation"""
+        body = jm['rigid_bodies'].bodies[body_index]
+        particle_index = body.particle_index
+        coord = IMP.algebra.Vector3D(jm['xyz'][particle_index])
+        rot = IMP.algebra.Rotation3D(jm['rigid_bodies'].quaternion[body_index])
+        return coord, rot
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_rotate(self):
+        """Test JAX implementation, rotation only"""
+        m, root, mc, rb, rb_mover = self.setup_mv_mover_test(0.0, 1.0)
+        r0 = rb.get_coordinates()
+        rot0 = rb.get_rotation()
+
+        ji = rb_mover._get_jax(space=IMP.jax.FreeSpace)
+        self.assertEqual(ji._keys, frozenset(["rigid_bodies"]))
+        jm = IMP._jax_util._get_jax_model(m, ['rigid_bodies'])
+
+        init_func = jax.jit(ji.init_func)
+        mvs = init_func(jax.random.key(42))
+
+        j = jax.jit(ji.propose_func)
+        new_jm, mvs, ratio = j(jm, mvs)
+        self.assertAlmostEqual(ratio, 1.0, delta=1e-5)
+
+        r1, rot1 = self._get_jax_rb_transform(new_jm, body_index=0)
+        transm = (r1 - r0).get_magnitude()
+        q = (rot1 / rot0).get_quaternion()
+        self.assertLessEqual(abs(get_axis_and_angle(q)[0]), 1.0)
+        self.assertAlmostEqual(transm, 0.0, delta=1e-4)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_translate(self):
+        """Test JAX implementation, translation only"""
+        m, root, mc, rb, rb_mover = self.setup_mv_mover_test(1.0, 0.0)
+        r0 = rb.get_coordinates()
+        rot0 = rb.get_rotation()
+
+        ji = rb_mover._get_jax(space=IMP.jax.FreeSpace)
+        jm = IMP._jax_util._get_jax_model(m, ['rigid_bodies'])
+
+        init_func = jax.jit(ji.init_func)
+        mvs = init_func(jax.random.key(42))
+
+        j = jax.jit(ji.propose_func)
+        new_jm, mvs, ratio = j(jm, mvs)
+        self.assertAlmostEqual(ratio, 1.0, delta=1e-5)
+
+        r1, rot1 = self._get_jax_rb_transform(new_jm, body_index=0)
+        transm = (r1 - r0).get_magnitude()
+        q = (rot1 / rot0).get_quaternion()
+        self.assertAlmostEqual(get_axis_and_angle(q)[0], 0.0, delta=1e-4)
+        self.assertLessEqual(transm, 1.0)
+
+    def test_pickle(self):
+        """Test (un-)pickle of RigidBodyMover"""
+        m, rb_mover = make_system()
+        dump = pickle.dumps(rb_mover)
+
+        newmvr = pickle.loads(dump)
+        self.assertEqual(newmvr.get_name(), "foo")
+        self.assertAlmostEqual(newmvr.get_maximum_translation(),
+                               1.0, delta=1e-5)
+        self.assertAlmostEqual(newmvr.get_maximum_rotation(), 2.0, delta=1e-5)
+
+    def test_pickle_polymorphic(self):
+        """Test (un-)pickle of RigidBodyMover via polymorphic pointer"""
+        m, rb_mover = make_system()
+        sm = IMP.core.SerialMover([rb_mover])
+        dump = pickle.dumps(sm)
+        newsm = pickle.loads(dump)
+        newmvr, = newsm.get_movers()
+        self.assertEqual(newmvr.get_name(), "foo")
+
+
+if __name__ == '__main__':
+    IMP.test.main()

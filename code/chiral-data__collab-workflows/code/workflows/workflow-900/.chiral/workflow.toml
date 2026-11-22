@@ -1,0 +1,2 @@
+name = "Sleep"
+description = "CPU steps for exercising job behaviour: one sleeps for a configurable duration (`sleep_seconds`, default 120s), one prints many lines quickly with optional stderr. Not for main."

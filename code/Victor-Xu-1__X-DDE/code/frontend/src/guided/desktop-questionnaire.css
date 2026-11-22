@@ -1,0 +1,298 @@
+/* Keep the current question and its navigation in separate desktop rows. */
+@media (min-width: 1080px) and (min-height: 620px) {
+  .studio-main:has(
+    > .studio-content
+    > .tool-center.is-input
+    > div:not([hidden])
+    .questionnaire:not(.single-page-task)
+    > fieldset[aria-labelledby]:not([hidden]),
+    > .studio-content > div:not([hidden]) > .prediction-workspace.is-input
+    .input-column:not([hidden]) > div:not([hidden])
+    .questionnaire > fieldset[aria-labelledby]:not([hidden])
+  ) {
+    display: flex;
+    flex-direction: column;
+    block-size: 100dvh;
+
+    > .studio-topbar {
+      flex-shrink: 0;
+    }
+
+    > .studio-content {
+      display: flex;
+      flex: 1 1 0;
+      flex-direction: column;
+      min-block-size: 0;
+      padding-block: 10px 12px;
+    }
+
+    > .studio-content > .module-task-picker {
+      flex-shrink: 0;
+      margin-block-end: 5px;
+    }
+
+    .tool-center.is-input,
+    .tool-center.is-input > div:not([hidden]),
+    .studio-content > div:not([hidden]):has(> .prediction-workspace.is-input),
+    .prediction-workspace.is-input,
+    .prediction-workspace.is-input > .workbench-section,
+    .prediction-workspace.is-input .workbench-columns,
+    .prediction-workspace.is-input .input-column:not([hidden]),
+    .prediction-workspace.is-input .input-column > div:not([hidden]),
+    .prediction-form-body {
+      display: flex;
+      flex: 1 1 0;
+      flex-direction: column;
+      min-block-size: 0;
+    }
+
+    .tool-center.is-input {
+      margin-block: 0;
+    }
+
+    .prediction-workspace.is-input
+      :is(.workspace-mode, .workbench-toolbar, .module-template) {
+      flex-shrink: 0;
+    }
+
+    .prediction-workspace.is-input .workbench-toolbar {
+      min-block-size: 0;
+      margin-block-end: 6px;
+    }
+
+    .prediction-workspace.is-input .workbench-columns {
+      align-items: stretch;
+    }
+
+    .prediction-workspace.is-input .module-template {
+      margin-block: 2px 6px;
+    }
+
+    .tool-center.is-input > .module-template {
+      flex-shrink: 0;
+      margin-block: 3px 6px;
+    }
+
+    .prediction-setup-layout {
+      flex: 1 1 0;
+      grid-template-rows: minmax(0, 1fr);
+      align-items: stretch;
+      min-block-size: 0;
+      margin-block-start: 0;
+    }
+
+    .prediction-setup-layout .prediction-setup {
+      display: flex;
+      flex-direction: column;
+      position: static;
+      min-block-size: 0;
+    }
+
+    :is(.tool-center, .prediction-workspace.is-input) .questionnaire:not(.single-page-task) {
+      display: flex;
+      flex: 1 1 0;
+      flex-direction: column;
+      min-block-size: 0;
+      padding: 0;
+      border-radius: 8px;
+
+      > :is(.questionnaire-steps, .questionnaire-page-heading, .template-step-help) {
+        flex-shrink: 0;
+        margin-block-end: 8px;
+      }
+
+      > .questionnaire-steps {
+        padding-block: 3px 5px;
+      }
+
+      > fieldset[aria-labelledby]:not([hidden]) {
+        flex: 1 1 0;
+        min-block-size: 0;
+        /* Keep absolutely positioned accessible labels inside the scroll pane. */
+        position: relative;
+        overflow: auto;
+        scrollbar-gutter: stable;
+        padding: 4px 4px 8px;
+        margin-block: 0;
+        container-type: size;
+
+        > legend + .structure-workbench {
+          margin-block-start: 0;
+        }
+
+        .structure-workbench:not([data-workspace-expanded], .is-text-only) {
+          grid-template-columns: minmax(0, 1fr) minmax(300px, 35%);
+          gap: 16px;
+        }
+
+        .structure-workbench:not([data-workspace-expanded])
+          > .structure-workbench-view
+          .viewer-panel:not(:popover-open, .pose-comparison .viewer-panel)
+          > .molecular-stage {
+          height: clamp(248px, calc(100cqh - 62px), 590px);
+          min-height: 0;
+        }
+      }
+
+      > .questionnaire-actions {
+        position: static;
+        flex-shrink: 0;
+        margin: 0;
+        padding: 7px 4px 3px;
+        border-radius: 0 0 8px 8px;
+      }
+    }
+
+    .tool-center.is-input .structure-workbench:not([data-workspace-expanded])
+      .surface-region-preview {
+      container: guided-region / inline-size;
+
+      .viewer-panel:not(:popover-open) {
+        --compact-viewer-tools: enabled;
+        padding: 0;
+
+        > :is(.studio-heading, .viewer-mode-options) {
+          margin: 0 0 3px;
+        }
+
+        :is(.viewer-heading-actions, .viewer-mode-options) :is(button, summary) {
+          min-height: 32px;
+        }
+
+        :is(.viewer-heading-actions, .viewer-mode-options) :is(button, .viewer-tool-trigger) {
+          min-width: 32px;
+          padding-inline: 5px;
+        }
+
+        .viewer-tool-content {
+          max-block-size: min(260px, 65cqh);
+        }
+      }
+    }
+
+    @container guided-region (min-width: 450px) {
+      .tool-center.is-input .surface-region-preview
+        .viewer-panel:has(> .viewer-mode-options):not(:popover-open) {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 0 6px;
+        position: relative;
+
+        > * {
+          grid-column: 1 / -1;
+        }
+
+        > .studio-heading {
+          grid-area: 1 / 2;
+          position: static;
+        }
+
+        > .studio-heading > h3 {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          overflow: hidden;
+          clip-path: inset(50%);
+        }
+
+        > .viewer-mode-options {
+          grid-area: 1 / 1;
+          position: static;
+        }
+
+        .viewer-tool-content {
+          inset-block-start: 37px;
+        }
+      }
+    }
+  }
+}
+
+@media (min-width: 1080px) and (620px <= height <= 719px) {
+  .studio-main:has(
+    > .studio-content > .tool-center.is-input .questionnaire > fieldset[aria-labelledby]:not([hidden]),
+    > .studio-content > div:not([hidden]) > .prediction-workspace.is-input
+    .input-column:not([hidden]) > div:not([hidden])
+    .questionnaire > fieldset[aria-labelledby]:not([hidden])
+  ) {
+    > .studio-topbar {
+      min-height: 52px;
+      margin-block: 9px 4px;
+      padding-block: 5px;
+    }
+
+    .studio-content .module-task-picker > label {
+      flex: 1 1 300px;
+    }
+
+    .prediction-workspace.is-input .workflow-options {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .prediction-workspace.is-input .workflow-options label {
+      min-block-size: 0;
+      padding: 9px 10px;
+      border-radius: 8px 8px 0 0;
+      gap: 7px;
+    }
+
+    .prediction-workspace.is-input .workflow-options small {
+      margin-block-start: 3px;
+      line-height: 1.4;
+    }
+
+    .prediction-workspace.is-input .workflow-note {
+      margin: 4px 0 0;
+    }
+
+    .prediction-workspace.is-input .questionnaire > .questionnaire-steps {
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin-block-end: 9px;
+      padding-block: 0 7px;
+    }
+
+    .tool-center .questionnaire > fieldset:not([hidden]):has(
+      > :is(.reference-material, .diff-reference):nth-child(2):nth-last-child(2)
+      + :is(.reference-material, .diff-reference):last-child
+    ) {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-content: start;
+      gap: 12px;
+
+      > .diff-reference {
+        margin: 0;
+        min-width: 0;
+      }
+    }
+
+    .tool-center.is-input .reference-material {
+      margin-block: 4px 10px;
+      border-radius: 10px;
+    }
+
+    .tool-center.is-input .reference-material-heading {
+      min-height: 0;
+      padding: 7px 12px;
+      border-radius: 9px 9px 0 0;
+    }
+
+    .tool-center.is-input .reference-material-body {
+      padding: 10px 12px;
+    }
+
+    .tool-center.is-input .reference-material-body .file-select {
+      min-height: 48px;
+      padding-block: 5px;
+    }
+
+    .tool-center.is-input :where(.questionnaire-choices > label) {
+      border-start-start-radius: 10px;
+      border-start-end-radius: 10px;
+    }
+
+  }
+}

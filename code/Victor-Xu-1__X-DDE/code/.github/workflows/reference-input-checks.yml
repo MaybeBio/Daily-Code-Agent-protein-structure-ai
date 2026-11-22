@@ -1,0 +1,287 @@
+name: Exact research input selection and recovery
+on:
+  workflow_dispatch:
+    inputs:
+      coordinate_confirmation_only:
+        type: boolean
+        default: false
+        description: Check only docking coordinate confirmation while exact material identity resolves; no scientific jobs
+      quality_preview_only:
+        type: boolean
+        default: false
+        description: Recheck only the retained native quality browser after unchanged input gates passed
+  push:
+    paths: &molecular_review_paths
+      - "scripts/material-input-scope.py"
+      - "tests/test_material_input_scope.py"
+      - "server_tests/test_material_sources_browser.py"
+      - "server_tests/test_sequence_material_browser.py"
+      - "server_tests/test_molecular_material_browser.py"
+      - "server_tests/material_capture.py"
+      - ".github/workflows/reference-input-checks.yml"
+      - "frontend/src/diffsbdd/ReferencePicker*"
+      - "frontend/src/diffsbdd/reference-metadata*"
+      - "frontend/src/diffsbdd/useReferenceSelection*"
+      - "frontend/src/diffsbdd/useReferenceHistory*"
+      - "frontend/src/operations/AssetPicker*"
+      - "frontend/src/operations/PropertyForm*"
+      - "frontend/src/operations/ArtifactPicker*"
+      - "frontend/src/operations/ResultTaskSelect*"
+      - "frontend/src/operations/useResultFiles*"
+      - "frontend/src/operations/useResultReuse*"
+      - "frontend/src/operations/result-source.css"
+      - "frontend/src/operations/result-source-labels*"
+      - "frontend/src/api-errors.test.ts"
+      - "frontend/src/api.ts"
+      - "frontend/src/presentation/research-files*"
+      - "src/opendde_workbench/artifacts.py"
+      - "src/opendde_workbench/operation_routes.py"
+      - "src/opendde_workbench/research/outputs.py"
+      - "src/opendde_workbench/research/output_identity.py"
+      - "tests/test_research_assets.py"
+      - "tests/test_result_metadata.py"
+      - "frontend/src/operations/AssetHistorySelect*"
+      - "frontend/src/operations/asset-acceptance*"
+      - "frontend/src/operations/useAssetUpload*"
+      - "frontend/src/operations/useSelectedAsset*"
+      - "frontend/src/research/SequencePicker*"
+      - "frontend/src/research/MaterialInput*"
+      - "frontend/src/research/material-input.css"
+      - "frontend/src/research/SequenceTextInput*"
+      - "frontend/src/research/useSequenceSources*"
+      - "frontend/src/research/useSequenceSave*"
+      - "frontend/src/research/HistoricalFileSelect*"
+      - "frontend/src/research/HistoryFileControls*"
+      - "frontend/src/research/history-file-controls.css"
+      - "frontend/src/research/input-catalog*"
+      - "frontend/src/research/SdfRecordPicker*"
+      - "frontend/src/research/useSdfAsset*"
+      - "frontend/src/integrations/LibraryInput*"
+      # These direct form consumers run in molecule-design-review-checks.yml;
+      # changed shared transports above still run this complete input gate.
+      - "frontend/src/simulations/SimulationForm.tsx"
+      - "frontend/src/diffsbdd/ReferenceFormats*"
+      - "src/opendde_workbench/research/input_catalog.py"
+      - "tests/test_input_catalog.py"
+      - "frontend/src/quality/QualityForm.tsx"
+      - "frontend/src/quality/QualityPreview.tsx"
+      - "frontend/src/quality/QualityMeasurements.tsx"
+      - "frontend/src/quality/QualityResults.tsx"
+      - "frontend/src/quality/quality-results.css"
+      - "frontend/src/quality/tests/QualityForm.test.tsx"
+      - "frontend/src/quality/tests/QualityResults.test.tsx"
+      - "server_tests/test_material_catalog_browser.py"
+      - "server_tests/test_generic_input_browser.py"
+      - "server_tests/test_result_reuse_browser.py"
+      - "server_tests/test_reference_input_browser.py"
+  pull_request:
+    paths: *molecular_review_paths
+permissions:
+  contents: read
+jobs:
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  material-scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      material_only: ${{ steps.scope.outputs.material_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/material-input-scope.py
+  material-inputs:
+    needs: [material-scope, utility-scope]
+    if: needs.utility-scope.outputs.utility_only != 'true' && needs.material-scope.outputs.material_only == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Seal the exact compiled web preview for read-only inspection
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, shutil, subprocess
+          from pathlib import Path
+          root = Path("outputs/material-web-preview")
+          shutil.copytree("src/opendde_workbench/web", root / "web")
+          files = {str(p.relative_to(root / "web")): hashlib.sha256(p.read_bytes()).hexdigest()
+                   for p in sorted((root / "web").rglob("*")) if p.is_file()}
+          source = {"head": os.environ["GITHUB_SHA"], "version": json.loads(Path("frontend/package.json").read_text())["version"],
+                    "frontend_tree": subprocess.check_output(["git", "rev-parse", "HEAD:frontend"], text=True).strip(), "files": files}
+          (root / "source.json").write_text(json.dumps(source, indent=2))
+          PY
+      - name: Source-change regression first; existing direct material contracts
+        working-directory: frontend
+        run: >-
+          npx vitest run src/diffsbdd/ReferencePickerUpload.test.tsx
+          src/diffsbdd/ReferencePicker.test.tsx src/diffsbdd/ReferencePickerLifecycle.test.tsx
+          src/diffsbdd/ReferenceFormats.test.tsx src/research/SdfRecordPicker.test.tsx
+          src/pockets/PocketForm.test.tsx src/docking/DockingForm.test.tsx
+          src/diffsbdd/DiffForm.test.tsx src/proximity/Form.test.tsx
+          src/operations/AssetPicker.test.tsx
+          src/operations/AssetPickerSources.test.tsx
+          src/operations/PropertyFormFileVerification.test.tsx src/operations/PropertyForm.test.tsx
+          src/research/SequencePickerRetention.test.tsx
+          src/research/SequencePicker.test.tsx src/research/useSequenceSave.test.tsx
+          src/antibodies/AntibodyNumberForm.test.tsx src/humanization/HumanizationForm.test.tsx
+          src/operations/useSelectedAsset.test.tsx src/operations/AssetHistorySelect.test.tsx
+          src/operations/ArtifactPicker.test.tsx src/operations/useResultReuse.test.tsx
+          src/integrations/Mol1FeatureInputs.test.tsx src/integrations/BoltzInputs.test.tsx
+          src/evidence/EvidenceForm.test.tsx src/admet/AdmetForm.test.tsx
+          src/chemistry/LibraryScreenForm.test.tsx src/operations/CampaignForm.test.tsx
+      - run: uv sync --locked --group dev --group browser
+      - run: uv run --locked pytest -q tests/test_material_input_scope.py
+      - run: uv run --locked ruff check scripts/material-input-scope.py tests/test_material_input_scope.py server_tests/test_material_sources_browser.py server_tests/test_sequence_material_browser.py server_tests/test_generic_input_browser.py server_tests/test_molecular_material_browser.py server_tests/material_capture.py
+      - run: uv run --locked playwright install chromium --with-deps
+      - name: Real bilingual STAT6 material upload, source lifecycle and layout; no computation
+        run: uv run --locked python -m pytest -x -q server_tests/test_material_sources_browser.py server_tests/test_sequence_material_browser.py server_tests/test_generic_input_browser.py server_tests/test_molecular_material_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compact-material-input-evidence
+          path: |
+            outputs/material-input
+            outputs/reference-input/generic
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: material-web-preview
+          path: outputs/material-web-preview
+  refinement-scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      refinement_only: ${{ steps.refinement.outputs.refinement_only }}
+      quality_layout_only: ${{ steps.quality-layout.outputs.quality_layout_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: refinement
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/docking-refinement-scope.py
+      - name: Delegate pose-quality presentation to its retained-result gate
+        id: quality-layout
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/pose-quality-scope.py
+  coordinate-confirmation:
+    if: github.event_name == 'workflow_dispatch' && inputs.coordinate_confirmation_only
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - working-directory: frontend
+        run: npx vitest run src/docking/DockingQuestions.test.tsx src/docking/DockingForm.test.tsx src/diffsbdd/useReferenceSelection.test.tsx
+      - run: uv sync --locked --group dev --group browser
+      - run: uv run --locked ruff check server_tests/test_docking_confirmation_browser.py
+      - run: uv run --locked python -m playwright install --with-deps chromium
+      - run: uv run --locked python -m pytest -x -q server_tests/test_docking_confirmation_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coordinate-confirmation-evidence
+          path: outputs/coordinate-confirmation
+  inputs:
+    needs: [refinement-scope, material-scope, utility-scope]
+    if: ${{ needs.utility-scope.outputs.utility_only != 'true' && !inputs.coordinate_confirmation_only && needs.refinement-scope.outputs.refinement_only != 'true' && needs.refinement-scope.outputs.quality_layout_only != 'true' && needs.material-scope.outputs.material_only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && python scripts/generate-plotly-css.py --check && npm run build --prefix frontend
+      - run: uv sync --locked --group dev --group browser
+      - name: Quality preview and real iframe-layout contract
+        if: ${{ inputs.quality_preview_only }}
+        working-directory: frontend
+        run: >-
+          npx vitest run src/quality/tests/QualityResults.test.tsx
+          src/viewer/source-layout.test.ts src/viewer/StructureViewer.test.tsx
+      - name: Changed file selection and directly connected questionnaires
+        if: ${{ !inputs.quality_preview_only }}
+        working-directory: frontend
+        run: >-
+          npx vitest run src/diffsbdd/ReferencePicker.test.tsx
+          src/diffsbdd/ReferencePickerLifecycle.test.tsx src/diffsbdd/reference-metadata.test.ts
+          src/diffsbdd/useReferenceSelection.test.tsx src/diffsbdd/useReferenceHistory.test.tsx
+          src/research/HistoricalFileSelect.test.tsx src/diffsbdd/DiffForm.test.tsx
+          src/docking/DockingForm.test.tsx src/pockets/PocketForm.test.tsx
+          src/receptors/StructurePrepareForm.test.tsx src/quality/tests/QualityForm.test.tsx
+          src/quality/tests/QualityResults.test.tsx src/quality/tests/QualityAssessment.test.tsx
+          src/quality/QualityReview.test.tsx
+          src/simulations/SimulationForm.test.tsx src/simulations/SimulationReview.test.tsx
+          src/diffsbdd/ReferenceFormats.test.tsx src/research/SdfRecordPicker.test.tsx
+          src/integrations/LibraryInput.test.tsx src/research/useSdfAsset.test.tsx
+          src/integrations/ScientificForm.test.tsx src/admet/AdmetForm.test.tsx
+          src/chemistry/LibraryScreenForm.test.tsx
+          src/operations/AssetPicker.test.tsx src/operations/AssetHistorySelect.test.tsx
+          src/operations/useSelectedAsset.test.tsx src/research/SequencePicker.test.tsx
+          src/research/useSequenceSave.test.tsx src/operations/PropertyForm.test.tsx
+          src/operations/CampaignForm.test.tsx src/antibodies/AntibodyNumberForm.test.tsx
+          src/humanization/HumanizationForm.test.tsx
+          src/operations/ArtifactPicker.test.tsx src/operations/useResultFiles.test.tsx
+          src/operations/useResultReuse.test.tsx src/api-errors.test.ts
+          src/operations/ResultTaskSelect.test.tsx src/operations/result-source-labels.test.ts
+          src/presentation/research-files.test.tsx
+      - name: Actual filtered input catalog, immutable versions and existing research API
+        if: ${{ !inputs.quality_preview_only }}
+        run: >-
+          uv run --locked pytest -q tests/test_input_catalog.py tests/test_research_assets.py tests/test_result_metadata.py tests/test_pose_quality.py
+      - run: uv run --locked playwright install chromium --with-deps
+      - name: Bilingual real STAT6 metadata deadline, file pagination, identity and exact review; no simulation
+        if: ${{ !inputs.quality_preview_only }}
+        run: uv run --locked python -m pytest -x -q server_tests/test_reference_input_browser.py server_tests/test_material_catalog_browser.py server_tests/test_generic_input_browser.py
+      - name: Restore an archived native result for input handoff; never calculate
+        if: ${{ !inputs.quality_preview_only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-result-reuse" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-result-reuse/state" >> "$GITHUB_ENV"
+          gh release download examples-v1 --repo "$GITHUB_REPOSITORY" --pattern x-dde-public-cases-v1.zip --dir "$RUNNER_TEMP"
+      - name: Bilingual actual result selection, immutable digest and uncertain-response handoff
+        if: ${{ !inputs.quality_preview_only }}
+        run: |
+          .venv/bin/python server_tests/prepare_layout_cases.py "$RUNNER_TEMP/x-dde-public-cases-v1.zip"
+          .venv/bin/python -m pytest -x -q server_tests/test_result_reuse_browser.py
+      - name: Inspect retained native quality measurements without calculations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-quality-reference" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-quality-reference/state" >> "$GITHUB_ENV"
+          WB_HOME="$RUNNER_TEMP/x-dde-quality-reference" WB_STATE_DIR="$RUNNER_TEMP/x-dde-quality-reference/state" uv run --locked python server_tests/prepare_quality_context_cases.py
+      - run: uv run --locked python -m pytest -x -q server_tests/test_quality_context_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reference-input-evidence
+          path: |
+            outputs/reference-input/**
+            outputs/quality-context/en/**
+            outputs/quality-context/zh/**

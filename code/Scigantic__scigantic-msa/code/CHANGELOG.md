@@ -1,0 +1,408 @@
+# Changelog
+
+## 0.3.0
+
+Open data. `run` and `MSA().get()` now merge the ColabFold server's search
+with alignments already published as open data, read where their
+publishers put them:
+
+- OpenFold3 training MSAs (`s3://openfold3-data`, CC BY 4.0), found through
+  OpenFold3's own table of representative sequences;
+- LiteFold's human proteome MSAs (Hugging Face, CC BY 4.0, a pinned
+  commit), found through its manifest;
+- OpenProteinSet UniClust30 MSAs (`s3://openfold`, CC BY 4.0), found by
+  asking UniParc for the accessions of the sequence's MD5 (not with
+  `--open-only`, see below);
+- with `--openproteinset`, OpenProteinSet's PDB MSAs, found through its
+  chain table and `alignment_db.index` (about 610 MB the first time).
+
+Each table is downloaded once into the cache, with its ETag and sha256,
+checked again at most once a day, and named in the attribution file. The
+sequence is looked up on your machine and is never sent for open data.
+
+0.3.0 contacts the open data hosts by default, on every `run` that does
+not pass `--no-open`. On a cluster or a machine without internet access,
+pass `--no-open` or set `SCIGANTIC_MSA_NO_REMOTE=1`; tables and files
+already in the cache are still used then.
+
+Privacy of the open data lookup:
+
+- The hosts of the open data learn which public entries you asked for.
+- With a search server, the sequence's MD5 goes to UniParc (UniProt). With
+  `--open-only` (`MSA(server=None)`) it does not, unless you pass
+  `--uniparc` (`uniparc=True`): the MD5 of a close variant of a public
+  protein can be reversed by trying the variants. Without UniParc, the
+  organisms come from the open files alone and UniClust30 entries are not
+  used. `--no-uniparc` turns it off with a server too.
+- `run` says before a run which requests the lookup makes, and after it
+  what was sent where, including requests that failed. Under
+  `SCIGANTIC_MSA_NO_REMOTE` it says that only the cache is used.
+- The attribution file holds the sequence's sha256 and any near match's
+  entry and identity, which can also identify a close variant: treat it as
+  sensitive when the sequence is.
+
+Changes you may notice:
+
+- Pairs by species use only species: UniRef rows of clusters with more
+  than one member (UniRef100 and 50 too, not only 90), taxa above species
+  ("Bacteria", "unclassified ..."), and UniProt's virtual codes such as
+  `9GAMM` no longer pair. A merged row never takes the species of an
+  identical row from another source.
+- The server's paired search is kept whole; only pairs that repeat an
+  earlier pair in every chain are left out. Pairs by species from open data
+  come from the merged rows, so they never bring back a copy the merge
+  removed. The pairing message says the server's paired rows are written in
+  addition to each chain's rows, and is printed once per run.
+- UniClust30 files that start with a consensus row are read (they were all
+  refused).
+- Chai-1 writes say when Chai's per-source quotas will drop rows; Boltz
+  writes note pairs Boltz loses to a repeated row.
+- The row TSV has a `bytes` column: the range of a shared OpenProteinSet
+  file the row was read from.
+- `--open-only` (`MSA(server=None)`) builds the MSA from open data alone and
+  sends the sequence to no search server. `--no-open` gives 0.2's result.
+- Rows are merged with per-row provenance. Rows with the same residues are
+  kept once, and so are rows of the same entry over the same part of it,
+  which exact-string dedup missed. ColabFold rows come first.
+- A complex gets the ColabFold server's own paired search, as
+  `colabfold_batch` sends it, then extra pairs by species from open rows
+  when the chains share an organism (`--open-pairs auto|always|never`).
+  This sends the chains to the server once more, and the confirmation says
+  so. The cap of 100 new jobs per run counts paired searches.
+- `run` prints, per chain, rows, an estimated Neff at 80% identity and
+  species for the merged MSA and for the server's result alone.
+- The attribution file lists every open set with its licence and table
+  version, the files read and rows kept per source, and a new
+  `scigantic-msa-rows/` folder holds one TSV per chain with every row's
+  source.
+- Chains are named A, B, ... in messages, as in the written files.
+- `Alignment.source` can be `merged` or `open`. `SCIGANTIC_MSA_NO_REMOTE`
+  now blocks the open data lookups too; what is in the cache is still used.
+- New `scigantic-msa sources` lists the open sets and the cached tables;
+  `--fetch` downloads them.
+- `--near` also uses open entries at 95% identity or more over 90% of the
+  query, found with a local `mmseqs`.
+- Test only: `SCIGANTIC_MSA_TEST_COLABFOLD_REPLAY` reads saved ColabFold
+  results from a folder instead of the server.
+- With `--open-only`, a run where open data could not be searched (no
+  network, a host failing, a table that cannot be downloaded) is an error
+  that names what failed, and writes nothing. A sequence no table holds is
+  still a warning only. An entry a table lists with no published files
+  says so.
+- `--openproteinset` asks before its first 610 MB download, and needs
+  `--yes` without a terminal.
+- `sources` prints the cache directory and says when a table in the cache
+  is damaged; `sources --fetch` builds it again. `sources --openproteinset`
+  needs `--fetch`.
+- `run` given an alignment file points to `convert`; Ctrl-C prints
+  "Interrupted."; processes waiting for another one's download say so.
+
+Downloads and the cache:
+
+- A download that ends early is read again and never kept: fewer bytes
+  than the server said, a Stockholm file without its closing `//`, or a
+  table with no length that stops inside a line. Only the row and size
+  caps cut a file, and those are marked `truncated: true`.
+- LiteFold files are read whole, not by the manifest's byte count, and a
+  manifest row with a bad byte count is skipped, not the whole table.
+- A web page sent in place of a table (a captive portal), or a table with
+  far fewer entries than the real one, is refused and not kept.
+- A damaged table in the cache (truncated, empty, unreadable) is removed
+  and built again. A damaged cached file or server result (one flipped
+  bit) is read as a miss and replaced.
+- A host name that does not resolve and a refused connection are not
+  retried, so an offline run fails in seconds. Each request has an overall
+  deadline, and a body that comes in too slowly is given up. A table that
+  failed is tried again after five minutes, not never in that process.
+- Two processes that need the same open file read it once; the second
+  waits for the first.
+- Without the cache (`--no-cache`, `cache=False`), the tables are
+  downloaded once per process, each `MSA` object's files are removed by
+  `close()` or a `with` block, and the temporary folder is removed on
+  SIGTERM too.
+- One `MSA` object can be used from several threads.
+- The cache's folders only lose group and other permissions; owner write
+  access you removed is not put back. Partial downloads are 0600.
+- The sdist includes the tests' `conftest.py` and fixtures.
+
+## 0.2.9
+
+Changes you may notice:
+
+- `SCIGANTIC_MSA_NO_REMOTE` set to only spaces now blocks, as the README
+  says any value but `0`, `false`, `no` or `off` does. An empty value is
+  still the same as not setting it.
+- A relative `XDG_CACHE_HOME` (or `LOCALAPPDATA` on Windows) is ignored, as
+  the XDG spec says, and the default under your home folder is used.
+- The cache's `alignments` folder is made 0700 the first time a run uses
+  the cache, even only to read it, so a cache made by 0.2.7 or older is
+  private after the upgrade without a new search.
+
+Fixes:
+
+- A server URL with a backslash is refused. `http://u:pass\@host` passed
+  the credentials check, printed the password and looked it up as a host
+  name. The check now reads the URL as urllib does, and every URL (from
+  `--host`, both environment variables, both clients and the NVIDIA
+  status URL) is checked for a user name or password first, so no error
+  repeats one (`//u:pass@host`, `http:/u:pass@host`, a fullwidth `@`).
+- `SCIGANTIC_MSA_NO_REMOTE` set while a request waits to be retried stops
+  the retry.
+- A `SCIGANTIC_MSA_CONTACT` that cannot go in an HTTP header (not Latin-1,
+  or with a line break) is refused with a clear message before anything
+  says it is sending, instead of a codec error after.
+
+## 0.2.8
+
+Changes you may notice:
+
+- `SCIGANTIC_MSA_NO_REMOTE` now also stops `ColabFoldClient` and
+  `NvidiaClient` used directly. Every request checks it, in each client and
+  in the HTTP layer. Calling a client's `search()` yourself still needs no
+  `remote=True`; the README says so.
+- A ColabFold result read back from the cache labels its rows as the fresh
+  result did. MGnify rows in the environmental alignment stay `env`
+  (Chai-1 `bfd_uniclust`, as chai_lab's own ColabFold path labels them)
+  instead of becoming `mgnify`, so a rerun writes the same Chai-1 files.
+  Older cache entries are read with the same labels.
+- `scigantic-msa-attribution.json` no longer holds the cache file's path or
+  the server's job id. The README lists what it holds.
+- Cache folders are made readable only by you (0700), and older ones are
+  tightened when written to.
+- `scigantic-msa cache` prints the cache directory. The README names every
+  place it can be (`SCIGANTIC_MSA_CACHE`, `XDG_CACHE_HOME`, `~/.cache`,
+  `LOCALAPPDATA`).
+- `AlphaFold3.prepare(..., out_dir=..., inline=False)` writes the MSAs as
+  files next to the JSON, as the README said it could.
+
+Fixes:
+
+- A server URL with a user name or password (`http://user:pass@host`) is
+  refused, from `--host`, the environment variables and the clients, and
+  the password is not printed.
+- `MSA("nvidia").get(..., remote=True)` without `NVIDIA_API_KEY` no longer
+  says it is sending the sequence before it stops.
+- The short peptide hint is quoted (`'=MKVLAAG'`), which zsh needs.
+- A cached result has the same `templates` and provenance as the fresh one,
+  and `cache_path` is set on a cache hit too.
+- The unusable cache warning is printed once per process.
+- `MSA.get` has typed overloads: a str gives an `Alignment`, a list gives a
+  list of them.
+- The missing pyarrow message also gives the `uv tool install` form.
+
+## 0.2.7
+
+Fixes, all in how AlphaFold 3 rows are ordered. No pair was ever at the
+wrong row; these orders needed gap rows that a better order avoids.
+
+- A chain that shares no species with any other chain no longer makes the
+  search pick an order with avoidable gap rows.
+- With more than 7 groups of pairs, a greedy order is tried as well, so a
+  shallow chain's pairs go first when that avoids gap rows.
+- The gap-row notice counts chains, not distinct sequences, and says when
+  a count is per chain (`chains A, C: 1 each`).
+
+## 0.2.6
+
+Changes you may notice:
+
+- AlphaFold 3: every paired row now sits at the same row index in every
+  chain that has it. Before, a chain without the first pairs' species and
+  with too few rows of its own put its later paired rows right after the
+  query, against other chains' rows of other species, while the notice
+  said they were paired. Where a chain has no row of its own left to stand
+  in, it gets a gap row, as Boltz does; the pairs are put in the order that
+  needs the fewest, and the notice says how many each chain got.
+- AlphaFold 3: rows that differ only in insertions are kept. AlphaFold 3
+  reads a user MSA without removing repeats, so they are not repeats to it.
+- Every MSA file is named, or put in a folder named, for its content. A
+  second alignment of the same sequence in one `--out` (`convert` with
+  another file and another `--name`, or `run` with `--host` after the
+  public server) no longer rewrites the first job's MSA for Boltz, Chai-1,
+  OpenFold3 and Protenix. Identical files are still shared. New paths:
+  Boltz `<sha256>.<hash>.a3m` and `.csv`, Chai-1
+  `msas/unpaired-<hash>/` for a job without pairing (as `paired-<hash>/`
+  before), OpenFold3 `main/<sha256>/<hash>/`, Protenix
+  `<sha256>/<hash>/`, AlphaFold 3 `inline=False`
+  `<sha256>.<hash>.unpaired.a3m` and `.paired.a3m`. The printed commands
+  and returned paths point there.
+- Boltz gets at most 8191 pair keys, the most it pairs besides the query.
+  Before, the rows of a pair past that were dropped by Boltz; now they are
+  unpaired rows.
+
+Fixes:
+
+- `https://api.colabfold.com//.` and other paths with repeated slashes
+  that the server reads as `/` are the public server, with its warning, cap
+  and cache.
+- The pairing notice counts chains, not distinct sequences, and names them
+  in order: A, B, A, C reads "across 4 chains", not "across 3 chains", and
+  "chains A, B, C, D", not "chains A, C, B, D".
+
+## 0.2.5
+
+Changes you may notice:
+
+- Species shared by only some chains of a complex are paired. Before,
+  AlphaFold 3, Boltz, Chai-1, ColabFold and OpenFold3 paired only species
+  present in every chain that had species, so one chain from another
+  organism removed all pairing for the others (Protenix already paired
+  them). Rows shared by more chains come first, and the notice says which
+  chains paired and how many rows each set got. `Pairing.rows` holds `None`
+  for a chain without a row of that species.
+- AlphaFold 3: where a chain has no row for a paired species, one of its
+  own unpaired rows stands in, so the rows after it stay aligned. It never
+  gets a gap row.
+- Writing a second complex into the same folder (A+B, then A+C, or then A
+  alone) no longer rewrites the first complex's MSA files and breaks its
+  pairing. Boltz CSVs with pair keys are named `<sha256>.<hash>.csv`.
+  Chai-1 files of a complex with paired rows go in
+  `<out>/chai/msas/paired-<hash>/`, which `Chai.prepare` returns and the
+  printed command uses. OpenFold3's paired folder and AlphaFold 3's
+  `inline=False` unpaired file with paired rows are named for their
+  content too. Files without pairing keep the plain name and are shared.
+- `run` refuses what the model's writer would refuse before it sends
+  anything: a Protenix chain with `U`, `B`, `Z`, `J` or `O`, and Chai-1
+  without pyarrow. Before, the sequence went to the server first. In a
+  `--batch`, only the refused job is skipped, and the closing message says
+  its input must change instead of asking to run again.
+- A server URL with a non-ASCII character is refused, with its ASCII
+  spelling when it has one. Before, `run` said it was sending, then failed
+  with a latin-1 error.
+
+Fixes:
+
+- `https://api.colabfold.com/.`, `/./` and other paths of only dot segments
+  are the public server, with its warning, cap and cache.
+- An attribution file with an odd entry no longer crashes the write after
+  the model's files are written. Replacing an attribution file that cannot
+  be read prints a warning.
+- `--batch` gives records whose names differ only in case or Unicode form
+  (`ß` and `SS`, a Hangul syllable and its jamo) their own folders. On macOS
+  the second one overwrote the first.
+- `COM¹`, `LPT³` and the like, and `COM0` and `LPT0`, get a `_` in front as
+  Windows reserves them, and a name cut to 200 bytes no longer ends in `.`.
+
+## 0.2.4
+
+Changes you may notice:
+
+- A complex with a chain that has no species information (environmental or
+  clustered hits only) keeps pairing for the other chains with AlphaFold 3,
+  Boltz, Chai-1, ColabFold and OpenFold3. Before, they silently lost all
+  pairing. Each model gets the species-less chain in the form its own code
+  expects, and the notice names that chain.
+- Pairing notices name chains by id (`chain C`), not by their position
+  among the distinct sequences (`chain(s) 3`). `Pairing.rows` holds `None`
+  for every row of a chain without species, and `pair_by_species` takes
+  `names=` for its message.
+- `scigantic-msa-attribution.json` keeps one entry per write under
+  `outputs`, and `sources` lists every distinct credit. Before, a second
+  write into the same folder (two models from Python, or a second `convert`
+  or `run` with another `--name`) replaced the earlier credit. The top-level
+  `chains`, `files` and `notes` keys are now inside each entry. A file from
+  0.2.3 is kept as the first entry.
+- `--name` with `--batch` is a prefix for every job: `--name run1` writes
+  `<out>/run1_<record>/<model>/`. Before, it was ignored.
+- `SCIGANTIC_MSA_NO_REMOTE` blocks on any value but `0`, `false`, `no` or
+  `off`. Before, `on` or `y` still sent the sequence.
+- Any spelling of the public server's URL (another case, `:443`, a trailing
+  slash, spaces, or `http://`) is the public server, reached over https, and
+  gets its warning. `--host` refuses a URL with a space, query or fragment.
+- One `run` sends at most 100 new sequences to the public server.
+- Protenix: a protein letter other than the 20 standard amino acids and `X`
+  (`U`, `B`, `Z`, `J`, `O`) is refused before any file is written, and
+  `Protenix.check` reports it. Protenix 2.0.0 stops on it with `KeyError`.
+- Job names in file names are cut to 200 bytes, not 100 characters, and
+  Windows reserved names (`CON`, `nul.txt`) get a `_` in front.
+
+Fixes:
+
+- `scigantic-msa --version` works, as well as `scigantic-msa version`.
+- Parallel `Chai.prepare` calls into one folder no longer fail or leave a
+  corrupt parquet file.
+- Chai-1 gets at most 8191 paired rows, the most it reads besides the query.
+- `run` checks the model's folders under `--out`, and each job's folder in a
+  batch, before sending anything.
+- `--server nvidia` without `NVIDIA_API_KEY` stops before asking to send.
+- A result download that is not a tar.gz fails only that job of a batch.
+- The 10-residue error no longer echoes a long sequence.
+- Depth warnings in a batch name the job.
+- `write_model` with `name=""` returns the files it wrote.
+- `convert --uniprot ""` is refused instead of ignored.
+- A model that refuses the input leaves no empty folders behind.
+- The time estimate for the public server says "or more", and lengths that
+  are all equal read "length 60 each".
+- Tests: an opt-in test runs Protenix's own JSON parser and MSA
+  featurisation on the files, with `SCIGANTIC_MSA_TEST_PROTENIX_PYTHON`.
+
+## 0.2.3
+
+Changes you may notice:
+
+- A FASTA file with several records needs `--complex` (one complex, at most
+  20 chains) or `--batch` (one job per record, at most 100). Before, it
+  silently became one complex.
+- `--batch` writes each record to `<out>/<record>/<model>/`. A job the
+  server cannot do no longer stops the others; the command ends with exit 1
+  and names the failed jobs.
+- Each model's files go in their own folder: `<out>/boltz/`, `<out>/af3/`
+  and so on, from both the command line and `write_model`. The printed next
+  command points there, with paths quoted for the shell.
+- `run` refuses a typed argument that is a directory, that matches a file
+  with an extension (`query` next to `query.fasta`), or that is under 10
+  residues. Start a short peptide with `=`, as in `=MKVLAAG`.
+- `--host`, `SCIGANTIC_MSA_COLABFOLD_URL` and `SCIGANTIC_MSA_NVIDIA_URL`
+  must be `http://` or `https://` URLs. `ftp://`, `file://` and a missing
+  scheme are refused before anything is sent.
+- `SCIGANTIC_MSA_NO_REMOTE=1` still uses results already in the cache, and
+  says nothing was sent when it blocks a search.
+- `run` and `convert` print each chain's depth, and warn when it is below
+  20 or only the query. A sequence of only `ACGTUN` gets a DNA/RNA warning.
+- Written files follow the umask (usually 0644) instead of 0600.
+- Job names in AlphaFold 3, OpenFold3 and Protenix JSON are file-safe:
+  `my job` becomes `my_job`, and a name like `../x` cannot leave `--out`.
+- New: `convert --uniprot FILE` (once per chain) and
+  `MSA().from_a3m(..., uniprot=...)` add a UniProt alignment used for
+  pairing.
+- New: `python -m scigantic_msa` runs the same command.
+
+Fixes:
+
+- An unusable cache (read-only, or a path that is a file) gives one warning
+  and the run goes on without it, instead of failing.
+- Cache `.lock` files are removed after use, and a lock left by a crashed
+  run no longer blocks.
+- Protenix `pairing.a3m` headers carry the taxid for every row that has one,
+  so Protenix pairs on the same species as the other models. Chains that
+  share a species with only some of the others now get `pairing.a3m` too.
+- AlphaFold 3 merge into an existing input writes the sequence in the
+  canonical form, so it matches the MSA's first row.
+- `Protenix.check` refuses a `sequences` entry or `proteinChain` that is not
+  an object.
+- A3M, Stockholm and FASTA with a UTF-8 BOM, CR or CRLF line endings, or a
+  leading `#A3M#` line are read. FASTA as UTF-16, Latin-1 or gzip is read.
+  Blank lines and indented headers in FASTA no longer crash.
+- Input errors name the record and chain at fault, and never echo a long
+  sequence back to the terminal.
+- `run` checks that `--out` can be written before sending anything.
+- `MSA().get()` gives clear errors for bytes, `None` or an empty chain, and
+  suggests a list when a sequence contains `:`.
+- Ctrl-C while waiting says that running the same command again resumes the
+  job, and exits 130.
+- `write_model(model, chains, out)` works as the README shows: `name` and
+  `quiet` have defaults and `out` can be a str.
+
+## 0.2.2
+
+- The `version` command reports the installed version. 0.2.1 reported 0.2.0.
+
+## 0.2.1
+
+- `write_model` is exported from the package and writes any model's inputs
+  with one call.
+- `from_a3m` errors say whether the argument was read as a path or as text.
+
+## 0.2.0
+
+- First release on PyPI.

@@ -1,0 +1,1263 @@
+"""Where to put a tag on a designed binder, plus a few QC numbers, read straight
+off a predicted binder-target complex.
+
+For each binder chain we work out which terminus (N or C) is the safer place to
+hang a purification/immobilization/conjugation tag. A good tag site is exposed
+(so the tag doesn't wreck the fold) and sits well away from the binding interface
+(so tethering there doesn't block the paratope once the binder is on a chip or
+displayed). So three numbers per terminus:
+
+  - relative SASA of the terminal residue (how exposed it is; Tien 2013 max-ASA)
+  - distance from the terminal CA to the nearest paratope CA
+  - orientation: does the chain point back toward the paratope (>0) or away (<0)
+
+recommended_tag is just the terminus farther from the interface, and we raise a
+warning if that terminus turns out to be buried, roughly tied with the other, or
+pointing back at the target. We also report the SG SASA of a terminal cysteine so
+you can eyeball whether it's a usable conjugation handle.
+
+Everything here is geometry/sequence off a single structure - no folding, no GPU,
+no network.
+"""
+
+import os
+import re
+
+import biotite.structure as struc
+import biotite.structure.io as strucio
+import numpy as np
+
+from ._diwv import instability_index
+
+_THREE_TO_ONE = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLU": "E", "GLN": "Q", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+}
+
+# Tien et al. 2013 theoretical max ASA per residue, used to turn a residue's
+# total SASA into a 0-1 exposure.
+_REF_MAX_ASA = {
+    "ALA": 129.0, "ARG": 274.0, "ASN": 195.0, "ASP": 193.0, "CYS": 167.0,
+    "GLU": 223.0, "GLN": 225.0, "GLY": 104.0, "HIS": 224.0, "ILE": 197.0,
+    "LEU": 201.0, "LYS": 236.0, "MET": 224.0, "PHE": 240.0, "PRO": 159.0,
+    "SER": 155.0, "THR": 172.0, "TRP": 285.0, "TYR": 263.0, "VAL": 174.0,
+}
+
+# When the binder chain isn't given we guess it as the shortest chain in this
+# residue window. It's only a fallback - the printed guess and the "largest
+# chain" warning are what actually keep you honest.
+_AUTO_MIN_LEN = 20
+_AUTO_MAX_LEN = 250
+
+
+def _load_protein(path):
+    """Load a structure, first model only, amino acids only."""
+    array = strucio.load_structure(path)
+    if isinstance(array, struc.AtomArrayStack):
+        array = array[0]
+    return array[struc.filter_amino_acids(array)]
+
+
+def _chain_lengths(array):
+    starts = struc.get_residue_starts(array)
+    lengths = {}
+    for s in starts:
+        c = str(array.chain_id[s])
+        lengths[c] = lengths.get(c, 0) + 1
+    return lengths
+
+
+def _guess_binder_chains(chain_lens):
+    candidates = {c: n for c, n in chain_lens.items() if _AUTO_MIN_LEN <= n <= _AUTO_MAX_LEN}
+    if not candidates:
+        return []
+    return [min(candidates, key=candidates.get)]
+
+
+def _chain_res_ids(array, chain_id):
+    """res_ids in chain order (N to C), not by numbering."""
+    starts = struc.get_residue_starts(array)
+    return [int(array.res_id[s]) for s in starts if array.chain_id[s] == chain_id]
+
+
+def _residue_relsasa(array, atom_sasa):
+    """{(chain, res_id): relative SASA} from whichever SASA array you pass in.
+
+    binderqc deliberately uses TWO exposure conventions, and which one a metric
+    takes is a claim about where the liability happens, not a detail:
+
+      complex  SASA computed with the target present, so a residue buried at the
+               interface reads as buried. Correct for anything that happens to
+               the bound molecule.
+      free     SASA of the binder alone. Correct for anything that happens to the
+               binder in solution before or between binding events, and the
+               convention the aggregation literature defines its scores on
+               (Chennamsetty 2009 SAP, Kuriata 2019 A3D, Raybould 2019 patches
+               are all surface properties of the molecule itself).
+
+    Mixing them silently is the failure mode: a hydrophobic residue buried against
+    the target scores as safe under `complex` and as a liability under `free`, and
+    a table that does not say which it used cannot be audited. Every exposure-
+    derived column records its convention in `exposure_context_*`.
+    """
+    res_sasa = struc.apply_residue_wise(array, atom_sasa, np.sum)
+    res_starts = struc.get_residue_starts(array)
+    rel = {}
+    for res_total, start in zip(res_sasa, res_starts, strict=True):
+        ref = _REF_MAX_ASA.get(array.res_name[start], 0.0)
+        rel[(array.chain_id[start], int(array.res_id[start]))] = (
+            (res_total / ref) if ref > 0 else float("nan")
+        )
+    return rel
+
+
+def _sg_sasa(array, atom_sasa, chain_id, res_id):
+    """SASA of a Cys SG atom (conjugatability). NaN if there's no SG here."""
+    mask = (array.chain_id == chain_id) & (array.res_id == res_id) & (array.atom_name == "SG")
+    return float(atom_sasa[mask][0]) if mask.any() else float("nan")
+
+
+def _binder_bsa(atom_sasa, binder_mask, binder_iso_sasa):
+    """Area the binder buries on binding = its SASA alone minus its SASA in the
+    complex. A tiny interface is the clearest tell of a junk binder. No PLIP,
+    just biotite SASA. Takes the isolated-binder SASA precomputed (shared with
+    SAP/A3D so it is only run once)."""
+    if not binder_mask.any():
+        return float("nan")
+    buried = np.clip(binder_iso_sasa - atom_sasa[binder_mask], 0.0, None).sum()
+    return float(buried)
+
+
+def _ca_coord(array, chain_id, res_id):
+    mask = (array.chain_id == chain_id) & (array.res_id == res_id) & (array.atom_name == "CA")
+    return array.coord[mask][0] if mask.any() else None
+
+
+def _interface_residue_ids(array, binder_chain, target_chains, cutoff):
+    """Binder residues with any heavy atom within cutoff of the target."""
+    binder_mask = array.chain_id == binder_chain
+    target_mask = np.isin(array.chain_id, list(target_chains))
+    if not binder_mask.any() or not target_mask.any():
+        return set()
+    b_coord, t_coord = array.coord[binder_mask], array.coord[target_mask]
+    b_resid = array.res_id[binder_mask]
+    interface = set()
+    # chunk the binder atoms so the pairwise distance matrix stays small on big targets
+    for i in range(0, len(b_coord), 2048):
+        chunk = b_coord[i : i + 2048]
+        d = np.linalg.norm(chunk[:, None, :] - t_coord[None, :, :], axis=-1)
+        hit = d.min(axis=1) <= cutoff
+        interface.update(int(r) for r in b_resid[i : i + 2048][hit])
+    return interface
+
+
+def _paratope_centroid(array, binder_chain, interface_ids):
+    cas = [c for c in (_ca_coord(array, binder_chain, r) for r in interface_ids) if c is not None]
+    return np.mean(cas, axis=0) if cas else None
+
+
+def _terminus_orientation(term_ca, adj_ca, paratope_centroid):
+    """Cosine between the way the chain extends past the terminus and the
+    direction to the paratope. A tag grows outward along (term_ca - adj_ca); if
+    that points at the paratope (>0) the tag heads straight for the target.
+    Positive is bad even when the terminus is far away; NaN if we can't tell."""
+    if term_ca is None or adj_ca is None or paratope_centroid is None:
+        return float("nan")
+    ext = term_ca - adj_ca
+    to_iface = paratope_centroid - term_ca
+    n_ext, n_if = np.linalg.norm(ext), np.linalg.norm(to_iface)
+    if n_ext == 0 or n_if == 0:
+        return float("nan")
+    return float(np.dot(ext, to_iface) / (n_ext * n_if))
+
+
+def _min_dist_to_interface(array, binder_chain, term_res_id, interface_ids):
+    if not interface_ids:
+        return float("nan")
+    term_ca = _ca_coord(array, binder_chain, term_res_id)
+    if term_ca is None:
+        return float("nan")
+    iface_cas = np.array([c for c in (_ca_coord(array, binder_chain, r) for r in interface_ids) if c is not None])
+    if len(iface_cas) == 0:
+        return float("nan")
+    return float(np.linalg.norm(iface_cas - term_ca, axis=1).min())
+
+
+def _binder_sequence(array, chain_id):
+    """One-letter sequence in chain order; anything non-standard becomes X."""
+    starts = struc.get_residue_starts(array)
+    return "".join(
+        _THREE_TO_ONE.get(str(array.res_name[s]), "X")
+        for s in starts if array.chain_id[s] == chain_id
+    )
+
+
+def _sequence_liabilities(seq):
+    """Common developability red flags, straight from the sequence. Motifs and
+    thresholds are the ones in Adaptyv's protein-qc skill (MIT). These are things
+    to look at, not automatic rejections.
+
+    Deamidation (NG/NS/NT) and Asp isomerization (D-[G/S/T/D/H]) are deliberately NOT
+    here: Sydow et al. 2014 found the real risk is set by local backbone flexibility
+    and exposure as well as the C+1 flank, so a sequence-only motif hit over-predicts.
+    binderqc has the structure, so those two are exposure-gated -- see
+    `_exposed_deamidation_sites`, computed alongside `_exposed_oxidation` in
+    `_score_binder_chain` and folded into the same `sequence_liabilities` column."""
+    flags = []
+    n_cys = seq.count("C")
+    if n_cys % 2 == 1:
+        flags.append(f"odd Cys count ({n_cys}): possible unpaired thiol")
+    if re.search(r"N[^P][ST]", seq):
+        flags.append("N-glycosylation sequon (NxS/T)")
+    if re.search(r"[KR]{3,}", seq):
+        flags.append("polybasic run (>=3 K/R): proteolysis")
+    if re.search(r"[AILMFWV]{6,}", seq):
+        flags.append("hydrophobic run (>=6): aggregation")
+    if re.search(r"H{3,}", seq):
+        flags.append("histidine run (>=3): confounds IMAC purification, reads like an affinity tag")
+    return flags
+
+
+# Kyte & Doolittle 1982 hydropathy.
+_KD = {
+    "A": 1.8, "R": -4.5, "N": -3.5, "D": -3.5, "C": 2.5, "Q": -3.5, "E": -3.5,
+    "G": -0.4, "H": -3.2, "I": 4.5, "L": 3.8, "K": -3.9, "M": 1.9, "F": 2.8,
+    "P": -1.6, "S": -0.8, "T": -0.7, "W": -0.9, "Y": -1.3, "V": 4.2,
+}
+
+# pKa for side chains and termini (a common simple set) - used for charge and pI.
+_PKA_POS = {"K": 10.5, "R": 12.5, "H": 6.0}
+_PKA_NEG = {"D": 3.9, "E": 4.1, "C": 8.5, "Y": 10.1}
+_PKA_NTERM, _PKA_CTERM = 9.0, 3.1
+
+
+def _gravy(seq):
+    """Mean Kyte-Doolittle hydropathy; higher means more hydrophobic."""
+    vals = [_KD[a] for a in seq if a in _KD]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+# Average residue masses (Da), the usual Expasy values.
+_RES_MASS = {
+    "A": 71.0788, "R": 156.1875, "N": 114.1038, "D": 115.0886, "C": 103.1388,
+    "E": 129.1155, "Q": 128.1307, "G": 57.0519, "H": 137.1411, "I": 113.1594,
+    "L": 113.1594, "K": 128.1741, "M": 131.1926, "F": 147.1766, "P": 97.1167,
+    "S": 87.0782, "T": 101.1051, "W": 186.2132, "Y": 163.1760, "V": 99.1326,
+}
+_WATER = 18.01528
+_HYDROPHOBIC = set("AILMFWV")
+_AROMATIC = set("FWY")
+
+
+def _protparam(seq):
+    """The two ProtParam numbers you actually reach for at the bench: molecular
+    weight and the reduced 280 nm extinction coefficient (Pace 1995), i.e. what
+    you need to express a construct and read its concentration."""
+    if not seq:
+        return {"mw": float("nan"), "ext_coeff_280": float("nan")}
+    mw = sum(_RES_MASS.get(a, 0.0) for a in seq) + _WATER
+    ext = 5500 * seq.count("W") + 1490 * seq.count("Y")   # reduced (no cystines)
+    return {"mw": mw, "ext_coeff_280": float(ext)}
+
+
+def _epitope_composition(array, target_iface):
+    """Hydrophobic fraction and aromatic count of the epitope residues - the
+    anchor chemistry a binder has to grip. This is about residue identity, so it
+    complements epitope_planarity, which is about shape."""
+    if not target_iface:
+        return float("nan"), 0
+    types = []
+    for ch, rid in target_iface:
+        m = (array.chain_id == ch) & (array.res_id == rid)
+        if m.any():
+            types.append(_THREE_TO_ONE.get(str(array.res_name[m][0]), "X"))
+    if not types:
+        return float("nan"), 0
+    hyd = sum(1 for t in types if t in _HYDROPHOBIC) / len(types)
+    arom = sum(1 for t in types if t in _AROMATIC)
+    return float(hyd), int(arom)
+
+
+def _glyco_occluded_epitope(array, target_chains, target_iface,
+                            expose_cut=0.20, reach=10.0):
+    """N-glycosylation sequons (N-X-[S/T], X != P) on the TARGET that are BOTH
+    solvent-exposed AND at/near the epitope -> an installed glycan sterically masks
+    that patch for a small binder, even where the bare backbone looks grippable.
+
+    Two things make this SASA-aware and not just a sequence grep:
+      - Exposure is measured on the target ALONE, not the complex. Glycans are
+        installed before the binder binds, and in the complex an engaged epitope
+        Asn reads as buried - so complex SASA would wrongly hide the very sites we
+        care about. We recompute target-only SASA here.
+      - Sequons are read off the modeled chain (consecutive res_ids), so a gap from
+        an unresolved loop can't fabricate a phantom sequon.
+
+    Returns a sorted list like ["A:N1119"] of occluding Asn sites.
+    """
+    if not target_iface:
+        return []
+    iface_cas = np.array([c for c in (_ca_coord(array, ch, r) for ch, r in target_iface) if c is not None])
+    if not len(iface_cas):
+        return []
+    tmask = np.isin(array.chain_id, list(target_chains))
+    tarr = array[tmask]
+    tsasa = np.nan_to_num(struc.sasa(tarr), nan=0.0)              # target-only SASA (no binder)
+    tres = struc.apply_residue_wise(tarr, tsasa, np.sum)
+    tstarts = struc.get_residue_starts(tarr)
+    trel = {}
+    for tot, st in zip(tres, tstarts, strict=True):
+        ref = _REF_MAX_ASA.get(tarr.res_name[st], 0.0)
+        trel[(str(tarr.chain_id[st]), int(tarr.res_id[st]))] = (tot / ref) if ref > 0 else float("nan")
+
+    starts = struc.get_residue_starts(array)
+    hits = []
+    for chain in target_chains:
+        chain_res = [(int(array.res_id[s]), str(array.res_name[s])) for s in starts if array.chain_id[s] == chain]
+        for k in range(len(chain_res) - 2):
+            (i, ni), (j, nj), (l, nl) = chain_res[k], chain_res[k + 1], chain_res[k + 2]
+            if j != i + 1 or l != i + 2:
+                continue
+            if ni != "ASN" or nj == "PRO" or nl not in ("SER", "THR"):
+                continue
+            rel = trel.get((str(chain), i), 0.0)
+            if rel != rel or rel < expose_cut:            # nan or buried -> not glycosylated
+                continue
+            ca = _ca_coord(array, chain, i)
+            if ca is None:
+                continue
+            if float(np.linalg.norm(iface_cas - ca, axis=1).min()) <= reach:
+                hits.append(f"{chain}:N{i}")
+    return sorted(set(hits))
+
+
+def _charge_at_ph(seq, ph):
+    """Net charge at a given pH (Henderson-Hasselbalch)."""
+    pos = 1.0 / (1.0 + 10 ** (ph - _PKA_NTERM))
+    for a, pk in _PKA_POS.items():
+        pos += seq.count(a) / (1.0 + 10 ** (ph - pk))
+    neg = 1.0 / (1.0 + 10 ** (_PKA_CTERM - ph))
+    for a, pk in _PKA_NEG.items():
+        neg += seq.count(a) / (1.0 + 10 ** (pk - ph))
+    return pos - neg
+
+
+def _net_charge(seq, ph=7.4):
+    return _charge_at_ph(seq, ph) if seq else float("nan")
+
+
+def _isoelectric_point(seq):
+    """pI by bisection. It leans on the pKa set above, so treat it as a guide."""
+    if not seq:
+        return float("nan")
+    lo, hi = 0.0, 14.0
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        if _charge_at_ph(seq, mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def _exposed_oxidation(array, binder_chain, relsasa, cut=0.30):
+    """Solvent-exposed Met/Trp on the binder (oxidation-prone). Exposure is over the
+    complex, so a residue buried at the interface is not flagged. Adaptyv skill motif."""
+    starts = struc.get_residue_starts(array)
+    sites = []
+    for s in starts:
+        if str(array.chain_id[s]) != binder_chain:
+            continue
+        nm = str(array.res_name[s])
+        if nm in ("MET", "TRP"):
+            rel = relsasa.get((array.chain_id[s], int(array.res_id[s])), float("nan"))
+            if rel == rel and rel >= cut:
+                sites.append(f"{_THREE_TO_ONE[nm]}{int(array.res_id[s])}")
+    return sites
+
+
+def _exposed_deamidation_sites(array, binder_chain, relsasa, cut=0.30):
+    """Exposed N-[G/S/T] deamidation and D-[G/S/T/D/H] Asp-isomerization motifs on the
+    binder, same exposure gate as `_exposed_oxidation`. Sydow et al. 2014 (PLoS ONE,
+    doi:10.1371/journal.pone.0100736) found deamidation/isomerization risk is set by
+    local backbone flexibility and exposure as well as the C+1 flank identity -- a
+    buried motif reacts far more slowly, so flagging on sequence alone over-predicts.
+    Gated on the N/D residue's own relative SASA (over the complex, same convention as
+    the oxidation check), not the flanking residue's."""
+    ordered = _chain_res_ids(array, binder_chain)
+    names = {}
+    for s in struc.get_residue_starts(array):
+        if str(array.chain_id[s]) == binder_chain:
+            names[int(array.res_id[s])] = _THREE_TO_ONE.get(str(array.res_name[s]), "X")
+
+    sites = []
+    for i, rid in enumerate(ordered[:-1]):
+        a, b = names.get(rid), names.get(ordered[i + 1])
+        if a not in ("N", "D"):
+            continue
+        rel = relsasa.get((binder_chain, rid), float("nan"))
+        if rel != rel or rel < cut:
+            continue
+        if a == "N" and b in "GST":
+            sites.append(f"N{rid}{b} (exposed, rel_sasa={rel:.2f})")
+        elif a == "D" and b in "GSTDH":
+            sites.append(f"D{rid}{b} (exposed, rel_sasa={rel:.2f})")
+    return sites
+
+
+def _lys_arg_pct(seq):
+    return round(100 * sum(seq.count(a) for a in "KR") / len(seq), 1) if seq else float("nan")
+
+
+def _sequence_metrics(seq):
+    """Sequence-derived row fields (developability + expression), pre-rounded.
+
+    `net_charge` and `lys_arg_pct` are WHOLE-BINDER, unlike `paratope_charge` (interface-
+    scoped, from `_score_binder_chain`). They're a distinct signal: a recent large-scale
+    de novo binder campaign (Claude Science et al. 2026, 211 designs tested by two CROs'
+    SPR/BLI plus a BVP-ELISA and ovalbumin polyreactivity counter-screen) found whole-
+    molecule net charge (rho=-0.57) and Lys+Arg content (rho=0.50) were its two strongest
+    correlates of nonspecific/polyreactive binding, out of 25 candidate measures tried."""
+    pp = _protparam(seq)
+    gravy = _gravy(seq)
+    ii = instability_index(seq)
+    libs = _sequence_liabilities(seq)
+    if np.isfinite(ii) and ii > 40:
+        libs.append(f"unstable (instability index {ii:.0f} > 40)")
+    return {
+        "mw": round(pp["mw"], 1) if np.isfinite(pp["mw"]) else float("nan"),
+        "gravy": round(gravy, 3) if np.isfinite(gravy) else float("nan"),
+        "pi": round(_isoelectric_point(seq), 2) if seq else float("nan"),
+        "net_charge": round(_net_charge(seq), 2) if seq else float("nan"),
+        "lys_arg_pct": _lys_arg_pct(seq),
+        "instability_index": round(ii, 1) if np.isfinite(ii) else float("nan"),
+        "ext_coeff_280": pp["ext_coeff_280"],
+        "sequence_liabilities": libs,   # list; joined by the caller after adding SASA-based flags
+        "binder_sequence": seq,
+    }
+
+
+def _principal_axis(coords):
+    """Unit vector along the long axis (direction of most spread)."""
+    centered = coords - coords.mean(axis=0)
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    return vh[0]
+
+
+def _target_interface_res(array, binder_chain, target_chains, cutoff):
+    """(chain, res_id) of target residues in contact with the binder."""
+    binder_mask = array.chain_id == binder_chain
+    target_mask = np.isin(array.chain_id, list(target_chains))
+    if not binder_mask.any() or not target_mask.any():
+        return []
+    b_coord = array.coord[binder_mask]
+    t_coord, t_chain, t_resid = array.coord[target_mask], array.chain_id[target_mask], array.res_id[target_mask]
+    hits = set()
+    for i in range(0, len(t_coord), 2048):
+        chunk = t_coord[i : i + 2048]
+        d = np.linalg.norm(chunk[:, None, :] - b_coord[None, :, :], axis=-1)
+        hit = d.min(axis=1) <= cutoff
+        for ch, rr, h in zip(t_chain[i : i + 2048], t_resid[i : i + 2048], hit, strict=True):
+            if h:
+                hits.add((str(ch), int(rr)))
+    return sorted(hits)
+
+
+def parse_epitope(spec):
+    """Parse a declared epitope, "B:45,47,50-58" or "B:45+C:12", to {(chain, res_id)}.
+
+    Ranges are inclusive. A bare number without a chain prefix is rejected rather
+    than guessed at: a design run usually has one target chain today and two
+    tomorrow, and silently binding the spec to whichever chain happens to be first
+    is how an epitope definition rots without anyone noticing.
+    """
+    residues, chain = set(), None
+    if not spec or not str(spec).strip():
+        return residues
+    for block in str(spec).replace("|", "+").split("+"):
+        for token in block.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if ":" in token:
+                chain, token = (t.strip() for t in token.split(":", 1))
+                if not token:
+                    continue
+            if chain is None:
+                raise ValueError(
+                    f"epitope token {token!r} has no chain; write it as CHAIN:RESID "
+                    "(e.g. B:45 or B:45-58)")
+            if "-" in token.lstrip("-"):
+                lo, hi = token.split("-", 1) if not token.startswith("-") else (token, token)
+                try:
+                    lo_i, hi_i = int(lo), int(hi)
+                except ValueError as exc:
+                    raise ValueError(f"bad epitope range {token!r}") from exc
+                if hi_i < lo_i:
+                    lo_i, hi_i = hi_i, lo_i
+                residues.update((chain, r) for r in range(lo_i, hi_i + 1))
+            else:
+                try:
+                    residues.add((chain, int(token)))
+                except ValueError as exc:
+                    raise ValueError(f"bad epitope residue {token!r}") from exc
+    return residues
+
+
+def _epitope_agreement(array, target_chains, contacted, declared):
+    """Compare the epitope a design actually contacts with the one that was asked for.
+
+    Every other epitope column here is descriptive: it reports whatever patch the
+    complex happens to show. None of them can say the design landed on the wrong
+    site, because the site it landed on becomes the epitope they describe. A design
+    that drifted to a second patch can therefore pass every column in this table.
+    That is what this pair of numbers is for, and it needs an epitope supplied from
+    outside the structure.
+
+    Both are residue-level over the target residues in contact (`interface_cutoff`),
+    not contact-weighted -- consistent with the other epitope columns, and a count
+    of atom pairs would let one deeply buried residue outvote five shallow ones.
+
+      epitope_contact_fraction  share of contacted target residues that were declared
+                                (precision: did it stay on-site)
+      epitope_coverage          share of declared residues contacted
+                                (recall: how much of the site it used)
+
+    Reporting only the first would call a design that grips three residues of a
+    twenty-residue epitope a perfect hit. Declared residues absent from the
+    structure are counted and returned, because a typo in a residue number
+    otherwise inflates precision while quietly shrinking the denominator of
+    coverage.
+    """
+    if not declared:
+        return {}
+    present = {(str(c), int(r)) for c, r in zip(array.chain_id, array.res_id, strict=True)
+               if str(c) in set(target_chains)}
+    missing = sorted(declared - present)
+    resolved = declared & present
+    touched = set(contacted)
+    hit = touched & resolved
+    return {
+        "epitope_declared_n": len(declared),
+        "epitope_declared_missing": len(missing),
+        "epitope_contacted_n": len(touched),
+        "epitope_hit_n": len(hit),
+        "epitope_contact_fraction": (len(hit) / len(touched)) if touched else float("nan"),
+        "epitope_coverage": (len(hit) / len(resolved)) if resolved else float("nan"),
+    }
+
+
+def _approach_angle(binder_ca, paratope_centroid, epitope_centroid):
+    """Angle (0-90 deg) between the binder's long axis and the paratope->epitope
+    axis. Near 0 the binder points end-on into the target; near 90 it lies across
+    the surface. STCRpy measures a docking angle for TCRs against a fixed MHC
+    frame; this is the same idea without needing a reference frame, so it works
+    for any binder. NaN if we can't compute it."""
+    if len(binder_ca) < 2 or paratope_centroid is None or epitope_centroid is None:
+        return float("nan")
+    axis = _principal_axis(binder_ca)
+    binding = epitope_centroid - paratope_centroid
+    n_bind = np.linalg.norm(binding)
+    if n_bind == 0:
+        return float("nan")
+    cos = abs(float(np.dot(axis, binding / n_bind)))   # axis has no direction
+    return float(np.degrees(np.arccos(min(cos, 1.0))))
+
+
+def _planarity_rmsd(coords):
+    """RMSD of points to their best-fit plane. Small = a flat epitope patch
+    (little to grip); bigger = concave/knobby. NaN below 3 points."""
+    if len(coords) < 3:
+        return float("nan")
+    centered = coords - coords.mean(axis=0)
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    normal = vh[-1]
+    return float(np.sqrt(np.mean((centered @ normal) ** 2)))
+
+
+# Black & Mould 1991 residue hydrophobicity (Expasy ProtScale "Hphob. / Black").
+# SAP shifts this so Gly = 0.
+_BLACK_MOULD = {
+    "A": 0.616, "R": 0.000, "N": 0.236, "D": 0.028, "C": 0.680, "E": 0.043,
+    "Q": 0.251, "G": 0.501, "H": 0.165, "I": 0.943, "L": 0.943, "K": 0.283,
+    "M": 0.738, "F": 1.000, "P": 0.711, "S": 0.359, "T": 0.450, "W": 0.878,
+    "Y": 0.880, "V": 0.825,
+}
+_CATION = {"ARG": ("NH1", "NH2", "NE"), "LYS": ("NZ",), "HIS": ("ND1", "NE2")}
+_ANION = {"ASP": ("OD1", "OD2"), "GLU": ("OE1", "OE2")}
+
+
+def _count_interface_hbonds(array, binder_chain, target_chains, cutoff=3.5):
+    """Interface N/O--N/O contacts within 3.5 A. A geometric proxy for H-bonds:
+    with no hydrogens we can't check donor/acceptor identity or angle, so this
+    counts potential polar contacts (tends to over-count)."""
+    polar = np.isin(array.element, ["N", "O"])
+    b = array.coord[polar & (array.chain_id == binder_chain)]
+    t = array.coord[polar & np.isin(array.chain_id, list(target_chains))]
+    if len(b) == 0 or len(t) == 0:
+        return 0
+    n = 0
+    for i in range(0, len(b), 2048):
+        d = np.linalg.norm(b[i:i + 2048][:, None, :] - t[None, :, :], axis=-1)
+        n += int((d <= cutoff).sum())
+    return n
+
+
+def _charged_mask(array, table):
+    m = np.zeros(len(array), dtype=bool)
+    for res, names in table.items():
+        m |= (array.res_name == res) & np.isin(array.atom_name, list(names))
+    return m
+
+
+def _count_salt_bridges(array, binder_chain, target_chains, cutoff=4.0):
+    """Interface salt bridges: distinct cross-chain residue pairs where a cationic
+    side-chain N (Arg/Lys/His) is within 4 A of an anionic side-chain O (Asp/Glu)."""
+    cat = np.where(_charged_mask(array, _CATION))[0]
+    ani = np.where(_charged_mask(array, _ANION))[0]
+    if len(cat) == 0 or len(ani) == 0:
+        return 0
+    tset = set(target_chains)
+    d = np.linalg.norm(array.coord[cat][:, None, :] - array.coord[ani][None, :, :], axis=-1)
+    pairs = set()
+    for ci, ai in zip(*np.where(d <= cutoff), strict=True):
+        gc, ga = cat[ci], ani[ai]
+        chc, cha = str(array.chain_id[gc]), str(array.chain_id[ga])
+        if (chc == binder_chain and cha in tset) or (cha == binder_chain and chc in tset):
+            pairs.add(((chc, int(array.res_id[gc])), (cha, int(array.res_id[ga]))))
+    return len(pairs)
+
+
+def _interface_packing(array, binder_chain, target_chains, binder_bsa, cutoff=4.0):
+    """Interface heavy-atom contacts (<= 4 A) per 100 A^2 of buried area. A
+    lightweight packing-density PROXY for Rosetta's contact molecular surface --
+    denser contacts per buried area = better packing. Not the validated metric."""
+    if not np.isfinite(binder_bsa) or binder_bsa <= 0:
+        return float("nan")
+    heavy = array.element != "H"
+    b = array.coord[heavy & (array.chain_id == binder_chain)]
+    t = array.coord[heavy & np.isin(array.chain_id, list(target_chains))]
+    if len(b) == 0 or len(t) == 0:
+        return float("nan")
+    n = 0
+    for i in range(0, len(b), 2048):
+        d = np.linalg.norm(b[i:i + 2048][:, None, :] - t[None, :, :], axis=-1)
+        n += int((d <= cutoff).sum())
+    return 100.0 * n / binder_bsa
+
+
+def _buried_unsat_polar(array, atom_sasa, binder_chain, target_chains,
+                        iface_cutoff=5.0, burial_sasa=2.0, partner_cutoff=3.5):
+    """Buried unsatisfied polar atoms at the interface (binder side).
+
+    A binder polar heavy atom (N/O) is a liability when it is (a) in the
+    interface zone (within `iface_cutoff` A of a target polar atom), (b) buried
+    in the complex (per-atom SASA <= `burial_sasa` A^2), yet (c) has no other
+    polar heavy atom in a DIFFERENT residue within `partner_cutoff` A to serve as
+    an H-bond partner. Burying a polar group costs the H-bond it made to water, so
+    an unsatisfied buried polar is destabilizing -- it is a known separator of
+    successful vs failed interface designs (Stranges & Kuhlman, Protein Sci 2013)
+    and is penalized in de novo binder design (Cao et al., Nature 2022). It is the
+    signal that separates a real, H-bond-satisfied polar interface from a floppy
+    one, so it matters most for polar-epitope targeting.
+
+    Proxy, exactly like _count_interface_hbonds: with no hydrogens we cannot check
+    donor/acceptor valence or angle, so an atom is counted satisfied if ANY polar
+    atom of another residue is near it. This CONSERVATIVELY under-counts unsat
+    (a geometrically wrong neighbour still "satisfies"). Returns (buns_count,
+    satisfied_fraction) over the interface-buried binder polar atoms; fraction is
+    NaN when there are no such atoms to judge.
+    """
+    polar = np.isin(array.element, ["N", "O"])
+    binder_polar_idx = np.where(polar & (array.chain_id == binder_chain))[0]
+    tgt_polar = array.coord[polar & np.isin(array.chain_id, list(target_chains))]
+    if len(binder_polar_idx) == 0 or len(tgt_polar) == 0:
+        return 0, float("nan")
+    polar_idx = np.where(polar)[0]
+    polar_coord = array.coord[polar_idx]
+    polar_chain = array.chain_id[polar_idx]
+    polar_res = array.res_id[polar_idx]
+    buns = 0
+    considered = 0
+    for gi in binder_polar_idx:
+        if atom_sasa[gi] > burial_sasa:                      # exposed -> not buried
+            continue
+        c = array.coord[gi]
+        if np.linalg.norm(tgt_polar - c, axis=1).min() > iface_cutoff:   # not at interface
+            continue
+        considered += 1
+        d = np.linalg.norm(polar_coord - c, axis=1)
+        other_res = (polar_chain != array.chain_id[gi]) | (polar_res != array.res_id[gi])
+        if not ((d <= partner_cutoff) & other_res).any():
+            buns += 1
+    if considered == 0:
+        return 0, float("nan")
+    return buns, round(1.0 - buns / considered, 3)
+
+
+def _sap_score(binder_sub, binder_iso_sasa, radius=10.0):
+    """Static-structure Spatial Aggregation Propensity (Chennamsetty 2009) on the
+    ISOLATED binder. Per residue: sum, over residues whose Cbeta is within `radius`,
+    of (relative SASA x Black-Mould hydrophobicity shifted so Gly=0).
+
+    Returns a (peak, total_load) tuple:
+      peak       - the maximum windowed value = hottest aggregation-prone patch.
+      total_load - sum of the positive windowed values = whole-surface aggregation
+                   load. Peak flags one bad spot; load reflects how much sticky
+                   surface there is overall (the two are complementary).
+    Simplifications vs the original: single-structure SASA (no MD average) and
+    whole-residue relative SASA (Tien max-ASA) instead of side-chain SAA vs an
+    Ala-X-Ala reference."""
+    sub = binder_sub
+    if len(sub) == 0:
+        return float("nan"), float("nan")
+    res_sasa = struc.apply_residue_wise(sub, binder_iso_sasa, np.sum)
+    starts = struc.get_residue_starts(sub)
+    gly = _BLACK_MOULD["G"]
+    contrib, coords = [], []
+    for k, s in enumerate(starts):
+        name3 = str(sub.res_name[s])
+        ref = _REF_MAX_ASA.get(name3, 0.0)
+        rel = (res_sasa[k] / ref) if ref > 0 else 0.0
+        h = _BLACK_MOULD.get(_THREE_TO_ONE.get(name3, "X"), gly) - gly  # unknown -> 0
+        rid = int(sub.res_id[s])
+        m_cb = (sub.res_id == rid) & (sub.atom_name == "CB")
+        m_ca = (sub.res_id == rid) & (sub.atom_name == "CA")
+        c = sub.coord[m_cb][0] if m_cb.any() else (sub.coord[m_ca][0] if m_ca.any() else None)
+        if c is not None:
+            contrib.append(rel * h)
+            coords.append(c)
+    if len(coords) < 1:
+        return float("nan"), float("nan")
+    coords = np.array(coords)
+    contrib = np.array(contrib)
+    within = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1) <= radius
+    windowed = within @ contrib
+    return float(np.max(windowed)), float(np.sum(np.clip(windowed, 0.0, None)))
+
+
+# Aggrescan3D a3v intrinsic aggregation-propensity scale, verbatim from
+# aggrescan/data/matrices/aggrescan.mat (Aggrescan3D 1.0.2). Higher = more
+# aggregation-prone. Distinct from a hydrophobicity scale: it is calibrated on
+# experimental aggregation data (Conchillo-Sole 2007), so aromatics/beta-branched
+# residues score high and charged residues score strongly negative.
+_A3V = {
+    "I": 1.9136, "F": 1.8456, "V": 1.6856, "L": 1.4716, "Y": 1.2506, "W": 1.1286,
+    "M": 1.0016, "C": 0.6956, "A": 0.0556, "T": -0.0674, "S": -0.2024, "P": -0.2424,
+    "G": -0.4434, "H": -0.9414, "Q": -1.1394, "N": -1.2104, "K": -1.6164,
+    "E": -1.7304, "D": -1.7014, "R": -1.7534,
+}
+
+
+# naccess reference max-ASA, the values Aggrescan3D's own freeSASA call uses for
+# relative SASA. They are compiled into freesasa's classifier_naccess.c rather than
+# written in naccess.config. Taken from freesasa 2.0.1 (MIT, (c) Simon Mitternacht).
+# Kept separate from _REF_MAX_ASA (Tien 2013), which every other column uses: Tien
+# is ~25% larger, which pushed every partially-exposed residue down a band and made
+# the port run ~30% hot against the reference. See tests/a3d_correctness.py.
+_A3D_REF_MAX_ASA = {
+    "ALA": 102.31, "ARG": 232.08, "ASN": 137.97, "ASP": 134.50, "CYS": 127.09,
+    "GLN": 172.15, "GLU": 166.09, "GLY": 71.50, "HIS": 173.15, "ILE": 166.62,
+    "LEU": 159.40, "LYS": 192.51, "MET": 185.85, "PHE": 193.15, "PRO": 131.26,
+    "SER": 109.82, "THR": 131.81, "TRP": 226.33, "TYR": 206.14, "VAL": 146.03,
+}
+
+
+def _a3d_score(binder_sub, binder_iso_sasa, max_dist=10.0):
+    """Aggrescan3D score (Zambrano 2015), ported faithfully from Aggrescan3D 1.0.2,
+    on the ISOLATED binder. Per residue (CA as centre):
+
+        agg_sup = 0                                        if RSA% < 10  (buried)
+                = a3v[aa] * 0.0599 * exp(0.0521*min(RSA,55))  otherwise
+        agg_fin = agg_sup + sum over residues within max_dist (CA-CA, excl self)
+                  of  agg_sup_neighbour * 1.2915 * exp(-2.56/max_dist * dist)
+    Buried central residues (agg_sup == 0) keep agg_fin = 0.
+
+    Returns (peak, total_positive):
+      peak            - max agg_fin  (hottest aggregation-prone spot)
+      total_positive  - sum of positive agg_fin = whole-surface aggregation load;
+                        this is the value the Aggrescan3D server reports as "A3D score".
+
+    a3v scale + all constants are taken verbatim from Aggrescan3D 1.0.2, and RSA
+    uses the same naccess reference max-ASA the reference tool does. Remaining
+    difference: absolute SASA comes from biotite rather than freeSASA with naccess
+    radii, so values track real A3D closely but are not bit-identical.
+
+    Measured against real Aggrescan3D 1.0.2 on 40 single-chain structures by
+    tests/a3d_correctness.py: a3d_score Pearson r=0.9996 (mean ratio 0.99, median
+    relative error 0.9%), a3d_total_positive r=0.9998.
+    Complements SAP (which uses a hydrophobicity scale + patch sum); A3D is
+    calibrated on aggregation data and thresholds out buried residues."""
+    sub = binder_sub
+    if len(sub) == 0:
+        return float("nan"), float("nan")
+    res_sasa = struc.apply_residue_wise(sub, binder_iso_sasa, np.sum)
+    starts = struc.get_residue_starts(sub)
+    agg_sup, coords = [], []
+    for k, s in enumerate(starts):
+        name3 = str(sub.res_name[s])
+        aa = _THREE_TO_ONE.get(name3, "X")
+        ref = _A3D_REF_MAX_ASA.get(name3, 0.0)
+        rid = int(sub.res_id[s])
+        m_ca = (sub.res_id == rid) & (sub.atom_name == "CA")
+        if aa not in _A3V or not m_ca.any():
+            continue
+        rsa = 100.0 * (res_sasa[k] / ref) if ref > 0 else 0.0     # relative SASA, percent
+        sup = 0.0 if rsa < 10.0 else _A3V[aa] * 0.0599 * np.exp(0.0521 * min(rsa, 55.0))
+        agg_sup.append(sup)
+        coords.append(sub.coord[m_ca][0])
+    if len(coords) < 1:
+        return float("nan"), float("nan")
+    coords = np.array(coords)
+    agg_sup = np.array(agg_sup, dtype=float)
+    d = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
+    w = 1.2915 * np.exp((-2.56 / max_dist) * d)
+    w[d >= max_dist] = 0.0        # A3D uses a strict distance cutoff
+    np.fill_diagonal(w, 0.0)      # exclude self (dist == 0)
+    agg_dis = w @ agg_sup
+    agg_fin = agg_sup + np.where(agg_sup != 0.0, agg_dis, 0.0)   # buried centres stay 0
+    return float(np.max(agg_fin)), float(np.sum(np.clip(agg_fin, 0.0, None)))
+
+
+_POS_RES = {"ARG", "LYS"}
+_NEG_RES = {"ASP", "GLU"}
+
+
+def _charge_patches(binder_sub, binder_iso_sasa, radius=10.0):
+    """TAP-style surface charge patches (Raybould 2019) on the ISOLATED binder. Per
+    residue, sum the SASA-weighted formal charge over residues whose Cbeta is within
+    `radius`, keeping the positive and negative sides separate so a basic cluster is
+    not cancelled by a nearby acidic one.
+
+    Returns (pos_patch, neg_patch), both >= 0: the strongest exposed positive and
+    negative charge cluster, i.e. an effective count of exposed R/K (resp. D/E) packed
+    within `radius`. Clustered like-charge on the surface drives viscosity and
+    self-association, which net charge / pI and salt-bridge counts miss. Charges are
+    R/K (+1) and D/E (-1); His is left neutral (only ~10% protonated at pH 7.4).
+
+    Thresholds are deliberately not baked in: TAP's amber/red cutoffs are calibrated on
+    antibody Fv surfaces and do not transfer to de-novo minibinders, so this is a
+    reported number like sap_score, not a gate."""
+    sub = binder_sub
+    if len(sub) == 0:
+        return float("nan"), float("nan")
+    res_sasa = struc.apply_residue_wise(sub, binder_iso_sasa, np.sum)
+    starts = struc.get_residue_starts(sub)
+    pos, neg, coords = [], [], []
+    for k, s in enumerate(starts):
+        name3 = str(sub.res_name[s])
+        ref = _REF_MAX_ASA.get(name3, 0.0)
+        rel = (res_sasa[k] / ref) if ref > 0 else 0.0
+        rid = int(sub.res_id[s])
+        m_cb = (sub.res_id == rid) & (sub.atom_name == "CB")
+        m_ca = (sub.res_id == rid) & (sub.atom_name == "CA")
+        c = sub.coord[m_cb][0] if m_cb.any() else (sub.coord[m_ca][0] if m_ca.any() else None)
+        if c is None:
+            continue
+        pos.append(rel if name3 in _POS_RES else 0.0)
+        neg.append(rel if name3 in _NEG_RES else 0.0)
+        coords.append(c)
+    if len(coords) < 1:
+        return float("nan"), float("nan")
+    coords = np.array(coords)
+    within = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1) <= radius
+    return float(np.max(within @ np.array(pos))), float(np.max(within @ np.array(neg)))
+
+
+def _paratope_patches(binder_sub, binder_iso_sasa, interface_ids, reach=10.0):
+    """Interface-aware version of the patch idea, which is TAP's actual move: score the
+    binding region, not the whole surface. Over binder residues within `reach` (Cbeta)
+    of a paratope (interface) residue, sum the SASA-weighted Black-Mould hydrophobicity
+    (shifted so Gly=0) and the SASA-weighted net formal charge.
+
+    Returns (hydrophobicity, net_charge): how sticky and how charge-clumped the
+    interface neighbourhood is. hydrophobicity is a positive load like sap_total but
+    localised to the paratope (only residues more hydrophobic than Gly count);
+    net_charge is signed (>0 basic paratope, <0 acidic). NaN if there is no interface."""
+    sub = binder_sub
+    if len(sub) == 0 or not interface_ids:
+        return float("nan"), float("nan")
+    res_sasa = struc.apply_residue_wise(sub, binder_iso_sasa, np.sum)
+    starts = struc.get_residue_starts(sub)
+    gly = _BLACK_MOULD["G"]
+    hyd, chg, coords, is_paratope = [], [], [], []
+    for k, s in enumerate(starts):
+        name3 = str(sub.res_name[s])
+        ref = _REF_MAX_ASA.get(name3, 0.0)
+        rel = (res_sasa[k] / ref) if ref > 0 else 0.0
+        rid = int(sub.res_id[s])
+        m_cb = (sub.res_id == rid) & (sub.atom_name == "CB")
+        m_ca = (sub.res_id == rid) & (sub.atom_name == "CA")
+        c = sub.coord[m_cb][0] if m_cb.any() else (sub.coord[m_ca][0] if m_ca.any() else None)
+        if c is None:
+            continue
+        one = _THREE_TO_ONE.get(name3, "X")
+        hyd.append(max(0.0, rel * (_BLACK_MOULD.get(one, gly) - gly)))   # hydrophobic load, >= 0
+        chg.append(rel * (1.0 if name3 in _POS_RES else -1.0 if name3 in _NEG_RES else 0.0))
+        coords.append(c)
+        is_paratope.append(rid in interface_ids)
+    if not any(is_paratope):
+        return float("nan"), float("nan")
+    coords, hyd, chg = np.array(coords), np.array(hyd), np.array(chg)
+    pcoords = coords[np.array(is_paratope)]
+    near = (np.linalg.norm(coords[:, None, :] - pcoords[None, :, :], axis=-1) <= reach).any(axis=1)
+    return float(hyd[near].sum()), float(chg[near].sum())
+
+
+def _score_binder_chain(array, atom_sasa, name, binder_chain, target_chains, chain_lens,
+                        relsasa, interface_cutoff, exposure_cutoff, declared_epitope=None,
+                        degradation_context="complex"):
+    ordered_ids = _chain_res_ids(array, binder_chain)
+    nterm_id, cterm_id = (ordered_ids[0], ordered_ids[-1]) if ordered_ids else (None, None)
+    # one residue in from each end, for the chain-extension direction
+    n_adj_id = ordered_ids[1] if len(ordered_ids) >= 2 else None
+    c_adj_id = ordered_ids[-2] if len(ordered_ids) >= 2 else None
+
+    def _resname(rid):
+        m = (array.chain_id == binder_chain) & (array.res_id == rid)
+        return str(array.res_name[m][0]) if m.any() else ""
+
+    interface_ids = _interface_residue_ids(array, binder_chain, target_chains, interface_cutoff)
+    binder_mask = array.chain_id == binder_chain
+    binder_sub = array[binder_mask]
+    binder_iso_sasa = np.nan_to_num(struc.sasa(binder_sub), nan=0.0)  # once; shared by BSA/SAP/A3D
+    # The degradation checks ask about a chemical reaction on a solvent-exposed side
+    # chain, and whether the target is present changes the answer for every interface
+    # residue. Both readings are legitimate -- "will it oxidise while bound" vs "will it
+    # oxidise in the vial" -- so this is a choice the caller makes, not one hidden here.
+    if degradation_context == "free":
+        degradation_relsasa = _residue_relsasa(binder_sub, binder_iso_sasa)
+    elif degradation_context == "complex":
+        degradation_relsasa = relsasa
+    else:
+        raise ValueError(
+            f"degradation_context must be 'complex' or 'free', got {degradation_context!r}")
+    binder_bsa = _binder_bsa(atom_sasa, binder_mask, binder_iso_sasa)
+    n_hbonds = _count_interface_hbonds(array, binder_chain, target_chains)
+    n_salt_bridges = _count_salt_bridges(array, binder_chain, target_chains)
+    buns_interface, polar_satisfied_frac = _buried_unsat_polar(array, atom_sasa, binder_chain, target_chains)
+    interface_packing = _interface_packing(array, binder_chain, target_chains, binder_bsa)
+    n_rel = relsasa.get((binder_chain, nterm_id), float("nan"))
+    c_rel = relsasa.get((binder_chain, cterm_id), float("nan"))
+    n_dist = _min_dist_to_interface(array, binder_chain, nterm_id, interface_ids)
+    c_dist = _min_dist_to_interface(array, binder_chain, cterm_id, interface_ids)
+
+    paratope = _paratope_centroid(array, binder_chain, interface_ids)
+    n_orient = _terminus_orientation(_ca_coord(array, binder_chain, nterm_id),
+                                     _ca_coord(array, binder_chain, n_adj_id), paratope)
+    c_orient = _terminus_orientation(_ca_coord(array, binder_chain, cterm_id),
+                                     _ca_coord(array, binder_chain, c_adj_id), paratope)
+
+    # only meaningful if the terminal residue is actually a cysteine
+    n_sg = _sg_sasa(array, atom_sasa, binder_chain, nterm_id) if _resname(nterm_id) == "CYS" else float("nan")
+    c_sg = _sg_sasa(array, atom_sasa, binder_chain, cterm_id) if _resname(cterm_id) == "CYS" else float("nan")
+
+    # pose + grippability, both computed straight from coordinates
+    binder_ca = array.coord[(array.chain_id == binder_chain) & (array.atom_name == "CA")]
+    target_iface = _target_interface_res(array, binder_chain, target_chains, interface_cutoff)
+    epitope_ca = np.array([c for c in (_ca_coord(array, ch, r) for ch, r in target_iface) if c is not None])
+    epitope_centroid = epitope_ca.mean(axis=0) if len(epitope_ca) else None
+    approach = _approach_angle(binder_ca, paratope, epitope_centroid)
+    planarity = _planarity_rmsd(epitope_ca)
+    epi_hyd_frac, epi_aromatic_n = _epitope_composition(array, target_iface)
+    glyco_sites = _glyco_occluded_epitope(array, target_chains, target_iface)
+
+    # sequence-side developability + expression
+    binder_seq = _binder_sequence(array, binder_chain)
+    seqm = _sequence_metrics(binder_seq)
+    ox_sites = _exposed_oxidation(array, binder_chain, degradation_relsasa)
+    deamidation_sites = _exposed_deamidation_sites(array, binder_chain, degradation_relsasa)
+    liabilities = list(seqm["sequence_liabilities"])
+    if ox_sites:
+        liabilities.append("solvent-exposed Met/Trp (oxidation): " + ", ".join(ox_sites))
+    if deamidation_sites:
+        liabilities.append("exposed deamidation/isomerization motif(s): " + ", ".join(deamidation_sites))
+    liabilities_str = "; ".join(liabilities)
+    sap, sap_total = _sap_score(binder_sub, binder_iso_sasa)
+    a3d_peak, a3d_total = _a3d_score(binder_sub, binder_iso_sasa)
+    charge_patch_pos, charge_patch_neg = _charge_patches(binder_sub, binder_iso_sasa)
+    paratope_hyd, paratope_chg = _paratope_patches(binder_sub, binder_iso_sasa, interface_ids)
+
+    # quality warnings say the binder/interface itself looks bad; tag-site
+    # warnings are only about where to put a tag. qc_pass ignores the latter.
+    quality, tagsite = [], []
+    if np.isfinite(planarity) and planarity < 1.0:
+        quality.append(f"flat epitope (planarity RMSD={planarity:.2f} A): low grippability")
+    if np.isfinite(epi_hyd_frac) and epi_hyd_frac < 0.2 and epi_aromatic_n == 0:
+        quality.append("polar epitope (few hydrophobic/aromatic anchors): hard to grip")
+    if glyco_sites:
+        quality.append("glyco-occluded epitope: exposed N-glycan sequon(s) at "
+                       + ", ".join(glyco_sites) + " in/near the interface (glycan can mask a grippable backbone)")
+    if np.isfinite(seqm["gravy"]) and seqm["gravy"] > 0.4:
+        quality.append(f"hydrophobic (GRAVY={seqm['gravy']:.2f}): solubility/aggregation risk")
+    if chain_lens.get(binder_chain) == max(chain_lens.values()):
+        quality.append("binder is the largest chain, so binder/target may be flipped")
+    if np.isfinite(binder_bsa) and binder_bsa < 300.0:
+        quality.append(f"small interface (binder BSA={binder_bsa:.0f} A^2): possibly weak/spurious")
+    if buns_interface >= 3:
+        quality.append(f"{buns_interface} buried unsatisfied polar atom(s) at interface "
+                       f"(satisfied frac={polar_satisfied_frac:.2f}): floppy/under-packed polar interface")
+
+    if not interface_ids:
+        recommended = "N/A"
+        quality.append("no interface residues found (check target chains / cutoff)")
+    else:
+        recommended = "C" if (np.nan_to_num(c_dist) >= np.nan_to_num(n_dist)) else "N"
+        rec_dist, other_dist = (c_dist, n_dist) if recommended == "C" else (n_dist, c_dist)
+        rec_rel = c_rel if recommended == "C" else n_rel
+        rec_orient = c_orient if recommended == "C" else n_orient
+        if np.isfinite(rec_rel) and rec_rel < exposure_cutoff:
+            tagsite.append(f"recommended {recommended}-term is buried (relSASA={rec_rel:.2f})")
+        if np.isfinite(rec_dist) and np.isfinite(other_dist) and abs(rec_dist - other_dist) < 5.0:
+            tagsite.append("both termini ~equidistant from interface (ambiguous)")
+        if np.isfinite(rec_dist) and rec_dist < 8.0:
+            tagsite.append(f"recommended terminus is close to interface ({rec_dist:.1f} A)")
+        if np.isfinite(rec_orient) and rec_orient > 0.5:
+            tagsite.append(f"recommended {recommended}-term points toward interface (orientation={rec_orient:.2f})")
+
+    warnings = quality + tagsite
+    qc_pass = not quality
+
+    return {
+        "pdb": name,
+        "binder_chain": binder_chain,
+        "target_chains": ",".join(target_chains),
+        "n_interface_res": len(interface_ids),
+        "binder_bsa": round(binder_bsa, 1) if np.isfinite(binder_bsa) else float("nan"),
+        "n_hbonds": n_hbonds,
+        "n_salt_bridges": n_salt_bridges,
+        "buns_interface": buns_interface,
+        "interface_polar_satisfied_frac": polar_satisfied_frac if np.isfinite(polar_satisfied_frac) else float("nan"),
+        "interface_packing": round(interface_packing, 2) if np.isfinite(interface_packing) else float("nan"),
+        "approach_angle": round(approach, 1) if np.isfinite(approach) else float("nan"),
+        "epitope_planarity": round(planarity, 2) if np.isfinite(planarity) else float("nan"),
+        "epitope_hydrophobic_frac": round(epi_hyd_frac, 2) if np.isfinite(epi_hyd_frac) else float("nan"),
+        "epitope_aromatic_n": epi_aromatic_n,
+        "epitope_glyco_occluded": bool(glyco_sites),
+        "epitope_glyco_sites": ";".join(glyco_sites),
+        "nterm_resnum": nterm_id,
+        "nterm_resname": _resname(nterm_id),
+        "nterm_relsasa": round(n_rel, 3) if np.isfinite(n_rel) else float("nan"),
+        "nterm_dist_to_interface": round(n_dist, 2) if np.isfinite(n_dist) else float("nan"),
+        "nterm_orientation": round(n_orient, 2) if np.isfinite(n_orient) else float("nan"),
+        "nterm_sg_sasa": round(n_sg, 2) if np.isfinite(n_sg) else float("nan"),
+        "cterm_resnum": cterm_id,
+        "cterm_resname": _resname(cterm_id),
+        "cterm_relsasa": round(c_rel, 3) if np.isfinite(c_rel) else float("nan"),
+        "cterm_dist_to_interface": round(c_dist, 2) if np.isfinite(c_dist) else float("nan"),
+        "cterm_orientation": round(c_orient, 2) if np.isfinite(c_orient) else float("nan"),
+        "cterm_sg_sasa": round(c_sg, 2) if np.isfinite(c_sg) else float("nan"),
+        "recommended_tag": recommended,
+        "mw": seqm["mw"],
+        "gravy": seqm["gravy"],
+        "pi": seqm["pi"],
+        "net_charge": seqm["net_charge"],
+        "lys_arg_pct": seqm["lys_arg_pct"],
+        "instability_index": seqm["instability_index"],
+        "ext_coeff_280": seqm["ext_coeff_280"],
+        "sap_score": round(sap, 2) if np.isfinite(sap) else float("nan"),
+        "sap_total": round(sap_total, 2) if np.isfinite(sap_total) else float("nan"),
+        "sap_per_res": (round(sap_total / len(ordered_ids), 3)
+                        if ordered_ids and np.isfinite(sap_total) else float("nan")),
+        "a3d_score": round(a3d_peak, 3) if np.isfinite(a3d_peak) else float("nan"),
+        "a3d_total_positive": round(a3d_total, 3) if np.isfinite(a3d_total) else float("nan"),
+        "charge_patch_pos": round(charge_patch_pos, 2) if np.isfinite(charge_patch_pos) else float("nan"),
+        "charge_patch_neg": round(charge_patch_neg, 2) if np.isfinite(charge_patch_neg) else float("nan"),
+        "paratope_hydrophobicity": round(paratope_hyd, 2) if np.isfinite(paratope_hyd) else float("nan"),
+        "paratope_charge": round(paratope_chg, 2) if np.isfinite(paratope_chg) else float("nan"),
+        "paratope_res": ",".join(str(r) for r in sorted(interface_ids)),
+        "sequence_liabilities": liabilities_str,
+        "warnings": "; ".join(warnings),
+        "qc_pass": qc_pass,
+        # which exposure convention produced the exposure-derived columns, so a table
+        # read six months later does not have to guess (see _residue_relsasa)
+        "exposure_context_degradation": degradation_context,
+        "exposure_context_surface": "free",
+        "binder_sequence": seqm["binder_sequence"],
+        # only present when an epitope was declared; see _epitope_agreement
+        **_epitope_agreement(array, target_chains, target_iface, declared_epitope or set()),
+    }
+
+
+def self_association(self_fold_path, row, self_chains=None, interface_cutoff=5.0):
+    """Where does the binder stick to itself, relative to where it binds the target?
+
+    Takes a predicted binder homodimer (two copies of the binder) plus a `row` from
+    score_structure for the same binder on its target, and reports how much of the
+    paratope the self-interface covers.
+
+    Interface PAE, ipTM and ipSAE all answer "is a self-interface predicted", never
+    "where". The distinction decides what to do about it: a binder that self-associates
+    away from the paratope is a formulation problem, one that self-associates through
+    the paratope competes with its own target binding.
+
+    Residue numbering in the homodimer must match the complex (it does if both came
+    from the same sequence); `residues_matched` is false when it does not.
+
+    Two numbers, because they answer different questions. overlap_frac is how much of
+    the paratope the self-interface buries - that is the one that decides whether target
+    binding is blocked. enrichment compares that overlap with what a self-interface of
+    the same size would bury sitting anywhere on the binder at random, so it says whether
+    the paratope is preferred (>1) or merely caught up in a large interface (~1).
+
+    The verdict bands the occluded fraction at 0.5 and 0.2. Those are stated conventions,
+    not calibrated cutoffs - there is no dataset of de-novo binders with measured
+    self-association to fit one on. Read the numbers.
+    """
+    array = _load_protein(self_fold_path)
+    chain_lens = _chain_lengths(array)
+    chains = list(self_chains) if self_chains else sorted(chain_lens)
+    if len(chains) != 2 or any(c not in chain_lens for c in chains):
+        return {"self_fold": os.path.basename(self_fold_path),
+                "error": f"need exactly two binder copies, got chains {chain_lens}"}
+    a, b = chains
+    seqs = [tuple(array.res_name[(array.chain_id == c) & (array.atom_name == "CA")]) for c in (a, b)]
+    if seqs[0] != seqs[1]:
+        return {"self_fold": os.path.basename(self_fold_path),
+                "error": f"chains {a}/{b} are not two copies of one sequence "
+                         f"({chain_lens[a]} vs {chain_lens[b]} residues) - this needs a homodimer"}
+
+    atom_sasa = np.nan_to_num(struc.sasa(array), nan=0.0)
+    a_mask = array.chain_id == a
+    a_iso_sasa = np.nan_to_num(struc.sasa(array[a_mask]), nan=0.0)
+    self_ids = _interface_residue_ids(array, a, [b], interface_cutoff)
+    self_bsa = _binder_bsa(atom_sasa, a_mask, a_iso_sasa)
+
+    paratope = {int(r) for r in str(row.get("paratope_res", "")).split(",") if r.strip()}
+    n_res = len(_chain_res_ids(array, a))
+    matched = bool(paratope) and paratope <= set(_chain_res_ids(array, a))
+
+    overlap = self_ids & paratope
+    frac = len(overlap) / len(paratope) if paratope else float("nan")
+    expected = len(self_ids) * len(paratope) / n_res if paratope and n_res else float("nan")
+    enrichment = len(overlap) / expected if expected else float("nan")
+
+    if not self_ids:
+        verdict, note = "no-self-interface", "no inter-copy contacts at this cutoff"
+    elif not matched:
+        verdict, note = "unknown", "paratope residue numbering absent from the homodimer"
+    else:
+        specific = "prefers the paratope" if enrichment > 1.2 else \
+                   ("avoids it" if enrichment < 0.8 else "no site preference")
+        verdict = ("paratope-occluding" if frac >= 0.5 else
+                   "paratope-partial" if frac >= 0.2 else "paratope-clear")
+        tail = {"paratope-occluding": "it competes with target binding",
+                "paratope-partial": "it eats into the binding surface",
+                "paratope-clear": "a formulation problem, not a binding one"}[verdict]
+        note = (f"self-association buries {frac:.0%} of the paratope "
+                f"({enrichment:.1f}x chance, {specific}) - {tail}")
+
+    return {"self_fold": os.path.basename(self_fold_path),
+            "self_bsa": round(self_bsa, 1) if np.isfinite(self_bsa) else float("nan"),
+            "self_n_interface_res": len(self_ids),
+            "self_paratope_overlap_n": len(overlap),
+            "self_paratope_overlap_frac": round(frac, 3) if frac == frac else float("nan"),
+            "self_paratope_enrichment": round(enrichment, 2) if enrichment == enrichment else float("nan"),
+            "self_verdict": verdict, "residues_matched": matched, "self_note": note}
+
+
+def grippability_consensus(row, iara_epitope_score=None):
+    """Combine binderQC's PHYSICAL grippability read with an optional LEARNED score.
+
+    binderQC scores grippability from geometry/chemistry (epitope planarity +
+    hydrophobic fraction + aromatic anchors, already in `row`, and now the
+    glyco-occlusion flag). A learned target-side model like IARA scores it from
+    actual de-novo outcomes. They are orthogonal, so agreement is informative.
+
+    `iara_epitope_score` is the mean hotspot probability (0-100) over the epitope,
+    computed by the CALLER with whatever tool they have. It is passed in rather than
+    invoked here on purpose: binderQC stays dependency-free and MIT-clean, and never
+    vendors an externally-licensed model.
+
+    Returns {"physical_grippable", "learned_grippable", "consensus", "note"} where
+    consensus is "grippable" | "flat" | "disagree" | "physical-only". physical-flat
+    AND learned-flat is the high-confidence "do not design de-novo" call (the TNC-A1
+    Face-1 case); a disagreement is worth a human look (glycan? flexible loop?).
+    """
+    planarity = row.get("epitope_planarity", float("nan"))
+    hyd = row.get("epitope_hydrophobic_frac", float("nan"))
+    arom = row.get("epitope_aromatic_n", 0) or 0
+    # mirror binderQC's own physical bars (the flat/polar/glyco warnings)
+    phys = (planarity == planarity and planarity >= 1.0)
+    if hyd == hyd and hyd < 0.2 and arom == 0:
+        phys = False
+    if row.get("epitope_glyco_occluded"):
+        phys = False
+    if iara_epitope_score is None:
+        return {"physical_grippable": bool(phys), "learned_grippable": None,
+                "consensus": "physical-only", "note": "no learned (IARA) score provided"}
+    learned = float(iara_epitope_score) >= 50.0
+    if phys and learned:
+        c, note = "grippable", "physical + learned agree: designable"
+    elif not phys and not learned:
+        c, note = "flat", "physical + learned agree FLAT: do not design de-novo"
+    else:
+        c, note = "disagree", "physical vs learned disagree: inspect (glycan / flexible loop / conformation)"
+    return {"physical_grippable": bool(phys), "learned_grippable": bool(learned),
+            "consensus": c, "note": note}
+
+
+def score_structure(path: str, binder_chains: "list[str] | None" = None,
+                    target_chains: "list[str] | None" = None,
+                    interface_cutoff: float = 5.0, exposure_cutoff: float = 0.25,
+                    verbose: bool = True, epitope: "str | None" = None,
+                    degradation_context: str = "complex") -> "list[dict]":
+    """Score every binder chain in one structure file.
+
+    binder_chains / target_chains are lists of chain ids. Leave binder_chains
+    empty to auto-guess it (shortest chain in the length window, printed when
+    verbose); leave target_chains empty to use every other chain as target.
+    interface_cutoff is the heavy-atom contact distance in A; exposure_cutoff is
+    the relSASA below which a terminus counts as buried.
+
+    degradation_context picks the exposure convention for the oxidation and
+    deamidation/isomerization checks: "complex" (default) asks whether the site is
+    exposed while bound, "free" asks about the binder alone in solution. The
+    aggregation and patch columns (SAP, A3D, charge patches) are always computed on
+    the free binder, because that is how their source definitions are written.
+
+    epitope optionally declares the target site the design was meant to hit, as
+    "B:45,47,50-58". Supplying it adds epitope_contact_fraction / epitope_coverage,
+    the only columns here that can tell you the design landed somewhere else; every
+    other epitope column describes whatever patch the structure shows.
+
+    Returns one dict per binder chain, or a single {"pdb", "error"} dict if the
+    requested chains aren't there.
+    """
+    binder_chains = list(binder_chains) if binder_chains else []
+    target_chains = list(target_chains) if target_chains else []
+
+    declared_epitope = parse_epitope(epitope) if epitope else set()
+
+    array = _load_protein(path)
+    name = os.path.basename(path)
+    chain_lens = _chain_lengths(array)
+    present = set(chain_lens)
+
+    if binder_chains:
+        binders = [c for c in binder_chains if c in present]
+        if len(binders) < len(binder_chains):
+            missing = sorted(set(binder_chains) - present)
+            return [{"pdb": name, "error": f"binder chains {missing} not in {sorted(present)}"}]
+    else:
+        binders = _guess_binder_chains(chain_lens)
+        if not binders:
+            return [{"pdb": name, "error": f"could not auto-guess a binder chain among {chain_lens}"}]
+        if verbose:
+            print(f"[auto] {name}: binder guess = {binders[0]} (chain lengths {chain_lens})")
+
+    # SASA of the whole complex once, reused for relSASA and the SG lookups
+    atom_sasa = np.nan_to_num(struc.sasa(array), nan=0.0)
+    relsasa = _residue_relsasa(array, atom_sasa)
+    rows = []
+    for bc in binders:
+        if target_chains:
+            targets = [c for c in target_chains if c in present]
+        else:
+            targets = sorted(present - set(binders))
+        rows.append(_score_binder_chain(
+            array, atom_sasa, name, bc, targets, chain_lens, relsasa, interface_cutoff,
+            exposure_cutoff, declared_epitope, degradation_context
+        ))
+    return rows

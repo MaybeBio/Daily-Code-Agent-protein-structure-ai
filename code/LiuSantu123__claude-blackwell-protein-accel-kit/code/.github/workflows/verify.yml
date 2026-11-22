@@ -1,0 +1,15 @@
+name: verify
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  source-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: bash -n scripts/*.sh kits/*/run.sh
+      - name: Check release contents
+        run: bash scripts/verify_tree.sh

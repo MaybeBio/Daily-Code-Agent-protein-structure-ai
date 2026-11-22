@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdflow"
+version = "0.1.0"
+description = "Reproducible protein-design workflow: backbone -> sequence -> structure -> metrics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "pandas>=2.0",
+  "biotite>=1.0",
+  "biopython>=1.83",
+  "PyYAML>=6.0",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+pdflow = "pdflow.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

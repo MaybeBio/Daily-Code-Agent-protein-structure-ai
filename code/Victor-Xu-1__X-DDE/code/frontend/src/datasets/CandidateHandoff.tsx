@@ -1,0 +1,316 @@
+import { useState, type ReactNode } from "react";
+import type { Job, Language } from "../types";
+import type { DatasetCandidate } from "./types";
+import { usePoseAssets } from "../docking/usePoseAssets";
+import {
+  poseAssetMessage,
+  type PoseAssetTarget,
+} from "../docking/pose-asset-lookup";
+import type { ScientificObject } from "../research/types";
+import { ResearchHandoff } from "../guided/ResearchHandoff";
+import { AdmetForm } from "../admet/AdmetForm";
+import { QualityForm } from "../quality/QualityForm";
+import { DockingForm } from "../docking/DockingForm";
+import { LibraryScreenForm } from "../chemistry/LibraryScreenForm";
+import { Editors } from "../editors/Editors";
+import { useDeployment } from "../deployment/client";
+import { ScientificForm } from "../integrations/ScientificForm";
+import { DeploymentPanel } from "../deployment/DeploymentPanel";
+import { usePoseSession } from "../viewer/PoseSession";
+import { usePoseHandoff } from "../viewer/usePoseHandoff";
+import {
+  PoseStudyInput,
+  type PoseStudySelection,
+} from "../viewer/PoseStudyInput";
+
+type Action =
+  | "interactions"
+  | "admet"
+  | "quality"
+  | "dock"
+  | "score"
+  | "minimize"
+  | "edit"
+  | "curate";
+const followupCapability = {
+  interactions: "plip.profile",
+  admet: "admet.predict",
+  quality: "posebusters.check",
+  dock: "gnina.dock",
+  score: "gnina.score",
+  minimize: "gnina.minimize",
+  edit: null,
+  curate: "chemistry.screen",
+} as const;
+
+function EditCandidate(props: {
+  job: Job;
+  language: Language;
+  object: ScientificObject;
+  onCreated(job: Job): void;
+}) {
+  const deployment = useDeployment();
+  const [setup, setSetup] = useState(false);
+  if (setup)
+    return (
+      <>
+        <button type="button" onClick={() => setSetup(false)}>
+          {props.language === "zh"
+            ? "← 返回分子编辑"
+            : "← Back to molecule editing"}
+        </button>
+        <DeploymentPanel
+          data={deployment.data}
+          error={deployment.error}
+          refresh={deployment.refresh}
+          language={props.language}
+        />
+      </>
+    );
+  return (
+    <Editors
+      language={props.language}
+      deployment={deployment.data}
+      deploymentError={deployment.error}
+      onRetry={deployment.refresh}
+      onSetup={() => setSetup(true)}
+      initialObject={props.object}
+      onCreated={props.onCreated}
+    />
+  );
+}
+export function CandidateHandoff({
+  job,
+  candidate,
+  language,
+  onCreated,
+  children,
+  receptorArtifact,
+}: {
+  job: Job;
+  candidate: DatasetCandidate | undefined;
+  language: Language;
+  onCreated?(job: Job): void;
+  children: ReactNode;
+  receptorArtifact?: string;
+}) {
+  const zh = language === "zh",
+    [submittedSource, setSubmittedSource] = useState<string | null>(null);
+  const session = usePoseSession();
+  const sourceKey = JSON.stringify([
+    job.id,
+    candidate?.id,
+    candidate?.artifact,
+    candidate?.record,
+    session?.plan.key,
+  ]);
+  const handoff = usePoseHandoff<Action>(sourceKey);
+  const action = handoff.value?.action;
+  const input = handoff.value?.selection;
+  const molecular: PoseAssetTarget | null = candidate?.artifact
+    ? { name: candidate.artifact, kind: "molecule", record: candidate.record }
+    : null;
+  const receptor: PoseAssetTarget | null =
+    receptorArtifact && candidate?.geometry === "binding_pose"
+      ? { name: receptorArtifact, kind: "structure", record: 0 }
+      : null;
+  const paired: PoseAssetTarget | null = candidate?.complex_artifact
+    ? { name: candidate.complex_artifact, kind: "structure", record: 0 }
+    : null;
+  const assets = usePoseAssets(
+    job.id,
+    [molecular, receptor, paired].filter((item) => item !== null),
+  );
+  const molecule = molecular ? assets.object(molecular) : undefined;
+  const protein = receptor ? assets.object(receptor) : undefined;
+  const complex = paired ? assets.object(paired) : undefined;
+  function created(value: Job) {
+    onCreated?.(value);
+    setSubmittedSource(sourceKey);
+  }
+  const inputProtein =
+    input?.displayed && input.receptor !== undefined
+      ? input.receptor
+      : protein?.reference;
+  function continueStudy(value: Action, selection: PoseStudySelection) {
+    if (!selection.ready) return;
+    handoff.open(value, selection);
+  }
+  if (action && input)
+    return (
+      <ResearchHandoff
+        language={language}
+        onBack={handoff.clear}
+        capability={followupCapability[action]}
+      >
+        {action === "interactions" ? (
+          complex ? (
+            <ScientificForm
+              form="plip.profile"
+              language={language}
+              initialStructure={complex.reference}
+              onCreated={created}
+            />
+          ) : null
+        ) : action === "admet" ? (
+          <AdmetForm
+            language={language}
+            initialMolecule={input.reference}
+            onCreated={created}
+          />
+        ) : action === "quality" ? (
+          <QualityForm
+            language={language}
+            initialMolecule={input.reference}
+            initialProtein={
+              candidate?.geometry === "binding_pose" ? inputProtein : null
+            }
+            onCreated={created}
+          />
+        ) : action === "edit" ? (
+          input.object ? (
+            <EditCandidate
+              job={job}
+              object={input.object}
+              language={language}
+              onCreated={created}
+            />
+          ) : (
+            <p role="alert">
+              {zh
+                ? "当前版本暂时无法编辑，请返回结果重新选择。"
+                : "This version cannot be edited. Return to results and select it again."}
+            </p>
+          )
+        ) : action === "curate" ? (
+          <LibraryScreenForm
+            language={language}
+            initialLibrary={input.reference}
+            onCreated={created}
+          />
+        ) : (
+          <DockingForm
+            mode={action}
+            language={language}
+            initialLigand={input.reference}
+            initialReceptor={inputProtein ?? null}
+            onCreated={created}
+          />
+        )}
+      </ResearchHandoff>
+    );
+  return (
+    <>
+      {children}
+      <div className="dataset-continuation">
+        <span>{zh ? "继续研究" : "Continue research"}</span>
+        <PoseStudyInput original={molecule} language={language}>
+          {(selection, waiting) =>
+            selection ? (
+              <>
+                {(["admet", "quality", "dock", "edit", "curate"] as const).map(
+                  (value, index) => (
+                    <button
+                      type="button"
+                      key={value}
+                      disabled={
+                        !selection.ready ||
+                        (value === "edit" && !selection.object)
+                      }
+                      onClick={() => continueStudy(value, selection)}
+                    >
+                      {
+                        (zh
+                          ? [
+                              "性质与早期安全性",
+                              "构象与姿势质控",
+                              "继续对接",
+                              "编辑当前分子",
+                              "整理候选集合",
+                            ]
+                          : [
+                              "ADMET predictions",
+                              "Pose quality",
+                              "Dock molecule",
+                              "Edit molecule",
+                              "Curate candidate set",
+                            ])[index]
+                      }
+                    </button>
+                  ),
+                )}
+                {candidate?.geometry === "binding_pose" &&
+                  protein &&
+                  !(selection.displayed && selection.receptor === null) && (
+                    <>
+                      <button
+                        type="button"
+                        disabled={!selection.ready}
+                        onClick={() => continueStudy("score", selection)}
+                      >
+                        {zh ? "重新评分" : "Rescore"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!selection.ready}
+                        onClick={() => continueStudy("minimize", selection)}
+                      >
+                        {zh ? "优化结合姿势" : "Refine pose"}
+                      </button>
+                    </>
+                  )}
+                {complex && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (molecule)
+                        continueStudy("interactions", {
+                          ...selection,
+                          reference: molecule.reference,
+                          object: molecule,
+                          displayed: false,
+                          ready: true,
+                        });
+                    }}
+                  >
+                    {zh
+                      ? "原始复合物相互作用"
+                      : "Original complex interactions"}
+                  </button>
+                )}
+              </>
+            ) : (
+              <button
+                type="button"
+                disabled={assets.busy || waiting || !candidate?.artifact}
+                onClick={() => void assets.refresh()}
+              >
+                {zh
+                  ? "准备当前候选供后续研究"
+                  : "Register candidate for follow-up"}
+              </button>
+            )
+          }
+        </PoseStudyInput>
+      </div>
+      {assets.busy && (
+        <button type="button" className="text-button" onClick={assets.cancel}>
+          {zh ? "取消读取" : "Cancel loading"}
+        </button>
+      )}
+      {assets.error && (
+        <div role="alert">
+          <p>{poseAssetMessage(assets.error, zh)}</p>
+          <button type="button" onClick={() => void assets.retry()}>
+            {zh ? "重新读取保存的材料" : "Retry saved materials"}
+          </button>
+        </div>
+      )}
+      {submittedSource === sourceKey && (
+        <p role="status">
+          {zh ? "新研究任务已提交。" : "The new study has been submitted."}
+        </p>
+      )}
+    </>
+  );
+}

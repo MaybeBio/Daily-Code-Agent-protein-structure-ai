@@ -1,0 +1,1165 @@
+"""gemmi-backed writers that project canonical structures to coordinate text."""
+
+import os
+import secrets
+from collections.abc import Iterator
+from itertools import groupby
+from math import isfinite
+from os import PathLike
+from pathlib import Path
+
+from protrepair.chemistry.nonstandard.registry import (
+    build_bundled_nonstandard_registry,
+)
+from protrepair.chemistry.standard.components import (
+    build_standard_component_library,
+)
+from protrepair.errors import (
+    ModelInvariantError,
+    StructureSerializationError,
+    UnsupportedFileFormatError,
+)
+from protrepair.io.gemmi_normalization import (
+    gemmi,
+    infer_file_format,
+)
+from protrepair.io.pdb_records import (
+    PDB_MAX_ATOM_SERIAL,
+    decode_pdb_integer,
+    encode_pdb_integer,
+    pdb_atom_identity_matches,
+    pdb_text_field_fits,
+)
+from protrepair.structure.aggregate import ProteinStructure
+from protrepair.structure.constitution import AtomSite, ResidueRole, ResidueSite
+from protrepair.structure.disulfide import disulfide_atom_ref_pair
+from protrepair.structure.geometry import AtomGeometry, ResidueGeometry
+from protrepair.structure.labels import AtomRef
+from protrepair.structure.provenance import FileFormat
+from protrepair.structure.slots import AtomIndex
+from protrepair.structure.topology import (
+    BondProvenance,
+    BondRelationshipType,
+    SourceBondRecordType,
+    TopologyBond,
+    is_covalent_like_relationship,
+    is_model_resolved_provenance,
+)
+
+
+def write_structure(
+    structure: ProteinStructure,
+    output_path: Path | str | PathLike[str],
+    *,
+    file_format: FileFormat | None = None,
+) -> None:
+    """Serialize a canonical structure to a path-like coordinate file."""
+
+    target_path = Path(output_path)
+    resolved_format = (
+        infer_file_format(target_path) if file_format is None else file_format
+    )
+    serialized_structure = write_structure_string(structure, resolved_format)
+    _atomic_write_text(target_path, serialized_structure)
+
+
+def _atomic_write_text(output_path: Path, text: str) -> None:
+    """Write text through a same-directory temporary file and atomic replace."""
+
+    temp_path: Path | None = None
+    file_descriptor: int | None = None
+    try:
+        temp_path, file_descriptor = _open_same_directory_temp_file(output_path)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as file:
+            file_descriptor = None
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+
+        _preserve_existing_output_mode(temp_path, output_path)
+        temp_path.replace(output_path)
+    except BaseException:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if temp_path is not None:
+            _remove_temporary_output(temp_path)
+        raise
+
+
+def _open_same_directory_temp_file(output_path: Path) -> tuple[Path, int]:
+    """Create one exclusive temporary file next to the output path."""
+
+    parent = output_path.parent
+    if not parent.exists():
+        raise FileNotFoundError(
+            f"output directory does not exist for {output_path}: {parent}"
+        )
+    if not parent.is_dir():
+        raise NotADirectoryError(
+            f"output parent is not a directory for {output_path}: {parent}"
+        )
+
+    for _ in range(100):
+        temp_path = parent / f".{output_path.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            file_descriptor = os.open(
+                temp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o666,
+            )
+        except FileExistsError:
+            continue
+
+        return temp_path, file_descriptor
+
+    raise FileExistsError(
+        f"could not allocate an unused temporary output path for {output_path}"
+    )
+
+
+def _remove_temporary_output(temp_path: Path) -> None:
+    """Best-effort cleanup for temporary output files."""
+
+    try:
+        temp_path.unlink()
+    except OSError:
+        pass
+
+
+def _preserve_existing_output_mode(temp_path: Path, output_path: Path) -> None:
+    """Keep existing target permissions across atomic replacement."""
+
+    try:
+        output_mode = output_path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        return
+
+    temp_path.chmod(output_mode)
+
+
+def write_structure_string(structure: ProteinStructure, file_format: FileFormat) -> str:
+    """Serialize a canonical structure to a coordinate string.
+
+    Parameters
+    ----------
+    structure : ProteinStructure
+        Canonical facts to project.
+    file_format : FileFormat
+        PDB or mmCIF output.
+
+    Returns
+    -------
+    str
+        The complete coordinate payload. PDB omits selected alternate-location
+        labels; mmCIF retains them.
+
+    Raises
+    ------
+    StructureSerializationError
+        PDB cannot preserve the admitted identities or numeric precision.
+    UnsupportedFileFormatError
+        The format selector is unsupported.
+    """
+
+    numeric_patches = (
+        _validate_pdb_output(structure) if file_format is FileFormat.PDB else {}
+    )
+    raw_structure = build_gemmi_structure(structure)
+    if file_format is FileFormat.PDB:
+        add_topology_connections_to_gemmi_structure(
+            raw_structure,
+            structure,
+            file_format=file_format,
+            bonds=(
+                *pdb_typed_connection_topology_bonds_for_egress(structure),
+                *_realized_pdb_cap_links_for_egress(structure),
+            ),
+        )
+        _normalize_pdb_altlocs(raw_structure)
+        pdb_text, serial_by_atom_ref = _project_public_pdb_records(
+            raw_structure.make_pdb_string(),
+            structure,
+            numeric_patches=numeric_patches,
+        )
+        return append_pdb_conect_records_from_topology(
+            pdb_text,
+            structure,
+            serial_by_atom_ref=serial_by_atom_ref,
+        )
+
+    if file_format is FileFormat.MMCIF:
+        bonds = gemmi_connection_topology_bonds_for_egress(
+            structure,
+            include_model_resolved=True,
+        )
+        add_topology_connections_to_gemmi_structure(
+            raw_structure,
+            structure,
+            file_format=file_format,
+            bonds=bonds,
+        )
+        mmcif_document = raw_structure.make_mmcif_document()
+        _quote_mmcif_asym_ids(mmcif_document, raw_structure[0])
+        _set_mmcif_connection_orders(mmcif_document, bonds)
+        _restore_mmcif_atom_attributes(mmcif_document, structure)
+        return mmcif_document.as_string()
+
+    raise UnsupportedFileFormatError(f"unsupported file format: {file_format}")
+
+
+def _realized_pdb_cap_links_for_egress(
+    structure: ProteinStructure,
+) -> tuple[TopologyBond, ...]:
+    """Retain realized cap chemistry if archival PDB ordering loses the source path."""
+    return tuple(
+        bond
+        for link in structure.provenance.ingress.pdb_adjacent_cap_links
+        if (
+            bond := link.bond_in(
+                structure.constitution, structure.geometry, structure.topology
+            )
+        )
+        is not None
+        and bond.relationship_type is BondRelationshipType.COVALENT
+        and bond.order == 1
+        and not bond.aromatic
+    )
+
+
+def _validate_pdb_output(
+    structure: ProteinStructure,
+) -> dict[int, tuple[tuple[int, str], ...]]:
+    if structure.geometry.atom_count() > PDB_MAX_ATOM_SERIAL:
+        raise StructureSerializationError(
+            "PDB atom serial capacity exceeded; use mmCIF"
+        )
+    for water in structure.constitution.waters:
+        emitted = gemmi.Residue()
+        emitted.name = water.component_id
+        if not emitted.is_water():
+            raise StructureSerializationError(
+                f"PDB cannot preserve the water role of {water.component_id} "
+                f"at {water.residue_id.display_token()}; use mmCIF"
+            )
+    for residue in structure.constitution.residue_slots:
+        label = residue.residue_id.display_token()
+        _require_pdb_field(residue.residue_id.chain_id, 2, f"chain ID at {label}")
+        _require_pdb_field(residue.component_id, 3, f"component ID at {label}")
+        _require_pdb_field(
+            residue.residue_id.insertion_code or "",
+            1,
+            f"insertion code at {label}",
+            shared_adapter_limit=True,
+        )
+        try:
+            encode_pdb_integer(residue.residue_id.seq_num, width=4)
+        except ValueError as error:
+            raise StructureSerializationError(
+                f"PDB residue number at {label} is outside the supported range; use mmCIF"
+            ) from error
+
+    patches: dict[int, tuple[tuple[int, str], ...]] = {}
+    for value, atom in enumerate(structure.constitution.atom_slots):
+        index = AtomIndex(value)
+        geometry = structure.geometry.atom_geometry(index)
+        if not pdb_text_field_fits(atom.name, width=4):
+            _require_pdb_field(
+                atom.name,
+                4,
+                f"atom name at {structure.constitution.atom_ref_at(index).display_token()}",
+            )
+        if not pdb_text_field_fits(geometry.altloc or "", width=1):
+            _require_pdb_field(
+                geometry.altloc or "",
+                1,
+                f"altloc at {structure.constitution.atom_ref_at(index).display_token()}",
+                shared_adapter_limit=True,
+            )
+        charge = structure.topology.formal_charge(index)
+        if charge is not None and abs(charge) > 9:
+            raise StructureSerializationError(
+                f"PDB formal charge {charge} at "
+                f"{structure.constitution.atom_ref_at(index).display_token()} "
+                "exceeds one digit; use mmCIF"
+            )
+        fields: list[tuple[int, str]] = []
+        for offset, coordinate in zip(
+            (30, 38, 46),
+            (geometry.position.x, geometry.position.y, geometry.position.z),
+            strict=True,
+        ):
+            # Interior values fit 8.3 without formatting; boundary values use the oracle below.
+            if -999.999 <= coordinate <= 9999.999:
+                continue
+            token = _pdb_overflow_field(
+                coordinate,
+                width=8,
+                normal_places=3,
+                minimum_places=2,
+                label=f"coordinate at {structure.constitution.atom_ref_at(index).display_token()}",
+            )
+            if token is not None:
+                fields.append((offset, token))
+        b_factor = 0.0 if geometry.b_factor is None else geometry.b_factor
+        if not 0.0 <= b_factor <= 999.99:
+            token = _pdb_overflow_field(
+                b_factor,
+                width=6,
+                normal_places=2,
+                minimum_places=0,
+                label=f"B-factor at {structure.constitution.atom_ref_at(index).display_token()}",
+            )
+            if token is not None:
+                fields.append((60, token))
+        if fields:
+            patches[value] = tuple(fields)
+    return patches
+
+
+def _require_pdb_field(
+    value: str,
+    width: int,
+    label: str,
+    *,
+    shared_adapter_limit: bool = False,
+) -> None:
+    if pdb_text_field_fits(value, width=width):
+        return
+    remedy = (
+        "the coordinate adapter requires a single printable character"
+        if shared_adapter_limit
+        else "use mmCIF"
+    )
+    raise StructureSerializationError(f"PDB {label} {value!r} does not fit; {remedy}")
+
+
+def _pdb_overflow_field(
+    value: float,
+    *,
+    width: int,
+    normal_places: int,
+    minimum_places: int,
+    label: str,
+) -> str | None:
+    if isfinite(value):
+        for places in range(normal_places, minimum_places - 1, -1):
+            token = f"{value:.{places}f}" + ("." if places == 0 else "")
+            if len(token) <= width:
+                return None if places == normal_places else token.rjust(width)
+    raise StructureSerializationError(
+        f"PDB {label} value {value!r} cannot fit with {minimum_places} fractional "
+        "digits; use mmCIF"
+    )
+
+
+def _pdb_atom_records(
+    lines: list[str],
+    structure: ProteinStructure,
+) -> Iterator[tuple[int, AtomIndex, int]]:
+    atom_indices = atom_index_values_in_coordinate_write_order(structure)
+    cursor = 0
+    seen_serials: set[int] = set()
+    for line_index, line in enumerate(lines):
+        is_atom = line.startswith(("ATOM  ", "HETATM"))
+        if not is_atom and not (line.startswith("TER   ") and line[6:11].strip()):
+            continue
+        try:
+            serial = decode_pdb_integer(line[6:11], width=5)
+        except ValueError as error:
+            raise StructureSerializationError(
+                f"invalid emitted PDB serial: {error}"
+            ) from error
+        if not 1 <= serial <= PDB_MAX_ATOM_SERIAL or serial in seen_serials:
+            raise StructureSerializationError(
+                f"PDB serial collision or overflow {serial}; use mmCIF"
+            )
+        seen_serials.add(serial)
+        if not is_atom:
+            continue
+        if cursor >= len(atom_indices):
+            raise StructureSerializationError(
+                "PDB output has more atom records than canonical atoms"
+            )
+        yield line_index, AtomIndex(atom_indices[cursor]), serial
+        cursor += 1
+    if cursor != len(atom_indices):
+        raise StructureSerializationError(
+            "PDB output has fewer atom records than canonical atoms"
+        )
+
+
+def _project_public_pdb_records(
+    pdb_text: str,
+    structure: ProteinStructure,
+    *,
+    numeric_patches: dict[int, tuple[tuple[int, str], ...]],
+) -> tuple[str, dict[AtomRef, int]]:
+    lines = pdb_text.splitlines(keepends=True)
+    serial_by_atom_ref: dict[AtomRef, int] = {}
+    for line_index, index, serial in _pdb_atom_records(lines, structure):
+        ref = structure.constitution.atom_ref_at(index)
+        residue = structure.constitution.residue_site_at(
+            structure.constitution.residue_index_for_atom_index(index)
+        )
+        atom = structure.constitution.atom_site_at(index)
+        charge = structure.topology.formal_charge(index)
+        line = lines[line_index]
+        ending = line[len(line.rstrip("\r\n")) :]
+        record = line.removesuffix(ending).ljust(80)
+        if atom.element_identity.is_isotope_alias():
+            record = (
+                record[:76] + f"{atom.element_identity.source_symbol:>2}" + record[78:]
+            )
+        if charge == 0:
+            record = record[:78] + "0+" + record[80:]
+        for offset, token in numeric_patches.get(index.value, ()):
+            record = record[:offset] + token + record[offset + len(token) :]
+
+        try:
+            matches = pdb_atom_identity_matches(record, ref, residue.component_id, None)
+        except ValueError as error:
+            raise StructureSerializationError(
+                f"invalid PDB identity at {ref.display_token()}: {error}"
+            ) from error
+        if not matches:
+            raise StructureSerializationError(
+                f"PDB output identity does not match {ref.display_token()}"
+            )
+        serial_by_atom_ref[ref] = serial
+        lines[line_index] = record + ending
+    return "".join(lines), serial_by_atom_ref
+
+
+def _normalize_pdb_altlocs(raw_structure: gemmi.Structure) -> None:
+    # Ingress already selected the atoms; do not run another conformer selection.
+    for model in raw_structure:
+        for chain in model:
+            for residue in chain:
+                for atom in residue:
+                    atom.altloc = "\0"
+
+    for connection in raw_structure.connections:
+        connection.partner1.altloc = "\0"
+        connection.partner2.altloc = "\0"
+
+
+def _quote_mmcif_asym_ids(document: gemmi.cif.Document, model: gemmi.Model) -> None:
+    """Repair unquoted declarations; Gemmi already quotes subchain references."""
+
+    quoted_by_id: dict[str, str] = {}
+    for subchain in model.subchains():
+        subchain_id = subchain.subchain_id()
+        if not subchain_id:
+            continue
+        token = gemmi.cif.quote(subchain_id)
+        if token != subchain_id:
+            quoted_by_id[subchain_id] = token
+
+    if not quoted_by_id:
+        return
+
+    identifiers = document.sole_block().find_values("_struct_asym.id")
+    for row_index, identifier in enumerate(identifiers):
+        if identifier in quoted_by_id:
+            identifiers[row_index] = quoted_by_id[identifier]
+
+
+def _set_mmcif_connection_orders(
+    document: gemmi.cif.Document,
+    bonds: tuple[TopologyBond, ...],
+) -> None:
+    """Project canonical orders into the rows emitted in Gemmi connection order."""
+    if not bonds:
+        return
+    table = document.sole_block().find_mmcif_category("_struct_conn.")
+    table.ensure_loop()
+    loop = table.loop
+    if loop is None:
+        raise ModelInvariantError("Gemmi did not emit a connection loop")
+    loop.add_columns(["_struct_conn.pdbx_value_order"], "?")
+    values = document.sole_block().find_values("_struct_conn.pdbx_value_order")
+    tokens = {1: "sing", 2: "doub", 3: "trip", 4: "quad", None: "?"}
+    if len(values) != len(bonds):
+        raise ModelInvariantError(
+            "Gemmi connection rows do not match topology projection"
+        )
+    for index, bond in enumerate(bonds):
+        if bond.order not in tokens:
+            raise ModelInvariantError(f"mmCIF cannot encode bond order {bond.order}")
+        values[index] = tokens[bond.order]
+
+
+def write_pdb_structure_string_without_conect(structure: ProteinStructure) -> str:
+    """Serialize a canonical structure to PDB text without CONECT records."""
+
+    raw_structure = build_gemmi_structure(structure)
+    add_topology_connections_to_gemmi_structure(
+        raw_structure,
+        structure,
+        file_format=FileFormat.PDB,
+        bonds=pdb_typed_connection_topology_bonds_for_egress(structure),
+    )
+    _normalize_pdb_altlocs(raw_structure)
+    return _restore_pdb_atom_attributes(
+        raw_structure.make_pdb_string(),
+        structure,
+    )
+
+
+def _restore_pdb_atom_attributes(
+    pdb_text: str,
+    structure: ProteinStructure,
+) -> str:
+    """Restore isotope symbols and explicit zeros collapsed by Gemmi."""
+
+    if not any(
+        atom_site.element_identity.is_isotope_alias()
+        for atom_site in structure.constitution.atom_slots
+    ) and not any(
+        atom is not None and atom.formal_charge == 0
+        for atom in structure.topology.atom_topologies
+    ):
+        return pdb_text
+
+    lines = pdb_text.splitlines(keepends=True)
+    coordinate_line_indices = tuple(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith(("ATOM  ", "HETATM"))
+    )
+    atom_index_values = atom_index_values_in_coordinate_write_order(structure)
+    if len(coordinate_line_indices) != len(atom_index_values):
+        raise ModelInvariantError(
+            "PDB isotope restoration requires one coordinate line per atom slot"
+        )
+
+    for line_index, atom_index_value in zip(
+        coordinate_line_indices,
+        atom_index_values,
+        strict=True,
+    ):
+        atom_site = structure.constitution.atom_site_at(AtomIndex(atom_index_value))
+        formal_charge = structure.topology.formal_charge(AtomIndex(atom_index_value))
+        if not atom_site.element_identity.is_isotope_alias() and formal_charge != 0:
+            continue
+
+        line = lines[line_index]
+        line_ending = line[len(line.rstrip("\r\n")) :]
+        record = line.removesuffix(line_ending).ljust(80)
+        if atom_site.element_identity.is_isotope_alias():
+            record = (
+                record[:76]
+                + f"{atom_site.element_identity.source_symbol:>2}"
+                + record[78:]
+            )
+        if formal_charge == 0:
+            record = record[:78] + "0+" + record[80:]
+        lines[line_index] = record + line_ending
+
+    return "".join(lines)
+
+
+def _restore_mmcif_atom_attributes(
+    document: gemmi.cif.Document,
+    structure: ProteinStructure,
+) -> None:
+    """Restore canonical isotope symbols and explicit neutral charge values."""
+
+    if not any(
+        atom_site.element_identity.is_isotope_alias()
+        for atom_site in structure.constitution.atom_slots
+    ) and not any(
+        atom is not None and atom.formal_charge == 0
+        for atom in structure.topology.atom_topologies
+    ):
+        return
+
+    atom_index_values = atom_index_values_in_coordinate_write_order(structure)
+    if not atom_index_values:
+        return
+
+    block = document.sole_block()
+    atom_site_type_symbols = block.find_loop("_atom_site.type_symbol")
+    atom_charges = block.find_loop("_atom_site.pdbx_formal_charge")
+    if len(atom_charges) != len(atom_index_values):
+        raise ModelInvariantError(
+            "mmCIF charge projection requires one row per atom slot"
+        )
+    if len(atom_site_type_symbols) != len(atom_index_values):
+        raise ModelInvariantError(
+            "mmCIF isotope restoration requires one type symbol per atom slot"
+        )
+
+    for row_index, atom_index_value in enumerate(atom_index_values):
+        atom_site = structure.constitution.atom_site_at(AtomIndex(atom_index_value))
+        if atom_site.element_identity.is_isotope_alias():
+            atom_site_type_symbols[row_index] = atom_site.element_identity.source_symbol
+        if structure.topology.formal_charge(AtomIndex(atom_index_value)) == 0:
+            atom_charges[row_index] = "0"
+
+    atom_type_symbols = block.find_loop("_atom_type.symbol")
+    if not atom_type_symbols:
+        raise ModelInvariantError(
+            "mmCIF isotope restoration requires an atom-type symbol loop"
+        )
+    atom_type_symbols.get_loop().set_all_values(
+        (tuple(dict.fromkeys(atom_site_type_symbols)),)
+    )
+
+
+def build_gemmi_structure(
+    structure: ProteinStructure,
+) -> gemmi.Structure:
+    """Project the canonical structure model into a gemmi structure."""
+
+    raw_structure = gemmi.Structure()
+    raw_structure.name = structure.provenance.ingress.source_name or "protrepair"
+    model = gemmi.Model(1)
+    for chain_id, residues in residues_by_chain_id(structure):
+        raw_chain = gemmi.Chain(chain_id)
+        for residue_site in residues:
+            residue_index = structure.constitution.residue_index(
+                residue_site.residue_id
+            )
+            residue_geometry = structure.residue_geometry(residue_index)
+            projected = build_gemmi_residue(
+                residue_site,
+                residue_geometry=residue_geometry,
+                formal_charge_by_atom_name=(
+                    structure.residue_formal_charge_by_atom_name(residue_index)
+                ),
+            )
+            if structure.constitution.role_at(residue_index) is ResidueRole.WATER:
+                projected.entity_type = gemmi.EntityType.Water
+            raw_chain.add_residue(projected)
+
+        model.add_chain(raw_chain)
+
+    raw_structure.add_model(model)
+    raw_structure.setup_entities()
+    raw_structure.assign_label_seq_id()
+    raw_structure.assign_subchains()
+    raw_structure.assign_serial_numbers()
+    return raw_structure
+
+
+def add_topology_connections_to_gemmi_structure(
+    raw_structure: gemmi.Structure,
+    structure: ProteinStructure,
+    *,
+    file_format: FileFormat,
+    bonds: tuple[TopologyBond, ...],
+) -> None:
+    """Project canonical bonds into format-appropriate Gemmi connections.
+
+    Parameters
+    ----------
+    raw_structure : gemmi.Structure
+        Output structure receiving connection records.
+    structure : ProteinStructure
+        Canonical atom identities and bond semantics.
+    file_format : FileFormat
+        Target format; PDB uses SSBOND for known single CYS S-S links.
+    bonds : tuple[TopologyBond, ...]
+        Bonds selected by the target format's emission policy.
+    """
+
+    used_names = {connection.name for connection in raw_structure.connections}
+    next_suffix_by_name: dict[str, int] = {}
+    for bond in bonds:
+        raw_connection = gemmi.Connection()
+        base_name = source_connection_name(bond)
+        name = base_name
+        suffix = next_suffix_by_name.get(base_name, 1)
+        while name in used_names:
+            name = f"{base_name}_{suffix}"
+            suffix += 1
+        next_suffix_by_name[base_name] = suffix
+        used_names.add(name)
+        raw_connection.name = name
+        raw_connection.link_id = source_connection_link_id(bond)
+        raw_connection.type = gemmi_connection_type(bond.relationship_type)
+        if (
+            file_format is FileFormat.PDB
+            and bond.relationship_type is BondRelationshipType.COVALENT
+            and bond.order == 1
+            and not bond.aromatic
+            and disulfide_atom_ref_pair(structure.constitution, bond) is not None
+        ):
+            # LINK cannot distinguish a known single bond from unknown order.
+            raw_connection.type = gemmi.ConnectionType.Disulf
+        if (
+            bond.source_metadata is not None
+            and bond.source_metadata.reported_distance_angstrom is not None
+        ):
+            raw_connection.reported_distance = (
+                bond.source_metadata.reported_distance_angstrom
+            )
+
+        populate_gemmi_connection_partner(
+            raw_connection.partner1,
+            structure,
+            bond.atom_index_1,
+        )
+        populate_gemmi_connection_partner(
+            raw_connection.partner2,
+            structure,
+            bond.atom_index_2,
+        )
+        raw_structure.connections.append(raw_connection)
+
+
+def source_explicit_topology_bonds_for_egress(
+    structure: ProteinStructure,
+) -> tuple[TopologyBond, ...]:
+    """Return all source-explicit topology bonds.
+
+    This is a source-preservation projection, not a concrete writer policy.
+    Format-specific writers should use gemmi_connection_topology_bonds_for_egress
+    or pdb_conect_topology_bonds_for_egress because PDB and mmCIF preserve
+    source-explicit relationships through different boundary records.
+    """
+
+    return tuple(
+        bond
+        for bond in structure.topology.bonds
+        if bond.provenance is BondProvenance.SOURCE_EXPLICIT
+    )
+
+
+def gemmi_connection_topology_bonds_for_egress(
+    structure: ProteinStructure,
+    *,
+    include_model_resolved: bool,
+    include_pdb_conect_origin: bool = True,
+) -> tuple[TopologyBond, ...]:
+    """Return topology bonds emitted through gemmi connection records.
+
+    Gemmi connection records preserve typed relationships such as LINK,
+    struct_conn, disulfide, hydrogen, and metal coordination. Callers that
+    append PDB CONECT separately exclude bonds originating from that untyped
+    connectivity table.
+    """
+
+    return tuple(
+        bond
+        for bond in structure.topology.bonds
+        if _topology_bond_is_gemmi_connection_emittable(
+            bond,
+            include_model_resolved=include_model_resolved,
+        )
+        and (
+            include_pdb_conect_origin
+            or bond.source_metadata is None
+            or bond.source_metadata.record_type is not SourceBondRecordType.PDB_CONECT
+        )
+    )
+
+
+def pdb_typed_connection_topology_bonds_for_egress(
+    structure: ProteinStructure,
+) -> tuple[TopologyBond, ...]:
+    """Return typed source connections and resolved disulfide chemistry.
+
+    Parameters
+    ----------
+    structure : ProteinStructure
+        Canonical structure whose connectivity is being exported.
+
+    Returns
+    -------
+    tuple[TopologyBond, ...]
+        Source typed bonds and disulfides, excluding hydrogen bonds. Disulfide
+        chemistry is preserved even for repaired bonds or resolved CONECT input.
+    """
+
+    return tuple(
+        bond
+        for bond in structure.topology.bonds
+        if bond.relationship_type is not BondRelationshipType.HYDROGEN_BOND
+        and (
+            bond.relationship_type is BondRelationshipType.DISULFIDE
+            or disulfide_atom_ref_pair(structure.constitution, bond) is not None
+            or (
+                bond.provenance is BondProvenance.SOURCE_EXPLICIT
+                and (
+                    bond.source_metadata is None
+                    or bond.source_metadata.record_type
+                    is not SourceBondRecordType.PDB_CONECT
+                )
+            )
+        )
+    )
+
+
+def _topology_bond_is_gemmi_connection_emittable(
+    bond: TopologyBond,
+    *,
+    include_model_resolved: bool,
+) -> bool:
+    """Return whether one topology bond may become a gemmi connection."""
+
+    if bond.provenance is BondProvenance.SOURCE_EXPLICIT:
+        return True
+
+    return include_model_resolved and _topology_bond_is_model_resolved_emittable(bond)
+
+
+def source_connection_name(bond: TopologyBond) -> str:
+    """Return a stable connection identifier for one source topology bond."""
+
+    source_metadata = bond.source_metadata
+    if (
+        source_metadata is not None
+        and source_metadata.source_id is not None
+        and _source_metadata_id_is_specific(bond)
+    ):
+        return source_metadata.source_id
+
+    return f"protrepair_{bond.atom_index_1.value}_{bond.atom_index_2.value}"
+
+
+def source_connection_link_id(bond: TopologyBond) -> str:
+    """Return the best boundary link identifier for one source topology bond."""
+
+    source_metadata = bond.source_metadata
+    if (
+        source_metadata is not None
+        and source_metadata.source_id is not None
+        and _source_metadata_id_is_specific(bond)
+    ):
+        return source_metadata.source_id
+
+    return source_connection_name(bond)
+
+
+def populate_gemmi_connection_partner(
+    raw_partner: gemmi.AtomAddress,
+    structure: ProteinStructure,
+    atom_index: AtomIndex,
+) -> None:
+    """Populate one gemmi connection partner from a canonical atom slot."""
+
+    atom_ref = structure.constitution.atom_ref_at(atom_index)
+    residue_site = structure.constitution.residue_site_at(
+        structure.constitution.residue_index(atom_ref.residue_id)
+    )
+    raw_partner.chain_name = atom_ref.residue_id.chain_id
+    raw_partner.res_id = gemmi.ResidueId()
+    raw_partner.res_id.name = residue_site.component_id
+    raw_partner.res_id.seqid = gemmi.SeqId(
+        atom_ref.residue_id.seq_num,
+        atom_ref.residue_id.insertion_code or " ",
+    )
+    raw_partner.atom_name = atom_ref.atom_name
+    atom_geometry = structure.geometry.atom_geometry(atom_index)
+    raw_partner.altloc = "\0" if atom_geometry.altloc is None else atom_geometry.altloc
+
+
+def gemmi_connection_type(
+    relationship_type: BondRelationshipType,
+) -> gemmi.ConnectionType:
+    """Return the gemmi connection type for one canonical relationship."""
+
+    if relationship_type is BondRelationshipType.COVALENT:
+        return gemmi.ConnectionType.Covale
+    if relationship_type is BondRelationshipType.DISULFIDE:
+        return gemmi.ConnectionType.Disulf
+    if relationship_type is BondRelationshipType.HYDROGEN_BOND:
+        return gemmi.ConnectionType.Hydrog
+    if relationship_type is BondRelationshipType.METAL_COORDINATION:
+        return gemmi.ConnectionType.MetalC
+
+    return gemmi.ConnectionType.Unknown
+
+
+def append_pdb_conect_records_from_topology(
+    pdb_text: str,
+    structure: ProteinStructure,
+    *,
+    serial_by_atom_ref: dict[AtomRef, int],
+) -> str:
+    """Append selected topology bonds using the validated output serial map.
+
+    Parameters
+    ----------
+    pdb_text : str
+        Coordinate records already projected from the structure.
+    structure : ProteinStructure
+        Canonical topology to serialize.
+    serial_by_atom_ref : dict[AtomRef, int]
+        Output serials keyed by canonical atoms, including both bond endpoints.
+
+    Returns
+    -------
+    str
+        Coordinate text with CONECT records.
+
+    Raises
+    ------
+    StructureSerializationError
+        A selected endpoint is missing from the serial map.
+    ModelInvariantError
+        A bond order exceeds the CONECT multiplicity limit.
+    """
+
+    neighbor_serials_by_source: dict[int, list[int]] = {}
+    for bond in pdb_conect_topology_bonds_for_egress(structure):
+        atom_ref_1 = structure.constitution.atom_ref_at(bond.atom_index_1)
+        atom_ref_2 = structure.constitution.atom_ref_at(bond.atom_index_2)
+        serial_1 = serial_by_atom_ref.get(atom_ref_1)
+        serial_2 = serial_by_atom_ref.get(atom_ref_2)
+        if serial_1 is None or serial_2 is None:
+            raise StructureSerializationError(
+                "PDB CONECT endpoint is missing from output: "
+                f"{atom_ref_1.display_token()}--{atom_ref_2.display_token()}"
+            )
+
+        multiplicity = 1 if bond.order is None else bond.order
+        if multiplicity > 4:
+            raise ModelInvariantError(
+                f"PDB CONECT cannot encode bond order {multiplicity}"
+            )
+        neighbor_serials_by_source.setdefault(serial_1, []).extend(
+            [serial_2] * multiplicity
+        )
+        neighbor_serials_by_source.setdefault(serial_2, []).extend(
+            [serial_1] * multiplicity
+        )
+
+    conect_lines = tuple(
+        line
+        for source_serial, neighbor_serials in sorted(
+            neighbor_serials_by_source.items()
+        )
+        for line in format_pdb_conect_lines(
+            source_serial,
+            tuple(sorted(neighbor_serials)),
+        )
+    )
+    if not conect_lines:
+        return pdb_text
+
+    conect_block = "\n".join(conect_lines)
+    if "\nEND" in pdb_text:
+        return pdb_text.replace("\nEND", f"\n{conect_block}\nEND", 1)
+
+    return pdb_text.rstrip("\n") + "\n" + conect_block + "\n"
+
+
+def pdb_conect_topology_bonds_for_egress(
+    structure: ProteinStructure,
+) -> tuple[TopologyBond, ...]:
+    """Return topology bonds that should be represented as PDB CONECT.
+
+    PDB CONECT cannot encode relationship type, so this projection preserves
+    source PDB CONECT records and emits covalent-like repaired/model-resolved
+    bonds. Typed source relationships such as metal coordination stay in gemmi
+    connection records unless they came from PDB CONECT.
+    """
+
+    return tuple(
+        bond
+        for bond in structure.topology.bonds
+        if _topology_bond_is_pdb_conect_emittable(bond)
+    )
+
+
+def _topology_bond_is_pdb_conect_emittable(bond: TopologyBond) -> bool:
+    """Return whether one topology bond may be serialized as PDB CONECT."""
+
+    if bond.provenance is BondProvenance.SOURCE_EXPLICIT:
+        if (
+            bond.source_metadata is not None
+            and bond.source_metadata.record_type is SourceBondRecordType.PDB_CONECT
+        ):
+            return True
+
+        return is_covalent_like_relationship(bond)
+
+    return _topology_bond_is_model_resolved_emittable(bond)
+
+
+def _topology_bond_is_model_resolved_emittable(bond: TopologyBond) -> bool:
+    """Return whether one model-resolved topology bond may be serialized."""
+
+    return is_model_resolved_provenance(bond) and is_covalent_like_relationship(bond)
+
+
+def _source_metadata_id_is_specific(bond: TopologyBond) -> bool:
+    """Return whether source metadata carries a boundary-specific identifier."""
+
+    if bond.source_metadata is None or bond.source_metadata.source_id is None:
+        return False
+    return not (
+        bond.source_metadata.record_type is SourceBondRecordType.PDB_CONECT
+        and bond.source_metadata.source_id == "CONECT"
+    )
+
+
+def pdb_atom_serial_by_atom_ref(
+    pdb_text: str,
+    structure: ProteinStructure,
+) -> dict[AtomRef, int]:
+    """Associate emitted serials with canonical atoms in coordinate write order.
+
+    Parameters
+    ----------
+    pdb_text : str
+        Text emitted for the supplied structure.
+    structure : ProteinStructure
+        Canonical source of atom keys and write order.
+
+    Returns
+    -------
+    dict[AtomRef, int]
+        Canonical atom keys associated with emitted serials.
+
+    Raises
+    ------
+    StructureSerializationError
+        Atom counts or emitted serials do not admit a one-to-one association.
+    """
+    return {
+        structure.constitution.atom_ref_at(index): serial
+        for _, index, serial in _pdb_atom_records(pdb_text.splitlines(), structure)
+    }
+
+
+def atom_index_values_in_coordinate_write_order(
+    structure: ProteinStructure,
+) -> tuple[int, ...]:
+    """Return canonical atom indices in coordinate serialization order."""
+
+    atom_index_values: list[int] = []
+    for _chain_id, residues in residues_by_chain_id(structure):
+        for residue_site in residues:
+            residue_index = structure.constitution.residue_index(
+                residue_site.residue_id
+            )
+            atom_index_values.extend(
+                structure.constitution.atom_index_in_residue(
+                    residue_index,
+                    atom_site.name,
+                ).value
+                for atom_site in residue_site.atom_sites
+            )
+
+    return tuple(atom_index_values)
+
+
+def format_pdb_conect_lines(
+    source_serial: int,
+    neighbor_serials: tuple[int, ...],
+) -> tuple[str, ...]:
+    """Return one or more fixed-width PDB CONECT records for one source atom."""
+
+    # Keep multiplicities together so readers need not recover an order split
+    # over continuation rows; identical repeated rows remain redundant evidence.
+    chunks: list[list[int]] = [[]]
+    for neighbor, occurrences in groupby(sorted(neighbor_serials)):
+        count = sum(1 for _ in occurrences)
+        if count > 4:
+            raise ModelInvariantError("PDB CONECT multiplicity exceeds quadruple order")
+        if len(chunks[-1]) + count > 4:
+            chunks.append([])
+        chunks[-1].extend([neighbor] * count)
+    return tuple(
+        "CONECT"
+        + encode_pdb_integer(source_serial, width=5)
+        + "".join(encode_pdb_integer(neighbor, width=5) for neighbor in chunk)
+        for chunk in chunks
+        if chunk
+    )
+
+
+def build_gemmi_residue(
+    residue_site: ResidueSite,
+    *,
+    residue_geometry: ResidueGeometry,
+    formal_charge_by_atom_name: tuple[tuple[str, int | None], ...],
+) -> gemmi.Residue:
+    """Project a canonical residue into a gemmi residue."""
+
+    raw_residue = gemmi.Residue()
+    raw_residue.name = residue_site.component_id
+    raw_residue.seqid = gemmi.SeqId(
+        residue_site.residue_id.seq_num,
+        residue_site.residue_id.insertion_code or " ",
+    )
+    raw_residue.het_flag = _gemmi_het_flag_for_residue(residue_site)
+    raw_residue.entity_type = (
+        gemmi.EntityType.NonPolymer
+        if residue_site.is_hetero
+        else gemmi.EntityType.Polymer
+    )
+
+    residue_formal_charge_by_atom_name = dict(formal_charge_by_atom_name)
+    for atom_site in residue_site.atom_sites:
+        raw_residue.add_atom(
+            build_gemmi_atom(
+                atom_site,
+                atom_geometry=residue_geometry.atom_geometry(atom_site.name),
+                formal_charge=residue_formal_charge_by_atom_name.get(atom_site.name),
+            )
+        )
+
+    return raw_residue
+
+
+def _gemmi_het_flag_for_residue(residue_site: ResidueSite) -> str:
+    """Return canonical PDB/mmCIF record spelling independently of entity role."""
+
+    if residue_site.is_hetero:
+        return "H"
+    if build_standard_component_library().has(residue_site.component_id):
+        return "A"
+    if build_bundled_nonstandard_registry().get(residue_site.component_id) is not None:
+        return "H"
+    return "A"
+
+
+def build_gemmi_atom(
+    atom_site: AtomSite,
+    *,
+    atom_geometry: AtomGeometry,
+    formal_charge: int | None,
+) -> gemmi.Atom:
+    """Project a canonical atom into a gemmi atom."""
+
+    raw_atom = gemmi.Atom()
+    raw_atom.name = atom_site.name
+    raw_atom.altloc = "\x00" if atom_geometry.altloc is None else atom_geometry.altloc
+    raw_atom.charge = 0 if formal_charge is None else formal_charge
+    raw_atom.element = gemmi.Element(atom_site.element)
+    raw_atom.pos = gemmi.Position(
+        atom_geometry.position.x,
+        atom_geometry.position.y,
+        atom_geometry.position.z,
+    )
+    raw_atom.occ = atom_geometry.occupancy
+    raw_atom.b_iso = 0.0 if atom_geometry.b_factor is None else atom_geometry.b_factor
+    return raw_atom
+
+
+def residues_by_chain_id(
+    structure: ProteinStructure,
+) -> tuple[tuple[str, list[ResidueSite]], ...]:
+    """Return polymer and ligand residues grouped by chain in write order."""
+
+    grouped_residues: dict[str, list[ResidueSite]] = {
+        chain.chain_id: list(chain.residues) for chain in structure.constitution.chains
+    }
+    polymer_chain_ids = tuple(chain.chain_id for chain in structure.constitution.chains)
+
+    for ligand in (*structure.constitution.ligands, *structure.constitution.waters):
+        chain_id = ligand.residue_id.chain_id
+        if chain_id not in grouped_residues:
+            grouped_residues[chain_id] = []
+
+        grouped_residues[chain_id].append(ligand)
+
+    chain_order = polymer_chain_ids + tuple(
+        chain_id for chain_id in grouped_residues if chain_id not in polymer_chain_ids
+    )
+    return tuple((chain_id, grouped_residues[chain_id]) for chain_id in chain_order)

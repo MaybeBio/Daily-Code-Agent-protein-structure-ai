@@ -1,0 +1,186 @@
+name: Molecular design scope and review
+on:
+  workflow_dispatch:
+    inputs:
+      check:
+        type: choice
+        default: questionnaire
+        options: [questionnaire, native-reinvent]
+        description: Native mode runs one real 20-candidate case; no MD or FEP
+  push:
+    paths: &design_review_paths
+      - "frontend/src/integrations/Reinvent*"
+      - "frontend/src/integrations/reinvent-modes.ts"
+      - "frontend/src/integrations/generated.ts"
+      - "frontend/src/integrations/validation*"
+      - "src/opendde_workbench/research/initial_pose.py"
+      - "tests/test_pose_minimization.py"
+      - "tests/test_reinvent_origin.py"
+      - "src/opendde_workbench/examples/stat6/integrated_requests.py"
+      - "frontend/src/integrations/ScientificReview.tsx"
+      - "frontend/src/integrations/ScientificForm*"
+      - "frontend/src/integrations/ScientificInputs.tsx"
+      - "frontend/src/integrations/ScientificSelection.tsx"
+      - "frontend/src/integrations/ScientificResults*"
+      - "frontend/src/integrations/ScientificChoices*"
+      - "frontend/src/integrations/ExpertChoices.tsx"
+      - "scripts/calculation-plan-scope.py"
+      - "tests/test_calculation_plan_scope.py"
+      - "server_tests/test_calculation_plan_browser.py"
+      - "frontend/src/integrations/inputs.css"
+      - "server_tests/test_reinvent_review_browser.py"
+      - "server_tests/test_reinvent_native_browser.py"
+      - "server_tests/reinvent_case_evidence.py"
+      - "server_tests/prepare_reinvent_runtime.py"
+      - "server_tests/export_reinvent_runtime.py"
+      - ".github/workflows/molecule-design-review-checks.yml"
+  pull_request:
+    paths: *design_review_paths
+permissions:
+  contents: read
+jobs:
+  prediction-context:
+    uses: ./.github/workflows/prediction-workspace-checks.yml
+    with:
+      scope_only: true
+  model-context:
+    uses: ./.github/workflows/property-model-review-checks.yml
+    with:
+      scope_only: true
+  calculation-plan:
+    needs: model-context
+    if: needs.model-context.outputs.calculation_plan_only == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev --group browser
+      - name: Exact budget, expert disclosure and direct form/validation consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/ScientificChoicesBudget.test.tsx
+          src/integrations/ScientificChoices.test.tsx src/integrations/ScientificForm.test.tsx
+          src/integrations/ReinventForm.test.tsx src/integrations/validation.test.ts
+      - name: Closed selection and source checks; no native calculation
+        run: |
+          uv run --locked pytest -q tests/test_calculation_plan_scope.py
+          uv run --locked ruff check scripts/calculation-plan-scope.py tests/test_calculation_plan_scope.py server_tests/test_calculation_plan_browser.py
+      - name: Isolated bilingual compiled frontend; no submissions
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-calculation-plan" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-calculation-plan/state" >> "$GITHUB_ENV"
+          uv run --locked playwright install chromium --with-deps
+      - run: uv run --locked python -m pytest -x -q server_tests/test_calculation_plan_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: calculation-plan-evidence
+          path: outputs/calculation-plan
+          if-no-files-found: warn
+  design-review:
+    needs: [model-context, prediction-context]
+    if: >-
+      (github.event_name == 'workflow_dispatch' || needs.prediction-context.outputs.utility_only != 'true') &&
+      (github.event_name == 'workflow_dispatch' || needs.prediction-context.outputs.boltz_confidence != 'true') &&
+      (github.event_name == 'workflow_dispatch' || needs.prediction-context.outputs.boltz_drafts != 'true') &&
+      needs.model-context.outputs.calculation_plan_only != 'true' &&
+      needs.model-context.outputs.model_context_only != 'true' &&
+      (github.event_name != 'workflow_dispatch' || inputs.check == 'questionnaire')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      WB_AUTO_DEPLOY: "0"
+      WB_BROWSER_URL: http://127.0.0.1:4330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - name: Build and check only the changed questionnaire and its direct contracts
+        run: |
+          npm ci --prefix frontend
+          npm run build --prefix frontend
+          cd frontend
+          npx vitest run src/integrations/ReinventReview.test.tsx src/integrations/ReinventInputs.test.tsx src/integrations/ReinventForm.test.tsx src/integrations/ScientificForm.test.tsx src/integrations/ScientificChoices.test.tsx src/integrations/ScientificResults.test.tsx src/integrations/validation.test.ts
+          cd ..
+          uv sync --locked --group dev --group browser
+          uv run --locked python scripts/generate-capability-catalog.py --check
+          uv run --locked pytest -q tests/test_pose_minimization.py tests/test_stat6_geometry.py
+          uv run --locked pytest -q tests/test_reinvent_origin.py
+          uv run --locked ruff check server_tests/test_reinvent_review_browser.py server_tests/test_reinvent_native_browser.py server_tests/reinvent_case_evidence.py server_tests/prepare_reinvent_runtime.py server_tests/export_reinvent_runtime.py
+      - name: Prepare the managed graphical editor only
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-design-review" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-design-review/state" >> "$GITHUB_ENV"
+          WB_HOME="$RUNNER_TEMP/x-dde-design-review" WB_STATE_DIR="$RUNNER_TEMP/x-dde-design-review/state" uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked playwright install chromium --with-deps
+      - name: Bilingual exact scaffold, actual Ketcher pixels and edited review; no inference
+        run: |
+          mkdir -p outputs/reinvent-review
+          .venv/bin/python -m opendde_workbench --port 4330 > outputs/reinvent-review/service.log 2>&1 &
+          service_pid=$!
+          trap 'kill "$service_pid" 2>/dev/null || true' EXIT
+          for n in $(seq 1 30); do curl --silent --fail "$WB_BROWSER_URL/api/health" >/dev/null && break; sleep 1; done
+          curl --silent --fail "$WB_BROWSER_URL/api/health" >/dev/null
+          .venv/bin/python -m pytest -x -q server_tests/test_reinvent_review_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: molecular-design-review-evidence
+          path: outputs/reinvent-review/**
+  native-reinvent:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'native-reinvent'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      WB_AUTO_DEPLOY: "0"
+      WB_BROWSER_URL: http://127.0.0.1:4330
+      WB_TEST_NATIVE_REINVENT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - name: Build the exact frontend and install only the selected managed components
+        run: |
+          npm ci --prefix frontend
+          npm run build --prefix frontend
+          uv sync --locked --group dev --group browser
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-reinvent" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-reinvent/state" >> "$GITHUB_ENV"
+          WB_HOME="$RUNNER_TEMP/x-dde-reinvent" WB_STATE_DIR="$RUNNER_TEMP/x-dde-reinvent/state" uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          WB_HOME="$RUNNER_TEMP/x-dde-reinvent" WB_STATE_DIR="$RUNNER_TEMP/x-dde-reinvent/state" uv run --locked python server_tests/prepare_reinvent_runtime.py
+          uv run --locked playwright install chromium --with-deps
+      - name: Submit the fixed-port study through the actual frontend and retain every native file
+        run: |
+          mkdir -p outputs/reinvent-native
+          .venv/bin/python -m opendde_workbench --port 4330 > outputs/reinvent-native/service.log 2>&1 &
+          service_pid=$!
+          trap 'kill "$service_pid" 2>/dev/null || true' EXIT
+          for n in $(seq 1 30); do curl --silent --fail "$WB_BROWSER_URL/api/health" >/dev/null && break; sleep 1; done
+          curl --silent --fail "$WB_BROWSER_URL/api/health" >/dev/null
+          .venv/bin/python -m pytest -x -q server_tests/test_reinvent_native_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reinvent-native-study-evidence
+          path: outputs/reinvent-native/**
+      - name: Retain the admitted complete image separately from scientific evidence
+        if: always()
+        run: .venv/bin/python server_tests/export_reinvent_runtime.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reinvent-reviewed-runtime-cache
+          path: ${{ runner.temp }}/x-dde-runtime-cache/**
+          retention-days: 1
+          compression-level: 0

@@ -1,0 +1,261 @@
+import logging
+from importlib import resources
+
+import numpy as np
+import pytest
+import yaml
+from click.testing import CliRunner
+from gufe import SmallMoleculeComponent
+from openff.toolkit import Molecule
+from openff.units import unit
+from rdkit import Chem
+
+from openfe.protocols.openmm_utils.charge_generation import (
+    HAS_NAGL,
+    HAS_OPENEYE,
+)
+from openfecli.commands.generate_partial_charges import charge_molecules
+
+
+@pytest.fixture
+def yaml_nagl_settings():
+    return """\
+partial_charge:
+  method: nagl
+  settings:
+    nagl_model: openff-gnn-am1bcc-0.1.0-rc.3.pt
+"""
+
+
+@pytest.fixture
+def methane() -> Molecule:
+    # ensure consistent atom ordering
+    methane = Molecule.from_mapped_smiles("[C:1]([H:2])([H:3])([H:4])[H:5]")
+    methane.generate_conformers(n_conformers=1)
+    return methane
+
+
+@pytest.fixture
+def methane_with_charges(methane) -> Molecule:
+    methane._partial_charges = [-1.0, 0.25, 0.25, 0.25, 0.25] * unit.elementary_charge
+    return methane
+
+
+@pytest.fixture
+def benzene_modifications_filepath():
+    with resources.as_file(resources.files("openfe.tests.data")) as d:
+        yield str(d / "benzene_modifications.sdf")
+
+
+def test_missing_output(methane, tmp_path):
+    runner = CliRunner()
+    mol_path = tmp_path / "methane.sdf"
+    methane.to_file(str(mol_path), "sdf")
+
+    cli_result = runner.invoke(charge_molecules, ["-M", mol_path])
+    assert cli_result.exit_code == 2
+    assert "Missing option '-o'" in cli_result.output
+
+
+def test_write_charges_to_input(methane, tmp_path):
+    runner = CliRunner()
+    mol_path = tmp_path / "methane.sdf"
+    methane.to_file(str(mol_path), "sdf")
+
+    with runner.isolated_filesystem():
+        # check an error is raised if we try to overwrite the input
+        with pytest.raises(FileExistsError, match="The output file "):
+            _ = runner.invoke(
+                charge_molecules, ["-M", mol_path, "-o", mol_path], catch_exceptions=False
+            )
+
+
+def test_charge_molecules_default(methane, tmp_path, caplog):
+    runner = CliRunner()
+    mol_path = tmp_path / "methane.sdf"
+    methane.to_file(str(mol_path), "sdf")
+    output_file = str(tmp_path / "charged_methane.sdf")
+    caplog.set_level(logging.INFO)
+    with runner.isolated_filesystem():
+        # make sure the charges are picked up
+        result = runner.invoke(charge_molecules, ["-M", mol_path, "-o", output_file])
+
+        assert result.exit_code == 0
+        assert "Partial charges are present for" in caplog.text
+        assert "Partial Charge Generation: am1bcc" in result.output
+        # make sure the charges have been saved
+        methane = SmallMoleculeComponent.from_sdf_file(filename=output_file)
+        off_methane = methane.to_openff()
+        assert off_methane.partial_charges is not None
+        assert len(off_methane.partial_charges) == 5
+
+
+@pytest.mark.parametrize(
+    "overwrite, expected_charges",
+    [
+        pytest.param(False, [-1.0, 0.25, 0.25, 0.25, 0.25], id="Don't overwrite"),
+        pytest.param(True, [-0.1084, 0.0271, 0.0271, 0.0271, 0.0271], id="Overwrite"),
+    ],
+)
+def test_charge_molecules_overwrite(
+    overwrite, tmp_path, caplog, methane_with_charges, expected_charges
+):
+    runner = CliRunner()
+    mol_path = tmp_path / "methane.sdf"
+    methane_with_charges.to_file(str(mol_path), "sdf")
+    output_file = str(tmp_path / "charged_methane.sdf")
+
+    args = ["-M", mol_path, "-o", output_file]
+    if overwrite:
+        args.append("--overwrite-charges")
+
+    with runner.isolated_filesystem():
+        # make sure the charges are picked up
+        caplog.set_level(logging.INFO)
+        result = runner.invoke(charge_molecules, args)
+        assert result.exit_code == 0
+
+        assert "Partial charges are present for" in caplog.text
+        assert "Partial Charge Generation: am1bcc" in result.output
+        if overwrite:
+            assert "Overwriting partial charges" in result.output
+
+        # make sure the charges have not changed from the inputs
+        methane = SmallMoleculeComponent.from_sdf_file(filename=output_file)
+        off_methane = methane.to_openff()
+        assert np.allclose(off_methane.partial_charges.m, expected_charges)
+
+
+@pytest.mark.parametrize(
+    "ncores",
+    [
+        pytest.param(1, id="1"),
+        pytest.param(2, id="2"),
+    ],
+)
+@pytest.mark.skipif(
+    not HAS_NAGL,
+    reason="needs NAGL",
+)
+@pytest.mark.skipif(
+    HAS_OPENEYE, reason="cannot use NAGL with rdkit backend when OpenEye is installed"
+)
+def test_charge_settings(
+    benzene_modifications_filepath, tmp_path, caplog, yaml_nagl_settings, ncores
+):
+    runner = CliRunner()
+    output_file = str(tmp_path / "charged_benzenes.sdf")
+
+    # get the input order
+    supplier = Chem.SDMolSupplier(benzene_modifications_filepath, removeHs=False)
+    input_order = [mol.GetProp("_Name") for mol in supplier]
+
+    # use nagl charges for CI speed!
+    settings_path = tmp_path / "settings.yaml"
+    with open(settings_path, "w") as f:
+        f.write(yaml_nagl_settings)
+
+    with runner.isolated_filesystem():
+        caplog.set_level(logging.INFO)
+        # make sure the charges are picked up
+        result = runner.invoke(
+            charge_molecules,
+            [
+                "-M",
+                benzene_modifications_filepath,
+                "-o",
+                output_file,
+                "-s",
+                settings_path,
+                "-n",
+                ncores,
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "Partial charges are present for" in caplog.text
+        assert "Partial Charge Generation: nagl" in result.output
+
+        # make sure the charges have been saved and the order of the molecules is preserved
+        supplier_out = Chem.SDMolSupplier(output_file, removeHs=False)
+        output_order = []
+        for mol in supplier_out:
+            smc = SmallMoleculeComponent.from_rdkit(mol)
+            off_mol = smc.to_openff()
+            assert off_mol.partial_charges is not None
+            assert len(off_mol.partial_charges) == off_mol.n_atoms
+            output_order.append(smc.name)
+
+        assert input_order == output_order
+
+
+def test_charge_molecules_missing_force_fields(methane, tmp_path):
+    # make sure an error is raised if we try to use forcefield charges without specifying a forcefield
+    runner = CliRunner()
+    mol_path = tmp_path / "methane.sdf"
+    methane.to_file(str(mol_path), "sdf")
+    out_path = str(tmp_path / "charged_methane.sdf")
+
+    settings = {
+        "partial_charge": {
+            "method": "forcefield",
+        }
+    }
+
+    settings_path = tmp_path / "settings.yaml"
+    yaml.safe_dump(settings, open(settings_path, "w"))
+
+    with runner.isolated_filesystem():
+        # # check an error is raised if we try to overwrite the input
+        with pytest.raises(
+            ExceptionGroup,
+            match="Partial charge generation failed for 1 molecules.",
+        ) as excinfo:
+            _ = runner.invoke(
+                charge_molecules,
+                ["-M", mol_path, "-o", out_path, "-s", settings_path],
+                catch_exceptions=False,
+            )
+            assert (
+                "The forcefield method requires a force field or list of force fields' to be provided via `forcefields`."
+                in str(excinfo.value)
+            )
+
+
+@pytest.mark.skipif(
+    not HAS_NAGL,
+    reason="needs NAGL",
+)
+@pytest.mark.skipif(
+    HAS_OPENEYE, reason="cannot use NAGL with rdkit backend when OpenEye is installed"
+)
+def test_charge_molecules_from_forcefield(methane, tmp_path):
+    # make sure we can use forcefield charges if we specify a forcefield
+    runner = CliRunner()
+    mol_path = tmp_path / "methane.sdf"
+    methane.to_file(str(mol_path), "sdf")
+    out_path = str(tmp_path / "charged_methane.sdf")
+
+    settings = {
+        "partial_charge": {
+            "method": "forcefield",
+            "settings": {"forcefields": ["openff-2.3.0"]},
+        }
+    }
+
+    settings_path = tmp_path / "settings.yaml"
+    yaml.safe_dump(settings, open(settings_path, "w"))
+
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            charge_molecules,
+            ["-M", mol_path, "-o", out_path, "-s", settings_path],
+            catch_exceptions=False,
+        )
+        assert result.exit_code == 0
+        assert "Partial Charge Generation: forcefield" in result.output
+
+        # make sure the charges have been saved
+        methane_out = SmallMoleculeComponent.from_sdf_file(filename=out_path)
+        off_methane_out = methane_out.to_openff()
+        assert off_methane_out.partial_charges is not None

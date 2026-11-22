@@ -1,0 +1,60 @@
+# The one binary. Everything above the library that a person runs is a subcommand of this.
+[package]
+name = "pantometry-app"
+description = "Run, check, verify, view and edit pantometry scenes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+# `pantometry` is what you type. The package cannot be called that — the library facade already
+# is — but the binary can, and the binary is the thing with a name a person says out loud.
+[[bin]]
+name = "pantometry"
+path = "src/main.rs"
+
+[dependencies]
+pantometry = { workspace = true }
+pantometry-world = { workspace = true }
+# **The reason the merge was worth doing.** `pantometry-world` refuses `"device": "gpu"` on its own
+# — it has no device and cannot acquire one — so honouring a scene that asks for one needed an
+# application linking both the format and an accelerator. Before this there was no such application
+# and the key could only be used from code somebody else wrote.
+pantometry-gpu = { workspace = true }
+viewer-core = { workspace = true }
+editor-core = { workspace = true }
+glam = { workspace = true }
+serde_json = { workspace = true }
+
+# The two windows. Mutually exclusive at runtime — one process, one event loop — and both here
+# because both are things you do to a run.
+# Without `accesskit` (and its web twin, `web_screen_reader`): the editor offers no screen-reader
+# tree. That feature brought in accesskit_unix and accesskit_windows, and through them every open
+# advisory this workspace had but one: zbus 4's zvariant, zvariant_derive and zbus_names
+# (unmaintained, merged into zbus 6, which no accesskit release uses yet), quick-xml 0.30's two
+# denial-of-service bugs, and paste. Nothing here called it. The rest of `default` is kept.
+#
+# `clipboard` and `links` are named because 0.31 turned them on unconditionally and 0.37 made them
+# features: without them the scene pane loses copy and paste and a hyperlink stops opening, and
+# nothing fails to compile. 0.37's new defaults are left off — `wgpu`, since `render.rs` is a glow
+# callback, and `system_fonts`, which would draw with whatever the machine has rather than the fonts
+# the screenshot and the ui-dump were taken with.
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "clipboard", "links"] }
+wgpu = "22"
+# winit's defaults less one: `wayland-csd-adwaita`. That feature draws the title bar itself on a
+# Wayland compositor that will not (GNOME's), and it lays out the title text with `ab_glyph`, whose
+# font parser is `ttf-parser` — unmaintained, RUSTSEC-2026-0192, and the last advisory this tree
+# carried once egui 0.37's epaint had stopped using it. Without the feature winit draws
+# smithay-client-toolkit's plain frame there instead, with no title text: X11, KDE's Wayland, Windows
+# and macOS draw their own decorations and see no difference. Nine crates go with it.
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+pollster = "0.4"
+rfd = "0.17.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "gif"] }
+
+[dev-dependencies]
+# The regression test runs one scene both ways and reads the result back through the run file's own
+# reader, which is what the viewer, the editor and the report all use.
+viewer-core = { workspace = true }

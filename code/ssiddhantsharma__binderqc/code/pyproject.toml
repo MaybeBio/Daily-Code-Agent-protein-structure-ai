@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "binderqc"
+version = "0.8.0"
+description = "Quality-control and tag-site scoring for designed protein binders, from a predicted complex"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Siddhant Sharma" }]
+keywords = ["protein-design", "binder", "developability", "qc", "sasa", "structural-biology"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "biotite>=1.0",
+    "numpy>=1.24",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+validation = ["matplotlib", "scipy", "freesasa"]  # tests/pisa_correctness.py + tests/a3d_correctness.py (network)
+docs = ["playwright", "matplotlib"]   # for docs/render_structure.py + make_schematic.py (figures)
+
+[project.scripts]
+binderqc = "binderqc.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ssiddhantsharma/binderqc"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/binderqc"]
+
+[tool.hatch.build.targets.sdist]
+# The README renders its images from raw.githubusercontent, so the PNGs are 2.5 MB
+# of a 2.6 MB sdist that nothing building or testing the package ever reads.
+exclude = ["docs/*.png", "tests/*.png"]
+
+[tool.ruff]
+line-length = 100
+exclude = ["tests/_a3d_work"]   # downloaded reference tool, not ours
+
+[tool.ruff.lint]
+# F=pyflakes bugs, I=import-sort, B=bugbear footguns, SIM=simplify, UP=pyupgrade.
+# Omit full E: E501/E70x are style noise on the numeric/plotting code.
+select = ["F", "I", "B", "SIM", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# printf is correct here: the string is a JS/CSS template full of {} braces,
+# so an f-string / str.format conversion would break the template.
+"docs/render_structure.py" = ["UP031"]

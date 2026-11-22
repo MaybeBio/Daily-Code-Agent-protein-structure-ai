@@ -1,0 +1,31 @@
+# Scientific Computing
+numpy>=1.23.0,<1.24.0
+pandas==1.4.1
+scipy>=1.7.3,<2.0.0
+
+# Configuration and I/O
+pyyaml
+easydict
+lmdb
+
+# Visualization and Logging
+tensorboard==2.9.0
+protobuf<=3.20.3
+Pillow>=9.1.0,<10.0.0
+tqdm
+matplotlib
+seaborn
+
+# Molecular Processing
+biopython
+pdb2pqr
+
+# Visualization
+py3Dmol
+
+# Utilities
+joblib
+scikit-learn
+
+# Optional (for experiment tracking)
+# wandb

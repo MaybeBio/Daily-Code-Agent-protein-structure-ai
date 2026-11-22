@@ -1,0 +1,34 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          # This repository deliberately has no uv.lock; the real
+          # dependency manifest is mliport/pyproject.toml, so the cache
+          # key must hash that path (a uv.lock default never matched).
+          cache-dependency-glob: "mliport/pyproject.toml"
+      # Pin the ruff version the project actually enforces locally; an
+      # unpinned `uv run ruff` drifts with new releases and fails on renamed
+      # rules (e.g. TCH003 -> TC003) that the 0.5.1 baseline never checks.
+      - name: Generated docs are in sync
+        run: uv run --no-project --with packaging python scripts/generate_docs.py --check
+      - name: Ruff check
+        run: uvx ruff@0.5.1 check --output-format=github mliport/mliport tests scripts
+      - name: Ruff format check
+        run: |
+          # Emit one annotation per unformatted file so failures are visible
+          # through the checks API as well as in the log.
+          uvx ruff@0.5.1 format --check mliport/mliport tests scripts \
+            | sed -n 's/^Would reformat: \(.*\)$/::error file=\1::ruff format would reformat this file/p;t;p'
+          uvx ruff@0.5.1 format --check mliport/mliport tests scripts

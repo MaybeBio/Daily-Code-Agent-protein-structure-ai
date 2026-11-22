@@ -1,8 +1,8 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/SreeVasthav-Upputoori/WaweDock
-- 快照日期: 2026-11-18
-- 快照 commit: [`636c676393a5`](https://github.com/SreeVasthav-Upputoori/WaweDock/commit/636c676393a53c8864e5b4e18a15dc61fb47e57c)
+- 快照日期: 2026-11-22
+- 快照 commit: [`e7483174c8e7`](https://github.com/SreeVasthav-Upputoori/WaweDock/commit/e7483174c8e7475c023391af4215ec2a85accb89)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
 ## 保留 (134 个文件, 2.2 MB)
@@ -11,10 +11,10 @@
 |---|---:|---:|
 | 源码 | 127 | 2.1 MB |
 | 文档 | 4 | 48.0 KB |
-| README | 1 | 27.8 KB |
+| README | 1 | 27.9 KB |
 | 构建/配置 | 2 | 1.4 KB |
 
-按后缀: `.js` 3 (973.0 KB)、`.py` 120 (908.9 KB)、`.css` 1 (215.0 KB)、`.md` 4 (64.7 KB)、`.html` 1 (25.7 KB)、`.txt` 1 (11.1 KB)、`.ps1` 1 (4.4 KB)、`pyproject.toml` 1 (1.4 KB)、`.pyw` 1 (270 B)、`.yml` 1 (59 B)
+按后缀: `.js` 3 (973.0 KB)、`.py` 120 (912.2 KB)、`.css` 1 (215.0 KB)、`.md` 4 (64.8 KB)、`.html` 1 (25.7 KB)、`.txt` 1 (11.1 KB)、`.ps1` 1 (4.4 KB)、`pyproject.toml` 1 (1.4 KB)、`.pyw` 1 (270 B)、`.yml` 1 (59 B)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

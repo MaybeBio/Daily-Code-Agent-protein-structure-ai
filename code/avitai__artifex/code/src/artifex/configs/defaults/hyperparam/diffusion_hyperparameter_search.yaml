@@ -1,0 +1,42 @@
+name: diffusion_hyperparameter_search
+description: Typed hyperparameter search template for protein point-cloud experiments.
+search_type: random
+num_trials: 20
+max_parallel_trials: 2
+search_space:
+  network.embed_dim:
+    type: choice
+    param_path: network.embed_dim
+    choices: [64, 128, 256, 512]
+  network.num_layers:
+    type: choice
+    param_path: network.num_layers
+    choices: [4, 6, 8, 12]
+  network.dropout_rate:
+    type: uniform
+    param_path: network.dropout_rate
+    low: 0.0
+    high: 0.5
+  training.optimizer.learning_rate:
+    type: uniform
+    param_path: training.optimizer.learning_rate
+    low: 1.0e-5
+    high: 5.0e-4
+    log_scale: true
+  training.optimizer.weight_decay:
+    type: uniform
+    param_path: training.optimizer.weight_decay
+    low: 1.0e-6
+    high: 1.0e-3
+    log_scale: true
+  training.scheduler.warmup_steps:
+    type: choice
+    param_path: training.scheduler.warmup_steps
+    choices: [200, 500, 1000]
+early_stopping: true
+patience: 5
+pruning: true
+pruning_interval: 1
+direction: minimize
+metric: validation_loss
+seed: 42

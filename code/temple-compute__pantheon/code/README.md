@@ -1,0 +1,157 @@
+# Horus Workflow Repository
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/temple-compute/pantheon)](https://github.com/temple-compute/pantheon/releases)
+[![Stars](https://img.shields.io/github/stars/temple-compute/pantheon?style=social)](https://github.com/temple-compute/pantheon/stargazers)
+[![Horus Runtime](https://img.shields.io/badge/runtime-horus--runtime-4B32C3)](https://github.com/temple-compute/horus-runtime)
+
+> Production-ready scientific workflows for the **Horus Runtime**. Molecular dynamics, virtual screening, docking, LLM training, and more. Each workflow is a multi-stage pipeline that routes every stage to the right cluster type automatically: HPC, cloud, or local.
+
+**Why Pantheon?** Stop writing glue code. Declare your pipeline once and Horus runs it across heterogeneous compute, streams logs live, retries failures, and produces typed artifacts you can trace.
+
+**Star the repo** ⭐ if you build scientific pipelines, it helps more people find these workflows.
+
+Each workflow directory contains:
+- `README.md`: purpose, pipeline, inputs/outputs, and parameters
+- `workflow.yaml` or `run.py`: a plain Horus workflow definition or Python workflow builder
+- `scripts/`: small stage scripts and helper code when needed
+
+## Getting Started
+
+```bash
+# 1. Install uv (recommended)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Clone this repo
+git clone https://github.com/temple-compute/pantheon
+cd pantheon
+
+# 3. Install horus-runtime from inside any workflow directory
+cd workflows/drug-discovery/w01-boltz2-virtual-screening
+uv sync
+# or, if you prefer pip:
+# pip install horus-runtime horus-environments
+
+# 4. Run the workflow
+uv run horus run workflow.yaml
+```
+
+> **BioExcel workflows** also require a conda-family tool (`micromamba`, `mamba`, or `conda`) on your `PATH`. Their executors build conda environments to provision GROMACS, AMBER, and related simulation tools. More on executors at [docs.templecompute.com](https://docs.templecompute.com/guides/concepts).
+
+## Workflows
+
+### Drug Discovery
+
+| ID | Workflow | Description |
+|---|---|---|
+| W-01 | [Boltz-2 Virtual Screening](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/drug-discovery/w01-boltz2-virtual-screening/README.md) | Screen a SMILES library against a protein sequence with Boltz-2 co-folding and affinity, ranked shortlist |
+| W-02 | [AutoDock Vina Docking](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/drug-discovery/w02-autodock-vina-docking/README.md) | Dock a ligand library into an uploaded or RCSB-fetched receptor with AutoDock Vina: prep → dock → rank |
+| W-32 | [DrugFlow + Boltz-2 Affinity](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/drug-discovery/w03-drugflow-boltz-affinity/README.md) | Generate pocket-conditioned molecules with DrugFlow, then score each one for binding affinity (ΔG) with Boltz-2 |
+| W-33 | [Lacuna Cryptic Pocket Discovery](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/drug-discovery/w06-lacuna-cryptic-pocket-discovery/README.md) | Find cryptic binding pockets in an uploaded or RCSB-fetched structure across a conformational ensemble with Lacuna |
+| W-34 | [Lacuna + AutoDock Vina Docking](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/drug-discovery/w07-lacuna-vina-docking/README.md) | Lacuna cryptic pocket discovery, then box a selected pocket and dock a ligand library with AutoDock Vina |
+| W-35 | [cMD Replicas (AMBER)](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/drug-discovery/w04-cmd/README.md) | PDB ID to report with AMBER: protonate (PROPKA), parameterize ligands (GAFF2), solvate, equilibrate and run production MD across N parallel replicas, then analyze and cluster |
+| W-36 | [OpenDDE Co-folding Screen](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/drug-discovery/w08-opendde-cofolding-screen/README.md) | Co-fold a protein–ligand library with OpenDDE (optional MSA toggle) and rank complexes by interface confidence |
+
+### OMSF (Open Molecular Software Foundation)
+
+| ID | Workflow | Description |
+|---|---|---|
+| W-37 | [OpenFE RBFE (TYK2)](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/omsf/w01-openfe-rbfe-tyk2/README.md) | Charge ligands, plan an RBFE network, run one OpenFE quickrun per leg as a map, gather ΔΔG |
+| W-38 | [OpenADMET CYP3A4 Models](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/omsf/w02-openadmet-cyp3a4/README.md) | Train one OpenADMET anvil model per architecture in parallel, compare them statistically, predict with the best |
+| W-39 | [OpenFF Protein-Ligand MD](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/omsf/w03-openff-protein-ligand-md/README.md) | Solvate, parameterize with OpenFF Sage + ff14SB via Interchange, run OpenMM replicas in parallel, analyze |
+
+### BioExcel Building Blocks
+
+| ID | Workflow | Description |
+|---|---|---|
+| W-03 | [GROMACS Protein MD Setup](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w01-gromacs-md-setup/README.md) | Full MD setup for lysozyme 1AKI using GROMACS: topology → solvation → equilibration → production MD |
+| W-04 | [Ligand Parameterization (GAFF / ACPype)](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w02-ligand-parameterization/README.md) | Generate GROMACS force-field parameters for a small-molecule ligand via OpenBabel and ACPype/GAFF |
+| W-05 | [AMBER Protein MD Setup](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w03-amber-md-setup/README.md) | Full MD setup for lysozyme 1AKI using AMBER: LEaP topology → solvation → equilibration → production MD + analysis |
+| W-09 | [GROMACS Protein-Ligand Complex MD Setup](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w04-gromacs-protein-ligand-complex-md-setup/README.md) | Full MD setup for a T4 lysozyme–ligand complex using GROMACS, AMBER99SB-ILDN, and GAFF/ACPype ligand parameters |
+| W-10 | [Mutation Free Energy (pmx, non-equilibrium TI)](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w05-mutation-free-energy-calculations/README.md) | Non-equilibrium alchemical mutation free-energy (ΔΔG) via GROMACS + pmx, estimated with CGI/BAR/Jarzynski |
+| W-11 | [Protein-Ligand Docking with a Cluster90 Binding Site](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w06-protein-ligand-docking-cluster90/README.md) | AutoDock Vina virtual screening with the docking box inferred from a PDB Cluster90 homolog analysis |
+| W-12 | [Protein-Ligand Docking with PDBe Binding Sites](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w07-protein-ligand-docking-pdbe-rest-api/README.md) | AutoDock Vina virtual screening with the docking box located via the PDBe REST API's annotated binding sites |
+| W-13 | [Protein-Ligand Docking into an fpocket Cavity](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w08-protein-ligand-docking-fpocket/README.md) | AutoDock Vina virtual screening with the docking box computed directly from fpocket cavity detection |
+| W-14 | ~~AMBER Protein MD Setup~~ | Retired: it duplicated [W-05](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w03-amber-md-setup/README.md) task for task |
+| W-15 | [AMBER Protein-Ligand Complex MD Setup](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w10-amber-protein-ligand-complex-md-setup/README.md) | AMBER MD setup for a T4 lysozyme–ligand complex with ACPype/GAFF ligand parameterization |
+| W-16 | [AMBER Constant-pH MD Setup](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w11-amber-constant-ph-md-setup/README.md) | Constant-pH MD with AmberTools, predicting per-residue pKa values from titratable-residue protonation states |
+| W-17 | [DNA Helical Parameters](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w12-dna-helical-parameters/README.md) | Extracts per-base-pair helical parameters and dynamics from a DNA MD trajectory using Curves+/Canal |
+| W-18 | [ABC MD Setup](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w13-abc-md-setup/README.md) | Ascona B-DNA Consortium standard protocol for DNA MD system preparation with AmberTools |
+| W-19 | [Protein Conformational Ensembles](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w14-protein-conformational-ensembles/README.md) | Generates and compares protein conformational ensembles via CONCOORD, ANM, FlexServ, NOLB, and iMODS |
+| W-20 | [Protein Conformational Transitions](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w15-protein-conformational-transitions/README.md) | Computes a conformational transition pathway between two protein states using GOdMD |
+| W-21 | [Macromolecular Coarse-Grained Flexibility](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w16-macromolecular-coarse-grained-flexibility/README.md) | FlexServ flexibility analysis (BD/DMD/NMA ensembles + PCA) from a single static structure |
+| W-22 | [Classical Molecular Interaction Potentials](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w17-classical-molecular-interaction-potentials/README.md) | CMIP interaction-potential grids and protein-ligand/protein-protein interaction energies |
+| W-23 | [Molecular Structure Checking](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w18-molecular-structure-checking/README.md) | Structure-quality checking and repair pipeline (Modeller + AMBER minimization) ahead of MD |
+| W-24 | [HADDOCK3 Protein-Protein Docking](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w19-haddock3-protein-protein-docking/README.md) | Antibody-antigen information-driven docking with HADDOCK3, scored against a reference complex |
+| W-25 | [AutoEncoders for MD Analysis](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w20-autoencoders-md-analysis/README.md) | Trains an AutoEncoder on MD trajectories for feature extraction and PLUMED collective-variable export |
+| W-26 | [Protein-Membrane MD Analysis](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w21-protein-membrane-md-analysis/README.md) | Membrane MD analysis: leaflet identification, bilayer thickness, order parameters, area per lipid, pore radius |
+| W-30 | [Cavity-Guided Virtual Screening](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w22-cavity-guided-virtual-screening/README.md) | fpocket cavity detection feeding an AutoDock Vina screen of a ligand library, ranked by affinity |
+| W-31 | [Cavity Analysis](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioexcel_building_blocks/w23-cavity-analysis/README.md) | fpocket cavity detection and ranking across a conformational ensemble |
+
+### Bioinformatics
+
+| ID | Workflow | Description |
+|---|---|---|
+| W-43 | [Influenza Segments Starter](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/bioinformatics/w01-flu-segments-starter/README.md) | Influenza segment FASTA → header parsing, QC, longest-ORF translation and an HTML report. |
+
+### nf-core Ports
+
+Native Horus ports of nf-core pipelines, with the same containers, command lines and resources as the Nextflow original.
+
+| ID | Workflow | Description |
+|---|---|---|
+| W-48 | [nf-core/demo](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w01-demo/README.md) | nf-core/demo 1.2.0 as native tasks: FastQC and seqtk per sample as `horus_map` stages, then a MultiQC report |
+| W-49 | [nf-core/rnaseq](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w02-rnaseq/README.md) | nf-core/rnaseq 3.27.0 test route as native tasks: TrimGalore, BBSplit, STAR + Salmon and Salmon pseudo-alignment, RSeQC, Qualimap and bigWigs per sample, then tximport and MultiQC |
+| W-50 | [nf-core/sarek](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w03-sarek/README.md) | nf-core/sarek 3.12.0 test route as native tasks: bwa mem per lane, GATK MarkDuplicates and BQSR, Strelka germline calling, CRAM and VCF QC, then MultiQC |
+| W-51 | [nf-core/scrnaseq](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w04-scrnaseq/README.md) | nf-core/scrnaseq 4.2.0 test route as native tasks: FastQC and STARsolo per sample, h5ad, Seurat and SCE conversion per matrix, then MultiQC |
+| W-52 | [nf-core/atacseq](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w05-atacseq/README.md) | nf-core/atacseq 2.1.2 test route as native tasks: TrimGalore and BWA per run, library and replicate merging, BAM filtering, deepTools, MACS2 broad peaks, HOMER, consensus peaks with featureCounts and DESeq2 QC, ataqv, then MultiQC |
+| W-53 | [nf-core/chipseq](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w06-chipseq/README.md) | nf-core/chipseq 2.1.0 test route as native tasks: BWA, Picard and BAMTools filtering, MACS3 broad peaks with HOMER annotation, consensus peaks with featureCounts and DESeq2 QC, then MultiQC |
+| W-54 | [nf-core/fetchngs](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w07-fetchngs/README.md) | nf-core/fetchngs 1.13.0 test route as native tasks: run metadata from ENA and NCBI per id, reads over FTP or through sra-tools per run, then an nf-core samplesheet |
+| W-55 | [nf-core/ampliseq](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w08-ampliseq/README.md) | nf-core/ampliseq 3.1.0 test route as native tasks: Cutadapt and DADA2 per sample and run, VSEARCH, decontam and Barrnap filters, DADA2 and QIIME2 taxonomy, QIIME2 diversity and ANCOM-BC fan-outs, MultiQC and the summary report |
+| W-56 | [nf-core/mag](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w09-mag/README.md) | nf-core/mag 5.5.0 test route as native tasks: read QC, MEGAHIT and metaSPAdes, MetaBAT2, MaxBin2 and SemiBin2 binning, then BUSCO, CAT, GTDB-Tk and Prokka per bin, the bin summary and MultiQC |
+| W-57 | [nf-core/viralrecon](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w10-viralrecon/README.md) | nf-core/viralrecon 3.0.0 test route as native tasks: fastp, Kraken2, Bowtie2, iVar variants, SnpEff, Freyja, a BCFtools consensus with Nextclade and Pangolin, SPAdes and Unicycler assemblies per sample, then QUAST and MultiQC |
+| W-58 | [nf-core/taxprofiler](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w11-taxprofiler/README.md) | nf-core/taxprofiler 2.0.1 test route as native tasks: read QC, host removal and run merging, then eleven profilers per sample and database, Krona, taxpasta and MultiQC |
+| W-59 | [nf-core/methylseq](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/nf-core-ports/w12-methylseq/README.md) | nf-core/methylseq 4.2.0 test route as native tasks: TrimGalore, Bismark align, deduplicate and methylation extractor per sample, then Bismark summary and MultiQC |
+
+### Chemistry
+
+| ID | Workflow | Description |
+|---|---|---|
+| W-45 | [UMA Nitro Molecular Dynamics](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/chemistry/w01-uma-nitro-md/README.md) | Relax any structure and run NVT MD with Meta's UMA potential in its fast single-GPU UMA Nitro mode; reports the mode that ran and ns/day |
+
+### AI
+
+| ID | Workflow | Description |
+|---|---|---|
+| W-28 | [LLM From Scratch - Pretrain, SFT & Eval](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/ai/w01-train-llm/README.md) | Clone a from-scratch Transformer repo, tokenize Pile/instruction data, pretrain, SFT, and evaluate GSM8K accuracy |
+| W-29 | [Tiny LLM From Scratch - TinyStories Pretrain & Sample](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/ai/w02-tiny-llm/README.md) | Pretrain a small from-scratch Transformer on TinyStories (not the 900GB Pile) and sample a generated story |
+| W-46 | [Bank Transaction Categoriser - Fine-tune & Compare Runs](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/ai/w03-transaction-categoriser/README.md) | Fine-tune a small pretrained encoder to classify card transactions into spending categories; one report per run (metrics, confusion matrix, time, hardware, hyperparameters) for side-by-side comparison |
+
+### Omics
+
+| ID | Workflow | Description |
+|---|---|---|
+| W-42 | [Engin Strain-to-Scale](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/omics/w01-engin-strain-to-scale/README.md) | Which host, which route, and what to run next for a bioprocess target, via Engin's three independent decision-aid CLIs, merged into one calibrated decision brief |
+
+### Clinical Trials
+
+| ID | Workflow | Description |
+|---|---|---|
+| W-40 | [Protocol Stress-Test](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/clinical-trials/w01-protocol-stress-test/README.md) | A public trial's eligibility criteria as computable rules on a Synthea population; thousands of protocol variants fanned out to rank criteria by the patients and diversity they cost |
+
+### Engine Showcases
+
+Small, self-contained workflows that demonstrate horus-runtime engine
+features rather than a science domain.
+
+| ID | Workflow | Description |
+|---|---|---|
+| W-06 | [Fan-out / Map / Gather](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/engine-showcases/w01-fanout-map-gather/README.md) | Split a collection into batches, run a `horus_map` stage over them concurrently, gather N results into one folder |
+| W-07 | [Programmatic Dynamic DAG](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/engine-showcases/w02-programmatic-dynamic-dag/README.md) | A task generates downstream tasks at runtime from the data it reads, via `add_task`/`expand` |
+| W-08 | [Bounded Loop (Range Map)](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/engine-showcases/w03-loop-map/README.md) | Run N deterministic iterations as a `horus_map` over a generated index list and gather the results |
+| W-27 | [Subworkflow Reuse](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/engine-showcases/w04-subworkflow-reuse/README.md) | Inline a child workflow into the parent with `sub:`, reusing one YAML-anchored body across two instances |
+| W-41 | [Execution Path Coverage](https://github.com/temple-compute/pantheon/blob/HEAD/workflows/engine-showcases/w05-execution-path-coverage/README.md) | One measurable task per execution mechanism as an acceptance harness for per-task resource measurement |
+
+## Contributing
+
+See [CONTRIBUTING.md](https://github.com/temple-compute/pantheon/blob/HEAD/CONTRIBUTING.md) for how to add new workflows or improve existing ones.

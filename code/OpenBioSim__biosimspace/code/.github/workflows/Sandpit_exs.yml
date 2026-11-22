@@ -1,0 +1,48 @@
+name: Sandpit_exs_CI
+
+on:
+  # run once a day at noon UTC
+  schedule:
+    - cron: "0 12 * * *"
+  push:
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash -l {0}
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-latest", ]
+        python-version: ["3.11",]
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: conda-incubator/setup-miniconda@v2
+        with:
+          auto-update-conda: true
+          python-version: ${{ matrix.python-version }}
+          activate-environment: bss_build
+          miniforge-version: latest
+
+      - name: Install dependency
+        run: |
+          conda install -c conda-forge -c openbiosim/label/main biosimspace python=3.11 ambertools gromacs "sire=2025.1.1" "alchemlyb>=2.1" pytest openff-interchange pint=0.21 rdkit "jaxlib>0.3.7" tqdm
+          python -m pip install git+https://github.com/Exscientia/MDRestraintsGenerator.git
+          # For the testing of BSS.FreeEnergy.AlchemicalFreeEnergy.analysis
+          python -m pip install https://github.com/alchemistry/alchemtest/archive/master.zip
+
+      - name: Install the dev version
+        run: |
+          conda remove --force biosimspace
+          pip install -e .
+
+      - name: Run tests
+        run: |
+          pytest -v --color=yes tests/Sandpit/Exscientia/

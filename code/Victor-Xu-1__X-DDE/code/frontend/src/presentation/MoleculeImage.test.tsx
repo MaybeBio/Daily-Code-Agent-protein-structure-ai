@@ -1,0 +1,129 @@
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { MoleculeDrawingProvider, MoleculeImage } from "./MoleculeImage";
+
+const { drawing, retry } = vi.hoisted(() => ({
+  drawing: vi.fn(),
+  retry: vi.fn(),
+}));
+vi.mock("./depiction-renderer", async (original) => ({
+  ...(await original<typeof import("./depiction-renderer")>()),
+  DepictionRenderer: class {
+    render = drawing;
+    close() {}
+    retryInitialization = retry;
+  },
+}));
+const svg = (label: string) =>
+  new Blob(
+    [`<svg xmlns="http://www.w3.org/2000/svg"><text>${label}</text></svg>`],
+    { type: "image/svg+xml" },
+  );
+const sourceA = {
+  smiles: "O=C(CCN1C=CN=N1)N(C2)CCC=C2C3=C(F)C4=C(C=C(N4)C(N(C)C)=O)C=C3",
+};
+const sourceB = { smiles: sourceA.smiles.replace("C(F)", "C(Cl)") };
+const pageFor = (source: typeof sourceA) => (
+  <MoleculeDrawingProvider>
+    <MoleculeImage source={source} label="Selected molecule" language="en" />
+  </MoleculeDrawingProvider>
+);
+
+beforeEach(() => vi.stubGlobal("IntersectionObserver", undefined));
+afterEach(() => {
+  cleanup();
+  drawing.mockReset();
+  retry.mockReset();
+  vi.unstubAllGlobals();
+});
+
+it.each([false, true])(
+  "recovers the actual selected structure after an explicit retry (compact=%s)",
+  async (compact) => {
+    const warning = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    drawing.mockRejectedValueOnce(
+      new Error("Native component initialization timed out"),
+    );
+    render(
+      <MoleculeDrawingProvider>
+        <MoleculeImage
+          source={sourceA}
+          label="Selected molecule"
+          language="en"
+          compact={compact}
+        />
+      </MoleculeDrawingProvider>,
+    );
+    try {
+      const button = await screen.findByRole("button", {
+        name: /Retry drawing/,
+      });
+      drawing.mockResolvedValueOnce(svg("selected-native-structure"));
+      await act(async () => button.click());
+      expect(
+        await screen.findByRole("img", {
+          name: "2D molecular structure · Selected molecule",
+        }),
+      ).toBeVisible();
+      expect(retry).toHaveBeenCalledOnce();
+      expect(drawing).toHaveBeenCalledTimes(2);
+      expect(drawing.mock.lastCall![0]).toEqual(sourceA);
+      expect(
+        screen.queryByRole("button", { name: /Retry drawing/ }),
+      ).toBeNull();
+    } finally {
+      warning.mockRestore();
+    }
+  },
+);
+
+it("hides the old molecule and disables export until the newly selected structure is ready", async () => {
+  drawing.mockResolvedValueOnce(svg("source-A"));
+  const page = render(pageFor(sourceA));
+  await screen.findByRole("img", {
+    name: "2D molecular structure · Selected molecule",
+  });
+  let finish!: (value: Blob) => void;
+  drawing.mockImplementationOnce(
+    () => new Promise<Blob>((resolve) => (finish = resolve)),
+  );
+  page.rerender(pageFor(sourceB));
+  expect(
+    screen.queryByRole("img", {
+      name: "2D molecular structure · Selected molecule",
+    }),
+  ).toBeNull();
+  expect(screen.getByRole("button", { name: /Export figure/ })).toBeDisabled();
+  await waitFor(() => expect(drawing).toHaveBeenCalledTimes(2));
+  await act(async () => finish(svg("source-B")));
+  expect(
+    await screen.findByRole("img", {
+      name: "2D molecular structure · Selected molecule",
+    }),
+  ).toBeVisible();
+  expect(drawing.mock.lastCall![0]).toEqual(sourceB);
+  expect(screen.getByRole("button", { name: /Export figure/ })).toBeEnabled();
+});
+
+it("does not apply a late drawing from a previously selected molecule", async () => {
+  let finish!: (value: Blob) => void;
+  drawing.mockImplementationOnce(
+    () => new Promise<Blob>((resolve) => (finish = resolve)),
+  );
+  const page = render(pageFor(sourceA));
+  await waitFor(() => expect(drawing).toHaveBeenCalledOnce());
+  drawing.mockResolvedValueOnce(svg("source-B"));
+  page.rerender(pageFor(sourceB));
+  const current = await screen.findByRole("img", {
+      name: "2D molecular structure · Selected molecule",
+    }),
+    url = current.getAttribute("src");
+  await act(async () => finish(svg("source-A")));
+  expect(
+    screen.getByRole("img", {
+      name: "2D molecular structure · Selected molecule",
+    }),
+  ).toHaveAttribute("src", url!);
+});

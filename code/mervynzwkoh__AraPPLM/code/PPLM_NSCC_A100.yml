@@ -1,0 +1,22 @@
+name: PPLM_NSCC_A100
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - biopython>=1.80
+  - pandas
+  - scikit-learn
+  - scipy
+  - tqdm
+  - h5py
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - torch>=2.0.0
+      - torchvision
+      - torchaudio
+      - fair-esm>=2.0.0
+      - umap-learn
+      - matplotlib
+      - seaborn

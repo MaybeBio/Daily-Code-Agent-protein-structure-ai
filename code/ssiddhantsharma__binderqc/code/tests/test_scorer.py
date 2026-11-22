@@ -1,0 +1,410 @@
+"""Tests for the binderqc scorer.
+
+Example data: PDB 7JZU -- the de novo designed minibinder LCB1 (chain A, 55 aa)
+bound to the SARS-CoV-2 RBD (chain B), from Cao et al., Science 2020. LCB1 is a
+three-helix bundle whose termini both sit near the binding face, so it is a good
+worked example of the "ambiguous" case. RCSB coordinate files are public domain.
+"""
+
+import math
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from binderqc import score_structure
+from binderqc.core import _load_protein, _target_interface_res, parse_epitope
+
+FIXTURE = Path(__file__).parent / "data" / "7JZU_LCB1_RBD.pdb"
+
+EXPECTED_COLUMNS = {
+    "pdb", "binder_chain", "target_chains", "n_interface_res", "binder_bsa",
+    "n_hbonds", "n_salt_bridges", "buns_interface", "interface_polar_satisfied_frac", "interface_packing",
+    "approach_angle", "epitope_planarity", "epitope_hydrophobic_frac", "epitope_aromatic_n",
+    "epitope_glyco_occluded", "epitope_glyco_sites",
+    "nterm_resnum", "nterm_resname", "nterm_relsasa", "nterm_dist_to_interface",
+    "nterm_orientation", "nterm_sg_sasa",
+    "cterm_resnum", "cterm_resname", "cterm_relsasa", "cterm_dist_to_interface",
+    "cterm_orientation", "cterm_sg_sasa",
+    "recommended_tag", "mw", "gravy", "pi", "net_charge", "lys_arg_pct",
+    "instability_index", "ext_coeff_280", "sap_score", "sap_total", "sap_per_res",
+    "a3d_score", "a3d_total_positive",
+    "charge_patch_pos", "charge_patch_neg", "paratope_hydrophobicity", "paratope_charge",
+    "paratope_res", "sequence_liabilities", "warnings", "qc_pass", "exposure_context_degradation", "exposure_context_surface", "binder_sequence",
+}
+
+
+@pytest.fixture(scope="module")
+def row():
+    """The single scored row for LCB1 (binder A) against the RBD (target B)."""
+    rows = score_structure(str(FIXTURE), binder_chains=["A"], target_chains=["B"])
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_schema(row):
+    assert set(row) == EXPECTED_COLUMNS
+    assert row["binder_chain"] == "A"
+    assert row["target_chains"] == "B"
+    assert len(row["binder_sequence"]) == 55
+
+
+def test_finds_an_interface(row):
+    # Pure CA/heavy-atom geometry -> deterministic across biotite versions.
+    assert row["n_interface_res"] > 10
+
+
+def test_interface_bsa_is_substantial(row):
+    # LCB1 is a real picomolar binder -> a large buried interface, well clear of
+    # the small-interface (300 A^2) warning threshold.
+    assert row["binder_bsa"] > 500
+    assert "small interface" not in row["warnings"]
+
+
+def test_recommends_terminus_farther_from_interface(row):
+    # LCB1: N-term ~5.3 A, C-term ~9.9 A from the paratope -> C is recommended.
+    assert row["recommended_tag"] == "C"
+    assert row["cterm_dist_to_interface"] >= row["nterm_dist_to_interface"]
+
+
+def test_ambiguous_warning_raised(row):
+    # The two termini are within 5 A of each other in interface distance.
+    assert "ambiguous" in row["warnings"]
+
+
+def test_sg_sasa_is_nan_for_noncysteine_termini(row):
+    # Termini are Asp/Glu, not Cys: SG-SASA must be NaN, never silently 0.
+    assert row["nterm_resname"] != "CYS" and row["cterm_resname"] != "CYS"
+    assert math.isnan(row["nterm_sg_sasa"])
+    assert math.isnan(row["cterm_sg_sasa"])
+
+
+def test_metrics_are_in_range(row):
+    for key in ("nterm_relsasa", "cterm_relsasa"):
+        assert 0.0 <= row[key] <= 1.5           # relSASA, occasionally slightly >1
+    for key in ("nterm_orientation", "cterm_orientation"):
+        assert -1.0 <= row[key] <= 1.0          # a cosine
+
+
+def test_pose_and_grippability(row):
+    assert 0.0 <= row["approach_angle"] <= 90.0     # undirected axis angle
+    assert row["epitope_planarity"] >= 0.0          # RMSD to best-fit plane
+
+
+def test_sequence_liabilities_is_a_string(row):
+    # May be empty; must never be missing.
+    assert isinstance(row["sequence_liabilities"], str)
+
+
+def test_histidine_run_flagged():
+    from binderqc.core import _sequence_liabilities
+
+    flags = _sequence_liabilities("AAAHHHAAA")
+    assert any("histidine run" in f for f in flags)
+    assert not any("histidine run" in f for f in _sequence_liabilities("AAAHHAAA"))
+
+
+def test_expression_signals_in_range(row):
+    assert -4.5 <= row["gravy"] <= 4.5              # Kyte-Doolittle bounds
+    assert 0.0 <= row["pi"] <= 14.0
+    assert -20.0 <= row["instability_index"] <= 250.0   # ProtParam II (Guruprasad 1990)
+
+
+def test_whole_binder_charge_and_lys_arg_distinct_from_paratope(row):
+    # net_charge/lys_arg_pct are WHOLE-BINDER -- must differ from the existing
+    # paratope-scoped paratope_charge, not just duplicate it under a new name.
+    seq = row["binder_sequence"]
+    expected_pct = round(100 * sum(seq.count(a) for a in "KR") / len(seq), 1)
+    assert row["lys_arg_pct"] == expected_pct
+    assert -10.0 <= row["net_charge"] <= 10.0        # sane range for a 55-residue binder
+    assert row["net_charge"] != row["paratope_charge"]
+
+
+def test_instability_index_formula():
+    # II = 10/L * sum of dipeptide DIWV weights (Guruprasad 1990) -- check against the matrix
+    from binderqc._diwv import DIWV, instability_index
+    seq = "MKLVN"
+    expected = 10.0 / len(seq) * sum(DIWV[seq[i]][seq[i + 1]] for i in range(len(seq) - 1))
+    assert abs(instability_index(seq) - expected) < 1e-9
+    assert instability_index("") != instability_index("")   # NaN for empty
+
+
+def test_charge_and_pi_logic():
+    # Polybasic -> high pI + positive charge; polyacidic -> low pI + negative.
+    from binderqc.core import _isoelectric_point, _net_charge
+    assert _isoelectric_point("K" * 10) > 9.0
+    assert _isoelectric_point("E" * 10) < 5.0
+    assert _net_charge("K" * 10) > 0
+    assert _net_charge("E" * 10) < 0
+
+
+def test_protparam_formulas():
+    # Check the formulas self-consistently + a physical MW range (no memorized
+    # external numbers, which are the classic fabrication trap).
+    from binderqc.core import _protparam
+    seq = "FVNQHLCGSHLVEALYLVCGERGFFYTPKT"   # 30-mer
+    pp = _protparam(seq)
+    assert 30 * 100 < pp["mw"] < 30 * 140                       # ~110 Da/residue
+    assert pp["ext_coeff_280"] == 5500 * seq.count("W") + 1490 * seq.count("Y")
+
+
+def test_buried_unsat_polar(row):
+    # LCB1 is a picomolar designed binder with a well-H-bonded interface, so no
+    # buried unsatisfied polars and every interface-buried polar is satisfied.
+    assert row["buns_interface"] == 0
+    assert row["interface_polar_satisfied_frac"] == 1.0
+    assert "buried unsatisfied polar" not in row["warnings"]
+
+
+def test_epitope_composition_reported(row):
+    assert 0.0 <= row["epitope_hydrophobic_frac"] <= 1.0
+    assert row["epitope_aromatic_n"] >= 0
+
+
+def test_glyco_occluded_epitope(row):
+    # types are stable for the schema/CSV
+    assert isinstance(row["epitope_glyco_occluded"], bool)
+    assert isinstance(row["epitope_glyco_sites"], str)
+    # LCB1 binds the RBD ACE2-binding motif; the RBD glycans (N331/N343) sit away
+    # from that epitope, so a SASA-aware, near-interface check must NOT flag them.
+    assert row["epitope_glyco_occluded"] is False
+    assert row["epitope_glyco_sites"] == ""
+
+
+def test_grippability_consensus():
+    from binderqc import grippability_consensus
+    grip = {"epitope_planarity": 2.5, "epitope_hydrophobic_frac": 0.5,
+            "epitope_aromatic_n": 2, "epitope_glyco_occluded": False}
+    flat = {"epitope_planarity": 0.4, "epitope_hydrophobic_frac": 0.1,
+            "epitope_aromatic_n": 0, "epitope_glyco_occluded": False}
+    assert grippability_consensus(grip)["consensus"] == "physical-only"   # no IARA score
+    assert grippability_consensus(grip, 70)["consensus"] == "grippable"    # both high
+    assert grippability_consensus(flat, 30)["consensus"] == "flat"         # both flat (TNC-A1 Face-1)
+    assert grippability_consensus(grip, 30)["consensus"] == "disagree"
+    assert grippability_consensus(flat, 70)["consensus"] == "disagree"
+    # a glyco-occluded epitope is physically NOT grippable no matter the shape/chemistry
+    glyco = dict(grip, epitope_glyco_occluded=True)
+    assert grippability_consensus(glyco, 80)["physical_grippable"] is False
+    assert grippability_consensus(glyco, 30)["consensus"] == "flat"
+
+
+def test_auto_guess_picks_the_small_chain():
+    rows = score_structure(str(FIXTURE), verbose=False)  # no binder chains given
+    assert len(rows) == 1
+    assert rows[0]["binder_chain"] == "A"       # 55 aa vs 193 aa RBD
+
+
+def test_missing_binder_chain_returns_error_row_not_crash():
+    rows = score_structure(str(FIXTURE), binder_chains=["Z"])
+    assert len(rows) == 1
+    assert "error" in rows[0]
+    assert "recommended_tag" not in rows[0]
+
+
+def test_nonstandard_residue_relsasa_is_nan():
+    # A residue absent from the Tien reference table must yield NaN relSASA,
+    # never 0 -- the "unknown, don't guess" contract.
+    import biotite.structure as struc
+    import numpy as np
+
+    from binderqc.core import _residue_relsasa
+
+    atom = struc.Atom([0.0, 0.0, 0.0], chain_id="A", res_id=1,
+                      res_name="PCA", atom_name="CA", element="C")
+    arr = struc.array([atom])
+    rel = _residue_relsasa(arr, np.array([12.3]))
+    assert math.isnan(rel[("A", 1)])
+
+
+def test_interface_and_aggregation_metrics(row):
+    assert isinstance(row["n_hbonds"], int) and row["n_hbonds"] >= 0
+    assert isinstance(row["n_salt_bridges"], int) and row["n_salt_bridges"] >= 0
+    assert row["interface_packing"] > 0                 # a real interface has contacts
+    assert row["sap_score"] > 0                         # LCB1 has some exposed hydrophobics
+    assert row["sap_total"] >= row["sap_score"]          # whole-surface load >= single hottest patch
+    # Aggrescan3D port: LCB1 has exposed aggregation-prone residues -> positive load,
+    # and the whole-surface total is >= the single hottest spot.
+    assert row["a3d_score"] > 0
+    assert row["a3d_total_positive"] >= row["a3d_score"]
+
+
+def test_charge_and_paratope_patches(row):
+    # TAP-style patches: both charge patches are non-negative magnitudes, and the
+    # paratope-vicinity metrics are finite because LCB1 has a real interface.
+    assert row["charge_patch_pos"] >= 0.0
+    assert row["charge_patch_neg"] >= 0.0
+    # LCB1 is acidic (pI 4.17), so its surface carries more exposed D/E than R/K.
+    assert row["charge_patch_neg"] >= row["charge_patch_pos"]
+    assert row["paratope_hydrophobicity"] >= 0.0            # a load, like sap_total
+    assert math.isfinite(row["paratope_charge"])            # signed: >0 basic, <0 acidic
+
+
+def test_charge_patches_keep_pos_and_neg_separate():
+    # Three exposed Lys clustered within 10 A, one Asp far away: the positive patch
+    # sums all three K's (~3), the negative patch sees only the lone D (~1), and the
+    # basic cluster is NOT cancelled by the distant acid.
+    import biotite.structure as struc
+    import numpy as np
+
+    from binderqc.core import _REF_MAX_ASA, _charge_patches
+
+    def cb(rid, name, xyz):
+        return struc.Atom(xyz, chain_id="A", res_id=rid, res_name=name,
+                          atom_name="CB", element="C")
+    arr = struc.array([
+        cb(1, "LYS", [0.0, 0.0, 0.0]),
+        cb(2, "LYS", [3.0, 0.0, 0.0]),
+        cb(3, "LYS", [0.0, 3.0, 0.0]),
+        cb(4, "ASP", [50.0, 0.0, 0.0]),
+    ])
+    # feed a SASA that makes each residue fully exposed (relSASA = 1.0)
+    iso = np.array([_REF_MAX_ASA["LYS"]] * 3 + [_REF_MAX_ASA["ASP"]])
+    pos, neg = _charge_patches(arr, iso, radius=10.0)
+    assert abs(pos - 3.0) < 1e-6
+    assert abs(neg - 1.0) < 1e-6
+
+
+def test_qc_pass_ignores_tag_site_warnings(row):
+    # LCB1's only warning is the ambiguous tag site (an advisory about where to
+    # tag, not a quality problem), so it must still pass QC.
+    assert "ambiguous" in row["warnings"]
+    assert row["qc_pass"] is True
+
+
+def test_cif_input_matches_pdb(tmp_path, row):
+    # The bundled fixture is a PDB; confirm the CIF path gives the same numbers.
+    import biotite.structure.io as strucio
+    arr = strucio.load_structure(str(FIXTURE))
+    cif = tmp_path / "7jzu.cif"
+    strucio.save_structure(str(cif), arr)
+    cif_row = score_structure(str(cif), binder_chains=["A"], target_chains=["B"])[0]
+    assert cif_row["binder_bsa"] == row["binder_bsa"]
+    assert cif_row["recommended_tag"] == row["recommended_tag"]
+    assert cif_row["binder_sequence"] == row["binder_sequence"]
+
+
+def test_multiple_binder_chains_give_multiple_rows():
+    rows = score_structure(str(FIXTURE), binder_chains=["A", "B"])
+    assert len(rows) == 2
+    assert {r["binder_chain"] for r in rows} == {"A", "B"}
+
+
+def test_cli_writes_csv_and_fasta(tmp_path):
+    from binderqc.cli import main
+    out, fa = tmp_path / "out.csv", tmp_path / "clean.fasta"
+    main(["--binder-chains", "A", "--target-chains", "B",
+          "--out", str(out), "--fasta", str(fa), str(FIXTURE)])
+    assert out.exists() and out.read_text().count("\n") >= 2      # header + >=1 row
+    assert fa.read_text().startswith(">")                          # LCB1 passes QC
+
+
+def test_deamidation_is_exposure_gated():
+    # Sydow et al. 2014: a buried N-G/D-G motif reacts far slower than an exposed one,
+    # so flagging on sequence alone over-predicts. Minimal synthetic chain (no real SASA
+    # needed -- relsasa is passed in directly to isolate the gating logic).
+    import biotite.structure as struc
+
+    from binderqc.core import _exposed_deamidation_sites
+
+    arr = struc.AtomArray(3)
+    arr.coord = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+    arr.chain_id = np.array(["A", "A", "A"])
+    arr.res_id = np.array([1, 2, 3])
+    arr.res_name = np.array(["ASN", "GLY", "ALA"])  # N1-G2 is a deamidation motif
+    arr.atom_name = np.array(["CA", "CA", "CA"])
+    arr.element = np.array(["C", "C", "C"])
+
+    exposed = {("A", 1): 0.50, ("A", 2): 0.50, ("A", 3): 0.50}
+    buried = {("A", 1): 0.05, ("A", 2): 0.50, ("A", 3): 0.50}
+
+    assert _exposed_deamidation_sites(arr, "A", exposed) == ["N1G (exposed, rel_sasa=0.50)"]
+    assert _exposed_deamidation_sites(arr, "A", buried) == []
+
+
+def test_cli_iara_score_adds_consensus_column(tmp_path):
+    # Passing a learned (IARA) epitope score wires in the physical-vs-learned
+    # consensus, and it must NOT appear when the flag is absent (schema stays lean).
+    from binderqc.cli import main
+    out = tmp_path / "out.csv"
+    main(["--binder-chains", "A", "--target-chains", "B", "--iara-score", "70",
+          "--out", str(out), str(FIXTURE)])
+    header = out.read_text().splitlines()[0]
+    assert "grippability_consensus" in header and "iara_grippability" in header
+    out2 = tmp_path / "out2.csv"
+    main(["--binder-chains", "A", "--target-chains", "B", "--out", str(out2), str(FIXTURE)])
+    assert "grippability_consensus" not in out2.read_text().splitlines()[0]
+
+
+# --- declared epitope ------------------------------------------------------
+
+def test_parse_epitope_ranges_and_chains():
+    assert parse_epitope("B:45,47,50-52") == {("B", 45), ("B", 47), ("B", 50), ("B", 51), ("B", 52)}
+    assert parse_epitope("B:45+C:9") == {("B", 45), ("C", 9)}
+    assert parse_epitope("B:52-50") == {("B", 50), ("B", 51), ("B", 52)}   # reversed range
+    assert parse_epitope("") == set()
+
+
+def test_parse_epitope_rejects_bare_residue():
+    # guessing the chain is how an epitope spec rots once a second target chain appears
+    with pytest.raises(ValueError):
+        parse_epitope("45")
+
+
+def test_epitope_columns_absent_unless_declared():
+    row = score_structure(FIXTURE, verbose=False)[0]
+    assert "epitope_contact_fraction" not in row
+
+
+def test_epitope_fraction_is_one_when_declared_equals_contacted():
+    array = _load_protein(FIXTURE)
+    contacted = _target_interface_res(array, "A", ["B"], 5.0)
+    spec = "B:" + ",".join(str(r) for _, r in contacted)
+    row = score_structure(FIXTURE, epitope=spec, verbose=False)[0]
+    assert row["epitope_contact_fraction"] == pytest.approx(1.0)
+    assert row["epitope_coverage"] == pytest.approx(1.0)
+    assert row["epitope_hit_n"] == len(contacted)
+
+
+def test_epitope_precision_and_recall_are_separate():
+    # half the real epitope: every contact is on-site (recall 1) but the design also
+    # touches residues nobody declared, so precision must drop. Reporting one number
+    # would call this a perfect hit.
+    array = _load_protein(FIXTURE)
+    contacted = _target_interface_res(array, "A", ["B"], 5.0)
+    half = contacted[: len(contacted) // 2]
+    row = score_structure(FIXTURE, epitope="B:" + ",".join(str(r) for _, r in half), verbose=False)[0]
+    assert row["epitope_coverage"] == pytest.approx(1.0)
+    assert row["epitope_contact_fraction"] < 0.6
+
+
+def test_epitope_missing_residues_are_counted_not_silently_dropped():
+    row = score_structure(FIXTURE, epitope="B:1-5", verbose=False)[0]   # not in this construct
+    assert row["epitope_declared_missing"] == 5
+    assert row["epitope_contact_fraction"] == pytest.approx(0.0)
+
+
+# --- exposure conventions --------------------------------------------------
+
+def test_degradation_context_changes_interface_buried_sites():
+    """A residue buried against the target is exposed in the free binder and not in the
+    complex. The two conventions must therefore disagree, or the option is a no-op."""
+    bound = score_structure(FIXTURE, degradation_context="complex", verbose=False)[0]
+    free = score_structure(FIXTURE, degradation_context="free", verbose=False)[0]
+    assert bound["sequence_liabilities"] != free["sequence_liabilities"]
+    assert bound["exposure_context_degradation"] == "complex"
+    assert free["exposure_context_degradation"] == "free"
+
+
+def test_surface_metrics_always_use_the_free_binder():
+    """SAP/A3D/charge patches are surface properties of the molecule itself, so they
+    must not move when the degradation convention changes."""
+    bound = score_structure(FIXTURE, degradation_context="complex", verbose=False)[0]
+    free = score_structure(FIXTURE, degradation_context="free", verbose=False)[0]
+    for col in ("sap_score", "a3d_score", "charge_patch_pos", "charge_patch_neg"):
+        assert bound[col] == pytest.approx(free[col]), col
+    assert bound["exposure_context_surface"] == free["exposure_context_surface"] == "free"
+
+
+def test_degradation_context_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        score_structure(FIXTURE, degradation_context="bogus", verbose=False)

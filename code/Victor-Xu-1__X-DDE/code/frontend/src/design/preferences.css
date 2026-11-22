@@ -1,0 +1,40 @@
+.management-card {
+  max-width: 850px;
+  margin: 20px 0;
+}
+.management-card p,
+.management-card small {
+  font-size: 13px;
+}
+.management-heading > span {
+  font-size: 12px;
+}
+.management-trigger {
+  border-radius: 10px;
+}
+.management-trigger-copy strong {
+  font-size: 13px;
+}
+.management-trigger-copy small {
+  font-size: 11px;
+}
+.management-menu {
+  background: var(--surface);
+  border-color: var(--line);
+  box-shadow: var(--shadow);
+}
+.studio-app .studio-topbar .global-search input[type="search"] {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  height: auto;
+  box-shadow: none;
+}
+.preference-warning {
+  color: var(--warning);
+  background: var(--warning-soft);
+  padding: 12px;
+  border-radius: 8px;
+  margin-top: 16px;
+}

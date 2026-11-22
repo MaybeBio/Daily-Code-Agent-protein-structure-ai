@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    env:
+      PROTREPAIR_RELEASE_STRICT_RDKIT: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Install package and dev dependencies
+        run: .venv/bin/python -m pip install -c constraints/release.txt ".[dev]"
+
+      - name: Ruff
+        run: .venv/bin/ruff check src/protrepair tests scripts/run_installed_artifact_smoke.py
+
+      - name: Ruff format
+        run: .venv/bin/ruff format --check src/protrepair tests scripts/run_installed_artifact_smoke.py
+
+      - name: Pyrefly
+        run: .venv/bin/pyrefly check
+
+      - name: Unit tests
+        run: .venv/bin/pytest tests/unit tests/corpus tests/workflow -m "not benchmark" -q --durations=25 --durations-min=1
+
+  installed-artifact-smoke:
+    name: Installed wheel and sdist FASPR/RDKit smoke (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Create release build environment
+        run: python -m venv .venv
+
+      - name: Install constrained release build tools
+        run: .venv/bin/python -m pip install -c constraints/release.txt hatchling hatch-vcs scikit-build-core
+
+      - name: Build release artifacts
+        run: .venv/bin/python -m hatchling build
+
+      - name: Smoke-test built wheel
+        run: .venv/bin/python scripts/run_installed_artifact_smoke.py --artifact-path dist/protrepair-*.whl --venv-path .tmp/release-wheel-smoke
+
+      - name: Smoke-test built sdist
+        run: .venv/bin/python scripts/run_installed_artifact_smoke.py --artifact-path dist/protrepair-*.tar.gz --venv-path .tmp/release-sdist-smoke
+
+  artifact-content:
+    name: Release artifact content (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Create release artifact test environment
+        run: python -m venv .venv
+
+      - name: Install constrained release artifact test tools
+        run: .venv/bin/python -m pip install -c constraints/release.txt pytest hatchling hatch-vcs scikit-build-core
+
+      - name: Run release artifact content tests
+        run: .venv/bin/python -m pytest tests/release/test_artifact_contents.py -q

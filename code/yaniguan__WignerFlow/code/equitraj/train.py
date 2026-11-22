@@ -1,0 +1,899 @@
+"""Training loop: teacher forcing (S1), input noise (S2), unrolled training (S3a truncated, S3b full).
+
+    python -m equitraj.train --config configs/argon/flow_s1_n10.yaml
+
+Resumable: a checkpoint is written every `ckpt_minutes` and at every evaluation; rerunning the
+same command continues from it. ckpt.pt stores the model, optimizer, step, best scores, the
+torch/numpy/Python/CUDA RNG, the shuffle position in the current epoch, and the spike-guard
+history. An older checkpoint has no RNG state, so resume re-seeds with seed + step and does not
+replay the opening batches. Each checkpoint is written under /tmp first, then copied into
+out_dir, and retried if that folder disappears (a Google Drive unmount). Model selection uses
+short validation rollouts, not the loss:
+best.pt by legacy_score, best_stable.pt by selection_score (stability first). Optional stability
+options (repulsion prior, noise schedule, unroll weights, overlap penalty) are documented in docs/STABILITY.md.
+"""
+
+import argparse
+import json
+import math
+import os
+import random
+import shutil
+import tempfile
+import time
+
+# Less CUDA memory fragmentation for the large m=4 unroll steps. Must be set before CUDA starts.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+from contextlib import contextmanager, nullcontext
+import numpy as np
+import torch
+import yaml
+from torch.utils.checkpoint import checkpoint
+
+from equitraj import analysis, so3
+from equitraj.dataset import TrajWindows, compute_stats
+from equitraj.ema import ExponentialMovingAverage, configure_matmul_precision
+from equitraj.layers import ATTENTION_VERSION
+from equitraj.model import EquiTraj, make_model
+from equitraj.monitor import REASONS
+from equitraj.neighbors import VerletList
+from equitraj.pair_masks import exclusions_from_bonds
+from equitraj.prior import estimate_rmin, overlap_penalty
+from equitraj.rollout import rollout, temperature
+
+
+def unroll_length(schedule, step):
+    """schedule: [[step, m], ...] sorted by step; returns the m in effect at this training step."""
+    m = schedule[0][1]
+    for s, mm in schedule:
+        if step >= s:
+            m = mm
+    return m
+
+
+def noise_sigma_at(tc, step):
+    """Input-noise level at this step: train.noise_schedule [[step, sigma], ...] interpolated linearly
+    (constant before the first and after the last point), else the constant train.noise_sigma."""
+    sched = tc.get("noise_schedule")
+    if not sched:
+        return tc.get("noise_sigma", 0.0)
+    steps = [float(s) for s, _ in sched]
+    sigmas = [float(v) for _, v in sched]
+    return float(np.interp(step, steps, sigmas))
+
+
+def lr_scale_after_switch(step, switch_step, rewarmup):
+    """LR multiplier after an unroll-length switch: linear 0.1 -> 1 over `rewarmup` steps (1 when disabled)."""
+    if not rewarmup or switch_step is None or step - switch_step >= rewarmup:
+        return 1.0
+    return 0.1 + 0.9 * max(0, step - switch_step) / float(rewarmup)
+
+
+def last_switch_step(schedule, step):
+    """Training step at which the unroll length in effect at `step` started (None for the first entry)."""
+    sw = None
+    m_prev = schedule[0][1]
+    for s, mm in schedule:
+        if s <= step and mm != m_prev:
+            sw = s
+        if s <= step:
+            m_prev = mm
+    return sw
+
+
+class SpikeGuard:
+    """Skips optimizer updates whose loss is non-finite or > factor x the running median of the last `window`
+    accepted losses at the current unroll length. History is reset when m changes; guarding starts after
+    `min_history` accepted losses. factor <= 0 disables the guard (only non-finite losses are skipped)."""
+
+    def __init__(self, factor=0.0, window=200, min_history=50):
+        self.factor, self.window, self.min_history = float(factor or 0.0), int(window), int(min_history)
+        self.hist, self.m, self.skipped = [], None, 0
+
+    def check(self, loss_value, m):
+        if m != self.m:
+            self.hist, self.m = [], m
+        if not math.isfinite(loss_value):
+            self.skipped += 1
+            return False
+        if self.factor > 0 and len(self.hist) >= self.min_history:
+            if loss_value > self.factor * float(np.median(self.hist)):
+                self.skipped += 1
+                return False
+        self.hist.append(loss_value)
+        self.hist = self.hist[-self.window:]
+        return True
+
+    def state_dict(self):
+        return {"hist": [float(x) for x in self.hist], "m": self.m, "skipped": int(self.skipped)}
+
+    def load_state_dict(self, state):
+        self.hist = [float(x) for x in state.get("hist", [])]
+        self.m = state.get("m", None)
+        self.skipped = int(state.get("skipped", 0))
+
+
+def atomic_save(obj, path, retries=5, backoff=1.0):
+    """Write `obj` to `path` so a vanished output folder does not abort training.
+
+    torch.save goes to a local temporary file first. That file is then copied to
+    `path`.tmp and renamed onto `path` (same final result as a direct save).
+    If the parent folder is missing, recreate it when possible and retry a few
+    times with a short wait. A Google Drive unmount removes the MyDrive path
+    mid-run; the retries cover a brief disconnect. If it still fails, raise
+    RuntimeError and say that a Drive unmount is the likely cause.
+    """
+    if retries < 1:
+        raise ValueError(f"retries must be >= 1, got {retries}")
+    parent = os.path.dirname(path)
+    fd, local = tempfile.mkstemp(prefix="wignerflow_ckpt_", suffix=".pt", dir=tempfile.gettempdir())
+    os.close(fd)
+    try:
+        torch.save(obj, local)
+        last_error = None
+        for attempt in range(retries):
+            try:
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                if parent and not os.path.isdir(parent):
+                    raise FileNotFoundError(f"Parent directory {parent} does not exist")
+                tmp_path = path + ".tmp"
+                shutil.copyfile(local, tmp_path)
+                os.replace(tmp_path, path)
+                return
+            except OSError as exc:
+                last_error = exc
+                if attempt + 1 >= retries:
+                    break
+                time.sleep(backoff)
+        raise RuntimeError(
+            f"Failed to save checkpoint to {path} after {retries} attempts. "
+            f"Parent directory {parent or '.'} is missing or not writable after a Drive unmount. "
+            f"Last error: {last_error}"
+        )
+    finally:
+        try:
+            os.remove(local)
+        except OSError:
+            pass
+
+
+def load_init_weights(model, path, device):
+    """Initialise `model` from a training checkpoint/snapshot (fine-tuning). Non-strict only for the optional
+    repulsion-prior buffer, so snapshots trained without the prior load into a model that has it.
+    Returns (missing_keys, the source step)."""
+    ck = torch.load(path, map_location=device, weights_only=False)
+    sd = ck["model"]
+    res = model.load_state_dict(sd, strict=False)
+    bad = [k for k in res.missing_keys if not k.startswith("prior.")] + list(res.unexpected_keys)
+    if bad:
+        raise RuntimeError(f"init_from {path}: incompatible keys {bad}")
+    absent = [k for k in model.state_dict() if k not in sd]  # e.g. prior.rmin (the model may tolerate it itself)
+    return absent, ck.get("step")
+
+
+def unroll_weights_for(weights, m, like):
+    """Per-unroll-step loss weights (m,): the list is cut to m entries or padded with its last value."""
+    w = [float(x) for x in weights][:m]
+    w = w + [w[-1]] * (m - len(w))
+    return torch.tensor(w, dtype=like.dtype, device=like.device)
+
+
+def _single_frame_graph(verlet, pos_f, box_f, lmax):
+    """Single-frame neighbor graph from a stateful VerletList (differentiable w.r.t. pos_f)."""
+    src, dst, vec = verlet(pos_f, box_f)
+    return {
+        "src": src,
+        "dst": dst,
+        "vec": vec,
+        "dist": torch.linalg.norm(vec, dim=-1),
+        "wigner": so3.edge_wigner(vec, lmax),
+    }
+
+
+def _collate_frame_graphs(frames_flat, n):
+    """Concatenate single-frame graphs so node i in frame f has index f * n + i."""
+    return {
+        "src": torch.cat([fg["src"] + f * n for f, fg in enumerate(frames_flat)], dim=0),
+        "dst": torch.cat([fg["dst"] + f * n for f, fg in enumerate(frames_flat)], dim=0),
+        "vec": torch.cat([fg["vec"] for fg in frames_flat], dim=0),
+        "dist": torch.cat([fg["dist"] for fg in frames_flat], dim=0),
+        "wigner": torch.cat([fg["wigner"] for fg in frames_flat], dim=0),
+    }
+
+
+def _window_graphs(win_graphs, n):
+    """Build (graph_bk, graph_last) from sliding [b][k] single-frame graphs without duplicate work."""
+    frames_bk = [fg for sys_frames in win_graphs for fg in sys_frames]
+    frames_last = [sys_frames[-1] for sys_frames in win_graphs]
+    return _collate_frame_graphs(frames_bk, n), _collate_frame_graphs(frames_last, n)
+
+
+@contextmanager
+def _bind_encode_graphs(model, graphs):
+    """Supply precomputed `graphs` to `model.encode` (and `_encode_full` if present) during `model.loss`."""
+    orig_encode = model.encode
+    orig_full = getattr(model, "_encode_full", None)
+
+    def encode_cached(pos, vel, types, box, graphs_arg=None, *args, **kwargs):
+        return orig_encode(pos, vel, types, box, graphs if graphs_arg is None else graphs_arg, *args, **kwargs)
+
+    model.encode = encode_cached
+    if orig_full is not None:
+        def full_cached(pos, vel, types, box, graphs_arg=None, *args, **kwargs):
+            return orig_full(pos, vel, types, box, graphs if graphs_arg is None else graphs_arg, *args, **kwargs)
+
+        model._encode_full = full_cached
+    try:
+        yield
+    finally:
+        model.encode = orig_encode
+        if orig_full is not None:
+            model._encode_full = orig_full
+
+
+def training_loss(model, pos, vel, box, types, masses, m, noise_sigma, backprop, unroll_sampling_steps,
+                  unroll_weights=None, noise_v_ratio=1.0, noise_type_scale=None, overlap_weight=0.0, overlap_r0=None,
+                  verlet_skin=None, excluded_pairs=None):
+    """Loss for one batch. pos, vel: (B, k + m_max, N, 3); only the first k + m frames are used.
+
+    m = 1 is teacher forcing. For m > 1 the model first predicts m-1 frames from its own outputs:
+      truncated: those predictions carry no gradient; the loss is on the last step only
+      full: gradients flow through all predictions; the loss is averaged over all m steps
+    Input noise (S2) is added to the context frames; the Δx target is taken relative to the
+    (noisy or predicted) last context frame, so the model learns to correct its input.
+
+    Optional (defaults reproduce the behavior above exactly):
+      unroll_weights: list of per-step weights; the loss is evaluated at every unroll step (in truncated
+          mode on detached contexts) and averaged with these weights, so later steps can count more
+      noise_v_ratio: velocity noise = noise_v_ratio * position noise level (both relative to dx_std / v_std)
+      noise_type_scale: (n_types,) multiplier on the noise of each element
+      overlap_weight, overlap_r0: add overlap_weight * overlap_penalty on the predicted positions
+          (every unrolled step in full mode, plus one differentiable prediction from the final context);
+          overlap_r0 is the (T, T) wall distance in Å
+      verlet_skin: optional skin (Å) for Verlet neighbor reuse + sliding-window frame-graph caching across
+          the m unroll steps (None keeps per-step brute-force/cell graph construction)
+    """
+    k = model.k
+    b, _, n, _ = pos.shape
+    ctx_x, ctx_v = pos[:, :k].clone(), vel[:, :k].clone()
+    if noise_sigma > 0:
+        tb = types.repeat(b).view(b, 1, -1, 1)
+        nx = torch.randn_like(ctx_x) * noise_sigma * model.dx_std[tb]
+        nv = torch.randn_like(ctx_v) * noise_sigma * model.v_std[tb]
+        if noise_v_ratio != 1.0:
+            nv = nv * noise_v_ratio
+        if noise_type_scale is not None:
+            ts = noise_type_scale.to(nx)[tb]
+            nx, nv = nx * ts, nv * ts
+        ctx_x = ctx_x + nx
+        ctx_v = ctx_v + nv
+    verlets = None
+    win_graphs = None
+    if verlet_skin is not None:
+        verlets = [VerletList(model.cutoff, float(verlet_skin)) for _ in range(b)]
+        win_graphs = [
+            [_single_frame_graph(verlets[bi], ctx_x[bi, t], None if box is None else box[bi], model.lmax)
+             for t in range(k)]
+            for bi in range(b)
+        ]
+    per_step = unroll_weights is not None
+    losses, pred_x = [], []
+    for j in range(m):
+        last = (j == m - 1)
+        graphs = None if win_graphs is None else _window_graphs(win_graphs, n)
+        if backprop == "full" or last or per_step:
+            dx_t = pos[:, k + j] - ctx_x[:, -1]
+            ctx_mgr = nullcontext() if graphs is None else _bind_encode_graphs(model, graphs)
+            with ctx_mgr:
+                losses.append(model.loss(ctx_x, ctx_v, types, box, masses, dx_t, vel[:, k + j]))
+        if last:
+            break
+        if backprop == "full":
+            if graphs is None:
+                dx, v_new = checkpoint(model.predict_with_grad, ctx_x, ctx_v, types, box, masses,
+                                       unroll_sampling_steps, use_reentrant=False)
+            else:
+                dx, v_new = checkpoint(model.predict_with_grad, ctx_x, ctx_v, types, box, masses,
+                                       unroll_sampling_steps, None, graphs, use_reentrant=False)
+        else:
+            with torch.no_grad():
+                if graphs is None:
+                    dx, v_new = model.predict(ctx_x, ctx_v, types, box, masses, n_steps=unroll_sampling_steps)
+                else:
+                    dx, v_new = model.predict_with_grad(ctx_x, ctx_v, types, box, masses,
+                                                        n_steps=unroll_sampling_steps, graphs=graphs)
+        ctx_x = torch.cat([ctx_x[:, 1:], (ctx_x[:, -1] + dx)[:, None]], dim=1)
+        ctx_v = torch.cat([ctx_v[:, 1:], v_new[:, None]], dim=1)
+        if win_graphs is not None:
+            for bi in range(b):
+                new_fg = _single_frame_graph(verlets[bi], ctx_x[bi, -1],
+                                             None if box is None else box[bi], model.lmax)
+                win_graphs[bi] = win_graphs[bi][1:] + [new_fg]
+        if backprop == "full":
+            pred_x.append(ctx_x[:, -1])
+    if per_step:
+        w = unroll_weights_for(unroll_weights, len(losses), losses[0])
+        loss = (torch.stack(losses) * w).sum() / w.sum()
+    else:
+        loss = torch.stack(losses).mean()
+    if overlap_weight > 0:
+        graphs = None if win_graphs is None else _window_graphs(win_graphs, n)
+        dx, _ = model.predict_with_grad(ctx_x, ctx_v, types, box, masses, unroll_sampling_steps, graphs=graphs)
+        pred_x.append(ctx_x[:, -1] + dx)
+        pen = torch.stack([overlap_penalty(x, box, types, overlap_r0, excluded_pairs=excluded_pairs) for x in pred_x]).mean()
+        loss = loss + overlap_weight * pen
+    return loss
+
+
+def build_loss_options(tc, ds, model, device):
+    """Build optional keyword arguments for training_loss from the train config."""
+    opts = {
+        "unroll_weights": tc.get("unroll_loss_weights"),
+        "noise_v_ratio": float(tc.get("noise_v_ratio", 1.0)),
+        "verlet_skin": tc.get("verlet_skin"),
+    }
+    bonds = getattr(ds, "bonds", None)
+    excl = exclusions_from_bonds(bonds, len(ds.types), device=device) if bonds is not None and len(bonds) > 0 else None
+    if excl is not None:
+        opts["excluded_pairs"] = excl
+    nts = tc.get("noise_type_scale")
+    if nts is not None:  # dict element -> scale (missing elements: 1) or list in ds.elements order
+        if isinstance(nts, dict):
+            nts = [float(nts.get(e, 1.0)) for e in ds.elements]
+        opts["noise_type_scale"] = torch.tensor(nts, dtype=torch.float32, device=device)
+    op = tc.get("overlap_penalty") or {}
+    if op.get("weight", 0.0) > 0:
+        rmin = (model.prior.rmin if model.prior is not None
+                else estimate_rmin(ds, op.get("percentile", 0.1),
+                                   excluded_pairs=None if excl is None else excl.cpu()).to(device))
+        opts["overlap_weight"] = float(op["weight"])
+        opts["overlap_r0"] = rmin * float(op.get("rmin_scale", 1.0))
+    return opts
+
+
+def micro_batch_size_for(tc, m):
+    """Number of windows per forward/backward pass at unroll length m.
+
+    Long unrolls keep one autograd graph per unroll step, so memory grows with m. From
+    train.micro_batch_min_m (default 4) on, the batch is split into micro-batches of
+    train.micro_batch_size windows (default: half the batch). Below that m the full batch is used.
+    The gradient is the same either way (see accumulate_gradients).
+    """
+    batch_size = int(tc["batch_size"])
+    if m < int(tc.get("micro_batch_min_m", 4)):
+        return batch_size
+    size = tc.get("micro_batch_size")
+    if size is None:
+        size = (batch_size + 1) // 2
+    return max(1, min(int(size), batch_size))
+
+
+def accumulate_gradients(model, pos, vel, box, types, masses, m, noise_sigma, backprop, unroll_sampling_steps,
+                         micro_batch_size, timer=None, **loss_opts):
+    """Run training_loss on micro-batches of the batch and call backward on each one.
+
+    Every term of training_loss is a mean over the windows of the batch, so each micro-batch loss is
+    weighted by its share of the batch. The summed gradient (added to the .grad of the parameters) and
+    the returned loss then equal one full-batch training_loss call; only one micro-batch graph is in
+    memory at a time. Returns the batch loss as a Python float.
+    """
+    batch = pos.shape[0]
+    total = 0.0
+    for start in range(0, batch, micro_batch_size):
+        end = min(start + micro_batch_size, batch)
+        part_box = None if box is None else box[start:end]
+        with (timer.phase("forward") if timer is not None else nullcontext()):
+            loss = training_loss(model, pos[start:end], vel[start:end], part_box, types, masses, m, noise_sigma,
+                                 backprop, unroll_sampling_steps, **loss_opts)
+        share = (end - start) / batch
+        with (timer.phase("backward") if timer is not None else nullcontext()):
+            (loss * share).backward()
+        total += loss.item() * share
+        del loss
+    return total
+
+
+def validation_starts(ds, k, n_starts, n_steps):
+    """Evenly spaced window indices whose trajectory has n_steps ground-truth frames after the k context frames.
+
+    The RDF comparison needs those frames; a start near the end of a trajectory would have almost none.
+    """
+    need = (k - 1 + n_steps) * ds.f + 1
+    valid = [i for i, (t, s0) in enumerate(ds.index) if s0 + need <= len(ds.pos[t])]
+    if not valid:
+        raise ValueError(f"no validation window has {n_steps} steps of ground truth after it; use a shorter rollout")
+    return np.array(valid)[np.linspace(0, len(valid) - 1, n_starts).astype(int)]
+
+
+def validation_rollout(model, ds, n_starts, n_steps, sampling_steps, device, t_ref, diag_sink=None, n_constraints=0):
+    """Short rollouts from evenly spaced validation windows. Returns stability and RDF metrics.
+
+    Only windows with n_steps frames of ground truth after them are used as starts.
+    diag_sink: optional list; the rollout's crash diagnostics are appended to it.
+    n_constraints: removed from the degrees of freedom in the temperature (0 by default).
+    """
+    starts = validation_starts(ds, model.k, n_starts, n_steps)
+    items = [ds[i] for i in starts]
+    pos = torch.stack([it[0][:model.k] for it in items])
+    vel = torch.stack([it[1][:model.k] for it in items])
+    box = torch.stack([it[2] for it in items]) if ds.periodic else None
+    every = max(1, n_steps // 50)
+    bonds = getattr(ds, "bonds", None)
+    excl = exclusions_from_bonds(bonds, len(ds.types)) if bonds is not None and len(bonds) > 0 else None
+    out = rollout(model, pos, vel, ds.types, box, ds.masses, n_steps,
+                  sampling_steps=sampling_steps, save_every=every, t_max=3 * t_ref,
+                  excluded_pairs=excl)
+    crash = out["crash_step"]
+    crashed = crash >= 0
+    metrics = {"val_crash_frac": crashed.float().mean().item(),
+               "val_steps_before_crash": torch.where(crashed, crash, torch.full_like(crash, n_steps)).float().mean().item(),
+               "val_rollout_wall_s": out["wall_s"]}
+    diag = out["diagnostics"]
+    for reason in REASONS:
+        metrics[f"val_crash_{reason}"] = float(sum(r == reason for r in diag["crash_reason"]))
+    dmin = [d for d in diag.get("min_pair_distance", []) if np.isfinite(d)]
+    if dmin:
+        metrics["val_min_pair_dist"] = float(min(dmin))
+    if diag_sink is not None:
+        diag_sink.append({"starts": starts.tolist(), "n_steps": n_steps,
+                          **{key: val for key, val in diag.items() if key != "series"}})
+    ok = torch.nonzero(~crashed).flatten().tolist()
+    t_drift = diag.get("T_drift_K_per_ns", [])
+    drift = [abs(t_drift[i]) for i in ok if i < len(t_drift) and np.isfinite(t_drift[i])]
+    if drift:
+        metrics["val_abs_T_drift_K_per_ns"] = float(np.mean(drift))
+    if not ok or out["positions"] is None:
+        return metrics
+    metrics["val_T_end"] = temperature(out["velocities"][-1, ok], ds.masses, n_constraints).mean().item()
+    # temperature error averaged over the second half of each rollout (one frame is too noisy to rank checkpoints)
+    vel = out["velocities"]
+    half = vel.shape[0] // 2
+    t_traj = torch.stack([temperature(vel[i, ok], ds.masses, n_constraints) for i in range(half, vel.shape[0])])  # (frames, ok)
+    metrics["val_T_rel_err"] = ((t_traj.mean(0) - t_ref).abs() / t_ref).mean().item()
+    # all-atom RDF of each rollout vs the ground-truth frames of the same trajectory over the same time span
+    idx = np.arange(len(ds.types))
+    l1 = []
+    for bi in ok:
+        t, s0 = ds.index[starts[bi]]
+        gt = np.asarray(ds.pos[t][s0 + (model.k - 1) * ds.f: s0 + (model.k - 1 + n_steps) * ds.f + 1: every * ds.f])
+        x = out["positions"][:, bi].numpy()
+        bx = None if box is None else box[bi].numpy()
+        r_max = 8.0 if bx is None else min(8.0, 0.49 * float(np.diag(bx).min()))
+        r, g_model, _ = analysis.rdf(x, None if bx is None else np.tile(bx, (len(x), 1, 1)), idx, idx, r_max, 80)
+        _, g_gt, _ = analysis.rdf(gt, None if bx is None else np.tile(bx, (len(gt), 1, 1)), idx, idx, r_max, 80)
+        l1.append(analysis.rdf_l1(r, g_model, g_gt))
+    metrics["val_rdf_l1"] = float(np.mean(l1))
+    return metrics
+
+
+def legacy_score(m):
+    """Lower is better: crashes dominate, then RDF error. Selects best.pt (unchanged)."""
+    return m["val_crash_frac"] * 100.0 + m.get("val_rdf_l1", 10.0)
+
+
+def temperature_aware_score(m, t_weight=1.0):
+    """Scalar score used by scripts/select_checkpoint.py; lower is better: crashes dominate, then RDF error plus
+    t_weight times the relative temperature error.
+
+    The temperature term matters because the model has no energy conservation: in argon v0, validation rollouts
+    with a good RDF could still be 70% too hot. t_weight=0 gives legacy_score. Metrics from logs written before
+    val_T_rel_err existed count as zero temperature error.
+    """
+    return legacy_score(m) + t_weight * m.get("val_T_rel_err", 0.0)
+
+
+def selection_score(m):
+    """Stability-first ranking key for best_stable.pt; lower (tuple comparison) is better:
+        1. crash fraction, 2. longer mean steps before crash, 3. RDF L1 + relative temperature error.
+    Uses the longer selection rollouts (keys prefixed sel_, eval.rollout_steps_select) when present.
+    Missing structural metrics (all rollouts crashed) count as a large error.
+    """
+    p = "sel_" if "sel_val_crash_frac" in m else ""
+    err = m.get(p + "val_rdf_l1", 10.0) + m.get(p + "val_T_rel_err", 1.0)
+    if not np.isfinite(err):
+        err = 1e9
+    return (float(m[p + "val_crash_frac"]), -float(m[p + "val_steps_before_crash"]), float(err))
+
+
+def _as_cpu_byte(tensor):
+    """Random-number state must stay a CPU byte tensor. Loading a checkpoint onto CUDA would move it."""
+    if not torch.is_tensor(tensor):
+        raise TypeError("RNG state must be a tensor")
+    return tensor.detach().to(dtype=torch.uint8, device="cpu").contiguous()
+
+
+def capture_rng_state():
+    """State stored in ckpt.pt: torch, numpy, Python random, and CUDA when CUDA is in use."""
+    state = {
+        "torch": torch.get_rng_state(),
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    """Restore a state from capture_rng_state. CUDA is applied only when this process has CUDA."""
+    torch.set_rng_state(_as_cpu_byte(state["torch"]))
+    numpy_state = state["numpy"]
+    # torch.load can return a read-only array; numpy.set_state needs a writable one.
+    if isinstance(numpy_state, tuple) and len(numpy_state) >= 2 and isinstance(numpy_state[1], np.ndarray):
+        items = list(numpy_state)
+        items[1] = np.array(numpy_state[1], copy=True)
+        numpy_state = tuple(items)
+    np.random.set_state(numpy_state)
+    random.setstate(state["python"])
+    cuda = state.get("cuda")
+    if cuda is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([_as_cpu_byte(t) for t in cuda])
+
+
+def reseed_all(seed):
+    """Seed torch, numpy, and Python. Used when an old checkpoint has no saved RNG."""
+    seed = int(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed % (2**32))
+    random.seed(seed)
+
+
+class EpochBatchSampler(torch.utils.data.Sampler):
+    """Yields shuffled batches for one epoch.
+
+    The shuffle uses its own torch.Generator, not the global RNG. A checkpoint stores that
+    generator's state from the start of the epoch and how many batches were already taken.
+    Resume redraws the same order and skips those batches. The index list itself is not stored.
+    """
+
+    def __init__(self, n, batch_size, generator):
+        self.n = int(n)
+        self.batch_size = int(batch_size)
+        self.generator = generator
+        self.perm = None
+        self.next_batch = 0
+        self.epoch_gen_state = None
+
+    @property
+    def n_batches(self):
+        return self.n // self.batch_size  # last partial batch is dropped, as drop_last=True did
+
+    def new_epoch(self):
+        self.epoch_gen_state = self.generator.get_state().clone()
+        self.perm = torch.randperm(self.n, generator=self.generator).tolist()
+        self.next_batch = 0
+
+    def load_epoch(self, epoch_gen_state, next_batch):
+        self.generator.set_state(_as_cpu_byte(epoch_gen_state))
+        self.epoch_gen_state = self.generator.get_state().clone()
+        self.perm = torch.randperm(self.n, generator=self.generator).tolist()
+        self.next_batch = int(next_batch)
+        if not 0 <= self.next_batch <= self.n_batches:
+            self.perm = None
+            self.next_batch = 0
+            self.epoch_gen_state = None
+
+    def state_dict(self):
+        if self.epoch_gen_state is None:
+            return None
+        return {
+            "epoch_gen_state": self.epoch_gen_state,
+            "next_batch": int(self.next_batch),
+            "n": int(self.n),
+        }
+
+    def __iter__(self):
+        if self.perm is None or self.next_batch >= self.n_batches:
+            self.new_epoch()
+        for b in range(self.next_batch, self.n_batches):
+            start = b * self.batch_size
+            yield self.perm[start:start + self.batch_size]
+
+    def __len__(self):
+        if self.perm is None or self.next_batch >= self.n_batches:
+            return self.n_batches
+        return self.n_batches - self.next_batch
+
+
+def apply_resume_rng(ckpt, seed, step, data_gen, batch_sampler, n_windows):
+    """Restore RNG and the position in the current epoch.
+
+    A current checkpoint has both. Resume redraws that epoch and skips the batches already used.
+    An older checkpoint has neither, so this re-seeds with seed + step. A resumed session then
+    does not replay the opening batches of a fresh run. A checkpoint saved before the first
+    epoch starts has RNG but no epoch position; the global RNG is restored and the epoch is drawn
+    from seed + step (equal to the fresh seed when step is 0).
+    """
+    rng = ckpt.get("rng")
+    has_rng = isinstance(rng, dict) and "torch" in rng
+    if has_rng:
+        restore_rng_state(rng)
+    loader = ckpt.get("loader")
+    same_data = (
+        isinstance(loader, dict)
+        and int(loader.get("n", -1)) == int(n_windows)
+        and "epoch_gen_state" in loader
+    )
+    if has_rng and same_data:
+        batch_sampler.load_epoch(loader["epoch_gen_state"], loader["next_batch"])
+        return
+    if not has_rng:
+        reseed_all(int(seed) + int(step))
+    data_gen.manual_seed(int(seed) + int(step))
+    batch_sampler.perm = None
+    batch_sampler.next_batch = 0
+    batch_sampler.epoch_gen_state = None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--device", default="cuda", help="cuda (default) or cpu/mps for small local tests")
+    ap.add_argument("--no_tensorboard", action="store_true", help="keep JSON logs without the optional tensorboard dependency")
+    args = ap.parse_args()
+    if args.device == "cuda" and not torch.cuda.is_available():
+        # fail loudly: a cluster job that silently trains on CPU wastes a day
+        raise RuntimeError("CUDA requested but torch.cuda.is_available() is False (CPU-only torch build?)")
+    with open(args.config, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    tc, ec = cfg["train"], cfg["eval"]
+    out_dir = cfg["out_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "config.yaml"), "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f)
+    device = torch.device(args.device)
+    seed = int(cfg.get("seed", 0))
+    torch.manual_seed(seed)
+
+    m_max = max(m for _, m in tc["unroll"])
+    train_ds = TrajWindows(cfg["data_dir"], "train", cfg["stride_steps"], cfg["k"], m=m_max, start_every=tc.get("start_every", 1),
+                           reject_estimated_velocities=tc.get("reject_estimated_velocities", False))
+    val_ds = TrajWindows(cfg["data_dir"], "val", cfg["stride_steps"], cfg["k"], m=1,
+                         reject_estimated_velocities=tc.get("reject_estimated_velocities", False))
+    workers = tc.get("workers", 4)
+    # Own generator, separate from the noise RNG, so a resume can redraw this epoch's order.
+    # The loader's generator is only for the worker seed. Without it, each new epoch would
+    # draw that seed from the global RNG and shift the noise sequence.
+    data_gen = torch.Generator()
+    data_gen.manual_seed(seed)
+    loader_seed = torch.Generator()
+    loader_seed.manual_seed(seed)
+    batch_sampler = EpochBatchSampler(len(train_ds), int(tc["batch_size"]), data_gen)
+    if batch_sampler.n_batches < 1:
+        raise ValueError(
+            f"batch_size {tc['batch_size']} is larger than the {len(train_ds)} training windows, "
+            "so the epoch would be empty"
+        )
+    loader = torch.utils.data.DataLoader(
+        train_ds, batch_sampler=batch_sampler, num_workers=workers, persistent_workers=workers > 0,
+        generator=loader_seed)
+    types, masses = train_ds.types.to(device), train_ds.masses.to(device)
+
+    model_cfg = dict(cfg["model"])
+    if model_cfg.get("n_ff_types") == "auto":
+        model_cfg["n_ff_types"] = 0 if train_ds.ff_type_names is None else len(train_ds.ff_type_names)
+    model = make_model(n_types=len(train_ds.elements), k=cfg["k"], stride_fs=train_ds.stride_fs, **model_cfg).to(device)
+    if getattr(train_ds, "particle_metadata", None) is not None and hasattr(model, "set_chemistry"):
+        model.set_chemistry(
+            charges=train_ds.charges,
+            ff_types=train_ds.ff_types,
+            bonds=train_ds.bonds,
+            n_atoms=len(train_ds.types),
+        )
+    train_excl = (exclusions_from_bonds(train_ds.bonds, len(train_ds.types), device=device)
+                  if train_ds.bonds is not None and len(train_ds.bonds) > 0 else None)
+    if model.prior is not None and train_excl is not None:
+        model.prior.excluded_pairs = train_excl
+    ckpt_path = os.path.join(out_dir, "ckpt.pt")
+    opt = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc.get("weight_decay", 0.0))
+    step, best, best_stable = 0, math.inf, None
+    ck = None
+    if os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ck["model"])
+        opt.load_state_dict(ck["opt"])
+        step, best = ck["step"], ck["best"]
+        best_stable = tuple(ck["best_stable"]) if ck.get("best_stable") is not None else None
+        apply_resume_rng(ck, seed, step, data_gen, batch_sampler, len(train_ds))
+        if isinstance(ck.get("rng"), dict) and "torch" in ck["rng"]:
+            print(f"resumed from step {step}", flush=True)
+        else:
+            print(f"resumed from step {step} (old checkpoint: re-seeded with seed + step)", flush=True)
+    else:
+        if model.prior is not None and not model.prior.rmin_fixed:
+            model.prior.rmin.copy_(estimate_rmin(train_ds, model.prior.percentile,
+                                                 excluded_pairs=None if train_excl is None else train_excl.cpu()))
+        st = compute_stats(train_ds)
+        model.dx_std.copy_(st["dx_std"])
+        model.v_std.copy_(st["v_std"])
+        residual = model.target == "residual"
+        model.out_dx_std.copy_(st["res_dx_std"] if residual else st["dx_std"])
+        model.out_v_std.copy_(st["res_v_std"] if residual else st["v_std"])
+        if getattr(model, "target_scaling", "element_std") == "mass":
+            model.mass_dx_std.copy_(st["mass_res_dx_std"] if residual else st["mass_dx_std"])
+            model.mass_v_std.copy_(st["mass_res_v_std"] if residual else st["mass_v_std"])
+        if tc.get("init_from"):
+            # fine-tune: weights and normalisation buffers come from the snapshot; a missing prior buffer
+            # keeps the r_min just estimated from the training data
+            missing, src_step = load_init_weights(model, tc["init_from"], device)
+            print(json.dumps({"init_from": tc["init_from"], "init_source_step": src_step, "missing_keys": missing}), flush=True)
+    print(json.dumps({"elements": train_ds.elements, "dx_std": model.dx_std.tolist(), "v_std": model.v_std.tolist(),
+                      "out_dx_std": model.out_dx_std.tolist(), "out_v_std": model.out_v_std.tolist(), "target": model.target,
+                      "n_params": sum(p.numel() for p in model.parameters()), "n_train_windows": len(train_ds)}), flush=True)
+    if model.prior is not None:
+        print(json.dumps({"repulsion_prior_rmin": model.prior.rmin.tolist(), "r0": model.prior.r0().tolist()}), flush=True)
+
+    if tc.get("matmul_precision") is not None:
+        print(json.dumps(configure_matmul_precision(tc["matmul_precision"])), flush=True)
+    ema = None
+    ema_path = os.path.join(out_dir, "ema.pt")
+    if tc.get("ema_decay") is not None and float(tc["ema_decay"]) > 0.0:
+        ema = ExponentialMovingAverage(model, decay=float(tc["ema_decay"]), warmup=bool(tc.get("ema_warmup", True)))
+        if step > 0 and os.path.exists(ema_path):
+            ema.load_state_dict(torch.load(ema_path, map_location=device, weights_only=True))
+
+    # optional stability options (absent keys keep the original behavior)
+    loss_opts = build_loss_options(tc, train_ds, model, device)
+    if "overlap_r0" in loss_opts:
+        print(json.dumps({"overlap_penalty_r0": loss_opts["overlap_r0"].tolist()}), flush=True)
+
+    def lr_at(s):
+        warm = tc.get("warmup", 1000)
+        if s < warm:
+            return tc["lr"] * (s + 1) / warm
+        return tc["lr"] * 0.5 * (1 + math.cos(math.pi * min(1.0, (s - warm) / max(1, tc["steps"] - warm))))
+
+    guard = SpikeGuard(tc.get("loss_spike_factor", 0.0), tc.get("loss_spike_window", 200))
+    if ck is not None and isinstance(ck.get("spike_guard"), dict):
+        guard.load_state_dict(ck["spike_guard"])
+
+    def save(path):
+        atomic_save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "best": best,
+                     "best_stable": None if best_stable is None else list(best_stable), "cfg": cfg,
+                     "elements": train_ds.elements, "rng": capture_rng_state(),
+                     "loader": batch_sampler.state_dict(), "spike_guard": guard.state_dict(),
+                     "attention_version": ATTENTION_VERSION}, path)
+
+    if args.no_tensorboard:
+        class ScalarWriter:
+            def add_scalar(self, *args, **kwargs):
+                pass
+        writer = ScalarWriter()
+    else:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(os.path.join(out_dir, "tb"))
+    log = open(os.path.join(out_dir, "log.jsonl"), "a")
+    # opt-in: count constrained degrees of freedom in the temperature (off by default; argon has none)
+    n_con = val_ds.n_constraints if tc.get("constrained_dof", False) else 0
+    t_ref = temperature(torch.stack([val_ds[i][1][0] for i in range(0, len(val_ds), max(1, len(val_ds) // 20))]), val_ds.masses, n_con).mean().item()
+    last_ckpt, t_start, running = time.time(), time.time(), []
+    rewarmup = int(tc.get("rewarmup_steps", 0))
+    gnorms = []
+    m_last = None
+    def evaluate_and_select():
+        nonlocal best, best_stable, last_ckpt
+        model.eval()
+        ema_ctx = nullcontext() if ema is None else ema.average_parameters(model)
+        with ema_ctx:
+            with torch.no_grad():
+                val = []
+                for i in np.linspace(0, len(val_ds) - 1, ec.get("val_batches", 20) * tc["batch_size"]).astype(int).reshape(-1, tc["batch_size"]):
+                    items = [val_ds[j] for j in i]
+                    vp = torch.stack([it[0] for it in items]).to(device)
+                    vv = torch.stack([it[1] for it in items]).to(device)
+                    vb = torch.stack([it[2] for it in items]).to(device) if val_ds.periodic else None
+                    val.append(training_loss(model, vp, vv, vb, types, masses, 1, 0.0, "truncated", 2).item())
+                metrics = {"step": step, "val_loss": float(np.mean(val))}
+                diags = []
+                metrics.update(validation_rollout(model, val_ds, ec.get("rollout_starts", 4), ec.get("rollout_steps", 500),
+                                                  ec.get("sampling_steps", 10), device, t_ref, diag_sink=diags,
+                                                  n_constraints=n_con))
+                if ec.get("rollout_steps_select"):  # longer rollouts used only for best_stable.pt
+                    sel = validation_rollout(model, val_ds, ec.get("rollout_starts_select", ec.get("rollout_starts", 4)),
+                                             ec["rollout_steps_select"], ec.get("sampling_steps", 10), device, t_ref,
+                                             diag_sink=diags, n_constraints=n_con)
+                    metrics.update({"sel_" + key: value for key, value in sel.items()})
+            for key, value in metrics.items():
+                if key != "step":
+                    writer.add_scalar(f"val/{key}", value, step)
+            score = legacy_score(metrics)
+            metrics["score"] = score
+            if score < best:
+                best = score
+                save(os.path.join(out_dir, "best.pt"))
+            stable = selection_score(metrics)
+            metrics["stability_score"] = list(stable)
+            if best_stable is None or stable < best_stable:
+                best_stable = stable
+                save(os.path.join(out_dir, "best_stable.pt"))
+            crashed_diags = [d for d in diags if any(c is not None for c in d["crashes"])]
+            if crashed_diags:
+                with open(os.path.join(out_dir, "crash_diagnostics.jsonl"), "a") as f:
+                    for d in crashed_diags:
+                        f.write(json.dumps({"step": step, **d}) + "\n")
+            # keep every evaluated checkpoint: short validation rollouts do not predict 10^4-step
+            # stability well (argon v0), so checkpoints are re-ranked later with long validation rollouts
+            atomic_save({"model": model.state_dict(), "step": step, "cfg": cfg, "elements": train_ds.elements,
+                         "attention_version": ATTENTION_VERSION},
+                        os.path.join(out_dir, "snapshots", f"step{step:06d}.pt"))
+        log.write(json.dumps(metrics) + "\n")
+        log.flush()
+        print(json.dumps(metrics), flush=True)
+        save(ckpt_path)
+        if ema is not None:
+            atomic_save(ema.state_dict(), ema_path)
+        last_ckpt = time.time()
+        model.train()
+
+    if step == 0 and tc.get("init_from") and ec.get("eval_at_start", True):
+        # fine-tune: score the initial weights so best_stable.pt can never be worse than the starting point
+        evaluate_and_select()
+    model.train()
+    while step < tc["steps"]:
+        for pos, vel, box in loader:
+            if step >= tc["steps"]:
+                break
+            pos, vel = pos.to(device), vel.to(device)
+            box = box.to(device) if train_ds.periodic else None
+            m = unroll_length(tc["unroll"], step)
+            lr_now = lr_at(step) * lr_scale_after_switch(step, last_switch_step(tc["unroll"], step), rewarmup)
+            for g in opt.param_groups:
+                g["lr"] = lr_now
+            if m != m_last:
+                # new unroll length: free cached blocks sized for the old graphs
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                print(json.dumps({"unroll_m": m, "at_step": step, "micro_batch_size": micro_batch_size_for(tc, m)}), flush=True)
+                m_last = m
+            # backward runs inside, one micro-batch at a time; a rejected update throws the gradient away
+            opt.zero_grad(set_to_none=True)
+            loss_value = accumulate_gradients(model, pos, vel, box, types, masses, m, noise_sigma_at(tc, step),
+                                              tc.get("backprop", "truncated"), tc.get("unroll_sampling_steps", 2),
+                                              micro_batch_size_for(tc, m), **loss_opts)
+            if not guard.check(loss_value, m):
+                opt.zero_grad(set_to_none=True)
+            else:
+                gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), tc.get("grad_clip", 1.0))
+                if torch.isfinite(gnorm):
+                    opt.step()
+                    if ema is not None:
+                        ema.update(model)
+                    gnorms.append(gnorm.item())
+                else:
+                    guard.skipped += 1
+                    opt.zero_grad(set_to_none=True)
+            step += 1
+            batch_sampler.next_batch += 1  # a later resume skips batches already used
+            if math.isfinite(loss_value):
+                running.append(loss_value)
+            if step % 50 == 0:
+                mean_loss = float(np.mean(running)) if running else float("nan")
+                mean_gn = float(np.mean(gnorms)) if gnorms else float("nan")
+                writer.add_scalar("train/loss", mean_loss, step)
+                writer.add_scalar("train/grad_norm", mean_gn, step)
+                writer.add_scalar("train/unroll_m", m, step)
+                print(json.dumps({"step": step, "loss": mean_loss, "m": m, "lr": lr_now,
+                                  "grad_norm": mean_gn, "skipped_updates": guard.skipped,
+                                  "elapsed_h": (time.time() - t_start) / 3600}), flush=True)
+                running, gnorms = [], []
+            if step % ec["every"] == 0 or step == tc["steps"]:
+                evaluate_and_select()
+            elif time.time() - last_ckpt > 60 * tc.get("ckpt_minutes", 20):
+                save(ckpt_path)
+                if ema is not None:
+                    atomic_save(ema.state_dict(), ema_path)
+                last_ckpt = time.time()
+    save(ckpt_path)
+    if ema is not None:
+        atomic_save(ema.state_dict(), ema_path)
+    log.close()
+    if hasattr(writer, "close"):
+        writer.close()
+    with open(os.path.join(out_dir, "done.json"), "w", encoding="utf-8") as f:
+        json.dump({"step": step, "best_score": best, "hours": (time.time() - t_start) / 3600}, f)
+
+
+if __name__ == "__main__":
+    main()

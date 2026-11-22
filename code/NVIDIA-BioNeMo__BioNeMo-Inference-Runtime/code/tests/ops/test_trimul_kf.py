@@ -1,0 +1,1188 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""TriMul KF custom ops: the K1 -> K2 -> K3 chain against the fp32 reference.
+
+SM90, SM100 and SM103 run it from source and from CUBINs.
+"""
+
+from __future__ import annotations
+
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+import pytest
+import torch
+
+from bionemo_ir import dsl_kernels
+from bionemo_ir._torch.custom_ops import trimul_kf_k1 as k1
+from bionemo_ir._torch.custom_ops import trimul_kf_k2 as k2
+from bionemo_ir._torch.custom_ops import trimul_kf_k3 as k3
+from bionemo_ir._torch.custom_ops.trimul_kf_k1 import _config as k1_config
+from bionemo_ir._torch.custom_ops.trimul_kf_k1 import cutedsl as k1_cutedsl
+from bionemo_ir._torch.custom_ops.trimul_kf_k2 import _config as k2_config
+from bionemo_ir._torch.custom_ops.trimul_kf_k2 import _cubin as k2_cubin
+from bionemo_ir._torch.custom_ops.trimul_kf_k2 import cutedsl as k2_cutedsl
+from bionemo_ir._torch.custom_ops.trimul_kf_k3 import _config as k3_config
+from bionemo_ir._torch.custom_ops.trimul_kf_k3 import _cubin as k3_cubin
+from bionemo_ir._torch.custom_ops.trimul_kf_k3 import cutedsl as k3_cutedsl
+from bionemo_ir._torch.utils.kernel import CuTeDSLKernelLibraryExecutable, CuTeDSLKernelVariantUnavailable
+from bionemo_ir._torch.utils.kernel import _cutedsl_kernel_library as library_runtime
+from tests._torch import SM_VERSION, cutedsl_test_modes, require_cubin_library, skip_if_not_sm90
+
+_CUTEDSL_MODES = cutedsl_test_modes("bionemo_ir._torch.custom_ops.trimul_kf_k1._source")
+_BACKENDS = (
+    (k1_cutedsl.TrimulKFK1CuTe, k1_cutedsl),
+    (k2_cutedsl.TrimulKFK2CuTe, k2_cutedsl),
+    (k3_cutedsl.TrimulKFK3CuTe, k3_cutedsl),
+)
+_MODE_CACHES: dict[tuple[type, str], dict] = {}
+_K2Tile = k2_config.TrimulKFK2Tile
+_EPS = 1e-5
+# bf16 a, b and product between fp32 stages.
+_ATOL = 8e-2
+
+# (B, N, C, D, outgoing, has_bias, residual, lengths), selecting every K1 variant and its padded a/b
+# layout (N = 504, 520, 552, 1016), every K2 tile the D = 128 and 256 bundles run, K2_1's odd-cluster fallback
+# (N = 392 at C = 64), and the K3 variants the configs select, with and without the residual.
+# N * N % 128 != 0 at N = 104, 136, 168, 200, 376 and 504: K1 still takes every batch in one launch, K3 variants
+# that tile a launch's rows flat one launch each.
+_CASES = [
+    (1, 128, 64, 64, True, False, False, "full"),
+    (1, 128, 32, 32, False, True, True, "tail"),
+    (1, 256, 32, 32, True, True, True, "random"),
+    (1, 256, 128, 128, False, False, True, "random"),
+    (1, 384, 128, 128, False, True, True, "tail"),
+    (1, 392, 128, 128, True, False, True, "random"),
+    (1, 512, 64, 64, True, True, True, "random"),
+    (2, 136, 128, 128, False, True, True, "random"),
+    (3, 168, 64, 64, True, True, False, "random"),
+    (1, 128, 256, 256, False, True, True, "full"),
+    (1, 256, 256, 256, True, True, True, "random"),
+    (1, 384, 256, 256, False, False, True, "tail"),
+    (2, 392, 256, 256, True, True, True, "random"),
+    (1, 1024, 256, 256, False, True, True, "tail"),
+    (1, 264, 256, 256, True, False, True, "tail"),
+    (2, 552, 128, 128, False, True, True, "random"),
+    (1, 392, 64, 64, False, False, True, "tail"),
+    (1, 128, 384, 256, True, False, True, "full"),
+    (1, 136, 384, 256, True, True, True, "tail"),
+    (1, 168, 384, 256, False, True, False, "random"),
+    (2, 200, 384, 256, False, False, True, "random"),
+    (1, 256, 384, 256, True, True, False, "random"),
+    (1, 264, 384, 256, True, False, True, "tail"),
+    (2, 376, 384, 256, False, True, True, "random"),
+    (1, 400, 384, 256, False, True, True, "tail"),
+    (1, 520, 384, 256, False, True, True, "random"),
+    (1, 1016, 384, 256, True, True, True, "tail"),
+    (1, 264, 128, 128, True, True, True, "random"),
+    (1, 520, 128, 128, True, False, True, "tail"),
+    (4, 104, 384, 256, True, True, True, "random"),
+    (2, 504, 384, 256, False, True, True, "random"),
+]
+# The D = 256 K2 tiles at 513-988 tokens (N here is the padded token count J the node passes K2): outgoing 224 on one CTA
+# (513-672: N = 520, the J of 513 tokens), outgoing 208 on one CTA (769-832: N = 776, 832), outgoing 224 on one CTA
+# (833-896: N = 864), incoming 224 on one CTA (769-896: N = 776, 896) and incoming 256 on a pair (897-952: N = 904),
+# plus the edges around them: N = 512 (still S=320's tiles), 984 (S=776's 256 pair) and 992 (the J of 988 and 989
+# tokens, S=1200's 256 pair).
+_D256_TAIL_CASES = [
+    (1, 520, 384, 256, True, True, True, "random"),
+    (1, 776, 384, 256, True, False, True, "tail"),
+    (1, 832, 256, 256, True, True, True, "random"),
+    (1, 864, 384, 256, True, True, False, "random"),
+    (1, 776, 384, 256, False, True, True, "random"),
+    (1, 896, 256, 256, False, False, True, "tail"),
+    (1, 904, 256, 256, False, True, True, "random"),
+    (1, 512, 384, 256, True, True, True, "tail"),
+    (1, 984, 384, 256, False, True, True, "tail"),
+    (1, 992, 256, 256, True, False, True, "random"),
+]
+_CASES += _D256_TAIL_CASES
+
+
+def _case_id(case) -> str:
+    B, N, C, D, outgoing, has_bias, residual, lengths = case
+    widths = f"C{C}" if C == D else f"C{C}-D{D}"
+    return f"B{B}-N{N}-{widths}-{'out' if outgoing else 'in'}-bias{int(has_bias)}-res{int(residual)}-{lengths}"
+
+
+def _reject_cubin(*_args, **_kwargs):
+    raise AssertionError("source test mode unexpectedly fell back to the CUBIN library")
+
+
+def _use_mode(mode: str, monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    """Route all three ops through exactly one of the source and CUBIN paths."""
+    monkeypatch.delenv("CUTEDSL_FORCE_CUBIN", raising=False)
+    caches = []
+    for backend, module in _BACKENDS:
+        cache = _MODE_CACHES.setdefault((backend, mode), {})
+        monkeypatch.setattr(backend, "_compiled_cache", cache)
+        caches.append(cache)
+        if mode == "source":
+            monkeypatch.setattr(module, "populate_compiled_cache_from_library", _reject_cubin)
+    if mode == "cubin":
+        require_cubin_library()
+        monkeypatch.setenv("CUTEDSL_FORCE_CUBIN", "1")
+    return caches
+
+
+def library_carries(family: str, sm: int) -> bool:
+    """Whether the CUBIN library this build embeds carries any ``family`` image for ``sm``: a corpus generated before
+    the SM100 images, or a build without the library, carries none."""
+    try:
+        library = library_runtime._load_kernel_library()
+    except library_runtime.CuTeDSLKernelLibraryUnavailable:
+        return False
+    return any(spec.target_sm == sm for spec in getattr(library, family).kernel_specs())
+
+
+def _skip_unless_chain_runs(mode: str) -> None:
+    """Skip unless this GPU runs the chain in ``mode``: SM100, SM103 and SM107 run CUBINs once the corpus carries
+    them."""
+    if SM_VERSION in (100, 103, 107):
+        if mode == "cubin" and not all(library_carries(f"trimul_kf_k{k}", SM_VERSION) for k in (1, 2, 3)):
+            pytest.skip(f"this build's CUBIN library carries no SM{SM_VERSION} TriMul KF images")
+        return
+    skip_if_not_sm90()
+
+
+def _skip_unless_ops_run() -> None:
+    """Skip unless this GPU runs the ops in the mode the environment selects."""
+    _skip_unless_chain_runs("cubin" if k1_cutedsl.TrimulKFK1CuTe.force_cubin() else "source")
+
+
+def _assert_dispatched(caches: list[dict], mode: str) -> None:
+    for cache in caches:
+        assert cache
+        assert all(isinstance(value, CuTeDSLKernelLibraryExecutable) == (mode == "cubin") for value in cache.values())
+    if mode == "cubin":
+        # a dynamic K2 tile's CUBIN runs the dynamic schedule, not its static fallback (K2's key ends with the tile's
+        # dynamic flag)
+        assert all(executable.dynamic is key[-1] for key, executable in caches[1].items() if isinstance(key[-1], bool))
+
+
+def _problem(
+    B: int, N: int, C: int, has_bias: bool, lengths: str, seed: int = 0, D: int | None = None
+) -> dict[str, torch.Tensor | None]:
+    """A chain problem of width ``C`` and hidden width ``D`` (``C`` unless given)."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+
+    def rnd(*shape: int, scale: float = 1.0) -> torch.Tensor:
+        return (torch.randn(*shape, device="cuda", generator=generator) * scale).to(torch.bfloat16)
+
+    D = C if D is None else D
+    seqlen = torch.full((B, N), N, device="cuda", dtype=torch.int32)
+    out_seqlen = seqlen.clone()
+    if lengths == "tail":
+        seqlen[:, : N - 5] = N - 5
+        seqlen[:, N - 5 :] = 0
+        out_seqlen = seqlen.clone()
+    elif lengths == "random":
+        seqlen = torch.randint(0, N + 1, (B, N), device="cuda", dtype=torch.int32, generator=generator)
+        out_seqlen = torch.randint(0, N + 1, (B, N), device="cuda", dtype=torch.int32, generator=generator)
+    problem = {
+        "x": rnd(B, N, N, C),
+        "seqlen": seqlen,
+        "out_seqlen": out_seqlen,
+        "norm_in_weight": rnd(C, scale=0.1) + 1,
+        "norm_in_bias": rnd(C, scale=0.1),
+        "norm_out_weight": rnd(D, scale=0.1) + 1,
+        "norm_out_bias": rnd(D, scale=0.1),
+        "p_in_weight": rnd(2 * D, C, scale=C**-0.5),
+        "g_in_weight": rnd(2 * D, C, scale=C**-0.5),
+        "p_out_weight": rnd(C, D, scale=D**-0.5),
+        "g_out_weight": rnd(C, C, scale=C**-0.5),
+    }
+    biases = ("p_in_bias", "g_in_bias", "p_out_bias", "g_out_bias")
+    sizes = (2 * D, 2 * D, C, C)
+    for name, size in zip(biases, sizes, strict=True):
+        problem[name] = rnd(size, scale=0.1) if has_bias else None
+    return problem
+
+
+def _widths(problem: dict) -> tuple[int, int]:
+    """The problem's ``(C, D)``."""
+    return problem["x"].shape[-1], problem["p_in_weight"].shape[0] // 2
+
+
+def _run_chain(problem: dict, outgoing: bool, residual: bool, pitched: bool | None = None) -> torch.Tensor:
+    return _run_chain_stages(problem, outgoing, residual, pitched)[-1]
+
+
+def _run_chain_stages(
+    problem: dict, outgoing: bool, residual: bool, pitched: bool | None = None
+) -> tuple[torch.Tensor | None, ...]:
+    """``a``, ``b``, ``stats``, the product and the output of the op chain.
+
+    K2 writes the product at K1's a/b pitch when ``pitched``; by default where the node does, for a K3 that reads a
+    pitch.
+    """
+    x = problem["x"]
+    C, D = _widths(problem)
+    op1 = k1.get_trimul_kf_k1_op(torch.bfloat16, C, D)
+    op2 = k2.get_trimul_kf_k2_op(torch.bfloat16, D, outgoing)
+    op3 = k3.get_trimul_kf_k3_op(torch.bfloat16, C, D, residual)
+    assert op1 is not None and op2 is not None and op3 is not None
+    fold_in = k1.fold_input_weights(
+        problem["norm_in_weight"],
+        problem["norm_in_bias"],
+        problem["p_in_weight"],
+        problem["g_in_weight"],
+        problem["p_in_bias"],
+        problem["g_in_bias"],
+        centred=op1.centred,
+    )
+    fold_out = k3.fold_output_weights(
+        problem["norm_out_weight"],
+        problem["norm_out_bias"],
+        problem["norm_in_weight"],
+        problem["norm_in_bias"],
+        problem["p_out_weight"],
+        problem["g_out_weight"],
+        problem["p_out_bias"],
+        problem["g_out_bias"],
+    )
+    a, b, stats = op1(x, problem["seqlen"], fold_in, _EPS)
+    prod = op2(a, b, pitched=op3.reads_pitch(x.shape[1], residual) if pitched is None else pitched)
+    out = op3(
+        prod,
+        x,
+        fold_out,
+        stats,
+        _EPS,
+        residual=residual,
+        actual_seqlen=problem["out_seqlen"] if residual else None,
+    )
+    return a, b, stats, prod, out
+
+
+# Output rows the fp32 reference computes at once: its temporaries stay under 1 GiB at N = 992, C = 384.
+_REFERENCE_ROWS = 64
+
+
+def _k1_reference_rows(problem: dict, item: int, rows: slice) -> torch.Tensor:
+    """fp32 channel-major ``a`` and ``b`` rows ``[2D, R, N]`` of batch item ``item``.
+
+    Each is ``mask * (n @ W_p.T + b_p) * sigmoid(n @ W_g.T + b_g)``, with ``n = LayerNorm(x)`` and
+    ``mask[i, j] = j < seqlen[item, i]``.
+    """
+    x = problem["x"][item, rows].float()
+    N, C = x.shape[1:]
+    normed = torch.nn.functional.layer_norm(
+        x, (C,), problem["norm_in_weight"].float(), problem["norm_in_bias"].float(), _EPS
+    )
+    proj = torch.nn.functional.linear(normed, problem["p_in_weight"].float(), _float(problem["p_in_bias"]))
+    gate = torch.nn.functional.linear(normed, problem["g_in_weight"].float(), _float(problem["g_in_bias"]))
+    mask = torch.arange(N, device=x.device) < problem["seqlen"][item, rows, None]
+    return (proj * torch.sigmoid(gate) * mask[..., None]).permute(2, 0, 1)
+
+
+def _k3_reference_rows(prod: torch.Tensor, problem: dict, item: int, rows: slice, residual: bool) -> torch.Tensor:
+    """fp32 output rows ``[R, N, C]`` of batch item ``item``: ``(LN_out(P) @ W_out.T + b_out) * sigmoid(LN_in(x) @
+    W_g.T + b_g)``.
+
+    ``P`` is the fp32 product rows ``prod`` ``[D, R, N]`` channel-last. The fused residual gives
+    ``(x + update) * mask``, ``mask[i, j] = j < out_seqlen[item, i]``.
+    """
+    x = problem["x"][item, rows].float()
+    N, C = x.shape[1:]
+    products = torch.nn.functional.layer_norm(
+        prod.permute(1, 2, 0),
+        (prod.shape[0],),
+        problem["norm_out_weight"].float(),
+        problem["norm_out_bias"].float(),
+        _EPS,
+    )
+    normed = torch.nn.functional.layer_norm(
+        x, (C,), problem["norm_in_weight"].float(), problem["norm_in_bias"].float(), _EPS
+    )
+    update = torch.nn.functional.linear(
+        products, problem["p_out_weight"].float(), _float(problem["p_out_bias"])
+    ) * torch.sigmoid(
+        torch.nn.functional.linear(normed, problem["g_out_weight"].float(), _float(problem["g_out_bias"]))
+    )
+    if not residual:
+        return update
+    mask = torch.arange(N, device=x.device) < problem["out_seqlen"][item, rows, None]
+    return (x + update) * mask[..., None]
+
+
+def _float(bias: torch.Tensor | None) -> torch.Tensor | None:
+    return None if bias is None else bias.float()
+
+
+def _k1_reference(problem: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """fp32 channel-major ``a``, ``b`` ``[B, D, N, N]`` of every batch item; see ``_k1_reference_rows``."""
+    B = problem["x"].shape[0]
+    ab = torch.stack([_k1_reference_rows(problem, item, slice(None)) for item in range(B)])
+    D = ab.shape[1] // 2
+    return ab[:, :D], ab[:, D:]
+
+
+def _k2_reference(a: torch.Tensor, b: torch.Tensor, outgoing: bool) -> torch.Tensor:
+    """fp32 ``prod`` ``[B, D, N, N]``: ``a[i, k] b[j, k]`` summed over ``k`` outgoing, ``a[k, i] b[k, j]`` incoming."""
+    return torch.einsum("bdik,bdjk->bdij" if outgoing else "bdki,bdkj->bdij", a.float(), b.float())
+
+
+def _k3_reference(prod: torch.Tensor, problem: dict, residual: bool) -> torch.Tensor:
+    """fp32 ``[B, N, N, C]`` of every batch item from ``prod`` ``[B, D, N, N]``; see ``_k3_reference_rows``."""
+    return torch.stack(
+        [_k3_reference_rows(p.float(), problem, item, slice(None), residual) for item, p in enumerate(prod)]
+    )
+
+
+def _reference(problem: dict, outgoing: bool, residual: bool) -> torch.Tensor:
+    """The whole fp32 chain for small cases; ``_assert_matches_reference`` bounds memory on large ones."""
+    a, b = _k1_reference(problem)
+    return _k3_reference(_k2_reference(a, b, outgoing), problem, residual)
+
+
+def _assert_matches_reference(out: torch.Tensor, problem: dict, outgoing: bool, residual: bool) -> None:
+    """Compare ``out`` with the fp32 chain, ``_REFERENCE_ROWS`` output rows at a time.
+
+    Only one batch item's fp32 ``a`` and ``b`` (``8 D N^2`` bytes) stay resident. The product sums ``a[i, k] b[j, k]``
+    over ``k`` outgoing and ``a[k, i] b[k, j]`` incoming.
+    """
+    B, N = out.shape[:2]
+    D = problem["p_in_weight"].shape[0] // 2
+    chunks = [slice(start, start + _REFERENCE_ROWS) for start in range(0, N, _REFERENCE_ROWS)]
+    for item in range(B):
+        ab = torch.empty(2 * D, N, N, device=out.device)
+        for rows in chunks:
+            ab[:, rows] = _k1_reference_rows(problem, item, rows)
+        a, b = ab[:D], ab[D:]
+        for rows in chunks:
+            if outgoing:
+                prod = torch.einsum("dik,djk->dij", a[:, rows], b)
+            else:
+                prod = torch.einsum("dki,dkj->dij", a[:, :, rows], b)
+            torch.testing.assert_close(
+                out[item, rows].float(),
+                _k3_reference_rows(prod, problem, item, rows, residual),
+                atol=_ATOL,
+                rtol=0,
+                msg=lambda message, item=item, rows=rows: f"batch item {item}, rows {rows.start}+: {message}",
+            )
+
+
+def _skip_without_room(B: int, N: int, C: int, D: int, outputs: int = 1, reference: bool = True) -> None:
+    """Skip a case the free GPU memory cannot hold.
+
+    The peak is ``x`` and the ``outputs`` the test keeps, plus the larger of the chain's bf16 ``a``, ``b`` and product
+    and, with ``reference``, one batch item's fp32 ``a`` and ``b`` and the reference's row temporaries. Tests sharing
+    one device run out before the kernels are at fault, so size the requirement from the case rather than failing on
+    allocation.
+    """
+    torch.cuda.empty_cache()
+    P = k1_config.ab_pitch(N, k1_config.ab_layout("pad_n_mod_16_8", N))
+    chain = B * (4 * D * P * P + 2 * D * N * N)
+    fp32 = 8 * D * N * N + 4 * _REFERENCE_ROWS * N * (8 * D + 4 * C) if reference else 0
+    footprint = 2 * B * N * N * C * (1 + outputs) + max(chain, fp32)
+    needed = footprint + footprint // 4
+    if torch.cuda.mem_get_info()[0] < needed:
+        pytest.skip(f"needs {needed / 2**30:.1f} GiB of free GPU memory")
+
+
+@pytest.mark.parametrize("mode", _CUTEDSL_MODES)
+@pytest.mark.parametrize("case", _CASES, ids=_case_id)
+def test_chain_matches_reference(mode, case, monkeypatch):
+    _skip_unless_chain_runs(mode)
+    B, N, C, D, outgoing, has_bias, residual, lengths = case
+    _skip_without_room(B, N, C, D)
+    caches = _use_mode(mode, monkeypatch)
+    problem = _problem(B, N, C, has_bias, lengths, D=D)
+    out = _run_chain(problem, outgoing, residual)
+    _assert_dispatched(caches, mode)
+    assert out.shape == problem["x"].shape and out.dtype == torch.bfloat16
+    _assert_matches_reference(out, problem, outgoing, residual)
+
+
+# Dense and padded K1 planes at C = 128, 256 and 384 (a pitched product at C = 384), K3 with and without the
+# residual, and each K2 tile list's widths.
+_BITWISE_CASES = [
+    _CASES[0],
+    _CASES[4],
+    _CASES[7],
+    _CASES[9],
+    _CASES[11],
+    _CASES[13],
+    _CASES[14],
+    _CASES[15],
+    _CASES[17],
+    _CASES[19],
+    _CASES[21],
+    _CASES[25],
+    _CASES[27],
+    _CASES[28],
+    (1, 520, 256, 256, True, True, True, "random"),
+    # K2's pitched product and K3_4's per-row image: N % 64 = 56
+    (2, 504, 384, 256, False, True, True, "random"),
+    *_D256_TAIL_CASES,
+]
+
+
+@pytest.mark.parametrize("case", _BITWISE_CASES, ids=_case_id)
+def test_cubin_chain_matches_source_chain_bitwise(case, monkeypatch):
+    """Both paths run the same machine code, so their outputs agree bit for bit."""
+    skip_if_not_sm90()
+    if set(_CUTEDSL_MODES) != {"source", "cubin"}:
+        pytest.skip("needs BIOIR_TEST_CUTEDSL_MODES=source,cubin")
+    B, N, C, D, outgoing, has_bias, residual, lengths = case
+    _skip_without_room(B, N, C, D, outputs=2, reference=False)
+    problem = _problem(B, N, C, has_bias, lengths, D=D)
+    outputs = []
+    for mode in ("source", "cubin"):
+        with monkeypatch.context() as patch:
+            caches = _use_mode(mode, patch)
+            outputs.append(_run_chain(problem, outgoing, residual))
+            _assert_dispatched(caches, mode)
+    assert torch.equal(outputs[0], outputs[1])
+
+
+@pytest.mark.parametrize("mode", _CUTEDSL_MODES)
+@pytest.mark.parametrize("case", _D256_TAIL_CASES[:7], ids=_case_id)
+def test_d256_tail_tiles_repeat_bit_for_bit(mode, case, monkeypatch):
+    """The single-CTA K2 tiles at 513-952 tokens claim their units from a counter: three runs of the chain, from source
+    or from the CUBIN library, write the same bits."""
+    skip_if_not_sm90()
+    B, N, C, D, outgoing, has_bias, residual, lengths = case
+    _skip_without_room(B, N, C, D, outputs=2, reference=False)
+    caches = _use_mode(mode, monkeypatch)
+    problem = _problem(B, N, C, has_bias, lengths, D=D)
+    first = _run_chain(problem, outgoing, residual)
+    _assert_dispatched(caches, mode)
+    for _ in range(2):
+        assert torch.equal(_run_chain(problem, outgoing, residual), first)
+
+
+# Padded K1 planes (N % 16 == 8 past the padding anchor), so K2 writes a pitched product and K3 reads it per row:
+# N % 64 = 56 (504, 568) and 8 (520), every shape and K3 variant, batch items of every length and masked columns, K3
+# with and without the residual.
+_PITCHED_CASES = [
+    (B, N, 384, 256, outgoing, lengths)
+    for N in (504, 520, 568)
+    for B in (1, 2, 4)
+    for outgoing in (True, False)
+    for lengths in ("random", "items")
+    if B < 4 or N == 504
+] + [
+    (B, N, C, C, outgoing, lengths)
+    for C in (32, 64, 128, 256)
+    for B, N, outgoing, lengths in ((1, 568, True, "random"), (2, 520, False, "items"), (2, 568, True, "items"))
+]
+
+
+def _pitched_case_id(case) -> str:
+    B, N, C, D, outgoing, lengths = case
+    return f"B{B}-N{N}-C{C}-D{D}-{'out' if outgoing else 'in'}-{lengths}"
+
+
+@pytest.mark.parametrize("mode", _CUTEDSL_MODES)
+@pytest.mark.parametrize("case", _PITCHED_CASES, ids=_pitched_case_id)
+def test_pitched_product_chain_matches_dense_chain_bitwise(mode, case, monkeypatch):
+    """K2 writing the product at K1's padded pitch and K3 reading it per row change no bit of either.
+
+    Each output row's math is the same on per-row tiles, so the pitched chain reproduces the dense one exactly,
+    masked rows and short batch items included, wherever K3's rule would take the pitched product or not.
+    """
+    skip_if_not_sm90()
+    B, N, C, D, outgoing, lengths = case
+    _skip_without_room(B, N, C, D, outputs=3, reference=False)
+    caches = _use_mode(mode, monkeypatch)
+    op3 = k3.get_trimul_kf_k3_op(torch.bfloat16, C, D, True)
+    variant = op3.select(N).kernel_variant
+    if mode == "cubin" and not all(op3.backend.supports_pitch(C, D, variant, res) for res in (True, False)):
+        pytest.skip(f"this build ships no pitched {variant} image for C={C}, D={D}")
+    problem = _problem(B, N, C, True, "random" if lengths == "random" else "full", seed=N + B, D=D)
+    if lengths == "items":
+        # short batch items padded to N: item b holds N - 48 b tokens, its padding rows and columns masked
+        seqlen = problem["seqlen"]
+        for item in range(B):
+            length = N - 48 * item
+            seqlen[item, :length] = length
+            seqlen[item, length:] = 0
+        problem["out_seqlen"] = seqlen.clone()
+    for residual in (True, False):
+        a, _, _, pitched_prod, pitched_out = _run_chain_stages(problem, outgoing, residual, pitched=True)
+        assert a.stride(2) == k1_config.ab_pitch(N, "padded") > N
+        assert pitched_prod.stride(2) == a.stride(2) and pitched_prod.stride(1) == N * a.stride(2)
+        *_, dense_prod, dense_out = _run_chain_stages(problem, outgoing, residual, pitched=False)
+        assert dense_prod.is_contiguous()
+        assert torch.equal(pitched_prod, dense_prod)
+        assert torch.equal(pitched_out, dense_out)
+    _assert_dispatched(caches, mode)
+    assert any(key[-1] == "pitched" for key in caches[2]), "K3 never ran its pitched image"
+
+
+def test_k2_writes_the_product_at_its_operands_pitch_on_request():
+    """``pitched`` writes the product's rows at a's row pitch; on dense planes that is the dense product. The column
+    tiles that reach past N write the pad columns too, as zeros, so that every row ends on a whole line."""
+    skip_if_not_sm90()
+    D, N = 64, 136
+    op2 = k2.get_trimul_kf_k2_op(torch.bfloat16, D, True)
+    P = k1_config.ab_pitch(N, "padded")
+    planes = torch.randn(2, 2, D, P, P, device="cuda").to(torch.bfloat16)
+    a, b = planes[..., :N, :N].unbind(0)
+    # hand the pitched product a block that held NaNs, so unwritten pad columns would show
+    torch.full((2, D, N, P), float("nan"), dtype=torch.bfloat16, device="cuda")
+    pitched = op2(a, b, pitched=True)
+    dense = op2(a, b)
+    assert dense.is_contiguous() and pitched.shape == dense.shape == (2, D, N, N)
+    assert pitched.stride() == (D * N * P, N * P, P, 1)
+    assert torch.equal(pitched, dense)
+    tile_n = op2.select(N).tile_n
+    covered = min(P, -(-N // tile_n) * tile_n)
+    assert covered > N
+    rows = pitched.as_strided((2, D, N, P), pitched.stride())
+    assert torch.equal(rows[..., N:covered], torch.zeros_like(rows[..., N:covered]))
+    contiguous = a.contiguous(), b.contiguous()
+    assert op2(*contiguous, pitched=True).is_contiguous()
+
+
+def test_k3_takes_k2s_pitched_product_and_rejects_other_strides():
+    skip_if_not_sm90()
+    C, D, N = 384, 256, 504
+    op3 = k3.get_trimul_kf_k3_op(torch.bfloat16, C, D, True)
+    assert op3.select(N).kernel_variant in k3_config.PITCHED_VARIANTS
+    x = torch.empty(2, N, N, C, device="cuda", dtype=torch.bfloat16)
+    buffer = torch.empty(2, D, N, 512, device="cuda", dtype=torch.bfloat16)
+    assert op3.accepts(buffer[..., :N], x)
+    assert op3.accepts(buffer[..., :N].contiguous(), x)
+    # rows 8-element aligned, planes exactly N rows, batch items D planes apart
+    assert not op3.accepts(torch.empty(2, D, N, 516, device="cuda", dtype=torch.bfloat16)[..., :N], x)
+    assert not op3.accepts(torch.empty(2, D, N + 8, 512, device="cuda", dtype=torch.bfloat16)[:, :, :N, :N], x)
+    assert not op3.accepts(torch.empty(2, 2 * D, N, 512, device="cuda", dtype=torch.bfloat16)[:, :D, :, :N], x)
+
+
+def test_k3_resident_launcher_rejects_n_off_the_token_alignment():
+    """K3_4 loads each slab as two 64-row units that must not straddle batch items, so its launcher needs 8 | n."""
+    skip_if_not_sm90()
+    if "cubin" not in _CUTEDSL_MODES:
+        pytest.skip("needs BIOIR_TEST_CUTEDSL_MODES to include cubin")
+    library = require_cubin_library()
+    C, D = 384, 256
+    executable = k3_cubin.TrimulKFK3CubinExecutable(library, library.trimul_kf_k3, 90, C, D, "K3_4", False)
+
+    def launch(n: int) -> None:
+        """One batch item of n tokens, every operand flat as the op passes it."""
+
+        def zeros(elements: int, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+            return torch.zeros(elements, device="cuda", dtype=dtype)
+
+        stats = zeros(-(-n * n // 128) * 128 * 2, torch.float32)
+        prod, x, out = zeros(D * n * n), zeros(n * n * C), zeros(n * n * C)
+        weights = (zeros(C * D), zeros(C * C), zeros(4 * C, torch.float32))
+        executable(prod, x, *weights, stats, None, out, n * n, n, 1, _EPS)
+
+    with pytest.raises(ValueError, match="multiple of 8, got n=12"):
+        launch(12)
+    launch(16)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("mode", _CUTEDSL_MODES)
+def test_graph_replay_feeds_each_k1_the_x_its_k3_wrote(mode, monkeypatch):
+    """tri_mul_out's K3 writes the x tri_mul_in's K1 reads; replay must not let K1 read it early.
+
+    The node folds its weights once, so in the trunk K1 follows the previous K3 directly. At N = 64
+    K3 leaves SMs free, and a K1 overlapping it would read the previous replay's x.
+    """
+    _skip_unless_chain_runs(mode)
+    caches = _use_mode(mode, monkeypatch)
+    problem = _problem(1, 64, 256, True, "full")
+    C = problem["x"].shape[-1]
+    op1 = k1.get_trimul_kf_k1_op(torch.bfloat16, C, C)
+    op2 = {outgoing: k2.get_trimul_kf_k2_op(torch.bfloat16, C, outgoing) for outgoing in (True, False)}
+    op3 = k3.get_trimul_kf_k3_op(torch.bfloat16, C, C, True)
+    fold_in = k1.fold_input_weights(
+        problem["norm_in_weight"],
+        problem["norm_in_bias"],
+        problem["p_in_weight"],
+        problem["g_in_weight"],
+        problem["p_in_bias"],
+        problem["g_in_bias"],
+        centred=op1.centred,
+    )
+    fold_out = k3.fold_output_weights(
+        problem["norm_out_weight"],
+        problem["norm_out_bias"],
+        problem["norm_in_weight"],
+        problem["norm_in_bias"],
+        problem["p_out_weight"],
+        problem["g_out_weight"],
+        problem["p_out_bias"],
+        problem["g_out_bias"],
+    )
+
+    def out_then_in(x: torch.Tensor, sync: bool) -> torch.Tensor:
+        """tri_mul_out then tri_mul_in on ``x``; ``sync`` finishes each chain before the next starts."""
+        for outgoing in (True, False):
+            a, b, stats = op1(x, problem["seqlen"], fold_in, _EPS)
+            prod = op2[outgoing](a, b)
+            x = op3(prod, x, fold_out, stats, _EPS, residual=True, actual_seqlen=problem["out_seqlen"])
+            if sync:
+                torch.cuda.synchronize()
+        return x
+
+    static = problem["x"].clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        out_then_in(static, sync=False)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        out = out_then_in(static, sync=False)
+    _assert_dispatched(caches, mode)
+    for seed in range(1, 4):
+        x = _problem(1, 64, C, True, "full", seed=seed)["x"]
+        static.copy_(x)
+        graph.replay()
+        torch.testing.assert_close(out, out_then_in(x, sync=True), rtol=0, atol=0)
+
+
+def _rows_reference(problem: dict, a: torch.Tensor, b: torch.Tensor, prod: torch.Tensor, outgoing: bool, rows):
+    """fp32 ``a``, ``b``, product and output rows of the last batch, each from its stage's own inputs."""
+    B, N, _, C = problem["x"].shape
+    x = problem["x"][B - 1, rows].float()
+    normed_in = torch.nn.functional.layer_norm(
+        x, (C,), problem["norm_in_weight"].float(), problem["norm_in_bias"].float(), _EPS
+    )
+    proj = torch.nn.functional.linear(normed_in, problem["p_in_weight"].float(), _float(problem["p_in_bias"]))
+    gate = torch.nn.functional.linear(normed_in, problem["g_in_weight"].float(), _float(problem["g_in_bias"]))
+    mask = torch.arange(N, device=x.device) < problem["seqlen"][B - 1, rows, None]
+    ab = (proj * torch.sigmoid(gate) * mask[..., None]).permute(2, 0, 1)
+    D = ab.shape[0] // 2
+    prod_rows = torch.empty((D, len(rows), N), device=x.device)
+    for d in range(0, D, 32):  # b in fp32, 32 planes at a time
+        planes = b[B - 1, d : d + 32].float()
+        if outgoing:
+            prod_rows[d : d + 32] = torch.einsum("drk,djk->drj", a[B - 1, d : d + 32, rows].float(), planes)
+        else:
+            prod_rows[d : d + 32] = torch.einsum("dkr,dkj->drj", a[B - 1, d : d + 32, :, rows].float(), planes)
+    products = torch.nn.functional.layer_norm(
+        prod[B - 1, :, rows].float().permute(1, 2, 0),
+        (D,),
+        problem["norm_out_weight"].float(),
+        problem["norm_out_bias"].float(),
+        _EPS,
+    )
+    update = torch.nn.functional.linear(
+        products, problem["p_out_weight"].float(), _float(problem["p_out_bias"])
+    ) * torch.sigmoid(
+        torch.nn.functional.linear(normed_in, problem["g_out_weight"].float(), _float(problem["g_out_bias"]))
+    )
+    out_mask = torch.arange(N, device=x.device) < problem["out_seqlen"][B - 1, rows, None]
+    return ab[:D], ab[D:], prod_rows, (x + update) * out_mask[..., None]
+
+
+# One launch per op past 2^31 elements: N = 2904 pads a/b to P = 2944; B = 2 at N = 3008 shares a launch; and B = 2 at
+# N = 2912, C = D = 256 puts the batch stride D * N * N past 2^31.
+_LARGE_CASES = [(1, 2904, 256), (2, 3008, 128), (2, 2912, 256)]
+
+
+@pytest.mark.parametrize("mode", _CUTEDSL_MODES)
+@pytest.mark.parametrize("outgoing", [True, False], ids=["out", "in"])
+@pytest.mark.parametrize(("B", "N", "C"), _LARGE_CASES, ids=lambda v: str(v))
+def test_chain_past_int32_offsets_matches_reference_rows(mode, B, N, C, outgoing, monkeypatch):
+    """Every stage's rows of the last batch, the last planes included, match fp32 once offsets pass 2^31."""
+    _skip_unless_chain_runs(mode)
+    torch.cuda.empty_cache()
+    P = k1.ab_pitch(N, "padded")
+    footprint = 2 * B * (2 * N * N * C + 2 * C * P * P + C * N * N)  # bf16 x and out, a and b, product
+    if torch.cuda.mem_get_info()[0] < max(32 * 2**30, footprint + footprint // 4):
+        pytest.skip(f"needs {max(32 * 2**30, footprint + footprint // 4) >> 30} GiB of free GPU memory")
+    caches = _use_mode(mode, monkeypatch)
+    problem = _problem(B, N, C, True, "random")
+    a, b, stats, prod, out = _run_chain_stages(problem, outgoing, True)
+    _assert_dispatched(caches, mode)
+    assert min(a.numel(), prod.numel(), out.numel()) > 2**31
+    rows = [0, N // 2, N - 1]
+    a_ref, b_ref, prod_ref, out_ref = _rows_reference(problem, a, b, prod, outgoing, rows)
+    torch.testing.assert_close(a[B - 1, :, rows].float(), a_ref, atol=_ATOL, rtol=1e-2)
+    torch.testing.assert_close(b[B - 1, :, rows].float(), b_ref, atol=_ATOL, rtol=1e-2)
+    torch.testing.assert_close(prod[B - 1, :, rows].float(), prod_ref, atol=_ATOL, rtol=1e-2)
+    torch.testing.assert_close(out[B - 1, rows].float(), out_ref, atol=_ATOL, rtol=0)
+
+
+@pytest.mark.parametrize("shape", sorted(k1_config.shipped_shapes(90)))
+def test_k1_k2_and_k3_agree_on_the_product_pitch(shape):
+    """For every token count, K1's a/b layout, the pitch K2 writes the product at and the tiles K3 reads it with agree.
+
+    The chain (the triangle node's rule) has K2 write the product at K1's pitch exactly where K1 pads its planes and
+    K3's product layout rule reads a pitch: every row then starts on a 128-byte line, and K3, a variant that can read
+    a pitch, runs its per-row image. Anywhere else the product is dense and K3 runs flat tiles.
+    """
+    C, D = shape
+    pitched = 0
+    for n in range(8, 4097, 8):
+        k1_selection = k1_config.select(90, C, D, n)
+        k3_selection = k3_config.select(90, C, D, n)
+        padded = k1_selection.ab_layout == "padded"
+        # K2 writes at a's row pitch: K1's padded pitch, or N on dense planes
+        prod_pitch = k1_selection.ab_pitch(n) if k3_selection.reads_pitch else n
+        assert (prod_pitch != n) == (padded and k3_selection.reads_pitch), n
+        assert prod_pitch == n or prod_pitch % k1_config.AB_PAD_ALIGN == 0, n
+        assert k3_selection.kernel_variant in k3_config.PITCHED_VARIANTS or not k3_selection.reads_pitch, n
+        pitched += prod_pitch != n
+    if (C, D) == (384, 256):
+        assert pitched, "the C=384, D=256 chain writes a pitched product somewhere"
+
+
+@pytest.mark.parametrize("shape", sorted(k1_config.shipped_shapes(90)))
+def test_k1_hands_row_statistics_exactly_to_the_k3_that_reads_them(shape):
+    """For every token count, K1 writes statistics exactly when the K3 it pairs with reads them."""
+    C, D = shape
+    assert shape in k3_config.shipped_shapes(90)
+    for n in range(8, 4097, 8):
+        assert k1_config.select(90, C, D, n).writes_stats == k3_config.select(90, C, D, n).reads_stats, n
+
+
+@pytest.mark.parametrize("D", sorted(k2_config.shipped_widths(90)))
+def test_k2_tiles_fill_their_clusters_and_deferred_stores(D):
+    """Every token count runs a tile whose clusters fill and whose deferred stores have enough k-blocks."""
+    for outgoing in (True, False):
+        for n in range(8, 4097, 8):
+            _, tile = k2_config.select(90, D, n, outgoing)
+            assert -(-n // tile.tile_n) % tile.cluster_n == 0, (n, tile)
+            assert tile.defer_kmin <= -(-n // k2_config.TILE_K), (n, tile)
+    paired = k2_config.TrimulKFK2Tile("K2_1", 192)
+    assert k2_config.runtime_tile(paired, 392) == k2_config.TrimulKFK2Tile("K2_1", 128)
+    assert k2_config.runtime_tile(paired, 384) == paired
+
+
+def test_shipped_shapes():
+    shapes = {(32, 32), (64, 64), (128, 128), (256, 256), (384, 256)}
+    assert k1_config.shipped_shapes(90) == shapes == k3_config.shipped_shapes(90)
+    assert k2_config.shipped_widths(90) == {32, 64, 128, 256}
+    assert k1_config.shipped_shapes(80) == frozenset()
+
+
+def test_centred_input_fold_rows_sum_to_about_zero():
+    """Centred rows sum to almost nothing, at about the rounding error of rounding each entry to nearest."""
+    for seed, (C, D) in enumerate(((384, 256), (256, 128), (32, 16))):
+        generator = torch.Generator().manual_seed(seed)
+        weight = (torch.randn(2 * D, C, generator=generator) * C**-0.5).to(torch.bfloat16)
+        gate = (torch.randn(2 * D, C, generator=generator) * C**-0.5).to(torch.bfloat16)
+        gamma = (torch.randn(C, generator=generator) * 0.1 + 1).to(torch.bfloat16)
+        fold = k1.fold_input_weights(gamma, None, weight, gate, centred=True)
+        assert fold.centred and not k1.fold_input_weights(gamma, None, weight, gate).centred
+        for rows, raw in ((fold.proj, weight), (fold.gate, gate)):
+            exact = raw.double() * gamma.double()
+            exact = exact - exact.mean(-1, keepdim=True)
+            nearest = exact.to(torch.bfloat16).double()
+            err, nearest_err = (rows.double() - exact).abs(), (nearest - exact).abs()
+            assert rows.double().sum(-1).abs().max() < 0.05 * nearest.sum(-1).abs().max()
+            assert err.pow(2).mean().sqrt() < 1.1 * nearest_err.pow(2).mean().sqrt()
+            assert err.max() < 1.5 * nearest_err.max()
+        interleaved = fold.interleaved.view(-1, 2, 8, C)
+        assert torch.equal(interleaved[:, 0].reshape(-1, C), fold.proj)
+        assert torch.equal(interleaved[:, 1].reshape(-1, C), fold.gate)
+
+
+@pytest.mark.parametrize("shape", sorted(k1_config.shipped_shapes(90)))
+def test_k1_reads_a_centred_fold_where_it_drops_the_mean_term(shape):
+    """K1_2, which every C >= 256 bundle selects, drops the LayerNorm mean term: its op asks for a centred fold
+    and rejects a plain one. The mean-term variants of the narrower bundles read the plain fold."""
+    skip_if_not_sm90()
+    C, D = shape
+    op1 = k1.get_trimul_kf_k1_op(torch.bfloat16, C, D)
+    assert op1.centred == (C >= 256)
+    assert all(k1_config.select(90, C, D, n).centred == op1.centred for n in range(8, 4097, 8))
+    if not op1.centred:
+        return
+    problem = _problem(1, 128, C, False, "full", D=D)
+    weights = [problem[name] for name in ("norm_in_weight", "norm_in_bias", "p_in_weight", "g_in_weight")]
+    with pytest.raises(ValueError, match="centred=True"):
+        op1(problem["x"], problem["seqlen"], k1.fold_input_weights(*weights), _EPS)
+
+
+def test_input_fold_interleaves_eight_row_blocks():
+    C, D = 32, 16
+    weight = torch.randn(2 * D, C).to(torch.bfloat16)
+    gate = torch.randn(2 * D, C).to(torch.bfloat16)
+    fold = k1.fold_input_weights(torch.ones(C), torch.zeros(C), weight, gate)
+    for r in range(2 * D):
+        assert torch.equal(fold.interleaved[(r // 8) * 16 + r % 8], fold.proj[r])
+        assert torch.equal(fold.interleaved[(r // 8) * 16 + r % 8 + 8], fold.gate[r])
+    assert fold.C == C and fold.D == D and fold.vec.shape == (8 * D,)
+
+
+@pytest.mark.parametrize("config", [{"S=128": {"kernel_variant": "K1_9"}}, {"N=128": {"kernel_variant": "K1_0"}}, {}])
+def test_malformed_k1_configs_are_rejected(config):
+    with pytest.raises(ValueError):
+        k1_config.parse_configs(config)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"S=128": {"kernel_variant": "K3_1", "prod_layout": "pitched"}},  # K3_1 has no per-row image
+        {"S=128": {"kernel_variant": "K3_4", "prod_layout": "strided"}},
+        {"S=128": {"kernel_variant": "K3_4", "ab_layout": "pad_n_mod_16_8"}},
+    ],
+)
+def test_malformed_k3_configs_are_rejected(config):
+    with pytest.raises(ValueError):
+        k3_config.parse_configs(config)
+
+
+def test_k3_product_layout_rules():
+    """``pitched_n_mod_64_ge_56`` reads a pitched product where 64-column row chunks overrun N by at most 8."""
+    ns = (488, 504, 512, 520, 536, 552, 568, 1016)
+    rule = "pitched_n_mod_64_ge_56"
+    assert [k3_config.prod_layout(rule, n) for n in ns] == ["dense", "pitched"] + ["dense"] * 4 + ["pitched"] * 2
+    assert k3_config.prod_layout("pitched", 520) == "pitched" and k3_config.prod_layout("dense", 504) == "dense"
+    with pytest.raises(ValueError):
+        k3_config.prod_layout("strided", 504)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"kernel_variant": "K2_1", "tile_n": 256},
+        {"kernel_variant": "K2_0", "tile_n": 128},
+        {"kernel_variant": "K2_0", "tile_n": 128, "cluster_m": 1, "defer_kmin": 0, "split_epi": True},
+        {"kernel_variant": "K2_0", "tile_n": 136, "cluster_m": 2, "defer_kmin": 0, "split_epi": False},
+        {"kernel_variant": "K2_1", "tile_n": 128, "dynamic": True},
+        {"kernel_variant": "K2_0", "tile_n": 256, "cluster_m": 2, "defer_kmin": 4, "split_epi": False, "static": True},
+    ],
+)
+def test_malformed_k2_tiles_are_rejected(entry):
+    with pytest.raises(ValueError):
+        k2_config.parse_tile(entry, "test")
+
+
+class _FakeK2Launcher:
+    """A K2 CUBIN launcher holding the static image of every tile, and the dynamic one where ``dynamic_images``."""
+
+    class DType:
+        BFLOAT16 = 0
+
+    def __init__(self, axis: bool, dynamic_images: bool) -> None:
+        self.axis, self.dynamic_images = axis, dynamic_images
+
+    def make_kernel_config(self, *geometry: object, **kwargs: bool) -> SimpleNamespace:
+        if kwargs and not self.axis:
+            raise TypeError("make_kernel_config(): incompatible function arguments")  # a launcher without the axis
+        dynamic = kwargs.get("dynamic", False)
+        if dynamic and not self.dynamic_images:
+            raise ValueError("No embedded trimul KF K2 CUBIN")
+        return SimpleNamespace(spec=SimpleNamespace(dynamic=dynamic) if self.axis else SimpleNamespace())
+
+
+@pytest.mark.parametrize(
+    ("axis", "dynamic_images", "runs_dynamic"),
+    [(False, False, False), (True, False, False), (True, True, True)],
+    ids=["launcher-without-the-axis", "no-dynamic-image", "dynamic-image"],
+)
+def test_k2_cubin_runs_a_dynamic_tile_statically_on_a_library_without_its_image(axis, dynamic_images, runs_dynamic):
+    """A dynamic tile runs its dynamic image where the library has one, and its static image (ignoring the counter)
+    where it predates it; a static tile always runs its static image."""
+    dynamic, static = _K2Tile("K2_0", 256, 2, 4, False, True), _K2Tile("K2_0", 256, 2, 4, False)
+    launcher = _FakeK2Launcher(axis, dynamic_images)
+    assert k2_cubin.TrimulKFK2CubinExecutable(None, launcher, 90, True, dynamic).dynamic is runs_dynamic
+    assert k2_cubin.TrimulKFK2CubinExecutable(None, launcher, 90, True, static).dynamic is False
+
+
+def test_k2_cubin_without_any_image_of_the_tile_is_unavailable():
+    class Empty(_FakeK2Launcher):
+        def make_kernel_config(self, *geometry: object, **kwargs: bool) -> SimpleNamespace:
+            raise ValueError("No embedded trimul KF K2 CUBIN")
+
+    with pytest.raises(CuTeDSLKernelVariantUnavailable):
+        k2_cubin.TrimulKFK2CubinExecutable(None, Empty(True, True), 90, True, _K2Tile("K2_0", 256, 2, 4, False, True))
+
+
+class _SourceBuild:
+    """Stands in for a source executable a call cached before ``CUTEDSL_FORCE_CUBIN`` was set."""
+
+
+class _LibraryImage(CuTeDSLKernelLibraryExecutable):
+    """Stands in for an executable the CUBIN library built."""
+
+
+@pytest.mark.parametrize("sm", [90, 100, 103])
+@pytest.mark.parametrize(
+    ("backend", "module", "shape"),
+    [
+        (k1_cutedsl.TrimulKFK1CuTe, k1_cutedsl, (384, 256)),
+        (k2_cutedsl.TrimulKFK2CuTe, k2_cutedsl, (256, True)),
+        (k3_cutedsl.TrimulKFK3CuTe, k3_cutedsl, (384, 256, True)),
+    ],
+    ids=["k1", "k2", "k3"],
+)
+def test_forced_cubin_ships_only_what_the_library_carries(
+    monkeypatch: pytest.MonkeyPatch, backend: type, module: ModuleType, shape: tuple, sm: int
+) -> None:
+    """A process can set ``CUTEDSL_FORCE_CUBIN`` after a source build landed under the key a CUBIN loads into.
+    ``ships`` must then ask the library: the source build does not pass for an image the library lacks, and an
+    image the library carries replaces it."""
+    carries = True
+
+    def image(library: object, launcher: object) -> _LibraryImage:
+        if not carries:
+            raise CuTeDSLKernelVariantUnavailable("the library lacks this image")
+        return _LibraryImage()
+
+    def populate(cache: dict, key: tuple, family: str, factory: object) -> object:
+        return library_runtime.populate_compiled_cache_from_library(cache, key, family, image)
+
+    families = SimpleNamespace(trimul_kf_k1=object(), trimul_kf_k2=object(), trimul_kf_k3=object())
+    monkeypatch.setattr(library_runtime, "_load_kernel_library", lambda: families)
+    monkeypatch.setattr(module, "populate_compiled_cache_from_library", populate)
+    cache: dict = {}
+    monkeypatch.setattr(backend, "_compiled_cache", cache)
+    monkeypatch.setenv("CUTEDSL_FORCE_CUBIN", "1")
+    op = backend(sm)
+    assert op.ships(*shape)
+    keys = list(cache)
+    assert keys
+
+    carries = False
+    cache.update(dict.fromkeys(keys, _SourceBuild()))
+    assert not op.ships(*shape)
+
+    carries = True
+    cache.update(dict.fromkeys(keys, _SourceBuild()))
+    assert op.ships(*shape)
+    assert all(isinstance(cache[key], _LibraryImage) for key in keys)
+
+
+class _DenseLaunchParams:
+    """K2's launch fields before the product pitch: like the bound class, it takes no other attribute."""
+
+    __slots__ = ("a", "b", "prod", "n", "l", "ab_pitch", "ab_plane", "counter", "stream")
+
+
+class _PitchedLaunchParams:
+    __slots__ = (*_DenseLaunchParams.__slots__, "prod_pitch", "prod_plane")
+
+
+@pytest.mark.parametrize(
+    ("launch_params", "prod_pitch", "runs"),
+    [
+        (_DenseLaunchParams, None, True),
+        (_DenseLaunchParams, 8, True),
+        (_DenseLaunchParams, 16, False),
+        (_PitchedLaunchParams, 16, True),
+    ],
+    ids=["old-library-dense", "old-library-dense-pitch-n", "old-library-pitched", "pitched"],
+)
+def test_k2_cubin_call_writes_dense_products_on_a_library_without_the_product_pitch(
+    monkeypatch: pytest.MonkeyPatch, launch_params: type, prod_pitch: int | None, runs: bool
+) -> None:
+    """A library built before the product pitch launches dense products and reports a pitched one unavailable."""
+    launched = []
+
+    class Launcher(_FakeK2Launcher):
+        LaunchParams = launch_params
+
+        def launch(self, config: SimpleNamespace, params: object) -> None:
+            launched.append(params)
+
+    monkeypatch.setattr(k2_cubin, "current_stream_handle", lambda tensor: 0)
+    library = SimpleNamespace(FlatTensorView=lambda *view: view)
+    tile = _K2Tile("K2_0", 256, 2, 4, False)
+    executable = k2_cubin.TrimulKFK2CubinExecutable(library, Launcher(True, False), 90, True, tile)
+    n = 8
+    pitch = n if prod_pitch is None else prod_pitch
+    operand, prod = torch.zeros(n * n), torch.zeros(n * pitch)
+
+    def call() -> None:
+        executable(operand, operand, prod, n, 1, n, n * n, prod_pitch, None if prod_pitch is None else n * pitch)
+
+    if not runs:
+        with pytest.raises(CuTeDSLKernelVariantUnavailable, match="predates pitched products"):
+            call()
+        assert not launched
+        return
+    call()
+    assert len(launched) == 1
+    if launch_params is _PitchedLaunchParams:
+        assert (launched[0].prod_pitch, launched[0].prod_plane) == (pitch, n * pitch)
+
+
+def test_k2_anchors_name_one_tile_or_one_per_direction():
+    shared = {"kernel_variant": "K2_1", "tile_n": 192}
+    outgoing = {"kernel_variant": "K2_2", "tile_n": 208, "cluster_m": 2, "defer_kmin": 8, "split_epi": False}
+    incoming = {"kernel_variant": "K2_0", "tile_n": 256, "cluster_m": 2, "defer_kmin": 8, "split_epi": True}
+    configs = {"S=264": shared, "S=832": {"out": outgoing, "in": incoming}}
+    out, inc = k2_config.parse_configs(configs, "o", True), k2_config.parse_configs(configs, "i", False)
+    assert out[264] == inc[264] == (k2_config.TrimulKFK2Tile("K2_1", 192),)
+    assert out[832] == (k2_config.parse_tile(outgoing, "o"),) and inc[832] == (k2_config.parse_tile(incoming, "i"),)
+    for bad in ({"out": outgoing}, {"out": outgoing, "in": incoming, "other": shared}):
+        with pytest.raises(ValueError):
+            k2_config.parse_configs({"S=832": bad})
+
+
+def test_ops_reject_misuse():
+    _skip_unless_ops_run()
+    C = 64
+    problem = _problem(1, 128, C, False, "full")
+    op1 = k1.get_trimul_kf_k1_op(torch.bfloat16, C, C)
+    op3 = k3.get_trimul_kf_k3_op(torch.bfloat16, C, C, True)
+    fold_in = k1.fold_input_weights(
+        problem["norm_in_weight"], problem["norm_in_bias"], problem["p_in_weight"], problem["g_in_weight"]
+    )
+    fold_out = k3.fold_output_weights(
+        problem["norm_out_weight"],
+        problem["norm_out_bias"],
+        problem["norm_in_weight"],
+        problem["norm_in_bias"],
+        problem["p_out_weight"],
+        problem["g_out_weight"],
+    )
+    x = problem["x"]
+    assert not op1.accepts(x[:, :124, :124].contiguous(), problem["seqlen"][:, :124].contiguous())
+    with pytest.raises(ValueError, match="multiple of 8"):
+        op1(x[:, :124, :124].contiguous(), problem["seqlen"][:, :124].contiguous(), fold_in, _EPS)
+    prod = torch.zeros(1, C, 128, 128, device="cuda", dtype=torch.bfloat16)
+    stats = torch.zeros(1, 128 * 128, 2, device="cuda")
+    with pytest.raises(ValueError, match="row statistics"):
+        op3(prod, x, fold_out, stats, _EPS, residual=True, actual_seqlen=problem["out_seqlen"])
+    with pytest.raises(ValueError, match="actual_seqlen exactly with residual"):
+        op3(prod, x, fold_out, None, _EPS, residual=True)
+    with pytest.raises(ValueError, match="must not alias x"):
+        op3(prod, x, fold_out, None, _EPS, residual=False, out=x)
+    # A partial overlap is aliasing too; a neighbouring range in the same buffer is not.
+    buffer = torch.empty(2 * x.numel(), device="cuda", dtype=x.dtype)
+    x_in_buffer = buffer[: x.numel()].view_as(x).copy_(x)
+    with pytest.raises(ValueError, match="must not alias x"):
+        op3(
+            prod,
+            x_in_buffer,
+            fold_out,
+            None,
+            _EPS,
+            residual=False,
+            out=buffer[x.numel() // 2 :][: x.numel()].view_as(x),
+        )
+    op3(prod, x_in_buffer, fold_out, None, _EPS, residual=False, out=buffer[x.numel() :].view_as(x))
+    assert k1.get_trimul_kf_k1_op(torch.float16, C, C) is None
+    assert k1.get_trimul_kf_k1_op(torch.bfloat16, 96, 96) is None
+
+
+@pytest.mark.parametrize(("B", "N"), [(1, 0), (0, 128)], ids=["no-tokens", "no-batch"])
+def test_ops_reject_empty_problems(B, N):
+    """An empty problem has nothing to launch; each op turns it away before its batch chunking."""
+    _skip_unless_ops_run()
+    C = 64
+    op1 = k1.get_trimul_kf_k1_op(torch.bfloat16, C, C)
+    op2 = k2.get_trimul_kf_k2_op(torch.bfloat16, C, True)
+    op3 = k3.get_trimul_kf_k3_op(torch.bfloat16, C, C, True)
+    x = torch.empty(B, N, N, C, device="cuda", dtype=torch.bfloat16)
+    seqlen = torch.empty(B, N, device="cuda", dtype=torch.int32)
+    channel_major = torch.empty(B, C, N, N, device="cuda", dtype=torch.bfloat16)
+
+    assert not op1.accepts(x, seqlen)
+    assert not op2.accepts(channel_major, channel_major)
+    assert not op3.accepts(channel_major, x)
+    with pytest.raises(ValueError, match="non-empty"):
+        op2(channel_major, channel_major)
+
+
+def test_source_kernels_never_request_programmatic_dependent_launch():
+    """The traced launches must not ask for PDL, which is unsafe under graph capture.
+
+    PDL is correct under plain stream ordering, but a capturing stream records
+    nodes rather than launching them and the attribute does not survive into
+    the graph: ``griddepcontrol.wait`` is then left with no trigger behind it,
+    so a replay can read a predecessor's output while it is still being
+    written. The resulting mismatch is a race -- it surfaced on a 14-layer
+    trunk yet not on an 8-layer one -- so no output comparison detects it
+    reliably and this guards the invariant directly instead.
+
+    ``use_pdl`` is a trace-time constant here, so this path cannot tell a
+    capture from a plain launch. The CUBIN launcher decides per launch and
+    keeps PDL everywhere except capture.
+    """
+    sources = Path(dsl_kernels.__file__).parent / "cute"
+    checked = 0
+    for name in (
+        "sm90_trimul_kf_k1",
+        "sm90_trimul_kf_k2",
+        "sm90_trimul_kf_k3",
+        "sm100_trimul_kf_k1",
+        "sm100_trimul_kf_k2",
+        "sm100_trimul_kf_k3",
+    ):
+        text = (sources / f"{name}.py").read_text()
+        assert "use_pdl=False," in text, f"{name} should launch without PDL"
+        assert "use_pdl=True" not in text, f"{name} requests PDL, which breaks CUDA graph replay"
+        checked += text.count("use_pdl=")
+    assert checked == 17, f"expected the chains' 17 launch sites (9 on SM90, 8 on SM100), found {checked}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("shape", [(128, 128), (256, 128), (384, 64)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
+def test_replayed_centring_matches_eager_bitwise(shape, dtype, monkeypatch):
+    """The graph each shape replays reproduces the eager passes bit for bit, input after input."""
+    monkeypatch.setattr(k3.ops, "_centre_graphs", {})
+    generator = torch.Generator(device="cuda").manual_seed(59)
+    for _ in range(3):
+        w = (torch.randn(shape, device="cuda", generator=generator, dtype=torch.float64) * 0.05).to(dtype)
+        replayed = k3.ops.centre_rows_bf16(w)
+        eager = k3.ops._centre_rows(w, k3.ops._CENTRE_PASSES)
+        assert replayed.dtype == eager.dtype == torch.bfloat16
+        assert torch.equal(replayed.view(torch.int16), eager.view(torch.int16))
+    assert len(k3.ops._centre_graphs) == 1
+    # A non-contiguous input and a capture both take the eager passes.
+    assert torch.equal(k3.ops.centre_rows_bf16(w.t().contiguous().t()).view(torch.int16), eager.view(torch.int16))
+    assert len(k3.ops._centre_graphs) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("captured", [False, True], ids=["threads-capture", "threads-replay"])
+def test_replayed_centring_is_safe_across_threads_and_streams(captured, monkeypatch):
+    """Threads centring weights of one shape on their own streams each get their own weights' result."""
+    monkeypatch.setattr(k3.ops, "_centre_graphs", {})
+    generator = torch.Generator(device="cuda").manual_seed(61)
+    weights = [(torch.randn(256, 256, device="cuda", generator=generator) * 0.05).bfloat16() for _ in range(4)]
+    expected = [k3.ops._centre_rows(w, k3.ops._CENTRE_PASSES) for w in weights]
+    if captured:
+        k3.ops.centre_rows_bf16(weights[0])
+    barrier = threading.Barrier(len(weights))
+
+    def centre(index: int) -> int:
+        mismatches = 0
+        with torch.cuda.stream(torch.cuda.Stream()):
+            barrier.wait()
+            for _ in range(50):
+                mismatches += not torch.equal(k3.ops.centre_rows_bf16(weights[index]), expected[index])
+        return mismatches
+
+    with ThreadPoolExecutor(max_workers=len(weights)) as pool:
+        assert list(pool.map(centre, range(len(weights)))) == [0] * len(weights)
+    assert len(k3.ops._centre_graphs) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("first", [torch.inference_mode, torch.no_grad], ids=["inference-first", "no-grad-first"])
+def test_replayed_centring_across_inference_mode(first, monkeypatch):
+    """A refold in a forward runs under inference_mode, a construction fold under no_grad: either may come first."""
+    monkeypatch.setattr(k3.ops, "_centre_graphs", {})
+    generator = torch.Generator(device="cuda").manual_seed(73)
+    w = (torch.randn(128, 128, device="cuda", generator=generator, dtype=torch.float64) * 0.05).bfloat16()
+    eager = k3.ops._centre_rows(w, k3.ops._CENTRE_PASSES)
+    modes = [first, torch.no_grad if first is torch.inference_mode else torch.inference_mode]
+    for mode in modes + modes:
+        with mode():
+            assert torch.equal(k3.ops.centre_rows_bf16(w).view(torch.int16), eager.view(torch.int16)), mode
+    assert len(k3.ops._centre_graphs) == 1
+    (_graph, static_in, static_out, _done) = next(iter(k3.ops._centre_graphs.values()))
+    assert not static_in.is_inference() and not static_out.is_inference()

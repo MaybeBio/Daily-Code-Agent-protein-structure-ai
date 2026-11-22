@@ -1,0 +1,51 @@
+0. The CHARMM C27 FF we have been using was inherited from Brooks lab 2004-2007.
+   The CMAP it includes is different from the distributed C27 FF.
+   This directory inlcudes the distributed version (C22+CMAP from toppar_c36_aug14.tgz)
+   and CpHMD top & par.
+
+1. top_all22_prot.rtf
+   Distributed C22 protein topology file
+
+2. par_all22_prot.prm
+   Distributed C22 protein parameter file + CMAP
+
+3. toppar_water_ions.str
+   Distributed C22 top & par for water and ions
+
+4. radius_gbsw.str
+   Distributed C22 atomic input radii for GBSW
+
+5. toppar_phmd_c22.str
+   CpHMD top & par.
+   Copied from toppar_phmd_c36.str; change ASPP2/ASPP1/GLUP2/GLUP1 top & par back to C22
+
+6. phmd_hybrid_g2_c22.in
+   Model compound PMF parameters for hybrid solvent CpHMD
+   Copied from phmd_hybrid_g2_shane.in, revise format
+
+7. Usage of distributed C27 FF with CpHMD toppar.
+   The strategy is not to touch distributed C27 FF but make our CpHMD toppar as a
+   stream file (toppar_phmd_c22.str). After regular toppar has been read in, stream
+   CpHMD toppar. Commands are:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+! Set variables
+! -------------
+set top     = XXX/top_all22_prot.rtf           ! C27 protein topology file
+set par     = XXX/par_all22_prot.prm           ! C27 protein parameter file
+set wation  = XXX/toppar_water_ions.str        ! C27 top & par for water & ions
+set phmdtp  = XXX/toppar_phmd_c22.str          ! C27 CpHMD top & par files
+
+! Read topology and parameter files
+! ---------------------------------
+open unit 1 read form name @top
+read rtf card unit 1
+close unit 1
+
+open unit 1 read form name @par
+read param card unit 1 flex ! must use flex here
+close unit 1
+
+stream @wation
+
+stream @phmdtp
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

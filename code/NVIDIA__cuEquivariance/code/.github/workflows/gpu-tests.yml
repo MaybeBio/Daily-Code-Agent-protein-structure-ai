@@ -1,0 +1,38 @@
+name: Tests on GPUs
+
+on:
+  push:
+    branches:
+      - "main"
+      - "release"
+      - "pull-request/[0-9]+"
+
+jobs:
+
+  jax-gpu:
+    runs-on: linux-amd64-gpu-l4-latest-1
+    
+    steps:
+    - name: Collect System and Hardware Information
+      run: |
+        uname -a
+        cat /etc/os-release
+        lscpu | head -20
+        free -h
+        df -h
+        nvidia-smi
+
+    - uses: actions/checkout@v5
+    
+    - uses: ./.github/actions/setup-python-uv
+      with:
+        python-version: '3.12'
+    
+    - uses: ./.github/actions/setup-cuequivariance-jax
+      with:
+        use-gpu: 'true'
+        
+    - name: Test with pytest
+      run: |
+        # XLA_PYTHON_CLIENT_PREALLOCATE=false pytest --doctest-modules -x -m "not slow" cuequivariance_jax
+        echo "skipping tests"

@@ -1,0 +1,3404 @@
+# Overview
+
+
+
+Martinize2 and Vermouth represent a unified framework for molecular topology generation, designed to transform atomic-level molecular structures into simulation-ready systems. This toolkit specializes in coarse-graining molecular dynamics simulations, with particular strength in handling complex polymeric systems including proteins, DNA, and other biomolecules.
+
+## Core Architecture
+
+The system is built around a **graph-based molecular representation** where atoms and coarse-grained beads are nodes, and bonds are edges. This approach enables flexible manipulation of molecular structures regardless of their topology, making it uniquely capable of handling non-linear polymers that challenge traditional tools [vermouth/molecule.py](vermouth/molecule.py#L1-L50).
+
+### Key Components
+
+**Vermouth Library**: The Python engine providing programmatic access to molecular transformations. It implements a modular architecture based on three core concepts:
+
+- **Blocks**: Graph-based descriptions of idealized residues/monomeric units with their MD parameters
+- **Links**: Molecular fragments describing interactions between residues/monomers  
+- **Modifications**: Deviations from standard blocks, including post-translational modifications
+
+**Martinize2 CLI**: The command-line interface built on Vermouth, providing a familiar workflow for users transitioning from the original Martinize tool [doc/source/general_overview.rst](doc/source/general_overview.rst#L25-L35).
+
+### System Architecture
+
+```mermaid
+graph TD
+    A[Input Structure] --> B[File Reader Processors]
+    B --> C[Molecule Graph]
+    C --> D[Force Field Application]
+    D --> E[Mapping/Coarse-Graining]
+    E --> F[Topology Generation]
+    F --> G[Output Files]
+    
+    H[Force Field Data] --> D
+    H --> E
+    
+    subgraph "Processor Pipeline"
+    B
+    D
+    E
+    F
+    end
+    
+    subgraph "Core Data Structures"
+    I[System Class]
+    J[Molecule Class]
+    K[Force Field Objects]
+    end
+    
+    C --> J
+    I --> J
+    K --> D
+```
+
+> [!TIP]
+> The processor pipeline architecture enables modular, extensible transformations where each processing step is isolated and can be combined in flexible sequences to achieve different molecular transformations.
+
+## Processing Pipeline
+
+The transformation occurs through a **processor pipeline system** where each processor performs a specific operation on molecular structures [vermouth/processors/__init__.py](vermouth/processors/__init__.py#L1-L51):
+
+### Core Processing Steps
+
+| Processor Type | Function | Example Implementation |
+|---|---|---|
+| **File Input** | Read coordinate files (PDB, GRO, CIF) | `PDBInput`, `GROInput`, `CIFInput` |
+| **Structure Repair** | Fix missing atoms/bonds | `RepairGraph`, `MakeBonds` |
+| **Force Field Application** | Apply molecular parameters | `DoLinks`, `DoMapping` |
+| **Coarse-Graining** | Transform resolution | `DoMapping`, `DoAverageBead` |
+| **Output Generation** | Write topology files | `ApplyPosres`, `SortMoleculeAtoms` |
+
+Each processor inherits from the base `Processor` class and implements either `run_molecule()` for single-molecule operations or `run_system()` for system-wide transformations [vermouth/processors/processor.py](vermouth/processors/processor.py#L21-L41).
+
+## Data Management
+
+The system manages molecular data through a hierarchical structure:
+
+### System Organization
+- **System Class**: Container for multiple molecules with force field context [vermouth/system.py](vermouth/system.py#L16-L35)
+- **Molecule Class**: Individual molecular graphs with attributes and interactions
+- **Force Field Data**: Centralized collection of blocks, links, and modifications [vermouth/data/data.py](vermouth/data/data.py#L1-L44)
+
+```mermaid
+graph LR
+    A[System] --> B[Molecule 1]
+    A --> C[Molecule 2]
+    A --> D[Molecule N]
+    
+    E[Force Field] --> F[Blocks]
+    E --> G[Links] 
+    E --> H[Modifications]
+    E --> I[Mappings]
+    
+    B --> E
+    C --> E
+    D --> E
+```
+
+## Key Features and Capabilities
+
+### Advanced Molecular Handling
+
+- **Topology-Agnostic Processing**: No assumptions about polymer structure, enabling handling of complex non-linear systems [doc/source/general_overview.rst](doc/source/general_overview.rst#L5-L10)
+- **Incomplete Structure Support**: Can process structures with missing atoms or incomplete atom names
+- **Post-Translational Modifications**: Native support for PTMs and other molecular modifications
+- **Multi-Force Field Support**: While optimized for Martini 2/3, architecture supports broader force field compatibility
+
+### Resolution Transformation
+
+The system excels at converting between different molecular resolutions:
+
+| Transformation | Input | Output | Use Case |
+|---|---|---|---|
+| **Atomistic → Coarse-Grained** | All-atom PDB | Martini CG structure | Enhanced simulation timescales |
+| **Force Field Conversion** | One FF format | Another FF format | Cross-platform compatibility |
+| **Topology Generation** | Coordinates + FF | Complete topology | MD simulation setup |
+
+> [!TIP]
+> Martinize2 identifies atoms primarily through connectivity analysis, reading CONECT records and using distance-based criteria similar to VMD for inter-residue bonding, ensuring robust structure recognition.
+
+## Integration and Ecosystem
+
+### Installation and Access
+- Distributed via PyPI: `pip install vermouth` [README.md](README.md#L35-L40)
+- Python 3.9+ requirement
+- Optional MDtraj dependency for alternative DSSP functionality
+- Development versions available via GitHub
+
+### Documentation and Support
+- Comprehensive API documentation at https://vermouth-martinize.readthedocs.io/
+- Active development with regular updates
+- Community support through GitHub issues
+- Academic citation available for research use
+
+## Next Steps
+
+To get started with Martinize2 and Vermouth:
+
+1. **Quick Start**: Begin with basic usage examples and command-line interface
+2. **Installation**: Set up the environment with proper dependencies  
+3. **Basic Usage**: Learn fundamental operations and common workflows
+4. **Architecture Deep Dive**: Explore the underlying system design and processor pipeline
+
+Continue to [Quick Start](2-quick-start) for hands-on examples, or proceed to [Installation and Setup](3-installation-and-setup) for detailed configuration instructions.
+
+# Quick Start
+
+
+
+Martinize2 and Vermouth provide a unified framework for transforming molecular structures between different resolutions, with primary focus on generating coarse-grained topologies from atomistic structures for the Martini force field. This quick start guide will help you get up and running with basic molecular transformations.
+
+## System Architecture Overview
+
+The system consists of two main components: **Vermouth** (the Python library) and **Martinize2** (the command-line interface). Vermouth handles the core transformation logic using graph-based molecular representations, while Martinize2 provides an accessible CLI for common workflows.
+
+```mermaid
+graph TD
+    A[Input Structure<br/>PDB/GRO Files] --> B[Martinize2 CLI]
+    B --> C[Vermouth Library]
+    C --> D[Processing Pipeline]
+    D --> E[Output Files<br/>Topology + Coordinates]
+    
+    subgraph "Vermouth Core"
+        F[Graph-Based<br/>Molecular Representation]
+        G[Processor Pipeline]
+        H[Force Field Integration]
+    end
+    
+    C --> F
+    C --> G
+    C --> H
+```
+
+## Installation and Basic Setup
+
+### Prerequisites
+- Python 3.9 or higher
+- pip package manager
+
+### Installation Commands
+
+```bash
+# Install the latest stable release
+pip install vermouth
+
+# Update existing installation
+pip install -U vermouth
+
+# Install development version (advanced users)
+pip install git+https://github.com/marrink-lab/vermouth-martinize.git#vermouth
+```
+
+> [!TIP]
+> The installation adds the `martinize2` command to your system PATH. Verify installation by running `martinize2 -h` to see available options.
+
+### Optional Dependencies
+
+For enhanced secondary structure assignment, you can install **MDTraj** as an alternative to DSSP:
+
+```bash
+pip install mdtraj
+```
+
+## Your First Molecular Transformation
+
+### Basic Command Structure
+
+The fundamental martinize2 workflow transforms atomistic structures to coarse-grained representations:
+
+```bash
+martinize2 -f input.pdb -x output.pdb -o topology.top -ff forcefield
+```
+
+### Practical Example: Protein Coarse-Graining
+
+Let's transform a lysozyme protein structure from atomistic to Martini 3 coarse-grained representation:
+
+```bash
+martinize2 -f lysozyme.pdb \
+           -x cg_lysozyme.pdb \
+           -o topology.top \
+           -ff martini3001 \
+           -dssp \
+           -elastic
+```
+
+**Command Breakdown:**
+
+| Parameter | Description | Purpose |
+|-----------|-------------|---------|
+| `-f lysozyme.pdb` | Input structure file | Atomistic protein structure |
+| `-x cg_lysozyme.pdb` | Output coordinate file | Coarse-grained coordinates |
+| `-o topology.top` | Output topology file | GROMACS topology |
+| `-ff martini3001` | Force field selection | Martini 3 force field |
+| `-dssp` | Secondary structure assignment | Improves accuracy |
+| `-elastic` | Elastic network generation | Maintains structure |
+
+### Processing Pipeline Overview
+
+Martinize2 executes a six-stage transformation pipeline [source](doc/source/martinize2_workflow.rst#L1-L20):
+
+```mermaid
+flowchart LR
+    A[1. Read Input Files] --> B[2. Repair Molecule]
+    B --> C[3. Apply Mapping]
+    C --> D[4. Generate Links]
+    D --> E[5. Post-Processing]
+    E --> F[6. Write Output]
+    
+    style A fill:#e1f5fe
+    style F fill:#c8e6c9
+```
+
+## Supported File Formats and Features
+
+### Input Formats
+- **PDB files** (preferred) - Contains complete structural information including chain identifiers and connectivity records
+- **GRO files** - Basic coordinate format
+
+### Output Formats
+- **GROMACS topology files** (`.top`) - Complete force field topology
+- **Coordinate files** - Both atomistic and coarse-grained structures
+
+### Key Capabilities
+
+| Feature | Description | Use Case |
+|---------|-------------|----------|
+| **Multi-scale Support** | Handles both atomistic and coarse-grained representations | Resolution transformation studies |
+| **Polymer Flexibility** | No assumptions about polymer linearity | Complex biomolecules, branched polymers |
+| **PTM Support** | Post-translational modifications | Realistic protein modeling |
+| **Structure Repair** | Handles missing atoms and non-standard names | Experimental structure processing |
+
+## Common Workflows and Options
+
+### Mutation and Modification
+
+Apply point mutations or modifications during processing:
+
+```bash
+# Mutate specific residue
+martinize2 -f protein.pdb -mutate PHE42:ALA -x mutated.pdb -o top.top
+
+# Apply terminal modifications
+martinize2 -f protein.pdb -nter NTER -cter CTER -x modified.pdb -o top.top
+```
+
+### Debugging and Troubleshooting
+
+When martinize2 encounters potential issues, it provides several debugging options:
+
+```bash
+# Verbose output for debugging
+martinize2 -f input.pdb -vv -x output.pdb -o top.top
+
+# Write intermediate graphs for inspection
+martinize2 -f input.pdb -write-graph -write-repair -x output.pdb -o top.top
+
+# Override warnings (use with caution)
+martinize2 -f input.pdb -maxwarn 5 -x output.pdb -o top.top
+```
+
+> [!TIP]
+> Always review warning messages carefully. Martinize2 refuses to write output files when it detects potentially invalid topologies to prevent simulation errors.
+
+## Next Steps
+
+Now that you have a basic understanding of Martinize2, consider exploring:
+
+- **[Installation and Setup](3-installation-and-setup)** - Detailed installation instructions and environment configuration
+- **[Basic Martinize2 Usage](4-basic-martinize2-usage)** - Comprehensive command-line options and advanced workflows  
+- **[Vermouth Library Architecture](5-vermouth-library-architecture)** - Understanding the underlying Python library for programmatic use
+
+For complete documentation and API reference, visit the official documentation at https://vermouth-martinize.readthedocs.io/
+
+# Installation and Setup
+
+
+
+This guide provides comprehensive instructions for installing and setting up Martinize2 and Vermouth, the ultimate resolution transformation tools for molecular dynamics simulations. These tools enable the conversion of atomistic structures to coarse-grained representations, primarily designed for the Martini force field and GROMACS simulation engine.
+
+## System Requirements
+
+Before proceeding with installation, ensure your system meets the following prerequisites:
+
+**Python Version:** Python 3.9 or greater is required [setup.cfg#L33-L37](setup.cfg#L33-L37). The package has been tested and supports Python versions 3.9, 3.10, 3.11, and 3.12.
+
+**Operating System:** The package is OS-independent and works on Windows, macOS, and Linux systems [setup.cfg#L30](setup.cfg#L30).
+
+**Core Dependencies:** The installation automatically handles these essential packages:
+- **numpy** for numerical computations
+- **networkx ≥ 2.0** for graph operations 
+- **scipy** for scientific computing
+- **pbr** for Python build reasonableness
+
+> [!TIP]
+> NetworkX version 2.0 or higher is strictly required for graph-based molecular transformations. Ensure your package manager installs the correct version.
+
+## Installation Methods
+
+### Standard Installation (Recommended)
+
+The most straightforward method is installing from PyPI using pip:
+
+```bash
+pip install vermouth
+```
+
+This command installs the latest stable release and automatically adds the `martinize2` executable to your system PATH [README.md#L44-L46](README.md#L44-L46).
+
+### Development Installation
+
+For researchers wanting to experiment with cutting-edge features or contribute to development:
+
+```bash
+pip install git+https://github.com/marrink-lab/vermouth-martinize.git#vermouth
+```
+
+> [!TIP]
+> Development versions may contain bugs that produce incorrect topologies. Always carefully validate your results when using development versions.
+
+### Updating Existing Installation
+
+To update an existing installation to the latest version:
+
+```bash
+pip install -U vermouth
+```
+
+## Optional Dependencies
+
+### MDTraj Integration
+
+For enhanced trajectory analysis capabilities as an alternative to DSSP:
+
+```bash
+pip install vermouth[mdtraj]
+```
+
+Or install MDTraj separately:
+
+```bash
+pip install mdtraj
+```
+
+### CIF File Support
+
+For handling Crystallographic Information Framework files:
+
+```bash
+pip install vermouth[PyCifRW]
+```
+
+Or install PyCifRW separately:
+
+```bash
+pip install PyCifRW
+```
+
+## Verification Installation
+
+After installation, verify that Martinize2 is properly installed by running:
+
+```bash
+martinize2 -h
+```
+
+This command displays the available options and confirms the program is accessible [README.md#L58-L60](README.md#L58-L60).
+
+## Project Architecture Overview
+
+Understanding the project structure helps with troubleshooting and development:
+
+```mermaid
+graph TB
+    A[Martinize2 CLI] --> B[Vermouth Library]
+    B --> C[Processors]
+    B --> D[Data Management]
+    B --> E[Graph Operations]
+    
+    C --> C1[File I/O]
+    C --> C2[Mapping]
+    C --> C3[Structure Analysis]
+    
+    D --> D1[Force Fields]
+    D --> D2[Mappings]
+    D --> D3[Citations]
+    
+    E --> E1[Molecule Class]
+    E --> E2[System Class]
+    E --> E3[NetworkX Integration]
+```
+
+### Key Directory Structure
+
+| Directory | Purpose | Key Components |
+|-----------|---------|----------------|
+| `vermouth/` | Core library | Processors, data structures, graph operations |
+| `vermouth/processors/` | Transformation pipeline | File I/O, mapping, analysis processors |
+| `vermouth/data/` | Force field data | Martini force fields, mappings, citations |
+| `vermouth/gmx/` | GROMACS integration | Topology, coordinate file handling |
+| `vermouth/pdb/` | Structure file support | PDB and CIF file parsing |
+
+![Project Structure](https://github.com/marrink-lab/vermouth-martinize/blob/main/vermouth/data/force_fields/martini22/martini_v2.2.itp?raw=true)
+
+## Development Environment Setup
+
+For developers wishing to contribute or extend the functionality:
+
+### Install Test Dependencies
+
+```bash
+pip install -r requirements-tests.txt
+```
+
+This includes testing frameworks like pytest, coverage tools, and additional dependencies for comprehensive testing [requirements-tests.txt#L1-L12](requirements-tests.txt#L1-L12).
+
+### Install Documentation Dependencies
+
+```bash
+pip install -r requirements-docs.txt
+```
+
+Required for building local documentation with Sphinx [requirements-docs.txt#L1-L8](requirements-docs.txt#L1-L8).
+
+### Running Tests
+
+Execute the test suite to verify your development environment:
+
+```bash
+pytest vermouth/tests/
+```
+
+The project uses pytest for testing with coverage reporting and hypothesis-based property testing [pyproject.toml#L4-L7](pyproject.toml#L4-L7).
+
+## Common Installation Issues
+
+### Python Version Conflicts
+
+Ensure you're using Python 3.9+. Check your version:
+
+```bash
+python --version
+```
+
+### Permission Errors
+
+If you encounter permission issues, consider using a virtual environment:
+
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install vermouth
+```
+
+### NetworkX Version Conflicts
+
+The package requires NetworkX ≥ 2.0. If you encounter compatibility issues:
+
+```bash
+pip install 'networkx>=2.0'
+```
+
+## Next Steps
+
+After successful installation, you can proceed to:
+
+- **[Basic Martinize2 Usage](4-basic-martinize2-usage)** - Learn fundamental command-line operations
+- **[Quick Start](2-quick-start)** - Get started with simple examples
+- **[Overview](1-overview)** - Understand the project's scope and capabilities
+
+For detailed API documentation and advanced usage patterns, the complete documentation is available at https://vermouth-martinize.readthedocs.io/ [README.md#L108-L110](README.md#L108-L110).
+
+# Basic Martinize2 Usage
+
+
+
+Martinize2 is the command-line interface for the Vermouth library, designed to transform atomistic molecular structures into coarse-grained models, primarily for the Martini force field. This guide covers the essential usage patterns for beginners working with molecular dynamics simulations.
+
+## Core Workflow Overview
+
+Martinize2 operates through a systematic six-stage pipeline that transforms your input structure into a ready-to-use coarse-grained model:
+
+```mermaid
+flowchart TD
+    A[Input Structure<br>.pdb/.gro files] --> B[Read & Parse<br>PDB/GRO files]
+    B --> C[Repair Graph<br>Fix missing atoms]
+    C --> D[Resolution Transformation<br>Apply force field mapping]
+    D --> E[Apply Links<br>Generate inter-residue interactions]
+    E --> F[Post Processing<br>Elastic networks, etc.]
+    F --> G[Write Output<br>.itp/.pdb files]
+    
+    style A fill:#e1f5fe
+    style G fill:#c8e6c9
+```
+
+## Basic Command Structure
+
+The fundamental martinize2 command follows this pattern:
+
+```bash
+martinize2 -f input.pdb -o output.top -x output_cg.pdb [options]
+```
+
+### Essential Parameters
+
+| Parameter | Description | Required | Example |
+|-----------|-------------|----------|---------|
+| `-f` | Input structure file | Yes | `-f protein.pdb` |
+| `-o` | Output topology file | Yes | `-o topol.top` |
+| `-x` | Output coordinate file | Yes | `-x cg_protein.pdb` |
+| `-ff` | Target force field | Recommended | `-ff martini3001` |
+
+## Quick Start Examples
+
+### Minimal Protein Conversion
+
+The simplest usage converts a protein structure to the default Martini3 force field:
+
+```bash
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb
+```
+
+This command attempts automatic conversion but may lack proper secondary structure treatment.
+
+### Complete Protein Processing
+
+For physically realistic simulations, include secondary structure assignment:
+
+```bash
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -ff martini3001 -dssp
+```
+
+> [!TIP]
+> Secondary structure assignment is crucial for accurate Martini protein simulations. Martinize2 offers two methods: external DSSP executable or the built-in mdtraj implementation.
+
+## Secondary Structure Handling
+
+### Automatic DSSP Assignment
+
+**Option 1: External DSSP**
+```bash
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -ff martini3001 -dssp /path/to/dssp
+```
+
+**Option 2: mdtraj Integration**
+```bash
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -ff martini3001 -dssp
+```
+
+### Manual Secondary Structure Specification
+
+When you know the secondary structure, use the `-ss` flag:
+
+```bash
+# All residues as helix
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -ss H
+
+# Mixed structure (10 residues: 5 helix, 5 coil)
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -ss HHHHHCCCCC
+```
+
+## Advanced Basic Features
+
+### Side Chain Fixing
+
+Side chain fixing ensures proper sampling of side chain dynamics and is **automatic in martinize2 ≥ 0.12.0**:
+
+```bash
+# Modern versions (automatic)
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -ff martini3001
+
+# Legacy versions (manual)
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -ff martini3001 -scfix
+
+# Disable automatic fixing
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -ff martini3001 -noscfix
+```
+
+### Cysteine Bridge Detection
+
+Martinize2 automatically identifies disulfide bridges:
+
+```bash
+# Automatic detection (default)
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -ff martini3001 -cys auto
+
+# Custom distance cutoff
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -ff martini3001 -cys 5.0
+```
+
+### Molecule Naming
+
+Prevent naming conflicts in multi-protein systems:
+
+```bash
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -ff martini3001 -name MYPROTEIN
+```
+
+This generates molecules named `MYPROTEIN_0`, `MYPROTEIN_1`, etc., instead of the default `molecule_0`, `molecule_1`.
+
+## Available Force Fields
+
+List all supported force fields:
+
+```bash
+martinize2 -list-ff
+```
+
+Common options include:
+- `martini3001` - Martini 3 protein force field
+- `martini22` - Legacy Martini 2 force field
+- Custom force fields (specify path with `-ff`)
+
+## Troubleshooting and Debugging
+
+### Common Issues
+
+1. **Missing Atoms Warning**: Check your input structure for incomplete residues
+2. **Unknown Residues**: Verify residue names match force field expectations
+3. **Secondary Structure Assignment**: Ensure DSSP is properly installed or use manual specification
+
+### Debug Options
+
+Enhance output verbosity for troubleshooting:
+
+```bash
+# Verbose output
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -v
+
+# Very verbose output
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -vv
+
+# Write intermediate graphs for inspection
+martinize2 -f protein.pdb -o topol.top -x cg_protein.pdb -write-graph -write-repair
+```
+
+## Output Files
+
+Martinize2 generates several output files:
+
+| File Type | Description | Extension |
+|-----------|-------------|-----------|
+| Topology | Molecular topology and parameters | `.top`, `.itp` |
+| Coordinates | Coarse-grained structure | `.pdb` |
+| Log | Processing information and citations | Console output |
+
+### Citation Information
+
+Martinize2 automatically generates appropriate citations based on features used. These appear in both the console output and topology file headers. **All cited papers should be referenced in your publications** to ensure proper credit to the developers and methods.
+
+## Next Steps
+
+After mastering basic usage, explore these advanced features:
+
+- **[Elastic Networks](elastic-networks)**: Add structure-preserving restraints
+- **[Gō Models](go-models)**: Implement structure-based potentials  
+- **[Mutations and Modifications](mutations-and-modifications)**: Modify protein sequences
+- **[Water Biasing](water-biasing)**: Optimize solvent interactions
+
+For deeper understanding of the underlying architecture, continue with **[Vermouth Library Architecture](5-vermouth-library-architecture)** to learn about the graph-based molecular representation system that powers Martinize2.
+
+# Vermouth Library Architecture
+
+
+
+The Vermouth library serves as the computational engine behind martinize2, providing a **Very Modular Universal Transformation Helper** for creating molecular dynamics topologies from coordinate files. This architecture overview examines the core components that enable systematic molecular transformations through a graph-based approach.
+
+## Core Architectural Principles
+
+Vermouth operates on three fundamental pillars: **graph-based molecular representation**, **processor pipeline system**, and **force field abstraction**. The library treats molecules as mathematical graphs where atoms become nodes and bonds become edges, enabling sophisticated topological operations while preserving chemical validity.
+
+The architecture follows a **layered design pattern** with clear separation of concerns:
+
+```mermaid
+graph TB
+    A[System Layer] --> B[Molecule Layer]
+    B --> C[Force Field Layer]
+    B --> D[Processor Layer]
+    D --> E[Utility Layer]
+    
+    A[System] --> F[Multi-molecule management]
+    B[Molecule] --> G[Graph operations]
+    C[ForceField] --> H[Parameter management]
+    D[Processor] --> I[Transformation pipeline]
+```
+
+## Core Components
+
+### System Class: The Container Layer
+
+The `System` class serves as the top-level container managing collections of molecules within a unified force field context. Located in [`vermouth/system.py`](vermouth/system.py#L21-L30), it provides:
+
+- **Molecule aggregation**: Maintains a list of `Molecule` objects representing the complete molecular system
+- **Force field coordination**: Ensures all molecules share consistent force field parameters
+- **Particle accounting**: Tracks total particle counts across all molecules
+- **Deep copying capabilities**: Enables system duplication for parallel processing
+
+The System class acts as the primary interface for high-level operations, delegating molecular-specific transformations to its constituent molecules.
+
+### Molecule Class: The Graph Foundation
+
+At the heart of Vermouth lies the `Molecule` class, extending NetworkX's `Graph` to represent molecular structures. Defined in [`vermouth/molecule.py`](vermouth/molecule.py#L331-L340), this class implements:
+
+- **Node-based atom representation**: Each atom becomes a graph node with associated attributes
+- **Edge-based connectivity**: Bonds and constraints are represented as graph edges
+- **Interaction management**: Beyond graph topology, molecules maintain separate interaction dictionaries for angles, dihedrals, and other force field terms
+- **Ordered node preservation**: Uses `OrderedDict` as `node_dict_factory` to maintain atom order critical for topology generation
+
+> [!TIP]
+> The dual representation—graph topology for connectivity plus separate interaction dictionaries—allows Vermouth to handle both structural transformations and force field parameterization independently, a key architectural advantage for coarse-graining operations.
+
+### ForceField Class: Parameter Abstraction
+
+The `ForceField` class in [`vermouth/forcefield.py`](vermouth/forcefield.py#L36-L45) provides a comprehensive abstraction for molecular mechanics force fields:
+
+- **Modular file loading**: Supports multiple file formats (.rtp, .ff, .bib) through a parser registry
+- **Reference graph management**: Maintains collections of blocks, links, and modifications as molecular templates
+- **Feature declaration system**: Links can declare capabilities enabling conditional processing
+- **Native force field caching**: Optimizes loading of built-in force fields
+
+This design enables seamless integration of custom force fields while maintaining compatibility with standard formats like Martini.
+
+### Processor System: Transformation Pipeline
+
+The processor architecture implements a **chain of responsibility pattern** for molecular transformations. The base `Processor` class in [`vermouth/processors/processor.py`](vermouth/processors/processor.py#L21-L30) defines:
+
+- **System-level processing**: `run_system` method iterates over all molecules
+- **Molecule-level transformation**: Abstract `run_molecule` method implemented by subclasses
+- **In-place modification**: Processors directly modify molecular structures for efficiency
+
+The processor directory contains 25+ specialized processors covering file I/O, mapping operations, structure analysis, and force field integration, forming a comprehensive transformation toolkit.
+
+## Data Flow Architecture
+
+Vermouth follows a **unidirectional data flow** pattern:
+
+1. **Input parsing**: File readers convert coordinate files to molecular graphs
+2. **Force field application**: Templates and parameters are applied to molecules
+3. **Processing pipeline**: Sequential processors transform molecular structure
+4. **Output generation**: Formatted topology files are written for simulation packages
+
+```mermaid
+flowchart LR
+    A[Coordinate Files] --> B[File Readers]
+    B --> C[Molecular Graphs]
+    C --> D[Force Field Integration]
+    D --> E[Processor Pipeline]
+    E --> F[Topology Generation]
+    F --> G[Simulation Files]
+```
+
+## Integration Points
+
+The architecture provides several key integration points:
+
+- **File format support**: PDB, GRO, CIF readers in dedicated modules
+- **GROMACS integration**: Specialized topology generation in `vermouth/gmx/`
+- **Structure analysis**: DSSP secondary structure assignment and RCSU contact mapping
+- **Custom processors**: Extensible framework for domain-specific transformations
+
+## Design Benefits
+
+This architecture delivers several advantages for molecular simulation workflows:
+
+- **Modularity**: Each component can be developed and tested independently
+- **Extensibility**: New force fields and processors integrate seamlessly
+- **Performance**: In-place graph operations minimize memory overhead
+- **Flexibility**: Graph representation supports both atomistic and coarse-grained models
+- **Maintainability**: Clear separation of concerns simplifies code evolution
+
+> [!TIP]
+> The graph-based approach enables sophisticated topological operations that would be extremely complex with traditional array-based molecular representations, particularly for coarse-graining where atom-to-bead mappings require non-local transformations.
+
+## Next Steps
+
+To understand how these components work together in practice, explore the [Processor Pipeline System](6-processor-pipeline-system) documentation, which details how individual processors are orchestrated to complete molecular transformations. For deeper insight into molecular representation, see [Graph-Based Molecular Representation](7-graph-based-molecular-representation).
+
+# Processor Pipeline System
+
+
+
+The Processor Pipeline System forms the computational backbone of vermouth-martinize, implementing a modular, graph-based approach to molecular transformation. This system enables sophisticated molecular processing workflows through a chain of specialized processors that operate on molecular graphs, transforming input structures into coarse-grained representations suitable for molecular dynamics simulations.
+
+## Architecture Overview
+
+The processor system is built around a simple yet powerful abstraction: each processor implements the `Processor` base class [processor.py](vermouth/processors/processor.py#L21), which provides two core methods for operating at different scales:
+
+- **`run_system(system)`**: Processes an entire system containing multiple molecules [processor.py](vermouth/processors/processor.py#L26)
+- **`run_molecule(molecule)`**: Processes individual molecules and must be implemented by subclasses [processor.py](vermouth/processors/processor.py#L40)
+
+The system-level operation iterates through all molecules in the system, applying the molecular transformation to each one and updating the system's molecule collection in-place [processor.py](vermouth/processors/processor.py#L27-L35).
+
+```mermaid
+flowchart TD
+    A[System Input] --> B[Processor 1]
+    B --> C[Processor 2]
+    C --> D[Processor N]
+    D --> E[System Output]
+    
+    B --> F[run_system]
+    F --> G[Iterate Molecules]
+    G --> H[run_molecule]
+    H --> I[Transform Molecule]
+    I --> G
+    G --> J[Update System]
+```
+
+## Core Processor Categories
+
+The vermouth library provides over 25 specialized processors organized into functional categories:
+
+### File I/O Processors
+These processors handle the ingestion of molecular structure data from various formats:
+
+- **`PDBInput`**: Reads PDB files with configurable exclusion criteria and hydrogen handling [pdb_reader.py](vermouth/processors/pdb_reader.py#L29)
+- **`GROInput`**: Processes GROMACS GRO format files
+- **`CIFInput`**: Handles crystallographic information files
+
+### Structure Transformation Processors
+These processors modify molecular topology and connectivity:
+
+- **`MakeBonds`**: Adds edges based on geometric criteria and reference blocks [make_bonds.py](vermouth/processors/make_bonds.py#L309)
+- **`RepairGraph`**: Rebuilds missing atoms and canonicalizes atom names using reference structures [repair_graph.py](vermouth/processors/repair_graph.py#L478)
+- **`DoMapping`**: Performs resolution transformation between force fields using mapping definitions [do_mapping.py](vermouth/processors/do_mapping.py#L823)
+
+### Annotation and Analysis Processors
+These processors add metadata and structural annotations:
+
+- **`AnnotateMutMod`**: Identifies mutations and modifications
+- **`AnnotateIDRs`**: Detects intrinsically disordered regions
+- **`NameMolType`**: Assigns molecular type classifications
+
+### Force Field Integration Processors
+These processors bridge molecular structures with force field parameters:
+
+- **`DoLinks`**: Establishes inter-residue connections
+- **`ApplyPosres`**: Applies position restraints
+- **`AttachMass`**: Attaches mass information to atoms
+
+## Pipeline Execution Model
+
+The processor pipeline follows a sequential execution model where each processor receives the output of the previous one. This design enables:
+
+**Incremental Transformation**: Complex molecular transformations are broken down into manageable steps, each handling a specific aspect of the conversion process.
+
+**Modular Composition**: Users can mix and match processors to create custom workflows tailored to specific molecular systems and analysis requirements.
+
+**Error Isolation**: Failures in individual processors can be isolated without affecting the entire pipeline, facilitating debugging and troubleshooting.
+
+> [!TIP]
+> The processor system's strength lies in its graph-based approach, where molecules are represented as NetworkX graphs. This enables powerful graph algorithms for molecular analysis and transformation while maintaining compatibility with standard molecular representations.
+
+## Processor Implementation Patterns
+
+### Configuration-Based Processors
+Most processors follow a configuration pattern where behavior is controlled through constructor parameters:
+
+```python
+# Example: MakeBonds processor configuration
+processor = MakeBonds(
+    allow_name=True,    # Use reference block edges
+    allow_dist=True,    # Use distance-based edge detection
+    fudge=1.2          # Van der Waals radius scaling factor
+)
+```
+
+### System vs. Molecule Operations
+Processors can operate at two levels:
+
+- **System-level processors** (like `PDBInput`) modify the entire system structure [pdb_reader.py](vermouth/processors/pdb_reader.py#L58)
+- **Molecule-level processors** (like `DoMapping`) transform individual molecules and rely on the base class system iteration [do_mapping.py](vermouth/processors/do_mapping.py#L869)
+
+## Integration with Molecular Graphs
+
+The processor system is tightly integrated with vermouth's graph-based molecular representation. Each processor operates on `Molecule` objects, which are NetworkX graphs enhanced with molecular metadata. This integration enables:
+
+- **Graph algorithms** for connectivity analysis and structure repair
+- **Node/edge attributes** for storing atomic and bond information
+- **Subgraph operations** for residue-level transformations
+- **Graph matching** for mapping between different resolutions
+
+The pipeline maintains molecular topology throughout the transformation process, ensuring that structural relationships are preserved or appropriately modified during coarse-graining operations.
+
+> [!TIP]
+> Processors maintain a clear separation between data transformation and business logic. The base `Processor` class handles the iteration mechanics, while subclasses focus on implementing specific molecular transformations.
+
+## Next Steps
+
+To understand how individual molecules are represented and manipulated within this pipeline system, explore the [Graph-Based Molecular Representation](7-graph-based-molecular-representation) documentation. For practical examples of processor usage in molecular workflows, see the [File I/O Processors](11-file-i-o-processors-pdb-gro-cif) and [Mapping and Coarse-Graining](12-mapping-and-coarse-graining) sections.
+
+# Graph-Based Molecular Representation
+
+
+
+The vermouth-martinize framework employs a sophisticated graph-based molecular representation system that forms the foundation for molecular coarse-graining and force field application. This architecture leverages NetworkX graphs to represent molecular topology, enabling powerful graph algorithms for structure analysis, manipulation, and transformation.
+
+## Core Graph Architecture
+
+### Molecule Class Foundation
+
+The `Molecule` class extends `nx.Graph` to represent molecular structures as mathematical graphs where atoms are nodes and bonds are edges [molecule.py#L331](vermouth/molecule.py#L331-L400). This inheritance provides immediate access to NetworkX's extensive graph algorithms while adding molecular-specific functionality:
+
+```python
+class Molecule(nx.Graph):
+    """
+    Represents a molecule as per a specific force field. Consists of atoms
+    (nodes), bonds (edges) and interactions such as angle potentials.
+    """
+    # As the particles are stored as nodes, we want the nodes to stay
+    # ordered.
+    node_dict_factory = OrderedDict
+```
+
+The molecule maintains several key attributes that extend beyond basic graph structure:
+
+- **interactions**: Dictionary storing force field interactions (bonds, angles, dihedrals, etc.)
+- **meta**: Metadata container for molecule-level information
+- **nrexcl**: Exclusion distance for non-bonded interactions
+- **citations**: Bibliographic references for the molecular description
+
+### Interaction Management System
+
+The framework implements a sophisticated interaction system that stores force field parameters separately from the graph topology [molecule.py#L522](vermouth/molecule.py#L522-L580):
+
+```python
+def add_interaction(self, type_, atoms, parameters, meta=None):
+    """
+    Add an interaction of the specified type with the specified parameters
+    involving the specified atoms.
+    """
+    for atom in atoms:
+        if atom not in self:
+            raise KeyError('Unknown atom {}'.format(atom))
+    self.interactions[type_].append(
+        Interaction(atoms=tuple(atoms), parameters=parameters, meta=meta)
+    )
+```
+
+This design separates topological connectivity (graph edges) from force field interactions, allowing flexible representation of different force field conventions while maintaining a clean graph structure.
+
+## Hierarchical Graph Organization
+
+### Residue-Level Abstraction
+
+The system provides powerful tools for working with molecular hierarchies through residue graph construction [graph_utils.py#L230](vermouth/graph_utils.py#L230-L280):
+
+```python
+def make_residue_graph(graph, attrs=('chain', 'resid', 'resname', 'insertion_code')):
+    """
+    Create a new graph based on `graph`, where nodes with identical attribute
+    values for the attribute names in `attrs` will be contracted into a single,
+    coarser node. With the default arguments it will create a graph with one
+    node per residue.
+    """
+```
+
+This function enables multi-scale analysis by collapsing atomic-level graphs into residue-level representations, essential for coarse-graining workflows where individual atoms become beads.
+
+### Block Template System
+
+The `Block` class extends `Molecule` to represent residue topology templates [molecule.py#L1051](vermouth/molecule.py#L1051-L1100):
+
+```python
+class Block(Molecule):
+    """
+    Residue topology template
+
+    Two blocks are equal if the underlying molecules are equal, and if the
+    block names are equal.
+    """
+```
+
+Blocks serve as templates that can be instantiated and modified to create specific molecular instances, providing a foundation for systematic molecular construction.
+
+## Advanced Graph Algorithms
+
+### Maximum Common Subgraph Detection
+
+The framework implements categorical graph algorithms for molecular comparison and mapping [graph_utils.py#L92](vermouth/graph_utils.py#L92-L100):
+
+```python
+def categorical_maximum_common_subgraph(graph1, graph2, attributes=tuple()):
+    """
+    Find maximum common subgraphs between two graphs based on categorical
+    attribute matching.
+    """
+    product = categorical_modular_product(graph1, graph2, attributes)
+    cliques = nx.find_cliques(product)
+    largest = maxes(cliques, key=len)
+    matches = [dict(clique) for clique in largest]
+    return matches
+```
+
+This algorithm is crucial for molecular mapping operations, enabling the identification of structural similarities between different molecular representations.
+
+### Semantic Graph Matching
+
+The `MappingGraphMatcher` class extends NetworkX's VF2 algorithm with semantic feasibility checking [graph_utils.py#L306](vermouth/graph_utils.py#L306-L318):
+
+```python
+class MappingGraphMatcher(nx.isomorphism.isomorphvf2.GraphMatcher):
+    def semantic_feasibility(self, G1_node, G2_node):
+        """
+        Returns True if mapping G1_node to G2_node is semantically feasible.
+        Adapted from networkx.algorithms.isomorphism.vf2userfunc._semantic_feasibility.
+        """
+```
+
+This enables intelligent graph matching that considers molecular semantics beyond pure topological structure.
+
+## Multi-Molecule System Management
+
+### System-Level Organization
+
+The `System` class provides container functionality for managing collections of molecules [system.py#L21](vermouth/system.py#L21-L30):
+
+```python
+class System:
+    """
+    A system of molecules.
+
+    Attributes
+    ----------
+    molecules: list[:class:`~vermouth.molecule.Molecule`]
+        The molecules in the system.
+    """
+```
+
+This enables processing of complex molecular systems containing multiple molecules, chains, or domains while maintaining individual molecule integrity.
+
+> [!TIP]
+> The graph-based representation enables powerful molecular transformations through NetworkX algorithms. Operations like subgraph extraction, graph composition, and isomorphism testing become trivial once molecules are represented as graphs, facilitating complex coarse-graining workflows.
+
+## Integration with Force Field System
+
+The graph representation seamlessly integrates with the force field system, where nodes carry atom types, charges, and other force field parameters as attributes. This tight coupling enables automatic parameter assignment and validation during molecular transformations.
+
+The separation of graph topology from interaction storage provides flexibility in supporting different force field formats while maintaining a consistent internal representation that can be efficiently manipulated and analyzed.
+
+## Next Steps
+
+To understand how these graph representations are transformed and processed, explore the [Processor Pipeline System](6-processor-pipeline-system) documentation. For detailed information about molecular operations and graph manipulations, see [Molecule Class and Graph Operations](8-molecule-class-and-graph-operations).
+
+# Molecule Class and Graph Operations
+
+
+
+The vermouth library implements a sophisticated graph-based molecular representation system that forms the core of martinize2's molecular processing capabilities. This architecture leverages NetworkX graphs to represent molecular structures while extending them with domain-specific functionality for force field operations and molecular transformations.
+
+## Core Molecule Class Architecture
+
+### Foundation: NetworkX Graph Extension
+
+The `Molecule` class extends `nx.Graph` to provide a robust foundation for molecular representation [molecule.py#L331](vermouth/molecule.py#L331-400). Each atom is stored as a node, bonds as edges, and higher-order interactions (angles, dihedrals, etc.) as specialized interaction data structures:
+
+```python
+class Molecule(nx.Graph):
+    """
+    Represents a molecule as per a specific force field. Consists of atoms
+    (nodes), bonds (edges) and interactions such as angle potentials.
+    """
+    node_dict_factory = OrderedDict  # Ensures ordered atom representation
+```
+
+> [!TIP]
+> The use of `OrderedDict` as `node_dict_factory` is critical for maintaining consistent atom ordering in output files, which is essential for reproducible molecular simulations.
+
+### Interaction Management System
+
+Molecules maintain a comprehensive interaction system using a dictionary structure where keys represent interaction types following GROMACS conventions ('bonds', 'angles', 'dihedrals', etc.) [molecule.py#L331](vermouth/molecule.py#L331-400):
+
+```python
+interactions: dict[str, list[Interaction]]
+```
+
+Each interaction is stored as a named tuple containing:
+- `atoms`: tuple of atom identifiers involved
+- `parameters`: force field parameters
+- `meta`: metadata including comments and citations
+
+### Dynamic Interaction API
+
+The molecule class provides a sophisticated dynamic API for interaction management through `__getattr__` method interception [molecule.py#L684](vermouth/molecule.py#L684-697):
+
+```python
+def __getattr__(self, name):
+    if name.startswith('get_') and name.endswith('s'):
+        type_ = name[len('get_'):-len('s')]
+        return partial(self.get_interaction, type_)
+    elif name.startswith('add_'):
+        type_ = name[len('add_'):]
+        return partial(self.add_interaction, type_)
+```
+
+This enables intuitive method calls like `mol.add_bonds()`, `mol.get_angles()`, and `mol.remove_dihedrals()`.
+
+## Graph Operations and Utilities
+
+### Node and Edge Management
+
+The molecule class overrides critical NetworkX methods to maintain interaction consistency:
+
+- **Node Removal**: `remove_node()` and `remove_nodes_from()` automatically clean up associated interactions [molecule.py#L990](vermouth/molecule.py#L990-1007)
+- **Subgraph Creation**: `subgraph()` returns new `Molecule` instances preserving interaction data [molecule.py#L485](vermouth/molecule.py#L485-494)
+- **Molecule Merging**: `merge_molecule()` combines molecules with proper index offsetting [molecule.py#L705](vermouth/molecule.py#L705-723)
+
+### Atomic Query System
+
+The `find_atoms()` method provides powerful atomic querying capabilities [molecule.py#L665](vermouth/molecule.py#L665-676):
+
+```python
+def find_atoms(self, **attrs):
+    """Yields all indices of atoms that match specified attributes"""
+    for node_idx in self:
+        node = self.nodes[node_idx]
+        if attributes_match(node, attrs):
+            yield node_idx
+```
+
+This enables complex queries like `mol.find_atoms(atomname='CA', resname='ALA')`.
+
+## Specialized Molecular Templates
+
+### Block Class: Residue Templates
+
+The `Block` class extends `Molecule` to represent residue topology templates [molecule.py#L1051](vermouth/molecule.py#L1051-1100):
+
+```python
+class Block(Molecule):
+    """
+    Residue topology template
+    
+    Attributes
+    ----------
+    name: str or None
+        The name of the residue
+    """
+```
+
+Blocks include specialized methods for:
+- Automatic angle and dihedral generation (`guess_angles()`, `guess_dihedrals()`)
+- Residue-specific interaction management
+- Template-to-molecule conversion with offset handling
+
+### Link Class: Inter-Residue Connections
+
+The `Link` class extends `Block` to define connections between residues [molecule.py#L1279](vermouth/molecule.py#L1279-1320):
+
+```python
+class Link(Block):
+    """
+    Template link between two residues.
+    
+    Includes:
+    - non_edges: forbidden connections
+    - removed_interactions: interactions to delete
+    - patterns: matching conditions
+    - features: required characteristics
+    """
+```
+
+Links enable sophisticated molecular transformations by specifying:
+- Which connections should NOT be created (`non_edges`)
+- Which interactions should be removed (`removed_interactions`)
+- Pattern matching conditions for application (`patterns`)
+- Required molecular features (`features`)
+
+### Modification Class: Structural Variants
+
+The `Modification` class extends `Link` to represent structural deviations from standard blocks [molecule.py#L1380](vermouth/molecule.py#L1380-1384):
+
+```python
+class Modification(Link):
+    """
+    A modification which describes deviations from a :class:`Block`.
+    """
+```
+
+## Advanced Graph Algorithms
+
+### Residue Graph Operations
+
+The `graph_utils` module provides sophisticated graph manipulation functions:
+
+#### Residue Graph Creation
+The `make_residue_graph()` function creates coarse-grained representations by contracting atoms into residue nodes [graph_utils.py#L230](vermouth/graph_utils.py#L230-280):
+
+```python
+def make_residue_graph(graph, attrs=('chain', 'resid', 'resname', 'insertion_code')):
+    """Create a new graph where nodes with identical attribute values are contracted"""
+```
+
+This function is optimized for performance, using custom partitioning instead of NetworkX's `quotient_graph` to avoid O(N²) scaling.
+
+#### Graph Matching and Isomorphism
+
+The `MappingGraphMatcher` class extends NetworkX's isomorphism algorithms for molecular applications [graph_utils.py#L306](vermouth/graph_utils.py#L306-318):
+
+```python
+class MappingGraphMatcher(nx.isomorphism.isomorphvf2.GraphMatcher):
+    def semantic_feasibility(self, G1_node, G2_node):
+        """Custom semantic feasibility for molecular mapping"""
+```
+
+## Pattern Matching and Predicates
+
+### Link Predicate System
+
+The link system uses a sophisticated predicate framework for pattern matching:
+
+#### Choice Predicate
+Tests if attributes match predefined values [molecule.py#L94](vermouth/molecule.py#L94-103):
+
+```python
+class Choice(LinkPredicate):
+    """Test if an attribute is defined and in a predefined list."""
+```
+
+#### Regex Predicate
+Enables regular expression matching for attribute values [molecule.py#L110](vermouth/molecule.py#L110-119):
+
+```python
+class Regex(LinkPredicate):
+    """Test if an attribute matches the provided regular expression."""
+```
+
+#### Negative Predicates
+The `NotDefinedOrNot` predicate provides negation capabilities [molecule.py#L127](vermouth/molecule.py#L127-149).
+
+## Parameter Calculation System
+
+### Geometric Parameter Effectors
+
+The system includes specialized classes for calculating interaction parameters from molecular geometry:
+
+#### Distance Calculation
+`ParamDistance` calculates inter-atomic distances [molecule.py#L267](vermouth/molecule.py#L267-276):
+
+```python
+class ParamDistance(LinkParameterEffector):
+    """Calculate the distance between a pair of nodes."""
+    n_keys_asked = 2
+```
+
+#### Angle Calculation
+`ParamAngle` computes angles between three atoms [molecule.py#L283](vermouth/molecule.py#L283-293):
+
+```python
+class ParamAngle(LinkParameterEffector):
+    """Calculate the angle in degrees between three consecutive nodes."""
+    n_keys_asked = 3
+```
+
+#### Dihedral Calculation
+`ParamDihedral` and `ParamDihedralPhase` handle torsion angle calculations [molecule.py#L300](vermouth/molecule.py#L300-326).
+
+> [!TIP]
+> All parameter effectors raise `ValueError` if atoms are missing or lack position data, ensuring robust error handling in molecular processing pipelines.
+
+## Integration with Force Field System
+
+The molecular graph system integrates seamlessly with the force field infrastructure through:
+
+- **Force Field References**: Each molecule maintains a `_force_field` attribute for parameter resolution
+- **Citation Management**: Automatic citation tracking for applied transformations
+- **Metadata Propagation**: Rich metadata system for provenance tracking
+
+## Performance Considerations
+
+The architecture prioritizes performance through:
+
+- **Ordered Node Storage**: Using `OrderedDict` for consistent atom ordering
+- **Efficient Graph Algorithms**: Custom implementations avoiding NetworkX's O(N²) operations
+- **Lazy Evaluation**: Dynamic method generation reducing memory footprint
+- **Optimized Matching**: Custom semantic feasibility functions for molecular isomorphism
+
+This graph-based molecular representation provides a flexible, extensible foundation for complex molecular transformations while maintaining the performance characteristics required for large-scale molecular simulations.
+
+## Next Steps
+
+To continue exploring the vermouth architecture, proceed to [Blocks, Links, and Modifications](9-blocks-links-and-modifications) for a deeper understanding of molecular templates and transformation patterns, or examine [Force Field System and Data Management](10-force-field-system-and-data-management) to understand how these graph structures integrate with force field parameters.
+
+# Blocks, Links, and Modifications
+
+
+
+The vermouth-martinize system employs a sophisticated hierarchical architecture for molecular topology definition, built upon three core abstractions: Blocks, Links, and Modifications. These components work together to enable flexible and extensible molecular modeling, particularly for complex biomolecular systems with post-translational modifications and inter-residue connections.
+
+## Core Architecture Overview
+
+```mermaid
+classDiagram
+    class Molecule {
+        +OrderedDict node_dict_factory
+        +add_interaction()
+        +get_interaction()
+        +find_atoms()
+        +merge_molecule()
+    }
+    
+    class Block {
+        +str name
+        +dict interactions
+        +add_atom()
+        +guess_angles()
+        +guess_dihedrals()
+        +to_molecule()
+    }
+    
+    class Link {
+        +list non_edges
+        +dict removed_interactions
+        +dict molecule_meta
+        +list patterns
+        +set features
+        +same_non_edges()
+    }
+    
+    class Modification {
+        +describes_deviations_from_block()
+    }
+    
+    Molecule <|-- Block
+    Block <|-- Link
+    Link <|-- Modification
+```
+
+## Blocks: Residue Topology Templates
+
+**Blocks** serve as the fundamental building blocks for molecular topology, representing residue templates with predefined atomic structure and interaction patterns [vermouth/molecule.py#L1051-L1120](vermouth/molecule.py#L1051-L1120).
+
+### Block Structure and Properties
+
+Each Block inherits from the `Molecule` class and extends it with residue-specific attributes:
+
+- **Name**: Identifies the residue type (e.g., "ALA", "GLY")
+- **Interactions**: Dictionary containing bonds, angles, dihedrals, and other force field parameters
+- **Ordered Node Storage**: Maintains consistent atom ordering through `OrderedDict` factory
+
+> [!TIP]
+> Blocks use an ordered node factory to ensure deterministic atom ordering, which is crucial for consistent topology generation and mapping operations.
+
+### Key Block Methods
+
+The `Block` class provides essential methods for topology manipulation:
+
+- **`add_atom()`**: Adds atoms with required 'atomname' attribute [vermouth/molecule.py#L1101-L1112](vermouth/molecule.py#L1101-L1112)
+- **`guess_angles()`**: Automatically generates angle interactions from bond topology [vermouth/molecule.py#L1142-L1158](vermouth/molecule.py#L1142-L1158)
+- **`guess_dihedrals()`**: Creates proper and improper dihedral angles [vermouth/molecule.py#L1159-L1180](vermouth/molecule.py#L1159-L1180)
+- **`to_molecule()`**: Converts block template to actual molecule with offset handling [vermouth/molecule.py#L1217-L1278](vermouth/molecule.py#L1217-L1278)
+
+## Links: Inter-Residue Connection Templates
+
+**Links** extend Blocks to define connections between residues, enabling complex molecular topology construction [vermouth/molecule.py#L1279-L1380](vermouth/molecule.py#L1279-L1380).
+
+### Link Matching System
+
+Links employ sophisticated pattern matching through several mechanisms:
+
+#### Link Predicates
+The system uses `LinkPredicate` classes for flexible attribute matching [vermouth/molecule.py#L35-L120](vermouth/molecule.py#L35-L120):
+
+- **`Choice`**: Tests if attribute is in predefined list
+- **`Regex`**: Matches attributes against regular expressions  
+- **`NotDefinedOrNot`**: Handles undefined or non-matching attributes
+
+#### Pattern Matching Algorithm
+The `match_link()` function implements comprehensive link matching [vermouth/processors/do_links.py#L237-L276](vermouth/processors/do_links.py#L237-L276):
+
+1. **Graph Isomorphism**: Uses NetworkX isomorphism for structural matching
+2. **Non-Edge Validation**: Ensures forbidden connections are avoided
+3. **Pattern Evaluation**: Applies custom pattern matching rules
+4. **Order Verification**: Validates residue sequence order consistency
+
+### Link Components
+
+| Component | Purpose | Key Attributes |
+|-----------|---------|----------------|
+| **non_edges** | Forbidden connections | List of anchor-attribute pairs |
+| **removed_interactions** | Interactions to delete | Dict of interaction types |
+| **molecule_meta** | Molecular metadata | Matching criteria |
+| **patterns** | Custom matching rules | Predicate-based patterns |
+| **features** | Required features | Set of feature flags |
+
+> [!TIP]
+> Links support both positive matching (what should connect) and negative matching (what should not connect), providing precise control over topology assembly.
+
+## Modifications: Deviation Templates
+
+**Modifications** inherit from Links and represent deviations from standard Block definitions, particularly useful for post-translational modifications (PTMs) and non-standard residues [vermouth/molecule.py#L1380-L1384](vermouth/molecule.py#L1380-L1384).
+
+### Modification Processing Pipeline
+
+The system processes modifications through the `CanonicalizeModifications` processor [vermouth/processors/canonicalize_modifications.py#L372-L383](vermouth/processors/canonicalize_modifications.py#L372-L383):
+
+#### PTM Identification
+The `identify_ptms()` function performs sophisticated PTM detection [vermouth/processors/canonicalize_modifications.py#L114-L160](vermouth/processors/canonicalize_modifications.py#L114-L160):
+
+1. **PTM Atom Detection**: Identifies atoms marked with `PTM_atom` attribute
+2. **Anchor Validation**: Ensures PTMs are properly anchored to non-PTM atoms
+3. **Coverage Analysis**: Determines which known PTMs cover observed modifications
+4. **Graph Covering**: Uses algorithmic approach to find optimal PTM combinations
+
+#### PTM Node Matching
+The `ptm_node_matcher()` function provides specialized comparison logic [vermouth/processors/canonicalize_modifications.py#L35-L52](vermouth/processors/canonicalize_modifications.py#L35-L52):
+
+- PTM atoms require element matching
+- Non-PTM atoms require atomname matching
+- Handles mixed PTM/non-PTM scenarios
+
+## Integration and Application
+
+### Link Application Process
+
+The `DoLinks` processor applies links to molecules through a systematic workflow [vermouth/processors/do_links.py#L290-L296](vermouth/processors/do_links.py#L290-L296):
+
+```mermaid
+flowchart TD
+    A[Start with Molecule] --> B[Get Links from Force Field]
+    B --> C[For Each Link]
+    C --> D[Find Subgraph Isomorphisms]
+    D --> E[Validate Non-Edges]
+    E --> F[Check Pattern Matching]
+    F --> G[Verify Order Constraints]
+    G --> H[Build Link Interactions]
+    H --> I[Apply to Molecule]
+    I --> J{More Links?}
+    J -->|Yes| C
+    J -->|No| K[Complete]
+```
+
+### Parameter Effectors
+
+Links can dynamically compute interaction parameters using `LinkParameterEffector` classes [vermouth/molecule.py#L152-L326](vermouth/molecule.py#L152-L326):
+
+| Effector | Calculation | Required Atoms |
+|----------|------------|----------------|
+| **ParamDistance** | Distance between atoms | 2 |
+| **ParamAngle** | Angle in degrees | 3 |
+| **ParamDihedral** | Dihedral angle in degrees | 4 |
+| **ParamDihedralPhase** | Phase-shifted dihedral | 4 |
+
+## Data Organization
+
+The system organizes modification and mapping data in structured directories [vermouth/data/](vermouth/data/):
+
+- **Force Fields**: Organization by force field type (Martini, CHARMM, AMBER, etc.)
+- **Mappings**: Atom-to-bead mapping files for different residues
+- **Modifications**: Specialized mapping files for PTMs and non-standard residues
+
+## Advanced Features
+
+### Multi-Modification Support
+The system handles multiple simultaneous modifications through tuple-based naming (e.g., `('C-ter',)`), enabling complex modification scenarios [vermouth/processors/do_links.py#L27-L33](vermouth/processors/do_links.py#L27-L33).
+
+### Flexible Attribute Matching
+Link predicates provide extensible matching criteria beyond simple equality, supporting regular expressions, choice lists, and conditional logic [vermouth/molecule.py#L35-L130](vermouth/molecule.py#L35-L130).
+
+### Topology Consistency
+The system maintains topology consistency through interaction management, edge creation from interactions, and proper handling of removed interactions [vermouth/molecule.py#L1011-L1047](vermouth/molecule.py#L1011-L1047).
+
+## Related Documentation
+
+For deeper understanding of related concepts:
+- [Molecule Class and Graph Operations](8-molecule-class-and-graph-operations) - Core molecular representation
+- [Force Field System and Data Management](10-force-field-system-and-data-management) - Force field integration
+- [Post-Translational Modifications](17-post-translational-modifications) - Advanced PTM handling
+- [Processor Pipeline System](6-processor-pipeline-system) - Processing architecture
+
+# Force Field System and Data Management
+
+
+
+The force field system in VerMoUTH provides a comprehensive framework for managing molecular force field data, including interaction parameters, residue mappings, and citation information. This system enables the modular loading and organization of force field components from various file formats while maintaining a unified interface for molecular topology generation.
+
+## Force Field Architecture
+
+The core of the force field system is built around the `ForceField` class, which serves as a container for all force field-related data. Each force field instance maintains several key components that work together to provide complete molecular description capabilities.
+
+```mermaid
+classDiagram
+    class ForceField {
+        +str name
+        +dict blocks
+        +list links
+        +dict modifications
+        +dict citations
+        +dict renamed_residues
+        +dict variables
+        +read_from(directory)
+        +has_feature(feature)
+        +reference_graphs
+    }
+    
+    class ForceFieldParser {
+        +dict FORCE_FIELD_PARSERS
+        +find_force_fields(directory)
+        +get_native_force_field(name)
+        +iter_force_field_files(directory)
+    }
+    
+    class DataManager {
+        +DATA_PATH
+        +COMMON_CITATIONS
+        +QUOTES
+    }
+    
+    ForceField --> ForceFieldParser : uses
+    ForceField --> DataManager : loads from
+    ForceFieldParser --> DataManager : accesses
+```
+
+The `ForceField` class [source](vermouth/forcefield.py#L36) encapsulates all force field data through its core attributes:
+
+- **blocks**: Dictionary containing molecular building blocks and their reference graphs
+- **links**: List of connection patterns that describe how blocks can be linked together
+- **modifications**: Dictionary of post-translational modifications and chemical modifications
+- **citations**: Bibliographic references for force field components
+- **renamed_residues**: Mapping of residue name variations
+- **variables**: Force field-specific variables and parameters
+
+## Data Loading and Management
+
+Force field data is managed through a sophisticated loading system that supports multiple file formats and provides both distributed library access and custom force field loading capabilities.
+
+### Data Path Resolution
+
+The system uses a centralized `DATA_PATH` [source](vermouth/__init__.py#L33) that points to the distributed data directory containing force fields, mappings, and citation files. This path is resolved using modern Python importlib resources when available, falling back to pathlib for older versions.
+
+### Force Field Discovery and Loading
+
+The `find_force_fields` function [source](vermouth/forcefield.py#L143) automatically discovers force fields in a given directory by searching for directories containing at least one RTP file. This enables dynamic loading of multiple force fields without explicit configuration.
+
+For accessing distributed force fields, the `get_native_force_field` function [source](vermouth/forcefield.py#L202) provides a cached interface to the built-in force field library. The system maintains a global cache (`_FORCE_FIELDS`) to ensure force field instances are singletons, which is critical for proper equality comparisons.
+
+### File Format Support
+
+The force field system supports multiple file formats through a parser registry:
+
+| Extension | Parser | Description |
+|-----------|--------|-------------|
+| `.rtp` | `read_rtp` | GROMACS Residue Topology Parameter files |
+| `.ff` | `read_ff` | VerMoUTH force field format |
+| `.bib` | `read_bib` | BibTeX citation files |
+
+The `FORCE_FIELD_PARSERS` dictionary [source](vermouth/forcefield.py#L27) maps file extensions to their respective parsing functions, enabling extensible support for new formats.
+
+## Force Field File Formats
+
+### RTP Format Handling
+
+The RTP (Residue Topology Parameter) format is the primary format for describing molecular building blocks. The `read_rtp` function [source](vermouth/gmx/rtp.py#L432) processes these files using a hierarchical iterator system:
+
+- `_IterRTPSections`: Iterates over major sections in the file
+- `_IterRTPSubsections`: Handles subsections within each section
+- `_IterRTPSubsectionLines`: Processes individual lines within subsections
+
+This hierarchical approach allows for proper parsing of complex RTP files containing multiple residue definitions, bonded parameters, and interaction specifications.
+
+### VerMoUTH FF Format
+
+The `.ff` format is a VerMoOUTH-specific format that extends the ITP format for rapid prototyping of force field components. The `FFDirector` class [source](vermouth/ffinput.py#L63) provides comprehensive parsing support for:
+
+- **Blocks**: Molecular building blocks with atoms, interactions, and metadata
+- **Links**: Connection patterns between blocks with pattern matching
+- **Modifications**: Chemical and post-translational modifications
+- **Variables**: Force field-wide parameter definitions
+- **Citations**: Bibliographic references for components
+
+The parser supports all GROMACS interaction types (bonds, angles, dihedrals, constraints, etc.) and extends them with VerMoOUTH-specific features like pattern matching and feature declarations.
+
+## Citation Management
+
+The force field system includes a sophisticated citation management system that tracks bibliographic references for all force field components.
+
+### Common Citations
+
+The `COMMON_CITATIONS` dictionary [source](vermouth/data/data.py#L31) is loaded from `citations.bib` and contains references that apply across multiple force fields. This centralized citation database ensures consistent referencing and avoids duplication.
+
+### Citation Parsing
+
+The `read_bib` function [source](vermouth/citation_parser.py#L173) processes BibTeX files using the `BibTexDirector` class [source](vermouth/citation_parser.py#L16]. This parser extracts citation entries and associates them with specific force field components, enabling proper academic attribution.
+
+## Force Field Features System
+
+The force field system includes a feature declaration mechanism that allows force fields to advertise their capabilities. The `features` property [source](vermouth/forcefield.py#L117) returns a set of all features declared by links in the force field, while the `has_feature` method [source](vermouth/forcefield.py#L127) provides a convenient way to check for specific capabilities.
+
+This feature system enables:
+- Conditional processing based on force field capabilities
+- Dynamic algorithm selection based on available features
+- Compatibility checking between force fields and processing pipelines
+
+## Distributed Force Field Library
+
+The system includes a comprehensive distributed force field library with support for multiple major force field families:
+
+| Force Field | Description | Files |
+|-------------|-------------|-------|
+| martini22, martini22p | Martini 2.x coarse-grained force fields | RTP, FF, mapping files |
+| martini3001, martini30b32 | Martini 3.x force fields | RTP, FF, mapping files |
+| charmm | CHARMM all-atom force field | RTP files |
+| amber | AMBER all-atom force field | RTP files |
+| gromos | GROMOS force field | RTP files |
+| elnedyn* | Elastic network force fields | RTP, FF files |
+
+Each force field directory contains the necessary files for complete molecular description, including residue topologies, interaction parameters, and mapping definitions for coarse-graining transformations.
+
+## Integration with Processing Pipeline
+
+The force field system integrates seamlessly with the VerMoOUTH processing pipeline through standardized interfaces. Force fields can be loaded and accessed by processors for:
+
+- **Block selection**: Choosing appropriate molecular building blocks
+- **Link application**: Connecting blocks according to force field rules
+- **Modification handling**: Applying chemical and post-translational modifications
+- **Parameter assignment**: Setting interaction parameters based on force field data
+- **Validation**: Ensuring molecular structures comply with force field requirements
+
+This integration enables the processor pipeline to work with any supported force field without requiring force field-specific code, maintaining the system's modularity and extensibility.
+
+The force field system's design prioritizes flexibility, performance, and maintainability, enabling researchers to work with diverse force field families while maintaining a consistent interface for molecular topology generation and coarse-graining transformations.
+
+# File I/O Processors (PDB, GRO, CIF)
+
+
+
+The file I/O processors in vermouth-martinize provide a unified interface for reading molecular structure files in PDB, GRO, and CIF formats. These processors integrate seamlessly with the processor pipeline system, converting external molecular data into the internal graph-based molecular representation used throughout the application.
+
+## Architecture Overview
+
+The file I/O processors follow a consistent design pattern, inheriting from the abstract `Processor` base class and implementing the `run_system` method to populate the system with parsed molecular data [vermouth/processors/processor.py#L21-L34]. Each processor delegates the actual parsing work to specialized format-specific modules while providing a common interface for the pipeline.
+
+```mermaid
+graph TD
+    A[Processor Base Class] --> B[PDBInput]
+    A --> C[GROInput] 
+    A --> D[CIFInput]
+    
+    B --> E[vermouth.pdb.pdb.read_pdb]
+    C --> F[vermouth.gmx.gro.read_gro]
+    D --> G[vermouth.pdb.cif.CIFReader]
+    
+    E --> H[System.add_molecule]
+    F --> H
+    G --> H
+    
+    style A fill:#e1f5fe
+    style H fill:#c8e6c9
+```
+
+## PDB File Processor
+
+The `PDBInput` processor handles Protein Data Bank (PDB) format files, supporting multi-model structures and connectivity information through CONECT records [vermouth/processors/pdb_reader.py#L29-L63].
+
+**Key Features:**
+- **Multi-model support**: Select specific models using the `modelidx` parameter
+- **Connectivity preservation**: Parses CONECT records to maintain bond information
+- **Residue exclusion**: Filter out unwanted residues (default: 'SOL')
+- **Hydrogen control**: Option to ignore hydrogen atoms with `ignh=True`
+
+**Constructor Parameters:**
+- `filename` (str): Path to the PDB file
+- `exclude` (Container[str]): Residue names to exclude (default: empty tuple)
+- `ignh` (bool): Discard hydrogens if True (default: False)
+- `modelidx` (int): Model number to parse (default: 1)
+
+The processor leverages the `PDBParser` class which implements a comprehensive line-by-line parsing strategy [vermouth/pdb/pdb.py#L32-L446], handling all major PDB record types including ATOM, HETATM, CRYST1, and CONECT records.
+
+## GRO File Processor
+
+The `GROInput` processor reads GROMACS GRO format files, which provide a compact representation of molecular structures with optional velocity information [vermouth/processors/gro_reader.py#L28-L40].
+
+**Key Features:**
+- **Automatic format detection**: Detects precision and velocity presence from file content
+- **Velocity support**: Preserves atomic velocities when present in the file
+- **Box information**: Extracts and stores periodic boundary conditions
+- **Flexible field parsing**: Adapts to varying coordinate precision
+
+**Constructor Parameters:**
+- `filename` (str): Path to the GRO file
+- `exclude` (Container[str]): Residue names to exclude (default: empty tuple)
+- `ignh` (bool): Discard hydrogens if True (default: False)
+
+The underlying `read_gro` function performs sophisticated field parsing, automatically detecting coordinate precision and velocity column presence [vermouth/gmx/gro.py#L29-L117].
+
+## CIF File Processor
+
+The `CIFInput` processor handles Crystallographic Information Framework (CIF) files, providing access to structures from the Protein Data Bank's modern format [vermouth/processors/cif_reader.py#L29-L61].
+
+**Key Features:**
+- **Multi-model support**: Select specific models from multi-model CIF files
+- **Category-based parsing**: Leverages CIF's structured data categories
+- **Type casting**: Automatic conversion of string values to appropriate types
+- **Comprehensive metadata**: Access to crystallographic and experimental information
+
+**Constructor Parameters:**
+- `filename` (str): Path to the CIF file
+- `exclude` (Container[str]): Residue names to exclude (default: empty tuple)
+- `ignh` (bool): Discard hydrogens if True (default: False)
+- `modelidx` (int): Model number to parse (default: 0)
+
+The processor uses the `CIFReader` class which implements category-aware parsing with automatic type conversion [vermouth/pdb/cif.py#L225-L239].
+
+## Common Processing Pattern
+
+All three file I/O processors follow a consistent workflow:
+
+1. **Initialization**: Store file path and parsing options
+2. **System processing**: Call the underlying format-specific parser
+3. **Molecule integration**: Add parsed molecules to the system using `system.add_molecule()`
+
+> [!TIP]
+> All processors return molecules without edges unless the source file contains explicit connectivity information (like CONECT records in PDB files). Bond generation typically requires separate processors in the pipeline.
+
+## Integration with Pipeline System
+
+These processors are designed to work seamlessly within the vermouth-martinize pipeline, serving as the initial data ingestion step. They convert external molecular data into the internal graph representation that subsequent processors can manipulate [vermouth/processors/processor.py#L26-L34].
+
+**Typical Usage Pattern:**
+```python
+# Example pipeline with file input
+system = System()
+pdb_processor = PDBInput('protein.pdb', exclude=('SOL', 'HOH'), ignh=True)
+pdb_processor.run_system(system)
+```
+
+## Format Comparison
+
+| Feature | PDB | GRO | CIF |
+|---------|-----|-----|-----|
+| Multi-model support | ✓ | ✗ | ✓ |
+| Velocity information | ✗ | ✓ | ✓ |
+| Connectivity records | ✓ (CONECT) | ✗ | ✗ |
+| Metadata richness | High | Low | Very High |
+| File size | Large | Small | Medium |
+| Precision | Fixed (3 decimals) | Variable | Variable |
+
+> [!TIP]
+> Choose GRO format for high-throughput processing of large systems where file size and processing speed are critical. Use PDB when connectivity information or extensive metadata is required. CIF provides the most comprehensive metadata support for crystallographic data.
+
+## Next Steps
+
+After file input processing, the next logical step in the pipeline is typically structure analysis and molecular processing. Continue with [Structure Analysis and Annotations](13-structure-analysis-and-annotations) to understand how the parsed molecular data is further processed and enriched with structural information.
+
+For understanding how these file I/O operations fit into the broader system architecture, refer to [Processor Pipeline System](6-processor-pipeline-system) and [Graph-Based Molecular Representation](7-graph-based-molecular-representation).
+
+# Mapping and Coarse-Graining
+
+
+
+The mapping and coarse-graining system in Vermouth enables transformation of molecular structures between different resolutions, primarily from atomistic to coarse-grained representations. This sophisticated system uses graph-based subgraph isomorphism to identify molecular patterns and apply predefined transformations.
+
+## Core Architecture
+
+The mapping system is built around three main components: the **Mapping** class that defines transformation rules, the **MappingBuilder** that constructs these rules from input files, and the **DoMapping** processor that applies transformations to molecular graphs.
+
+```mermaid
+graph TD
+    A[Mapping Files] --> B[MappingDirector Parser]
+    B --> C[MappingBuilder]
+    C --> D[Mapping Object]
+    D --> E[DoMapping Processor]
+    E --> F[Transformed Molecule]
+    
+    G[Force Field Data] --> E
+    H[Original Molecule] --> E
+```
+
+## Mapping File Format
+
+Mapping files define how atoms in one force field correspond to beads in another. The format supports both **block mappings** for standard residues and **modification mappings** for terminal groups and special cases.
+
+### Basic Block Mapping Structure
+
+A typical amino acid mapping file contains:
+
+```
+[ molecule ]
+ALA
+
+[from]
+charmm
+
+[to]
+martini3001
+
+[ martini ]
+BB SC1
+
+[ mapping ]
+charmm27 charmm36
+
+[ atoms ]
+    1     N    BB
+    2    HN    BB
+    3    CA    BB
+    4    HA    !BB
+    5    CB    SC1
+    6   HB1    !SC1
+    7   HB2    !SC1
+   8   HB3    !SC1
+    9     C    BB
+   10     O    BB
+```
+
+The mapping specifies that atoms 1, 2, 3, 9, and 10 map to the backbone bead (BB), while atoms 5-8 map to the side chain bead (SC1). Atoms marked with `!` are excluded from the coarse-grained representation.
+
+### Modification Mappings
+
+Terminal groups and special chemical modifications use a more complex structure:
+
+```
+[ modification ]
+[ from ]
+charmm
+[ to ]
+martini3001
+[ from blocks ]
+C-ter
+[ to blocks ]
+C-ter
+
+[ from nodes ]
+N
+
+[ from edges ]
+N CA
+
+[ mapping ]
+CA BB
+C  BB
+O  BB
+OXT BB
+```
+
+## Mapping Implementation
+
+### The Mapping Class
+
+The `Mapping` class [vermouth/map_parser.py](vermouth/map_parser.py#L31) encapsulates transformation rules and performs subgraph isomorphism to find matching patterns in target molecules. The core mapping operation uses NetworkX's graph isomorphism algorithms:
+
+```python
+def map(self, graph, node_match=None, edge_match=None):
+    """
+    Performs the partial mapping described by this object on `graph`. It
+    first find the induced subgraph isomorphisms between `graph` and
+    :attr:`block_from`, after which it will process the found isomorphisms
+    according to :attr:`mapping`.
+    """
+```
+
+The mapping process involves:
+1. Finding subgraph isomorphisms between the input molecule and the source block pattern
+2. Applying the defined atom-to-bead mappings with associated weights
+3. Generating the transformed coarse-grained structure
+
+### DoMapping Processor
+
+The `DoMapping` processor [vermouth/processors/do_mapping.py](vermouth/processors/do_mapping.py#L823) orchestrates the transformation process:
+
+```python
+def do_mapping(molecule, mappings, to_ff, attribute_keep=(), attribute_must=()):
+    """
+    Creates a new :class:`~vermouth.molecule.Molecule` in force field `to_ff`
+    from `molecule`, based on `mappings`. It does this by doing a subgraph
+    isomorphism of all blocks in `mappings` and `molecule`.
+    """
+```
+
+The processor handles both block mappings for standard residues and modification mappings for special cases, merging them into a coherent coarse-grained structure.
+
+## Force Field Support
+
+Vermouth includes extensive mapping support for multiple force field combinations:
+
+| Force Field Directory | Target Force Field | Supported Source FFs |
+|----------------------|-------------------|---------------------|
+| martini3001/ | Martini 3.0.0 | charmm36, amber |
+| martini3IDP/ | Martini 3 IDP | charmm36, amber |
+| elnedyn/ | ElNedyN | charmm36 |
+| martini30b32/ | Martini 3.0b32 | charmm36 |
+
+> [!TIP]
+> The mapping system uses weighted averaging for bead positioning. When multiple atoms map to a single bead, their positions are weighted according to the mapping weights, ensuring physically meaningful coarse-grained coordinates.
+
+## Advanced Features
+
+### Weight Normalization
+
+Mapping weights are automatically normalized to ensure proper mass distribution [vermouth/map_parser.py](vermouth/map_parser.py#L190):
+
+```python
+def _normalize_weights(self):
+    """
+    Normalize weights in :attr:`mapping` such that the sum of the weights
+    of nodes mapping to something is 1.
+    """
+```
+
+### Attribute Transfer
+
+The system preserves essential molecular attributes during transformation, with configurable control over which attributes to keep from the original molecule versus which to derive from the mapping blocks.
+
+### Chirality Preservation
+
+Special handling for chiral centers ensures stereochemical information is maintained during coarse-graining, as seen in the alanine example with explicit chiral specifications.
+
+## Integration with Workflow
+
+The mapping system integrates seamlessly with the broader Vermouth pipeline. After mapping, the coarse-grained structure can undergo further processing steps like [elastic network application](18-elastic-network-and-structure-biasing) or [topology generation](22-topology-generation-workflow).
+
+> [!TIP]
+> For complex molecules with non-standard residues or modifications, custom mapping files can be created following the established format and placed in the appropriate force field directory.
+
+## Next Steps
+
+To understand how molecules are represented and manipulated throughout this process, see [Molecule Class and Graph Operations](8-molecule-class-and-graph-operations). For information on how the transformed structures are used in simulations, refer to [GROMACS Integration](21-gromacs-integration).
+
+# Structure Analysis and Annotations
+
+
+
+The Structure Analysis and Annotations module in Vermouth provides a comprehensive suite of processors for analyzing molecular structures and adding semantic annotations that enhance downstream processing capabilities. These processors extract structural information, identify special regions, and enrich molecular graphs with metadata essential for accurate coarse-graining and force field application.
+
+## Secondary Structure Analysis
+
+### DSSP Integration and Annotation
+
+The secondary structure analysis capabilities are centered around the DSSP (Dictionary of Secondary Structure of Proteins) algorithm, which assigns secondary structure elements to protein residues based on hydrogen bonding patterns and geometric criteria [vermouth/dssp/dssp.py](vermouth/dssp/dssp.py#L15-L17).
+
+The `AnnotateDSSP` processor serves as the primary interface for secondary structure annotation:
+
+```python
+class AnnotateDSSP(Processor):
+    name = 'AnnotateDSSP'
+    
+    def __init__(self, executable=None, savedir=None):
+        # Initialize DSSP executable and output directory
+    
+    def run_molecule(self, molecule):
+        # Apply DSSP annotation to individual molecules
+```
+
+The core annotation function [`annotate_dssp`](vermouth/dssp/dssp.py#L333-L385) performs the actual structural analysis by:
+
+1. Filtering molecules to identify proteins with valid positions
+2. Creating a temporary system for DSSP processing
+3. Executing the DSSP algorithm via external callable functions
+4. Mapping results back to the original molecular graph
+
+### Martini Secondary Structure Conversion
+
+A critical capability is the conversion from detailed DSSP annotations to Martini-compatible secondary structure representations. The [`convert_dssp_to_martini`](vermouth/dssp/dssp.py#L386-L447) function implements sophisticated pattern matching to translate between structural resolutions:
+
+- **Helical regions**: Differentiates between helix starts (H-bond donors), ends (H-bond acceptors), and core regions
+- **Extended structures**: Consolidates β-sheets and extended regions into a single category
+- **Special cases**: Handles collagenous fibers, turns, bends, and coils
+
+The conversion uses ordered pattern matching to identify helix boundaries and apply appropriate Martini classifications, ensuring compatibility with the coarse-grained force field requirements.
+
+## Molecular Feature Annotation
+
+### Intrinsically Disordered Regions (IDRs)
+
+The IDR annotation system identifies and marks flexible protein regions that lack stable secondary structure. The [`AnnotateIDRs`](vermouth/processors/annotate_idrs.py#L87-L95) processor implements this functionality:
+
+```python
+def annotate_disorder(molecule, id_regions, annotation="cgidr"):
+    for region in id_regions:
+        for key, node in molecule.nodes.items():
+            if _in_chain_and_resid_region(region, node['stash']['resid'], node['chain']):
+                molecule.nodes[key][annotation] = True
+                # Override secondary structure to coil for disordered regions
+                if "cgsecstruct" in node and node["cgsecstruct"] != "C":
+                    node["cgsecstruct"] = "C"
+                    molecule.meta['modified_cgsecstruct'] = True
+```
+
+This annotation is particularly valuable for Go-model construction and structure biasing applications where disordered regions require special treatment.
+
+### Mutations and Modifications
+
+The mutation and modification annotation system enables precise tracking of sequence changes and chemical modifications through the [`AnnotateMutMod`](vermouth/processors/annotate_mut_mod.py#L269-L269) processor. The core function [`annotate_modifications`](vermouth/processors/annotate_mut_mod.py#L213-L268) supports:
+
+- **Residue specification**: Complex matching criteria including chain, residue name, and ID
+- **Modification application**: Integration with force field modification libraries
+- **Mutation tracking**: Association with block definitions for structural changes
+- **Success reporting**: Detailed status tracking for applied modifications
+
+The system uses residue graph traversal to identify targets and applies annotations in-place, maintaining consistency with the molecular representation.
+
+## Specialized Structure Processing
+
+### Charge Dummy Placement
+
+The charge dummy system handles the positioning of virtual particles used in electrostatic modeling. The [`LocateChargeDummies`](vermouth/processors/locate_charge_dummies.py#L195-L195) processor implements sophisticated geometric algorithms for dummy placement:
+
+```python
+def locate_all_dummies(molecule, attribute_tag=DEFAULT_DUMMY_ATTRIBUTE):
+    dummies = [
+        (find_anchor(molecule, dummy_key, attribute_tag), dummy_key)
+        for dummy_key in molecule.nodes
+        if molecule.nodes[dummy_key].get(attribute_tag, None) is not None
+    ]
+    # Group by anchor and apply geometric placement algorithms
+    grouped_by_anchor = itertools.groupby(dummies, key=operator.itemgetter(0))
+    for anchor_key, dummy_pairs in grouped_by_anchor:
+        dummy_keys = [pair[1] for pair in dummy_pairs]
+        locate_dummy(molecule, anchor_key, dummy_keys, attribute_tag)
+```
+
+The placement algorithm utilizes Fibonacci sphere sampling and colinear pair generation to ensure optimal charge distribution around anchor atoms.
+
+### Cysteine Bridge Detection
+
+The cysteine bridge system identifies and manages disulfide bonds through specialized processors. The [`AddCysteinBridgesThreshold`](vermouth/processors/tune_cystein_bridges.py#L78-L78) and [`RemoveCysteinBridgeEdges`](vermouth/processors/tune_cystein_bridges.py#L58-L58) processors provide complementary functionality:
+
+- **Bridge detection**: Distance-based identification of potential disulfide bonds
+- **Template matching**: Universal bridge templates for consistent handling
+- **Dynamic management**: Addition and removal based on structural criteria
+
+## Processor Integration Architecture
+
+The annotation processors follow a consistent architectural pattern, inheriting from the base `Processor` class and implementing standardized interfaces:
+
+```mermaid
+graph TD
+    A[Processor Base Class] --> B[Structure Analysis Processors]
+    B --> C[AnnotateDSSP]
+    B --> D[AnnotateIDRs]
+    B --> E[AnnotateMutMod]
+    B --> F[LocateChargeDummies]
+    B --> G[CysteinBridge Processors]
+    
+    C --> H[run_molecule]
+    C --> I[run_system]
+    D --> H
+    D --> I
+    E --> H
+    E --> I
+    F --> H
+    G --> H
+    G --> I
+    
+    H --> J[Molecule Graph Modification]
+    I --> K[System-wide Processing]
+```
+
+Each processor operates through two main entry points:
+- **`run_molecule`**: Processes individual molecular graphs
+- **`run_system`**: Handles multi-molecule systems with coordination
+
+## Data Flow and Processing Pipeline
+
+The annotation system integrates seamlessly with the broader Vermouth processing pipeline:
+
+1. **Input validation**: Ensures molecular graphs contain required attributes
+2. **Structure analysis**: Applies specialized algorithms for feature detection
+3. **Annotation application**: Modifies graph nodes and edges with metadata
+4. **Consistency maintenance**: Preserves graph integrity throughout processing
+5. **Status reporting**: Provides feedback on processing success and issues
+
+The processors maintain a clear separation of concerns, with each focusing on specific structural aspects while contributing to a comprehensive molecular understanding.
+
+## Integration with Force Field Systems
+
+Annotation processors interact closely with the force field infrastructure, particularly for:
+
+- **Secondary structure mapping**: Translation between different structural representations
+- **Modification validation**: Ensuring compatibility with force field definitions
+- **Block association**: Linking mutations to appropriate building blocks
+- **Parameter assignment**: Supporting downstream topology generation
+
+This integration ensures that structural annotations are not merely descriptive but actively influence the coarse-graining process and force field parameter selection.
+
+The Structure Analysis and Annotations module thus serves as a critical bridge between raw molecular structures and their processed, analysis-ready representations, enabling sophisticated molecular modeling workflows within the Vermouth ecosystem.
+
+For understanding how these annotations feed into the transformation pipeline, see [Mapping and Coarse-Graining](12-mapping-and-coarse-graining). To explore the force field integration aspects, refer to [Martini Force Field Support](14-martini-force-field-support).
+
+# Martini Force Field Support
+
+
+
+Vermouth-martinize provides comprehensive support for the Martini coarse-grained force field family, enabling molecular dynamics simulations at mesoscopic scales. The system implements a modular architecture that supports multiple Martini versions while maintaining backward compatibility and extensibility for custom force field development.
+
+## Martini Force Field Architecture
+
+The Martini force field implementation follows a hierarchical organization where each force field version is contained in its own directory within `vermouth/data/force_fields/` [source](vermouth/data/force_fields/). The system currently supports multiple Martini variants:
+
+```mermaid
+graph TD
+    A[Martini Force Fields] --> B[martini22]
+    A --> C[martini22p]
+    A --> D[martini3001]
+    A --> E[martini30b32]
+    A --> F[martini30dev]
+    A --> G[martini3IDP]
+    A --> H[elnedyn21]
+    A --> I[elnedyn22]
+    A --> J[elnedyn22p]
+    
+    D --> D1[aminoacids.ff]
+    D --> D2[general.ff]
+    D --> D3[modifications.ff]
+    D --> D4[citations.bib]
+    D --> D5[small_molecule_martini3.ff]
+```
+
+Each force field directory contains standardized files that define the molecular components and interaction parameters:
+
+| File Type | Extension | Purpose | Parser |
+|-----------|-----------|---------|--------|
+| Force field definitions | `.ff` | Molecule blocks, links, modifications | `read_ff` |
+| Residue topology | `.rtp` | Atomic residue definitions | `read_rtp` |
+| Citations | `.bib` | Bibliographic references | `read_bib` |
+
+## Force Field Loading System
+
+The force field management system uses a cached singleton pattern to efficiently load and manage force field data [source](vermouth/forcefield.py#L31-L33). The `get_native_force_field()` function provides access to distributed force fields:
+
+```python
+def get_native_force_field(name):
+    """
+    Get a force field from the distributed library knowing its name.
+    """
+    global _FORCE_FIELDS
+    try:
+        return _FORCE_FIELDS[name]
+    except KeyError:
+        _FORCE_FIELDS = find_force_fields(os.path.join(DATA_PATH, 'force_fields'))
+        return _FORCE_FIELDS[name]
+```
+
+> [!TIP]
+> The caching mechanism ensures that force field objects remain singletons, which is crucial for proper comparison operations and memory efficiency during large-scale processing.
+
+## Martini 3 Implementation Details
+
+Martini 3 represents the current state-of-the-art implementation with improved interaction balance and expanded bead type repertoire [source](vermouth/data/force_fields/martini3001/citations.bib#L1-L12). The force field structure includes:
+
+### Amino Acid Definitions
+The `aminoacids.ff` file defines protein building blocks with standardized bead types and constraints [source](vermouth/data/force_fields/martini3001/aminoacids.ff#L13-L49):
+
+```
+[ macros ]
+protein_resnames "CYSG|CYSF|CYSP|GLYM|GLY|ALA|CYS|VAL|LEU|ILE|MET|PRO|HYP|ASN|GLN|ASP|ASPP|ASH|GLU|GLUP|GLH|THR|SER|LYS|LSN|LYN|ARG|HSE|HIS|HSD|HSP|HID|HIP|HIE|PHE|TYR|TRP"
+prot_default_bb_type P2
+stiff_fc 1000000
+```
+
+### Global Variables
+The `general.ff` file establishes force field-wide parameters and constants [source](vermouth/data/force_fields/martini3001/general.ff#L13-L22):
+
+```
+[ variables ]
+center_weight "mass"
+regular "0.47"
+small "0.41"
+tiny "0.34"
+water_type "W"
+bb_atomname "BB"
+```
+
+### Post-Translational Modifications
+The `modifications.ff` file defines chemical modifications and terminal variants [source](vermouth/data/force_fields/martini3001/modifications.ff#L1-L35):
+
+```
+[ modification ]
+C-ter
+[ atoms ]
+BB {"replace": {"atype": "Q5", "charge": -1}}
+
+[ modification ]
+N-ter
+[ atoms ]
+BB {"replace": {"atype": "Q5", "charge": 1}}
+```
+
+## FF File Format Parser
+
+The force field files use a custom `.ff` format that extends the GROMACS ITP format with additional features for molecular graph manipulation [source](vermouth/ffinput.py#L15-L23). The `FFDirector` class handles parsing of:
+
+- **Molecule types** (`[ moleculetype ]`): Define molecular blocks with exclusion parameters
+- **Atoms** (`[ atoms ]`): Specify bead types, charges, and connectivity
+- **Interactions** (`[ bonds ]`, `[ angles ]`, `[ dihedrals ]`): Define force field parameters
+- **Links** (`[ link ]`): Describe molecular connections and transformations
+- **Modifications** (`[ modification ]`): Handle chemical modifications and variants
+
+> [!TIP]
+> The parser supports conditional directives and meta-information for advanced force field customization, enabling sophisticated molecular modeling scenarios.
+
+## Integration with Processing Pipeline
+
+The Martini force field integrates seamlessly with the vermouth processing pipeline through the `ForceField` class [source](vermouth/forcefield.py#L36-L143). Key integration points include:
+
+- **Reference Graphs**: Access to molecular blocks and templates via `reference_graphs` property
+- **Feature Detection**: Automatic identification of force field capabilities through `features` property
+- **Pattern Matching**: Support for molecular pattern recognition and transformation
+- **Citation Management**: Automatic bibliographic tracking for reproducible simulations
+
+## Scientific Validation and Citations
+
+Each Martini variant includes comprehensive citation metadata tracking the scientific development and validation [source](vermouth/data/force_fields/martini3001/citations.bib#L13-L41). The system maintains references for:
+
+- Core force field development (Martini 3: Nature Methods 2021)
+- Small molecule parameterization (Advanced Theory and Simulations 2022)
+- Gō-model integration (Nature Communications 2025)
+- Protein lipidation parameters (JCTC 2023)
+
+This ensures proper scientific attribution and enables users to trace the theoretical foundations of their simulations.
+
+## Next Steps
+
+For comprehensive understanding of the force field system, explore:
+
+- [Force Field System and Data Management](10-force-field-system-and-data-management) for detailed architecture
+- [Custom Force Field Development](15-custom-force-field-development) for extending the system
+- [Interaction Parameter Management](16-interaction-parameter-management) for parameter optimization
+- [Processor Pipeline System](6-processor-pipeline-system) for integration with molecular processing workflows
+
+# Custom Force Field Development
+
+
+
+Vermouth-martinize provides a comprehensive framework for developing custom force fields through its modular architecture and extensible file format system. This guide covers the essential components and methodologies for creating and integrating custom force fields into the martinize2 workflow.
+
+## Force Field Architecture Overview
+
+The force field system in vermouth is built around the `ForceField` class, which serves as a centralized container for all force field data including blocks, links, modifications, variables, and citations [vermouth/forcefield.py#L36-L64]. The architecture supports multiple file formats (.ff, .rtp, .bib) through a unified parsing system [vermouth/forcefield.py#L27].
+
+```mermaid
+flowchart TD
+    A[Force Field Directory] --> B[.ff Files]
+    A --> C[.rtp Files] 
+    A --> D[.bib Files]
+    B --> E[FF Format Parser]
+    C --> F[RTP Format Parser]
+    D --> G[Bibliography Parser]
+    E --> H[ForceField Object]
+    F --> H
+    G --> H
+    H --> I[Blocks Dictionary]
+    H --> J[Links List]
+    H --> K[Modifications Dictionary]
+    H --> L[Variables Dictionary]
+    H --> M[Citations Dictionary]
+```
+
+## File Format Support
+
+### FF Format (.ff files)
+The FF format is the primary format for custom force field development, providing a flexible test format for rapid prototyping [vermouth/ffinput.py#L16-L23]. It extends the ITP format with enhanced features for molecular component description.
+
+### RTP Format (.rtp files)
+For compatibility with GROMACS, the system supports RTP files through the `read_rtp` function [vermouth/gmx/rtp.py#L432-L450], which parses residue topology files and populates the force field object.
+
+### Bibliography Format (.bib files)
+Citation management is handled through .bib files, enabling proper attribution of force field parameters and methodologies.
+
+## Force Field Structure Components
+
+### Blocks
+Blocks represent molecular building blocks and are stored in the `blocks` dictionary [vermouth/forcefield.py#L65]. Each block contains atom definitions, interactions, and connectivity patterns.
+
+### Links
+Links define inter-block connections and are stored as a list in the `links` attribute [vermouth/forcefield.py#L66]. They specify how different molecular components interact.
+
+### Modifications
+Modifications allow for dynamic alterations to molecular structures and are stored in the `modifications` dictionary [vermouth/forcefield.py#L67]. Common examples include terminal modifications and post-translational modifications.
+
+### Variables
+Global variables are stored in the `variables` dictionary [vermouth/forcefield.py#L68], enabling parameter customization and conditional behavior.
+
+## Creating Custom Force Fields
+
+### Directory Structure
+Custom force fields follow a standardized directory structure:
+```
+custom_forcefield/
+├── molecules.ff      # Primary molecule definitions
+├── modifications.ff   # Molecular modifications
+├── general.ff        # Global variables and settings
+└── citations.bib     # Bibliography references
+```
+
+### FF File Syntax
+The FF format supports multiple sections for comprehensive force field definition:
+
+- **[moleculetype]**: Defines molecular blocks with atom types and interactions
+- **[link]**: Specifies inter-block connections and patterns
+- **[modification]**: Defines structural modifications
+- **[variables]**: Global parameter definitions
+- **[citations]**: Reference management
+
+### Example: Custom Amino Acid Definition
+```ff
+[ moleculetype ]
+CUSTOM_AA    1
+
+[ atoms ]
+;id type resnr residu atom cgnr   charge
+ 1   P5   1     CUSTOM_AA    BB     1      0
+ 2   P4   1     CUSTOM_AA    SC1    2      0
+
+[ bonds ]
+; ai aj funct length force.c.
+ 1  2  1  0.35  1000
+```
+
+## Force Field Loading and Management
+
+### Native Force Field Access
+The system provides cached access to native force fields through `get_native_force_field(name)` [vermouth/forcefield.py#L202-L210], enabling efficient loading of distributed force fields.
+
+### Custom Force Field Integration
+Custom force fields can be loaded using the `ForceField` class constructor with a directory path [vermouth/forcefield.py#L64-L75]:
+```python
+from vermouth.forcefield import ForceField
+
+custom_ff = ForceField(directory='/path/to/custom_forcefield')
+```
+
+### File Discovery
+The `iter_force_field_files` function automatically discovers all supported force field files in a directory [vermouth/forcefield.py#L192-L198], handling multiple extensions through a unified interface.
+
+## Advanced Features
+
+### Feature System
+Force fields can declare features through links, enabling conditional processing and feature detection [vermouth/forcefield.py#L117-L128]. The `has_feature(feature)` method allows runtime feature checking.
+
+### Citation Management
+Comprehensive citation support is built into the force field system, with citations stored at both force field and component levels [vermouth/forcefield.py#L70].
+
+### Pattern Matching
+The FF format supports sophisticated pattern matching for molecular recognition and conditional modifications, enabling flexible force field design.
+
+## Integration with Martinize2 Workflow
+
+Custom force fields integrate seamlessly with the martinize2 processor pipeline. The force field object provides access to all molecular components needed for coarse-graining and topology generation.
+
+For detailed information about force field integration with specific processors, refer to [Processor Pipeline System](6-processor-pipeline-system) and [Martini Force Field Support](14-martini-force-field-support).
+
+## Best Practices
+
+1. **Modular Design**: Separate different molecular components into logical files
+2. **Consistent Naming**: Use standardized residue and atom naming conventions
+3. **Documentation**: Include comprehensive citations and comments
+4. **Validation**: Test force field components with known molecular systems
+5. **Version Control**: Maintain version information for force field updates
+
+> [!TIP]
+> When developing custom force fields, leverage the existing Martini force fields as templates. The martini22, martini3001, and other variants in `vermouth/data/force_fields/` provide excellent reference implementations for common molecular components and interaction patterns.
+
+## Next Steps
+
+For practical implementation details and examples, explore the existing force field implementations in the `vermouth/data/force_fields/` directory. Understanding the interaction between force fields and the processing pipeline will be enhanced by reviewing [Processor Pipeline System](6-processor-pipeline-system) and [Molecule Class and Graph Operations](8-molecule-class-and-graph-operations).
+
+# Interaction Parameter Management
+
+
+
+The interaction parameter management system in vermouth-martinize provides a sophisticated framework for defining, parsing, and applying molecular interaction parameters across different force fields. This system enables flexible specification of bonds, angles, dihedrals, constraints, and other interaction types with dynamic parameter calculation capabilities.
+
+## Core Architecture
+
+The interaction parameter system is built around several key components that work together to manage force field parameters:
+
+### Parameter Effectors
+
+The system supports dynamic parameter calculation through parameter effectors that can compute values based on molecular geometry at runtime. These effectors are defined in the `PARAMETER_EFFECTORS` dictionary [vermouth/ffinput.py#L55-L62]:
+
+```python
+PARAMETER_EFFECTORS = {
+    'dist': ParamDistance,
+    'angle': ParamAngle,
+    'dihedral': ParamDihedral,
+    'dihphase': ParamDihedralPhase,
+}
+```
+
+Each effector class inherits from `LinkParameterEffector` and implements specific geometric calculations:
+
+- **ParamDistance**: Calculates distance between two nodes [vermouth/molecule.py#L267-L282]
+- **ParamAngle**: Calculates angle between three consecutive nodes in degrees [vermouth/molecule.py#L283-L299]
+- **ParamDihedral**: Calculates dihedral angle defined by four nodes in degrees [vermouth/molecule.py#L300-L315]
+- **ParamDihedralPhase**: Calculates dihedral angle shifted by -180 degrees [vermouth/molecule.py#L316-L330]
+
+### Interaction Type Support
+
+The system supports comprehensive interaction types through the `interactions_natoms` mapping [vermouth/ffinput.py#L65-L85]:
+
+| Interaction Type | Number of Atoms | Description |
+|------------------|-----------------|-------------|
+| bonds | 2 | Bond interactions |
+| angles | 3 | Angle interactions |
+| dihedrals | 4 | Dihedral angle interactions |
+| impropers | 4 | Improper dihedral interactions |
+| constraints | 2 | Distance constraints |
+| pairs | 2 | Non-bonded pair interactions |
+| position_restraints | 1 | Position restraints |
+| virtual_sites2-4 | 3-5 | Virtual site definitions |
+
+## Force Field File Structure
+
+### FF File Format
+
+The `.ff` file format provides a structured way to define molecular components and their interactions. The format is built on a subset of the ITP format and includes several key sections:
+
+#### Variables Section
+Global variables can be defined for use throughout the force field:
+```ff
+[ variables ]
+elastic_network_bond_type 1
+res_min_dist 3
+prot_default_bb_type P2
+stiff_fc 1000000
+```
+
+#### Molecule Definitions
+Each molecule type is defined with its atoms and interactions:
+
+```ff
+[ moleculetype ]
+ALA                1
+
+[ atoms ]
+;id type resnr residu atom cgnr   charge
+ 1   SP2    1   ALA    BB     1      0
+ 2   TC3    1   ALA    SC1    2      0 
+
+[ constraints ]
+;  i     j   funct   length  
+  BB   SC1    1       0.270
+
+[ bonds ]
+;  i     j   funct   length  force.c.
+  BB   SC1    1       0.270  $stiff_fc
+```
+
+#### Conditional Interactions
+The system supports conditional interactions using meta directives:
+
+```ff
+[ constraints ]
+#meta {"group": "Side chain bonds", "ifndef": "FLEXIBLE"}
+;  i     j   funct   length  
+  BB   SC1    1       0.270
+
+[ bonds ]
+#meta {"group": "Side chain bonds", "ifdef": "FLEXIBLE"}
+;  i     j   funct   length  
+  BB   SC1    1       0.270  $stiff_fc
+```
+
+## Parameter Parsing System
+
+### Dynamic Parameter Resolution
+
+The parsing system can handle both static parameters and dynamic calculations. When a parameter effector is encountered, it follows this process [vermouth/ffinput.py#L812-L835]:
+
+1. **Effector Detection**: Tokens with parentheses are identified as parameter effectors
+2. **Class Resolution**: The effector name is mapped to the appropriate class
+3. **Parameter Extraction**: Comma-separated parameters are extracted from within parentheses
+4. **Format Specification**: Optional format specifications can be provided using the `|` separator
+
+Example usage in force field files:
+```ff
+[ bonds ]
+;  i     j   funct   length              force.c.
+  BB   SC1    1    dist(BB,SC1)|.3f     angle(BB,SC1,SC2)*10
+```
+
+### Interaction Management
+
+The `Molecule` class provides comprehensive interaction management methods:
+
+- **add_interaction**: Add new interactions with metadata [vermouth/molecule.py#L522-L553]
+- **add_or_replace_interaction**: Add interactions or replace existing ones [vermouth/molecule.py#L554-L595]
+- **get_interaction**: Retrieve interactions by type [vermouth/molecule.py#L596-L612]
+- **remove_interaction**: Remove specific interactions [vermouth/molecule.py#L613-L643]
+- **remove_matching_interaction**: Remove interactions matching templates [vermouth/molecule.py#L644-L664]
+
+## Force Field Organization
+
+### Directory Structure
+
+Force fields are organized in `vermouth/data/force_fields/` with each force field having its own subdirectory:
+
+```
+force_fields/
+├── martini3001/
+│   ├── aminoacids.ff
+│   ├── general.ff
+│   ├── modifications.ff
+│   ├── nucleotides.ff
+│   └── citations.bib
+├── martini22/
+├── charmm/
+└── amber/
+```
+
+### Modification System
+
+The modification system allows for atomic-level changes to molecular building blocks. Modifications are defined in `.ff` files and can:
+
+- Replace atom types and charges
+- Add or remove atoms
+- Modify connectivity
+
+Example modification for terminal groups:
+```ff
+[ modification ]
+C-ter
+[ atoms ]
+BB {"replace": {"atype": "Q5", "charge": -1}}
+```
+
+## Integration with Force Field Classes
+
+The `ForceField` class serves as the central hub for managing all force field data [vermouth/forcefield.py#L36-L142]. It provides:
+
+- **File Reading**: Automatic discovery and parsing of force field files
+- **Reference Graphs**: Access to all known molecular blocks
+- **Feature Management**: Declaration and querying of force field features
+- **Citation Management**: Bibliographic information tracking
+
+### Force Field Loading
+
+Force fields are loaded using the `read_from` method which:
+1. Scans the directory for supported file types
+2. Uses appropriate parsers for each file extension
+3. Populates the force field with parsed data
+4. Maintains relationships between blocks, links, and modifications
+
+## Advanced Features
+
+### Conditional Compilation
+
+The system supports conditional compilation of interactions based on variables:
+- `#ifdef VARIABLE`: Include section if variable is defined
+- `#ifndef VARIABLE`: Include section if variable is not defined
+- Variables can be set in the `[ variables ]` section
+
+### Meta Information
+
+Interactions can include meta information for organization and debugging:
+```ff
+#meta {"group": "Side chain bonds", "description": "Backbone-side chain connections"}
+```
+
+### Citation Integration
+
+Force fields can include bibliographic information that gets automatically associated with the molecular components that use them.
+
+## Best Practices
+
+1. **Variable Naming**: Use descriptive variable names that reflect their purpose
+2. **Parameter Organization**: Group related interactions using meta directives
+3. **Conditional Logic**: Use conditional compilation for different simulation scenarios
+4. **Documentation**: Include comprehensive comments and meta information
+5. **Testing**: Validate parameter calculations across different molecular geometries
+
+This interaction parameter management system provides a robust foundation for defining complex molecular force fields while maintaining flexibility for different scientific applications and simulation requirements.
+
+For more details on related topics, see [Force Field System and Data Management](10-force-field-system-and-data-management) and [Custom Force Field Development](15-custom-force-field-development).
+
+# Post-Translational Modifications
+
+
+
+Post-translational modifications (PTMs) represent chemical changes to proteins after their synthesis, playing crucial roles in protein function, regulation, and interaction. In the vermouth-martinize framework, PTMs are handled through a sophisticated system that combines graph-based molecular representation with force field integration to accurately model these modifications in coarse-grained simulations.
+
+## PTM Architecture Overview
+
+The PTM system operates through a multi-stage pipeline that transforms molecular graphs to incorporate modifications while maintaining structural integrity and force field compatibility:
+
+```mermaid
+flowchart TD
+    A[Input Molecule] --> B[AnnotateMutMod Processor]
+    B --> C[CanonicalizeModifications Processor]
+    C --> D[RenameModifiedResidues Processor]
+    D --> E[Modified Molecule]
+    
+    F[Force Field Data] --> G[modifications.ff Files]
+    G --> H[PTM Definitions]
+    H --> C
+    H --> D
+```
+
+The architecture leverages three core processors that work sequentially to handle PTM detection, canonicalization, and residue renaming. Each processor operates on the molecular graph representation, ensuring that modifications are properly integrated into the coarse-graining workflow.
+
+## PTM Detection and Annotation
+
+The **AnnotateMutMod** processor serves as the entry point for PTM handling, responsible for marking residues that require modifications or mutations. This processor parses residue specifications using a flexible format that supports chain identifiers, residue names, and residue numbers [annotate_mut_mod.py#L28-L50].
+
+The residue specification follows the pattern `[<chain>-][<resname>][[#]<resid>]`, allowing precise targeting of specific residues for modification. For example, `A-LYS2` targets lysine residue 2 in chain A, while `PO4#2` targets residue number 2 regardless of chain.
+
+The processor maintains separate lists for modifications and mutations, applying them through the `annotate_modifications` function that traverses the molecular graph and marks appropriate atoms with modification attributes [annotate_mut_mod.py#L269-L305].
+
+## PTM Canonicalization
+
+The **CanonicalizeModifications** processor performs the core PTM identification and standardization work. This sophisticated system identifies unexpected atoms marked as PTM atoms and canonicalizes their attributes based on known modifications in the force field [canonicalize_modifications.py#L17-L21].
+
+The canonicalization process involves several key steps:
+
+1. **PTM Atom Detection**: The `find_ptm_atoms` function locates all atoms with the `PTM_atom` attribute set to `True`, traversing the molecular graph to identify PTM branches and their anchor nodes [canonicalize_modifications.py#L53-L60].
+
+2. **Graph Matching**: The system uses a specialized node matcher (`ptm_node_matcher`) that compares PTM atoms based on element identity and non-PTM atoms based on atom names [canonicalize_modifications.py#L35-L42].
+
+3. **Modification Identification**: The `identify_ptms` function performs graph isomorphism matching between detected PTM patterns and known modifications from the force field [canonicalize_modifications.py#L114-L125].
+
+4. **Attribute Correction**: Once PTMs are identified, the system corrects atom names and applies the appropriate modifications from the force field definitions.
+
+> [!TIP]
+> The PTM detection system requires complete PTM structures in the input file. Missing atoms will prevent proper identification and canonicalization of modifications.
+
+## Force Field Integration
+
+PTM definitions are stored in force field-specific `modifications.ff` files, which contain structured definitions of supported modifications. These files define both atomic modifications and connectivity changes required for each PTM [martini3001/modifications.ff#L1-L50].
+
+Each modification definition includes:
+
+- **Atom specifications**: Define which atoms to modify and their new properties
+- **Edge definitions**: Specify connectivity changes for complex modifications
+- **Replacement rules**: Define new atom types, charges, and residue names
+
+For example, the LYS-LSN modification defines lysine side-chain neutralization by replacing the SC2 atom type with SN6d and removing the charge [martini3001/modifications.ff#L50-L60].
+
+## Residue Renaming System
+
+The **RenameModifiedResidues** processor handles the final step of PTM integration by updating residue names based on applied modifications. This system uses a mapping from force field data that defines new residue names based on the original residue name and applied modifications [rename_modified_residues.py#L23-L40].
+
+The renaming process:
+1. Extracts modification lists from each atom
+2. Sorts modifications to ensure consistent ordering
+3. Looks up the appropriate new residue name from the force field mapping
+4. Updates the residue name in-place
+
+This ensures that modified residues are correctly labeled in the output, facilitating downstream analysis and visualization.
+
+## Supported PTM Types
+
+The system supports a comprehensive range of PTMs across different force fields:
+
+- **Terminal modifications**: C-ter, N-ter, COOH-ter, NH2-ter, CCAP-ter, NCAP-ter
+- **Side-chain modifications**: GLU-HE1, GLU-HE2, ASP-HD1, ASP-HD2, LYS-LSN, LYS-HZ3
+- **Histidine states**: HIS-HP (protonated), HIS-HE (epsilon), HIS-HD (delta)
+- **Complex modifications**: Multi-atom modifications with connectivity changes
+
+Each modification is carefully defined to maintain structural integrity and force field compatibility.
+
+> [!TIP]
+> PTM definitions are force field-specific. Always ensure you're using the correct force field version that includes the PTMs you need for your simulation.
+
+## Testing and Validation
+
+The PTM system includes comprehensive testing to ensure reliable modification handling. The test suite covers various scenarios including simple PTM atoms, complex multi-residue modifications, and edge cases like incomplete PTM structures [test_ptm_detection.py#L67-L128].
+
+Test cases validate:
+- Correct PTM atom grouping and anchor identification
+- Accurate modification recognition through graph matching
+- Proper handling of edge cases and error conditions
+- Integration with the broader molecular processing pipeline
+
+## Integration with Processing Pipeline
+
+PTM processors integrate seamlessly into the broader martinize2 workflow, working in concert with other processors to produce correctly modified coarse-grained structures. The typical processing order ensures that PTMs are handled after initial structure parsing but before final topology generation.
+
+For developers working with custom PTMs, the system provides extension points through force field modification files and processor customization. The modular architecture allows for adding new PTM definitions without modifying core processing logic.
+
+Understanding PTM processing is essential for accurate protein simulation, as these modifications can significantly impact protein behavior, interactions, and overall system dynamics. The vermouth-martinize PTM system provides a robust foundation for handling these complex chemical transformations in coarse-grained molecular dynamics.
+
+For comprehensive understanding of the molecular processing pipeline, see [Processor Pipeline System](6-processor-pipeline-system). To understand how PTMs integrate with force field data, refer to [Force Field System and Data Management](10-force-field-system-and-data-management).
+
+# Elastic Network and Structure Biasing
+
+
+
+Vermouth provides sophisticated elastic network and structure biasing capabilities that enable researchers to maintain structural integrity during coarse-grained simulations. These features are essential for preserving native protein conformations and implementing structure-based models like Go-models.
+
+## Elastic Network Models
+
+Elastic network models (ENMs) implement harmonic restraints between beads to maintain structural relationships. The primary implementation in vermouth is the **rubber band** elastic network, which adds distance-dependent harmonic bonds between selected beads.
+
+### Rubber Band Implementation
+
+The `ApplyRubberBand` processor creates elastic networks with distance-dependent force constants [apply_rubber_band.py](vermouth/processors/apply_rubber_band.py#L439-L546). The force constant calculation follows a decay function:
+
+```python
+def compute_force_constants(distance_matrix, lower_bound, upper_bound,
+                            decay_factor, decay_power, base_constant,
+                            minimum_force):
+    constants = compute_decay(distance_matrix, lower_bound, decay_factor, decay_power)
+    np.fill_diagonal(constants, 0)
+    constants *= base_constant
+    constants[constants < minimum_force] = 0
+    constants[constants > base_constant] = base_constant
+    constants[distance_matrix > upper_bound] = 0
+    return constants
+```
+
+> [!TIP]
+> The decay function allows for sophisticated force constant modulation where shorter distances receive stronger restraints, following the relationship `k = base_constant * decay_function(distance)`.
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `lower_bound` | - | Minimum distance for force application |
+| `upper_bound` | - | Maximum distance for elastic bonds |
+| `decay_factor` | - | Distance decay factor for force constants |
+| `decay_power` | - | Power law exponent for distance decay |
+| `base_constant` | - | Base force constant value |
+| `minimum_force` | - | Minimum force threshold |
+| `res_min_dist` | 2 | Minimum residue separation [apply_rubber_band.py](vermouth/processors/apply_rubber_band.py#L32-L34) |
+
+### Connectivity Analysis
+
+The system includes sophisticated connectivity analysis to avoid creating redundant bonds:
+
+```python
+def are_connected(graph, left, right, separation):
+    """Check if two nodes are already connected within a given separation."""
+    try:
+        shortest_path = nx.shortest_path_length(graph, left, right)
+        return shortest_path <= separation
+    except (nx.NetworkXNoPath, KeyError):
+        return False
+```
+
+This prevents creating elastic bonds between beads that are already covalently or closely connected in the molecular graph.
+
+## Go-Model Structure Biasing
+
+Go-models implement structure-based biasing using native contacts as reference points. Vermouth's Go-model implementation resides in the `rcsu` (residue contact structure utilities) module.
+
+### Contact Map Generation
+
+The `GenerateContactMap` processor calculates native contacts using van der Waals overlap analysis [contact_map.py](vermouth/rcsu/contact_map.py#L779-L808):
+
+```python
+def do_contacts(molecule, write_file):
+    vdw_list, atypes, coords, res_serial, resids, chains, resnames, res_idx, ca_pos, nresidues, mol_graph = _contact_info(molecule)
+    overlaps, contacts, stabilisers, destabilisers = _calculate_contacts(vdw_list, atypes, coords, res_serial, nresidues)
+    contacts, all_contacts = _get_contacts(nresidues, overlaps, contacts, stabilisers, destabilisers, res_idx, mol_graph)
+```
+
+The contact calculation uses sophisticated geometric analysis including:
+- Van der Waals radius calculations
+- Surface overlap detection using Fibonacci sphere algorithms
+- Contact stabilization/destabilization analysis
+
+### Structural Bias Computation
+
+The `ComputeStructuralGoBias` processor converts contacts into non-bonded interaction parameters [go_structure_bias.py](vermouth/rcsu/go_structure_bias.py#L235-L280):
+
+```python
+def compute_go_interaction(self, contacts):
+    go_inters = {}
+    for atype_a, atype_b, dist in contacts:
+        sigma = dist / self.conversion_factor
+        contact_bias = NonbondParam(atoms=(atype_a, atype_b),
+                                    sigma=sigma,
+                                    epsilon=self.go_eps,
+                                    meta={"comment": [f"go bond {dist}"]})
+        self.system.gmx_topology_params["nonbond_params"].append(contact_bias)
+```
+
+> [!TIP]
+> The Go-model bias is implemented as Lennard-Jones type non-bonded interactions where the sigma parameter matches the native distance and epsilon provides the bias strength.
+
+### Go-Model Pipeline
+
+The Go-model functionality is integrated through a dedicated pipeline [go_pipeline.py](vermouth/rcsu/go_pipeline.py#L25-L57):
+
+```python
+GoPipeline = GoProcessorPipeline([SetMoleculeMeta,
+                                  VirtualSiteCreator,
+                                  ComputeStructuralGoBias])
+```
+
+This pipeline orchestrates the complete Go-model setup including molecule metadata handling, virtual site creation, and structural bias computation.
+
+## Architecture Overview
+
+```mermaid
+graph TB
+    A[Molecular Structure] --> B[Contact Analysis]
+    A --> C[Elastic Network Analysis]
+    
+    B --> D[Contact Map Generation]
+    D --> E[Go-Model Bias Computation]
+    E --> F[Non-bonded Parameters]
+    
+    C --> G[Distance Matrix Calculation]
+    G --> H[Force Constant Computation]
+    H --> I[Bond Parameters]
+    
+    F --> J[GROMACS Topology]
+    I --> J
+    
+    subgraph "Elastic Network"
+        K[ApplyRubberBand Processor]
+        L[Distance-based Decay]
+        M[Connectivity Filtering]
+    end
+    
+    subgraph "Go-Model"
+        N[GenerateContactMap Processor]
+        O[ComputeStructuralGoBias Processor]
+        P[Contact Map Analysis]
+    end
+```
+
+## Integration and Usage
+
+Both elastic networks and Go-model biasing integrate seamlessly with the vermouth processor pipeline. They can be used independently or in combination:
+
+- **Elastic Networks**: Applied via `ApplyRubberBand` processor with customizable distance criteria and decay functions
+- **Go-Models**: Applied via `GoPipeline` which handles the complete structure biasing workflow
+- **Combined Usage**: Elastic networks can complement Go-models by providing additional long-range restraints
+
+The parameters are stored in the system's `gmx_topology_params` and automatically written to GROMACS topology files using the standard topology writing functionality.
+
+## Next Steps
+
+For understanding how these biasing methods integrate with the overall transformation workflow, see [Processor Pipeline System](6-processor-pipeline-system). To learn about the molecular graph representation that underlies these calculations, refer to [Graph-Based Molecular Representation](7-graph-based-molecular-representation). For details on force field integration and topology generation, see [GROMACS Integration](21-gromacs-integration).
+
+# High-Throughput Processing
+
+
+
+Vermouth-martinize provides a robust architecture for high-throughput molecular processing, enabling efficient handling of large-scale molecular systems through systematic pipeline orchestration and optimized data structures. This capability is essential for processing hundreds or thousands of molecular structures in automated workflows, making it particularly valuable for drug discovery, materials science, and systems biology applications.
+
+## System-Level Processing Architecture
+
+The foundation of high-throughput processing lies in the `System` class, which serves as a container for multiple molecules and provides the interface for batch processing operations. The system maintains a collection of molecules with consistent force field assignments, ensuring uniform processing across all molecular entities [source](vermouth/system.py#L21-L29).
+
+```mermaid
+graph TB
+    A[System Class] --> B[Molecule Collection]
+    A --> C[Force Field Management]
+    A --> D[Metadata Storage]
+    
+    B --> E[Individual Molecules]
+    E --> F[Graph-based Structure]
+    E --> G[Interactions]
+    E --> H[Atomic Properties]
+    
+    C --> I[Unified FF Assignment]
+    C --> J[Validation Checks]
+    
+    D --> K[Topology Parameters]
+    D --> L[Go Model Parameters]
+    D --> M[Custom Metadata]
+```
+
+The System class provides essential methods for managing molecular collections:
+
+- **Molecule Addition**: The `add_molecule` method ensures force field consistency and automatically assigns the system's force field to new molecules [source](vermouth/system.py#L58-L66)
+- **Particle Counting**: The `num_particles` property efficiently calculates total system size across all molecules [source](vermouth/system.py#L78-L82)
+- **System Copying**: Deep copying capabilities enable parallel processing workflows while preserving original data integrity [source](vermouth/system.py#L84-L93)
+
+## Processor Pipeline for Batch Operations
+
+High-throughput processing leverages the abstract `Processor` class, which defines the interface for both molecule-level and system-level transformations. The base `run_system` method implements the core batch processing pattern by iterating through all molecules in a system and applying the molecular transformation sequentially [source](vermouth/processors/processor.py#L26-L35).
+
+This design enables several key high-throughput capabilities:
+
+### Parallel Processing Architecture
+
+The processor system supports both sequential and parallel processing patterns. Each processor operates independently on individual molecules, allowing for straightforward parallelization:
+
+```python
+# Sequential processing (default)
+for molecule in system.molecules:
+    result = processor.run_molecule(molecule)
+    processed_molecules.append(result)
+```
+
+### Memory-Efficient Processing
+
+The architecture supports in-place modifications to minimize memory overhead during large-scale processing. Processors can modify molecules directly or return new instances, providing flexibility based on memory constraints and processing requirements.
+
+### Specialized High-Throughput Processors
+
+Several processors are specifically designed for high-throughput scenarios:
+
+#### MergeAllMolecules Processor
+
+The `MergeAllMolecules` processor exemplifies system-level optimization by consolidating multiple molecules into a single entity, reducing computational overhead for subsequent operations [source](vermouth/processors/merge_all_molecules.py#L22-L28). This processor:
+
+- Efficiently combines all molecules in a system into the first molecule
+- Preserves atomic interactions and connectivity during merging
+- Maintains force field consistency across the merged structure
+- Optimizes memory usage for large molecular assemblies
+
+The merging process leverages the `merge_molecule` method in the `Molecule` class, which handles complex operations such as atom index offsetting, interaction preservation, and force field validation [source](vermouth/molecule.py#L705-L730).
+
+## Performance Optimization Strategies
+
+### Graph-Based Molecular Representation
+
+Vermouth's use of NetworkX graphs for molecular representation provides inherent advantages for high-throughput processing:
+
+- **Efficient Traversal**: Graph algorithms enable rapid analysis of molecular connectivity and topology
+- **Memory Optimization**: Sparse graph representations minimize memory footprint for large molecules
+- **Algorithmic Flexibility**: Rich ecosystem of graph algorithms supports diverse analysis tasks
+
+### Batch Processing Patterns
+
+The system supports several high-throughput processing patterns:
+
+1. **Sequential Pipeline**: Processors are chained together, with each operating on the entire system
+2. **Parallel Molecule Processing**: Individual molecules are processed concurrently across multiple cores
+3. **Chunked Processing**: Large systems are divided into manageable chunks for memory-efficient processing
+
+### Resource Management
+
+High-throughput workflows benefit from several resource management features:
+
+- **Lazy Loading**: Molecular data is loaded on-demand to minimize memory usage
+- **Incremental Processing**: Systems can be processed incrementally, enabling handling of datasets larger than available memory
+- **Checkpoint/Restart**: Processing state can be saved and restored for long-running workflows
+
+## Integration with External Tools
+
+The high-throughput architecture seamlessly integrates with external computational tools:
+
+- **GROMACS Integration**: Direct support for GROMACS file formats and topology generation [source](vermouth/gmx/)
+- **Parallel File I/O**: Optimized readers and writers for PDB, GRO, and CIF formats support concurrent access
+- **Cluster Computing**: The modular processor architecture facilitates deployment on high-performance computing clusters
+
+## Scalability Considerations
+
+The system demonstrates excellent scalability characteristics:
+
+- **Linear Scaling**: Processing time scales linearly with the number of molecules for most operations
+- **Memory Efficiency**: Graph-based representation minimizes memory overhead
+- **I/O Optimization**: Batch file operations reduce disk access overhead
+
+For extremely large datasets, the system supports distributed processing patterns where multiple instances can work on different subsets of the data, with results merged at the end of processing.
+
+## Best Practices for High-Throughput Processing
+
+### Processor Design Guidelines
+
+When creating custom processors for high-throughput workflows:
+
+1. **Implement Efficient Algorithms**: Use O(n) or O(n log n) algorithms where possible
+2. **Minimize Memory Allocations**: Reuse data structures and avoid unnecessary copying
+3. **Handle Edge Cases**: Ensure robust processing of malformed or incomplete molecular data
+4. **Provide Progress Feedback**: Implement logging and progress reporting for long-running operations
+
+### Workflow Optimization
+
+Optimal high-throughput workflows typically follow this pattern:
+
+```mermaid
+flowchart LR
+    A[Input Data] --> B[Validation]
+    B --> C[Preprocessing]
+    C --> D[Core Processing]
+    D --> E[Postprocessing]
+    E --> F[Output Generation]
+    
+    D --> D1[Parallel Processors]
+    D1 --> D2[Load Balancing]
+    D2 --> D3[Error Handling]
+```
+
+## Future Directions
+
+The high-throughput processing architecture continues to evolve with ongoing developments in:
+
+- **GPU Acceleration**: Integration with GPU-accelerated molecular processing libraries
+- **Cloud-Native Processing**: Support for containerized deployment and cloud-based scaling
+- **Machine Learning Integration**: Automated parameter optimization and intelligent processing pipelines
+
+This robust foundation ensures that vermouth-martinize can handle the increasing computational demands of modern molecular simulation workflows while maintaining flexibility and extensibility for future requirements.
+
+For deeper understanding of the processing pipeline, refer to [Processor Pipeline System](6-processor-pipeline-system) and for molecular data structures, see [Molecule Class and Graph Operations](8-molecule-class-and-graph-operations).
+
+# System Class and Multi-Molecule Management
+
+
+
+The System class serves as the central container for managing collections of molecules within the Vermouth molecular simulation framework. It provides a unified interface for handling multi-molecule systems, ensuring force field consistency, and coordinating molecular operations across complex biomolecular simulations.
+
+## System Architecture Overview
+
+The System class implements a hierarchical management structure where individual molecules are organized and controlled through a centralized interface. This design enables efficient handling of large-scale molecular systems while maintaining strict force field compatibility and metadata management.
+
+```mermaid
+classDiagram
+    class System {
+        -molecules: list[Molecule]
+        -_force_field: ForceField
+        -gmx_topology_params: defaultdict
+        -go_params: defaultdict
+        -meta: defaultdict
+        +add_molecule(molecule)
+        +num_particles: int
+        +copy(): System
+        +force_field: ForceField
+    }
+    
+    class Molecule {
+        +nodes: dict
+        +interactions: dict
+        +force_field: ForceField
+        +merge_molecule(other)
+        +copy(): Molecule
+    }
+    
+    class Processor {
+        +run_system(system)
+        +run_molecule(molecule)
+    }
+    
+    System "1" *-- "*" Molecule : contains
+    Processor --> System : operates on
+```
+
+> [!TIP]
+> The System class maintains strict force field consistency across all contained molecules, preventing incompatible force field mixing through validation during molecule addition.
+
+## Core System Components
+
+### Molecule Container Management
+
+The System class maintains a list of Molecule objects as its primary data structure, with each molecule representing an independent molecular entity within the larger system. The container supports dynamic addition of molecules through the `add_molecule` method, which includes comprehensive validation to ensure force field compatibility [system.py#L58-L66](vermouth/system.py#L58-L66).
+
+The molecule addition process follows a sophisticated validation workflow:
+1. **Force Field Inheritance**: New molecules automatically inherit the system's force field if they lack one
+2. **System Force Field Update**: The system updates its force field when adding the first molecule with a defined force field
+3. **Compatibility Validation**: Strict checking prevents mixing molecules with different force fields
+
+```python
+def add_molecule(self, molecule):
+    if molecule.force_field is None:
+        molecule._force_field = self.force_field
+    if self.force_field is None:
+        self.force_field = molecule.force_field
+    if molecule.force_field != self.force_field:
+        raise KeyError(f'Cannot add Molecule with force field '
+                       f'{molecule.force_field} to system with force field '
+                       f'{self.force_field}')
+    self.molecules.append(molecule)
+```
+
+### Force Field Management
+
+Force field handling in the System class demonstrates a sophisticated inheritance and validation mechanism. The `force_field` property acts as both a getter and setter, ensuring consistency across all contained molecules [system.py#L38-L54](vermouth/system.py#L38-L54). When the system's force field is modified, all molecules are automatically updated to maintain consistency.
+
+### Metadata and Parameter Storage
+
+Beyond molecules and force fields, the System class provides specialized containers for various simulation parameters:
+- **gmx_topology_params**: GROMACS topology-specific parameters
+- **go_params**: Go-model parameters for structure biasing
+- **meta**: General-purpose metadata storage
+
+These containers use `defaultdict(list)` structures, enabling flexible parameter accumulation during processing pipelines.
+
+## Multi-Molecule Operations
+
+### System-Level Processing
+
+The System class integrates seamlessly with Vermouth's processor architecture, enabling system-wide transformations. Processors like `MergeAllMolecules` and `MergeChains` demonstrate the system's capability to manipulate entire molecular collections [merge_all_molecules.py#L29-L33](vermouth/processors/merge_all_molecules.py#L29-L33).
+
+The `MergeAllMolecules` processor exemplifies system-level operations by consolidating all molecules into a single entity:
+
+```python
+def run_system(self, system):
+    if not system.molecules:
+        return system
+    
+    molecule = system.molecules[0]
+    for other in system.molecules[1:]:
+        molecule.merge_molecule(other)
+    
+    system.molecules = [molecule]
+    return system
+```
+
+### Molecule Merging Strategies
+
+The system supports multiple merging strategies through specialized processors:
+- **Complete Merging**: `MergeAllMolecules` consolidates all molecules into one
+- **Chain-Based Merging**: `MergeChains` merges molecules based on chain identifiers
+
+These operations leverage the underlying `Molecule.merge_molecule` method, which handles the complex graph-based merging of molecular structures [molecule.py#L705-L783](vermouth/molecule.py#L705-L783).
+
+## System Properties and Utilities
+
+### Particle Counting
+
+The `num_particles` property provides efficient calculation of the total particle count across all molecules in the system [system.py#L77-L82](vermouth/system.py#L77-L82):
+
+```python
+@property
+def num_particles(self):
+    return sum(len(mol) for mol in self.molecules)
+```
+
+### System Cloning
+
+The `copy` method creates deep copies of the entire system, including all contained molecules while preserving force field associations [system.py#L84-L93](vermouth/system.py#L84-L93). This capability is essential for creating simulation snapshots and performing comparative analyses.
+
+## Error Handling and Validation
+
+The System class implements robust error handling, particularly for force field compatibility. The test suite demonstrates comprehensive validation scenarios:
+
+1. **Force Field Mismatch Detection**: Prevents adding molecules with incompatible force fields [test_system.py#L25-L42](vermouth/tests/test_system.py#L25-L42)
+2. **Automatic Force Field Assignment**: Handles systems that initially lack force fields [test_system.py#L43-L59](vermouth/tests/test_system.py#L43-L59)
+
+> [!TIP]
+> Force field validation occurs during molecule addition, ensuring early detection of incompatibilities before expensive processing operations begin.
+
+## Integration with Processing Pipeline
+
+The System class serves as the primary data structure for processor pipelines, enabling complex molecular transformations. Processors can operate at the system level, modifying multiple molecules simultaneously while maintaining consistency across the entire molecular ensemble.
+
+This integration allows for sophisticated workflows such as:
+- Multi-chain protein processing
+- Solvent system preparation
+- Coarse-graining transformations
+- Topology generation for mixed molecular systems
+
+The System class thus provides the foundational architecture for managing complex molecular simulations while ensuring data integrity and processing efficiency.
+
+For more detailed information about specific molecular operations, see [Molecule Class and Graph Operations](8-molecule-class-and-graph-operations). To understand how systems integrate with simulation workflows, refer to [Topology Generation Workflow](22-topology-generation-workflow).
+
+# GROMACS Integration
+
+
+
+Vermouth provides comprehensive GROMACS integration through dedicated modules for handling GROMACS file formats and topology generation. The integration enables seamless conversion between molecular representations and GROMACS-compatible files, supporting the complete workflow from structure input to simulation-ready topologies.
+
+## GROMACS File Format Support
+
+The `vermouth.gmx` module contains specialized handlers for all major GROMACS file formats, ensuring compatibility with the GROMACS simulation ecosystem.
+
+### GRO File Handling
+
+GRO (GROningen) files are handled through the `gro.py` module, providing both reading and writing capabilities:
+
+- **Reading**: The `read_gro()` function parses GRO files to create Molecule objects, supporting residue exclusion and hydrogen filtering options [source](vermouth/gmx/gro.py#L29-L46)
+- **Writing**: The `write_gro()` function exports System objects to GRO format with configurable precision and box parameters [source](vermouth/gmx/gro.py#L118-L136)
+
+The GRO processor integration allows direct pipeline usage through the `GROInput` processor class [source](vermouth/processors/gro_reader.py#L28-L39).
+
+### ITP File Processing
+
+ITP (Include Topology) files are central to GROMACS force field definitions:
+
+- **Writing**: The `write_molecule_itp()` function generates complete ITP files including atoms, bonds, angles, dihedrals, and other interaction parameters [source](vermouth/gmx/itp.py#L77-L100)
+- **Reading**: The `read_itp()` function parses ITP files using the sophisticated `ITPDirector` class that handles all GROMACS topology sections [source](vermouth/gmx/itp_read.py#L473-L485)
+
+The ITP reader supports all standard GROMACS sections including moleculetype, atoms, bonds, angles, dihedrals, constraints, and various virtual site types [source](vermouth/gmx/itp_read.py#L260-L286).
+
+### RTP File Support
+
+RTP (Residue Topology Parameter) files are processed through the `rtp.py` module, which handles the complex hierarchical structure of RTP files:
+
+- **Section Iterators**: Three-tier iterator system (`_IterRTPSections`, `_IterRTPSubsections`, `_IterRTPSubsectionLines`) provides structured access to RTP content [source](vermouth/gmx/rtp.py#L126-L169)
+- **Block Processing**: The `read_rtp()` function parses blocks and links from RTP files to populate force field definitions [source](vermouth/gmx/rtp.py#L432-L450)
+
+## Topology Generation System
+
+The topology generation system creates complete GROMACS topology files from Vermouth System objects.
+
+### Topology File Structure
+
+The `write_gmx_topology()` function generates hierarchical topology files:
+
+```mermaid
+flowchart TD
+    A[System Object] --> B[write_gmx_topology]
+    B --> C[Main .top File]
+    B --> D[atomtypes.itp]
+    B --> E[nonbond_params.itp]
+    B --> F[Molecule .itp Files]
+    C --> G[#include Statements]
+    D --> H[Atom Type Definitions]
+    E --> I[Non-bonded Parameters]
+    F --> J[Molecule Topologies]
+```
+
+The function creates a main topology file with included parameter files, separating different directive types into dedicated ITP files for better organization [source](vermouth/gmx/topology.py#L116-L140).
+
+### Parameter Management
+
+Two key functions handle topology parameters:
+
+- **Atom Types**: `write_atomtypes()` generates [atomtypes] sections with mass, sigma, epsilon, and metadata [source](vermouth/gmx/topology.py#L40-L46)
+- **Non-bonded Parameters**: `write_nonbond_params()` creates [nonbond_params] sections for pair interactions [source](vermouth/gmx/topology.py#L78-L84)
+
+Both functions support C6/C12 parameter conversion through the `sigma_epsilon_to_C6_C12()` utility [source](vermouth/gmx/topology.py#L31-L36).
+
+## GROMACS Preprocessor Variables
+
+Vermouth supports GROMACS preprocessing variables for topology customization, enabling simulation-specific modifications without altering force field files.
+
+### Supported Variables
+
+| Variable | Purpose | Usage in .mdp file |
+|----------|---------|-------------------|
+| `FLEXIBLE` | Switches bonds between harmonic and constraints | `define = -DFLEXIBLE` |
+| `POSRES` | Activates position restraints | `define = -DPOSRES` |
+| `POSRES_FC` | Controls position restraint force constant | `define = -DPOSRES -DPOSRES_FC=500` |
+
+These variables integrate with GROMACS preprocessing system, allowing conditional topology sections based on simulation parameters [source](doc/source/gromacs_variables.rst#L4-L44).
+
+## Integration Architecture
+
+The GROMACS integration follows Vermouth's modular architecture:
+
+```mermaid
+graph TB
+    subgraph "Input Layer"
+        A[GRO Reader] --> B[System Object]
+        C[ITP Reader] --> D[Force Field]
+        E[RTP Reader] --> D
+    end
+    
+    subgraph "Processing Layer"
+        B --> F[Processors]
+        D --> F
+        F --> G[Modified System]
+    end
+    
+    subgraph "Output Layer"
+        G --> H[ITP Writer]
+        G --> I[GRO Writer]
+        G --> J[Topology Writer]
+        H --> K[Molecule .itp Files]
+        I --> L[Coordinate .gro Files]
+        J --> M[System .top + .itp Files]
+    end
+```
+
+This architecture enables flexible workflows where different input formats can be processed through the same pipeline and output in various GROMACS-compatible formats.
+
+## Usage Patterns
+
+### Typical Workflow
+
+1. **Input**: Read structures using GRO or PDB readers
+2. **Processing**: Apply molecular transformations through processors
+3. **Output**: Generate complete GROMACS topology files
+
+The integration supports both programmatic usage through direct function calls and pipeline-based processing through the processor system.
+
+### Processor Integration
+
+GROMACS file operations are integrated into the processor pipeline through dedicated processors:
+
+- `GROInput`: Reads GRO files into the pipeline [source](vermouth/processors/gro_reader.py#L28-L39)
+- File writers can be integrated as output processors for automated file generation
+
+This integration allows seamless incorporation of GROMACS operations into complex molecular processing workflows.
+
+## Next Steps
+
+For complete workflow understanding, see:
+- [Topology Generation Workflow](22-topology-generation-workflow) for detailed topology creation processes
+- [Force Field System and Data Management](10-force-field-system-and-data-management) for force field integration details
+- [Processor Pipeline System](6-processor-pipeline-system) for processing architecture information
+
+# Topology Generation Workflow
+
+
+
+The topology generation workflow in vermouth represents the culmination of molecular processing, transforming processed molecular graphs into GROMACS-compatible topology files. This workflow bridges the gap between the internal graph-based molecular representation and the simulation-ready format required by GROMACS.
+
+## System-Level Topology Architecture
+
+The topology generation process operates at the system level through the `System` class, which manages collections of molecules and their associated force field parameters [source](vermouth/system.py#L21-L30). The system serves as the central container that orchestrates the final output generation, maintaining references to all molecules and their collective topology parameters.
+
+The workflow follows a hierarchical organization where the system contains multiple molecules, each potentially representing different molecular types (proteins, lipids, solvents). This structure enables efficient management of complex biomolecular systems with heterogeneous components.
+
+## GROMACS Topology File Generation
+
+The core topology generation is handled by the `write_gmx_topology` function in `vermouth/gmx/topology.py` [source](vermouth/gmx/topology.py#L116-L122). This function implements a sophisticated multi-file output strategy that separates different topology components into specialized files:
+
+```mermaid
+flowchart TD
+    A[System Input] --> B{Check Molecules}
+    B -->|Empty| C[Error: No molecules]
+    B -->|Valid| D[Write atomtypes.itp]
+    D --> E[Write nonbond_params.itp]
+    E --> F[Process Molecule Groups]
+    F --> G[Write molecule ITP files]
+    G --> H[Generate main .top file]
+    H --> I[Include statements]
+    I --> J[ molecules section]
+    J --> K[Final topology]
+```
+
+The function generates a main `.top` file that includes multiple `.itp` files for different molecular types and parameters. This modular approach enhances maintainability and follows GROMACS best practices for topology organization.
+
+### Molecule Group Processing
+
+The topology generator employs intelligent molecule grouping based on molecule types (`moltype`) [source](vermouth/gmx/topology.py#L160-L200). Using `itertools.groupby`, it processes consecutive molecules with the same type, which is crucial for maintaining the correct order in the final `[ molecules ]` section. This approach preserves the original molecular arrangement while optimizing file generation.
+
+Each unique molecule type triggers the creation of a dedicated `.itp` file containing all the molecular parameters, interactions, and metadata. The system tracks which molecule types have been processed to avoid duplicate file generation.
+
+## ITP File Generation and Molecular Parameters
+
+Individual molecule topology files (`.itp`) are generated using the `write_molecule_itp` function [source](vermouth/gmx/itp.py#L77-L150). This function handles the detailed formatting of molecular information into GROMACS ITP format, including:
+
+- **Atom definitions**: Each atom must have attributes for atom type, residue ID, residue name, atom name, and charge group
+- **Molecule metadata**: Including exclusion lists (`nrexcl`) and molecule type information
+- **Section formatting**: Proper alignment and formatting of all topology sections
+
+The function performs comprehensive validation to ensure all required molecular information is present before writing the topology file. This validation prevents generation of incomplete or invalid topology files.
+
+## Parameter Management and Force Field Integration
+
+The topology generation process integrates closely with the force field system through `system.gmx_topology_params` [source](vermouth/gmx/topology.py#L40-L84). This parameter storage contains:
+
+- **Atom types**: Definitions of all atom types used in the system
+- **Non-bonded parameters**: Lennard-Jones and other non-bonded interaction parameters
+- **Conversion utilities**: Functions to transform between different parameter representations (σ-ε to C6-C12)
+
+The system supports both σ-ε and C6-C12 parameter formats, with automatic conversion handled by the `sigma_epsilon_to_C6_C12` function [source](vermouth/gmx/topology.py#L31-L36).
+
+## File Writing Strategy and Error Handling
+
+Vermouth employs a sophisticated deferred file writing mechanism through the `DeferredFileWriter` class [source](vermouth/file_writer.py#L52-L153). This singleton class provides atomic file operations that prevent corruption of existing files:
+
+1. **Temporary file creation**: All writes go to temporary files first
+2. **Validation period**: Files remain temporary until explicit finalization
+3. **Atomic move operations**: Temporary files are moved to final destinations only after successful completion
+4. **Backup management**: Existing files are backed up following GROMACS conventions
+
+This approach ensures that topology generation failures don't leave partially written or corrupted files, which is critical for reproducible simulations.
+
+## Citation Management and Documentation
+
+The topology generation workflow automatically includes relevant citations in generated files [source](vermouth/gmx/topology.py#L185-L195). Each molecule's force field citations are collected and formatted according to the force field's citation mapping. This automatic citation inclusion ensures proper attribution of force field parameters and methodologies.
+
+The system maintains a hierarchical citation structure where common citations are combined with molecule-specific references, creating comprehensive documentation within the generated topology files.
+
+## Integration with Processing Pipeline
+
+The topology generation represents the final stage of the martinize2 processing pipeline [source](doc/source/martinize2_workflow.rst#L286-L296). After all molecular transformations, mappings, and post-processing steps are complete, the topology generation converts the processed molecular graphs into simulation-ready files.
+
+This integration ensures that all modifications, elastic networks, and other processing results are properly reflected in the final topology files. The workflow maintains consistency between the internal graph representation and the external file format throughout the process.
+
+## Advanced Features and Extensions
+
+The topology generation system supports several advanced features:
+
+- **Conditional parameter inclusion**: Based on system defines and molecular properties
+- **Custom section formatting**: Through pre-section and post-section line specifications
+- **Multi-molecule systems**: Efficient handling of heterogeneous molecular assemblies
+- **GROMACS character limits**: Automatic handling of GROMACS parsing limitations
+
+These features enable the generation of complex topologies for sophisticated biomolecular simulations while maintaining compatibility with GROMACS requirements.
+
+---
+
+The topology generation workflow represents a critical bridge between vermouth's internal molecular representation and GROMACS simulation requirements. Through careful design of the file writing strategy, parameter management, and integration with the processing pipeline, it ensures reliable and reproducible topology generation for complex biomolecular systems.
+
+For deeper understanding of the processing pipeline that feeds into topology generation, refer to [Processor Pipeline System](6-processor-pipeline-system) and [Molecule Class and Graph Operations](8-molecule-class-and-graph-operations).

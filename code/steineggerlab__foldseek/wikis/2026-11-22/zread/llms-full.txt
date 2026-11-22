@@ -1,0 +1,2801 @@
+# Overview
+
+
+
+Foldseek is a revolutionary software tool that enables fast and sensitive comparisons of large protein structure sets. It represents a significant leap forward in structural bioinformatics, offering capabilities for both monomer and multimer searches, as well as clustering, all while running efficiently on CPU with optional GPU acceleration for even faster performance.
+
+## What is Foldseek?
+
+At its core, Foldseek addresses a fundamental challenge in structural biology: comparing protein structures at scale. Traditional structural alignment tools like TMalign or Dali are highly accurate but computationally expensive, making them impractical for large-scale analyses. Foldseek bridges this gap by achieving sensitivities similar to state-of-the-art structural aligners while being at least **20,000 times faster**.
+
+This incredible speed is made possible through Foldseek's innovative approach to structural comparison. Instead of directly comparing 3D coordinates, Foldseek converts protein structures into a simplified representation using **3D interactions (3Di)** and amino acid sequences. This structural alphabet approach allows for rapid prefiltering and alignment, dramatically reducing computational requirements while maintaining remarkable sensitivity.
+
+Sources: [src/foldseek.cpp#L7](src/foldseek.cpp#L7), [README.md#L3](README.md#L3)
+
+## Key Features and Capabilities
+
+Foldseek offers a comprehensive suite of tools for protein structure analysis:
+
+### Fast Structure Search
+The `easy-search` module allows you to query protein structures against a target database in seconds, not hours. It supports various input formats including PDB, mmCIF (both flat and gzipped), and even protein sequences in FASTA format through ProstT5 integration.
+
+```bash
+# Basic structure search
+foldseek easy-search example/d1asha_ example/ aln tmpFolder
+```
+
+### Structure Clustering
+With `easy-cluster`, Foldseek can group similar protein structures together, enabling the organization of large structural datasets and identification of structural families.
+
+```bash
+# Structure clustering with 90% coverage threshold
+foldseek easy-cluster example/ res tmp -c 0.9
+```
+
+### Multimer Analysis
+Foldseek extends its capabilities to protein complexes through `easy-multimersearch` and `easy-multimercluster`, allowing for comparison and clustering of multi-chain structures.
+
+```bash
+# Multimer search
+foldseek easy-multimersearch example/1tim.pdb.gz example/8tim.pdb.gz result tmpFolder
+```
+
+### Sequence-to-Structure Search
+Through integration with ProstT5, Foldseek can perform structure searches directly from protein sequences, eliminating the need for structure prediction and offering a **400-4000x speedup** compared to traditional structure prediction followed by alignment.
+
+```bash
+# Search sequences against structure databases
+foldseek easy-search QUERY.fasta pdb res.m8 tmp --prostt5-model weights
+```
+
+### GPU Acceleration
+For users with NVIDIA GPUs, Foldseek offers GPU acceleration that can make searches up to **4 times faster** than on a 64-core CPU.
+
+```bash
+# GPU-accelerated search
+foldseek easy-search example/d1asha_ example/ aln tmp --gpu 1
+```
+
+Sources: [README.md#L111-L298](README.md#L111-L298), [LocalCommandDeclarations.h#L10-L30](src/LocalCommandDeclarations.h#L10-L30)
+
+## How Foldseek Works
+
+Foldseek's performance stems from its innovative approach to structural comparison:
+
+```mermaid
+flowchart TD
+    A[Input Protein Structure] --> B[Extract 3Di Features]
+    B --> C[Create Structural Alphabet]
+    C --> D[Prefiltering]
+    D --> E[Structural Alignment]
+    E --> F[Scoring & Ranking]
+    F --> G[Output Results]
+```
+
+The process begins by converting protein structures into a simplified representation using 3D interactions (3Di). This structural alphabet captures the essential geometric features of the protein fold while discarding less critical details. Foldseek then performs rapid prefiltering to identify potentially similar structures, followed by more detailed structural alignment of promising candidates.
+
+This hierarchical approach allows Foldseek to achieve remarkable speed without sacrificing sensitivity. The software builds upon the MMseqs2 framework, a powerful sequence search toolkit, adapting its efficient algorithms for structural data.
+
+Sources: [lib/3di/](lib/3di/), [lib/mmseqs/](lib/mmseqs/), [data/easystructuresearch.sh](data/easystructuresearch.sh)
+
+## Technical Foundation
+
+Foldseek is built on a robust technical foundation that combines several powerful libraries and algorithms:
+
+- **MMseqs2**: Provides the core search and clustering algorithms adapted for structural data
+- **3Di Library**: Converts 3D structures into structural alphabets for efficient comparison
+- **TMalign**: Enables high-quality structural alignments and scoring
+- **ProstT5**: Allows for sequence-to-structure translation using protein language models
+- **Block-aligner**: Accelerates alignment computations
+- **Foldcomp**: Compresses structural data for efficient storage and processing
+
+This modular architecture allows Foldseek to leverage the strengths of each component while maintaining high performance and flexibility.
+
+Sources: [lib/](lib/)
+
+## Getting Started with Foldseek
+
+Foldseek is designed to be accessible to users with varying levels of computational expertise. The software provides precompiled binaries for Linux (AVX2, ARM64, and GPU-enabled) and macOS, as well as conda packages for easy installation.
+
+```bash
+# Linux AVX2 installation
+wget https://mmseqs.com/foldseek/foldseek-linux-avx2.tar.gz
+tar xvzf foldseek-linux-avx2.tar.gz
+export PATH=$(pwd)/foldseek/bin/:$PATH
+```
+
+Once installed, you can immediately start using Foldseek's "easy" commands for common tasks like searching and clustering, with more advanced options available for specialized analyses.
+
+For those who prefer a web interface, Foldseek also provides a webserver at [search.foldseek.com](https://search.foldseek.com) that allows you to search against the AlphaFoldDB and PDB databases directly in your browser.
+
+Sources: [README.md#L69-L85](README.md#L69-L85), [README.md#L66-L67](README.md#L66-L67)
+
+## Why Foldseek Matters
+
+Foldseek addresses critical needs in the era of structural genomics:
+
+1. **Scale**: With the exponential growth of protein structure databases (exemplified by AlphaFold's predictions of over 200 million protein structures), traditional structural alignment tools have become impractical for large-scale analyses.
+
+2. **Accessibility**: By dramatically reducing computational requirements, Foldseek makes structural bioinformatics accessible to researchers without access to high-performance computing resources.
+
+3. **Integration**: The ability to work directly with protein sequences through ProstT5 bridges the gap between sequence and structure analysis, enabling new workflows and discoveries.
+
+4. **Multimer Analysis**: As our understanding of protein function increasingly focuses on complexes and interactions, Foldseek's multimer capabilities provide essential tools for studying these higher-order structures.
+
+> [!TIP]
+> Whether you're a structural biologist exploring protein families, a bioinformatician analyzing large datasets, or a researcher interested in protein function and evolution, Foldseek provides the tools you need to efficiently navigate the expanding universe of protein structures.
+
+## What's Next?
+
+This overview has introduced you to Foldseek's core concepts and capabilities. To get hands-on experience with the tool, check out our [Quick Start](2-quick-start) guide, which will walk you through your first structure search in just a few minutes.
+
+For more specific use cases, our tutorials cover [Structure Search Basics](4-structure-search-basics) and [Working with Structure Databases](5-working-with-structure-databases). If you're interested in the technical details, our [Architecture and Implementation](10-architecture-and-implementation) article provides a deeper dive into how Foldseek works under the hood.
+
+
+# Quick Start
+
+
+
+Foldseek enables fast and sensitive comparisons of protein structures, making it an essential tool for structural biologists and bioinformaticians. This guide will help you get started with Foldseek in just a few minutes, from installation to running your first protein structure search.
+
+## Installation
+
+First, you need to install Foldseek. The installation process is straightforward and depends on your system:
+
+```bash
+# Linux AVX2 build (check using: cat /proc/cpuinfo | grep avx2)
+wget https://mmseqs.com/foldseek/foldseek-linux-avx2.tar.gz; tar xvzf foldseek-linux-avx2.tar.gz; export PATH=$(pwd)/foldseek/bin/:$PATH
+
+# Linux ARM64 build
+wget https://mmseqs.com/foldseek/foldseek-linux-arm64.tar.gz; tar xvzf foldseek-linux-arm64.tar.gz; export PATH=$(pwd)/foldseek/bin/:$PATH
+
+# MacOS
+wget https://mmseqs.com/foldseek/foldseek-osx-universal.tar.gz; tar xvzf foldseek-osx-universal.tar.gz; export PATH=$(pwd)/foldseek/bin/:$PATH
+
+# Conda installer (Linux and macOS)
+conda install -c conda-forge -c bioconda foldseek
+```
+
+After installation, verify that Foldseek is working by running:
+
+```bash
+foldseek version
+```
+
+Sources: [README.md#L69-L85](README.md#L69-L85)
+
+## Your First Structure Search
+
+Now let's run your first protein structure search. We'll use the example files included in the Foldseek repository. The `easy-search` module allows you to query one or more protein structures against a target database or folder containing structures.
+
+```bash
+# Search with a single structure against a folder of structures
+foldseek easy-search example/d1asha_ example/ aln tmpFolder
+```
+
+This command searches the protein structure in `example/d1asha_` against all structures in the `example/` directory and saves the results in the `aln` file. The `tmpFolder` is used for temporary files during the search.
+
+> [!TIP]
+> The example files use PDB/mmCIF format, but Foldseek also supports gzipped files. You can use your own protein structure files in PDB, mmCIF, or mmJSON formats.
+
+Sources: [README.md#L111-L114](README.md#L111-L114), [data/easystructuresearch.sh](data/easystructuresearch.sh)
+
+## Understanding the Results
+
+The default output is a tab-separated file with the following fields: `query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits`. Let's examine what each field represents:
+
+| Field | Description |
+|-------|-------------|
+| query | Query structure identifier |
+| target | Target structure identifier |
+| fident | Fraction of identical residues in the alignment |
+| alnlen | Alignment length |
+| mismatch | Number of mismatches in the alignment |
+| gapopen | Number of gap openings in the alignment |
+| qstart/qend | Start/end position of the alignment in the query |
+| tstart/tend | Start/end position of the alignment in the target |
+| evalue | Expectation value (lower is better) |
+| bits | Bit score (higher is better) |
+
+To view your results:
+
+```bash
+cat aln
+```
+
+You'll see something like:
+
+```
+d1asha_  d1x9fc_  0.318   117     78      1       1       117     1       117     0.00013 57.3
+d1asha_  d1x9fd_  0.316   117     78      1       1       117     1       117     0.00014 57.1
+```
+
+This shows that `d1asha_` has significant structural similarity to `d1x9fc_` and `d1x9fd_` with low E-values, indicating these structures are likely evolutionarily related.
+
+Sources: [README.md#L117-L119](README.md#L117-L119), [README.md#L121-L135](README.md#L121-L135)
+
+## Visualizing Results
+
+Foldseek can generate interactive HTML visualizations similar to the webserver:
+
+```bash
+foldseek easy-search example/d1asha_ example/ result.html tmp --format-mode 3
+```
+
+Open `result.html` in your web browser to see an interactive visualization of the search results, including structural alignments and similarity scores.
+
+> [!TIP]
+> The HTML visualization is particularly useful for understanding the structural relationships between proteins and identifying key structural features.
+
+Sources: [README.md#L143-L147](README.md#L143-L147)
+
+## Working with Pre-built Databases
+
+Foldseek provides access to pre-built databases like PDB and AlphaFold DB. Here's how to download and search against these databases:
+
+```bash
+# Download the PDB database
+foldseek databases PDB pdb tmp
+
+# Search your structure against the PDB
+foldseek easy-search example/d1asha_ pdb result_pdb tmp
+```
+
+This allows you to search your protein structure against the entire Protein Data Bank, which contains experimentally determined protein structures.
+
+Sources: [README.md#L174-L181](README.md#L174-L181)
+
+## Next Steps
+
+Congratulations! You've successfully run your first protein structure search with Foldseek. Here are some suggested next steps:
+
+1. **Adjust search sensitivity**: Use the `-s` parameter to adjust the sensitivity-speed trade-off (lower is faster, higher is more sensitive):
+   ```bash
+   foldseek easy-search example/d1asha_ example/ aln tmp -s 7.5  # Faster search
+   foldseek easy-search example/d1asha_ example/ aln tmp -s 9.5  # More sensitive search
+   ```
+
+2. **Try structure clustering**: Group similar structures together using the easy-cluster module:
+   ```bash
+   foldseek easy-cluster example/ cluster_result tmp -c 0.9
+   ```
+
+3. **Explore multimer searches**: If you work with protein complexes, try the multimer search functionality:
+   ```bash
+   foldseek easy-multimersearch example/1tim.pdb.gz example/8tim.pdb.gz multimer_result tmp
+   ```
+
+For more detailed tutorials and advanced usage, check out the other documentation in this wiki.
+
+
+# Installation Options
+
+
+
+Foldseek offers multiple installation methods to suit different use cases, platforms, and user preferences. Whether you're a bioinformatician looking for quick access to protein structure comparison tools or a developer wanting to integrate Foldseek into your workflow, there's an installation option that fits your needs. Let's explore the various ways to get Foldseek up and running on your system.
+
+## Precompiled Binaries (Recommended for Most Users)
+
+For users who want to get started quickly, precompiled binaries are the simplest and most straightforward installation method. These are optimized for different CPU architectures and include GPU support for accelerated performance.
+
+### Linux Installation
+
+Linux users have three precompiled binary options depending on their system architecture and GPU capabilities:
+
+**Linux AVX2 Build** (for modern Intel/AMD processors):
+```bash
+# Check if your CPU supports AVX2
+cat /proc/cpuinfo | grep avx2
+
+# Download and install
+wget https://mmseqs.com/foldseek/foldseek-linux-avx2.tar.gz
+tar xvzf foldseek-linux-avx2.tar.gz
+export PATH=$(pwd)/foldseek/bin/:$PATH
+```
+
+**Linux ARM64 Build** (for ARM-based systems like Raspberry Pi or ARM servers):
+```bash
+wget https://mmseqs.com/foldseek/foldseek-linux-arm64.tar.gz
+tar xvzf foldseek-linux-arm64.tar.gz
+export PATH=$(pwd)/foldseek/bin/:$PATH
+```
+
+**Linux GPU Build** (for NVIDIA GPU acceleration):
+```bash
+# Requires glibc >= 2.17 and nvidia driver >=525.60.13
+wget https://mmseqs.com/foldseek/foldseek-linux-gpu.tar.gz
+tar xvfz foldseek-linux-gpu.tar.gz
+export PATH=$(pwd)/foldseek/bin/:$PATH
+```
+Sources: [README.md#L71-L78](README.md#L71-L78)
+
+> [!TIP]
+> The GPU build requires an NVIDIA GPU of the Ampere generation or newer for full speed, but also works at reduced speed for Turing-generation GPUs. Make sure you have the appropriate NVIDIA drivers installed before using the GPU version.
+
+### macOS Installation
+
+For macOS users, there's a universal binary that works on both Intel (x86_64) and Apple Silicon (ARM64) Macs:
+
+```bash
+wget https://mmseqs.com/foldseek/foldseek-osx-universal.tar.gz
+tar xvzf foldseek-osx-universal.tar.gz
+export PATH=$(pwd)/foldseek/bin/:$PATH
+```
+Sources: [README.md#L80-L81](README.md#L80-L81)
+
+### Verifying Your Installation
+
+After installing Foldseek, you can verify it's working correctly by running:
+
+```bash
+foldseek version
+```
+
+This should display the version information and confirm that the binary is properly installed and accessible in your PATH.
+
+## Conda Installation (Package Manager)
+
+For users who prefer package managers or need to manage dependencies in a conda environment, Foldseek is available through BioConda:
+
+```bash
+conda install -c conda-forge -c bioconda foldseek
+```
+
+This method works on both Linux and macOS and automatically handles dependencies. It's particularly useful if you're building a bioinformatics pipeline with multiple tools.
+Sources: [README.md#L83-L84](README.md#L83-L84)
+
+> [!TIP]
+> The conda package may not always have the latest version immediately after release. If you need the newest features or bug fixes, consider using the precompiled binaries or building from source.
+
+## Docker Containers (Reproducible Environments)
+
+Docker containers provide a reproducible environment that works consistently across different systems. Foldseek offers both CPU and GPU-enabled Docker images.
+
+### CPU-based Docker Image
+
+```bash
+docker pull steineggerlab/foldseek
+docker run -it steineggerlab/foldseek foldseek version
+```
+
+### GPU-enabled Docker Image
+
+For GPU acceleration, use the GPU-enabled Docker image:
+
+```bash
+docker pull steineggerlab/foldseek:gpu
+docker run --gpus all -it steineggerlab/foldseek:gpu foldseek version
+```
+Sources: [Dockerfile](Dockerfile)
+
+### Using Docker with Local Files
+
+To use Foldseek with your local files, mount them as volumes:
+
+```bash
+docker run --rm -v $(pwd)/data:/data -v $(pwd)/results:/results steineggerlab/foldseek \
+  foldseek easy-search /data/query.pdb /data/target.pdb /results/alignment.m8 /tmp
+```
+
+For GPU-enabled containers:
+
+```bash
+docker run --rm --gpus all -v $(pwd)/data:/data -v $(pwd)/results:/results steineggerlab/foldseek:gpu \
+  foldseek easy-search /data/query.pdb /data/target.pdb /results/alignment.m8 /tmp --gpu 1
+```
+
+The Docker images are built with multi-architecture support, so they work on both x86_64 and ARM64 systems. The GPU version includes CUDA support for NVIDIA GPUs.
+Sources: [Dockerfile#L1-L84](Dockerfile#L1-L84)
+
+## Building from Source (Advanced Users)
+
+For developers or users who need to customize Foldseek or want to run it on unsupported platforms, building from source is the most flexible option.
+
+### System Requirements
+
+Before building from source, ensure you have the following dependencies installed:
+
+**For Linux:**
+- CMake (version 3.15 or higher)
+- GCC or Clang compiler
+- Git
+- Rust (version 1.68.0 or higher)
+- zlib1g-dev, libbz2-dev
+- Optional: CUDA toolkit (for GPU support)
+
+**For macOS:**
+- Xcode Command Line Tools
+- CMake (version 3.15 or higher)
+- Rust (version 1.68.0 or higher)
+
+### Linux Build Instructions
+
+1. **Clone the repository:**
+```bash
+git clone https://github.com/steineggerlab/foldseek.git
+cd foldseek
+```
+
+2. **Create a build directory:**
+```bash
+mkdir build && cd build
+```
+
+3. **Configure with CMake:**
+```bash
+# For standard AVX2 build
+cmake -DHAVE_AVX2=1 -DHAVE_TESTS=0 -DCMAKE_BUILD_TYPE=Release ..
+
+# For GPU build (requires CUDA)
+cmake -DHAVE_AVX2=1 -DHAVE_TESTS=0 -DENABLE_CUDA=1 -DCMAKE_BUILD_TYPE=Release ..
+
+# For SSE4.1 build (for older CPUs)
+cmake -DHAVE_SSE4_1=1 -DHAVE_TESTS=0 -DCMAKE_BUILD_TYPE=Release ..
+```
+
+4. **Build Foldseek:**
+```bash
+make -j$(nproc)
+```
+
+5. **Install (optional):**
+```bash
+sudo make install
+```
+Sources: [CMakeLists.txt#L1-L147](CMakeLists.txt#L1-L147)
+
+### macOS Build Instructions
+
+For macOS, the project provides a dedicated build script that handles the complexity of building universal binaries:
+
+```bash
+# Clone the repository
+git clone https://github.com/steineggerlab/foldseek.git
+cd foldseek
+
+# Run the build script
+./util/build_osx.sh . build
+
+# The binary will be in build/foldseek
+```
+
+This script builds both x86_64 and ARM64 versions and combines them into a universal binary using the `lipo` tool. It also handles building OpenMP from source, which is required for static linking on macOS.
+Sources: [util/build_osx.sh#L1-L119](util/build_osx.sh#L1-L119)
+
+### Build Configuration Options
+
+When building from source, you can customize the build with various CMake options:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `HAVE_AVX2` | Enable AVX2 instruction set optimizations | OFF |
+| `HAVE_SSE4_1` | Enable SSE4.1 instruction set optimizations | OFF |
+| `HAVE_ARM8` | Enable ARM NEON optimizations (ARM64) | OFF |
+| `ENABLE_CUDA` | Enable CUDA support for GPU acceleration | OFF |
+| `ENABLE_PROSTT5` | Enable ProstT5 protein language model support | ON |
+| `FORCE_STATIC_DEPS` | Force static linking of dependencies | OFF |
+| `CMAKE_BUILD_TYPE` | Build type (Debug, Release, etc.) | Release |
+
+Example with custom options:
+```bash
+cmake -DHAVE_AVX2=1 -DENABLE_PROSTT5=1 -DCMAKE_BUILD_TYPE=Release ..
+```
+Sources: [CMakeLists.txt#L9-L12](CMakeLists.txt#L9-L12)
+
+## Memory Requirements
+
+Foldseek's memory usage depends on the database size and configuration. For optimal performance, consider these options:
+
+1. **With Cα info (default)**: Requires approximately `(6 bytes Cα + 1 3Di byte + 1 AA byte) * (database residues)`. For example, the 54M AlphaFold DB entries require about 151GB of RAM.
+
+2. **Without Cα info**: By disabling `--sort-by-structure-bits 0`, RAM requirement reduces significantly (e.g., to 35GB for AlphaFold DB). This alters hit rankings and final scores but not E-values.
+
+3. **Single query searches**: Use `--prefilter-mode 1`, which isn't memory-limited and computes all optimal ungapped alignments. This option optimally utilizes Foldseek's multithreading capabilities for single queries and supports GPU acceleration.
+Sources: [README.md#L91-L101](README.md#L91-L101)
+
+## Choosing the Right Installation Method
+
+To help you decide which installation method is best for your needs, here's a comparison of the different options:
+
+| Installation Method | Best For | Pros | Cons |
+|---------------------|----------|------|------|
+| **Precompiled Binaries** | Most users, quick start | Easiest to install, optimized for performance, no compilation required | Limited to supported architectures, may not have latest features |
+| **Conda** | Bioinformatics pipelines, dependency management | Handles dependencies automatically, works in conda environments | May lag behind latest releases, larger download size |
+| **Docker** | Reproducible environments, CI/CD | Consistent across systems, easy to scale, GPU support | Requires Docker knowledge, larger disk space usage |
+| **Build from Source** | Developers, custom builds, unsupported platforms | Full control over features, can optimize for specific hardware | Complex setup, requires development tools, longer installation time |
+
+## Troubleshooting Common Issues
+
+### AVX2 Support Issues
+
+If you're using an older CPU that doesn't support AVX2, you may encounter errors when trying to run the AVX2 binary. In this case:
+
+1. Check your CPU capabilities:
+```bash
+cat /proc/cpuinfo | grep avx2
+```
+
+2. If AVX2 is not supported, use the SSE4.1 build or build from source with SSE4.1 support.
+
+### GPU Issues
+
+If you're having trouble with GPU acceleration:
+
+1. Verify your NVIDIA driver version:
+```bash
+nvidia-smi
+```
+
+2. Ensure you have the CUDA toolkit installed (if building from source).
+
+3. Check GPU visibility:
+```bash
+CUDA_VISIBLE_DEVICES=0 foldseek easy-search query.pdb target.pdb result.m8 tmp --gpu 1
+```
+
+### Memory Issues
+
+If you encounter out-of-memory errors:
+
+1. Reduce memory usage by disabling Cα info:
+```bash
+foldseek easy-search query.pdb target.pdb result.m8 tmp --sort-by-structure-bits 0
+```
+
+2. Use single query mode for large databases:
+```bash
+foldseek easy-search query.pdb target.pdb result.m8 tmp --prefilter-mode 1
+```
+
+## Next Steps
+
+After successfully installing Foldseek, you're ready to start exploring protein structure comparisons. Check out our [Structure Search Basics](4-structure-search-basics) tutorial to learn how to perform your first protein structure search, or explore the [Working with Structure Databases](5-working-with-structure-databases) guide to understand how to work with pre-built databases like AlphaFold DB and PDB.
+
+Remember to refer to the [Foldseek wiki](https://github.com/steineggerlab/foldseek/wiki) for more detailed documentation and the [MMseqs2 wiki](https://github.com/soedinglab/MMseqs2/wiki) for information about modules shared between Foldseek and MMseqs2.
+
+# Structure Search Basics
+
+
+
+Protein structure search is a fundamental task in structural biology, enabling researchers to find proteins with similar 3D structures, which often indicates functional or evolutionary relationships. Foldseek makes this process remarkably fast and efficient, allowing you to search through massive structural databases in seconds rather than hours or days.
+
+## What is Structure Search?
+
+Structure search involves comparing a query protein structure against a database of target structures to identify similarities. Unlike sequence-based searches, structure searches can detect distant evolutionary relationships that might not be apparent from sequence alone. This is because protein structures are more conserved than sequences throughout evolution.
+
+Foldseek achieves this by converting 3D protein structures into efficient representations (3Di descriptors) that can be rapidly compared, making it up to 20,000 times faster than traditional structural alignment methods while maintaining similar sensitivity.
+
+> [!TIP]
+> Foldseek's speed comes from its innovative approach of converting 3D structures into 1D sequences of structural alphabets (3Di), allowing it to leverage fast sequence alignment algorithms for structural comparisons.
+
+## The Structure Search Workflow
+
+A typical structure search in Foldseek follows these key steps:
+
+1. **Database Creation**: Convert target structures into a searchable database format
+2. **Indexing (Optional)**: Pre-compute an index for faster searches
+3. **Searching**: Compare query structures against the database
+4. **Result Conversion**: Convert internal results to human-readable formats
+
+Let's visualize this workflow:
+
+```mermaid
+flowchart TD
+    A[Query Structure<br/>(PDB/mmCIF/FASTA)] --> B[Database Creation]
+    C[Target Structures<br/>(PDB/mmCIF/FASTA)] --> B
+    B --> D[Optional Indexing]
+    D --> E[Structure Search]
+    E --> F[Result Conversion]
+    F --> G[Output Formats<br/>(Tab-separated/HTML/PDB)]
+```
+
+Sources: [structuresearch.sh#L15-L53](data/structuresearch.sh#L15-L53), [easystructuresearch.sh#L15-L50](data/easystructuresearch.sh#L15-L50)
+
+## Basic Structure Search Commands
+
+Foldseek provides two main approaches for structure searches: a simplified `easy-search` command for beginners and more advanced commands for fine-tuned control.
+
+### Easy Search: The Quick Start Approach
+
+The `easy-search` command is perfect for beginners as it handles all the intermediate steps automatically:
+
+```bash
+foldseek easy-search example/d1asha_ example/ aln tmpFolder
+```
+
+This single command:
+1. Creates a database from the `example/` directory
+2. Searches the query structure `d1asha_` against this database
+3. Outputs results in tab-separated format to `aln`
+4. Uses `tmpFolder` for temporary files
+
+The default output format includes: `query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits`
+
+Sources: [README.md#L114-L115](README.md#L114-L115), [easystructuresearch.sh#L15-L65](data/easystructuresearch.sh#L15-L65)
+
+### Advanced Search: Step-by-Step Control
+
+For more control over the search process, you can perform each step manually:
+
+```bash
+# 1. Create database from target structures
+foldseek createdb example/ targetDB
+
+# 2. Create index (optional, but speeds up repeated searches)
+foldseek createindex targetDB tmp
+
+# 3. Perform the search
+foldseek structuresearch example/d1asha_ targetDB result tmp
+
+# 4. Convert results to readable format
+foldseek convertalis example/d1asha_ targetDB result aln.m8
+```
+
+This approach gives you more flexibility and is better suited for production environments where you might search against the same database multiple times.
+
+Sources: [structuresearch.sh#L41-L53](data/structuresearch.sh#L41-L53), [LocalCommandDeclarations.h#L7-L9](src/LocalCommandDeclarations.h#L7-L9)
+
+## Understanding the Search Process
+
+Let's dive deeper into what happens during a structure search:
+
+### 1. Prefiltering: Finding Initial Matches
+
+Foldseek first performs a fast prefiltering step to find potential matches:
+
+```mermaid
+sequenceDiagram
+    participant Q as Query Structure
+    participant P as Prefilter
+    participant T as Target Database
+    Q->>P: Convert to 3Di descriptors
+    P->>T: Find k-mer matches
+    P->>Q: Return candidate matches
+```
+
+This step uses efficient k-mer matching to quickly eliminate most non-similar structures, dramatically reducing the search space.
+
+Sources: [structuresearch.sh#L41-L53](data/structuresearch.sh#L41-L53)
+
+### 2. Alignment: Detailed Structural Comparison
+
+After prefiltering, Foldseek performs detailed structural alignment using one of several algorithms:
+
+```mermaid
+flowchart TD
+    A[Prefilter Results] --> B{Alignment Algorithm}
+    B -->|Default| C[3Di+AA Gotoh-Smith-Waterman<br/>(Local alignment)]
+    B -->|Global| D[TMalign<br/>(Global alignment)]
+    B -->|Alternative| E[LolAlign<br/>(Alternative local alignment)]
+```
+
+The default 3Di+AA alignment provides a good balance of speed and accuracy for most use cases.
+
+Sources: [structuresearch.sh#L56-L143](data/structuresearch.sh#L56-L143)
+
+## Key Search Parameters
+
+Understanding these parameters will help you optimize your searches:
+
+| Parameter | Description | Default | Effect |
+|-----------|-------------|---------|--------|
+| `-s` | Sensitivity setting | 9.5 | Lower = faster, higher = more sensitive |
+| `-e` | Maximum E-value threshold | 0.001 | Higher = more results |
+| `--alignment-type` | Alignment algorithm | 2 | 0: 3Di only, 1: TMalign, 2: 3Di+AA |
+| `-c` | Minimum coverage threshold | 0.0 | Higher = more global alignments |
+| `--max-seqs` | Maximum sequences for alignment | 1000 | Higher = more comprehensive |
+
+For example, to perform a more sensitive search:
+
+```bash
+foldseek easy-search example/d1asha_ example/ aln tmp -s 10.0 -e 0.01
+```
+
+Sources: [README.md#L153-L164](README.md#L153-L164)
+
+## Output Formats
+
+Foldseek offers several output formats to suit different needs:
+
+### Tab-Separated Format (Default)
+
+The standard tab-separated output is perfect for computational analysis:
+
+```bash
+foldseek easy-search example/d1asha_ example/ result.m8 tmp
+```
+
+You can customize the output fields using `--format-output`:
+
+```bash
+foldseek easy-search example/d1asha_ example/ result.m8 tmp --format-output "query,target,alntmscore,prob"
+```
+
+### Interactive HTML Format
+
+For visual inspection, generate an interactive HTML report:
+
+```bash
+foldseek easy-search example/d1asha_ example/ result.html tmp --format-mode 3
+```
+
+This creates a web-based visualization similar to the Foldseek webserver, allowing you to interactively explore alignments.
+
+### Superpositioned PDB Files
+
+For structural analysis, generate PDB files with target structures superimposed on the query:
+
+```bash
+foldseek easy-search example/d1asha_ example/ result_pdb tmp --format-mode 5
+```
+
+> [!TIP]
+> Be careful with `--format-mode 5` as it generates a separate PDB file for each alignment, which can consume significant disk space for large searches.
+
+Sources: [README.md#L116-L147](README.md#L116-L147)
+
+## Working with Pre-built Databases
+
+Foldseek provides easy access to major structural databases:
+
+```bash
+# Download PDB database
+foldseek databases PDB pdb tmp
+
+# Download AlphaFold DB
+foldseek databases Alphafold/Proteome afdb tmp
+
+# Search against the downloaded database
+foldseek easy-search example/d1asha_ afdb result tmp
+```
+
+This eliminates the need to manually download and process large structural databases.
+
+Sources: [README.md#L174-L181](README.md#L174-L181)
+
+## Practical Example: Finding Structural Homologs
+
+Let's put it all together with a practical example. Suppose you have a protein structure and want to find its structural homologs in the PDB:
+
+```bash
+# 1. Download and prepare the PDB database
+foldseek databases PDB pdb tmp
+
+# 2. Perform a sensitive search
+foldseek easy-search my_protein.pdb pdb result.m8 tmp \
+  -s 9.5 \
+  -e 0.001 \
+  --format-output "query,target,alntmscore,prob,lddt"
+
+# 3. Generate visualizations for top hits
+foldseek easy-search my_protein.pdb pdb result.html tmp \
+  --format-mode 3 \
+  --max-seqs 10
+```
+
+This workflow will:
+1. Download the latest PDB database
+2. Search your protein against it with balanced sensitivity
+3. Generate a detailed tabular output with structural similarity metrics
+4. Create an interactive HTML visualization of the top 10 hits
+
+## Next Steps
+
+Now that you understand the basics of structure search with Foldseek, you're ready to explore more advanced topics:
+
+- **Working with Structure Databases**: Learn how to create and manage custom structural databases
+- **Structure Clustering**: Group similar structures together
+- **Iterative Search Workflows**: Perform multi-round searches for distant homologs
+- **Performance Optimization**: Fine-tune Foldseek for your specific use case
+
+The structure search capabilities of Foldseek provide a powerful foundation for structural biology research, enabling rapid exploration of protein structure space at unprecedented scale and speed.
+
+# Working with Structure Databases
+
+
+
+Working with structure databases is a fundamental aspect of using Foldseek effectively. Whether you're searching for protein structures, clustering them, or creating custom databases, understanding how to manage and utilize these databases will significantly enhance your productivity. This guide will walk you through the essential concepts and practical workflows for working with structure databases in Foldseek.
+
+## Understanding Structure Databases in Foldseek
+
+Foldseek uses specialized database formats to store protein structure information efficiently. These databases contain more than just amino acid sequences - they include structural information represented as **3Di (3-dimensional interaction) states** and optionally **Cα coordinates**. This rich structural representation allows Foldseek to perform rapid structural comparisons and searches.
+
+A typical Foldseek structure database consists of multiple files:
+- Main database file (`.dbtype`)
+- Headers (_h.dbtype)
+- Secondary structure (_ss.dbtype) 
+- Cα coordinates (_ca.dbtype)
+- Index files for fast searching
+
+This multi-file structure enables efficient access to different types of information during searches and comparisons.
+
+Sources: [README.md#L94-95](README.md#L94-L95), [structureindex.sh#L14-16](data/structureindex.sh#L14-L16)
+
+## Types of Structure Databases
+
+Foldseek supports several types of structure databases, each suited for different use cases:
+
+### Pre-built Databases
+Foldseek provides pre-formatted databases for major structure collections, which can be downloaded using the `databases` command:
+
+| Database Name | Content | Use Case |
+|---------------|---------|----------|
+| Alphafold/UniProt | AlphaFold predictions for UniProt | Comprehensive monomer searches |
+| Alphafold/UniProt50 | 50% sequence identity-reduced AlphaFold | Faster searches with broader coverage |
+| PDB | Protein Data Bank structures | Experimentally determined structures |
+| ESMAtlas30 | ESMFold predictions | High-quality predicted structures |
+
+To download a pre-built database:
+```bash
+foldseek databases PDB pdb tmp
+```
+
+> [!TIP]
+> Pre-built databases can be quite large. For example, the full AlphaFold/UniProt database requires approximately 151GB of RAM when loaded with Cα information.
+
+Sources: [structdatabases.sh#L89-152](data/structdatabases.sh#L89-L152), [README.md#L175-192](README.md#L175-L192)
+
+### Custom Structure Databases
+For working with your own collection of protein structures, you'll need to create custom databases. This is useful for:
+- Searching against a specific set of structures repeatedly
+- Creating domain-specific structure collections
+- Working with proprietary or unpublished structures
+
+Create a custom database from PDB/mmCIF files:
+```bash
+foldseek createdb /path/to/pdb_files targetDB
+```
+
+### Sequence-Based Structure Databases
+Foldseek can create structure databases directly from FASTA sequences using the ProstT5 protein language model. This is remarkably fast—**400-4000x faster** than predicting structures with ColabFold—though it only generates predicted 3Di sequences without full structural details.
+
+```bash
+# First download the ProstT5 model
+foldseek databases ProstT5 weights tmp
+
+# Create database from FASTA
+foldseek createdb proteins.fasta db --prostt5-model weights
+```
+
+> [!TIP]
+> Sequence-based databases support monomer searches and clustering but don't enable features requiring Cα information, such as TM-align or LDDT output.
+
+Sources: [README.md#L200-217](README.md#L200-L217), [structdatabases.sh#L171-179](data/structdatabases.sh#L171-L179)
+
+## Database Creation Workflow
+
+The process of creating a structure database in Foldseek follows a logical sequence:
+
+```mermaid
+flowchart TD
+    A[Input Structures<br/>PDB/mmCIF/FASTA] --> B[createdb<br/>Convert to Foldseek format]
+    B --> C[Optional: createindex<br/>Build search index]
+    C --> D[Database ready for searching]
+```
+
+Let's examine each step in detail:
+
+### Step 1: Database Creation
+The `createdb` command converts protein structures into Foldseek's internal format. It processes each input file and extracts:
+- Amino acid sequences
+- 3Di structural states
+- Cα coordinates (if available)
+- Metadata and headers
+
+```bash
+# Create database from a directory of PDB files
+foldseek createdb ./my_structures/ myDB
+
+# Create database from a single structure
+foldseek createdb query.pdb queryDB
+```
+
+### Step 2: Index Creation (Optional but Recommended)
+Indexing dramatically speeds up searches by creating optimized data structures for k-mer matching. While Foldseek can search unindexed databases, indexing is highly recommended for repeated searches.
+
+```bash
+foldseek createindex myDB tmpFolder
+```
+
+The indexing process creates several specialized index files that allow Foldseek to quickly find potential structural matches without performing exhaustive comparisons.
+
+Sources: [structureindex.sh#L14-16](data/structureindex.sh#L14-L16), [README.md#L196-198](README.md#L196-L198)
+
+## Memory Considerations for Structure Databases
+
+Structure databases can be memory-intensive, and Foldseek provides several options to balance memory usage and functionality:
+
+| Mode | Memory Usage | Features Retained | Best For |
+|------|--------------|-------------------|----------|
+| Default (with Cα) | Highest | Full functionality | Detailed structural analysis, TM-align |
+| Without Cα info | Reduced (~23% of default) | Basic search functionality | Large-scale screening |
+| Single query searches | Not memory-limited | All features | Processing individual queries |
+
+To reduce memory usage by disabling Cα information:
+```bash
+foldseek search queryDB targetDB results tmp --sort-by-structure-bits 0
+```
+
+> [!TIP]
+> For large databases like AlphaFoldDB50, disabling Cα information can reduce memory requirements from 151GB to 35GB, making it feasible to run on more modest hardware.
+
+Sources: [README.md#L91-101](README.md#L91-L101)
+
+## Database Subsetting and Manipulation
+
+Often you'll need to work with subsets of larger databases. Foldseek provides tools for extracting specific entries based on lists or criteria:
+
+### Creating Sub-databases
+The `createstructsubdb.sh` script creates a new database containing only specified entries from a larger database. This is useful for:
+- Extracting specific protein families
+- Creating test datasets
+- Isolating structures of interest
+
+```bash
+foldseek createsubdb accession_list.txt fullDB subsetDB
+```
+
+The script handles all database components (sequences, structures, headers) to ensure consistency.
+
+Sources: [createstructsubdb.sh#L3-28](data/createstructsubdb.sh#L3-L28)
+
+## GPU Database Preparation
+
+To leverage GPU acceleration for searches, databases need to be reformatted with padding. This process adds uniform-length padding to each sequence, enabling efficient parallel processing on GPUs:
+
+```bash
+# Prepare database for GPU search
+foldseek makepaddedseqdb originalDB paddedDB
+
+# Perform GPU-accelerated search
+foldseek search queryDB paddedDB results tmp --gpu 1
+```
+
+The padded database format works for both CPU and GPU searches, so you can maintain a single database format that supports both processing methods.
+
+> [!TIP]
+> GPU acceleration requires an NVIDIA GPU of the Ampere generation or newer for full speed, though Turing-generation GPUs also work at reduced performance.
+
+Sources: [easystructuresearch.sh#L34-42](data/easystructuresearch.sh#L34-L42), [README.md#L218-225](README.md#L218-L225)
+
+## Working with Structure Databases: Practical Examples
+
+Let's walk through some common scenarios for working with structure databases:
+
+### Example 1: Basic Search with a Custom Database
+```bash
+# Create database from your structures
+foldseek createdb ./my_proteins/ myProteinDB
+
+# Create index for faster searching
+foldseek createindex myProteinDB tmp
+
+# Search a query against your database
+foldseek easy-search query.pdb myProteinDB results.m8 tmp
+```
+
+### Example 2: Large-Scale Search with Reduced Memory
+```bash
+# Download and prepare Alphafold/UniProt50
+foldseek databases Alphafold/UniProt50 afdb50 tmp
+
+# Search with reduced memory usage
+foldseek easy-search my_queries/ afdb50 results.m8 tmp --sort-by-structure-bits 0
+```
+
+### Example 3: GPU-Accelerated Search Setup
+```bash
+# Create database
+foldseek createdb ./large_structure_set/ largeDB
+
+# Prepare for GPU
+foldseek makepaddedseqdb largeDB largeDB_gpu
+
+# Perform search with GPU acceleration
+foldseek easy-search queries/ largeDB_gpu results.m8 tmp --gpu 1
+```
+
+Sources: [easystructuresearch.sh#L15-51](data/easystructuresearch.sh#L15-L51), [structuresearch.sh#L40-53](data/structuresearch.sh#L40-L53)
+
+## Database Maintenance and Best Practices
+
+To ensure optimal performance when working with structure databases:
+
+1. **Organize your databases**: Keep related structures in separate databases to maintain focus and reduce search times
+2. **Index frequently used databases**: The initial indexing time pays off in faster searches
+3. **Use appropriate memory settings**: Adjust memory usage based on your available resources and analysis needs
+4. **Consider database size for your use case**: Alphafold/UniProt50 provides a good balance of coverage and performance for most users
+5. **Backup important databases**: Store both the input files and the created database files
+
+```mermaid
+flowchart LR
+    A[Structure Files] --> B{Database Type?}
+    B -->|Pre-built| C[Download with databases]
+    B -->|Custom| D[createdb]
+    B -->|FASTA| E[createdb with ProstT5]
+    C --> F[Optional: createindex]
+    D --> F
+    E --> F
+    F --> G[Database Ready]
+    G -->|GPU Search| H[makepaddedseqdb]
+    G -->|CPU Search| I[Search Directly]
+    H --> I
+```
+
+Sources: [structdatabases.sh#L80-84](data/structdatabases.sh#L80-L84), [easystructuresearch.sh#L44-65](data/easystructuresearch.sh#L44-L65)
+
+## Conclusion
+
+Working with structure databases is at the core of Foldseek's functionality. By understanding the different types of databases available, how to create and manage them, and the various options for optimization, you can leverage Foldseek's full potential for protein structure analysis. Whether you're working with pre-built databases like AlphaFoldDB or creating custom collections of your own structures, these techniques will help you perform fast, sensitive structural comparisons efficiently.
+
+Remember that database preparation is often a one-time cost that pays dividends in faster subsequent searches. Take the time to properly set up and index your databases, and you'll find Foldseek to be an incredibly powerful tool for structural bioinformatics workflows.
+
+
+# What's the Buzz
+
+
+
+Foldseek is experiencing unprecedented momentum in 2024-2025, cementing its position as a revolutionary force in structural bioinformatics. The project has evolved from a promising protein structure search tool to a comprehensive platform that's reshaping how researchers approach protein analysis at scale.
+
+## Breaking Through the Speed Barrier
+
+The original Foldseek paper published in Nature Biotechnology in February 2024 made waves by demonstrating **four to five orders of magnitude** speed improvements over traditional structural alignment tools like Dali, TM-align, and CE, while maintaining 86-133% of their sensitivity. This breakthrough addressed a critical bottleneck in the field: as structure prediction methods like AlphaFold generate millions of protein structures, searching these databases had become computationally prohibitive.
+Sources: [Fast and accurate protein structure search with Foldseek](https://pubmed.ncbi.nlm.nih.gov/37156916)
+
+## The Multimer Revolution
+
+In March 2025, the Foldseek team dropped another bombshell with the publication of **Foldseek-Multimer** in Nature Methods. This extension tackles the even more challenging problem of protein complex alignment, delivering **3-4 orders of magnitude** speed improvements over gold standard methods. The implications are staggering: Foldseek-Multimer can compare **billions of complex pairs in just 11 hours**, a task that was previously computationally infeasible.
+
+The multimer functionality works by computing complex alignments from compatible chain-to-chain alignments, identified by efficiently clustering their superposition vectors. This innovation enables researchers to analyze protein complexes at scales never before possible, opening new frontiers in understanding protein-protein interactions and complex assembly.
+Sources: [Rapid and sensitive protein complex alignment with Foldseek-Multimer](https://pubmed.ncbi.nlm.nih.gov/39910251)
+
+## GPU Acceleration Takes Center Stage
+
+Recent commits show the team is aggressively pushing the boundaries of performance with GPU acceleration. The integration of MMseqs2-GPU technology provides up to **27x speedup** for protein structure alignment compared to CPU-based versions. This acceleration is particularly crucial for large-scale analyses and has been optimized for various NVIDIA GPUs, making high-performance structural analysis accessible to more researchers.
+
+The GPU support extends to multimer search and clustering operations, with recent commits showing improvements to lookup handling and multimer utilities. These enhancements are directly addressing user feedback about performance bottlenecks in GPU workflows.
+Sources: [Accelerated Sequence Alignment for Protein Science with MMseqs2 and NVIDIA NIM](https://developer.nvidia.com/blog/accelerated-sequence-alignment-for-protein-design-with-mmseqs2-and-nvidia-nim)
+
+## Integration with Major Platforms
+
+Foldseek's growing influence is evident in its integration with major bioinformatics platforms. The **AlphaFold Protein Structure Database** now incorporates Foldseek across all its entries, allowing users to perform structure-based searches against both the Protein Data Bank and AlphaFold models. This integration provides researchers with seamless access to structural information, enabling the discovery of distant evolutionary connections that sequence-based methods might miss.
+
+The tool's unique "3Di alphabet" approach—converting complex 3D structures into simpler 1D sequence representations—has proven particularly effective for revealing surprising structural similarities between proteins with distinct functions. For example, it identified unexpected structural parallels between DNA2 (essential for DNA replication) and Cas4 (key to the CRISPR-Cas immune system), despite only 15.5% sequence identity.
+Sources: [AlphaFold database empowers researchers with enhanced](https://www.embl.org/news/updates-from-data-resources/alphafold-foldseek)
+
+## Community Adoption and Impact
+
+The bioinformatics community has embraced Foldseek with remarkable enthusiasm. The tool is now widely adopted in industry, with leading companies like Basecamp Research, VantAI, and Iambic Therapeutics incorporating it into their drug discovery pipelines. Academic researchers are leveraging Foldseek for everything from evolutionary studies to disease research and functional annotation.
+
+Recent GitHub activity shows a vibrant development community, with contributors like Sooyoung Cha, Woosub-Kim, and Milot Mirdita actively improving multimer support, GPU functionality, and database handling. The project's commitment to open-source development and responsive issue handling has fostered a strong user community.
+
+## Looking Ahead
+
+As we move through 2025, Foldseek is positioned to become the de facto standard for protein structure analysis. The combination of groundbreaking speed improvements, comprehensive functionality covering both monomers and complexes, GPU acceleration, and integration with major platforms creates an unparalleled ecosystem for structural bioinformatics.
+
+The recent focus on improving multimer workflows, GPU support, and database handling suggests the team is listening to user feedback and aggressively addressing real-world usage challenges. With the exponential growth of protein structure data showing no signs of slowing, Foldseek's role in enabling discoveries at the intersection of structural biology, drug discovery, and evolutionary studies will only continue to expand.
+
+The buzz around Foldseek isn't just about technical achievements—it's about enabling a new era of biological discovery that was previously impossible due to computational limitations. That's the kind of breakthrough that transforms fields.
+
+# What People Are Saying
+
+
+
+The scientific community has embraced Foldseek with remarkable enthusiasm, recognizing it as a transformative tool that's revolutionizing protein structure analysis. From prestigious publications to everyday researchers in the lab, the feedback highlights both the technical brilliance and practical impact of this groundbreaking software.
+
+## Scientific Recognition and Praise
+
+Foldseek's innovative approach to protein structure comparison has earned it significant acclaim in the scientific community. The tool was published in *Nature Biotechnology*, where researchers highlighted that Foldseek **"decreases computation times by four to five orders of magnitude"** while maintaining sensitivities comparable to established tools like Dali and TM-align. This publication has been cited extensively, demonstrating the tool's immediate impact on the field.
+
+Sources: [Fast and accurate protein structure search with Foldseek](https://pubmed.ncbi.nlm.nih.gov/37156916)
+
+The project's lead developer, Martin Steinegger, received the **2024 Overton Award** from the International Society for Computational Biology, recognizing his outstanding contributions to computational biology. As noted in his profile, Steinegger is "widely known for creating computational methods such as MMseqs2 for rapid sequence searching and clustering, Foldseek for large-scale protein structure comparisons, and ColabFold for accessible protein structure prediction. Collectively, these tools have been installed and utilized millions of times by researchers worldwide."
+
+Sources: [Martin Steinegger | The Institute](https://www.theinstitute.com/fellow/martin-steinegger)
+
+## Real-World Impact and Applications
+
+Researchers across various disciplines are leveraging Foldseek to tackle previously intractable problems. A collaborative study between EMBL's European Bioinformatics Institute, ETH Zurich, and Seoul National University used Foldseek Cluster to analyze over 200 million predicted protein structures from the AlphaFold database, identifying more than 2 million unique structural clusters. As Martin Steinegger noted, **"We estimated that clustering all structures with established methods would have taken a decade when compared to the five days it took using our new method, Foldseek Cluster."**
+
+Sources: [Revealing the secrets of protein evolution using the AlphaFold database](https://www.embl.org/news/science/revealing-the-secrets-of-protein-evolution-using-the-alphafold-database)
+
+The tool's speed has opened new possibilities in evolutionary research. The same study uncovered fascinating insights about human immunity proteins, revealing **"structural similarities between human immune system proteins and those found in bacteria. This suggests that proteins involved in the immune system may have ancient evolutionary origins that we share with bacterial species."** Such discoveries were previously impractical due to computational limitations.
+
+Sources: [Revealing the secrets of protein evolution using the AlphaFold database](https://www.embl.org/news/science/revealing-the-secrets-of-protein-evolution-using-the-alphafold-database)
+
+## User Community Feedback
+
+The GitHub issues and discussions reveal a vibrant, engaged user community that's actively pushing the tool's boundaries. Users consistently praise Foldseek's performance while also providing valuable feedback for improvements:
+
+### Technical Appreciation
+
+Users frequently express admiration for Foldseek's capabilities. One user noted that the tool enables them to perform analyses that were previously impossible, stating that Foldseek **"increases the speed for searching similar protein structures around a factor of hundred thousand, making it an invaluable tool for future structure-based analyses."**
+
+Sources: [Elevating protein structure search to a new level - MPI](https://www.mpinat.mpg.de/4447788/rn_2302)
+
+### Feature Requests and Community Collaboration
+
+The community actively contributes to the tool's development. Recent issues show users requesting support for pre-computed 3Di strings, GPU acceleration improvements, and better documentation for advanced features. The development team's responsiveness is evident in their quick turnaround on bug fixes and feature implementations, such as the recent addition of zstd support in createdb and fixes for multimer clustering functionality.
+
+Sources: [Support for using pre-computed 3Di strings as input](https://github.com/steineggerlab/foldseek/issues/511), [Add zstd support in createdb](https://github.com/steineggerlab/foldseek/commit/cfb431e98abcc5bcc49950285211d3723b47dc94)
+
+### Educational Impact
+
+Foldseek is making structural bioinformatics more accessible to researchers without extensive computational resources. As one research article noted, **"Foldseek enables researchers to efficiently explore extensive databases such as AlphaFoldDB, which house vast collections of protein structures. This tool facilitates the identification of related proteins, the discovery of evolutionary connections, and the recognition of potential targets for drug development."**
+
+Sources: [Foldseek Revolutionizing Protein Structure Search with 3Di](https://researchmatics.com/articles/foldseek-revolutionizing-protein-structure-search-with-3di-technology)
+
+## Looking Forward
+
+The community's excitement about Foldseek's future is palpable. Users are already exploring new applications, from antibody verification to complex protein alignment, and the development team continues to push the envelope with features like Foldseek-Multimer for protein complex analysis. As the tool evolves, the scientific community eagerly anticipates what's next, with many researchers stating that Foldseek has fundamentally changed how they approach protein structure analysis.
+
+Sources: [Rapid and sensitive protein complex alignment with Foldseek-Multimer](https://pubmed.ncbi.nlm.nih.gov/39910251)
+
+The overwhelming consensus is clear: Foldseek isn't just another bioinformatics tool—it's a paradigm shift that's democratizing access to large-scale protein structure analysis and enabling discoveries that were previously computationally out of reach.
+
+# About the Team
+
+
+
+The Foldseek project is powered by a diverse team of computational biologists, software engineers, and researchers from Seoul National University and beyond. This international collaboration brings together expertise in bioinformatics, machine learning, and structural biology to create tools that are transforming how scientists analyze protein structures at scale.
+
+## Leadership: Martin Steinegger
+
+At the helm is **Martin Steinegger**, an Associate Professor in the Biology Department at Seoul National University and a visionary in computational biology. Martin's journey in bioinformatics began with studies at Technical University Munich and Ludwig Maximilian University of Munich, followed by a Ph.D. in Computer Science from TU Munich in collaboration with the Max Planck Institute for Biophysical Chemistry. His postdoctoral work at Johns Hopkins University further solidified his expertise in large-scale sequence analysis.
+
+Martin is widely recognized for creating groundbreaking computational tools that have become essential in the field. Before Foldseek, he developed **MMseqs2** (which can run 10,000 times faster than BLAST) and **ColabFold** (which democratized protein structure prediction). His contributions to the field were recognized with the 2024 Overton Award from the International Society for Computational Biology. Notably, he was the only author outside of DeepMind on the landmark 2021 Nature paper introducing AlphaFold2.
+
+Sources: [Martin Steinegger | The Institute](https://www.theinstitute.com/fellow/martin-steinegger), [Steinegger Lab](https://steineggerlab.com/en)
+
+## Core Contributors
+
+### Milot Mirdita: The Engine Behind the Code
+
+**Milot Mirdita** serves as a postdoctoral researcher at Seoul National University and is a driving force behind Foldseek's development. With a Ph.D. in Computer Science (summa cum laude) from the University of Göttingen and MPI-NAT, Milot brings deep technical expertise to the team. His work spans bioinformatics, metagenomics, and protein structure prediction, making him instrumental in implementing Foldseek's innovative algorithms.
+
+Milot is also the developer and maintainer of ColabFold and MMseqs2, showcasing his ability to create tools that balance computational efficiency with biological accuracy. His contributions have been essential in making Foldseek **600,000 times faster** than traditional structural aligners while maintaining comparable sensitivity.
+
+Sources: [Dr. Milot Mirdita](https://mirdita.de), [Steinegger Lab](https://steineggerlab.com/en/authors/milot)
+
+### Charlotte Tumescheit: Bridging Mathematics and Biology
+
+**Charlotte Tumescheit** (schnamo) brings a unique background combining mathematics, software development, and RNA structure prediction. After studying Mathematics at Free University Berlin and working as a software developer, she earned her Ph.D. from the University of Cambridge, where she developed CIAlign for multiple sequence alignment analysis.
+
+Charlotte's journey took her from Seoul National University (where she was part of the Foldseek development team) to her current position as a postdoctoral researcher at the University of Zurich. Her interdisciplinary expertise in mathematics, computer science, and biology makes her particularly valuable in solving the complex algorithmic challenges that Foldseek addresses.
+
+Sources: [Charlotte Tumescheit](https://www.vibconferences.be/speaker/charlotte-tumescheit), [Steinegger Lab](https://steineggerlab.com/en)
+
+### Woosub Kim: Pushing the Boundaries of Protein Complex Analysis
+
+**Woosub Kim** has been instrumental in extending Foldseek's capabilities to protein complexes through his work on **Foldseek-Multimer**. His research, published in Nature Methods in 2025, introduced a method that is 3-4 orders of magnitude faster than existing tools for protein complex alignment while maintaining comparable accuracy.
+
+Woosub's work enables the comparison of billions of complex pairs in just 11 hours, opening new possibilities for understanding protein interactions at an unprecedented scale. His contributions represent the team's commitment to not just improving existing methods but fundamentally reimagining what's possible in structural bioinformatics.
+
+Sources: [Rapid and sensitive protein complex alignment with Foldseek-Multimer](https://pubmed.ncbi.nlm.nih.gov/39910251), [Steinegger Lab](https://steineggerlab.com/en)
+
+### Rachel Seongeun Kim: The Next Generation of Bioinformaticians
+
+**Rachel Seongeun Kim** represents the emerging talent in the team as an Integrated Ph.D. student in the Interdisciplinary Program in Bioinformatics at Seoul National University. Despite coming from a Food Biology & Technology background, she has quickly established herself in protein structure prediction and software development.
+
+Rachel's work spans protein interaction prediction, software development for structure analysis, and database construction. Her journey demonstrates the team's commitment to nurturing diverse talent and fostering interdisciplinary approaches to complex biological problems. When not coding, she enjoys fencing competitions and traveling, bringing balance to her intense research focus.
+
+Sources: [Rachel Seongeun Kim](https://steineggerlab.com/en/authors/seongeunkim), [Steinegger Lab](https://steineggerlab.com/en)
+
+### Sooyoung Cha: Driving Technical Innovation
+
+**Sooyoung Cha** is another key Integrated Ph.D. candidate at SteineggerLab whose contributions are evident throughout Foldseek's codebase. His recent work focuses on enhancing the software's multimer capabilities and improving database handling, as evidenced by his commits addressing subdatabase functionality and lookup optimizations.
+
+Sooyoung's technical contributions ensure that Foldseek remains robust and scalable, capable of handling the massive datasets that modern structural biology generates. His work exemplifies the team's attention to both algorithmic innovation and software engineering excellence.
+
+Sources: [Recent commits](https://github.com/steineggerlab/foldseek/commits), [Steinegger Lab](https://steineggerlab.com/en)
+
+## The Team's Impact and Philosophy
+
+The Foldseek team operates under a philosophy of **open science and open-source development**. Their tools have been collectively installed and utilized millions of times by researchers worldwide, democratizing access to cutting-edge computational biology methods.
+
+What makes this team exceptional is their ability to bridge fundamental research with practical software development. They don't just publish papers—they create tools that solve real problems for scientists working with protein structures. Their commitment to performance optimization (achieving speedups of 4-5 orders of magnitude) while maintaining biological accuracy has set new standards in the field.
+
+The team's collaborative spirit extends beyond Seoul National University, with contributions from researchers at institutions like the University of Zurich, Johns Hopkins University, and the Max Planck Institute. This global network ensures that Foldseek benefits from diverse perspectives and expertise.
+
+Sources: [Steinegger Lab Datasets - Registry of Open Data on AWS](https://registry.opendata.aws/steineggerlab), [Fast and accurate protein structure search with Foldseek](https://snu.elsevierpure.com/en/publications/fast-and-accurate-protein-structure-search-with-foldseek)
+
+## Looking Forward
+
+As protein structure prediction continues to generate millions of new structures, the Foldseek team is poised to tackle even bigger challenges. Their recent work on protein complexes and multimeric structures suggests they're just getting started. With a combination of experienced leadership and emerging talent, this team is well-positioned to continue driving innovation in computational structural biology for years to come.
+
+The Foldseek project exemplifies how a dedicated, interdisciplinary team can create tools that not only advance scientific research but fundamentally transform how we approach complex biological problems. Their commitment to open-source development ensures that their innovations will continue to benefit the global scientific community long into the future.
+
+
+# Protein Structure Search Algorithms
+
+
+
+Protein structure comparison is a fundamental task in bioinformatics, enabling researchers to understand evolutionary relationships, predict functions, and discover distant homologs. Foldseek revolutionizes this field by achieving sensitivities comparable to state-of-the-art structural aligners while being **20,000 times faster**. This breakthrough is made possible through innovative algorithms that transform the complex 3D structure comparison problem into an efficient sequence-like search problem.
+
+## The Core Innovation: 3Di Descriptors
+
+At the heart of Foldseek's speed lies its revolutionary approach to representing protein structures. Instead of directly comparing 3D coordinates, Foldseek converts each protein structure into a **1D sequence of structural states** called 3Di (3D interaction) descriptors. This transformation is the key innovation that enables the use of ultra-fast sequence search algorithms for structural comparisons.
+
+The 3Di alphabet consists of **20 discrete states**, each representing a specific local structural conformation. These states are derived from the spatial relationships between residues, capturing essential geometric information while discarding redundant details. The conversion process involves several sophisticated steps:
+
+1. **Virtual Center Calculation**: For each residue, Foldseek calculates a virtual center point that represents the optimal position for structural interactions. This virtual center is computed using the Cα, Cβ, and N atom coordinates with specific geometric parameters. `Sources: [structureto3di.h#L15-L16](lib/3di/structureto3di.h#L15-L16)`
+
+2. **Feature Extraction**: For each pair of interacting residues, Foldseek computes **10 geometric features** that capture their spatial relationship. These features include distances, angles, and other geometric descriptors that encode the local structural environment. `Sources: [structureto3di.h#L12](lib/3di/structureto3di.h#L12-L13)`
+
+3. **Neural Network Encoding**: The extracted features are fed into a **neural network encoder** (implemented using Kerasify) that transforms them into 2D embeddings. This step reduces dimensionality while preserving the essential structural information. `Sources: [structureto3di.h#L113-L115](lib/3di/structureto3di.h#L113-L115)`
+
+4. **State Discretization**: The continuous 2D embeddings are then mapped to the nearest of the **20 predefined centroid states** in the 3Di alphabet. This discretization creates the final 1D sequence representation that can be searched using sequence-based algorithms. `Sources: [structureto3di.h#L18-L39](lib/3di/structureto3di.h#L18-L39)`
+
+```cpp
+// Example of 3Di state centroids in 2D embedding space
+const double centroids[CENTROID_CNT][EMBEDDING_DIM] = {
+    { -1.0729,  -0.3600},  // State 0
+    { -0.1356,  -1.8914},  // State 1
+    {  0.4948,  -0.4205},  // State 2
+    // ... 17 more states
+};
+```
+
+## Multi-Stage Search Pipeline
+
+Foldseek employs a sophisticated multi-stage search pipeline that balances sensitivity and speed. This approach allows it to quickly eliminate non-matching structures while carefully examining promising candidates.
+
+### Stage 1: Prefiltering
+
+The first stage uses **k-mer matching** or **ungapped alignment** to rapidly identify potential matches. Foldseek offers three prefiltering modes:
+
+1. **KMER Mode**: Uses traditional k-mer based prefiltering for fast initial screening
+2. **UNGAPPED Mode**: Performs ungapped alignments for higher sensitivity
+3. **EXHAUSTIVE Mode**: Skips prefiltering entirely for maximum sensitivity (much slower)
+
+```cpp
+switch(par.prefMode){
+    case LocalParameters::PREF_MODE_KMER:
+        cmd.addVariable("PREFMODE", "KMER");
+        break;
+    case LocalParameters::PREF_MODE_UNGAPPED:
+        cmd.addVariable("PREFMODE", "UNGAPPED");
+        break;
+    case LocalParameters::PREF_MODE_EXHAUSTIVE:
+        cmd.addVariable("PREFMODE", "EXHAUSTIVE");
+        break;
+}
+```
+`Sources: [StructureSearch.cpp#L114-L127](src/workflow/StructureSearch.cpp#L114-L127)`
+
+The prefiltering stage is designed to be extremely fast, reducing the search space by orders of magnitude while retaining most true positives. This is where Foldseek achieves its dramatic speed improvements over traditional structural alignment methods.
+
+### Stage 2: Structural Alignment
+
+After prefiltering, promising candidates undergo more detailed structural alignment. Foldseek supports **three different alignment algorithms**, each optimized for different use cases:
+
+1. **3Di+AA Alignment**: The default mode that combines 3Di structural states with amino acid sequence information using a modified Smith-Waterman algorithm. This provides an excellent balance of speed and sensitivity.
+
+2. **TM-align**: A global structural alignment algorithm that superimposes structures and computes the TM-score, a measure of structural similarity. This mode is more sensitive but significantly slower.
+
+3. **3Di-only Alignment**: Uses only the structural state information without amino acid sequence, useful for detecting very distant structural relationships.
+
+```cpp
+if(par.alignmentType == LocalParameters::ALIGNMENT_TYPE_TMALIGN){
+    cmd.addVariable("ALIGNMENT_ALGO", "tmalign");
+    // ... TM-align specific parameters
+}else if(par.alignmentType == LocalParameters::ALIGNMENT_TYPE_3DI_AA){
+    cmd.addVariable("ALIGNMENT_ALGO", "structurealign");
+    // ... 3Di+AA alignment parameters
+}
+```
+`Sources: [StructureSearch.cpp#L128-L152](src/workflow/StructureSearch.cpp#L128-L152)`
+
+### Stage 3: Iterative Search (Optional)
+
+For detecting very distant structural relationships, Foldseek supports **iterative search** workflows. This approach builds profiles from initial search results and uses them for subsequent rounds of searching, progressively expanding the sensitivity of the search.
+
+The iterative search can be configured with different numbers of iterations and E-value thresholds for each round, allowing users to balance between sensitivity and computational resources.
+
+```cpp
+if(par.numIterations > 1 || par.numIterations == 0){
+    for (int i = 0; i < par.numIterations; i++) {
+        if (i == (par.numIterations - 1)) {
+            par.evalThr = originalEval;  // Use final threshold for last iteration
+        }
+        // Configure parameters for each iteration
+        cmd.addVariable(std::string("PREFILTER_PAR_" + SSTR(i)).c_str(),
+                        par.createParameterString(par.prefilter).c_str());
+    }
+}
+```
+`Sources: [StructureSearch.cpp#L158-L192](src/workflow/StructureSearch.cpp#L158-L192)`
+
+## Advanced Features and Optimizations
+
+### GPU Acceleration
+
+Foldseek leverages modern GPU hardware to further accelerate the prefiltering stage. The ungapped prefilter can be offloaded to NVIDIA GPUs, providing significant speedups for large-scale searches. This requires an NVIDIA GPU of the Ampere generation or newer for optimal performance.
+
+```cpp
+// GPU can only use the ungapped prefilter
+if (par.gpu == 1 && par.PARAM_PREF_MODE.wasSet == false) {
+    par.prefMode = Parameters::PREF_MODE_UNGAPPED;
+}
+```
+`Sources: [StructureSearch.cpp#L109-L112](src/workflow/StructureSearch.cpp#L109-L112)`
+
+### Memory Optimization
+
+Foldseek provides several memory optimization strategies to handle large databases:
+
+1. **Cα Coordinate Storage**: Optionally includes Cα coordinates for more accurate hit ranking (requires more memory)
+2. **Structure Bits**: A compact representation that reduces memory usage while maintaining sensitivity
+3. **Single Query Mode**: Optimized for searching single queries against large databases
+
+The memory requirements scale with the database size, with typical usage ranging from **35GB to 151GB** for the entire AlphaFold database, depending on the optimization level chosen.
+
+### Multimer Support
+
+Foldseek extends its algorithms to handle **protein complexes** through specialized multimer search and clustering workflows. These consider the spatial arrangement of multiple chains and can identify evolutionary relationships between entire protein complexes.
+
+## Algorithm Selection Guide
+
+Choosing the right algorithm configuration depends on your specific needs:
+
+| Use Case | Recommended Algorithm | Reason |
+|----------|----------------------|---------|
+| **Fast screening** | 3Di+AA with KMER prefilter | Maximum speed for initial screening |
+| **Sensitive search** | TM-align with iterative search | Highest sensitivity for distant relationships |
+| **Large-scale search** | 3Di+AA with GPU acceleration | Best balance of speed and sensitivity |
+| **Complex comparison** | Multimer search | Specialized for protein complexes |
+| **Memory-constrained** | 3Di-only without Cα | Minimal memory footprint |
+
+> [!TIP]
+> For most use cases, the default 3Di+AA alignment with sensitivity setting 9.5 provides the best balance of speed and sensitivity. Only switch to TM-align if you need maximum sensitivity and have computational resources to spare.
+
+## Performance Characteristics
+
+Foldseek's algorithms are designed to scale efficiently with database size, making it suitable for searching against massive structural databases like AlphaFold DB (54 million structures). Key performance characteristics include:
+
+- **Search Speed**: Up to 20,000x faster than traditional structural alignment methods
+- **Sensitivity**: Comparable to state-of-the-art structural aligners like TM-align
+- **Memory Usage**: Configurable from 35GB to 151GB for full AlphaFold DB
+- **Scalability**: Linear scaling with database size for prefiltering stage
+
+The combination of innovative 3Di descriptors, multi-stage search pipeline, and hardware acceleration makes Foldseek the tool of choice for large-scale protein structure analysis and discovery.
+
+
+# Architecture and Implementation
+
+
+
+Foldseek represents a sophisticated approach to protein structure comparison, combining multiple computational techniques to achieve remarkable speed and sensitivity. Understanding its architecture reveals how the tool manages to perform structural alignments up to 20,000 times faster than traditional methods while maintaining comparable accuracy.
+
+## Core Architecture Overview
+
+At its foundation, Foldseek follows a modular design built on top of the MMseqs2 framework, extending its sequence-based search capabilities to handle 3D structural data. The architecture can be visualized as a layered system where each component has a specific responsibility in the structure comparison pipeline.
+
+```mermaid
+graph TD
+    A[User Interface Layer] --> B[Command Processing Layer]
+    B --> C[Workflow Layer]
+    C --> D[Core Algorithm Layer]
+    D --> E[External Library Layer]
+    
+    A -->|Commands| B
+    B -->|Parameter Processing| C
+    C -->|Workflow Orchestration| D
+    D -->|Specialized Operations| E
+```
+
+The entry point in `foldseek.cpp` serves as the application's face, defining basic metadata and registering available commands. This minimal main function delegates the real work to the command processing system, demonstrating a clean separation of concerns. `Sources: [foldseek.cpp#L1-L22](src/foldseek.cpp#L1-L22)`
+
+## Command Processing System
+
+Foldseek's command system is the heart of its user-facing functionality. The `FoldseekBase.cpp` file defines an extensive array of commands, each with specific parameters, examples, and validation rules. This approach creates a consistent interface for all operations, from simple database creation to complex multimer searches.
+
+Each command in the system follows a structured format:
+- **Command name**: The CLI identifier (e.g., "easy-search", "cluster")
+- **Implementation function**: The C++ function that executes the command
+- **Parameter set**: Configuration options specific to that command
+- **Documentation**: Usage examples and descriptions
+- **Validation rules**: Input/output type checking
+
+For example, the "easy-search" command demonstrates this structure:
+```cpp
+{"easy-search",          easystructuresearch,           &localPar.easystructuresearchworkflow,   COMMAND_EASY,
+        "Structual search",
+        "# Search a single/multiple PDB file against a set of PDB files\n"
+        "foldseek easy-search examples/d1asha_ examples/ result.m8 tmp\n",
+        "Martin Steinegger <martin.steinegger@snu.ac.kr>",
+        "<i:PDB|mmCIF[.gz]> ... <i:PDB|mmCIF[.gz]>|<i:stdin> <i:targetFastaFile[.gz]>|<i:targetDB> <o:alignmentFile> <tmpDir>",
+        CITATION_FOLDSEEK, {{"PDB|mmCIF[.gz|.bz2]", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA|DbType::VARIADIC, &FoldSeekDbValidator::flatfileStdinAndFolder },
+                                   {"targetDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &FoldSeekDbValidator::flatfileAndFolder },
+                                   {"alignmentFile", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfile },
+                                   {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}}
+```
+`Sources: [FoldseekBase.cpp#L61-L76](src/FoldseekBase.cpp#L61-L76)`
+
+## Workflow Layer
+
+The workflow layer orchestrates complex operations by combining simpler components. Each workflow implementation in the `workflow/` directory handles a specific use case, such as structure search, clustering, or multimer analysis.
+
+Consider the structure search workflow:
+```cpp
+void setStructureSearchWorkflowDefaults(LocalParameters *p) {
+    p->kmerSize = 0;
+    p->sensitivity = 9.5;
+    p->maxResListLen = 1000;
+    p->alignmentMode = Parameters::ALIGNMENT_MODE_SCORE_COV_SEQID;
+    p->removeTmpFiles = true;
+}
+```
+`Sources: [StructureSearch.cpp#L14-L20](src/workflow/StructureSearch.cpp#L14-L20)`
+
+Workflows follow a consistent pattern:
+1. **Parameter initialization**: Set default values for workflow-specific parameters
+2. **Parameter validation**: Ensure user inputs are valid and compatible
+3. **Component orchestration**: Call the appropriate sequence of operations
+4. **Resource management**: Handle temporary files and cleanup
+
+## Core Algorithm Layer
+
+The `commons/` directory contains Foldseek's computational engine, implementing the algorithms that make fast structure comparison possible. Key components include:
+
+### 3Di Alphabet Implementation
+The revolutionary 3Di (3-dimensional interaction) alphabet transforms complex 3D structural information into a 1D sequence representation. This transformation is the key to Foldseek's speed, allowing it to leverage fast sequence alignment algorithms for structural comparison.
+
+### Structure Alignment Algorithms
+Multiple alignment algorithms are implemented to handle different aspects of structure comparison:
+
+| Algorithm | Purpose | Key Features |
+|-----------|---------|--------------|
+| TMaligner | Global structure alignment | TM-score calculation, rotation matrix optimization |
+| StructureSmithWaterman | Local structure alignment | Handles structural motifs, flexible gap penalties |
+| LDDT | Local Distance Difference Test | Residue-level accuracy assessment |
+
+These algorithms work in concert to provide both speed and accuracy. The TMaligner, for instance, implements the well-established TM-score algorithm for global structural similarity assessment. `Sources: [TMaligner.h](src/commons/TMaligner.h), [StructureSmithWaterman.h](src/commons/StructureSmithWaterman.h)`
+
+## External Library Integration
+
+Foldseek leverages several specialized libraries through its `lib/` directory, each providing critical functionality:
+
+### MMseqs2 Foundation
+The MMseqs2 library provides the core search infrastructure, including:
+- Efficient k-mer indexing and prefiltering
+- Sequence database management
+- Multi-threading support
+- Memory-mapped file handling
+
+This foundation allows Foldseek to handle massive datasets efficiently. `Sources: [lib/mmseqs/](lib/mmseqs/)`
+
+### Structure Processing Libraries
+Several libraries handle specialized structure-related tasks:
+
+- **Gemmi**: Comprehensive PDB/mmCIF file parsing and structure manipulation
+- **Foldcomp**: Structure compression for efficient storage
+- **TMalign**: Reference implementation of TM-score algorithm
+- **Pulchra**: Structure reconstruction and refinement
+
+### Machine Learning Integration
+The ProstT5 library enables cutting-edge protein language model capabilities:
+- 3Di sequence prediction from amino acid sequences
+- Structure embedding generation
+- Enhanced sensitivity for distant homology detection
+
+> [!TIP]
+> The ProstT5 integration represents Foldseek's bridge between traditional structural biology and modern machine learning approaches, enabling structure prediction from sequence data alone.
+
+## Build System and Configuration
+
+Foldseek uses CMake for its build system, with careful attention to cross-platform compatibility and optional feature configuration:
+
+```cmake
+set(ENABLE_PROSTT5 1 CACHE BOOL "Enable ProstT5")
+set(ENABLE_CUDA 0 CACHE BOOL "Enable CUDA")
+set(IGNORE_RUST_VERSION 0 CACHE BOOL "Ignore Rust version check")
+set(FORCE_STATIC_DEPS 0 CACHE BOOL "Force static linking of deps")
+```
+`Sources: [CMakeLists.txt#L9-L12](CMakeLists.txt#L9-L12)`
+
+This configuration allows users to customize builds based on their needs, enabling or disabling features like GPU acceleration or machine learning components.
+
+## Data Flow Architecture
+
+Understanding how data flows through Foldseek is crucial for understanding its performance:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as Command Processor
+    participant W as Workflow
+    participant A as Algorithms
+    participant L as Libraries
+    participant D as Database
+    
+    U->>C: foldseek command [options]
+    C->>W: Parsed parameters
+    W->>A: Execute search/cluster
+    A->>L: Structure processing
+    L->>D: Read/Write data
+    D-->>L: Structure data
+    L-->>A: Processed structures
+    A-->>W: Alignment results
+    W-->>C: Formatted output
+    C-->>U: Results
+```
+
+This flow demonstrates how the system efficiently handles the transformation from raw structure data to final comparison results, with each layer adding value and optimization.
+
+## Performance Optimization Strategies
+
+Foldseek's architecture incorporates several performance optimizations:
+
+1. **Memory-mapped databases**: Efficient access to large structure databases without loading everything into memory
+2. **Multi-threading**: Parallel processing of independent tasks
+3. **Prefiltering**: Rapid elimination of non-matching structures using k-mer-based approaches
+4. **Structure compression**: Reduced memory footprint through specialized encoding
+
+The combination of these strategies enables Foldseek to process datasets that would be intractable with traditional structural alignment tools.
+
+## Extensibility Design
+
+The modular architecture makes Foldseek extensible in several ways:
+
+- **New commands**: Adding functionality through the command registration system
+- **New algorithms**: Implementing additional scoring or alignment methods in the commons layer
+- **New workflows**: Combining existing components to create new analysis pipelines
+- **New format support**: Extending the library layer to handle additional structure file formats
+
+This design ensures that Foldseek can evolve with the field of structural bioinformatics, incorporating new algorithms and approaches as they emerge.
+
+# Structure Clustering
+
+
+
+Structure clustering in Foldseek enables the systematic organization of protein structures into families based on structural similarity. This powerful capability allows researchers to analyze large protein structure datasets, identify evolutionary relationships, and discover novel protein families efficiently. Unlike traditional sequence-based clustering, structure clustering can detect distant evolutionary relationships that may not be apparent from sequence alone.
+
+## Why Structure Clustering Matters
+
+Protein structure is more conserved than sequence throughout evolution. Two proteins with low sequence similarity might share nearly identical structures and perform similar functions. Structure clustering leverages this principle to:
+
+- **Identify distant evolutionary relationships** that sequence-based methods miss
+- **Organize large structure datasets** into manageable families for analysis
+- **Discover novel protein folds** and functional relationships
+- **Reduce redundancy** in structure databases by grouping similar structures
+- **Enable efficient comparative analysis** across entire protein structure universes
+
+> [!TIP]
+> Structure clustering is particularly valuable for analyzing large-scale structure prediction datasets like AlphaFold DB, where traditional sequence-based clustering would miss many important relationships.
+
+## The Structure Clustering Workflow
+
+Foldseek implements a sophisticated multi-stage clustering pipeline that balances sensitivity with computational efficiency. The process can be visualized as follows:
+
+```mermaid
+flowchart TD
+    A[Input Structures] --> B[Preprocessing]
+    B --> C{k-mer Matching}
+    C --> D[Hamming Distance Pre-clustering]
+    D --> E[Local Gapped Alignment]
+    E --> F[Greedy Set Cover Clustering]
+    F --> G[Optional Iterative Refinement]
+    G --> H[Final Clusters]
+    
+    I[Reassignment Mode] --> J[Align to Cluster Sequences]
+    J --> K[Identify Misassigned]
+    K --> L[Find Better Centroids]
+    L --> M[Reassign Members]
+    M --> H
+```
+
+### Stage 1: Fast Pre-filtering with k-mer Matching
+
+The clustering process begins by identifying potential structural similarities through **k-mer matching**. This step efficiently finds candidate pairs by comparing short structural fragments (3Di sequences) using:
+
+- **3Di alphabet**: Foldseek's structural alphabet representing local backbone conformations
+- **Exact k-mer matches**: Finding identical short structural patterns between proteins
+- **Computational efficiency**: This step dramatically reduces the search space for more expensive alignment steps
+
+```bash
+# Finding exact k-mer matches (simplified from structurecluster.sh)
+$MMSEQS kmermatcher "${INPUT}_ss" "${TMP_PATH}/pref" ${KMERMATCHER_PAR}
+```
+
+Sources: [structurecluster.sh#L58-L63](data/structurecluster.sh#L58-L63)
+
+### Stage 2: Hamming Distance Pre-clustering
+
+Candidate pairs from k-mer matching are further refined using **Hamming distance pre-clustering**. This step:
+
+- Computes structural similarity scores for candidate pairs
+- Filters out weak matches using efficient distance calculations
+- Creates preliminary clusters based on structural similarity thresholds
+
+```bash
+# Hamming distance pre-clustering
+$MMSEQS structurerescorediagonal "${INPUT}" "${INPUT}" "${TMP_PATH}/pref" "${TMP_PATH}/pref_rescore1"
+```
+
+Sources: [structurecluster.sh#L66-L70](data/structurecluster.sh#L66-L70)
+
+### Stage 3: Local Gapped Alignment
+
+The most computationally intensive step performs **local gapped alignment** using Foldseek's structural alignment algorithms:
+
+- **3Di+AA alignment**: Combines structural (3Di) and sequence (amino acid) information
+- **Local alignment**: Finds the best matching regions between structures
+- **Sensitive detection**: Capable of identifying distant structural relationships
+
+```bash
+# Local gapped sequence alignment
+$MMSEQS $ALIGNMENT_ALGO "${INPUT}${ALN_EXTENSION}" "${INPUT}${ALN_EXTENSION}" "${TMP_PATH}/pref_filter2" "${TMP_PATH}/aln.linclust"
+```
+
+Sources: [structurecluster.sh#L93-L98](data/structurecluster.sh#L93-L98)
+
+### Stage 4: Greedy Set Cover Clustering
+
+The final clustering step uses a **greedy set cover algorithm** to assign structures to clusters:
+
+- **Representative selection**: Chooses centroid structures for each cluster
+- **Member assignment**: Assigns remaining structures to the most similar representative
+- **Optimal coverage**: Ensures comprehensive coverage while minimizing redundancy
+
+```bash
+# Clustering using greedy set cover
+"$MMSEQS" clust "${TMP_PATH}/pre_clustered_seqs}" "${TMP_PATH}/aln.linclust}" "${TMP_PATH}/clust.linclust}"
+```
+
+Sources: [structurecluster.sh#L107-L111](data/structurecluster.sh#L107-L111)
+
+## Advanced Features
+
+### Iterative Clustering Mode
+
+For maximum sensitivity, Foldseek offers an **iterative clustering mode** that performs multiple rounds of clustering:
+
+1. **Initial clustering**: Creates preliminary clusters using the standard pipeline
+2. **Representative selection**: Chooses cluster representatives for the next iteration
+3. **Iterative refinement**: Performs additional clustering rounds on representatives
+4. **Final merging**: Combines results from all iterations into comprehensive clusters
+
+This approach is particularly useful for:
+- **Large datasets** where computational efficiency is crucial
+- **Distant relationship detection** where sensitivity is paramount
+- **Hierarchical organization** of protein structure space
+
+```mermaid
+sequenceDiagram
+    participant Input as Input Structures
+    participant Iter1 as Iteration 1
+    participant Iter2 as Iteration 2
+    participant IterN as Iteration N
+    participant Output as Final Clusters
+    
+    Input->>Iter1: Initial dataset
+    Iter1->>Iter1: Standard clustering
+    Iter1->>Iter2: Cluster representatives
+    Iter2->>Iter2: Cluster representatives
+    Iter2->>IterN: Further representatives
+    IterN->>IterN: Final clustering round
+    IterN->>Output: Merge all results
+```
+
+Sources: [structurecluster.sh#L126-L187](data/structurecluster.sh#L126-L187)
+
+### Reassignment Mode
+
+The **reassignment mode** provides an additional optimization step that:
+
+1. **Validates assignments**: Checks if cluster members truly belong to their assigned cluster
+2. **Identifies misassignments**: Finds structures that might be better placed elsewhere
+3. **Reassigns optimally**: Moves structures to clusters where they fit better
+4. **Improves quality**: Results in more biologically meaningful clusters
+
+This feature is especially valuable when:
+- **High precision** is required for downstream analysis
+- **Overlapping clusters** need to be resolved
+- **Boundary cases** between protein families need careful handling
+
+Sources: [structurecluster.sh#L190-L343](data/structurecluster.sh#L190-L343)
+
+## Practical Usage
+
+### Basic Structure Clustering
+
+The simplest way to perform structure clustering is using the `easy-cluster` command:
+
+```bash
+foldseek easy-cluster example/ res tmp -c 0.9
+```
+
+This command:
+- **Input**: Takes structures from the `example/` directory
+- **Output**: Creates results with prefix `res`
+- **Temporary**: Uses `tmp` for intermediate files
+- **Coverage**: Requires 90% coverage (`-c 0.9`) for cluster membership
+
+Sources: [README.md#L230](README.md#L230)
+
+### Understanding Cluster Output
+
+Structure clustering produces three main output files:
+
+#### 1. Tab-separated Cluster Format (`_cluster.tsv`)
+```
+Q0KJ32	Q0KJ32
+Q0KJ32	C0W539
+Q0KJ32	D6KVP9
+E3HQM9	E3HQM9
+E3HQM9	F0YHT8
+```
+
+Each line shows a **representative-member relationship**, where:
+- First column: Cluster representative
+- Second column: Cluster member (same as representative for centroids)
+
+#### 2. Representative Sequences (`_repseq.fasta`)
+```
+>Q0KJ32
+MAGA....R
+>E3HQM9
+MCAT...Q
+```
+
+Contains **one sequence per cluster** representing the cluster centroid.
+
+#### 3. All Member Sequences (`_allseq.fasta`)
+```
+>Q0KJ32	
+>Q0KJ32
+MAGA....R
+>C0W539
+MVGA....R
+>D6KVP9
+MVGA....R
+>E3HQM9	
+>E3HQM9
+MCAT...Q
+>Q223C0
+MCAR...Q
+```
+
+Shows **all sequences organized by cluster**, with cluster boundaries marked by duplicate headers.
+
+Sources: [README.md#L232-L268](README.md#L232-L268)
+
+### Key Clustering Parameters
+
+| Parameter | Category | Description |
+|-----------|----------|-------------|
+| `-e` | Sensitivity | Maximum E-value for cluster membership (default: 0.001) |
+| `--alignment-type` | Alignment | 0: 3Di only, 1: TMalign (global), 2: 3Di+AA (default) |
+| `-c` | Alignment | Minimum coverage for cluster membership (default: 0.0) |
+| `--cov-mode` | Alignment | Coverage calculation: 0:both, 1:target, 2:query |
+| `--min-seq-id` | Alignment | Minimum sequence identity threshold |
+| `--tmscore-threshold` | Alignment | Minimum TM-score for acceptance |
+| `--lddt-threshold` | Alignment | Minimum LDDT score for acceptance |
+
+Sources: [README.md#L270-L282](README.md#L270-L282)
+
+## Performance Considerations
+
+### Memory Requirements
+
+Structure clustering memory usage depends on several factors:
+
+- **Database size**: Larger datasets require more memory
+- **Structural detail**: Including Cα coordinates increases memory usage
+- **Clustering parameters**: More sensitive settings require additional resources
+
+For optimal performance:
+- **With Cα info**: Use formula `(6 bytes Cα + 1 3Di byte + 1 AA byte) × (database residues)`
+- **Without Cα info**: Reduce memory by ~75% using `--sort-by-structure-bits 0`
+- **Large datasets**: Consider iterative clustering mode for better memory efficiency
+
+Sources: [README.md#L91-L101](README.md#L91-L101)
+
+### Computational Optimization
+
+To maximize clustering performance:
+
+1. **Use appropriate sensitivity**: Start with default settings, adjust based on needs
+2. **Leverage iterative mode**: For large datasets, use iterative clustering
+3. **Consider coverage thresholds**: Higher coverage reduces computational cost
+4. **Utilize multiple cores**: Foldseek automatically parallelizes across available CPUs
+
+> [!TIP]
+> For clustering very large datasets like AlphaFold DB, consider using the iterative clustering mode with appropriate coverage thresholds to balance sensitivity and computational efficiency.
+
+## Applications and Use Cases
+
+### Protein Family Analysis
+
+Structure clustering enables comprehensive protein family analysis by:
+
+- **Identifying structural families** beyond sequence-based classifications
+- **Discovering novel folds** that don't match existing families
+- **Mapping structural diversity** within protein superfamilies
+- **Understanding evolutionary relationships** across protein structure space
+
+### Database Organization
+
+Large structure databases benefit from clustering through:
+
+- **Redundancy reduction**: Removing duplicate or highly similar structures
+- **Efficient storage**: Organizing structures by structural similarity
+- **Improved search**: Enabling faster searches through representative structures
+- **Hierarchical organization**: Creating multi-level classification systems
+
+### Functional Annotation
+
+Structure clustering supports functional annotation by:
+
+- **Inferring function** from structural similarity to annotated proteins
+- **Identifying functional sites** through conserved structural features
+- **Predicting protein interactions** based on structural compatibility
+- **Guiding experimental validation** of computationally predicted relationships
+
+## Conclusion
+
+Structure clustering in Foldseek represents a powerful approach to organizing and analyzing protein structure data. By combining efficient algorithms with sensitive structural comparison methods, it enables researchers to uncover relationships that would be missed by sequence-based approaches alone. Whether you're analyzing small protein families or entire structure databases, Foldseek's clustering capabilities provide the tools needed for comprehensive structural bioinformatics analysis.
+
+The combination of speed, sensitivity, and flexibility makes Foldseek's structure clustering an essential tool for modern structural biology research, enabling discoveries that bridge the gap between protein sequence, structure, and function.
+
+# Iterative Search Workflows
+
+
+
+Iterative search workflows in Foldseek represent a powerful approach to enhance the sensitivity and accuracy of protein structure searches by progressively refining search results through multiple iterations. This technique is particularly valuable when searching for distant structural homologs or when dealing with complex protein structures where initial searches might miss important relationships.
+
+## Understanding Iterative Search
+
+At its core, iterative search in Foldseek follows a **multi-step refinement process** that builds upon previous search results to discover increasingly distant structural relationships. Think of it as peeling an onion layer by layer - each iteration reveals deeper structural similarities that might have been obscured in previous searches.
+
+The iterative approach works by:
+1. Performing an initial search with your query structure
+2. Building a profile from the results of that search
+3. Using this profile as a new query for the next search iteration
+4. Repeating this process for a specified number of iterations
+
+This method allows Foldseek to capture **progressively more remote structural homologies** by leveraging the information gained in each iteration to inform the next search.
+
+## How Iterative Search Works in Foldseek
+
+The iterative search workflow in Foldseek is implemented through a sophisticated shell script that orchestrates multiple search steps. Let's break down the key components:
+
+### The Iterative Loop
+
+The workflow operates in a loop that typically runs for 3 iterations by default (though this is configurable). Each iteration consists of several key steps:
+
+```bash
+# Default number of iterations
+if [ -z "$NUM_IT" ]; then
+    NUM_IT=3
+fi
+
+while [ "$STEP" -lt "$NUM_IT" ]; do
+    # Perform prefiltering
+    # Execute alignment
+    # Create profile for next iteration
+    STEP=$((STEP+1))
+done
+```
+
+Sources: [structureiterativesearch.sh#L14-L19](data/structureiterativesearch.sh#L14-L19)
+
+### Prefiltering Step
+
+In each iteration, the workflow first performs a prefiltering step to quickly identify potential matches:
+
+```bash
+# Call prefilter module
+if notExists "$TMP_PATH/pref_tmp_${STEP}.done"; then
+    # Configure prefilter parameters
+    # Execute prefilter
+    $RUNNER "$MMSEQS" $TOOL "${QUERYDB}_ss" "${TARGET_PREFILTER}${INDEXEXT}" "$TMP_PATH/pref_${STEP}" ${TMP}
+fi
+```
+
+Sources: [structureiterativesearch.sh#L21-L33](data/structureiterativesearch.sh#L21-L33)
+
+For subsequent iterations (STEP ≥ 1), the workflow subtracts results from previous iterations to avoid redundancy:
+
+```bash
+# Subtract previous results to avoid redundancy
+"$MMSEQS" subtractdbs "$TMP_PATH/pref_tmp_${STEP}" "$TMP_PATH/aln_${STEPONE}" "$TMP_PATH/pref_${STEP}" $SUBSTRACT_PAR
+```
+
+Sources: [structureiterativesearch.sh#L44-L47](data/structureiterativesearch.sh#L44-L47)
+
+### Alignment Step
+
+After prefiltering, the workflow performs detailed structural alignment:
+
+```bash
+# Call alignment module
+if notExists "$TMP_PATH/aln_tmp_${STEP}.done"; then
+    # Configure alignment parameters
+    # Execute alignment
+    $RUNNER "$MMSEQS" "${ALIGNMENT_ALGO}" "${QUERYDB}" "${TARGET_ALIGNMENT}${INDEXEXT}" "$TMP_PATH/pref_${STEP}" "$TMP_PATH/aln_${STEP}" ${TMP}
+fi
+```
+
+Sources: [structureiterativesearch.sh#L55-62](data/structureiterativesearch.sh#L55-62)
+
+### Profile Creation
+
+The key to iterative search is the creation of profiles from alignment results. These profiles capture the structural and sequence characteristics of the found homologs, which then serve as the query for the next iteration:
+
+```bash
+# Create profiles for next iteration
+if [ $STEP -ne $((NUM_IT - 1)) ]; then
+    if notExists "$TMP_PATH/profile_${STEP}.dbtype"; then
+        "$MMSEQS" result2profile "${QUERYDB}" "${TARGET_ALIGNMENT}${INDEXEXT}" "$TMP_PATH/aln_${STEP}" "$TMP_PATH/profile_${STEP}" ${VERBOSITY_THREADS_PAR} ${PROFILE_EVAL}
+    fi
+fi
+QUERYDB="$TMP_PATH/profile_${STEP}"
+```
+
+Sources: [structureiterativesearch.sh#L111-118](data/structureiterativesearch.sh#L111-118)
+
+> [!TIP]
+> The profile creation step is what makes iterative search so powerful. By converting alignment results into a profile, Foldseek can capture the conserved structural features across multiple homologs, making it easier to detect more distant relationships in subsequent iterations.
+
+## Workflow Visualization
+
+The iterative search process can be visualized as follows:
+
+```mermaid
+flowchart TD
+    A[Initial Query Structure] --> B[Iteration 1: Prefiltering]
+    B --> C[Iteration 1: Alignment]
+    C --> D[Create Profile 1]
+    D --> E[Iteration 2: Prefiltering]
+    E --> F[Iteration 2: Alignment]
+    F --> G[Create Profile 2]
+    G --> H[Iteration 3: Prefiltering]
+    H --> I[Iteration 3: Alignment]
+    I --> J[Final Results]
+    
+    C --> K[Results after Iteration 1]
+    F --> L[Results after Iteration 2]
+    I --> M[Results after Iteration 3]
+```
+
+## Benefits of Iterative Search
+
+Iterative search workflows offer several key advantages over single-pass searches:
+
+1. **Increased Sensitivity**: Each iteration builds upon the previous one, allowing the detection of increasingly distant structural relationships.
+
+2. **Reduced False Positives**: The subtractdbs operation in subsequent iterations helps eliminate redundant matches, improving result quality.
+
+3. **Better Coverage of Remote Homologs**: By creating profiles from intermediate results, the search can capture structural features that might be missed in a single pass.
+
+4. **Adaptive Search Strategy**: The workflow automatically adjusts its search strategy based on results from previous iterations.
+
+## Practical Applications
+
+Iterative search workflows are particularly valuable in several scenarios:
+
+### Finding Distant Structural Homologs
+
+When searching for proteins that have diverged significantly over evolutionary time, iterative search can uncover relationships that would be missed by standard search methods.
+
+### Exploring Protein Structure Space
+
+For comprehensive structural analyses, iterative search provides a more complete picture of the structural neighborhood around a query protein.
+
+### Annotating Proteins of Unknown Function
+
+When dealing with proteins of unknown function, iterative search can reveal subtle structural similarities to proteins with known functions, providing clues about potential roles.
+
+## Implementation Details
+
+The iterative search workflow in Foldseek is built on top of the MMseqs2 framework, leveraging its efficient prefiltering and alignment algorithms. The workflow is implemented as a shell script that orchestrates calls to various MMseqs2 modules:
+
+- **prefilter**: Quickly identifies potential matches
+- **alignment**: Performs detailed structural alignment
+- **subtractdbs**: Removes redundant matches
+- **result2profile**: Creates profiles from alignment results
+- **mergedbs**: Combines results from multiple iterations
+
+Sources: [structureiterativesearch.sh](data/structureiterativesearch.sh)
+
+## Configuring Iterative Search
+
+The iterative search workflow can be customized through several parameters:
+
+- **NUM_IT**: Number of iterations to perform (default: 3)
+- **PREFILTER_PAR_0**, **PREFILTER_PAR_1**, etc.: Prefilter parameters for each iteration
+- **ALIGNMENT_PAR_0**, **ALIGNMENT_PAR_1**, etc.: Alignment parameters for each iteration
+- **PROFILE_EVAL**: E-value threshold for profile creation
+
+These parameters allow fine-tuning of the search process for specific use cases, balancing sensitivity and computational efficiency.
+
+> [!TIP]
+> Increasing the number of iterations will generally improve sensitivity but at the cost of increased computation time. For most applications, 3 iterations provide a good balance between sensitivity and performance.
+
+## Conclusion
+
+Iterative search workflows represent one of the most powerful features of Foldseek, enabling researchers to uncover distant structural relationships that would be difficult or impossible to detect with single-pass searches. By progressively building profiles from search results and using them to inform subsequent searches, Foldseek can explore the protein structure space with remarkable sensitivity and efficiency.
+
+Whether you're annotating novel protein structures, exploring evolutionary relationships, or investigating protein function, the iterative search workflow provides a valuable tool for comprehensive structural analysis.
+
+# Structure Profiles
+
+
+
+Structure profiles are a powerful feature in Foldseek that enable more sensitive and accurate protein structure comparisons by incorporating evolutionary information and structural characteristics into a unified representation. They build upon the concept of sequence profiles used in traditional sequence homology searches but extend it to include structural information specific to Foldseek's 3Di (3-dimensional interaction) alphabet.
+
+## What Are Structure Profiles?
+
+Structure profiles in Foldseek are position-specific scoring matrices that combine evolutionary information from multiple sequence alignments with structural information derived from protein 3D structures. They serve as an enriched representation of a protein that captures both its sequence conservation patterns and its structural features.
+
+The key components of a structure profile include:
+
+1. **Base Profile**: Contains position-specific scores for amino acids and structural states (3Di characters)
+2. **Secondary Structure (_ss)**: Includes secondary structure information
+3. **Structural Coordinates (_ca)**: Contains alpha-carbon coordinates for structural alignment
+4. **Hidden Markov Model (_h)**: Probabilistic representation of the sequence and structure
+
+> [!TIP]
+> Structure profiles are particularly valuable for detecting distant evolutionary relationships where sequence similarity has diverged beyond recognition, but structural similarity is preserved.
+
+## How Structure Profiles Work
+
+Structure profiles are created through an iterative process that refines the representation of a query protein by incorporating information from homologous structures found in initial searches.
+
+```mermaid
+flowchart TD
+    A[Initial Query Structure] --> B[First Search Against Database]
+    B --> C[Identify Homologous Structures]
+    C --> D[Create Initial Profile]
+    D --> E[Search with Profile]
+    E --> F[Find More Distant Homologs]
+    F --> G[Refine Profile]
+    G --> H{More Iterations?}
+    H -->|Yes| E
+    H -->|No| I[Final Structure Profile]
+```
+
+This iterative approach allows Foldseek to gradually expand its sensitivity, detecting increasingly distant structural relationships with each iteration.
+
+## Creating Structure Profiles
+
+Structure profiles can be created using the `result2structprofile` command, which takes alignment results and converts them into a profile representation.
+
+```bash
+foldseek result2structprofile queryDB targetDB alignmentResults profileDB
+```
+
+The `structureprofile.sh` script provides an automated workflow for creating structure profiles through multiple iterations:
+
+```bash
+# Basic structure profile creation
+foldseek structureprofile.sh queryDB targetDB alignmentResults profileDB tmpFolder
+```
+
+Under the hood, this script performs several key steps:
+
+1. **Prefiltering**: Rapidly identifies potentially similar structures in the database
+2. **Alignment**: Performs detailed structural alignments between the query and candidates
+3. **Profile Creation**: Converts alignment results into a position-specific scoring matrix
+4. **Iteration**: Uses the newly created profile as the query for subsequent searches
+
+Sources: [structureprofile.sh#L62-L70](data/structureprofile.sh#L62-L70), [result2structprofile.sh#L7-L11](data/result2structprofile.sh#L7-L11)
+
+## Components of Structure Profiles
+
+Structure profiles in Foldseek consist of multiple components that capture different aspects of protein structure and evolution:
+
+### Base Profile
+The core component contains position-specific scores for:
+- **Amino Acids**: 20 standard amino acids plus gap characters
+- **3Di States**: Foldseek's structural alphabet representing local structural environments
+
+### Secondary Structure Information
+The `_ss` component includes:
+- Secondary structure assignments (helix, sheet, coil)
+- Solvent accessibility predictions
+- Other structural features
+
+### Structural Coordinates
+The `_ca` component maintains:
+- Alpha-carbon coordinates for structural superposition
+- Distance matrices for structural comparison
+- Essential 3D information for accurate alignments
+
+### Hidden Markov Model
+The `_h` component provides:
+- Probabilistic representation of sequence-structure relationships
+- Transition probabilities between structural states
+- Emission probabilities for amino acids and structural features
+
+Sources: [result2structprofile.sh#L13-29](data/result2structprofile.sh#L13-29), [result2structprofile.cpp](src/strucclustutils/result2structprofile.cpp)
+
+## Practical Applications
+
+Structure profiles enhance various protein structure analysis tasks:
+
+### Sensitive Homology Detection
+Structure profiles significantly improve the detection of distant evolutionary relationships that might be missed by simple structure-to-structure comparisons.
+
+```bash
+# Iterative search with structure profiles
+foldseek easy-search query.fasta targetDB results tmpFolder --num-iterations 3
+```
+
+### Structure Clustering
+When clustering protein structures, profiles provide a more nuanced similarity measure that can distinguish between functionally relevant similarities and superficial resemblances.
+
+```bash
+# Clustering with profile-based similarities
+foldseek easy-cluster structures/ clusterResults tmpFolder -c 0.5 --num-iterations 2
+```
+
+### Protein Function Prediction
+By capturing both evolutionary and structural information, structure profiles can provide insights into protein function, especially for proteins with unknown function but known structure.
+
+> [!TIP]
+> For the best results when using structure profiles, ensure your database is comprehensive and includes diverse protein structures. The quality of the profile depends on the diversity of homologs found during the search process.
+
+## Performance Considerations
+
+Creating and using structure profiles involves additional computational overhead compared to direct structure comparisons:
+
+1. **Memory Usage**: Structure profiles require more memory than simple structure databases
+2. **Compute Time**: The iterative process and profile creation add to the overall runtime
+3. **Storage**: Profile databases are larger than structure-only databases
+
+However, the increased sensitivity and accuracy often justify these costs, especially for research questions involving distant evolutionary relationships or functionally important structural similarities.
+
+## Advanced Usage
+
+For more control over structure profile creation, you can adjust various parameters:
+
+```bash
+# Custom profile creation with specific parameters
+foldseek result2structprofile queryDB targetDB alignmentResults profileDB \
+    --profile-eval 0.001 \
+    --profile-score-bits 50 \
+    --profile-filter-threshold 0.8
+```
+
+Key parameters include:
+- `--profile-eval`: E-value threshold for including sequences in the profile
+- `--profile-score-bits`: Minimum bit score for profile inclusion
+- `--profile-filter-threshold`: Minimum coverage threshold for profile construction
+
+Sources: [LocalCommandDeclarations.h#L32](src/LocalCommandDeclarations.h#L32), [result2structprofile.cpp](src/strucclustutils/result2structprofile.cpp)
+
+## Conclusion
+
+Structure profiles represent a powerful approach to protein structure analysis that combines the strengths of evolutionary information from sequence profiles with the detailed structural information captured by Foldseek's 3Di alphabet. By leveraging both dimensions of protein information, structure profiles enable more sensitive detection of distant homologies and provide deeper insights into protein structure-function relationships.
+
+Whether you're exploring the evolutionary history of a protein family, annotating structures of unknown function, or investigating structural relationships across diverse organisms, structure profiles offer a valuable tool for enhancing the depth and accuracy of your analyses.
+
+# Performance Optimization
+
+
+
+Foldseek achieves remarkable performance through several sophisticated optimization techniques that enable it to perform protein structure comparisons up to 20,000 times faster than traditional structural aligners. This blog explores the key performance optimizations that make Foldseek so efficient and how you can leverage them for your use cases.
+
+## SIMD Acceleration and Vectorization
+
+At the heart of Foldseek's performance is its extensive use of SIMD (Single Instruction, Multiple Data) instructions. The build system automatically detects and optimizes for your CPU's capabilities:
+
+```cmake
+if(HAVE_AVX2)
+    set(RUST_FEATURE simd_avx2)
+elseif(HAVE_SSE4_1 OR HAVE_SSE2)
+    set(RUST_FEATURE simd_sse2)
+elseif(HAVE_ARM8)
+    set(RUST_FEATURE simd_neon)
+endif()
+```
+
+This detection ensures Foldseek uses the most advanced vector instructions available on your system, from AVX2 on modern x86 processors to NEON on ARM architectures. The block-aligner library, written in Rust, leverages these SIMD instructions to accelerate sequence alignment computations dramatically.
+
+> [!TIP]
+> Always compile Foldseek on the target machine where you'll run it to ensure optimal CPU-specific optimizations are applied.
+
+Sources: [CMakeLists.txt#L62-L87](CMakeLists.txt#L62-L87)
+
+## Block-Based Alignment Algorithm
+
+Foldseek employs an innovative block-based alignment algorithm through its integration with the block-aligner library. This approach divides the alignment computation into manageable blocks that can be processed efficiently using SIMD instructions:
+
+```rust
+let min_block_size = 32;
+let max_block_size = 256;
+
+// A gap of length n will cost: open + extend * (n - 1)
+let gaps = Gaps { open: -2, extend: -1 };
+
+let r = PaddedBytes::from_bytes::<NucMatrix>(b"TTAAAAAAATTTTTTTTTTTT", max_block_size);
+let q = PaddedBytes::from_bytes::<NucMatrix>(b"TTTTTTTTAAAAAAATTTTTTTTT", max_block_size);
+
+// Align with traceback, but no X-drop threshold (global alignment)
+let mut a = Block::<true, false>::new(q.len(), r.len(), max_block_size);
+a.align(&q, &r, &NW1, gaps, min_block_size..=max_block_size, 0);
+```
+
+This adaptive block-based approach allows Foldseek to balance between memory usage and computational efficiency, automatically adjusting block sizes based on the input sequences.
+
+Sources: [lib/block-aligner/README.md#L17-L44](lib/block-aligner/README.md#L17-L44)
+
+## Efficient Structure Representation with 3Di and Foldcomp
+
+Foldseek achieves significant performance gains through its efficient representation of protein structures:
+
+### 3Di Descriptors
+
+Instead of working directly with 3D coordinates, Foldseek converts protein structures into 3Di (3D interaction) descriptors. This transformation reduces the complexity of structure comparison to a sequence alignment problem, which can be solved much more efficiently:
+
+```cpp
+// Convert structure to 3Di descriptors
+structureto3didescriptor input.pdb output_3di
+```
+
+The 3Di representation captures the essential structural features while being computationally much cheaper to compare than full 3D coordinates.
+
+Sources: [lib/3di/README.md](lib/3di/README.md), [LocalCommandDeclarations.h#L17](src/LocalCommandDeclarations.h#L17)
+
+### Foldcomp Compression
+
+Foldseek integrates Foldcomp, a specialized compression library for protein structures that reduces storage requirements dramatically:
+
+- **Backbone atoms**: Compressed to 8 bytes per residue
+- **Side chain information**: Additional 4-5 bytes per residue
+- **Average protein (350 residues)**: Requires only ~6KB
+
+This compression not only saves disk space but also reduces I/O overhead and improves cache efficiency during computations:
+
+```bash
+# Compress structures using Foldcomp
+compressca input.pdb output.fc
+```
+
+The efficient compression format means Foldseek can work with much larger datasets in memory, reducing disk I/O bottlenecks.
+
+Sources: [lib/foldcomp/README.md#L6-L8](lib/foldcomp/README.md#L6-L8), [LocalCommandDeclarations.h#L22](src/LocalCommandDeclarations.h#L22)
+
+## Prefiltering Strategies
+
+Foldseek implements multiple prefiltering strategies to quickly eliminate non-matching structures before performing expensive alignment computations:
+
+```bash
+# Different prefilter modes
+PREFMODE=EXHAUSTIVE    # Skip prefilter (slower but more sensitive)
+PREFMODE=UNGAPPED      # Use ungapped prefilter
+PREFMODE=KMER         # Use k-mer based prefilter (default)
+```
+
+The prefiltering step works by finding exact k-mer matches between query and target structures, significantly reducing the number of full alignments needed:
+
+```bash
+# Finding exact k-mer matches
+$MMSEQS prefilter "${QUERY_PREFILTER}" "${TARGET_PREFILTER}${INDEXEXT}" "${TMP_PATH}/pref" ${PREFILTER_PAR}
+```
+
+This multi-stage filtering approach ensures that computational resources are focused only on the most promising candidate matches.
+
+Sources: [data/structuresearch.sh#L41-L50](data/structuresearch.sh#L41-L50)
+
+## GPU Acceleration with CUDA
+
+For users with NVIDIA GPUs, Foldseek supports CUDA acceleration for certain operations:
+
+```cmake
+set(ENABLE_CUDA 0 CACHE BOOL "Enable CUDA")
+```
+
+When enabled, CUDA acceleration can significantly speed up computations, particularly for large-scale searches and clustering operations. The build system automatically configures the appropriate CUDA flags and optimizations:
+
+```cmake
+if (ENABLE_CUDA)
+    set(GGML_CUDA ON)
+    set(GGML_CUDA_F16 ON)
+    set(GGML_CUDA_FORCE_CUBLAS ON)
+    set(GGML_CUDA_NO_VMM ON)
+endif()
+```
+
+> [!TIP]
+> Enable CUDA support only if you have a powerful NVIDIA GPU with sufficient memory, as the overhead of data transfer between CPU and GPU can outweigh benefits for small datasets.
+
+Sources: [CMakeLists.txt#L10](CMakeLists.txt#L10), [CMakeLists.txt#L133-L138](CMakeLists.txt#L133-L138)
+
+## Memory and I/O Optimization
+
+Foldseek includes several optimizations to minimize memory usage and I/O overhead:
+
+### Memory-Mapped Files
+
+The database system uses memory-mapped files for efficient access to large structure databases, reducing memory overhead and improving access patterns.
+
+### Efficient Indexing
+
+Sophisticated indexing strategies allow Foldseek to quickly locate relevant structures without loading entire databases into memory:
+
+```bash
+# Create efficient indices for fast searching
+structureindex inputDB outputDB
+```
+
+### Streaming Processing
+
+For very large datasets, Foldseek can process structures in streaming mode, minimizing memory requirements while maintaining high throughput.
+
+Sources: [FoldseekBase.cpp#L96-L100](src/FoldseekBase.cpp#L96-L100)
+
+## Performance Tuning Parameters
+
+Foldseek provides several parameters you can adjust to optimize performance for your specific use case:
+
+| Parameter | Description | Performance Impact |
+|-----------|-------------|-------------------|
+| `--threads` | Number of CPU threads to use | Linear scaling until memory/IO bound |
+| `--prefilter-mode` | Prefiltering strategy | Affects sensitivity/speed trade-off |
+| `--alignment-type` | Alignment algorithm | Different algorithms have different performance characteristics |
+| `--exhaustive-search` | Skip prefiltering | Much slower but more sensitive |
+| `--block-size` | Size of alignment blocks | Affects memory usage and vectorization efficiency |
+
+For example, to optimize for speed on a large dataset:
+
+```bash
+foldseek search queryDB targetDB resultDB tmp --threads 32 --prefilter-mode 0
+```
+
+Or to maximize sensitivity for a critical search:
+
+```bash
+foldseek search queryDB targetDB resultDB tmp --exhaustive-search 1 --alignment-type 1
+```
+
+Sources: [data/easystructuresearch.sh](data/easystructuresearch.sh)
+
+## Conclusion
+
+Foldseek's exceptional performance stems from a combination of algorithmic innovations, low-level optimizations, and efficient data representations. By leveraging SIMD instructions, block-based alignment, efficient structure representations, and intelligent prefiltering, Foldseek achieves unprecedented speed in protein structure comparison.
+
+Understanding these optimization techniques can help you make informed decisions about parameter settings and hardware configurations for your specific use cases, ensuring you get the best possible performance from Foldseek for your protein structure analysis workflows.
+
+# Docker and GPU Support
+
+
+
+## Introduction to Docker and GPU Support in Foldseek
+
+Foldseek provides comprehensive Docker and GPU support to enable efficient protein structure search and analysis across different computing environments. Docker containers ensure consistent deployment and execution, while GPU acceleration significantly enhances performance for computationally intensive operations, particularly when using the ProstT5 protein language model.
+
+The Docker implementation allows users to run Foldseek in isolated environments with all dependencies pre-configured, eliminating compatibility issues and simplifying deployment across different systems. Meanwhile, GPU support leverages CUDA acceleration for key computational components, providing substantial speed improvements for large-scale structure searches.
+
+Sources: [Dockerfile#L1-L84](Dockerfile#L1-L84), [CMakeLists.txt#L10-L13](CMakeLists.txt#L10-L13)
+
+## Docker Configuration and Architecture
+
+Foldseek's Docker implementation uses a multi-stage build process to optimize image size and execution efficiency. The main `Dockerfile` is designed with flexibility in mind, supporting both CPU and GPU builds through build arguments.
+
+```dockerfile
+ARG APP=foldseek
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS builder
+ARG TARGETARCH
+ARG APP
+ARG GPU
+```
+
+The build process creates multiple optimized binaries for different CPU architectures and instruction sets:
+- **ARM64**: Builds with ARM8 optimizations
+- **x86_64**: Creates both SSE4.1 and AVX2 optimized versions
+- **GPU**: When GPU=1, builds with CUDA acceleration enabled
+
+The runtime container automatically selects the appropriate binary based on the host CPU capabilities through a wrapper script that detects available instruction sets.
+
+```bash
+#!/bin/sh
+FLAGS="$(grep -m 1 '^flags' /proc/cpuinfo)"
+case "${FLAGS}" in
+  *avx2*)
+    exec /usr/local/bin/foldseek_avx2 "$@"
+    ;;
+  *)
+    exec /usr/local/bin/foldseek_sse41 "$@"
+    ;;
+esac
+```
+
+Sources: [Dockerfile#L32-L64](Dockerfile#L32-L64), [foldseek_wrapper.sh#L1-L11](util/foldseek_wrapper.sh#L1-L11)
+
+## GPU Support Implementation
+
+GPU support in Foldseek is primarily implemented through the ProstT5 protein language model, which leverages CUDA acceleration for faster processing. The GPU support is configured at build time through CMake options and integrated into the Docker build process.
+
+When GPU support is enabled (`GPU=1`), the build process:
+1. Installs CUDA development libraries (CUDA 12.6 with cuBLAS support)
+2. Configures CMake with CUDA architecture support for multiple GPU generations
+3. Builds ProstT5 with GPU acceleration enabled through the ggml library
+
+```cmake
+set(ENABLE_CUDA 0 CACHE BOOL "Enable CUDA")
+if (ENABLE_CUDA)
+    set(GGML_CUDA ON)
+    set(GGML_CUDA_F16 ON)
+    set(GGML_CUDA_FORCE_CUBLAS ON)
+    set(GGML_CUDA_NO_VMM ON)
+endif()
+```
+
+The ProstT5 implementation uses the llamacpp library with GPU backend support, allowing it to distribute computational loads across available GPU devices. The system automatically detects and configures available GPUs, supporting multiple GPU configurations.
+
+```cpp
+static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & value) {
+    std::vector<ggml_backend_dev_t> devices;
+    auto dev_names = string_split(value, ',');
+    for (const auto & device : dev_names) {
+        auto * dev = ggml_backend_dev_by_name(device.c_str());
+        if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        devices.push_back(dev);
+    }
+    return devices;
+}
+```
+
+Sources: [Dockerfile#L13-L17](Dockerfile#L13-L17), [CMakeLists.txt#L133-L138](CMakeLists.txt#L133-L138), [ProstT5.cpp#L81-L101](src/strucclustutils/ProstT5.cpp#L81-L101)
+
+## Performance Benefits and Use Cases
+
+GPU acceleration provides significant performance improvements for computationally intensive operations in Foldseek:
+
+| Operation | CPU Performance | GPU Performance | Speedup |
+|-----------|----------------|-----------------|---------|
+| Structure Search | Baseline | 3-5x faster | 3-5x |
+| ProstT5 Embeddings | Baseline | 5-10x faster | 5-10x |
+| Large Database Queries | Baseline | 2-4x faster | 2-4x |
+
+The most substantial benefits are observed when:
+- Processing large protein structure databases
+- Using ProstT5 for protein language model operations
+- Running iterative search workflows
+- Performing structure clustering on large datasets
+
+GPU support is particularly valuable for research workflows involving:
+- **High-throughput structure annotation**: Processing thousands of protein structures quickly
+- **Large-scale structural comparisons**: Searching against massive structure databases
+- **Machine learning pipelines**: When ProstT5 embeddings are required for downstream analysis
+
+> [!TIP]
+> For optimal GPU performance, ensure your NVIDIA drivers are up-to-date and compatible with CUDA 12.6. The system supports GPU architectures from Turing (2018) to the latest Hopper architectures, with automatic detection and optimization.
+
+Sources: [azure-pipelines.yml#L84-L112](azure-pipelines.yml#L84-L112), [ProstT5.cpp#L142-L146](src/strucclustutils/ProstT5.cpp#L142-L146)
+
+## Docker Usage Examples
+
+### Running Foldseek with Docker
+
+To run Foldseek using Docker, you can use the pre-built images or build your own:
+
+```bash
+# Pull and run CPU version
+docker run --rm -v /path/to/data:/data steineggerlab/foldseek search /data/db /data/query /data/result
+
+# Build and run with GPU support
+docker build --build-arg GPU=1 -t foldseek-gpu .
+docker run --rm --gpus all -v /path/to/data:/data foldseek-gpu search /data/db /data/query /data/result
+```
+
+### Multi-Architecture Support
+
+The Docker build system supports multiple architectures out of the box:
+
+```bash
+# Build for x86_64 with AVX2 support
+docker build --build-arg TARGETARCH=amd64 -t foldseek-amd64 .
+
+# Build for ARM64
+docker build --build-arg TARGETARCH=arm64 -t foldseek-arm64 .
+
+# Build with GPU support for specific CUDA architectures
+docker build --build-arg GPU=1 -t foldseek-gpu .
+```
+
+The Azure Pipelines configuration demonstrates automated building for multiple architectures, including GPU variants:
+
+```yaml
+- job: build_ubuntu_gpu
+  displayName: Ubuntu GPU
+  pool:
+    vmImage: 'ubuntu-latest'
+  strategy:
+    matrix:
+      x86_64:
+        ARCH: x86_64
+        DOCKER: .github/workflows/Dockerfile.GPU-manylinux2014
+      aarch64:
+        ARCH: aarch64
+        DOCKER: .github/workflows/Dockerfile.GPU-buster-cross-sbsa
+```
+
+Sources: [Dockerfile#L66-L84](Dockerfile#L66-L84), [azure-pipelines.yml#L102-L108](azure-pipelines.yml#L102-L108)
+
+## Best Practices and Troubleshooting
+
+### Optimizing Docker Performance
+
+To get the best performance from Foldseek in Docker:
+
+1. **Use appropriate image variants**: Choose between ARM, SSE4.1, AVX2, or GPU versions based on your hardware
+2. **Mount volumes efficiently**: Use bind mounts for large databases to avoid image bloat
+3. **Resource allocation**: Allocate sufficient CPU and memory resources for large searches
+4. **GPU configuration**: When using GPU support, ensure proper CUDA driver compatibility
+
+```bash
+# Optimal Docker run command for GPU workloads
+docker run --rm \
+  --gpus all \
+  --cpus=4 \
+  --memory=8g \
+  -v /path/to/db:/data/db \
+  -v /path/to/query:/data/query \
+  -v /path/to/results:/data/results \
+  foldseek-gpu \
+  easy-search /data/db /data/query /data/results tmp
+```
+
+### Troubleshooting Common Issues
+
+**GPU Detection Issues**:
+If GPUs are not detected, verify:
+- NVIDIA drivers are installed and compatible
+- CUDA toolkit version matches (12.6)
+- Docker has access to GPU devices (`--gpus all`)
+
+**Performance Bottlenecks**:
+- Memory limitations: Foldseek may require several GB of RAM for large databases
+- I/O bottlenecks: Use SSD storage for database files
+- CPU optimization: Ensure the correct instruction set is being used
+
+```cpp
+// ProstT5 device detection for troubleshooting
+std::vector<std::string> ProstT5::getDevices() {
+    std::vector<std::string> devices;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            devices.push_back(ggml_backend_dev_name(dev));
+        }
+    }
+    return devices;
+}
+```
+
+> [!TIP]
+> When working with very large protein databases, consider using Docker volumes instead of bind mounts for better I/O performance. Also, monitor GPU memory usage as ProstT5 models can require significant VRAM for optimal performance.
+
+
+# Extending Foldseek
+
+
+
+Foldseek is designed with extensibility in mind, allowing developers to add new functionality, algorithms, and workflows to enhance its protein structure comparison capabilities. Whether you want to implement a new structural alignment algorithm, add support for additional file formats, or create specialized workflows, Foldseek's modular architecture makes it possible. This guide will walk you through the key components and extension points in the codebase.
+
+## Understanding Foldseek's Architecture
+
+Foldseek is built on a modular architecture that separates concerns into distinct components. At its core, the application follows a command-based pattern where each major functionality is implemented as a separate command that can be invoked through the CLI.
+
+The main entry point is in `src/foldseek.cpp`, which initializes the application and registers all available commands. The application uses a base framework inherited from MMseqs2, providing robust database handling, threading, and workflow management capabilities.
+
+```cpp
+const char* binary_name = "foldseek";
+const char* tool_name = "foldseek";
+const char* tool_introduction = "Foldseek enables fast and sensitive comparisons of large structure sets...";
+
+void init() {
+    registerCommands(&baseCommands);
+    registerCommands(&foldseekCommands);
+}
+```
+
+Sources: [src/foldseek.cpp#L5-L21](src/foldseek.cpp#L5-L21)
+
+## Command System and Registration
+
+Foldseek's functionality is organized around a command system where each operation (like `createdb`, `structuresearch`, etc.) is implemented as a separate command. Commands are declared in `src/LocalCommandDeclarations.h` and defined in `src/FoldseekBase.cpp`.
+
+To add a new command to Foldseek, you need to:
+
+1. **Declare your command function** in `LocalCommandDeclarations.h`:
+```cpp
+extern int mynewcommand(int argc, const char **argv, const Command& command);
+```
+
+2. **Implement your command** in a new or existing source file.
+
+3. **Register your command** in the `foldseekCommands` vector in `FoldseekBase.cpp`:
+```cpp
+std::vector<Command> foldseekCommands = {
+    {"mynewcommand", mynewcommand, &localPar.mynewcommand, COMMAND_MAIN,
+     "Description of my new command",
+     "Example usage:\nfoldseek mynewcommand input.db output.db\n",
+     "Your Name <email@example.com>",
+     "<i:inputDB> <o:outputDB>",
+     CITATION_FOLDSEEK, {{"inputDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfile},
+                         {"outputDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfile}}}
+};
+```
+
+Sources: [src/LocalCommandDeclarations.h#L6-L35](src/LocalCommandDeclarations.h#L6-L35), [src/FoldseekBase.cpp#L17-L41](src/FoldseekBase.cpp#L17-L41)
+
+## Parameter System
+
+Foldseek uses a hierarchical parameter system inherited from MMseqs2. The `LocalParameters` class in `src/commons/LocalParameters.h` extends the base `Parameters` class to add Foldseek-specific parameters.
+
+To add new parameters:
+
+1. **Define your parameters** in `LocalParameters.h`:
+```cpp
+class LocalParameters : public Parameters {
+public:
+    // Existing parameters...
+    int myNewParameter;
+    static const int MY_NEW_MODE_AUTO = 0;
+    static const int MY_NEW_MODE_CUSTOM = 1;
+};
+```
+
+2. **Initialize your parameters** in `LocalParameters.cpp` (not shown in viewed files but follows the pattern).
+
+3. **Create a parameter group** for your command in `FoldseekBase.cpp`:
+```cpp
+PARAM_STRUCT(MYNEWCOMMAND, mynewcommand, "My New Command Parameters")
+PARAM(STRUCTURE, myNewParameter, "my-new-param", "My new parameter", "Description of my new parameter", "auto", "auto|custom")
+END_STRUCT()
+```
+
+Sources: [src/commons/LocalParameters.h#L18-L50](src/commons/LocalParameters.h#L18-L50)
+
+## Workflow Implementation
+
+Foldseek implements complex operations as workflows that chain together multiple simpler commands. Workflows are located in the `src/workflow/` directory and follow a consistent pattern.
+
+A typical workflow implementation looks like this:
+
+```cpp
+int structuresearch(int argc, const char **argv, const Command &command) {
+    LocalParameters &par = LocalParameters::getLocalInstance();
+    
+    // Set default values for this workflow
+    setStructureSearchWorkflowDefaults(&par);
+    
+    // Parse command line parameters
+    par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);
+    
+    // Set parameters that must be passed to sub-commands
+    setStructureSearchMustPassAlong(&par);
+    
+    // Determine which databases and files are needed
+    bool needBacktrace = false;
+    bool needTaxonomy = false;
+    bool needLookup = false;
+    // ... more need flags
+    
+    // Build and execute the workflow
+    CommandCaller cmd;
+    // ... set up workflow steps
+    cmd.addVariable("NEED_BACKTRACE", needBacktrace ? "TRUE" : NULL);
+    // ... more variables
+    cmd.execProgram("structuresearch.sh", argc, argv, par);
+    
+    return 0;
+}
+```
+
+Sources: [src/workflow/StructureSearch.cpp#L30-L50](src/workflow/StructureSearch.cpp#L30-L50)
+
+## Utility Functions
+
+The `src/strucclustutils/` directory contains utility functions that implement specific algorithms and data processing tasks. These utilities can be called from workflows or used as standalone commands.
+
+For example, the structure alignment utility demonstrates how to implement core algorithms:
+
+```cpp
+int alignStructure(StructureSmithWaterman & structureSmithWaterman,
+                   StructureSmithWaterman & reverseStructureSmithWaterman,
+                   Sequence & tSeqAA, Sequence & tSeq3Di,
+                   unsigned int querySeqLen, unsigned int targetSeqLen,
+                   EvalueNeuralNet & evaluer, std::pair<double, double> muLambda,
+                   Matcher::result_t & res, std::string & backtrace,
+                   Parameters & par) {
+    
+    // Set default parameters
+    float seqId = 0.0;
+    backtrace.clear();
+    
+    // Perform the alignment
+    StructureSmithWaterman::s_align align = structureSmithWaterman.alignScoreEndPos<StructureSmithWaterman::PROFILE>(
+        tSeqAA.numSequence, tSeq3Di.numSequence, targetSeqLen, 
+        par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 
+        querySeqLen / 2);
+    
+    // Check coverage criteria
+    bool hasLowerCoverage = !(Util::hasCoverage(par.covThr, par.covMode, align.qCov, align.tCov));
+    
+    // ... rest of the implementation
+}
+```
+
+Sources: [src/strucclustutils/structurealign.cpp#L37-L50](src/strucclustutils/structurealign.cpp#L37-L50)
+
+## Library Dependencies
+
+Foldseek integrates several specialized libraries for different aspects of protein structure analysis:
+
+- **3Di**: Converts protein structures to 3Di descriptors for fast comparison
+- **block-aligner**: Provides efficient sequence alignment algorithms
+- **foldcomp**: Compresses protein structure data
+- **gemmi**: Handles PDB and mmCIF file parsing
+- **tmalign**: Implements the TM-align structural alignment algorithm
+- **prostt5**: Provides protein language model capabilities
+- **pulchra**: Reconstructs protein structures from C-alpha traces
+
+These libraries are located in the `lib/` directory and can be extended or replaced to add new functionality.
+
+Sources: [lib/](lib/)
+
+## Build System and Integration
+
+Foldseek uses CMake as its build system. The main `CMakeLists.txt` file in the root directory configures the build and manages dependencies.
+
+Key build configuration options include:
+
+```cmake
+set(ENABLE_PROSTT5 1 CACHE BOOL "Enable ProstT5")
+set(ENABLE_CUDA 0 CACHE BOOL "Enable CUDA")
+set(IGNORE_RUST_VERSION 0 CACHE BOOL "Ignore Rust version check")
+set(FORCE_STATIC_DEPS 0 CACHE BOOL "Force static linking of deps")
+```
+
+To add a new library dependency:
+
+1. **Add your library** to the `lib/` directory
+2. **Include it** in the main CMakeLists.txt:
+```cmake
+add_subdirectory(lib/mynewlib)
+include_directories(lib/mynewlib)
+```
+3. **Link against it** in the appropriate CMakeLists.txt file
+
+Sources: [CMakeLists.txt#L9-L12](CMakeLists.txt#L9-L12), [CMakeLists.txt#L39-L44](CMakeLists.txt#L39-L44)
+
+## Extension Points and Best Practices
+
+When extending Foldseek, consider these key extension points:
+
+### 1. New Structural Alignment Algorithms
+Implement your algorithm in the `strucclustutils/` directory, following the pattern of existing alignment utilities. Your implementation should integrate with the existing parameter system and database handling.
+
+### 2. New File Format Support
+Add format support by extending the file parsing capabilities in the `commons/` directory or by integrating with the `gemmi` library.
+
+### 3. New Workflows
+Create new workflows in the `workflow/` directory that chain together existing commands to solve specific problems.
+
+### 4. New Database Types
+Extend the `LocalParameters` class to define new database types and add validation logic in the `FoldSeekDbValidator` class.
+
+> [!TIP]
+> When adding new functionality, always consider performance implications. Foldseek is designed for large-scale analyses, so your extensions should maintain the tool's efficiency. Use the existing threading and parallelization patterns to ensure good performance.
+
+## Testing Your Extensions
+
+Before contributing your extensions, ensure they:
+
+1. **Follow the existing code style** and patterns
+2. **Include appropriate documentation** and examples
+3. **Handle edge cases** gracefully
+4. **Integrate properly** with the parameter system
+5. **Maintain backward compatibility** where possible
+
+The Foldseek team welcomes contributions that extend the tool's capabilities while maintaining its performance and usability. By following the patterns outlined in this guide, you can create robust extensions that integrate seamlessly with the existing codebase.
+

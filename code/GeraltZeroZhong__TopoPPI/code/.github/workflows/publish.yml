@@ -1,0 +1,431 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      resume_run_id:
+        description: "Resume a draft release from its original tag run ID (leave empty for a build only)"
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    if: ${{ !inputs.resume_run_id }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify release metadata
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(PYTHONPATH=src python -c 'from topoppi._version import __version__; print(__version__)')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          plugin_version="$(PYTHONPATH=plugins/affinity python -c 'from topoppi_affinity import __version__; print(__version__)')"
+          hotspot_version="$(PYTHONPATH=plugins/hotspot python -c 'from topoppi_hotspot import __version__; print(__version__)')"
+          if [[ "$plugin_version" != "$version" || "$hotspot_version" != "$version" ]]; then
+            echo "Package versions differ: Core $version / Affinity $plugin_version / Hotspot $hotspot_version" >&2
+            exit 1
+          fi
+          if [[ "$version" =~ (a|b|rc|\.dev)[0-9]*$ ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version v$version." >&2
+            exit 1
+          fi
+
+  linux:
+    needs: metadata
+    uses: ./.github/workflows/ci.yml
+    with:
+      release_artifacts: true
+
+  windows:
+    needs: metadata
+    uses: ./.github/workflows/windows-installer.yml
+
+  macos:
+    needs: metadata
+    uses: ./.github/workflows/macos-app.yml
+
+  affinity:
+    needs: metadata
+    uses: ./.github/workflows/affinity-plugin.yml
+    with:
+      release_artifacts: true
+
+  hotspot:
+    needs: metadata
+    uses: ./.github/workflows/hotspot-plugin.yml
+    with:
+      release_artifacts: true
+
+  assemble:
+    needs:
+      - metadata
+      - linux
+      - windows
+      - macos
+      - affinity
+      - hotspot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-affinity
+          path: incoming/affinity
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-hotspot
+          path: incoming/hotspot
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-linux
+          path: incoming/linux
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-windows
+          path: incoming/windows
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-macos-arm64
+          path: incoming/macos-arm64
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-macos-x86_64
+          path: incoming/macos-x86_64
+
+      - name: Assemble and verify the release bundle
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          expected = {
+              f"linux/topoppi-{version}-py3-none-any.whl",
+              f"linux/topoppi-{version}.tar.gz",
+              f"affinity/topoppi_affinity-{version}-py3-none-any.whl",
+              f"affinity/topoppi_affinity-{version}.tar.gz",
+              f"hotspot/topoppi_hotspot-{version}-py3-none-any.whl",
+              f"hotspot/topoppi_hotspot-{version}.tar.gz",
+              "linux/OptCuts_bin-linux-x86_64",
+              "linux/TopoPPI-LICENSE.txt",
+              "linux/OptCuts-LICENSE.txt",
+              "linux/OptCuts-NOTICE.md",
+              "linux/OptCuts-THIRD-PARTY-LICENSES.txt",
+              f"windows/TopoPPI-{version}-windows-x86_64-setup.exe",
+              "windows/OptCuts_bin-windows-x86_64.exe",
+              "windows/OptCuts_bin-windows-x86_64.exe.sha256",
+              f"macos-arm64/TopoPPI-{version}-macos-arm64.dmg",
+              f"macos-x86_64/TopoPPI-{version}-macos-x86_64.dmg",
+          }
+          incoming = Path("incoming")
+          actual = {
+              path.relative_to(incoming).as_posix()
+              for path in incoming.rglob("*")
+              if path.is_file()
+          }
+          if actual != expected:
+              missing = sorted(expected - actual)
+              extra = sorted(actual - expected)
+              raise SystemExit(f"Release artifact mismatch; missing={missing}, extra={extra}")
+
+          output = Path("release-assets")
+          output.mkdir()
+          for relative in sorted(expected):
+              source = incoming / relative
+              target = output / source.name
+              if target.exists():
+                  raise SystemExit(f"Duplicate release filename: {target.name}")
+              target.write_bytes(source.read_bytes())
+
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-bundle
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 30
+
+  draft_release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs:
+      - metadata
+      - assemble
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.metadata.outputs.version }}
+      PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-bundle
+          path: release-assets
+
+      - name: Create or update a draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
+            if [[ "$is_draft" != true ]]; then
+              echo "Release $TAG is already public." >&2
+              exit 1
+            fi
+          else
+            args=("$TAG" --verify-tag --draft --generate-notes --title "TopoPPI $VERSION")
+            if [[ "$PRERELEASE" == true ]]; then
+              args+=(--prerelease)
+            fi
+            gh release create "${args[@]}"
+          fi
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | sort)
+          gh release upload "$TAG" --clobber "${assets[@]}"
+
+  release_source:
+    needs: draft_release
+    if: >-
+      ${{ !cancelled() && (needs.draft_release.result == 'success' ||
+          (github.event_name == 'workflow_dispatch' && inputs.resume_run_id != '' &&
+           github.ref == format('refs/heads/{0}', github.event.repository.default_branch))) }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write  # GitHub exposes draft releases to accounts with push access.
+    outputs:
+      run_id: ${{ steps.source.outputs.run_id }}
+      tag: ${{ steps.source.outputs.tag }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - name: Identify the release bundle
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.resume_run_id || github.run_id }}
+          RESUME: ${{ inputs.resume_run_id != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if [[ "$RESUME" == true ]]; then
+            [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+            run="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")"
+            jq -e --arg repo "$GITHUB_REPOSITORY" '
+              .event == "push" and .path == ".github/workflows/publish.yml" and
+              .head_repository.full_name == $repo' <<<"$run" >/dev/null
+            tag="$(jq -r .head_branch <<<"$run")"
+            [[ "$tag" =~ ^v[0-9][0-9A-Za-z.]*$ ]]
+            sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha)"
+            [[ "$sha" == "$(jq -r .head_sha <<<"$run")" ]]
+            draft="$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json isDraft,apiUrl)"
+            jq -e .isDraft <<<"$draft" >/dev/null
+            gh api "$(jq -r .apiUrl <<<"$draft")" --jq '.assets[] | [.digest, .name] | @tsv' > draft-assets.tsv
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download the original bundle for comparison with the draft
+        if: inputs.resume_run_id != ''
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          name: release-bundle
+          path: release-assets
+
+      - name: Match the draft attachments to the original build
+        if: inputs.resume_run_id != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum -- * | sort > ../bundle.sha256
+          awk -F '\t' '{sub(/^sha256:/, "", $1); print $1 "  " $2}' ../draft-assets.tsv | sort > ../draft.sha256
+          diff -u ../bundle.sha256 ../draft.sha256
+
+  pypi:
+    needs: release_source
+    if: ${{ !cancelled() && needs.release_source.result == 'success' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - environment: pypi
+            packages: topoppi topoppi_affinity
+          - environment: pypi-hotspot
+            packages: topoppi_hotspot
+    environment: ${{ matrix.environment }}
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.release_source.outputs.run_id }}
+          name: release-bundle
+          path: release-assets
+
+      - name: Select Python distributions
+        env:
+          VERSION: ${{ needs.release_source.outputs.version }}
+          PACKAGES: ${{ matrix.packages }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir pypi-dist
+          for package in $PACKAGES; do
+            install -m 644 "release-assets/${package}-${VERSION}-py3-none-any.whl" "release-assets/${package}-${VERSION}.tar.gz" pypi-dist/
+          done
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          packages-dir: pypi-dist/
+          skip-existing: true
+
+  verify_pypi:
+    needs: [release_source, pypi]
+    if: ${{ !cancelled() && needs.release_source.result == 'success' && needs.pypi.result == 'success' }}
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.release_source.outputs.run_id }}
+          name: release-bundle
+          path: release-assets
+
+      - name: Match PyPI files to the assembled bundle
+        env:
+          VERSION: ${{ needs.release_source.outputs.version }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          for project in ('topoppi', 'topoppi-affinity', 'topoppi-hotspot'):
+              normalized = project.replace('-', '_')
+              expected = {}
+              for name in (f"{normalized}-{version}-py3-none-any.whl", f"{normalized}-{version}.tar.gz"):
+                  content = Path("release-assets", name).read_bytes()
+                  expected[name] = hashlib.sha256(content).hexdigest()
+              url = f"https://pypi.org/pypi/{project}/{version}/json"
+              for attempt in range(12):
+                  try:
+                      with urllib.request.urlopen(url, timeout=30) as response:
+                          payload = json.load(response)
+                  except urllib.error.HTTPError as exc:
+                      if exc.code != 404 or attempt == 11:
+                          raise
+                  else:
+                      actual = {item['filename']: item['digests']['sha256'] for item in payload['urls']}
+                      if all(actual.get(name) == digest for name, digest in expected.items()):
+                          break
+                      if attempt == 11:
+                          raise SystemExit(f"PyPI digest mismatch for {project}: expected={expected}, actual={actual}")
+                  time.sleep(10)
+          PY
+      - name: Verify Core and all three prediction tasks from PyPI
+        env:
+          VERSION: ${{ needs.release_source.outputs.version }}
+          HF_HUB_OFFLINE: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/pypi-install"
+          "$RUNNER_TEMP/pypi-install/bin/python" -m pip install "topoppi==$VERSION"
+          "$RUNNER_TEMP/pypi-install/bin/python" - <<'PY'
+          import importlib.util
+          import tempfile
+          import topoppi
+          from topoppi.examples import copy_example
+
+          assert topoppi.plugins.available('chemistry')
+          assert not topoppi.plugins.available('affinity')
+          assert not topoppi.plugins.available('hotspot')
+          assert importlib.util.find_spec('torch') is None
+          with tempfile.TemporaryDirectory() as directory:
+              path = copy_example(directory, synthetic=True)
+              interface = topoppi.get_interface(topoppi.load_structure(path), 'A', 'B')
+              result = topoppi.run('chemistry.detect', interface)
+              assert result.engine == 'prolif' and len(result.interactions) == 6
+          PY
+          "$RUNNER_TEMP/pypi-install/bin/python" -m pip install "topoppi[affinity,hotspot]==$VERSION" "topoppi-affinity==$VERSION" "topoppi-hotspot==$VERSION"
+          "$RUNNER_TEMP/pypi-install/bin/python" -m topoppi_affinity --help
+          "$RUNNER_TEMP/pypi-install/bin/python" -m topoppi_affinity models status
+          "$RUNNER_TEMP/pypi-install/bin/python" -m topoppi_hotspot --help
+          "$RUNNER_TEMP/pypi-install/bin/python" -c "import importlib.util; assert importlib.util.find_spec('torch') is None"
+          install -m 755 release-assets/OptCuts_bin-linux-x86_64 "$RUNNER_TEMP/pypi-install/bin/OptCuts_bin"
+          python - <<'PY'
+          import os
+          import tarfile
+          from pathlib import Path
+
+          version = os.environ['VERSION']
+          with tarfile.open(f'release-assets/topoppi-{version}.tar.gz') as archive:
+              for name in ('smoke_affinity.py', 'smoke_binding.py'):
+                  source = archive.extractfile(f'topoppi-{version}/installer/{name}')
+                  Path(os.environ['RUNNER_TEMP'], name).write_bytes(source.read())
+          PY
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/pypi-install/bin/python" smoke_binding.py --no-gui
+
+  publish_release:
+    needs: [release_source, verify_pypi]
+    if: ${{ !cancelled() && needs.release_source.result == 'success' && needs.verify_pypi.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.release_source.outputs.tag }}
+    steps:
+      - name: Publish the verified GitHub release
+        shell: bash
+        run: gh release edit "$TAG" --draft=false --latest

@@ -1,0 +1,178 @@
+# AI Models and Modeling Tools for BioJazz Lab
+
+**Maintained by:** BioJazz Lab, Department of Biology, Baylor University  
+**Last updated:** 2026-11-18  
+**Purpose:** Track AI/ML models relevant to BioJazz Lab research — phage-host interactions, genome-scale metabolic modeling, PTM-driven biomolecular assembly, and multi-scale eco-evolutionary dynamics.
+
+---
+
+## Table of Contents
+
+1. [Protein Modeling & Design](#protein-modeling--design)
+2. [Molecular Dynamics & Conformational Sampling](#molecular-dynamics--conformational-sampling)
+3. [Molecular Docking & Binding Affinity](#molecular-docking--binding-affinity)
+4. [Genomics & Metagenomics](#genomics--metagenomics)
+5. [Metabolic Modeling & Systems Biology](#metabolic-modeling--systems-biology)
+6. [Phage Biology & Viromics](#phage-biology--viromics)
+7. [Multi-omics & Proteomics](#multi-omics--proteomics)
+8. [Virtual Cell & Cell Simulation](#virtual-cell--cell-simulation)
+9. [Computational Tools & Algorithms](#computational-tools--algorithms)
+
+---
+
+## Protein Modeling & Design
+
+| Model | Description | Access | Notes |
+|-------|-------------|--------|-------|
+| **AlphaFold3** | Structure prediction for proteins, DNA, RNA, ligands, ions | [AlphaFold Server](https://alphafoldserver.com) / [GitHub](https://github.com/google-deepmind/alphafold3) | Best for single-chain and complex structures; supports PTMs |
+| **OpenFold3** | Open-source community reimplementation of AlphaFold3 (permissive license) | [GitHub](https://github.com/aqlaboratory/openfold) | Enables training and fine-tuning; basis for AQAffinity |
+| **RomeroLab/lightning-boltz** | PyTorch Lightning training framework for Boltz-1/2; biomolecular structure prediction | [GitHub](https://github.com/RomeroLab/lightning-boltz) | MIT-licensed; strong AlphaFold3 alternative for proteins, DNA, RNA, small molecules |
+| **ESMC (ESM Cambrian)** | Protein language model (300M & 600M params); sequence representation, function prediction, embeddings | [GitHub](https://github.com/evolutionaryscale/esm) / [HuggingFace](https://huggingface.co/EvolutionaryScale) | Successor to ESM-2; Dec 2024; no MSA needed; strong zero-shot function annotation |
+| **ESMFold2** | Fast single-sequence protein structure prediction; successor to ESMFold | [GitHub](https://github.com/evolutionaryscale/esm) / [Biohub](https://biohub.org/?p=42883) | EvolutionaryScale / CZ Biohub; no MSA; suitable for large-scale metagenomic screening |
+| **ESM-3** | Multimodal protein model (sequence, structure, function) | [GitHub](https://github.com/evolutionaryscale/esm) | Supports conditional generation; useful for design |
+| **ProtTrans (ProtBERT, ProtT5)** | Protein sequence embeddings via transformer | [GitHub](https://github.com/ProtTrans/ProtTrans) / [HuggingFace](https://huggingface.co/Rostlab) | Good for representation learning; classification tasks |
+| **RoseTTAFold2 / RoseTTAFold-All-Atom** | Structure prediction; supports small molecules | [GitHub](https://github.com/uw-ipd/RoseTTAFold2) | Handles non-protein atoms well |
+| **ProteinMPNN** | Inverse folding / sequence design from backbone | [GitHub](https://github.com/dauparas/ProteinMPNN) | Useful for engineering phage tail fibers or enzymes |
+| **SaProt** | Structure-aware protein language model | [GitHub](https://github.com/westlake-realerc/SaProt) | Combines sequence + structure tokens |
+| **RFD4-Proteina** | Generative diffusion model for de novo protein design (NVIDIA + UW Institute for Protein Design; successor to RFDiffusion) | [GitHub](https://github.com/RosettaCommons/RFD4-Proteina) / [HuggingFace](https://huggingface.co/nvidia/RFD4-Proteina) / [NVIDIA NIM](https://build.nvidia.com/ipd/rfd4-proteina) | 2026; open-weight; state-of-the-art backbone design |
+| **se3_diffusion (FrameDiff)** | SE(3) diffusion model for de novo protein backbone generation | [GitHub](https://github.com/jasonkyuyim/se3_diffusion) | Generates diverse backbone scaffolds; ICML 2023 |
+| **RigidSSL** | Rigidity-aware geometric pretraining for protein design and conformational ensembles | [GitHub](https://github.com/ZhanghanNi/RigidSSL) / [ICLR 2026](https://iclr.cc/virtual/2026/poster/10008912) | SSL using rigid body augmentation; improves design and ensemble prediction |
+| **FoldDisco** | Ultra-fast discontinuous structural motif search across the protein universe | [GitHub](https://github.com/steineggerlab/folddisco) | From Steinegger lab; indexes and queries billions of structures |
+| **PhosphoSitePlus ML tools** | PTM site prediction | [PhosphoSitePlus](https://www.phosphosite.org) | Relevant for PTM-driven assembly project |
+| **DeepPhos / NetPhos** | Phosphorylation site prediction | [NetPhos](https://services.healthtech.dtu.dk/services/NetPhos-3.1/) | Classical PTM prediction |
+
+---
+
+## Molecular Dynamics & Conformational Sampling
+
+| Model | Description | Access | Notes |
+|-------|-------------|--------|-------|
+| **ConforNets** | Latent-based conformational control built on OpenFold3; generates and steers protein conformational ensembles | [GitHub](https://github.com/aqlaboratory/confornets) / [arXiv](https://arxiv.org/abs/2604.18559) | From aqlaboratory (OpenFold3 team); 2026 |
+| **BioEmu2** | Microsoft generative model for protein equilibrium conformational ensemble emulation | [GitHub](https://github.com/microsoft/bioemu) / [HuggingFace](https://huggingface.co/microsoft/bioemu2) | Replaces costly MD simulations for ensemble generation; thermodynamically grounded |
+| **SO3LR** | Pretrained machine-learned force field for (bio)molecular MD: SO3krates network for semi-local interactions plus physical long-range electrostatics, dispersion, and short-range repulsion | [GitHub](https://github.com/general-molecular-simulations/so3lr) / [Docs](https://so3lr.github.io/) / [JACS 2025](https://doi.org/10.1021/jacs.5c09558) | JAX-based; ASE calculator + CLI for NVT/NPT MD; Tauri models cover H–At (2026 preprint); code MIT, Tauri weights CC BY-NC 4.0 |
+| **yesint/molar** | Rust + Python library for high-performance reading and analysis of MD trajectories | [GitHub](https://github.com/yesint/molar) / [Docs](https://docs.rs/molar) | Supports GROMACS, AMBER formats; fast alternative to MDAnalysis for large trajectories |
+| **David-OConnor/dynamics** | Rust-based molecular dynamics simulation engine | [GitHub](https://github.com/David-OConnor/dynamics) / [Docs](https://docs.rs/dynamics) | Lightweight MD library; useful for custom simulation workflows |
+
+---
+
+## Molecular Docking & Binding Affinity
+
+| Model | Description | Access | Notes |
+|-------|-------------|--------|-------|
+| **DiffDock** | Diffusion-based protein–ligand docking | [GitHub](https://github.com/gcorso/DiffDock) | State-of-the-art blind docking; relevant for enzyme–metabolite interactions |
+| **DiffDock-Glide** | DiffDock pose sampling combined with Schrödinger Glide scoring for improved accuracy | [GitHub](https://github.com/gcorso/DiffDock) | Hybrid approach; Glide rescoring improves pose selection |
+| **SurfDock** | Surface-informed diffusion model for protein–ligand complex prediction; uses molecular surface geometry to guide pose sampling | [GitHub](https://github.com/CAODH/SurfDock) / [Nature Methods](https://www.nature.com/articles/s41592-024-02516-y) | Published Nature Methods 2024; strong blind docking benchmark performance |
+| **AQAffinity** | Structure-free binding affinity prediction built on OpenFold3 (SandboxAQ) | [SandboxAQ](https://www.sandboxaq.com/aqaffinity) / [Docs](https://docs.aisim.sandboxaq.com/aqaffinity) | High-speed drug potency prediction without requiring a solved structure; 2026 |
+
+---
+
+## Genomics & Metagenomics
+
+| Model | Description | Access | Notes |
+|-------|-------------|--------|-------|
+| **Nucleotide Transformer (NT)** | DNA language models (500M–2.5B) for genomic sequences | [GitHub](https://github.com/instadeepai/nucleotide-transformer) / [HuggingFace](https://huggingface.co/InstaDeepAI) | Broad genomic tasks: variant effect, regulatory elements |
+| **DNABERT-2** | Multi-species DNA foundation model | [GitHub](https://github.com/Zhihan1996/DNABERT-2) | Better than DNABERT-1; tokenization improvements |
+| **Evo2** | DNA language model (7B & 40B params) trained on 9.3 trillion nucleotides across all domains of life; prokaryote, phage, and eukaryote genomes | [GitHub](https://github.com/arcinstitute/evo2) | Arc Institute + NVIDIA; particularly relevant for phage-host research |
+| **HyenaDNA** | Long-range DNA model (up to 1M context) | [GitHub](https://github.com/HazyResearch/hyena-dna) | Long genomic context; efficient architecture |
+| **Caduceus** | Bidirectional, long-range DNA model | [GitHub](https://github.com/kuleshov-group/caduceus) | State-space model; strong on genomic benchmarks |
+| **structRFM** | Structure-guided RNA foundation model pretrained on sequence–secondary-structure pairs; embeddings, secondary structure prediction, fine-tuning for RNA tasks | [GitHub](https://github.com/heqin-zhu/structRFM) / [bioRxiv](https://www.biorxiv.org/content/10.1101/2025.08.06.668731) / [PyPI](https://pypi.org/project/structRFM) | MIT-licensed; 2025; HuggingFace-style AutoModel/AutoTokenizer interface |
+| **RhoFold+** | RNA 3D structure prediction from sequence using an RNA language model (RNA-FM) plus optional MSAs | [GitHub](https://github.com/ml4bio/RhoFold) / [Web Server](https://proj.cse.cuhk.edu.hk/aihlab/RhoFold/) / [HuggingFace](https://huggingface.co/cuhkaih/rhofold) | Nature Methods 2024; Apache-2.0 code; training data is non-commercial only |
+| **MMseqs2** | Ultra-fast many-against-many protein/nucleotide sequence search and clustering | [GitHub](https://github.com/soedinglab/MMseqs2) | Essential for large-scale homology search and metagenomic annotation; orders of magnitude faster than BLAST |
+| **MMseqs2-GPU** | GPU-accelerated MMseqs2 for massive-scale sequence search and clustering | [GitHub](https://github.com/soedinglab/MMseqs2) | Same interface as MMseqs2; dramatically faster on GPU nodes; ideal for HPC metagenomics workflows |
+| **GenoME** | Metagenomic classification and embedding | — | Useful for microbiome studies |
+| **DeepMicro** | Deep learning for microbiome phenotype prediction | [GitHub](https://github.com/minoh0201/DeepMicro) | Relevant for eco-evolutionary microbiome work |
+
+---
+
+## Metabolic Modeling & Systems Biology
+
+| Model | Description | Access | Notes |
+|-------|-------------|--------|-------|
+| **MICOM** | Community metabolic modeling (flux balance) | [GitHub](https://github.com/micom-dev/micom) | Multi-species FBA; relevant for microbial community metabolism |
+| **DLKcat** | Deep learning–based kcat (enzyme turnover) prediction | [GitHub](https://github.com/SysBioChalmers/DLKcat) | Useful for parameterizing GEMs |
+| **UniKP** | Unified enzyme kinetics prediction (kcat, Km, Ki) | [GitHub](https://github.com/Luo-SynBioLab/UniKP) | Broader than DLKcat |
+| **TurNuP / NNKD** | kcat/Km prediction from sequence + substrate | — | Alternative kinetics tools |
+| **FluxML / COBRA.py** | Constraint-based metabolic modeling frameworks | [GitHub](https://github.com/opencobra/cobrapy) | Core tools for genome-scale metabolic models |
+| **gpuGEM** | GPU-accelerated linear optimization for genome-scale metabolic models via NVIDIA cuOpt | [arXiv](https://arxiv.org/abs/2610.24106) | 1.1–94× faster than HiGHS; MIT-licensed; `pip install gpugem`; requires Volta+ GPU, CUDA 12, cuOpt 26.6+ |
+| **GEM-PRO** | Structure-aware GEM construction | [GitHub](https://github.com/SBRG/GEM-PRO) | Links protein structure to metabolic models |
+| **AutoML-GEM** | ML-guided GEM refinement | — | Gap-filling and curation |
+| **DeepEC** | EC number prediction from sequence | [GitHub](https://github.com/kaistsystemsbiology/DeepEC) | Useful for annotating metabolic genes |
+| **ECRECer** | Enzyme commission number prediction | [GitHub](https://github.com/zhangjlab/ECRECer) | Alternative to DeepEC |
+
+---
+
+## Phage Biology & Viromics
+
+| Model | Description | Access | Notes |
+|-------|-------------|--------|-------|
+| **PhaTYP** | Phage lifestyle (lytic/lysogenic) prediction | [GitHub](https://github.com/KennthShang/PhaTYP) | Relevant for phage-host interaction studies |
+| **CHERRY** | Phage-host interaction prediction | [GitHub](https://github.com/KennthShang/CHERRY) | Direct phage-host linkage from sequence |
+| **iPHoP** | Integrated phage-host prediction | [GitHub](https://github.com/marbl/iPHoP) | Ensemble approach; recommended for metagenomics |
+| **DeepHost** | Deep learning phage host range prediction | [GitHub](https://github.com/deephost) | Sequence-based host prediction |
+| **VirSorter2** | Virus identification in metagenomic data | [GitHub](https://github.com/jiarong/VirSorter2) | Standard virome discovery tool |
+| **VIBRANT** | Virus identification and annotation | [GitHub](https://github.com/AnantharamanLab/VIBRANT) | Good for viral metabolic annotation |
+| **CheckV** | Quality assessment of viral genomes | [GitHub](https://github.com/apcamargo/checkv) | Essential QC before downstream analysis |
+| **PhageAI** | Phage lifecycle AI platform | [PhageAI](https://phage.ai) | Commercial; useful for classification |
+| **Evo2 (phage-tuned)** | Generative model for phage and viral sequence design; zero-shot functional sequence generation | [GitHub](https://github.com/arcinstitute/evo2) | Arc Institute + NVIDIA; strong zero-shot generalization to phage proteins |
+
+---
+
+## Multi-omics & Proteomics
+
+| Model | Description | Access | Notes |
+|-------|-------------|--------|-------|
+| **Prosit** | Peptide fragmentation and retention time prediction | [GitHub](https://github.com/kusterlab/prosit) / [Prosit Server](https://www.proteomicsdb.org/prosit/) | Enhances MS/MS database search |
+| **AlphaPeptStats** | Statistical analysis of proteomics data | [GitHub](https://github.com/MannLabs/alphapeptstats) | From Mann lab; PTM-aware |
+| **MSBooster** | Deep learning–rescoring for proteomics | [GitHub](https://github.com/Nesvilab/MSBooster) | Integrates with FragPipe pipeline |
+| **DeepMass:Prism** | Deep learning for proteomics data analysis | — | Spectral library generation |
+| **MOFA+** | Multi-omics factor analysis | [GitHub](https://github.com/bioFAM/MOFA2) | Integrates transcriptomics, proteomics, metabolomics |
+| **scVI / scANVI** | Single-cell multi-omics integration | [GitHub](https://github.com/scverse/scvi-tools) | Latent variable models for sc data |
+| **totalVI** | Protein + RNA joint modeling (CITE-seq) | [scvi-tools](https://github.com/scverse/scvi-tools) | Part of scvi-tools ecosystem |
+| **UnitedNet** | Multi-modal single-cell data integration | [GitHub](https://github.com/LiuLab-Bioelectronics-Harvard/UnitedNet) | Transfer between modalities |
+
+---
+
+## Virtual Cell & Cell Simulation
+
+| Model | Description | Access | Notes |
+|-------|-------------|--------|-------|
+| **scGPT** | Single-cell foundation model (33M cells pre-trained); cell type annotation, perturbation prediction, GRN inference | [GitHub](https://github.com/bowang-lab/scGPT) | Strong zero-shot generalization across tissues |
+| **Geneformer** | Transformer pre-trained on 30M single-cell profiles; in silico gene perturbations | [HuggingFace](https://huggingface.co/ctheodoris/Geneformer) | Predicts knockout effects without experiments |
+| **scFoundation** | Large-scale single-cell foundation model (100M+ cells) | [GitHub](https://github.com/biomap-research/scFoundation) | Strong cross-tissue and cross-condition generalization |
+| **UCE (Universal Cell Embeddings)** | Zero-shot single-cell embeddings; works across species without fine-tuning | [GitHub](https://github.com/snap-stanford/UCE) | Useful for cross-organism eco-evolutionary comparisons |
+| **GEARS** | Graph-based model for predicting single and combinatorial genetic perturbations | [GitHub](https://github.com/snap-stanford/GEARS) | Predicts unseen perturbation outcomes from sc data |
+| **CellOracle** | GRN inference + TF perturbation simulation from scRNA/scATAC | [GitHub](https://github.com/morris-lab/CellOracle) | Simulates cell fate changes; links GRN to cell identity |
+| **SCENIC / SCENIC+** | Gene regulatory network inference from scRNA-seq and scATAC-seq | [GitHub](https://github.com/aertslab/scenicplus) | SCENIC+ integrates chromatin accessibility for GRN |
+| **NicheNet** | Cell–cell communication via ligand–target inference | [GitHub](https://github.com/saeyslab/nichenetr) | Predicts intercellular signaling; relevant for phage-host and host–microbe contexts |
+| **CellChat** | Quantitative inference of cell–cell signaling networks at pathway level | [GitHub](https://github.com/sqjin/CellChat) | Complements NicheNet; good for microbial community signaling |
+| **scBERT** | BERT-based model for single-cell cell type annotation | [GitHub](https://github.com/TencentAILabHealthcare/scBERT) | Pre-trained on PanglaoDB |
+| **CellTypist** | Automated cell type classification with curated model zoo | [GitHub](https://github.com/Teichlab/celltypist) | Fast inference; many pre-built tissue models |
+| **AIDO.Cell** | AI-driven cell foundation model for multi-modal sequence-to-cell prediction | [GitHub](https://github.com/genbio-ai/AIDO) | Emerging; multi-task model spanning sequence to phenotype |
+| **Cell2Sentence** | Translates single-cell expression data to/from natural language via LLMs | [GitHub](https://github.com/vandijklab/cell2sentence-ft) | Bridges LLM reasoning with single-cell biology |
+| **Cellpose** | Deep learning segmentation of cells in 2D/3D images | [GitHub](https://github.com/MouseLand/cellpose) | Core tool for imaging-based phenomics and spatial omics |
+| **PhysiCell** | Agent-based multicellular simulation (mechanistic, not ML) | [GitHub](https://github.com/MathCancer/PhysiCell) | Integrates with ML outputs for whole-tissue spatial modeling |
+| **LatticeMicrobe** | GPU-accelerated stochastic whole-cell simulation via RDME; spatial reaction-diffusion in realistic cell geometries | [luthey-schulten.chemistry.illinois.edu](https://luthey-schulten.chemistry.illinois.edu/Software2.0.html) | From Luthey-Schulten lab (UIUC); designed for bacterial/microbial cell modeling |
+| **Smoldyn** | Spatial stochastic simulator for cell biology; models molecular diffusion, reactions, and membrane interactions in 3D | [GitHub](https://github.com/ssandrews/Smoldyn) / [smoldyn.org](http://www.smoldyn.org) | Rule-based spatial simulation; integrates with SBML/BioNetGen |
+| **Virtual Cell (VCell)** | ODE/PDE/stochastic simulation of intracellular dynamics with spatial support | [vcell.org](https://vcell.org) | NRBSC platform; useful for mechanistic signaling models |
+| **BioNetGen / PyBNG** | Rule-based modeling of biochemical reaction networks | [GitHub](https://github.com/RuleWorld/bionetgen) | Signaling network simulation; pairs well with parameter estimation tools (cf. pyModEst) |
+
+---
+
+## Computational Tools & Algorithms
+
+| Tool | Description | Access | Notes |
+|------|-------------|--------|-------|
+| **bigraph-rs** | Rust implementation of bigraph data structures (bigraphical reactive systems) | [GitHub](https://github.com/sebschmi/bigraph-rs) / [Docs](https://docs.rs/bigraph) | Formal graph model for concurrent biological systems; useful for network topology analysis |
+
+---
+
+## Contributing & Conventions
+
+- Add a new row to the relevant table; include model name (bold), a brief description, an access link, and notes specific to BioJazz Lab use cases.
+- Mark deprecated or superseded models with ~~strikethrough~~.
+- For models actively in use in the lab, add a ✅ to the **Notes** column.
+- Update the `Last updated` date at the top when making changes.
+
+---
+
+*For questions or suggestions, contact Song Feng (song.zhimu.feng@gmail.com).*

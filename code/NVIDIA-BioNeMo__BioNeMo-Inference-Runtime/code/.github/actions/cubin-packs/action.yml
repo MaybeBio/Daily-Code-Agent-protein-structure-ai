@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: Fetch the CUBIN packs
+description: >
+  Pull the LFS-tracked CUBIN packs and nothing else, so a job that needs them
+  does not pay for the whole LFS store and no workflow repeats the pattern.
+
+runs:
+  using: composite
+  steps:
+    # The pattern and its rationale live in the script. Callers check out with
+    # `lfs: false` and keep their credentials.
+    - shell: bash
+      run: scripts/ci/fetch_cubin_packs.sh

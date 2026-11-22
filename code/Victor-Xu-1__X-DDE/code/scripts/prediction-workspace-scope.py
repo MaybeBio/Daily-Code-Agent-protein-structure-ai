@@ -1,0 +1,1470 @@
+"""Delegate a bounded prediction-presentation batch to its exact browser/consumer gate."""
+
+import fnmatch
+import os
+import runpy
+import subprocess
+
+
+def confidence_frame_only(changed, event="push"):
+    return runpy.run_path("scripts/confidence-frame-scope.py")["selected"](changed, event)
+
+
+def setup_summary_only(changed, event="push"):
+    return runpy.run_path("scripts/prediction-setup-scope.py")["selected"](changed, event)
+
+
+PATTERNS = (
+    "frontend/public/fonts/jetbrains-mono/*",
+    "frontend/public/fonts/plus-jakarta/*",
+    "frontend/src/presentation/Prediction*",
+    "frontend/src/presentation/prediction-*.css",
+    "frontend/src/presentation/prediction-heading-focus*",
+    "frontend/src/presentation/prediction-settings-summary.ts",
+    "frontend/src/viewer/confidence-*",
+    "frontend/src/viewer/ConfidenceControls*",
+    "frontend/src/viewer/structure-bytes*",
+    "frontend/src/operations/confidence-*",
+    "frontend/src/presentation/plots/InteractivePlot*",
+    "src/opendde_workbench/confidence_binding.py",
+    "src/opendde_workbench/confidence.py",
+    "tests/test_confidence_binding.py",
+    "tests/test_import_confidence.py",
+    "server_tests/native_confidence_case.py",
+    "server_tests/test_native_confidence_browser.py",
+    "frontend/src/viewer/ChainControls*",
+    "frontend/src/viewer/chain-controls.css",
+    "frontend/src/viewer/chain-visibility*",
+    "frontend/src/viewer/StructureViewport.tsx",
+    "frontend/src/viewer/StructureViewer.test.tsx",
+    "frontend/src/viewer/scene.ts",
+    "frontend/src/viewer/frame.ts",
+    "frontend/src/viewer/style.test.ts",
+    "frontend/src/viewer/style.ts",
+    "frontend/src/viewer/protocol.ts",
+    "frontend/src/viewer/StructureInspection*",
+    "frontend/src/viewer/ViewerControls*",
+    # Their existing native pose/comparison gates own these direct-consumer fixtures.
+    "server_tests/comparison_api_harness.py",
+    "server_tests/test_pose_handoff_browser.py",
+    "server_tests/test_native_receptors.py",
+    "frontend/src/viewer/structure-inspection.css",
+    "frontend/src/viewer/polymer-detail.ts",
+    "frontend/src/viewer/residue-selection*",
+    "frontend/src/viewer/display-readiness*",
+    "frontend/src/integrations/prediction-presentation*",
+    "frontend/src/integrations/Mol1Form.tsx",
+    "frontend/src/integrations/Mol1Confidence.tsx",
+    "frontend/src/integrations/ScientificForm.tsx",
+    "frontend/src/integrations/ScientificResults.tsx",
+    "frontend/src/studio/PredictionResults.tsx",
+    "frontend/src/studio/PredictionResults.test.tsx",
+    "frontend/src/studio/PredictionInspection.tsx",
+    "frontend/src/studio/CandidatePanel*",
+    "frontend/src/studio/AnalysisGrid.tsx",
+    "frontend/src/examples/ExampleJobResult*",
+    "frontend/src/studio/HomeWorkspace.test.tsx",
+    "frontend/src/studio/Header.tsx",
+    "frontend/src/operations/ConfidencePanel*",
+    "frontend/src/guided/MolecularInputs.tsx",
+    "frontend/src/guided/MolecularInputs.test.tsx",
+    "frontend/src/TaskForm.tsx",
+    "frontend/src/App.tsx",
+    "server_tests/prediction_workspace_case.py",
+    "server_tests/test_prediction_workspace_browser.py",
+    "server_tests/test_prediction_input_preview_browser.py",
+    "server_tests/test_prediction_entry_browser.py",
+    "server_tests/test_template_controls_browser.py",
+    "server_tests/test_ensemble_results_browser.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    ".github/workflows/task-layout-checks.yml",
+    ".github/workflows/user-interface-checks.yml",
+    ".github/workflows/structure-layout-checks.yml",
+    ".github/workflows/landscape-checks.yml",
+    "docs/frontend-layout.md",
+    "docs/quality/frontend.md",
+    "docs/quality/frontend-coverage.md",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package*.json",
+    "install.sh",
+    "install.ps1",
+)
+
+INPUT_PREVIEW_FILES = {
+    "frontend/src/guided/desktop-questionnaire.css",
+    "frontend/src/presentation/PredictionSetup.tsx",
+    "frontend/src/presentation/PredictionSetup.test.tsx",
+    "frontend/src/presentation/PredictionInputPreview.tsx",
+    "frontend/src/presentation/PredictionEntityPreview.tsx",
+    "frontend/src/presentation/PredictionSourceMolecule.tsx",
+    "frontend/src/presentation/PredictionInputPreview.test.tsx",
+    "frontend/src/presentation/prediction-input-inspector.css",
+    "frontend/src/presentation/prediction-input-preview.css",
+    "frontend/src/presentation/prediction-inputs.css",
+    "frontend/src/presentation/prediction-setup-summary.css",
+    "frontend/src/integrations/ScientificForm.tsx",
+    "server_tests/test_prediction_input_preview_browser.py",
+    "scripts/prediction-workspace-scope.py",
+    "scripts/molecular-utility-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    "tests/test_molecular_utility_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    ".github/workflows/molecular-utility-checks.yml",
+    "docs/quality/frontend-coverage.md",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+
+ENTITY_INPUT_FILES = {
+    "frontend/src/integrations/Mol1FeatureInputs.tsx",
+    "frontend/src/integrations/Mol1FeatureInputs.test.tsx",
+    "frontend/public/fonts/jetbrains-mono/JetBrainsMono-Medium.woff2",
+    "frontend/public/fonts/jetbrains-mono/OFL.txt",
+    "frontend/public/fonts/jetbrains-mono/provenance.json",
+    "frontend/src/operations/EntityOptions.tsx",
+    ".github/workflows/mol1-restraint-checks.yml",
+    "frontend/src/guided/MolecularInputs.tsx",
+    "frontend/src/guided/MolecularInputs.test.tsx",
+    "frontend/src/integrations/BoltzInputs.tsx",
+    "frontend/src/integrations/BoltzInputs.test.tsx",
+    "frontend/src/integrations/Mol1Form.tsx",
+    "frontend/src/integrations/Mol1Composition.ts",
+    "frontend/src/presentation/PredictionEntityCard.tsx",
+    "frontend/src/presentation/PredictionEntityState.ts",
+    "frontend/src/presentation/PredictionEntitySummary.ts",
+    "frontend/src/presentation/PredictionMolecularFields.tsx",
+    "frontend/src/presentation/PredictionEntityEditing.test.tsx",
+    "frontend/src/presentation/prediction-entity-card.css",
+    "frontend/src/presentation/prediction-inputs.css",
+    "frontend/src/presentation/prediction-workspace.css",
+    "server_tests/test_prediction_entities_browser.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    "docs/frontend-layout.md",
+    "docs/quality/frontend-coverage.md",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+
+
+def entity_inputs_only(changed, event="push"):
+    changed = set(changed)
+    return (
+        event in {"push", "pull_request"}
+        and bool(
+            {
+                name
+                for name in ENTITY_INPUT_FILES
+                if name.startswith(("frontend/src/", "frontend/public/fonts/jetbrains-mono/"))
+            }
+            & changed
+        )
+        and changed <= ENTITY_INPUT_FILES
+    )
+
+
+BOLTZ_INPUT_SOURCES = {
+    "server_tests/test_boltz_input_settings_browser.py",
+    "frontend/src/integrations/BoltzInputs.test.tsx",
+    "frontend/src/integrations/BoltzInputs.tsx",
+    "frontend/src/integrations/BoltzMsaInput.tsx",
+    "frontend/src/integrations/boltz-input-settings.css",
+}
+BOLTZ_INPUT_FILES = BOLTZ_INPUT_SOURCES | {
+    "frontend/src/integrations/ScientificForm.test.tsx",
+    "frontend/src/integrations/BoltzInputs.test.tsx",
+    "server_tests/test_boltz_input_settings_browser.py",
+    "server_tests/test_boltz_final_review_browser.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    "docs/frontend-layout.md",
+    "docs/quality/frontend-coverage.md",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+
+
+def boltz_inputs_only(changed, event="push"):
+    changed = set(changed)
+    return (
+        event in {"push", "pull_request"}
+        and bool(changed & BOLTZ_INPUT_SOURCES)
+        and changed <= BOLTZ_INPUT_FILES
+    )
+
+
+COMPUTATION_SETTING_SOURCES = {
+    "frontend/src/integrations/Mol1Settings.tsx",
+    "frontend/src/integrations/Mol1SeedEditor.tsx",
+    "frontend/src/integrations/Mol1RuntimeSettings.tsx",
+    "frontend/src/integrations/mol1-seeds.ts",
+    "frontend/src/integrations/mol1-computation-settings.css",
+    "server_tests/test_mol1_settings_browser.py",
+}
+COMPUTATION_SETTING_FILES = COMPUTATION_SETTING_SOURCES | {
+    "frontend/src/integrations/Mol1SeedEditor.test.tsx",
+    "frontend/src/integrations/Mol1Form.tsx",
+    "frontend/src/integrations/Mol1Form.test.tsx",
+    "frontend/src/presentation/prediction-draft-model.ts",
+    "server_tests/test_prediction_drafts_browser.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    ".github/workflows/mol1-restraint-checks.yml",
+    "docs/frontend-layout.md",
+    "docs/quality/frontend-coverage.md",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+
+
+def computation_settings_only(changed, event="push"):
+    changed = set(changed)
+    return (
+        event in {"push", "pull_request"}
+        and bool(changed & COMPUTATION_SETTING_SOURCES)
+        and changed <= COMPUTATION_SETTING_FILES
+    )
+
+
+FEATURE_SETTING_SOURCES = {
+    "frontend/src/presentation/PredictionFeatureDialog.tsx",
+    "frontend/src/presentation/PredictionFeatureSettings.tsx",
+    "frontend/src/presentation/PredictionFeatureSettings.test.tsx",
+    "frontend/src/presentation/prediction-feature-policy.ts",
+    "frontend/src/presentation/prediction-feature-settings.css",
+    "server_tests/test_prediction_feature_settings_browser.py",
+}
+FEATURE_SETTING_FILES = (
+    ENTITY_INPUT_FILES
+    | FEATURE_SETTING_SOURCES
+    | {
+        ".github/workflows/template-controls-checks.yml",
+        "frontend/src/TaskForm.tsx",
+        "frontend/src/TaskForm.test.tsx",
+        "frontend/src/integrations/Mol1Form.test.tsx",
+        "frontend/src/operations/ExpertParameters.tsx",
+        "frontend/src/operations/operations.test.tsx",
+        "server_tests/test_mol1_final_review_browser.py",
+        "server_tests/test_prediction_drafts_browser.py",
+        "server_tests/test_mol1_browser.py",
+    }
+)
+
+
+def feature_settings_only(changed, event="push"):
+    changed = set(changed)
+    return (
+        event in {"push", "pull_request"}
+        and bool(changed & FEATURE_SETTING_SOURCES)
+        and changed <= FEATURE_SETTING_FILES
+    )
+
+
+DRAFT_FILES = {
+    "frontend/src/presentation/prediction-settings-summary.ts",
+    "frontend/src/presentation/PredictionSetup.test.tsx",
+    "frontend/src/presentation/PredictionInputPreview.tsx",
+    "frontend/src/presentation/PredictionInputPreview.test.tsx",
+    ".github/workflows/docking-runtime-checks.yml",
+    "frontend/src/presentation/PredictionSetup.tsx",
+    "frontend/src/presentation/PredictionDraftControls.tsx",
+    "frontend/src/presentation/PredictionDraftList.tsx",
+    "frontend/src/presentation/PredictionDraftControls.test.tsx",
+    "frontend/src/presentation/prediction-draft-model.ts",
+    "frontend/src/presentation/prediction-drafts.css",
+    "frontend/src/integrations/Mol1Form.tsx",
+    "frontend/src/integrations/Mol1Settings.tsx",
+    "src/opendde_workbench/api.py",
+    "src/opendde_workbench/assets.py",
+    "src/opendde_workbench/drafts/__init__.py",
+    "src/opendde_workbench/drafts/models.py",
+    "src/opendde_workbench/drafts/storage.py",
+    "src/opendde_workbench/drafts/routes.py",
+    "tests/test_prediction_drafts.py",
+    "server_tests/test_prediction_drafts_browser.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    "docs/quality/frontend-coverage.md",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+
+
+BOLTZ_DRAFT_FILES = DRAFT_FILES | {
+    "frontend/src/integrations/ScientificForm.tsx",
+    "frontend/src/integrations/ScientificForm.test.tsx",
+    "frontend/src/integrations/BoltzDraftBoundary.tsx",
+    "frontend/src/integrations/boltz-draft.ts",
+    "frontend/src/presentation/BoltzDraftControls.test.tsx",
+    "frontend/src/presentation/SharedPredictionDraftControls.tsx",
+    "frontend/src/presentation/prediction-draft-contract.ts",
+    "frontend/src/presentation/mol1-draft-adapter.ts",
+    "src/opendde_workbench/drafts/boltz.py",
+    "src/opendde_workbench/drafts/snapshot.py",
+    "tests/test_boltz_drafts.py",
+    "server_tests/test_boltz_drafts_browser.py",
+    ".github/workflows/molecule-design-review-checks.yml",
+}
+
+OPENDDE_DRAFT_FILES = {
+    "src/opendde_workbench/drafts/compatibility_process.py",
+    "tests/test_draft_compatibility_process.py",
+    "src/opendde_workbench/drafts/compatibility.py",
+    "src/opendde_workbench/drafts/compatibility_probe.py",
+    "scripts/check-draft-compatibility.py",
+    "tests/test_draft_compatibility.py",
+    "server_tests/test_mol1_final_review_browser.py",
+    "server_tests/test_job_review_layout_browser.py",
+    "server_tests/test_prediction_drafts_browser.py",
+    "server_tests/test_boltz_drafts_browser.py",
+    "server_tests/test_template_controls_browser.py",
+    "frontend/src/TaskForm.tsx",
+    "frontend/src/TaskForm.test.tsx",
+    "frontend/src/TaskFormDrafts.test.tsx",
+    "frontend/src/operations/ExpertParameters.tsx",
+    "frontend/src/operations/IntegerListField.tsx",
+    "frontend/src/operations/IntegerListField.css",
+    "frontend/src/operations/IntegerListField.test.tsx",
+    "frontend/src/operations/integer-list-model.ts",
+    "frontend/src/operations/opendde-draft.ts",
+    "frontend/src/operations/opendde-draft.test.ts",
+    "frontend/src/operations/useOpenDdeEditor.ts",
+    "frontend/src/presentation/PredictionDraftBoundary.tsx",
+    "src/opendde_workbench/drafts/entities.py",
+    "src/opendde_workbench/drafts/opendde.py",
+    "tests/test_opendde_drafts.py",
+    "server_tests/test_opendde_drafts_browser.py",
+    "frontend/src/integrations/BoltzDraftBoundary.tsx",
+    "frontend/src/presentation/prediction-draft-contract.ts",
+    "frontend/src/presentation/prediction-draft-model.ts",
+    "src/opendde_workbench/drafts/boltz.py",
+    "src/opendde_workbench/drafts/models.py",
+    "src/opendde_workbench/drafts/snapshot.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    "docs/quality/frontend-coverage.md",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+
+
+DRAFT_COMPATIBILITY_SOURCES = {
+    "src/opendde_workbench/drafts/compatibility_process.py",
+    "tests/test_draft_compatibility_process.py",
+    "src/opendde_workbench/drafts/compatibility.py",
+    "src/opendde_workbench/drafts/compatibility_probe.py",
+    "scripts/check-draft-compatibility.py",
+    "tests/test_draft_compatibility.py",
+}
+DRAFT_COMPATIBILITY_FILES = DRAFT_COMPATIBILITY_SOURCES | {
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    "docs/quality/frontend-coverage.md",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+
+
+def draft_compatibility_only(changed, event="push"):
+    changed = set(changed)
+    return (
+        event in {"push", "pull_request"}
+        and bool(changed & DRAFT_COMPATIBILITY_SOURCES)
+        and changed <= DRAFT_COMPATIBILITY_FILES
+    )
+
+
+def draft_compatibility_changed(changed):
+    return bool(set(changed) & DRAFT_COMPATIBILITY_SOURCES)
+
+
+FINAL_REVIEW_FILES = {
+    ".github/workflows/mol1-restraint-checks.yml",
+    "frontend/src/integrations/Mol1Form.tsx",
+    "frontend/src/integrations/Mol1Form.test.tsx",
+    "frontend/src/integrations/Mol1JobReview.tsx",
+    "frontend/src/integrations/mol1-job-request.ts",
+    "frontend/src/integrations/mol1-job-request.test.ts",
+    "frontend/src/integrations/mol1-job-review.css",
+    "frontend/src/guided/Questionnaire.tsx",
+    "frontend/src/presentation/PredictionInputPreview.tsx",
+    "frontend/src/presentation/PredictionEntityPreview.tsx",
+    "frontend/src/presentation/PredictionReviewDialog.tsx",
+    "server_tests/test_mol1_final_review_browser.py",
+    "server_tests/test_mol1_browser.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    "docs/quality/frontend-coverage.md",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+
+
+BOLTZ_REVIEW_FILES = FINAL_REVIEW_FILES | {
+    "frontend/src/integrations/BoltzInputs.tsx",
+    "frontend/src/integrations/BoltzInputs.test.tsx",
+    "frontend/src/integrations/ScientificInputs.tsx",
+    "frontend/src/integrations/BoltzJobReview.tsx",
+    "frontend/src/integrations/boltz-job-request.ts",
+    "frontend/src/integrations/ScientificForm.tsx",
+    "frontend/src/integrations/ScientificForm.test.tsx",
+    "frontend/src/integrations/ScientificReview.tsx",
+    "frontend/src/presentation/PredictionJobReview.tsx",
+    "frontend/src/presentation/PredictionJobSettings.tsx",
+    "frontend/src/presentation/PredictionInputPreview.test.tsx",
+    "frontend/src/research/asset-download.ts",
+    "frontend/src/presentation/prediction-job-review.css",
+    "server_tests/test_boltz_final_review_browser.py",
+}
+
+OPENDDE_REVIEW_FILES = {
+    "frontend/src/App.tsx",
+    "frontend/src/TaskForm.tsx",
+    "frontend/src/TaskForm.test.tsx",
+    "frontend/src/guided/workflows.test.tsx",
+    "frontend/src/operations/OpenDdeJobReview.tsx",
+    "frontend/src/operations/opendde-job-request.ts",
+    "frontend/src/studio/HomeWorkspace.tsx",
+    "server_tests/test_opendde_final_review_browser.py",
+}
+
+FOLD_REVIEW_FILES = FINAL_REVIEW_FILES | {
+    ".github/workflows/harness-input-checks.yml",
+    "frontend/src/operations/FoldJobReview.tsx",
+    "frontend/src/operations/fold-job-review.css",
+    "frontend/src/operations/HarnessForm.tsx",
+    "frontend/src/operations/HarnessFoldInputs.test.tsx",
+    "frontend/src/operations/useTaskSubmit.ts",
+    "frontend/src/operations/useTaskSubmit.test.ts",
+    "frontend/src/presentation/PredictionJobReview.tsx",
+    "server_tests/test_fold_msa_sources_browser.py",
+    "server_tests/test_native_fold_chain_contract.py",
+    "src/opendde_workbench/fold_review.py",
+    "src/opendde_workbench/harness_chains.py",
+    "src/opendde_workbench/harness_routes.py",
+    "tests/test_fold_review.py",
+}
+
+
+DOCKING_REVIEW_ENTRYPOINTS = {
+    "frontend/src/docking/DockingJobReview.tsx",
+    "frontend/src/docking/docking-job-request.ts",
+    "server_tests/test_docking_job_review_browser.py",
+}
+DOCKING_REVIEW_FILES = DOCKING_REVIEW_ENTRYPOINTS | {
+    ".github/workflows/docking-runtime-checks.yml",
+    "frontend/src/diffsbdd/ReviewReference.tsx",
+    "frontend/src/docking/DockingForm.test.tsx",
+    "frontend/src/docking/DockingForm.tsx",
+    "frontend/src/docking/DockingReview.tsx",
+    "frontend/src/docking/DockingReview.test.tsx",
+    "server_tests/docking_browser.py",
+    "frontend/src/docking/FlexibleReceptorForm.test.tsx",
+    "frontend/src/docking/SearchPreview.test.tsx",
+    "frontend/src/docking/SearchPreview.tsx",
+    "frontend/src/docking/SearchRegion.tsx",
+    "frontend/src/docking/docking-job-review.css",
+    "frontend/src/viewer/search-box.ts",
+    "src/opendde_workbench/asset_records.py",
+    "src/opendde_workbench/chemistry/sdf_io.py",
+    "tests/test_asset_record_download.py",
+    "frontend/src/presentation/PredictionJobReview.tsx",
+    "frontend/src/presentation/PredictionReviewDialog.tsx",
+    "frontend/src/presentation/prediction-job-review.css",
+    "server_tests/flexible_receptor_browser.py",
+    "server_tests/flexible_receptor_questionnaire.py",
+    "server_tests/test_frontend_browser.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+
+
+def docking_review_only(changed, event="push"):
+    return (
+        event in {"push", "pull_request"}
+        and DOCKING_REVIEW_ENTRYPOINTS <= set(changed) <= DOCKING_REVIEW_FILES
+    )
+
+
+SPATIAL_DESIGN_REVIEW_REQUIRED = {
+    "frontend/src/diffsbdd/SpatialDesignJobReview.tsx",
+    "frontend/src/diffsbdd/spatial-design-review.ts",
+    "server_tests/test_diff_review_browser.py",
+}
+SPATIAL_DESIGN_REVIEW_FILES = SPATIAL_DESIGN_REVIEW_REQUIRED | {
+    ".github/workflows/prolif-contact-checks.yml",
+    "frontend/src/diffsbdd/DiffForm.tsx",
+    "frontend/src/diffsbdd/DiffForm.test.tsx",
+    "frontend/src/diffsbdd/DiffReview.tsx",
+    "frontend/src/diffsbdd/DiffTemplateReplay.test.tsx",
+    "frontend/src/diffsbdd/FixedAtomPicker.tsx",
+    "frontend/src/diffsbdd/SavedRegions.tsx",
+    "frontend/src/diffsbdd/SavedRegions.test.tsx",
+    "frontend/src/regions/useNativeIdentity.ts",
+    "frontend/src/regions/useNativeIdentity.test.tsx",
+    "frontend/src/diffsbdd/model.ts",
+    "frontend/src/diffsbdd/PocketPicker.tsx",
+    "frontend/src/diffsbdd/spatial-design-review.css",
+    "docs/frontend-layout.md",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+
+
+def job_review_layout_only(changed, event="push"):
+    return runpy.run_path("scripts/job-review-scope.py")["selected"](changed, event)
+
+
+def final_review_only(changed, event="push"):
+    changed = set(changed)
+    return event in {"push", "pull_request"} and (
+        job_review_layout_only(changed, event)
+        or {
+            "frontend/src/integrations/Mol1Form.tsx",
+            "frontend/src/integrations/Mol1JobReview.tsx",
+            "server_tests/test_mol1_final_review_browser.py",
+        }.issubset(changed)
+        and changed.issubset(FINAL_REVIEW_FILES)
+        or {
+            "frontend/src/integrations/ScientificForm.tsx",
+            "frontend/src/integrations/BoltzJobReview.tsx",
+            "server_tests/test_boltz_final_review_browser.py",
+        }.issubset(changed)
+        and changed.issubset(BOLTZ_REVIEW_FILES)
+        or {
+            "frontend/src/TaskForm.tsx",
+            "frontend/src/operations/OpenDdeJobReview.tsx",
+            "server_tests/test_opendde_final_review_browser.py",
+        }.issubset(changed)
+        and changed.issubset(
+            OPENDDE_REVIEW_FILES
+            | {
+                "frontend/src/presentation/PredictionJobReview.tsx",
+                "scripts/prediction-workspace-scope.py",
+                "tests/test_prediction_workspace_scope.py",
+                ".github/workflows/prediction-workspace-checks.yml",
+                "pyproject.toml",
+                "uv.lock",
+                "frontend/package.json",
+                "frontend/package-lock.json",
+                "install.sh",
+                "install.ps1",
+            }
+        )
+        or {
+            "frontend/src/operations/FoldJobReview.tsx",
+            "src/opendde_workbench/fold_review.py",
+            "server_tests/test_fold_msa_sources_browser.py",
+        }.issubset(changed)
+        and changed.issubset(FOLD_REVIEW_FILES)
+        or docking_review_only(changed, event)
+        or SPATIAL_DESIGN_REVIEW_REQUIRED <= changed <= SPATIAL_DESIGN_REVIEW_FILES
+    )
+
+
+def final_review_changed(changed, event="push"):
+    return (
+        job_review_layout_only(changed, event)
+        or event == "workflow_dispatch"
+        or any(
+            path.startswith("frontend/src/integrations/mol1-job-")
+            or path
+            in {
+                "frontend/src/integrations/Mol1Form.tsx",
+                "frontend/src/integrations/Mol1JobReview.tsx",
+                "frontend/src/guided/Questionnaire.tsx",
+                "frontend/src/presentation/PredictionReviewDialog.tsx",
+                "frontend/src/presentation/PredictionJobReview.tsx",
+                "frontend/src/presentation/PredictionJobSettings.tsx",
+                "frontend/src/presentation/prediction-job-review.css",
+                "server_tests/test_mol1_final_review_browser.py",
+            }
+            for path in changed
+        )
+    )
+
+
+def boltz_review_changed(changed, event="push"):
+    return event == "workflow_dispatch" or any(
+        path in BOLTZ_REVIEW_FILES - FINAL_REVIEW_FILES
+        or path
+        in {
+            "frontend/src/guided/Questionnaire.tsx",
+            "frontend/src/presentation/PredictionEntityPreview.tsx",
+            "frontend/src/presentation/PredictionReviewDialog.tsx",
+        }
+        for path in changed
+    )
+
+
+def opendde_review_changed(changed, event="push"):
+    return event == "workflow_dispatch" or any(
+        path in OPENDDE_REVIEW_FILES
+        or path
+        in {
+            "frontend/src/guided/Questionnaire.tsx",
+            "frontend/src/presentation/PredictionEntityPreview.tsx",
+            "frontend/src/presentation/PredictionReviewDialog.tsx",
+            "frontend/src/presentation/PredictionJobReview.tsx",
+            "frontend/src/presentation/PredictionJobSettings.tsx",
+            "frontend/src/presentation/prediction-job-review.css",
+        }
+        for path in changed
+    )
+
+
+def boltz_drafts_only(changed, event="push"):
+    changed = set(changed)
+    return (
+        event in {"push", "pull_request"}
+        and {
+            "frontend/src/integrations/ScientificForm.tsx",
+            "frontend/src/integrations/boltz-draft.ts",
+            "frontend/src/presentation/SharedPredictionDraftControls.tsx",
+            "src/opendde_workbench/drafts/storage.py",
+            "src/opendde_workbench/drafts/models.py",
+            "tests/test_boltz_drafts.py",
+            "server_tests/test_boltz_drafts_browser.py",
+        }.issubset(changed)
+        and changed.issubset(BOLTZ_DRAFT_FILES)
+    )
+
+
+def opendde_drafts_only(changed, event="push"):
+    changed = set(changed)
+    return (
+        event in {"push", "pull_request"}
+        and {
+            "frontend/src/TaskForm.tsx",
+            "frontend/src/TaskFormDrafts.test.tsx",
+            "frontend/src/operations/opendde-draft.ts",
+            "src/opendde_workbench/drafts/opendde.py",
+            "tests/test_opendde_drafts.py",
+            "server_tests/test_opendde_drafts_browser.py",
+        }.issubset(changed)
+        and changed.issubset(OPENDDE_DRAFT_FILES)
+    )
+
+
+def drafts_only(changed, event="push"):
+    changed = set(changed)
+    return (
+        draft_compatibility_only(changed, event)
+        or opendde_drafts_only(changed, event)
+        or boltz_drafts_only(changed, event)
+        or (
+            event in {"push", "pull_request"}
+            and {
+                "frontend/src/presentation/PredictionDraftControls.tsx",
+                "src/opendde_workbench/drafts/storage.py",
+                "tests/test_prediction_drafts.py",
+                "server_tests/test_prediction_drafts_browser.py",
+            }.issubset(changed)
+            and changed.issubset(DRAFT_FILES)
+        )
+    )
+
+
+def drafts_changed(changed, event="push"):
+    if draft_compatibility_only(changed, event):
+        return False
+    return event == "workflow_dispatch" or any(
+        name.startswith(
+            ("src/opendde_workbench/drafts/", "frontend/src/presentation/PredictionDraft")
+        )
+        or name
+        in {
+            "frontend/src/presentation/prediction-draft-model.ts",
+            "frontend/src/presentation/prediction-drafts.css",
+            "frontend/src/integrations/Mol1Form.tsx",
+            "frontend/src/integrations/Mol1Settings.tsx",
+            "src/opendde_workbench/api.py",
+            "src/opendde_workbench/assets.py",
+            "tests/test_prediction_drafts.py",
+            "server_tests/test_prediction_drafts_browser.py",
+            "frontend/src/integrations/boltz-draft.ts",
+            "frontend/src/integrations/BoltzDraftBoundary.tsx",
+            "frontend/src/presentation/SharedPredictionDraftControls.tsx",
+            "frontend/src/presentation/BoltzDraftControls.test.tsx",
+            "frontend/src/presentation/prediction-draft-contract.ts",
+            "frontend/src/presentation/mol1-draft-adapter.ts",
+            "tests/test_boltz_drafts.py",
+            "server_tests/test_boltz_drafts_browser.py",
+            "frontend/src/TaskFormDrafts.test.tsx",
+            "frontend/src/operations/opendde-draft.ts",
+            "frontend/src/operations/opendde-draft.test.ts",
+            "frontend/src/operations/useOpenDdeEditor.ts",
+            "frontend/src/operations/IntegerListField.tsx",
+            "frontend/src/operations/IntegerListField.test.tsx",
+            "frontend/src/operations/integer-list-model.ts",
+            "tests/test_opendde_drafts.py",
+            "server_tests/test_opendde_drafts_browser.py",
+        }
+        for name in changed
+    )
+
+
+def input_preview_only(changed, event="push"):
+    if setup_summary_only(changed, event):
+        return True
+    changed = set(changed)
+    return (
+        event in {"push", "pull_request"}
+        and {
+            "frontend/src/presentation/PredictionSetup.tsx",
+            "frontend/src/presentation/PredictionInputPreview.tsx",
+            "frontend/src/presentation/PredictionInputPreview.test.tsx",
+        }.issubset(changed)
+        and changed.issubset(INPUT_PREVIEW_FILES)
+    )
+
+
+def preview_changed(changed, event="push"):
+    if setup_summary_only(changed, event):
+        return True
+    if draft_compatibility_only(changed, event):
+        return False
+    return event == "workflow_dispatch" or any(
+        name.startswith(
+            (
+                "frontend/src/presentation/PredictionSetup",
+                "frontend/src/presentation/PredictionInputPreview",
+                "frontend/src/presentation/PredictionEntityPreview",
+                "frontend/src/presentation/PredictionSourceMolecule",
+                "frontend/src/presentation/PredictionReviewDialog",
+            )
+        )
+        or name
+        in {
+            "frontend/src/presentation/prediction-settings-summary.ts",
+            "frontend/src/research/asset-download.ts",
+            "frontend/src/presentation/prediction-input-preview.css",
+            "frontend/src/presentation/prediction-input-inspector.css",
+            "frontend/src/presentation/prediction-setup-summary.css",
+            "frontend/src/presentation/prediction-inputs.css",
+            "frontend/src/presentation/prediction-shell.css",
+            "frontend/src/presentation/prediction-workspace.css",
+            "frontend/src/integrations/ScientificForm.tsx",
+            "frontend/src/integrations/Mol1Form.tsx",
+            "frontend/src/TaskForm.tsx",
+            "server_tests/test_prediction_input_preview_browser.py",
+            "scripts/prediction-workspace-scope.py",
+            ".github/workflows/prediction-workspace-checks.yml",
+        }
+        for name in changed
+    )
+
+
+CONFIDENCE_PATTERNS = (
+    "src/opendde_workbench/confidence.py",
+    "tests/test_import_confidence.py",
+    "frontend/src/operations/ConfidencePanel*",
+    "server_tests/prediction_workspace_case.py",
+    "server_tests/native_confidence_case.py",
+    "server_tests/test_native_confidence_browser.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    "docs/frontend-layout.md",
+    "docs/quality/frontend-coverage.md",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package*.json",
+    "install.sh",
+    "install.ps1",
+)
+
+
+CONFIDENCE_LAYOUT_SOURCES = (
+    "frontend/src/presentation/PredictionConfidenceCard.tsx",
+    "frontend/src/presentation/prediction-confidence-card.css",
+    "frontend/src/presentation/StructureWorkbench.tsx",
+    "frontend/src/presentation/structure-workbench.css",
+    "frontend/src/viewer/StructureInspection.tsx",
+    "frontend/src/viewer/structure-inspection.css",
+)
+CONFIDENCE_LAYOUT_FILES = (
+    CONFIDENCE_PATTERNS
+    + CONFIDENCE_LAYOUT_SOURCES
+    + (
+        "frontend/src/presentation/prediction-results.css",
+        "frontend/src/studio/PredictionResults.tsx",
+        "frontend/src/integrations/Mol1Confidence.tsx",
+        "frontend/src/integrations/ScientificResults.tsx",
+        "server_tests/test_prediction_sample_export_browser.py",
+        "frontend/src/viewer/StructureViewport.tsx",
+        "frontend/src/viewer/StructureInspection.test.tsx",
+        "frontend/src/viewer/StructureViewer.test.tsx",
+        ".github/workflows/task-layout-checks.yml",
+    )
+)
+
+
+BOLTZ_CONFIDENCE_FILES = (
+    "frontend/src/operations/ConfidenceDownload*",
+    "frontend/src/operations/ConfidencePlddt*",
+    "frontend/src/operations/confidence-data.ts",
+    "frontend/src/operations/confidence-request*",
+    "frontend/src/presentation/prediction-confidence-card.css",
+    "server_tests/test_prediction_sample_export_browser.py",
+    "src/opendde_workbench/native_arrays.py",
+    "src/opendde_workbench/boltz_confidence*.py",
+    "src/opendde_workbench/science_routes.py",
+    "src/opendde_workbench/prediction_archive.py",
+    "src/opendde_workbench/prediction_sample_export.py",
+    "src/opendde_workbench/integrations/boltz_result.py",
+    "src/opendde_workbench/integrations/native_boltz.py",
+    "src/opendde_workbench/integrations/result.py",
+    "frontend/src/presentation/usePredictionConfidence*",
+    "frontend/src/studio/PredictionInspection.tsx",
+    "frontend/src/integrations/ScientificResults.tsx",
+    "frontend/src/integrations/types.ts",
+    "frontend/src/viewer/confidence-*",
+    "tests/confidence_array_fixture.py",
+    "frontend/src/viewer/scene.ts",
+    "frontend/src/viewer/style.test.ts",
+    "tests/test_native_arrays.py",
+    "tests/test_boltz_confidence*.py",
+    "server_tests/boltz_confidence_case.py",
+    "server_tests/test_boltz_confidence*.py",
+    ".github/workflows/scientific-upgrade-checks.yml",
+    ".github/workflows/molecule-design-review-checks.yml",
+    ".github/workflows/protein-interface-checks.yml",
+    "scripts/protein-interface-scope.py",
+    "tests/test_protein_interface_scope.py",
+)
+
+
+def boltz_confidence_only(changed):
+    patterns = CONFIDENCE_PATTERNS + BOLTZ_CONFIDENCE_FILES
+    return any(
+        name.startswith(
+            (
+                "src/opendde_workbench/boltz_confidence",
+                "tests/test_boltz_confidence",
+                "server_tests/test_boltz_confidence",
+                "frontend/src/operations/ConfidencePlddt",
+                "frontend/src/operations/ConfidenceDownload",
+            )
+        )
+        or name
+        in {
+            "src/opendde_workbench/native_arrays.py",
+            "frontend/src/operations/confidence-data.ts",
+        }
+        for name in changed
+    ) and all(any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns) for name in changed)
+
+
+def native_confidence_only(changed):
+    if confidence_frame_only(changed):
+        return True
+    if boltz_confidence_only(changed):
+        return True
+    if any(name in CONFIDENCE_LAYOUT_SOURCES for name in changed):
+        return all(
+            any(fnmatch.fnmatchcase(name, pattern) for pattern in CONFIDENCE_LAYOUT_FILES)
+            for name in changed
+        )
+    return (
+        "src/opendde_workbench/confidence.py" in changed
+        and "frontend/src/operations/ConfidencePanel.tsx" in changed
+        and all(
+            any(fnmatch.fnmatchcase(name, pattern) for pattern in CONFIDENCE_PATTERNS)
+            for name in changed
+        )
+    )
+
+
+def confidence_changed(changed):
+    if confidence_frame_only(changed):
+        return True
+    if workspace_expansion_only(changed):
+        return True
+    if boltz_confidence_only(changed):
+        return True
+    return any(
+        name.startswith("frontend/src/operations/ConfidencePanel")
+        or name in CONFIDENCE_LAYOUT_SOURCES
+        or name
+        in {
+            "frontend/src/tokens.css",
+            "src/opendde_workbench/confidence.py",
+            "src/opendde_workbench/confidence_binding.py",
+            "tests/test_confidence_binding.py",
+            "tests/test_import_confidence.py",
+            "server_tests/native_confidence_case.py",
+            "server_tests/test_native_confidence_browser.py",
+        }
+        for name in changed
+    )
+
+
+SAMPLE_EXPORT_SOURCES = CONFIDENCE_LAYOUT_SOURCES + (
+    "frontend/src/presentation/PredictionSample*.tsx",
+    "frontend/src/presentation/prediction-results.css",
+    "src/opendde_workbench/science_routes.py",
+    "src/opendde_workbench/prediction_sample_export.py",
+    "tests/test_prediction_sample_export.py",
+    "server_tests/test_prediction_sample_export_browser.py",
+    "src/opendde_workbench/integrations/native_boltz.py",
+    "src/opendde_workbench/native_runtime/analysis.py",
+)
+SAMPLE_EXPORT_FILES = SAMPLE_EXPORT_SOURCES + (
+    "src/opendde_workbench/examples/pins.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package*.json",
+    "install.sh",
+    "install.ps1",
+)
+
+
+def sample_export_changed(changed):
+    return "frontend/src/tokens.css" in changed or any(
+        fnmatch.fnmatchcase(name, pattern) for name in changed for pattern in SAMPLE_EXPORT_SOURCES
+    )
+
+
+def sample_export_only(changed, event="push"):
+    return (
+        event in {"push", "pull_request"}
+        and sample_export_changed(changed)
+        and all(
+            any(fnmatch.fnmatchcase(name, pattern) for pattern in SAMPLE_EXPORT_FILES)
+            for name in changed
+        )
+    )
+
+
+REFERENCE_REVIEW_SOURCES = (
+    "frontend/src/presentation/PredictionReference*.ts*",
+    "frontend/src/presentation/prediction-reference-review.css",
+    "server_tests/test_prediction_reference_review_browser.py",
+)
+REFERENCE_REVIEW_FILES = REFERENCE_REVIEW_SOURCES + (
+    "frontend/src/integrations/ScientificResults.tsx",
+    "frontend/src/viewer/StructureViewport.tsx",
+    "frontend/src/viewer/frame.ts",
+    "frontend/src/viewer/source-layout.ts",
+    "frontend/src/viewer/source-layout.test.ts",
+    "frontend/src/viewer/pose-errors.ts",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package*.json",
+    "install.sh",
+    "install.ps1",
+)
+
+
+def reference_review_changed(changed):
+    return any(
+        fnmatch.fnmatchcase(name, pattern)
+        for name in changed
+        for pattern in REFERENCE_REVIEW_SOURCES
+    )
+
+
+def reference_review_only(changed, event="push"):
+    return (
+        event in {"push", "pull_request"}
+        and reference_review_changed(changed)
+        and all(
+            any(fnmatch.fnmatchcase(name, pattern) for pattern in REFERENCE_REVIEW_FILES)
+            for name in changed
+        )
+    )
+
+
+HISTORY_INPUT_SOURCES = (
+    "frontend/src/presentation/HistoricalPredictionInput.tsx",
+    "frontend/src/presentation/HistoricalPredictionInput.test.tsx",
+    "frontend/src/presentation/HistoricalInputOverview.tsx",
+    "frontend/src/presentation/prediction-history-types.ts",
+    "frontend/src/presentation/prediction-history-model.ts",
+    "frontend/src/presentation/prediction-history-model.test.ts",
+    "frontend/src/presentation/prediction-history-native.ts",
+    "frontend/src/presentation/prediction-history-input.css",
+    "server_tests/test_prediction_history_input_browser.py",
+)
+HISTORY_INPUT_FILES = HISTORY_INPUT_SOURCES + (
+    "frontend/src/presentation/PredictionEntityPreview.tsx",
+    "frontend/src/presentation/PredictionInputPreview.test.tsx",
+    "docs/quality/frontend-coverage.md",
+    "frontend/src/TaskDetail.tsx",
+    "frontend/src/studio/PredictionResults.tsx",
+    "frontend/src/presentation/PredictionReviewDialog.tsx",
+    "frontend/src/presentation/artifact-file.ts",
+    "src/opendde_workbench/api.py",
+    "tests/test_jobs.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package*.json",
+    "install.sh",
+    "install.ps1",
+)
+
+
+def history_input_changed(changed):
+    return any(name in HISTORY_INPUT_SOURCES for name in changed)
+
+
+def history_input_only(changed, event="push"):
+    return (
+        event in {"push", "pull_request"}
+        and history_input_changed(changed)
+        and all(
+            any(fnmatch.fnmatchcase(name, pattern) for pattern in HISTORY_INPUT_FILES)
+            for name in changed
+        )
+    )
+
+
+JOB_ARCHIVE_SOURCES = (
+    "src/opendde_workbench/prediction_archive.py",
+    "frontend/src/presentation/PredictionArchiveDownload.tsx",
+    "frontend/src/presentation/PredictionResultHeader.tsx",
+    "frontend/src/presentation/prediction-result-header.css",
+    "server_tests/test_prediction_job_archive_browser.py",
+)
+JOB_ARCHIVE_FILES = (
+    HISTORY_INPUT_FILES
+    + JOB_ARCHIVE_SOURCES
+    + (
+        "src/opendde_workbench/prediction_sample_export.py",
+        "src/opendde_workbench/science_routes.py",
+        "tests/test_prediction_sample_export.py",
+        "frontend/src/App.tsx",
+        "frontend/src/TaskDetail.test.tsx",
+        "frontend/src/studio/TaskWorkspace*.tsx",
+        "frontend/src/presentation/prediction-results.css",
+        "frontend/src/presentation/prediction-workspace.css",
+    )
+)
+
+
+def job_archive_changed(changed):
+    return any(name in JOB_ARCHIVE_SOURCES for name in changed)
+
+
+def job_archive_only(changed, event="push"):
+    return (
+        event in {"push", "pull_request"}
+        and job_archive_changed(changed)
+        and all(
+            any(fnmatch.fnmatchcase(name, pattern) for pattern in JOB_ARCHIVE_FILES)
+            for name in changed
+        )
+    )
+
+
+EXAMPLE_INSPECTION_FILES = {
+    "frontend/src/studio/PredictionInspection.tsx",
+    "frontend/src/studio/PredictionResults.tsx",
+    "frontend/src/studio/PredictionResults.test.tsx",
+    "frontend/src/studio/CandidatePanel.tsx",
+    "frontend/src/studio/CandidatePanel.test.tsx",
+    "frontend/src/studio/AnalysisGrid.tsx",
+    "frontend/src/presentation/PredictionSamples.tsx",
+    "frontend/src/presentation/PredictionSamples.test.tsx",
+    "frontend/src/presentation/PredictionSampleIdentity.ts",
+    "frontend/src/presentation/prediction-results.css",
+    "frontend/src/presentation/prediction-inputs.css",
+    "frontend/src/presentation/prediction-shell.css",
+    "frontend/src/presentation/prediction-workspace.css",
+    "frontend/src/examples/ExampleJobResult.tsx",
+    "frontend/src/examples/ExampleJobResult.test.tsx",
+    "server_tests/prediction_workspace_case.py",
+    "server_tests/test_prediction_workspace_browser.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    ".github/workflows/example-result-set-checks.yml",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+# A stacked service candidate has its own lifecycle and upgrade checks.
+SERVICE_SHUTDOWN_FILES = {
+    "src/opendde_workbench/__main__.py",
+    "tests/test_service_shutdown.py",
+    ".github/workflows/service-control-checks.yml",
+    ".github/workflows/service-upgrade-checks.yml",
+    "docs/development.md",
+}
+
+
+def example_inspection_only(changed, event):
+    paths = set(changed)
+    if (
+        event not in {"push", "pull_request"}
+        or not {
+            "frontend/src/studio/PredictionInspection.tsx",
+            "frontend/src/examples/ExampleJobResult.tsx",
+        }
+        & paths
+    ):
+        return False
+    if SERVICE_SHUTDOWN_FILES <= paths:
+        paths -= SERVICE_SHUTDOWN_FILES
+    return paths <= EXAMPLE_INSPECTION_FILES
+
+
+RESULT_LAYOUT_SOURCES = {
+    "frontend/src/presentation/PredictionPlotSize.ts",
+    "frontend/src/presentation/PredictionConfidenceCard.tsx",
+    "frontend/src/operations/ConfidencePanel.tsx",
+    "frontend/src/presentation/prediction-inspection.css",
+    "frontend/src/presentation/prediction-wide-inspection.css",
+    "frontend/src/presentation/PredictionArchiveDownload.tsx",
+    "frontend/src/presentation/prediction-results.css",
+    "frontend/src/presentation/prediction-workspace.css",
+    "frontend/src/presentation/prediction-shell.css",
+    "frontend/src/presentation/prediction-result-header.css",
+    "frontend/src/presentation/PredictionResultHeader.tsx",
+    "frontend/src/examples/ExampleJobResult.tsx",
+}
+RESULT_LAYOUT_FILES = RESULT_LAYOUT_SOURCES | {
+    ".github/workflows/example-result-set-checks.yml",
+    ".github/workflows/publication-checks.yml",
+    "frontend/src/operations/ConfidencePanel.test.tsx",
+    "frontend/src/examples/ExampleJobResult.test.tsx",
+    "server_tests/test_native_confidence_browser.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    "docs/frontend-layout.md",
+    "pyproject.toml", "uv.lock", "frontend/package.json", "frontend/package-lock.json",
+    "install.sh", "install.ps1",
+}
+
+
+def result_layout_only(changed, event="push"):
+    return (event in {"push", "pull_request"} and bool(RESULT_LAYOUT_SOURCES.intersection(changed))
+            and set(changed).issubset(RESULT_LAYOUT_FILES))
+
+
+PREDICTION_PUBLICATION_LAYOUT_SOURCES = {
+    "frontend/src/presentation/PredictionResultHeader.tsx",
+    "frontend/src/presentation/prediction-inspection.css",
+    "frontend/src/presentation/prediction-result-header.css",
+}
+PREDICTION_PUBLICATION_LAYOUT_FILES = PREDICTION_PUBLICATION_LAYOUT_SOURCES | {
+    ".github/workflows/prediction-workspace-checks.yml",
+    ".github/workflows/publication-checks.yml",
+    "scripts/prediction-workspace-scope.py",
+    "server_tests/test_native_confidence_browser.py",
+    "tests/test_prediction_workspace_scope.py",
+}
+
+
+def prediction_publication_layout_only(changed, base, event="push"):
+    paths = set(changed)
+    if event not in {"push", "pull_request"} or not paths & PREDICTION_PUBLICATION_LAYOUT_SOURCES:
+        return False
+    versions = runpy.run_path("scripts/docking-result-scope.py")
+    mirrors = paths - PREDICTION_PUBLICATION_LAYOUT_FILES
+    return mirrors <= versions["VERSION_FILES"] and (
+        not mirrors or bool(base) and versions["only_version_mirrors"](base, mirrors)
+    )
+
+
+def selected(changed, event="push"):
+    if input_preview_only(changed, event):
+        return True
+    if result_layout_only(changed, event):
+        return True
+    if workspace_expansion_only(changed, event):
+        return True
+    if (
+        boltz_inputs_only(changed, event)
+        or computation_settings_only(changed, event)
+        or entity_inputs_only(changed, event)
+        or feature_settings_only(changed, event)
+        or example_inspection_only(changed, event)
+        or sample_export_only(changed, event)
+        or reference_review_only(changed, event)
+        or history_input_only(changed, event)
+        or job_archive_only(changed, event)
+        or drafts_only(changed, event)
+        or final_review_only(changed, event)
+    ):
+        return True
+    if event in {"push", "pull_request"} and native_confidence_only(changed):
+        return True
+    return (
+        event in {"push", "pull_request"}
+        and any(
+            name.startswith(
+                (
+                    "frontend/src/presentation/Prediction",
+                    "frontend/src/viewer/StructureInspection",
+                    "frontend/src/viewer/ViewerControls",
+                )
+            )
+            for name in changed
+        )
+        and all(any(fnmatch.fnmatchcase(name, pattern) for pattern in PATTERNS) for name in changed)
+    )
+
+
+EXPANSION_SOURCES = {
+    "frontend/src/presentation/WorkspaceFullscreenControl.tsx",
+    "frontend/src/presentation/useWorkspaceFullscreen.ts",
+    "frontend/src/presentation/workspace-expansion.ts",
+    "frontend/src/presentation/workspace-fullscreen.css",
+}
+EXPANSION_FILES = EXPANSION_SOURCES | {
+    "frontend/src/studio/PredictionInspection.tsx",
+    "frontend/src/integrations/ScientificResults.tsx",
+    "frontend/src/presentation/WorkspaceFullscreenControl.test.tsx",
+    "frontend/src/presentation/structure-workbench.css",
+    "frontend/src/presentation/prediction-results.css",
+    "frontend/src/design/module-surfaces.css",
+    "frontend/src/docking/docking-job-review.css",
+    "frontend/src/datasets/datasets.css",
+    "frontend/src/diffsbdd/spatial-design-review.css",
+    "frontend/src/quality/quality-results.css",
+    "frontend/src/proximity/FormReview.css",
+    "frontend/src/viewer/viewer.css",
+    "frontend/src/simulations/simulations.css",
+    "server_tests/fullscreen_browser_helpers.py",
+    "server_tests/publication_browser_helpers.py",
+    "server_tests/test_workspace_fullscreen_browser.py",
+    "server_tests/test_native_confidence_browser.py",
+    "server_tests/test_prediction_workspace_browser.py",
+    "server_tests/test_target_selection_browser.py",
+    "server_tests/test_diff_review_browser.py",
+    "server_tests/test_reinvent_review_browser.py",
+    "server_tests/test_reinvent_native_browser.py",
+    "server_tests/test_native_docking.py",
+    "server_tests/flexible_receptor_probe.py",
+    "server_tests/flexible_receptor_browser.py",
+    "server_tests/flexible_receptor_questionnaire.py",
+    "scripts/prediction-workspace-scope.py",
+    "tests/test_prediction_workspace_scope.py",
+    ".github/workflows/prediction-workspace-checks.yml",
+    ".github/workflows/publication-checks.yml",
+    ".github/workflows/simulation-view-checks.yml",
+    "docs/frontend-layout.md",
+    "pyproject.toml",
+    "uv.lock",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "install.sh",
+    "install.ps1",
+}
+
+
+def workspace_expansion_only(changed, event="push"):
+    paths = set(changed)
+    # The existing native figure, simulation and prediction gates own this shared
+    # presentation. A mixed backend, constraint, input or task edit is never delegated.
+    return (
+        event in {"push", "pull_request"}
+        and bool(paths & EXPANSION_SOURCES)
+        and paths <= EXPANSION_FILES
+    )
+
+
+def shared_workbench_only(changed, event="push"):
+    if workspace_expansion_only(changed, event):
+        return True
+    return (
+        event in {"push", "pull_request"}
+        and native_confidence_only(changed)
+        and bool(
+            {
+                "frontend/src/presentation/StructureWorkbench.tsx",
+                "frontend/src/presentation/structure-workbench.css",
+            }.intersection(changed)
+        )
+    )
+
+
+def prediction_only(changed, event="push"):
+    if workspace_expansion_only(changed, event):
+        return True
+    shared_workbench = {
+        "frontend/src/presentation/StructureWorkbench.tsx",
+        "frontend/src/presentation/structure-workbench.css",
+    }
+    return not shared_workbench.intersection(changed) and selected(changed, event)
+
+
+def main():
+    base = os.environ.get("BASE", "")
+    if os.environ.get("GITHUB_REF_NAME", "main") != "main":
+        base = subprocess.check_output(
+            ["git", "merge-base", "origin/main", "HEAD"], text=True
+        ).strip()
+    changed = (
+        subprocess.check_output(
+            ["git", "diff", "--name-only", base, "HEAD"], text=True
+        ).splitlines()
+        if base and set(base) != {"0"}
+        else []
+    )
+    appearance = runpy.run_path("scripts/appearance-scope.py")["from_git"](
+        changed, base, os.environ.get("GITHUB_EVENT_NAME", "push")
+    )
+    with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+        for key, value in {
+            "confidence_frame": confidence_frame_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "setup_summary": setup_summary_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "result_layout_only": result_layout_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "prediction_publication_layout": prediction_publication_layout_only(
+                changed, base, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "draft_compatibility": draft_compatibility_changed(changed),
+            "draft_compatibility_only": draft_compatibility_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "boltz_drafts": boltz_drafts_only(changed, os.environ.get("GITHUB_EVENT_NAME", "push")),
+            "boltz_confidence": boltz_confidence_only(changed),
+            "appearance_only": appearance,
+            "boltz_inputs": boltz_inputs_only(changed, os.environ.get("GITHUB_EVENT_NAME", "push")),
+            "computation_settings": computation_settings_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "feature_settings": feature_settings_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "job_review_layout": job_review_layout_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "entity_inputs": feature_settings_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            )
+            or entity_inputs_only(changed, os.environ.get("GITHUB_EVENT_NAME", "push")),
+            "shared_workbench_only": shared_workbench_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "job_archive_changed": job_archive_changed(changed),
+            "job_archive_only": job_archive_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "history_input_changed": history_input_changed(changed),
+            "history_input_only": history_input_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "reference_review_changed": reference_review_changed(changed),
+            "reference_review_only": reference_review_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "sample_export_changed": sample_export_changed(changed),
+            "sample_export_only": sample_export_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "docking_review_only": docking_review_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "drafts_only": drafts_only(changed, os.environ.get("GITHUB_EVENT_NAME", "push")),
+            "drafts_changed": drafts_changed(changed, os.environ.get("GITHUB_EVENT_NAME", "push")),
+            "final_review_only": final_review_only(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "final_review_changed": final_review_changed(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "boltz_review_changed": boltz_review_changed(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+            "opendde_review_changed": opendde_review_changed(
+                changed, os.environ.get("GITHUB_EVENT_NAME", "push")
+            ),
+        }.items():
+            stream.write(f"{key}={str(value).lower()}\n")
+        stream.write(
+            "preview_changed="
+            + str(preview_changed(changed, os.environ.get("GITHUB_EVENT_NAME", "push"))).lower()
+            + "\n"
+        )
+        stream.write(
+            "input_preview="
+            + str(input_preview_only(changed, os.environ.get("GITHUB_EVENT_NAME", "push"))).lower()
+            + "\n"
+        )
+        stream.write("confidence_changed=" + str(confidence_changed(changed)).lower() + "\n")
+        stream.write("native_confidence=" + str(native_confidence_only(changed)).lower() + "\n")
+        stream.write(
+            "prediction_only="
+            + str(prediction_only(changed, os.environ.get("GITHUB_EVENT_NAME", "push"))).lower()
+            + "\n"
+        )
+
+
+if __name__ == "__main__":
+    main()

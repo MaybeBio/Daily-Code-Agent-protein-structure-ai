@@ -1,0 +1,80 @@
+/**
+ *  \file internal/StaticListContainer.h
+ *  \brief Store a static list of objects.
+ *
+ *  Copyright 2007-2023 IMP Inventors. All rights reserved.
+ */
+
+#ifndef IMPKERNEL_INTERNAL_STATIC_LIST_CONTAINER_H
+#define IMPKERNEL_INTERNAL_STATIC_LIST_CONTAINER_H
+
+#include <IMP/kernel_config.h>
+#include "ListLikeContainer.h"
+#include "container_helpers.h"
+#include <IMP/object_macros.h>
+#include <cereal/access.hpp>
+#include <cereal/types/base_class.hpp>
+
+IMPKERNEL_BEGIN_INTERNAL_NAMESPACE
+
+template <class Base>
+class StaticListContainer : public ListLikeContainer<Base> {
+  typedef ListLikeContainer<Base> P;
+
+  friend class cereal::access;
+
+  template<class Archive> void serialize(Archive &ar) {
+    ar(cereal::base_class<P>(this));
+  }
+  IMP_OBJECT_SERIALIZE_DECL(StaticListContainer<Base>);
+
+ public:
+  StaticListContainer(Model *m, std::string name) : P(m, name) {}
+  StaticListContainer() {}
+  void add(typename Base::PassContainedIndexType vt) {
+    Base::set_has_dependencies(false);
+    typename Base::ContainedIndexTypes cur;
+    P::swap(cur);
+    cur.push_back(vt);
+    P::swap(cur);
+  }
+  void add(const typename Base::ContainedIndexTypes &c) {
+    if (c.empty()) return;
+    Base::set_has_dependencies(false);
+    typename Base::ContainedIndexTypes cur;
+    P::swap(cur);
+    cur += c;
+    P::swap(cur);
+  }
+  void set(typename Base::ContainedIndexTypes cp) {
+    Base::set_has_dependencies(false);
+    P::swap(cp);
+  }
+  void remove(typename Base::PassContainedIndexType vt) {
+    Base::set_has_dependencies(false);
+    typename Base::ContainedIndexTypes t;
+    P::swap(t);
+    t.erase(std::remove(t.begin(), t.end(), vt), t.end());
+    P::swap(t);
+  }
+  void clear() {
+    Base::set_has_dependencies(false);
+    typename Base::ContainedIndexTypes t;
+    P::swap(t);
+  }
+  virtual ParticleIndexes get_all_possible_indexes() const override {
+    return flatten(P::get_indexes());
+  }
+  virtual ModelObjectsTemp do_get_inputs() const override {
+    return ModelObjectsTemp();
+  }
+  virtual typename Base::ContainedIndexTypes get_range_indexes() const
+      override {
+    return P::get_indexes();
+  }
+  IMP_OBJECT_METHODS(StaticListContainer);
+};
+
+IMPKERNEL_END_INTERNAL_NAMESPACE
+
+#endif /* IMPKERNEL_INTERNAL_STATIC_LIST_CONTAINER_H */

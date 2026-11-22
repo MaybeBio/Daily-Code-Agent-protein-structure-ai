@@ -1,0 +1,377 @@
+name: Joi_bio pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      gene:
+        description: "타깃 유전자 (예: EPAS1) 또는 all"
+        required: true
+        default: EPAS1
+      n_decoys:
+        description: "decoy 수"
+        required: false
+        default: "2500"
+      max_actives:
+        description: "활성 상한 (높으면 EF 임계값이 도달 불가능해진다)"
+        required: false
+        default: "60"
+      max_ligands:
+        description: "샤드당 리간드 상한 (0=전체)"
+        required: false
+        default: "0"
+      exhaustiveness:
+        description: "Vina exhaustiveness (높을수록 정확·느림)"
+        required: false
+        default: "8"
+      pdb_id:
+        description: "수용체 PDB ID 강제 지정. 비우면 자동 선택. 두 팔 비교를 재현하려면 반드시 고정한다 (치료군 = 6CZW)"
+        required: false
+        default: ""
+      library_path:
+        description: "미리 만들어 둔 라이브러리 jsonl. 지정하면 ChEMBL 재질의 대신 이 파일을 고정해 쓴다"
+        required: false
+        default: ""
+      dock_timeout:
+        description: "도킹 작업당 timeout(분). 비용 상한 = 작업 수 x 이 값"
+        required: false
+        default: "300"
+
+# 로그와 결과를 ci-results 브랜치로 되돌려 보낸다.
+# Actions 로그는 blob 스토리지에 있어 API로 읽기 어렵기 때문이다.
+permissions:
+  contents: write
+
+jobs:
+  preflight:
+    name: 환경 사전 점검
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          # 버전을 고정한다. 'latest' 는 micro.mamba.pm API 로 해석되는데
+          # 2026-11-08 에 그 엔드포인트가 HTTP 504 를 반복해서 돌려줬고
+          # 탐침 18개 작업 중 8개가 거기서 죽었다. 구체적 버전을 주면
+          # github.com/mamba-org/micromamba-releases 에서 받는다.
+          micromamba-version: "2.10.0-0"
+          cache-environment: true
+
+      # 의존성 문제를 2분 안에 잡는다. 이게 없으면 prep 5분 + 도킹 1시간을
+      # 쓰고 나서야 리간드 준비가 전부 실패했다는 걸 알게 된다.
+      - name: import·변환 점검
+        shell: bash -el {0}
+        run: |
+          set -o pipefail
+          python - <<'PY'
+          import vina, meeko, rdkit, scipy, numpy, requests, yaml
+          print("import OK:", "vina meeko rdkit scipy numpy requests yaml")
+          from meeko import MoleculePreparation, PDBQTWriterLegacy
+          from rdkit import Chem
+          from rdkit.Chem import AllChem
+          m = Chem.AddHs(Chem.MolFromSmiles("CC(=O)Oc1ccccc1C(=O)O"))
+          prm = AllChem.ETKDGv3(); prm.randomSeed = 42
+          assert AllChem.EmbedMolecule(m, prm) == 0, "3D 임베딩 실패"
+          AllChem.MMFFOptimizeMolecule(m, maxIters=200)
+          setups = MoleculePreparation().prepare(m)
+          txt, ok, err = PDBQTWriterLegacy.write_string(setups[0])
+          assert ok, f"PDBQT 변환 실패: {err}"
+          print(f"리간드 PDBQT 변환 OK ({len(txt.splitlines())}줄)")
+          v = vina.Vina(sf_name="vina", cpu=1, verbosity=0)
+          print("Vina 인스턴스 OK")
+          PY
+          obabel -V
+
+  prep:
+    name: 구조·라이브러리 준비
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      genes: ${{ steps.genes.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          # 버전을 고정한다. 'latest' 는 micro.mamba.pm API 로 해석되는데
+          # 2026-11-08 에 그 엔드포인트가 HTTP 504 를 반복해서 돌려줬고
+          # 탐침 18개 작업 중 8개가 거기서 죽었다. 구체적 버전을 주면
+          # github.com/mamba-org/micromamba-releases 에서 받는다.
+          micromamba-version: "2.10.0-0"
+          cache-environment: true
+
+      - name: 타깃 목록 결정
+        id: genes
+        shell: bash -el {0}
+        run: |
+          if [ "${{ inputs.gene }}" = "all" ]; then
+            LIST=$(python -c "
+          import yaml, json
+          t = yaml.safe_load(open('config/targets.yaml'))['targets']
+          t.sort(key=lambda x: x.get('priority', 99))
+          print(json.dumps([x['gene'] for x in t]))")
+          else
+            LIST='["${{ inputs.gene }}"]'
+          fi
+          echo "list=$LIST" >> $GITHUB_OUTPUT
+          echo "타깃: $LIST"
+
+      - name: Stage 01 — 구조 확보와 포켓 정의
+        id: s01
+        shell: bash -el {0}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          for g in $(echo '${{ steps.genes.outputs.list }}' | python -c "import sys,json;print(' '.join(json.load(sys.stdin)))"); do
+            echo "===== $g =====" | tee -a logs/01_structure.log
+            PDBARG=""
+            if [ -n "${{ inputs.pdb_id }}" ]; then PDBARG="--pdb-id ${{ inputs.pdb_id }}"; fi
+            python -m core.structure.fetch --gene "$g" $PDBARG 2>&1 | tee -a logs/01_structure.log
+          done
+
+      - name: Stage 02 — 라이브러리 구성
+        if: always() && steps.s01.outcome == 'success'
+        shell: bash -el {0}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          for g in $(echo '${{ steps.genes.outputs.list }}' | python -c "import sys,json;print(' '.join(json.load(sys.stdin)))"); do
+            echo "===== $g =====" | tee -a logs/02_library.log
+            if [ -n "${{ inputs.library_path }}" ]; then
+              python scripts/freeze_library.py --gene "$g" \
+                --library "${{ inputs.library_path }}" 2>&1 | tee -a logs/02_library.log
+            else
+              python -m modules.small_molecule.library --gene "$g" \
+                --n-decoys ${{ inputs.n_decoys }} \
+                --max-actives ${{ inputs.max_actives }} 2>&1 | tee -a logs/02_library.log
+            fi
+          done
+
+      - name: 로그·메타데이터를 ci-results 브랜치로
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          DEST=$RUNNER_TEMP/ci
+          git clone --quiet --depth 1 --branch ci-results \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$DEST"
+          OUT="$DEST/runs/${GITHUB_RUN_ID}/prep"
+          mkdir -p "$OUT"
+          cp -r logs "$OUT/" 2>/dev/null || true
+          # 큰 jsonl 은 제외하고 메타데이터만 가져간다
+          find targets -name '*.json' -exec cp --parents {} "$OUT/" \; 2>/dev/null || true
+          cd "$DEST"
+          git add -A
+          git -c user.name=joi-bio-ci -c user.email=ci@joi-bio \
+            commit -q -m "prep logs: run ${GITHUB_RUN_ID} (${{ inputs.gene }})" || exit 0
+          git push --quiet origin ci-results
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prepared
+          path: targets/
+          retention-days: 7
+          if-no-files-found: warn
+
+  dock:
+    name: 도킹
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.dock_timeout) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        gene: ${{ fromJson(needs.prep.outputs.genes) }}
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          # 버전을 고정한다. 'latest' 는 micro.mamba.pm API 로 해석되는데
+          # 2026-11-08 에 그 엔드포인트가 HTTP 504 를 반복해서 돌려줬고
+          # 탐침 18개 작업 중 8개가 거기서 죽었다. 구체적 버전을 주면
+          # github.com/mamba-org/micromamba-releases 에서 받는다.
+          micromamba-version: "2.10.0-0"
+          cache-environment: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: prepared
+          path: targets/
+
+      - name: Stage 03 — Vina 도킹
+        shell: bash -el {0}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          python -u -m modules.small_molecule.dock \
+            --gene ${{ matrix.gene }} \
+            --shard ${{ matrix.shard }} --n-shards 32 \
+            --max-ligands ${{ inputs.max_ligands }} \
+            --exhaustiveness ${{ inputs.exhaustiveness }} 2>&1 \
+            | tee logs/03_dock_${{ matrix.gene }}_${{ matrix.shard }}.log
+
+      - name: 로그를 ci-results 브랜치로
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          DEST=$RUNNER_TEMP/ci
+          # cd 하지 않는다. 예전 루프는 cd "$DEST" 뒤 다음 회차에서 그 디렉터리를
+          # 지워 "Unable to read current working directory" 로 죽었다. 샤드 8개일
+          # 때는 충돌이 드물어 안 드러났고, 16개로 올리자 바로 터졌다.
+          for i in $(seq 1 12); do
+            rm -rf "$DEST"
+            git clone --quiet --depth 1 --branch ci-results \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$DEST" || { sleep 5; continue; }
+            OUT="$DEST/runs/${GITHUB_RUN_ID}/dock-${{ matrix.gene }}-${{ matrix.shard }}"
+            mkdir -p "$OUT"
+            cp -r logs/* "$OUT/" 2>/dev/null || true
+            # 잘린 샤드의 부분 결과. 남아 있다 = 그 샤드는 완주하지 못했다
+            cp targets/*/partial_shard*.jsonl "$OUT/" 2>/dev/null || true
+            git -C "$DEST" add -A
+            git -C "$DEST" -c user.name=joi-bio-ci -c user.email=ci@joi-bio \
+              commit -q -m "dock logs: run ${GITHUB_RUN_ID} ${{ matrix.gene }} shard ${{ matrix.shard }}" || exit 0
+            if git -C "$DEST" push --quiet origin ci-results; then exit 0; fi
+            sleep $(( (RANDOM % 25) + 5 ))
+          done
+          echo "[!] ci-results push 를 12회 재시도했으나 실패했다. 아티팩트에는 남아 있다."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: docked-${{ matrix.gene }}-${{ matrix.shard }}
+          path: |
+            targets/${{ matrix.gene }}/docked_shard*.jsonl
+            targets/${{ matrix.gene }}/partial_shard*.jsonl
+          retention-days: 7
+          if-no-files-found: warn
+
+  report:
+    name: 검증·보고서
+    needs: [preflight, prep, dock]
+    if: always() && needs.prep.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          # 버전을 고정한다. 'latest' 는 micro.mamba.pm API 로 해석되는데
+          # 2026-11-08 에 그 엔드포인트가 HTTP 504 를 반복해서 돌려줬고
+          # 탐침 18개 작업 중 8개가 거기서 죽었다. 구체적 버전을 주면
+          # github.com/mamba-org/micromamba-releases 에서 받는다.
+          micromamba-version: "2.10.0-0"
+          cache-environment: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/dl
+
+      - name: 결과 수집
+        shell: bash -el {0}
+        run: |
+          mkdir -p targets logs
+          cp -r /tmp/dl/prepared/* targets/ 2>/dev/null || true
+          for d in /tmp/dl/docked-*; do
+            [ -d "$d" ] || continue
+            base=$(basename "$d")
+            g=$(echo "$base" | sed -E 's/^docked-(.+)-[0-9]+$/\1/')
+            mkdir -p "targets/$g"
+            cp "$d"/*.jsonl "targets/$g/" 2>/dev/null || true
+          done
+          echo "수집된 타깃:" | tee logs/04_collect.log
+          ls targets | tee -a logs/04_collect.log
+
+      - name: Stage 04-05 — 검증 게이트와 ADMET
+        shell: bash -el {0}
+        run: |
+          set +e
+          for g in $(ls targets); do
+            echo "===== $g =====" | tee -a logs/04_validate.log
+            python -m core.validation.gate --gene "$g" 2>&1 | tee -a logs/04_validate.log
+            python -m modules.small_molecule.admet --gene "$g" 2>&1 | tee -a logs/05_admet.log
+          done
+          exit 0
+
+      - name: Stage 05b — 포즈 좌표 생성 (시각화용)
+        shell: bash -el {0}
+        run: |
+          set +e
+          for g in $(ls targets); do
+            [ -f "targets/$g/docked_all.jsonl" ] || continue
+            echo "===== $g =====" | tee -a logs/05b_poses.log
+            python -m modules.small_molecule.poses --gene "$g" \
+              --top-n 15 --poses-per-ligand 3 2>&1 | tee -a logs/05b_poses.log
+          done
+          exit 0
+
+      - name: Stage 06 — 보고서
+        shell: bash -el {0}
+        run: |
+          set -o pipefail
+          python -m core.report.build 2>&1 | tee logs/06_report.log
+
+      - name: 결과를 ci-results 브랜치로
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          DEST=$RUNNER_TEMP/ci
+          git clone --quiet --depth 1 --branch ci-results \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$DEST"
+          OUT="$DEST/runs/${GITHUB_RUN_ID}/report"
+          mkdir -p "$OUT"
+          cp -r logs "$OUT/" 2>/dev/null || true
+          cp -r results "$OUT/" 2>/dev/null || true
+          find targets -name '*.json' -exec cp --parents {} "$OUT/" \; 2>/dev/null || true
+          # 후보는 상위 20개만
+          for f in targets/*/candidates.jsonl; do
+            [ -f "$f" ] || continue
+            mkdir -p "$OUT/$(dirname "$f")"
+            head -20 "$f" > "$OUT/${f%.jsonl}_top20.jsonl"
+          done
+          # 구조 뷰어가 읽을 파일 — 수용체와 포즈 좌표
+          for f in targets/*/receptor.pdb targets/*/poses.sdf; do
+            [ -f "$f" ] || continue
+            mkdir -p "$OUT/$(dirname "$f")"
+            cp "$f" "$OUT/$f"
+          done
+          cp "$OUT/results/report.md" "$DEST/LATEST_REPORT.md" 2>/dev/null || true
+          cd "$DEST"
+          git add -A
+          git -c user.name=joi-bio-ci -c user.email=ci@joi-bio \
+            commit -q -m "report: run ${GITHUB_RUN_ID} (${{ inputs.gene }})" || exit 0
+          git push --quiet origin ci-results
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: joi-bio-report
+          path: |
+            results/
+            logs/
+            targets/*/validation.json
+            targets/*/candidates.jsonl
+            targets/*/target_meta.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: 요약 출력
+        if: always()
+        run: cat results/report.md >> $GITHUB_STEP_SUMMARY || true

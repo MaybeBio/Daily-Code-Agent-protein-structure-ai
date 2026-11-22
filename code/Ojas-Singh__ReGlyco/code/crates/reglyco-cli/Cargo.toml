@@ -1,0 +1,37 @@
+[package]
+name = "reglyco-cli"
+version.workspace = true
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "Command-line interface implementation for ReGlyco"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+
+[features]
+# GlycoFlow network on CUDA (`--glycoflow-device cuda`); build with CUDA_COMPUTE_CAP set
+glycoflow-cuda = ["reglyco-glycoflow/cuda"]
+
+[dependencies]
+anyhow.workspace = true
+crabsaxs = { package = "crabsaxs", version = "0.1.1", path = "../../../crabSAXS" }
+crabwurcs-core.workspace = true
+crabwurcs-iupac.workspace = true
+crabwurcs-pdb.workspace = true
+clap.workspace = true
+glysys.workspace = true
+reglyco-build = { version = "0.2.3", path = "../reglyco-build" }
+reglyco-core = { version = "0.2.3", path = "../reglyco-core" }
+reglyco-density = { version = "0.2.3", path = "../reglyco-density" }
+reglyco-ensemble = { version = "0.2.3", path = "../reglyco-ensemble" }
+reglyco-glycoflow = { version = "0.2.3", path = "../reglyco-glycoflow" }
+reglyco-refine = { version = "0.2.3", path = "../reglyco-refine" }
+reglyco-relax = { version = "0.2.3", path = "../reglyco-relax" }
+reglyco-report = { version = "0.2.3", path = "../reglyco-report" }
+reglyco-saxs = { version = "0.2.3", path = "../reglyco-saxs" }
+reglyco-validate = { version = "0.2.3", path = "../reglyco-validate" }
+reglyco-workflow = { version = "0.2.3", path = "../reglyco-workflow" }
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+toml = "0.8"

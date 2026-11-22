@@ -1,0 +1,220 @@
+{% extends "base.html" %}
+{% set active = 'latest' %}
+{% block title %}AlphaFraud &middot; {{ label }}{% endblock %}
+
+{% macro figure(fig_json, dom_id, caption='') %}
+  {% if fig_json %}
+  <div class="card">
+    <div class="plot" id="{{ dom_id }}"></div>
+    {% if caption %}<p class="hint plot-caption">{{ caption }}</p>{% endif %}
+    <div class="dlbar"><button class="dl" onclick="downloadPlotCsv('{{ dom_id }}','{{ dom_id }}.csv')">⬇ Download CSV</button></div>
+  </div>
+  <script type="application/json" data-target="{{ dom_id }}">{{ fig_json | safe }}</script>
+  {% endif %}
+{% endmacro %}
+
+{% macro fmt(v, dash='—') %}{% if v is none %}{{ dash }}{% else %}{{ v }}{% endif %}{% endmacro %}
+{% macro r2(v) %}{% if v is none %}—{% elif v is number %}{{ '%.2f'|format(v) }}{% else %}{{ v }}{% endif %}{% endmacro %}
+
+{% block content %}
+  {% if is_all %}
+  <h1>All structures</h1>
+  <p class="sub">Cumulative across every processed release week, to {{ today }}.</p>
+  <p class="sub hint">💡 Pick a week from the <strong>Jump to</strong> menu below (or the <a href="{{ url_for('archive') }}">Archive</a> tab) to see that week's <strong>notable releases</strong> — the novel and confidently-wrong highlights called out for each release.</p>
+  {% elif is_backfill %}
+  <h1>Release month {{ label[:7] }}</h1>
+  <p class="sub">All human structures deposited in {{ label[:7] }} (from the historical archive backfill).</p>
+  {% else %}
+  <h1>Release week {{ label }}</h1>
+  {% endif %}
+  <div class="week-select">
+    <label for="weekpick">Jump to:</label>
+    <select id="weekpick" onchange="if(this.value)window.location=this.value">
+      <option value="{{ url_for('index') }}" {% if is_all %}selected{% endif %}>All structures</option>
+      {% if weeks %}
+      <optgroup label="Latest weekly releases">
+        {% for w in weeks %}
+        <option value="{{ url_for('week', label=w.label) }}" {% if not is_all and w.label == label %}selected{% endif %}>{{ w.label }} ({{ w.n_compared }})</option>
+        {% endfor %}
+      </optgroup>
+      {% endif %}
+      {% if backfill_months %}
+      <optgroup label="Archive — by deposit month">
+        {% for w in backfill_months %}
+        <option value="{{ url_for('week', label=w.label) }}" {% if not is_all and w.label == label %}selected{% endif %}>{{ w.label[:7] }} ({{ w.n_compared }})</option>
+        {% endfor %}
+      </optgroup>
+      {% endif %}
+    </select>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><div class="n">{{ '{:,}'.format(kpis.n_analysed) }}</div><div class="l">structures analysed{% if kpis.n_fully < kpis.n_analysed %} <span class="hint">({{ '{:,}'.format(kpis.n_fully) }} full · {{ kpis.full_pct }}%)</span>{% endif %}</div></div>
+    <div class="kpi {% if kpis.confidently_wrong %}alert{% endif %}"><div class="n">{{ '{:,}'.format(kpis.confidently_wrong) }}{% if kpis.confidently_wrong_pct is not none %}<span class="pct">{{ kpis.confidently_wrong_pct }}%</span>{% endif %}</div><div class="l">confidently wrong</div></div>
+    <div class="kpi"><div class="n">{{ '{:,}'.format(kpis.novel) }}{% if kpis.novel_pct is not none %}<span class="pct">{{ kpis.novel_pct }}%</span>{% endif %}</div><div class="l">novel sequences</div></div>
+    <div class="kpi {% if kpis.novel_and_wrong %}alert{% endif %}"><div class="n">{{ '{:,}'.format(kpis.novel_and_wrong) }}{% if kpis.novel_and_wrong_pct is not none %}<span class="pct">{{ kpis.novel_and_wrong_pct }}%</span>{% endif %}</div><div class="l">novel &amp; wrong</div></div>
+    <div class="kpi good"><div class="n">{{ fmt(kpis.median_tm) }}</div><div class="l">median TM-score</div></div>
+  </div>
+
+  {% if highlights and not is_all %}
+  <div class="card featured">
+    <h3 style="margin:0 0 4px">⭐ {% if is_backfill %}Notable releases this month{% else %}This week's notable releases{% endif %}</h3>
+    <p class="verdict {{ highlights.severity }}">{{ highlights.verdict }}</p>
+    {% if highlights.rows %}
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>PDB</th><th>Protein</th><th>Flags</th><th>Why it matters</th></tr></thead>
+        <tbody>
+          {% for r in highlights.rows %}
+          <tr class="{% if r.wrong %}wrong{% endif %}">
+            <td class="pdbcell">
+                {% set ru = ribbon_url(r.entity_id) %}
+                {% if ru %}<a href="{{ url_for('entry', entity_id=r.entity_id) }}"><img class="ribbonthumb" src="{{ ru }}" loading="lazy" alt="Cα deviation ribbon for {{ r.entry_id }}"></a>{% endif %}
+                <span><a href="{{ url_for('entry', entity_id=r.entity_id) }}">{{ r.entry_id }}_{{ r.chain }}</a>
+                <a href="https://www.rcsb.org/structure/{{ r.entry_id }}" target="_blank" rel="noopener noreferrer" class="hint">↗</a></span></td>
+            <td>{% if r.uniprot %}<a href="https://www.uniprot.org/uniprotkb/{{ r.uniprot }}" target="_blank" rel="noopener noreferrer">{{ r.protein }}</a>{% else %}{{ r.protein }}{% endif %}</td>
+            <td>{% for b in r.badges %}<span class="badge {{ b.cls }}">{{ b.label }}</span> {% endfor %}</td>
+            <td>{{ r.annotation | safe }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="hint" style="margin:10px 0 0"><a href="#matched">see all {{ '{:,}'.format(highlights.total) }} structures ↓</a></p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {{ figure(figures.scatter, 'scatter', scatter_note) }}
+  {{ figure(figures.scatter_zoom, 'scatterZoom', 'Zoomed into the red "confidently wrong" box above (pLDDT ≥ 70, TM < 0.5) — the structures AlphaFold got confidently wrong.') }}
+  {{ figure(figures.dumbbell, 'dumbbell', 'The worst offenders ranked, one row per protein (AlphaFold has one model per sequence, so repeat depositions are collapsed — “×N” marks how many structures of that protein exist; the worst is shown). Each row joins what AlphaFold claimed (blue, pLDDT/100) to what the experiment showed (red, TM-score) — the longer the bar, the bigger the miss. Hover a dot to preview its Cα-deviation ribbon; click to open the full entry.') }}
+  <div class="explain">
+    <h4>How to read this</h4>
+    <p>Every point is one experimental protein structure. The <dfn>horizontal axis</dfn> is AlphaFold's own
+    confidence in its prediction (mean pLDDT, 0&ndash;100). The <dfn>vertical axis</dfn> is how well that blind
+    prediction actually matches the experiment (TM-score, 0&ndash;1; above 0.5 means the same fold, above 0.9
+    near-identical). <dfn>Marker size</dfn> grows with the FRAUD score (confidence-weighted error).</p>
+    <p><dfn>Cutoff:</dfn> the shaded red box is the "confidently wrong" zone &mdash; AlphaFold was confident
+    (mean pLDDT above 70) yet the fold is wrong (TM-score below 0.5). A predictor that had truly solved folding
+    would leave that box empty.</p>
+    <p class="takehome">Take-home: {{ kpis.confidently_wrong }} of {{ kpis.n_analysed }} structures
+    ({{ (100 * kpis.confidently_wrong / kpis.n_analysed) | round(1) if kpis.n_analysed else 0 }}%) are
+    confidently wrong; median TM-score is {{ kpis.median_tm }}.</p>
+    <details class="readmore"><summary><span class="rm-more">Read more</span><span class="rm-less">Show less</span> &mdash; how each metric is calculated</summary>
+    <p class="metric"><dfn>TM-score:</dfn> how similar the two 3D shapes are overall, 0&ndash;1 (a random pair scores
+    ~0.17, an identical fold ~1). Length-normalised so large and small proteins compare fairly.
+    <span class="eq">TM = (1/L) Σᵢ 1/(1 + (dᵢ/d₀)²)</span> &mdash; dᵢ is the gap between the i-th aligned Cα atoms
+    after best-fit superposition, and d₀ = 1.24(L&minus;15)^⅓ &minus; 1.8 sets the distance scale for length L.
+    <span class="ref">Ref: Zhang &amp; Skolnick, <em>Proteins</em> 2004
+    <a href="https://doi.org/10.1002/prot.20264" target="_blank" rel="noopener noreferrer">doi:10.1002/prot.20264</a>;
+    computed with TM-align, <a href="https://doi.org/10.1093/nar/gki524" target="_blank" rel="noopener noreferrer">doi:10.1093/nar/gki524</a>.</span></p>
+    <p class="metric"><dfn>pLDDT:</dfn> AlphaFold's own confidence in each residue, 0&ndash;100 (higher = surer). It is
+    the model predicting its <em>own</em> accuracy before ever seeing the experiment. We plot the per-structure mean.
+    <span class="eq">pLDDT = (1/N) Σᵢ pLDDTᵢ</span>, where pLDDTᵢ is the network's confidence output for residue i.</p>
+    <p class="metric"><dfn>FRAUD score:</dfn> the headline number &mdash; how wrong the prediction was, weighted by how
+    confident AlphaFold was, so a big error it was sure about counts most.
+    <span class="eq">FRAUD = (1/N) Σᵢ (pLDDTᵢ/100) · min(Δᵢ,15)/15</span>, where Δᵢ is residue i's Cα distance from the
+    experiment (&Aring;) after superposition, capped at 15 &Aring;. Runs 0 (perfect) to 1.</p>
+    <p class="metric"><dfn>Novelty:</dfn> how little AlphaFold had to go on &mdash; 100 minus the highest sequence
+    identity between this protein and any structure released before the 2018-04-30 training cutoff. <em>High = genuinely
+    unseen</em> (100% = nothing similar was ever in the training set).
+    <span class="eq">novelty = 100 &minus; maxₚ identity(s, p)</span> over pre-cutoff PDB chains p, with identity =
+    100 &times; (matching aligned residues)/(alignment length), from an MMseqs2 search.</p>
+    <p class="metric"><dfn>Homology:</dfn> the point colour. High novelty (above 70%) flags the sequence
+    as <em>novel</em> (amber) &mdash; AlphaFold had no close template; otherwise a pre-cutoff <em>homolog</em> existed
+    (blue) it could have learned the fold from. <span class="eq">novel ⇔ novelty &gt; 70%</span>.</p>
+    </details>
+  </div>
+
+  {{ figure(figures.histograms, 'histograms') }}
+  <div class="explain">
+    <h4>What the metrics mean</h4>
+    <p><dfn>TM-score</dfn> (0&ndash;1): overall fold match &mdash; above 0.5 is the same fold, above 0.9
+    near-identical. <dfn>C&alpha;-RMSD</dfn> (&Aring;): average backbone distance after best-fit superposition
+    &mdash; lower is better (under 2&nbsp;&Aring; is excellent). <dfn>lDDT</dfn> (0&ndash;1): local accuracy
+    measured without superposition &mdash; above 0.8 is good. Each bar counts how many structures fall in that range.</p>
+    <p class="takehome">Take-home: median TM-score {{ kpis.median_tm }} &mdash;
+    {{ 'most predictions match the experimental fold well, with a long tail that do not' if kpis.median_tm and kpis.median_tm > 0.7 else 'a substantial fraction disagree with the experimental fold' }}.</p>
+    <details class="readmore"><summary><span class="rm-more">Read more</span><span class="rm-less">Show less</span> &mdash; how each metric is calculated</summary>
+    <p class="metric"><dfn>TM-score:</dfn> overall shape match, 0&ndash;1 (above 0.5 = same fold, above 0.9 near-identical),
+    length-normalised. <span class="eq">TM = (1/L) Σᵢ 1/(1 + (dᵢ/d₀)²)</span> with dᵢ the aligned-Cα gap after
+    superposition and d₀ = 1.24(L&minus;15)^⅓ &minus; 1.8.
+    <span class="ref">Ref: Zhang &amp; Skolnick, <em>Proteins</em> 2004
+    <a href="https://doi.org/10.1002/prot.20264" target="_blank" rel="noopener noreferrer">doi:10.1002/prot.20264</a>.</span></p>
+    <p class="metric"><dfn>Cα-RMSD:</dfn> the average straight-line distance between matching backbone Cα atoms once the
+    two structures are best-fit superposed (&Aring;; lower is better, under ~2 &Aring; excellent).
+    <span class="eq">RMSD = √( (1/N) Σᵢ |Pᵢ &minus; (R·Qᵢ + t)|² )</span>, with Pᵢ/Qᵢ the experimental/model Cα
+    coordinates and R,t the rotation and translation from Kabsch superposition.</p>
+    <p class="metric"><dfn>lDDT:</dfn> local accuracy with <em>no</em> superposition &mdash; the fraction of short-range
+    inter-residue distances the model reproduces, so it is not fooled by a single wrongly-placed domain.
+    <span class="eq">lDDT = (1/N) Σᵢ ¼ Σ_t 1[ |d_exp &minus; d_model| &lt; t ]</span> over thresholds
+    t ∈ {0.5, 1, 2, 4} &Aring; and all residue pairs within 15 &Aring;.</p>
+    </details>
+  </div>
+
+  {% if figures.trend %}
+  {{ figure(figures.trend, 'trend') }}
+  <div class="explain">
+    <h4>Trend over time</h4>
+    <p>The <dfn>blue line</dfn> is the mean TM-score of the structures by their <dfn>deposit month</dfn>; the
+    <dfn>red bars</dfn> count how many were confidently wrong. Binning by deposit date (rather than by when we
+    processed them) gives an even timeline, tracking whether AlphaFold's accuracy on newly-deposited structures
+    is holding steady, improving, or slipping as the PDB keeps growing. Months with fewer than 5 structures are
+    omitted so each point is a meaningful average. A <dfn>dashed trend line</dfn> is drawn <strong>only if</strong>
+    the change over time is statistically significant.</p>
+    <details class="readmore"><summary><span class="rm-more">Read more</span><span class="rm-less">Show less</span> &mdash; how each metric is calculated</summary>
+    <p class="metric"><dfn>Mean TM-score:</dfn> the month's average shape-match score.
+    <span class="eq">TM̄ = (1/M) Σ TM</span> over the M structures deposited that month.</p>
+    <p class="metric"><dfn>Trend line:</dfn> a monotonic-trend test over the monthly means &mdash; <dfn>Mann-Kendall</dfn>
+    (Kendall's τ) for significance, with a robust <dfn>Theil-Sen</dfn> slope for the line. Rank-based, so it tolerates
+    the skewed TM distribution and noisy low-count months. Shown only when <span class="eq">p &lt; 0.05</span>;
+    otherwise a note reports that no significant trend was found.</p>
+    <p class="metric"><dfn>Confidently wrong:</dfn> the count that were both confident and wrong.
+    <span class="eq">count( mean pLDDT &gt; 70 AND TM &lt; 0.5 )</span>.</p>
+    </details>
+  </div>
+  {% endif %}
+
+  <h2 id="matched">Matched structures</h2>
+  {% if is_all and total_count > table_cap %}
+  <p class="hint">Showing the top {{ table_cap }} of {{ total_count }} by FRAUD score. Open a specific week above, or the <a href="{{ url_for('leaderboard') }}">worst-offenders leaderboard</a>, for the full ranked list.</p>
+  {% endif %}
+  <div class="toolbar">
+    <input type="search" id="tableSearch" placeholder="filter by PDB id, UniProt, gene, description…">
+    <label><input type="checkbox" id="wrongOnly"> confidently wrong only</label>
+    <label><input type="checkbox" id="novelOnly"> novel only</label>
+  </div>
+  <div class="tablewrap">
+    <table id="dataTable" class="sortable">
+      <thead>
+        <tr>
+          <th>PDB</th><th>UniProt</th><th>Protein</th><th>Method</th><th>Å</th><th>Deposited</th>
+          <th>Novelty %</th><th>pLDDT</th><th>TM</th><th>lDDT</th><th>GDT_TS</th><th>RMSD</th><th>FRAUD</th><th>Flag</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in entities %}
+        <tr class="{% if e.confidently_wrong %}wrong{% endif %}" data-wrong="{{ 1 if e.confidently_wrong else 0 }}" data-novel="{{ 1 if e.is_novel else 0 }}">
+          <td><a href="{{ url_for('entry', entity_id=e.entity_id) }}">{{ e.entry_id }}_{{ e.chain }}</a></td>
+          <td>{% if e.uniprot %}<a href="https://www.uniprot.org/uniprotkb/{{ e.uniprot }}" target="_blank" rel="noopener">{{ e.uniprot }}</a>{% else %}—{% endif %}</td>
+          <td>{{ (e.description or '')[:42] }}</td>
+          <td>{{ e.method or '—' }}</td>
+          <td class="num" data-sort="{{ e.resolution if e.resolution is not none else 99 }}">{{ r2(e.resolution) }}</td>
+          <td data-sort="{{ e.deposit_date }}">{{ (e.deposit_date or '')[:10] }}</td>
+          <td class="num" data-sort="{{ nov(e.novelty_identity) if e.novelty_identity is not none else -1 }}">{{ r2(nov(e.novelty_identity)) }}{% if e.is_novel %} <span class="badge novel">novel</span>{% endif %}</td>
+          <td class="num" data-sort="{{ e.mean_plddt if e.mean_plddt is not none else -1 }}">{{ r2(e.mean_plddt) }}</td>
+          <td class="num" data-sort="{{ e.tm_by_experiment if e.tm_by_experiment is not none else -1 }}">{{ r2(e.tm_by_experiment) }}</td>
+          <td class="num" data-sort="{{ e.lddt if e.lddt is not none else -1 }}">{{ r2(e.lddt) }}</td>
+          <td class="num" data-sort="{{ e.gdt_ts if e.gdt_ts is not none else -1 }}">{{ r2(e.gdt_ts) }}</td>
+          <td class="num" data-sort="{{ e.ca_rmsd if e.ca_rmsd is not none else -1 }}">{{ r2(e.ca_rmsd) }}</td>
+          <td class="num" data-sort="{{ e.fraud_score if e.fraud_score is not none else -1 }}">{{ r2(e.fraud_score) }}</td>
+          <td>{% if e.confidently_wrong %}<span class="badge wrong">wrong</span>{% else %}<span class="badge ok">ok</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="dlbar"><button class="dl" onclick="downloadTableCsv('dataTable','alphafraud_structures.csv')">⬇ Download CSV</button></div>
+  <p class="hint">Click a column header to sort. FRAUD = confidence-weighted error; a structure is
+  flagged <b>confidently wrong</b> when mean pLDDT &gt; 70 yet TM-score &lt; 0.5.</p>
+{% endblock %}

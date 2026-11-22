@@ -1,0 +1,63 @@
+# currently using Emscripten 5.0.2
+SHELL = /bin/bash
+EMSDK_ENV ?= $(HOME)/local/emsdk/emsdk_env.sh
+CXX = . $(EMSDK_ENV) >/dev/null && em++
+
+INCLUDE = -I../include
+
+COMMON_FLAGS = \
+  -Wall -Wextra -std=c++26 \
+  -s STRICT=1 \
+  -s DISABLE_EXCEPTION_CATCHING=0
+
+FLAGS = -O3 -flto $(COMMON_FLAGS)
+DEPFLAGS = -MMD -MP
+
+LINK_FLAGS = \
+  --pre-js pre.js \
+  --post-js post.js \
+  --no-entry \
+  --emit-tsd gemmi.d.ts \
+  -lembind \
+  -s EXPORTED_RUNTIME_METHODS=writeArrayToMemory,HEAPU8 \
+  -s INCOMING_MODULE_JS_API=print,printErr,setStatus,onRuntimeInitialized \
+  -s ALLOW_MEMORY_GROWTH=1 \
+  -s MODULARIZE=1 \
+  -s EXPORT_NAME=Gemmi
+
+all: gemmi.js
+
+debug: FLAGS = -g -O0 $(COMMON_FLAGS)
+debug: LINK_FLAGS += -s SAFE_HEAP=1 -s ASSERTIONS=2
+debug: gemmi.js
+
+GEMMI_OBJS = mmcif.o mtz.o pdb.o polyheur.o resinfo.o select.o sprintf.o symmetry.o json.o monlib.o read_cif.o assembly.o to_pdb.o to_mmcif.o
+
+BINDING_OBJS = gemmi.o cell.o iso.o mol.o map.o mtz_fft.o
+
+gemmi.js: $(GEMMI_OBJS) $(BINDING_OBJS)
+	$(CXX) $(FLAGS) $(LINK_FLAGS) $(GEMMI_OBJS) $(BINDING_OBJS) -o $@
+
+# old mtz module (not built by default)
+mtz.js: mtz_fft.cpp cell.o mtz.o symmetry.o
+	$(CXX) -DSTANDALONE_MTZ=1 $(INCLUDE) $(FLAGS) \
+	-lembind --no-entry --pre-js=pre.js \
+	-s MODULARIZE=1 -s ALLOW_MEMORY_GROWTH=1 \
+	-s EXPORTED_RUNTIME_METHODS=writeArrayToMemory,HEAPU8 \
+	-s EXPORT_NAME=GemmiMtz $^ -o $@
+
+$(GEMMI_OBJS): %.o: ../src/%.cpp
+	$(CXX) $(INCLUDE) $(FLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BINDING_OBJS): %.o: %.cpp
+	$(CXX) $(INCLUDE) $(FLAGS) $(DEPFLAGS) -c $< -o $@
+
+%.o: %.cpp
+	$(CXX) $(INCLUDE) $(FLAGS) $(DEPFLAGS) -c $<
+
+clean:
+	rm -f *.o *.d gemmi.js mtz.js *.wasm
+
+.PHONY: clean all debug
+
+-include $(GEMMI_OBJS:.o=.d) $(BINDING_OBJS:.o=.d)

@@ -1,0 +1,52 @@
+name: openff-toolkit-test
+channels:
+  - conda-forge
+dependencies:
+    # Base depends
+  - python
+  - packaging
+  - numpy
+  - networkx
+  - cachetools
+  - xmltodict
+  - python-constraint2
+  - openmm >=7.6
+  - openff-forcefields >=2023.05.1
+  - openff-units
+  - openff-amber-ff-ports
+  - openff-utilities >=0.1.5
+  - openff-interchange-base >=0.5
+  - openff-nagl-base >=0.4.0
+  - openff-nagl-models >=0.3.0
+    # Toolkit-specific
+  - ambertools >=22
+  - rdkit >=2025
+
+  - openeye::openeye-toolkits
+    # Test-only/optional/dev/typing
+  - pytest
+  - pytest-cov
+  - pytest-xdist
+  - pytest-rerunfailures
+  - pytest-timeout
+  - pytest-mock
+  - pyyaml
+  - toml
+  - bson
+  - msgpack-python
+  - pydantic =2
+  - qcelemental
+  - qcportal >=0.70
+  - qcengine
+  - nglview
+  - mdtraj
+  - nbval
+  - mypy =2
+  - types-setuptools
+  - types-toml
+  - types-PyYAML
+  - types-networkx
+  - types-xmltodict
+  - types-cachetools
+  - pip:
+    - mongo-types

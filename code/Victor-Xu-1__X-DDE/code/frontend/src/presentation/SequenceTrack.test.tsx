@@ -1,0 +1,165 @@
+import { readFileSync } from "node:fs";
+import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, expect, it, vi } from "vitest";
+import { SequenceTrack } from "./SequenceTrack";
+import { downloadBlob } from "./visual-export";
+vi.mock("./visual-export", () => ({ downloadBlob: vi.fn() }));
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+it.each(["en", "zh"] as const)(
+  "keeps exact STAT6 positions and FASTA in the compact review in %s",
+  async (language) => {
+    const sequence = readFileSync(
+      "../src/opendde_workbench/examples/stat6/inputs/STAT6-human-P42226.fasta",
+      "utf8",
+    )
+      .split(/\r?\n/)
+      .slice(1)
+      .join("");
+    const user = userEvent.setup();
+    render(
+      <SequenceTrack
+        sequence={sequence}
+        label="STAT6"
+        language={language}
+        compact
+      />,
+    );
+    expect(screen.queryByRole("heading", { name: "STAT6" })).toBeNull();
+    expect(screen.getByText("847 aa", { exact: true })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "STAT6 · 3 L" }));
+    expect(
+      screen.getByText(
+        language === "zh" ? "序列位置 3 · L" : "Sequence position 3 · L",
+      ),
+    ).toBeVisible();
+    await user.click(
+      screen.getByRole("button", {
+        name:
+          language === "zh"
+            ? "下载此序列 FASTA"
+            : "Download this sequence FASTA",
+      }),
+    );
+    const [blob, filename] = vi.mocked(downloadBlob).mock.calls[0];
+    const text = await new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.readAsText(blob);
+    });
+    expect(filename).toBe("STAT6.fasta");
+    expect(text).toBe(
+      ">STAT6\n" + sequence.match(/.{1,80}/g)!.join("\n") + "\n",
+    );
+  },
+);
+
+it("binds residue selection to the displayed source rather than retaining an index on a different sequence", async () => {
+  const user = userEvent.setup();
+  const view = render(
+    <SequenceTrack sequence="ACDEFGH" label="Source" language="en" />,
+  );
+  await user.click(screen.getByRole("button", { name: "Source · 5 F" }));
+  expect(screen.getByRole("button", { name: "Source · 5 F" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  view.rerender(
+    <SequenceTrack sequence="YVKLWTR" label="Source" language="en" />,
+  );
+  expect(screen.getByRole("button", { name: "Source · 5 W" })).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
+  expect(screen.queryByText("Sequence position 5 · W")).toBeNull();
+});
+
+it("region navigation reports the exact one-based source position and permits controlled selection", async () => {
+  const select = vi.fn(),
+    user = userEvent.setup();
+  const props = {
+    sequence: "ACDEFGH",
+    label: "Input",
+    language: "en" as const,
+    regions: [{ start: 3, end: 5, label: "CDR1" }],
+    onSelect: select,
+  };
+  const view = render(<SequenceTrack {...props} selectedPosition={null} />);
+  await user.click(screen.getByRole("button", { name: "CDR1" }));
+  expect(select).toHaveBeenCalledWith(3);
+  view.rerender(<SequenceTrack {...props} selectedPosition={3} />);
+  expect(
+    screen.getByRole("button", { name: "Input · 3 D · CDR1" }),
+  ).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByText("Sequence position 3 · D · CDR1")).toBeVisible();
+  view.rerender(<SequenceTrack {...props} selectedPosition={30} />);
+  expect(
+    screen.getByRole("button", { name: "Input · 3 D · CDR1" }),
+  ).toHaveAttribute("aria-pressed", "false");
+});
+
+it("supports one keyboard entry point and crosses bounded segments without changing numbering", async () => {
+  const user = userEvent.setup();
+  render(
+    <SequenceTrack
+      sequence={"a".repeat(847)}
+      label="STAT6"
+      language="en"
+      unit="positions"
+    />,
+  );
+  const first = screen.getByRole("button", { name: "STAT6 · 1 a" });
+  expect(first.tabIndex).toBe(0);
+  expect(screen.getByRole("button", { name: "STAT6 · 2 a" }).tabIndex).toBe(-1);
+  first.focus();
+  await user.keyboard("{End}");
+  expect(screen.getByRole("button", { name: "STAT6 · 847 a" })).toHaveFocus();
+  expect(screen.getByText("Sequence position 847 · a")).toBeVisible();
+  expect(
+    document.querySelectorAll(".sequence-residue-grid button"),
+  ).toHaveLength(247);
+  await user.keyboard("{ArrowLeft}");
+  expect(screen.getByRole("button", { name: "STAT6 · 846 a" })).toHaveFocus();
+  await user.keyboard("{Home}");
+  expect(screen.getByRole("button", { name: "STAT6 · 1 a" })).toHaveFocus();
+  expect(
+    document.querySelectorAll(".sequence-residue-grid button"),
+  ).toHaveLength(600);
+});
+
+it("exports the currently displayed exact sequence with a traceable record identity", async () => {
+  const view = render(
+    <SequenceTrack
+      sequence="ACDEF"
+      label="Candidate sequence · A"
+      recordName="study-123:sample-1:A"
+      language="en"
+    />,
+  );
+  view.rerender(
+    <SequenceTrack
+      sequence="AKDEF"
+      label="Candidate sequence · A"
+      recordName="study-123:sample-2:A"
+      language="en"
+    />,
+  );
+  await userEvent
+    .setup()
+    .click(
+      screen.getByRole("button", { name: "Download this sequence FASTA" }),
+    );
+  const [blob, filename] = vi.mocked(downloadBlob).mock.calls[0];
+  expect(filename).toBe("study-123_sample-2_A.fasta");
+  const text = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(blob);
+  });
+  expect(text).toBe(">study-123:sample-2:A\nAKDEF\n");
+});

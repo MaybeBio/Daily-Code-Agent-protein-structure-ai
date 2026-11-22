@@ -1,0 +1,18 @@
+# requirements.txt — top-level Python dependencies only.
+# Versions live in constraints.txt (single source of truth).
+# Install with:  pip install -c constraints.txt -r requirements.txt
+#
+# NOTE: acpype is installed by conda in the `amber` environment (2023.10.27).
+#       It is deliberately NOT a pip dependency here: installing a second ACPYPE
+#       into the base env is exactly the drift documented in PLAN.md P0-1.
+
+biopython
+numpy
+pandas
+scipy
+rdkit
+openbabel-wheel
+streamlit
+plotly
+py3Dmol
+requests

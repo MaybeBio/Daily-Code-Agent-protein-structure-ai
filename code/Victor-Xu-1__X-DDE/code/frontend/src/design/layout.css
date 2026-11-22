@@ -1,0 +1,250 @@
+/* Shared workspace rhythm. Colors are defined once in tokens.css. */
+:root {
+  --text-body: 14px;
+  --text-small: 13px;
+  --content-width: none;
+  --radius: 12px;
+}
+html {
+  scrollbar-color: var(--line) transparent;
+}
+body {
+  background: var(--canvas);
+  color: var(--ink);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+button,
+input,
+select,
+textarea {
+  color: inherit;
+}
+button {
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    box-shadow 120ms ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  button {
+    transition: none;
+  }
+}
+button:disabled {
+  opacity: 0.5;
+}
+:where(button, a, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
+}
+::selection {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+.studio-app {
+  grid-template-columns: 224px minmax(0, 1fr);
+  background: var(--canvas);
+  color: var(--ink);
+}
+.studio-sidebar {
+  background: var(--sidebar);
+  border-color: var(--line);
+  padding: 20px 12px 12px;
+}
+.studio-brand {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 10px;
+  min-height: 48px;
+  padding: 2px 12px;
+  margin-bottom: 22px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+.studio-brand-mark {
+  display: block;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  object-fit: contain;
+}
+.studio-brand-wordmark {
+  display: block;
+  width: 84px;
+  height: auto;
+  object-fit: contain;
+}
+:root[data-theme="dark"] .studio-brand-wordmark {
+  filter: brightness(0) invert(1);
+}
+@media (max-width: 960px) {
+  .studio-brand {
+    justify-content: center;
+    padding: 4px;
+  }
+  .studio-brand-wordmark {
+    display: none;
+  }
+}
+.studio-sidebar nav {
+  gap: 5px;
+}
+.studio-sidebar nav button {
+  min-height: 42px;
+  padding: 8px 12px;
+  gap: 9px;
+  border-radius: 9px;
+  font-size: 13px;
+  line-height: 1.4;
+  font-weight: 550;
+}
+.studio-sidebar nav button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.studio-sidebar nav button:hover {
+  background: var(--surface-hover);
+}
+.studio-sidebar nav button .anticon {
+  font-size: 17px;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.studio-sidebar nav button.active .anticon {
+  color: var(--accent);
+}
+.studio-sidebar nav button b {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+}
+.nav-short {
+  display: none;
+}
+.studio-topbar {
+  min-height: 68px;
+  height: auto;
+  margin: 18px 28px 8px;
+  padding: 10px 24px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  box-shadow: 0 8px 28px rgb(37 45 50 / 3%);
+  gap: 16px;
+}
+.page-context {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.global-search {
+  width: min(400px, 45vw);
+  margin-left: auto;
+  height: 36px;
+  border-color: var(--line);
+  border-radius: 20px;
+  background: var(--surface);
+}
+.global-search input {
+  color: var(--ink);
+  background: transparent;
+  font-size: 13px;
+  min-width: 0;
+}
+.global-search input::placeholder {
+  color: var(--muted);
+  opacity: 1;
+}
+.top-actions {
+  gap: 12px;
+}
+.top-popover > div,
+.search-results {
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  border-radius: 12px;
+  padding: 8px;
+  max-height: 55dvh;
+  overflow: auto;
+}
+.top-popover button,
+.search-results button {
+  min-height: 40px;
+  padding: 10px;
+  background: transparent;
+  color: var(--ink);
+  border-radius: 6px;
+}
+.top-popover button:hover,
+.search-results button:hover {
+  background: var(--surface-hover);
+}
+.studio-content {
+  width: 100%;
+  max-width: var(--content-width);
+  padding: 28px 32px 24px;
+  min-width: 0;
+}
+.studio-content > [hidden] {
+  display: none;
+}
+.studio-content:has(> .task-workspace.is-input) {
+  max-width: 1536px;
+  margin-inline: auto;
+}
+.research-heading,
+.management-heading {
+  margin-bottom: 12px;
+  min-height: 0;
+  gap: 20px;
+  align-items: flex-start;
+}
+.studio-content h1,
+.research-heading h1,
+.utility-page > h1,
+.project-workspace > header h1 {
+  font-family: var(--font);
+  font-size: 20px;
+  line-height: 1.35;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  color: var(--ink);
+}
+.studio-content h2 {
+  font-family: var(--font);
+  font-size: 18px;
+  line-height: 1.45;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+.studio-content h3 {
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.45;
+  font-weight: 600;
+}
+.research-heading p,
+.utility-page > p,
+.management-heading > p,
+.project-workspace header > p {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--muted);
+  max-width: 780px;
+  margin-top: 10px;
+}
+.utility-page {
+  min-height: 0;
+}

@@ -1,0 +1,4107 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Modified for the mliport project: multi-engine MLIP support (UMA/MACE/DPA/GRACE).
+"""
+Command-line interface for mliport.
+
+Provides subcommands for different calculation types:
+- run: Run from INCAR configuration file
+- sp: Single point calculation
+- opt: Geometry optimization
+- md: Molecular dynamics
+- neb: Fixed-cell NEB/CI-NEB workflow
+- batch: Batch processing
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import signal
+import sys
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+from ase.io import read, write as ase_write
+
+from mliport.backend_selection import (
+    NEP_RUNTIMES,
+    PROCESS_ISOLATED_BACKENDS,
+    model_type_choices,
+)
+from mliport.config import (
+    IncarConfig,
+    get_default_config,
+    get_schema,
+    resolve_config,
+)
+from mliport.config.settings import init_settings_file
+from mliport.engine import CalculationEngine, EngineConfig
+from mliport.protocols import CancellationRequested
+from mliport.run_directory import OutputDirectoryInUseError
+from mliport.run_status import (
+    EXIT_CANCELLED,
+    EXIT_ERROR,
+    EXIT_SUCCESS,
+    RunOutcome,
+    classify_exception,
+    classify_result,
+    describe,
+    exit_code_for,
+)
+
+#: Seconds the first SIGTERM/SIGINT gives the runners to stop at a safe point
+#: and publish a cancelled status before the watchdog forces a bounded exit.
+CANCEL_GRACE_SECONDS = float(os.environ.get("MLIPORT_CANCEL_GRACE_SECONDS", "30"))
+
+
+def _preflight_md_structure(atoms, config: EngineConfig) -> None:
+    """Reject unsupported NHC constraints before the CLI claims an output path."""
+    if config.calc_type != "md":
+        return
+    from mliport.config.defaults import BUILTIN_DEFAULTS  # noqa: PLC0415
+    from mliport.runners.md import MDRunner  # noqa: PLC0415
+
+    options = config.run_options
+    MDRunner.preflight_nhc_constraints(
+        atoms,
+        ensemble=options.get("ensemble", BUILTIN_DEFAULTS["md"]["ensemble"]),
+        thermostat=options.get("thermostat", BUILTIN_DEFAULTS["md"]["thermostat"]),
+    )
+
+
+def _run_product(
+    engine: CalculationEngine, atoms, *, calc_type: str, started_at: float
+):
+    """Run a product calculation with cancellation and unified exit codes."""
+    cancel_event = threading.Event()
+    watchdog: threading.Timer | None = None
+
+    def _start_watchdog() -> None:
+        nonlocal watchdog
+        if watchdog is not None:
+            return
+        watchdog = threading.Timer(CANCEL_GRACE_SECONDS, _force_cancelled_exit)
+        watchdog.daemon = True
+        watchdog.start()
+
+    previous: dict[int, object] = {}
+
+    def _handler(signum, frame):  # noqa: ARG001
+        if cancel_event.is_set():
+            signal.signal(signum, previous.get(signum, signal.SIG_DFL))
+            raise KeyboardInterrupt
+        cancel_event.set()
+        print(
+            "\nCancellation requested; stopping at the next safe point "
+            "(press again to force).",
+            file=sys.stderr,
+        )
+        _start_watchdog()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous[sig] = signal.getsignal(sig)
+        # ValueError: non-main thread (library use) keeps the default handler.
+        with contextlib.suppress(ValueError):
+            signal.signal(sig, _handler)
+    try:
+        result = engine.run(
+            atoms,
+            log_fn=_console_log,
+            started_at=started_at,
+            cancel_event=cancel_event,
+        )
+    except (KeyboardInterrupt, CancellationRequested) as exc:
+        print(f"\n{describe(classify_exception(exc))}.", file=sys.stderr)
+        return exit_code_for(classify_exception(exc))
+    except Exception as exc:  # noqa: BLE001 - reported as a failed run
+        print(f"Error: {exc}")
+        return EXIT_ERROR
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        for sig, prev in previous.items():
+            with contextlib.suppress(ValueError):
+                signal.signal(sig, prev)
+    outcome = classify_result(result, calc_type=calc_type)
+    if outcome is RunOutcome.NOT_CONVERGED:
+        print(
+            f"Warning: {calc_type.upper()} {describe(outcome)}; inspect the "
+            "output directory before using the structure."
+        )
+    return exit_code_for(outcome)
+
+
+def _force_cancelled_exit() -> None:
+    print(
+        f"Error: cancellation did not finish within {CANCEL_GRACE_SECONDS:g}s; "
+        "forcing exit.",
+        file=sys.stderr,
+    )
+    os._exit(EXIT_CANCELLED)
+
+
+def _doctor_device_argument(value: str) -> str:
+    """Argparse validator for doctor device targets, including ``cuda:N``."""
+    normalized = value.strip().lower()
+    if normalized in {"auto", "cpu", "cuda", "gpu"}:
+        return normalized
+    if normalized.startswith("cuda:") and normalized[5:].isdigit():
+        return normalized
+    raise argparse.ArgumentTypeError("device must be auto, cpu, cuda, gpu, or cuda:N")
+
+
+def _mliport_version() -> str:
+    """Installed mliport version for `--version` and the doctor JSON report."""
+    try:
+        from importlib.metadata import version as _dist_version
+
+        return _dist_version("mliport")
+    except Exception:  # noqa: BLE001 - source-only / unusual environments
+        return "0.0.0"
+
+
+class _MliportArgumentParser(argparse.ArgumentParser):
+    """Argument parser whose usage errors fail instead of "not converged".
+
+    ``argparse`` exits with status 2 for a usage error, but mliport reserves
+    exit code 2 for "the calculation finished but did not converge" (see
+    :mod:`mliport.run_status`).  The queue worker maps a child's exit code back
+    to a job status, so an invalid command line must not be reported as
+    ``not_converged``: it is a failure (exit 1) like any other error.
+    """
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_ERROR, f"{self.prog}: error: {message}\n")
+
+
+def create_parser() -> argparse.ArgumentParser:
+    """Create argument parser with subcommands."""
+    parser = _MliportArgumentParser(
+        prog="mliport",
+        description="mliport - VASP-like CLI for MLIP models",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run from INCAR file
+  mliport run
+
+  # Single point calculation
+  mliport sp structure.cif --model uma-s-1.pt --task omat
+
+  # Geometry optimization with cell relaxation
+  mliport opt structure.cif --cell-opt --fmax 0.02
+
+  # Molecular dynamics (NVT)
+  mliport md structure.cif --ensemble NVT --temp 300 --steps 10000
+
+  # Fixed-cell NEB with complete-band checkpoints
+  mliport neb --initial initial.vasp --final final.vasp --model model.pt --output results/hop
+
+  # Batch processing
+  mliport batch structures/ --pattern "*.cif" --output results/
+
+  # Run environment diagnostic (recommended after install!)
+  mliport doctor --engine uma --device auto
+
+  # Generate template INCAR
+  mliport template sp
+        """,
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"mliport {_mliport_version()}",
+        help="Show the installed mliport version and exit.",
+    )
+
+    # Global option: explicit settings.ini (plan section 4.2). Must precede
+    # the subcommand, e.g. `mliport --settings path.ini sp ...`.
+    parser.add_argument(
+        "--settings",
+        type=str,
+        default=None,
+        help="Path to a settings.ini file (overrides MLIPORT_SETTINGS env / "
+        "./settings.ini / ~/.config/mliport/settings.ini).",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    def _add_resolver_args(
+        p: argparse.ArgumentParser, *, trajectory_output_flags: bool = True
+    ) -> None:
+        """Add config-resolver args shared by sp/opt/md/neb/batch."""
+        p.add_argument(
+            "--charge",
+            type=int,
+            default=None,
+            metavar="INTEGER",
+            help="Total molecular charge stored in atoms.info (UMA omol default: 0).",
+        )
+        p.add_argument(
+            "--spin",
+            type=int,
+            default=None,
+            metavar="INTEGER",
+            help=(
+                "Molecular spin metadata; UMA omol interprets it as spin "
+                "multiplicity (default: 1)."
+            ),
+        )
+        p.add_argument(
+            "--inference-mode",
+            type=str,
+            default=None,
+            choices=["default", "turbo"],
+            help="UMA inference mode (default: task-specific; turbo is rejected for other engines).",
+        )
+        p.add_argument(
+            "--dpa-runtime",
+            dest="dpa_runtime",
+            type=str,
+            default=None,
+            choices=["current", "legacy"],
+            help=(
+                "DPA runtime environment: 'current' (pinned DPA-4-capable "
+                "deepmd-kit, default) or 'legacy' (.venv-dpa-legacy with "
+                "deepmd-kit 3.0.0b3 for DPA-2 checkpoints such as DPA-SSE). "
+                "mliport never falls back between them."
+            ),
+        )
+        p.add_argument(
+            "--nep-runtime",
+            dest="nep_runtime",
+            type=str,
+            default=None,
+            choices=list(NEP_RUNTIMES),
+            help=(
+                "NEP execution runtime (required for --model-type nep): 'ase' "
+                "runs Calorine CPUNEP on cpu / GPUNEP on cuda; 'gpumd' runs one "
+                "native gpumd process per job on cuda. mliport never infers or "
+                "falls back between them."
+            ),
+        )
+        p.add_argument(
+            "--gpumd-command",
+            "--nep-gpumd-command",
+            dest="nep_gpumd_command",
+            type=str,
+            default=None,
+            metavar="PATH",
+            help=(
+                "Path to the gpumd executable used by --nep-runtime gpumd (and "
+                "by Calorine GPUNEP). Launched as argv, never through a shell; "
+                "path, version and SHA256 are recorded."
+            ),
+        )
+        p.add_argument(
+            "--cpu-threads",
+            "--torch-num-threads",
+            dest="torch_num_threads",
+            type=int,
+            metavar="N",
+            default=None,
+            help="CPU intra-op threads (PyTorch for UMA/MACE and DPA PyTorch "
+            "models; TensorFlow for GRACE; DPA .pb uses its TensorFlow backend "
+            "settings; default: backend/system).",
+        )
+        p.add_argument(
+            "--activation-checkpointing",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="UMA GPU memory-saving activation checkpointing.",
+        )
+        p.add_argument(
+            "--gpu-memory-growth",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "GRACE: grow TensorFlow GPU memory on demand instead of "
+                "reserving the whole device (default: enabled)."
+            ),
+        )
+        p.add_argument(
+            "--gpu-memory-limit-mb",
+            type=int,
+            default=None,
+            metavar="MIB",
+            help="GRACE: hard per-process TensorFlow GPU memory limit in MiB.",
+        )
+        p.add_argument(
+            "--neighbor-cache",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "GRACE: verlet-style neighbour-list cache (extended cutoff + "
+                "exact per-step re-filter while preserving periodic-image "
+                "semantics; default: enabled)."
+            ),
+        )
+        p.add_argument(
+            "--neighbor-skin",
+            type=float,
+            default=None,
+            metavar="ANGSTROM",
+            help=(
+                "GRACE: neighbour-cache skin in Å; the neighbour table is "
+                "rebuilt when any atom moves more than skin/2 (default: 1.5)."
+            ),
+        )
+        p.add_argument(
+            "--dtype",
+            "--default-dtype",
+            dest="default_dtype",
+            type=str,
+            default=None,
+            choices=["float32", "float64"],
+            help="MACE model dtype (default: float64; use float32 explicitly for speed).",
+        )
+        p.add_argument(
+            "--head",
+            type=str,
+            default=None,
+            help="MACE head or DeepMD/DPA branch name.",
+        )
+        p.add_argument(
+            "--d3",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Add DFT-D3 dispersion (torch-dftd) on top of the model; only "
+                "for models trained on dispersion-free data (default: off)."
+            ),
+        )
+        p.add_argument(
+            "--d3-xc",
+            dest="d3_xc",
+            type=str,
+            default=None,
+            metavar="FUNCTIONAL",
+            help="Reference functional of the model's training data (default: pbe).",
+        )
+        p.add_argument(
+            "--d3-damping",
+            dest="d3_damping",
+            type=str,
+            default=None,
+            choices=["zero", "bj", "zerom", "bjm"],
+            help="DFT-D3 damping function (default: bj).",
+        )
+        if trajectory_output_flags:
+            p.add_argument(
+                "--write-outcar",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help="Write the VASP-like OUTCAR output (use --no-write-outcar to reduce MD I/O).",
+            )
+            p.add_argument(
+                "--write-xdatcar",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help="Write XDATCAR (use --no-write-xdatcar to keep only the canonical trajectory).",
+            )
+            p.add_argument(
+                "--write-trajectory",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help="Write the canonical ASE trajectory (recommended for reproducible MD).",
+            )
+        p.add_argument(
+            "--model-alias",
+            type=str,
+            default=None,
+            help="Model alias defined in settings.ini [model:NAME].",
+        )
+        p.add_argument(
+            "--profile",
+            type=str,
+            default=None,
+            help="Reusable profile from settings.ini [profile:NAME].",
+        )
+
+    # run command
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run calculation from INCAR file",
+        description="Read configuration from INCAR file and run calculation",
+    )
+    run_parser.add_argument(
+        "-i",
+        "--incar",
+        type=str,
+        default="INCAR.mliport",
+        help="Path to INCAR configuration file (default: INCAR.mliport)",
+    )
+    run_parser.add_argument(
+        "-s",
+        "--structure",
+        type=str,
+        default=None,
+        help="Structure file (default: POSCAR, CONTCAR, or from INCAR)",
+    )
+    run_parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=None,
+        help=(
+            "Output directory (default: INCAR OUTPUT_DIR, else results/ in the "
+            "folder that holds the INCAR)"
+        ),
+    )
+    run_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Allow replacing calculation outputs (an earlier run, or VASP "
+            "OUTCAR/CONTCAR) already present in the output directory"
+        ),
+    )
+    run_parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help=(
+            "Override the INCAR DEVICE for this run: cpu, cuda, gpu or cuda:N. "
+            "The queue rewrites this flag to the leased GPU's logical cuda:0, "
+            "so a queued job is pinned to its leased card."
+        ),
+    )
+
+    # sp command
+    sp_parser = subparsers.add_parser(
+        "sp",
+        help="Single point calculation",
+        description="Calculate energy, forces, and stress",
+    )
+    sp_parser.add_argument(
+        "structure",
+        type=str,
+        help="Input structure file (CIF, XYZ, POSCAR, etc.)",
+    )
+    sp_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Path to model checkpoint (or a model-alias name; see --model-alias).",
+    )
+    sp_parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        choices=list(model_type_choices()),
+        help="MLIP engine type; required unless a model alias/profile " "provides it.",
+    )
+    sp_parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        help="Task type. UMA: omat/omol/...; others: bulk/molecule (default: engine-specific).",
+    )
+    sp_parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device for calculation: cpu, cuda, gpu or cuda:N (default: cpu).",
+    )
+    sp_parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        help="Output directory (default: settings OUTPUT_DIR, else '.')",
+    )
+    sp_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Allow replacing calculation outputs (an earlier run, or VASP "
+            "OUTCAR/CONTCAR) already present in the output directory"
+        ),
+    )
+    sp_parser.add_argument(
+        "--name",
+        "-n",
+        type=str,
+        default=None,
+        help="Job name (output will be in OUTPUT/NAME)",
+    )
+    _add_resolver_args(sp_parser)
+    # opt command
+    opt_parser = subparsers.add_parser(
+        "opt",
+        help="Geometry optimization",
+        description="Optimize atomic positions and optionally cell parameters",
+    )
+    opt_parser.add_argument(
+        "structure",
+        type=str,
+        help="Input structure file",
+    )
+    opt_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Path to model checkpoint (or a model-alias name; see --model-alias).",
+    )
+    opt_parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        choices=list(model_type_choices()),
+        help="MLIP engine type; required unless a model alias/profile " "provides it.",
+    )
+    opt_parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        help="Task type. UMA: omat/omol/...; others: bulk/molecule (default: engine-specific).",
+    )
+    opt_parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device for calculation: cpu, cuda, gpu or cuda:N (default: cpu).",
+    )
+    opt_parser.add_argument(
+        "--fmax",
+        type=float,
+        default=None,
+        help="Force convergence threshold in eV/Angstrom (default: 0.05).",
+    )
+    opt_parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Maximum optimization steps (default: 500).",
+    )
+    opt_parser.add_argument(
+        "--optimizer",
+        type=str,
+        default=None,
+        choices=["FIRE", "BFGS", "LBFGS"],
+        help="Optimization algorithm (default: FIRE).",
+    )
+    opt_parser.add_argument(
+        "--cell-opt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Optimize cell parameters (requires stress support).",
+    )
+    opt_parser.add_argument(
+        "--fix-symmetry",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Preserve crystal symmetry during optimization.",
+    )
+    opt_parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        help="Output directory (default: settings OUTPUT_DIR, else '.')",
+    )
+    opt_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Allow replacing calculation outputs (an earlier run, or VASP "
+            "OUTCAR/CONTCAR) already present in the output directory"
+        ),
+    )
+    opt_parser.add_argument(
+        "--name",
+        "-n",
+        type=str,
+        default=None,
+        help="Job name (output will be in OUTPUT/NAME)",
+    )
+    _add_resolver_args(opt_parser)
+
+    # md command
+    md_parser = subparsers.add_parser(
+        "md",
+        help="Molecular dynamics",
+        description="Run MD simulation (NVT, NVE or isotropic MTK NPT)",
+    )
+    md_parser.add_argument(
+        "structure",
+        type=str,
+        help="Input structure file",
+    )
+    md_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Path to model checkpoint (or a model-alias name; see --model-alias).",
+    )
+    md_parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        choices=list(model_type_choices()),
+        help="MLIP engine type; required unless a model alias/profile " "provides it.",
+    )
+    md_parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        help="Task type. UMA: omat/omol/...; others: bulk/molecule (default: engine-specific).",
+    )
+    md_parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device for calculation: cpu, cuda, gpu or cuda:N (default: cuda).",
+    )
+    md_parser.add_argument(
+        "--ensemble",
+        type=str,
+        default=None,
+        choices=["NVT", "NVE", "NPT"],
+        help="MD ensemble (default: NVT).",
+    )
+    md_parser.add_argument(
+        "--temp",
+        type=float,
+        default=None,
+        help="Temperature in Kelvin (default: 300).",
+    )
+    md_parser.add_argument(
+        "--pressure-gpa",
+        type=float,
+        default=None,
+        help="NPT target pressure in GPa (+ compression, default 0).",
+    )
+    md_parser.add_argument(
+        "--npt-tdamp",
+        type=float,
+        default=None,
+        help="NPT MTK thermostat damping in fs (default 100).",
+    )
+    md_parser.add_argument(
+        "--npt-pdamp",
+        type=float,
+        default=None,
+        help="NPT MTK barostat damping in fs (default 1000).",
+    )
+    for key in ("npt-tchain", "npt-pchain", "npt-tloop", "npt-ploop"):
+        md_parser.add_argument(
+            f"--{key}",
+            type=int,
+            default=None,
+            help="NPT MTK chain length or integration substeps.",
+        )
+    md_parser.add_argument(
+        "--timestep",
+        type=float,
+        default=None,
+        help="Time step in femtoseconds (default: 1.0).",
+    )
+    md_parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Number of production MD steps (default: 1000).",
+    )
+    md_parser.add_argument(
+        "--equilibration-steps",
+        "--equil-steps",
+        dest="equilibration_steps",
+        type=int,
+        default=None,
+        help=("Same-ensemble equilibration steps before production (default: 0)."),
+    )
+    md_parser.add_argument(
+        "--thermostat",
+        type=str,
+        default=None,
+        choices=["LANGEVIN", "BUSSI", "NHC"],
+        help="NVT thermostat (default: LANGEVIN).",
+    )
+    md_parser.add_argument(
+        "--friction",
+        type=float,
+        default=None,
+        help="Langevin friction coefficient in fs^-1 (default: 0.001).",
+    )
+    md_parser.add_argument(
+        "--bussi-tau",
+        type=float,
+        default=None,
+        help="Bussi/CSVR coupling time in fs (default: 1000.0).",
+    )
+    md_parser.add_argument(
+        "--nhc-tdamp",
+        type=float,
+        default=None,
+        help="Nose-Hoover-chain damping time in fs (default: 100.0).",
+    )
+    md_parser.add_argument(
+        "--nhc-tchain",
+        type=int,
+        default=None,
+        help="Nose-Hoover chain length (default: 3).",
+    )
+    md_parser.add_argument(
+        "--nhc-tloop",
+        type=int,
+        default=None,
+        help="Nose-Hoover thermostat substeps (default: 1).",
+    )
+    md_parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=None,
+        help="Interval for saving trajectory frames (default: 10).",
+    )
+    md_parser.add_argument(
+        "--pre-relax",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Pre-relax before MD (default: on NVT, off NVE/NPT).",
+    )
+    md_parser.add_argument(
+        "--pre-relax-steps",
+        type=int,
+        default=None,
+        help="Maximum pre-relaxation steps (default: 50).",
+    )
+    md_parser.add_argument(
+        "--pre-relax-fmax",
+        type=float,
+        default=None,
+        help="Pre-relaxation force threshold in eV/Angstrom (default: 0.1).",
+    )
+    md_parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible MD (default: auto-generated and recorded).",
+    )
+    md_parser.add_argument(
+        "--velocity-policy",
+        choices=["auto", "initialize", "preserve"],
+        default=None,
+        help="Velocity initialization policy (default: auto).",
+    )
+    md_parser.add_argument(
+        "--com-policy",
+        choices=["auto", "none", "initialize_only", "constraint"],
+        default=None,
+        help=(
+            "Center-of-mass policy (default: auto; for NHC auto zeroes the "
+            "COM momentum once, which NHC conserves)."
+        ),
+    )
+    md_parser.add_argument(
+        "--fmax-abort",
+        type=float,
+        default=None,
+        help="Large-force abort threshold in eV/Angstrom (default: 20).",
+    )
+    md_parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default=None,
+        help="Output directory (default: settings OUTPUT_DIR, else '.')",
+    )
+    md_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Allow replacing calculation outputs (an earlier run, or VASP "
+            "OUTCAR/CONTCAR) already present in the output directory"
+        ),
+    )
+    md_parser.add_argument(
+        "--name",
+        "-n",
+        type=str,
+        default=None,
+        help="Job name (output will be in OUTPUT/NAME)",
+    )
+    _add_resolver_args(md_parser)
+
+    # Fixed-cell NEB command. Scientific defaults stay in config/defaults.py;
+    # argparse uses None so settings/profile/checkpoint layers remain effective.
+    neb_parser = subparsers.add_parser(
+        "neb",
+        help="Fixed-cell NEB/CI-NEB reaction path",
+        description=(
+            "Run a serial-image fixed-cell NEB with atomic full-band checkpoints, "
+            "geometry resume, and VASP path export."
+        ),
+    )
+    neb_parser.add_argument("--initial", default=None, help="Initial endpoint file")
+    neb_parser.add_argument("--final", default=None, help="Final endpoint file")
+    neb_parser.add_argument(
+        "--resume",
+        default=None,
+        help="Complete checkpoint, checkpoints directory, or NEB run directory",
+    )
+    neb_parser.add_argument(
+        "--model",
+        default=None,
+        help="Model path (or alias); restored from the checkpoint for resume",
+    )
+    neb_parser.add_argument(
+        "--model-type",
+        default=None,
+        choices=list(model_type_choices()),
+    )
+    neb_parser.add_argument("--task", default=None)
+    neb_parser.add_argument(
+        "--device",
+        default=None,
+        help="cpu, cuda, gpu, or cuda:N (default: cpu)",
+    )
+    neb_parser.add_argument(
+        "--images",
+        dest="n_intermediate_images",
+        type=int,
+        default=None,
+        help="Number of intermediate images (endpoints are additional)",
+    )
+    neb_parser.add_argument(
+        "--climb", action=argparse.BooleanOptionalAction, default=None
+    )
+    neb_parser.add_argument(
+        "--method", dest="neb_method", choices=["improvedtangent"], default=None
+    )
+    neb_parser.add_argument(
+        "--interpolation",
+        dest="neb_interpolation",
+        choices=["linear", "idpp"],
+        default=None,
+    )
+    neb_parser.add_argument(
+        "--path-convention", choices=["mic", "unwrapped"], default=None
+    )
+    neb_parser.add_argument("--spring", dest="neb_spring", type=float, default=None)
+    neb_parser.add_argument("--fmax", type=float, default=None)
+    neb_parser.add_argument("--max-steps", type=int, default=None)
+    neb_parser.add_argument("--pre-fmax", dest="neb_pre_fmax", type=float, default=None)
+    neb_parser.add_argument(
+        "--pre-max-steps", dest="neb_pre_max_steps", type=int, default=None
+    )
+    neb_parser.add_argument("--maxstep", dest="neb_maxstep", type=float, default=None)
+    neb_parser.add_argument(
+        "--endpoint-policy", choices=["validate", "relax"], default=None
+    )
+    neb_parser.add_argument("--endpoint-fmax", type=float, default=None)
+    neb_parser.add_argument("--endpoint-steps", type=int, default=None)
+    neb_parser.add_argument("--idpp-fmax", type=float, default=None)
+    neb_parser.add_argument("--idpp-steps", type=int, default=None)
+    neb_parser.add_argument(
+        "--idpp-mic", action=argparse.BooleanOptionalAction, default=None
+    )
+    neb_parser.add_argument("--min-distance", dest="neb_min_distance", type=float)
+    neb_parser.add_argument("--checkpoint-interval", type=int, default=None)
+    neb_parser.add_argument("--fmax-abort", type=float, default=None)
+    neb_parser.add_argument(
+        "--atom-map",
+        default=None,
+        help="0-based final indices in initial-atom order, comma-separated",
+    )
+    neb_parser.add_argument(
+        "--image-shifts",
+        default=None,
+        help="Integer lattice shifts per atom, e.g. '0,0,0;1,0,0'",
+    )
+    neb_parser.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        help="New run directory; resume infers and locks the original directory",
+    )
+    neb_parser.add_argument(
+        "--name",
+        "-n",
+        default=None,
+        help="Optional new-run subdirectory (used by queue jobs)",
+    )
+    _add_resolver_args(neb_parser, trajectory_output_flags=False)
+
+    # confsearch command (spec section 12.1)
+    confsearch_parser = subparsers.add_parser(
+        "confsearch",
+        help="MD-based configuration search (adsorbate mode)",
+        description=(
+            "Search for low-energy adsorbate configurations on a periodic slab "
+            "with Langevin NVT cycles and local quenches. Outputs a ranked, "
+            "deduplicated candidate set for DFT re-ranking (never a "
+            "global-minimum claim)."
+        ),
+    )
+    confsearch_sub = confsearch_parser.add_subparsers(
+        dest="confsearch_command", required=True
+    )
+    conf_run = confsearch_sub.add_parser("run", help="Run (or resume) a search")
+    conf_run.add_argument(
+        "starts",
+        nargs="*",
+        default=None,
+        help="Mode A: one or more start structures (multi-frame files allowed).",
+    )
+    conf_run.add_argument(
+        "--adsorbate-indices",
+        dest="cs_adsorbate_indices",
+        default=None,
+        help="Mode A: 0-based adsorbate atom indices, e.g. '300-341' or '0,5,7-9'.",
+    )
+    conf_run.add_argument("--slab", dest="cs_slab", default=None, help="Mode B slab")
+    conf_run.add_argument(
+        "--molecule", dest="cs_molecule", default=None, help="Mode B conformers"
+    )
+    conf_run.add_argument(
+        "--n-starts", dest="cs_n_starts", type=int, default=None, help="Mode B count"
+    )
+    conf_run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate inputs, regions and budget without loading a model.",
+    )
+    conf_run.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume the search in --output from its checkpoint.",
+    )
+    conf_run.add_argument("--model", type=str, default=None)
+    conf_run.add_argument(
+        "--model-type", type=str, default=None, choices=list(model_type_choices())
+    )
+    conf_run.add_argument("--task", type=str, default=None)
+    conf_run.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="cpu, cuda, gpu or cuda:N (default: configured device, else cpu).",
+    )
+    conf_run.add_argument("--output", type=str, default=None)
+    conf_run.add_argument("--name", "-n", default=None)
+    conf_run.add_argument("--cycles", dest="cs_cycles", type=int, default=None)
+    conf_run.add_argument("--mode", dest="cs_mode", type=str, default=None)
+    conf_run.add_argument(
+        "--md-mobile",
+        dest="cs_md_mobile",
+        type=str,
+        choices=["adsorbate", "adsorbate_and_top", "all_free"],
+        default=None,
+    )
+    conf_run.add_argument("--temperature-high", type=float, default=None)
+    conf_run.add_argument("--temperature-low", type=float, default=None)
+    conf_run.add_argument("--hold-ps", type=float, default=None)
+    conf_run.add_argument("--cool-ps", type=float, default=None)
+    conf_run.add_argument("--snapshot-interval-ps", type=float, default=None)
+    conf_run.add_argument("--top-k", dest="cs_top_k", type=int, default=None)
+    conf_run.add_argument("--export-window", type=float, default=None)
+    conf_run.add_argument(
+        "--refine", dest="cs_refine", action="store_true", default=None
+    )
+    conf_run.add_argument(
+        "--no-refine", dest="cs_refine", action="store_false", default=None
+    )
+    conf_run.add_argument(
+        "--allow-direct-forces",
+        dest="cs_allow_direct_forces",
+        action="store_true",
+        default=None,
+    )
+    conf_run.add_argument(
+        "--no-allow-direct-forces",
+        dest="cs_allow_direct_forces",
+        action="store_false",
+        default=None,
+    )
+    conf_run.add_argument("--seed", type=int, default=None)
+    conf_run.add_argument("--timestep", type=float, default=None)
+    conf_run.add_argument("--friction", type=float, default=None)
+    conf_run.add_argument("--fmax-abort", dest="fmax_abort", type=float, default=None)
+    conf_run.add_argument("--quench-fmax", type=float, default=None)
+    conf_run.add_argument("--quench-steps", type=int, default=None)
+    conf_run.add_argument("--fix-below", dest="cs_fix_below", type=float, default=None)
+    conf_run.add_argument("--top-depth", dest="cs_top_depth", type=float, default=None)
+    conf_run.add_argument(
+        "--ramp-interval", dest="cs_ramp_interval", type=int, default=None
+    )
+    conf_run.add_argument(
+        "--save-interval", dest="cs_save_interval", type=int, default=None
+    )
+    conf_run.add_argument(
+        "--accept-temperature", dest="cs_accept_temperature", type=float, default=None
+    )
+    conf_run.add_argument(
+        "--bond-scale", dest="cs_bond_scale", type=float, default=None
+    )
+    conf_run.add_argument(
+        "--bond-break-scale", dest="cs_bond_break_scale", type=float, default=None
+    )
+    conf_run.add_argument(
+        "--ionic-species", dest="cs_ionic_species", type=str, default=None
+    )
+    conf_run.add_argument(
+        "--desorption-distance", dest="cs_desorption_distance", type=float, default=None
+    )
+    conf_run.add_argument(
+        "--min-image-distance", dest="cs_min_image_distance", type=float, default=None
+    )
+    conf_run.add_argument(
+        "--min-vacuum-gap", dest="cs_min_vacuum_gap", type=float, default=None
+    )
+    conf_run.add_argument(
+        "--place-contact-scale", dest="cs_place_contact_scale", type=float, default=None
+    )
+    conf_run.add_argument("--anchor", dest="cs_place_anchor", type=str, default=None)
+    conf_run.add_argument(
+        "--anchor-scale", dest="cs_place_anchor_scale", type=float, default=None
+    )
+    conf_run.add_argument(
+        "--place-other-min-scale",
+        dest="cs_place_other_min_scale",
+        type=float,
+        default=None,
+    )
+    conf_run.add_argument(
+        "--anchor-targets", dest="cs_place_anchor_targets", type=str, default=None
+    )
+    conf_run.add_argument(
+        "--place-max-attempts", dest="cs_place_max_attempts", type=int, default=None
+    )
+    conf_run.add_argument(
+        "--dedup-energy-tol", dest="cs_dedup_energy_tol", type=float, default=None
+    )
+    conf_run.add_argument(
+        "--dedup-geom-tol", dest="cs_dedup_geom_tol", type=float, default=None
+    )
+    conf_run.add_argument(
+        "--dedup-fp-tol", dest="cs_dedup_fp_tol", type=float, default=None
+    )
+    conf_run.add_argument("--fp-rcut", dest="cs_fp_rcut", type=float, default=None)
+    conf_run.add_argument(
+        "--fp-binwidth", dest="cs_fp_binwidth", type=float, default=None
+    )
+    conf_run.add_argument("--fp-sigma", dest="cs_fp_sigma", type=float, default=None)
+    conf_run.add_argument(
+        "--refine-fmax", dest="cs_refine_fmax", type=float, default=None
+    )
+    conf_run.add_argument(
+        "--refine-steps", dest="cs_refine_steps", type=int, default=None
+    )
+    conf_run.add_argument("--reaction-policy", type=str, default=None)
+    _add_resolver_args(conf_run, trajectory_output_flags=False)
+
+    conf_place = confsearch_sub.add_parser(
+        "place", help="Placement only (no model): write starts for inspection"
+    )
+    conf_place.add_argument("--slab", dest="cs_slab", required=True)
+    conf_place.add_argument("--molecule", dest="cs_molecule", required=True)
+    conf_place.add_argument("--n-starts", dest="cs_n_starts", type=int, required=True)
+    conf_place.add_argument("--output", required=True)
+    conf_place.add_argument("--seed", type=int, default=None)
+    conf_place.add_argument("--anchor", dest="cs_place_anchor", default=None)
+    conf_place.add_argument(
+        "--anchor-targets", dest="cs_place_anchor_targets", default=None
+    )
+
+    conf_resume = confsearch_sub.add_parser("resume", help="Resume a search")
+    conf_resume.add_argument("run", help="Run directory to resume")
+    conf_resume.add_argument("--model", type=str, default=None)
+    conf_resume.add_argument(
+        "--model-type", type=str, default=None, choices=list(model_type_choices())
+    )
+    conf_resume.add_argument("--task", type=str, default=None)
+    conf_resume.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Override recorded device (subject to resume identity validation).",
+    )
+    _add_resolver_args(conf_resume, trajectory_output_flags=False)
+
+    conf_extend = confsearch_sub.add_parser(
+        "extend", help="Add more cycles to a finished search"
+    )
+    conf_extend.add_argument("run", help="Run directory to extend")
+    conf_extend.add_argument(
+        "--cycles", dest="cs_cycles", type=int, required=True, help="extra cycles"
+    )
+    conf_extend.add_argument("--model", type=str, default=None)
+    conf_extend.add_argument(
+        "--model-type", type=str, default=None, choices=list(model_type_choices())
+    )
+    conf_extend.add_argument("--task", type=str, default=None)
+    conf_extend.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Override recorded device (subject to checkpoint identity validation).",
+    )
+    _add_resolver_args(conf_extend, trajectory_output_flags=False)
+
+    conf_merge = confsearch_sub.add_parser(
+        "merge", help="Merge comparable finished searches without new calculations"
+    )
+    conf_merge.add_argument("runs", nargs="+", help="run directories")
+    conf_merge.add_argument("--output", required=True, help="merged run directory")
+
+    conf_export = confsearch_sub.add_parser(
+        "export", help="Re-export the ranked candidates from a finished run"
+    )
+    conf_export.add_argument("run", help="Run directory to re-export")
+    conf_export.add_argument(
+        "--top-k", dest="cs_top_k", type=int, default=None, help="number of ranks"
+    )
+    conf_export.add_argument(
+        "--window",
+        dest="cs_export_window",
+        type=float,
+        default=None,
+        help="energy window in eV above the best",
+    )
+    conf_export.add_argument(
+        "--output",
+        default=None,
+        help="destination directory (default: RUN/top_reexport)",
+    )
+
+    # batch command
+    batch_parser = subparsers.add_parser(
+        "batch",
+        help="Batch processing",
+        description="Process multiple structures in batch mode",
+    )
+    batch_parser.add_argument(
+        "input_dir",
+        type=str,
+        help="Input directory containing structure files",
+    )
+    batch_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Path to model checkpoint (or a model-alias name; see --model-alias).",
+    )
+    batch_parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        choices=list(model_type_choices()),
+        help="MLIP engine type; required unless a model alias/profile " "provides it.",
+    )
+    batch_parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        help="Task type. UMA: omat/omol/...; others: bulk/molecule (default: engine-specific).",
+    )
+    batch_parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device for calculation: cpu, cuda, gpu or cuda:N (default: cpu).",
+    )
+    batch_parser.add_argument(
+        "--calc-type",
+        type=str,
+        default=None,
+        choices=["sp", "opt"],
+        help="Sub-calculation type for the sweep (default: sp).",
+    )
+    batch_parser.add_argument(
+        "--pattern",
+        type=str,
+        default=None,
+        help=(
+            "File glob to match, relative to INPUT_DIR; may span directories, "
+            "e.g. '*/ewald_rank_*/1.cif' or '**/*.cif'. If omitted, discovers "
+            "*.cif, *.xyz, *.vasp and POSCAR* directly in INPUT_DIR."
+        ),
+    )
+    batch_parser.add_argument(
+        "--fmax",
+        type=float,
+        default=None,
+        help="--calc-type opt: force convergence threshold in eV/Angstrom (default: 0.05).",
+    )
+    batch_parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="--calc-type opt: maximum optimization steps per structure (default: 500).",
+    )
+    batch_parser.add_argument(
+        "--optimizer",
+        type=str,
+        default=None,
+        choices=["FIRE", "BFGS", "LBFGS"],
+        help="--calc-type opt: optimization algorithm (default: FIRE).",
+    )
+    batch_parser.add_argument(
+        "--cell-opt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="--calc-type opt: optimize cell parameters (requires stress support).",
+    )
+    batch_parser.add_argument(
+        "--fix-symmetry",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="--calc-type opt: preserve crystal symmetry during optimization.",
+    )
+    batch_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue an interrupted batch in the same --output directory: "
+            "structures already completed or not converged under identical "
+            "settings are reused, failed and unfinished ones run again."
+        ),
+    )
+    batch_parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default="batch_results",
+        help="Output directory (default: batch_results)",
+    )
+    batch_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Allow replacing calculation outputs (an earlier run, or VASP "
+            "OUTCAR/CONTCAR) already present in the output directory"
+        ),
+    )
+    batch_parser.add_argument(
+        "--name",
+        "-n",
+        type=str,
+        default=None,
+        help="Job name (output will be in OUTPUT/NAME)",
+    )
+    _add_resolver_args(batch_parser)
+
+    # config command (plan section 4.2 / 9 / 17.6 / 24)
+    for _model_parser in (
+        run_parser,
+        sp_parser,
+        opt_parser,
+        md_parser,
+        neb_parser,
+        batch_parser,
+    ):
+        _model_parser.add_argument(
+            "--lenient-config",
+            action="store_true",
+            help=(
+                "Downgrade unknown/cross-backend configuration keys to "
+                "warnings (legacy behaviour). The default is strict."
+            ),
+        )
+
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Inspect and manage mliport configuration",
+        description="Show resolved config, settings search paths, validate "
+        "settings.ini, or explain where a parameter value comes from.",
+    )
+    config_sub = config_parser.add_subparsers(dest="config_command", required=True)
+    config_show = config_sub.add_parser("show", help="Show the resolved configuration")
+    config_show.add_argument(
+        "--lenient-config",
+        action="store_true",
+        help="Downgrade unknown configuration keys to warnings.",
+    )
+    config_sub.add_parser("paths", help="List settings.ini search paths")
+    config_init = config_sub.add_parser("init", help="Create a settings.ini")
+    config_init.add_argument(
+        "--project",
+        action="store_true",
+        help="Write ./settings.ini",
+    )
+    config_init.add_argument(
+        "--user",
+        action="store_true",
+        help="Write the user-level settings.ini",
+    )
+    config_init.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=None,
+        help="Explicit output path (overrides --project/--user)",
+    )
+    config_init.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing file",
+    )
+    config_validate = config_sub.add_parser(
+        "validate", help="Validate a settings.ini file"
+    )
+    config_validate.add_argument(
+        "path",
+        type=str,
+        nargs="?",
+        default=None,
+        help="settings.ini path (default: resolved search)",
+    )
+    config_explain = config_sub.add_parser(
+        "explain",
+        help="Explain why a parameter has its resolved value",
+    )
+    config_explain.add_argument("key", type=str, help="Parameter name")
+    config_show = config_sub.add_parser("schema", help="List recognised option keys")
+    config_show.add_argument(
+        "--strict",
+        action="store_true",
+        help="Only show keys valid in strict mode",
+    )
+
+    template_parser = subparsers.add_parser(
+        "template",
+        help="Generate template INCAR files",
+        description="Generate template configuration files",
+    )
+    template_parser.add_argument(
+        "type",
+        choices=["sp", "opt", "md", "neb", "confsearch"],
+        help="Type of template to generate",
+    )
+    template_parser.add_argument(
+        "--engine",
+        choices=list(model_type_choices()),
+        default=None,
+        help=(
+            "Render backend-specific model fields. Omit for a "
+            "backend-neutral template (no implicit UMA default)."
+        ),
+    )
+    template_parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=None,
+        help="Output file name (default: INCAR.{type})",
+    )
+
+    # tui command
+    subparsers.add_parser(
+        "tui",
+        help="Launch interactive TUI mode",
+        description="Launch interactive terminal UI for visual configuration",
+    )
+
+    # convert-xdatcar command: re-emit a trajectory in the exact VASP
+    # XDATCAR layout (unwrapped coordinates, VASP column widths).
+    xdatcar_parser = subparsers.add_parser(
+        "convert-xdatcar",
+        help="Export an ASE-readable trajectory as a standard XDATCAR",
+        description=(
+            "Export trajectory.traj, or re-emit an mliport/VASP XDATCAR, in "
+            "the layout VASP writes: unwrapped scaled coordinates and VASP "
+            "column widths (12-char fields, 8 decimals). For legacy mliport "
+            "runs prefer trajectory.traj because it retains image history."
+        ),
+    )
+    xdatcar_parser.add_argument(
+        "input",
+        type=str,
+        help="Input ASE-readable trajectory (prefer trajectory.traj for old runs)",
+    )
+    xdatcar_parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=None,
+        help="Output file (default: <input>.vasp)",
+    )
+
+    # Analysis v2: explicit scientific subcommands rather than a monolithic
+    # list of loosely coupled tasks.
+    analyze_parser = subparsers.add_parser(
+        "analyze",
+        help="Run validated trajectory analysis",
+        description="Analyze an mliport run, ASE trajectory, or XDATCAR.",
+    )
+    analyze_parser.add_argument(
+        "run",
+        type=str,
+        help="mliport run directory or trajectory file",
+    )
+    analyze_sub = analyze_parser.add_subparsers(dest="analysis_task", required=True)
+
+    def _analysis_source_options(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--positions-convention",
+            choices=["wrapped", "unwrapped", "unknown"],
+            default=None,
+            help=(
+                "Coordinate convention for external trajectories. A value that "
+                "conflicts with trusted mliport artifact metadata is rejected."
+            ),
+        )
+        p.add_argument(
+            "--frame-interval-fs",
+            type=float,
+            default=None,
+            help="Explicit saved-frame interval when trajectory metadata lacks time.",
+        )
+        p.add_argument(
+            "--force", action="store_true", help="Recompute an existing analysis ID."
+        )
+
+    def _analysis_range_options(p: argparse.ArgumentParser) -> None:
+        _analysis_source_options(p)
+        p.add_argument(
+            "--include-equilibration",
+            action="store_true",
+            help="Include equilibration frames (production-only is the default).",
+        )
+        p.add_argument("--start-frame", type=int, default=None)
+        p.add_argument("--stop-frame", type=int, default=None)
+
+    validate_parser = analyze_sub.add_parser(
+        "validate", help="Validate trajectory semantics and task eligibility"
+    )
+    _analysis_source_options(validate_parser)
+
+    thermo_parser = analyze_sub.add_parser(
+        "thermo", help="Thermodynamic diagnostics and NVE energy drift"
+    )
+    _analysis_range_options(thermo_parser)
+    thermo_parser.add_argument("--block-size-frames", type=int, default=None)
+
+    rdf_parser = analyze_sub.add_parser("rdf", help="Bulk partial RDF and coordination")
+    _analysis_range_options(rdf_parser)
+    rdf_parser.add_argument("--center", dest="center_species", required=True)
+    rdf_parser.add_argument("--neighbor", dest="neighbor_species", required=True)
+    rdf_parser.add_argument("--rmax", dest="r_max_A", type=float, default=None)
+    rdf_parser.add_argument("--bins", type=int, default=200)
+    rdf_parser.add_argument("--cn-cutoff", dest="cn_cutoff_A", type=float, default=None)
+    rdf_parser.add_argument("--stride", type=int, default=1)
+
+    rmsd_parser = analyze_sub.add_parser(
+        "rmsd", help="Periodic-displacement RMSD/RMSF crystal diagnostic"
+    )
+    _analysis_range_options(rmsd_parser)
+    rmsd_parser.add_argument("--species", default=None)
+    rmsd_parser.add_argument(
+        "--drift-reference",
+        choices=["none", "nonmobile", "indices"],
+        default="none",
+    )
+    rmsd_parser.add_argument("--drift-indices", default=None)
+
+    msd_parser = analyze_sub.add_parser("msd", help="Directional windowed MSD")
+    _analysis_range_options(msd_parser)
+    msd_parser.add_argument("--mobile", dest="mobile_species", required=True)
+    msd_parser.add_argument(
+        "--axes", default="xyz", help="One or comma-separated x/y/z/xy/xz/yz/xyz"
+    )
+    msd_parser.add_argument(
+        "--drift-reference",
+        choices=["none", "nonmobile", "all", "indices"],
+        default="none",
+    )
+    msd_parser.add_argument(
+        "--drift-mode",
+        choices=["none", "arithmetic_mean", "mass_weighted_com"],
+        default="mass_weighted_com",
+        help=(
+            "Explicit native-MSD centre definition (default mass-weighted COM); "
+            "the recorded definition must match kinisi for cross-backend "
+            "comparison."
+        ),
+    )
+    msd_parser.add_argument("--drift-indices", default=None)
+    msd_parser.add_argument("--method", choices=["fft", "direct"], default="fft")
+    msd_parser.add_argument("--fit-start-ps", type=float, default=None)
+    msd_parser.add_argument("--fit-stop-ps", type=float, default=None)
+    msd_parser.add_argument(
+        "--alpha-window-decades",
+        type=float,
+        default=None,
+        help=(
+            "Full width (base-10 decades) of the local log-log regression "
+            "window for the MSD exponent; default 0.25. Recorded in the result."
+        ),
+    )
+    msd_parser.add_argument(
+        "--alpha-min-points",
+        type=int,
+        default=None,
+        help="Minimum points inside a local alpha window (default 5).",
+    )
+    msd_parser.add_argument(
+        "--alpha-min-origins",
+        type=int,
+        default=None,
+        help=(
+            "Minimum time origins before an alpha point is reported as "
+            "sufficient information (default 8; origins are not independent "
+            "samples)."
+        ),
+    )
+    msd_parser.add_argument(
+        "--alpha-consistency-band",
+        type=float,
+        default=None,
+        help=(
+            "Half-band around alpha=1 accepted as consistent with diffusion "
+            "(default 0.2); outside it the point is not_diffusive."
+        ),
+    )
+    msd_parser.add_argument(
+        "--alpha-max-lag-ps",
+        type=float,
+        default=None,
+        help=(
+            "Ignore lag times above this value for the alpha estimator (and "
+            "record it in the result); raw MSD data are unaffected."
+        ),
+    )
+    msd_parser.add_argument(
+        "--alpha-log-x",
+        action="store_true",
+        help="Plot the alpha figure with a logarithmic lag-time axis.",
+    )
+    msd_parser.add_argument(
+        "--alpha-focus-band",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("LOW", "HIGH"),
+        help=(
+            "Focused alpha view (view only): the exported values are never "
+            "cropped and the figure annotates how many points fall outside."
+        ),
+    )
+
+    transport_parser = analyze_sub.add_parser(
+        "transport", help="kinisi tracer diffusion and NE conductivity"
+    )
+    _analysis_source_options(transport_parser)
+    transport_parser.add_argument("--mobile", dest="mobile_species", required=True)
+    transport_parser.add_argument(
+        "--charge", dest="ionic_charge_e", type=float, required=True
+    )
+    transport_parser.add_argument("--fit-start-ps", type=float, required=True)
+    transport_parser.add_argument(
+        "--lag-step-ps",
+        type=float,
+        default=None,
+        help=(
+            "Spacing of the explicit kinisi lag-time grid in ps. "
+            "This sparsifies lag times, not trajectory frames, and must be "
+            "used together with --lag-stop-ps."
+        ),
+    )
+    transport_parser.add_argument(
+        "--lag-stop-ps",
+        type=float,
+        default=None,
+        help=(
+            "Maximum lag time for the explicit kinisi lag-time grid in ps. "
+            "This sparsifies lag times, not trajectory frames, and must be "
+            "used together with --lag-step-ps."
+        ),
+    )
+    transport_parser.add_argument("--dimensions", default="xyz")
+    transport_parser.add_argument(
+        "--drift-reference",
+        choices=["none", "nonmobile", "all", "indices"],
+        default="none",
+    )
+    transport_parser.add_argument(
+        "--drift-mode",
+        choices=["none", "arithmetic_mean", "mass_weighted_com"],
+        default="arithmetic_mean",
+        help=(
+            "Explicit framework-drift centre definition. kinisi transport "
+            "pre-applies it once and records it; cross-backend comparisons "
+            "require matching definitions."
+        ),
+    )
+    transport_parser.add_argument("--drift-indices", default=None)
+    transport_parser.add_argument("--temperature-K", type=float, default=None)
+    transport_parser.add_argument("--collective-conductivity", action="store_true")
+    transport_parser.add_argument(
+        "--collective-system-particles",
+        type=int,
+        default=1,
+        help=(
+            "kinisi index-ordered statistical groups for collective/jump analysis; "
+            "these are not independent MD replicas (default: 1)."
+        ),
+    )
+    transport_parser.add_argument(
+        "--jump-diffusion",
+        action="store_true",
+        help="Also run kinisi JumpDiffusionAnalyzer as a total/jump diagnostic.",
+    )
+    transport_parser.add_argument("--random-seed", type=int, default=0)
+    transport_parser.add_argument("--n-samples", type=int, default=1000)
+    transport_parser.add_argument("--n-walkers", type=int, default=32)
+    transport_parser.add_argument("--n-burn", type=int, default=500)
+    transport_parser.add_argument("--n-thin", type=int, default=10)
+    transport_parser.add_argument(
+        "--parser-memory-limit-gib",
+        type=float,
+        default=4.0,
+        help=(
+            "Fail before kinisi parsing when the estimated trajectory-parser "
+            "peak exceeds this many GiB (default: 4)."
+        ),
+    )
+    transport_parser.add_argument(
+        "--allow-reconstructed-fallback",
+        action="store_true",
+        help=(
+            "Diagnostic only: permit transport to fall back to kinisi's "
+            "unverified from_ase displacement reconstruction when the exact "
+            "adapter is unavailable. Results are marked "
+            "publication_grade=false."
+        ),
+    )
+
+    density_parser = analyze_sub.add_parser(
+        "density", help="Periodic 3-D mobile-ion density map"
+    )
+    _analysis_range_options(density_parser)
+    density_parser.add_argument("--mobile", dest="mobile_species", required=True)
+    density_parser.add_argument("--spacing", dest="spacing_A", type=float, default=0.25)
+    density_parser.add_argument("--smoothing-sigma-A", type=float, default=None)
+    density_parser.add_argument("--stride", type=int, default=1)
+
+    arrhenius_parser = analyze_sub.add_parser(
+        "arrhenius", help="Fit independent multi-temperature diffusion results"
+    )
+    _analysis_source_options(arrhenius_parser)
+    arrhenius_parser.add_argument(
+        "--temperature",
+        dest="temperatures_K",
+        type=float,
+        action="append",
+        required=True,
+    )
+    arrhenius_parser.add_argument(
+        "--diffusivity",
+        dest="diffusivities_m2_s",
+        type=float,
+        action="append",
+        required=True,
+    )
+    arrhenius_parser.add_argument(
+        "--diffusivity-std", dest="diffusivity_std_m2_s", type=float, action="append"
+    )
+    arrhenius_parser.add_argument(
+        "--extrapolate-temperature",
+        dest="extrapolate_temperatures_K",
+        type=float,
+        action="append",
+        default=[],
+    )
+    arrhenius_parser.add_argument(
+        "--source-run-id", dest="source_run_ids", action="append"
+    )
+
+    electrolyte_parser = analyze_sub.add_parser(
+        "electrolyte", help="GEMDAT site, jump, and percolation mechanisms"
+    )
+    _analysis_source_options(electrolyte_parser)
+    electrolyte_parser.add_argument("--mobile", dest="mobile_species", required=True)
+    site_group = electrolyte_parser.add_mutually_exclusive_group(required=True)
+    site_group.add_argument("--sites", dest="sites_path", default=None)
+    site_group.add_argument("--discover-sites-from-density", action="store_true")
+    electrolyte_parser.add_argument("--temperature-K", type=float, default=None)
+    electrolyte_parser.add_argument("--resolution-A", type=float, default=0.5)
+    electrolyte_parser.add_argument("--background-level", type=float, default=0.1)
+    electrolyte_parser.add_argument("--site-radius-A", type=float, default=None)
+    electrolyte_parser.add_argument("--minimal-residence", type=int, default=0)
+    electrolyte_parser.add_argument(
+        "--drift-reference",
+        choices=["none", "nonmobile", "all", "indices"],
+        default="none",
+    )
+    electrolyte_parser.add_argument(
+        "--drift-mode",
+        choices=["none", "arithmetic_mean", "mass_weighted_com"],
+        default="arithmetic_mean",
+        help="Explicit GEMDAT framework-drift centre definition.",
+    )
+    electrolyte_parser.add_argument("--drift-indices", default=None)
+    electrolyte_parser.add_argument(
+        "--jump-dimensions", type=int, choices=[1, 2, 3], default=3
+    )
+    electrolyte_parser.add_argument("--percolation-axes", default="xyz")
+
+    for name in ("vacf", "spectrum"):
+        spectral_parser = analyze_sub.add_parser(
+            name,
+            help=(
+                "Velocity autocorrelation"
+                if name == "vacf"
+                else "Qualified VACF-derived velocity spectrum"
+            ),
+        )
+        _analysis_range_options(spectral_parser)
+        spectral_parser.add_argument("--species", default=None)
+        spectral_parser.add_argument(
+            "--method", choices=["fft", "direct"], default="fft"
+        )
+        if name == "spectrum":
+            spectral_parser.add_argument(
+                "--taper",
+                choices=["one-sided-cosine", "none"],
+                default="one-sided-cosine",
+            )
+            spectral_parser.add_argument(
+                "--normalization",
+                choices=["normalized_area", "raw_spectrum"],
+                default="normalized_area",
+            )
+
+    # queue command: Slurm-like submission and scheduling of background jobs.
+    queue_parser = subparsers.add_parser(
+        "queue",
+        help="Submit and schedule queued background jobs",
+        description=(
+            "Slurm-like job queue: submit tasks from a JSON file, then run "
+            "a scheduler that executes them one at a time (default) or up to "
+            "--max-concurrent at once. Each task may use its own Python "
+            "environment / engine / model."
+        ),
+    )
+    queue_sub = queue_parser.add_subparsers(dest="queue_command", required=True)
+    queue_submit = queue_sub.add_parser(
+        "submit",
+        help="Enqueue tasks from a JSON task file",
+        description=(
+            "Read a JSON task file and add every task to the queue with "
+            "status PENDING. Start the scheduler with 'mliport queue start' "
+            "to execute them."
+        ),
+    )
+    queue_submit.add_argument(
+        "task_file",
+        type=str,
+        help="Path to the JSON task file",
+    )
+    queue_start = queue_sub.add_parser(
+        "start",
+        help="Start the queue scheduler",
+        description=(
+            "Promote queued (PENDING) jobs to RUNNING and run them to "
+            "completion, respecting --max-concurrent."
+        ),
+    )
+    queue_start.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=1,
+        help="How many jobs may run at once (default: 1, single GPU).",
+    )
+    queue_start.add_argument(
+        "--max-jobs-per-gpu",
+        type=int,
+        default=1,
+        help=(
+            "How many queued jobs may share one GPU (default: 1, exclusive). "
+            "Raise it only for small systems whose models fit together in "
+            "device memory; --max-concurrent still caps the total."
+        ),
+    )
+    queue_start.add_argument(
+        "--poll",
+        type=float,
+        default=5.0,
+        help="Scheduler poll interval in seconds (default: 5).",
+    )
+    queue_start.add_argument(
+        "--foreground",
+        action="store_true",
+        help="Run the scheduler in the foreground (Ctrl-C to stop).",
+    )
+    queue_sub.add_parser(
+        "stop",
+        help="Stop a background scheduler",
+    )
+    queue_sub.add_parser(
+        "status",
+        help="Show queue and scheduler status",
+    )
+    queue_pause = queue_sub.add_parser(
+        "pause",
+        help="Pause one pending job, or the whole pending queue",
+    )
+    queue_pause.add_argument(
+        "job_id",
+        nargs="?",
+        help="Specific pending job ID; omit to pause all pending dispatch",
+    )
+    queue_resume = queue_sub.add_parser(
+        "resume",
+        help="Resume one paused job, or the whole pending queue",
+    )
+    queue_resume.add_argument(
+        "job_id",
+        nargs="?",
+        help="Specific paused job ID; omit to resume all pending dispatch",
+    )
+
+    # doctor command
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Run environment diagnostic checks",
+        description=(
+            "Inventory installed engines without importing them, or validate one "
+            "selected engine/device runtime."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the machine-readable doctor report as JSON.",
+    )
+    doctor_parser.add_argument(
+        "--engine",
+        choices=["auto", *model_type_choices(), "dpa-legacy"],
+        default="auto",
+        help=(
+            "Engine to runtime-check. auto (default) performs a side-effect-free "
+            "package inventory only."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--device",
+        type=_doctor_device_argument,
+        default="auto",
+        metavar="DEVICE",
+        help="Target auto, cpu, cuda, gpu, or cuda:N (used with --engine).",
+    )
+    doctor_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model checkpoint to load (requires --engine and --task).",
+    )
+    doctor_parser.add_argument(
+        "--task",
+        type=str,
+        default=None,
+        help="Explicit model task/PBC semantic used by the model probe.",
+    )
+    doctor_parser.add_argument(
+        "--head",
+        type=str,
+        default=None,
+        help="Explicit MACE head or DPA/DeepMD branch for the model probe.",
+    )
+    doctor_parser.add_argument(
+        "--structure",
+        type=str,
+        default=None,
+        help="Optional structure for a real energy/force single-point smoke test.",
+    )
+    doctor_parser.add_argument(
+        "--dpa-runtime",
+        dest="dpa_runtime",
+        type=str,
+        default=None,
+        choices=["current", "legacy"],
+        help=(
+            "DPA environment for the model probe: 'current' (pinned "
+            "DPA-4-capable runtime) or 'legacy' (DPA-2 pre-release runtime for "
+            "checkpoints such as DPA-SSE). `--engine dpa-legacy` implies it."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--dtype",
+        dest="default_dtype",
+        choices=["float32", "float64"],
+        default="float64",
+        help="MACE dtype used by the model probe (default: float64).",
+    )
+
+    # setup command
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="Detect your GPU and get the matching PyTorch install command",
+        description=(
+            "Detect NVIDIA GPUs via nvidia-smi (works even before PyTorch is "
+            "installed) and print the exact torch version + install commands "
+            "for your card. Supports Maxwell (GTX 900 series) through Hopper; "
+            "Blackwell (RTX 50) gets torch 2.8+; Kepler (GTX 700) is flagged "
+            "unsupported."
+        ),
+    )
+    setup_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output machine-readable JSON instead of the text report",
+    )
+
+    # jobs command
+    jobs_parser = subparsers.add_parser("jobs", help="List background jobs")
+    jobs_parser.add_argument(
+        "--refresh", type=int, default=0, help="Auto-refresh interval in seconds"
+    )
+    jobs_parser.add_argument(
+        "--project",
+        action="store_true",
+        help="Only list jobs submitted from the current project root",
+    )
+
+    # kill command
+    kill_parser = subparsers.add_parser("kill", help="Kill a background job")
+    kill_parser.add_argument("job_id", help="Job ID to kill")
+
+    # clean command
+    clean_parser = subparsers.add_parser(
+        "clean", help="Remove completed/failed job records"
+    )
+    clean_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List terminal job records without deleting them",
+    )
+
+    # state command
+    state_parser = subparsers.add_parser(
+        "state", help="Inspect and migrate persistent user state"
+    )
+    state_sub = state_parser.add_subparsers(dest="state_command", required=True)
+    state_sub.add_parser("path", help="Print the persistent state paths")
+    state_migrate = state_sub.add_parser(
+        "migrate", help="Import legacy ~/.mliport job history (explicit)"
+    )
+    state_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be imported without writing",
+    )
+
+    return parser
+
+
+def print_header():
+    """Print mliport header."""
+    print("=" * 80)
+    print(" MLIPORT".center(80))
+    print(" (mliport - backend-neutral MLIP workflows)".center(80))
+    print("=" * 80)
+    print()
+
+
+def _run_started_at(args: argparse.Namespace) -> float:
+    """Return the command-entry timestamp, including parsing and input loading."""
+    return getattr(args, "_run_started_at", time.perf_counter())
+
+
+def _console_log(message: str, level: str = "info") -> None:
+    """Print a live engine log message immediately."""
+    print(message, flush=True)
+
+
+def _load_settings(args: argparse.Namespace):
+    """Load settings.ini honouring --settings / MLIPORT_SETTINGS / cwd / user."""
+    from mliport.config.settings import load_settings  # noqa: PLC0415
+
+    return load_settings(explicit=getattr(args, "settings", None))
+
+
+#: confsearch keys read straight off the parsed CLI namespace.
+_CONFSEARCH_CLI_KEYS = (
+    "cs_mode",
+    "cs_starts",
+    "cs_adsorbate_indices",
+    "cs_slab",
+    "cs_molecule",
+    "cs_n_starts",
+    "cs_fix_below",
+    "cs_md_mobile",
+    "cs_top_depth",
+    "cs_temperature_high",
+    "cs_temperature_low",
+    "cs_hold_ps",
+    "cs_cool_ps",
+    "cs_snapshot_interval_ps",
+    "cs_ramp_interval",
+    "cs_cycles",
+    "cs_save_interval",
+    "cs_accept_temperature",
+    "cs_quench_fmax",
+    "cs_quench_steps",
+    "cs_bond_scale",
+    "cs_bond_break_scale",
+    "cs_ionic_species",
+    "cs_reaction_policy",
+    "cs_desorption_distance",
+    "cs_min_image_distance",
+    "cs_min_vacuum_gap",
+    "cs_place_contact_scale",
+    "cs_place_anchor",
+    "cs_place_anchor_scale",
+    "cs_place_other_min_scale",
+    "cs_place_anchor_targets",
+    "cs_place_max_attempts",
+    "cs_dedup_energy_tol",
+    "cs_dedup_geom_tol",
+    "cs_dedup_fp_tol",
+    "cs_fp_rcut",
+    "cs_fp_binwidth",
+    "cs_fp_sigma",
+    "cs_top_k",
+    "cs_export_window",
+    "cs_refine",
+    "cs_refine_fmax",
+    "cs_refine_steps",
+    "cs_allow_direct_forces",
+    "timestep",
+    "friction",
+    "seed",
+    "fmax_abort",
+)
+
+
+def _build_cli_opts(args: argparse.Namespace, calc_type: str) -> dict:
+    """Collect non-None CLI args into a canonical option dict.
+
+    Only explicitly-provided values are included so that unspecified
+    parameters fall through to settings/profile/built-in defaults
+    (plan section 17.6: argparse defaults -> None, resolved by ConfigResolver).
+    """
+    opts: dict = {}
+    if getattr(args, "lenient_config", False):
+        opts["strict_config"] = False
+    for key in (
+        "model_type",
+        "task",
+        "device",
+        "charge",
+        "spin",
+        "inference_mode",
+        "torch_num_threads",
+        "activation_checkpointing",
+        "gpu_memory_growth",
+        "gpu_memory_limit_mb",
+        "neighbor_cache",
+        "neighbor_skin",
+        "default_dtype",
+        "head",
+        "dpa_runtime",
+        "nep_runtime",
+        "nep_gpumd_command",
+        "d3",
+        "d3_xc",
+        "d3_damping",
+        "write_outcar",
+        "write_xdatcar",
+        "write_trajectory",
+    ):
+        value = getattr(args, key, None)
+        if value is not None:
+            opts[key] = value
+    if calc_type == "opt":
+        for key in ("fmax", "max_steps", "optimizer", "cell_opt", "fix_symmetry"):
+            value = getattr(args, key, None)
+            if value is not None:
+                opts[key] = value
+    elif calc_type == "confsearch":
+        # ``confsearch run`` takes mode-A starts positionally (argparse dest
+        # ``starts``); the resolver's option is ``cs_starts``.  Normalise here
+        # as well as in ``_cmd_confsearch_run`` so an argv built by the queue/
+        # TUI helper resolves identically through this helper.
+        starts = getattr(args, "starts", None)
+        if starts:
+            opts["cs_starts"] = os.pathsep.join(str(item) for item in starts)
+        for key in _CONFSEARCH_CLI_KEYS:
+            value = getattr(args, key, None)
+            if value is not None:
+                opts[key] = value
+    elif calc_type == "md":
+        if getattr(args, "temp", None) is not None:
+            opts["temperature"] = args.temp
+        for key in (
+            "ensemble",
+            "pressure_gpa",
+            "npt_tdamp",
+            "npt_pdamp",
+            "npt_tchain",
+            "npt_pchain",
+            "npt_tloop",
+            "npt_ploop",
+            "timestep",
+            "steps",
+            "equilibration_steps",
+            "thermostat",
+            "friction",
+            "bussi_tau",
+            "nhc_tdamp",
+            "nhc_tchain",
+            "nhc_tloop",
+            "save_interval",
+            "pre_relax",
+            "pre_relax_steps",
+            "pre_relax_fmax",
+            "seed",
+            "velocity_policy",
+            "com_policy",
+            "fmax_abort",
+        ):
+            value = getattr(args, key, None)
+            if value is not None:
+                opts[key] = value
+    elif calc_type == "neb":
+        if getattr(args, "initial", None) is not None:
+            opts["neb_initial"] = args.initial
+        if getattr(args, "final", None) is not None:
+            opts["neb_final"] = args.final
+        for key in (
+            "n_intermediate_images",
+            "climb",
+            "neb_method",
+            "neb_interpolation",
+            "path_convention",
+            "neb_spring",
+            "fmax",
+            "max_steps",
+            "neb_pre_fmax",
+            "neb_pre_max_steps",
+            "neb_maxstep",
+            "endpoint_policy",
+            "endpoint_fmax",
+            "endpoint_steps",
+            "idpp_fmax",
+            "idpp_steps",
+            "idpp_mic",
+            "neb_min_distance",
+            "checkpoint_interval",
+            "fmax_abort",
+        ):
+            value = getattr(args, key, None)
+            if value is not None:
+                opts[key] = value
+    elif calc_type == "batch":
+        # batch `--calc-type` selects the sub-calculation (sp/opt).
+        if getattr(args, "calc_type", None) is not None:
+            opts["sub_calc_type"] = args.calc_type
+        for key in (
+            "pattern",
+            "fmax",
+            "max_steps",
+            "optimizer",
+            "cell_opt",
+            "fix_symmetry",
+        ):
+            value = getattr(args, key, None)
+            if value is not None:
+                opts[key] = value
+    return opts
+
+
+def _resolve_engine_config(
+    args: argparse.Namespace,
+    calc_type: str,
+    *,
+    model_path: str | None = None,
+    incar_layer: dict | None = None,
+    output_dir: str | None = None,
+    job_name: str | None = None,
+    default_output_dir: str | Path | None = None,
+) -> tuple:
+    """Resolve a full config and build an EngineConfig from it.
+
+    Returns ``(EngineConfig, ResolvedConfig, MliportSettings)``.
+    """
+    from mliport.config.aliases import parse_model_aliases  # noqa: PLC0415
+
+    settings = _load_settings(args)
+    aliases = parse_model_aliases(settings.parser)
+
+    model_alias = getattr(args, "model_alias", None)
+    cli = _build_cli_opts(args, calc_type)
+
+    # `--model` may be a filesystem path OR a model-alias name (plan section
+    # 5.1: `--model mace_mpa0`). An explicit --model-alias wins; otherwise a
+    # value matching a known alias is treated as the alias.
+    if model_path is not None:
+        cli.setdefault("model_path", model_path)
+    else:
+        model_arg = getattr(args, "model", None)
+        if model_arg is not None:
+            if model_alias is None and model_arg in aliases:
+                model_alias = model_arg
+            else:
+                cli.setdefault("model_path", model_arg)
+        elif model_alias is None and not incar_layer:
+            raise SystemExit(
+                "Error: one of --model PATH or --model-alias NAME is required."
+            )
+
+    resolved = resolve_config(
+        calc_type=calc_type,
+        settings=settings,
+        model_alias_name=model_alias,
+        profile_name=getattr(args, "profile", None),
+        incar=incar_layer,
+        cli=cli,
+        cli_base_dir=Path.cwd(),
+    )
+    engine_config = EngineConfig.from_resolved(resolved)
+    # Output-directory precedence (review R13): an explicit argument wins,
+    # then an explicit CLI --output, then INCAR/settings OUTPUT_DIR, then the
+    # caller's default, then ".".
+    # The argparse default for --output is None precisely so an INCAR
+    # OUTPUT_DIR is not silently shadowed by the current-directory default.
+    # `mliport run` passes <INCAR folder>/results as the default (task-folder
+    # usage, #61 R1.2); every other subcommand keeps ".".
+    explicit_output = (
+        output_dir if output_dir is not None else getattr(args, "output", None)
+    )
+    if explicit_output is None:
+        explicit_output = resolved.settings.get("output_dir")
+    if explicit_output is None:
+        explicit_output = default_output_dir
+    engine_config.output_dir = (
+        Path(explicit_output if explicit_output else ".").expanduser().resolve()
+    )
+    engine_config.job_name = (
+        job_name if job_name is not None else getattr(args, "name", None)
+    )
+    engine_config.overwrite = bool(getattr(args, "overwrite", False))
+    # Batch resume only; other subcommands (neb, confsearch) have their own
+    # checkpoint-based --resume handled by their runners.
+    engine_config.resume = calc_type == "batch" and bool(getattr(args, "resume", False))
+    _maybe_reexec_for_device_isolation(resolved)
+    return engine_config, resolved, settings
+
+
+_ISOLATION_BACKENDS = PROCESS_ISOLATED_BACKENDS
+
+
+def _device_visibility_value(device: str) -> str:
+    """CUDA_VISIBLE_DEVICES value for the requested device.
+
+    Uses the same resolver as the queue lease so both paths choose the same
+    physical GPU, including when the caller already set CUDA_VISIBLE_DEVICES.
+    """
+    from mliport.devices import resolve_visible_device  # noqa: PLC0415
+
+    if str(device).strip().lower() == "cpu":
+        return ""
+    resolved = resolve_visible_device(device)
+    if resolved is None:  # defensive: cpu handled above
+        return ""
+    return resolved.uuid
+
+
+def _maybe_reexec_for_device_isolation(resolved) -> None:
+    """Restart DPA/GRACE commands in a process with isolated GPU visibility.
+
+    Their ASE adapters cannot select a GPU after the framework is imported, so
+    the documented per-environment CLI commands would otherwise fail on a
+    machine that has not exported CUDA_VISIBLE_DEVICES. Re-exec keeps the
+    user-facing command and arguments unchanged (fresh-install acceptance
+    finding, LGPS round).
+    """
+    from mliport.devices import visibility_is_isolated  # noqa: PLC0415
+
+    if resolved.model_type not in _ISOLATION_BACKENDS:
+        return
+    if os.environ.get("MLIPORT_DEVICE_ISOLATION_REEXEC") == "1":
+        return
+    if visibility_is_isolated(resolved.device):
+        return
+    value = _device_visibility_value(resolved.device)
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = value
+    env["MLIPORT_DEVICE_ISOLATION_REEXEC"] = "1"
+    print(
+        f"Note: restarting with isolated device visibility "
+        f"(CUDA_VISIBLE_DEVICES={value!r}) for {resolved.model_type.upper()}.",
+        file=sys.stderr,
+    )
+    argv0 = sys.argv[0] if sys.argv else ""
+    if argv0 and os.access(argv0, os.X_OK):
+        os.execvpe(argv0, sys.argv, env)
+    os.execvpe(
+        sys.executable,
+        [sys.executable, "-m", "mliport.cli", *sys.argv[1:]],
+        env,
+    )
+
+
+def _output_claim(engine):
+    """Claim the run directory for an engine (no-op for engine-like stubs)."""
+    claim = getattr(engine, "output_directory_claim", None)
+    return claim() if callable(claim) else contextlib.nullcontext()
+
+
+def _final_run_dir(config: EngineConfig) -> Path:
+    """Directory the calculation actually writes into (job subdir included)."""
+    if config.job_name:
+        return Path(config.output_dir) / config.job_name
+    return Path(config.output_dir)
+
+
+def _emit_resolved_config(resolved, output_dir: Path) -> None:
+    """Atomically write resolved_config.json into the FINAL run directory.
+
+    The file records the provenance of one job; writing it to the parent
+    output directory let sibling jobs overwrite each other (review R13).
+    """
+    import json  # noqa: PLC0415
+    import os  # noqa: PLC0415
+
+    if not resolved.settings.get("write_resolved_config", True):
+        return
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / "resolved_config.json"
+    payload = json.dumps(resolved.as_dict(), indent=2, default=str) + "\n"
+    tmp = output_dir / f".resolved_config.json.tmp-{os.getpid()}"
+    try:
+        tmp.write_text(payload, encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        print(
+            f"Warning: could not write {target}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Execute 'run': one INCAR in a task folder, no arguments required.
+
+    Tracking: #61 (task folder + INCAR + ``models/``). The flow is deliberate:
+
+    1. parse and validate the INCAR (syntax, keys, values),
+    2. resolve the full configuration, including the model path,
+    3. only then look for and read the structure,
+    4. claim the output directory and run.
+
+    Steps 1-2 come before any structure or model work so a broken INCAR is
+    reported as a configuration error, not as a missing POSCAR or a backend
+    import failure (spec R1.4).
+    """
+    started_at = _run_started_at(args)
+    # Load configuration
+    incar_path = Path(args.incar).expanduser()
+    # Backward-compat: fall back to legacy INCAR.uma if the default is missing.
+    if not incar_path.exists() and args.incar == "INCAR.mliport":
+        legacy = Path("INCAR.uma")
+        if legacy.exists():
+            incar_path = legacy
+    if not incar_path.exists():
+        print(f"Error: INCAR file not found: {incar_path}")
+        return 1
+
+    config = IncarConfig.from_file(incar_path)
+
+    # Validate configuration
+    errors = config.validate()
+    if errors:
+        print("Configuration errors:")
+        for error in errors:
+            print(f"  - {error}")
+        return 1
+
+    calc_type = config.get_str("CALC_TYPE", config.get_str("CALCULATION", "sp")).lower()
+    job_name = config.get_str("JOB_NAME", None)
+    # Task-folder default output: <INCAR folder>/results (spec R1.2). It is a
+    # *default*, so --output and OUTPUT_DIR still win (see _resolve_engine_config).
+    default_output_dir = incar_path.expanduser().resolve().parent / "results"
+
+    if calc_type == "neb":
+        try:
+            engine_config, resolved, _settings = _resolve_engine_config(
+                args,
+                "neb",
+                incar_layer=config,
+                output_dir=args.output,
+                job_name=job_name,
+                default_output_dir=default_output_dir,
+            )
+            initial_path = resolved.run_options.get("neb_initial")
+            final_path = resolved.run_options.get("neb_final")
+            if not initial_path or not final_path:
+                raise ValueError("NEB INCAR requires both NEB_INITIAL and NEB_FINAL")
+            initial = read(initial_path)
+            final = read(final_path)
+            engine = CalculationEngine.from_config(engine_config)
+            result = engine.run_neb(
+                resolved,
+                initial=initial,
+                final=final,
+                log_fn=_console_log,
+            )
+            outcome = classify_result(result, calc_type="neb")
+            if outcome is RunOutcome.NOT_CONVERGED:
+                print(
+                    "Warning: NEB did not converge; resume from the latest "
+                    "checkpoint to continue."
+                )
+            return exit_code_for(outcome)
+        except (KeyboardInterrupt, CancellationRequested) as exc:
+            print(f"\n{describe(classify_exception(exc))}.", file=sys.stderr)
+            return exit_code_for(classify_exception(exc))
+        except Exception as exc:
+            print(f"Error: {exc}")
+            return EXIT_ERROR
+
+    if calc_type == "confsearch":
+        # Spec R3.3: an INCAR may select CONFSEARCH, and it must take exactly the
+        # same code path as `mliport confsearch run` (no second implementation).
+        return _run_confsearch_job(
+            args,
+            incar_layer=config,
+            resume=False,
+            dry_run=False,
+            default_output_dir=default_output_dir,
+        )
+
+    # Determine calculation type from INCAR (authoritative for the `run` flow).
+    # `mliport run` dispatches single-structure runs only. A BATCH INCAR was
+    # previously accepted by validation and then crashed with a confusing
+    # "Unknown calc_type: batch" after model loading. Fail fast with guidance.
+    if calc_type not in {"sp", "opt", "md"}:
+        print(f"Error: CALC_TYPE={calc_type!r} cannot be executed by 'mliport run'.")
+        if calc_type == "batch":
+            print(
+                "       Batch calculations use the 'mliport batch' subcommand instead."
+            )
+        return 1
+
+    # The INCAR dict (UPPER keys) is passed as a resolver layer; aliases are
+    # canonicalised automatically (MODEL_TYPE -> model_type, FMAX -> fmax ...).
+    # Resolving here, before the structure is read, also resolves MODEL_PATH and
+    # rejects unknown keys/settings first (spec R1.4).
+    engine_config, resolved, _settings = _resolve_engine_config(
+        args,
+        calc_type,
+        incar_layer=config,
+        output_dir=args.output,
+        job_name=job_name,
+        default_output_dir=default_output_dir,
+    )
+
+    # Determine structure file
+    structure_file = args.structure
+    if structure_file is None:
+        # Try common defaults in the current directory. A task folder is meant
+        # to be run from inside itself (that is where `mliport run` writes
+        # `results/`), so the default names are not searched next to an
+        # `--incar` that lives elsewhere; say what was searched instead of only
+        # reporting that nothing was found.
+        candidates = ["POSCAR", "CONTCAR", "structure.cif", "structure.xyz"]
+        for default in candidates:
+            if Path(default).exists():
+                structure_file = default
+                break
+
+    if structure_file is None:
+        print("Error: No structure file specified and no default found")
+        print(f"       Searched for {', '.join(candidates)} in {Path.cwd()}")
+        print(
+            "       Pass the structure as an argument, or run the command from "
+            "the folder that holds it."
+        )
+        return 1
+
+    structure_path = Path(structure_file).expanduser().resolve()
+    if not structure_path.exists():
+        print(f"Error: Structure file not found: {structure_path}")
+        return 1
+
+    # Read structure
+    print(f"Reading structure from: {structure_path}")
+    try:
+        atoms = read(structure_path)
+    except Exception as e:
+        print(f"Error reading structure: {e}")
+        return 1
+
+    print(f"System: {atoms.get_chemical_formula()}")
+    print(f"Atoms: {len(atoms)}")
+    print()
+
+    engine = CalculationEngine.from_config(engine_config)
+    try:
+        _preflight_md_structure(atoms, engine_config)
+        with _output_claim(engine):
+            _emit_resolved_config(resolved, _final_run_dir(engine_config))
+            return _run_product(
+                engine, atoms, calc_type=calc_type, started_at=started_at
+            )
+    except (OutputDirectoryInUseError, ValueError) as exc:
+        print(f"Error: {exc}")
+        return EXIT_ERROR
+
+
+def cmd_sp(args: argparse.Namespace) -> int:
+    """Execute 'sp' command."""
+    started_at = _run_started_at(args)
+
+    structure_path = Path(args.structure).expanduser().resolve()
+    if not structure_path.exists():
+        print(f"Error: Structure file not found: {structure_path}")
+        return 1
+
+    config, resolved, _settings = _resolve_engine_config(args, "sp")
+
+    print(f"System: reading from {structure_path}")
+
+    try:
+        atoms = read(structure_path)
+        print(f"System: {atoms.get_chemical_formula()}")
+        print(f"Atoms: {len(atoms)}")
+
+        engine = CalculationEngine.from_config(config)
+        with _output_claim(engine):
+            _emit_resolved_config(resolved, _final_run_dir(config))
+            return _run_product(engine, atoms, calc_type="sp", started_at=started_at)
+    except Exception as e:
+        print(f"Error: {e}")
+        return EXIT_ERROR
+
+
+def cmd_opt(args: argparse.Namespace) -> int:
+    """Execute 'opt' command."""
+    started_at = _run_started_at(args)
+
+    structure_path = Path(args.structure).expanduser().resolve()
+    if not structure_path.exists():
+        print(f"Error: Structure file not found: {structure_path}")
+        return 1
+
+    config, resolved, _settings = _resolve_engine_config(args, "opt")
+
+    print(f"Reading structure from: {structure_path}")
+
+    try:
+        atoms = read(structure_path)
+        print(f"System: {atoms.get_chemical_formula()}")
+        print(f"Atoms: {len(atoms)}")
+
+        engine = CalculationEngine.from_config(config)
+        with _output_claim(engine):
+            _emit_resolved_config(resolved, _final_run_dir(config))
+            return _run_product(engine, atoms, calc_type="opt", started_at=started_at)
+    except Exception as e:
+        print(f"Error: {e}")
+        return EXIT_ERROR
+
+
+def cmd_md(args: argparse.Namespace) -> int:
+    """Execute 'md' command."""
+    started_at = _run_started_at(args)
+
+    structure_path = Path(args.structure).expanduser().resolve()
+    if not structure_path.exists():
+        print(f"Error: Structure file not found: {structure_path}")
+        return 1
+
+    config, resolved, _settings = _resolve_engine_config(args, "md")
+
+    print(f"Reading structure from: {structure_path}")
+
+    try:
+        atoms = read(structure_path)
+        print(f"System: {atoms.get_chemical_formula()}")
+        print(f"Atoms: {len(atoms)}")
+
+        engine = CalculationEngine.from_config(config)
+        _preflight_md_structure(atoms, config)
+        with _output_claim(engine):
+            _emit_resolved_config(resolved, _final_run_dir(config))
+            return _run_product(engine, atoms, calc_type="md", started_at=started_at)
+    except Exception as e:
+        print(f"Error: {e}")
+        return EXIT_ERROR
+
+
+def _parse_neb_atom_map(value: str | None) -> list[int] | None:
+    if value is None:
+        return None
+    try:
+        parsed = [int(token.strip()) for token in value.split(",")]
+    except ValueError as exc:
+        raise ValueError("--atom-map must contain comma-separated integers") from exc
+    if not parsed or any(not token.strip() for token in value.split(",")):
+        raise ValueError("--atom-map cannot contain empty entries")
+    return parsed
+
+
+def _parse_neb_image_shifts(value: str | None) -> list[list[int]] | None:
+    if value is None:
+        return None
+    rows: list[list[int]] = []
+    try:
+        for row in value.split(";"):
+            values = [int(token.strip()) for token in row.split(",")]
+            if len(values) != 3 or any(not token.strip() for token in row.split(",")):
+                raise ValueError
+            rows.append(values)
+    except ValueError as exc:
+        raise ValueError(
+            "--image-shifts must contain one x,y,z integer row per atom, "
+            "separated by semicolons"
+        ) from exc
+    if not rows:
+        raise ValueError("--image-shifts cannot be empty")
+    return rows
+
+
+def cmd_neb(args: argparse.Namespace) -> int:
+    """Execute a new or geometry-resumed fixed-cell NEB workflow."""
+    from mliport.neb.workflow import (  # noqa: PLC0415
+        checkpoint_resolved_layer,
+        checkpoint_run_directory,
+    )
+
+    try:
+        if args.resume is not None:
+            if args.initial is not None or args.final is not None:
+                raise ValueError("--resume cannot be combined with --initial/--final")
+            if args.atom_map is not None or args.image_shifts is not None:
+                raise ValueError(
+                    "--resume restores atom mapping/winding from the checkpoint"
+                )
+            if args.name is not None:
+                raise ValueError("--name cannot change the directory of a resumed run")
+            if args.model_alias is not None or args.profile is not None:
+                raise ValueError(
+                    "Resume restores the original alias/profile values; use direct "
+                    "CLI overrides, which are checked by the fingerprint"
+                )
+            run_dir = checkpoint_run_directory(args.resume)
+            if args.output is not None:
+                requested_output = Path(args.output).expanduser().resolve()
+                if requested_output != run_dir:
+                    raise ValueError(
+                        f"--output must be the original resume directory {run_dir}"
+                    )
+            checkpoint_layer = checkpoint_resolved_layer(args.resume)
+            engine_config, resolved, _settings = _resolve_engine_config(
+                args,
+                "neb",
+                incar_layer=checkpoint_layer,
+                output_dir=str(run_dir),
+                job_name=None,
+            )
+            initial = final = None
+            atom_map = image_shifts = None
+        else:
+            if args.initial is None or args.final is None:
+                raise ValueError("A new NEB run requires --initial and --final")
+            if args.output is None:
+                raise ValueError(
+                    "A new NEB run requires an explicit --output directory"
+                )
+            engine_config, resolved, _settings = _resolve_engine_config(args, "neb")
+            initial_path = resolved.run_options.get("neb_initial")
+            final_path = resolved.run_options.get("neb_final")
+            if not initial_path or not final_path:
+                raise ValueError("Typed NEB endpoint paths were not resolved")
+            initial = read(initial_path)
+            final = read(final_path)
+            atom_map = _parse_neb_atom_map(args.atom_map)
+            image_shifts = _parse_neb_image_shifts(args.image_shifts)
+
+        engine = CalculationEngine.from_config(engine_config)
+        result = engine.run_neb(
+            resolved,
+            initial=initial,
+            final=final,
+            resume=args.resume,
+            atom_map=atom_map,
+            image_shifts=image_shifts,
+            log_fn=_console_log,
+        )
+        print(f"NEB status: {result['status']}")
+        print(f"Run ID: {result['run_id']}")
+        print(f"Checkpoint: {result['latest_checkpoint']}")
+        if result.get("barrier_forward_sampled_eV") is not None:
+            print(
+                "Sampled forward barrier: "
+                f"{result['barrier_forward_sampled_eV']:.8f} eV"
+            )
+        outcome = classify_result(result, calc_type="neb")
+        if outcome is RunOutcome.NOT_CONVERGED:
+            print(
+                "Warning: NEB did not converge; resume from the latest "
+                "checkpoint to continue."
+            )
+        return exit_code_for(outcome)
+    except (KeyboardInterrupt, CancellationRequested) as exc:
+        print(f"\n{describe(classify_exception(exc))}.", file=sys.stderr)
+        return exit_code_for(classify_exception(exc))
+    except Exception as exc:
+        print(f"Error: {exc}")
+        return EXIT_ERROR
+
+
+def cmd_confsearch(args: argparse.Namespace) -> int:
+    """Execute 'confsearch run|place|resume'."""
+    sub = getattr(args, "confsearch_command", None)
+    try:
+        if sub == "place":
+            return _cmd_confsearch_place(args)
+        if sub in {"run", "resume"}:
+            return _cmd_confsearch_run(args, resume=(sub == "resume"))
+        if sub == "export":
+            return _cmd_confsearch_export(args)
+        if sub == "extend":
+            return _cmd_confsearch_extend(args)
+        if sub == "merge":
+            return _cmd_confsearch_merge(args)
+        print(f"Error: unknown confsearch subcommand {sub!r}", file=sys.stderr)
+        return EXIT_ERROR
+    except (KeyboardInterrupt, CancellationRequested) as exc:
+        print(f"\n{describe(classify_exception(exc))}.", file=sys.stderr)
+        return exit_code_for(classify_exception(exc))
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    except Exception as exc:
+        print(f"Error: {exc}")
+        return EXIT_ERROR
+
+
+def _cmd_confsearch_place(args: argparse.Namespace) -> int:
+    """Placement only: no model is loaded, the starts are written for review."""
+    from mliport.confsearch.options import ConfsearchOptions
+    from mliport.confsearch.prepare import prepare_starts
+
+    seed = args.seed if args.seed is not None else 0
+    options = ConfsearchOptions(
+        cs_slab=args.cs_slab,
+        cs_molecule=args.cs_molecule,
+        cs_n_starts=args.cs_n_starts,
+        cs_place_anchor=getattr(args, "cs_place_anchor", None),
+        cs_place_anchor_targets=getattr(args, "cs_place_anchor_targets", None),
+        seed=seed,
+    )
+    sequence = np.random.SeedSequence(seed)
+    placement_ss, *_ = sequence.spawn(1 + int(options.cs_n_starts))
+    starts = prepare_starts(options, placement_rng=np.random.default_rng(placement_ss))
+    output = Path(args.output).expanduser().resolve()
+    starts_dir = output / "starts"
+    starts_dir.mkdir(parents=True, exist_ok=True)
+    for start in starts:
+        ase_write(starts_dir / f"{start.label}.extxyz", start.atoms, format="extxyz")
+        ase_write(starts_dir / f"{start.label}.vasp", start.atoms, format="vasp")
+        if start.placement is not None:
+            (starts_dir / f"{start.label}.placement.json").write_text(
+                json.dumps(start.placement.to_dict(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+    print(f"Placed {len(starts)} start(s) in {starts_dir}")
+    for warning in sorted(
+        {warning for start in starts for warning in start.regions.warnings}
+    ):
+        print(f"Warning: {warning}")
+    return EXIT_SUCCESS
+
+
+def _mliport_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version  # noqa: PLC0415
+
+    try:
+        return version("mliport")
+    except PackageNotFoundError:  # pragma: no cover - always installed
+        return "unknown"
+
+
+def _jsonable_option(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_option(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonable_option(item) for key, item in value.items()}
+    return str(value)
+
+
+def _load_confsearch_run(run_dir: Path) -> tuple[dict, dict, dict]:
+    """Load (context, results, options-dict) of a finished confsearch run."""
+    context_path = run_dir / "run_context.json"
+    results_path = run_dir / "search_results.json"
+    for path in (context_path, results_path):
+        if not path.is_file():
+            raise ValueError(f"Cannot read run: {path} not found")
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+    results = json.loads(results_path.read_text(encoding="utf-8"))
+    return context, results, dict(context.get("options") or {})
+
+
+def _cmd_confsearch_extend(args: argparse.Namespace) -> int:
+    """`extend RUN --cycles N`: add N cycles to every surviving replica."""
+    from dataclasses import replace as _replace
+
+    from mliport.confsearch.options import ConfsearchOptions
+    from mliport.confsearch.prepare import input_hashes
+
+    run_dir = Path(args.run).expanduser().resolve()
+    context, _results, options_payload = _load_confsearch_run(run_dir)
+    import dataclasses as _dataclasses
+
+    known = {item.name for item in _dataclasses.fields(ConfsearchOptions)}
+    old_options = ConfsearchOptions(
+        **{key: value for key, value in options_payload.items() if key in known}
+    )
+    added = int(args.cs_cycles)
+    if added < 1:
+        raise ValueError("--cycles must be >= 1 for extend")
+    new_options = _replace(old_options, cs_cycles=old_options.cs_cycles + added)
+
+    print(
+        f"Extending {run_dir.name} by {added} cycle(s) "
+        f"({old_options.cs_cycles} -> {new_options.cs_cycles}); the previous "
+        "results are archived once the resume fingerprint has been validated"
+    )
+
+    # The new budget goes into the *resolved* configuration only.  It must not
+    # reach run_context.json here: the workflow validates the resume fingerprint
+    # against the recorded (old) budget first and archives/records afterwards
+    # (spec 11.3), so a refused extension leaves the run untouched.
+    incar_layer = _confsearch_layer_from_context(context)
+    incar_layer["cs_cycles"] = int(new_options.cs_cycles)
+    # `--cycles N` means "add N", but the CLI layer carries the *total* cycle
+    # count (it has higher precedence than the INCAR layer, so leaving the added
+    # value there would resolve back to the old budget).
+    args.cs_cycles = int(new_options.cs_cycles)
+    args.output = str(run_dir)
+    args.starts = None
+    engine_config, resolved, _settings = _resolve_engine_config(
+        args, "confsearch", incar_layer=incar_layer
+    )
+    engine = CalculationEngine.from_config(engine_config)
+    result = engine.run_confsearch(
+        resolved,
+        output_dir=engine_config.output_dir,
+        resume=True,
+        allow_cycle_change=True,
+        log_fn=_console_log,
+    )
+    print(f"confsearch status: {result.get('status')}")
+    print(f"Quenches: {result.get('diagnostics', {}).get('n_quenches')}")
+    for warning in result.get("warnings", []):
+        print(f"Warning: {warning}")
+    del input_hashes
+    return exit_code_for(classify_result(result, calc_type="confsearch"))
+
+
+def _comparability_key(context: dict) -> dict:
+    """The section 11.4 comparability key of one source run (revision 5).
+
+    The model part is the section 11.2 identity subset; the system part adds the
+    atomic numbers in order, the cell and the PBC, because index sets alone are
+    not enough (two different slabs can share them).
+    """
+    from mliport.confsearch.checkpoint import model_identity  # noqa: PLC0415
+
+    options = context.get("options") or {}
+    model = context.get("model") or {}
+    system = context.get("system") or {}
+    electronic = context.get("electronic_state") or {}
+    return {
+        "model": model_identity(model),
+        "system": {
+            "numbers": system.get("numbers"),
+            "cell_A": system.get("cell_A"),
+            "pbc": system.get("pbc"),
+            # Spec 11.4 revision 6: the exact fixed-atom positions identify the
+            # slab geometry even when composition, order, cell and index sets
+            # agree (two terminations cut from one supercell).
+            "fixed_positions_A": system.get("fixed_positions_A"),
+        },
+        "electronic_state": {
+            "charge": electronic.get("charge"),
+            "spin": electronic.get("spin"),
+        },
+        "regions": context.get("regions"),
+        "ionic_species": options.get("cs_ionic_species"),
+        "bond_scale": options.get("cs_bond_scale"),
+        "bond_break_scale": options.get("cs_bond_break_scale"),
+        "dedup": [
+            options.get("cs_dedup_energy_tol"),
+            options.get("cs_dedup_geom_tol"),
+            options.get("cs_dedup_fp_tol"),
+            options.get("cs_fp_rcut"),
+            options.get("cs_fp_binwidth"),
+            options.get("cs_fp_sigma"),
+        ],
+        "quench": [options.get("cs_quench_fmax"), options.get("cs_quench_steps")],
+        "refine": [
+            options.get("cs_refine"),
+            options.get("cs_refine_fmax"),
+            options.get("cs_refine_steps"),
+        ],
+    }
+
+
+def _cmd_confsearch_merge(args: argparse.Namespace) -> int:
+    """`merge RUN1 RUN2 ... --output DIR`: combine comparable searches."""
+    from mliport.confsearch import status as cs_status
+    from mliport.confsearch.options import ConfsearchOptions
+    from mliport.confsearch.regions import Regions
+    from mliport.confsearch.registry import MinimumOrigin, MinimumRegistry
+    from mliport.confsearch.results import build_results
+
+    sources = [Path(item).expanduser().resolve() for item in args.runs]
+    contexts = []
+    for run_dir in sources:
+        context, _results, _options = _load_confsearch_run(run_dir)
+        contexts.append(context)
+    for run_dir, context in zip(sources, contexts, strict=True):
+        system = context.get("system") or {}
+        if (
+            not system.get("numbers")
+            or not system.get("cell_A")
+            or system.get("pbc") is None
+            or system.get("fixed_positions_A") is None
+        ):
+            raise ValueError(
+                f"Cannot merge {run_dir.name}: run_context.json does not record the "
+                "atomic numbers, cell and PBC (spec 11.4 revision 5). Re-run that "
+                "search with this revision; merging refuses to compare index sets "
+                "alone, because two different slabs can share them."
+            )
+    reference_key = _comparability_key(contexts[0])
+    for run_dir, context in zip(sources[1:], contexts[1:], strict=True):
+        key = _comparability_key(context)
+        differences = [
+            name for name in reference_key if key.get(name) != reference_key.get(name)
+        ]
+        if differences:
+            raise ValueError(
+                f"Cannot merge {run_dir.name}: its comparability key differs from "
+                f"{sources[0].name} in {', '.join(sorted(differences))}"
+            )
+
+    import dataclasses as _dataclasses
+
+    known = {item.name for item in _dataclasses.fields(ConfsearchOptions)}
+    options = ConfsearchOptions(
+        **{
+            key: value
+            for key, value in (contexts[0].get("options") or {}).items()
+            if key in known
+        }
+    )
+    regions_payload = contexts[0].get("regions") or {}
+    regions = Regions(
+        adsorbate=np.asarray(regions_payload.get("adsorbate", []), dtype=int),
+        slab=np.asarray(regions_payload.get("slab", []), dtype=int),
+        fixed=np.asarray(regions_payload.get("fixed", []), dtype=int),
+        relax=np.asarray(regions_payload.get("relax", []), dtype=int),
+        warnings=(),
+    )
+    merged = MinimumRegistry(
+        options=options, adsorbate=regions.adsorbate, fixed=regions.fixed
+    )
+    next_id = 1
+    id_map: dict[tuple[int, int], int] = {}
+    for source_index, run_dir in enumerate(sources):
+        _context, results, _payload = _load_confsearch_run(run_dir)
+        source = MinimumRegistry.from_dict(
+            results["diagnostics"]["registry"],
+            options=options,
+            adsorbate=regions.adsorbate,
+            fixed=regions.fixed,
+        )
+        for status, uniques in source.status_classes().items():
+            for unique in uniques:
+                old_id = unique.unique_id
+                unique.unique_id = next_id
+                id_map[(source_index, old_id)] = next_id
+                for member in unique.members:
+                    # Spec 11.4: the origin carries the source run id.  The
+                    # replica index is not renumbered (a >=1000 offset silently
+                    # collides), the source string is what identifies the run.
+                    member.origin = MinimumOrigin(
+                        replica=member.origin.replica,
+                        cycle=member.origin.cycle,
+                        source=f"merge:{run_dir.name}",
+                        snapshot_index=member.origin.snapshot_index,
+                    )
+                merged._classes.setdefault(status, []).append(unique)
+                merged._unique_by_id[unique.unique_id] = unique
+                next_id += 1
+    merged._next_unique_id = next_id
+    merged._next_record_id = (
+        sum(
+            source_registry.total_records()
+            for source_registry in (
+                MinimumRegistry.from_dict(
+                    _load_confsearch_run(run_dir)[1]["diagnostics"]["registry"],
+                    options=options,
+                    adsorbate=regions.adsorbate,
+                    fixed=regions.fixed,
+                )
+                for run_dir in sources
+            )
+        )
+        + 1
+    )
+    merges = merged.consolidate()
+
+    output = Path(args.output).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    discovery = [
+        row
+        for run_dir in sources
+        for row in _load_confsearch_run(run_dir)[1]["diagnostics"].get(
+            "discovery_curve"
+        )
+        if isinstance(row, dict)
+    ]
+    del discovery, id_map, merges
+    results = build_results(
+        registry=merged,
+        options=options,
+        replicas=[],
+        discovery=[],
+        baseline={
+            "stage": "merge",
+            "sources": [run_dir.name for run_dir in sources],
+            "best_energy_eV": min(
+                (
+                    unique.energy_eV
+                    for status in cs_status.rankable_statuses(
+                        options.cs_reaction_policy
+                    )
+                    for unique in merged.uniques(status)
+                ),
+                default=None,
+            ),
+        },
+        warnings=[],
+        output_dir=output,
+        model_record=contexts[0].get("model") or {},
+        gradient_preflight=contexts[0].get("gradient_preflight") or {},
+        cumulative_md_ps=sum(
+            float(
+                _load_confsearch_run(run_dir)[1]["diagnostics"].get(
+                    "cumulative_md_ps", 0.0
+                )
+            )
+            for run_dir in sources
+        ),
+        seed=int(contexts[0].get("seed") or 0),
+        starts=[{"source": run_dir.name} for run_dir in sources],
+        regions=regions,
+        references=None,
+        calculator=None,
+    )
+    results["merge"] = {
+        "sources": [run_dir.name for run_dir in sources],
+        "refinement_reused": False,
+        "note": (
+            "Merged rankings use the quench energies of the source registry "
+            "representatives; refinement was not recomputed (spec 11.4)."
+        ),
+    }
+    (output / "search_results.json").write_text(
+        json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(f"Merged {len(sources)} run(s) into {output}")
+    print(f"Rankable minima: {results['ranking']['n_rankable']}")
+    return EXIT_SUCCESS
+
+
+def _cmd_confsearch_export(args: argparse.Namespace) -> int:
+    """Re-export the ranked candidates of a finished run (spec section 12.1)."""
+    from dataclasses import fields as _fields
+
+    from mliport.confsearch.options import ConfsearchOptions
+    from mliport.confsearch.regions import Regions
+    from mliport.confsearch.registry import MinimumRegistry
+    from mliport.confsearch.results import _export_candidate
+
+    run_dir = Path(args.run).expanduser().resolve()
+    context_path = run_dir / "run_context.json"
+    results_path = run_dir / "search_results.json"
+    for path in (context_path, results_path):
+        if not path.is_file():
+            raise ValueError(f"Cannot re-export: {path} not found")
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+    results = json.loads(results_path.read_text(encoding="utf-8"))
+    known = {item.name for item in _fields(ConfsearchOptions)}
+    options = ConfsearchOptions(
+        **{
+            key: value
+            for key, value in (context.get("options") or {}).items()
+            if key in known
+        }
+    )
+    top_k = args.cs_top_k if args.cs_top_k is not None else int(options.cs_top_k)
+    window = (
+        args.cs_export_window
+        if args.cs_export_window is not None
+        else float(options.cs_export_window)
+    )
+    regions_payload = context.get("regions") or {}
+    regions = Regions(
+        adsorbate=np.asarray(regions_payload.get("adsorbate", []), dtype=int),
+        slab=np.asarray(regions_payload.get("slab", []), dtype=int),
+        fixed=np.asarray(regions_payload.get("fixed", []), dtype=int),
+        relax=np.asarray(regions_payload.get("relax", []), dtype=int),
+        warnings=(),
+    )
+    if regions.adsorbate.size == 0:
+        raise ValueError("Cannot re-export: run_context.json has no regions")
+    registry = MinimumRegistry.from_dict(
+        results["diagnostics"]["registry"],
+        options=options,
+        adsorbate=regions.adsorbate,
+        fixed=regions.fixed,
+    )
+    uniques = {unique.unique_id: unique for unique in registry.uniques()}
+    entries = sorted(
+        (results["ranking"].get("refined") or [])
+        + (results["ranking"].get("unrefined") or []),
+        key=lambda entry: (entry["energy_eV"], entry["id"]),
+    )
+    if not entries:
+        raise ValueError("Cannot re-export: the run has no rankable minima")
+    best = entries[0]["energy_eV"]
+    selected = [entry for entry in entries if entry["energy_eV"] - best <= window][
+        :top_k
+    ]
+    destination = (
+        Path(args.output).expanduser().resolve()
+        if args.output is not None
+        else run_dir / "top_reexport"
+    )
+    written = []
+    for position, entry in enumerate(selected, start=1):
+        unique = uniques.get(int(entry["id"]))
+        if unique is None:
+            continue
+        written.append(
+            _export_candidate(
+                destination / f"rank_{position:03d}",
+                unique_id=int(entry["id"]),
+                payload=unique.to_dict(),
+                atoms=unique.representative.atoms,
+                options=options,
+                regions=regions,
+                entry=entry,
+                energy=float(entry["energy_eV"]),
+            )
+        )
+    print(f"Re-exported {len(written)} candidate(s) to {destination}")
+    print(
+        "Note: re-exports use the registry representatives (quench geometries); "
+        "the original top/ directories hold the refined geometries when "
+        "refinement was enabled."
+    )
+    return EXIT_SUCCESS
+
+
+def _confsearch_layer_from_context(context: dict) -> dict:
+    """Rebuild a config layer from a recorded ``run_context.json``.
+
+    The config layers carry ``cs_starts`` as an ``os.pathsep``-joined scalar
+    while the context records it as a list (the CLI/API join the positional
+    starts), so a resume or an extend must convert it back -- otherwise the
+    resolver validates the *stringified list* as a path and refuses.
+    """
+    layer = dict(context.get("options") or {})
+    starts = layer.get("cs_starts")
+    if isinstance(starts, (list, tuple)):
+        layer["cs_starts"] = os.pathsep.join(str(item) for item in starts)
+    model = context.get("model") or {}
+    for key, value in (
+        ("model_type", model.get("model_type")),
+        ("model_path", model.get("model_path")),
+        ("task", model.get("task")),
+        ("device", context.get("device")),
+        ("head", model.get("head_requested")),
+        ("default_dtype", model.get("dtype_requested")),
+        ("inference_mode", model.get("inference_mode")),
+    ):
+        if value is not None:
+            layer[key] = value
+    return layer
+
+
+def _cmd_confsearch_run(args: argparse.Namespace, *, resume: bool) -> int:
+    """Execute ``mliport confsearch run|resume`` from the command line."""
+    incar_layer: dict = {}
+    if resume:
+        run_dir = Path(args.run).expanduser().resolve()
+        context_path = run_dir / "run_context.json"
+        if not context_path.is_file():
+            raise ValueError(f"Cannot resume: {context_path} not found")
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+        incar_layer.update(_confsearch_layer_from_context(context))
+        args.output = str(run_dir)
+        args.starts = None
+    else:
+        if args.output is None:
+            raise ValueError("A new confsearch run requires an explicit --output")
+        if args.starts:
+            incar_layer["cs_starts"] = os.pathsep.join(
+                str(item) for item in args.starts
+            )
+        for key in _CONFSEARCH_CLI_KEYS:
+            value = getattr(args, key, None)
+            if value is not None:
+                incar_layer.setdefault(key, value)
+
+    return _run_confsearch_job(
+        args,
+        incar_layer=incar_layer,
+        resume=resume,
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+
+
+def _run_confsearch_job(
+    args: argparse.Namespace,
+    *,
+    incar_layer: dict,
+    resume: bool,
+    dry_run: bool,
+    default_output_dir: str | Path | None = None,
+) -> int:
+    """Resolve, run and report one confsearch job.
+
+    This is the single code path behind both ``mliport confsearch run`` and an
+    INCAR with ``CALC_TYPE = CONFSEARCH`` run through ``mliport run`` (spec
+    R3.3). ``incar_layer`` is the INCAR mapping for the second entry point and
+    a plain dict of CLI-provided keys for the first, so the resolved
+    configuration is identical for identical inputs.
+    """
+    engine_config, resolved, _settings = _resolve_engine_config(
+        args,
+        "confsearch",
+        incar_layer=incar_layer,
+        default_output_dir=default_output_dir,
+    )
+    engine = CalculationEngine.from_config(engine_config)
+    result = engine.run_confsearch(
+        resolved,
+        output_dir=engine_config.output_dir,
+        resume=resume,
+        dry_run=dry_run,
+        log_fn=_console_log,
+    )
+
+    if result.get("status") == "dry_run":
+        budget = result.get("budget", {})
+        print("confsearch dry run: inputs and regions are valid")
+        print(f"Starts: {result.get('n_starts')}")
+        print(
+            "Budget: "
+            f"{budget.get('cycles')} cycles x {budget.get('md_steps_per_cycle')} "
+            f"MD steps = {budget.get('md_steps_total')} steps, "
+            f"<= {budget.get('quench_upper_bound')} quenches"
+        )
+        for warning in result.get("warnings", []):
+            print(f"Warning: {warning}")
+        return EXIT_SUCCESS
+
+    ranking = result.get("ranking", {})
+    print(f"confsearch status: {result.get('status')}")
+    print(f"Quenches: {result.get('diagnostics', {}).get('n_quenches')}")
+    if ranking.get("best_energy_eV") is not None:
+        print(f"Lowest found: {ranking['best_energy_eV']:.6f} eV")
+    for entry in (ranking.get("refined") or [])[:5]:
+        print(
+            f"  rank id={entry['id']} E={entry['energy_eV']:.6f} eV "
+            f"hits={entry['hit_count']} replicas={entry['n_replicas']} "
+            f"flags={','.join(entry['flags']) or '-'}"
+        )
+    for warning in result.get("warnings", []):
+        print(f"Warning: {warning}")
+    return exit_code_for(classify_result(result, calc_type="confsearch"))
+
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    """Execute 'batch' command."""
+    started_at = _run_started_at(args)
+
+    input_dir = Path(args.input_dir).expanduser().resolve()
+    if not input_dir.exists():
+        print(f"Error: Input directory not found: {input_dir}")
+        return 1
+
+    if getattr(args, "resume", False) and getattr(args, "overwrite", False):
+        print("Error: --resume and --overwrite are mutually exclusive.")
+        return 1
+
+    config, resolved, _settings = _resolve_engine_config(args, "batch")
+    pattern = resolved.run_options.get("pattern")
+
+    try:
+        engine = CalculationEngine.from_config(config)
+        if "pattern" in resolved.run_options:
+            files = sorted(input_dir.glob(pattern))
+        else:
+            # Match the formats supported by BatchRunner/read(), not only CIF.
+            # The old CLI duplicated discovery but forgot XYZ/VASP/POSCAR, so
+            # valid directories were reported as empty.
+            files = sorted(
+                {
+                    *input_dir.glob("*.cif"),
+                    *input_dir.glob("*.xyz"),
+                    *input_dir.glob("*.vasp"),
+                    *input_dir.glob("POSCAR*"),
+                }
+            )
+        if not files:
+            if "pattern" in resolved.run_options:
+                print(f"No files matching '{pattern}' found in {input_dir}")
+            else:
+                print(f"No supported structure files found in {input_dir}")
+            return 1
+        print(f"Found {len(files)} structure files")
+        with _output_claim(engine):
+            _emit_resolved_config(resolved, _final_run_dir(config))
+            summary = engine.run_batch(
+                files,
+                log_fn=_console_log,
+                started_at=started_at,
+                input_root=input_dir,
+            )
+        print(
+            f"Batch done: {summary['success']} completed, "
+            f"{summary.get('not_converged', 0)} not converged, "
+            f"{summary['failed'] - summary.get('not_converged', 0)} failed"
+            + (
+                f" ({summary['reused']} reused from the earlier run)"
+                if summary.get("reused")
+                else ""
+            )
+        )
+        if summary["failed"] > 0:
+            return 1
+        return 0
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Execute 'config' subcommands (plan section 4.2 / 9 / 17.6)."""
+    sub = args.config_command
+
+    if sub == "paths":
+        settings = _load_settings(args)
+        print("settings.ini search paths (high priority first):")
+        for path in settings.searched:
+            marker = "  (loaded)" if path in settings.loaded_paths else ""
+            print(f"  {path}{marker}")
+        if not settings.loaded_paths:
+            print("  (no settings.ini found; using built-in defaults)")
+        return 0
+
+    if sub == "init":
+        if args.output:
+            target = args.output
+        elif args.user:
+            target = "user"
+        else:
+            # default to project-level when neither flag is given
+            target = "project"
+        try:
+            path = init_settings_file(target, force=args.force)
+        except FileExistsError as exc:
+            print(f"Error: {exc} (use --force to overwrite)")
+            return 1
+        print(f"Wrote settings.ini: {path}")
+        return 0
+
+    if sub == "validate":
+        explicit = args.path
+        settings = (
+            _load_settings(argparse.Namespace(settings=explicit))
+            if explicit
+            else _load_settings(args)
+        )
+        # Re-parse strictly to surface parser errors.
+        import configparser  # noqa: PLC0415
+
+        parser = configparser.ConfigParser(interpolation=None)
+        paths_to_check = [Path(explicit)] if explicit else settings.loaded_paths
+        if not paths_to_check:
+            print("No settings.ini found to validate.")
+            return 1
+        errors: list[str] = []
+        for p in paths_to_check:
+            try:
+                parser.read(p, encoding="utf-8")
+            except (configparser.Error, OSError) as exc:
+                errors.append(f"{p}: {exc}")
+        # Schema-validate every section's keys.
+        schema = get_schema()
+        known = schema.known_names()
+        for section in parser.sections():
+            for key, _value in parser.items(section):
+                if key.lower() not in known and not section.startswith(
+                    ("engine:", "model:", "profile:")
+                ):
+                    suggestion = schema.suggest(key)
+                    hint = f" Did you mean {suggestion[0]!r}?" if suggestion else ""
+                    errors.append(f"[{section}] unknown key {key!r}.{hint}")
+        if errors:
+            print("settings.ini validation errors:")
+            for err in errors:
+                print(f"  - {err}")
+            return 1
+        print(f"settings.ini OK ({len(paths_to_check)} file(s)).")
+        return 0
+
+    if sub == "explain":
+        # Explain uses a representative md resolve; the source trace is what matters.
+        settings = _load_settings(args)
+        resolved = resolve_config(
+            calc_type="md",
+            settings=settings,
+            cli=(
+                {"strict_config": False}
+                if getattr(args, "lenient_config", False)
+                else None
+            ),
+        )
+        print(resolved.explain(args.key))
+        return 0
+
+    if sub == "schema":
+        schema = get_schema()
+        # The section column comes from the same option table that generates
+        # the INCAR templates and docs/incar.md (#61 R3.4).
+        print(f"{'name':24s} {'type':8s} {'scopes':24s} {'section':22s} aliases")
+        print("-" * 104)
+        for spec in schema.specs:
+            scopes = ",".join(sorted(spec.scopes))
+            aliases = ",".join(sorted(spec.aliases)) if spec.aliases else ""
+            print(
+                f"{spec.name:24s} {spec.type.__name__:8s} {scopes:24s} "
+                f"{spec.group:22s} {aliases}"
+            )
+        return 0
+
+    # sub == "show"
+    settings = _load_settings(args)
+    resolved = resolve_config(calc_type="md", settings=settings)
+    print("Resolved configuration (calc_type=md, no CLI overrides):")
+    print(f"  settings.ini: {resolved.settings_path or '(built-in defaults)'}")
+    print(f"  model_type  : {resolved.model_type}")
+    print(f"  task        : {resolved.task}")
+    print(f"  device      : {resolved.device}")
+    print(f"  inference_mode: {resolved.inference_mode}")
+    print(f"  calculator_options: {resolved.calculator_options}")
+    print(f"  run_options: {resolved.run_options}")
+    return 0
+
+
+def cmd_template(args: argparse.Namespace) -> int:
+    """Execute 'template' command."""
+    config = get_default_config(args.type, engine=args.engine)
+
+    output_file = args.output
+    if output_file is None:
+        output_file = f"INCAR.{args.type}"
+
+    config.write(output_file)
+    print(f"Template written to: {output_file}")
+
+    return 0
+
+
+def cmd_tui(args: argparse.Namespace) -> int:
+    """Launch interactive TUI mode."""
+    import sys  # noqa: PLC0415
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(
+            "Error: mliport tui requires an interactive terminal. "
+            "Run it from a terminal, or use `mliport tui --help` and the "
+            "Python API in headless environments.",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        from mliport.tui import MliportApp  # noqa: PLC0415
+    except ImportError as e:
+        print("Error: TUI mode requires textual.")
+        print("Install with: pip install textual")
+        print(f"Import error: {e}")
+        return 1
+
+    app = MliportApp()
+    return app.run()
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Run environment diagnostic checks."""
+    import json  # noqa: PLC0415
+
+    from mliport.doctor import format_diagnostics, run_diagnostics  # noqa: PLC0415
+
+    checks, failures = run_diagnostics(
+        model_path=args.model,
+        engine=args.engine,
+        device=args.device,
+        task=args.task,
+        head=args.head,
+        structure_path=args.structure,
+        default_dtype=args.default_dtype,
+        dpa_runtime=getattr(args, "dpa_runtime", None),
+    )
+    if getattr(args, "json", False):
+        payload = {
+            "schema": "mliport.doctor-report/1",
+            "mliport_version": _mliport_version(),
+            "engine": args.engine,
+            "device": args.device,
+            "failures": failures,
+            "checks": checks,
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    else:
+        print(format_diagnostics(checks))
+    return 0 if failures == 0 else 1
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Detect the GPU and print the matching PyTorch install commands."""
+    import json  # noqa: PLC0415
+
+    from mliport.gpu_setup import (  # noqa: PLC0415
+        detect_gpus,
+        format_setup_report,
+        setup_report_json,
+    )
+
+    gpus = detect_gpus()
+    # CPU-only detection/report is a successful outcome, not an error.
+    if args.json:
+        print(json.dumps(setup_report_json(gpus), indent=2, ensure_ascii=False))
+        return 0
+    print(format_setup_report(gpus))
+    return 0
+
+
+def cmd_convert_xdatcar(args: argparse.Namespace) -> int:
+    """Export an ASE-readable trajectory in the standard VASP layout."""
+    from mliport.writers.xdatcar import convert_to_vasp_xdatcar  # noqa: PLC0415
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"Error: Input trajectory not found: {input_path}")
+        return 1
+    try:
+        out = convert_to_vasp_xdatcar(input_path, args.output)
+    except Exception as exc:
+        print(f"Error: conversion failed: {exc}")
+        return 1
+    print(f"Converted to VASP-standard XDATCAR: {out}")
+    return 0
+
+
+def _parse_index_list(value: str | None) -> list[int] | None:
+    if value is None:
+        return None
+    try:
+        parsed = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError("drift indices must be comma-separated integers") from exc
+    if not parsed:
+        raise ValueError("drift indices cannot be empty")
+    return parsed
+
+
+def _print_transport_summary(results: dict) -> None:
+    """Print a compact, human-readable transport posterior summary."""
+
+    tracer = results.get("tracer_diffusion") or {}
+    d_post = tracer.get("D_posterior_m2_s") or {}
+    lag = tracer.get("lag_grid") or {}
+    ne = results.get("nernst_einstein") or {}
+    sigma = ne.get("sigma_NE_tracer_posterior_mS_cm") or {}
+    print(f"Production mean T: {results.get('temperature_mean_K', float('nan')):g} K")
+    print("Tracer diffusion:")
+    d_mean = d_post.get("mean")
+    d_std = d_post.get("std")
+    d_ci = d_post.get("credible_interval_95") or [None, None]
+    if d_mean is not None:
+        print(f"  D = {d_mean:.6e} m^2/s")
+    if d_std is not None:
+        print(f"  posterior SD = {d_std:.6e} m^2/s")
+    if d_ci[0] is not None and d_ci[1] is not None:
+        print(f"  95% credible interval = [{d_ci[0]:.6e}, {d_ci[1]:.6e}] m^2/s")
+    fit_start = tracer.get("fit_start_ps")
+    fit_stop = tracer.get("fit_stop_ps")
+    if fit_start is not None and fit_stop is not None:
+        print("Fit window:")
+        print(f"  {fit_start:g} - {fit_stop:g} ps")
+    mode = lag.get("mode")
+    n_total = lag.get("n_lag_points_total")
+    nominal = lag.get("nominal_step_ps")
+    if nominal is None:
+        nominal = lag.get("requested_step_ps")
+    print("Kinisi lag grid:")
+    if mode == "custom" and nominal is not None:
+        print(f"  custom, nominal step {nominal:g} ps, {n_total} total points")
+    else:
+        print(f"  {mode}, {n_total} total points")
+    sigma_mean = sigma.get("mean")
+    sigma_ci = sigma.get("credible_interval_95") or [None, None]
+    if sigma_mean is not None:
+        print("Nernst-Einstein tracer conductivity:")
+        print(f"  sigma_NE = {sigma_mean:.6e} mS/cm")
+        if sigma_ci[0] is not None and sigma_ci[1] is not None:
+            print(
+                f"  95% credible interval = [{sigma_ci[0]:.6e}, {sigma_ci[1]:.6e}] mS/cm"
+            )
+    collective = results.get("collective_conductivity") or {}
+    coll = collective.get("sigma_collective_mS_cm_posterior") or {}
+    if coll.get("mean") is not None:
+        print(
+            "Collective Einstein ionic conductivity (trajectory/charge-model quantity):"
+        )
+        print(f"  sigma_collective = {coll['mean']:.6e} mS/cm")
+        interval = coll.get("credible_interval_95") or [None, None]
+        if interval[0] is not None:
+            print(
+                f"  95% credible interval = [{interval[0]:.6e}, {interval[1]:.6e}] mS/cm"
+            )
+        dsigma = collective.get("D_sigma_posterior_m2_s") or {}
+        if dsigma.get("mean") is not None:
+            print(f"  D_sigma = {dsigma['mean']:.6e} m^2/s")
+        haven = results.get("haven_ratio") or {}
+        if haven.get("point_estimate") is not None:
+            print(f"  Haven ratio H_R = {haven['point_estimate']:.6g}")
+        corr = results.get("correlation_factor") or {}
+        if corr.get("point_estimate") is not None:
+            print(f"  correlation factor = {corr['point_estimate']:.6g}")
+    jump = results.get("jump_diffusion") or {}
+    if jump:
+        d_j = jump.get("D_J_posterior_m2_s") or {}
+        if d_j.get("mean") is not None:
+            print(f"Jump/total displacement diagnostic D_J = {d_j['mean']:.6e} m^2/s")
+    for warning in results.get("warnings", []):
+        print(f"WARNING: {warning}")
+
+
+def cmd_analyze(args: argparse.Namespace) -> int:
+    """Execute one explicit Analysis v2 subcommand."""
+
+    from mliport.analysis.runner import run_analysis  # noqa: PLC0415
+    from mliport.analysis.schema import AnalysisRequest  # noqa: PLC0415
+
+    excluded = {
+        "command",
+        "settings",
+        "run",
+        "analysis_task",
+        "force",
+        "_run_started_at",
+    }
+    parameters = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in excluded and value is not None
+    }
+    if args.analysis_task == "transport" and (
+        (args.lag_step_ps is None) != (args.lag_stop_ps is None)
+    ):
+        print("Error: --lag-step-ps and --lag-stop-ps must be provided together")
+        return 1
+    if "start_frame" in parameters:
+        parameters["start"] = parameters.pop("start_frame")
+    if "stop_frame" in parameters:
+        parameters["stop"] = parameters.pop("stop_frame")
+    if "drift_indices" in parameters:
+        try:
+            parameters["drift_indices"] = _parse_index_list(parameters["drift_indices"])
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
+    # Argparse store_true defaults are meaningful for scientific semantics,
+    # except the site-source flag which must remain explicit False when a CIF
+    # was selected.
+    try:
+        outcome = run_analysis(
+            AnalysisRequest(
+                task=args.analysis_task,
+                source=args.run,
+                parameters=parameters,
+                force=bool(args.force),
+            )
+        )
+    except Exception as exc:
+        print(f"Error: {exc}")
+        return 1
+    print(f"Analysis {outcome['status']}: {outcome['analysis_id']}")
+    print(f"Output: {outcome['output_dir']}")
+    if outcome.get("reused"):
+        print("Existing completed result reused (pass --force to recompute).")
+    if args.analysis_task == "validate":
+        result = outcome.get("results") or {}
+        time_report = result.get("time", {})
+        print(f"Frames: {result.get('n_frames')}")
+        print(f"Production frames: {result.get('production_frames')}")
+        print(f"3-D PBC: {result.get('three_dimensional_pbc')}")
+        print(f"Fixed cell: {result.get('fixed_cell')}")
+        print(f"Uniform sampling: {time_report.get('uniform')}")
+        print(f"Frame interval (fs): {time_report.get('frame_interval_fs')}")
+        print(f"MSD/transport eligible: {result.get('eligible_for_transport')}")
+        print(f"VACF eligible: {result.get('eligible_for_vacf')}")
+        for warning in result.get("warnings", []):
+            print(f"WARNING: {warning}")
+    elif args.analysis_task == "transport":
+        _print_transport_summary(outcome.get("results") or {})
+    elif args.analysis_task == "msd":
+        for warning in (outcome.get("results") or {}).get("warnings", []):
+            print(f"WARNING: {warning}")
+    return 0
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    """Execute 'queue' subcommands (submit/start/stop/status)."""
+    from mliport.jobs import JobManager  # noqa: PLC0415
+    from mliport.queue import (  # noqa: PLC0415
+        QueueScheduler,
+        pause_pending_job,
+        pause_scheduler,
+        resume_paused_job,
+        resume_scheduler,
+        scheduler_status,
+        start_scheduler,
+        stop_scheduler,
+        submit_task_file,
+    )
+
+    sub = args.queue_command
+
+    if sub == "submit":
+        try:
+            mgr = JobManager()
+            job_ids, max_concurrent = submit_task_file(mgr, args.task_file)
+        except Exception as exc:
+            print(f"Error: {exc}")
+            return 1
+        print(f"Queued {len(job_ids)} task(s) with status PENDING.")
+        for job_id in job_ids:
+            job = mgr.get_job(job_id)
+            display_name = job.get("display_name", job_id) if job else job_id
+            print(f"  - {display_name} [{job_id}]")
+        print(
+            "Start the scheduler with: "
+            f"mliport queue start --max-concurrent {max_concurrent}"
+        )
+        print(
+            "(the task file's max_concurrent is a suggestion; the running "
+            "scheduler's --max-concurrent is what is enforced)"
+        )
+        return 0
+
+    if sub == "start":
+        try:
+            if args.foreground:
+                scheduler = QueueScheduler(
+                    max_concurrent=args.max_concurrent,
+                    poll_interval=args.poll,
+                    max_jobs_per_gpu=args.max_jobs_per_gpu,
+                )
+                print(
+                    "Scheduler running in foreground ",
+                    f"(max_concurrent={args.max_concurrent}, ",
+                    f"poll={args.poll}s). Ctrl-C to stop.",
+                )
+                with contextlib.suppress(KeyboardInterrupt):
+                    scheduler.run_forever()
+                print("Scheduler stopped.")
+                return 0
+            pid = start_scheduler(
+                jobs_dir=JobManager().jobs_dir,
+                max_concurrent=args.max_concurrent,
+                poll_interval=args.poll,
+                max_jobs_per_gpu=args.max_jobs_per_gpu,
+            )
+        except Exception as exc:
+            print(f"Error: {exc}")
+            return 1
+        print(f"Scheduler started in background (PID {pid}).")
+        print("Stop it with: mliport queue stop")
+        return 0
+
+    if sub == "stop":
+        stopped = stop_scheduler(jobs_dir=JobManager().jobs_dir)
+        if stopped:
+            print("Scheduler stopped.")
+        else:
+            print("No scheduler was running.")
+        return 0
+
+    if sub == "pause":
+        if args.job_id:
+            mgr = JobManager()
+            job = mgr.get_job(args.job_id)
+            if job is None:
+                print(f"Error: job not found: {args.job_id}")
+                return 1
+            if job.get("status") != "pending":
+                print(
+                    f"Error: job {args.job_id} has status {job.get('status')!r}; "
+                    "only pending jobs can be paused."
+                )
+                return 1
+            pause_pending_job(mgr.jobs_dir, args.job_id)
+            print(f"Job paused: {args.job_id}. Other pending jobs are unchanged.")
+            return 0
+        paused = pause_scheduler(jobs_dir=JobManager().jobs_dir)
+        if paused:
+            print("Queue paused: running jobs continue; pending jobs will wait.")
+        else:
+            print("Queue is already paused.")
+        return 0
+
+    if sub == "resume":
+        if args.job_id:
+            mgr = JobManager()
+            job = mgr.get_job(args.job_id)
+            if job is None:
+                print(f"Error: job not found: {args.job_id}")
+                return 1
+            if job.get("status") != "paused":
+                print(
+                    f"Error: job {args.job_id} has status {job.get('status')!r}; "
+                    "only paused jobs can be resumed."
+                )
+                return 1
+            resume_paused_job(mgr.jobs_dir, args.job_id)
+            print(f"Job resumed: {args.job_id}. It re-enters the pending queue.")
+            return 0
+        resumed = resume_scheduler(jobs_dir=JobManager().jobs_dir)
+        if resumed:
+            print("Queue resumed: pending jobs may now be launched.")
+        else:
+            print("Queue was not paused.")
+        return 0
+
+    # sub == "status"
+    mgr = JobManager()
+    summary = mgr.queue_summary()
+    status = scheduler_status(jobs_dir=mgr.jobs_dir)
+    if status["running"] and status.get("paused"):
+        print(f"Scheduler: PAUSED (PID {status['pid']}; running jobs continue)")
+    elif status["running"]:
+        print(f"Scheduler: RUNNING (PID {status['pid']})")
+    else:
+        suffix = " (queue paused)" if status.get("paused") else ""
+        print(f"Scheduler: not running{suffix}")
+    print(
+        f"Queued:     {summary['pending']} pending, {summary['paused']} paused, "
+        f"{summary['claimed']} claimed, {summary['running']} running"
+    )
+    print(
+        f"Finished:   {summary['done']} done, {summary['failed']} failed, ",
+        f"{summary['cancelled']} cancelled",
+    )
+    return 0
+
+
+def cmd_jobs(args: argparse.Namespace) -> int:
+    from mliport.jobs import JobManager, legacy_state_hint  # noqa: PLC0415
+
+    mgr = JobManager()
+    print(f"User job history: {mgr.jobs_dir}")
+    hint = legacy_state_hint()
+    if hint:
+        print(hint)
+    jobs = mgr.list_jobs(project_only=getattr(args, "project", False))
+    if not jobs:
+        print("No jobs found.")
+        return 0
+    print(
+        f"{'Name':<24} {'Run ID':<36} {'Status':<12} "
+        f"{'Type':<6} {'Formula':<12} {'Device'}"
+    )
+    print("-" * 110)
+    for j in jobs:
+        print(
+            f"{j.get('display_name', j['job_id']):<24} {j['job_id']:<36} "
+            f"{j['status']:<12} {j.get('calc_type', ''):<6} "
+            f"{j.get('formula', ''):<12} {j.get('device', '')}"
+        )
+    return 0
+
+
+def cmd_kill(args: argparse.Namespace) -> int:
+    """Kill a background job."""
+    from mliport.jobs import JobManager  # noqa: PLC0415
+
+    mgr = JobManager()
+    ok = mgr.kill_job(args.job_id)
+    if ok:
+        print(f"Killed: {args.job_id}")
+        return 0
+    else:
+        print(f"Failed to kill: {args.job_id}")
+        return 1
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    """Remove completed/failed job records (never active jobs or results)."""
+    from mliport.jobs import JobManager  # noqa: PLC0415
+
+    mgr = JobManager()
+    dry_run = bool(getattr(args, "dry_run", False))
+    removed = mgr.clean(dry_run=dry_run)
+    if dry_run:
+        print(f"Would remove {len(removed)} completed/failed job records.")
+    elif removed:
+        print(f"Removed {len(removed)} completed/failed job records.")
+    else:
+        print("No completed/failed jobs to clean.")
+    return 0
+
+
+def cmd_state(args: argparse.Namespace) -> int:
+    """Inspect or migrate persistent user state."""
+    from mliport.jobs import (  # noqa: PLC0415
+        legacy_state_hint,
+        migrate_legacy_state,
+        state_paths,
+    )
+
+    if args.state_command == "path":
+        paths = state_paths()
+        print(f"State root: {paths['state_root']}")
+        print(f"Job state: {paths['jobs_dir']}")
+        legacy = paths["legacy_jobs_dir"]
+        print(f"Legacy job state: {legacy}")
+        hint = legacy_state_hint()
+        if hint:
+            print(hint)
+        return 0
+    if args.state_command == "migrate":
+        report = migrate_legacy_state(dry_run=bool(getattr(args, "dry_run", False)))
+        action = "Would import" if report["dry_run"] else "Imported"
+        print(f"{action} {len(report['imported'])} legacy job record(s).")
+        for skip in report["skipped"]:
+            print(f"Skipped {skip['file']}: {skip['reason']}")
+        print(f"Legacy records stay in {report['source']} (read-only).")
+        return 0
+    print(f"Unknown state command: {args.state_command}", file=sys.stderr)
+    return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Main entry point: Ctrl-C anywhere resolves to exit code 130."""
+    # mliport numbers GPUs like nvidia-smi (PCI bus order). CUDA defaults to
+    # FASTEST_FIRST, which renumbers devices on mixed-GPU nodes, so --device
+    # cuda:N and numeric CUDA_VISIBLE_DEVICES entries would name a different
+    # physical GPU. Set before any framework initializes CUDA; an explicit
+    # user choice is respected.
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.", file=sys.stderr)
+        return EXIT_CANCELLED
+
+
+def _main(argv: list[str] | None = None) -> int:
+    run_started_at = time.perf_counter()
+    # Check if running in TUI mode (no command, or explicit 'tui' command)
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # If no arguments provided, launch TUI by default
+    if len(argv) == 0:
+        try:
+            from mliport.tui import MliportApp  # noqa: PLC0415
+
+            print("Launching interactive TUI mode...")
+            print("(Use --help for command-line interface)")
+            time.sleep(0.5)
+            app = MliportApp()
+            return app.run()
+        except ImportError:
+            # Fall back to CLI help if textual not installed
+            pass
+
+    parser = create_parser()
+    args = parser.parse_args(argv)
+    args._run_started_at = run_started_at
+
+    # Handle TUI command
+    if args.command == "tui":
+        return cmd_tui(args)
+
+    if args.command is None:
+        parser.print_help()
+        return 1
+
+    # --json output must be clean (no banner) for scripting. The `config`
+    # subcommands also produce machine/script-oriented output, so suppress the
+    # banner for them too.
+    suppress_banner = (
+        (args.command == "setup" and getattr(args, "json", False))
+        or (args.command == "doctor" and getattr(args, "json", False))
+        or args.command in {"config", "analyze", "state"}
+    )
+    if not suppress_banner:
+        print_header()
+
+    # Dispatch to appropriate command handler
+    commands = {
+        "run": cmd_run,
+        "sp": cmd_sp,
+        "opt": cmd_opt,
+        "md": cmd_md,
+        "neb": cmd_neb,
+        "confsearch": cmd_confsearch,
+        "batch": cmd_batch,
+        "config": cmd_config,
+        "template": cmd_template,
+        "doctor": cmd_doctor,
+        "setup": cmd_setup,
+        "convert-xdatcar": cmd_convert_xdatcar,
+        "analyze": cmd_analyze,
+        "queue": cmd_queue,
+        "jobs": cmd_jobs,
+        "kill": cmd_kill,
+        "clean": cmd_clean,
+        "state": cmd_state,
+    }
+
+    handler = commands.get(args.command)
+    if handler is None:
+        print(f"Error: Unknown command: {args.command}")
+        return 1
+
+    try:
+        return handler(args)
+    except ValueError as exc:
+        # Configuration/argument errors (including the fail-closed
+        # "no MLIP backend was selected") are user-facing, never a traceback.
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

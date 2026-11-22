@@ -1,0 +1,73 @@
+# Production Restart and Extension
+
+Use this page only when a production run is being extended, retried, or
+debugged. Normal first-time production runs can stay in `SKILL.md` and the
+solvent-specific guidance page.
+
+## Recommended Extension Path
+
+Create a new `prod` node with `--continue-from`:
+
+```bash
+mdclaw create_node --job-dir <job_dir> --node-type prod \
+  --continue-from <completed_prod_node_id> \
+  --label "+50ns" \
+  --conditions '{"simulation_time_ns": 50}'
+
+mdclaw --job-dir <job_dir> --node-id <extension_prod_node_id> run_production \
+  --simulation-time-ns 50.0 --platform CUDA
+```
+
+`--simulation-time-ns` is the additional time to run in the new node. Each
+prod node writes its own `trajectory.dcd`; concatenate through `md-analyze`
+when a continuous trajectory is required.
+
+## Restart Resolution
+
+The Python resolver in `mdclaw/_node.py` is authoritative:
+
+- `--continue-from <completed_prod_node_id>` restarts from exactly that prod node. It prefers
+  `state.xml` and falls back to `checkpoint.chk` only for same-GPU
+  bit-exact replays (committor / sensitivity analyses). If neither artifact
+  exists, the run fails instead of silently choosing another ancestor.
+- Plain `--parent-node-ids <prod_node_id>` walks prod ancestors and then falls back to
+  the eq ancestor. Use it only when the exact restart source does not matter.
+- Fresh `eq -> prod` runs restart from the eq state. The eq state is written
+  with `final_step=0`, so the requested production time remains the full first
+  production length.
+- The temperature follows the restart source when `--temperature-kelvin` is
+  omitted (rule: `SKILL.md` Prerequisites); the extension above needs no
+  temperature flag.
+- Integrator settings may differ from the eq state on a fresh `eq -> prod`
+  XML restart: a different timestep (an equilibration that ran at 2 fs after
+  a NaN retry, production at 4 fs with HMR), temperature or friction is
+  reported in `warnings` and `restart_integrator_changes`, not refused. A
+  `prod -> prod` continuation keeps its parent's temperature and timestep
+  (temperature rule: `SKILL.md` Prerequisites). A `checkpoint.chk` restart
+  must match exactly (`Restart integrator signature mismatch`), and a
+  different integrator kind is always refused.
+
+`state.xml` is portable across nodes and GPU models — it is the
+preferred restart vehicle in every case. `checkpoint.chk` is kept on
+disk for bit-identical reproduction (binary OpenMM checkpoints are
+platform-specific). Topology artifacts are XML-only: every restart
+reads the same `system.xml` + `topology.pdb` + `state.xml` triple from
+the topo ancestor.
+
+Biased production changes the live System and therefore requires the portable
+XML state; binary checkpoint restart fails with
+`production_bias_checkpoint_unsupported`. Extend a biased production only with
+`--continue-from`: the distance-restraint declaration, or the custom-force
+script and parameters, is then inherited unless explicitly overridden.
+
+## Switching Ensembles Across Nodes
+
+`state.xml` is loaded via `XmlSerializer.deserialize` and only
+positions / velocities / periodic box are transferred. Barostat
+parameters in the saved state are dropped when the new prod context has
+no barostat, and a new barostat in the new context starts in its
+default state. This means an NPT-equilibrated state can resume directly
+into an NVT prod (and vice versa) without rebuilding the topology — just
+set `--pressure-bar 0` (NVT) or `--pressure-bar 1.0` (NPT) on the new
+node. A short volume re-equilibration is expected when starting NPT
+from an NVT state.

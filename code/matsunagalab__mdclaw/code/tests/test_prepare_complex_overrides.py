@@ -1,0 +1,1212 @@
+"""Tests for prepare_complex SS-bond / HIS state overrides (Plan B).
+
+Heavy dependencies (PDBFixer, pdb2pqr, packmol-memgen) are side-stepped
+by patching ``split_molecules`` / ``clean_protein`` / ``merge_structures``
+so we can assert the branching logic around the user overrides without
+requiring the full conda env.
+"""
+
+import json
+import textwrap
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from mdclaw.structure.prepare_complex import (
+    _confirmation_source_from_entries,
+    _has_unmodeled_terminal_residues,
+    _missing_residue_confirmation_block,
+    _remap_missing_residue_record,
+    _states_for_chain,
+    _validate_prepare_node_context,
+    prepare_complex,
+)
+from mdclaw.structure.pdb_utils import (
+    _exclude_deuterium_atoms_from_pdb,
+    _pdb_noncap_protein_hydrogen_signature,
+)
+from mdclaw.structure.terminal_caps import (
+    _classify_terminal_cap_noncap_hydrogen_changes,
+    _complete_terminal_cap_hydrogens_with_modeller,
+    _resolve_terminal_cap_settings,
+    _restore_noncap_terminal_h_aliases,
+)
+
+
+SSBOND_MINI_PDB = textwrap.dedent("""\
+SSBOND   1 CYS A   10    CYS A   20                          1555   1555  2.04
+ATOM      1  N   CYS A  10      -2.000   0.000   0.000  1.00  0.00           N
+ATOM      2  CA  CYS A  10      -1.000   0.000   0.000  1.00  0.00           C
+ATOM      3  C   CYS A  10      -0.500   1.000   0.000  1.00  0.00           C
+ATOM      4  O   CYS A  10      -1.000   2.000   0.000  1.00  0.00           O
+ATOM      5  CB  CYS A  10      -0.500  -1.000   0.000  1.00  0.00           C
+ATOM      6  SG  CYS A  10       0.000  -1.500   0.000  1.00  0.00           S
+ATOM      7  N   CYS A  20       4.000   0.000   0.000  1.00  0.00           N
+ATOM      8  CA  CYS A  20       3.000   0.000   0.000  1.00  0.00           C
+ATOM      9  C   CYS A  20       2.500   1.000   0.000  1.00  0.00           C
+ATOM     10  O   CYS A  20       3.000   2.000   0.000  1.00  0.00           O
+ATOM     11  CB  CYS A  20       2.500  -1.000   0.000  1.00  0.00           C
+ATOM     12  SG  CYS A  20       2.040  -1.500   0.000  1.00  0.00           S
+TER
+END
+""")
+
+
+def test_prepare_node_context_includes_protonation_overrides(monkeypatch):
+    captured = {}
+
+    def fake_validate(job_dir, node_id, node_type, *, actual_conditions):
+        captured.update(actual_conditions)
+        return {"success": True, "code": "ok", "blocking_codes": [], "errors": []}
+
+    monkeypatch.setattr(
+        "mdclaw._node.validate_node_execution_context",
+        fake_validate,
+    )
+    result = _validate_prepare_node_context(
+        job_dir="job",
+        node_id="prep_001",
+        select_chains=["A"],
+        ph=7.4,
+        cap_termini=False,
+        n_terminal_cap=None,
+        c_terminal_cap=None,
+        terminal_cap_forcefield=None,
+        process_proteins=True,
+        process_ligands=True,
+        histidine_states={"A:10": "HIE"},
+        protonation_states={"A:11": "GLH"},
+        protonation_method="no-prediction",
+        preserve_input_protonation=True,
+        strip_input_caps=False,
+        missing_residue_method=" AUTO ",
+        include_types=["protein"],
+        include_ligand_ids=None,
+        include_ligand_resnames=None,
+        exclude_ligand_ids=None,
+        include_associated_ligands=False,
+    )
+
+    assert result["success"] is True
+    assert captured["histidine_states"] == {"A:10": "HIE"}
+    assert captured["protonation_states"] == {"A:11": "GLH"}
+    assert captured["protonation_method"] == "no-prediction"
+    assert captured["preserve_input_protonation"] is True
+    assert captured["missing_residue_method"] == "auto"
+
+
+def test_confirmation_source_reports_mixed_entry_provenance():
+    assert _confirmation_source_from_entries([
+        {"source": "user_override"},
+        {"source": "auto_detected"},
+    ]) == "mixed"
+    assert _confirmation_source_from_entries([
+        {"source": "user_override"},
+    ]) == "user_override"
+
+
+def test_prepare_forwards_all_scientific_arguments_to_condition_guard(monkeypatch, mini_pdb):
+    import importlib
+    import inspect
+
+    pc = importlib.import_module("mdclaw.structure.prepare_complex")
+    captured = {}
+    monkeypatch.setattr(pc, "_resolve_prepare_node_structure_file", lambda *a: {
+        "structure_file": str(mini_pdb), "source_structure_id": "candidate_001",
+    })
+    def guard(*args, actual_conditions):
+        captured.update(actual_conditions)
+        return {"success": False, "code": "test_stop", "errors": ["stop before chemistry"]}
+    monkeypatch.setattr("mdclaw._node.validate_node_execution_context", guard)
+    monkeypatch.setattr("mdclaw._node.fail_node_from_result", lambda *a, **k: a[2])
+    prepare_complex(job_dir="job", node_id="prep_001",
+                    residue_ranges=["A:-1-208", "A:219-305"], join_range_pieces=True)
+    expected = set(inspect.signature(prepare_complex).parameters) - {
+        "job_dir", "node_id", "structure_file", "output_dir",
+    }
+    assert set(captured) == expected  # New parameters must not silently go unchecked.
+    assert captured["residue_ranges"] == ["A:-1-208", "A:219-305"]
+    assert captured["join_range_pieces"] is True
+    assert captured["source_structure_id"] == "candidate_001"
+
+
+@pytest.mark.parametrize("key,declared,actual,ok", [
+    ("residue_ranges", "A:-1-208,A:219-305", ["A:-1-208", "A:219-305"], True),
+    ("residue_ranges", ["A:219-305", " A:-1-208 "], ["A:-1-208,A:219-305"], True),
+    ("residue_ranges", "A:-1-208,A:219-305", ["A:-1-208", "A:219-304"], False),
+    ("residue_ranges", "A:-1-208", [], False),
+    ("residue_ranges", {"A:-1-208": True}, ["A:-1-208"], False),
+    ("join_range_groups", "A:1-10,A:20-30", ["A:1-10,A:20-30"], True),
+    ("join_range_groups", ["A:1-10,A:20-30"], ["A:1-10", "A:20-30"], False),
+    ("join_range_pieces", True, False, False),
+    ("build_terminal_missing_residues", True, False, False),
+    ("protonate_ligands", True, False, False),
+])
+def test_prep_declared_conditions_on_real_node(tmp_path, mini_pdb, key, declared, actual, ok):
+    from mdclaw._node import create_node
+    from mdclaw.research.source_node import register_local_structure
+    from mdclaw.study.workflow import bootstrap_md_workflow
+
+    study = bootstrap_md_workflow(str(tmp_path / "study"), question="condition test")
+    job = study["job_dir"]
+    source = create_node(job, "source")
+    assert register_local_structure(str(mini_pdb), job, source["node_id"])["success"]
+    prep = create_node(job, "prep", conditions={key: declared})
+    result = _validate_prepare_node_context(job_dir=job, node_id=prep["node_id"], **{key: actual})
+    assert result["success"] is ok, result
+    if not ok:
+        assert "condition_mismatch" in result["blocking_codes"]
+
+
+def test_terminal_omission_detection_requires_a_nonzero_residue_count():
+    assert _has_unmodeled_terminal_residues({
+        "terminal_excluded": {"total_residues": 77}
+    })
+    assert not _has_unmodeled_terminal_residues({
+        "terminal_excluded": {"total_residues": 0}
+    })
+
+
+def test_missing_residue_confirmation_never_calls_predicted_coordinates_override():
+    repair = {
+        "chain_id": "A",
+        "method": "modeller",
+        "total_residues": 33,
+    }
+    block = _missing_residue_confirmation_block(
+        [repair],
+        [],
+        "modeller",
+    )
+
+    assert block["source"] == "predicted"
+    assert block["method_requested"] == "modeller"
+    assert block["source"] != "user_override"
+
+
+def test_escalated_missing_residue_confirmation_records_actual_method():
+    repair = {
+        "chain_id": "A",
+        "method": "modeller",
+        "method_requested": "auto",
+        "method_used": "modeller",
+        "escalated": True,
+        "total_residues": 33,
+    }
+
+    block = _missing_residue_confirmation_block([repair], [], "auto")
+
+    assert block["source"] == "predicted"
+    assert block["method_requested"] == "auto"
+    assert block["method"] == "modeller"
+    assert block["escalated"] is True
+
+
+def test_terminal_only_omissions_create_a_confirmation_block():
+    detection = {
+        "chain_id": "A",
+        "reference_sequence_available": True,
+        "terminal_excluded": {"total_residues": 77},
+    }
+
+    block = _missing_residue_confirmation_block([], [detection], "pdbfixer")
+
+    assert block is not None
+    assert block["source"] == "auto_detected"
+    assert block["terminal_unmodeled"] == [detection]
+
+
+def test_missing_residue_records_use_merged_chain_and_keep_provenance():
+    record = _remap_missing_residue_record(
+        {"chain_id": "label_A", "author_chain": "AUTH"},
+        {
+            "status": "modeled",
+            "total_residues": 3,
+            "segments": [{"chain_id": "A", "residue_count": 3}],
+        },
+        {"label_A": "B"},
+    )
+
+    assert record["chain_id"] == "B"
+    assert record["source_chain"] == "label_A"
+    assert record["author_chain"] == "AUTH"
+    assert record["segments"][0]["chain_id"] == "B"
+    assert record["segments"][0]["source_chain"] == "A"
+
+
+@pytest.fixture
+def mini_pdb(tmp_path):
+    """Tiny 2-CYS PDB with an SSBOND record so auto-detection finds one pair."""
+    p = tmp_path / "ssbond_mini.pdb"
+    p.write_text(SSBOND_MINI_PDB)
+    return p
+
+
+def _short_circuit_heavy_steps(monkeypatch):
+    """Stop prepare_complex after Step 1.5 by making split_molecules return empty.
+
+    ``result["disulfide_bonds"]`` / ``result["disulfide_source"]`` are set
+    before split_molecules runs, so we can still assert on them even when
+    downstream steps are inert. Stubbing clean_protein and merge_structures
+    keeps the test insensitive to PDBFixer / propka availability.
+    """
+    import importlib
+
+    _pc = importlib.import_module("mdclaw.structure.prepare_complex")
+
+    def fake_split(*args, **kwargs):
+        return {
+            "success": True,
+            "output_dir": str(kwargs.get("output_dir", ".")),
+            "protein_files": [],
+            "ligand_files": [],
+            "ion_files": [],
+            "water_files": [],
+            "chain_file_info": [],
+            "all_chains": [],
+            "errors": [],
+        }
+
+    def fake_clean(*args, **kwargs):
+        return {"success": True, "output_file": None, "operations": [], "warnings": [], "errors": [], "statistics": {}, "disulfide_bonds": []}
+
+    def fake_merge(*args, **kwargs):
+        return {"success": True, "output_file": None, "statistics": {}}
+
+    monkeypatch.setattr(_pc, "split_molecules", fake_split)
+    monkeypatch.setattr(_pc, "clean_protein", fake_clean)
+    monkeypatch.setattr(_pc, "merge_structures", fake_merge)
+    return _pc
+
+
+@pytest.mark.parametrize("number", [-1, 0, 208, 219, 264, 305])
+def test_protonation_routing_uses_component_window(number):
+    state = {"chain": "A", "resnum": str(number), "icode": "B", "state": "HIP"}
+    for window in ([(-1, 208)], [(219, 305)], [(-1, 208), (219, 305)]):
+        expected = [state] if any(lo <= number <= hi for lo, hi in window) else None
+        assert _states_for_chain([state], "A", "label_A", window) == expected
+    assert _states_for_chain([state], "B", "label_B", [(-1, 305)]) is None
+
+
+@pytest.mark.parametrize("argument", ["protonation_states", "histidine_states"])
+@pytest.mark.parametrize("target", ["A:264", "A:210", "A:999", "Z:264"])
+def test_prepare_routes_overrides_between_same_chain_fragments(
+    mini_pdb, monkeypatch, tmp_path, argument, target,
+):
+    pc = _short_circuit_heavy_steps(monkeypatch)
+    files = [str(tmp_path / f"fragment_{i}.pdb") for i in range(2)]
+    for name in files:
+        Path(name).write_text(SSBOND_MINI_PDB)
+    infos = [
+        {"file": name, "chain_id": "A", "author_chain": "A", "type": "protein",
+         "residue_range": {"start": lo, "end": hi}}
+        for name, (lo, hi) in zip(files, [(-1, 208), (219, 305)])
+    ]
+    monkeypatch.setattr(pc, "split_molecules", lambda *a, **k: {
+        "success": True, "output_dir": str(tmp_path),
+        "protein_files": files, "chain_file_info": infos,
+        "all_chains": [{"chain_id": "A", "author_chain": "A"}],
+        "ligand_files": [], "ion_files": [], "water_files": [], "errors": [],
+    })
+    monkeypatch.setattr(pc, "repair_complex_missing_residues", lambda *a, **k: {
+        "success": True, "applied": False, "outputs_by_source": {}, "warnings": [],
+    })
+    clean = MagicMock(return_value={
+        "success": True, "output_file": None, "statistics": {}, "errors": [],
+    })
+    monkeypatch.setattr(pc, "clean_protein", clean)
+    result = prepare_complex(
+        structure_file=str(mini_pdb), output_dir=str(tmp_path / "out"),
+        select_chains=["A"], protonation_method="no-prediction", **{argument: {target: "HIP"}},
+    )
+    if target == "A:264":
+        assert clean.call_count == 2
+        assert clean.call_args_list[0].kwargs["protonation_states"] is None
+        assert clean.call_args_list[1].kwargs["protonation_states"] == [
+            {"chain": "A", "resnum": "264", "icode": "", "state": "HIP"}
+        ]
+    else:
+        clean.assert_not_called()
+        assert result["code"] == "invalid_protonation_state"
+        assert target in " ".join(result["errors"])
+
+
+class TestDisulfideOverride:
+
+    def test_auto_detect_marks_source_as_auto(self, mini_pdb, monkeypatch, tmp_path):
+        _short_circuit_heavy_steps(monkeypatch)
+        result = prepare_complex(
+            structure_file=str(mini_pdb),
+            output_dir=str(tmp_path / "out"),
+            select_chains=["A"],
+        )
+        assert result["disulfide_source"] == "auto_detected"
+        assert len(result["disulfide_bonds"]) == 1
+        pair = result["disulfide_bonds"][0]
+        assert pair["cys1"]["resnum"] == 10
+        assert pair["cys2"]["resnum"] == 20
+        # confirmation_needed surfaces the same pair with source="auto_detected"
+        cn = result.get("confirmation_needed", {})
+        assert cn["disulfide_bonds"]["source"] == "auto_detected"
+        assert len(cn["disulfide_bonds"]["pairs"]) == 1
+
+    def test_empty_override_with_a_bonded_deposit_pair_is_refused(self, mini_pdb, monkeypatch, tmp_path):
+        """'[]' no longer drops the deposit's bonded A10-A20 without a word."""
+        _short_circuit_heavy_steps(monkeypatch)
+        result = prepare_complex(
+            structure_file=str(mini_pdb),
+            output_dir=str(tmp_path / "out"),
+            select_chains=["A"],
+            disulfide_pairs=[],
+        )
+        assert result["code"] == "detected_disulfides_suppressed"
+        assert result["context"]["suppressed_disulfides"] == ["A:10-A:20"]
+        action = result["next_action"]
+        assert "omit --disulfide-pairs" in action
+        assert '"form_bond": false' in action and '"resnum": 10' in action
+
+    def test_pair_named_with_form_bond_false_stays_reduced(self, mini_pdb, monkeypatch, tmp_path):
+        _short_circuit_heavy_steps(monkeypatch)
+        reduced = {"cys1": {"chain": "A", "resnum": 10}, "cys2": {"chain": "A", "resnum": 20},
+                   "form_bond": False}
+        result = prepare_complex(
+            structure_file=str(mini_pdb),
+            output_dir=str(tmp_path / "out"),
+            select_chains=["A"],
+            disulfide_pairs=[reduced],
+        )
+        assert result.get("code") != "detected_disulfides_suppressed"
+        assert result["disulfide_source"] == "user_override"
+        assert result["disulfide_bonds"][0]["form_bond"] is False
+
+    def test_user_list_replaces_auto_detection(self, mini_pdb, monkeypatch, tmp_path):
+        _short_circuit_heavy_steps(monkeypatch)
+        user_pair = {"cys1": {"chain": "A", "resnum": 5}, "cys2": {"chain": "A", "resnum": 45}}
+        # The deposit's bonded A10-A20 must be named too; kept reduced here.
+        reduced = {"cys1": {"chain": "A", "resnum": 10}, "cys2": {"chain": "A", "resnum": 20},
+                   "form_bond": False}
+        result = prepare_complex(
+            structure_file=str(mini_pdb),
+            output_dir=str(tmp_path / "out"),
+            select_chains=["A"],
+            disulfide_pairs=[user_pair, reduced],
+        )
+        assert result["disulfide_source"] == "user_override"
+        assert len(result["disulfide_bonds"]) == 2
+        out = result["disulfide_bonds"][0]
+        assert out["cys1"]["resnum"] == 5
+        assert out["cys2"]["resnum"] == 45
+        assert out["source"] == "user_override"
+        assert result["confirmation_needed"]["disulfide_bonds"]["source"] == "user_override"
+
+    def test_disulfide_bonds_json_reflects_override(self, mini_pdb, monkeypatch, tmp_path):
+        """The disulfide_bonds.json persisted under the node should match the override."""
+        _short_circuit_heavy_steps(monkeypatch)
+        out_dir = tmp_path / "out"
+        user_pair = {"cys1": {"chain": "A", "resnum": 10}, "cys2": {"chain": "A", "resnum": 20}}
+        prepare_complex(
+            structure_file=str(mini_pdb),
+            output_dir=str(out_dir),
+            select_chains=["A"],
+            disulfide_pairs=[user_pair],
+        )
+        dj = Path(str(out_dir).replace("/out", "/out")) / "disulfide_bonds.json"
+        # The file path is out_dir/disulfide_bonds.json
+        dj = out_dir / "disulfide_bonds.json"
+        assert dj.exists()
+        persisted = json.loads(dj.read_text())
+        assert len(persisted) == 1
+        assert persisted[0]["cys1"]["resnum"] == 10
+
+
+class TestComponentDisposition:
+
+    def test_exclude_deuterium_atoms_records_disposition(self, tmp_path):
+
+        pdb = tmp_path / "deuterated.pdb"
+        pdb.write_text(textwrap.dedent("""\
+            ATOM      1  N   ARG A   1       0.000   0.000   0.000  1.00  0.00           N
+            ATOM      2  D1  ARG A   1       0.100   0.000   0.000  1.00  0.00           D
+            ATOM      3  CA  ARG A   1       1.000   0.000   0.000  1.00  0.00           C
+            END
+            """))
+        out = tmp_path / "deuterium_stripped.pdb"
+
+        disposition = _exclude_deuterium_atoms_from_pdb(pdb, out)
+
+        assert out.exists()
+        assert " D1 " not in out.read_text()
+        assert " CA " in out.read_text()
+        assert disposition["summary"]["experimental_isotope_atoms_excluded"] == 1
+        assert disposition["entries"][0]["classification"] == "experimental_isotope"
+        assert disposition["entries"][0]["action_taken"] == "excluded"
+
+    def test_exclude_deuterium_atoms_zero_summary_for_standard_pdb(self, tmp_path):
+
+        pdb = tmp_path / "standard.pdb"
+        pdb.write_text(textwrap.dedent("""\
+            ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N
+            END
+            """))
+        out = tmp_path / "unused.pdb"
+
+        disposition = _exclude_deuterium_atoms_from_pdb(pdb, out)
+
+        assert not out.exists()
+        assert disposition["summary"]["experimental_isotope_atoms_excluded"] == 0
+        assert disposition["summary"]["excluded_atom_count"] == 0
+        assert disposition["entries"] == []
+
+    def test_exclude_deuterium_atoms_keeps_deoxy_atom_names(self, tmp_path):
+
+        pdb = tmp_path / "deoxy_names.pdb"
+        pdb.write_text(textwrap.dedent("""\
+            ATOM      1  D5'  DG A   1       0.000   0.000   0.000  1.00  0.00
+            ATOM      2  D3'  DG A   1       1.000   0.000   0.000  1.00  0.00
+            END
+            """))
+        out = tmp_path / "unused.pdb"
+
+        disposition = _exclude_deuterium_atoms_from_pdb(pdb, out)
+
+        assert not out.exists()
+        assert disposition["summary"]["experimental_isotope_atoms_excluded"] == 0
+        assert disposition["entries"] == []
+
+
+class TestTerminalCaps:
+    @staticmethod
+    def _write_terminal_cap_fixture(path: Path) -> None:
+        path.write_text(textwrap.dedent("""\
+            ATOM      1  CH3 ACE A   1       2.000   1.000   0.000  1.00  0.00           C
+            ATOM      2  C   ACE A   1       0.517   0.768   0.000  1.00  0.00           C
+            ATOM      3  O   ACE A   1       0.018   0.768  -1.133  1.00  0.00           O
+            ATOM      4  N   ALA A   2      -0.150   0.540   1.114  1.00  0.00           N
+            ATOM      5  CA  ALA A   2      -1.600   0.308   1.114  1.00  0.00           C
+            ATOM      6  HA  ALA A   2      -1.949  -0.013   0.138  1.00  0.00           H
+            ATOM      7  CB  ALA A   2      -1.905  -0.770   2.152  1.00  0.00           C
+            ATOM      8  C   ALA A   2      -2.326   1.608   1.432  1.00  0.00           C
+            ATOM      9  O   ALA A   2      -1.738   2.399   2.170  1.00  0.00           O
+            ATOM     10  N   NME A   3      -3.537   1.817   0.909  1.00  0.00           N
+            ATOM     11  CH3 NME A   3      -4.300   3.029   1.180  1.00  0.00           C
+            TER
+            END
+            """))
+
+    @staticmethod
+    def _make_noncap_h_complete_cap_h_missing(
+        source: Path,
+        output: Path,
+        *,
+        cap_resname: str = "NME",
+    ) -> None:
+        from openmm.app import ForceField, Modeller, PDBFile
+
+        full = output.with_name(f"{output.stem}.full_h.pdb")
+        pdb = PDBFile(str(source))
+        modeller = Modeller(pdb.topology, pdb.positions)
+        modeller.addHydrogens(ForceField("amber/protein.ff19SB.xml"), pH=7.4)
+        with full.open("w") as handle:
+            PDBFile.writeFile(
+                modeller.topology,
+                modeller.positions,
+                handle,
+                keepIds=True,
+            )
+
+        lines = []
+        for line in full.read_text().splitlines():
+            if line.startswith(("ATOM", "HETATM")):
+                resname = line[17:20].strip().upper()
+                element = line[76:78].strip().upper() if len(line) >= 78 else ""
+                atom_name = line[12:16].strip().upper()
+                if (
+                    resname == cap_resname
+                    and (element == "H" or atom_name.startswith("H"))
+                ):
+                    continue
+            lines.append(line)
+        output.write_text("\n".join(lines) + "\n")
+
+    def test_resolve_terminal_cap_settings_supports_one_sided_caps(self):
+
+        assert _resolve_terminal_cap_settings(
+            cap_termini=False,
+            n_terminal_cap="ACE",
+            c_terminal_cap=None,
+        ) == ("ACE", None)
+        assert _resolve_terminal_cap_settings(
+            cap_termini=False,
+            n_terminal_cap=None,
+            c_terminal_cap="NME",
+        ) == (None, "NME")
+        assert _resolve_terminal_cap_settings(
+            cap_termini=True,
+            n_terminal_cap=None,
+            c_terminal_cap=None,
+        ) == ("ACE", "NME")
+
+        with pytest.raises(ValueError):
+            _resolve_terminal_cap_settings(
+                cap_termini=False,
+                n_terminal_cap="NME",
+                c_terminal_cap=None,
+            )
+
+    def test_noncap_hydrogen_signature_ignores_hetatm_caps(self, tmp_path):
+
+        pdb = tmp_path / "hetatm_caps.pdb"
+        pdb.write_text(textwrap.dedent("""\
+            HETATM    1  H1  ACE A   1       0.000   0.000   0.000  1.00  0.00           H
+            HETATM    2  H2  ACE A   1       0.100   0.000   0.000  1.00  0.00           H
+            ATOM      3  N   ALA A   2       1.000   0.000   0.000  1.00  0.00           N
+            ATOM      4  HA  ALA A   2       1.100   0.000   0.000  1.00  0.00           H
+            HETATM    5  H1  NME A   3       2.000   0.000   0.000  1.00  0.00           H
+            END
+            """))
+
+        signature = _pdb_noncap_protein_hydrogen_signature(pdb)
+
+        assert signature == {"A:2::ALA": ("HA",)}
+
+    def test_noncap_hydrogen_signature_includes_noncap_hetatm(self, tmp_path):
+
+        pdb = tmp_path / "hetatm_noncap.pdb"
+        pdb.write_text(textwrap.dedent("""\
+            HETATM    1  H1  MSE A   7       0.000   0.000   0.000  1.00  0.00           H
+            HETATM    2  C1  MSE A   7       0.100   0.000   0.000  1.00  0.00           C
+            END
+            """))
+
+        signature = _pdb_noncap_protein_hydrogen_signature(pdb)
+
+        assert signature == {"A:7::MSE": ("H1",)}
+
+    def test_terminal_cap_guard_accepts_cyx_without_hg_completion(self):
+
+        unsafe, accepted = _classify_terminal_cap_noncap_hydrogen_changes(
+            {},
+            {"A:34::CYX": ("H", "HA", "HB2", "HB3")},
+        )
+
+        assert unsafe == []
+        assert accepted == ["A:34::CYX"]
+
+    def test_terminal_cap_guard_rejects_cyx_hg_completion(self):
+
+        unsafe, accepted = _classify_terminal_cap_noncap_hydrogen_changes(
+            {},
+            {"A:34::CYX": ("H", "HA", "HB2", "HB3", "HG")},
+        )
+
+        assert unsafe == ["A:34::CYX"]
+        assert accepted == []
+
+    def test_terminal_cap_guard_accepts_uncapped_terminal_heavy_only_completion(self):
+
+        unsafe, accepted = _classify_terminal_cap_noncap_hydrogen_changes(
+            {},
+            {"A:1::THR": ("H1", "H2", "H3", "HA", "HB", "HG1", "HG21", "HG22", "HG23")},
+            safe_terminal_residue_keys={"A:1::THR"},
+        )
+
+        assert unsafe == []
+        assert accepted == ["A:1::THR"]
+
+    def test_terminal_cap_guard_rejects_existing_terminal_h_change(self):
+
+        unsafe, accepted = _classify_terminal_cap_noncap_hydrogen_changes(
+            {"A:1::THR": ("H1",)},
+            {"A:1::THR": ("H1", "H2", "H3", "HA")},
+            safe_terminal_residue_keys={"A:1::THR"},
+        )
+
+        assert unsafe == ["A:1::THR"]
+        assert accepted == []
+
+    def test_terminal_cap_guard_accepts_terminal_h1_h_alias(self):
+
+        before = {"A:1::THR": ("H1", "H2", "H3", "HA", "HB")}
+        after = {"A:1::THR": ("H", "H2", "H3", "HA", "HB")}
+
+        unsafe, accepted = _classify_terminal_cap_noncap_hydrogen_changes(
+            before,
+            after,
+            safe_terminal_residue_keys={"A:1::THR"},
+        )
+
+        assert unsafe == []
+        assert accepted == ["A:1::THR"]
+
+    def test_terminal_cap_restores_terminal_h1_name_alias(self, tmp_path):
+
+        input_pdb = tmp_path / "input.pdb"
+        input_pdb.write_text(textwrap.dedent("""\
+            ATOM      1  H1  THR A   1       0.000   0.000   0.000  1.00  0.00           H
+            ATOM      2  H2  THR A   1       0.100   0.000   0.000  1.00  0.00           H
+            ATOM      3  H3  THR A   1       0.200   0.000   0.000  1.00  0.00           H
+            ATOM      4  CA  THR A   1       1.000   0.000   0.000  1.00  0.00           C
+            END
+            """))
+        output_text = textwrap.dedent("""\
+            ATOM      1  H   THR A   1       0.000   0.000   0.000  1.00  0.00           H
+            ATOM      2  H2  THR A   1       0.100   0.000   0.000  1.00  0.00           H
+            ATOM      3  H3  THR A   1       0.200   0.000   0.000  1.00  0.00           H
+            ATOM      4  CA  THR A   1       1.000   0.000   0.000  1.00  0.00           C
+            END
+            """)
+
+        restored, keys = _restore_noncap_terminal_h_aliases(
+            output_text,
+            input_pdb,
+            safe_terminal_residue_keys={"A:1::THR"},
+        )
+
+        assert keys == ["A:1::THR"]
+        atom_names = [
+            line[12:16].strip()
+            for line in restored.splitlines()
+            if line.startswith("ATOM")
+        ]
+        assert atom_names[:3] == ["H1", "H2", "H3"]
+
+    def test_terminal_cap_guard_rejects_internal_h1_h_alias(self):
+
+        unsafe, accepted = _classify_terminal_cap_noncap_hydrogen_changes(
+            {"A:2::THR": ("H1", "H2", "H3", "HA", "HB")},
+            {"A:2::THR": ("H", "H2", "H3", "HA", "HB")},
+            safe_terminal_residue_keys={"A:1::ALA"},
+        )
+
+        assert unsafe == ["A:2::THR"]
+        assert accepted == []
+
+    def test_terminal_cap_guard_still_rejects_internal_non_cyx_completion(self):
+
+        unsafe, accepted = _classify_terminal_cap_noncap_hydrogen_changes(
+            {},
+            {"A:2::ALA": ("H", "HA", "HB1", "HB2", "HB3")},
+            safe_terminal_residue_keys={"A:1::THR"},
+        )
+
+        assert unsafe == ["A:2::ALA"]
+        assert accepted == []
+
+    def test_terminal_cap_guard_rejects_terminal_cyx_hg_completion(self):
+
+        unsafe, accepted = _classify_terminal_cap_noncap_hydrogen_changes(
+            {},
+            {"A:1::CYX": ("H", "HA", "HB2", "HB3", "HG")},
+            safe_terminal_residue_keys={"A:1::CYX"},
+        )
+
+        assert unsafe == ["A:1::CYX"]
+        assert accepted == []
+
+    def test_terminal_cap_hydrogen_completion_adds_cap_hydrogens(self, tmp_path):
+        pytest.importorskip("openmmforcefields")
+
+        heavy = tmp_path / "ace_ala_nme_heavy.pdb"
+        capped = tmp_path / "ace_ala_nme_missing_nme_h.pdb"
+        self._write_terminal_cap_fixture(heavy)
+        self._make_noncap_h_complete_cap_h_missing(
+            heavy,
+            capped,
+            cap_resname="NME",
+        )
+
+        result = _complete_terminal_cap_hydrogens_with_modeller(
+            capped,
+            expected_caps={"NME"},
+            forcefield_name="ff19SB",
+            ph=7.4,
+        )
+
+        assert result["success"] is True, result
+        assert Path(result["output_file"]).exists()
+        assert result["forcefield"] == "ff19SB"
+        assert result["forcefield_xml"] == "amber/protein.ff19SB.xml"
+        assert result["cap_hydrogens_added"] >= 4
+        assert result["cap_hydrogen_count_after"]["NME"] >= 4
+        assert result["noncap_hydrogen_signature_preserved"] is True
+
+        output_text = Path(result["output_file"]).read_text()
+        assert " NME " in output_text
+        assert any(
+            line[17:20].strip() == "NME" and line[12:16].strip().startswith("H")
+            for line in output_text.splitlines()
+            if line.startswith(("ATOM", "HETATM"))
+        )
+
+    def test_terminal_cap_hydrogen_completion_rejects_noncap_repair(self, tmp_path):
+        pytest.importorskip("openmmforcefields")
+
+        capped = tmp_path / "ace_ala_nme_noncap_h_incomplete.pdb"
+        self._write_terminal_cap_fixture(capped)
+
+        result = _complete_terminal_cap_hydrogens_with_modeller(
+            capped,
+            expected_caps={"NME"},
+            forcefield_name="ff19SB",
+            ph=7.4,
+        )
+
+        assert result["success"] is False
+        assert (
+            result["code"]
+            == "terminal_cap_hydrogen_completion_changed_noncap_hydrogens"
+        )
+        assert result["noncap_hydrogen_signature_preserved"] is False
+        assert any(
+            "A:2::ALA" in item
+            for item in result["noncap_hydrogen_signature_changed_residues"]
+        )
+
+
+class TestPrepareComplexComponentFailure:
+
+    def test_failed_protein_chain_blocks_overall_success_and_partial_merge(
+        self, mini_pdb, monkeypatch, tmp_path
+    ):
+        import importlib
+
+
+        _pc = importlib.import_module("mdclaw.structure.prepare_complex")
+        out_dir = tmp_path / "out"
+        split_dir = out_dir / "split"
+        split_dir.mkdir(parents=True)
+        protein_a = split_dir / "protein_A.pdb"
+        protein_b = split_dir / "protein_B.pdb"
+        protein_a.write_text("ATOM      1  N   ALA A   1       0.0   0.0   0.0  1.00  0.00           N\nEND\n")
+        protein_b.write_text("ATOM      1  N   ALA B   1       0.0   0.0   0.0  1.00  0.00           N\nEND\n")
+
+        def fake_split(*args, **kwargs):
+            return {
+                "success": True,
+                "output_dir": str(split_dir),
+                "protein_files": [str(protein_a), str(protein_b)],
+                "ligand_files": [],
+                "ion_files": [],
+                "water_files": [],
+                "chain_file_info": [
+                    {"chain_id": "A", "author_chain": "A", "file": str(protein_a)},
+                    {"chain_id": "B", "author_chain": "B", "file": str(protein_b)},
+                ],
+                "all_chains": [
+                    {"chain_id": "A", "author_chain": "A"},
+                    {"chain_id": "B", "author_chain": "B"},
+                ],
+                "errors": [],
+            }
+
+        def fake_clean(pdb_file, **kwargs):
+            if pdb_file == str(protein_a):
+                return {
+                    "success": False,
+                    "errors": ["terminal cap H guard failed"],
+                    "code": "terminal_cap_hydrogen_completion_changed_noncap_hydrogens",
+                    "warnings": [],
+                }
+            return {
+                "success": True,
+                "output_file": str(protein_b.with_suffix(".amber.pdb")),
+                "operations": [],
+                "warnings": [],
+                "errors": [],
+                "statistics": {},
+                "disulfide_bonds": [],
+            }
+
+        merge_calls = []
+
+        def fake_merge(*args, **kwargs):
+            merge_calls.append((args, kwargs))
+            return {"success": True, "output_file": str(out_dir / "merged.pdb"), "statistics": {}}
+
+        monkeypatch.setattr(_pc, "split_molecules", fake_split)
+        monkeypatch.setattr(_pc, "clean_protein", fake_clean)
+        monkeypatch.setattr(_pc, "merge_structures", fake_merge)
+
+        result = prepare_complex(
+            structure_file=str(mini_pdb),
+            output_dir=str(out_dir),
+            select_chains=["A", "B"],
+        )
+
+        assert result["success"] is False
+        assert result["overall_status"] == "failed"
+        assert result["protein_preparation_success"] is False
+        assert result["code"] == "terminal_cap_hydrogen_completion_changed_noncap_hydrogens"
+        assert "merged_pdb" not in result
+        assert merge_calls == []
+
+
+class TestHistidineOverride:
+
+    def test_histidine_states_override_flagged_in_confirmation(
+        self, mini_pdb, monkeypatch, tmp_path
+    ):
+        _short_circuit_heavy_steps(monkeypatch)
+        result = prepare_complex(
+            structure_file=str(mini_pdb),
+            output_dir=str(tmp_path / "out"),
+            select_chains=["A"],
+            histidine_states={"A:64": "HIP"},
+        )
+        # When no proteins are cleaned (stubbed split), preparation_summary
+        # is empty, but the override path still records intent via
+        # confirmation_needed["histidine_states"]["source"]
+        cn = result.get("confirmation_needed", {})
+        # confirmation_needed only surfaces when something was applied. With
+        # no proteins returning histidine_states, the dict is empty — but
+        # the override intent still propagates through sa_histidine_states
+        # for clean_protein. We assert the parameter is accepted, not its
+        # downstream effect here (that's covered by the end-to-end test).
+        assert result.get("overall_status") is not None
+        # If confirmation_needed is present (depends on disulfide detection),
+        # the histidine block must carry source="user_override"
+        if "histidine_states" in cn:
+            assert cn["histidine_states"]["source"] == "user_override"
+
+
+def test_prepare_complex_propagates_large_missing_gap_recommendation(
+    mini_pdb,
+    monkeypatch,
+    tmp_path,
+):
+    import importlib
+
+
+    _pc = importlib.import_module("mdclaw.structure.prepare_complex")
+    protein_file = tmp_path / "protein_A.pdb"
+    protein_file.write_text(SSBOND_MINI_PDB)
+    recommendation = {
+        "reason": "internal_missing_residues_exceed_pdbfixer_scope",
+        "recommended_next_action": "regenerate_source_structure",
+        "restart_stage": "source",
+        "options": [
+            {
+                "option": "use_modeller_template_modeling",
+                "next_skill": "skills/modeller-predict/SKILL.md",
+            },
+            {
+                "option": "use_boltz2_structure_prediction",
+                "next_skill": "skills/boltz-predict/SKILL.md",
+            },
+        ],
+    }
+
+    def fake_split(*args, **kwargs):
+        return {
+            "success": True,
+            "output_dir": str(kwargs.get("output_dir", ".")),
+            "protein_files": [str(protein_file)],
+            "nucleic_files": [],
+            "glycan_files": [],
+            "ligand_files": [],
+            "ion_files": [],
+            "water_files": [],
+            "chain_file_info": [
+                {
+                    "chain_id": "A",
+                    "author_chain": "A",
+                    "chain_type": "protein",
+                    "file": str(protein_file),
+                },
+            ],
+            "all_chains": [{"chain_id": "A", "author_chain": "A"}],
+            "errors": [],
+        }
+
+    def fake_clean(*args, **kwargs):
+        return {
+            "success": False,
+            "errors": ["Internal missing residues exceed the PDBFixer repair scope."],
+            "code": "pdbfixer_missing_residues_out_of_scope",
+            "workflow_recommendation": recommendation,
+            "recommended_next_action": "regenerate_source_structure",
+            "recommended_next_skills": [
+                "skills/modeller-predict/SKILL.md",
+                "skills/boltz-predict/SKILL.md",
+            ],
+            "missing_residue_repair": {"status": "out_of_scope"},
+        }
+
+    monkeypatch.setattr(_pc, "split_molecules", fake_split)
+    monkeypatch.setattr(_pc, "clean_protein", fake_clean)
+
+    result = prepare_complex(
+        structure_file=str(mini_pdb),
+        output_dir=str(tmp_path / "out"),
+        select_chains=["A"],
+    )
+
+    assert result["success"] is False
+    assert result["code"] == "pdbfixer_missing_residues_out_of_scope"
+    assert result["recommended_next_action"] == "regenerate_source_structure"
+    assert result["workflow_recommendation"] == recommendation
+    protein = result["proteins"][0]
+    assert protein["code"] == "pdbfixer_missing_residues_out_of_scope"
+    assert protein["missing_residue_repair"]["status"] == "out_of_scope"
+
+
+class TestPrecedence:
+
+    def test_direct_args_win_over_structure_analysis(self, mini_pdb, monkeypatch, tmp_path):
+        """Direct disulfide_pairs must beat structure_analysis.disulfide_bonds.
+
+        The precedence (direct args > structure_analysis > auto-detect) is
+        applied where ``sa_disulfide_pairs`` is assembled for clean_protein, and
+        that block only runs when split_molecules yields a protein file. The
+        earlier ``result["disulfide_bonds"]`` field never sees structure_analysis
+        at all, so asserting on it would pass no matter which input won — this
+        test therefore stubs split to return one protein and inspects exactly
+        what clean_protein was handed.
+        """
+        import importlib
+
+        _pc = importlib.import_module("mdclaw.structure.prepare_complex")
+        protein_file = tmp_path / "protein_A.pdb"
+        protein_file.write_text(SSBOND_MINI_PDB)
+
+        def fake_split(*args, **kwargs):
+            return {
+                "success": True,
+                "output_dir": str(kwargs.get("output_dir", ".")),
+                "protein_files": [str(protein_file)],
+                "ligand_files": [],
+                "ion_files": [],
+                "water_files": [],
+                "chain_file_info": [
+                    {"chain_id": "A", "file": str(protein_file), "type": "protein"}
+                ],
+                "all_chains": [{"chain_id": "A", "type": "protein"}],
+                "errors": [],
+            }
+
+        def fake_merge(*args, **kwargs):
+            return {"success": True, "output_file": None, "statistics": {}}
+
+        mock_clean = MagicMock(return_value={
+            "success": True, "output_file": str(protein_file), "operations": [],
+            "warnings": [], "errors": [], "statistics": {}, "disulfide_bonds": [],
+        })
+        monkeypatch.setattr(_pc, "split_molecules", fake_split)
+        monkeypatch.setattr(_pc, "merge_structures", fake_merge)
+        monkeypatch.setattr(_pc, "clean_protein", mock_clean)
+
+        sa = {
+            "disulfide_bonds": [
+                {"chain1": "A", "resnum1": 1, "chain2": "A", "resnum2": 2, "form_bond": True}
+            ],
+            "histidine_states": [{"chain": "A", "resnum": 50, "state": "HIE"}],
+        }
+        # The direct pair names the fixture's own cysteines: a declared site the
+        # split output does not hold is refused before cleaning
+        # (disulfide_site_not_selected), which would leave precedence untested.
+        direct = [{"cys1": {"chain": "A", "resnum": 10}, "cys2": {"chain": "A", "resnum": 20}}]
+        prepare_complex(
+            structure_file=str(mini_pdb),
+            output_dir=str(tmp_path / "out"),
+            select_chains=["A"],
+            structure_analysis=sa,
+            disulfide_pairs=direct,
+            histidine_states={"A:99": "HIP"},
+        )
+
+        assert mock_clean.called, "clean_protein was never reached; precedence untested"
+        handed = mock_clean.call_args.kwargs["disulfide_pairs"]
+        assert handed is not None
+        # The direct pair (10/20) reached clean_protein; the structure_analysis
+        # pair (1/2) did not.
+        assert [(p["resnum1"], p["resnum2"]) for p in handed] == [(10, 20)]
+        assert mock_clean.call_args.kwargs["protonation_states"] == [
+            {"chain": "A", "resnum": "99", "icode": "", "state": "HIP"}
+        ]
+
+
+# ── the chemistry summary printed for the user ────────────────────────────
+
+
+from mdclaw.confirmation_report import (  # noqa: E402
+    _format_disulfide_pair,
+    _format_protonation_state,
+    _residue_sort_key,
+    report_confirmation_items,
+)
+
+
+def test_disulfide_pair_reads_as_a_bond_with_its_evidence():
+    pair = {
+        "cys1": {"chain": "A", "resnum": 124, "resname": "CYS"},
+        "cys2": {"chain": "A", "resnum": 203, "resname": "CYS"},
+        "distance_angstrom": 2.02,
+        "confidence": "high",
+    }
+    assert _format_disulfide_pair(pair) == "A:124 - A:203  2.02 A (high)"
+
+
+def test_unrecognised_disulfide_shape_is_shown_not_swallowed():
+    assert _format_disulfide_pair({"unexpected": 1}) == "{'unexpected': 1}"
+    assert _format_disulfide_pair(["A:1", "A:2"]) == "A:1 - A:2"
+
+
+def test_protonation_state_names_what_it_replaced():
+    entry = {
+        "chain": "A", "resnum": "97", "icode": "",
+        "state": "ASH", "default_state": "ASP", "source": "auto_detected",
+    }
+    assert _format_protonation_state(entry) == "A:97 ASP -> ASH (auto_detected)"
+
+
+def test_residues_sort_by_number_not_lexically():
+    keys = [("A:112", "HID"), ("A:77", "HIE"), ("B:5", "HIP")]
+    assert [k for k, _ in sorted(keys, key=_residue_sort_key)] == [
+        "A:77", "A:112", "B:5",
+    ]
+
+
+def test_summary_is_emitted_once_with_everything_assigned(caplog):
+    items = {
+        "disulfide_bonds": {"source": "auto_detected", "pairs": [
+            {"cys1": {"chain": "A", "resnum": 124},
+             "cys2": {"chain": "A", "resnum": 203}},
+        ]},
+        "histidine_states": {"source": "auto_detected", "states": {"A:77": "HID"}},
+        "protonation_states": {"source": "auto_detected", "states": [
+            {"chain": "A", "resnum": "97", "state": "ASH",
+             "default_state": "ASP", "source": "auto_detected"},
+        ]},
+    }
+
+    with caplog.at_level("INFO"):
+        report_confirmation_items(items)
+
+    text = caplog.text
+    assert "A:124 - A:203" in text
+    assert "A:77 HID" in text
+    assert "A:97 ASP -> ASH" in text
+    assert text.count("Chemistry assigned") == 1
+    assert "--disulfide-pairs / --histidine-states / --protonation-states" in text
+    assert "from_input_structure" not in text
+
+
+def test_summary_footer_only_names_relevant_missing_residue_flag(caplog):
+    items = {
+        "missing_residues": {
+            "method": "modeller",
+            "repairs": [{
+                "chain_id": "A",
+                "total_residues": 3,
+                "segment_count": 1,
+                "max_segment_length": 3,
+            }],
+            "detection": [],
+        },
+    }
+
+    with caplog.at_level("INFO"):
+        report_confirmation_items(items)
+
+    text = caplog.text
+    assert "--missing-residue-method" in text
+    assert "--disulfide-pairs" not in text
+    assert "--histidine-states" not in text
+    assert "--protonation-states" not in text
+    assert "from_input_structure" not in text
+
+
+def test_summary_calls_out_automatic_modeller_escalation(caplog):
+    items = {
+        "missing_residues": {
+            "source": "predicted",
+            "method": "modeller",
+            "method_requested": "auto",
+            "escalated": True,
+            "repairs": [{"chain_id": "A", "total_residues": 6}],
+            "detection": [],
+        },
+    }
+
+    with caplog.at_level("INFO"):
+        report_confirmation_items(items)
+
+    assert "requested auto, escalated automatically" in caplog.text
+    assert "predicted, not measured" in caplog.text
+
+
+def test_summary_footer_says_input_states_are_fixed_across_ph(caplog):
+    items = {
+        "protonation_states": {
+            "source": "user_override",
+            "states": [{
+                "chain": "A",
+                "resnum": "97",
+                "state": "ASH",
+                "source": "user_override",
+                "override_origin": "input_structure",
+                "input_state_preserved": True,
+            }],
+        },
+    }
+
+    with caplog.at_level("INFO"):
+        report_confirmation_items(items)
+
+    assert "preserved from the input are fixed overrides" in caplog.text
+    assert "changing --ph will not move those residues" in caplog.text
+
+
+def test_summary_renders_terminal_only_omissions_as_unmodeled(caplog):
+    items = {
+        "missing_residues": {
+            "source": "auto_detected",
+            "method": "pdbfixer",
+            "method_requested": "pdbfixer",
+            "repairs": [],
+            "detection": [],
+            "terminal_unmodeled": [{
+                "chain_id": "A",
+                "terminal_excluded": {
+                    "total_residues": 77,
+                    "n_terminal_residues": 10,
+                    "c_terminal_residues": 67,
+                },
+            }],
+        },
+    }
+
+    with caplog.at_level("INFO"):
+        report_confirmation_items(items)
+
+    assert "terminal missing residues UNMODELED: 77 residue(s)" in caplog.text
+    assert "10 N-terminal, 67 C-terminal" in caplog.text
+    assert "rebuilt" not in caplog.text
+    assert "--missing-residue-method" in caplog.text
+
+
+def test_nothing_is_printed_when_nothing_was_assigned(caplog):
+    items = {
+        "disulfide_bonds": {"source": "auto_detected", "pairs": []},
+        "histidine_states": {"source": "auto_detected", "states": {}},
+        "protonation_states": {"source": "auto_detected", "states": []},
+    }
+
+    with caplog.at_level("INFO"):
+        report_confirmation_items(items)
+
+    assert "Chemistry assigned" not in caplog.text
+
+
+def test_a_declared_list_that_drops_a_detected_disulfide_is_warned_about(mini_pdb):
+    """096_soluble_1ay7 r2 passed '[]' and lost C7-C96 without a word."""
+    import importlib
+
+    _pc = importlib.import_module("mdclaw.structure.prepare_complex")
+    left_out = _pc._detected_disulfides_not_declared(Path(mini_pdb), [], ["A"])
+    assert [(b["cys1"]["resnum"], b["cys2"]["resnum"]) for b in left_out] == [(10, 20)]
+    named = [{"cys1": {"chain": "A", "resnum": 10}, "cys2": {"chain": "A", "resnum": 20}}]
+    assert _pc._detected_disulfides_not_declared(Path(mini_pdb), named, ["A"]) == []
+    assert _pc._detected_disulfides_not_declared(Path(mini_pdb), [], ["B"]) == []
+

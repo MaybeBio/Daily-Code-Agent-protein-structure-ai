@@ -1,0 +1,140 @@
+---
+name: md-analyze
+description: "Molecular dynamics trajectory analysis using MDClaw CLI tools. Routes concat, metric, and troubleshooting workflows through focused guidance pages."
+---
+
+# MD Analyze
+
+For display-only requests (trajectory playback, interactive rotation, or a
+still image), follow `skills/common/visual-qa.md` and stop after display;
+reuse display-ready artifacts. If PBC correction, subsampling, or requested
+fitting is needed, follow its trajectory-display procedure for derived artifacts.
+
+Follow `skills/common/preamble.md`, `skills/common/run-loop.md` (the canonical
+node loop), and `skills/common/tool-output.md` for error handling.
+Use `mdclaw inspect_job --job-dir <job_dir>` to confirm the job state
+and identify the production or analysis node(s) that answer the analysis
+question.
+
+Run this skill when the current request directly asks for analysis, or when a
+production handoff still needs analysis or a scientific answer. In harnesses
+with slash commands, `/md-analyze` is the shortcut.
+
+If the job belongs to a study with `study_plan.json`, use the plan's `analysis`
+list as the starting point for metric selection. Treat it as scientific intent,
+not as a brittle execution contract: missing or incomplete plan fields should
+not block normal analysis.
+
+## Workflow
+
+Follow the canonical loop in `skills/common/run-loop.md`, specialized here as:
+
+1. `inspect_job` to confirm the job state and find the production/analysis
+   node(s) that answer the question.
+2. Confirm the Step 0 fields below.
+3. Combine the production lineage into one analysis trajectory:
+   `skills/md-analyze/concat.md`.
+4. Create an `analyze` node per metric and run the tool with `--job-dir` /
+   `--node-id`: `skills/md-analyze/metrics.md`.
+5. Report results with node lineage, selection, and stride.
+
+## Study Completion
+
+For an analysis-only request, report the requested node results and stop. For
+a scientific-answer request:
+
+1. Repeat the required production and analysis work for every planned job
+   needed by the question.
+   Keep analysis nodes inside their own job DAG; compare artifacts from
+   different jobs during study-level synthesis, not with cross-job parents.
+2. Use `inspect_job` to verify those `prod` and `analyze` nodes are completed;
+   do not use the evidence report's status as the completion check.
+3. Run `generate_md_report --study-dir <study_dir>` (`--plan-id` for a selected
+   non-active plan). If `report_selection_required`, ask which targets to combine
+   as replicas, separate, or omit; do not guess even in autonomous mode. Pass the
+   selected `{job_dir,node_id,label}` objects via `--targets` and `--grouping`.
+   Synthesize the actual results against the plan's decision criteria and record
+   the conclusion with `record_study_log --record-type decision`.
+4. Return the evidence-backed answer with limitations and provenance. If
+   required work is still queued or running, report a resumable DAG handoff
+   instead of claiming completion.
+
+Read by task:
+
+- Calculation-history review, manuscript Methods/BibTeX or MDDB files:
+  `skills/md-report/SKILL.md`.
+- Collective variables and bias energy from custom-force production runs:
+  `skills/md-analyze/collective-variables.md`
+- Solute tempering (`run_sst2`) runs: MBAR reweighting of all rungs, the dF(t) sampling verdict,
+  weight convergence verdict, per-frame weights and the fixed-weight handoff:
+  `skills/md-analyze/tempering.md` (run it before any metric on SST2 data)
+- Metadynamics (`run_metadynamics`) walkers: dF between two states versus
+  time, one number and one figure, with the verdict:
+  `skills/md-analyze/metadynamics.md`
+- Weighted-ensemble rounds (`we_resample` policy nodes, segments
+  `prod_<scheme>_r<round>_w<replica>`): rates, verdicts, the convergence
+  figure (`we_convergence.png`: the rate had the run stopped after each
+  round, judged over the second half like `analyze_metadynamics`) and weighted
+  distributions come from `analyze_we`, `skills/md-we/kinetics.md`; frames of
+  a weighted ensemble are averaged with their walker weights
+  (`we_frames.csv`), never as equal frames
+- On errors (missing artifacts, bad selections, empty DCDs), act on the
+  returned `code`/`hints`. Do not silently switch atom selections; ask the
+  user if the requested selection does not match the topology.
+
+## Step 0 Summary
+
+Confirm these fields before running analysis:
+
+| Parameter | Value |
+|-----------|-------|
+| Target | job directory |
+| Analysis data scope | segment, production_chain, or comparison (`alchemical` exists for fep parents; that is `md-fep`'s `analyze_fep`, not this skill) |
+| Analysis subjects | optional for segment/production_chain; for trajectory comparisons declare two (with `comparison_mapping`) — `create_node` accepts a bare comparison scope, the metric tool then refuses without them |
+| Comparison mapping | required for different chains/topologies; initial types: `residue_number`, `atom_selection` |
+| Validation | require `analysis_data_scope`; comparison is binary/pairwise (two analyze parents; when declared, two unique subject `label`s) |
+| Leaf prod node | requested node or deepest continuation leaf |
+| Atom selection | mdtraj selection, default `"protein"` |
+| Region annotation | source and residue mapping, when comparing named biological regions |
+| Stride | integer, default `1` |
+
+For comparisons between two branches in the same job DAG, create the node with
+explicit subjects and mapping. For different `job_dir`s, compare the separate
+analysis artifacts during study-level synthesis instead.
+
+- Parents: two completed `production_chain` analyze nodes.
+- Put `analysis_subjects` and `comparison_mapping` on the comparison node
+  itself, not on the parent nodes. The resolver still exposes multi-parent
+  inputs as `branches_input` for tool compatibility.
+- `residue_number` mapping: each reference is `subject_label:residue_id`, where
+  `residue_id` is a string, not a number.
+- `atom_selection` mapping: selection values are mdtraj selection strings.
+
+```bash
+mdclaw create_node --job-dir <job_dir> --node-type analyze \
+  --parent-node-ids <analyze_apo> <analyze_holo> \
+  --label "apo_vs_holo" \
+  --conditions '{"analysis_data_scope": "comparison",
+                 "analysis_subjects": [
+                   {"label": "apo"},
+                   {"label": "holo"}
+                 ],
+                 "comparison_mapping": {
+                   "type": "residue_number",
+                   "pairs": [["apo:10", "holo:10"]]
+                 }}'
+```
+
+Create an `analyze` node first, then run analysis tools with both `--job-dir`
+and `--node-id`.
+
+## Structure Preview and Visual QA
+
+The structure-preview and visual-review procedure is shared across all stages.
+Follow `skills/common/visual-qa.md` when the user asks for playback, interactive
+rotation, a structural snapshot, or a visual check. Do not render one on your
+own judgement that an artifact "would benefit" from it — previews are large images and go unused
+unless someone asked to look at them.
+
+For residue, bond, charge, or historical-status discrepancies, follow
+[chemistry diagnostics](https://github.com/matsunagalab/mdclaw/blob/HEAD/skills/common/chemistry-diagnostics.md).

@@ -1,0 +1,383 @@
+import { describe, it, expect } from 'vitest';
+import { parseDumpFile, boundBoxToTriclinic } from '../src/services/dumpParser';
+import { detectFileFormat, detectFormatFromContent } from '../src/services/fileParser';
+import { computeMSD } from '../src/services/trajectoryAnalysis';
+
+// Orthogonal, 2 frames, custom columns incl. element + q
+const ORTHO = `ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+3
+ITEM: BOX BOUNDS pp pp pp
+0.0000000000000000e+00 1.0000000000000000e+01
+0.0000000000000000e+00 1.0000000000000000e+01
+0.0000000000000000e+00 1.0000000000000000e+01
+ITEM: ATOMS id type element x y z q
+1 1 O 1.0 2.0 3.0 -0.8
+2 1 H 2.0 2.0 3.0 0.4
+3 2 Na 9.0 9.0 9.0 1.0
+ITEM: TIMESTEP
+100
+ITEM: NUMBER OF ATOMS
+3
+ITEM: BOX BOUNDS pp pp pp
+0.0000000000000000e+00 1.0000000000000000e+01
+0.0000000000000000e+00 1.0000000000000000e+01
+0.0000000000000000e+00 1.0000000000000000e+01
+ITEM: ATOMS id type element x y z q
+1 1 O 1.5 2.5 3.5 -0.8
+2 1 H 2.5 2.5 3.5 0.4
+3 2 Na 8.5 8.5 8.5 1.0
+`;
+
+// Triclinic, style-atom default columns (id type xs ys zs — SCALED).
+// tilts: xy=-2, xz=-0.5, yz=-1 ; true box lx=10 ly=8 lz=6, origin (0,0,0).
+// Per Howto_triclinic: xlo_bound = 0 + MIN(0,-2,-.5,-2.5) = -2.5 ; xhi_bound = 10 + MAX(...)=10
+// ylo_bound = 0 + MIN(0,-1) = -1 ; yhi_bound = 8 + MAX(0,-1) = 8 ; z 0..6
+const TRICLINIC = `ITEM: TIMESTEP
+500
+ITEM: NUMBER OF ATOMS
+2
+ITEM: BOX BOUNDS xy xz yz pp pp pp
+-2.5 10.0 -2.0
+-1.0 8.0 -0.5
+0.0 6.0 -1.0
+ITEM: ATOMS id type xs ys zs
+1 1 0.0 0.0 0.0
+2 1 1.0 1.0 1.0
+`;
+
+describe('LAMMPS dump parser', () => {
+  it('parses orthogonal multi-frame dumps with element/q columns', () => {
+    const d = parseDumpFile(ORTHO);
+    expect(d.atoms).toHaveLength(3);
+    expect(d.frames).toHaveLength(2);
+    expect(d.atoms[0]).toMatchObject({ id: 1, type: 8, charge: -0.8, x: 1, y: 2, z: 3 });
+    expect(d.atoms[1].type).toBe(1); // H
+    expect(d.atoms[2].type).toBe(11); // Na
+    expect(d.box).toEqual({ xlo: 0, xhi: 10, ylo: 0, yhi: 10, zlo: 0, zhi: 10 });
+    // frame 2 swapped in playback keeps topology metadata stable
+    expect(d.frames![1].atoms[0]).toMatchObject({ x: 1.5, y: 2.5, z: 3.5 });
+    expect(d.frames![0].comment).toContain('timestep 0');
+    expect(d.frames![1].comment).toContain('timestep 100');
+    // min/max span ALL frames
+    expect(d.max.x).toBeCloseTo(9);
+    expect(d.min.x).toBeCloseTo(1);
+  });
+
+  it('resolves elements from the element column; a type number alone names no element', () => {
+    const d = parseDumpFile(ORTHO);
+    expect(d.atomTypes[8].element).toBe('O');
+    expect(d.atomTypes[11].element).toBe('Na');
+    const noElem = parseDumpFile(`ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+1
+ITEM: BOX BOUNDS pp pp pp
+0 10
+0 10
+0 10
+ITEM: ATOMS id type x y z
+1 6 5 5 5
+`);
+    // type 6 is not carbon: LAMMPS numbers types in the input's own order
+    expect(noElem.atoms[0].type).toBe(6);
+    expect(noElem.atomTypes[6]).toMatchObject({ element: 'X', label: 'Type 6' });
+  });
+
+  it('does not draw a C/H/N dump as C/He/Li: types without element information stay unknown and unbonded', () => {
+    // a methylamine-like fragment written by "dump custom ... id type x y z": types 1 = C, 2 = H, 3 = N
+    const d = parseDumpFile(`ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+4
+ITEM: BOX BOUNDS pp pp pp
+0 20
+0 20
+0 20
+ITEM: ATOMS id type x y z
+1 1 10.0 10.0 10.0
+2 2 11.09 10.0 10.0
+3 3 9.53 11.38 10.0
+4 2 9.64 9.49 10.89
+`);
+    expect(d.atoms.map(a => a.type)).toEqual([1, 2, 3, 2]);
+    for (const t of [1, 2, 3]) expect(d.atomTypes[t].element).toBe('X');
+    expect(d.atomTypes[2]).toMatchObject({ label: 'Type 2', count: 2 });
+    // no covalent radii without elements, so no guessed bonds (He would have had none and Li far too many)
+    expect(d.bonds).toHaveLength(0);
+  });
+
+  it('takes the element from a mass column, from element type labels, and from an element column in any case', () => {
+    const byMass = parseDumpFile(`ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+3
+ITEM: BOX BOUNDS pp pp pp
+0 20
+0 20
+0 20
+ITEM: ATOMS id type mass x y z
+1 1 12.011 10.0 10.0 10.0
+2 2 1.008 11.09 10.0 10.0
+3 3 14.007 9.53 11.38 10.0
+`);
+    expect([1, 2, 3].map(t => byMass.atomTypes[t].element)).toEqual(['C', 'H', 'N']);
+    expect(byMass.atoms.map(a => a.type)).toEqual([1, 2, 3]);
+    expect(byMass.atomTypes[1].mass).toBeCloseTo(12.011);
+    // C-H (1.09) and C-N (1.47) are bonds from the covalent radii of the resolved elements
+    expect(byMass.bonds).toHaveLength(2);
+
+    const byLabel = parseDumpFile(`ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+4
+ITEM: BOX BOUNDS pp pp pp
+0 20
+0 20
+0 20
+ITEM: ATOMS id type x y z
+1 OW 10.0 10.0 10.0
+2 H 10.96 10.0 10.0
+3 CA 5.0 5.0 5.0
+4 Na 15.0 15.0 15.0
+`);
+    // labels are numbered in order of first appearance; "OW" and "CA" are no element symbols (CA is not calcium)
+    expect(byLabel.atoms.map(a => a.type)).toEqual([1, 2, 3, 4]);
+    expect([1, 2, 3, 4].map(t => byLabel.atomTypes[t].element)).toEqual(['X', 'H', 'X', 'Na']);
+    expect(byLabel.atomTypes[1].label).toBe('OW');
+    expect(byLabel.atomTypes[3].label).toBe('CA');
+
+    const lower = parseDumpFile(`ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+2
+ITEM: BOX BOUNDS pp pp pp
+0 20
+0 20
+0 20
+ITEM: ATOMS id type element x y z
+1 1 na 5 5 5
+2 2 cl 7.8 5 5
+`);
+    expect(lower.atomTypes[11].element).toBe('Na');
+    expect(lower.atomTypes[17].element).toBe('Cl');
+  });
+
+  it('converts triclinic bounding box to true box (verified Howto_triclinic inverse)', () => {
+    const box = boundBoxToTriclinic(
+      [-2.5, 10], [-1, 8], [0, 6], -2.0, -0.5, -1.0,
+    );
+    expect(box.xlo).toBeCloseTo(0);
+    expect(box.xhi).toBeCloseTo(10);
+    expect(box.ylo).toBeCloseTo(0);
+    expect(box.yhi).toBeCloseTo(8);
+    expect(box.zlo).toBeCloseTo(0);
+    expect(box.zhi).toBeCloseTo(6);
+    expect(box.xy).toBeCloseTo(-2);
+    expect(box.xz).toBeCloseTo(-0.5);
+    expect(box.yz).toBeCloseTo(-1);
+  });
+
+  it('de-scales fractional coords in the triclinic vector basis', () => {
+    const d = parseDumpFile(TRICLINIC);
+    // atom 2 at (1,1,1): x = 0 + 10 - 2 - 0.5 = 7.5 ; y = 0 + 8 - 1 = 7 ; z = 6
+    const a2 = d.atoms[1];
+    expect(a2.x).toBeCloseTo(7.5);
+    expect(a2.y).toBeCloseTo(7);
+    expect(a2.z).toBeCloseTo(6);
+    // atom 1 at origin corner
+    expect(d.atoms[0]).toMatchObject({ x: 0, y: 0, z: 0 });
+    expect(d.box!.xy).toBeCloseTo(-2);
+  });
+
+  it('prefers x/y/z over xu/yu/zu over xs/ys/zs and errors without any', () => {
+    const unwrapped = parseDumpFile(`ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+1
+ITEM: BOX BOUNDS pp pp pp
+0 10
+0 10
+0 10
+ITEM: ATOMS id type xu yu zu
+1 1 12.0 3.0 4.0
+`);
+    expect(unwrapped.atoms[0]).toMatchObject({ x: 12, y: 3, z: 4 });
+
+    expect(() => parseDumpFile(`ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+1
+ITEM: BOX BOUNDS pp pp pp
+0 10
+0 10
+0 10
+ITEM: ATOMS id type vx vy vz
+1 1 0 0 0
+`)).toThrow(/coord/i);
+  });
+
+  it('throws on empty input and atom-count mismatch in the first frame', () => {
+    expect(() => parseDumpFile('')).toThrow(/dump/i);
+    expect(() => parseDumpFile(`ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+3
+ITEM: BOX BOUNDS pp pp pp
+0 10
+0 10
+0 10
+ITEM: ATOMS id type x y z
+1 1 0 0 0
+`)).toThrow(/expected 3 atoms/);
+  });
+
+  it('format detection: extension and content sniffing', () => {
+    expect(detectFileFormat('run.lammpstrj')).toBe('lammpsdump');
+    expect(detectFileFormat('snap.dump')).toBe('lammpsdump');
+    expect(detectFormatFromContent(ORTHO)).toBe('lammpsdump');
+  });
+});
+
+describe('dump parser — scaled-unwrapped columns and image flags', () => {
+  const header = (cols: string) => `ITEM: TIMESTEP
+0
+ITEM: NUMBER OF ATOMS
+2
+ITEM: BOX BOUNDS pp pp pp
+0.0 10.0
+0.0 10.0
+0.0 10.0
+ITEM: ATOMS ${cols}
+`;
+
+  it('reads xsu/ysu/zsu (scaled UNWRAPPED) — previously rejected outright', () => {
+    // docs.lammps.org/dump.html: "unwrapped coordinates are scaled by the box
+    // size. Atoms that have passed through a periodic boundary will have the
+    // corresponding coordinate increased or decreased by 1.0."
+    const d = parseDumpFile(header('id type xsu ysu zsu') +
+      '1 1 0.25 0.5 0.75\n' +
+      '2 1 1.5 -0.5 2.0\n');
+    expect(d.atoms).toHaveLength(2);
+    expect(d.atoms[0].x).toBeCloseTo(2.5, 6);
+    expect(d.atoms[0].y).toBeCloseTo(5.0, 6);
+    expect(d.atoms[0].z).toBeCloseTo(7.5, 6);
+    // past the boundary: 1.5 -> 15, -0.5 -> -5, 2.0 -> 20
+    expect(d.atoms[1].x).toBeCloseTo(15, 6);
+    expect(d.atoms[1].y).toBeCloseTo(-5, 6);
+    expect(d.atoms[1].z).toBeCloseTo(20, 6);
+  });
+
+  it('captures ix/iy/iz without moving the rendered position', () => {
+    const d = parseDumpFile(header('id type x y z ix iy iz') +
+      '1 1 1.0 2.0 3.0 2 -1 0\n' +
+      '2 1 4.0 5.0 6.0 0 0 0\n');
+    // x/y/z stay WRAPPED — unwrapping here would scatter the render
+    expect(d.atoms[0].x).toBeCloseTo(1.0, 6);
+    expect(d.atoms[0].ix).toBe(2);
+    expect(d.atoms[0].iy).toBe(-1);
+    expect(d.atoms[0].iz).toBe(0);
+    expect(d.atoms[1].ix).toBe(0);
+  });
+
+  it('leaves image flags undefined when the dump has no such columns', () => {
+    const d = parseDumpFile(header('id type x y z') + '1 1 1 2 3\n2 1 4 5 6\n');
+    expect(d.atoms[0].ix).toBeUndefined();
+  });
+
+  it('still rejects a dump with no coordinate columns at all', () => {
+    expect(() => parseDumpFile(header('id type q') + '1 1 0.5\n2 1 0.5\n'))
+      .toThrow(/no coordinate columns/);
+  });
+
+  it('gives every frame its own box, so an NPT cell can breathe', () => {
+    const frame = (ts: number, hi: number) => `ITEM: TIMESTEP
+${ts}
+ITEM: NUMBER OF ATOMS
+1
+ITEM: BOX BOUNDS pp pp pp
+0.0 ${hi}
+0.0 ${hi}
+0.0 ${hi}
+ITEM: ATOMS id type x y z
+1 1 1.0 1.0 1.0
+`;
+    const d = parseDumpFile(frame(0, 10) + frame(100, 12) + frame(200, 11));
+    expect(d.frames).toHaveLength(3);
+    expect(d.frames![0].box!.xhi).toBeCloseTo(10, 6);
+    expect(d.frames![1].box!.xhi).toBeCloseTo(12, 6);
+    expect(d.frames![2].box!.xhi).toBeCloseTo(11, 6);
+    // the reference box stays frame 0's, which is what camera framing uses
+    expect(d.box!.xhi).toBeCloseTo(10, 6);
+  });
+});
+
+describe('dump parser — image flags only accompany a WRAPPED position', () => {
+  const frames = (cols: string, rows: (t: number) => string, n = 5) => {
+    let src = '';
+    for (let t = 0; t <= n; t++) {
+      src += `ITEM: TIMESTEP\n${t}\nITEM: NUMBER OF ATOMS\n1\n` +
+        `ITEM: BOX BOUNDS pp pp pp\n0.0 10.0\n0.0 10.0\n0.0 10.0\n` +
+        `ITEM: ATOMS ${cols}\n${rows(t)}\n`;
+    }
+    return src;
+  };
+
+  /**
+   * Regression: a dump may legitimately carry BOTH `xu yu zu` and `ix iy iz`.
+   * The coordinate is then already absolute, so passing the flags downstream
+   * makes MSD add the same box offset twice — a 4x overestimate on a steady
+   * drift (400 instead of 100 for a +2/frame drift over 5 frames).
+   */
+  it('drops ix/iy/iz when the coordinate came from xu/yu/zu', () => {
+    const d = parseDumpFile(frames(
+      'id type xu yu zu ix iy iz',
+      t => `1 1 ${2 * t} 0.0 0.0 ${Math.floor((2 * t) / 10)} 0 0`,
+    ));
+    expect(d.atoms[0].ix).toBeUndefined();
+    const pts = computeMSD(d.frames!, d.box, { timeOriginStride: 1 });
+    // xu is already unwrapped: drift of 2/frame over 5 frames -> 10² = 100
+    expect(pts[pts.length - 1].msd).toBeCloseTo(100, 6);
+  });
+
+  it('drops ix/iy/iz when the coordinate came from xsu/ysu/zsu', () => {
+    const d = parseDumpFile(frames(
+      'id type xsu ysu zsu ix iy iz',
+      t => `1 1 ${(2 * t) / 10} 0.0 0.0 ${Math.floor((2 * t) / 10)} 0 0`,
+    ));
+    expect(d.atoms[0].ix).toBeUndefined();
+    const pts = computeMSD(d.frames!, d.box, { timeOriginStride: 1 });
+    expect(pts[pts.length - 1].msd).toBeCloseTo(100, 6);
+  });
+
+  it('KEEPS ix/iy/iz alongside wrapped x/y/z, and MSD then matches exactly', () => {
+    const d = parseDumpFile(frames(
+      'id type x y z ix iy iz',
+      t => `1 1 ${(2 * t) % 10} 0.0 0.0 ${Math.floor((2 * t) / 10)} 0 0`,
+    ));
+    expect(d.atoms[0].ix).toBe(0);
+    const pts = computeMSD(d.frames!, d.box, { timeOriginStride: 1 });
+    expect(pts[pts.length - 1].msd).toBeCloseTo(100, 6);
+  });
+
+  it('KEEPS ix/iy/iz alongside wrapped scaled xs/ys/zs', () => {
+    const d = parseDumpFile(frames(
+      'id type xs ys zs ix iy iz',
+      t => `1 1 ${((2 * t) % 10) / 10} 0.0 0.0 ${Math.floor((2 * t) / 10)} 0 0`,
+    ));
+    expect(d.atoms[0].ix).toBe(0);
+    const pts = computeMSD(d.frames!, d.box, { timeOriginStride: 1 });
+    expect(pts[pts.length - 1].msd).toBeCloseTo(100, 6);
+  });
+
+  it('prefers wrapped x/y/z when a dump carries both x and xu', () => {
+    const d = parseDumpFile(frames(
+      'id type x y z xu yu zu',
+      t => `1 1 ${(2 * t) % 10} 0.0 0.0 ${2 * t} 0.0 0.0`,
+    ));
+    // rendering must use the wrapped column
+    expect(d.atoms[0].x).toBeCloseTo(0, 6);
+    expect(d.frames![3].atoms[0].x).toBeCloseTo(6, 6);
+  });
+});

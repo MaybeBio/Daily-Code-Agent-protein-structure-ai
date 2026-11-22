@@ -1,0 +1,104 @@
+.sequence-track {
+  border: 0;
+  border-radius: 0;
+  background: var(--surface);
+  padding: 12px 0;
+  min-width: 0;
+  box-shadow: none;
+}
+.sequence-track header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.sequence-track header > span,
+.sequence-track footer {
+  color: var(--muted);
+  font-size: 12px;
+}
+.sequence-track header h3 {
+  margin: 0;
+}
+.sequence-region-map {
+  height: 26px;
+  position: relative;
+  margin-bottom: 14px;
+  background: var(--surface-muted);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.sequence-region-map button {
+  position: absolute;
+  inset-block: 0;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 0;
+  border-radius: 5px;
+  font-size: 9px;
+  padding: 0;
+  overflow: visible;
+  white-space: nowrap;
+}
+.sequence-track-scroll {
+  max-height: 240px;
+  overflow: auto;
+}
+.sequence-residue-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(24px, 1fr));
+  gap: 3px;
+}
+.sequence-residue-grid button {
+  position: relative;
+  display: grid;
+  text-align: center;
+  color: var(--ink);
+  background: var(--surface-muted);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 4px 1px;
+  font: 13px var(--mono);
+  min-height: 38px;
+}
+.sequence-residue-grid small {
+  height: 12px;
+  font: 8px var(--font);
+  color: var(--muted);
+}
+.sequence-residue-grid button.has-region {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.sequence-residue-grid button.is-selected {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.sequence-track footer {
+  margin-top: 12px;
+}
+.sequence-segment-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.sequence-segment-controls button {
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  padding: 5px 0;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .sequence-residue-grid button {
+    transition:
+      background-color 150ms,
+      border-color 150ms;
+  }
+}

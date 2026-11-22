@@ -1,0 +1,24 @@
+active_threshold_nm: 1000
+admet_hepatotox_threshold: 0.5
+admet_herg_threshold: 0.5
+chembl_id: CHEMBL2563
+chembl_screen_n: 1000
+disease: endometriosis
+docking_exhaustiveness: 8
+inactive_threshold_nm: 10000
+known_inhibitor: CC1=CC=C(C=C1)S(=O)(=O)NC2=NC=C(C=N2)C3=CC=CC=N3
+max_permutation_analogues: 100
+md_steps: 25000
+md_temperature: 300
+md_timestep: 0.004
+ml_cv_folds: 5
+n_analogues: 50
+pdb_id: 4NTJ
+receptor: P2Y12
+reference_ic50_nm: 89
+reference_name: AZD1283
+reference_source: Springthorpe et al. 2007
+sequence: ''
+tanimoto_vs_threshold: 0.4
+top_hits_for_analogues: 5
+use_admet_ai: true

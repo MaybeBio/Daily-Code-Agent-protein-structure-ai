@@ -1,0 +1,31 @@
+name: topoppi-dev
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy>=1.21.0
+  - scipy
+  - biopython
+  - scikit-image
+  - matplotlib
+  - tk                    
+  - igl=2.6.*
+  - trimesh                
+  - networkx            
+  - pillow          
+  - rtree      
+  - shapely
+  - mdanalysis
+  - rdkit
+  - psutil
+  - tqdm
+  - meshio
+  - pip
+  - pip:
+    - prolif
+    - pytest
+    - pytest-cov
+    - ruff
+    - build
+    - twine

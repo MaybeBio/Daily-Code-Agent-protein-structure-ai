@@ -1,0 +1,92 @@
+[project]
+name = "waterflow"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "torch==2.8.0",
+  "torch-geometric>=2.8.0",
+  "torch-scatter",
+  "torch-cluster",
+  "pyg-lib>=0.6.0",
+  "e3nn",
+  "esm",
+  "biotite",
+  "pymol-open-source-whl>=3.1.0.4",
+  "scipy",
+  "scikit-learn",
+  "pandas",
+  "numpy",
+  "matplotlib",
+  "pillow",
+  "loguru",
+  "tqdm",
+  "wandb",
+  "jaxtyping",
+]
+
+[dependency-groups]
+dev = ["pytest", "pytest-cov", "ty", "prek", "ruff"]
+
+# PyTorch CUDA 12.6 index (so `torch` comes from the right place)
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+# PyG “find-links” page as a flat index (equivalent to pip -f ...)
+[[tool.uv.index]]
+name = "pyg-cu126"
+url = "https://data.pyg.org/whl/torch-2.8.0+cu126.html"
+format = "flat"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+torch-scatter = { index = "pyg-cu126" }
+torch-cluster = { index = "pyg-cu126" }
+pyg-lib = { index = "pyg-cu126" }
+
+[tool.mypy]
+disallow_untyped_defs = false
+ignore_missing_imports = true
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.ty.rules]
+# uvx runs ty in isolation without project dependencies - ignore missing imports
+unresolved-import = "ignore"
+# PyTorch Geometric has incomplete type stubs - dynamic attributes on Batch/Data
+unresolved-attribute = "ignore"
+# PyG's MessagePassing.message() override pattern is intentional
+invalid-method-override = "ignore"
+# PyG's propagate() uses **kwargs which ty doesn't understand
+missing-argument = "ignore"
+# Dict.get() returns union types that don't narrow well
+invalid-argument-type = "ignore"
+
+# torch.distributed declares its API under `if is_available():`, so every member
+# reads as conditionally defined. Scoped to the one module that uses it -- the
+# training scripts reach DDP through src/distributed.py, not torch.distributed.
+[[tool.ty.overrides]]
+include = ["src/distributed.py"]
+
+[tool.ty.overrides.rules]
+possibly-missing-attribute = "ignore"
+
+[tool.ruff.lint]
+fixable = ["I001", "F401", "UP"]
+ignore = ["E402", "E501", "E721", "E731", "E741", "F722", "F821", "UP015", "UP037"]
+select = ["E", "F", "I001", "UP"]
+
+[tool.ruff.lint.flake8-import-conventions.extend-aliases]
+"collections" = "co"
+"functools" = "ft"
+"itertools" = "it"
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+extra-standard-library = ["typing_extensions"]
+lines-after-imports = 2
+order-by-type = false

@@ -1,0 +1,1156 @@
+# Auxiliar generic functions and classes used along the workflow
+
+from mddb_workflow import __path__, __version__
+from mddb_workflow.utils.constants import RESIDUE_NAME_LETTERS, PROTEIN_RESIDUE_NAME_LETTERS
+from mddb_workflow.utils.constants import YELLOW_HEADER, RED_HEADER, COLOR_END
+from mddb_workflow.utils.constants import STANDARD_TOPOLOGY_FILENAME
+from mddb_workflow.utils.constants import GLOBALS
+from mddb_workflow.utils.constants import DATABASE_DOCUMENT_SIZE_LIMIT
+from mddb_workflow.utils.constants import DATABASE_DOCUMENT_PATTERNS, DATABASE_DOCUMENT_LIST_PATTERNS
+from mddb_workflow.utils.constants import AUTOMATIC_FLAG
+from mddb_workflow.utils.constants import EXTENDED_PDB_ID_FORMAT
+from mddb_workflow.utils.type_hints import *
+
+import os
+from os.path import isfile, exists
+import re
+import sys
+import time
+import json
+import yaml
+import bson
+from glob import glob
+import numpy
+# NEVER FORGET: GraphQL has a problem with urllib.parse -> It will always return error 400 (Bad request)
+# We must use requests instead
+import requests
+import http.client
+from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+import urllib.request
+from subprocess import run, PIPE
+from dataclasses import asdict, is_dataclass
+import multiprocessing
+from functools import wraps
+import socket
+
+
+def is_imported(module_name: str) -> bool:
+    """Check if a module has been imported."""
+    return module_name in sys.modules
+
+
+class QuietException (Exception):
+    """Exception which is not to print traceback.
+    They are used when the problem is not in our code.
+    """
+    pass
+
+
+class InputError (QuietException):
+    """Quite exception for when user input is wrong."""
+    pass
+
+
+class TestFailure (QuietException):
+    """Quite exception for when MD data has not passed a quality check test."""
+    pass
+
+
+class InputsUpdated (QuietException):
+    """Quiet exception for when the inputs file has been changed during the run to fix a failed test.
+    e.g. fragments added to the PBC selection or the image set to true.
+    Tasks which were already run with the previous inputs must be run again, so the workflow is relaunched.
+    """
+    pass
+
+
+class EnvironmentError (QuietException):
+    """Quite exception for when the problem is not in the code but in the environment."""
+    pass
+
+
+class ToolError (QuietException):
+    """Quite exception for when the problem comes from a third party dependency."""
+    pass
+
+
+class RemoteServiceError (QuietException):
+    """Quite exception for when the problem comes from a remote service."""
+    pass
+
+
+class RequestError (QuietException):
+    """Quite exception for when the problem comes from an HTTP request."""
+    pass
+
+
+class RateLimitError (RequestError):
+    """Quite exception for when a remote service rejects our requests because we sent too many (error 429)."""
+    def __init__(self, message: str, retry_after: Optional[float] = None):
+        super().__init__(message)
+        # Seconds the service asks us to wait before trying again, if it says so
+        self.retry_after = retry_after
+
+
+class DatabaseUnavailableError (RemoteServiceError):
+    """Quite exception for when the MDDB database is not responding."""
+    pass
+
+
+class ForcedStop (QuietException):
+    """Quite exception for when we stop the workflow in purpose."""
+    pass
+
+
+class SegmentationFault (QuietException):
+    """Quite exception for when a segmentation fault happens in a third party dependency."""
+    pass
+
+
+class NoReferableException (Exception):
+    """No referable exception for PDB synthetic constructs or chimeric entities."""
+    def __str__(self): return f'No referable sequence {self.sequence}'
+    def __repr__(self): return self.__str__()
+    def get_sequence(self) -> str:
+        return self.args[0]
+    sequence = property(get_sequence, None, None, 'Aminoacids sequence')
+
+
+def custom_excepthook(exception_class, message, traceback):
+    """Handle a custom exception where our input error exception has a quiet behaviour."""
+    # Quite behaviour if it is our input error exception
+    if QuietException in exception_class.__bases__:
+        print('{0}: {1}'.format(exception_class.__name__, message))  # Only print Error Type and Message
+        return
+    # Default behaviour otherwise
+    sys.__excepthook__(exception_class, message, traceback)
+
+
+sys.excepthook = custom_excepthook
+
+# Set a special exception for when a MD has been removed
+REMOVED_MD = Exception('Removed MD')
+# Set a special exceptions for when the topology is missing or some of its contents
+MISSING_TOPOLOGY = Exception('Missing topology')
+MISSING_CHARGES = Exception('Missing atom charges')
+MISSING_BONDS = Exception('Missing atom bonds')
+MISSING_VALUE = Exception('No value')
+JSON_SERIALIZABLE_MISSING_BONDS = 'MB'
+
+# Keep all exceptions in a set
+STANDARD_EXCEPTIONS = {MISSING_TOPOLOGY, MISSING_CHARGES, MISSING_BONDS}
+
+
+def parse_automatic_selection(selection_string: Optional[str]) -> tuple[bool, Optional[str]]:
+    """Check if a selection string is the automatic flag, which may be followed by an additional selection.
+    e.g. auto + resname LIG
+    Return whether the selection is automatic and the additional selection string, if any.
+    """
+    if not isinstance(selection_string, str): return False, None
+    flag, plus, additional = selection_string.partition('+')
+    if flag.strip() != AUTOMATIC_FLAG: return False, None
+    if not plus: return True, None
+    additional = additional.strip()
+    if not additional:
+        raise InputError(f'Selection "{selection_string}" is missing a selection after the "+"')
+    return True, additional
+
+
+def all_cases(names: list[str] | set[str]) -> set[str]:
+    """Given a list or set of names.
+
+    Return a set with all case-posibilites:
+    - All upper case
+    - All lower case
+    - First upper case and the rest lower case
+
+    """
+    all_names = []
+    for name in names:
+        all_upper = name.upper()
+        all_lower = name.lower()
+        one_upper = name[0].upper() + name[1:].lower()
+        all_names += [all_upper, all_lower, one_upper]
+    return set(all_names)
+
+
+def all_charges(names: list[str] | set[str]) -> set[str]:
+    """Given a list or set of names.
+
+    Return a set with all charge-posibilites:
+    - No charge
+    - Positive charge (+)
+    - Negative charge (-)
+
+    """
+    all_names = []
+    for name in names:
+        positive = name + '+'
+        negative = name + '-'
+        all_names += [name, positive, negative]
+    return set(all_names)
+
+
+def residue_name_to_letter(residue_name: str) -> str:
+    """Given a residue name, return its single letter."""
+    return RESIDUE_NAME_LETTERS.get(residue_name, 'X')
+
+
+def protein_residue_name_to_letter(residue_name: str) -> str:
+    """Given a protein residue name, return its single letter."""
+    return PROTEIN_RESIDUE_NAME_LETTERS.get(residue_name, 'X')
+
+
+OBJECT_TYPES = {dict, list, tuple}
+
+
+def recursive_transformer(target_object: dict | list | tuple, transformer: Optional[Callable] = None) -> dict | list | tuple:
+    """Recursive transformer for nested dicts and lists.
+    Note that a new object is created to prevent mutating the original.
+    If no transformer function is passed then it becomes a recursive cloner.
+    WARNING: the transformer function could mutate some types of the original object if not done properly.
+    """
+    object_type = type(target_object)
+    # Get a starting object and entries iterator depending on the object type
+    if object_type is dict:
+        clone = {}
+        entries = target_object.items()
+    elif object_type is list or object_type is tuple:
+        # Note that if it is a tuple we make a list anyway and we convert it to tuple at the end
+        # WARNING: Note that tuples do not support reassigning items
+        clone = [None for i in range(len(target_object))]
+        entries = enumerate(target_object)
+    else: ValueError(f'The recursive cloner should only be applied to object and lists, not to {object_type}')
+    # Iterate the different entries in the object
+    for index_or_key, value in entries:
+        # Get he value type
+        value_type = type(value)
+        # If it is a dict or list then call the transformer recursively
+        if value_type in OBJECT_TYPES: clone[index_or_key] = recursive_transformer(value, transformer)
+        # If it is not an object type then apply the transformer to it
+        else: clone[index_or_key] = transformer(value) if transformer else value
+    # If it was a tuple then make the conversion now
+    if object_type == tuple: clone = tuple(clone)
+    return clone
+
+
+# Set some headers for the serializer
+EXCEPTION_HEADER = 'Exception: '
+
+
+# LORE: This was originally intended to support exceptions in the cache
+def json_serializer(object: dict | list | tuple) -> dict | list | tuple:
+    """Serialize a standard JSON with support for additional types."""
+    def serializer(value):
+        # If we have exceptions then convert them to text with an appropiate header
+        if type(value) is Exception:
+            return f'{EXCEPTION_HEADER}{value}'
+        if type(value) is NoReferableException:
+            return f'NoReferableException: {value.sequence}'
+        # This must be done before the set check because asdict() will create dicts with sets inside
+        if is_dataclass(value) and not isinstance(value, type):
+            dict_value = asdict(value)
+            return recursive_transformer(dict_value, serializer)
+        if isinstance(value, set):
+            return list(value)
+        # If the type is not among the ones we check then assume it is already serializable
+        return value
+    object_clone = recursive_transformer(object, serializer)
+    return object_clone
+
+
+def json_deserializer(object: dict | list | tuple) -> dict | list | tuple:
+    """Deserialize a standard JSON with support for additional types."""
+    def deserializer(value):
+        # Check if there is any value which was adapted to become JSON serialized and restore it
+        if type(value) is str and value[0:11] == EXCEPTION_HEADER:
+            # WARNING: Do not declare new exceptions here but use the constant ones
+            # WARNING: Otherwise further equality comparisions will fail
+            exception_message = value[11:]
+            standard_exception = next((exception for exception in STANDARD_EXCEPTIONS if str(exception) == exception_message), None)
+            if standard_exception is None:
+                raise ValueError(f'Exception "{exception_message}" is not among standard exceptions')
+            return standard_exception
+        if type(value) is str and value[0:22] == 'NoReferableException: ':
+            sequence = value[22:]
+            return NoReferableException(sequence)
+        # If the type is not among the ones we check then assume it is already deserialized
+        return value
+    object_clone = recursive_transformer(object, deserializer)
+    return object_clone
+
+
+def load_json(filepath: str, replaces: Optional[list[tuple]] = []) -> dict:
+    """Load a JSON with additional logic to better handle problems."""
+    try:
+        with open(filepath, 'r') as file:
+            content = file.read()
+            # Make pure text replacements
+            for replace in replaces:
+                target, replacement = replace
+                content = content.replace(target, replacement)
+            # Parse the content to JSON
+            parsed_content = json.loads(content)
+            # Deserialize some types like Exceptions, which are stored in JSONs in this context
+            deserialized_content = json_deserializer(parsed_content)
+        return deserialized_content
+    except Exception as error:
+        raise Exception(f'Something went wrong when loading JSON file {filepath}: {str(error)}')
+
+
+def get_bson_size(value) -> int:
+    """Get the size in bytes of a value once encoded in BSON, which is what MongoDB actually stores."""
+    # Wrap the value since BSON only encodes objects and some analyses are lists at the top level
+    # Note that the loader also wraps analyses this way: { name, value }
+    return len(bson.encode({ 'value': value }))
+
+
+def check_database_document_size(filepath: str):
+    """If the file is to be loaded in the database as a document, make sure it does not exceed the size limit.
+    Size is measured as the BSON encoding of every document, which is what MongoDB actually stores.
+    """
+    filename = os.path.basename(filepath)
+    is_document = any(re.match(pattern, filename) for pattern in DATABASE_DOCUMENT_PATTERNS)
+    is_document_list = any(re.match(pattern, filename) for pattern in DATABASE_DOCUMENT_LIST_PATTERNS)
+    if not is_document and not is_document_list: return
+    with open(filepath, 'r') as file:
+        content = json.load(file)
+    documents = content if is_document_list else [content]
+    for document in documents:
+        size = get_bson_size(document)
+        if size <= DATABASE_DOCUMENT_SIZE_LIMIT: continue
+        raise RuntimeError(f'Output file {filepath} is to be loaded in the database but a document is too big: '
+            f'{size / 1024 ** 2:.2f} Mb (limit is {DATABASE_DOCUMENT_SIZE_LIMIT / 1024 ** 2:.2f} Mb).\n'
+            '  MongoDB documents can not exceed 16 Mb and, anyway, such a big document would make the service slow.\n'
+            '  The format of this output should be reconsidered.')
+
+
+def save_json(content, filepath: str, indent: Optional[int] = None, separators: Optional[tuple] = None):
+    """Save a JSON with additional logic to better handle problems."""
+    try:
+        with open(filepath, 'w') as file:
+            serialized_content = json_serializer(content)
+            json.dump(serialized_content, file, indent=indent, separators=separators)
+    except Exception as error:
+        # Rename the JSON file since it will be half written thus giving problems when loaded
+        os.rename(filepath, filepath + '.wrong')
+        raise Exception(f'Something went wrong when saving JSON file {filepath}: {str(error)}')
+
+
+# DANI: Por algún motivo yaml.load también funciona con archivos en formato JSON
+def load_yaml(filepath: str, replaces: Optional[list[tuple]] = []) -> dict:
+    """Load a YAML with additional logic to better handle problems.
+    The argument replaces allows to replace file content before beeing processed.
+    Every replace is a tuple whith two values: the target and the replacement.
+    """
+    try:
+        with open(filepath, 'r') as file:
+            content = file.read()
+            # Pre-process fields that commonly contain colons (DOIs, URLs, etc.)
+            # Match field: value where value isn't already quoted and may span multiple lines
+            # content = re.sub(
+            #     r'^(citation:\s*)(?!")([^\n]+(?:\n(?!\w+:)[^\n]+)*)$',
+            #     r'\1"\2"',
+            #     content,
+            #     flags=re.MULTILINE
+            # )
+            for replace in replaces:
+                target, replacement = replace
+                content = content.replace(target, replacement)
+            parsed_content = yaml.load(content, Loader=yaml.CLoader)
+        return parsed_content
+    except Exception as error:
+        warn(str(error).replace('\n', ' '))
+        raise InputError('Something went wrong when loading YAML file ' + filepath)
+
+
+def save_yaml(content, filepath: str):
+    """Save a YAML with additional logic to better handle problems."""
+    with open(filepath, 'w') as file:
+        yaml.dump(content, file, sort_keys=False, allow_unicode=True)
+
+
+# Set a few constants to erase previou logs in the terminal
+CURSOR_UP_ONE = '\x1b[1A'
+ERASE_LINE = '\x1b[2K'
+ERASE_PREVIOUS_LINES = CURSOR_UP_ONE + ERASE_LINE + CURSOR_UP_ONE
+
+
+def delete_previous_log():
+    """Remove previous line in the terminal."""
+    print(ERASE_PREVIOUS_LINES)
+
+
+class StatusLineStream:
+    """Output stream which keeps a status line (e.g. 'still waiting for 3 jobs') at the bottom of the terminal.
+    Any other text is written above the status line, so they never mix.
+    When the output is not a terminal (e.g. a log file) the status is written as a normal line, only when it changes.
+    """
+    def __init__(self, stream):
+        self.stream = stream
+        self.is_terminal = stream.isatty()
+        # Current status text, or None when there is no status
+        self.status = None
+        # True when the status line is on screen
+        self.status_shown = False
+        # True when the cursor is at the start of a line
+        self.at_line_start = True
+
+    def write(self, text: str) -> int:
+        if self.status_shown:
+            self.stream.write('\r' + ERASE_LINE)
+            self.status_shown = False
+        written = self.stream.write(text)
+        if text: self.at_line_start = text.endswith('\n')
+        # Draw the status line again below the new text
+        if self.is_terminal and self.status is not None and self.at_line_start:
+            self.stream.write(self.status)
+            self.status_shown = True
+        return written
+
+    def set_status(self, text: str):
+        if text == self.status: return
+        self.status = text
+        if self.status_shown: self.stream.write('\r' + ERASE_LINE)
+        # Something was printed without a line end, so the status starts in a new line
+        elif not self.at_line_start: self.stream.write('\n')
+        if not self.is_terminal:
+            self.stream.write(text + '\n')
+            return
+        self.stream.write(text)
+        self.status_shown = True
+        self.at_line_start = True
+
+    def clear_status(self):
+        if self.status_shown: self.stream.write('\r' + ERASE_LINE)
+        self.status = None
+        self.status_shown = False
+
+    # Anything else (flush, fileno, encoding...) goes to the original stream
+    def __getattr__(self, name: str):
+        return getattr(self.stream, name)
+
+
+def set_status_line(text: str):
+    """Show a status line which is rewritten every time instead of filling the log.
+    Other logs printed meanwhile are written above it.
+    """
+    if isinstance(sys.stdout, StatusLineStream): sys.stdout.set_status(text)
+    # When the output is not ours (e.g. Jupyter or pytest) the status is just printed
+    else: print(text)
+
+
+def clear_status_line():
+    """Remove the status line set with 'set_status_line'."""
+    if isinstance(sys.stdout, StatusLineStream): sys.stdout.clear_status()
+
+
+def reprint(text: str):
+    """Reprint text in the same line in the terminal."""
+    delete_previous_log()
+    print(text)
+
+
+def warn(message: str):
+    """Print a message with a colored warning header."""
+    print(YELLOW_HEADER + '⚠  WARNING: ' + COLOR_END + message)
+
+
+def fail(message: str):
+    """Print a message with a colored warning header."""
+    print(RED_HEADER + '✖  FAIL: ' + COLOR_END + message)
+
+
+def mean(values: list[float]) -> float:
+    """Get the mean/average of a list of values."""
+    return sum(values) / len(values)
+
+
+def round_to_hundredths(number: float) -> float:
+    """Round a number to hundredths."""
+    return round(number * 100) / 100
+
+
+def round_to_thousandths(number: float) -> float:
+    """Round a number to thousandths."""
+    return round(number * 1000) / 1000
+
+
+def ranger(numbers: list[int], unit_separator : str = ',', range_separator : str = '-') -> str:
+    """Given a list with numbers, create a string where number in a row are represented rangedly.
+
+    Example:
+        [1, 3, 5, 6, 7, 8] => "1,3,5-8"
+
+    """
+    # Remove duplicates and sort numbers
+    sorted_numbers = sorted(list(set(numbers)))
+    # Get the number of numbers in the list
+    number_count = len(sorted_numbers)
+    # If there is only one number then finish here
+    if number_count == 1:
+        return str(sorted_numbers[0])
+    # Start the parsing otherwise
+    ranged = ''
+    last_number = -1
+    # Iterate numbers
+    for i, number in enumerate(sorted_numbers):
+        # Skip this number if it was already included in a previous serie
+        if i <= last_number: continue
+        # Add current number to the ranged string
+        ranged += unit_separator + str(number)
+        # Now iterate numbers after the current number
+        next_index = i+1
+        for j, next_number in enumerate(sorted_numbers[next_index:], next_index):
+            # Set the length of the serie
+            length = j - i
+            # End of the serie
+            if next_number - number != length:
+                # The length here is the length which broke the serie
+                # i.e. if the length here is 2 the actual serie length is 1
+                serie_length = length - 1
+                if serie_length > 1:
+                    last_serie_number = j - 1
+                    previous_number = sorted_numbers[last_serie_number]
+                    ranged += range_separator + str(previous_number)
+                    last_number = last_serie_number
+                break
+            # End of the selection
+            if j == number_count - 1:
+                if length > 1:
+                    ranged += range_separator + str(next_number)
+                    last_number = j
+    # Remove the first coma before returning the ranged string
+    return ranged[1:]
+
+
+def otherwise(values: list) -> Generator[tuple, None, None]:
+    """Set a special iteration system.
+    Return one value of the list and a new list with all other values for each value.
+    """
+    for v, value in enumerate(values):
+        others = values[0:v] + values[v+1:]
+        yield value, others
+
+
+def pairwise(values: list) -> Generator[tuple, None, None]:
+    """Set a special iteration system.
+    Return every possible pair of values in the list.
+    """
+    n_values = len(values)
+    for i in range(n_values):
+        for j in range(i + 1, n_values):
+            yield values[i], values[j]
+
+
+# List files in a directory
+def list_files(directory: str) -> list[str]:
+    """List files in a directory."""
+    return [f for f in os.listdir(directory) if isfile(f'{directory}/{f}')]
+
+
+# Check if a directory is empty
+def is_directory_empty(directory: str) -> bool:
+    """Check if a directory is empty."""
+    return len(os.listdir(directory)) == 0
+
+
+GLOB_CHARACTERS = ['*', '?', '[']
+
+
+def is_glob(path: str) -> bool:
+    """Check if a string has patterns to be parsed by a glob function.
+
+    Note that this is not trivial, but this function should be good enough for our case.
+    https://stackoverflow.com/questions/42283009/check-if-string-is-a-glob-pattern
+    """
+    # Find unescaped glob characters
+    for c, character in enumerate(path):
+        if character not in GLOB_CHARACTERS:
+            continue
+        if c == 0:
+            return True
+        previous_characters = path[c-1]
+        if previous_characters != '\\':
+            return True
+    return False
+
+
+def parse_glob(path: str) -> list[str]:
+    """Parse a glob path into one or several results.
+
+    If the path has no glob characters then return it as it is.
+    Otherwise parse the glob pattern.
+    """
+    # If there is no glob pattern then just return the string as is
+    if not is_glob(path):
+        return [path]
+    # If there is glob pattern then parse it
+    parsed_filepaths = glob(path)
+    return parsed_filepaths
+
+
+def is_url(path: str) -> bool:
+    """Return whether the passed string is a URL or not."""
+    return path[0:4] == 'http'
+
+
+def url_to_source_filename(url: str, is_sample: bool = False, verbose: bool = True) -> str:
+    """Set the filename of an input file downloaded from an input URL.
+
+    In this scenario we are free to set our own paths or filenames.
+    Note that the original name will usually be the very same output filename.
+    In order to avoid both filenames being the same we will add a header here.
+    This headers includes also a reference to the database and project.
+    Thus if there is a new accession then we rely on the filenames to know
+    if we already have the correct ones or if we must download again.
+    """
+    url_splits = url.split('/')
+    # Get the name of the source database/service
+    # This will be at the start of the URL, right after the protocol
+    source_site = url_splits[2]
+    source_alias = source_site.split('.')[0].split('-')[0]
+    # Get the project accession
+    # Accession in the URL is placed in .../projects/ACCESSION/...
+    accession = 'unknown-accession'
+    accession_split_index = url_splits.index('projects') + 1
+    accession = url_splits[accession_split_index]
+    # Get the original filename, which will be at the end of the URL
+    original_filename = url_splits[-1]
+    # Edit the filename if this is a sample
+    filename = original_filename
+    if is_sample:
+        filename_splits = filename.split('.')
+        if filename_splits == 1: filename = filename + '_SAMPLE'
+        else: filename = '.'.join(filename_splits[0:-1]) + '_SAMPLE.' + filename_splits[-1]
+    # Set the final name
+    source_filename = f'source_{source_alias}_{accession}_{filename}'
+    if verbose: print(f'{url} -> {source_filename}')
+    return source_filename
+
+
+def download_file(request_url: str, output_file: 'File'):
+    """Download files from a specific URL."""
+    print(f'Downloading file "{output_file.path}" from {request_url}\n')
+    try:
+        urllib.request.urlretrieve(request_url, output_file.path)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            raise Exception(f'Missing remote file "{output_file.filename}"')
+        # If we don't know the error then simply say something went wrong
+        raise Exception(f'Something went wrong when downloading file "{output_file.filename}" from {request_url}')
+
+
+def is_standard_topology(file: 'File') -> bool:
+    """Check if a file is a standard topology.
+    Note that the filename may include the source header.
+    """
+    return file.filename.endswith(STANDARD_TOPOLOGY_FILENAME)
+
+
+# Supported data types for binary files and their numpy codes
+# '<' stands for little endian
+SUPPORTED_BINARY_TYPES = {
+    'float16': '<f2',
+    'float32': '<f4',
+    'float64': '<f8',
+    'uint16': '<u2',
+    'uint32': '<u4',
+    'int32': '<i4',
+}
+
+
+def store_binary_data(data: list[float] | list[int], dtype: str, metadata : dict, filepath: str):
+    """Store binary data to a file.
+
+    Args:
+        data: A list of numeric values
+        dtype: The data type of every value in the output file (e.g. float32, uint32)
+        metadata: Additional data to be written in a companion file (filepath + .meta.json)
+        filepath: The output file path
+
+    """
+    numpy_dtype = SUPPORTED_BINARY_TYPES.get(dtype, None)
+    if not numpy_dtype:
+        raise ValueError(f'Not supported data type {dtype}, please select one of these: {", ".join(SUPPORTED_BINARY_TYPES.keys())}')
+    values = numpy.asarray(data)
+    # Make sure integer values fit in the requested type, since numpy would silently overflow them
+    if 'int' in dtype and len(values) > 0:
+        limits = numpy.iinfo(numpy_dtype)
+        if values.min() < limits.min or values.max() > limits.max:
+            raise ValueError(f'Values out of range for {dtype} ({limits.min} - {limits.max}): min {values.min()}, max {values.max()}')
+    values.astype(numpy_dtype).tofile(filepath)
+    # Write the companion metadata file, including the data type so readers know how to parse it
+    companion_filepath = filepath + '.meta.json'
+    save_json({ **metadata, 'dtype': dtype }, companion_filepath)
+
+
+class CaptureOutput (object):
+    """Capture all stdout or stderr within a code region even if it comes from another non-python threaded process.
+
+    https://stackoverflow.com/questions/24277488/in-python-how-to-capture-the-stdout-from-a-c-shared-library-to-a-variable
+    """
+    escape_char = "\b"
+    def __init__(self, stream: str = 'stdout'):
+        # Get sys stdout or stderr
+        if not hasattr(sys, stream):
+            raise ValueError(f'Unknown stream "{stream}". Expected stream value is "stdout" or "stderr"')
+        self.original_stream = getattr(sys, stream)
+        self.original_streamfd = self.original_stream.fileno()
+        self.captured_text = ""
+        # Create a pipe so the stream can be captured:
+        self.pipe_out, self.pipe_in = os.pipe()
+    def __enter__(self):
+        self.captured_text = ""
+        # Save a copy of the stream:
+        self.streamfd = os.dup(self.original_streamfd)
+        # Replace the original stream with our write pipe:
+        os.dup2(self.pipe_in, self.original_streamfd)
+        return self
+    def __exit__(self, type, value, traceback):
+        # Make sure there is at least some output or the 'readOutput' may hang forever
+        # This has been observed only when running the workflow from Jupyter Notebook
+        # Print the escape character to make the readOutput method stop:
+        self.original_stream.write(' ' + self.escape_char)
+        # Flush the stream to make sure all our data goes in before
+        # the escape character:
+        self.original_stream.flush()
+        self.readOutput()
+        # Close the pipe:
+        os.close(self.pipe_in)
+        os.close(self.pipe_out)
+        # Restore the original stream:
+        os.dup2(self.streamfd, self.original_streamfd)
+        # Close the duplicate stream:
+        os.close(self.streamfd)
+    def readOutput(self):
+        while True:
+            content = os.read(self.pipe_out, os.O_RDONLY)
+            char = content.decode(self.original_stream.encoding)
+            # print(char)
+            # char = os.read(self.pipe_out, 1).decode(self.original_stream.encoding)
+            if not char or self.escape_char in char:
+                break
+            self.captured_text += char
+
+
+# Retry configuration for HTTP requests
+MAX_RETRIES = 3
+RETRY_DELAY = 1.0  # seconds
+RETRY_BACKOFF = 2.0  # exponential backoff multiplier
+# When a service says we sent too many requests we must wait longer
+RATE_LIMIT_RETRIES = 5
+RATE_LIMIT_DELAY = 10.0  # seconds
+
+
+def get_retry_after(headers) -> Optional[float]:
+    """Get the seconds to wait from the 'Retry-After' header of a response, if any."""
+    retry_after = headers.get('Retry-After')
+    # This header may also be a date, in which case we ignore it
+    if retry_after is None or not retry_after.isdigit(): return None
+    return float(retry_after)
+
+
+def _get_http_status(error: Exception) -> Optional[int]:
+    """Get the HTTP status code of a request error, if any."""
+    if isinstance(error, HTTPError): return error.code
+    if isinstance(error, requests.exceptions.HTTPError) and error.response is not None:
+        return error.response.status_code
+    return None
+
+
+def _get_error_retry_after(error: Exception) -> Optional[float]:
+    """Get the seconds to wait before retrying, if the error says so."""
+    if isinstance(error, RateLimitError): return error.retry_after
+    if isinstance(error, HTTPError): return get_retry_after(error.headers)
+    if isinstance(error, requests.exceptions.HTTPError) and error.response is not None:
+        return get_retry_after(error.response.headers)
+    return None
+
+
+def retry_request(func=None, *, retry_not_found: bool = False,
+    max_retries: int = MAX_RETRIES, retry_delay: float = RETRY_DELAY):
+    """Decorator to retry HTTP requests with exponential backoff.
+
+    Network errors, server errors (5xx) and too many requests errors (429) are retried.
+    Other HTTP errors (e.g. 404) are raised directly since retrying would give the same result.
+    Not found errors (404) are also retried with 'retry_not_found', for things which should exist,
+    since a server may answer 404 for a while (e.g. when it is restarting).
+    Network and server errors are tried 'max_retries' times in total, waiting 'retry_delay' seconds
+    after the first failure and twice as long after every next one.
+    """
+    if func is None: return lambda func: retry_request(func, retry_not_found=retry_not_found,
+        max_retries=max_retries, retry_delay=retry_delay)
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        attempt = 0
+        while True:
+            try:
+                return func(*args, **kwargs)
+            # Catch network-related exceptions for retry
+            except (RateLimitError,
+                    requests.exceptions.RequestException,
+                    http.client.RemoteDisconnected, http.client.IncompleteRead,
+                    ConnectionError, TimeoutError, URLError) as error:
+                status = _get_http_status(error)
+                # Errors in our request would fail again, except for too many requests
+                retried_status = status == 429 or (retry_not_found and status == 404)
+                if status is not None and status < 500 and not retried_status:
+                    raise
+                rate_limited = isinstance(error, RateLimitError) or status == 429
+                max_attempts = RATE_LIMIT_RETRIES if rate_limited else max_retries
+                attempt += 1
+                if attempt >= max_attempts:
+                    print(f"Request failed after {attempt} attempts: {error}")
+                    raise
+                if rate_limited:
+                    delay = _get_error_retry_after(error) or RATE_LIMIT_DELAY * RETRY_BACKOFF ** (attempt - 1)
+                else:
+                    delay = retry_delay * RETRY_BACKOFF ** (attempt - 1)
+                print(f"Request failed (attempt {attempt}/{max_attempts}): {error}. Retrying in {delay:.1f}s...")
+                time.sleep(delay)
+    return wrapper
+
+
+@retry_request
+def request_pdb_data(pdb_id: str, query: str) -> dict | None:
+    """Request data to the PDB GraphQL API.
+
+    Note that this function may be used for either PDB ids or PDB molecule ids, depending on the query.
+    The query parameter may be constructed using the following page:
+    https://data.rcsb.org/graphql/index.html
+    """
+    # Entries have 4 characters or the extended format (e.g. pdb_00001abc), anything else is a ligand
+    is_entry = len(pdb_id) == 4 or re.match(EXTENDED_PDB_ID_FORMAT, pdb_id)
+    data_key = 'entry' if is_entry else 'chem_comp'
+    # Set the request URL
+    request_url = 'https://data.rcsb.org/graphql'
+    # Set the POST data
+    post_data = {
+        "query": query,
+        "variables": {"id": pdb_id}
+    }
+    # Send the request
+    try:
+        response = requests.post(request_url, json=post_data)
+    except requests.exceptions.ConnectionError as error:
+        raise ConnectionError('No internet connection :(') from None
+    if response.status_code == 429:
+        raise RateLimitError(f'Too many requests to the PDB API for {pdb_id}',
+            retry_after=get_retry_after(response.headers))
+    if response.status_code != 200:
+        raise RequestError(f'Something went wrong with the PDB API request for {pdb_id} '
+            f'(error {response.status_code}): {response.text}')
+    # Get the response
+    parsed_response = json.loads(response.text)['data'][data_key]
+    if parsed_response is None:
+        new_pdb_id = request_replaced_pdb(pdb_id)
+        if new_pdb_id:
+            warn(f'PDB {pdb_id} is obsolete. {new_pdb_id} will be used instead.')
+            parsed_response = request_pdb_data(new_pdb_id, query)
+        else:
+            warn(f'PDB id {pdb_id} not found')
+    return parsed_response
+
+
+@retry_request
+def request_replaced_pdb(pdb_id):
+    """Use the RCSB REST API to get the replaced PDB id.
+
+    This is useful when the PDB is obsolete and has been replaced.
+    """
+    query_url = 'https://data.rcsb.org/rest/v1/holdings/removed/' + pdb_id
+    response = requests.get(query_url, headers={'Content-Type': 'application/json'})
+    # The API answers 404 when the PDB has not been removed
+    if response.status_code == 404:
+        return None
+    if response.status_code == 429:
+        raise RateLimitError(f'Too many requests to the PDB API for removed PDB {pdb_id}',
+            retry_after=get_retry_after(response.headers))
+    if response.status_code != 200:
+        raise RequestError(f'Something went wrong with the PDB API request for removed PDB {pdb_id} '
+            f'(error {response.status_code}): {response.text}')
+    try:
+        return response.json()['rcsb_repository_holdings_removed']['id_codes_replaced_by'][0]
+    except (KeyError, IndexError):
+        # It may be not replaced if the entry is obsolete due to paper retraction
+        # e.g. 1BEF, 7CU7
+        print(f'PDB {pdb_id} was removed and not replaced by any other PDB')
+        return None
+
+
+def numerate_filename(filename: str, number: int, zeros: int = 2, separator: str = '_') -> str:
+    """Given a filename, set a suffix number on it, right before the extension.
+
+    Args:
+        filename: The original filename
+        number: The number to add as suffix
+        zeros: The number of zeros to fill the name
+        separator: The separator between filename and number
+
+    """
+    splits = filename.split('.')
+    sufix = separator + str(number).zfill(zeros)
+    return '.'.join(splits[0:-1]) + sufix + '.' + splits[-1]
+
+
+def glob_filename(filename: str, separator: str = '_') -> str:
+    """Given a filename, set a suffix including '*', right before the extension.
+    This should match all filenames obtained through the numerate_filename function when used in bash.
+    """
+    splits = filename.split('.')
+    sufix = separator + '*'
+    return '.'.join(splits[0:-1]) + sufix + '.' + splits[-1]
+
+
+def purge_glob(filename: str):
+    """Delete all files matched by the glob_filename function."""
+    glob_pattern = glob_filename(filename)
+    existing_outputs = glob(glob_pattern)
+    for existing_output in existing_outputs:
+        if exists(existing_output): os.remove(existing_output)
+
+
+def get_analysis_name(filename: str) -> str:
+    """Given a filename with the pattern 'mda.xxxx.json', get the 'xxxx' out of it."""
+    name_search = re.search(r'/mda.([A-Za-z0-9_-]*).json$', filename)
+    if not name_search:
+        raise ValueError(f'Wrong expected format in filename {filename}')
+    # To make it coherent with the rest of analyses, the analysis name become parsed when loaded in the database
+    # Every '_' is replaced by '-' so we must keep the analysis name coherent or the web client will not find it
+    return name_search[1].replace('_', '-')
+
+
+# DANI: Do not use getattr with a default argument or hasattr
+# DANI: If you do, you will loose any further AtributeError(s)
+# DANI: Thus you will have very silent errors every time you have a silly typo
+# DANI: This is a python itself unresolved error https://bugs.python.org/issue39865
+def safe_hasattr(instance, attribute_name: str) -> bool:
+    """Use a safe alternative to hasattr."""
+    return attribute_name in set(dir(instance))
+
+def safe_getattr(instance, attribute_name: str, default : Any = MISSING_VALUE):
+    """Use a safe alternative to getattr."""
+    if not safe_hasattr(instance, attribute_name):
+        if default is MISSING_VALUE:
+            raise AttributeError(f'"{str(instance)}" has no attribute "{attribute_name}"')
+        return default
+    return getattr(instance, attribute_name)
+
+
+def read_ndict(nested_dict: dict, nested_key: str, placeholder=KeyError('Missing nested key')):
+    """Read a value in a nested dictionary using a single combined key.
+    Return the placeholder if any key in the path does not exist.
+    """
+    keys = nested_key.split('.')
+    value = nested_dict
+    for key in keys:
+        # support list indices
+        if key.isdigit():
+            if type(value) is not list: return placeholder
+            index = int(key)
+            value = value[index]
+        # support dict keys
+        else:
+            if type(value) is not dict: return placeholder
+            value = value.get(key, placeholder)
+            if value == placeholder: return placeholder
+    return value
+
+
+def write_ndict(nested_dict: dict, nested_key: str, value):
+    """Write a value in a nested dictionary using a single combined key.
+    Raise an error if any key in the path is missing.
+    """
+    keys = nested_key.split('.')
+    nested_keys = keys[0:-1]
+    next_target = nested_dict
+    for k, key in enumerate(nested_keys):
+        # support list indices
+        if key.isdigit():
+            if type(next_target) is not list:
+                raise ValueError(f'{".".join(nested_keys[0:k])} should be a list, but it is {next_target}')
+            index = int(key)
+            next_target = next_target[index]
+        # support dict keys
+        else:
+            if type(next_target) is not dict:
+                raise ValueError(f'{".".join(nested_keys[0:k])} should be a dict, but it is {next_target}')
+            missing_key_error = KeyError(f'Missing nested key {key}')
+            next_target = next_target.get(key, missing_key_error)
+            if next_target == missing_key_error: raise missing_key_error
+    field = keys[-1]
+    next_target[field] = value
+
+
+def get_git_version() -> str:
+    """Get the current git version."""
+    git_command = f"git -C {__path__[0]}"
+    # The workflow was not installed from a git clone
+    if run(f"{git_command} rev-parse", shell=True, stdout=PIPE, stderr=PIPE).returncode != 0:
+        return __version__
+    process = run(f"{git_command} describe --tags", shell=True, stdout=PIPE, stderr=PIPE)
+    if process.returncode == 0:
+        return process.stdout.decode().strip()
+    # No tag is reachable from the current commit (e.g. a clone without tags)
+    commit = run(f"{git_command} rev-parse --short HEAD", shell=True, stdout=PIPE, stderr=PIPE).stdout.decode().strip()
+    return f'{__version__} untagged {commit}'
+
+
+def natural_sort_key(s):
+    """Sort strings that contain numbers in human order (C1, C2, C3 instead of C1, C11, C2)."""
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split('([0-9]+)', s)]
+
+
+@retry_request
+def handle_http_request(request_url, error_context="request") -> Optional[str]:
+    """Make an HTTP request handler with consistent error handling."""
+    try:
+        with urlopen(request_url) as response:
+            return response.read().decode("utf-8", errors='ignore')
+    except HTTPError as error:
+        if error.code == 404:
+            return None
+        if error.code == 429:
+            raise RateLimitError(f'Too many requests in the {error_context}',
+                retry_after=get_retry_after(error.headers))
+        raise RequestError(f'Something went wrong with the {error_context} (error {error.code})')
+    except URLError as error:
+        # Convert SSL/timeout URLErrors to TimeoutError so @retry_request decorator retries them
+        if 'ssl' in str(error.reason).lower() and 'timed out' in str(error.reason).lower():
+            raise TimeoutError(str(error.reason))
+        raise RequestError(f'Something went wrong with the {error_context}: {error.reason}')
+
+
+def unique(source_list: list) -> list:
+    """Get a new list with unique values while conserving the order."""
+    return list(dict.fromkeys(source_list))
+
+
+def list_values_match(list_a: list, list_b: list) -> bool:
+    """Given two lists, check if all their values perfectly match in the same order."""
+    # If lists do not match in length then we are done already
+    if len(list_a) != len(list_b):
+        return False
+    # Iterate pairs of values
+    for value_a, value_b in zip(list_a, list_b):
+        if value_a != value_b: return False
+    return True
+
+
+def get_first_list_values_missmatch(list_a: list, list_b: list) -> bool:
+    """Given two lists, find the first value which does not match between them. Return None if there is no missmatch"""
+    for index, (value_a, value_b) in enumerate(zip(list_a, list_b)):
+        if value_a != value_b: return index, value_a, value_b
+    return None
+
+
+def get_available_cpus() -> int:
+    """Count the CPUs this process may use.
+
+    The CPU count of the machine is wrong in clusters: a SLURM job gets only the CPUs it requested,
+    and memory for them, while its node has many more (56 or 64 in the MMB partitions of the IRB cluster).
+    """
+    # CPUs this process is allowed to run on, restricted by cgroups and taskset
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    # Not available in macOS
+    except AttributeError:
+        cpus = os.cpu_count() or 1
+    # SLURM does not always pin the job to its CPUs, but it says how many were requested
+    slurm_cpus = os.environ.get('SLURM_CPUS_PER_TASK') or os.environ.get('SLURM_CPUS_ON_NODE')
+    if slurm_cpus and slurm_cpus.isdigit():
+        cpus = min(cpus, int(slurm_cpus))
+    return max(cpus, 1)
+
+
+def _timeout_worker(func, result_queue, args, kwargs):
+    """Worker function that runs in a separate process for timeout support."""
+    try:
+        result = func(*args, **kwargs)
+        result_queue.put(('success', result))
+    except Exception as e:
+        result_queue.put(('error', e))
+
+
+def timeout(seconds=60):
+    """Add a timeout to a function using a separate process.
+
+    Unlike the signal-based approach, this works in:
+    - Non-main threads
+    - Multiprocessing / cluster environments
+    - Any OS (not just Unix)
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            result_queue = multiprocessing.Queue()
+            process = multiprocessing.Process(
+                target=_timeout_worker,
+                args=(func, result_queue, args, kwargs),
+            )
+            process.start()
+            process.join(timeout=seconds)
+
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                # Force kill if it didn't terminate gracefully
+                if process.is_alive():
+                    process.kill()
+                    process.join()
+                raise TimeoutError(f"Function '{func.__name__}' timed out after {seconds} seconds.")
+
+            if result_queue.empty():
+                raise RuntimeError(f"Function '{func.__name__}' terminated without returning a result.")
+
+            status, payload = result_queue.get_nowait()
+            if status == 'error':
+                raise payload
+            return payload
+        return wrapper
+    return decorator
+
+
+class SocketTimeout:
+    """Set socket timeout for a block of code.
+
+    This is a simpler alternative to the full process-based timeout for cases where we just want to
+    ensure that network operations don't hang indefinitely.
+    This is the case for SSL handshakes in clusters where connection issues can cause long hangs.
+    """
+    def __init__(self, seconds: int):
+        self.seconds = seconds
+        self.old_timeout = None
+
+    def start(self):
+        # Save the current timeout
+        self.old_timeout = socket.getdefaulttimeout()
+        # Set the new timeout
+        socket.setdefaulttimeout(self.seconds)
+
+    def stop(self):
+        # Restore the original timeout
+        socket.setdefaulttimeout(self.old_timeout)
+
+
+def get_auxiliar_filepath(filename: str) -> str:
+    """Get the path of an auxiliar file to be created where the workflow is to be run (--dir).
+    Note that this must be requested from a function, or the globals may be not updated.
+    """
+    return f'{GLOBALS["working_directory"]}/{filename}'
+
+
+def download_mmcif(pdb_id: str, output_filepath: str):
+    """Download a mmCIF file corresponding to a PDB entry."""
+    request_url = f'https://files.rcsb.org/download/{pdb_id}.cif'
+    try:
+        parsed_response = None
+        with urllib.request.urlopen(request_url) as response:
+            parsed_response = response.read().decode("utf-8")
+        with open(output_filepath, 'w') as file:
+            file.write(parsed_response)
+    except Exception as error:
+        raise Exception(f'Something went wrong when downloading {pdb_id} structure: {request_url} with error: {error}')

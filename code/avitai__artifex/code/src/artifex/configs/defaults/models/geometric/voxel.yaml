@@ -1,0 +1,15 @@
+name: default_voxel_model
+description: Default typed config for voxel generation models.
+network:
+  name: voxel_network
+  hidden_dims: [64, 64, 64, 64]
+  activation: gelu
+  base_channels: 64
+  num_layers: 4
+  kernel_size: 3
+  use_residual: true
+voxel_size: 16
+voxel_dim: 1
+loss_type: focal
+focal_gamma: 2.0
+dropout_rate: 0.1

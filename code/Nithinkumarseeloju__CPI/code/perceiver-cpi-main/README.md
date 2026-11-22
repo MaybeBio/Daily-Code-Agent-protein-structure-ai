@@ -1,0 +1,212 @@
+# Perceiver CPI binding-affinity app (Group G1590)
+
+Predicts how strongly a compound (SMILES) binds to a protein (amino-acid sequence), using the Perceiver CPI model (Nguyen et al., *Bioinformatics* 2023) trained on one of three benchmark datasets: Davis, KIBA or Metz. Each dataset uses its own scale, so scores from different models can't be compared with each other.
+
+> **Status:** the app runs end to end. Three trained models, a FastAPI backend, a structure
+> lookup that finds real solved complexes, and a web interface — all from one server. See
+> [CLAUDE.md](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/CLAUDE.md) for the full phase history.
+>
+> **Honest summary of accuracy:** all three models are worse than the published paper, and they are
+> much better at telling compounds apart than proteins. Both are measured, explained and reported
+> rather than glossed over. Third-party code is listed in [THIRD_PARTY.md](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/THIRD_PARTY.md).
+
+**Requirements so far:** Windows, Git, Python 3.12 (`py -3.12`). Model training runs on Google Colab, because this machine has no NVIDIA GPU.
+
+## Folder layout
+
+| Folder | What's in it |
+|---|---|
+| `reference/` | Paper full text, official repo zip, raw datasets (read-only) |
+| `model_2d/` | Perceiver CPI model code (from the official repo) |
+| `data/` | Cleaned datasets and train/val/test splits |
+| `experiments/` | Configs, logs, results tables |
+| `models/` | Final trained models: `davis/`, `kiba/`, `metz/` |
+| `backend/` | FastAPI server |
+| `frontend/` | React + Vite web page |
+
+## Data
+
+The raw CSVs are not stored in git because they're too large. Put them in `reference/data/`:
+
+| File | Rows | Label |
+|---|---|---|
+| `davis.csv` | 30,056 | pKd |
+| `kiba.csv` | 118,254 | KIBA score |
+| `metz.csv` | 35,259 | pKi |
+
+Then build the cleaned files in `data/` (~20 s) and check them:
+
+```
+.venv\Scripts\python.exe data\prepare_datasets.py
+.venv\Scripts\python.exe data\check_datasets.py --with-model
+```
+
+The cleaned files have the columns `smiles,sequence,label`.
+- **Davis:** 30,056 rows, unchanged.
+- **KIBA:** 117,657 rows, after dropping duplicates and averaging repeated pairs. This matches the paper.
+- **Metz:** 35,259 rows, unchanged.
+
+What changed and why: [data/prep_report.md](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/data/prep_report.md). Every merged KIBA pair is listed in [data/logs/kiba_merged_pairs.csv](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/data/logs/kiba_merged_pairs.csv).
+
+## Train/test splits
+
+Build the 5-fold splits the paper uses, then check them for leakage:
+
+```
+.venv\Scripts\python.exe data\make_splits.py
+.venv\Scripts\python.exe data\check_splits.py --with-model
+```
+
+- **Build time:** about 36 s, using the saved protein-similarity file. The checks take about 7 min, mostly re-aligning proteins and a 1-epoch training run.
+- **Settings:**
+  - Davis gets novel pair, novel compound, novel protein and novel-hard pair.
+  - KIBA and Metz get novel pair only, as in the paper.
+- **Where the files go:** `data/splits/<dataset>/<setting>/fold{0-4}_{train,val,test}.csv`, about 800 MB, not in git.
+- **Fold sizes:** see [data/splits/summary.md](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/data/splits/summary.md). The decisions behind the splits are in CLAUDE.md §4.
+
+## Setup (local, CPU)
+
+From the project folder, in PowerShell:
+
+```
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install torch==2.15.0 --index-url https://download.pytorch.org/whl/cpu
+.venv\Scripts\python.exe -m pip install -r model_2d\requirements.txt
+```
+
+That is about 350 MB to download and ~1.5 GB on disk.
+
+The model code in `model_2d/` is the official Perceiver CPI repo, with three small fixes so it runs on modern PyTorch. They are listed in [model_2d/CHANGES.md](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/model_2d/CHANGES.md).
+
+## Check that it works (toy dataset)
+
+From `model_2d\`, train a tiny model (~1 min on CPU), then predict with it:
+
+```
+..\.venv\Scripts\python.exe train.py --data_path ./toy_dataset/novel_pair_0_train.csv --separate_val_path ./toy_dataset/novel_pair_0_val.csv --separate_test_path ./toy_dataset/novel_pair_0_test.csv --metric mse --dataset_type regression --save_dir ../experiments/phase1_smoke/toy_ckpt --target_columns label --epochs 150 --ensemble_size 3 --num_folds 1 --batch_size 50 --aggregation mean --dropout 0.1 --save_preds --seed 0
+..\.venv\Scripts\python.exe predict.py --test_path ./toy_dataset/novel_pair_0_test.csv --checkpoint_dir ../experiments/phase1_smoke/toy_ckpt --preds_path ../experiments/phase1_smoke/toy_preds.csv --num_workers 0
+```
+
+Expected results are in [experiments/phase1_smoke/README.md](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/experiments/phase1_smoke/README.md).
+
+## Training the baseline (Phase 4, needs an NVIDIA GPU)
+
+We train **one model per dataset** on novel-pair fold 0 (see CLAUDE.md §6 for why). First, build the bundle on this laptop (~38 MB):
+
+```
+.venv\Scripts\python.exe experiments\phase4_baseline\make_bundle.py
+```
+
+Then use either route.
+
+**A. Google Colab (the college's GPU; current plan).** Upload `experiments\phase4_baseline\colab_upload\perceiver_cpi_colab\` to Google Drive and share it.
+- Steps and an email draft are in [UPLOAD_GUIDE.md](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/experiments/phase4_baseline/colab/UPLOAD_GUIDE.md).
+- Whoever runs the notebook just chooses *Run all*. It resumes after disconnects and writes `results_to_copy.zip` into the Drive folder.
+
+**B. A laptop with an NVIDIA GPU.** Copy `perceiver_gpu_bundle.zip` to it and follow [RUN_ON_GPU_LAPTOP.md](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/experiments/phase4_baseline/gpu_bundle/RUN_ON_GPU_LAPTOP.md).
+
+Either way, extract `results_to_copy.zip` into `experiments\phase4_baseline\`. The results then sit in `experiments\phase4_baseline\runs\`.
+
+For predictions with a ± (MC dropout), see [model_2d/mc_dropout.py](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/model_2d/mc_dropout.py).
+
+## The 3D binding pose
+
+Poses come from **AutoDock Vina**, which needs no trained model — it is a physics scoring function.
+Two routes, and the app uses whichever is available:
+
+1. **A solved structure, when one exists.** The app looks the pair up in BindingDB and shows the
+   real experimental complex. Works today, no extra software, covers 74% of Davis test pairs.
+2. **Docking, for everything else.** Runs in a separate service. Connect it with
+   `PERCEIVER_DOCKING_URL`; full instructions in **[docs/3D_INTEGRATION.md](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/docs/3D_INTEGRATION.md)**.
+
+Unset, the job endpoints say so plainly rather than faking a result.
+
+## Running the app
+
+One command, one server — the interface, the API and the models together:
+
+```
+.venv\Scripts\python.exe -m uvicorn backend.app:app --port 8000
+```
+
+Then open <http://127.0.0.1:8000/>.
+
+Pick a dataset, search for a pair (or paste your own SMILES and sequence), and press Predict. You
+get an affinity score with its band and confidence, the measured laboratory value when the pair is
+in the source data, and — when anyone has solved it — the real experimental structure, with the
+pocket residues and polar contacts drawn.
+
+### 1. Build the model registry (once)
+
+Copies the trained checkpoints into `models/`, writes a model card for each, and works out the
+"is this input anything like the training data?" thresholds. Takes a few minutes.
+
+```
+.venv\Scripts\python.exe models\build_registry.py
+.venv\Scripts\python.exe models\calibrate_confidence.py
+```
+
+The second one calibrates the low/medium/high confidence label on each model's **validation** set.
+The test set is never used for this.
+
+### 2. Start the backend
+
+```
+.venv\Scripts\python.exe -m uvicorn backend.app:app --reload --port 8000
+```
+
+Open <http://127.0.0.1:8000/docs> for an interactive page you can try every endpoint from.
+
+| Endpoint | What it does |
+|---|---|
+| `GET /health` | Is the server up, and can it load the models |
+| `GET /models` | What the dropdown should offer, with each model's honest accuracy |
+| `POST /predict` | `{smiles, sequence, model}` -> score, unit, confidence, band, warnings |
+| `GET /history` | Recent predictions, newest first (SQLite, `backend/history.db`) |
+| `POST /predict-3d` | Returns 501. The 3D branch is a separate phase. |
+
+The first prediction takes a few seconds while the model loads; after that it is cached in memory.
+
+Try it from the command line:
+
+```
+curl -X POST http://127.0.0.1:8000/predict -H "Content-Type: application/json" ^
+  -d "{\"smiles\":\"CC(=O)Oc1ccccc1C(=O)O\",\"sequence\":\"MVHLTPEEK...\",\"model\":\"davis\"}"
+```
+
+Or without the server at all:
+
+```
+cd model_2d
+..\.venv\Scripts\python.exe predict_api.py --smiles "CC(=O)Oc1ccccc1C(=O)O" --sequence "MKKFF..." --model davis
+```
+
+### 3. Tests
+
+```
+.venv\Scripts\python.exe -m pytest backend -v
+```
+
+### How to read a prediction
+
+- **score** is in that model's own unit (pKd, pKi or KIBA score). Higher means stronger binding.
+  **Never compare a score from one model with a score from another** - the three datasets are on
+  different scales and were never merged.
+- **band** (strong / moderate / weak) uses the published cut-off where one exists: pKd >= 7 for
+  Davis, KIBA score >= 12.1. The second cut-off in each case is our own assumption and says so in
+  the response.
+- **confidence** is the spread of 30 predictions made with dropout left switched on. **It is not a
+  95% confidence interval** - measured coverage is 33-63%. It is shown as a relative
+  low/medium/high label, with the cut-offs calibrated on validation data.
+- **warnings** always include the protein caveat, and will tell you when your compound or protein
+  is outside what the model was trained on.
+
+### Known limitations, measured
+
+| | What we measured |
+|---|---|
+| Accuracy vs the paper | Davis 0.622 vs 0.463, Metz 0.762 vs 0.658, KIBA 0.575 vs 0.522 (test MSE, lower is better) |
+| Protein sensitivity | Hold the compound fixed and change the protein, and the model's ranking is close to random. See [experiments/phase5/protein_sensitivity.md](https://github.com/Nithinkumarseeloju/CPI/blob/HEAD/perceiver-cpi-main/experiments/phase5/protein_sensitivity.md). |
+| Protein length | Only the first 499 residues are used, as in the published model |
+| Scope | Trained on kinase inhibitors and kinases only |

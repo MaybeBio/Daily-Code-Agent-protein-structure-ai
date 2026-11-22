@@ -1,0 +1,518 @@
+"""Tests for `oplm.model.configuration_oplm` — OplmConfig validation and derivation."""
+
+from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING
+
+import pytest
+
+from oplm.model import OplmConfig
+from oplm.model.ffn import round_up_to
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Defaults and derived fields
+# ---------------------------------------------------------------------------
+
+
+def test_defaults_match_architecture_spec():
+    cfg = OplmConfig()
+    assert cfg.model_type == "oplm"
+    assert cfg.vocab_size == 33
+    assert cfg.hidden_size == 768
+    assert cfg.num_hidden_layers == 12
+    assert cfg.num_attention_heads == 12
+    assert cfg.max_position_embeddings == 1024
+    assert cfg.rope_theta == 10000.0
+    assert cfg.norm_type == "layernorm"
+    assert cfg.norm_strategy == "pre"
+    assert cfg.qk_norm is True
+    assert cfg.qk_norm_mode == "channel"
+    assert cfg.qk_norm_l2_scale_init is None
+    assert cfg.mask_dropout is False
+    assert cfg.mask_dropout_reference_ratio == 0.12
+    assert cfg.residual_scaling == "sqrt_num_layers"
+    assert cfg.residual_gate == "none"
+    assert cfg.residual_gate_init == 1.0
+    assert cfg.attn_output_gate == "none"
+    assert cfg.value_residual == "none"
+    assert cfg.value_residual_lambda_init == 0.5
+    assert cfg.init_scale_output_projections is True
+    assert cfg.ffn_activation == "swiglu"
+    assert cfg.ffn_bias is False
+    assert cfg.attention_dropout == 0.0
+    assert cfg.hidden_dropout == 0.0
+    assert cfg.tie_word_embeddings is False
+    assert cfg.mlm_head_activation == "gelu"
+    assert cfg.canon_enabled is False
+    assert cfg.canon_residual is True
+    assert cfg.canon_positions == []
+    assert cfg.canon_activation == "none"
+    assert cfg.classifier_pool == "mean"
+    assert cfg.classifier_dropout == 0.0
+    assert cfg.pre_head_norm is False
+    assert cfg.mup_enable is False
+    assert cfg.mup_base_width == 512
+    assert cfg.mup_output_mult == 1.0
+    assert cfg.gradient_checkpointing is False
+    assert cfg.pad_token_id == 1
+    assert cfg.bos_token_id == 0
+    assert cfg.eos_token_id == 2
+    assert cfg.unk_token_id == 3
+    assert cfg.mask_token_id == 32
+
+
+def test_head_dim_derived_from_hidden_and_heads():
+    cfg = OplmConfig(hidden_size=512, num_attention_heads=8)
+    assert cfg.head_dim == 64
+
+
+def test_intermediate_size_derived_from_swiglu_convention():
+    cfg = OplmConfig(hidden_size=768)
+    # 8/3 * 768 = 2048; already a multiple of 256.
+    assert cfg.intermediate_size == round_up_to(int(8 * 768 / 3), 256)
+    assert cfg.intermediate_size == 2048
+
+
+def test_intermediate_size_rounds_up_to_256():
+    cfg = OplmConfig(hidden_size=512, num_attention_heads=8)
+    # 8/3 * 512 ≈ 1365 -> round up to nearest 256 -> 1536.
+    assert cfg.intermediate_size == 1536
+
+
+def test_rope_dim_defaults_to_head_dim_with_zero_nope():
+    cfg = OplmConfig(hidden_size=512, num_attention_heads=8)
+    assert cfg.rope_dim == cfg.head_dim
+    assert cfg.nope_dim == 0
+
+
+def test_explicit_overrides_take_precedence_over_derivations():
+    cfg = OplmConfig(
+        hidden_size=512,
+        num_attention_heads=8,
+        head_dim=64,
+        intermediate_size=2048,
+        rope_dim=32,
+        nope_dim=32,
+    )
+    assert cfg.head_dim == 64
+    assert cfg.intermediate_size == 2048
+    assert cfg.rope_dim == 32
+    assert cfg.nope_dim == 32
+
+
+# ---------------------------------------------------------------------------
+# Validation rules
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_hidden_size_not_divisible_by_heads():
+    with pytest.raises(ValueError, match="divisible by num_attention_heads"):
+        OplmConfig(hidden_size=100, num_attention_heads=8)
+
+
+def test_rejects_head_dim_mismatch():
+    with pytest.raises(ValueError, match="must equal hidden_size"):
+        OplmConfig(hidden_size=512, num_attention_heads=8, head_dim=128)
+
+
+def test_rejects_rope_plus_nope_mismatch():
+    with pytest.raises(ValueError, match="must equal"):
+        OplmConfig(
+            hidden_size=512,
+            num_attention_heads=8,
+            head_dim=64,
+            rope_dim=32,
+            nope_dim=16,
+        )
+
+
+def test_rejects_odd_rope_dim():
+    with pytest.raises(ValueError, match="rope_dim must be even"):
+        OplmConfig(
+            hidden_size=512,
+            num_attention_heads=8,
+            head_dim=64,
+            rope_dim=33,
+            nope_dim=31,
+        )
+
+
+def test_rejects_negative_rope_dim():
+    with pytest.raises(ValueError, match="rope_dim must be >= 0"):
+        OplmConfig(
+            hidden_size=512,
+            num_attention_heads=8,
+            head_dim=64,
+            rope_dim=-2,
+            nope_dim=66,
+        )
+
+
+@pytest.mark.parametrize(
+    "field,bad_value,expected_match",
+    [
+        ("norm_type", "zorm", "norm_type must be one of"),
+        ("norm_strategy", "preprost", "norm_strategy must be one of"),
+        ("qk_norm_mode", "cosine", "qk_norm_mode must be one of"),
+        ("residual_scaling", "linear", "residual_scaling must be one of"),
+        ("residual_gate", "vector", "residual_gate must be one of"),
+        ("attn_output_gate", "tanh", "attn_output_gate must be one of"),
+        ("value_residual", "blend", "value_residual must be one of"),
+        ("ffn_activation", "relu", "ffn_activation must be one of"),
+        ("mlm_head_activation", "swiglu", "mlm_head_activation must be one of"),
+        ("canon_activation", "tanh", "canon_activation must be one of"),
+        ("classifier_pool", "max", "classifier_pool must be one of"),
+    ],
+)
+def test_rejects_unknown_categorical_values(field, bad_value, expected_match):
+    with pytest.raises(ValueError, match=expected_match):
+        OplmConfig(**{field: bad_value})
+
+
+# --- Architecture-ablation toggles (mask dropout, L2 QKNorm, residual gates) ---
+
+
+@pytest.mark.parametrize("ratio", [-0.01, 1.0, 1.5])
+def test_rejects_mask_dropout_reference_ratio_out_of_range(ratio):
+    with pytest.raises(ValueError, match="mask_dropout_reference_ratio must satisfy"):
+        OplmConfig(mask_dropout_reference_ratio=ratio)
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.12, 0.99])
+def test_accepts_mask_dropout_reference_ratio_in_range(ratio):
+    cfg = OplmConfig(mask_dropout_reference_ratio=ratio)
+    assert cfg.mask_dropout_reference_ratio == ratio
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0])
+def test_rejects_non_positive_qk_norm_l2_scale_init(scale):
+    with pytest.raises(ValueError, match="qk_norm_l2_scale_init must be positive"):
+        OplmConfig(qk_norm_mode="l2", qk_norm_l2_scale_init=scale)
+
+
+def test_accepts_positive_qk_norm_l2_scale_init():
+    cfg = OplmConfig(qk_norm_mode="l2", qk_norm_l2_scale_init=8.0)
+    assert cfg.qk_norm_l2_scale_init == 8.0
+
+
+def test_qk_norm_l2_scale_init_none_is_preserved():
+    cfg = OplmConfig(qk_norm_mode="l2")
+    assert cfg.qk_norm_l2_scale_init is None
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_rejects_non_finite_residual_gate_init(value):
+    with pytest.raises(ValueError, match="residual_gate_init must be finite"):
+        OplmConfig(residual_gate_init=value)
+
+
+@pytest.mark.parametrize("gate", ["none", "scalar", "channel"])
+def test_accepts_valid_residual_gate_modes(gate):
+    cfg = OplmConfig(residual_gate=gate)
+    assert cfg.residual_gate == gate
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_rejects_non_finite_value_residual_lambda_init(value):
+    with pytest.raises(ValueError, match="value_residual_lambda_init must be finite"):
+        OplmConfig(value_residual_lambda_init=value)
+
+
+@pytest.mark.parametrize("mode", ["none", "fixed", "learnable"])
+def test_accepts_valid_value_residual_modes(mode):
+    cfg = OplmConfig(value_residual=mode)
+    assert cfg.value_residual == mode
+
+
+def test_canon_enabled_requires_non_empty_positions():
+    with pytest.raises(ValueError, match="canon_positions must be non-empty"):
+        OplmConfig(canon_enabled=True, canon_positions=[])
+
+
+def test_canon_residual_can_be_disabled_explicitly():
+    cfg = OplmConfig(canon_residual=False)
+    assert cfg.canon_residual is False
+
+
+def test_canon_rejects_unknown_position():
+    with pytest.raises(ValueError, match="canon_positions entries must be a subset"):
+        OplmConfig(canon_enabled=True, canon_positions=["A", "Z"], canon_kernel_sizes=3)
+
+
+def test_canon_rejects_duplicate_positions():
+    with pytest.raises(ValueError, match="must not contain duplicates"):
+        OplmConfig(canon_enabled=True, canon_positions=["A", "A"], canon_kernel_sizes=3)
+
+
+def test_canon_rejects_hybrid_norm_strategy():
+    """hybrid has no outer attention pre-norm, so Canon-A has no insertion point."""
+    with pytest.raises(ValueError, match="not supported with norm_strategy='hybrid'"):
+        OplmConfig(
+            canon_enabled=True,
+            canon_positions=["A"],
+            canon_kernel_sizes=3,
+            norm_strategy="hybrid",
+        )
+
+
+@pytest.mark.parametrize("strategy", ["pre", "sandwich", "post_sdpa"])
+def test_canon_allowed_under_pre_sandwich_post_sdpa(strategy: str):
+    """Canon is valid under every strategy that keeps an outer attention pre-norm."""
+    cfg = OplmConfig(
+        canon_enabled=True,
+        canon_positions=["A", "B", "C", "D"],
+        canon_kernel_sizes=3,
+        norm_strategy=strategy,
+    )
+    assert cfg.norm_strategy == strategy
+
+
+def test_canon_resolved_kernel_sizes_cached_back_onto_field():
+    cfg = OplmConfig(
+        num_hidden_layers=4,
+        canon_enabled=True,
+        canon_positions=["A"],
+        canon_kernel_sizes=3,
+    )
+    assert cfg.canon_kernel_sizes == [3, 3, 3, 3]
+
+
+def test_canon_linear_schedule_resolves_per_layer():
+    cfg = OplmConfig(
+        num_hidden_layers=5,
+        canon_enabled=True,
+        canon_positions=["A", "D"],
+        canon_kernel_sizes={"schedule": "linear", "min": 3, "max": 11},
+    )
+    assert cfg.canon_kernel_sizes == [3, 5, 7, 9, 11]
+
+
+def test_canon_constant_schedule_resolves_per_layer():
+    cfg = OplmConfig(
+        num_hidden_layers=3,
+        canon_enabled=True,
+        canon_positions=["C"],
+        canon_kernel_sizes={"schedule": "constant", "value": 5},
+    )
+    assert cfg.canon_kernel_sizes == [5, 5, 5]
+
+
+def test_canon_kernel_size_list_length_mismatch_raises():
+    with pytest.raises(ValueError, match="canon_kernel_sizes list has length"):
+        OplmConfig(
+            num_hidden_layers=4,
+            canon_enabled=True,
+            canon_positions=["A"],
+            canon_kernel_sizes=[3, 3, 3],
+        )
+
+
+def test_canon_disabled_does_not_resolve_kernel_sizes():
+    """When canon is off, the raw value is left untouched (no resolution required)."""
+    cfg = OplmConfig(
+        num_hidden_layers=4,
+        canon_enabled=False,
+        canon_kernel_sizes=4,
+    )
+    assert cfg.canon_kernel_sizes == 4
+
+
+def test_non_default_vocab_emits_warning():
+    with pytest.warns(UserWarning, match="custom vocabularies are not yet supported"):
+        OplmConfig(vocab_size=64)
+
+
+# ---------------------------------------------------------------------------
+# Pass-through / forward-compat with PretrainedConfig kwargs
+# ---------------------------------------------------------------------------
+
+
+def test_pretrained_config_kwargs_forwarded():
+    cfg = OplmConfig(
+        architectures=["OplmForMaskedLM"],
+        _name_or_path="brineylab/oplm-base",
+    )
+    # Both attrs come from PretrainedConfig.__init__'s kwargs handling.
+    assert cfg.architectures == ["OplmForMaskedLM"]
+    assert cfg._name_or_path == "brineylab/oplm-base"
+
+
+def test_tie_word_embeddings_forwarded_to_base_class():
+    cfg = OplmConfig(tie_word_embeddings=True)
+    assert cfg.tie_word_embeddings is True
+
+
+# ---------------------------------------------------------------------------
+# μP (maximal update parametrization) fields and helpers
+# ---------------------------------------------------------------------------
+
+
+def test_mup_width_mult_is_noop_when_disabled():
+    """With μP off, the width multiplier is 1.0 regardless of hidden_size."""
+    cfg = OplmConfig(hidden_size=1024, num_attention_heads=16, mup_base_width=512)
+    assert cfg.mup_enable is False
+    assert cfg.mup_width_mult() == 1.0
+
+
+def test_mup_width_mult_is_one_at_base_width():
+    """When enabled at the base width, m = 1 (the pilot-sweep reference)."""
+    cfg = OplmConfig(hidden_size=512, num_attention_heads=8, mup_enable=True, mup_base_width=512)
+    assert cfg.mup_width_mult() == 1.0
+
+
+def test_mup_width_mult_scales_with_hidden_size():
+    """m = hidden_size / mup_base_width when μP is enabled."""
+    cfg = OplmConfig(hidden_size=1024, num_attention_heads=16, mup_enable=True, mup_base_width=512)
+    assert cfg.mup_width_mult() == 2.0
+
+
+def test_mup_base_intermediate_size_uses_rounding_not_global_m():
+    """down_proj's base fan-in follows the same round_up_to as the live FFN width.
+
+    At hidden 1024 the live intermediate is 2816 and the base (512) intermediate
+    is 1536, so the FFN fan-in ratio is 2816/1536 ≈ 1.833 — distinct from the
+    hidden width multiplier m = 2.0 (the FFN-rounding correction, μP Finding 5).
+    """
+    cfg = OplmConfig(hidden_size=1024, num_attention_heads=16, mup_enable=True, mup_base_width=512)
+    assert cfg.intermediate_size == 2816
+    assert cfg.mup_base_intermediate_size() == 1536
+    assert cfg.mup_base_intermediate_size() == round_up_to(int(8 * 512 / 3), 256)
+    assert cfg.intermediate_size / cfg.mup_base_intermediate_size() != cfg.mup_width_mult()
+
+
+def test_mup_base_intermediate_size_honors_relu2():
+    """The base FFN fan-in uses the relu2 (~4·D) derivation under relu2 activation."""
+    cfg = OplmConfig(hidden_size=768, ffn_activation="relu2", mup_base_width=512)
+    assert cfg.mup_base_intermediate_size() == round_up_to(4 * 512, 256) == 2048
+
+
+@pytest.mark.parametrize("bad_width", [0, -1])
+def test_rejects_non_positive_mup_base_width(bad_width):
+    with pytest.raises(ValueError, match="mup_base_width must be >= 1"):
+        OplmConfig(mup_base_width=bad_width)
+
+
+@pytest.mark.parametrize("bad_mult", [0.0, -1.0])
+def test_rejects_non_positive_mup_output_mult(bad_mult):
+    with pytest.raises(ValueError, match="mup_output_mult must be > 0"):
+        OplmConfig(mup_output_mult=bad_mult)
+
+
+def test_mup_fields_survive_save_load_roundtrip(tmp_path: Path):
+    """μP fields ride in config.json and restore on from_pretrained."""
+    cfg = OplmConfig(
+        hidden_size=512,
+        num_attention_heads=8,
+        mup_enable=True,
+        mup_base_width=256,
+        mup_output_mult=2.5,
+    )
+    cfg.save_pretrained(tmp_path)
+
+    on_disk = json.loads((tmp_path / "config.json").read_text())
+    assert on_disk["mup_enable"] is True
+    assert on_disk["mup_base_width"] == 256
+    assert on_disk["mup_output_mult"] == 2.5
+
+    restored = OplmConfig.from_pretrained(tmp_path)
+    assert restored.mup_enable is True
+    assert restored.mup_base_width == 256
+    assert restored.mup_output_mult == 2.5
+    assert restored.mup_width_mult() == 2.0  # 512 / 256
+
+
+# ---------------------------------------------------------------------------
+# save_pretrained / from_pretrained round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_save_and_from_pretrained_roundtrip_preserves_fields(tmp_path: Path):
+    cfg = OplmConfig(
+        hidden_size=512,
+        num_hidden_layers=4,
+        num_attention_heads=8,
+        norm_type="rmsnorm",
+        norm_strategy="sandwich",  # Canon (below) is valid under sandwich
+        qk_norm_mode="l2",
+        qk_norm_l2_scale_init=8.0,
+        mask_dropout=True,
+        mask_dropout_reference_ratio=0.1,
+        residual_gate="channel",
+        residual_gate_init=0.5,
+        canon_enabled=True,
+        canon_positions=["A", "D"],
+        canon_kernel_sizes={"schedule": "linear", "min": 3, "max": 9},
+        post_embed_norm=True,
+        tie_word_embeddings=True,
+    )
+    cfg.save_pretrained(tmp_path)
+
+    on_disk = json.loads((tmp_path / "config.json").read_text())
+    assert on_disk["model_type"] == "oplm"
+    # The resolved per-layer list is serialised — not the original dict spec.
+    assert on_disk["canon_kernel_sizes"] == [3, 5, 7, 9]
+
+    restored = OplmConfig.from_pretrained(tmp_path)
+    assert restored.hidden_size == 512
+    assert restored.num_hidden_layers == 4
+    assert restored.num_attention_heads == 8
+    assert restored.head_dim == 64
+    assert restored.norm_type == "rmsnorm"
+    assert restored.norm_strategy == "sandwich"
+    assert restored.qk_norm_mode == "l2"
+    assert restored.qk_norm_l2_scale_init == 8.0
+    assert restored.mask_dropout is True
+    assert restored.mask_dropout_reference_ratio == 0.1
+    assert restored.residual_gate == "channel"
+    assert restored.residual_gate_init == 0.5
+    assert restored.canon_enabled is True
+    assert restored.canon_residual is True
+    assert restored.canon_positions == ["A", "D"]
+    assert restored.canon_kernel_sizes == [3, 5, 7, 9]
+    assert restored.post_embed_norm is True
+    assert restored.tie_word_embeddings is True
+
+
+def test_save_pretrained_writes_token_ids(tmp_path: Path):
+    cfg = OplmConfig()
+    cfg.save_pretrained(tmp_path)
+    on_disk = json.loads((tmp_path / "config.json").read_text())
+    assert on_disk["pad_token_id"] == 1
+    assert on_disk["bos_token_id"] == 0
+    assert on_disk["eos_token_id"] == 2
+
+
+def test_packed_attention_defaults_to_sdpa() -> None:
+    assert OplmConfig().packed_attention == "sdpa"
+
+
+def test_packed_attention_defaults_to_sdpa_for_old_configs() -> None:
+    saved = OplmConfig().to_dict()
+    del saved["packed_attention"]  # an hf/config.json written before the field existed
+    assert OplmConfig.from_dict(saved).packed_attention == "sdpa"
+
+
+def test_packed_attention_flex_round_trips() -> None:
+    cfg = OplmConfig(packed_attention="flex")
+    assert OplmConfig.from_dict(cfg.to_dict()).packed_attention == "flex"
+
+
+def test_packed_attention_rejects_unknown_value() -> None:
+    with pytest.raises(ValueError, match="packed_attention must be one of"):
+        OplmConfig(packed_attention="flash")
+
+
+def test_packed_attention_flex_rejects_attention_dropout() -> None:
+    with pytest.raises(ValueError, match="no attention dropout"):
+        OplmConfig(packed_attention="flex", attention_dropout=0.1)
+
+
+def test_accepts_esmc_qk_norm_and_residual_scaling():
+    """The ESM-C recipe's full-width QK norm and sqrt(L/36) residual scaling validate."""
+    cfg = OplmConfig(qk_norm_mode="full", residual_scaling="esmc")
+    assert cfg.qk_norm_mode == "full"
+    assert cfg.residual_scaling == "esmc"

@@ -1,0 +1,4167 @@
+# Overview
+
+
+
+OpenFE is a comprehensive Python framework for alchemical free energy calculations in drug discovery. As the flagship project of the Open Free Energy consortium, it provides robust, permissively licensed open-source tools for molecular simulation workflows. The toolkit enables researchers to plan, execute, and analyze free energy calculations using various methods through both Python APIs and command-line interfaces.
+
+## Architecture Overview
+
+OpenFE follows a modular architecture built around three core pillars: **Setup**, **Protocols**, and **Analysis**. The framework leverages the `gufe` library for fundamental data structures and provides extensive OpenMM-based simulation protocols.
+
+```mermaid
+graph TB
+    subgraph "Core Framework"
+        A[OpenFE Main Package]
+        B[gufe - Core Data Structures]
+        C[OpenMM - Simulation Engine]
+    end
+    
+    subgraph "Setup Layer"
+        D[Atom Mapping]
+        E[Ligand Network Planning]
+        F[Chemical System Generation]
+    end
+    
+    subgraph "Protocol Layer"
+        G[RBFE Protocols]
+        H[ABFE Protocols]
+        I[MD Protocols]
+        J[Septop Methods]
+    end
+    
+    subgraph "Interface Layer"
+        K[Python API]
+        L[Command Line Interface]
+        M[Analysis Tools]
+    end
+    
+    A --> B
+    A --> C
+    A --> D
+    A --> E
+    A --> F
+    A --> G
+    A --> H
+    A --> I
+    A --> J
+    A --> K
+    A --> L
+    A --> M
+```
+
+## Key Components
+
+### Setup Module
+The setup module provides tools for preparing molecular systems and planning calculations:
+
+- **Atom Mapping**: Multiple mapping algorithms including LomapAtomMapper, PersesAtomMapper, and KartografAtomMapper for determining correspondences between molecular structures [openfe/setup/__init__.py](openfe/setup/__init__.py#L5-L15)
+- **Network Planning**: Algorithms for optimizing ligand transformation networks to minimize computational cost while maximizing accuracy
+- **Chemical System Generation**: Tools for creating and validating molecular systems with proper components
+
+### Protocol System
+OpenFE implements a sophisticated protocol system for different types of free energy calculations:
+
+| Protocol Type | Description | Key Features |
+|---------------|-------------|--------------|
+| **RBFE** | Relative Binding Free Energy | Ligand binding comparisons, network-based optimization |
+| **ABFE** | Absolute Binding Free Energy | Single molecule binding calculations |
+| **MD** | Molecular Dynamics | System equilibration and production runs |
+| **Septop** | Restraint Methods | Advanced restraint systems for binding calculations |
+
+The protocols are organized in the [openfe/protocols](openfe/protocols/) directory with specialized modules for each calculation type, all built on OpenMM for high-performance molecular simulations.
+
+### Analysis and Visualization
+OpenFE provides comprehensive tools for analyzing and visualizing results:
+
+- **Network Analysis**: Maximum likelihood estimation for free energy networks
+- **3D Visualization**: Molecular structure and transformation visualization
+- **Plotting Tools**: Network graphs and result visualization capabilities
+
+## Interface Options
+
+OpenFE offers multiple ways to interact with the framework:
+
+### Python API
+The primary interface provides programmatic access to all OpenFE functionality:
+
+```python
+from openfe import LigandNetwork, Transformation
+from openfe.setup import LomapAtomMapper, ligand_network_planning
+```
+
+### Command Line Interface
+A comprehensive CLI ([openfecli/cli.py](openfecli/cli.py#L18-L25)) provides access to common operations through organized command sections:
+- **Network Planning**: Tools for creating optimal ligand networks
+- **Quickrun Executor**: Direct execution of calculations
+- **Miscellaneous**: Utility functions and data management
+
+## Project Structure
+
+The toolkit follows a well-organized structure that separates concerns and maintains modularity:
+
+![Project Structure](https://github.com/OpenFreeEnergy/openfe/blob/main/docs/_static/OFE-color-icon.svg?raw=true)
+
+- **Core Package** ([openfe/](openfe/)): Main library with setup, protocols, analysis, and utilities
+- **CLI Package** ([openfecli/](openfecli/)): Command-line interface and related tools
+- **Documentation** ([docs/](docs/)): Comprehensive documentation with tutorials, guides, and API reference
+- **Development Tools** ([devtools/](devtools/)): Scripts and utilities for development and testing
+
+## Getting Started
+
+OpenFE is designed to be accessible for beginners while providing advanced features for experts. The toolkit supports multiple installation methods including conda, Docker, and single-file installers. The project maintains high standards for code quality with comprehensive testing, documentation, and continuous integration.
+
+**Next Steps**: For hands-on experience, proceed to [Quick Start](2-quick-start) to install OpenFE and run your first calculation, or visit [Installation and Environment Setup](3-installation-and-environment-setup) for detailed installation instructions.
+
+# Quick Start
+
+
+
+Welcome to OpenFE! This quick start guide will get you up and running with alchemical free energy calculations in minutes. OpenFE is a powerful, open-source toolkit for planning, executing, and analyzing molecular free energy calculations for drug discovery and computational chemistry.
+
+## What You'll Accomplish
+
+In this quick start, you will:
+- Install OpenFE using the recommended method
+- Verify your installation works correctly  
+- Plan your first relative binding free energy (RBFE) network
+- Execute a basic free energy calculation
+- Understand the core OpenFE workflow
+
+## System Requirements
+
+Before we begin, ensure you have:
+- **POSIX system** (macOS or Linux/Unix) - OpenFE is not currently compatible with Windows
+- **Python 3.10+** (Python 3.11+ recommended for full functionality)
+- **GPU support** (optional but recommended for performance)
+
+## Installation
+
+### The Recommended Way: Miniforge
+
+We strongly recommend installing OpenFE with **Miniforge**, which provides easy installation of required dependencies like OpenMM and AmberTools.
+
+```bash
+# Install Miniforge (select your OS and architecture)
+curl -OL https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+sh Miniforge3-Linux-x86_64.sh -b
+~/miniforge3/bin/mamba init bash
+```
+
+After installation, restart your shell and create the OpenFE environment:
+
+```bash
+# Create and activate the OpenFE environment
+mamba create -n openfe_env openfe
+mamba activate openfe_env
+```
+
+### Verify Your Installation
+
+Test that everything is working correctly:
+
+```bash
+# Quick test (takes a few seconds)
+openfe test
+
+# Comprehensive test (takes up to an hour, tests GPU features)
+openfe test --long
+```
+
+> [!TIP]
+> The first `openfe test` run may take longer due to code compilation, but this only happens once per installation.
+
+## Core Architecture Overview
+
+OpenFE follows a modular, network-based approach to free energy calculations:
+
+```mermaid
+graph TB
+    A[Molecules] --> B[Atom Mapping]
+    B --> C[Network Planning]
+    C --> D[Protocol Setup]
+    D --> E[Simulation Execution]
+    E --> F[Results Analysis]
+    
+    subgraph "Core Components"
+        G[Chemical Systems]
+        H[Transformations]
+        I[Alchemical Networks]
+    end
+    
+    subgraph "Execution Layer"
+        J[Protocols]
+        K[Protocol Units]
+        L[Orchestration]
+    end
+```
+
+The toolkit is built around these key concepts from the `gufe` library [openfe/__init__.py](openfe/__init__.py#L18-L30):
+- **Chemical Systems**: Molecular representations (proteins, ligands, solvent)
+- **Transformations**: Alchemical pathways between molecular states
+- **Alchemical Networks**: Collections of interconnected transformations
+- **Protocols**: Simulation execution methods (RBFE, ABFE, MD, etc.)
+
+## Your First Calculation: CLI Workflow
+
+Let's walk through a complete RBFE calculation using the command line interface.
+
+### Step 1: Plan the Network
+
+Create a relative binding free energy network for a set of ligands:
+
+```bash
+openfe plan-rbfe-network \
+  --mol-dir path/to/ligands/ \
+  --protein path/to/protein.pdb \
+  --output-dir my_rbfe_network \
+  --mapper lomap \
+  --network-planner minimal-spanning-tree
+```
+
+This command:
+- Reads ligands from the specified directory
+- Maps atom correspondences using Lomap
+- Plans an efficient network using minimal spanning tree algorithm
+- Outputs the network configuration files
+
+### Step 2: Execute the Calculation
+
+Run the planned network using the quickrun executor:
+
+```bash
+openfe quickrun my_rbfe_network/transformation.json \
+  --work-dir my_rbfe_results \
+  --output results.json
+```
+
+The quickrun command [openfecli/commands/quickrun.py](openfecli/commands/quickrun.py#L25-L42) executes the transformation defined in the JSON file, creating directories for each simulation task and storing the results.
+
+### Step 3: Analyze Results
+
+While detailed analysis is covered in later tutorials, you can quickly check your results:
+
+```python
+import json
+
+# Load and examine results
+with open('results.json', 'r') as f:
+    results = json.load(f)
+    
+print(f"Free energy change: {results['free_energy']:.2f} kcal/mol")
+```
+
+## Your First Calculation: Python API Workflow
+
+For more flexibility and customization, use the Python API:
+
+```python
+from openfe import SmallMoleculeComponent, ProteinComponent, SolventComponent
+from openfe import LigandAtomMapper, LigandNetwork
+from openfe.setup import lomap_scorers, ligand_network_planning
+from openfe.protocols import OpenMM_RBFEProtocol
+
+# Load molecular components
+ligands = [SmallMoleculeComponent.from_file(f'ligand{i}.mol2') for i in range(5)]
+protein = ProteinComponent.from_file('protein.pdb')
+solvent = SolventComponent.from_file('solvent.xml')
+
+# Create atom mapper and plan network
+mapper = LigandAtomMapper()
+scorer = lomap_scorers.default
+network = ligand_network_planning.minimal_spanning_tree(ligands, mapper, scorer)
+
+# Set up and execute protocol
+protocol = OpenMM_RBFEProtocol(
+    settings={'forcefield': 'openff-2.0.0', 'temperature': 300.0}
+)
+
+# Execute the first transformation
+transformation = list(network.edges)[0]
+results = protocol.execute(transformation)
+print(f"ΔG = {results.get_free_energy():.2f} kcal/mol")
+```
+
+## Key Features at a Glance
+
+| Feature | CLI | Python API | Use Case |
+|---------|-----|------------|----------|
+| **Network Planning** | ✅ | ✅ | Quick setup vs. custom control |
+| **Protocol Selection** | ✅ | ✅ | Standard vs. custom protocols |
+| **Batch Execution** | ✅ | ✅ | Simple scripts vs. orchestration |
+| **Visualization** | Limited | ✅ | Basic vs. advanced plotting |
+| **Customization** | Limited | ✅ | Standard workflows vs. research |
+
+> [!TIP]
+> Start with the CLI for quick calculations, then transition to the Python API for complex workflows and custom protocols.
+
+## Installation Directory Structure
+
+When you install OpenFE, you get both the core library and command line tools:
+
+```
+openfe/                    # Core Python library
+├── protocols/             # Simulation protocols
+├── setup/                # System setup tools
+├── analysis/             # Results analysis
+└── utils/                # Utility functions
+
+openfecli/                 # Command line interface
+├── commands/             # CLI commands
+│   ├── plan_rbfe_network.py
+│   ├── quickrun.py
+│   └── ...
+└── parameters/           # CLI parameter handling
+```
+
+## Next Steps
+
+Now that you have OpenFE running, we recommend exploring these resources:
+
+1. **[Installation and Environment Setup](3-installation-and-environment-setup)** - Detailed installation options and troubleshooting
+2. **[Running Your First Free Energy Calculation](4-running-your-first-free-energy-calculation)** - Complete tutorial with real data
+3. **[CLI Overview and Common Commands](5-cli-overview-and-common-commands)** - Master the command line interface
+4. **[Python API Showcase](https://github.com/OpenFreeEnergy/ExampleNotebooks)** - Interactive Jupyter notebooks
+
+## Common Quick Start Issues
+
+| Issue | Solution |
+|-------|----------|
+| **Import errors** | Ensure you've activated the conda environment: `mamba activate openfe_env` |
+| **GPU not detected** | Install CUDA toolkit and check OpenMM GPU support: `python -c "from openmm import platform; print(platform.Platform.getPlatformByName('CUDA').getName())"` |
+| **Memory issues** | Reduce system size or use fewer parallel processes in your protocol settings |
+| **Slow calculations** | Enable GPU acceleration and use appropriate sampling settings |
+
+## Resources and Support
+
+- **Documentation**: [https://docs.openfree.energy](https://docs.openfree.energy)
+- **Example Notebooks**: [GitHub Repository](https://github.com/OpenFreeEnergy/ExampleNotebooks)
+- **Issues & Support**: [GitHub Issues](https://github.com/OpenFreeEnergy/openfe/issues)
+- **Community**: [Open Free Energy Website](https://openfree.energy)
+
+You're now ready to explore the powerful world of alchemical free energy calculations with OpenFE! The toolkit provides both simplicity for beginners and flexibility for experts, making it an ideal choice for computational chemistry research and drug discovery applications.
+
+# Installation and Environment Setup
+
+
+
+OpenFE is a comprehensive Python package for executing alchemical free energy calculations, designed for both beginners and advanced users in computational chemistry and molecular modeling. This guide covers multiple installation approaches to suit different environments and use cases.
+
+## System Requirements and Compatibility
+
+OpenFE is currently compatible with POSIX systems (macOS and UNIX/Linux) and follows Scientific Python SPEC0 standards with specific considerations:
+
+- **Python versions**: 3.10-3.14 supported (Python 3.10 no longer actively maintained as of openfe 1.6.0)
+- **OpenMM versions**: 8.0, 8.1.2, 8.2.0 (OpenMM v8.3.0 not yet supported)
+- **NAGL partial charges**: Requires Python ≥3.11
+- **OpenEye Toolkits**: Not compatible with Python 3.13
+
+## Supported Hardware Platforms
+
+| Platform | Architecture | GPU Support | Recommendation |
+|----------|--------------|-------------|----------------|
+| Linux | x86_64, aarch64, ppc64le | NVIDIA CUDA | Production use |
+| macOS | arm64 (Apple Silicon) | None | Development/testing |
+
+For optimal performance, we recommend Linux x86_64 with NVIDIA GPUs and driver version 525.60.13 or greater.
+
+## Installation Methods Overview
+
+```mermaid
+flowchart TD
+    A[Choose Installation Method] --> B[Miniforge Recommended]
+    A --> C[Existing Mamba/Conda]
+    A --> D[Single File Installer]
+    A --> E[Container Distribution]
+    A --> F[Developer Install]
+    
+    B --> B1[Download Miniforge]
+    B1 --> B2[Create Environment]
+    B2 --> B3[Activate & Test]
+    
+    C --> C1[Use Existing Manager]
+    C1 --> C2[Install openfe]
+    C2 --> C3[Activate & Test]
+    
+    D --> D1[Download Installer]
+    D1 --> D2[Run Installer]
+    D2 --> D3[Verify Installation]
+    
+    E --> E1[Docker Pull]
+    E1 --> E2[Apptainer Pull]
+    E2 --> E3[Test GPU Access]
+    
+    F --> F1[Clone Repository]
+    F1 --> F2[Create Environment]
+    F2 --> F3[Editable Install]
+```
+
+## Installation with Miniforge (Recommended)
+
+Miniforge provides the easiest installation experience with pre-configured conda-forge access and faster package resolution than conda.
+
+### Step 1: Install Miniforge
+
+Select your operating system, architecture, and shell from the interactive tool below, then run the generated commands:
+
+```bash
+# Example for Linux x86_64 with bash
+curl -OL https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+sh Miniforge3-Linux-x86_64.sh -b
+~/miniforge3/bin/mamba init bash
+rm -f Miniforge3-Linux-x86_64.sh
+```
+
+### Step 2: Create OpenFE Environment
+
+```bash
+mamba create -n openfe_env openfe
+mamba activate openfe_env
+```
+
+### Step 3: Verify Installation
+
+```bash
+# Quick test
+openfe test
+
+# Comprehensive test suite (recommended for production)
+openfe test --long
+```
+
+> [!TIP]
+> The first test run may take longer due to code compilation, but this only happens once per installation.
+
+## Installation with Existing Mamba/Conda
+
+If you already have mamba or micromamba installed:
+
+```bash
+mamba create -c conda-forge -n openfe_env openfe
+mamba activate openfe_env
+```
+
+## Reproducible Builds with Conda-Lock
+
+For cross-platform reproducible environments, use conda-lock files:
+
+```bash
+# Install conda-lock in separate environment
+conda create -n conda-lock -c conda-lock
+conda activate conda-lock
+
+# Download latest lock file
+curl -LOJ https://github.com/OpenFreeEnergy/openfe/releases/latest/download/openfe-conda-lock.yml
+
+# Create environment from lock file
+conda-lock install -n openfe openfe-conda-lock.yml
+conda activate openfe
+
+# Verify installation
+pytest --pyargs openfe openfecli
+```
+
+## Single File Installer
+
+For offline installations or when internet access is limited:
+
+```bash
+# Download installer (Linux x86_64 example)
+curl -LOJ https://github.com/OpenFreeEnergy/openfe/releases/latest/download/OpenFEforge-Linux-x86_64.sh
+
+# Make executable and run
+chmod +x ./OpenFEforge-Linux-x86_64.sh
+./OpenFEforge-Linux-x86_64.sh
+
+# Verify installation
+which python  # Should show openfeforge/bin/python
+openfe --help
+pytest --pyargs openfe openfecli
+```
+
+> [!TIP]
+> The single file installer may modify your `.bashrc` and could require manual intervention to access previous conda installations.
+
+## Containerized Distributions
+
+### Docker
+
+```bash
+# Pull latest image
+docker pull ghcr.io/openfreeenergy/openfe:latest
+
+# For production, use specific version
+docker pull ghcr.io/openfreeenergy/openfe:1.0.1
+```
+
+### Apptainer (Singularity)
+
+```bash
+# Pull image
+singularity pull oras://ghcr.io/openfreeenergy/openfe:latest-apptainer
+
+# Test GPU access
+singularity run --nv openfe_latest-apptainer.sif python -m openmm.testInstallation
+
+# Access CLI
+singularity run --nv openfe_latest-apptainer.sif openfe --help
+```
+
+## HPC Environment Considerations
+
+High Performance Computing environments present unique challenges due to differences between login and compute nodes. We recommend using containers for HPC deployments.
+
+### CUDA Version Management
+
+For conda-based installations in HPC environments:
+
+```bash
+# Check CUDA version on compute node
+nvidia-smi  # Look for "CUDA Version" in output
+
+# Override CUDA detection on login node
+CONDA_OVERRIDE_CUDA=11.7 mamba create -n openfe_env openfe
+```
+
+### Virtual Package Detection
+
+Conda uses virtual packages to detect system capabilities. The difference between login and compute nodes can cause issues:
+
+```bash
+# On login node (no GPU)
+mamba info  # Shows: __archspec=1=x86_64, __glibc=2.17=0, __linux=3.10.0=0
+
+# On compute node (with GPU)  
+mamba info  # Shows: __archspec=1=x86_64, __cuda=11.7=0, __glibc=2.17=0
+```
+
+## Developer Installation
+
+For contributing to OpenFE:
+
+```bash
+# Clone repository
+git clone https://github.com/OpenFreeEnergy/openfe.git
+cd openfe
+
+# Create environment from specification
+mamba create -f environment.yml
+mamba activate openfe_env
+
+# Install in editable mode
+python -m pip install --no-deps -e .
+```
+
+## Optional Dependencies
+
+Certain advanced features require additional packages:
+
+```bash
+# For perses tools (requires OpenEye license)
+mamba install -c openeye perses openeye-toolkits
+```
+
+## Troubleshooting
+
+### Debug Script
+
+Run the debug script to diagnose installation issues:
+
+```bash
+bash -c "$(curl -Ls https://raw.githubusercontent.com/OpenFreeEnergy/openfe/main/devtools/debug_openmm.sh)" | tee -a debug.log
+```
+
+### Common Error: CUDA PTX Version Mismatch
+
+```
+openmm.OpenMMException: Error loading CUDA module: CUDA_ERROR_UNSUPPORTED_PTX_VERSION (222)
+```
+
+**Solution**: Re-create environment with correct CUDA toolkit version for your hardware/driver combination.
+
+### Custom Docker Build Issues
+
+When building custom Docker images, you may need to increase file descriptor limits:
+
+```bash
+docker build --ulimit nofile=262144:262144 .
+```
+
+## Environment Specification
+
+The standard OpenFE environment includes these key dependencies:
+
+- **Core**: OpenMM 8.2.0, OpenFF Toolkit, RDKit
+- **Analysis**: pymbar, cinnabar, pandas  
+- **Visualization**: py3dmol, networkx, pygraphviz
+- **Testing**: pytest with parallel execution support
+- **Documentation**: sphinx with pydata theme
+
+For production deployments, the [production/environment.yml](production/environment.yml) provides a streamlined specification optimized for HPC environments.
+
+## Next Steps
+
+After successful installation, proceed to [Running Your First Free Energy Calculation](4-running-your-first-free-energy-calculation) to learn the basics of using OpenFE, or explore the [CLI Overview and Common Commands](5-cli-overview-and-common-commands) for command-line interface usage.
+
+![OpenFE Logo](https://github.com/OpenFreeEnergy/openfe/blob/main/docs/_static/OFE-color-icon.svg?raw=true)
+
+# Running Your First Free Energy Calculation
+
+
+
+Welcome to your first free energy calculation with OpenFE! This guide will walk you through the complete process of setting up and running a relative binding free energy (RBFE) calculation using the command-line interface. RBFE calculations are fundamental in drug discovery for predicting how small modifications to ligands affect their binding affinity to a target protein.
+
+## Understanding the OpenFE Workflow
+
+Before diving into the practical steps, let's understand the high-level architecture of how OpenFE handles free energy calculations:
+
+```mermaid
+flowchart TD
+    A[Input Files<br/>Ligands + Protein] --> B[Network Planning<br/>plan-rbfe-network]
+    B --> C[Charge Assignment<br/>AM1-BCC charges]
+    C --> D[Atom Mapping<br/>Kartograf mapper]
+    D --> E[Network Generation<br/>Minimal spanning network]
+    E --> F[Protocol Setup<br/>OpenMM RBFE protocol]
+    F --> G[JSON Output<br/>Transformation files]
+    G --> H[Execution<br/>quickrun command]
+    H --> I[Results Analysis<br/>ΔG values + uncertainties]
+```
+
+The workflow consists of two main phases: **planning** and **execution**. During planning, OpenFE analyzes your molecular system, generates atom mappings between ligands, and creates an optimized network of transformations. During execution, each transformation is simulated using molecular dynamics to calculate free energy differences.
+
+## Prerequisites and Setup
+
+Before running your first calculation, ensure you have:
+
+1. **OpenFE installed** - Follow the [Installation and Environment Setup](3-installation-and-environment-setup) guide
+2. **Molecular structure files**:
+   - Ligand files in SDF format (or SMILES strings)
+   - Protein structure in PDB or PDBx/mmCIF format
+3. **Basic understanding** of free energy calculations (covered in [Alchemical Free Energy Calculations Fundamentals](6-alchemical-free-energy-calculations-fundamentals))
+
+## Step 1: Prepare Your Input Files
+
+### Ligand Files
+OpenFE accepts ligands in multiple formats through the molecule loading system [openfecli/parameters/mol.py](openfecli/parameters/mol.py#L7-67):
+
+- **SDF files** (recommended): Contains 3D coordinates and connectivity
+- **MOL2 files**: Alternative format with partial charge information
+- **SMILES strings**: Simple text representation for quick testing
+
+```bash
+# Example ligand files
+ligands/
+├── benzene.sdf
+├── toluene.sdf
+├── phenol.sdf
+└── chlorobenzene.sdf
+```
+
+### Protein Files
+Protein structures are loaded via the protein parameter system [openfecli/parameters/protein.py](openfecli/parameters/protein.py#L7-47):
+
+- **PDB files**: Standard protein structure format
+- **PDBx/mmCIF files**: Modern format with better handling of large structures
+
+```bash
+# Example protein file
+protein/
+└── tyrosine_kinase.pdb
+```
+
+> [!TIP]
+> Ensure your protein structure is properly prepared: remove alternate conformations, add missing residues, and include all necessary cofactors. The quality of your input structures directly impacts calculation accuracy.
+
+## Step 2: Plan Your RBFE Network
+
+The `plan-rbfe-network` command is your gateway to setting up a complete free energy calculation campaign. This command handles all the complex setup automatically [openfecli/commands/plan_rbfe_network.py](openfecli/commands/plan_rbfe_network.py#L75-257).
+
+### Basic Command Structure
+
+```bash
+openfe plan-rbfe-network \
+  --mol-dir ligands/ \
+  --protein protein/tyrosine_kinase.pdb \
+  --output-dir rbfe_network
+```
+
+### Key Parameters Explained
+
+| Parameter | Required | Description | Default |
+|-----------|----------|-------------|---------|
+| `--mol-dir` | Yes | Directory containing ligand files | - |
+| `--protein` | Yes | Protein structure file | - |
+| `--cofactors` | No | Additional cofactor molecules | None |
+| `--output-dir` | No | Output directory for network | `alchemicalNetwork` |
+| `--n-protocol-repeats` | No | Number of simulation repeats | 3 |
+| `--n-cores` | No | CPU cores for charge generation | 1 |
+
+### What Happens During Planning?
+
+1. **Charge Assignment**: OpenFE automatically generates AM1-BCC partial charges for all ligands using the OpenFF toolkit [openfecli/commands/plan_rbfe_network.py](openfecli/commands/plan_rbfe_network.py#L85-95)
+
+2. **Atom Mapping**: The KartografAtomMapper creates optimal correspondences between ligand atoms [openfecli/commands/plan_rbfe_network.py](openfecli/commands/plan_rbfe_network.py#L25-27)
+
+3. **Network Optimization**: A minimal spanning network is generated to minimize the total number of required transformations [openfecli/commands/plan_rbfe_network.py](openfecli/commands/plan_rbfe_network.py#L27-29)
+
+4. **Protocol Setup**: The OpenMM Relative Hybrid Topology Protocol is configured with default settings [openfecli/commands/plan_rbfe_network.py](openfecli/commands/plan_rbfe_network.py#L70-75)
+
+### Output Structure
+
+After planning completes, you'll have:
+
+```
+rbfe_network/
+├── transformation_1.json
+├── transformation_2.json
+├── transformation_3.json
+└── ligand_network.json
+```
+
+Each JSON file contains a complete transformation ready for execution, including all simulation parameters and molecular system information.
+
+## Step 3: Execute Your First Calculation
+
+With your network planned, it's time to run the actual simulations using the `quickrun` command [openfecli/commands/quickrun.py](openfecli/commands/quickrun.py#L25-142).
+
+### Running a Single Transformation
+
+```bash
+openfe quickrun rbfe_network/transformation_1.json \
+  --work-dir simulation_results \
+  --output results_1.json
+```
+
+### Understanding the Execution Process
+
+The `quickrun` command performs several key steps:
+
+1. **DAG Creation**: Creates a directed acyclic graph of simulation tasks [openfecli/commands/quickrun.py](openfecli/commands/quickrun.py#L85-87)
+2. **Simulation Execution**: Runs molecular dynamics simulations for each lambda window [openfecli/commands/quickrun.py](openfecli/commands/quickrun.py#L89-95)
+3. **Result Analysis**: Processes simulation data to calculate free energy estimates [openfecli/commands/quickrun.py](openfecli/commands/quickrun.py#L97-101)
+4. **Error Handling**: Provides detailed error reporting if simulations fail [openfecli/commands/quickrun.py](openfecli/commands/quickrun.py#L127-133)
+
+### Expected Output
+
+A successful calculation produces:
+
+```json
+{
+  "estimate": -2.34,
+  "uncertainty": 0.15,
+  "protocol_result": {...},
+  "unit_results": {...}
+}
+```
+
+Where `estimate` is the ΔG value in kcal/mol and `uncertainty` represents the statistical error.
+
+## Step 4: Analyze Your Results
+
+### Understanding the Output
+
+- **ΔG (estimate)**: Free energy difference between the two ligand states
+- **Uncertainty**: Statistical confidence in the estimate
+- **Protocol Result**: Detailed simulation metadata and convergence metrics
+
+### Convergence Assessment
+
+Good calculations typically show:
+- Uncertainty < 0.5 kcal/mol for well-converged results
+- Consistent results across multiple protocol repeats
+- No large fluctuations in energy terms during simulation
+
+### Troubleshooting Common Issues
+
+| Issue | Likely Cause | Solution |
+|-------|--------------|----------|
+| High uncertainty (>1.0 kcal/mol) | Insufficient sampling time | Increase simulation length or protocol repeats |
+| Simulation crashes | Poor atomic clashes in input | Check and prepare molecular structures |
+| Large ΔG values (>10 kcal/mol) | Incorrect atom mapping | Verify ligand similarity and mapping quality |
+
+## Advanced Options and Customization
+
+### Custom Settings with YAML
+
+For more control over your calculations, create a YAML settings file:
+
+```yaml
+mapper:
+  type: KartografAtomMapper
+  settings:
+    atom_max_distance: 0.95
+    map_hydrogens: true
+
+scorer:
+  type: default_lomap_scorer
+
+network_planner:
+  type: minimal_spanning_network
+
+solvent:
+  type: water
+  ionic_strength: 0.15 M
+
+partial_charge:
+  partial_charge_method: am1bcc
+  off_toolkit_backend: openeye
+```
+
+Use it with: `--settings custom_settings.yaml`
+
+### High-Throughput Execution
+
+For large ligand sets, consider:
+- Using more CPU cores: `--n-cores 8`
+- Parallel execution of multiple transformations
+- Batch processing with job schedulers
+
+## Next Steps
+
+Congratulations! You've successfully run your first free energy calculation. To expand your knowledge:
+
+1. **Explore different calculation types**: Learn about [Absolute Binding Free Energy (ABFE) Protocols](13-absolute-binding-free-energy-abfe-protocols)
+2. **Deepen your understanding**: Study [Alchemical Free Energy Calculations Fundamentals](6-alchemical-free-energy-calculations-fundamentals)
+3. **Master the CLI**: Read [CLI Overview and Common Commands](5-cli-overview-and-common-commands)
+4. **Try Python interface**: Progress to the [RBFE Python Tutorial](tutorials/rbfe_python_tutorial.nblink) for programmatic control
+
+> [!TIP]
+> The command-line interface is perfect for getting started and routine calculations. As your needs grow, consider the Python API for greater flexibility and custom protocol development.
+
+## Summary
+
+You've now experienced the complete OpenFE workflow:
+
+1. ✅ **Prepared** molecular input files
+2. ✅ **Planned** an optimized RBFE network
+3. ✅ **Executed** free energy simulations
+4. ✅ **Analyzed** results and understood uncertainties
+
+The OpenFE framework handles the complexity of free energy calculations while providing you with control over key parameters. This foundation enables you to tackle increasingly sophisticated molecular design challenges in drug discovery and computational chemistry.
+
+# CLI Overview and Common Commands
+
+
+
+The OpenFE Command Line Interface (CLI) provides a comprehensive set of tools for setting up, executing, and analyzing free energy calculations. This interface is designed to make common workflows accessible to both beginners and advanced users while maintaining the flexibility of the underlying Python library.
+
+## CLI Architecture Overview
+
+The CLI is organized into three main command categories, each serving distinct purposes in the free energy calculation workflow:
+
+```mermaid
+graph TD
+    A[OpenFE CLI] --> B[Network Planning]
+    A --> C[Quickrun Executor]
+    A --> D[Miscellaneous]
+    
+    B --> B1[plan-rbfe-network]
+    B --> B2[plan-rhfe-network]
+    B --> B3[view-ligand-network]
+    
+    C --> C1[quickrun]
+    
+    D --> D1[atommapping]
+    D --> D2[charge-molecules]
+    D --> D3[fetch]
+    D --> D4[gather]
+    D --> D5[test]
+```
+
+The main CLI entry point is defined in [openfecli/cli.py](openfecli/cli.py#L36-L45), which provides access to all subcommands through a unified interface. The command organization follows the logical workflow of free energy calculations: from network planning and setup through execution to results analysis.
+
+## Network Planning Commands
+
+### Relative Binding Free Energy (RBFE) Network Planning
+
+The `plan-rbfe-network` command is the primary tool for setting up binding free energy calculations. This command automates the complex process of creating an optimal network of ligand transformations and preparing them for execution.
+
+**Key Features:**
+- Automatic ligand network optimization
+- Partial charge generation for consistency across transformations
+- Protocol configuration with customizable repeats
+- Protein and cofactor handling
+
+**Basic Usage:**
+```bash
+openfe plan-rbfe-network --molecules ./ligands/ --protein ./protein.pdb --output ./alchemicalNetwork
+```
+
+The command supports extensive customization through YAML configuration files and various parameters for mapper selection, scoring functions, and network planning algorithms [openfecli/commands/plan_rbfe_network.py](openfecli/commands/plan_rbfe_network.py#L120-L144).
+
+### Relative Hydration Free Energy (RHFE) Network Planning
+
+For solvation free energy calculations, the `plan-rhfe-network` command provides similar functionality but focuses on vacuum-to-solvent transformations:
+
+```bash
+openfe plan-rhfe-network --molecules ./ligands/ --output ./hydrationNetwork
+```
+
+This tool is particularly useful for testing and validation purposes, offering a straightforward way to set up hydration free energy campaigns [openfecli/commands/plan_rhfe_network.py](openfecli/commands/plan_rhfe_network.py#L120-L135).
+
+### Network Visualization
+
+The `view-ligand-network` command allows you to visualize planned networks:
+
+```bash
+openfe view-ligand-network alchemicalNetwork/ligand_network.graphml
+```
+
+This generates visual representations of the transformation network, helping you understand the connectivity and optimization of your planned calculations [openfecli/commands/view_ligand_network.py](openfecli/commands/view_ligand_network.py#L6-L17).
+
+## Execution Commands
+
+### Quickrun Executor
+
+The `quickrun` command executes individual transformations that have been planned by the network planning tools:
+
+```bash
+openfe quickrun alchemicalNetwork/transformation_1.json --work-dir ./run1 --output results1.json
+```
+
+This command handles the complete execution of a single transformation, including file management, result collection, and error handling [openfecli/commands/quickrun.py](openfecli/commands/quickrun.py#L17-L33).
+
+> [!TIP]
+> Quickrun automatically creates working directories and manages temporary files, ensuring clean execution environments for each transformation. Use the `--work-dir` option to specify custom locations for better organization of large calculation campaigns.
+
+## Utility and Analysis Commands
+
+### Atom Mapping Analysis
+
+The `atommapping` command provides tools for examining and validating atom mappings between ligand pairs:
+
+```bash
+openfe atommapping --mol ligand1.sdf --mol ligand2.sdf --mapper kartograf --output mapping.png
+```
+
+This is essential for debugging mapping issues and understanding the correspondence between atoms in molecular transformations [openfecli/commands/atommapping.py](openfecli/commands/atommapping.py#L16-L29).
+
+### Partial Charge Generation
+
+The `charge-molecules` command generates partial charges for molecular sets:
+
+```bash
+openfe charge-molecules --molecules ./ligands/ --output charged_ligands.sdf --n-cores 4
+```
+
+This ensures consistent charge assignments across all molecules in a calculation network, which is critical for accurate free energy calculations [openfecli/commands/generate_partial_charges.py](openfecli/commands/generate_partial_charges.py#L30-L43).
+
+### Results Gathering and Analysis
+
+The `gather` command collects and analyzes results from multiple transformations:
+
+```bash
+openfe gather ./results/ --report ddg --output network_results.tsv
+```
+
+This powerful tool supports multiple analysis modes:
+- `dg`: Maximum likelihood estimates of absolute ΔG values
+- `ddg`: Relative binding free energies (ΔΔG)
+- `raw`: Individual leg results for detailed analysis
+
+The gather command automatically handles result validation, error detection, and statistical analysis across the entire network [openfecli/commands/gather.py](openfecli/commands/gather.py#L593-L640).
+
+### Resource Management
+
+The `fetch` command provides access to tutorials and example resources:
+
+```bash
+openfe fetch tutorial-rbfe
+```
+
+This downloads and sets up tutorial materials, making it easy to get started with OpenFE workflows [openfecli/commands/fetch.py](openfecli/commands/fetch.py#L51-L57).
+
+### System Testing
+
+The `test` command runs the OpenFE test suite to verify your installation:
+
+```bash
+openfe test --long
+```
+
+This comprehensive testing ensures that all components are functioning correctly in your environment [openfecli/commands/test.py](openfecli/commands/test.py#L12-L25).
+
+## Common Command Patterns
+
+| Workflow | Commands | Purpose |
+|---------|----------|---------|
+| **Complete RBFE Campaign** | `plan-rbfe-network` → `quickrun` → `gather` | Full binding free energy calculation |
+| **Quick Mapping Check** | `atommapping` | Validate ligand transformations |
+| **System Validation** | `test` → `fetch` → `charge-molecules` | Environment setup and testing |
+| **Results Analysis** | `gather` → `view-ligand-network` | Post-calculation analysis and visualization |
+
+## Parameter System
+
+OpenFE CLI uses a sophisticated parameter system that provides type checking, validation, and help text generation. Common parameter types include:
+
+- **MOL_DIR**: Directory containing molecular files
+- **PROTEIN**: Protein structure file
+- **OUTPUT_DIR**: Directory for calculation output
+- **NCORES**: Number of processing cores
+- **OVERWRITE**: File overwrite protection
+
+These parameters ensure consistent behavior across commands and provide helpful error messages for incorrect usage.
+
+> [!TIP]
+> Most commands support YAML configuration files for advanced customization. Use the `--yaml-settings` option to specify custom mapper configurations, scoring functions, and protocol parameters without having to remember complex command-line arguments.
+
+## Next Steps
+
+After mastering these CLI basics, you may want to explore:
+
+- [Running Your First Free Energy Calculation](4-running-your-first-free-energy-calculation) for a complete walkthrough
+- [Alchemical Free Energy Calculations Fundamentals](6-alchemical-free-energy-calculations-fundamentals) for deeper theoretical understanding
+- [Network-Based Molecular Transformations](7-network-based-molecular-transformations) for advanced network planning concepts
+
+The CLI provides a solid foundation for free energy calculations, while the Python API offers additional flexibility for custom workflows and advanced research applications.
+
+# Alchemical Free Energy Calculations Fundamentals
+
+
+
+Alchemical free energy calculations form the theoretical and computational foundation of modern molecular design and drug discovery. This page introduces the fundamental concepts, methodologies, and implementation patterns used in OpenFE for performing alchemical transformations that predict binding free energies and molecular properties.
+
+## Theoretical Foundations
+
+### Thermodynamic Basis
+
+Alchemical free energy calculations rely on the fundamental connection between free energy differences and statistical mechanics. The core principle involves computing the free energy difference ΔG between two thermodynamic states through a series of intermediate states that gradually transform one system into another. This approach leverages the fact that free energy is a state function, meaning the path taken between states does not affect the final result.
+
+In OpenFE, this theoretical framework is implemented through the **AbsoluteAlchemicalFactory** class, which creates alchemically modified systems using **AlchemicalRegion** objects that define which atoms participate in the transformation [openfe/protocols/openmm_afe/base.py#L657-L662]. The factory systematically scales interactions using lambda (λ) parameters that control the gradual transformation from the initial to final state.
+
+### Lambda Scheduling
+
+The lambda schedule determines how the alchemical transformation is discretized into intermediate states. OpenFE implements separate lambda schedules for different interaction types:
+
+- **Electrostatic interactions**: Scaled using `lambda_electrostatics`
+- **Steric/van der Waals interactions**: Scaled using `lambda_sterics` 
+- **Restraint forces**: Scaled using `lambda_restraints`
+
+The scheduling is carefully designed with reversed lambda values (1-λ) to maintain consistency with the AbsoluteAlchemicalFactory convention where λ=1 represents fully interacting states [openfe/protocols/openmm_afe/base.py#L595-L597].
+
+## Calculation Types
+
+### Absolute Free Energy (AFE) Calculations
+
+Absolute free energy calculations determine the free energy of transferring a molecule from one environment to another, typically from vacuum to solution or from solution to a binding site. The **BaseAbsoluteUnit** class provides the foundational framework for these calculations [openfe/protocols/openmm_afe/base.py#L86-L89].
+
+Key components of AFE calculations include:
+
+- **System preparation**: Creating the molecular system with appropriate solvent and protein components
+- **Alchemical region definition**: Identifying atoms that will be decoupled/annihilated
+- **Thermodynamic state generation**: Creating the series of intermediate lambda states
+- **Simulation execution**: Running molecular dynamics at each lambda state
+- **Free energy analysis**: Using MBAR (Multistate Bennett Acceptance Ratio) to compute final free energy differences
+
+### Relative Free Energy (RFE) Calculations
+
+Relative free energy calculations compute the difference in free energy between two similar molecules, typically evaluating relative binding affinities. The **RelativeHybridTopologyProtocol** implements these calculations using hybrid topology approaches [openfe/protocols/openmm_rfe/equil_rfe_methods.py#L496-L496].
+
+RFE calculations in OpenFE support multiple sampling methods:
+
+- **Hamiltonian Replica Exchange (HREX)**: Exchanges configurations between different lambda states
+- **Self-adjusted mixture sampling (SAMS)**: Adapts sampling weights for optimal efficiency
+- **Independent window sampling**: Simulates each lambda state independently
+
+> [!TIP]
+> Relative calculations are generally more accurate than absolute calculations because systematic errors cancel out when computing differences between similar molecules. This makes RFE the preferred approach for most drug discovery applications.
+
+## System Preparation and Validation
+
+### Component Management
+
+OpenFE uses a modular component-based system where molecules are represented as **Component** objects:
+
+- **SmallMoleculeComponent**: Represents drug-like molecules with defined chemistry
+- **ProteinComponent**: Represents protein structures with proper residue definitions  
+- **SolventComponent**: Defines the solvent environment (water model, ionic strength)
+
+The system preparation process involves assigning partial charges to molecules using methods like AM1-BCC or RESP charges [openfe/protocols/openmm_afe/base.py#L400-L404], creating the molecular topology, and placing components in an appropriate simulation box.
+
+### Alchemical Region Definition
+
+The alchemical region specifies which atoms participate in the transformation. For absolute calculations, this typically involves decoupling an entire ligand from its environment. For relative calculations, the region includes atoms that differ between the two ligands.
+
+The **_get_alchemical_indices** method identifies these atoms by examining the component residues and topology information [openfe/protocols/openmm_afe/base.py#L135-L141], ensuring that only the intended atoms are modified during the alchemical transformation.
+
+## Simulation and Analysis
+
+### Multi-State Sampling
+
+OpenFE implements multi-state sampling using the **MultiStateSampler** framework from OpenMMTools. This approach simultaneously simulates multiple lambda states, allowing for efficient exchange of configurations between states and improved statistical sampling.
+
+The **MultistateEquilFEAnalysis** class provides comprehensive analysis tools for evaluating simulation results [openfe/protocols/openmm_utils/multistate_analysis.py#L62-L87]. Key analysis capabilities include:
+
+- **Equilibration detection**: Automatically identifying when simulations reach equilibrium
+- **Free energy calculation**: Using MBAR to compute free energy differences with uncertainty estimates
+- **Overlap matrix analysis**: Evaluating phase space overlap between lambda states
+- **Replica exchange statistics**: Monitoring the efficiency of state exchanges
+
+### Adaptive Protocol Settings
+
+OpenFE includes intelligent protocol adaptation based on system characteristics. The **_adaptive_settings** method automatically adjusts simulation parameters for challenging transformations [openfe/protocols/openmm_rfe/equil_rfe_methods.py#L548-L614]:
+
+```python
+# Example: Charge-changing transformations get enhanced settings
+if mapping.get_alchemical_charge_difference() != 0:
+    protocol_settings.simulation_settings.production_length = 20 * unit.nanosecond
+    protocol_settings.simulation_settings.n_replicas = 22
+    protocol_settings.lambda_settings.lambda_windows = 22
+```
+
+> [!TIP]
+> Charge-changing transformations require more careful sampling due to the long-range nature of electrostatic interactions. OpenFE automatically detects these cases and applies enhanced protocols with increased simulation time and more lambda windows.
+
+## Quality Assurance and Validation
+
+### Convergence Assessment
+
+Proper convergence assessment is critical for reliable free energy calculations. OpenFE provides multiple metrics for evaluating convergence:
+
+- **Statistical uncertainty**: Bootstrap analysis provides confidence intervals
+- **Forward-reverse consistency**: Comparing forward and reverse transformation results
+- **Overlap matrix eigenvalues**: Ensuring adequate phase space overlap between states
+- **Replica exchange acceptance rates**: Monitoring sampling efficiency
+
+The **get_forward_and_reverse_analysis** method implements comprehensive convergence checks by analyzing subsets of the trajectory data [openfe/protocols/openmm_utils/multistate_analysis.py#L284-L286].
+
+### Error Estimation
+
+Free energy uncertainties are estimated using MBAR's statistical framework combined with bootstrap resampling. The **_get_free_energy** method implements this analysis, providing both point estimates and confidence intervals [openfe/protocols/openmm_utils/multistate_analysis.py#L199-L205].
+
+## Integration with Network-Based Approaches
+
+OpenFE is designed around the concept of **alchemical networks**, where multiple transformations are organized into connected graphs. This network-based approach enables:
+
+- **Redundant pathways**: Multiple routes between molecules improve robustness
+- **Cycle closure analysis**: Internal consistency checks within the network
+- **Maximum likelihood estimation**: Global optimization across all network edges
+
+The **AbstractAlchemicalNetworkPlanner** provides the interface for creating these networks [openfe/setup/alchemical_network_planner/abstract_alchemical_network_planner.py#L9-L16], with concrete implementations for different planning strategies.
+
+## Next Steps
+
+Now that you understand the fundamentals of alchemical free energy calculations, you can explore:
+
+- [Network-Based Molecular Transformations](7-network-based-molecular-transformations) to learn how multiple calculations are organized into efficient networks
+- [Protocol System and Execution Framework](8-protocol-system-and-execution-framework) to understand the computational infrastructure
+- [Atom Mapping and Molecular Transformations](9-atom-mapping-and-molecular-transformations) for detailed information about preparing molecular transformations
+
+The modular design of OpenFE allows you to start with simple absolute calculations and progress to complex network-based relative binding free energy studies as you become more familiar with the framework.
+
+# Network-Based Molecular Transformations
+
+
+
+Network-based molecular transformations represent a fundamental paradigm in computational chemistry where free energy calculations are organized as interconnected graphs rather than isolated pairwise comparisons. This approach enables efficient exploration of chemical space through strategic pathway planning, error cancellation, and thermodynamic cycle closure.
+
+## Core Architecture
+
+The OpenFE framework implements network-based transformations through a hierarchical architecture that separates concerns between ligand network planning, chemical system generation, and protocol execution. The foundation rests on the `AbstractAlchemicalNetworkPlanner` interface [openfe/setup/alchemical_network_planner/abstract_alchemical_network_planner.py#L9](openfe/setup/alchemical_network_planner/abstract_alchemical_network_planner.py#L9), which defines the contract for all network planning implementations.
+
+### Network Planning Hierarchy
+
+```mermaid
+graph TD
+    A[AbstractAlchemicalNetworkPlanner] --> B[RelativeAlchemicalNetworkPlanner]
+    B --> C[RBFEAlchemicalNetworkPlanner]
+    B --> D[RHFEAlchemicalNetworkPlanner]
+    
+    E[Ligand Network Planning] --> F[generate_minimal_spanning_network]
+    E --> G[generate_radial_network]
+    E --> H[generate_maximal_network]
+    E --> I[generate_minimal_redundant_network]
+    
+    J[Chemical System Generation] --> K[EasyChemicalSystemGenerator]
+    
+    L[Protocol Execution] --> M[RelativeHybridTopologyProtocol]
+```
+
+The `RelativeAlchemicalNetworkPlanner` serves as the concrete implementation base [openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L46](openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L46), orchestrating three key components:
+
+1. **Ligand Mappers**: Tools for establishing atom correspondence between molecules
+2. **Mapping Scorers**: Functions evaluating transformation quality and feasibility  
+3. **Network Planners**: Algorithms optimizing the graph topology for computational efficiency
+
+## Network Planning Strategies
+
+OpenFE provides multiple network generation algorithms, each optimized for different computational scenarios:
+
+### Minimal Spanning Network
+
+The `generate_minimal_spanning_network` function creates the most computationally efficient topology by connecting all ligands with the minimum number of edges while maximizing total mapping scores [openfe/setup/ligand_network_planning.py#L208](openfe/setup/ligand_network_planning.py#L208). This approach minimizes computational cost while maintaining connectivity through high-quality transformations.
+
+### Radial Network
+
+The radial (hub-and-spoke) topology centers all transformations around a single reference ligand [openfe/setup/ligand_network_planning.py#L49](openfe/setup/ligand_network_planning.py#L49). This strategy provides consistent reference points and simplifies analysis, making it ideal for lead optimization campaigns where all compounds are compared to a common scaffold.
+
+### Maximal Network
+
+For comprehensive exploration, the `generate_maximal_network` generates all possible pairwise mappings [openfe/setup/ligand_network_planning.py#L157](openfe/setup/ligand_network_planning.py#L157). While computationally intensive, this approach maximizes pathway redundancy and provides the most robust error cancellation through cycle closure.
+
+## Specialized Network Planners
+
+### Relative Binding Free Energy (RBFE) Networks
+
+The `RBFEAlchemicalNetworkPlanner` specializes in protein-ligand binding calculations [openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L289](openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L289). Key features include:
+
+- **Adaptive Protocol Settings**: Automatic adjustment of simulation parameters based on transformation characteristics
+- **Net Charge Handling**: Specialized treatment for transformations involving charge changes
+- **Protein Context Integration**: Proper handling of protein-ligand complex formation and solvent effects
+
+The planner accepts ligands, solvent, protein, and optional cofactors to construct complete binding thermodynamic cycles [openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L350](openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L350).
+
+### Relative Hydration Free Energy (RHFE) Networks
+
+The `RHFEAlchemicalNetworkPlanner` focuses on solvation thermodynamics by comparing ligand binding in solvent versus vacuum [openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L225](openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L225). This approach enables:
+
+- **Solvation Energy Decomposition**: Separation of binding and desolvation contributions
+- **Vacuum Simulations**: Specialized handling of non-periodic boundary conditions
+- **Transferability Assessment**: Evaluation of ligand properties across different environments
+
+> [!TIP]
+> The chemical system generator automatically configures vacuum simulations with "nocutoff" nonbonded methods when detecting transformations involving vacuum states, ensuring proper treatment of long-range electrostatics.
+
+## Transformation Construction
+
+Each network edge represents a molecular transformation with associated thermodynamic protocols. The transformation construction process involves:
+
+1. **Mapping Generation**: Atom correspondence establishment through configurable mappers
+2. **System Preparation**: Chemical system generation for both endpoint states
+3. **Protocol Assignment**: Simulation protocol configuration and parameter adaptation
+4. **Network Assembly**: Integration of individual transformations into a coherent graph
+
+The framework supports protocol adaptation based on transformation characteristics, particularly for charge-changing mutations where simulation parameters require special consideration [openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L314](openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L314).
+
+## Integration and Extensibility
+
+The network-based architecture seamlessly integrates with OpenFE's broader ecosystem:
+
+- **Storage Systems**: Network metadata and results are managed through specialized storage clients
+- **Analysis Tools**: Network-wide analysis enables thermodynamic cycle validation and error estimation
+- **Visualization Utilities**: Network plotting capabilities provide insight into transformation pathways and computational efficiency
+
+> [!TIP]
+> The modular design allows users to mix and match mappers, scorers, and network planners to create customized workflows optimized for specific chemical systems and computational resources.
+
+## Practical Applications
+
+Network-based transformations excel in scenarios requiring:
+
+- **Lead Optimization**: Efficient exploration of structure-activity relationships through targeted networks
+- **Selectivity Studies**: Comparative analysis across multiple protein targets
+- **Property Prediction**: Systematic evaluation of physicochemical properties across chemical series
+- **Method Validation**: Thermodynamic cycle closure provides internal consistency checks
+
+The network approach transforms individual free energy calculations into a coherent thermodynamic framework, enabling more robust predictions and deeper chemical insights than isolated pairwise comparisons.
+
+For detailed implementation guidance, see [Atom Mapping and Molecular Transformations](9-atom-mapping-and-molecular-transformations) and [Ligand Network Planning Algorithms](10-ligand-network-planning-algorithms). Protocol-specific details are covered in [Relative Binding Free Energy (RBFE) Protocols](12-relative-binding-free-energy-rbfe-protocols) and [Absolute Binding Free Energy (ABFE) Protocols](13-absolute-binding-free-energy-abfe-protocols).
+
+# Protocol System and Execution Framework
+
+
+
+The OpenFE protocol system provides a comprehensive, extensible framework for executing free energy calculations through a well-architected hierarchy of protocols, units, and settings. This framework enables reproducible, scalable computational chemistry workflows while maintaining flexibility for custom method development.
+
+## Architecture Overview
+
+The protocol system follows a layered architecture that separates concerns between high-level workflow orchestration, specific calculation protocols, and detailed simulation settings. This design enables both ease of use for standard workflows and extensibility for advanced users.
+
+```mermaid
+graph TB
+    subgraph "Protocol Layer"
+        A[gufe.Protocol] --> B[RelativeHybridTopologyProtocol]
+        A --> C[AbsoluteBindingProtocol]
+        A --> D[Custom Protocols]
+    end
+    
+    subgraph "Execution Layer"
+        E[gufe.ProtocolUnit] --> F[BaseAbsoluteUnit]
+        E --> G[RelativeHybridTopologyProtocolUnit]
+        E --> H[AbsoluteBindingComplexUnit]
+        E --> I[AbsoluteBindingSolventUnit]
+    end
+    
+    subgraph "Settings Layer"
+        J[SettingsBaseModel] --> K[Protocol-Specific Settings]
+        K --> L[MultiStateSimulationSettings]
+        K --> M[OpenMMEngineSettings]
+        K --> N[IntegratorSettings]
+    end
+    
+    subgraph "Utility Layer"
+        O[LambdaProtocol] --> P[Alchemical State Management]
+        Q[OpenMM Utils] --> R[System Generation & Validation]
+        S[Restraint Utils] --> T[Geometry & Force Application]
+    end
+    
+    B --> G
+    C --> H
+    C --> I
+    G --> P
+    H --> P
+    I --> P
+    G --> R
+    H --> R
+    I --> R
+    H --> T
+```
+
+## Core Protocol Classes
+
+### Relative Free Energy Protocols
+
+The `RelativeHybridTopologyProtocol` [openfe/protocols/openmm_rfe/equil_rfe_methods.py#L496](openfe/protocols/openmm_rfe/equil_rfe_methods.py#L496) implements ligand-to-ligand transformations using hybrid topology systems. This protocol supports multiple sampling methods including Hamiltonian Replica Exchange, Self-Adjusted Mixture Sampling, and Independent Window Sampling.
+
+Key features include:
+- **Hybrid topology construction** for seamless alchemical transformations
+- **Multi-state sampling** with configurable replica exchange strategies
+- **Comprehensive analysis** including overlap matrices and replica transition statistics
+- **Adaptive settings** that automatically configure parameters based on molecular properties
+
+The protocol creates `RelativeHybridTopologyProtocolUnit` instances [openfe/protocols/openmm_rfe/equil_rfe_methods.py#L683](openfe/protocols/openmm_rfe/equil_rfe_methods.py#L683) that execute individual transformations, with results aggregated in `RelativeHybridTopologyProtocolResult` [openfe/protocols/openmm_rfe/equil_rfe_methods.py#L276](openfe/protocols/openmm_rfe/equil_rfe_methods.py#L276).
+
+### Absolute Free Energy Protocols
+
+The `AbsoluteBindingProtocol` [openfe/protocols/openmm_afe/equil_binding_afe_method.py#L517](openfe/protocols/openmm_afe/equil_binding_afe_method.py#L517) handles ligand binding calculations through separate complex and solvent phases. This protocol builds on the `BaseAbsoluteUnit` [openfe/protocols/openmm_afe/base.py#L86](openfe/protocols/openmm_afe/base.py#L86) which provides common functionality for absolute calculations.
+
+The protocol creates two distinct unit types:
+- **Complex phase**: `AbsoluteBindingComplexUnit` [openfe/protocols/openmm_afe/equil_binding_afe_method.py#L914](openfe/protocols/openmm_afe/equil_binding_afe_method.py#L914) for bound state simulations
+- **Solvent phase**: `AbsoluteBindingSolventUnit` [openfe/protocols/openmm_afe/equil_binding_afe_method.py#L1262](openfe/protocols/openmm_afe/equil_binding_afe_method.py#L1262) for unbound state simulations
+
+Both phases incorporate Boresch restraints for proper standard state corrections and provide detailed structural analysis capabilities.
+
+## Settings and Configuration
+
+### Hierarchical Settings System
+
+The protocol framework uses a sophisticated settings hierarchy based on `SettingsBaseModel` that provides type validation, default values, and comprehensive documentation:
+
+| Settings Class | Primary Purpose | Key Parameters |
+|---|---|---|
+| `MultiStateSimulationSettings` [openfe/protocols/openmm_utils/omm_settings.py#L544](openfe/protocols/openmm_utils/omm_settings.py#L544) | Alchemical sampling control | `sampler_method`, `n_replicas`, `time_per_iteration` |
+| `OpenMMEngineSettings` [openfe/protocols/openmm_utils/omm_settings.py#L314](openfe/protocols/openmm_utils/omm_settings.py#L314) | MD engine configuration | `compute_platform`, `gpu_device_index` |
+| `IntegratorSettings` [openfe/protocols/openmm_utils/omm_settings.py#L353](openfe/protocols/openmm_utils/omm_settings.py#L353) | Integration parameters | `timestep`, `langevin_collision_rate` |
+| `OpenMMSolvationSettings` [openfe/protocols/openmm_utils/omm_settings.py#L50](openfe/protocols/openmm_utils/omm_settings.py#L50) | System solvation | `solvent_model`, `solvent_padding` |
+
+### Protocol-Specific Settings
+
+Each protocol defines specialized settings classes that inherit from the base settings:
+
+- **Lambda Settings**: Control alchemical switching functions and window distributions [openfe/protocols/openmm_rfe/equil_rfe_settings.py#L33](openfe/protocols/openmm_rfe/equil_rfe_settings.py#L33)
+- **Alchemical Settings**: Configure soft-core potentials and charge handling [openfe/protocols/openmm_rfe/equil_rfe_settings.py#L50](openfe/protocols/openmm_rfe/equil_rfe_settings.py#L50)
+- **Partial Charge Settings**: Manage charge calculation methods and backends [openfe/protocols/openmm_utils/omm_settings.py#L231](openfe/protocols/openmm_utils/omm_settings.py#L231)
+
+> [!TIP]
+> The settings system uses Pydantic models with automatic validation, ensuring that invalid configurations are caught early with clear error messages. This prevents common mistakes like incompatible timestep values or unsupported sampling methods.
+
+## Lambda Protocol System
+
+### Alchemical State Management
+
+The `LambdaProtocol` class [openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py#L14](openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py#L14) provides sophisticated control over alchemical transformations through configurable switching functions. It manages the progression of different energy components (electrostatics, sterics) throughout the transformation pathway.
+
+Key capabilities include:
+- **Multiple switching functions** with customizable parameters
+- **Charge singularity avoidance** through naked charge detection [openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py#L231](openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py#L231)
+- **Visualization tools** for lambda schedule inspection and validation
+
+The `RelativeAlchemicalState` [openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py#L291](openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py#L291) extends this framework with specific parameters for relative transformations, handling insertion/deletion processes and core component scaling.
+
+## Execution and Orchestration
+
+### Protocol Unit Execution
+
+Protocol units implement the core execution logic through standardized interfaces:
+
+1. **Preparation Phase**: System setup, charge assignment, and topology construction
+2. **Equilibration Phase**: Energy minimization and gradual system relaxation
+3. **Production Phase**: Alchemical sampling with configured methods
+4. **Analysis Phase**: Result processing and statistical analysis
+
+The `BaseAbsoluteUnit` [openfe/protocols/openmm_afe/base.py#L86](openfe/protocols/openmm_afe/base.py#L86) provides a template method pattern that standardizes this workflow while allowing customization at each stage.
+
+### Result Management
+
+Protocol results implement comprehensive analysis interfaces:
+
+- **Free Energy Estimation**: MBAR-based analysis with uncertainty quantification
+- **Overlap Assessment**: Matrix-based evaluation of sampling efficiency
+- **Replica Analysis**: Transition statistics and state distribution monitoring
+- **Structural Analysis**: Trajectory inspection and restraint geometry validation
+
+> [!TIP]
+> Results are stored in structured formats that enable both immediate analysis and post-processing. The system maintains full provenance information, allowing traceability from final results back to original input parameters.
+
+## Extension Framework
+
+### Custom Protocol Development
+
+The framework supports extension through well-defined interfaces:
+
+1. **Protocol Subclassing**: Inherit from `gufe.Protocol` for new calculation types
+2. **Unit Implementation**: Create specialized `ProtocolUnit` classes for execution logic
+3. **Settings Definition**: Design configuration classes using `SettingsBaseModel`
+4. **Result Handling**: Implement `ProtocolResult` for output management
+
+### Utility Integration
+
+The protocol system integrates with specialized utility modules:
+- **OpenMM Utils** [openfe/protocols/openmm_utils/](openfe/protocols/openmm_utils/): System generation and validation
+- **Restraint Utils** [openfe/protocols/restraint_utils/](openfe/protocols/restraint_utils/): Geometry management and force application
+- **Charge Generation** [openfe/protocols/openmm_utils/charge_generation.py](openfe/protocols/openmm_utils/charge_generation.py): Partial charge calculation workflows
+
+This modular architecture enables rapid development of new methods while leveraging existing, validated components.
+
+## Next Steps
+
+To deepen your understanding of the protocol system:
+
+- Explore [Relative Binding Free Energy (RBFE) Protocols](12-relative-binding-free-energy-rbfe-protocols) for specific implementation details
+- Review [Absolute Binding Free Energy (ABFE) Protocols](13-absolute-binding-free-energy-abfe-protocols) for complex transformation workflows
+- Study [Custom Protocol Development](20-custom-protocol-development) for extension guidance
+- Examine [High-Throughput Execution and Orchestration](22-high-throughput-execution-and-orchestration) for scaling considerations
+
+The protocol system serves as the foundation for reproducible free energy calculations, providing both the flexibility needed for research and the robustness required for production workflows.
+
+# Atom Mapping and Molecular Transformations
+
+
+
+Atom mapping is a fundamental process in free energy calculations that establishes correspondence between atoms in different molecular states. This process enables the construction of alchemical pathways where molecules are gradually transformed from one state to another, allowing for the computation of relative free energy differences.
+
+## Core Architecture
+
+The atom mapping system in OpenFE is built around an extensible architecture that supports multiple mapping algorithms and scoring functions. The foundation is the `LigandAtomMapper` abstract base class, which defines the interface for generating atom correspondences between `SmallMoleculeComponent` instances [ligandatommapper.py#L11-L17].
+
+```mermaid
+classDiagram
+    class LigandAtomMapper {
+        <<abstract>>
+        +suggest_mappings(componentA, componentB)
+        +_mappings_generator(componentA, componentB)*
+    }
+    
+    class LomapAtomMapper {
+        +_mappings_generator()
+    }
+    
+    class PersesAtomMapper {
+        +allow_ring_breaking: bool
+        +preserve_chirality: bool
+        +use_positions: bool
+        +coordinate_tolerance: Quantity
+        +_mappings_generator()
+    }
+    
+    class KartografAtomMapper {
+        +_mappings_generator()
+    }
+    
+    LigandAtomMapper <|-- LomapAtomMapper
+    LigandAtomMapper <|-- PersesAtomMapper
+    LigandAtomMapper <|-- KartografAtomMapper
+```
+
+## Implementation Classes
+
+### Base Mapper Interface
+
+The `LigandAtomMapper` class serves as the foundation for all mapping implementations. It requires subclasses to implement the `_mappings_generator` method, which returns an iterable of atom mapping dictionaries [ligandatommapper.py#L19-L38]. The public `suggest_mappings` method converts these dictionaries into `LigandAtomMapping` objects [ligandatommapper.py#L40-L65].
+
+### Lomap Integration
+
+The `LomapAtomMapper` provides a wrapper around the Lomap library's maximum common substructure (MCS) algorithm. This mapper is imported directly from the Lomap package and adapted to match OpenFE's API [lomap_mapper.py#L9].
+
+### Perses Integration
+
+The `PersesAtomMapper` offers sophisticated mapping capabilities with configurable parameters:
+
+- **allow_ring_breaking**: Controls whether only full molecular cycles should be mapped
+- **preserve_chirality**: Enforces strict chirality preservation in mappings
+- **use_positions**: Utilizes spatial coordinates for mapping decisions
+- **coordinate_tolerance**: Defines the distance tolerance for position-based mapping [perses_mapper.py#L52-L80]
+
+The implementation constructs a Perses `AtomMapper` and processes the resulting mappings, with optional chirality preservation [perses_mapper.py#L82-L110].
+
+## Scoring Systems
+
+OpenFE provides comprehensive scoring functions to evaluate the quality of atom mappings:
+
+### Lomap Scorers
+
+The Lomap scoring suite includes multiple specialized metrics [lomap_scorers.py#L4-L16]:
+- `atomic_number_score`: Evaluates atomic number consistency
+- `default_lomap_score`: Standard Lomap scoring function
+- `ecr_score`: Edge consistency ratio scoring
+- `heterocycles_score`: Heterocycle mapping quality
+- `hybridization_score`: Hybridization state preservation
+- `mcsr_score`, `mncar_score`, `tmcsr_score`: Various substructure matching scores
+
+### Perses Scorer
+
+The `default_perses_scorer` provides normalized scoring with optional position-based evaluation [perses_scorers.py#L37-L121]. It considers multiple factors:
+- Number of mapped atoms
+- Aromatic atom correspondence
+- Heavy atom mapping quality
+- Ring structure preservation
+
+> [!TIP]
+> The Perses scorer normalization uses weighted combinations of different mapping aspects (1.0 for total atoms, 0.8 for aromatic, 0.5 for heavy atoms, 0.4 for ring atoms) to enable cross-comparison between different molecular pairs [perses_scorers.py#L111-L117].
+
+## Command Line Interface
+
+The atom mapping functionality is accessible through the `openfe atommapping` command, which provides tools for examining specific mappings between ligand pairs [atommapping.py#L16-L40].
+
+### Usage Patterns
+
+The CLI supports two main output modes:
+
+1. **Dictionary Output**: Prints the atom mapping correspondence directly to console [atommapping.py#L68-L71]
+2. **Visualization**: Generates PNG images showing the mapped molecular structures [atommapping.py#L74-L97]
+
+The command requires exactly two molecules and a mapper specification, using the `generate_mapping` utility to ensure single mapping results [atommapping.py#L43-L65].
+
+## Integration with Alchemical Networks
+
+Atom mappings serve as the foundation for molecular transformations in alchemical networks. Each mapping defines a specific transformation pathway between two molecular states, enabling the systematic construction of free energy calculation networks.
+
+The mapping quality directly impacts the reliability and efficiency of subsequent free energy calculations. High-quality mappings with good chemical intuition and minimal structural perturbations lead to more accurate and convergent simulations.
+
+> [!TIP]
+> When selecting a mapper for your workflow, consider the trade-off between mapping coverage and quality. Lomap typically provides faster, more conservative mappings, while Perses offers more sophisticated position-aware mapping at the cost of increased computational complexity.
+
+## Next Steps
+
+After establishing atom mappings, you can explore [Ligand Network Planning Algorithms](10-ligand-network-planning-algorithms) to understand how individual mappings are combined into comprehensive alchemical networks, or proceed to [Chemical System Generation and Validation](11-chemical-system-generation-and-validation) to learn about preparing molecular systems for simulation.
+
+# Ligand Network Planning Algorithms
+
+
+
+Ligand network planning algorithms are fundamental to OpenFE's approach to relative free energy calculations. These algorithms determine how ligands are connected in a network, directly impacting computational efficiency, accuracy, and statistical robustness of the calculations. The system provides multiple network planning strategies optimized for different use cases, from minimal computational footprint to maximum redundancy.
+
+## Network Planning Architecture
+
+The ligand network planning system follows a hierarchical architecture that separates concerns between network topology generation and alchemical transformation creation. At the core is the `AbstractAlchemicalNetworkPlanner` interface [openfe/setup/alchemical_network_planner/abstract_alchemical_network_planner.py#L9-L16], which defines the contract for all network planners. The concrete implementation `RelativeAlchemicalNetworkPlanner` [openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L46] serves as the base for specialized planners like `RBFEAlchemicalNetworkPlanner` and `RHFEAlchemicalNetworkPlanner`.
+
+```mermaid
+graph TB
+    A[AbstractAlchemicalNetworkPlanner] --> B[RelativeAlchemicalNetworkPlanner]
+    B --> C[RBFEAlchemicalNetworkPlanner]
+    B --> D[RHFEAlchemicalNetworkPlanner]
+    
+    E[Ligand Network Planning Functions] --> F[generate_radial_network]
+    E --> G[generate_maximal_network]
+    E --> H[generate_minimal_spanning_network]
+    E --> I[generate_minimal_redundant_network]
+    
+    B --> E
+    C --> J[Protein + Solvent Systems]
+    D --> K[Solvent Only Systems]
+```
+
+The planner orchestrates three key components: atom mappers for proposing molecular correspondences, scoring functions for evaluating mapping quality, and network planning algorithms for optimizing the graph topology [openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L49-L95].
+
+## Core Network Planning Algorithms
+
+### Minimal Spanning Network
+
+The `generate_minimal_spanning_network` function creates the most computationally efficient network by connecting all ligands with the minimum number of edges while maximizing total mapping scores [openfe/setup/ligand_network_planning.py#L208-L235]. This approach uses a minimum spanning tree algorithm to ensure every ligand is reachable while minimizing computational cost.
+
+**Key characteristics:**
+- **Edge count**: N-1 edges for N ligands
+- **Optimization**: Maximizes total mapping score
+- **Use case**: Limited computational resources, initial screening
+
+### Radial Network
+
+The radial network (also known as hub-and-spoke or star-map) connects all ligands through a central reference ligand [openfe/setup/ligand_network_planning.py#L49-L120]. This topology is particularly useful when you have a well-characterized reference compound or want to minimize error propagation through the network.
+
+**Key characteristics:**
+- **Edge count**: N-1 edges (all connected to central hub)
+- **Central ligand**: Can be specified by name, index, or molecule object
+- **Advantage**: Reduces cumulative errors,便于结果解释
+
+### Maximal Network
+
+The `generate_maximal_network` function creates a complete network with all possible ligand-to-ligand connections [openfe/setup/ligand_network_planning.py#L157-L207]. This comprehensive approach generates up to N(N-1)/2 potential edges, making it ideal for debugging atom mappers or as a starting point for other optimization algorithms.
+
+**Key characteristics:**
+- **Edge count**: Up to N(N-1)/2 edges
+- **Completeness**: Includes all possible mappings
+- **Use case**: Mapper debugging, comprehensive analysis
+
+### Minimal Redundant Network
+
+The `generate_minimal_redundant_network` provides a balance between efficiency and statistical robustness by ensuring each node has multiple connections [openfe/setup/ligand_network_planning.py#L252-L295]. This algorithm generates multiple minimum spanning trees to provide redundancy while maintaining computational efficiency.
+
+**Key characteristics:**
+- **Redundancy level**: Controlled by `mst_num` parameter
+- **Statistical robustness**: Multiple paths between ligands
+- **Error estimation**: Enables uncertainty quantification
+
+## Algorithm Selection Guidelines
+
+| Algorithm | Computational Cost | Statistical Robustness | Error Propagation | Best Use Case |
+|-----------|-------------------|------------------------|-------------------|---------------|
+| Minimal Spanning | Lowest | Low | High | Resource-constrained screening |
+| Radial | Low | Medium | Low | Reference-based studies |
+| Maximal | Highest | High | Low | Mapper debugging, analysis |
+| Minimal Redundant | Medium | High | Medium | Production calculations |
+
+## Integration with Alchemical Planning
+
+The network planning algorithms integrate seamlessly with the broader alchemical planning framework. The `RelativeAlchemicalNetworkPlanner` uses the specified network planner to generate ligand connections, then constructs full alchemical transformations by combining these with chemical systems and protocols [openfe/setup/alchemical_network_planner/relative_alchemical_network_planner.py#L121-L140].
+
+> [!TIP]
+> The choice of network planner significantly impacts both computational efficiency and result accuracy. For production calculations, consider using minimal redundant networks with mst_num=2 to balance cost and statistical robustness.
+
+## Command Line Interface
+
+OpenFE provides CLI commands for network planning, including `plan-rbfe-network` and `plan-rhfe-network` [openfecli/commands/plan_rbfe_network.py#L120-L144]. These commands expose the network planning functionality through a user-friendly interface, supporting various mappers, scorers, and network planning algorithms.
+
+## Advanced Configuration
+
+Network planners support advanced configuration through:
+- **Multiple mappers**: Combine different mapping strategies
+- **Custom scoring functions**: Implement domain-specific mapping evaluation
+- **Parallel processing**: Leverage multiple cores for large ligand sets
+- **Progress tracking**: Monitor network generation for large systems
+
+The system's modular design allows easy extension with new network planning algorithms while maintaining compatibility with existing workflows. This flexibility enables researchers to tailor network topology to their specific computational constraints and accuracy requirements.
+
+> [!TIP]
+> When working with charged ligands, ensure your mapper supports element changes and charge variations. The default LomapAtomMapper configuration includes element_change=True for this purpose.
+
+For understanding how these networks integrate with molecular transformations, see [Atom Mapping and Molecular Transformations](9-atom-mapping-and-molecular-transformations). To learn about executing calculations on planned networks, refer to [Protocol System and Execution Framework](8-protocol-system-and-execution-framework).
+
+# Chemical System Generation and Validation
+
+
+
+Chemical system generation and validation in OpenFE provides a systematic framework for creating consistent molecular environments for free energy calculations. This module ensures that ligands are properly prepared across different simulation scenarios including vacuum, solvent, and protein-bound states.
+
+## Architecture Overview
+
+The chemical system generation framework follows an abstract factory pattern with a concrete implementation for common use cases. The architecture is built around standardized component labels and a flexible generator system that can handle various molecular environments.
+
+```mermaid
+classDiagram
+    class AbstractChemicalSystemGenerator {
+        <<abstract>>
+        +__call__(component) Iterable~ChemicalSystem~
+    }
+    
+    class EasyChemicalSystemGenerator {
+        -solvent: SolventComponent
+        -protein: ProteinComponent
+        -cofactors: List~SmallMoleculeComponent~
+        -do_vacuum: bool
+        +__init__(solvent, protein, cofactors, do_vacuum)
+        +__call__(component) Iterable~ChemicalSystem~
+    }
+    
+    class RFEComponentLabels {
+        <<enumeration>>
+        PROTEIN: "protein"
+        LIGAND: "ligand"
+        SOLVENT: "solvent"
+        COFACTOR: "cofactor"
+    }
+    
+    class ChemicalSystem {
+        +components: Dict
+        +name: str
+    }
+    
+    AbstractChemicalSystemGenerator <|-- EasyChemicalSystemGenerator
+    EasyChemicalSystemGenerator --> ChemicalSystem : creates
+    EasyChemicalSystemGenerator --> RFEComponentLabels : uses
+```
+
+## Component Label System
+
+The framework uses a standardized enumeration system for labeling molecular components within chemical systems [source](openfe/setup/chemicalsystem_generator/abstract_chemicalsystem_generator.py#L12-L18):
+
+| Label | Value | Purpose |
+|-------|-------|---------|
+| `PROTEIN` | "protein" | Protein component in complex systems |
+| `LIGAND` | "ligand" | Primary small molecule for transformation |
+| `SOLVENT` | "solvent" | Solvent environment component |
+| `COFACTOR` | "cofactor" | Additional small molecules in protein complexes |
+
+These labels ensure consistent component identification across different chemical systems and enable automated validation of system composition.
+
+## EasyChemicalSystemGenerator Implementation
+
+The `EasyChemicalSystemGenerator` class provides a straightforward interface for generating chemical systems in multiple environments [source](openfe/setup/chemicalsystem_generator/easy_chemicalsystem_generator.py#L19-L120).
+
+### Initialization Parameters
+
+The generator accepts four key parameters that determine which types of systems will be created:
+
+- **`solvent`** (SolventComponent, optional): Enables solvated system generation
+- **`protein`** (ProteinComponent, optional): Enables complex system generation with protein
+- **`cofactors`** (Iterable[SmallMoleculeComponent], optional): Additional molecules included in protein complexes
+- **`do_vacuum`** (bool, optional): Controls vacuum system generation
+
+> [!TIP]
+> The generator enforces at least one valid environment configuration. If neither solvent nor protein is provided and `do_vacuum` is false, a `ValueError` is raised to prevent invalid system generation attempts.
+
+### System Generation Order
+
+The generator follows a deterministic order when creating systems [source](openfe/setup/chemicalsystem_generator/easy_chemicalsystem_generator.py#L71-L120):
+
+1. **Vacuum system** (if `do_vacuum=True`): Contains only the ligand
+2. **Solvent system** (if solvent provided): Ligand + solvent environment  
+3. **Complex system** (if protein provided): Ligand + protein + optional cofactors + optional solvent
+
+This ordered approach ensures predictable system naming and consistent preparation across different molecular environments.
+
+## System Validation Framework
+
+OpenFE includes a comprehensive validation system for verifying chemical system composition [source](openfe/tests/setup/chemicalsystem_generator/component_checks.py#L7-L21):
+
+```python
+def ligandC_in_chem_sys(chemical_system: ChemicalSystem) -> bool:
+    return RFEComponentLabels.LIGAND in chemical_system.components
+
+def solventC_in_chem_sys(chemical_system: ChemicalSystem) -> bool:
+    return RFEComponentLabels.SOLVENT in chemical_system.components
+
+def proteinC_in_chem_sys(chemical_system: ChemicalSystem) -> bool:
+    return RFEComponentLabels.PROTEIN in chemical_system.components
+```
+
+These validation functions enable automated testing of system composition and ensure that generated systems contain the expected components for their intended simulation scenarios.
+
+## Common Usage Patterns
+
+### Hydration Scenario
+For ligand hydration free energy calculations:
+```python
+generator = EasyChemicalSystemGenerator(do_vacuum=True, solvent=SolventComponent())
+systems = list(generator(ligand_component))
+# Result: [vacuum_system, solvent_system]
+```
+
+### Binding Scenario  
+For protein-ligand binding calculations:
+```python
+generator = EasyChemicalSystemGenerator(
+    solvent=SolventComponent(),
+    protein=ProteinComponent()
+)
+systems = list(generator(ligand_component))
+# Result: [solvent_system, complex_system]
+```
+
+### Complete Binding Cycle
+For full thermodynamic cycle including vacuum:
+```python
+generator = EasyChemicalSystemGenerator(
+    do_vacuum=True,
+    solvent=SolventComponent(), 
+    protein=ProteinComponent()
+)
+systems = list(generator(ligand_component))
+# Result: [vacuum_system, solvent_system, complex_system]
+```
+
+> [!TIP]
+> The generator uses systematic naming conventions: `{ligand_name}_{environment}` where environment is "vacuum", "solvent", or "complex". This enables easy identification and downstream processing of generated systems.
+
+## Integration with Workflow
+
+The chemical system generation integrates seamlessly with OpenFE's broader workflow for free energy calculations. Generated systems serve as the foundation for:
+
+- **Alchemical network planning**: Systems provide the endpoints for molecular transformations
+- **Protocol execution**: Each system type requires specific simulation protocols
+- **Results analysis**: System labels enable organized result collection and comparison
+
+For advanced users requiring custom system generation logic, the `AbstractChemicalSystemGenerator` interface provides the foundation for implementing specialized generators that can handle non-standard molecular environments or complex multi-component systems.
+
+## Next Steps
+
+To continue exploring OpenFE's molecular system setup capabilities, consider examining:
+
+- [Atom Mapping and Molecular Transformations](9-atom-mapping-and-molecular-transformations) for understanding how molecules are connected in transformations
+- [Ligand Network Planning Algorithms](10-ligand-network-planning-algorithms) for optimizing transformation pathways
+- [Protocol System and Execution Framework](8-protocol-system-and-execution-framework) for running simulations on generated systems
+
+# Relative Binding Free Energy (RBFE) Protocols
+
+
+
+Relative Binding Free Energy (RBFE) protocols in OpenFE provide a comprehensive framework for calculating the free energy differences between ligand binding to a common receptor. These protocols implement hybrid topology approaches using OpenMM and are based on proven methodologies from the Perses toolkit, offering multiple sampling strategies and extensive configurability for accurate binding affinity predictions.
+
+## Protocol Architecture Overview
+
+The RBFE implementation follows a modular architecture that separates concerns between protocol definition, execution units, settings management, and utility functions. This design enables flexible configuration while maintaining computational efficiency and reproducibility.
+
+```mermaid
+graph TD
+    A[RelativeHybridTopologyProtocol] --> B[Protocol Settings]
+    A --> C[Protocol Units]
+    A --> D[Result Management]
+    
+    B --> E[Forcefield Settings]
+    B --> F[Alchemical Settings]
+    B --> G[Simulation Settings]
+    B --> H[Lambda Settings]
+    
+    C --> I[HybridTopologyFactory]
+    C --> J[MultiState Samplers]
+    C --> K[Lambda Protocols]
+    
+    D --> L[Free Energy Estimates]
+    D --> M[Uncertainty Analysis]
+    D --> N[Overlap Matrices]
+    
+    I --> O[Core/Environment Atoms]
+    I --> P[Hybrid System Creation]
+    I --> Q[Nonbonded Force Handling]
+    
+    J --> R[Replica Exchange]
+    J --> S[Self-Adjusted Mixture Sampling]
+    J --> T[Independent Window Sampling]
+```
+
+## Core Protocol Components
+
+### RelativeHybridTopologyProtocol
+
+The main protocol class orchestrates the entire RBFE calculation workflow [openfe/protocols/openmm_rfe/equil_rfe_methods.py](openfe/protocols/openmm_rfe/equil_rfe_methods.py#L496-L508). This class serves as the entry point for defining RBFE calculations and manages the creation of protocol units, execution coordination, and result aggregation.
+
+Key responsibilities include:
+- Creating protocol units for each transformation
+- Managing repeat calculations for statistical robustness
+- Coordinating execution through the OpenFE framework
+- Aggregating results from multiple independent runs
+
+### RelativeHybridTopologyProtocolUnit
+
+Each protocol unit represents a single execution of the RBFE calculation [openfe/protocols/openmm_rfe/equil_rfe_methods.py](openfe/protocols/openmm_rfe/equil_rfe_methods.py#L683-L710). These units encapsulate the complete simulation workflow including system preparation, minimization, equilibration, and production sampling.
+
+The unit handles:
+- Hybrid topology system creation
+- Multi-state sampler initialization
+- Simulation execution across lambda windows
+- Data collection and analysis
+- Structural and energetic analysis
+
+## Hybrid Topology System Construction
+
+The HybridTopologyFactory is responsible for creating the hybrid molecular system that enables smooth alchemical transformations between ligands [openfe/protocols/openmm_rfe/_rfe_utils/relative.py](openfe/protocols/openmm_rfe/_rfe_utils/relative.py#L23-L84).
+
+### Atom Classification System
+
+The factory categorizes atoms into four distinct classes:
+- **Core atoms**: Common atoms present in both ligands
+- **Environment atoms**: Receptor and solvent atoms
+- **Unique old atoms**: Atoms only present in the initial ligand
+- **Unique new atoms**: Atoms only present in the final ligand
+
+This classification enables selective application of alchemical perturbations while maintaining the structural integrity of the receptor environment.
+
+### Force Field Integration
+
+The hybrid system construction handles all force field components:
+- **Bonded forces**: Bonds, angles, and torsions with appropriate scaling
+- **Nonbonded forces**: Electrostatic and van der Waals interactions with softcore potentials
+- **Constraints**: Maintaining molecular geometry during transformation
+- **Virtual sites**: Handling special cases like lone pairs
+
+## Lambda Protocols and Alchemical Transformation
+
+### Lambda Schedule Management
+
+The LambdaProtocol class defines how different energy components are scaled during the alchemical transformation [openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py](openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py#L45-L80).
+
+Multiple predefined protocols are available:
+
+| Protocol | Description | Lambda Range |
+|----------|-------------|--------------|
+| **default** | Sequential turning off of old terms (0.0-0.5) and on of new terms (0.5-1.0) | 0.0 → 1.0 |
+| **quarters** | Four distinct phases for each energy component | 0.0 → 1.0 |
+| **namd** | Implementation following Jiang et al. J. Chem. Inf. Model. 2019 | 0.0 → 1.0 |
+| **ele-scaled** | Electrostatics scaled with λ^0.5 for energy linearity | 0.0 → 1.0 |
+
+The default protocol uses the following lambda functions [openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py](openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py#L25-L41):
+- Core terms: Linear scaling (λ)
+- Old sterics/electrostatics: Turn off between 0.0-0.5
+- New sterics/electrostatics: Turn on between 0.5-1.0
+
+### Alchemical State Management
+
+The RelativeAlchemicalState class manages the lambda parameters for different energy components [openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py](openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py#L291-L340):
+- `lambda_sterics_core`: Core steric interactions
+- `lambda_electrostatics_core`: Core electrostatic interactions  
+- `lambda_sterics_insert/delete`: New/old steric interactions
+- `lambda_electrostatics_insert/delete`: New/old electrostatic interactions
+
+> [!TIP]
+> The lambda protocol choice significantly impacts sampling efficiency. The default protocol provides good balance for most systems, but the quarters protocol may be better for challenging transformations with large electrostatic differences.
+
+## Multi-State Sampling Methods
+
+OpenFE RBFE protocols support three advanced sampling strategies through the HybridCompatibilityMixin [openfe/protocols/openmm_rfe/_rfe_utils/multistate.py](openfe/protocols/openmm_rfe/_rfe_utils/multistate.py#L29-L43):
+
+### 1. Hamiltonian Replica Exchange (HREX)
+
+The HybridRepexSampler enables exchange between different lambda states to improve sampling efficiency [openfe/protocols/openmm_rfe/_rfe_utils/multistate.py](openfe/protocols/openmm_rfe/_rfe_utils/multistate.py#L155-L162). This method:
+- Facilitates barrier crossing between lambda states
+- Improves convergence for difficult transformations
+- Provides natural error estimation through replica statistics
+
+### 2. Self-Adjusted Mixture Sampling (SAMS)
+
+The HybridSAMSSampler implements optimal weight adaptation for efficient free energy estimation [openfe/protocols/openmm_rfe/_rfe_utils/multistate.py](openfe/protocols/openmm_rfe/_rfe_utils/multistate.py#L168-L175). This approach:
+- Automatically optimizes lambda state weights
+- Minimizes variance in free energy estimates
+- Particularly useful for large ligand networks
+
+### 3. Independent Window Sampling
+
+The HybridMultiStateSampler provides traditional independent sampling at each lambda window [openfe/protocols/openmm_rfe/_rfe_utils/multistate.py](openfe/protocols/openmm_rfe/_rfe_utils/multistate.py#L181-L188). This method:
+- Offers simplicity and easy parallelization
+- Provides straightforward error analysis
+- Serves as a baseline for comparison
+
+## Protocol Configuration
+
+### Settings Hierarchy
+
+The RelativeHybridTopologyProtocolSettings class provides comprehensive configuration options [openfe/protocols/openmm_rfe/equil_rfe_settings.py](openfe/protocols/openmm_rfe/equil_rfe_settings.py#L104-L158):
+
+| Setting Category | Key Parameters | Description |
+|-----------------|----------------|-------------|
+| **Protocol Control** | `protocol_repeats` | Number of independent repeats for statistics |
+| **Force Field** | `forcefield_settings` | OpenMM force field parameters |
+| **Thermodynamics** | `thermo_settings` | Temperature, pressure conditions |
+| **Solvation** | `solvation_settings` | Solvent model and box parameters |
+| **Partial Charges** | `partial_charge_settings` | Charge calculation methods |
+| **Lambda Protocol** | `lambda_settings` | Lambda windows and functions |
+| **Alchemical** | `alchemical_settings` | Softcore parameters and corrections |
+| **Simulation** | `simulation_settings` | Sampling method and duration |
+| **Engine** | `engine_settings` | OpenMM platform and precision |
+| **Integrator** | `integrator_settings` | Timestep and barostat settings |
+| **Output** | `output_settings` | Data storage and analysis options |
+
+### Lambda Configuration
+
+The LambdaSettings class controls the alchemical transformation schedule [openfe/protocols/openmm_rfe/equil_rfe_settings.py](openfe/protocols/openmm_rfe/equil_rfe_settings.py#L33-L50):
+- `lambda_functions`: Choice of predefined protocols ('default', 'namd', 'quarters')
+- `lambda_windows`: Number of lambda states (default: 11)
+
+### Alchemical Parameters
+
+The AlchemicalSettings class manages softcore and correction parameters [openfe/protocols/openmm_rfe/equil_rfe_settings.py](openfe/protocols/openmm_rfe/equil_rfe_settings.py#L50-L103):
+- `softcore_LJ`: Choice between 'gapsys' and 'beutler' softcore functions
+- `softcore_alpha`: Softcore alpha parameter (default: 0.85)
+- `use_dispersion_correction`: Apply long-range dispersion corrections
+- `explicit_charge_correction`: Handle charge changes during transformation
+
+> [!TIP]
+> For systems with significant charge differences between ligands, enable `explicit_charge_correction` to avoid artifacts from net charge changes during the alchemical transformation.
+
+## Results Analysis and Output
+
+### Result Container
+
+The RelativeHybridTopologyProtocolResult class provides comprehensive analysis tools [openfe/protocols/openmm_rfe/equil_rfe_methods.py](openfe/protocols/openmm_rfe/equil_rfe_methods.py#L276-L495):
+
+Key methods include:
+- `get_estimate()`: Mean free energy difference across repeats
+- `get_uncertainty()`: Standard deviation between repeats
+- `get_individual_estimates()`: Results from each independent repeat
+- `get_overlap_matrices()`: Energy overlap analysis between lambda states
+- `get_replica_transition_statistics()`: Exchange rates for replica methods
+- `equilibration_iterations()` and `production_iterations()`: Sampling statistics
+
+### Statistical Analysis
+
+The protocol implements robust statistical analysis:
+- **Mean estimation**: Average across independent repeats
+- **Uncertainty quantification**: Standard deviation between repeats
+- **Convergence assessment**: Overlap matrix analysis
+- **Replica statistics**: Exchange rates and state distributions
+
+## Integration with OpenFE Framework
+
+The RBFE protocols seamlessly integrate with the broader OpenFE ecosystem:
+- **Network planning**: Compatible with ligand network planning algorithms
+- **Storage**: Results stored in OpenFE's standardized format
+- **Visualization**: Integration with network plotting tools
+- **CLI support**: Command-line interface for protocol execution
+
+## Best Practices and Recommendations
+
+### Protocol Selection
+
+- **Standard transformations**: Use default lambda protocol with HREX sampling
+- **Large electrostatic changes**: Consider quarters protocol or ele-scaled variant
+- **High-throughput screening**: Independent window sampling for parallel efficiency
+- **Challenging transformations**: SAMS for optimal weight adaptation
+
+### Convergence Assessment
+
+Monitor multiple convergence indicators:
+- Overlap matrices should show good coverage (>0.1 overlap preferred)
+- Replica exchange rates around 20-30% for HREX
+- Consistent results across independent repeats
+- Small statistical uncertainties (<0.5 kcal/mol preferred)
+
+### Computational Resources
+
+Balance accuracy and efficiency:
+- **Production runs**: 1-5 ns per lambda window typical
+- **Lambda windows**: 11-21 windows sufficient for most cases
+- **Protocol repeats**: 3-5 repeats for reliable statistics
+- **Parallel execution**: Utilize multiple replicas for efficiency
+
+The RBFE protocols in OpenFE provide a robust, flexible foundation for accurate binding free energy calculations, with extensive customization options to address diverse molecular transformation challenges.
+
+# Absolute Binding Free Energy (ABFE) Protocols
+
+
+
+Absolute Binding Free Energy (ABFE) protocols in OpenFE provide a comprehensive framework for calculating the binding free energy of a single ligand to a target protein without requiring reference ligands. These protocols implement thermodynamically rigorous approaches based on alchemical transformations and leverage OpenMM's molecular dynamics capabilities for high-precision free energy calculations.
+
+## Protocol Architecture Overview
+
+The ABFE implementation follows a modular architecture that separates different phases of the calculation into specialized protocol units. The system is built around two main protocol types: Absolute Binding Protocol for protein-ligand binding calculations and Absolute Solvation Protocol for solvation free energy calculations.
+
+```mermaid
+graph TD
+    A[ABFE Protocol System] --> B[AbsoluteBindingProtocol]
+    A --> C[AbsoluteSolvationProtocol]
+    
+    B --> D[AbsoluteBindingComplexUnit]
+    B --> E[AbsoluteBindingSolventUnit]
+    
+    C --> F[AbsoluteSolvationVacuumUnit]
+    C --> G[AbsoluteSolvationSolventUnit]
+    
+    D --> H[BaseAbsoluteUnit]
+    E --> H
+    F --> H
+    G --> H
+    
+    H --> I[OpenMM Engine]
+    H --> J[MultiState Sampling]
+    H --> K[Alchemical Transformations]
+```
+
+## Core Protocol Types
+
+### Absolute Binding Protocol
+
+The `AbsoluteBindingProtocol` calculates the binding free energy by performing alchemical transformations in both complex and solvent environments [openfe/protocols/openmm_afe/equil_binding_afe_method.py](openfe/protocols/openmm_afe/equil_binding_afe_method.py#L517-L580). This protocol implements a thermodynamic cycle that includes:
+
+- **Complex Phase**: Ligand is decoupled from the protein-ligand complex
+- **Solvent Phase**: Ligand is decoupled from solution
+- **Restraint System**: Boresch restraints maintain proper ligand orientation during complex calculations
+
+The protocol supports multiple sampling methods including Hamiltonian Replica Exchange, Self-adjusted Mixture Sampling, and Independent Window sampling.
+
+### Absolute Solvation Protocol
+
+The `AbsoluteSolvationProtocol` calculates solvation free energies through vacuum-to-solvent alchemical transformations [openfe/protocols/openmm_afe/equil_solvation_afe_method.py](openfe/protocols/openmm_afe/equil_solvation_afe_method.py#L405-L470). This protocol consists of:
+
+- **Vacuum Phase**: Ligand exists in vacuum environment
+- **Solvent Phase**: Ligand is transferred to explicit solvent
+
+## Protocol Units and Execution Flow
+
+Each protocol is composed of specialized protocol units that handle different computational phases:
+
+| Protocol Unit | Environment | Purpose | Key Features |
+|---------------|-------------|---------|--------------|
+| `AbsoluteBindingComplexUnit` | Protein-ligand complex | Decouple ligand from complex | Boresch restraints, standard state corrections |
+| `AbsoluteBindingSolventUnit` | Solvent | Decouple ligand from solution | Solvent equilibration, alchemical sampling |
+| `AbsoluteSolvationVacuumUnit` | Vacuum | Vacuum phase calculation | No cutoffs, gas phase dynamics |
+| `AbsoluteSolvationSolventUnit` | Solvent | Solvent phase calculation | Explicit solvent, periodic boundaries |
+
+All protocol units inherit from `BaseAbsoluteUnit` [openfe/protocols/openmm_afe/base.py](openfe/protocols/openmm_afe/base.py#L86-L89), which provides common functionality for system preparation, alchemical transformations, and simulation execution.
+
+## Configuration and Settings
+
+### Lambda Schedule Configuration
+
+The alchemical transformation is controlled through lambda schedules that define how different interaction components are scaled:
+
+```python
+# Example lambda settings for binding protocol
+lambda_settings = LambdaSettings(
+    lambda_elec=[0.0, 0.25, 0.5, 0.75, 1.0, ...],  # Electrostatic scaling
+    lambda_vdw=[0.0, 0.0, 0.0, 0.0, 0.0, ...],     # Van der Waals scaling  
+    lambda_restraints=[0.0, 0.0, 0.0, 0.0, 0.0, ...] # Restraint scaling
+)
+```
+
+The lambda schedules are carefully designed to ensure smooth alchemical transitions and adequate sampling at each state [openfe/protocols/openmm_afe/equil_afe_settings.py](openfe/protocols/openmm_afe/equil_afe_settings.py#L52-L120).
+
+### Simulation Settings
+
+ABFE protocols require extensive configuration including:
+
+- **Force Field Settings**: OpenMM force field parameters for different environments
+- **Thermodynamic Settings**: Temperature, pressure, and ensemble conditions
+- **Engine Settings**: OpenMM compute platform and precision settings
+- **Integrator Settings**: Langevin dynamics parameters and timestep
+- **Output Settings**: Trajectory and energy output configuration
+
+> [!TIP]
+> The default settings provided with ABFE protocols are optimized for typical small molecule systems but should be carefully validated for specific use cases, particularly for charged or highly flexible ligands.
+
+## Results Analysis
+
+### Protocol Results Structure
+
+Both ABFE protocols return specialized result objects that provide comprehensive analysis capabilities:
+
+- **`AbsoluteBindingProtocolResult`**: Contains binding free energy estimates with uncertainties
+- **`AbsoluteSolvationProtocolResult`**: Provides solvation free energy calculations
+
+### Analysis Methods
+
+The result objects offer multiple analysis methods [openfe/protocols/openmm_afe/equil_binding_afe_method.py](openfe/protocols/openmm_afe/equil_binding_afe_method.py#L105-L495):
+
+- `get_estimate()`: Primary free energy estimate with statistical uncertainty
+- `get_individual_estimates()`: Individual repeat estimates for convergence analysis
+- `get_overlap_matrices()`: Energy overlap analysis between lambda states
+- `get_replica_transition_statistics()`: Replica exchange efficiency metrics
+- `get_forward_and_reverse_energy_analysis()`: Detailed energy decomposition
+
+## Implementation Details
+
+### Alchemical System Preparation
+
+The protocols use OpenMM's `AbsoluteAlchemicalFactory` to create alchemical systems with proper lambda-dependent scaling of interactions [openfe/protocols/openmm_afe/base.py](openfe/protocols/openmm_afe/base.py#L620-L626). The system preparation includes:
+
+1. **Component Identification**: Automatic detection of alchemical components
+2. **Partial Charge Assignment**: Configurable charge generation methods
+3. **System Generation**: OpenMM system creation with appropriate force fields
+4. **Restraint Integration**: Boresch restraint geometry determination
+
+### Multi-State Sampling
+
+ABFE protocols implement multi-state sampling using OpenMMTools' `MultiStateSampler` framework [openfe/protocols/openmm_afe/base.py](openfe/protocols/openmm_afe/base.py#L898-L908). This provides:
+
+- **Replica Exchange**: Efficient sampling across lambda states
+- **Parallel Execution**: Multiple replica simulations running concurrently
+- **Adaptive Sampling**: Dynamic adjustment of sampling parameters
+
+## Current Limitations
+
+The ABFE protocols have several important limitations that users should be aware of:
+
+1. **Charge Restrictions**: Alchemical species with net charge are not currently supported [openfe/protocols/openmm_afe/equil_binding_afe_method.py](openfe/protocols/openmm_afe/equil_binding_afe_method.py#L16)
+2. **Molecule Size**: Only small molecules are supported as alchemical species
+3. **Transformation Direction**: Disappearing molecules are only allowed in state A
+4. **Restraint Systems**: Limited to Boresch-style restraints for binding calculations
+
+> [!TIP]
+> For charged ligands or large molecules, consider using Relative Binding Free Energy (RBFE) protocols instead, which can handle a broader range of chemical transformations.
+
+## Best Practices
+
+### System Preparation
+
+1. **Ligand Parameterization**: Ensure proper partial charges and force field parameters
+2. **Protein Preparation**: Add missing residues, optimize protonation states
+3. **Solvation**: Use appropriate box sizes and ion concentrations
+4. **Minimization**: Perform thorough energy minimization before production runs
+
+### Sampling Considerations
+
+1. **Lambda Windows**: Use sufficient lambda windows for smooth transitions
+2. **Simulation Length**: Ensure adequate sampling at each lambda state
+3. **Convergence Monitoring**: Track free energy estimates across repeats
+4. **Overlap Analysis**: Verify sufficient energy overlap between adjacent states
+
+## Integration with OpenFE Ecosystem
+
+ABFE protocols integrate seamlessly with the broader OpenFE framework:
+
+- **Network Planning**: Can be incorporated into larger alchemical networks
+- **Result Storage**: Compatible with OpenFE's storage and metadata systems
+- **Visualization**: Results can be analyzed with OpenFE's plotting tools
+- **CLI Support**: Available through OpenFE's command-line interface
+
+For practical examples and tutorials, see the [ABFE tutorial notebook](docs/tutorials/abfe_tutorial.nblink) which demonstrates complete workflow implementation.
+
+## Next Steps
+
+To continue your exploration of OpenFE's capabilities:
+
+- Learn about [Relative Binding Free Energy (RBFE) Protocols](12-relative-binding-free-energy-rbfe-protocols) for comparative ligand binding studies
+- Explore [Molecular Dynamics and Thermodynamic Integration](14-molecular-dynamics-and-thermodynamic-integration) for deeper understanding of the underlying methods
+- Review [Restraint Systems and Septop Methods](15-restraint-systems-and-septop-methods) for advanced restraint implementations
+- Study [Custom Protocol Development](20-custom-protocol-development) to create specialized free energy calculations
+
+The ABFE protocols provide a solid foundation for rigorous absolute free energy calculations while maintaining the flexibility and extensibility that characterize the OpenFE platform.
+
+# Molecular Dynamics and Thermodynamic Integration
+
+
+
+Molecular Dynamics (MD) and Thermodynamic Integration (TI) form the computational foundation for alchemical free energy calculations in OpenFE. This documentation explores the sophisticated implementation of MD protocols and TI methodologies that enable precise estimation of free energy differences between molecular states.
+
+## Core MD Architecture
+
+OpenFE implements a comprehensive MD framework through the `PlainMDProtocol` class, which provides the fundamental building blocks for molecular simulations [plain_md_methods.py](openfe/protocols/openmm_md/plain_md_methods.py#L118-L238). The protocol follows a structured approach with three distinct phases:
+
+```mermaid
+flowchart TD
+    A[Energy Minimization] --> B[NVT Equilibration]
+    B --> C[NPT Equilibration]
+    C --> D[Production MD]
+    D --> E[Trajectory Analysis]
+    
+    A --> A1[Remove Bad Contacts]
+    A --> A2[Optimize Geometry]
+    
+    B --> B1[Constant Volume]
+    B --> B2[Temperature Control]
+    
+    C --> C1[Constant Pressure]
+    C --> C2[Density Equilibration]
+    
+    D --> D1[Data Collection]
+    D --> D2[Periodic Saving]
+```
+
+### MD Simulation Pipeline
+
+The core MD execution is handled by the `_run_MD` static method, which orchestrates the complete simulation workflow [plain_md_methods.py](openfe/protocols/openmm_md/plain_md_methods.py#L281-L295). This method implements:
+
+1. **Energy Minimization**: Removes steric clashes and optimizes molecular geometry using `simulation.minimizeEnergy()` with configurable iteration limits
+2. **NVT Equilibration**: Constant volume equilibration to stabilize temperature, with optional barostat disabling
+3. **NPT Equilibration**: Constant pressure equilibration to achieve proper density using Monte Carlo barostat
+4. **Production MD**: Extended sampling phase with configurable trajectory output and checkpointing
+
+> [!TIP]
+> The MD pipeline supports flexible trajectory output through MDTraj integration, allowing selective atom subset saving and multiple format support (PDB, XTC) for efficient storage and analysis.
+
+## Thermodynamic Integration Framework
+
+Thermodynamic Integration in OpenFE is implemented through sophisticated lambda coupling protocols that control the gradual transformation between molecular states. The `LambdaProtocol` class provides the mathematical foundation for these alchemical transformations [lambdaprotocol.py](openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py#L14-L21).
+
+### Lambda Coupling Strategies
+
+OpenFE offers multiple pre-defined lambda protocols tailored for different transformation scenarios:
+
+| Protocol | Description | Lambda Range | Key Features |
+|----------|-------------|--------------|--------------|
+| **default** | Standard dual-topology approach | 0.0 → 1.0 | Linear core terms, staggered electrostatics/sterics |
+| **namd** | NAMD-compatible protocol | 0.0 → 1.0 | Optimized for NAMD, smooth transitions |
+| **quarters** | Sequential component transformation | 0.0 → 1.0 | Individual component control in 0.25 increments |
+| **ele-scaled** | Electrostatic scaling | 0.0 → 1.0 | √λ scaling for linear energy behavior |
+
+The lambda functions control different energetic components:
+
+```python
+# Example from default protocol
+lambda_functions = {
+    'lambda_sterics_core': lambda x: x,
+    'lambda_electrostatics_core': lambda x: x,
+    'lambda_sterics_insert': lambda x: 0.0 if x < 0.5 else 2.0 * (x - 0.5),
+    'lambda_sterics_delete': lambda x: 2.0 * x if x < 0.5 else 1.0,
+    'lambda_electrostatics_insert': lambda x: 0.0 if x < 0.5 else 2.0 * (x - 0.5),
+    'lambda_electrostatics_delete': lambda x: 2.0 * x if x < 0.5 else 1.0
+}
+```
+
+> [!TIP]
+> The lambda protocols include built-in validation to prevent singularities from naked charges, ensuring numerical stability throughout the alchemical transformation.
+
+## Multi-State Sampling and Analysis
+
+OpenFE implements advanced multi-state sampling methods through hybrid samplers that support replica exchange and self-adjusted mixture sampling [multistate.py](openfe/protocols/openmm_rfe/_rfe_utils/multistate.py#L155-L187).
+
+### Hybrid Sampler Architecture
+
+The framework provides three specialized sampler classes:
+
+1. **HybridRepexSampler**: Replica exchange for enhanced sampling across lambda windows
+2. **HybridSAMSSampler**: Self-adjusted mixture sampling for optimal lambda state distribution  
+3. **HybridMultiStateSampler**: General multi-state sampling with hybrid topology support
+
+These samplers handle the complexity of endpoint states with different numbers of degrees of freedom through the `HybridCompatibilityMixin` [multistate.py](openfe/protocols/openmm_rfe/_rfe_utils/multistate.py#L29-L42).
+
+### Free Energy Analysis
+
+The `MultistateAnalyzer` class provides comprehensive analysis tools for extracting thermodynamic information from multi-state simulations [multistate_analysis.py](openfe/protocols/openmm_utils/multistate_analysis.py#L1-L50). Key capabilities include:
+
+- **MBAR Analysis**: Bennett Acceptance Ratio for optimal free energy estimation
+- **Overlap Matrix**: Assessment of sampling efficiency between lambda states
+- **Convergence Analysis**: Forward/reverse integration for statistical validation
+- **Replica Exchange Statistics**: Transition matrix analysis for exchange efficiency
+
+```mermaid
+flowchart LR
+    A[Raw Simulation Data] --> B[Equilibration Detection]
+    B --> C[Timeseries Analysis]
+    C --> D[MBAR Processing]
+    D --> E[Free Energy Estimates]
+    D --> F[Overlap Matrix]
+    D --> G[Convergence Metrics]
+    
+    E --> H[ΔG Results]
+    F --> I[Sampling Efficiency]
+    G --> J[Statistical Confidence]
+```
+
+## Hybrid Topology Generation
+
+The `HybridTopologyFactory` class creates the molecular systems required for alchemical transformations [relative.py](openfe/protocols/openmm_rfe/_rfe_utils/relative.py#L1-L50). This sophisticated system handles:
+
+### Atom Classification
+
+The hybrid system categorizes atoms into four types:
+
+| Atom Type | Lambda=0 State | Lambda=1 State | Description |
+|-----------|----------------|----------------|-------------|
+| **unique_old_atom** | Active | Inactive | Atoms only in initial state |
+| **unique_new_atom** | Inactive | Active | Atoms only in final state |
+| **core_atom** | Old parameters | New parameters | Mapped atoms in changing regions |
+| **environment_atom** | Active | Active | Unchanged environmental atoms |
+
+### System Integration
+
+The hybrid topology factory ensures proper coordinate consistency between end states and manages the complex bookkeeping required for dual-topology alchemical transformations. This includes handling of:
+
+- Custom nonbonded forces for alchemical interactions
+- Proper mass and parameter inheritance
+- Consistent topology mapping across lambda states
+
+## Integration with OpenFE Ecosystem
+
+The MD and TI components integrate seamlessly with the broader OpenFE framework:
+
+### Protocol Composition
+MD protocols can be combined with free energy protocols for comprehensive workflows:
+- **RBFE**: Relative binding free energy calculations [Relative Binding Free Energy (RBFE) Protocols](12-relative-binding-free-energy-rbfe-protocols)
+- **ABFE**: Absolute binding free energy calculations [Absolute Binding Free Energy (ABFE) Protocols](13-absolute-binding-free-energy-abfe-protocols)
+- **Restraint Systems**: Septop and other restraint methods [Restraint Systems and Septop Methods](15-restraint-systems-and-septop-methods)
+
+### Results Analysis
+The MD output integrates with OpenFE's analysis tools:
+- Individual calculation results [Working with Individual Calculation Results](16-working-with-individual-calculation-results)
+- Network-based analysis [Network-Based Results Analysis](17-network-based-results-analysis)
+- Maximum likelihood estimation [Maximum Likelihood Estimation for Free Energy Networks](18-maximum-likelihood-estimation-for-free-energy-networks)
+
+## Performance and Optimization
+
+OpenFE's MD implementation includes several performance optimizations:
+
+### Platform Selection
+The `get_openmm_platform` function provides intelligent platform selection for optimal performance [omm_compute.py](openfe/protocols/openmm_utils/omm_compute.py#L13-L17):
+
+- GPU acceleration for production simulations
+- CPU fallback for compatibility
+- Multi-GPU support for parallel execution
+
+### Memory Management
+- Efficient trajectory storage through selective atom saving
+- Checkpoint/restart capabilities for long simulations
+- Optimized data structures for large molecular systems
+
+### Validation and Quality Control
+The framework includes comprehensive validation:
+
+- **Parameter Validation**: Ensures physical consistency of simulation parameters
+- **System Validation**: Checks for proper topology and coordinate consistency
+- **Energy Validation**: Verifies energy conservation and reasonable values
+
+## Advanced Configuration
+
+For users requiring specialized functionality, OpenFE supports:
+
+### Custom Lambda Protocols
+User-defined lambda functions can be implemented for specific transformation requirements:
+
+```python
+custom_protocol = LambdaProtocol(
+    functions={
+        'lambda_sterics_core': lambda x: x**2,
+        'lambda_electrostatics_core': lambda x: x**3,
+        # Custom functions for specific use cases
+    },
+    windows=20
+)
+```
+
+### Protocol Extension
+The modular architecture allows for protocol customization and extension for specialized applications.
+
+## Best Practices
+
+When implementing MD and TI calculations in OpenFE:
+
+1. **System Preparation**: Ensure proper minimization and equilibration before production runs
+2. **Lambda Schedule Selection**: Choose appropriate lambda protocols for your specific transformation
+3. **Convergence Monitoring**: Utilize built-in analysis tools to verify simulation convergence
+4. **Performance Optimization**: Select appropriate hardware platforms and simulation parameters
+5. **Validation**: Always validate results through multiple independent runs
+
+The combination of robust MD protocols, sophisticated thermodynamic integration methods, and comprehensive analysis tools makes OpenFE a powerful platform for accurate free energy calculations in molecular design and drug discovery applications.
+
+# Restraint Systems and Septop Methods
+
+
+
+The OpenFE framework provides sophisticated restraint systems and Separated Topologies (SepTop) methods for accurate binding free energy calculations. This documentation covers the architectural design, implementation details, and practical applications of these advanced features.
+
+## Restraint Architecture Overview
+
+Restraint systems in OpenFE are built on a modular architecture that separates geometry definition from force application. The system supports multiple restraint types including harmonic bonds, flat-bottom potentials, and the sophisticated Boresch restraint system for maintaining ligand orientation during binding calculations.
+
+```mermaid
+graph TD
+    A[Restraint Settings] --> B[Geometry Definition]
+    B --> C[Force Application]
+    C --> D[OpenMM Integration]
+    
+    A --> A1[DistanceRestraintSettings]
+    A --> A2[FlatBottomRestraintSettings] 
+    A --> A3[BoreschRestraintSettings]
+    
+    B --> B1[DistanceRestraintGeometry]
+    B --> B2[FlatBottomDistanceGeometry]
+    B --> B3[BoreschRestraintGeometry]
+    
+    C --> C1[HarmonicBondRestraint]
+    C --> C2[FlatBottomBondRestraint]
+    C --> C3[BoreschRestraint]
+```
+
+## Restraint Types and Configuration
+
+### Distance-Based Restraints
+
+Distance restraints provide simple harmonic or flat-bottom potentials between atom groups:
+
+- **HarmonicBondRestraint**: Standard harmonic potential with configurable spring constant
+- **FlatBottomBondRestraint**: Harmonic potential with a flat-bottom well region
+- **CentroidRestraints**: Apply forces to center-of-mass of atom groups rather than individual atoms
+
+The distance restraint settings are defined through `DistanceRestraintSettings` [source](openfe/protocols/restraint_utils/settings.py#L35-L71), which includes parameters for spring constants and atom selection strategies.
+
+### Boresch Restraint System
+
+The Boresch restraint is the most sophisticated option, maintaining ligand orientation through six geometric parameters:
+
+| Parameter | Description | Default Force Constant |
+|-----------|-------------|----------------------|
+| r_aA0 | H0-G0 bond distance | 4184.0 kJ/mol/nm² |
+| θ_A0 | H1-H0-G0 angle | 334.72 kJ/mol/rad² |
+| θ_B0 | H0-G0-G1 angle | 334.72 kJ/mol/rad² |
+| φ_A0 | H2-H1-H0-G0 dihedral | 334.72 kJ/mol/rad² |
+| φ_B0 | H1-H0-G0-G1 dihedral | 334.72 kJ/mol/rad² |
+| φ_C0 | H0-G0-G1-G2 dihedral | 334.72 kJ/mol/rad² |
+
+> [!TIP]
+> The Boresch restraint geometry is automatically detected using RMSF filtering and distance criteria. The system searches for optimal anchor atoms in the host protein based on flexibility and spatial proximity to the ligand.
+
+## SepTop Method Architecture
+
+The Separated Topologies (SepTop) method implements a dual-ligand approach where both ligands are present simultaneously in the simulation, with one being decoupled while the other is coupled. This approach offers several advantages over traditional single-topology methods.
+
+### Core Components
+
+The SepTop implementation consists of several key classes:
+
+- **SepTopProtocol**: Main protocol class orchestrating the entire calculation [source](openfe/protocols/openmm_septop/equil_septop_method.py#L857-L1385)
+- **SepTopComplexSetupUnit**: Handles complex phase system preparation [source](openfe/protocols/openmm_septop/equil_septop_method.py#L1429-L2030)
+- **SepTopSolventSetupUnit**: Manages solvent phase system setup [source](openfe/protocols/openmm_septop/equil_septop_method.py#L2043-L2296)
+- **SepTopComplexRunUnit/SepTopSolventRunUnit**: Execute the actual simulations
+
+### Lambda Schedule Management
+
+SepTop requires careful management of multiple lambda parameters for each ligand:
+
+```mermaid
+graph LR
+    A[Ligand A] --> B[lambda_elec_A]
+    A --> C[lambda_vdw_A] 
+    A --> D[lambda_restraints_A]
+    
+    E[Ligand B] --> F[lambda_elec_B]
+    E --> G[lambda_vdw_B]
+    E --> H[lambda_restraints_B]
+    
+    B --> I[Alchemical Transformation]
+    C --> I
+    D --> I
+    F --> I
+    G --> I
+    H --> I
+```
+
+The lambda schedules are defined through `LambdaSettings` [source](openfe/protocols/openmm_septop/equil_septop_settings.py#L46-L276), ensuring proper coupling/decoupling sequences for each ligand component.
+
+## Restraint Integration in SepTop
+
+### Complex Phase Restraints
+
+In the complex phase, SepTop applies Boresch restraints to maintain ligand orientation relative to the protein. The restraint geometry is automatically detected using MDAnalysis and RMSF filtering:
+
+1. **Anchor Detection**: Identifies suitable protein atoms based on flexibility criteria
+2. **Geometry Optimization**: Finds optimal restraint parameters through trajectory analysis  
+3. **Force Application**: Applies CustomCompoundBondForce with lambda-dependent scaling
+
+The restraint detection algorithm uses configurable parameters like `rmsf_cutoff` (default 0.1 nm) and `host_min_distance`/`host_max_distance` for spatial filtering [source](openfe/protocols/restraint_utils/geometry/boresch/geometry.py#L135-L150).
+
+### Solvent Phase Restraints
+
+In the solvent phase, simpler harmonic restraints are applied to prevent ligand drift. The `solvent_restraint_settings` in `SepTopSettings` control this behavior [source](openfe/protocols/openmm_septop/equil_septop_settings.py#L441-L441).
+
+## Standard State Corrections
+
+Both restraint systems provide automatic standard state correction calculations:
+
+- **Distance Restraints**: Analytical corrections based on harmonic potential volume
+- **Boresch Restraints**: Full 6-dimensional correction including angular and dihedral contributions
+
+The `get_standard_state_correction` method in each restraint class handles these calculations [source](openfe/protocols/restraint_utils/openmm/omm_restraints.py#L153-L158).
+
+## Practical Implementation
+
+### Settings Configuration
+
+SepTop requires comprehensive settings configuration through `SepTopSettings` [source](openfe/protocols/openmm_septop/equil_septop_settings.py#L336-L445):
+
+```python
+settings = SepTopSettings(
+    protocol_repeats=3,
+    complex_restraint_settings=BoreschRestraintSettings(
+        host_selection="backbone",
+        rmsf_cutoff=0.1 * unit.nanometer
+    ),
+    solvent_restraint_settings=DistanceRestraintSettings(
+        spring_constant=4184.0 * unit.kilojoule_per_mole / unit.nm**2
+    )
+)
+```
+
+### Validation and Error Handling
+
+The system includes extensive validation:
+
+- Charge difference checking for alchemical compatibility
+- Lambda schedule monotonicity validation
+- Geometry constraint verification
+- Force field compatibility checks
+
+> [!TIP]
+> SepTop currently requires ligands to have identical net charges. Transformations involving charge changes are not supported due to the complexity of handling electrostatic discontinuities in the separated topology framework.
+
+## Advanced Features
+
+### Multi-State Sampling
+
+SepTop supports advanced sampling methods through integration with OpenMMTools:
+
+- **Hamiltonian Replica Exchange**: Multiple lambda states with exchange attempts
+- **Self-Adjusted Mixture Sampling**: Adaptive lambda state weighting
+- **Independent Window Sampling**: Parallel execution of lambda windows
+
+### Output and Analysis
+
+The `SepTopProtocolResult` class provides comprehensive analysis capabilities [source](openfe/protocols/openmm_septop/equil_septop_method.py#L365-L835):
+
+- Individual lambda window estimates with uncertainties
+- Overlap matrix analysis for sampling efficiency
+- Replica transition statistics
+- Restraint geometry validation data
+
+## Integration with OpenFE Ecosystem
+
+SepTop and restraint systems integrate seamlessly with the broader OpenFE framework:
+
+- **Network Planning**: Compatible with ligand network planning algorithms
+- **Storage Systems**: Results stored in standardized format for later analysis
+- **Visualization**: Restraint geometries can be visualized using built-in tools
+
+The restraint architecture provides a foundation for extending the system with new restraint types and sampling methods, making OpenFE a flexible platform for advanced free energy calculations.
+
+## Next Steps
+
+For practical implementation guidance, see the [SepTop Tutorial](14-septop-tutorial) which provides step-by-step examples of setting up and running SepTop calculations. For understanding how these methods fit into the broader calculation workflow, review the [Protocol System and Execution Framework](8-protocol-system-and-execution-framework).
+
+# Working with Individual Calculation Results
+
+
+
+This page focuses on accessing and analyzing results from individual free energy calculations in OpenFE. After executing your calculations, you'll need to understand how to retrieve, interpret, and visualize the data produced by different protocols.
+
+## Result Storage Architecture
+
+OpenFE uses a hierarchical storage system for calculation results, organized through several key classes that provide different levels of access to your data:
+
+```mermaid
+graph TD
+    A[ResultClient] --> B[TransformationResult]
+    B --> C[CloneResult]
+    C --> D[ExtensionResult]
+    D --> E[Data Files]
+    
+    F[JSONMetadataStore] --> A
+    G[ResultServer] --> A
+    
+    H[ProtocolDAGResult] --> I[ProtocolResult]
+    I --> J[get_estimate/get_uncertainty]
+```
+
+### Core Result Classes
+
+The result system is built around four main container classes [openfe/storage/resultclient.py](openfe/storage/resultclient.py#L22-L288):
+
+- **`ResultClient`**: The main entry point for accessing stored results, connecting to external storage via `JSONMetadataStore` and `ResultServer` [openfe/storage/resultclient.py](openfe/storage/resultclient.py#L93-L249)
+- **`TransformationResult`**: Represents results for a specific transformation, containing multiple clones [openfe/storage/resultclient.py](openfe/storage/resultclient.py#L252-L258)
+- **`CloneResult`**: Contains results from individual simulation clones/repeats [openfe/storage/resultclient.py](openfe/storage/resultclient.py#L261-L270)
+- **`ExtensionResult`**: Provides access to individual data files within a clone's results [openfe/storage/resultclient.py](openfe/storage/resultclient.py#L274-L288)
+
+## Accessing Results
+
+### From Command Line Execution
+
+When using the `quickrun` command, results are stored as JSON files alongside data directories. The JSON file contains essential summary information:
+
+```python
+import gufe
+import json
+
+with open('./Transformation-97d7223f918bbdb0570edc2a49bbc43e_results.json', 'r') as f:
+    results = json.load(f, cls=gufe.tokenization.JSON_HANDLER.decoder)
+
+results['estimate']      # Free energy estimate
+results['uncertainty']   # Statistical uncertainty
+```
+
+### From Python Execution
+
+When executing protocols programmatically, you work with `ProtocolDAGResult` objects that can be aggregated into `ProtocolResult` objects:
+
+```python
+# Execute a ProtocolDAG
+dag_result = openfe.execute_DAG(protocol_dag)
+
+# Gather multiple results
+protocol_result = protocol.gather([dag_result1, dag_result2, ...])
+
+# Get final estimates
+estimate = protocol_result.get_estimate()
+uncertainty = protocol_result.get_uncertainty()
+```
+
+> [!TIP]
+> The `ProtocolResult.gather()` method automatically handles averaging and concatenation of multiple iterations, providing statistically robust estimates through proper error propagation.
+
+## Data Access Patterns
+
+### Hierarchical Navigation
+
+Results are accessed through a path-like interface that mirrors the storage hierarchy:
+
+```python
+# Access transformation results
+transformation_result = result_client.load_transformation(transformation_key)
+
+# Navigate to clone results
+clone_result = transformation_result[clone_id]
+
+# Access specific data files
+trajectory_data = clone_result['trajectory.dcd']
+energies_data = clone_result['energies.npy']
+```
+
+### File Loading Methods
+
+The `_ResultContainer` base class provides flexible file access methods [openfe/storage/resultclient.py](openfe/storage/resultclient.py#L71-L79):
+
+- **`load_stream()`**: Returns a file-like object for streaming large files
+- **`load_bytes()`**: Loads entire file contents into memory as bytes
+
+```python
+# Stream large trajectory files
+with clone_result.load_stream('trajectory.dcd') as f:
+    trajectory_data = f.read()
+
+# Load small configuration files directly
+config_bytes = clone_result.load_bytes('settings.json')
+```
+
+## Analysis and Visualization
+
+### Multistate Analysis
+
+For protocols using multistate sampling (like RBFE calculations), OpenFE provides comprehensive analysis tools through the `MultistateEquilFEAnalysis` class [openfe/protocols/openmm_utils/multistate_analysis.py](openfe/protocols/openmm_utils/multistate_analysis.py#L62-L494):
+
+```python
+from openfe.protocols.openmm_utils import MultistateEquilFEAnalysis
+
+# Initialize analysis with reporter and sampling method
+analysis = MultistateEquilFEAnalysis(
+    reporter=reporter,
+    sampling_method="repex",  # or "sams"
+    result_units=unit.kilocalorie_per_mole
+)
+
+# Get equilibrated free energy estimates
+fe_estimate, fe_error = analysis.get_equil_free_energy()
+
+# Access convergence analysis
+forward_reverse = analysis.get_forward_and_reverse_analysis(num_samples=10)
+```
+
+### Key Analysis Properties
+
+The `MultistateEquilFEAnalysis` class provides rich analysis capabilities:
+
+| Property | Description |
+|----------|-------------|
+| `free_energy` | Final equilibrated free energy estimate |
+| `free_energy_error` | MBAR uncertainty estimate |
+| `equilibration_iterations` | Number of iterations discarded as equilibration |
+| `production_iterations` | Number of iterations used for analysis |
+| `replica_states` | Timeseries of states for each replica |
+| `free_energy_overlaps` | Overlap matrix and eigenvalues |
+| `replica_exchange_statistics` | Exchange acceptance rates |
+
+### Plotting Capabilities
+
+OpenFE includes specialized plotting functions for result visualization [openfe/analysis/plotting.py](openfe/analysis/plotting.py#L12-L361):
+
+```python
+from openfe.analysis.plotting import plot_convergence, plot_lambda_transition_matrix
+
+# Plot convergence analysis
+ax = plot_convergence(
+    forward_and_reverse=convergence_data,
+    units=unit.kilocalorie_per_mole
+)
+
+# Plot lambda transition matrix
+ax = plot_lambda_transition_matrix(transition_matrix)
+```
+
+> [!TIP]
+> All plotting functions return matplotlib Axes objects, allowing for further customization and integration into larger figure layouts.
+
+## Protocol-Specific Results
+
+Different protocols produce different types of results:
+
+| Protocol Type | Typical Outputs | Analysis Methods |
+|---------------|------------------|------------------|
+| **RelativeHybridTopologyProtocol** | Free energies, overlap matrices, convergence plots, trajectories | MultistateEquilFEAnalysis |
+| **AbsoluteHybridTopologyProtocol** | Binding free energies, restraint data, convergence analysis | Custom binding analysis |
+| **PlainMDProtocol** | Trajectories, energy timeseries, structural analysis | Standard MD analysis tools |
+
+## Result Validation
+
+### Quality Assessment
+
+When working with individual results, consider these validation steps:
+
+1. **Convergence Checking**: Examine forward/reverse convergence plots
+2. **Overlap Analysis**: Review state overlap matrices for sufficient sampling
+3. **Equilibration Detection**: Verify proper equilibration period identification
+4. **Statistical Uncertainty**: Ensure uncertainties are within acceptable ranges
+
+### Troubleshooting Common Issues
+
+| Issue | Symptoms | Solutions |
+|-------|----------|-----------|
+| **Poor Convergence** | Large uncertainties, divergent forward/reverse | Increase simulation time, check lambda scheduling |
+| **Low Overlap** | High overlap matrix eigenvalues | Add intermediate lambda states, adjust softcore parameters |
+| **Insufficient Equilibration** | Systematic bias in estimates | Increase equilibration time, use automatic detection |
+
+## Integration with Network Analysis
+
+Individual calculation results form the foundation for network-based analysis. After mastering individual result handling, you can proceed to [Network-Based Results Analysis](17-network-based-results-analysis) to understand how multiple calculations combine into comprehensive free energy networks.
+
+The hierarchical result storage system ensures that individual results remain accessible even when incorporated into larger network analyses, maintaining traceability and enabling detailed investigation of problematic transformations.
+
+## Best Practices
+
+1. **Systematic Organization**: Use consistent naming conventions for result directories
+2. **Metadata Preservation**: Store simulation parameters alongside results for reproducibility
+3. **Automated Validation**: Implement automated quality checks before accepting results
+4. **Backup Strategies**: Maintain backups of critical calculation results
+5. **Documentation**: Keep detailed records of analysis parameters and decisions
+
+By following these guidelines and leveraging OpenFE's comprehensive result access and analysis tools, you can effectively work with individual calculation results to extract reliable free energy estimates and identify potential issues in your simulations.
+
+# Network-Based Results Analysis
+
+
+
+Network-based results analysis in OpenFE provides powerful tools for visualizing, analyzing, and interpreting free energy calculations performed across molecular transformation networks. This approach enables researchers to examine the interconnected nature of alchemical calculations, identify patterns, and extract meaningful insights from complex datasets.
+
+## Core Analysis Infrastructure
+
+### Results Storage and Access
+
+OpenFE implements a hierarchical storage system through the `ResultClient` class [openfe/storage/resultclient.py](openfe/storage/resultclient.py#L50-L289), which manages access to calculation results with the following structure:
+
+```mermaid
+graph TD
+    A[ResultClient] --> B[TransformationResult]
+    B --> C[CloneResult]
+    C --> D[ExtensionResult]
+    D --> E[Result Files]
+    
+    F[External Store] --> A
+    G[Metadata Store] --> A
+```
+
+The storage system organizes results by:
+- **Transformations**: Individual alchemical calculations between molecular states
+- **Clones**: Multiple independent runs of the same transformation
+- **Extensions**: Different types of output files (trajectories, energies, etc.)
+
+### Network Visualization Framework
+
+The network visualization system is built on a flexible matplotlib-based architecture [openfe/utils/network_plotting.py](openfe/utils/network_plotting.py#L1-L426):
+
+```mermaid
+classDiagram
+    class GraphDrawing {
+        +graph: nx.Graph
+        +nodes: dict
+        +edges: dict
+        +event_handler: EventHandler
+        +draw()
+        +reset_bounds()
+    }
+    
+    class Node {
+        +artist: matplotlib.artist
+        +draggable: bool
+        +select(event, graph)
+        +update_location(x, y)
+    }
+    
+    class Edge {
+        +artist: matplotlib.artist
+        +pickable: bool
+        +select(event, graph)
+        +update_locations()
+    }
+    
+    class EventHandler {
+        +active: Union[Node, Edge]
+        +selected: Union[Node, Edge]
+        +on_mousedown(event)
+        +on_drag(event)
+        +on_mouseup(event)
+    }
+    
+    GraphDrawing --> Node
+    GraphDrawing --> Edge
+    GraphDrawing --> EventHandler
+    Node --|> matplotlib.artist
+    Edge --|> matplotlib.artist
+```
+
+## Specialized Analysis Tools
+
+### Convergence Analysis
+
+The `plot_convergence` function [openfe/analysis/plotting.py](openfe/analysis/plotting.py#L85-L200) provides visual analysis of calculation convergence by comparing forward and reverse free energy estimates:
+
+```python
+def plot_convergence(
+    forward_and_reverse: dict[str, Union[npt.NDArray, Quantity]], 
+    units: Quantity
+) -> Axes:
+```
+
+This function generates convergence plots showing:
+- Forward and reverse free energy estimates over increasing sample fractions
+- Error bars indicating statistical uncertainty
+- Final value confidence regions
+
+### Lambda Transition Matrix Visualization
+
+For multi-state calculations, the `plot_lambda_transition_matrix` function [openfe/analysis/plotting.py](openfe/analysis/plotting.py#L14-L83) visualizes state transition probabilities:
+
+```python
+def plot_lambda_transition_matrix(matrix: npt.NDArray) -> Axes:
+```
+
+The visualization displays:
+- Heat map of transition probabilities between lambda states
+- Color-coded intensity representing transition likelihood
+- Numerical annotations for specific probability values
+
+### Molecular Network Analysis
+
+OpenFE provides specialized tools for ligand network visualization through the `AtomMappingNetworkDrawing` class [openfe/utils/atommapping_network_plotting.py](openfe/utils/atommapping_network_plotting.py#L140-L172):
+
+```mermaid
+flowchart LR
+    A[LigandNetwork] --> B[AtomMappingNetworkDrawing]
+    B --> C[Interactive Visualization]
+    C --> D[Node Selection]
+    C --> E[Edge Selection]
+    D --> F[Molecule Display]
+    E --> G[Atom Mapping Display]
+```
+
+Key features include:
+- **Interactive node selection**: Click on ligand nodes to highlight connections
+- **Edge mapping visualization**: Select edges to display detailed atom mappings between molecules
+- **Dynamic layout**: Draggable nodes for custom network arrangement
+
+## Advanced Analysis Capabilities
+
+### Replica Exchange Analysis
+
+The `plot_replica_timeseries` function [openfe/analysis/plotting.py](openfe/analysis/plotting.py#L202-L230) tracks replica state evolution in replica exchange simulations:
+
+```python
+def plot_replica_timeseries(
+    state_timeseries: npt.NDArray,
+    equilibration_iterations: Optional[int] = None,
+) -> Axes:
+```
+
+This analysis reveals:
+- Replica state transitions over simulation time
+- Equilibration period identification
+- Exchange frequency patterns
+
+### Structural Analysis Tools
+
+OpenFE includes structural analysis capabilities for monitoring molecular behavior:
+
+#### 2D RMSD Analysis
+The `plot_2D_rmsd` function [openfe/analysis/plotting.py](openfe/analysis/plotting.py#L232-L275) generates multi-state RMSD heat maps:
+
+```python
+def plot_2D_rmsd(data: list[list[float]], vmax:5.0) -> plt.Figure:
+```
+
+#### Ligand Behavior Monitoring
+Additional tools track ligand dynamics:
+- `plot_ligand_COM_drift`: Center of mass movement over time
+- `plot_ligand_RMSD`: Ligand structural stability analysis
+
+## Integration with Workflow
+
+Network-based analysis integrates seamlessly with OpenFE's calculation workflow:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant RC as ResultClient
+    participant AN as Analysis Tools
+    participant V as Visualization
+    
+    U->>RC: Load calculation results
+    RC->>AN: Provide transformation data
+    AN->>AN: Perform convergence analysis
+    AN->>V: Generate network plots
+    V->>U: Display interactive visualizations
+    U->>V: Interact with network elements
+    V->>AN: Update based on selections
+```
+
+## Best Practices
+
+### Data Organization
+- Store results using the hierarchical `ResultClient` system
+- Maintain consistent naming conventions for transformations and clones
+- Utilize metadata storage for efficient result retrieval
+
+### Visualization Optimization
+- Use interactive network plots for exploring complex transformation networks
+- Leverage convergence analysis to identify calculation issues early
+- Combine multiple visualization types for comprehensive analysis
+
+### Performance Considerations
+- Cache frequently accessed results using the built-in caching mechanism
+- Use selective loading for large datasets to minimize memory usage
+- Consider batch processing for systematic network analyses
+
+Network-based results analysis in OpenFE provides a comprehensive framework for understanding the interconnected nature of free energy calculations, enabling researchers to extract maximum insight from their computational experiments.
+
+## Next Steps
+
+For deeper understanding of the mathematical foundations behind network analysis, explore [Maximum Likelihood Estimation for Free Energy Networks](18-maximum-likelihood-estimation-for-free-energy-networks). To learn about visualizing molecular structures in 3D, see [3D Molecular Visualization and Network Plotting](19-3d-molecular-visualization-and-network-plotting).
+
+# Maximum Likelihood Estimation for Free Energy Networks
+
+
+
+Maximum Likelihood Estimation (MLE) forms the statistical foundation for analyzing free energy calculations in OpenFE, particularly through the implementation of the Multistate Bennett Acceptance Ratio (MBAR) method. This approach provides optimal estimates of free energy differences by leveraging data from multiple thermodynamic states simultaneously.
+
+## MBAR Implementation in OpenFE
+
+OpenFE implements MLE through the `MultistateEquilFEAnalysis` class, which provides comprehensive analysis capabilities for multistate free energy calculations [openfe/protocols/openmm_utils/multistate_analysis.py](openfe/protocols/openmm_utils/multistate_analysis.py#L62-L495). The class integrates with OpenMMTools' multistate sampling infrastructure and utilizes the pyMBAR library for statistical analysis.
+
+### Core Statistical Framework
+
+The implementation follows the MBAR methodology as described in the foundational papers by Shirts and Chodera [openfe/protocols/openmm_utils/multistate_analysis.py](openfe/protocols/openmm_utils/multistate_analysis.py#L30-L35). The key components include:
+
+- **Energy Matrix Analysis**: The method processes reduced energy matrices `u_ln` where rows represent thermodynamic states and columns contain energy samples [openfe/protocols/openmm_utils/multistate_analysis.py](openfe/protocols/openmm_utils/multistate_analysis.py#L199-L205)
+- **Sample Counting**: Proper handling of sample counts `N_l` for each state ensures unbiased estimates
+- **Bootstrap Uncertainty**: Implementation supports both analytical and bootstrap-based uncertainty quantification
+
+```python
+def _get_free_energy(
+    analyzer: multistate.MultiStateSamplerAnalyzer,
+    u_ln: npt.NDArray,
+    N_l: npt.NDArray,
+    bootstraps: int = 1000,
+    return_units: Quantity = unit.kilocalorie_per_mole,
+) -> tuple[Quantity, Quantity]:
+```
+
+### Data Processing Pipeline
+
+The MLE analysis follows a systematic approach to ensure reliable results:
+
+```mermaid
+flowchart TD
+    A[Raw Simulation Data] --> B[Equilibration Detection]
+    B --> C[Decorrelation Analysis]
+    C --> D[Energy Matrix Construction]
+    D --> E[MBAR Optimization]
+    E --> F[Free Energy Estimation]
+    F --> G[Uncertainty Quantification]
+    G --> H[Convergence Validation]
+```
+
+## Advanced Analysis Features
+
+### Forward-Reverse Convergence Analysis
+
+OpenFE implements sophisticated convergence diagnostics through forward-reverse analysis [openfe/protocols/openmm_utils/multistate_analysis.py](openfe/protocols/openmm_utils/multistate_analysis.py#L284-L352). This method progressively analyzes subsets of the data from both temporal directions to assess convergence stability:
+
+- **Fractional Sampling**: Data is analyzed in increasing fractions (10% to 100%)
+- **Bidirectional Validation**: Forward and reverse analyses provide convergence confidence
+- **Error Propagation**: Analytical uncertainties are computed for each subset
+
+### Overlap Matrix Analysis
+
+The overlap matrix provides critical insights into state sampling efficiency [openfe/protocols/openmm_utils/multistate_analysis.py](openfe/protocols/openmm_utils/multistate_analysis.py#L373-L388):
+
+- **Matrix Computation**: `mbar.compute_overlap()` generates the probability overlap between states
+- **Eigenvalue Analysis**: Largest nontrivial eigenvalue indicates overall mixing quality
+- **Visual Diagnostics**: Overlap matrices can be visualized to identify problematic state transitions
+
+> [!TIP]
+> The overlap matrix scalar value (one minus the largest nontrivial eigenvalue) serves as a key diagnostic - values closer to 1.0 indicate better state overlap and more reliable free energy estimates.
+
+## Statistical Quality Assurance
+
+### Equilibration Detection
+
+Automatic equilibration detection follows the statistical methods described by Shirts and Chodera [openfe/protocols/openmm_utils/multistate_analysis.py](openfe/protocols/openmm_utils/multistate_analysis.py#L46-L50). The implementation:
+
+- Identifies and discards equilibration periods
+- Ensures only production data contributes to final estimates
+- Provides transparent reporting of discarded iterations
+
+### Decorrelation and Uncorrelated Sampling
+
+The analysis pipeline includes sophisticated decorrelation methods:
+
+- **Timeseries Analysis**: Statistical methods identify correlation lengths
+- **Thinning**: Data is thinned to ensure statistical independence
+- **Sample Validation**: Equal sample counts across states are verified
+
+> [!TIP]
+> Bootstrap analysis with 1000 iterations provides robust uncertainty estimates, though analytical errors are used for forward-reverse analysis due to convergence issues with limited data points.
+
+## Integration with Network Analysis
+
+### Multi-Protocol Support
+
+The MLE framework supports various sampling methods:
+
+| Sampling Method | Description | MLE Compatibility |
+|-----------------|-------------|-------------------|
+| `repex` | Replica Exchange | Full support with exchange matrix analysis |
+| `sams` | Self-Adjusted Mixture Sampling | Basic MLE support |
+| `independent` | Independent Simulations | Standard MLE application |
+
+### Visualization and Diagnostics
+
+OpenFE provides comprehensive visualization tools for MLE results [openfe/analysis/plotting.py](openfe/analysis/plotting.py#L12-L143):
+
+- **Transition Matrices**: Visual representation of state transition probabilities
+- **Convergence Plots**: Forward-reverse analysis visualization
+- **Overlap Heatmaps**: Matrix visualization of state overlaps
+
+```python
+def plot_lambda_transition_matrix(matrix: npt.NDArray) -> Axes:
+    """Plot out a transition matrix with validation warnings"""
+```
+
+## Best Practices for MLE Analysis
+
+### Data Quality Requirements
+
+For reliable MLE results, ensure:
+
+- **Sufficient Sampling**: Each state should have adequate decorrelated samples
+- **State Overlap**: Adjacent states should have reasonable overlap (evidenced by overlap matrix)
+- **Convergence**: Forward-reverse analysis should show consistent estimates
+
+### Error Interpretation
+
+Understanding uncertainty estimates is crucial:
+
+- **Bootstrap Errors**: Provide robust uncertainty quantification with 1000 bootstrap samples
+- **Analytical Errors**: Used when bootstrap computation is impractical
+- **Convergence Indicators**: Consistency between forward and reverse analyses validates results
+
+## Integration with OpenFE Workflow
+
+The MLE analysis integrates seamlessly with OpenFE's protocol system:
+
+1. **Protocol Execution**: Standard OpenFE protocols generate multistate data
+2. **Result Collection**: Data is stored using OpenFE's storage system
+3. **Analysis Application**: `MultistateEquilFEAnalysis` processes collected results
+4. **Reporting**: Comprehensive analysis results are generated with visualizations
+
+This integration ensures that MLE analysis is accessible within the standard OpenFE workflow while maintaining methodological rigor and statistical validity.
+
+For practical implementation details and examples, refer to the [Network-Based Results Analysis](17-network-based-results-analysis) page, which demonstrates how to apply these methods in real-world scenarios.
+
+# 3D Molecular Visualization and Network Plotting
+
+
+
+OpenFE provides comprehensive visualization capabilities for both 3D molecular structures and network-based free energy calculations. These tools enable researchers to inspect molecular transformations, analyze network topology, and gain insights into calculation workflows through interactive visual representations.
+
+## 3D Molecular Visualization
+
+The 3D visualization functionality in OpenFE leverages the `py3Dmol` library to create interactive molecular displays that help researchers understand molecular alignments and transformations.
+
+### Core Visualization Functions
+
+OpenFE provides two main 3D visualization functions, though both are deprecated in favor of class methods:
+
+1. **`view_components_3d()`** - Visualizes multiple molecular components in a single interactive view [openfe/utils/visualization_3D.py](openfe/utils/visualization_3D.py#L111-L158)
+2. **`view_mapping_3d()`** - Renders relative transformation edges with atom mapping annotations [openfe/utils/visualization_3D.py](openfe/utils/visualization_3D.py#L159-L210)
+
+> [!TIP]
+> Both functions are deprecated. Use `LigandAtomMapping.view_3d()` class method instead for current implementations.
+
+### Visualization Features
+
+The 3D visualization system supports:
+
+- **Interactive molecular displays** using py3Dmol with customizable styles (stick, sphere, line, cartoon)
+- **Automatic molecular positioning** with intelligent shift calculations to prevent overlap [openfe/utils/visualization_3D.py](openfe/utils/visualization_3D.py#L22-L31)
+- **Atom mapping annotations** with colored spheres highlighting corresponding atoms between molecules [openfe/utils/visualization_3D.py](openfe/utils/visualization_3D.py#L72-L110)
+- **Flexible view management** allowing existing views to be passed and extended
+
+### Installation Requirements
+
+3D visualization requires the optional py3Dmol dependency:
+```bash
+pip install py3Dmol
+```
+
+## Network Plotting Architecture
+
+OpenFE's network plotting system provides a sophisticated framework for visualizing molecular transformation networks with interactive capabilities. The architecture is built on matplotlib and NetworkX, offering extensible components for custom visualization needs.
+
+### Core Architecture Components
+
+The network plotting system consists of three main architectural layers:
+
+```mermaid
+graph TB
+    A[NetworkX Graph] --> B[GraphDrawing Class]
+    B --> C[Node Objects]
+    B --> D[Edge Objects]
+    B --> E[EventHandler]
+    C --> F[Matplotlib Artists]
+    D --> F
+    E --> G[Interactive Events]
+    F --> H[Visual Output]
+```
+
+#### GraphDrawing Framework
+
+The `GraphDrawing` class serves as the central orchestrator [openfe/utils/network_plotting.py](openfe/utils/network_plotting.py#L326-L426):
+
+- **Node Management**: Creates and manages node positions using graphviz layout algorithms
+- **Edge Registration**: Handles edge creation and visual representation
+- **Event Handling**: Integrates interactive mouse events for node dragging and edge selection
+- **Canvas Management**: Controls matplotlib figure creation and rendering
+
+#### Interactive Node System
+
+Nodes in the network are represented by the `Node` class [openfe/utils/network_plotting.py](openfe/utils/network_plotting.py#L25-L137), providing:
+
+- **Draggable functionality** with real-time position updates
+- **Visual state management** for selection and highlighting
+- **Event handling** for mouse interactions (mousedown, drag, mouseup)
+- **Extensible artist system** allowing custom visual representations
+
+#### Edge Visualization
+
+The `Edge` class manages molecular transformation visualizations [openfe/utils/network_plotting.py](openfe/utils/network_plotting.py#L138-L217):
+
+- **Dynamic line drawing** connecting network nodes
+- **Interactive selection** with visual feedback
+- **Data association** linking edges to molecular transformations
+- **Position synchronization** maintaining connections during node movement
+
+### Atom Mapping Network Specialization
+
+OpenFE provides specialized classes for ligand network visualization that extend the base framework:
+
+#### AtomMappingEdge Class
+
+The `AtomMappingEdge` class enhances edge visualization with molecular structure rendering [openfe/utils/atommapping_network_plotting.py](openfe/utils/atommapping_network_plotting.py#L16-L121):
+
+- **Molecular image generation** using RDKit drawing capabilities
+- **Automatic layout calculation** for left/right molecule positioning
+- **Interactive mapping display** showing atom correspondences on edge selection
+- **Transparent background rendering** for clean visualization integration
+
+> [!TIP]
+> The edge selection automatically displays detailed atom mappings with highlighted correspondences between ligand pairs.
+
+#### LigandNode Class
+
+Specialized node representation for ligands in the network [openfe/utils/atommapping_network_plotting.py](openfe/utils/atommapping_network_plotting.py#L122-L141):
+
+- **Compact visual design** optimized for network density
+- **Efficient extent calculation** for proper spacing
+- **Integration with edge visualization** for seamless interaction
+
+### Usage Patterns
+
+#### Basic Network Visualization
+
+The simplest way to visualize a ligand network:
+
+```python
+from openfe.utils import plot_atommapping_network
+
+# Create network visualization
+figure = plot_atommapping_network(ligand_network)
+```
+
+This convenience function creates an `AtomMappingNetworkDrawing` instance [openfe/utils/atommapping_network_plotting.py](openfe/utils/atommapping_network_plotting.py#L158-L172) with default styling and interaction capabilities.
+
+#### Advanced Customization
+
+For specialized visualization needs, the framework supports:
+
+- **Custom node classes** extending the base `Node` functionality
+- **Specialized edge rendering** for different data types
+- **Custom event handlers** for domain-specific interactions
+- **Layout algorithm selection** through NetworkX integration
+
+### Analysis Plotting Integration
+
+Beyond network visualization, OpenFE provides analysis plotting functions for free energy calculation results:
+
+#### Lambda Transition Matrices
+
+Visualize state transition probabilities in thermodynamic calculations [openfe/analysis/plotting.py](openfe/analysis/plotting.py#L12-L140):
+
+- **Heat map representation** of transition probabilities
+- **Automatic validation** checking matrix consistency
+- **Color-coded intensity** showing transition likelihoods
+- **Grid layout** with clear state boundaries
+
+#### Convergence and Time Series
+
+Monitor calculation progress and stability:
+
+- **Convergence plots** showing forward/reverse integration [openfe/analysis/plotting.py](openfe/analysis/plotting.py#L140-L238)
+- **Replica time series** for replica exchange simulations [openfe/analysis/plotting.py](openfe/analysis/plotting.py#L238-L278)
+- **RMSD analysis** for structural stability assessment [openfe/analysis/plotting.py](openfe/analysis/plotting.py#L278-L350)
+
+## Integration with Workflow
+
+The visualization tools integrate seamlessly with the broader OpenFE ecosystem:
+
+### Protocol Integration
+
+Visualization functions work with results from all protocol types:
+- **RBFE calculations** for ligand binding studies
+- **ABFE calculations** for absolute binding free energies
+- **Molecular dynamics** simulations for structural analysis
+
+### Storage and Metadata
+
+Visualizations can be combined with storage systems for:
+- **Result archiving** with visual documentation
+- **Metadata association** linking plots to calculation parameters
+- **Reproducible reporting** for publication-quality figures
+
+## Best Practices
+
+### Performance Considerations
+
+- **Large networks**: Consider layout simplification for networks with >50 nodes
+- **Molecular complexity**: Use simplified rendering for complex molecules in dense networks
+- **Interactive performance**: Disable automatic redrawing during extensive manipulations
+
+### Visual Design Guidelines
+
+- **Color consistency**: Maintain consistent color schemes across related visualizations
+- **Label clarity**: Ensure node labels remain readable at different zoom levels
+- **Edge density**: Manage edge visual weight in highly connected networks
+
+### Export and Sharing
+
+- **Publication quality**: Use vector formats (SVG, PDF) for high-resolution outputs
+- **Interactive notebooks**: Leverage Jupyter integration for exploratory analysis
+- **Web deployment**: Export HTML formats for interactive web sharing
+
+The visualization capabilities in OpenFE provide researchers with powerful tools for understanding molecular transformations, analyzing calculation networks, and communicating results effectively. The extensible architecture allows for customization while maintaining ease of use for common visualization tasks.
+
+For more detailed analysis of calculation results, see [Network-Based Results Analysis](17-network-based-results-analysis) and [Working with Individual Calculation Results](16-working-with-individual-calculation-results).
+
+# Custom Protocol Development
+
+
+
+This guide provides comprehensive information for developing custom protocols in OpenFE, enabling you to extend the framework's capabilities for specialized free energy calculations.
+
+## Protocol Architecture Overview
+
+OpenFE follows a modular protocol architecture built on the `gufe.Protocol` base class, with specialized implementations for different types of free energy calculations. The framework separates protocol definitions, settings management, and execution units to maximize code reusability and maintainability.
+
+```mermaid
+graph TB
+    A[gufe.Protocol] --> B[RelativeHybridTopologyProtocol]
+    A --> C[AbsoluteProtocol]
+    A --> D[SepTopProtocol]
+    A --> E[PlainMDProtocol]
+    
+    B --> F[RelativeHybridTopologyProtocolUnit]
+    C --> G[BaseAbsoluteUnit]
+    D --> H[BaseSepTopSetupUnit]
+    D --> I[BaseSepTopRunUnit]
+    
+    J[Settings Classes] --> K[ProtocolSettings]
+    J --> L[SimulationSettings]
+    J --> M[OutputSettings]
+    
+    B -.-> J
+    C -.-> J
+    D -.-> J
+    E -.-> J
+```
+
+## Core Protocol Components
+
+### Protocol Classes
+
+Protocol classes serve as the main entry points for defining free energy calculations. They inherit from `gufe.Protocol` and implement the following key methods:
+
+- **`_create()`**: Generates protocol units for execution
+- **`_gather()`**: Collects and processes results from protocol units
+- **`_default_settings()`**: Provides default configuration
+- **`_adaptive_settings()`**: Creates settings adapted to specific systems
+
+The `RelativeHybridTopologyProtocol` in [openmm_rfe/equil_rfe_methods.py](openfe/protocols/openmm_rfe/equil_rfe_methods.py#L496-L682) exemplifies this structure, implementing relative binding free energy calculations using hybrid topologies.
+
+### Protocol Units
+
+Protocol units (`gufe.ProtocolUnit`) represent individual computational tasks that can be executed independently. OpenFE provides several base classes:
+
+- **`BaseAbsoluteUnit`**: For absolute free energy calculations [openmm_afe/base.py](openfe/protocols/openmm_afe/base.py#L86-L1250)
+- **`RelativeHybridTopologyProtocolUnit`**: For relative transformations with hybrid topologies [openmm_rfe/equil_rfe_methods.py](openfe/protocols/openmm_rfe/equil_rfe_methods.py#L683-L1318)
+- **`BaseSepTopSetupUnit`** and **`BaseSepTopRunUnit`**: For separate topology calculations [openmm_septop/base.py](openfe/protocols/openmm_septop/base.py#L233-L706)
+
+### Settings Management
+
+Settings classes inherit from `SettingsBaseModel` and provide structured configuration management:
+
+| Settings Class | Purpose | Key Features |
+|---------------|---------|--------------|
+| `MultiStateSimulationSettings` | Multi-state simulation control | Sampling methods, replica configuration |
+| `OpenMMEngineSettings` | OpenMM-specific engine configuration | Platform selection, GPU indexing |
+| `IntegratorSettings` | MD integrator parameters | Timestep, collision rate, constraints |
+| `OutputSettings` | Output and reporting configuration | Checkpointing, trajectory writing |
+
+The comprehensive settings hierarchy is defined in [openmm_utils/omm_settings.py](openfe/protocols/openmm_utils/omm_settings.py#L42-L705).
+
+## Creating Custom Protocols
+
+### Step 1: Define Protocol Settings
+
+Create a settings class that inherits from the appropriate base settings:
+
+```python
+from openfe.protocols.openmm_utils import MultiStateSimulationSettings, SettingsBaseModel
+
+class CustomProtocolSettings(Settings):
+    """Settings for custom free energy protocol"""
+    
+    # Core simulation settings
+    simulation_settings: MultiStateSimulationSettings
+    engine_settings: OpenMMEngineSettings
+    output_settings: MultiStateOutputSettings
+    
+    # Protocol-specific parameters
+    custom_parameter: float = 1.0
+    enable_custom_feature: bool = True
+    
+    @field_validator("custom_parameter")
+    def validate_custom_parameter(cls, v):
+        if v <= 0:
+            raise ValueError("custom_parameter must be positive")
+        return v
+```
+
+### Step 2: Implement Protocol Unit
+
+Create a protocol unit that performs the actual calculation:
+
+```python
+class CustomProtocolUnit(gufe.ProtocolUnit):
+    """Protocol unit for custom free energy calculation"""
+    
+    def __init__(self, *, protocol, stateA, stateB, generation=0, repeat_id=0, name=None):
+        super().__init__(
+            protocol=protocol,
+            stateA=stateA,
+            stateB=stateB,
+            generation=generation,
+            repeat_id=repeat_id,
+            name=name
+        )
+    
+    def _execute(self, ctx, **kwargs):
+        """Execute the custom calculation"""
+        # Implement your custom algorithm here
+        # Access settings via self.protocol._settings
+        
+        results = {
+            'free_energy': self._calculate_free_energy(),
+            'uncertainty': self._estimate_uncertainty(),
+            'metadata': self._generate_metadata()
+        }
+        
+        return results
+    
+    def _calculate_free_energy(self):
+        """Implement your free energy calculation method"""
+        pass
+    
+    def _estimate_uncertainty(self):
+        """Implement uncertainty estimation"""
+        pass
+```
+
+### Step 3: Create Protocol Class
+
+Implement the main protocol class that coordinates the units:
+
+```python
+class CustomProtocol(gufe.Protocol):
+    """Custom free energy protocol"""
+    
+    result_cls = CustomProtocolResult
+    _settings_cls = CustomProtocolSettings
+    
+    @classmethod
+    def _default_settings(cls):
+        """Provide default settings"""
+        return CustomProtocolSettings(
+            simulation_settings=MultiStateSimulationSettings(),
+            engine_settings=OpenMMEngineSettings(),
+            output_settings=MultiStateOutputSettings()
+        )
+    
+    def _create(self, stateA, stateB, mapping=None, extends=None):
+        """Create protocol units for execution"""
+        units = []
+        
+        for repeat_id in range(self._settings.protocol_repeats):
+            unit = CustomProtocolUnit(
+                protocol=self,
+                stateA=stateA,
+                stateB=stateB,
+                repeat_id=repeat_id,
+                name=f"{self.name}_repeat_{repeat_id}"
+            )
+            units.append(unit)
+        
+        return units
+    
+    def _gather(self, protocol_dag_results):
+        """Gather and process results from all units"""
+        results = []
+        
+        for dag_result in protocol_dag_results:
+            for unit_result in dag_result:
+                results.append(unit_result)
+        
+        return self.result_cls(results=results)
+```
+
+## Lambda Protocol System
+
+For alchemical transformations, OpenFE provides a sophisticated lambda protocol system defined in [openmm_rfe/_rfe_utils/lambdaprotocol.py](openfe/protocols/openmm_rfe/_rfe_utils/lambdaprotocol.py#L14-L340):
+
+```python
+from openfe.protocols.openmm_rfe._rfe_utils.lambdaprotocol import LambdaProtocol
+
+# Create custom lambda schedule
+lambda_protocol = LambdaProtocol(
+    functions='custom',  # or 'default'
+    windows=20,
+    lambda_schedule=[0.0, 0.1, 0.2, ..., 1.0]
+)
+
+# Access lambda parameters
+state = RelativeAlchemicalState()
+state.set_alchemical_parameters(0.5, lambda_protocol)
+```
+
+The lambda protocol supports multiple switching functions and provides validation for alchemical transformations.
+
+## Validation and Testing
+
+OpenFE includes comprehensive validation utilities in [openmm_utils/settings_validation.py](openfe/protocols/openmm_utils/settings_validation.py#L17-L313):
+
+```python
+from openfe.protocols.openmm_utils.settings_validation import (
+    validate_openmm_solvation_settings,
+    validate_timestep,
+    get_simsteps,
+    divmod_time_and_check
+)
+
+# Validate settings
+validate_openmm_solvation_settings(your_settings)
+validate_timestep(hmass=4.0, timestep=2.0 * unit.femtosecond)
+
+# Calculate simulation parameters
+n_steps = get_simsteps(
+    sim_length=5.0 * unit.nanosecond,
+    timestep=2.0 * unit.femtosecond,
+    mc_steps=1000
+)
+```
+
+## Integration with OpenMM Ecosystem
+
+Custom protocols can leverage the full OpenMM ecosystem through OpenFE's utilities:
+
+- **System Generation**: Use `SystemGenerator` for consistent force field application
+- **Multi-state Sampling**: Access `MultiStateSampler` for replica exchange and SAMS
+- **Analysis Tools**: Integrate with MBAR and other analysis methods
+- **Restraint Systems**: Implement custom restraints using the geometry framework
+
+> [!TIP]
+> When developing custom protocols, always inherit from the appropriate base classes rather than implementing everything from scratch. This ensures compatibility with OpenFE's orchestration and storage systems while providing access to validated utilities and settings management.
+
+## Best Practices
+
+1. **Settings Validation**: Always implement proper field validators for custom settings
+2. **Error Handling**: Include comprehensive error handling and informative error messages
+3. **Documentation**: Provide detailed docstrings for all public methods and classes
+4. **Testing**: Create unit tests following the patterns in [openfe/tests/protocols/](openfe/tests/protocols/)
+5. **Reproducibility**: Ensure deterministic behavior through proper random seed handling
+
+> [!TIP]
+> Consider implementing adaptive settings that can automatically adjust parameters based on system properties, similar to the `_adaptive_settings` method in existing protocols. This can significantly improve robustness for diverse molecular systems.
+
+For further guidance on specific implementation details, examine the existing protocols in the [openfe/protocols/](openfe/protocols/) directory and their corresponding tests. The [Protocol System and Execution Framework](8-protocol-system-and-execution-framework) page provides additional architectural context for understanding how custom protocols integrate with the broader OpenFE ecosystem.
+
+# Partial Charge Generation Methods
+
+
+
+OpenFE provides a comprehensive system for generating partial charges on molecules, essential for accurate free energy calculations. The framework supports multiple charge generation methods and toolkit backends, allowing flexibility based on available software and computational requirements.
+
+## Overview of Charge Generation Architecture
+
+The partial charge generation system is built around a modular architecture that separates charge methods from toolkit backends, enabling users to choose the optimal combination for their specific needs. The system supports both single-molecule and bulk processing with parallelization capabilities.
+
+```mermaid
+flowchart TD
+    A[Input Molecules] --> B[Charge Method Selection]
+    B --> C{Method Type}
+    
+    C -->|AM1BCC| D[AM1BCC Charge Assignment]
+    C -->|AM1BCC-ELF10| E[AM1BCC-ELF10 Charge Assignment]
+    C -->|NAGL| F[NAGL Neural Network Charges]
+    C -->|Espaloma| G[Espaloma ML Charges]
+    
+    D --> H[Toolkit Backend]
+    E --> H
+    F --> H
+    G --> H
+    
+    H --> I{Backend Choice}
+    I -->|AmberTools| J[RDKit + AmberTools]
+    I -->|OpenEye| K[OpenEye Toolkits]
+    I -->|RDKit| L[RDKit Only]
+    
+    J --> M[Charged Molecules]
+    K --> M
+    L --> M
+```
+
+## Supported Charge Methods
+
+OpenFE supports four distinct partial charge generation methods, each with different computational characteristics and accuracy profiles:
+
+| Method | Description | Supported Backends | Max Conformers | Use Case |
+|--------|-------------|-------------------|----------------|----------|
+| **am1bcc** | Standard AM1-BCC charges with ELF population analysis | AmberTools, OpenEye | 1 | Traditional, well-tested method |
+| **am1bccelf10** | AM1-BCC with ELF10 population analysis (10 conformers) | OpenEye only | Unlimited | Higher accuracy for flexible molecules |
+| **nagl** | Neural network assisted graph learning charges | All backends | 1 | Fast, ML-based approach |
+| **espaloma** | Espaloma machine learning charges | RDKit, AmberTools | 1 | Alternative ML method |
+
+> [!TIP]
+> The **am1bccelf10** method requires OpenEye toolkits and can handle multiple conformers, making it particularly suitable for flexible molecules where conformational averaging improves charge accuracy. However, it's computationally more expensive than standard am1bcc.
+
+## Toolkit Backend Options
+
+The charge generation system supports three primary toolkit backends, each with different capabilities and dependencies:
+
+### AmberTools Backend
+- **Components**: RDKitToolkitWrapper + AmberToolsToolkitWrapper
+- **Methods Supported**: am1bcc, nagl, espaloma
+- **Advantages**: Open-source, widely available
+- **Limitations**: Cannot use am1bccelf10
+
+### OpenEye Backend
+- **Components**: OpenEyeToolkitWrapper only
+- **Methods Supported**: am1bcc, am1bccelf10, nagl
+- **Advantages**: Commercial-grade performance, supports all methods
+- **Limitations**: Requires OpenEye license
+
+### RDKit Backend
+- **Components**: RDKitToolkitWrapper only
+- **Methods Supported**: nagl, espaloma
+- **Advantages**: Lightweight, fast for ML methods
+- **Limitations**: Cannot perform quantum mechanical charge calculations
+
+## Command Line Interface
+
+The primary interface for charge generation is through the `charge-molecules` command:
+
+```bash
+openfe charge-molecules -M input_directory -o charged_molecules.sdf --yaml-settings config.yaml
+```
+
+### YAML Configuration Structure
+
+The charge generation process is controlled through a YAML configuration file with the following structure:
+
+```yaml
+partial_charge:
+  method: am1bcc  # or am1bccelf10, nagl, espaloma
+  settings:
+    off_toolkit_backend: ambertools  # or openeye, rdkit
+    number_of_conformers: 1  # for am1bccelf10 only
+    nagl_model: null  # auto-select latest production model
+```
+
+> [!TIP]
+> When using the **nagl** method without specifying a model, the system automatically selects the latest production AM1BCC model. For reproducible results, explicitly specify the model version in your configuration.
+
+## Implementation Details
+
+### Core Charge Assignment Function
+
+The main charge assignment logic is implemented in `assign_offmol_partial_charges()` [openfe/protocols/openmm_utils/charge_generation.py#L285-L292], which orchestrates the method-specific charge assignment functions:
+
+- **AM1BCC Methods**: `assign_offmol_am1bcc_charges()` [openfe/protocols/openmm_utils/charge_generation.py#L163-L167]
+- **NAGL Method**: `assign_offmol_nagl_charges()` [openfe/protocols/openmm_utils/charge_generation.py#L111-L115]
+- **Espaloma Method**: `assign_offmol_espaloma_charges()` [openfe/protocols/openmm_utils/charge_generation.py#L73-L74]
+
+### Bulk Processing with Parallelization
+
+For large molecule sets, the system provides `bulk_assign_partial_charges()` [openfe/protocols/openmm_utils/charge_generation.py#L434-L442] which supports multiprocessed charge generation:
+
+```python
+charged_molecules = bulk_assign_partial_charges(
+    molecules=small_molecules,
+    overwrite=True,
+    method="am1bcc",
+    toolkit_backend="ambertools",
+    generate_n_conformers=1,
+    nagl_model=None,
+    processors=4  # Parallel processing
+)
+```
+
+### Conformer Generation
+
+The system includes intelligent conformer generation through `_generate_offmol_conformers()` [openfe/protocols/openmm_utils/charge_generation.py#L206-L211], which is essential for QM-based charge methods that require 3D molecular structures.
+
+## Method-Specific Considerations
+
+### AM1BCC vs AM1BCC-ELF10
+
+The key difference lies in population analysis and conformer handling:
+- **AM1BCC**: Uses standard ELF population analysis with single conformer
+- **AM1BCC-ELF10**: Uses ELF10 analysis with multiple conformers (default 10), providing better conformational averaging
+
+### NAGL Neural Network Charges
+
+NAGL (Neural Network Assisted Graph Learning) represents a modern approach to charge generation:
+- **Speed**: Significantly faster than QM methods
+- **Accuracy**: Comparable to AM1BCC for many drug-like molecules
+- **Flexibility**: Works with any toolkit backend
+- **Model Management**: Automatic selection of latest production models
+
+### Espaloma Integration
+
+Espaloma provides an alternative machine learning approach:
+- **Integration**: Uses `espaloma_charge` package
+- **Warning**: Currently marked as experimental with runtime warnings [openfe/protocols/openmm_utils/charge_generation.py#L85]
+- **Compatibility**: Limited to RDKit and AmberTools backends
+
+## Error Handling and Validation
+
+The system includes comprehensive error handling for common scenarios:
+
+1. **Missing Dependencies**: Clear error messages when required packages are unavailable
+2. **Backend Compatibility**: Validation that selected methods work with chosen backends
+3. **Conformer Requirements**: Automatic conformer generation when needed
+4. **File I/O**: Robust handling of input/output file operations
+
+## Integration with OpenFE Workflows
+
+Partial charge generation integrates seamlessly with other OpenFE components:
+
+- **Ligand Networks**: Charged molecules are automatically used in network planning
+- **Protocol Setup**: Charges are preserved throughout protocol execution
+- **Result Storage**: Charged molecules are stored with complete metadata
+
+The charge generation system is designed to be a foundational step in any free energy calculation workflow, ensuring that subsequent simulations start with properly parameterized molecular systems.
+
+## Next Steps
+
+For practical implementation guidance, see the [CLI Overview and Common Commands](5-cli-overview-and-common-commands) for command-line usage patterns, or refer to [Custom Protocol Development](20-custom-protocol-development) for integrating charge generation into custom workflows.
+
+# High-Throughput Execution and Orchestration
+
+
+
+The OpenFE framework provides a robust orchestration system designed for high-throughput free energy calculations, enabling scalable execution of complex alchemical networks across distributed computing environments. This documentation explores the architectural components and execution patterns that facilitate efficient large-scale molecular simulations.
+
+## Orchestration Architecture Overview
+
+OpenFE's orchestration system follows a layered architecture that separates concerns between simulation execution, result management, and data persistence. The design enables both single-machine workflows and distributed computing scenarios while maintaining consistent interfaces and data handling patterns.
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        CLI[CLI Commands]
+        API[Python API]
+    end
+    
+    subgraph "Execution Layer"
+        QuickRun[QuickRun Executor]
+        DAG[DAG Execution Engine]
+        Protocol[Protocol Units]
+    end
+    
+    subgraph "Storage Layer"
+        ResultClient[Result Client]
+        ResultServer[Result Server]
+        MetadataStore[Metadata Store]
+    end
+    
+    subgraph "Data Layer"
+        ExternalStore[External Storage]
+        FileSystem[File System]
+        Database[(Database)]
+    end
+    
+    CLI --> QuickRun
+    API --> DAG
+    QuickRun --> DAG
+    DAG --> Protocol
+    Protocol --> ResultClient
+    ResultClient --> ResultServer
+    ResultServer --> MetadataStore
+    ResultServer --> ExternalStore
+    MetadataStore --> FileSystem
+    ExternalStore --> Database
+```
+
+## Core Storage and Result Management
+
+The storage subsystem provides the foundation for high-throughput execution by managing simulation results, metadata, and intermediate data efficiently. The architecture uses a hierarchical container system that enables scalable data organization and retrieval.
+
+### Result Container Hierarchy
+
+The storage system employs a nested container pattern that mirrors the logical structure of free energy calculations:
+
+- **ResultClient**: Top-level container for accessing stored calculation results and networks [openfe/storage/resultclient.py#L93-L98]  
+- **TransformationResult**: Container for individual transformation calculations [openfe/storage/resultclient.py#L252-L257]
+- **CloneResult**: Container for protocol unit clones (repeated simulations) [openfe/storage/resultclient.py#L261-L270]  
+- **ExtensionResult**: Container for individual output files and data [openfe/storage/resultclient.py#L274-L287]
+
+Each container implements the `_ResultContainer` abstract base class, providing consistent navigation and data access patterns throughout the hierarchy [openfe/storage/resultclient.py#L22-L90].
+
+### Metadata Management
+
+The system includes flexible metadata storage implementations:
+
+| Store Type | Characteristics | Use Case |
+|------------|----------------|----------|
+| **JSONMetadataStore** | Single JSON file storage, simple implementation | Small-scale projects, development |
+| **PerFileJSONMetadataStore** | Individual metadata files per result | Large-scale distributed computing |
+
+The metadata stores implement a mapping interface that abstracts storage details while maintaining efficient access to calculation metadata [openfe/storage/metadatastore.py#L14-L38].
+
+## High-Throughput Execution Patterns
+
+### QuickRun Executor
+
+The `quickrun` command provides the primary interface for executing individual transformations at scale. It handles the complete workflow from transformation loading through execution and result aggregation:
+
+```mermaid
+flowchart TD
+    Start([Start]) --> Load[Load Transformation JSON]
+    Load --> Plan[Plan Simulation DAG]
+    Plan --> Execute[Execute DAG with Retries]
+    Execute --> Gather[Gather Results]
+    Gather --> Analyze[Analyze Results]
+    Analyze --> Output[Save Results JSON]
+    Output --> End([End])
+    
+    Execute -->|Failure| Handle[Handle Failure]
+    Handle --> Output
+```
+
+The executor supports key high-throughput features:
+- **Retry Logic**: Automatic retry mechanism for failed protocol units (`n_retries=2`) [openfecli/commands/quickrun.py#L76-L82]
+- **Workspace Management**: Configurable working directories with automatic creation [openfecli/commands/quickrun.py#L58-L65]
+- **Result Aggregation**: Automatic collection and analysis of simulation results [openfecli/commands/quickrun.py#L83-L92]
+
+### Network Planning and Batch Execution
+
+For large-scale calculations, the `plan-rbfe-network` command enables batch generation of transformation definitions that can be executed in parallel:
+
+```python
+# Example: Plan a network for high-throughput execution
+openfe plan-rbfe-network \
+    --molecules ligands.sdf \
+    --protein protein.pdb \
+    --output-dir network_definitions \
+    --n-protocol-repeats 3 \
+    --n-cores 8
+```
+
+This creates individual JSON files for each transformation edge, which can then be distributed across computing resources using the quickrun executor [openfecli/commands/plan_rbfe_network.py#L120-L144].
+
+## Result Collection and Analysis
+
+### Gather Command for Network Analysis
+
+The `gather` command provides sophisticated result collection capabilities for high-throughput scenarios:
+
+| Report Type | Description | Output Format |
+|-------------|-------------|---------------|
+| **dg** | Maximum likelihood estimates of absolute ΔG values | Ligand, ΔG, uncertainty |
+| **ddg** | Relative free energy differences between ligand pairs | Ligand_i, Ligand_j, ΔΔG, uncertainty |
+| **raw** | Individual simulation results without aggregation | All raw simulation data |
+
+The gather command supports recursive directory traversal, making it ideal for collecting results from distributed execution environments [openfecli/commands/gather.py#L634-L693].
+
+### Advanced Features
+
+- **Partial Result Handling**: `--allow-partial` flag enables processing incomplete networks [openfecli/commands/gather.py#L626-L632]
+- **Flexible Output**: Support for both human-readable tables and TSV format for downstream processing
+- **Error Resilience**: Robust handling of failed simulations and missing data
+
+## Scalability and Performance Considerations
+
+### Memory Management
+
+The storage system employs lazy loading and streaming interfaces to handle large datasets efficiently:
+
+```python
+# Stream large result files without loading entirely into memory
+result_client.load_stream(location, allow_changed=False)
+
+# Access specific files within extensions without full container loading
+extension_result["output_file.dat"]
+```
+
+### Concurrent Execution
+
+The architecture supports concurrent execution through:
+- **Protocol Unit Independence**: Each unit can execute independently
+- **DAG Parallelization**: Directed acyclic graph execution enables natural parallelization
+- **Resource Management**: Configurable processor allocation for network planning
+
+### Data Deduplication
+
+The ResultClient includes built-in deduplication for gufe tokenizable objects, reducing storage overhead for repeated molecular structures and protocols [openfe/storage/resultclient.py#L131-L143].
+
+> [!TIP]
+> For optimal performance in high-throughput scenarios, consider using the PerFileJSONMetadataStore for large networks (>1000 transformations) to avoid memory bottlenecks associated with single-file metadata storage.
+
+> [!TIP]
+> When executing on HPC systems, combine the quickrun executor with job array scheduling. Each transformation JSON file becomes an independent job, enabling massive parallelization while maintaining centralized result collection through the gather command.
+
+## Integration with External Systems
+
+### Storage Abstraction
+
+The ResultServer provides a clean abstraction between metadata management and data storage, enabling integration with various storage backends:
+
+- **Local File Systems**: Default for single-machine workflows
+- **Network Storage**: NFS, Lustre, or other distributed file systems
+- **Cloud Storage**: S3, Google Cloud Storage, or Azure Blob Storage
+- **Object Databases**: MongoDB or other NoSQL solutions
+
+### Plugin Architecture
+
+The CLI system supports extensible command plugins, allowing custom orchestration workflows to be integrated seamlessly with the core framework [openfecli/cli.py#L16-L26].
+
+## Best Practices for High-Throughput Workflows
+
+1. **Network Design**: Plan networks with appropriate redundancy (3+ repeats) for statistical robustness
+2. **Resource Allocation**: Match protocol repeat counts to available computing resources
+3. **Result Management**: Use hierarchical directory structures to organize large result sets
+4. **Monitoring**: Leverage the logging system to track execution progress across distributed jobs
+5. **Error Handling**: Implement retry logic and partial result processing for robust workflows
+
+The orchestration system in OpenFE provides a comprehensive foundation for high-throughput free energy calculations, balancing flexibility with performance to enable research at molecular discovery scales.
+
+## Next Steps
+
+For comprehensive understanding of the complete workflow, explore:
+- [Protocol System and Execution Framework](8-protocol-system-and-execution-framework) for detailed execution patterns
+- [Network-Based Results Analysis](17-network-based-results-analysis) for advanced analysis techniques  
+- [Storage and Metadata Management](23-storage-and-metadata-management) for deeper storage architecture details
+
+# Storage and Metadata Management
+
+
+
+OpenFE provides a comprehensive storage and metadata management system designed to handle the complex data structures generated by free energy calculations. This system abstracts the underlying storage mechanisms while maintaining rich metadata for validation, deduplication, and efficient retrieval of computational results.
+
+## Architecture Overview
+
+The storage system follows a layered architecture that separates concerns between data storage, metadata management, and client access:
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        RC[ResultClient]
+        TR[TransformationResult]
+        CR[CloneResult]
+        ER[ExtensionResult]
+    end
+    
+    subgraph "Abstraction Layer"
+        RS[ResultServer]
+    end
+    
+    subgraph "Metadata Layer"
+        MS[MetadataStore]
+        JMS[JSONMetadataStore]
+        PFMS[PerFileJSONMetadataStore]
+    end
+    
+    subgraph "Storage Layer"
+        ES[External Store]
+    end
+    
+    RC --> RS
+    TR --> RC
+    CR --> TR
+    ER --> CR
+    RS --> MS
+    RS --> ES
+    MS --> JMS
+    MS --> PFMS
+    JMS --> ES
+    PFMS --> ES
+```
+
+## Core Components
+
+### ResultServer: The Central Abstraction
+
+The `ResultServer` class serves as the primary interface between client code and the underlying storage systems [resultserver.py#L11-L15]. It manages the coordination between metadata and data storage, providing a unified abstraction that hides the complexity of metadata management from users.
+
+Key responsibilities include:
+- **Metadata Validation**: Ensuring data integrity through metadata comparison [resultserver.py#L37-L51]
+- **Storage Operations**: Coordinating storage of both data and associated metadata [resultserver.py#L25-L30]
+- **Missing File Detection**: Identifying inconsistencies between metadata and actual storage [resultserver.py#L55-L57]
+
+> [!TIP]
+> The ResultServer implements a critical validation pattern that checks metadata consistency before data access, preventing silent corruption in long-running free energy calculations.
+
+### Metadata Management Strategies
+
+OpenFE provides two distinct metadata storage approaches, each optimized for different use cases:
+
+#### JSONMetadataStore: Centralized Metadata
+
+The `JSONMetadataStore` maintains all metadata in a single `metadata.json` file [metadatastore.py#L41-L44]. This approach is simple to implement but has scalability limitations for large datasets.
+
+**Characteristics:**
+- Single file metadata storage
+- Atomic updates through complete file rewriting
+- Simple dependency-free implementation
+- Suitable for small to medium-scale calculations
+
+#### PerFileJSONMetadataStore: Distributed Metadata
+
+The `PerFileJSONMetadataStore` stores metadata in individual JSON files within a `metadata/` directory [metadatastore.py#L70-L74]. This provides better scalability and concurrent access patterns.
+
+**Characteristics:**
+- Individual metadata files per data object
+- Granular access and modification
+- Better performance for large datasets
+- Supports concurrent operations
+
+### ResultClient: Hierarchical Data Access
+
+The `ResultClient` implements a hierarchical navigation system for accessing stored results [resultclient.py#L93-L100]. It uses a path-like interface to organize results by transformation, clone, and extension:
+
+```python
+# Access pattern example
+client = ResultClient(external_store)
+transformation_result = client[transformation_key]
+clone_result = transformation_result[clone_id]
+extension_file = clone_result[extension_id]["output_file.dat"]
+```
+
+The client supports:
+- **GufeTokenizable Deduplication**: Objects are stored using content-based keys to avoid duplication [resultclient.py#L131-L143]
+- **Hierarchical Navigation**: Natural path-like access to nested results [resultclient.py#L46-L48]
+- **Lazy Loading**: Data is loaded only when accessed to minimize memory usage
+
+## Data Organization Patterns
+
+### Storage Key Structure
+
+The system uses a structured key format for organizing stored objects [resultclient.py#L106-L125]:
+
+```
+{prefix}/{class_name}/{token}.json
+```
+
+Where:
+- `prefix`: Organizational category (e.g., "setup", "results")
+- `class_name`: Type of stored object
+- `token`: Unique content-based identifier
+
+### Result Hierarchy
+
+Results are organized in a three-level hierarchy:
+
+1. **Transformation Level**: Individual transformations between molecular states
+2. **Clone Level**: Multiple executions of the same transformation
+3. **Extension Level**: Specific output files and data products
+
+## Advanced Features
+
+### Content-Based Deduplication
+
+The system implements sophisticated deduplication for GufeTokenizable objects [resultclient.py#L131-L143]. Objects with identical content share storage, reducing disk usage and ensuring consistency:
+
+```python
+def _store_gufe_tokenizable(self, prefix, obj):
+    for o in get_all_gufe_objs(obj):
+        key = self._gufe_key_to_storage_key(prefix, o.key)
+        if key not in self.result_server:  # Only store if not present
+            data = json.dumps(o.to_keyed_dict(), cls=JSON_HANDLER.encoder, sort_keys=True)
+            self.result_server.store_bytes(key, data)
+```
+
+### Dependency Resolution
+
+Loading complex objects requires recursive dependency resolution to reconstruct object graphs [resultclient.py#L164-L200]. The system performs depth-first traversal to rebuild object hierarchies while maintaining object identity.
+
+### Validation and Integrity
+
+The storage system provides robust validation mechanisms:
+
+- **Metadata Consistency**: Automatic validation of metadata against stored data [resultserver.py#L37-L51]
+- **Change Detection**: Identification of modified or corrupted files
+- **Missing File Detection**: Identification of orphaned metadata entries [resultserver.py#L55-L57]
+
+> [!TIP]
+> The validation system uses metadata comparison rather than content hashing for efficiency, allowing fast integrity checks while maintaining detection of unauthorized modifications.
+
+## Implementation Considerations
+
+### Performance Optimizations
+
+- **Metadata Caching**: In-memory caching of metadata for rapid access [metadatastore.py#L16]
+- **Lazy Loading**: Data loaded only when explicitly requested
+- **Path Optimization**: Efficient string-based path construction and traversal
+
+### Extensibility
+
+The architecture supports extension through:
+- **Custom Metadata Stores**: Abstract base class enables alternative metadata backends [metadatastore.py#L14-L38]
+- **Pluggable Storage**: External store abstraction supports various storage systems
+- **Custom Result Containers**: Extensible hierarchy for specialized result types
+
+### Error Handling
+
+The system provides comprehensive error handling for:
+- **Missing Resources**: Clear error messages for unavailable data
+- **Corrupted Data**: Detection and reporting of metadata inconsistencies
+- **Storage Failures**: Graceful handling of underlying storage issues
+
+## Best Practices
+
+### Choosing Metadata Storage
+
+- **Small Projects**: Use `JSONMetadataStore` for simplicity
+- **Large-Scale Calculations**: Use `PerFileJSONMetadataStore` for better performance
+- **Concurrent Access**: Prefer distributed metadata for multi-process workflows
+
+### Data Organization
+
+- Use consistent naming conventions for transformations and clones
+- Organize results by calculation type and date
+- Implement cleanup strategies for old or failed calculations
+
+### Performance Optimization
+
+- Batch metadata operations when possible
+- Use lazy loading for large result sets
+- Consider memory requirements when loading complex networks
+
+## Integration Points
+
+The storage system integrates with other OpenFE components:
+
+- **Protocol System**: Stores transformation results and intermediate data
+- **Network Planning**: Persists alchemical networks and planning metadata
+- **Analysis Tools**: Provides data access for results analysis and visualization
+
+For detailed information on related components, see [Protocol System and Execution Framework](8-protocol-system-and-execution-framework) and [Network-Based Results Analysis](17-network-based-results-analysis).
+
+## Next Steps
+
+To effectively utilize the storage and metadata management system:
+
+1. **Choose Storage Strategy**: Select appropriate metadata store based on project scale
+2. **Implement Data Access Patterns**: Use hierarchical navigation for result access
+3. **Set Up Validation**: Configure appropriate validation levels for your workflow
+4. **Monitor Storage Usage**: Implement monitoring for storage growth and performance
+
+For practical examples, refer to the [Working with Individual Calculation Results](16-working-with-individual-calculation-results) documentation.

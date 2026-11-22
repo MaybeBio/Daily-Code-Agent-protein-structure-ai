@@ -1,0 +1,396 @@
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+from pandora.schemas.annotation import ContactAtomSet
+from pandora.schemas.common import RankKey
+from pandora.schemas.structure import AtomSiteRecord
+
+
+class ChainRecord(BaseModel):
+    """One polymer chain, reshaped from a canonical `Structure` for
+    dataset export.
+
+    Attributes:
+        entry_id: The structure's entry id.
+        chain_id: The chain's `label_asym_id`.
+        auth_chain_id: The chain's `auth_asym_id`, if different.
+        entity_id: The id of the entity this chain belongs to.
+        sequence: The chain's polymer sequence, if any.
+        residue_count: The number of distinct residues in the chain.
+        atom_count: The number of atoms in the chain.
+    """
+
+    entry_id: str
+    chain_id: str  # label_asym_id
+    auth_chain_id: str | None = None
+    entity_id: str
+    sequence: str | None = None
+    residue_count: int
+    atom_count: int
+
+
+class DatasetChainRecord(ChainRecord):
+    """One kept polymer chain as a dataset table row: its `ChainRecord`
+    joined with its completeness, its entry's quality, where its
+    structure was written, and whether it is a symmetry copy.
+
+    Attributes:
+        seqres_length: The chain entity's SEQRES length, if measured.
+        missing_n_term: Missing SEQRES positions before the first
+            present residue, if measured.
+        missing_c_term: Missing SEQRES positions after the last present
+            residue, if measured.
+        missing_middle: Missing SEQRES positions between them, if
+            measured.
+        experimental_method: The entry's experimental method, if known.
+        resolution: The entry's resolution in angstroms, if known.
+        structure_path: The file holding the chain's structure, if
+            written.
+        copy_of: The chain it is a symmetry copy of, or None.
+    """
+
+    seqres_length: int | None = None
+    missing_n_term: int | None = None
+    missing_c_term: int | None = None
+    missing_middle: int | None = None
+    experimental_method: str | None = None
+    resolution: float | None = None
+    structure_path: str | None = None
+    copy_of: str | None = None
+
+
+class ResidueRecord(BaseModel):
+    """One polymer residue and its atoms, reshaped from a canonical
+    `Structure` for dataset export.
+
+    Attributes:
+        entry_id: The structure's entry id.
+        chain_id: The residue's `label_asym_id`.
+        seq_id: The residue's `label_seq_id`, if polymeric.
+        auth_seq_id: The residue's `auth_seq_id`.
+        auth_chain_id: The residue's `auth_asym_id`, if known.
+        ins_code: The residue's insertion code, None for none.
+        comp_id: The residue's component id (e.g. "ALA").
+        atoms: Every atom belonging to this residue.
+    """
+
+    entry_id: str
+    chain_id: str  # label_asym_id
+    seq_id: int | None = None
+    auth_seq_id: str | None = None
+    auth_chain_id: str | None = None
+    ins_code: str | None = None
+    comp_id: str
+    atoms: list[AtomSiteRecord]
+    # Coordinates/B-factor live on each AtomSiteRecord — this record is a
+    # residue-scoped slice of Structure.atoms, not a re-derived summary.
+
+
+class InterfaceRecord(BaseModel):
+    """One polymer chain pair in contact, built from a
+    `residue_contacts` layer by `extract_interface_records()`.
+
+    Attributes:
+        entry_id: The structure's entry id.
+        chain_id_1: The first chain in the interface.
+        chain_id_2: The second chain in the interface.
+        distance_cutoff: The contact distance cutoff used, in
+            angstroms; None if unknown (e.g. an imported layer).
+        atom_set: Which atoms counted towards contacts ("all",
+            "heavy", "backbone" or "ca"); None if unknown. Records
+            written before this field existed load as "all", which is
+            what they used.
+        interface_residues_chain_1: Contacting residue ids on
+            `chain_id_1`'s side.
+        interface_residues_chain_2: Contacting residue ids on
+            `chain_id_2`'s side.
+        contact_count: The total number of contacting residues on
+            both sides.
+        residue_pairs: Contacting `(chain_id_1 residue, chain_id_2
+            residue)` id pairs, sorted.
+    """
+
+    entry_id: str
+    chain_id_1: str
+    chain_id_2: str
+    distance_cutoff: float | None = None
+    atom_set: ContactAtomSet | None = "all"
+    interface_residues_chain_1: list[str]
+    interface_residues_chain_2: list[str]
+    contact_count: int
+    residue_pairs: list[tuple[str, str]] = Field(default_factory=list)
+    # Built from residue_contacts rows (Pandora's own or imported) —
+    # this record never computes contacts itself.
+
+
+MissingResidueDefinition = Literal["unobserved", "incomplete_backbone"]
+
+
+class ChainCompleteness(BaseModel):
+    """How much of one polymer chain's SEQRES has coordinates.
+
+    Attributes:
+        entry_id: The structure's entry id.
+        chain_id: The chain's `label_asym_id`.
+        seqres_length: The number of positions in the chain entity's
+            `_entity_poly_seq`.
+        missing_n_term: Missing positions before the first present
+            residue.
+        missing_c_term: Missing positions after the last present
+            residue.
+        missing_middle: Missing positions between the first and last
+            present residue.
+    """
+
+    entry_id: str
+    chain_id: str
+    seqres_length: int
+    missing_n_term: int
+    missing_c_term: int
+    missing_middle: int
+
+
+# Curation ---------------------------------
+
+
+ExclusionReason = Literal[
+    "RESOLUTION_THRESHOLD",
+    "NULL_RESOLUTION",
+    "CHAIN_TOO_SHORT",
+    "TOO_FEW_CHAINS",
+    "METHOD_EXCLUDED",
+    "ORGANISM_EXCLUDED",
+    "MISSING_TAXONOMY",
+    "DUPLICATE",
+    "RFREE_THRESHOLD",
+    "RFREE_GAP_THRESHOLD",
+    "RSYM_THRESHOLD",
+    "NULL_RFACTOR",
+    "NONSTANDARD_RESIDUE",
+    "TOO_MANY_ATOMS",
+    "MISSING_TAILS",
+    "MISSING_MIDDLE",
+    "CHAIN_TOO_LONG",
+    "NO_SEQRES",
+    "NO_CHAINS_LEFT",
+    "POLYMER_TYPE_EXCLUDED",
+]
+
+
+class ExclusionRecord(BaseModel):
+    """Record of why one structure, or one chain of it, was excluded
+    during curation or deduplication.
+
+    Attributes:
+        entry_id: The excluded structure's entry id.
+        chain_id: The excluded chain's `label_asym_id`, or None when
+            the whole entry was excluded.
+        reason_code: A machine-readable reason the structure was
+            excluded.
+        message: A human-readable description of the exclusion.
+    """
+
+    entry_id: str
+    chain_id: str | None = None
+    reason_code: ExclusionReason
+    message: str
+
+
+class QualityRules(BaseModel):
+    """Curation policy for resolution, R-factors, experimental method,
+    residue content, size, and chain counts.
+
+    Attributes:
+        max_resolution: The maximum resolution (in angstroms) allowed;
+            structures coarser than this are excluded.
+        null_resolution_behavior: Whether a structure with no
+            resolution is excluded or included when `max_resolution`
+            is set.
+        min_chain_length: The minimum residue count a structure's
+            longest chain must reach, checked after chain rules remove
+            chains.
+        min_polymer_chains: The minimum number of polymer chains
+            (asym units) a structure must have, checked after chain
+            rules remove chains.
+        include_experimental_methods: If non-empty, only these
+            experimental methods are allowed.
+        exclude_experimental_methods: Experimental methods that are
+            always excluded.
+        max_resolution_by_method: Resolution limits per experimental
+            method, overriding `max_resolution` for entries with that
+            method. With several matching methods, the strictest wins.
+        rfactor_methods: The methods the R-factor rules apply to.
+        max_r_free: The maximum Rfree.
+        max_r_free_gap: The maximum |Rfree - Rwork|.
+        max_r_sym: The maximum Rsym, or Rmerge when Rsym is missing.
+        null_rfactor_behavior: Whether an entry missing a value an
+            active R-factor rule needs is excluded or included.
+        exclude_nonstandard_residues: Whether an entry with any
+            non-standard polymer residue is excluded.
+        allowed_nonstandard_residues: Non-standard residues that don't
+            trigger `exclude_nonstandard_residues`.
+        max_atoms: The maximum number of atoms an entry may have.
+        missing_residue_definition: What counts as a missing residue
+            for the missing-fraction rules (see `chain_completeness`).
+        max_missing_tail_fraction: Chains whose missing N- plus
+            C-terminal residues exceed this fraction of SEQRES are
+            removed.
+        max_missing_middle_fraction: Chains whose missing middle
+            residues exceed this fraction of SEQRES minus the missing
+            tails are removed.
+        max_chain_length: Chains with more observed residues than this
+            are removed.
+    """
+
+    max_resolution: float | None = None
+    null_resolution_behavior: Literal["exclude", "include"] = "exclude"
+    min_chain_length: int | None = None
+    min_polymer_chains: int | None = None
+    include_experimental_methods: list[str] = Field(default_factory=list)
+    exclude_experimental_methods: list[str] = Field(default_factory=list)
+    max_resolution_by_method: dict[str, float] = Field(default_factory=dict)
+    rfactor_methods: list[str] = Field(
+        default_factory=lambda: ["X-RAY DIFFRACTION"]
+    )
+    max_r_free: float | None = None
+    max_r_free_gap: float | None = None
+    max_r_sym: float | None = None
+    null_rfactor_behavior: Literal["exclude", "include"] = "include"
+    exclude_nonstandard_residues: bool = False
+    allowed_nonstandard_residues: list[str] = Field(default_factory=list)
+    max_atoms: int | None = None
+    missing_residue_definition: MissingResidueDefinition = "incomplete_backbone"
+    max_missing_tail_fraction: float | None = None
+    max_missing_middle_fraction: float | None = None
+    max_chain_length: int | None = None
+
+
+class OrganismRules(BaseModel):
+    """Curation policy for including/excluding structures by source
+    organism taxon.
+
+    Attributes:
+        include_taxa: If non-empty, only these NCBI taxon ids are
+            allowed.
+        exclude_taxa: NCBI taxon ids that are always excluded.
+    """
+
+    include_taxa: list[str] = Field(default_factory=list)
+    exclude_taxa: list[str] = Field(default_factory=list)
+
+
+class ContentRules(BaseModel):
+    """Curation policy for which ligand/water/ion and polymer content is
+    kept.
+
+    Attributes:
+        keep_ligands: Whether non-polymer ligands are kept in curated
+            structures.
+        keep_waters: Whether water molecules are kept in curated
+            structures.
+        keep_ions: Whether ions are kept in curated structures.
+        keep_polymer_types: If set, only polymer chains whose entity
+            polymer type (e.g. "polypeptide(L)") is listed are kept;
+            other polymer chains are removed. None keeps every type.
+    """
+
+    keep_ligands: bool = True
+    keep_waters: bool = True
+    keep_ions: bool = True
+    keep_polymer_types: list[str] | None = None
+
+
+class DeduplicationRules(BaseModel):
+    """Policy for removing duplicate and contained structures.
+
+    Attributes:
+        enabled: Whether structures sharing the same `entry_id` are
+            removed. `pandora dedup --contained` ignores it.
+        contained_rank: Which entry to keep among entries with equal
+            chain counts per cluster (`find_contained`), best first; the
+            lowest entry id breaks the last tie.
+    """
+
+    enabled: bool = False
+    contained_rank: list[RankKey] = Field(
+        default_factory=lambda: [RankKey(key="resolution", order="min")]
+    )
+
+
+class ContainmentRecord(BaseModel):
+    """One entry removed because another entry contains it.
+
+    Attributes:
+        entry_id: The removed entry.
+        contained_in: A kept entry that contains it (the lowest id).
+        equal: True when both have the same chain counts per cluster
+            and the other entry ranked better.
+    """
+
+    entry_id: str
+    contained_in: str
+    equal: bool
+
+
+class DatasetCurationPolicy(BaseModel):
+    """The full, named policy governing dataset curation: quality,
+    organism, and content rules.
+
+    Attributes:
+        policy_id: A unique identifier for this policy.
+        policy_name: A human-readable name for this policy.
+        policy_version: The policy's version string.
+        description: A free-text description of the policy.
+        quality_rules: The resolution/method/chain-length rules.
+        organism_rules: The organism taxon inclusion/exclusion rules.
+        content_rules: The ligand/water/ion content rules.
+    """
+
+    policy_id: str
+    policy_name: str
+    policy_version: str
+    description: str = ""
+    quality_rules: QualityRules = Field(default_factory=QualityRules)
+    organism_rules: OrganismRules = Field(default_factory=OrganismRules)
+    content_rules: ContentRules = Field(default_factory=ContentRules)
+
+
+class CurationProvenance(BaseModel):
+    """Record of which curation policy ran on one structure, and when.
+
+    Attributes:
+        curated_at: When this curation run completed, as an ISO 8601
+            timestamp.
+        policy_id: The id of the policy that ran.
+        policy_name: The name of the policy that ran.
+        policy_version: The version of the policy that ran.
+        dropped_raw_categories: The verbatim mmCIF categories removed
+            from `Structure.raw` because they refer to chains or
+            residues by id and curation removed some chains or ligands.
+    """
+
+    curated_at: str
+    policy_id: str
+    policy_name: str
+    policy_version: str
+    dropped_raw_categories: list[str] = Field(default_factory=list)
+
+
+class DeduplicationProvenance(BaseModel):
+    """Record of one deduplication run: whether it was enabled and how
+    many duplicates it found.
+
+    Attributes:
+        deduplicated_at: When this deduplication run completed, as an
+            ISO 8601 timestamp.
+        enabled: Whether deduplication was actually applied.
+        duplicates_found: How many structures were removed as
+            duplicates.
+    """
+
+    deduplicated_at: str
+    enabled: bool
+    duplicates_found: int = 0

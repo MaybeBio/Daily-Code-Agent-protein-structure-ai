@@ -1,0 +1,106 @@
+name: build_cpu
+
+on:
+  push:
+    paths:
+      - .github/workflows/build_cpu.yml
+  workflow_dispatch: {}
+
+env:
+  gmxversion: "2026.4"
+  gmxcompileto: C:/FOSS/gromacs_264
+  dependhome: C:/FOSS/Dependencies
+  dependpath: C:/FOSS/Dependencies/vcpkg_installed/x64-windows
+
+jobs:
+  build:
+    runs-on: windows-2025
+    if: github.event.repository.owner.id == github.event.sender.id
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install FFTW, hwloc, OpenBLAS
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ${{ env.dependhome }}
+          Set-Location ${{ env.dependhome }}
+          vcpkg new --application
+          vcpkg add port fftw3[avx2,threads]
+          vcpkg add port hwloc
+          vcpkg add port openblas[threads]
+          vcpkg install --overlay-ports=${{ github.workspace }}\vcpkg_overlay
+          Get-ChildItem "${{ env.dependpath }}\bin"
+
+      - name: Download Gromacs
+        shell: bash
+        env:
+          gmxdownloadlink: https://ftp.gromacs.org/gromacs/gromacs-2026.4.tar.gz
+          gmxmd5hash: "fbe7d5071dee17e3f448502b1fd30d55"
+        run: |
+          curl --retry 10 -Lfo gromacs_src.tar.gz ${{ env.gmxdownloadlink }}
+          echo "${{ env.gmxmd5hash }}  gromacs_src.tar.gz" | md5sum -c
+          tar xf gromacs_src.tar.gz
+          cd gromacs-${{ env.gmxversion }}
+          patch -p1 < ../0001-fix-MSVC-error-C3615.patch
+
+      - name: Compile GROMACS double precision
+        shell: cmd
+        run: |
+          cd gromacs-${{ env.gmxversion }}
+          mkdir build
+          cd build
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat" x64 -vcvars_ver=14.44
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_INSTALL_PREFIX=${{ env.gmxcompileto }}" "-DCMAKE_PREFIX_PATH=${{ env.dependpath }}"  "-DGMX_DOUBLE=ON" "-DGMX_SIMD=AVX2_256" "-DGMX_HWLOC=ON" ..
+          cmake --build .
+          cmake --install .
+          cd ..
+          cd ..
+          rd /S /Q gromacs-${{ env.gmxversion }}
+
+      - name: Unzip GROMACS again
+        shell: bash
+        run: |
+          tar xf gromacs_src.tar.gz
+          cd gromacs-${{ env.gmxversion }}
+          patch -p1 < ../0001-fix-MSVC-error-C3615.patch
+
+      - name: Compile GROMACS single precision
+        shell: cmd
+        run: |
+          cd gromacs-${{ env.gmxversion }}
+          mkdir build
+          cd build
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat" x64 -vcvars_ver=14.44
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_INSTALL_PREFIX=${{ env.gmxcompileto }}" "-DCMAKE_PREFIX_PATH=${{ env.dependpath }}" "-DGMX_SIMD=AVX2_256" "-DGMX_HWLOC=ON" ..
+          cmake --build .
+          cmake --install .
+          cd ..
+          cd ..
+          rd /S /Q gromacs-${{ env.gmxversion }}
+
+      - name: Checksum
+        shell: bash
+        run: |
+          echo "BUILDDATE=$(date '+%b%d')" >> $GITHUB_ENV
+          cd `cygpath "${{ env.gmxcompileto }}"/bin`
+          sha256sum gmx.exe | tee gmx.exe.sha256
+          sha256sum gmx_d.exe | tee gmx_d.exe.sha256
+
+      - name: Copy DLLs, extra force fields and Test
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse -Path "extra_force_fields\charmm36*.ff" "${{ env.gmxcompileto }}\share\gromacs\top\"
+          Copy-Item -Force -Path "${{ env.dependpath }}\bin\*.dll" -Destination "${{ env.gmxcompileto }}\bin\"
+          Set-Location ${{ env.gmxcompileto }}\bin
+          Remove-Item -Force -Path fftw3l.dll
+          .\gmx.exe -version
+          .\gmx_d.exe -version
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        if: ${{ success() }}
+        with:
+          name: GROMACS-${{ env.gmxversion }}_${{ env.BUILDDATE }}_CPU_Windows-AMD64-AVX2_msvc
+          path: ${{ env.gmxcompileto }}

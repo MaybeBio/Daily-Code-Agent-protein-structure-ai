@@ -1,0 +1,26 @@
+set(LLVM_TARGET_DEFINITIONS MDExecOps.td)
+mlir_tablegen(MDExecOps.h.inc -gen-op-decls)
+mlir_tablegen(MDExecOps.cpp.inc -gen-op-defs)
+mlir_tablegen(MDExecDialect.h.inc -gen-dialect-decls -dialect=md_exec)
+mlir_tablegen(MDExecDialect.cpp.inc -gen-dialect-defs -dialect=md_exec)
+add_mlir_dialect_tablegen_target(MDIRMDExecIncGen)
+
+set(LLVM_TARGET_DEFINITIONS MDExecEnums.td)
+mlir_tablegen(MDExecEnums.h.inc -gen-enum-decls)
+mlir_tablegen(MDExecEnums.cpp.inc -gen-enum-defs)
+add_public_tablegen_target(MDIRMDExecEnumsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS MDExecAttrs.td)
+mlir_tablegen(MDExecAttrs.h.inc -gen-attrdef-decls -attrdefs-dialect=md_exec)
+mlir_tablegen(MDExecAttrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=md_exec)
+add_public_tablegen_target(MDIRMDExecAttrsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS LoopEffects.td)
+mlir_tablegen(LoopEffects.h.inc -gen-op-interface-decls)
+mlir_tablegen(LoopEffects.cpp.inc -gen-op-interface-defs)
+add_public_tablegen_target(MDIRMDExecLoopEffectsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS PairKernelBody.td)
+mlir_tablegen(PairKernelBody.h.inc -gen-op-interface-decls)
+mlir_tablegen(PairKernelBody.cpp.inc -gen-op-interface-defs)
+add_public_tablegen_target(MDIRMDExecPairKernelBodyIncGen)

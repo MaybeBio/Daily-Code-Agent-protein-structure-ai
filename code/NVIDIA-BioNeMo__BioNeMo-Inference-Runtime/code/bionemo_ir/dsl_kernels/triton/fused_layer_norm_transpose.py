@@ -1,0 +1,789 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Inference-only fused LayerNorm/RMSNorm with layout transposes.
+
+Normalizes the last dimension only; ``nn.LayerNorm``'s multi-axis
+``normalized_shape`` is not supported.
+
+Derived from cuEquivariance's fused LayerNorm kernels, with three changes:
+
+1. Pick 64-bit indexing from the tiled channel extent
+   ``ceil(D / TILE_D) * TILE_D``, not logical ``D``. Upstream can choose i32
+   for ``D=196`` while the kernel spans a 256-wide tile and overflow on long
+   pair sequences.
+2. ``pad_multiple`` zero-extends the output channels so a consumer GEMM can
+   take a vector-aligned K. The tile already covers that width, so the extra
+   store is free.
+3. Fit the whole row in one tile when possible so mean and variance come
+   from one load. Wider rows tile with ``E[x^2] - E[x]^2``; neither path
+   walks ``x`` a third time.
+"""
+
+from __future__ import annotations
+
+import enum
+import functools
+from typing import NamedTuple
+
+import torch
+import triton
+import triton.language as tl
+
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+class TokenPad(NamedTuple):
+    """Padded token geometry for a ``[B, I, J, D]`` output.
+
+    The store walks the padded axes and gathers from the packed input, so the
+    result is the unpadded output placed inside a ``[B, i_pad, j_pad, D]``
+    buffer with the surplus rows and columns written as zeros.
+    """
+
+    i_true: int
+    j_true: int
+    i_pad: int
+    j_pad: int
+
+    @property
+    def tokens_in(self) -> int:
+        """Flattened token count the input carries."""
+        return self.i_true * self.j_true
+
+    @property
+    def tokens_out(self) -> int:
+        """Flattened token count the output spans."""
+        return self.i_pad * self.j_pad
+
+
+class Layout(enum.IntEnum):
+    BND_BND = 0
+    BDN_BND = 1
+    BND_BDN = 2
+    DBN_BND = 3
+    BND_DBN = 4
+    BIJD_BJID = 5
+
+
+@triton.jit
+def _affine(x_hat, w, b):
+    """Fuse ``x_hat * w + b`` into one FMA.
+
+    A plain multiply-add is contracted for some constexpr ``D_OUT`` widths
+    and not others, so padded and unpadded stores can round the ``[0, D)``
+    head differently. Keep ``D_OUT`` specialized so the store stays
+    vectorized.
+    """
+    return tl.math.fma(x_hat, w, b)
+
+
+@triton.jit
+def layer_norm_transpose_forward_kernel(
+    # inputs
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    # outputs
+    out_ptr,
+    B,
+    N,
+    # Token grid ``[I, J]`` of layout 5, which stores row ``i * J + j`` at ``j * I + i``.
+    PAIR_I,
+    PAIR_J,
+    D: tl.constexpr,
+    D_OUT: tl.constexpr,
+    EPS: tl.constexpr,
+    TILE_N: tl.constexpr,
+    TILE_D: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    RMS_NORM: tl.constexpr,
+    LAYOUT: tl.constexpr,
+    SINGLE_TILE: tl.constexpr,
+    NEEDS_INT64: tl.constexpr = True,
+    # Token padding: ``N`` counts the padded grid, ``N_IN`` the packed input.
+    N_IN: tl.constexpr = 0,
+    I_TRUE: tl.constexpr = 0,
+    J_TRUE: tl.constexpr = 0,
+    J_PAD: tl.constexpr = 0,
+    TOKEN_PAD: tl.constexpr = False,
+):
+    # ``D_OUT >= D`` widens the output row stride so the result is a
+    # zero-extended operand for kernels that need a K aligned to a vector
+    # width.  Statistics are still taken over the true ``D`` channels; the
+    # ``[D, D_OUT)`` tail is written as explicit zeros.
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    if NEEDS_INT64:
+        pid_n = tl.cast(pid_n, tl.int64)
+        pid_b = tl.cast(pid_b, tl.int64)
+        N = tl.cast(N, tl.int64)
+        B = tl.cast(B, tl.int64)
+
+    offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
+    offs_d = tl.arange(0, TILE_D)
+    mask_n = offs_n < N
+
+    # ``keep_n`` gates the loads and the normalisation, ``mask_n`` the store.
+    # They differ only under token padding, where the grid walks the padded
+    # token axis and the gap rows store zeros without reading anything.
+    if TOKEN_PAD:
+        i_idx = offs_n // J_PAD
+        j_idx = offs_n % J_PAD
+        keep_n = mask_n & (i_idx < I_TRUE) & (j_idx < J_TRUE)
+        in_n = i_idx * J_TRUE + j_idx
+        n_in = N_IN
+    else:
+        keep_n = mask_n
+        in_n = offs_n
+        n_in = N
+
+    # Layouts 1 and 3 stride the channel axis, so a channel tile advances by a
+    # row of N; the others hold D contiguous.
+    if LAYOUT == 1:  # bdn->bnd
+        x_ptrs = x_ptr + pid_b * D * N + offs_d[None, :] * N + offs_n[:, None]
+        x_step = TILE_D * N
+    elif LAYOUT == 3:  # dbn->bnd
+        x_ptrs = x_ptr + offs_d[None, :] * B * N + pid_b * N + offs_n[:, None]
+        x_step = TILE_D * B * N
+    else:  # bnd->bnd, bnd->bdn, bnd->dbn, bijd->bjid
+        x_ptrs = x_ptr + pid_b * n_in * D + in_n[:, None] * D + offs_d[None, :]
+        x_step = TILE_D
+
+    # Layouts 0/1/3/5 write D contiguously, so ``D_OUT`` is their row stride.
+    # Layouts 2/4 keep D as an outer axis (the launcher pins ``D_OUT == D``
+    # for them, since widening D there would not align anything).
+    if LAYOUT == 2:  # bnd->bdn
+        out_ptrs = out_ptr + pid_b * N * D + offs_d[None, :] * N + offs_n[:, None]
+        out_step = TILE_D * N
+    elif LAYOUT == 4:  # bnd->dbn
+        out_ptrs = out_ptr + offs_d[None, :] * B * N + pid_b * N + offs_n[:, None]
+        out_step = TILE_D * B * N
+    elif LAYOUT == 5:  # bijd->bjid
+        out_n = (offs_n % PAIR_J) * PAIR_I + offs_n // PAIR_J
+        out_ptrs = out_ptr + pid_b * N * D_OUT + out_n[:, None] * D_OUT + offs_d[None, :]
+        out_step = TILE_D
+    else:
+        out_ptrs = out_ptr + pid_b * N * D_OUT + offs_n[:, None] * D_OUT + offs_d[None, :]
+        out_step = TILE_D
+
+    if SINGLE_TILE:
+        # The tile spans the row, so one load serves both moments and the
+        # store. This is the whole reason the kernel is fast: the traffic is
+        # one read and one write, which is the floor for a normalisation.
+        mask_d = offs_d < D
+        x = tl.load(x_ptrs, mask=keep_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+        if RMS_NORM:
+            x_centred = x
+        else:
+            mean = tl.sum(x, axis=1) / D
+            # Lanes past D loaded zero and would carry ``-mean`` into the variance.
+            # Clearing them once leaves a centred row the store reuses as-is.
+            x_centred = tl.where(mask_d[None, :], x - mean[:, None], 0.0)
+        rstd = tl.rsqrt(tl.sum(x_centred * x_centred, axis=1) / D + EPS)
+        x_hat = x_centred * rstd[:, None]
+        if HAS_WEIGHT and HAS_BIAS:
+            w = tl.load(w_ptr + offs_d, mask=mask_d, other=1.0).to(tl.float32)
+            b = tl.load(b_ptr + offs_d, mask=mask_d, other=0.0).to(tl.float32)
+            y = _affine(x_hat, w[None, :], b[None, :])
+        elif HAS_WEIGHT:
+            w = tl.load(w_ptr + offs_d, mask=mask_d, other=1.0).to(tl.float32)
+            y = x_hat * w[None, :]
+        elif HAS_BIAS:
+            b = tl.load(b_ptr + offs_d, mask=mask_d, other=0.0).to(tl.float32)
+            y = x_hat + b[None, :]
+        else:
+            y = x_hat
+        # Affine defaults can reach out-of-range lanes; clear them so the
+        # store can widen over the pad tail. With ``D_OUT == D`` this is a no-op.
+        if TOKEN_PAD:
+            # A gap row loaded zeros, so its affine output is the bias, not zero.
+            y = tl.where(keep_n[:, None] & mask_d[None, :], y, 0.0)
+        else:
+            y = tl.where(mask_d[None, :], y, 0.0)
+        tl.store(out_ptrs, y, mask=mask_n[:, None] & (offs_d < D_OUT))
+    else:
+        num_tiles_d = tl.cdiv(D, TILE_D)
+        acc = tl.zeros([TILE_N, TILE_D], dtype=tl.float32)
+        acc_sq = tl.zeros([TILE_N, TILE_D], dtype=tl.float32)
+        for di in range(num_tiles_d):
+            mask_d = offs_d < (D - di * TILE_D)
+            x = tl.load(x_ptrs, mask=keep_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+            if not RMS_NORM:
+                acc += x
+            acc_sq += x * x
+            x_ptrs += x_step
+
+        if RMS_NORM:
+            mean = tl.zeros([TILE_N], dtype=tl.float32)
+            var = tl.sum(acc_sq, axis=1) / D
+        else:
+            mean = tl.sum(acc, axis=1) / D
+            # ``E[x^2] - E[x]^2`` fuses what would otherwise be two loops over x.
+            # Accumulation is fp32 over normalised activations, so the cancellation
+            # this form is known for stays well inside the output dtype; the clamp
+            # only guards against a negative rounding.
+            var = tl.maximum(tl.sum(acc_sq, axis=1) / D - mean * mean, 0.0)
+        rstd = tl.rsqrt(var + EPS)
+        x_ptrs -= x_step * num_tiles_d
+
+        if HAS_WEIGHT:
+            w_ptrs = w_ptr + offs_d
+        if HAS_BIAS:
+            b_ptrs = b_ptr + offs_d
+
+        for di in range(num_tiles_d):
+            mask_d = offs_d < (D - di * TILE_D)
+            x = tl.load(x_ptrs, mask=keep_n[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+            x_hat = (x - mean[:, None]) * rstd[:, None]
+            if HAS_WEIGHT and HAS_BIAS:
+                w = tl.load(w_ptrs, mask=mask_d, other=1.0).to(tl.float32)
+                b = tl.load(b_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+                y = _affine(x_hat, w[None, :], b[None, :])
+            elif HAS_WEIGHT:
+                w = tl.load(w_ptrs, mask=mask_d, other=1.0).to(tl.float32)
+                y = x_hat * w[None, :]
+            elif HAS_BIAS:
+                b = tl.load(b_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+                y = x_hat + b[None, :]
+            else:
+                y = x_hat
+            if HAS_WEIGHT:
+                w_ptrs += TILE_D
+            if HAS_BIAS:
+                b_ptrs += TILE_D
+            if TOKEN_PAD:
+                y = tl.where(keep_n[:, None] & mask_d[None, :], y, 0.0)
+            else:
+                y = tl.where(mask_d[None, :], y, 0.0)
+            tl.store(out_ptrs, y, mask=mask_n[:, None] & (offs_d < (D_OUT - di * TILE_D)))
+            x_ptrs += x_step
+            out_ptrs += out_step
+
+
+_TILE_D = 64
+
+
+def _padded_channels(D: int, pad_multiple: int) -> int:
+    """Round ``D`` up to ``pad_multiple``, or return ``D`` when disabled.
+
+    ``pad_multiple`` must divide the channel tile so the widened row still
+    fits inside the tiles the kernel already walks; otherwise the pad tail
+    would fall outside the store loop.
+    """
+    if pad_multiple <= 0:
+        return D
+    if _TILE_D % pad_multiple != 0:
+        raise ValueError(f"pad_multiple must divide the {_TILE_D}-channel tile, got {pad_multiple}")
+    return triton.cdiv(D, pad_multiple) * pad_multiple
+
+
+def _allocate_output(
+    x: torch.Tensor,
+    layout: Layout,
+    pad_multiple: int = -1,
+    out_dtype: torch.dtype | None = None,
+    token_pad: TokenPad | None = None,
+) -> tuple[torch.Tensor, int, int, int, int]:
+    out_dtype = x.dtype if out_dtype is None else out_dtype
+    if layout in (Layout.BND_BND, Layout.BIJD_BJID):
+        B, N, D = x.shape
+        D_OUT = _padded_channels(D, pad_multiple)
+        if token_pad is not None:
+            N = token_pad.tokens_out
+        out = torch.empty((B, N, D_OUT), dtype=out_dtype, device=x.device)
+    elif layout == Layout.BDN_BND:
+        B, D, N = x.shape
+        D_OUT = _padded_channels(D, pad_multiple)
+        out = torch.empty((B, N, D_OUT), dtype=out_dtype, device=x.device)
+    elif layout == Layout.BND_BDN:
+        B, N, D = x.shape
+        D_OUT = D
+        out = torch.empty((B, D, N), dtype=out_dtype, device=x.device)
+    elif layout == Layout.DBN_BND:
+        D, B, N = x.shape
+        D_OUT = _padded_channels(D, pad_multiple)
+        out = torch.empty((B, N, D_OUT), dtype=out_dtype, device=x.device)
+    elif layout == Layout.BND_DBN:
+        B, N, D = x.shape
+        D_OUT = D
+        out = torch.empty((D, B, N), dtype=out_dtype, device=x.device)
+    else:
+        raise ValueError(f"unsupported layout {layout}")
+
+    return out, B, N, D, D_OUT
+
+
+def _needs_int64(B: int, N: int, D: int, tile_d: int = 64) -> bool:
+    """Select i64 using the largest tiled channel offset."""
+    tiled_D = triton.cdiv(D, tile_d) * tile_d
+    return B * N * tiled_D >= 2**31 - 1
+
+
+#: fp32 values a single-tile program may hold. 16384 is 64 KB of accumulator,
+#: which fits without spilling at every warp count this launcher picks.
+_SINGLE_TILE_MAX_ELEMS = 16384
+#: Rows per program floor. Below 4 the tile stops amortising the row-wise
+#: reduction and the store loses its 2D shape.
+_MIN_TILE_N = 4
+_TARGET_FP32_PER_THREAD = 32
+#: fp32 values per thread when the load strides the channel axis. Those rows
+#: reduce across lanes rather than inside a thread, so the tile is sized to
+#: hold one warp (``32 * 128 == 4096`` values) and the deep per-thread slice is
+#: what keeps loads in flight instead of extra warps.
+_STRIDED_FP32_PER_THREAD = 128
+#: Rows per program floor for those layouts: a bf16 thread reads 8 contiguous
+#: rows, so a shorter tile leaves part of the load vector unused.
+_STRIDED_MIN_TILE_N = 8
+#: Working set, as a multiple of L2, below which the warp-sized tile is taken.
+#: One warp's worth of rows is narrower than a 128-byte line once ``D`` reaches
+#: 256, so the strided load fetches part of a sector; neighbouring programs
+#: cover the rest, which L2 absorbs but a DRAM stream does not. Past this the
+#: fetch is the bottleneck and hides the reduction anyway, so the wider tile
+#: that has been shipping stays. Measured on an H100: below it the warp tile is
+#: 1.2-1.9x, above it up to 5% slower at ``D=256``.
+_STRIDED_WARP_TILE_L2_MULTIPLE = 2
+
+
+class _LaunchTuning(NamedTuple):
+    """Single-tile launch constants for one SM version.
+
+    Fitted by a sweep that times every ``(tile_n, num_warps)`` through :func:`layer_norm_transpose`.
+    Warps are sized from fp32 values per thread, the quantity whose optimum held across D, batch
+    and N.
+    """
+
+    #: Elements per program when D is contiguous; the row tile is this over the channel tile.
+    tile_elems: int
+    #: fp32 values per thread when D is contiguous.
+    fp32_per_thread: int
+    #: Row-tile cap when the load strides D.
+    strided_tile_n: int
+    #: fp32 values per thread when the load strides D.
+    strided_fp32_per_thread: int
+    #: ``(tile_n, num_warps)`` when the load strides D over a token count that is not a
+    #: multiple of 16: Triton cannot prove the rows aligned, so the loads go scalar and need
+    #: more warps in flight.
+    strided_unaligned: tuple[int, int]
+
+
+#: Tuned SM versions; any other keeps :func:`_default_launch_params`. Constants are per SM,
+#: so one entry serves every SM count of that version.
+_LAUNCH_TUNING: dict[int, _LaunchTuning] = {
+    # A100 (108 SMs), D 64-768, B 1-32, N 256-1536: every pick within 1.13x of the swept best. Over the
+    # default: the TriMul output norm 1.085x (up to 1.25x), 1.07x on unaligned tokens; contiguous D even
+    # overall. Contiguous picks stay on one warp up to D=256 and on one tile above it, so the
+    # token-padded norm matches the unpadded one bit for bit.
+    80: _LaunchTuning(
+        tile_elems=512,
+        fp32_per_thread=32,
+        strided_tile_n=64,
+        strided_fp32_per_thread=128,
+        strided_unaligned=(32, 4),
+    ),
+    # L40S (142 SMs), D 64-384, B 1-32, N 256-1536. Over the default: the TriMul output norm 1.2x
+    # where the pick moves (small batches; up to 1.5x at D=256), 1.04x on unaligned tokens;
+    # contiguous D even overall. Contiguous picks stay on one warp up to D=256, so the token-padded
+    # norm matches the unpadded one bit for bit; the default's two-warp D=64 tile does not. Picks
+    # within 1.21x of the swept best: the strided optimum wants 16 warps or tiles past
+    # _SINGLE_TILE_MAX_ELEMS, which these constants cannot reach.
+    89: _LaunchTuning(
+        tile_elems=1024,
+        fp32_per_thread=32,
+        strided_tile_n=64,
+        strided_fp32_per_thread=8,
+        strided_unaligned=(8, 8),
+    ),
+    # H200 (132 SMs), D 128-1024, B 1-32, N 64-1536: every pick within 1.1x of the swept best.
+    # Over the default: contiguous D=384 1.12-1.2x, the TriMul output norm 1.2x at D=256 and
+    # 1.5x at D=128.
+    90: _LaunchTuning(
+        tile_elems=1024,
+        fp32_per_thread=128,
+        strided_tile_n=64,
+        strided_fp32_per_thread=128,
+        strided_unaligned=(32, 4),
+    ),
+}
+
+
+def _strides_channel_axis(layout: Layout) -> bool:
+    """True when the load walks D with a stride, so N must carry coalescing."""
+    return layout in (Layout.BDN_BND, Layout.DBN_BND)
+
+
+def _prev_power_of_2(n: int) -> int:
+    """Largest power of two not exceeding ``n``, at least 1.
+
+    Every tile extent reaches ``tl.arange``, which rejects anything else, and
+    the grid-filling bound below is an arbitrary quotient.
+    """
+    return 1 << (n.bit_length() - 1) if n > 0 else 1
+
+
+@functools.cache
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+@functools.cache
+def _l2_bytes(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).L2_cache_size
+
+
+@functools.cache
+def _sm_version(device_index: int) -> int:
+    major, minor = torch.cuda.get_device_capability(device_index)
+    return major * 10 + minor
+
+
+@functools.cache
+def _launch_params(
+    D: int,
+    D_OUT: int,
+    B: int,
+    N: int,
+    layout: Layout,
+    sm_version: int,
+    sm_count: int,
+    cache_resident: bool = False,
+) -> tuple[int, int, int, bool]:
+    """Pick ``(tile_d, tile_n, num_warps, single_tile)`` for an SM version and SM count.
+
+    A channel tile that spans the row lets the kernel take both moments from one load, so it
+    wins whenever the register footprint fits. The row tile and warp count then come from the
+    SM version's :class:`_LaunchTuning`, and the SM count bounds the row tile so the grid still
+    fills the machine. SM versions without a tuning use :func:`_default_launch_params`.
+    """
+    tile_d = triton.next_power_of_2(max(D, D_OUT))
+    if tile_d * _MIN_TILE_N > _SINGLE_TILE_MAX_ELEMS:
+        return _TILE_D, 64, 8, False
+    if sm_version == 100 and layout == Layout.BND_BND and D == D_OUT == 384 and B * N >= 8192:
+        # Narrower CTAs expose more independent rows in the large contiguous
+        # normalization used by the pair transition. Keep the full row in registers.
+        return tile_d, 8, 2, True
+    tuning = _LAUNCH_TUNING.get(sm_version)
+    if tuning is None:
+        return _default_launch_params(tile_d, B * N, layout, sm_count, cache_resident)
+
+    fill = _prev_power_of_2(B * N // sm_count)
+    budget = _SINGLE_TILE_MAX_ELEMS // tile_d
+    if not _strides_channel_axis(layout):
+        tile_n = max(_MIN_TILE_N, min(64, tuning.tile_elems // tile_d, fill))
+        per_thread = tuning.fp32_per_thread
+    elif N % 16:
+        tile_n, num_warps = tuning.strided_unaligned
+        return tile_d, min(tile_n, budget), num_warps, True
+    else:
+        tile_n = min(max(_STRIDED_MIN_TILE_N, min(tuning.strided_tile_n, fill)), budget)
+        per_thread = tuning.strided_fp32_per_thread
+    return tile_d, tile_n, min(8, max(1, tile_n * tile_d // (32 * per_thread))), True
+
+
+def _default_launch_params(
+    tile_d: int,
+    rows: int,
+    layout: Layout,
+    sm_count: int,
+    cache_resident: bool,
+) -> tuple[int, int, int, bool]:
+    """Single-tile ``(tile_d, tile_n, num_warps, single_tile)`` for SM versions without a tuning.
+
+    The row tile depends on where D sits in memory, because that decides what
+    the row reduction costs.
+
+    When D is contiguous, a thread's own load vector already covers part of the
+    row, so the reduction is mostly a sequential add and the warp count only
+    has to fill the machine: ~32 fp32 per thread was flat to within 1.5% of the
+    swept optimum at all four production shapes.
+
+    When the load strides D -- the triangle-multiplication output norm, which
+    reads ``[D, B, I, J]`` -- nothing of the row lands inside a thread. The
+    reduction is then pure data movement between lanes, and its cost is set by
+    how many *warps* a row spans: within one warp it is a shuffle butterfly,
+    across warps it becomes a shared-memory round trip with two barriers, paid
+    twice because the variance waits on the mean. Sizing the tile to one warp
+    removes both barriers, which is 1.2-1.9x on the ``dbij->bijd`` shapes the
+    TriMul stacks request; the deep per-thread slice replaces the memory-level
+    parallelism the extra warps used to supply. That only pays while the pair
+    tensor is cache-resident, hence ``cache_resident`` -- see
+    :data:`_STRIDED_WARP_TILE_L2_MULTIPLE`.
+    """
+    if cache_resident and _strides_channel_axis(layout):
+        warp_tile = 32 * _STRIDED_FP32_PER_THREAD
+        tile_n = max(_STRIDED_MIN_TILE_N, min(64, warp_tile // tile_d))
+        tile_n = max(_STRIDED_MIN_TILE_N, min(tile_n, _prev_power_of_2(rows // sm_count)))
+        # A row wider than one warp's slice has to span several; keep them at
+        # the same per-thread depth rather than shrinking the tile further.
+        return tile_d, tile_n, max(1, tile_n * tile_d // warp_tile), True
+
+    budget = _SINGLE_TILE_MAX_ELEMS if _strides_channel_axis(layout) else _SINGLE_TILE_MAX_ELEMS // 2
+    tile_n = min(64, max(1, budget // tile_d))
+    tile_n = max(_MIN_TILE_N, min(tile_n, _prev_power_of_2(rows // sm_count)))
+    num_warps = tile_n * tile_d // (32 * _TARGET_FP32_PER_THREAD)
+    num_warps = min(8, max(2, triton.next_power_of_2(max(1, num_warps))))
+    return tile_d, tile_n, num_warps, True
+
+
+def _launch_layer_norm_transpose(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    eps: float,
+    elementwise_affine: bool,
+    rms_norm: bool,
+    layout: Layout,
+    pad_multiple: int = -1,
+    out_dtype: torch.dtype | None = None,
+    token_pad: TokenPad | None = None,
+    pair_ij: tuple[int, int] = (0, 0),
+) -> torch.Tensor:
+    if not x.is_cuda:
+        raise ValueError("fused LayerNorm/RMSNorm requires a CUDA input")
+    if x.dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"unsupported input dtype {x.dtype}; expected fp16, bf16, or fp32")
+    if out_dtype is not None and out_dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"unsupported output dtype {out_dtype}; expected fp16, bf16, or fp32")
+    if pad_multiple > 0 and layout in (Layout.BND_BDN, Layout.BND_DBN):
+        raise ValueError(
+            f"pad_multiple needs an output that is contiguous in D; layout {layout!r} keeps D as an outer axis"
+        )
+    if token_pad is not None and layout != Layout.BND_BND:
+        raise ValueError(f"token padding needs a [B, N, D] output; layout {layout!r} does not have one")
+    out, B, N, D, D_OUT = _allocate_output(x, layout, pad_multiple, out_dtype, token_pad)
+    has_weight = elementwise_affine and weight is not None
+    has_bias = elementwise_affine and bias is not None
+    if rms_norm and has_bias:
+        raise ValueError("RMSNorm does not support an additive bias")
+    for name, parameter, enabled in (("weight", weight, has_weight), ("bias", bias, has_bias)):
+        if not enabled or parameter is None:
+            continue
+        if parameter.shape != (D,):
+            raise ValueError(f"{name} must have shape ({D},), got {tuple(parameter.shape)}")
+        if parameter.device != x.device:
+            raise ValueError(f"{name} must be on {x.device}, got {parameter.device}")
+        if parameter.dtype not in _SUPPORTED_DTYPES:
+            raise ValueError(f"unsupported {name} dtype {parameter.dtype}; expected fp16, bf16, or fp32")
+    if out.numel() == 0:
+        return out
+
+    device_index = x.device.index or 0
+    traffic = B * N * (D * x.element_size() + D_OUT * out.element_size())
+    tile_d, tile_n, num_warps, single_tile = _launch_params(
+        D,
+        D_OUT,
+        B,
+        N,
+        layout,
+        _sm_version(device_index),
+        _sm_count(device_index),
+        traffic <= _STRIDED_WARP_TILE_L2_MULTIPLE * _l2_bytes(device_index),
+    )
+    x = x.contiguous()
+    weight_arg = weight.contiguous() if has_weight else x
+    bias_arg = bias.contiguous() if has_bias else x
+    layer_norm_transpose_forward_kernel[(triton.cdiv(N, tile_n), B, 1)](
+        x,
+        weight_arg,
+        bias_arg,
+        out,
+        B,
+        N,
+        *pair_ij,
+        D=D,
+        D_OUT=D_OUT,
+        EPS=eps,
+        TILE_N=tile_n,
+        TILE_D=tile_d,
+        HAS_WEIGHT=has_weight,
+        HAS_BIAS=has_bias,
+        RMS_NORM=rms_norm,
+        LAYOUT=int(layout),
+        SINGLE_TILE=single_tile,
+        NEEDS_INT64=_needs_int64(B, N, D, tile_d),
+        N_IN=0 if token_pad is None else token_pad.tokens_in,
+        I_TRUE=0 if token_pad is None else token_pad.i_true,
+        J_TRUE=0 if token_pad is None else token_pad.j_true,
+        J_PAD=0 if token_pad is None else token_pad.j_pad,
+        TOKEN_PAD=token_pad is not None,
+        num_warps=num_warps,
+        num_stages=2,
+    )
+    return out
+
+
+def layer_norm_transpose(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    eps: float = 1e-5,
+    elementwise_affine: bool = True,
+    layout: str = "nd->nd",  # codespell:ignore nd
+    pad_multiple: int = -1,
+    rms_norm: bool = False,
+    out_dtype: torch.dtype | None = None,
+    token_pad_multiple: int = -1,
+) -> torch.Tensor:
+    """Apply inference-only fused LayerNorm/RMSNorm with an optional layout change.
+
+    Normalizes the last dimension only; ``nn.LayerNorm``'s multi-axis
+    ``normalized_shape`` is not supported.
+
+    Args:
+        x: Input tensor in fp16, bf16, or fp32.
+        weight: Optional per-channel affine weight.
+        bias: Optional per-channel LayerNorm bias. RMSNorm rejects a bias.
+        eps: Epsilon added to the variance.
+        elementwise_affine: Whether to apply available ``weight`` and ``bias``.
+        layout: Input-to-output layout transform.
+        pad_multiple: round the output channel dim up to this multiple,
+            writing zeros in the tail (``< 0`` disables). Normalisation
+            statistics still use the true channel count, so the result is the
+            unpadded output zero-extended along D -- a valid operand for a
+            GEMM whose K must be vector-aligned. Only valid for layouts whose
+            output is contiguous in D, and the multiple must divide the
+            64-channel tile.
+        rms_norm: Compute RMSNorm instead of LayerNorm.
+        out_dtype: Optional output dtype. Defaults to the input dtype.
+        token_pad_multiple: round both token axes up to this multiple,
+            writing zeros in the surplus rows and columns (``< 0`` disables).
+            Only valid for ``"bijd->bijd"``. The result is the unpadded output
+            placed inside a ``[B, i_pad, j_pad, D]`` buffer, which is what the
+            ``dual_gemm_x_x`` transposed path needs to return a projection
+            whose token strides and extents are both vector-aligned. The zeros
+            matter: that GEMM masks rows by multiplying with ``0.0``, and
+            ``inf * 0`` is ``nan``, so an uninitialised gap would propagate.
+    """
+    if rms_norm and elementwise_affine and bias is not None:
+        raise ValueError("RMSNorm does not support an additive bias")
+    if token_pad_multiple > 0 and layout != "bijd->bijd":
+        raise ValueError(f"token_pad_multiple is only supported for 'bijd->bijd', got {layout!r}")
+    token_pad = None
+    pair_ij = (0, 0)
+
+    supported_layouts = (
+        "nd->nd",  # codespell:ignore nd
+        "nd->dn",
+        "dn->nd",  # codespell:ignore nd
+        "bnd->bnd",
+        "bnd->bdn",
+        "bdn->bnd",
+        "dbn->bnd",
+        "bnd->dbn",
+        "bijd->bijd",
+        "bijd->bdij",
+        "bdij->bijd",
+        "dbij->bijd",
+        "bijd->dbij",
+        "bijd->bjid",
+    )
+
+    if layout == "nd->nd":  # codespell:ignore nd
+        N, D = x.shape
+        x = x.contiguous().view(1, N, D)
+        out_shape = (N, D)
+        kernel_layout = Layout.BND_BND
+    elif layout == "nd->dn":
+        N, D = x.shape
+        x = x.contiguous().view(1, N, D)
+        out_shape = (D, N)
+        kernel_layout = Layout.BND_BDN
+    elif layout == "dn->nd":  # codespell:ignore nd
+        D, N = x.shape
+        x = x.contiguous().view(1, D, N)
+        out_shape = (N, D)
+        kernel_layout = Layout.BDN_BND
+    elif layout == "bnd->bnd":
+        B, N, D = x.shape
+        out_shape = (B, N, D)
+        kernel_layout = Layout.BND_BND
+    elif layout == "bdn->bnd":
+        B, D, N = x.shape
+        out_shape = (B, N, D)
+        kernel_layout = Layout.BDN_BND
+    elif layout == "bnd->bdn":
+        B, N, D = x.shape
+        out_shape = (B, D, N)
+        kernel_layout = Layout.BND_BDN
+    elif layout == "dbn->bnd":
+        D, B, N = x.shape
+        out_shape = (B, N, D)
+        kernel_layout = Layout.DBN_BND
+    elif layout == "bnd->dbn":
+        B, N, D = x.shape
+        out_shape = (D, B, N)
+        kernel_layout = Layout.BND_DBN
+    elif layout == "bijd->bijd":
+        B, I, J, D = x.shape
+        if token_pad_multiple > 0:
+            token_pad = TokenPad(
+                i_true=I,
+                j_true=J,
+                i_pad=triton.cdiv(I, token_pad_multiple) * token_pad_multiple,
+                j_pad=triton.cdiv(J, token_pad_multiple) * token_pad_multiple,
+            )
+            out_shape = (B, token_pad.i_pad, token_pad.j_pad, D)
+        else:
+            out_shape = (B, I, J, D)
+        x = x.contiguous().view(B, I * J, D)
+        kernel_layout = Layout.BND_BND
+    elif layout == "bijd->bdij":
+        B, I, J, D = x.shape
+        out_shape = (B, D, I, J)
+        x = x.contiguous().view(B, I * J, D)
+        kernel_layout = Layout.BND_BDN
+    elif layout == "bdij->bijd":
+        B, D, I, J = x.shape
+        out_shape = (B, I, J, D)
+        x = x.contiguous().view(B, D, I * J)
+        kernel_layout = Layout.BDN_BND
+    elif layout == "dbij->bijd":
+        D, B, I, J = x.shape
+        out_shape = (B, I, J, D)
+        x = x.contiguous().view(D, B, I * J)
+        kernel_layout = Layout.DBN_BND
+    elif layout == "bijd->dbij":
+        B, I, J, D = x.shape
+        out_shape = (D, B, I, J)
+        x = x.contiguous().view(B, I * J, D)
+        kernel_layout = Layout.BND_DBN
+    elif layout == "bijd->bjid":
+        B, I, J, D = x.shape
+        out_shape = (B, J, I, D)
+        x = x.contiguous().view(B, I * J, D)
+        kernel_layout = Layout.BIJD_BJID
+        pair_ij = (I, J)
+    else:
+        raise ValueError(f"layout {layout} not supported; expected one of {supported_layouts}")
+
+    out = _launch_layer_norm_transpose(
+        x,
+        weight,
+        bias,
+        eps,
+        elementwise_affine,
+        rms_norm,
+        kernel_layout,
+        pad_multiple,
+        out_dtype,
+        token_pad,
+        pair_ij,
+    )
+    if pad_multiple > 0:
+        # Padding is rejected above unless D is the trailing output axis.
+        out_shape = (*out_shape[:-1], out.shape[-1])
+    return out.contiguous().view(*out_shape)

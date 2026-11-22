@@ -1,0 +1,46 @@
+# Link Checker — uses the lychee-action directly.
+#
+# This was previously a reusable workflow call to Lambda-Biolab/.github-private
+# but that path kept failing with "workflow was not found" errors despite the
+# file existing at the pinned SHA. The reusable workflow itself only contained
+# the lychee-action invocation, so it's inlined here to remove the dependency.
+#
+# When the .github-private repo's reusable workflows stabilize, this can revert
+# to the reusable call.
+name: Link Checker
+
+on:
+  # Dropped the `push: branches-ignore: [main]` trigger that was here
+  # before. Each push was firing a full lychee run on every commit,
+  # which competed for the limited GitHub-hosted ubuntu-latest runner
+  # pool and queued other workflows (CI, secrets) for 30-60 minutes.
+  #
+  # The remaining triggers are sufficient:
+  # - pull_request: types: [closed] — fires when a PR is closed/merged,
+  #   catching any link breakage that landed before the merge
+  # - schedule: weekly Sunday 00:00 UTC — catches external link rot
+  #   (URLs that 404 weeks/months after they're added)
+  # - workflow_dispatch — manual trigger for ad-hoc checks
+  pull_request:
+    types: [closed]
+    branches: [main]
+  schedule:
+    - cron: "00 00 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Lychee link check
+        id: lychee
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: "--config .lychee.toml ."
+          fail: true

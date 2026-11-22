@@ -1,0 +1,712 @@
+//! The table of every optional tool: what it is, where it is installed, how it is launched, how it
+//! is probed, and how Molchanica drives it. See the [module docs](super) for how it is used.
+
+use std::{env, fmt, path::PathBuf};
+
+use bio_tools::{
+    License,
+    tool_definitions::{
+        Tool as InstallableTool,
+        catalog::{self, CatalogEntry},
+    },
+};
+
+use super::paths::{data_root, managed_venv_dir};
+
+/// One optional third-party tool.
+///
+/// Adding a variant plus its [`REGISTRY`] entry is all that is needed for it to appear in the
+/// status panel and be resolvable through [`find_executable`](super::find_executable).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Tool {
+    RdKit,
+    OpenDde,
+    Boltz2,
+    Chai1,
+    Protenix,
+    EsmFold2,
+    AlphaFold3,
+    OpenFold3,
+    ProteinMpnn,
+    LigandMpnn,
+    RfDiffusion3,
+    Gromacs,
+    Psi4,
+    Orca,
+    Xtb,
+    Gemmi,
+}
+
+impl Tool {
+    /// Every tool, in the order the status panel lists them: prediction and design first, then the
+    /// simulation and file-format helpers.
+    pub const ALL: [Self; 16] = [
+        Self::OpenDde,
+        Self::Boltz2,
+        Self::Chai1,
+        Self::OpenFold3,
+        Self::Protenix,
+        Self::EsmFold2,
+        Self::AlphaFold3,
+        Self::LigandMpnn,
+        Self::ProteinMpnn,
+        Self::RfDiffusion3,
+        Self::RdKit,
+        Self::Gromacs,
+        Self::Psi4,
+        Self::Orca,
+        Self::Xtb,
+        Self::Gemmi,
+    ];
+
+    pub fn spec(self) -> &'static ToolSpec {
+        REGISTRY
+            .iter()
+            .find(|spec| spec.tool == self)
+            .expect("every Tool variant has a registry entry")
+    }
+}
+
+impl fmt::Display for Tool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.spec().name())
+    }
+}
+
+/// How a tool is launched, which determines where it is looked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolKind {
+    /// A standalone native binary. Looked for in the tool's bundle directory, then on `PATH`.
+    Executable,
+    /// A console script (`opendde`, `boltz`, ...) inside a Molchanica-managed uv environment.
+    VenvScript,
+    /// The interpreter of a Molchanica-managed uv environment. Used where the tool's code is
+    /// a checkout rather than a package with an entry point, and where driving the Python API
+    /// directly is more robust than depending on a CLI's argument shape.
+    VenvPython,
+    /// A launcher in a managed Conda prefix.
+    CondaScript,
+}
+
+/// How Molchanica runs a tool once it is installed.
+///
+/// This is the split that decides which code to read when changing how a tool is used: every
+/// [`SharedAdapter`](Self::SharedAdapter) tool goes through the same form, runner, and result
+/// browser, with no per-tool code in Molchanica.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolAdapter {
+    /// `bio_tools`' Python adapter, fed by the form contract `bio_tools` publishes for the tool's
+    /// catalog slug. See [`shared_adapter`](super::shared_adapter).
+    SharedAdapter,
+    /// Driven from elsewhere in Molchanica (the MD, ORCA, and electron-density code); this module
+    /// only finds, probes, and reports on it.
+    External,
+}
+
+/// A file that must exist before a tool can actually do anything — typically model weights, which
+/// are downloaded separately from the code and are the usual reason an "installed" tool fails on
+/// first use.
+#[derive(Clone, Copy, Debug)]
+pub struct RequiredAsset {
+    /// Relative to the tool's bundle directory.
+    pub relative_path: &'static str,
+    pub description: &'static str,
+}
+
+/// Shown if a registry entry ever names a catalog slug `bio_tools` no longer has.
+const MISSING_CATALOG: &str = "(the bio_tools catalog entry for this tool is missing)";
+
+/// Everything Molchanica knows about one tool.
+///
+/// Every [`REGISTRY`] entry lists these fields in this order, so that entries can be compared at a
+/// glance.
+pub struct ToolSpec {
+    pub tool: Tool,
+    /// The `bio_tools` catalog entry this tool is described by: name, summary, home page, and
+    /// licence. `bio_web` reads the same table, so none of it is restated here. Not always the
+    /// install recipe's slug; see [`Self::slug`].
+    pub catalog_slug: &'static str,
+    pub kind: ToolKind,
+    pub adapter: ToolAdapter,
+    /// Base name of the console script or binary, without any platform suffix.
+    pub executable: &'static str,
+    /// An absolute path here overrides discovery for tools that support it.
+    pub exe_override_env: Option<&'static str>,
+    /// Points at the tool's bundle or virtual-environment root, overriding the managed location.
+    pub root_override_env: Option<&'static str>,
+    /// Independently overrides a checkout or binary bundle for Python tools that need both a
+    /// virtual environment and repository assets.
+    pub bundle_root_override_env: Option<&'static str>,
+    /// Subdirectory of `<data root>/process_executables` holding a binary distribution or checkout.
+    pub bundle_subdir: Option<&'static str>,
+    /// Weights and data files, relative to the bundle directory.
+    pub required_assets: &'static [RequiredAsset],
+    /// Whether Molchanica can install it through `bio_tools`. False for tools with a licence gate
+    /// or vendor-managed installation (ORCA), which the user has to obtain themselves.
+    pub molchanica_managed: bool,
+    /// Shown when the tool cannot be found.
+    pub install_hint: &'static str,
+    /// Arguments to a probe that proves the right program answered.
+    pub version_args: &'static [&'static str],
+    /// A substring the probe's output must contain. Guards against name collisions — `orca` is
+    /// also a screen reader, and `gmx` output has to actually be GROMACS.
+    pub version_marker: &'static str,
+    /// Whether the probe is expected to be slow because it imports a scientific Python stack.
+    pub slow_probe: bool,
+}
+
+impl ToolSpec {
+    /// The shared `bio_tools` catalog entry.
+    pub fn catalog(&self) -> Option<&'static CatalogEntry> {
+        catalog::by_slug(self.catalog_slug)
+    }
+
+    /// The `bio_tools` install recipe backing this tool, where one exists. `None` for the tools
+    /// only ever obtained from a vendor.
+    pub fn recipe(&self) -> Option<InstallableTool> {
+        self.catalog().and_then(|entry| entry.identity.tool())
+    }
+
+    /// The machine-readable identifier: the managed environment's directory name, and the key the
+    /// `bio_tools` installer is asked for. Taken from the install recipe, so that the directory
+    /// Molchanica builds and the one `bio_tools` installs into cannot disagree.
+    pub fn slug(&self) -> &'static str {
+        self.recipe()
+            .map_or(self.catalog_slug, InstallableTool::slug)
+    }
+
+    /// The key `bio_tools` publishes this tool's form contract, presets, and Python adapter under,
+    /// for [`ToolAdapter::SharedAdapter`] tools. `None` for every other tool.
+    pub fn adapter_slug(&self) -> Option<&'static str> {
+        (self.adapter == ToolAdapter::SharedAdapter).then_some(self.catalog_slug)
+    }
+
+    /// How the tool is written wherever a person reads it.
+    pub fn name(&self) -> &'static str {
+        match self.recipe() {
+            Some(recipe) => recipe.name(),
+            None => self.catalog().map_or(self.catalog_slug, CatalogEntry::name),
+        }
+    }
+
+    /// A short description, shown in the status panel.
+    pub fn summary(&self) -> &'static str {
+        self.catalog()
+            .map_or(MISSING_CATALOG, |entry| entry.spec.summary)
+    }
+
+    /// The page to send someone to for more: the project's home, else its repository, else docs.
+    pub fn url(&self) -> &'static str {
+        self.catalog()
+            .and_then(|entry| {
+                entry
+                    .spec
+                    .home_url
+                    .or(entry.spec.repo_url)
+                    .or(entry.spec.docs_url)
+            })
+            .unwrap_or(MISSING_CATALOG)
+    }
+
+    /// Official links in display order, as `(label, url)`. Only links the tool has are included.
+    pub fn links(&self) -> Vec<(&'static str, &'static str)> {
+        let Some(entry) = self.catalog() else {
+            return Vec::new();
+        };
+        let spec = &entry.spec;
+
+        [
+            ("Docs", spec.docs_url),
+            ("Input parameters", spec.input_params_url),
+            ("Examples", spec.examples_url),
+            ("Paper", spec.paper_url),
+            ("Home page", spec.home_url),
+            ("Source", spec.repo_url),
+            ("License", spec.license.official_url().or(spec.license_url)),
+        ]
+        .into_iter()
+        .filter_map(|(label, url)| url.map(|url| (label, url)))
+        .collect()
+    }
+
+    /// The licence's short label, e.g. `MIT`.
+    pub fn license(&self) -> License {
+        self.catalog()
+            .map_or(License::Other, |entry| entry.spec.license)
+    }
+
+    /// Licence terms of the whole stack a run needs, not just the upstream repository's label.
+    pub fn license_details(&self) -> &'static str {
+        self.catalog()
+            .map_or(MISSING_CATALOG, |entry| entry.spec.license_details)
+    }
+
+    /// `<data root>/process_executables/python_envs/<slug>`, or the override value.
+    pub fn venv_root(&self) -> Option<PathBuf> {
+        if let Some(name) = self.root_override_env
+            && let Some(configured) = env::var_os(name)
+        {
+            return Some(PathBuf::from(configured));
+        }
+        data_root().map(|root| managed_venv_dir(&root, self.slug()))
+    }
+
+    /// `<data root>/process_executables/<bundle_subdir>`, or the override value.
+    pub fn bundle_root(&self) -> Option<PathBuf> {
+        if let Some(name) = self.bundle_root_override_env.or(self.root_override_env)
+            && let Some(configured) = env::var_os(name)
+        {
+            return Some(PathBuf::from(configured));
+        }
+        let subdir = self.bundle_subdir?;
+        data_root().map(|root| root.join("process_executables").join(subdir))
+    }
+
+    /// Whether this tool can run on the platform Molchanica is running on.
+    ///
+    /// Not a field: for everything Molchanica installs, this is exactly the question
+    /// `bio_tools` already answers with [`InstallableTool::is_supported`] -- whether upstream
+    /// publishes the wheels and binaries the recipe needs here -- and duplicating the answer in
+    /// the table only creates somewhere for the two to disagree. A tool the user installs
+    /// themselves (ORCA) is never gated: `bio_tools` may well have no recipe for
+    /// this platform while the vendor ships a perfectly good build of it.
+    pub fn is_supported(&self) -> bool {
+        match self.recipe() {
+            Some(recipe) if self.molchanica_managed => recipe.is_supported(),
+            _ => true,
+        }
+    }
+
+    /// The badge shown beside a tool unavailable on this platform.
+    pub fn platform_label(&self) -> Option<String> {
+        (!self.is_supported()).then(|| format!("Not available on {OS_NAME}"))
+    }
+
+    /// Why this tool can't be installed or run here, if it can't.
+    pub fn unavailable_message(&self) -> Option<String> {
+        (!self.is_supported()).then(|| format!("{} is not available on {OS_NAME}", self.name()))
+    }
+
+    /// User-facing instruction for installing this tool.
+    pub fn install_command(&self) -> String {
+        if !self.molchanica_managed {
+            return self.install_hint.to_owned();
+        }
+        if let Some(message) = self.unavailable_message() {
+            return format!("{message}.");
+        }
+        format!(
+            "Install {} from Molchanica's Tools panel (recipe `{}`).",
+            self.name(),
+            self.slug()
+        )
+    }
+
+    pub fn can_install_here(&self) -> bool {
+        self.molchanica_managed && self.is_supported()
+    }
+}
+
+/// The install hint every Molchanica-managed tool shares.
+const MANAGED_HINT: &str = "Install from Molchanica's Tools panel.";
+
+/// This platform's name, for messages about tools unavailable here.
+const OS_NAME: &str = if cfg!(target_os = "windows") {
+    "Windows"
+} else if cfg!(target_os = "macos") {
+    "macOS"
+} else {
+    "Linux"
+};
+
+/// The single description of every tool. See the module docs for how it is used.
+pub static REGISTRY: &[ToolSpec] = &[
+    ToolSpec {
+        tool: Tool::RdKit,
+        catalog_slug: "rdkit",
+        kind: ToolKind::VenvPython,
+        adapter: ToolAdapter::External,
+        executable: "python",
+        exe_override_env: Some("RDKIT_PYTHON"),
+        root_override_env: Some("MOLCHANICA_RDKIT_ROOT"),
+        bundle_root_override_env: None,
+        bundle_subdir: None,
+        required_assets: &[],
+        molchanica_managed: true,
+        install_hint: "Install RDKit from Tools, or set RDKIT_PYTHON to a Python interpreter with RDKit installed.",
+        version_args: &["-E", "-c", bio_tools::rdkit::PROBE],
+        version_marker: "RDKit",
+        slow_probe: true,
+    },
+    // ---------------------------------------------------------------------------------------------
+    // Structure prediction, run through bio_tools' shared adapter
+    // ---------------------------------------------------------------------------------------------
+    ToolSpec {
+        tool: Tool::OpenDde,
+        catalog_slug: "opendde",
+        kind: ToolKind::VenvScript,
+        adapter: ToolAdapter::SharedAdapter,
+        executable: "opendde",
+        exe_override_env: Some("MOLCHANICA_OPENDDE_EXECUTABLE"),
+        // Predates this registry and is documented, so it keeps its own name rather than becoming
+        // MOLCHANICA_OPENDDE_VENV_DIR; existing installs and shell profiles continue to work.
+        root_override_env: Some("OPENDDE_VENV_DIR"),
+        bundle_root_override_env: None,
+        bundle_subdir: None,
+        required_assets: &[],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &["--version"],
+        version_marker: "opendde",
+        slow_probe: true,
+    },
+    ToolSpec {
+        tool: Tool::Boltz2,
+        catalog_slug: "boltz2",
+        kind: ToolKind::VenvScript,
+        adapter: ToolAdapter::SharedAdapter,
+        executable: "boltz",
+        exe_override_env: Some("MOLCHANICA_BOLTZ_EXECUTABLE"),
+        root_override_env: Some("MOLCHANICA_BOLTZ_VENV_DIR"),
+        bundle_root_override_env: None,
+        bundle_subdir: None,
+        required_assets: &[],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        // Boltz has no --version; `boltz --help` exits 0 and lists its `predict` subcommand.
+        version_args: &["--help"],
+        version_marker: "predict",
+        slow_probe: true,
+    },
+    ToolSpec {
+        tool: Tool::Chai1,
+        catalog_slug: "chai1",
+        kind: ToolKind::VenvScript,
+        adapter: ToolAdapter::SharedAdapter,
+        executable: "chai-lab",
+        exe_override_env: Some("MOLCHANICA_CHAI1_EXECUTABLE"),
+        root_override_env: None,
+        bundle_root_override_env: None,
+        bundle_subdir: None,
+        required_assets: &[],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &["--help"],
+        version_marker: "chai-lab",
+        slow_probe: true,
+    },
+    ToolSpec {
+        tool: Tool::OpenFold3,
+        catalog_slug: "openfold3",
+        kind: ToolKind::VenvScript,
+        adapter: ToolAdapter::SharedAdapter,
+        executable: "run_openfold",
+        exe_override_env: Some("MOLCHANICA_OPENFOLD3_EXECUTABLE"),
+        root_override_env: None,
+        bundle_root_override_env: None,
+        bundle_subdir: None,
+        required_assets: &[],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &["predict", "--help"],
+        version_marker: "run_openfold",
+        slow_probe: true,
+    },
+    ToolSpec {
+        tool: Tool::Protenix,
+        catalog_slug: "protenix",
+        kind: ToolKind::VenvScript,
+        adapter: ToolAdapter::SharedAdapter,
+        executable: "protenix",
+        exe_override_env: Some("MOLCHANICA_PROTENIX_EXECUTABLE"),
+        root_override_env: Some("MOLCHANICA_PROTENIX_VENV_DIR"),
+        bundle_root_override_env: None,
+        bundle_subdir: None,
+        required_assets: &[],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &["--help"],
+        version_marker: "protenix",
+        slow_probe: true,
+    },
+    ToolSpec {
+        tool: Tool::EsmFold2,
+        catalog_slug: "esmfold2",
+        kind: ToolKind::VenvScript,
+        adapter: ToolAdapter::SharedAdapter,
+        executable: "esm-fold",
+        exe_override_env: Some("MOLCHANICA_ESMFOLD2_EXECUTABLE"),
+        root_override_env: None,
+        bundle_root_override_env: None,
+        bundle_subdir: None,
+        required_assets: &[],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &["--help"],
+        version_marker: "esm-fold",
+        slow_probe: true,
+    },
+    // AlphaFold 3's code is installed by `bio_tools`, but its model parameters are Google's, under
+    // non-commercial terms; `bio_tools` fetches them only when ALPHAFOLD3_ACCEPT_WEIGHTS_TERMS is
+    // set, so the parameters are a required asset the user may have to place themselves. Runs
+    // take their MSAs from the ColabFold server, so the genetic databases are not required.
+    ToolSpec {
+        tool: Tool::AlphaFold3,
+        catalog_slug: "alphafold3",
+        kind: ToolKind::VenvPython,
+        adapter: ToolAdapter::SharedAdapter,
+        executable: "python",
+        exe_override_env: Some("MOLCHANICA_ALPHAFOLD3_PYTHON"),
+        root_override_env: Some("MOLCHANICA_ALPHAFOLD3_VENV_DIR"),
+        bundle_root_override_env: Some("MOLCHANICA_ALPHAFOLD3_ROOT"),
+        bundle_subdir: Some("alphafold3"),
+        required_assets: &[
+            RequiredAsset {
+                relative_path: "source/run_alphafold.py",
+                description: "the AlphaFold 3 checkout",
+            },
+            RequiredAsset {
+                relative_path: "models/af3.bin.zst",
+                description: "the AlphaFold 3 model parameters (Google's af3.bin.zst, from                               https://storage.googleapis.com/alphafold3/af3.bin.zst under the                               AlphaFold 3 Model Parameters Terms of Use)",
+            },
+        ],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &["--version"],
+        version_marker: "Python 3",
+        slow_probe: false,
+    },
+    // ---------------------------------------------------------------------------------------------
+    // Sequence and backbone design, run through bio_tools' shared adapter
+    // ---------------------------------------------------------------------------------------------
+    ToolSpec {
+        tool: Tool::LigandMpnn,
+        catalog_slug: "ligandmpnn",
+        kind: ToolKind::VenvPython,
+        adapter: ToolAdapter::SharedAdapter,
+        executable: "python",
+        exe_override_env: Some("MOLCHANICA_LIGANDMPNN_PYTHON"),
+        root_override_env: Some("MOLCHANICA_LIGANDMPNN_VENV_DIR"),
+        bundle_root_override_env: Some("MOLCHANICA_LIGANDMPNN_ROOT"),
+        bundle_subdir: Some("LigandMPNN"),
+        required_assets: &[
+            RequiredAsset {
+                relative_path: "run.py",
+                description: "the LigandMPNN checkout",
+            },
+            RequiredAsset {
+                relative_path: "model_params/ligandmpnn_v_32_010_25.pt",
+                description: "the default LigandMPNN weights",
+            },
+        ],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &["--version"],
+        version_marker: "Python 3",
+        slow_probe: false,
+    },
+    // Also run natively, by the Protein design window's AbMPNN tab; see `mpnn`.
+    ToolSpec {
+        tool: Tool::ProteinMpnn,
+        catalog_slug: "proteinmpnn",
+        kind: ToolKind::VenvPython,
+        adapter: ToolAdapter::SharedAdapter,
+        executable: "python",
+        exe_override_env: Some("MOLCHANICA_PROTEINMPNN_PYTHON"),
+        root_override_env: Some("MOLCHANICA_PROTEINMPNN_VENV_DIR"),
+        bundle_root_override_env: Some("MOLCHANICA_PROTEINMPNN_ROOT"),
+        bundle_subdir: Some("ProteinMPNN"),
+        required_assets: &[
+            RequiredAsset {
+                relative_path: "protein_mpnn_run.py",
+                description: "the ProteinMPNN checkout",
+            },
+            RequiredAsset {
+                relative_path: "vanilla_model_weights/v_48_020.pt",
+                description: "the default ProteinMPNN weights",
+            },
+        ],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &["--version"],
+        version_marker: "Python 3",
+        slow_probe: false,
+    },
+    // RFdiffusion3 is the only RFdiffusion generation Molchanica supports: 1 and 2 are gone from
+    // `bio_tools`, and their Hydra-override command line has nothing in common with RFD3's JSON
+    // `InputSpecification`.
+    //
+    // Windows runs it too. `rc-foundry` is a pure-Python wheel and `rc-foundry[rfd3]` resolves to
+    // the same packages on both platforms, so the recipe in `bio_tools` installs and runs here;
+    // see the notes on its catalog entry, `tool_definitions/rfdiffusion3.rs`.
+    ToolSpec {
+        tool: Tool::RfDiffusion3,
+        catalog_slug: "rfd3",
+        kind: ToolKind::VenvScript,
+        adapter: ToolAdapter::SharedAdapter,
+        executable: "rfd3",
+        exe_override_env: Some("MOLCHANICA_RFD3_EXECUTABLE"),
+        root_override_env: Some("MOLCHANICA_RFD3_VENV_DIR"),
+        bundle_root_override_env: Some("MOLCHANICA_RFD3_ROOT"),
+        bundle_subdir: Some("rfd3"),
+        required_assets: &[RequiredAsset {
+            relative_path: "checkpoints/rfd3_latest.ckpt",
+            description: "the RFdiffusion3 checkpoint",
+        }],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &["--help"],
+        version_marker: "rfd3",
+        slow_probe: true,
+    },
+    // ---------------------------------------------------------------------------------------------
+    // Simulation, quantum chemistry, and file formats
+    // ---------------------------------------------------------------------------------------------
+    ToolSpec {
+        tool: Tool::Gromacs,
+        catalog_slug: "gromacs",
+        kind: ToolKind::Executable,
+        adapter: ToolAdapter::External,
+        executable: "gmx",
+        exe_override_env: Some("MOLCHANICA_GROMACS_EXECUTABLE"),
+        root_override_env: None,
+        bundle_root_override_env: None,
+        bundle_subdir: Some("gromacs"),
+        required_assets: &[],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        // Not `-version`: about 10% of runs exit 0 with no output (2026.2, Windows).
+        version_args: &["-h"],
+        // From the banner, which goes to stderr.
+        version_marker: "GROMACS - gmx",
+        // Loads hundreds of MB of CUDA libraries, which a virus scan can hold up for seconds.
+        slow_probe: true,
+    },
+    ToolSpec {
+        tool: Tool::Psi4,
+        catalog_slug: "psi4",
+        kind: ToolKind::CondaScript,
+        adapter: ToolAdapter::SharedAdapter,
+        executable: "psi4",
+        exe_override_env: None,
+        root_override_env: None,
+        bundle_root_override_env: None,
+        bundle_subdir: None,
+        required_assets: &[],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &[],
+        version_marker: "",
+        slow_probe: true,
+    },
+    ToolSpec {
+        tool: Tool::Orca,
+        catalog_slug: "orca",
+        kind: ToolKind::Executable,
+        adapter: ToolAdapter::External,
+        executable: "orca",
+        exe_override_env: Some("MOLCHANICA_ORCA_EXECUTABLE"),
+        root_override_env: None,
+        bundle_root_override_env: None,
+        bundle_subdir: None,
+        required_assets: &[],
+        molchanica_managed: false,
+        install_hint: "Register at https://www.faccts.de/orca/ and put `orca` on PATH, \
+                       or set MOLCHANICA_ORCA_EXECUTABLE.",
+        // Not a valid ORCA flag, but it prints its banner anyway, which is what we match on. The
+        // banner check matters: `orca` on Linux is often the GNOME screen reader.
+        version_args: &["--help"],
+        version_marker: "O   R   C   A",
+        slow_probe: false,
+    },
+    // Runs GFN-FF; see `force_fields`.
+    ToolSpec {
+        tool: Tool::Xtb,
+        catalog_slug: "xtb",
+        kind: ToolKind::Executable,
+        adapter: ToolAdapter::External,
+        executable: "xtb",
+        exe_override_env: Some("XTB_EXECUTABLE"),
+        root_override_env: None,
+        bundle_root_override_env: None,
+        bundle_subdir: Some("xtb"),
+        required_assets: &[],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &["--version"],
+        version_marker: "xtb version",
+        slow_probe: false,
+    },
+    // Opens MTZ and structure-factor mmCIF files; see `file_io`.
+    ToolSpec {
+        tool: Tool::Gemmi,
+        catalog_slug: "gemmi",
+        kind: ToolKind::VenvScript,
+        adapter: ToolAdapter::External,
+        executable: "gemmi",
+        exe_override_env: Some("MOLCHANICA_GEMMI_EXECUTABLE"),
+        root_override_env: None,
+        bundle_root_override_env: None,
+        bundle_subdir: None,
+        required_assets: &[],
+        molchanica_managed: true,
+        install_hint: MANAGED_HINT,
+        version_args: &["--help"],
+        version_marker: "GEMMI library",
+        slow_probe: false,
+    },
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gated() -> Vec<&'static str> {
+        Tool::ALL
+            .iter()
+            .map(|tool| tool.spec())
+            .filter(|spec| !spec.is_supported())
+            .map(ToolSpec::name)
+            .collect()
+    }
+
+    /// Platform support is no longer a field: [`ToolSpec::is_supported`] asks `bio_tools` whether
+    /// the recipe it would install has wheels here. This pins the answer, so that a recipe gaining
+    /// or losing a platform upstream shows up as a failure here rather than as a tool quietly
+    /// appearing or vanishing from the Tools panel.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn only_the_linux_only_recipes_are_gated() {
+        // Chai-1 also runs on Apple Silicon, on the CPU.
+        let expected: &[&str] = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            &["Protenix-v2", "ESMFold 2", "AlphaFold 3"]
+        } else if cfg!(target_os = "macos") {
+            &["Chai-1", "Protenix-v2", "ESMFold 2", "AlphaFold 3"]
+        } else {
+            &[
+                "Chai-1",
+                "OpenFold3",
+                "Protenix-v2",
+                "ESMFold 2",
+                "AlphaFold 3",
+            ]
+        };
+        assert_eq!(gated(), expected);
+    }
+
+    /// The tools the user installs themselves are never gated, whatever `bio_tools` says about a
+    /// recipe for them: ORCA ships vendor builds for every platform Molchanica runs on.
+    #[test]
+    fn user_supplied_tools_are_never_gated() {
+        assert!(
+            Tool::Orca.spec().is_supported(),
+            "ORCA should never be gated"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn nothing_is_gated_on_linux() {
+        assert_eq!(gated(), Vec::<&str>::new());
+    }
+}

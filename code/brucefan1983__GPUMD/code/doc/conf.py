@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import re
+import sphinx_rtd_theme
+import subprocess
+from collections import Counter
+from docutils import nodes
+from sphinx import addnodes
+from pybtex.database import parse_file
+
+project = 'GPUMD'
+author = 'The GPUMD developer team'
+copyright = '2023'
+site_url = 'https://gpumd.org'
+
+version = ''
+if len(version) == 0:
+    process = subprocess.Popen(['git', 'tag'], stdout=subprocess.PIPE)
+    stdout, _ = process.communicate()
+    versions = [s for s in stdout.decode().split('\n') if len(s)]
+    if len(versions) > 0:
+        version = versions[-1]
+    else:
+        version = 'unknown'
+
+extensions = [
+    'sphinx_sitemap',
+    'sphinx.ext.autodoc',
+    'sphinx.ext.autosummary',
+    'sphinx.ext.coverage',
+    'sphinx.ext.doctest',
+    'sphinx.ext.graphviz',
+    'sphinx.ext.ifconfig',
+    'sphinx.ext.intersphinx',
+    'sphinx.ext.mathjax',
+    'sphinx.ext.napoleon',
+    'sphinx.ext.todo',
+    'sphinx.ext.viewcode',
+    'sphinx_autodoc_typehints',
+    'sphinxcontrib.bibtex',
+    'nbsphinx',
+    'sphinx_tabs.tabs']
+bibtex_bibfiles = ['publications.bib']
+
+graphviz_output_format = 'svg'
+templates_path = ['_templates']
+source_suffix = '.rst'
+master_doc = 'index'
+pygments_style = 'sphinx'
+todo_include_todos = True
+
+html_logo = "_static/logo.png"
+html_favicon = "_static/logo.ico"
+html_theme = 'sphinx_rtd_theme'
+html_static_path = ['_static']
+html_context = {
+    'current_version': version,
+    'versions':
+        [('latest release',
+          '{}'.format(site_url)),
+         ('development version',
+          '{}/dev'.format(site_url))]}
+htmlhelp_basename = 'GPUMDdoc'
+intersphinx_mapping = \
+    {'numpy':   ('https://numpy.org/doc/stable/', None),
+     'scipy':   ('https://scipy.github.io/devdocs/', None),
+     'sklearn': ('https://scikit-learn.org/stable', None)}
+
+# Settings for nbsphinx
+nbsphinx_execute = 'never'
+
+# Options for LaTeX output
+_PREAMBLE = r"""
+\usepackage{amsmath,amssymb}
+\renewcommand{\vec}[1]{\boldsymbol{#1}}
+\DeclareMathOperator*{\argmin}{\arg\!\min}
+%\DeclareMathOperator{\argmin}{\arg\!\min}
+"""
+
+latex_elements = {
+    'preamble': _PREAMBLE,
+}
+latex_documents = [
+    (master_doc, 'GPUMD.tex', 'GPUMD documentation',
+     'The GPUMD developer team', 'manual'),
+]
+
+
+# Options for manual page output
+man_pages = [
+    (master_doc, 'GPUMD', 'GPUMD documentation', [author], 1)
+]
+
+
+# Options for Texinfo output
+texinfo_documents = [
+    (master_doc, 'GPUMD', 'GPUMD documentation',
+     author, 'GPUMD documentation', 'GPUMD', 'Miscellaneous'),
+]
+
+
+html_css_files = [
+    'custom.css',
+]
+
+
+def add_publication_counts(app, doctree):
+    if app.env.docname != 'publications':
+        return
+    bibfile = os.path.join(app.srcdir, 'publications.bib')
+    app.env.note_dependency(bibfile)
+    counts = Counter(entry.fields.get('year') for entry in parse_file(bibfile).entries.values())
+    for title in doctree.findall(nodes.title):
+        year = title.astext()
+        if re.fullmatch(r'\d{4}', year):
+            count = counts[year]
+            label = 'publication' if count == 1 else 'publications'
+            title += nodes.Text(f' ({count} {label})')
+
+
+def remove_latex_empty_chapters(app, doctree, docname):
+    if app.builder.format != 'latex':
+        return
+    for node in list(doctree.findall(addnodes.start_of_file)):
+        if node['docname'] in ('bibliography', 'genindex'):
+            node.parent.remove(node)
+
+
+def setup(app):
+    app.connect('doctree-read', add_publication_counts, priority=400)
+    app.connect('doctree-resolved', remove_latex_empty_chapters)

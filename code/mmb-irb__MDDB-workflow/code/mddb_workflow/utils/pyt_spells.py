@@ -1,0 +1,242 @@
+import pytraj as pyt
+from packaging.version import Version
+import numpy as np
+from mddb_workflow.utils.auxiliar import InputError, ToolError, SegmentationFault
+from mddb_workflow.utils.file import File
+from mddb_workflow.utils.selections import Selection
+from mddb_workflow.utils.type_hints import *
+from mddb_workflow.tools.get_reduced_trajectory import calculate_frame_step
+import subprocess
+import sys
+# Set pytraj supported formats
+pytraj_supported_structure_formats = {'prmtop', 'pdb', 'mol2', 'psf', 'cif', 'sdf'}
+pytraj_supported_trajectory_formats = {'xtc', 'trr', 'crd', 'mdcrd', 'nc', 'dcd'}
+
+
+def get_pytraj_trajectory (
+    input_topology_filename : str,
+    input_trajectory_filename : str,
+    atom_selection : Optional['Selection'] = None):
+    """Get the whole trajectory as a generator."""
+    # Topology is mandatory to setup the pytraj trajectory
+    if not input_topology_filename:
+        raise InputError('Missing topology file to setup PyTraj trajectory')
+
+    # Quick check for segmentation fault that happen with some topologies (MDBind 5a5s)
+    result = subprocess.run(
+        [sys.executable, "-c",
+         f"import pytraj as pt; pt.load_topology('{input_topology_filename}')"],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode == -11:  # SIGSEGV
+        raise SegmentationFault("SIGSEGV while loading topology with pytraj")
+
+    # Set the pytraj trayectory and get the number of frames
+    # NEVER FORGET: The pytraj iterload does not accept a mask, but we can strip atoms later
+    pyt_trajectory = pyt.iterload(input_trajectory_filename, input_topology_filename)
+
+    # WARNING: This extra line prevents the error "Segment violation (core dumped)" in some pdbs
+    # This happens with some random pdbs which pytraj considers to have 0 Mols
+    # More info: https://github.com/Amber-MD/cpptraj/pull/820
+    # DANI: Esto es útil en pytraj <= 2.0.5 pero hace fallar el código a partir de pytraj 2.0.6
+    if Version(pyt.__version__) <= Version('2.0.5'):
+        pyt_trajectory.top.start_new_mol()
+
+    # Filter away atoms which ARE NOT in the atom selection
+    if atom_selection:
+        # Get atom indices for all atoms but the ones in the atom selection
+        topology = pyt_trajectory.top
+        all_atoms = set(range(topology.n_atoms))
+        keep_atoms = set(atom_selection.atom_indices)
+        strip_atoms = all_atoms - keep_atoms
+        if len(strip_atoms) > 0:
+            # Convert the strip atom indices to a pytraj mask string and strip the iterator
+            mask = Selection(strip_atoms).to_pytraj()
+            pyt_trajectory = pyt_trajectory.strip(mask)
+
+    return pyt_trajectory
+
+
+def get_reduced_pytraj_trajectory (
+    input_topology_filename : str,
+    input_trajectory_filename : str,
+    snapshots : int,
+    reduced_trajectory_frames_limit : int):
+    """Get the reduced trajectory.
+    WARNING: The final number of frames may be the specifided or less.
+    """
+    # Set the pytraj trayectory and get the number of frames
+    pt_trajectory = get_pytraj_trajectory(input_topology_filename, input_trajectory_filename)
+    # WARNING: Do not read pt_trajectory.n_frames to get the number of snapshots or you will read the whole trajectory
+    # WARNING: This may be a lot of time for a huge trajectory. Use the snapshots input instead
+
+    # Set a reduced trajectory used for heavy analyses
+
+    # If the current trajectory has already less or the same frames than the limit
+    # Then do nothing and use it also as reduced
+    if snapshots <= reduced_trajectory_frames_limit:
+        frame_step = 1
+        return pt_trajectory, frame_step, snapshots
+
+    frame_step, reduced_frame_count = calculate_frame_step(snapshots, reduced_trajectory_frames_limit)
+    reduced_pt_trajectory = pt_trajectory[0:snapshots:frame_step]
+    return reduced_pt_trajectory, frame_step, reduced_frame_count
+
+# Get the frame count from any trajectory format
+# WARNING: There is a function for XTC format only which is way faster
+# LORE: This was tried also with mdtraj's iterload but pytraj was way faster
+def get_frames_count (
+    structure_file : 'File',
+    trajectory_file : 'File',
+    verbose : bool = True) -> int:
+    """Get the trajectory frames count."""
+    if verbose: print('-> Counting number of frames')
+
+    if not trajectory_file.exists:
+        raise InputError('Missing trajectroy file when counting frames: ' + trajectory_file.path)
+
+    if not structure_file.exists:
+        raise InputError('Missing topology file when counting frames: ' + structure_file.path)
+
+    # Load the trajectory from pytraj
+    pyt_trajectory = pyt.iterload(
+        trajectory_file.path,
+        structure_file.path)
+
+    # Return the frames number
+    frames = pyt_trajectory.n_frames
+    if verbose: print(f' Frames: {frames}')
+
+    # If 0 frames were counted then there is something wrong with the file
+    if frames == 0:
+        raise InputError('Something went wrong when reading the trajectory')
+
+    return frames
+# Set function supported formats
+get_frames_count.format_sets = [
+    {
+        'inputs': {
+            'input_structure_filename': pytraj_supported_structure_formats,
+            'input_trajectory_filename': pytraj_supported_trajectory_formats
+        }
+    }
+]
+
+# DANI: Note that a PRMTOP file is not a structure but a topology
+# DANI: However it is important that the argument is called 'structure' for the format finder
+def filter_topology (
+    input_structure_file : str,
+    output_structure_file : str,
+    input_selection : 'Selection'
+):
+    """Filter topology atoms."""
+    # Generate a pytraj mask with the desired selection
+    mask = input_selection.to_pytraj()
+
+    # Load the topology
+    topology = pyt.load_topology(input_structure_file.path)
+
+    # Apply the filter mask
+    filtered_topology = topology[mask]
+
+    # Write the filtered topology to disk
+    filtered_topology.save(output_structure_file.path)
+
+    # Check the output file exists at this point
+    # If not then it means something went wrong with gromacs
+    if not output_structure_file.exists:
+        raise ToolError('Something went wrong with PyTraj')
+
+
+filter_topology.format_sets = [
+    {
+        'inputs': {
+            'input_structure_file': pytraj_supported_structure_formats,
+        },
+        'outputs': {
+            # Pytraj can not write mmCIF files
+            'output_structure_file': pytraj_supported_structure_formats - {'cif'}
+        }
+    }
+]
+
+# This value is used in NetCDF to represent a missing value or NaN
+# We must declare it as a numpy's float64 since this is the type of pytraj coordinates
+# Thus we can directly compare numpy's float64 equality
+NETCDF_MISSING_VALUE = np.float64(9.969209968386869e+36)
+
+def find_first_corrupted_frame (input_topology_filepath : str, input_trajectory_filepath : str) -> Optional[int]:
+    """Find the first corrupted frame number with NaN or all zero coordinates,
+    given a corrupted NetCDF file, whose first frames may be read by pytraj.
+    """
+    print('Checking NetCDF integrity')
+    # Iterload the trajectory to pytraj
+    trajectory = get_pytraj_trajectory(input_topology_filepath, input_trajectory_filepath)
+    # Iterate frames until we find one frame whose last atom coordinates are all zeros
+    frame_iterator = iter(trajectory.iterframe())
+    expected_frames = trajectory.n_frames
+    for f, frame in enumerate(frame_iterator, 1):
+        print(f' Reading frame {f}/{expected_frames}', end='\r')
+        atom_coordinates = frame.xyz
+        # Make sure there are actual coordinates here
+        # If there is any problem we may have frames with coordinates full of "wrong" values
+        # First check for missing values, which may be created by cpptraj
+        if np.isin(NETCDF_MISSING_VALUE, atom_coordinates):
+            print(f' Found missing values in frame {f}')
+            return f
+        # Make sure there are no literal NaNs
+        if np.isnan(frame.xyz).any():
+            print(f' Found NaN values in frame {f}')
+            return f
+        # Make sure there are no "falsy" values like zeros or nulls
+        if not atom_coordinates.all():
+            print(f' Found zero or falsy values in frame {f}')
+            return f
+    return None
+
+def find_all_corrupted_frames (input_topology_filepath : str, input_trajectory_filepath : str) -> list[int]:
+    """Find all corrupted frame numbers with NaN or zero coordinates. Frame numbers will be in order."""
+    corrupted_frames = []
+    # Iterload the trajectory to pytraj
+    trajectory = get_pytraj_trajectory(input_topology_filepath, input_trajectory_filepath)
+    # Iterate frames until we find one frame whose last atom coordinates are all zeros
+    frame_iterator = iter(trajectory.iterframe())
+    expected_frames = trajectory.n_frames
+    if expected_frames == 0:
+        raise InputError('Something is wrong when the trajectory, no frames were found')
+    for f, frame in enumerate(frame_iterator, 1):
+        print(f' Reading frame {f}/{expected_frames}', end='\r')
+        atom_coordinates = frame.xyz
+        # Make sure there are actual coordinates here
+        # If there is any problem we may have frames with coordinates full of "wrong" values
+        # First check for missing values, which may be created by cpptraj
+        if np.isin(NETCDF_MISSING_VALUE, atom_coordinates):
+            corrupted_frames.append(f)
+        # Make sure there are no literal NaNs
+        if np.isnan(frame.xyz).any():
+            corrupted_frames.append(f)
+        # Make sure there are no "falsy" values like zeros or nulls
+        if not atom_coordinates.all():
+            corrupted_frames.append(f)
+    return corrupted_frames
+
+
+def get_average_structure (structure_file : 'File', trajectory_file : 'File', output_file : 'File'):
+    """Get an average structure from a trajectory.
+    This process is carried by pytraj, since the Gromacs average may be displaced.
+    """
+    # Iterload the trajectory to pytraj
+    pytraj_trajectory = get_pytraj_trajectory(structure_file.path, trajectory_file.path)
+
+    # Create a new frame with the average positions
+    # WARNING: Do not pass the argument 'autoimage=True'
+    # WARNING: Autoimage makes some trajectories get displaced the same as in Gromacs
+    average_frame = pyt.mean_structure(pytraj_trajectory())
+
+    # In order to export it, first create an empty trajectory only with the topology
+    # Then add the average frame and write it to 'xtc' format
+    average = pyt.Trajectory(top=pytraj_trajectory.top)
+    average.append(average_frame)
+    pyt.write_traj(output_file.path, average, overwrite=True)

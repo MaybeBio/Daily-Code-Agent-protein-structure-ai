@@ -1,0 +1,5 @@
+
+[container]
+docker_image = "ghcr.io/chiral-data/boltz:2025_09_05"
+
+[scripts]

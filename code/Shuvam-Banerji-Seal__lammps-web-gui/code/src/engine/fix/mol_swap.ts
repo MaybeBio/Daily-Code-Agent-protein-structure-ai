@@ -1,0 +1,291 @@
+import { Fix } from './fix';
+import { StyleError } from '../force/types';
+import { hasCharge, isMolecularStyle } from '../atoms';
+import type { System } from '../system';
+import { RanPark } from '../rng';
+import { takeFixRecord } from './restartRecord';
+import { inumeric, logical, numeric } from '../force/util';
+import { typeWord } from '../labelmap';
+import { libm } from '../libm';
+
+/*
+ * fix ID group-ID mol/swap N X itype jtype seed T keyword value ...
+ * — docs.lammps.org/fix_mol_swap.html (plans/lammps-docs/fix_mol_swap.rst).
+ * "This fix performs Monte Carlo swaps of two specified atom types within a
+ * randomly selected molecule." Every N steps X swaps are attempted: "For each
+ * attempt a single molecule ID is randomly selected." "The range of possible
+ * molecule IDs from loID to hiID is pre-computed before each run begins. The
+ * loID/hiID is set for the molecule with the smallest/largest ID which has any
+ * itype or jtype atoms in it." "Also note that if atoms with molecule ID = 0
+ * exist, they are not considered molecules by this fix". "Candidate atoms for
+ * swapping must also be in the fix group. Atoms within the selected molecule
+ * which are not itype or jtype are ignored." Every itype atom of the molecule
+ * becomes jtype and every jtype atom becomes itype.
+ *
+ * "The potential energy of the entire system is computed before and after each
+ * swap is performed within a single molecule. The specified temperature T is
+ * used in the Metropolis criterion to accept or reject the attempted swap. If
+ * the swap is rejected all swapped values are reversed." "When an atom is
+ * swapped from itype to jtype (or vice versa), if charges are defined, the
+ * charge values for itype versus jtype atoms are also swapped." "If the *ke*
+ * keyword is set to yes, which is the default, and the masses of itype and
+ * jtype atoms are different, then when a swap occurs, the velocity of the
+ * swapped atom is rescaled by the sqrt of the mass ratio, so as to conserve the
+ * kinetic energy of the atom."
+ *
+ * The fix computes a global vector of length 2 (swap attempts, swap accepts);
+ * the page calls the vector values intensive.
+ *
+ * Random stream (measured with native LAMMPS as a black box, 3 single-atom
+ * molecules 1/2/2 with pair eps 0.1/0.5/1.0 at fixed positions, T = 1, N = 1,
+ * X = 1, seeds 1 2 3 4 12345 482794 987654321 over 200 attempts): the fix uses
+ * RanPark seeded with the seed and advanced by NO discarded draws (fix pour
+ * discards 30, this fix discards none). Each attempt draws exactly two
+ * uniforms: first the molecule ID as loID + floor(u (hiID - loID + 1)), then,
+ * after the before/after energy evaluation, the Metropolis uniform — the
+ * acceptance draw is made even when the energy decreases (native draws two
+ * uniforms per attempt unconditionally; with the always-draw rule all 7
+ * seeds reproduce native's accept sequence exactly, a short-circuit rule does
+ * not). A selected molecule that holds no itype or jtype atoms is still an
+ * attempt that counts as an accept (its dE is 0), consuming both draws
+ * (measured: a 4-molecule system with one empty molecule matched only when the
+ * empty selection incremented attempts and accepts).
+ *
+ * Schedule (measured): the first attempt is on the first step of the first run
+ * that follows the fix definition (step + 1), then every N steps, and the
+ * counter continues across runs (measured with reset_timestep 100: attempts at
+ * 101, 104, 107 for N = 3; and with run 4 then run 6: attempts at 1, 4, 7, 10).
+ *
+ * ke yes rescaling (measured with masses 1 and 4 in one molecule, T huge so the
+ * swap always accepts): an atom 1 -> 2 with v = 1 becomes v = 0.5, an atom
+ * 2 -> 1 with v = -1 becomes v = -2, i.e. v_new = v_old sqrt(m_old / m_new);
+ * with ke no the velocities are unchanged. Charge swap (measured with
+ * atom_style full, q = +1 / -1): the charge follows the type. When the charges
+ * of all itype (or all jtype) atoms are not equal, native warns (Cannot swap
+ * charges in fix mol/swap) and leaves the charges unchanged (measured).
+ *
+ * Unsupported: every keyword except ke, itype == jtype, and T <= 0 are
+ * StyleErrors (native rejects them as an illegal fix mol/swap command).
+ *
+ * As native LAMMPS does (src/MC/fix_mol_swap.cpp at b332f28): the molecule range and the swapped charges come from
+ * the fix group's atoms in molecules (init); the event runs at the exchange stage of its step (pre_exchange, after
+ * the step's integration and before its forces); energy_full (pre_force, the forces, post_force, compute pe) runs once
+ * at the event start and once per attempt, an accepted swap keeping its energy; the velocity factors are those of the
+ * per-type masses (sqrt(m_i / m_j) and its inverse, ke off for equal masses), and a rejected swap is undone by swapping
+ * back with the inverse factors.
+ */
+
+/** The state fix mol/swap keeps in a restart file (fix_mol_swap.cpp write_restart). */
+export interface MolSwapRestart { seed: number; nextStep: number; attempts: number; accepts: number; step: number }
+
+export class FixMolSwap extends Fix {
+  readonly style = 'mol/swap';
+  private readonly N: number;
+  private readonly X: number;
+  private readonly itype: number;
+  private readonly jtype: number;
+  private readonly T: number;
+  private readonly ke: boolean;
+  private readonly rng: RanPark;
+  private loMol = 1;
+  private hiMol = 0;
+  /** Charges of itype and jtype when every such atom shares one value, else null. */
+  private qSwap: [number, number] | null = null;
+  /** Velocity factors of a swap i -> j and j -> i (fix_mol_swap.cpp i2j_vscale, j2i_vscale); null: ke off. */
+  private vscale: [number, number] | null = null;
+  /** Energy of the current state (energy_stored), set at the event start and by each accepted swap. */
+  private energyStored = 0;
+  private nextStep: number;
+  private attempts = 0;
+  private accepts = 0;
+
+  constructor(sys: System, id: string, group: string, args: string[]) {
+    super(sys, id, group, args);
+    const s = sys.state;
+    // As native LAMMPS does (src/MC/fix_mol_swap.cpp FixMolSwap::FixMolSwap at b332f28): the six values are read, then the
+    // optional keywords (ke takes a logical value), then the values are checked; each check but the type range fails as
+    // "Illegal fix mol/swap command".
+    const illegal = 'Illegal fix mol/swap command';
+    if (args.length < 6) throw new StyleError(illegal);
+    this.N = inumeric(args[0]);
+    this.X = inumeric(args[1]);
+    this.itype = inumeric(typeWord(sys.labels, 'atom', args[2]));
+    this.jtype = inumeric(typeWord(sys.labels, 'atom', args[3]));
+    const seed = inumeric(args[4]);
+    this.T = numeric(args[5]);
+    let ke = true;
+    for (let i = 6; i < args.length; i += 2) {
+      if (args[i] !== 'ke' || i + 2 > args.length) throw new StyleError(illegal);
+      ke = logical(args[i + 1]);
+    }
+    if (this.N <= 0 || this.X < 0 || this.itype === this.jtype) throw new StyleError(illegal);
+    if (this.itype <= 0 || this.itype > s.ntypes || this.jtype <= 0 || this.jtype > s.ntypes) {
+      throw new StyleError('Fix mol/swap atom types are invalid');
+    }
+    if (seed <= 0 || !(this.T > 0)) throw new StyleError(illegal);
+    if (ke && s.rmass) throw new StyleError('Cannot conserve kinetic energy with fix mol/swap unless per-type masses');
+    if (!isMolecularStyle(s.atomStyle)) {
+      throw new StyleError(`fix mol/swap: atom_style ${s.atomStyle} has no molecule IDs`);
+    }
+    if (seed >= 2147483647) throw new StyleError(`fix mol/swap: seed must be a positive integer below 2^31-1, got '${args[4]}'`);
+    this.rng = new RanPark(seed);
+    this.ke = ke;
+    this.vectorFlag = true;
+    this.sizeVector = 2;
+    this.extvector = 0;
+    this.nextStep = s.step + 1;
+    const saved = takeFixRecord(sys, id, this.style)?.state as MolSwapRestart | undefined;
+    if (saved) this.restoreState(saved);
+  }
+
+  /**
+   * fix_mol_swap.cpp write_restart: the generator, the next step, the attempt and accept counts and the step the file
+   * was written at (restart checks that it is the file's).
+   */
+  restartState(): MolSwapRestart {
+    return { seed: this.rng.state(), nextStep: this.nextStep, attempts: this.attempts, accepts: this.accepts, step: this.sys.state.step };
+  }
+
+  /** FixMolSwap::restart: the generator, the next step and the counts; the step must be the file's. */
+  private restoreState(r: MolSwapRestart): void {
+    if (r.step !== this.sys.state.step) throw new StyleError(`fix ${this.id}: must not reset timestep when restarting fix mol/swap`);
+    this.rng.reset(r.seed);
+    this.nextStep = r.nextStep;
+    this.attempts = r.attempts;
+    this.accepts = r.accepts;
+  }
+
+  init(): void {
+    const s = this.sys.state;
+    // loID/hiID over the molecule IDs that contain any itype or jtype atom of the fix group; molecule 0 is not a
+    // molecule
+    let lo = Number.POSITIVE_INFINITY;
+    let hi = 0;
+    for (let i = 0; i < s.n; i++) {
+      if (!(s.mask[i] & this.groupBit)) continue;
+      if (s.type[i] !== this.itype && s.type[i] !== this.jtype) continue;
+      const m = s.molecule[i];
+      if (m <= 0) continue;
+      if (m < lo) lo = m;
+      if (m > hi) hi = m;
+    }
+    this.loMol = hi >= 1 ? lo : 1;
+    this.hiMol = hi;
+    // ke yes: the factors of the per-type masses, ke off when they are equal (fix_mol_swap.cpp init)
+    const mi = s.massByType[this.itype], mj = s.massByType[this.jtype];
+    this.vscale = this.ke && !s.rmass && mi !== mj ? [Math.sqrt(mi / mj), Math.sqrt(mj / mi)] : null;
+    this.chargeValues();
+  }
+
+  /**
+   * fix_mol_swap.html: the charge of itype versus jtype atoms is swapped, which
+   * "requires that all itype atoms in the system have the same charge value.
+   * Likewise all jtype atoms in the system must have the same charge value. If
+   * this is not the case, LAMMPS issues a warning that it cannot swap charge
+   * values."
+   */
+  private chargeValues(): void {
+    const s = this.sys.state;
+    if (!hasCharge(s)) { this.qSwap = null; return; }
+    // fix_mol_swap.cpp init: the charge of the last itype (jtype) atom of the group in a molecule (-BIG without one),
+    // then every such atom must have it
+    const BIG = 1.0e20;
+    const q = [-BIG, -BIG];
+    const counted = (i: number) => s.molecule[i] !== 0 && (s.mask[i] & this.groupBit) !== 0;
+    for (let i = 0; i < s.n; i++) {
+      if (!counted(i)) continue;
+      if (s.type[i] === this.itype) q[0] = s.q[i];
+      if (s.type[i] === this.jtype) q[1] = s.q[i];
+    }
+    let bad = false;
+    for (let i = 0; i < s.n; i++) {
+      if (!counted(i)) continue;
+      if ((s.type[i] === this.itype && s.q[i] !== q[0]) || (s.type[i] === this.jtype && s.q[i] !== q[1])) bad = true;
+    }
+    if (bad) {
+      this.sys.warn('Cannot swap charges in fix mol/swap');
+      this.qSwap = null;
+    } else {
+      this.qSwap = [q[0], q[1]];
+    }
+  }
+
+  /**
+   * The scheduled step is a reneighbor step (fix_mol_swap.cpp: force_reneighbor, next_reneighbor), so the run loop
+   * calls preExchange and rebuilds the lists, with the swapped types, before the step's forces.
+   */
+  reneighborDue(step: number): boolean {
+    return step === this.nextStep;
+  }
+
+  /** The event of the scheduled step (fix_mol_swap.cpp pre_exchange): after the step's integration, before its forces. */
+  preExchange(): void {
+    const s = this.sys.state;
+    if (s.step !== this.nextStep) return;
+    this.sys.bump();
+    this.energyStored = this.potentialEnergy();
+    for (let x = 0; x < this.X; x++) this.attempt();
+    this.nextStep += this.N;
+  }
+
+  /** One MC swap attempt (fix_mol_swap.cpp attempt_swap): pick a molecule, swap its itype/jtype atoms, Metropolis test. */
+  private attempt(): void {
+    const s = this.sys.state;
+    this.attempts++;
+    const energyBefore = this.energyStored;
+    const span = this.hiMol - this.loMol + 1;
+    let mol = this.loMol + Math.floor(this.rng.uniform() * span);
+    if (mol > this.hiMol) mol = this.hiMol;
+    this.swapMolecule(mol);
+    this.sys.bump();
+    const energyAfter = this.potentialEnergy();
+    if (this.rng.uniform() < libm.exp((energyBefore - energyAfter) / (s.units.boltz * this.T))) {
+      this.accepts++;
+      this.energyStored = energyAfter;
+      return;
+    }
+    // rejected: swap the same atoms back, with the inverse velocity factors
+    this.swapMolecule(mol);
+    this.sys.bump();
+  }
+
+  /** Swaps every itype and jtype atom of the group in molecule mol (type, charge, and the ke yes velocity factor). */
+  private swapMolecule(mol: number): void {
+    const s = this.sys.state;
+    for (let i = 0; i < s.n; i++) {
+      if (s.molecule[i] !== mol || (s.mask[i] & this.groupBit) === 0) continue;
+      if (s.type[i] === this.itype) this.setType(i, this.jtype);
+      else if (s.type[i] === this.jtype) this.setType(i, this.itype);
+    }
+  }
+
+  /** Changes one atom's type, its charge and (ke yes) its velocity, conserving kinetic energy. */
+  private setType(i: number, newType: number): void {
+    const s = this.sys.state;
+    s.type[i] = newType;
+    if (this.qSwap) s.q[i] = newType === this.itype ? this.qSwap[0] : this.qSwap[1];
+    if (this.vscale) {
+      // i2j_vscale for an itype atom becoming jtype, j2i_vscale for the reverse (per-atom masses do not change with
+      // the type, so they keep the velocity)
+      const f = newType === this.jtype ? this.vscale[0] : this.vscale[1];
+      s.v[3 * i] *= f; s.v[3 * i + 1] *= f; s.v[3 * i + 2] *= f;
+    }
+  }
+
+  /**
+   * energy_full (fix_mol_swap.cpp): modify->pre_force, the forces, modify->post_force (a dynamic group's
+   * post_force_group fix first, then every post_force fix), and compute pe with the fix_modify energy contributions.
+   */
+  private potentialEnergy(): number {
+    const sys = this.sys;
+    for (const f of sys.fixes) f.preForce?.();
+    const a = sys.forces();
+    sys.assignDynamicGroups(false);
+    for (const f of sys.fixes) f.postForce?.();
+    return a.evdwl + a.ecoul + a.elong + a.ebond + a.eangle + a.edihed + a.eimp + sys.fixEnergy();
+  }
+
+  computeVector(i: number): number {
+    return i === 0 ? this.attempts : this.accepts;
+  }
+}

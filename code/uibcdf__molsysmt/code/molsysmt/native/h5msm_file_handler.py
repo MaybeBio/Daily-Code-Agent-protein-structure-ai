@@ -1,0 +1,575 @@
+from datetime import datetime
+
+import h5py
+import numpy as np
+
+from molsysmt import pyunitwizard as puw
+from molsysmt._private.smonitor import FormatError, LegacyH5MSMWarning, warn
+
+h5msm_version = "0.4"
+supported_h5msm_versions = frozenset({"0.3", "0.4"})
+
+
+class H5MSMFileHandler:
+    """Lightweight handler for reading and writing h5msm files."""
+
+    def __repr__(self):
+        """Summarizing stored metadata without reading or rendering payloads."""
+        from ._repr import summary
+
+        file = getattr(self, "file", None)
+        return summary(
+            self,
+            format_version=getattr(self, "format_version", None),
+            is_open=bool(file),
+        )
+
+    def __init__(
+        self,
+        filename,
+        io_mode="r",
+        creator="MolSysMT",
+        compression="gzip",
+        compression_opts=4,
+        int_precision="single",
+        float_precision="single",
+        length_unit=None,
+        time_unit=None,
+        energy_unit=None,
+        temperature_unit=None,
+        charge_unit=None,
+        mass_unit=None,
+        format_version=None,
+        closed=False,
+        skip_digestion=False,
+    ):
+        """Open or create an h5msm file with the desired storage options."""
+
+        self.file = None
+        self.format_version = None
+
+        if io_mode == "w":
+            self.file = _new_msmfile(
+                filename,
+                creator=creator,
+                compression=compression,
+                compression_opts=compression_opts,
+                int_precision=int_precision,
+                float_precision=float_precision,
+                length_unit=length_unit,
+                time_unit=time_unit,
+                energy_unit=energy_unit,
+                temperature_unit=temperature_unit,
+                charge_unit=charge_unit,
+                mass_unit=mass_unit,
+                format_version=format_version,
+            )
+
+        elif io_mode == "r":
+            self.file = h5py.File(filename, "r")
+
+        else:
+            raise NotImplementedError
+
+        raw_version = self.file.attrs.get("version")
+        if isinstance(raw_version, bytes):
+            raw_version = raw_version.decode()
+        self.format_version = None if raw_version is None else str(raw_version)
+        if self.format_version not in supported_h5msm_versions:
+            self.file.close()
+            from molsysmt._private.h5msm import modular_handler_reason
+            from molsysmt._private.h5msm_storage.versions import MODULAR_VERSIONS
+
+            raise FormatError(
+                reason=(
+                    modular_handler_reason(self.format_version)
+                    if self.format_version in MODULAR_VERSIONS
+                    else (
+                        f"Unsupported H5MSM version {self.format_version!r}; "
+                        f"expected one of {sorted(supported_h5msm_versions)}."
+                    )
+                ),
+                caller="molsysmt.native.H5MSMFileHandler",
+            )
+
+        if io_mode == "r":
+            from molsysmt._private.h5msm_units import validate_legacy_structural_units
+
+            try:
+                validate_legacy_structural_units(self.file)
+            except Exception:
+                self.file.close()
+                raise
+            warn(LegacyH5MSMWarning(version=self.format_version))
+
+        if closed:
+            self.file.close()
+
+    def write_topology(self, topology, selection="all", syntax="MolSysMT"):
+        """Writing stable inventory and explicitly supplied chemistry to H5MSM 0.4.
+
+        A pure Topology supplies only stable inventory. Molecular-system forms
+        supplying bonds retain an independent ChemicalStates collection; no
+        chemical assignments are inferred from a pure native inventory.
+
+        Parameters
+        ----------
+        topology : molecular system
+            Source supplying stable inventory and, optionally, chemical states.
+            Conversion of a richer form requests no structural series.
+        selection : str, list, tuple or numpy.ndarray, default='all'
+            Atom selection applied consistently to inventory and stored chemistry.
+        syntax : str, default='MolSysMT'
+            Selection syntax used to evaluate selection.
+
+        Returns
+        -------
+        None
+            The supplied domains are written into this open legacy file.
+
+        Notes
+        -----
+        Pure Topology writes only its inventory. It cannot supply the chemical
+        collection required by the complete H5MSM 0.4 MolSys reader. The public
+        conversion route writes optional domains using modular H5MSM 1.0 by
+        default. This handler retains its legacy format contract.
+        """
+
+        from molsysmt._private.variables import is_all
+        from molsysmt.basic import convert, select
+        from molsysmt.form.molsysmt_Topology.to_file_h5msm import dump_topology_to_h5msm
+        from molsysmt.native import Topology
+
+        if is_all(selection):
+            atom_indices = "all"
+        else:
+            atom_indices = select(topology, selection=selection, syntax=syntax)
+
+        if isinstance(topology, Topology):
+            dump_topology_to_h5msm(topology, file=self.file, atom_indices=atom_indices)
+            return
+        source = convert(
+            topology,
+            to_form="molsysmt.MolSys",
+            selection=atom_indices,
+            structure_indices=[],
+        )
+        if source.topology is None:
+            raise ValueError("Writing topology requires an explicit stable inventory.")
+        dump_topology_to_h5msm(source.topology, file=self.file)
+        if source.chemical_states is not None:
+            from molsysmt.form._h5msm_chemical_states import write_chemical_states
+
+            dataset = self.file["topology"]["atoms"]["atom_id"]
+            options = {"compression": dataset.compression}
+            if dataset.compression == "gzip":
+                options["compression_opts"] = dataset.compression_opts
+            write_chemical_states(
+                source.chemical_states, self.file["topology"], options
+            )
+
+    def close(self):
+        """Close the underlying HDF5 handle."""
+
+        self.file.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+def _new_msmfile(
+    filename,
+    creator="MolSysMT",
+    compression="gzip",
+    compression_opts=4,
+    int_precision="single",
+    float_precision="single",
+    length_unit=None,
+    time_unit=None,
+    energy_unit=None,
+    temperature_unit=None,
+    charge_unit=None,
+    mass_unit=None,
+    format_version=None,
+):
+    """Create a new h5msm file on disk and initialize datasets."""
+
+    if format_version is None:
+        format_version = h5msm_version
+    if format_version not in supported_h5msm_versions:
+        raise FormatError(
+            reason=f"Cannot create unsupported H5MSM version {format_version!r}.",
+            caller="molsysmt.native.H5MSMFileHandler",
+        )
+
+    if compression == "lzf":
+        compression_opts = None
+
+    if int_precision == "single":
+        int_type = np.int32
+    elif int_precision == "double":
+        int_type = np.int64
+
+    if float_precision == "single":
+        float_type = np.float32
+    elif float_precision == "double":
+        float_type = np.float64
+
+    file = h5py.File(filename, "w")
+
+    file.attrs["version"] = format_version
+    file.attrs["type"] = "h5msm"
+    file.attrs["creator"] = creator
+    file.attrs["int_precision"] = int_precision
+    file.attrs["float_precision"] = float_precision
+    file.attrs["creation_time"] = datetime.now().isoformat()
+    file.attrs["modification_time"] = datetime.now().isoformat()
+
+    if length_unit is None:
+        file.attrs["length_unit"] = puw.get_standard_units(
+            dimensionality={"[L]": 1}, form="string"
+        )
+    else:
+        file.attrs["length_unit"] = puw.get_unit(length_unit, to_form="string")
+
+    if time_unit is None:
+        file.attrs["time_unit"] = puw.get_standard_units(
+            dimensionality={"[T]": 1}, form="string"
+        )
+    else:
+        file.attrs["time_unit"] = puw.get_unit(time_unit, to_form="string")
+
+    if energy_unit is None:
+        file.attrs["energy_unit"] = puw.get_standard_units(
+            dimensionality={"[L]": 2, "[M]": 1, "[T]": -2, "[mol]": -1}, form="string"
+        )
+    else:
+        file.attrs["energy_unit"] = puw.get_unit(energy_unit, to_form="string")
+
+    if temperature_unit is None:
+        file.attrs["temperature_unit"] = puw.get_standard_units(
+            dimensionality={"[K]": 1}, form="string"
+        )
+    else:
+        file.attrs["temperature_unit"] = puw.get_unit(
+            temperature_unit, to_form="string"
+        )
+
+    if charge_unit is None:
+        file.attrs["charge_unit"] = puw.get_standard_units(
+            dimensionality={"[A]": 1, "[T]": 1}, form="string"
+        )
+    else:
+        file.attrs["charge_unit"] = puw.get_unit(charge_unit, to_form="string")
+
+    if mass_unit is None:
+        file.attrs["mass_unit"] = puw.get_standard_units(
+            dimensionality={"[M]": 1}, form="string"
+        )
+    else:
+        file.attrs["mass_unit"] = puw.get_unit(mass_unit, to_form="string")
+
+    global_dataset_options = {"compression": compression}
+    global_dataset_options["compression_opts"] = compression_opts
+
+    # Topology
+
+    topology = file.create_group("topology")
+    topology.attrs["n_atoms"] = 0
+    topology.attrs["n_groups"] = 0
+    topology.attrs["n_components"] = 0
+    topology.attrs["n_molecules"] = 0
+    topology.attrs["n_entities"] = 0
+    topology.attrs["n_chains"] = 0
+    topology.attrs["n_bonds"] = 0
+
+    ## Atoms
+
+    atoms = topology.create_group("atoms")
+
+    atoms.create_dataset(
+        "atom_id",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    atoms.create_dataset(
+        "atom_name",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    atoms.create_dataset(
+        "atom_type",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    if format_version == "0.4":
+        atoms.create_dataset(
+            "isotope", (0,), dtype=np.uint16, maxshape=(None,), **global_dataset_options
+        )
+    atoms.create_dataset(
+        "group_index", (0,), dtype=int_type, maxshape=(None,), **global_dataset_options
+    )
+    atoms.create_dataset(
+        "chain_index", (0,), dtype=int_type, maxshape=(None,), **global_dataset_options
+    )
+    atoms.create_dataset(
+        "component_index",
+        (0,),
+        dtype=int_type,
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+
+    ## Groups
+
+    groups = topology.create_group("groups")
+
+    groups.create_dataset(
+        "group_id",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    groups.create_dataset(
+        "group_name",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    groups.create_dataset(
+        "group_type",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    groups.create_dataset(
+        "molecule_index",
+        (0,),
+        dtype=int_type,
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+
+    ## Molecules
+
+    molecules = topology.create_group("molecules")
+
+    molecules.create_dataset(
+        "molecule_id",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    molecules.create_dataset(
+        "molecule_name",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    molecules.create_dataset(
+        "molecule_type",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    molecules.create_dataset(
+        "entity_index", (0,), dtype=int_type, maxshape=(None,), **global_dataset_options
+    )
+
+    ## Entities
+
+    entities = topology.create_group("entities")
+
+    entities.create_dataset(
+        "entity_id",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    entities.create_dataset(
+        "entity_name",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    entities.create_dataset(
+        "entity_type",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+
+    ## Components
+
+    components = topology.create_group("components")
+
+    components.create_dataset(
+        "component_id",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    components.create_dataset(
+        "component_name",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    components.create_dataset(
+        "component_type",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+
+    ## Chains
+
+    chains = topology.create_group("chains")
+
+    chains.create_dataset(
+        "chain_id",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    chains.create_dataset(
+        "chain_name",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    chains.create_dataset(
+        "chain_type",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+
+    ## Bonds
+
+    bonds = topology.create_group("bonds")
+
+    bonds.create_dataset(
+        "atom1_index", (0,), dtype=int_type, maxshape=(None,), **global_dataset_options
+    )
+    bonds.create_dataset(
+        "atom2_index", (0,), dtype=int_type, maxshape=(None,), **global_dataset_options
+    )
+    bonds.create_dataset(
+        "order",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    bonds.create_dataset(
+        "type",
+        (0,),
+        dtype=h5py.string_dtype(),
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+
+    # Structures
+
+    structures_sd = file.create_group("structures")
+    structures_sd.attrs["n_atoms"] = 0
+    structures_sd.attrs["n_structures"] = 0
+    structures_sd.attrs["n_structures_written"] = 0
+    structures_sd.attrs["constant_time_step"] = False
+    structures_sd.attrs["time_step"] = 0.0
+    structures_sd.attrs["constant_id_step"] = False
+    structures_sd.attrs["id_step"] = 0
+    structures_sd.attrs["constant_box"] = False
+    structures_sd.attrs["pbc"] = "none"  # none, cell, mic, continuous
+    structures_sd.attrs["n_degrees_of_freedom"] = 0
+    structures_sd.attrs["temperature_from_kinetic_energy"] = False
+
+    structures_sd.create_dataset(
+        "id", (0,), dtype=int_type, maxshape=(None,), **global_dataset_options
+    )
+    structures_sd.create_dataset(
+        "time", (0,), dtype=float_type, maxshape=(None,), **global_dataset_options
+    )
+    structures_sd.create_dataset(
+        "box",
+        (0, 3, 3),
+        dtype=float_type,
+        maxshape=(None, 3, 3),
+        **global_dataset_options,
+    )
+    structures_sd.create_dataset(
+        "coordinates",
+        (0, 0, 3),
+        dtype=float_type,
+        maxshape=(None, None, 3),
+        **global_dataset_options,
+    )
+    structures_sd.create_dataset(
+        "velocities",
+        (0, 0, 3),
+        dtype=float_type,
+        maxshape=(None, None, 3),
+        **global_dataset_options,
+    )
+    structures_sd.create_dataset(
+        "b_factor",
+        (0, 0),
+        dtype=float_type,
+        maxshape=(None, None),
+        **global_dataset_options,
+    )
+    structures_sd.create_dataset(
+        "kinetic_energy",
+        (0,),
+        dtype=float_type,
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    structures_sd.create_dataset(
+        "potential_energy",
+        (0,),
+        dtype=float_type,
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    structures_sd.create_dataset(
+        "temperature",
+        (0,),
+        dtype=float_type,
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+    structures_sd.create_dataset(
+        "chemical_state_index",
+        (0,),
+        dtype=int_type,
+        maxshape=(None,),
+        **global_dataset_options,
+    )
+
+    return file

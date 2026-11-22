@@ -1,0 +1,698 @@
+import contextlib
+import copy
+import json
+import logging
+import sys
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Union
+
+import ase.data
+import metatensor.torch as mts
+import torch
+from deepmd.pt.model.model import get_standard_model
+from deepmd.pt.utils.nlist import extend_input_and_build_neighbor_list
+from metatensor.torch import Labels, TensorBlock, TensorMap
+from metatomic.torch import (
+    AtomisticModel,
+    ModelCapabilities,
+    ModelMetadata,
+    ModelOutput,
+    NeighborListOptions,
+    System,
+)
+
+from metatrain.utils.abc import ModelInterface, common_upgrade_checkpoint
+from metatrain.utils.architectures import get_default_hypers
+from metatrain.utils.data import TargetInfo
+from metatrain.utils.data.atom_pair_helpers import check_no_atom_pair_targets
+from metatrain.utils.data.dataset import DatasetInfo
+from metatrain.utils.data.target_info import get_features_info
+from metatrain.utils.dtype import dtype_to_str
+from metatrain.utils.hypers import raise_if_hypers_mismatch
+from metatrain.utils.metadata import merge_metadata
+from metatrain.utils.sum_over_atoms import sum_over_atoms
+
+from . import checkpoints
+from .documentation import ModelHypers
+from .modules.structures import concatenate_structures
+
+
+_PRECISION_INT_TO_DTYPE = {32: torch.float32, 64: torch.float64}
+_INT_TO_DEEPMD_PREC = {32: "float32", 64: "float64"}
+_DEEPMD_PREC_TO_INT = {v: k for k, v in _INT_TO_DEEPMD_PREC.items()}
+
+
+@contextlib.contextmanager
+def _build_on_cpu():
+    """Force deepmd-kit module-level device constants to CPU during model
+    construction, ensuring deterministic (CPU) RNG for weight initialization
+    regardless of CUDA availability."""
+    cpu = torch.device("cpu")
+    saved = {}
+    for name, mod in sys.modules.items():
+        if mod is None or not name.startswith("deepmd.pt"):
+            continue
+        for attr in ("device", "DEVICE"):
+            val = getattr(mod, attr, None)
+            if isinstance(val, torch.device) and val.type == "cuda":
+                saved[(name, attr)] = val
+                setattr(mod, attr, cpu)
+    try:
+        yield
+    finally:
+        for (name, attr), original in saved.items():
+            mod = sys.modules.get(name)
+            if mod is not None:
+                setattr(mod, attr, original)
+
+
+def _register_untracked_tensors(model: torch.nn.Module) -> None:
+    """Register plain tensor attributes as non-persistent buffers.
+
+    deepmd-kit stores some tensors (e.g. type_mask) as plain attributes
+    rather than parameters or buffers.  These are invisible to .to(device)
+    and .to(dtype).  Converting them to non-persistent buffers makes them
+    move correctly without affecting state_dict (checkpoint compatibility)."""
+    for module in model.modules():
+        registered = set()
+        for n, _ in module.named_parameters(recurse=False):
+            registered.add(n)
+        for n, _ in module.named_buffers(recurse=False):
+            registered.add(n)
+        for attr_name in list(vars(module).keys()):
+            val = getattr(module, attr_name)
+            if isinstance(val, torch.Tensor) and attr_name not in registered:
+                delattr(module, attr_name)
+                module.register_buffer(attr_name, val, persistent=False)
+
+
+class DPA3(ModelInterface[ModelHypers]):
+    __checkpoint_version__ = 5
+    __supported_devices__ = ["cuda", "cpu"]
+    __supported_dtypes__ = [torch.float32, torch.float64]
+    __default_metadata__ = ModelMetadata(
+        references={
+            "implementation": [
+                "https://github.com/deepmodeling/deepmd-kit",
+            ],
+            "architecture": [
+                "DPA3: https://arxiv.org/abs/2506.01686",
+            ],
+        }
+    )
+
+    key_labels: Dict[str, Labels]
+    component_labels: Dict[str, List[List[Labels]]]
+    property_labels: Dict[str, List[Labels]]
+
+    def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
+        super().__init__(hypers, dataset_info, self.__default_metadata__)
+        check_no_atom_pair_targets(dataset_info.targets, self.__class__.__name__)
+        self.atomic_types = dataset_info.atomic_types
+
+        # Resolve precision: descriptor.precision is the authority.
+        desc_prec = self.hypers["descriptor"]["precision"]
+        fit_prec = self.hypers["fitting_net"]["precision"]
+        if desc_prec not in _PRECISION_INT_TO_DTYPE:
+            raise ValueError(
+                f"Unsupported descriptor precision: {desc_prec}. "
+                f"Must be one of {list(_PRECISION_INT_TO_DTYPE.keys())}."
+            )
+        if fit_prec not in _PRECISION_INT_TO_DTYPE:
+            raise ValueError(
+                f"Unsupported fitting_net precision: {fit_prec}. "
+                f"Must be one of {list(_PRECISION_INT_TO_DTYPE.keys())}."
+            )
+        self.dtype: torch.dtype = _PRECISION_INT_TO_DTYPE[desc_prec]
+
+        self.targets_keys = list(dataset_info.targets.keys())[0]
+
+        # Pretrained model loading: if dpa3_model is provided, load it
+        # instead of building from scratch with get_standard_model.
+        self.loaded_dpa3 = self.hypers.get("dpa3_model") is not None
+        self._loaded_out_bias: Optional[torch.Tensor] = None
+        self._loaded_out_std: Optional[torch.Tensor] = None
+        if self.loaded_dpa3:
+            dpa3_model = self.hypers["dpa3_model"]
+            if isinstance(dpa3_model, (str, Path)):
+                loaded = torch.load(
+                    str(dpa3_model),
+                    weights_only=False,
+                    map_location=torch.device("cpu"),
+                )
+                state_dict = loaded.get("model") if isinstance(loaded, dict) else None
+                if not isinstance(state_dict, dict) or "_extra_state" not in state_dict:
+                    raise ValueError(
+                        f"'{dpa3_model}' is not a deepmd-kit training checkpoint. "
+                        f"Use the checkpoint distributed by deepmd-kit (for "
+                        f"example 'DPA-3.3-1M.pt') directly without freezing it via "
+                        f"'dp --pt freeze'."
+                    )
+
+                params = state_dict["_extra_state"]["model_params"]
+                if "model_dict" not in params:
+                    # Very rare case: a single-task dpa3 model
+                    cfg, prefix = params, "model.Default."
+                    branch = None
+                else:
+                    # A pretrained dpa3 model is usually a multi-task checkpoint
+                    # with branches
+                    branch = hypers["dpa3_model_branch"]
+                    available = sorted(params["model_dict"])
+                    if branch is None:
+                        raise ValueError(
+                            f"The pretrained DPA3 model has multiple branches. "
+                            f"Please specify the branch to load via the "
+                            f"'dpa3_model_branch' hyperparameter. Available "
+                            f"branches: {', '.join(available)}"
+                        )
+                    elif branch not in params["model_dict"]:
+                        raise ValueError(
+                            f"The specified branch '{branch}' is not available in "
+                            f"the pretrained DPA3 model. "
+                            f"Available branches: {', '.join(available)}"
+                        )
+                    cfg = params["model_dict"][branch]
+                    prefix = f"model.{branch}."
+                with _build_on_cpu():
+                    self.model = get_standard_model(cfg)
+                # Update the atomic types extracted from the dataset with the types
+                # from the pretrained model
+                dataset_info.atomic_types = [
+                    ase.data.atomic_numbers[element] for element in cfg["type_map"]
+                ]
+                self.atomic_types = dataset_info.atomic_types
+                branch_state_dict = {
+                    k[len(prefix) :]: v
+                    for k, v in state_dict.items()
+                    if k.startswith(prefix)
+                }
+                missing, unexpected = self.model.load_state_dict(
+                    branch_state_dict, strict=False
+                )
+                real = [k for k in missing + unexpected if "_extra_state" not in k]
+                if real:
+                    if branch is not None:
+                        raise RuntimeError(
+                            f"state_dict mismatch for branch {branch}: {real[:5]}"
+                        )
+                    else:
+                        raise RuntimeError(f"state_dict mismatch: {real[:5]}")
+            elif isinstance(dpa3_model, torch.nn.Module):
+                self.model = dpa3_model.cpu()
+            elif isinstance(dpa3_model, dict):
+                # An already-extracted deepmd-kit multi-task model
+                with _build_on_cpu():
+                    self.model = get_standard_model(dpa3_model)
+                self.model._metatrain_extracted_scaleshift = True
+            else:
+                raise ValueError(
+                    "The 'dpa3_model' hyper must be a file path or a torch.nn.Module "
+                    "or a dict."
+                )
+
+            self._deepmd_cfg = json.loads(self.model.get_model_def_script())
+            cfg = self._deepmd_cfg
+            self.hypers["descriptor"]["precision"] = _DEEPMD_PREC_TO_INT[
+                cfg["descriptor"]["precision"]
+            ]
+            self.hypers["fitting_net"]["precision"] = _DEEPMD_PREC_TO_INT[
+                cfg["fitting_net"]["precision"]
+            ]
+            self.hypers["descriptor"]["repflow"]["e_rcut"] = cfg["descriptor"][
+                "repflow"
+            ]["e_rcut"]
+            self.dtype = _PRECISION_INT_TO_DTYPE[self.hypers["descriptor"]["precision"]]
+            self.atomic_types = [ase.data.atomic_numbers[s] for s in cfg["type_map"]]
+            dataset_info.atomic_types = self.atomic_types
+
+            _register_untracked_tensors(self.model)
+
+            # Extract output bias and std from the atomic model, then zero
+            # them so metatrain's CompositionModel and Scaler handle them.
+            if not getattr(self.model, "_metatrain_extracted_scaleshift", False):
+                atomic_model = self.model.atomic_model
+                if hasattr(atomic_model, "out_bias"):
+                    self._loaded_out_bias = atomic_model.out_bias.clone()
+                    atomic_model.out_bias.zero_()
+                if hasattr(atomic_model, "out_std"):
+                    self._loaded_out_std = atomic_model.out_std.clone()
+                    atomic_model.out_std.fill_(1.0)
+                self.model._metatrain_extracted_scaleshift = True
+        else:
+            # Build a new model from hypers.  _build_on_cpu() patches
+            # deepmd-kit module-level DEVICE constants so weight init
+            # uses CPU RNG (deterministic across CUDA/CPU environments).
+            type_map = [ase.data.chemical_symbols[z] for z in self.atomic_types]
+            # deepmd-kit expects precision as strings; convert at the boundary.
+            deepmd_hypers: Dict[str, Any] = copy.deepcopy(dict(hypers))
+            # The following two keys are only used in metatrain; deepmd-kit does not
+            # recognize it.
+            deepmd_hypers.pop("dpa3_model", None)
+            deepmd_hypers.pop("dpa3_model_branch", None)
+            deepmd_hypers["type_map"] = type_map
+            deepmd_hypers["descriptor"]["precision"] = _INT_TO_DEEPMD_PREC[desc_prec]
+            deepmd_hypers["fitting_net"]["precision"] = _INT_TO_DEEPMD_PREC[fit_prec]
+            with _build_on_cpu():
+                self.model = get_standard_model(deepmd_hypers)
+            _register_untracked_tensors(self.model)
+
+        self._last_layer_feature_size = int(
+            self.model.atomic_model.fitting_net.neuron[-1]
+        )
+
+        self.outputs: Dict[str, TargetInfo] = {}
+
+        self.num_properties: Dict[str, Dict[str, int]] = {}
+
+        self.register_buffer("key_labels", {})
+        self.register_buffer("component_labels", {})
+        self.register_buffer("property_labels", {})
+        for target_name, target in dataset_info.targets.items():
+            self._add_output(target_name, target)
+
+        self.requested_nl = NeighborListOptions(
+            cutoff=self.hypers["descriptor"]["repflow"]["e_rcut"],
+            full_list=True,
+            strict=True,
+        )
+
+    def _add_output(self, target_name: str, target: TargetInfo) -> None:
+        if not target.is_scalar:
+            raise ValueError("The DPA3 architecture can only predict scalars.")
+        self.num_properties[target_name] = {}
+        self.key_labels[target_name] = target.layout.keys
+        self.component_labels[target_name] = [
+            block.components for block in target.layout.blocks()
+        ]
+        self.property_labels[target_name] = [
+            block.properties for block in target.layout.blocks()
+        ]
+        self.outputs[target_name] = target
+        features_name = self._last_layer_features_name(target_name)
+        self.outputs[features_name] = get_features_info(
+            self._last_layer_feature_size,
+            sample_kind="atom",
+            description=f"last-layer features for {target_name}",
+        )
+
+    @staticmethod
+    def _last_layer_features_name(target_name: str) -> str:
+        return f"mtt::aux::{target_name.replace('mtt::', '')}_last_layer_features"
+
+    def get_rcut(self):
+        return self.model.atomic_model.get_rcut()
+
+    def get_sel(self):
+        return self.model.atomic_model.get_sel()
+
+    def requested_neighbor_lists(self) -> List[NeighborListOptions]:
+        return [self.requested_nl]
+
+    def _prepare_atype(self, species: torch.Tensor) -> torch.Tensor:
+        """Map padded species tensor to deepmd-kit type indices."""
+        max_z = max(max(self.atomic_types), 0) + 1
+        lookup = torch.full(
+            (max_z + 1,), -1, dtype=species.dtype, device=species.device
+        )
+        for idx, z in enumerate(self.atomic_types):
+            lookup[z] = idx
+        valid_mask = species >= 0
+        safe_species = species.clamp(min=0)
+        result = lookup[safe_species]
+        result[~valid_mask] = -1
+        return result
+
+    def _forward_from_batch(
+        self,
+        positions: torch.Tensor,
+        atype: torch.Tensor,
+        box: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Pure-tensor forward pass for compilation preparation.
+
+        Takes pre-processed batch tensors and returns raw per-atom energies
+        as a flat dictionary.
+
+        :param positions: Padded positions [batch, max_atoms, 3].
+        :param atype: Deepmd-kit type indices [batch, max_atoms] (already
+            remapped via ``_prepare_atype``).
+        :param box: Cell tensor [batch, 3, 3] or None for non-periodic.
+        :return: Dict with ``"atom_energy"`` (masked flat tensor of real atom
+            energies) and ``"energy"`` (per-system total energy).
+        """
+        model_ret = self.model.forward_common(
+            positions,
+            atype,
+            box,
+            fparam=None,
+            aparam=None,
+            do_atomic_virial=False,
+        )
+
+        result: Dict[str, torch.Tensor] = {}
+        if self.model.get_fitting_net() is not None:
+            result["atom_energy"] = model_ret["energy"]
+            result["energy"] = model_ret["energy_redu"]
+        else:
+            result["atom_energy"] = model_ret.get("energy", model_ret["updated_coord"])
+            result["energy"] = model_ret.get("energy_redu", torch.zeros(1))
+
+        return result
+
+    @torch.jit.unused
+    def _forward_from_batch_with_grad(
+        self,
+        positions: torch.Tensor,
+        atype: torch.Tensor,
+        box: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Run deepmd-kit with autograd enabled in eager no-grad contexts."""
+        with torch.enable_grad():
+            return self._forward_from_batch(positions, atype, box)
+
+    def _forward_embedding_from_batch(
+        self,
+        positions: torch.Tensor,
+        atype: torch.Tensor,
+        box: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Return DPA3 fitting features without changing the model mode.
+
+        Deepmd-kit's public ``model.forward_embedding`` API is restricted to
+        evaluation mode, while metatrain models must also provide last-layer
+        features when ``forward`` is called in training mode. Prepare the
+        deepmd-kit inputs here and call the atomic-model embedding API directly
+        to avoid changing the model mode inside ``forward``.
+        """
+        coord, cast_box, fparam, aparam, _ = self.model._input_type_cast(
+            positions,
+            box=box,
+            fparam=None,
+            aparam=None,
+        )
+        (
+            extended_coord,
+            extended_atype,
+            mapping,
+            nlist,
+        ) = extend_input_and_build_neighbor_list(
+            coord,
+            atype,
+            self.model.get_rcut(),
+            self.model.get_sel(),
+            mixed_types=True,
+            box=cast_box,
+        )
+        extended_coord = extended_coord.view(extended_atype.shape[0], -1, 3)
+        nlist = self.model.format_nlist(
+            extended_coord,
+            extended_atype,
+            nlist,
+        )
+        return self.model.atomic_model.forward_embedding(
+            extended_coord,
+            extended_atype,
+            nlist,
+            mapping=mapping,
+            fparam=fparam,
+            aparam=aparam,
+        )
+
+    def forward(
+        self,
+        systems: List[System],
+        outputs: Dict[str, ModelOutput],
+        selected_atoms: Optional[Labels] = None,
+    ) -> Dict[str, TensorMap]:
+        if len(outputs) == 0:
+            return {}
+
+        device = systems[0].positions.device
+
+        return_dict: Dict[str, TensorMap] = {}
+
+        (positions, species, cells, atom_index, system_index) = concatenate_structures(
+            systems
+        )
+
+        atype = self._prepare_atype(species)
+
+        if torch.all(cells == 0).item():
+            box = None
+        else:
+            box = cells
+
+        values = torch.stack([system_index, atom_index], dim=0).transpose(0, 1)
+        invariant_coefficients = Labels(
+            names=["system", "atom"], values=values.to(device)
+        )
+
+        # Use species to identify real atoms (>=0) vs padding (-1).
+        # This is robust across platforms, unlike energy-magnitude thresholding
+        # which can incorrectly mask real atoms with near-zero initial energies.
+        mask = species >= 0
+
+        if self.targets_keys in outputs:
+            # deepmd-kit obtains forces and virials through autograd inside its
+            # forward. Eager LLPR covariance collection can run under no-grad, so
+            # gradients need to be re-enabled locally in that case.
+            if torch.jit.is_scripting():
+                raw = self._forward_from_batch(positions, atype, box)
+            else:
+                raw = self._forward_from_batch_with_grad(positions, atype, box)
+
+            batch_size, max_atoms = species.shape
+            atom_energy = raw["atom_energy"].reshape(batch_size, max_atoms)
+            atomic_property = TensorMap(
+                self.key_labels[self.targets_keys],
+                [
+                    TensorBlock(
+                        values=atom_energy[mask].unsqueeze(-1),
+                        samples=invariant_coefficients,
+                        components=self.component_labels[self.targets_keys][0],
+                        properties=self.property_labels[self.targets_keys][0],
+                    )
+                ],
+            )
+
+            if selected_atoms is not None:
+                atomic_property = mts.slice(
+                    atomic_property, axis="samples", selection=selected_atoms
+                )
+
+            if outputs[self.targets_keys].sample_kind == "atom":
+                return_dict[self.targets_keys] = atomic_property
+            else:
+                # sum the atomic property to get the total property
+                return_dict[self.targets_keys] = sum_over_atoms(atomic_property)
+
+        features_name = self._last_layer_features_name(self.targets_keys)
+        if features_name in outputs:
+            # The embedding path does not return energies. When both outputs are
+            # requested, energy and features therefore require separate calls,
+            # which rebuild the neighbor list and descriptor.
+            embedding = self._forward_embedding_from_batch(positions, atype, box)
+            atomic_features = embedding["atomic_feature"][mask]
+            features_layout = self.outputs[features_name].layout
+            features_block = features_layout.block(0)
+            features = TensorMap(
+                features_layout.keys.to(device),
+                [
+                    TensorBlock(
+                        values=atomic_features,
+                        samples=invariant_coefficients,
+                        components=[],
+                        properties=features_block.properties.to(device),
+                    )
+                ],
+            )
+            if selected_atoms is not None:
+                features = mts.slice(features, axis="samples", selection=selected_atoms)
+            if outputs[features_name].sample_kind == "system":
+                features = sum_over_atoms(features)
+            return_dict[features_name] = features
+
+        return return_dict
+
+    def restart(
+        self,
+        dataset_info: DatasetInfo,
+        model_hypers: Optional[Mapping[str, Any]] = None,
+    ) -> "DPA3":
+
+        if model_hypers is not None:
+            default_hypers = get_default_hypers("experimental.dpa3")["model"]
+            raise_if_hypers_mismatch(
+                self.hypers, model_hypers, default_hypers=default_hypers
+            )
+
+        # merge old and new dataset info
+        merged_info = self.dataset_info.union(dataset_info)
+        new_atomic_types = [
+            at for at in merged_info.atomic_types if at not in self.atomic_types
+        ]
+        new_targets = {
+            key: value
+            for key, value in merged_info.targets.items()
+            if key not in self.dataset_info.targets
+        }
+
+        if len(new_atomic_types) > 0:
+            raise ValueError(
+                f"New atomic types found in the dataset: {new_atomic_types}. "
+                "The DPA3 model does not support adding new atomic types."
+            )
+
+        # register new outputs as new last layers
+        for target_name, target in new_targets.items():
+            self._add_output(target_name, target)
+
+        self.dataset_info = merged_info
+
+        return self
+
+    @classmethod
+    def load_checkpoint(
+        cls,
+        checkpoint: Dict[str, Any],
+        context: Literal["restart", "finetune", "export"],
+    ) -> "DPA3":
+        model_data = checkpoint["model_data"]
+
+        if context == "restart":
+            logging.info(f"Using latest model from epoch {checkpoint['epoch']}")
+            model_state_dict = checkpoint["model_state_dict"]
+        elif context in {"finetune", "export"}:
+            logging.info(f"Using best model from epoch {checkpoint['best_epoch']}")
+            model_state_dict = checkpoint["best_model_state_dict"]
+            if model_state_dict is None:
+                model_state_dict = checkpoint["model_state_dict"]
+        else:
+            raise ValueError("Unknown context tag for checkpoint loading!")
+
+        model = cls(
+            hypers=model_data["model_hypers"],
+            dataset_info=model_data["dataset_info"],
+        )
+
+        # Determine dtype from the deepmd-kit model's construction-time
+        # precision (authoritative; .to(dtype) does not update self.prec).
+        dtype = next(model.model.parameters()).dtype
+
+        model.to(dtype).load_state_dict(model_state_dict)
+
+        # Loading the metadata from the checkpoint
+        metadata = checkpoint.get("metadata", None)
+        if metadata is not None:
+            model.__default_metadata__ = metadata
+
+        return model
+
+    def export(self, metadata: Optional[ModelMetadata] = None) -> AtomisticModel:
+        dtype = next(self.parameters()).dtype
+        if dtype not in self.__supported_dtypes__:
+            raise ValueError(f"unsupported dtype {dtype} for DPA3")
+
+        # Make sure the model is all in the same dtype
+        self.to(dtype)
+
+        capabilities = ModelCapabilities(
+            outputs={
+                name: info.to_model_output(sample_kind="atom")
+                for name, info in self.outputs.items()
+            },
+            atomic_types=self.atomic_types,
+            interaction_range=self.hypers["descriptor"]["repflow"]["e_rcut"],
+            length_unit=self.dataset_info.length_unit,
+            supported_devices=self.__supported_devices__,
+            dtype=dtype_to_str(dtype),
+        )
+        if metadata is None:
+            metadata = self.__default_metadata__
+        else:
+            metadata = merge_metadata(self.__default_metadata__, metadata)
+
+        return AtomisticModel(self.eval(), metadata, capabilities)
+
+    @classmethod
+    def upgrade_checkpoint(
+        cls, checkpoint: dict[str, Any], version: Optional[int] = None
+    ) -> dict[str, Any]:
+        return common_upgrade_checkpoint(
+            checkpoint, version, cls.__checkpoint_version__, "model", checkpoints
+        )
+
+    def get_checkpoint(
+        self, best_model_state_dict: Optional[dict[str, Any]] = None
+    ) -> Dict:
+        model_state_dict = self.state_dict()
+        hypers = dict(self.hypers)
+
+        # deepmd-kit modules contain locally-defined classes (e.g.
+        # make_embedding_network.<locals>.EN) that cannot be pickled.
+        # Never store a Module in hypers; state_dict captures all weights.
+        if hasattr(self, "_deepmd_cfg"):
+            hypers["dpa3_model"] = self._deepmd_cfg
+        else:
+            hypers.pop("dpa3_model", None)
+
+        checkpoint = {
+            "architecture_name": "experimental.dpa3",
+            "model_ckpt_version": self.__checkpoint_version__,
+            "metadata": self.metadata,
+            "model_data": {
+                "model_hypers": hypers,
+                "dataset_info": self.dataset_info,
+            },
+            "epoch": None,
+            "best_epoch": None,
+            "model_state_dict": model_state_dict,
+            "best_model_state_dict": best_model_state_dict or model_state_dict,
+        }
+        return checkpoint
+
+    def supported_outputs(self) -> Dict[str, TargetInfo]:
+        return self.outputs
+
+    def get_fixed_composition_weights(self) -> dict[str, dict[int, float]]:
+        """Return per-type energy biases extracted from a loaded model.
+
+        These are passed to ``CompositionModel.train_model`` as
+        ``fixed_weights`` so the pretrained biases are preserved rather than
+        refitted from data.
+        """
+        if self._loaded_out_bias is None:
+            return {}
+        # out_bias shape: [n_out, ntypes, max_out_size].  For energy
+        # prediction the first output and first property are used.
+        bias = self._loaded_out_bias[0, :, 0]  # [ntypes]
+        return {
+            self.targets_keys: {
+                z: bias[i].item() for i, z in enumerate(self.atomic_types)
+            }
+        }
+
+    def get_fixed_scaling_weights(
+        self,
+    ) -> dict[str, Union[float, dict[int, float]]]:
+        """Return per-type scaling factors extracted from a loaded model.
+
+        These are passed to ``Scaler.train_model`` as ``fixed_weights``.
+        """
+        if self._loaded_out_std is None:
+            return {}
+        # out_std shape: [n_out, ntypes, max_out_size]
+        std = self._loaded_out_std[0, :, 0]  # [ntypes]
+        # The Scaler only accepts a scalar fixed weight for per-structure
+        # targets such as the energy, so a per-type std cannot be represented.
+        if not torch.all(std == std[0]):
+            raise NotImplementedError(
+                "Loaded DPA3 models with non-uniform per-type 'out_std' are "
+                "not supported. Currently, the std values are all 1.0 in all "
+                "pretrained DPA3 models. This might change in the future if "
+                "new models are trained to predict properties except from "
+                "the energy."
+            )
+        return {self.targets_keys: std[0].item()}

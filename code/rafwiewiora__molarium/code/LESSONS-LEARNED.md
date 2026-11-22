@@ -1,0 +1,269 @@
+# Molarium lessons learned
+
+This file records implementation findings that changed a product or engineering decision. Measurements
+belong here only when their system, runtime, and timing boundary are clear.
+
+## Close each explicitly scoped numerical boundary
+
+The [YTHDF2 Apple WebGPU control](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/trained-target-ythdf2-webgpu/README.md)
+closes a previously pending browser measurement while reusing the original native
+capture, exact inputs, trained weights and earlier CPU result. Its atom-feature
+boundary agrees despite the original complete poses disagreeing strongly.
+That is evidence for this boundary at controlled inputs, not an explanation of
+the pose disagreement. Preserve each stage's remaining limits and measure the
+next boundary rather than promoting a component pass to full-model parity.
+
+The [NVIDIA trunk measurement](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/trained-trunk-nvidia/README.md)
+also shows why scheduler status and scientific status must stay separate. The
+browser completed all 32 arrays, then the numerical checker failed its original
+combined gate. Inspect the completed receipt and raw outputs before retrying a
+`FAILED` job; repeating that calculation would have discarded a real result.
+
+## Preparation, parameter validity and minimized geometry are separate states
+
+An unchanged molecule object does not imply an unchanged atom-index mapping.
+The [SR-13 release-gate failure](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/STALE_POLISH_2026-09-25.md) showed that
+queued interactive polish must be invalidated on graph edits, even when those
+edits already discard numerical parameters. Check cancellation both before
+dispatch and after asynchronous worker completion.
+
+The [SR-10/11/12 follow-up](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/SIMULATION_UI_CACHE_2026-09-10.md) adds
+three related lessons: refresh controls after clearing busy flags; test normal
+reload with warm script caches, not only fresh browsers; and distinguish exact
+saved display-aligned MD frames from arbitrary geometry edits when deciding
+whether minimization can be reused.
+
+An R-group edit must discard stale numerical parameters without discarding the
+fact that the protein was prepared. Re-running crystallographic ligand preparation
+is not a substitute for retyping the edited graph. Likewise, added/locally relaxed
+hydrogens do not imply that the full complex was minimized before MD. The
+[SR-08/09 reproduction](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/SIMULATION_READINESS_2026-09-10.md) demonstrated
+both mistakes in the live workflow. Remember preparation provenance separately,
+key minimization reuse to the actual molecular state and energy protocol, and
+test user sequences (prepare → edit → finish → simulate), not just isolated actions.
+
+## A feasible pose can satisfy a silently weakened question
+
+The [September 6 design-function panel](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/DESIGN_FUNCTION_VALIDATION_2026-09-06.md)
+found that registered CDK2 chlorination yielded 23/64 feasible candidate chains only after an
+unavailable, previously required water contact was automatically omitted. Validate the required
+contact **set across actions**, not merely each final candidate's `feasible` flag.
+
+Atom lineage is not a motion policy: that step deliberately samples an affected attachment torsion,
+releasing five inherited ring atoms while the remaining 19-atom core stays exactly fixed.
+Measure both sets. After receptor relaxation, remeasure contacts from live atom coordinates;
+cached candidate distances and captured receptor points need not describe the visible complex.
+
+The [public Design finding-to-fix ledger](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/DESIGN_FINDINGS_AND_FIXES_2026-09-06.md)
+keeps each original observation linked to its implementation and regression evidence. Correcting
+software does not turn a frozen failed experiment into a historical pass. Required/optional contact
+intent, feature availability, candidate satisfaction, and current geometry are distinct state and
+must stay distinct in both the API and interface.
+
+The subsequent source-stable remediation showed a second layer: CDK2's N7–water contact looked
+missing because graph staging regenerated the unchanged donor H with a new ID. Preserving the
+single H under strict unchanged-chemistry/local-geometry conditions recovered both original
+contacts without omission. Fail-closed behavior prevents a false pass; repairing the identity
+cause restores the legitimate workflow. Changed chemistry and multi-H ambiguity still need an
+explicit correspondence decision, not the same automatic repair.
+
+Help text is part of the scientific contract. Explain what moves and what is enforced at the
+operation's control: constrained ligand propagation, unrestrained pocket minimization, induced-fit
+backbone motion, and discrete rotamer application answer different questions. An **i** button
+should clarify those differences, not replace an explicit warning or fail-closed action guard.
+
+## A cutoff is not automatically faster
+
+The direct WebGPU engine has a correct, OpenMM-compared 1.0 nm nonperiodic cutoff path with a 1.2 nm
+Verlet list. Its first implementation builds that list by checking every atom pair every 20 steps and
+then gathers force data through indirect neighbor-buffer reads.
+
+On Chrome 151 using the Apple M1 Pro Metal WebGPU adapter, warmed OBC2/ACE dynamics with X-H
+constraints and a 2 fs step gave:
+
+| System | Run | No cutoff | 1.0 nm cutoff | Outcome |
+|---|---:|---:|---:|---:|
+| Rosemary Trp-cage, 304 atoms | 5,000 steps | 1,430 steps/s | 772 steps/s | cutoff 46% slower |
+| Rosemary ubiquitin, 1,231 atoms | 1,000 steps | 340 steps/s | 282 steps/s | cutoff 17% slower |
+
+The 1.2 nm list contains about 71% of all directed pairs for compact Trp-cage and 32% for ubiquitin.
+At these sizes, list construction and irregular memory access cost more than the skipped arithmetic.
+A cutoff also changes the Hamiltonian, so its energy is not expected to match a no-cutoff run.
+
+Decision: user-facing calculations use no cutoff and expose no cutoff selector. The existing cutoff
+code remains reachable by validation tests while a spatial neighbor-list implementation is developed.
+
+## Force agreement does not guarantee accurate energy reduction
+
+The September 5 direct-worker suite found an isolated ubiquitin Lennard–Jones energy error
+of 1.45668 kJ/mol despite close force agreement. Replacing serial f32 accumulation with
+per-atom partial sums and a tree reduction reduced the error to 0.000626 kJ/mol without
+changing the force calculation or acceptance tolerance. Keep isolated-term energy tests,
+not only total energies that can cancel. [Raw before/after evidence](https://github.com/rafwiewiora/molarium/blob/HEAD/benchmarks/simulation/README.md#regression-discovered-by-this-suite).
+
+## State exactly which numerical inputs agree
+
+The full 47-case direct-worker suite passes against native Reference on identical f32 inputs
+on M1 Pro and L4, but only 42/47 pass against original double-valued inputs. Translated and
+near-minimum structures expose f32 coordinate limits. Native CUDA double passes the original
+inputs too. Keep original, packed, and quantization comparisons separate, and select the
+native original observation when reporting original-input agreement.
+
+## Validate complete requests and complete outputs
+
+A returned result is not enough: require finite energy and exactly 3N Cartesian forces,
+unique expected case IDs, reviewed protocol bytes, and explicit suite coverage. An empty
+suite, silently ignored force class, or missing frame is not evidence of correctness.
+The [Astra review](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/ASTRA_REVIEW_OF_SOL_WORK_2026-09-05.md) preserves the original
+worker-boundary defects and appends their fixes and negative regression tests.
+
+## Keep oracles and execution boundaries independent
+
+WASM OpenMM checks are useful compatibility diagnostics, not modern GPU performance
+baselines. The direct-worker native oracle builds analytic OpenMM forces independently
+from the numeric System; shared parameter assignment is still not independently validated.
+STORMM-worker/native OpenMM coverage uses its own supported-case and original-input gate.
+Its Å/kcal parameter packing is not the direct worker's f32-nm packing. Frozen-evidence CI verifies
+archived results; it does not dispatch today's GPU kernels. Report fresh correctness runs
+separately, and never equate resident native-Context timing with browser whole-job timing.
+
+## Static scoring must preserve the supplied pose
+
+Constraints on a System are not permission to project a fixed-pose scoring input. STORMM's
+old score-batch initialization applied SHAKE before its first energy read. Read-only evaluation
+now preserves the coordinates and labels constraints as not applied; dynamics still projects
+them. A deliberately unsatisfied analytic constraint checks both the coordinates and forces.
+
+## A local URL does not make an entire checkout safe to serve
+
+Default both server modes to loopback, explicitly declare public files, reject dotfiles and
+foreign Host headers, and check canonical paths for symlink escape. Browser tests use
+OS-allocated server ports and visible startup errors; random port ranges and unread stderr
+can conceal a dead server or point a test at another process.
+
+## Navigation races need traces that do not overwhelm the timing
+
+Wrapping every stream, digest, and database promise made the checkpoint-import hang disappear
+in early probes. Sparse non-pausing stage markers reproduced it at `indexedDB.open`, after
+asset transport and SHA verification had already completed. Connection cleanup alone did not
+recover the case. Deferring database initialization on blank reproduction landing pages,
+alongside lifecycle cleanup and bounded explicit errors, passed ten repeated navigation imports.
+Preserve both failure and recovery traces; do not call a passing instrumented run a root-cause
+diagnosis or silently replace a failed durable save with volatile in-memory state.
+
+## Native prediction comparison needs more than matching model names
+
+OpenBind-0 is not Foldarium's historical OpenFold3 preview-2 checkpoint or the
+older protein-only OpenFold 2 export. Pin the trained checkpoint and runtime
+separately. Equal integer seeds and sampling counts do not match random tensors,
+feature generation, quantization or samplers. Retain within-method seed spread
+alongside cross-engine pose differences, and preserve the predicted receptor
+when aligning a complex. Agreement on arbitrary test pairs is not experimental
+pose accuracy. The [cofolding comparison record](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-method-comparison-2026-11-12/README.md)
+preserves the first native results and the remaining work.
+
+A native mmCIF may omit a ligand's bonds. Recover correspondence from explicit
+named input chemistry and record its source hash; never infer the intended graph
+from possibly distorted predicted distances. A cached ligand conformer also does
+not prove which reference conformer the model actually used.
+
+## Spot recovery must exclude saved scientific work
+
+A node failure can leave a native receipt saying `running` after valid model files
+were already saved. Capture a source-side file/hash inventory after the job stops,
+then validate chemistry and query/seed identities before planning only missing
+poses. An incomplete transfer must trigger retrieval, not recomputation. Preserve
+original query IDs, group remaining seeds, and require unique full-cohort coverage
+when assembling results. An assembled cohort does not relabel an interrupted CLI
+as complete, and an unmeasured total wall time stays unavailable. The
+[six-pose interruption and 42-pose recovery plan](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-method-comparison-2026-11-12/README.md)
+retain the concrete example and coordinate-preservation checks.
+
+## Sanitized chemical identity is not model-feature parity
+
+The [recent PDB reconstruction panel](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-recent-pdb-2026-11-13/README.md)
+exposed two equivalent-SMILES cases whose raw aromatic/bond feature flags differed
+from RDKit even though their sanitized chemical identities agreed. Normalize the
+representation before conformer generation and featurization, preserve the source
+and normalized hashes, and check the raw feature graph independently. A scorer
+must accept equivalent Kekule/aromatic spellings while still rejecting real
+charge or bond-order changes. Never use crystal coordinates to repair a prediction's
+declared chemistry.
+
+The corrected inputs did not establish better pose reconstruction: original
+Boltz gave 1/27 poses within 2 Å; normalized Boltz and OpenBind gave 0/27 each in
+the single-sequence phase. Keep both outcomes. Input validity, native numerical
+agreement, protein-fold quality and ligand placement are separate claims.
+
+
+## Equivalent SMILES still do not fix tensor inputs
+
+The [native/shared-JS feature audit](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/README.md)
+accounts for every atom in two diagnostic systems. It verifies matching alignment,
+elements, formal charges and bond adjacency while revealing different ligand
+parser order, model atom-name encoding and generated reference conformers. An
+isomeric chemical identity certificate does not certify equality of these inputs.
+Preserve actual processed strings and arrays, enumerate chemical-map ambiguity,
+and introduce separate controls before attributing pose disagreement to a kernel.
+Reference conformers are generated inputs, not experimental bound coordinates.
+
+## A stage result needs its own numerical and timing boundary
+
+The [trained atom-feature comparison](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/trained-target/README.md)
+passes at exact generated inputs and trained FP32 weights. It qualifies that
+stage, not the projected trunk, denoising, quantization or pose accuracy. Capture
+the actual stochastic inputs at the next stage instead of assuming equal seed
+integers produce equal random tensors. Preserve intermediate outputs so a
+failure can be localized without changing the tolerance.
+
+CAP-01 also exposed feature receipts whose wall-clock start was created after
+imports while elapsed time included imports. Bind the clocks to one start and
+state the measured scope; retain the old receipts. Synchronized module timings,
+CLI elapsed time and instrumented seam captures answer different questions.
+
+## Requested precision is not executed precision
+
+The [four-cycle trunk audit](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-feature-parity-2026-11-13/trained-trunk-apple/README.md)
+requested FP32 storage, weights and accumulation while an independent pair-kernel
+policy still enabled half arithmetic. Correcting that test configuration reduced
+cycle-0 MSA relative error about 712-fold. Observe generated shader sources and
+record the actual precision policy; a dtype label or full-FP32 weight file cannot
+certify the arithmetic of every operation. Preserve the original measurement
+and its source when correcting the producer. Production folding defaults were
+not changed by this audit fix.
+
+The strict control passed all 32 relative-error gates but only 14 combined gates.
+Absolute failures remain under the predeclared threshold. Distinguish numerical
+scale, representable-value spacing, implementation acceptance and structural
+accuracy; explaining a residual does not turn a failed gate into a historical
+pass. A matched component control also cannot explain the separate Boltz-2
+pose benchmark without further evidence.
+
+## A completed document may still be the wrong page
+
+The same audit recorded `about:blank` with `readyState=complete` before the
+requested fixture page arrived. A readiness predicate must bind the expected
+URL, page identity and actual data endpoint. Keep the observed startup contexts
+with the resulting calculation receipt. The original zero-seam failure and
+exact readiness-only correction remain linked as TRUNK-PAGE-01.
+
+## More samples and a selectable hit answer different questions
+
+The [480-prediction native-positive study](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/cofold-rnp-spectrum-2026-11-15/README.md)
+increased limited-valid any-hit coverage from 25/48 at six samples to 26/48 at
+ten; highest archived ipTM selection stayed at 17/48. Retrospective any-hit
+selection uses the experimental answer, while prospective selection needs a
+declared rule. Preserve rounded confidence ties and every planned denominator.
+Portable review files should carry every original pose, explicit chemistry and
+empty human decisions. A software UI test can verify export and persistence;
+it cannot provide scientific selections or validate binding poses.
+
+
+### Verify the actual custom-domain browser network
+
+The canonical reviewer matched repository HTTP bytes while an actual browser
+observed an additional provider-injected analytics script. CSP blocked that
+script load. After the user disabled automatic Web Analytics, the same
+saved-pose workflow passed its unchanged network guard. Preserve failed and
+passing observations separately, and distinguish attempted loads, blocked
+requests, executed scripts and uploaded data ([DN-01](https://github.com/rafwiewiora/molarium/blob/HEAD/reviews/COFOLD_REVIEW_PRODUCTION_NETWORK_2026-11-17.md)).

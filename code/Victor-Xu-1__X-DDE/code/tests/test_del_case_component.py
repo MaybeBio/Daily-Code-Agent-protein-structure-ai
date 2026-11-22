@@ -1,0 +1,152 @@
+"""Install the immutable full DEL cohort through existing case-data authorities."""
+
+import json
+import os
+import sqlite3
+import zipfile
+from pathlib import Path
+from uuid import uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+
+from opendde_workbench.deployment.catalog import CASE_BUNDLE_IDS, PACKAGES, dependencies
+from opendde_workbench.examples import del_bundle_release as source
+from opendde_workbench.examples.bundle import restore_bundle, verify_examples
+
+
+def test_del_data_component_is_data_only_and_uses_the_single_existing_queue():
+    package = PACKAGES["public-del-examples"]
+    assert package.id in CASE_BUNDLE_IDS
+    assert package.kind == "data" and package.engine == "x-dde" and package.automatic
+    assert package.url == source.URL and package.checksum == source.SHA256
+    assert package.version == source.VERSION == "4"
+    assert source.CAPABILITIES == (
+        "del.library",
+        "del.enumerate",
+        "del.decode",
+        "del.count",
+        "del.analyze",
+        "del.series",
+        "del.model",
+        "del.candidates",
+        "del.followup",
+    )
+    assert dependencies(package.id) == [package.id]
+
+
+def test_published_full_del_data_cold_restore_preserves_records_without_execution(settings):
+    from opendde_workbench.api import create_app
+    from opendde_workbench.store import Store
+
+    filename = os.environ.get("WB_REVIEWED_DEL_ARCHIVE")
+    if not filename:
+        pytest.skip("The exact full-cohort archive is supplied by the scoped delivery gate")
+    archive = Path(filename)
+    assert archive.stat().st_size == source.BYTES
+    with zipfile.ZipFile(archive) as bundle:
+        manifest = json.loads(bundle.read("manifest.json"))
+    assert manifest["profile"] == "del6"
+    assert manifest["source_revision"] == source.SOURCE_REVISION
+    assert manifest["capabilities"] == list(source.CAPABILITIES)
+    app = create_app(settings)
+    store = Store(settings.state_dir / "jobs.sqlite3")
+    private = str(uuid4())
+    with store.connect() as db:
+        db.execute(
+            "INSERT INTO projects VALUES(?,?,?,?)",
+            (private, "Personal research", "Retain", "today"),
+        )
+    restore_bundle(archive, settings, source.SHA256)
+    assert verify_examples(settings, source.CAPABILITIES, profile="del6") == {
+        "modules": 9,
+        "computed": 9,
+        "validated": 0,
+    }
+    with store.connect() as db:
+        before = {
+            table: db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
+            for table in ("jobs", "assets", "example_pins")
+        }
+        assert before == {"jobs": 15, "assets": 5, "example_pins": 9}
+        assert not db.execute(
+            "SELECT id FROM jobs WHERE status IN ('queued','running','cancelling')"
+        ).fetchall()
+        assert (
+            db.execute("SELECT description FROM projects WHERE id=?", (private,)).fetchone()[0]
+            == "Retain"
+        )
+    expected = (
+        (
+            "del.series",
+            "58cee50b-25d1-4e9d-8be9-74916c0cd135",
+            "mono-disynthon.csv",
+            {"observed_members": 518285, "series": 9402, "shown_series": 9402},
+        ),
+        (
+            "del.candidates",
+            "5d4e2972-685a-41ee-8237-c135626ad35b",
+            "del-candidates.sdf",
+            {"selected": 5, "resolved": 5, "failed": 0},
+        ),
+        (
+            "del.followup",
+            "f8d334e1-de23-4411-b48e-a2fa728ceca9",
+            "followup-measurements.csv",
+            {"reported": 1, "matched": 1, "unmatched": 0},
+        ),
+    )
+    with TestClient(app, base_url="http://127.0.0.1:4320") as client:
+        for capability, job_id, filename, expected_counts in expected:
+            detail = client.get("/api/examples/" + capability)
+            assert detail.status_code == 200
+            example = detail.json()
+            assert example["computed_result_available"]
+            assert example["pin"]["case_id"] == "del-unc006-brd4"
+            assert example["pin"]["revision"] == 5
+            assert example["pin"]["job_id"] == job_id
+            assert example["pin"]["review"]["scope"] == "reviewed_computational_example"
+            result_path = settings.state_dir / "jobs" / job_id / "output/result.json"
+            result = json.loads(result_path.read_text())
+            assert result["complete"] and result["counts"] == expected_counts
+            downloaded = client.get(f"/api/jobs/{job_id}/download", params={"name": filename})
+            assert downloaded.status_code == 200
+            assert downloaded.content == result_path.with_name(filename).read_bytes()
+        # The real held-out BB1 model is an independent-validation rejection example.
+        model = client.get("/api/examples/del.model").json()
+        assert model["computed_result_available"]
+        assert model["pin"]["job_id"] == "d8fb2c6c-7eb5-4d9e-96f8-7368b0f489b7"
+        native = settings.state_dir / "jobs" / model["pin"]["job_id"] / "output/result.json"
+        result = json.loads(native.read_text())
+        assert result["complete"]
+        assert result["counts"] == {
+            "source_members": 518285,
+            "sampled_members": 50000,
+            "training": 39250,
+            "heldout": 10750,
+            "unresolved_structures": 0,
+        }
+        assert result["metrics"]["rmse_log1p_enrichment"] > result["metrics"]["mean_baseline_rmse"]
+        assert result["metrics"]["spearman_enrichment"] < 0.04
+        downloaded = client.get(
+            f"/api/jobs/{model['pin']['job_id']}/download",
+            params={"name": "holdout-predictions.csv"},
+        )
+        assert downloaded.status_code == 200
+        assert downloaded.content == native.with_name("holdout-predictions.csv").read_bytes()
+        assert len(downloaded.content.splitlines()) == 10751
+        assert model["pin"]["review"]["scope"] == "reviewed_computational_example"
+    restore_bundle(archive, settings, source.SHA256)
+    with store.connect() as db:
+        assert before == {
+            table: db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0] for table in before
+        }
+    native = settings.state_dir / "jobs/891e0487-837a-4b8c-ad95-381b22f896e8/output/analysis.sqlite"
+    with sqlite3.connect("file:" + str(native) + "?mode=ro", uri=True) as db:
+        assert db.execute("SELECT COUNT(*) FROM members").fetchone()[0] == 518285
+        assert db.execute("SELECT COUNT(*) FROM enrichment").fetchone()[0] == 1036570
+        assert db.execute(
+            "SELECT supporting_samples,prioritizable FROM enrichment "
+            "WHERE member=? AND comparison=?",
+            ("A047-B058-C036", "BRD4_E2_vs_matrix"),
+        ).fetchone() == (1, 0)

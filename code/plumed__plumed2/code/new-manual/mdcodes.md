@@ -1,0 +1,129 @@
+## Codes interfaced with PLUMED
+
+PLUMED can be incorporated into an MD code and used to analyze or bias a molecular dynamics run on the fly.
+Some MD codes already include calls to the PLUMED library
+and be PLUMED-ready in their original distribution.
+As far as we know, the following MD codes can be used with PLUMED out of the box:
+
+- [Amber](http://ambermd.org/), pmemd module, since version 20.
+- [AmberTools](http://ambermd.org/), sander module, since version 15.
+- [CP2K](http://www.cp2k.org), since Feb 2015.
+- [ESPResSo](http://espressomd.org), in a version that has been patched with PLUMED can be found
+  [here](http://davidebr.github.io/espresso/).
+- [PINY-MD](http://github.com/TuckermanGroup/PINY), in its plumed branch.
+- [IPHIGENIE](http://sourceforge.net/projects/iphigenie/).
+- [AceMD](http://www.multiscalelab.org/acemd/), see [this link](https://github.com/tonigi/ACEMD-PLUMED).
+- [OpenMM](http://openmm.org), using the [openmm-plumed plugin](http://github.com/peastman/openmm-plumed).
+- [DL_POLY4](https://www.scd.stfc.ac.uk/Pages/DL_POLY.aspx).
+- [VNL-ATK](https://quantumwise.com), see [this link](https://docs.quantumwise.com/tutorials/metadynamics_with_plumed/metadynamics_with_plumed.html).
+- [ABIN](https://github.com/PHOTOX/ABIN).
+- [i-pi](https://github.com/i-pi/i-pi).
+- [LAMMPS](https://lammps.sandia.gov/) since Nov 2018.
+- [Yaff](https://github.com/molmod/yaff), since Jul 2019.
+- [DFTB+](https://www.dftbplus.org/), since release 20.1.
+- [Metalwalls](https://gitlab.com/ampere2/metalwalls)
+- [ASE](https://wiki.fysik.dtu.dk/ase/)
+- [GPUMD](https://gpumd.org/)
+- [GROMACS](https://www.gromacs.org/) as of version 2025, with limited support (see the table below).
+
+We also provide patches for [namd](https://www.ks.uiuc.edu/Research/namd/), [quantum espresso](https://www.quantum-espresso.org) and
+[GROMACS](https://www.gromacs.org/) (`plumed patch --list-engines` lists them). The patches for GROMACS 2025 and 2026 add features to the
+PLUMED interface that GROMACS includes since version 2025, and the patch for GROMACS 2024 has some more:
+
+| Feature | GROMACS 2025 or later, without patches | patches for GROMACS 2025 and 2026 | patch for GROMACS 2024 |
+|:--|:--:|:--:|:--:|
+| biases on atoms, with domain decomposition and multiple time stepping | yes (1) | yes | yes |
+| [ENERGY](https://github.com/plumed/plumed2/blob/HEAD/new-manual/ENERGY.md) collective variable and biases on the energy | no | yes (2,3) | yes (3) |
+| multiple simulations that communicate through MPI (e.g. `WALKERS_MPI`) | no | yes | yes |
+| PLUMED checkpoint data written at the steps of the GROMACS checkpoints | no | yes (2) | yes |
+| PLUMED files trimmed at the step of the GROMACS checkpoint at `mdrun -cpi` (see below) | no | yes | yes |
+| PLUMED stopping the simulation (e.g. [COMMITTOR](https://github.com/plumed/plumed2/blob/HEAD/new-manual/COMMITTOR.md)) | no | yes | yes |
+| polarizable models with shells | no | yes (4) | no |
+| replica exchange with a PLUMED bias (`-replex`, `-hrex`) | no | no | yes |
+| lambda dynamics (expanded ensemble) | no | no | yes |
+
+Notes on the table:
+
+1. GROMACS 2026.0 to 2026.3 without patches stop at startup with more than one MPI rank.
+2. Not with the modular simulator of GROMACS, the default for md-vv: set `GMX_DISABLE_MODULAR_SIMULATOR=1`.
+3. With multiple time stepping, only on the steps when the slow forces are computed.
+4. With [ENERGY](https://github.com/plumed/plumed2/blob/HEAD/new-manual/ENERGY.md), PLUMED updates (e.g. deposits its bias) with the energy before the shells are relaxed.
+
+### Restarting GROMACS with PLUMED
+
+With the patches, when GROMACS is restarted from its checkpoint (`gmx mdrun -cpi state.cpt -plumed plumed.dat`),
+PLUMED is told the step S of the GROMACS checkpoint, from which the simulation continues. The same PLUMED input can be
+used for the first run and for the restarts, without [RESTART](https://github.com/plumed/plumed2/blob/HEAD/new-manual/RESTART.md): GROMACS tells PLUMED that the run is restarted.
+
+- Without [CHECKPOINT](https://github.com/plumed/plumed2/blob/HEAD/new-manual/CHECKPOINT.md), PLUMED appends to its files, as with RESTART, after removing from them the lines
+  written at or after step S by the interrupted run (they are moved to `bck.trimmed.X.filename`), as GROMACS does with its
+  own files. In this way COLVAR, HILLS, KERNELS, etc. contain every step once, and [METAD](https://github.com/plumed/plumed2/blob/HEAD/new-manual/METAD.md) and
+  [OPES_METAD](https://github.com/plumed/plumed2/blob/HEAD/new-manual/OPES_METAD.md) restart from the hills and kernels deposited before step S (step S is computed again).
+  The restart is not exact: the bias is rebuilt from the files, written with a finite precision. Files without a
+  time field are appended as they are; `RESTART NO_TRIM` switches the trimming off (see [RESTART](https://github.com/plumed/plumed2/blob/HEAD/new-manual/RESTART.md)).
+- With [CHECKPOINT](https://github.com/plumed/plumed2/blob/HEAD/new-manual/CHECKPOINT.md) at the top of the PLUMED input, PLUMED writes its own checkpoint file whenever GROMACS
+  writes its own; at the restart the files are truncated to the sizes they had at the checkpoint, the state of the actions
+  is restored, and the restarted run continues the interrupted one exactly (with `-reprod`, the files are identical to those
+  of an uninterrupted run). The checkpoint file of PLUMED must be there: if it is missing (e.g. CHECKPOINT was added to the
+  input of a run that did not have it), PLUMED stops with an error, and `RESTART_FROM=NO` restarts without it.
+- `-noappend` does not change what PLUMED does: GROMACS writes new part files, PLUMED trims and appends to its own files.
+- With `-multidir` every simulation trims or restores its own files (they have the replica suffix); the simulations must
+  restart from checkpoints written at the same step.
+
+Without the patches, GROMACS 2025 and later do not tell PLUMED the step of the checkpoint: the files are appended as they are.
+
+If you maintain another MD code that is PLUMED-ready let us know and we will add it to this list.
+
+The status of the interface between some of these MD codes and PLUMED are tested [here](https://plumed-testcenter.github.io).  You can find examples of how we build
+the interfaces between PLUMED and these codes on that site.  However, you will in general need to refer to the documentation of the MD code to know how to use it with the latest PLUMED release.
+
+PLUMED can also be used as a [tool](https://github.com/plumed/plumed2/blob/HEAD/new-manual/module_cltools.md) for post processing the results from molecular dynamics
+or enhanced sampling calculations.  Notice that PLUMED can be used as an analysis tool from the following packages:
+
+- [PLUMED-GUI](http://github.com/tonigi/vmd_plumed) is a [VMD](http://www.ks.uiuc.edu/Research/vmd/) plugin that computes PLUMED collective variables.
+- [HTMD](http://www.htmd.org/) can use PLUMED collective variables for analysis.
+- [OpenPathSampling](http://openpathsampling.org/), using the [PLUMED Wrapper for OpenPathSampling](https://e-cam.readthedocs.io/en/latest/Classical-MD-Modules/modules/OpenPathSampling/ops_plumed_wrapper/readme.html).
+
+## GROMACS and PLUMED with GPU
+
+Since version 4.6.x GROMACS can run in an hybrid mode making use of both
+your CPU and your GPU (either using CUDA or OpenCL for newer versions of
+GROMACS). The calculation of the short-range non-bonded interactions is
+performed on the GPU while long-range and bonded interactions are at the
+same time calculated on the CPU. By varying the cut-off for short-range
+interactions GROMACS can optimize the balance between GPU/CPU loading
+and obtain amazing performances.
+
+GROMACS patched with PLUMED takes into account PLUMED in its load-balancing,
+adding the PLUMED timings to the one resulting from bonded interactions and long-
+range interactions. This means that the CPU/GPU balance will be optimized
+automatically to take into account PLUMED!
+
+It is important to notice that the optimal setup to use GROMACS alone
+on the GPU or GROMACS + PLUMED can be different, try to change the number
+of MPI/OpenMP processes (see [OpenMP](https://github.com/plumed/plumed2/blob/HEAD/new-manual/actions.md#openmp)) used by GROMACS and PLUMED to find
+optimal performances. Remember that in GROMACS multiple MPI threads
+can use the same GPU:
+
+i.e. if you have 4 cores and 2 GPU you can:
+
+- use 2 MPI/2GPU/2OPENMP:
+
+```bash
+export PLUMED_NUM_THREADS=2
+mpiexec -np 2 gmx_mpi mdrun -nb gpu -ntomp 2 -pin on -gpu_id 01
+```
+
+- use 4 MPI/2GPU:
+
+```bash
+export PLUMED_NUM_THREADS=1
+mpiexec -np 4 gmx_mpi mdrun -nb gpu -ntomp 1 -pin on -gpu_id 0011
+```
+
+Of notice that since plumed 2.5 and gromacs 2018.3 the number of openMP threads can automatically set by gromacs (so `PLUMED_NUM_THREADS` is not needed, and the number of OpenMP threads used by plumed is set by `-ntomp`)
+
+```bash
+mpiexec -np 2 gmx_mpi mdrun -nb gpu -ntomp 2 -pin on -gpu_id 01
+```
+

@@ -1,0 +1,406 @@
+import { useEffect, useId, useRef, useState } from "react";
+import type { Health, Job, Language, Prediction, Project } from "../types";
+import { type ToolId } from "./catalog";
+import { CapabilityFilters } from "./CapabilityFilters";
+import { researchModules } from "../studio/research-modules";
+import { researchIcons } from "../studio/research-icons";
+import { ResearchStageNavigation } from "../studio/ResearchStageNavigation";
+import { ProjectContinuation } from "../studio/ProjectContinuation";
+import { themeForModule } from "../design/module-theme";
+import { filterCapabilities, type ModalityFilter } from "./filter";
+import { QualityForm } from "../quality/QualityForm";
+import { AdmetForm } from "../admet/AdmetForm";
+import { HumanizationForm } from "../humanization/HumanizationForm";
+import { AntibodyNumberForm } from "../antibodies/AntibodyNumberForm";
+import { LibraryScreenForm } from "../chemistry/LibraryScreenForm";
+import { EvidenceWorkspace } from "../evidence/EvidenceWorkspace";
+import { SurfaceForm } from "../receptors/SurfaceForm";
+import { ChannelForm } from "../space/ChannelForm";
+import { ProximityForm } from "../proximity/Form";
+import { StructurePrepareForm } from "../receptors/StructurePrepareForm";
+import { ReferenceImportForm } from "../discovery/ReferenceImportForm";
+import { TargetResearchForm } from "../discovery/TargetResearchForm";
+import { PropertyForm } from "./PropertyForm";
+import { FeatureForm } from "./FeatureForm";
+import { ImportForm } from "./ImportForm";
+import { HarnessForm } from "./HarnessForm";
+import { CampaignForm } from "./CampaignForm";
+import "./operations.css";
+import "../design/research-entry.css";
+import { RegionWorkspace } from "../regions/RegionWorkspace";
+import { PocketForm } from "../pockets/PocketForm";
+import { PoseWorkspace } from "../poses/PoseWorkspace";
+import { WorkflowCenter } from "../workflows/WorkflowCenter";
+import { ReceptorForm } from "../receptors/ReceptorForm";
+import { ComparisonForm } from "../structure-comparison/ComparisonForm";
+import { StateForm } from "../chemistry/StateForm";
+import { DiffForm } from "../diffsbdd/DiffForm";
+import { DockingForm } from "../docking/DockingForm";
+import { ExampleActions } from "../examples/ExampleActions";
+import { ExampleContext } from "../examples/context";
+import type { PreparedExample } from "../examples/types";
+import type { DockingMode } from "../docking/types";
+import type { DiffMode } from "../diffsbdd/types";
+import { ScientificForm } from "../integrations/ScientificForm";
+import { ProteinInterfaceForm } from "../integrations/ProteinInterfaceForm";
+import { isScientificForm } from "../integrations/types";
+import { SimulationForm } from "../simulations/SimulationForm";
+import { Mol1Form } from "../integrations/Mol1Form";
+import { isSimulationForm } from "../simulations/types";
+import { DatasetForm } from "../datasets/DatasetForm";
+import { isDatasetTool } from "../datasets/dataset-model";
+
+export function ToolCenter({
+  language,
+  jobs,
+  onCreated,
+  onDraft,
+  selectedTool,
+  onSelectTool,
+  entryRevision = 0,
+  catalogueRevision = 0,
+  projects = [],
+  onOpenWorkspace,
+}: {
+  entryRevision?: number;
+  catalogueRevision?: number;
+  selectedTool: ToolId | null;
+  onSelectTool(value: ToolId | null): void;
+  language: Language;
+  health: Health | null;
+  jobs: Job[];
+  onCreated(j: Job): void;
+  onDraft(p: Prediction): void;
+  projects?: Project[];
+  onOpenWorkspace?(project: Project | null): void;
+}) {
+  const zh = language === "zh",
+    selected = selectedTool,
+    [modality, setModality] = useState<ModalityFilter>("all");
+  const current = filterCapabilities("all").find((t) => t.id === selected),
+    index = zh ? 0 : 1;
+  const headingId = useId(),
+    heading = useRef<HTMLHeadingElement>(null),
+    lastOpenedTool = useRef<ToolId | null>(null),
+    cards = useRef<Partial<Record<ToolId, HTMLButtonElement | null>>>({});
+  useEffect(() => {
+    if (selected) heading.current?.focus();
+    else if (lastOpenedTool.current)
+      cards.current[lastOpenedTool.current]?.focus();
+  }, [selected, entryRevision]);
+  const filteredTools = filterCapabilities(modality);
+  const [example, setExample] = useState<PreparedExample | null>(null);
+  const [exampleLoad, setExampleLoad] = useState(0);
+  const [previewing, setPreviewing] = useState(false);
+  useEffect(() => {
+    setExample(null);
+    setPreviewing(false);
+  }, [selected, entryRevision]);
+  useEffect(() => {
+    setModality("all");
+  }, [catalogueRevision]);
+  return (
+    <section
+      className={`tool-center ${current ? "task-workspace " + (previewing ? "is-result" : "is-input") : ""}`}
+      aria-labelledby={headingId}
+    >
+      <h1 id={headingId} ref={heading} tabIndex={-1} className="sr-only">
+        {current ? current.label[index] : zh ? "全部能力" : "All capabilities"}
+      </h1>
+      {current ? (
+        <>
+          <ExampleActions
+            key={current.id + ":" + entryRevision}
+            capability={current.id}
+            language={language}
+            onBack={() => onSelectTool(null)}
+            onLoad={(value) => {
+              setExample(value);
+              setExampleLoad((n) => n + 1);
+            }}
+            onPreviewChange={setPreviewing}
+            onClear={() => {
+              setExample(null);
+              setExampleLoad((n) => n + 1);
+            }}
+          />
+          <div hidden={previewing}>
+            <ExampleContext.Provider
+              key={current.id + ":" + entryRevision + ":" + exampleLoad}
+              value={
+                example?.module.capability_id === current.id ? example : null
+              }
+            >
+              {selected && isDatasetTool(selected) ? (
+                <DatasetForm
+                  tool={selected}
+                  language={language}
+                  onCreated={onCreated}
+                  onPrepare={onSelectTool}
+                />
+              ) : selected === "deepternary.model" ? (
+                <ProximityForm language={language} onCreated={onCreated} />
+              ) : selected === "mol1.predict" ? (
+                <Mol1Form language={language} onCreated={onCreated} />
+              ) : isSimulationForm(selected) ? (
+                <SimulationForm
+                  form={selected}
+                  language={language}
+                  onCreated={onCreated}
+                />
+              ) : selected === "structure" ? (
+                <ProteinInterfaceForm
+                  language={language}
+                  onCreated={onCreated}
+                />
+              ) : isScientificForm(selected) ? (
+                <ScientificForm
+                  form={selected}
+                  language={language}
+                  onCreated={onCreated}
+                  onChooseTask={onSelectTool}
+                />
+              ) : selected === "antibody.humanize" ? (
+                <HumanizationForm language={language} onCreated={onCreated} />
+              ) : selected === "admet.brain" ? (
+                <AdmetForm
+                  language={language}
+                  onCreated={onCreated}
+                  focus="brain"
+                />
+              ) : selected === "admet.predict" ? (
+                <AdmetForm language={language} onCreated={onCreated} />
+              ) : selected === "posebusters.check" ? (
+                <QualityForm language={language} onCreated={onCreated} />
+              ) : selected === "antibody.number" ? (
+                <AntibodyNumberForm language={language} onCreated={onCreated} />
+              ) : selected === "chemistry.screen" ? (
+                <LibraryScreenForm language={language} onCreated={onCreated} />
+              ) : selected === "caver.paths" ? (
+                <ChannelForm language={language} onCreated={onCreated} />
+              ) : selected === "biopython.exposure" ? (
+                <SurfaceForm language={language} onCreated={onCreated} />
+              ) : selected === "biopython.prepare" ? (
+                <StructurePrepareForm
+                  language={language}
+                  onCreated={onCreated}
+                />
+              ) : selected === "discovery.import" ? (
+                <ReferenceImportForm
+                  language={language}
+                  onCreated={onCreated}
+                />
+              ) : selected?.startsWith("discovery.") ? (
+                <TargetResearchForm
+                  key={selected}
+                  entity={
+                    selected === "discovery.target" ? "target" : "disease"
+                  }
+                  language={language}
+                  onCreated={onCreated}
+                />
+              ) : selected === "pose_exploration" ? (
+                <PoseWorkspace language={language} showBackend={false} />
+              ) : selected === "rmsd" ? (
+                <ComparisonForm language={language} onCreated={onCreated} />
+              ) : selected === "biopython.ensemble" ? (
+                <ReceptorForm language={language} onCreated={onCreated} />
+              ) : selected === "chemistry.states" ? (
+                <StateForm language={language} onCreated={onCreated} />
+              ) : selected === "experimental.evidence" ? (
+                <EvidenceWorkspace language={language} />
+              ) : selected === "regions" ? (
+                <RegionWorkspace language={language} />
+              ) : selected === "p2rank.detect" ? (
+                <PocketForm
+                  language={language}
+                  onCreated={onCreated}
+                  onPredict={() => onSelectTool("predict")}
+                />
+              ) : selected === "workflows" ? (
+                <WorkflowCenter language={language} jobs={jobs} />
+              ) : selected?.startsWith("diffsbdd.") ? (
+                <DiffForm
+                  key={selected}
+                  mode={selected.slice(9) as DiffMode}
+                  language={language}
+                  onCreated={onCreated}
+                />
+              ) : selected?.startsWith("gnina.") ? (
+                <DockingForm
+                  key={selected}
+                  mode={selected.slice(6) as DockingMode}
+                  language={language}
+                  onCreated={onCreated}
+                />
+              ) : selected === "properties" ? (
+                <PropertyForm language={language} onCreated={onCreated} />
+              ) : selected === "features" ? (
+                <FeatureForm language={language} onCreated={onCreated} />
+              ) : selected === "import" ? (
+                <ImportForm
+                  language={language}
+                  jobs={jobs}
+                  onCreated={onCreated}
+                  onDraft={onDraft}
+                />
+              ) : selected === "campaign" ? (
+                <CampaignForm language={language} />
+              ) : (
+                <HarnessForm
+                  key={selected}
+                  tool={selected!}
+                  language={language}
+                  onCreated={onCreated}
+                />
+              )}
+            </ExampleContext.Provider>
+          </div>
+        </>
+      ) : (
+        <>
+          <header className="catalogue-heading">
+            <div>
+              <span className="catalogue-eyebrow" aria-hidden="true">
+                AI DRUG DISCOVERY
+              </span>
+              <h2>{zh ? "研究任务" : "Research tasks"}</h2>
+              <p>
+                {zh
+                  ? "从靶点到候选，选择研究阶段开始。"
+                  : "Choose a research stage, from target to candidate."}
+              </p>
+            </div>
+            <span className="catalogue-count">
+              {zh
+                ? `${filteredTools.length} 项任务可选`
+                : `${filteredTools.length} research tasks`}
+            </span>
+          </header>
+          <ResearchStageNavigation
+            language={language}
+            onSelect={onSelectTool}
+          />
+          <CapabilityFilters
+            language={language}
+            modality={modality}
+            onModality={setModality}
+          />
+          <p
+            className="sr-only"
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {zh
+              ? `显示 ${filteredTools.length} / ${filterCapabilities("all").length} 项能力`
+              : `Showing ${filteredTools.length} of ${filterCapabilities("all").length} capabilities`}
+          </p>
+          <div className="tool-grid capability-sections">
+            {researchModules.map((module) => {
+              const entries = filteredTools
+                .filter((tool) => module.tools.includes(tool.id))
+                .sort(
+                  (a, b) =>
+                    module.tools.indexOf(a.id) - module.tools.indexOf(b.id),
+                );
+              if (!entries.length) return null;
+              const Icon = researchIcons[module.id];
+              return (
+                <section
+                  key={module.id}
+                  className="capability-group"
+                  data-module-theme={themeForModule(module.id)}
+                  aria-label={module.label[index]}
+                >
+                  <header
+                    className="capability-group-heading"
+                    title={module.purpose[index]}
+                  >
+                    <span
+                      className={`capability-icon is-${module.id}`}
+                      aria-hidden="true"
+                    >
+                      <Icon />
+                    </span>
+                    <div className="capability-heading-copy">
+                      <h2>{module.label[index]}</h2>
+                      <small>
+                        {entries.length} {zh ? "项任务" : "tasks"}
+                      </small>
+                      <p className="capability-purpose">
+                        {module.purpose[index]}
+                      </p>
+                    </div>
+                  </header>
+                  <div className="capability-recommended">
+                    {entries
+                      .filter((tool) => module.recommended.includes(tool.id))
+                      .map((tool) => (
+                        <button
+                          type="button"
+                          className="tool-card"
+                          data-capability={tool.id}
+                          key={tool.id}
+                          ref={(element) => {
+                            cards.current[tool.id] = element;
+                          }}
+                          onClick={() => {
+                            lastOpenedTool.current = tool.id;
+                            onSelectTool(tool.id);
+                          }}
+                          aria-label={tool.label[index]}
+                          title={tool.note[index] + " · " + tool.source}
+                        >
+                          <h2>{tool.label[index]}</h2>
+                          <span aria-hidden="true">→</span>
+                        </button>
+                      ))}
+                  </div>
+                  {entries.some(
+                    (tool) => !module.recommended.includes(tool.id),
+                  ) && (
+                    <details className="capability-additional">
+                      <summary>
+                        {zh ? "更多方法" : "Additional methods"}
+                      </summary>
+                      {entries
+                        .filter((tool) => !module.recommended.includes(tool.id))
+                        .map((tool) => (
+                          <button
+                            type="button"
+                            className="tool-card"
+                            data-capability={tool.id}
+                            key={tool.id}
+                            ref={(element) => {
+                              cards.current[tool.id] = element;
+                            }}
+                            onClick={() => {
+                              lastOpenedTool.current = tool.id;
+                              onSelectTool(tool.id);
+                            }}
+                            aria-label={tool.label[index]}
+                            title={tool.note[index] + " · " + tool.source}
+                          >
+                            <h2>{tool.label[index]}</h2>
+                            <span aria-hidden="true">→</span>
+                          </button>
+                        ))}
+                    </details>
+                  )}
+                </section>
+              );
+            })}
+          </div>
+          {onOpenWorkspace && (
+            <ProjectContinuation
+              language={language}
+              projects={projects}
+              onOpen={onOpenWorkspace}
+            />
+          )}
+        </>
+      )}
+    </section>
+  );
+}

@@ -1,0 +1,80 @@
+"""Construct the represented group hierarchy without an invented atom domain."""
+
+import numpy as np
+import pandas as pd
+
+
+def from_group_records(records, *, naming_scheme=None):
+    """Build independent canonical tables from already interpreted record groups."""
+    from molsysmt._private.name_resolution import classify_group_name
+    from molsysmt.element.chain.chain_names import _alphabetic_chain_id
+    from molsysmt.element.group.amino_acid.codes import aa3_to_aa1
+
+    from ._topology_infer import infer_molecule_types_from_topology
+    from .topology import Topology
+
+    names = [name for record in records for name in record["groups"]]
+    count = len(records)
+    topology = Topology(
+        n_groups=len(names), n_molecules=count, n_entities=count, n_chains=count
+    )
+    topology.groups["group_id"] = pd.array(
+        [str(i) for i in range(len(names))], dtype="string"
+    )
+    topology.groups["group_name"] = pd.array(names, dtype="string")
+    topology.groups["group_type"] = pd.array(
+        [
+            classify_group_name(
+                name,
+                naming_scheme
+                if naming_scheme is not None
+                else "sequence"
+                if name in aa3_to_aa1
+                else None,
+            )
+            for name in names
+        ],
+        dtype="string",
+    )
+    topology.set_group_naming_schemes(
+        naming_scheme
+        if naming_scheme is not None
+        else ["sequence" if name in aa3_to_aa1 else None for name in names]
+    )
+    topology.groups["molecule_index"] = pd.array(
+        np.repeat(np.arange(count), [len(record["groups"]) for record in records]),
+        dtype="Int64",
+    )
+    labels = [record.get("id", str(index)) for index, record in enumerate(records)]
+    descriptions = [
+        record.get("description", label) for record, label in zip(records, labels)
+    ]
+    types = (
+        infer_molecule_types_from_topology(topology) if names else ["unknown"] * count
+    )
+    for singular, table in [
+        ("molecule", topology.molecules),
+        ("entity", topology.entities),
+        ("chain", topology.chains),
+    ]:
+        table[f"{singular}_id"] = pd.array(
+            [
+                record.get("chain_id", _alphabetic_chain_id(i))
+                for i, record in enumerate(records)
+            ]
+            if singular == "chain"
+            else [str(i) for i in range(count)],
+            dtype="string",
+        )
+        table[f"{singular}_name"] = pd.array(
+            descriptions if singular == "entity" else labels, dtype="string"
+        )
+        table[f"{singular}_type"] = pd.array(types, dtype="string")
+    topology.molecules["entity_index"] = pd.array(range(count), dtype="Int64")
+    offsets = np.concatenate(
+        ([0], np.cumsum([len(record["groups"]) for record in records]))
+    )
+    topology.set_chain_groups(
+        [list(range(int(offsets[i]), int(offsets[i + 1]))) for i in range(count)]
+    )
+    return topology

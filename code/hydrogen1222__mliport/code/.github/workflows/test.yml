@@ -1,0 +1,173 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          # This repository deliberately has no uv.lock; the real
+          # dependency manifest is mliport/pyproject.toml, so the cache
+          # key must hash that path (a uv.lock default never matched).
+          cache-dependency-glob: "mliport/pyproject.toml"
+      - name: Install mliport dev dependencies
+        run: |
+          uv venv .venv-dev --python ${{ matrix.python-version }}
+          uv pip install --python .venv-dev/bin/python -e './mliport[dev]'
+      # test_json_writer exercises the JSON encoder's torch-tensor path, so
+      # the full suite needs torch. Use the CPU index; the PyPI linux wheel
+      # drags in the multi-GB CUDA stack the suite never touches.
+      - name: Install CPU torch for the test suite
+        run: |
+          uv pip install --python .venv-dev/bin/python torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Run tests
+        run: |
+          .venv-dev/bin/python -m pytest tests -q
+
+  installer-windows-contract:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "mliport/pyproject.toml"
+      - name: Install the package and focused test dependencies
+        run: |
+          uv venv .venv-installer --python 3.12
+          uv pip install --python .venv-installer/Scripts/python.exe -e ./mliport pytest
+      - name: Test installer contracts on native Windows paths
+        run: |
+          .venv-installer/Scripts/python.exe -m pytest `
+            tests/mliport/mliport/test_install_plan.py `
+            tests/mliport/mliport/test_install_venv_contract.py `
+            tests/mliport/mliport/test_install_cli.py `
+            tests/mliport/mliport/test_install_launcher.py `
+            tests/mliport/mliport/test_install_compatibility.py -q
+      - name: Exercise the PowerShell installer dry run
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = Join-Path $PWD "mliport"
+          uv run --no-project --with packaging --python 3.12 -- python -m mliport.install --engines nep --device cpu --dry-run
+
+  analysis-backends:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          # This repository deliberately has no uv.lock; the real
+          # dependency manifest is mliport/pyproject.toml, so the cache
+          # key must hash that path (a uv.lock default never matched).
+          cache-dependency-glob: "mliport/pyproject.toml"
+      - name: Install all analysis backends
+        run: |
+          uv venv .venv-analysis --python 3.12
+          uv pip install --python .venv-analysis/bin/python -e './mliport[dev,analysis-all]'
+      - name: Verify supported backend majors
+        run: |
+          .venv-analysis/bin/python -c "import gemdat, kinisi; assert gemdat.__version__.startswith('1.'); assert kinisi.__version__.startswith('2.')"
+      - name: Run real kinisi and GEMDAT integration tests
+        run: |
+          .venv-analysis/bin/python -m pytest \
+            tests/mliport/mliport/analysis/test_analysis_backends_integration.py \
+            tests/mliport/mliport/analysis/test_electrolyte_nearest_site.py \
+            -q
+
+  # The built wheel must install and import on every supported Python, not
+  # just the runner that happens to build/test. Smoke only -- the heavy
+  # analysis matrix stays on its own job.
+  wheel-install-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          # This repository deliberately has no uv.lock; the real
+          # dependency manifest is mliport/pyproject.toml, so the cache
+          # key must hash that path (a uv.lock default never matched).
+          cache-dependency-glob: "mliport/pyproject.toml"
+      - name: Build wheel
+        run: uv build --wheel --out-dir dist ./mliport
+      - name: Install wheel into a clean pinned interpreter
+        run: |
+          uv venv wheel-clean --python ${{ matrix.python-version }}
+          uv pip install --python wheel-clean/bin/python --no-deps dist/mliport-*.whl
+      - name: Smoke test the installed wheel
+        run: |
+          wheel-clean/bin/python -I - <<'PY'
+          import sys
+
+          from mliport.capabilities import require_neb_capability, resolve_capabilities
+
+          ok = resolve_capabilities({}, ["energy", "forces"])
+          require_neb_capability(ok)
+          direct = resolve_capabilities({"direct_forces": True}, ["energy", "forces"])
+          try:
+              require_neb_capability(direct)
+          except ValueError:
+              pass
+          else:
+              raise SystemExit("direct-force models must be rejected")
+          print("capability wheel smoke ok on", sys.version)
+          PY
+
+  # Really executes scripts/install_mliport.sh for the NEP backend (network,
+  # uv, a fresh .venv-nep) and runs doctor from the result. Plan-level checks
+  # live in tests/mliport/mliport/test_install_plan.py and run everywhere.
+  installer-real-nep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "mliport/pyproject.toml"
+      - name: Install pytest only
+        run: |
+          uv venv .venv-ci --python 3.12
+          uv pip install --python .venv-ci/bin/python pytest
+      - name: Real NEP install, doctor, reinstall, mirror, offline
+        env:
+          MLIPORT_REAL_INSTALL: "1"
+          MLIPORT_REAL_INSTALL_LOGDIR: ${{ runner.temp }}/nep-install-logs
+        run: |
+          .venv-ci/bin/python -m pytest tests/mliport/mliport/test_install_nep_real.py -v -rA -p no:cacheprovider
+      - name: Print install logs
+        if: always()
+        run: |
+          for f in "${{ runner.temp }}"/nep-install-logs/*.log; do
+            echo "::group::$(basename "$f")"
+            cat "$f"
+            echo "::endgroup::"
+          done
+      - name: Upload install logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nep-install-logs
+          path: ${{ runner.temp }}/nep-install-logs
+          if-no-files-found: warn

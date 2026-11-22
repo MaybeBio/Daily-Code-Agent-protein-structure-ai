@@ -1,0 +1,111 @@
+.pose-workspace,
+.pose-plan-run,
+.pose-results {
+  min-width: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+.pose-form fieldset {
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+.pose-site-choices {
+  display: grid;
+  gap: 0.45rem;
+}
+.pose-site-choices label {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+.pose-workspace select,
+.pose-workspace input {
+  max-width: 100%;
+}
+.pose-table {
+  min-width: 0;
+  max-width: 100%;
+  overflow: auto;
+}
+.pose-table table {
+  border-collapse: collapse;
+  min-width: 500px;
+  width: 100%;
+}
+.pose-table td,
+.pose-table th {
+  text-align: left;
+  padding: 0.45rem;
+  border-bottom: 1px solid var(--line);
+}
+.pose-table td {
+  overflow-wrap: anywhere;
+}
+.pose-workspace pre {
+  max-width: 100%;
+  overflow: auto;
+}
+
+/* A nested details/section is a grid item: its table must not define the
+   parent's automatic minimum width. Keep the wide table internally scrollable. */
+.pose-score-comparison,
+.score-comparison-results,
+.score-comparison-group,
+.pose-score-comparison details {
+  min-width: 0;
+  max-width: 100%;
+}
+.pose-score-comparison[open],
+.score-comparison-results,
+.score-comparison-group {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.75rem;
+}
+
+.pose-context-row {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.pose-context-row .field {
+  flex: 1;
+  min-width: min(100%, 260px);
+  margin: 0;
+}
+.pose-context-row > button {
+  flex: 0 0 auto;
+  margin: 0;
+}
+.pose-history {
+  margin-top: 18px;
+}
+.pose-history > summary {
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 13px;
+}
+.pose-history > .field {
+  margin-top: 12px;
+}
+
+.pose-study-context > summary,
+.pose-run-settings > summary {
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 600;
+  padding-block: 10px;
+}
+.pose-study-context[open] > summary {
+  margin-bottom: 10px;
+}
+.pose-run-controls {
+  display: grid;
+  gap: 12px;
+  padding-block: 10px;
+}

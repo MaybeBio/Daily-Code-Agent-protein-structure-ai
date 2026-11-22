@@ -1,0 +1,451 @@
+"""GPU identities without importing a numerical runtime or changing visibility."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+
+def cuda_failure_guidance(
+    error: BaseException, *, requested_device: str, backend: str
+) -> str | None:
+    """Clarify recognisable CUDA availability errors without guessing a fallback.
+
+    Return None for unrelated failures: model/chemistry errors must retain their
+    original exception type and message.
+    """
+    target = str(requested_device).strip().lower()
+    if not (target in {"cuda", "gpu"} or target.startswith(("cuda:", "gpu:"))):
+        return None
+    message = str(error).lower()
+    known_cuda_unavailable = (
+        "torch not compiled with cuda enabled",
+        "pytorch was compiled without cuda",
+        "found no nvidia driver",
+        "no nvidia driver on your system",
+        "cuda driver version is insufficient",
+        "cuda error: no device",
+        "cuda error: invalid device ordinal",
+        "cuda_error_no_device",
+        "cudaerrornodevice",
+        "no cuda gpus are available",
+        "cuda is not available",
+        "cuda not available",
+        "no gpu devices available",
+    )
+    if not any(fragment in message for fragment in known_cuda_unavailable):
+        return None
+    return (
+        f"{backend.upper()} was asked to use {requested_device!r}, but CUDA "
+        "is unavailable or incompatible in this runtime. Verify device "
+        "visibility with nvidia-smi, and run "
+        f"'mliport doctor --engine {backend} --device {requested_device}' "
+        "in the same backend environment; check its CUDA-enabled framework "
+        f"installation. Original error: {error}"
+    )
+
+
+@dataclass(frozen=True)
+class VisibleGpu:
+    logical_index: int
+    uuid: str
+    physical_index: int | None
+    name: str
+    compute_capability: tuple[int, int] | None
+
+
+def visible_gpus(
+    physical: Sequence[VisibleGpu], environment: Mapping[str, str] | None = None
+) -> list[VisibleGpu]:
+    """Resolve an explicit CUDA visibility list, preserving its logical order.
+
+    Unknown or ambiguous selectors fail closed; an empty list hides all GPUs.
+    UUID prefixes are accepted only when uniquely resolvable in the inventory.
+    """
+    env = os.environ if environment is None else environment
+    visibility = env.get("CUDA_VISIBLE_DEVICES")
+    if visibility is None:
+        selected = list(physical)
+    elif visibility.strip() in {"", "-1"}:
+        selected = []
+    else:
+        selected = []
+        for token in visibility.split(","):
+            selector = token.strip()
+            matches = [
+                gpu
+                for gpu in physical
+                if (selector.isdigit() and gpu.physical_index == int(selector))
+                or (
+                    selector.startswith(("GPU-", "MIG-"))
+                    and gpu.uuid.startswith(selector)
+                )
+            ]
+            if len(matches) != 1 or matches[0] in selected:
+                if selector.startswith("MIG-"):
+                    raise RuntimeError(
+                        "CUDA_VISIBLE_DEVICES exposes a MIG device; mliport's "
+                        "device resolver supports whole GPUs only"
+                    )
+                raise RuntimeError(
+                    f"CUDA_VISIBLE_DEVICES selector {selector!r} is unknown, "
+                    "ambiguous, or duplicated"
+                )
+            selected.append(matches[0])
+    return [
+        VisibleGpu(
+            index, gpu.uuid, gpu.physical_index, gpu.name, gpu.compute_capability
+        )
+        for index, gpu in enumerate(selected)
+    ]
+
+
+def query_physical_gpus() -> list[VisibleGpu]:
+    """Physical GPU inventory from nvidia-smi (single source for CLI/queue)."""
+    import subprocess  # noqa: PLC0415
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,uuid",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("nvidia-smi failed while resolving a GPU device") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit code {result.returncode}"
+        raise RuntimeError(f"nvidia-smi failed while resolving a GPU device: {detail}")
+    inventory: list[VisibleGpu] = []
+    for line in result.stdout.splitlines():
+        fields = [field.strip() for field in line.split(",", maxsplit=1)]
+        if len(fields) != 2 or not fields[0].isdigit() or not fields[1]:
+            raise RuntimeError(f"Malformed nvidia-smi GPU inventory line: {line!r}")
+        inventory.append(
+            VisibleGpu(len(inventory), fields[1], int(fields[0]), "", None)
+        )
+    return inventory
+
+
+def resolve_visible_device(
+    device: str,
+    *,
+    inventory: Sequence[VisibleGpu] | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> VisibleGpu | None:
+    """Resolve ``cpu``/``cuda``/``cuda:N`` inside the current CVD frame.
+
+    The returned GPU carries the local ordinal (in the CUDA_VISIBLE_DEVICES
+    order), the immutable physical UUID and the physical index.  Numeric and
+    UUID visibility lists are both honoured, invalid ordinals fail closed, and
+    ``cpu`` returns ``None``.
+    """
+    normalized = str(device).strip().lower()
+    if normalized == "cpu":
+        return None
+    if normalized.startswith("mig-"):
+        raise ValueError(
+            "MIG devices are not supported as --device values; select a whole "
+            "GPU with cuda:N"
+        )
+    import re  # noqa: PLC0415
+
+    match = re.fullmatch(r"(?:gpu|cuda)(?::(\d+))?", normalized)
+    if match is None:
+        raise ValueError(
+            f"Cannot resolve device {device!r}; expected cpu, cuda, gpu or cuda:N"
+        )
+    local_ordinal = int(match.group(1) or 0)
+    env = os.environ if environment is None else environment
+    single_mig = _single_mig_visibility(env)
+    if single_mig is not None:
+        # A scheduler (e.g. Slurm on MIG-partitioned A100/H100 nodes) exposes
+        # exactly one MIG instance. It is the only CUDA device in the process.
+        if local_ordinal != 0:
+            raise RuntimeError(
+                f"CUDA device {device!r} is not visible; CUDA_VISIBLE_DEVICES "
+                "exposes a single MIG instance (use cuda or cuda:0)"
+            )
+        return VisibleGpu(0, single_mig, None, "", None)
+    physical = list(inventory) if inventory is not None else query_physical_gpus()
+    visible = visible_gpus(physical, env)
+    if not visible:
+        raise RuntimeError(
+            f"No CUDA device is visible for {device!r} "
+            f"(CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES')!r})"
+        )
+    if local_ordinal >= len(visible):
+        raise RuntimeError(
+            f"CUDA device {device!r} is not visible; CUDA_VISIBLE_DEVICES "
+            f"exposes {len(visible)} device(s)"
+        )
+    return visible[local_ordinal]
+
+
+def _single_mig_visibility(environment: Mapping[str, str]) -> str | None:
+    """Return the MIG UUID when CUDA_VISIBLE_DEVICES selects exactly one."""
+    visibility = (environment.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    if visibility.startswith("MIG-") and "," not in visibility:
+        return visibility
+    return None
+
+
+def uuid_body(uuid: str) -> str:
+    """UUID without its ``GPU-``/``MIG-`` prefix (frameworks differ in prefix)."""
+    for prefix in ("GPU-", "MIG-"):
+        if uuid.startswith(prefix):
+            return uuid[len(prefix) :]
+    return uuid
+
+
+def resolve_device_uuid(
+    device: str,
+    *,
+    inventory: Sequence[VisibleGpu] | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> str | None:
+    """Immutable UUID for a requested device (``None`` for CPU).
+
+    This is the single resolver shared by the CLI isolation re-exec and the
+    queue device lease, so both choose the same physical GPU.
+    """
+    resolved = resolve_visible_device(
+        device, inventory=inventory, environment=environment
+    )
+    return None if resolved is None else resolved.uuid
+
+
+def verify_runtime_uuid(actual_uuid: str | None, requested_uuid: str) -> str:
+    """Never substitute the requested identity for missing runtime evidence."""
+    if not actual_uuid:
+        raise RuntimeError("Framework did not report an actual GPU UUID")
+    lease = os.environ.get("MLIPORT_LEASED_GPU_UUID")
+    actual = uuid_body(actual_uuid)
+    if actual != uuid_body(requested_uuid) or (lease and actual != uuid_body(lease)):
+        raise RuntimeError("Actual framework GPU UUID differs from request or lease")
+    return actual_uuid
+
+
+def visibility_is_isolated(device: str) -> bool:
+    """True when CUDA_VISIBLE_DEVICES already isolates this process.
+
+    Non-raising counterpart of :func:`require_isolated_visibility`; the CLI
+    uses it to decide whether DPA/GRACE must restart in a fresh process.
+    """
+    dev = str(device).lower()
+    visibility = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if dev == "cpu":
+        return visibility is not None and visibility.strip() in {"", "-1"}
+    return bool(
+        dev in {"cuda", "gpu", "cuda:0"}
+        and visibility is not None
+        and visibility.strip()
+        and visibility.strip() != "-1"
+        and "," not in visibility
+        and os.environ.get("LOCAL_RANK", "0") == "0"
+        and os.environ.get("DEVICE") != "cpu"
+    )
+
+
+def require_isolated_visibility(device: str, backend: str) -> None:
+    """Preflight backends whose ASE adapter has no per-calculator device.
+
+    Such adapters cannot safely select another GPU inside an existing Python
+    process. The caller must isolate it before importing the framework, as the
+    queue worker does. No environment variable is modified here.
+    """
+    if not visibility_is_isolated(device):
+        raise RuntimeError(
+            f"{backend} requires process-level device isolation before framework "
+            "imports. Use the queue worker, or start a fresh process with "
+            "CUDA_VISIBLE_DEVICES='' for cpu / a single GPU UUID for cuda:0. "
+            "Refusing to change the parent process GPU visibility."
+        )
+
+
+def torch_model_identity(model, requested: str) -> dict:
+    """Read device identity from model tensors, never from requested settings."""
+    unknown = {
+        "actual_device_type": "unknown",
+        "actual_device_logical_index": None,
+        "actual_device_uuid": None,
+    }
+    if model is None or not callable(getattr(model, "parameters", None)):
+        return unknown
+    import torch
+
+    if not isinstance(model, torch.nn.Module):
+        return unknown
+    tensors = list(model.parameters())
+    if not tensors and callable(getattr(model, "buffers", None)):
+        tensors = list(model.buffers())
+    if not tensors or not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        return unknown
+    devices = {tensor.device for tensor in tensors}
+    if len(devices) != 1:
+        raise RuntimeError("Model tensors span multiple devices; identity is ambiguous")
+    actual = next(iter(devices))
+    expected_type = "cpu" if requested == "cpu" else "cuda"
+    if actual.type != expected_type:
+        raise RuntimeError("Model tensor device type differs from requested device")
+    identity = {
+        "actual_device_type": actual.type,
+        "actual_device_logical_index": actual.index,
+        "actual_device_uuid": None,
+        "model_precision": sorted(
+            {
+                str(t.dtype).removeprefix("torch.")
+                for t in tensors
+                if t.is_floating_point()
+            }
+        ),
+    }
+    if actual.type == "cuda":
+        # Compare the tensor's GPU with the requested ordinal inside the same
+        # CUDA runtime enumeration. Mapping the ordinal through nvidia-smi
+        # instead disagrees whenever CUDA_DEVICE_ORDER is FASTEST_FIRST on a
+        # mixed-GPU node, needs nvidia-smi on PATH, and cannot see MIG.
+        requested_index = _requested_cuda_ordinal(requested)
+        reported = _torch_device_uuid(torch, actual.index)
+        source = "torch" if reported is not None else None
+        if reported is None:
+            # torch < 2.4 does not expose ``device_properties().uuid``. When the
+            # process was started with exactly one GPU UUID in
+            # CUDA_VISIBLE_DEVICES - which the DPA and GRACE isolation contract
+            # requires - the visible ordinal *is* that UUID, so it can still be
+            # recorded, with its provenance. Nothing is invented: without the
+            # variable the call still fails closed.
+            reported = _isolated_visibility_uuid(actual.index)
+            source = "CUDA_VISIBLE_DEVICES" if reported is not None else None
+        if reported is None:
+            raise RuntimeError(
+                f"CUDA runtime did not report a UUID for requested {requested!r} "
+                "and CUDA_VISIBLE_DEVICES does not name a single GPU UUID"
+            )
+        expected = _torch_device_uuid(torch, requested_index) or reported
+        identity["actual_device_uuid_source"] = source
+        identity["actual_device_uuid"] = verify_runtime_uuid(reported, expected)
+    return identity
+
+
+def _requested_cuda_ordinal(requested: str) -> int:
+    """Logical CUDA ordinal for ``cuda``/``gpu`` (0) or ``cuda:N`` (N)."""
+    value = str(requested).strip().lower()
+    if value.startswith("cuda:") and value[5:].isdigit():
+        return int(value[5:])
+    return 0
+
+
+def _isolated_visibility_uuid(index: int | None) -> str | None:
+    """UUID named by a single-entry ``CUDA_VISIBLE_DEVICES``, if any.
+
+    Only logical device 0 can be attributed this way: with more than one entry
+    the variable no longer proves which physical GPU a logical index maps to.
+    """
+    import os
+
+    value = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not value:
+        return None
+    entries = [entry.strip() for entry in value.split(",") if entry.strip()]
+    if len(entries) != 1 or (index not in (0, None)):
+        return None
+    uuid = entries[0]
+    if uuid.startswith(("GPU-", "MIG-")):
+        return uuid
+    return None
+
+
+def _torch_device_uuid(torch, index: int | None) -> str | None:
+    """``GPU-``-prefixed UUID of a CUDA device as the CUDA runtime reports it."""
+    properties = torch.cuda.get_device_properties(0 if index is None else index)
+    uuid = getattr(properties, "uuid", None)
+    if uuid is None:
+        return None
+    uuid = str(uuid)
+    if not uuid.startswith(("GPU-", "MIG-")):
+        uuid = "GPU-" + uuid
+    return uuid
+
+
+def tensorflow_output_identity(outputs, requested: str) -> dict:
+    """Confirm TensorFlow output placement via its runtime PCI bus identity."""
+    unknown = {
+        "actual_device_type": "unknown",
+        "actual_device_logical_index": None,
+        "actual_device_uuid": None,
+    }
+    if not isinstance(outputs, list) or not outputs:
+        return unknown
+    import re
+    import subprocess
+
+    import tensorflow as tf
+    from tensorflow.python.client import device_lib
+
+    tensors = [
+        value
+        for output in outputs
+        for value in output.values()
+        if isinstance(value, tf.Tensor) and value.dtype.is_floating
+    ]
+    if not tensors:
+        return unknown
+    gpu_tensors = [tensor for tensor in tensors if "GPU:" in tensor.device.upper()]
+    device_names = {tensor.device for tensor in gpu_tensors or tensors}
+    if len(device_names) != 1:
+        raise RuntimeError("TensorFlow output devices are ambiguous")
+    name = next(iter(device_names))
+    spec = tf.DeviceSpec.from_string(name)
+    actual_type = "cuda" if spec.device_type == "GPU" else "cpu"
+    if actual_type != ("cpu" if requested == "cpu" else "cuda"):
+        raise RuntimeError("TensorFlow output device differs from request")
+    identity = {
+        "actual_device_type": actual_type,
+        "actual_device_logical_index": spec.device_index
+        if actual_type == "cuda"
+        else None,
+        "actual_device_uuid": None,
+        "model_precision": sorted({tensor.dtype.name for tensor in tensors}),
+    }
+    if actual_type == "cpu":
+        return identity
+    local = [
+        dev
+        for dev in device_lib.list_local_devices()
+        if dev.device_type == "GPU"
+        and tf.DeviceSpec.from_string(dev.name).device_index == spec.device_index
+    ]
+    if len(local) != 1:
+        raise RuntimeError("Cannot identify actual TensorFlow GPU")
+    bus = re.search(r"pci bus id:\s*([0-9a-fA-F:.]+)", local[0].physical_device_desc)
+    if bus is None:
+        raise RuntimeError("TensorFlow runtime did not report a GPU PCI bus ID")
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=pci.bus_id,uuid", "--format=csv,noheader,nounits"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    matches = [
+        uuid.strip()
+        for line in result.stdout.splitlines()
+        for address, uuid in [line.split(",", 1)]
+        if address.strip().lower().lstrip("0") == bus.group(1).lower().lstrip("0")
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("TensorFlow PCI bus cannot be uniquely mapped to a GPU UUID")
+    identity["actual_device_uuid"] = verify_runtime_uuid(
+        matches[0], resolve_device_uuid(requested)
+    )
+    return identity

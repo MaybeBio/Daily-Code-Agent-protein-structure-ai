@@ -1,0 +1,14 @@
+{
+  "name": "dockstudio-desktop",
+  "private": true,
+  "version": "2.0.5",
+  "description": "DockStudio desktop shell (Tauri)",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

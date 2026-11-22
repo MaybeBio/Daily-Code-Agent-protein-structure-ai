@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kfold"
+dynamic = ["version"]
+description = "K-Fold"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+  # core dependencies
+  "torch",
+  "numpy",
+  "tqdm",
+  "scipy",
+  "omegaconf",
+  "huggingface-hub>=1.31.0",
+  "rdkit",
+  "einops",
+  "gemmi",
+  "pyyaml",
+  # apo sampler
+  "numba",
+  "atlasfold>=1.0.4",
+]
+
+[project.scripts]
+kfold = "kfold.cli.main:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "kfold.__version__" }
+
+[project.optional-dependencies]
+train = [
+  "torch>=2.7.0",
+  'lightning', # for training loop
+  'wandb', # for experiment tracking
+  'lmdb', # for training dataset storage
+  'msgpack', # for data serialization
+  "zstandard",
+  'bioprior @ git+https://github.com/SeonghwanSeo/bio-prior.git@v0.1.2',
+  # for ccd data handling
+  'pdbeccdutils',
+]
+cuequiv = [
+  "cuequivariance==0.10.0",
+  "cuequivariance_torch==0.10.0",
+  "cuequivariance_ops_cu12==0.10.0",
+  "cuequivariance_ops_torch_cu12==0.10.0",
+]

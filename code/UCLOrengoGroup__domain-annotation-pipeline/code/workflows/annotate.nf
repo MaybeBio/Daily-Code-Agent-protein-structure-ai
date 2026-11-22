@@ -1,0 +1,709 @@
+#!/usr/bin/env nextflow
+
+nextflow.enable.dsl = 2
+
+/*
+ * Domain Annotation Pipeline - Main Workflow
+ * 
+ * This workflow processes UniProt entries through multiple domain prediction tools,
+ * generates consensus results, and produces final annotated domain assignments.
+ */
+
+
+// ===============================================
+// PARAMETERS
+// ===============================================
+// Output directory
+params.results_dir = params.results_dir ?: "${workflow.launchDir}/results/${params.project_name}"
+params.publish_mode = 'copy'
+
+// ===============================================
+// MODULE IMPORTS
+// ===============================================
+
+// Data preparation modules
+include { get_uniprot_data } from '../modules/get_uniprot.nf'
+// include { collect_taxonomy } from '../modules/collect_taxonomy.nf'
+// include { extract_pdb_from_zip } from '../modules/extract_pdb_from_zip.nf'
+include { filter_pdb_from_zip } from '../modules/filter_pdb_from_zip.nf'
+// New process to create and transform an input mapping (id and zip) into chunk files within zips
+include { create_input_from_zip } from '../modules/create_input_from_zip.nf'
+include { chunk_ids_by_zip as chunk_by_zip        } from '../modules/chunk_by_zipfile.nf'
+include { chunk_ids_by_zip as heavy_chunk_by_zip  } from '../modules/chunk_by_zipfile.nf'
+include { renumber_pdb_file } from '../modules/renumber_pdb_file.nf'
+// Domain prediction modules
+// run_ted_segmentation has been split so Chainsaw runs concurrently with the Merizo->UniDoc chain,
+// then consensus joins the three choppings.
+include { run_ted_merizo_unidoc } from '../modules/run_ted_merizo_unidoc.nf'
+include { run_ted_chainsaw } from '../modules/run_ted_chainsaw.nf'
+include { run_ted_consensus } from '../modules/run_ted_consensus.nf'
+
+// Filtering and consensus modules - these are all unused as ted_segmentation takes care of all of this funtionality.
+//include { run_filter_domains } from '../modules/run_filter_domains.nf'
+//include { run_filter_domains_reformatted as run_filter_domains_reformatted_unidoc } from '../modules/run_filter_domains_reformatted.nf'
+//include { run_filter_domains_reformatted as run_filter_domains_reformatted_merizo } from '../modules/run_filter_domains_reformatted.nf'
+//include { convert_merizo_results } from '../modules/convert_merizo_results.nf'
+//include { convert_unidoc_results } from '../modules/convert_unidoc_results.nf'
+//include { run_get_consensus } from '../modules/run_get_consensus.nf'
+//include { run_filter_consensus } from '../modules/run_filter_consensus.nf'
+
+// Post-processing modules
+//include { chop_pdb } from '../modules/chop_pdb.nf'
+include { chop_pdb_from_zip } from '../modules/chop_pdb_from_zip.nf'
+include { restore_pdb_numbering } from '../modules/restore_pdb_numbering.nf'
+include { create_md5 } from '../modules/create_domain_md5.nf'
+include { run_stride } from '../modules/run_stride.nf'
+//include { summarise_stride } from '../modules/summarise_stride.nf'
+include { transform_consensus } from '../modules/transform.nf'
+
+// Analysis modules
+include { run_domain_quality } from '../modules/run_domain_quality.nf'
+include { run_measure_globularity } from '../modules/run_measure_globularity.nf'
+include { run_plddt } from '../modules/run_plddt.nf'
+include { no_plddt } from '../modules/no_plddt.nf'
+include { join_plddt_md5 } from '../modules/join_plddt_md5.nf'
+
+// Final collection modules
+include { collect_results } from '../modules/collect_results_combine_chopping.nf'
+include { collect_results_final } from '../modules/collect_results_add_metadata.nf'
+include { restore_final_results } from '../modules/restore_final_results.nf'
+include { benchmark_compare_results } from '../modules/benchmark_compare_results.nf'
+
+// Foldseek modules
+include { fetch_foldseek_assets } from '../foldseek/modules/foldseek_fetch_foldseek_assets.nf'
+include { foldseek_create_db } from '../foldseek/modules/foldseek_create_db.nf'
+include { foldseek_run_foldseek } from '../foldseek/modules/foldseek_run_foldseek.nf'
+include { foldseek_run_convertalis } from '../foldseek/modules/foldseek_run_convertalis.nf'
+include { foldseek_process_results } from '../foldseek/modules/foldseek_process_results.nf'
+
+
+// ===============================================
+// HELPER FUNCTIONS
+// ===============================================
+
+def warnOnArchitectureMismatch() {
+    def jvmArch = (System.getProperty('os.arch') ?: 'unknown').toLowerCase()
+    def hostArch = 'unknown'
+
+    try {
+        hostArch = 'uname -m'.execute().text.trim().toLowerCase()
+    } catch (Exception _ignored) {
+        // Keep hostArch as 'unknown' if uname is unavailable.
+    }
+
+    def hostIsArm = hostArch.contains('aarch64') || hostArch.contains('arm64')
+    def jvmIsX86 = jvmArch.contains('x86_64') || jvmArch.contains('amd64')
+
+    if (hostIsArm && jvmIsX86) {
+        log.warn(
+            """
+            =====================================================================
+            Architecture mismatch detected
+            ---------------------------------------------------------------------
+            Host architecture          : ${hostArch}
+            JVM architecture           : ${jvmArch}
+            Resolved container tag     : ${params.container_tag_name}
+
+            This often causes amd64 container selection on arm64 hosts and slower
+            emulated execution (notably in run_ted_segmentation).
+
+            Recommended actions:
+            - Use an arm64 JDK so Java reports arm64/aarch64
+            - Or override tags explicitly: --container_tag_name <existing-tag>
+            =====================================================================
+            """.stripIndent()
+        )
+    }
+}
+
+def validateParameters() {
+
+    warnOnArchitectureMismatch()
+
+    if (!params.project_name) {
+        error("Project name must be specified in the parameters.")
+    }
+
+    if (!params.chunk_size || (params.chunk_size as Integer) <= 0 ) {
+        error("Chunk size must be a positive integer.")
+    }
+
+    if (params.debug && !params.max_entries) {
+        params.max_entries = 10
+    }
+
+    if (!params.input_zip_dir) {
+        error("--input_zip_dir must be specified.")
+    }
+
+    // Ensure results directory exists
+    if (!file(params.results_dir).exists()) {
+        file(params.results_dir).mkdirs()
+    }
+    // Ensure reports directory exists
+    if (!file(params.reports_dir).exists()) {
+        file(params.reports_dir).mkdirs()
+    }
+
+    // Validate required parameters
+    if (!params.input_zip_dir || !file(params.input_zip_dir).exists()) {
+        error("Input ZIP directory not found: ${params.input_zip_dir}")
+    }
+    // Validate optional uniprot_tsv_file format (first 100 lines)
+    if (params.uniprot_tsv_file) {
+        def mappingFile = file(params.uniprot_tsv_file)
+        if (!mappingFile.exists()) {
+            error("UniProt TSV file not found: ${params.uniprot_tsv_file}")
+        }
+        mappingFile.readLines().take(100).eachWithIndex { line, idx ->
+            def cols = line.split('\t')
+            if (cols.size() != 2)
+                error("Invalid TSV mapping: line ${idx + 1} does not have 2 tab-separated columns")
+            if (!cols[1].endsWith('.zip'))
+                error("Invalid TSV mapping: line ${idx + 1} zip name must end with .zip")
+        }
+    }
+    // Foldseek asset existence check
+    def db_exists     = params.target_db   && file(params.target_db).exists() // Check existence of target_db
+    def lookup_exists = params.lookup_file && file(params.lookup_file).exists() // Check existence of lookup_file
+    params.fetch_foldseek_assets = !(db_exists && lookup_exists) // Decide whether assets must be fetched
+
+    // Foldseek-specific validation
+    if (!params.parser_script || !file(params.parser_script).exists()) {
+        error("Foldseek parser_script not found: ${params.parser_script}")
+    }
+    log.info(
+        """
+    ==============================================
+    Domain Annotation Pipeline
+    ==============================================
+    Project name         : ${params.project_name}
+    UniProt TSV file     : ${params.uniprot_tsv_file ?: 'N/A'}
+    Input ZIP folder     : ${params.input_zip_dir}
+    Main chunk size      : ${params.chunk_size}
+    Heavy chunk size     : ${params.heavy_chunk_size}
+    Adaptive heavy chunks: ${params.adaptive_heavy_chunking}
+    Foldseek_scale_factor: ${params.fs_scale_factor}
+    Min chain residues   : ${params.min_chain_residues}
+    Max entries (debug)  : ${params.max_entries ?: 'N/A'}
+    Results dir          : ${params.results_dir}
+    Reports dir          : ${params.reports_dir}
+    Debug mode           : ${params.debug}
+    TED tools version    : ${params.ted_tools_version}
+    cath-alphaflow ver.  : ${params.cath_alphaflow_version}
+    ----------------------------------------------
+    Foldseek Configuration Information
+    ----------------------------------------------
+    Target database     : ${params.foldseek_db_url.tokenize('/')[-1]}
+    Lookup file         : ${params.foldseek_lookup_url.tokenize('/')[-1]}
+    Foldseek assests dir: .../${params.cache_dir.tokenize('/')[-3]}/${params.cache_dir.tokenize('/')[-2]}/${params.cache_dir.tokenize('/')[-1]}
+    Assets status       : ${params.fetch_foldseek_assets ? 'Fetching new assets' : 'Using existing assets'}
+    ==============================================
+    """.stripIndent()
+    )
+}
+
+// ===============================================
+// MAIN WORKFLOW
+// ===============================================
+
+workflow {
+    
+    validateParameters()
+    
+    // =========================================
+    // PHASE 0: Setup Foldseek Assets
+    // =========================================
+    if (params.auto_fetch_foldseek_assets) {
+        // Download foldseek assets: storeDir + fetch_foldseek_assets checks for missing files or change in URL and downloads if required
+        fetch_foldseek_assets()
+        // Use process outputs - Nextflow ensures fetch completes before downstream processes start
+        ch_target_db = fetch_foldseek_assets.out.target_db
+        ch_lookup_file = fetch_foldseek_assets.out.lookup_file
+
+    } else {
+        // Manual mode - specifies custom CATH database file locations
+        // Usage: set --auto_fetch_foldseek_assets to false and --target_db /path/to/db --lookup_file /path/to/lookup
+        if (!file(params.target_db).exists()) {
+            error("Foldseek target_db file not found: ${params.target_db}")
+        }
+        if (!file(params.lookup_file).exists()) {
+            error("Foldseek lookup_file not found: ${params.lookup_file}")
+        }
+        ch_target_db = Channel.value(file(params.target_db))
+        ch_lookup_file = Channel.value(file(params.lookup_file))
+    }
+
+    // =========================================
+    // PHASE 1: Data Preparation
+    // =========================================
+
+    // A TSV file (two columns: id <TAB> zip_name) may be specified at runtime with param --uniprot_tsv_file to list ids and zip names.
+    if (params.uniprot_tsv_file) {
+        input_mapping_ch = Channel.fromPath(params.uniprot_tsv_file, checkIfExists: true)
+    } else {
+    // If not, create the ids and zip file channel directly from the zips in --input_zip_dir (mandatory runtime input).
+        input_mapping_ch = create_input_from_zip(file(params.input_zip_dir), file(params.create_input_from_zip_script))
+    }
+    // zip_id_ch splits the mapping file into [id, zip_name] tuples for downstream processing
+    zip_id_ch = input_mapping_ch                                    // Create a channel from the input
+        .splitCsv(sep: '\t')                                        // Split into individual values by row
+        .map { row -> tuple(row[0].trim(), row[1].trim()) }         // Assign the id from col 1 and the zip file from col 2
+        .filter { id, zip_name -> id != '' && zip_name != '' }      // Filter blank id rows
+        .unique()                                                   // Remove duplicates
+        .toSortedList { a, b -> a[0] <=> b[0] }                     // Sort by id for deterministic order
+        .flatMap { it }                                             // Flatten into a list to stream into the channel
+    // Resultant zip_id_ch is [id, zip_name]
+    
+    // Apply debug limit if enabled
+    if (params.debug && params.max_entries) {
+        zip_id_ch = zip_id_ch.take(params.max_entries)
+    }
+
+    // Now create a file called all_ids_mapping.txt which contains two columns: [id, zip_name].
+    all_ids_mapping_ch = zip_id_ch
+        .map { id, zip -> "${id}\t${zip}" }
+        .collectFile(
+            name: 'all_ids_mapping.txt',
+            newLine: true,
+            sort: true,
+            storeDir: "${params.results_dir}/intermediate"
+        )
+    
+    // chunk_ids_by_zip splits all_ids_mapping.txt into chunk_size chunks within zips, assigning a 3-part tuple [chunk_id, chunk_file, zip_name].
+    zip_chunks = chunk_by_zip(all_ids_mapping_ch, params.chunk_size, file(params.chunk_by_zip_script), false)
+
+    // Recreate the original chunked_ids_mapping_ch from the 3-part tuple output of chunk_by_zip. This feeds filter_pdb_from_zip.
+    chunked_ids_mapping_ch = zip_chunks.chunk_mapping
+    .splitCsv(header: true, sep: '\t')
+    .map { row ->
+        tuple(
+            row.chunk_id as int,
+            file(row.chunk_file),
+            file("${params.input_zip_dir}/${row.zip_name}")
+        )
+    }
+    // As a branch channel, create a 2-part tuple channel [chunk_id, chunk_file] just for get_uniprot_data
+    chunked_tax_ids_ch = chunked_ids_mapping_ch
+        .map { chunk_id, id_file, zip_name ->
+        tuple(chunk_id, id_file) }
+
+    // Get taxonomic data using the new chunked_tax_ids_ch which only has [chunk_id, chunk_file]
+    uniprot_data_ch = get_uniprot_data(chunked_tax_ids_ch)
+    collected_taxonomy_ch = uniprot_data_ch
+        .toSortedList { it -> it[0] }
+        .flatMap{ it }
+        .collectFile(
+            name: 'all_taxonomy.tsv',
+            keepHeader: true,
+            skip: 1,
+            sort: false,
+            storeDir: params.results_dir,
+        ) { it[1] }
+    
+    // Determine which ZIP archive downstream should use.
+    // If cif_mode is enabled, first convert the input CIF.GZ ZIP to a PDB ZIP. If not continue with PDB ZIP file.
+    // For the multizip (sharded) input - this block becomes redundant. Remove input_zip_ch and pdb_zip_ch. 
+    //input_zip_ch = Channel.value(file(params.pdb_zip_file))
+
+    //if (params.cif_mode) {
+    //    pdb_zip_ch = prepare_pdb_file(input_zip_ch)
+    //} else {
+    //    pdb_zip_ch = input_zip_ch
+    //}
+
+    // =========================================
+    // Experimental PDB structures, set "--experimental true" in the run command
+    // =========================================
+    // For experimental models, run renumber_pdb_file first on the 3-part tuple chunked data channel, then filter_pdb_from_zip.
+    if (params.experimental == true) {
+        renumber_file_ch = renumber_pdb_file(chunked_ids_mapping_ch,file("${baseDir}/../docker/script/renumber_pdb.py"))
+        filter_input_ch = renumber_file_ch.normalised.map {chunk_id, id_file, normalised_zip, resmaps_zip ->
+        tuple(chunk_id, id_file, normalised_zip)}
+        filtered_pdb_ch = filter_pdb_from_zip(filter_input_ch, params.min_chain_residues, params.max_chain_residues, file(params.filter_pdb_zip_script))}
+    // For predicted models, run filter_pdb_from_zip on the 3-part tuple chunked data channel (creates filtered lists).
+    else {filtered_pdb_ch = filter_pdb_from_zip(chunked_ids_mapping_ch, params.min_chain_residues, params.max_chain_residues, file(params.filter_pdb_zip_script))}
+
+    // Keep validation results for auditing and carry accepted residue counts
+    // forward so segmentation chunks can be ordered from shortest to longest.
+    filtered_pdb_ch.metadata
+        .toSortedList { it -> it[0] }
+        .flatMap { it }
+        .collectFile(
+            name: 'pdb_filter_metadata.tsv',
+            keepHeader: true,
+            skip: 1,
+            sort: false,
+            storeDir: "${params.results_dir}/intermediate"
+        ) { it[1] }
+    
+    // =========================================
+    // PHASE 2: Domain Prediction
+    // =========================================
+
+    // Rechunk for TED segmentation using ID, ZIP name and protein length.
+    // Metadata columns 0, 2 and 7 are pdb_id, status and residue_count;
+    // for example, an accepted row is emitted as: A0A000\tinput.zip\t394
+    filtered_three_part_ch = filtered_pdb_ch.metadata
+        .flatMap { chunk_id, metadata_file, zip_name ->
+            metadata_file.text
+                .readLines()
+                .drop(1)
+                .findAll { line -> line.split('\t', -1)[2] == 'accepted' }
+                .collect { line ->
+                    def fields = line.split('\t', -1)
+                    "${fields[0]}\t${zip_name}\t${fields[7]}"
+                }
+        }
+        .collectFile(
+            name: 'filtered_af_ids.txt', // Write the chunks to an output file
+            newLine: true,
+            sort: true,
+            storeDir: "${params.results_dir}/intermediate"
+        )
+
+    // Use process chunk_ids_by_zip to split filtered_af_ids.txt into heavy_chunk_size chunks within zips, assigning the 3-part tuple [chunk_id, chunk_file, zip_name].
+    heavy_chunks = heavy_chunk_by_zip(filtered_three_part_ch, params.heavy_chunk_size, file(params.chunk_by_zip_script), params.adaptive_heavy_chunking)
+    
+    // Create heavy_chunk_ch as a channel from the process output for both experimental and predicted models
+    // For experimental models replace the original ZIP with the path to each normalised_X.zip file.
+    if (params.experimental == true) {
+        normalised_zip_ch = renumber_file_ch.normalised_zip
+            .map { chunk_id, zip_file ->         // accept chunk_id, zip_file (full path) from the tuple
+                tuple(zip_file.name, zip_file)   // only keep the zip_file name and zip_file path (drop chunk_id)
+            }
+        heavy_mapping_ch = heavy_chunks.chunk_mapping // define a channel from the chunk_mapping.tsv file
+            .splitCsv(header: true, sep: '\t')
+            .map { row ->
+                tuple(row.zip_name, row.chunk_id as int, file(row.chunk_file), row.max_residues as int) // 4 part tuple
+            }
+        heavy_chunk_ch = heavy_mapping_ch
+            .combine(normalised_zip_ch, by: 0) // join the two channels above on zip name
+            .map { zip_name, chunk_id, chunk_file, max_residues, zip_file -> // input is now a 5-part tuple (zip_file from normailised_zip_ch)
+                tuple(chunk_id, chunk_file, zip_file, max_residues) // keep only these 4 for the heavy_chunk_ch
+            }
+    } 
+    // For predicted models, keep the original ZIP file
+    else {
+        heavy_chunk_ch = heavy_chunks.chunk_mapping
+        .splitCsv(header: true, sep: '\t')
+        .map { row ->
+        tuple(row.chunk_id as int, file(row.chunk_file), file("${params.input_zip_dir}/${row.zip_name}"), row.max_residues as int)}
+    }
+
+    // Run Chainsaw concurrently with the Merizo->UniDoc chain (both consume the same chunk channel),
+    // then join the three choppings by chunk_id (plus the zip name) to compute consensus.
+    merizo_unidoc_ch = run_ted_merizo_unidoc(heavy_chunk_ch)
+    chainsaw_seg_ch  = run_ted_chainsaw(heavy_chunk_ch)
+
+    consensus_input_ch = merizo_unidoc_ch.merizo
+        .join(merizo_unidoc_ch.unidoc)
+        .join(chainsaw_seg_ch.chainsaw)
+        .join(heavy_chunk_ch.map { cid, id_file, zip, max_residues -> tuple(cid, zip.name) })
+
+    consensus_ch = run_ted_consensus(consensus_input_ch)
+
+    // =========================================
+    // PHASE 3: Results Collection & Filtering
+    // =========================================
+
+    // collect the results for chainsaw, merizo and unidoc output - now added sorting to each to help cache performance.
+    collected_chainsaw_ch = chainsaw_seg_ch.chainsaw
+        .toSortedList { it -> it[0] }
+        .flatMap { it }
+        .collectFile(
+            name: 'domain_assignments.chainsaw.tsv',
+            sort: false,
+            storeDir: params.results_dir,
+        ) { it[1] }
+
+    collected_merizo_ch = merizo_unidoc_ch.merizo
+        .toSortedList { it -> it[0] }
+        .flatMap { it }
+        .collectFile(
+            name: 'domain_assignments.merizo.tsv',
+            sort: false,
+            storeDir: params.results_dir,
+        ) { it[1] }
+
+    collected_unidoc_ch = merizo_unidoc_ch.unidoc
+        .toSortedList { it -> it[0] }
+        .flatMap { it }
+        .collectFile(
+            name: 'domain_assignments.unidoc.tsv',
+            sort: false,
+            storeDir: params.results_dir,
+        ) { it[1] }
+
+    // collect the results for the consensus output - note: this channel drives the rest of the workflow.
+    // TODO: current behaviour (storeDir) writes to a permanent file in results. Enhancement: update to use a cached work directory.
+    collected_consensus_ch = consensus_ch.consensus
+        .toSortedList { it -> it[0] }
+        .flatMap { it }
+        .collectFile(
+            name: 'domain_assignments.consensus.tsv',
+            sort: false,
+            storeDir: params.results_dir,
+        ) { it[1] }
+
+    // =========================================
+    // PHASE 4: Post-Consensus Processing
+    // =========================================
+    // Build the 3-part tuple [chunk_id, consensus_file, zip_file] for downstream processing.
+    // For experimental models replace the original ZIP with the path to each normalised_X.zip file.
+    if (params.experimental == true) {
+    chop_input_ch = consensus_ch.consensus
+        .map { chunk_id, consensus_file, zip_name ->
+            tuple(zip_name, chunk_id, consensus_file)
+        }
+        .combine(normalised_zip_ch, by: 0)
+        .map { zip_name, chunk_id, consensus_file, zip_file ->
+            tuple(chunk_id, consensus_file, zip_file)
+        }
+    } 
+    // For predicted models, keep the original ZIP file
+    else {
+    chop_input_ch = consensus_ch.consensus
+        .map { chunk_id, consensus_file, zip_name ->
+            tuple(chunk_id, consensus_file, file("${params.input_zip_dir}/${zip_name}"))
+        }
+    }
+    // Chop pdbs in parallel using chunks and extracting from zip on-the-fly. Removed pdb_zip_ch and replaced with the 3-part tuple
+    chop_pdb_from_zip(chop_input_ch)
+    chopped_pdb_ch = chop_pdb_from_zip.out.chopped_pdbs
+    // Output failed chopping files to an errors directory
+    chop_pdb_from_zip.out.empty_error_pdbs.subscribe { id, archiveFile ->
+        def errorDir = file("${params.results_dir}/errors")
+        errorDir.mkdirs()
+        archiveFile.copyTo(errorDir.resolve(archiveFile.name))
+    }
+
+    // Generate MD5 hashes for domains added a new file and script_ch - NEW CODE
+    md5_chunks_ch = create_md5(chopped_pdb_ch)
+    collected_md5_ch = md5_chunks_ch
+        .toSortedList { it -> it[0] }
+        .flatMap{ it }
+        .collectFile(
+            name: "all_md5.tsv",
+            keepHeader: true,
+            skip: 1,
+            sort: false,
+            storeDir: params.results_dir,
+        ) { it[1] }
+
+    // For Experimental models only: regenerate the chopped pdbs with the original numbering
+    if (params.experimental == true) {
+        resmap_mapping_ch = consensus_ch.consensus
+            .map { chunk_id, consensus_file, zip_name ->
+                def original_chunk_id = zip_name
+                    .replace('normalised_', '')
+                    .replace('.zip', '') as int
+                tuple(chunk_id, original_chunk_id)
+            }
+
+        restoration_input_ch = chopped_pdb_ch
+            .combine(resmap_mapping_ch, by: 0)
+            .map { chunk_id, chopped_pdb_file, original_chunk_id ->
+                tuple(original_chunk_id, chunk_id, chopped_pdb_file)
+            }
+            .combine(renumber_file_ch.resmaps_zip, by: 0)
+            .map { original_chunk_id, chunk_id, chopped_pdb_file, resmap_zip ->
+                tuple(chunk_id, chopped_pdb_file, resmap_zip)
+            }
+
+        restore_pdb_numbering(restoration_input_ch, file("${baseDir}/../docker/script/restore_pdb_numbering.py"))
+    }
+    // =========================================
+    // PHASE 5: Structure Analysis
+    // =========================================
+
+    // Run STRIDE analysis
+    stride_summary_script_ch = file(
+        "${workflow.projectDir}/../docker/script/create_stride_summary.py", // this becomes input:stride_summary_script
+        checkIfExists: true)
+    
+    stride_summaries_ch = run_stride(chopped_pdb_ch, stride_summary_script_ch)
+
+    collected_stride_summaries_ch = stride_summaries_ch
+        .toSortedList { it -> it[0] }
+        .flatMap{ it }
+        .collectFile(
+            name: "all_stride_summaries.tsv",
+            keepHeader: true,
+            skip: 1,
+            sort: false,
+            storeDir: params.results_dir,
+        ) { it[1] } // use file name to collect
+    
+    // Run globularity analysis
+    globularity_ch = run_measure_globularity(chopped_pdb_ch)
+    // globularity_ch.view { "globularity_ch: " + it }
+    // no flatten as only a single file per chunk
+    collected_globularity_ch = globularity_ch
+        .toSortedList { it -> it[0] }
+        .flatMap{ it }
+        .collectFile(
+            name: "all_domain_globularity.tsv",
+            keepHeader: true,
+            skip: 1,
+            sort: false,
+            storeDir: params.results_dir,            
+        ) { it[1] } // use file name to collect
+
+    // Run domain quality
+    domain_quality_ch = run_domain_quality(chopped_pdb_ch)
+
+    collected_domain_quality_ch = domain_quality_ch
+        .toSortedList { it -> it[0] }
+        .flatMap{ it }
+        .collectFile(
+            name: "all_domain_quality.csv",
+            keepHeader: true,
+            skip: 1,
+            sort: false,
+            storeDir: params.results_dir,
+        ) { it[1] } // use file name to collect
+
+    // Run pLDDT analysis on Experimental and Predicted structures
+    if (params.experimental == true) {
+    // Run the dummy module (no_plddt) to ignore the Bfac column and set plddt to 100
+    plddt_ch = no_plddt(chopped_pdb_ch)
+    }
+    else {
+    // Run the regular avg_plddt calculation module
+    plddt_ch = run_plddt(chopped_pdb_ch)
+    }
+    collected_plddt_ch = plddt_ch
+        .toSortedList { it -> it[0] }
+        .flatMap{ it }
+        .collectFile(
+            name: "all_plddt.tsv",
+            sort: false,
+            storeDir: params.results_dir,
+        ) { it[1] } // use file name to collect
+    
+    collected_plddt_with_md5_ch = join_plddt_md5(collected_plddt_ch, collected_md5_ch)
+
+    // =========================================
+    // PHASE 6: Run foldseek
+    // =========================================
+    // Introduce a new channel to create foldseek_batch_ch from chopped_pdb_ch using fs_scale_factor
+    foldseek_batch_ch = chopped_pdb_ch
+        .map { chunk_id, tar_file ->
+            tuple((chunk_id / params.fs_scale_factor) as int, tar_file)
+        } // this part is dividing by the scale factor and then dropping the decimal so <scale factor = 0 for example.
+        .groupTuple()
+
+    // Create the query DB from the combined foldseek_batch_ch channel
+    foldseek_create_db(foldseek_batch_ch) // New - run from the new foldseek_batch_ch
+
+    // Run foldseek search on the output of process create_foldseek_db and the CATH database
+    fs_search_ch = foldseek_run_foldseek(foldseek_create_db.out.query_db_dir, ch_target_db)
+    
+    // Convert results with fs convertalis, pass query_db, CATH_db and output db from run_foldseek
+    fs_m8_ch = foldseek_run_convertalis(fs_search_ch, ch_target_db)
+
+    // Parse output - first create a channel from the location of the python and look_up scripts
+    ch_parser_script = Channel.value(file(params.parser_script))
+    //ch_parser_script = Channel.fromPath(params.parser_script, checkIfExists: true)
+    
+    // Now pass the convertalis .m8 and python script as intputs to the parsing process
+    fs_parsed_ch = foldseek_process_results(fs_m8_ch, ch_lookup_file, ch_parser_script)
+    
+    // Finally combine results together with a similar collectFile statement as used above
+    foldseek_ch = fs_parsed_ch
+        .toSortedList { it -> it[0] }
+        .flatMap{ it }
+        .collectFile( 
+            name: 'foldseek_parsed_results.tsv',
+            keepHeader: true,
+            skip: 1,
+            sort: false,
+            storeDir: params.results_dir,
+        ) { it[1] }
+
+    // =========================================
+    // PHASE 7: Final Assembly
+    // =========================================
+
+    // Transform consensus with structure data
+
+    // This hard codes combine_results_final.py as the input to the collect_results_final process.
+    transform_consensus_script_ch = Channel.fromPath(
+        "${workflow.projectDir}/../docker/script/transform_consensus.py",
+        checkIfExists: true
+    )
+
+    transformed_consensus_ch = transform_consensus(
+        transform_consensus_script_ch,
+        collected_consensus_ch,
+        collected_md5_ch,
+        collected_stride_summaries_ch,
+    )
+
+    // Collect intermediate results
+    intermediate_results_ch = collect_results(
+        collected_chainsaw_ch,
+        collected_merizo_ch,
+        collected_unidoc_ch,    
+    )
+
+    // This hard codes combine_results_final.py as the input to the collect_results_final process. 
+    collect_results_script_ch = Channel.fromPath(
+        "${workflow.projectDir}/../docker/script/combine_results_final.py", // this becomes input:combine_script
+        checkIfExists: true
+    )
+    // Now collect the final results
+    final_results_ch = collect_results_final(
+        collect_results_script_ch,
+        transformed_consensus_ch,
+        collected_globularity_ch,
+        collected_plddt_with_md5_ch,
+        collected_domain_quality_ch,
+        collected_taxonomy_ch,
+        foldseek_ch,
+    )
+
+    // Compare the results to the benchmark set if the benchmark_154 profile is used
+    if (params.benchmark) {
+        expected_results_ch = channel.fromPath(
+            params.expected_results,
+            checkIfExists: true
+        )
+
+        benchmark_compare_results(
+            final_results_ch,
+            expected_results_ch
+        )
+    }
+    
+    // ==========================================
+    // PHASE 8: Completion and output Information
+    // ==========================================
+    // If this is an experimental PDB run - create the restored_final_results listing as a copy of final_results with original residue numbers
+    if (params.experimental == true) {
+        all_resmaps_ch = renumber_file_ch.resmaps_zip
+            .map { chunk_id, resmap_zip -> resmap_zip }
+            .collect()
+
+        restored_final_results_ch = restore_final_results(final_results_ch, all_resmaps_ch,file("${baseDir}/../docker/script/restore_final_results.py"))
+    }
+    // Remove duplicate final output file and log the location of final_results.tsv to screen
+    final_results_ch
+        .map { def output_path = "${params.results_dir}/final_results.tsv"
+            log.info("Final results written to: ${output_path}")
+            return output_path
+        }
+
+    // Create completion marker
+    final_results_ch
+        .map {
+            def completion_file = file("${params.results_dir}/WORKFLOW_COMPLETED")
+            completion_file.text = """
+            Workflow completed successfully at: ${new Date()}
+            Total processing time: ${workflow.duration}
+            """.stripIndent()
+            return "Workflow completed successfully"
+        }
+        .view()
+}

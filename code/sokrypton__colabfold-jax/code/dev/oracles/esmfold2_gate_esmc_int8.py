@@ -1,0 +1,55 @@
+"""Gate the int8 ESM-C tower against native's saved hidden states, ON GPU.
+
+The float32 tower never fit a 23 GB card, which is why the original gate set
+jax_platform_name='cpu' -- a standing rule violation that only existed because
+of the size. At int8 the blob is 5.46 GB and the forward runs one block at a
+time, so this runs where everything else does.
+"""
+import os as _os, sys as _sys  # dev/af3_dev_paths.py: vendor trees, venvs and weights
+_sys.path.insert(0, _os.path.normpath(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), '..')))
+from af3_dev_paths import dev_path  # noqa: E402
+import os
+import sys
+import time
+
+import numpy as np
+import jax
+
+sys.path.insert(0, dev_path('~/alphafold3'))
+sys.path.insert(0, dev_path('~/alphafold3/src'))
+sys.argv = sys.argv[:1]
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from esmfold2_dumps import state_dict as _sd_of, native as _native_of
+# MODEL picks the release: every ESMFold2 variant has its own weights AND
+# its own shim, and crossing them reads corr 0.026 against native.
+MODEL = os.environ.get('MODEL', 'esmfold2')
+assert jax.devices()[0].platform == 'gpu', 'this must run on the GPU'
+
+from alphafold3.model import esm as E
+from dev.oracles.fold_check import parse_ca
+
+seq, _ = parse_ca(dev_path('~/6MRR.pdb'))
+nat = _native_of(MODEL)['lm_hidden'][0]      # (L, 81, D) torch, fp32
+
+t0 = time.time()
+ours = E.embed(seq)                                            # (L, 81, D)
+print('int8 tower: %s in %.0f s' % ((ours.shape,), time.time() - t0))
+print('native     : %s' % (nat.shape,))
+for li in (0, 1, 40, 78, 79, 80):
+  o, n = ours[:, li], nat[:, li]
+  print('  layer %-3d relerr %.3e  corr %.8f'
+        % (li, np.abs(o - n).max() / max(np.abs(n).max(), 1e-9),
+           np.corrcoef(o.ravel(), n.ravel())[0, 1]))
+print('ALL layers corr %.8f' % np.corrcoef(ours.ravel(), nat.ravel())[0, 1])
+
+# What actually matters is not the hidden states but the pair representation the
+# trunk sees: the learned softmax mix concentrates on the last layers, so an
+# error there counts for more than one at layer 3.
+from alphafold3.model import esm as esmfold2_lm
+p = esmfold2_lm.load_shim_params(dev_path('~/ported/esmfold2'))
+zo = esmfold2_lm.shim(ours, p)
+zn = esmfold2_lm.shim(nat, p)
+print('lm_pair    corr %.8f   std %.4f vs %.4f'
+      % (np.corrcoef(np.asarray(zo).ravel(), np.asarray(zn).ravel())[0, 1],
+         np.asarray(zo).std(), np.asarray(zn).std()))
+np.savez_compressed(S + '6mrr_lm_pair_int8.npz', lm_pair=np.asarray(zo, np.float32))

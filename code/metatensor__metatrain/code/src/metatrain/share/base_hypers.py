@@ -1,0 +1,588 @@
+# mypy: disable-error-code=misc
+# We ignore misc errors in this file because TypedDict
+# with default values is not allowed by mypy.
+import os
+import warnings
+from typing import Annotated, Any, Literal, Optional
+
+from annotated_types import Interval
+from pydantic import (
+    AfterValidator,
+    ConfigDict,
+    Discriminator,
+    NonNegativeInt,
+    Tag,
+    with_config,
+)
+from typing_extensions import NotRequired, TypedDict
+
+from metatrain.utils.distributed.slurm import is_slurm
+
+
+class BasePrecision:
+    """OmegaConf interpolation that resolves to ``base_precision``.
+
+    Use :attr:`value` as the default for architecture precision fields so they
+    automatically track the user's ``base_precision`` (16, 32, or 64)::
+
+        precision: int = BasePrecision.value
+
+    The value ``"${base_precision}"`` is a native OmegaConf interpolation.
+    After ``OmegaConf.merge``, accessing the field resolves it through the
+    root-level ``base_precision`` key (which itself may use the
+    ``${default_precision:}`` resolver).
+    """
+
+    value: str = "${base_precision}"
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class ArchitectureBaseHypers(TypedDict):
+    name: str
+    """The name of the architecture."""
+    atomic_types: NotRequired[list[int]]
+    """List of atomic types present in the dataset.
+
+    If not provided, it will be inferred from the training dataset.
+    This hyperparameter is useful if you envision that in the future
+    your model will need to be trained/finetuned on datasets with
+    additional atomic types.
+    """
+    model: NotRequired[dict]
+    """Model-specific hyperparameters.
+    These depend on the architecture used.
+    """
+    training: NotRequired[dict]
+    """Training-specific hyperparameters.
+
+    These depend on the architecture used.
+    """
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class SystemsHypers(TypedDict):
+    """Hyperparameters for the systems in the dataset."""
+
+    read_from: NotRequired[str]
+    """Path to the file containing the systems."""
+    reader: NotRequired[Optional[Literal["ase", "metatensor"]]]
+    """The reader library to use for parsing.
+
+    If ``null`` or not provided, the reader will be guessed
+    from the file extension. For example, ``.xyz`` and ``.extxyz``
+    will be read by ``ase`` and ``.mts`` will be read by
+    ``metatensor``."""
+    length_unit: NotRequired[Optional[str]]
+    """Unit of lengths in the system file, optional but **highly recommended for
+    running simulations**. If not given, no unit conversion will be performed when
+    running simulations which may lead to severe errors.
+
+    The list of possible length units is available `here
+    <https://docs.metatensor.org/metatomic/latest/torch/reference/misc.html#known-quantities-units>`_."""
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class GradientDict(TypedDict):
+    read_from: NotRequired[str]
+    """The path to the file for gradient data.
+
+    If not provided, the path from its associated target is used.
+    """
+    reader: NotRequired[Optional[Literal["ase", "metatensor"]] | dict]
+    """The reader library to use for parsing.
+
+    If ``null`` or not provided, the reader will be guessed
+    from the file extension. For example, ``.xyz`` and ``.extxyz``
+    will be read by ``ase`` and ``.mts`` will be read by
+    ``metatensor``."""
+    key: NotRequired[str]
+    """The key under which the target is stored in the file.
+
+    If not provided, it defaults to the key of the gradient in the
+    yaml dataset specification."""
+
+
+ScalarTargetTypeHyper = Literal["scalar"]
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class CartesianTargetConfig(TypedDict):
+    rank: int
+    """The rank of the cartesian target (e.g. 1 for vectors)."""
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class CartesianTargetTypeHypers(TypedDict):
+    """Hyperparameters to specify cartesian target types."""
+
+    cartesian: CartesianTargetConfig
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class SphericalTargetIrrepsConfig(TypedDict):
+    num: NotRequired[int]
+    """Number of irreps of this type.
+
+    Note that this will get multiplied by the number of subtargets
+    specified in ``TargetHypers``.
+    """
+    o3_lambda: int
+    o3_sigma: int
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class SphericalTargetConfig(TypedDict):
+    irreps: (
+        list[SphericalTargetIrrepsConfig]  # Global irreps
+        | list[list[SphericalTargetIrrepsConfig]]  # Global irreps, rows and cols
+        | dict[int, list[SphericalTargetIrrepsConfig]]  # Atomic basis.
+        | dict[int, list[list[SphericalTargetIrrepsConfig]]]  # At. basis, rows and cols
+    )
+    """Specification for the basis of the spherical target.
+
+    Every individual irrep is specified as a dictionary following
+    ``SphericalTargetIrrepsConfig``, however there are different
+    situations in which the basis will have a different grouping of
+    the irreps.
+
+    The simplest case is when a target's layout is just a list
+    of irreps. In that case, ``irreps`` simply receives a list
+    of irreps.
+
+    If the layout depends on the atomic type, then ``irreps``
+    is a dictionary with the atomic type as the key and a
+    list of irreps as the value.
+
+    If the target is a matrix and:
+
+    - Rows and columns have the same basis: ``irreps`` contains
+      the basis of the rows and columns as specified above.
+    - Rows and columns have different bases: for both cases when
+      the basis is global or per atom type, the list of irreps is
+      replaced by a list of two lists of irreps, one for the rows
+      and one for the columns.
+    """
+    product: NotRequired[Literal[None, "coupled", "cartesian"]] = None
+    """Means of describing a higher rank target that is made of the base irreps.
+    If:
+
+    - ``product`` is ``None`` or not provided: the target has simply the base irreps.
+    - ``product`` is ``"coupled"``: the target is built by all the possible products
+      between irreps and coupling them to their irreducible representations.
+      The target is therefore still of rank 1.
+    - ``product`` is ``"cartesian"``: the target is built by all the possible products
+      between irreps, creating a target of rank 2.
+    """
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class SphericalTargetTypeHypers(TypedDict):
+    """Hyperparameters to specify spherical target types."""
+
+    spherical: SphericalTargetConfig
+
+
+def target_type_discriminator(v: Any) -> str | None:
+    """Discriminator function for the TargetType union.
+
+    It helps pydantic determine whether it is dealing with a scalar,
+    cartesian or spherical target. This will make pydantic try to
+    validate only against the relevant typed dict, which makes
+    validation errors much cleaner.
+
+    :param v: The value to discriminate.
+    :return: The tag of the type that pydantic should validate.
+    """
+    if isinstance(v, dict):
+        if "cartesian" in v:
+            return "cartesian"
+        elif "spherical" in v:
+            return "spherical"
+    elif isinstance(v, str) and v == "scalar":
+        return "scalar"
+    # Could not determine the target type, pydantic will raise a
+    # validation error with the appropriate message.
+    return None
+
+
+TargetType = Annotated[
+    Annotated[ScalarTargetTypeHyper, Tag("scalar")]
+    | Annotated[CartesianTargetTypeHypers, Tag("cartesian")]
+    | Annotated[SphericalTargetTypeHypers, Tag("spherical")],
+    Discriminator(target_type_discriminator),
+]
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class TargetHypers(TypedDict):
+    """Hyperparameters for the targets in the dataset."""
+
+    quantity: NotRequired[str] = ""
+    """The quantity that the target represents (e.g., ``energy``,
+    ``dipole``). Currently only ``energy`` gets a special treatment from
+    ``metatrain``, for any other quantity there is no need to specify
+    it."""
+    read_from: NotRequired[str]
+    """The path to the file containing the target data, defaults
+    to ``systems.read_from`` path if not provided."""
+    reader: NotRequired[Optional[Literal["ase", "metatensor"]] | dict]
+    """The reader library to use for parsing.
+
+    If ``null`` or not provided, the reader will be guessed
+    from the file extension. For example, ``.xyz`` and ``.extxyz``
+    will be read by ``ase`` and ``.mts`` will be read by
+    ``metatensor``."""
+    key: NotRequired[str]
+    """The key under which the target is stored in the file.
+
+    If not provided, it defaults to the key of the target in the
+    yaml dataset specification."""
+    unit: NotRequired[str] = ""
+    """Unit of the target, optional but **highly recommended for running simulations**.
+    If not given, no unit conversion will be performed when running simulations which
+    may lead to severe errors.
+
+    The list of possible units is available `here
+    <https://docs.metatensor.org/metatomic/latest/torch/reference/misc.html#known-quantities-units>`_."""
+
+    sample_kind: NotRequired[Literal["system", "atom", "atom_pair"]]
+    """Which kind of sample the target corresponds to.
+
+    If not provided and ``per_atom`` is also not provided,
+    it defaults to ``"system"``.
+    """
+    per_atom: NotRequired[bool]
+    """Old key that is deprecated, ``sample_kind`` should be used instead.
+
+    If set to true, ``sample_kind`` is set to ``"atom"``.
+    If set to false, ``sample_kind`` is set to ``"system"``.
+
+    If this and ``sample_kind`` are both provided and they are not
+    consistent with each other, an error is raised.
+    """
+    type: NotRequired[TargetType]
+    """Specifies the type of the target.
+
+    See :ref:`Fitting Generic Targets <fitting-generic-targets>` to understand
+    in detail how to specify each target type."""
+    num_subtargets: NotRequired[int] = 1
+    """Specifies the number of sub-targets that need to be learned as part of
+    this target.
+
+    Each subtarget is treated as entirely equivalent by models in metatrain
+    and they will often be represented as outputs of the same neural
+    network layer. A common use case for this field is when you are learning a
+    discretization of a continuous target, such as the grid points of a function. In the
+    example above, there are 4000 sub-targets for the density of states (DOS). In
+    metatensor, these correspond to the number of properties of the target."""
+    description: NotRequired[str] = ""
+    """A description of this target. A description is highly recommended if there is
+    more than one target with the same :attr:`quantity`."""
+    forces: NotRequired[bool | str | GradientDict]
+    """Specification for the forces associated with the target.
+
+    See :ref:`gradient-subsection`.
+    """
+    stress: NotRequired[bool | str | GradientDict]
+    """Specification for the stress associated with the target.
+
+    See :ref:`gradient-subsection`.
+    """
+    virial: NotRequired[bool | str | GradientDict]
+    """Specification for the virial associated with the target.
+
+    See :ref:`gradient-subsection`.
+    """
+
+
+def sanitize_architecture_hypers(
+    architecture_name: str, hypers: dict, trainer_hypers_cls: type
+) -> dict:
+    """Sanitize architecture hypers: handle deprecated options and check them
+    against the runtime environment.
+
+    :param architecture_name: The name of the architecture.
+    :param hypers: The architecture options.
+    :param trainer_hypers_cls: The TrainerHypers class of the architecture.
+    :return: The sanitized hypers.
+    """
+    training_hypers = hypers.get("training", {})
+
+    if "distributed" in training_hypers:
+        warnings.warn(
+            "DEPRECATED[distributed]: The `distributed` option is deprecated "
+            "and will be removed at some point. When it is not set, "
+            "distributed training is enabled automatically when running under "
+            "more than one SLURM task.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    num_tasks = int(os.environ.get("SLURM_NTASKS", "1")) if is_slurm() else 1
+    if num_tasks > 1:
+        # Without distributed training, every SLURM task would run its own
+        # full copy of the same training.
+        if "distributed" not in trainer_hypers_cls.__annotations__:
+            raise ValueError(
+                f"This job was launched with {num_tasks} SLURM tasks, but the "
+                f"'{architecture_name}' architecture does not support "
+                "distributed training: every task would run its own full copy "
+                "of the same training. Please launch with a single task."
+            )
+        if training_hypers.get("distributed") is False:
+            raise ValueError(
+                f"This job was launched with {num_tasks} SLURM tasks, but "
+                "distributed training is disabled: every task would run its "
+                "own full copy of the same training. Remove 'distributed: "
+                "false' from the 'training' section of the architecture "
+                "options (distributed training is enabled automatically in "
+                "multi-task SLURM jobs), or launch with a single task."
+            )
+
+    return hypers
+
+
+def sanitize_target_hypers(target_hypers: TargetHypers) -> TargetHypers:
+    """Sanitize the target hypers by handling deprecated keys and setting defaults."""
+
+    if "per_atom" in target_hypers:
+        per_atom = target_hypers.pop("per_atom")
+        sample_kind: Literal["system", "atom"] = "atom" if per_atom else "system"
+
+        warnings.warn(
+            "DEPRECATED[per_atom]: The `per_atom` key in target specifications is"
+            " deprecated and will be removed at some point. Please use "
+            f"`sample_kind` instead. You passed {per_atom=} which corresponds "
+            f"to {sample_kind=}.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+        if (
+            "sample_kind" in target_hypers
+            and target_hypers["sample_kind"] != sample_kind
+        ):
+            raise ValueError(
+                f"Conflict between `per_atom` and `sample_kind`: The input "
+                f"{per_atom=} corresponds to {sample_kind=}, but sample_kind is "
+                f"set to '{target_hypers['sample_kind']}'. Please remove the "
+                "`per_atom` key and set `sample_kind` to the desired value."
+            )
+
+        target_hypers["sample_kind"] = sample_kind
+    elif "sample_kind" not in target_hypers:
+        target_hypers["sample_kind"] = "system"
+
+    return target_hypers
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class DatasetDictHypers(TypedDict):
+    systems: str | SystemsHypers
+    """Path to the dataset file or a dictionary specifying the dataset."""
+    targets: dict[
+        str, Annotated[TargetHypers, AfterValidator(sanitize_target_hypers)] | str
+    ]
+    """A dictionary specifying the targets in the dataset."""
+    extra_data: NotRequired[dict]
+    """Additional data to include from the dataset."""
+    indices: NotRequired[list[int] | str]
+    """Explicit indices to select from the dataset.
+
+    Can be either a list of integers (e.g., ``[0, 1, 5, 10]``) or a path to a
+    text file containing one index per line. When specified, only the structures
+    at these indices will be used from the dataset.
+    """
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class IndicesOnlyHypers(TypedDict):
+    """
+    Config for validation/test sets that reference the training source via indices.
+    """
+
+    indices: list[int] | str
+    """Indices into the training set source file.
+
+    Can be either a list of integers (e.g., ``[0, 1, 5, 10]``) or a path to a
+    text file containing one index per line. The indices reference the same
+    source file as specified in ``training_set.systems.read_from``.
+    """
+
+
+def training_set_discriminator(v: Any) -> str | None:
+    """Discriminator function for the TrainingSetSpec union.
+
+    It helps pydantic determine whether it is dealing with a single dataset
+    specification, a list of dataset specifications or a string path to a
+    dataset. This will make pydantic try to validate only against the
+    relevant type, which makes validation errors much cleaner.
+
+    :param v: The value to discriminate.
+    :return: The tag of the type that pydantic should validate.
+    """
+    if isinstance(v, dict):
+        return "dict"
+    elif isinstance(v, list):
+        return "list"
+    elif isinstance(v, str):
+        return "str"
+    # Could not determine the training set spec type, pydantic will raise a
+    # validation error with the appropriate message.
+    return None
+
+
+def val_or_test_set_discriminator(v: Any) -> str | None:
+    """Discriminator function for the ValOrTestSetSpec union.
+
+    Same as the training discriminator, but accepts also numbers.
+
+    :param v: The value to discriminate.
+    :return: The tag of the type that pydantic should validate.
+    """
+    if isinstance(v, dict):
+        if len(v) == 1 and "indices" in v:
+            return "indices"
+        return "dict"
+    elif isinstance(v, list):
+        return "list"
+    elif isinstance(v, str):
+        return "str"
+    elif isinstance(v, (int, float)):
+        return "fraction"
+    # Could not determine the val/test set spec type, pydantic will raise a
+    # validation error with the appropriate message.
+    return None
+
+
+TrainingSetSpec = Annotated[
+    Annotated[DatasetDictHypers, Tag("dict")]
+    | Annotated[list[DatasetDictHypers], Tag("list")]
+    | Annotated[str, Tag("str")],
+    Discriminator(training_set_discriminator),
+]
+
+ValOrTestSetSpec = Annotated[
+    Annotated[IndicesOnlyHypers, Tag("indices")]
+    | Annotated[DatasetDictHypers, Tag("dict")]
+    | Annotated[list[DatasetDictHypers], Tag("list")]
+    | Annotated[str, Tag("str")]
+    | Annotated[int | float, Interval(ge=0.0, lt=1.0), Tag("fraction")],
+    Discriminator(val_or_test_set_discriminator),
+]
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class EquivarianceHypers(TypedDict):
+    max_angular_momentum_grid: NotRequired[int | None] = None
+    """Degree of the O(3) quadrature used to measure the equivariance error.
+
+    When ``None``, metatomic picks a default from the maximum angular momentum
+    of the targets, which is exact only for models that are equivariant by
+    construction. The cost grows steeply with this value.
+    """
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class EvalDatasetDictHypers(TypedDict):
+    systems: str | SystemsHypers
+    """Path to the dataset file or a dictionary specifying the dataset."""
+    targets: NotRequired[
+        dict[str, Annotated[TargetHypers, AfterValidator(sanitize_target_hypers)] | str]
+    ]
+    """A dictionary specifying the targets in the dataset."""
+    extra_data: NotRequired[dict]
+    """Additional data to include from the dataset."""
+    indices: NotRequired[list[int] | str]
+    """Explicit indices to select from the dataset.
+
+    Can be either a list of integers (e.g., ``[0, 1, 5, 10]``) or a path to a
+    text file containing one index per line. When specified, only the structures
+    at these indices will be used from the dataset.
+    """
+    equivariance: NotRequired[EquivarianceHypers]
+    """Also measure the O(3) equivariance error of the model.
+
+    Requires a ``targets`` section. Use ``equivariance: {}`` to enable it with
+    the default settings. Every system is additionally evaluated on many rotated
+    and inverted copies, so evaluation becomes substantially slower. The
+    O(3)-averaged predictions and their variance over the orientations are written
+    to the output file next to the predictions, as ``o3::average::<target>`` and
+    ``o3::variance::<target>``.
+    """
+    log_separate_blocks: NotRequired[bool] = False
+    """Report metrics separately for each block of each target, instead of
+    aggregated over the whole target.
+
+    Each per-block metric is labeled with the block's key, e.g. for a spherical
+    target decomposed by ``o3_lambda``/``o3_sigma``/``atom_type``:
+    ``"<target> (o3_lambda=1,o3_sigma=1,atom_type=6) RMSE"``. Matches the
+    ``log_separate_blocks`` training hyperparameter.
+    """
+
+
+EvalHypers = EvalDatasetDictHypers | list[EvalDatasetDictHypers]
+
+
+WandbConfig = dict
+
+
+@with_config(ConfigDict(extra="forbid", strict=True))
+class BaseHypers(TypedDict):
+    """Base hyperparameters for all models."""
+
+    architecture: ArchitectureBaseHypers
+    """Architecture-specific hyperparameters."""
+
+    device: NotRequired[str]
+    """The computational device used for model training. If not provided, ``metatrain``
+    automatically chooses the best option by default. The available devices and the
+    best device option depend on the model architecture. The easiest way to use this
+    parameter is to use either either ``"cpu"``, ``"gpu"``, ``"multi-gpu"``. Internally,
+    under the choice ``"gpu"``, the script will automatically choose between ``"cuda"``
+    or ``"mps"``."""
+    base_precision: NotRequired[Literal[16, 32, 64]]
+    """The base precision for float values. For example, a value of ``16`` corresponds
+    to the data type ``float16``. The datatypes that are supported as well as the
+    default datatype depend on the model architecture used."""
+    seed: NotRequired[NonNegativeInt]
+    """The seed used for non-deterministic operations. It sets the seed of
+    ``numpy.random``, ``random``, ``torch`` and ``torch.cuda``. This parameter is
+    important for ensuring reproducibility. If not specified, the seed is generated
+    randomly and reported in the log.
+    """
+    print_stats: NotRequired[bool | Literal["auto"]] = "auto"
+    """Whether to print statistics about the datasets before training.
+
+    If set to ``"auto"``, statistics are printed only if the training, validation
+    and test sets combined have less than 1 million structures.
+    """
+    wandb: NotRequired[WandbConfig]
+    """Configuration for Weights & Biases logging.
+
+    If ``None``, W&B logging is disabled."""
+    final_eval: NotRequired[bool] = True
+    """Whether to evaluate the final model (the one exported by ``mtt train``) on the
+    training, validation and test sets after training, logging the resulting RMSE/MAE
+    metrics.
+
+    For very large datasets, this evaluation can be expensive. Set this to ``False``
+    to skip it.
+    """
+
+    training_set: TrainingSetSpec
+    """Specification of the training dataset."""
+    validation_set: ValOrTestSetSpec
+    """Specification of the validation dataset.
+
+    Can be a float fraction (e.g., ``0.1`` for 10% of training data),
+    a full dataset specification, or an ``indices`` dict referencing
+    the training source file.
+    """
+    test_set: NotRequired[ValOrTestSetSpec] = 0.0
+    """Specification of the test dataset.
+
+    Can be a float fraction (e.g., ``0.1`` for 10% of training data),
+    a full dataset specification, or an ``indices`` dict referencing
+    the training source file.
+    """

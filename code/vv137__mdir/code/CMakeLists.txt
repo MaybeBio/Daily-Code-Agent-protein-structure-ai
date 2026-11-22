@@ -1,0 +1,76 @@
+cmake_minimum_required(VERSION 3.20.0)
+project(mdir VERSION 0.2.1 LANGUAGES CXX C)
+
+set(CMAKE_BUILD_WITH_INSTALL_NAME_DIR ON)
+set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to conform to")
+
+# The standard library must have the floating-point std::from_chars (#654).
+include(${PROJECT_SOURCE_DIR}/cmake/CheckFloatFromChars.cmake)
+mdir_check_float_from_chars()
+
+find_package(MLIR REQUIRED CONFIG)
+
+# Default arguments for lit.
+set(LLVM_LIT_ARGS "-sv" CACHE STRING "Default options for lit")
+
+message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+
+set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/bin)
+set(LLVM_LIBRARY_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/lib)
+set(MLIR_BINARY_DIR ${CMAKE_BINARY_DIR})
+
+list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
+list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+
+include(TableGen)
+include(AddLLVM)
+include(AddMLIR)
+include(HandleLLVMOptions)
+
+# Every image carries a build ID (NT_GNU_BUILD_ID), which the keys of the
+# compile cache take as the identity of the build (D397).
+include(CheckLinkerFlag)
+check_linker_flag(CXX "LINKER:--build-id=sha1" MDIR_LINKER_BUILD_ID)
+if(MDIR_LINKER_BUILD_ID)
+  add_link_options("LINKER:--build-id=sha1")
+endif()
+
+# An installation holds the driver and its runtime only: the static libraries
+# of the dialects and passes are linked into the driver and are not installed.
+set(LLVM_INSTALL_TOOLCHAIN_ONLY ON)
+
+set(MDIR_SOURCE_DIR ${PROJECT_SOURCE_DIR})
+set(MDIR_BINARY_DIR ${PROJECT_BINARY_DIR})
+
+include_directories(${LLVM_INCLUDE_DIRS})
+include_directories(${MLIR_INCLUDE_DIRS})
+include_directories(${MDIR_SOURCE_DIR}/include)
+include_directories(${MDIR_BINARY_DIR}/include)
+link_directories(${LLVM_BUILD_LIBRARY_DIR})
+add_definitions(${LLVM_DEFINITIONS})
+
+add_subdirectory(include)
+add_subdirectory(lib)
+add_subdirectory(runtime)
+add_subdirectory(lib/Compiler)
+# The plugin of learned potentials (D270): a C++20 library that
+# links libtorch and metatomic, which MDIR's core loads with dlopen through
+# include/mdir/MLIP/Plugin.h. The core never links it.
+option(MDIR_ENABLE_METATOMIC
+  "Build the optional plugin that evaluates metatomic models (libtorch)" OFF)
+if(MDIR_ENABLE_METATOMIC)
+  add_subdirectory(lib/MLIP)
+endif()
+option(MDIR_ENABLE_PYTHON "Build the optional Python compilation interface" OFF)
+if(MDIR_ENABLE_PYTHON)
+  add_subdirectory(python)
+endif()
+# The tests (test/) and what only they use: the test passes of mdir-opt and
+# the tools under test/. The Python sdist leaves test/ out, so its wheel
+# builds with MDIR_BUILD_TESTS=OFF (pyproject.toml, #624).
+option(MDIR_BUILD_TESTS "Build the tests, their tools, and mdir-opt" ON)
+if(MDIR_BUILD_TESTS)
+  add_subdirectory(test)
+endif()
+add_subdirectory(tools)

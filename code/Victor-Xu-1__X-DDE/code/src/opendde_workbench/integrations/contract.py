@@ -1,0 +1,275 @@
+"""Typed native inputs; no browser paths, commands, downloads or arbitrary configuration."""
+
+import re
+from typing import Annotated, Literal, Self
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
+
+from ..proximity.options import TernaryPayload
+from ..scientific_objects import MoleculeRef
+from ..simulations.options import (
+    DynamicsPayload,
+    FreeEnergyPayload,
+    GromacsDynamicsPayload,
+    payload_tag,
+)
+from ..task_metadata import TaskMetadata
+from .mol1_contract import Mol1Payload
+from .options import (
+    BoltzGenPayload,
+    BoltzPayload,
+    ChempropPayload,
+    ElectrostaticsPayload,
+    ExecutionOptions,
+    InteractionPayload,
+    LigandMPNNPayload,
+    ProteinInterfacePayload,
+    RefinementPayload,
+    ReinventPayload,
+)
+
+OPERATIONS = {
+    "mol1_predict": "mol1",
+    "ternary_model": "deepternary",
+    "boltz_predict": "boltz",
+    "reinvent_design": "reinvent",
+    "ligandmpnn_design": "ligandmpnn",
+    "boltzgen_design": "boltzgen",
+    "structure_refine": "openmm",
+    "molecular_dynamics": "openmm",
+    "gromacs_dynamics": "gromacs",
+    "binding_free_energy": "openfe",
+    "electrostatics": "apbs",
+    "chemprop_train": "chemprop",
+    "chemprop_predict": "chemprop",
+    "interaction_profile": "plip",
+    "protein_interface": "plip",
+}
+
+
+def native_payload_tag(value):
+    scope = value.get("scope") if isinstance(value, dict) else getattr(value, "scope", None)
+    if payload_tag(value) == "plip" and scope == "protein_interface":
+        return "plip_interface"
+    return payload_tag(value)
+
+
+class MaterialInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    role: Literal[
+        "structure",
+        "ligand",
+        "library",
+        "scaffold",
+        "partner_a",
+        "partner_b",
+        "arm_a",
+        "arm_b",
+        "msa",
+        "template",
+        "sequence",
+    ]
+    source: MoleculeRef
+
+
+Payload = Annotated[
+    Annotated[BoltzPayload, Tag("boltz")]
+    | Annotated[Mol1Payload, Tag("mol1")]
+    | Annotated[ReinventPayload, Tag("reinvent")]
+    | Annotated[LigandMPNNPayload, Tag("ligandmpnn")]
+    | Annotated[BoltzGenPayload, Tag("boltzgen")]
+    | Annotated[RefinementPayload, Tag("openmm")]
+    | Annotated[DynamicsPayload, Tag("openmm_dynamics")]
+    | Annotated[GromacsDynamicsPayload, Tag("gromacs")]
+    | Annotated[FreeEnergyPayload, Tag("openfe")]
+    | Annotated[ElectrostaticsPayload, Tag("apbs")]
+    | Annotated[ChempropPayload, Tag("chemprop")]
+    | Annotated[InteractionPayload, Tag("plip")]
+    | Annotated[ProteinInterfacePayload, Tag("plip_interface")]
+    | Annotated[TernaryPayload, Tag("deepternary")],
+    Discriminator(native_payload_tag),
+]
+
+
+class IntegratedTask(TaskMetadata):
+    model_config = ConfigDict(extra="forbid")
+    operation: Literal[
+        "mol1_predict",
+        "ternary_model",
+        "boltz_predict",
+        "reinvent_design",
+        "ligandmpnn_design",
+        "boltzgen_design",
+        "structure_refine",
+        "molecular_dynamics",
+        "gromacs_dynamics",
+        "binding_free_energy",
+        "electrostatics",
+        "chemprop_train",
+        "chemprop_predict",
+        "interaction_profile",
+        "protein_interface",
+    ]
+    name: str = Field(min_length=1, max_length=80, pattern=r"^[^\x00-\x1f\x7f]+$")
+    project_id: UUID | None = None
+    inputs: list[MaterialInput] = Field(default_factory=list, max_length=32)
+    payload: Payload
+    options: ExecutionOptions = Field(default_factory=ExecutionOptions)
+
+    @model_validator(mode="after")
+    def contract(self) -> Self:
+        self.name = self.name.strip()
+        if not self.name or self.payload.kind != OPERATIONS[self.operation]:
+            raise ValueError("Choose a named task and its matching scientific program.")
+        if self.constraints:
+            raise ValueError("This native adapter does not execute platform constraint sets.")
+        roles = {item.role for item in self.inputs}
+        interface = isinstance(self.payload, ProteinInterfacePayload)
+        if (self.operation == "protein_interface") != interface:
+            raise ValueError("Choose the protein-interface protocol for this operation.")
+        if (
+            not interface
+            and self.payload.kind not in {"boltz", "mol1"}
+            and len(roles) != len(self.inputs)
+        ):
+            raise ValueError("Select each input role exactly once.")
+        if interface:
+            from .protein_interface_contract import validate_interface_inputs
+
+            validate_interface_inputs(self)
+        if self.scientific_inputs != [item.source for item in self.inputs]:
+            raise ValueError("Confirm the exact scientific input versions before submission.")
+        if any(
+            item.source.conformer
+            or (item.role not in {"ligand", "arm_a", "arm_b"} and item.source.record)
+            for item in self.inputs
+        ):
+            raise ValueError(
+                "Whole structures/libraries use record zero and the original conformer."
+            )
+        kind = self.payload.kind
+        if kind != "mol1" and len(self.inputs) > 8:
+            raise ValueError("This scientific adapter supports at most eight input files.")
+        if kind == "mol1":
+            from .mol1_contract import validate_input_contract
+
+            validate_input_contract(self)
+        if kind in {"openmm", "gromacs"}:
+            from ..simulations.restraints import validate_restraint_sources
+
+            validate_restraint_sources(self)
+        if (self.operation in {"molecular_dynamics", "gromacs_dynamics"}) != isinstance(
+            self.payload, DynamicsPayload
+        ):
+            raise ValueError("Select the dynamics protocol for a molecular-dynamics task.")
+        expected = (
+            {"structure"} if kind in {"ligandmpnn", "boltzgen", "openmm", "apbs", "plip"} else set()
+        )
+        if kind == "deepternary":
+            from ..proximity.contract import validate_task
+
+            validate_task(self)
+        elif kind == "openfe":
+            if roles != {"structure", "library"}:
+                raise ValueError("FEP requires a protein and an aligned congeneric ligand library.")
+        elif kind in {"openmm", "gromacs"}:
+            expected = {"structure"}
+            if not expected <= roles or not roles <= {"structure", "ligand"}:
+                raise ValueError(
+                    "Refinement needs a structure and optionally its exact bound ligand."
+                )
+        elif kind == "boltzgen":
+            scaffold = self.payload.modality in {"antibody", "nanobody"}
+            if roles != ({"structure", "scaffold"} if scaffold else {"structure"}):
+                raise ValueError(
+                    "Antibody variable-region design needs an exact framework scaffold."
+                )
+            if scaffold and not (self.payload.scaffold_chain and self.payload.scaffold_residues):
+                raise ValueError("Select the framework chain and the residues to redesign.")
+            if any(
+                not re.fullmatch(r"[A-Za-z0-9]-?\d+[A-Za-z]?", r)
+                for r in self.payload.scaffold_residues
+            ):
+                raise ValueError("Select exact scaffold residue identities.")
+        elif kind == "reinvent":
+            if self.payload.validate_scaffold_origin and self.payload.mode != "r_groups":
+                raise ValueError("Scaffold origin validation is available for R-group design.")
+            expected = (
+                {"ligand"}
+                if self.payload.mode in {"analogues", "optimize"}
+                or self.payload.validate_scaffold_origin
+                else set()
+            )
+            if roles != expected:
+                raise ValueError("Choose the exact molecular input required by this design mode.")
+            if self.payload.mode in {"r_groups", "linker"}:
+                count = 1 if self.payload.mode == "r_groups" else 2
+                if len(self.payload.fragments) != count or any(
+                    "*" not in s or len(s) > 2000 or re.search(r"\s", s)
+                    for s in self.payload.fragments
+                ):
+                    raise ValueError(
+                        "Choose scaffold/fragments with explicit attachment points (*)."
+                    )
+            if any(not lo < hi for lo, hi in (self.payload.molecular_weight, self.payload.logp)):
+                raise ValueError("Property ranges must have increasing limits.")
+        elif kind == "chemprop":
+            expected = {"library"}
+            if self.payload.mode != self.operation.removeprefix("chemprop_"):
+                raise ValueError("Property-model mode differs from the chosen task.")
+            if self.payload.mode == "predict" and not (
+                self.payload.model_job and self.payload.model_sha256
+            ):
+                raise ValueError("Choose a complete X-DDE-trained model with its exact checksum.")
+            if roles != expected:
+                raise ValueError("Choose one whole SDF library for property modeling.")
+        elif kind == "mol1":
+            pass  # Exact component-file roles and versions were checked above.
+        elif kind == "boltz":
+            from .boltz_inputs import validate_input_contract
+
+            validate_input_contract(self)
+        elif roles != expected:
+            raise ValueError("The selected input roles differ from this task's requirements.")
+        if kind == "boltz":
+            components = self.payload.components
+            if len({item.id for item in components}) != len(components):
+                raise ValueError("Assign each molecular component a unique chain identifier.")
+            alphabets = {
+                "protein": set("ACDEFGHIKLMNPQRSTVWYX"),
+                "rna": set("ACGU"),
+                "dna": set("ACGT"),
+            }
+            if any(
+                item.kind in alphabets and not set(item.value) <= alphabets[item.kind]
+                for item in components
+            ):
+                raise ValueError("Sequence letters differ from the chosen molecular type.")
+            if self.payload.affinity and (
+                sum(item.kind == "ligand" for item in components) != 1
+                or not any(c.kind == "protein" for c in components)
+            ):
+                raise ValueError("Affinity prediction requires exactly one small-molecule ligand.")
+        if kind == "ligandmpnn" and any(
+            not re.fullmatch(r"[A-Za-z0-9]-?\d+[A-Za-z]?", item)
+            for item in self.payload.redesigned_residues
+        ):
+            raise ValueError(
+                "Choose residue identities such as A123, preserving chain and insertion code."
+            )
+        if kind == "boltzgen":
+            low, high = self.payload.length
+            if not 8 <= low <= high <= 300 or self.payload.retain > self.payload.candidates:
+                raise ValueError(
+                    "Choose a bounded design length and retain no more than generated."
+                )
+            if any(not re.fullmatch(r"[A-Za-z0-9]", chain) for chain in self.payload.target_chains):
+                raise ValueError("Choose explicit one-character target chains.")
+        if kind in {"boltz", "boltzgen"} and self.options.device != "cuda":
+            raise ValueError("Choose the server GPU for this computationally demanding task.")
+        if (
+            kind in {"apbs", "plip", "reinvent"} or self.operation == "structure_refine"
+        ) and self.options.device != "cpu":
+            raise ValueError("This reviewed environment executes on CPU.")
+        return self

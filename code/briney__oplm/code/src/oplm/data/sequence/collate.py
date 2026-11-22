@@ -1,0 +1,533 @@
+"""Tokenization, padding, and masked-language-model collation.
+
+``tokenize_and_pad`` is the shared pad/tokenize primitive (no masking).
+:class:`MLMCollator` layers fixed-``k`` Gumbel-top-k masking with BERT 80/10/10
+replacement on top, supporting optional per-residue weighted masking.
+
+The masking scheme (docs/data.md, Masking) is **dynamic** (RoBERTa-style):
+masks are drawn fresh each call, so the same sequence is masked differently across
+epochs. Evaluation freezes them via ``deterministic=True`` — a generator per row, seeded
+from the sequence, *not* a separate collator class (docs/data.md, Deterministic eval
+masking). All token-id constants are derived from the tokenizer (``data/tokenizer.py``),
+never hardcoded.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+import torch
+from torch import Tensor
+
+from oplm.data.tokenizer import (
+    align_per_residue,
+    canonical_amino_acid_ids,
+    mask_token_id,
+    non_maskable_ids,
+    pad_token_id,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from oplm.model import OplmTokenizerFast
+
+logger = logging.getLogger(__name__)
+
+# Cross-entropy ignore index for non-target positions (PyTorch default).
+_IGNORE_INDEX = -100
+
+# Per-residue masking-weight field carried on row dicts (see dataset.py).
+_WEIGHTS_KEY = "masking_weights"
+
+__all__ = ["MLMCollator", "RowFiller", "first_fit", "token_length", "tokenize_and_pad"]
+
+
+def _sequence_of(item: Mapping[str, object] | str) -> str:
+    """Extract the raw sequence string from a batch item.
+
+    Args:
+        item: Either a raw sequence ``str`` or a mapping with a ``"sequence"`` key.
+
+    Returns:
+        The raw one-letter amino-acid sequence.
+
+    Raises:
+        TypeError: If ``item`` is neither a ``str`` nor a mapping.
+        KeyError: If a mapping item lacks a ``"sequence"`` key.
+    """
+    if isinstance(item, str):
+        return item
+    if isinstance(item, Mapping):
+        if "sequence" not in item:
+            raise KeyError("batch item mapping is missing required 'sequence' key")
+        return str(item["sequence"])
+    raise TypeError(f"batch items must be str or mapping, got {type(item).__name__}")
+
+
+def _sequence_id_of(item: Mapping[str, object] | str) -> str:
+    """Extract the ``sequence_id`` from a batch item (for ``keep_sequence_ids=True``).
+
+    Args:
+        item: A mapping with a ``"sequence_id"`` key.
+
+    Returns:
+        The row's ``sequence_id``.
+
+    Raises:
+        KeyError: If ``item`` is a raw ``str`` (which carries no id) or a mapping
+            missing the ``"sequence_id"`` key.
+    """
+    if isinstance(item, str):
+        raise KeyError("keep_sequence_ids=True requires mapping batch items, got a raw str")
+    if isinstance(item, Mapping):
+        if "sequence_id" not in item:
+            raise KeyError("batch item mapping is missing required 'sequence_id' key")
+        return str(item["sequence_id"])
+    raise KeyError(
+        f"keep_sequence_ids=True requires mapping batch items, got {type(item).__name__}"
+    )
+
+
+def tokenize_and_pad(
+    batch: Sequence[Mapping[str, object] | str],
+    tokenizer: OplmTokenizerFast,
+    max_length: int,
+    *,
+    weights: Sequence[Sequence[float] | None] | None = None,
+    pad_to_multiple_of: int | None = None,
+) -> dict[str, Tensor]:
+    """Tokenize and pad a batch of sequences (no masking, no labels).
+
+    Each raw sequence is truncated to ``max_length - 2`` residues (leaving room for
+    ``<cls>``/``<eos>``), tokenized with the canonical tokenizer, and padded to the
+    smallest multiple of ``pad_to_multiple_of`` that is ≥ the batch's longest member
+    (or exactly the batch's longest member when ``pad_to_multiple_of`` is ``None``).
+    This is the shared primitive used by the variant/structure/downstream consumers
+    and, internally, by :class:`MLMCollator`.
+
+    Args:
+        batch: Items are raw sequence ``str`` s or mappings carrying a ``"sequence"``.
+        tokenizer: The canonical :class:`~oplm.model.OplmTokenizerFast`.
+        max_length: Maximum tokenized length ``T`` (including ``<cls>``/``<eos>``);
+            raw sequences are clipped to ``max_length - 2`` residues.
+        weights: Optional per-row raw per-residue vectors (``None`` for a row with
+            no weights). When supplied, the output additionally carries an aligned
+            ``"masking_weights"`` ``(B, T)`` tensor (specials/pad → ``0.0``,
+            ``None`` row → uniform ``1.0``) via :func:`~oplm.data.tokenizer.align_per_residue`.
+            Used internally by the MLM collator; the default output is the two keys
+            below.
+        pad_to_multiple_of: When set, pads sequences to the smallest multiple of this
+            value that is ≥ the batch's longest member. ``None`` (default) pads to
+            exactly the batch's longest member, reproducing today's behavior.
+
+    Returns:
+        ``{"input_ids": (B, T) long, "attention_mask": (B, T) long}``, plus
+        ``"masking_weights": (B, T) float32`` when ``weights`` is supplied.
+    """
+    sequences = [_sequence_of(item) for item in batch]
+    max_residues = max_length - 2  # room for <cls>/<eos>
+    truncated = [seq[:max_residues] for seq in sequences]
+
+    encoded = tokenizer(
+        truncated, padding=True, pad_to_multiple_of=pad_to_multiple_of, return_tensors="pt"
+    )
+    out: dict[str, Tensor] = {
+        "input_ids": encoded["input_ids"],
+        "attention_mask": encoded["attention_mask"],
+    }
+
+    if weights is not None:
+        total_len = int(out["input_ids"].shape[1])
+        # Raw (pre-truncation) lengths; align_per_residue re-applies truncation.
+        lengths = [len(seq) for seq in sequences]
+        out[_WEIGHTS_KEY] = align_per_residue(
+            weights,
+            lengths=lengths,
+            total_len=total_len,
+            fill_special=0.0,
+            fill_pad=0.0,
+        )
+    return out
+
+
+class RowFiller:
+    """First-fit placement of token lengths, in order, into ``rows`` rows of ``width`` tokens.
+
+    The token batcher (:class:`~oplm.data.sequence.batching.TokenBatcher`) and the collator's
+    fixed-shape packing both place sequences through this class, so they cannot disagree about
+    where a batch closes or which row a sequence lands in.
+    """
+
+    def __init__(self, rows: int, width: int) -> None:
+        self._free = [width] * rows
+        self.placement: list[int] = []
+
+    def place(self, length: int) -> bool:
+        """Put ``length`` in the first row with room; return ``False``, placing nothing, if none."""
+        for row, room in enumerate(self._free):
+            if length <= room:
+                self._free[row] -= length
+                self.placement.append(row)
+                return True
+        return False
+
+
+def first_fit(lengths: Sequence[int], rows: int, width: int) -> list[int] | None:
+    """Each length's row under :class:`RowFiller`, or ``None`` if one fits in no row."""
+    filler = RowFiller(rows, width)
+    return filler.placement if all(filler.place(n) for n in lengths) else None
+
+
+def token_length(sequence: str, width: int) -> int:
+    """Tokens a sequence takes in a row of ``width``: up to ``width - 2`` residues + 2 specials."""
+    return min(len(sequence), width - 2) + 2
+
+
+class MLMCollator:
+    """Masked-language-model collator: tokenize/pad, then mask.
+
+    Wraps :func:`tokenize_and_pad` and applies the OPLM masking scheme
+    (docs/data.md, Masking): per row, a **fixed count**
+    ``k = round(mask_prob * n_eligible)`` of eligible positions is sampled without
+    replacement via **Gumbel-top-k**, then the BERT 80/10/10 split decides each
+    masked token's replacement (``<mask>`` / random canonical AA / keep original).
+    Uniform masking is the equal-weights special case of the same code path.
+
+    Masking is dynamic by default (fresh each call). With ``deterministic=True`` each
+    row gets its own generator seeded from ``seed`` and the row's sequence, so a
+    sequence's mask doesn't depend on which batch, worker or GPU it lands in, and the
+    global RNG is left alone — the evaluation policy.
+
+    Args:
+        tokenizer: The canonical :class:`~oplm.model.OplmTokenizerFast`.
+        max_length: Maximum tokenized length passed to :func:`tokenize_and_pad`.
+        mask_prob: Fraction of eligible positions selected for masking per row.
+        mask_token_prob: Of masked positions, fraction replaced with ``<mask>``.
+        random_token_prob: Of masked positions, fraction replaced with a random
+            canonical amino acid. The remainder keep their original id.
+        weighted_masking: Honor each row's ``masking_weights`` to bias selection.
+            When ``False`` the column is ignored and masking is uniform.
+        deterministic: Freeze each sequence's mask (evaluation policy).
+        seed: Base seed for the deterministic per-row generators.
+        pad_to_multiple_of: Forwarded to :func:`tokenize_and_pad`. When set, the
+            sequence axis is padded to the smallest multiple of this value ≥ the
+            batch's longest member. ``None`` (default) pads to exactly the batch's
+            longest member, reproducing today's behavior.
+        keep_sequence_ids: Surface each row's ``sequence_id`` as a plain
+            ``list[str]`` under ``"sequence_ids"`` in the returned batch dict
+            (excluded from tensor collation). Off by default; used by tests and
+            tooling that need to trace which rows a dataloader actually served
+            (e.g. the double-sharding verification test) rather than by training.
+        pack_sequences: After masking, pack the batch's sequences back to back into as
+            few rows of at most ``max_length`` tokens as first-fit-decreasing finds (or
+            exactly ``pack_rows`` rows, see below), and add ``"segment_ids"`` ``(rows, T)``
+            (``1..n`` per sequence in a row, ``0`` at pads) and ``"num_sequences"`` (a plain
+            ``int``, the batch size before packing). Masks and labels are those the
+            unpacked batch would get.
+        pack_rows: With ``pack_sequences``: pack into exactly this many rows of
+            ``max_length`` (token mode), laid out by :func:`first_fit` in input order;
+            raises if the sequences do not fit. ``None`` keeps first-fit-decreasing into
+            as few rows as needed.
+
+    Raises:
+        ValueError: If any probability is outside ``[0, 1]``,
+            ``mask_token_prob + random_token_prob > 1``, or ``pack_rows`` is set without
+            ``pack_sequences`` or below 1.
+    """
+
+    def __init__(
+        self,
+        tokenizer: OplmTokenizerFast,
+        max_length: int = 1024,
+        mask_prob: float = 0.15,
+        mask_token_prob: float = 0.8,
+        random_token_prob: float = 0.1,
+        *,
+        weighted_masking: bool = False,
+        deterministic: bool = False,
+        seed: int = 0,
+        pad_to_multiple_of: int | None = None,
+        keep_sequence_ids: bool = False,
+        pack_sequences: bool = False,
+        pack_rows: int | None = None,
+    ) -> None:
+        _validate_probs(mask_prob, mask_token_prob, random_token_prob)
+        if pack_rows is not None and (not pack_sequences or pack_rows < 1):
+            raise ValueError(
+                f"pack_rows requires pack_sequences=True and pack_rows >= 1, got {pack_rows}"
+            )
+        self._tokenizer = tokenizer
+        self._max_length = max_length
+        self._mask_prob = mask_prob
+        self._mask_token_prob = mask_token_prob
+        self._random_token_prob = random_token_prob
+        self._weighted_masking = weighted_masking
+        self._deterministic = deterministic
+        self._seed = seed
+        self._pad_to_multiple_of = pad_to_multiple_of
+        self._keep_sequence_ids = keep_sequence_ids
+        self._pack_sequences = pack_sequences
+        self._pack_rows = pack_rows
+
+        # Derived id constants (computed once from the tokenizer, never hardcoded).
+        self._mask_token_id = mask_token_id(tokenizer)
+        self._pad_token_id = pad_token_id(tokenizer)
+        self._canonical_ids = canonical_amino_acid_ids(tokenizer)  # (20,) long
+        self._non_maskable = torch.tensor(sorted(non_maskable_ids(tokenizer)), dtype=torch.long)
+
+        self._warned_missing_weights = False
+
+    def __call__(
+        self, batch: Sequence[Mapping[str, object] | str]
+    ) -> dict[str, Tensor | list[str] | int]:
+        """Collate ``batch`` into ``{input_ids, attention_mask, labels}``.
+
+        Also carries ``"sequence_ids"`` (a plain ``list[str]``, not collated into a
+        tensor) when ``keep_sequence_ids=True``.
+        """
+        generators = self._row_generators(batch)
+
+        raw_weights = self._collect_weights(batch) if self._weighted_masking else None
+        encoded = tokenize_and_pad(
+            batch,
+            self._tokenizer,
+            self._max_length,
+            weights=raw_weights,
+            pad_to_multiple_of=self._pad_to_multiple_of,
+        )
+        input_ids = encoded["input_ids"]  # (B, T) long
+        attention_mask = encoded["attention_mask"]  # (B, T) long
+        labels = torch.full_like(input_ids, _IGNORE_INDEX)
+
+        # Eligibility (B, T): real, non-special tokens.
+        eligible = (attention_mask == 1) & ~torch.isin(input_ids, self._non_maskable)
+
+        # Selection weights (B, T): uniform unless weighted masking is on; either
+        # way, non-eligible positions get weight 0 so they can never be selected.
+        if self._weighted_masking:
+            weights = encoded[_WEIGHTS_KEY]
+        else:
+            weights = torch.ones_like(input_ids, dtype=torch.float32)
+        weights = weights.masked_fill(~eligible, 0.0)
+
+        self._mask_batch(input_ids, labels, eligible, weights, generators, attention_mask)
+        out: dict[str, Tensor | list[str] | int] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+        if self._pack_sequences:
+            if self._pack_rows is not None:
+                expected = [token_length(_sequence_of(item), self._max_length) for item in batch]
+                if attention_mask.sum(1).tolist() != expected:
+                    raise ValueError(
+                        "tokenized lengths differ from token_length(); the token batcher's "
+                        "placement no longer matches the batch"
+                    )
+            out = self._pack(input_ids, attention_mask, labels)
+        if self._keep_sequence_ids:
+            out["sequence_ids"] = self._collect_sequence_ids(batch)
+        return out
+
+    def _pack(
+        self, input_ids: Tensor, attention_mask: Tensor, labels: Tensor
+    ) -> dict[str, Tensor | list[str] | int]:
+        """Pack right-padded rows back to back into rows of at most ``max_length`` tokens.
+
+        Without ``pack_rows``: first-fit-decreasing into as few rows as needed, trimmed to
+        the longest row. With it: :func:`first_fit` in input order into exactly
+        ``(pack_rows, max_length)``.
+        """
+        lengths = attention_mask.sum(1).tolist()
+        rows: list[list[int]]  # batch indices per packed row
+        if self._pack_rows is not None:
+            placement = first_fit(lengths, self._pack_rows, self._max_length)
+            if placement is None:
+                raise ValueError(
+                    f"{len(lengths)} sequences ({sum(lengths)} tokens) do not fit "
+                    f"{self._pack_rows} rows of {self._max_length}"
+                )
+            rows = [
+                [i for i, r in enumerate(placement) if r == row] for row in range(self._pack_rows)
+            ]
+            width = self._max_length
+        else:
+            rows = []
+            free: list[int] = []
+            for i in sorted(range(len(lengths)), key=lengths.__getitem__, reverse=True):
+                fit = next((r for r, room in enumerate(free) if lengths[i] <= room), None)
+                if fit is None:
+                    rows.append([i])
+                    free.append(self._max_length - lengths[i])
+                else:
+                    rows[fit].append(i)
+                    free[fit] -= lengths[i]
+            width = self._max_length - min(free)
+            if self._pad_to_multiple_of:
+                width = -(-width // self._pad_to_multiple_of) * self._pad_to_multiple_of
+        shape = (len(rows), width)
+        packed = {
+            "input_ids": input_ids.new_full(shape, self._pad_token_id),
+            "attention_mask": attention_mask.new_zeros(shape),
+            "labels": labels.new_full(shape, _IGNORE_INDEX),
+            "segment_ids": attention_mask.new_zeros(shape),
+        }
+        for r, members in enumerate(rows):
+            start = 0
+            for segment, i in enumerate(members, start=1):
+                end = start + lengths[i]
+                packed["input_ids"][r, start:end] = input_ids[i, : lengths[i]]
+                packed["attention_mask"][r, start:end] = 1
+                packed["labels"][r, start:end] = labels[i, : lengths[i]]
+                packed["segment_ids"][r, start:end] = segment
+                start = end
+        return {**packed, "num_sequences": len(lengths)}
+
+    def _collect_sequence_ids(self, batch: Sequence[Mapping[str, object] | str]) -> list[str]:
+        """Pull each row's ``sequence_id`` from the batch, in row order.
+
+        Raises:
+            KeyError: If a mapping item lacks a ``"sequence_id"`` key, or an item
+                is a raw ``str`` (which carries no id).
+        """
+        return [_sequence_id_of(item) for item in batch]
+
+    def _row_generators(
+        self, batch: Sequence[Mapping[str, object] | str]
+    ) -> list[torch.Generator] | None:
+        """One generator per row in deterministic mode, seeded from ``seed`` and the sequence.
+
+        Dynamic mode returns ``None`` so sampling falls through to the global RNG and masks
+        stay fresh.
+        """
+        if not self._deterministic:
+            return None
+        generators = []
+        for item in batch:
+            key = f"{self._seed}:{_sequence_of(item)}".encode()
+            generator = torch.Generator()
+            generator.manual_seed(int.from_bytes(hashlib.blake2b(key, digest_size=8).digest()))
+            generators.append(generator)
+        return generators
+
+    def _collect_weights(
+        self, batch: Sequence[Mapping[str, object] | str]
+    ) -> list[list[float] | None]:
+        """Pull per-row ``masking_weights`` from the batch dicts.
+
+        Rows without weights (non-mapping, or ``None``) surface as ``None`` and are
+        treated as uniform by :func:`~oplm.data.tokenizer.align_per_residue`. If the
+        whole batch lacks weights (column entirely absent), warn once and fall back
+        to uniform masking (docs/data.md, Masking).
+        """
+        weights: list[list[float] | None] = []
+        any_present = False
+        for item in batch:
+            value = (
+                item.get(_WEIGHTS_KEY)  # ty: ignore[invalid-argument-type]  # Mapping[str, object]
+                if isinstance(item, Mapping)
+                else None
+            )
+            if value is not None:
+                any_present = True
+            weights.append(value)  # ty: ignore[invalid-argument-type]  # list[float] | None
+
+        if not any_present and not self._warned_missing_weights:
+            logger.warning(
+                "weighted_masking=True but no '%s' present in batch; "
+                "falling back to uniform masking.",
+                _WEIGHTS_KEY,
+            )
+            self._warned_missing_weights = True
+        return weights
+
+    def _mask_batch(
+        self,
+        input_ids: Tensor,
+        labels: Tensor,
+        eligible: Tensor,
+        weights: Tensor,
+        generators: list[torch.Generator] | None,
+        attention_mask: Tensor,
+    ) -> None:
+        """Select and replace masked positions in place, row by row.
+
+        Selection is Gumbel-top-k: ``key = log(weight) + gumbel`` and the top
+        ``k_b`` keys are masked. ``k_b`` is clamped to the count of positive-weight
+        eligible positions, so uniform masking (all weights 1) is the special case.
+        With per-row ``generators``, each row draws only over its own real tokens, so
+        its mask doesn't depend on the batch's padded width.
+        """
+        # Gumbel noise g = -log(-log(u)), u ~ Uniform(0, 1). (B, T)
+        if generators is None:
+            u = torch.rand(input_ids.shape)
+        else:
+            u = torch.full(input_ids.shape, 0.5)  # padding: weight 0, never selected
+            for b, n in enumerate(attention_mask.sum(dim=1).tolist()):
+                u[b, :n] = torch.rand(n, generator=generators[b])
+        gumbel = -torch.log(-torch.log(u))
+        # key = log(w) + g; force -inf where weight == 0 (zero-weight + non-eligible)
+        # so those positions are never in the top-k (and so NaNs from -inf+inf die).
+        key = torch.log(weights) + gumbel
+        key = key.masked_fill(weights == 0, float("-inf"))
+
+        n_eligible = eligible.sum(dim=1)  # (B,)
+        k_per_row = torch.round(self._mask_prob * n_eligible.float()).long()
+        n_positive = (weights > 0).sum(dim=1)  # (B,)
+        k_per_row = torch.minimum(k_per_row, n_positive)
+
+        for b in range(input_ids.shape[0]):
+            k_b = int(k_per_row[b].item())
+            if k_b <= 0:
+                continue
+            masked_idx = torch.topk(key[b], k_b).indices  # (k_b,)
+            labels[b, masked_idx] = input_ids[b, masked_idx]
+            self._replace(input_ids, b, masked_idx, None if generators is None else generators[b])
+
+    def _replace(
+        self,
+        input_ids: Tensor,
+        row: int,
+        masked_idx: Tensor,
+        generator: torch.Generator | None,
+    ) -> None:
+        """Apply the BERT 80/10/10 replacement split over a row's masked positions.
+
+        ``mask_token_prob`` → ``<mask>``; ``random_token_prob`` → a uniform draw
+        from the canonical amino acids; the remainder keep the original id.
+        """
+        n = int(masked_idx.numel())
+        roll = torch.rand(n, generator=generator)  # (n,)
+        to_mask = roll < self._mask_token_prob
+        to_random = (roll >= self._mask_token_prob) & (
+            roll < self._mask_token_prob + self._random_token_prob
+        )
+
+        input_ids[row, masked_idx[to_mask]] = self._mask_token_id
+
+        random_idx = masked_idx[to_random]
+        n_random = int(random_idx.numel())
+        if n_random > 0:
+            choice = torch.randint(
+                0, int(self._canonical_ids.numel()), (n_random,), generator=generator
+            )
+            input_ids[row, random_idx] = self._canonical_ids[choice]
+
+
+def _validate_probs(mask_prob: float, mask_token_prob: float, random_token_prob: float) -> None:
+    """Validate the masking probabilities (mirrors ``DataConfig`` constraints)."""
+    if not 0.0 <= mask_prob <= 1.0:
+        raise ValueError(f"mask_prob must be in [0, 1], got {mask_prob}")
+    if not 0.0 <= mask_token_prob <= 1.0:
+        raise ValueError(f"mask_token_prob must be in [0, 1], got {mask_token_prob}")
+    if not 0.0 <= random_token_prob <= 1.0:
+        raise ValueError(f"random_token_prob must be in [0, 1], got {random_token_prob}")
+    if mask_token_prob + random_token_prob > 1.0 + 1e-9:
+        raise ValueError(
+            "mask_token_prob + random_token_prob must be <= 1, got "
+            f"{mask_token_prob} + {random_token_prob} = {mask_token_prob + random_token_prob}"
+        )

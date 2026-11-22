@@ -1,0 +1,326 @@
+"""
+This is a script for the frontend of the ModelEvaluatorPlot class for visualizing cross-validated
+model evaluation and paired comparison results.
+"""
+from typing import Optional, List, Tuple, Union
+import numpy as np
+import pandas as pd
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+
+import aaanalysis.utils as ut
+from ._backend.model_evaluator.model_evaluator_plot import plot_scores, plot_compare, plot_learning_curve
+
+
+# I Helper Functions
+def check_df_curve(df_curve: pd.DataFrame) -> None:
+    """Check the learning-curve table schema and values before plotting."""
+    ut.check_df(name="df_curve", df=df_curve, cols_required=ut.COLS_CURVE_MODELEVAL,
+                accept_none=False)
+    if len(df_curve) == 0:
+        raise ValueError(
+            "'df_curve' (n_rows=0) should contain at least one row of learning-curve "
+            "data.")
+    str_cols = [ut.COL_MODEL, ut.COL_METRIC]
+    wrong_str_cols = [col for col in str_cols if not df_curve[col].map(
+        lambda val: isinstance(val, str) and len(val) > 0).all()]
+    if wrong_str_cols:
+        raise ValueError(f"'df_curve' (columns={wrong_str_cols}) should contain non-empty string "
+                         f"model and metric values.")
+    numeric_cols = [ut.COL_TRAIN_SIZE, ut.COL_SCORE, ut.COL_SCORE_STD, ut.COL_CI_LOW,
+                    ut.COL_CI_HIGH, ut.COL_N_SCORES]
+    wrong_numeric_cols = [
+        col for col in numeric_cols
+        if not pd.api.types.is_numeric_dtype(df_curve[col])
+        or pd.api.types.is_bool_dtype(df_curve[col])
+        or pd.api.types.is_complex_dtype(df_curve[col])
+    ]
+    if wrong_numeric_cols:
+        raise ValueError(f"'df_curve' (columns={wrong_numeric_cols}) should contain numeric curve "
+                         f"values.")
+    finite_cols = [ut.COL_TRAIN_SIZE, ut.COL_SCORE, ut.COL_SCORE_STD, ut.COL_N_SCORES]
+    values = df_curve[finite_cols].to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError(
+            f"'df_curve' (columns={finite_cols}) should contain finite training-size, score, "
+            f"score-std, and score-count values.")
+    train_sizes = df_curve[ut.COL_TRAIN_SIZE].to_numpy(dtype=float)
+    if (train_sizes < 2).any() or not np.equal(train_sizes, np.floor(train_sizes)).all():
+        raise ValueError(f"'df_curve' (train_size={train_sizes.tolist()}) should contain integer "
+                         f"training sizes of at least 2.")
+    score_std = df_curve[ut.COL_SCORE_STD].to_numpy(dtype=float)
+    if (score_std < 0).any():
+        raise ValueError(
+            f"'df_curve' (score_std={score_std.tolist()}) should contain non-negative score "
+            f"standard deviations.")
+    n_scores = df_curve[ut.COL_N_SCORES].to_numpy(dtype=float)
+    if (n_scores < 1).any() or not np.equal(n_scores, np.floor(n_scores)).all():
+        raise ValueError(
+            f"'df_curve' (n_scores={n_scores.tolist()}) should contain positive integer score "
+            f"counts.")
+    ci = df_curve[[ut.COL_CI_LOW, ut.COL_CI_HIGH]].to_numpy(dtype=float)
+    ci_is_nan = np.isnan(ci)
+    if not (np.isfinite(ci).all(axis=1) | ci_is_nan.all(axis=1)).all():
+        raise ValueError("'df_curve' (ci_low/ci_high) should contain two finite CI bounds or two "
+                         "NaN values.")
+    if (np.isfinite(ci).all(axis=1) & (ci[:, 0] > ci[:, 1])).any():
+        raise ValueError("'df_curve' (ci_low > ci_high) should contain CI bounds in ascending "
+                         "order.")
+    group_cols = [ut.COL_MODEL, ut.COL_TRAIN_SIZE, ut.COL_METRIC]
+    if df_curve.duplicated(subset=group_cols).any():
+        raise ValueError(f"'df_curve' (duplicate {group_cols} rows) should contain one row per "
+                         f"model, training size, and metric.")
+    n_sizes = (
+        df_curve.groupby([ut.COL_MODEL, ut.COL_METRIC], sort=False)[ut.COL_TRAIN_SIZE].nunique())
+    if (n_sizes < 2).any():
+        raise ValueError(
+            f"'df_curve' (training-size counts={n_sizes.to_dict()}) should contain at least two "
+            f"training sizes per model and metric.")
+
+
+def check_metric_curve(metric: Optional[str], df_curve: pd.DataFrame) -> str:
+    """Resolve the metric to plot: ``mcc`` when present, else the first metric of ``df_curve``."""
+    list_metrics = list(dict.fromkeys(df_curve[ut.COL_METRIC]))
+    if len(list_metrics) == 0:
+        raise ValueError(f"'df_curve' (n_rows={len(df_curve)}) should be a learning-curve table "
+                         f"with at least one row.")
+    if metric is None:
+        return "mcc" if "mcc" in list_metrics else list_metrics[0]
+    ut.check_str_options(name="metric", val=metric, list_str_options=list_metrics)
+    return metric
+
+
+# II Main Functions
+class ModelEvaluatorPlot:
+    """
+    Plotting class for :class:`ModelEvaluator` results.
+
+    Visualizes the two ``ModelEvaluator`` tables: :meth:`scores` draws grouped confidence-interval
+    bars of the cross-validated scores per (model, metric) from :meth:`ModelEvaluator.run`, and
+    :meth:`compare` draws the paired model comparison from :meth:`ModelEvaluator.eval` as signed
+    delta bars with bootstrap-CI whiskers and significance markers. :meth:`learning_curve` draws the
+    metric versus training size from :meth:`ModelEvaluator.learning_curve` with a CI band.
+
+    Every plotting method returns a ``(fig, ax)`` pair (a thin tuple subclass): unpack as
+    ``fig, ax = ...``. For backward compatibility, the returned object also forwards attribute
+    access to ``ax``.
+
+    .. versionadded:: 1.1.0
+
+    .. versionchanged:: 1.2.0
+        Added :meth:`learning_curve` for learning-curve tables.
+
+    See Also
+    --------
+    * :class:`ModelEvaluator` for the logic class whose results this visualizes.
+    """
+
+    def __init__(self):
+        """
+        See Also
+        --------
+        * :class:`ModelEvaluator`: the logic class whose evaluation and comparison this visualizes.
+        """
+
+    @staticmethod
+    def scores(df_eval: pd.DataFrame,
+               *, figsize: Tuple[Union[int, float], Union[int, float]] = (6, 4),
+               colors: Optional[List[str]] = None,
+               metrics: Optional[List[str]] = None,
+               ) -> Tuple[Figure, Axes]:
+        """
+        Plot cross-validated scores per (model, metric) as grouped bars with CI error bars.
+
+        One bar group per metric holds one bar per model; the error bars show the bootstrap
+        confidence interval of the mean (falling back to the fold std where the CI is ``NaN``),
+        so models are compared at a glance with their uncertainty.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_eval : pd.DataFrame, shape (n_models * n_metrics, 7)
+            Evaluation table from :meth:`ModelEvaluator.run` with columns ``model``, ``metric``,
+            ``score``, ``score_std``, ``ci_low``, ``ci_high``, and ``n_scores``. Error bars use the
+            bootstrap CI (``ci_low`` / ``ci_high``), falling back to ``score_std`` where the CI is
+            ``NaN``.
+        figsize : tuple, default=(6, 4)
+            Figure dimensions (width, height) in inches.
+        colors : list of str, optional
+            One color per model (in first-appearance order). Defaults to the package color list.
+        metrics : list of str, optional
+            Subset and order of metrics to show on the x-axis. Defaults to all metrics in
+            ``df_eval`` (first-appearance order).
+
+        Returns
+        -------
+        fig : Figure
+            Figure object for the evaluation plot.
+        ax : Axes
+            Axes object of the grouped bar chart.
+
+        See Also
+        --------
+        * :meth:`ModelEvaluator.run`: the respective computation method.
+
+        Examples
+        --------
+        .. include:: examples/me_plot_scores.rst
+        """
+        # Check input
+        ut.check_df(name="df_eval", df=df_eval, cols_required=ut.COLS_EVAL_MODELEVAL, accept_none=False)
+        ut.check_figsize(figsize=figsize, accept_none=False)
+        ut.check_list_colors(name="colors", val=colors, accept_none=True)
+        metrics = ut.check_list_like(name="metrics", val=metrics, accept_none=True, accept_str=True)
+        # Plotting
+        n_models = df_eval[ut.COL_MODEL].nunique()
+        if colors is None:
+            colors = ut.plot_get_clist_(n_colors=n_models)
+        elif len(colors) < n_models:
+            raise ValueError(f"'colors' (n={len(colors)}) should provide at least one color per "
+                             f"model (n_models={n_models}).")
+        fig, ax = plot_scores(df_eval=df_eval, colors=colors, figsize=figsize, metrics=metrics)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def compare(df_eval: pd.DataFrame,
+                *, figsize: Tuple[Union[int, float], Union[int, float]] = (6, 4),
+                colors: Optional[List[str]] = None,
+                alpha: float = 0.05,
+                ) -> Tuple[Figure, Axes]:
+        """
+        Plot the paired model comparison as signed delta bars with CI whiskers.
+
+        Each bar is one model pair's ``delta`` (``score_a - score_b``); bars are colored by sign,
+        whiskers show the bootstrap CI, and a star marks a pair whose ``p_value`` is below
+        ``alpha`` (a significant difference).
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_eval : pd.DataFrame, shape (n_pairs, 8)
+            Comparison table from :meth:`ModelEvaluator.eval` with columns ``model_a``,
+            ``model_b``, ``metric``, ``delta``, ``delta_std``, ``ci_low``, ``ci_high``, and
+            ``p_value``.
+        figsize : tuple, default=(6, 4)
+            Figure dimensions (width, height) in inches.
+        colors : list of str of length 2, optional
+            Colors for positive and negative deltas (``[color_pos, color_neg]``). Defaults to the
+            package positive/negative colors.
+        alpha : float, default=0.05
+            Significance level in ``(0, 1)``; pairs with ``p_value < alpha`` are starred.
+
+        Returns
+        -------
+        fig : Figure
+            Figure object for the comparison plot.
+        ax : Axes
+            Axes object of the delta bar chart.
+
+        See Also
+        --------
+        * :meth:`ModelEvaluator.eval`: the respective computation method.
+
+        Examples
+        --------
+        .. include:: examples/me_plot_compare.rst
+        """
+        # Check input
+        ut.check_df(name="df_eval", df=df_eval, cols_required=ut.COLS_COMPARE_MODELEVAL, accept_none=False)
+        ut.check_figsize(figsize=figsize, accept_none=False)
+        ut.check_list_colors(name="colors", val=colors, accept_none=True, min_n=2, max_n=2)
+        ut.check_number_range(name="alpha", val=alpha, min_val=0.0, max_val=1.0,
+                              just_int=False, exclusive_limits=True)
+        # Plotting
+        if colors is None:
+            colors = [ut.COLOR_POS, ut.COLOR_NEG]
+        fig, ax = plot_compare(df_eval=df_eval, color_pos=colors[0], color_neg=colors[1],
+                               figsize=figsize, alpha=alpha)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def learning_curve(df_curve: pd.DataFrame,
+                       *, metric: Optional[str] = None,
+                       figsize: Tuple[Union[int, float], Union[int, float]] = (6, 4),
+                       colors: Optional[Union[str, List[str]]] = None,
+                       show_ci: bool = True,
+                       ) -> Tuple[Figure, Axes]:
+        """
+        Plot a learning curve: one metric versus training size per model, with a CI band.
+
+        One line per model connects the mean cross-validated score at each training size; the
+        shaded band shows the bootstrap confidence interval of the mean (falling back to the fold
+        std where the CI is ``NaN``). A curve still rising at the largest size suggests the task is
+        sampling-limited; a flat curve suggests it has saturated.
+
+        .. versionadded:: 1.2.0
+
+        Parameters
+        ----------
+        df_curve : pd.DataFrame, shape (n_models * n_train_sizes * n_metrics, 8)
+            Learning-curve table from :meth:`ModelEvaluator.learning_curve` with columns ``model``,
+            ``train_size``, ``metric``, ``score``, ``score_std``, ``ci_low``, ``ci_high``, and
+            ``n_scores``. Model and metric values must be non-empty strings; training sizes must
+            be integer-valued and at least 2, score counts positive integer-valued, and scores and
+            standard deviations finite (with non-negative standard deviations). Each (model,
+            training size, metric) tuple must occur once and each model/metric curve must have at
+            least two training sizes. Confidence bounds must be finite and ordered, or both
+            ``NaN`` when the curve was computed with ``ci=None``.
+        metric : str or None, default=None
+            Metric to plot; must be one of the metrics in ``df_curve``. Defaults to ``"mcc"`` when
+            present, otherwise the first metric of ``df_curve``.
+        figsize : tuple of int or float, default=(6, 4)
+            Positive figure dimensions ``(width, height)`` in inches; changes the rendered figure
+            size.
+        colors : str, list of str, or None, default=None
+            One color per model (in first-appearance order); a single color name counts as one
+            color, not as a sequence of characters. If ``None``, uses the package color list.
+        show_ci : bool, default=True
+            If ``True``, draw the confidence band (``ci_low`` / ``ci_high``, or ``score_std`` where
+            the CI is ``NaN``) around each curve. If ``False``, draws only the score lines.
+
+        Returns
+        -------
+        fig : Figure
+            Figure object for the learning-curve plot.
+        ax : Axes
+            Axes object of the learning-curve line plot.
+
+        Raises
+        ------
+        ValueError
+            If ``df_curve`` is not a DataFrame with the learning-curve columns or holds no rows,
+            its values do not form a valid learning-curve table, ``metric`` is not one of its
+            metrics, ``figsize`` is not a positive numeric pair, ``show_ci`` is not boolean, or
+            ``colors`` is not a valid color string/list with at least one color per model.
+
+        See Also
+        --------
+        * :meth:`ModelEvaluator.learning_curve`: the respective computation method.
+
+        Examples
+        --------
+        .. include:: examples/me_plot_learning_curve.rst
+        """
+        # Check input
+        check_df_curve(df_curve=df_curve)
+        metric = check_metric_curve(metric=metric, df_curve=df_curve)
+        ut.check_figsize(figsize=figsize, accept_none=False)
+        if colors is not None and not isinstance(colors, (str, list)):
+            raise ValueError(f"'colors' ({type(colors).__name__}) should be a string or a list of "
+                             f"color strings.")
+        ut.check_list_colors(name="colors", val=colors, accept_none=True)
+        ut.check_bool(name="show_ci", val=show_ci)
+        # Plotting
+        n_models = df_curve[ut.COL_MODEL].nunique()
+        if isinstance(colors, str):
+            # A single color name is one color, not a sequence of single-character colors.
+            colors = [colors]
+        if colors is not None and len(colors) < n_models:
+            raise ValueError(f"'colors' (n={len(colors)}) should be at least one color per model "
+                             f"(n_models={n_models}).")
+        list_colors = colors if colors is not None else ut.plot_get_clist_(n_colors=n_models)
+        fig, ax = plot_learning_curve(df_curve=df_curve, metric=metric, colors=list_colors,
+                                      figsize=figsize, show_ci=show_ci)
+        return ut.FigAxResult(fig, ax)

@@ -1,0 +1,318 @@
+import type { SimBox, SimState } from './types';
+
+/*
+ * Box geometry: orthogonal and restricted triclinic boxes, periodic wrapping
+ * with image flags, minimum image, and shrink-wrapping.
+ *
+ * docs.lammps.org/Howto_triclinic.html: the restricted triclinic box has
+ * edge vectors "A = (xhi-xlo,0,0), B = (xy,yhi-ylo,0), C = (xz,yz,zhi-zlo)".
+ * docs.lammps.org/boundary.html: "for y periodicity a particle which exits
+ * the lower y boundary is displaced in the x-direction by xy before it
+ * re-enters the upper y boundary" — so an atom's unwrapped position is
+ * x + ix*A + iy*B + iz*C.
+ * Shrink-wrapping: "For style s, the position of the face is set so as to
+ * encompass the atoms in that dimension (shrink-wrapping), no matter how far
+ * they move." "For style m, shrink-wrapping occurs, but is bounded by the
+ * value specified in the data or restart file or set by the create_box
+ * command." Native LAMMPS leaves a margin of 1e-4 of the box length the box
+ * had when it was defined (measured: boxes 10 and 1000 wide give margins
+ * 0.001 and 0.1, unchanged by later shrinking) — see SHRINK_PAD.
+ */
+
+export const SHRINK_PAD = 1e-4;
+
+export interface BoxInit {
+  lo: [number, number, number];
+  hi: [number, number, number];
+  periodic?: [boolean, boolean, boolean];
+  tilt?: [number, number, number];
+  boundary?: SimBox['boundary'];
+}
+
+/** A complete SimBox from bounds; boundary defaults to periodic (p p p). */
+export const makeBox = (b: BoxInit): SimBox => {
+  const boundary = b.boundary
+    ?? (b.periodic ?? [true, true, true]).map((p) => (p ? ['p', 'p'] : ['f', 'f'])) as SimBox['boundary'];
+  const tilt: [number, number, number] = b.tilt ? [...b.tilt] : [0, 0, 0];
+  return {
+    lo: [...b.lo],
+    hi: [...b.hi],
+    periodic: [boundary[0][0] === 'p', boundary[1][0] === 'p', boundary[2][0] === 'p'],
+    tilt,
+    triclinic: !!b.tilt,
+    boundary: boundary.map((f) => [f[0], f[1]]) as SimBox['boundary'],
+    minLo: [...b.lo],
+    minHi: [...b.hi],
+  };
+};
+
+export const cloneBox = (b: SimBox): SimBox => ({
+  lo: [...b.lo], hi: [...b.hi], periodic: [...b.periodic], tilt: [...b.tilt], triclinic: b.triclinic,
+  boundary: b.boundary.map((f) => [f[0], f[1]]) as SimBox['boundary'], minLo: [...b.minLo], minHi: [...b.minHi],
+  // the general triclinic rotation is part of the box (SimBox.general); a copy keeps it
+  ...(b.general ? { general: { Q: b.general.Q.map((r) => [...r]) as NonNullable<SimBox['general']>['Q'] } } : {}),
+});
+
+/**
+ * Cached geometry of a box: lengths, tilt, inverse h. Rebuild with `update`
+ * whenever the box changes (shrink-wrap, deform, barostat, change_box).
+ */
+export class Geometry {
+  lx = 0; ly = 0; lz = 0;
+  xy = 0; xz = 0; yz = 0;
+  lo: [number, number, number] = [0, 0, 0];
+  hi: [number, number, number] = [0, 0, 0];
+  periodic: [boolean, boolean, boolean] = [true, true, true];
+  triclinic = false;
+  /** h^-1 entries for x = lo + h * lambda, h = [[lx, xy, xz], [0, ly, yz], [0, 0, lz]]. */
+  private i00 = 0; private i01 = 0; private i02 = 0; private i11 = 0; private i12 = 0; private i22 = 0;
+  /** Per-dimension shrink-wrap margin (1e-4 of the defined length). */
+  pad: [number, number, number] = [0, 0, 0];
+
+  constructor(public box: SimBox) {
+    this.update();
+    this.pad = [0, 1, 2].map((d) => SHRINK_PAD * (box.hi[d] - box.lo[d])) as [number, number, number];
+  }
+
+  update(): void {
+    const b = this.box;
+    this.lo = [...b.lo];
+    this.hi = [...b.hi];
+    this.periodic = [...b.periodic];
+    this.lx = b.hi[0] - b.lo[0];
+    this.ly = b.hi[1] - b.lo[1];
+    this.lz = b.hi[2] - b.lo[2];
+    [this.xy, this.xz, this.yz] = b.tilt;
+    this.triclinic = b.triclinic;
+    // inverse of the upper-triangular h
+    this.i00 = 1 / this.lx;
+    this.i11 = 1 / this.ly;
+    this.i22 = 1 / this.lz;
+    this.i01 = -this.xy / (this.lx * this.ly);
+    this.i12 = -this.yz / (this.ly * this.lz);
+    this.i02 = (this.xy * this.yz - this.ly * this.xz) / (this.lx * this.ly * this.lz);
+  }
+
+  /** Volume (3d) or area (2d) — docs.lammps.org/thermo_style.html "vol = volume". */
+  volume(dimension: 2 | 3): number {
+    return dimension === 3 ? this.lx * this.ly * this.lz : this.lx * this.ly;
+  }
+
+  /** The upper-triangular inverse box matrix toLamda applies: i00, i01, i02, i11, i12, i22. */
+  get hInv(): [number, number, number, number, number, number] {
+    return [this.i00, this.i01, this.i02, this.i11, this.i12, this.i22];
+  }
+
+  /** Fractional coordinates of x (out[0..2]). */
+  toLamda(x: number, y: number, z: number, out: number[]): void {
+    const dx = x - this.lo[0], dy = y - this.lo[1], dz = z - this.lo[2];
+    out[0] = this.i00 * dx + this.i01 * dy + this.i02 * dz;
+    out[1] = this.i11 * dy + this.i12 * dz;
+    out[2] = this.i22 * dz;
+  }
+
+  fromLamda(l0: number, l1: number, l2: number, out: number[]): void {
+    out[0] = this.lo[0] + this.lx * l0 + this.xy * l1 + this.xz * l2;
+    out[1] = this.lo[1] + this.ly * l1 + this.yz * l2;
+    out[2] = this.lo[2] + this.lz * l2;
+  }
+
+  /** Edge vector d (0 = A, 1 = B, 2 = C) times k, added to x[3i..]. */
+  addEdge(x: Float64Array, i: number, d: number, k: number): void {
+    if (d === 0) { x[3 * i] += k * this.lx; return; }
+    if (d === 1) { x[3 * i] += k * this.xy; x[3 * i + 1] += k * this.ly; return; }
+    x[3 * i] += k * this.xz; x[3 * i + 1] += k * this.yz; x[3 * i + 2] += k * this.lz;
+  }
+
+  /**
+   * Wraps atom i back into the periodic box, updating its image flags.
+   * Dimensions are handled z, y, x so a tilted shift is applied before the
+   * coordinates it moves are tested.
+   */
+  remap(x: Float64Array, image: Int32Array, i: number): void {
+    if (this.triclinic) { this.remapTriclinic(x, image, i); return; }
+    for (let d = 2; d >= 0; d--) {
+      if (!this.periodic[d]) continue;
+      // fractional coordinate along d (only components d.. matter: h is upper triangular)
+      const dx = x[3 * i] - this.lo[0], dy = x[3 * i + 1] - this.lo[1], dz = x[3 * i + 2] - this.lo[2];
+      const lam = d === 2 ? this.i22 * dz
+        : d === 1 ? this.i11 * dy + this.i12 * dz
+          : this.i00 * dx + this.i01 * dy + this.i02 * dz;
+      if (lam >= 0 && lam < 1) continue;
+      const k = Math.floor(lam);
+      this.addEdge(x, i, d, -k);
+      image[3 * i + d] += k;
+      // floating-point edge, tested on the coordinate itself as native does (domain.cpp Domain::pbc() at b332f28:
+      // "if (x[i][0] >= hi[0]) { x[i][0] -= period[0]; x[i][0] = MAX(x[i][0],lo[0]); ..."). The fractional test
+      // i00 * (x - lo) rounds a wrapped 0.6999999999999998 (from -0.7000000000000001 in the box -0.7..0.7) to 1 and
+      // undid the wrap: the atom then kept its unwrapped position in native's bins and in the pair order.
+      const c = x[3 * i + d];
+      if (c >= this.hi[d]) {
+        this.addEdge(x, i, d, -1);
+        x[3 * i + d] = Math.max(x[3 * i + d], this.lo[d]);
+        image[3 * i + d] += 1;
+      } else if (c < this.lo[d]) { this.addEdge(x, i, d, 1); image[3 * i + d] -= 1; }
+    }
+  }
+
+  /**
+   * Triclinic wrap in fractional coordinates. Measured with native LAMMPS (black box, 400 random atoms in a
+   * box with xy 1.37, xz 0.71, yz -0.43, read_data then write_dump, %.17g): every atom, inside the box or
+   * not, is taken to lamda = h^-1 (x - lo) and back to x = h lamda + lo, with each periodic lamda reduced
+   * by its floor (image += floor); the sums are left to right, x = ((lx*l0 + xy*l1) + xz*l2) + lo, and y and z
+   * likewise. A Cartesian edge shift (x -= k*A) gives the same atom up to round-off, but native's
+   * bits differ, and loop geom velocities hash the bits, so the round trip is what matches.
+   */
+  /**
+   * remap() of atom i in a triclinic box that also stores the atom's fractional coordinates after the wrap in lam[3i..3i+2]:
+   * as native LAMMPS does at a reneighboring (src/verlet.cpp at b332f28: "domain->x2lamda(atom->nlocal); domain->pbc();
+   * ... comm->borders(); domain->lamda2x(atom->nlocal+atom->nghost)"), the ghost atoms are then placed from these lamda.
+   */
+  remapKeepLamda(x: Float64Array, image: Int32Array, i: number, lam: Float64Array): void {
+    this.remapTriclinic(x, image, i, lam);
+  }
+
+  private remapTriclinic(x: Float64Array, image: Int32Array, i: number, lamOut?: Float64Array): void {
+    const dx = x[3 * i] - this.lo[0], dy = x[3 * i + 1] - this.lo[1], dz = x[3 * i + 2] - this.lo[2];
+    const l = [
+      this.i00 * dx + this.i01 * dy + this.i02 * dz,
+      this.i11 * dy + this.i12 * dz,
+      this.i22 * dz,
+    ];
+    // Domain::remap (src/domain.cpp at b332f28): while (coord < lo) coord += period; while (coord >= hi) coord -= period;
+    // coord = MAX(coord, lo), with lo = 0, hi = period = 1. The loops, not a floor: l = -2.8e-17 (an atom on the x = 0
+    // face of a tilted box) becomes 1.0 after one +1 and must then take the second step to 0.0; a floor shift stops at 1.0
+    // and moves the atom by a whole box length. Measured with native LAMMPS (black box): the MoS2 single layer data
+    // (xy 25.58) keeps those atoms at x = 9.59, not 60.74.
+    for (let d = 2; d >= 0; d--) {
+      if (!this.periodic[d]) continue;
+      while (l[d] < 0) { l[d] += 1; image[3 * i + d] -= 1; }
+      while (l[d] >= 1) { l[d] -= 1; image[3 * i + d] += 1; }
+      l[d] = Math.max(l[d], 0);
+    }
+    x[3 * i] = this.lx * l[0] + this.xy * l[1] + this.xz * l[2] + this.lo[0];
+    x[3 * i + 1] = this.ly * l[1] + this.yz * l[2] + this.lo[1];
+    x[3 * i + 2] = this.lz * l[2] + this.lo[2];
+    if (lamOut) { lamOut[3 * i] = l[0]; lamOut[3 * i + 1] = l[1]; lamOut[3 * i + 2] = l[2]; }
+  }
+
+  /**
+   * Atom i taken to lamda = h^-1 (x - lo) and back to x = h lamda + lo, summed as native's x2lamda/lamda2x do; with
+   * lamOut, the lamda is stored in lamOut[3i..3i+2].
+   */
+  lamdaRoundTrip(x: Float64Array, i: number, lamOut?: Float64Array): void {
+    const dx = x[3 * i] - this.lo[0], dy = x[3 * i + 1] - this.lo[1], dz = x[3 * i + 2] - this.lo[2];
+    const l0 = this.i00 * dx + this.i01 * dy + this.i02 * dz;
+    const l1 = this.i11 * dy + this.i12 * dz;
+    const l2 = this.i22 * dz;
+    x[3 * i] = this.lx * l0 + this.xy * l1 + this.xz * l2 + this.lo[0];
+    x[3 * i + 1] = this.ly * l1 + this.yz * l2 + this.lo[1];
+    x[3 * i + 2] = this.lz * l2 + this.lo[2];
+    if (lamOut) { lamOut[3 * i] = l0; lamOut[3 * i + 1] = l1; lamOut[3 * i + 2] = l2; }
+  }
+
+  private readonly scratchX = new Float64Array(3);
+  private readonly scratchImage = new Int32Array(3);
+
+  /** A point mapped into the periodic box (the rule of remap(), without an atom). */
+  remapPoint(p: number[]): void {
+    // a point already inside an orthogonal box stays as it is (native Domain::remap only moves a coordinate below lo
+    // or at/above hi); region matches call this for every point (fix gcmc and fix widom test 10,000,000 of them)
+    if (!this.triclinic && p[0] >= this.lo[0] && p[0] < this.hi[0] && p[1] >= this.lo[1] && p[1] < this.hi[1]
+      && p[2] >= this.lo[2] && p[2] < this.hi[2]) return;
+    const x = this.scratchX;
+    x[0] = p[0]; x[1] = p[1]; x[2] = p[2];
+    this.remap(x, this.scratchImage, 0);
+    p[0] = x[0]; p[1] = x[1]; p[2] = x[2];
+  }
+
+  /** Unwrapped position of atom i: x + ix*A + iy*B + iz*C. */
+  unwrap(x: Float64Array, image: Int32Array, i: number, out: number[]): void {
+    const ix = image[3 * i], iy = image[3 * i + 1], iz = image[3 * i + 2];
+    out[0] = x[3 * i] + ix * this.lx + iy * this.xy + iz * this.xz;
+    out[1] = x[3 * i + 1] + iy * this.ly + iz * this.yz;
+    out[2] = x[3 * i + 2] + iz * this.lz;
+  }
+
+  /**
+   * Minimum-image convention on a displacement d (in place), periodic
+   * dimensions only; for a triclinic box, z then y then x, each shift using
+   * the full edge vector.
+   */
+  minimumImage(d: number[] | Float64Array): void {
+    if (this.periodic[2]) {
+      if (Math.abs(d[2]) > 0.5 * this.lz) {
+        const k = Math.round(d[2] / this.lz);
+        d[2] -= k * this.lz; d[1] -= k * this.yz; d[0] -= k * this.xz;
+      }
+    }
+    if (this.periodic[1]) {
+      if (Math.abs(d[1]) > 0.5 * this.ly) {
+        const k = Math.round(d[1] / this.ly);
+        d[1] -= k * this.ly; d[0] -= k * this.xy;
+      }
+    }
+    if (this.periodic[0]) {
+      if (Math.abs(d[0]) > 0.5 * this.lx) {
+        const k = Math.round(d[0] / this.lx);
+        d[0] -= k * this.lx;
+      }
+    }
+  }
+
+  /** True if (x, y, z) is inside the box (half-open on hi). */
+  inside(x: number, y: number, z: number): boolean {
+    const l = [0, 0, 0];
+    this.toLamda(x, y, z, l);
+    return l[0] >= 0 && l[0] < 1 && l[1] >= 0 && l[1] < 1 && l[2] >= 0 && l[2] < 1;
+  }
+}
+
+/**
+ * Re-fits shrink-wrapped faces around the atoms (Developer_flow: "The box
+ * boundaries are then reset (if needed) via the reset_box() method ... e.g. if
+ * box boundaries are shrink-wrapped to current particle coordinates").
+ * Returns true if the box changed. Orthogonal boxes; for a triclinic box the
+ * extents are measured in fractional coordinates of the tilted faces.
+ */
+export const shrinkWrap = (s: SimState, g: Geometry): boolean => {
+  const b = s.box;
+  let changed = false;
+  const lam = [0, 0, 0];
+  for (let d = 0; d < 3; d++) {
+    const [flo, fhi] = b.boundary[d];
+    const slo = flo === 's' || flo === 'm';
+    const shi = fhi === 's' || fhi === 'm';
+    if (!slo && !shi) continue;
+    if (s.dimension === 2 && d === 2) continue;
+    if (s.n === 0) continue;
+    let mn = Infinity, mx = -Infinity;
+    for (let i = 0; i < s.n; i++) {
+      let c: number;
+      if (g.triclinic) {
+        g.toLamda(s.x[3 * i], s.x[3 * i + 1], s.x[3 * i + 2], lam);
+        c = lam[d];
+      } else c = s.x[3 * i + d];
+      if (c < mn) mn = c;
+      if (c > mx) mx = c;
+    }
+    if (g.triclinic) {
+      // convert the fractional extents back to box coordinates along d
+      const len = d === 0 ? g.lx : d === 1 ? g.ly : g.lz;
+      mn = b.lo[d] + mn * len;
+      mx = b.lo[d] + mx * len;
+    }
+    if (slo) {
+      let v = mn - g.pad[d];
+      if (flo === 'm') v = Math.min(v, b.minLo[d]);
+      if (v !== b.lo[d]) { b.lo[d] = v; changed = true; }
+    }
+    if (shi) {
+      let v = mx + g.pad[d];
+      if (fhi === 'm') v = Math.max(v, b.minHi[d]);
+      if (v !== b.hi[d]) { b.hi[d] = v; changed = true; }
+    }
+  }
+  if (changed) g.update();
+  return changed;
+};

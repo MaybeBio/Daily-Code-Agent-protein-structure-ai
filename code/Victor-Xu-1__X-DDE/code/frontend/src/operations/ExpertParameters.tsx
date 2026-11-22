@@ -1,0 +1,259 @@
+import { PredictionFeatureSettings } from "../presentation/PredictionFeatureSettings";
+import type { Language, Parameters } from "../types";
+import { Hint } from "../guided/Hint";
+import { useEffect, useState } from "react";
+import { request } from "../api";
+import { IntegerListField } from "./IntegerListField";
+import type { IntegerField, IntegerText } from "./integer-list-model";
+
+export function ExpertParameters({
+  value,
+  onChange,
+  language,
+  expert,
+  contextKey = "",
+  integerText,
+  onIntegerTextChange,
+}: {
+  value: Parameters;
+  onChange(p: Parameters): void;
+  language: Language;
+  expert: boolean;
+  contextKey?: string;
+  integerText?: IntegerText;
+  onIntegerTextChange?(field: IntegerField, value: string): void;
+}) {
+  const zh = language === "zh";
+  const [checkpoints, setCheckpoints] = useState<
+      { id: string; present: boolean }[]
+    >([]),
+    [registryError, setRegistryError] = useState("");
+  useEffect(() => {
+    if (!expert) return;
+    const c = new AbortController();
+    void request<{ id: string; present: boolean }[]>("/checkpoints", {
+      signal: c.signal,
+    })
+      .then(setCheckpoints)
+      .catch((e) => {
+        if (!c.signal.aborted) setRegistryError(String(e));
+      });
+    return () => c.abort();
+  }, [expert]);
+  const update = (patch: Partial<Parameters>) =>
+    onChange({ ...value, ...patch });
+  const flags = [
+    [
+      "tfg",
+      "配体几何引导（TFG）",
+      "Ligand geometry guidance (TFG)",
+      "在蛋白–配体预测中加入几何势引导；不是新分子生成。",
+      "Geometry potentials during protein–ligand prediction; does not generate new molecules.",
+      false,
+    ],
+    [
+      "atom_confidence",
+      "输出逐原子置信度",
+      "Atom-level confidence",
+      "用于查看 PAE、PDE 和原子置信度，建议保留。",
+      "Exports native confidence arrays for inspection.",
+      true,
+    ],
+    [
+      "deterministic",
+      "确定性计算",
+      "Deterministic execution",
+      "尽量减少重复运行的数值差异，可能影响速度。",
+      "Reduces numerical variation, potentially at a speed cost.",
+      false,
+    ],
+    [
+      "enable_cache",
+      "缓存中间计算",
+      "Cache computations",
+      "重复使用中间计算，通常保留开启。",
+      "Reuse intermediate computation; normally enabled.",
+      true,
+    ],
+    [
+      "enable_fusion",
+      "融合计算",
+      "Kernel fusion",
+      "减少计算开销；遇到内核兼容问题时可关闭。",
+      "Reduces overhead; disable to investigate kernel compatibility.",
+      true,
+    ],
+    [
+      "enable_tf32",
+      "启用 TF32",
+      "Enable TF32",
+      "CUDA 上的速度与精度折中。",
+      "CUDA speed/precision tradeoff.",
+      true,
+    ],
+  ] as const;
+  return (
+    <section className="extended-parameters">
+      <PredictionFeatureSettings
+        value={value}
+        onChange={update}
+        language={language}
+        contextKey={JSON.stringify([contextKey, value])}
+        hasRna
+      />
+      {expert && (
+        <>
+          {(checkpoints.length > 0 || value.checkpoint_id) && (
+            <label className="field">
+              {zh
+                ? "服务器注册的自定义权重"
+                : "Server-registered custom checkpoint"}
+              <select
+                value={value.checkpoint_id ?? ""}
+                onChange={(e) =>
+                  update({ checkpoint_id: e.target.value || null })
+                }
+              >
+                <option value="">
+                  {zh
+                    ? "使用上方选择的标准 / ABAG 模型"
+                    : "Use the selected standard / ABAG checkpoint"}
+                </option>
+                {checkpoints.map((c) => (
+                  <option key={c.id} value={c.id} disabled={!c.present}>
+                    {c.id}
+                    {!c.present ? (zh ? "（文件缺失）" : " (missing)") : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {registryError && (
+            <p role="status" className="notice">
+              {registryError}
+            </p>
+          )}
+          <div className="parameter-grid">
+            <label className="field">
+              {zh ? "计算设备" : "Compute device"}
+              <select
+                value={value.device ?? "cuda"}
+                onChange={(e) =>
+                  update({
+                    device: e.target.value as Parameters["device"],
+                    gpu_ids: [],
+                    distributed: false,
+                    triatt_kernel: "auto",
+                    trimul_kernel: "auto",
+                    dtype: e.target.value === "cpu" ? "fp32" : value.dtype,
+                  })
+                }
+              >
+                <option value="cuda">NVIDIA GPU (CUDA)</option>
+                <option value="cpu">CPU</option>
+              </select>
+            </label>
+            <IntegerListField
+              value={value.additional_seeds ?? []}
+              text={integerText?.additional_seeds}
+              onTextChange={(raw) =>
+                onIntegerTextChange?.("additional_seeds", raw)
+              }
+              language={language}
+              onChange={(additional_seeds) => update({ additional_seeds })}
+              max={4294967295}
+              count={7}
+              label={
+                zh
+                  ? "额外随机种子（逗号分隔）"
+                  : "Additional seeds (comma separated)"
+              }
+            />
+            {(value.device !== "cpu" ||
+              (value.gpu_ids?.length ?? 0) > 0 ||
+              Boolean(integerText?.gpu_ids?.trim())) && (
+              <IntegerListField
+                value={value.gpu_ids ?? []}
+                text={integerText?.gpu_ids}
+                onTextChange={(raw) => onIntegerTextChange?.("gpu_ids", raw)}
+                language={language}
+                onChange={(gpu_ids) => update({ gpu_ids })}
+                max={63}
+                count={8}
+                label={
+                  zh
+                    ? "GPU 编号（留空自动）"
+                    : "GPU indices (blank = automatic)"
+                }
+              />
+            )}
+            {(["trimul_kernel", "triatt_kernel"] as const).map((key) => (
+              <label className="field" key={key}>
+                {key === "trimul_kernel"
+                  ? zh
+                    ? "三角乘法内核"
+                    : "Triangle multiplication kernel"
+                  : zh
+                    ? "三角注意力内核"
+                    : "Triangle attention kernel"}
+                <select
+                  value={value[key] ?? "auto"}
+                  onChange={(e) => update({ [key]: e.target.value })}
+                >
+                  {[
+                    "auto",
+                    "torch",
+                    ...(value.device !== "cpu" ? ["cuequivariance"] : []),
+                  ].map((v) => (
+                    <option key={v}>{v}</option>
+                  ))}
+                </select>
+              </label>
+            ))}
+            <label className="field">
+              {zh ? "RNA 搜索 CPU 数" : "RNA search CPUs"}
+              <input
+                type="number"
+                min={1}
+                max={32}
+                value={value.search_cpus ?? 4}
+                onChange={(e) =>
+                  update({ search_cpus: Number(e.target.value) })
+                }
+              />
+            </label>
+          </div>
+          <div className="check-choices">
+            {flags.map(([key, cn, en, hcn, hen, def]) => (
+              <span className="choice-with-help" key={key}>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={value[key] ?? def}
+                    onChange={(e) => update({ [key]: e.target.checked })}
+                  />
+                  {zh ? cn : en}
+                </label>
+                <Hint label={zh ? cn + "说明" : en + " help"}>
+                  {zh ? hcn : hen}
+                </Hint>
+              </span>
+            ))}
+          </div>
+          {value.device !== "cpu" && (
+            <label>
+              <input
+                type="checkbox"
+                checked={value.distributed ?? false}
+                onChange={(e) => update({ distributed: e.target.checked })}
+              />
+              {zh
+                ? "多 GPU FoldCP（至少选择两张 GPU）"
+                : "Multi-GPU FoldCP (select at least two GPUs)"}
+            </label>
+          )}
+        </>
+      )}
+    </section>
+  );
+}

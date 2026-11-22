@@ -1,0 +1,157 @@
+/**
+ *  \file VectorData.h
+ *  \brief Underlying storage for VectorD
+ *  Copyright 2007-2026 IMP Inventors. All rights reserved.
+*/
+
+#ifndef IMPKERNEL_INTERNAL_VECTOR_BASE_H
+#define IMPKERNEL_INTERNAL_VECTOR_BASE_H
+
+#include <IMP/kernel_config.h>
+#include <IMP/exception.h>
+#include <boost/scoped_array.hpp>
+#include <cereal/access.hpp>
+#include <limits>
+
+IMPKERNEL_BEGIN_INTERNAL_NAMESPACE
+
+template <class T>
+inline T get_null_value() {
+  return T();
+}
+
+template <>
+inline double get_null_value() {
+  return std::numeric_limits<double>::quiet_NaN();
+}
+
+template <>
+inline int get_null_value() {
+  return std::numeric_limits<int>::max();
+}
+
+template <class T>
+inline bool get_is_null_value(const T &val) {
+  return val == get_null_value<T>();
+}
+
+// Can't use default implementation for double, since NaN never compares
+// equal to anything - even itself
+template <>
+inline bool get_is_null_value(const double &val) {
+  return val != val;
+}
+
+template <class T, int D, bool KNOWN_DEFAULT>
+class VectorData {
+  T storage_[D];
+
+  friend class cereal::access;
+
+  template<class Archive>
+  void serialize(Archive &ar) {
+    for (auto &i: storage_) {
+      ar(i);
+    }
+  }
+
+ public:
+  unsigned int get_dimension() const { return D; }
+  VectorData(int) {}
+  VectorData() {
+#if IMP_HAS_CHECKS >= IMP_USAGE
+    for (unsigned int i = 0; i < D; ++i) {
+      storage_[i] = get_null_value<T>();
+    }
+#else
+    if (KNOWN_DEFAULT) {
+      for (unsigned int i = 0; i < D; ++i) {
+        storage_[i] = get_null_value<T>();
+      }
+    }
+#endif
+  }
+  template <class It>
+  void set_coordinates(It b, It e) {
+    IMP_USAGE_CHECK(std::distance(b, e) == D,
+                    "Wrong number of coordinates provided.");
+    std::copy(b, e, storage_);
+  }
+  T *get_data() { return storage_; }
+  const T *get_data() const { return storage_; }
+
+#ifdef _MSC_VER
+  IMP_CXX11_DEFAULT_COPY_CONSTRUCTOR(VectorData);
+#else
+  VectorData(const VectorData &other) {
+    std::copy(other.storage_, other.storage_ + D, storage_);
+  }
+#endif
+
+  bool get_is_null() const { return get_is_null_value<T>(storage_[0]); }
+  ~VectorData() {
+#if IMP_HAS_CHECKS >= IMP_USAGE
+    for (unsigned int i = 0; i < D; ++i) {
+      storage_[i] = get_null_value<T>();
+    }
+#endif
+  }
+};
+
+template <class T, bool KNOWN_DEFAULT>
+class VectorData<T, -1, KNOWN_DEFAULT> {
+  boost::scoped_array<T> storage_;
+  unsigned int d_;
+
+  friend class cereal::access;
+
+  template<class Archive>
+  void save(Archive &ar) const {
+    ar(d_);
+    for (unsigned i = 0; i < d_; ++i) {
+      ar(storage_[i]);
+    }
+  }
+
+  template<class Archive>
+  void load(Archive &ar) {
+    ar(d_);
+    storage_.reset(new T[d_]);
+    T *data = get_data();
+    for (unsigned i = 0; i < d_; ++i) {
+      ar(*(data + i));
+    }
+  }
+
+ public:
+  VectorData(int d) : storage_(new T[d]), d_(d) {}
+  VectorData(const VectorData &o) {
+    set_coordinates(o.get_data(), o.get_data() + o.get_dimension());
+  }
+  VectorData &operator=(const VectorData &o) {
+    set_coordinates(o.get_data(), o.get_data() + o.get_dimension());
+    return *this;
+  }
+  VectorData() : d_(0) {}
+  unsigned int get_dimension() const { return d_; }
+  template <class It>
+  void set_coordinates(It b, It e) {
+    d_ = std::distance(b, e);
+    storage_.reset(new T[d_]);
+    std::copy(b, e, storage_.get());
+  }
+  T *get_data() { return storage_.get(); }
+  const T *get_data() const { return storage_.get(); }
+  bool get_is_null() const { return d_ == 0; }
+  ~VectorData() {
+#if IMP_HAS_CHECKS >= IMP_USAGE
+    for (unsigned int i = 0; i < d_; ++i) {
+      storage_[i] = get_null_value<T>();
+    }
+#endif
+  }
+};
+
+IMPKERNEL_END_INTERNAL_NAMESPACE
+
+#endif /* IMPKERNEL_INTERNAL_VECTOR_BASE_H */

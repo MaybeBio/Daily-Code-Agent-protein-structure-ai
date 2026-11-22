@@ -1,28 +1,28 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/cytokineking/FreeBindCraft
-- 快照日期: 2026-11-18
-- 快照 commit: [`5a469149aae9`](https://github.com/cytokineking/FreeBindCraft/commit/5a469149aae943139b47ac9c61eb1f8818c4a939)
+- 快照日期: 2026-11-22
+- 快照 commit: [`c1fcd0e52316`](https://github.com/cytokineking/FreeBindCraft/commit/c1fcd0e52316a3e08058c1f15ad17725f69751d4)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (81 个文件, 733.7 KB)
+## 保留 (85 个文件, 863.3 KB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|
-| 源码 | 63 | 650.1 KB |
-| README | 8 | 38.0 KB |
-| 文档 | 6 | 34.8 KB |
-| 构建/配置 | 4 | 10.8 KB |
+| 源码 | 66 | 753.0 KB |
+| 文档 | 7 | 51.9 KB |
+| README | 8 | 47.3 KB |
+| 构建/配置 | 4 | 11.0 KB |
 
-按后缀: `.py` 53 (611.9 KB)、`.md` 13 (71.5 KB)、`.sh` 8 (19.7 KB)、`.mm` 1 (17.2 KB)、`.lock` 1 (4.9 KB)、`.cfg` 1 (2.7 KB)、`Dockerfile` 1 (2.5 KB)、`.slurm` 1 (1.3 KB)、`无后缀` 1 (1.3 KB)、`manifest.json` 1 (663 B)
+按后缀: `.py` 56 (710.8 KB)、`.md` 14 (95.6 KB)、`.sh` 8 (23.7 KB)、`.mm` 1 (17.2 KB)、`.lock` 1 (4.9 KB)、`无后缀` 1 (3.7 KB)、`Dockerfile` 1 (2.7 KB)、`.cfg` 1 (2.7 KB)、`.slurm` 1 (1.3 KB)、`manifest.json` 1 (663 B)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 
-## 省略 (62 个文件, 32.4 MB)
+## 省略 (64 个文件, 32.4 MB)
 
 | 原因 | 文件数 | 大小 |
 |---|---:|---:|
-| 后缀不在白名单 | 62 | 32.4 MB |
+| 后缀不在白名单 | 64 | 32.4 MB |
 
 体积最大的省略文件:
 

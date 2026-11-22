@@ -1,0 +1,468 @@
+// Builds the program of a run: a module of md and dyn ops.
+//
+// See docs/driver.md, Section 2.
+
+#ifndef MDIR_DRIVER_BUILDER_H
+#define MDIR_DRIVER_BUILDER_H
+
+#include "mdir/Driver/Control.h"
+#include "mdir/Driver/System.h"
+
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace mdir {
+namespace driver {
+
+/// A floating-point type that a buffer of the host holds.
+enum class Element { F32, F64 };
+
+/// An array of a program, one number or one row for each particle or each
+/// tuple, that programs may share (D256): a copy is a reference to
+/// the same numbers, and a write to an array that is shared copies it first,
+/// so that an array that two programs hold is never written. The program
+/// that an update of the tunables builds shares with the one before it every
+/// array that no value of a tunable enters (BuildKept), which is most of
+/// what a program holds: 1.7 kB an atom.
+template <typename T> class SharedArray {
+public:
+  SharedArray() = default;
+  SharedArray(std::vector<T> values)
+      : values(std::make_shared<std::vector<T>>(std::move(values))) {}
+  SharedArray &operator=(std::vector<T> given) {
+    values = std::make_shared<std::vector<T>>(std::move(given));
+    return *this;
+  }
+
+  /// The numbers, to read.
+  const std::vector<T> &get() const { return values ? *values : getNone(); }
+  operator const std::vector<T> &() const { return get(); }
+  size_t size() const { return get().size(); }
+  bool empty() const { return get().empty(); }
+  const T *data() const { return get().data(); }
+  const T &operator[](size_t i) const { return get()[i]; }
+  auto begin() const { return get().begin(); }
+  auto end() const { return get().end(); }
+
+  /// The numbers, to write: its own copy, if another array shares them.
+  std::vector<T> &edit() {
+    if (!values)
+      values = std::make_shared<std::vector<T>>();
+    else if (values.use_count() != 1)
+      values = std::make_shared<std::vector<T>>(*values);
+    return *values;
+  }
+  void push_back(const T &value) { edit().push_back(value); }
+  void assign(size_t count, const T &value) { edit().assign(count, value); }
+  void clear() { values.reset(); }
+
+  /// Whether both hold the same numbers because they share them: what an
+  /// update has not built anew.
+  bool shares(const SharedArray &other) const {
+    return values == other.values;
+  }
+  bool operator==(const SharedArray &other) const {
+    return shares(other) || get() == other.get();
+  }
+  bool operator!=(const SharedArray &other) const { return !(*this == other); }
+
+private:
+  static const std::vector<T> &getNone() {
+    static const std::vector<T> none;
+    return none;
+  }
+  std::shared_ptr<std::vector<T>> values;
+};
+
+/// The program of a run, and what the host must pass to it.
+///
+/// The entry function takes, in this order: the buffers of the positions
+/// and of the velocities; the buffer of the forces, if `takesForces` is
+/// set; the buffer of the masses; one buffer for each field in `fields`;
+/// the three edge lengths of the cell, in nm; the time step, in ps; and the
+/// number of the step that the run begins after. A minimization in segments
+/// then takes the length of its first step, and a program of segments
+/// whether the call begins the run. Last come the values of `startValues`,
+/// one f64 each, in their order. The entry never writes the buffers of the
+/// masses, of the fields, of the tables, and of the members and fields of
+/// the tuple sets, which it declares `mdrt.read_only` and the compile proves
+/// so (D258): a caller may hand it the arrays below.
+struct Program {
+  /// The module, as text.
+  std::string module;
+  /// The name of the entry function.
+  std::string entry;
+
+  /// The types that the buffers hold.
+  Element state;
+  Element force;
+  Element mass;
+  Element parameter;
+
+  /// Whether the run begins with forces that it is given: a run that
+  /// continues an earlier one, with an integrator that carries forces.
+  bool takesForces = false;
+  /// Whether the state that a checkpoint holds has forces.
+  bool writesForces = false;
+
+  /// The parameters that differ between the types, one value per particle,
+  /// in the units of the control file.
+  struct Field {
+    std::string name;
+    SharedArray<double> values;
+    /// Whether the field holds whole numbers, which the program takes as
+    /// i32: the types of the particles.
+    bool isInteger = false;
+  };
+  std::vector<Field> fields;
+
+  /// Parameters of the pairs of types that a pair term looks up, in the
+  /// units of the control file: `values[a * count + b]` for the types `a`
+  /// and `b`.
+  /// A table of `count` rows: of pairs of types, symmetric and square,
+  /// or of `columns` columns.
+  struct Table {
+    std::string name;
+    unsigned count = 0;
+    std::vector<double> values;
+    unsigned columns = 0;
+
+    bool isSquare() const { return columns == 0; }
+    unsigned getColumns() const { return isSquare() ? count : columns; }
+    llvm::StringRef getType() const {
+      return isSquare() ? "!table" : "!grid";
+    }
+  };
+  std::vector<Table> tables;
+
+  /// The tuples of a topology: bonds, angles, and the like. `members` has
+  /// `arity` particles for each tuple, and each field one value for each
+  /// tuple, in the units of MDIR.
+  struct TupleSet {
+    std::string name;
+    unsigned arity = 0;
+    SharedArray<int32_t> members;
+    std::vector<Field> fields;
+    /// Whether a tuple is the same read backward, as the members of a bond
+    /// or of a dihedral are. Those of a virtual site or a correction map
+    /// are not.
+    bool reversible = true;
+    /// Whether a tuple of two members has an order, as the pairs of a
+    /// particle and the anchor of its constraint group have (D110).
+    bool oriented = false;
+
+    size_t size() const { return arity ? members.size() / arity : 0; }
+    /// Whether no particle is a member of two tuples, as in the groups of
+    /// a constraint.
+    bool isDisjoint() const { return hasNoRepeat({&members.get()}); }
+    /// Whether no particle is in the lists `lists` twice: one pass over
+    /// them with a mark for each particle. A sort of a copy was 64 to 75%
+    /// of what an update of the tunables built anew (#324): 108 of 143 ms
+    /// for the five sets of 408,609 atoms.
+    static bool hasNoRepeat(
+        std::initializer_list<const std::vector<int32_t> *> lists) {
+      int64_t least = 0, most = -1;
+      for (const std::vector<int32_t> *list : lists)
+        for (int32_t member : *list) {
+          least = std::min<int64_t>(least, member);
+          most = std::max<int64_t>(most, member);
+        }
+      std::vector<bool> seen(static_cast<size_t>(most - least + 1), false);
+      for (const std::vector<int32_t> *list : lists)
+        for (int32_t member : *list) {
+          size_t at = static_cast<size_t>(member - least);
+          if (seen[at])
+            return false;
+          seen[at] = true;
+        }
+      return true;
+    }
+    llvm::StringRef getOrientation() const {
+      if (arity == 2 && !oriented)
+        return "unordered";
+      return reversible ? "reversal" : "ordered";
+    }
+  };
+  std::vector<TupleSet> tupleSets;
+
+  /// The correction for the dispersion beyond the cutoff, in kJ/mol, at
+  /// the volume of the run: what it adds to the potential energy and to
+  /// the trace of the virial.
+  double dispersionEnergy = 0.0;
+  double dispersionVirial = 0.0;
+  /// The part of the estimate of the shift (D210) that does not depend on
+  /// the volume, in kJ/mol: the estimate is X (1 - V / (N (4π/3) r_c³))
+  /// with X proportional to 1 / V, so X is in `dispersionEnergy` and
+  /// -X V / (N (4π/3) r_c³), the particle itself taken out of its
+  /// neighbors, is this constant (#224). 0 unless the energy of the run
+  /// holds the estimate.
+  double dispersionFixedEnergy = 0.0;
+
+  /// Particle mesh Ewald or the reaction field: whether the program has
+  /// it, and the constant energy of its Coulomb terms in kJ/mol: for
+  /// particle mesh Ewald the self term and the background of a net charge,
+  /// with what the background adds to the trace of the virial; for the
+  /// reaction field its self term (D140).
+  bool pme = false;
+  bool reactionField = false;
+  double coulombConstantEnergy = 0.0;
+  double coulombConstantVirial = 0.0;
+  double coulombSelfEnergy = 0.0;
+  /// [free_energy] (D161): for each state, the constant energies that
+  /// depend on λ, in kJ/mol at the volume of the file: those that do not
+  /// depend on the volume (the self term of particle mesh Ewald) and those
+  /// proportional to 1 / V (the background of a net charge and the
+  /// correction for the dispersion); and for each component of λ their
+  /// derivatives at the state of the run.
+  std::vector<double> stateFixedEnergies, stateVolumeEnergies;
+  std::vector<double> lambdaFixedDerivatives, lambdaVolumeDerivatives;
+  /// For each column of `observe`, what the correction for the dispersion
+  /// adds to it, in kJ/mol (per unit of the constant) at the volume of the
+  /// file, proportional to 1 / V: the tail of an observed pair term and its
+  /// derivatives (D209); 0 for the other columns.
+  std::vector<double> observableVolumeConstants;
+  /// And what it adds that does not depend on the volume: that part of the
+  /// estimate of the shift of an observed pair term, and its derivatives.
+  std::vector<double> observableFixedConstants;
+  /// The derivative of the energy in the tunables
+  /// (D230, docs/python-gradient.md): whether the entry
+  /// evaluates it when the host asks (the start value `tunable_gradient`);
+  /// for each tunable, whether a rule gives its derivative or the program
+  /// provably does not read it; and the values that the entry hands the
+  /// host (mdrtWriteTunableGradient), each the derivative in one site of a
+  /// tunable, with what the host adds to it, in kJ/mol per unit of the
+  /// tunable at the volume of the build, proportional to 1 / V: the
+  /// derivative of the tail of a pair term and of its shift estimate
+  /// (D209, D210).
+  bool tunableGradient = false;
+  enum class GradientOutcome { Rule, Zero };
+  std::vector<GradientOutcome> gradientOutcomes;
+  struct GradientSlot {
+    unsigned tunable = 0;
+    unsigned site = 0;
+    double volumeConstant = 0.0;
+    /// The part that does not depend on the volume (the estimate of the
+    /// shift, #224).
+    double fixedConstant = 0.0;
+  };
+  std::vector<GradientSlot> gradientSlots;
+  /// The derivative is that of the potential that the forces sample,
+  /// shifted to 0 at the cutoff where the run cuts it (D210). After the
+  /// derivatives the entry hands over that energy less the energy that
+  /// the run reports, and the host adds the estimate of the shift that the
+  /// correction for the dispersion does not hold already, in kJ/mol at the
+  /// volume of the build, proportional to 1 / V.
+  double gradientShiftEnergy = 0.0;
+  /// And its part that does not depend on the volume (#224).
+  double gradientShiftFixedEnergy = 0.0;
+  /// The fields of the particles that the entry hands the host after the
+  /// numbers (mdrtWriteTunableGradientField), each the derivative of the
+  /// energy in the value of each particle of a field of zeros through
+  /// which the sites of one tunable enter their kernels: the derivative in
+  /// the site `first` is the value of the field at the particle `second`
+  /// (in the order of the input).
+  /// A field of a seed of a table (Control::tunableTableSeeds) gives, for
+  /// each type, the site `rows[type].site` (or none, -1) the sum of its
+  /// values over the particles of the type, times `scale`, plus what the
+  /// host adds, `volumeConstant`: the derivative of the correction for the
+  /// dispersion and of its shift estimate, in kJ/mol per unit of the
+  /// tunable at the volume of the build, proportional to 1 / V.
+  struct GradientField {
+    unsigned tunable = 0;
+    SharedArray<std::pair<uint32_t, uint32_t>> sites;
+    struct Row {
+      int64_t site = -1;
+      double scale = 1.0, volumeConstant = 0.0;
+      /// The part that does not depend on the volume (#224).
+      double fixedConstant = 0.0;
+    };
+    std::vector<Row> rows;
+  };
+  std::vector<GradientField> gradientFields;
+  /// The arguments of the potential `@tunable` that the entry asks the
+  /// derivative in, each with the tunable (its place among the
+  /// declarations) whose derivative it gives, so that an error of the
+  /// differentiation names the tunable (#256).
+  std::vector<std::pair<unsigned, unsigned>> gradientArguments;
+  /// What the host adds to the derivative in the charge of each particle,
+  /// in kJ/mol/e: the derivative of the self term of the reaction field or
+  /// of particle mesh Ewald, which does not depend on the cell, and that
+  /// of the background of a net charge, at the volume of the build,
+  /// proportional to 1 / V. Empty unless the charges are a tunable whose
+  /// derivative the program carries.
+  std::vector<double> gradientChargeFixed, gradientChargeVolume;
+  /// β in nm⁻¹ and the numbers of points of the grid, for the log.
+  double pmeBeta = 0.0;
+  int64_t pmeGrid[3] = {0, 0, 0};
+  /// The prolate kernel (D266): its bandwidths c and c₁, the
+  /// points P of the window, and the aliasing estimate of the grid.
+  bool pmeProlate = false;
+  /// Influence "P3M" (D304): `md.reciprocal` takes `p3m`.
+  bool pmeP3M = false;
+  double pmeBandwidth = 0.0, pmeWindowBandwidth = 0.0, pmeAliasing = 0.0;
+  int64_t pmeOrder = 4;
+  /// (1 − Φ(x))/(1 − x) of the prolate kernel as a Chebyshev series in
+  /// t = 2x − 1, x = r / r_c: the direct sum's term in a loop over pairs
+  /// whose kernel a table of r² takes (D280).
+  std::vector<double> pmeFarSeries;
+  /// The self term is −f s Σ q² and the background of a net charge Q
+  /// −f π Q² b / V: s = β/√π and b = 1/(2β²) for the Gaussian, s = χ(0)/
+  /// (2 r_c) and b = r_c² ⟨x²⟩_χ for the prolate kernel, in nm⁻¹ and nm².
+  double pmeSelfFactor = 0.0, pmeBackgroundFactor = 0.0;
+  /// Particle mesh Ewald of the dispersion (D162): whether the program has
+  /// it, its self term in kJ/mol, which does not depend on the volume and
+  /// which the program does not compute, and β in nm⁻¹ and the grid.
+  bool ljpme = false;
+  double ljpmeSelfEnergy = 0.0;
+  double ljpmeBeta = 0.0;
+  int64_t ljpmeGrid[3] = {0, 0, 0};
+
+  /// The skin of the neighbor structures, in nm, and the number of
+  /// neighbors that they hold per particle.
+  double skin;
+  int64_t neighborWidth;
+  /// The skin of the inner list of a dual list, in nm; 0 keeps one list.
+  double pruneSkin = 0.0;
+
+  /// Whether the program puts the particles in the order of their
+  /// positions, and the width of the cells that it orders them by, in nm.
+  bool reorders = false;
+  double orderWidth = 0.0;
+
+  /// A program of segments (Control::segments, D196): its
+  /// entry runs every part of a simulation in one activation
+  /// (D215); a loop over parts begins each iteration with
+  /// `mdrtPartBoundary`, which hands the host the state where it is and
+  /// takes the step and the counts of the loops of the next part. With
+  /// Control::frames the entry is a loop over frames instead
+  /// (D251): each iteration begins with `mdrtFrameBoundary`,
+  /// which gives the buffer of the positions of the next frame and writes
+  /// its cell, and evaluates what the start of a run evaluates. `segmentPeriod` is the period of coupling that an iteration of
+  /// its outer loop takes, or 0 if the outer loop is over single steps;
+  /// `closingSteps` are the steps of a period after its plain steps.
+  int64_t segmentPeriod = 0;
+  int64_t closingSteps = 1;
+
+  /// A program with tunable parameters (Control::tunables,
+  /// D213): its values are those of its buffers, never
+  /// constants of its text. Its entry's `%first_call` is 2 for a call that
+  /// evaluates the forces of the state that it is given anew, as the first
+  /// call does, without the half kick back of leapfrog.
+  bool tunable = false;
+
+  /// The values that depend on the state that the run begins from, its
+  /// cell above all, which the entry takes as its last arguments rather
+  /// than its text holding them as constants (D227):
+  /// two programs that differ only in them have the same text, and the
+  /// compile cache serves the second (docs/compile-cache.md). Each is
+  /// computed on the host as the constant was, so that a run gives the
+  /// same numbers to the bit. They are, in this order and where the
+  /// program has them:
+  ///
+  /// - `tilt_bx`, `tilt_cx`, `tilt_cy`: the tilts of a triclinic cell at
+  ///   the start, in nm;
+  /// - `rest_edge0` to `rest_edge2`: the edges of the cell that the
+  ///   reference positions of the restraints are for, in nm, where a
+  ///   barostat scales them;
+  /// - `baro_constant`, `baro_energy_constant`: what the barostat adds for
+  ///   the constant terms (the correction for the dispersion and the
+  ///   background of particle mesh Ewald), the trace of their virial times
+  ///   the volume and their energy times the volume, in kJ/mol nm³ at the
+  ///   volume of the start; with tunables they depend on their values too
+  ///   (D213);
+  /// - `bstate0` to `bstate8`: the state that the first scaling of a
+  ///   barostat that scales every step takes its pressure from, as the
+  ///   checkpoint that the run continues keeps it (D92).
+  struct StartValue {
+    std::string name;
+    double value = 0.0;
+  };
+  std::vector<StartValue> startValues;
+};
+
+/// The terms of a model that a tunable enters
+/// (D243, docs/python-frames.md): the Lennard-Jones of
+/// the pairs within the cutoff with its correction for the dispersion, if
+/// sigma or epsilon is tunable; the electrostatics, whole, if the charges
+/// are; the pair terms of which a tunable constant is read by the
+/// expression, or which read the charges when these are tunable; and the
+/// tuple terms of which a tunable parameter is read, and built-in periodic
+/// dihedrals when their proper coefficients are tunable.
+struct DependentTerms {
+  bool lennardJones = false, coulomb = false, dihedrals = false;
+  std::vector<unsigned> pairs, tuples;
+  bool hasPair(unsigned index) const {
+    return std::find(pairs.begin(), pairs.end(), index) != pairs.end();
+  }
+  bool hasTuple(unsigned index) const {
+    return std::find(tuples.begin(), tuples.end(), index) != tuples.end();
+  }
+  /// Their names, for the plan of a program: "lennard_jones", "coulomb",
+  /// "dihedrals", "pair:<name>", "tuple:<name>".
+  std::vector<std::string> names;
+};
+DependentTerms getDependentTerms(const Control &control, const System &system);
+/// Makes `control` that of a program of the dependent terms alone: sets
+/// Control::dependentTerms, leaves the electrostatics out if no tunable
+/// enters them, and keeps the observed columns of the terms that stay.
+void keepDependentTerms(Control &control, const System &system);
+
+/// The arrays of a program as a build has them once it has made them from
+/// the topology (the fields, the tables, and the tuple sets) and before it
+/// computes anything from them (D256, docs/jit-invariants.md).
+struct BuildKept;
+
+/// Builds the program of `control` and `system`. With `kept`, the arrays of
+/// another build of the same model at other values of its tunables, the
+/// build takes them in place of making them from the topology, and fills
+/// those that `kept` holds empty from the model: everything else, the
+/// constants that the host adds and the text, it makes as without them.
+llvm::Expected<Program> buildProgram(const Control &control,
+                                     const System &system,
+                                     const BuildKept *kept = nullptr);
+
+/// Replaces the module text of `program` with the module as MLIR's printer
+/// prints it once the text is parsed (#568, ProgramModule.cpp): its SSA
+/// names, numbers, and layout are the printer's, not the builder's. A text
+/// that does not parse is left as it is, for the lowering to report.
+/// buildProgram calls it on every program it returns. The text keeps the
+/// locations of the ops: those that the builder gives (the terms of custom
+/// expressions), and the positions in its text, which name the kernels of
+/// the lowering.
+void printParsedModule(Program &program);
+/// The module of `program` for a reader, as `mdir emit --stage=module` and
+/// Python's `Program.ir` show it: the locations that the builder gives
+/// inline, and not the positions in its text.
+std::string printModuleForReading(const Program &program);
+
+/// The arrays alone, as a build of `control` and `system` makes them.
+llvm::Expected<std::shared_ptr<BuildKept>> buildArrays(const Control &control,
+                                                       const System &system);
+
+/// Compares the arrays `arrays` with those of `program`, which a build of
+/// the same model with other values in the sites of its tunables made. An
+/// array that is the same to the bit in both is one that those values do not
+/// enter: `arrays` keeps it, sharing the array of the program. One that
+/// differs is emptied, for the build that takes `arrays` to fill. Returns
+/// false, and leaves `arrays` of no use, if the two do not hold the same
+/// arrays or differ in the members of a tuple set.
+bool keepArraysOf(BuildKept &arrays, const Program &program);
+/// How many arrays `keepArraysOf` kept, and how many it emptied.
+std::pair<size_t, size_t> countArrays(const BuildKept &arrays);
+/// Adds 1 to the first number of the first kept field of the particles, in
+/// a copy of its own: what a defect would leave, for the test of the
+/// comparison. False if there is none.
+bool spoilArray(BuildKept &arrays);
+
+/// The first thing in which two programs differ, to the bit, in words; an
+/// empty string if they are the same. Every member of Program is compared:
+/// one that is added to Program is added there
+/// (D254).
+std::string describeDifference(const Program &a, const Program &b);
+
+} // namespace driver
+} // namespace mdir
+
+#endif // MDIR_DRIVER_BUILDER_H

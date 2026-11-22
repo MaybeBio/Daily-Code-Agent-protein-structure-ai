@@ -1,0 +1,180 @@
+import { describe, expect, it } from 'vitest';
+import { Session } from '../src/engine/interpreter';
+import type { System } from '../src/engine/system';
+import { gpuPairSpec, HYBRID_STYLE, pairSpecEval, tableInnerError, type GpuPairSpec } from '../src/engine/gpu/pairSpec';
+import { accelerator } from '../src/engine/run/accel';
+import type { ForceBackend } from '../src/engine/types';
+
+/*
+ * The pair styles the WebGPU backend runs besides lj/cut (gpu/pairSpec.ts): the coefficients taken from the engine's
+ * initialized style and the kernel's force law (pairSpecEval, the same arithmetic in fp64) give the CPU style's forces
+ * and energies over every pair of a charged system. The WGSL kernel itself is checked in Chromium (SwiftShader).
+ */
+
+const BOX = `units real
+atom_style charge
+lattice sc 3.4
+region box block 0 6 0 6 0 6
+create_box 2 box
+create_atoms 1 box
+mass * 20.0
+set group all type/fraction 2 0.5 4321
+set type 1 charge 0.6
+set type 2 charge -0.6
+displace_atoms all random 0.4 0.4 0.4 8191
+`;
+
+const STYLES: Record<string, string> = {
+  'lj/cut/coul/cut': 'pair_style lj/cut/coul/cut 6.0 7.5\npair_coeff 1 1 0.2 3.0\npair_coeff 2 2 0.1 3.4 5.5 7.0\npair_modify shift yes',
+  'coul/cut': 'pair_style coul/cut 7.0\npair_coeff * *\npair_coeff 1 2 6.5',
+  buck: 'pair_style buck 6.5\npair_coeff * * 20000.0 0.3 120.0\npair_coeff 1 2 15000.0 0.28 90.0 5.8\npair_modify shift yes',
+  'buck/coul/cut': 'pair_style buck/coul/cut 6.0 7.5\npair_coeff * * 20000.0 0.3 120.0\npair_coeff 1 2 15000.0 0.28 90.0 5.5 7.0',
+  morse: 'pair_style morse 6.5\npair_coeff * * 0.3 1.2 3.3\npair_coeff 1 2 0.5 1.5 3.1 6.0\npair_modify shift yes',
+  soft: 'pair_style soft 6.0\npair_coeff * * 2.0\npair_coeff 1 2 3.0 5.0',
+  yukawa: 'pair_style yukawa 0.4 6.5\npair_coeff * * 40.0\npair_coeff 1 2 60.0 6.0\npair_modify shift yes',
+  'lj96/cut': 'pair_style lj96/cut 6.5\npair_coeff * * 0.2 3.2\npair_coeff 1 2 0.3 3.0 6.0\npair_modify shift yes',
+  born: 'pair_style born 6.5\npair_coeff * * 6000.0 0.32 2.6 100.0 50.0\npair_coeff 1 2 5000.0 0.30 2.4 80.0 40.0 6.0\npair_modify shift yes',
+  // the real-space part of the long-range styles: the kspace style sets G-ewald and computes nothing here (compute no),
+  // and table 0 makes the CPU style use the polynomial erfc the kernel uses
+  'coul/long': 'pair_style coul/long 7.0\npair_coeff * *\npair_modify table 0\nkspace_style ewald 1e-4\nkspace_modify compute no',
+  'lj/cut/coul/long': 'pair_style lj/cut/coul/long 6.0 7.0\npair_coeff 1 1 0.2 3.0\npair_coeff 2 2 0.1 3.4 5.5\npair_modify shift yes table 0\nkspace_style ewald 1e-4\nkspace_modify compute no',
+  'lj/charmm/coul/long': 'pair_style lj/charmm/coul/long 5.0 6.5 7.0\npair_coeff 1 1 0.2 3.0\npair_coeff 2 2 0.1 3.4\npair_modify table 0\nkspace_style ewald 1e-4\nkspace_modify compute no',
+  'lj/class2': 'pair_style lj/class2 6.5\npair_coeff * * 0.2 3.2\npair_coeff 1 2 0.3 3.0 6.0\npair_modify shift yes',
+  'lj/class2/coul/cut': 'pair_style lj/class2/coul/cut 6.0 7.0\npair_coeff 1 1 0.2 3.0\npair_coeff 2 2 0.1 3.4 5.5 6.5\npair_modify shift yes',
+  'lj/class2/coul/long': 'pair_style lj/class2/coul/long 6.0 7.0\npair_coeff 1 1 0.2 3.0\npair_coeff 2 2 0.1 3.4 5.5\npair_modify shift yes table 0\nkspace_style ewald 1e-4\nkspace_modify compute no',
+  'buck/coul/long': 'pair_style buck/coul/long 6.0 7.0\npair_coeff * * 20000.0 0.3 120.0\npair_coeff 1 2 15000.0 0.28 90.0 5.5\npair_modify shift yes table 0\nkspace_style ewald 1e-4\nkspace_modify compute no',
+  'born/coul/long': 'pair_style born/coul/long 6.0 7.0\npair_coeff * * 6000.0 0.32 2.6 100.0 50.0\npair_coeff 1 2 5000.0 0.30 2.4 80.0 40.0 5.5\npair_modify shift yes table 0\nkspace_style ewald 1e-4\nkspace_modify compute no',
+  // pair_style hybrid and hybrid/overlay (pairSpec.ts gpuHybridSpec): a sub-style per type pair, two sub-styles on every
+  // type pair with the long-range Coulomb term, and one type pair with two layers where the others have one
+  'hybrid lj/cut buck': 'pair_style hybrid lj/cut 6.0 buck 6.5\npair_coeff 1 1 lj/cut 0.2 3.0\npair_coeff 2 2 lj/cut 0.1 3.4\npair_coeff 1 2 buck 15000.0 0.28 90.0\npair_modify shift yes',
+  'hybrid/overlay lj/cut coul/long': 'pair_style hybrid/overlay lj/cut 6.0 coul/long 7.0\npair_coeff * * lj/cut 0.2 3.0\npair_coeff 2 2 lj/cut 0.1 3.4 5.5\npair_coeff * * coul/long\npair_modify shift yes table 0\nkspace_style ewald 1e-4\nkspace_modify compute no',
+  'hybrid/overlay morse yukawa': 'pair_style hybrid/overlay morse 6.5 yukawa 0.4 6.5\npair_coeff * * morse 0.3 1.2 3.3\npair_coeff 1 2 yukawa 60.0 6.0\npair_modify shift yes',
+  'hybrid/overlay buck coul/cut': 'pair_style hybrid/overlay buck 6.5 coul/cut 7.0\npair_coeff * * buck 20000.0 0.3 120.0\npair_coeff * * coul/cut\npair_coeff 1 2 coul/cut 6.5',
+  // pair_style table in its three interpolation styles, two tables (the 1-2 pair its own)
+  'table linear': 'pair_style table linear 1000\npair_coeff * * lj.table LJA 6.5\npair_coeff 1 2 lj.table LJB 6.0',
+  'table spline': 'pair_style table spline 1000\npair_coeff * * lj.table LJA 6.5\npair_coeff 1 2 lj.table LJB 6.0',
+  'table lookup': 'pair_style table lookup 2000\npair_coeff * * lj.table LJA 6.5\npair_coeff 1 2 lj.table LJB 6.0',
+};
+
+/** Two 12-6 LJ tables in r spacing (pair_table.html: keyword, N and R, then index r e f per line), 1 to 7 A. */
+const ljTables = (): string => {
+  const out = ['# LJ tables for the GPU table test'];
+  for (const [name, eps, sig] of [['LJA', 0.2, 3.1], ['LJB', 0.3, 2.9]] as const) {
+    const n = 601, lo = 1.0, hi = 7.0;
+    out.push('', name, `N ${n} R ${lo} ${hi}`, '');
+    for (let k = 0; k < n; k++) {
+      const r = lo + (k * (hi - lo)) / (n - 1), s6 = (sig / r) ** 6;
+      out.push(`${k + 1} ${r} ${4 * eps * (s6 * s6 - s6)} ${(24 * eps * (2 * s6 * s6 - s6)) / r}`);
+    }
+  }
+  return out.join('\n');
+};
+
+const systemFor = async (lines: string): Promise<System> => {
+  const s = new Session({ emit: () => {}, writeFile: () => {} });
+  if (lines.includes('lj.table')) s.addFile('lj.table', ljTables());
+  await s.execute(`${BOX}${lines}\nrun 0\n`);
+  return (s as unknown as { sys: System }).sys;
+};
+
+/** Forces and energies of every pair with the spec's law (minimum image in the periodic box). */
+const specForces = (sys: System, spec: GpuPairSpec) => {
+  const st = sys.state;
+  const L = [0, 1, 2].map((d) => st.box.hi[d] - st.box.lo[d]);
+  const f = new Float64Array(3 * st.n);
+  let evdwl = 0, ecoul = 0;
+  for (let i = 0; i < st.n; i++) {
+    for (let j = i + 1; j < st.n; j++) {
+      const d = [0, 1, 2].map((k) => { const v = st.x[3 * i + k] - st.x[3 * j + k]; return v - L[k] * Math.round(v / L[k]); });
+      const rsq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+      const r = pairSpecEval(spec, st.type[i], st.type[j], rsq, st.q[i], st.q[j]);
+      evdwl += r.evdwl; ecoul += r.ecoul;
+      for (let k = 0; k < 3; k++) { f[3 * i + k] += r.fpair * d[k]; f[3 * j + k] -= r.fpair * d[k]; }
+    }
+  }
+  return { f, evdwl, ecoul };
+};
+
+describe('GPU pair-style specs against the CPU styles', () => {
+  for (const [name, lines] of Object.entries(STYLES)) {
+    it(name, async () => {
+      const sys = await systemFor(lines);
+      const st = sys.state;
+      const p = sys.ff.pair!;
+      const spec = gpuPairSpec(p, st.ntypes, st.units.qqr2e * (p.coulConstScale ?? 1) / sys.ff.dielectric);
+      if (typeof spec === 'string') throw new Error(spec);
+      if (/long/.test(name)) expect(spec.gewald).toBeGreaterThan(0);
+      expect(spec.maxCutoff).toBeLessThan((st.box.hi[0] - st.box.lo[0]) / 2);
+      const got = specForces(sys, spec);
+      const acc = sys.ff.acc;
+      expect(got.evdwl).toBeCloseTo(acc.evdwl, 8);
+      expect(got.ecoul).toBeCloseTo(acc.ecoul, 8);
+      let worst = 0, scale = 0;
+      for (let k = 0; k < 3 * st.n; k++) { worst = Math.max(worst, Math.abs(got.f[k] - st.f[k])); scale = Math.max(scale, Math.abs(st.f[k])); }
+      expect(worst / scale).toBeLessThan(1e-12);
+    });
+  }
+
+  it('pair_style hybrid/overlay: layers per type pair, per-step only, and the hybrids the GPU spec does not take', async () => {
+    const gpuRes = { kind: 'webgpu', label: 'WebGPU · test', compute: () => ({ pe: 0, virial: 0 }), dispose() {}, canAdvance: () => true, advance: async () => ({ pe: 0, virial: 0 }), canAdvanceSpec: () => true } as unknown as ForceBackend;
+    const sys = await systemFor(`${STYLES['hybrid/overlay morse yukawa']}\nfix 1 all nve`);
+    const a = accelerator(sys, gpuRes);
+    expect(a.reason).toBeNull();
+    expect(a.accel?.spec?.style).toBe(HYBRID_STYLE);
+    expect(a.accel?.spec?.layers).toBe(2);
+    // the whole-step kernel takes one law for every type pair
+    expect(a.accel?.resident).toBe(false);
+    const refused = async (lines: string) => {
+      const s2 = await systemFor(`${lines}\nfix 1 all nve`);
+      return accelerator(s2, gpuRes).reason;
+    };
+    expect(await refused('pair_style hybrid/scaled 0.5 lj/cut 6.0 0.5 buck 6.5\npair_coeff * * lj/cut 0.2 3.0\npair_coeff * * buck 20000.0 0.3 120.0')).toMatch(/hybrid\/scaled/);
+    expect(await refused('pair_style hybrid/overlay lj/cut/coul/cut 6.0 coul/long 7.0\npair_coeff * * lj/cut/coul/cut 0.2 3.0\npair_coeff * * coul/long\nkspace_style ewald 1e-4\nkspace_modify compute no')).toMatch(/both long-range and cut Coulomb/);
+    expect(await refused('pair_style hybrid/overlay lj/cut 6.0 buck 6.5\npair_coeff * * lj/cut 0.2 3.0\npair_coeff * * buck 20000.0 0.3 120.0\npair_modify pair buck special lj 0.0 0.0 0.0')).toMatch(/pair_modify special for sub-style buck/);
+    expect(await refused('pair_style hybrid lj/cut 6.0 morse/smooth/linear 6.5\npair_coeff * * lj/cut 0.2 3.0\npair_coeff 1 2 morse/smooth/linear 0.3 1.2 3.3')).toMatch(/pair style hybrid/);
+  });
+
+  it('pair_style table: per-step only, and a pair inside the inner cutoff stops the run with the CPU style\'s error', async () => {
+    const gpuRes = { kind: 'webgpu', label: 'WebGPU · test', compute: () => ({ pe: 0, virial: 0 }), dispose() {}, canAdvance: () => true, advance: async () => ({ pe: 0, virial: 0 }), canAdvanceSpec: () => true } as unknown as ForceBackend;
+    const sys = await systemFor(`${STYLES['table linear']}\nfix 1 all nve`);
+    const a = accelerator(sys, gpuRes);
+    expect(a.reason).toBeNull();
+    expect(a.accel?.spec?.style).toBe(19);
+    expect(a.accel?.resident).toBe(false);
+    const spec = a.accel!.spec!;
+    // the fp64 law and the readback's message: two atoms 0.5 A apart (the tables start at 1 A)
+    expect(() => pairSpecEval(spec, 1, 1, 0.5 * 0.5, 0, 0)).toThrow('pair distance 0.5 below the table inner cutoff 1');
+    const st = { n: 2, x: [1, 1, 1, 1.5, 1, 1], type: [1, 1], box: { lo: [0, 0, 0], hi: [20, 20, 20] }, dimension: 3 };
+    expect(tableInnerError(spec, st, 0)).toBe('pair distance 0.5 below the table inner cutoff 1');
+  });
+
+  it('the GPU accelerator takes these styles, and names the ones it does not run', async () => {
+    const gpu = { kind: 'webgpu', label: 'WebGPU · test', compute: () => ({ pe: 0, virial: 0 }), dispose() {} } as unknown as ForceBackend;
+    const withFix = async (lines: string) => {
+      const sys = await systemFor(`${lines}\nfix 1 all nve`);
+      return accelerator(sys, gpu);
+    };
+    const ok = await withFix(STYLES.buck);
+    expect(ok.reason).toBeNull();
+    expect(ok.accel?.spec?.style).toBe(3);
+    // whole steps on the GPU (resident.ts) for a style with only fix nve, charged ones too
+    const gpuRes = { ...gpu, canAdvance: () => true, advance: async () => ({ pe: 0, virial: 0 }), canAdvanceSpec: () => true } as unknown as ForceBackend;
+    const res = await (async () => accelerator(await systemFor(`${STYLES.morse}\nfix 1 all nve`), gpuRes))();
+    expect(res.accel?.resident).toBe(true);
+    // (cutoffs within a third of the 20.4 A box for whole steps; past half of it the run stays on the CPU altogether)
+    const charged = await (async () => accelerator(await systemFor('pair_style buck/coul/cut 6.0 6.5\npair_coeff * * 20000.0 0.3 120.0\nfix 1 all nve'), gpuRes))();
+    expect(charged.reason).toBeNull();
+    expect(charged.accel?.resident).toBe(true);
+    // and not with a thermostat (the GPU steps integrate fix nve only)
+    const langevin = await (async () => accelerator(await systemFor('pair_style buck/coul/cut 6.0 6.5\npair_coeff * * 20000.0 0.3 120.0\nfix 1 all nve\nfix 2 all langevin 300 300 100 4928'), gpuRes))();
+    expect(langevin.accel?.resident).toBe(false);
+    // between 2 and 3 cutoffs: the per-step kernel (every cell once along the edge), not whole steps
+    const mid = await (async () => accelerator(await systemFor(`${STYLES['buck/coul/cut']}\nfix 1 all nve`), { ...gpuRes, canAdvanceSpec: () => false } as unknown as ForceBackend))();
+    expect(mid.reason).toBeNull();
+    expect(mid.accel?.resident).toBe(false);
+    const long = await (async () => accelerator(await systemFor('pair_style buck/coul/cut 6.0 10.5\npair_coeff * * 20000.0 0.3 120.0\nfix 1 all nve'), gpuRes))();
+    expect(long.reason).toBe('a box shorter than 2 pair cutoffs along a periodic edge');
+    const expand = await withFix('pair_style lj/expand 6.0\npair_coeff * * 0.2 3.0 0.5');
+    expect(expand.reason).toMatch(/pair style lj\/expand \(the GPU path implements lj\/cut, lj\/cut\/coul\/cut, coul\/cut, buck, buck\/coul\/cut, morse, soft, yukawa, lj96\/cut, born, coul\/long, lj\/cut\/coul\/long, lj\/charmm\/coul\/long, lj\/class2, lj\/class2\/coul\/cut, lj\/class2\/coul\/long, buck\/coul\/long, born\/coul\/long, table, eam, eam\/alloy, eam\/fs, sw, sw\/mod, tersoff, lj\/cut\/tip4p\/long, lj\/cut\/tip4p\/cut, tip4p\/long, tip4p\/cut, eff\/cut, gran\/hooke, gran\/hooke\/history, gran\/hertz\/history, granular, and hybrid and hybrid\/overlay of the pairwise ones only\)/);
+  });
+});

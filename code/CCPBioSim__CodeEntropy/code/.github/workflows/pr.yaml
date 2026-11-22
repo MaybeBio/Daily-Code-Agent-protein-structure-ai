@@ -1,0 +1,113 @@
+name: Pull Request CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit
+    uses: CCPBioSim/.github/.github/workflows/ci-test-python.yaml@f72e64d2dc791ad5ceda145777a3922895d92a5d # 0.17.0
+    permissions:
+      contents: read
+      checks: write
+      statuses: write
+      pull-requests: write
+    with:
+      package: CodeEntropy
+      lowest-dependencies-check: true
+      test-path: tests/unit
+      os: '["ubuntu-24.04", "macos-26", "windows-2025-vs2026"]'
+      timeout-minutes: 25
+
+  discover-systems:
+    name: Discover regression systems
+    runs-on: ubuntu-26.04
+    outputs:
+      systems: ${{ steps.set-systems.outputs.systems }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.15"
+
+      - name: Install testing dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[testing]
+
+      - name: Discover systems
+        id: set-systems
+        run: |
+          SYSTEMS=$(python -m tests.regression.list_systems)
+          echo "systems=$SYSTEMS" >> "$GITHUB_OUTPUT"
+
+  regression-quick:
+    name: Regression fast • ${{ matrix.system }}
+    needs: discover-systems
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+
+    strategy:
+      fail-fast: false
+      matrix:
+        system: ${{ fromJson(needs.discover-systems.outputs.systems) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.15"
+
+      - name: Install testing dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[testing]
+
+      - name: Run fast regression tests
+        run: |
+          python -m pytest tests/regression \
+            -m "not slow" \
+            --system "${{ matrix.system }}" \
+            -vv \
+            --durations=20
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: quick-regression-failure-${{ matrix.system }}
+          path: |
+            .testdata/**
+            /tmp/pytest-of-*/pytest-*/**
+
+  docs:
+    name: Docs
+    needs: unit
+    uses: CCPBioSim/.github/.github/workflows/ci-docs.yaml@f72e64d2dc791ad5ceda145777a3922895d92a5d # 0.17.0
+    permissions:
+      contents: read
+    with:
+      timeout-minutes: 25
+
+  pre-commit:
+    name: Pre-commit
+    needs: unit
+    uses: CCPBioSim/.github/.github/workflows/ci-pre-commit.yaml@f72e64d2dc791ad5ceda145777a3922895d92a5d # 0.17.0
+    permissions:
+      contents: read
+    with:
+      timeout-minutes: 15

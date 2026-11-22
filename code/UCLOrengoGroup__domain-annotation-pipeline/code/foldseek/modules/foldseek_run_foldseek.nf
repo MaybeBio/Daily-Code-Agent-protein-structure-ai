@@ -1,0 +1,36 @@
+process foldseek_run_foldseek {
+    label 'sge_low'
+    container "ghcr.io/uclorengogroup/domain-annotation-pipeline-foldseek:${params.container_tag_name}" 
+    
+    input:
+    tuple val(id), path(query_db_dir)
+    path(target_db)
+
+    output:
+    tuple val(id), path(query_db_dir), path("result_db_dir"), emit: search_results
+
+    script:
+    """
+    export OMP_NUM_THREADS=${task.cpus}
+    export MKL_NUM_THREADS=${task.cpus}
+    export OPENBLAS_NUM_THREADS=${task.cpus}
+
+    mkdir -p tmp_foldseek
+    mkdir -p result_db_dir
+    ${params.foldseek_exec} search \\
+        ${query_db_dir}/query_db \\
+        ${target_db}/${params.foldseek_db_name} \\
+        result_db_dir/foldseek_output_db \\
+        tmp_foldseek \\
+        --cov-mode 5 \\
+        --alignment-type 2 \\
+        -e ${params.T_EVALUE_THRESHOLD} \\
+        -s 10 \\
+        -c ${params.H_COVERAGE_THRESHOLD} \\
+        -a \\
+        --threads ${task.cpus}
+    
+    rm -rf tmp_foldseek
+    
+    """
+}

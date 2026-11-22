@@ -1,0 +1,1178 @@
+"""DAG input resolution for each node type (explain_node, resolvers)."""
+
+import json
+import logging
+from pathlib import Path
+from typing import Any, Optional
+
+
+logger = logging.getLogger(__name__)
+
+from mdclaw.node.constants import DAG_GUIDANCE  # noqa: E402
+from mdclaw.node.graph import find_ancestor_artifact, get_ancestors  # noqa: E402
+from mdclaw.node.io import _load_json_artifact, _read_artifact_from_node, _read_continued_from, _read_metadata_field, _read_node_metadata, _sanitize_label  # noqa: E402
+from mdclaw.node.lifecycle import read_node, validate_node_execution_context  # noqa: E402
+from mdclaw.node.prod_chain import _find_ancestor_node_id, _select_md_restart_ancestor, _walk_prod_trajectory_records_from  # noqa: E402
+from mdclaw.node.progress import _load_progress_v3  # noqa: E402
+from mdclaw.node.snapshot import node_missing_error  # noqa: E402
+
+
+def explain_node(
+    job_dir: str,
+    node_id: str,
+    expected_node_type: Optional[str] = None,
+    actual_conditions: Optional[dict] = None,
+) -> dict:
+    """Return read-only node details plus validation and resolved inputs."""
+    jd = Path(job_dir).resolve()
+    node_json = jd / "nodes" / node_id / "node.json"
+    if not node_json.exists():
+        return node_missing_error(str(jd), node_id, expected_type=expected_node_type)
+
+    node = read_node(str(jd), node_id)
+    node_type = node.get("node_type")
+    expected = expected_node_type or node_type
+    progress = _load_progress_v3(jd / "progress.json") or {}
+    nodes_index = progress.get("nodes", {})
+    progress_entry = nodes_index.get(node_id, {})
+    parent_statuses = {
+        parent_id: (nodes_index.get(parent_id) or {}).get("status")
+        for parent_id in node.get("parent_node_ids", [])
+    }
+    dependency_statuses = {
+        dep_id: (nodes_index.get(dep_id) or {}).get("status")
+        for dep_id in node.get("dependency_node_ids", [])
+    }
+
+    validation = validate_node_execution_context(
+        str(jd),
+        node_id,
+        expected,
+        actual_conditions=actual_conditions,
+        validate_conditions=actual_conditions is not None,
+    )
+    resolved_inputs = resolve_node_inputs(str(jd), node_id, node_type)
+    input_errors = list(resolved_inputs.get("input_resolution_errors", []))
+    source_selection_error = None
+    if (
+        node_type == "prep"
+        and actual_conditions
+        and resolved_inputs.get("source_bundle_file")
+    ):
+        from mdclaw.source_bundle import (
+            load_source_bundle,
+            select_source_structure,
+            source_record_path,
+            source_selection_from_values,
+        )
+
+        selection = source_selection_from_values(
+            source_structure_id=actual_conditions.get("source_structure_id"),
+            source_candidate_id=actual_conditions.get("source_candidate_id"),
+            source_model_index=actual_conditions.get("source_model_index"),
+            source_model_id=actual_conditions.get("source_model_id"),
+        )
+        if selection:
+            try:
+                record = select_source_structure(
+                    load_source_bundle(resolved_inputs["source_bundle_file"]),
+                    selection,
+                )
+                source_node_dir = (
+                    jd / "nodes" /
+                    str(resolved_inputs["source_bundle_resolved_from_node_id"])
+                )
+                structure_file = source_record_path(record, source_node_dir)
+                resolved_inputs.update({
+                    "structure_file": str(structure_file),
+                    "structure_resolved_from_node_id": resolved_inputs[
+                        "source_bundle_resolved_from_node_id"
+                    ],
+                    "source_structure_id": record.get("structure_id"),
+                    "source_structure": record,
+                })
+            except (KeyError, TypeError, ValueError) as exc:
+                source_selection_error = str(exc)
+    source_candidates = resolved_inputs.pop("source_candidates", [])
+    source_selection_required = (
+        node_type == "prep"
+        and resolved_inputs.get("source_structure_count", 0) > 1
+        and not resolved_inputs.get("structure_file")
+    )
+    if source_selection_required:
+        candidate_ids = [
+            str(candidate.get("structure_id"))
+            for candidate in source_candidates
+            if candidate.get("structure_id")
+        ]
+        if source_selection_error:
+            input_errors.append(
+                f"{source_selection_error}. Options: {candidate_ids}"
+            )
+        else:
+            input_errors.append(
+                "Pass --source-structure-id before running this prep node. "
+                f"Options: {candidate_ids}"
+            )
+
+    code = (
+        "source_candidate_selection_required"
+        if source_selection_required
+        # A resolver that names why the inputs cannot be assembled (a hybrid
+        # topo under a prod node, a plain topo under a fep node) puts that
+        # code here so the agent can branch on it before running anything.
+        else resolved_inputs.get("input_resolution_code") or "ok"
+    )
+    ready_to_run = validation.get("success") is True and not input_errors
+    # One list for everything that blocks the run: validation.blocking_codes
+    # covers the execution context only, so an input-resolution refusal
+    # (hybrid_topology_production_blocked) used to appear nowhere in it.
+    blocking_codes = list(validation.get("blocking_codes") or [])
+    if input_errors:
+        input_code = code if code != "ok" else "input_resolution_blocked"
+        if input_code not in blocking_codes:
+            blocking_codes.append(input_code)
+    # The envelope's generic ``next`` for a pending node is "run"; when the
+    # context is valid but the inputs cannot be assembled that contradicts
+    # ready_to_run, so say blocked. (An incomplete parent already gets the
+    # parent's step from the envelope.)
+    blocked_next = (
+        {"next": {"action": "blocked", "node_id": node_id, "node_type": node_type,
+                  "blocking_codes": blocking_codes, "reason": input_errors[0]}}
+        if validation.get("success") is True and input_errors
+        else {}
+    )
+    required_action = (
+        {
+            "required_action": {
+                "parameter": "source_structure_id",
+                "cli_flag": "--source-structure-id",
+                "candidates": source_candidates,
+            }
+        }
+        if source_selection_required
+        else {}
+    )
+
+    return {
+        "success": True,
+        "code": code,
+        "ready_to_run": ready_to_run,
+        **required_action,
+        "blocking_codes": blocking_codes,
+        **blocked_next,
+        "dag_guidance": DAG_GUIDANCE,
+        "job_dir": str(jd),
+        "node_id": node_id,
+        "node_type": node_type,
+        "status": node.get("status"),
+        "label": node.get("label"),
+        "parents": node.get("parent_node_ids", []),
+        "dependencies": node.get("dependency_node_ids", []),
+        "parent_statuses": parent_statuses,
+        "dependency_statuses": dependency_statuses,
+        "conditions": node.get("conditions", {}),
+        # ready_to_run cannot speak for the declared conditions: only the stage
+        # tool knows which of them it reports, and it has not run. Say so
+        # rather than letting ready_to_run imply every guard passed.
+        "conditions_checked": bool(actual_conditions),
+        "artifact_keys": sorted((node.get("artifacts") or {}).keys()),
+        "metadata_errors": (node.get("metadata") or {}).get("errors", []),
+        "warnings": node.get("warnings", []),
+        "progress_entry": progress_entry,
+        "validation": validation,
+        "resolved_inputs": resolved_inputs,
+        "missing_inputs": input_errors,
+    }
+
+
+def _input_resolution_status_errors(job_dir: str, node_id: str) -> list[str]:
+    """Return parent/dependency status errors for resolver auto-discovery.
+
+    ``resolve_node_inputs`` is intentionally non-throwing so callers can
+    still fall back to explicit parameters. The resolver must nevertheless
+    avoid trusting artifacts through an incomplete DAG edge.
+    """
+    jd = Path(job_dir)
+    progress = _load_progress_v3(jd / "progress.json")
+    if progress is None:
+        return [f"progress.json is missing or invalid under {job_dir}"]
+
+    nodes_index = progress.get("nodes", {})
+    node_entry = nodes_index.get(node_id)
+    if node_entry is None:
+        return [f"Node '{node_id}' is missing from progress.json"]
+
+    errors: list[str] = []
+    refs = [
+        ("Parent", pid) for pid in node_entry.get("parents", [])
+    ] + [
+        ("Dependency", did) for did in node_entry.get("dependencies", [])
+    ]
+    for ref_label, ref_id in refs:
+        ref_entry = nodes_index.get(ref_id)
+        if ref_entry is None:
+            errors.append(
+                f"{ref_label} node '{ref_id}' is missing from progress.json"
+            )
+            continue
+        status = ref_entry.get("status")
+        if status != "completed":
+            errors.append(
+                f"{ref_label} node '{ref_id}' must be completed before "
+                f"resolving inputs for '{node_id}' (status={status!r})"
+            )
+    return errors
+
+
+def input_resolution_recovery(job_dir: str, node_id: str) -> Optional[dict]:
+    """Structured recovery hint when a node is blocked by a non-completed parent.
+
+    When ``node_id`` cannot resolve inputs because a parent/dependency is stuck
+    ``running``/``failed``/``pending`` (not ``completed``), return an
+    ``action=create_node`` suggestion targeting the *blocking node's stage* so a
+    weak agent re-creates the stuck ancestor instead of re-running the blocked
+    child against an unreachable parent. Returns ``None`` when nothing is
+    blocking, or on any read error — this is a best-effort hint, not part of the
+    tool contract.
+    """
+    try:
+        progress = _load_progress_v3(Path(job_dir) / "progress.json")
+        if progress is None:
+            return None
+        nodes_index = progress.get("nodes", {})
+        node_entry = nodes_index.get(node_id)
+        if node_entry is None:
+            return None
+        refs = [
+            ("parent", pid) for pid in node_entry.get("parents", [])
+        ] + [
+            ("dependency", did) for did in node_entry.get("dependencies", [])
+        ]
+        for ref_kind, ref_id in refs:
+            ref_entry = nodes_index.get(ref_id)
+            if ref_entry is None or ref_entry.get("status") == "completed":
+                continue
+            status = ref_entry.get("status")
+            ref_type = ref_entry.get("type")
+            grandparents = list(ref_entry.get("parents", []) or [])
+            cmd = f"mdclaw create_node --job-dir {job_dir} --node-type {ref_type}"
+            if grandparents:
+                cmd += f" --parent-node-ids {','.join(grandparents)}"
+            return {
+                "code": "parent_node_not_completed",
+                "blocking_node_id": ref_id,
+                "blocking_node_type": ref_type,
+                "blocking_status": status,
+                "action": "create_node",
+                "node_type": ref_type,
+                "suggested_parent_node_ids": grandparents,
+                "next_command": cmd,
+                "message": (
+                    f"'{node_id}' is blocked because {ref_kind} node '{ref_id}' is "
+                    f"{status!r}, not 'completed'. Re-running '{node_id}' will keep "
+                    f"failing — create a NEW '{ref_type}' node from "
+                    f"{grandparents or 'an earlier completed ancestor'}, run it, "
+                    f"then create a NEW '{node_entry.get('type')}' "
+                    f"node instead of rerunning '{node_id}'."
+                ),
+            }
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _record_input_resolution_error(result: dict, error: str) -> None:
+    result.setdefault("input_resolution_errors", []).append(error)
+    result.setdefault("input_resolution_error", error)
+
+
+def _nearest_ancestor_artifact_or_error(
+    job_dir: str,
+    node_id: str,
+    ancestor_type: str,
+    artifact_key: str,
+):
+    """Resolve a required artifact from the nearest ancestor of a given type.
+
+    Unlike ``find_ancestor_artifact``, this helper does not walk past a nearest
+    same-type ancestor with a missing artifact. For required workflow inputs,
+    doing so can silently bind an older branch's artifact after a weak agent
+    created an incomplete nearer node.
+    """
+    ancestor_id = _find_ancestor_node_id(job_dir, node_id, ancestor_type)
+    if ancestor_id is None:
+        return None, None, None
+    value = _read_artifact_from_node(job_dir, ancestor_id, artifact_key)
+    if value is None:
+        return (
+            None,
+            ancestor_id,
+            f"Nearest {ancestor_type} ancestor '{ancestor_id}' is completed "
+            f"but missing required artifact '{artifact_key}' for '{node_id}'",
+        )
+    return value, ancestor_id, None
+
+
+def _resolve_topology_files(job_dir: str, node_id: str) -> dict:
+    """Resolve topology artifacts emitted by the nearest topo ancestor.
+
+    Topo nodes built via ``build_amber_system`` / ``build_openmm_system``
+    emit a ``system_xml`` + ``topology_pdb`` + ``state_xml`` triple. The
+    XML triple is the only supported topology contract on the run side —
+    min / eq / prod / analyze refuse to consume any other artifact set.
+
+    **Atomicity guarantee**: all triple components must come from the
+    same topo node. We never fall back to an older topo ancestor for
+    ``topology_pdb`` / ``state_xml``, because mixing artifacts across
+    topo nodes would point min/eq/prod at a different physical System.
+    Missing components on the chosen topo node surface as
+    ``input_resolution_error`` rather than a silent walk upward.
+    """
+    result: dict = {}
+
+    topo_id = _find_ancestor_node_id(job_dir, node_id, "topo")
+    if topo_id is None:
+        _record_input_resolution_error(
+            result,
+            f"No topo ancestor found for '{node_id}'.",
+        )
+        return result
+
+    sys_xml = _read_artifact_from_node(job_dir, topo_id, "system_xml")
+    topo_pdb = _read_artifact_from_node(job_dir, topo_id, "topology_pdb")
+    state_xml = _read_artifact_from_node(job_dir, topo_id, "state_xml")
+    if sys_xml is None or topo_pdb is None or state_xml is None:
+        _record_input_resolution_error(
+            result,
+            f"Topo ancestor '{topo_id}' is missing the XML triple: "
+            f"system_xml={'ok' if sys_xml else 'MISSING'}, "
+            f"topology_pdb={'ok' if topo_pdb else 'MISSING'}, "
+            f"state_xml={'ok' if state_xml else 'MISSING'}. The "
+            f"triple must be emitted atomically by build_amber_system "
+            f"/ build_openmm_system; do not mix artifacts across topo "
+            f"nodes.",
+        )
+        return result
+    result["system_xml_file"] = sys_xml
+    result["topology_pdb_file"] = topo_pdb
+    result["state_xml_file"] = state_xml
+    result["topology_resolved_from_node_id"] = topo_id
+    # Surface build-time choices the run side needs to validate against
+    # runtime kwargs. ``implicit_solvent`` is the load-bearing one
+    # (mismatch silently runs the wrong GB model); ``hmr`` and
+    # ``solvent_type`` are along for the ride so min/eq/prod can produce
+    # cleaner diagnostics without re-deserializing system.xml. Missing
+    # metadata keys (hand-built node.json) keep the value as ``None`` so
+    # downstream guards can skip the check rather than blocking on noise.
+    try:
+        topo_meta = read_node(job_dir, topo_id).get("metadata") or {}
+    except (OSError, json.JSONDecodeError):
+        topo_meta = {}
+    result["topology_implicit_solvent"] = topo_meta.get("implicit_solvent")
+    result["topology_hmr"] = topo_meta.get("hmr")
+    result["topology_solvent_type"] = topo_meta.get("solvent_type")
+    return result
+
+
+def _resolve_topo_inputs(job_dir: str, node_id: str) -> dict:
+    result: dict = {}
+    solv_anc = _find_ancestor_node_id(job_dir, node_id, "solv")
+    if solv_anc is not None:
+        v = _read_artifact_from_node(job_dir, solv_anc, "solvated_pdb")
+        if v:
+            result["pdb_file"] = v
+            result["pdb_resolved_from_node_id"] = solv_anc
+        else:
+            _record_input_resolution_error(
+                result,
+                f"Nearest solv ancestor '{solv_anc}' is completed but missing "
+                f"required artifact 'solvated_pdb' for '{node_id}'",
+            )
+    else:
+        v, prep_id, error = _nearest_ancestor_artifact_or_error(
+            job_dir, node_id, "prep", "merged_pdb"
+        )
+        if error:
+            _record_input_resolution_error(result, error)
+        if v:
+            result["pdb_file"] = v
+            result["pdb_resolved_from_node_id"] = prep_id
+
+    prep_anc = _find_ancestor_node_id(job_dir, node_id, "prep")
+    value = _read_artifact_from_node(job_dir, prep_anc, "ligand_chemistry") if prep_anc else None
+    if value:
+        result["ligand_chemistry"] = value
+
+    for result_key, artifact_key, expected_type in (
+        ("modxna_params", "modxna_params", list),
+        ("disulfide_bonds", "disulfide_bonds", list),
+        ("glycan_metadata", "glycan_metadata", dict),
+        ("glycan_linkages", "glycan_linkages", list),
+    ):
+        value = _read_artifact_from_node(job_dir, prep_anc, artifact_key) if prep_anc else None
+        loaded = _load_json_artifact(value, expected_type)
+        if loaded is not None:
+            result[result_key] = loaded
+
+    bd = find_ancestor_artifact(job_dir, node_id, "solv", "box_dimensions")
+    loaded_box = _load_json_artifact(bd, dict)
+    if loaded_box is not None:
+        result["box_dimensions"] = loaded_box
+
+    if solv_anc is not None:
+        result["solvation_node_id"] = solv_anc
+        is_membrane = _read_metadata_field(job_dir, solv_anc, "is_membrane")
+        if isinstance(is_membrane, bool):
+            result["is_membrane"] = is_membrane
+        solv_water_model = _read_metadata_field(job_dir, solv_anc, "water_model")
+        if isinstance(solv_water_model, str):
+            result["solvation_water_model"] = solv_water_model
+        neutralization_expected = _read_metadata_field(
+            job_dir, solv_anc, "neutralization_expected"
+        )
+        if isinstance(neutralization_expected, bool):
+            result["neutralization_expected"] = neutralization_expected
+    return result
+
+
+def _resolve_md_restart(job_dir: str, node_id: str) -> dict:
+    """Locate the restart artifact for an MD node (eq or prod).
+
+    Search order: explicit ``continue_from`` ancestor first, then walk
+    parents in BFS order. For each ancestor whose ``node_type`` is
+    ``"min"``, ``"prod"``, or ``"eq"``, prefer the portable ``state``
+    (XML) artifact and fall back to ``checkpoint`` (binary, same-GPU
+    bit-exact replay) *on that same ancestor* before considering older
+    ancestors. Two invariants:
+
+    1. A near prod/eq/min ancestor that only carries a checkpoint wins against
+       a far ancestor that has a state — the alternative silently rolls
+       the run back across an unsaved node step.
+    2. A *completed* min/prod/eq ancestor that carries neither artifact
+       blocks resolution outright (``restart_from_error``). Skipping
+       past it would lose whatever the user's tool produced on that
+       node; the right answer is to re-run that node, not pretend it
+       didn't run.
+
+    Returns a dict with one of:
+      - ``restart_from`` (str path) + ``restart_from_node_id`` (str) on
+        a successful match. ``read_ancestor_final_step`` must read
+        ``metadata.final_step`` from that same node id so the
+        cumulative step counter matches the loaded artifact.
+      - ``restart_from_error`` (str) for ``continue_from`` that names a
+        node without either artifact, or for a completed min/prod/eq
+        ancestor that carries neither artifact.
+      - empty when no min/prod/eq ancestor exists at all (legacy fresh
+        eq run).
+
+    Eq and prod nodes use the same resolver — min → eq, eq → eq, and
+    prod → prod all share the same ancestor-selection invariants.
+    """
+    result: dict = {}
+    continued_from = _read_continued_from(job_dir, node_id)
+    if continued_from is not None:
+        src = _read_artifact_from_node(job_dir, continued_from, "state")
+        if src is None:
+            src = _read_artifact_from_node(job_dir, continued_from, "checkpoint")
+        if src is not None:
+            result["restart_from"] = src
+            result["restart_from_node_id"] = continued_from
+            try:
+                node = read_node(job_dir, continued_from)
+                result["restart_from_node_type"] = (
+                    node.get("type") or node.get("node_type")
+                )
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                pass
+        else:
+            result["restart_from_error"] = (
+                f"continue_from='{continued_from}' but that node has neither a "
+                f"'state' nor 'checkpoint' artifact — extension cannot start. "
+                f"Wait for that node to finish (or fix the DAG to point at a "
+                f"completed min/eq/prod ancestor)."
+            )
+        return result
+
+    return _select_md_restart_ancestor(job_dir, node_id)
+
+
+
+
+
+
+def _resolve_prod_custom_force(job_dir: str, node_id: str) -> dict:
+    """Inherit the custom-force bias from a ``--continue-from`` prod parent.
+
+    A biased production extended via ``continue_from`` should keep biasing
+    with the same script and parameters unless the caller overrides them.
+    Returns the parent's ``custom_force_script`` artifact path (resolved
+    absolute) and ``custom_force_parameters`` metadata, or an empty dict when
+    the parent carried no custom force.
+    """
+    result: dict = {}
+    continued_from = _read_continued_from(job_dir, node_id)
+    if continued_from is None:
+        return result
+    script = _read_artifact_from_node(job_dir, continued_from, "custom_force_script")
+    if script:
+        result["custom_force_script"] = script
+        params = _read_metadata_field(
+            job_dir, continued_from, "custom_force_parameters"
+        )
+        if isinstance(params, dict):
+            result["custom_force_parameters"] = params
+    return result
+
+
+def _resolve_prod_distance_restraints(job_dir: str, node_id: str) -> dict:
+    """Inherit declarative distance bias from a ``--continue-from`` parent."""
+    continued_from = _read_continued_from(job_dir, node_id)
+    if continued_from is None:
+        return {}
+    restraints = _read_metadata_field(
+        job_dir, continued_from, "distance_restraints"
+    )
+    if isinstance(restraints, list):
+        return {"distance_restraints": restraints}
+    return {}
+
+
+def _resolve_restart_temperature(job_dir: str, restart_node_id: Optional[str]) -> dict:
+    """Temperature of the node whose state a run restarts from.
+
+    A production or equilibration that omits ``--temperature-kelvin`` runs at
+    this temperature: the eq node on a fresh eq -> prod, the prod parent on a
+    continuation (rounds segments get the temperature setup_rounds pinned,
+    passed explicitly by the driver; run_equilibration only uses it to refuse
+    an omitted temperature after a non-300 K eq). It is read from that
+    node's ``integrator_signature`` (what the restart check compares, so an
+    inherited value can never trip it), else ``metadata.temperature_kelvin``
+    (run_sst2 records only its reference temperature). Never a further
+    ancestor, never parsed from state.xml. Empty when there is nothing to
+    inherit.
+
+    The nearest eq ancestor is the wrong source: after an eq at 310 K and a
+    production run explicitly at 300 K, a continuation must keep 300 K.
+    MDDataBench glm-5.3-flash 3cond 010_membrane_6kux r3 (2026-09-26): eq at
+    310 K as asked, production without the flag ran at the 300 K default.
+    """
+    if not restart_node_id:
+        return {}
+    signature = _read_metadata_field(job_dir, restart_node_id, "integrator_signature")
+    value = signature.get("temperature_kelvin") if isinstance(signature, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        value = _read_metadata_field(job_dir, restart_node_id, "temperature_kelvin")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return {}
+    try:
+        node = read_node(job_dir, restart_node_id)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        node = {}
+    return {
+        "restart_temperature_kelvin": float(value),
+        "restart_temperature_node_id": restart_node_id,
+        "restart_temperature_node_type": node.get("node_type"),
+    }
+
+
+def _resolve_eq_ensemble_metadata(job_dir: str, node_id: str) -> dict:
+    result: dict = {}
+    eq_anc = _find_ancestor_node_id(job_dir, node_id, "eq")
+    if eq_anc is None:
+        return result
+    fe = _read_metadata_field(job_dir, eq_anc, "final_ensemble")
+    if isinstance(fe, str):
+        result["eq_final_ensemble"] = fe
+    pb = _read_metadata_field(job_dir, eq_anc, "pressure_bar")
+    if isinstance(pb, (int, float)):
+        result["eq_pressure_bar"] = float(pb)
+    return result
+
+
+def _resolve_hybrid_topology_extras(job_dir: str, topo_id: Optional[str]) -> dict:
+    """``hybrid_manifest`` + ``fep_protocol`` from a ``build_hybrid_system`` topo.
+
+    Returns an empty dict when the topo is a plain (non-hybrid) build so the
+    caller can raise ``fep_hybrid_topology_required``.
+    """
+    result: dict = {}
+    if topo_id is None:
+        return result
+    manifest = _read_artifact_from_node(job_dir, topo_id, "hybrid_manifest")
+    protocol = _read_artifact_from_node(job_dir, topo_id, "fep_protocol")
+    if manifest:
+        result["hybrid_manifest_file"] = manifest
+    if protocol:
+        result["fep_protocol_file"] = protocol
+    return result
+
+
+def _resolve_fep_inputs(job_dir: str, node_id: str) -> dict:
+    """Inputs for a ``fep`` node: the hybrid XML triple, the eq restart state,
+    the topo's ``hybrid_manifest`` / ``fep_protocol``, and (for fep → fep
+    extension) the parent fep node's per-window state index."""
+    result: dict = {}
+    result.update(_resolve_topology_files(job_dir, node_id))
+    topo_id = result.get("topology_resolved_from_node_id")
+    extras = _resolve_hybrid_topology_extras(job_dir, topo_id)
+    topo_fep = _read_metadata_field(job_dir, topo_id, "fep") if topo_id is not None else None
+    if (topo_id is not None and not extras.get("fep_protocol_file")
+            and isinstance(topo_fep, dict) and topo_fep.get("restraint_required")):
+        # The complex leg of an absolute binding free energy: decoupling an
+        # unrestrained ligand lets it leave the site, so that topology carries
+        # no lambda protocol until add_boresch_restraint has re-issued it.
+        _record_input_resolution_error(
+            result,
+            f"topo ancestor '{topo_id}' is the unrestrained complex leg of build_decoupled_system; it has no "
+            "lambda protocol. Create a topo node under this branch's completed eq node "
+            "(create_node --node-type topo --parent-node-ids <eq node>), run add_boresch_restraint on it, "
+            "and parent the fep node to that topo node.",
+        )
+        code = "abfe_restraint_required"
+        result["input_resolution_code"] = code
+    elif topo_id is not None and not (
+        extras.get("hybrid_manifest_file") and extras.get("fep_protocol_file")
+    ):
+        _record_input_resolution_error(
+            result,
+            f"topo ancestor '{topo_id}' was not built by build_hybrid_system "
+            f"(missing hybrid_manifest / fep_protocol). "
+            f"Create a topo node with build_hybrid_system --mutation <spec> first.",
+        )
+        code = "fep_hybrid_topology_required"
+        result["input_resolution_code"] = code
+    result.update(extras)
+    if topo_id is not None:
+        is_membrane = _read_metadata_field(job_dir, topo_id, "is_membrane")
+        if isinstance(is_membrane, bool):
+            result["is_membrane"] = is_membrane
+    # The prep's component map addresses the solute for --restraint-atoms
+    # solute_heavy, as for min / eq.
+    chain_identity_map = find_ancestor_artifact(job_dir, node_id, "prep", "chain_identity_map")
+    if chain_identity_map:
+        result["chain_identity_map_file"] = chain_identity_map
+    # eq state = equilibrated lambda=0 end state (same atom count as the hybrid).
+    result.update(_resolve_md_restart(job_dir, node_id))
+    if (not result.get("restart_from") and not result.get("restart_from_error")
+            and "input_resolution_code" not in result):
+        # Only reachable through a topo parent: windows must start from an
+        # equilibrated state, never from a freshly built topology.
+        _record_input_resolution_error(
+            result,
+            f"fep node '{node_id}' has no equilibrated ancestor. Windows start from the eq state: run min -> eq "
+            "under the topology and parent the fep node to that eq (for an absolute-binding complex leg: to the "
+            "add_boresch_restraint topo under that eq).",
+        )
+        code = "fep_equilibration_required"
+        result["input_resolution_code"] = code
+    result.update(_resolve_eq_ensemble_metadata(job_dir, node_id))
+    # fep → fep: the parent's window index carries per-window states. One
+    # parent only: pooling several parents is the analyze node's job.
+    try:
+        node = read_node(job_dir, node_id)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        node = {}
+    fep_parents = []
+    for pid in node.get("parent_node_ids") or []:
+        try:
+            if read_node(job_dir, pid).get("node_type") == "fep":
+                fep_parents.append(pid)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+    if len(fep_parents) > 1:
+        _record_input_resolution_error(
+            result,
+            f"a fep node extends exactly one fep parent, got {fep_parents}; create one child per "
+            f"parent (their windows are pooled by the analyze node).",
+        )
+        code = "fep_parent_ambiguous"
+        result["input_resolution_code"] = code
+    elif fep_parents:
+        pid = fep_parents[0]
+        result["fep_parent_node_id"] = pid
+        windows = _read_artifact_from_node(job_dir, pid, "fep_windows")
+        if windows:
+            result["fep_parent_windows_file"] = windows
+        else:
+            _record_input_resolution_error(
+                result, f"fep parent '{pid}' has no fep_windows artifact; it must complete run_fep first.")
+            code = "fep_windows_missing"
+            result["input_resolution_code"] = code
+    return result
+
+
+def _resolve_analyze_fep_inputs(job_dir: str, node_id: str, parents: list[str]) -> dict:
+    """Analyze node whose parents are all ``fep`` windows: collect each parent's
+    ``fep_windows`` index plus the shared hybrid topology metadata."""
+    result: dict = {}
+    records = []
+    for pid in parents:
+        windows = _read_artifact_from_node(job_dir, pid, "fep_windows")
+        if windows is None:
+            _record_input_resolution_error(
+                result,
+                f"fep parent '{pid}' is missing its 'fep_windows' artifact; "
+                f"run_fep must complete on that node before analyze_fep.",
+            )
+            continue
+        records.append({"fep_node_id": pid, "fep_windows_file": windows})
+    result["fep_window_records"] = records
+    topo_id = _find_ancestor_node_id(job_dir, node_id, "topo")
+    result.update(_resolve_hybrid_topology_extras(job_dir, topo_id))
+    if topo_id is not None:
+        result["topology_resolved_from_node_id"] = topo_id
+    return result
+
+
+def resolve_node_inputs(
+    job_dir: str,
+    node_id: str,
+    node_type: str,
+    *,
+    explicit_paths: Optional[dict[str, str]] = None,
+) -> dict:
+    """Auto-resolve standard input files for a node from its DAG ancestors.
+
+    Returns a dict of resolved absolute paths. In node mode, ``explicit_paths``
+    may name caller-supplied file inputs; a value that differs from the
+    canonical DAG artifact is rejected instead of overriding provenance.
+
+    Mappings:
+
+    - ``prep``: selected structure from the job's source bundle, falling back
+                to legacy ``structure_file`` artifacts when needed.
+    - ``solv``: ``merged_pdb`` plus ``ligand_chemistry`` from nearest ``prep``
+                ancestor
+    - ``topo``: ``solvated_pdb`` / ``box_dimensions`` from nearest ``solv``
+                ancestor, plus ``ligand_chemistry`` from nearest ``prep``
+                ancestor
+    - ``min``:  same topology artifacts as ``eq``; writes a minimized
+                portable state for downstream equilibration
+    - ``eq``:   ``system_xml`` + ``topology_pdb`` + ``state_xml`` from nearest
+                ``topo`` ancestor (XML triple is the only supported
+                topology contract on the run side), plus ``state`` from a
+                nearest ``min`` or prior ``eq`` / ``prod`` ancestor when present
+    - ``prod``: same topology artifacts as ``eq``;
+                ``checkpoint`` / ``state`` from nearest ``eq`` ancestor (parent)
+    """
+    result: dict = {}
+    status_errors = _input_resolution_status_errors(job_dir, node_id)
+    if status_errors:
+        return {
+            "input_resolution_error": status_errors[0],
+            "input_resolution_errors": status_errors,
+        }
+
+    if node_type == "prep":
+        ancestors = get_ancestors(job_dir, node_id)
+        pj = Path(job_dir) / "progress.json"
+        progress = _load_progress_v3(pj)
+        if progress is not None:
+            nodes_index = progress.get("nodes", {})
+            source_ancestors = [
+                nid for nid in ancestors
+                if nodes_index.get(nid, {}).get("type") == "source"
+            ]
+            if len(source_ancestors) == 1:
+                source_id = _find_ancestor_node_id(job_dir, node_id, "source")
+                bundle_file = (
+                    _read_artifact_from_node(job_dir, source_id, "source_bundle")
+                    if source_id is not None
+                    else None
+                )
+                if bundle_file:
+                    try:
+                        from mdclaw.source_bundle import (
+                            load_source_bundle,
+                            source_record_path,
+                        )
+
+                        bundle = load_source_bundle(bundle_file)
+                        structures = [
+                            s for s in bundle.get("structures", [])
+                            if isinstance(s, dict)
+                        ]
+                        source_node_dir = Path(job_dir) / "nodes" / str(source_id)
+                        result.update({
+                            "source_bundle_file": bundle_file,
+                            "source_bundle_resolved_from_node_id": source_id,
+                            "source_structure_count": len(structures),
+                        })
+                        if len(structures) > 1:
+                            result["source_candidates"] = [
+                                {
+                                    "structure_id": record.get("structure_id"),
+                                    "candidate_id": record.get("candidate_id"),
+                                    "rank": record.get("rank"),
+                                    "is_primary": bool(record.get("is_primary")),
+                                    "label": record.get("label"),
+                                }
+                                for record in structures
+                            ]
+                        if len(structures) == 1:
+                            record = structures[0]
+                            structure_file = source_record_path(record, source_node_dir)
+                            result.update({
+                                "structure_file": str(structure_file),
+                                "structure_resolved_from_node_id": source_id,
+                                "source_structure_id": record.get("structure_id"),
+                                "source_structure": record,
+                            })
+                    except Exception as exc:
+                        _record_input_resolution_error(result, str(exc))
+                else:
+                    v, source_id, error = _nearest_ancestor_artifact_or_error(
+                        job_dir, node_id, "source", "structure_file"
+                    )
+                    if error:
+                        _record_input_resolution_error(result, error)
+                    if v:
+                        result["structure_file"] = v
+                        result["structure_resolved_from_node_id"] = source_id
+
+    elif node_type == "solv":
+        v, prep_id, error = _nearest_ancestor_artifact_or_error(
+            job_dir, node_id, "prep", "merged_pdb"
+        )
+        if error:
+            _record_input_resolution_error(result, error)
+        if v:
+            result["pdb_file"] = v
+            result["pdb_resolved_from_node_id"] = prep_id
+        if prep_id:
+            for key in ("ligand_chemistry", "chain_identity_map"):
+                value = _read_artifact_from_node(job_dir, prep_id, key)
+                if value:
+                    result[key] = value
+            value = _read_artifact_from_node(job_dir, prep_id, "disulfide_bonds")
+            if value:
+                loaded = _load_json_artifact(value, list)
+                if loaded is None:
+                    _record_input_resolution_error(result, "Invalid prep disulfide_bonds artifact")
+                else:
+                    result["disulfide_bonds"] = loaded
+                    result["disulfide_bonds_resolved_from_node_id"] = prep_id
+
+    elif node_type == "topo":
+        result.update(_resolve_topo_inputs(job_dir, node_id))
+
+    elif node_type == "min":
+        result.update(_resolve_topology_files(job_dir, node_id))
+        chain_identity_map = find_ancestor_artifact(
+            job_dir, node_id, "prep", "chain_identity_map"
+        )
+        if chain_identity_map:
+            result["chain_identity_map_file"] = chain_identity_map
+        topo_anc = _find_ancestor_node_id(job_dir, node_id, "topo")
+        if topo_anc is not None:
+            is_membrane = _read_metadata_field(job_dir, topo_anc, "is_membrane")
+            if isinstance(is_membrane, bool):
+                result["is_membrane"] = is_membrane
+
+    elif node_type == "eq":
+        result.update(_resolve_topology_files(job_dir, node_id))
+        chain_identity_map = find_ancestor_artifact(
+            job_dir, node_id, "prep", "chain_identity_map"
+        )
+        if chain_identity_map:
+            result["chain_identity_map_file"] = chain_identity_map
+        topo_anc = _find_ancestor_node_id(job_dir, node_id, "topo")
+        if topo_anc is not None:
+            is_membrane = _read_metadata_field(job_dir, topo_anc, "is_membrane")
+            if isinstance(is_membrane, bool):
+                result["is_membrane"] = is_membrane
+        # min → eq is the standard path: surface the min node's state XML so
+        # equilibration starts from explicitly minimized coordinates. eq → eq
+        # chaining continues to surface the parent eq state for multi-stage
+        # equilibration. A legacy first eq node from topo has no restart
+        # ancestor and runs directly from the topo state.xml.
+        result.update(_resolve_md_restart(job_dir, node_id))
+        result.update(_resolve_restart_temperature(job_dir, result.get("restart_from_node_id")))
+
+    elif node_type == "prod":
+        result.update(_resolve_topology_files(job_dir, node_id))
+        topo_anc = _find_ancestor_node_id(job_dir, node_id, "topo")
+        if topo_anc is not None:
+            is_membrane = _read_metadata_field(job_dir, topo_anc, "is_membrane")
+            if isinstance(is_membrane, bool):
+                result["is_membrane"] = is_membrane
+            if _read_artifact_from_node(job_dir, topo_anc, "fep_protocol"):
+                # A hybrid topology is the wild type only at lambda=0 and
+                # carries the mutant's atoms as non-interacting ghosts under
+                # the wild-type residue name. Plain production on it gives
+                # wild-type physics but a trajectory / topology.pdb whose
+                # residue is neither state, so every residue-based analysis
+                # downstream reads it wrong. Sampling on a hybrid is the fep
+                # stage; wild-type MD wants a plain topo.
+                result["topology_is_hybrid"] = True
+                _record_input_resolution_error(
+                    result,
+                    f"topo ancestor '{topo_anc}' is a hybrid (alchemical) topology built by "
+                    "build_hybrid_system; production nodes do not run on it. Sample lambda windows with a "
+                    "fep node (run_fep), or build a plain topo node (build_amber_system) from the same solv "
+                    "node for wild-type production.",
+                )
+                code = "hybrid_topology_production_blocked"
+                result["input_resolution_code"] = code
+        result.update(_resolve_md_restart(job_dir, node_id))
+        result.update(_resolve_restart_temperature(job_dir, result.get("restart_from_node_id")))
+        result.update(_resolve_prod_custom_force(job_dir, node_id))
+        result.update(_resolve_prod_distance_restraints(job_dir, node_id))
+        continued_from = _read_continued_from(job_dir, node_id)
+        if continued_from:
+            plumed_file = _read_artifact_from_node(job_dir, continued_from, "plumed_input")
+            if plumed_file:
+                result["plumed_file"] = plumed_file
+            elif _read_metadata_field(job_dir, continued_from, "plumed"):
+                result["input_resolution_error"] = "PLUMED continuation is missing its recorded input."
+
+        # Surface the eq ancestor's ensemble as a default-pressure hint
+        # so a prod that omits ``--pressure-bar`` still defaults to NPT
+        # when its eq ran NPT. The ensemble-agnostic state loader handles
+        # the cross-ensemble case safely (positions/velocities/box are
+        # transferred without restoring barostat parameters), so this
+        # inheritance is a UX convenience rather than a correctness
+        # requirement.
+        result.update(_resolve_eq_ensemble_metadata(job_dir, node_id))
+
+    elif node_type == "fep":
+        result.update(_resolve_fep_inputs(job_dir, node_id))
+
+    elif node_type == "analyze":
+        # Analyze nodes resolve inputs based on how many parents they
+        # have and whether those parents are prods or analyze nodes.
+        # Four combinations, documented inline below. create_node
+        # already validated that parents are non-empty and uniform
+        # (all-prod or all-analyze); this branch trusts that contract.
+        start_nj = Path(job_dir) / "nodes" / node_id / "node.json"
+        if not start_nj.exists():
+            return result
+        try:
+            start_data = json.loads(start_nj.read_text())
+        except (json.JSONDecodeError, OSError):
+            return result
+        parents: list[str] = start_data.get("parent_node_ids", [])
+        if not parents:
+            return result
+
+        parent_types: list[str] = []
+        for pid in parents:
+            pj = Path(job_dir) / "nodes" / pid / "node.json"
+            if not pj.exists():
+                parent_types.append("missing")
+                continue
+            try:
+                parent_types.append(
+                    json.loads(pj.read_text()).get("node_type", "unknown")
+                )
+            except (json.JSONDecodeError, OSError):
+                parent_types.append("unreadable")
+
+        n_parents = len(parents)
+        # Every analyze branch needs the same topology for atom-selection
+        # DSL evaluation — within one job_dir all prods share the topo.
+        # The modern XML triple's ``topology_pdb`` is mdtraj-compatible
+        # and is the only topology source the resolver returns.
+        topology = find_ancestor_artifact(
+            job_dir, node_id, "topo", "topology_pdb"
+        )
+        if topology:
+            result["topology_file"] = topology
+        frame_times_ns = find_ancestor_artifact(
+            job_dir, node_id, "analyze", "frame_times_ns"
+        )
+        if frame_times_ns:
+            result["frame_times_ns_file"] = frame_times_ns
+
+        if n_parents >= 1 and all(pt == "fep" for pt in parent_types):
+            # Alchemical shape: every parent is a fep window node; the
+            # analyze tool (analyze_fep) runs MBAR over their reduced
+            # potentials. No trajectory chain is involved.
+            result.update(_resolve_analyze_fep_inputs(job_dir, node_id, parents))
+        elif n_parents == 1 and parent_types[0] == "prod":
+            # Phase 1 single-prod shape: trajectory + energy chain
+            # collected chronologically along the prod lineage.
+            trajectory_records = _walk_prod_trajectory_records_from(
+                job_dir, parents[0]
+            )
+            result["trajectory_records"] = trajectory_records
+            result["trajectory_chain"] = [
+                record["trajectory_file"]
+                for record in trajectory_records
+            ]
+            result["energy_chain"] = [
+                record["energy_file"]
+                for record in trajectory_records
+                if record.get("energy_file")
+            ]
+        elif n_parents >= 1 and all(pt == "prod" for pt in parent_types):
+            # Phase 3 multi-prod shape: each parent is an independent
+            # leaf prod; walk its own chain and produce one branch
+            # input per parent.
+            branches_input: list[dict[str, Any]] = []
+            for pid in parents:
+                # Borrow the chain collector by pointing a synthetic
+                # analyze node at this prod. Simplest is to walk
+                # directly from the parent id.
+                trajectory_records = _walk_prod_trajectory_records_from(
+                    job_dir, pid
+                )
+                traj_chain = [
+                    record["trajectory_file"]
+                    for record in trajectory_records
+                ]
+                energy_chain = [
+                    record["energy_file"]
+                    for record in trajectory_records
+                    if record.get("energy_file")
+                ]
+                conditions = _read_node_metadata(job_dir, pid).get(
+                    "conditions", {}
+                )
+                branches_input.append(
+                    {
+                        "label": _sanitize_label(pid),
+                        "leaf_prod_id": pid,
+                        "trajectory_records": trajectory_records,
+                        "trajectory_chain": traj_chain,
+                        "energy_chain": energy_chain,
+                        "conditions": conditions,
+                    }
+                )
+            result["branches_input"] = branches_input
+        elif n_parents == 1 and parent_types[0] == "analyze":
+            # Phase 2/3 single-analyze parent. If the parent itself is
+            # multi-branch, propagate its branches structured artifact
+            # so downstream tools iterate the same way regardless of
+            # how the multi-ness arose.
+            parent_branches = _read_artifact_from_node(
+                job_dir, parents[0], "branches"
+            )
+            if isinstance(parent_branches, list):
+                # Multi-branch propagation. The `branches` artifact
+                # stores per-branch paths as node-relative strings
+                # (``artifacts/combined_<label>.dcd``); resolve them
+                # to absolute paths here so downstream tools don't
+                # have to re-derive the parent node's directory.
+                parent_node_dir = (
+                    Path(job_dir) / "nodes" / parents[0]
+                )
+
+                def _abs(rel: Optional[str]) -> Optional[str]:
+                    if not rel:
+                        return None
+                    p = Path(rel)
+                    return str(p if p.is_absolute() else (parent_node_dir / rel).resolve())
+
+                result["branches_input"] = [
+                    {
+                        "label": b.get("label"),
+                        "leaf_prod_id": b.get("leaf_prod_id"),
+                        "trajectory_file": _abs(
+                            b.get("fitted_trajectory")
+                            or b.get("combined_trajectory")
+                            or b.get("trajectory")
+                        ),
+                        "energy_file": _abs(
+                            b.get("combined_energy") or b.get("energy")
+                        ),
+                        "frame_times_ns_file": _abs(
+                            b.get("frame_times_ns")
+                        ),
+                        "conditions": b.get("conditions", {}),
+                    }
+                    for b in parent_branches
+                ]
+                # Shared reference_pdb lives at the parent's top-level
+                ref_pdb = _read_artifact_from_node(
+                    job_dir, parents[0], "reference_pdb"
+                )
+                if ref_pdb is not None:
+                    result["reference_pdb"] = ref_pdb
+            else:
+                # Single-trajectory parent (Phase 1 concat output, or
+                # a single-parent Phase 2 output). Prefer fitted over
+                # combined so a fit→rmsd chain picks up aligned frames.
+                traj = _read_artifact_from_node(
+                    job_dir, parents[0], "fitted_trajectory"
+                ) or _read_artifact_from_node(
+                    job_dir, parents[0], "combined_trajectory"
+                )
+                if traj is not None:
+                    result["trajectory_file"] = traj
+                ref_pdb = _read_artifact_from_node(
+                    job_dir, parents[0], "reference_pdb"
+                )
+                if ref_pdb is not None:
+                    result["reference_pdb"] = ref_pdb
+        elif n_parents >= 2 and all(pt == "analyze" for pt in parent_types):
+            # Phase 3 multi-analyze shape: each parent contributes one
+            # branch (its combined_trajectory, preferring fitted).
+            # reference_pdb is taken from the first parent as a shared
+            # topology reference — create_node does not enforce that
+            # the parents share one; caller is responsible for sanity.
+            ref_pdb: Optional[str] = None
+            branches_input = []
+            for pid in parents:
+                traj = _read_artifact_from_node(
+                    job_dir, pid, "fitted_trajectory"
+                ) or _read_artifact_from_node(
+                    job_dir, pid, "combined_trajectory"
+                )
+                energy = _read_artifact_from_node(
+                    job_dir, pid, "combined_energy"
+                )
+                frame_times = _read_artifact_from_node(
+                    job_dir, pid, "frame_times_ns"
+                ) or find_ancestor_artifact(
+                    job_dir, pid, "analyze", "frame_times_ns"
+                )
+                parent_metadata = _read_node_metadata(job_dir, pid)
+                conditions = parent_metadata.get("conditions", {})
+                if ref_pdb is None:
+                    ref_pdb = _read_artifact_from_node(
+                        job_dir, pid, "reference_pdb"
+                    )
+                branches_input.append(
+                    {
+                        "label": _sanitize_label(pid),
+                        "analyze_node_id": pid,
+                        # What kind of analysis the parent recorded (e.g.
+                        # ``fep_mbar``) so a comparison tool can check it
+                        # is consuming the right inputs.
+                        "analysis": parent_metadata.get("analysis"),
+                        "leaf_prod_id": None,
+                        "trajectory_file": traj,
+                        "energy_file": energy,
+                        "frame_times_ns_file": frame_times,
+                        # Alchemical legs carry their MBAR result instead
+                        # of a trajectory.
+                        "fep_result_file": _read_artifact_from_node(job_dir, pid, "fep_result"),
+                        "conditions": conditions,
+                    }
+                )
+            result["branches_input"] = branches_input
+            if ref_pdb is not None:
+                result["reference_pdb"] = ref_pdb
+        # Other shapes were rejected at create_node time.
+
+    for key, explicit in (explicit_paths or {}).items():
+        if not explicit:
+            continue
+        resolved = result.get(key)
+        if not isinstance(resolved, str):
+            _record_input_resolution_error(
+                result,
+                f"DAG did not resolve canonical input '{key}' for '{node_id}'; "
+                f"explicit path overrides are not allowed in node mode",
+            )
+            continue
+        if Path(explicit).resolve() != Path(resolved).resolve():
+            _record_input_resolution_error(
+                result,
+                f"Explicit {key} '{Path(explicit).resolve()}' conflicts with "
+                f"DAG-resolved artifact '{Path(resolved).resolve()}' for '{node_id}'",
+            )
+
+    return result

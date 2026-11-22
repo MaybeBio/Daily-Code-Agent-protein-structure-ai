@@ -1,0 +1,35 @@
+# Ruff linter + formatter configuration
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "SIM",    # flake8-simplify
+    "T20",    # flake8-print
+    "RUF",    # ruff-specific rules
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # function call in default argument (FastAPI Depends)
+    "RUF012", # mutable class variable annotation
+    "RUF001", # ambiguous unicode in strings (CJK fullwidth chars)
+    "RUF002", # ambiguous unicode in docstrings (CJK fullwidth chars)
+    "RUF003", # ambiguous unicode in comments (CJK fullwidth chars)
+    "N803",   # argument name should be lowercase (ML convention: X_embed)
+    "N806",   # variable in function should be lowercase (ML convention: Z_bg)
+    "I001",   # import sorting (enforced by formatter, not blocker)
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["T20", "S101"]           # allow print and assert in tests
+"src/*" = ["T20", "UP", "B", "E402", "F401", "F541", "F841", "N812", "SIM", "RUF059", "W605"]  # research scripts: relaxed rules
+
+[lint.isort]
+known-first-party = ["site_api", "src"]

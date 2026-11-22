@@ -1,0 +1,131 @@
+[package]
+name = "molchanica"
+# Single source of truth for the app version: the About popup reads it via `CARGO_PKG_VERSION`,
+# and the `make_release` scripts parse it out of this file.
+version = "0.5.4"
+edition = "2024"
+
+
+[dependencies]
+graphics = { version = "0.6.9", features = ["app_utils"] }
+egui = "0.36.2"
+# Offscreen publication rendering, using the same GPU stack as the interactive engine.
+wgpu = "30.0.1"
+egui-wgpu = "0.36.2"
+
+pollster = "1.0"
+png = "0.18"
+# ChEBI supplies molecular diagrams as SVG, with atom labels already outlined.
+egui_extras = { version = "0.36.2", default-features = false, features = ["svg"] }
+
+#egui_tiles = "0.12.0" # For layouts etc. Experimenting
+egui-file-dialog = "0.15.0" #  For file dialogs.
+egui_plot = "0.37.0"  # For Rama plots
+
+# My own libraries here, many of which were designed specilfically for use
+# with Molchanica.
+lin_alg = { version = "1.4.3", features = ["encode"] }
+na_seq = "0.3.16"
+bio_apis = { version = "0.3.1", features = ["encode"] }
+bio_files = { version = "0.5.5", features = ["encode"] }
+bio_tools = "0.1.6"
+mcubes = "0.1.7"
+dynamics = { version = "0.2.7", features = ["encode"] }
+# todo: A/R. For reflections. Remove if you split out the 3D FFT code.
+ewald = { version = "0.2.0" }
+mol_defs = { version = "0.1.1", features = ["render"] }
+
+# ADME and synthesis are private, unpublished crates. Cargo requires path deps to exist even when
+# optional, so these stay commented out. Uncomment locally to build with `--features adme,synthesis`.
+#adme = { path = "../adme", optional = true }
+#synthesis = { path = "../synthesis", optional = true }
+
+# Checking for, downloading, and installing new releases, from the About popup. Without its
+# default `gui` feature, which is the Software Manager application itself.
+software_manager = "0.1.1"
+
+
+# For loading and saving config
+bincode = "2.0.1"
+rayon = "1.12"
+
+# For electron density reflections
+rustfft = "6.4"
+
+rand = "0.10"
+regex = "1.13"
+chrono = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+
+# For structure prediction (Boltz-2, Chai-1, ESMFold 2, OpenDDE, Protenix-v2)
+# and external tools (ProteinMPNN),
+# which exchange JSON with the processes they drive.
+serde_json = "1.0"
+serde_yaml = "0.9"
+flate2 = "1.1" # Preview and load compressed model outputs while preserving raw files.
+
+# We use Parquet for molecule databases, e.g. for screening, and a built-in convenience set.
+# Parquet is the on-disk format; Arrow is its in-memory format.
+parquet = { version = "60.1", features = ["arrow"] }
+arrow = "60.1"
+# Parquet reads from anything implementing `ChunkReader`; `Bytes` is how we point one at the
+# database embedded in the binary, rather than a file on disk.
+bytes = "1.12"
+
+# `dynamic-loading` rather than `dynamic-linking`: the CUDA driver library is resolved with
+# `dlopen`/`LoadLibrary` on first use instead of being a load-time dependency of the executable.
+# That is what lets the default (CUDA-enabled) build start on machines with no NVIDIA driver, on
+# both Windows and Linux; `util::get_computation_device` probes for the library and falls back to
+# `ComputationDevice::Cpu`. Cargo unions features, and cudarc's build script rejects having both
+# loading and linking active, so `ewald` and `dynamics` declare the same set.
+# (An earlier note here said loading couldn't find the GPU on Ubuntu. `libcuda.so.1` -- the name
+# the driver actually installs -- is in cudarc's candidate list, so if that recurs, check what
+# `ldconfig -p | grep libcuda` reports on the affected machine before reaching for linking again.)
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"], optional = true }
+# GPU name, driver and CUDA versions for the sidebar, without creating a CUDA context. Loaded at runtime.
+nvml-wrapper = { version = "0.13", optional = true }
+
+rodio = { version = "0.23", optional = true }  # For sonification of bonds etc.
+webbrowser = "1.2"  # For opening links, e.g. from the remote DBs
+# Available system memory, for sizing MD trajectory loads. Already a dep of egui-file-dialog.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
+
+# We use these when developing locally to reduce friction.
+[patch.crates-io]
+graphics = { path = "../../graphics" }
+lin_alg = { path = "../../lin_alg" }
+#na_seq = { path = "../na_seq" }
+bio_apis = { path = "../bio_apis" }
+bio_tools = { path = "../bio_tools" }
+#mcubes = { path = "../mcubes" }
+bio_files = { path = "../bio_files" }
+dynamics = { path = "../dynamics" }
+mol_defs = { path = "../mol_defs" }
+ewald = { path = "../ewald" }
+#software_manager = { path = "../../software_manager" }
+
+
+[build-dependencies]
+cuda_setup = { version = "0.1.10", optional = true }
+# This is for embedding an application icon, on Windows.
+winresource = "0.1"
+
+# We feature-gate the CUDA dependency, so this program can be run on computers that don't have a
+# suitable graphics chip.
+[features]
+default = ["cuda"]
+
+#cuda = ["cuda_setup", "cudarc", "lin_alg/cuda", "dynamics/cuda", "dynamics/vkfft", "ewald/vkfft"]
+cuda = ["cuda_setup", "cudarc", "nvml-wrapper", "lin_alg/cuda", "dynamics/cuda", "dynamics/cufft", "ewald/cufft"]
+
+# `adme` and `synthesis` features are implicit, from their optional deps above. We still feature-gate
+# code out based on them, but can't include them here as they're not published.
+sonification = ["rodio"]
+
+[lints.rust]
+# Declares the `adme` and `synthesis` features while their deps are commented out.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("adme", "synthesis"))'] }
+
+[profile.release]
+strip = true  # Strip symbols from binary. Size reduction on Linux/Mac.

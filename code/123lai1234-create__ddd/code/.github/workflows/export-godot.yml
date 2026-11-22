@@ -1,0 +1,112 @@
+name: Export Godot Game
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/games/xian-godot/**"
+  workflow_dispatch:
+
+concurrency:
+  group: export-godot
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  GODOT_VERSION: "4.3"
+  GODOT_RELEASE: "stable"
+
+jobs:
+  export-and-deploy:
+    name: Export Godot → Commit → Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Godot install (cached) ───────────────────────────────
+      - name: Cache Godot binary + export templates
+        id: cache-godot
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/godot4
+            ~/.local/share/godot/export_templates
+          key: godot-${{ env.GODOT_VERSION }}-${{ env.GODOT_RELEASE }}
+
+      - name: Install Godot ${{ env.GODOT_VERSION }}
+        if: steps.cache-godot.outputs.cache-hit != 'true'
+        run: |
+          VER="${GODOT_VERSION}-${GODOT_RELEASE}"
+          wget -q "https://github.com/godotengine/godot/releases/download/${VER}/Godot_v${VER}_linux.x86_64.zip" -O /tmp/godot.zip
+          unzip -q /tmp/godot.zip -d /tmp
+          mv "/tmp/Godot_v${VER}_linux.x86_64" /tmp/godot4
+          chmod +x /tmp/godot4
+
+      - name: Install Godot export templates
+        if: steps.cache-godot.outputs.cache-hit != 'true'
+        run: |
+          VER="${GODOT_VERSION}-${GODOT_RELEASE}"
+          TPL_DIR=~/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_RELEASE}
+          mkdir -p "$TPL_DIR"
+          wget -q "https://github.com/godotengine/godot/releases/download/${VER}/Godot_v${VER}_export_templates.tpz" -O /tmp/tpl.tpz
+          unzip -q /tmp/tpl.tpz -d /tmp/tpl
+          mv /tmp/tpl/templates/* "$TPL_DIR/"
+
+      # ── Export ───────────────────────────────────────────────
+      - name: Export Godot game (Web)
+        run: |
+          mkdir -p astro/public/games/xian-godot
+          /tmp/godot4 --headless \
+            --path "${{ github.workspace }}/frontend/games/xian-godot" \
+            --export-release "Web" \
+            "${{ github.workspace }}/astro/public/games/xian-godot/index.html"
+          echo "=== Exported files ==="
+          ls -lh astro/public/games/xian-godot/
+
+      # ── Commit exported files so Deploy Frontend always has them ─
+      - name: Commit web export to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add astro/public/games/xian-godot/
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "auto: update Godot web export [skip export]"
+          git push
+
+      # ── Build Astro ──────────────────────────────────────────
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cache node_modules
+        id: cache-node
+        uses: actions/cache@v4
+        with:
+          path: astro/node_modules
+          key: node-${{ hashFiles('astro/package-lock.json') }}
+
+      - name: Install (cache miss only)
+        if: steps.cache-node.outputs.cache-hit != 'true'
+        run: cd astro && npm ci
+
+      - name: Build Astro
+        run: cd astro && npm run build
+
+      # ── Deploy immediately (Deploy Frontend will also fire) ──
+      - name: Deploy to Vercel (prebuilt)
+        continue-on-error: true
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: team_a3kKe1wDrxqQfuXTUnw4SUxw
+          VERCEL_PROJECT_ID: prj_wQljgcHZu1IhJ0CBloPc4yiWJlcb
+        run: |
+          [ -z "$VERCEL_TOKEN" ] && echo "::warning::VERCEL_TOKEN not set" && exit 0
+          mkdir -p .vercel/output/static
+          cp -r astro/dist/. .vercel/output/static/
+          echo '{"version":3}' > .vercel/output/config.json
+          npx --yes vercel deploy --prod --prebuilt --token="$VERCEL_TOKEN" 2>&1 | tail -10

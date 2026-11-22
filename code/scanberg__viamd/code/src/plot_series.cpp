@@ -1,0 +1,1761 @@
+#include <plot_series.h>
+
+#include <viamd.h>
+#include <display_units.h>
+#include <frame_axis.h>
+#include <serialization_utils.h>
+
+#include <md_system.h>
+#include <core/md_allocator.h>
+#include <core/md_array.h>
+#include <core/md_bitset.h>
+#include <core/md_hash.h>
+#include <core/md_log.h>
+#include <core/md_str.h>
+#include <core/md_path.h>
+#include <core/md_vec_math.h>
+
+#include <float.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+// ## Keys and names
+
+bool series_key_equal(const SeriesKey& a, const SeriesKey& b) {
+    return a.source == b.source && a.variant == b.variant && a.period == b.period && strcmp(a.path, b.path) == 0;
+}
+
+SeriesKey series_key(SeriesSource source, md_str_t path, SeriesVariant variant, uint32_t period) {
+    SeriesKey key;
+    key.source  = source;
+    key.variant = variant;
+    key.period  = period;
+    // A path that does not fit is left empty rather than cut: a truncated path names something else
+    if (path.len < sizeof(key.path)) {
+        md_str_copy_to_char_buf(key.path, sizeof(key.path), path);
+    }
+    return key;
+}
+
+// The child of the series' path each variant is read from; empty for the series itself.
+static const char* variant_leaf[SeriesVariant_Count] = {
+    "",
+    "mean",
+    "variance",
+    "extent",
+    "",
+};
+
+static const char* variant_label[SeriesVariant_Count] = {
+    "",
+    " (mean)",
+    " (mean+-sd)",
+    " (min/max)",
+    " (agg)",
+};
+
+static const char* variant_name[SeriesVariant_Count] = {
+    "values",
+    "mean",
+    "sigma",
+    "extent",
+    "aggregate",
+};
+
+static const char* source_name[SeriesSource_Count] = {
+    "system",
+    "script",
+};
+
+const char* series_source_name(SeriesSource source) {
+    return source_name[source < SeriesSource_Count ? source : 0];
+}
+
+bool series_source_from_name(SeriesSource* out, md_str_t name, uint32_t* period) {
+    for (int k = 0; k < SeriesSource_Count; ++k) {
+        if (md_str_eq_cstr(name, source_name[k])) {
+            *out = (SeriesSource)k;
+            return true;
+        }
+    }
+    if (md_str_eq_cstr(name, "script_filtered")) {
+        *out = SeriesSource_Script;
+        if (period) *period = SERIES_PERIOD_LEGACY_FILTER;
+        return true;
+    }
+    return false;
+}
+
+uint32_t series_legacy_period(const ApplicationState* app, uint32_t period) {
+    if (period != SERIES_PERIOD_LEGACY_FILTER) return period;
+    const uint32_t id = app->timeline.periods.legacy_filter_id;
+    return timeline_periods_find(&app->timeline.periods, id) ? id : 0;
+}
+
+static const char* plot_type_name[PlotType_Count] = {
+    "line",
+    "scatter",
+    "area",
+    "bars",
+};
+
+static const md_str_t script_prefix = MD_STR_INIT("script/");
+
+static bool is_script(SeriesSource source) {
+    return source == SeriesSource_Script;
+}
+
+// The script's is the evaluation's table. Over a period, a temporal property is taken over the period's frames, and a
+// distribution or a volume from the slot over them (series_slot).
+const md_attributes_t* series_table(const ApplicationState* app, SeriesSource source) {
+    MD_ASSERT(app);
+    if (source == SeriesSource_System) {
+        return &app->mold.sys.attributes;
+    }
+    const script::Eval* eval = is_script(source) ? app->script.eval : nullptr;
+    return eval ? script::attributes(eval) : nullptr;
+}
+
+const md_attributes_t* series_table(const ApplicationState* app, SeriesSource source, md_str_t path) {
+    (void)path;
+    return series_table(app, source);
+}
+
+// The frames of the key's period, [beg, end[: every frame without one. False when it covers no frames.
+static bool key_period_frames(uint32_t* beg, uint32_t* end, const ApplicationState* app, const SeriesKey& key) {
+    return series_period_frames(beg, end, app, key, 0);
+}
+
+bool series_frame_mask(md_bitset_t* out, const ApplicationState* app, const SeriesKey& key, md_allocator_i* alloc) {
+    MD_ASSERT(out);
+    const script::Eval* eval = is_script(key.source) ? app->script.eval : nullptr;
+    if (!eval) return false;
+    md_bitset_t held = script::eval_output_frames(eval, series_script_ident(key), alloc);
+    if (key.period != 0) {
+        uint32_t beg, end;
+        held = md_bitset_and(held, key_period_frames(&beg, &end, app, key) ? md_bitset_range(beg, end) : md_bitset_empty_set(), alloc);
+    }
+    *out = held;
+    return true;
+}
+
+const char* series_period_name(const ApplicationState* app, uint32_t period) {
+    const TimelinePeriod* r = timeline_periods_find(&app->timeline.periods, period);
+    return r ? r->name : "missing period";
+}
+
+md_str_t series_script_ident(const SeriesKey& key) {
+    md_str_t path = md_str_from_cstr(key.path);
+    if (is_script(key.source) && md_str_begins_with(path, script_prefix)) {
+        return md_str_substr(path, script_prefix.len);
+    }
+    return {};
+}
+
+SeriesState series_state(const ApplicationState* app, const SeriesKey& key) {
+    SeriesState st;
+    const script::Eval* eval = is_script(key.source) ? app->script.eval : nullptr;
+    if (!eval) return st;
+    const md_str_t ident = series_script_ident(key);
+
+    // Against the script in the editor, when it compiles and is not the one evaluated: computed from the same thing,
+    // or not (script::output_fingerprint). A property neither has is nothing to speak of: nothing is shown.
+    const script::Program* ir = script::valid(app->script.ir) ? app->script.ir : app->script.eval_ir;
+    const uint64_t evaluated = script::eval_output_fingerprint(eval, ident);
+    const uint64_t now = ir ? script::output_fingerprint(ir, ident) : evaluated;
+    if (!evaluated && !now) return st;
+    if (evaluated && !now) {
+        st.status = SeriesStatus_Removed;
+        return st;
+    }
+    if (evaluated && now != evaluated) {
+        st.status = SeriesStatus_Outdated;
+        return st;
+    }
+
+    // How far it has come: over every frame, or over its period's
+    uint32_t beg = 0, end = 0;
+    const bool over_period = key.period != 0;
+    st.num_wanted = key_period_frames(&beg, &end, app, key) ? end - beg : 0;
+    const uint32_t kinds = (uint32_t)script::output_flags(app->script.eval_ir, ident);
+    if (over_period && (kinds & (script::OUTPUT_DISTRIBUTION | script::OUTPUT_VOLUME))) {
+        // Its slot over the period's frames. What it has yet to do is the frames it wants and does not hold, and those
+        // it holds and does not want: of what it holds, (wanted + held - pending) / 2 are wanted.
+        script::AggregateInfo info;
+        if (script::aggregate_info(&info, eval, SCRIPT_SLOT_PERIOD(key.period), ident)) {
+            const uint32_t both = (st.num_wanted + info.num_frames - MD_MIN(info.num_pending, st.num_wanted + info.num_frames)) / 2;
+            st.num_frames = MD_MIN(both, st.num_wanted);
+            st.num_extra  = info.num_frames - MD_MIN(both, info.num_frames);
+            if (info.num_pending > 0) st.status = SeriesStatus_Partial;
+        }
+        return st;
+    }
+    md_bitset_t held = script::eval_output_frames(eval, ident, app->allocator.frame);
+    if (over_period) {
+        held = md_bitset_and(held, st.num_wanted ? md_bitset_range(beg, end) : md_bitset_empty_set(), app->allocator.frame);
+    }
+    st.num_frames = (uint32_t)md_bitset_count(held);
+    if (st.num_frames < st.num_wanted) st.status = SeriesStatus_Partial;
+    return st;
+}
+
+void series_state_suffix(char* buf, size_t cap, const SeriesState& state) {
+    switch (state.status) {
+    case SeriesStatus_Partial:
+        if (state.num_frames < state.num_wanted) snprintf(buf, cap, " \xC2\xB7 %u/%u", state.num_frames, state.num_wanted);
+        else snprintf(buf, cap, " \xC2\xB7 %u to take out", state.num_extra);
+        break;
+    case SeriesStatus_Outdated: snprintf(buf, cap, " \xC2\xB7 outdated"); break;
+    case SeriesStatus_Removed:  snprintf(buf, cap, " \xC2\xB7 removed"); break;
+    default: if (cap) buf[0] = '\0'; break;
+    }
+}
+
+void series_state_describe(char* buf, size_t cap, const SeriesState& state) {
+    switch (state.status) {
+    case SeriesStatus_Partial:
+        if (state.num_extra > 0) {
+            snprintf(buf, cap, "Holds %u of its %u frames so far, and %u frames it no longer covers,\nwhich are taken out as they are evaluated: Evaluate to finish it.",
+                     state.num_frames, state.num_wanted, state.num_extra);
+        } else {
+            snprintf(buf, cap, "Evaluated over %u of its %u frames so far", state.num_frames, state.num_wanted);
+        }
+        break;
+    case SeriesStatus_Outdated:
+        snprintf(buf, cap, "Shown as evaluated from an earlier version of the script.\nWhat it is computed from has changed: Evaluate to update it.");
+        break;
+    case SeriesStatus_Removed:
+        snprintf(buf, cap, "Shown as last evaluated: it is no longer in the script.");
+        break;
+    default:
+        if (cap) buf[0] = '\0';
+        break;
+    }
+}
+
+static md_str_t path_leaf(md_str_t path) {
+    return md_str_substr(path, md_str_rfind_char(path, '/') + 1);
+}
+
+void series_label(char* buf, size_t cap, const ApplicationState* app, const SeriesKey& key) {
+    MD_ASSERT(buf && cap > 0);
+    md_str_t base = {};
+    if (is_script(key.source)) {
+        base = series_script_ident(key);
+    } else {
+        const md_attributes_t* table = series_table(app, key.source);
+        const md_attribute_t*  attr  = table ? md_attributes_find(table, md_str_from_cstr(key.path)) : nullptr;
+        base = (attr && !md_str_empty(attr->label)) ? attr->label : path_leaf(md_str_from_cstr(key.path));
+    }
+    const int v = key.variant < SeriesVariant_Count ? key.variant : 0;
+    if (key.period != 0) {
+        snprintf(buf, cap, MD_STR_FMT "%s (%s)", MD_STR_ARG(base), variant_label[v], series_period_name(app, key.period));
+    } else {
+        snprintf(buf, cap, MD_STR_FMT "%s", MD_STR_ARG(base), variant_label[v]);
+    }
+}
+
+ImVec4 series_default_color(const ApplicationState* app, const SeriesKey& key) {
+    size_t idx = 0;
+    if (is_script(key.source)) {
+        // The property's place in the script, the same in every view of it
+        const md_str_t ident = series_script_ident(key);
+        const script::Program* ir = app->script.eval_ir;
+        const size_t num = ir ? script::num_outputs(ir) : 0;
+        const md_str_t* names = ir ? script::output_names(ir) : nullptr;
+        for (size_t i = 0; i < num; ++i) {
+            if (md_str_eq(names[i], ident)) { idx = i; break; }
+        }
+    } else {
+        idx = (size_t)md_hash64_str(md_str_from_cstr(key.path), 0);
+    }
+    ImVec4 color = ImGui::ColorConvertU32ToFloat4(PROPERTY_COLORS[idx % MD_COUNTOF(PROPERTY_COLORS)]);
+    if (key.variant == SeriesVariant_Sigma)  color.w *= 0.4f;
+    if (key.variant == SeriesVariant_Extent) color.w *= 0.2f;
+    return color;
+}
+
+md_str_t series_member_label(const ApplicationState* app, const SeriesKey& key, int k) {
+    if (k < 0) return {};
+    char buf[SERIES_PATH_CAP + 8];
+    const int len = snprintf(buf, sizeof(buf), "%s/labels", key.path);
+    if (len <= 0 || (size_t)len >= sizeof(buf)) return {};
+    const md_str_t path = {buf, (size_t)len};
+    const md_attributes_t* table = series_table(app, key.source, path);
+    const md_attribute_t* attr = table ? md_attributes_find(table, path) : nullptr;
+    if (!attr || attr->format.type != MD_ATTRIBUTE_TYPE_STR || attr->format.rank != 1 || (uint32_t)k >= attr->format.shape[0]) return {};
+    return md_attribute_str(table, attr, (size_t)k);
+}
+
+void series_set_drag_payload(const char* dnd_type, const SeriesKey& key, int src_subplot, const char* label, ImVec4 color) {
+    SeriesDragPayload payload;
+    payload.key = key;
+    payload.src_subplot = src_subplot;
+    ImGui::SetDragDropPayload(dnd_type, &payload, sizeof(payload));
+    ImPlot::ItemIcon(color);
+    ImGui::SameLine();
+    ImGui::TextUnformatted(label);
+}
+
+// ## Attributes
+
+// Something a view can be drawn from: numbers, and resident. A virtual attribute (a trajectory's
+// coordinates) would be produced whole to draw it, which is not something anyone means by
+// dragging it into a plot.
+static bool attribute_numeric_resident(const md_attribute_t* attr) {
+    if (!attr) return false;
+    if (attr->format.rank < 1 || attr->format.shape[0] == 0) return false;
+    return md_attribute_type_is_numeric(attr->format.type) && !md_attribute_is_virtual(attr);
+}
+
+static bool attribute_temporal(const md_attribute_t* attr) {
+    return attribute_numeric_resident(attr) && (attr->flags & MD_ATTRIBUTE_FLAG_TEMPORAL);
+}
+
+static uint32_t script_property_kind(const ApplicationState* app, const SeriesKey& key) {
+    const script::Program* ir = app->script.eval_ir;
+    return (ir && is_script(key.source)) ? script::output_flags(ir, series_script_ident(key)) : (uint32_t)script::OUTPUT_NONE;
+}
+
+// Labels and script identity, which a view has whether or not the series resolves
+template <typename View>
+static void fill_names(View* out, const ApplicationState* app, const SeriesKey& key) {
+    char base[64], suffix[32];
+    series_label(base, sizeof(base), app, key);
+    out->state = series_state(app, key);
+    series_state_suffix(suffix, sizeof(suffix), out->state);
+    snprintf(out->label, sizeof(out->label), "%s%s", base, suffix);
+    snprintf(out->plot_id, sizeof(out->plot_id), "%s###%d:%d:%u:%s", out->label, (int)key.source, (int)key.variant, key.period, key.path);
+    if (is_script(key.source)) {
+        const md_str_t ident = series_script_ident(key);
+        md_str_copy_to_char_buf(out->script_ident, sizeof(out->script_ident), ident);
+        out->vis_ref = script::output_ref(app->script.eval_ir, ident);
+    }
+}
+
+// ## Caches
+//
+// What is derived from an attribute is kept until the attribute changes. An attribute's version
+// only orders the changes within one table, and a table can be freed and another allocated in its
+// place (a new dataset, a recompiled script), so the caches are dropped whole when that happens
+// (series_cache_free) rather than trusted to tell.
+
+struct ConvertEntry {
+    uint64_t               key = 0;
+    const md_attributes_t* table = nullptr;
+    uint64_t               version = 0;
+    bool                   valid = false;
+    md_array(uint8_t)      data = nullptr;  // count floats or doubles, as the key says
+    size_t                 count = 0;
+    int                    last_used = 0;
+};
+
+struct HistogramEntry {
+    uint64_t               key = 0;
+    const md_attributes_t* table = nullptr;
+    uint64_t               version = 0;     // of the values, and of the weights where there are any
+    bool                   valid = false;
+    int                    num_bins = 0;
+    int                    dim = 0;
+    double                 x_min = 0, x_max = 0;    // stored unit
+    float                  y_min = 0, y_max = 0;
+    double                 bandwidth_min = 0, bandwidth_max = 0;    // of the members' kernels, stored unit; 0 unsmoothed
+    md_array(float)        bins = nullptr;
+    int                    last_used = 0;
+};
+
+// The bandwidths a property is smoothed with, one per member (or one of the members pooled): Silverman's rule of
+// thumb over every frame the evaluation holds, of its values binned as every curve of it is. Every curve of the
+// property, over whichever period, is smoothed with these (times the series' smoothing), so that its curves compare: a
+// period's own bandwidth would widen as the period shortens, and lower its peaks by itself.
+struct BandwidthEntry {
+    uint64_t               key = 0;
+    const md_attributes_t* table = nullptr;
+    uint64_t               version = 0;     // of the values, and of which frames the evaluation holds
+    md_array(double)       h = nullptr;     // stored unit
+    int                    last_used = 0;
+};
+
+// What the slot of a distribution or volume holds, copied out of it whenever it holds something new
+// (script::aggregate_read): over a period (SCRIPT_SLOT_PERIOD)
+struct SlotEntry {
+    uint64_t        key = 0;
+    char            ident[64] = "";
+    uint64_t        version = 0;
+    script::AggregateInfo info = {};
+    md_array(float) values = nullptr;
+    md_array(float) weights = nullptr;
+    int             last_used = 0;
+};
+
+static md_array(ConvertEntry)   convert_cache = nullptr;
+static md_array(HistogramEntry) histogram_cache = nullptr;
+static md_array(BandwidthEntry) bandwidth_cache = nullptr;
+static md_array(SlotEntry)      slot_cache = nullptr;
+
+// A converted copy of the whole attribute in dst_unit (as stored for md_unit_none()): as floats, or as doubles (type F64),
+// which is what a time is kept in
+static const void* cache_convert(ApplicationState* app, const md_attributes_t* table, const md_attribute_t* attr, md_unit_t dst_unit,
+                                 md_attribute_type_t type, size_t* out_count) {
+    MD_ASSERT(type == MD_ATTRIBUTE_TYPE_F32 || type == MD_ATTRIBUTE_TYPE_F64);
+    uint64_t key = md_hash64(&dst_unit.base.raw_bits, sizeof(dst_unit.base.raw_bits), 0);
+    key = md_hash64(&dst_unit.mult, sizeof(dst_unit.mult), key);
+    key = md_hash64(&type, sizeof(type), key);
+    key = md_hash64_str(attr->path, key);
+
+    const int frame = ImGui::GetFrameCount();
+    ConvertEntry* entry = nullptr;
+    for (size_t i = 0; i < md_array_size(convert_cache); ++i) {
+        if (convert_cache[i].key == key && convert_cache[i].table == table) {
+            entry = &convert_cache[i];
+            break;
+        }
+    }
+    if (!entry) {
+        md_array_push(convert_cache, ConvertEntry{}, app->allocator.persistent);
+        entry = &convert_cache[md_array_size(convert_cache) - 1];
+        entry->key   = key;
+        entry->table = table;
+    } else if (entry->version == attr->version) {
+        entry->last_used = frame;
+        *out_count = entry->count;
+        return entry->valid ? entry->data : nullptr;
+    }
+
+    entry->version   = attr->version;
+    entry->last_used = frame;
+    const size_t count = md_attribute_element_count(&attr->format);
+    const md_attribute_slice_t all = md_attribute_slice_all();
+    if (type == MD_ATTRIBUTE_TYPE_F64) {
+        md_array_resize(entry->data, count * sizeof(double), app->allocator.persistent);
+        entry->valid = md_attribute_extract_f64((double*)entry->data, count, table, attr, all, dst_unit) == count;
+    } else {
+        md_array_resize(entry->data, count * sizeof(float), app->allocator.persistent);
+        entry->valid = md_attribute_extract_f32((float*)entry->data, count, table, attr, all, dst_unit) == count;
+    }
+    if (!entry->valid) {
+        md_array_free(entry->data, app->allocator.persistent);
+        entry->data = nullptr;
+    }
+    entry->count = entry->valid ? count : 0;
+    *out_count = entry->count;
+    return entry->valid ? entry->data : nullptr;
+}
+
+// The attribute's values as floats: in place when they are stored so (a script property, which
+// is read while the evaluation fills it in), converted and cached otherwise
+static const float* attribute_floats(ApplicationState* app, const md_attributes_t* table, const md_attribute_t* attr) {
+    if (attr->format.type == MD_ATTRIBUTE_TYPE_F32) {
+        return (const float*)attr->data;
+    }
+    size_t count = 0;
+    const float* data = (const float*)cache_convert(app, table, attr, md_unit_none(), MD_ATTRIBUTE_TYPE_F32, &count);
+    return (data && count == md_attribute_element_count(&attr->format)) ? data : nullptr;
+}
+
+// The times of a series' frame axis in the unit of the run's (the timeline's): the run's own in place, another axis in
+// place when it holds them as they are (an energy file's in ps beside a trajectory in ps), converted otherwise. Frames
+// numbered place only against frames numbered: a run without time has nothing to put a picosecond on, and an axis
+// without time nothing to put on a run with it. NULL then, and when the axis cannot be read.
+static const double* timeline_times(ApplicationState* app, const md_attributes_t* table, const md_attribute_t* axis, size_t* out_count) {
+    const md_attribute_t* run_axis = run_time_axis(app);
+    if (run_axis && md_attribute_same_data(axis, run_axis)) {
+        *out_count = run_num_frames(app);
+        return run_frame_times(app);
+    }
+    const md_unit_t run_unit = run_time_unit(app);
+    if (md_unit_is_none(run_unit) != md_unit_is_none(axis->unit)) return nullptr;
+    if (md_unit_equal(run_unit, axis->unit)) {
+        if (const double* t = (const double*)md_attribute_view(axis, MD_ATTRIBUTE_TYPE_F64, 1, 1)) {
+            *out_count = axis->format.shape[0];
+            return t;
+        }
+    }
+    return (const double*)cache_convert(app, table, axis, run_unit, MD_ATTRIBUTE_TYPE_F64, out_count);
+}
+
+// The slot of the script property under key, as it is now. NULL while there is none: not asked for, or not a
+// distribution or a volume. The values stay put until the slot is next read. A period's slot is asked for by what shows
+// it (series_period_slot), and let go when nothing has read it for a while (series_cache_gc).
+static const SlotEntry* series_slot(ApplicationState* app, uint64_t key, md_str_t ident) {
+    const script::Eval* eval = app->script.eval;
+    script::AggregateInfo info;
+    if (!eval || md_str_empty(ident) || !script::aggregate_info(&info, eval, key, ident)) return nullptr;
+
+    SlotEntry* entry = nullptr;
+    for (size_t i = 0; i < md_array_size(slot_cache); ++i) {
+        if (slot_cache[i].key == key && md_str_eq(md_str_from_cstr(slot_cache[i].ident), ident)) {
+            entry = &slot_cache[i];
+            break;
+        }
+    }
+    if (!entry) {
+        md_array_push(slot_cache, SlotEntry{}, app->allocator.persistent);
+        entry = &slot_cache[md_array_size(slot_cache) - 1];
+        entry->key = key;
+        md_str_copy_to_char_buf(entry->ident, sizeof(entry->ident), ident);
+    }
+    entry->last_used = ImGui::GetFrameCount();
+
+    if (entry->version != info.version || md_array_size(entry->values) != info.num_values) {
+        md_array_resize(entry->values,  info.num_values, app->allocator.persistent);
+        md_array_resize(entry->weights, info.num_values, app->allocator.persistent);
+        if (!script::aggregate_read(&entry->info, entry->values, entry->weights, info.num_values, eval, key, ident)) {
+            entry->version = 0;
+            return nullptr;
+        }
+        entry->version = entry->info.version;
+    }
+    return entry;
+}
+
+// The slot of a script property over a period, asked for over the frames [beg, end[ it covers now: moved, the period
+// takes its slot along, and the slot keeps what it has in common with its new frames
+static const SlotEntry* series_period_slot(ApplicationState* app, md_str_t ident, uint32_t period, uint32_t beg, uint32_t end) {
+    const md_bitset_t frames = md_bitset_range(beg, end);
+    if (!app->script.eval || !script::aggregate_request(app->script.eval, SCRIPT_SLOT_PERIOD(period), ident, &frames)) return nullptr;
+    return series_slot(app, SCRIPT_SLOT_PERIOD(period), ident);
+}
+
+void series_cache_gc(ApplicationState* app) {
+    // Several seconds unused: nothing draws it any more
+    const int frame = ImGui::GetFrameCount();
+    for (size_t i = 0; i < md_array_size(convert_cache);) {
+        if (frame - convert_cache[i].last_used > 600) {
+            md_array_free(convert_cache[i].data, app->allocator.persistent);
+            md_array_swap_back_and_pop(convert_cache, i);
+        } else {
+            ++i;
+        }
+    }
+    for (size_t i = 0; i < md_array_size(histogram_cache);) {
+        if (frame - histogram_cache[i].last_used > 600) {
+            md_array_free(histogram_cache[i].bins, app->allocator.persistent);
+            md_array_swap_back_and_pop(histogram_cache, i);
+        } else {
+            ++i;
+        }
+    }
+    for (size_t i = 0; i < md_array_size(bandwidth_cache);) {
+        if (frame - bandwidth_cache[i].last_used > 600) {
+            md_array_free(bandwidth_cache[i].h, app->allocator.persistent);
+            md_array_swap_back_and_pop(bandwidth_cache, i);
+        } else {
+            ++i;
+        }
+    }
+    for (size_t i = 0; i < md_array_size(slot_cache);) {
+        if (frame - slot_cache[i].last_used > 600) {
+            if (app->script.eval) {
+                // Nothing shows it any more
+                script::aggregate_release(app->script.eval, slot_cache[i].key, md_str_from_cstr(slot_cache[i].ident));
+            }
+            md_array_free(slot_cache[i].values,  app->allocator.persistent);
+            md_array_free(slot_cache[i].weights, app->allocator.persistent);
+            md_array_swap_back_and_pop(slot_cache, i);
+        } else {
+            ++i;
+        }
+    }
+}
+
+void series_cache_free(ApplicationState* app) {
+    for (size_t i = 0; i < md_array_size(convert_cache); ++i) {
+        md_array_free(convert_cache[i].data, app->allocator.persistent);
+    }
+    md_array_free(convert_cache, app->allocator.persistent);
+    convert_cache = nullptr;
+
+    for (size_t i = 0; i < md_array_size(histogram_cache); ++i) {
+        md_array_free(histogram_cache[i].bins, app->allocator.persistent);
+    }
+    md_array_free(histogram_cache, app->allocator.persistent);
+    histogram_cache = nullptr;
+
+    for (size_t i = 0; i < md_array_size(bandwidth_cache); ++i) {
+        md_array_free(bandwidth_cache[i].h, app->allocator.persistent);
+    }
+    md_array_free(bandwidth_cache, app->allocator.persistent);
+    bandwidth_cache = nullptr;
+
+    for (size_t i = 0; i < md_array_size(slot_cache); ++i) {
+        md_array_free(slot_cache[i].values,  app->allocator.persistent);
+        md_array_free(slot_cache[i].weights, app->allocator.persistent);
+    }
+    md_array_free(slot_cache, app->allocator.persistent);
+    slot_cache = nullptr;
+}
+
+// ## What a series can be shown as
+
+uint32_t series_views(const ApplicationState* app, const SeriesKey& key, const char** out_reason) {
+    const char* reason_buf = nullptr;
+    const char** reason = out_reason ? out_reason : &reason_buf;
+    *reason = nullptr;
+
+    const md_attributes_t* table = series_table(app, key.source, md_str_from_cstr(key.path));
+    const md_attribute_t* attr = table ? md_attributes_find(table, md_str_from_cstr(key.path)) : nullptr;
+    if (!attr) {
+        *reason = "Nothing is published at this path";
+        return 0;
+    }
+    if (attr->format.type == MD_ATTRIBUTE_TYPE_STR) {
+        *reason = "Text, not numbers";
+        return 0;
+    }
+
+    const bool temporal = attr->flags & MD_ATTRIBUTE_FLAG_TEMPORAL;
+    if (temporal) {
+        if (!attribute_numeric_resident(attr)) {
+            *reason = "Produced on demand, a frame at a time: showing it would produce every frame";
+            return 0;
+        }
+        if (md_attributes_axis(table, attr) == attr) {
+            *reason = "A frame axis: the time the others are sampled at";
+            return 0;
+        }
+
+        uint32_t views = SeriesView_Distribution;
+        const size_t n = attr->format.shape[0];
+        if (is_script(key.source)) {
+            // Over a period it is the same over time, so only the one over every frame is offered for that
+            if (key.period == 0 && n == run_num_frames(app)) views |= SeriesView_Timeline;
+        } else {
+            // What series_resolve_temporal needs of the axis, short of converting it
+            const md_attribute_t* axis = md_attributes_axis(table, attr);
+            const md_attribute_t* run_axis = run_time_axis(app);
+            if (axis && axis->format.shape[0] == n) {
+                if ((run_axis && md_attribute_same_data(axis, run_axis)) ||
+                    md_unit_is_none(run_time_unit(app)) == md_unit_is_none(axis->unit)) {
+                    views |= SeriesView_Timeline;
+                }
+            }
+        }
+        if (!(views & SeriesView_Timeline) && key.period == 0) {
+            *reason = "Its frame axis cannot be placed on the timeline (no trajectory, or time without a unit on one side)";
+        }
+        return views;
+    }
+
+    if (is_script(key.source) && (script_property_kind(app, key) & script::OUTPUT_DISTRIBUTION) && attribute_numeric_resident(attr)) {
+        if (attr->format.rank != 1) {
+            *reason = "An array of distributions, [n][bins]: not plotted yet";
+            return 0;
+        }
+        return SeriesView_Distribution;
+    }
+
+    *reason = "Not sampled over time, and not a distribution";
+    return 0;
+}
+
+// ## Over time
+
+bool series_resolve_temporal(SeriesTemporalView* out, ApplicationState* app, const SeriesKey& key) {
+    MD_ASSERT(out && app);
+    *out = SeriesTemporalView{};
+    fill_names(out, app, key);
+
+    if (key.variant >= SeriesVariant_Count || key.variant == SeriesVariant_Aggregate || key.path[0] == '\0') return false;
+    // Over a period it is the same over time: shown over every frame
+    if (key.period != 0) return false;
+
+    const md_str_t path = md_str_from_cstr(key.path);
+    const md_attributes_t* table = series_table(app, key.source, path);
+    if (!table) return false;
+
+    const md_attribute_t* attr = md_attributes_find(table, path);
+    if (!attribute_temporal(attr)) return false;
+
+    // What is drawn, and for a band around a centre, what spreads it
+    const md_attribute_t* src  = attr;
+    const md_attribute_t* src2 = nullptr;
+    switch (key.variant) {
+    case SeriesVariant_Mean:
+        src = md_attributes_find_in(table, path, md_str_from_cstr(variant_leaf[SeriesVariant_Mean]));
+        break;
+    case SeriesVariant_Sigma:
+        src  = md_attributes_find_in(table, path, md_str_from_cstr(variant_leaf[SeriesVariant_Mean]));
+        src2 = md_attributes_find_in(table, path, md_str_from_cstr(variant_leaf[SeriesVariant_Sigma]));
+        if (!attribute_temporal(src2)) return false;
+        break;
+    case SeriesVariant_Extent:
+        src = md_attributes_find_in(table, path, md_str_from_cstr(variant_leaf[SeriesVariant_Extent]));
+        break;
+    default:
+        break;
+    }
+    if (!attribute_temporal(src)) return false;
+
+    const size_t n = src->format.shape[0];
+    const size_t stride = md_attribute_element_count(&src->format) / n;
+    if (src2 && md_attribute_element_count(&src2->format) != n) return false;
+    if (key.variant == SeriesVariant_Extent && stride != 2) return false;
+    if ((key.variant == SeriesVariant_Mean || key.variant == SeriesVariant_Sigma) && stride != 1) return false;
+
+    // Shown in the display unit of the values themselves. The variance is in their square and is
+    // read through its square root, so the same factor applies to the band.
+    md_unit_t shown;
+    out->y_scale = (float)display_units::factor(&shown, attr->unit);
+    display_units::print(out->unit_str, sizeof(out->unit_str), shown);
+    series_periodic(&out->periodic, app, key, out->y_scale);
+
+    // ### x
+    const double* x = nullptr;
+    if (is_script(key.source)) {
+        // Evaluated over the run's frames, so its axis is the timeline's
+        if (n != run_num_frames(app)) return false;
+        x = run_frame_times(app);
+    } else {
+        const md_attribute_t* axis = md_attributes_axis(table, src);
+        if (!axis || axis->format.shape[0] != n) return false;
+        size_t count = 0;
+        x = timeline_times(app, table, axis, &count);
+        if (!x || count != n) return false;
+    }
+
+    // ### y
+    const float* y  = attribute_floats(app, table, src);
+    const float* y2 = src2 ? attribute_floats(app, table, src2) : nullptr;
+    if (!y || (src2 && !y2)) return false;
+
+    out->x = x;
+    out->y = y;
+    out->y2 = y2;
+    out->num_samples = (int)n;
+    out->stride = (int)stride;
+
+    switch (key.variant) {
+    case SeriesVariant_Values:
+        out->dim = (int)MD_MIN(stride, (size_t)PLOT_MAX_POPULATION);
+        break;
+    case SeriesVariant_Mean:
+        out->dim = 1;
+        break;
+    case SeriesVariant_Sigma:
+    case SeriesVariant_Extent:
+        out->dim  = 1;
+        out->band = true;
+        break;
+    default:
+        return false;
+    }
+    return true;
+}
+
+void series_temporal_band(const SeriesTemporalView& v, int i, double* lo, double* hi) {
+    if (v.y2) {
+        const double mean = v.y[i];
+        const double sd   = sqrt(MD_MAX(0.0, (double)v.y2[i]));
+        *lo = (mean - sd) * v.y_scale;
+        *hi = (mean + sd) * v.y_scale;
+    } else {
+        *lo = v.y[(size_t)i * v.stride + 0] * v.y_scale;
+        *hi = v.y[(size_t)i * v.stride + 1] * v.y_scale;
+    }
+}
+
+double series_temporal_index_at(const SeriesTemporalView& v, double x) {
+    return (v.num_samples > 0 && v.x) ? frame_at_time(v.x, (size_t)v.num_samples, x) : 0.0;
+}
+
+int series_temporal_print_value(char* buf, size_t cap, const SeriesTemporalView& v, int i, int k) {
+    if (i < 0 || i >= v.num_samples) return snprintf(buf, cap, "-");
+    if (v.band) {
+        double lo, hi;
+        series_temporal_band(v, i, &lo, &hi);
+        if (v.y2) {
+            return snprintf(buf, cap, "%.4g +- %.4g", 0.5 * (lo + hi), 0.5 * (hi - lo));
+        }
+        if (series_periodic_valid(v.periodic)) {
+            // The arc from lo around to hi, which may cross the end of the period: both as the values are given
+            const double len = series_periodic_length(v.periodic);
+            const double a = lo - len * floor((lo - v.periodic.beg) / len);
+            const double b = hi - len * floor((hi - v.periodic.beg) / len);
+            return snprintf(buf, cap, "%.4g .. %.4g", a, b);
+        }
+        return snprintf(buf, cap, "%.4g .. %.4g", lo, hi);
+    }
+    return snprintf(buf, cap, "%.4g", series_temporal_point(v, i, k).y);
+}
+
+// ## As a distribution
+
+// x moved by whole periods of length len into [beg, beg + len[
+static inline double wrap_periodic(double x, double beg, double len) {
+    const double t = x - beg;
+    return beg + (t - len * floor(t / len));
+}
+
+// The bandwidth of a Gaussian kernel density estimate of n values whose density is binned in bins (num_bins over
+// [lo, hi]): Silverman's rule of thumb, 0.9 min(sd, IQR / 1.34) n^(-1/5), from the bins themselves. Of periodic values,
+// [lo, hi[ the period, from the circular standard deviation.
+static double kde_bandwidth(const float* bins, int num_bins, double lo, double hi, size_t n, bool periodic) {
+    const double w = (hi - lo) / num_bins;
+    double mass = 0.0;
+    for (int b = 0; b < num_bins; ++b) mass += bins[b];
+    if (mass <= 0.0 || n == 0) return 0.0;
+
+    double sd = 0.0, iqr = 0.0;
+    if (periodic) {
+        double c = 0.0, s = 0.0;
+        for (int b = 0; b < num_bins; ++b) {
+            const double a = 2.0 * MD_PI * (b + 0.5) / num_bins;
+            c += bins[b] * cos(a);
+            s += bins[b] * sin(a);
+        }
+        const double R = sqrt(c * c + s * s) / mass;
+        sd = (R > 0.0 ? sqrt(MD_MIN(-2.0 * log(R), MD_PI * MD_PI)) : MD_PI) * (hi - lo) / (2.0 * MD_PI);
+    } else {
+        double mean = 0.0;
+        for (int b = 0; b < num_bins; ++b) mean += bins[b] * (lo + (b + 0.5) * w);
+        mean /= mass;
+        double var = 0.0;
+        for (int b = 0; b < num_bins; ++b) {
+            const double d = lo + (b + 0.5) * w - mean;
+            var += bins[b] * d * d;
+        }
+        sd = sqrt(var / mass);
+        // The quartiles, interpolated within the bin they fall in
+        double q[2] = {lo, hi};
+        const double at[2] = {0.25 * mass, 0.75 * mass};
+        double cum = 0.0;
+        int qi = 0;
+        for (int b = 0; b < num_bins && qi < 2; ++b) {
+            while (qi < 2 && cum + bins[b] >= at[qi]) {
+                q[qi] = lo + (b + (bins[b] > 0.0f ? (at[qi] - cum) / bins[b] : 0.0)) * w;
+                qi += 1;
+            }
+            cum += bins[b];
+        }
+        iqr = q[1] - q[0];
+    }
+    const double spread = (iqr > 0.0) ? MD_MIN(sd, iqr / 1.34) : sd;
+    return 0.9 * spread * pow((double)n, -0.2);
+}
+
+// Convolves the bins with a Gaussian of standard deviation sigma bins. Around the period for periodic values, which then
+// lose nothing over the ends. Otherwise each bin is divided by the part of the kernel which falls within the range (the
+// cut-and-normalize correction): without it the density falls off towards the ends of the range, where the kernel
+// reaches out past them over values there are none of.
+static void gaussian_smooth(float* bins, int num_bins, double sigma, bool periodic) {
+    if (sigma < 0.25 || num_bins < 2) return;
+    const int r = MD_MIN((int)ceil(4.0 * sigma), num_bins);
+    md_temp_scope_t temp = md_temp_begin();
+    float* kernel = md_temp_alloc_array(temp, float, 2 * r + 1);
+    float* src    = md_temp_alloc_array(temp, float, num_bins);
+    double ksum = 0.0;
+    for (int i = -r; i <= r; ++i) {
+        kernel[i + r] = (float)exp(-0.5 * (i / sigma) * (i / sigma));
+        ksum += kernel[i + r];
+    }
+    for (int i = 0; i <= 2 * r; ++i) kernel[i] = (float)(kernel[i] / ksum);
+    md_memcpy(src, bins, sizeof(float) * num_bins);
+    for (int b = 0; b < num_bins; ++b) {
+        double acc = 0.0;
+        double within = 0.0;
+        for (int i = -r; i <= r; ++i) {
+            int s = b + i;
+            if (periodic) {
+                s %= num_bins;
+                if (s < 0) s += num_bins;
+            } else if (s < 0 || s >= num_bins) {
+                continue;
+            }
+            acc += kernel[i + r] * src[s];
+            within += kernel[i + r];
+        }
+        bins[b] = (float)(periodic ? acc : (within > 0.0 ? acc / within : 0.0));
+    }
+    md_temp_end(temp);
+}
+
+// Density of values[f * stride + k] over the frames f in mask (all num_frames without one), per
+// member k or over all of them at once, and how many values each counts (count, dim_out). Values outside
+// [lo, hi] are not counted; periodic values in [lo, hi[, the period, are all counted, moved into it by
+// whole periods. Not smoothed (smooth_temporal).
+static void bin_temporal(float* bins, size_t* count, int num_bins, int dim_out, double lo, double hi, const float* values, size_t num_frames, size_t stride,
+                         const md_bitset_t* mask, bool periodic) {
+    const bool aggregate = dim_out == 1 && stride > 1;
+    md_memset(bins, 0, sizeof(float) * (size_t)num_bins * dim_out);
+    md_memset(count, 0, sizeof(size_t) * dim_out);
+
+    const double inv_range = hi > lo ? 1.0 / (hi - lo) : 0.0;
+    auto add_frame = [&](size_t f) {
+        const float* row = values + f * stride;
+        const size_t members = aggregate ? stride : (size_t)dim_out;
+        for (size_t k = 0; k < members; ++k) {
+            double val = row[k];
+            if (periodic) {
+                if (!(val == val)) continue;   // a frame not evaluated
+                val = wrap_periodic(val, lo, hi - lo);
+            } else if (!(lo <= val && val <= hi)) {
+                continue;
+            }
+            const int b = MD_CLAMP((int)((val - lo) * inv_range * num_bins), 0, num_bins - 1);
+            const size_t d = aggregate ? 0 : k;
+            bins[d * num_bins + b] += 1.0f;
+            count[d] += 1;
+        }
+    };
+
+    if (mask) {
+        md_bitset_iter_t it = md_bitset_iter(*mask);
+        while (md_bitset_iter_next(&it)) {
+            const size_t f = it.idx;
+            if (f >= num_frames) break;
+            add_frame(f);
+        }
+    } else {
+        for (size_t f = 0; f < num_frames; ++f) {
+            add_frame(f);
+        }
+    }
+
+    const double width = (hi - lo) / num_bins;
+    for (int d = 0; d < dim_out; ++d) {
+        if (count[d] == 0 || width <= 0.0) continue;
+        const float scl = (float)(1.0 / (width * count[d]));
+        for (int b = 0; b < num_bins; ++b) {
+            bins[d * num_bins + b] *= scl;
+        }
+    }
+}
+
+// The binned densities (bin_temporal) made kernel density estimates: member d smoothed with a Gaussian of standard
+// deviation h[d], in the unit of [lo, hi]
+static void smooth_temporal(float* bins, int num_bins, int dim_out, double lo, double hi, const double* h, bool periodic) {
+    const double width = (hi - lo) / num_bins;
+    if (width <= 0.0) return;
+    for (int d = 0; d < dim_out; ++d) {
+        if (h[d] > 0.0) gaussian_smooth(bins + (size_t)d * num_bins, num_bins, h[d] / width, periodic);
+    }
+}
+
+// The bandwidths of a property (BandwidthEntry), binned as its curves are: over [lo, hi] in num_bins, of the frames in
+// mask (all without one), dim of them. key names the property and how it is binned, version its values and the frames.
+static const double* reference_bandwidths(ApplicationState* app, uint64_t key, const md_attributes_t* table, uint64_t version, int num_bins, int dim,
+                                          double lo, double hi, const float* values, size_t num_frames, size_t stride, const md_bitset_t* mask, bool periodic) {
+    BandwidthEntry* e = nullptr;
+    for (size_t i = 0; i < md_array_size(bandwidth_cache); ++i) {
+        if (bandwidth_cache[i].key == key && bandwidth_cache[i].table == table) {
+            e = &bandwidth_cache[i];
+            break;
+        }
+    }
+    if (!e) {
+        md_array_push(bandwidth_cache, BandwidthEntry{}, app->allocator.persistent);
+        e = &bandwidth_cache[md_array_size(bandwidth_cache) - 1];
+        e->key = key;
+        e->table = table;
+        e->version = ~version;
+    }
+    e->last_used = ImGui::GetFrameCount();
+    if (e->version != version || md_array_size(e->h) != (size_t)dim) {
+        e->version = version;
+        md_array_resize(e->h, (size_t)dim, app->allocator.persistent);
+        md_temp_scope_t temp = md_temp_begin();
+        float*  bins  = md_temp_alloc_array(temp, float, (size_t)num_bins * dim);
+        size_t* count = md_temp_alloc_array(temp, size_t, (size_t)dim);
+        bin_temporal(bins, count, num_bins, dim, lo, hi, values, num_frames, stride, mask, periodic);
+        for (int d = 0; d < dim; ++d) {
+            e->h[d] = kde_bandwidth(bins + (size_t)d * num_bins, num_bins, lo, hi, count[d], periodic);
+        }
+        md_temp_end(temp);
+    }
+    return e->h;
+}
+
+// A distribution evaluated at num_src bins, averaged down to num_dst (a divisor of it): each
+// destination bin is the weighted mean of the source bins it covers
+static void downsample_bins(float* dst, int num_dst, const float* src, const float* weights, int num_src) {
+    const int factor = MD_MAX(1, num_src / num_dst);
+    for (int d = 0; d < num_dst; ++d) {
+        double sum = 0.0;
+        double weight = 0.0;
+        for (int i = 0; i < factor; ++i) {
+            const int s = d * factor + i;
+            if (s >= num_src) break;
+            sum    += src[s];
+            weight += weights ? weights[s] : 1.0;
+        }
+        dst[d] = weight > 0.0 ? (float)(sum / weight) : 0.0f;
+    }
+}
+
+// A (min, max) pair: rank 0 with two components, as the script publishes it, or two values of any shape
+static bool read_range(double out[2], const md_attributes_t* table, const md_attribute_t* range) {
+    if (!range || !range->data || range->format.type == MD_ATTRIBUTE_TYPE_NONE || range->format.type == MD_ATTRIBUTE_TYPE_STR) return false;
+    if (md_attribute_element_count(&range->format) != 2) return false;
+    return md_attribute_extract_f64(out, 2, table, range, md_attribute_slice_all(), md_unit_none()) == 2 && out[1] > out[0];
+}
+
+// ## Periodic values
+
+bool series_periodic_equal(const SeriesPeriodic& a, const SeriesPeriodic& b) {
+    const double tol = 1.0e-5 * MD_MAX(series_periodic_length(a), series_periodic_length(b));
+    return fabs(a.beg - b.beg) <= tol && fabs(a.end - b.end) <= tol;
+}
+
+// The period and seam published beside the values at path, in their stored unit
+static bool read_periodic(SeriesPeriodic* out, const md_attributes_t* table, md_str_t path) {
+    *out = SeriesPeriodic{};
+    double range[2];
+    if (!table || !read_range(range, table, md_attributes_find_in(table, path, MD_STR_LIT("period")))) return false;
+    double seam = range[0];
+    const md_attribute_t* s = md_attributes_find_in(table, path, MD_STR_LIT("seam"));
+    if (s && s->data && md_attribute_type_is_numeric(s->format.type) && md_attribute_element_count(&s->format) == 1) {
+        md_attribute_extract_f64(&seam, 1, table, s, md_attribute_slice_all(), md_unit_none());
+    }
+    out->beg  = range[0];
+    out->end  = range[1];
+    out->seam = wrap_periodic(seam, range[0], range[1] - range[0]);
+    return true;
+}
+
+bool series_periodic(SeriesPeriodic* out, const ApplicationState* app, const SeriesKey& key, double scale) {
+    MD_ASSERT(out);
+    const md_str_t path = md_str_from_cstr(key.path);
+    if (!(scale > 0.0) || !read_periodic(out, series_table(app, key.source, path), path)) {
+        *out = SeriesPeriodic{};
+        return false;
+    }
+    out->beg  *= scale;
+    out->end  *= scale;
+    out->seam *= scale;
+    return true;
+}
+
+bool series_period_frames(uint32_t* beg, uint32_t* end, const ApplicationState* app, const SeriesKey& key, uint32_t period) {
+    const uint32_t num_frames = app->script.eval ? (uint32_t)script::eval_num_frames(app->script.eval) : (uint32_t)run_num_frames(app);
+    if (num_frames == 0) return false;
+    // The key's own: every frame, or its period's
+    if (period == 0) period = key.period;
+    if (period == 0) {
+        *beg = 0;
+        *end = num_frames;
+        return true;
+    }
+    const TimelinePeriod* r = timeline_periods_find(&app->timeline.periods, period);
+    int b = 0, e = 0;
+    if (!r || !timeline_period_frames(&b, &e, *r, app->animation.frame, (int)num_frames)) return false;
+    *beg = (uint32_t)b;
+    *end = (uint32_t)e + 1;
+    return true;
+}
+
+bool series_resolve_histogram(SeriesHistogramView* out, ApplicationState* app, const SeriesKey& key, int num_bins, uint32_t period, float smoothing) {
+    MD_ASSERT(out && app);
+    *out = SeriesHistogramView{};
+    fill_names(out, app, key);
+
+    if (key.path[0] == '\0') return false;
+    if (key.variant != SeriesVariant_Values && key.variant != SeriesVariant_Aggregate) return false;
+    // Over a period, the one asked for or the key's own: a script property's frames, which are the trajectory's
+    if (period == 0) period = key.period;
+    if (period != 0 && !is_script(key.source)) return false;
+    uint32_t period_beg = 0, period_end = 0;
+    if (period != 0 && !series_period_frames(&period_beg, &period_end, app, key, period)) return false;
+
+    const md_str_t path = md_str_from_cstr(key.path);
+    const md_attributes_t* table = series_table(app, key.source, path);
+    if (!table) return false;
+
+    const md_attribute_t* attr = md_attributes_find(table, path);
+    if (!attribute_numeric_resident(attr)) return false;
+
+    const bool temporal     = attribute_temporal(attr);
+    const bool distribution = !temporal && (script_property_kind(app, key) & script::OUTPUT_DISTRIBUTION);
+    if (!temporal && !distribution) return false;
+
+    const md_attribute_t* weight = distribution ? md_attributes_find_in(table, path, MD_STR_LIT("weight")) : nullptr;
+    if (weight && (!attribute_numeric_resident(weight) || md_attribute_element_count(&weight->format) != md_attribute_element_count(&attr->format))) {
+        weight = nullptr;
+    }
+
+    const size_t n = attr->format.shape[0];
+    const size_t stride = md_attribute_element_count(&attr->format) / n;
+
+    int dim = 1;
+    if (temporal) {
+        dim = (key.variant == SeriesVariant_Aggregate) ? 1 : (int)MD_MIN(stride, (size_t)PLOT_MAX_POPULATION);
+        num_bins = MD_CLAMP(num_bins, 2, 4096);
+    } else {
+        // Evaluated at a resolution of its own; only coarser is on offer
+        if (stride != 1 || key.variant != SeriesVariant_Values) return false;
+        num_bins = MD_CLAMP(num_bins, 1, (int)n);
+        while (n % (size_t)num_bins) --num_bins;
+    }
+
+    // What is binned: a temporal attribute over the frames that count (the frames the evaluation holds, of the period's),
+    // a distribution as published, or over the period's frames as its slot holds it. A period's slot is asked for here,
+    // for the frames the period covers now: moved, the period takes its slot along.
+    md_bitset_t frames = md_bitset_empty_set();
+    md_bitset_t held = md_bitset_empty_set();
+    const md_bitset_t* mask = nullptr;
+    const md_bitset_t* held_mask = nullptr;     // every frame the evaluation holds, which the bandwidth is of
+    if (temporal) {
+        SeriesKey over = key;
+        over.period = 0;
+        if (series_frame_mask(&frames, app, over, app->allocator.frame)) {
+            held = frames;
+            held_mask = &held;
+            if (period != 0) frames = md_bitset_and(frames, md_bitset_range(period_beg, period_end), app->allocator.frame);
+            mask = &frames;
+        }
+    }
+    const SlotEntry* slot = nullptr;
+    if (distribution && period != 0) {
+        slot = series_period_slot(app, series_script_ident(key), period, period_beg, period_end);
+        if (!slot || md_array_size(slot->values) != md_attribute_element_count(&attr->format)) return false;
+    }
+
+    // Periodic values are binned over their period, around which they are all counted (and smoothed)
+    SeriesPeriodic periodic = {};
+    if (temporal) read_periodic(&periodic, table, path);
+    const bool is_periodic = series_periodic_valid(periodic);
+    // A script distribution is shown as evaluated
+    if (!temporal) smoothing = 0.0f;
+    smoothing = MD_MAX(smoothing, 0.0f);
+
+    // ### Cached bins
+    uint64_t hkey = md_hash64_str(path, (uint64_t)key.source * 31 + key.variant);
+    hkey = md_hash64(&num_bins, sizeof(num_bins), hkey);
+    hkey = md_hash64(&periodic, sizeof(periodic), hkey);
+    // The property binned so, whichever period: what its bandwidths are of
+    const uint64_t bw_key = hkey;
+    hkey = md_hash64(&period, sizeof(period), hkey);
+    hkey = md_hash64(&smoothing, sizeof(smoothing), hkey);
+    // Of what is binned: the values and weights, and which frames count
+    uint64_t version = slot ? slot->version : attr->version + (weight ? weight->version << 1 : 0);
+    const uint64_t bw_version = held_mask ? md_bitset_hash64(*held_mask, attr->version) : attr->version;
+    if (mask) version = md_bitset_hash64(*mask, version);
+    // Smoothed, also of every frame held: the bandwidth is of those
+    if (smoothing > 0.0f) version = md_hash64(&bw_version, sizeof(bw_version), version);
+
+    const int frame = ImGui::GetFrameCount();
+    HistogramEntry* entry = nullptr;
+    for (size_t i = 0; i < md_array_size(histogram_cache); ++i) {
+        if (histogram_cache[i].key == hkey && histogram_cache[i].table == table) {
+            entry = &histogram_cache[i];
+            break;
+        }
+    }
+    if (!entry) {
+        md_array_push(histogram_cache, HistogramEntry{}, app->allocator.persistent);
+        entry = &histogram_cache[md_array_size(histogram_cache) - 1];
+        entry->key = hkey;
+        entry->table = table;
+        entry->version = ~version;
+    }
+    entry->last_used = frame;
+
+    if (entry->version != version) {
+        entry->version = version;
+        entry->valid = false;
+        entry->num_bins = num_bins;
+        entry->dim = dim;
+        md_array_resize(entry->bins, (size_t)num_bins * dim, app->allocator.persistent);
+
+        const float* values = slot ? slot->values : attribute_floats(app, table, attr);
+        if (values) {
+            double range[2] = {0, 0};
+            bool has_range = read_range(range, table, md_attributes_find_in(table, path, MD_STR_LIT("range")));
+            if (is_periodic) {
+                range[0] = periodic.beg;
+                range[1] = periodic.end;
+                has_range = true;
+            }
+            if (temporal) {
+                if (!has_range) {
+                    // The range the values cover, over the frames that count
+                    double lo = DBL_MAX, hi = -DBL_MAX;
+                    for (size_t i = 0; i < n * stride; ++i) {
+                        const double v = values[i];
+                        if (v == v) { lo = MD_MIN(lo, v); hi = MD_MAX(hi, v); }
+                    }
+                    if (lo > hi) { lo = 0; hi = 1; }
+                    if (hi <= lo) { const double pad = MD_MAX(fabs(lo) * 1e-3, 1e-6); lo -= pad; hi += pad; }
+                    range[0] = lo;
+                    range[1] = hi;
+                }
+                md_temp_scope_t temp = md_temp_begin();
+                size_t* count = md_temp_alloc_array(temp, size_t, (size_t)dim);
+                bin_temporal(entry->bins, count, num_bins, dim, range[0], range[1], values, n, stride, mask, is_periodic);
+                md_temp_end(temp);
+                entry->bandwidth_min = entry->bandwidth_max = 0.0;
+                if (smoothing > 0.0f) {
+                    const double* ref = reference_bandwidths(app, bw_key, table, bw_version, num_bins, dim, range[0], range[1], values, n, stride, held_mask, is_periodic);
+                    double h[PLOT_MAX_POPULATION];
+                    double h_min = DBL_MAX, h_max = 0.0;
+                    for (int d = 0; d < dim; ++d) {
+                        h[d] = smoothing * ref[d];
+                        if (h[d] > 0.0) { h_min = MD_MIN(h_min, h[d]); h_max = MD_MAX(h_max, h[d]); }
+                    }
+                    smooth_temporal(entry->bins, num_bins, dim, range[0], range[1], h, is_periodic);
+                    if (h_max > 0.0) {
+                        entry->bandwidth_min = h_min;
+                        entry->bandwidth_max = h_max;
+                    }
+                }
+                entry->valid = true;
+            } else if (has_range) {
+                const float* w = slot ? slot->weights : weight ? attribute_floats(app, table, weight) : nullptr;
+                downsample_bins(entry->bins, num_bins, values, w, (int)n);
+                entry->valid = true;
+            }
+            entry->x_min = range[0];
+            entry->x_max = range[1];
+
+            float y_min = FLT_MAX, y_max = -FLT_MAX;
+            for (size_t i = 0; i < (size_t)num_bins * dim; ++i) {
+                y_min = MD_MIN(y_min, entry->bins[i]);
+                y_max = MD_MAX(y_max, entry->bins[i]);
+            }
+            entry->y_min = entry->valid ? y_min : 0.0f;
+            entry->y_max = entry->valid ? y_max : 0.0f;
+        }
+    }
+    if (!entry->valid) return false;
+
+    // ### Units
+    // A temporal attribute binned: its values along x, and along y a probability density, which is
+    // per unit of x and so rescales against it - it integrates to one in the unit it is shown in.
+    // A script distribution: its bin axis along x, and its own values along y.
+    double x_scl = 1.0;
+    double y_scl = 1.0;
+    if (distribution) {
+        const md_attribute_t* bin = md_attributes_find_in(table, path, MD_STR_LIT("bin"));
+        x_scl = display_units::factor_print(out->x_unit_str, sizeof(out->x_unit_str), bin ? bin->unit : md_unit_none());
+        y_scl = display_units::factor_print(out->y_unit_str, sizeof(out->y_unit_str), attr->unit);
+    } else {
+        x_scl = display_units::factor_print(out->x_unit_str, sizeof(out->x_unit_str), attr->unit);
+        y_scl = x_scl != 0.0 ? 1.0 / x_scl : 1.0;
+        if (out->x_unit_str[0] != '\0') {
+            // "1/nm", but "1/(kJ/mol)": a compound unit is inverted whole
+            const bool compound = strpbrk(out->x_unit_str, "/ *^") != nullptr;
+            snprintf(out->y_unit_str, sizeof(out->y_unit_str), compound ? "1/(%s)" : "1/%s", out->x_unit_str);
+        }
+    }
+
+    out->bins = entry->bins;
+    out->num_bins = entry->num_bins;
+    out->dim = entry->dim;
+    out->x_min = entry->x_min * x_scl;
+    out->x_max = entry->x_max * x_scl;
+    if (is_periodic && x_scl > 0.0) {
+        out->periodic.beg  = periodic.beg  * x_scl;
+        out->periodic.end  = periodic.end  * x_scl;
+        out->periodic.seam = periodic.seam * x_scl;
+    }
+    out->y_scale = y_scl;
+    out->y_min = entry->y_min * y_scl;
+    out->y_max = entry->y_max * y_scl;
+    out->bandwidth_min = entry->bandwidth_min * x_scl;
+    out->bandwidth_max = entry->bandwidth_max * x_scl;
+    return true;
+}
+
+bool series_resolve_histogram_periods(SeriesHistogramView* out, ApplicationState* app, const SeriesKey& key, int num_bins,
+                                      const uint32_t* periods, int num_periods, float smoothing) {
+    MD_ASSERT(out && app);
+    const bool over_periods = is_script(key.source) && (num_periods > 1 || (num_periods == 1 && periods[0] != 0));
+    if (!over_periods) {
+        return series_resolve_histogram(out, app, key, num_bins, 0, smoothing);
+    }
+
+    // A population is pooled: one curve per period, not one per member and period
+    SeriesKey k = key;
+    {
+        SeriesHistogramView probe;
+        if (series_resolve_histogram(&probe, app, key, num_bins) && probe.dim > 1) {
+            k.variant = SeriesVariant_Aggregate;
+        }
+    }
+
+    num_periods = MD_MIN(num_periods, PLOT_MAX_PERIODS);
+    SeriesHistogramView views[PLOT_MAX_PERIODS];
+    bool any = false;
+    int first = -1;
+    for (int p = 0; p < num_periods; ++p) {
+        const bool ok = series_resolve_histogram(&views[p], app, k, num_bins, periods[p], smoothing);
+        any |= ok;
+        if (ok && first < 0) first = p;
+    }
+
+    // Named as the series is, whichever resolved
+    *out = views[first >= 0 ? first : 0];
+    out->num_periods = num_periods;
+    out->dim = num_periods;
+    if (!any) {
+        out->bins = nullptr;
+        out->num_bins = 0;
+    }
+
+    // Every period binned alike: the bins of each, one after the other
+    const SeriesHistogramView& ref = views[first >= 0 ? first : 0];
+    float* bins = any ? (float*)md_alloc(app->allocator.frame, (size_t)ref.num_bins * num_periods * sizeof(float)) : nullptr;
+    double y_min = DBL_MAX, y_max = -DBL_MAX;
+    const script::Eval* eval = app->script.eval;
+    const md_str_t ident = series_script_ident(key);
+    const bool distribution = script_property_kind(app, key) & script::OUTPUT_DISTRIBUTION;
+    for (int p = 0; p < num_periods; ++p) {
+        SeriesPeriodInfo& info = out->periods[p];
+        info = SeriesPeriodInfo{};
+        info.id = periods[p];
+        const SeriesHistogramView& v = views[p];
+        info.valid = any && v.bins && v.num_bins == ref.num_bins && v.x_min == ref.x_min && v.x_max == ref.x_max;
+        if (bins) {
+            float* dst = bins + (size_t)p * ref.num_bins;
+            if (info.valid) {
+                md_memcpy(dst, v.bins, (size_t)ref.num_bins * sizeof(float));
+                y_min = MD_MIN(y_min, v.y_min);
+                y_max = MD_MAX(y_max, v.y_max);
+            } else {
+                md_memset(dst, 0, (size_t)ref.num_bins * sizeof(float));
+            }
+        }
+
+        // What it is called and coloured, and how much of it there is. The key's own period in the series' colour.
+        const uint32_t period = periods[p] != 0 ? periods[p] : key.period;
+        if (period == 0) {
+            snprintf(info.name, sizeof(info.name), "All frames");
+        } else if (const TimelinePeriod* r = timeline_periods_find(&app->timeline.periods, period)) {
+            snprintf(info.name, sizeof(info.name), "%s", r->name);
+            if (periods[p] != 0) {
+                info.color = ImVec4(r->color.x, r->color.y, r->color.z, r->color.w);
+                info.own_color = true;
+            }
+        }
+        uint32_t beg = 0, end = 0;
+        if (eval && series_period_frames(&beg, &end, app, key, period)) {
+            info.num_wanted = end - beg;
+            if (distribution && period != 0) {
+                script::AggregateInfo si;
+                if (script::aggregate_info(&si, eval, SCRIPT_SLOT_PERIOD(period), ident)) {
+                    // Of what it holds, what it wants (see series_state)
+                    const uint32_t both = (info.num_wanted + si.num_frames - MD_MIN(si.num_pending, info.num_wanted + si.num_frames)) / 2;
+                    info.num_frames = MD_MIN(both, info.num_wanted);
+                }
+            } else {
+                const md_bitset_t held = script::eval_output_frames(eval, ident, app->allocator.frame);
+                info.num_frames = (uint32_t)md_bitset_count(md_bitset_and(held, md_bitset_range(beg, end), app->allocator.frame));
+            }
+        }
+    }
+    out->bins = bins;
+    if (any) {
+        out->y_min = y_min;
+        out->y_max = y_max;
+    }
+    return any;
+}
+
+// ## Volumes
+
+// A volume is {x, y, z}, an array of n of them {n, x, y, z}: the member is a slice of the first axis. 0 for anything else.
+static uint32_t volume_shape(uint32_t dim[3], const md_attribute_t* attr) {
+    if (!attr || attr->format.type != MD_ATTRIBUTE_TYPE_F32 || attr->format.components != 1) return 0;
+    const uint32_t rank = attr->format.rank;
+    if (rank != 3 && rank != 4) return 0;
+    const uint32_t* shape = attr->format.shape + (rank - 3);
+    for (int i = 0; i < 3; ++i) {
+        if (dim) dim[i] = shape[i];
+    }
+    return rank == 4 ? attr->format.shape[0] : 1;
+}
+
+uint32_t series_volume_count(const ApplicationState* app, const SeriesKey& key) {
+    if (!is_script(key.source)) return 0;
+    const md_attributes_t* table = series_table(app, key.source, md_str_from_cstr(key.path));
+    return volume_shape(nullptr, table ? md_attributes_find(table, md_str_from_cstr(key.path)) : nullptr);
+}
+
+bool series_resolve_volume(SeriesVolumeView* out, ApplicationState* app, const SeriesKey& key, uint32_t member) {
+    MD_ASSERT(out && app);
+    *out = SeriesVolumeView{};
+    series_label(out->label, sizeof(out->label), app, key);
+    if (!is_script(key.source)) return false;
+    const md_str_t ident = series_script_ident(key);
+    md_str_copy_to_char_buf(out->script_ident, sizeof(out->script_ident), ident);
+    out->vis_ref = script::output_ref(app->script.eval_ir, ident);
+    out->state = series_state(app, key);
+
+    const md_attributes_t* table = series_table(app, key.source, md_str_from_cstr(key.path));
+    const md_attribute_t* attr = table ? md_attributes_find(table, md_str_from_cstr(key.path)) : nullptr;
+    if (!attr || !attr->data) return false;
+    out->count = volume_shape(out->dim, attr);
+    if (out->count == 0) return false;
+    out->member = MD_MIN(member, out->count - 1);
+    if (out->count > 1) {
+        // As the script names it: v[2]
+        if (key.period != 0) {
+            snprintf(out->label, sizeof(out->label), MD_STR_FMT "[%u] (%s)", MD_STR_ARG(ident), out->member + 1, series_period_name(app, key.period));
+        } else {
+            snprintf(out->label, sizeof(out->label), MD_STR_FMT "[%u]", MD_STR_ARG(ident), out->member + 1);
+        }
+    }
+    const size_t member_values = (size_t)out->dim[0] * out->dim[1] * out->dim[2];
+
+    const float* values = nullptr;
+    if (key.period != 0) {
+        // Over the period's frames: as its slot holds it, all of the volumes
+        uint32_t beg, end;
+        if (!key_period_frames(&beg, &end, app, key)) return false;
+        const SlotEntry* slot = series_period_slot(app, ident, key.period, beg, end);
+        if (!slot || md_array_size(slot->values) != md_attribute_element_count(&attr->format)) return false;
+        values = slot->values;
+        out->version = slot->version;
+    } else {
+        values = (const float*)attr->data;
+        out->version = attr->version;
+    }
+    out->data = values + out->member * member_values;
+
+    // Where its voxels are, and its bulk density, published beside it
+    char path[SERIES_PATH_CAP + 16];
+    double o[3], b[9], bulk;
+    snprintf(path, sizeof(path), "%s/origin", key.path);
+    const md_attribute_t* ao = md_attributes_find(table, md_str_from_cstr(path));
+    snprintf(path, sizeof(path), "%s/basis", key.path);
+    const md_attribute_t* ab = md_attributes_find(table, md_str_from_cstr(path));
+    if (ao && ab && md_attribute_extract_f64(o, 3, table, ao, md_attribute_slice_all(), ao->unit) == 3 &&
+        md_attribute_extract_f64(b, 9, table, ab, md_attribute_slice_all(), ab->unit) == 9) {
+        out->placed = true;
+        out->origin = md_float3_t{(float)o[0], (float)o[1], (float)o[2]};
+        for (int a = 0; a < 3; ++a) out->basis[a] = md_float3_t{(float)b[3 * a], (float)b[3 * a + 1], (float)b[3 * a + 2]};
+    }
+    snprintf(path, sizeof(path), "%s/bulk", key.path);
+    const md_attribute_t* ak = md_attributes_find(table, md_str_from_cstr(path));
+    if (ak && md_attribute_extract_f64(&bulk, 1, table, ak, md_attribute_slice_all(), ak->unit) == 1) out->bulk = bulk;
+    return true;
+}
+
+// ## Script properties
+
+size_t series_script_property_count(const ApplicationState* app) {
+    return app->script.eval_ir ? script::num_outputs(app->script.eval_ir) : 0;
+}
+
+bool series_script_property(SeriesKey* out, const ApplicationState* app, SeriesSource source, size_t index, uint32_t kind_flags) {
+    const script::Program* ir = app->script.eval_ir;
+    if (!ir || !is_script(source) || index >= script::num_outputs(ir)) return false;
+    const md_str_t name = script::output_names(ir)[index];
+    if (!(script::output_flags(ir, name) & kind_flags)) return false;
+
+    char path[SERIES_PATH_CAP];
+    const int len = snprintf(path, sizeof(path), MD_STR_FMT MD_STR_FMT, MD_STR_ARG(script_prefix), MD_STR_ARG(name));
+    if (len <= 0 || (size_t)len >= sizeof(path)) return false;
+
+    const md_attributes_t* table = series_table(app, source, md_str_t{path, (size_t)len});
+    if (!table) return false;
+    if (!md_attributes_find(table, md_str_t{path, (size_t)len})) return false;
+
+    *out = series_key(source, md_str_t{path, (size_t)len});
+    return true;
+}
+
+// ## Subplots
+
+// The key's own period is period 0: the frames of the key
+static uint32_t own_period(const PlotSeries& s, uint32_t id) {
+    return id == s.key.period ? 0 : id;
+}
+
+bool plot_series_has_period(const PlotSeries& s, uint32_t id) {
+    id = own_period(s, id);
+    for (int i = 0; i < s.num_periods; ++i) {
+        if (s.periods[i] == id) return true;
+    }
+    return false;
+}
+
+bool plot_series_add_period(PlotSeries& s, uint32_t id) {
+    id = own_period(s, id);
+    if (plot_series_has_period(s, id) || s.num_periods >= PLOT_MAX_PERIODS) return false;
+    s.periods[s.num_periods++] = id;
+    return true;
+}
+
+void plot_series_remove_period(PlotSeries& s, uint32_t id) {
+    id = own_period(s, id);
+    if (s.num_periods <= 1) return;
+    for (int i = 0; i < s.num_periods; ++i) {
+        if (s.periods[i] != id) continue;
+        for (int j = i + 1; j < s.num_periods; ++j) s.periods[j - 1] = s.periods[j];
+        s.periods[--s.num_periods] = 0;
+        return;
+    }
+}
+
+int plot_find_series(const PlotSubplot& sp, const SeriesKey& key) {
+    for (int i = 0; i < sp.count; ++i) {
+        if (series_key_equal(sp.series[i].key, key)) return i;
+    }
+    return -1;
+}
+
+int plot_add_series(const ApplicationState* app, PlotSubplot& sp, const SeriesKey& key) {
+    if (key.path[0] == '\0') return -1;
+    const int existing = plot_find_series(sp, key);
+    if (existing != -1) return existing;
+    if (sp.count >= PLOT_MAX_SERIES_PER_SUBPLOT) {
+        MD_LOG_INFO("A subplot holds at most %d series", PLOT_MAX_SERIES_PER_SUBPLOT);
+        return -1;
+    }
+    PlotSeries& s = sp.series[sp.count];
+    s = PlotSeries{};
+    s.key = key;
+    s.color = series_default_color(app, key);
+    s.population_mask.set();
+    return sp.count++;
+}
+
+void plot_remove_series(PlotSubplot& sp, int index) {
+    if (index < 0 || index >= sp.count) return;
+    for (int i = index; i < sp.count - 1; ++i) {
+        sp.series[i] = sp.series[i + 1];
+    }
+    sp.count -= 1;
+}
+
+void plot_move_series(const ApplicationState* app, PlotSubplot& src, PlotSubplot& dst, const SeriesKey& key) {
+    if (&src == &dst) return;
+    const int src_idx = plot_find_series(src, key);
+    if (src_idx == -1) {
+        plot_add_series(app, dst, key);
+        return;
+    }
+    if (plot_find_series(dst, key) == -1) {
+        if (dst.count >= PLOT_MAX_SERIES_PER_SUBPLOT) return;
+        dst.series[dst.count++] = src.series[src_idx];
+    }
+    plot_remove_series(src, src_idx);
+}
+
+void plot_clear(PlotSubplot* subplots, int count) {
+    for (int i = 0; i < count; ++i) {
+        subplots[i].count = 0;
+    }
+}
+
+void plot_resolve_legacy_periods(const ApplicationState* app, PlotSubplot* subplots, int count) {
+    for (int i = 0; i < count; ++i) {
+        PlotSubplot& sp = subplots[i];
+        for (int j = 0; j < sp.count;) {
+            PlotSeries& s = sp.series[j];
+            if (s.key.period != SERIES_PERIOD_LEGACY_FILTER) { ++j; continue; }
+            s.key.period = series_legacy_period(app, s.key.period);
+            // Its periods again, of which the period it now has of its own is its period 0
+            const PlotSeries was = s;
+            s.num_periods = 0;
+            for (int k = 0; k < was.num_periods; ++k) plot_series_add_period(s, was.periods[k]);
+            if (s.num_periods == 0) s.num_periods = 1;
+            const int first = plot_find_series(sp, s.key);
+            if (first != j) {
+                plot_remove_series(sp, j);
+            } else {
+                ++j;
+            }
+        }
+    }
+}
+
+// ## Series loaded along the run
+
+size_t system_series_groups(md_str_t out_groups[], size_t cap, const ApplicationState* app) {
+    MD_ASSERT(app);
+    if (app->mold.run[0] == '\0') return 0;
+    const md_attributes_t* table = &app->mold.sys.attributes;
+    const md_str_t run = md_str_from_cstr(app->mold.run);
+
+    size_t count = 0;
+    for (md_attribute_iter_t it = md_attributes_iter(table, run); md_attributes_next(&it);) {
+        const md_attribute_t* attr = it.attr;
+        if (attr->format.type != MD_ATTRIBUTE_TYPE_STR) continue;
+        if (!md_str_eq_cstr(md_attribute_leaf(attr), "source")) continue;
+        const md_str_t group = md_attribute_group(attr);
+        if (md_str_empty(group) || md_str_eq(group, run)) continue;
+        if (out_groups && count < cap) out_groups[count] = group;
+        count += 1;
+    }
+    return count;
+}
+
+md_str_t system_series_group_source(const ApplicationState* app, md_str_t group) {
+    const md_attributes_t* table = &app->mold.sys.attributes;
+    const md_attribute_t* src = md_attributes_find_in(table, group, MD_STR_LIT("source"));
+    if (!src || src->format.type != MD_ATTRIBUTE_TYPE_STR) return {};
+    return md_attribute_str(table, src, 0);
+}
+
+void system_series_group_label(char* buf, size_t cap, const ApplicationState* app, md_str_t group) {
+    MD_ASSERT(buf && cap > 0);
+    md_str_t rel = group;
+    const md_str_t run = md_str_from_cstr(app->mold.run);
+    if (!md_str_empty(run) && md_str_begins_with(group, run) && group.len > run.len + 1) {
+        rel = md_str_substr(group, run.len + 1);
+    }
+    md_str_t file = system_series_group_source(app, group);
+    file = md_path_filename(file);
+    if (md_str_empty(file)) {
+        snprintf(buf, cap, MD_STR_FMT, MD_STR_ARG(rel));
+    } else {
+        snprintf(buf, cap, MD_STR_FMT "  (" MD_STR_FMT ")", MD_STR_ARG(rel), MD_STR_ARG(file));
+    }
+}
+
+size_t system_series_members(md_str_t out_paths[], size_t cap, const ApplicationState* app, md_str_t group) {
+    MD_ASSERT(app);
+    const md_attributes_t* table = &app->mold.sys.attributes;
+
+    size_t count = 0;
+    for (md_attribute_iter_t it = md_attributes_iter(table, group); md_attributes_next(&it);) {
+        const md_attribute_t* attr = it.attr;
+        if (!attribute_temporal(attr)) continue;
+        if (md_attributes_axis(table, attr) == attr) continue;  // The group's own time
+        if (out_paths && count < cap) out_paths[count] = attr->path;
+        count += 1;
+    }
+    return count;
+}
+
+// ## Workspace
+
+void plot_layout_serialize(viamd::serialization_state_t& state, md_str_t section, md_str_t series_section, const PlotSubplot* subplots, int num_subplots) {
+    viamd::write_section_header(state, section);
+    viamd::write_int(state, MD_STR_LIT("NumSubplots"), num_subplots);
+
+    for (int i = 0; i < PLOT_MAX_SUBPLOTS; ++i) {
+        const PlotSubplot& sp = subplots[i];
+        for (int j = 0; j < sp.count; ++j) {
+            const PlotSeries& s = sp.series[j];
+            viamd::write_section_header(state, series_section);
+            viamd::write_int (state, MD_STR_LIT("Subplot"), i);
+            viamd::write_str (state, MD_STR_LIT("Source"),  md_str_from_cstr(source_name[s.key.source < SeriesSource_Count ? s.key.source : 0]));
+            viamd::write_str (state, MD_STR_LIT("Variant"), md_str_from_cstr(variant_name[s.key.variant < SeriesVariant_Count ? s.key.variant : 0]));
+            viamd::write_str (state, MD_STR_LIT("Path"),    md_str_from_cstr(s.key.path));
+            if (s.key.period != 0) {
+                viamd::write_int(state, MD_STR_LIT("Period"), (int)s.key.period);
+            }
+            viamd::write_vec4(state, MD_STR_LIT("Color"),   md_float4_set(s.color.x, s.color.y, s.color.z, s.color.w));
+            viamd::write_str (state, MD_STR_LIT("PlotType"), md_str_from_cstr(plot_type_name[s.plot_type < PlotType_Count ? s.plot_type : 0]));
+            viamd::write_int (state, MD_STR_LIT("Marker"),  (int)s.marker);
+            viamd::write_flt (state, MD_STR_LIT("MarkerSize"), s.marker_size);
+            viamd::write_flt (state, MD_STR_LIT("BarWidth"), s.bar_width);
+            viamd::write_flt (state, MD_STR_LIT("LineWeight"), s.line_weight);
+            viamd::write_int (state, MD_STR_LIT("NumBins"), s.num_bins);
+            // Written also when off (0): off is no longer the default
+            viamd::write_flt (state, MD_STR_LIT("Smoothing"), s.smoothing);
+            viamd::write_bool(state, MD_STR_LIT("UseColormap"), s.use_colormap);
+            viamd::write_int (state, MD_STR_LIT("Colormap"), (int)s.colormap);
+            viamd::write_flt (state, MD_STR_LIT("ColormapAlpha"), s.colormap_alpha);
+            if (plot_series_has_periods(s)) {
+                int periods[PLOT_MAX_PERIODS];
+                for (int k = 0; k < s.num_periods; ++k) periods[k] = (int)s.periods[k];
+                viamd::write_int_vec(state, MD_STR_LIT("Periods"), periods, s.num_periods);
+            }
+        }
+    }
+}
+
+bool plot_layout_deserialize(viamd::deserialization_state_t& state, md_str_t section, md_str_t series_section, const ApplicationState* app, PlotSubplot* subplots, int* num_subplots) {
+    const md_str_t cur = viamd::section_header(state);
+    md_str_t ident, arg;
+
+    if (md_str_eq(cur, section)) {
+        while (viamd::next_entry(ident, arg, state)) {
+            if (md_str_eq_cstr(ident, "NumSubplots")) {
+                int n;
+                if (viamd::extract_int(n, arg)) {
+                    *num_subplots = MD_CLAMP(n, 1, PLOT_MAX_SUBPLOTS);
+                }
+            }
+        }
+        return true;
+    }
+
+    if (md_str_eq(cur, series_section)) {
+        PlotSeries s = {};
+        s.population_mask.set();
+        int  subplot = -1;
+        bool has_color = false;
+        while (viamd::next_entry(ident, arg, state)) {
+            md_str_t str;
+            int   i;
+            if (md_str_eq_cstr(ident, "Subplot")) {
+                viamd::extract_int(subplot, arg);
+            } else if (md_str_eq_cstr(ident, "Source") && viamd::extract_str(str, arg)) {
+                series_source_from_name(&s.key.source, str, &s.key.period);
+            } else if (md_str_eq_cstr(ident, "Period") && viamd::extract_int(i, arg)) {
+                s.key.period = (uint32_t)MD_MAX(i, 0);
+            } else if (md_str_eq_cstr(ident, "Variant") && viamd::extract_str(str, arg)) {
+                for (int k = 0; k < SeriesVariant_Count; ++k) {
+                    if (md_str_eq_cstr(str, variant_name[k])) s.key.variant = (SeriesVariant)k;
+                }
+            } else if (md_str_eq_cstr(ident, "Path")) {
+                viamd::extract_to_char_buf(s.key.path, sizeof(s.key.path), arg);
+            } else if (md_str_eq_cstr(ident, "Color")) {
+                md_float4_t c = {};
+                viamd::extract_vec4(c, arg);
+                s.color = ImVec4(c.x, c.y, c.z, c.w);
+                has_color = true;
+            } else if (md_str_eq_cstr(ident, "PlotType") && viamd::extract_str(str, arg)) {
+                for (int k = 0; k < PlotType_Count; ++k) {
+                    if (md_str_eq_cstr(str, plot_type_name[k])) s.plot_type = (PlotType)k;
+                }
+            } else if (md_str_eq_cstr(ident, "Marker") && viamd::extract_int(i, arg)) {
+                s.marker = (ImPlotMarker)MD_CLAMP(i, 0, ImPlotMarker_COUNT - 1);
+            } else if (md_str_eq_cstr(ident, "MarkerSize")) {
+                viamd::extract_flt(s.marker_size, arg);
+            } else if (md_str_eq_cstr(ident, "BarWidth")) {
+                viamd::extract_flt(s.bar_width, arg);
+            } else if (md_str_eq_cstr(ident, "LineWeight")) {
+                viamd::extract_flt(s.line_weight, arg);
+                s.line_weight = MD_CLAMP(s.line_weight, PLOT_LINE_WEIGHT_MIN, PLOT_LINE_WEIGHT_MAX);
+            } else if (md_str_eq_cstr(ident, "NumBins") && viamd::extract_int(i, arg)) {
+                s.num_bins = MD_CLAMP(i, 2, 4096);
+            } else if (md_str_eq_cstr(ident, "Smoothing")) {
+                viamd::extract_flt(s.smoothing, arg);
+                s.smoothing = MD_CLAMP(s.smoothing, 0.0f, 16.0f);
+            } else if (md_str_eq_cstr(ident, "UseColormap")) {
+                viamd::extract_bool(s.use_colormap, arg);
+            } else if (md_str_eq_cstr(ident, "Colormap") && viamd::extract_int(i, arg)) {
+                s.colormap = (ImPlotColormap)i;
+            } else if (md_str_eq_cstr(ident, "ColormapAlpha")) {
+                viamd::extract_flt(s.colormap_alpha, arg);
+            } else if (md_str_eq_cstr(ident, "Periods")) {
+                // Period ids, as many as there are, separated by commas
+                int num = 0;
+                uint32_t value = 0;
+                bool digits = false;
+                for (size_t c = 0; c <= arg.len; ++c) {
+                    const char ch = c < arg.len ? arg.ptr[c] : ',';
+                    if (ch >= '0' && ch <= '9') {
+                        value = value * 10 + (uint32_t)(ch - '0');
+                        digits = true;
+                    } else if (ch == ',') {
+                        if (digits && num < PLOT_MAX_PERIODS) s.periods[num++] = value;
+                        value = 0;
+                        digits = false;
+                    }
+                }
+                if (num > 0) s.num_periods = num;
+            }
+        }
+
+        if (0 <= subplot && subplot < PLOT_MAX_SUBPLOTS) {
+            const int idx = plot_add_series(app, subplots[subplot], s.key);
+            if (idx != -1) {
+                PlotSeries& dst = subplots[subplot].series[idx];
+                const ImVec4 default_color = dst.color;
+                dst = s;
+                if (!has_color) dst.color = default_color;
+            }
+        }
+        return true;
+    }
+
+    return false;
+}

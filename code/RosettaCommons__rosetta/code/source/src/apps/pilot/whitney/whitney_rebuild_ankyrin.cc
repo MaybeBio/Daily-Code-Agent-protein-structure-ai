@@ -1,0 +1,89 @@
+// -*- mode:c++;tab-width:2;indent-tabs-mode:t;show-trailing-whitespace:t;rm-trailing-spaces:t -*-
+// vi: set ts=2 noet:
+//
+// (c) Copyright Rosetta Commons Member Institutions.
+// (c) This file is part of the Rosetta software suite and is made available under license.
+// (c) The Rosetta software is developed by the contributing members of the Rosetta Commons.
+// (c) For more information, see http://www.rosettacommons.org. Questions about this can be
+// (c) addressed to University of Washington CoMotion, email: license@uw.edu.
+
+/// @brief
+/// @author jk
+
+#include <iostream>
+
+// Protocol Headers
+
+// Core Headers
+#include <core/conformation/Residue.hh>
+#include <devel/init.hh>
+#include <core/pose/Pose.hh>
+#include <core/scoring/ScoreFunction.hh>
+#include <core/scoring/ScoreFunctionFactory.hh>
+#include <core/optimization/MinimizerOptions.hh>
+#include <basic/options/util.hh>
+
+// Utility Headers
+#include <utility/io/ozstream.hh>
+
+//Auto Headers
+#include <core/import_pose/import_pose.hh>
+
+
+using namespace core;
+using namespace core::scoring;
+using namespace core::optimization;
+
+
+/// General testing code
+int
+main( int argc, char * argv [] )
+{
+
+	try {
+
+
+		devel::init(argc, argv);
+
+		std::cout << "Starting to build fasta sequence" << std::endl;
+
+		// create pose for wild type native
+		pose::Pose native_pose;
+
+		//read in pdb file from command line
+		std::string const input_pdb_name ( basic::options::start_file() );
+		core::import_pose::pose_from_file( native_pose, input_pdb_name , core::import_pose::PDB_file);
+
+		scoring::ScoreFunctionOP scorefxn( get_score_function() );
+		scorefxn->set_weight( core::scoring::fa_dun, 0.1 );
+
+
+		//output file
+		utility::io::ozstream seq_outstream;
+		seq_outstream.open( "sequence.out", std::ios::out );
+
+		for ( core::Size i = 1, nres = native_pose.size(); i <= nres; i++ ) {
+
+			std::ostringstream data_stream;
+			chemical::AA const wt_aa( native_pose.residue(i).aa() );
+			data_stream << oneletter_code_from_aa( wt_aa );
+
+			seq_outstream << data_stream.str();
+
+		}
+
+		seq_outstream.close();
+		seq_outstream.clear();
+
+		std::cout << "Finished printing sequence" << std::endl;
+
+		return 0;
+
+	} catch (utility::excn::Exception const & e ) {
+		e.display();
+		return -1;
+	}
+
+}
+
+

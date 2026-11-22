@@ -1,0 +1,407 @@
+"""Source declarations independent of the selected atom address space."""
+
+from dataclasses import dataclass, replace
+
+from protrepair.errors import ModelInvariantError
+from protrepair.structure.constitution import StructureConstitution
+from protrepair.structure.geometry import StructureGeometry
+from protrepair.structure.labels import AtomRef, ResidueId
+from protrepair.structure.slots import AtomIndex
+from protrepair.structure.topology import (
+    BondProvenance,
+    BondRelationshipType,
+    SourceBondMetadata,
+    SourceBondRecordType,
+    StructureTopology,
+    TopologyBond,
+    is_covalent_like_relationship,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SourceAtomIdentity:
+    """Source endpoint identity before selected canonical lowering.
+
+    Parameters
+    ----------
+    atom_ref : AtomRef
+        Source residue and atom name.
+    component_id : str
+        Component identity, normalized to uppercase without surrounding spaces.
+    altloc : str or None
+        Alternate location; blank values become None.
+
+    Raises
+    ------
+    ValueError
+        The component identity is blank.
+    """
+
+    atom_ref: AtomRef
+    component_id: str
+    altloc: str | None = None
+
+    def __post_init__(self) -> None:
+        component_id = self.component_id.strip().upper()
+        if not component_id:
+            raise ValueError("source atom identities require a component id")
+
+        altloc = self.altloc
+        if altloc is not None:
+            altloc = altloc.strip() or None
+
+        object.__setattr__(self, "component_id", component_id)
+        object.__setattr__(self, "altloc", altloc)
+
+    def sort_key(self) -> tuple[ResidueId, str, str, str]:
+        """Return a deterministic key for unordered source endpoint pairs."""
+
+        return (
+            self.atom_ref.residue_id,
+            self.atom_ref.atom_name,
+            self.component_id,
+            self.altloc or "",
+        )
+
+    def resolve_index(
+        self,
+        constitution: StructureConstitution,
+        geometry: StructureGeometry,
+        *,
+        require_altloc_match: bool = True,
+    ) -> AtomIndex | None:
+        """Resolve this exact source identity in aligned selected facets.
+
+        Parameters
+        ----------
+        constitution : StructureConstitution
+            Selected current atom address space.
+        geometry : StructureGeometry
+            Geometry aligned with that address space.
+        require_altloc_match : bool
+            Whether the selected alternate location must match the declaration.
+
+        Returns
+        -------
+        AtomIndex or None
+            Selected slot, or None if the atom, component or altloc differs.
+        """
+        residue = constitution.residue_or_ligand(self.atom_ref.residue_id)
+        if residue is None or residue.component_id != self.component_id:
+            return None
+
+        index = constitution.resolve_atom_index(self.atom_ref)
+        if index is None:
+            return None
+        if require_altloc_match and geometry.atom_geometry(index).altloc != self.altloc:
+            return None
+        return index
+
+
+@dataclass(frozen=True, slots=True)
+class SourceConnection:
+    """One source-declared connection before canonical topology lowering.
+
+    ``source_metadata.reported_order=None`` supplies connectivity without an order.
+    In particular, a single CONECT neighbor occurrence is not an assertion
+    that the chemical bond is single.
+
+    Parameters
+    ----------
+    endpoint_1, endpoint_2 : SourceAtomIdentity
+        Source endpoints, including component and alternate-location identity.
+    source_metadata : SourceBondMetadata
+        Source relationship and order, before component or sequence resolution.
+
+    Raises
+    ------
+    TypeError
+        A field has a noncanonical type.
+    ValueError
+        Endpoints identify the same atom.
+    """
+
+    endpoint_1: SourceAtomIdentity
+    endpoint_2: SourceAtomIdentity
+    source_metadata: SourceBondMetadata
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.endpoint_1, SourceAtomIdentity) or not isinstance(
+            self.endpoint_2,
+            SourceAtomIdentity,
+        ):
+            raise TypeError(
+                "source connection endpoints must be SourceAtomIdentity values"
+            )
+        if self.endpoint_1.atom_ref == self.endpoint_2.atom_ref:
+            raise ValueError("source connections require two distinct atoms")
+        if not isinstance(self.source_metadata, SourceBondMetadata):
+            raise TypeError("source connection metadata must be SourceBondMetadata")
+
+        endpoint_1 = self.endpoint_1
+        endpoint_2 = self.endpoint_2
+        if endpoint_2.sort_key() < endpoint_1.sort_key():
+            endpoint_1, endpoint_2 = endpoint_2, endpoint_1
+
+        object.__setattr__(self, "endpoint_1", endpoint_1)
+        object.__setattr__(self, "endpoint_2", endpoint_2)
+
+    def endpoint_pair(self) -> tuple[SourceAtomIdentity, SourceAtomIdentity]:
+        """Return the canonically ordered source endpoint pair."""
+
+        return (self.endpoint_1, self.endpoint_2)
+
+    def is_peptide_link_candidate(self) -> bool:
+        """Return whether this connection can support peptide-chain context."""
+
+        residue_id_1 = self.endpoint_1.atom_ref.residue_id
+        residue_id_2 = self.endpoint_2.atom_ref.residue_id
+        return bool(
+            self.source_metadata.record_type is not SourceBondRecordType.PDB_CONECT
+            and self.source_metadata.reported_relationship_type
+            in {
+                BondRelationshipType.COVALENT,
+                BondRelationshipType.UNKNOWN,
+            }
+            and residue_id_1 != residue_id_2
+            and residue_id_1.chain_id == residue_id_2.chain_id
+            and {
+                self.endpoint_1.atom_ref.atom_name,
+                self.endpoint_2.atom_ref.atom_name,
+            }
+            == {"C", "N"}
+        )
+
+    def requires_exact_altloc_match(self) -> bool:
+        """Return whether lowering requires the selected source altloc."""
+
+        return self.source_metadata.record_type is not SourceBondRecordType.PDB_SSBOND
+
+    def is_fallback_record(self) -> bool:
+        """Return whether typed records take precedence over this record's type."""
+
+        return self.source_metadata.record_type is SourceBondRecordType.PDB_CONECT
+
+    def merge(self, other: "SourceConnection") -> "SourceConnection":
+        """Combine declarations for the same surviving atom pair.
+
+        Parameters
+        ----------
+        other : SourceConnection
+            A declaration whose endpoints survived canonical selection.
+
+        Returns
+        -------
+        SourceConnection
+            Typed metadata with any compatible supplementary order evidence.
+
+        Raises
+        ------
+        ModelInvariantError
+            The endpoints, explicit orders, or typed declarations conflict.
+        """
+        if {self.endpoint_1.atom_ref, self.endpoint_2.atom_ref} != {
+            other.endpoint_1.atom_ref,
+            other.endpoint_2.atom_ref,
+        }:
+            raise ModelInvariantError(
+                "cannot merge source connections for different atoms"
+            )
+        order = self.source_metadata.reported_order
+        other_order = other.source_metadata.reported_order
+        if order is not None and other_order is not None and order != other_order:
+            raise ModelInvariantError(
+                "conflicting source bond orders for one atom pair"
+            )
+
+        if (
+            not self.is_fallback_record()
+            and not other.is_fallback_record()
+            and replace(
+                self,
+                source_metadata=replace(self.source_metadata, reported_order=None),
+            )
+            != replace(
+                other,
+                source_metadata=replace(other.source_metadata, reported_order=None),
+            )
+        ):
+            raise ModelInvariantError("conflicting bonds in typed source connections")
+        preferred = other if self.is_fallback_record() else self
+        return replace(
+            preferred,
+            source_metadata=replace(
+                preferred.source_metadata,
+                reported_order=order if order is not None else other_order,
+            ),
+        )
+
+    def to_topology_bond(
+        self,
+        atom_index_1: AtomIndex,
+        atom_index_2: AtomIndex,
+        *,
+        expected_bond: TopologyBond | None,
+    ) -> TopologyBond:
+        """Resolve absent attributes without replacing explicit source evidence.
+
+        Parameters
+        ----------
+        atom_index_1, atom_index_2 : AtomIndex
+            Surviving canonical endpoints corresponding to this connection.
+        expected_bond : TopologyBond or None
+            Component or sequence chemistry for the same endpoint pair.
+
+        Returns
+        -------
+        TopologyBond
+            Source-backed connectivity with a resolved or explicitly unknown order.
+
+        Raises
+        ------
+        ModelInvariantError
+            The expected endpoints differ, or a disulfide carries a multiple order.
+        """
+        if expected_bond is not None and set(expected_bond.endpoint_pair()) != {
+            atom_index_1,
+            atom_index_2,
+        }:
+            raise ModelInvariantError(
+                "expected chemistry refers to a different atom pair"
+            )
+        relationship = self.source_metadata.reported_relationship_type
+        reported_order = self.source_metadata.reported_order
+        order = reported_order
+        aromatic = False
+        compatible = (
+            expected_bond is not None
+            and is_covalent_like_relationship(expected_bond)
+            and relationship
+            in {
+                BondRelationshipType.UNKNOWN,
+                BondRelationshipType.COVALENT,
+                BondRelationshipType.DISULFIDE,
+            }
+        )
+        if compatible and expected_bond is not None:
+            if relationship is BondRelationshipType.UNKNOWN:
+                relationship = expected_bond.relationship_type
+            if order is None:
+                order = expected_bond.order
+            aromatic = expected_bond.aromatic and order in {1, 2}
+        if relationship is BondRelationshipType.DISULFIDE:
+            if reported_order not in {None, 1}:
+                raise ModelInvariantError(
+                    "disulfide connectivity conflicts with a multiple bond order"
+                )
+            order = 1
+        return TopologyBond(
+            atom_index_1,
+            atom_index_2,
+            order=order,
+            aromatic=aromatic,
+            relationship_type=relationship,
+            provenance=BondProvenance.SOURCE_EXPLICIT,
+            source_metadata=self.source_metadata,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PdbAdjacentCapLink:
+    """A bare CONECT pair corroborated by consecutive source PDB slots.
+
+    Parameters
+    ----------
+    carbon, nitrogen : SourceAtomIdentity
+        The selected C and N endpoints in source residue order. Exactly one
+        belongs to the open port of a retained ACE or NME.
+
+    Raises
+    ------
+    TypeError
+        An endpoint is not a SourceAtomIdentity.
+    ValueError
+        The endpoints do not describe a directed adjacent cap attachment.
+    """
+
+    carbon: SourceAtomIdentity
+    nitrogen: SourceAtomIdentity
+
+    def __post_init__(self) -> None:
+        carbon, nitrogen = self.carbon, self.nitrogen
+        if not isinstance(carbon, SourceAtomIdentity) or not isinstance(
+            nitrogen, SourceAtomIdentity
+        ):
+            raise TypeError(
+                "PDB cap attachment endpoints must be SourceAtomIdentity values"
+            )
+        if (
+            (carbon.atom_ref.atom_name, nitrogen.atom_ref.atom_name) != ("C", "N")
+            or not carbon.atom_ref.residue_id.immediately_precedes(
+                nitrogen.atom_ref.residue_id
+            )
+            or not (
+                (
+                    carbon.component_id == "ACE"
+                    and nitrogen.component_id not in ("ACE", "NME")
+                )
+                or (
+                    nitrogen.component_id == "NME"
+                    and carbon.component_id not in ("ACE", "NME")
+                )
+            )
+        ):
+            raise ValueError(
+                "a PDB cap attachment requires consecutive open peptide ports"
+            )
+
+    @property
+    def cap_residue_id(self) -> ResidueId:
+        """Return the retained residue owning the attachment."""
+        cap = self.carbon if self.carbon.component_id == "ACE" else self.nitrogen
+        return cap.atom_ref.residue_id
+
+    def bond_in(
+        self,
+        constitution: StructureConstitution,
+        geometry: StructureGeometry,
+        topology: StructureTopology,
+    ) -> TopologyBond | None:
+        """Rebind the original declaration to an aligned structure snapshot.
+
+        Parameters
+        ----------
+        constitution, geometry, topology : StructureConstitution, StructureGeometry, StructureTopology
+            Aligned facets containing the selected endpoints and source bond.
+
+        Returns
+        -------
+        TopologyBond or None
+            The surviving source-backed edge, regardless of effective order,
+            or None if the endpoint identity, role, or declaration changed.
+        """
+        carbon = self.carbon.resolve_index(constitution, geometry)
+        nitrogen = self.nitrogen.resolve_index(constitution, geometry)
+        if carbon is None or nitrogen is None:
+            return None
+        for endpoint, index, element in (
+            (self.carbon, carbon, "C"),
+            (self.nitrogen, nitrogen, "N"),
+        ):
+            residue = constitution.residue_or_ligand(endpoint.atom_ref.residue_id)
+            assert residue is not None
+            if (
+                residue.is_hetero != (residue.residue_id == self.cap_residue_id)
+                or constitution.atom_site_at(index).element != element
+            ):
+                return None
+
+        bond = topology.bond_between(carbon, nitrogen)
+        if (
+            bond is None
+            or bond.provenance is not BondProvenance.SOURCE_EXPLICIT
+            or bond.source_metadata is None
+            or not bond.source_metadata.is_bare_pdb_conect()
+        ):
+            return None
+        return bond

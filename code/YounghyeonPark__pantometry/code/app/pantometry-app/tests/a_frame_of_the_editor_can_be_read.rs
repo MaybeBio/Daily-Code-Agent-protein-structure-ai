@@ -1,0 +1,1275 @@
+//! **The editor could not be looked at except by opening it.**
+//!
+//! `--layout-at` checks the arithmetic that decides which side panels fit; `--drawn-extent` checks
+//! where the shaded pass puts a run's geometry. Neither says what is *on the screen*. So every
+//! change to the interface was unverifiable, and this repository has already paid for that once:
+//! three side panels took the whole of a 533-point window, the paint callback was handed a rect of
+//! **zero width**, it drew nothing — correctly — and an afternoon went into the renderer before
+//! anybody printed the rect.
+//!
+//! `--ui-dump` builds one frame from an `egui::Context` alone and reports every string it drew and
+//! where. `eframe::App::ui`'s `Frame` argument is unused, as `App::update`'s was before egui 0.34, so nothing here ever needed
+//! eframe; the shaded viewport is a `PaintCallback`, which a headless run records and never
+//! executes, so no GPU is needed either.
+//!
+//! # Text and rects, not pixels
+//!
+//! A screenshot answers "does it look right" only to somebody looking. These are the questions a
+//! test can hold: **is the control inside the window at this width**, **is the viewport wider than
+//! nothing**, **is the error where a reader will find it**.
+//!
+//! Not "was the label elided", which is what was written here first. egui does not truncate a
+//! button's text — the row overflows instead — so `elided` stayed at 0 with a hundred-character
+//! label in a 500-point window, and an assertion that it was 0 could not have failed. It is still
+//! in the dump as a number to read. What replaced it measures each string's own right edge, and
+//! that found `fit view` laid out at x=704 of a 700-point window on the first run.
+
+/// The binary, asked for one frame.
+fn dump(args: &[&str]) -> String {
+    dump_listing("", args)
+}
+
+/// The binary, asked for one frame, with `recent` named as the file the start screen reads.
+///
+/// **Every dump names one**, including the ones that do not care: without it the start screen would
+/// read whichever list belongs to whoever is running the suite, and a test whose result depends on
+/// the machine it runs on is not a test. The default is a path that does not exist, which the
+/// editor reads as an empty list.
+fn dump_listing(recent: &str, args: &[&str]) -> String {
+    let mut argv = vec!["--ui-dump".to_string()];
+    argv.extend(args.iter().map(|a| (*a).to_string()));
+    let none = std::env::temp_dir().join("pantometry-no-such-recent-list.json");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pantometry"))
+        .args(&argv)
+        .env(
+            "PANTOMETRY_RECENT",
+            if recent.is_empty() {
+                none.to_string_lossy().into_owned()
+            } else {
+                recent.to_string()
+            },
+        )
+        .output()
+        .expect("the binary runs");
+    assert!(
+        out.status.success(),
+        "--ui-dump {argv:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A scene on disk to open, written by the binary's own `emit`.
+///
+/// The built-in scene, which is what the dump used to show when no file was named. Written out
+/// rather than reached at a path relative to this file, because a test binary that knows where the
+/// source tree is, is a test binary that keeps working after the tree has moved — this workspace
+/// has already had six tests pass against a checkout that was no longer there.
+fn scene() -> String {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let dir = std::env::temp_dir().join("pantometry-ui-dump-scene");
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let out = dir.join("built-in.json");
+        let done = std::process::Command::new(env!("CARGO_BIN_EXE_pantometry"))
+            .args(["emit", &out.to_string_lossy()])
+            .output()
+            .expect("the binary runs");
+        assert!(
+            done.status.success() && out.is_file(),
+            "emit did not write a scene: {}",
+            String::from_utf8_lossy(&done.stderr)
+        );
+        out.to_string_lossy().into_owned()
+    })
+    .clone()
+}
+
+/// Where a dump line's text begins: two marker columns, three five-wide numbers, two spaces.
+const TEXT_AT: usize = 22;
+
+/// What a dump line says, or `None` if it is not a text line.
+///
+/// **Written once.** This column was written down in four places and then the dump grew a second
+/// marker — `!` for a string the window cut off, `=` for a string drawn on another — and four
+/// tests began failing with *"no menu titled File"*. A constant nobody can get wrong in one place
+/// is worth more than four correct copies.
+fn said(line: &str) -> Option<&str> {
+    line.get(TEXT_AT..).filter(|t| !t.is_empty())
+}
+
+/// A dump line's `left`, `top` and `width`.
+///
+/// Parsed out of the columns before the text, so a marker in either of them is skipped rather
+/// than counted as a field.
+fn box_of(line: &str) -> Option<(f32, f32, f32)> {
+    let mut n = line
+        .get(..TEXT_AT)?
+        .split_whitespace()
+        .filter_map(|w| w.parse::<f32>().ok());
+    Some((n.next()?, n.next()?, n.next()?))
+}
+
+/// The viewport's rect — `left, top, width, height` — out of the header.
+///
+/// The rect the paint callback was handed, which is the number the original defect was: it was
+/// zero points wide and the pass drew nothing, correctly, for an afternoon.
+fn viewport(dump: &str) -> (f32, f32, f32, f32) {
+    let line = dump
+        .lines()
+        .find(|l| l.starts_with("viewport="))
+        .unwrap_or_else(|| panic!("no viewport in:\n{dump}"));
+    let (pos, size) = line["viewport=".len()..]
+        .split_once(' ')
+        .expect("left,top WxH");
+    let (l, t) = pos.split_once(',').expect("left,top");
+    let (w, h) = size.split_once('x').expect("WxH");
+    let n = |s: &str| s.parse::<f32>().expect("a number");
+    (n(l), n(t), n(w), n(h))
+}
+
+/// The `n` out of a `key=n` line in the header.
+fn count(dump: &str, key: &str) -> usize {
+    let line = dump
+        .lines()
+        .find(|l| l.starts_with(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("no {key} in:\n{dump}"));
+    line[key.len() + 1..].parse().expect("a number")
+}
+
+#[test]
+fn a_frame_has_something_on_it_and_a_viewport_to_draw_in() {
+    let d = dump(&[&scene()]);
+    assert!(d.starts_with("size=1500x950"), "{d:.80}");
+    // Thirty-six strings on the default window. A floor rather than the number, because the count
+    // moves whenever a label is added and the assertion worth having is "the frame is not empty".
+    assert!(count(&d, "texts") > 20, "the frame is nearly empty:\n{d}");
+    // **The viewport is queued**, which is one of the two things the zero-width defect needed and
+    // the weaker one: a rect of zero width is still a callback, and this assertion passed at every
+    // width while the rect was empty. How wide it is, is `the_viewport_keeps_its_floor_at_every_width`.
+    assert_eq!(count(&d, "callbacks"), 1, "no shaded viewport:\n{d}");
+}
+
+#[test]
+fn the_viewport_keeps_its_floor_at_every_width() {
+    // **The assertion the arithmetic could not make.** `--layout-at 900` said `view=290` while the
+    // callback's rect was `0 x 870`: `panels_that_fit` reserved the panels' minimums — 170, 240,
+    // 200 — and the panels then took their defaults — 260, 430, 320. The sum had a hole in it at
+    // 1000, 950, 900 and 700 points: the same zero-width viewport that once cost an afternoon in
+    // the renderer, still there, under a guard that was checking its own arithmetic rather than
+    // the program — and it never looked at these four: its sweep is `(200..3200).step_by(17)`, so
+    // it tests 897 and 914 and nothing between them. A guard that passes about a different
+    // repository, at widths it does not visit.
+    //
+    // So this reads the rect the paint callback was actually handed. A window narrower than the
+    // floor plus its two gaps cannot honour the floor and is not asked to — at 260 points every
+    // panel is gone and the viewport gets the 244 that exist.
+    let floor = 280.0_f32;
+    let chrome = 16.0_f32;
+    for width in [
+        1500, 1200, 1000, 950, 900, 800, 700, 600, 533, 500, 420, 360, 300, 260,
+    ] {
+        let d = dump(&[&scene(), "--width", &width.to_string()]);
+        let (_, _, w, h) = viewport(&d);
+        let want = floor.min(width as f32 - chrome);
+        assert!(
+            w >= want,
+            "the viewport is {w} points wide at {width}, under {want}:\n{d}"
+        );
+        assert!(
+            h > 100.0,
+            "the viewport is {h} points tall at {width}:\n{d}"
+        );
+    }
+}
+
+#[test]
+fn nothing_the_reader_should_see_is_cut_off_by_the_window() {
+    // **A control that does not fit is not elided, it is lost.** The toolbar was a plain
+    // `horizontal`, and at 700 points `fit view` was laid out at x=704..746 of a 700-point window
+    // — drawn, clipped by the panel, invisible and unclickable. `elided` saw none of it: egui does
+    // not truncate a button's text, the row overflows instead, so the assertion that stood here
+    // counted a thing that cannot happen and read zero with a hundred-character label at 500.
+    //
+    // Nor is it "reaches past the right edge of the window", which was the next try and which the
+    // path box fails honestly: a `TextEdit` lays its whole line out and clips it to its own field,
+    // so an absolute path is 431 points of galley inside 220 points of box and nothing is wrong.
+    // What `cut` counts is a string clipped by something that reaches the window's own edge.
+    for width in [1500, 1100, 900, 700, 620, 500, 420, 300, 260] {
+        let d = dump(&[&scene(), "--width", &width.to_string()]);
+        assert_eq!(
+            count(&d, "cut"),
+            0,
+            "something is cut off at {width}; the lines marked `!`:\n{d}"
+        );
+    }
+
+    // **And the count is one that can move.** Disabling the condition it is computed from changed
+    // nothing at any width above, because nothing is cut at any of them — which is the state to be
+    // in and also the shape of an assertion that cannot fail. So a width where something *must* be
+    // cut: at 40 points `watching the file` is a wider string than the whole window, and wrapping
+    // a row cannot help when one item is wider than the row. If this stops being non-zero, `cut`
+    // has stopped measuring and the zeros above mean nothing.
+    //
+    // **And tall enough for that string to be on the screen at all.** Since egui 0.37 a label in a
+    // row too narrow for it wraps into a column a character wide, so at 40 points every menu title
+    // and button is a tall thin stack, the panels outgrow 950 points, and the status bar — the
+    // string this probe is for — was laid out below the window's bottom: `cut=0` with the one
+    // input that has to cut not on the screen. At 2000 it is, at x=-64.
+    let tiny = dump(&[&scene(), "--width", "40", "--height", "2000"]);
+    assert!(
+        count(&tiny, "cut") > 0,
+        "nothing is cut in a 40-point window, so `cut` is not measuring:\n{tiny}"
+    );
+}
+
+#[test]
+fn nothing_is_drawn_on_top_of_anything_else() {
+    // **The viewport's bottom was claimed four times.** The scale bar, the colour bar, the count
+    // of what the shaded pass drew and the frame transport each anchored to `rect.bottom()` on
+    // their own, and with a run open the slider was laid out through the middle of the count.
+    // Legible in a screenshot of the window and invisible to every other column of the dump,
+    // which is why `overlap` exists: `13`, `frame` and `0 triangles, 0 lines, 0 paints` were
+    // marked `=` on three lines four points apart.
+    //
+    // A band each now — 26 points, which is what `colour_bar` and `scale_bar` occupy — and the
+    // transport is two rows rather than one so the reservation above it can be counted rather
+    // than measured. That count is the fragile part, and this is what holds it.
+    //
+    // **Two of the five placements are slack, measured.** Sabotage moved the draw count back to
+    // the viewport's bottom edge and halved the transport's reserved rows, and neither made this
+    // fail: without the ladder those two only *abut* their neighbours, by a point or two, and
+    // `overlap` shrinks each rect by 2 above and below before intersecting, so that two adjacent
+    // rows of text are not a collision. So this holds the reservation and the colour bar's band, and the other two
+    // lines buy room to read rather than correctness. Saying which is which is cheaper than a
+    // reader assuming all four are load-bearing.
+    for width in [1500, 1100, 900, 700, 620, 500, 420, 300, 260] {
+        for flag in ["--ran", "--iso"] {
+            let d = dump(&[&scene(), flag, "--width", &width.to_string()]);
+            assert_eq!(
+                count(&d, "overlap"),
+                0,
+                "strings are drawn on each other at {width} with {flag}; \
+                 the lines marked `=`:\n{d}"
+            );
+            assert_eq!(
+                count(&d, "cut"),
+                0,
+                "something is cut off at {width} with {flag}; the lines marked `!`:\n{d}"
+            );
+        }
+    }
+
+    // **And the count is one that can move.** Every width above reads zero, which is the state to
+    // be in and also the shape of an assertion that cannot fail. A menu drawn over the panel
+    // behind it is an overlap by construction — that is what a menu is — so opening one is the
+    // case where the number must not be zero.
+    let plain = dump(&[&scene()]);
+    let (x, y) = menu_at(&plain, "View");
+    let opened = dump(&[&scene(), "--click", &format!("{x},{y}")]);
+    assert!(
+        count(&opened, "overlap") > 0,
+        "an open menu overlaps nothing, so `overlap` is not measuring:\n{opened}"
+    );
+}
+
+#[test]
+fn every_control_is_still_there_at_every_width() {
+    // **The other half, and the one `cut` cannot see.** At 500 points the unwrapped toolbar did not
+    // draw its last three controls at all — `watch file`, `run on change` and `fit view` were not
+    // laid out, not clipped, and the status bar said only that the inspector had gone. A control
+    // that is absent reads as a feature the program does not have.
+    // What is left after seven of the nine went back to the menus that already held them. `deep`
+    // stays because it changes what `verify` does when you press it; `watch file` and `run on
+    // change` went because they change what happens when nobody presses anything, and that is a
+    // thing to read in the status bar rather than a control to keep room for.
+    let want = ["run", "verify", "deep", "fit view"];
+    for width in [1500, 1100, 900, 700, 620, 500, 420] {
+        let d = dump(&[&scene(), "--width", &width.to_string()]);
+        // The text begins at column 21: a one-character marker, three five-wide numbers and two
+        // spaces. Sliced rather than split, because a label has spaces in it.
+        let on_screen: Vec<&str> = d.lines().filter_map(said).collect();
+        let missing: Vec<&&str> = want
+            .iter()
+            .filter(|w| !on_screen.iter().any(|t| t == *w))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "gone from the toolbar at {width}: {missing:?}\n{d}"
+        );
+    }
+}
+
+#[test]
+fn a_dropped_panel_says_so_rather_than_vanishing() {
+    // At 500 points the inspector does not fit. The failure this guards is the silent one — a
+    // panel that is simply not there, which reads as a missing feature rather than as a window
+    // that is too narrow.
+    let wide = dump(&[&scene(), "--width", "1500"]);
+    let narrow = dump(&[&scene(), "--width", "500"]);
+    let note = narrow
+        .lines()
+        .find(|l| l.contains(" hidden — "))
+        .unwrap_or_else(|| panic!("no panel was said to be hidden at 500:\n{narrow}"));
+    // **Every panel that is gone, named.** This asserted `the inspector hidden` alone, which was
+    // the right question while the inspector went first. The assets go first now, the note named
+    // them and only them, and the inspector left without a word at the very width this guards —
+    // the test caught it. So the assertion is generalised rather than repointed: whichever of the
+    // headings is on screen at 1500 and absent at 500 has to be in the note.
+    for (heading, called) in [
+        ("Inspector", "the inspector"),
+        ("Assets", "the assets"),
+        ("Outliner", "the outliner"),
+    ] {
+        assert!(wide.contains(heading), "no {heading} at 1500:\n{wide}");
+        if !narrow.contains(heading) {
+            assert!(
+                note.contains(called),
+                "{called} went at 500 and the note does not say so: {note}"
+            );
+        }
+    }
+    assert!(!narrow.contains("Inspector"), "the inspector fits at 500?");
+}
+
+#[test]
+fn opening_with_no_file_offers_the_two_ways_in_and_no_editor() {
+    // **What `pantometry edit` with no argument used to do was open the built-in scene**, which is
+    // an answer to a question nobody asked: whoever typed it either has a scene somewhere or wants
+    // to make one. Neither of those was on the screen, and the way to a file on disk was to know
+    // that the toolbar's text box was a way in.
+    let d = dump(&[]);
+    assert!(d.contains("New project"), "no way to make one:\n{d}");
+    assert!(d.contains("Open a scene"), "no way to open one:\n{d}");
+    // And none of the editor, because there is nothing yet for it to act on. A window of disabled
+    // controls is a worse answer to "what now" than two buttons.
+    assert_eq!(count(&d, "callbacks"), 0, "a viewport with no scene:\n{d}");
+    assert!(!d.contains("Outliner"), "the outliner over no scene:\n{d}");
+    assert!(
+        !d.contains("a small room ringing"),
+        "still the built-in scene:\n{d}"
+    );
+}
+
+#[test]
+fn the_chooser_offers_every_kind_the_format_defines() {
+    // **Derived from the table, not listed here.** A twentieth domain reaches the chooser without
+    // this file learning about it, and a nineteenth that stops being offered fails rather than
+    // quietly disappearing from a menu — which is how the editor's Add list is checked too.
+    //
+    // `--custom`, because `--new` is no longer this screen: New project opens on the shipped
+    // scenes now and the kinds are behind `Custom…`. Both tests here read `--new` and both went on
+    // passing against the wrong screen for exactly as long as the preset screen happened to
+    // contain the word `bar`.
+    let d = dump(&["--new", "--custom"]);
+    assert_eq!(count(&d, "callbacks"), 0, "a viewport with no scene:\n{d}");
+
+    // **One frame of a scrollable list shows what fits in the frame**, and at twenty-two kinds
+    // the list is taller than a 950-point window: `molecule` pushed `well`'s description below
+    // the `Back` row at y=859 and `winding` off it altogether, name and all. It was every name
+    // and all but one description at twenty-one, and every one of both at twenty. egui 0.37's
+    // 13-point text (12.5 before) made each row taller, and `well`'s name followed its description
+    // below the edge: the window's row height changing, which is the case this pin names, read
+    // and moved rather than passed. `elided=0` in
+    // the dump says nothing was truncated; it is a `ScrollArea`, and a user scrolls. So both sets
+    // are pinned at this size — one more is the list outgrowing the window again, one fewer the
+    // window or the row height changing — and what is *offered* is read from a frame tall enough
+    // to hold all of it, which is the list a person reaches by scrolling.
+    let named_below: Vec<&str> = pantometry_world::templates::TEMPLATES
+        .iter()
+        .filter(|t| {
+            !d.contains(&format!(
+                "  {}
+",
+                t.kind
+            ))
+        })
+        .map(|t| t.kind)
+        .collect();
+    let described_below: Vec<&str> = pantometry_world::templates::TEMPLATES
+        .iter()
+        .filter(|t| !d.contains(t.about))
+        .map(|t| t.kind)
+        .collect();
+    assert_eq!(
+        (named_below, described_below),
+        (vec!["well", "winding"], vec!["well", "winding"]),
+        "the set of kinds below the bottom of one frame has changed. One more is a list that has \
+         outgrown the window again; one fewer is the window or the row height having changed, and \
+         both are worth reading rather than passing:
+{d}"
+    );
+    let tall = dump(&["--new", "--custom", "--height", "1400"]);
+    assert_eq!(count(&tall, "elided"), 0, "{tall}");
+    for t in pantometry_world::templates::TEMPLATES {
+        assert!(
+            tall.contains(&format!(
+                "  {}
+",
+                t.kind
+            )),
+            "{} is not offered:
+{tall}",
+            t.kind
+        );
+        assert!(
+            tall.contains(t.about),
+            "{} is offered with nothing said about it:
+{tall}",
+            t.kind
+        );
+    }
+}
+
+#[test]
+fn the_kinds_that_need_a_partner_say_so_and_only_they_do() {
+    // `beam` names what it shines `onto` and `structure` names the block it `follows`. Neither is
+    // wired up — three fields have to agree, not one name — so the chooser says it and the scene
+    // opens on the format's own complaint. Exactly two, because a third that stopped saying it
+    // would be a row that looks complete and is not.
+    //
+    // Read from a frame tall enough for the whole list, as the test above reads what is offered:
+    // at 950 points `structure`'s note is below the scroll area's edge since egui 0.37's taller
+    // rows, so one frame says it once — which is a list that scrolls, not a row that went quiet.
+    let d = dump(&["--new", "--custom", "--height", "1400"]);
+    let said = d
+        .lines()
+        .filter(|l| l.contains("names another domain"))
+        .count();
+    let want = pantometry_world::templates::TEMPLATES
+        .iter()
+        .filter(|t| t.needs_a_partner())
+        .count();
+    assert_eq!(said, want, "{said} rows say it, {want} kinds need it:\n{d}");
+    assert_eq!(want, 2, "the set of kinds needing a partner has changed");
+}
+
+#[test]
+fn a_set_that_cannot_share_one_duration_says_so_before_it_is_made() {
+    // **The thing a chooser can say and a checker cannot.** Every combination of these kinds is a
+    // *well-formed* scene, so nothing downstream refuses it: what happens is that `atoms` finishes
+    // in picoseconds while a thermal `network` advances by a ten-trillionth of what it needs, and
+    // the picture looks like a bug in the physics. Measured from the same numbers the scene is
+    // built with, and said where the choice is being made.
+    // **`well` against `orbit`, not `atoms` against `network`.** This asked for `3e14 times
+    // apart`, and that number was a product of the units error in `atoms`: it held 6e-12 s against
+    // a domain whose own time unit is one second. Corrected to 6.0 the two are 300 apart, under the
+    // threshold, and this test had nothing to look at. The table's real extremes are a quantum
+    // `well` at 2e-13 s and a `compartments` model at 43200 — 2.16e17, which no correction is
+    // going to move. `orbit` held the far end at 3.6e16 until a dose took half a day to leave.
+    let far = dump(&["--new", "well,orbit"]);
+    assert!(
+        far.contains("times apart"),
+        "2e-13 s against two hours passed without comment:\n{far}"
+    );
+
+    // And not said about two kinds a shipped scene already runs together, or the warning is
+    // decoration rather than a measurement.
+    let near = dump(&["--new", "bar,heater"]);
+    assert!(
+        !near.contains("times apart"),
+        "two kinds that run together were warned about:\n{near}"
+    );
+}
+
+/// Where a menu title sits, so a click can be aimed at it.
+fn menu_at(dump: &str, title: &str) -> (f32, f32) {
+    let line = dump
+        .lines()
+        .find(|l| said(l) == Some(title) && box_of(l).is_some_and(|(_, top, _)| top == 4.0))
+        .unwrap_or_else(|| panic!("no menu titled {title}:\n{dump}"));
+    let (left, _, w) = box_of(line).expect("a menu title's box");
+    (left + w / 2.0, 10.0)
+}
+
+#[test]
+fn what_left_the_toolbar_is_in_the_menu_it_was_taken_from() {
+    // **The claim that justified the removal, checked rather than asserted.** Seven controls came
+    // off the toolbar because a menu already held them, and until `--click` there was no way to
+    // see inside a menu: a frame built with no input shows six titles and nothing under them, so
+    // "it still has a home" was exactly the kind of sentence this repository has learned to
+    // distrust. A press and a release at the title opens one.
+    let plain = dump(&[&scene()]);
+    for (title, items) in [
+        ("File", &["Open…", "Revert", "Save", "Save as…"][..]),
+        ("Watch", &["Watch file", "Run on change"][..]),
+        ("View", &["Fit view"][..]),
+    ] {
+        let (x, y) = menu_at(&plain, title);
+        let opened = dump(&[&scene(), "--click", &format!("{x},{y}")]);
+        for item in items {
+            assert!(
+                opened.contains(item),
+                "{title} does not hold {item} — it left the toolbar for nowhere:\n{opened}"
+            );
+        }
+        // And the menu really opened, rather than the item having been on screen all along.
+        assert!(
+            items.iter().any(|i| !plain.contains(*i)),
+            "{title}'s items were already on screen without opening it, so this proves nothing"
+        );
+    }
+}
+
+#[test]
+fn a_run_can_be_looked_at_without_an_event_loop() {
+    // **Half the editor does not exist until a run does**: the colour bar, the readings, the
+    // transport, the probe and the isosurface strip. The window reaches them by streaming on a
+    // thread and reporting through a channel, which a frame built with no event loop has nowhere
+    // to receive — so until `--ran` the dump could see the empty half and nothing else, which is
+    // the position the whole editor was in before this hook existed.
+    let before = dump(&[&scene()]);
+    let after = dump(&[&scene(), "--ran"]);
+    assert!(
+        !before.contains("frame") || !before.contains("ran: "),
+        "the editor had already run without being asked:\n{before}"
+    );
+    assert!(
+        after.contains("ran: 12 frames"),
+        "no run happened:\n{after}"
+    );
+    assert!(
+        after.contains("t = 0.020000 s"),
+        "no time on the transport:\n{after}"
+    );
+}
+
+#[test]
+fn the_isosurface_level_is_on_the_picture_it_changes() {
+    // **A menu is where a thing is turned on; it is not where a continuous value is set.** The
+    // level's whole point is watching the surface move as you drag it, and it lived inside the
+    // View menu — which is drawn over the viewport it moves in. The toggle stayed; the slider and
+    // the two notes that go with it are on the strip at the bottom of the viewport, under the
+    // colour bar whose scale they share.
+    let d = dump(&[&scene(), "--iso"]);
+    assert_eq!(
+        d.matches("isosurface level").count(),
+        1,
+        "the level is in two places, or none:\n{d}"
+    );
+
+    // On the picture: inside the viewport's own rect, not in a panel beside it.
+    let (vx, vy, vw, vh) = viewport(&d);
+    let line = d
+        .lines()
+        .find(|l| said(l) == Some("isosurface level"))
+        .expect("the slider's line");
+    let (x, y, _) = box_of(line).expect("the slider's box");
+    assert!(
+        x >= vx && x <= vx + vw && y >= vy && y <= vy + vh,
+        "the level is at {x},{y}, outside the viewport at {vx},{vy} {vw}x{vh}:\n{d}"
+    );
+
+    // And the toggle is still in the menu, where turning a thing on belongs.
+    let (mx, my) = menu_at(&d, "View");
+    let opened = dump(&[&scene(), "--iso", "--click", &format!("{mx},{my}")]);
+    assert!(
+        opened.contains("Isosurface at a value"),
+        "the toggle left with the slider:\n{opened}"
+    );
+    assert_eq!(
+        opened.matches("isosurface level").count(),
+        1,
+        "opening the menu produced a second level control:\n{opened}"
+    );
+}
+
+#[test]
+fn the_panels_are_in_a_menu_about_the_window_and_not_about_the_view() {
+    // **`View` was doing two jobs.** Eleven items across three subjects — how the viewport draws,
+    // which panels are on screen, and where the camera goes — while every other menu did one.
+    // The three that are not about the picture at all are the window's furniture, and they have a
+    // menu named for that now: a seventh name to read against three fewer items in the largest
+    // menu, which is the trade this makes on purpose.
+    //
+    // Counted rather than searched, because `Outliner` and `Inspector` are also panel headings on
+    // the screen behind the menu: opening the right menu makes each appear a second time.
+    let plain = dump(&[&scene()]);
+    let count = |d: &str, needle: &str| d.matches(needle).count();
+
+    let (wx, wy) = menu_at(&plain, "Window");
+    let window = dump(&[&scene(), "--click", &format!("{wx},{wy}")]);
+    for item in ["Outliner", "Inspector", "Settings and source"] {
+        assert!(
+            count(&window, item) > count(&plain, item),
+            "Window does not hold {item}:\n{window}"
+        );
+    }
+
+    let (vx, vy) = menu_at(&plain, "View");
+    let view = dump(&[&scene(), "--click", &format!("{vx},{vy}")]);
+    for item in ["Outliner", "Inspector", "Settings and source"] {
+        assert_eq!(
+            count(&view, item),
+            count(&plain, item),
+            "View still offers {item}:\n{view}"
+        );
+    }
+    // And View opened, or the three assertions above are about a menu that never appeared.
+    assert!(
+        count(&view, "Fit view") > count(&plain, "Fit view"),
+        "the View menu did not open, so this proves nothing:\n{view}"
+    );
+}
+
+#[test]
+fn solo_is_offered_once_and_where_the_selection_is_made() {
+    // **The eighth duplicate.** Seven came off the toolbar because a menu already held them; this
+    // one went the other way. `solo` acts on the *selection*, the outliner is where a selection is
+    // made, and its header carries the checkbox with the state visible — so the View menu's copy
+    // was the one to go.
+    let plain = dump(&[&scene()]);
+    assert!(
+        plain.contains("solo"),
+        "the outliner's own checkbox is gone:\n{plain}"
+    );
+    let (x, y) = menu_at(&plain, "View");
+    let opened = dump(&[&scene(), "--click", &format!("{x},{y}")]);
+    assert!(
+        !opened.contains("Solo the selection"),
+        "the menu still offers it:\n{opened}"
+    );
+    // The menu did open — otherwise this would pass with the item still there.
+    assert!(
+        opened.contains("Isosurface at a value"),
+        "the View menu did not open, so this proves nothing:\n{opened}"
+    );
+}
+
+#[test]
+fn a_picture_filtered_by_a_hidden_control_says_so() {
+    // **What removing the menu copy would otherwise have left.** The checkbox is in the outliner's
+    // header, so hiding the outliner — narrowing the window until it is squeezed out, or turning
+    // it off in the View menu — leaves the viewport drawing one domain out of five with nothing on
+    // screen saying why. A picture filtered by a control nobody can see is the silence this
+    // repository hunts.
+    //
+    // 460 points is the first width the outliner does not survive; 1500 is one where it does.
+    let hidden = dump(&[&scene(), "--solo", "--width", "420"]);
+    assert!(
+        hidden.contains("solo — drawing only the selection"),
+        "the outliner is gone and nothing says the view is filtered:\n{hidden}"
+    );
+
+    // And it is not said when the checkbox is on screen to say it, or when solo is off — a notice
+    // that is always there is decoration rather than a measurement.
+    let shown = dump(&[&scene(), "--solo", "--width", "1500"]);
+    assert!(
+        !shown.contains("solo — drawing only the selection"),
+        "said while the checkbox is on screen:\n{shown}"
+    );
+    let off = dump(&[&scene(), "--width", "420"]);
+    assert!(
+        !off.contains("solo — drawing only the selection"),
+        "said while solo is off:\n{off}"
+    );
+}
+
+#[test]
+fn the_editor_says_what_it_does_when_nobody_is_looking() {
+    // Watching a file and running on change happen with no click, so the status bar is where a
+    // person finds out they are on. They were two checkboxes taking permanent room on the
+    // toolbar, which showed the same state and cost four times the width.
+    let d = dump(&[&scene()]);
+    assert!(
+        d.contains("watching the file"),
+        "nothing says the editor is watching:\n{d}"
+    );
+}
+
+#[test]
+fn a_remembered_file_that_is_gone_is_shown_and_refused() {
+    // A list that silently shortens itself looks like a list that forgot. The reader is then left
+    // wondering whether the editor lost their scene or they imagined opening it — so a path that
+    // has gone is on the screen, named, and not clickable.
+    let dir = std::env::temp_dir().join("pantometry-recent-test");
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    let list = dir.join("recent.json");
+    let here = scene();
+    let gone = dir.join("deleted-since.json");
+    let _ = std::fs::remove_file(&gone);
+    std::fs::write(
+        &list,
+        serde_json::to_string(&[here.clone(), gone.to_string_lossy().into_owned()])
+            .expect("two strings"),
+    )
+    .expect("writable");
+
+    let d = dump_listing(&list.to_string_lossy(), &[]);
+    assert!(d.contains("Recent"), "no list at all:\n{d}");
+    assert!(d.contains("built-in.json"), "the scene that is there:\n{d}");
+    assert!(
+        d.contains("deleted-since.json — missing"),
+        "the scene that is gone left without a word:\n{d}"
+    );
+}
+
+#[test]
+fn a_scene_that_does_not_check_out_says_why_on_the_screen() {
+    // The parser knows `line:column` and the missing key by name. What this asserts is that the
+    // sentence reaches the *screen* — a diagnostic that only ever appears on stderr is a
+    // diagnostic an editor's user never sees.
+    let dir = std::env::temp_dir().join("pantometry-ui-dump-test");
+    std::fs::create_dir_all(&dir).expect("a temp dir");
+    let path = dir.join("broken.json");
+    std::fs::write(
+        &path,
+        r#"{ "title": "broken", "duration_s": 1.0, "frames": 2, "domains": [ { "kind": "block", "name": "b" } ] }"#,
+    )
+    .expect("writable");
+
+    let d = dump(&[&path.to_string_lossy()]);
+    assert!(
+        d.contains("missing field `cells`"),
+        "the parser's reason is not on screen:\n{d}"
+    );
+    assert!(d.contains("1:100"), "the place is not on screen:\n{d}");
+
+    // **And what the editor did is still on screen while the document is wrong.** The status bar
+    // was `match error { Some => error, None => status }`, so a parse error hid every report the
+    // editor made about its own actions — saving a scene with a missing field wrote the file and
+    // said nothing. The two are facts about different things, and the second is wanted most
+    // exactly when the first is true.
+    assert!(
+        d.contains("loaded "),
+        "the error hid what the editor just did:\n{d}"
+    );
+
+    // Reading order: the document's problem first, then what happened. The error was on the
+    // right-hand side of the window for one commit, because a right-to-left row puts the first
+    // widget added at the right.
+    let x = |needle: &str| -> f32 {
+        let line = d
+            .lines()
+            .find(|l| said(l).is_some_and(|t| t.starts_with(needle)))
+            .unwrap_or_else(|| panic!("no {needle} in:\n{d}"));
+        box_of(line).expect("a left edge").0
+    };
+    assert!(
+        x("1:100") < x("loaded "),
+        "the error is not the first thing on the line:\n{d}"
+    );
+}
+
+#[test]
+fn the_two_command_rows_are_both_there_and_are_not_the_same_row() {
+    // **What the dump can and cannot see.** A menu's *items* live inside a closed menu and are not
+    // on the screen; what is on the screen is six menu titles and the strip of buttons under them.
+    // So this asserts the two rows, not their contents — an earlier version of this test was named
+    // for a claim about duplication that its assertion did not make, and could not have: it counted
+    // whether five strings appeared *anywhere*, which is true of five strings that appear once.
+    //
+    // The duplication is real and is read from the source rather than from here: `File` holds Load
+    // and Save while the toolbar holds `load` and `save`, and `View` holds Fit view while the
+    // toolbar holds `fit view`. Whether that is redundancy worth removing is a design question this
+    // test does not answer.
+    let d = dump(&[&scene()]);
+    let row = |top: i32| -> Vec<String> {
+        d.lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let (_, y) = (it.next()?, it.next()?.parse::<i32>().ok()?);
+                (y == top).then(|| said(l).unwrap_or("").to_string())
+            })
+            .collect()
+    };
+    let menu = row(4);
+    // **Where the toolbar is, read rather than written down.** It was `row(26)`, and egui 0.37's
+    // roomier buttons put the strip at 30: the test then reported an empty toolbar about a frame
+    // that had one. The row is the one `fit view` is on, and what is asserted is that it is below
+    // the menu's and that `run` shares it.
+    let top_of = |text: &str| -> Option<i32> {
+        d.lines().find_map(|l| {
+            let mut it = l.split_whitespace();
+            let (_, y) = (it.next()?, it.next()?.parse::<i32>().ok()?);
+            (said(l) == Some(text)).then_some(y)
+        })
+    };
+    let bar_top = top_of("fit view").expect("`fit view` is on the screen");
+    assert!(
+        bar_top > 4,
+        "the toolbar is not below the menu row: at y={bar_top}
+{d}"
+    );
+    let bar = row(bar_top);
+    assert_eq!(
+        menu,
+        ["File", "Edit", "View", "Window", "Domain", "Run", "Watch"],
+        "the menu row is not what it was"
+    );
+    assert!(
+        bar.contains(&"run".to_string()) && bar.contains(&"fit view".to_string()),
+        "the toolbar row is not below the menu row: {bar:?}"
+    );
+    assert_ne!(menu, bar, "the two rows collapsed into one");
+}
+
+/// **The screen with the pictures on it, at every width and in every area.**
+///
+/// This is the screen a person lands on, and it is the one the dump could not reach: the tiles
+/// only exist once an area is expanded, so a frame built from nothing has all eleven shut and
+/// shows nothing to measure. `--open <n>` expands one, and this walks all of them.
+///
+/// Both defects it was written after were invisible in a dump of the shut screen and obvious in
+/// one of an open area:
+///
+/// * `ui.vertical` inside `horizontal_wrapped` gives the row no item size to break on, so nothing
+///   wrapped and the fifth tile's caption was laid out at x=1384 of a 1500-point window — `cut=1`,
+///   and the dump named the string.
+/// * Reserving the rect fixed that and `allocate_ui` inherits the *parent's* layout, which for a
+///   wrapped row is left-to-right. The three strings in a tile were laid out along it instead of
+///   stacked: `overlap=8`, at every width.
+///
+/// Neither would have failed a test of the shut screen and neither shows up in a screenshot of the
+/// first area alone — the second one did not, and it was found by widening the sweep.
+#[test]
+fn every_area_of_the_start_screen_lays_out_at_every_width() {
+    let areas = pantometry_world::presets::AREA_COUNT;
+    assert!(
+        areas >= 8,
+        "only {areas} areas — the walk would prove little"
+    );
+    // 500 is narrower than the 780-point column the screen asks for, which is the case that
+    // found the column had asked for it unconditionally.
+    for w in ["1500", "1100", "900", "700", "500"] {
+        let shut = dump(&["--new", "--width", w]);
+        assert_eq!(
+            count(&shut, "cut"),
+            0,
+            "at {w} with every area shut:
+{shut}"
+        );
+        assert_eq!(
+            count(&shut, "overlap"),
+            0,
+            "at {w} with every area shut:
+{shut}"
+        );
+        for a in 0..areas {
+            let n = a.to_string();
+            let d = dump(&["--new", "--open", &n, "--width", w]);
+            // **Something was drawn**, or the three zeros below are true of an empty screen.
+            // Measured: a `if ui.ctx().screen_rect().width() < 800.0 { continue; }` inserted into
+            // the tile loop passed all 22 tests in this file, because the only check that an open
+            // area shows anything ran at the default width alone — 22 of these 55 combinations
+            // were asserting three zeros about nothing.
+            //
+            // *One* title rather than all of them: at 500 points the column scrolls and only the
+            // first three of an area's seven are laid out, which is the screen working.
+            //
+            // **And the last area is below the fold.** Since egui 0.37's taller rows, `All of it
+            // at once` — the thirteenth, under twelve shut ones — puts its one tile's caption at
+            // y≈900 under a `Back` row at 892, and the scroll area does not lay it out. That is
+            // the column scrolling, as at 500; so a frame tall enough to reach it is asked, and
+            // only for whether something was drawn. The geometry below is still this frame's.
+            let key = pantometry_world::presets::AREAS[a].0;
+            let drew = |d: &str| {
+                pantometry_world::presets::PRESETS
+                    .iter()
+                    .any(|p| p.area == key && d.contains(p.title))
+            };
+            let tall;
+            let seen = if drew(&d) {
+                &d
+            } else {
+                tall = dump(&["--new", "--open", &n, "--width", w, "--height", "1400"]);
+                &tall
+            };
+            assert!(
+                drew(seen),
+                "area {a} ({key}) at {w} is open and drew no tile, in 950 points or 1400:
+{seen}"
+            );
+            assert_eq!(
+                count(&d, "cut"),
+                0,
+                "area {a} at {w}:
+{d}"
+            );
+            assert_eq!(
+                count(&d, "overlap"),
+                0,
+                "area {a} at {w}:
+{d}"
+            );
+            assert_eq!(
+                count(&d, "elided"),
+                0,
+                "area {a} at {w}:
+{d}"
+            );
+        }
+    }
+}
+
+/// **Opening an area shows its scenes, and shutting it stops showing them.**
+///
+/// The walk above measures geometry and would pass just as well against a screen that drew no
+/// tiles at all — an area whose contents silently stopped rendering has nothing to lay out badly.
+/// This is the other half: the titles of that area's scenes are on the screen when it is open and
+/// are not when it is shut.
+#[test]
+fn an_open_area_shows_its_scenes_and_a_shut_one_does_not() {
+    use pantometry_world::presets::{AREAS, PRESETS};
+    let shut = dump(&["--new"]);
+    for (a, (key, name, _)) in AREAS.iter().enumerate() {
+        let held: Vec<&str> = PRESETS
+            .iter()
+            .filter(|p| p.area == *key)
+            .map(|p| p.title)
+            .collect();
+        assert!(!held.is_empty(), "{key} holds nothing");
+        for title in &held {
+            assert!(
+                !shut.contains(title),
+                "{name} is shut and `{title}` is on the screen:
+{shut}"
+            );
+        }
+        // Tall enough for the last area's tiles, which are below a 950-point frame since egui
+        // 0.37's taller rows (see the walk above). Every check on an open area reads this frame:
+        // a taller one hides nothing a shorter one shows, so none of them is weakened by it.
+        let open = dump(&["--new", "--open", &a.to_string(), "--height", "1400"]);
+        for title in &held {
+            assert!(
+                open.contains(title),
+                "{name} is open and `{title}` is not on the screen:
+{open}"
+            );
+        }
+        // And only that area's, or opening one would open all eleven and the collapsing would be
+        // decoration.
+        let others = PRESETS.iter().filter(|p| p.area != *key).count();
+        let showing = PRESETS
+            .iter()
+            .filter(|p| p.area != *key && open.contains(p.title))
+            .count();
+        assert_eq!(
+            showing, 0,
+            "{name} is open and {showing} of {others} scenes from other areas are showing too"
+        );
+
+        // **The sentence the screen says about a scene with no picture, counted.** `Art::of`
+        // decodes a tile and turns *any* failure into the same `None` that "this scene has no
+        // geometry" is — so a tile that stopped decoding would put a claim about the physics
+        // under a scene that draws perfectly well. Measured: forcing one preset's decode to fail
+        // left all 22 tests in this file green.
+        //
+        // Counted against the data rather than pinned, so it follows the presets.
+        let wordless = PRESETS
+            .iter()
+            .filter(|p| p.area == *key && p.thumb.is_none())
+            .count();
+        assert_eq!(
+            open.matches("no picture").count(),
+            wordless,
+            "{name} has {wordless} scenes with no picture and the screen says so {} times:
+{open}",
+            open.matches("no picture").count()
+        );
+    }
+}
+
+/// **`--open` refuses an index that is not an area.**
+///
+/// This door exists only so a test can see the tiles, and it used to ignore anything it could not
+/// read: `--open 99`, `--open banana`, `--open -1` and a bare `--open` each produced a dump
+/// byte-identical to the shut screen and exited 0. The shut screen satisfies every geometric
+/// assertion the sweep makes about an open one, so a mistyped index bought a green — which is the
+/// one thing a door built for tests must not do.
+#[test]
+fn a_bad_area_is_refused_rather_than_shown_shut() {
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pantometry"));
+    let last = pantometry_world::presets::AREA_COUNT - 1;
+    for bad in [
+        last.saturating_add(1).to_string(),
+        "banana".into(),
+        "-1".into(),
+    ] {
+        let out = std::process::Command::new(&bin)
+            .args(["--ui-dump", "--new", "--open", &bad])
+            .output()
+            .expect("the binary runs");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--open {bad} was not refused: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("takes an area from 0 to"),
+            "--open {bad} was refused without saying what it takes"
+        );
+    }
+    // And the last real one is not refused, or the bound is off by one and every test above it
+    // has been reading a shut screen.
+    let out = std::process::Command::new(&bin)
+        .args(["--ui-dump", "--new", "--open", &last.to_string()])
+        .output()
+        .expect("the binary runs");
+    assert!(
+        out.status.success(),
+        "--open {last} is the last area and was refused"
+    );
+}
+
+/// **A run the scene refuses is an exit code, not a frame.** `--ui-dump --ran` printed
+/// `the run refused: …` on stdout and exited 0, so anything reading the exit code took the refusal
+/// for a frame: `tools/screenshot/take.ps1` would have written it over a figure's caption and
+/// printed `wrote`, and the guard comparing that caption with a fresh dump of the same broken
+/// scene would have agreed with it. Both ways a dump runs a scene are held, because each had its
+/// own early return.
+#[test]
+fn a_refused_run_exits_one_and_prints_no_frame() {
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pantometry"));
+    let dir = std::env::temp_dir().join("pantometry-ui-dump-refused");
+    std::fs::create_dir_all(&dir).expect("a temporary directory");
+    // A file that parses as JSON and is not a scene: it opens, and only running it fails.
+    let bad = dir.join("not-a-scene.json");
+    std::fs::write(&bad, r#"{"not": "a scene"}"#).expect("the scene is written");
+    let bad = bad.to_string_lossy().into_owned();
+    for run in ["--ran", "--run-after-clicks"] {
+        let out = std::process::Command::new(&bin)
+            .args(["--ui-dump", &bad, run])
+            .output()
+            .expect("the binary runs");
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(out.status.code(), Some(1), "{run}: {stdout}{stderr}");
+        assert!(stdout.is_empty(), "{run}: a frame was printed: {stdout}");
+        assert!(
+            stderr.starts_with("the run refused: "),
+            "{run}: refused without saying so: {stderr}"
+        );
+    }
+    // And the same flags on a scene that runs still print a frame, or the refusal above is
+    // every scene's.
+    for run in ["--ran", "--run-after-clicks"] {
+        let out = std::process::Command::new(&bin)
+            .args(["--ui-dump", &scene(), run])
+            .output()
+            .expect("the binary runs");
+        assert!(out.status.success(), "{run}: a good scene was refused");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).starts_with("size="),
+            "{run}: a good scene printed no frame"
+        );
+    }
+}
+
+/// **An argument the dump does not understand is refused, not ignored.**
+///
+/// Each flag used to be looked up on its own, so an argument no lookup asked for was never seen.
+/// Every case below produced a frame and exited 0: `--rann` and a scene written after a flag the
+/// shut start screen, `--width 1500px` a 1500-point window, `--click 10;20` no click, and a scene
+/// that does not exist the built-in scene run under the missing file's name — with nothing in the
+/// frame to say so. A test with any of these typos was checking something it did not ask for.
+///
+/// Each bad case is paired with the one-word fix, which must print a frame: without the pair a
+/// dump that refused everything would pass. And each names the reason it must be refused for,
+/// because any refusal prints the same exit code and usage, so without it a case could be caught
+/// by a rule other than the one it is there for.
+///
+/// The second eight came from review of the first: a scene that exists and is not UTF-8, `--open`
+/// and `--custom` without `--new`, a kind the chooser does not have, and a click that cannot land.
+#[test]
+fn an_argument_it_does_not_take_is_refused_rather_than_ignored() {
+    let bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pantometry"));
+    let s = scene();
+    let missing = std::env::temp_dir()
+        .join("pantometry-ui-dump-no-such-scene.json")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        !std::path::Path::new(&missing).exists(),
+        "{missing} exists, so it cannot stand for a missing scene"
+    );
+    // UTF-16 with its byte-order mark, which is what PowerShell 5.1's `>` writes: a file that
+    // exists, that `fs::read` reads, and that the editor's `read_to_string` does not.
+    let wide = std::env::temp_dir().join("pantometry-ui-dump-utf16-scene.json");
+    let text = std::fs::read_to_string(&s).expect("the scene is readable");
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    std::fs::write(&wide, bytes).expect("the UTF-16 scene is written");
+    let wide = wide.to_string_lossy().into_owned();
+    let cases: [(&[&str], &[&str], &str); 16] = [
+        (&["--rann"], &["--ran"], "does not take --rann"),
+        (&[&s, "--rann"], &[&s, "--ran"], "does not take --rann"),
+        (&["--ran", &s], &[&s, "--ran"], "after a flag"),
+        (&["--width", "1500px"], &["--width", "1500"], "got 1500px"),
+        (
+            &["--width", "800", "--width", "900"],
+            &["--width", "900"],
+            "given twice",
+        ),
+        (&["--click", "10;20"], &["--click", "10,20"], "got 10;20"),
+        (&["--drag", "1,2,3"], &["--drag", "1,2,3,4"], "got 1,2,3"),
+        (
+            &[&missing, "--ran"],
+            &[&s, "--ran"],
+            "does not stand the built-in",
+        ),
+        (
+            &[&wide, "--ran"],
+            &[&s, "--ran"],
+            "does not stand the built-in",
+        ),
+        (
+            &["--open", "0"],
+            &["--new", "--open", "0"],
+            "--open takes effect only",
+        ),
+        (
+            &["--custom"],
+            &["--new", "--custom"],
+            "--custom takes effect only",
+        ),
+        (
+            &["--new", "welll,orbit"],
+            &["--new", "well,orbit"],
+            "got \"welll\"",
+        ),
+        (&["--new", "well,"], &["--new", "well"], "got \"\""),
+        (&["--click", "NaN,10"], &["--click", "10,10"], "got NaN,10"),
+        (
+            &["--click", "5000,10"],
+            &["--click", "500,10"],
+            "outside the 1500x950",
+        ),
+        (
+            &["--drag", "1,2,3,-4"],
+            &["--drag", "1,2,3,4"],
+            "outside the 1500x950",
+        ),
+    ];
+    for (bad, good, why) in cases {
+        let out = std::process::Command::new(&bin)
+            .arg("--ui-dump")
+            .args(bad)
+            .output()
+            .expect("the binary runs");
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{bad:?} was not refused: {stdout}{stderr}"
+        );
+        assert!(stdout.is_empty(), "{bad:?}: a frame was printed: {stdout}");
+        assert!(
+            stderr.contains("usage: pantometry --ui-dump"),
+            "{bad:?}: refused without the usage: {stderr}"
+        );
+        assert!(
+            stderr.contains(why),
+            "{bad:?}: refused, but not for {why:?}: {stderr}"
+        );
+        assert!(
+            dump(good).starts_with("size="),
+            "{good:?}, the fix for {bad:?}, printed no frame"
+        );
+    }
+}
+
+/// **Every string on every screen can actually be drawn by the font that draws it.**
+///
+/// A codepoint the bundled face does not have comes out as a hollow square, and nothing here could
+/// see it: the dump reports the *string*, and the string is fine — `\u{25b8}` is a triangle by
+/// every measure except the one that matters. The outliner drew **two** missing-glyph squares on
+/// every row, a fold arrow and an eye, for as long as it had rows; the chooser drew eleven. Both
+/// were found by taking a screenshot and looking, which is not a check.
+///
+/// `unwritable` asks `epaint`'s own `has_glyphs` of the family each string was laid out in, so it
+/// is the same question the renderer will ask. Control characters are excluded — a `TextEdit`'s
+/// buffer carries newlines and no face has a glyph for one.
+#[test]
+fn every_string_is_one_the_font_can_draw() {
+    let scene = scene();
+    let screens: [(&str, Vec<&str>); 7] = [
+        ("the front screen", vec![]),
+        ("the preset screen", vec!["--new"]),
+        ("an open area", vec!["--new", "--open", "0"]),
+        ("the last area", vec!["--new", "--open", "10"]),
+        ("the kinds screen", vec!["--new", "--custom"]),
+        ("a scene, not run", vec![&scene]),
+        ("a scene, run", vec![&scene, "--ran"]),
+    ];
+    for (what, args) in screens {
+        for w in ["1500", "900", "700"] {
+            let mut argv = args.clone();
+            argv.extend(["--width", w]);
+            let d = dump(&argv);
+            let squares: Vec<&str> = d.lines().filter(|l| l.starts_with('?')).collect();
+            assert_eq!(
+                count(&d, "unwritable"),
+                0,
+                "{what} at {w} draws {} string(s) the font has no glyphs for:\n{}",
+                squares.len(),
+                squares.join("\n")
+            );
+        }
+    }
+}
+
+/// Where a string sits, as a point to click. Read from the dump rather than written down, because
+/// a coordinate typed into a test goes on pressing whatever moves under it.
+fn centre_of(dump: &str, text: &str) -> (f32, f32) {
+    let line = dump
+        .lines()
+        .find(|l| said(l) == Some(text))
+        .unwrap_or_else(|| panic!("nothing on screen says `{text}`:\n{dump}"));
+    let (left, top, w) = box_of(line).expect("a box");
+    (left + w / 2.0, top + 7.0)
+}
+
+/// **Going back to the pictures and returning does not clear what was ticked.**
+///
+/// `Back` used to drop every tick on the floor. The set is taken out of `self.choosing` at the top
+/// of the frame with `mem::take`, and that arm neither restored it nor consumed it — harmless
+/// while `Back` meant "leave the chooser entirely", wrong the moment it came to mean "up one level
+/// to the pictures", because `Custom…` comes straight back to a list with nothing in it.
+///
+/// It needs **two** clicks to see: the ticks are on neither screen, so what is checked is that the
+/// kinds screen still says the thing it only says when two kinds are ticked. `--click` took one
+/// point until this test, which is why a state change across screens had never been checked.
+#[test]
+fn what_was_ticked_survives_a_trip_to_the_pictures_and_back() {
+    let kinds = dump(&["--new", "well,orbit"]);
+    // The warning only appears with both ticked, and `Create` only with at least one.
+    let warned = |d: &str| d.contains("times apart");
+    assert!(
+        warned(&kinds),
+        "the kinds screen did not warn to begin with:\n{kinds}"
+    );
+    let (bx, by) = centre_of(&kinds, "Back");
+
+    let back = format!("{bx},{by}");
+    let pictures = dump(&["--new", "well,orbit", "--click", &back]);
+    assert!(
+        pictures.contains("open one of these and change it"),
+        "clicking Back did not reach the pictures:\n{pictures}"
+    );
+    let (cx, cy) = centre_of(&pictures, "Custom\u{2026}");
+
+    let again = dump(&[
+        "--new",
+        "well,orbit",
+        "--click",
+        &back,
+        "--click",
+        &format!("{cx},{cy}"),
+    ]);
+    assert!(
+        !again.contains("open one of these and change it"),
+        "clicking Custom did not leave the pictures:\n{again}"
+    );
+    assert!(
+        warned(&again),
+        "the ticks were dropped on the way to the pictures and back:\n{again}"
+    );
+}

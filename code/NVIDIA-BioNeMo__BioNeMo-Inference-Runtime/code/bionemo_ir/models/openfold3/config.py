@@ -1,0 +1,434 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from pydantic import ConfigDict, Field
+
+from bionemo_ir._torch.graph_optimization.config import CUDAGraphOptimizationConfig, NamedDimTies
+from bionemo_ir._torch.graph_optimization.graph_policy import (
+    diffusion_graph_max_tokens,
+    exact_graph_config,
+    pairformer_graph_config,
+    trunk_graph_config,
+)
+from bionemo_ir._torch.modules.openfold3.utils.atomize_utils import ATOM_GATHER_KEYS
+from bionemo_ir._torch.sampling.frame_reuse import FrameReuseSetting
+from bionemo_ir.configs import (
+    BaseConfig,
+    DiffusionTransformerConfig,
+    FeatureDictPadSpec,
+    MSAModuleStackConfig,
+    PairformerConfig,
+    TrunkPadSpec,
+)
+from bionemo_ir.registry import SupMat
+
+# Batch features the denoising step reads: relative-position features, reference
+# conformer, atom layout and the gather tables of ``prepare_atom_reduction``.
+DENOISER_FEATURE_KEYS: tuple[str, ...] = (
+    "asym_id",
+    "entity_id",
+    "residue_index",
+    "sym_id",
+    "token_index",
+    "token_mask",
+    "num_atoms_per_token",
+    "atom_mask",
+    "atom_to_token_index",
+    "atom_broadcast_index",
+    *ATOM_GATHER_KEYS,
+    "ref_atom_name_chars",
+    "ref_charge",
+    "ref_element",
+    "ref_mask",
+    "ref_pos",
+    "ref_space_uid",
+)
+
+
+def _diffusion_graph_config() -> CUDAGraphOptimizationConfig:
+    return exact_graph_config(
+        named_dims=(
+            NamedDimTies(
+                name="num_tokens",
+                input_dims=(("si_input", (-2,)), ("si_trunk", (-2,)), ("zij_trunk", (-2, -3)), ("token_mask", (-1,))),
+            ),
+        ),
+        max_tokens=diffusion_graph_max_tokens(),
+        stable_kwargs=(
+            "batch",
+            "token_mask",
+            "atom_mask",
+            "si_input",
+            "si_trunk",
+            "zij_trunk",
+            "prepared_zij",
+            "prepared_si",
+            "prepared_atom_cl",
+            "prepared_atom_plm",
+            "prepared_atom_encoder_pair_biases",
+            "prepared_atom_decoder_pair_biases",
+            "prepared_atom_encoder_conditioning",
+            "prepared_atom_decoder_conditioning",
+            "prepared_token_pair_biases",
+            "prepared_token_conditioning_weights",
+        ),
+        feature_kwargs={"batch": DENOISER_FEATURE_KEYS},
+    )
+
+
+class _Default:
+    c_z: int = 128
+    c_s: int = 384
+    n_query: int = 32
+    n_key: int = 128
+    c_s_input: int = 449
+
+
+class InputEmbedderAllAtomConfig(BaseConfig):
+    c_s_input: int = 449
+    c_atom_ref_element: int = 119
+    c_atom_ref_name_chars: int = 256
+    c_atom: int = 128
+    c_atom_pair: int = 16
+    c_token: int = 384
+    c_hidden: int = 32
+    n_transition: int = 2
+    n_query: int = _Default.n_query
+    n_key: int = _Default.n_key
+    c_s: int = _Default.c_s
+    c_z: int = _Default.c_z
+    max_relative_idx: int = 32
+    max_relative_chain: int = 2
+    add_noisy_pos: bool = False
+    atom_transformer_config: DiffusionTransformerConfig = DiffusionTransformerConfig(
+        num_blocks=3,
+        num_heads=4,
+        dim=128,
+        dim_single_cond=128,
+        dim_pairwise=16,
+        post_layer_norm=False,
+        bias_proj=True,
+        dtype="float32",
+        initial_norm=False,
+        attention_initial_norm=False,
+        use_ada_layer_norm=True,
+        use_separate_layer_norm=True,
+        conditioned_transition_using_silu=True,
+        version="v1",
+        shared_pair_norm=True,
+    )
+
+
+class TemplateEmbedderConfig(BaseConfig):
+    c_z: int = _Default.c_z
+
+    template_pair_embedder: BaseConfig = BaseConfig(
+        c_in=128,
+        c_dgram=39,
+        c_aatype=32,
+        c_out=64,
+    )
+
+    template_pair_stack: BaseConfig = BaseConfig(
+        c_t=64,
+        c_hidden_tri_att=16,
+        c_hidden_tri_mul=64,
+        no_blocks=2,
+        no_heads=4,
+        tri_mul_first=True,
+        trimul_high_precision=False,
+        pair_transition_n=2,
+        transition_type="swiglu",
+        # The shipped of3-p2-155k checkpoint targets OSS v0.4.3, whose
+        # ending-node triangle attention uses the untransposed pair bias.
+        tri_attn_transposed_bias=False,
+    )
+
+
+class MSAModuleEmbedderConfig(BaseConfig):
+    c_m_feats: int = 34
+    c_m: int = 64
+    c_s_input: int = 449
+    subsample_main_msa: bool = False
+    subsample_all_msa: bool = True
+    min_subsampled_all_msa: int = 1024
+    max_subsampled_all_msa: int = 1024
+    # BioIR and OSS featurizers set ``msa_mask`` to 1 except at padded tokens,
+    # so every row is valid and row selection needs no device-to-host read.
+    assume_valid_msa_rows: bool = True
+
+
+class DiffusionModuleConfig(BaseConfig):
+    graph_optimization_config: CUDAGraphOptimizationConfig | None = Field(
+        default_factory=_diffusion_graph_config, description="CUDA-graph policy for one denoising step."
+    )
+    c_s_input: int = _Default.c_s_input
+    c_atom_ref_element: int = 119
+    c_atom_ref_name_chars: int = 256
+    c_atom: int = 128
+    c_atom_pair: int = 16
+    c_hidden: int = 32
+    n_transition: int = 2
+    n_query: int = 32
+    n_key: int = 128
+    c_s: int = _Default.c_s
+    c_z: int = _Default.c_z
+    c_token: int = 768
+    sigma_data: float = 16
+    eps: float = 1e-5
+    inf: float = 1e9
+    add_noisy_pos: bool = True
+    diffusion_conditioning_config: BaseConfig = BaseConfig(c_fourier_emb=256, max_relative_idx=32, max_relative_chain=2)
+    atom_transformer_encoder_config: BaseConfig = BaseConfig(
+        num_blocks=3,
+        num_heads=4,
+        dim=128,
+        dim_single_cond=128,
+        dim_pairwise=16,
+        post_layer_norm=False,
+        bias_proj=True,
+        dtype="float32",
+        eps=1e-5,
+        inf=1e9,
+        initial_norm=False,
+        attention_initial_norm=False,
+        use_ada_layer_norm=True,
+        use_separate_layer_norm=True,
+        conditioned_transition_using_silu=True,
+        version="v1",
+        shared_pair_norm=True,
+    )
+    diffusion_transformer_config: BaseConfig = BaseConfig(
+        token_transformer=DiffusionTransformerConfig(
+            num_blocks=24,
+            num_heads=16,
+            dim=768,
+            dim_single_cond=c_s,
+            dim_pairwise=c_z,
+            expansion_factor=2,
+            bias_proj=True,
+            use_separate_layer_norm=False,
+            conditioned_transition_using_silu=True,
+            version="v1",
+            dtype="float32",
+        )
+    )
+    atom_transformer_decoder_config: BaseConfig = BaseConfig(
+        num_blocks=3,
+        num_heads=4,
+        dim=128,
+        dim_single_cond=128,
+        dim_pairwise=16,
+        post_layer_norm=False,
+        bias_proj=True,
+        dtype="float32",
+        eps=1e-5,
+        inf=1e9,
+        initial_norm=False,
+        attention_initial_norm=False,
+        use_ada_layer_norm=True,
+        use_separate_layer_norm=True,
+        conditioned_transition_using_silu=True,
+        version="v1",
+        shared_pair_norm=True,
+    )
+
+
+class EDMSamplingConfig(BaseConfig):
+    # Check assignments too: the documented way to change ``frame_reuse_period`` is to assign it.
+    model_config = ConfigDict(validate_assignment=True)
+
+    gamma_0: float = 0.8
+    gamma_min: float = 1.0
+    noise_scale: float = 1.003
+    step_scale: float = 1.5
+    use_conditioning: bool = True
+    frame_reuse_period: FrameReuseSetting = Field(
+        default="auto",
+        description=(
+            "Approximation: in the churn-free tail of the rollout, run the denoiser every this many steps and map the"
+            ' previous prediction through each step\'s augmentation in between. "auto" (default) uses period 4 when'
+            " the rollout has 100, 150, 200 or 400 steps and runs exact otherwise; 0 is always exact; 4 forces reuse,"
+            " and the model rejects other step counts before it runs the trunk."
+        ),
+    )
+
+
+class AuxiliaryHeadsConfig(BaseConfig):
+    graph_optimization_config: CUDAGraphOptimizationConfig | None = Field(
+        default_factory=pairformer_graph_config, description="CUDA-graph policy for the per-sample Pairformer stack."
+    )
+    c_s_input: int = 449
+    c_z: int = 128
+    min_bin: float = 3.25
+    max_bin: float = 50.75
+    no_bin: int = 39
+    max_atoms_per_token: int = 23
+    inf: float = 1e9
+    memory_efficient_mode: bool = Field(
+        default=True, description="Run confidence Pairformer separately for each sample."
+    )
+    compact_output: bool = Field(
+        default=False,
+        description=(
+            "Reduce every sample's PAE logits to PAE, pTM and ipTM inside the confidence head during uncaptured "
+            "inference, and skip the PDE, distogram and resolved heads. Requires memory_efficient_mode. "
+            "Preserves the raw path's coordinate-dtype quantization before FP32 reduction."
+        ),
+    )
+    offload_pairformer_outputs: bool = Field(
+        default=True,
+        description=(
+            "Project each completed confidence pair immediately and keep only final PAE/PDE logits on CPU when "
+            "memory_efficient_mode is enabled. Other outputs stay on the input device."
+        ),
+    )
+    pairformer: PairformerConfig = PairformerConfig(
+        token_s=384,
+        token_z=128,
+        pairwise_head_width=32,
+        pairwise_num_heads=4,
+        num_blocks=4,
+        num_heads=16,
+        trimul_high_precision=False,
+        version="v1",
+        tri_attn_transposed_bias=False,
+        dtype="float32",
+    )
+    pde: BaseConfig = BaseConfig(
+        c_z=128,
+        c_out=64,
+    )
+    lddt: BaseConfig = BaseConfig(
+        c_s=384,
+        max_atoms_per_token=23,
+        c_out=50,
+    )
+
+    distogram: BaseConfig = BaseConfig(
+        c_z=128,
+        c_out=64,
+    )
+    experimentally_resolved: BaseConfig = BaseConfig(
+        c_s=384,
+        max_atoms_per_token=23,
+        c_out=2,
+    )
+    pae: BaseConfig = BaseConfig(
+        enabled=True,
+        c_z=128,
+        c_out=64,
+    )
+    # Tensors padded around the confidence pairformer.
+    token_pad_spec: TrunkPadSpec = TrunkPadSpec(
+        single_channel=("s",),
+        pair_channel=("z",),
+        single_last=("mask",),
+        pair_last=("pair_mask",),
+    )
+
+
+class TrunkConfig(BaseConfig):
+    graph_optimization_config: CUDAGraphOptimizationConfig | None = Field(
+        default_factory=trunk_graph_config, description="CUDA-graph policy for one trunk recycle."
+    )
+    pairformer: PairformerConfig = PairformerConfig()
+    # Tensors padded to a multiple of 8 tokens before the trunk; feature_dict covers the batch keys.
+    token_pad_spec: TrunkPadSpec = TrunkPadSpec(
+        single_channel=("s_input", "s_init"),
+        pair_channel=("z_init",),
+        feature_dict=FeatureDictPadSpec(
+            single_last=(
+                "token_mask",
+                "asym_id",
+                "residue_index",
+                "entity_id",
+                "has_deletion",
+                "deletion_value",
+                "msa_mask",
+                "template_pseudo_beta_mask",
+                "template_backbone_frame_mask",
+            ),
+            single_channel=("msa", "template_restype"),
+            pair_channel=("template_distogram", "template_unit_vector"),
+        ),
+    )
+
+
+class NoiseScheduleConfig(BaseConfig):
+    sigma_data: int = 16
+    s_max: float = 160.0
+    s_min: float = 0.0004
+    p: int = 7
+
+
+class OpenFold3Config(BaseConfig):
+    """P2 architecture matching of3-p2-155k and OpenFold3 0.4.3."""
+
+    c_z: int = _Default.c_z
+    c_s: int = _Default.c_s
+    num_recycles: int = 3
+    n_query: int = _Default.n_query
+    n_key: int = _Default.n_key
+    no_rollout_steps: int = 200
+    no_rollout_samples: int = 1
+    # fp32 LayerNorm → cast to trunk dtype (bf16-mixed without autocast).
+    trunk_ln_high_precision: bool = True
+
+    input_embedder_config: BaseConfig = InputEmbedderAllAtomConfig()
+    template_embedder_config: BaseConfig = TemplateEmbedderConfig()
+    msa_module_embedder_config: BaseConfig = MSAModuleEmbedderConfig()
+    msa_stack_module_config: BaseConfig = MSAModuleStackConfig(tri_attn_transposed_bias=False)
+    diffusion_module_config: BaseConfig = DiffusionModuleConfig()
+    auxiliary_heads_config: BaseConfig = AuxiliaryHeadsConfig()
+    edm_sampling_config: BaseConfig = EDMSamplingConfig()
+    noise_schedule_config: BaseConfig = NoiseScheduleConfig()
+
+    trunk: TrunkConfig = TrunkConfig(
+        pairformer=PairformerConfig(
+            token_s=c_s,
+            token_z=c_z,
+            pairwise_head_width=32,
+            pairwise_num_heads=4,
+            num_blocks=48,
+            num_heads=16,
+            trimul_high_precision=False,
+            version="v1",
+            tri_attn_transposed_bias=False,
+            dtype="float32",
+        )
+    )
+    structure_module: BaseConfig = BaseConfig(
+        score_model=BaseConfig(
+            token_transformer=DiffusionTransformerConfig(
+                num_blocks=24,
+                num_heads=16,
+                dim=768,
+                dim_single_cond=c_s,
+                dim_pairwise=c_z,
+                expansion_factor=2,
+                bias_proj=True,
+                use_separate_layer_norm=False,
+                conditioned_transition_using_silu=True,
+                attention_initial_norm=False,
+                post_layer_norm=False,
+                version="v1",
+                dtype="float32",
+            ),
+        )
+    )
+
+
+PRETRAINED_CONFIG_REGISTRY = {SupMat.OpenFold3: OpenFold3Config}

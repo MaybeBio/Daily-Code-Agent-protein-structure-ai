@@ -1,0 +1,424 @@
+/**
+ * Thin HTTP transport over built-in fetch (Node 20+).
+ *
+ * - Bearer auth via the configured API key (never logged; see sanitize()).
+ * - Per-request timeout via AbortController.
+ * - Robust envelope handling: success `{ data, meta }`, error
+ *   `{ error: { code, message, retryable }, request_id }`
+ *   plus `X-Request-Id` header propagation.
+ * - Retry-After honored for retry-safe GETs with bounded exponential
+ *   backoff + jitter. Mutations (POST) are NEVER auto-retried.
+ */
+import { buildInfo } from './build-info.js';
+import { randomUUID } from 'node:crypto';
+import { isUUID } from './uuid.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { EXIT, httpStatusToExit, errorCodeToExit } from './exit-codes.js';
+
+export const DEFAULT_TIMEOUT_MS = 30_000;
+export const MAX_GET_ATTEMPTS = 4;
+export const BACKOFF_BASE_MS = 500;
+export const BACKOFF_MAX_MS = 15_000;
+
+/** Redact anything that looks like a credential. */
+export function sanitize(value) {
+  if (typeof value !== 'string') return value;
+  return value
+    .replace(/arx_[A-Za-z0-9_-]{8,}/g, 'arx_[REDACTED]')
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, '$1[REDACTED]');
+}
+
+/** API failure with stable exit mapping. */
+export class ApiError extends Error {
+  constructor({ status, code, message, details, retryable, requestId, retryAfterMs }) {
+    super(sanitize(message || `Request failed${status ? ` (HTTP ${status})` : ''}`));
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+    this.retryable = retryable;
+    this.requestId = requestId;
+    this.retryAfterMs = retryAfterMs;
+    const publicDetails = sanitizeErrorDetails(details);
+    if (publicDetails !== undefined) this.details = publicDetails;
+    const fromStatus = typeof status === 'number' ? httpStatusToExit(status) : undefined;
+    const fromCode = errorCodeToExit(code);
+    // HTTP status wins when present; error-code mapping refines unknown statuses.
+    this.exitCode = fromStatus !== undefined ? fromStatus : (fromCode ?? EXIT.SERVER);
+    if (fromStatus === EXIT.SERVER && fromCode !== undefined) this.exitCode = fromCode;
+  }
+}
+
+/** Keep bounded public validation, payment and project-control details. */
+export function sanitizeErrorDetails(details) {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return undefined;
+  const result = {};
+  if (['abort_required', 'terminal_project_required', 'root_delete_requires_project_action'].includes(details.reason)) result.reason = details.reason;
+  if (['attention', 'timeout', 'interrupted'].includes(details.wait_outcome)) {
+    result.wait_outcome = details.wait_outcome;
+    if (isUUID(details.deletion_request_id)) result.deletion_request_id = details.deletion_request_id;
+    if (details.cleanup && typeof details.cleanup === 'object' && !Array.isArray(details.cleanup)) {
+      const c = details.cleanup;
+      const observation = {};
+      if (['managed', 'forge'].includes(c.kind)) observation.kind = c.kind;
+      if (c.state === null || ['pending', 'verified_empty', 'attention', 'completed'].includes(c.state)) observation.state = c.state;
+      for (const field of ['last_checked_at', 'last_complete_check_at', 'verified_empty_at', 'next_reconcile_at', 'verification_not_before']) {
+        if (c[field] === null) observation[field] = null;
+        else if (typeof c[field] === 'string' && Number.isFinite(Date.parse(c[field]))) observation[field] = new Date(c[field]).toISOString();
+      }
+      for (const field of ['object_count', 'multipart_count']) {
+        if (c[field] === null || Number.isSafeInteger(c[field]) && c[field] >= 0) observation[field] = c[field];
+      }
+      for (const field of ['compute_released', 'artifacts_deleted']) if (typeof c[field] === 'boolean') observation[field] = c[field];
+      if (c.error != null) observation.error = { code: 'storage_cleanup_incomplete', message: 'Project cleanup needs review' };
+      if (['publication_open','write_grants_pending','grant_coverage_unknown','namespace_unverified','storage_list_failed',
+        'storage_delete_failed','multipart_list_failed','multipart_abort_failed','invalid_storage_response','owner_unconfirmed',
+        'staging_pending','staging_attention','cleanup_attention'].includes(c.reason)) observation.reason = c.reason;
+      result.cleanup = observation;
+    }
+  }
+  if (Array.isArray(details.issues)) {
+    result.issues = details.issues.slice(0, 50).flatMap((issue) => {
+      if (!issue || !Array.isArray(issue.field) || typeof issue.rule !== 'string' || typeof issue.message !== 'string') return [];
+      const projected = {
+        field: issue.field.slice(0, 32).filter((v) => typeof v === 'string' || Number.isSafeInteger(v)).map(sanitize),
+        rule: sanitize(issue.rule).slice(0, 128),
+        message: sanitize(issue.message).slice(0, 1000),
+      };
+      if (issue.constraint && typeof issue.constraint === 'object') {
+        const constraint = {};
+        for (const key of ['minimum', 'maximum', 'minimum_field', 'maximum_field', 'allowed', 'fields', 'expected']) {
+          const value = issue.constraint[key];
+          if (typeof value === 'number' && Number.isFinite(value)) constraint[key] = value;
+          else if (typeof value === 'string') constraint[key] = sanitize(value).slice(0, 1000);
+          else if (Array.isArray(value) && value.every((v) => typeof v === 'string')) constraint[key] = value.slice(0, 50).map((v) => sanitize(v).slice(0, 128));
+        }
+        if (Object.keys(constraint).length) projected.constraint = constraint;
+      }
+      return [projected];
+    });
+  }
+  for (const key of ['current_balance_usd', 'required_balance_usd', 'deficit_usd']) {
+    if (typeof details[key] === 'number' && Number.isFinite(details[key])) result[key] = details[key];
+  }
+  const statuses = ['created', 'queued', 'running', 'in_progress', 'paused', 'completed', 'aborted', 'failed'];
+  if (statuses.includes(details.current_status)) result.current_status = details.current_status;
+  if (Array.isArray(details.allowed_statuses) && details.allowed_statuses.every((value) => statuses.includes(value))) {
+    result.allowed_statuses = [...new Set(details.allowed_statuses)];
+  }
+  if (isUUID(details.project_id)) result.project_id = details.project_id.trim().toLowerCase();
+  if (isUUID(details.batch_id) && isUUID(details.session_id) && Array.isArray(details.files) && details.files.length <= 100) {
+    result.batch_id = details.batch_id;
+    result.session_id = details.session_id;
+    if (['ready','pending','partial','failed'].includes(details.state)) result.state = details.state;
+    for (const key of ['ready_count','pending_count','failed_count','unknown_count','total_bytes']) {
+      if (Number.isSafeInteger(details[key]) && details[key] >= 0) result[key] = details[key];
+    }
+    if (Array.isArray(details.input_ids) && details.input_ids.length <= 100 && details.input_ids.every(isUUID)) result.input_ids = details.input_ids;
+    result.files = details.files.flatMap(file => {
+      if (!file || !isUUID(file.input_id) || !['ready','pending','failed','unknown'].includes(file.state)
+          || !Number.isSafeInteger(file.size_bytes) || file.size_bytes < 0 || typeof file.path !== 'string'
+          || Buffer.byteLength(file.path) > 1024 || /[\\\x00-\x1f\x7f]/.test(file.path)
+          || file.path.split('/').some(part => !part || part === '.' || part === '..')) return [];
+      return [{input_id:file.input_id,path:file.path,size_bytes:file.size_bytes,state:file.state,
+        ...(file.error ? {error:{code:['rate_limited','input_unconfirmed'].includes(file.error.code) ? file.error.code : 'input_staging_failed',
+          message:'Inspect this input ID and recover the same batch.'}} : {})}];
+    });
+  }
+  if (Number.isSafeInteger(details.control_revision) && details.control_revision >= 0) result.control_revision = details.control_revision;
+  if (typeof details.human_resume_required === 'boolean') result.human_resume_required = details.human_resume_required;
+  // Approval points at an ordinary project page. Never retain a grant, query,
+  // embedded credential or arbitrary backend URL under this public field.
+  if (result.project_id) {
+    const projectPath = new RegExp(`^/projects/(?:forge/)?${result.project_id}$`, 'i');
+    if (typeof details.approval_path === 'string' && projectPath.test(details.approval_path)) result.approval_path = details.approval_path;
+    if (typeof details.approval_url === 'string' && details.approval_url.length <= 2048) {
+      try {
+        const url = new URL(details.approval_url);
+        if (url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash
+            && projectPath.test(url.pathname) && sanitize(url.href) === url.href) result.approval_url = url.href;
+      } catch { /* Malformed approval links remain private. */ }
+    }
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
+/** Network-related failure, including invalid or unconfirmed remote responses. */
+export class NetworkError extends Error {
+  constructor(message, { cause } = {}) {
+    super(sanitize(message));
+    this.name = 'NetworkError';
+    this.exitCode = EXIT.NETWORK;
+    this.retryable = true;
+    if (cause !== undefined) this.cause = cause;
+  }
+}
+
+/** An API request failed at the client transport boundary or timed out. */
+export class ConnectivityError extends NetworkError {
+  constructor(message, { cause, method } = {}) {
+    super(`Unable to reach Ariax from this client. ${message}`, { cause });
+    this.name = 'ConnectivityError';
+    this.code = 'network_error';
+    this.method = method;
+  }
+}
+
+/**
+ * Parse a Retry-After header value (seconds or HTTP date) to ms.
+ * @param {string|null|undefined} value
+ * @param {number} [nowMs]
+ * @returns {number|undefined} bounded to [0, 120000]
+ */
+export function parseRetryAfter(value, nowMs = Date.now()) {
+  if (value == null || value === '') return undefined;
+  const s = String(value).trim();
+  if (/^\d+$/.test(s)) {
+    return Math.min(Number(s) * 1000, 120_000);
+  }
+  const t = Date.parse(s);
+  if (!Number.isNaN(t)) {
+    return Math.max(0, Math.min(t - nowMs, 120_000));
+  }
+  return undefined;
+}
+
+/**
+ * Bounded exponential backoff with +/-50% jitter.
+ * @param {number} attempt 0-based
+ * @param {( ) => number} [rand] injectable RNG for tests
+ */
+export function backoffDelay(attempt, baseMs = BACKOFF_BASE_MS, maxMs = BACKOFF_MAX_MS, rand = Math.random) {
+  const exp = Math.min(baseMs * 2 ** attempt, maxMs);
+  const jitter = exp * (0.5 + rand());
+  return Math.min(Math.round(jitter), maxMs);
+}
+
+const sleep = (ms, signal) => delay(ms, undefined, { signal });
+
+function interrupted(signal) {
+  const error = new Error(signal?.reason?.message || 'Request interrupted.');
+  error.exitCode = EXIT.INTERRUPTED;
+  return error;
+}
+
+async function withCallerSignal(operation, signal) {
+  if (!signal) return operation();
+  if (signal.aborted) throw interrupted(signal);
+  let abort;
+  const cancelled = new Promise((_, reject) => {
+    abort = () => reject(interrupted(signal));
+    signal.addEventListener('abort', abort, { once: true });
+  });
+  try { return await Promise.race([operation(), cancelled]); }
+  finally { signal.removeEventListener('abort', abort); }
+}
+
+function isLoopback(hostname) {
+  return hostname === 'localhost' || hostname === '::1' || /^127(?:\.\d{1,3}){3}$/.test(hostname);
+}
+
+/** Validate a server-issued upload or download URL without exposing it in errors. */
+export function validateTransferUrl(value, label = 'Transfer') {
+  let url;
+  try {
+    url = new URL(String(value));
+  } catch {
+    throw new NetworkError(`${label} URL is invalid.`);
+  }
+  if (url.username || url.password || url.hash) {
+    throw new NetworkError(`${label} URL contains unsupported credentials or a fragment.`);
+  }
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopback(url.hostname))) {
+    throw new NetworkError(`${label} URL must use HTTPS.`);
+  }
+  return url.toString();
+}
+
+function buildUrl(baseUrl, path, query) {
+  const direct = new URL(baseUrl.replace(/\/+$/, '') + (path.startsWith('/') ? path : `/${path}`));
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v === undefined || v === null || v === '') continue;
+      direct.searchParams.append(k, String(v));
+    }
+  }
+  return direct.toString();
+}
+
+/**
+ * Create a thin API client.
+ * @param {{ baseUrl: string, apiKey?: string, timeoutMs?: number, fetchImpl?: typeof fetch, sleepImpl?: (ms:number,signal?:AbortSignal)=>Promise<void>, rand?: ()=>number, onRetry?: (info:{method:string,path:string,attempt:number,waitMs:number,status?:number})=>void }} opts
+ */
+export function createClient({
+  baseUrl,
+  apiKey = '',
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  fetchImpl = globalThis.fetch,
+  sleepImpl = sleep,
+  rand = Math.random,
+  onRetry,
+} = {}) {
+  if (!baseUrl) throw new Error('baseUrl is required');
+  const cliVersion = buildInfo().version;
+
+  async function rawRequest(method, path, { query, body, idempotencyKey, timeout, signal } = {}) {
+    if (signal?.aborted) throw interrupted(signal);
+    const url = buildUrl(baseUrl, path, query);
+    const requestId = randomUUID();
+    const headers = {
+      Accept: 'application/json',
+      'X-Ariax-Client': 'cli',
+      'X-Ariax-CLI-Version': cliVersion,
+      'X-Request-Id': requestId,
+    };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    if (idempotencyKey) headers['Idempotency-Key'] = String(idempotencyKey);
+    let payload;
+    if (body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      payload = JSON.stringify(body);
+    }
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    const ms = timeout ?? timeoutMs;
+    const timer = setTimeout(() => controller.abort(), ms);
+    let responseReceived = false;
+    try {
+      const res = await fetchImpl(url, {
+        method,
+        headers,
+        body: payload,
+        signal: controller.signal,
+        redirect: 'error',
+      });
+      responseReceived = true;
+      const result = await parseResponse(res, { method, path });
+      if (signal?.aborted) throw interrupted(signal);
+      if (controller.signal.aborted) throw new ConnectivityError(`Request timed out after ${ms}ms: ${method} ${path}`, { method });
+      return result;
+    } catch (err) {
+      if (signal?.aborted) throw interrupted(signal);
+      if (err instanceof ApiError || err instanceof NetworkError) throw err;
+      if (err && err.name === 'AbortError') {
+        const message = `Request timed out after ${ms}ms: ${method} ${path}`;
+        if (responseReceived) throw new NetworkError(message);
+        throw new ConnectivityError(message, { method, cause: err });
+      }
+      const message = `${method} ${path}: ${err?.message || err}`;
+      if (responseReceived) throw new NetworkError(`Network failure: ${message}`, { cause: err });
+      throw new ConnectivityError(message, { method, cause: err });
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+    }
+  }
+
+  async function parseResponse(res, { method, path }) {
+    const headerRequestId =
+      res.headers?.get?.('x-request-id') || res.headers?.get?.('x-requestid') || undefined;
+    const retryAfterMs = parseRetryAfter(res.headers?.get?.('retry-after'));
+    const status = res.status;
+    let text = '';
+    try {
+      text = await res.text();
+    } catch {
+      text = '';
+    }
+    let parsed;
+    if (text) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = undefined;
+      }
+    }
+    if (res.ok) {
+      const data = parsed !== undefined && parsed !== null && typeof parsed === 'object' && 'data' in parsed
+        ? parsed.data
+        : parsed;
+      const meta = parsed && typeof parsed === 'object' ? parsed.meta : undefined;
+      const requestId =
+        (parsed && typeof parsed === 'object' && (parsed.request_id || parsed.requestId)) ||
+        headerRequestId;
+      return { status, data, meta, requestId, headers: res.headers, retryAfterMs, raw: parsed ?? text };
+    }
+    let code;
+    let message;
+    let retryable;
+    let envelopeRequestId;
+    let details;
+    if (parsed && typeof parsed === 'object') {
+      const e = parsed.error && typeof parsed.error === 'object' ? parsed.error : undefined;
+      code = e?.code ?? parsed.code;
+      message = e?.message ?? parsed.message;
+      retryable = e?.retryable ?? parsed.retryable;
+      details = e?.details;
+      envelopeRequestId = parsed.request_id ?? parsed.requestId;
+    }
+    if (!message) message = `Request failed: ${method} ${path} (HTTP ${status})`;
+    throw new ApiError({
+      status,
+      code,
+      message,
+      details,
+      retryable,
+      requestId: envelopeRequestId || headerRequestId,
+      retryAfterMs,
+    });
+  }
+
+  function isRetryableGetError(err) {
+    if (err instanceof NetworkError) return true;
+    if (err instanceof ApiError) {
+      if (err.status === 429) return true;
+      if (err.status === 503 || err.status === 504) return true;
+      if (err.status >= 500 && err.retryable === true) return true;
+    }
+    return false;
+  }
+
+  /** GET with bounded retries (honors Retry-After, else backoff+jitter). */
+  async function get(path, opts = {}) {
+    const attempts = opts.attempts ?? MAX_GET_ATTEMPTS;
+    let lastErr;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        return await rawRequest('GET', path, opts);
+      } catch (err) {
+        lastErr = err;
+        if (opts.signal?.aborted) throw interrupted(opts.signal);
+        if (!isRetryableGetError(err) || attempt === attempts - 1) throw err;
+        const waitMs = err.retryAfterMs ?? backoffDelay(attempt, BACKOFF_BASE_MS, BACKOFF_MAX_MS, rand);
+        onRetry?.({ method: 'GET', path, attempt: attempt + 1, waitMs, status: err.status });
+        await withCallerSignal(() => sleepImpl(waitMs, opts.signal), opts.signal);
+      }
+    }
+    throw lastErr;
+  }
+
+  /** POST is never auto-retried (no blind mutation retry). */
+  async function post(path, opts = {}) {
+    return rawRequest('POST', path, opts);
+  }
+
+  return { get, post, rawRequest };
+}
+
+/** Extract the `data` member of a success envelope (or the body itself). */
+export function envelopeData(body) {
+  if (body && typeof body === 'object' && 'data' in body) return body.data;
+  return body;
+}
+
+/** Normalize a list envelope to an array (data | data.items | data.projects | ...). */
+export function envelopeList(body, keys = ['items', 'projects', 'jobs', 'artifacts', 'logs', 'protocols']) {
+  const data = envelopeData(body);
+  if (Array.isArray(data)) return { list: data, meta: body?.meta };
+  if (data && typeof data === 'object') {
+    for (const k of keys) {
+      if (Array.isArray(data[k])) return { list: data[k], meta: data.meta ?? body?.meta, cursor: data.next_cursor ?? data.cursor };
+    }
+  }
+  return { list: [], meta: body?.meta };
+}

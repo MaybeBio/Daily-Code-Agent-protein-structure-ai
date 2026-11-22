@@ -1,0 +1,519 @@
+import { useState } from "react";
+import "./inputs.css";
+import { Questionnaire } from "../guided/Questionnaire";
+import { PredictionSetup } from "../presentation/PredictionSetup";
+import { SharedPredictionDraftControls } from "../presentation/SharedPredictionDraftControls";
+import { BoltzDraftBoundary } from "./BoltzDraftBoundary";
+import {
+  boltzDraftAdapter,
+  snapshotBoltzSettings,
+  type BoltzDraft,
+} from "./boltz-draft";
+import { useTaskReadiness } from "../guided/useTaskReadiness";
+import { useTaskSubmit } from "../operations/useTaskSubmit";
+import type { Job, Language } from "../types";
+import type { MoleculeRef } from "../research/types";
+import { referenceKey } from "../research/input-catalog";
+import { RestraintEditor } from "../simulations/RestraintEditor";
+import type {
+  SimulationRestraint,
+  RestraintAtom,
+} from "../simulations/restraints";
+import {
+  boltzMaterialInputs,
+  boltzMsaKey,
+  type BoltzComponent,
+} from "./boltz-inputs";
+import { nativeDefaults } from "./generated";
+import { ScientificInputs } from "./ScientificInputs";
+import { BoltzInputs, type BoltzInputRow } from "./BoltzInputs";
+import { ScientificChoices } from "./ScientificChoices";
+import { ScientificSelection } from "./ScientificSelection";
+import { ScaffoldSelection } from "./ScaffoldSelection";
+import { ScientificReview } from "./ScientificReview";
+import { BoltzJobReview } from "./BoltzJobReview";
+import { boltzPreviewComponents } from "./boltz-job-request";
+import { usesStartingMolecule, usesMolecularInput } from "./reinvent-modes";
+import {
+  validBoltzComponents,
+  validDesignFragments,
+  validScientificChoices,
+} from "./validation";
+import {
+  useExample,
+  useExampleReference,
+  useExampleTask,
+} from "../examples/context";
+import {
+  scientificForms,
+  type ScientificForm as FormId,
+  type ScientificPayload,
+  type ScientificTask,
+} from "./types";
+
+interface ScientificFormProps {
+  form: FormId;
+  language: Language;
+  onCreated(job: Job): void;
+  initialStructure?: MoleculeRef | null;
+  onChooseTask?(form: FormId): void;
+}
+
+export function ScientificForm(props: ScientificFormProps) {
+  return props.form === "boltz.predict" ? (
+    <BoltzDraftBoundary>
+      {({ edition, ...draft }) => (
+        <ScientificEditor key={edition} {...props} {...draft} />
+      )}
+    </BoltzDraftBoundary>
+  ) : (
+    <ScientificEditor {...props} />
+  );
+}
+
+function ScientificEditor({
+  form,
+  language,
+  onCreated,
+  initialStructure: chosenStructure = null,
+  onChooseTask,
+  initialDraft = null,
+  onResume,
+}: ScientificFormProps & {
+  initialDraft?: BoltzDraft | null;
+  onResume?(value: BoltzDraft): void;
+}) {
+  const zh = language === "zh",
+    [program, operation] = scientificForms[form];
+  const example = useExample(),
+    preset = useExampleTask(operation);
+  const initialStructure = useExampleReference(
+    ["plip", "ligandmpnn"].includes(program) ? "structure" : "receptor",
+    ["apbs", "openmm"].includes(program)
+      ? "protein_only"
+      : ["plip", "ligandmpnn"].includes(program)
+        ? "brd4"
+        : program === "boltzgen"
+          ? "her2_domain_iv"
+          : "receptor",
+    "brd4",
+    "her2",
+  );
+  const initialLigand = useExampleReference(
+    "ligand",
+    program === "chemprop" ? "egfr_library" : "jq1",
+    "imatinib",
+  );
+  const [structure, setStructure] = useState<MoleculeRef | null>(
+    program === "boltz"
+      ? null
+      : (chosenStructure ??
+          preset?.inputs.find((i) => i.role === "structure")?.source ??
+          (["reinvent", "chemprop"].includes(program)
+            ? null
+            : initialStructure)),
+  );
+  const [ligand, setLigand] = useState<MoleculeRef | null>(
+    program === "boltz"
+      ? null
+      : (preset?.inputs.find((i) => ["ligand", "library"].includes(i.role))
+          ?.source ??
+          (program === "chemprop" ||
+          (program === "reinvent" &&
+            usesStartingMolecule({
+              kind: "reinvent",
+              mode: preset?.payload?.mode ?? nativeDefaults.reinvent.mode,
+            }))
+            ? initialLigand
+            : null)),
+  );
+  const [verifiedLibrary, setVerifiedLibrary] = useState<MoleculeRef | null>(
+    null,
+  );
+  const [scaffold, setScaffold] = useState<MoleculeRef | null>(null);
+  const [msaVerified, setMsaVerified] = useState<Record<string, string>>({});
+  const [settings, setPayload] = useState<ScientificPayload>(() => ({
+    ...structuredClone(nativeDefaults[program]),
+    kind: program,
+    ...(program === "chemprop"
+      ? { mode: operation === "chemprop_train" ? "train" : "predict" }
+      : {}),
+    ...(program === "ligandmpnn" ? { redesigned_residues: [] } : {}),
+    ...(program === "boltzgen" ? { target_chains: [] } : {}),
+    ...(preset?.payload ?? {}),
+    ...initialDraft?.state.settings,
+  }));
+  const [boltzRows, setBoltzRows] = useState<BoltzInputRow[]>(() => {
+    if (program !== "boltz") return [];
+    const components = initialDraft?.state.components ??
+      (preset?.payload?.components as BoltzComponent[] | undefined) ?? [
+        {
+          id: "A",
+          kind: "protein",
+          value: example?.sequences.protein ?? "",
+          msa_mode: "provided",
+        },
+        { id: "B", kind: "ligand", value: "", source: initialLigand },
+      ];
+    return components.map((component, index) => ({
+      key: String(index),
+      revision: 0,
+      component,
+    }));
+  });
+  const payload =
+    program === "boltz"
+      ? { ...settings, components: boltzRows.map((row) => row.component) }
+      : settings;
+  const [selectionValid, setSelectionValid] = useState(
+    !["ligandmpnn", "boltzgen", "plip"].includes(program),
+  );
+  const [expert, setExpert] = useState(initialDraft?.state.expert ?? false);
+  const [restraints, setRestraints] = useState<SimulationRestraint[]>(() => {
+    const saved = (preset?.payload.restraints ?? []) as SimulationRestraint[];
+    const matches = (atom: RestraintAtom) => {
+      const source = atom.role === "structure" ? structure : ligand;
+      return source && referenceKey(source) === referenceKey(atom.source);
+    };
+    return program === "openmm" &&
+      saved.every((row) =>
+        row.kind === "position"
+          ? matches(row.atom)
+          : matches(row.first) && matches(row.second),
+      )
+      ? structuredClone(saved)
+      : [];
+  });
+  const [name, setName] = useState(
+    initialDraft?.state.name ??
+      preset?.name ??
+      example?.case.label[zh ? 0 : 1] ??
+      "",
+  );
+  const [options, setOptions] = useState<ScientificTask["options"]>(() => ({
+    device: ["boltz", "boltzgen"].includes(program) ? "cuda" : "cpu",
+    cpu: 2,
+    memory_mib: ["boltz", "boltzgen"].includes(program) ? 24576 : 4096,
+    seed: 101,
+    ...structuredClone(preset?.options ?? {}),
+    ...initialDraft?.state.options,
+  }));
+  const readiness = useTaskReadiness(form),
+    run = useTaskSubmit(onCreated);
+  function update(patch: Partial<ScientificPayload>) {
+    setPayload((value) => ({ ...value, ...patch }));
+  }
+  const inputs: ScientificTask["inputs"] =
+    program === "boltz"
+      ? boltzMaterialInputs(payload.components as BoltzComponent[])
+      : [];
+  if (program !== "boltz") {
+    if (structure) inputs.push({ role: "structure", source: structure });
+    if (scaffold && ["antibody", "nanobody"].includes(String(payload.modality)))
+      inputs.push({ role: "scaffold", source: scaffold });
+    if (ligand && (program !== "reinvent" || usesMolecularInput(payload)))
+      inputs.push({
+        role: program === "chemprop" ? "library" : "ligand",
+        source: ligand,
+      });
+  }
+  const inputValid =
+    program === "boltz"
+      ? validBoltzComponents(payload.components, payload.affinity) &&
+        (payload.components as BoltzComponent[]).every(
+          (component) =>
+            component.kind !== "protein" ||
+            component.msa_mode === "single" ||
+            Boolean(
+              component.msa &&
+              msaVerified[component.id] === boltzMsaKey(component),
+            ),
+        )
+      : program === "reinvent"
+        ? validDesignFragments(payload) &&
+          (!usesMolecularInput(payload) || Boolean(ligand))
+        : program === "chemprop"
+          ? Boolean(
+              ligand &&
+              verifiedLibrary &&
+              referenceKey(ligand) === referenceKey(verifiedLibrary),
+            )
+          : Boolean(structure) &&
+            (program !== "boltzgen" ||
+              !["antibody", "nanobody"].includes(String(payload.modality)) ||
+              Boolean(scaffold));
+  const modeValid =
+    (program !== "chemprop" ||
+      operation === "chemprop_train" ||
+      Boolean(payload.model_job && payload.model_sha256)) &&
+    (program !== "boltzgen" ||
+      !["antibody", "nanobody"].includes(String(payload.modality)) ||
+      Boolean(
+        payload.scaffold_chain &&
+        (payload.scaffold_residues as string[] | undefined)?.length,
+      ));
+  const optionsValid =
+    validScientificChoices(payload) &&
+    Number.isInteger(options.cpu) &&
+    options.cpu >= 1 &&
+    options.cpu <= 16 &&
+    Number.isInteger(options.memory_mib) &&
+    options.memory_mib >= 1024 &&
+    options.memory_mib <= 65536 &&
+    Number.isInteger(options.seed) &&
+    options.seed >= 0 &&
+    options.seed <= 2147483647;
+  const unavailable = zh
+    ? "计算环境尚未就绪，可先填写材料，再到组件页完成部署。"
+    : "Prepare the scientific environment in Components before submission.";
+  function currentTask(): ScientificTask {
+    return {
+      operation,
+      name: name.trim() || (zh ? "研究计算" : "Research calculation"),
+      inputs,
+      scientific_inputs: inputs.map((item) => item.source),
+      payload: program === "openmm" ? { ...payload, restraints } : payload,
+      options,
+    };
+  }
+  const questionnaire = (
+    <Questionnaire
+      language={language}
+      busy={run.busy}
+      error={readiness.error || run.error}
+      ready={readiness.ready}
+      onCheckEnvironment={readiness.recheck}
+      unavailable={unavailable}
+      submitLabel={
+        program === "boltz"
+          ? zh
+            ? "预览任务"
+            : "Preview job"
+          : zh
+            ? "提交计算"
+            : "Submit calculation"
+      }
+      onSubmit={
+        program === "boltz" ? undefined : () => run.submit(currentTask())
+      }
+      renderReview={
+        program === "boltz"
+          ? ({ confirm, dismiss }) => (
+              <BoltzJobReview
+                language={language}
+                input={currentTask()}
+                ready={readiness.ready}
+                unavailable={readiness.error || unavailable}
+                busy={run.busy}
+                error={run.error}
+                recheck={readiness.recheck}
+                confirm={confirm}
+                onClose={dismiss}
+                submit={run.submit}
+              />
+            )
+          : undefined
+      }
+      steps={[
+        {
+          title: zh ? "选择研究材料" : "Choose research inputs",
+          valid: inputValid,
+          content:
+            program === "boltz" ? (
+              <BoltzInputs
+                rows={boltzRows}
+                onRows={setBoltzRows}
+                language={language}
+                onMsaVerified={(chain, valid) =>
+                  setMsaVerified((previous) =>
+                    previous[chain] === valid
+                      ? previous
+                      : { ...previous, [chain]: valid },
+                  )
+                }
+              />
+            ) : (
+              <ScientificInputs
+                onLibraryVerified={setVerifiedLibrary}
+                program={program}
+                language={language}
+                payload={payload}
+                onChange={update}
+                structure={structure}
+                onStructure={(value) => {
+                  setStructure(value);
+                  setRestraints([]);
+                  update(
+                    program === "ligandmpnn"
+                      ? { redesigned_residues: [] }
+                      : program === "boltzgen"
+                        ? { target_chains: [] }
+                        : program === "plip"
+                          ? { ligand_chain: "", ligand_number: null }
+                          : {},
+                  );
+                }}
+                ligand={ligand}
+                onLigand={(value) => {
+                  setLigand(value);
+                  setRestraints([]);
+                }}
+                scaffold={scaffold}
+                onScaffold={(value) => {
+                  setScaffold(value);
+                  update({ scaffold_chain: null, scaffold_residues: [] });
+                }}
+              />
+            ),
+        },
+        {
+          title: zh ? "选择研究目标" : "Choose the research objective",
+          valid: selectionValid && modeValid,
+          content: (
+            <>
+              <ScientificSelection
+                program={program}
+                language={language}
+                payload={payload}
+                onChange={update}
+                structure={structure}
+                ligand={ligand}
+                onValid={setSelectionValid}
+                onTrainModel={
+                  onChooseTask
+                    ? () => onChooseTask("chemprop.train")
+                    : undefined
+                }
+              />
+              {program === "boltzgen" &&
+                scaffold &&
+                ["antibody", "nanobody"].includes(String(payload.modality)) && (
+                  <ScaffoldSelection
+                    source={scaffold}
+                    language={language}
+                    payload={payload}
+                    onChange={update}
+                  />
+                )}
+            </>
+          ),
+        },
+        ...(program === "openmm" && structure
+          ? [
+              {
+                title: zh
+                  ? "设置三维约束（可选）"
+                  : "Set 3D restraints (optional)",
+                guideStep: null,
+                valid: true,
+                content: (
+                  <RestraintEditor
+                    key={
+                      referenceKey(structure) +
+                      (ligand ? referenceKey(ligand) : "")
+                    }
+                    structure={structure}
+                    ligand={ligand}
+                    value={restraints}
+                    onChange={setRestraints}
+                    language={language}
+                  />
+                ),
+              },
+            ]
+          : []),
+        {
+          title: zh ? "选择计算方案" : "Choose a calculation plan",
+          guideStep: 2,
+          valid: optionsValid,
+          content: (
+            <ScientificChoices
+              program={program}
+              language={language}
+              payload={payload}
+              onChange={update}
+              options={options}
+              onOptions={setOptions}
+              expert={expert}
+              onExpert={setExpert}
+            />
+          ),
+        },
+        {
+          title: zh ? "确认并提交" : "Review and submit",
+          guideStep: 3,
+          valid: inputValid && selectionValid && modeValid && optionsValid,
+          content: (
+            <>
+              <label className="field">
+                {zh ? "任务名称" : "Task name"}
+                <input
+                  maxLength={80}
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder={zh ? "为这次研究起个名字" : "Name this study"}
+                />
+              </label>
+              {program === "boltz" ? (
+                <p className="field-help">
+                  {zh
+                    ? "打开预览，核对链、材料和预测设置。"
+                    : "Open the preview to verify chains, sources, and prediction settings."}
+                </p>
+              ) : (
+                <ScientificReview
+                  program={program}
+                  language={language}
+                  payload={payload}
+                  inputs={inputs}
+                  options={options}
+                />
+              )}
+              {program === "openmm" && (
+                <p>
+                  {zh ? "三维约束" : "3D restraints"}: {restraints.length}
+                </p>
+              )}
+            </>
+          ),
+        },
+      ]}
+    />
+  );
+  return (
+    <PredictionSetup
+      enabled={program === "boltz"}
+      language={language}
+      components={
+        program === "boltz"
+          ? boltzPreviewComponents(payload.components as BoltzComponent[])
+          : []
+      }
+      model="Boltz-2"
+      seeds={[options.seed]}
+      samples={Number(payload.samples ?? 1)}
+      valid={inputValid}
+      draftControls={
+        program === "boltz" && onResume ? (
+          <SharedPredictionDraftControls
+            adapter={boltzDraftAdapter}
+            state={{
+              name,
+              components: boltzRows.map((row) => row.component),
+              settings: snapshotBoltzSettings(settings),
+              options,
+              expert,
+            }}
+            initial={initialDraft}
+            language={language}
+            busy={run.busy}
+            onName={setName}
+            onResume={onResume}
+          />
+        ) : undefined
+      }
+    >
+      {questionnaire}
+    </PredictionSetup>
+  );
+}

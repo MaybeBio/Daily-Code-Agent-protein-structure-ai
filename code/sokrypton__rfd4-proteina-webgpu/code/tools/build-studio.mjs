@@ -1,0 +1,122 @@
+#!/usr/bin/env node
+/**
+ * Compose index.html and assets/ from a released AtomWorks Studio browser bundle.
+ *
+ * Studio used to be vendored under studio-src/ and built here, which meant re-applying local patches on every
+ * import and keeping a fork of Studio's index.html. The fork was the worse half: Studio looks its elements up by id
+ * and throws on a missing one, so a page that had drifted would stop Studio booting outright. Nothing is vendored
+ * now — the bundle comes out of the released PyPI wheel, and the page is composed from Studio's own index.html plus the
+ * fragment this repo owns (web/page/head.html).
+ *
+ *   npm run build:studio                      # the pinned release in studio.json
+ *   npm run build:studio -- --from <dir>      # a bundle built locally, for trying an unreleased Studio
+ *
+ * Studio is driven through its documented embedding API (window.atomworksStudio); see web/app.js. The design card (start
+ * screen, job editor, run settings, Generate, designs, Refold, Save all) is Studio's: web/app.js mounts it with
+ * `window.atomworksStudio.mountDesignCard`, so the page composes no card markup of its own.
+ */
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const ASSETS = join(ROOT, 'assets');
+const LIST = join(ASSETS, 'studio-files.json');
+const PIN = JSON.parse(readFileSync(join(ROOT, 'studio.json'), 'utf8'));
+
+const args = process.argv.slice(2);
+const fromIndex = args.indexOf('--from');
+const localBundle = fromIndex === -1 ? null : args[fromIndex + 1];
+
+function run(cmd, cmdArgs, cwd = ROOT) {
+  const result = spawnSync(cmd, cmdArgs, { cwd, stdio: 'inherit' });
+  if (result.status !== 0) throw new Error(`${cmd} ${cmdArgs.join(' ')} failed (${result.status})`);
+}
+
+/**
+ * The released wheel from PyPI, verified against the checksum in studio.json so a build cannot silently change bundle.
+ * Studio ships its browser bundle inside the wheel (annotation_studio/web/), the same files as the GitHub release's
+ * atomworks-studio-web.tar.gz, so the page depends on the package the Spaces install rather than on a second artifact.
+ */
+function downloadBundle() {
+  const meta = JSON.parse(spawnSync('curl', ['-fsSL', `https://pypi.org/pypi/${PIN.package}/${PIN.version}/json`], { encoding: 'utf8' }).stdout || 'null');
+  const file = meta?.urls?.find((entry) => entry.packagetype === 'bdist_wheel');
+  if (!file) throw new Error(`${PIN.package} ${PIN.version} has no wheel on PyPI`);
+  const work = mkdtempSync(join(tmpdir(), 'studio-bundle-'));
+  const archive = join(work, file.filename);
+  run('curl', ['-fsSL', file.url, '-o', archive], work);
+  const digest = createHash('sha256').update(readFileSync(archive)).digest('hex');
+  if (PIN.sha256 && PIN.sha256 !== digest) {
+    throw new Error(`${file.url}\n  expected sha256 ${PIN.sha256}\n  got      sha256 ${digest}`);
+  }
+  if (!PIN.sha256) console.warn(`studio: no sha256 pinned; downloaded wheel is ${digest}`);
+  const out = join(work, 'wheel');
+  mkdirSync(out);
+  run('unzip', ['-q', archive, 'annotation_studio/web/*', '-d', out], work);
+  return join(out, 'annotation_studio', 'web');
+}
+
+// An override means the committed site is an unreleased Studio build; rebuilding from the release would quietly drop
+// whatever it carries, so that needs a deliberate choice (remove `override`, or pass the override's bundle).
+if (PIN.override && !localBundle) {
+  throw new Error(`studio.json has an override (${PIN.override.repository} ${PIN.override.commit}): build that commit and pass `
+    + `--from <its dist>, or remove "override" once a release contains it. See studio.json "_override".`);
+}
+const bundle = localBundle ? resolve(localBundle) : downloadBundle();
+const studioPage = join(bundle, 'index.html');
+if (!existsSync(studioPage)) throw new Error(`${bundle} is not a Studio bundle (no index.html)`);
+
+// Studio's own files, replacing the previous build's and nothing else in assets/.
+const walk = (dir) => readdirSync(dir).flatMap((name) => {
+  const path = join(dir, name);
+  return statSync(path).isDirectory() ? walk(path) : [path];
+});
+const emitted = walk(join(bundle, 'assets')).map((path) => relative(bundle, path));
+for (const file of existsSync(LIST) ? JSON.parse(readFileSync(LIST, 'utf8')) : []) {
+  rmSync(join(ROOT, file), { force: true });
+}
+for (const file of emitted) {
+  mkdirSync(dirname(join(ROOT, file)), { recursive: true });
+  cpSync(join(bundle, file), join(ROOT, file));
+}
+writeFileSync(LIST, JSON.stringify(emitted.sort(), null, 2) + '\n');
+
+// Compose the page: Studio's markup plus this repo's head additions (the card is mounted by web/app.js).
+const head = readFileSync(join(ROOT, 'web/page/head.html'), 'utf8').trimEnd();
+let page = readFileSync(studioPage, 'utf8');
+
+page = page.replace(/<title>[^<]*<\/title>/, `<title>${PIN.title}</title>`);
+if (!page.includes('</head>')) throw new Error('Studio index.html has no </head>');
+// Ahead of Studio's entry script, so app.js installs the /api/* interceptor before Studio boots against it.
+const entryScript = page.match(/\s*<script type="module" crossorigin src="[^"]+"><\/script>/);
+if (!entryScript) throw new Error('Studio index.html has no module entry script');
+page = page.replace(entryScript[0], `\n${head}${entryScript[0]}`);
+if (!page.includes('id="atomworks-studio-popover"')) throw new Error('Studio index.html has no #atomworks-studio-popover (the sidebar the card mounts into)');
+// Patinae (Studio's WebGPU renderer) is not offered on this page. It works, but its adapter implements neither
+// `updateLiveCif` nor `setLiveMode`, both optional in Studio's viewer contract, so every live frame of a design
+// goes through the full `loadCif` rebuild and its `loadCif` has no options parameter, dropping `keepCamera`.
+// Measured here (tools/gpu/bench-renderer.js): a design costs 1.66x as much with Patinae as with Mol*, and the
+// camera resets on each of ~50 frames. Mol* draws on WebGL2 and so does not compete with the model for the GPU.
+// Remove this once Patinae implements those two methods; `?viewer=patinae` still reaches it deliberately.
+const patinaeOption = page.match(/\s*<option value="patinae">[^<]*<\/option>/);
+if (!patinaeOption) throw new Error('Studio index.html has no Patinae option to remove; re-check this transform');
+page = page.replace(patinaeOption[0], '');
+const patinaePrompt = page.match(/\s*<button class="renderer-prompt-choice"[^>]*data-renderer="patinae"[^>]*>[\s\S]*?<\/button>/);
+if (!patinaePrompt) throw new Error('Studio index.html has no Patinae prompt button to remove; re-check this transform');
+page = page.replace(patinaePrompt[0], '');
+if (/value="patinae"|data-renderer="patinae"/.test(page)) {
+  throw new Error('Patinae is still selectable in the composed page');
+}
+
+// Studio's bundle is built to be served from the site root; this one lives under a project path on Pages.
+page = page.replaceAll('="/assets/', '="./assets/').replaceAll('="/guide/', '="./guide/');
+if (/(?:src|href)="\/[^"]/.test(page)) {
+  throw new Error(`composed page still has root-absolute paths: ${page.match(/(?:src|href)="\/[^"]+"/g)}`);
+}
+
+writeFileSync(join(ROOT, 'index.html'), page);
+console.log(`studio: ${PIN.override ? `${PIN.override.repository}@${PIN.override.commit}` : PIN.version}${localBundle ? ` (local: ${localBundle})` : ''}, ${emitted.length} files`);
+run('node', [join(ROOT, 'tools/stamp-modules.mjs')]);

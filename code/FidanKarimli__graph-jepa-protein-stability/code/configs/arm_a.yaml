@@ -1,0 +1,10 @@
+# Arm A: no pretraining. The encoder starts from random weights and is trained
+# together with the ddG head, so this is the "learn everything from labels" baseline.
+#
+# There is no pretrain.target here, which is what marks the arm as untrained:
+# finetune.py looks for a checkpoint only when one is set.
+
+arm: A
+
+finetune:
+  mode: full

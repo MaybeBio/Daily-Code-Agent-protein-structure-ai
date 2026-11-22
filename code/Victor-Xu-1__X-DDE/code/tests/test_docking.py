@@ -1,0 +1,344 @@
+"""Docking contracts, API boundaries and real SQLite lineage; native science is remote."""
+
+from uuid import uuid4
+
+import pytest
+from pydantic import ValidationError
+
+from opendde_workbench.assets import AssetStore
+from opendde_workbench.docking.contract import DockingTask
+from opendde_workbench.docking.options import (
+    DockingOptions,
+    SearchBox,
+    arguments,
+    parse_search_report,
+)
+from opendde_workbench.docking.runtime import configuration, validate
+from opendde_workbench.engine_registry import engine_for
+from opendde_workbench.native_arguments import needs_gpu
+from opendde_workbench.requests import TASK_ADAPTER, input_identifiers
+from opendde_workbench.research.contracts import VersionInput
+from opendde_workbench.research.outputs import OutputCatalog
+from opendde_workbench.research.storage import ScientificStore
+from opendde_workbench.store import Store
+from opendde_workbench.workflows.contracts import PlanInput
+
+
+def reference():
+    return {"asset_id": str(uuid4()), "sha256": "a" * 64}
+
+
+def test_dock_uses_recorded_nominal_box_without_ligand_expansion():
+    args = arguments(DockingOptions(), "dock")
+    assert args[args.index("--autobox_extend") + 1] == "false"
+    assert args[args.index("--verbosity") + 1] == "2"
+    for mode in ("score", "minimize"):
+        assert "--autobox_extend" not in arguments(DockingOptions(), mode)
+    log = "Using search box with center -1.25,2,3e+1 and size 4,20.5,6\n"
+    report = parse_search_report(log)
+    assert report.center == (-1.25, 2, 30)
+    assert report.size == (4, 20.5, 6)
+    assert report.automatic_ligand_extension is False
+    assert report.precision == "engine_log_rounded"
+    for invalid in (
+        "",
+        log + log,
+        log.replace("size 4", "size 0"),
+        log.replace("2,3e+1", "nan,3e+1"),
+    ):
+        with pytest.raises(ValueError):
+            parse_search_report(invalid)
+
+
+def task():
+    receptor, ligand = reference(), reference()
+    return {
+        "operation": "docking",
+        "name": "poses",
+        "receptor": receptor,
+        "ligand": ligand,
+        "search": {
+            "kind": "box",
+            "frame": receptor,
+            "box": {"center": [1, 2, 3], "size": [20, 20, 20]},
+        },
+    }
+
+
+def test_exact_frame_budgets_and_single_registered_engine():
+    value = task()
+    request = TASK_ADAPTER.validate_python(value)
+    assert isinstance(request, DockingTask) and engine_for(request.operation).id == "gnina"
+    assert input_identifiers(request) == {
+        value["receptor"]["asset_id"],
+        value["ligand"]["asset_id"],
+    }
+    assert not needs_gpu(request)
+    assert needs_gpu(request.model_copy(update={"options": DockingOptions(use_gpu=True)}))
+    for mutate in [
+        lambda v: v["search"].update(frame=reference()),
+        lambda v: v.update(name=" "),
+        lambda v: v.update(mode="score"),
+        lambda v: v.update(options={"exhaustiveness": 128, "num_modes": 100}),
+        lambda v: v.update(options={"cnn_scoring": "all"}),
+        lambda v: v.update(options={"cpu": True}),
+        lambda v: v["search"]["box"].update(center=[float("nan"), 0, 0]),
+        lambda v: v["search"]["box"].update(size=[0, 20, 20]),
+    ]:
+        bad = task()
+        mutate(bad)
+        with pytest.raises(ValidationError):
+            TASK_ADAPTER.validate_python(bad)
+    assert "--score_only" in arguments(DockingOptions(), "score")
+    assert "--no_gpu" in arguments(DockingOptions(), "dock")
+    assert "--minimize" in arguments(DockingOptions(), "minimize")
+    assert SearchBox(center=(1, 2, 3), size=(20, 20, 20)).unit == "angstrom"
+
+
+def test_pose_scoring_requires_explicit_frame_and_rejects_search_controls():
+    value = task()
+    value.update(
+        mode="score",
+        search=None,
+        pose_frame=value["receptor"],
+        pose_coordinate_basis="user_confirmed",
+    )
+    assert DockingTask.model_validate(value).mode == "score"
+    value["options"] = {"cnn_scoring": "all", "use_gpu": True}
+    with pytest.raises(ValidationError, match="Score-only"):
+        DockingTask.model_validate(value)
+
+
+def test_independent_unavailable_runtime_and_gpu_preflight(settings, client_factory):
+    with pytest.raises(ValueError, match="Install GNINA"):
+        configuration(settings)
+    with pytest.raises(RuntimeError):
+        validate(DockingTask.model_validate(task()), {"ready": False})
+    gpu = task()
+    gpu["options"] = {"use_gpu": True}
+    with pytest.raises(RuntimeError, match="NVIDIA"):
+        validate(DockingTask.model_validate(gpu), {"ready": True})
+    with client_factory() as client:
+        cap = client.get("/api/capabilities/gnina.dock")
+        assert cap.status_code == 200 and cap.json()["environment"] == "gnina"
+        refs = {}
+        for role, kind, name, content in [
+            ("receptor", "structure", "protein.pdb", b"ATOM\n"),
+            ("ligand", "ligand", "ligand.sdf", b"mol\n$$$$\n"),
+        ]:
+            asset = client.post(
+                "/api/assets?kind=" + kind + "&name=" + name,
+                content=content,
+                headers={"Content-Type": "application/octet-stream"},
+            ).json()
+            refs[role] = {"asset_id": asset["id"], "sha256": asset["sha256"]}
+        value = task()
+        value.update(refs)
+        value["search"]["frame"] = refs["receptor"]
+        response = client.post("/api/jobs", json=value, headers={"Idempotency-Key": str(uuid4())})
+        assert response.status_code == 503, response.text
+        value["ligand"]["sha256"] = "0" * 64
+        assert (
+            client.post(
+                "/api/jobs", json=value, headers={"Idempotency-Key": str(uuid4())}
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post("/api/jobs", json=value, headers={"X-Workbench-CSRF": "bad"}).status_code
+            == 403
+        )
+        assert client.get("/api/jobs").json() == []
+
+
+def test_output_lineage_records_and_filtered_query_are_persistent(tmp_path):
+    store = Store(tmp_path / "jobs.sqlite3")
+    assets = AssetStore(store, tmp_path / "assets")
+    scientific = ScientificStore(store, assets)
+    receptor = assets.save("receptor.pdb", "structure", b"ATOM\n")
+    ligand = assets.save("input.sdf", "ligand", b"molecule\n$$$$\n")
+    versions = [
+        scientific.create(VersionInput(asset_id=a.id, kind=k, label=a.name), uuid4())
+        for a, k in [(receptor, "structure"), (ligand, "molecule")]
+    ]
+    value = task()
+    value.update(
+        receptor=versions[0].reference.model_dump(mode="json"),
+        ligand=versions[1].reference.model_dump(mode="json"),
+    )
+    value["search"]["frame"] = value["receptor"]
+    job = store.create(DockingTask.model_validate(value), str(uuid4()), 20, 100)
+    file = tmp_path / "pose-001.sdf"
+    file.write_text("molecule\n$$$$\n")
+    catalog = OutputCatalog(store, assets)
+    asset, poses = catalog.preserve(job.id, file, "ligand")
+    assert catalog.preserve(job.id, file, "ligand")[1] == poses
+    assert poses[0].parent_id == versions[1].id
+    assert poses[0].reference.record == 0 and poses[0].reference.sha256 == asset.sha256
+    persisted = ScientificStore(Store(tmp_path / "jobs.sqlite3"), assets)
+    assert persisted.list(source_job=job.id) == poses
+    assert persisted.list(source_job=uuid4()) == []
+
+
+def test_workflow_allows_new_docking_ligand_but_not_unverified_pose_frames():
+    value = {
+        "name": "design then dock",
+        "steps": [
+            {
+                "id": "design",
+                "request": {"operation": "properties", "name": "source", "smiles": ["CCO"]},
+            },
+            {
+                "id": "dock",
+                "request": task(),
+                "depends_on": ["design"],
+                "bindings": [
+                    {
+                        "from_step": "design",
+                        "target": "docking_ligand",
+                        "kind": "ligand",
+                        "artifact": "molecule.sdf",
+                    }
+                ],
+            },
+        ],
+    }
+    assert PlanInput.model_validate(value).steps[1].bindings[0].target == "docking_ligand"
+    second = value["steps"][1]["request"]
+    second.update(
+        mode="score",
+        search=None,
+        pose_frame=second["receptor"],
+        pose_coordinate_basis="user_confirmed",
+    )
+    with pytest.raises(ValidationError, match="existing poses"):
+        PlanInput.model_validate(value)
+
+
+def test_task_native_snapshot_is_isolated_from_later_source_changes(tmp_path):
+    import hashlib
+
+    from opendde_workbench.docking.snapshot import NATIVE_FILES, capture
+
+    source = tmp_path / "source" / "docking"
+    source.mkdir(parents=True)
+    for name in NATIVE_FILES:
+        (source / name).write_text("original adapter bytes")
+    (source.parent / "scientific_objects.py").write_text("canonical contract bytes")
+    (source.parent / "chemistry").mkdir()
+    (source.parent / "chemistry/molfile_stereo.py").write_text("source stereo export bytes")
+    directory = tmp_path / "job"
+    directory.mkdir()
+    target, digests = capture(directory, source)
+    (source / "native.py").write_text("new source bytes after scheduling")
+    assert (target / "docking/native.py").read_text() == "original adapter bytes"
+    assert digests["docking/native.py"] == hashlib.sha256(b"original adapter bytes").hexdigest()
+    assert set(digests) == {
+        "docking/native.py",
+        "docking/chemistry.py",
+        "docking/bounds.py",
+        "docking/options.py",
+        "docking/manifest.py",
+        "docking/receptor_input.py",
+        "docking/reference.py",
+        "docking/scoring.py",
+        "docking/flexible_contract.py",
+        "docking/flexible_receptor.py",
+        "docking/receptor_atoms.py",
+        "docking/receptor_links.py",
+        "docking/residue_geometry.py",
+        "scientific_objects.py",
+        "docking/molfile_stereo.py",
+    }
+    assert (target / "docking/molfile_stereo.py").read_bytes() == b"source stereo export bytes"
+    (source / "bounds.py").write_text("Changed verifier after capture")
+    (source / "reference.py").write_text("Changed reference comparison after capture")
+    (source / "scoring.py").write_text("Changed score parser after capture")
+    assert (target / "docking/bounds.py").read_bytes() == b"original adapter bytes"
+    assert (target / "docking/reference.py").read_bytes() == b"original adapter bytes"
+    assert (target / "docking/scoring.py").read_bytes() == b"original adapter bytes"
+    with pytest.raises(FileExistsError):
+        capture(directory, source)
+
+
+def test_host_gpu_selection_does_not_become_an_invalid_container_index():
+    args = arguments(DockingOptions(use_gpu=True, gpu_device=3), "dock")
+    assert args[args.index("--device") + 1] == "0"
+
+
+def test_failed_native_container_records_exit_and_is_removed(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from opendde_workbench.container_supervision import attach
+
+    directory = tmp_path / str(uuid4())
+    directory.mkdir()
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[1] == "inspect":
+            return SimpleNamespace(
+                stdout=json.dumps({"Running": False, "ExitCode": 2, "OOMKilled": False})
+            )
+        return SimpleNamespace(returncode=2 if args[1] == "start" else 0)
+
+    monkeypatch.setattr("opendde_workbench.container_supervision.subprocess.run", run)
+    with pytest.raises(RuntimeError, match="did not finish successfully"):
+        attach(directory, "xdde-gnina-")
+    assert json.loads((directory / "native-exit.json").read_text())["ExitCode"] == 2
+    assert calls[-1] == ["docker", "rm", "xdde-gnina-" + directory.name]
+
+
+def test_deployment_paths_follow_the_canonical_environment_registry(tmp_path, monkeypatch):
+    from opendde_workbench.deployment.paths import environment_root
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert environment_root(tmp_path / "components", "gnina").name == "gnina"
+    with pytest.raises(ValueError, match="Unknown"):
+        environment_root(tmp_path, "../escape")
+
+
+def test_normalized_pose_contract_rejects_false_success_and_conflicting_atom_maps():
+    from opendde_workbench.docking.result import Pose, Score
+
+    valid = {
+        "record": 0,
+        "valid": True,
+        "smiles": "CCO",
+        "artifact": "pose-001.sdf",
+        "mapping_status": "native_atom_maps",
+        "source_to_pose_atoms": [0, 1, 2],
+        "scores": [
+            {"name": "minimizedAffinity", "value": -5, "unit": "kcal/mol", "direction": "lower"}
+        ],
+    }
+    assert Pose.model_validate(valid).artifact == "pose-001.sdf"
+    for changes in [
+        {"artifact": "../outside.sdf"},
+        {"source_to_pose_atoms": [0, 0, 2]},
+        {"scores": []},
+        {"valid": False},
+        {"mapping_status": "ambiguous_reconfirm_selections"},
+    ]:
+        with pytest.raises(ValidationError):
+            Pose.model_validate({**valid, **changes})
+    with pytest.raises(ValidationError):
+        Score(name="CNNscore", value=float("nan"), unit="model_output", direction="higher")
+    with pytest.raises(ValidationError):
+        Score(name="minimizedAffinity", value=-5, unit="model_output", direction="higher")
+
+
+def test_real_metadata_protocol_is_not_corrupted_by_stderr_warnings():
+    import asyncio
+    import json
+    import sys
+
+    from opendde_workbench.engine import command
+
+    script = "import sys; print('{\"ready\":true}'); print('diagnostic warning',file=sys.stderr)"
+    code, text = asyncio.run(command(sys.executable, "-c", script, separate_stderr=True))
+    assert code == 0 and json.loads(text) == {"ready": True}
+    code, text = asyncio.run(command(sys.executable, "-c", script))
+    assert code == 0 and "diagnostic warning" in text

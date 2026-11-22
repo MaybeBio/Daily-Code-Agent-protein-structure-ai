@@ -1,0 +1,86 @@
+name: BioNeMo Benchmark CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Pytest & Mock Inference Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies (libGL & Cairo for RDKit / Matplotlib)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libxrender1 libxext6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run Ruff Linter & Static Analysis Gate
+        run: |
+          ruff check src tests scripts
+
+      - name: Verify Package Imports & Syntax
+        run: |
+          python -c "import bionemo_benchmark; import bionemo_benchmark.core; import bionemo_benchmark.domain; import bionemo_benchmark.server; import bionemo_benchmark.mcp"
+          python -m py_compile run_benchmark.py serve_cockpit.py
+
+      - name: Prepare Working Directories
+        run: |
+          mkdir -p results data/pdbs
+
+      - name: Run Pytest Test Suite
+        env:
+          PYTHONPATH: src:.
+          TRANSFORMERS_OFFLINE: "0"
+          HF_HUB_DISABLE_SYMLINKS_WARNING: "1"
+          ADMIN_RESET_KEY: "bionemo-admin-prod-9821"
+        run: |
+          pytest -v tests/
+
+      - name: Run Release Static Parity Audit
+        run: |
+          python scripts/audit/audit_release.py
+
+      - name: Execute End-to-End Mock Benchmark & Chart Generation
+        env:
+          PYTHONPATH: src:.
+        run: |
+          python run_benchmark.py --mock --save-plots --iterations 1
+
+      - name: Verify Generated Artifacts
+        run: |
+          ls -la results/
+          test -f results/benchmark_summary.csv
+          test -f results/throughput_comparison.png
+          test -f results/latency_vs_length.png
+
+  docker-build:
+    name: Docker Build Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build Docker Container
+        run: |
+          docker build -t bionemo-cockpit:ci .

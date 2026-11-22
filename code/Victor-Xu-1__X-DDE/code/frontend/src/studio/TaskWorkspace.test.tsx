@@ -1,0 +1,567 @@
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { useState, type ComponentProps } from "react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { api } from "../api";
+import * as client from "../api";
+import { defaults } from "../form-model";
+import type { Job } from "../types";
+import { TaskWorkspace } from "./TaskWorkspace";
+import { PredictionResultHeader } from "../presentation/PredictionResultHeader";
+import { historyFixture, identityFixture } from "./task-history.test-fixtures";
+const job: Job = {
+  id: "00000000-0000-0000-0000-000000000001",
+  request: {
+    name: "STAT6 structure",
+    components: [{ kind: "protein", value: "ACDE", count: 1 }],
+    parameters: defaults,
+  },
+  status: "succeeded",
+  created_at: "2026-10-01",
+  started_at: null,
+  finished_at: null,
+  error: null,
+  parent_id: null,
+};
+const descriptors = {
+  ...job,
+  id: "00000000-0000-0000-0000-000000000002",
+  request: {
+    operation: "properties",
+    name: "STAT6 descriptors",
+    smiles: [],
+    ligand_files: [],
+  },
+  status: "cancelled",
+} as Job;
+let historyJobs: Job[];
+beforeEach(() => {
+  window.history.replaceState(null, "", "/");
+  historyJobs = [job, descriptors];
+  vi.spyOn(client, "request").mockImplementation(async (path) => {
+    if (path === "/runtime-controls?include_native=false")
+      return {
+        engines: [
+          {
+            id: "opendde",
+            name: "OpenDDE",
+            operations: ["predict"],
+            enabled: false,
+            active: false,
+            ready: true,
+          },
+          {
+            id: "chemistry",
+            name: "Chemistry",
+            operations: ["properties"],
+            enabled: false,
+            active: false,
+            ready: true,
+          },
+        ],
+        capabilities: {},
+      } as never;
+    const identity = path.match(/^\/task-history\/([^/]+)\/identity$/);
+    const selected = identity
+      ? [job, descriptors, ...historyJobs].find(
+          (value) => value.id === identity[1],
+        )
+      : undefined;
+    if (!selected) throw new Error("Unhandled test request: " + path);
+    return identityFixture(selected) as never;
+  });
+  vi.spyOn(api, "taskHistory").mockImplementation(async (path) =>
+    historyFixture(historyJobs, path),
+  );
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+  window.history.replaceState(null, "", "/");
+});
+function props(
+  overrides: Partial<ComponentProps<typeof TaskWorkspace>> = {},
+): ComponentProps<typeof TaskWorkspace> {
+  return {
+    language: "en",
+    scopedModule: "evaluation",
+    job: null,
+    detail: null,
+    detailError: false,
+    onRefresh: vi.fn(),
+    onJob: vi.fn(),
+    onChanged: vi.fn(),
+    onStart: vi.fn(),
+    projects: [],
+    projectId: null,
+    onProject: vi.fn(),
+    renderPrediction: () => <div>Actual prediction result</div>,
+    ...overrides,
+  };
+}
+async function modulePage() {
+  await screen.findByRole("button", { name: "STAT6 descriptors" });
+}
+it("uses one compact empty state when a module has no tasks", async () => {
+  historyJobs = [];
+  const onStart = vi.fn();
+  render(<TaskWorkspace {...props({ onStart })} />);
+  expect(screen.getByText("Loading tasks…")).toBeVisible();
+  expect(
+    screen.queryByRole("searchbox", { name: "Search this module" }),
+  ).toBeNull();
+  await screen.findByRole("heading", { name: "No tasks in this module yet" });
+  expect(screen.queryByRole("table")).toBeNull();
+  expect(
+    screen.queryByRole("searchbox", { name: "Search this module" }),
+  ).toBeNull();
+  expect(screen.queryByRole("navigation", { name: "Task pages" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "New task" }));
+  expect(onStart).toHaveBeenCalledWith("admet.predict");
+});
+
+it("rejects invalid date URLs without issuing a broader history query", async () => {
+  window.history.replaceState(
+    null,
+    "",
+    "/#view=results&module=evaluation&from=2026-02-31",
+  );
+  render(<TaskWorkspace {...props()} />);
+  expect(screen.getByRole("alert")).toHaveTextContent("Choose valid dates");
+  expect(api.taskHistory).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+  await modulePage();
+});
+it("restores date filters from the module route and clears them with the other filters", async () => {
+  window.history.replaceState(
+    null,
+    "",
+    "/#view=results&module=evaluation&from=2026-10-02&to=2026-10-02",
+  );
+  render(<TaskWorkspace {...props()} />);
+  await screen.findByRole("heading", { name: "No matching tasks" });
+  const dates = screen.getByRole("button", { name: /Date range/ });
+  expect(dates).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByRole("button", { name: /Start date: / })).toBeVisible();
+  expect(screen.queryByRole("table")).toBeNull();
+  fireEvent.click(dates);
+  expect(dates).toHaveAttribute("aria-expanded", "false");
+  expect(screen.queryByRole("button", { name: /Start date: / })).toBeNull();
+  expect(window.location.hash).toContain("from=2026-10-02");
+  expect(api.taskHistory).toHaveBeenCalledWith(
+    expect.stringContaining("created_from="),
+    expect.any(AbortSignal),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+  await modulePage();
+  expect(window.location.hash).not.toContain("from=");
+  expect(window.location.hash).not.toContain("to=");
+});
+it("keeps retry availability and the matched backend inside a module header", async () => {
+  const p = props({ job: descriptors, retryAvailable: false });
+  const view = render(<TaskWorkspace {...p} />);
+  expect(screen.getByRole("button", { name: "Run again" })).toBeDisabled();
+  const toggle = await screen.findByRole("switch", { name: "Chemistry" });
+  expect(toggle.closest("header")).toHaveClass("task-detail-header");
+  expect(toggle).not.toBeChecked();
+  view.rerender(<TaskWorkspace {...p} retryAvailable />);
+  expect(screen.getByRole("button", { name: "Run again" })).toBeEnabled();
+});
+it.each(["en", "zh"] as const)(
+  "leads directly into the selected %s prediction and returns through its native header",
+  async (language) => {
+    function Harness() {
+      const [selected, setSelected] = useState<Job | null>(job);
+      return (
+        <TaskWorkspace
+          {...props({
+            language,
+            scopedModule: "structures",
+            job: selected,
+            onJob: (id) => setSelected(id ? job : null),
+            renderPrediction: (onHistory, headerActions) => (
+              <PredictionResultHeader
+                job={job}
+                title="STAT6 structure"
+                language={language}
+                onHistory={onHistory}
+              >
+                {headerActions}
+              </PredictionResultHeader>
+            ),
+          })}
+        />
+      );
+    }
+    render(<Harness />);
+    expect(
+      screen.queryByRole("heading", {
+        level: 2,
+        name: language === "zh" ? "任务结果" : "Task results",
+      }),
+    ).toBeNull();
+    expect(document.querySelector(".task-history-list")).toBeNull();
+    expect(
+      screen.getByRole("heading", { name: "STAT6 structure" }),
+    ).toBeVisible();
+    const toggle = await screen.findByRole("switch", { name: "OpenDDE" });
+    expect(toggle.closest("header")).toHaveClass("prediction-result-heading");
+    expect(toggle).not.toBeChecked();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: language === "zh" ? "预测记录" : "Predictions",
+      }),
+    );
+    await screen.findByRole("heading", {
+      level: 2,
+      name: language === "zh" ? "任务结果" : "Task results",
+    });
+    expect(
+      screen.getByRole("heading", {
+        level: 2,
+        name: language === "zh" ? "任务结果" : "Task results",
+      }),
+    ).toHaveFocus();
+    expect(document.querySelector(".task-result-content")).toBeNull();
+  },
+);
+it.each(["en", "zh"] as const)(
+  "keeps project context and one return control in a selected %s operation",
+  async (language) => {
+    const projectJob = {
+      ...descriptors,
+      request: { ...descriptors.request, project_id: "study" },
+    } as Job;
+    historyJobs = [projectJob];
+    function Harness() {
+      const [selected, setSelected] = useState<Job | null>(projectJob);
+      return (
+        <TaskWorkspace
+          {...props({
+            language,
+            job: selected,
+            projectId: "study",
+            projects: [
+              {
+                id: "study",
+                name: "STAT6 study",
+                description: "",
+                created_at: "2026-10-01",
+              },
+            ],
+            onJob: (id) => setSelected(id ? projectJob : null),
+          })}
+        />
+      );
+    }
+    render(<Harness />);
+    expect(
+      screen.queryByRole("heading", {
+        level: 2,
+        name: language === "zh" ? "任务结果" : "Task results",
+      }),
+    ).toBeNull();
+    expect(document.querySelector(".task-history-list")).toBeNull();
+    expect(
+      screen.getByRole("group", {
+        name: language === "zh" ? "项目筛选" : "Project filter",
+      }),
+    ).toHaveTextContent("STAT6 study");
+    const navigation = screen.getByRole("navigation", {
+      name: language === "zh" ? "任务结果导航" : "Task result navigation",
+    });
+    expect(navigation.closest(".task-detail-header")).not.toBeNull();
+    expect(
+      screen.getAllByRole("button", {
+        name: language === "zh" ? "返回任务结果" : "Back to task results",
+      }),
+    ).toHaveLength(1);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: language === "zh" ? "返回任务结果" : "Back to task results",
+      }),
+    );
+    await screen.findByRole("button", { name: "STAT6 descriptors" });
+    expect(
+      screen.getByRole("heading", {
+        level: 2,
+        name: language === "zh" ? "任务结果" : "Task results",
+      }),
+    ).toHaveFocus();
+    expect(document.querySelector(".task-result-content")).toBeNull();
+  },
+);
+it("opens only the owning module and never a mixed task list", async () => {
+  const p = props();
+  render(<TaskWorkspace {...p} />);
+  await modulePage();
+  expect(screen.queryByRole("button", { name: "STAT6 structure" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "New task" }));
+  expect(p.onStart).toHaveBeenCalledWith("admet.predict");
+});
+it.each([
+  { ...job, status: "failed" },
+  {
+    ...job,
+    status: "cancelled",
+    request: {
+      operation: "mol1_predict",
+      name: "STAT6 native prediction",
+      payload: {},
+      options: {},
+    },
+  },
+  {
+    ...job,
+    status: "interrupted",
+    request: {
+      operation: "boltz_predict",
+      name: "STAT6 native prediction",
+      payload: {},
+      options: {},
+    },
+  },
+] as Job[])(
+  "keeps the native history action for a terminal prediction $status",
+  (selected) => {
+    render(
+      <TaskWorkspace
+        {...props({ scopedModule: "structures", job: selected })}
+      />,
+    );
+    expect(screen.getAllByRole("button", { name: "Predictions" })).toHaveLength(
+      1,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Back to task results" }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("heading", { level: 2, name: "Task results" }),
+    ).toBeNull();
+    expect(document.querySelector(".task-history-list")).toBeNull();
+  },
+);
+it("moves a running native prediction from common navigation to its terminal header", () => {
+  const native = {
+    ...job,
+    status: "running",
+    request: {
+      operation: "mol1_predict",
+      name: "STAT6 native prediction",
+      payload: {},
+      options: {},
+    },
+  } as Job;
+  const p = props({ scopedModule: "structures", job: native });
+  const view = render(<TaskWorkspace {...p} />);
+  expect(
+    screen.getAllByRole("button", { name: "Back to task results" }),
+  ).toHaveLength(1);
+  expect(screen.queryByRole("button", { name: "Predictions" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Refresh tasks" }));
+  expect(p.onRefresh).toHaveBeenCalledOnce();
+  view.rerender(<TaskWorkspace {...p} job={{ ...native, status: "failed" }} />);
+  expect(screen.getAllByRole("button", { name: "Predictions" })).toHaveLength(
+    1,
+  );
+  expect(
+    screen.queryByRole("button", { name: "Back to task results" }),
+  ).toBeNull();
+});
+it("opens an exact linked task in its owning module and masks foreign selected results", async () => {
+  const p = props({ job, scopedModule: "structures" });
+  const view = render(<TaskWorkspace key="structures" {...p} />);
+  expect(screen.getByText("Actual prediction result")).toBeVisible();
+  view.rerender(<TaskWorkspace key="evaluation" {...props({ job })} />);
+  await modulePage();
+  expect(screen.queryByText("Actual prediction result")).toBeNull();
+  expect(
+    screen.queryByRole("combobox", { name: "Switch task module" }),
+  ).toBeNull();
+});
+it("filters within the chosen module and offers a clear empty state", async () => {
+  render(<TaskWorkspace {...props()} />);
+  await modulePage();
+  fireEvent.change(screen.getByRole("combobox", { name: "Status" }), {
+    target: { value: "failed" },
+  });
+  await screen.findByRole("heading", { name: "No matching tasks" });
+  expect(
+    screen.queryByRole("button", { name: "STAT6 descriptors" }),
+  ).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+  await screen.findByRole("button", { name: "STAT6 descriptors" });
+});
+it("preserves page and query when selecting a row and returning to its list", async () => {
+  historyJobs = Array.from({ length: 25 }, (_, i) => ({
+    ...descriptors,
+    id: `id-${i}`,
+    request: { ...descriptors.request, name: `STAT6 series ${i}` },
+  }));
+  function Harness() {
+    const [selected, setSelected] = useState<Job | null>(null);
+    return (
+      <TaskWorkspace
+        {...props({
+          job: selected,
+          onJob: (id) =>
+            setSelected(historyJobs.find((job) => job.id === id) ?? null),
+        })}
+      />
+    );
+  }
+  render(<Harness />);
+  await screen.findByRole("button", { name: "STAT6 series 0" });
+  fireEvent.change(
+    screen.getByRole("searchbox", { name: "Search this module" }),
+    { target: { value: "STAT6 series" } },
+  );
+  await waitFor(() =>
+    expect(vi.mocked(api.taskHistory).mock.calls.at(-1)?.[0]).toContain(
+      "q=STAT6+series",
+    ),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  await screen.findByRole("button", { name: "STAT6 series 20" });
+  fireEvent.click(screen.getByRole("button", { name: "STAT6 series 20" }));
+  expect(document.querySelector(".task-history-list")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Back to task results" }));
+  expect(
+    screen.getByRole("searchbox", { name: "Search this module" }),
+  ).toHaveValue("STAT6 series");
+  expect(
+    within(screen.getByRole("navigation", { name: "Task pages" })).getByText(
+      "2 / 2",
+    ),
+  ).toBeVisible();
+  expect(screen.getByRole("heading", { name: "Task results" })).toHaveFocus();
+});
+it("keeps projects isolated and hides a selected task belonging to another project", async () => {
+  historyJobs = [
+    job,
+    {
+      ...descriptors,
+      request: { ...descriptors.request, project_id: "study" },
+    },
+  ];
+  const p = props({
+    job,
+    projectId: "study",
+    projects: [
+      {
+        id: "study",
+        name: "Target study",
+        description: "",
+        created_at: "2026-10-01",
+      },
+    ],
+  });
+  render(<TaskWorkspace {...p} />);
+  await modulePage();
+  expect(
+    screen.getByRole("group", { name: "Project filter" }),
+  ).toHaveTextContent("Target study");
+  expect(screen.queryByText("Actual prediction result")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Clear filter" }));
+  expect(p.onProject).toHaveBeenCalledWith(null);
+});
+it("keeps a just-submitted task visible when its history request fails", async () => {
+  vi.mocked(api.taskHistory).mockRejectedValue(new Error("Unavailable"));
+  const p = props({
+    scopedModule: "structures",
+    job: { ...job, status: "queued" },
+  });
+  render(<TaskWorkspace {...p} />);
+  expect(
+    await screen.findByRole("heading", { name: "STAT6 structure" }),
+  ).toBeVisible();
+  fireEvent.click(await screen.findByRole("button", { name: "Reconnect" }));
+  expect(p.onRefresh).toHaveBeenCalledOnce();
+});
+it("opens other tasks without discarding unclassified history", async () => {
+  historyJobs = [
+    {
+      ...job,
+      request: { operation: "doctor", name: "Environment check" },
+    } as Job,
+  ];
+  render(<TaskWorkspace {...props({ scopedModule: "other" })} />);
+  await screen.findByRole("button", { name: "Environment check" });
+  expect(
+    screen.queryByRole("combobox", { name: "Switch task module" }),
+  ).toBeNull();
+});
+it("does not expose a global module picker or foreign results", async () => {
+  render(<TaskWorkspace {...props({ job })} />);
+  await modulePage();
+  expect(screen.queryByRole("button", { name: "Task modules" })).toBeNull();
+  expect(screen.queryByRole("group", { name: "Task modules" })).toBeNull();
+  expect(screen.queryByText("Actual prediction result")).toBeNull();
+});
+it("preserves saved Chinese and shows a concise empty workspace", async () => {
+  historyJobs = [];
+  render(<TaskWorkspace {...props({ language: "zh" })} />);
+  await screen.findByText("这个模块还没有任务");
+  expect(screen.getByRole("button", { name: "新建任务" })).toBeVisible();
+});
+it("restores an unselected module and its search after remount instead of opening mixed history", async () => {
+  const p = props();
+  const first = render(<TaskWorkspace {...p} />);
+  await modulePage();
+  fireEvent.change(
+    screen.getByRole("searchbox", { name: "Search this module" }),
+    { target: { value: "STAT6" } },
+  );
+  await waitFor(() => expect(window.location.hash).toContain("q=STAT6"));
+  expect(window.location.hash).toContain("module=evaluation");
+  first.unmount();
+  render(<TaskWorkspace {...p} />);
+  expect(
+    screen.queryByRole("combobox", { name: "Switch task module" }),
+  ).toBeNull();
+  expect(
+    screen.getByRole("searchbox", { name: "Search this module" }),
+  ).toHaveValue("STAT6");
+  await screen.findByRole("button", { name: "STAT6 descriptors" });
+  expect(screen.queryByRole("button", { name: "STAT6 structure" })).toBeNull();
+});
+
+it.each(["en", "zh"] as const)(
+  "persists the visible %s search before the debounced server query",
+  async (language) => {
+    vi.useFakeTimers();
+    const view = render(<TaskWorkspace {...props({ language })} />);
+    try {
+      await act(async () => vi.advanceTimersByTimeAsync(0));
+      fireEvent.change(
+        screen.getByRole("searchbox", {
+          name: language === "zh" ? "搜索模块内任务" : "Search this module",
+        }),
+        { target: { value: "STAT6 fragment" } },
+      );
+      expect(new URLSearchParams(window.location.hash.slice(1)).get("q")).toBe(
+        "STAT6 fragment",
+      );
+      expect(
+        vi
+          .mocked(api.taskHistory)
+          .mock.calls.some(([path]) => path.includes("q=STAT6")),
+      ).toBe(false);
+      await act(async () => vi.advanceTimersByTimeAsync(250));
+      expect(vi.mocked(api.taskHistory).mock.calls.at(-1)?.[0]).toContain(
+        "q=STAT6+fragment",
+      );
+      expect(new URLSearchParams(window.location.hash.slice(1)).get("q")).toBe(
+        "STAT6 fragment",
+      );
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  },
+);

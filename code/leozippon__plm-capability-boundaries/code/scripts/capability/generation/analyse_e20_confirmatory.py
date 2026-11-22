@@ -1,0 +1,900 @@
+#!/usr/bin/env python3
+"""Pre-specified confirmatory analysis of E20: does pairwise coupling add design benefit over first-order information?
+
+Written before the confirmatory records exist; the decision rules below are frozen and must not be
+weakened, broadened or extended to make a result come out.
+
+Endpoints, per domain per cell: the primary is the mean TM-score over candidates with
+identity_to_wild_type < 20 (at least 25 such candidates, otherwise the value is missing and is never
+imputed); the co-primary is the feasibility rate, the admissible fraction of the pool. The independence
+unit is the domain. A contrast with fewer than MINIMUM_BOOTSTRAP_UNITS domains is "unestimable": no
+interval, no p-value. The headline is the achieved
+upper 95% bound on C - Pr and F - M, per model and pooled. The verdict flag requires that bound to lie
+below the 0.05 TM margin in each model separately, and is only ever "no pairwise-specific design benefit",
+"inconclusive at this power" or "unestimable"; it is never "positive" and never "equivalent". The decision
+rests on the interval and the margin, not on either p-value.
+
+Selection is structurally blind to structure-derived fields: selectors see a SelectorView holding the
+sequences and native_loglik and nothing else, and plddt_mean, ptm and tm_score are refused by name.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import warnings
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+from scipy import stats
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import analyse_selection_factorial as sf  # noqa: E402
+from src.capability.context.family_potts import load_family_model  # noqa: E402
+from src.capability.core.io import write_json  # noqa: E402
+from src.capability.core.statistics import MINIMUM_BOOTSTRAP_UNITS, bootstrap_unit_floor  # noqa: E402
+from src.capability.generation import fold_recapitulation as fr  # noqa: E402
+
+SCHEMA = "e20_confirmatory_v1"
+SEALED_DOMAINS = ("1E0L", "1F0M", "1IFY", "1V1C", "2K1B", "2LGW", "2LVN", "3DKM")
+MODELS = ("progen2-medium", "protgpt2")
+POOLED = "pooled"
+STRATA = (*MODELS, POOLED)
+
+ADMISSIBLE_IDENTITY = 20.0  # percent identity to the wild type; admissible means strictly below
+MIN_ADMISSIBLE = 25
+MARGIN = 0.05
+SELECTION_K = 10
+SELECTION_POOL_ARM = "N"  # selection re-ranks the unguided pool, so it is the only intervention in play
+CONFIDENCE = 0.95
+N_RESAMPLES = 9999
+BOOTSTRAP_SEED = 20261013
+LEAVE_OUT_DOMAIN = "1IFY"
+EPS = 1e-12
+
+VERDICT_CONCLUDE = "no pairwise-specific design benefit"
+VERDICT_INCONCLUSIVE = "inconclusive at this power"
+VERDICT_UNESTIMABLE = "unestimable"
+EQUIVALENCE_CONTRASTS = ("C-Pr", "F-M")
+
+#: Frozen doses (lambda_fields, lambda_coupling). C, Cx and Cd share one coupling dose per model.
+_C = {"progen2-medium": (0.0, 4.0), "protgpt2": (0.0, 8.0)}
+FROZEN_DOSES = {
+    "N": {m: (0.0, 0.0) for m in MODELS},
+    "Pr": {m: (0.25, 0.0) for m in MODELS},
+    "M": {m: (0.25, 0.0) for m in MODELS},
+    "C": _C, "Cx": _C, "Cd": _C,
+    "F": {"progen2-medium": (0.25, 1.0), "protgpt2": (0.5, 0.25)},
+}
+CELL_CONTRASTS = (("C-Pr", "C", "Pr"), ("F-M", "F", "M"), ("C-Cx", "C", "Cx"), ("C-Cd", "C", "Cd"),
+                  ("C-N", "C", "N"), ("Pr-N", "Pr", "N"))
+SELECTION_CONTRASTS = (("potts_full-potts_fields", "potts_full", "potts_fields"),
+                       ("potts_coupling-coupling_permuted", "potts_coupling", "coupling_permuted"))
+REFERENCE_CONTRASTS = (("P-N", "P", "N"), ("H-N", "H", "N"))
+FRONTIER_ARMS = ("Pr", "C")
+
+#: Structure-derived fields that may never rank or choose a candidate. Never merged into one score either.
+FORBIDDEN_SELECTOR_FIELDS = frozenset({"plddt_mean", "ptm", "tm_score"})
+SELECTOR_NAMES = ("native_loglik", "potts_fields", "potts_coupling", "potts_full", "coupling_permuted")
+
+#: Reference arms are keyed on the model label their records carry; a record under any other label is refused.
+REFERENCE_MODEL_LABELS = {"P": "potts-joint", "H": "natural"}
+BCA_NOTE = ("BCa over 8 domains: realised coverage of a nominal 95% percentile interval is about 0.89 at eight "
+            "units (src.capability.core.statistics); the interval is anti-conservative, so read the bound as "
+            "optimistic, not exact.")
+SIGN_FLIP_NOTE = ("exact two-sided sign-flip p cannot fall below 2/2**n (0.0078 at n=8); after Holm over 8 "
+                  "contrasts the smallest attainable adjusted p is 0.0625, so no contrast in this family can "
+                  "reach family-wise significance at 0.05 by this test. The decision rests on the interval "
+                  "and the margin, not on either p-value.")
+
+#: The secondary hypothesis about family depth. Declared from the four development domains before the
+#: evaluation domains were read; it sits outside the primary Holm family and cannot touch the verdict.
+DEPTH_LABEL = "secondary_predeclared_msa_depth"
+GUIDANCE_ARMS = ("M", "Pr", "C", "F")  # the genuine guidance arms; Cx and Cd are wrong-constraint controls
+MSA_ROWS_DEVELOPMENT = {"2KWH": 145, "1UFM": 358, "1K1V": 524, "3L1X": 798}
+#: The development support is definition-dependent. Best over the whole dose axis (the declared observation) orders
+#: perfectly inversely with depth; the frozen-dose gain used for the test does not (1UFM breaks the ordering in both
+#: models). Both are recorded; the frozen-dose numbers are the best of M, Pr, C, F at the frozen dose minus N.
+DEVELOPMENT_OBSERVATION = {
+    "best_over_dose_axis": {"2KWH": 0.1030, "1UFM": 0.0762, "1K1V": 0.0647, "3L1X": 0.0480,
+                            "definition": "best non-native arm over the whole dose axis minus native, below 20% "
+                                          "identity, 25-candidate floor; outcome-maximised, so upward-biased",
+                            "monotone_in_depth": True},
+    "frozen_dose": {"progen2-medium": {"2KWH": 0.0505, "1UFM": 0.0169, "1K1V": 0.0325, "3L1X": 0.0152},
+                    "protgpt2": {"2KWH": 0.0544, "1UFM": 0.0275, "1K1V": 0.0603, "3L1X": 0.0301},
+                    "definition": "the definition the depth hypothesis is tested under",
+                    "monotone_in_depth": False},
+    "msa_rows": MSA_ROWS_DEVELOPMENT,
+    "support_statement": (
+        "The development support is definition-dependent: monotone under a best-over-dose-axis gain, non-monotone "
+        "under the frozen-dose gain (ordered by depth the frozen-dose gains are 0.0505, 0.0169, 0.0325, 0.0152 for "
+        "progen2-medium and 0.0544, 0.0275, 0.0603, 0.0301 for protgpt2). This lowers the prior on the hypothesis. "
+        "It is tested anyway because the sealed set spans 56-fold in depth against development's 5.5-fold, so it is "
+        "the first adequately-ranged test rather than a confirmation of a development finding. The declared "
+        "direction stays negative: it was declared before this recomputation, and changing it now would fit the "
+        "declaration to the data.")}
+DEPTH_COVARIATES = ("log10_msa_depth", "mean_msa_identity_to_query")
+DEPTH_DIRECTION = {"log10_msa_depth": "negative", "mean_msa_identity_to_query": "none declared; descriptive"}
+DEPTH_CAVEAT = (
+    "Suggestive only, and weaker than first declared. In development, four domains ordered a best-over-dose-axis "
+    "gain perfectly inversely with MSA depth, but the frozen-dose gain used here does not (see "
+    "development_observation). A perfect monotone ordering in a specified direction arises by chance with "
+    "probability 1/24 at n=4, so even the first was a hypothesis, not a finding. Gain can also track chain length or the native baseline instead of depth; four "
+    "domains cannot separate the three, so the length- and baseline-controlled partial is reported alongside. "
+    "Gain is the best of four guidance arms minus native, which is biased upward by selecting the maximum. With "
+    "eight domains the intervals are wide; no pass/fail threshold is attached and no verdict is drawn.")
+
+#: Pre-declared secondary on how much of the oracle headroom a selector captures. Outside the Holm family, no
+#: bearing on the verdict, no threshold.
+CAPTURE_LABEL = "captured_fraction_of_oracle_headroom"
+CAPTURE_ARMS = ("N", "Pr", "C")
+CAPTURE_EXPECTATION = (
+    "Declared expectation, stated before the numbers: the captured fraction is well below 1 and does not increase "
+    "with pool depth. No threshold and no pass/fail verdict is attached; the value is the number itself.")
+CAPTURE_ORACLE_STATEMENT = (
+    "The TM oracle selects the top candidates by the realised TM-score, the primary endpoint, which is prohibited "
+    "for any method. It is computed outside the selector registry, which cannot see tm_score, and exists only to "
+    "measure the ceiling. It is not a selector and not a proposed method.")
+CAPTURE_DEVELOPMENT_ONLY = (
+    "Budget scaling (whether the gain grows with candidate budget) is development-only, measured by "
+    "analyse_selection_budget.py at depths 100 to 500. The sealed domains carry 200 candidates in the primary-family "
+    "cells and 100 in the frontier cells, not 500, so it cannot be repeated on them. Only the captured fraction at "
+    "their own depths is reported here.")
+
+STATEMENT = (
+    "Pre-specified analysis; decision rules frozen before the data existed. The independence unit is the "
+    "domain. Contrasts with fewer than MINIMUM_BOOTSTRAP_UNITS domains carry no interval and no p-value. "
+    "The headline is the achieved upper bound on C-Pr and F-M; the margin flag requires it below 0.05 TM "
+    "in each model separately. Neither p-value decides anything."
+)
+
+
+# ------------------------------------------------------------------ selector registry
+
+
+@dataclass(frozen=True)
+class SelectorView:
+    """All a selector may read: the sequences, their domain and native_loglik."""
+
+    domain: str
+    sequences: tuple[str, ...]
+    native_loglik: np.ndarray
+
+
+def selector_view(rows) -> SelectorView:
+    """Project records onto the selector-visible fields; nothing structural survives the projection."""
+
+    return SelectorView(rows[0]["domain"], tuple(r["sequence"] for r in rows),
+                        np.array([r["native_loglik"] for r in rows], dtype=np.float64))
+
+
+def selector_scores(names, view: SelectorView, model, permutation_seed: int) -> dict[str, np.ndarray]:
+    """Scores of the requested selectors, computed by the shared Potts machinery of the selection analysis."""
+
+    for name in names:
+        if name in FORBIDDEN_SELECTOR_FIELDS:
+            raise ValueError(f"{name!r} is a structure-derived field and cannot be used as a selector")
+        if name not in SELECTOR_NAMES:
+            raise ValueError(f"unknown selector {name!r}; the registry holds {SELECTOR_NAMES}")
+    codes = sf.encode_pool(list(view.sequences), model.length, view.domain)
+    scores = sf.selector_scores(model, None, permutation_seed, codes)
+    scores["native_loglik"] = view.native_loglik
+    return {name: scores[name] for name in names}
+
+
+# ------------------------------------------------------------------ cell summaries
+
+
+def _mean(values):
+    values = [v for v in values if v is not None]
+    return float(np.mean(values)) if len(values) else None
+
+
+def summarise_cell(rows) -> dict:
+    """Every per-cell number: endpoints with their identity companions, controls and guidance strength."""
+
+    ident = np.array([r["identity_to_wild_type"] for r in rows], dtype=np.float64)
+    msa = np.array([r["max_msa_identity"] for r in rows], dtype=np.float64)
+    tm = np.array([r["tm_score"] for r in rows], dtype=np.float64)
+    admissible = ident < ADMISSIBLE_IDENTITY
+    n_adm = int(admissible.sum())
+    strengths = [r["guidance_strength"]["kl_per_residue"] for r in rows if r.get("guidance_strength")]
+    if strengths and len(strengths) != len(rows):
+        raise ValueError(f"{rows[0]['model']}/{rows[0]['domain']}/{rows[0]['arm']}: only some records carry guidance_strength")
+    return {
+        "n": len(rows), "n_admissible": n_adm, "feasibility": n_adm / len(rows),
+        "tm": float(tm[admissible].mean()) if n_adm >= MIN_ADMISSIBLE else None,
+        "identity_admissible": _mean(ident[admissible]), "msa_identity_admissible": _mean(msa[admissible]),
+        "identity_pool": float(ident.mean()), "msa_identity_pool": float(msa.mean()),
+        "tm_all_candidates": float(tm.mean()),
+        "composition_tv_to_wild_type": _mean([r["composition_tv_to_wild_type"] for r in rows]),
+        "composition_tv_to_family": _mean([r["composition_tv_to_family"] for r in rows]),
+        **(fr.diversity([r["sequence"] for r in rows]) if len(rows) > 1 else {}),
+        "kl_per_residue": _mean(strengths) if strengths else None,
+    }
+
+
+def group_cells(records) -> dict[tuple, list]:
+    cells = defaultdict(list)
+    for r in records:
+        cells[(r["model"], r["domain"], r["arm"], r["lambda_fields"], r["lambda_coupling"])].append(r)
+    return cells
+
+
+def selected_summary(admissible_rows, scores, name: str) -> dict:
+    """Mean TM and identities of the top-k candidates under one selector, drawn from the admissible pool."""
+
+    top = np.argsort(-scores, kind="stable")[:SELECTION_K]
+    picked = [admissible_rows[i] for i in top]
+    return {"tm": float(np.mean([r["tm_score"] for r in picked])), "n_admissible": len(admissible_rows),
+            "identity_admissible": float(np.mean([r["identity_to_wild_type"] for r in picked])),
+            "msa_identity_admissible": float(np.mean([r["max_msa_identity"] for r in picked])), "selector": name}
+
+
+# ------------------------------------------------------------------ statistics
+
+
+def holm_adjust(p_values, family_size: int | None = None) -> list[float | None]:
+    """Holm step-down adjusted p-values for a family of fixed size; None entries (unestimable) count as p = 1.
+
+    The family size is the number of contrasts in the frozen family, not the number that happened to be
+    estimable, so the correction never depends on the data.
+    """
+
+    m = family_size if family_size is not None else len(p_values)
+    if m < len(p_values):
+        raise ValueError("family size smaller than the number of p-values")
+    filled = [1.0 if p is None else float(p) for p in p_values]
+    order = sorted(range(len(filled)), key=lambda i: filled[i])
+    adjusted, running = [None] * len(filled), 0.0
+    for rank, i in enumerate(order):
+        running = max(running, min(1.0, (m - rank) * filled[i]))
+        adjusted[i] = running
+    return [None if p_values[i] is None else adjusted[i] for i in range(len(filled))]
+
+
+def bca_interval(values) -> tuple[list[float], bool]:
+    """95% BCa bootstrap interval of the mean over domains; a constant sample is returned as a point, flagged."""
+
+    v = np.asarray(values, dtype=np.float64)
+    if float(np.ptp(v)) == 0.0:
+        return [float(v[0]), float(v[0])], True
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = stats.bootstrap((v,), np.mean, method="BCa", confidence_level=CONFIDENCE,
+                                 n_resamples=N_RESAMPLES, random_state=np.random.default_rng(BOOTSTRAP_SEED))
+    low, high = float(result.confidence_interval.low), float(result.confidence_interval.high)
+    if not (np.isfinite(low) and np.isfinite(high)):
+        raise RuntimeError("BCa interval is non-finite")
+    return [low, high], False
+
+
+def sign_flip_p(diffs) -> float:
+    """Exact two-sided sign-flip p-value of the mean difference: all 2**n sign patterns enumerated."""
+
+    d = np.asarray(diffs, dtype=np.float64)
+    signs = np.array(np.meshgrid(*[[-1.0, 1.0]] * len(d))).reshape(len(d), -1).T
+    return float(np.mean(np.abs((signs * d).mean(axis=1)) >= abs(d.mean()) - EPS))
+
+
+def estimate(per_domain: dict, missing: dict, *, descriptive_floor: int | None = None, label: str = "") -> dict:
+    """Summarise one contrast over domains.
+
+    ``per_domain`` maps domain -> {"diff", "identity_diff", "msa_identity_diff"}. Below the unit floor no
+    interval and no p-value are produced; ``descriptive_floor`` lowers the floor for the one pre-declared
+    descriptive sensitivity and then withholds the p-value as well.
+    """
+
+    diffs = np.array([v["diff"] for v in per_domain.values()], dtype=np.float64)
+    n = len(diffs)
+    floor_units = MINIMUM_BOOTSTRAP_UNITS if descriptive_floor is None else descriptive_floor
+    floor = bootstrap_unit_floor(n, minimum_units=floor_units)
+    record = {
+        "n_domains": n, "per_domain": per_domain, "missing_domains": missing,
+        "mean": float(diffs.mean()) if n else None,
+        "mean_identity_diff": _mean([v["identity_diff"] for v in per_domain.values()]),
+        "mean_msa_identity_diff": _mean([v["msa_identity_diff"] for v in per_domain.values()]),
+        "favouring": {"positive": int((diffs > 0).sum()), "negative": int((diffs < 0).sum()),
+                      "tied": int((diffs == 0).sum())},
+        "interval95_bca": None, "interval_zero_variance": None, "interval_coverage_note": None,
+        "p_holm_ttest": None, "p_holm_signflip": None, "_p": None, "_ps": None,
+    }
+    if floor["degenerate"]:
+        reason = f"{n} domains have a value, below the {floor_units}-domain floor"
+        if missing:
+            reason += "; without a value: " + "; ".join(f"{d} ({why})" for d, why in missing.items())
+        record.update(status="unestimable", reason=reason)
+        return record
+    record["interval95_bca"], record["interval_zero_variance"] = bca_interval(diffs)
+    record["interval_coverage_note"] = BCA_NOTE
+    if descriptive_floor is None:
+        sd = float(diffs.std(ddof=1))
+        record["_p"] = (float(stats.ttest_1samp(diffs, 0.0).pvalue) if sd > 0.0
+                        else (1.0 if float(diffs.mean()) == 0.0 else 0.0))
+        record["_ps"] = sign_flip_p(diffs)
+    record.update(status="descriptive" if descriptive_floor is not None else "estimated", reason=label or None)
+    return record
+
+
+def finish_family(records: dict, family_size: int) -> dict:
+    """Holm-adjust the frozen family and drop the uncorrected p-values so only the adjusted ones are reported."""
+
+    names = list(records)
+    for key, out in (("_p", "p_holm_ttest"), ("_ps", "p_holm_signflip")):
+        for name, p in zip(names, holm_adjust([records[n][key] for n in names], family_size)):
+            records[name][out] = p
+    return strip_p(records)
+
+
+def strip_p(records: dict) -> dict:
+    for rec in records.values():
+        rec.pop("_p")
+        rec.pop("_ps")
+    return records
+
+
+# ------------------------------------------------------------------ contrasts
+
+
+class Sources:
+    """Per (model, domain, name) summaries for cell arms and for selectors, with the reason when one is absent."""
+
+    def __init__(self, records, family_models, permutation_seed):
+        self.cells = {k: summarise_cell(v) for k, v in group_cells(records).items()}
+        for (model, domain, arm, *_dose) in self.cells:
+            if arm in REFERENCE_MODEL_LABELS and model != REFERENCE_MODEL_LABELS[arm]:
+                raise ValueError(f"{domain}: {arm} records carry model {model!r}; the reference arm must be "
+                                 f"labelled {REFERENCE_MODEL_LABELS[arm]!r}, and there is no fallback")
+        self.arm_cells = defaultdict(list)
+        for (model, domain, arm, *_dose), summary in self.cells.items():
+            self.arm_cells[(model, domain, arm)].append(summary)
+        by_arm = defaultdict(list)
+        for r in records:
+            by_arm[(r["model"], r["domain"], r["arm"])].append(r)
+        names = sorted({n for _, x, y in SELECTION_CONTRASTS for n in (x, y)})
+        self._selected = {}
+        for (model, domain, arm), rows in by_arm.items():
+            if arm != SELECTION_POOL_ARM or domain not in family_models:
+                continue
+            admissible = [r for r in rows if r["identity_to_wild_type"] < ADMISSIBLE_IDENTITY]
+            if len(admissible) < MIN_ADMISSIBLE:
+                for name in names:
+                    self._selected[(model, domain, name)] = {"tm": None, "n_admissible": len(admissible)}
+                continue
+            scores = selector_scores(names, selector_view(admissible), family_models[domain], permutation_seed)
+            for name in names:
+                self._selected[(model, domain, name)] = selected_summary(admissible, scores[name], name)
+
+    def cell(self, model, domain, arm):
+        """The frozen-dose cell summary, or (None, reason). P and H are keyed on their model label, not a dose."""
+
+        if arm in REFERENCE_MODEL_LABELS:
+            found = self.arm_cells.get((REFERENCE_MODEL_LABELS[arm], domain, arm), [])
+            if len(found) > 1:
+                raise ValueError(f"{domain}/{arm}: {len(found)} cells under model {REFERENCE_MODEL_LABELS[arm]!r}")
+            return (found[0], None) if found else (None, f"no {arm} cell under model {REFERENCE_MODEL_LABELS[arm]!r}")
+        key = (model, domain, arm, *FROZEN_DOSES[arm][model])
+        if key in self.cells:
+            return self.cells[key], None
+        return None, f"no {arm} cell at dose {FROZEN_DOSES[arm][model]}"
+
+    def selected(self, model, domain, name):
+        if (model, domain, name) in self._selected:
+            return self._selected[(model, domain, name)], None
+        return None, f"no {SELECTION_POOL_ARM} pool or family model for selection"
+
+
+def side_value(summary, reason, name, metric):
+    if summary is None:
+        return None, reason
+    if summary[metric] is None:
+        return None, f"{name}: {summary['n_admissible']} admissible < {MIN_ADMISSIBLE}"
+    return summary, None
+
+
+def model_contrast(domains, model, a, b, metric, getter) -> tuple[dict, dict]:
+    """Per-domain differences a - b for one model; ``getter(model, domain, name)`` returns (summary, reason)."""
+
+    ident, msa = (("identity_admissible", "msa_identity_admissible") if metric == "tm"
+                  else ("identity_pool", "msa_identity_pool"))
+    per, missing = {}, {}
+    for d in domains:
+        sa, ra = side_value(*getter(model, d, a), a, metric)
+        sb, rb = side_value(*getter(model, d, b), b, metric)
+        if sa is None or sb is None:
+            missing[d] = ra or rb
+            continue
+        per[d] = {"diff": sa[metric] - sb[metric], "identity_diff": sa[ident] - sb[ident],
+                  "msa_identity_diff": sa[msa] - sb[msa]}
+    return per, missing
+
+
+def pooled_contrast(by_model: dict) -> tuple[dict, dict]:
+    """Per-domain mean over models; a domain missing in either model is missing, never imputed."""
+
+    domains = set().union(*(set(p) | set(m) for p, m in by_model.values()))
+    per, missing = {}, {}
+    for d in sorted(domains):
+        parts = [by_model[m][0].get(d) for m in MODELS]
+        if any(p is None for p in parts):
+            missing[d] = "; ".join(f"{m}: {by_model[m][1][d]}" for m in MODELS if d in by_model[m][1])
+            continue
+        per[d] = {k: float(np.mean([p[k] for p in parts])) for k in parts[0]}
+    return per, missing
+
+
+def contrast_table(domains, spec, metric, getter, **kw) -> dict:
+    """{stratum: {contrast: estimate}} for contrasts ``spec = ((name, a, b), ...)``."""
+
+    out = {s: {} for s in STRATA}
+    for name, a, b in spec:
+        by_model = {m: model_contrast(domains, m, a, b, metric, getter) for m in MODELS}
+        for m in MODELS:
+            out[m][name] = estimate(*by_model[m], **kw)
+        out[POOLED][name] = estimate(*pooled_contrast(by_model), **kw)
+    return out
+
+
+def verdict_reason(primary: dict, strata: dict) -> str:
+    """Every condition behind the verdict, with its numbers: unestimable contrasts and over-margin bounds."""
+
+    fired, clear = [], []
+    for model in MODELS:
+        for name in EQUIVALENCE_CONTRASTS:
+            rec, upper = primary[model][name], strata[model]["upper_bound"][name]
+            if upper is None:
+                fired.append(f"{model} {name} unestimable ({rec['reason']})")
+            elif upper >= MARGIN - EPS:
+                fired.append(f"{model} {name} upper bound {upper:+.4f} exceeds margin {MARGIN} by {upper - MARGIN:+.4f}")
+            else:
+                clear.append(f"{model} {name} upper bound {upper:+.4f}")
+    if fired:
+        return "; ".join(fired) + (f". Below margin {MARGIN}: " + "; ".join(clear) if clear else "")
+    return f"all four model-level upper bounds are below margin {MARGIN}: " + "; ".join(clear)
+
+
+# ------------------------------------------------------------------ secondary: family depth
+
+
+def msa_covariates(msa_dir: Path, wild_types: dict) -> dict:
+    """Per domain: chain length, MSA row count, log10 depth and mean percent identity of the rows to the query.
+
+    Identity follows ``fold_recapitulation.max_msa_identity`` (matches over the row's non-gap columns, rows
+    covering at least MIN_MSA_COVERAGE of the query); exact copies of the query are excluded from the mean.
+    """
+
+    out = {}
+    for domain, query in sorted(wild_types.items()):
+        rows = fr.load_msa(msa_dir, domain, len(query))
+        q = np.frombuffer(query.encode(), dtype=np.uint8)
+        identities, copies = [], 0
+        for row in rows:
+            codes = np.frombuffer(row.upper().encode(), dtype=np.uint8)
+            aligned = codes != ord("-")
+            n = int(aligned.sum())
+            if n < fr.MIN_MSA_COVERAGE * len(query):
+                continue
+            ident = 100.0 * float(np.sum((codes == q) & aligned)) / n
+            if ident == 100.0:
+                copies += 1
+            else:
+                identities.append(ident)
+        out[domain] = {"role": "evaluation" if domain in SEALED_DOMAINS else "development", "length": len(query),
+                       "msa_rows": len(rows), "log10_msa_depth": float(np.log10(len(rows))),
+                       "mean_msa_identity_to_query": float(np.mean(identities)), "n_rows_in_mean": len(identities),
+                       "n_query_copies_excluded": copies}
+    return out
+
+
+def _ranks_residual(v, controls):
+    """Rank-transform, then remove a least-squares fit on the ranked controls (with intercept)."""
+
+    r = stats.rankdata(v)
+    if controls is None:
+        return r
+    design = np.column_stack([np.ones(len(r))] + [stats.rankdata(c) for c in controls])
+    return r - design @ np.linalg.lstsq(design, r, rcond=None)[0]
+
+
+def rank_correlation(x, y, controls=None) -> float:
+    """Spearman correlation, or the partial Spearman controlling ``controls``; NaN when a margin is constant."""
+
+    a, b = _ranks_residual(x, controls), _ranks_residual(y, controls)
+    if np.ptp(a) < 1e-12 or np.ptp(b) < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def correlation_with_interval(x, y, controls=None) -> dict:
+    """Point estimate and 95% percentile bootstrap over domains; degenerate resamples are dropped and counted."""
+
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    controls = None if controls is None else [np.asarray(c, float) for c in controls]
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    draws = []
+    for _ in range(N_RESAMPLES):
+        i = rng.integers(0, len(x), len(x))
+        r = rank_correlation(x[i], y[i], None if controls is None else [c[i] for c in controls])
+        if np.isfinite(r):
+            draws.append(r)
+    point = rank_correlation(x, y, controls)
+    if not np.isfinite(point) or len(draws) < 0.9 * N_RESAMPLES:
+        return {"estimate": None if not np.isfinite(point) else point, "interval95_percentile": None,
+                "n_draws_used": len(draws), "note": "interval withheld: too many degenerate resamples"}
+    return {"estimate": point, "interval95_percentile": [float(np.percentile(draws, 2.5)),
+                                                          float(np.percentile(draws, 97.5))],
+            "n_draws_used": len(draws), "n_draws_dropped_degenerate": N_RESAMPLES - len(draws)}
+
+
+def axis_gain_descriptive(sources: "Sources", domains) -> dict:
+    """Outcome-maximised best-over-dose-axis gain for Pr and C, beside their frozen-dose gain. Not part of the test."""
+
+    out = {"label": "descriptive; best over the dose axis is chosen on the outcome and is therefore upward-biased; "
+                    "kept out of the declared test; shown so the definition dependence is visible",
+           "arms": {}}
+    for arm in FRONTIER_ARMS:
+        per = {}
+        for d in [x for x in SEALED_DOMAINS if x in domains]:
+            gains, frozen, chosen = [], [], {}
+            for model in MODELS:
+                base, why = side_value(*sources.cell(model, d, "N"), "N", "tm")
+                axis = {k[3:]: c["tm"] for k, c in sources.cells.items() if k[:3] == (model, d, arm) and c["tm"] is not None}
+                fz, _ = side_value(*sources.cell(model, d, arm), arm, "tm")
+                if base is None or not axis:
+                    break
+                dose = max(axis, key=axis.get)
+                chosen[model] = list(dose)
+                gains.append(axis[dose] - base["tm"])
+                frozen.append(None if fz is None else fz["tm"] - base["tm"])
+            else:
+                per[d] = {"best_over_axis_gain": float(np.mean(gains)), "chosen_dose_by_model": chosen,
+                          "frozen_dose_gain": None if None in frozen else float(np.mean(frozen))}
+        out["arms"][arm] = {"per_domain": per,
+                            "mean_best_over_axis_gain": _mean([v["best_over_axis_gain"] for v in per.values()]),
+                            "mean_frozen_dose_gain": _mean([v["frozen_dose_gain"] for v in per.values()])}
+    return out
+
+
+def depth_hypothesis(sources: "Sources", domains, covariates: dict) -> dict:
+    """Secondary pre-declared hypothesis: guidance gain against family depth, tested on evaluation domains only."""
+
+    evaluation = [d for d in SEALED_DOMAINS if d in domains]
+    per_domain, missing = {}, {}
+    for d in evaluation:
+        gains, arms, baselines = [], {}, []
+        for model in MODELS:
+            base, why = sources.cell(model, d, "N")
+            base, why = side_value(base, why, "N", "tm")
+            options = {}
+            for arm in GUIDANCE_ARMS:
+                cell, reason = side_value(*sources.cell(model, d, arm), arm, "tm")
+                if cell is not None:
+                    options[arm] = cell["tm"]
+            if base is None or not options:
+                missing[d] = f"{model}: " + (why or "no guidance arm meets the 25-candidate floor")
+                break
+            best = max(options, key=options.get)
+            arms[model], gains, baselines = best, gains + [options[best] - base["tm"]], baselines + [base["tm"]]
+        else:
+            per_domain[d] = {"gain": float(np.mean(gains)), "best_arm_by_model": arms,
+                             "native_baseline_tm": float(np.mean(baselines))}
+    units = bootstrap_unit_floor(len(per_domain))
+    tests = {}
+    for name in DEPTH_COVARIATES:
+        entry = {"predeclared_direction": DEPTH_DIRECTION[name], "n_domains": len(per_domain)}
+        if units["degenerate"]:
+            entry.update(status="unestimable", reason=f"{len(per_domain)} evaluation domains have a gain, below the "
+                         f"{MINIMUM_BOOTSTRAP_UNITS}-domain floor" + (f"; without one: {missing}" if missing else ""))
+        else:
+            ds = list(per_domain)
+            x = [covariates[d][name] for d in ds]
+            gain = [per_domain[d]["gain"] for d in ds]
+            controls = [[covariates[d]["length"] for d in ds], [per_domain[d]["native_baseline_tm"] for d in ds]]
+            entry.update(status="reported", spearman=correlation_with_interval(x, gain),
+                         partial_spearman_controlling_length_and_native_baseline=
+                         correlation_with_interval(x, gain, controls))
+        tests[name] = entry
+    depths = [v["msa_rows"] for v in covariates.values() if v["role"] == "evaluation"]
+    dev = [v["msa_rows"] for v in covariates.values() if v["role"] == "development"]
+    return {
+        "label": DEPTH_LABEL,
+        "predeclared_direction": DEPTH_DIRECTION,
+        "provenance": {"generated_from": "the four development domains (1K1V, 1UFM, 2KWH, 3L1X)",
+                       "frozen_before_evaluation_domains_were_read": True,
+                       "outside_primary_holm_family": True, "influences_primary_verdict": False},
+        "caveat": DEPTH_CAVEAT,
+        "development_observation": DEVELOPMENT_OBSERVATION,
+        "descriptive_best_over_dose_axis_gain": axis_gain_descriptive(sources, domains),
+        "gain_definition": f"per model, the best of {GUIDANCE_ARMS} at the frozen dose minus N, each a mean TM over "
+                           f"candidates below {ADMISSIBLE_IDENTITY:g}% identity with at least {MIN_ADMISSIBLE}; "
+                           "the domain gain is the mean over the two models and needs both",
+        "depth_range": {"evaluation_rows": [min(depths), max(depths)], "evaluation_fold": max(depths) / min(depths),
+                        "development_rows": [min(dev), max(dev)] if dev else None,
+                        "development_fold": max(dev) / min(dev) if dev else None,
+                        "note": "the evaluation set spans a far wider depth range than development did, so it is "
+                                "better suited to this question"},
+        "covariates_all_twelve_domains": covariates,
+        "per_domain_gain": per_domain, "domains_without_gain": missing,
+        "tests": tests,
+        "interval_note": "percentile bootstrap over domains; with eight units coverage is below nominal (see "
+                         "interval_coverage_note) and the interval is wide; no threshold is applied",
+    }
+
+
+def tm_oracle_gain(admissible_rows, k: int = SELECTION_K) -> float:
+    """Ceiling measurement, not a selector: top-k by realised TM minus the pool mean, within the admissible pool.
+
+    Deliberately outside the selector registry (which cannot see tm_score) and used only for the captured
+    fraction below.
+    """
+
+    tm = np.sort([r["tm_score"] for r in admissible_rows])[::-1]
+    return float(tm[:k].mean() - tm.mean())
+
+
+def captured_fraction(records, family_models, permutation_seed: int) -> dict:
+    """Per sealed domain at the frozen doses, k = 10: each selector's gain, the oracle's, and the captured fraction.
+
+    Within a (model, domain) cell the pool is the admissible candidates (at least 25); a domain's gains are the
+    means over the two models and a domain's captured fraction is the ratio of those mean gains. The interval is
+    BCa over the domains, withheld below the unit floor.
+    """
+
+    cells = group_cells(records)
+    domains = sorted({r["domain"] for r in records} & set(SEALED_DOMAINS))
+    names = list(SELECTOR_NAMES)
+    out = {"label": CAPTURE_LABEL, "outside_primary_holm_family": True, "influences_primary_verdict": False,
+           "expectation": CAPTURE_EXPECTATION, "oracle_statement": CAPTURE_ORACLE_STATEMENT,
+           "development_only_note": CAPTURE_DEVELOPMENT_ONLY, "k": SELECTION_K, "interval_coverage_note": BCA_NOTE,
+           "arms": {}}
+    for arm in CAPTURE_ARMS:
+        per, missing = {}, {}
+        for d in domains:
+            sel_gain = {n: [] for n in names}
+            oracle_gain, sizes = [], {}
+            for model in MODELS:
+                rows = cells.get((model, d, arm, *FROZEN_DOSES[arm][model]))
+                admissible = [r for r in rows or [] if r["identity_to_wild_type"] < ADMISSIBLE_IDENTITY]
+                if len(admissible) < MIN_ADMISSIBLE or d not in family_models:
+                    missing[d] = f"{model}: no {arm} pool with {MIN_ADMISSIBLE} admissible candidates and a family model"
+                    break
+                sizes[model] = {"pool": len(rows), "admissible": len(admissible)}
+                scores = selector_scores(names, selector_view(admissible), family_models[d], permutation_seed)
+                pool_mean = float(np.mean([r["tm_score"] for r in admissible]))
+                for n in names:
+                    top = np.argsort(-scores[n], kind="stable")[:SELECTION_K]
+                    sel_gain[n].append(float(np.mean([admissible[i]["tm_score"] for i in top])) - pool_mean)
+                oracle_gain.append(tm_oracle_gain(admissible))
+            else:
+                og = float(np.mean(oracle_gain))
+                per[d] = {"oracle_gain": og, "pool_sizes": sizes,
+                          "selectors": {n: {"gain": float(np.mean(sel_gain[n])),
+                                            "captured_fraction": float(np.mean(sel_gain[n])) / og if og > 0 else None}
+                                        for n in names}}
+        floor = bootstrap_unit_floor(len(per))
+        block = {"n_domains": len(per), "per_domain": per, "missing_domains": missing,
+                 "mean_oracle_gain": _mean([v["oracle_gain"] for v in per.values()]), "selectors": {}}
+        for n in names:
+            fr_values = [v["selectors"][n]["captured_fraction"] for v in per.values()]
+            entry = {"mean_gain": _mean([v["selectors"][n]["gain"] for v in per.values()]),
+                     "mean_captured_fraction": _mean(fr_values)}
+            if floor["degenerate"] or None in fr_values:
+                entry.update(status="unestimable", interval95_bca=None,
+                             reason=f"{len(per)} evaluation domains have a value, below the "
+                                    f"{MINIMUM_BOOTSTRAP_UNITS}-domain floor" if floor["degenerate"]
+                             else "an oracle gain was not positive in some domain")
+            else:
+                entry.update(status="estimated", interval95_bca=bca_interval(fr_values)[0])
+            block["selectors"][n] = entry
+        out["arms"][arm] = block
+    return out
+
+
+def equivalence(primary: dict) -> dict:
+    """Headline: achieved upper 95% bounds on C-Pr and F-M. Flag: both models' bounds strictly below +0.05.
+
+    The flag requires each model separately; the pooled stratum is supporting. Unestimable in any model
+    gives "unestimable"; otherwise any bound at or above the margin gives "inconclusive at this power".
+    """
+
+    out = {"margin_tm": MARGIN, "rule": "conclude only if the upper 95% BCa bound of both C-Pr and F-M lies below "
+           "+margin in progen2-medium and in protgpt2 separately; unestimable if any of those four is "
+           "unestimable; otherwise inconclusive. The pooled stratum is supporting information only.",
+           "interval_coverage_note": BCA_NOTE, "strata": {}}
+    for stratum in STRATA:
+        recs = {n: primary[stratum][n] for n in EQUIVALENCE_CONTRASTS}
+        upper = {n: (r["interval95_bca"][1] if r["status"] == "estimated" else None) for n, r in recs.items()}
+        out["strata"][stratum] = {
+            "mean": {n: r["mean"] for n, r in recs.items()}, "upper_bound": upper,
+            "below_margin": {n: (None if u is None else bool(u < MARGIN - EPS)) for n, u in upper.items()}}
+    out["achieved_upper_bound"] = {n: {s: out["strata"][s]["upper_bound"][n] for s in STRATA}
+                                   for n in EQUIVALENCE_CONTRASTS}
+    bounds = [out["strata"][m]["upper_bound"][n] for m in MODELS for n in EQUIVALENCE_CONTRASTS]
+    if any(u is None for u in bounds):
+        verdict = VERDICT_UNESTIMABLE
+    elif all(u < MARGIN - EPS for u in bounds):
+        verdict = VERDICT_CONCLUDE
+    else:
+        verdict = VERDICT_INCONCLUSIVE
+    out["verdict"] = verdict
+    out["verdict_reason"] = verdict_reason(primary, out["strata"])
+    out["verdict_is_secondary_flag"] = True
+    return out
+
+
+# ------------------------------------------------------------------ secondary tables
+
+
+def dose_axis(sources: Sources, arms) -> list[dict]:
+    """Per stratum, arm and dose: mean over (model, domain) cells of the endpoints and their identity companions."""
+
+    groups = defaultdict(list)
+    for (model, domain, arm, lf, lc), s in sources.cells.items():
+        if arms is None or arm in arms:
+            for stratum in (model, POOLED) if model in MODELS else (model,):
+                groups[(stratum, arm, lf, lc)].append(s)
+    rows = []
+    for (stratum, arm, lf, lc), cells in sorted(groups.items(), key=str):
+        with_tm = [c for c in cells if c["tm"] is not None]
+        rows.append({
+            "stratum": stratum, "arm": arm, "lambda_fields": lf, "lambda_coupling": lc, "n_cells": len(cells),
+            "feasibility": _mean([c["feasibility"] for c in cells]),
+            "tm_admissible": _mean([c["tm"] for c in with_tm]), "n_cells_with_tm": len(with_tm),
+            "identity_admissible": _mean([c["identity_admissible"] for c in with_tm]),
+            "tm_all_candidates": _mean([c["tm_all_candidates"] for c in cells]),
+            "identity_pool": _mean([c["identity_pool"] for c in cells]),
+            "kl_per_residue": _mean([c["kl_per_residue"] for c in cells if c["kl_per_residue"] is not None]),
+        })
+    return rows
+
+
+# ------------------------------------------------------------------ driver
+
+
+def analyse(records, family_models, permutation_seed: int, covariates: dict | None = None) -> dict:
+    domains = sorted({r["domain"] for r in records})
+    sources = Sources(records, family_models, permutation_seed)
+    cell_getter = sources.cell
+    selection_getter = sources.selected
+
+    def tables(metric, spec, getter, **kw):
+        return contrast_table(domains, spec, metric, getter, **kw)
+
+    def primary_family(metric, spec, selection_spec=()):
+        table = tables(metric, spec, cell_getter)
+        if selection_spec:
+            for stratum, recs in tables(metric, selection_spec, selection_getter).items():
+                table[stratum].update(recs)
+        size = len(spec) + len(selection_spec)
+        return {s: {"holm_family_size": size, "contrasts": finish_family(recs, size)} for s, recs in table.items()}
+
+    primary = primary_family("tm", CELL_CONTRASTS, SELECTION_CONTRASTS)
+    verdict = equivalence({s: p["contrasts"] for s, p in primary.items()})
+    feasibility = primary_family("feasibility", CELL_CONTRASTS)
+    reference = {s: strip_p(r) for s, r in tables("tm", REFERENCE_CONTRASTS, cell_getter).items()}
+
+    leave_out = [d for d in domains if d != LEAVE_OUT_DOMAIN]
+    sensitivity = None
+    if LEAVE_OUT_DOMAIN in domains:
+        kw = dict(descriptive_floor=MINIMUM_BOOTSTRAP_UNITS - 1, label=f"descriptive only: {len(leave_out)} domains, "
+                  f"below the {MINIMUM_BOOTSTRAP_UNITS}-domain floor; no p-value")
+        both = {**contrast_table(leave_out, CELL_CONTRASTS, "tm", cell_getter, **kw)}
+        for stratum, recs in contrast_table(leave_out, SELECTION_CONTRASTS, "tm", selection_getter, **kw).items():
+            both[stratum].update(recs)
+        sensitivity = {s: strip_p(r) for s, r in both.items()}
+
+    return {
+        "schema": SCHEMA, "statement": STATEMENT,
+        "domains": domains, "matches_sealed_eight": domains == sorted(SEALED_DOMAINS),
+        "minimum_bootstrap_units": MINIMUM_BOOTSTRAP_UNITS,
+        "frozen": {"admissible_identity_below": ADMISSIBLE_IDENTITY, "minimum_admissible": MIN_ADMISSIBLE,
+                   "margin_tm": MARGIN, "selection_k": SELECTION_K, "selection_pool_arm": SELECTION_POOL_ARM,
+                   "interval": f"{int(CONFIDENCE * 100)}% BCa bootstrap over domains, {N_RESAMPLES} resamples, "
+                               f"seed {BOOTSTRAP_SEED}",
+                   "p_value": "two-sided paired t-test and exact sign-flip test over domains, each Holm-adjusted within "
+                              "the frozen family; unestimable contrasts count as p = 1 so the family size is "
+                              "fixed. " + SIGN_FLIP_NOTE,
+                   "interval_coverage_note": BCA_NOTE,
+                   "doses": {a: {m: list(d) for m, d in v.items()} for a, v in FROZEN_DOSES.items()},
+                   "permutation_seed": permutation_seed},
+        "primary_tm": primary, "equivalence": verdict,
+        "coprimary_feasibility": feasibility,
+        "reference_arms_descriptive": reference,
+        "sensitivity_leave_out_1IFY_descriptive": sensitivity,
+        CAPTURE_LABEL: captured_fraction(records, family_models, permutation_seed),
+        DEPTH_LABEL: None if covariates is None else depth_hypothesis(sources, domains, covariates),
+        "frontier": dose_axis(sources, FRONTIER_ARMS),
+        "dose_response_recovery_confounded": {
+            "label": "recovery-confounded: mean TM over all candidates, admissibility not applied",
+            "rows": dose_axis(sources, None)},
+        "cells": [{"model": m, "domain": d, "arm": a, "lambda_fields": lf, "lambda_coupling": lc, **s}
+                  for (m, d, a, lf, lc), s in sorted(sources.cells.items(), key=str)],
+    }
+
+
+def render(result: dict) -> str:
+    lines = [f"domains {result['domains']} (sealed eight: {result['matches_sealed_eight']})"]
+    blocks = [("PRIMARY TM (Holm family)", result["primary_tm"], True),
+              ("CO-PRIMARY FEASIBILITY (Holm family)", result["coprimary_feasibility"], True),
+              ("REFERENCE ARMS (descriptive, no Holm)", {s: {"contrasts": c} for s, c in result["reference_arms_descriptive"].items()}, False)]
+    if result["sensitivity_leave_out_1IFY_descriptive"]:
+        blocks.append(("LEAVE-1IFY-OUT (descriptive only)",
+                       {s: {"contrasts": c} for s, c in result["sensitivity_leave_out_1IFY_descriptive"].items()}, False))
+    for title, family, holm in blocks:
+        lines.append(f"== {title} ==")
+        for stratum, block in family.items():
+            for name, c in block["contrasts"].items():
+                per = " ".join(f"{d}:{v['diff']:+.4f}" for d, v in c["per_domain"].items())
+                head = f"[{stratum}] {name:<34} n={c['n_domains']} "
+                if c["status"] == "unestimable":
+                    lines.append(f"{head}UNESTIMABLE ({c['reason']}) per-domain [{per}] mean {c['mean']}")
+                    continue
+                lo, hi = c["interval95_bca"]
+                p = (f" p_holm t={c['p_holm_ttest']:.4f} signflip={c['p_holm_signflip']:.4f}" if holm else "")
+                lines.append(f"{head}mean {c['mean']:+.4f} CI95 [{lo:+.4f}, {hi:+.4f}] +{c['favouring']['positive']}/"
+                             f"-{c['favouring']['negative']} d_id_wt {c['mean_identity_diff']:+.1f}{p} [{per}]")
+    cap = result[CAPTURE_LABEL]
+    lines.append(f"== {CAPTURE_LABEL} (k={cap['k']}; outside the Holm family; no verdict) ==")
+    lines.append(cap["expectation"])
+    for arm, b in cap["arms"].items():
+        for n, e in b["selectors"].items():
+            ci = "unestimable" if e["interval95_bca"] is None else f"CI95 [{e['interval95_bca'][0]:+.3f}, {e['interval95_bca'][1]:+.3f}]"
+            cf = "n/a" if e["mean_captured_fraction"] is None else f"{e['mean_captured_fraction']:+.3f}"
+            lines.append(f"[{arm}] {n:<18} n={b['n_domains']} gain {e['mean_gain'] if e['mean_gain'] is None else format(e['mean_gain'], '+.4f')} "
+                         f"oracle {b['mean_oracle_gain'] if b['mean_oracle_gain'] is None else format(b['mean_oracle_gain'], '+.4f')} captured {cf} {ci}")
+    depth = result.get(DEPTH_LABEL)
+    if depth:
+        lines.append(f"== {DEPTH_LABEL} (declared direction for depth: {depth['predeclared_direction']['log10_msa_depth']}; "
+                     "outside the Holm family, no verdict) ==")
+        for name, t in depth["tests"].items():
+            if t["status"] == "unestimable":
+                lines.append(f"{name}: UNESTIMABLE ({t['reason']})")
+                continue
+            sp, pt = t["spearman"], t["partial_spearman_controlling_length_and_native_baseline"]
+            def fmt(c):
+                return "n/a" if c["estimate"] is None else (
+                    f"{c['estimate']:+.3f}" + ("" if c["interval95_percentile"] is None else
+                                               f" [{c['interval95_percentile'][0]:+.3f}, {c['interval95_percentile'][1]:+.3f}]"))
+            lines.append(f"{name}: spearman {fmt(sp)}  partial(length, baseline) {fmt(pt)}")
+        lines.append(depth["caveat"])
+    eq = result["equivalence"]
+    lines.append(f"== HEADLINE: achieved upper 95% BCa bound on mean TM difference ({eq['interval_coverage_note']}) ==")
+    for name, by_stratum in eq["achieved_upper_bound"].items():
+        cells = "  ".join(f"{s}: " + ("unestimable" if u is None else f"{u:+.4f}") for s, u in by_stratum.items())
+        lines.append(f"{name:<6}{cells}   (margin {eq['margin_tm']:+.2f})")
+    lines.append(f"margin flag (secondary; both models required): {eq['verdict']}")
+    lines.append(f"verdict_reason: {eq['verdict_reason']}")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--records", type=Path, required=True, help="per_sequence.jsonl of the confirmatory cells")
+    ap.add_argument("--references", type=Path, required=True, help="directory of family-reference <DOMAIN>.npz/.json")
+    ap.add_argument("--out", type=Path, required=True, help="output JSON artefact")
+    ap.add_argument("--msa-dir", type=Path, required=True, help="directory of <DOMAIN>.pdb.fasta alignments (all twelve)")
+    ap.add_argument("--wild-type-fasta", type=Path, required=True, help="wild-type FASTA of all twelve domains")
+    ap.add_argument("--permutation-seed", type=int, required=True,
+                    help="the declared permuted_coupling seed of the generation protocol")
+    args = ap.parse_args(argv)
+    fr.require_asset(args.records, "--records")
+    fr.require_asset(args.references, "--references", directory=True)
+    records = sf.load_records(args.records)
+    if not records:
+        raise ValueError(f"--records {args.records} holds no records")
+    family_models = {d: load_family_model(d, args.references) for d in sorted({r["domain"] for r in records})}
+    wild_types = fr.load_wild_types(args.wild_type_fasta, "--wild-type-fasta")
+    fr.require_asset(args.msa_dir, "--msa-dir", directory=True)
+    result = analyse(records, family_models, args.permutation_seed, msa_covariates(args.msa_dir, wild_types))
+    result["inputs"] = {"records": str(args.records), "references": str(args.references)}
+    write_json(args.out, result)
+    print(render(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

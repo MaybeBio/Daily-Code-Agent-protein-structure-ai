@@ -1,0 +1,152 @@
+"""GNINA is an isolated adapter below the sole BackendRouter execution authority."""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+from .. import container_runtime, local_process
+from ..container_supervision import stop_owned
+from ..engine import command
+from .manifest import VERSION
+from .runtime import configuration, labels_match
+from .snapshot import capture
+
+
+class DockingBackend:
+    def __init__(self, settings):
+        self.settings = settings
+
+    @staticmethod
+    def container(identifier):
+        return "xdde-gnina-" + identifier
+
+    async def readiness(self):
+        result = {
+            "ready": False,
+            "reason": None,
+            "version": VERSION,
+            "gpu_runtime": False,
+            "scientific_acceptance": "pending_server_validation",
+        }
+        try:
+            image = configuration(self.settings)
+            image, runtime, _ = container_runtime.selection(self.settings, "gnina", image)
+            code, text = await runtime.command(
+                command,
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{json .Config.Labels}}",
+                image,
+                timeout=8,
+                separate_stderr=True,
+            )
+            if code or not labels_match(json.loads(text) or {}):
+                raise ValueError(
+                    "GNINA image is missing or differs from the reviewed runtime contract."
+                )
+            code, text = await runtime.command(
+                command,
+                "docker",
+                "info",
+                "--format",
+                "{{range $name, $runtime := .Runtimes}}{{$name}} {{end}}",
+                timeout=8,
+                separate_stderr=True,
+            )
+            if code:
+                raise ValueError("The Docker daemon is unavailable.")
+            result.update(ready=True, gpu_runtime="nvidia" in text.split())
+        except (ValueError, OSError, RuntimeError, TimeoutError) as exc:
+            result["reason"] = str(exc)
+        return result
+
+    async def start(self, job, directory):
+        image = configuration(self.settings)
+        image, runtime = container_runtime.prepare(self.settings, "gnina", directory, image)
+        source = Path(__file__).parent
+        adapter, adapter_files = capture(directory, source)
+        output = directory / "output"
+        output.mkdir(exist_ok=True)
+        paths = [adapter, directory, directory / "assets", output]
+        if any("," in str(path) or path.is_symlink() for path in paths):
+            raise ValueError("Native mount paths must be real paths without commas.")
+        options = job.request.options
+        args = [
+            "docker",
+            "create",
+            "--name",
+            self.container(job.id),
+            "--network",
+            "none",
+            "--read-only",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            "128",
+            "--memory",
+            str(options.memory_mib) + "m",
+            "--cpus",
+            str(options.cpu),
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=512m",
+            "--env",
+            "HOME=/tmp",
+            "--env",
+            "OMP_NUM_THREADS=" + str(options.cpu),
+            "--workdir",
+            "/output",
+        ]
+        for host, target in [
+            (adapter, "/platform"),
+            (directory / "assets", "/input/assets"),
+            (directory / "request.json", "/input/request.json"),
+            (directory / "bindings.json", "/input/bindings.json"),
+        ]:
+            args.extend(["--mount", f"type=bind,source={host},target={target},readonly"])
+        if job.request.constraints:
+            receipt = directory / "constraint-execution.json"
+            if receipt.is_symlink() or not receipt.is_file():
+                raise ValueError("Scientific conditions lack their validated execution snapshot.")
+            args.extend(
+                ["--mount", f"type=bind,source={receipt},target=/input/constraints.json,readonly"]
+            )
+        args.extend(["--mount", f"type=bind,source={output},target=/output"])
+        if options.use_gpu:
+            args.extend(["--gpus", "device=" + str(options.gpu_device)])
+        args.extend(["--entrypoint", "python", image, "-B", "/platform/docking/native.py"])
+        code, text = await runtime.command(command, *args)
+        if code:
+            raise RuntimeError("Unable to create the GNINA task container: " + text)
+        (directory / "docking-execution.json").write_text(
+            json.dumps(
+                {"image": image, "adapter_files": adapter_files, "container_runtime": runtime.value}
+            )
+        )
+        env = {
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(source.parent.parent),
+        }
+        try:
+            return await local_process.start(
+                Path(sys.executable), source / "supervise.py", directory, env
+            )
+        except Exception:
+            await runtime.command(command, "docker", "rm", "--force", self.container(job.id))
+            raise
+
+    async def stop(self, job_id, directory):
+        await stop_owned(
+            directory,
+            self.container(job_id),
+            Path(__file__).with_name("supervise.py"),
+            command,
+            label="GNINA",
+        )

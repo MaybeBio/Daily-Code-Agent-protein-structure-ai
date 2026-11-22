@@ -1,0 +1,159 @@
+name: Test
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+  push:
+    branches:
+    - trunk
+
+  workflow_dispatch:
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CLICOLOR: 1
+
+jobs:
+  unit_test:
+    name: Unit test [${{ matrix.os }}-${{ matrix.target || 'native' }}]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-26.04
+          - macos-26
+          - windows-2025
+        target:
+         - ''
+
+        include:
+        - os: ubuntu-26.04
+          target: wasm32-unknown-unknown
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Remove native build configuration
+      run: rm .cargo/config.toml
+    - name: Configure Rust
+      uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+      with:
+        toolchain: 1.100.0
+        targets: ${{ matrix.target }}
+    - name: Check rust installation
+      run: rustup toolchain list
+    # extra toolchains occur on some actions runners but not others, resulting in cache misses
+    - name: Remove extra rust toolchains
+      run: >
+        for toolchain in $(rustup toolchain list | grep -v default); do
+            rustup toolchain uninstall "$toolchain"
+        done
+    # rust-cache already includes a Cargo.lock hash in the key. However, it
+    # eagerly restores caches with previous Cargo.lock files. This causes
+    # multiple builds to be cached in target/ increasing the cache usage
+    # dramatically. Add the Cargo.lock hash again in the key portion to
+    # prevent this restoration.
+    - name: Cache
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        key: test-${{ matrix.target || 'native' }}-${{ hashFiles('Cargo.lock') }}
+        cache-bin: false
+        add-job-id-key: false
+        save-if: ${{ github.ref != 'refs/heads/trunk' }}
+
+    - name: Build [default features]
+      run: >
+        cargo build
+        --profile=ci
+        --locked
+        --workspace
+        --lib
+        --bins
+        --tests
+        --examples
+        ${{ matrix.target != '' && '--target' || '' }} ${{ matrix.target }}
+        --verbose
+      if: ${{ matrix.target == '' }}
+
+    - name: Build [all features]
+      run: >
+        cargo build
+        --profile=ci
+        --all-features
+        --locked
+        --workspace
+        --lib
+        --bins
+        --tests
+        --examples
+        ${{ matrix.target != '' && '--target' || '' }} ${{ matrix.target }}
+        --verbose
+
+    - name: Run tests
+      run: >
+        cargo test
+        --profile=ci
+        --all-features
+        --locked
+        --workspace
+        --verbose
+      if: ${{ matrix.target == '' }}
+
+    - name: Run tests [max_ghosts_12]
+      run: >
+        cargo test
+        --profile=ci
+        --features=max_ghosts_12
+        --locked
+        --package=hoomd-microstate
+        --verbose
+      if: ${{ matrix.target == '' }}
+
+    - name: Build API documentation
+      run: >
+        cargo doc
+        --profile=ci
+        --all-features
+        --locked
+        --workspace
+        --no-deps
+      if: ${{ matrix.target == '' }}
+
+    - name: Run benchmarks
+      run: >
+        cargo bench
+        --profile=ci
+        --all-features
+        --locked
+        --workspace
+      if: ${{ matrix.target == '' }}
+
+    - name: Show target directory size
+      run: du -hsc target/*
+
+  tests_complete:
+    name: All tests
+    if: always()
+    needs: [unit_test]
+    runs-on: ubuntu-26.04
+
+    steps:
+    - run: jq --exit-status 'all(.result == "success")' <<< "${NEEDS}"
+      env:
+        NEEDS: ${{ toJson(needs) }}
+    - name: Done
+      run: exit 0

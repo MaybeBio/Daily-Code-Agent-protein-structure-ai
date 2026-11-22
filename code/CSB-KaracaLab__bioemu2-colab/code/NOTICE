@@ -1,0 +1,23 @@
+This repository contains a Colab notebook built around BioEmu2.
+
+Portions of BioEmu2_Colab.ipynb are adapted from the usage examples of
+https://github.com/microsoft/bioemu2:
+
+    Copyright (c) Microsoft Corporation.
+    Licensed under the MIT License.
+
+BioEmu2 itself is not included here. The notebook installs it from that
+repository at run time, pinned to commit 6d1ca74, and downloads the model
+weights from https://huggingface.co/microsoft/bioemu2, which are published
+under the MIT License.
+
+md_reference/ holds 21 frames of the 1KKL trajectories of the DynaBench dataset, seven from
+each of its three 100 ns replicas with the first 20 ns of each discarded. They are included so
+that the test run has something to compare against, and they are not covered by this
+repository's MIT licence. Please cite:
+
+    Barlas AB, Laurent B, Karaca E, Prévost C, Sacquin-Mora S. DynaBench: Dynamic data for the docking
+    benchmark. Journal of Molecular Biology 438 (2026) 169650. doi:10.1016/j.jmb.2026.169650
+
+The full trajectories are distributed at http://www-lbt.ibpc.fr/DynaBench on the MDposit
+platform (INRIA node) of the Molecular Dynamics Data Bank.

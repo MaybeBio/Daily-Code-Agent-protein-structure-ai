@@ -1,0 +1,167 @@
+/*
+ * The screen page's own stylesheet.
+ *
+ * Deliberately small and self-contained: the same visual language as the fold
+ * page (gray-50 ground, white cards, 0.5rem radius, one blue accent) written
+ * out rather than inherited, because localfold.css is the FOLD page's layout
+ * and coupling a second page to it makes every change to one a risk to the
+ * other. No Tailwind - the fold page's own header records why.
+ */
+:root {
+  --ground: #f9fafb;
+  --card: #ffffff;
+  --line: #e5e7eb;
+  --ink: #1f2937;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --warn: #b45309;
+  --bad: #b91c1c;
+}
+* { box-sizing: border-box; }
+/* 🔴 THE GROUND COLOUR GOES ON `html`, NOT ONLY ON `body`. Once the body is a
+   centred column with a max-width, its background stops covering the viewport
+   and the margins either side show the browser's default white. */
+html { background: var(--ground); }
+body {
+  /* 🔴 ONE CENTRED COLUMN, 948px, WHICH IS LocalFold'S OWN `.page-width`.
+     index.html wraps its content in `<div class="mx-auto page-width">` and that
+     number is not arbitrary: 600 (the viewer canvas) + 8 (gap) + 340 (its side
+     panel). This page had no width at all, so on a wide screen every card
+     stretched edge to edge - a 164-residue sequence on one line and the MSA
+     control a thousand pixels from the label it belongs to. */
+  max-width: 948px;
+  margin: 0 auto; padding: 1rem; background: var(--ground); color: var(--ink);
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+h1 { font-size: 1.25rem; margin: 0; font-weight: 700; }
+h1 span { color: var(--muted); font-weight: 400; font-size: 0.95rem; }
+.card {
+  background: var(--card); border: 1px solid var(--line); border-radius: 0.5rem;
+  padding: 0.75rem; margin-bottom: 0.75rem;
+}
+.row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+.row > label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase;
+  letter-spacing: 0.03em; }
+.grow { flex: 1 1 auto; min-width: 0; }
+header.row { margin-bottom: 0.75rem; }
+button {
+  font: inherit; padding: 0.4rem 0.9rem; border-radius: 0.375rem;
+  border: 1px solid var(--line); background: var(--card); cursor: pointer;
+}
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: 0.5; cursor: default; }
+input, select, textarea {
+  font: inherit; padding: 0.35rem 0.5rem; border: 1px solid var(--line);
+  border-radius: 0.375rem; background: var(--card); color: var(--ink);
+}
+textarea { width: 100%; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px; resize: vertical; }
+input[type="number"] { width: 5rem; }
+#status {
+  background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af;
+  border-radius: 0.5rem; padding: 0.5rem 0.75rem; margin-bottom: 0.75rem;
+}
+#status.bad { background: #fef2f2; border-color: #fecaca; color: var(--bad); }
+/* 🔴 ONE AFTER THE OTHER, NOT SIDE BY SIDE. The scene and the ranked table were
+   two columns of a 1fr 1fr grid, which halved both: the viewer got ~340px of a
+   1280px window and the scatter was squeezed beside a table of six numeric
+   columns. Stacked, each gets the full 948 and the page reads top to bottom -
+   target, ligands, settings, queue, scene, ranking - the way LocalFold's does.
+   The grid is kept rather than replaced so the gap rule still applies. */
+.split { display: grid; grid-template-columns: 1fr; gap: 0.75rem; }
+#viewer { height: 420px; border-radius: 0.375rem; overflow: hidden;
+  background: #fff; position: relative; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 0.25rem 0.4rem; border-bottom: 1px solid var(--line);
+  white-space: nowrap; }
+th:first-child, td:first-child, th.left, td.left { text-align: left; }
+th { cursor: pointer; user-select: none; color: var(--muted); font-weight: 600;
+  font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.03em; }
+th.sorted { color: var(--accent); }
+td.smiles { font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+  max-width: 14rem; overflow: hidden; text-overflow: ellipsis; }
+tr.refused td, tr.failed td { color: var(--bad); }
+tr.skipped td { color: var(--muted); }
+.swatch { display: inline-block; width: 0.7rem; height: 0.7rem; border-radius: 2px;
+  vertical-align: -1px; margin-right: 0.35rem; }
+.scroll { max-height: 340px; overflow: auto; }
+.note { color: var(--muted); font-size: 0.8rem; }
+.warn { color: var(--warn); }
+#queue { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+#queue span {
+  font-size: 11px; padding: 0.1rem 0.35rem; border-radius: 0.25rem;
+  border: 1px solid var(--line); font-family: ui-monospace, Menlo, monospace;
+}
+#queue span.running { border-color: var(--accent); color: var(--accent); }
+#queue span.done { background: #f0fdf4; border-color: #bbf7d0; }
+#queue span.failed, #queue span.refused { background: #fef2f2; border-color: #fecaca;
+  color: var(--bad); }
+
+
+/* 🔴 THE CANVAS FILLS THE COLUMN, AND THE CONTROLS GO UNDER IT. py2Dmol lays
+   `#mainContainer` out as a flex ROW and pins the canvas to 600, which is
+   right for index.html: 600 of canvas beside a 340 panel carrying the PAE map,
+   the confidence card and the heatmap tabs - the 948 column exactly. This page
+   has none of those panels, so that row left ~330px holding six buttons and a
+   picker, with ~450px of white under them.
+
+   🔴 THE BOX THAT WAS ACTUALLY 600 IS `.py2dmol-slot-body`, AND IT DOES NOT
+   EXIST UNTIL THE FIRST STRUCTURE LOADS. py2Dmol then WRAPS the canvas box in
+   `.py2dmol-slot > .py2dmol-slot-body` - its fullscreen machinery looks for
+   `.py2dmol-slot--1 > .py2dmol-slot-body` - and its stylesheet pins slot 1's
+   body to 600x600. So `width: 100%` on `#canvasContainer` applied the whole
+   time and resolved to 100% OF 600.
+
+   That cost four wrong attempts, all aimed at boxes that were already correct:
+   specificity (mine wins, two ids against an id and a class), flex alignment,
+   and stating the ancestors' widths. What settled it was printing every
+   ancestor's width in the BROKEN state:
+
+     canvasContainer     client=598  css=600px
+     .py2dmol-slot-body  client=600  css=600px   <- here
+     .py2dmol-slot       client=890  css=890px
+     viewerColumn        client=890  css=890px
+
+   🔴 AND A CHECK ON A FRESHLY LOADED PAGE CANNOT SEE IT, because the wrapper is
+   absent until something is loaded: the same chain measures 890 throughout
+   before the first scene. The vendor ships `width: 100%` for the slot and its
+   body in its own narrow-screen query, so this is its supported wide geometry
+   rather than a new one.
+
+   🔴 AND IT TAKES **BOTH** OF THE RULES BELOW - the stated widths AND the slot
+   body - which was established by deleting the first pair as "dead" and
+   measuring 604 instead of 894. `revealViewer` sets `display: flex` on
+   `#viewer-container`, so `#mainContainer` becomes a flex ITEM that sizes to
+   its content while its content sizes from it; the vendor's own stylesheet
+   warns about exactly this a few lines past its 948 rule - "Stating the width
+   breaks that circularity." Overriding the slot body alone leaves that
+   circularity in place, and stating the widths alone leaves the slot body
+   pinned at 600. Neither rule is redundant; do not tidy either away without
+   re-measuring the chain AFTER a scene has loaded.
+
+   🔴 THE HEIGHT IS FIXED RATHER THAN SQUARE. The vendor's narrow-screen rule
+   pairs `width: 100%` with `aspect-ratio: 1 / 1`, which at ~900 wide is a
+   ~900-tall viewport - taller than most screens, pushing the ranked table off
+   the fold. A protein with its ligands reads better landscape, and the resize
+   handle still works for anyone who disagrees. */
+#viewer-container { width: 100%; }
+#viewer-container #mainContainer {
+  flex-direction: column; align-items: stretch; width: 100%;
+}
+#viewer-container #viewerColumn,
+#viewer-container #rightPanelsContainer { width: 100%; }
+#viewer-container .py2dmol-slot,
+#viewer-container .py2dmol-slot > .py2dmol-slot-body { width: 100%; }
+#viewer-container #canvasContainer { width: 100%; height: 600px; }
+
+/* 🔴 py2Dmol's OWN OBJECT PICKER IS HIDDEN, because on this page it is a
+   control that cannot do anything and it was read as the one that can. The
+   whole visible scene is concatenated into a SINGLE object (web/screen.js's
+   `drawScene` says why), so the vendor's dropdown has exactly one entry, named
+   "screen" - and a reader looking for a way to isolate one binder found that
+   dropdown first and reasonably expected the binders to be in it. The real
+   picker is `#show-ligand`, a few rows down, which rebuilds the scene from the
+   ligands it lists. The select is left in the DOM rather than removed: the
+   renderer's change listener, the prev/next buttons and a restored session all
+   drive the current object through it. */
+#viewer-container #objectRow { display: none; }

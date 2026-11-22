@@ -1,7 +1,7 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/dralgroup/mlatom
-- 快照日期: 2026-11-18
+- 快照日期: 2026-11-22
 - 快照 commit: [`c34839eb354c`](https://github.com/dralgroup/mlatom/commit/c34839eb354c7a8fb264b34b82c6b90043f6572e)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 

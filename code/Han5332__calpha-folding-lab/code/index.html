@@ -1,0 +1,563 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Folding Lab</title>
+<style>
+/* Layout: a settings rail, the protein's name over a large 3D stage with the scorecard beside it, analysis tabs below. */
+:root {
+  --bg: #ffffff; --panel: #f5f5f7; --panel-2: #ffffff; --sunken: #e8e8ed;
+  --ink: #1d1d1f; --ink-2: #424245; --muted: #6e6e73; --line: #e0e0e5; --line-strong: #d2d2d7; --grid: #e4e4e9;
+  --accent: #0066cc; --accent-soft: #dcebfc; --stage: #f5f5f7;
+  --model: #0071e3; --native: #8e8e93; --helix: #ff375f; --strand: #ff9f0a; --coil: #c7c7cc;
+  --m1: #0a84ff; --m2: #5e5ce6; --m3: #bf5af2; --m4: #ff375f; --m5: #ff9f0a;   /* chain, N → C (as on the start page) */
+  --heat-lo: #ffffff; --heat-hi: #1d1d1f; --ramp-a: #b9dcff; --ramp-b: #003e99;
+  --good: #34c759; --warn: #ff9f0a; --bad: #d70015;
+  --btn: #0071e3; --btn-ink: #ffffff; --seg-on: #ffffff;
+  --nav: rgba(255,255,255,.76); --glass: rgba(255,255,255,.78);
+  --fill: color-mix(in srgb, var(--ink) 6%, transparent); --fill-2: color-mix(in srgb, var(--ink) 11%, transparent);
+  --shadow: 0 0 0 .5px color-mix(in srgb, var(--ink) 14%, transparent), 0 12px 32px -10px rgba(0,0,0,.22);
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;   /* numbers use tabular figures */
+  --grad: linear-gradient(90deg, var(--m1), var(--m2), var(--m3), var(--m4), var(--m5));   /* the site's thread: the chain, N → C */
+  --r: 12px; --r-card: 22px; --pill: 980px;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #000000; --panel: #1c1c1e; --panel-2: #2c2c2e; --sunken: #2c2c2e;
+  --ink: #f5f5f7; --ink-2: #c7c7cc; --muted: #98989d; --line: #2c2c2e; --line-strong: #48484a; --grid: #2a2a2c;
+  --accent: #2997ff; --accent-soft: #0f2a47; --stage: #101012; --model: #2997ff; --coil: #48484a;
+  --heat-lo: #1c1c1e; --heat-hi: #64d2ff; --ramp-a: #12355e; --ramp-b: #8fd0ff;
+  --good: #30d158; --bad: #ff453a; --seg-on: #636366;
+  --nav: rgba(22,22,23,.8); --glass: rgba(44,44,46,.72); color-scheme: dark;
+} }
+:root[data-theme="dark"] {
+  --bg: #000000; --panel: #1c1c1e; --panel-2: #2c2c2e; --sunken: #2c2c2e;
+  --ink: #f5f5f7; --ink-2: #c7c7cc; --muted: #98989d; --line: #2c2c2e; --line-strong: #48484a; --grid: #2a2a2c;
+  --accent: #2997ff; --accent-soft: #0f2a47; --stage: #101012; --model: #2997ff; --coil: #48484a;
+  --heat-lo: #1c1c1e; --heat-hi: #64d2ff; --ramp-a: #12355e; --ramp-b: #8fd0ff;
+  --good: #30d158; --bad: #ff453a; --seg-on: #636366;
+  --nav: rgba(22,22,23,.8); --glass: rgba(44,44,46,.72); color-scheme: dark;
+}
+@view-transition { navigation: auto; }   /* start page ⇄ lab: one site, a cross-fade between pages */
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { background: var(--bg); }
+body { margin: 0; color: var(--ink); font-family: var(--font-ui); font-size: 14px; line-height: 1.43; letter-spacing: -.008em; -webkit-font-smoothing: antialiased; }
+h1, h2, h3 { margin: 0; text-wrap: balance; font-weight: 600; }
+button, input, select, textarea { font: inherit; color: inherit; letter-spacing: inherit; }
+:focus-visible { outline: 2px solid var(--btn); outline-offset: 2px; }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+/* ---------- app bar: the same bar and site tabs as the start page ---------- */
+.appbar { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 12px;
+  height: 48px; padding-inline: 22px; background: var(--nav); backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: .5px solid color-mix(in srgb, var(--ink) 14%, transparent); view-transition-name: topbar; }
+.navtabs { display: flex; gap: 4px; }
+.navtabs a { padding: 6px 12px; border-radius: var(--pill); font-size: 12px; letter-spacing: -.005em; color: var(--ink); opacity: .8; text-decoration: none; white-space: nowrap; transition: opacity .2s; }
+.navtabs a:hover, .navtabs a.on { opacity: 1; }
+.navtabs a.on { font-weight: 600; }
+@media (max-width: 900px) { .navtabs a.opt { display: none; } }
+.brand { display: inline-flex; align-items: center; gap: 8px; justify-self: start; color: var(--ink); text-decoration: none; }
+.brand svg { width: 20px; height: 20px; flex: none; }
+.brand b { font-size: 17px; font-weight: 600; letter-spacing: -.02em; white-space: nowrap; }
+.barend { justify-self: stretch; justify-content: flex-end; display: flex; align-items: center; gap: 10px; min-width: 0; }
+.barend .btn { flex: none; }
+@media (max-height: 540px) { .appbar { position: static; } .sidebar { top: 12px; max-height: calc(100vh - 24px); } }
+@media (max-width: 640px) { .appbar { grid-template-columns: auto auto minmax(0, 1fr); gap: 6px; padding-inline: 16px; } .navtabs a { padding: 6px 8px; } }
+@media (max-width: 480px) { .brand b { display: none; } }
+.status { display: inline-flex; align-items: center; gap: 7px; min-width: 0; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; }
+.status span:last-child { overflow: hidden; text-overflow: ellipsis; }
+.status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--line-strong); flex: none; }
+.status[data-state="running"] .dot { background: var(--btn); animation: pulse 1.2s ease-in-out infinite; }
+.status[data-state="done"] .dot { background: var(--good); }
+@keyframes pulse { 50% { opacity: 0.3; } }
+@media (prefers-reduced-motion: reduce) { .status[data-state="running"] .dot { animation: none; } }
+
+.btn { border: 0; background: var(--fill); color: var(--ink); padding: 7px 14px; border-radius: var(--pill); cursor: pointer; font-size: 13px; line-height: 1.25;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; text-decoration: none; transition: background 0.15s; }
+.btn:hover { background: var(--fill-2); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn.primary { background: var(--btn); color: var(--btn-ink); padding: 7px 18px; min-width: 64px; }
+.btn.primary:hover { background: #0077ed; }
+.btn.tint { background: var(--accent-soft); color: var(--accent); }
+.btn.tint:hover { background: color-mix(in srgb, var(--accent) 16%, var(--panel)); }
+.btn.ghost { background: transparent; color: var(--ink-2); }
+.btn.ghost:hover { background: var(--fill); color: var(--ink); }
+.btn svg { width: 15px; height: 15px; }
+.btn.file { position: relative; overflow: hidden; }
+.btn.file input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.iconbtn { width: 30px; height: 30px; padding: 0; border-radius: 50%; }
+.iconbtn[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
+
+/* ---------- layout ---------- */
+.layout { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 20px; padding: 20px 22px 64px; max-width: 1640px; margin: 0 auto; align-items: start; }
+@media (max-width: 1080px) {
+  /* narrow screens: name and structure first, then settings, then the analysis tabs */
+  .layout { display: flex; flex-direction: column; align-items: stretch; }
+  .layout > main { display: contents; }
+  .pagehead { order: 0; } .hero { order: 1; } .sidebar { order: 2; } .tabs { order: 3; } [data-panel] { order: 4; }
+}
+@media (max-width: 520px) { .layout { padding-inline: 14px; gap: 14px; } }
+.card { position: relative; background: var(--panel); border-radius: var(--r-card); min-width: 0; }
+
+/* ---------- sidebar ---------- */
+.sidebar { display: flex; flex-direction: column; gap: 14px; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 68px); max-height: calc(100vh - 88px); overflow: auto; border-radius: var(--r-card); scrollbar-width: thin; }
+@media (max-width: 1080px) { .sidebar { position: static; max-height: none; overflow: visible; } }
+.side { padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+.side h2, .eyebrow { font-size: 19px; font-weight: 600; letter-spacing: -.02em; line-height: 1.2; }
+.plist { display: flex; flex-direction: column; gap: 1px; margin-inline: -8px; }
+details.morepdb summary .count { margin-left: auto; margin-right: 8px; font-size: 12px; font-weight: 400; color: var(--muted); }
+.side-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.side-head .pics { font-size: 12px; color: var(--muted); }
+#morelist { margin-top: 10px; }
+#morelist { max-height: 460px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.prot.pic { grid-template-columns: auto minmax(0, 1fr) auto; gap: 0 12px; }
+.prot.pic img { grid-column: 1; grid-row: 1 / span 2; width: 52px; height: 52px; border-radius: 12px; object-fit: cover; background: #fff; }
+.prot.pic .pname, .prot.pic .pmeta { grid-column: 2; }
+.prot.pic .pid { grid-column: 3; }
+.nopics .prot.pic img { display: none; }
+.nopics .prot.pic { column-gap: 0; }
+.nopics .prot.pic .pid { margin-left: 10px; }
+@media (max-width: 1080px) and (min-width: 521px) { .plist { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; } }
+.prot { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 10px; align-items: center; text-align: left; padding: 7px 10px; border-radius: var(--r); border: 0; background: transparent; cursor: pointer; }
+.prot:hover { background: var(--fill); }
+.prot[aria-checked="true"] { background: var(--accent-soft); }
+.prot .pid { grid-column: 2; grid-row: 1 / span 2; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.prot[aria-checked="true"] .pid { color: var(--accent); }
+.prot .pname { grid-column: 1; font-weight: 500; font-size: 14px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.prot[aria-checked="true"] .pname { font-weight: 600; }
+.pitem { position: relative; min-width: 0; }
+.pitem .prot { width: 100%; }
+.prot.haslink { padding-right: 34px; }
+.plink { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); width: 24px; height: 24px; display: grid; place-items: center; border-radius: 50%; color: var(--muted); }
+.plink svg { width: 14px; height: 14px; }
+.plink:hover { color: var(--accent); background: var(--panel-2); }
+.plink:focus-visible { outline: 2px solid var(--btn); outline-offset: 1px; }
+.prot .pmeta { grid-column: 1; color: var(--muted); font-size: 12px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; }
+.note { margin: 0; font-size: 12px; line-height: 1.4; color: var(--muted); }
+.note:empty { display: none; }
+.note.err { color: var(--bad); }
+.methods { display: flex; flex-direction: column; gap: 8px; }
+.method { text-align: left; border: 1px solid var(--line-strong); background: var(--panel-2); border-radius: 14px; padding: 11px 13px; cursor: pointer; display: grid; gap: 2px; transition: border-color .15s; }
+.method:hover { border-color: var(--muted); }
+.method[aria-checked="true"] { border-color: var(--btn); box-shadow: inset 0 0 0 1px var(--btn); }
+.method:disabled { opacity: 0.45; cursor: not-allowed; }
+.method .radio { display: none; }
+.method b { font-weight: 600; font-size: 14px; }
+.method span.d { color: var(--muted); font-size: 12.5px; line-height: 1.38; }
+.method .badge { font-size: 11px; font-weight: 500; color: var(--accent); background: var(--accent-soft); border-radius: var(--pill); padding: 2px 7px; margin-left: 6px; vertical-align: 1px; }
+.seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; background: var(--fill-2); border-radius: 9px; padding: 2px; gap: 2px; }
+.seg button { border: 0; background: transparent; padding: 5px 10px; border-radius: 7px; cursor: pointer; font-size: 13px; color: var(--ink); line-height: 1.25; }
+.seg button[aria-pressed="true"] { background: var(--seg-on); font-weight: 500; box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 0 0 .5px rgba(0,0,0,.04); }
+.seg button:disabled { opacity: 0.4; cursor: not-allowed; }
+details.adv { border-top: .5px solid var(--line-strong); padding-top: 12px; }
+details.adv summary { cursor: pointer; font-size: 14px; font-weight: 500; list-style: none; display: flex; align-items: center; justify-content: space-between; }
+details.adv summary::-webkit-details-marker { display: none; }
+details.adv summary::after { content: "›"; color: var(--muted); font-size: 18px; line-height: 1; transition: transform .2s; }
+details.adv[open] summary::after { transform: rotate(90deg); }
+.fields { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
+.slider { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 8px; align-items: center; }
+.slider label { font-size: 13px; }
+.slider output { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.slider input[type="range"] { grid-column: 1 / -1; width: 100%; accent-color: var(--btn); margin: 0; }
+.slider .hint { grid-column: 1 / -1; font-size: 12px; line-height: 1.38; color: var(--muted); }
+.inline { display: flex; gap: 8px; align-items: center; }
+.inline input[type="number"] { width: 100%; min-width: 0; padding: 7px 10px; border-radius: 10px; border: 1px solid var(--line-strong); background: var(--panel-2); font-size: 13px; font-variant-numeric: tabular-nums; }
+.check { display: inline-flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
+.check input { accent-color: var(--btn); margin: 0; }
+textarea { width: 100%; min-height: 64px; resize: vertical; padding: 9px 10px; border-radius: 10px; border: 1px solid var(--line-strong); background: var(--panel-2); font-size: 12.5px; word-break: break-all; }
+.label { font-size: 13px; color: var(--ink-2); }
+#hop-field, #stopfold-field, #blind-field { display: flex; flex-direction: column; gap: 3px; }
+#stopfold-field.off, #blind-field.off { opacity: 0.45; }
+.hint-line { font-size: 12px; line-height: 1.38; color: var(--muted); padding-left: 21px; margin-bottom: 4px; }
+.slider.off { opacity: 0.45; }
+
+/* ---------- main ---------- */
+main { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.pagehead { padding: 6px 4px 0; min-width: 0; }
+.kick { display: flex; align-items: center; gap: 10px; margin: 0 0 10px; font: 600 14px/1.3 var(--font-ui); letter-spacing: -.01em; color: var(--muted); }
+.kick::before { content: ""; width: 24px; height: 2px; border-radius: 1px; background: var(--grad); flex: none; }
+.pagehead h1 { font-size: clamp(28px, 3.4vw, 44px); line-height: 1.08; letter-spacing: -.028em; }
+.pagehead h1 span { display: block; margin-top: 6px; font-size: clamp(15px, 1.5vw, 19px); line-height: 1.3; font-weight: 400; letter-spacing: -.014em; color: var(--muted); }
+.hero { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 20px; align-items: stretch; }
+@media (max-width: 1320px) { .hero { grid-template-columns: minmax(0, 1fr); } }
+.stagecard { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+.stage { position: relative; background: var(--stage); aspect-ratio: 16 / 10; min-height: min(380px, 62vh); max-height: 76vh; width: 100%; overflow: hidden; touch-action: none; }
+@media (max-width: 640px) { .stage { aspect-ratio: 1 / 1.05; min-height: 0; max-height: 68vh; } }
+/* short landscape screens (phones turned sideways): size the view by height so controls stay on screen */
+@media (max-height: 540px) and (orientation: landscape) { .stage { aspect-ratio: auto; height: 68vh; min-height: 200px; max-height: none; } }
+.stage canvas { cursor: grab; }
+.stage canvas:active { cursor: grabbing; }
+.ov { position: absolute; z-index: 2; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.glass { background: var(--glass); backdrop-filter: saturate(180%) blur(20px); -webkit-backdrop-filter: saturate(180%) blur(20px); border-radius: var(--pill); padding: 3px; box-shadow: 0 0 0 .5px color-mix(in srgb, var(--ink) 12%, transparent); }
+.ov.tl { left: 14px; top: 14px; right: 210px; }
+.ov.tr { right: 14px; top: 14px; gap: 2px; }
+.ov.bl { left: 14px; bottom: 14px; pointer-events: none; max-width: 52%; border-radius: 14px; }
+.ov select { border: 0; background: transparent; padding: 5px 8px; font-size: 13px; border-radius: var(--pill); cursor: pointer; max-width: 100%; }
+.ov .seg { background: var(--glass); border-radius: var(--pill); padding: 3px; }
+.ov .seg button { border-radius: var(--pill); padding: 5px 12px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: var(--pill); border: 0; background: transparent; font-size: 13px; cursor: pointer; color: var(--ink); }
+.chip:hover { background: var(--fill); }
+.chip[aria-pressed="false"] { opacity: 0.45; }
+.chip:disabled { opacity: 0.3; cursor: not-allowed; }
+.sw { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.legendbar { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-2); padding: 5px 10px; }
+.legendbar .grad { width: 120px; height: 6px; border-radius: 3px; }
+.legendbar .k { display: inline-flex; align-items: center; gap: 5px; }
+.legendbar .blk { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.sidelabels { position: absolute; z-index: 1; top: 104px; left: 0; right: 0; display: grid; grid-template-columns: 1fr 1fr; pointer-events: none; }
+.sidelabels span { justify-self: center; font-size: 12px; font-weight: 500; color: var(--ink-2); background: var(--glass); padding: 4px 12px; border-radius: var(--pill); }
+.hoverlabel { position: absolute; z-index: 3; pointer-events: none; background: rgba(29,29,31,.94); color: #f5f5f7; border-radius: 10px; padding: 6px 10px; font-size: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.25); white-space: nowrap; transform: translate(12px, -50%); }
+.hoverlabel b { font-weight: 600; }
+.zoomhint { position: absolute; right: 14px; bottom: 14px; z-index: 2; font-size: 12px; color: var(--muted); pointer-events: none; text-align: right; max-width: 44%; line-height: 1.35; }
+@media (max-width: 1080px) { .zoomhint { display: none; } }
+@media (max-width: 640px) {
+  /* phone: one compact row of view controls on top, model/PDB chips bottom right, colour legend hidden */
+  .ov.tl { left: 8px; top: 8px; right: 8px; flex-wrap: nowrap; gap: 6px; }
+  .ov.tl > .glass:not(.seg) { flex: 1 1 0; min-width: 0; }
+  .ov select { width: 100%; text-overflow: ellipsis; }
+  #layout-seg { display: none; }
+  .ov.tr { top: auto; bottom: 8px; right: 8px; }
+  .ov.tr .chip { padding: 4px 8px; font-size: 12px; }
+  .ov.tr .iconbtn { width: 28px; height: 28px; }
+  .ov.bl { display: none; }
+  .sidelabels { top: 52px; }
+}
+.webgl-fail { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; text-align: center; color: var(--ink-2); }
+
+.timeline { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 12px 18px; }
+.timeline input[type="range"] { width: 100%; accent-color: var(--btn); margin: 0; }
+.tl-readout { display: flex; align-items: center; gap: 16px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tl-readout b { color: var(--ink); font-weight: 500; }
+.runlen { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; gap: 14px; align-items: center; padding: 12px 18px 14px; border-top: .5px solid var(--line-strong); font-size: 13px; }
+.runlen .btn { justify-self: end; }
+.runlen input { width: 100%; accent-color: var(--btn); margin: 0; }
+.runlen output { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; min-width: 44px; text-align: right; }
+@media (max-width: 520px) { .runlen { grid-template-columns: minmax(0, 1fr) auto; gap: 6px 10px; } .runlen label { grid-column: 1 / -1; } .runlen .btn { grid-column: 1 / -1; justify-self: start; } }
+.btn.small { padding: 6px 16px; }
+@media (max-width: 640px) { .timeline { grid-template-columns: auto minmax(0, 1fr); } .tl-readout { grid-column: 1 / -1; flex-wrap: wrap; gap: 4px 14px; } }
+.progress { height: 2px; background: var(--line); }
+.progress i { display: block; height: 100%; width: 0; background: var(--grad) 0 0 / 100vw 100%; transition: width 0.2s; }
+
+/* scorecard */
+.score { padding: 22px; display: flex; flex-direction: column; gap: 16px; }
+.score-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.which { font-size: 12px; color: var(--muted); }
+.bigrow { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.big { display: flex; flex-direction: column; gap: 6px; }
+.big b { font-size: 72px; font-weight: 600; line-height: 0.95; letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
+.big b small { font-size: 0.36em; font-weight: 500; color: var(--muted); margin-left: 4px; letter-spacing: -.02em; }
+.big span { font-size: 13px; color: var(--muted); }
+.verdict { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px 5px 8px; border-radius: var(--pill); font-size: 13px; font-weight: 500; background: var(--fill); }
+.verdict svg { width: 16px; height: 16px; flex: none; }
+[data-tone="good"] > svg { color: var(--good); } [data-tone="warn"] > svg { color: var(--warn); } [data-tone="bad"] > svg { color: var(--bad); } [data-tone="none"] > svg { color: var(--muted); }
+.tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.tile { background: var(--panel-2); border-radius: 14px; padding: 12px 13px; display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.tile span { font-size: 12px; color: var(--muted); }
+.tile b { font-size: 26px; font-weight: 600; line-height: 1.05; letter-spacing: -.025em; font-variant-numeric: tabular-nums; }
+.meter { height: 4px; border-radius: 2px; background: var(--fill-2); position: relative; }
+.meter i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 2px; background: var(--model); }
+.meter u { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink-2); text-decoration: none; border-radius: 1px; }
+.metrics { margin: 0; display: flex; flex-direction: column; }
+.metric { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1px 12px; padding: 9px 0; border-top: .5px solid var(--line-strong); }
+.metric dt { font-size: 14px; }
+.metric dd { margin: 0; font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; text-align: right; }
+.metric .why { grid-column: 1 / -1; font-size: 12px; line-height: 1.38; color: var(--muted); }
+.fine { margin: 0; font-size: 12px; line-height: 1.4; color: var(--muted); }
+
+/* tabs: a segmented control; it scrolls sideways when it does not fit */
+.tabs { display: flex; gap: 2px; align-self: flex-start; max-width: 100%; overflow-x: auto; scrollbar-width: none; background: var(--fill-2); border-radius: 11px; padding: 2px; }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs button { border: 0; background: transparent; padding: 6px 14px; border-radius: 9px; font-size: 13px; color: var(--ink); cursor: pointer; white-space: nowrap; flex: none; }
+.tabs button[aria-selected="true"] { background: var(--seg-on); font-weight: 500; box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 0 0 .5px rgba(0,0,0,.04); }
+.panel { padding: 22px; display: flex; flex-direction: column; gap: 14px; }
+.panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; }
+.panel-head h3 { font-size: 21px; letter-spacing: -.02em; line-height: 1.2; }
+.sub { margin: 0; font-size: 14px; line-height: 1.43; color: var(--muted); max-width: 80ch; }
+.legend { display: flex; gap: 6px 14px; flex-wrap: wrap; font-size: 12px; color: var(--ink-2); align-items: center; }
+.legend .k { display: inline-flex; gap: 6px; align-items: center; }
+.legend .blk { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.legend .line { width: 16px; height: 2px; border-radius: 1px; display: inline-block; }
+.legend .ramp { width: 90px; height: 6px; border-radius: 3px; display: inline-block; background: linear-gradient(90deg, var(--heat-hi), var(--heat-lo)); box-shadow: 0 0 0 .5px var(--line-strong); }
+.legend .ramp.time { background: linear-gradient(90deg, var(--ramp-a), var(--ramp-b)); }
+.scroll-x { overflow-x: auto; }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+@media (max-width: 900px) { .two { grid-template-columns: minmax(0, 1fr); } }
+canvas.chart { display: block; max-width: 100%; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th { text-align: left; font-weight: 400; font-size: 12px; color: var(--muted); padding: 8px 10px; border-bottom: .5px solid var(--line-strong); white-space: nowrap; }
+td { padding: 10px; border-bottom: .5px solid var(--line-strong); white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr.sel td { background: var(--accent-soft); }
+.tag { display: inline-flex; align-items: center; gap: 6px; }
+.tag svg { width: 14px; height: 14px; }
+.empty td { color: var(--muted); white-space: normal; }
+.prose { font-size: 15px; line-height: 1.47; color: var(--ink-2); display: flex; flex-direction: column; gap: 12px; }
+.prose p { margin: 0; max-width: 72ch; }
+.prose b { color: var(--ink); font-weight: 600; }
+.prose a, #msa-paste a { color: var(--accent); text-decoration: none; }
+.prose a:hover, #msa-paste a:hover { text-decoration: underline; }
+.prose h4 { margin: 8px 0 0; font-size: 17px; letter-spacing: -.015em; color: var(--ink); font-weight: 600; }
+
+/* MSA + AI panel */
+.pipe { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 960px) { .pipe { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .pipe { grid-template-columns: minmax(0, 1fr); } }
+.step { position: relative; overflow: hidden; background: var(--panel-2); border-radius: 16px; padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.step .k { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.step .k i { width: 7px; height: 7px; border-radius: 50%; background: var(--line-strong); flex: none; }
+.step[data-s="run"] .k i { background: var(--btn); animation: pulse 1.2s ease-in-out infinite; }
+.step[data-s="done"] .k i { background: var(--good); }
+.step b { font-size: 28px; font-weight: 600; line-height: 1.1; letter-spacing: -.025em; font-variant-numeric: tabular-nums; }
+.step b small { font-size: 12px; font-weight: 400; color: var(--muted); letter-spacing: 0; }
+.step .d { font-size: 12.5px; line-height: 1.38; color: var(--muted); }
+.step .bar { position: absolute; left: 0; bottom: 0; height: 3px; background: var(--btn); transition: width 0.2s; }
+.evo-col { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.evo-col h4 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+.evo-col .seg button { padding: 4px 9px; }
+td.wrap { white-space: normal; color: var(--ink-2); font-size: 13px; min-width: 220px; }
+@media (prefers-reduced-motion: reduce) { .step[data-s="run"] .k i { animation: none; } }
+
+footer { max-width: 1640px; margin: 0 auto; padding: 0 22px 44px; font-size: 12px; line-height: 1.5; color: var(--muted); }
+footer div { border-top: .5px solid var(--line-strong); padding-top: 18px; }
+footer b { color: var(--ink); font-weight: 600; }
+
+.tooltip { position: fixed; z-index: 50; pointer-events: none; background: rgba(29,29,31,.94); color: #d2d2d7; border-radius: 12px; padding: 9px 12px; font-size: 12.5px; line-height: 1.4; box-shadow: 0 10px 30px rgba(0,0,0,.25); max-width: 280px; }
+.tooltip b { font-weight: 600; color: #fff; }
+.tooltip .tl { display: grid; grid-template-columns: auto auto; gap: 1px 14px; margin-top: 4px; }
+.tooltip .tl span:nth-child(even) { text-align: right; color: #fff; font-variant-numeric: tabular-nums; }
+</style>
+
+<header class="appbar">
+  <a class="brand" href="site/index.html"><svg viewBox="0 0 20 20" aria-hidden="true"><linearGradient id="thread" x1="0" x2="1" y1="0" y2="0"><stop offset="0" style="stop-color:var(--m1)"/><stop offset=".5" style="stop-color:var(--m3)"/><stop offset="1" style="stop-color:var(--m5)"/></linearGradient><path d="M3 13c2.2-7 4.6-7 5.8-2.6s3.4 4 6.2-3.4" fill="none" stroke="url(#thread)" stroke-width="2.2" stroke-linecap="round"/></svg>
+    <b>Folding Lab</b></a>
+  <nav class="navtabs" aria-label="Site"><a href="site/index.html">Start</a><a class="opt" href="site/index.html#how">How it works</a><a class="opt" href="site/index.html#results">Results</a><a class="on" href="index.html" aria-current="page">Lab</a></nav>
+  <div class="barend">
+    <div class="status" id="status" data-state="idle" role="status"><span class="dot"></span><span id="status-text">Ready</span></div>
+    <button class="btn primary" id="run" type="button">Fold</button>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar" aria-label="Settings">
+    <section class="card side">
+      <div class="side-head"><h2>Protein</h2><label class="check pics"><input type="checkbox" id="pics" checked> Pictures</label></div>
+      <div class="plist" id="plist" role="radiogroup" aria-label="Protein"></div>
+      <details class="adv morepdb">
+        <summary>More from the PDB<span class="count">23</span></summary>
+        <div class="plist" id="morelist" role="radiogroup" aria-label="More proteins"></div>
+      </details>
+      <div class="row">
+        <label class="btn file" for="pdb-file" title="PDB or mmCIF (.pdb, .cif, also .gz)">Upload structure<input type="file" id="pdb-file" accept=".pdb,.ent,.cif,.mmcif,.gz,.txt"></label>
+        <button class="btn" id="seq-toggle" type="button" aria-expanded="false">Type a sequence</button>
+      </div>
+      <div id="custom" hidden>
+        <label class="label" for="seq-input">One-letter sequence, 8–5,000 residues</label>
+        <textarea id="seq-input" spellcheck="false">KKWTWNPATGKWTWQE</textarea>
+        <div class="row"><button class="btn" id="seq-use" type="button">Fold this sequence</button></div>
+        <p class="note">With no experimental structure, the comparison views stay empty.</p>
+      </div>
+      <p class="note" id="load-msg" role="status"></p>
+    </section>
+
+    <section class="card side">
+      <h2>Method</h2>
+      <div class="methods" id="methods" role="radiogroup" aria-label="Method"></div>
+      <div id="ss-field">
+        <span class="label">Secondary structure</span>
+        <div class="seg" id="ss-seg" role="group" aria-label="Secondary structure source" style="margin-top:6px">
+          <button type="button" data-v="pred" aria-pressed="true">Predicted</button>
+          <button type="button" data-v="real" aria-pressed="false">From PDB record</button>
+        </div>
+      </div>
+      <details class="adv">
+        <summary>Search options</summary>
+        <div class="fields">
+      <div id="hop-field">
+        <label class="check"><input type="checkbox" id="hop" checked> Monte Carlo restarts</label>
+        <span class="hint-line">When a replica stops improving for 50k steps, try a new move and keep it only if it helps.</span>
+        <div class="slider" style="margin-top:8px">
+          <label for="hop-sev">Restart severity</label><output id="hop-sev-out" for="hop-sev">Default</output>
+          <input type="range" id="hop-sev" min="1" max="5" step="1" value="3" aria-describedby="hop-sev-hint">
+          <span class="hint" id="hop-sev-hint"></span>
+        </div>
+      </div>
+      <div id="blind-field">
+        <label class="check"><input type="checkbox" id="earlystop"> Stop early when replicas agree</label>
+        <span class="hint-line">From 40% of the run, once most replicas sit in the same fold as the best one and the energy has levelled off, cool down quickly and finish. Blind: it never looks at the PDB structure. MSA + AI only.</span>
+        <label class="check"><input type="checkbox" id="cullstray"> Restart stray replicas</label>
+        <span class="hint-line">Between 40% and 70% of the run, a replica stuck in the mirror image of the best fold, or in a strained one, restarts from the best replica. Blind, MSA + AI only.</span>
+      </div>
+      <div id="stopfold-field">
+        <label class="check"><input type="checkbox" id="stopfold"> Stop at same fold</label>
+        <span class="hint-line">Ends the run as soon as any replica matches the PDB fold (TM-score ≥ 0.5 or close RMSD). Uses the answer, so it isn't blind.</span>
+      </div>
+        </div>
+      </details>
+      <details class="adv" id="adv">
+        <summary>Advanced settings</summary>
+        <div class="fields">
+          <div id="steps-field"></div>
+          <div id="sliders" class="fields" style="margin:0"></div>
+          <div id="schedule" class="fields" style="margin:0"></div>
+          <div class="slider"><label for="replicas">Independent replicas</label><output id="replicas-out">12</output>
+            <input type="range" id="replicas" min="1" max="16" step="1" value="12"><span class="hint">Each runs in its own thread; the consensus model comes from clustering all of them.</span></div>
+          <div><label class="label" for="seed">Random seed</label>
+            <div class="inline" style="margin-top:6px"><input id="seed" type="number" min="1" max="999999" value="11"><button class="btn" id="reroll" type="button">New</button></div></div>
+          <label class="check"><input type="checkbox" id="watch"> Slow motion (about 3,000 steps/s per replica)</label>
+        </div>
+      </details>
+    </section>
+
+    <section class="card side" hidden>
+      <h2>Best predictions</h2>
+      <p class="note">Saved MSA + AI runs on proteins the network never saw. Load one to explore a good fold without waiting.</p>
+      <div class="plist" id="examples"></div>
+    </section>
+
+    <section class="card side">
+      <h2>Benchmark</h2>
+      <p class="note">Fold all ten PDB proteins in a row with the current method and settings. Results land in the run log.</p>
+      <button class="btn" id="run-all" type="button">Run all ten</button>
+    </section>
+  </aside>
+
+  <main>
+    <div class="pagehead"><p class="kick">03 / The lab</p><h1 id="crumb"></h1></div>
+    <div class="hero">
+      <section class="card stagecard" aria-label="3D structure">
+        <div class="stage" id="stage">
+          <div class="ov tl">
+            <div class="glass"><select id="rep" aria-label="Representation">
+              <option value="cartoon">Cartoon (atoms on zoom)</option>
+              <option value="sticks">Cartoon + all atoms</option>
+              <option value="ball">Ball and stick</option>
+              <option value="spacefill">Spacefill</option>
+              <option value="trace">Cα trace</option>
+            </select></div>
+            <div class="glass"><select id="colorby" aria-label="Color by">
+              <option value="rainbow">Color: N → C</option>
+              <option value="ss">Color: secondary structure</option>
+              <option value="dev">Color: distance from PDB</option>
+              <option value="hydro">Color: hydrophobicity</option>
+            </select></div>
+            <div class="glass seg" id="layout-seg" role="group" aria-label="Layout">
+              <button type="button" data-v="overlay" aria-pressed="true">Superposed</button>
+              <button type="button" data-v="side" aria-pressed="false">Side by side</button>
+            </div>
+          </div>
+          <div class="ov tr glass">
+            <button class="chip" id="show-model" type="button" aria-pressed="true"><span class="sw" style="background:var(--model)"></span>Model</button>
+            <button class="chip" id="show-pdb" type="button" aria-pressed="true"><span class="sw" style="background:var(--muted)"></span>PDB</button>
+            <button class="btn ghost iconbtn" id="spin" type="button" aria-pressed="false" title="Spin" aria-label="Spin"><svg viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v2.5h-2.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+            <button class="btn ghost iconbtn" id="recenter" type="button" title="Reset view" aria-label="Reset view"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2" fill="currentColor"/><path d="M8 1.5v2.5M8 12v2.5M1.5 8H4M12 8h2.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
+          </div>
+          <div class="sidelabels" id="sidelabels" hidden><span>Model</span><span id="side-pdb">PDB</span></div>
+          <div class="ov bl glass" id="legend3d"></div>
+          <div class="zoomhint" id="zoomhint">Drag to rotate · scroll to zoom in on atoms · right-drag to pan · double-click a residue to focus</div>
+          <div class="hoverlabel" id="hover" hidden></div>
+        </div>
+        <div class="progress" aria-hidden="true"><i id="progress"></i></div>
+        <div class="timeline">
+          <button class="btn iconbtn" id="replay" type="button" title="Replay trajectory" aria-label="Replay trajectory"><svg viewBox="0 0 16 16" id="replay-icon"><path d="M5 3.5v9l7-4.5z" fill="currentColor"/></svg></button>
+          <input type="range" id="scrub" min="0" max="0" value="0" aria-label="Trajectory frame">
+          <div class="tl-readout"><span>step <b id="ro-step">0</b></span><span>kT <b id="ro-t">–</b></span><span>E <b id="ro-e">–</b></span><span id="ro-speed"></span></div>
+        </div>
+        <div class="runlen">
+          <label for="tl-steps">Steps per replica</label>
+          <input type="range" id="tl-steps" min="0" max="27" step="1" value="5">
+          <output id="tl-steps-out" for="tl-steps">300k</output>
+          <button class="btn small tint" id="tl-start" type="button">Start</button>
+        </div>
+      </section>
+      <section class="card score" id="score" aria-live="polite"></section>
+    </div>
+
+    <div class="tabs" role="tablist" id="tabs">
+      <button role="tab" data-tab="traj" aria-selected="true">Trajectory</button>
+      <button role="tab" data-tab="evo" aria-selected="false">MSA + AI</button>
+      <button role="tab" data-tab="res" aria-selected="false">Residues</button>
+      <button role="tab" data-tab="cmap" aria-selected="false">Contact map</button>
+      <button role="tab" data-tab="land" aria-selected="false">Energy landscape</button>
+      <button role="tab" data-tab="reps" aria-selected="false">Replicas</button>
+      <button role="tab" data-tab="log" aria-selected="false">Run log</button>
+      <button role="tab" data-tab="method" aria-selected="false">Method</button>
+    </div>
+
+    <section class="card panel" data-panel="traj">
+      <div class="panel-head"><h3>Trajectory</h3>
+        <div class="legend"><span class="k"><span class="line" style="background:var(--model)"></span><span id="traj-focus">Replica 1 (shown)</span></span><span class="k"><span class="line" style="background:var(--coil)"></span>Other replicas</span></div></div>
+      <p class="sub">Sampled every few thousand steps. Click a line to show that replica; the vertical rule marks the frame on screen.</p>
+      <canvas class="chart" id="traj"></canvas>
+    </section>
+    <section class="card panel" data-panel="evo" hidden>
+      <div class="panel-head"><h3>Evolution and AI</h3>
+        <div class="row">
+          <label class="btn file" for="msa-file">Upload MSA<input type="file" id="msa-file" accept=".a3m,.fasta,.fa,.faa,.fas,.aln,.txt"></label>
+          <button class="btn" id="msa-paste-toggle" type="button" aria-expanded="false">Paste</button>
+          <button class="btn ghost" id="msa-reset" type="button" hidden>Remove uploaded MSA</button>
+        </div></div>
+      <p class="sub">Related proteins keep the same fold, and residues that touch tend to mutate together. A multiple sequence alignment (MSA) of homologs carries that signal; mean-field direct coupling analysis (DCA) pulls it out, and a residual neural network turns it into a distance histogram for every residue pair plus a secondary-structure call. Those predictions are what “MSA + AI” folds with.</p>
+      <div id="msa-paste" hidden class="fields" style="margin:0">
+        <label class="label" for="msa-text">A3M, aligned FASTA, or plain homolog sequences in FASTA (they are aligned to the query with Smith–Waterman). Get one from <a href="https://search.mmseqs.com" target="_blank" rel="noopener">MMseqs2</a>, <a href="https://www.ebi.ac.uk/Tools/hmmer/search/jackhmmer" target="_blank" rel="noopener">jackhmmer</a> or <a href="https://blast.ncbi.nlm.nih.gov/Blast.cgi?PAGE=Proteins" target="_blank" rel="noopener">BLAST</a>.</label>
+        <textarea id="msa-text" spellcheck="false" placeholder=">query&#10;NLYIQWLKDGGPSSGRPPPS&#10;>homolog_1&#10;…"></textarea>
+        <div class="row"><button class="btn" id="msa-use" type="button">Use this alignment</button></div>
+      </div>
+      <p class="note" id="msa-msg" role="status"></p>
+      <div class="pipe" id="evo-pipe"></div>
+      <div class="two">
+        <div class="evo-col"><div class="panel-head"><h4>Alignment</h4>
+          <div class="legend"><span class="k"><span class="blk" style="background:rgb(64,120,220)"></span>hydrophobic</span><span class="k"><span class="blk" style="background:rgb(224,76,70)"></span>+</span><span class="k"><span class="blk" style="background:rgb(196,84,205)"></span>−</span><span class="k"><span class="blk" style="background:rgb(46,170,98)"></span>polar</span><span class="k"><span class="blk" style="background:rgb(236,150,48)"></span>Gly</span><span class="k"><span class="blk" style="background:rgb(204,182,40)"></span>Pro</span></div></div>
+          <canvas class="chart" id="msa-canvas"></canvas><p class="fine" id="msa-cap"></p></div>
+        <div class="evo-col"><div class="panel-head"><h4>Predicted contacts</h4>
+          <div class="seg" id="evo-map-seg" role="group" aria-label="Contact source"><button type="button" data-v="ai" aria-pressed="true">Neural network</button><button type="button" data-v="dca" aria-pressed="false">Raw DCA</button></div></div>
+          <canvas class="chart" id="evo-map"></canvas><p class="fine" id="evo-cap"></p></div>
+      </div>
+      <div class="table-wrap" id="evo-table"></div>
+    </section>
+    <section class="card panel" data-panel="res" hidden>
+      <div class="panel-head"><h3>Residue by residue</h3>
+        <div class="legend"><span class="k"><span class="blk" style="background:var(--helix)"></span>Helix</span><span class="k"><span class="blk" style="background:var(--strand)"></span>Strand</span><span class="k"><span class="blk" style="background:var(--coil);height:3px"></span>Coil</span><span class="k"><span class="blk" style="background:var(--model)"></span>Distance from PDB</span></div></div>
+      <p class="sub">Secondary structure of the PDB record, the method's prediction and the model's own geometry, with each residue's distance from the PDB position after superposition.</p>
+      <div class="scroll-x"><canvas class="chart" id="tracks"></canvas></div>
+    </section>
+    <section class="card panel" data-panel="cmap" hidden>
+      <div class="panel-head"><h3>Contact map</h3><div class="legend"><span class="mono">4 Å</span><span class="ramp"></span><span class="mono">12 Å</span></div></div>
+      <p class="sub">Cα–Cα distance for every residue pair. Lower-left is the PDB structure, upper-right the model; matching patterns mean matching contacts. Helices show as bands along the diagonal, paired strands as lines across it.</p>
+      <canvas class="chart" id="cmap"></canvas>
+    </section>
+    <section class="card panel" data-panel="land" hidden>
+      <div class="panel-head"><h3>Energy landscape</h3>
+        <div class="legend"><span>early</span><span class="ramp time"></span><span>late</span><span class="k"><span class="blk" style="background:var(--native);transform:rotate(45deg);width:8px;height:8px"></span>PDB structure</span><span class="k"><span class="blk" style="border:2px solid var(--ink);border-radius:50%;width:10px;height:10px"></span>Consensus model</span></div></div>
+      <p class="sub">Every sampled frame of every replica: energy against distance from the PDB structure. A good force field makes a funnel that slopes down toward 0 Å.</p>
+      <canvas class="chart" id="funnel"></canvas>
+    </section>
+    <section class="card panel" data-panel="reps" hidden>
+      <div class="panel-head"><h3>Replicas</h3></div>
+      <p class="sub">Independent runs from different random coils. The consensus model is the medoid of the largest cluster of late, low-temperature frames, the way I-TASSER's SPICKER and Rosetta pick models.</p>
+      <div class="table-wrap"><table id="reptable"></table></div>
+    </section>
+    <section class="card panel" data-panel="log" hidden>
+      <div class="panel-head"><h3>Run log</h3><button class="btn" id="clear-log" type="button">Clear</button></div>
+      <div class="table-wrap"><table id="history"></table></div>
+    </section>
+    <section class="card panel prose" data-panel="method" hidden id="method-panel"></section>
+  </main>
+</div>
+<footer><div><b>Designed and built by Han.</b> Structures from the RCSB Protein Data Bank. Every fold runs in your browser.</div></footer>
+<div class="tooltip" id="tip" hidden></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="natives.js?v8" charset="utf-8"></script>
+<script src="kb.js" charset="utf-8"></script>
+<script src="engine.js?v11" charset="utf-8"></script>
+<script src="evo.js?v12" charset="utf-8"></script>
+<script src="evo-msa.js?v10" charset="utf-8"></script>
+<script src="evo-model.js?v8" charset="utf-8"></script>
+<script src="evo-examples.js" charset="utf-8"></script>
+<script src="viewer3d.js?v12" charset="utf-8"></script>
+<script src="benchmark.js?v8" charset="utf-8"></script>
+<script src="app.js?v18" charset="utf-8"></script>

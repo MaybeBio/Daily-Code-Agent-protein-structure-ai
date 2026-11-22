@@ -1,0 +1,297 @@
+[build-system]
+# setuptools is the build backend so the Cython kernel in
+# `_filters_c/_inner.pyx` is compiled into the wheel at build time —
+# end users `pip install aaanalysis` (or `uv add`) and the precompiled
+# `.so` ships with the wheel; no manual `setup_inner.py build_ext` step.
+# See docs/adr/0001-cpp-backend-architecture.md.
+requires = [
+  # >=84.1.0 includes the namespace-package wheel path fix as well as
+  # the sdist MANIFEST.in exclusion fix; enforce both in isolated builds.
+  "setuptools>=84.1.0",
+  "wheel",
+  "Cython>=3.0",
+  "numpy>=1.24",
+]
+build-backend = "setuptools.build_meta"
+
+
+# -------------------------
+# PEP 621 metadata (uv + modern tooling)
+# -------------------------
+[project]
+name = "aaanalysis"
+# Manually maintained and always AHEAD of the latest PyPI release, so a development
+# tree never reports an already-published version. After publishing X.Y.Z (and
+# tagging vX.Y.Z), bump this to the next unreleased number in the same step.
+# Enforced by .github/workflows/version_guard.yml.
+version = "1.2.0"
+description = "Python framework for interpretable protein prediction"
+readme = "README.rst"
+requires-python = ">=3.11.5"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "Stephan Breimann", email = "stephanbreimann@gmail.de" }]
+keywords = ["protein", "prediction", "bioinformatics", "machine learning", "interpretable AI"]
+
+classifiers = [
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Natural Language :: English",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "License :: OSI Approved :: BSD License",
+  "Development Status :: 5 - Production/Stable",
+]
+
+dependencies = [
+  "cycler>=0.12.1",
+  "et-xmlfile>=2.0.0",
+  "fonttools>=4.56.0",
+  "Jinja2>=3.1.6",
+  "joblib>=1.4.2",
+  "kiwisolver>=1.4.7",
+  "logomaker>=0.8.6",
+  "matplotlib>=3.5.3",
+  "numpy>=1.24.4",
+  "openpyxl>=3.1.5",
+  "packaging>=26.1",
+  "pandas>=2.2.3",
+  "patsy>=1.0.1",
+  "Pillow>=13.0.0",
+  "pyparsing>=3.2.1",
+  "python-dateutil>=2.9.0",
+  "pytz>=2024.2",
+  "scikit-learn>=1.6.1",
+  "scipy>=1.13.1",
+  "seaborn>=0.13.2",
+  "six>=1.17.0",
+  "threadpoolctl>=3.5.0",
+]
+
+[project.optional-dependencies]
+pro = [
+  "biopython>=1.87",
+  "shap>=0.46.0",
+  "UpSetPlot>=0.9.0",
+  "requests>=2.0",
+  # AFragmenter (Verwimp et al. 2025, Bioinformatics): PAE-based Leiden
+  # clustering for AlphaFold structures. Lazy-imported by
+  # StructurePreprocessor.get_domains(tool='afragmenter'); ~10 MB of new
+  # transitive deps (python-igraph + rich), no DL framework.
+  "afragmenter>=0.0.6",
+  # py3Dmol (Python binding to 3Dmol.js): the 3D structure renderer for
+  # CPPStructurePlot (map_structure / plot_combined / interactive) and its
+  # self-contained HTML export. Pure-Python, no DL framework; lazy-imported (the
+  # rest of the package works without it) but required by the structure methods.
+  "py3Dmol>=2.0",
+  # ipywidgets: the live, selection-linked explorer (CPPStructurePlot.interactive).
+  # Pure-Python notebook UI, lazy-imported inside .interactive() so the static
+  # map_structure / plot_combined paths never require it. Also pinned in [docs]
+  # for nbsphinx widget rendering.
+  "ipywidgets>=8.0.0",
+]
+embed = [
+  # Protein-language-model embedding compute path for
+  # EmbeddingPreprocessor.fetch_embeddings (ESM-2 / ESM-1b / ProtT5 / ProstT5
+  # from the Hugging Face Hub). Isolated from [pro] because torch alone is
+  # ~1-2 GB - 50x the weight of every other pro feature. Lazy-imported inside
+  # the method; the rest of EmbeddingPreprocessor works without it. See ADR-0029.
+  # Floor is 2.13.0: torch <= 2.12.1 is vulnerable to memory corruption via
+  # torch.jit.script (CVE-2025-3000, GHSA-rrmf-rvhw-rf47); 2.13.0 is the fix.
+  "torch>=2.13.0",
+  "transformers>=4.40",
+  "sentencepiece>=0.2",
+  "huggingface_hub>=0.23",
+]
+bench = [
+  # Committed perf benchmark + regression-guard suite (tests/benchmarks/, issue
+  # #187). Isolated from [dev] on purpose: keeping pytest-benchmark out of the
+  # default dev install means the unit / coverage matrices never collect the
+  # benchmarks (the suite importorskips when the plugin is absent), so wall-clock
+  # noise never reaches the blocking gates. The suite runs in the opt-in perf
+  # nightly; install with -e ".[dev,pro,bench]" to run it locally.
+  # pytest-benchmark 5.3.0 uses the private Node._nodeid removed in pytest 9.2.
+  # Keep this compatibility bound scoped to benchmarking until upstream is fixed.
+  "pytest>=9.0.3,<9.2",
+  "pytest-benchmark>=4.0",
+]
+docs = [
+  "aaanalysis[pro]",
+  "docutils==0.21.2",
+  "nbconvert>=7.17.2",
+  # Security floors for nbconvert's HTML parsing and Jupyter dependencies.
+  "soupsieve>=4.0",
+  "tornado>=6.6.1",
+  "nbformat==5.10.4",
+  "nbsphinx==0.9.6",
+  "numpydoc==1.8.0",
+  "sphinx==8.1.3",
+  "sphinx-autodoc-typehints==1.15.0",
+  "sphinx-copybutton==0.5.2",
+  "sphinx_design==0.6.1",
+  "sphinx_rtd_theme==3.0.2",
+  "sphinxext-opengraph==0.9.1",
+  "urllib3>=2.8.0",
+  "ipywidgets>=8.0.0",
+]
+dev = [
+  "aaanalysis[docs]",
+  "black>=26.10.1",
+  # deap is a DEV/TEST-ONLY parity oracle + benchmark for SeqOpt's NSGA-II
+  # re-implementation; the shipped runtime never imports it (pure-Python core).
+  "deap>=1.4",
+  "hypothesis>=6.124.7",
+  "ipykernel==6.29.5",
+  "ipython>=8.18.1",
+  "pandoc==2.4",
+  "poetry>=2.0.1",
+  "pytest>=9.0.3",
+  "pytest-cov>=7.1.0",
+  "pytest-xdist>=3.6.0",
+  "pytest-mpl==0.19.0",
+  "mutmut>=3.0",
+  "pyright>=1.1.400",
+]
+
+[project.urls]
+Homepage = "https://aaanalysis.readthedocs.io"
+Repository = "https://github.com/breimanntools/aaanalysis"
+Documentation = "https://aaanalysis.readthedocs.io"
+
+
+# -------------------------
+# Poetry config (kept for Poetry packaging behavior)
+# -------------------------
+[tool.poetry]
+include = [
+  "data/*.xlsx",
+  "data/benchmarks/*.tsv",
+  "data/benchmarks/*.xlsx",
+]
+homepage = "https://aaanalysis.readthedocs.io"
+
+[tool.poetry.urls]
+Repository = "https://github.com/breimanntools/aaanalysis"
+Documentation = "https://aaanalysis.readthedocs.io"
+
+
+# -------------------------
+# setuptools — package discovery + data files (build backend uses this)
+# -------------------------
+[tool.setuptools.packages.find]
+include = ["aaanalysis*"]
+
+[tool.setuptools.package-data]
+aaanalysis = [
+  "py.typed",
+  "_data/*.xlsx",
+  "_data/*.tsv",
+  "_data/**/*.xlsx",
+  "_data/**/*.tsv",
+]
+
+
+# -------------------------
+# cibuildwheel — runs in the release CI to build per-platform wheels
+# carrying the precompiled Cython extension. Configured here so the
+# release workflow doesn't need inline cibuildwheel options.
+# -------------------------
+[tool.cibuildwheel]
+# Build wheels for the supported Python floor (3.11+) up through 3.14.
+# Skip PyPy (no Cython benefit; numpy + scipy wheels are also limited),
+# 32-bit linux/win (negligible scientific-Python usage), and all musllinux:
+# scikit-learn — a hard dependency — publishes no musl wheels, so the stack
+# is not pip-installable on Alpine regardless, and testing a musl wheel
+# forces an hours-long from-source build of the ML stack in the container.
+build = "cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_* *-manylinux_i686 *-win32 pp*"
+build-verbosity = 1
+# aarch64 wheels are built (and shipped) but not test-run: the test phase
+# would execute under QEMU emulation, which multiplies the dependency
+# install + parity test to hours. The x86_64 parity tests still gate the
+# same C kernel.
+test-skip = "*-manylinux_aarch64"
+# Sanity-check the wheel after install against the real, non-editable artifact:
+# (1) the PEP 561 py.typed marker is present in the installed package — catches a
+#     package-data misconfiguration before the wheel ever reaches PyPI. Run as a
+#     standalone script (not via pytest) so import resolves to the installed wheel
+#     rather than the {project} source tree, which always carries the marker;
+# (2) the Cython parity test end-to-end vs the legacy path — catches ABI / dtype
+#     / dispatch regressions at build time rather than at user-install time.
+test-requires = [
+  "pytest>=9.0.3", "hypothesis>=6.124.7",
+  "pandas>=2.2.3", "scikit-learn>=1.6.1", "biopython>=1.87",
+  "matplotlib>=3.5.3", "seaborn>=0.13.2", "logomaker>=0.8.6",
+]
+test-command = "python {project}/tests/_check_py_typed_packaged.py && pytest {project}/tests/unit/cpp_tests/test_get_feature_matrix_c_parity.py -x -q"
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+# Pillow>=12.3 (a hard dependency) ships Linux wheels only for
+# manylinux_2_28, so the default manylinux2014 (glibc 2.17) container
+# cannot install the dependency stack during the wheel test phase.
+# Build and test on manylinux_2_28 (glibc >= 2.28: RHEL 8+, Ubuntu
+# 20.04+, Debian 10+); older-glibc systems could not run the package
+# anyway for lack of installable dependencies.
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+
+[tool.cibuildwheel.macos]
+archs = ["x86_64", "arm64"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+
+
+# -------------------------
+# uv (optional)
+# -------------------------
+[tool.uv]
+managed = true
+
+
+# -------------------------
+# Tooling
+# -------------------------
+[tool.black]
+line-length = 88
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | \.eggs
+  | \.mypy_cache
+  | \.pytest_cache
+  | __pycache__
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.flake8]
+max-line-length = 88
+exclude = '''
+.git,
+__pycache__,
+build,
+dist,
+venv
+'''
+
+# Mutation testing (ADR-0016) — opt-in dev tool, run in a NON-GATING nightly
+# CI job (mutation_nightly.yml), never as a hard gate. Scoped to the CPP numeric
+# core (filters / ranking) where weak tests matter most; surviving mutants feed
+# the golden/property assertions. Widen paths_to_mutate as the audit expands.
+[tool.mutmut]
+paths_to_mutate = "aaanalysis/feature_engineering/_backend/cpp/_filters/"
+tests_dir = "tests/unit/cpp_tests/"

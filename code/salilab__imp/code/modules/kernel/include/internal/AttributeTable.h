@@ -1,0 +1,557 @@
+/**
+ *  \file AttributeTable.h    \brief Keys to cache lookup of attribute strings.
+ *
+ *  Copyright 2007-2026 IMP Inventors. All rights reserved.
+ *
+ */
+
+#ifndef IMPKERNEL_ATTRIBUTE_TABLE_H
+#define IMPKERNEL_ATTRIBUTE_TABLE_H
+
+#include "../base_types.h"
+#include "../utility.h"
+#include <IMP/log.h>
+#include <IMP/Object.h>
+#include <IMP/Array.h>
+#include <IMP/Pointer.h>
+#include <IMP/VectorD.h>
+#include "../particle_index.h"
+#include <boost/dynamic_bitset.hpp>
+#include <boost/container/flat_map.hpp>
+#include <cereal/access.hpp>
+#include <cereal/types/base_class.hpp>
+#include <cereal/types/string.hpp>
+#include <cereal/types/map.hpp>
+
+#include <limits>
+
+// Add serialization support for boost::dynamic_bitset
+namespace cereal {
+  template <class Archive, typename Block, typename Allocator>
+  inline void save(Archive &ar,
+                   boost::dynamic_bitset<Block, Allocator> const &t) {
+    std::string bits;
+    boost::to_string(t, bits);
+    ar(bits);
+  }
+
+  template <class Archive, typename Block, typename Allocator>
+  inline void load(Archive &ar,
+                   boost::dynamic_bitset<Block, Allocator> &t) {
+    std::string bits;
+    ar(bits);
+    t = boost::dynamic_bitset<Block, Allocator>(bits);
+  }
+}
+
+IMPKERNEL_BEGIN_NAMESPACE
+
+class Particle;
+
+IMPKERNEL_END_NAMESPACE
+
+IMPKERNEL_BEGIN_INTERNAL_NAMESPACE
+
+// VectorD and SphereD do not support operator==, so provide our
+// own functions to test for exact equality (to be used during serialization)
+template<class T> struct vector_equal {
+  bool operator()(const T&a, const T&b) {
+    return std::equal(a.begin(), a.end(), b.begin());
+  }
+};
+
+template<class T> struct sphere_equal {
+  bool operator()(const T&a, const T&b) {
+    return a.get_radius() == b.get_radius() && std::equal(a.get_center().begin(), a.get_center().end(), b.get_center().begin());
+  }
+};
+
+/** Base class for defining traits of attributes in the attribute table
+    to be stored in a Model object. The traits define the type of attribute
+    values, the attribute key, a container for the list of values etc.
+
+    Template params:
+    T - the attribute type
+    K - the attribute key type
+*/
+template <class T, class K>
+struct DefaultTraits {
+  //! a container storing the attribute data for all particles (indexed by ParticleIndex)
+  typedef IndexVector<ParticleIndexTag, T> Container;
+  typedef T Value;
+  typedef T PassValue;
+  typedef K Key;
+  typedef PassValue const* ContainerConstDataAccess;
+  typedef Value* ContainerDataAccess;
+  //! returns the maximum of a and b
+  static const T &max(const T &a, const T &b) { return std::max(a, b); }
+  //! returns the minimum of a and b
+  static const T &min(const T &a, const T &b) { return std::min(a, b); }
+  //! compares a and b for equality
+  static bool is_equal(const T &a, const T &b) { return a == b; }
+  //! allow direct const access to the container data
+  static ContainerConstDataAccess access_container_data(Container const& c) { return c.data(); }
+  //! allow direct non-const access to the container data
+  static ContainerDataAccess access_container_data(Container&       c) { return c.data(); }
+
+  //! allow direct non-const access to the entire container data
+  static ContainerDataAccess access_full_container_data(Container& c) {
+    return c.data();
+  }
+};
+
+template <class T, class K, class Allocator = std::allocator<T>>
+struct ArrayTraits {
+  typedef IMP::Vector<T, Allocator> Value;
+  typedef IndexVector<ParticleIndexTag, Value> Container;
+  typedef const Value &PassValue;
+  typedef K Key;
+  typedef Value const* ContainerConstDataAccess;
+  typedef Value* ContainerDataAccess;
+  static Value get_invalid() { return Value(); }
+  static bool get_is_valid(const Value &v) { return !v.empty(); }
+  static const Value &max(const Value &a, const Value &) { return a; }
+  static const Value &min(const Value &, const Value &b) { return b; }
+  static bool is_equal(const Value &a, const Value &b) { return a == b; }
+  //! allow direct const access to the container data
+  static ContainerConstDataAccess access_container_data(Container const& c) { return c.data(); }
+  //! allow direct non-const access to the container data
+  static ContainerDataAccess access_container_data(Container&       c) { return c.data(); }
+
+  //! allow direct non-const access to the entire container data
+  static ContainerDataAccess access_full_container_data(Container& c) {
+    return c.data();
+  }
+};
+
+// A view into an IndexVector that contains one or more sets of
+// attributes, exposing a single active set at a time. The sets are
+// stored contiguously in memory, as a large 1D array.
+template <class Tag, class T, class Allocator = std::allocator<T>,
+          class Equal = std::equal_to<T>>
+class MultiIndexVector {
+  typedef IndexVector<Tag, T, Allocator, Equal> V;
+  typedef Vector<T, Allocator> P;
+
+  // Note that we provide a custom operator= so that must be updated
+  // if any members here are changed
+
+  // The full IndexVector of size_ particle attributes over nsets_
+  // attribute sets
+  V full_vector_;
+  int active_set_;
+  // Pointer into full_vector_ of the start of the active set
+  // ( = size_ * active_set_)
+  T *front_pointer_;
+  size_t offset_;
+  size_t size_;
+  int nsets_;
+  bool external_;
+
+  friend class cereal::access;
+  template<class Archive> void serialize(Archive &ar) {
+    ar(nsets_, full_vector_, external_);
+    if (nsets_ > 1) {
+      ar(active_set_);
+    } else {
+      if (std::is_base_of<cereal::detail::InputArchiveBase, Archive>::value) {
+        active_set_ = 0;
+      }
+    }
+    if (std::is_base_of<cereal::detail::InputArchiveBase, Archive>::value) {
+      size_ = full_vector_.size() / nsets_;
+      set_front_pointer();
+    }
+  }
+
+  void set_front_pointer() {
+    offset_ = size_ * active_set_;
+    // Since we keep a raw pointer, must reset it whenever full_vector_'s
+    // storage potentially changes, e.g. after any resize
+    front_pointer_ = full_vector_.data() + offset_;
+  }
+
+ public:
+  typedef T& reference;
+  typedef typename P::const_iterator const_iterator;
+  typedef typename P::iterator iterator;
+
+  MultiIndexVector() : active_set_(0), size_(0), nsets_(1), external_(false) {
+    set_front_pointer();
+  }
+  IMP_BRACKET(T, Index<Tag>, get_as_unsigned_int(i) < size_,
+              return front_pointer_[get_as_unsigned_int(i)]);
+
+  // Update front pointer after copy constructor
+  MultiIndexVector(const MultiIndexVector& s)
+          : full_vector_(s.full_vector_), active_set_(s.active_set_),
+            size_(s.size_), nsets_(s.nsets_), external_(s.external_) {
+    // pointer points into s; update it to point into this
+    set_front_pointer();
+  }
+
+  // Update front pointer after assignment from another object
+  MultiIndexVector& operator=(const MultiIndexVector& s) {
+    full_vector_ = s.full_vector_;
+    active_set_ = s.active_set_;
+    size_ = s.size_;
+    nsets_ = s.nsets_;
+    // pointer points into s; update it to point into this
+    set_front_pointer();
+    return *this;
+  }
+
+  T* data() { return front_pointer_; }
+  const T* data() const { return front_pointer_; }
+
+  T* full_data() { return full_vector_.data(); }
+  const T* full_data() const { return full_vector_.data(); }
+
+  std::size_t size() const { return size_; }
+
+  //! Get the number of attribute sets (we generally start with 1)
+  int get_number_of_sets() const { return nsets_; }
+
+  void set_number_of_sets(int nsets, const T &fill_value) {
+    IMP_USAGE_CHECK(nsets >= 1, "Cannot have less than 1 set");
+    IMP_USAGE_CHECK(active_set_ == 0,
+                    "Cannot set number of sets when active set is not 0");
+    nsets_ = nsets;
+    active_set_ = 0;
+    if (!external_) {
+      full_vector_.resize(size_ * nsets, fill_value);
+    }
+    set_front_pointer();
+  }
+
+  void set_active_set(int set) {
+    IMP_USAGE_CHECK(set >= 0 && set < nsets_, "Invalid set index");
+    IMP_USAGE_CHECK(!external_,
+                    "Cannot change active set when using external storage");
+    active_set_ = set;
+    set_front_pointer();
+  }
+
+  void set_sets_external(bool external) {
+    IMP_USAGE_CHECK(nsets_ == 1,
+                    "Cannot change external flag unless number of sets is 1");
+    IMP_USAGE_CHECK(active_set_ == 0,
+                    "Cannot change external flag when active set is not 0");
+    external_ = external;
+  }
+
+  bool get_sets_external() const { return external_; }
+
+  void resize(size_t count, const T &fill_value) {
+    if (nsets_ == 1) {
+      size_ = count;
+      full_vector_.resize(count, fill_value);
+      set_front_pointer();
+    } else {
+      // we *could* allow this when using external storage
+      IMP_THROW("Cannot add particles when using more than one attribute set",
+                IndexException);
+    }
+  }
+
+  iterator begin() { return full_vector_.begin() + offset_; }
+  iterator end() { return full_vector_.begin() + offset_ + size_; }
+  const_iterator begin() const { return full_vector_.begin() + offset_; }
+  const_iterator end() const { return full_vector_.begin() + offset_ + size_; }
+};
+
+//! traits for a table of Float attribute (a C/C++ double type),
+//! see also DefaultTraits
+struct FloatAttributeTableTraits : public DefaultTraits<double, FloatKey> {
+  typedef MultiIndexVector<ParticleIndexTag, double> Container;
+  static double get_invalid() {
+    /* do not use NaN as sometimes GCC will optimize things incorrectly.*/
+    /*if (std::numeric_limits<float>::has_quiet_NaN) {
+         return std::numeric_limits<float>::quiet_NaN();
+         } else*/
+    if (std::numeric_limits<double>::has_infinity) {
+      return std::numeric_limits<double>::infinity();
+    } else {
+      return std::numeric_limits<double>::max();
+    }
+  }
+  static bool get_is_valid(double f) {
+    /*if (std::numeric_limits<float>::has_quiet_NaN) {
+      return !isnan(f);
+      } else*/
+    return f < std::numeric_limits<double>::max();
+  }
+  //! allow direct const access to the container data
+  static ContainerConstDataAccess access_container_data(Container const& c) { return c.data(); }
+  //! allow direct non-const access to the container data
+  static ContainerDataAccess access_container_data(Container&       c) { return c.data(); }
+
+  //! allow direct const access to the full container data (all sets)
+  static ContainerConstDataAccess access_full_container_data(Container const& c) { return c.full_data(); }
+  //! allow direct non-const access to the full container data (all sets)
+  static ContainerDataAccess access_full_container_data(Container&       c) { return c.full_data(); }
+};
+
+struct ParticleAttributeTableTraits
+    : public DefaultTraits<ParticleIndex, ParticleIndexKey> {
+  static Value get_invalid() {
+    return get_invalid_index<ParticleIndexTag>();
+  }
+  static bool get_is_valid(const Value &f) { return f != get_invalid(); }
+};
+
+struct ParticlesAttributeTableTraits
+    : public ArrayTraits<ParticleIndex, ParticleIndexesKey,
+                         IMP_VECTOR_ALLOCATOR<ParticleIndex>> {};
+
+struct ObjectAttributeTableTraits {
+  typedef Object *Value;
+  typedef Object *PassValue;
+  typedef ObjectKey Key;
+  typedef IndexVector<ParticleIndexTag, Pointer<Object>> Container;
+  typedef Pointer<Object> const* ContainerConstDataAccess;
+  typedef Pointer<Object>* ContainerDataAccess;
+  static Value get_invalid() { return nullptr; }
+  static bool get_is_valid(const Value &f) { return f; }
+  static Value min(Value a, Value b) { return std::min(a, b); }
+  static Value max(Value a, Value b) { return std::max(a, b); }
+  static bool is_equal(Value a, Value b) { return a == b; }
+    //! allow direct const access to the container data
+  static ContainerConstDataAccess access_container_data(Container const& c) { return c.data(); }
+  //! allow direct non-const access to the container data
+  static ContainerDataAccess access_container_data(Container&       c) { return c.data(); }
+
+  //! allow direct non-const access to the entire container data
+  static ContainerDataAccess access_full_container_data(Container& c) {
+    return c.data();
+  }
+
+};
+
+struct WeakObjectAttributeTableTraits {
+  typedef Object *Value;
+  typedef Object *PassValue;
+  typedef WeakObjectKey Key;
+  typedef IndexVector<ParticleIndexTag, WeakPointer<Object>> Container;
+  typedef WeakPointer<Object> const* ContainerConstDataAccess;
+  typedef WeakPointer<Object>* ContainerDataAccess;
+  static Value get_invalid() { return nullptr; }
+  static bool get_is_valid(const Value &f) { return f; }
+  static Value min(Value a, Value b) { return std::min(a, b); }
+  static Value max(Value a, Value b) { return std::max(a, b); }
+  static bool is_equal(Value a, Value b) { return a == b; }
+    //! allow direct const access to the container data
+  static ContainerConstDataAccess access_container_data(Container const& c) { return c.data(); }
+  //! allow direct non-const access to the container data
+  static ContainerDataAccess access_container_data(Container&       c) { return c.data(); }
+
+  //! allow direct non-const access to the entire container data
+  static ContainerDataAccess access_full_container_data(Container& c) {
+    return c.data();
+  }
+};
+
+struct ObjectsAttributeTableTraits {
+  typedef Objects Value;
+  typedef const Objects &PassValue;
+  typedef ObjectsKey Key;
+  typedef IndexVector<ParticleIndexTag, Objects> Container;
+  typedef Objects const* ContainerConstDataAccess;
+  typedef Objects* ContainerDataAccess;
+  static Value get_invalid() { return Value(); }
+  static bool get_is_valid(const Value &f) { return !f.empty(); }
+  static Value min(Value a, Value b) {
+    IMP_UNUSED(b);
+    return a;
+  }
+  static Value max(Value a, Value b) {
+    IMP_UNUSED(a);
+    return b;
+  }
+  static bool is_equal(Value a, Value b) { return a == b; }
+  //! allow direct const access to the container data
+  static ContainerConstDataAccess access_container_data(Container const& c) { return c.data(); }
+  //! allow direct non-const access to the container data
+  static ContainerDataAccess access_container_data(Container&       c) { return c.data(); }
+
+  //! allow direct non-const access to the entire container data
+  static ContainerDataAccess access_full_container_data(Container& c) {
+    return c.data();
+  }
+};
+
+struct IntsAttributeTableTraits : ArrayTraits<int, IntsKey> {};
+
+struct FloatsAttributeTableTraits : ArrayTraits<double, FloatsKey> {};
+
+struct IntAttributeTableTraits : public DefaultTraits<Int, IntKey> {
+  static Int get_invalid() { return std::numeric_limits<Int>::max(); }
+  static bool get_is_valid(Int f) { return f != get_invalid(); }
+
+};
+
+template <unsigned D, class K>
+struct VectorDAttributeTableTraits {
+  typedef K Key;
+  typedef VectorD<D> Value;
+  typedef VectorD<D> PassValue;
+  typedef MultiIndexVector<ParticleIndexTag, Value, std::allocator<Value>,
+                           vector_equal<Value>> Container;
+  typedef PassValue const* ContainerConstDataAccess;
+  typedef Value* ContainerDataAccess;
+
+  static Value get_invalid() {
+    double inv = FloatAttributeTableTraits::get_invalid();
+    Value val;
+    std::fill(val.begin(), val.end(), inv);
+    return val;
+  }
+
+  static bool get_is_valid(const Value &f) {
+    double inv = FloatAttributeTableTraits::get_invalid();
+    return std::get<0>(f) != inv;
+  }
+
+  static bool is_equal(const Value &a, const Value &b) {
+    return std::equal(a.begin(), a.end(), b.begin());
+  }
+
+  static Value min(const Value &a, const Value &b) {
+    IMP_UNUSED(b);
+    return a;
+  }
+
+  static Value max(const Value &a, const Value &b) {
+    IMP_UNUSED(a);
+    return b;
+  }
+
+  //! allow direct const access to the container data
+  static ContainerConstDataAccess access_container_data(Container const& c) {
+    return c.data();
+  }
+
+  //! allow direct non-const access to the container data
+  static ContainerDataAccess access_container_data(Container& c) {
+    return c.data();
+  }
+
+  //! allow direct non-const access to the full container data (all sets)
+  static ContainerDataAccess access_full_container_data(Container& c) {
+    return c.full_data();
+  }
+};
+
+template <class K>
+struct GenericBoolAttributeTableTraits : public DefaultTraits<bool, K> {
+  struct Container : public boost::dynamic_bitset<> {
+    friend class cereal::access;
+
+    template<class Archive> void serialize(Archive &ar) {
+      ar(cereal::base_class<boost::dynamic_bitset<>>(this));
+    }
+
+    typedef boost::dynamic_bitset<> P;
+    P::reference operator[](Index<ParticleIndexTag> i) {
+      return P::operator[](get_as_unsigned_int(i));
+    }
+    bool operator[](Index<ParticleIndexTag> i) const {
+      return P::operator[](get_as_unsigned_int(i));
+    }
+  };
+  typedef Container const& ContainerConstDataAccess;
+  typedef Container& ContainerDataAccess;
+  static bool get_invalid() { return false; }
+  static bool get_is_valid(bool f) { return f; }
+    //! allow direct const access to the container data
+  ContainerConstDataAccess access_container_data(Container const& c) { return c; }
+  //! allow direct non-const access to the container data
+  static ContainerDataAccess access_container_data(Container&       c) { return c; }
+
+  //! allow direct non-const access to the entire container data
+  static ContainerDataAccess access_full_container_data(Container& c) {
+    return c.data();
+  }
+
+};
+
+typedef GenericBoolAttributeTableTraits<FloatKey> BoolAttributeTableTraits;
+
+struct StringAttributeTableTraits : public DefaultTraits<String, StringKey> {
+  static Value get_invalid() { return "This is an invalid string in IMP"; }
+  static bool get_is_valid(String f) { return f != get_invalid(); }
+};
+
+/** Base class for defining traits of sparse attributes in the attribute table
+    to be stored in a Model object.
+    Template params:
+    T - the attribute type
+    K - the attribute key type
+*/
+template <class T, class K>
+struct DefaultSparseTraits {
+  typedef boost::container::flat_map<ParticleIndex, T> Container;
+  typedef T Value;
+  typedef T PassValue;
+  typedef K Key;
+  typedef PassValue const* ContainerConstDataAccess;
+  typedef Value* ContainerDataAccess;
+};
+
+struct SparseStringAttributeTableTraits
+   : public DefaultSparseTraits<String, SparseStringKey> {};
+
+struct SparseIntAttributeTableTraits
+   : public DefaultSparseTraits<Int, SparseIntKey> {};
+
+struct SparseFloatAttributeTableTraits
+   : public DefaultSparseTraits<Float, SparseFloatKey> {};
+
+struct SparseParticleAttributeTableTraits
+   : public DefaultSparseTraits<ParticleIndex, SparseParticleIndexKey> {};
+
+
+// The traits for the particle class are declared in the Particle.h
+
+/** \internal
+    If memory becomes a problem then either use a char table to look up
+    actual entries or use perfect hashing.
+    http://burtleburtle.net/bob/hash/perfect.html
+
+    Actually Cuckoo hashing is probably a better bet as that gets
+    high occupancy without large tables for the hash function.
+
+    \note This version of the table uses certain values of the data
+    to signal that the entry is invalid. Setting an entry to these
+    values is a checked error. The values are specified by the
+    Traits::invalid entry.
+ */
+
+namespace {
+static const FloatKey xyzr_keys[] = {FloatKey(0U), FloatKey(1U),
+                                     FloatKey(2U), FloatKey(3U)};
+
+#ifndef __clang__
+// just to disable a warning
+inline int use_xyz_to_disable_warning() {
+  if (xyzr_keys[0] != FloatKey(0U)) {
+    return 1;
+  } else
+    return 0;
+}
+#endif
+}
+
+IMPKERNEL_END_INTERNAL_NAMESPACE
+
+CEREAL_SPECIALIZE_FOR_ALL_ARCHIVES(
+   IMP::internal::GenericBoolAttributeTableTraits<IMP::FloatKey>::Container,
+   cereal::specialization::member_serialize);
+CEREAL_SPECIALIZE_FOR_ALL_ARCHIVES(
+   IMP::internal::GenericBoolAttributeTableTraits<IMP::Vector3DDerivKey>::Container,
+   cereal::specialization::member_serialize);
+CEREAL_SPECIALIZE_FOR_ALL_ARCHIVES(
+   IMP::internal::GenericBoolAttributeTableTraits<IMP::Vector4DDerivKey>::Container,
+   cereal::specialization::member_serialize);
+
+#endif /* IMPKERNEL_ATTRIBUTE_TABLE_H */

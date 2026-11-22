@@ -1,0 +1,5 @@
+# What the annotation transformer family imports, at the versions its tests pass on, with
+# foundry.layers', which projections vendor beside it.
+einops>=0.8.2
+torch>=2.14
+transformers>=5.17

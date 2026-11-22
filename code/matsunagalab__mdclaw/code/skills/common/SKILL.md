@@ -1,0 +1,40 @@
+---
+name: common
+description: "Display existing molecular structures, MD trajectories, or the progress of a running job: route prepared full-system views, playback and interactive rotation to Molstar (MCP viewer in Codex, an Artifact page in Claude Code, or a local browser), still images to PyMOL, and troubleshoot remote Molstar display. Also supplies shared MDClaw job-loop, output, solvent, chemistry, and handoff conventions for md-* skills."
+---
+
+# MDClaw Common Conventions
+
+For a molecule/trajectory display request (including "play it", "I want to rotate it",
+"show the whole prepared system" and "show me a still image"), follow [visual-qa.md](https://github.com/matsunagalab/mdclaw/blob/HEAD/skills/common/visual-qa.md) directly and stop
+after display. It owns intent selection, current-session capability checks,
+and fallback. Viewing existing files does not start an MD workflow.
+Stage-specific contents and any display-copy processing are selected there too.
+In Claude Code, Molstar playback is delivered as an Artifact page
+(`export_molstar_page`), because Claude Code does not render MCP viewer widgets.
+The page also reaches a desktop outside the site firewall, and it can show a
+running production.
+For remote display failures or a missing Molstar tool in other clients, read its
+**How the MCP viewer works** and **When the MCP viewer is missing or does not
+render** sections before choosing a workaround. The execution host and the
+user's display client are different roles; MCP connection success is not
+rendering success.
+
+This directory holds the shared pages that the MDClaw workflow skills
+(`md-prepare`, `md-equilibration`, `md-production`, `md-analyze`, `md-study`,
+`md-fep`, `md-abfe`, `md-we`, `hpc-run`, and the model-backend skills)
+reference as `skills/common/<page>.md`. It is installed alongside them so
+those references resolve. For work other than display, start from the workflow
+skill that matches the user's request.
+
+| Page | Contents |
+|---|---|
+| `preamble.md` | Role framing and global rules shared by all MDClaw skills. |
+| `run-loop.md` | The canonical node run loop: inspect once on entry, then `create -> explain -> run` per stage. The DAG moves artifacts; the agent does not. |
+| `tool-output.md` | How to read MDClaw CLI output: envelope, `dag` / `next` blocks, stable guardrail `code`s. |
+| `solvent-regimes.md` | Routing between explicit water, implicit solvent, vacuum, and membrane preparation. |
+| `implicit-solvent-contract.md` | What the implicit-solvent path supports and refuses. |
+| `chemistry-diagnostics.md` | Diagnosing chemistry guardrail failures during preparation. |
+| `visual-qa.md` | Molstar/PyMOL selection by user intent and available display capabilities; optional visual review. |
+| `trajectory-display.md` | Host-side preparation snapshots and trajectory display copies: retain lipids/ligands, subsample long runs, correct PBC where supported, and fit to the average only on request. |
+| `md-handoff.md` | Handoff from source-producing prediction skills (Boltz, MODELLER, BioEmu) to MD preparation. |

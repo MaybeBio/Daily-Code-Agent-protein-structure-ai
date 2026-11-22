@@ -1,0 +1,376 @@
+"""DNA adapter core: tokenization-agnostic CETT and variant scoring.
+
+The adapters cover two architectures:
+
+- ``carbon``  — Llama/Qwen-style causal decoder (``model.model.layers``)
+- ``dnabert`` — BERT-style masked encoder (``model.bert.encoder.layer``)
+
+Both expose a standard FFN output projection, so the CETT formula is the same:
+
+    CETT_j = |z_j| * ||W_out[:, j]|| / (||h|| + eps)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+from typing import Dict, List, Optional
+
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+import torch
+
+DNA_ALPHABET = "ACGT"
+DNA_COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+
+
+def reverse_complement(sequence: str) -> str:
+    return sequence.translate(DNA_COMPLEMENT)[::-1]
+
+
+def pick_device(device: Optional[str] = None) -> str:
+    if device:
+        return device
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def get_layers(model, adapter: str):
+    """Return the transformer block list for a DNA adapter."""
+    if adapter == "carbon":
+        base = getattr(model, "model", model)
+        layers = getattr(base, "layers", None)
+        if layers is not None:
+            return layers
+    elif adapter == "dnabert":
+        for path in (("bert", "encoder", "layer"), ("encoder", "layer")):
+            obj = model
+            for attr in path:
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return obj
+    raise ValueError(f"cannot find transformer layers for adapter {adapter!r}")
+
+
+def get_ffn_output_proj(layer, adapter: str):
+    """Return the FFN output projection that CETT hooks."""
+    if adapter == "carbon":
+        mlp = getattr(layer, "mlp", None)
+        proj = getattr(mlp, "down_proj", None) if mlp is not None else None
+        if proj is not None:
+            return proj
+    elif adapter == "dnabert":
+        mlp = getattr(layer, "mlp", None)
+        proj = getattr(mlp, "wo", None) if mlp is not None else None
+        if proj is not None:
+            return proj
+        output = getattr(layer, "output", None)
+        proj = getattr(output, "dense", None) if output is not None else None
+        if proj is not None:
+            return proj
+    raise ValueError(f"cannot find FFN output projection for adapter {adapter!r}")
+
+
+def dequantize_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Return a dense float copy of a weight, including bitsandbytes 4-bit."""
+    quant_state = getattr(weight, "quant_state", None)
+    if quant_state is None:
+        return weight.detach().float()
+    from bitsandbytes.functional import dequantize_4bit
+
+    # Params4bit.dequantize() can return the packed tensor on some ROCm
+    # builds; the functional path uses the stored quant state directly.
+    return dequantize_4bit(weight.data, quant_state).detach().float()
+
+
+def _col_norm_cache_key(model, adapter: str, indices: List[int]) -> str:
+    identity = getattr(getattr(model, "config", None), "_name_or_path", None)
+    identity = identity or type(model).__name__
+    layers = ",".join(str(index) for index in indices)
+    return f"{identity}|{adapter}|{layers}"
+
+
+def _default_cache_dir() -> Path:
+    return Path(os.environ.get("BIOINTERP_CACHE_DIR", str(Path.home() / ".cache" / "biointerp")))
+
+
+def _load_col_norm_cache(path: Path, key: str, indices: List[int]):
+    if not path.exists():
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get("key") != key:
+        return None
+    values = payload.get("norms")
+    if not isinstance(values, dict):
+        return None
+    norms = {}
+    for index in indices:
+        value = values.get(index)
+        if not isinstance(value, torch.Tensor) or value.ndim != 1:
+            return None
+        if not torch.isfinite(value).all():
+            return None
+        norms[index] = value.float().cpu()
+    return norms
+
+
+def precompute_col_norms(
+    model,
+    adapter: str,
+    layers: Optional[List[int]] = None,
+    cache: bool = False,
+    cache_dir: Optional[Path] = None,
+) -> Dict[int, torch.Tensor]:
+    blocks = get_layers(model, adapter)
+    indices = list(range(len(blocks))) if layers is None else layers
+    cache_path = None
+    if cache:
+        key = _col_norm_cache_key(model, adapter, indices)
+        base = Path(cache_dir) if cache_dir is not None else _default_cache_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+        cache_path = base / f"col_norms_{digest}.pt"
+        cached = _load_col_norm_cache(cache_path, key, indices)
+        if cached is not None:
+            return cached
+
+    norms: Dict[int, torch.Tensor] = {}
+    for i in indices:
+        module = get_ffn_output_proj(blocks[i], adapter)
+        weight = dequantize_weight(module.weight)
+        dim = 1 if type(module).__name__ == "Conv1D" else 0
+        norms[i] = torch.norm(weight, dim=dim).cpu()
+    if cache_path is not None:
+        torch.save({"key": key, "norms": norms}, cache_path)
+    return norms
+
+
+def load_dna_model(spec: dict, device: Optional[str] = None):
+    """Load a DNA model from a registry spec and return ``(model, tokenizer, device)``."""
+    adapter = spec.get("adapter")
+    hf_id = spec["hf_id"]
+    dev = pick_device(device)
+
+    if adapter == "carbon":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
+        kwargs = {"trust_remote_code": True}
+        quantized = bool(spec.get("load_in_4bit"))
+        if quantized:
+            if not dev.startswith("cuda"):
+                raise ValueError("4-bit loading requires a CUDA/ROCm device")
+            from transformers import BitsAndBytesConfig
+
+            compute = spec.get("compute_dtype", spec.get("dtype", "bf16"))
+            compute_dtype = torch.bfloat16 if compute in ("bf16", "bfloat16") else torch.float16
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_use_double_quant=True,
+            )
+            kwargs["device_map"] = {"": dev}
+            kwargs["low_cpu_mem_usage"] = True
+        elif spec.get("dtype") in ("bf16", "bfloat16"):
+            kwargs["torch_dtype"] = torch.bfloat16
+        model = AutoModelForCausalLM.from_pretrained(hf_id, **kwargs)
+    elif adapter == "dnabert":
+        from transformers import AutoModelForMaskedLM, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
+        try:
+            model = AutoModelForMaskedLM.from_pretrained(hf_id, trust_remote_code=True)
+        except (ValueError, OSError):
+            from transformers.models.bert.configuration_bert import BertConfig
+
+            config = BertConfig.from_pretrained(hf_id)
+            model = AutoModelForMaskedLM.from_pretrained(
+                hf_id, trust_remote_code=True, config=config
+            )
+    else:
+        raise ValueError(f"unknown DNA adapter {adapter!r} for model {hf_id!r}")
+
+    model.eval()
+    if not (adapter == "carbon" and spec.get("load_in_4bit")):
+        model.to(dev)
+    if adapter == "dnabert":
+        # DNABERT-2 selects its Triton kernel when attention dropout is zero,
+        # including on CPU/MPS where the kernel cannot run. A nonzero p_dropout
+        # keeps inference on the standard PyTorch path (dropout is inactive in
+        # eval mode), making CPU/MPS and CUDA behavior consistent.
+        for block in get_layers(model, "dnabert"):
+            attention = getattr(block, "attention", None)
+            self_attention = getattr(attention, "self", None)
+            if hasattr(self_attention, "p_dropout"):
+                self_attention.p_dropout = max(float(self_attention.p_dropout), 1e-6)
+    return model, tokenizer, dev
+
+
+def _gather_token_states(
+    tensor: torch.Tensor, positions: torch.Tensor, attention_mask: torch.Tensor
+):
+    """Gather token states from padded ``(B, L, D)`` or packed ``(N, D)`` tensors."""
+    if tensor.dim() == 3:
+        batch = positions.shape[0]
+        b_idx = torch.arange(batch, device=tensor.device).unsqueeze(1)
+        return tensor[b_idx, positions]
+    lengths = attention_mask.sum(dim=1).tolist()
+    offsets = []
+    total = 0
+    for length in lengths:
+        offsets.append(total)
+        total += int(length)
+    flat = [offsets[b] + p for b in range(positions.shape[0]) for p in positions[b].tolist()]
+    return tensor[torch.tensor(flat, dtype=torch.long, device=tensor.device)]
+
+
+@torch.inference_mode()
+def extract_cett(
+    model,
+    tokens: dict,
+    positions: torch.Tensor,
+    layers: List[int],
+    col_norms: Dict[int, torch.Tensor],
+    adapter: str,
+    capture_hidden: bool = False,
+    capture_attention: bool = False,
+):
+    """Run one forward pass and return CETT + logits at the given token positions."""
+    blocks = get_layers(model, adapter)
+    positions = positions.to(tokens["input_ids"].device)
+    batch = positions.shape[0]
+    b_idx = torch.arange(batch, device=positions.device).unsqueeze(1)
+    attention_mask = tokens.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(tokens["input_ids"])
+
+    z_cache: Dict[int, torch.Tensor] = {}
+    h_cache: Dict[int, torch.Tensor] = {}
+    hidden_cache: Dict[int, torch.Tensor] = {}
+    handles = []
+
+    def make_hook(idx: int):
+        def hook(module, inputs, output):
+            # Gather on the accelerator and transfer once after the forward
+            # pass. Calling .cpu() here synchronizes every layer and leaves the
+            # GPU idle between blocks.
+            z_cache[idx] = _gather_token_states(
+                inputs[0].detach(), positions, attention_mask
+            ).float()
+            h_cache[idx] = _gather_token_states(output.detach(), positions, attention_mask).float()
+            return output
+
+        return hook
+
+    def make_hidden_hook(idx: int):
+        def hook(module, inputs, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            hidden_cache[idx] = _gather_token_states(
+                hidden.detach(), positions, attention_mask
+            ).float()
+            return output
+
+        return hook
+
+    for i in layers:
+        handles.append(get_ffn_output_proj(blocks[i], adapter).register_forward_hook(make_hook(i)))
+    if capture_hidden:
+        for i in range(len(blocks)):
+            handles.append(blocks[i].register_forward_hook(make_hidden_hook(i)))
+    forward = dict(tokens)
+    if capture_attention:
+        forward["output_attentions"] = True
+    try:
+        out = model(**forward)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    col_norms_dev = {i: col_norms[i].to(positions.device) for i in layers}
+    cett_parts = []
+    for i in layers:
+        z = z_cache[i].reshape(batch * positions.shape[1], -1)
+        h = h_cache[i].reshape(batch * positions.shape[1], -1)
+        cett_parts.append(torch.abs(z) * col_norms_dev[i] / (h.norm(dim=-1, keepdim=True) + 1e-8))
+    cett = torch.cat(cett_parts, dim=-1).float().cpu()
+
+    logits = out.logits[b_idx, positions]
+    result = {
+        "cett": cett,
+        "logits": logits.reshape(batch * positions.shape[1], -1).float().cpu(),
+    }
+    if capture_hidden:
+        hidden = torch.stack(
+            [hidden_cache[i].reshape(batch * positions.shape[1], -1) for i in range(len(blocks))]
+        )
+        result["hidden_states"] = list(hidden.float().cpu())
+    if capture_attention:
+        attentions = getattr(out, "attentions", None)
+        if not attentions:
+            raise RuntimeError("model returned no attention weights; use eager attention")
+        result["attentions"] = [item.detach().float().cpu() for item in attentions]
+    return result
+
+
+def extract_cett_masked(
+    model,
+    tokens,
+    positions,
+    layers,
+    col_norms,
+    adapter,
+    capture_hidden=False,
+    capture_attention=False,
+):
+    return extract_cett(
+        model,
+        tokens,
+        positions,
+        layers,
+        col_norms,
+        adapter,
+        capture_hidden,
+        capture_attention,
+    )
+
+
+def extract_cett_causal(
+    model,
+    tokens,
+    positions,
+    layers,
+    col_norms,
+    adapter,
+    capture_hidden=False,
+    capture_attention=False,
+):
+    return extract_cett(
+        model,
+        tokens,
+        positions,
+        layers,
+        col_norms,
+        adapter,
+        capture_hidden,
+        capture_attention,
+    )
+
+
+@torch.inference_mode()
+def score_ref_alt(model, tokens_ref, tokens_alt, position: int, ref_id: int, alt_id: int) -> float:
+    """Return log p(alt) - log p(ref) at one token position."""
+    ref_logits = model(**tokens_ref).logits[0, position].float()
+    alt_logits = model(**tokens_alt).logits[0, position].float()
+    ref_logp = torch.log_softmax(ref_logits, dim=-1)
+    alt_logp = torch.log_softmax(alt_logits, dim=-1)
+    return float(alt_logp[alt_id] - ref_logp[ref_id])

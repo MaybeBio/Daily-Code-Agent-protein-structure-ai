@@ -1,0 +1,130 @@
+# The production training recipe at the 170M mini-prod horizon (#121: 1M stable + 200k
+# decay), stated as overrides on top of the packaged defaults (src/oplm/configs/train/base.yaml
+# and the model preset). Token mode: the global batch is train.tokens_per_step; per-device
+# batch and accumulation are derived from slurm.max_batch_tokens. Usable on its own:
+#   oplm slurm generate --config configs/scaling.yaml --preset 170M --out jobs/170M
+# `oplm sweep scale` merges the confirmed muP winner into this file before generating.
+# Cluster paths, partition and container are placeholders: edit them for your site.
+
+model:
+  max_position_embeddings: 2048
+  packed_attention: flex
+  residual_gate: none
+
+train:
+  # Best LR for 1.2M steps at 4M tok/step, from the LR-vs-length power law (docs/mup-lr.md,
+  # *LR vs training length*); the 24k funnel value is 0.0063. PENDING(#70): production
+  # (~10M-step) LR, ~0.0009-0.0012.
+  lr: 0.002
+  weight_decay_to_init: 0.1
+  tokens_per_step: 4194304
+  # Per-device micro-batch (170M mini-prod: 65536 x 64 GPUs = tokens_per_step, accumulation 1).
+  # batch_tokens x GPUs x accumulation must equal tokens_per_step (2^22), so node counts are
+  # powers of two (32 nodes: batch_tokens 16384).
+  # `oplm slurm generate` renders this value as-is for every preset; it does not read
+  # slurm.max_batch_tokens (only `oplm sweep` does). For another preset pass
+  # train.batch_tokens=<slurm.max_batch_tokens[preset]> on the generate command line.
+  batch_tokens: 65536
+  scheduler: wsd_linear
+  # Mini-prod horizon: 2k warmup + 998k stable + 200k decay (20% of stable) = 1.2M max_steps.
+  # The decay runs as a branch off checkpoint-1000000 with the anneal mix (docs/data.md);
+  # rendered as-is, the run decays on the stable mix. PENDING(#70): production horizon (~10M).
+  # Keep warmup_steps + stable_steps strictly less than max_steps so the decay phase exists
+  # (the sweep-phase convention of stable_steps = max_steps - warmup_steps is for short proxy
+  # runs and does not belong here).
+  max_steps: 1200000
+  stable_steps: 998000
+  warmup_steps: 2000
+  save_every: 5000
+  # Retain a permanent checkpoint every 50k steps, exempt from save_total_limit rotation.
+  keep_every_n_steps: 50000
+  # Resume from the newest committed checkpoint under output_dir on every restart, so a
+  # requeue after preemption continues training instead of restarting from step 0.
+  auto_resume: true
+  # Must be an absolute path on shared storage (all nodes write checkpoints here).
+  output_dir: /path/to/oplm-runs/scaling
+  parallelism: ddp
+  compile: true
+  compile_dynamic: false
+
+data:
+  pack_sequences: true
+  train:
+    # PENDING(#61): paths become the published training-set layout.
+    # Stable-phase mix (#58). Rows, not tokens (0.05 rows ≈ 12% tokens).
+    uniref70:
+      path: /path/to/oplm-training-data/uniref70/train
+      fraction: 0.05
+    deepclust70:
+      path: /path/to/oplm-training-data/deepclust70/train
+      fraction: 0.95
+  eval:
+    # Held-out uniref70 clusters, 5,000 per stratum (docs/data.md, *Held-out sequences*).
+    uniref70_singletons:
+      path: /path/to/oplm-training-data/uniref70/eval_singletons.parquet
+      type: sequence
+      every: {steps: 500}
+    uniref70_gte2:
+      path: /path/to/oplm-training-data/uniref70/eval_gte2.parquet
+      type: sequence
+      every: {steps: 500}
+    # Antibody CDR3 evals (docs/evaluation.md, *antibody_cdr3*) from
+    # brineylab/oplm-antibody-sequences tag v2.0.0: antibody_cdrh3 is the heavy-chain
+    # CDR3-identity holdout (read its *_heavy metrics); the other two are held-out AntiRef90
+    # clusters. Cheap (~61k short forwards per file), so one cadence serves the stable phase
+    # and the antibody anneal (#78).
+    antibody_cdrh3:
+      path: /path/to/oplm-antibody-sequences/eval_cdrh3.parquet
+      type: antibody_cdr3
+      every: {steps: 5000}
+    antibody_singletons:
+      path: /path/to/oplm-antibody-sequences/eval_singletons.parquet
+      type: antibody_cdr3
+      every: {steps: 5000}
+    antibody_gte2:
+      path: /path/to/oplm-antibody-sequences/eval_gte2.parquet
+      type: antibody_cdr3
+      every: {steps: 5000}
+    # Structure evals (contact precision@L), published as brineylab/oplm-structure-evals.
+    pdb40:
+      path: /path/to/oplm-structure-evals/pdb40_256
+      type: structure
+      coevolution: /path/to/oplm-structure-evals/coevolution
+      every: {steps: 5000}
+    pdb40_2048:
+      path: /path/to/oplm-structure-evals/pdb40_2048
+      type: structure
+      coevolution: /path/to/oplm-structure-evals/coevolution
+      every: {steps: 50000}
+    cameo:
+      path: /path/to/oplm-structure-evals/cameo_256
+      type: structure
+      coevolution: /path/to/oplm-structure-evals/coevolution
+      every: {steps: 5000}
+    casp:
+      path: /path/to/oplm-structure-evals/casp15_16
+      type: structure
+      coevolution: /path/to/oplm-structure-evals/coevolution
+      every: {steps: 5000}
+
+slurm:
+  partition: gpu
+  time_limit:
+    default: "168:00:00"
+  cpus_per_task: 128
+  gpus_per_node: 8
+  exclusive: true
+  mem: "0"
+  log_dir: /path/to/logs
+  env_file: /path/to/.env
+  container_image: /path/to/deeplearning.sqsh
+  container_mounts:
+    - /path/to/data:/path/to/data
+    - /tmp:/tmp
+  install: pip install oplm[train]
+  max_concurrent: 4
+  # Requeue budget for the rendered sbatch requeue wrapper.
+  max_requeues: 20
+  nodes: {170M: 8, 400M: 8, 800M: 16, 1B: 16}
+  # Per-device micro-batch cap in tokens; the 170M mini-prod runs 65536 with no accumulation.
+  max_batch_tokens: {170M: 65536, 400M: 32768, 800M: 16384, 1B: 16384}

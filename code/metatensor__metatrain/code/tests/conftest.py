@@ -1,0 +1,123 @@
+import logging
+import math
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from filelock import FileLock
+
+from metatrain.utils.architectures import get_default_hypers
+
+
+def pytest_xdist_auto_num_workers():
+    """Limit the number of workers used by pytest"""
+    n_processes = os.cpu_count() or 1
+    # We are setting the maximum to 1 because there
+    # are some tests that fail on the CI when using more
+    # than 1 worker. We need to investigate this and hopefully
+    # bring the maximum back to 12 (the previous value)
+    return min(1, math.ceil(n_processes * 0.8))
+
+
+MODEL_HYPERS = get_default_hypers("soap_bpnn")["model"]
+
+# -------------------------------
+#      PATHS TO RESOURCES
+# -------------------------------
+RESOURCES_PATH = Path(__file__).parent / "resources"
+
+DATASET_PATH_QM9 = RESOURCES_PATH / "qm9_reduced_100.xyz"
+DATASET_PATH_ETHANOL = RESOURCES_PATH / "ethanol_reduced_100.xyz"
+DATASET_PATH_CARBON = RESOURCES_PATH / "carbon_reduced_100.xyz"
+DATASET_PATH_QM7X = RESOURCES_PATH / "qm7x_reduced_100.xyz"
+DATASET_PATH_DOS = RESOURCES_PATH / "dos_100.xyz"
+DATASET_PATH_SPHERICAL = RESOURCES_PATH / "spherical_disk_dataset.zip"
+EVAL_OPTIONS_PATH = RESOURCES_PATH / "eval.yaml"
+OPTIONS_PATH = RESOURCES_PATH / "options.yaml"
+OPTIONS_PET_PATH = RESOURCES_PATH / "options-pet.yaml"
+OPTIONS_EXTRA_DATA_PATH = RESOURCES_PATH / "options-extra-data.yaml"
+OPTIONS_SPHERICAL_PATH = RESOURCES_PATH / "options-spherical.yaml"
+
+
+# -------------------------------
+#    PATHS TO TRAINED MODELS
+# -------------------------------
+# These files are generated from training on each test run
+# and take some time to generate. Therefore, we make them a
+# fixture so that they are generated lazily only if there
+# is a test that requires them. Since we support parallel
+# test runs, we use the unique identifier for the test run to
+# so that the multiple workers do not replicate work and wait
+# for each other.
+def _find_bash() -> str:
+    """Find a working bash executable.
+
+    On Windows, avoids WSL bash (C:\\Windows\\System32\\bash.exe) and looks
+    for Git Bash instead.
+    """
+    if sys.platform != "win32":
+        return "bash"
+    # Try common Git for Windows installation paths first
+    for candidate in [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+    ]:
+        if os.path.exists(candidate):
+            return candidate
+    # Fall back to shutil.which, but skip the WSL stub in System32
+    bash = shutil.which("bash")
+    if bash and "system32" not in bash.lower():
+        return bash
+    raise RuntimeError(
+        "Could not find Git Bash on Windows. Please install Git for Windows."
+    )
+
+
+def ensure_path(mode: str) -> Path:
+    """Checks if the path for a model exists, and if not
+    runs the training script to generate it."""
+    path = RESOURCES_PATH / f"train_{mode}" / f"model-{mode}.pt"
+    if path.exists():
+        return path
+
+    # Use a file lock to serialize access across xdist workers, ensuring only
+    # one worker trains at a time. FileLock is released automatically on process
+    # exit, so it cannot leave stale locks behind.
+    lock_path = RESOURCES_PATH / f"{mode}.trainlock"
+    with FileLock(str(lock_path)):
+        # Re-check after acquiring the lock — another worker may have generated
+        # the model while we were waiting.
+        if path.exists():
+            return path
+
+        result = subprocess.run(
+            [_find_bash(), str(RESOURCES_PATH / "run_trainings.sh"), mode],
+            stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE,
+        )
+
+        if result.returncode != 0:
+            logging.error(
+                f"Error generating model for mode {mode}"
+                f"Training script output:\n{result.stdout.decode()}",
+            )
+            raise RuntimeError(f"Failed to generate model for mode {mode}")
+    return path
+
+
+@pytest.fixture(scope="session")
+def MODEL_PATH() -> Path:
+    return ensure_path("32-bit")
+
+
+@pytest.fixture(scope="session")
+def MODEL_PATH_64_BIT() -> Path:
+    return ensure_path("64-bit")
+
+
+@pytest.fixture(scope="session")
+def MODEL_PATH_PET() -> Path:
+    return ensure_path("pet")

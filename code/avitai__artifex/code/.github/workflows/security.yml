@@ -1,0 +1,67 @@
+name: Security
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer push to a pull request cancels its superseded run; a push to main always completes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Artifex
+        uses: ./.github/actions/setup-artifex
+        with:
+          python-version: "3.12"
+          cache-suffix: security
+          linux-editable-target: ".[dev]"
+
+      # Every extra and dependency group the lock resolves, in groups that respect
+      # [tool.uv] conflicts, each audited by a pinned pip-audit against both its PyPI and
+      # OSV services with a fresh advisory cache. Ignored advisories and their reasons would
+      # live in [tool.substrax.audit-lock.ignore] in pyproject.toml; the action also fails on
+      # an ignore no advisory matches any more.
+      - name: Audit the locked dependencies
+        uses: avitai/substrax/.github/actions/audit-lock@66ea9c185db08074b91e1da55a5c34748ec19a67
+
+      # The scans run whatever the audit found, so a red job names every scan that failed.
+      - name: Run security scans
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bandit_status=0
+          detect_secrets_status=0
+
+          uv run --locked bandit -c pyproject.toml -r src/artifex/ -f json -o bandit-report.json \
+            || bandit_status=$?
+
+          uv run --locked detect-secrets scan --baseline .secrets.baseline \
+            > detect-secrets-report.json || detect_secrets_status=$?
+
+          if [[ "$bandit_status" -ne 0 || "$detect_secrets_status" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Upload security report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-report
+          path: |
+            bandit-report.json
+            detect-secrets-report.json

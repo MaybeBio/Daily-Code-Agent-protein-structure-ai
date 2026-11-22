@@ -1,0 +1,1004 @@
+pub mod about;
+pub mod binding;
+pub mod command_files;
+pub mod external_tools;
+pub mod ff_params;
+mod flex_lists;
+pub mod mol_db;
+pub mod pharmacophore;
+pub mod protein_comparison;
+pub mod protein_design;
+mod protein_res_management;
+mod quantum_chem;
+pub(in crate::ui) mod rama_plot;
+pub mod reactions;
+#[cfg(feature = "synthesis")]
+mod reactions_synthesis;
+pub mod recent_files;
+pub mod selections;
+mod settings;
+pub(crate) mod tool_runner;
+
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+
+use bio_apis::{amber_geostd, rcsb};
+use egui::{Color32, Context, Id, Pos2, RichText, ScrollArea, TextEdit, Ui, Window};
+use graphics::{EngineUpdates, Scene};
+use lin_alg::f64::Vec3;
+use mol_defs::molecules::{
+    MolGenericRef, MolType,
+    common::{MolVisibility, MoleculeCommon},
+};
+use tool_runner::{ToolWindowKind, tool_window};
+
+use crate::{
+    button, cam,
+    cam::{MolCameraTarget, move_cam_to_mol},
+    external_tools::remote::{self, ComputeTarget},
+    file_io::download_mols::load_atom_coords_rcsb,
+    label,
+    mol_alignment::run_alignment,
+    screening::screen_by_alignment,
+    state::{MetadataTarget, State},
+    ui::{
+        COL_SPACING, COLOR_ACTION, COLOR_ACTIVE, COLOR_HIGHLIGHT, COLOR_INACTIVE, COLOR_REMOVE,
+        ROW_SPACING, load_all_idents_button,
+        misc::selector,
+        panels::{
+            md_viewer,
+            mol_data::{metadata, seq_metadata},
+        },
+        util::{Idents, edit_mol_name, list_idents},
+    },
+    util::{RedrawFlags, handle_err},
+};
+
+/// Where popups start, unless they override it.
+const POPUP_POS: Pos2 = Pos2::new(300., 300.);
+
+/// Metadata values and identifiers (e.g. InChI, SMILES) can be very long; wrap them at this
+/// width instead of letting the popup grow to the width of the application window.
+const METADATA_MAX_WIDTH: f32 = 600.;
+
+/// Initial width of the metadata popup. (egui's default for resizable windows is 320.)
+const METADATA_INIT_WIDTH: f32 = 450.;
+
+/// Widths of the metadata editor's key and value text boxes. They must sum to less than
+/// `METADATA_MAX_WIDTH`, leaving room for the row's delete button.
+const KEY_EDIT_WIDTH: f32 = 160.;
+const VAL_EDIT_WIDTH: f32 = 340.;
+
+/// Initial width of the force-field parameter editor.
+const FF_PARAMS_WIDTH: f32 = 550.;
+
+/// The tool shown in the "Protein design" window.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ProteinToolsTab {
+    #[default]
+    Rfd3,
+    PredictSequence,
+    PredictStructure,
+    Binding,
+}
+
+/// Show one popup window, returning whether it should stay open.
+///
+/// The close button is egui's own, drawn at the right of the title bar of any window given an
+/// `open` flag. It sits in the title bar rather than in the window's contents, so it costs the
+/// contents no space and no layout of their own.
+///
+/// That flag cannot be the `PopupState` field itself: the contents borrow `state` too, and the two
+/// borrows would overlap. So it is a local the caller folds back into its field, and only a close
+/// folds back -- contents that close their own window are left to do so.
+fn show_popup(window: Window<'_>, ctx: &Context, contents: impl FnOnce(&mut Ui)) -> bool {
+    let mut open = true;
+    window.open(&mut open).show(ctx, contents);
+    open
+}
+
+/// Based on popup state, shows popups. This is the entry point for all popups.
+pub(in crate::ui) fn load_popups(
+    state: &mut State,
+    scene: &mut Scene,
+    ui: &mut Ui,
+    redraw: &mut RedrawFlags,
+    updates: &mut EngineUpdates,
+) {
+    external_tools::process_finished_jobs(state);
+
+    if state.ui.popup.parquet_db
+        || state.ui.popup.pharmacophore_screening
+        || state.ui.popup.alignment_screening
+    {
+        crate::threads::start_builtin_mol_db_load(state);
+    }
+    binding::poll(state, ui);
+    protein_comparison::poll(state, ui, redraw);
+    if state.ui.popup.protein_comparison {
+        state.ui.popup.protein_comparison = show_popup(
+            popup("Protein superposition and comparison").default_width(760.),
+            ui.ctx(),
+            |ui| protein_comparison::editor(state, scene, ui, redraw, updates),
+        );
+    }
+    if state.ui.popup.selections {
+        state.ui.popup.selections = show_popup(
+            popup("Selections and representation layers").default_width(700.),
+            ui.ctx(),
+            |ui| selections::editor(state, ui, redraw),
+        );
+    }
+    reactions::poll_downloads(state, scene, redraw, updates);
+    if crate::reactions::poll(state) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
+    }
+    if state.ui.popup.reactions {
+        let open = show_popup(
+            popup("Rhea reactions")
+                .default_width(920.0)
+                .min_width(840.0)
+                .default_height(800.0)
+                .max_height(1_600.0),
+            ui.ctx(),
+            |ui| reactions::reactions_window(&mut state.ui.reactions, &mut state.to_save, ui),
+        );
+        state.ui.popup.reactions &= open;
+    }
+
+    #[cfg(feature = "synthesis")]
+    if state.ui.popup.synthesis_reactions {
+        let open = show_popup(
+            popup("Synthesis reaction library")
+                .default_width(980.0)
+                .min_width(880.0)
+                .default_height(820.0)
+                .max_height(1_600.0),
+            ui.ctx(),
+            |ui| {
+                reactions_synthesis::synthesis_reactions_window(
+                    &mut state.ui.synthesis_reactions,
+                    &mut state.to_save,
+                    ui,
+                )
+            },
+        );
+        state.ui.popup.synthesis_reactions &= open;
+    }
+
+    if state.ui.popup.show_get_geostd {
+        let open = show_popup(popup("Load force-field parameters"), ui.ctx(), |ui| {
+            get_geostd(state, scene, updates, ui);
+        });
+        state.ui.popup.show_get_geostd &= open;
+    }
+
+    if state.ui.popup.show_associated_structures {
+        let open = show_popup(popup("Associated structures"), ui.ctx(), |ui| {
+            associated_structures(state, scene, updates, &mut redraw.peptide, ui);
+        });
+        state.ui.popup.show_associated_structures &= open;
+    }
+
+    if state.ui.popup.alignment {
+        let open = show_popup(popup("Molecule alignment"), ui.ctx(), |ui| {
+            alignment(state, scene, &mut redraw.ligand, updates, ui);
+        });
+        state.ui.popup.alignment &= open;
+    };
+
+    if state.ui.popup.alignment_screening {
+        let open = show_popup(popup("Alignment screening"), ui.ctx(), |ui| {
+            alignment_screening(state, ui);
+        });
+        state.ui.popup.alignment_screening &= open;
+    }
+
+    if state.ui.popup.show_settings {
+        let open = show_popup(popup("Settings"), ui.ctx(), |ui| {
+            settings::settings(state, scene, ui, redraw, updates);
+        });
+        state.ui.popup.show_settings &= open;
+    }
+
+    if state.ui.popup.recent_files {
+        // The number of rows per page flexes to fill the window's height.
+        let window = popup("Recent files").default_height(480.);
+        let open = show_popup(window, ui.ctx(), |ui| {
+            recent_files::recent_files_popup(state, scene, ui, updates);
+        });
+        state.ui.popup.recent_files &= open;
+    }
+
+    if state.ui.popup.rama_plot
+        && let Some(mol) = state
+            .peptide_for_tools_i()
+            .and_then(|i| state.peptides.get(i))
+    {
+        let open = show_popup(popup("Ramachandran plot"), ui.ctx(), |ui| {
+            rama_plot::plot_rama(&mol.residues, &mol.common.ident, ui);
+        });
+        state.ui.popup.rama_plot &= open;
+    }
+
+    if state.ui.popup.pharmacophore_boolean {
+        let open = show_popup(popup("Pharmacophore (boolean)"), ui.ctx(), |ui| {
+            pharmacophore::pharmacophore_boolean_window(state, ui);
+        });
+        state.ui.popup.pharmacophore_boolean &= open;
+    }
+
+    if state.ui.popup.pharmacophore_screening {
+        let open = show_popup(popup("Pharmacophore screening"), ui.ctx(), |ui| {
+            pharmacophore::pharmacophore_screen(state, scene, ui, updates);
+        });
+        state.ui.popup.pharmacophore_screening &= open;
+    }
+
+    if let Some(target) = state.ui.popup.metadata {
+        let open = show_popup(
+            popup("Metadata")
+                .default_width(METADATA_INIT_WIDTH)
+                .max_width(METADATA_MAX_WIDTH),
+            ui.ctx(),
+            |ui| match target {
+                MetadataTarget::Mol(mol_type, i) => metadata(mol_type, i, state, redraw, ui),
+                MetadataTarget::Seq(i) => seq_metadata(i, state, ui),
+            },
+        );
+        if !open {
+            state.ui.popup.metadata = None;
+        }
+    }
+
+    if state.ui.popup.lig_pocket_creation {
+        let open = show_popup(popup("Residue Management"), ui.ctx(), |ui| {
+            protein_res_management::lig_pocket_from_het_res(
+                state,
+                scene,
+                ui,
+                updates,
+                &mut redraw.peptide,
+            );
+        });
+        state.ui.popup.lig_pocket_creation &= open;
+    }
+
+    if state.ui.popup.lig_attach.is_some() {
+        let open = show_popup(popup("Add ligand to protein"), ui.ctx(), |ui| {
+            protein_res_management::lig_attach_popup(state, scene, ui, updates);
+        });
+        if !open {
+            state.ui.popup.lig_attach = None;
+        }
+    }
+
+    if state.ui.popup.parquet_db {
+        let open = show_popup(popup("Molecule databases"), ui.ctx(), |ui| {
+            mol_db::parquet_db(state, scene, updates, ui);
+        });
+        state.ui.popup.parquet_db &= open;
+    }
+
+    if state.ui.popup.md_mol_set_editor {
+        let open = show_popup(popup("MD molecule set editor"), ui.ctx(), |ui| {
+            md_viewer::md_mol_set_editor(state, scene, updates, ui, redraw);
+        });
+        state.ui.popup.md_mol_set_editor &= open;
+    }
+
+    if state.ui.popup.ff_params {
+        let (dx, dy) = ff_params::POPUP_OFFSET;
+        let pos = Pos2::new(POPUP_POS.x + dx, POPUP_POS.y + dy);
+
+        let open = show_popup(
+            popup("Force-field parameter editor")
+                .default_pos(pos)
+                .default_width(FF_PARAMS_WIDTH),
+            ui.ctx(),
+            |ui| {
+                ff_params::ff_param_editor(state, ui);
+            },
+        );
+        state.ui.popup.ff_params &= open;
+    }
+
+    if state.ui.popup.protein_tools {
+        // An explicit ID, as the dormant `protein_design` window has the same title.
+        let open = show_popup(
+            popup("Protein design")
+                .id(Id::new("protein_tools"))
+                .default_width(760.0)
+                .default_height(900.0),
+            ui.ctx(),
+            |ui| protein_tools(state, scene, ui, redraw, updates),
+        );
+        state.ui.popup.protein_tools &= open;
+    }
+
+    if state.ui.popup.quantum_chem {
+        let open = show_popup(
+            popup("Quantum chemistry")
+                .default_width(760.0)
+                .default_height(700.0),
+            ui.ctx(),
+            |ui| quantum_chem::window(state, scene, updates, redraw, ui),
+        );
+        state.ui.popup.quantum_chem &= open;
+    }
+
+    if state.ui.popup.external_tools {
+        let open = show_popup(
+            popup("Third-party tools")
+                .default_width(620.0)
+                .max_height(1000.0),
+            ui.ctx(),
+            |ui| {
+                external_tools::external_tools_window(state, ui);
+            },
+        );
+        state.ui.popup.external_tools &= open;
+    }
+
+    if state.ui.popup.protein_design {
+        let open = show_popup(popup("Protein design"), ui.ctx(), |ui| {
+            protein_design::protein_design_window(state, ui);
+        });
+        state.ui.popup.protein_design &= open;
+    }
+
+    if state.ui.popup.about {
+        let open = show_popup(popup("About"), ui.ctx(), |ui| {
+            about::about_window(state, ui);
+        });
+        state.ui.popup.about &= open;
+    }
+}
+
+/// The "Protein design" window's contents: a tab selector, then the selected tool.
+fn protein_tools(
+    state: &mut State,
+    scene: &mut Scene,
+    ui: &mut Ui,
+    redraw: &mut RedrawFlags,
+    updates: &mut EngineUpdates,
+) {
+    ui.horizontal(|ui| {
+        if let Some(tab) = selector(
+            ui,
+            state.ui.popup.protein_tools_tab,
+            &[
+                (
+                    ProteinToolsTab::Rfd3,
+                    "RFDiffusion3",
+                    "Generate protein backbones with RFdiffusion3: unconditional, around a \
+                    target, ligand, nucleic acid, or motif, or under a point group. Feed the \
+                    result to ProteinMPNN to get a sequence.",
+                ),
+                (
+                    ProteinToolsTab::PredictStructure,
+                    "Predict structure",
+                    "Predict a structure from an amino-acid or nucleotide sequence.",
+                ),
+                (
+                    ProteinToolsTab::PredictSequence,
+                    "Predict sequence",
+                    "Predict amino-acid sequences for a protein backbone using ProteinMPNN.",
+                ),
+                (
+                    ProteinToolsTab::Binding,
+                    "Binding",
+                    "Inspect protein–ligand contacts and clashes, or predict a complex and \
+                    affinity with Boltz-2.",
+                ),
+            ],
+        ) {
+            state.ui.popup.protein_tools_tab = tab;
+        }
+
+        ui.add_space(COL_SPACING * 2.);
+        compute_selector(
+            ui,
+            &mut state.to_save.compute_target,
+            "Run tools on this computer. Each must be installed, and most need an NVIDIA GPU.",
+        );
+    });
+
+    if state.to_save.compute_target == ComputeTarget::Remote {
+        remote_token_ui(ui, &mut state.to_save.athanor_api_token);
+    }
+
+    ui.separator();
+
+    match state.ui.popup.protein_tools_tab {
+        ProteinToolsTab::Rfd3 => {
+            tool_window(state, ToolWindowKind::BackboneDesign, scene, updates, ui);
+        }
+        ProteinToolsTab::PredictSequence => {
+            tool_window(state, ToolWindowKind::SequenceDesign, scene, updates, ui);
+        }
+        ProteinToolsTab::PredictStructure => {
+            tool_window(
+                state,
+                ToolWindowKind::StructurePrediction,
+                scene,
+                updates,
+                ui,
+            );
+        }
+        ProteinToolsTab::Binding => {
+            // The tall one. Scrolled here, not by the window, to keep the tabs in view.
+            flex_lists::page(ui, "protein_tools_binding", |ui, lists| {
+                binding::editor(state, scene, lists, ui, redraw, updates);
+            });
+        }
+    }
+}
+
+fn compute_selector(ui: &mut Ui, target: &mut ComputeTarget, local_help: &str) {
+    ui.label("Compute");
+    if let Some(selected) = selector(
+        ui,
+        *target,
+        &[
+            (
+                ComputeTarget::Local,
+                ComputeTarget::Local.label(),
+                local_help,
+            ),
+            (
+                ComputeTarget::Remote,
+                ComputeTarget::Remote.label(),
+                "Send inputs to athanortools.com and download the results here.",
+            ),
+        ],
+    ) {
+        *target = selected;
+    }
+}
+
+fn remote_token_ui(ui: &mut Ui, token: &mut String) {
+    ui.horizontal(|ui| {
+        let help = "Optional. Runs without a token are anonymous, and limited per day. Make \
+            one on your athanortools.com dashboard.";
+
+        ui.label("athanortools.com API token").on_hover_text(help);
+        ui.add(
+            TextEdit::singleline(token)
+                .password(true)
+                .hint_text("Optional")
+                .desired_width(220.),
+        )
+        .on_hover_text(help);
+        ui.hyperlink_to("Get a token", remote::DASHBOARD_URL);
+    });
+}
+
+fn get_geostd(
+    state: &mut State,
+    scene: &mut Scene,
+    engine_updates: &mut EngineUpdates,
+    ui: &mut Ui,
+) {
+    let mut load_ff = false;
+    let mut load_frcmod = false;
+    // These vars avoid dbl borrow.
+    // todo: Is this always the lig you want?
+    if let Some(lig) = &state.active_mol() {
+        if let MolGenericRef::Small(l) = lig {
+            load_ff = !l.ff_params_loaded;
+            load_frcmod = !l.frcmod_loaded;
+
+            // let Some(lig) = state.active_mol_mut() else {
+            //     return;
+            // };
+            let mut msg = String::from("Not ready for dynamics: ");
+
+            if !l.ff_params_loaded {
+                msg += "No FF params or partial charges are present on this ligand."
+            }
+
+            // if !lig.frcmod_loaded {
+            //     msg += "No FRCMOD parameters loaded for this ligand."
+            // }
+
+            ui.label(RichText::new(msg).color(Color32::LIGHT_RED));
+        }
+
+        ui.add_space(ROW_SPACING);
+
+        // todo: What about cases where a SDF from pubchem or drugbank doesn't include teh name used by Amber?
+        if ui.button("Check online").clicked() {
+            // let Some(lig) = state.ligand.as_mut() else {
+            //     return;
+            // };
+
+            match amber_geostd::find_mols(&lig.common().ident) {
+                Ok(data) => {
+                    state.ui.popup.get_geostd_items = data;
+                }
+                Err(e) => handle_err(
+                    &mut state.ui,
+                    format!("Problem loading mol data online: {e:?}"),
+                ),
+            }
+        }
+
+        // This clone is annoying; db borrow.
+        let items = state.ui.popup.get_geostd_items.clone();
+        for mol_data in items {
+            if ui
+                .button(
+                    RichText::new(format!("Load params for {}", mol_data.ident_pdbe))
+                        .color(COLOR_HIGHLIGHT),
+                )
+                .clicked()
+            {
+                state.load_geostd_mol_data(
+                    &mol_data.ident_pdbe,
+                    load_ff,
+                    load_frcmod,
+                    engine_updates,
+                    scene,
+                );
+
+                state.ui.popup.show_get_geostd = false;
+            }
+        }
+    }
+}
+
+fn associated_structures(
+    state: &mut State,
+    scene: &mut Scene,
+    engine_updates: &mut EngineUpdates,
+    redraw_peptide: &mut bool,
+    ui: &mut Ui,
+) {
+    let mut associated_structs = Vec::new();
+    if let Some(lig) = state.active_mol()
+        && let MolGenericRef::Small(l) = lig
+    {
+        // todo: I don't like this clone, but not sure how else to do it.
+        associated_structs = l.associated_structures.clone();
+    }
+
+    if state.active_mol().is_some() {
+        for s in &associated_structs {
+            ui.horizontal(|ui| {
+                if ui
+                    .button(RichText::new(&s.pdb_id).color(COLOR_HIGHLIGHT))
+                    .clicked()
+                {
+                    rcsb::open_overview(&s.pdb_id);
+                }
+                ui.add_space(COL_SPACING);
+
+                if ui
+                    .button(RichText::new("Open this protein").color(COLOR_HIGHLIGHT))
+                    .clicked()
+                {
+                    load_atom_coords_rcsb(&s.pdb_id, state, scene, engine_updates, redraw_peptide);
+                }
+            });
+
+            ui.label(RichText::new(&s.description));
+
+            ui.add_space(ROW_SPACING);
+        }
+    }
+}
+
+fn alignment_screening(state: &mut State, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        ui.label("Alignment screening uses the active Parquet database.");
+
+        if let Some(mol_count) = state.active_mol_db().map(|db| db.index_meta.len()) {
+            ui.add_space(COL_SPACING);
+            ui.label(format!("({mol_count} molecules)"));
+            ui.add_space(COL_SPACING);
+
+            if ui
+                .button(RichText::new("Run screening").color(COLOR_ACTION))
+                .clicked()
+            {
+                // Checked immediately above; the button can't be drawn without an active DB.
+                let loaded = state.active_mol_db().map(|db| db.load_all());
+
+                match loaded.unwrap_or_else(|| Ok(Vec::new())) {
+                    Ok(mut mols) => {
+                        for mol in &mut mols {
+                            mol.update_characterization();
+                        }
+
+                        state.volatile.alignment.mols_passed_screening = Vec::new();
+
+                        if mols.len() >= 2 {
+                            let template = mols[0].clone();
+                            let score_thresh = 60.;
+                            let size_diff_thresh = 0.4;
+
+                            let result = screen_by_alignment(
+                                &template,
+                                &mols,
+                                score_thresh,
+                                size_diff_thresh,
+                            );
+
+                            let max_stored = 10_000;
+                            for (i, _score) in result.into_iter().take(max_stored) {
+                                state
+                                    .volatile
+                                    .alignment
+                                    .mols_passed_screening
+                                    .push(mols[i].clone());
+                            }
+                        }
+                    }
+                    Err(e) => handle_err(
+                        &mut state.ui,
+                        format!("Failed to load molecules from database: {e}"),
+                    ),
+                }
+            }
+        } else {
+            ui.add_space(COL_SPACING);
+            ui.label("No database selected.");
+        }
+    });
+
+    if !state.volatile.alignment.mols_passed_screening.is_empty() {
+        ui.label("Results:");
+        // todo: Scroll area
+        let max_to_show = 20;
+        let mut shown = 0;
+
+        for mol in &state.volatile.alignment.mols_passed_screening {
+            // todo: Load this to state when clicked etc.
+            label!(
+                ui,
+                format!("- {}", mol.common.name(Some(&mol.idents))),
+                Color32::WHITE
+            );
+
+            shown += 1;
+            if shown > max_to_show {
+                break;
+            }
+        }
+    }
+}
+
+/// What the metadata popup asks its caller to do, once the frame is drawn.
+pub(in crate::ui) struct MetadataPopupResult {
+    pub load_all_idents: bool,
+    /// `Some(None)` clears the override and restores the generated label.
+    pub name: Option<Option<String>>,
+    /// Set when the user changed a field: the molecule's metadata, rebuilt from the edit rows.
+    pub metadata: Option<HashMap<String, String>>,
+}
+
+/// What the metadata popup displays and edits: the parts of a molecule, or of a sequence, that
+/// it needs.
+pub(in crate::ui) struct MetadataSource<'a> {
+    /// For the heading.
+    pub display_name: &'a str,
+    /// The user-editable name. `None` if not set.
+    pub name: &'a Option<String>,
+    pub metadata: &'a HashMap<String, String>,
+    pub path: &'a Option<PathBuf>,
+}
+
+impl<'a> MetadataSource<'a> {
+    pub fn from_mol(mol: &'a MoleculeCommon, display_name: &'a str) -> Self {
+        Self {
+            display_name,
+            name: &mol.name,
+            metadata: &mol.metadata,
+            path: &mol.path,
+        }
+    }
+}
+
+pub(in crate::ui) fn metadata_popup(
+    editing: &mut bool,
+    edit_rows: &mut Vec<(String, String)>,
+    src: MetadataSource,
+    idents: Option<Idents>,
+    loading_idents: bool,
+    prefs_dir: &Path,
+    ui: &mut Ui,
+) -> MetadataPopupResult {
+    let mut result = MetadataPopupResult {
+        load_all_idents: false,
+        name: None,
+        metadata: None,
+    };
+
+    // Everything here is left-aligned and wrapping: a right-aligned or non-wrapping row would
+    // stretch the popup to the width available to it, instead of to the width its content needs.
+    ui.horizontal_wrapped(|ui| {
+        ui.heading(
+            RichText::new(format!("Metadata for {}", src.display_name)).color(Color32::WHITE),
+        );
+
+        ui.add_space(COL_SPACING);
+
+        let (color, text) = if *editing {
+            (COLOR_ACTIVE, "Disable editing")
+        } else {
+            (COLOR_INACTIVE, "Enable editing")
+        };
+
+        if button!(
+            ui,
+            text,
+            color,
+            "Enable or disable editing metadata fields."
+        )
+        .clicked()
+        {
+            *editing = !*editing;
+
+            if *editing {
+                // Sorted: a `HashMap`'s iteration order is arbitrary, and rows that jumped around
+                // between frames would be unusable to edit.
+                *edit_rows = src
+                    .metadata
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                edit_rows.sort_by(|a, b| a.0.cmp(&b.0));
+            } else {
+                edit_rows.clear();
+            }
+        }
+
+        ui.add_space(COL_SPACING);
+
+        // The online identifier lookup is for small molecules. Other molecule types still use
+        // this popup for their general metadata and identifiers, but must not offer it.
+        if matches!(idents, Some(Idents::Small(_))) && load_all_idents_button(ui, loading_idents) {
+            result.load_all_idents = true;
+        }
+    });
+
+    ScrollArea::vertical()
+        .min_scrolled_height(800.0)
+        .show(ui, |ui| {
+            if *editing {
+                metadata_editor(edit_rows, &src, idents, prefs_dir, &mut result, ui);
+                return;
+            }
+
+            if let Some(idents_) = idents {
+                ui.add_space(ROW_SPACING);
+                result.name = list_idents(Some(src.name), idents_, src.path, prefs_dir, ui);
+            } else {
+                result.name = edit_mol_name(src.name, ui);
+            }
+
+            ui.add_space(ROW_SPACING);
+
+            for (k, v) in src.metadata.iter() {
+                // Wrap long values instead of widening the popup to fit them on one line.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("{k}: ")));
+                    label!(ui, v.to_string(), Color32::WHITE);
+                });
+            }
+        });
+
+    result
+}
+
+/// Editable rows of key/value metadata fields, with controls to add and remove them. Sets
+/// `result.metadata` on any change, so the caller can apply it to the molecule.
+fn metadata_editor(
+    edit_rows: &mut Vec<(String, String)>,
+    src: &MetadataSource,
+    idents: Option<Idents>,
+    prefs_dir: &Path,
+    result: &mut MetadataPopupResult,
+    ui: &mut Ui,
+) {
+    result.name = edit_mol_name(src.name, ui);
+    ui.add_space(ROW_SPACING);
+
+    if let Some(idents_) = idents {
+        let _ = list_idents(None, idents_, src.path, prefs_dir, ui);
+        ui.add_space(ROW_SPACING);
+    }
+
+    let mut changed = false;
+    // Applied after the loop; removing a row while iterating it would shift the rows below.
+    let mut to_remove = None;
+
+    ui.horizontal(|ui| {
+        if button!(ui, "+", COLOR_ACTION, "Add a metadata field.").clicked() {
+            edit_rows.push((String::new(), String::new()));
+        }
+        ui.add_space(COL_SPACING);
+        label!(ui, "Fields with a blank name are discarded.", Color32::GRAY);
+    });
+
+    ui.add_space(ROW_SPACING);
+
+    for (i, (k, v)) in edit_rows.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            if ui
+                .add(TextEdit::singleline(k).desired_width(KEY_EDIT_WIDTH))
+                .changed()
+            {
+                changed = true;
+            }
+
+            // Multiline so long values wrap inside the popup instead of widening it; a single
+            // row tall, growing as needed.
+            if ui
+                .add(
+                    TextEdit::multiline(v)
+                        .desired_width(VAL_EDIT_WIDTH)
+                        .desired_rows(1),
+                )
+                .changed()
+            {
+                changed = true;
+            }
+
+            if button!(ui, "❌", COLOR_REMOVE, "Delete this field.").clicked() {
+                to_remove = Some(i);
+            }
+        });
+    }
+
+    if let Some(i) = to_remove {
+        edit_rows.remove(i);
+        changed = true;
+    }
+
+    if changed {
+        let mut metadata = HashMap::with_capacity(edit_rows.len());
+        for (k, v) in edit_rows.iter() {
+            // A blank key can't be stored; it's the state a newly-added row starts in. Duplicate
+            // keys collapse to the last one, which is also transient while a key is being typed.
+            if k.is_empty() {
+                continue;
+            }
+            metadata.insert(k.clone(), v.clone());
+        }
+
+        result.metadata = Some(metadata);
+    }
+}
+
+fn alignment(
+    state: &mut State,
+    scene: &mut Scene,
+    redraw_lig: &mut bool,
+    engine_updates: &mut EngineUpdates,
+    ui: &mut Ui,
+) {
+    ui.label("Alignment:");
+
+    if !state.volatile.alignment.results.is_empty() {
+        let res = &state.volatile.alignment.results[0];
+        ui.label("Results:");
+
+        label!(
+            ui,
+            format!(
+                "Score: {:.2} E template: {:.2} E query: {:.2} Vol: {:.2}",
+                res.score, res.avg_potential_e_template, res.avg_potential_e_query, res.volume
+            ),
+            Color32::WHITE
+        );
+    }
+
+    ui.add_space(ROW_SPACING);
+
+    ui.horizontal(|ui| {
+        let help_text = "If selected, the template atom will be allowed to take on different \
+                conformations based on its rotatable bonds. If not, only the query molecule will \
+                be flexible.";
+
+        ui.label("Treat the template molecule as flexible.")
+            .on_hover_text(help_text);
+        ui.checkbox(&mut state.volatile.alignment.flexible_template, "")
+            .on_hover_text(help_text);
+    });
+
+    ui.add_space(ROW_SPACING);
+
+    for (i, mol) in state.ligands.iter().enumerate() {
+        let mta = &mut state.volatile.alignment.mols_to_align;
+
+        let selected_pos = mta.iter().position(|&x| x == i);
+        let color = if selected_pos.is_some() {
+            COLOR_ACTIVE
+        } else {
+            COLOR_INACTIVE
+        };
+
+        if ui
+            .button(RichText::new(mol.common.name(Some(&mol.idents))).color(color))
+            .clicked()
+        {
+            match selected_pos {
+                Some(pos) => {
+                    // Toggle off.
+                    mta.swap_remove(pos);
+                }
+                None => {
+                    // Toggle on (cap at 2, avoid duplicates).
+                    match mta.len() {
+                        0 | 1 => mta.push(i),
+                        _ => {
+                            // Keep the most recent selection and add this as the newest:
+                            // [old, recent] -> [recent, i]
+                            mta[0] = mta[1];
+                            mta[1] = i;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ui.add_space(ROW_SPACING);
+    ui.separator();
+
+    if state.volatile.alignment.mols_to_align.len() == 2 && ui.button("Run alignment").clicked() {
+        run_alignment(state, &mut false);
+
+        // Set visualization settings to view the result.
+        state.ligands[state.volatile.alignment.mols_to_align[0]]
+            .common
+            .visibility = MolVisibility::Visible;
+
+        state.ligands[state.volatile.alignment.mols_to_align[1]]
+            .common
+            .visibility = MolVisibility::Visible;
+
+        state.ui.color_by_mol = true;
+
+        for (i, mol) in state.ligands.iter_mut().enumerate() {
+            // Required to make our snapshots work, in the current implementation.
+            mol.common.selected_for_md = if i == state.volatile.alignment.mols_to_align[1] {
+                Some(1)
+            } else {
+                None
+            };
+        }
+
+        *redraw_lig = true;
+
+        let i_mol = state.volatile.alignment.mols_to_align[0];
+        move_cam_to_mol(
+            MolCameraTarget::new(&state.ligands[i_mol].common, (MolType::Ligand, i_mol)),
+            &mut state.ui.cam_snapshot,
+            scene,
+            &mut state.volatile.orbit_center,
+            Vec3::new_zero(),
+            engine_updates,
+        );
+        cam::set_fog(state, &mut scene.camera);
+    }
+}
+
+/// Builds a window used to host a popup. Unlike a fixed `Popup`, an `egui::Window` behaves like
+/// a normal OS window: the user can drag it by its title bar and resize it from the edges. Egui
+/// tracks each window's position and size internally (keyed by `title`), so the geometry persists
+/// across frames without us storing it in `PopupState`. `title` doubles as the window's egui id,
+/// so it must be unique per popup.
+fn popup(title: &str) -> Window<'static> {
+    Window::new(title.to_owned())
+        .default_pos(POPUP_POS)
+        .movable(true)
+        .resizable(true)
+        .collapsible(true)
+        .constrain(true)
+}

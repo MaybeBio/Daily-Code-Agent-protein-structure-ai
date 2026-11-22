@@ -1,0 +1,9 @@
+import types
+
+form = "openff.Molecule"
+
+__all__ = [
+    name
+    for name, obj in globals().items()
+    if isinstance(obj, types.FunctionType) and name.startswith("set_")
+]

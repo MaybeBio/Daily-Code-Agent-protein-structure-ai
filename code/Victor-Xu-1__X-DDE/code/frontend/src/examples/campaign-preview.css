@@ -1,0 +1,44 @@
+.campaign-case-preview h3 {
+  margin-top: 0;
+  font-size: 16px;
+}
+.campaign-template-state {
+  margin-bottom: 20px;
+}
+.campaign-case-preview table {
+  width: 100%;
+  min-width: 0;
+  font-size: 13px;
+}
+.campaign-case-preview td {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.campaign-material-choice {
+  background: transparent;
+  border: 0;
+  color: var(--accent);
+  font: inherit;
+  padding: 4px 0;
+  text-align: left;
+  min-height: 36px;
+  cursor: pointer;
+}
+.campaign-material-choice:hover,
+.campaign-material-choice[aria-pressed="true"] {
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+.campaign-case-preview tr[data-selected] {
+  background: var(--accent-soft);
+}
+.campaign-material-inspector {
+  display: grid;
+  gap: 20px;
+}
+.studio-app .campaign-material-inspector .viewer-panel {
+  padding: 0;
+}
+.campaign-case-preview .help-trigger {
+  margin-top: 12px;
+}

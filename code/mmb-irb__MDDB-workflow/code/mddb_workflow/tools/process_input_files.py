@@ -1,0 +1,623 @@
+from mddb_workflow.utils.auxiliar import InputError, MISSING_TOPOLOGY, warn
+from mddb_workflow.utils.constants import CONVERTED_STRUCTURE, CONVERTED_TRAJECTORY, SKIPPED_TRAJECTORY
+from mddb_workflow.utils.constants import FILTERED, FILTERED_STRUCTURE, FILTERED_TRAJECTORY
+from mddb_workflow.utils.constants import IMAGED, IMAGED_STRUCTURE, IMAGED_TRAJECTORY, AUTO_IMAGE_FLAG
+from mddb_workflow.utils.constants import CORRECTED_STRUCTURE, CORRECTED_TRAJECTORY
+from mddb_workflow.utils.constants import INCOMPLETE_PREFIX, CG_ATOM_ELEMENT, SNAPSHOTS_FLAG
+from mddb_workflow.utils.constants import FAITH_BYPASS, BROKEN_PBC_FLAG, AUTOMATIC_FLAG, CHAINS_CHANGED_FLAG, STABLE_BONDS_FLAG
+from mddb_workflow.utils.file import File
+from mddb_workflow.utils.formats import is_amber_topology
+from mddb_workflow.utils.selections import Selection
+from mddb_workflow.utils.structures import Structure
+from mddb_workflow.utils.gmx_spells import count_xtc_frames, copy_xtc_frames, count_complete_xtc_frames
+from mddb_workflow.utils.arg_cksum import get_cksum_id
+from mddb_workflow.utils.type_hints import *
+
+from mddb_workflow.tools.check_inputs import check_input_files, FIXED_TOPOLOGY_EXCEPTION, FIXED_STRUCTURE_EXCEPTION
+from mddb_workflow.tools.conversions import convert
+from mddb_workflow.tools.filter_atoms import filter_atoms
+from mddb_workflow.tools.image_and_fit import image_and_fit, check_fitted_trajectory, is_imaging_needed
+from mddb_workflow.tools.get_charges import get_charges
+from mddb_workflow.tools.structure_corrector import structure_corrector
+from mddb_workflow.tools.get_bonds import find_safe_bonds, mine_topology_bonds
+
+
+def _prepare_incomplete_output(output_directory: str, output_filename: str) -> File:
+    """Return an intermediate file to be processed.
+    This prevents using an incomplete file in case the workflow is suddenly interrupted while processing.
+    """
+    incomplete_output_file = File(f'{output_directory}/{INCOMPLETE_PREFIX + output_filename}')
+    if incomplete_output_file.exists:
+        incomplete_output_file.remove()
+    return incomplete_output_file
+
+
+def _commit_incomplete_output(incomplete_output_file: File, output_file: File) -> None:
+    """Once processed, rename the file as completed.
+    If the processed file already exists then it means it is the input file.
+    """
+    if output_file.exists:
+        incomplete_output_file.remove()
+    else:
+        incomplete_output_file.rename_to(output_file)
+
+
+def process_input_files(
+    input_structure_file: 'File',
+    input_trajectory_files: list['File'],
+    input_topology_file: 'File',
+    # Output
+    output_directory: str,
+    output_topology_file: 'File',
+    output_structure_file: 'File',
+    output_trajectory_file: 'File',
+    # Processing parameters
+    filter_selection: str,
+    image: bool | str,
+    fit: bool | str,
+    translation: list[float] | str,
+    input_chainer: Optional[dict],
+    input_skip_frames: Optional[tuple[int, int]],
+    # Selections
+    # Note that they are not used directly but they are used inderictly
+    # However we must add them as arguments, so this task will be run again if they change
+    input_pbc_selection: Optional[str],
+    input_cg_selection: Optional[str],
+    input_ua_selection: Optional[str],
+    input_dummy_selection: Optional[str],
+    input_forced_class_selections: dict,
+    # The cross-PBC contacts test depends on the simulation box
+    # It is not used directly but this task must be run again if it changes
+    # Note that the box may be ignored also if PBC are found to be broken (see below)
+    ignore_box: bool,
+    # Make sure the MD is used only to set values or use its functions, but not to get values
+    # Values must be passed separately as inputs so the task can identify when inputs change
+    self: 'MD',
+    # Get the task which is calling this function
+    # Thus we may know which inputs have changed compared to previous runs
+    task: 'Task',
+    # The faith argument
+    faith: bool,
+):
+    """Process input files to generate the processed files.
+    This process corrects and standarizes the topology, the trajectory and the structure.
+    """
+    # Make sure we do not enter in a loop
+    # This may happen when we read/call an output value/file by mistake
+    if hasattr(self, '_processed'): raise RuntimeError('Looped processing')
+    self._processed = True
+
+    # Input trajectories should have all the same format
+    input_trajectory_formats = set([trajectory_file.format for trajectory_file in input_trajectory_files])
+    if len(input_trajectory_formats) > 1:
+        raise InputError('All input trajectory files must have the same format')
+
+    # If the faith argument was passed then set input files as output files and exit
+    if faith:
+        # Faith is only meant for inputs which are outputs of an up to date workflow
+        # These structures are always mmCIF files written by us
+        if input_structure_file.format != 'cif':
+            raise InputError('The --faith argument requires an input structure in mmCIF format (.cif) '
+                'since it is only meant for outputs of an up to date workflow')
+        self.register.add_warning(FAITH_BYPASS, 'All processing steps and tests were skipped')
+        output_structure_file.set_symlink_to(input_structure_file, force=True)
+        if len(input_trajectory_files) > 1: raise InputError('Please do not use the --faith argument')
+        if input_skip_frames and any(input_skip_frames): raise InputError('Frames can not be skipped when using the --faith argument')
+        output_trajectory_file.set_symlink_to(input_trajectory_files[0], force=True)
+        if output_topology_file != MISSING_TOPOLOGY:
+            output_topology_file.set_symlink_to(input_topology_file, force=True)
+        return
+    self.register.remove_warnings(FAITH_BYPASS)
+
+    # --- TOPOLOGY FORMAT CHECK ---------------------------------------------------------
+
+    # There is a chance that the input topology changes at the very beginning
+    # To handle this we create a new variable so we don't have to mutate the input_topology_file variable
+    # WARNING: It is also crucial not to set an intermediate file as the input file since symlinks may remian at the end
+    # WARNING: Since the 'incomplete_inpro' directory changes the name to 'inpro' at the end this would break all paths
+    initial_topology_file = input_topology_file
+
+    # Topologies with the .top extension for us are considered Gromacs topology format
+    # However it is usual than Amber topologies (ideally .prmtop) are also '.top'
+    # So if we have .top input topology read it to make sure which is its format
+    # If it is an amber topology then change its extension to .prmtop
+    # The extension is also important for some external tools (e.g. VMD)
+    if initial_topology_file != MISSING_TOPOLOGY and initial_topology_file.extension == 'top' and is_amber_topology(initial_topology_file):
+        warn('Input topology has extension .top, which is ambiguous since it may refer to GROMACS topologies as well. '
+            'Since it is an amber topology the outputs will have extension .prmtop to avoid ambiguity.')
+        # Change the final output topology format
+        output_topology_file = output_topology_file.get_reformated_file('prmtop')
+        # Create a input topology symlink/copy with the correct extension so we can feed it to other programs without problems
+        reformatted_topology_file = initial_topology_file.get_reformated_file('prmtop').get_relocated_file(output_directory)
+        reformatted_topology_file.set_symlink_to(initial_topology_file)
+        # Change the final output topology format
+        output_topology_file = output_topology_file.get_reformated_file('prmtop')
+        # Replace input files
+        if input_structure_file == initial_topology_file:
+            input_structure_file = reformatted_topology_file
+        initial_topology_file = reformatted_topology_file
+
+    # --- ATOM COUNTS MATCH CHECK -----------------------------------------------------------------------
+
+    # Check input files match in number of atoms
+    # Here we have not standarized the format so we must check differently with every format
+    exceptions = check_input_files(input_structure_file, input_trajectory_files, initial_topology_file, self.cache)
+
+    # There is a chance that the inputs checker has fixed or prefiltered the topology to match trajectory
+    # If this is the case then use the fixed/prefiltered topology from now on
+    fixed_topology = exceptions.get(FIXED_TOPOLOGY_EXCEPTION, None)
+    if fixed_topology:
+        if input_structure_file == initial_topology_file:
+            input_structure_file = fixed_topology
+        initial_topology_file = fixed_topology
+    # The same may happen with the structure when there is no topology
+    fixed_structure = exceptions.get(FIXED_STRUCTURE_EXCEPTION, None)
+    if fixed_structure:
+        input_structure_file = fixed_structure
+
+    # --- CONVERTING AND MERGING ------------------------------------------------------------
+
+    # Set the output file for the already converted structure
+    # Note that the structure is always converted, since our mmCIF files are always written by us
+    converted_structure_file = File(f'{output_directory}/{CONVERTED_STRUCTURE}')
+    # Set the output format for the already converted trajectory
+    input_trajectories_format = list(input_trajectory_formats)[0]
+    output_trajectory_format = output_trajectory_file.format
+    # Set the output file for the already converted trajectory
+    # If input trajectory already matches the output format and is unique then avoid the renaming
+    if input_trajectories_format == output_trajectory_format and len(input_trajectory_files) == 1:
+        converted_trajectory_file = input_trajectory_files[0]
+    else:
+        converted_trajectory_file = File(f'{output_directory}/{CONVERTED_TRAJECTORY}')
+    # Join all input trajectory paths
+    input_trajectory_paths = [trajectory_file.path for trajectory_file in input_trajectory_files]
+
+    incompleted_converted_trajectory_file = _prepare_incomplete_output(output_directory, CONVERTED_TRAJECTORY)
+
+    # Convert input structure and trajectories to output structure and trajectory
+    if not converted_structure_file.exists or not converted_trajectory_file.exists:
+        print(' * Converting and merging')
+        convert(
+            input_structure_filepath=input_structure_file.path,
+            output_structure_filepath=converted_structure_file.path,
+            input_trajectory_filepaths=input_trajectory_paths,
+            output_trajectory_filepath=incompleted_converted_trajectory_file.path,
+        )
+        _commit_incomplete_output(incompleted_converted_trajectory_file, converted_trajectory_file)
+
+    # Topologies are never converted, but they are kept in their original format
+
+    # --- SKIPPING FRAMES ------------------------------------------------------------
+
+    # Remove the first and the last frames of the trajectory if it was requested
+    # Note that the converted trajectory may be the input trajectory itself so we never modify it
+    skipped_trajectory_file = converted_trajectory_file
+    first_frames, last_frames = input_skip_frames or (0, 0)
+    if first_frames or last_frames:
+        skipped_trajectory_file = File(f'{output_directory}/{SKIPPED_TRAJECTORY}')
+        incompleted_skipped_trajectory_file = _prepare_incomplete_output(output_directory, SKIPPED_TRAJECTORY)
+        if not skipped_trajectory_file.exists:
+            if first_frames: print(f' * Skipping the first {first_frames} frames')
+            frames = lambda frame: frame >= first_frames
+            if last_frames:
+                # An incomplete last frame counts as a frame, so it can be skipped
+                complete_frames, incomplete_last_frame = count_complete_xtc_frames(converted_trajectory_file.path)
+                print(f' * Skipping the last {last_frames} frames' + (' (the last one is incomplete)' if incomplete_last_frame else ''))
+                frames = range(first_frames, complete_frames + incomplete_last_frame - last_frames)
+            written_frames = copy_xtc_frames(converted_trajectory_file.path, incompleted_skipped_trajectory_file.path, frames,
+                allow_incomplete_last_frame=bool(last_frames))
+            if written_frames == 0:
+                incompleted_skipped_trajectory_file.remove()
+                raise InputError(f'Cannot skip the first {first_frames} and the last {last_frames} frames: '
+                    'the trajectory has not enough frames')
+            _commit_incomplete_output(incompleted_skipped_trajectory_file, skipped_trajectory_file)
+
+    # --- COUNTING FRAMES ------------------------------------------------------------
+
+    # Count frames as soon as possible, so the number is reused everywhere further
+    # Next steps (filtering, imaging and correcting) do not change the number of frames
+    # The public snapshots getter can not be used here, since the output trajectory does not exist yet
+    snapshots = None
+    # If we already have a value in the cache then use it, unless the input trajectory has changed
+    same_trajectory = 'input_trajectory_files' not in task.changed_inputs \
+        and 'input_skip_frames' not in task.changed_inputs
+    if same_trajectory: snapshots = self.cache.retrieve(SNAPSHOTS_FLAG)
+    if snapshots is None:
+        snapshots = count_xtc_frames(skipped_trajectory_file)
+        self.cache.update(SNAPSHOTS_FLAG, snapshots)
+
+    # --- provisional reference structure ---
+
+    # Now that we MUST have a structure file we can set a provisional structure instance
+    # Note that this structure is not yet corrected so it must be used with care
+    # Otherwise we could have silent errors
+    provisional_structure = Structure.from_file(converted_structure_file.path)
+    # Now we can set a provisional coarse grain selection
+    # This selection is useful to avoid problems with CG atom elements
+    # Logs are shown only once, so here only if atoms are not to be filtered
+    provisional_cg_selection = self._parse_cg_selection(provisional_structure, skipped_trajectory_file, initial_topology_file,
+        snapshots, verbose=not filter_selection)
+    for atom_index in provisional_cg_selection.atom_indices:
+        provisional_structure.atoms[atom_index].element = CG_ATOM_ELEMENT
+    # Set also provisional forced class selections and apply them to the provisional structure
+    # This may be important for the automatic filtering
+    self._set_forced_class_selections(provisional_structure, verbose=False)
+    if self.forced_class_selections:
+        provisional_structure.force_classifications(self.forced_class_selections)
+
+    # --- FILTERING ATOMS ------------------------------------------------------------
+
+    # Find out if we need to filter
+    # i.e. check if there is a selection filter and it matches some atoms
+    must_filter = bool(filter_selection)
+
+    # Set output filenames for the already filtered structure and trajectory
+    if must_filter:
+        filtered_structure_file = File(f'{output_directory}/{FILTERED_STRUCTURE}')
+        filtered_trajectory_file = File(f'{output_directory}/{FILTERED_TRAJECTORY}')
+    else:
+        filtered_structure_file = converted_structure_file
+        filtered_trajectory_file = skipped_trajectory_file
+    # Note that this is the only step affecting topology and thus here we output the definitive topology
+    filtered_topology_file = output_topology_file if must_filter else initial_topology_file
+
+    incompleted_filtered_trajectory_file = _prepare_incomplete_output(output_directory, FILTERED_TRAJECTORY)
+
+    # Check if any output file is missing
+    missing_filter_output = not filtered_structure_file.exists \
+        or not filtered_trajectory_file.exists \
+        or (filtered_topology_file != MISSING_TOPOLOGY and not filtered_topology_file.exists)
+
+    # Check if parameters have changed
+    # Note that for this specific step only filtering is important
+    previous_filtered_parameters = self.cache.retrieve(FILTERED)
+    same_filtered_parameters = previous_filtered_parameters == filter_selection
+
+    # Filter atoms in structure, trajectory and topology if required and not done yet
+    if must_filter and (missing_filter_output or not same_filtered_parameters):
+        print(' * Filtering atoms')
+        filter_atoms(
+            input_structure_file=converted_structure_file,
+            input_trajectory_file=skipped_trajectory_file,
+            input_topology_file=initial_topology_file,  # We use input topology
+            output_structure_file=filtered_structure_file,
+            output_trajectory_file=incompleted_filtered_trajectory_file,
+            output_topology_file=filtered_topology_file,  # We genereate the definitive topology
+            reference_structure=provisional_structure,
+            filter_selection=filter_selection,
+        )
+        _commit_incomplete_output(incompleted_filtered_trajectory_file, filtered_trajectory_file)
+        self.cache.update(FILTERED, filter_selection)
+
+    # --- provisional reference structure ---
+
+    # Now that we have a filtered structure file we have to update provisional structure instance
+    # Note that this structure is not yet corrected so it must be used with care
+    # Otherwise we could have silent errors
+    provisional_structure = Structure.from_file(filtered_structure_file.path)
+    # Again, set the coarse grain atoms
+    # Since elements may be needed to guess PBC selection we must solve them right before
+    # The selection must be parsed again only if atoms were filtered
+    if must_filter:
+        provisional_cg_selection = self._parse_cg_selection(provisional_structure, filtered_trajectory_file, filtered_topology_file,
+            snapshots, verbose=True)
+    for atom_index in provisional_cg_selection.atom_indices:
+        provisional_structure.atoms[atom_index].element = CG_ATOM_ELEMENT
+    # Set the selection of dummy atoms already
+    self._dummy_selection = self._parse_dummy_selection(provisional_structure)
+
+    # Set also provisional forced class selections and apply them to the provisional structure
+    # This may be important for the automatic filtering
+    self._set_forced_class_selections(provisional_structure, verbose=False)
+    if self.forced_class_selections:
+        provisional_structure.force_classifications(self.forced_class_selections)
+
+    # Also we can set a provisional PBC selection
+    # This selection is useful both for imaging/fitting and for the correction
+    # We will make sure that the provisonal and the final PBC selections match
+    # Since this is proviosonal we will make it silent
+    provisional_pbc_selection = self._parse_pbc_selection(provisional_structure)
+
+    # --- FITTED TRAJECTORY AND BROKEN PBC CHECK -----------------------------------------
+
+    # Check if the trajectory was fitted already
+    # If so but the box was not rotated along with the coordinates then the box is useless
+    # In this case the simulation box is ignored in the whole workflow
+    center_selection = provisional_structure.invert_selection(provisional_pbc_selection)
+    already_fitted, broken_pbc = False, False
+    if center_selection:
+        already_fitted, broken_pbc = check_fitted_trajectory(filtered_trajectory_file, provisional_structure, center_selection)
+    self.cache.update(BROKEN_PBC_FLAG, broken_pbc)
+
+    # Fit only if the trajectory is not fitted already, when the fit is automatic
+    # Without atoms to fit on (i.e. everything is PBC) there is nothing to fit
+    if fit == AUTOMATIC_FLAG:
+        fit = bool(center_selection) and not already_fitted
+        print(f' Automatic fit: {fit}')
+
+    # Mine bonds from the topology only once, since they are used in the imaging and in the structure correction
+    topology_bonds = mine_topology_bonds(filtered_topology_file)
+
+    # Image only if non-PBC molecules are split by the box boundaries or the system is scattered, when the image is automatic
+    # Without a usable box there is nothing to image
+    # Save the value so the workflow may be run again with the image if the trajectory integrity test fails
+    if image == AUTOMATIC_FLAG:
+        image = not ignore_box and not broken_pbc and is_imaging_needed(
+            filtered_trajectory_file, topology_bonds, provisional_structure, center_selection)
+        print(f' Automatic image: {image}')
+        self.cache.update(AUTO_IMAGE_FLAG, image)
+
+    # --- IMAGING AND FITTING ------------------------------------------------------------
+
+    # There is no logical way to know if the trajectory is already imaged or it must be imaged
+    # We rely exclusively in input flags
+    must_image = image or fit
+
+    # Set output filenames for the already filtered structure and trajectory
+    if must_image:
+        imaged_structure_file = File(f'{output_directory}/{IMAGED_STRUCTURE}')
+        imaged_trajectory_file = File(f'{output_directory}/{IMAGED_TRAJECTORY}')
+    else:
+        imaged_structure_file = filtered_structure_file
+        imaged_trajectory_file = filtered_trajectory_file
+
+    incompleted_imaged_trajectory_file = _prepare_incomplete_output(output_directory, IMAGED_TRAJECTORY)
+
+    # Check if any output file is missing
+    missing_imaged_output = not imaged_structure_file.exists or not imaged_trajectory_file.exists
+
+    # Check if parameters have changed
+    # Note that for this step the filter parameters is also important
+    previous_imaged_parameters = self.cache.retrieve(IMAGED)
+    same_imaged_parameters = previous_imaged_parameters == [image, fit, translation]
+
+    # Image the trajectory if it is required
+    # i.e. make the trajectory uniform avoiding atom jumps and making molecules to stay whole
+    # Fit the trajectory by removing the translation and rotation if it is required
+    if must_image and (missing_imaged_output or not same_imaged_parameters):
+        print(' * Imaging and fitting')
+        image_and_fit(
+            input_structure_file=filtered_structure_file,
+            input_trajectory_file=filtered_trajectory_file,
+            input_topology_file=filtered_topology_file,  # This is optional if there are no PBC residues
+            output_structure_file=imaged_structure_file,
+            output_trajectory_file=incompleted_imaged_trajectory_file,
+            image=image,
+            fit=fit,
+            translation=translation,
+            structure=provisional_structure,
+            pbc_selection=provisional_pbc_selection,
+            topology_bonds=topology_bonds,
+            # Bonds are found as the safe bonds further, but here with the provisional structure
+            find_bonds=lambda trajectory_file, frames_count: find_safe_bonds(
+                filtered_topology_file,
+                trajectory_file,
+                STABLE_BONDS_FLAG not in self.project.trust,
+                frames_count,
+                provisional_structure,
+                self.register,
+                provisional_cg_selection,
+                self.project.guess_bonds,
+                self.project.ignore_bonds,
+                topology_bonds=topology_bonds,
+            ),
+        )
+        _commit_incomplete_output(incompleted_imaged_trajectory_file, imaged_trajectory_file)
+        # Update the cache
+        self.cache.update(IMAGED, [image, fit, translation])
+        # Update the provisional strucutre coordinates
+        imaged_structure = Structure.from_file(imaged_structure_file.path)
+        imaged_structure_coords = [atom.coords for atom in imaged_structure.atoms]
+        provisional_structure.set_new_coordinates(imaged_structure_coords)
+
+    # --- CORRECTING STRUCTURE ------------------------------------------------------------
+
+    # Note that this step, although it is focused in the structure, requires also the trajectory
+    # Also the trajectory may be altered in very rare cases where coordinates must be resorted
+
+    # There is no possible reason to not correct the structure
+    # This is the last step so the output files will be named as the output files of the whole processing
+
+    # Update the MD task snapshots value, which was counted after skipping frames
+    self.get_snapshots.prefill(self, snapshots, {
+        'structure_file': imaged_structure_file,
+        'trajectory_file': imaged_trajectory_file
+    })
+
+    # WARNING:
+    # We may need to resort atoms in the structure corrector function
+    # In such case, bonds and charges must be resorted as well and saved apart to keep values coherent
+    # Bonds are calculated during the structure corrector but atom charges must be extracted no
+    charges = get_charges(filtered_topology_file)
+    self.get_charges.prefill(self, charges, {
+        'topology_file': filtered_topology_file
+    })
+
+    print(' * Correcting structure')
+
+    # Set output filenames for the already filtered structure and trajectory
+    corrected_structure_filepath = f'{output_directory}/{CORRECTED_STRUCTURE}'
+    corrected_structure_file = File(corrected_structure_filepath)
+    corrected_trajectory_filepath = f'{output_directory}/{CORRECTED_TRAJECTORY}'
+    corrected_trajectory_file = File(corrected_trajectory_filepath)
+
+    # Set a provisional united atom selection
+    # Atoms in united atom residues may have their hydrogens absorbed, so the coherent bonds test expects less bonds
+    provisional_ua_selection = self._parse_ua_selection(provisional_structure, imaged_trajectory_file, provisional_cg_selection, snapshots)
+
+    # Correct the structure
+    # This function reads and or modifies the following MD variables:
+    #   snapshots, reference_bonds, register, cache, mercy, trust
+    chains_changed = structure_corrector(
+        structure=provisional_structure,
+        input_trajectory_file=imaged_trajectory_file,
+        input_topology_file=filtered_topology_file,
+        output_structure_file=corrected_structure_file,
+        output_trajectory_file=corrected_trajectory_file,
+        final_structure_file=output_structure_file,
+        final_trajectory_file=output_trajectory_file,
+        MD=self,
+        pbc_selection=provisional_pbc_selection,
+        cg_selection=provisional_cg_selection,
+        ua_selection=provisional_ua_selection,
+        dummy_selection=self.dummy_selection,
+        snapshots=snapshots,
+        register=self.register,
+        mercy=self.project.mercy,
+        trust=self.project.trust,
+        guess_bonds=self.project.guess_bonds,
+        ignore_bonds=self.project.ignore_bonds,
+        topology_bonds=topology_bonds,
+        chainer=input_chainer,
+    )
+    # Save if chains were changed, since selections by chain may not select the same atoms after the correction
+    self.cache.update(CHAINS_CHANGED_FLAG, chains_changed)
+
+    # If the corrected output exists then use it
+    # Otherwise use the previous step files
+    # Corrected files are generated only when changes are made in these files
+    corrected_structure_file = corrected_structure_file if corrected_structure_file.exists else imaged_structure_file
+    corrected_trajectory_file = corrected_trajectory_file if corrected_trajectory_file.exists else imaged_trajectory_file
+
+    # Set for every type of file (structure, trajectory and topology) the input, the last processed step and the output files
+    input_and_output_files = [
+        (input_structure_file, corrected_structure_file, output_structure_file),
+        (input_trajectory_files[0], corrected_trajectory_file, output_trajectory_file),
+        (input_topology_file, filtered_topology_file, output_topology_file)
+    ]
+    # Set a list of intermediate files
+    intermediate_files = set([
+        converted_structure_file, converted_trajectory_file, skipped_trajectory_file,
+        filtered_structure_file, filtered_trajectory_file,
+        imaged_structure_file, imaged_trajectory_file,
+    ])
+    # Now we must rename files to match the output file
+    # Processed files remain with some intermediate filename
+    for input_file, processed_file, output_file in input_and_output_files:
+        # If the processed file is already the output file then there is nothing to do here
+        # This means it was already the input file and no changes were made
+        if processed_file == output_file: continue
+        # There is a chance that the input files have not been modified
+        # This means the input format has already the output format and it is not to be filtered, imaged, fitted or corrected
+        # However we need the output files to exist and we dont want to rename the original ones since we want to conserve them
+        # In order to not duplicate data, we will setup a symbolic link to the input files with the output filepaths
+        if processed_file == input_file or processed_file.is_symlink_to(input_file):
+            output_file.set_symlink_to(input_file, force=True)
+        # Otherwise rename the last intermediate file as the output file
+        else:
+            # In case the processed file is a symlink we must make sure the symlink is not made to a intermediate step
+            # Intermediate steps will be removed further and thus the symlink would break
+            if processed_file.is_symlink():
+                # Get the target file where the symlink points to
+                target_file = processed_file.get_symlink()
+                if target_file in intermediate_files:
+                    target_file.rename_to(output_file)
+                else:
+                    processed_file.rename_to(output_file)
+            # If the files is not a symlink then simply rename it
+            else:
+                processed_file.rename_to(output_file)
+
+    # Save the internal variables
+    self._structure_file = output_structure_file
+    self._trajectory_file = output_trajectory_file
+    self._topology_file = output_topology_file
+
+    # --- Cache update ---
+
+    # If the input and output file have the same name then overwrite input cksums
+    # Thus we avoid this task to run forever
+    # DANI: Esto es provisional, hay que prohibir que los inputs se llamen como los outputs
+    if input_structure_file == output_structure_file:
+        task.cache_cksums['input_structure_file'] = get_cksum_id(output_structure_file)
+    if len(input_trajectory_files) == 1 and input_trajectory_files[0] == output_trajectory_file:
+        task.cache_cksums['input_trajectory_files'] = get_cksum_id([output_trajectory_file])
+    if input_topology_file == output_topology_file:
+        task.cache_cksums['input_topology_file'] = get_cksum_id(output_topology_file)
+
+    # Update the MD task snapshots value again in case the final structure or trajectory changed
+    self.get_snapshots.update_inputs_cache(self, {
+        'structure_file': output_structure_file,
+        'trajectory_file': output_trajectory_file
+    })
+
+    # Write safe bonds back to the MD
+    self.get_reference_bonds.update_inputs_cache(self, {
+        'topology_file': output_topology_file,
+        'structure_file': output_structure_file,
+        'trajectory_file': output_trajectory_file,
+        'structure': provisional_structure,
+    })
+
+    # --- Definitive selections ---
+
+    # Now that we have the corrected structure we can set the definitive atom selections
+
+    # Set the final structure
+    final_structure = Structure.from_file(output_structure_file.path)
+    final_cg_selection = self._parse_cg_selection(final_structure, output_trajectory_file, output_topology_file, snapshots)
+
+    # Make sure the CG selection is identical to the provisional selection
+    if final_cg_selection != provisional_cg_selection:
+        print(f'Provisional CG selection ({len(provisional_cg_selection)})')
+        print(f'Final CG selection ({len(final_cg_selection)})')
+        provisional_atom_indices = set(provisional_cg_selection.atom_indices)
+        final_atom_indices = set(final_cg_selection.atom_indices)
+        different_atom_indices = (provisional_atom_indices - final_atom_indices) \
+            | (final_atom_indices - provisional_atom_indices)
+        different_atoms_vmd_selection = Selection(different_atom_indices).to_vmd()
+        print(f'Difference: {different_atoms_vmd_selection}')
+        raise InputError('Coarse grain selection is not consistent after correcting the structure. '
+            'Please consider using a different CG selection. '
+            'Avoid relying in atom distances or elements to avoid this problem.')
+    self._cg_selection = final_cg_selection
+
+    # The united atom selection only relaxes the coherent bonds test, so a difference is not critical
+    # Atoms may be sorted while correcting the structure, so the final selection is the one to keep
+    final_ua_selection = self._parse_ua_selection(final_structure, output_trajectory_file, final_cg_selection, snapshots, verbose=False)
+    if final_ua_selection != provisional_ua_selection:
+        warn(f'United atom selection changed after correcting the structure ({len(provisional_ua_selection)} -> {len(final_ua_selection)} atoms)')
+    self._ua_selection = final_ua_selection
+
+    # Make sure the PBC selection is identical to the provisional selection
+    if self.pbc_selection != provisional_pbc_selection:
+        print(f'Provisional PBC selection ({len(provisional_pbc_selection)})')
+        print(f'Final PBC selection ({len(self.pbc_selection)})')
+        provisional_atom_indices = set(provisional_pbc_selection.atom_indices)
+        final_atom_indices = set(self.pbc_selection.atom_indices)
+        different_atom_indices = (provisional_atom_indices - final_atom_indices) \
+            | (final_atom_indices - provisional_atom_indices)
+        different_atoms_vmd_selection = Selection(different_atom_indices).to_vmd()
+        print(f'Difference: {different_atoms_vmd_selection}')
+        raise InputError('PBC selection is not consistent after correcting the structure. '
+            'Please consider using a different PBC selection. '
+            'Avoid relying in atom distances or elements to avoid this problem.'
+            'Also always prefer to use "residue" instead of "resid".')
+
+    # --- RUNNING FINAL TESTS ------------------------------------------------------------
+
+    # Note that tests here do not modify any file
+
+    # Check the trajectory has not sudden jumps
+    self.is_trajectory_integral()
+
+    # Check there are no cross-periodic boundary contacts
+    self.are_there_cross_periodic_contacts()
+
+    # Make a final test summary
+    self.print_tests_summary()
+
+    # Issue some warnings if failed or never run tests are skipped
+    self._issue_required_test_warnings()
+
+    # --- Cleanup intermediate files
+
+    # Set a list of input files to NOT be removed
+    inputs_files = set([input_structure_file, *input_trajectory_files, input_topology_file])
+    # We must make sure an intermediate file is not actually an input file before deleting it
+    removable_files = intermediate_files - inputs_files
+    # Now delete every removable file
+    for removable_file in removable_files:
+        # Note that a broken symlink does not 'exists'
+        if removable_file.exists or removable_file.is_symlink():
+            removable_file.remove()

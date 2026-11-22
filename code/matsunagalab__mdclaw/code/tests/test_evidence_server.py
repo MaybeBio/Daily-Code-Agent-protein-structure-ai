@@ -1,0 +1,577 @@
+"""Target selection, replica identity, provenance and read-only report contracts."""
+
+import json
+from pathlib import Path
+
+import pytest
+
+from mdclaw.evidence import generate_md_report
+
+
+def node(job, nid, kind="prod", parents=(), metadata=None, status="completed", **extra):
+    path = job / "nodes" / nid / "node.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = dict(node_id=nid, node_type=kind, parent_node_ids=list(parents),
+                  dependency_node_ids=[], metadata=metadata or {}, conditions={},
+                  artifacts={}, status=status, **extra)
+    path.write_text(json.dumps(record))
+    return path
+
+
+def target(job, nid, label):
+    return dict(job_dir=str(job), node_id=nid, label=label)
+
+
+def test_single_leaf_and_read_only(tmp_path):
+    node(tmp_path, "source", "source")
+    node(tmp_path, "prod", parents=["source"], metadata={"temperature_kelvin": 300})
+    before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    result = generate_md_report(job_dir=str(tmp_path))
+    assert result["success"]
+    history = result["report"]["subjects"][0]["history"]
+    assert [r["node_id"] for r in history] == ["source", "prod"]
+    assert history[-1]["source"]["metadata_pointer"] == "/metadata"
+    assert generate_md_report(job_dir=str(tmp_path)) == result
+    assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+
+
+def test_multiple_leaves_require_selection_including_failed(tmp_path):
+    node(tmp_path, "a")
+    node(tmp_path, "b", status="failed")
+    out = tmp_path / "report"
+    result = generate_md_report(job_dir=str(tmp_path), grouping="replicas", output_dir=str(out))
+    assert result["code"] == "report_selection_required"
+    assert {t["status"] for t in result["candidates"]} == {"completed", "failed"}
+    assert not out.exists()
+
+
+def test_same_job_replicas_preserve_shared_eq_and_differences(tmp_path):
+    node(tmp_path, "eq", "eq")
+    node(tmp_path, "a", parents=["eq"], metadata={"temperature_kelvin": 300, "random_seed": 1})
+    node(tmp_path, "b", parents=["eq"], metadata={"temperature_kelvin": 300, "random_seed": 2})
+    node(tmp_path, "ignored", metadata={"temperature_kelvin": 999})
+    targets = [target(tmp_path, "a", "r1"), target(tmp_path, "b", "r2")]
+    assert generate_md_report(targets=targets)["code"] == "report_selection_required"
+    result = generate_md_report(targets=targets, grouping="replicas")
+    assert result["success"]
+    report = result["report"]
+    assert report["relationships"][0]["shared_ancestors"] == ["eq"]
+    assert report["relationships"][0]["shared_production"] == []
+    assert report["comparison"]["common_recorded_settings"]["prod/1/recorded/temperature_kelvin"] == 300
+    assert "prod/1/recorded/random_seed" in report["comparison"]["differences"]
+    assert "ignored" not in json.dumps(report)
+
+
+@pytest.mark.parametrize("kind, left, right, difference", [
+    ("min", {"restraint_atoms": "solute_heavy", "restraint_force_constant": 100},
+     {"restraint_atoms": "solute_heavy", "restraint_force_constant": 200},
+     "restraint_force_constant"),
+    ("eq", {"restraint_atoms": "solute_heavy", "restraint_count": 12},
+     {"restraint_atoms": "backbone", "restraint_count": 8}, "restraint_atoms"),
+    ("prod", {"distance_restraints": [{"name": "d", "selection_group1": "resid 0",
+                                      "selection_group2": "resid 1", "target_distance_nm": 1,
+                                      "force_constant_kj_mol_nm2": 100}]},
+     {"distance_restraints": [{"name": "d", "selection_group1": "resid 0",
+                              "selection_group2": "resid 1", "target_distance_nm": 2,
+                              "force_constant_kj_mol_nm2": 100}]}, "distance_restraints"),
+    ("prod", {"custom_force": {"kind": "torch_script_energy", "signature": {
+        "sha256": "same_script", "parameters": {"k": 100}}}},
+     {"custom_force": {"kind": "torch_script_energy", "signature": {
+         "sha256": "same_script", "parameters": {"k": 200}}}},
+     "custom_force/signature/parameters/k"),
+    ("prod", {"custom_force_signature": {"sha256": "script_a", "parameters": {}}},
+     {"custom_force_signature": {"sha256": "script_b", "parameters": {}}},
+     "custom_force_signature/sha256"),
+    ("prod", {"steering": {"duration_steps": 1000, "update_steps": 10}},
+     {"steering": {"duration_steps": 2000, "update_steps": 10}}, "steering/duration_steps"),
+    ("prod", {"plumed": {"protocol": {"signature": {"sha256": "input_a"}}}},
+     {"plumed": {"protocol": {"signature": {"sha256": "input_b"}}}},
+     "plumed/protocol/signature/sha256"),
+])
+def test_execution_argument_biases_are_compared(tmp_path, kind, left, right, difference):
+    # No node conditions: these settings were supplied as tool execution arguments.
+    node(tmp_path, "a", kind, metadata=left)
+    node(tmp_path, "b", kind, metadata=right)
+    result = generate_md_report(
+        targets=[target(tmp_path, "a", "a"), target(tmp_path, "b", "b")], grouping="separate")
+    assert result["success"]
+    rows = result["report"]["comparison"]["differences"][f"{kind}/1/recorded/{difference}"]
+    assert all(row["present"] for row in rows)
+    assert rows[0]["value"] != rows[1]["value"]
+
+
+def test_biased_and_unbiased_productions_are_distinguished(tmp_path):
+    node(tmp_path, "a", metadata={"distance_restraints": [{"target_distance_nm": 1}]})
+    node(tmp_path, "b")
+    report = generate_md_report(
+        targets=[target(tmp_path, "a", "a"), target(tmp_path, "b", "b")],
+        grouping="replicas")["report"]
+    rows = report["comparison"]["differences"]["prod/1/recorded/distance_restraints"]
+    assert [row["present"] for row in rows] == [True, False]
+
+
+def test_bias_progress_and_artifact_locations_remain_history_only(tmp_path):
+    for nid, elapsed in (("a", 10), ("b", 20)):
+        node(tmp_path, nid, metadata={
+            "custom_force_signature": {"sha256": "same_script", "parameters": {"k": 100}},
+            "steering": {"duration_steps": 20, "update_steps": 1, "initial_sha256": "same",
+                         "initial_file": str(tmp_path / nid / "steering_initial.npz"),
+                         "elapsed_steps": elapsed, "schedule_complete": elapsed == 20,
+                         "progress": elapsed / 20},
+            "plumed": {"protocol": {"signature": {"sha256": "same_input"}},
+                       "elapsed_steps": elapsed, "schedule_complete": elapsed == 20},
+            "final_step": elapsed,
+        })
+    report = generate_md_report(
+        targets=[target(tmp_path, "a", "a"), target(tmp_path, "b", "b")],
+        grouping="replicas")["report"]
+    assert report["comparison"]["differences"] == {}
+    assert [s["history"][0]["recorded_metadata"]["steering"]["elapsed_steps"]
+            for s in report["subjects"]] == [10, 20]
+
+
+@pytest.mark.parametrize("change", ["measurement", "progress", "target", "force_constant"])
+def test_distance_steering_summary_separates_results_from_protocol(tmp_path, change):
+    from mdclaw.simulation.steering import DistanceSteering
+
+    summaries = []
+    for nid in ("a", "b"):
+        # Exercise the real summary serializer without starting a simulation.
+        steering = object.__new__(DistanceSteering)
+        restraint = {"name": "d", "target_distance_nm": 3 if nid == "b" and change == "target" else 2,
+                     "force_constant_kj_mol_nm2": 200 if nid == "b" and change == "force_constant" else 100}
+        steering.protocol = {"duration_steps": 100, "update_steps": 10,
+                             "signature": {"restraints": [restraint]},
+                             "initial_distances_nm": {"d": 1}}
+        steering.loaded = {"restraints": [restraint]}
+        steering.fixed = False
+        steering.elapsed = 50 if nid == "b" and change == "progress" else 100
+        steering.centers = {"d": 1.5 if steering.elapsed == 50 else restraint["target_distance_nm"]}
+        distance = 2.1 if nid == "b" and change == "measurement" else 1.9
+        steering.distances = lambda distance=distance: {"d": distance}
+        summaries.append(steering.summary())
+        node(tmp_path, nid, metadata={"steering": summaries[-1]})
+    result = generate_md_report(
+        targets=[target(tmp_path, "a", "a"), target(tmp_path, "b", "b")], grouping="replicas")
+    assert result["success"]
+    report = result["report"]
+    differences = report["comparison"]["differences"]
+    if change in ("measurement", "progress"):
+        assert differences == {}
+    else:
+        assert set(differences) == {"prod/1/recorded/steering/signature/restraints"}
+    assert [s["history"][0]["recorded_metadata"]["steering"] for s in report["subjects"]] == summaries
+
+
+@pytest.mark.parametrize("parameter", ["center", "force_constant", "group_weight"])
+def test_nested_runtime_force_parameters_are_compared(tmp_path, parameter):
+    openmm = pytest.importorskip("openmm")
+    for nid, value in (("a", 1.0), ("b", 2.0)):
+        system = openmm.System()
+        for _ in range(3):
+            system.addParticle(12)
+        force = openmm.CustomCentroidBondForce(2, "0.5*k*(distance(g1,g2)-r0)^2")
+        force.addPerBondParameter("k")
+        force.addPerBondParameter("r0")
+        force.addGroup([0, 1], [1, value if parameter == "group_weight" else 1])
+        force.addGroup([2])
+        force.addBond([0, 1], [value if parameter == "force_constant" else 100,
+                               value if parameter == "center" else 1])
+        system.addForce(force)
+        path = node(tmp_path, nid)
+        data = json.loads(path.read_text())
+        data["artifacts"] = {"runtime_system": "runtime.xml"}
+        path.write_text(json.dumps(data))
+        (path.parent / "runtime.xml").write_text(openmm.XmlSerializer.serialize(system))
+    report = generate_md_report(
+        targets=[target(tmp_path, "a", "a"), target(tmp_path, "b", "b")],
+        grouping="replicas")["report"]
+    rows = report["comparison"]["differences"]["prod/1/runtime/runtime_system/forces"]
+    left, right = (row["value"][0] for row in rows)
+    assert left["definition_sha256"] != right["definition_sha256"]
+    assert {k: v for k, v in left.items() if k != "definition_sha256"} == {
+        k: v for k, v in right.items() if k != "definition_sha256"}
+
+
+def test_runtime_force_comparison_ignores_xml_format_and_source_location(tmp_path):
+    definitions = [
+        '<Force type="CustomBondForce" name="bias"><Bonds><Bond p1="0" p2="1" param1="1"/></Bonds></Force>',
+        '<Force name="bias" type="CustomBondForce">\n  <Bonds>\n    <Bond param1="1" p2="1" p1="0"/>\n  </Bonds>\n</Force>',
+    ]
+    for nid, definition in zip(("a", "b"), definitions):
+        path = node(tmp_path / nid, "prod")
+        data = json.loads(path.read_text())
+        data["artifacts"] = {"runtime_system": f"{nid}.xml"}
+        path.write_text(json.dumps(data))
+        (path.parent / f"{nid}.xml").write_text(f"<System><Forces>{definition}</Forces></System>")
+    report = generate_md_report(
+        targets=[target(tmp_path / nid, "prod", nid) for nid in ("a", "b")],
+        grouping="replicas")["report"]
+    assert report["comparison"]["differences"] == {}
+    sources = [s["history"][0]["runtime_sources"]["runtime_system"] for s in report["subjects"]]
+    assert sources[0]["file"] != sources[1]["file"]
+    assert sources[0]["sha256"] != sources[1]["sha256"]
+
+
+def test_cross_job_replicas_missing_not_equal_null(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    node(a, "prod", metadata={"random_seed": None})
+    node(b, "prod")
+    result = generate_md_report(targets=[target(a, "prod", "a"), target(b, "prod", "b")], grouping="replicas")
+    assert result["success"]
+    rows = result["report"]["comparison"]["differences"]["prod/1/recorded/random_seed"]
+    assert [r["present"] for r in rows] == [True, False]
+
+
+def test_continuations_and_duplicate_analyses_are_not_replicas(tmp_path):
+    node(tmp_path, "p1")
+    node(tmp_path, "p2", parents=["p1"])
+    node(tmp_path, "a1", "analyze", ["p2"])
+    node(tmp_path, "a2", "analyze", ["p2"])
+    for left, right in (("p1", "p2"), ("a1", "a2")):
+        targets = [target(tmp_path, left, "a"), target(tmp_path, right, "b")]
+        assert not generate_md_report(targets=targets, grouping="replicas")["success"]
+        assert generate_md_report(targets=targets, grouping="separate")["success"]
+
+
+@pytest.mark.parametrize("parents", [["missing"], ["a"]])
+def test_broken_lineage_fails(tmp_path, parents):
+    node(tmp_path, "a", parents=parents)
+    assert not generate_md_report(targets=[target(tmp_path, "a", "a")])["success"]
+
+
+def test_dependencies_are_recorded_but_not_production_ancestors(tmp_path):
+    node(tmp_path, "dep")
+    path = node(tmp_path, "a")
+    data = json.loads(path.read_text())
+    data["dependency_node_ids"] = ["dep"]
+    path.write_text(json.dumps(data))
+    subject = generate_md_report(targets=[target(tmp_path, "a", "a")])["report"]["subjects"][0]
+    assert len(subject["history"]) == 2
+    assert subject["production_node_ids"] == ["a"]
+
+
+def test_production_forks_retain_shared_prefix_without_pooling(tmp_path):
+    node(tmp_path, "shared")
+    node(tmp_path, "a", parents=["shared"])
+    node(tmp_path, "b", parents=["shared"])
+    result = generate_md_report(targets=[target(tmp_path, "a", "a"), target(tmp_path, "b", "b")], grouping="replicas")
+    assert result["success"]
+    assert result["report"]["relationships"][0]["shared_production"] == ["shared"]
+    assert [s["production_frontier"] for s in result["report"]["subjects"]] == [["a"], ["b"]]
+
+
+def test_runtime_citations_not_from_declarations(tmp_path):
+    path = node(tmp_path, "p", metadata={"integrator_signature": {"integrator": "LangevinMiddleIntegrator"}})
+    data = json.loads(path.read_text())
+    data["conditions"] = {"method": "SHAKE WHAM MBAR"}
+    data["artifacts"] = {"runtime_system": "system.xml", "integrator": "integrator.xml"}
+    path.write_text(json.dumps(data))
+    (path.parent / "system.xml").write_text('<System openmmVersion="8.5.1"><Constraints><Constraint/></Constraints><Forces><Force type="MonteCarloMembraneBarostat" pressure="1"/></Forces></System>')
+    (path.parent / "integrator.xml").write_text('<Integrator type="LangevinMiddleIntegrator" temperature="300"/>')
+    result = generate_md_report(job_dir=str(tmp_path), output_dir=str(tmp_path / "report"))
+    assert result["success"]
+    citations = result["report"]["citations"]
+    assert len(citations["selected"]) == 5
+    middle = next(c for c in citations["selected"] if c["key"] == "Zhang2019LFMiddle")
+    assert middle["reasons"][0]["evidence_file"] == str(path.parent / "integrator.xml")
+    assert middle["reasons"][0]["evidence_field"] == "/Integrator/@type"
+    assert citations["documentation"][0]["dedicated_paper"] is None
+    assert any(x["method"] == "constraint_solver" for x in citations["unresolved"])
+    assert "SHAKE" not in citations["bibtex"]
+    assert Path(result["files"]["bibtex"]).read_text() == citations["bibtex"]
+    # Re-running into the same directory refreshes the report and says so.
+    assert "replaced" not in result["files"]
+    (tmp_path / "report" / "notes.txt").write_text("mine")
+    again = generate_md_report(job_dir=str(tmp_path), output_dir=str(tmp_path / "report"))
+    assert again["success"], again
+    assert sorted(Path(p).name for p in again["files"]["replaced"]) == ["references.bib", "report.json"]
+    assert (tmp_path / "report" / "notes.txt").read_text() == "mine"
+    assert not generate_md_report(job_dir=str(tmp_path), output_dir=str(path.parent / "report"))["success"]
+
+
+def test_study_named_plan_and_missing_jobs(tmp_path):
+    (tmp_path / "study.json").write_text(json.dumps({"jobs": [{"job_id": "a", "job_dir": "jobs/a"}, {"job_id": "b", "job_dir": "jobs/b"}]}))
+    (tmp_path / "plans").mkdir()
+    plan = tmp_path / "plans" / "selected.json"
+    plan.write_text(json.dumps({"plan": {"jobs": [{"job_id": "a"}]}}))
+    node(tmp_path / "jobs/a", "p")
+    result = generate_md_report(study_dir=str(tmp_path), plan_id="selected")
+    assert result["success"]
+    assert len(result["report"]["subjects"]) == 1
+    assert result["report"]["study"]["plan_file"] == str(plan)
+    plan.write_text(json.dumps({"plan": {"jobs": [{"job_id": "missing"}]}}))
+    assert not generate_md_report(study_dir=str(tmp_path), plan_id="selected")["success"]
+    assert not generate_md_report(study_dir=str(tmp_path), plan_id="absent")["success"]
+
+
+def test_duplicate_and_invalid_inputs(tmp_path):
+    node(tmp_path, "a")
+    t = target(tmp_path, "a", "a")
+    for kwargs in ({}, {"targets": []}, {"targets": [t, t], "grouping": "separate"},
+                   {"job_dir": str(tmp_path), "targets": [t]}, {"job_dir": str(tmp_path), "plan_id": "x"}):
+        assert not generate_md_report(**kwargs)["success"]
+
+
+def test_corrupt_node_and_study_plan_fail_closed(tmp_path):
+    path = node(tmp_path, "p")
+    path.write_text("{")
+    assert not generate_md_report(job_dir=str(tmp_path))["success"]
+    (tmp_path / "study.json").write_text('{"jobs": []}')
+    (tmp_path / "study_plan.json").write_text("{")
+    assert not generate_md_report(study_dir=str(tmp_path))["success"]
+
+
+def test_cli_discovery_and_retirement():
+    from mdclaw._cli import _discover_tools, _missing_tool_error
+    tools = _discover_tools()
+    assert "generate_md_report" in tools
+    for old in ("generate_md_evidence_report", "generate_study_evidence_report"):
+        assert old not in tools
+        assert "generate_md_report" in _missing_tool_error(old, tools)["message"]
+
+
+def test_missing_runtime_and_failed_analysis_stay_explicit(tmp_path):
+    path = node(tmp_path, "a", "analyze", status="failed")
+    data = json.loads(path.read_text())
+    data["artifacts"] = {"integrator": "absent.xml"}
+    data["metadata"] = {"integrator_signature": {"integrator": "LangevinMiddleIntegrator"}}
+    path.write_text(json.dumps(data))
+    report = generate_md_report(job_dir=str(tmp_path))["report"]
+    assert report["subjects"][0]["analysis_results"] == []
+    assert report["subjects"][0]["history"][0]["warnings"]
+    assert report["citations"]["selected"] == []
+
+
+def test_recorded_parameters_not_inferred_from_label(tmp_path):
+    node(tmp_path, "p", label="ff19SB OPC HMR", metadata={"effective_forcefield": "ff14SB", "water_model": "tip3p", "hmr": True})
+    refs = generate_md_report(job_dir=str(tmp_path))["report"]["citations"]["selected"]
+    assert {r["key"] for r in refs} == {"Maier2015ff14SB", "Jorgensen1983TIP3P", "Hopkins2015HMR"}
+
+
+def test_packaged_bibliography_matches_verified_audit():
+    import re
+    from mdclaw.evidence import citations
+    audit = Path(__file__).parents[1] / "docs/research/citation-audit-2026-09-06.bib"
+    source = audit.read_text()
+    packaged = Path(citations.__file__).with_name("references.bib").read_text()
+    entries = list(re.finditer(r"@\w+\{([^,]+),\n.*?^\}", packaged, re.M | re.S))
+    assert len(entries) == len({m[1] for m in entries}) == 37
+    assert all(m[0] in source for m in entries)
+
+
+def test_cli_execution_with_json_targets(tmp_path, capsys):
+    from mdclaw._cli import main
+    node(tmp_path, "a")
+    targets = [target(tmp_path, "a", "r1")]
+    with pytest.raises(SystemExit) as exc:
+        main(["generate_md_report", "--targets", json.dumps(targets)])
+    assert exc.value.code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["success"]
+    assert result["report"]["subjects"][0]["label"] == "r1"
+
+
+def _alchemical_job(job):
+    """source -> prep -> solv -> topo(hybrid) -> min -> eq -> fep -> analyze(fep_mbar) for the
+    folded leg; prep2(unfolded) -> ... -> analyze(fep_mbar); a ddG comparison over both."""
+    node(job, "source", "source")
+    node(job, "prep", "prep", ["source"])
+    node(job, "prep2", "prep", ["prep"], metadata={"leg_role": "unfolded", "tool": "extract_tripeptide"})
+    for leg, top in (("f", "prep"), ("u", "prep2")):
+        node(job, f"solv_{leg}", "solv", [top])
+        node(job, f"topo_{leg}", "topo", [f"solv_{leg}"],
+             metadata={"fep": {"mutation": "A:W6A", "n_windows": 21, "phase_bounds": [0.25, 0.75],
+                               "endstate_builder": "amber", "endpoint_validation_passed": True},
+                       "effective_forcefield": "ff19SB", "water_model": "opc", "hmr": True})
+        node(job, f"min_{leg}", "min", [f"topo_{leg}"])
+        node(job, f"eq_{leg}", "eq", [f"min_{leg}"])
+        node(job, f"fep_{leg}", "fep", [f"eq_{leg}"],
+             metadata={"lambda_indices": list(range(21)), "n_protocol_windows": 21, "sampling_time_ns": 1.0,
+                       "ensemble": "NPT", "restraint_atoms": "backbone" if leg == "f" else None})
+        node(job, f"an_{leg}", "analyze", [f"fep_{leg}"],
+             metadata={"analysis": "fep_mbar", "mutation": "A:W6A", "dG_kj_mol": 12.0 if leg == "f" else -7.0,
+                       "dG_error_kj_mol": 1.4, "n_states": 21, "min_neighbour_overlap": 0.07, "subsampled": True})
+    node(job, "ddg", "analyze", ["an_f", "an_u"],
+         metadata={"analysis": "fep_ddg", "cycle": "folding", "mutation": "A:W6A", "ddG_kj_mol": 19.0,
+                   "ddG_error_kj_mol": 2.0, "legs": {"folded": {"node_id": "an_f"}, "unfolded": {"node_id": "an_u"}}})
+
+
+def test_alchemical_lineage_is_reported_and_cited(tmp_path):
+    _alchemical_job(tmp_path)
+    result = generate_md_report(targets=[target(tmp_path, "ddg", "ddg")], output_dir=str(tmp_path / "report"))
+    assert result["success"], result
+    subject = result["report"]["subjects"][0]
+    # fep nodes are the sampling stage of an alchemical leg
+    assert subject["production_node_ids"] == []
+    assert sorted(subject["fep_node_ids"]) == ["fep_f", "fep_u"]
+    assert sorted(subject["production_frontier"]) == ["fep_f", "fep_u"]
+    alchemical = subject["alchemical"]
+    assert [t["node_id"] for t in alchemical["hybrid_topologies"]] == ["topo_f", "topo_u"]
+    assert alchemical["hybrid_topologies"][0]["mutation"] == "A:W6A"
+    assert {w["node_id"]: w["restraint_atoms"] for w in alchemical["fep_nodes"]} == {"fep_f": "backbone", "fep_u": None}
+    assert [leg["dG_kj_mol"] for leg in alchemical["legs"]] == [12.0, -7.0]
+    assert alchemical["ddg"]["ddG_kj_mol"] == 19.0 and alchemical["ddg"]["cycle"] == "folding"
+    # settings comparison sees the alchemical settings
+    assert "topo/1/recorded/fep/mutation" in result["report"]["comparison"]["common_recorded_settings"]
+    selected = {entry["key"] for entry in result["report"]["citations"]["selected"]}
+    assert {"Shirts2008MBAR", "Chodera2007Timeseries", "Chodera2016Equilibration", "Klimovich2015Guidelines",
+            "Gapsys2015pmx", "Beutler1994SoftCore", "Seeliger2010Thermostability", "Tian2020ff19SB", "Izadi2014OPC",
+            "Hopkins2015HMR"} <= selected
+    assert "Chen2018ChargeChangingFEP" not in selected  # W6A keeps the net charge
+    bib = (tmp_path / "report" / "references.bib").read_text()
+    assert "@article{Shirts2008MBAR" in bib and "10.1016/0009-2614(94)00397-1" in bib
+    # a charge-changing mutation built with the co-alchemical ion cites it
+    charged = tmp_path / "charged"
+    node(charged, "topo", "topo", metadata={"fep": {"mutation": "A:A14D", "charge_correction": "coalchemical_ion"}})
+    charged_keys = {e["key"] for e in generate_md_report(job_dir=str(charged))["report"]["citations"]["selected"]}
+    assert "Chen2018ChargeChangingFEP" in charged_keys
+    # an absolute-binding job cites the restraint and the cycle, not the pmx hybrid
+    abfe = tmp_path / "abfe"
+    node(abfe, "topo", "topo", metadata={"fep": {"kind": "abfe_decouple", "leg": "complex", "restraint": "boresch"}})
+    node(abfe, "dg", "analyze", ["topo"], metadata={"analysis": "abfe_binding", "ligand_symmetry_number": 12})
+    abfe_keys = {e["key"] for e in generate_md_report(job_dir=str(abfe))["report"]["citations"]["selected"]}
+    assert {"Boresch2003AbsoluteBinding", "Gilson1997BindingAffinities", "Mobley2007ModelSite",
+            "Beutler1994SoftCore"} <= abfe_keys and "Gapsys2015pmx" not in abfe_keys
+    # a plain MD subject cites none of the alchemical methods
+    plain = tmp_path / "plain"
+    node(plain, "prod", "prod", metadata={"hmr": True})
+    plain_keys = {e["key"] for e in generate_md_report(job_dir=str(plain))["report"]["citations"]["selected"]}
+    assert not plain_keys & {"Shirts2008MBAR", "Gapsys2015pmx", "Beutler1994SoftCore", "Seeliger2010Thermostability"}
+
+
+def test_alchemical_legs_are_separate_not_replicas(tmp_path):
+    _alchemical_job(tmp_path)
+    legs = [target(tmp_path, "an_f", "folded"), target(tmp_path, "an_u", "unfolded")]
+    assert generate_md_report(targets=legs, grouping="separate")["success"]
+    # different fep frontiers: the legs may be listed as replicas by shape, and
+    # the ddG node nests both of them, so it cannot be one
+    assert generate_md_report(targets=legs, grouping="replicas")["success"]
+    nested = [target(tmp_path, "ddg", "ddg"), target(tmp_path, "an_f", "folded")]
+    assert not generate_md_report(targets=nested, grouping="replicas")["success"]
+    assert generate_md_report(targets=nested, grouping="separate")["success"]
+
+
+def _artifacts(path, **artifacts):
+    data = json.loads(path.read_text())
+    data["artifacts"] = artifacts
+    path.write_text(json.dumps(data))
+    return path
+
+
+def _keys(job):
+    citations = generate_md_report(job_dir=str(job))["report"]["citations"]
+    return {entry["key"] for entry in citations["selected"]}, citations
+
+
+def test_openmm_version_is_read_from_the_state_and_system_a_node_wrote(tmp_path):
+    """min / eq keep a State XML and topo a System XML, not a runtime System copy;
+    their root element names the OpenMM that wrote them (T4L ABFE report, 2026-09-27:
+    every eq node was reported as having no recorded OpenMM version)."""
+    from mdclaw._common import sha256_file
+
+    topo = _artifacts(node(tmp_path, "topo", "topo"), system_xml="artifacts/system.xml")
+    (topo.parent / "artifacts").mkdir()
+    (topo.parent / "artifacts" / "system.xml").write_text(
+        '<?xml version="1.0" ?>\n<System openmmVersion="8.5.1" type="System" version="1">\n\t<Particles/>\n</System>\n')
+    eq = _artifacts(node(tmp_path, "eq", "eq", ["topo"],
+                         metadata={"integrator_signature": {"integrator": "LangevinMiddleIntegrator"}}),
+                    state="artifacts/equilibrated.xml", checkpoint="artifacts/equilibrated.chk")
+    (eq.parent / "artifacts").mkdir()
+    state = eq.parent / "artifacts" / "equilibrated.xml"
+    state.write_text('<?xml version="1.0" ?>\n<State openmmVersion="8.5.1" stepCount="250000" time="1000.0" '
+                     'type="State" version="1">\n\t<Positions/>\n</State>\n')
+    old = _artifacts(node(tmp_path, "old", "eq", ["eq"],
+                          metadata={"integrator_signature": {"integrator": "LangevinMiddleIntegrator"}}),
+                     state="artifacts/equilibrated.xml")
+    (old.parent / "artifacts").mkdir()
+    (old.parent / "artifacts" / "equilibrated.xml").write_text('<State openmmVersion="7.7.0" type="State"/>')
+    node(tmp_path, "bare", "eq", ["old"], metadata={"integrator_signature": {"integrator": "LangevinMiddleIntegrator"}})
+
+    report = generate_md_report(targets=[target(tmp_path, "bare", "r1")])["report"]
+    citations = report["citations"]
+    openmm = next(entry for entry in citations["selected"] if entry["key"] == "Eastman2024OpenMM8")
+    reasons = {reason["node_id"]: reason for reason in openmm["reasons"]}
+    assert set(reasons) == {"topo", "eq"}
+    assert reasons["topo"]["evidence_field"] == "/System/@openmmVersion"
+    assert reasons["eq"]["evidence_field"] == "/State/@openmmVersion"
+    assert reasons["eq"]["evidence_file"] == str(state)
+    assert reasons["eq"]["evidence_sha256"] == sha256_file(state)
+    versions = {u["node_id"]: u for u in citations["unresolved"] if u["method"] == "OpenMM_version"}
+    assert set(versions) == {"old", "bare"}
+    assert versions["old"]["value"] == "7.7.0"           # recorded, but no paper mapped for 7.x
+    assert "value" not in versions["bare"]               # nothing written by OpenMM is listed
+    assert report["comparison"]["common_recorded_settings"]["eq/1/runtime/openmm_serialization/openmm_version"] == "8.5.1"
+
+
+def test_preparation_solvation_and_ligand_parameters_are_cited_from_what_each_stage_recorded(tmp_path):
+    # protonation: PDB2PQR always, PROPKA unless no-prediction; PDBFixer has no paper
+    prep = tmp_path / "prep"
+    node(prep, "p", "prep", metadata={"protonation_baseline_method": "pdb2pqr+propka", "pdbfixer_version": "1.12.0"})
+    keys, citations = _keys(prep)
+    assert keys == {"Dolinsky2004PDB2PQR", "Dolinsky2007PDB2PQR", "Jurrus2018APBSPDB2PQR",
+                    "Olsson2011PROPKA3", "Sondergaard2011PROPKA"}
+    assert [(d["method"], d["version"], d["dedicated_paper"]) for d in citations["documentation"]] == [
+        ("PDBFixer", "1.12.0", None)]
+    assert "@article{Dolinsky2007PDB2PQR" in citations["bibtex"]
+    fixed = tmp_path / "fixed"
+    node(fixed, "p", "prep", metadata={"protonation_baseline_method": "pdb2pqr_no_prediction"})
+    assert _keys(fixed)[0] == {"Dolinsky2004PDB2PQR", "Dolinsky2007PDB2PQR", "Jurrus2018APBSPDB2PQR"}
+    off = tmp_path / "off"
+    node(off, "p", "prep", metadata={"protonation_baseline_method": "disabled"})
+    assert _keys(off)[0] == set()
+
+    # solvation: packmol-memgen (and the PACKMOL it runs) only when that is what built the box
+    packmol = {"SchottVerdugo2019PackmolMemgen", "Martinez2009Packmol"}
+    for name, metadata, expected in (
+            ("named", {"backend": "packmol-memgen", "backend_version": "2025.1.29"}, packmol),
+            ("fallback", {"backend": "openmm_fallback"}, set()),
+            ("membrane", {"membrane_backend": "packmol-memgen"}, packmol),
+            ("patch", {"membrane_backend": "patch-tile"}, set())):
+        job = tmp_path / name
+        node(job, "s", "solv", metadata=metadata)
+        assert _keys(job)[0] == expected, name
+    # recorded before solvate_structure named its backend: the REMARK packmol-memgen wrote decides
+    for name, first_line, expected in (
+            ("legacy", "REMARK   Packmol generated pdb file, Packmol Memgen estimated parameters", packmol),
+            ("legacy_other", "REMARK   1 CREATED WITH OPENMM 8.5.1", set())):
+        job = tmp_path / name
+        path = _artifacts(node(job, "s", "solv", metadata={"box_shape": "cubic"}), solvated_pdb="artifacts/solvated.pdb")
+        (path.parent / "artifacts").mkdir()
+        (path.parent / "artifacts" / "solvated.pdb").write_text(first_line + "\nATOM      1  O   HOH W   1\nEND\n")
+        keys, citations = _keys(job)
+        assert keys == expected, name
+        if expected:
+            reason = citations["selected"][0]["reasons"][0]
+            assert reason["evidence_file"] == str(path.parent / "artifacts" / "solvated.pdb")
+
+    # ligands: GAFF via the template generator (antechamber typing), NAGL Ash 1.0 or AM1-BCC charges
+    def topo(job, ligands, charges):
+        node(job, "t", "topo", metadata={"forcefield_provenance": {
+            "kind": "amber_via_openmmforcefields", "openmmforcefields_version": "0.16.0",
+            "small_molecule_forcefield": "gaff-2.11", "ligand_molecules": ligands,
+            "ligand_charge_assignment": charges}})
+        return _keys(job)
+
+    benzene = [{"residue_name": "BNZ", "topology_parameter_source": "topology_gaff_template_generator"}]
+    gaff = {"Wang2004GAFF", "Wang2006Antechamber", "Case2023AmberTools"}
+    keys, citations = topo(tmp_path / "nagl", benzene,
+                           [{"method": "nagl", "nagl_model": "openff-gnn-am1bcc-1.0.0.pt", "status": "success"}])
+    assert keys == gaff | {"Wang2025AshGCWorkingPaper"}
+    assert sorted((d["method"], d["version"]) for d in citations["documentation"]) == [
+        ("GAFF2 parameter set", "gaff-2.11"), ("OpenFF NAGL model", "openff-gnn-am1bcc-1.0.0.pt"),
+        ("openmmforcefields", "0.16.0")]
+    keys, _ = topo(tmp_path / "am1bcc", benzene, [{"method": "am1bcc_fallback", "status": "fallback"}])
+    assert keys == gaff | {"Jakalian2000AM1BCC", "Jakalian2002AM1BCC"}
+    keys, citations = topo(tmp_path / "am1bcc_requested", benzene,
+                           [{"method": "am1bcc", "charge_engine": "ambertools_sqm", "status": "success"}])
+    assert keys == gaff | {"Jakalian2000AM1BCC", "Jakalian2002AM1BCC"}
+    assert not any(u["method"] == "ligand_charge_method" for u in citations["unresolved"])
+    keys, citations = topo(tmp_path / "other_model", benzene,
+                           [{"method": "nagl", "nagl_model": "openff-gnn-am1bcc-0.1.0-rc.3.pt", "status": "success"}])
+    assert keys == gaff
+    assert any(u["method"] == "nagl_model" for u in citations["unresolved"])
+    # a protein-only build still names gaff-2.11 in its provenance; no ligand went through it
+    keys, citations = topo(tmp_path / "protein_only", [], [])
+    assert keys == set()
+    assert [d["method"] for d in citations["documentation"]] == ["openmmforcefields"]

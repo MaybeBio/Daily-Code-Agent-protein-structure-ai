@@ -1,0 +1,202 @@
+import { cleanup, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, expect, it, vi } from "vitest";
+import type { Job } from "../../types";
+import { QualityResults } from "../QualityResults";
+import type { PoseQualityResult } from "../types";
+import { viewerLoad } from "../../viewer/source-layout";
+afterEach(cleanup);
+
+const preview = vi.hoisted(() => vi.fn());
+vi.mock("../../viewer/StructureViewer", () => ({
+  StructureViewer: (props: unknown) => {
+    // Exercise the real iframe boundary even though WebGL is outside jsdom.
+    viewerLoad(props);
+    preview(props);
+    return <span>Real source preview</span>;
+  },
+}));
+it("keeps failed and unavailable checks distinct without fabricating a quality pass", () => {
+  const result: PoseQualityResult = {
+    operation: "pose_quality",
+    complete: true,
+    schema_version: 1,
+    inputs: {},
+    coordinate_basis: null,
+    versions: {},
+    native_config_sha256: "a".repeat(64),
+    classification: "fails",
+    options: { profile: "mol", cpu: 1, memory_mib: 2048 },
+    checks: [
+      { id: "bond_lengths", outcome: "fail" },
+      { id: "internal_energy", outcome: "unavailable" },
+    ],
+    metrics: {},
+    previews_sha256: { "molecule-preview.sdf": "a".repeat(64) },
+  };
+  render(
+    <QualityResults job={{ id: "job" } as Job} result={result} language="zh" />,
+  );
+  expect(screen.getByText("未能计算", { exact: true })).toBeVisible();
+  expect(screen.getByText("需要复核", { exact: true })).toBeVisible();
+  expect(
+    screen.queryByText("已通过全部适用检查", { exact: false }),
+  ).not.toBeInTheDocument();
+  expect(screen.getByText("Real source preview")).toBeVisible();
+  expect(screen.queryByRole("link", { name: "下载质控报告" })).toBeNull();
+  expect(screen.queryByText(/原始指标与来源|native_config_sha256/)).toBeNull();
+});
+
+it("keeps all check categories reachable and never treats a missing preview or check as a pass", async () => {
+  const result = {
+    classification: "incomplete",
+    inputs: {},
+    metrics: { number_bonds: 12 },
+    previews_sha256: {},
+    checks: [
+      { id: "bond_lengths", outcome: "pass" },
+      { id: "internal_energy", outcome: "unavailable" },
+      { id: "bond_angles", outcome: "fail" },
+    ],
+  } as unknown as PoseQualityResult;
+  const user = userEvent.setup();
+  render(
+    <QualityResults job={{ id: "job" } as Job} result={result} language="en" />,
+  );
+  expect(
+    screen.getByText("This quality result contains no preview structure."),
+  ).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Return to 3D" })).toBeNull();
+  const table = screen.getByRole("table", { name: "Quality check outcomes" });
+  const filter = screen.getByRole("combobox", { name: "Which checks?" });
+  expect(filter).toHaveValue("attention");
+  expect(within(table).getAllByRole("row")).toHaveLength(3);
+  expect(within(table).getAllByRole("row")[1]).toHaveTextContent(
+    "Needs review",
+  );
+  expect(within(table).queryByText("Pass")).toBeNull();
+  await user.selectOptions(filter, "all");
+  expect(within(table).getAllByRole("row")).toHaveLength(4);
+  await user.selectOptions(filter, "unavailable");
+  expect(within(table).getAllByRole("row")).toHaveLength(2);
+  expect(within(table).getByText("Not calculated")).toBeVisible();
+  expect(within(table).queryByText("Pass")).toBeNull();
+  expect(screen.queryByText("Real source preview")).toBeNull();
+});
+
+it.each(["en", "zh"] as const)(
+  "shows whole-pose RMSD and a read-only exact-record experimental overlay in %s",
+  async (language) => {
+    const result = {
+      classification: "fails",
+      coordinate_basis: "user_confirmed",
+      options: { profile: "redock", cpu: 1, memory_mib: 2048 },
+      inputs: {
+        protein: {},
+        molecule: {},
+        reference: { asset_id: "experimental", record: 7 },
+      },
+      previews_sha256: {
+        "protein-preview.pdb": "a".repeat(64),
+        "molecule-preview.sdf": "b".repeat(64),
+      },
+      metrics: {
+        rmsd: 8.6789695619,
+        kabsch_rmsd: 5.166254826,
+        smallest_distance_protein: 2.60249064,
+      },
+      checks: [{ id: "rmsd_≤_2å", outcome: "fail" }],
+    } as unknown as PoseQualityResult;
+    render(
+      <QualityResults
+        job={{ id: "native" } as Job}
+        result={result}
+        language={language}
+      />,
+    );
+    expect(screen.getByText("8.68 Å", { exact: true })).toBeVisible();
+    expect(
+      screen.getByText(
+        language === "zh"
+          ? "整分子原位 RMSD"
+          : "Whole-molecule RMSD in receptor frame",
+      ),
+    ).toBeVisible();
+    expect(preview).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sourceSnapshot: true }),
+    );
+    const user = userEvent.setup();
+    await user.click(
+      screen.getByRole("button", {
+        name: language === "zh" ? "实验参考叠合" : "Experimental overlay",
+      }),
+    );
+    expect(preview).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        urls: [
+          "/api/jobs/native/download?name=protein-preview.pdb",
+          "/api/jobs/native/download?name=molecule-preview.sdf",
+          "/api/assets/experimental",
+        ],
+        records: [0, 0, 7],
+        comparison: true,
+        sourceSnapshot: true,
+        focusModels: [1, 2],
+      }),
+    );
+    expect(result.metrics.rmsd).toBe(8.6789695619);
+    await user.click(
+      screen.getByRole("button", {
+        name: language === "zh" ? "查看检查" : "Review checks",
+      }),
+    );
+    expect(
+      screen.getByRole("region", {
+        name: language === "zh" ? "质量判读" : "Quality review",
+      }),
+    ).toHaveFocus();
+    await user.selectOptions(
+      screen.getByRole("combobox", {
+        name: language === "zh" ? "显示哪些检查？" : "Which checks?",
+      }),
+      "all",
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: language === "zh" ? "返回三维" : "Return to 3D",
+      }),
+    );
+    expect(
+      screen.getByRole("region", {
+        name: language === "zh" ? "姿势三维预览" : "Pose 3D preview",
+      }),
+    ).toHaveFocus();
+    expect(preview).toHaveBeenLastCalledWith(
+      expect.objectContaining({ comparison: true, records: [0, 0, 7] }),
+    );
+  },
+);
+
+it("never replaces missing or invalid measurements with zero, nor overlays a reference without a confirmed frame", () => {
+  const result = {
+    classification: "incomplete",
+    options: { profile: "redock" },
+    inputs: { protein: {}, reference: { asset_id: "experimental", record: 2 } },
+    coordinate_basis: null,
+    previews_sha256: { "molecule-preview.sdf": "a".repeat(64) },
+    metrics: { rmsd: Number.NaN, smallest_distance_protein: -1 },
+    checks: [],
+  } as unknown as PoseQualityResult;
+  render(
+    <QualityResults
+      job={{ id: "partial" } as Job}
+      result={result}
+      language="en"
+    />,
+  );
+  expect(screen.getAllByText("Not measured")).toHaveLength(2);
+  expect(screen.queryByText(/NaN|0\.00 Å/)).toBeNull();
+  expect(
+    screen.queryByRole("button", { name: "Experimental overlay" }),
+  ).toBeNull();
+});

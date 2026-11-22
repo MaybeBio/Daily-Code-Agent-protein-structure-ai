@@ -1,0 +1,111 @@
+#!/bin/bash
+
+#SBATCH --job-name=glycandock
+#SBATCH --partition=simbiosyslab,short
+#SBATCH --array=0-0
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=2G
+#SBATCH --time=06:00:00
+#SBATCH --output=./gdock_%A_%a.out
+
+# ====================== #
+# Run the GlycanDock
+# protocol on an input
+# receptor-glycoligand
+# complex, as a SLURM
+# job array.
+# ====================== #
+
+# Each array task is one independent process that generates one block of
+# decoys. GlycanDock samples are independent, so nothing is shared between
+# tasks and no communication is needed -- the scheduler is the whole
+# parallelization layer.
+#
+# One core per task is deliberate. PyRosetta runs this protocol
+# single-threaded, and the `short` and `sharing` partitions cap a single job at
+# MaxNodes=2 -- but an array is N separate jobs, so the array as a whole is not
+# bound by that limit. Many small tasks also backfill into idle slots faster
+# than a few large ones.
+#
+# --array is set to 0-0 here so a bare `sbatch` runs a single task. Override it
+# at submit time, and pass a matching --n-blocks (or rely on
+# $SLURM_ARRAY_TASK_COUNT, which run_glycandock.py reads automatically):
+#
+#   sbatch --array=0-41 scripts/slurm/run_glycandock.sh \
+#       complex.pdb -n 1000 --grid grid.pdb
+#
+# Size blocks so each task runs 1-4 hours; check the plan first with
+# `run_glycandock.py ... --dry-run`.
+#
+# Partition notes for this cluster:
+#   simbiosyslab  lab-owned, PriorityTier=10, 30 day limit, 768 CPUs on 3
+#                 nodes. QoS `pi` has no per-user limits, so throttle yourself.
+#   short         default, 2 day limit, ~9000 CPUs. Good general overflow.
+#                 QoS `short` caps each user at 50 running jobs (array tasks
+#                 count individually) and cpu=1024.
+#   sharing       ~22000 cores but a hard 1 hour limit -- size blocks to
+#                 finish in ~45 minutes with margin.
+# Throttle concurrent tasks on shared partitions with e.g. --array=0-41%20.
+#
+# Resources per task (measured, 2hrl-sia28sia, one decoy per task):
+#   - Nodes are hyperthreaded and SelectTypeParameters=CR_CORE_MEMORY, so a
+#     1-CPU task is allocated a whole core = 2 CPUs (sacct AllocCPUS=2). Count
+#     2 CPUs per task against partition totals.
+#   - Peak RSS ~1.0 GB. --mem=2G gives ~2x headroom; it matches the cluster
+#     DefMemPerCPU=2000 but is pinned here so it survives policy changes. If
+#     MaxRSS climbs on large blocks, raise it.
+#
+# Logs are written per task via %A_%a (job id, array index). Without that,
+# every task in the array would clobber the same file. stderr goes into the
+# same .out file (there is no --error), which halves the log inodes per run.
+#
+# Outputs: each task writes a single <run_id>_block<NNN>.tar.xz into --outdir
+# (decoys + manifest + timings), staging decoys in node-local $TMPDIR (else
+# /tmp) so per-decoy files never touch the project filesystem. To fold the
+# whole run into one <run_id>.tar.xz once every task has succeeded:
+#
+#   jid=$(sbatch --parsable --array=0-41 scripts/slurm/run_glycandock.sh \
+#       complex.pdb -n 1000 --grid grid.pdb --outdir runs/1k9i)
+#   sbatch --dependency=afterok:$jid scripts/slurm/merge_glycandock_blocks.sh \
+#       runs/1k9i --logs "gdock_${jid}_*.out"
+
+CONDA_PATH="${CONDA_PATH:-}"
+GLYCOGRAPHER_PATH="${GLYCOGRAPHER_PATH:-}"
+
+module purge
+
+## Resolve `GLYCOGRAPHER_PATH` and `CONDA_PATH`, expand ~, and set defaults
+if [ -z "$GLYCOGRAPHER_PATH" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    GLYCOGRAPHER_PATH="$(cd "$SCRIPT_DIR/../.." && pwd)"
+else
+    case "$GLYCOGRAPHER_PATH" in
+        ~*) GLYCOGRAPHER_PATH="${HOME}${GLYCOGRAPHER_PATH#\~}" ;;
+    esac
+fi
+
+## Prefer an explicitly set CONDA_PATH, otherwise try to discover Conda
+if [ -z "$CONDA_PATH" ]; then
+    if command -v conda >/dev/null 2>&1; then
+        CONDA_PATH="$(conda info --base 2>/dev/null || true)"
+    else
+        echo "Warning: conda not found; glycographer env may not activate properly"
+    fi
+fi
+
+# Exit on any error
+set -e
+
+if [[ "$#" -eq 0 ]]; then
+    echo "No arguments provided. See: run_glycandock.py --help"
+    exit 1
+fi
+
+echo "host=$(hostname) job=${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID} task=${SLURM_ARRAY_TASK_ID:-0}/${SLURM_ARRAY_TASK_COUNT:-1}"
+
+$CONDA_PATH/envs/glycographer/bin/python \
+    $GLYCOGRAPHER_PATH/scripts/run_glycandock.py "$@"
+
+exit 0

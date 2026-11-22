@@ -1,0 +1,11 @@
+biopython>=1.88
+biotite>=1.7.1
+numpy>=2.5.3
+pyarrow>=25.0.1
+scipy>=1.18.1
+torch>=2.14.0
+tqdm>=4.70.1
+transformers>=5.17.0
+# gpu_alignment.py: the Triton kernel, which ships Linux wheels only; pinned by environments/embedding_runtime/lock.txt,
+# and absent from the research lock on Windows, which the marker says.
+triton>=3.8.0; sys_platform == "linux"

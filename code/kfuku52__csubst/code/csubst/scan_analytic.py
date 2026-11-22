@@ -1,0 +1,333 @@
+"""Analytical endpoint-enrichment evidence under a fixed CTMC tree model.
+
+Each alternative exponentially tilts *endpoint* changes on specified branches,
+normalizing every transition row. A prespecified mixture likelihood ratio is
+an e-value under the simple null. Its reciprocal is a conservative P-value.
+Tree pruning integrates shared ancestors and site rate categories. No posterior
+mass is treated as an integer observation and no null simulations are used.
+"""
+
+import json
+import math
+
+import numpy as np
+from scipy.special import logsumexp
+
+from csubst import endpoint, endpoint_io
+
+
+MULTIPLIERS = (2., 10., 100.)
+ALTERNATIVES = (*MULTIPLIERS, 'conditional_endpoint')
+SUPPORTED_MATCHES = ('any2any', 'any2spe', 'spe2any', 'spe2spe')
+
+
+def validate_profile(profile):
+    """Validate prespecified probabilities; never estimate weights from test data."""
+    if not isinstance(profile, dict) or profile.get('version') != 1:
+        raise ValueError('Analytical profile requires version 1.')
+    atoms = profile.get('atoms')
+    if not isinstance(atoms, list) or not atoms:
+        raise ValueError('Analytical profile requires nonempty atoms.')
+    for atom in atoms:
+        if not isinstance(atom, dict) or set(atom) != {'multiplier', 'participation', 'weight'}:
+            raise ValueError('Each atom requires multiplier, participation and weight.')
+        multiplier, rho, weight = atom['multiplier'], atom['participation'], atom['weight']
+        for value in (rho, weight):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError('Profile probabilities must be finite numbers.')
+        if not 0 <= rho <= 1 or weight < 0:
+            raise ValueError('Invalid profile probabilities.')
+        if multiplier is not None and (isinstance(multiplier, bool)
+                or not isinstance(multiplier, (int, float)) or not math.isfinite(multiplier) or multiplier < 1):
+            raise ValueError('Multiplier must be finite and >=1, or null for the infinite limit.')
+    if not math.isclose(sum(a['weight'] for a in atoms), 1., rel_tol=0, abs_tol=1e-10):
+        raise ValueError('Profile weights must sum to one.')
+    return profile
+
+
+def read_profile(path):
+    with open(path, encoding='utf-8') as handle:
+        return validate_profile(json.load(handle))
+
+
+def default_profile():
+    return dict(version=1, atoms=[dict(multiplier=m, participation=1., weight=.25)
+                                for m in (*MULTIPLIERS, None)])
+
+
+def _log_child_message(transition, child, event=None, factors=None, participation=None, conditional=None):
+    """Propagate rare child evidence before rounding transition products."""
+    with np.errstate(divide='ignore'):
+        log_transition = np.log(transition)
+        log_child = np.log(child)[:, None, :]
+        base = logsumexp(log_transition + log_child, axis=2)
+        if event is None:
+            return base
+        log_tilted = log_transition + np.where(event, np.log(factors)[:, None, None], 0.)
+        log_tilted -= logsumexp(log_tilted, axis=2, keepdims=True)
+        if conditional.any():
+            selected = np.where(event, log_transition, -np.inf)
+            mass = logsumexp(selected, axis=1, keepdims=True)
+            possible = np.isfinite(mass)
+            log_tilted[conditional] = np.where(possible, selected - np.where(possible, mass, 0.),
+                                              log_transition)
+        tilted = logsumexp(log_tilted + log_child, axis=2)
+        return np.logaddexp(base + np.log1p(-participation)[:, None],
+                            tilted + np.log(participation)[:, None])
+
+
+class EndpointEnrichment:
+    def __init__(self, model, mapping, profile=None):
+        self.profile = validate_profile(default_profile() if profile is None else profile)
+        self.atoms = [dict(a) for a in self.profile["atoms"]]
+        self.model = model
+        self.mapping = np.asarray(mapping)
+        if (self.mapping.shape != model.pi.shape or self.mapping.dtype.kind not in 'iu'
+                or np.any(self.mapping < 0)):
+            raise ValueError('Invalid endpoint-to-scan state mapping.')
+
+    def log_likelihoods(self, tips, branches=(), from_ids=(), to_ids=()):
+        """Null then prespecified alternative atoms, with scaled pruning."""
+        model = self.model
+        if set(tips) != model.leaves:
+            raise ValueError('Every leaf needs an observation likelihood.')
+        branches = set(map(int, branches))
+        if not branches <= set(model.order) - {model.root}:
+            raise ValueError('Target branches must be non-root tree nodes.')
+        event = (np.isin(self.mapping, from_ids)[:, None]
+                 & np.isin(self.mapping, to_ids)[None, :]
+                 & (self.mapping[:, None] != self.mapping[None, :]))
+        # Infinite-tilt rows are formed without infinities.
+        factors = np.array([1.] + [a["multiplier"] or 1. for a in self.atoms])
+        large_tilts = np.flatnonzero(factors > np.finfo(float).max / 2)
+        participation = np.array([0.] + [a["participation"] for a in self.atoms])
+        conditional = np.array([False] + [a["multiplier"] is None for a in self.atoms])
+        conditional_indices = np.flatnonzero(conditional)
+        likelihoods = []
+        for category, weight in enumerate(model.weights):
+            partial: dict[int, np.ndarray] = {}
+            scales: dict[int, np.ndarray] = {}
+            for node in reversed(model.order):
+                value = np.ones((len(factors), model.pi.size))
+                scale = np.zeros(len(factors))
+                if node in model.leaves:
+                    tip = np.asarray(tips[node], dtype=float)
+                    if tip.shape != model.pi.shape or not np.isfinite(tip).all() or np.any(tip < 0):
+                        raise ValueError('Invalid leaf observation likelihood.')
+                    value *= tip
+                messages = []
+                rare = None
+                for child in model.children[node]:
+                    transition = model.transition(child, category)
+                    child_partial = partial.pop(child)
+                    targeted = child in branches
+                    if targeted:
+                        tilted = transition[None, :, :] * np.where(event, factors[:, None, None], 1.)
+                        selected = transition * event
+                        mass = selected.sum(axis=1, keepdims=True)
+                        if large_tilts.size:
+                            # Halve rows whose matching mass could push their sum
+                            # out of range, preserving their relative weights.
+                            heavy_rows = mass[:, 0] > .5
+                            for index in large_tilts:
+                                tilted[index, heavy_rows] *= .5
+                        tilted /= tilted.sum(axis=2, keepdims=True)
+                        # If the null gives this row zero event probability
+                        # (e.g. zero branch length), every finite tilt is the
+                        # original row, so its limit is also the original row.
+                        for index in conditional_indices:
+                            np.divide(selected, mass, out=tilted[index], where=mass > 0)
+                        tilted = (participation[:, None, None] * tilted
+                                  + (1 - participation[:, None, None]) * transition)
+                        message = np.einsum('aij,aj->ai', tilted, child_partial)
+                    else:
+                        message = child_partial @ transition.T
+                    child_scale = scales.pop(child)
+                    messages.append((child, child_partial, child_scale))
+                    value *= message
+                    scale += child_scale
+                    normalizer = value.max(axis=1)
+                    if normalizer.min() < endpoint._PRUNING_LOG_THRESHOLD:
+                        small = (normalizer < endpoint._PRUNING_LOG_THRESHOLD) & np.isfinite(scale)
+                        if small.any():
+                            rare = small if rare is None else rare | small
+                    # A zero likelihood is legitimate for an impossible category.
+                    positive = normalizer > 0
+                    value[positive] /= normalizer[positive, None]
+                    with np.errstate(divide='ignore'):
+                        scale += np.log(normalizer)
+                if rare is not None:
+                    # Recover states lost in any intermediate sibling
+                    # product and compute the scale from the original messages.
+                    log_value = np.zeros_like(value[rare])
+                    log_scale = np.zeros_like(scale[rare])
+                    for child, child_partial, child_scale in messages:
+                        transition = model.transition(child, category)
+                        if child in branches:
+                            log_value += _log_child_message(
+                                transition, child_partial[rare], event,
+                                factors[rare], participation[rare], conditional[rare],
+                            )
+                        else:
+                            log_value += _log_child_message(transition, child_partial[rare])
+                        log_scale += child_scale[rare]
+                    maximum = log_value.max(axis=1)
+                    value[rare] = np.exp(log_value - np.where(np.isfinite(maximum), maximum, 0.)[:, None])
+                    scale[rare] = log_scale + maximum
+                partial[node], scales[node] = value, scale
+            root_partial = partial[model.root]
+            root_mass = root_partial @ model.pi
+            with np.errstate(divide='ignore'):
+                log_root = np.log(root_mass)
+                subnormal = root_mass < np.finfo(float).tiny
+                if subnormal.any():
+                    # The root prior can make every compatible term round to
+                    # zero even when the scaled conditional likelihood is positive.
+                    log_root[subnormal] = logsumexp(np.log(root_partial[subnormal]) + np.log(model.pi), axis=1)
+            likelihoods.append(log_root + scales[model.root] + math.log(weight))
+        return logsumexp(likelihoods, axis=0)
+
+    def test(self, tips, branches, from_ids, to_ids):
+        logs = self.log_likelihoods(tips, branches, from_ids, to_ids)
+        if not np.isfinite(logs[0]):
+            raise ValueError('Observed site has zero likelihood under the declared null.')
+        log_e = float(logsumexp(logs[1:], b=[a["weight"] for a in self.atoms]) - logs[0])
+        # Keep log evidence even when a very small P underflows in float64.
+        return min(1., math.exp(min(0., -log_e))), log_e
+
+
+def adjusted_pvalues(pvalues, family_size, dependence='BH', *, log_scale=False):
+    """Adjust probabilities (or their natural logs) for the full family."""
+    p = np.asarray(pvalues, dtype=float)
+    invalid = np.isnan(p) | (p > 0) if log_scale else ~np.isfinite(p) | (p < 0) | (p > 1)
+    if (p.ndim != 1 or invalid.any()
+            or int(family_size) != family_size or family_size < p.size):
+        raise ValueError('Invalid analytical P-values or prespecified family size.')
+    if dependence not in ('BH', 'BY'):
+        raise ValueError('Unknown FDR method.')
+    if not p.size:
+        return p.copy()
+    factor = 1.
+    if dependence == 'BY':
+        from scipy.special import digamma
+        factor = float(digamma(family_size + 1) + np.euler_gamma)
+    order = np.argsort(p, kind='stable')
+    ranks = np.arange(1, len(p) + 1)
+    if log_scale:
+        ranked = p[order] + math.log(family_size) + math.log(factor) - np.log(ranks)
+        adjusted = np.minimum(0., np.minimum.accumulate(ranked[::-1])[::-1])
+        with np.errstate(under='ignore'):
+            adjusted = np.exp(adjusted)
+    else:
+        ranked = p[order] * family_size * factor / ranks
+        adjusted = np.minimum(1., np.minimum.accumulate(ranked[::-1])[::-1])
+    out = np.empty_like(p)
+    out[order] = adjusted
+    return out
+
+
+def family_size(sites, states, traits, targets, matches):
+    if (any(isinstance(v, bool) or int(v) != v for v in (sites, states, traits, targets))
+            or sites < 0 or min(states, traits, targets) < 1 or not matches):
+        raise ValueError('Invalid prespecified analytical hypothesis dimensions.')
+    if set(matches) - set(SUPPORTED_MATCHES):
+        raise ValueError('Endpoint analytical P supports any2any, any2spe, spe2any and spe2spe only.')
+    counts = {'any2any': 1, 'any2spe': states, 'spe2any': states, 'spe2spe': states * (states - 1)}
+    return int(sites * traits * targets * sum(counts[m] for m in set(matches)))
+
+
+def validate_options(g):
+    """Reject unsupported combinations before fitting IQ-TREE or reading data."""
+    mode = g.get('scan_analytic_pvalue', 'none')
+    if mode == 'none':
+        if g.get('scan_analytic_profile'):
+            raise ValueError('--scan_analytic_profile requires --scan_analytic_pvalue endpoint_mixture.')
+        return False
+    if mode != 'endpoint_mixture':
+        raise ValueError('--scan_analytic_pvalue must be none or endpoint_mixture.')
+    if g.get('scan_pvalue_calibration', 'full_scan') != 'none':
+        raise ValueError('Endpoint analytical inference requires --scan_pvalue_calibration none.')
+    if str(g.get('ml_anc', False)).strip().lower() in ('true', 'yes', '1', 'y', 'on'):
+        raise ValueError('Endpoint analytical scan requires --ml_anc no to retain tip ambiguity.')
+    if g.get('nonsyn_recode') == '3di20':
+        raise ValueError('Endpoint analytical scan currently requires a codon model.')
+    from csubst import substitution_scan
+    matches = substitution_scan.normalize_scan_matches(g.get('scan_match', 'any2spe'))
+    family_size(0, 2, 1, 1, matches)
+    if g.get('scan_analytic_profile'):
+        read_profile(g['scan_analytic_profile'])
+    return True
+
+
+def prepare(g):
+    """Freeze the null and hypothesis universe before discovery/site filtering."""
+    if not validate_options(g):
+        return None
+    name = str(g.get('substitution_model', ''))
+    rates, weights = endpoint_io.model_rates(g)
+    parents, lengths = endpoint_io._tree_arrays(g, False)
+    model = endpoint.EndpointModel(parents, lengths, g['instantaneous_codon_rate_matrix'],
+                                   g.get('equilibrium_frequency', g.get('empirical_eq_freq')), rates, weights)
+    mapping = endpoint_io._mapping(g, 'N', model.pi.size).argmax(axis=1)
+    from csubst import substitution_scan
+    matches = substitution_scan.normalize_scan_matches(g.get('scan_match', 'any2spe'))
+    targets = ['fg']
+    sites = g['state_cdn'].shape[1]
+    total = family_size(sites, len(g['nonsyn_state_orders']), len(g['fg_df'].columns) - 1, len(targets), matches)
+    profile = read_profile(g['scan_analytic_profile']) if g.get('scan_analytic_profile') else default_profile()
+    g['scan_analytic_summary'] = dict(method='endpoint_mixture_likelihood_ratio_reciprocal',
+        p_column='p_endpoint_enrichment_analytic', log_e_column='log_e_endpoint_enrichment',
+        family_size=total, family_scope='all_input_sites_states_traits_targets_matches_before_selection',
+        alternatives=profile["atoms"], alternative_profile=profile, null='fixed_fitted_codon_CTMC_with_rate_category_mixture',
+        validity='superuniform_for_fixed_correct_null; fitted_nuisance_uncertainty_not_calibrated',
+        bh_assumption='equivalent_to_eBH_for_reciprocal_e_values; arbitrary_dependence_under_fixed_correct_null',
+        by_assumption='arbitrary_dependence_with_valid_marginal_P',
+        rates=rates.tolist(), weights=weights.tolist(), input_sites=int(sites),
+        null_model=dict(name=name, parents=parents.tolist(), branch_lengths=lengths.tolist(),
+                        q=model.q.tolist(), pi=model.pi.tolist(), state_mapping=mapping.tolist()))
+    return EndpointEnrichment(model, mapping, profile)
+
+
+def annotate(g, frame, units, engine):
+    if engine is None:
+        return frame
+    from csubst import substitution_scan
+    out = frame.copy()
+    import pandas as pd
+    # Determine target clades from topology and phenotype only. ASR coverage
+    # or support must never select the alternative tested on the same data.
+    valid = np.array([n for n in engine.model.order if n != engine.model.root], dtype=int)
+    units = substitution_scan.build_scan_units(g, pd.DataFrame({'branch_id': valid}))
+    traits = list(g['fg_df'].columns[1:])
+    fg = substitution_scan._fg_ids_map_from_units(units, traits, 'fg_branch_ids', g.get('fg_ids', {}))
+    rate_fg = substitution_scan._rate_fg_ids_map_from_units(units, fg, traits)
+    g['scan_analytic_summary']['target_branches'] = {t: ids.tolist() for t, ids in rate_fg.items()}
+    values, logs = [], []
+    for _, row in out.iterrows():
+        site = int(row['site'])
+        tips = {}
+        for leaf in engine.model.leaves:
+            emissions = g.get('scan_tip_emissions', g['state_cdn'])
+            obs = np.asarray(emissions[leaf, site], dtype=float)
+            tips[leaf] = obs if obs.sum() else np.ones(engine.model.pi.size)
+        branches = substitution_scan._target_branch_ids_from_maps(rate_fg, row['trait'], row['target_class'], valid)
+        if "event_eligible" in g:
+            branches = branches[g["event_eligible"][branches, site]]
+        p, log_e = engine.test(tips, branches,
+            [int(v) for v in str(row['from_state_ids']).split(',') if v],
+            [int(v) for v in str(row['to_state_ids']).split(',') if v])
+        values.append(p)
+        logs.append(log_e)
+    total = g['scan_analytic_summary']['family_size']
+    out['p_endpoint_enrichment_analytic'] = values
+    out['log_e_endpoint_enrichment'] = logs
+    out['scan_analytic_family_size'] = total
+    out['scan_analytic_status'] = 'model_conditional_fitted_null'
+    pvalues = np.asarray(values, dtype=float)
+    log_scale = pvalues.min(initial=1.) < np.finfo(float).tiny
+    if log_scale:
+        # Recover ordering and apply the family-size factor before rounding.
+        pvalues = np.minimum(0., -np.asarray(logs, dtype=float))
+    out['q_endpoint_enrichment_analytic_bh'] = adjusted_pvalues(pvalues, total, log_scale=log_scale)
+    out['q_endpoint_enrichment_analytic_by'] = adjusted_pvalues(pvalues, total, 'BY', log_scale=log_scale)
+    return out

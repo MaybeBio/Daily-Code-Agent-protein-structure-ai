@@ -1,0 +1,176 @@
+name: Cpptraj Tests
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  linux_build:
+    runs-on: ubuntu-latest
+    name: Build ${{ matrix.compiler }} with CMake ${{ matrix.use_cmake }}
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: ["gnu", "clang"]
+        use_cmake: ["0", "1"]
+        use_openmp: ["no"]
+        use_mpi: ["no"]
+        include:
+          - use_openmp: "yes"
+            compiler: "gnu"
+            use_mpi: "no"
+            use_cmake: "0"
+          - use_openmp: "no"
+            compiler: "gnu"
+            use_mpi: "yes"
+            use_cmake: "0"
+          - use_openmp: "yes"
+            compiler: "gnu"
+            use_mpi: "yes"
+            use_cmake: "0"
+          - use_openmp: "no"
+            compiler: "gnu"
+            use_mpi: "yes"
+            use_cmake: "1"
+
+    env:
+      COMPILER: ${{ matrix.compiler }}
+      USE_CMAKE: ${{ matrix.use_cmake }}
+      BUILD_TYPE: "install"
+      TEST_TYPE: "test.showerrors"
+      USE_MPI: ${{ matrix.use_mpi }}
+      USE_OPENMP: ${{ matrix.use_openmp }}
+
+    steps:
+      - name: Install prerequisite packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --fix-missing gfortran
+          sudo apt-get install -y --fix-missing libbz2-dev
+          sudo apt-get install -y --fix-missing libblas-dev liblapack-dev
+          sudo apt-get install -y --fix-missing libfftw3-dev
+          sudo apt-get install -y --fix-missing clang
+          sudo apt-get install -y --fix-missing cmake-data cmake
+
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      - name: Compile and test cpptraj
+        shell: bash -lex {0}
+        run: |
+          curl -OL https://anaconda.org/AmberMD/amber_phenix/0.9.6/download/linux-64/amber_phenix-0.9.6-0.tar.bz2
+          tar jxf amber_phenix-0.9.6-0.tar.bz2 lib/libsander.so AmberTools/src/sander/sander.h
+          mkdir -p include && mv AmberTools/src/sander/sander.h include
+          mv lib include $HOME
+
+          if [ $USE_OPENMP = "yes" ]; then
+            export OPT="openmp"
+            export OMP_NUM_THREADS=4
+            if [ "$USE_CMAKE" = "1" ]; then
+              export BUILD_FLAGS="-DOPENMP=TRUE"
+            else
+              export BUILD_FLAGS="-openmp"
+            fi
+          fi
+
+          if [ $USE_MPI = "yes" ]; then
+            curl -OL http://www.mpich.org/static/downloads/3.4.2/mpich-3.4.2.tar.gz
+            tar -zxf mpich-3.4.2.tar.gz
+            cd mpich-3.4.2
+            export FFLAGS=-fallow-argument-mismatch
+            ./configure --with-device=ch3 --prefix=$HOME
+            make -j2
+            make install
+            cd ..
+            export PATH=$HOME/bin:$PATH
+            export LD_LIBRARY_PATH=$HOME/lib:$LD_LIBRARY_PATH
+            export DO_PARALLEL="mpirun -n 2"
+            if [ $USE_OPENMP = "yes" ]; then
+              export OMP_NUM_THREADS=1
+            fi
+            if [ "$USE_CMAKE" = "1" ]; then
+              export BUILD_FLAGS="-DMPI=TRUE ${BUILD_FLAGS}"
+            else
+              export BUILD_FLAGS="-mpi ${BUILD_FLAGS}"
+            fi
+          fi
+
+          if [ "$USE_CMAKE" = "1" ]; then
+            curl -OL https://github.com/Unidata/netcdf-c/archive/refs/tags/v4.9.3.tar.gz
+            tar -zxf v4.9.3.tar.gz
+            cd netcdf-c-4.9.3
+            ./configure --disable-byterange --disable-libxml2 --disable-netcdf-4 --disable-dap --disable-doxygen --prefix=$HOME
+            make -j2
+            make install
+            cd ..
+            export PATH=$HOME/bin:$PATH
+            export LD_LIBRARY_PATH=$HOME/lib:${LD_LIBRARY_PATH}
+
+            mkdir build install
+            installdir=$(pwd)
+            cd build
+            cmake .. $BUILD_FLAGS -DCOMPILER=${COMPILER^^} -DINSTALL_HEADERS=FALSE \
+                     -DCMAKE_INSTALL_PREFIX=$installdir -DCMAKE_LIBRARY_PATH=$HOME/lib \
+                     -DPRINT_PACKAGING_REPORT=TRUE -DNetCDF_LIBRARIES_C=$HOME/lib/libnetcdf.so \
+                     -DNetCDF_INCLUDES=$HOME/include
+            make -j2 install
+            cd ..
+            export PATH=$installdir/bin:$PATH
+          else
+            export LD_LIBRARY_PATH=$HOME/lib:${LD_LIBRARY_PATH}
+            ./configure -makeblas --buildlibs ${BUILD_FLAGS} ${COMPILER}
+            source cpptraj.sh
+            make -j2 install
+          fi
+          cd test && make $TEST_TYPE
+
+  build-pytraj:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -l {0}
+    strategy:
+      max-parallel: 5
+    steps:
+    - uses: actions/checkout@v5
+    - name: Set up conda
+      uses: conda-incubator/setup-miniconda@v4
+      with:
+        miniforge-version: latest
+        auto-update-conda: true
+        channels: conda-forge
+        channel-priority: strict
+        environment-file: devtools/ci/environment.yml
+        activate-environment: cpptraj-ci
+    - name: Install cpptraj
+      run: |
+        echo "CONDA root: $CONDA_PREFIX"
+        conda info
+        conda list
+        python --version
+        export PATH=$HOME/bin:${PATH}
+        export LD_LIBRARY_PATH=$HOME/lib:${LD_LIBRARY_PATH}
+        export PATH=$CONDA_PREFIX/bin:${PATH}
+        export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}
+        echo $PATH
+        echo $LD_LIBRARY_PATH
+        ls $CONDA_PREFIX/lib
+        export MAKE_COMMAND="make -j2"
+        ./configure -makeblas --buildlibs -openmp -shared --with-zlib=$CONDA_PREFIX --with-bzlib=$CONDA_PREFIX --with-hdf5=$CONDA_PREFIX --with-netcdf=$CONDA_PREFIX --with-fftw3=$CONDA_PREFIX gnu
+        source cpptraj.sh
+        make -j2 libcpptraj
+    - name: Install pytraj
+      run: |        
+        git clone https://github.com/Amber-MD/pytraj.git
+        export PATH=$CONDA_PREFIX/bin:${PATH}
+        export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}
+        source cpptraj.sh
+        cd pytraj
+        python setup.py install
+        cd ..
+    - name: Test with pytest
+      run: |
+        export PATH=$CONDA_PREFIX/bin:${PATH}
+        export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:${LD_LIBRARY_PATH}
+        source cpptraj.sh && cd pytraj/tests && pytest -vs --ignore=test_parallel_pmap

@@ -1,0 +1,319 @@
+import os
+from datetime import datetime
+import functools
+
+from accelerate import Accelerator
+from accelerate.utils import gather_object
+import click
+import pandas as pd
+import torch
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoProcessor
+from tqdm import tqdm
+
+from proxyz.data import sampler
+from proxyz.utils import data_utils, dict2object, model_utils, structure_utils
+
+
+@click.command(context_settings={"show_default": True})
+@click.option(
+    "--model_dir",
+    type=click.Path(),
+    default="./deepseek_style_model",
+    help="Trained model dir. If it has no weights at the root, the latest "
+    "checkpoint-* subdirectory is used automatically.",
+)
+@click.option(
+    "--data_files", type=click.Path(), multiple=True, help="Data files to classify. "
+)
+@click.option(
+    "--cluster_files",
+    type=click.Path(),
+    multiple=True,
+    help="Clustering files for cluster-based sampling. Each file has two columns: "
+    "cluster_id and data_row_id. Sampling weight = n / (1 + log(n)) or 1 + log(n) "
+    "where n is cluster size.",
+)
+@click.option(
+    "--data_format",
+    type=click.Choice(["line", "fasta", "foldcomp", "pdb"]),
+    default="line",
+    help="Input format: one sequence per line ('line'), FASTA ('fasta'), "
+    "Foldcomp ('foldcomp') or PDB ('pdb/cif').",
+)
+@click.option(
+    "--max_sequence_length",
+    type=int,
+    default=None,
+    help="If set, randomly crop sequences longer than this to a subsequence of this "
+    "length. Useful for controlling memory usage with variable-length inputs.",
+)
+@click.option(
+    "--batch_size", type=int, default=8, help="Sequences classified per batch."
+)
+@click.option(
+    "--output_dir",
+    type=click.Path(),
+    default="./classify_sequences",
+    help="Directory where the output FASTA file is written.",
+)
+@click.option(
+    "--contact_ranges",
+    type=click.Choice(structure_utils.contact_ranges.keys()),
+    multiple=True,
+    default=structure_utils.contact_ranges.keys(),
+    help="Minimum separation distance to consider. We often want to measure contacts "
+    "at a certain range. Typical ranges are short [6, 12], medium [12, 24], and long "
+    "[24, inf)."
+)
+@click.option("--seed", type=int, default=42, help="Random seed for reproducibility.")
+@click.option(
+    "--attn_implementation",
+    type=click.Choice(["flash_attention_2", "sdpa", "eager"]),
+    default="flash_attention_2",
+    help="Attention backend used for inference.",
+)
+@click.option(
+    "--torch_compile",
+    is_flag=True,
+    help="Compiles PyTorch code to fused kernels to make it run faster.",
+)
+@click.option(
+    "--save_features",
+    is_flag=True,
+    help="Run a forward pass over each sequence and save the auxiliary "
+    "token-classification outputs (CLE logits, distogram logits) as a .pt file.",
+)
+@click.option("-v", "--verbose", is_flag=True, help="verbose output.")
+def main(**args):
+    args = dict2object(**args)
+
+    torch.manual_seed(args.seed)
+    accelerator = Accelerator()
+    device = accelerator.device
+    use_cuda = torch.cuda.is_available()
+
+    # ==========================================
+    # 1. RESOLVE MODEL & LOAD TOKENIZER
+    # ==========================================
+    model_path = model_utils.resolve_model_path(args.model_dir)
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+
+    if processor.tokenizer.bos_token_id is None or (
+        processor.tokenizer.eos_token_id is None
+    ):
+        raise click.UsageError(
+            "Tokenizer has no [BOS]/[EOS]. Retrain with the updated train.py "
+            "(which adds them) or point --model_dir at such a model."
+        )
+
+    # ==========================================
+    # 2. LOAD TRAINED MODEL
+    # ==========================================
+    # FlashAttention needs half precision; bf16 is also the fastest path on CUDA.
+    dtype = torch.bfloat16 if use_cuda else torch.float32
+    attn_impl = args.attn_implementation if use_cuda else "eager"
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        dtype=dtype,
+        attn_implementation=attn_impl,
+        trust_remote_code=True,
+    )
+    model = model.to(device).eval()
+
+    if args.save_features and not (
+        model.config.has_cle_lm_head or model.config.has_distogram_lm_head
+    ):
+        raise click.UsageError(
+            "--save_features requires a checkpoint trained with "
+            "--model_has_cle_lm_head and/or --model_has_distogram_lm_head."
+        )
+
+    if args.torch_compile:
+        model = torch.compile(model)
+
+    if args.verbose:
+        print(f"--- ProXYZ Classification ---")  # pylint: disable=f-string-without-interpolation
+        print(f"Model:       {model_path}")
+        print(f"Device:      {device}  dtype={dtype}  attn={attn_impl}")
+        print(f"Vocab size:  {len(processor.tokenizer)}  bos={processor.tokenizer.bos_token_id} eos={processor.tokenizer.eos_token_id}")  # pylint: disable=line-too-long
+        print(f"Data files:  {','.join(args.data_files)}")
+        print(f"Data format: {args.data_format}")
+
+    # ==========================================
+    # 3. ENCODE PROMPT & CLASSIFY IN BATCHES
+    # ==========================================
+    # Ban all tokens whose string representation contains "X" (unknown residue).
+    # This prevents the model from emitting ambiguous amino-acid placeholders.
+    eval_dataset = data_utils.create_dataset(args.data_files, args.data_format)
+
+    # Apply tokenization
+    tokenize_function = functools.partial(
+        data_utils.tokenize_function,
+        processor,
+        args.data_format,
+        char_apply=model.config.has_characterization,
+        max_length=args.max_sequence_length,
+    )
+    eval_dataset = eval_dataset.with_transform(tokenize_function)
+
+    # Load cluster information and compute sampling weights if cluster files provided
+    eval_sampler = None
+    if args.cluster_files:
+        # Dedicated seeded generator so sampling is reproducible regardless of
+        # global RNG consumption elsewhere (model loading, accelerate, ...).
+        generator = torch.Generator().manual_seed(args.seed)
+        eval_sampler = sampler.from_cluster_files(
+            eval_dataset, args.cluster_files, generator=generator
+        )
+        if args.verbose:
+            print(f"--- Cluster-based sampling ---")  # pylint: disable=f-string-without-interpolation
+            print(f"Clusters: {len(eval_sampler):,}")
+
+    eval_dataloader = DataLoader(
+        eval_dataset, batch_size=args.batch_size, sampler=eval_sampler, pin_memory=True
+    )
+    eval_dataloader = accelerator.prepare(eval_dataloader)
+
+    # TODO: provided by args
+    # distogram to contact: bin k covers (bins[k-1], bins[k]], so the last bin
+    # fully within 8 A is the last boundary <= 8, i.e. count(bins <= 8) - 1.
+    distogram_cutoff_idx = int((processor.distogram_bins <= 8).sum(-1)) - 1
+
+    loss_fn = functools.partial(F.cross_entropy, ignore_index=processor.ignore_index)
+
+    # Normal clasification mode
+    results, features = [], []
+    for input_ids in tqdm(
+        eval_dataloader, desc="classification", disable=not accelerator.is_main_process
+    ):
+        input_ids = data_utils.prepare_inputs(processor, input_ids)
+        with torch.no_grad():
+            outputs = model(**input_ids, use_cache=False)
+
+        attention_mask_key = "char_attention_mask"
+        if attention_mask_key not in input_ids:
+            attention_mask_key = "attention_mask"
+        assert attention_mask_key in input_ids
+
+        if outputs.distogram_logits is not None and "distogram_labels" in input_ids:
+            distogram_labels = input_ids["distogram_labels"]
+
+            valid_length = (distogram_labels != processor.ignore_index).any(-1).sum(-1)
+
+            contact_matrix = F.softmax(outputs.distogram_logits, dim=-1)
+            contact_matrix = contact_matrix[..., :distogram_cutoff_idx + 1].sum(-1)
+            contact_target = (distogram_labels <= distogram_cutoff_idx).where(
+                distogram_labels != processor.ignore_index, processor.ignore_index
+            )
+
+            distogram_metrics = structure_utils.contact_precision(
+                contact_matrix, contact_target, src_lengths=valid_length
+            )
+            for contact_range in args.contact_ranges:
+                minsep, maxsep = structure_utils.contact_ranges[contact_range]
+                distogram_metrics.update(
+                    {
+                        f"{key}/{contact_range}": value
+                        for key, value in structure_utils.contact_precision(
+                            contact_matrix,
+                            contact_target,
+                            src_lengths=valid_length,
+                            minsep=minsep,
+                            maxsep=maxsep,
+                        ).items()
+                    }
+                )
+        else:
+            distogram_metrics = None
+
+        batched_result = []
+        for idx in range(len(input_ids["id"])):
+            result = {
+                "id": input_ids["id"][idx],
+                "length": input_ids[attention_mask_key][idx].sum().item() - 2
+            }
+            ppl = torch.exp(
+                loss_fn(outputs.logits[idx][:-1, :], input_ids["labels"][idx][1:])
+            )
+            if outputs.char_logits is not None:
+                char_ppl = torch.exp(
+                    loss_fn(
+                        outputs.char_logits[idx][:-1, :],
+                        input_ids["char_labels"][idx][1:],
+                    )
+                )
+                result["PPL/char"] = char_ppl.item()
+                result["PPL/token"] = ppl.item()
+                ppl *= char_ppl
+            result["PPL"] = ppl.item()
+            if distogram_metrics is not None:
+                result["valid"] = valid_length[idx].item()
+                for key, value in distogram_metrics.items():
+                    result[key] = value[idx].item()
+            batched_result.append(result)
+
+        # Gather python strings/objects across all GPUs safely. This returns a list of
+        # all strings from all GPUs combined
+        batched_result = gather_object(batched_result)
+        if accelerator.is_main_process:
+            results += batched_result
+
+        if args.save_features:
+            batched_feature = []
+            for idx in range(len(input_ids["id"])):
+                feat = {
+                    "id": input_ids["id"][idx],
+                    "mask": input_ids[attention_mask_key][idx].cpu(),
+                }
+                if outputs.cle_logits is not None:
+                    feat["cle_logits"] = outputs.cle_logits[idx].cpu()
+                if outputs.distogram_logits is not None:
+                    feat["distogram_logits"] = outputs.distogram_logits[idx].cpu()
+                batched_feature.append(feat)
+
+            batched_feature = gather_object(batched_feature)
+            if accelerator.is_main_process:
+                features += batched_feature
+
+    # ==========================================
+    # 4. WRITE EMBED OUTPUT
+    # ==========================================
+    if accelerator.is_main_process:
+        # Drop the padded duplicates instead of positional truncation: they sit
+        # at the end of each process stream, i.e. mid-list after gathering.
+        results = list(data_utils.deduplicate(results))
+        features = list(data_utils.deduplicate(features))
+        if len(results) != len(eval_dataset):
+            print(
+                f"Warning: classified {len(results)} of {len(eval_dataset)} sequences"
+            )
+
+        os.makedirs(args.output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        if features and args.save_features:
+            output_path = os.path.join(args.output_dir, f"classify_{timestamp}.pt")
+
+            with open(output_path, "wb") as f:
+                torch.save(features, f)
+
+            print(f"Wrote {len(features)} features to {output_path}")
+
+        output_path = os.path.join(args.output_dir, f"classify_{timestamp}.csv")
+        df = pd.DataFrame(results)
+        if args.verbose:
+            print("Classification Summary:")
+            print(df.describe())
+        df.to_csv(output_path, index=False)
+        print(f"Wrote {len(results)} results to {output_path}")
+
+    # Clean up distributed process group to avoid resource leaks
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

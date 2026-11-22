@@ -1,0 +1,9 @@
+channels:
+- uibcdf
+- conda-forge
+- ambermd
+dependencies:
+- python
+- pip
+- setuptools >=77.0.3
+- versioningit>=3.0

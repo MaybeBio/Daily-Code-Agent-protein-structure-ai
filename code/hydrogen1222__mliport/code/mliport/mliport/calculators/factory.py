@@ -1,0 +1,265 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+#
+# Modified for the mliport project: multi-engine CalculatorFactory.
+
+"""
+Calculator factory.
+
+Selects the right MLIP engine wrapper from a ``model_type`` string. Each
+wrapper is imported lazily so only the chosen engine's backend is loaded.
+Adding a new engine only requires one new wrapper module + one ``elif``
+branch here; Runners/Writers/CLI/TUI stay untouched.
+
+Phase 1 changes (plan section 11.1 / 17.2):
+
+* MACE receives its full backend-specific options (``default_dtype`` with a
+  factory-level float64 fallback, and ``head``) so the dtype chosen on the
+  CLI/INCAR/API actually reaches ``MACECalculator``.
+* ``cuda:0`` style device strings are accepted and forwarded unchanged.
+* Unknown / misspelled engine-specific options are rejected (or warned about)
+  instead of being silently dropped -- a typo such as ``default_dtpe`` now
+  reports ``Did you mean 'default_dtype'?`` rather than silently using float64.
+"""
+
+from __future__ import annotations
+
+import difflib
+import warnings
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from mliport.backend_selection import (
+    ALL_CALCULATOR_OPTION_KEYS,
+    CALCULATOR_OPTION_KEYS,
+    PROCESS_ISOLATED_BACKENDS,
+    SUPPORTED_TYPES,
+    UMA_ALIASES,
+    calculator_option_keys,
+    require_model_type,
+)
+from mliport.base_calculator import BaseMLIPCalculator
+from mliport.calculators.dispersion import (
+    D3CorrectedCalculator,
+    d3_device,
+    normalize_d3_options,
+)
+
+if TYPE_CHECKING:
+    from typing import Any
+
+
+# Calculator-option keys each engine consumes come from the central backend
+# table. Keys that belong to a *different* engine are rejected in strict mode
+# (warn-and-drop in lenient mode); keys that match no engine are typos.
+_CALC_KEYS = CALCULATOR_OPTION_KEYS
+_ALL_CALC_KEYS = ALL_CALCULATOR_OPTION_KEYS
+
+
+def _check_unknown_kwargs(
+    model_type: str, kwargs: dict[str, Any], *, strict: bool
+) -> dict[str, Any]:
+    """Filter ``kwargs`` to the keys ``model_type`` consumes.
+
+    Args:
+        model_type: Lowercased engine name.
+        kwargs: Raw engine-specific options.
+        strict: When True, unknown keys raise ``ValueError`` (with a typo
+            suggestion); otherwise they emit a ``UserWarning``.
+
+    Returns:
+        The subset of ``kwargs`` that ``model_type`` actually consumes.
+    """
+    accepted = calculator_option_keys(model_type)
+    kept: dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if key in accepted:
+            kept[key] = value
+            continue
+        # A key valid for another engine: fatal under strict config, benign
+        # warn-and-drop only in the explicit lenient mode (CFG-01).
+        if key in _ALL_CALC_KEYS:
+            message = (
+                f"Option {key!r} is not applicable to engine {model_type!r}; "
+                "cross-backend options are rejected in strict mode."
+            )
+            if strict:
+                raise ValueError(message)
+            warnings.warn(message, stacklevel=3)
+            continue
+        # Truly unknown key -> likely a typo.
+        suggestion = difflib.get_close_matches(
+            key, sorted(_ALL_CALC_KEYS | {"device", "task"}), n=1, cutoff=0.6
+        )
+        hint = f" Did you mean {suggestion[0]!r}?" if suggestion else ""
+        message = f"Unknown calculator option {key!r} for engine {model_type!r}.{hint}"
+        if strict:
+            raise ValueError(message)
+        warnings.warn(message, stacklevel=3)
+    return kept
+
+
+class CalculatorFactory:
+    """Create the appropriate MLIP Calculator wrapper from a model type."""
+
+    @staticmethod
+    def create(
+        model_type: str,
+        model_path: str | Path,
+        device: str = "cpu",
+        task: str = "bulk",
+        *,
+        strict: bool = False,
+        **kwargs: Any,
+    ) -> BaseMLIPCalculator:
+        """
+        Create a calculator wrapper for the requested engine.
+
+        Args:
+            model_type: Engine name (``uma``/``fairchem``, ``mace``,
+                ``dpa``, ``grace``).
+            model_path: Path to the model checkpoint/file.
+            device: Device for calculation (``cpu``, ``cuda``, ``gpu`` or
+                ``cuda:N``). Forwarded unchanged to the wrapper.
+            task: Task type. UMA uses ``omat``/``omol``/...; other engines use
+                ``bulk``/``molecule`` (PBC hint only).
+            strict: When True, unknown engine-specific options raise instead of
+                warning (plan section 10 / 17.2).
+            **kwargs: Engine-specific options. UMA accepts ``inference_mode``,
+                ``torch_num_threads`` and ``activation_checkpointing``; MACE
+                accepts ``default_dtype`` (factory fallback ``float64``) and
+                ``head``; DPA accepts ``head`` for multi-task branches; GRACE
+                accepts ``cpu_threads`` for TensorFlow intra-op parallelism and
+                GPU memory-growth / hard-limit controls. Every engine accepts
+                ``d3`` (with optional ``d3_xc``/``d3_damping``) to add a
+                DFT-D3 dispersion correction on top of the model.
+
+        Returns:
+            A ``BaseMLIPCalculator`` subclass instance; a
+            :class:`~mliport.calculators.dispersion.D3CorrectedCalculator`
+            around the backend wrapper when ``d3`` is enabled.
+
+        Raises:
+            ValueError: If ``model_type`` is not supported, or (in strict mode)
+                an unknown engine-specific option is supplied.
+        """
+        m_type = require_model_type(model_type)
+        kwargs = _check_unknown_kwargs(m_type, kwargs, strict=strict)
+        normalized_task = str(task).strip().lower()
+        if m_type not in UMA_ALIASES and normalized_task not in {
+            "bulk",
+            "molecule",
+        }:
+            raise ValueError(
+                f"Invalid task {task!r} for engine {m_type!r}. Non-UMA "
+                "engines require the explicit PBC semantic 'bulk' or "
+                "'molecule'."
+            )
+        # Validate DFT-D3 before loading anything, so a request that would add
+        # dispersion twice (or not at all) fails before the model is touched.
+        d3_settings = normalize_d3_options(
+            "uma" if m_type in UMA_ALIASES else m_type,
+            normalized_task,
+            d3=kwargs.get("d3", False),
+            d3_xc=kwargs.get("d3_xc"),
+            d3_damping=kwargs.get("d3_damping"),
+        )
+
+        if m_type in UMA_ALIASES:
+            from mliport.calculators.uma import UMACalculator  # noqa: PLC0415
+
+            base: BaseMLIPCalculator = UMACalculator(
+                model_path=model_path,
+                task=normalized_task,
+                device=device,
+                inference_mode=kwargs.get("inference_mode", "default"),
+                torch_num_threads=kwargs.get("torch_num_threads"),
+                activation_checkpointing=kwargs.get("activation_checkpointing"),
+            )
+        elif m_type == "mace":
+            from mliport.calculators.mace_calc import (
+                MACECalculatorWrapper,  # noqa: PLC0415
+            )
+
+            # Accuracy-first fallback for direct construction. Users must opt
+            # in explicitly to float32 when throughput matters more.
+            base = MACECalculatorWrapper(
+                model_path=model_path,
+                device=device,
+                task=normalized_task,
+                default_dtype=kwargs.get("default_dtype", "float64"),
+                head=kwargs.get("head"),
+            )
+        elif m_type == "dpa":
+            from mliport.calculators.dpa_calc import (
+                DPACalculatorWrapper,  # noqa: PLC0415
+            )
+
+            base = DPACalculatorWrapper(
+                model_path=model_path,
+                device=device,
+                task=normalized_task,
+                head=kwargs.get("head"),
+                dpa_runtime=kwargs.get("dpa_runtime", "current"),
+            )
+        elif m_type == "grace":
+            from mliport.calculators.grace_calc import (
+                GRACECalculatorWrapper,  # noqa: PLC0415
+            )
+
+            base = GRACECalculatorWrapper(
+                model_path=model_path,
+                device=device,
+                task=normalized_task,
+                cpu_threads=kwargs.get("cpu_threads"),
+                gpu_memory_growth=kwargs.get("gpu_memory_growth", True),
+                gpu_memory_limit_mb=kwargs.get("gpu_memory_limit_mb"),
+                neighbor_cache=kwargs.get("neighbor_cache", True),
+                neighbor_skin=kwargs.get("neighbor_skin", 1.5),
+            )
+        elif m_type == "nep":
+            from mliport.backend_selection import (  # noqa: PLC0415
+                normalize_device_for_nep,
+                normalize_nep_runtime,
+            )
+            from mliport.calculators.nep_calc import (
+                NEPCalculatorWrapper,  # noqa: PLC0415
+            )
+
+            runtime = normalize_nep_runtime(kwargs.get("nep_runtime"))
+            # A NEP runtime the ASE adapter cannot express must be routed to
+            # the native GPUMD runner, never turned into a per-step ASE
+            # calculator (PR #61 section A.5).
+            if runtime == "gpumd":
+                raise ValueError(
+                    "NEP_RUNTIME=gpumd is a native gpumd process, not an ASE "
+                    "calculator. The engine dispatches it to "
+                    "mliport.gpumd.runner; do not construct it through "
+                    "CalculatorFactory."
+                )
+            base = NEPCalculatorWrapper(
+                model_path=model_path,
+                device=normalize_device_for_nep(runtime, device),
+                task=normalized_task,
+                nep_runtime=runtime,
+                gpumd_command=kwargs.get("nep_gpumd_command"),
+            )
+        else:
+            raise ValueError(
+                f"Unsupported model type: '{model_type}'. "
+                f"Supported: {', '.join(sorted(SUPPORTED_TYPES - {'fairchem'}))}"
+            )
+
+        if d3_settings is None:
+            return base
+        return D3CorrectedCalculator(
+            base,
+            device=d3_device(
+                device,
+                process_isolated=m_type in PROCESS_ISOLATED_BACKENDS,
+            ),
+            xc=d3_settings["xc"],
+            damping=d3_settings["damping"],
+        )

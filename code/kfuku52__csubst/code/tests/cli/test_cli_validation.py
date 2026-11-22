@@ -1,0 +1,452 @@
+import contextlib
+import io
+import subprocess
+import sys
+import os
+import re
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from cli_runner import run_csubst
+
+
+def _resolve_log_path(repo_root, args):
+    args = tuple(args)
+    if "--log_file" in args:
+        log_index = args.index("--log_file") + 1
+        return Path(args[log_index])
+    for token in args:
+        if token.startswith("--log_file="):
+            return Path(token.split("=", 1)[1])
+    if len(args) > 0:
+        if args[0] == "benchmark":
+            return repo_root / "csubst_benchmark" / "csubst.log"
+        if args[0] == "benchmark-plot":
+            return repo_root / "csubst_benchmark_plot" / "csubst.log"
+        if args[0] == "doctor":
+            return repo_root / "csubst_doctor" / "csubst.log"
+        if args[0] == "simulate":
+            return repo_root / "csubst_simulate" / "csubst.log"
+        if args[0] == "scan":
+            return repo_root / "csubst_scan" / "csubst.log"
+        if args[0] == "search":
+            return repo_root / "csubst_search" / "csubst.log"
+        if args[0] == "analyze":
+            return repo_root / "csubst_search" / "csubst.log"
+        if args[0] == "inspect":
+            return repo_root / "csubst_inspect" / "csubst.log"
+        if args[0] == "sites":
+            return repo_root / "csubst_sites" / "csubst.log"
+        if args[0] == "site":
+            return repo_root / "csubst_sites" / "csubst.log"
+    return repo_root / "csubst.log"
+
+
+_CLI_NAMESPACE = None
+_CLI_PARSERS = {}
+
+
+def _get_cli_namespace():
+    global _CLI_NAMESPACE
+    if _CLI_NAMESPACE is None:
+        from csubst import cli
+
+        _CLI_NAMESPACE = vars(cli)
+    return _CLI_NAMESPACE
+
+
+def _get_cli_parser(show_advanced):
+    show_advanced = bool(show_advanced)
+    if show_advanced not in _CLI_PARSERS:
+        namespace = _get_cli_namespace()
+        _CLI_PARSERS[show_advanced] = namespace["_build_parser"](
+            show_advanced=show_advanced
+        )
+    return _CLI_PARSERS[show_advanced]
+
+
+@pytest.mark.parametrize('command', ['search', 'analyze', 'inspect', 'sites'])
+def test_3di_default_backend_is_esm3di(command):
+    assert _get_cli_parser(False).parse_args([command]).sa_backend == 'esm3di-35m'
+
+
+@pytest.mark.parametrize('command', ['search', 'analyze', 'benchmark'])
+def test_search_iqtree_model_default_and_override(command):
+    parser = _get_cli_parser(False)
+    assert parser.parse_args([command]).iqtree_model == 'ECMK07_GY0K+F+R4'
+    assert parser.parse_args([command, '--iqtree_model', 'ECMK07+F+R4']).iqtree_model == 'ECMK07+F+R4'
+
+
+@pytest.mark.parametrize('command', ['search', 'analyze'])
+def test_high_order_pruning_modes(command):
+    parser = _get_cli_parser(False)
+    assert parser.parse_args([command]).high_order_pruning == 'all_cutoffs'
+    for value in ('all_cutoffs', 'ocn_bound', 'auto'):
+        args = parser.parse_args([command, '--high_order_pruning', value])
+        assert args.high_order_pruning == value
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args([command, '--high_order_pruning', 'legacy'])
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize('command', ['simulate', 'scan', 'doctor', 'sites', 'inspect'])
+def test_other_iqtree_commands_keep_ecmk07_default(command):
+    assert _get_cli_parser(False).parse_args([command]).iqtree_model == 'ECMK07+F+R4'
+
+
+@pytest.mark.parametrize('command, first, second, value', [
+    ('simulate', 'background_omega', 'background_nonsyn_syn_rate_ratio', 'model'),
+    ('simulate', 'foreground_omega', 'foreground_nonsyn_syn_rate_ratio', 'background'),
+    ('simulate', 'percent_convergent_site', 'percent_foreground_sites', '25'),
+    ('simulate', 'convergent_amino_acids', 'target_amino_acids', 'A'),
+    ('simulate', 'percent_biased_sub', 'target_bias_strength', '50'),
+    ('simulate', 'tree_scaling_factor', 'tree_branch_length_scale', '0.5'),
+    ('simulate', 'foreground_scaling_factor', 'foreground_branch_length_scale', '2'),
+    ('simulate', 'simulate_focal_tips', 'simulate_max_focal_tips', '4'),
+    ('search', 'calc_omega_pvalue', 'calc_omegaC_pvalue', 'yes'),
+    ('search', 'omega_pvalue_null_model', 'omegaC_pvalue_null_model', 'poisson'),
+    ('search', 'omega_pvalue_nbinom_alpha', 'omegaC_pvalue_nbinom_alpha', '1'),
+    ('search', 'omega_pvalue_niter_schedule', 'omegaC_pvalue_niter_schedule', '100'),
+    ('search', 'omega_pvalue_refine_upper_edge_bins', 'omegaC_pvalue_refine_upper_edge_bins', '3'),
+    ('search', 'omega_pvalue_rounding', 'omegaC_pvalue_rounding', 'floor'),
+])
+def test_scientific_option_aliases_set_the_same_value(command, first, second, value):
+    parser = _get_cli_parser(True)
+    commands = ('search', 'analyze', 'benchmark') if command == 'search' else (command,)
+    for name in commands:
+        assert parser.parse_args([name, '--' + first, value]) == parser.parse_args([name, '--' + second, value])
+
+
+@pytest.mark.parametrize('old_args', [['--export_expected_omega', 'yes'], ['--export_expected_omega=yes']])
+def test_expected_omegaC_export_requires_full_option_name(old_args, capsys):
+    parser = _get_cli_parser(False)
+    assert parser.parse_args(['simulate', '--export_expected_omegaC', 'yes']).export_expected_omega
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(['simulate', *old_args])
+    assert exc.value.code == 2
+    assert 'unrecognized arguments: --export_expected_omega' in capsys.readouterr().err
+
+
+def test_download_default_resource_matches_3di_backend():
+    parser = _get_cli_parser(False)
+    assert parser.parse_args(['download']).resource == parser.parse_args(['sites']).sa_backend
+
+
+@pytest.mark.parametrize('command,backend', [
+    ('search', 'prostt5'), ('inspect', 'prostt5-cnn'), ('sites', 'esm3di-35m'),
+])
+def test_3di_backend_and_neutral_aliases_share_existing_destinations(command, backend):
+    args = _get_cli_parser(True).parse_args([
+        command, '--sa_backend', backend, '--sa_device', 'cpu', '--sa_batch_size', '3',
+        '--sa_cache', 'no', '--sa_cache_file', 'shared.tsv', '--sa_no_download', 'yes',
+    ])
+    assert args.sa_backend == backend
+    assert args.sa_batch_size == 3
+    assert args.prostt5_device == 'cpu'
+    assert args.prostt5_cache is False
+    assert args.prostt5_cache_file == 'shared.tsv'
+    assert args.prostt5_no_download is True
+
+
+def _run_cli(*args):
+    """Exercise parser/handler behavior without starting another Python."""
+    namespace = _get_cli_namespace()
+    normalized_args, show_advanced = namespace["_normalize_help_argv"](list(args))
+    parser = _get_cli_parser(show_advanced)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    returncode = 0
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        try:
+            parsed_args = parser.parse_args(normalized_args)
+            namespace["_main"](argv=normalized_args, parsed_args=parsed_args)
+        except SystemExit as exc:
+            returncode = int(exc.code or 0)
+    result = SimpleNamespace(
+        returncode=returncode,
+        stdout=stdout.getvalue(),
+        stderr=stderr.getvalue(),
+    )
+    return result, result.stderr
+
+
+def _run_cli_subprocess(*args):
+    """Exercise entrypoint/log-file integration in an isolated process."""
+    with tempfile.TemporaryDirectory(prefix='csubst-cli-') as workdir:
+        log_path = _resolve_log_path(Path(workdir), args)
+        proc = run_csubst(list(args), cwd=workdir)
+        log_text = log_path.read_text(encoding='utf-8') if log_path.exists() else proc.stderr
+    return proc, log_text
+
+
+@pytest.mark.parametrize('method_args', [[], ['--expectation_method', 'codon_model']])
+def test_3di_codon_expectations_fail_cleanly_before_inference(method_args):
+    proc, log_text = _run_cli(
+        'search', '--nonsyn_recode', '3di20', '--sa_asr_mode', 'translate', '--full_cds_alignment_file', 'missing.fa',
+        *method_args,
+    )
+    assert proc.returncode == 2
+    assert 'require --sa_asr_mode direct' in log_text
+    assert 'use --expectation_method urn explicitly' in log_text
+    assert 'Traceback' not in log_text
+    assert 'Starting IQ-TREE' not in proc.stdout
+
+
+def test_sites_invalid_max_sites_fails_cleanly_without_matplotlib_side_effects():
+    proc, log_text = _run_cli("sites", "--branch_id", "0", "--tree_site_plot_max_sites", "0")
+    assert proc.returncode == 2
+    assert "--tree_site_plot_max_sites should be >= 1." in log_text
+    assert "Traceback" not in log_text
+    assert "Matplotlib" not in log_text
+
+
+def test_download_rejects_unsupported_checksum_request_cleanly():
+    proc, log_text = _run_cli(
+        'download', '--resource', 'all', '--verify', 'yes', '--no_download', 'yes'
+    )
+    assert proc.returncode == 2
+    assert '--verify yes is not supported for ProstT5' in log_text
+    assert 'Traceback' not in log_text
+
+
+def test_missing_output_option_value_is_reported_once_and_written_to_log():
+    proc, log_text = _run_cli_subprocess("search", "--outdir")
+    expected = "argument --outdir: expected one argument"
+    assert proc.returncode == 2
+    assert proc.stderr.count(expected) == 1
+    assert expected in log_text
+
+
+def test_invalid_common_random_seed_fails_cleanly():
+    proc, log_text = _run_cli("scan", "--random_seed", "-2")
+    assert proc.returncode == 2
+    assert "--random_seed should be -1 or >= 0." in log_text
+    assert "Traceback" not in log_text
+
+
+def test_sites_deprecated_probability_options_are_rejected():
+    proc, log_text = _run_cli("sites", "--branch_id", "0", "--tree_site_plot_min_prob", "0.5")
+    assert proc.returncode == 2
+    assert "unrecognized arguments: --tree_site_plot_min_prob 0.5" in log_text
+
+
+def test_sites_invalid_species_regex_fails_cleanly():
+    proc, log_text = _run_cli("sites", "--branch_id", "0", "--species_regex", "(")
+    assert proc.returncode == 2
+    assert "--species_regex is not a valid regular expression" in log_text
+    assert "Traceback" not in log_text
+
+
+def test_inspect_help_includes_species_overlap_node_plot_option():
+    proc, log_text = _run_cli("inspect", "-h")
+    assert proc.returncode == 0
+    help_text = (proc.stdout or "") + (proc.stderr or "") + (log_text or "")
+    assert "--species_overlap_node_plot" in help_text
+    assert "--output_manifest" in help_text
+    assert "--combination_count_max_arity" in help_text
+    assert "--plot_state_aa_highlight_pattern" in help_text
+    assert "--plot_state_aa_highlight_color" in help_text
+    assert "--plot_nonsyn_recode_pca" in help_text
+    assert "--nonsyn_recode" in help_text
+    assert "--download_prostt5" not in help_text
+    assert "--sa_smoke_max_branches" not in help_text
+
+    proc, _ = _run_cli("inspect", "--help-advanced")
+    assert proc.returncode == 0
+    advanced_help = (proc.stdout or "") + (proc.stderr or "")
+    assert "--tree_tip_label_spacing" in advanced_help
+    assert "--tree_fig_max_height" in advanced_help
+    assert "--download_prostt5" in advanced_help
+    assert "--sa_smoke_max_branches" in advanced_help
+
+
+def test_sites_help_shows_output_manifest_and_removed_site_output_manifest_is_rejected():
+    proc, log_text = _run_cli("sites", "-h")
+    assert proc.returncode == 0
+    help_text = (proc.stdout or "") + (proc.stderr or "") + (log_text or "")
+    assert "--output_manifest" in help_text
+    assert "--site_summary_plot" in help_text
+    assert "--site_output_manifest" not in help_text
+    assert "default=swissmodel,pdb,alphafold,alphafill" in help_text
+    assert "--database_search {remote,local}" in help_text
+    assert "default=remote" in help_text
+    assert "--alphafold_version latest|N" in help_text
+    proc, log_text = _run_cli("sites", "--branch_id", "0", "--site_output_manifest", "no")
+    assert proc.returncode == 2
+    assert "unrecognized arguments: --site_output_manifest no" in log_text
+
+
+@pytest.mark.parametrize("subcommand", ["search"])
+def test_epistasis_options_are_advanced_only(subcommand):
+    proc, _ = _run_cli(subcommand, "-h")
+    assert proc.returncode == 0
+    help_text = (proc.stdout or "") + (proc.stderr or "")
+    assert "--epistasis_" not in help_text
+
+    proc, _ = _run_cli(subcommand, "--help-advanced")
+    assert proc.returncode == 0
+    help_text = (proc.stdout or "") + (proc.stderr or "")
+    assert "default=swissmodel,pdb,alphafold,alphafill" in help_text
+    assert "Supported:" in help_text
+    assert "swissmodel" in help_text
+    assert "--epistasis_beta" in help_text
+    assert "--epistasis_pdb" in help_text
+    assert "--alphafold_version latest|N" in help_text
+    assert "--database_search {remote,local}" in help_text
+
+
+@pytest.mark.parametrize(
+    "subcommand",
+    ["search", "scan"],
+)
+def test_removed_performance_options_are_absent_from_shared_help(subcommand):
+    proc, _ = _run_cli(subcommand, "-h")
+    assert proc.returncode == 0
+    normal_help = (proc.stdout or "") + (proc.stderr or "")
+    assert "--threads" in normal_help
+    assert "--blas_threads" in normal_help
+    assert "--parallel_" not in normal_help
+    assert "--sub_tensor_backend" not in normal_help
+    assert "--float_type" not in normal_help
+    assert "--expected_state_backend" not in normal_help
+
+    proc, _ = _run_cli(subcommand, "--help-advanced")
+    assert proc.returncode == 0
+    advanced_help = (proc.stdout or "") + (proc.stderr or "")
+    assert "--threads" in advanced_help
+    assert "--blas_threads" in advanced_help
+    assert "--parallel_" not in advanced_help
+    assert "--sub_tensor_backend" not in advanced_help
+    assert "--float_type" not in advanced_help
+    assert "--expected_state_backend" in advanced_help
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("--parallel_backend", "threading"),
+        ("--sub_tensor_backend", "dense"),
+        ("--float_type", "32"),
+        ("--omegaC_method", "modelfree"),
+        ("--infile_type", "iqtree"),
+        ("--plot_state_aa", "yes"),
+        ("--prostt5_batch_size", "8"),
+        ("--pseudocount_strength", "2.0"),
+    ],
+)
+def test_removed_performance_options_are_rejected(option, value):
+    proc, log_text = _run_cli("search", option, value)
+    assert proc.returncode == 2
+    assert "unrecognized arguments:" in log_text
+
+
+def test_cli_help_lists_primary_commands_and_legacy_aliases():
+    proc, log_text = _run_cli("--help")
+    assert proc.returncode == 0
+    help_text = (proc.stdout or "") + (proc.stderr or "") + (log_text or "")
+    assert "benchmark" in help_text
+    assert "benchmark-plot" in help_text
+    assert "doctor" in help_text
+    assert "scan" in help_text
+    assert "search (analyze)" in help_text
+    assert "sites (site)" in help_text
+
+
+def test_scan_help_is_available():
+    proc, _ = _run_cli("scan", "-h")
+    assert proc.returncode == 0
+    help_text = (proc.stdout or "") + (proc.stderr or "")
+    assert "--scan_match" in help_text
+    assert "--scan_unit_mode" in help_text
+    assert "lineage|stem|clade" in help_text
+    assert "default=clade" in help_text
+    assert "--random_seed" in help_text
+    assert "any2any" in help_text
+    assert re.search(r"--scan_unit(?![A-Za-z0-9_])", help_text) is None
+    assert "--scan_rate_exposure" in help_text
+    assert "q_weighted" in help_text
+    assert "endpoint for joint/bridge" in help_text
+    assert "endpoint" in help_text
+    assert "fitted discrete rate categories" in " ".join(help_text.split())
+    assert "--scan_rate_event_mode" in help_text
+    assert "--scan_other_scope" in help_text
+    assert "all|sister" in help_text
+    assert "--scan_sister_stem_only" in help_text
+    assert "--scan_pvalue_calibration" in help_text
+    assert "full_scan" in help_text
+    assert "--scan_n_permutations" in help_text
+    assert "--scan_site_plot" in help_text
+    assert "--scan_site_plot_filter" in help_text
+    assert "--scan_site_plot_alpha" in help_text
+    assert "--tree_site_plot_format" in help_text
+    assert "--tree_site_plot_max_sites" in help_text
+    assert "--tree_site_tip_label_spacing" not in help_text
+    assert "--tree_site_fig_max_height" not in help_text
+    assert "--scan_permutation_mode" not in help_text
+    assert "--scan_rate_length" in help_text
+    assert "raw for joint/bridge" in help_text
+    assert "--nonsyn_recode" in help_text
+    assert "--scan_report_targets" not in help_text
+    assert "--scan_candidate_target" not in help_text
+    assert "--fg_clade_permutation" not in help_text
+    assert "--fg_exclude_wg" not in help_text
+    assert "--mg_parent" not in help_text
+    assert "--mg_sister" not in help_text
+
+    proc, _ = _run_cli("scan", "--help-advanced")
+    assert proc.returncode == 0
+    advanced_help = (proc.stdout or "") + (proc.stderr or "")
+    assert "--tree_site_tip_label_spacing" in advanced_help
+    assert "--tree_site_fig_max_height" in advanced_help
+    assert "--scan_permutation_sample_original" in advanced_help
+
+
+def test_scan_parser_defaults_keep_one_assignment_space():
+    from csubst import cli
+
+    args = cli._build_parser(show_advanced=True).parse_args(["scan"])
+    assert args.scan_permutation_sample_original is True
+    assert args.scan_permutation_retry_sample_original is False
+    assert args.scan_pvalue_calibration == "full_scan"
+
+
+def test_benchmark_plot_missing_directory_fails_cleanly():
+    proc, log_text = _run_cli(
+        "benchmark-plot",
+        "--benchmark_dir",
+        str(Path(__file__).resolve().parents[2] / "definitely_missing_benchmark_dir"),
+        "--benchmark_plot_recursive",
+        "no",
+    )
+    assert proc.returncode == 2
+    assert "--benchmark_dir was not found or is not a directory" in log_text
+    assert "Traceback" not in log_text
+
+
+def test_inspect_rejects_legacy_yes_state_plot_option():
+    proc, log_text = _run_cli("inspect", "--plot_state_aa", "yes")
+    assert proc.returncode == 2
+    assert "no longer accepts yes/no" in log_text
+
+
+def test_cli_entrypoint_runs_from_repo_root_without_pythonpath():
+    repo_root = Path(__file__).resolve().parents[2]
+    cmd = [sys.executable, "-m", "csubst", "--help"]
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    proc = subprocess.run(
+        cmd, cwd=str(repo_root), env=env, capture_output=True, text=True
+    )
+    assert proc.returncode == 0
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    assert "ModuleNotFoundError" not in combined
+    assert "No module named 'csubst'" not in combined
+
+
+@pytest.mark.parametrize('command', ['search', 'inspect'])
+def test_all_sites_are_retained_by_default(command):
+    args = _get_cli_parser(False).parse_args([command])
+    assert args.drop_invariant_tip_sites == 'no'
+    assert args.site_filter_report is False

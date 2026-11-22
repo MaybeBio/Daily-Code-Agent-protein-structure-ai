@@ -1,0 +1,14 @@
+"""Eval task implementations. Importing this module triggers registration."""
+
+from __future__ import annotations
+
+from oplm.eval.tasks import (
+    antibody_cdr3,  # noqa: F401
+    everest,  # noqa: F401
+    proteinglue,  # noqa: F401
+    proteingym,  # noqa: F401
+    proteingym_clinical,  # noqa: F401
+    sequence,  # noqa: F401
+    structure,  # noqa: F401
+    tape,  # noqa: F401
+)

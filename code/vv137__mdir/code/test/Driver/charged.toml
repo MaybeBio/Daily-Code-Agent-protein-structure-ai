@@ -1,0 +1,81 @@
+# The mixture of argon (AR) and krypton (KR) of mixture.toml with made-up
+# charges of +0.25 and -0.25: Lennard-Jones with Lorentz-Berthelot mixing,
+# except for the pair of types AR and KR, which [[energy.nbfix]] sets;
+# Coulomb with the product of the charges; both cut at 9 Å with no shift,
+# and the correction for the dispersion of the Lennard-Jones term.
+#
+# RUN: mdir run %s | FileCheck %s
+# RUN: mdir emit %s | FileCheck %s --check-prefix=MODULE
+
+# The potential energy and the trace of the virial at the start agree with
+# Inputs/charged_reference.py: 349.879817 kcal/mol and -527.164345 kcal/mol,
+# with a correction of -24.905084 kcal/mol in the energy.
+#
+# CHECK:      INFO:      STEP           TIME      TOTAL_ENE  POTENTIAL_ENE    KINETIC_ENE    TEMPERATURE         VIRIAL       PRESSURE
+# CHECK-NEXT: INFO:         0         0.0000 {{ *[0-9.]+}} {{ *}}349.8798 {{ *[0-9.]+}} {{ *[0-9.]+}} {{ *}}-527.1643 {{ *-?[0-9.]+}}
+
+# The term with an override looks its parameters up in tables of the pairs
+# of types; the other gathers the charges and multiplies them.
+#
+# MODULE:      md.potential @energy({{%[a-z0-9]+}}: !md.field<@atoms, 3 x f64>, {{%[a-z0-9]+}}: !md.cell, [[TYPE:%[a-z0-9]+]]: !md.field<@atoms, i32>, [[Q:%[a-z0-9]+]]: !md.field<@atoms, f64>, [[EPSILON:%[a-z0-9]+]]: !md.table<2, f64, symmetric>, [[SIGMA:%[a-z0-9]+]]: !md.table<2, f64, symmetric>) -> f64
+# MODULE:        md.sum_relation {{.*}} gather([[TYPE]] : !md.field<@atoms, i32>)
+# MODULE-NEXT:   ^bb0({{%[a-z0-9]+}}: f64, {{%[a-z0-9]+}}: vector<3xf64>, [[TI:%[a-z0-9]+]]: i32, [[TJ:%[a-z0-9]+]]: i32):
+# MODULE-DAG:      md.lookup [[SIGMA]]{{\[}}[[TI]], [[TJ]]] : !md.table<2, f64, symmetric>, i32, i32 -> f64
+# MODULE-DAG:      md.lookup [[EPSILON]]{{\[}}[[TI]], [[TJ]]] : !md.table<2, f64, symmetric>, i32, i32 -> f64
+# MODULE:        md.sum_relation {{.*}} gather([[Q]] : !md.field<@atoms, f64>)
+# MODULE-NEXT:   ^bb0({{%[a-z0-9]+}}: f64, {{%[a-z0-9]+}}: vector<3xf64>, [[QI:%[a-z0-9]+]]: f64, [[QJ:%[a-z0-9]+]]: f64):
+# MODULE:          arith.constant 332.0637130741{{[0-9]*}} : f64
+# MODULE:          arith.mulf [[QI]], [[QJ]] : f64
+
+[input]
+coordinates = "Inputs/mixture.pdb"
+
+[output]
+energy_interval = 10
+[energy]
+cutoff       = 9.0
+pairlist_distance = 10.0
+
+[[energy.pair]]
+name            = "lj"
+expression      = "4*epsilon*((sigma/r)^12 - (sigma/r)^6)"
+mixing          = "lorentz-berthelot"
+dispersion_correction = "ENERGY_PRESSURE"
+
+[[energy.pair]]
+name       = "coulomb"
+expression = "coulomb*q/r"
+mixing     = { q = "product" }
+
+[[energy.pair_override]]
+pair    = "lj"
+types   = ["AR", "KR"]
+epsilon = 0.2
+sigma   = 3.3
+
+[[energy.type]]
+name    = "AR"
+mass    = 39.95
+epsilon = 0.238465
+sigma   = 3.4
+q       = 0.25
+
+[[energy.type]]
+name    = "KR"
+mass    = 83.80
+epsilon = 0.3253
+sigma   = 3.65
+q       = -0.25
+
+[dynamics]
+integrator    = "VELOCITY_VERLET"
+time_step     = 0.002
+steps         = 20
+
+[ensemble]
+ensemble    = "NVE"
+temperature = 120.0
+
+[boundary]
+type       = "PERIODIC"
+box = [23.2, 23.2, 23.2]

@@ -1,0 +1,2760 @@
+"""
+Structure Server - PDB retrieval and structure cleaning tools.
+
+Provides tools for:
+- Automatic retrieval of structure files from PDB/AlphaFold/PDB-REDO (prefers mmCIF)
+- Chain separation and classification using gemmi
+- Structure cleaning, missing residue modeling, water/heterogen removal, and protonation using PDBFixer
+- Automatic detection of disulfide bonds and CYS->CYX renaming
+- Mutation modeling with HPacker
+- Ligand chemistry preparation with SMILES/SDF template matching
+- LLM-friendly structure validation and error reporting at each step
+"""
+
+# Configure logging early to suppress noisy third-party logs
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from mdclaw._common import setup_logger  # noqa: E402
+
+logger = setup_logger(__name__)
+
+import json  # noqa: E402
+import re  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import List, Optional  # noqa: E402
+
+from mdclaw._common import (  # noqa: E402
+    BaseToolWrapper,
+    create_validation_error,
+    create_unique_subdir,
+    generate_job_id,
+)
+from mdclaw.research.nucleic import (  # noqa: E402
+    MODIFIED_NUCLEIC_UNSUPPORTED_MESSAGE,
+    classify_nucleic_residues,
+    modified_nucleic_support_report,
+)
+from mdclaw.chemistry_constants import (  # noqa: E402
+    classify_glycan_residues,
+    INSPECTED_PROTEIN_RESNAMES,
+    protein_sequence_symbol,
+    WATER_NAMES,
+    is_standard_bare_ion_resname,
+)
+from mdclaw.selection_utils import (  # noqa: E402
+    associated_ligand_candidates,
+    associated_ligands_by_author_chain,
+    selected_associated_ligand_candidates,
+)
+from mdclaw.structure.residue_range import residue_numbering_summary  # noqa: E402
+
+# Default working directory for prepare_complex when output_dir is not specified
+WORKING_DIR = Path(".")
+PDB_CHAIN_ID_POOL = (
+    list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    + list("abcdefghijklmnopqrstuvwxyz")
+    + list("0123456789")
+)
+_DEUTERIUM_FALLBACK_ATOM_NAME_RE = re.compile(r"^D[0-9]*$")
+DEFAULT_TERMINAL_CAP_FORCEFIELD = "ff19SB"
+SUPPORTED_N_TERMINAL_CAPS = {"ACE"}
+SUPPORTED_C_TERMINAL_CAPS = {"NME"}
+TERMINAL_CAP_RESIDUES = SUPPORTED_N_TERMINAL_CAPS | SUPPORTED_C_TERMINAL_CAPS
+SUPPORTED_PREP_SOLVENT_TYPES = {"explicit", "implicit", "vacuum"}
+
+# Initialize tool wrappers
+pdb2pqr_wrapper = BaseToolWrapper("pdb2pqr")
+pdb4amber_wrapper = BaseToolWrapper("pdb4amber")
+
+
+def _normalize_ligand_resnames(values: Optional[List[str]]) -> list[str]:
+    if values is None:
+        return []
+    return sorted({str(value).strip().upper() for value in values if str(value).strip()})
+
+
+def _chain_residue_names(chain: dict) -> list[str]:
+    names = chain.get("residue_names")
+    if isinstance(names, dict):
+        values = names.get("unique_residues") or []
+        return [str(value).strip().upper() for value in values if str(value).strip()]
+    if isinstance(names, list):
+        return [str(value).strip().upper() for value in names if str(value).strip()]
+    resname = str(chain.get("resname") or "").strip().upper()
+    return [resname] if resname else []
+
+
+def _chain_matches_ligand_resnames(chain: dict, requested_resnames: set[str]) -> bool:
+    return bool(set(_chain_residue_names(chain)) & requested_resnames)
+
+
+def _route_free_amino_acid_request(result: dict, chains: list, *, resnames=None, ids=None) -> None:
+    """A ligand request that names a free amino acid gets the declaration.
+
+    The split reads a standard amino acid deposited on its own (free ARG in
+    6MJ7) as a one-residue protein component, so a ligand selector naming it
+    finds nothing. "requested ligand residue name(s) were not found" sent
+    test-v6-cli agents guessing; the refusal now names the
+    ``--ligand-components`` declaration that makes it a ligand.
+    """
+    from mdclaw.structure.free_amino_acid import free_amino_acid_chains, free_amino_acid_next_action
+
+    free = free_amino_acid_chains(chains)
+    wanted = []
+    names = {str(n).strip().upper() for n in (resnames or ())}
+    for site in free:
+        if site["resname"] in names:
+            wanted.append(site)
+            continue
+        for item in ids or ():
+            parts = str(item).strip().split(":")
+            if (len(parts) == 3 and parts[1].strip().upper() == site["resname"]
+                    and parts[0].strip() in {site["author_chain"], site["chain_id"]}
+                    and parts[2].strip() == str(site["resnum"])):
+                wanted.append(site)
+                break
+    if not wanted:
+        return
+    result["code"] = "ligand_is_amino_acid_component"
+    result["free_amino_acid_components"] = wanted
+    result["next_action"] = free_amino_acid_next_action(
+        wanted, reason="was asked for as a ligand but is a one-residue protein component")
+
+
+def _candidate_matches_ligand_resnames(
+    candidate: dict,
+    requested_resnames: set[str],
+) -> bool:
+    names = [
+        str(value).strip().upper()
+        for value in candidate.get("residue_names", [])
+        if str(value).strip()
+    ]
+    resname = str(candidate.get("resname") or "").strip().upper()
+    if resname:
+        names.append(resname)
+    return bool(set(names) & requested_resnames)
+
+
+# Two hetero residues bonded to each other are one ligand. A deposit says so in
+# its ``struct_conn`` / LINK records; a PDB written by a modelling tool usually
+# says nothing, and gemmi then gives every hetero residue its own subchain, which
+# is the unit everything below works in. Sucralose is the case that found this:
+# two CCD components (RRY, RRJ) joined by a glycosidic bond, one unit from the
+# mmCIF and two from MODELLER's PDB, where the second half can match no SMILES.
+LIGAND_COVALENT_CONTACT_ANGSTROM = 1.9
+
+
+def _group_covalent_ligand_units(structure, model, chains_info: list[dict]) -> list[dict]:
+    """Merge ligand units that are covalently joined into one entry.
+
+    Units are joined when a Covale connection links them or, failing any
+    record, when heavy atoms of the two sit within
+    ``LIGAND_COVALENT_CONTACT_ANGSTROM``. Only ligand-type units on the same
+    author chain are considered: ions, waters and glycans keep their own
+    handling, and a bond to a protein chain is a different problem that is
+    reported, not merged. The first unit in file order leads; the others are
+    folded into it as ``covalent_members`` and dropped from the list.
+    """
+    ligands = [c for c in chains_info if c.get("chain_type") == "ligand"]
+    if len(ligands) < 2:
+        return chains_info
+    try:
+        import numpy as np
+    except ImportError:
+        return chains_info
+
+    residues_by_unit: dict[str, list] = {}
+    atoms_by_unit: dict[str, list] = {}
+    for entry in ligands:
+        span = model.get_subchain(entry["chain_id"])
+        residues_by_unit[entry["chain_id"]] = list(span)
+        atoms_by_unit[entry["chain_id"]] = [
+            (atom.pos.x, atom.pos.y, atom.pos.z)
+            for residue in span for atom in residue
+            if (atom.element.name or "").upper() not in {"H", "D"}
+        ]
+    unit_of_residue = {
+        (entry["author_chain"], residue.seqid.num, (residue.seqid.icode or "").strip(), residue.name.strip()): entry["chain_id"]
+        for entry in ligands
+        for residue in residues_by_unit[entry["chain_id"]]
+    }
+
+    parent = {entry["chain_id"]: entry["chain_id"] for entry in ligands}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    links: dict[frozenset, str] = {}
+    for connection in getattr(structure, "connections", []) or []:
+        if getattr(connection.type, "name", "") != "Covale":
+            continue
+        ends = []
+        for partner in (connection.partner1, connection.partner2):
+            key = (partner.chain_name, partner.res_id.seqid.num,
+                   (partner.res_id.seqid.icode or "").strip(), partner.res_id.name.strip())
+            ends.append(unit_of_residue.get(key))
+        if all(ends) and ends[0] != ends[1]:
+            union(ends[0], ends[1])
+            links[frozenset(ends)] = "record"
+    by_author: dict[str, list] = {}
+    for entry in ligands:
+        by_author.setdefault(entry["author_chain"], []).append(entry)
+    for members in by_author.values():
+        for i, first in enumerate(members):
+            xa = atoms_by_unit[first["chain_id"]]
+            if not xa:
+                continue
+            a = np.array(xa, dtype=float)
+            for second in members[i + 1:]:
+                if frozenset((first["chain_id"], second["chain_id"])) in links:
+                    continue
+                xb = atoms_by_unit[second["chain_id"]]
+                if not xb:
+                    continue
+                b = np.array(xb, dtype=float)
+                d = float(np.min(np.linalg.norm(a[:, None, :] - b[None, :, :], axis=-1)))
+                if d <= LIGAND_COVALENT_CONTACT_ANGSTROM:
+                    union(first["chain_id"], second["chain_id"])
+                    links[frozenset((first["chain_id"], second["chain_id"]))] = f"distance {d:.2f} A"
+
+    groups: dict[str, list[dict]] = {}
+    for entry in ligands:
+        groups.setdefault(find(entry["chain_id"]), []).append(entry)
+    # Each unit's own residue name, read before the leader's residue_names is
+    # replaced by the merged set (the leader was reported as its partner's name).
+    own_resname = {
+        entry["chain_id"]: ((entry.get("residue_names") or {}).get("unique_residues") or [None])[0]
+        for entry in ligands
+    }
+    dropped: set[str] = set()
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        leader, rest = members[0], members[1:]
+        names = set()
+        atoms = 0
+        residues = 0
+        for entry in members:
+            names.update((entry.get("residue_names") or {}).get("unique_residues") or [])
+            atoms += int(entry.get("num_atoms") or 0)
+            residues += int(entry.get("num_residues") or 0)
+        unique = sorted(names)
+        leader["residue_names"] = {
+            "unique_residues": unique[:10],
+            "total_unique_count": len(unique),
+            "truncated": len(unique) > 10,
+        }
+        leader["num_atoms"] = atoms
+        leader["num_residues"] = residues
+        leader["covalent_members"] = [entry["chain_id"] for entry in rest]
+        leader["covalent_unit_aliases"] = [entry["unique_id"] for entry in rest if entry.get("unique_id")]
+        leader["merged_from"] = [
+            {"chain_id": entry["chain_id"], "unique_id": entry.get("unique_id"),
+             "resnum": entry.get("resnum"),
+             "resname": own_resname.get(entry["chain_id"]),
+             "link": ("leader" if entry is leader else next(
+                 (how for key, how in links.items()
+                  if entry["chain_id"] in key and leader["chain_id"] in key), "chained"))}
+            for entry in members
+        ]
+        dropped.update(entry["chain_id"] for entry in rest)
+        logger.info(
+            "Ligand units %s are covalently joined; treated as one ligand %s",
+            [entry["chain_id"] for entry in members], leader.get("unique_id"),
+        )
+    return [c for c in chains_info if c.get("chain_id") not in dropped]
+
+
+def _inspect_molecules_impl(structure_file: str) -> dict:
+    """Inspect an mmCIF or PDB structure file and return detailed molecular information.
+    
+    This tool examines a structure file without modifying it, returning comprehensive
+    information about each chain/molecule including its type (protein, ligand, water, etc.),
+    residue composition, identifiers, and metadata from the file header (when available).
+    
+    Use this tool to:
+    - Understand the composition of a structure before splitting
+    - Identify which chains are proteins vs ligands vs water vs ions
+    - Get molecular names and descriptions from the header
+    - Get chain IDs for selective extraction with split_molecules
+    
+    Args:
+        structure_file: Path to the mmCIF (.cif) or PDB (.pdb/.ent) file to inspect.
+    
+    Returns:
+        Dict with:
+            - success: bool - True if inspection completed successfully
+            - source_file: str - Original input file path
+            - file_format: str - Detected file format ('cif' or 'pdb')
+            - header: dict - Header information (if available):
+                - pdb_id: str - PDB identifier
+                - title: str - Structure title
+                - deposition_date: str - Date of deposition
+                - resolution: float - Resolution in Angstroms (for X-ray)
+                - experiment_method: str - Experimental method (X-RAY, NMR, etc.)
+            - entities: list[dict] - Entity information from header:
+                - entity_id: str - Entity identifier
+                - name: str - Entity name/description (e.g., "ADENYLATE KINASE")
+                - entity_type: str - Type (polymer, non-polymer, water)
+                - polymer_type: str - For polymers (polypeptide(L), polyribonucleotide, etc.)
+                - chain_ids: list[str] - Chain IDs belonging to this entity
+            - num_models: int - Number of models in the structure
+            - chains: list[dict] - Detailed information for each chain:
+                - chain_id: str - Unique chain identifier (label_asym_id for mmCIF)
+                - author_chain: str - Original author chain ID (auth_asym_id)
+                - entity_id: str - Entity ID this chain belongs to
+                - entity_name: str - Name of the entity (from header)
+                - chain_type: str - Classification ('protein', 'ligand', 'water', 'ion')
+                - is_protein: bool - True if chain contains protein residues
+                - is_water: bool - True if chain is water molecules
+                - num_residues: int - Number of residues in the chain
+                - num_atoms: int - Number of atoms in the chain
+                - residue_names: list[str] - Unique residue names in the chain
+                - sequence: str - One-letter sequence (for proteins only)
+            - summary: dict - Quick overview. Exposes BOTH chain-ID
+              systems so callers can pick the right one for
+              ``select_chains``:
+                - num_protein_chains: int
+                - num_ligand_chains: int
+                - num_water_chains: int
+                - num_ion_chains: int
+                - total_chains: int
+                # Pass these to ``select_chains`` (label_asym_id, the
+                # simple PDB-style ID used by RCSB / SabDab):
+                - protein_label_ids: list[str]
+                - ligand_label_ids: list[str]
+                - water_label_ids: list[str]
+                - ion_label_ids: list[str]
+                # Author IDs (auth_asym_id) — for display and provenance,
+                # kept under the historical field names for backward
+                # compatibility. split_molecules will still accept these
+                # via its author_chain fallback:
+                - protein_chain_ids: list[str]
+                - ligand_chain_ids: list[str]
+                - water_chain_ids: list[str]
+                - ion_chain_ids: list[str]
+                # Explicit mapping, useful when label and author disagree
+                # (e.g. 7QVK label "B" ↔ auth "BBB"; 7NMU label "C" ↔
+                # auth "DDD" — the mapping can even be reordered):
+                - chain_id_map: dict[str, str]  # label -> author
+            - errors: list[str] - Error messages (empty if success=True)
+            - warnings: list[str] - Non-critical issues encountered
+    """
+    logger.info(f"Inspecting molecules in: {structure_file}")
+    
+    # Initialize result structure
+    result = {
+        "success": False,
+        "source_file": str(structure_file),
+        "file_format": None,
+        "header": {},
+        "entities": [],
+        "num_models": 0,
+        "chains": [],
+        "summary": {
+            "num_protein_chains": 0,
+            "num_nucleic_chains": 0,
+            "num_glycan_chains": 0,
+            "num_ligand_chains": 0,
+            "num_water_chains": 0,
+            "num_ion_chains": 0,
+            "total_chains": 0,
+            "protein_chain_ids": [],
+            "nucleic_chain_ids": [],
+            "glycan_chain_ids": [],
+            "ligand_chain_ids": [],
+            "water_chain_ids": [],
+            "ion_chain_ids": [],
+            "modified_nucleic_support_status": "not_detected",
+            "modified_nucleic_support": modified_nucleic_support_report([]),
+            "unsupported_modified_nucleic_residues": [],
+        },
+        "errors": [],
+        "warnings": []
+    }
+    
+    # Check for gemmi dependency
+    try:
+        import gemmi
+    except ImportError:
+        result["errors"].append("gemmi library not installed")
+        result["errors"].append("Hint: Install with: pip install gemmi")
+        logger.error("gemmi not installed")
+        return result
+    
+    # Validate input file
+    structure_path = Path(structure_file)
+    if not structure_path.exists():
+        result["errors"].append(f"Structure file not found: {structure_file}")
+        logger.error(f"Structure file not found: {structure_file}")
+        return result
+    
+    suffix = structure_path.suffix.lower()
+    if suffix not in ['.cif', '.pdb', '.ent']:
+        result["errors"].append(f"Unsupported file format: {suffix}")
+        result["errors"].append("Hint: Supported formats are .cif, .pdb, and .ent")
+        logger.error(f"Unsupported file format: {suffix}")
+        return result
+    
+    result["file_format"] = "cif" if suffix == ".cif" else "pdb"
+    
+    try:
+        # Read structure with gemmi
+        logger.info(f"Reading structure with gemmi ({suffix})...")
+        if suffix == '.cif':
+            doc = gemmi.cif.read(str(structure_path))
+            block = doc[0]
+            structure = gemmi.make_structure_from_block(block)
+        else:  # .pdb or .ent
+            structure = gemmi.read_pdb(str(structure_path))
+        structure.setup_entities()
+        
+        result["num_models"] = len(structure)
+        
+        # Extract header information
+        header_info = {}
+        if structure.name:
+            header_info["pdb_id"] = structure.name
+        if hasattr(structure, 'info') and structure.info:
+            # For mmCIF files, info contains metadata
+            if '_struct.title' in structure.info:
+                header_info["title"] = structure.info['_struct.title']
+        # Try to get resolution
+        if structure.resolution > 0:
+            header_info["resolution"] = round(structure.resolution, 2)
+        # Get spacegroup (indicates X-ray)
+        if structure.spacegroup_hm:
+            header_info["spacegroup"] = structure.spacegroup_hm
+            header_info["experiment_method"] = "X-RAY DIFFRACTION"
+        # Check for NMR models
+        elif len(structure) > 1:
+            header_info["experiment_method"] = "SOLUTION NMR"
+        
+        result["header"] = header_info
+        
+        # Extract entity information from structure
+        entities_info = []
+        entity_name_map = {}  # entity_id -> name mapping
+        entity_subchains = {}  # entity_id -> list of chain_ids
+        
+        for entity in structure.entities:
+            entity_id = entity.name if entity.name else str(len(entities_info) + 1)
+            
+            # Get entity type as string
+            entity_type_str = str(entity.entity_type).replace("EntityType.", "").lower()
+            
+            # Get polymer type if applicable
+            polymer_type_str = None
+            if entity.polymer_type != gemmi.PolymerType.Unknown:
+                polymer_type_str = str(entity.polymer_type).replace("PolymerType.", "")
+            
+            # Get chain IDs (subchains) for this entity
+            chain_ids = list(entity.subchains)
+            entity_subchains[entity_id] = chain_ids
+            
+            # Try to get entity description/name
+            entity_name = None
+            # For mmCIF, try to get from full_name or description
+            if hasattr(entity, 'full_name') and entity.full_name:
+                entity_name = entity.full_name
+            
+            # Store for later use
+            for cid in chain_ids:
+                entity_name_map[cid] = {
+                    "entity_id": entity_id,
+                    "name": entity_name,
+                    "entity_type": entity_type_str,
+                    "polymer_type": polymer_type_str
+                }
+            
+            entity_info = {
+                "entity_id": entity_id,
+                "name": entity_name,
+                "entity_type": entity_type_str,
+                "polymer_type": polymer_type_str,
+                "chain_ids": chain_ids
+            }
+            entities_info.append(entity_info)
+        
+        result["entities"] = entities_info
+        
+        # One-letter amino acid code mapping
+
+        
+        # Use first model for analysis
+        model = structure[0]
+        
+        chains_info = []
+        protein_chain_ids = []
+        nucleic_chain_ids = []
+        ligand_chain_ids = []
+        glycan_chain_ids = []
+        water_chain_ids = []
+        ion_chain_ids = []
+        nucleic_subtypes = {}
+        modified_nucleic_residues = []
+        glycan_residues = []
+        
+        for subchain in model.subchains():
+            chain_id = subchain.subchain_id()  # label_asym_id - unique identifier
+            res_list = list(subchain)
+            if not res_list:
+                continue
+            
+            # Collect residue information
+            residue_names = set()
+            num_atoms = 0
+            sequence_parts = []
+            
+            has_protein = False
+            has_water = False
+            has_ion = False
+            
+            for res in res_list:
+                res_name = res.name.strip()
+                res_atoms = list(res)
+                residue_names.add(res_name)
+                num_atoms += len(res_atoms)
+                
+                if res_name in INSPECTED_PROTEIN_RESNAMES:
+                    has_protein = True
+                    sequence_parts.append(protein_sequence_symbol(res_name))
+                elif res_name in WATER_NAMES:
+                    has_water = True
+                elif len(res_atoms) == 1 and is_standard_bare_ion_resname(res_name):
+                    has_ion = True
+            
+            # Get the author chain name (auth_asym_id) from the parent chain
+            author_chain = None
+            for chain in model:
+                for chain_subchain in chain.subchains():
+                    if chain_subchain.subchain_id() == chain_id:
+                        author_chain = chain.name
+                        break
+                if author_chain:
+                    break
+            
+            if author_chain is None:
+                author_chain = chain_id  # Fallback
+
+            # Get entity information before classification so polymer_type can
+            # distinguish real nucleic polymers from one-letter ligand names.
+            entity_info = entity_name_map.get(chain_id, {})
+            nucleic_info = classify_nucleic_residues(
+                residue_names,
+                entity_info.get("polymer_type"),
+            )
+            glycan_info = classify_glycan_residues(
+                residue_names,
+                entity_info.get("entity_type"),
+                entity_info.get("polymer_type"),
+                entity_info.get("name"),
+            )
+            
+            # Classify chain type.
+            # The *_chain_ids lists store author_chain (auth_asym_id); they
+            # are kept for display and backward compatibility. The
+            # corresponding *_label_ids lists (emitted below in summary)
+            # are built from chain_id (label_asym_id) and are what
+            # split_molecules / prepare_complex expect in select_chains.
+            if has_protein:
+                chain_type = "protein"
+                if author_chain not in protein_chain_ids:
+                    protein_chain_ids.append(author_chain)
+            elif nucleic_info["is_nucleic"]:
+                chain_type = "nucleic"
+                if author_chain not in nucleic_chain_ids:
+                    nucleic_chain_ids.append(author_chain)
+                if nucleic_info["subtype"]:
+                    nucleic_subtypes[chain_id] = nucleic_info["subtype"]
+                modified_names = set(nucleic_info["modified_residue_names"])
+                for res in res_list:
+                    res_name = res.name.strip()
+                    if res_name not in modified_names:
+                        continue
+                    modified_nucleic_residues.append({
+                        "chain": author_chain,
+                        "author_chain": author_chain,
+                        "label_chain": chain_id,
+                        "resnum": res.seqid.num,
+                        "icode": str(res.seqid.icode or ""),
+                        "resname": res_name,
+                        "source_resname": res_name,
+                        "coordinate_frame": "source",
+                    })
+            elif glycan_info["is_glycan"]:
+                chain_type = "glycan"
+                if author_chain not in glycan_chain_ids:
+                    glycan_chain_ids.append(author_chain)
+                for res_name in glycan_info["residue_names"]:
+                    glycan_residues.append({
+                        "chain": author_chain,
+                        "resname": res_name,
+                    })
+            elif has_water:
+                chain_type = "water"
+                if author_chain not in water_chain_ids:
+                    water_chain_ids.append(author_chain)
+            elif has_ion:
+                chain_type = "ion"
+                if author_chain not in ion_chain_ids:
+                    ion_chain_ids.append(author_chain)
+            else:
+                chain_type = "ligand"
+                if author_chain not in ligand_chain_ids:
+                    ligand_chain_ids.append(author_chain)
+            
+            # Token optimization: Truncate residue_names and replace sequence with length
+            unique_residues = sorted(list(residue_names))
+            truncated_residues = unique_residues[:10] if len(unique_residues) > 10 else unique_residues
+            residue_summary = {
+                "unique_residues": truncated_residues,
+                "total_unique_count": len(unique_residues),
+                "truncated": len(unique_residues) > 10
+            }
+
+            # Get residue number for unique identification (first residue)
+            first_res = res_list[0]
+            first_resnum = first_res.seqid.num
+            first_resname = first_res.name.strip()
+
+            # Create unique ID for ligands/ions (format: chain:resname:resnum)
+            # For proteins, use chain:PROTEIN:start-end format
+            if chain_type in ("ligand", "ion"):
+                unique_id = f"{author_chain}:{first_resname}:{first_resnum}"
+            else:
+                unique_id = None  # Proteins use chain ID only
+
+            chain_info = {
+                "chain_id": chain_id,
+                "author_chain": author_chain,
+                "entity_id": entity_info.get("entity_id"),
+                "entity_name": entity_info.get("name"),
+                "chain_type": chain_type,
+                "is_protein": has_protein,
+                "is_nucleic": chain_type == "nucleic",
+                "nucleic_subtype": nucleic_info["subtype"] if chain_type == "nucleic" else None,
+                "modified_nucleic_residue_names": (
+                    nucleic_info["modified_residue_names"] if chain_type == "nucleic" else []
+                ),
+                "is_glycan": chain_type == "glycan",
+                "glycan_residue_names": (
+                    glycan_info["residue_names"] if chain_type == "glycan" else []
+                ),
+                "is_water": has_water,
+                "num_residues": len(res_list),
+                "num_atoms": num_atoms,
+                "residue_names": residue_summary,
+                "sequence": "".join(sequence_parts) if has_protein else None,
+                "sequence_length": len("".join(sequence_parts)) if has_protein else 0,
+                "cap_count": sum(r.name.strip() in {"ACE", "NME"} for r in res_list),
+                "sequence_unmapped_residue_names": (
+                    sorted(residue_names - INSPECTED_PROTEIN_RESNAMES) if has_protein else []
+                ),
+                "resnum": first_resnum,
+                "unique_id": unique_id,
+            }
+            if chain_type in ("protein", "nucleic", "glycan"):
+                chain_info["residue_numbering"] = residue_numbering_summary(
+                    [
+                        (
+                            residue.seqid.num,
+                            str(residue.seqid.icode or "").strip(),
+                            residue.name,
+                        )
+                        for residue in res_list
+                    ]
+                )
+            chains_info.append(chain_info)
+
+        chains_info = _group_covalent_ligand_units(structure, model, chains_info)
+        result["chains"] = chains_info
+        # Summary exposes BOTH ID systems so the caller can pick the right
+        # one for `select_chains`. The contract is:
+        #   - `protein_label_ids` / `ligand_label_ids` / ... = chain_id
+        #     (label_asym_id) — **this is what you pass to select_chains**.
+        #   - `protein_chain_ids` / `ligand_chain_ids` / ... =
+        #     author_chain (auth_asym_id) — for display / provenance.
+        #     Kept under the historical name for backward compatibility.
+        #   - `chain_id_map` = {chain_id -> author_chain} so surprising
+        #     pairings (e.g. 7NMU has label C ↔ auth DDD) are visible.
+        protein_label_ids = [c["chain_id"] for c in chains_info if c["chain_type"] == "protein"]
+        nucleic_label_ids = [c["chain_id"] for c in chains_info if c["chain_type"] == "nucleic"]
+        glycan_label_ids  = [c["chain_id"] for c in chains_info if c["chain_type"] == "glycan"]
+        ligand_label_ids  = [c["chain_id"] for c in chains_info if c["chain_type"] == "ligand"]
+        water_label_ids   = [c["chain_id"] for c in chains_info if c["chain_type"] == "water"]
+        ion_label_ids     = [c["chain_id"] for c in chains_info if c["chain_type"] == "ion"]
+        chain_id_map = {c["chain_id"]: c["author_chain"] for c in chains_info}
+        associated_ligands = associated_ligand_candidates(chains_info)
+        result["associated_ligand_candidates"] = associated_ligands
+        result["summary"] = {
+            "num_protein_chains": len(protein_chain_ids),
+            "num_nucleic_chains": len(nucleic_chain_ids),
+            "num_glycan_chains": len(glycan_chain_ids),
+            "num_ligand_chains": len(ligand_chain_ids),
+            "num_water_chains": len(water_chain_ids),
+            "num_ion_chains": len(ion_chain_ids),
+            "total_chains": len(chains_info),
+            # author_chain (auth_asym_id) lists — for display.
+            "protein_chain_ids": protein_chain_ids,
+            "nucleic_chain_ids": nucleic_chain_ids,
+            "glycan_chain_ids": glycan_chain_ids,
+            "ligand_chain_ids": ligand_chain_ids,
+            "water_chain_ids": water_chain_ids,
+            "ion_chain_ids": ion_chain_ids,
+            # chain_id (label_asym_id) lists — pass these to select_chains.
+            "protein_label_ids": protein_label_ids,
+            "nucleic_label_ids": nucleic_label_ids,
+            "glycan_label_ids": glycan_label_ids,
+            "ligand_label_ids": ligand_label_ids,
+            "water_label_ids": water_label_ids,
+            "ion_label_ids": ion_label_ids,
+            "chain_id_map": chain_id_map,
+            "associated_ligand_candidates": associated_ligands,
+            "associated_ligands_by_author_chain": associated_ligands_by_author_chain(
+                associated_ligands
+            ),
+            "nucleic_subtypes": nucleic_subtypes,
+            "modified_nucleic_residues": modified_nucleic_residues,
+            "glycan_residues": glycan_residues,
+        }
+        use_label_ids = result["file_format"] == "cif"
+        result["action_contract"] = {
+            "chain_id_namespace": (
+                "label_asym_id" if use_label_ids else "auth_asym_id"
+            ),
+            "chains_by_type": {
+                "protein": protein_label_ids if use_label_ids else protein_chain_ids,
+                "nucleic": nucleic_label_ids if use_label_ids else nucleic_chain_ids,
+                "glycan": glycan_label_ids if use_label_ids else glycan_chain_ids,
+                "ligand": ligand_label_ids if use_label_ids else ligand_chain_ids,
+                "water": water_label_ids if use_label_ids else water_chain_ids,
+                "ion": ion_label_ids if use_label_ids else ion_chain_ids,
+            },
+            "default_include_types": [
+                "protein", "nucleic", "glycan", "ligand", "ion",
+            ],
+            "standard_cleanup_tool": "prepare_complex",
+            "standard_cleanup_handles": [
+                "altloc", "MSE", "residue_numbering", "missing_sidechains",
+            ],
+            "residue_identity_fields": [
+                "resnum", "insertion_code", "resname",
+            ],
+            "residue_range_semantics": (
+                "inclusive endpoint identities in deposited chain order"
+            ),
+        }
+        modified_support = modified_nucleic_support_report(modified_nucleic_residues)
+        result["summary"]["modified_nucleic_support_status"] = modified_support["status"]
+        result["summary"]["modified_nucleic_support"] = modified_support
+        result["summary"]["unsupported_modified_nucleic_residues"] = (
+            modified_nucleic_residues if modified_support["detected"] else []
+        )
+        if modified_support["detected"]:
+            result["warnings"].append(MODIFIED_NUCLEIC_UNSUPPORTED_MESSAGE)
+        
+        # Check if any chains were found
+        if not chains_info:
+            result["warnings"].append("No chains found in structure file")
+            result["warnings"].append("Hint: The file may be empty or contain only header information")
+        
+        result["success"] = True
+        logger.info(f"Successfully inspected structure: {len(chains_info)} chains found")
+        logger.info(
+            f"  Proteins: {len(protein_chain_ids)}, Nucleics: {len(nucleic_chain_ids)}, "
+            f"Ligands: {len(ligand_chain_ids)}, Waters: {len(water_chain_ids)}, "
+            f"Ions: {len(ion_chain_ids)}"
+        )
+        
+    except Exception as e:
+        error_msg = f"Error during structure inspection: {type(e).__name__}: {str(e)}"
+        result["errors"].append(error_msg)
+        logger.error(error_msg)
+        
+        if "parse" in str(e).lower() or "read" in str(e).lower():
+            result["errors"].append("Hint: The structure file may be corrupted or in an unsupported format")
+    
+    return result
+
+
+def _carry_reference_sequence(
+    source_structure,
+    subchain_id: str,
+    chain_structure,
+    out_file,
+) -> None:
+    """Copy the chain's SEQRES reference sequence onto the extracted chain.
+
+    Splitting builds a fresh ``gemmi.Structure`` holding only the modeled
+    residues, so the reference sequence stays behind in the parent. PDBFixer
+    finds missing residues by comparing coordinates against that reference:
+    without it ``findMissingResidues()`` returns nothing and every internal
+    gap passes through preparation as a silent chain break.
+
+    ``setup_entities`` first, because gemmi writes SEQRES from an entity whose
+    subchains match the chain it is writing; the entity it builds here starts
+    with an empty ``full_sequence`` for us to fill.
+
+    A source without SEQRES (a stripped PDB, a predicted model) simply has no
+    reference to carry, and the chain is written as before.
+    """
+    import gemmi
+
+    try:
+        source_entity = next(
+            (
+                entity
+                for entity in source_structure.entities
+                if subchain_id in list(entity.subchains)
+            ),
+            None,
+        )
+        if source_entity is None or not len(source_entity.full_sequence):
+            return
+
+        chain_structure.setup_entities()
+        carried = False
+        for entity in chain_structure.entities:
+            if entity.entity_type == gemmi.EntityType.Polymer:
+                entity.full_sequence = list(source_entity.full_sequence)
+                carried = True
+        if carried:
+            logger.info(
+                "Carried %d-residue reference sequence to %s",
+                len(source_entity.full_sequence),
+                out_file,
+            )
+    except Exception as exc:  # noqa: BLE001 - never block the split itself
+        logger.warning(
+            "Could not carry the reference sequence for subchain %s: %s: %s",
+            subchain_id,
+            type(exc).__name__,
+            exc,
+        )
+
+
+def _parse_join_range_groups(
+    join_range_groups: Optional[List[str]],
+    parsed_ranges: list,
+    join_range_pieces: bool,
+) -> list[tuple[str, ...]]:
+    """Normalize explicit same-chain range groups or raise one stable error."""
+    from mdclaw.structure.residue_range import (
+        ResidueRangeError,
+        parse_residue_ranges,
+    )
+
+    def invalid(message: str, hints: list[str]) -> None:
+        raise ResidueRangeError(
+            message,
+            code="invalid_join_range_groups",
+            hints=hints,
+        )
+
+    if join_range_pieces and join_range_groups:
+        invalid(
+            "join_range_pieces and join_range_groups cannot be used together",
+            ["Use --join-range-pieces for join-all, or --join-range-groups for named groups."],
+        )
+    if not join_range_groups:
+        return []
+
+    raw_groups = [join_range_groups] if isinstance(join_range_groups, str) else join_range_groups
+    requested = {entry.spelled() for entry in parsed_ranges}
+    seen: set[str] = set()
+    groups = []
+    for raw_group in raw_groups:
+        parts = [part.strip() for part in str(raw_group).split(",") if part.strip()]
+        if not parts:
+            invalid(
+                "join_range_groups contains an empty group",
+                ["Write each group as comma-separated ranges, for example A:29-173,A:183-227."],
+            )
+        entries = []
+        for part in parts:
+            try:
+                entries.append(parse_residue_ranges([part])[0])
+            except ResidueRangeError as exc:
+                invalid(f"Cannot read join range group {raw_group!r}: {exc}", exc.hints)
+        spellings = tuple(entry.spelled() for entry in entries)
+        absent = [spelling for spelling in spellings if spelling not in requested]
+        if absent:
+            invalid(
+                f"Join range group names range(s) absent from residue_ranges: {absent}",
+                ["Every grouped range must also appear exactly in --residue-ranges."],
+            )
+        duplicates = sorted(
+            {spelling for spelling in spellings if spellings.count(spelling) > 1}
+            | {spelling for spelling in spellings if spelling in seen}
+        )
+        if duplicates:
+            invalid(
+                f"Join range group repeats range membership: {duplicates}",
+                ["List each requested range in at most one --join-range-groups value."],
+            )
+        chains = {entry.chain for entry in entries}
+        if len(chains) != 1:
+            invalid(
+                f"Join range group spans different source chains: {sorted(chains)}",
+                ["Each group may contain ranges from one source chain only."],
+            )
+        seen.update(spellings)
+        groups.append(spellings)
+    return groups
+
+
+def _range_fit(parsed_ranges, chains, id_key) -> tuple[int, int]:
+    """How well residue ranges fit the polymer chains named under one id space.
+
+    Returns ``(endpoints found, ranges that select anything)`` summed over the
+    ranges, where a chain is matched when ``chains[i][id_key]`` equals the
+    range's chain name. Used only to tell label ids from author ids when the
+    two id sets are permutations of each other.
+    """
+    found = overlapping = 0
+    for entry in parsed_ranges or []:
+        residues = [
+            (record["resnum"], record["insertion_code"])
+            for info in chains
+            if info.get(id_key) == entry.chain
+            and info.get("chain_type") in ("protein", "nucleic", "glycan")
+            for record in (info.get("residue_numbering") or {}).get("ordered_residues") or []
+        ]
+        if not residues:
+            continue
+        present = set(residues)
+        found += (tuple(entry.start) in present) + (tuple(entry.end) in present)
+        low, high = sorted((entry.start[0], entry.end[0]))
+        overlapping += any(low <= number <= high for number, _icode in residues)
+    return found, overlapping
+
+
+def _split_listed_ids(values):
+    """``["A,B", " C"]`` -> ``["A", "B", "C"]``; ``None`` stays ``None``."""
+    if values is None:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    out = []
+    for value in values:
+        for part in str(value).replace(",", " ").split():
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+def default_select_chains_from_ranges(select_chains, residue_ranges, analysis=None):
+    """``(select_chains, adjustment)``: residue ranges alone select their chains.
+
+    A range used to crop only the chain it names while every other chain came
+    through whole (049_nucleic_1iv6, qwen v5: ranges for the two DNA strands
+    and the protein of chain A, ``--select-chains`` omitted, and a further
+    chain arrived uncropped). Naming a range for some chains and none for the
+    rest reads as "these chains, cropped", so with ``select_chains`` omitted
+    the selection is the chains the ranges name, in the order they are named,
+    resolved exactly as ``--select-chains`` would be. An explicit
+    ``select_chains`` is never touched; a malformed range is left for the range
+    parser to refuse, and a name ``analysis`` does not know (label or author)
+    is left for ``residue_range_chain_not_found``.
+    """
+    select_chains = _split_listed_ids(select_chains)
+    if select_chains is not None or not residue_ranges:
+        return select_chains, None
+    from mdclaw.structure.residue_range import ResidueRangeError, parse_residue_ranges
+
+    try:
+        parsed = parse_residue_ranges(residue_ranges)
+    except ResidueRangeError:
+        return select_chains, None
+    named = list(dict.fromkeys(entry.chain for entry in parsed))
+    if analysis is not None:
+        known = {str(name) for chain in analysis.get("chains") or []
+                 for name in (chain.get("chain_id"), chain.get("author_chain")) if name}
+        if any(name not in known for name in named):
+            return select_chains, None
+    if not named:
+        return select_chains, None
+    return named, {
+        "code": "select_chains_defaulted_to_range_chains",
+        "message": (
+            "select_chains was omitted, so the chains the residue ranges name were "
+            f"selected ({', '.join(named)}); every other chain is left out. Pass "
+            "--select-chains to keep other chains as well."
+        ),
+        "select_chains": named,
+    }
+
+
+def _select_chains_read_as_author(analysis, select_chains, parsed_ranges, structure_file):
+    """``(read_as_author, permuted)`` for a chain request on this entry.
+
+    Label ids can be a permutation of the author ids (1KX5: author D is
+    label F, author I is label A). The documented convention for mmCIF is
+    the label id, and most calls follow it; but a task that names chains and
+    ranges in author terms then lands on other chains, every endpoint is
+    "unresolved" and nothing says why (051_nucleic_1kx5, campaign v2: every
+    CLI attempt timed out on it). The names alone cannot tell the two apart
+    when both id sets are the same letters, so the residue numbers decide:
+    the names are read as author ids only when every requested name is an
+    author chain, one of them names a different chain as a label, and the
+    requested ranges fit the author chains strictly better than the label
+    chains. Reading on the names alone broke every call that used labels
+    the documented way (1IV6 "A:1-13" is label A's DNA strand, author A is
+    the protein 378-434; 1A66, 1J46, 1ZGW, 2HDC alike).
+    """
+    chains = analysis.get("chains") or []
+    author_ids = {info.get("author_chain") for info in chains}
+    label_ids = {info.get("chain_id") for info in chains}
+    label_to_author = {info.get("chain_id"): info.get("author_chain") for info in chains}
+    requested = set(select_chains or []) | {entry.chain for entry in parsed_ranges or []}
+    read_as_author = bool(
+        requested
+        and Path(structure_file).suffix.lower() not in (".pdb", ".ent")
+        and all(name in author_ids for name in requested)
+        and any(name in label_ids and label_to_author.get(name) != name for name in requested)
+        and _range_fit(parsed_ranges, chains, "author_chain")
+        > _range_fit(parsed_ranges, chains, "chain_id")
+    )
+    permuted = {name: label_to_author[name] for name in sorted(requested)
+                if name in label_ids and label_to_author.get(name) != name} if read_as_author else {}
+    return read_as_author, permuted
+
+
+def _resolve_select_chain_labels(analysis, select_chains, include_types, *, read_as_author):
+    """The label chains a ``select_chains`` request names, by one rule.
+
+    Every reader of a chain request resolves it here -- the split, the
+    disulfide and metal-site filters, the glycan closure -- so they cannot
+    disagree about which chains were asked for. Two readings of one request
+    once diverged: the split read 2DD8's "H L S" as author chains while the
+    disulfide filter mapped label H (the water of author S) to S and dropped
+    every disulfide of the heavy chain without a word (019_antibody_2dd8,
+    028_complex_1dfj, 022_antibody_3rvw: 13 attempts of campaign v5).
+
+    Returns ``{"selected", "missing", "fallback_used", "rescued"}``: the label
+    ids, the names that resolved to nothing, the names resolved through the
+    author fallback, and the names rescued from a label that holds no
+    deliverable chain (``(name, labels, reason)``).
+    """
+    chains = analysis.get("chains") or []
+    include_types = include_types or ["protein", "nucleic", "glycan", "ligand", "ion"]
+    selected: set[str] = set()
+    missing: list[str] = []
+    fallback_used: list[tuple[str, list[str]]] = []
+    rescued: list[tuple[str, list[str], str]] = []
+    for ch in select_chains or []:
+        if read_as_author:
+            selected |= {c["chain_id"] for c in chains if c["author_chain"] == ch}
+            continue
+        label_hits = [c for c in chains if c["chain_id"] == ch]
+        author_hits = [c for c in chains if c["author_chain"] == ch]
+        if label_hits:
+            # A label that holds only water names nothing the split can
+            # deliver (crystal waters are always dropped). When the same
+            # letters are an author chain with a deliverable chain under it,
+            # that chain is what was asked for: 2DD8's label H is the water of
+            # author S, while author H is the heavy chain.
+            deliverable = [c for c in author_hits
+                           if c.get("chain_type") != "water"
+                           and c.get("chain_type") in include_types]
+            if all(c.get("chain_type") == "water" for c in label_hits) and deliverable:
+                labels = sorted(c["chain_id"] for c in author_hits)
+                selected |= set(labels)
+                rescued.append((ch, labels, "label_holds_only_water"))
+                continue
+            selected |= {c["chain_id"] for c in label_hits}
+            continue
+        if author_hits:
+            labels = sorted(c["chain_id"] for c in author_hits)
+            selected |= set(labels)
+            fallback_used.append((ch, labels))
+            continue
+        missing.append(ch)
+
+    # Second fallback: if the primary label selection yielded chains but NONE
+    # of them are in include_types, try author-chain match (including the
+    # first-character-of-author shortcut that SabDab uses -- Hchain='F' in a
+    # multi-chain mmCIF with auth 'FFF' corresponds to the chain under auth
+    # 'FFF', which is the label that carries the protein, not label 'F' which
+    # in those entries is a ligand or water subchain).
+    selected_infos = [c for c in chains if c["chain_id"] in selected]
+    if selected and not missing and not any(c["chain_type"] in include_types for c in selected_infos):
+        rescue_label_ids: set[str] = set()
+        rescue_hits: list[tuple[str, list[str], str]] = []
+        for ch in select_chains or []:
+            matches = [c for c in chains
+                       if c["author_chain"] == ch and c["chain_type"] in include_types]
+            if not matches and len(ch) == 1:
+                matches = [c for c in chains
+                           if c["chain_type"] in include_types
+                           and c["author_chain"]
+                           and c["author_chain"][0] == ch
+                           and c["author_chain"] != ch]
+            if matches:
+                rescue_label_ids |= {c["chain_id"] for c in matches}
+                rescue_hits.append((ch, sorted({c["chain_id"] for c in matches}),
+                                    "no_selected_chain_in_include_types"))
+        if rescue_label_ids:
+            selected = rescue_label_ids
+            rescued.extend(rescue_hits)
+    return {"selected": selected, "missing": missing,
+            "fallback_used": fallback_used, "rescued": rescued}
+
+
+def exclusion_targets(analysis) -> dict[str, set[str]]:
+    """Every id an ``exclude_ligand_ids`` entry may name -> the label chains it drops.
+
+    Ligand and ion instances answer to ``chains[].unique_id`` (and a covalent
+    unit to any of its residues' ids); a glycan chain answers to
+    ``<author>:<resname>:<resnum>`` of any of its residues and is dropped
+    whole. Water is not here: crystal water is always removed.
+    """
+    targets: dict[str, set[str]] = {}
+    for chain in analysis.get("chains") or []:
+        label = str(chain.get("chain_id"))
+        kind = chain.get("chain_type")
+        if kind in ("ligand", "ion"):
+            for name in [chain.get("unique_id"), *(chain.get("covalent_unit_aliases") or [])]:
+                if name:
+                    targets.setdefault(str(name), set()).add(label)
+        elif kind == "glycan":
+            author = chain.get("author_chain")
+            for record in (chain.get("residue_numbering") or {}).get("ordered_residues") or []:
+                for number in {str(record.get("resnum")), str(record.get("residue_id"))}:
+                    targets.setdefault(f"{author}:{record.get('resname')}:{number}", set()).add(label)
+    return targets
+
+
+def unmatched_exclusion_refusal(analysis, exclude_ligand_ids) -> Optional[dict]:
+    """``exclude_ligand_id_unmatched`` for entries that name nothing, else None.
+
+    An exclusion that matches nothing used to be dropped without a word, and
+    what it meant to remove stayed in: 069_soluble_1aol (glm v5) passed
+    ``--exclude-ligand-ids NAG ZN HOH`` -- residue names, not ids -- and the
+    glycan came back in as a covalently linked chain.
+    """
+    targets = exclusion_targets(analysis)
+    unmatched = [entry for entry in exclude_ligand_ids or [] if entry not in targets]
+    if not unmatched:
+        return None
+    by_resname: dict[str, list[str]] = {}
+    for name in sorted(targets):
+        parts = name.split(":")
+        if len(parts) == 3:
+            by_resname.setdefault(parts[1].upper(), []).append(name)
+    suggestions: list[str] = []
+    notes: list[str] = []
+    for entry in unmatched:
+        spelled = str(entry).strip()
+        resname = spelled.split(":")[1] if spelled.count(":") == 2 else spelled
+        resname = resname.upper()
+        if resname in ("HOH", "WAT", "DOD", "H2O"):
+            notes.append(f"{spelled}: crystal water is always removed; drop it from the list")
+            continue
+        matches = by_resname.get(resname) or []
+        if matches:
+            # One id per chain is enough: an id drops the whole glycan chain.
+            per_label: dict[str, str] = {}
+            for name in matches:
+                for label in sorted(targets[name]):
+                    per_label.setdefault(label, name)
+            ids = sorted(set(per_label.values()))
+            suggestions.extend(ids)
+            notes.append(f"{spelled} names no instance; its ids here are {', '.join(ids)}")
+        else:
+            notes.append(f"{spelled} matches no ligand, ion or glycan of this entry")
+    keep = [entry for entry in exclude_ligand_ids if entry in targets]
+    fixed = list(dict.fromkeys(keep + suggestions))
+    if fixed:
+        next_action = ("Pass instance ids, not residue names: --exclude-ligand-ids "
+                       + " ".join(fixed) + " (inspect_molecules lists chains[].unique_id), "
+                       "then run the same (still pending) node again.")
+    else:
+        next_action = ("Drop --exclude-ligand-ids (nothing in it names a component of this "
+                       "entry), then run the same (still pending) node again.")
+    glycan_labels = {str(c.get("chain_id")) for c in analysis.get("chains") or []
+                     if c.get("chain_type") == "glycan"}
+    if any(targets[name] & glycan_labels for name in suggestions):
+        notes.append("To leave out every glycan, omit glycan from --include-types instead.")
+    error = create_validation_error(
+        "exclude_ligand_ids",
+        "entries name no ligand, ion or glycan instance: " + ", ".join(unmatched),
+        expected="ids from inspect_molecules chains[].unique_id (author_chain:resname:resnum)",
+        actual=", ".join(str(e) for e in exclude_ligand_ids),
+        hints=notes,
+        context_extra={"unmatched_exclude_ligand_ids": unmatched,
+                       "suggested_exclude_ligand_ids": fixed},
+        code="exclude_ligand_id_unmatched",
+    )
+    error["next_action"] = next_action
+    return error
+
+
+def resolve_chain_selection(structure_file, select_chains, *, include_types=None,
+                            residue_ranges=None, analysis=None) -> dict:
+    """Resolve a chain request exactly as :func:`split_molecules` will.
+
+    For the readers that work on the source before the split -- disulfide and
+    metal-site detection, the glycan closure -- and need the same chains in
+    author space, where SSBOND / ``_struct_conn`` records live. Returns
+    ``select_chains`` (after comma splitting and the range default),
+    ``label_ids`` (None when everything is selected), ``author_chains``
+    (author ids of those labels; None when everything is selected),
+    ``read_as_author``, ``missing`` and ``range_windows_by_author``
+    (``{author: [(start, end), ...]}`` of polymer chains given a range).
+    """
+    from mdclaw.structure.residue_range import ResidueRangeError, parse_residue_ranges
+
+    if analysis is None:
+        analysis = _inspect_molecules_impl(str(structure_file))
+    chains = analysis.get("chains") or []
+    select_chains, _adjustment = default_select_chains_from_ranges(
+        select_chains, residue_ranges, analysis)
+    try:
+        parsed_ranges = parse_residue_ranges(residue_ranges)
+    except ResidueRangeError:
+        parsed_ranges = []
+    read_as_author, _permuted = _select_chains_read_as_author(
+        analysis, select_chains, parsed_ranges, structure_file)
+    windows: dict[str, list[tuple[int, int]]] = {}
+    labels = {info.get("chain_id") for info in chains}
+    for entry in parsed_ranges:
+        if entry.chain in labels and not read_as_author:
+            matched = [info for info in chains if info.get("chain_id") == entry.chain]
+        else:
+            matched = [info for info in chains if info.get("author_chain") == entry.chain]
+        for info in matched:
+            if info.get("chain_type") in ("protein", "nucleic", "glycan"):
+                low, high = sorted((entry.start[0], entry.end[0]))
+                windows.setdefault(str(info.get("author_chain")), []).append((low, high))
+    out = {
+        "select_chains": select_chains,
+        "read_as_author": read_as_author,
+        "range_windows_by_author": windows,
+        "label_ids": None,
+        "author_chains": None,
+        "missing": [],
+    }
+    if select_chains is None:
+        return out
+    resolved = _resolve_select_chain_labels(
+        analysis, select_chains, include_types, read_as_author=read_as_author)
+    out["label_ids"] = sorted(resolved["selected"])
+    out["author_chains"] = sorted({str(c.get("author_chain")) for c in chains
+                                   if c.get("chain_id") in resolved["selected"]})
+    out["missing"] = resolved["missing"]
+    return out
+
+
+
+def split_molecules(
+    structure_file: str,
+    output_dir: Optional[str] = None,
+    select_chains: Optional[List[str]] = None,
+    include_types: Optional[List[str]] = None,
+    include_ligand_ids: Optional[List[str]] = None,
+    include_ligand_resnames: Optional[List[str]] = None,
+    exclude_ligand_ids: Optional[List[str]] = None,
+    include_associated_ligands: bool = False,
+    residue_ranges: Optional[List[str]] = None,
+    join_range_pieces: bool = False,
+    join_range_groups: Optional[List[str]] = None,
+    extra_label_ids: Optional[List[str]] = None,
+) -> dict:
+    """Split an mmCIF or PDB structure file into separate chain files.
+
+    This tool splits a structure into chain files by molecular type:
+    protein, nucleic, ligand, ion, and water. Output files are always in PDB
+    format. Files are named as protein_1.pdb, nucleic_1.pdb, ligand_1.pdb,
+    ion_1.pdb, water_1.pdb, etc.
+
+    Chain Selection — label_asym_id vs auth_asym_id:
+        **Rule of thumb: pass the short chain ID exactly as it appears
+        in your input file.**
+
+        - For **mmCIF** inputs pass ``chain_id`` (= label_asym_id), the
+          short per-entity ID used by RCSB / SabDab (e.g. ``B`` for
+          7QVK). The accompanying ``author_chain`` (auth_asym_id) is
+          the depositor's original label and may be multi-letter
+          (``AAA``, ``BBB``, ``AbA``) or reordered from the label
+          (7NMU: label ``C`` ↔ auth ``DDD``).
+        - For **PDB** inputs pass ``author_chain`` (= the 1-character
+          value in column 22). gemmi's ``chain_id`` for PDB files is
+          an auto-generated subchain ID like ``Axp`` / ``Ax1`` / ``Axw``
+          — that's an internal artifact, not something users write.
+
+        Implementation: the tool tries ``chain_id`` (label) first, then
+        ``author_chain`` (auth). This single rule handles both formats
+        correctly — mmCIF hits on the primary path, PDB hits on the
+        fallback — and the fallback warning is suppressed for PDB
+        inputs since author-match IS the natural path there. Errors
+        list both systems and the ``label -> author`` mapping so the
+        caller can disambiguate.
+
+        Type-aware rescue: when the primary label match lands on chains
+        that are all outside ``include_types`` (e.g. a SabDab
+        ``Hchain='F'`` that matches the water/ligand subchain at label
+        F while the nanobody lives at a different label), the tool
+        retries with author_chain matching — including a
+        first-character-of-author shortcut (``'F' -> auth 'FFF'``).
+        This covers multi-chain RCSB mmCIF entries whose PDB-format
+        export truncated long auth IDs to single letters. The rescue
+        emits a warning naming the actual label chosen.
+
+        Internally, gemmi's subchain iteration is keyed on label_asym_id
+        (that's a gemmi API constraint, not a design choice). For
+        chain-level bookkeeping (disulfide pairs, merged-PDB chain
+        column) we prefer auth_asym_id because it tracks the biological
+        chain rather than mmCIF's entity-level split.
+
+    Type Filtering:
+        Use include_types to filter by molecular type. By default (None), all
+        types except water are included. Valid types: "protein", "nucleic",
+        "glycan", "ligand", "ion". Crystal waters are not supported: "water" is
+        refused (``crystal_waters_unsupported``) and water residues are always
+        dropped; explicit solvent comes from solvate_structure.
+
+    Tip: Use inspect_molecules first to understand the structure and identify
+    which chains you want to extract. It shows both chain_id (label_asym_id)
+    and author_chain (auth_asym_id) for each chain, plus a
+    ``chain_id_map`` in the summary.
+
+    Args:
+        structure_file: Path to the mmCIF (.cif) or PDB (.pdb) file to split.
+        output_dir: Output directory (auto-generated if None).
+        select_chains: List of chain IDs to extract. Matches ``chain_id``
+                       (label_asym_id) first and falls back to
+                       ``author_chain`` (auth_asym_id) for any unresolved
+                       entries. Use inspect_molecules to find available
+                       IDs. If None, extracts all chains.
+        include_types: List of molecular types to include. Valid values:
+                       "protein", "nucleic", "glycan", "ligand", "ion".
+                       If None (default), includes ["protein", "nucleic", "glycan", "ligand", "ion"].
+                       "water" is refused: crystal waters are not supported.
+        include_ligand_ids: List of ligand unique IDs to include (format:
+                           "author_chain:resname:resnum", e.g.,
+                           ["A:ACP:501"]). If specified, only these ligands
+                           are extracted. If select_chains omitted a requested
+                           ligand's label chain, the chain is auto-included
+                           with a ``ligand_chain_auto_included`` adjustment.
+                           Use inspect_molecules to get available ligand unique IDs.
+        include_ligand_resnames: List of ligand residue names to include
+                           within the selected polymer scope, e.g. ["NDP"].
+                           When select_chains is provided, matching
+                           associated ligand label chains are auto-included
+                           even if their label chain IDs differ from the
+                           selected protein/nucleic/glycan chain IDs. When
+                           select_chains is omitted, all matching ligand
+                           residue names in the structure are included.
+        exclude_ligand_ids: List of ligand unique IDs to exclude (format: "chain:resname:resnum",
+                           e.g., ["A:ACT:401", "A:ACT:402"]). If specified, these ligands are
+                           skipped. Takes precedence if a ligand is in both include and exclude.
+        include_associated_ligands: If True, auto-include ligand label chains
+                           associated with selected protein/nucleic/glycan
+                           author chains. If False, this condition blocks
+                           instead of silently dropping associated ligands.
+        residue_ranges: Polymer residue ranges to retain. Multiple ranges from
+                           one chain are written as separate components unless
+                           a join option groups them.
+        join_range_pieces: Bond the ranges of one chain into a single chain
+                           across the omitted span (default: False). Only for
+                           an explicit "join the pieces" request.
+        join_range_groups: Comma-separated groups of ranges to bond into one
+                           component, for example
+                           ``["A:29-173,A:183-227"]``. Ungrouped ranges stay
+                           separate. Mutually exclusive with
+                           ``join_range_pieces``.
+        extra_label_ids: Label chain ids to add to a ``select_chains``
+                           request after it has been resolved (prepare_complex
+                           passes covalently linked glycan chains here). They
+                           never change how the requested names are read.
+
+    Residue ranges without ``select_chains`` select the chains they name
+    (``select_chains_defaulted_to_range_chains``); every other chain is left
+    out. Pass ``select_chains`` as well to keep other chains whole.
+
+    ``exclude_ligand_ids`` entries name ligand or ion instances
+    (``chains[].unique_id``) or a residue of a glycan chain
+    (``<author>:<resname>:<resnum>``, which drops that glycan chain). An entry
+    that names nothing is refused (``exclude_ligand_id_unmatched``).
+
+    Returns:
+        Dict with:
+            - success: bool - True if splitting completed successfully
+            - job_id: str - Unique identifier for this operation
+            - output_dir: str - Directory containing output files
+            - source_file: str - Original input file path
+            - file_format: str - Output format (always 'pdb')
+            - protein_files: list[str] - Paths to protein chain files (protein_*.pdb)
+            - nucleic_files: list[str] - Paths to nucleic chain files (nucleic_*.pdb)
+            - glycan_files: list[str] - Paths to glycan chain files (glycan_*.pdb)
+            - ligand_files: list[str] - Paths to ligand chain files (ligand_*.pdb)
+            - ion_files: list[str] - Paths to ion chain files (ion_*.pdb)
+            - water_files: list[str] - Paths to water chain files (water_*.pdb)
+            - all_chains: list[dict] - Metadata for all chains found (from inspect_molecules)
+            - chain_file_info: list[dict] - Mapping of chains to output files
+            - include_types: list[str] - Types that were included
+            - errors: list[str] - Error messages (empty if success=True)
+            - warnings: list[str] - Non-critical issues encountered
+    """
+    logger.info(f"Splitting structure: {structure_file}")
+    
+    # Set default include_types (exclude water by default)
+    if include_types is None:
+        include_types = ["protein", "nucleic", "glycan", "ligand", "ion"]
+
+    # Validate include_types
+    valid_types = {"protein", "nucleic", "glycan", "ligand", "ion", "water"}
+    invalid_types = set(include_types) - valid_types
+    if invalid_types:
+        logger.warning(f"Invalid include_types ignored: {invalid_types}. Valid: {valid_types}")
+        include_types = [t for t in include_types if t in valid_types]
+
+    requested_ligand_ids: list[str] | None = None
+    requested_ligand_id_set: set[str] | None = None
+    requested_ligand_resnames = _normalize_ligand_resnames(include_ligand_resnames)
+    requested_ligand_resname_set = set(requested_ligand_resnames)
+    excluded_ligand_id_set: set[str] | None = None
+    if exclude_ligand_ids is not None:
+        excluded_ligand_id_set = {
+            str(item).strip()
+            for item in exclude_ligand_ids
+            if str(item).strip()
+        }
+    resname_selected_ligand_ids: set[str] | None = None
+    
+    # Initialize result structure for LLM error handling
+    job_id = generate_job_id()
+    result = {
+        "success": False,
+        "job_id": job_id,
+        "output_dir": None,
+        "source_file": str(structure_file),
+        "file_format": "pdb",
+        "protein_files": [],
+        "nucleic_files": [],
+        "glycan_files": [],
+        "ligand_files": [],
+        "ion_files": [],
+        "water_files": [],
+        "all_chains": [],
+        "chain_file_info": [],
+        "include_types": include_types,
+        "selection_adjustments": [],
+        "residue_ranges": {
+            "requested": [],
+            "resolved": {},
+            "delivered": {},
+            "join_range_pieces": bool(join_range_pieces),
+            "join_range_groups": [],
+            "resolved_groups": [],
+            "component_sizes": [],
+        },
+        # One line per written polymer component: the residues it really
+        # holds (first, last, count, gaps, insertion codes), whether or not
+        # a range was asked for, so the caller can hold it against the task.
+        "delivered_chain_ranges": [],
+        "errors": [],
+        "warnings": []
+    }
+
+    # Crystal waters are not supported: nothing downstream carries them (the
+    # merge never took the split's water files and no stage adds their
+    # hydrogens), so asking for them used to end in a prepared system with no
+    # water and no word of it. Refuse the request instead of dropping it.
+    if "water" in include_types:
+        result.update(
+            create_validation_error(
+                "include_types",
+                "Crystal waters are not supported; water residues are always removed",
+                expected="Types from protein, nucleic, glycan, ligand, ion",
+                actual=include_types,
+                hints=[
+                    "Drop 'water' from --include-types; explicit solvent is added by "
+                    "solvate_structure after prep.",
+                    "A structural water the result depends on (for example one bridging "
+                    "a ligand) cannot be kept: report it as a limitation of the prepared model.",
+                ],
+                code="crystal_waters_unsupported",
+            )
+        )
+        return result
+
+    # Parse the ranges before anything else touches the file: a malformed range
+    # is the caller's to fix and there is nothing to read the structure for.
+    from mdclaw.structure import residue_range as rr
+    from mdclaw.structure.residue_range import (
+        ResidueRangeError,
+        describe_span,
+        parse_residue_ranges,
+    )
+    try:
+        parsed_ranges = parse_residue_ranges(residue_ranges)
+        parsed_join_groups = _parse_join_range_groups(
+            join_range_groups,
+            parsed_ranges,
+            join_range_pieces,
+        )
+    except ResidueRangeError as exc:
+        result["errors"].append(str(exc))
+        result["code"] = exc.code
+        result["hints"] = exc.hints
+        return result
+    result["residue_ranges"]["requested"] = [entry.spelled() for entry in parsed_ranges]
+    result["residue_ranges"]["join_range_groups"] = [
+        list(group) for group in parsed_join_groups
+    ]
+    join_group_by_range = {
+        spelling: group
+        for group in parsed_join_groups
+        for spelling in group
+    }
+
+    if (
+        "ligand" not in include_types
+        and (include_ligand_ids is not None or include_ligand_resnames is not None)
+    ):
+        result.update(
+            create_validation_error(
+                "include_types",
+                "Ligand selectors require ligand in include_types",
+                expected="Add ligand to include_types or remove the ligand selector",
+                actual=include_types,
+                hints=[
+                    "Include ligands: --include-types protein ligand",
+                    "Or remove --include-ligand-ids/--include-ligand-resnames.",
+                ],
+                context_extra={
+                    "include_ligand_ids": include_ligand_ids,
+                    "include_ligand_resnames": include_ligand_resnames,
+                },
+                code="ligand_type_required",
+            )
+        )
+        return result
+    
+    # First, analyze the structure
+    # "A,B" is one argument on the command line (047_nucleic_1c7u cli_skill_sif
+    # r1 lost a prep node to "Chain(s) not found: ['A,B']"); lists of ids are
+    # read the way residue ranges already are, split on commas and whitespace.
+    select_chains = _split_listed_ids(select_chains)
+    include_ligand_ids = _split_listed_ids(include_ligand_ids)
+    exclude_ligand_ids = _split_listed_ids(exclude_ligand_ids)
+    # Rebuilt from the split list: "A:ZN:301,A:NAG:401" is one argument.
+    excluded_ligand_id_set = (
+        set(exclude_ligand_ids) if exclude_ligand_ids is not None else None)
+    analysis = _inspect_molecules_impl(structure_file)
+
+    if not analysis["success"]:
+        result["errors"] = analysis["errors"]
+        result["warnings"] = analysis["warnings"]
+        return result
+
+    select_chains, range_default = default_select_chains_from_ranges(
+        select_chains, residue_ranges, analysis)
+    if range_default is not None:
+        result["selection_adjustments"].append(range_default)
+        result["warnings"].append(
+            f"{range_default['code']}: {range_default['message']}")
+
+    result["all_chains"] = analysis["chains"]
+
+    # How the names are read (label or author ids) is decided once, in
+    # _select_chains_read_as_author; the docstring there says why.
+    read_as_author, _permuted_names = _select_chains_read_as_author(
+        analysis, select_chains, parsed_ranges, structure_file)
+
+    excluded_label_ids: set[str] = set()
+    if exclude_ligand_ids:
+        refusal = unmatched_exclusion_refusal(analysis, exclude_ligand_ids)
+        if refusal is not None:
+            result.update(refusal)
+            return result
+        targets = exclusion_targets(analysis)
+        excluded_label_ids = {label for entry in exclude_ligand_ids for label in targets[entry]}
+        result["excluded_label_ids"] = sorted(excluded_label_ids)
+
+    # Resolve each residue range to the chains it names, once and globally, so
+    # the per-chain loop only has to look up an answer. Two rules matter here.
+    # Label wins over author: 6W9C's zinc is label I with author chain C, so a
+    # range written "C:4-315" for the protein would otherwise also empty the
+    # zinc. And a range applies to polymers only -- it describes a construct,
+    # while ions, ligands and water are selected by their own identifiers.
+    _labels = {info.get("chain_id") for info in analysis["chains"]}
+    range_by_chain_id = {}
+    for entry in parsed_ranges:
+        if entry.chain in _labels and not read_as_author:
+            matched = [info for info in analysis["chains"]
+                       if info.get("chain_id") == entry.chain]
+        else:
+            matched = [info for info in analysis["chains"]
+                       if info.get("author_chain") == entry.chain]
+        for info in matched:
+            if info.get("chain_type") in ("protein", "nucleic", "glycan"):
+                # A chain may carry several ranges: a GPCR fusion construct is
+                # receptor-half, crystallisation partner, receptor-half on one
+                # deposited chain, and the reference keeps only the halves.
+                chain_id = info.get("chain_id")
+                range_by_chain_id.setdefault(chain_id, []).append(entry)
+                # Published so nothing downstream resolves the ranges a second
+                # time. Two independent resolutions of the same name drift: a
+                # homodimer whose copies are labels C and E under one author
+                # chain C is cropped here on the label (C only) while a
+                # re-resolution on the author name would bound E as well, and
+                # E was never cropped.
+                record = result["residue_ranges"]["resolved"].setdefault(
+                    chain_id, {"pieces": [], "author_chain": info.get("author_chain")})
+                record["pieces"].append({
+                    "range": entry.spelled(),
+                    "start": entry.start[0],
+                    "start_icode": entry.start[1],
+                    "end": entry.end[0],
+                    "end_icode": entry.end[1],
+                })
+                record["range"] = rr.spelled(range_by_chain_id[chain_id])
+                # ``start``/``end`` are the single-range spelling and only exist
+                # while there is one range. For a fusion they would be the outer
+                # envelope -- 18 and 458 for pieces 18-214 and 383-458 -- which
+                # is the widened request the ranges exist to refuse, and 23 and
+                # 1196 for a construct whose partner is renumbered into the
+                # 1000s. A reader that has not learned about ``pieces`` should
+                # fail on the missing key rather than be handed that.
+                if len(record["pieces"]) == 1:
+                    record["start"] = record["pieces"][0]["start"]
+                    record["end"] = record["pieces"][0]["end"]
+                else:
+                    record.pop("start", None)
+                    record.pop("end", None)
+
+    if include_ligand_ids is not None and "ligand" in include_types:
+        requested_ligand_ids = sorted(
+            {str(item).strip() for item in include_ligand_ids if str(item).strip()}
+        )
+        # A covalently joined ligand answers to any of its residues' ids.
+        alias_to_unit = {
+            str(alias): str(chain["unique_id"])
+            for chain in analysis["chains"]
+            if chain.get("chain_type") == "ligand" and chain.get("unique_id")
+            for alias in chain.get("covalent_unit_aliases") or []
+        }
+        requested_ligand_ids = sorted({alias_to_unit.get(item, item) for item in requested_ligand_ids})
+        requested_ligand_id_set = set(requested_ligand_ids)
+        available_ligand_ids = sorted(
+            {
+                str(chain["unique_id"])
+                for chain in analysis["chains"]
+                if chain.get("chain_type") == "ligand" and chain.get("unique_id")
+            }
+        )
+        matched_ligand_ids = sorted(
+            set(requested_ligand_ids) & set(available_ligand_ids)
+        )
+        missing_ligand_ids = sorted(
+            set(requested_ligand_ids) - set(available_ligand_ids)
+        )
+        result["ligand_selection"] = {
+            "requested_ligand_ids": requested_ligand_ids,
+            "available_ligand_ids": available_ligand_ids,
+            "matched_ligand_ids": matched_ligand_ids,
+            "missing_ligand_ids": missing_ligand_ids,
+        }
+        if missing_ligand_ids:
+            result.update(
+                create_validation_error(
+                    "include_ligand_ids",
+                    "requested ligand unique ID(s) were not found",
+                    expected=(
+                        "ligand unique_id values from inspect_molecules, e.g. "
+                        "author_chain:resname:resnum"
+                    ),
+                    actual=", ".join(missing_ligand_ids),
+                    hints=[
+                        "Run inspect_molecules and copy chains[].unique_id exactly.",
+                        "Do not pass only a ligand residue name such as ATP or AP5.",
+                        f"Available ligand unique_id values: {available_ligand_ids}",
+                    ],
+                    context_extra={
+                        "requested_ligand_ids": requested_ligand_ids,
+                        "available_ligand_ids": available_ligand_ids,
+                        "matched_ligand_ids": matched_ligand_ids,
+                        "missing_ligand_ids": missing_ligand_ids,
+                    },
+                    code="requested_ligand_ids_not_found",
+                )
+            )
+            _route_free_amino_acid_request(result, analysis["chains"], ids=missing_ligand_ids)
+            return result
+
+        if requested_ligand_resname_set:
+            ligand_chain_by_id = {
+                str(chain.get("unique_id")): chain
+                for chain in analysis["chains"]
+                if chain.get("chain_type") == "ligand" and chain.get("unique_id")
+            }
+            mismatched_ligand_ids = sorted(
+                ligand_id
+                for ligand_id in matched_ligand_ids
+                if not _chain_matches_ligand_resnames(
+                    ligand_chain_by_id[ligand_id],
+                    requested_ligand_resname_set,
+                )
+            )
+            result["ligand_selection"]["requested_ligand_resnames"] = (
+                requested_ligand_resnames
+            )
+            if mismatched_ligand_ids:
+                result["ligand_selection"]["mismatched_ligand_ids"] = (
+                    mismatched_ligand_ids
+                )
+                result.update(
+                    create_validation_error(
+                        "include_ligand_ids/include_ligand_resnames",
+                        "requested ligand ID(s) do not match requested residue name(s)",
+                        expected=(
+                            "If both selectors are supplied, every explicit ligand ID "
+                            "must have one of the requested residue names"
+                        ),
+                        actual=", ".join(mismatched_ligand_ids),
+                        hints=[
+                            "Use only --include-ligand-ids for exact instance selection.",
+                            "Use only --include-ligand-resnames for residue-name scoped selection.",
+                        ],
+                        context_extra={
+                            "requested_ligand_ids": requested_ligand_ids,
+                            "requested_ligand_resnames": requested_ligand_resnames,
+                            "mismatched_ligand_ids": mismatched_ligand_ids,
+                        },
+                        code="ligand_id_resname_mismatch",
+                    )
+                )
+                return result
+
+    if (
+        include_ligand_resnames is not None
+        and not requested_ligand_resnames
+        and "ligand" in include_types
+    ):
+        result.update(
+            create_validation_error(
+                "include_ligand_resnames",
+                "include_ligand_resnames was provided but no residue names were usable",
+                expected="One or more ligand residue names such as NDP, ATP, or AP5",
+                actual=include_ligand_resnames,
+                code="empty_ligand_resname_selection",
+            )
+        )
+        return result
+
+    if requested_ligand_resname_set and "ligand" in include_types:
+        available_resnames = sorted(
+            {
+                resname
+                for chain in analysis["chains"]
+                if chain.get("chain_type") == "ligand"
+                for resname in _chain_residue_names(chain)
+            }
+        )
+        matching_chains = [
+            chain
+            for chain in analysis["chains"]
+            if chain.get("chain_type") == "ligand"
+            and chain.get("unique_id")
+            and _chain_matches_ligand_resnames(chain, requested_ligand_resname_set)
+        ]
+        if not matching_chains:
+            result["ligand_selection"] = {
+                "mode": "include_ligand_resnames",
+                "requested_ligand_resnames": requested_ligand_resnames,
+                "available_ligand_resnames": available_resnames,
+                "available_ligand_ids": sorted(
+                    str(chain.get("unique_id"))
+                    for chain in analysis["chains"]
+                    if chain.get("chain_type") == "ligand" and chain.get("unique_id")
+                ),
+            }
+            result.update(
+                create_validation_error(
+                    "include_ligand_resnames",
+                    "requested ligand residue name(s) were not found",
+                    expected="Ligand residue names present in inspect_molecules output",
+                    actual=", ".join(requested_ligand_resnames),
+                    hints=[
+                        f"Available ligand residue names: {available_resnames}",
+                        "Use inspect_molecules to confirm ligand residue names and unique IDs.",
+                    ],
+                    context_extra=result["ligand_selection"],
+                    code="requested_ligand_resnames_not_found",
+                )
+            )
+            _route_free_amino_acid_request(
+                result, analysis["chains"], resnames=requested_ligand_resname_set)
+            return result
+    
+    # Check for gemmi dependency (should be available if analysis succeeded)
+    try:
+        import gemmi
+    except ImportError:
+        result["errors"].append("gemmi library not installed")
+        return result
+    
+    # Validate input file
+    structure_path = Path(structure_file)
+    suffix = structure_path.suffix.lower()
+    
+    # Setup output directory
+    base_dir = Path(output_dir) if output_dir else WORKING_DIR
+    out_dir = create_unique_subdir(base_dir, "split")
+    result["output_dir"] = str(out_dir)
+
+    try:
+        # Read structure with gemmi
+        logger.info(f"Reading structure with gemmi ({suffix})...")
+        if suffix == '.cif':
+            doc = gemmi.cif.read(str(structure_path))
+            block = doc[0]
+            structure = gemmi.make_structure_from_block(block)
+        else:  # .pdb or .ent
+            structure = gemmi.read_pdb(str(structure_path))
+        structure.setup_entities()
+        
+        structure.assign_label_seq_id()
+        model = structure[0]  # Use first model
+        
+        # Build chain info lookup from analysis results
+        chain_info = {c["chain_id"]: c for c in analysis["chains"]}
+        
+        # Determine which chains to select.
+        # Option 2 contract: select_chains is label_asym_id (chain_id) first,
+        # with a safety fallback to author_chain for unresolved IDs. We always
+        # end up with a set of label IDs in selected_chain_ids, which is what
+        # the downstream gemmi subchain loop keys on.
+        available_chain_ids = [c["chain_id"] for c in analysis["chains"]]
+        available_author_chains = sorted({c["author_chain"] for c in analysis["chains"]})
+        label_to_author_map = {c["chain_id"]: c["author_chain"] for c in analysis["chains"]}
+
+        if select_chains is not None:
+            selected_chain_ids: set[str] = set()
+            missing_chains: list[str] = []
+            fallback_used: list[tuple[str, list[str]]] = []
+            # Label ids can be a permutation of the author ids (1KX5: author D
+            # is label F, author I is label A). Read as labels, the task's
+            # author-numbered ranges then land on other chains, every endpoint
+            # is "unresolved" and nothing says why (051_nucleic_1kx5: all three
+            # cli_sif attempts timed out on it). When every requested id is an
+            # author chain and at least one of them names a *different* chain
+            # as a label, the ids are read as author ids and the call says so.
+            if read_as_author:
+                permuted = _permuted_names
+                result["selection_adjustments"].append({
+                    "code": "chain_ids_read_as_author",
+                    "message": (
+                        "select_chains were read as author chain ids: as label ids they "
+                        f"would name other chains here (label -> author {permuted})."
+                    ),
+                    "label_to_author": dict(label_to_author_map),
+                })
+                result["warnings"].append(
+                    "chain_ids_read_as_author: the requested chain ids match author "
+                    "chains, and the same letters are label ids of other chains in this "
+                    f"entry ({permuted}); they were read as author ids."
+                )
+            # One resolution rule for every reader of the request (the
+            # disulfide and metal filters and the glycan closure call the same
+            # function before the split runs).
+            resolution = _resolve_select_chain_labels(
+                analysis, select_chains, include_types, read_as_author=read_as_author)
+            selected_chain_ids = set(resolution["selected"])
+            missing_chains = resolution["missing"]
+            fallback_used = resolution["fallback_used"]
+
+            if missing_chains:
+                result["errors"].append(f"Chain(s) not found: {missing_chains}")
+                result["errors"].append(
+                    f"Hint: Available chain_id (label_asym_id) values: {available_chain_ids}"
+                )
+                result["errors"].append(
+                    f"Hint: Available author_chain (auth_asym_id) values: {available_author_chains}"
+                )
+                result["errors"].append(
+                    f"Hint: label -> author mapping: {label_to_author_map}"
+                )
+                logger.error(
+                    f"Requested chains not found: {missing_chains} "
+                    f"(available labels={available_chain_ids}; authors={available_author_chains})"
+                )
+                return result
+
+            # Suppress fallback warnings when the input is PDB format. For
+            # PDB files the "label_asym_id" that gemmi surfaces is actually
+            # an auto-generated subchain_id (e.g. ``Axp``, ``Ax1``, ``Axw``
+            # for the protein / 1st ligand / water of author chain A), not
+            # something the user would reasonably type. The PDB chain
+            # column is the author_chain, so author-fallback IS the natural
+            # resolution path and need not be flagged.
+            _suffix = structure_path.suffix.lower()
+            _is_pdb_input = _suffix in (".pdb", ".ent")
+            if fallback_used and not _is_pdb_input:
+                for ch, labels in fallback_used:
+                    result["warnings"].append(
+                        f"Chain '{ch}' resolved via author_chain fallback -> label(s) {labels}. "
+                        f"Pass the label_asym_id directly to avoid this fallback."
+                    )
+            for ch, labels, reason in resolution["rescued"]:
+                if reason == "label_holds_only_water":
+                    result["selection_adjustments"].append({
+                        "code": "chain_id_read_as_author_over_water_label",
+                        "message": (
+                            f"Label chain {ch} holds only crystal water (always dropped); "
+                            f"author chain {ch} was selected instead (label(s) {labels})."
+                        ),
+                        "requested": ch,
+                        "label_ids": labels,
+                    })
+                    result["warnings"].append(
+                        f"chain_id_read_as_author_over_water_label: label chain '{ch}' holds "
+                        f"only water, so '{ch}' was read as the author chain -> label(s) {labels}."
+                    )
+                else:
+                    result["warnings"].append(
+                        f"Chain '{ch}' rescued via author-chain fallback (primary "
+                        f"label match had no chains in include_types={include_types}). "
+                        f"Resolved to label(s) {labels}. Common for SabDab 1-char IDs "
+                        f"on mmCIF entries with multi-letter author IDs (e.g. 'F' -> "
+                        f"auth 'FFF')."
+                    )
+            # Label chains a caller resolved itself and adds to the request
+            # (prepare_complex's covalently linked glycans). Added after the
+            # resolution so they cannot change how the names are read.
+            for label in extra_label_ids or []:
+                if label in chain_info:
+                    selected_chain_ids.add(label)
+            if include_ligand_ids is not None and "ligand" in include_types:
+                requested = requested_ligand_id_set or set()
+                matching_ligands = [
+                    c for c in analysis["chains"]
+                    if c.get("chain_type") == "ligand"
+                    and c.get("unique_id") in requested
+                ]
+                auto_added = sorted(
+                    c["chain_id"]
+                    for c in matching_ligands
+                    if c.get("chain_id") not in selected_chain_ids
+                )
+                if auto_added:
+                    selected_chain_ids |= set(auto_added)
+                    adjustment = {
+                        "code": "ligand_chain_auto_included",
+                        "message": (
+                            "Requested ligand(s) were outside select_chains; "
+                            "their label chain(s) were added automatically."
+                        ),
+                        "added_chain_ids": auto_added,
+                        "requested_ligand_ids": sorted(requested),
+                    }
+                    result["selection_adjustments"].append(adjustment)
+                    result["warnings"].append(
+                        "ligand_chain_auto_included: requested ligand(s) "
+                        f"{sorted(requested)} require ligand label chain(s) "
+                        f"{auto_added}, which were added to select_chains."
+                    )
+            elif requested_ligand_resname_set and "ligand" in include_types:
+                associated_candidates = selected_associated_ligand_candidates(
+                    analysis["chains"],
+                    selected_chain_ids,
+                    exclude_ligand_ids=excluded_ligand_id_set,
+                )
+                matching_associated = [
+                    candidate
+                    for candidate in associated_candidates
+                    if _candidate_matches_ligand_resnames(
+                        candidate,
+                        requested_ligand_resname_set,
+                    )
+                ]
+                direct_selected_ligands = [
+                    c for c in analysis["chains"]
+                    if c.get("chain_type") == "ligand"
+                    and c.get("unique_id")
+                    and c.get("chain_id") in selected_chain_ids
+                    and (
+                        excluded_ligand_id_set is None
+                        or c.get("unique_id") not in excluded_ligand_id_set
+                    )
+                    and _chain_matches_ligand_resnames(
+                        c,
+                        requested_ligand_resname_set,
+                    )
+                ]
+                resname_selected_ligand_ids = {
+                    str(candidate["unique_id"])
+                    for candidate in matching_associated
+                } | {
+                    str(chain["unique_id"])
+                    for chain in direct_selected_ligands
+                }
+                auto_added = sorted(
+                    {
+                        str(candidate["ligand_chain_id"])
+                        for candidate in matching_associated
+                        if candidate.get("ligand_chain_id") not in selected_chain_ids
+                    }
+                )
+                if auto_added:
+                    selected_chain_ids |= set(auto_added)
+                excluded_same_author_ids = sorted(
+                    {
+                        str(candidate["unique_id"])
+                        for candidate in associated_candidates
+                        if str(candidate["unique_id"]) not in resname_selected_ligand_ids
+                    }
+                )
+                selected_label_chains = sorted(
+                    {
+                        str(candidate["ligand_chain_id"])
+                        for candidate in matching_associated
+                    }
+                    | {
+                        str(chain["chain_id"])
+                        for chain in direct_selected_ligands
+                    }
+                )
+                result["ligand_selection"] = {
+                    "mode": "include_ligand_resnames",
+                    "scope": "selected_associated_ligands",
+                    "requested_ligand_resnames": requested_ligand_resnames,
+                    "selected_ligand_ids": sorted(resname_selected_ligand_ids),
+                    "selected_ligand_label_chains": selected_label_chains,
+                    "associated_ligand_candidates": associated_candidates,
+                    "excluded_same_author_ligand_ids": excluded_same_author_ids,
+                }
+                if not resname_selected_ligand_ids:
+                    available_matching_ids = sorted(
+                        str(chain.get("unique_id"))
+                        for chain in analysis["chains"]
+                        if chain.get("chain_type") == "ligand"
+                        and chain.get("unique_id")
+                        and _chain_matches_ligand_resnames(
+                            chain,
+                            requested_ligand_resname_set,
+                        )
+                    )
+                    result.update(
+                        create_validation_error(
+                            "include_ligand_resnames",
+                            (
+                                "requested ligand residue name(s) were found, "
+                                "but none are associated with the selected chain scope"
+                            ),
+                            expected=(
+                                "A selected polymer chain with associated ligand(s) "
+                                "matching the requested residue name(s)"
+                            ),
+                            actual=", ".join(requested_ligand_resnames),
+                            hints=[
+                                "Check --select-chains against inspect_molecules output.",
+                                (
+                                    "Use --include-ligand-ids for an exact ligand "
+                                    "instance outside the selected polymer scope."
+                                ),
+                                f"Matching ligand IDs elsewhere: {available_matching_ids}",
+                            ],
+                            context_extra=result["ligand_selection"],
+                            code="requested_ligand_resnames_not_in_selected_scope",
+                        )
+                    )
+                    return result
+                result["selection_adjustments"].append(
+                    {
+                        "code": "ligand_resname_chain_auto_included",
+                        "message": (
+                            "Ligand chain(s) matching requested residue name(s) "
+                            "were selected within the associated polymer scope."
+                        ),
+                        "requested_ligand_resnames": requested_ligand_resnames,
+                        "added_chain_ids": auto_added,
+                        "selected_ligand_ids": sorted(resname_selected_ligand_ids),
+                        "excluded_same_author_ligand_ids": excluded_same_author_ids,
+                    }
+                )
+                result["warnings"].append(
+                    "ligand_resname_chain_auto_included: selected ligand "
+                    f"residue name(s) {requested_ligand_resnames}; selected "
+                    f"ligand ID(s) {sorted(resname_selected_ligand_ids)}; "
+                    f"added label chain(s) {auto_added}."
+                )
+            elif "ligand" in include_types:
+                associated_candidates = selected_associated_ligand_candidates(
+                    analysis["chains"],
+                    selected_chain_ids,
+                    exclude_ligand_ids=excluded_ligand_id_set,
+                )
+                if associated_candidates:
+                    if include_associated_ligands:
+                        auto_added = sorted(
+                            {
+                                str(candidate["ligand_chain_id"])
+                                for candidate in associated_candidates
+                            }
+                        )
+                        auto_ids = sorted(
+                            {
+                                str(candidate["unique_id"])
+                                for candidate in associated_candidates
+                            }
+                        )
+                        selected_chain_ids |= set(auto_added)
+                        result["selection_adjustments"].append(
+                            {
+                                "code": "associated_ligand_chain_auto_included",
+                                "message": (
+                                    "Ligand chain(s) associated with selected "
+                                    "polymer author chain(s) were added."
+                                ),
+                                "added_chain_ids": auto_added,
+                                "associated_ligand_ids": auto_ids,
+                                "associated_ligand_candidates": associated_candidates,
+                            }
+                        )
+                        result["ligand_selection"] = {
+                            "mode": "include_associated_ligands",
+                            "associated_ligand_candidates": associated_candidates,
+                            "selected_ligand_ids": auto_ids,
+                            "selected_ligand_label_chains": auto_added,
+                        }
+                        result["warnings"].append(
+                            "associated_ligand_chain_auto_included: selected "
+                            "polymer author chain(s) have associated ligand "
+                            f"candidate(s) {auto_ids}; added label chain(s) "
+                            f"{auto_added}."
+                        )
+                    else:
+                        recommended_ids = sorted(
+                            {
+                                str(candidate["unique_id"])
+                                for candidate in associated_candidates
+                            }
+                        )
+                        recommended_chain_additions = sorted(
+                            {
+                                str(candidate["ligand_chain_id"])
+                                for candidate in associated_candidates
+                            }
+                        )
+                        result["ligand_selection"] = {
+                            "mode": "associated_ligands_require_selection",
+                            "associated_ligand_candidates": associated_candidates,
+                            "recommended_include_ligand_ids": recommended_ids,
+                            "recommended_select_chain_additions": (
+                                recommended_chain_additions
+                            ),
+                            "recommended_flags": {
+                                "include_ligand_ids": recommended_ids,
+                                "select_chains_add": recommended_chain_additions,
+                                "include_associated_ligands": True,
+                            },
+                        }
+                        result.update(
+                            create_validation_error(
+                                "include_ligand_ids",
+                                (
+                                    "selected chain(s) have associated ligand "
+                                    "candidate(s), but no ligand instance was "
+                                    "selected"
+                                ),
+                                expected=(
+                                    "explicit include_ligand_ids, "
+                                    "--include-associated-ligands, or omit "
+                                    "ligand from include_types"
+                                ),
+                                actual="include_ligand_ids omitted",
+                                hints=[
+                                    (
+                                        "Use --include-ligand-ids "
+                                        + " ".join(recommended_ids)
+                                    ),
+                                    (
+                                        "Or use --include-associated-ligands "
+                                        "to include these same-author ligand "
+                                        "candidate(s)."
+                                    ),
+                                    (
+                                        "If the task is ligand-free, omit "
+                                        "ligand from --include-types."
+                                    ),
+                                ],
+                                # Ids only: the full candidate records stay in
+                                # ligand_selection, which brief output may stub.
+                                # The whole records here made this refusal an
+                                # 11 KB envelope whose fix sat at the bottom.
+                                context_extra={
+                                    "associated_ligand_ids": recommended_ids,
+                                    "recommended_include_ligand_ids": (
+                                        recommended_ids
+                                    ),
+                                    "recommended_select_chain_additions": (
+                                        recommended_chain_additions
+                                    ),
+                                },
+                                code="associated_ligands_require_selection",
+                            )
+                        )
+                        spelled_ids = " ".join(recommended_ids)
+                        result["next_action"] = (
+                            f"Decide the ligands {spelled_ids} and run the same (still "
+                            f"pending) node again with one of: keep them -> "
+                            f"--include-ligand-ids {spelled_ids}; leave them out -> "
+                            f"--exclude-ligand-ids {spelled_ids}; no ligand at all -> "
+                            "omit ligand from --include-types."
+                        )
+                        return result
+        else:
+            # Default: select all chains (type filtering happens later)
+            selected_chain_ids = set(c["chain_id"] for c in analysis["chains"])
+            if requested_ligand_resname_set and "ligand" in include_types:
+                matching_ligands = [
+                    c for c in analysis["chains"]
+                    if c.get("chain_type") == "ligand"
+                    and c.get("unique_id")
+                    and (
+                        excluded_ligand_id_set is None
+                        or c.get("unique_id") not in excluded_ligand_id_set
+                    )
+                    and _chain_matches_ligand_resnames(
+                        c,
+                        requested_ligand_resname_set,
+                    )
+                ]
+                resname_selected_ligand_ids = {
+                    str(chain["unique_id"])
+                    for chain in matching_ligands
+                }
+                result["ligand_selection"] = {
+                    "mode": "include_ligand_resnames",
+                    "scope": "all_matching_ligands",
+                    "requested_ligand_resnames": requested_ligand_resnames,
+                    "selected_ligand_ids": sorted(resname_selected_ligand_ids),
+                    "selected_ligand_label_chains": sorted(
+                        str(chain["chain_id"]) for chain in matching_ligands
+                    ),
+                }
+        
+        logger.info(f"Chains to export: {sorted(selected_chain_ids)}")
+        
+        # Write each chain to a separate PDB file
+        protein_files = []
+        nucleic_files = []
+        glycan_files = []
+        ligand_files = []
+        ion_files = []
+        water_files = []
+        protein_idx = 1
+        nucleic_idx = 1
+        glycan_idx = 1
+        ligand_idx = 1
+        ion_idx = 1
+        water_idx = 1
+        chain_file_info = []
+        
+        folded_units = {
+            member
+            for entry in chain_info.values()
+            for member in entry.get("covalent_members") or []
+        }
+        for subchain in model.subchains():
+            chain_id = subchain.subchain_id()  # label_asym_id
+            if chain_id not in selected_chain_ids and chain_id not in folded_units:
+                continue
+            if chain_id in folded_units:
+                # Written with the unit that leads it (see _group_covalent_ligand_units).
+                continue
+            
+            info = chain_info.get(chain_id, {})
+            chain_type = info.get("chain_type", "ligand")
+
+            # Skip if chain_type not in include_types
+            if chain_type not in include_types:
+                continue
+            # An excluded ligand, ion or glycan chain (exclusion_targets); for
+            # ligands the unique_id check below says the same thing.
+            if chain_type in ("ligand", "ion", "glycan") and chain_id in excluded_label_ids:
+                logger.info(f"Excluding {chain_type} chain {chain_id} (in exclude_ligand_ids)")
+                continue
+
+            # Apply ligand-specific filtering by unique_id
+            if chain_type == "ligand":
+                unique_id = info.get("unique_id")
+                if unique_id:
+                    # Check exclude filter first (takes precedence)
+                    if (
+                        excluded_ligand_id_set is not None
+                        and unique_id in excluded_ligand_id_set
+                    ):
+                        logger.info(f"Excluding ligand {unique_id} (in exclude_ligand_ids)")
+                        continue
+                    # Check include filter
+                    if (
+                        requested_ligand_id_set is not None
+                        and unique_id not in requested_ligand_id_set
+                    ):
+                        logger.info(f"Skipping ligand {unique_id} (not in include_ligand_ids)")
+                        continue
+                    if (
+                        resname_selected_ligand_ids is not None
+                        and unique_id not in resname_selected_ligand_ids
+                    ):
+                        logger.info(
+                            f"Skipping ligand {unique_id} "
+                            "(not selected by include_ligand_resnames)"
+                        )
+                        continue
+            
+            # Use author_chain (single letter) for PDB compatibility
+            # label_asym_id can be too long for PDB format (e.g., "Axp" from OPM)
+            author_chain = info.get("author_chain", chain_id)
+            # Ensure chain name is max 1 character for PDB format
+            pdb_chain_name = author_chain[0] if len(author_chain) > 1 else (author_chain if author_chain else "A")
+
+            waters_skipped = 0
+            # The residue range, if this chain was given one. Matched against
+            # both names because a range may be written with either, which is
+            # the contract chain selection already follows.
+            chain_ranges = range_by_chain_id.get(chain_id)
+            range_kept, range_dropped, range_boundary_icodes = [], [], []
+            kept_by_range = {}
+            ordered_range_resolution = {}
+            if chain_ranges:
+                try:
+                    ordered_range_resolution = rr.resolve_ordered_ranges(
+                        chain_ranges,
+                        [
+                            (residue.seqid.num, str(residue.seqid.icode or "").strip())
+                            for residue in subchain
+                        ],
+                    )
+                except ResidueRangeError as exc:
+                    result["errors"].append(str(exc))
+                    result["code"] = exc.code
+                    result["hints"] = exc.hints
+                    return result
+                resolved_record = result["residue_ranges"]["resolved"].get(chain_id, {})
+                for piece in resolved_record.get("pieces", []):
+                    resolution = ordered_range_resolution.get(piece["range"], {})
+                    piece["selection_mode"] = resolution.get("selection_mode")
+                    piece["start_observed"] = resolution.get("start_observed")
+                    piece["end_observed"] = resolution.get("end_observed")
+            range_spellings = [entry.spelled() for entry in chain_ranges or []]
+            if not chain_ranges or join_range_pieces:
+                component_keys = [None]
+                component_ranges = {None: range_spellings}
+            elif parsed_join_groups:
+                grouped_ranges = []
+                seen_groups = set()
+                for spelling in range_spellings:
+                    group = join_group_by_range.get(spelling, (spelling,))
+                    if group not in seen_groups:
+                        grouped_ranges.append(group)
+                        seen_groups.add(group)
+                component_keys = [
+                    group[0] if len(group) == 1 else group
+                    for group in grouped_ranges
+                ]
+                component_ranges = {
+                    key: list(group)
+                    for key, group in zip(component_keys, grouped_ranges)
+                }
+            else:
+                component_keys = range_spellings
+                component_ranges = {
+                    spelling: [spelling] for spelling in range_spellings
+                }
+            component_key_by_range = {
+                spelling: key
+                for key, spellings in component_ranges.items()
+                for spelling in spellings
+            }
+            multiple_range_components = bool(
+                chain_ranges and len(component_keys) > 1
+            )
+            component_chains = {
+                key: gemmi.Chain(pdb_chain_name) for key in component_keys
+            }
+            component_residue_counts = dict.fromkeys(component_keys, 0)
+            kept_residues_by_component: dict = {key: [] for key in component_keys}
+            unit_residues = list(subchain)
+            for member_id in info.get("covalent_members") or []:
+                member_span = model.get_subchain(member_id)
+                if len(member_span):
+                    unit_residues.extend(list(member_span))
+            for residue_index, residue in enumerate(unit_residues):
+                res_name = residue.name.strip()
+                # Crystal waters are not supported: drop water residues
+                # regardless of chain type.
+                if res_name in WATER_NAMES:
+                    waters_skipped += 1
+                    continue
+                if chain_ranges:
+                    icode = str(residue.seqid.icode or "").strip()
+                    held = next(
+                        (
+                            entry
+                            for entry in chain_ranges
+                            if residue_index
+                            in ordered_range_resolution[entry.spelled()]["indices"]
+                        ),
+                        None,
+                    )
+                    if held is not None:
+                        range_kept.append(residue.seqid.num)
+                        # Which range kept it, so a chain given several of them
+                        # can still say that one of them selected nothing --
+                        # the mistake this check exists for, and an easier one
+                        # to make with two ranges than with one.
+                        kept_by_range.setdefault(held.spelled(), []).append(
+                            residue.seqid.num)
+                    else:
+                        range_dropped.append(residue.seqid.num)
+                        # A bound written as a plain number sorts before the
+                        # same number with an insertion code, so "1-100" keeps
+                        # 100 and drops 100A. That is a real answer but not an
+                        # obvious one, and nothing downstream can see it: the
+                        # coverage check reads the number column, where 100A
+                        # reads as 100.
+                        bounds = {end[0] for entry in chain_ranges
+                                  for end in (entry.start, entry.end)}
+                        if icode and residue.seqid.num in bounds:
+                            range_boundary_icodes.append(
+                                f"{residue.name}{residue.seqid.num}{icode}")
+                        continue
+                else:
+                    held = None
+                
+                new_residue = gemmi.Residue()
+                new_residue.name = residue.name
+                new_residue.seqid = residue.seqid
+                new_residue.subchain = residue.subchain
+                seen_atom_names = set()
+                for atom in residue:
+                    altloc_char = atom.altloc
+                    if altloc_char in ('\x00', '', 'A', ' '):
+                        if atom.name not in seen_atom_names:
+                            new_atom = gemmi.Atom()
+                            new_atom.name = atom.name
+                            new_atom.pos = atom.pos
+                            new_atom.occ = atom.occ
+                            new_atom.b_iso = atom.b_iso
+                            new_atom.element = atom.element
+                            new_residue.add_atom(new_atom)
+                            seen_atom_names.add(atom.name)
+                if len(list(new_residue)) > 0:
+                    component_key = (
+                        component_key_by_range[held.spelled()]
+                        if held is not None
+                        else None
+                    )
+                    component_chains[component_key].add_residue(new_residue)
+                    component_residue_counts[component_key] += 1
+                    kept_residues_by_component[component_key].append((
+                        residue.seqid.num, str(residue.seqid.icode or "").strip(), res_name,
+                    ))
+
+            if waters_skipped > 0:
+                logger.info(f"Skipped {waters_skipped} water residue(s) in chain {chain_id}")
+
+            # Recorded before the chain can be dropped for being empty: a range
+            # that selected nothing has to be reported as an empty range, not
+            # lost along with the chain it emptied.
+            if chain_ranges:
+                written = rr.spelled(chain_ranges)
+                if range_boundary_icodes:
+                    result["warnings"].append(
+                        f"Residue range {written} drops "
+                        f"{len(range_boundary_icodes)} residue(s) that share an "
+                        f"endpoint number but carry an insertion code "
+                        f"({', '.join(range_boundary_icodes[:4])}); write the "
+                        "endpoint with the insertion code to include them")
+                key = f"{written}@{chain_id}"
+                result["residue_ranges"]["delivered"][key] = {
+                    "range": written,
+                    "ranges": {
+                        entry.spelled(): {
+                            "kept": len(kept_by_range.get(entry.spelled(), [])),
+                            "span_delivered": describe_span(
+                                kept_by_range.get(entry.spelled(), [])),
+                        }
+                        for entry in chain_ranges
+                    },
+                    "chain_id": chain_id,
+                    "author_chain": author_chain,
+                    "kept": len(range_kept),
+                    "dropped": len(range_dropped),
+                    "span_in_file": describe_span(range_kept + range_dropped),
+                    "span_delivered": describe_span(range_kept),
+                }
+
+            for component_index, component_key in enumerate(component_keys, start=1):
+                new_chain = component_chains[component_key]
+                residue_count = component_residue_counts[component_key]
+                if not len(list(new_chain)):
+                    continue
+                new_structure = gemmi.Structure()
+                new_model = gemmi.Model("1")
+                new_model.add_chain(new_chain)
+                new_structure.add_model(new_model)
+                
+                # Determine output file based on chain type
+                author_chain_id = info.get("author_chain", chain_id)
+                resnum = info.get("resnum")
+                # residue_names is a dict with "unique_residues" list
+                residue_names_data = info.get("residue_names", {})
+                if isinstance(residue_names_data, dict):
+                    unique_res = residue_names_data.get("unique_residues", ["UNK"])
+                    res_name = unique_res[0] if unique_res else "UNK"
+                elif isinstance(residue_names_data, list):
+                    res_name = residue_names_data[0] if residue_names_data else "UNK"
+                else:
+                    res_name = "UNK"
+
+                if chain_type == "protein":
+                    out_file = out_dir / f"protein_{protein_idx}.pdb"
+                    protein_files.append(str(out_file))
+                    protein_idx += 1
+                elif chain_type == "nucleic":
+                    out_file = out_dir / f"nucleic_{nucleic_idx}.pdb"
+                    nucleic_files.append(str(out_file))
+                    nucleic_idx += 1
+                elif chain_type == "glycan":
+                    if resnum is not None:
+                        out_file = out_dir / f"glycan_{res_name}_{author_chain_id}{resnum}.pdb"
+                        if multiple_range_components:
+                            out_file = out_dir / (
+                                f"glycan_{res_name}_{author_chain_id}{resnum}_"
+                                f"piece{component_index}.pdb"
+                            )
+                    else:
+                        out_file = out_dir / f"glycan_{glycan_idx}.pdb"
+                    glycan_files.append(str(out_file))
+                    glycan_idx += 1
+                elif chain_type == "ligand":
+                    # Use descriptive naming: ligand_{resname}_{chain}{resnum}.pdb
+                    if resnum is not None:
+                        out_file = out_dir / f"ligand_{res_name}_{author_chain_id}{resnum}.pdb"
+                    else:
+                        out_file = out_dir / f"ligand_{res_name}_{ligand_idx}.pdb"
+                    ligand_files.append(str(out_file))
+                    ligand_idx += 1
+                elif chain_type == "ion":
+                    # Use descriptive naming: ion_{resname}_{chain}{resnum}.pdb
+                    if resnum is not None:
+                        out_file = out_dir / f"ion_{res_name}_{author_chain_id}{resnum}.pdb"
+                    else:
+                        out_file = out_dir / f"ion_{res_name}_{ion_idx}.pdb"
+                    ion_files.append(str(out_file))
+                    ion_idx += 1
+                elif chain_type == "water":
+                    out_file = out_dir / f"water_{water_idx}.pdb"
+                    water_files.append(str(out_file))
+                    water_idx += 1
+                else:
+                    # Fallback for unknown types
+                    out_file = out_dir / f"ligand_{ligand_idx}.pdb"
+                    ligand_files.append(str(out_file))
+                    ligand_idx += 1
+                
+                if chain_type in {"protein", "nucleic"}:
+                    _carry_reference_sequence(
+                        structure, chain_id, new_structure, out_file,
+                    )
+
+                new_structure.write_pdb(str(out_file))
+                logger.info(f"Wrote {chain_type}: {out_file}")
+                file_info = {
+                    "chain_id": chain_id,
+                    "author_chain": info.get("author_chain", chain_id),
+                    "chain_type": chain_type,
+                    "nucleic_subtype": info.get("nucleic_subtype"),
+                    "resnum": resnum,
+                    "unique_id": info.get("unique_id"),
+                    "file": str(out_file),
+                    "residue_count": residue_count,
+                    "covalent_members": info.get("covalent_members") or None,
+                    "merged_from": info.get("merged_from") or None,
+                }
+                delivered_ranges = component_ranges[component_key]
+                if chain_type in {"protein", "nucleic", "glycan"}:
+                    delivered_entry = {
+                        "chain_id": chain_id,
+                        "author_chain": info.get("author_chain", chain_id),
+                        "chain_type": chain_type,
+                        "requested": list(delivered_ranges) or None,
+                        "file": str(out_file),
+                        **rr.compact_numbering(rr.residue_numbering_summary(
+                            kept_residues_by_component.get(component_key, []))),
+                    }
+                    file_info["delivered_range"] = {
+                        key: delivered_entry[key]
+                        for key in ("first", "last", "count", "span", "gaps", "insertion_codes")
+                    }
+                    result["delivered_chain_ranges"].append(delivered_entry)
+                if chain_type == "protein" and chain_ranges:
+                    from .residue_identity import selection_identity
+
+                    file_info["residue_identity"] = selection_identity(
+                        structure, subchain,
+                        [entry for entry in chain_ranges
+                         if entry.spelled() in delivered_ranges],
+                        block if suffix == '.cif' else None,
+                    )
+                if component_key is not None:
+                    resolved_pieces = [
+                        next(
+                            piece
+                            for piece in result["residue_ranges"]["resolved"][chain_id]["pieces"]
+                            if piece["range"] == spelling
+                        )
+                        for spelling in delivered_ranges
+                    ]
+                    if len(resolved_pieces) == 1:
+                        file_info["residue_range"] = dict(resolved_pieces[0])
+                    else:
+                        file_info["residue_ranges"] = [
+                            dict(piece) for piece in resolved_pieces
+                        ]
+                chain_file_info.append(file_info)
+
+                if chain_ranges:
+                    delivered = result["residue_ranges"]["delivered"][
+                        f"{rr.spelled(chain_ranges)}@{chain_id}"
+                    ]
+                    for spelling in delivered_ranges:
+                        delivered["ranges"][spelling]["delivered_component"] = str(
+                            out_file
+                        )
+                        resolved_piece = next(
+                            piece
+                            for piece in result["residue_ranges"]["resolved"][chain_id]["pieces"]
+                            if piece["range"] == spelling
+                        )
+                        resolved_piece["delivered_component"] = str(out_file)
+                    result["residue_ranges"]["resolved_groups"].append({
+                        "chain_id": chain_id,
+                        "author_chain": author_chain,
+                        "ranges": delivered_ranges,
+                        "residue_count": residue_count,
+                        "delivered_component": str(out_file),
+                    })
+        
+        result["protein_files"] = protein_files
+        result["nucleic_files"] = nucleic_files
+        result["glycan_files"] = glycan_files
+        result["ligand_files"] = ligand_files
+        result["ion_files"] = ion_files
+        result["water_files"] = water_files
+        result["chain_file_info"] = chain_file_info
+        result["residue_ranges"]["component_sizes"] = [
+            group["residue_count"]
+            for group in result["residue_ranges"]["resolved_groups"]
+        ]
+        
+        # Warn if no files were generated
+        total_files = (
+            len(protein_files)
+            + len(nucleic_files)
+            + len(glycan_files)
+            + len(ligand_files)
+            + len(ion_files)
+            + len(water_files)
+        )
+        if total_files == 0:
+            result["warnings"].append("No output files were generated")
+            result["warnings"].append("Hint: All chains may have been filtered out by selection or water exclusion")
+        
+        # A range that met nothing is a request that was not carried out, and a
+        # smaller structure is not a smaller answer to it. Refuse, and put the
+        # chain's real span in the message so the corrected range can be written
+        # straight from it.
+        for entry in parsed_ranges:
+            # Matched on the piece rather than on the record's whole spelling: a
+            # chain given several ranges delivers one record naming all of them.
+            records = [record for record in result["residue_ranges"]["delivered"].values()
+                       if entry.spelled() in record.get("ranges", {})]
+            if len(records) > 1:
+                result["warnings"].append(
+                    f"Residue range {entry.spelled()} matched "
+                    f"{len(records)} chains ("
+                    + ", ".join(record["chain_id"] for record in records)
+                    + "); a name that is an author chain rather than a label "
+                      "covers every copy under it, and the range was applied to "
+                      "all of them")
+            delivered = records[0] if records else None
+            if delivered is None:
+                available = sorted({
+                    name for info in result["all_chains"]
+                    for name in (info.get("chain_id"), info.get("author_chain"))
+                    if name
+                })
+                result["errors"].append(
+                    f"Residue range {entry.spelled()} names a chain that is not in "
+                    f"the selection; the structure offers {', '.join(available)}")
+                result["code"] = "residue_range_chain_not_found"
+                result["hints"] = [
+                    "Chain names come from the same space as select_chains: the "
+                    "label for mmCIF, the author chain for PDB.",
+                    "Selecting a range does not select the chain; pass it to "
+                    "select_chains as well.",
+                    "A range applies to polymers only, so a chain dropped by "
+                    "include_types, or one holding an ion or a ligand, will not "
+                    "be found here even though the structure contains it.",
+                ]
+                return result
+            if all(record["ranges"][entry.spelled()]["kept"] == 0
+                   for record in records):
+                result["errors"].append(
+                    f"Residue range {entry.spelled()} selects no residue; chain "
+                    f"{delivered['chain_id']} resolves {delivered['dropped']} "
+                    f"residue(s) spanning {delivered['span_in_file']}")
+                result["code"] = "residue_range_selects_nothing"
+                result["hints"] = [
+                    f"Write the range inside the chain's own numbering, for "
+                    f"example {entry.chain}:{delivered['span_in_file']}.",
+                    "A range may reach past what is resolved when the missing "
+                    "residues can be built, so the reachable span is the "
+                    "reference sequence rather than the resolved one.",
+                ]
+                return result
+
+        # Write metadata file
+        metadata_file = out_dir / "split_metadata.json"
+        with open(metadata_file, 'w') as f:
+            json.dump(result, f, indent=2)
+        
+        result["success"] = True
+        logger.info(
+            f"Successfully split structure: {len(protein_files)} protein, "
+            f"{len(nucleic_files)} nucleic, {len(glycan_files)} glycan, "
+            f"{len(ligand_files)} ligand, "
+            f"{len(ion_files)} ion, {len(water_files)} water files"
+        )
+        
+    except Exception as e:
+        error_msg = f"Error during structure splitting: {type(e).__name__}: {str(e)}"
+        result["errors"].append(error_msg)
+        logger.error(error_msg)
+        
+        if "parse" in str(e).lower() or "read" in str(e).lower():
+            result["errors"].append("Hint: The structure file may be corrupted or in an unsupported format")
+        elif "memory" in str(e).lower():
+            result["errors"].append("Hint: The structure file may be too large. Try splitting manually first.")
+    
+    return result

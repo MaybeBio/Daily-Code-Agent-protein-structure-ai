@@ -1,0 +1,1546 @@
+"""Production MD tools."""
+
+# Configure logging early to suppress noisy third-party logs
+import os
+import time
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from mdclaw._common import new_simulation, setup_logger  # noqa: E402
+from mdclaw._tool_meta import node_tool, tool_parameter_examples  # noqa: E402
+
+logger = setup_logger(__name__)
+
+from pathlib import Path  # noqa: E402
+from typing import Optional  # noqa: E402
+
+from mdclaw._common import (  # noqa: E402
+    create_unique_subdir,
+    create_validation_error,
+    generate_job_id,
+)
+
+# Default output location, created when a tool writes there, not at import.
+WORKING_DIR = Path("outputs").resolve()
+
+from mdclaw.simulation._base import _check_topology_implicit_solvent_match, _fail_node_if_running, _resolve_implicit_solvent_model, _resolve_topology_run_settings  # noqa: E402
+from mdclaw.simulation.custom_forces import CUSTOM_FORCE_GROUP, CustomForceError, CustomForceReporter, custom_force_signature, load_custom_forces, write_cv_metadata  # noqa: E402
+from mdclaw.simulation.deadline import DeadlineStepper, job_deadline_epoch  # noqa: E402
+from mdclaw.simulation.integrator_plan import _compute_step_plan, _record_production_node_result  # noqa: E402
+from mdclaw.simulation.restraints import DistanceRestraintError, load_distance_restraints, normalize_distance_restraints  # noqa: E402
+from mdclaw.simulation.run_guard import context_refusal, md_preflight  # noqa: E402
+from mdclaw.simulation.steering import PROTOCOL_PARAMETER, DistanceSteering, TorchSteering, check_steering_handoff, prepare_torch_steering, validate_steering  # noqa: E402
+from mdclaw.simulation.plumed import PlumedRun, native_log, validate_run as validate_plumed  # noqa: E402
+from mdclaw.simulation.restart import _close_reporter_stream, _count_state_data_rows, _detect_ensemble_mismatch, _flush_reporter_stream, _integrator_restart_verdict, _load_state_into_simulation, _resolve_dcd_append_mode, _resolve_restart_node_id_for_run, _restart_random_seed, _restart_source_metadata, _save_checkpoint_atomic, _save_state_atomic, _sibling_seed_collision  # noqa: E402
+from mdclaw.simulation.xml_contract import _ModernSystemContractError, _deserialize_xml_system, _effective_pressure_bar, _integrator_signature, _load_xml_topology_inputs, _signature_mismatches, _system_signature, _validate_xml_system_contract  # noqa: E402
+
+
+def _safe_custom_force_signature(
+    custom_force_script: Optional[str],
+    custom_force_parameters: Optional[dict],
+) -> Optional[dict]:
+    """Best-effort custom-force signature for node identity.
+
+    Returns ``None`` when no custom force is configured. Never raises — a
+    missing/unreadable file degrades to a signature without the hash so node
+    validation can still proceed (the real load below surfaces the error).
+    """
+    if not custom_force_script:
+        return None
+    try:
+        return custom_force_signature(
+            custom_force_script=custom_force_script,
+            custom_force_parameters=custom_force_parameters,
+        )
+    except Exception:  # noqa: BLE001
+        return {
+            "kind": "torch_script_energy",
+            "sha256": None,
+            "parameters": custom_force_parameters or {},
+        }
+
+
+def _restart_source_node_type(job_dir, node_id):
+    """Node type of the restart ancestor, or None outside node mode."""
+    if not job_dir or not node_id:
+        return None
+    try:
+        from mdclaw._node import read_node
+
+        return read_node(job_dir, node_id).get("node_type")
+    except Exception:  # noqa: BLE001 - provenance only; never blocks the run
+        return None
+
+
+@node_tool(node_type="prod")
+@tool_parameter_examples(distance_restraints=[[{
+    "name": "tm3_tm6",
+    "selection_group1": "protein and resid 100 to 120 and not element H",
+    "selection_group2": "protein and resid 240 to 260 and not element H",
+    "force_constant_kj_mol_nm2": 1000.0,
+    "target_distance_nm": 1.2,
+}]])
+def run_production(
+    system_xml_file: Optional[str] = None,
+    topology_pdb_file: Optional[str] = None,
+    state_xml_file: Optional[str] = None,
+    simulation_time_ns: float = 1.0,
+    temperature_kelvin: Optional[float] = None,
+    pressure_bar: Optional[float] = None,
+    timestep_fs: Optional[float] = None,
+    output_frequency_ps: float = 10.0,
+    trajectory_format: str = "dcd",
+    custom_force_script: Optional[str] = None,
+    custom_force_parameters: Optional[dict] = None,
+    distance_restraints: Optional[list[dict]] = None,
+    name: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    is_membrane: bool = False,
+    implicit_solvent: Optional[str] = None,
+    platform: str = "auto",
+    device_index: Optional[str] = None,
+    restart_from: Optional[str] = None,
+    hmr: Optional[bool] = None,
+    random_seed: Optional[int] = None,
+    job_dir: Optional[str] = None,
+    node_id: Optional[str] = None,
+    steering_time_ns: Optional[float] = None,
+    steering_update_interval_ps: float = 1.0,
+    plumed_file: Optional[str] = None,
+    allow_seed_reuse: bool = False,
+) -> dict:
+    """Run MD simulation using OpenMM.
+
+    Performs molecular dynamics simulation with OpenMM, supporting both
+    NVT and NPT ensembles with Langevin dynamics.
+
+    Args:
+        system_xml_file: Path to ``system.xml`` from the topo ancestor
+            (``build_amber_system`` / ``build_openmm_system``). The run
+            side never reconstructs the System from ForceField XML —
+            the saved triple is the source of truth.
+        topology_pdb_file: Path to ``topology.pdb`` from the same topo
+            ancestor.
+        state_xml_file: Path to ``state.xml`` from the same topo
+            ancestor; preferred over the PDB coordinates when present.
+        simulation_time_ns: Simulation time to run IN THIS CALL in nanoseconds
+                     (default: 1.0). On restart (``restart_from`` set) this is
+                     the *additional* time to append after the checkpoint —
+                     e.g. prod_001 ran 10 ns, prod_002 with ``simulation_time_ns=5``
+                     runs 5 more ns. (The eq checkpoint is written with
+                     ``currentStep=0`` by design, so the eq→prod case is
+                     unchanged: ``simulation_time_ns`` there is the full
+                     production duration.)
+        temperature_kelvin: Temperature in Kelvin. Omitted: the temperature of
+                     the node this run restarts from (the eq node on eq ->
+                     prod, the prod parent on --continue-from), recorded as
+                     temperature_kelvin_source="inherited"; 300 K when there is
+                     none. Pass it only to change the temperature on purpose:
+                     different from an eq state is a warning, different from a
+                     prod parent is refused before anything runs
+                     (production_restart_integrator_mismatch).
+        pressure_bar: Pressure in bar. Set for NPT, None for NVT. Omitted in
+                     node mode: the eq ancestor's pressure when it ran NPT.
+        timestep_fs: Integration timestep in femtoseconds. When omitted, uses
+                     4 fs for HMR topologies and 2 fs otherwise.
+        output_frequency_ps: Output frequency in picoseconds (default: 10.0)
+        trajectory_format: Trajectory format - "dcd" or "pdb" (default: "dcd")
+        custom_force_script: Path to a Python script defining a single
+                     ``energy(positions, ctx) -> torch.Tensor`` function (a
+                     scalar potential energy in kJ/mol). MDClaw computes the
+                     forces by autograd (``forces = -dE/dx``) and wraps it in
+                     an ``openmmtorch.PythonTorchForce`` added to the System
+                     before the Simulation is built. ``positions`` is an
+                     (N,3) nm tensor; ``ctx.select(sel)`` returns mdtraj-style
+                     atom indices that match the System, ``ctx.reference`` is
+                     the fixed reference geometry, and ``ctx.params`` exposes
+                     ``custom_force_parameters``. The function may return
+                     ``(energy, {cv_name: value})`` to log collective
+                     variables. A pre-trained model is loaded inside this
+                     function (e.g. ``torch.load``). Requires an
+                     ``openmm-torch`` build that provides ``PythonTorchForce``.
+        custom_force_parameters: Optional dict passed to the script as
+                     ``ctx.params``. Recognized keys include ``pbc`` (bool).
+        distance_restraints: Optional non-empty list of harmonic center-of-mass
+                     distance restraints. Each object must contain ``name``,
+                     ``selection_group1``, ``selection_group2``,
+                     ``force_constant_kj_mol_nm2``, and ``target_distance_nm``.
+                     Selections use the mdtraj DSL. This native OpenMM route is
+                     mutually exclusive with ``custom_force_script``.
+        steering_time_ns: Optional total steering duration. Native distance bias
+                     moves its centers from measured input distances to targets;
+                     custom scripts receive ctx.steering.progress (0 to 1) and
+                     frozen initial_positions / initial_box, with arbitrary CVs.
+                     Label this independent prod node steered_X; continue from it
+                     without this flag for fixed-center umbrella_X. May span calls;
+                     repeat the same duration to resume, not the remaining time.
+        steering_update_interval_ps: Center update interval (default 1 ps).
+                     Uses a right-endpoint staircase approximation to a linear
+                     ramp. Unrelated to trajectory output frequency. XML restart
+                     requires the companion steering.json file to preserve progress;
+                     custom steering also requires steering_initial.npz. After a
+                     completed custom ramp, omitting steering_time_ns freezes
+                     progress at 1, including subsequent umbrella continuations.
+        plumed_file: Optional bounded history-free PLUMED input (basic CVs,
+                     RESTRAINT or MOVINGRESTRAINT, one PRINT FILE=COLVAR).
+                     Mutually exclusive with distance_restraints/custom_force_script.
+                     Uses nm, ps, kJ/mol, radians and 1-based atom indices.
+                     MOVINGRESTRAINT STEP values are relative to protocol origin;
+                     declare matching steering_time_ns when starting/resuming a ramp.
+                     Completed ramps continue unchanged at their final restraint.
+                     PLUMED updates every MD step, not steering_update_interval_ps.
+                     See skills/md-production/plumed.md for the supported subset.
+        name: Optional name prefix for output files
+        output_dir: Output directory. If None, creates output/{job_id}/
+        is_membrane: Set True for membrane systems to use MonteCarloMembraneBarostat
+                     with semi-isotropic pressure coupling (XY coupled, Z independent).
+                     Uses surface tension = 0 bar*nm for NPγT ensemble. (default: False)
+        implicit_solvent: Generalized Born implicit solvent model. Options:
+                     - None (default): Use explicit solvent with PME
+                     - "HCT": Hawkins-Cramer-Truhlar (igb=1)
+                     - "OBC1": Onufriev-Bashford-Case I (igb=2)
+                     - "OBC2": Onufriev-Bashford-Case II (igb=5, recommended)
+                     - "GBn": GBn model (igb=7)
+                     - "GBn2": GBn2 model (igb=8, Amber recommended)
+                     Note: NPT not supported with implicit solvent - uses NVT.
+        platform: OpenMM platform - "CUDA", "OpenCL", "CPU", "Reference", or
+                     "auto" (default). "auto" lets OpenMM choose the fastest.
+        device_index: One GPU device index (e.g. "0"). Only used with
+                     CUDA or OpenCL platforms. A comma list that splits one
+                     run across GPUs ("0,1,2,3") is refused
+                     (``multi_gpu_device_index``): it ran 20 K above the
+                     thermostat in campaign test-v6-cli.
+        restart_from: Path to a state file to restart from. Prefer ``.xml``
+                     (saveState, cross-node portable); ``.chk``
+                     (saveCheckpoint, GPU-architecture-specific) is kept
+                     for same-GPU bit-exact replay (committor / sensitivity
+                     analyses) but no code path reads it when a ``.xml``
+                     is also present. In node mode this is auto-resolved
+                     via ``resolve_node_inputs`` (state first, checkpoint
+                     second). Skips minimization and runs
+                     ``simulation_time_ns`` additional nanoseconds on top
+                     of the restart step count. The trajectory is written
+                     to this node's own ``artifacts/`` directory as a
+                     fresh DCD (no cross-node append) — to stitch
+                     trajectories across nodes, concatenate with mdtraj
+                     or similar.
+        hmr: Hydrogen Mass Repartitioning setting. When omitted in node mode,
+                     inherits the topology; standalone runs default to enabled.
+        random_seed: Random number seed for reproducible simulations.
+                     Controls integrator and initial velocity randomization.
+                     If None (default), OpenMM uses system entropy.
+                     Different seeds produce independent trajectories from
+                     the same initial configuration. In node mode a seed a
+                     completed sibling already ran from the same restart
+                     ancestor is refused (``production_sibling_seed_collision``):
+                     the effective seed derives from the seed and the
+                     ancestor's step count, so the run would repeat that
+                     sibling's trajectory exactly.
+        allow_seed_reuse: Accept such a repeated seed on purpose (a bit-exact
+                     replay of a sibling segment).
+
+    Returns:
+        Dict with:
+            - success: bool - True if simulation completed successfully
+            - job_id: str - Unique identifier for this simulation
+            - output_dir: str - Path to output directory
+            - ensemble: str - "NVT" or "NPT"
+            - simulation_time_ns: float - Actual simulation time
+            - trajectory_file: str - Path to trajectory file
+            - final_structure: str - Path to final PDB structure
+            - energy_file: str - Path to energy log file
+            - initial_energy_kj_mol: float - Initial potential energy
+            - final_energy_kj_mol: float - Final potential energy
+            - num_steps: int - Total simulation steps
+            - errors: list[str] - Error messages if any
+            - warnings: list[str] - Non-critical warnings
+    """
+    _call = dict(locals())
+    _started_monotonic = time.monotonic()
+    # Auto-resolve inputs from DAG when in node mode
+    _eq_final_ensemble: Optional[str] = None
+    _eq_pressure_bar: Optional[float] = None
+    _pressure_bar_inherited = False
+    _temperature_source = "explicit" if temperature_kelvin is not None else "default"
+    _temperature_inherited_from: Optional[str] = None
+    _temperature_note: Optional[str] = None
+    if job_dir and node_id:
+        from mdclaw._node import resolve_node_inputs, validate_node_execution_context
+        _inputs = resolve_node_inputs(job_dir, node_id, "prod")
+        if not plumed_file:
+            plumed_file = _inputs.get("plumed_file")
+        if not is_membrane and _inputs.get("is_membrane"):
+            is_membrane = True
+        hmr, implicit_solvent, timestep_fs = _resolve_topology_run_settings(
+            hmr=hmr,
+            implicit_solvent=implicit_solvent,
+            topology_hmr=_inputs.get("topology_hmr"),
+            topology_implicit_solvent=_inputs.get("topology_implicit_solvent"),
+            timestep_fs=timestep_fs,
+        )
+        _eq_final_ensemble = _inputs.get("eq_final_ensemble")
+        _eq_pressure_bar = _inputs.get("eq_pressure_bar")
+        # Inherit the custom force from a ``--continue-from`` parent so a
+        # biased production can be extended without re-specifying the bias.
+        # Explicit flags always win over the inherited value.
+        if not custom_force_script:
+            if _inputs.get("custom_force_script"):
+                custom_force_script = _inputs["custom_force_script"]
+            if (custom_force_parameters is None
+                    and _inputs.get("custom_force_parameters") is not None):
+                custom_force_parameters = _inputs["custom_force_parameters"]
+        if (distance_restraints is None
+                and _inputs.get("distance_restraints") is not None):
+            distance_restraints = _inputs["distance_restraints"]
+        try:
+            distance_restraints = normalize_distance_restraints(
+                distance_restraints
+            )
+        except DistanceRestraintError as exc:
+            return create_validation_error(
+                "distance_restraints",
+                str(exc),
+                expected="non-empty list of harmonic COM-distance restraint objects",
+                actual=repr(distance_restraints),
+                code=exc.code,
+            )
+        if custom_force_script and distance_restraints:
+            return create_validation_error(
+                "custom_force_script / distance_restraints",
+                "Specify either custom_force_script or distance_restraints, not both.",
+                expected="exactly one production bias route",
+                actual="both provided",
+                code="production_bias_conflict",
+            )
+        if (pressure_bar is None
+                and _eq_final_ensemble == "NPT"
+                and _eq_pressure_bar is not None):
+            pressure_bar = _eq_pressure_bar
+            _pressure_bar_inherited = True
+            logger.info(
+                f"pressure_bar inherited from eq ancestor "
+                f"(final_ensemble=NPT, {pressure_bar} bar)"
+            )
+        pressure_bar = _effective_pressure_bar(pressure_bar, implicit_solvent)
+        # Resolver-level failures are recorded on the node so a failed
+        # extension does not remain pending after the tool exits.
+        if not restart_from and "restart_from_error" in _inputs:
+            err = _inputs["restart_from_error"]
+            from mdclaw._node import begin_node, fail_node
+            begin_node(job_dir, node_id)
+            fail_node(job_dir, node_id, errors=[err])
+            return create_validation_error(
+                "restart_from",
+                err,
+                expected="Completed continue_from prod node with state or checkpoint artifact",
+                actual=f"job_dir={job_dir}, node_id={node_id}",
+                code="restart_from_unavailable",
+            )
+        if "input_resolution_error" in _inputs:
+            err = _inputs["input_resolution_error"]
+            code = _inputs.get("input_resolution_code") or "input_resolution_blocked"
+            error = create_validation_error(
+                "job_dir/node_id",
+                err,
+                expected="Completed topo and restart ancestors with required artifacts",
+                actual=f"job_dir={job_dir}, node_id={node_id}",
+                context_extra={
+                    "input_resolution_errors": _inputs.get("input_resolution_errors", []),
+                },
+                code=code,
+            )
+            if code == "hybrid_topology_production_blocked":
+                # A structural refusal, not a run failure: nothing ran, so the
+                # node stays pending and the agent branches (fep node, or a
+                # plain topo) without burning this node.
+                from mdclaw._node import fail_node_from_result
+                return fail_node_from_result(job_dir, node_id, error, default_error=err)
+            from mdclaw._node import begin_node, fail_node
+            begin_node(job_dir, node_id)
+            fail_node(job_dir, node_id, errors=[err], code=code)
+            return error
+        # The node this run restarts from decides both the step counter and,
+        # when --temperature-kelvin is omitted, the temperature. See
+        # run_equilibration for the rationale: explicit ``--restart-from``
+        # wins over the resolver's auto-pick, and we trust the resolver's
+        # ``restart_from_node_id`` only when we actually used the resolver's
+        # path. An explicit path is matched back to a DAG ancestor by
+        # absolute-path equality so the step counter cannot drift from the
+        # artifact we load. Resolved before the declared-condition check so a
+        # node declaring temperature_kelvin compares the value that will run.
+        _explicit_restart_from = bool(restart_from)
+        if not _explicit_restart_from and "restart_from" in _inputs:
+            restart_from = _inputs["restart_from"]
+        _restart_from_node_id = _resolve_restart_node_id_for_run(
+            job_dir=job_dir, node_id=node_id,
+            restart_from=restart_from,
+            explicit_restart_from=_explicit_restart_from,
+            inputs=_inputs,
+        )
+        from mdclaw.node.inputs import _resolve_restart_temperature
+        _restart_temperature = _resolve_restart_temperature(job_dir, _restart_from_node_id)
+        if temperature_kelvin is None:
+            if _restart_temperature:
+                temperature_kelvin = _restart_temperature["restart_temperature_kelvin"]
+                _temperature_source = "inherited"
+                _temperature_inherited_from = _restart_from_node_id
+                _temperature_note = (
+                    f"temperature_kelvin={temperature_kelvin} inherited from "
+                    f"{_restart_temperature.get('restart_temperature_node_type') or 'node'} "
+                    f"'{_restart_from_node_id}', the node this run restarts from."
+                )
+            else:
+                temperature_kelvin = 300.0
+                if restart_from and _restart_from_node_id is None:
+                    _temperature_note = (
+                        "temperature_kelvin=300.0 (default): the restart file matches no DAG "
+                        "ancestor, so there is no recorded temperature to inherit."
+                    )
+                elif _restart_from_node_id is not None:
+                    _temperature_note = (
+                        f"temperature_kelvin=300.0 (default): restart node "
+                        f"'{_restart_from_node_id}' records no temperature to inherit."
+                    )
+        _actual = {
+            "simulation_time_ns": simulation_time_ns,
+            "temperature_kelvin": temperature_kelvin,
+            "pressure_bar": pressure_bar,
+            # The pressure is resolved by now (inherited from the eq
+            # ancestor when omitted), so the ensemble is known: agents
+            # declare it ("NPT") and 054_nucleic_1zgw cli_skill_sif r3
+            # lost its production job to "did not include declared
+            # condition 'ensemble'".
+            "ensemble": ("NPT" if (pressure_bar is not None and pressure_bar > 0
+                                   and not implicit_solvent) else "NVT"),
+            "timestep_fs": timestep_fs,
+            "output_frequency_ps": output_frequency_ps,
+            "trajectory_format": trajectory_format,
+            "is_membrane": is_membrane,
+            "implicit_solvent": implicit_solvent,
+            "platform": platform,
+            "device_index": device_index,
+            "hmr": hmr,
+            "random_seed": random_seed,
+            "custom_force": _safe_custom_force_signature(
+                custom_force_script, custom_force_parameters,
+            ),
+            "distance_restraints": distance_restraints,
+            "steering_time_ns": steering_time_ns,
+            "steering_update_interval_ps": steering_update_interval_ps,
+        }
+        _ctx = validate_node_execution_context(job_dir, node_id, "prod", actual_conditions=_actual)
+        if not _ctx["success"]:
+            return context_refusal(run_production, _call, job_dir, node_id, _ctx, _actual)
+        # A prod -> prod continuation must keep its parent's integrator; a
+        # different temperature or timestep used to fail only after the node
+        # had started, with no code. Refuse before anything runs.
+        if (_restart_temperature.get("restart_temperature_node_type") == "prod"
+                and _restart_from_node_id):
+            from mdclaw.node.io import _read_metadata_field as _read_field
+            _parent_signature = _read_field(job_dir, _restart_from_node_id,
+                                            "integrator_signature")
+            if isinstance(_parent_signature, dict):
+                _drift = []
+                _parent_t = _parent_signature.get("temperature_kelvin")
+                if isinstance(_parent_t, (int, float)) and abs(float(_parent_t) - float(temperature_kelvin)) > 1e-6:
+                    _drift.append(f"temperature_kelvin: parent={float(_parent_t)}, "
+                                  f"this run={float(temperature_kelvin)}")
+                _parent_dt = _parent_signature.get("timestep_fs")
+                if (timestep_fs is not None and isinstance(_parent_dt, (int, float))
+                        and abs(float(_parent_dt) - float(timestep_fs)) > 1e-6):
+                    _drift.append(f"timestep_fs: parent={float(_parent_dt)}, "
+                                  f"this run={float(timestep_fs)}")
+                if _drift:
+                    from mdclaw._node import fail_node_from_result
+                    _msg = (f"a prod -> prod continuation from '{_restart_from_node_id}' must keep "
+                            "its integrator settings; " + "; ".join(_drift) + ".")
+                    return fail_node_from_result(job_dir, node_id, create_validation_error(
+                        "temperature_kelvin / timestep_fs",
+                        _msg,
+                        expected="the prod parent's temperature and timestep",
+                        actual="; ".join(_drift),
+                        hints=[
+                            "Omit --temperature-kelvin: a continuation inherits its parent's "
+                            "temperature. Pass --timestep-fs equal to the parent's.",
+                            "To run at another temperature, branch a new prod node from the eq node.",
+                        ],
+                        code="production_restart_integrator_mismatch",
+                    ), default_error=_msg)
+        if not system_xml_file and "system_xml_file" in _inputs:
+            system_xml_file = _inputs["system_xml_file"]
+        if not topology_pdb_file and "topology_pdb_file" in _inputs:
+            topology_pdb_file = _inputs["topology_pdb_file"]
+        if not state_xml_file and "state_xml_file" in _inputs:
+            state_xml_file = _inputs["state_xml_file"]
+        # Two unbiased segments that restart from one ancestor with one
+        # random_seed integrate the same noise (the effective seed is derived
+        # from the seed and the ancestor's step count) and are the same
+        # trajectory. Refuse before anything runs unless a bit-exact replay is
+        # intended; the node stays pending. A biased run (custom force,
+        # restraints, PLUMED, steering) integrates a different System and is
+        # left alone.
+        _plain_run = not (custom_force_script or distance_restraints or plumed_file
+                          or steering_time_ns is not None)
+        if random_seed is not None and not allow_seed_reuse and _plain_run:
+            _collision = _sibling_seed_collision(
+                job_dir, node_id, _restart_from_node_id, random_seed,
+            )
+            if _collision is not None:
+                from mdclaw._node import fail_node_from_result
+                _sibling = _collision["sibling_node_id"]
+                _msg = (
+                    f"random_seed={random_seed} was already run by completed sibling "
+                    f"'{_sibling}' from restart ancestor '{_collision['restart_node_id']}'; "
+                    "this run would repeat that trajectory exactly."
+                )
+                return fail_node_from_result(job_dir, node_id, create_validation_error(
+                    "random_seed",
+                    _msg,
+                    expected="a random_seed no completed sibling used from the same restart ancestor",
+                    actual=f"random_seed={random_seed}, sibling={_sibling}",
+                    hints=[
+                        "Pass a different --random-seed for an independent replicate.",
+                        "Pass --allow-seed-reuse for a deliberate bit-exact replay.",
+                    ],
+                    code="production_sibling_seed_collision",
+                ), default_error=_msg)
+        # Catch implicit-solvent model mismatches between the topo node's
+        # build-time metadata and the runtime --implicit-solvent flag
+        # before any System is built. Mirror of the run_equilibration
+        # guard; both sites must agree because min/eq/prod share the topo
+        # ancestor's saved system.xml.
+        _topo_solvent_mismatch = _check_topology_implicit_solvent_match(
+            topology_implicit_solvent=_inputs.get("topology_implicit_solvent"),
+            runtime_implicit_solvent=implicit_solvent,
+        )
+        if _topo_solvent_mismatch is not None:
+            from mdclaw._node import begin_node, fail_node
+            begin_node(job_dir, node_id)
+            fail_node(
+                job_dir, node_id,
+                errors=_topo_solvent_mismatch["errors"],
+            )
+            err = create_validation_error(
+                "implicit_solvent",
+                _topo_solvent_mismatch["message"],
+                expected=(
+                    "build-time and runtime implicit_solvent agree "
+                    "after canonicalization (HCT / OBC1 / OBC2 / GBn / GBn2)"
+                ),
+                actual=(
+                    f"build={_inputs.get('topology_implicit_solvent')!r}, "
+                    f"runtime={implicit_solvent!r}"
+                ),
+                code=_topo_solvent_mismatch["code"],
+            )
+            err["errors"] = _topo_solvent_mismatch["errors"]
+            return err
+
+    if not (job_dir and node_id):
+        if temperature_kelvin is None:
+            temperature_kelvin = 300.0
+        hmr, implicit_solvent, timestep_fs = _resolve_topology_run_settings(
+            hmr=hmr,
+            implicit_solvent=implicit_solvent,
+            timestep_fs=timestep_fs,
+        )
+        pressure_bar = _effective_pressure_bar(pressure_bar, implicit_solvent)
+        try:
+            distance_restraints = normalize_distance_restraints(
+                distance_restraints
+            )
+        except DistanceRestraintError as exc:
+            return create_validation_error(
+                "distance_restraints",
+                str(exc),
+                expected="non-empty list of harmonic COM-distance restraint objects",
+                actual=repr(distance_restraints),
+                code=exc.code,
+            )
+        if custom_force_script and distance_restraints:
+            return create_validation_error(
+                "custom_force_script / distance_restraints",
+                "Specify either custom_force_script or distance_restraints, not both.",
+                expected="exactly one production bias route",
+                actual="both provided",
+                code="production_bias_conflict",
+            )
+
+    if plumed_file and (custom_force_script or distance_restraints):
+        return create_validation_error("plumed_file", "Choose exactly one production bias route.",
+                                       code="production_bias_conflict")
+    try:
+        _plumed_validated = validate_plumed(plumed_file, restart_from, steering_time_ns,
+                                            steering_update_interval_ps, timestep_fs)
+        if not plumed_file:
+            validate_steering(steering_time_ns, steering_update_interval_ps,
+                              distance_restraints, timestep_fs, custom_force_script)
+        check_steering_handoff(restart_from, steering_time_ns)
+    except (DistanceRestraintError, CustomForceError) as exc:
+        return create_validation_error(
+            "plumed_file" if plumed_file else "steering_time_ns", str(exc), code=exc.code,
+            expected="valid production bias/restart protocol", actual=plumed_file or steering_time_ns,
+        )
+
+    if not (system_xml_file and topology_pdb_file):
+        return create_validation_error(
+            "topology_inputs",
+            "system_xml_file and topology_pdb_file are required",
+            expected="XML triple from build_amber_system / build_openmm_system",
+            actual=(
+                f"system_xml_file={system_xml_file!r}, "
+                f"topology_pdb_file={topology_pdb_file!r}"
+            ),
+            hints=["Run build_amber_system first or execute in node mode from a prod node."],
+            code="missing_xml_topology_inputs",
+        )
+    logger.info(f"Starting MD simulation: {simulation_time_ns}ns at {temperature_kelvin}K")
+
+    # Initialize result structure
+    job_id = generate_job_id()
+    result = {
+        "success": False,
+        "job_id": job_id,
+        "output_dir": None,
+        "ensemble": None,
+        "simulation_time_ns": simulation_time_ns,
+        "temperature_kelvin": temperature_kelvin,
+        "temperature_kelvin_source": _temperature_source,
+        "temperature_kelvin_inherited_from": _temperature_inherited_from,
+        "pressure_bar": pressure_bar,
+        "timestep_fs": timestep_fs,
+        "trajectory_file": None,
+        "final_structure": None,
+        "energy_file": None,
+        "initial_energy_kj_mol": None,
+        "final_energy_kj_mol": None,
+        "num_steps": None,
+        "platform": None,
+        "device_index": None,
+        "checkpoint_file": None,
+        "runtime_system_file": None,
+        "integrator_file": None,
+        "restarted_from": None,
+        "steps_completed": None,
+        "start_step": None,
+        "start_time_ns": None,
+        "hmr": False,
+        "random_seed": None,
+        "distance_restraints": distance_restraints,
+        "distance_restraint_signature": None,
+        "errors": [],
+        "warnings": []
+    }
+    if _temperature_note:
+        result["warnings"].append(_temperature_note)
+
+    # Setup output directory.
+    _node_mode = job_dir and node_id
+    # A segment of a rounds scheme keeps its length (the scheme's tau) and
+    # its driver owns the time budget; every other run stops before the
+    # batch job's deadline and completes with what it has.
+    _scheme_segment = False
+    # Where and on which platform the run may integrate: refused before
+    # begin_node, so the node stays pending for the corrected command.
+    _refusal = md_preflight(run_production, _call, job_dir, node_id)
+    if _refusal is not None:
+        return _refusal
+    if _node_mode:
+        from mdclaw._node import begin_node
+        from mdclaw._node import read_node as _read_node
+        out_dir = Path(job_dir) / "nodes" / node_id / "artifacts"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        begin_node(job_dir, node_id)
+        _scheme_segment = bool((_read_node(job_dir, node_id).get("metadata") or {}).get("scheme"))
+    else:
+        base_dir = Path(output_dir) if output_dir else WORKING_DIR
+        out_dir = create_unique_subdir(base_dir, "production")
+    result["output_dir"] = str(out_dir)
+
+    # Copy a node-mode custom-force script/module into the node's artifacts so
+    # the exact bias used is preserved (provenance) and survives ``--continue
+    # -from``. Repoint the variable at the copy so loading and the recorded
+    # artifact reference the same file.
+    _custom_force_script_artifact: Optional[str] = None
+    if _node_mode and custom_force_script:
+        import shutil
+        src = Path(custom_force_script)
+        if src.is_file():
+            dest = out_dir / "custom_force_script.py"
+            if src.resolve() != dest.resolve():
+                shutil.copy2(src, dest)
+            custom_force_script = str(dest)
+            _custom_force_script_artifact = "artifacts/custom_force_script.py"
+
+    # Validate input files. Every early-return path below this point
+    # happens AFTER begin_node(), so it must transit through
+    # _fail_node_if_running to flip the node out of "running" —
+    # otherwise the DAG sees a perpetually in-flight node.
+    system_xml_path = Path(system_xml_file).resolve()
+    topology_pdb_path = Path(topology_pdb_file).resolve()
+    state_xml_path = Path(state_xml_file).resolve() if state_xml_file else None
+    if not system_xml_path.is_file():
+        result["errors"].append(f"system.xml not found: {system_xml_file}")
+        return _fail_node_if_running(job_dir, node_id, result)
+    if not topology_pdb_path.is_file():
+        result["errors"].append(f"topology.pdb not found: {topology_pdb_file}")
+        return _fail_node_if_running(job_dir, node_id, result)
+    if state_xml_path and not state_xml_path.is_file():
+        result["errors"].append(f"state.xml not found: {state_xml_file}")
+        return _fail_node_if_running(job_dir, node_id, result)
+    if (
+        restart_from
+        and Path(restart_from).suffix.lower() != ".xml"
+        and (custom_force_script or distance_restraints)
+    ):
+        result["code"] = "production_bias_checkpoint_unsupported"
+        result["errors"].append(
+            "Biased production requires a portable XML state restart; binary "
+            "checkpoints require an identical System."
+        )
+        return _fail_node_if_running(job_dir, node_id, result)
+
+    try:
+        from openmm.app import (
+            DCDReporter, StateDataReporter, CheckpointReporter,
+            HCT, OBC1, OBC2, GBn, GBn2,
+        )
+        from openmm import (
+            LangevinMiddleIntegrator, MonteCarloBarostat,
+            MonteCarloMembraneBarostat, Platform, XmlSerializer,
+        )
+        from openmm.unit import (
+            nanometer, kelvin, picosecond, femtoseconds, bar,
+        )
+    except ImportError:
+        result["errors"].append("OpenMM not installed")
+        result["errors"].append("Hint: Install with: conda install -c conda-forge openmm")
+        return _fail_node_if_running(job_dir, node_id, result)
+
+    # Map canonical implicit-solvent names (matching forcefield_catalog
+    # and the openmmforcefields ``implicit/<name>.xml`` keys) to OpenMM
+    # symbols. Resolution goes through ``_resolve_implicit_solvent_model``
+    # so user-provided aliases (``gbneck2``, ``igb8``, case variants)
+    # canonicalize the same way build_amber_system does — and unknown
+    # names fail-fast instead of silently falling back to OBC2.
+    IMPLICIT_MODELS = {
+        "HCT":  HCT,    # igb=1
+        "OBC1": OBC1,   # igb=2
+        "OBC2": OBC2,   # igb=5 (default, well-tested)
+        "GBn":  GBn,    # igb=7
+        "GBn2": GBn2,   # igb=8 (recommended by Amber manual)
+    }
+    
+    _plumed_run = None
+    _plumed_log = None
+    simulation = None
+    try:
+        # Load topology + initial positions / box vectors from the XML
+        # triple. The build-time forcefield, constraints, and HMR are
+        # baked into ``system.xml`` and validated against the runtime
+        # ``hmr`` / ``implicit_solvent`` request below.
+        logger.info("Loading XML topology triple (system.xml + topology.pdb + state.xml)")
+        xml_inputs = _load_xml_topology_inputs(
+            system_xml_file=str(system_xml_path),
+            topology_pdb_file=str(topology_pdb_path),
+            state_xml_file=str(state_xml_path) if state_xml_path else None,
+        )
+        is_periodic = xml_inputs.is_periodic
+
+        if hmr:
+            logger.info(f"HMR enabled: hydrogenMass=4.0 amu (timestep={timestep_fs}fs)")
+            if timestep_fs <= 2.0:
+                result["warnings"].append(
+                    f"HMR enabled but timestep is {timestep_fs}fs. "
+                    f"Consider using --timestep-fs 4.0 for better throughput."
+                )
+            result["hmr"] = True
+        else:
+            if timestep_fs > 2.0:
+                result["warnings"].append(
+                    f"HMR is disabled but timestep is {timestep_fs}fs. "
+                    f"Without HMR, timestep > 2 fs may cause instability. "
+                    f"Consider --hmr or --timestep-fs 2.0."
+                )
+            result["hmr"] = False
+
+        # Resolve the GB symbol up-front so a runtime typo fails before
+        # the System is built. The build vs runtime model match was
+        # already enforced by the topology metadata guard upstream.
+        if implicit_solvent:
+            _gb_model, gb_err = _resolve_implicit_solvent_model(
+                implicit_solvent, IMPLICIT_MODELS
+            )
+            if gb_err:
+                result["errors"].extend(gb_err["errors"])
+                result["code"] = gb_err["code"]
+                return _fail_node_if_running(job_dir, node_id, result)
+            from mdclaw import forcefield_catalog as _fc
+            canonical_implicit = _fc.normalize_implicit_solvent(implicit_solvent)
+            result["solvent_type"] = "implicit"
+            result["implicit_model"] = canonical_implicit
+        elif is_periodic:
+            result["solvent_type"] = "explicit"
+        else:
+            result["errors"].append(
+                "Non-periodic topology without implicit_solvent would run vacuum production. "
+                "Pass --implicit-solvent for GB simulations or build an explicit-solvent topology."
+            )
+            return _fail_node_if_running(job_dir, node_id, result)
+
+        # Deserialize a fresh System from system.xml. The build-time
+        # forcefield / constraints / HMR / GB are baked in; the run side
+        # never reconstructs the System from ForceField XML. The
+        # contract check raises if HMR or implicit-solvent requests
+        # contradict what was baked at build time.
+        logger.info("Deserializing system.xml")
+        try:
+            system = _deserialize_xml_system(xml_inputs)
+            _validate_xml_system_contract(
+                system, xml_inputs.topology,
+                hmr_request=hmr,
+                implicit_solvent_request=implicit_solvent,
+            )
+        except _ModernSystemContractError as exc:
+            result["errors"].append(str(exc))
+            result["code"] = exc.code
+            return _fail_node_if_running(job_dir, node_id, result)
+
+        # Custom force / CV bias. Resolved and added to the System *before*
+        # the Simulation is built (OpenMM requires forces be present at
+        # Context creation). The bias goes in a dedicated force group so its
+        # energy can be logged in isolation for CV analysis / reweighting.
+        _custom_force_loaded = None
+        _distance_restraint_loaded = None
+        _torch_steering = None
+        if custom_force_script:
+            try:
+                _torch_steering = prepare_torch_steering(
+                    restart_from=restart_from, time_ns=steering_time_ns,
+                    signature=_safe_custom_force_signature(custom_force_script, custom_force_parameters),
+                    positions=xml_inputs.positions, box=xml_inputs.box_vectors,
+                    is_periodic=is_periodic, output_dir=out_dir,
+                )
+                _custom_force_loaded = load_custom_forces(
+                    system=system,
+                    topology_pdb_file=str(topology_pdb_path),
+                    reference_positions=xml_inputs.positions,
+                    custom_force_script=custom_force_script,
+                    custom_force_parameters=custom_force_parameters,
+                    steering=_torch_steering,
+                )
+            except CustomForceError as exc:
+                result["errors"].append(str(exc))
+                result["code"] = exc.code
+                return _fail_node_if_running(job_dir, node_id, result)
+            for _f in _custom_force_loaded["forces"]:
+                _f.setForceGroup(CUSTOM_FORCE_GROUP)
+                system.addForce(_f)
+            result["custom_force"] = {
+                "kind": _custom_force_loaded["kind"],
+                "signature": _custom_force_loaded["signature"],
+                "has_cv": _custom_force_loaded["has_cv"],
+                "cv_names": _custom_force_loaded["cv_names"],
+            }
+            logger.info(
+                "Custom force loaded (kind=%s, cv=%s)",
+                _custom_force_loaded["kind"], _custom_force_loaded["cv_names"],
+            )
+        elif plumed_file:
+            _plumed_run = PlumedRun(
+                _plumed_validated, system=system, topology=xml_inputs.topology,
+                restart_from=restart_from, timestep_fs=timestep_fs,
+                time_ns=steering_time_ns, output_dir=out_dir,
+                report_interval=int(output_frequency_ps * 1000 / timestep_fs),
+                temperature_kelvin=temperature_kelvin,
+            )
+            _plumed_log = native_log(out_dir / "plumed.log")
+            _plumed_log.__enter__()
+        elif distance_restraints:
+            try:
+                _distance_restraint_loaded = load_distance_restraints(
+                    system=system,
+                    topology=xml_inputs.topology,
+                    distance_restraints=distance_restraints,
+                    is_periodic=is_periodic,
+                )
+            except DistanceRestraintError as exc:
+                result["errors"].append(str(exc))
+                result["code"] = exc.code
+                return _fail_node_if_running(job_dir, node_id, result)
+            for _f in _distance_restraint_loaded["forces"]:
+                if steering_time_ns is not None:
+                    _f.addGlobalParameter(PROTOCOL_PARAMETER, 0.0)
+                _f.setForceGroup(CUSTOM_FORCE_GROUP)
+                system.addForce(_f)
+            result["distance_restraints"] = _distance_restraint_loaded[
+                "restraints"
+            ]
+            result["distance_restraint_signature"] = (
+                _distance_restraint_loaded["signature"]
+            )
+            logger.info(
+                "Native distance restraints loaded (cv=%s)",
+                _distance_restraint_loaded["cv_names"],
+            )
+
+        restart_seed_step: Optional[int] = None
+        if restart_from and _node_mode:
+            from mdclaw._node import read_ancestor_final_step
+            restart_seed_step = read_ancestor_final_step(
+                job_dir, node_id,
+                restart_node_id=_restart_from_node_id,
+            )
+        effective_random_seed = (
+            _restart_random_seed(random_seed, restart_seed_step)
+            if restart_from else random_seed
+        )
+
+        # Add barostat if NPT (only for periodic explicit solvent systems).
+        # ``pressure_bar=0`` is conventionally NVT (matches
+        # ``_effective_pressure_bar`` and the docstring's "0 or None: NVT"
+        # rule); without this guard, a 0-bar barostat would be added and
+        # the ``_detect_ensemble_mismatch`` warning for NPT-state-into-NVT
+        # restarts would never fire.
+        if (pressure_bar is not None and pressure_bar > 0
+                and is_periodic and not implicit_solvent):
+            if is_membrane:
+                # Membrane systems: MonteCarloMembraneBarostat with semi-isotropic coupling
+                # XYIsotropic: X and Y axes scale together (membrane plane)
+                # ZFree: Z axis scales independently (membrane thickness)
+                # Surface tension = 0 bar*nm for NPγT ensemble
+                barostat = MonteCarloMembraneBarostat(
+                    pressure_bar * bar,
+                    0.0 * bar * nanometer,  # Surface tension = 0 (NPγT)
+                    temperature_kelvin * kelvin,
+                    MonteCarloMembraneBarostat.XYIsotropic,
+                    MonteCarloMembraneBarostat.ZFree,
+                    25  # Frequency (default)
+                )
+                logger.info("Using MonteCarloMembraneBarostat (XYIsotropic, ZFree, γ=0)")
+            else:
+                # Non-membrane systems: standard MonteCarloBarostat
+                barostat = MonteCarloBarostat(
+                    pressure_bar * bar,
+                    temperature_kelvin * kelvin
+                )
+            if effective_random_seed is not None:
+                barostat.setRandomNumberSeed(effective_random_seed)
+            system.addForce(barostat)
+            ensemble = "NPT"
+        elif implicit_solvent and pressure_bar is not None and pressure_bar > 0:
+            # Warn user that NPT is not supported with implicit solvent
+            logger.warning("Implicit solvent simulations use NVT ensemble - ignoring pressure setting")
+            result["warnings"].append("NPT not supported with implicit solvent, using NVT")
+            ensemble = "NVT"
+        else:
+            ensemble = "NVT"
+        result["ensemble"] = ensemble
+        result["is_membrane"] = is_membrane
+        current_system_signature = _system_signature(
+            xml_inputs,
+            solvent_type=result.get("solvent_type", "unknown"),
+            ensemble=ensemble,
+            pressure_bar=pressure_bar,
+            is_membrane=is_membrane,
+            implicit_solvent=implicit_solvent,
+            hmr=hmr,
+        )
+        current_integrator_signature = _integrator_signature(
+            temperature_kelvin=temperature_kelvin,
+            timestep_fs=timestep_fs,
+        )
+        result["system_signature"] = current_system_signature
+        result["integrator_signature"] = current_integrator_signature
+
+        # Create integrator
+        integrator = LangevinMiddleIntegrator(
+            temperature_kelvin * kelvin,
+            1.0 / picosecond,
+            timestep_fs * femtoseconds
+        )
+        if effective_random_seed is not None:
+            integrator.setRandomNumberSeed(effective_random_seed)
+        if random_seed is not None:
+            result["random_seed"] = random_seed
+            if restart_from:
+                result["effective_random_seed"] = effective_random_seed
+                result["random_seed_restart_offset"] = max(
+                    1, int(restart_seed_step or 0)
+                )
+
+        # Preserve the exact live objects used to construct the Context.  The
+        # topology artifact's base system.xml intentionally has no runtime
+        # barostat; these files let an evaluator verify the actual ensemble,
+        # thermostat/integrator settings, and bias forces from serialized
+        # OpenMM objects instead of trusting argument-derived metadata.
+        runtime_system_file = out_dir / "runtime_system.xml"
+        integrator_file = out_dir / "integrator.xml"
+        integrator_file.write_text(XmlSerializer.serialize(integrator))
+        result["integrator_file"] = str(integrator_file)
+        try:
+            runtime_system_file.write_text(XmlSerializer.serialize(system))
+        except Exception as exc:  # noqa: BLE001 - plugin serialization boundary
+            if _custom_force_loaded is None:
+                raise
+            # PythonTorchForce may contain a Python callable that OpenMM cannot
+            # pickle. Custom-force production remains supported, but such a run
+            # intentionally cannot hand a serializable, bias-free runtime
+            # System to an external confirmatory harness.
+            runtime_system_file.unlink(missing_ok=True)
+            result["warnings"].append(
+                "Live runtime System could not be serialized because the "
+                f"custom force is not serializable: {type(exc).__name__}: "
+                f"{exc}"
+            )
+        else:
+            result["runtime_system_file"] = str(runtime_system_file)
+
+        # Platform selection
+        PLATFORM_MAP = {"cuda": "CUDA", "opencl": "OpenCL", "cpu": "CPU", "reference": "Reference"}
+        platform_obj = None
+        platform_properties = {}
+        if platform.lower() != "auto":
+            plat_key = platform.lower()
+            if plat_key not in PLATFORM_MAP:
+                result["errors"].append(
+                    f"Unknown platform '{platform}'. "
+                    f"Valid options: auto, CUDA, OpenCL, CPU, Reference"
+                )
+                return _fail_node_if_running(job_dir, node_id, result)
+            platform_obj = Platform.getPlatformByName(PLATFORM_MAP[plat_key])
+            if device_index and plat_key in ("cuda", "opencl"):
+                platform_properties["DeviceIndex"] = device_index
+
+        # Create simulation
+        if platform_obj:
+            simulation = new_simulation(
+                xml_inputs.topology, system, integrator,
+                platform=platform_obj, platformProperties=platform_properties,
+            )
+        else:
+            simulation = new_simulation(xml_inputs.topology, system, integrator)
+
+        result["platform"] = simulation.context.getPlatform().getName()
+        if device_index:
+            result["device_index"] = device_index
+
+        # File name prefix
+        pref = f"{name}_" if name else ""
+        checkpoint_file = out_dir / f"{pref}checkpoint.chk"
+
+        # Load checkpoint or set initial positions
+        if restart_from:
+            restart_path = Path(restart_from)
+            if not restart_path.is_file():
+                result["errors"].append(f"Restart file not found: {restart_from}")
+                return _fail_node_if_running(job_dir, node_id, result)
+            restart_meta = _restart_source_metadata(job_dir, node_id, restart_from)
+            restart_system_signature = restart_meta.get("system_signature")
+            restart_integrator_signature = restart_meta.get("integrator_signature")
+            # XML state is the portable, ensemble-agnostic restart vehicle:
+            # _load_state_into_simulation transfers positions/velocities/box
+            # without re-applying barostat parameters, so NPT ↔ NVT switches
+            # are safe. Binary .chk restart, by contrast, requires the
+            # System and integrator to be byte-identical. Partition the
+            # signature keys accordingly.
+            _restart_is_xml = restart_path.suffix == ".xml"
+            _system_hard_keys: tuple[str, ...] = (
+                "system_xml_sha256", "topology_pdb_sha256", "solvent_type",
+                "is_membrane", "implicit_solvent", "hmr",
+            ) if _restart_is_xml else (
+                "system_xml_sha256", "topology_pdb_sha256", "solvent_type",
+                "ensemble", "pressure_bar", "is_membrane",
+                "implicit_solvent", "hmr",
+            )
+            _system_soft_keys: tuple[str, ...] = (
+                ("ensemble", "pressure_bar") if _restart_is_xml else ()
+            )
+            if isinstance(restart_system_signature, dict):
+                hard_mismatches = _signature_mismatches(
+                    restart_system_signature, current_system_signature,
+                    _system_hard_keys,
+                )
+                if hard_mismatches:
+                    result["errors"].append(
+                        "Restart system signature mismatch: " + "; ".join(hard_mismatches)
+                    )
+                if _system_soft_keys:
+                    soft_mismatches = _signature_mismatches(
+                        restart_system_signature, current_system_signature,
+                        _system_soft_keys,
+                    )
+                    if soft_mismatches:
+                        result["warnings"].append(
+                            "Restart ensemble switch (XML state): "
+                            + "; ".join(soft_mismatches)
+                            + " — _load_state_into_simulation drops barostat "
+                            "parameters; positions / velocities / box vectors "
+                            "transfer cleanly across NPT ↔ NVT."
+                        )
+            if isinstance(restart_integrator_signature, dict):
+                mismatches = _signature_mismatches(
+                    restart_integrator_signature,
+                    current_integrator_signature,
+                    ("integrator", "temperature_kelvin", "timestep_fs", "friction_per_ps"),
+                )
+                if mismatches:
+                    restart_source_type = _restart_source_node_type(
+                        job_dir, _restart_from_node_id if _node_mode else None)
+                    hard, soft = _integrator_restart_verdict(
+                        mismatches, restart_is_xml=_restart_is_xml,
+                        source_node_type=restart_source_type,
+                    )
+                    if hard:
+                        result["errors"].append(
+                            "Restart integrator signature mismatch: " + "; ".join(hard)
+                        )
+                    if soft:
+                        result["warnings"].append(
+                            "Restart integrator settings changed (XML state from "
+                            f"{restart_source_type or 'an ancestor'} node): " + "; ".join(soft)
+                            + " — positions, velocities and box are transferred as they "
+                            "are and the new Langevin integrator re-thermalizes them "
+                            "within picoseconds; this is the normal equilibration-to-"
+                            "production handoff. A prod -> prod continuation must keep "
+                            "these identical."
+                        )
+                        result["restart_integrator_changes"] = soft
+            if result["errors"]:
+                return _fail_node_if_running(job_dir, node_id, result)
+            # Use the ensemble-agnostic loader: XML is read via
+            # XmlSerializer.deserialize and only positions/velocities/box
+            # are transferred, so an NPT-saved state can resume into an
+            # NVT System (and vice versa) without barostat-parameter
+            # rejection. Binary .chk falls back to loadCheckpoint and
+            # still requires identical System and GPU architecture.
+            system_has_barostat = any(
+                isinstance(f, (MonteCarloBarostat,
+                               MonteCarloMembraneBarostat))
+                for f in system.getForces()
+            )
+            if restart_path.suffix == ".xml":
+                _kind = _detect_ensemble_mismatch(
+                    restart_path, system_has_barostat
+                )
+                if _kind == "npt_state_nvt_system":
+                    result["warnings"].append(
+                        "Ensemble switch: the saved state contains NPT "
+                        "barostat parameters but this run is NVT — barostat "
+                        "parameters are dropped, positions/velocities/box "
+                        "are preserved."
+                    )
+                elif _kind == "nvt_state_npt_system":
+                    result["warnings"].append(
+                        "Ensemble switch: NVT state into NPT system — the "
+                        "barostat starts in its default relaxed state and "
+                        "will re-equilibrate the volume over the first few ps."
+                    )
+
+            _load_info = _load_state_into_simulation(
+                simulation, restart_path, is_periodic=is_periodic,
+                temperature_kelvin=temperature_kelvin,
+                random_seed=effective_random_seed,
+            )
+            if _load_info.get("velocities_rethermalized"):
+                result["warnings"].append(
+                    "Restart state had no velocities; re-thermalized "
+                    f"at {temperature_kelvin} K."
+                )
+            if _load_info.get("box_vectors_dropped"):
+                result["warnings"].append(
+                    "Restart state contained periodic box vectors, but this "
+                    "production is non-periodic; dropped box vectors."
+                )
+            # Restore the cumulative step counter from the *same*
+            # ancestor whose artifact we just loaded — eq→prod and
+            # prod→prod extension preserves the timeline. The state
+            # file itself does not carry currentStep.
+            if _node_mode:
+                from mdclaw._node import read_ancestor_final_step
+                anc_step = read_ancestor_final_step(
+                    job_dir, node_id,
+                    restart_node_id=_restart_from_node_id,
+                )
+                if anc_step is not None:
+                    simulation.currentStep = anc_step
+            logger.info(
+                f"Restarted from {_load_info['format']} "
+                f"(step {simulation.currentStep})"
+            )
+            if _pressure_bar_inherited:
+                result["warnings"].append(
+                    f"pressure_bar={pressure_bar} inherited from eq "
+                    f"ancestor (final_ensemble=NPT)."
+                )
+            append_dcd = True
+            result["restarted_from"] = restart_from
+        else:
+            append_dcd = False
+            simulation.context.setPositions(xml_inputs.positions)
+            # Set box vectors for periodic explicit solvent systems (required for PME)
+            if is_periodic and not implicit_solvent:
+                if xml_inputs.box_vectors is not None:
+                    simulation.context.setPeriodicBoxVectors(*xml_inputs.box_vectors)
+
+        if _plumed_run is not None:
+            _plumed_run.restore_clock(simulation)
+        steering = None
+        if not plumed_file and (steering_time_ns is not None or _torch_steering is not None):
+            schedule_args = dict(
+                time_ns=steering_time_ns, update_ps=steering_update_interval_ps,
+                timestep_fs=timestep_fs, restart_from=restart_from, output_dir=out_dir,
+            )
+            if _torch_steering is not None:
+                steering = TorchSteering(simulation, _custom_force_loaded, _torch_steering, **schedule_args)
+                result["steering_initial_file"] = str(_torch_steering["initial_file"])
+            else:
+                steering = DistanceSteering(simulation, _distance_restraint_loaded, **schedule_args)
+            result["steering_file"] = str(steering.path)
+            result["sampling_role"] = "fixed_bias" if steering.fixed else "steered"
+
+        # Setup output file paths
+        trajectory_file = out_dir / f"{pref}trajectory.{trajectory_format}"
+        energy_file = out_dir / f"{pref}energy.dat"
+
+        # Trajectory and energy reporters must fire on the SAME schedule
+        # and share the SAME append state. A single report_interval and a
+        # single do_append variable ensures they cannot drift apart (e.g.
+        # energy_file existing but trajectory_file missing, or vice versa,
+        # would otherwise silently diverge the `append=` argument).
+        report_interval = int(output_frequency_ps / timestep_fs * 1000)
+        do_append, _stale_warning, _ = _resolve_dcd_append_mode(
+            trajectory_file, energy_file, append_dcd
+        )
+        if _stale_warning:
+            result["warnings"].append(_stale_warning)
+
+        trajectory_reporter = None
+        if trajectory_format.lower() == "dcd":
+            trajectory_reporter = DCDReporter(
+                str(trajectory_file), report_interval, append=do_append
+            )
+        else:
+            from openmm.app import PDBReporter
+            trajectory_reporter = PDBReporter(str(trajectory_file), report_interval)
+        simulation.reporters.append(trajectory_reporter)
+
+        energy_reporter = StateDataReporter(
+            str(energy_file),
+            report_interval,
+            step=True,
+            time=True,
+            potentialEnergy=True,
+            kineticEnergy=True,
+            totalEnergy=True,
+            temperature=True,
+            volume=(ensemble == "NPT"),
+            density=(ensemble == "NPT"),
+            append=do_append,
+        )
+        simulation.reporters.append(energy_reporter)
+
+        # Checkpoint + state reporters — periodic saves. Both fire on
+        # the same interval. The .chk is bit-identical-restart material
+        # (same GPU only); the .xml is the portable artifact that
+        # downstream prod and `--continue-from` extensions will load.
+        checkpoint_interval = max(report_interval * 10, 5000)
+        simulation.reporters.append(
+            CheckpointReporter(str(checkpoint_file), checkpoint_interval)
+        )
+        state_file = out_dir / f"{pref}state.xml"
+        simulation.reporters.append(
+            CheckpointReporter(str(state_file), checkpoint_interval, writeState=True)
+        )
+        result["checkpoint_file"] = str(checkpoint_file)
+        result["state_file"] = str(state_file)
+
+        # Custom-force / CV logging. Bias potential energy is read from the
+        # dedicated force group every report; CV values (if the script
+        # returned a cv_dict) are logged alongside. Shares the trajectory /
+        # energy report interval and append state.
+        _cv_reporter = None
+        if (_custom_force_loaded is not None
+                or _distance_restraint_loaded is not None):
+            _bias = _custom_force_loaded or _distance_restraint_loaded
+            cv_file = out_dir / f"{pref}collective_variables.csv"
+            _cv_reporter = CustomForceReporter(
+                str(cv_file),
+                report_interval,
+                force_group=CUSTOM_FORCE_GROUP,
+                evaluator=_bias.get("evaluator"),
+                cv_names=_bias["cv_names"],
+                append=do_append,
+                global_parameters=_bias.get("global_parameters"),
+            )
+            simulation.reporters.append(_cv_reporter)
+            result["collective_variables_file"] = str(cv_file)
+            meta_file = out_dir / f"{pref}collective_variables.meta.json"
+            write_cv_metadata(
+                str(meta_file),
+                signature=_bias["signature"],
+                cv_names=_bias["cv_names"],
+                temperature_kelvin=temperature_kelvin,
+                parameters=(
+                    custom_force_parameters
+                    if _custom_force_loaded is not None
+                    else {"distance_restraints": _bias["restraints"],
+                          **({"steering": steering.protocol} if steering else {})}
+                ),
+                steering=steering.protocol if steering and _custom_force_loaded else None,
+            )
+            result["collective_variables_meta_file"] = str(meta_file)
+
+        # Get initial energy
+        state = simulation.context.getState(getEnergy=True)
+        initial_energy = state.getPotentialEnergy()
+        result["initial_energy_kj_mol"] = float(initial_energy._value)
+        logger.info(f"Initial energy: {initial_energy}")
+
+        # Minimize energy (skip on restart)
+        if not restart_from:
+            logger.info("Minimizing energy...")
+            simulation.minimizeEnergy(maxIterations=5000)
+            # Set initial velocities from Maxwell-Boltzmann distribution
+            if random_seed is not None:
+                simulation.context.setVelocitiesToTemperature(
+                    temperature_kelvin * kelvin, random_seed
+                )
+            else:
+                simulation.context.setVelocitiesToTemperature(
+                    temperature_kelvin * kelvin
+                )
+
+        # Run simulation. See _compute_step_plan for the semantics —
+        # simulation_time_ns is always "run this much in this call", and
+        # eq→prod's legacy "full production length" meaning is preserved
+        # because the eq checkpoint is saved with currentStep=0.
+        plan = _compute_step_plan(
+            simulation_time_ns, timestep_fs, simulation.currentStep
+        )
+        start_step = plan["start_step"]
+        steps_to_run = plan["steps_to_run"]
+        if _plumed_run is not None and start_step + steps_to_run >= 2**31 - 1:
+            raise CustomForceError(code="plumed_input_invalid", message="PLUMED plugin's 32-bit step counter would overflow.")
+        simulation_steps = plan["num_steps"]
+        result["num_steps"] = simulation_steps
+        result["start_step"] = start_step
+        result["start_time_ns"] = _plumed_run.start_time / 1000 if _plumed_run else plan["start_time_ns"]
+
+        if steps_to_run <= 0:
+            result["errors"].append(
+                "simulation_time_ns is too short for the timestep; production would run 0 steps"
+            )
+            raise ValueError(result["errors"][-1])
+        if report_interval <= 0:
+            result["errors"].append(
+                "output_frequency_ps is too small for the timestep; report interval is 0 steps"
+            )
+            raise ValueError(result["errors"][-1])
+        if report_interval > steps_to_run:
+            result["errors"].append(
+                "output_frequency_ps is longer than this production segment; "
+                "trajectory and energy reporters would not emit any frames"
+            )
+            raise ValueError(result["errors"][-1])
+
+        logger.info(
+            f"Running {steps_to_run} steps "
+            f"(start_step={start_step}, target_total={simulation_steps})"
+        )
+
+        _md_started = time.monotonic()
+        _deadline = None if _scheme_segment else job_deadline_epoch()
+        stepper = DeadlineStepper(_deadline, report_interval,
+                                  steering.step if steering else simulation.step)
+        steps_run = stepper.run(steps_to_run)
+        if steering:
+            result["steering"] = steering.summary()
+            # Per-bond centers have changed since Context construction.
+            if _distance_restraint_loaded is not None:
+                runtime_system_file.write_text(XmlSerializer.serialize(system))
+            if not steering.fixed:
+                result["warnings"].append(
+                    "Steered trajectories are non-equilibrium initialization, not umbrella samples. "
+                    "Check actual CV target attainment and equilibrate at the fixed target before analysis."
+                )
+        # Integration time alone (reporters included, Simulation build and
+        # state I/O excluded) so a scheme of short segments can separate the
+        # MD from the per-segment overhead.
+        _md_seconds = time.monotonic() - _md_started
+        result["md_seconds"] = round(_md_seconds, 3)
+        result["ns_per_day"] = (
+            round(steps_run * timestep_fs * 1e-6 / _md_seconds * 86400.0, 1)
+            if _md_seconds > 0 and steps_run > 0 else None
+        )
+        if stepper.stopped:
+            # The job ends before the requested length would: keep what ran
+            # (a frame boundary), complete the node with it, and say how the
+            # rest continues. The requested length stays in the record.
+            _left = stepper.seconds_left_at_stop or 0.0
+            if steps_run == 0:
+                result["code"] = "production_time_limit"
+                result["errors"].append(
+                    f"The batch job ends in {_left:.0f} s: no production step was run. "
+                    "Submit this node again in a job with a longer --time-limit."
+                )
+                raise ValueError(result["errors"][-1])
+            _actual_ns = steps_run * timestep_fs * 1e-6
+            _remaining_ns = max(0.0, simulation_time_ns - _actual_ns)
+            result["requested_simulation_time_ns"] = simulation_time_ns
+            result["simulation_time_ns"] = round(_actual_ns, 6)
+            result["remaining_simulation_time_ns"] = round(_remaining_ns, 6)
+            result["stopped_reason"] = "time_limit"
+            _needed_min = (_remaining_ns / result["ns_per_day"] * 1440.0 + 5.0
+                           if result["ns_per_day"] else None)
+            _continue = (
+                f"mdclaw create_node --job-dir {job_dir} --node-type prod --continue-from {node_id}"
+                if _node_mode else "a run that restarts from this state.xml"
+            )
+            result["warnings"].append(
+                f"Stopped {_left:.0f} s before the job's time limit: {_actual_ns:.3f} of the "
+                f"requested {simulation_time_ns} ns ran at {result['ns_per_day']} ns/day. The node "
+                f"completes with that; the remaining {_remaining_ns:.3f} ns is a continuation: "
+                f"{_continue}, then run_production --simulation-time-ns {_remaining_ns:.3f}"
+                + (f" in a job of at least {_needed_min:.0f} min." if _needed_min else ".")
+            )
+            steps_to_run = steps_run
+            simulation_steps = start_step + steps_run
+            result["num_steps"] = simulation_steps
+
+        # Save final checkpoint + state (periodic reporter may not have
+        # fired for short runs). Both formats so downstream can choose.
+        _save_checkpoint_atomic(simulation, checkpoint_file)
+        _save_state_atomic(simulation, state_file)
+        logger.info(f"Final checkpoint saved: {checkpoint_file}")
+        logger.info(f"Final state saved: {state_file}")
+
+        result["steps_completed"] = simulation.currentStep
+
+        # Get final energy and positions
+        state = simulation.context.getState(getEnergy=True, getPositions=True)
+        final_energy = state.getPotentialEnergy()
+        result["final_energy_kj_mol"] = float(final_energy._value)
+        if _plumed_run is not None:
+            result.update(_plumed_run.finish(simulation))
+            if result["sampling_role"] == "steered":
+                result["warnings"].append("PLUMED steering is non-equilibrium initialization; check actual target attainment and fixed-window relaxation.")
+        logger.info(f"Final energy: {final_energy}")
+
+        expected_reports = steps_to_run // report_interval if report_interval > 0 else 0
+        if expected_reports > 0:
+            fallback_outputs = []
+            for reporter, output_path, label in (
+                (trajectory_reporter, trajectory_file, "trajectory"),
+                (energy_reporter, energy_file, "energy"),
+            ):
+                _flush_reporter_stream(reporter)
+                if not output_path.exists() or output_path.stat().st_size == 0:
+                    reporter.report(simulation, state)
+                    _flush_reporter_stream(reporter)
+                    fallback_outputs.append(label)
+            if fallback_outputs:
+                result["warnings"].append(
+                    "Reporter outputs were empty after simulation; wrote final "
+                    + ", ".join(fallback_outputs)
+                    + " snapshot(s)."
+                )
+
+        for reporter in (trajectory_reporter, energy_reporter):
+            _close_reporter_stream(reporter)
+        if _cv_reporter is not None:
+            _cv_reporter.close()
+
+        # Save final structure
+        final_pdb = out_dir / f"{pref}final_structure.pdb"
+        positions = state.getPositions()
+        # Restore the Amber/PTM/water residue names OpenMM's PDBFile loader
+        # normalized away when topology.pdb was loaded (same shared exporter as
+        # min/eq; pure text relabel, MD result/state.xml unaffected).
+        from mdclaw.structure.pdb_utils import (
+            render_simulation_pdb_preserving_resnames,
+        )
+        # Same as min/eq: CRYST1 follows the topology, which still holds the
+        # build-time box, so pass the final state's box and image around the
+        # solute. state.xml / .chk / the DCD keep the integrated coordinates.
+        final_pdb.write_text(
+            render_simulation_pdb_preserving_resnames(
+                simulation.topology,
+                positions,
+                topology_pdb_file,
+                box_vectors=(
+                    state.getPeriodicBoxVectors() if is_periodic else None
+                ),
+                image=is_periodic,
+                warnings=result["warnings"],
+            )
+        )
+
+        # Update result with file paths
+        result["trajectory_file"] = str(trajectory_file)
+        result["final_structure"] = str(final_pdb)
+        result["energy_file"] = str(energy_file)
+
+        # Trajectory and energy reporters share identical report_interval
+        # and append state by construction, so they fire at the same steps
+        # against the same simulation state. Either both files are populated
+        # or both are empty — a divergence (one ok, one empty) would mean
+        # the alignment has silently broken. Treat either missing file as a
+        # hard failure so that divergence surfaces loudly rather than hiding
+        # behind a warning.
+        missing_outputs = []
+        if expected_reports > 0:
+            if not trajectory_file.exists() or trajectory_file.stat().st_size == 0:
+                missing_outputs.append("trajectory")
+            if not energy_file.exists() or energy_file.stat().st_size == 0:
+                missing_outputs.append("energy")
+
+        if missing_outputs:
+            result["errors"].append(
+                "Reporter outputs missing after simulation: "
+                + ", ".join(missing_outputs)
+            )
+        else:
+            energy_rows = _count_state_data_rows(energy_file)
+            result["energy_rows"] = energy_rows
+            if expected_reports > 0 and energy_rows < expected_reports:
+                result["errors"].append(
+                    f"Energy reporter wrote {energy_rows} rows, expected at least {expected_reports}"
+                )
+            else:
+                result["success"] = True
+
+        logger.info(f"Simulation complete. Trajectory saved: {trajectory_file}")
+
+    except (_ModernSystemContractError, DistanceRestraintError, CustomForceError) as exc:
+        logger.error("Production aborted by modern-system contract: %s", exc)
+        result["errors"].append(str(exc))
+        result["code"] = exc.code
+    except Exception as e:
+        logger.error(f"MD simulation failed: {e}")
+        result["errors"].append(f"MD simulation failed: {type(e).__name__}: {str(e)}")
+    finally:
+        if _plumed_log is not None:
+            simulation = None  # PLUMED finalization/logging precedes stdout restore
+            _plumed_log.__exit__(None, None, None)
+
+    # Node state update
+    if _node_mode:
+        result["wall_seconds"] = round(time.monotonic() - _started_monotonic, 3)
+        _record_production_node_result(
+            result=result,
+            job_dir=job_dir,
+            node_id=node_id,
+            # The length that ran: shorter than requested after a time-limit stop.
+            simulation_time_ns=result.get("simulation_time_ns", simulation_time_ns),
+            temperature_kelvin=temperature_kelvin,
+            pressure_bar=pressure_bar,
+            platform=platform,
+            hmr=hmr,
+            timestep_fs=timestep_fs,
+            output_frequency_ps=output_frequency_ps,
+            random_seed=random_seed,
+            custom_force_script_artifact=_custom_force_script_artifact,
+        )
+
+    return result

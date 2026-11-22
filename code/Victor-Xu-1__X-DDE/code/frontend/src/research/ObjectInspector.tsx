@@ -1,0 +1,273 @@
+import { PoseWorkspace } from "../poses/PoseWorkspace";
+import type { Language } from "../types";
+import { canPreviewFile, SelectedAssetPreview } from "./SelectedAssetPreview";
+import { PoseStudyInput } from "../viewer/PoseStudyInput";
+import { VerifiedArtifactDownload } from "../presentation/VerifiedArtifactDownload";
+import { WorkspaceFullscreenControl } from "../presentation/WorkspaceFullscreenControl";
+import {
+  edgeLabels,
+  type GraphNode,
+  type ObjectKind,
+  type ResearchGraph,
+  type ScientificObject,
+} from "./types";
+
+export function ObjectInspector({
+  node,
+  graph,
+  selected,
+  language,
+  busy,
+  label,
+  notes,
+  rating,
+  setLabel,
+  setNotes,
+  setRating,
+  onEdit,
+  onProperties,
+  onSelect,
+  onJob,
+  mutate,
+  register,
+}: {
+  node: GraphNode | undefined;
+  graph: ResearchGraph;
+  selected: string | null;
+  language: Language;
+  busy: boolean;
+  label: string;
+  notes: string;
+  rating: number;
+  setLabel(value: string): void;
+  setNotes(value: string): void;
+  setRating(value: number): void;
+  onEdit(value: ScientificObject): void;
+  onProperties(value: ScientificObject): void;
+  onSelect(value: string): void;
+  onJob(id: string): void;
+  mutate(fn: () => Promise<unknown>): Promise<void>;
+  register(
+    assetId: string,
+    kind: ObjectKind,
+    label: string,
+    parent?: ScientificObject,
+  ): Promise<ScientificObject>;
+}) {
+  const zh = language === "zh",
+    object = node?.object;
+  const downloadLabel = zh ? "下载此版本" : "Download version";
+  const related = graph.edges.filter(
+    (e) => e.source === selected || e.target === selected,
+  );
+  return (
+    <section
+      className={`setup-card research-inspector${node ? "" : " is-empty"}`}
+    >
+      {node ? (
+        <>
+          <header className="research-inspector-heading">
+            <h2>{node.label}</h2>
+            {object && (
+              <div className="editor-toolbar">
+                {object.kind === "molecule" && (
+                  <PoseStudyInput original={object} language={language}>
+                    {(selection) => (
+                      <>
+                        <button
+                          disabled={!selection?.ready || !selection.object}
+                          onClick={() => {
+                            if (selection?.object) onEdit(selection.object);
+                          }}
+                          title={
+                            zh
+                              ? "在 Ketcher 中打开；保存会创建新版本并保留原始分子。"
+                              : "Open in Ketcher. Saving creates a new version and preserves the original."
+                          }
+                        >
+                          {zh ? "编辑分子" : "Edit molecule"}
+                        </button>
+                        <button
+                          disabled={!selection?.ready || !selection.object}
+                          onClick={() => {
+                            if (selection?.object)
+                              onProperties(selection.object);
+                          }}
+                        >
+                          {zh ? "用作性质计算输入" : "Use for properties"}
+                        </button>
+                      </>
+                    )}
+                  </PoseStudyInput>
+                )}
+                <VerifiedArtifactDownload
+                  key={object.id}
+                  reference={object.reference}
+                  label={zh ? "下载" : "Download"}
+                  downloadLabel={downloadLabel}
+                  language={language}
+                />
+                {canPreviewFile(object.kind) && (
+                  <WorkspaceFullscreenControl
+                    language={language}
+                    compact
+                    structureFocus
+                  />
+                )}
+              </div>
+            )}
+          </header>
+          {object && (
+            <>
+              <SelectedAssetPreview object={object} language={language} />
+              <details className="asset-annotations" key={object.id}>
+                <summary>
+                  {zh ? "名称、备注与人工评价" : "Name, notes & human rating"}
+                </summary>
+                <label className="field">
+                  {zh ? "名称" : "Name"}
+                  <input
+                    disabled={busy}
+                    value={label}
+                    maxLength={120}
+                    onChange={(e) => setLabel(e.target.value)}
+                  />
+                </label>
+                <label className="field">
+                  {zh ? "研究备注" : "Research notes"}
+                  <textarea
+                    disabled={busy}
+                    value={notes}
+                    maxLength={3000}
+                    onChange={(e) => setNotes(e.target.value)}
+                  />
+                </label>
+                <label className="field">
+                  {zh
+                    ? "人工评价（不代表模型分数）"
+                    : "Human rating (not a model score)"}
+                  <select
+                    disabled={busy}
+                    value={rating}
+                    onChange={(e) => setRating(Number(e.target.value))}
+                  >
+                    {[0, 1, 2, 3, 4, 5].map((n) => (
+                      <option key={n} value={n}>
+                        {n === 0 ? (zh ? "未评价" : "Unrated") : `${n} / 5`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  disabled={busy || !label.trim()}
+                  onClick={() =>
+                    void mutate(() =>
+                      register(
+                        object.reference.asset_id,
+                        object.kind,
+                        label.trim(),
+                        object,
+                      ),
+                    )
+                  }
+                >
+                  {zh ? "保存备注为新版本" : "Save notes as new version"}
+                </button>
+              </details>
+              <details className="asset-version-help">
+                <summary>{zh ? "版本说明" : "About this version"}</summary>
+                <p className="field-help">
+                  {zh
+                    ? "切换预览构象后，下载按钮仍保存标题所对应的原文件。"
+                    : "Download saves the original file for the named version, even when another pose is displayed."}
+                </p>
+              </details>
+            </>
+          )}
+          {node.kind === "file" &&
+            ["ligand", "structure", "sequences", "config"].includes(
+              node.asset_kind ?? "",
+            ) && (
+              <button
+                disabled={busy}
+                onClick={() =>
+                  void mutate(() =>
+                    register(
+                      node.asset_id!,
+                      (
+                        {
+                          ligand: "molecule",
+                          structure: "structure",
+                          sequences: "sequence",
+                          config: "analysis",
+                        } as Record<string, ObjectKind>
+                      )[node.asset_kind!],
+                      node.label,
+                    ),
+                  )
+                }
+              >
+                {zh ? "登记为科学资产" : "Register scientific asset"}
+              </button>
+            )}
+          {node.job_id && (
+            <button onClick={() => onJob(node.job_id!)}>
+              {zh ? "查看任务与结果" : "Open task & results"}
+            </button>
+          )}
+          {node.exploration_id && (
+            <details>
+              <summary>
+                {zh ? "打开配套姿势探索" : "Open paired pose exploration"}
+              </summary>
+              <PoseWorkspace
+                key={node.id}
+                language={language}
+                initialExplorationId={node.exploration_id}
+              />
+            </details>
+          )}
+          <h3>{zh ? "关联来源与去向" : "Sources & downstream use"}</h3>
+          {!related.length ? (
+            <p>
+              {zh ? "尚未被其他任务使用。" : "Not yet used by another task."}
+            </p>
+          ) : (
+            <ul className="research-relations">
+              {related.map((edge, i) => {
+                const target =
+                    edge.source === selected ? edge.target : edge.source,
+                  other = graph.nodes.find((n) => n.id === target);
+                return (
+                  <li key={i}>
+                    <span>
+                      {edge.target === selected
+                        ? zh
+                          ? "来源"
+                          : "Source"
+                        : zh
+                          ? "去向"
+                          : "Downstream"}
+                      {" · "}
+                      {edgeLabels[edge.relation]?.[zh ? 0 : 1]}
+                      {": "}
+                    </span>
+                    <button onClick={() => onSelect(target)}>
+                      {other?.label ?? target}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </>
+      ) : (
+        <p>
+          {zh
+            ? "选择文件，查看结构、序列或继续研究。"
+            : "Select a file to inspect its structure or sequence, or continue research."}
+        </p>
+      )}
+    </section>
+  );
+}

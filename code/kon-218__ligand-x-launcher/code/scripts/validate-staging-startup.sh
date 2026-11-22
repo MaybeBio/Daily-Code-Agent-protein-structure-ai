@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# Start and validate the exact production Compose bundle in an isolated project.
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUNTIME_DIR="${RUNTIME_ROOT:-$ROOT_DIR/runtime}"
+
+ENV_FILE="${ENV_FILE:-runtime/.env.production}"
+OVERRIDE_ENV_FILE="${OVERRIDE_ENV_FILE:-}"
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-ligandx-staging}"
+TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-900}"
+POLL_SECONDS="${POLL_SECONDS:-10}"
+CLEANUP="${CLEANUP:-true}"
+LOG_DIR="${LOG_DIR:-}"
+
+# Preserve repository-relative override/log arguments while Compose resolves
+# all bind mounts beside the relocated runtime snapshot.
+[[ "$ENV_FILE" = /* ]] || ENV_FILE="$ROOT_DIR/$ENV_FILE"
+if [ -n "$OVERRIDE_ENV_FILE" ] && [[ "$OVERRIDE_ENV_FILE" != /* ]]; then
+  OVERRIDE_ENV_FILE="$ROOT_DIR/$OVERRIDE_ENV_FILE"
+fi
+if [ -n "$LOG_DIR" ] && [[ "$LOG_DIR" != /* ]]; then
+  LOG_DIR="$ROOT_DIR/$LOG_DIR"
+fi
+cd "$RUNTIME_DIR"
+
+
+# rabbitmq/redis/postgres/flower/proxy use a fixed container_name in the
+# canonical compose file (so a dev override stack can deliberately share them
+# with a real running install), which defeats --project-name isolation for
+# those five services specifically. Give this run its own prefix so it can
+# start alongside an already-running install instead of failing with
+# "Conflict. The container name ... is already in use".
+export LIGANDX_INFRA_CONTAINER_PREFIX="${LIGANDX_INFRA_CONTAINER_PREFIX:-$COMPOSE_PROJECT_NAME}"
+
+if [ ! -f "$ENV_FILE" ]; then
+  echo "Missing env file: $ENV_FILE" >&2
+  exit 1
+fi
+if [ -n "$OVERRIDE_ENV_FILE" ] && [ ! -f "$OVERRIDE_ENV_FILE" ]; then
+  echo "Missing override env file: $OVERRIDE_ENV_FILE" >&2
+  exit 1
+fi
+
+compose=(docker compose --project-name "$COMPOSE_PROJECT_NAME" --env-file "$ENV_FILE")
+if [ -n "$OVERRIDE_ENV_FILE" ]; then
+  compose+=(--env-file "$OVERRIDE_ENV_FILE")
+fi
+
+# The base docker-compose.yml is deliberately CPU-safe (no GPU device
+# reservations). Most GPU services fall back to CPU gracefully, but
+# worker-gpu-long fails closed by default (entrypoint.sh's worker-gpu-long
+# branch: LIGANDX_REQUIRE_CUDA defaults to "1" and SystemExits if OpenMM has
+# no CUDA platform, with no CPU path) — so under the base file alone it
+# crash-loops for this script's whole TIMEOUT_SECONDS wait, on GPU hosts and
+# CPU-only ones alike. The launcher's gpuComposeArgs() layers
+# docker-compose.gpu.yml whenever CheckGPU() (an `nvidia-smi` probe) succeeds
+# and the overlay file exists (app.go); mirror that exact check here so this
+# "exact production Compose bundle" validation matches what a real install
+# would run. When no GPU is present, relax LIGANDX_REQUIRE_CUDA the same way
+# a genuine CPU-only production install must, so the smoke test still
+# validates the rest of the stack instead of failing on a check the base
+# compose file was never going to satisfy.
+if [ -f "$RUNTIME_DIR/docker-compose.gpu.yml" ] && command -v nvidia-smi >/dev/null 2>&1 \
+    && nvidia-smi >/dev/null 2>&1; then
+  compose+=(-f docker-compose.yml -f docker-compose.gpu.yml)
+  echo "NVIDIA GPU detected: layering docker-compose.gpu.yml onto staging validation."
+else
+  export LIGANDX_REQUIRE_CUDA="${LIGANDX_REQUIRE_CUDA:-0}"
+  echo "No NVIDIA GPU detected: staging validation runs CPU-only (LIGANDX_REQUIRE_CUDA=$LIGANDX_REQUIRE_CUDA)."
+fi
+
+collect_diagnostics() {
+  local status=$?
+  if [ -n "$LOG_DIR" ]; then
+    mkdir -p "$LOG_DIR"
+    "${compose[@]}" ps -a --format json > "$LOG_DIR/compose-ps.jsonl" 2>/dev/null || true
+    "${compose[@]}" logs --no-color > "$LOG_DIR/compose.log" 2>&1 || true
+  fi
+  if [ "$CLEANUP" = "true" ]; then
+    "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap collect_diagnostics EXIT
+
+VERSION_VALUE="$(awk -F= '$1=="VERSION"{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' "${OVERRIDE_ENV_FILE:-$ENV_FILE}" | tail -n 1)"
+if [ -z "$VERSION_VALUE" ] || [ "$VERSION_VALUE" = "latest" ] || [[ "$VERSION_VALUE" == CHANGE_ME* ]]; then
+  echo "VERSION must be pinned before staging validation." >&2
+  exit 1
+fi
+
+# Compose's ${VAR:?} guards only reject empty/unset values, so a base env file
+# still carrying template placeholders would pass them and start the stack on
+# publicly-known secrets. Refuse that here, mirroring the launcher's
+# envfile.IsPlaceholder semantics (empty, any CHANGE_ME marker, unresolved
+# ${...}) plus the known dev literal "change-me-in-production" from Core's
+# .env.example. Effective values follow Compose's --env-file precedence: the
+# override file wins over the base env per key. Values are never printed.
+declare -A STAGING_ENV=()
+while IFS= read -r env_line || [ -n "$env_line" ]; do
+  case "${env_line#"${env_line%%[![:space:]]*}"}" in ''|\#*) continue ;; esac
+  env_key="${env_line%%=*}"
+  if [ "$env_key" = "$env_line" ]; then continue; fi
+  env_value="${env_line#*=}"
+  env_key="${env_key#"${env_key%%[![:space:]]*}"}"; env_key="${env_key%"${env_key##*[![:space:]]}"}"
+  env_value="${env_value#"${env_value%%[![:space:]]*}"}"; env_value="${env_value%"${env_value##*[![:space:]]}"}"
+  STAGING_ENV["$env_key"]="$env_value"
+done < <(cat "$ENV_FILE" ${OVERRIDE_ENV_FILE:+"$OVERRIDE_ENV_FILE"})
+
+placeholder_keys=()
+for env_key in POSTGRES_PASSWORD RABBITMQ_PASSWORD REDIS_PASSWORD QC_SECRET_KEY \
+               LIGANDX_PASSWORD FLOWER_PASSWORD INTERNAL_WORKER_SECRET; do
+  env_value="${STAGING_ENV[$env_key]:-}"
+  if [ -z "$env_value" ] || [[ "$env_value" == *CHANGE_ME* ]] || [[ "$env_value" == *'${'* ]] \
+      || [ "$env_value" = "change-me-in-production" ]; then
+    placeholder_keys+=("$env_key")
+  fi
+done
+if [ "${#placeholder_keys[@]}" -gt 0 ]; then
+  echo "Staging env still contains placeholder secrets: ${placeholder_keys[*]}" >&2
+  echo "Generate real values for these keys before staging validation." >&2
+  exit 1
+fi
+
+mapfile -t expected_services < <("${compose[@]}" config --services | sort -u)
+if [ "${#expected_services[@]}" -eq 0 ]; then
+  echo "Compose configuration contains no services." >&2
+  exit 1
+fi
+printf 'Starting %s services with VERSION=%s in project %s\n' \
+  "${#expected_services[@]}" "$VERSION_VALUE" "$COMPOSE_PROJECT_NAME"
+"${compose[@]}" pull
+"${compose[@]}" up -d --remove-orphans
+
+expected_csv="$(IFS=,; echo "${expected_services[*]}")"
+export EXPECTED_SERVICES="$expected_csv"
+deadline=$((SECONDS + TIMEOUT_SECONDS))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if "${compose[@]}" ps -a --format json | python3 -c '
+import json, os, sys
+expected = set(filter(None, os.environ["EXPECTED_SERVICES"].split(",")))
+seen, bad = set(), []
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    item = json.loads(line)
+    name = item.get("Service")
+    seen.add(name)
+    state = (item.get("State") or "").lower()
+    health = (item.get("Health") or "").lower()
+    code = int(item.get("ExitCode") or 0)
+    ready = (state == "running" and health in {"", "healthy"}) or (state == "exited" and code == 0)
+    if not ready:
+        bad.append((name, state, health, code))
+missing = expected - seen
+if missing or bad:
+    print(f"waiting: ready={len(expected) - len(missing) - len(bad)}/{len(expected)} missing={sorted(missing)} bad={bad}")
+    raise SystemExit(1)
+print(f"all {len(expected)} configured services are ready")
+'; then
+    break
+  fi
+  sleep "$POLL_SECONDS"
+done
+
+"${compose[@]}" ps -a --format json | python3 -c '
+import json, os, sys
+expected = set(filter(None, os.environ["EXPECTED_SERVICES"].split(",")))
+seen, bad = set(), []
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    item = json.loads(line)
+    name = item.get("Service")
+    seen.add(name)
+    state = (item.get("State") or "").lower()
+    health = (item.get("Health") or "").lower()
+    code = int(item.get("ExitCode") or 0)
+    if not ((state == "running" and health in {"", "healthy"}) or (state == "exited" and code == 0)):
+        bad.append((name, state, health, code))
+missing = expected - seen
+if missing or bad:
+    print(f"Compose validation failed; missing={sorted(missing)} bad={bad}", file=sys.stderr)
+    raise SystemExit(1)
+'
+
+GATEWAY_PORT_VALUE="$(awk -F= '$1=="GATEWAY_PORT"{print $2}' "${OVERRIDE_ENV_FILE:-$ENV_FILE}" | tail -n 1)"
+FRONTEND_PORT_VALUE="$(awk -F= '$1=="FRONTEND_PORT"{print $2}' "${OVERRIDE_ENV_FILE:-$ENV_FILE}" | tail -n 1)"
+export GATEWAY_PORT_VALUE="${GATEWAY_PORT_VALUE:-8000}"
+export FRONTEND_PORT_VALUE="${FRONTEND_PORT_VALUE:-3000}"
+python3 - <<'PY'
+import os
+import urllib.request
+
+for name, url in (
+    ("gateway", f"http://127.0.0.1:{os.environ['GATEWAY_PORT_VALUE']}/health"),
+    ("frontend", f"http://127.0.0.1:{os.environ['FRONTEND_PORT_VALUE']}/"),
+):
+    with urllib.request.urlopen(url, timeout=15) as response:
+        if response.status >= 400:
+            raise SystemExit(f"{name} returned HTTP {response.status}")
+        print(f"{name}: HTTP {response.status}")
+PY
+
+echo "Full production Compose validation passed."

@@ -1,0 +1,160 @@
+"""Research orchestration is a hook in the sole Worker, not a second consumer."""
+
+from datetime import UTC, datetime
+
+from ..models import TERMINAL
+from ..store import CapacityError, ConflictError
+from .bindings import resolve
+from .contracts import PlanInput
+from .quality_gate import QualityGateRejected, require_quality
+
+
+class WorkflowService:
+    def __init__(self, records, worker, preflight, settings):
+        self.records, self.worker, self.preflight, self.settings = (
+            records,
+            worker,
+            preflight,
+            settings,
+        )
+
+    def active_attempts(self, run):
+        return [a for a in run["attempts"] if a["status"] not in TERMINAL]
+
+    def cancel(self, identifier):
+        return self.records.cancel(identifier)
+
+    def update(self, identifier, state, reason=None, expected=None):
+        return self.records.change(identifier, state, reason, expected or {"running"}, strict=False)
+
+    def enforce_budget(self, run, plan):
+        elapsed = (datetime.now(UTC) - datetime.fromisoformat(run["created_at"])).total_seconds()
+        if elapsed <= plan.budget.wall_seconds:
+            return False
+        try:
+            self.cancel(run["id"])
+        except ConflictError:
+            self.update(
+                run["id"], "blocked", "Wall budget reached; native synchronous call still active."
+            )
+        return True
+
+    async def check_running_budgets(self):
+        for run in self.records.runs({"running"}, limit=100):
+            plan = PlanInput.model_validate(self.records.plan(run["plan_id"])["body"])
+            self.enforce_budget(run, plan)
+
+    async def tick(self):
+        if self.records.store.queue_halt() or self.worker.error:
+            return
+        # Drain legacy partial cancellations before the sole Worker can claim any child.
+        # Completed runs leave this query, so only retained rows advance the offset.
+        offset = 0
+        while cancelling := self.records.runs({"cancelling"}, limit=100, offset=offset):
+            for run in cancelling:
+                run = self.records.cancel(run["id"], recover=True)
+                if not self.active_attempts(run):
+                    run = self.update(run["id"], "cancelled", expected={"cancelling"})
+                offset += run["state"] == "cancelling"
+        for run in self.records.runs({"running"}, limit=100):
+            plan = PlanInput.model_validate(self.records.plan(run["plan_id"])["body"])
+            if self.enforce_budget(run, plan):
+                continue
+            if any(attempt["status"] == "missing" for attempt in run["attempts"]):
+                self.update(
+                    run["id"], "blocked", "A task record is missing. Restore it from backup."
+                )
+                continue
+            latest = {a["step_id"]: a for a in run["attempts"]}
+            try:
+                require_quality(
+                    plan,
+                    latest,
+                    self.records.store,
+                    self.settings,
+                    dependencies={
+                        key for key, value in latest.items() if value["status"] == "succeeded"
+                    },
+                )
+            except QualityGateRejected as exc:
+                self.update(run["id"], "failed", str(exc))
+                continue
+            except (ValueError, OSError, KeyError) as exc:
+                self.update(run["id"], "blocked", str(exc))
+                continue
+            if all(
+                step.id in latest and latest[step.id]["status"] == "succeeded"
+                for step in plan.steps
+            ):
+                self.update(run["id"], "succeeded")
+                continue
+            if plan.failure_policy == "continue_independent" and all(
+                step.id in latest
+                and (
+                    latest[step.id]["status"] == "succeeded"
+                    or latest[step.id]["status"] == "failed"
+                    and latest[step.id]["attempt"] >= step.retries
+                )
+                for step in plan.steps
+            ):
+                self.update(
+                    run["id"],
+                    "failed",
+                    "All independent combinations finished; failed attempts are retained.",
+                )
+                continue
+            for step in plan.steps:
+                previous = latest.get(step.id)
+                if previous:
+                    if previous["status"] not in TERMINAL or previous["status"] == "succeeded":
+                        continue
+                    if previous["status"] != "failed" or previous["attempt"] >= step.retries:
+                        if previous["status"] == "failed" and (
+                            plan.failure_policy == "continue_independent"
+                        ):
+                            continue
+                        self.update(
+                            run["id"], "failed", f"Step {step.id} ended as {previous['status']}."
+                        )
+                        break
+                    previous_job = self.records.store.get(previous["job_id"])
+                    if previous_job and previous_job.finished_at:
+                        delay = (
+                            datetime.now(UTC) - datetime.fromisoformat(previous_job.finished_at)
+                        ).total_seconds()
+                        if delay < step.retry_backoff_seconds * (2 ** previous["attempt"]):
+                            continue
+                if any(
+                    dep not in latest or latest[dep]["status"] != "succeeded"
+                    for dep in step.depends_on
+                ):
+                    continue
+                if len(run["attempts"]) >= plan.budget.max_jobs:
+                    self.update(run["id"], "blocked", "Workflow job budget exhausted.")
+                    break
+                try:
+                    request = resolve(
+                        step, latest, self.records.store, self.worker.outputs, self.settings
+                    )
+                    await self.preflight(request)
+                    self.records.enqueue(
+                        run["id"],
+                        step.id,
+                        request,
+                        self.settings.max_pending,
+                        self.settings.max_jobs,
+                    )
+                except CapacityError:
+                    # Existing queue limits apply. No retry or new task while capacity is full.
+                    break
+                except Exception as exc:
+                    from fastapi import HTTPException
+
+                    if isinstance(exc, HTTPException):
+                        reason = str(exc.detail)
+                    elif isinstance(exc, (ValueError, KeyError, OSError, ConflictError)):
+                        reason = str(exc)
+                    else:
+                        raise
+                    self.update(run["id"], "blocked", reason)
+                break

@@ -1,0 +1,27 @@
+# Root config. Each block below is composed from its own config group.
+# Usage: python3 train.py run=<preset>   (presets live in configs/run/)
+defaults:
+  - data@data_cfg: rna3db
+  - interpolant: default
+  - model: ipa_6blocks
+  - training@experiment.training: default
+  - validation@experiment.validation: default
+  - trainer@experiment.trainer: ddp
+  - wandb@experiment.wandb: default
+  - checkpointer@experiment.checkpointer: default
+  - _self_
+  - run: null # optional preset, applied last so it overrides everything above
+
+experiment:
+  seed: 42
+  finetune: False
+  warm_start: null
+  warm_start_cfg_override: True
+  use_swa: False
+  batch_ot:
+    enabled: True
+    cost: kabsch
+    noise_per_sample: 1
+    permute: False
+  optimizer:
+    lr: 0.0001

@@ -1,0 +1,746 @@
+"""Pure interpretation of original observations against standard site chemistry."""
+
+from collections import Counter
+from dataclasses import dataclass, replace
+
+from protrepair.chemistry.component.defaults import build_default_component_library
+from protrepair.chemistry.component.graph import BondDefinition
+from protrepair.chemistry.component.semantics import IdealGeometryHeavyAtomSemantics
+from protrepair.chemistry.component.template import ResidueTemplate
+from protrepair.chemistry.microstate.catalog import (
+    PeptideLinkage,
+    PolymerChemicalSite,
+    standard_microstate_candidates,
+)
+from protrepair.chemistry.microstate.graph import MicrostateGraph
+from protrepair.chemistry.microstate.resolution import (
+    AppliedMicrostateChoice,
+    HydrogenAttachmentBasis,
+    MicrostateConstraints,
+    MicrostateResolution,
+    MicrostateResolutionStatus,
+    MicrostateSelectionBasis,
+    MicrostateSite,
+    ObservedHydrogenAttachment,
+)
+from protrepair.structure.constitution import (
+    AtomSite,
+    ResidueSite,
+    StructureConstitution,
+)
+from protrepair.structure.labels import AtomRef, ResidueId
+from protrepair.structure.observation import StructureObservation
+from protrepair.structure.topology import BondRelationshipType, TopologyBond
+
+_HISTIDINE_COORDINATION_METALS = frozenset(
+    {"FE", "ZN", "CU", "CO", "NI", "MN", "CD", "HG", "CA"}
+)
+_STANDARD_OXYGEN_COORDINATION_METALS = frozenset(
+    {"MG", "CA", "FE", "ZN", "CU", "CO", "NI", "MN", "CD", "HG"}
+)
+_CYSTEINE_COORDINATION_METALS = frozenset(
+    {"FE", "ZN", "CU", "CO", "NI", "MN", "CD", "HG"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PolymerMicrostateSite:
+    """Interpret original evidence for one standard chemical site.
+
+    Parameters
+    ----------
+    template : ResidueTemplate
+        Active template. Custom chemistry/semantics are refused, not replaced by
+        a standard graph just because the component has a familiar name.
+    kind : PolymerChemicalSite
+        Independent side-chain or terminal decision unit.
+    linkage : PeptideLinkage
+        Caller-established backbone linkage. Must be UNKNOWN for a side chain.
+    free_terminal_assumption : bool
+        Mark FREE supplied as a preparation assumption rather than established
+        chemical context. Only allowed for a free backbone site; it neither
+        becomes source evidence nor overrides contrary source chemistry.
+
+    Notes
+    -----
+    This resolver neither mutates a structure nor selects a physiological pH.
+    Callers must bind current linkage or mark a preparation assumption, and
+    rebind after chemical edits. Original observations cannot describe newly
+    introduced crosslinks.
+
+    Raises
+    ------
+    TypeError
+        Site, linkage or assumption has a noncanonical type.
+    ValueError
+        A backbone linkage is supplied for a side-chain site, or a free-terminal
+        assumption is attached to a site that is not FREE.
+    """
+
+    template: ResidueTemplate
+    kind: PolymerChemicalSite
+    linkage: PeptideLinkage = PeptideLinkage.UNKNOWN
+    free_terminal_assumption: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, PolymerChemicalSite) or not isinstance(
+            self.linkage, PeptideLinkage
+        ):
+            raise TypeError("site and linkage must be canonical enum members")
+        if type(self.free_terminal_assumption) is not bool:
+            raise TypeError("free-terminal assumption must be a boolean")
+        if (
+            self.kind is PolymerChemicalSite.SIDECHAIN
+            and self.linkage is not PeptideLinkage.UNKNOWN
+        ):
+            raise ValueError("side-chain sites do not have a backbone linkage")
+        if self.free_terminal_assumption and self.linkage is not PeptideLinkage.FREE:
+            raise ValueError(
+                "a free-terminal assumption requires FREE backbone linkage"
+            )
+
+    def resolve(
+        self,
+        residue: ResidueSite,
+        observation: StructureObservation | None,
+        *,
+        override: MicrostateConstraints | None = None,
+        applied_choice: AppliedMicrostateChoice | None = None,
+        preferences: tuple[MicrostateConstraints, ...] = (),
+        requirements: MicrostateConstraints | None = None,
+    ) -> MicrostateResolution:
+        """Resolve chemistry without treating generated atoms as source evidence.
+
+        Parameters
+        ----------
+        residue : ResidueSite
+            Current scaffold with canonical heavy-atom names.
+        observation : StructureObservation or None
+            Original selected input. None is unavailable, not neutral chemistry.
+        override : MicrostateConstraints or None
+            Explicit site-scoped authority to supersede interpretable source facts.
+        applied_choice : AppliedMicrostateChoice or None
+            Previously applied choice. Defaults remain source-compatible
+            preferences, never overrides. Reused only for the same component,
+            site atoms and boundary valence. Stale defaults are reconsidered;
+            stale overrides are refused. A new override takes precedence.
+            Current boundary endpoints still require validation by the caller.
+        preferences : tuple[MicrostateConstraints, ...]
+            Ordered preferences among source-compatible candidates only.
+
+        requirements : MicrostateConstraints or None
+            Physical donor constraints bound by the current snapshot. Original
+            coordination is enforced separately; overrides cannot bypass either.
+
+        Returns
+        -------
+        MicrostateResolution
+            Coupled graph, ambiguity, conflict, or explicit inapplicability.
+            Missing site or boundary atoms and uninterpretable H attachments are
+            insufficient even with an override. Backbone sites do not require
+            completion of an unrelated side chain.
+
+        Raises
+        ------
+        ValueError
+            An otherwise applicable resolution receives an empty override.
+        """
+        library = build_default_component_library()
+        stock = library.get(self.template.component_id)
+        if (
+            stock is None
+            or stock != self.template
+            or library.normalize_component_id(residue.component_id)
+            != stock.component_id
+        ):
+            return MicrostateResolution(
+                MicrostateResolutionStatus.UNSUPPORTED,
+                details=("custom or mismatched component chemistry",),
+            )
+        if (
+            self.kind is not PolymerChemicalSite.SIDECHAIN
+            and self.linkage is PeptideLinkage.UNKNOWN
+        ):
+            return MicrostateResolution(
+                MicrostateResolutionStatus.INSUFFICIENT,
+                details=("backbone linkage is unknown",),
+            )
+        site = self.candidates()
+        if site is None:
+            return MicrostateResolution(
+                MicrostateResolutionStatus.UNSUPPORTED,
+                details=("no supported standard site catalog",),
+            )
+
+        reference = site.candidates[0]
+        if override is None and applied_choice is not None:
+            if not applied_choice.matches_site(
+                residue.residue_id, residue.component_id, reference
+            ):
+                if applied_choice.basis is MicrostateSelectionBasis.OVERRIDE:
+                    return MicrostateResolution(
+                        MicrostateResolutionStatus.UNSUPPORTED,
+                        details=("applied choice no longer matches the chemical site",),
+                    )
+            elif applied_choice.basis is MicrostateSelectionBasis.OVERRIDE:
+                override = applied_choice.constraints()
+            else:
+                preferences = (applied_choice.constraints(), *preferences)
+        required = {atom.name for atom in reference.atoms}
+        heavy_names = set(stock.expected_polymer_heavy_atom_names())
+        if self.kind is PolymerChemicalSite.SIDECHAIN:
+            required.update(heavy_names)
+        else:
+            site_names = set(required)
+            required.update(
+                name
+                for bond in stock.definition.bonds
+                if {bond.atom_name_1, bond.atom_name_2} & site_names
+                for name in (bond.atom_name_1, bond.atom_name_2)
+                if name in heavy_names
+            )
+        missing = required - set(residue.atom_site_names())
+        if missing:
+            return MicrostateResolution(
+                MicrostateResolutionStatus.INSUFFICIENT,
+                details=(f"missing heavy atoms: {', '.join(sorted(missing))}",),
+            )
+        if not self._scaffold_matches_template(residue):
+            return MicrostateResolution(
+                MicrostateResolutionStatus.UNSUPPORTED,
+                details=("current heavy scaffold differs from standard chemistry",),
+            )
+        if (
+            self.kind is PolymerChemicalSite.BACKBONE_C
+            and self.linkage is PeptideLinkage.LINKED
+            and residue.has_atom_site("OXT")
+        ):
+            return MicrostateResolution(
+                MicrostateResolutionStatus.UNSUPPORTED,
+                details=("linked backbone C also has a terminal oxygen",),
+            )
+        if any(
+            residue.atom_site(atom.name).element != atom.element
+            for atom in reference.atoms
+        ):
+            return MicrostateResolution(
+                MicrostateResolutionStatus.UNSUPPORTED,
+                details=("site atom elements disagree with standard chemistry",),
+            )
+
+        evidence = self._source_evidence(residue, observation, reference)
+        if isinstance(evidence, MicrostateResolution):
+            return evidence
+        constraints, attachments, details = evidence
+        if observation is not None:
+            try:
+                original_requirements = self.coordination_requirements(
+                    residue.residue_id,
+                    observation.constitution,
+                    observation.bonds_for_residue(residue.residue_id),
+                )
+            except ValueError as error:
+                return MicrostateResolution(
+                    MicrostateResolutionStatus.UNSUPPORTED, details=(str(error),)
+                )
+            if not original_requirements.is_empty():
+                feasible = tuple(
+                    graph
+                    for graph in site.candidates
+                    if original_requirements.violations(graph).is_empty()
+                )
+                if not feasible:
+                    return MicrostateResolution(
+                        MicrostateResolutionStatus.UNSUPPORTED,
+                        details=("coordination is outside the standard site catalog",),
+                    )
+                site = MicrostateSite(feasible)
+        if self.free_terminal_assumption:
+            details = (*details, "free-terminal linkage is a preparation assumption")
+        resolution = site.resolve(
+            constraints,
+            override=override,
+            preferences=preferences,
+            requirements=requirements,
+        )
+        return replace(
+            resolution,
+            details=(*resolution.details, *details),
+            observed_hydrogens=attachments,
+        )
+
+    def coordination_requirements(
+        self,
+        residue_id: ResidueId,
+        constitution: StructureConstitution,
+        bonds: tuple[TopologyBond, ...],
+    ) -> MicrostateConstraints:
+        """Validate standard donors without assigning metal or acid protonation.
+
+        Parameters
+        ----------
+        residue_id : ResidueId
+            Standard polymer site identity in the supplied address space.
+        constitution : StructureConstitution
+            Atom identities used to interpret incident physical relationships.
+        bonds : tuple[TopologyBond, ...]
+            Incident edges for this residue, in that address space.
+
+        Returns
+        -------
+        MicrostateConstraints
+            Zero H at one supported HIS ring-N donor. Validated ASP/GLU O and
+            linked peptide carbonyl O and a single CYS SG donor add no H or
+            charge requirements. Empty also covers no site coordination.
+            Coordinate edges do not contribute covalent boundary valence.
+
+        Raises
+        ------
+        ValueError
+            Coordination touches an unsupported site, partner or donor motif.
+
+        Notes
+        -----
+        O donors admit MG/CA/FE/ZN/CU/CO/NI/MN/CD/HG, including bidentate and
+        bridging carboxyl groups. Their acid/anion state remains subject to the
+        catalog and source evidence, not inferred from coordination. HIS retains
+        its single ring-N donor and FE/ZN/CU/CO/NI/MN/CD/HG/CA partner grammar.
+        CYS admits one SG donor to FE/ZN/CU/CO/NI/MN/CD/HG; neutral thiol and
+        thiolate remain separate source-compatible candidates.
+        Neither grammar establishes metal charge, oxidation, pKa or FF support.
+        """
+        coordinate_bonds = tuple(
+            bond
+            for bond in bonds
+            if bond.relationship_type is BondRelationshipType.METAL_COORDINATION
+        )
+        if not coordinate_bonds:
+            return MicrostateConstraints()
+        catalog = self.candidates()
+        names = (
+            set()
+            if catalog is None
+            else {atom.name for atom in catalog.candidates[0].atoms}
+        )
+        histidine = (
+            self.kind is PolymerChemicalSite.SIDECHAIN
+            and self.template.component_id == "HIS"
+        )
+        cysteine = (
+            self.kind is PolymerChemicalSite.SIDECHAIN
+            and self.template.component_id == "CYS"
+        )
+        if histidine:
+            donor_names = {"ND1", "NE2"}
+            donor_element = "N"
+            partner_elements = _HISTIDINE_COORDINATION_METALS
+        elif cysteine:
+            donor_names = {"SG"}
+            donor_element = "S"
+            partner_elements = _CYSTEINE_COORDINATION_METALS
+        elif self.kind is PolymerChemicalSite.SIDECHAIN and (
+            self.template.component_id in {"ASP", "GLU"}
+        ):
+            donor_names = (
+                {"OD1", "OD2"}
+                if self.template.component_id == "ASP"
+                else {"OE1", "OE2"}
+            )
+            donor_element = "O"
+            partner_elements = _STANDARD_OXYGEN_COORDINATION_METALS
+        elif (
+            self.kind is PolymerChemicalSite.BACKBONE_C
+            and self.linkage is PeptideLinkage.LINKED
+        ):
+            donor_names = {"O"}
+            donor_element = "O"
+            partner_elements = _STANDARD_OXYGEN_COORDINATION_METALS
+        else:
+            donor_names = set()
+            donor_element = ""
+            partner_elements = frozenset()
+
+        if donor_names:
+            heavy_names = set(self.template.expected_heavy_atom_names())
+            boundary_names = {
+                name
+                for bond in self.template.definition.bonds
+                if (bond.atom_name_1 in names) != (bond.atom_name_2 in names)
+                for name in (bond.atom_name_1, bond.atom_name_2)
+                if name in heavy_names
+                and (
+                    name != "OXT"
+                    or self.kind is not PolymerChemicalSite.BACKBONE_C
+                    or self.linkage is not PeptideLinkage.LINKED
+                )
+            }
+            names.update(boundary_names)
+        donors: set[str] = set()
+        for bond in coordinate_bonds:
+            first, second = (
+                constitution.atom_ref_at(index) for index in bond.endpoint_pair()
+            )
+            inside = tuple(
+                ref
+                for ref in (first, second)
+                if ref.residue_id == residue_id and ref.atom_name in names
+            )
+            if not inside:
+                continue
+            donor = inside[0]
+            partner = second if donor == first else first
+            donor_atom = constitution.resolve_atom_site(donor)
+            partner_atom = constitution.resolve_atom_site(partner)
+            if (
+                len(inside) != 1
+                or donor.atom_name not in donor_names
+                or donor_atom is None
+                or donor_atom.element != donor_element
+                or partner.residue_id == residue_id
+                or partner_atom is None
+                or partner_atom.element_identity.chemical_symbol not in partner_elements
+                or bond.order is not None
+                or bond.aromatic
+                or ((histidine or cysteine) and donor.atom_name in donors)
+            ):
+                raise ValueError("unsupported standard-site coordination boundary")
+            donors.add(donor.atom_name)
+        if histidine and len(donors) > 1:
+            raise ValueError(
+                "multiple histidine ring donors require unsupported chemistry"
+            )
+        return MicrostateConstraints(
+            hydrogens=tuple((name, 0) for name in donors) if histidine else ()
+        )
+
+    def _source_evidence(
+        self,
+        residue: ResidueSite,
+        observation: StructureObservation | None,
+        graph: MicrostateGraph,
+    ) -> (
+        tuple[
+            MicrostateConstraints,
+            tuple[ObservedHydrogenAttachment, ...],
+            tuple[str, ...],
+        ]
+        | MicrostateResolution
+    ):
+        if observation is None:
+            return MicrostateConstraints(), (), ("original observation unavailable",)
+        source = observation.constitution.residue_or_ligand(residue.residue_id)
+        if source is None:
+            return (
+                MicrostateConstraints(),
+                (),
+                ("residue absent from original observation",),
+            )
+        # Aliases are not all chemically equivalent: HSD/HSE/HSP carry conventions
+        # not represented by the current generic HIS template. Do not erase them.
+        if source.component_id != self.template.component_id:
+            return MicrostateResolution(
+                MicrostateResolutionStatus.UNSUPPORTED,
+                details=(
+                    "source component alias or identity needs explicit reconciliation",
+                ),
+            )
+        if not self._scaffold_matches_template(source):
+            return MicrostateResolution(
+                MicrostateResolutionStatus.UNSUPPORTED,
+                details=("original heavy scaffold differs from standard chemistry",),
+            )
+        if any(
+            source.has_atom_site(atom.name)
+            and source.atom_site(atom.name).element != atom.element
+            for atom in graph.atoms
+        ):
+            return MicrostateResolution(
+                MicrostateResolutionStatus.UNSUPPORTED,
+                details=("source atom elements disagree with the site",),
+            )
+
+        names = {atom.name for atom in graph.atoms}
+        refs = {AtomRef(residue.residue_id, name) for name in names}
+        charges = tuple(
+            (name, charge)
+            for name in sorted(names)
+            if (charge := observation.formal_charge(AtomRef(residue.residue_id, name)))
+            is not None
+        )
+        orders: list[BondDefinition] = []
+        hydrogen_neighbors: dict[AtomRef, list[AtomRef]] = {}
+        untyped_hydrogen_neighbors: dict[AtomRef, list[AtomRef]] = {}
+        attachments: list[ObservedHydrogenAttachment] = []
+        external_peptide_partners: set[AtomRef] = set()
+        for bond in observation.bonds_for_residue(residue.residue_id):
+            first = observation.constitution.atom_ref_at(bond.atom_index_1)
+            second = observation.constitution.atom_ref_at(bond.atom_index_2)
+            for atom_ref, other_ref in ((first, second), (second, first)):
+                if (
+                    atom_ref.residue_id == residue.residue_id
+                    and observation.constitution.atom_site_at(
+                        bond.atom_index_1 if atom_ref == first else bond.atom_index_2
+                    ).is_hydrogen()
+                ):
+                    if bond.relationship_type is BondRelationshipType.COVALENT:
+                        hydrogen_neighbors.setdefault(atom_ref, []).append(other_ref)
+                    elif bond.relationship_type is BondRelationshipType.UNKNOWN:
+                        untyped_hydrogen_neighbors.setdefault(atom_ref, []).append(
+                            other_ref
+                        )
+            if not ({first, second} & refs):
+                continue
+            first_atom = observation.constitution.atom_site_at(bond.atom_index_1)
+            second_atom = observation.constitution.atom_site_at(bond.atom_index_2)
+            if first_atom.is_hydrogen() or second_atom.is_hydrogen():
+                hydrogen_ref = first if first_atom.is_hydrogen() else second
+                if (
+                    hydrogen_ref.residue_id != residue.residue_id
+                    and bond.relationship_type
+                    in (
+                        BondRelationshipType.COVALENT,
+                        BondRelationshipType.UNKNOWN,
+                    )
+                ):
+                    return MicrostateResolution(
+                        MicrostateResolutionStatus.UNSUPPORTED,
+                        details=(
+                            "external source H attachment requires reconciliation",
+                        ),
+                    )
+                if (
+                    bond.relationship_type is BondRelationshipType.COVALENT
+                    and bond.order not in (None, 1)
+                ):
+                    return MicrostateResolution(
+                        MicrostateResolutionStatus.CONFLICT,
+                        details=("non-single source hydrogen bond order",),
+                    )
+                continue
+            if bond.relationship_type in (
+                BondRelationshipType.HYDROGEN_BOND,
+                BondRelationshipType.METAL_COORDINATION,
+            ):
+                continue
+            if bond.relationship_type not in (
+                BondRelationshipType.COVALENT,
+                BondRelationshipType.UNKNOWN,
+            ):
+                return MicrostateResolution(
+                    MicrostateResolutionStatus.UNSUPPORTED,
+                    details=("site participates in unsupported source relationship",),
+                )
+            if first in refs and second in refs:
+                if graph.bond_order(first.atom_name, second.atom_name) is None:
+                    return MicrostateResolution(
+                        MicrostateResolutionStatus.UNSUPPORTED,
+                        details=("source changes the standard site skeleton",),
+                    )
+                if bond.order is not None:
+                    orders.append(
+                        BondDefinition(
+                            first.atom_name, second.atom_name, order=bond.order
+                        )
+                    )
+                continue
+            inside, outside = (first, second) if first in refs else (second, first)
+            if outside.residue_id == residue.residue_id:
+                expected = next(
+                    (
+                        b
+                        for b in self.template.definition.bonds
+                        if {b.atom_name_1, b.atom_name_2}
+                        == {inside.atom_name, outside.atom_name}
+                    ),
+                    None,
+                )
+                allowed = expected is not None and bond.order in (None, expected.order)
+                if (
+                    self.kind is PolymerChemicalSite.BACKBONE_C
+                    and outside.atom_name == "OXT"
+                ):
+                    allowed = False
+            else:
+                expected_names = (
+                    ("N", "C")
+                    if self.kind is PolymerChemicalSite.BACKBONE_N
+                    else ("C", "N")
+                )
+                allowed = (
+                    self.kind is not PolymerChemicalSite.SIDECHAIN
+                    and self.linkage is PeptideLinkage.LINKED
+                    and (inside.atom_name, outside.atom_name) == expected_names
+                    and bond.order in (None, 1)
+                )
+                if allowed:
+                    external_peptide_partners.add(outside)
+            if not allowed or len(external_peptide_partners) > 1:
+                return MicrostateResolution(
+                    MicrostateResolutionStatus.UNSUPPORTED,
+                    details=("source external bonds disagree with site boundary",),
+                )
+
+        hydrogens: Counter[str] = Counter()
+        anchors = self.named_hydrogen_parents(source)
+        for hydrogen in observation.hydrogen_atoms(residue.residue_id):
+            parents = hydrogen_neighbors.get(hydrogen, [])
+            if len(parents) > 1:
+                return MicrostateResolution(
+                    MicrostateResolutionStatus.CONFLICT,
+                    details=("source H has multiple covalent parents",),
+                )
+            if parents:
+                parent = parents[0]
+                parent_atom = observation.constitution.resolve_atom_site(parent)
+                if (
+                    parent.residue_id != residue.residue_id
+                    or parent_atom is None
+                    or parent_atom.is_hydrogen()
+                ):
+                    return MicrostateResolution(
+                        MicrostateResolutionStatus.UNSUPPORTED,
+                        details=("source H parent is not a local heavy atom",),
+                    )
+                basis = HydrogenAttachmentBasis.SOURCE_COVALENT
+            else:
+                name = anchors.get(hydrogen.atom_name)
+                if name is None:
+                    return MicrostateResolution(
+                        MicrostateResolutionStatus.INSUFFICIENT,
+                        details=(
+                            f"unresolved source H attachment: {hydrogen.atom_name}",
+                        ),
+                    )
+                parent = AtomRef(residue.residue_id, name)
+                basis = HydrogenAttachmentBasis.STANDARD_NAME
+            if any(
+                neighbor != parent
+                for neighbor in untyped_hydrogen_neighbors.get(hydrogen, ())
+            ):
+                return MicrostateResolution(
+                    MicrostateResolutionStatus.INSUFFICIENT,
+                    details=(
+                        "untyped H connectivity disagrees with interpreted attachment",
+                    ),
+                )
+            if parent not in refs:
+                continue
+            if observation.formal_charge(hydrogen) not in (None, 0):
+                return MicrostateResolution(
+                    MicrostateResolutionStatus.UNSUPPORTED,
+                    details=("charged source H is outside the closed-shell catalog",),
+                )
+            hydrogens[parent.atom_name] += 1
+            attachments.append(ObservedHydrogenAttachment(hydrogen, parent, basis))
+        return (
+            MicrostateConstraints(
+                charges=charges,
+                minimum_hydrogens=tuple(hydrogens.items()),
+                bonds=tuple(orders),
+            ),
+            tuple(attachments),
+            (),
+        )
+
+    def _scaffold_matches_template(self, residue: ResidueSite) -> bool:
+        expected = set(self.template.expected_atom_names()) | {"OXT"}
+        semantics = self.template.heavy_atom_semantics
+        reference = self.template.reference_component
+        elements = (
+            {atom.atom_name: atom.element for atom in reference.atoms}
+            if reference is not None
+            else {atom.atom_name: atom.element for atom in semantics.component.atoms}
+            if isinstance(semantics, IdealGeometryHeavyAtomSemantics)
+            else {}
+        )
+        return all(
+            atom.element == elements.get(atom.name, atom.name[0])
+            if atom.name in expected
+            else atom.is_hydrogen()
+            for atom in residue.atom_sites
+        )
+
+    def candidates(self) -> MicrostateSite | None:
+        """Project supported backbone family or exact side-chain catalog.
+
+        Returns
+        -------
+        MicrostateSite or None
+            Backbone graphs may serve bundled peptide-like modifications. The
+            resolver still checks the complete active template against the bundle;
+            a custom family label alone never authorizes stock chemistry.
+        """
+        return standard_microstate_candidates(
+            self.template.component_id
+            if self.kind is PolymerChemicalSite.SIDECHAIN
+            else self.template.backbone_family_component_id,
+            self.kind,
+            self.linkage,
+        )
+
+    def named_hydrogen_parents(self, residue: ResidueSite) -> dict[str, str]:
+        """Interpret standard H names without asserting actual connectivity.
+
+        Parameters
+        ----------
+        residue : ResidueSite
+            Original or current residue carrying H/D/T identities.
+
+        Returns
+        -------
+        dict[str, str]
+            Recognized H names and heavy parents, including terminal and isotope
+            aliases. Unrecognized names are omitted, not guessed geometrically.
+            Actual bonds must be checked separately by the consumer.
+        """
+        names = {}
+        for atom in residue.atom_sites:
+            if not atom.is_hydrogen():
+                continue
+            names[atom.name] = self.hydrogen_slot_name(atom)
+        aliases = self.template.polymer_hydrogen_parent_aliases()
+        return {
+            name: aliases[canonical]
+            for name, canonical in names.items()
+            if canonical in aliases
+        }
+
+    @staticmethod
+    def hydrogen_slot_name(atom: AtomSite) -> str:
+        """Return the polymer name with its isotope prefix removed, if present."""
+        name = atom.name
+        position = 1 if name[0].isdigit() else 0
+        if atom.element in {"D", "T"} and name[position : position + 1] == atom.element:
+            return name[:position] + "H" + name[position + 1 :]
+        return name
+
+    def hydrogen_name_candidates(self, parent_name: str) -> tuple[str, ...]:
+        """Return preferred new H names, without selecting a protonation state.
+
+        Parameters
+        ----------
+        parent_name : str
+            Canonical site heavy-atom name.
+
+        Returns
+        -------
+        tuple[str, ...]
+            Template names followed by supported microstate-specific names.
+            Existing and original identities take precedence in the context.
+        """
+        if parent_name == "N":
+            return (
+                ("H",) if self.linkage is PeptideLinkage.LINKED else ("H1", "H2", "H3")
+            )
+        template_names = self.template.expected_polymer_hydrogen_atom_names()
+        anchors = self.template.template_hydrogen_anchor_by_name(template_names)
+        names = [name for name in template_names if anchors.get(name) == parent_name]
+        extra = {
+            "HIS": {"ND1": "HD1", "NE2": "HE2"},
+            "ASP": {"OD1": "HD1", "OD2": "HD2"},
+            "GLU": {"OE1": "HE1", "OE2": "HE2"},
+        }.get(self.template.component_id, {})
+        extra.update({"O": "HO", "OXT": "HXT"})
+        if parent_name in extra and extra[parent_name] not in names:
+            names.append(extra[parent_name])
+        return tuple(names)

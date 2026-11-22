@@ -1,0 +1,111 @@
+---
+summary: Keep controlled Viewer artifacts outside the scientific source checkout.
+issue: uibcdf/molsysmt#669
+status: resolved
+opened: 2026-11-09
+closed: 2026-11-09
+severity: medium
+verification: reproduced
+area: [ci, provenance, viewer]
+guard: devtools/tests/test_execute_scientific_evidence.py::test_controlled_viewer_wheel_preserves_clean_source_certificate
+normative:
+blocked_by: []
+supersedes: []
+---
+
+# Controlled wheel dirties the scientific checkout
+
+**Status:** source correction independently received and integrated by the
+owner. The corrected artifact mechanism is closed; the original failed matrix
+and next exact-candidate hosted receiving remain separate requirements. No
+source-cleanliness rule is relaxed.
+
+## What
+
+Full CI downloads the controlled Viewer wheel under `controlled-wheelhouse/`
+inside the checked-out source. Seven emitted certificates in run 42659643113
+report 107/107 scientific cases passing but refuse release eligibility because
+that file is untracked. This is an artifact-placement failure, not evidence of
+incorrect scientific results or a defect in the certificate's clean-source rule.
+
+## How
+
+The independently verified original Linux/Python 3.14 artifact is 13694390542,
+ZIP SHA-256 `98829f7874b074c426fcfd9f56e62f5c109daf5ef086bdef8b312a0ecb866c53`.
+Its before/after states retain commit `da08fb1e4518d7334f07dbac9f1263d3b717d814`,
+clean tracked source and the same unknown wheel path. The public failure and
+remaining matrix dispositions are attached to the owning issue.
+
+The regression uses the actual workflow's build/download/install/upload paths,
+an independent real Git commit and the actual certificate. Before correction
+it gives one failure/one pass: the declared workflow placement fails, while a
+deliberately untracked wheel is correctly refused. The correction places all
+wheel paths under runner temporary storage and preserves shell quoting. The
+test also expands the actual install pattern in Bash with spaces in the runner
+directory, proving it still supplies one artifact argument. The refusal control
+continues to put a wheel inside source; no allowlist or ignore is broadened.
+
+The cancelled macOS/Python 3.14 job 129307576249 has runner_id=0, no runner name
+and no steps. Its 45-minute elapsed interval is queued time, not an observed
+test timeout. No scientific certificate exists for that unexecuted cell.
+
+The corrected affected collection passes 160 cases with fixed inputs, including
+the complete certificate tests and required addon/dependency preflights. An
+intermediate attempt retains nine failures/151 passes: the first quoting layout
+was not recognized by the existing static route audit and did not match the
+new test's raw-pattern selector. Canonical quoting of the dynamic temporary
+root fixes both while real Bash expansion still preserves spaces. These are
+prepared-route failures, not additional scientific defects or waived checks.
+
+## Why
+
+A dependency artifact is not scientific source. Keep acquisition products
+outside checkout while retaining strict source identity, exact Viewer pins,
+one portable wheel, zero-skip evidence and the complete native matrix. The
+existing smoke command also receives the certificate regression module.
+
+Scoped local receiving and failed originals belong to the consumer's private
+packet under uibcdf/molsysviewer#315. The source fix does not authorize packages,
+tags, promotions, release claims or treating the incomplete matrix as passing.
+
+
+## Owner receiving — 2026-11-09
+
+The owner receives PR #668's full contribution at merge 3dfe27ab6, retaining its
+original authors/commits and failed CI evidence. The same 66-case source selection
+on new immutable Viewer 346c3319 first gives 65 passes/one #670 fixture failure;
+after the minimal schema declaration it passes all 66 on 3fe645437. The actual
+workflow-path/real-Git guards, path-with-spaces shell expansion, strict deliberate
+inside-checkout refusal, configuration contexts and provisional descriptor
+contracts all pass. No cleanliness allowlist, engine or scientific threshold
+changes. The owner retains the downloaded Linux JUnit ZIP and verified digest.
+
+The corrected hosted run 42689572908 has concluded failure, rather than the
+contribution's earlier pending snapshot: seven cells fail their full suite and
+macOS/Python 3.12 fails provisioning. Native logs and Linux JUnit independently
+identify #670 and #671. Neither reopens the original artifact-placement mechanism;
+original failures stay failed and a new exact-candidate matrix remains due.
+Owner clean-source scientific and broader regression receiving follow before
+this bug's bounded closeout. No new remote matrix is launched.
+
+
+## Resolution — 2026-11-09
+
+Clean source c37e42510 / immutable Viewer 346c3319 passes all 5,711 addon and
+selected preflight cases, 251 affected mechanics/projection/force controls and
+all 107 registered scientific cases (68 nodes, no skips). The strict clean
+scientific certificate records source correspondence; it is not release
+authorization. Fourteen fast gates pass. Original native refusal/assertion
+semantics are preserved, including malformed report rejection and deliberate
+inside-checkout artifact refusal.
+
+Actual Jupyter receives all ten Chemistry and twenty Analysis checks on the
+new host. Missing local Playwright/harness preparation attempts are retained;
+the existing tools and generated harness resolve those setup failures without
+source/assertion/deadline changes. Original hosted failures stay failed. #671
+provisioning and the required exact-candidate full matrix remain pending.
+
+See the [bounded receiving record](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/pre1_ci_and_mechanics_receiving_669_670_582_20261109.json)
+for exact source/backend identities, input hashes, failed originals, execution
+scopes, resource limits, notebook preservation and limitations. The front-matter
+guard protects the actual original mechanism rather than a weaker output shape.

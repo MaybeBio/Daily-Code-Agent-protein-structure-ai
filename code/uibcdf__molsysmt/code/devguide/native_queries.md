@@ -1,0 +1,216 @@
+# Native query contract
+
+**Role:** normative implementation and public-contract guidance.
+**Tracking:** uibcdf/molsysmt#128; boundary repair uibcdf/molsysmt#391;
+nullable selected counts uibcdf/molsysmt#392.
+
+## Public entry points
+
+Resident `MolSys`, `Topology`, `Structures`, `ChemicalStates`, `Interactions`
+and `MolSysBuilder` inherit `get()` and `info()` from
+`molsysmt/native/queries.py`. These methods use the basic-tool attribute
+catalogue, argument semantics, quantity policy and output assembly.
+
+The receiver supplies the free functions' `molecular_system` argument. Preserve
+the existing MolSys/Builder positional order:
+
+```python
+get(element='system', selection='all', structure_indices='all', mask=None,
+    syntax='MolSysMT', get_missing_bonds=True, output_type='values',
+    skip_digestion=False, *, chemical_state='reference', **kwargs)
+
+info(element='system', selection='all', syntax='MolSysMT', skip_digestion=False,
+     *, mask=None, structure_indices='all', output_type='styler')
+```
+
+Using named options gives the same experience as `basic.get`/`basic.info`.
+Unlike the free functions, `chemical_state` in native `get` and
+`structure_indices`/`output_type` in native `info` are keyword-only. Do not
+reinterpret old positional syntax/skip arguments as structure/output options.
+
+`get` delivers one value, an ordered list of values or a requested attribute
+dictionary. `info` delivers a Styler by default, a DataFrame or dictionary
+records. Unsupported/absent attributes follow the basic query contract; no
+additional hierarchy or chemical assignment is invented. A partial MolSys
+does not require topology for a system summary.
+
+## Validation ownership
+
+Each native public method has an ArgDigest boundary and SMonitor signal. The
+native decorator's local registry reuses existing value digesters with their
+basic query semantic context. It does not copy their rules or weaken their
+attribute-flag validation. Alias tables share the plain declaration provider
+behind `get_argument_aliases()` and keyword admission reuses the canonical
+attribute domain. Declaration bootstrap reads the shared internal catalog
+without importing decorated public helpers: loading a normalization module
+first must not cache a partially initialized alias registry. Public catalog
+paths retain the same mutable collections and builder entry point; no second
+attribute store, consumer preload or registry-clear workaround is introduced.
+
+Native wildcard registrations belong only to those methods' decorator plans;
+they do not broaden other APIs' aliases or keyword domains. Inherited native
+methods retain their contract under a subclass's runtime caller. The native
+MolSys, Topology and ChemicalStates constructors declare their value context
+through `native_constructor`, so inherited constructors retain their existing
+count rules even in another module. That decorator context is not an admitted
+public argument and does not bypass digestion. It does not change ArgDigest's
+normalization or function-contract lookup. ArgDigest 0.17.0 provides explicit
+contract ownership under
+[uibcdf/argdigest#37](https://github.com/uibcdf/argdigest/issues/37).
+MolSysMT retains its current context and dependency floor: fixing an owner also
+changes alias, standardizer and function/domain lookup, and some assembled
+mixins deliberately need runtime ownership. The
+[consumer receiving study](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/archive/resolved_proposals/argdigest_0_17_receiving.md)
+records the tested alternatives and completed clean installed public 0.17.1
+receiving under uibcdf/molsysmt#428. No global definition-owner policy is enabled.
+
+Private execution/provider helpers are undecorated. Trusted provider calls
+receive normalized options, selected indices validated against the available
+axis and catalogued attribute flags. `skip_digestion=True` remains reserved for
+values already satisfying that complete callee contract. No value-passport or
+permanently validated mutable-object state is introduced.
+
+Scalar mechanics attribute requests are Boolean flags, not physical parameter
+values. True reads the stored setting, False omits it and an absent setting
+returns None. Stored Boolean settings are still returned as data. Native MolSys
+and basic queries share this rule through the existing value-contract registry.
+Reading does not supply engine defaults, certify support or credit execution.
+
+## Shared execution
+
+`basic.get._get` and `basic.info._info` contain shared internal execution and
+table assembly. The general public functions supply universal discovery,
+complementary-form search and conversion pipes. Native methods supply a known
+single-domain provider instead:
+
+- Resolve the adapter for the known native class without `get_form`.
+- Use that adapter's existing attribute availability and specific getters;
+  avoid general `where_is_attribute` searches and conversion pipes.
+- Validate explicit axes with the shared index validators and native counts.
+- Reuse attribute grouping, derivations, ID/scalar normalization and quantity
+  standardization from the common executor.
+- Share `info` columns and presentation, including evaluated structure scope.
+
+Output assembly returns exact built-in scalars directly when the attribute is
+outside the canonical physical-unit wrapping table. Such values cannot be
+quantity-backend objects. Physical fields retain wrapping/standardization, and
+custom numeric subclasses and array/quantity containers retain the ordinary
+quantity inspection path. This avoids emitting quantity-probe misses for plain
+counts without changing the unit policy or weakening a public boundary.
+
+Native methods do not call the decorated universal `get`/`info`. Specific form
+providers remain reused; this is not a rewrite of every attribute getter or
+native table. There is no persistent cache of mutable values/counts and no
+whole-system copy/build just to locate an attribute. Explicit indices retain
+order/repetitions; mask intersections retain existing sorted-unique semantics.
+
+## Supported domains
+
+| Object | Current molecular query scope |
+| --- | --- |
+| MolSys | Its supported topology, chemical-state, structure and mechanics attributes; available partial domains and declared axes. |
+| Topology | Stable atom inventory and represented group/molecule/entity/chain memberships; no bond/component/state facade. |
+| Structures | Supported structural attributes and axis counts. Specialized `get_coordinates`, `get_box`, `get_time` and other existing getters remain available. |
+| ChemicalStates | Selected-state atom/bond/component indices, counts, nullable assignments and declarations; collection-wide state inventory and reference. Specialized bonds/history access remains available. |
+| Interactions | Current adapter metadata: declared atom and structure domains. `query`, `between_selections` and `to_page` remain the occurrence/coverage/measurement API. |
+| MolSysBuilder | Its declared editable domains; no `build()` or finalization is required. |
+
+Chemical-state resolution belongs to ChemicalStates, including standalone typed
+dictionary collections. MolSys adds explicit structure/state associations. Pure
+Topology cannot resolve chemistry through an owner. Invalid/ambiguous state
+selection fails without reference mutation. Basic queries can join explicitly
+composed native Topology/ChemicalStates domains without copying their payloads or
+rebinding owners; shared axis cardinality is validated before querying.
+
+`attribute.bonds_are_required_to_get_attribute` describes graph prerequisites,
+not missing-inventory reconstruction in a foreign form. Stable atom/group/chain/
+molecule/entity fields and counts do not require bonds when queried from stable
+axes. Bond/component attributes and queries sourced from either state-local axis
+still require its graph. General get/selection planning must not request bond
+inference solely for stable molecule or entity membership. Stored molecule
+membership must not be recomputed from later chemical components.
+
+## Selection boundaries
+
+All/unrestricted and flat explicit index queries use the native provider's
+direct selection path. Boolean masks use shared mask validation; numeric
+intersections preserve existing selection semantics. Expression languages,
+nested selections and expression masks retain `basic.select` and its existing
+parser/providers. These cases are supported fallbacks, not claimed to eliminate
+universal dispatch throughout an expression evaluation.
+
+The requested structure scope is passed to every summary acquisition and
+recursive expression-mask selection. Selected hierarchy counts exclude missing
+parents and deduplicate only declared memberships; full-system counts retain
+the complete declared inventories, including rows without known members. Reading
+`n_molecules`, `n_entities` or an `info()` summary never reconstructs native
+parent tables, clears dirty flags or replaces stored labels. Missing scalar
+parent links propagate as `None` through atom/group/molecule queries for parent
+indices, IDs, names and types; explicit index order and repetitions survive.
+Reconstruction is a separate explicit operation. This contract describes resident
+native inventories, not foreign-form or dictionary finalization.
+Typed counts retain their existing group
+or molecule type definitions. No missing group is labelled a small molecule.
+
+Standalone Structures atom counts use native observable alignment, including
+velocity/B-factor/occupancy-only payloads. Time/box-only containers have the
+existing native zero atom count; time does not infer atoms. MolSys retains its
+separate partial-domain rules for an undeclared atom axis. Shape-only `repr`
+remains distinct from this validating data query.
+
+## Declarative dictionary queries
+
+`TopologyDict` and `MolSysDict` continue to use `msm.get()` and `msm.info()`;
+they do not acquire the resident instance methods. Their topological adapters
+read these values without copying or finalizing a native object:
+
+- `n_atoms` from the system or an atom selection;
+- `atom_index` from atoms;
+- `atom_id`, `atom_name` and `atom_type` from atoms when the requested fields
+  are already stored strings.
+
+Flat atom selections preserve order/repetitions and basic-tool index/mask
+validation. Lists returned for stored labels are detached. There is no cache:
+later dictionary edits are observed. These queries read the requested inventory;
+they do not validate unrelated hierarchy, chemistry or coordinate payloads.
+
+Missing or non-string atom fields retain the converter's normalization,
+defaults and element inference. Nested selections retain the existing native
+route. Other topological getters and complete `info` summaries still use the
+declared conversion pipes. In particular, group, chain, molecule and entity
+counts cannot generally be replaced by serialized list lengths: finalization
+can supply missing memberships or infer parents.
+
+The private form probe `_can_get_without_conversion` allows the shared basic
+executor to bypass a bulk pipe only when every requested field has a direct
+route for the actual selected indices. Unsupported/mixed queries keep ordinary
+piping, including complementary forms. Do not set the general pipe metadata to
+`None` merely because a subset of getters becomes direct.
+
+Writers use schema 0.2 and readers retain 0.1. The bounded stored-atom route
+applies to both interpretations; other queries use their supported native
+conversion route. MolSysDict 0.2 retains independently optional chemistry,
+structures, named analyses and explicit associations. Explicit state requests
+decode the independent owner before resolving it; this path is not advertised
+as a bounded chemical-column query. Full decoding validates schema/typed fields
+and refuses unrepresented metadata and extensions.
+
+## Evidence and remaining scope
+
+The semantic and mechanism guards live in
+`tests/native/test_native_queries.py`. They assert independently expected
+counts, hierarchy links, coordinates, units and errors, and prohibit universal
+discovery/conversion for claimed direct cases. Existing basic/native/interaction
+tests protect general delivery and sparse result behavior.
+
+The dated performance study and reproducer are maintained in
+[the #128 record](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/pending_proposals/native_query_shortcuts.md) and
+`benchmarks/native_queries.py`. Compare fully validated routes; narrower
+property/trusted-adapter costs are not equivalent native-query speedups.
+
+Dictionary forms, file handlers, ViewerJSON, Simulation and experimental
+MolecularMechanics do not acquire these instance methods. Direct dictionary
+reads beyond the bounded atom inventory and specialized disk access remain
+pending study scope. Stored-atom query and fallback guards live in
+`tests/form/molsysmt_TopologyDict/test_direct_queries.py` for both dictionary forms.
+No new dependency, numerical method, Rust kernel or persistence format is added.

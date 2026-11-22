@@ -1,0 +1,42 @@
+add_mlir_dialect_library(MDIRMDExecTransforms
+  AccumulateDestinations.cpp
+  Approximate.cpp
+  AssignAlgebra.cpp
+  AssignPrecision.cpp
+  AssignStorage.cpp
+  AssignStreams.cpp
+  ChooseHostPairs.cpp
+  ChooseNeighbors.cpp
+  ChooseScatter.cpp
+  CheckTransfers.cpp
+  ExpandRadial.cpp
+  ExposeValidity.cpp
+  FoldTables.cpp
+  FuseLoops.cpp
+  NarrowSums.cpp
+  RebuildAtInterval.cpp
+  ReleaseDeadStorage.cpp
+  ReuseNeighbors.cpp
+  ShareDivisions.cpp
+  SimplifyDistance.cpp
+
+  ADDITIONAL_HEADER_DIRS
+  ${PROJECT_SOURCE_DIR}/include/mdir/Dialect/MDExec/Transforms
+
+  DEPENDS
+  MDIRMDExecPassIncGen
+
+  LINK_LIBS PUBLIC
+  MDIRMD
+  MDIRMDExec
+  MDIRMDRT
+  MLIRArithDialect
+  MLIRFuncDialect
+  MLIRGPUDialect
+  MLIRIR
+  MLIRMathDialect
+  MLIRMemRefDialect
+  MLIRPass
+  MLIRSCFDialect
+  MLIRVectorDialect
+  )

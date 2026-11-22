@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1"
+    >
+    <title>Protein Function Predictor</title>
+
+    <link
+        rel="stylesheet"
+        href="/static/styles.css"
+    >
+
+    <script
+        src="/static/app.js"
+        defer
+    ></script>
+</head>
+
+<body>
+    <main class="container">
+        <header class="hero">
+            <p class="eyebrow">
+                ESM2 protein language model
+            </p>
+
+            <h1>
+                Protein Function Predictor
+            </h1>
+
+            <p class="subtitle">
+                Predict selected Gene Ontology
+                Molecular Function terms from an
+                amino-acid sequence.
+            </p>
+        </header>
+
+        <section class="card input-card">
+            <label for="sequence">
+                Protein sequence
+            </label>
+
+            <textarea
+                id="sequence"
+                rows="10"
+                maxlength="20000"
+                placeholder="Paste an amino-acid sequence, for example: MRWQEMGYIFYPRKLR"
+                spellcheck="false"
+            ></textarea>
+
+            <div class="input-footer">
+                <span id="sequence-length">
+                    0 / 1024 residues
+                </span>
+
+                <button
+                    id="predict-button"
+                    type="button"
+                >
+                    Predict function
+                </button>
+            </div>
+
+            <p
+                id="error-message"
+                class="error-message"
+                hidden
+            ></p>
+        </section>
+
+        <section
+            id="results-section"
+            class="card"
+            hidden
+        >
+            <div class="results-header">
+                <div>
+                    <p class="eyebrow">
+                        Model output
+                    </p>
+
+                    <h2>
+                        Molecular Function predictions
+                    </h2>
+                </div>
+            </div>
+
+            <p class="results-note">
+                Scores are outputs from the
+                logistic-regression classifier and
+                should not be interpreted as calibrated
+                biological probabilities.
+            </p>
+
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>GO term</th>
+                            <th>Score</th>
+                            <th>Threshold</th>
+                            <th>Prediction</th>
+                        </tr>
+                    </thead>
+
+                    <tbody id="results-body">
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <footer>
+            Frozen ESM2 embeddings +
+            one-vs-rest logistic regression.
+            Maximum sequence length: 1024 residues.
+        </footer>
+    </main>
+</body>
+</html>

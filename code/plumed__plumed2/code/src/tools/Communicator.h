@@ -1,0 +1,362 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2011-2023 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#ifndef __PLUMED_tools_Communicator_h
+#define __PLUMED_tools_Communicator_h
+#if defined(__PLUMED_HAS_MPI) || defined(__PLUMED_MPIWRAP)
+#include "../mpiwrap/mpi-types.h"
+#endif
+#include <cstdlib>
+#include "Exception.h"
+#include "TypesafePtr.h"
+#include <vector>
+#include <string>
+#include "Vector.h"
+#include "Tensor.h"
+#include "Matrix.h"
+
+namespace PLMD {
+
+#if !defined(__PLUMED_HAS_MPI) && !defined(__PLUMED_MPIWRAP)
+/// Surrogate of MPI_Comm when MPI library is not available
+class MPI_Comm {};
+/// Surrogate of MPI_Datatype when MPI library is not available
+class MPI_Datatype {};
+/// Surrogate of MPI_Status when MPI library is not available
+class MPI_Status {};
+/// Surrogate of MPI_Request when MPI library is not available
+class MPI_Request {};
+#endif
+
+/// \ingroup TOOLBOX
+/// Class containing wrappers to MPI.
+/// All the MPI related stuff is relegated here.
+class Communicator {
+/// Communicator
+  mutable MPI_Comm communicator{};
+/// Whether communicator contains an actual native handle, rather than deferred SELF.
+  mutable bool communicatorResolved=false;
+/// Resolve default SELF after provider selection and MPI initialization.
+  void resolveCommunicator()const;
+/// True if this process holds the communicator only as a stand-in.
+/// See setStandIn().
+  bool standIn=false;
+/// In debug builds, raise an error if this communicator is a stand-in.
+  void checkNotStandIn()const;
+/// Function returning the MPI type.
+/// You can use it to access to the MPI type of a C++ type, e.g.
+/// `MPI_Datatype type=getMPIType<double>();`
+/// Unsupported types have no specialization and fail at link time. In particular,
+/// use unsigned long buffers rather than unsigned long long: the latter datatype
+/// is optional in host thread-MPI implementations.
+  template <class T>
+  static MPI_Datatype getMPIType();
+/// Structure defining a buffer for MPI.
+/// It contains info on the pointed data and its type and size. It is useful to
+/// allow wrapper of MPI functions where the triplet (buffer,type,size)
+/// is grouped into a single object. It can be built starting from
+/// different kinds of data. To implement compatibility of MPI wrappers
+/// with e.g. vectors, add constructors here.
+  struct Data {
+    void*pointer;
+    int size;
+    int nbytes=0;
+    MPI_Datatype type;
+/// Init from pointer and size
+    template <typename T> Data(T*p,int s): pointer(p), size(s), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+/// Init from reference
+    template <typename T> explicit Data(T&p): pointer(&p), size(1), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+/// Init from pointer to VectorGeneric
+    template <typename T, unsigned n> explicit Data(VectorTyped<T,n> *p,int s): pointer(p), size(n*s), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+/// Init from reference to VectorGeneric
+    template <typename T, unsigned n> explicit Data(VectorTyped<T,n> &p): pointer(&p), size(n), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+/// Init from pointer to TensorTyped
+    template <typename T, unsigned n,unsigned m> explicit Data(TensorTyped<T,n,m> *p,int s): pointer(p), size(n*m*s), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+/// Init from reference to TensorTyped
+    template <typename T, unsigned n,unsigned m> explicit Data(TensorTyped<T,n,m> &p): pointer(&p), size(n*m), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+/// Init from reference to std::vector
+    template <typename T> explicit Data(std::vector<T>&v) {
+      Data d(v.data(),v.size());
+      pointer=d.pointer;
+      size=d.size;
+      type=d.type;
+    }
+/// Init from reference to PLMD::Matrix
+    template <typename T> explicit Data(Matrix<T>&m ) {
+      if(m.nrows()*m.ncols()>0) {
+        Data d(&m(0,0),m.nrows()*m.ncols());
+        pointer=d.pointer;
+        size=d.size;
+        type=d.type;
+      } else {
+        pointer=NULL;
+        size=0;
+      }
+    }
+/// Init from reference to std::string
+    explicit Data(std::string&s) {
+      if(s.size()>0) {
+        Data d(&s[0],s.size());
+        pointer=d.pointer;
+        size=d.size;
+        type=d.type;
+      } else {
+        pointer=NULL;
+        size=0;
+      }
+    }
+  };
+/// Const version of Communicator::Data
+/// See Communicator::Data documentation
+  struct ConstData {
+    const void*pointer;
+    int size;
+    int nbytes=0;
+    MPI_Datatype type;
+    template <typename T> explicit ConstData(const T*p,int s): pointer(p), size(s), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+    template <typename T> explicit ConstData(const T&p): pointer(&p), size(1), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+    template <typename T,unsigned n> explicit ConstData(const VectorTyped<T,n> *p,int s): pointer(p), size(n*s), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+    template <typename T,unsigned n> explicit ConstData(const VectorTyped<T,n> &p): pointer(&p), size(n), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+    template <typename T, unsigned n,unsigned m> explicit ConstData(const TensorTyped<T,n,m> *p,int s): pointer(p), size(n*m*s), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+    template <typename T, unsigned n,unsigned m> explicit ConstData(const TensorTyped<T,n,m> &p): pointer(&p), size(n*m), nbytes(sizeof(T)), type(getMPIType<T>()) {}
+    template <typename T> explicit ConstData(const std::vector<T>&v) {
+      ConstData d(v.data(),v.size());
+      pointer=d.pointer;
+      size=d.size;
+      type=d.type;
+    }
+    template <typename T> explicit ConstData(const Matrix<T>&m ) {
+      if(m.nrows()*m.ncols()>0) {
+        ConstData d(&m(0,0),m.nrows()*m.ncols());
+        pointer=d.pointer;
+        size=d.size;
+        type=d.type;
+      } else {
+        pointer=NULL;
+        size=0;
+      }
+    }
+    explicit ConstData(const std::string&s) {
+      if(s.size()>0) {
+        ConstData d(&s[0],s.size());
+        pointer=d.pointer;
+        size=d.size;
+        type=d.type;
+      } else {
+        pointer=NULL;
+        size=0;
+      }
+    }
+  };
+public:
+  ///Runtime acces to the __PLUMED_HAS_MPI definition
+  static bool plumedHasMPI();
+
+/// Wrapper class for MPI_Status
+  class Status {
+    int Get_count(MPI_Datatype)const;
+  public:
+    MPI_Status s;
+    template <class T>
+    int Get_count()const {
+      return Get_count(getMPIType<T>());
+    }
+  };
+/// Special status used when status should be ignored.
+/// E.g. `Recv(a,0,1,Communicator::StatusIgnore);`
+/// Notice that this is the default for Recv, so this is equivalent to
+/// `Recv(a,0,1);`
+  static Status StatusIgnore;
+/// Wrapper class for MPI_Request
+  class Request {
+  public:
+    MPI_Request r;
+    void wait(Status&s=StatusIgnore);
+  };
+/// Default constructor
+  Communicator();
+/// Copy constructor.
+/// It effectively "clones" the communicator, providing a new one acting on the same group
+  Communicator(const Communicator&);
+/// Assignment operator.
+/// It effectively "clones" the communicator, providing a new one acting on the same group
+  Communicator& operator=(const Communicator&);
+/// Destructor
+  virtual ~Communicator();
+/// Obtain the rank of the present process
+  int Get_rank()const;
+/// Obtain the number of processes
+  int Get_size()const;
+/// Set from a real MPI communicator.
+/// \param comm MPI communicator
+  void Set_comm(MPI_Comm comm);
+/// Reference to MPI communicator
+  MPI_Comm & Get_comm();
+/// Mark this communicator as a stand-in on this process.
+/// A stand-in is a communicator that other processes were given but this
+/// process was not, so it does not connect this process to the processes it
+/// is meant to connect. This is the case of PLMD::Action::multi_sim_comm on
+/// all the processes of a replica except the first one.
+/// In debug builds, using a stand-in (asking its rank or size, or
+/// communicating over it) raises an error. Set_comm() clears the mark.
+  void setStandIn(bool s);
+/// True if this communicator has been marked as a stand-in with setStandIn().
+  bool isStandIn()const;
+/// Set from a pointer to a real MPI communicator (C).
+/// \param comm Pointer to a C MPI communicator
+  void Set_comm(const TypesafePtr & comm);
+/// Set from a pointer to a real MPI communicator (FORTRAN).
+/// \param comm Pointer to a FORTRAN MPI communicator (INTEGER)
+  void Set_fcomm(const TypesafePtr & comm);
+/// Wrapper to MPI_Abort.
+/// \param code Error code
+  void Abort(int code);
+/// Wrapper to MPI_Barrier
+  void Barrier()const;
+/// Tests if MPI library is initialized
+  static bool initialized();
+/// Tests if MPI library has been finalized (false without MPI)
+  static bool finalized();
+/// Wrapper for MPI_Allreduce with MPI_SUM (data struct)
+  void Sum(const Data&);
+/// Wrapper for MPI_Allreduce with MPI_SUM (pointer)
+  template <class T> void Sum(T*buf,int count) {
+    Sum(Data(buf,count));
+  }
+/// Wrapper for MPI_Allreduce with MPI_SUM (reference)
+  template <class T> void Sum(T&buf) {
+    Sum(Data(buf));
+  }
+/// Wrapper for MPI_Allreduce with MPI_PROD (data struct)
+  void Prod(const Data&);
+/// Wrapper for MPI_Allreduce with MPI_PROD (pointer)
+  template <class T> void Prod(T*buf,int count) {
+    Prod(Data(buf,count));
+  }
+/// Wrapper for MPI_Allreduce with MPI_PROD (reference)
+  template <class T> void Prod(T&buf) {
+    Prod(Data(buf));
+  }
+/// Wrapper for MPI_Allreduce with MPI_MAX (data struct)
+  void Max(const Data&);
+/// Wrapper for MPI_Allreduce with MPI_MAX (pointer)
+  template <class T> void Max(T*buf,int count) {
+    Max(Data(buf,count));
+  }
+/// Wrapper for MPI_Allreduce with MPI_MAX (reference)
+  template <class T> void Max(T&buf) {
+    Max(Data(buf));
+  }
+/// Wrapper for MPI_Allreduce with MPI_MIN (data struct)
+  void Min(const Data&);
+/// Wrapper for MPI_Allreduce with MPI_MIN (pointer)
+  template <class T> void Min(T*buf,int count) {
+    Min(Data(buf,count));
+  }
+/// Wrapper for MPI_Allreduce with MPI_MIN (reference)
+  template <class T> void Min(T&buf) {
+    Min(Data(buf));
+  }
+
+/// Wrapper for MPI_Bcast (data struct)
+  void Bcast(const Data&,int);
+/// Wrapper for MPI_Bcast (pointer)
+  template <class T> void Bcast(T*buf,int count,int root) {
+    Bcast(Data(buf,count),root);
+  }
+/// Wrapper for MPI_Bcast (reference)
+  template <class T> void Bcast(T&buf,int root) {
+    Bcast(Data(buf),root);
+  }
+
+/// Wrapper for MPI_Scatter (data struct)
+  void Scatter(const ConstData& sendbuf,int sendcount,const Data& recvbuf,int recvcount,int root);
+/// Wrapper for MPI_Scatter (pointer)
+  template <class T,class S> void Scatter(const T*sendbuf,int sendcount,S*recvbuf,int recvcount,int root) {
+    Scatter(ConstData(sendbuf,sendcount*Get_size()),sendcount,Data(recvbuf,recvcount),recvcount,root);
+  }
+/// Wrapper for MPI_Scatter (reference)
+  template <class T,class S> void Scatter(const T&sendbuf,int sendcount,S&recvbuf,int recvcount,int root) {
+    Scatter(ConstData(sendbuf),sendcount,Data(recvbuf),recvcount,root);
+  }
+
+/// Wrapper for MPI_Gather (data struct)
+  void Gather(const ConstData& sendbuf,int sendcount,const Data& recvbuf,int recvcount,int root);
+/// Wrapper for MPI_Gather (pointer)
+  template <class T,class S> void Gather(const T*sendbuf,int sendcount,S*recvbuf,int recvcount,int root) {
+    Gather(ConstData(sendbuf,sendcount),sendcount,Data(recvbuf,recvcount*Get_size()),recvcount,root);
+  }
+/// Wrapper for MPI_Gather (reference)
+  template <class T,class S> void Gather(const T&sendbuf,int sendcount,S&recvbuf,int recvcount,int root) {
+    Gather(ConstData(sendbuf),sendcount,Data(recvbuf),recvcount,root);
+  }
+
+/// Wrapper for MPI_Isend (data struct)
+  Request Isend(const ConstData&,int,int);
+/// Wrapper for MPI_Isend (pointer)
+  template <class T> Request Isend(const T*buf,int count,int source,int tag) {
+    return Isend(ConstData(buf,count),source,tag);
+  }
+/// Wrapper for MPI_Isend (reference)
+  template <class T> Request Isend(const T&buf,int source,int tag) {
+    return Isend(ConstData(buf),source,tag);
+  }
+
+/// Wrapper for MPI_Allgatherv (data struct)
+  void Allgatherv(const ConstData& in,const Data& out,const int*,const int*);
+/// Wrapper for MPI_Allgatherv (pointer)
+  template <class T,class S> void Allgatherv(const T*sendbuf,int sendcount,S*recvbuf,const int*recvcounts,const int*displs) {
+    Allgatherv(ConstData(sendbuf,sendcount),Data(recvbuf,0),recvcounts,displs);
+  }
+/// Wrapper for MPI_Allgatherv (reference)
+  template <class T,class S> void Allgatherv(const T&sendbuf,S&recvbuf,const int*recvcounts,const int*displs) {
+    Allgatherv(ConstData(sendbuf),Data(recvbuf),recvcounts,displs);
+  }
+
+/// Wrapper for MPI_Allgather (data struct)
+  void Allgather(const ConstData& in,const Data& out);
+/// Wrapper for MPI_Allgatherv (pointer)
+  template <class T,class S> void Allgather(const T*sendbuf,int sendcount,S*recvbuf,int recvcount) {
+    Allgather(ConstData(sendbuf,sendcount),Data(recvbuf,recvcount*Get_size()));
+  }
+/// Wrapper for MPI_Allgatherv (reference)
+  template <class T,class S> void Allgather(const T&sendbuf,S&recvbuf) {
+    Allgather(ConstData(sendbuf),Data(recvbuf));
+  }
+
+/// Wrapper for MPI_Recv (data struct)
+  void Recv(const Data&,int,int,Status&s=StatusIgnore);
+/// Wrapper for MPI_Recv (pointer)
+  template <class T> void Recv(T*buf,int count,int source,int tag,Status&s=StatusIgnore) {
+    Recv(Data(buf,count),source,tag,s);
+  }
+/// Wrapper for MPI_Recv (reference)
+  template <class T> void Recv(T&buf,int source,int tag,Status&s=StatusIgnore) {
+    Recv(Data(buf),source,tag,s);
+  }
+
+/// Wrapper to MPI_Comm_split
+  void Split(int,int,Communicator&)const;
+};
+
+}
+
+#endif

@@ -1,0 +1,866 @@
+---
+summary: The documentation build carries a large accepted warning population that hides new warnings.
+issue: uibcdf/molsysmt#144
+status: resolved
+opened: 2026-07-29
+closed: 2026-10-27
+severity: low
+verification: measured
+area: [docs]
+guard: devtools/tests/test_documentation_heading_structure.py::test_documentation_ci_options_reject_real_sphinx_warning
+normative: devguide/release_gate.md
+blocked_by: []
+supersedes: []
+---
+
+# Sphinx Warning Baseline and API Reference Debt
+
+**Status:** source-resolved on 2026-10-27 with warning-free strict HTML builds
+and an executed CI-option regression guard. Earlier acceptance and checkpoint
+statements below are historical observations, not the final status.
+**Found:** 2026-07-29 during a forced full Sphinx build.
+**Scope:** generated API reference, legacy User Guide pages, course markup style,
+orphan pages, and notebook metadata.
+
+## Evidence
+
+The forced build
+
+```bash
+cd docs
+sphinx-build -E -q -b html -w /tmp/molsysmt-sphinx-warnings.log . _build/html
+```
+
+completed with exit code 0 and generated the HTML site. Its warning log contained
+1,223 `WARNING:` records before the bounded F4 repairs. The largest tagged
+families were:
+
+| Family | Count | Meaning |
+| --- | ---: | --- |
+| `myst.header` | 423 | non-consecutive heading levels; 369 are in the course |
+| `toc.no_title` | 350 | notebook targets without a usable title, often repeated |
+| `toc.not_included` | 114 | source pages absent from every toctree |
+| `myst.xref_missing` | 78 | unresolved legacy MyST links |
+| `autodoc.import_object` | 50 | stale API objects |
+| `myst.directive_unknown` | 32 | unsupported directives; 13 course occurrences use `key-takeaway` |
+| `docutils` | 22 | malformed or inconsistent reStructuredText |
+| `toc.not_readable` | 11 | references to source documents that did not exist |
+| `ref.ref` | 4 | unresolved Sphinx labels |
+
+Autosummary also reported 42 initial import failures and 49 generation-time
+failures, dominated by form pages that still name a module-level `get` adapter
+which the current form does not expose.
+
+The full log is deliberately not committed: it contains absolute environment
+paths and is reproducible from the command above.
+
+## What F4 fixed
+
+All 11 `toc.not_readable` cases found by the forced build were corrected:
+
+- obsolete API entries for molecular dynamics, `thirds`, and oligosaccharides;
+- a removed showcase membrane page;
+- stale amino-acid, hydrogen-bond, structure, NGLView, and OpenMM-reporter
+  notebook names.
+
+An incremental Sphinx build after those repairs exited 0 and reported zero
+`toc.not_readable` warnings. It also reported no unresolved course cross-reference
+and no warning involving either of the semantic targets introduced in Common Core
+12 and 17.
+
+The Sphinx build regenerated ten checked-in autosummary pages for native and H5MSM
+forms. Those changes expose current chemical-state, bond-metadata, and
+thermodynamic getters/setters instead of preserving the stale generated lists.
+
+## The published build was worse than this baseline, until 2026-08-08
+
+Everything above measures the build produced by the command in **Evidence**, run by
+hand. Until 2026-08-08 that was not the build being published.
+
+`uibcdf/action-sphinx-docs-to-gh-pages` ran `sphinx-apidoc -o . ../` by default, and
+the documentation workflow never disabled it. Reproduced against a scratch output
+directory, that step generates **153 `.rst` files** — `modules.rst`, `conftest.rst`,
+and one per subpackage — into `docs/`. None of them is in any toctree, so each was an
+orphan page, built, published and counted as a warning the local baseline never saw;
+autodoc also imported every module in the tree to render them. The published site
+carried the result: `modules.html` and `molsysmt.basic.html` were reachable on
+`www.uibcdf.org/molsysmt/`, a second API reference beside the curated one under
+`docs/api/`, which nobody maintained.
+
+The workflow now passes `sphinx-apidoc: false`, and version 3.0.0 of the action also
+makes it the default. `modules.html` returns 404 on the published site as of
+2026-08-08.
+
+**Consequence for this report:** the local command and the CI build now measure the
+same thing, so the inventory above is finally the inventory of what readers get. Any
+ratchet built per the remediation plan should be measured once more before being
+frozen — the `toc.not_included` and `autodoc.import_object` families are the two this
+change touches, and neither has been re-counted since.
+
+## Why this does not block 1.0
+
+The release contract requires the course structure to be free of references to
+nonexistent documents. That condition is now satisfied dynamically by Sphinx and
+statically by `validate_course.py`. The remaining warnings are real quality debt,
+but they do not change runtime correctness, API availability, scientific results,
+or the resolved course navigation.
+
+Making all 156 course notebooks warning-free, rebuilding the old form reference,
+and deciding which orphan pages belong in the published navigation are separate,
+potentially large editorial projects. Folding them into the release candidate
+would delay the source release behind pre-existing documentation cleanup without
+improving its scientific contract.
+
+This is accepted debt, not a claim that the documentation is warning-clean.
+
+## Remediation plan
+
+Work by family and keep a ratcheted warning inventory:
+
+1. generate form API pages from the discovered module surface, never from stale
+   hand-maintained operation lists;
+2. add a documentation validator that fails on a new warning family or count
+   increase while allowing the recorded baseline to decrease;
+3. repair unresolved public API labels and remove duplicate source identities;
+4. decide whether each orphan User Guide page belongs in a toctree or should be
+   archived;
+5. add titles and stable semantic labels to published notebooks;
+6. replace or register `key-takeaway`, then normalize course heading levels;
+7. normalize notebook cell IDs before a future `nbformat` release makes their
+   absence an error.
+
+Each step should update the baseline by category. Do not solve the problem by
+globally suppressing warnings.
+
+## Closure criteria
+
+- a forced clean Sphinx build emits no warnings;
+- generated API pages name only importable current objects;
+- every published page has an intentional navigation status;
+- course directives and heading levels follow the documented MyST conventions;
+- notebooks validate without missing-cell-ID compatibility warnings;
+- CI rejects any reintroduced warning.
+
+## Fresh shared Python 3.14 build — 2026-10-06
+
+At source `5e2721691`, the shared development environment runs
+`python -m sphinx -b html -q -j 12 docs <fresh-output-directory>` with Sphinx
+9.1.0 and the actual configured extensions. It exits 0 and reports 781
+`WARNING:` lines, five Docutils `ERROR:` lines and no missing course toctree
+documents. Notebook execution remains disabled. Three generated autosummary
+formatting rewrites were restored; executable notebook cells and saved outputs
+were unchanged. The [receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/stabilization_s5_shared_20261006.json)
+records effective extension versions, the log hash and the error locations.
+
+The five error lines arise from an unknown `yyy` target in the NGLView
+`set_color_by_value` docstring, three undefined vector substitutions in the
+`get_lengths_and_angles_from_box` docstring, and an invalid grid argument in the
+legacy `content/user/tools/index_v2.md` draft. They are existing rendering debt
+under this issue. Exit zero permits these Docutils errors and must not be
+reported as error-free documentation. Counts from fresh and incremental builds
+or different installed extensions are checkpoint observations, not a ratchet
+comparison. This checkpoint satisfies the missing-course-document condition;
+the broader closure criteria above remain unmet.
+
+## Bounded box API repair — 2026-10-09
+
+The three vector-substitution errors and associated definition-list warning in
+`get_lengths_and_angles_from_box` are repaired under uibcdf/molsysmt#358. Its
+[resolution record](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/archive/resolved_bugs/box_geometry_documentation_misstates_units_and_fails_rendering.md)
+retains a real one-page Sphinx HTML guard: original prose fails, corrected prose
+renders without page diagnostics. Nondefault length/angle policy controls and
+the public doctest also pass. This is a bounded API repair, not a fresh full-site
+warning inventory; it does not close the other errors or the broader criteria
+above. The initial checkpoint's counts remain historical evidence.
+
+## Bounded NGLView API repair — 2026-10-09
+
+Under uibcdf/molsysmt#361 the unknown `yyy` target is removed and the obsolete,
+invalid public example is replaced by a local example using explicit NGLView.
+The [resolution record](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/archive/resolved_bugs/nglview_color_example_uses_obsolete_apis_and_fails_rendering.md)
+retains an actual page-rendering and example-execution guard, existing color
+regressions and one re-executed Toolbox notebook. The API page has no diagnostics;
+this is not a new whole-site warning inventory. The legacy `index_v2.md` grid
+error and broader warning/navigation debt remain under this issue.
+
+## Bounded legacy Toolbox grid repair — 2026-10-09
+
+The retained `content/user/tools/index_v2.md` draft supplies three grid-size
+arguments, which Sphinx Design rejects: the directive requires one or four.
+The actual card section fails its strict Sphinx/MyST rendering guard before the
+repair. Four breakpoint values now retain one column on small displays, two on
+medium and three on large displays. The guard
+`devtools/tests/test_public_api_docs.py::test_legacy_toolbox_cards_render_without_directive_errors`
+renders the source card content, rejects all page diagnostics and verifies the
+responsive grid and endpoint cards in HTML. Its separate legacy navigation is
+outside this bounded test; the draft is not newly admitted to published navigation.
+
+All four API/documentation guard cases pass. Rendering applications now use
+Sphinx's test application cleanup to avoid leaking global directive/node
+registrations between serial tests. Six Python warnings remain separate
+(Sphinx 11 deprecations and expected legacy H5MSM notices); they are not page
+diagnostics. The five error locations named in the earlier checkpoint have
+received bounded repairs, but no fresh full-site build or warning inventory is
+claimed. Broader warning, navigation and API-reference debt remains open here.
+
+## Notebook-schema checkpoint — 2026-10-13
+
+The #385 HTML build exits 0 but prints twelve repeated JSON schema errors from
+six untouched notebooks: Common Core 08/10/19, Biophysics 39 and basic get/set
+tutorials. Their nbformat minor is 4 while cells contain IDs introduced for minor
+5. The gzip tutorial and modified Module 01 are valid. A zero Sphinx exit does not
+prove a clean build. This bounded schema repair remains pending within #144; it
+is separate from gzip input correctness and requires preserving existing outputs.
+
+## Bounded notebook-schema repair — 2026-10-13
+
+The six notebooks in the preceding checkpoint declared nbformat 4.4 but contained
+cell IDs, which that schema rejects. They now declare 4.5, retain their existing
+IDs and assign missing IDs once. New IDs use the first sixteen hexadecimal digits
+of SHA-256 over documentation-relative path, cell position and cell type; stored
+IDs remain attached to their cells during subsequent edits. IDs are unique within
+each notebook. No random identifiers, content rewrites or execution are involved.
+
+The [receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/notebook_schema_repair_20261013.json) records the
+six paths, file hashes, schema versions, preserved/added ID counts and a hash of
+the complete JSON payload excluding only nbformat_minor and per-cell id. A direct
+comparison with the original files confirms that all other JSON values are
+identical: source text and list/string representation, outputs, execution counts,
+cell/notebook metadata and attachments. Existing code execution fingerprints and
+saved outputs therefore remain applicable; this repair does not qualify the
+legacy scientific examples afresh.
+
+The guard `devtools/tests/test_documentation_notebook_schema.py` validates raw
+stored JSON with nbformat, before any reader can normalize or repair it, and checks
+that validation leaves the input unchanged. All six cases fail on the original
+files and pass after repair. The schema cases plus the five notebook-executor
+controls pass 11/11 using Python 3.14.7, twelve workers and pytest-receptor.
+
+A focused Sphinx HTML project copies the actual six notebooks, uses MyST-NB and
+the same notebook reader options, disables execution as in the site configuration,
+and renders each page with its stored outputs. It exits 0 with no ERROR lines or
+Notebook JSON is invalid diagnostics. Its 102 warnings include references to
+pages absent from that isolated project and legacy course directives; this is
+neither a full-site build nor a warning-baseline comparison. Sphinx 9.1.0,
+MyST-NB 1.4.0 and nbformat 5.11.1 are recorded in the receipt. Course structure,
+Ruff and developer-guide checks pass. The broader #144 closure criteria remain
+open, with partial status unchanged.
+
+## Bounded API-to-tutorial link repair — 2026-10-13
+
+The earlier import-failure counts are historical observations. A fresh inventory
+checks the 246 explicit autodoc declarations in current `docs/api/**/*.rst`
+through Sphinx's `import_by_name`, honoring each page's `currentmodule`:
+all resolve. This does not inventory every API role in notebooks or establish
+full-site warning counts.
+
+Three public docstrings still link to removed tutorial labels. They now point to
+the actual stored notebook targets:
+
+| Public function | Tutorial target |
+|---|---|
+| `molsysmt.form.get_attributes` | `Tutorial_Form_Get_attributes` |
+| `molsysmt.form.has_attribute` | `Tutorial_Form_Has_attribute` |
+| `molsysmt.build.solve_atoms_with_alternate_location` | `Tutorial_Solve_atoms_with_alternate_locations` |
+
+The alternate-location tutorial also contained three Markdown API roles using
+the nonexistent plural function name. Those roles now use the singular public
+name, matching the existing executable examples. Its paired instructions record
+that name while retaining the plural tutorial filename, title and stable label.
+A complete JSON comparison confirms that only these three Markdown names change;
+code, saved outputs, execution counts, cell IDs and metadata are preserved.
+Common Core 12 and the affected PDB Frontier course examples already use the
+singular API and need no changes for this repair.
+
+The guard
+`devtools/tests/test_public_api_docs.py::test_api_tutorial_links_resolve_to_actual_notebook_targets`
+builds each real public docstring together with the introduction read from its
+actual tutorial notebook and the actual Forms introduction. It does not inject
+a replacement target. It checks the generated API-to-tutorial hyperlink and the
+tutorial-to-API hyperlink; removing either real target or changing the public
+function name fails. All three cases fail on the original docstrings with their
+undefined labels and pass after repair, with empty Sphinx warning streams.
+
+The complete public-API rendering selection passes **29 cases**, and all three
+changed-module doctests pass, on Python 3.14.7 with twelve workers and
+pytest-receptor. The wider selection retains Python-level Sphinx Napoleon
+deprecations and three existing legacy H5MSM warnings. Focused Ruff and
+developer-guide checks pass. The
+[receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/api_tutorial_links_repair_20261013.json) retains
+versions, before/after outcomes and notebook hashes.
+
+This is a repair of three API/tutorial boundaries, not a reexecution of the full
+notebooks or a fresh full-site warning baseline. Runtime behavior and signatures
+are unchanged; #144 remains partial and release coordination under #334 remains
+paused. Remaining work follows the family-by-family remediation plan above.
+
+## Bounded Common Core navigation repair — 2026-10-14
+
+All twenty Common Core notebooks now link to the real Foundations target
+`user-foundations-index`, replacing 26 references to the undefined
+`user-foundations` target. The course template and contributor examples use the
+same current target. Eleven links to removed notebook names are replaced with
+semantic module references and accurate display names:
+
+- Module 02 proceeds to Module 03, Molecular Elements; its transition now
+  describes the atom/group/molecule hierarchy rather than Native Forms.
+- Module 06 points to Module 08's attribute extraction, without promising a
+  nonexistent Interactive Selection module.
+- Modules 11, 13 and 17 use the actual Module 12, 14 and 18 identities.
+- Module 15 points forward to composition in Module 17 in its narrative, while
+  its sequential Next Module link correctly reaches Module 16.
+
+The README and course instructions locate the Native Forms reference model in
+Module 04 rather than a missing Module 02 file. Paired module instructions retain
+their protected topics and use the current navigation identities.
+
+The guard
+`devtools/tests/test_validate_course.py::test_common_core_navigation_links_reach_real_module_and_foundations_targets`
+renders actual stored module headings and navigation lines through MyST-NB,
+with the real Common Core index and actual Foundations/selection-syntax headings.
+The resulting HTML must contain a Foundations hyperlink in every Core module
+and a Next Module hyperlink to the following notebook in the current order.
+It uses no invented replacement labels. Replaying the final guard against the
+original Git notebook content, without modifying the checkout, rejects 26
+undefined Foundations references and eleven missing-module references: 37
+Sphinx warning lines. The corrected project has an empty Sphinx warning stream.
+
+The course/API/schema selection passes **37 tests** in 8.64 seconds on Python
+3.14.7 with twelve workers and pytest-receptor. Python-level MyST/Sphinx
+deprecations and existing H5MSM migration warnings remain visible in that
+selection. The 156-notebook course validator, whole-repository Ruff lint and
+format checks, and developer-guide validation pass. The
+[receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/course_navigation_repair_20261014.json) records
+versions, the negative control, per-notebook hashes and preservation evidence.
+
+Only Markdown source fields change in twenty Core notebooks and the template.
+All other JSON, including code, saved outputs, execution counts, metadata,
+cell IDs and attachments, is identical to the original. Semantic anchors and
+filenames remain unchanged. This does not reexecute scientific examples or
+certify complete notebook rendering or a warning-clean site. Generic portal
+links for deeper topics in Native Forms still need semantic review; the guard
+does not claim to verify those topic descriptions. The broader #144 closure
+criteria remain unmet and release coordination under #334 remains paused.
+
+
+## Bounded native links and course directive repair — 2026-10-22
+
+A forced full-site HTML build on the development source based on cdf7808e1
+reports 739 `WARNING:` records, zero `ERROR:` records and exit 0. This supersedes
+neither the historical measurements nor their environment: it is a new baseline.
+
+The repair redirects six nonexistent per-form reference paths in the native
+Foundations pages to actual native-query and conversion/form API targets.
+Paired instructions retain their protected topics and require real API targets.
+It preserves all other page sections. The configured local `key_takeaway`
+extension registers the course's existing directive as a standard Docutils
+admonition with a default title. No notebook, stored output or heading changes;
+no warning suppression. Its guard renders the actual twenty Common Core blocks,
+the course template and Foundations block, comparing the parsed body and inline
+content against standard admonitions. Without registration the negative control
+reports the unknown directive and produces no admonition nodes. Both cases pass.
+
+Developer testing docs also use the existing distance-test directory and current
+Python 3.11–3.14 matrices, distinguish PR/push/scheduled checks and correct the
+release/manual documentation deployment trigger. Maintainer CI-skip policy is
+linked rather than reduced to general advice to skip prose commits. The generated
+`get_vectors` API page is retained because the current structure autosummary
+already declares it; unrelated generated formatting rewrites are restored.
+
+```bash
+python -m pytest devtools/tests/test_course_takeaway_rendering.py --receptor=llm -n 12
+python -m sphinx -E -q -j 12 -b html -w /tmp/molsysmt-144-warnings-after.log docs /tmp/molsysmt-144-html
+```
+
+The clean full-site rebuild exits 0 with **711 warnings and zero errors**:
+
+| Family | Before | After |
+|---|---:|---:|
+| myst.header | 411 | 411 |
+| myst.directive_parse | 270 | 270 |
+| myst.directive_unknown | 24 | 2 |
+| toc.not_included | 17 | 17 |
+| ref.doc | 6 | 0 |
+| myst.xref_missing | 5 | 5 |
+| misc.highlighting_failure | 4 | 4 |
+| docutils | 1 | 1 |
+| ref.ref | 1 | 1 |
+
+The remaining unknown directives are `tabs` in the citation page and `info` in
+Common Core 01. No broad course/header rewrite or global warning ratchet is
+claimed. The proposed complete-warning closure criteria remain unmet, so #144
+stays partial. Notebook execution is disabled in this build; rendering a block
+is not a new scientific qualification of the notebook's executable examples.
+
+Linux x86_64, Python 3.14.7, Sphinx 9.1.0, MyST-NB 1.4.0 and the current development
+Viewer source; local source evidence, not installed release qualification.
+The [receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/documentation_warning_repair_20261022.json)
+records sanitized counts, warning-log digests, versions and the rendering guard.
+
+
+## Additional notebook-schema checkpoint — 2026-10-26
+
+The full HTML build for the ParmEd bridge repairs (uibcdf/molsysmt#463 and
+uibcdf/molsysmt#464) exits 0 but emits ten repeated notebook-schema ERROR
+diagnostics from five other course notebooks: the four paths'
+`34_Comparison_Superposition.ipynb` and Common Core
+`16_Structural_Operations.ipynb`. Their stored cells contain IDs while the
+notebooks still declare schema 4.4. They are outside the six-file raw-JSON guard
+added on 2026-10-13; that bounded repair did not cover these five.
+
+The newly edited ParmEd/MDTraj/Modeller pages, conversion Cookbook and Common
+Core Module 01 are not the source of these schema errors. Their public examples
+execute successfully, but the full-site command must not be described as clean.
+Extend the existing schema guard and apply the same metadata-only 4.5 repair,
+preserving every source cell and executed output, before clearing this debt.
+The [ParmEd receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/conversion_execution_parmed_20261026.json)
+retains the observed exit, diagnostic count and scope. #144 remains partial.
+
+
+## Source-wide notebook-schema guard and repair — 2026-10-26
+
+The follow-up inventory reads every documentation source notebook as raw JSON,
+not through a reader that can normalize metadata. It finds ten invalid sources:
+six declare schema 4.4 while containing IDs, and four declare 4.5 while lacking
+a cell ID. The first inventory also includes 21 local editor checkpoints; these
+are excluded from the source guard. The actual guarded inventory is 491 notebooks:
+490 under `docs/content/` and the homepage, with generated builds outside its scope.
+The expanded guard initially fails ten cases and passes 481 in 7.26 seconds.
+
+The six 4.4 notebooks now declare 4.5. All 84 existing cell IDs are retained, and
+37 missing IDs are assigned using the same deterministic path/position/type hash
+as the earlier repair. The [receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/notebook_schema_repair_20261026.json)
+lists the ten paths, pre/post hashes and unchanged payload hashes. Direct comparison
+against HEAD verifies that every other JSON value is identical, including source
+text and its list/string representation, saved outputs, execution counts, all
+metadata and attachments. There is no execution or scientific requalification
+of the examples in this metadata-only repair.
+
+`tests/documentation/test_notebook_schema.py` brings the shared raw-JSON guard
+into ordinary pytest discovery; the developer-tool entry point remains valid.
+The guard discovers source paths instead of maintaining a whitelist of previously
+repaired notebooks, so future sources are included automatically. It also checks
+that validation has not repaired its input and that 4.5 cell IDs are unique.
+The schema and executor controls pass **496/496**, with no failures or skips, in
+7.21 seconds using twelve workers and Pytest Receptor. The maintained
+[compilation guide](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/notebook_compilation_and_visualization.md) records the
+normal test command and source scope.
+
+A forced full-site HTML rebuild exits zero, renders all ten repaired pages, and
+emits **zero errors and zero notebook-schema diagnostics**. It retains 731 warnings:
+428 `myst.header`, 271 `myst.directive_parse`, two `myst.directive_unknown`,
+17 `toc.not_included`, five `myst.xref_missing`, four `misc.highlighting_failure`,
+one `ref.ref`, one `ref.footnote` and two untagged warnings. This is a new source
+checkpoint, not a controlled warning-count reduction against the October 22
+checkpoint. Ruff lint/format and the fourteen fast gates pass. #144 remains partial
+for its broader markup/navigation/reference debt; no clean-warning site, installed
+package pair or release qualification is claimed.
+
+## Additional source-schema repair — 2026-10-26
+
+The property-query documentation build encountered three path-39 notebooks
+with newly introduced cell IDs under schema 4.4. The raw source guard failed
+three cases with 488 controls passing; Sphinx also emitted invalid-notebook
+ERROR messages despite a successful process status. That run is not a clean
+HTML qualification.
+
+The Alzheimer's, antiviral and enzyme path notebooks now declare schema 4.5
+and have 31 deterministic missing IDs assigned. Existing IDs, cell payloads,
+outputs and execution metadata are preserved exactly. The paired payload
+comparison and before/after hashes are retained in
+[the query receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/physchem_queries_20261026.json).
+The raw schema guard then passes all 491 source notebooks. The broader warning
+and reference debt remains open; no complete course or warning-free build is
+claimed by these metadata-only repairs.
+
+
+## Bounded directive rendering and cell-ID repair — 2026-10-27
+
+A forced full-site build on source 4e544cb12 plus the recorded working-tree
+baseline completes with 737 warnings and zero errors. A first separate /tmp
+output fails with OSError 122 (quota exceeded); it is not a successful baseline.
+Only the task-owned failed output is retired. Subsequent full builds reuse the
+existing workspace output with fresh environments and all documents rewritten:
+
+```bash
+python -m sphinx -E -a -q -j 12 -b html -w <warning-log> docs docs/_build/html
+```
+
+The bounded correction keeps native note/seealso directive kinds and dropdown
+classes, moving ten accidental first-line title arguments into their bodies in
+six topology tutorials. Their catalog text, linked tool lists and ordering remain.
+The Tools AGENTS examples now prescribe that valid syntax instead of reproducing
+the same parser warning. The initial course page's glossary was already valid;
+the broken block was its separate Supported Forms Portal notice. A supported
+admonition now renders its original text/link with the information styling.
+Citation panels use the installed sphinx_design tab-set/tab-item directives and
+an explicit BibTeX download role; all citation metadata and BibTeX bytes remain.
+
+A real-source rendering guard initially fails three actual-source cases while
+three negative controls reproduce the old warnings. It now passes all six cases,
+requiring panel content and actual bibliography bytes, the portal link/body,
+ten typed dropdowns and their linked reference lists. No warning is suppressed.
+Fixture labels isolate directive parsing; the full-site run separately checks
+real cross-references. This is stronger than checking for a replacement string
+or merely registering a directive name.
+
+The combined raw-schema/rendering run exposes one additional missing cell ID in
+Common Core 12 (one failed, 503 passed). Assigning cell 31 the deterministic
+ID d790ba39f0606da3 is its only JSON change. The existing raw-source guard then
+passes; every code cell, output, execution count and all other metadata remain
+identical. The seven prose-edited notebooks likewise retain all code, output and
+cell IDs. No examples are newly executed or scientifically requalified.
+
+Final checks:
+
+```bash
+python -m pytest tests/documentation/test_directive_rendering.py devtools/tests/test_course_takeaway_rendering.py devtools/tests/test_documentation_notebook_schema.py --receptor=llm -n 12
+python devtools/scripts/validate_citation.py
+```
+
+The direct developer-tool run passes all 504 cases in 10.51 s with no skips.
+The six real-source cases also participate in normal pytest discovery through
+`tests/documentation/test_directive_rendering.py`, retaining their fixture and
+negative controls. The corrected forced full-site build
+exits zero with zero errors and 725 warnings. Comparison against the successful
+baseline reduces only these families:
+
+| Family | Before | After |
+|---|---:|---:|
+| myst.directive_unknown | 2 | 0 |
+| myst.directive_parse | 271 | 261 |
+| All warnings | 737 | 725 |
+
+Other warning-family counts are unchanged. Source hash comparison verifies that
+only the ten intended documentation/guidance files differ; the four previously
+dirty generated API pages remain untouched. Ruff and citation checks pass.
+The [receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/documentation_directive_repair_20261027.json)
+records source hashes, preserved payloads, exact counts, environment, failed
+attempts and guard intent. #144 remains partial for its remaining 725 warnings;
+this is not a warning-free site, new scientific result or release qualification.
+
+
+### Joint-head integration checkpoint — 2026-10-27
+
+A concurrent addon integration, 11e7ab7f0, extends the prose of Common Core 12
+and the bound-tools guide after the controlled comparison above. On the combined
+source b7b88d94e327afea14f0372a0303755876550ab6, all 504 normal-discovery,
+rendering and schema cases pass again in 8.65 s. Exact raw-JSON comparison with
+its immediate parent confirms the Common Core 12 change in our commit is only
+the missing cell ID; the concurrently integrated source text is preserved.
+
+Another forced full-site build succeeds with zero errors and **726 warnings**.
+A normalized warning multiset comparison finds one additional existing-family
+H1-to-H3 warning in Common Core 12; headers are now 435, while parse warnings
+remain 261 and unknown directives remain zero. Every other family count is
+unchanged. Course heading policy and its broader accepted debt are not silently
+rewritten to eliminate this later section's warning. The earlier 737-to-725
+comparison and receipt retain their original source identity and numbers;
+726 is the combined-head checkpoint, not a correction of those measurements.
+Integrated warning-log SHA-256: c68e593804b84cbe49ffadd31c1432dfd79301f6260aa10aef717f5f99abf523.
+No scientific notebook execution, warning suppression or release qualification
+is inferred from this rendering/schema checkpoint.
+
+
+## Complete inline-title directive family repair — 2026-10-27
+
+The preceding successful full-site checkpoint has 726 warnings. Before this
+repair, source 40a8ac2ea changes four governance guides under #505, including
+the rendered docs/AGENTS page; native/addon executables and user/course content
+are unchanged. The retained checkpoint is an observation, not an identical-source
+controlled experiment. The generated API working-tree changes retain their
+recorded hashes. We do not rerun an otherwise unchanged scientific suite.
+
+MyST tokenization identifies exactly 261 remaining invalid first-line titles:
+257 in Toolbox tutorials and four in the Enzyme interaction-matrix module,
+two charged/aromatic recipes and the return-types guide. Literal fenced code
+examples remain opaque. Moving each title to its bold first body paragraph
+preserves note/seealso kind, dropdown class, complete body bytes, closing fence
+and links. The repair changes 160 notebooks and one Markdown document. Every
+other raw notebook JSON value, including code, outputs, cell IDs, metadata and
+order, is identical. The copied Basic Tools instructions receive valid syntax.
+No scientific statement, method, cutoff or unit is changed.
+
+The staged transform refuses a two-block layout variation before any write:
+get_vectors omits the optional blank line after options. The final transform
+handles both known layouts and proves body preservation. No unconditional
+regex replacement, code/example execution or general source reformat is used.
+
+The normal-discovery guard now inventories 278 standard dropdowns across 173
+documents. It renders actual source and compares complete parsed text and
+reference order against independent ordinary-Markdown body containers. It
+preserves typed nodes, dropdown styling, useful content and backend disclosure.
+Case-only aliases are normalized only in the isolated fixture. Original
+six-page topology content assertions remain unchanged. Negative controls
+restore invalid syntax; lexical controls protect literal code examples.
+Initially the new corpus guard fails one case while ten controls pass.
+
+```bash
+python -m pytest tests/documentation/test_directive_rendering.py devtools/tests/test_course_takeaway_rendering.py devtools/tests/test_documentation_notebook_schema.py --receptor=llm -n 12
+python -m sphinx -E -a -q -j 12 -b html -w <warning-log> docs docs/_build/html
+```
+
+Final qualification passes **509 tests in 16.13 s**, without skips. The forced
+full-site build exits zero, with zero errors and **465 warnings**, compared
+with the preceding 726-warning checkpoint. All 261 myst.directive_parse
+warnings disappear; myst.directive_unknown remains zero. Every other family
+count is unchanged, including 435 header warnings. No warning is suppressed
+and no source excluded. Notebook execution remains off.
+
+The [receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/documentation_dropdown_family_repair_20261027.json)
+records versions, source differences, log digests, every document/body preservation
+hash and guard intent. #144 remains partial for its header/navigation/reference/
+highlighting debt. No warning-free site, new scientific result, performance
+benchmark, installed-pair or release qualification is claimed.
+
+
+## Public reference and literal rendering repair — 2026-10-27
+
+A fresh forced build on b50edcc52 reproduces the preceding 465-warning
+checkpoint, with zero errors. Four generated API pages already have unrelated
+working-tree edits; their hashes are retained and those edits are not included.
+The first attempt to build another complete HTML copy under a new temporary
+directory fails with OSError 122 (disk quota). Only that incomplete output is
+removed. Reusing the existing HTML output directory succeeds; the failed attempt
+is not counted as baseline evidence.
+
+This slice fixes nine warnings without suppression or source exclusions:
+
+- Seven standalone reStructuredText examples in the docstring-writing guide
+  receive the correct lexer, removing four highlighting warnings. Every code
+  fence body remains byte-identical, including actual Python examples.
+- The sequence-identity Notes paragraph cites its existing Ensembler footnote.
+  No attribution, scientific definition or producer reference is invented.
+- The Iterator Notes list retains its full last item with correct continuation
+  indentation. Both Python modules have identical executable ASTs after
+  removing docstrings.
+- The nested OpenMM toctree gets a distinct name. The parent `items` name and
+  every navigation entry remain unchanged.
+- The missing-bond tutorial links to the existing Topology guide for the real
+  `Topology.add_bonds()` method, replacing a reference to a nonexistent tutorial.
+- The home page retains its pending-paper statement and links to the actual
+  citation guide. There is no `papers.bib` file; no paper reference is fabricated.
+  The software BibTeX download, authors, version and DOI remain unchanged.
+  Its paired instructions reflect this truthful publication state.
+
+Real-source Sphinx controls render all literal examples, both public docstrings,
+both third-party navigation levels, the tutorial reference and the home citation.
+Assertions protect full literal text, attribution linkage, list membership,
+navigation entries, destination links and downloaded bibliography bytes. Paired
+negative controls restore each original failure. The footnote check uses actual
+reStructuredText pages: an initial eval-rst miniature did not reproduce the
+full-site unreferenced-footnote warning. Fixture-only corrections account for
+23 actual code fences and inspect final HTML links instead of unresolved
+environment nodes. No product assertion is weakened to accept a defect.
+
+The schema regression also detects four new Markdown cells introduced by
+b50edcc52 in the advanced hydrogen-bond course modules. Their `id` fields are
+invalid under those notebooks' declared 4.4 schema. Removing exactly these four
+new fields preserves their declared format, every source cell, metadata, code,
+output and order, including the new addon explanation. The existing raw-JSON
+schema guard fails on the source revision and passes after this correction.
+
+```bash
+python -m pytest tests/documentation/test_directive_rendering.py devtools/tests/test_course_takeaway_rendering.py devtools/tests/test_documentation_notebook_schema.py --receptor=llm -n 12
+python -m pytest --doctest-modules molsysmt/basic/iterator.py molsysmt/topology/get_sequence_identity.py tests/basic/iterator/test_iterator.py tests/topology/get_sequence_identity/test_get_sequence_identity.py --receptor=llm -n 12
+python -m sphinx -E -a -q -j 12 -b html -w <warning-log> docs docs/_build/html
+```
+
+The final documentation regression passes 519 cases without skips. The focused
+API/doctest run passes 15 cases; its legacy-H5MSM/off-axis warnings remain
+visible. The rendering regression retains MyST's Sphinx-11 API deprecation
+warnings. These provider warnings are separate from the Sphinx site inventory.
+
+The forced full-site comparison is **465 to 456 warnings**, with zero errors:
+four highlighting warnings, one footnote, one list-format warning, one duplicate
+label and two broken links disappear. Remaining counts are 435 myst.header,
+17 toc.not_included and four myst.xref_missing. All other warning families are
+zero. Notebook execution remains off. The parent/child navigation guard also
+checks preservation of the original parent anchor.
+
+The [receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/documentation_reference_repair_20261027.json)
+retains source identities, preservation proofs, warning inventories, log digests
+and test intent. Ruff lint/format, citation and developer-guide checks pass.
+#144 remains partial: the remaining internal navigation/reference debt and course
+heading policy are not silently hidden or rewritten. This checkpoint is not a
+full scientific-suite, installed-pair, performance or release qualification.
+
+
+## Published source boundary and API navigation repair — 2026-10-27
+
+On source 050375083, the preceding forced-site checkpoint has 456 warnings:
+435 header warnings, 17 orphan documents and four unresolved source links.
+The seventeen documents have two different dispositions; eliminating warnings
+alone would not justify excluding useful public content.
+
+Five public API documents are connected to their owning indexes. The bond
+reference now appears in the element toctree and documents the two existing
+unit-bearing heuristic data exports and their coverage limits. Four historical
+hydrogen-bond import pages appear under a clearly named compatibility section
+of the canonical hydrogen-bond API. Their existing paths and all canonical
+entries remain unchanged. No Python export, chemical criterion or unit changes.
+
+Twelve documents are repository-only material: root contributor instructions,
+the documentation README, two alternate index drafts, the unfinished Supported
+scratch notebook, the contributor course README, the authoring template and
+the course devtools/pending-fix/pending-proposal records. They remain in Git with
+specific publication exclusions. Existing nested-instruction exclusions gain
+their missing root counterparts. The scratch notebook has no narrative/title
+and includes the removed supported.viewers surface; the maintained capability
+API remains published. All 156 course modules and course navigation indexes
+remain published. The documentation README now points to the real Pages
+workflow/environment, correct PyData theme and code-fingerprint execution rule;
+it no longer advertises nonexistent Read the Docs configuration/requirements.
+Source-relative links in contributor guides remain valid in their repository
+context. The template's placeholder is not promoted into a public lesson.
+
+The source-boundary guard uses Sphinx's actual Project discovery, not a string
+check for exclusion names. It verifies the twelve repository-only documents
+are absent and every actual User Guide/API source, manifested public page and
+course module remains discoverable. Manifested contributor files must exist
+and stay outside that published set. This catches stale get_plane and thirds
+manifest paths; they now name the existing get_least_squares_plane and
+third_party pages and their matching instructions.
+
+A miniature site renders the actual element and hydrogen-bond source trees,
+checking both navigation and real API import paths. Its tutorial labels are
+read from existing public sources. Negative controls restore the old discovery
+boundary and remove the five API connections; they reproduce the twelve leaks
+and five orphan warnings. Initial fixture attempts reveal the old manifest
+paths, missing tutorial context and three tutorials living under interactions
+rather than hbonds. An initial autodata description pulls in a built-in dict
+docstring and produces parser errors; explicit py:data declarations document
+the existing exported data without rendering that unrelated built-in text.
+That exploratory full-site build is not successful qualification merely
+because Sphinx returns zero despite docutils errors.
+
+```bash
+python -m pytest tests/documentation/test_source_boundary.py tests/documentation/test_directive_rendering.py devtools/tests/test_course_takeaway_rendering.py devtools/tests/test_documentation_notebook_schema.py devtools/tests/test_public_api_docs.py --receptor=llm -n 12
+python -m sphinx -E -a -q -j 12 -b html -w <warning-log> docs docs/_build/html
+```
+
+The regression passes **554 tests**, without skips. Sphinx/Napoleon
+deprecations and three expected legacy-H5MSM warnings remain visible in pytest;
+they are separate from site-build diagnostics. The final full-site build has
+zero errors and **433 warnings, all myst.header**. The 17 orphan and four
+reference warnings disappear. Two additional header warnings belonged to the
+excluded authoring template: no public course heading is reformatted and no
+warning category is suppressed.
+
+The previous generated HTML output is removed before the source-boundary build
+so obsolete pages cannot survive as stale files. Final HTML/search-index checks
+verify the twelve exclusions and the five retained public pages. Package source
+and every notebook are unchanged; the four pre-existing generated RST edits
+retain their original hashes and remain outside this commit. The
+[receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/documentation_navigation_repair_20261027.json)
+records discovery, rendered-output checks, warning provenance and unsuccessful
+attempts. Ruff lint/format and developer-guide checks pass. #144 stays partial
+for the explicit heading-policy debt, without a new release qualification.
+
+
+## Continuous headings and strict compilation closeout — 2026-10-27
+
+The retained source checkpoint at 896556999 has 433 myst.header warnings:
+424 in course modules and nine in the home page and three other public pages.
+The maintainer explicitly approves replacing the course's skipped H3/H4 rule
+with continuous H1/H2/H3 source headings. Inspection of the actual PyData output
+shows that Sphinx already renders those skipped sections as H2/H3; the old
+instruction's Sphinx Book Theme typography rationale does not describe the
+current build.
+
+A MyST-token-driven, staged transform changes 441 heading markers in 98 course
+notebooks, two in the excluded authoring template and six in the two User Guide
+pages and return-types guide. It tracks original parent relationships across
+cells, so existing H2 sections and nested subsections retain their meaning.
+Fenced examples and directives remain opaque. Every other Markdown character
+and every notebook JSON value is preserved, including code, results, cell IDs,
+execution counts and metadata. An initial line-array assumption is rejected
+before any write; the final transform also preserves multi-line source items
+without reformatting notebook JSON.
+
+The course instructions and template now use the approved semantic hierarchy.
+All 38 existing paired course contracts are read and their protected scientific
+content is retained. The pre-existing absence of 118 other paired contracts is
+reported separately in uibcdf/molsysmt#512 and deferred after 1.0; it is not
+replaced with empty generated contracts or added to this warning-repair scope.
+
+The home page gains one semantic MolSysMT title with its index-top anchor.
+Scoped CSS clips only that title visually while retaining it in the document;
+the existing logos remain the visible header and the three section sizes retain
+their previous H1 font-size variable. The Install/Use/Citation headings become
+H2 under the proper title. All prior text, image attributes, links and IDs are
+preserved. Browser inventory is empty in this session: DOM/CSS checks are
+executed, but no live browser, pixel comparison or screen-reader qualification
+is claimed. The temporary loopback preview server is stopped.
+
+Complete article comparison covers the 101 normalized published pages. Twenty-two
+are byte-identical. In the other 79, Sphinx closes section tags on the other side
+of an adjacent horizontal rule; canonicalizing only that delimiter placement
+and inter-tag whitespace makes all 101 equal. Heading tags, content, attributes,
+links and anchors otherwise remain unchanged. No course typography change is
+needed. Home comparison separately removes only its added title and verifies
+all original text, links, images and anchor IDs.
+
+An initial parallel strict build exposes an independent pre-existing duplicate:
+the Basic and Element is_composed_of tutorials share Tutorial_Is_composed_of.
+Both sources are unchanged by the heading transform. Preserve the Basic anchor
+used by its public API docstring; the Element tutorial receives
+Tutorial_Element_Is_composed_of and its caller link is corrected. The global
+Markdown-label guard checks actual MyST targets with Docutils name normalization,
+so detection no longer depends on which documents a parallel reader processes.
+Both additional notebook changes affect only those Markdown references.
+
+The canonical documentation workflow now passes -q -j 12 -W --keep-going to its
+existing v3.0.0 publication action. Inspection of that exact provider revision
+confirms those options reach sphinx-build and failure precedes publication.
+The guard reads the real YAML options and executes Sphinx on a deliberately
+bad heading: actual CI options reject it, while removing -W returns success.
+This tests behavior, not the presence of a flag-shaped string. The release gate
+now requires warning-clean compilation across the complete published source set.
+
+```bash
+python -m pytest tests/documentation/test_heading_structure.py tests/documentation/test_source_boundary.py tests/documentation/test_directive_rendering.py devtools/tests/test_course_takeaway_rendering.py devtools/tests/test_documentation_notebook_schema.py devtools/tests/test_public_api_docs.py --receptor=llm -n 12
+python devtools/scripts/validate_course.py
+python -m sphinx -E -a -q -j 12 -W --keep-going -b html -w <warning-log> docs docs/_build/html
+python -m sphinx -E -a -q -j 1 -W --keep-going -b html -w <serial-warning-log> docs docs/_build/html
+```
+
+Final regression: **565 passed in 22.80 s**, no failures or skips. The visible
+573 pytest warnings are Sphinx/Napoleon/MyST deprecations and three legacy-H5MSM
+notices, separate from site-build diagnostics. Both full strict builds exit
+zero with **zero Sphinx warnings and zero errors**. Serial validation is an
+additional deterministic global-label check motivated by the newly exposed
+collision; the ordinary 12-worker profile also passes. Course validation retains
+all 156 modules, toctrees, manifest entries and semantic labels.
+
+The [heading receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/documentation_heading_repair_20261027.json)
+records the maintainer decision, source/JSON preservation, HTML comparison,
+unsuccessful attempts, strict logs and executed guard intent. All earlier family
+receipts retain their original measurements. The complete warning population is
+now zero without warning suppression or additional source exclusions. All current
+API references import, published navigation is intentional, course headings and
+directives follow maintained rules, and raw notebook schema validation passes.
+
+This satisfies #144's source closure criteria. It does not publish the rebuilt
+site, qualify an installed pair, certify the science of historical notebooks or
+authorize a release. Exact-candidate and public-artifact work remains separate
+under uibcdf/molsysmt#334.
+
+
+### Concurrent source integration checkpoint — 2026-10-27
+
+While preparing closeout, the shared main receives 2baf16426 (the synchronized
+Discussions/naming guide) and 8d129124e (an independently owned detector addon
+change). Both are reviewed and retained. The latter appends its own explanation
+to four advanced hydrogen-bond modules and extends the addon guide. Our heading
+edits remain separate from those additions; no new paragraph, example or result
+is removed to recover an old hash. The original 101-article comparison above
+retains its earlier checkpoint identity. The final receiving receipt separately
+records the 97 equivalent articles and four modules with the committed new prose,
+checking preservation against the new parent as well as the original source.
+
+Documentation regression and strict parallel/serial builds are repeated on the
+combined source. They do not qualify the unrelated addon implementation, whose
+owner retains its evidence. The closing guard names its defining devtools test
+module: the normal-discovery re-export is executable, but the local static guard
+index accepts definitions rather than re-exported function selectors.

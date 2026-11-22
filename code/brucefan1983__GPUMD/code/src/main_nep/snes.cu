@@ -1,0 +1,277 @@
+/*
+    Copyright 2017 Zheyong Fan and GPUMD development team
+    This file is part of GPUMD.
+    GPUMD is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+    GPUMD is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Lesser General Public License for more details.
+    You should have received a copy of the GNU Lesser General Public License
+    along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+/*----------------------------------------------------------------------------80
+Use the separable natural evolution strategy (SNES) to fit potential parameters.
+
+Reference:
+
+T. Schaul, T. Glasmachers, and J. Schmidhuber,
+High Dimensions and Heavy Tails for Natural Evolution Strategies,
+https://doi.org/10.1145/2001576.2001692
+
+Major contributors:
+  Zheyong Fan: Initial implementation.
+  Eric Lindgren: Configurable model and restart checkpoints.
+  Paul Erhart: Configurable random seeds and training output intervals.
+------------------------------------------------------------------------------*/
+
+#include "fitness.cuh"
+#include "parameters.cuh"
+#include "potential.cuh"
+#include "snes.cuh"
+#include "utilities/error.cuh"
+#include "utilities/gpu_macro.cuh"
+#include <chrono>
+#include <cmath>
+
+static __global__ void initialize_curand_states(gpurandState* state, int N, int seed)
+{
+  int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n < N) {
+    gpurand_init(seed, n, 0, &state[n]);
+  }
+}
+
+SNES::SNES(Parameters& para, Potential& potential) : potential(potential)
+{
+  maximum_generation = para.maximum_generation;
+  number_of_variables = para.number_of_variables;
+  population_size = para.population_size;
+  const int N = population_size * number_of_variables;
+  int num = number_of_variables / para.num_types;
+  eta_sigma = (3.0f + std::log(num * 1.0f)) / (5.0f * sqrt(num * 1.0f)) / 2.0f;
+  fitness_total.resize(population_size * (para.num_types + 1));
+  index.resize(population_size * (para.num_types + 1));
+  population.resize(N);
+  mu.resize(number_of_variables);
+  sigma.resize(number_of_variables);
+  utility.resize(population_size);
+  initialize_rng(para.seed);
+
+  gpuSetDevice(0); // normally use GPU-0
+  gpu_type_of_variable.resize(number_of_variables);
+  gpu_index.resize(population_size * (para.num_types + 1));
+  gpu_utility.resize(population_size);
+  gpu_sigma.resize(number_of_variables);
+  gpu_mu.resize(number_of_variables);
+  gpu_s.resize(N);
+  gpu_population.resize(N);
+  curand_states.resize(N);
+  initialize_curand_states<<<(N - 1) / 128 + 1, 128>>>(
+    curand_states.data(), N, para.seed >= 0 ? para.seed : 1234567);
+  GPU_CHECK_KERNEL
+
+  potential.initialize_parameters(rng, mu, sigma);
+  gpuSetDevice(0); // normally use GPU-0
+  gpu_mu.copy_from_host(mu.data());
+  gpu_sigma.copy_from_host(sigma.data());
+
+  calculate_utility();
+  gpu_utility.copy_from_host(utility.data());
+  potential.parameter_groups(type_of_variable);
+  gpu_type_of_variable.copy_from_host(type_of_variable.data());
+}
+
+void SNES::initialize_rng(const int seed)
+{
+  if (seed >= 0) {
+    rng = std::mt19937(seed);
+    return;
+  }
+#ifdef DEBUG
+  rng = std::mt19937(12345678);
+#else
+  rng = std::mt19937(std::chrono::system_clock::now().time_since_epoch().count());
+#endif
+};
+
+void SNES::calculate_utility()
+{
+  float utility_sum = 0.0f;
+  for (int n = 0; n < population_size; ++n) {
+    utility[n] = std::max(0.0f, std::log(population_size * 0.5f + 1.0f) - std::log(n + 1.0f));
+    utility_sum += utility[n];
+  }
+  for (int n = 0; n < population_size; ++n) {
+    utility[n] = utility[n] / utility_sum - 1.0f / population_size;
+  }
+}
+
+void SNES::run(Parameters& para, Fitness* fitness_function)
+{
+  print_line_1();
+  printf("Started training.\n");
+  print_line_2();
+
+  fitness_function->print_training_header();
+
+  for (int n = 0; n < maximum_generation; ++n) {
+    create_population();
+    potential.set_population_mean(gpu_mu.data());
+    fitness_function->compute(
+      n,
+      para,
+      population.data(),
+      gpu_population.data(),
+      gpu_type_of_variable.data(),
+      fitness_total.data());
+
+    sort_population(para);
+
+    std::string checkpoint_base;
+    if (0 == (n + 1) % para.save_potential) {
+      fitness_function->get_save_potential_label(para, n, checkpoint_base);
+    }
+
+    int best_index = index[para.num_types * population_size];
+    fitness_function->report_error(
+      para,
+      n,
+      fitness_total[para.num_types * population_size + 0], // already sorted, hence 0
+      best_index,
+      population.data() + number_of_variables * best_index,
+      checkpoint_base);
+
+    update_mu_and_sigma();
+    if (0 == (n + 1) % para.output_interval) {
+      const char* filename = "nep.restart";
+      output_mu_and_sigma(para, filename);
+    }
+    // Optionally save the nep.restart file at the same time as save_potential
+    if (!checkpoint_base.empty() && para.save_potential_restart) {
+      const std::string restart_file = checkpoint_base + ".restart";
+      output_mu_and_sigma(para, restart_file.c_str());
+    }
+  }
+}
+
+static __global__ void gpu_create_population(
+  const int N,
+  const int number_of_variables,
+  const float* g_mu,
+  const float* g_sigma,
+  gpurandState* g_state,
+  float* g_s,
+  float* g_population)
+{
+  int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n < N) {
+    int v = n % number_of_variables;
+    gpurandState state = g_state[n];
+    float s = gpurand_normal(&state);
+    g_s[n] = s;
+    g_population[n] = g_sigma[v] * s + g_mu[v];
+    g_state[n] = state;
+  }
+}
+
+void SNES::create_population()
+{
+  gpuSetDevice(0); // normally use GPU-0
+  const int N = population_size * number_of_variables;
+  gpu_create_population<<<(N - 1) / 128 + 1, 128>>>(
+    N,
+    number_of_variables,
+    gpu_mu.data(),
+    gpu_sigma.data(),
+    curand_states.data(),
+    gpu_s.data(),
+    gpu_population.data());
+  GPU_CHECK_KERNEL
+  gpu_population.copy_to_host(population.data());
+}
+
+static void insertion_sort(float array[], int index[], int n)
+{
+  for (int i = 1; i < n; i++) {
+    float key = array[i];
+    int j = i - 1;
+    while (j >= 0 && array[j] > key) {
+      array[j + 1] = array[j];
+      index[j + 1] = index[j];
+      --j;
+    }
+    array[j + 1] = key;
+    index[j + 1] = i;
+  }
+}
+
+void SNES::sort_population(Parameters& para)
+{
+  for (int t = 0; t < para.num_types + 1; ++t) {
+    for (int n = 0; n < population_size; ++n) {
+      index[t * population_size + n] = n;
+    }
+
+    insertion_sort(
+      fitness_total.data() + t * population_size,
+      index.data() + t * population_size,
+      population_size);
+  }
+}
+
+static __global__ void gpu_update_mu_and_sigma(
+  const int population_size,
+  const int number_of_variables,
+  const float eta_sigma,
+  const int* g_type_of_variable,
+  const int* g_index,
+  const float* g_utility,
+  const float* g_s,
+  float* g_mu,
+  float* g_sigma)
+{
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  if (v < number_of_variables) {
+    const int type = g_type_of_variable[v];
+    float gradient_mu = 0.0f, gradient_sigma = 0.0f;
+    for (int p = 0; p < population_size; ++p) {
+      const int pv = g_index[type * population_size + p] * number_of_variables + v;
+      const float utility = g_utility[p];
+      const float s = g_s[pv];
+      gradient_mu += s * utility;
+      gradient_sigma += (s * s - 1.0f) * utility;
+    }
+    const float sigma = g_sigma[v];
+    g_mu[v] += sigma * gradient_mu;
+    g_sigma[v] = fminf(sigma * exp(eta_sigma * gradient_sigma), 1.0f);
+  }
+}
+
+void SNES::update_mu_and_sigma()
+{
+  gpuSetDevice(0); // normally use GPU-0
+  gpu_index.copy_from_host(index.data());
+  gpu_update_mu_and_sigma<<<(number_of_variables - 1) / 128 + 1, 128>>>(
+    population_size,
+    number_of_variables,
+    eta_sigma,
+    gpu_type_of_variable.data(),
+    gpu_index.data(),
+    gpu_utility.data(),
+    gpu_s.data(),
+    gpu_mu.data(),
+    gpu_sigma.data());
+  GPU_CHECK_KERNEL;
+}
+
+void SNES::output_mu_and_sigma(Parameters& para, const char* filename)
+{
+  gpuSetDevice(0); // normally use GPU-0
+  gpu_mu.copy_to_host(mu.data());
+  gpu_sigma.copy_to_host(sigma.data());
+  potential.write_restart(filename, mu, sigma);
+}

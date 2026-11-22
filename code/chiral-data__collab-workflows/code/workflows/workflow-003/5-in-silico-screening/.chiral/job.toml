@@ -1,0 +1,25 @@
+name = "5 Virtual Screening using SMINA"
+description = "Virtual screening using SMINA molecular docking"
+inputs = ["*.pdb", "ligand_library"]
+outputs = ["docking_results", "results"]
+
+[container]
+image = "ghcr.io/chiral-data/smina:2025_11_06"
+
+[scripts]
+run = "run.sh"
+
+[params.exhaustiveness]
+type = "integer"
+default = 8
+hint = "smina config"
+
+[params.num_modes]
+type = "integer"
+default = 5
+hint = "smina config"
+
+[params.energy_range]
+type = "integer"
+default = 4
+hint = "smina config"

@@ -1,0 +1,778 @@
+import warnings
+
+import numpy as np
+import pytest
+
+from csubst import main_simulate
+from csubst import tree
+from csubst import ete
+from csubst import output_safety
+
+
+@pytest.mark.parametrize("suffix", ["state", "treefile", "rate", "iqtree", "log", "anc.fa"])
+@pytest.mark.parametrize("alias", ["direct", "symlink", "hardlink"])
+def test_true_asr_bundle_preserves_protected_files(tmp_path, suffix, alias):
+    import os
+
+    anc = tmp_path / "anc.fa"
+    anc.write_text(">R\nAAA\n")
+    target = tmp_path / ("export." + suffix)
+    protected = target if alias == "direct" else tmp_path / "input"
+    protected.write_text("original input or log\n")
+    if alias == "symlink":
+        target.symlink_to(protected)
+    elif alias == "hardlink":
+        os.link(protected, target)
+    g = {
+        "tree": tree.add_numerical_node_labels(ete.PhyloNode("(A:1,B:1)R;", format=1)),
+        "eq_freq": np.full(61, 1 / 61),
+        "genetic_code": 1,
+        "background_omega": 0.2,
+    }
+    with output_safety.output_context([("input or log", protected)]):
+        with pytest.raises(ValueError, match="must not overwrite"):
+            main_simulate.write_true_asr_bundle(g, str(anc), str(tmp_path / "export"))
+    assert protected.read_text() == "original input or log\n"
+    assert list(tmp_path.glob("export.*")) == [target]
+
+
+def test_get_num_adjusted_sites_does_not_mutate_parent_state_tensor():
+    tr = tree.add_numerical_node_labels(ete.PhyloNode("(A:1,B:1)R;", format=1))
+    nodes = {n.name: int(ete.get_prop(n, "numerical_label")) for n in tr.traverse()}
+    a_node = [n for n in tr.traverse() if n.name == "A"][0]
+    state_cdn = np.zeros((len(nodes), 1, 2), dtype=float)
+    state_cdn[nodes["R"], 0, :] = [0.6, 0.4]
+    state_cdn[nodes["A"], 0, :] = [0.0, 0.0]
+    state_cdn[nodes["B"], 0, :] = [1.0, 0.0]
+    g = {
+        "state_cdn": state_cdn.copy(),
+        "codon_orders": np.array(["AAA", "AAG"]),
+        "codon_table": [["K", "AAA"], ["K", "AAG"]],
+        "instantaneous_codon_rate_matrix": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=float),
+    }
+    parent_before = g["state_cdn"][nodes["R"], :, :].copy()
+    tree.get_num_adjusted_sites(g=g, node=a_node)
+    np.testing.assert_allclose(g["state_cdn"][nodes["R"], :, :], parent_before, atol=1e-12)
+
+
+def test_get_num_adjusted_sites_uses_nearest_stateful_parent_after_reroot():
+    iqtree_like = ete.PhyloNode("(A:1,B:1,(C:1,D:1)Y:1)R;", format=1)
+    rooted = ete.PhyloNode("(A:1,(B:1,(C:1,D:1)Y:1):1)RR;", format=1)
+    tr = tree.add_numerical_node_labels(tree.transfer_root(tree_to=iqtree_like, tree_from=rooted))
+    labels = {n.name: int(ete.get_prop(n, "numerical_label")) for n in tr.traverse() if n.name}
+    b_node = [n for n in tr.traverse() if n.name == "B"][0]
+    num_node = max(int(ete.get_prop(n, "numerical_label")) for n in tr.traverse()) + 1
+    state_cdn = np.zeros((num_node, 1, 2), dtype=float)
+    state_cdn[labels["R"], 0, :] = [1.0, 0.0]
+    state_cdn[labels["Y"], 0, :] = [1.0, 0.0]
+    state_cdn[labels["A"], 0, :] = [1.0, 0.0]
+    state_cdn[labels["B"], 0, :] = [0.0, 1.0]
+    state_cdn[labels["C"], 0, :] = [1.0, 0.0]
+    state_cdn[labels["D"], 0, :] = [1.0, 0.0]
+    g = {
+        "state_cdn": state_cdn,
+        "codon_orders": np.array(["AAA", "AAG"]),
+        "codon_table": [["K", "AAA"], ["K", "AAG"]],
+        "instantaneous_codon_rate_matrix": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=float),
+        "float_tol": 1e-12,
+    }
+    adjusted_s, adjusted_n = tree.get_num_adjusted_sites(g=g, node=b_node)
+    assert adjusted_s > 0.0
+    assert pytest.approx(adjusted_n, abs=1e-12) == 0.0
+
+
+def test_biased_index_helpers_match_manual_pairs():
+    codon_table = [["K", "AAA"], ["K", "AAG"], ["N", "AAC"], ["*", "TAA"]]
+    codon_order = np.array(["AAA", "AAG", "AAC"])
+    biased_aas = np.array(["K"])
+    nsy_idx = main_simulate.get_biased_nonsynonymous_substitution_index(biased_aas, codon_table, codon_order)
+    np.testing.assert_array_equal(nsy_idx, [[2, 0], [2, 1]])
+    cdn_idx = main_simulate.get_biased_codon_index(biased_aas, codon_table, codon_order)
+    np.testing.assert_array_equal(cdn_idx, [[0], [1]])
+
+
+def test_get_synonymous_codon_substitution_index_manual_count():
+    g = {"codon_table": [["K", "AAA"], ["K", "AAG"], ["N", "AAC"]]}
+    codon_order = np.array(["AAA", "AAG", "AAC"])
+    out = main_simulate.get_synonymous_codon_substitution_index(g, codon_order)
+    np.testing.assert_array_equal(out, [[0, 1], [1, 0]])
+
+
+def test_rescale_substitution_matrix_with_eq_freq_normalizes_expected_rate():
+    mat = np.array([[-1.0, 1.0], [2.0, -2.0]], dtype=float)
+    idx = np.array([[0, 1]], dtype=int)
+    eq = np.array([0.9, 0.1], dtype=float)
+    out = main_simulate.rescale_substitution_matrix(mat, idx, scaling_factor=2.0, eq_freq=eq)
+    np.testing.assert_allclose(out.sum(axis=1), [0.0, 0.0], atol=1e-12)
+    expected_rate = float(np.sum(eq * (-np.diag(out))))
+    assert expected_rate == pytest.approx(1.0, abs=1e-12)
+
+
+def test_bias_eq_freq_scales_and_renormalizes():
+    eq = np.array([0.2, 0.3, 0.5], dtype=float)
+    out = main_simulate.bias_eq_freq(eq, biased_cdn_index=np.array([[0], [1]]), convergence_intensity_factor=2.0)
+    # pre-normalization: [0.4, 0.6, 0.5] -> normalized by 1.5
+    np.testing.assert_allclose(out, [4 / 15, 6 / 15, 5 / 15], atol=1e-12)
+
+
+def test_get_biased_amino_acids_rejects_oversized_random_request():
+    codon_table = [["K", "AAA"], ["K", "AAG"], ["N", "AAC"]]
+    with pytest.raises(ValueError, match="exceeds available amino acids"):
+        main_simulate.get_biased_amino_acids("random3", codon_table)
+
+
+def test_get_biased_amino_acids_rejects_unknown_symbol():
+    codon_table = [["K", "AAA"], ["K", "AAG"], ["N", "AAC"]]
+    with pytest.raises(ValueError, match="Unknown amino acid"):
+        main_simulate.get_biased_amino_acids("Z", codon_table)
+
+
+def test_get_biased_amino_acids_random_mode_is_reproducible_with_rng():
+    codon_table = [["K", "AAA"], ["K", "AAG"], ["N", "AAC"], ["F", "TTT"], ["F", "TTC"]]
+    rng_a = np.random.default_rng(17)
+    rng_b = np.random.default_rng(17)
+    out_a1 = main_simulate.get_biased_amino_acids("random1", codon_table, rng=rng_a)
+    out_a2 = main_simulate.get_biased_amino_acids("random1", codon_table, rng=rng_a)
+    out_b1 = main_simulate.get_biased_amino_acids("random1", codon_table, rng=rng_b)
+    out_b2 = main_simulate.get_biased_amino_acids("random1", codon_table, rng=rng_b)
+    np.testing.assert_array_equal(out_a1, out_b1)
+    np.testing.assert_array_equal(out_a2, out_b2)
+
+
+def test_explicit_biased_amino_acids_form_a_set():
+    codon_table = [["K", "AAA"], ["N", "AAC"]]
+    np.testing.assert_array_equal(
+        main_simulate.get_biased_amino_acids("KNK", codon_table), ["K", "N"],
+    )
+
+
+def test_apply_percent_biased_sub_preserves_foreground_omega():
+    mat = np.array(
+        [[-1.0, 0.5, 0.5], [0.5, -1.0, 0.5], [0.5, 0.5, -1.0]],
+        dtype=float,
+    )
+    all_syn = np.array([[0, 1], [1, 0]])
+    all_nsy = np.array([[0, 2], [1, 2], [2, 0], [2, 1]])
+    codon_table = [["K", "AAA"], ["K", "AAG"], ["N", "AAC"]]
+    out = main_simulate.apply_percent_biased_sub(
+        mat=mat,
+        percent_biased_sub=20,
+        target_index=np.array([[2, 0], [2, 1]]),
+        biased_aas=np.array(["K"]),
+        codon_table=codon_table,
+        codon_orders=np.array(["AAA", "AAG", "AAC"]),
+        all_nsy_cdn_index=all_nsy,
+        all_syn_cdn_index=all_syn,
+        foreground_omega=2.0,
+    )
+    dnds = main_simulate.get_total_Q(out, all_nsy) / main_simulate.get_total_Q(out, all_syn)
+    assert pytest.approx(dnds, rel=0, abs=1e-12) == 2.0
+    np.testing.assert_allclose(out.sum(axis=1), [0.0, 0.0, 0.0], atol=1e-12)
+
+
+def test_apply_percent_biased_sub_with_no_targets_rescales_omega_without_nan():
+    mat = np.array(
+        [[-1.0, 0.5, 0.5], [0.5, -1.0, 0.5], [0.5, 0.5, -1.0]],
+        dtype=float,
+    )
+    all_syn = np.array([[0, 1], [1, 0]])
+    all_nsy = np.array([[0, 2], [1, 2], [2, 0], [2, 1]])
+    codon_table = [["K", "AAA"], ["K", "AAG"], ["N", "AAC"]]
+    out = main_simulate.apply_percent_biased_sub(
+        mat=mat,
+        percent_biased_sub=20,
+        target_index=np.zeros((0, 2), dtype=int),
+        biased_aas=np.array([], dtype=str),
+        codon_table=codon_table,
+        codon_orders=np.array(["AAA", "AAG", "AAC"]),
+        all_nsy_cdn_index=all_nsy,
+        all_syn_cdn_index=all_syn,
+        foreground_omega=2.0,
+    )
+    dnds = main_simulate.get_total_Q(out, all_nsy) / main_simulate.get_total_Q(out, all_syn)
+    assert np.isfinite(out).all()
+    assert pytest.approx(dnds, rel=0, abs=1e-12) == 2.0
+
+
+@pytest.mark.parametrize(
+    "g,pattern",
+    [
+        ({"num_simulated_site": 0, "percent_convergent_site": 10, "percent_biased_sub": 90}, "num_simulated_site"),
+        ({"num_simulated_site": 10, "percent_convergent_site": -1, "percent_biased_sub": 90}, "percent_foreground_sites"),
+        ({"num_simulated_site": 10, "percent_convergent_site": 101, "percent_biased_sub": 90}, "percent_foreground_sites"),
+        ({"num_simulated_site": 10, "percent_convergent_site": 10, "percent_biased_sub": 100}, "target_bias_strength"),
+    ],
+)
+def test_validate_simulate_params_rejects_out_of_range_values(g, pattern):
+    with pytest.raises(ValueError, match=pattern):
+        main_simulate._validate_simulate_params(g)
+
+
+def test_evolve_nonconvergent_partition_forwards_seed_to_pyvolve(monkeypatch):
+    call_kwargs = {}
+
+    class DummyModel:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+    class DummyPartition:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+    class DummyEvolver:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        def __call__(self, **kwargs):
+            call_kwargs.update(kwargs)
+
+    class DummyPyvolve:
+        Model = DummyModel
+        Partition = DummyPartition
+        Evolver = DummyEvolver
+
+    monkeypatch.setattr(main_simulate, "_PYVOLVE", DummyPyvolve())
+    g = {
+        "num_convergent_site": 0,
+        "num_simulated_site": 5,
+        "background_Q": np.array([[-1.0, 1.0], [1.0, -1.0]], dtype=float),
+        "background_tree": object(),
+        "simulate_seed_nonconvergent": 101,
+    }
+    main_simulate.evolve_nonconvergent_partition(g)
+    assert call_kwargs["seed"] == 101
+    assert call_kwargs["seqfile"] == "tmp.csubst.simulate_nonconvergent.fa"
+
+
+def test_resolve_simulation_site_rates_no_mode_returns_ones():
+    g = {"num_simulated_site": 4, "simulate_asrv": "no"}
+    out = main_simulate._resolve_simulation_site_rates(g)
+    assert np.array_equal(out, np.ones(4, dtype=float))
+
+
+def test_resolve_simulation_site_rates_file_mode_wraps_when_needed():
+    g = {
+        "num_simulated_site": 5,
+        "simulate_asrv": "file",
+        "iqtree_rate_values": np.array([0.5, 1.0, 2.0], dtype=float),
+    }
+    out = main_simulate._resolve_simulation_site_rates(g)
+    assert np.allclose(out, np.array([0.5, 1.0, 2.0, 0.5, 1.0], dtype=float))
+
+
+def test_resolve_simulation_background_omega_falls_back_to_iqtree_then_default():
+    assert main_simulate._resolve_simulation_background_omega({"background_omega": 0.7, "omega": 1.2}) == pytest.approx(0.7, abs=1e-12)
+    g_iq = {"background_omega": None, "omega": 0.42}
+    out_iq = main_simulate._resolve_simulation_background_omega(g_iq)
+    assert out_iq == pytest.approx(0.42, abs=1e-12)
+    g_default = {"background_omega": None, "omega": None}
+    out_default = main_simulate._resolve_simulation_background_omega(g_default)
+    assert out_default == pytest.approx(0.2, abs=1e-12)
+
+
+def test_resolve_simulation_eq_freq_auto_prefers_iqtree_and_reorders(monkeypatch):
+    class _DummyReadFrequencies:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def compute_frequencies(self):
+            raise AssertionError("alignment fallback should not be used when IQ-TREE frequencies exist")
+
+    class _DummyPyvolve:
+        ReadFrequencies = _DummyReadFrequencies
+
+    monkeypatch.setattr(main_simulate, "_PYVOLVE", _DummyPyvolve())
+    g = {
+        "simulate_eq_freq": "auto",
+        "equilibrium_frequency": np.array([0.2, 0.3, 0.5], dtype=float),
+        "codon_orders": np.array(["AAA", "AAC", "AAG"], dtype=object),
+        "pyvolve_codon_orders": np.array(["AAG", "AAA", "AAC"], dtype=object),
+        "alignment_file": "dummy.fa",
+    }
+    out = main_simulate._resolve_simulation_eq_freq(g)
+    np.testing.assert_allclose(out, np.array([0.5, 0.2, 0.3], dtype=float), atol=1e-12)
+
+
+def test_resolve_simulation_eq_freq_alignment_mode_uses_alignment_frequencies(monkeypatch):
+    class _DummyReadFrequencies:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def compute_frequencies(self):
+            return np.array([0.1, 0.2, 0.7], dtype=float)
+
+    class _DummyPyvolve:
+        ReadFrequencies = _DummyReadFrequencies
+
+    monkeypatch.setattr(main_simulate, "_PYVOLVE", _DummyPyvolve())
+    g = {
+        "simulate_eq_freq": "alignment",
+        "pyvolve_codon_orders": np.array(["AAA", "AAC", "AAG"], dtype=object),
+        "alignment_file": "dummy.fa",
+    }
+    out = main_simulate._resolve_simulation_eq_freq(g)
+    np.testing.assert_allclose(out, np.array([0.1, 0.2, 0.7], dtype=float), atol=1e-12)
+
+
+def test_evolve_nonconvergent_partition_uses_sitewise_rates_when_asrv_file(monkeypatch):
+    call_kwargs = {}
+    model_matrices = []
+    partition_sizes = []
+    partition_models = []
+
+    class DummyModel:
+        def __init__(self, *args, **kwargs):
+            model_matrices.append(np.array(kwargs["parameters"]["matrix"], dtype=float))
+
+    class DummyPartition:
+        def __init__(self, *args, **kwargs):
+            partition_sizes.append(int(kwargs["size"]))
+            partition_models.append(kwargs["models"])
+
+    class DummyEvolver:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        def __call__(self, **kwargs):
+            call_kwargs.update(kwargs)
+
+    class DummyPyvolve:
+        Model = DummyModel
+        Partition = DummyPartition
+        Evolver = DummyEvolver
+
+    monkeypatch.setattr(main_simulate, "_PYVOLVE", DummyPyvolve())
+    g = {
+        "num_convergent_site": 1,
+        "num_simulated_site": 5,
+        "background_Q": np.array([[-1.0, 1.0], [1.0, -1.0]], dtype=float),
+        "background_tree": object(),
+        "simulate_asrv": "file",
+        "simulate_rate_nonconvergent": np.array([0.5, 2.0, 3.0, 0.5], dtype=float),
+        "simulate_seed_nonconvergent": 2026,
+    }
+    main_simulate.evolve_nonconvergent_partition(g)
+    assert call_kwargs["seed"] == 2026
+    assert partition_sizes == [1, 1, 1, 1]
+    assert partition_models[0] is partition_models[3]
+    assert len(model_matrices) == 3
+    assert model_matrices[0][0, 1] == pytest.approx(0.5)
+    assert model_matrices[1][0, 1] == pytest.approx(2.0)
+    assert model_matrices[2][0, 1] == pytest.approx(3.0)
+    assert model_matrices[0][0, 0] == pytest.approx(-0.5)
+    assert model_matrices[1][0, 0] == pytest.approx(-2.0)
+    assert model_matrices[2][0, 0] == pytest.approx(-3.0)
+
+
+def test_evolve_nonconvergent_partition_reports_correct_site_range(capsys, monkeypatch):
+    class DummyModel:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class DummyPartition:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class DummyEvolver:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, **kwargs):
+            return None
+
+    class DummyPyvolve:
+        Model = DummyModel
+        Partition = DummyPartition
+        Evolver = DummyEvolver
+
+    monkeypatch.setattr(main_simulate, "_PYVOLVE", DummyPyvolve())
+    g = {
+        "num_convergent_site": 3,
+        "num_simulated_site": 10,
+        "background_Q": np.array([[-1.0, 1.0], [1.0, -1.0]], dtype=float),
+        "background_tree": object(),
+        "simulate_asrv": "no",
+        "simulate_seed_nonconvergent": None,
+    }
+    main_simulate.evolve_nonconvergent_partition(g)
+    out = capsys.readouterr().out
+    assert "Codon site 4-10; Non-convergent codons" in out
+
+
+def test_get_pyvolve_newick_marks_foreground_without_mutating_distances():
+    tr = tree.add_numerical_node_labels(ete.PhyloNode("(A:0.1,B:0.2)R;", format=1))
+    for node in tr.traverse():
+        ete.add_features(node, **{"is_fg_t": False, "foreground_lineage_id_t": 0})
+    a_node = [n for n in tr.traverse() if n.name == "A"][0]
+    ete.set_prop(a_node, "is_fg_t", True)
+    ete.set_prop(a_node, "foreground_lineage_id_t", 1)
+    out = main_simulate.get_pyvolve_newick(tr, "t")
+    assert "#m1" in out
+    assert pytest.approx(a_node.dist, rel=0, abs=1e-12) == 0.1
+
+
+def test_foreground_stem_uses_biased_model_only_on_the_stem():
+    tr = tree.add_numerical_node_labels(ete.PhyloNode('((A#1:0.1,B:0.2)U_stem:0.3,C:0.4)R_root;', format=1))
+    stem = next(node for node in tr.traverse() if node.name == 'U_stem')
+    ete.set_prop(stem, 'is_fg_t', True)
+    ete.set_prop(stem, 'foreground_lineage_id_t', 1)
+    simulated = main_simulate.get_pyvolve_tree(tr, foreground_scaling_factor=2, trait_name='t')
+    assert simulated.name == 'R_root'
+    biased = next(node for node in simulated.children if node.name == 'U_stem')
+    assert (biased.model_flag, biased.branch_length) == ('m1', 0.6)
+    assert {node.name: (node.model_flag, node.branch_length) for node in biased.children} == {
+        'A#1': ('root', 0.1), 'B': ('root', 0.2),
+    }
+    assert stem.name == 'U_stem' and stem.dist == 0.3
+
+
+def test_invariant_site_keeps_stationary_root_frequencies(tmp_path):
+    pyvolve = main_simulate._require_pyvolve()
+    frequencies = np.array([0.1, 0.2, 0.3, 0.4])
+    matrix = np.broadcast_to(frequencies, (4, 4)).copy() - np.eye(4)
+    model = main_simulate._make_pyvolve_custom_model(
+        pyvolve, {'simulate_custom_frequency_file': tmp_path / 'frequencies.txt'}, 'root',
+        matrix, rate_factor=0,
+    )
+    np.testing.assert_allclose(model.params['state_freqs'], frequencies)
+    np.testing.assert_array_equal(model.matrix, np.zeros((4, 4)))
+    part = pyvolve.Partition(models=model, size=100)
+    evolver = pyvolve.Evolver(partitions=part, tree=pyvolve.read_tree(tree='(A:1,B:2)R;'))
+    evolver(seed=4, seqfile=None, ratefile=None, infofile=None)
+    assert len(set(evolver.evolved_seqs.values())) == 1
+    assert len(set(evolver.evolved_seqs['R'])) == 4
+
+
+def test_scale_tree_multiplies_every_branch_length():
+    tr = ete.PhyloNode("(A:1.0,B:2.0)R;", format=1)
+    out = main_simulate.scale_tree(tr, 3.0)
+    dists = sorted([n.dist for n in out.traverse()])
+    assert dists == [0.0, 3.0, 6.0]
+
+
+def test_get_background_Q_rejects_unknown_method():
+    with pytest.raises(ValueError, match="Unsupported Q matrix method"):
+        main_simulate.get_background_Q({}, Q_method="unknown_method")
+
+
+def test_get_background_Q_auto_respects_target_omega_and_expected_rate(monkeypatch):
+    exchangeability = np.array(
+        [[0.0, 1.0, 2.0], [1.0, 0.0, 3.0], [2.0, 3.0, 0.0]],
+        dtype=float,
+    )
+
+    def _fake_read_exchangeability_matrix(_file, _codon_orders):
+        return exchangeability
+
+    monkeypatch.setattr(main_simulate.parser_misc, "read_exchangeability_matrix", _fake_read_exchangeability_matrix)
+    g = {
+        "substitution_model": "ECMrest+F+R4",
+        "pyvolve_codon_orders": np.array(["AAA", "AAG", "AAC"], dtype=object),
+        "eq_freq": np.array([0.2, 0.3, 0.5], dtype=float),
+        "all_syn_cdn_index": np.array([[0, 1], [1, 0]], dtype=int),
+        "all_nsy_cdn_index": np.array([[0, 2], [1, 2], [2, 0], [2, 1]], dtype=int),
+        "background_omega": 1.5,
+    }
+    out = main_simulate.get_background_Q(g, Q_method="auto")
+    dnds = main_simulate.get_total_Q(out, g["all_nsy_cdn_index"]) / main_simulate.get_total_Q(out, g["all_syn_cdn_index"])
+    assert dnds == pytest.approx(1.5, abs=1e-12)
+    expected_rate = float(np.sum(g["eq_freq"] * (-np.diag(out))))
+    assert expected_rate == pytest.approx(1.0, abs=1e-12)
+
+
+def test_concatenate_alignment_concatenates_matching_headers(tmp_path):
+    in1 = tmp_path / "a.fa"
+    in2 = tmp_path / "b.fa"
+    out = tmp_path / "out.fa"
+    in1.write_text(">A\nAAA\n>B\nCCC\n", encoding="utf-8")
+    in2.write_text(">A\nGGG\n>B\nTTT\n", encoding="utf-8")
+    main_simulate.concatenate_alignment(str(in1), str(in2), str(out))
+    assert out.read_text(encoding="utf-8") == ">A\nAAAGGG\n>B\nCCCTTT\n"
+
+
+def test_concatenate_alignment_rejects_mismatched_headers(tmp_path):
+    in1 = tmp_path / "a.fa"
+    in2 = tmp_path / "b.fa"
+    out = tmp_path / "out.fa"
+    in1.write_text(">A\nAAA\n", encoding="utf-8")
+    in2.write_text(">B\nGGG\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="FASTA headers differ"):
+        main_simulate.concatenate_alignment(str(in1), str(in2), str(out))
+
+
+def test_split_tip_and_ancestor_alignment_separates_sequences(tmp_path):
+    in_fa = tmp_path / "all.fa"
+    tip_fa = tmp_path / "tips.fa"
+    anc_fa = tmp_path / "anc.fa"
+    in_fa.write_text(">R\nAAA\n>A\nCCC\n>B\nGGG\n", encoding="utf-8")
+    n_tip, n_anc = main_simulate.split_tip_and_ancestor_alignment(
+        in_fasta=str(in_fa),
+        tip_out=str(tip_fa),
+        anc_out=str(anc_fa),
+        tip_names=["A", "B"],
+    )
+    assert (n_tip, n_anc) == (2, 1)
+    tip = main_simulate.read_fasta(str(tip_fa))
+    anc = main_simulate.read_fasta(str(anc_fa))
+    assert list(tip.keys()) == ["A", "B"]
+    assert list(anc.keys()) == ["R"]
+    assert anc["R"] == "AAA"
+
+
+def test_write_true_asr_bundle_writes_iqtree_compatible_files(tmp_path):
+    tr = tree.add_numerical_node_labels(ete.PhyloNode("(A:1,B:1)R;", format=1))
+    anc = tmp_path / "anc.fa"
+    anc.write_text(">R\nAAA\n", encoding="utf-8")
+    g = {
+        "tree": tr,
+        "eq_freq": np.full(shape=(61,), fill_value=(1 / 61), dtype=float),
+        "iqtree_model": "ECMK07+F+R4",
+        "genetic_code": 1,
+        "background_omega": 0.2,
+    }
+    prefix = str(tmp_path / "sim_true")
+    out = main_simulate.write_true_asr_bundle(g=g, anc_fasta=str(anc), prefix=prefix)
+    for key in ["state", "treefile", "rate", "iqtree", "log", "anc_fasta"]:
+        assert key in out
+        assert (tmp_path / ("sim_true" + "." + ("anc.fa" if key == "anc_fasta" else key))).exists()
+    state = (tmp_path / "sim_true.state").read_text(encoding="utf-8").splitlines()
+    assert state[0].startswith("Node\tSite\tState\tp_")
+    assert state[1].startswith("R\t1\tAAA\t")
+    iqtree_text = (tmp_path / "sim_true.iqtree").read_text(encoding="utf-8")
+    assert "Model of substitution: ECMK07+F+R4" in iqtree_text
+
+
+def test_write_true_asr_bundle_prefers_substitution_model_and_kappa(tmp_path):
+    tr = tree.add_numerical_node_labels(ete.PhyloNode("(A:1,B:1)R;", format=1))
+    anc = tmp_path / "anc.fa"
+    anc.write_text(">R\nAAA\n", encoding="utf-8")
+    g = {
+        "tree": tr,
+        "eq_freq": np.full(shape=(61,), fill_value=(1 / 61), dtype=float),
+        "iqtree_model": "ECMK07+F+R4",
+        "substitution_model": "GY+F3X4+R4",
+        "genetic_code": 1,
+        "background_omega": 0.2,
+        "kappa": 2.75,
+    }
+    prefix = str(tmp_path / "sim_true_model")
+    _ = main_simulate.write_true_asr_bundle(g=g, anc_fasta=str(anc), prefix=prefix)
+    iqtree_text = (tmp_path / "sim_true_model.iqtree").read_text(encoding="utf-8")
+    assert "Model of substitution: GY+F3X4+R4" in iqtree_text
+    log_text = (tmp_path / "sim_true_model.log").read_text(encoding="utf-8")
+    assert "Transition/transversion ratio (kappa): 2.750000" in log_text
+
+
+def test_write_true_asr_bundle_rejects_invalid_kappa(tmp_path):
+    tr = tree.add_numerical_node_labels(ete.PhyloNode("(A:1,B:1)R;", format=1))
+    anc = tmp_path / "anc.fa"
+    anc.write_text(">R\nAAA\n", encoding="utf-8")
+    g = {
+        "tree": tr,
+        "eq_freq": np.full(shape=(61,), fill_value=(1 / 61), dtype=float),
+        "iqtree_model": "ECMK07+F+R4",
+        "genetic_code": 1,
+        "background_omega": 0.2,
+        "kappa": -0.1,
+    }
+    with pytest.raises(ValueError, match="kappa should be >= 0"):
+        main_simulate.write_true_asr_bundle(g=g, anc_fasta=str(anc), prefix=str(tmp_path / "sim_true_kappa_bad"))
+
+
+def test_write_true_asr_bundle_uses_simulated_site_rates(tmp_path):
+    tr = tree.add_numerical_node_labels(ete.PhyloNode("(A:1,B:1)R;", format=1))
+    anc = tmp_path / "anc.fa"
+    anc.write_text(">R\nAAAAACAAG\n", encoding="utf-8")  # 3 codon sites
+    g = {
+        "tree": tr,
+        "eq_freq": np.full(shape=(61,), fill_value=(1 / 61), dtype=float),
+        "iqtree_model": "ECMK07+F+R4",
+        "genetic_code": 1,
+        "background_omega": 0.2,
+        "simulate_site_rates": np.array([0.5, 2.0, 3.25], dtype=float),
+    }
+    prefix = str(tmp_path / "sim_true_rates")
+    _ = main_simulate.write_true_asr_bundle(g=g, anc_fasta=str(anc), prefix=prefix)
+    rate_lines = (tmp_path / "sim_true_rates.rate").read_text(encoding="utf-8").splitlines()
+    assert rate_lines[0] == "Site\tC_Rate"
+    assert rate_lines[1] == "1\t0.500000"
+    assert rate_lines[2] == "2\t2.000000"
+    assert rate_lines[3] == "3\t3.250000"
+
+
+def test_write_true_asr_bundle_rejects_mismatched_site_rate_length(tmp_path):
+    tr = tree.add_numerical_node_labels(ete.PhyloNode("(A:1,B:1)R;", format=1))
+    anc = tmp_path / "anc.fa"
+    anc.write_text(">R\nAAAAACAAG\n", encoding="utf-8")  # 3 codon sites
+    g = {
+        "tree": tr,
+        "eq_freq": np.full(shape=(61,), fill_value=(1 / 61), dtype=float),
+        "iqtree_model": "ECMK07+F+R4",
+        "genetic_code": 1,
+        "background_omega": 0.2,
+        "simulate_site_rates": np.array([0.5, 2.0], dtype=float),
+    }
+    with pytest.raises(ValueError, match="simulate_site_rates length"):
+        main_simulate.write_true_asr_bundle(g=g, anc_fasta=str(anc), prefix=str(tmp_path / "sim_true_bad_rate"))
+
+
+def test_rescale_branch_length_adjusted_site_keeps_ndist_when_only_nonsynonymous_substitutions(monkeypatch):
+    tr = tree.add_numerical_node_labels(ete.PhyloNode("(A:2.0,B:2.0)R;", format=1))
+    node_by_name = {n.name: n for n in tr.traverse() if n.name}
+    a_node = node_by_name["A"]
+    a_nl = int(ete.get_prop(a_node, "numerical_label"))
+    num_nodes = len(list(tr.traverse()))
+    g = {
+        "tree": tr,
+        "state_cdn": np.ones((num_nodes, 1, 1), dtype=float),
+        "float_tol": 1e-12,
+    }
+    os_counts = np.zeros(num_nodes, dtype=float)
+    on_counts = np.zeros(num_nodes, dtype=float)
+    on_counts[a_nl] = 5.0
+    os_tensor = object()
+    on_tensor = object()
+
+    def fake_get_branch_sub_counts(tensor):
+        if tensor is os_tensor:
+            return os_counts
+        if tensor is on_tensor:
+            return on_counts
+        raise AssertionError("Unexpected tensor object")
+
+    monkeypatch.setattr(tree.substitution, "get_branch_sub_counts", fake_get_branch_sub_counts)
+    monkeypatch.setattr(tree, "get_num_adjusted_sites", lambda local_g, node: (1.0, 1.0))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        tree.rescale_branch_length(g, os_tensor, on_tensor, denominator="adjusted_site")
+    runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert runtime_warnings == []
+    assert ete.get_prop(a_node, "Sdist") == pytest.approx(0.0, abs=1e-12)
+    assert ete.get_prop(a_node, "Ndist") == pytest.approx(a_node.dist, abs=1e-12)
+    assert ete.get_prop(a_node, "SNdist") == pytest.approx(a_node.dist, abs=1e-12)
+
+
+def test_rescale_branch_length_adjusted_site_keeps_nonzero_component_when_other_adjusted_site_is_zero(monkeypatch):
+    tr = tree.add_numerical_node_labels(ete.PhyloNode("(A:2.0,B:2.0)R;", format=1))
+    node_by_name = {n.name: n for n in tr.traverse() if n.name}
+    a_node = node_by_name["A"]
+    a_nl = int(ete.get_prop(a_node, "numerical_label"))
+    num_nodes = len(list(tr.traverse()))
+    g = {
+        "tree": tr,
+        "state_cdn": np.ones((num_nodes, 1, 1), dtype=float),
+        "float_tol": 1e-12,
+    }
+    os_counts = np.zeros(num_nodes, dtype=float)
+    on_counts = np.zeros(num_nodes, dtype=float)
+    on_counts[a_nl] = 3.0
+    os_tensor = object()
+    on_tensor = object()
+
+    def fake_get_branch_sub_counts(tensor):
+        if tensor is os_tensor:
+            return os_counts
+        if tensor is on_tensor:
+            return on_counts
+        raise AssertionError("Unexpected tensor object")
+
+    monkeypatch.setattr(tree.substitution, "get_branch_sub_counts", fake_get_branch_sub_counts)
+    # No adjusted synonymous opportunities but valid adjusted nonsynonymous opportunities.
+    monkeypatch.setattr(tree, "get_num_adjusted_sites", lambda local_g, node: (0.0, 1.0))
+
+    tree.rescale_branch_length(g, os_tensor, on_tensor, denominator="adjusted_site")
+    assert ete.get_prop(a_node, "Sdist") == pytest.approx(0.0, abs=1e-12)
+    assert ete.get_prop(a_node, "Ndist") == pytest.approx(a_node.dist, abs=1e-12)
+    assert ete.get_prop(a_node, "SNdist") == pytest.approx(a_node.dist, abs=1e-12)
+
+
+def test_rescale_branch_length_adjusted_site_accumulates_distance_across_state_less_synthetic_parent(monkeypatch):
+    # Explicit unloaded internal node; rerooting must not erase a real ASR name.
+    tr = tree.add_numerical_node_labels(ete.PhyloNode("(A:.5,(B:1,(C:1,D:1)Y:1):.5)R;", format=1))
+    labels = {node.name: int(ete.get_prop(node, "numerical_label")) for node in tr.traverse() if node.name}
+    b_node = next(node for node in tr.traverse() if node.name == "B")
+    synthetic_parent = b_node.up
+    assert synthetic_parent is not None
+    assert synthetic_parent.name in ("", None)
+    num_node = max(int(ete.get_prop(node, "numerical_label")) for node in tr.traverse()) + 1
+    state_cdn = np.zeros((num_node, 1, 1), dtype=float)
+    for name in ["R", "Y", "A", "B", "C", "D"]:
+        state_cdn[labels[name], 0, 0] = 1.0
+    g = {
+        "tree": tr,
+        "state_cdn": state_cdn,
+        "float_tol": 1e-12,
+    }
+    os_counts = np.zeros(num_node, dtype=float)
+    on_counts = np.zeros(num_node, dtype=float)
+    on_counts[labels["B"]] = 2.0
+    os_tensor = object()
+    on_tensor = object()
+
+    def fake_get_branch_sub_counts(tensor):
+        if tensor is os_tensor:
+            return os_counts
+        if tensor is on_tensor:
+            return on_counts
+        raise AssertionError("Unexpected tensor object")
+
+    monkeypatch.setattr(tree.substitution, "get_branch_sub_counts", fake_get_branch_sub_counts)
+    monkeypatch.setattr(tree, "get_num_adjusted_sites", lambda local_g, node: (0.0, 1.0))
+
+    tree.rescale_branch_length(g, os_tensor, on_tensor, denominator="adjusted_site")
+    expected_dist = float(b_node.dist or 0.0) + float(synthetic_parent.dist or 0.0)
+    assert ete.get_prop(b_node, "Sdist") == pytest.approx(0.0, abs=1e-12)
+    assert ete.get_prop(b_node, "Ndist") == pytest.approx(expected_dist, abs=1e-12)
+    assert ete.get_prop(b_node, "SNdist") == pytest.approx(expected_dist, abs=1e-12)
+
+
+def test_mg_true_asr_preserves_generator_frequencies(tmp_path):
+    from csubst import parser_iqtree, parser_misc
+    tr = tree.add_numerical_node_labels(ete.PhyloNode('(A:1,B:1)R;', format=1))
+    anc = tmp_path / 'anc.fa'
+    anc.write_text('>R\nAAA\n')
+    codons = parser_misc.get_exchangeability_codon_order()
+    frequencies = np.array([[.1, .2, .3, .4], [.4, .3, .2, .1], [.2, .4, .1, .3]])
+    pi = np.array([np.prod([frequencies[p, 'ACGT'.index(c[p])] for p in range(3)]) for c in codons])
+    pi /= pi.sum()
+    # Writer uses Pyvolve's lexicographic codon order.
+    g = dict(tree=tr, eq_freq=pi[np.argsort(codons)], substitution_model='MG+F3X4',
+             genetic_code=1, background_omega=.2, mg_nucleotide_frequencies=frequencies)
+    paths = main_simulate.write_true_asr_bundle(g, str(anc), str(tmp_path / 'true'))
+    context = dict(path_iqtree_iqtree=paths['iqtree'], codon_orders=np.sort(codons), float_type=np.float64,
+                   alignment_file=str(anc))
+    parser_iqtree.read_iqtree(context)
+    np.testing.assert_allclose(context['mg_nucleotide_frequencies'], frequencies)
+    np.testing.assert_allclose(context['equilibrium_frequency'], pi[np.argsort(codons)])
+
+
+def test_mg_alignment_frequency_override_is_rejected():
+    with pytest.raises(ValueError, match='not supported for MG'):
+        main_simulate._resolve_simulation_eq_freq({
+            'simulate_eq_freq': 'alignment', 'substitution_model': 'MG+F3X4'})
+
+
+def test_scalar_background_kernel_matches_expm_and_rejects_irreducibility_failure():
+    from scipy.linalg import expm
+    pi = np.array([.2, .3, .5])
+    q = np.tile(pi, (3, 1)) - np.eye(3)
+    transition = main_simulate._background_transition(q, pi)
+    for t in (0., 1e-12, .25, 12.):
+        np.testing.assert_allclose(transition(t), expm(q * t), rtol=1e-12, atol=1e-16)
+    assert main_simulate._background_transition(np.zeros((3, 3)), pi) is None
+    cycle = np.roll(np.eye(3), 1, axis=1) - np.eye(3)
+    assert main_simulate._background_transition(cycle, np.ones(3)/3) is None
+
+
+def test_zero_n_generator_retains_all_synonymous_classes(tmp_path):
+    pi = np.array([.1, .2, .3, .4])
+    q = np.tile(pi, (4, 1)) - np.eye(4)
+    nonsyn = np.array([(i, j) for i in range(4) for j in range(4) if i//2 != j//2])
+    syn = np.array([(0, 1), (1, 0), (2, 3), (3, 2)])
+    q = main_simulate.apply_percent_biased_sub(q, 80, nonsyn[:1], ['A'], [], [], nonsyn, syn, 0., pi)
+    g = dict(eq_freq=pi, background_omega=0., simulate_custom_frequency_file=str(tmp_path/'pi.txt'))
+    model = main_simulate._make_pyvolve_custom_model(main_simulate._require_pyvolve(), g, 'root', q)
+    np.testing.assert_array_equal(model.params['state_freqs'], pi)
+    np.testing.assert_array_equal(model.matrix[tuple(nonsyn.T)], 0.)
+    assert (model.matrix[tuple(syn.T)] > 0.).all()

@@ -1,0 +1,260 @@
+import torch
+
+from metatrain.utils.io import _ckpt_from_arch_ckpt
+
+
+def model_update_v1_v2(checkpoint: dict) -> None:
+    """
+    Update a v1 checkpoint to v2.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    ensemble_sizes = {}
+    for key in checkpoint["state_dict"].keys():
+        if key.endswith("_ensemble_weights"):
+            ensemble_sizes[key.replace("_ensemble_weights", "")] = checkpoint[
+                "state_dict"
+            ][key].shape[1]
+    checkpoint["model_data"] = {}
+    checkpoint["model_data"]["hypers"] = {
+        "ensembles": {
+            "num_members": ensemble_sizes,
+            # correct means not needed to load the state_dict correctly
+            "means": {name: [] for name in ensemble_sizes.keys()},
+        },
+    }
+    checkpoint["model_data"]["dataset_info"] = checkpoint["wrapped_model_checkpoint"][
+        "model_data"
+    ]["dataset_info"]
+
+
+def model_update_v2_v3(checkpoint: dict) -> None:
+    """
+    Update a v2 checkpoint to v3.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    # state_dict renamed to model_state_dict, best_model_state_dict added with the
+    # new training procedure for the ensemble by backpropagation
+    checkpoint["model_state_dict"] = checkpoint.pop("state_dict")
+    checkpoint["best_model_state_dict"] = None
+    # changed format for ensemble weights (only do energy for simplicity)
+    t = checkpoint["model_state_dict"].pop("energy_ensemble_weights").T
+    checkpoint["model_state_dict"]["llpr_ensemble_layers.energy.weight"] = t
+    # added num_ensemble_members to hypers (only do energy for simplicity)
+    num_members = t.shape[0]
+    checkpoint["model_data"]["hypers"]["num_ensemble_members"] = {"energy": num_members}
+    # we set the following to None and the user will probably get errors if they're
+    # accessed from a restart exercise (which would be useless anyway as there was
+    # no ensemble training by backpropagation before this version)
+    checkpoint["epoch"] = None
+    checkpoint["best_epoch"] = None
+
+
+def model_update_v3_v4(checkpoint: dict) -> None:
+    """
+    Update a v3 checkpoint to v4.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    # need to change all inv_covariance to cholesky buffers
+    state_dict = checkpoint["model_state_dict"]
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("inv_covariance_"):
+            cholesky_key = key.replace("inv_covariance_", "cholesky_")
+            covariance_key = key.replace("inv_covariance_", "covariance_")
+            covariance = state_dict[covariance_key]
+            # Try with an increasingly high regularization parameter until
+            # the matrix is invertible
+            is_not_pd = True
+            regularizer = 1e-20
+            while is_not_pd and regularizer < 1e16:
+                try:
+                    cholesky = torch.linalg.cholesky(
+                        0.5 * (covariance + covariance.T)
+                        + regularizer
+                        * torch.eye(
+                            covariance.shape[0],
+                            device=covariance.device,
+                            dtype=torch.float64,
+                        )
+                    ).to(covariance.dtype)
+                    is_not_pd = False
+                except RuntimeError:
+                    regularizer *= 10.0
+            if is_not_pd:
+                raise RuntimeError(
+                    "Could not compute Cholesky decomposition. Something went "
+                    "wrong. Please contact the metatrain developers"
+                )
+            new_state_dict[cholesky_key] = cholesky
+        else:
+            new_state_dict[key] = value
+    checkpoint["model_state_dict"] = new_state_dict
+
+
+def model_update_v4_v5(checkpoint: dict) -> None:
+    """
+    Update a v4 checkpoint to v5.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    checkpoint["wrapped_model_checkpoint"] = _ckpt_from_arch_ckpt(
+        checkpoint["wrapped_model_checkpoint"]
+    )
+
+
+def model_update_v5_v6(checkpoint: dict) -> None:
+    """
+    Update a v5 checkpoint to v6.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    # added _mts_helper and _extra_state buffers
+    state_dict = checkpoint["model_state_dict"]
+    reference = next(iter(state_dict.values()))
+    empty_tensor = torch.zeros(0, dtype=reference.dtype, device=reference.device)
+    state_dict["_mts_helper"] = empty_tensor
+    state_dict["_extra_state"] = {}
+
+
+def model_update_v6_v7(checkpoint: dict) -> None:
+    """
+    Update a v6 checkpoint to v7.
+
+    The LLPR state of each target moves under ``targets.<name>``, with one covariance
+    for each block of features, one multiplier for each property of each block of the
+    target, and one ensemble layer for each block. The ensemble weights no longer
+    include the multipliers, which are applied to the deviations of the members
+    instead.
+
+    :param checkpoint: The checkpoint to update.
+    """
+
+    def uncertainty_name(name: str) -> str:
+        if name == "energy":
+            return "energy_uncertainty"
+        return f"mtt::aux::{name.replace('mtt::', '')}_uncertainty"
+
+    dataset_info = checkpoint["wrapped_model_checkpoint"]["dataset_info"]
+    targets = {uncertainty_name(name): name for name in dataset_info.targets}
+    for state_dict_name in ("model_state_dict", "best_model_state_dict"):
+        state_dict = checkpoint[state_dict_name]
+        if state_dict is None:
+            continue
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("covariance_") or key.startswith("cholesky_"):
+                kind, name = key.split("_", 1)
+                prefix = f"targets.{targets[name]}.covariances.0"
+                new_state_dict[f"{prefix}.{kind}"] = value
+            elif key.startswith("multiplier_"):
+                name = targets[key[len("multiplier_") :]]
+                layout = dataset_info.targets[name].layout
+                num_properties = sum(len(block.properties) for block in layout.blocks())
+                new_state_dict[f"targets.{name}.multipliers"] = value.expand(
+                    num_properties
+                ).clone()
+            elif key.startswith("llpr_ensemble_layers."):
+                name, parameter = key[len("llpr_ensemble_layers.") :].rsplit(".", 1)
+                multiplier = state_dict[f"multiplier_{uncertainty_name(name)}"]
+                new_state_dict[f"targets.{name}.ensemble_layers.0.{parameter}"] = (
+                    value / multiplier
+                )
+            else:
+                new_state_dict[key] = value
+        checkpoint[state_dict_name] = new_state_dict
+
+
+def trainer_update_v1_v2(checkpoint: dict) -> None:
+    """
+    Update trainer checkpoint from version 1 to version 2.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    # A version bump was skipped, inside this if
+    # we do the update that was supposed to be done for
+    # that version bump.
+    if "optimizer_state_dict" not in checkpoint:
+        # we set the following to None and the user will probably get errors if they're
+        # accessed from a restart exercise (which would be useless anyway as there was
+        # no ensemble training by backpropagation before this version)
+        checkpoint["epoch"] = None
+        checkpoint["optimizer_state_dict"] = None
+        checkpoint["scheduler_state_dict"] = None
+        checkpoint["best_epoch"] = None
+        checkpoint["best_metric"] = None
+        checkpoint["best_optimizer_state_dict"] = None
+        checkpoint["best_model_state_dict"] = None
+    # Added distributed training hyperparameters
+    if "train_hypers" in checkpoint:
+        checkpoint["train_hypers"]["distributed"] = False
+        checkpoint["train_hypers"]["distributed_port"] = 39591
+
+
+def trainer_update_v2_v3(checkpoint: dict) -> None:
+    """
+    Update trainer checkpoint from version 2 to version 3.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    if "train_hypers" in checkpoint:
+        checkpoint["train_hypers"]["batch_atom_bounds"] = [None, None]
+
+
+def trainer_update_v3_v4(checkpoint: dict) -> None:
+    """
+    Update trainer checkpoint from version 3 to version 4.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    if "train_hypers" in checkpoint:
+        checkpoint["train_hypers"]["calibrate_with_absolute_residuals"] = False
+
+
+def trainer_update_v4_v5(checkpoint: dict) -> None:
+    """
+    Update trainer checkpoint from version 4 to version 5.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    # added calibration method to pick the alpha prefactor
+    if "train_hypers" in checkpoint:
+        if checkpoint["train_hypers"].get("calibrate_with_absolute_residuals", False):
+            checkpoint["train_hypers"]["calibration_method"] = "absolute_residuals"
+        else:
+            checkpoint["train_hypers"]["calibration_method"] = "squared_residuals"
+
+
+def trainer_update_v5_v6(checkpoint: dict) -> None:
+    """
+    Update trainer checkpoint from version 5 to version 6.
+
+    The ``batch_atom_bounds`` field has been removed from the trainer schema
+    (max-atom packing is now done by the sampler, via ``max_atoms_per_batch``
+    and ``min_atoms_per_batch``). ``batch_atom_bounds`` bounds are translated
+    into the equivalent sampler settings; if it was unset, the new sampler
+    settings default to no packing.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    if "train_hypers" in checkpoint:
+        train_hypers = checkpoint["train_hypers"]
+        min_bound, max_bound = train_hypers.pop("batch_atom_bounds", [None, None])
+        train_hypers["max_atoms_per_batch"] = max_bound
+        train_hypers["min_atoms_per_batch"] = min_bound if min_bound is not None else 0
+
+
+def trainer_update_v6_v7(checkpoint: dict) -> None:
+    """
+    Deprecate the ``distributed`` hyperparameter.
+
+    So that it doesn't show up in the restarting options.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    if "train_hypers" in checkpoint:
+        train_hypers = checkpoint["train_hypers"]
+        if "distributed" in train_hypers and train_hypers["distributed"] is None:
+            train_hypers.pop("distributed")

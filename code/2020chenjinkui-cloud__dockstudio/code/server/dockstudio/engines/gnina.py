@@ -1,0 +1,290 @@
+"""gnina engine adapter (Linux + NVIDIA GPU only; unavailable elsewhere with a
+Chinese explanation). Reuses the vina subprocess adapter; parses gnina PDBQT
+output (`REMARK minimizedAffinity` per MODEL plus CNNscore/CNNaffinity rows in
+stdout)."""
+
+from __future__ import annotations
+
+import os
+import platform
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from ..config import bundled_engine_binary
+from ..logging import get_logger
+from ..models import DockingError, EngineUnavailableError, Pose
+from .base import GNINA_CNN_MISSING, EngineManifest, marker
+from .vina import VinaEngine, _key_lines
+
+log = get_logger("engines.gnina")
+
+_AFF_RE = re.compile(r"^\s*REMARK\s+minimizedAffinity\s+(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+_CNN_RE = re.compile(
+    r"CNNscore[:=\s]\s*(-?\d+(?:\.\d+)?).*?CNNaffinity[:=\s]\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE
+)
+_CNN_SCORE_RE = re.compile(r"CNNscore[:=\s]\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+_CNN_AFF_RE = re.compile(r"CNNaffinity[:=\s]\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+_MODEL_RE = re.compile(r"^\s*MODEL\s+(\d+)", re.IGNORECASE)
+_GNINA_STDOUT_TABLE_RE = re.compile(
+    r"^\s*(\d+)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)"
+)
+# gnina's stdout table header varies between releases:
+#   "mode |  affinity | CNN pose score | CNN affinity"   (dock/minimize)
+#   "CNNscore: 0.98 CNNaffinity: -9.9"                   (log-style lines)
+_GNINA_TABLE_HEADER_RE = re.compile(r"CNN\s*(?:pose\s*)?score|CNN\s*affinity", re.IGNORECASE)
+
+
+def parse_gnina_out(out_path: Path, run_log: str) -> list[Pose]:
+    """gnina out.pdbqt: `REMARK minimizedAffinity <x>`, `REMARK CNNscore <y>`,
+    `REMARK CNNaffinity <z>` per model, plus stdout mode table / log support."""
+    poses: list[Pose] = []
+    if out_path.is_file():
+        current_pose: dict[str, Any] | None = None
+        for line in out_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            m_mod = _MODEL_RE.match(line)
+            if m_mod:
+                if current_pose is not None and current_pose.get("affinity") is not None:
+                    poses.append(Pose(**current_pose))
+                current_pose = {
+                    "index": int(m_mod.group(1)),
+                    "affinity": None,
+                    "cnn_score": None,
+                    "cnn_affinity": None,
+                }
+                continue
+
+            m_aff = _AFF_RE.match(line)
+            if m_aff:
+                if current_pose is None:
+                    current_pose = {
+                        "index": len(poses) + 1,
+                        "affinity": float(m_aff.group(1)),
+                        "cnn_score": None,
+                        "cnn_affinity": None,
+                    }
+                else:
+                    current_pose["affinity"] = float(m_aff.group(1))
+
+            m_comb = _CNN_RE.search(line)
+            if m_comb and current_pose is not None:
+                current_pose["cnn_score"] = float(m_comb.group(1))
+                current_pose["cnn_affinity"] = float(m_comb.group(2))
+            else:
+                m_cs = _CNN_SCORE_RE.search(line)
+                if m_cs and current_pose is not None:
+                    current_pose["cnn_score"] = float(m_cs.group(1))
+                m_ca = _CNN_AFF_RE.search(line)
+                if m_ca and current_pose is not None:
+                    current_pose["cnn_affinity"] = float(m_ca.group(1))
+
+        if current_pose is not None and current_pose.get("affinity") is not None:
+            poses.append(Pose(**current_pose))
+
+    # fallback: stdout mode table (gnina 4-column or vina-style) if present.
+    # `--score_only` / `--minimize` runs may emit the CNN columns only in this
+    # table (header spellings differ across gnina releases), so the header
+    # detection accepts both "CNN pose score" and "CNNscore"/"CNNaffinity".
+    if not poses:
+        has_gnina_table_header = bool(_GNINA_TABLE_HEADER_RE.search(run_log))
+        for line in run_log.splitlines():
+            if has_gnina_table_header:
+                m_gnina = _GNINA_STDOUT_TABLE_RE.match(line)
+                if m_gnina:
+                    poses.append(
+                        Pose(
+                            index=int(m_gnina.group(1)),
+                            affinity=float(m_gnina.group(2)),
+                            cnn_score=float(m_gnina.group(3)),
+                            cnn_affinity=float(m_gnina.group(4)),
+                        )
+                    )
+                    continue
+            m_vina = re.match(r"^\s*(\d+)\s+(-?\d+(?:\.\d+)?)\s+(\S+)\s+(\S+)", line)
+            if m_vina:
+                poses.append(Pose(index=int(m_vina.group(1)), affinity=float(m_vina.group(2))))
+
+    # Supplement/backfill CNN score & CNN affinity from run_log if missing on poses
+    cnn_pairs: list[tuple[float, float]] = []
+    for m in _CNN_RE.finditer(run_log):
+        cnn_pairs.append((float(m.group(1)), float(m.group(2))))
+    if not cnn_pairs:
+        sc = _CNN_SCORE_RE.findall(run_log)
+        af = _CNN_AFF_RE.findall(run_log)
+        if sc and af and len(sc) == len(af):
+            cnn_pairs = [(float(s), float(a)) for s, a in zip(sc, af)]
+
+    for i, (cs, ca) in enumerate(cnn_pairs):
+        if i < len(poses):
+            if poses[i].cnn_score is None:
+                poses[i].cnn_score = cs
+            if poses[i].cnn_affinity is None:
+                poses[i].cnn_affinity = ca
+
+    if not poses:
+        raise DockingError(f"gnina output contained no binding poses: {_key_lines(run_log)}")
+    if all(p.cnn_score is None and p.cnn_affinity is None for p in poses):
+        log.warning(
+            "gnina 输出中没有任何 CNNscore/CNNaffinity（%d 个 pose）：CNN 两列将为 None，"
+            "本次运行已标记为 %s，请在报告中按降级结果解读",
+            len(poses),
+            GNINA_CNN_MISSING,
+        )
+    return poses
+
+
+class GninaEngine(VinaEngine):
+    """gnina: deep-learning rescoring fork of Vina."""
+
+    manifest = EngineManifest(
+        name="gnina",
+        scoring_functions=["vina", "vinardo", "ad4_scoring", "dkoes_fast"],
+        supports_flex_residues=True,
+        requires_gpu=True,
+        platforms=["linux"],
+        homepage="https://github.com/gnina/gnina",
+    )
+
+    def _binary(self) -> Path:
+        if platform.system() != "Linux":
+            raise EngineUnavailableError(
+                "gnina 需要 Linux + NVIDIA GPU，Windows 用户请用 WSL2"
+                "（指引见 docs/deploy.md#wsl2）。"
+            )
+        exe = "gnina"
+        env = os.environ.get("DOCKSTUDIO_GNINA")
+        if env and Path(env).is_file():
+            return Path(env)
+        found = shutil.which(exe)
+        if found:
+            return Path(found)
+        bundled = bundled_engine_binary(exe)
+        if bundled is not None:
+            return bundled
+        raise EngineUnavailableError(
+            "gnina 二进制未找到：设置 DOCKSTUDIO_GNINA 或放入 resources/bin/linux-x86_64。"
+        )
+
+    def _gpu_ok(self) -> tuple[bool, str]:
+        if shutil.which("nvidia-smi"):
+            try:
+                proc = subprocess.run(
+                    ["nvidia-smi", "-L"],
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+                if proc.returncode == 0 and b"GPU" in (proc.stdout or b""):
+                    return True, ""
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        for candidate in ("libcuda.so", "libcuda.so.1"):
+            for libdir in ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/local/cuda/lib64"):
+                if (Path(libdir) / candidate).exists():
+                    return True, ""
+        return False, (
+            "检测到 gnina 但无 NVIDIA GPU；设置 DOCKSTUDIO_GNINA_CPU=1 可强制 CPU（--no_gpu，极慢）"
+        )
+
+    def is_available(self) -> tuple[bool, str | None]:
+        try:
+            binary = self._binary()
+            self.manifest.version = self._version(binary)
+        except EngineUnavailableError as exc:
+            return False, str(exc)
+        ok, reason = self._gpu_ok()
+        if not ok and os.environ.get("DOCKSTUDIO_GNINA_CPU") != "1":
+            return False, reason
+        return True, None
+
+    def _build_cmd(
+        self,
+        binary: str,
+        box,
+        params,
+        receptor_name: str,
+        ligand_name: str,
+        out_name: str,
+    ) -> list[str]:
+        """gnina CLI 不含 --energy_range（vina 专有），从继承的命令里剔除。
+
+        另外支持原位重打分/局部优化（Task Fix 3.3 / P1-3.3）：
+        ``DockParams.score_only`` -> ``--score_only``（坐标不变，仅 CNN/Vina 打分），
+        ``DockParams.minimize``   -> ``--minimize``（以给定构象为起点做就地局部优化）。
+        两者同为真时 ``--score_only`` 优先（严格更保守：绝不移动坐标）。
+        """
+        cmd = super()._build_cmd(binary, box, params, receptor_name, ligand_name, out_name)
+        if "--energy_range" in cmd:
+            i = cmd.index("--energy_range")
+            del cmd[i : i + 2]
+        # In-place rescoring flags: `--score_only` wins over `--minimize`.
+        if getattr(params, "score_only", False):
+            cmd.append("--score_only")
+        elif getattr(params, "minimize", False):
+            cmd.append("--minimize")
+        if os.environ.get("DOCKSTUDIO_GNINA_CPU") == "1":
+            cmd.append("--no_gpu")
+        return cmd
+
+    # --------------------------------------------------- in-place rescoring
+
+    def _prepare_staged_ligand(self, staged: Path) -> Path:
+        """Make any staged ligand readable for gnina's in-place scoring modes.
+
+        Two real-machine findings drive this (GN-08):
+
+        * gnina dispatches its parser on the file extension, so an exported
+          ``pose_1.sdf`` used to die in the PDBQT reader as soon as
+          :meth:`VinaEngine.dock` renamed it to ``ligand.pdbqt``;
+        * a *multi-model* ``out.pdbqt`` from an earlier run is rejected at the
+          first ``ENDMDL`` (``Unknown or inappropriate tag``).
+
+        Non-PDBQT inputs are returned untouched (the extension now survives
+        staging). A PDBQT input is reduced to a single model without ``ENDMDL``:
+        ``--score_only`` / ``--minimize`` score exactly one supplied pose, and the
+        Tier-2 pose being refined is the top one, so picking MODEL 1 is the
+        deterministic choice (see docs/fixes/gnina-rescore-2026-11-18.md).
+        """
+        if staged.suffix.lower() != ".pdbqt":
+            return staged
+        text = staged.read_text(encoding="utf-8", errors="replace")
+        if "MODEL" not in text and "ENDMDL" not in text:
+            return staged  # plain single-pose PDBQT: nothing to normalise
+        kept: list[str] = []
+        models = 0
+        for line in text.splitlines():
+            token = line.split(maxsplit=1)[0].upper() if line.strip() else ""
+            if token == "MODEL":
+                models += 1
+                if models > 1:
+                    break
+                kept.append(line)
+                continue
+            if token == "ENDMDL":
+                continue
+            kept.append(line)
+        normalised = "\n".join(kept).rstrip("\n") + "\n"
+        if normalised != text:
+            staged.write_text(normalised, encoding="utf-8", newline="\n")
+            log.info(
+                "gnina ligand normalised: %d model(s) -> 1, ENDMDL stripped (%s)",
+                max(models, 1),
+                staged.name,
+            )
+        return staged
+
+    def _degradation_notes(self, poses: list[Pose]) -> list[str]:
+        """GN-03: a run without CNN values must say so instead of returning None."""
+        if poses and all(p.cnn_score is None and p.cnn_affinity is None for p in poses):
+            return [
+                marker(
+                    GNINA_CNN_MISSING,
+                    f"gnina {len(poses)} 个 pose 均无 CNNscore/CNNaffinity，CNN 列只能留空",
+                )
+            ]
+        return []
+
+    def _parse_poses(self, out_path: Path, run_log: str) -> list[Pose]:
+        return parse_gnina_out(out_path, run_log)

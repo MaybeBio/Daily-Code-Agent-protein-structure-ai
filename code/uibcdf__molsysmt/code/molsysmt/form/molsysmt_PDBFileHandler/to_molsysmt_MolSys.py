@@ -1,0 +1,618 @@
+import os
+
+import numpy as np
+import pandas as pd
+from depdigest import dep_digest
+
+from molsysmt._private.argdigest import arg_digest
+
+
+def _site_variants(model):
+    output = {}
+    for atom in model.atoms:
+        output.setdefault(atom.site_key, []).append(atom)
+    return output
+
+
+def _canonical_atoms(content):
+    if not content.models:
+        return [], {}
+    variants = _site_variants(content.models[0])
+    return [items[0] for items in variants.values()], variants
+
+
+def _topology_rows(content):
+    canonical_atoms, variants = _canonical_atoms(content)
+    group_rows = []
+    chain_rows = []
+    group_indices = {}
+    chain_indices = {}
+
+    for atom in canonical_atoms:
+        chain_key = (atom.chain_segment, atom.chain_id)
+        if chain_key not in chain_indices:
+            chain_indices[chain_key] = len(chain_rows)
+            chain_rows.append((atom.chain_id, atom.chain_id))
+        group_key = (
+            atom.chain_segment,
+            atom.chain_id,
+            atom.group_id,
+            atom.insertion_code,
+            atom.group_name,
+        )
+        if group_key not in group_indices:
+            group_indices[group_key] = len(group_rows)
+            group_rows.append(
+                (
+                    atom.group_id,
+                    atom.group_name,
+                    chain_indices[chain_key],
+                )
+            )
+
+    atom_rows = []
+    for atom in canonical_atoms:
+        group_key = (
+            atom.chain_segment,
+            atom.chain_id,
+            atom.group_id,
+            atom.insertion_code,
+            atom.group_name,
+        )
+        chain_key = (atom.chain_segment, atom.chain_id)
+        atom_rows.append(
+            (
+                str(atom.serial),
+                atom.atom_name,
+                atom.element_symbol,
+                group_indices[group_key],
+                chain_indices[chain_key],
+            )
+        )
+    return atom_rows, group_rows, chain_rows, canonical_atoms, variants
+
+
+def _get_group_types(group_rows, atom_rows, naming_scheme=None):
+    from molsysmt._private.name_resolution import (
+        classify_group_name as get_group_type_from_group_name,
+    )
+    from molsysmt.element.group.small_molecule.group_names import (
+        group_names as reserved_small_molecule_names,
+    )
+
+    atom_names_by_group_index = {}
+    for _, atom_name, _, group_index, _ in atom_rows:
+        atom_names_by_group_index.setdefault(int(group_index), set()).add(atom_name)
+
+    group_types = []
+    for group_index, (_, group_name, _) in enumerate(group_rows):
+        group_type = get_group_type_from_group_name(group_name, naming_scheme)
+        if (
+            naming_scheme is None
+            and group_type == "small molecule"
+            and reserved_small_molecule_names is not None
+            and group_name in reserved_small_molecule_names
+            and {"N", "CA", "C", "O", "CB"}.issubset(
+                atom_names_by_group_index.get(group_index, set())
+            )
+        ):
+            group_type = "amino acid"
+        group_types.append(group_type)
+    return np.array(group_types, dtype=object)
+
+
+@dep_digest("openmm")
+def _get_bonded_atom_pairs_from_openmm_pdb(item):
+    from io import StringIO
+
+    from openmm.app import PDBFile
+
+    item.file.seek(0)
+    text = item.file.read()
+    item.file.seek(0)
+    pdb = PDBFile(StringIO(text))
+    _, variants = _canonical_atoms(item.content)
+    serial_to_site_index = {}
+    for site_index, records in enumerate(variants.values()):
+        for record in records:
+            serial_to_site_index.setdefault(str(record.serial), site_index)
+
+    openmm_to_site_index = {}
+    openmm_atoms = list(pdb.topology.atoms())
+    for atom in openmm_atoms:
+        atom_id = getattr(atom, "id", None)
+        if atom_id is not None and str(atom_id) in serial_to_site_index:
+            openmm_to_site_index[atom.index] = serial_to_site_index[str(atom_id)]
+        elif len(openmm_atoms) == len(variants):
+            openmm_to_site_index[atom.index] = atom.index
+
+    output = []
+    for bond in pdb.topology.bonds():
+        if (
+            bond.atom1.index in openmm_to_site_index
+            and bond.atom2.index in openmm_to_site_index
+        ):
+            output.append(
+                (
+                    openmm_to_site_index[bond.atom1.index],
+                    openmm_to_site_index[bond.atom2.index],
+                )
+            )
+    return output
+
+
+def _build_domains_from_content(
+    item, get_missing_bonds=True, bond_inference_engine=None, *, from_naming_scheme=None
+):
+    from molsysmt.native import MolSys
+
+    content = item.content
+    (
+        atom_rows,
+        group_rows,
+        chain_rows,
+        canonical_atoms,
+        variants,
+    ) = _topology_rows(content)
+
+    native = MolSys(
+        n_atoms=len(atom_rows), n_groups=len(group_rows), n_chains=len(chain_rows)
+    )
+    topology = native.topology
+
+    if atom_rows:
+        topology.atoms["atom_id"] = np.array(
+            [row[0] for row in atom_rows], dtype=object
+        )
+        topology.atoms["atom_name"] = np.array(
+            [row[1] for row in atom_rows], dtype=object
+        )
+        from molsysmt.element.atom import get_atom_type_from_atom_name
+
+        topology.atoms["atom_type"] = np.array(
+            [row[2] or get_atom_type_from_atom_name(row[1]) for row in atom_rows],
+            dtype=object,
+        )
+        topology.atoms["group_index"] = np.array(
+            [row[3] for row in atom_rows], dtype=int
+        )
+        topology.atoms["chain_index"] = np.array(
+            [row[4] for row in atom_rows], dtype=int
+        )
+    topology.rebuild_atoms(redefine_ids=False, redefine_types=False)
+
+    if group_rows:
+        topology.groups["group_id"] = np.array(
+            [row[0] for row in group_rows], dtype=object
+        )
+        topology.groups["group_name"] = np.array(
+            [row[1] for row in group_rows], dtype=object
+        )
+        if from_naming_scheme is not None:
+            topology.set_group_naming_schemes(from_naming_scheme)
+        topology.groups["group_type"] = _get_group_types(
+            group_rows, atom_rows, from_naming_scheme
+        )
+    if chain_rows:
+        topology.chains["chain_id"] = np.array(
+            [row[0] for row in chain_rows], dtype=object
+        )
+        topology.chains["chain_name"] = np.array(
+            [row[1] for row in chain_rows], dtype=object
+        )
+
+    formal_charges = [atom.formal_charge for atom in canonical_atoms]
+    if any(value is not None for value in formal_charges):
+        native.chemical_states._set_chemical_state_atom_attribute(
+            "formal_charge", pd.array(formal_charges, dtype="Int16")
+        )
+
+    from molsysmt._private.pdb_connectivity import record, validate_policy
+    from molsysmt._private.pdb_declarations import resolve
+    from molsysmt._private.smonitor import (
+        LibraryNotFoundError,
+        PDBBondInferenceWarning,
+        warn,
+    )
+
+    validate_policy(get_missing_bonds, bond_inference_engine)
+    explicit_pairs, declaration_issues = resolve(content, canonical_atoms, variants)
+    bond_evidence = {pair: "explicit" for pair in explicit_pairs}
+    inference_status, inference_error = "disabled", None
+    if get_missing_bonds:
+        try:
+            if from_naming_scheme is not None:
+                from molsysmt._private.amino_acid_templates import (
+                    check_external_preparation,
+                )
+
+                check_external_preparation(
+                    native,
+                    "OpenMM",
+                    "molsysmt.form.molsysmt_PDBFileHandler.to_molsysmt_MolSys",
+                )
+            inferred_pairs = _get_bonded_atom_pairs_from_openmm_pdb(item)
+            inference_status = "inferred"
+        except Exception as error:
+            if bond_inference_engine == "OpenMM":
+                raise
+            inference_error = error
+            inference_status = (
+                "unavailable"
+                if (
+                    isinstance(error, LibraryNotFoundError)
+                    or (
+                        isinstance(error, ModuleNotFoundError)
+                        and error.name in ("openmm", "openmm.app")
+                    )
+                )
+                else "failed"
+            )
+            warn(
+                PDBBondInferenceWarning(
+                    extra={
+                        "status": inference_status,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    }
+                )
+            )
+            inferred_pairs = []
+        for pair in inferred_pairs:
+            normalized = tuple(sorted((int(pair[0]), int(pair[1]))))
+            if normalized[0] != normalized[1] and normalized[1] < len(canonical_atoms):
+                bond_evidence.setdefault(normalized, "inferred")
+
+    if bond_evidence:
+        pairs = sorted(bond_evidence)
+        native.chemical_states._append_chemical_state_bonds(
+            pairs,
+            types=["covalent"] * len(pairs),
+            evidence=[bond_evidence[pair] for pair in pairs],
+        )
+        native.rebuild_components()
+        native.rebuild_molecules()
+        topology.rebuild_chains(
+            redefine_indices=False,
+            redefine_ids=False,
+            redefine_names=False,
+            redefine_types=True,
+        )
+        topology.rebuild_entities(force=True)
+
+    record(
+        native.chemical_states,
+        inference_status,
+        bond_inference_engine,
+        error=inference_error,
+        declaration_issues=declaration_issues,
+        from_naming_scheme=from_naming_scheme,
+    )
+
+    return native
+
+
+def _build_topology_from_content(
+    item, get_missing_bonds=True, bond_inference_engine=None, *, from_naming_scheme=None
+):
+    """Project stable inventory from the declared PDB domain reader."""
+    return _build_domains_from_content(
+        item,
+        get_missing_bonds,
+        bond_inference_engine,
+        from_naming_scheme=from_naming_scheme,
+    ).topology
+
+
+def _build_bioassemblies(content, chain_rows):
+    from molsysmt import pyunitwizard as puw
+
+    chain_indices_by_id = {}
+    for chain_index, (chain_id, _) in enumerate(chain_rows):
+        chain_indices_by_id.setdefault(chain_id, []).append(chain_index)
+
+    output = {}
+    for assembly_id, operations in content.bioassemblies.items():
+        chain_sets = []
+        rotations = []
+        translations = []
+        for operation in operations:
+            indices = []
+            for chain_id in operation["chain_ids"]:
+                indices.extend(chain_indices_by_id.get(chain_id, []))
+            if not indices:
+                continue
+            chain_sets.append(indices)
+            rotations.append(operation["rotation"])
+            translations.append(operation["translation"])
+        if not rotations:
+            continue
+        chain_indices = (
+            chain_sets[0]
+            if all(indices == chain_sets[0] for indices in chain_sets)
+            else chain_sets
+        )
+        output[assembly_id] = {
+            "chain_indices": chain_indices,
+            "rotations": np.asarray(rotations, dtype=float),
+            "translations": puw.quantity(
+                np.asarray(translations, dtype=float), "angstrom"
+            ),
+        }
+    return output or None
+
+
+def _build_structures_from_content(item):
+    from molsysmt import pyunitwizard as puw
+    from molsysmt._private import rust_backend as _kernels
+    from molsysmt.native import Structures
+
+    content = item.content
+    atom_rows, _, chain_rows, canonical_atoms, _ = _topology_rows(content)
+    if not content.models:
+        return Structures()
+
+    canonical_keys = [atom.site_key for atom in canonical_atoms]
+    coordinates = []
+    occupancies = []
+    b_factors = []
+    alternate_locations = []
+    for model in content.models:
+        variants = _site_variants(model)
+        if set(variants) != set(canonical_keys):
+            from molsysmt._private.smonitor import StructuralInconsistencyError
+
+            raise StructuralInconsistencyError(
+                reason="PDB models do not share one canonical atom-site axis.",
+                caller="molsysmt.PDBFileHandler",
+            )
+        primary = [variants[key][0] for key in canonical_keys]
+        coordinates.append([atom.coordinates for atom in primary])
+        occupancies.append(
+            [np.nan if atom.occupancy is None else atom.occupancy for atom in primary]
+        )
+        b_factors.append(
+            [np.nan if atom.b_factor is None else atom.b_factor for atom in primary]
+        )
+        model_alternates = {}
+        for atom_index, key in enumerate(canonical_keys):
+            items = variants[key]
+            if len(items) < 2 and not items[0].alternate_location:
+                continue
+            model_alternates[atom_index] = {
+                "location_id": np.array(
+                    [atom.alternate_location for atom in items], dtype=object
+                ),
+                "atom_id": np.array([str(atom.serial) for atom in items], dtype=object),
+                "occupancy": np.array(
+                    [
+                        np.nan if atom.occupancy is None else atom.occupancy
+                        for atom in items
+                    ],
+                    dtype=float,
+                ),
+                "coordinates": puw.quantity(
+                    np.array([atom.coordinates for atom in items], dtype=float),
+                    "angstrom",
+                ),
+                "b_factor": puw.quantity(
+                    np.array(
+                        [
+                            np.nan if atom.b_factor is None else atom.b_factor
+                            for atom in items
+                        ],
+                        dtype=float,
+                    ),
+                    "angstrom**2",
+                ),
+            }
+            model_alternates[atom_index]["coordinates"] = puw.convert(
+                model_alternates[atom_index]["coordinates"], to_unit="nm"
+            )
+            model_alternates[atom_index]["b_factor"] = puw.convert(
+                model_alternates[atom_index]["b_factor"], to_unit="nm**2"
+            )
+        alternate_locations.append(model_alternates)
+
+    coordinates = puw.quantity(np.asarray(coordinates, dtype=float), "angstrom")
+    occupancy = np.asarray(occupancies, dtype=float)
+    b_factor = puw.quantity(np.asarray(b_factors, dtype=float), "angstrom**2")
+    if np.isnan(occupancy).all():
+        occupancy = None
+    if np.isnan(puw.get_value(b_factor)).all():
+        b_factor = None
+    if not any(alternate_locations):
+        alternate_locations = None
+
+    box = None
+    if content.cryst1 is not None:
+        a, b, c, alpha, beta, gamma = content.cryst1
+        single_box = _kernels.get_box_from_lengths_and_angles_single_structure(
+            np.array([a, b, c], dtype=np.float64),
+            np.array(
+                puw.get_value(
+                    puw.quantity([alpha, beta, gamma], "degrees"),
+                    to_unit="radians",
+                ),
+                dtype=np.float64,
+            ),
+        )
+        box = puw.quantity(
+            np.repeat(single_box[np.newaxis, :, :], len(content.models), axis=0),
+            "angstrom",
+        )
+
+    structures = Structures()
+    structures.append(
+        coordinates=coordinates,
+        structure_id=np.array(
+            [model.structure_id for model in content.models], dtype=object
+        ),
+        box=box,
+        occupancy=occupancy,
+        b_factor=b_factor,
+        alternate_location=alternate_locations,
+        skip_digestion=True,
+    )
+    structures.bioassembly = _build_bioassemblies(content, chain_rows)
+    return structures
+
+
+def _apply_compnd_names(item, molsys):
+    compnd = getattr(getattr(item.entry, "title", None), "compnd", None)
+    if not compnd:
+        return
+    chain_to_name = {}
+    for record in compnd:
+        name = record.molecule.lstrip(": ").strip() if record.molecule else None
+        if name:
+            for chain_id in record.chain:
+                chain_to_name[chain_id] = name
+    if not chain_to_name:
+        return
+
+    atoms = molsys.topology.atoms
+    groups = molsys.topology.groups
+    chain_ids = molsys.topology.chains["chain_id"].to_numpy()
+    molecule_names = molsys.topology.molecules["molecule_name"].to_numpy(
+        dtype=object, copy=True
+    )
+    molecule_types = molsys.topology.molecules["molecule_type"].to_numpy(dtype=object)
+    for molecule_index in range(len(molecule_names)):
+        if molecule_types[molecule_index] not in {"protein", "peptide"}:
+            continue
+        group_indices = groups.index[
+            groups["molecule_index"] == molecule_index
+        ].to_numpy()
+        atom_indices = atoms.index[atoms["group_index"].isin(group_indices)].to_numpy()
+        if len(atom_indices):
+            chain_id = chain_ids[int(atoms.iloc[atom_indices[0]]["chain_index"])]
+            if chain_id in chain_to_name:
+                molecule_names[molecule_index] = chain_to_name[chain_id]
+    molsys.topology.molecules["molecule_name"] = molecule_names
+    molsys.topology.rebuild_entities(force=True)
+
+
+def _build_molsys_from_pdb_handler(
+    item, get_missing_bonds=True, bond_inference_engine=None, *, from_naming_scheme=None
+):
+    from molsysmt._private.pdb_connectivity import validate_policy
+
+    validate_policy(get_missing_bonds, bond_inference_engine)
+    native_inference = get_missing_bonds and bond_inference_engine == "MolSysMT"
+
+    output = _build_domains_from_content(
+        item,
+        get_missing_bonds=False if native_inference else get_missing_bonds,
+        bond_inference_engine=None if native_inference else bond_inference_engine,
+        from_naming_scheme=from_naming_scheme,
+    )
+    output.structures = _build_structures_from_content(item)
+    if native_inference:
+        from molsysmt.build import infer_covalent_bonds
+
+        output = infer_covalent_bonds(output, structure_indices=0)
+    _apply_compnd_names(item, output)
+    return output
+
+
+@arg_digest(form="molsysmt.PDBFileHandler")
+def to_molsysmt_MolSys(
+    item,
+    atom_indices="all",
+    structure_indices="all",
+    get_missing_bonds=True,
+    skip_digestion=False,
+    *,
+    bond_inference_engine=None,
+    from_naming_scheme=None,
+):
+    """
+    Converting from molsysmt.PDBFileHandler to molsysmt.MolSys.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    atom_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Atom indices (0-based) to include.
+    structure_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Structure indices (0-based) to include or process.
+    get_missing_bonds : bool, default=True
+        Request connectivity inference, or retain only declared PDB edges when False.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+    bond_inference_engine : str or None, default=None
+        Explicit 'MolSysMT' or 'OpenMM', requiring get_missing_bonds=True. None
+        retains the legacy optional OpenMM policy, with diagnosed failures.
+    from_naming_scheme : str or None, default=None
+        Source group-name convention ('amber', 'ccd', 'legacy' or 'sequence'),
+        declared before classification and native inference. None leaves it
+        undeclared. This does not rename atoms/groups or translate chemical state.
+
+    Returns
+    -------
+    molsysmt.MolSys
+        Resulting object in molsysmt.MolSys form.
+
+    Notes
+    -----
+    An explicit source convention is declared on the fresh topology before
+    classification and native inference. Original labels are retained. No
+    source naming is guessed from the PDB format. The reader history records
+    source_naming_scheme independently of later metadata edits. Semantic
+    selections through public convert use the interpreted inventory.
+
+    OpenMM has no source-naming adapter for the reviewed contextual labels or
+    incompatible cap declarations. Explicit OpenMM requests raise before that
+    provider executes; the legacy optional route warns and retains the typed
+    cause and declared edges. No native fallback is selected automatically.
+    Undeclared input keeps the prior engine/default policy.
+
+    The first chemical-state preparation record stores typed declaration
+    diagnostics under ``report['declaration_issues']``. It retains source line
+    numbers (1-based), record indices (0-based within each record kind), raw
+    fixed-column records and directed canonical endpoint indices (-1 when
+    missing or ambiguous). These historical indices describe the original
+    reader operation, even after extraction or reordering.
+
+    Alternate serials map to canonical sites with conditional scope recorded.
+    Unknown LINK alternates and nonidentity symmetry images are not projected
+    onto different observed sites. Redundant declarations retain one edge and
+    do not establish bond order. Conflicting declared CYS sulfur partners remain
+    explicit, with their conflict reported rather than resolved by a guess.
+    Use ``return_report=True`` or ``strict=True`` on public ``msm.convert`` for
+    conversion limitations. Declared LINK/CONECT records do not certify covalent
+    bond kind, valence or a complete alternate-specific chemical state.
+
+    The interpretation follows wwPDB PDB 3.3 sections 6 and 10:
+    https://www.wwpdb.org/documentation/file-format-content/format33/sect6.html
+    and https://www.wwpdb.org/documentation/file-format-content/format33/sect10.html.
+
+    .. versionadded:: 1.0.0
+    """
+    from .to_molsysmt_PDBFileHandler import to_molsysmt_PDBFileHandler
+
+    if isinstance(item, (str, os.PathLike)):
+        item = to_molsysmt_PDBFileHandler(str(item), skip_digestion=True)
+        opened_here = True
+    else:
+        opened_here = False
+
+    try:
+        output = _build_molsys_from_pdb_handler(
+            item,
+            get_missing_bonds=get_missing_bonds,
+            bond_inference_engine=bond_inference_engine,
+            from_naming_scheme=from_naming_scheme,
+        )
+        return output.extract(
+            atom_indices=atom_indices,
+            structure_indices=structure_indices,
+            copy_if_all=False,
+            skip_digestion=True,
+        )
+    finally:
+        if opened_here:
+            item.close()

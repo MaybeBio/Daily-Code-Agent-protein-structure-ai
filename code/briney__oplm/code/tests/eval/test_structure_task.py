@@ -1,0 +1,271 @@
+"""Structure-eval task tests: a slow end-to-end run plus pure config-parse tests.
+
+The slow test exercises the canonical-tokenizer swap and
+the full categorical-Jacobian P@L path — wildtype + per-mutation forward passes,
+the ``(L, A, L, A)`` reduction, and precision@L scoring — over real structures.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import shutil
+from typing import TYPE_CHECKING
+
+import numpy as np
+import pandas as pd
+import pytest
+import torch
+
+from oplm.config import (
+    DataConfig,
+    EvalDatasetEntry,
+    OplmConfig,
+    ScheduleSpec,
+    TrainConfig,
+)
+from oplm.data import StructureData, get_tokenizer, load_structures
+from oplm.eval.metrics.categorical_jacobian import get_canonical_amino_acid_token_ids
+from oplm.eval.metrics.coevolution import DEFAULT_COEVOLUTION_METRICS
+from oplm.eval.tasks.structure import StructureEvalTask, StructureTaskConfig
+from oplm.model import OplmConfig as OplmModelConfig
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    from oplm.model import OplmForMaskedLM
+
+_MAX_SEQ_LEN = 128
+
+
+# --- pure config-parse test (no model / fixtures) ------------------------------
+
+
+def test_structure_config_rejects_string_bool() -> None:
+    """A YAML string like ``"false"`` must not coerce to ``True`` (issue #5)."""
+    with pytest.raises(ValueError, match="use_cbeta"):
+        StructureTaskConfig.from_extra({"use_cbeta": "false"})
+
+
+def test_structure_config_real_bools_parse() -> None:
+    """Actual bools are accepted verbatim."""
+    cfg = StructureTaskConfig.from_extra({"use_cbeta": False})
+    assert cfg.use_cbeta is False
+
+
+def test_structure_config_jacobian_sample_size_floor() -> None:
+    """``categorical_jacobian_sample_size`` must be >= 1 when provided."""
+    with pytest.raises(ValueError, match="categorical_jacobian_sample_size"):
+        StructureTaskConfig.from_extra({"categorical_jacobian_sample_size": 0})
+
+
+@pytest.mark.parametrize("bad_batch", [0, 21])
+def test_structure_config_jacobian_mutation_batch_size_range(bad_batch: int) -> None:
+    """``categorical_jacobian_mutation_batch_size`` must lie in ``[1, 20]``."""
+    with pytest.raises(ValueError, match="categorical_jacobian_mutation_batch_size"):
+        StructureTaskConfig.from_extra({"categorical_jacobian_mutation_batch_size": bad_batch})
+
+
+# --- slow end-to-end test ------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_structure_eval_precision_in_unit_interval(
+    structure_fixtures_dir: Path, make_model: Callable[..., OplmForMaskedLM]
+) -> None:
+    """Categorical-Jacobian P@L runs over a few real structures and lands in ``[0, 1]``."""
+    from accelerate import Accelerator
+
+    cfg = OplmConfig(
+        model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN),
+        train=TrainConfig(wandb_enabled=False),
+        data=DataConfig(num_workers=0, pin_memory=False),
+    )
+    model = make_model(max_position_embeddings=_MAX_SEQ_LEN)
+    entry = EvalDatasetEntry(
+        name="struct",
+        path=str(structure_fixtures_dir),
+        type="structure",
+        schedule=ScheduleSpec("steps", 1),
+        # Cap to a couple of small structures to keep the Jacobian's L×20
+        # forward passes cheap on CPU.
+        extra={"max_structures": 2},
+    )
+    task = StructureEvalTask(entry, cfg)
+    accelerator = Accelerator(cpu=True)
+
+    metrics = task.evaluate(model, accelerator)
+
+    assert "precision_at_L" in metrics
+    p = metrics["precision_at_L"]
+    assert math.isfinite(p)
+    assert 0.0 <= p <= 1.0
+
+
+def _task() -> StructureEvalTask:
+    """A structure task with its tokenizer state initialized, as ``evaluate`` would."""
+    cfg = OplmConfig(
+        model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN),
+        train=TrainConfig(wandb_enabled=False),
+        data=DataConfig(num_workers=0, pin_memory=False),
+    )
+    entry = EvalDatasetEntry(
+        name="struct", path=".", type="structure", schedule=ScheduleSpec("steps", 1)
+    )
+    task = StructureEvalTask(entry, cfg)
+    task._tokenizer = get_tokenizer()
+    task._canonical_aa_token_ids = get_canonical_amino_acid_token_ids(task._tokenizer)
+    return task
+
+
+def test_structure_without_modeled_residues_is_skipped(
+    make_model: Callable[..., OplmForMaskedLM],
+) -> None:
+    """No residue with a full backbone: skipped before any forward pass."""
+    struct = StructureData(
+        name="empty",
+        sequence="ACDEFGHIK",
+        coords=torch.full((9, 3, 3), float("nan")),
+        chain_id="A",
+    )
+    model = make_model(max_position_embeddings=_MAX_SEQ_LEN)
+    assert _task()._process_single_structure(struct, model, torch.device("cpu")) is None
+
+
+def test_structures_too_long_for_the_context_are_reported(caplog: pytest.LogCaptureFixture) -> None:
+    """A set's longest chains drop out at a short context; say so instead of a DEBUG line."""
+
+    def struct(name: str, length: int) -> StructureData:
+        return StructureData(
+            name=name, sequence="A" * length, coords=torch.zeros(length, 3, 3), chain_id="A"
+        )
+
+    task = _task()
+    task._structures = [struct("short", _MAX_SEQ_LEN - 2), struct("long", _MAX_SEQ_LEN - 1)]
+    with caplog.at_level("WARNING"):
+        assert task._select_structure_names() == {"short"}
+    assert "1 of 2 structures" in caplog.text
+
+
+@pytest.mark.slow
+def test_unmodeled_residues_are_unscored(
+    structure_fixtures_dir: Path,
+    tmp_path: Path,
+    make_model: Callable[..., OplmForMaskedLM],
+) -> None:
+    """Five unmodeled residues: the model reads all 46, L counts the 41 modeled."""
+    lines = [
+        line
+        for line in (structure_fixtures_dir / "1CRN.pdb").read_text().splitlines(keepends=True)
+        if not (line.startswith(("ATOM", "ANISOU")) and 20 <= int(line[22:26]) <= 24)
+    ]
+    (tmp_path / "1CRN_gap.pdb").write_text("".join(lines))
+    (struct,) = load_structures(tmp_path)
+    model = make_model(max_position_embeddings=_MAX_SEQ_LEN)
+    data = _task()._process_single_structure(struct, model, torch.device("cpu"))
+    assert data is not None
+    assert len(struct.sequence) == 46 and data.seq_len == 41
+    gap = torch.arange(19, 24)
+    assert not torch.isin(data.pair_indices[0], gap).any()
+    assert not torch.isin(data.pair_indices[1], gap).any()
+
+
+def test_structure_config_parses_coevolution_path() -> None:
+    assert StructureTaskConfig.from_extra({"coevolution": "/x"}).coevolution == "/x"
+    assert StructureTaskConfig.from_extra({}).coevolution is None
+
+
+def test_coevolution_key_extends_default_metrics(tmp_path: Path) -> None:
+    (tmp_path / "manifest.parquet").touch()  # only its existence is checked at construction
+    folder = str(tmp_path)
+
+    def metrics(**kw) -> list[str]:
+        entry = EvalDatasetEntry(
+            name="s", path=".", type="structure", schedule=ScheduleSpec("steps", 1), **kw
+        )
+        cfg = OplmConfig(model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN))
+        return StructureEvalTask(entry, cfg).metrics
+
+    assert metrics(extra={"coevolution": folder}) == [
+        "precision_at_L",
+        *DEFAULT_COEVOLUTION_METRICS,
+    ]
+    assert metrics(extra={"coevolution": folder}, metrics=["precision_at_L"]) == ["precision_at_L"]
+    assert metrics() == ["precision_at_L"]
+
+
+@pytest.mark.slow
+def test_structure_metrics_identical_with_and_without_coevolution(
+    structure_fixtures_dir: Path,
+    tmp_path: Path,
+    make_model: Callable[..., OplmForMaskedLM],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Coevolution for 1CRN only: structure P@L unchanged, 1CRN decomposes, others excluded."""
+    from accelerate import Accelerator
+
+    cfg = OplmConfig(
+        model=OplmModelConfig(max_position_embeddings=_MAX_SEQ_LEN),
+        train=TrainConfig(wandb_enabled=False),
+        data=DataConfig(num_workers=0, pin_memory=False),
+    )
+    model = make_model(max_position_embeddings=_MAX_SEQ_LEN)
+    accelerator = Accelerator(cpu=True)
+
+    def run(path: Path, extra: dict) -> dict[str, float]:
+        return run_entry(path, extra, None)
+
+    def run_entry(path: Path, extra: dict, metrics: list[str] | None) -> dict[str, float]:
+        entry = EvalDatasetEntry(
+            metrics=metrics,
+            name="struct",
+            path=str(path),
+            type="structure",
+            schedule=ScheduleSpec("steps", 1),
+            extra=extra,
+        )
+        return StructureEvalTask(entry, cfg).evaluate(model, accelerator)
+
+    crn_dir = tmp_path / "crn"
+    crn_dir.mkdir()
+    shutil.copy(structure_fixtures_dir / "1CRN.pdb", crn_dir)
+    (crn,) = load_structures(crn_dir)
+    gen = torch.Generator().manual_seed(0)
+    potts = torch.randn(len(crn.sequence), len(crn.sequence), generator=gen)
+    potts = potts + potts.T
+    sha = hashlib.sha256(crn.sequence.encode()).hexdigest()
+    coevo = tmp_path / "coevolution"
+    (coevo / "couplings").mkdir(parents=True)
+    np.save(coevo / "couplings" / f"{sha}.npy", potts.numpy().astype(np.float16))
+    pd.DataFrame({"sha256": [sha], "length": [len(crn.sequence)], "neff_bin": ["high"]}).to_parquet(
+        coevo / "manifest.parquet"
+    )
+
+    without = run(structure_fixtures_dir, {})
+    with caplog.at_level("WARNING"):
+        with_coevo = run(structure_fixtures_dir, {"coevolution": str(coevo)})
+    crn_only = run(crn_dir, {})
+
+    assert with_coevo["precision_at_L"] == without["precision_at_L"]
+    assert "p_at_L_beyond" in with_coevo and "p_at_L_beyond" not in without
+    assert with_coevo["p_at_L_shared"] + with_coevo["p_at_L_beyond"] == pytest.approx(
+        crn_only["precision_at_L"]
+    )
+    assert "2 of 3 structures have no coevolution data" in caplog.text
+
+    only = run_entry(structure_fixtures_dir, {"coevolution": str(coevo)}, ["p_at_L_beyond"])
+    assert "p_at_L_beyond" in only and "precision_at_L" not in only
+
+
+def test_coevolution_misconfiguration_fails_at_construction(tmp_path: Path) -> None:
+    def build(**kw) -> StructureEvalTask:
+        entry = EvalDatasetEntry(
+            name="struct", path=".", type="structure", schedule=ScheduleSpec("steps", 1), **kw
+        )
+        return StructureEvalTask(entry, OplmConfig(model=OplmModelConfig()))
+
+    with pytest.raises(ValueError, match="struct.*manifest.parquet"):
+        build(extra={"coevolution": str(tmp_path)})
+    with pytest.raises(ValueError, match="struct.*no coevolution"):
+        build(metrics=["p_at_L_beyond"])

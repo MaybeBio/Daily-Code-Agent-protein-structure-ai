@@ -1,0 +1,1504 @@
+name: Molecular utility input and BBB checks
+on:
+  push:
+    paths: &utility_paths
+      - "frontend/src/editors/ketcher-conversions*"
+      - "frontend/src/editors/recognition-host-editor.css"
+      - "frontend/src/editors/portable-smiles*"
+      - "frontend/src/utilities/ImageInputSource.ts"
+      - "frontend/src/utilities/UtilityImage*"
+      - "frontend/src/utilities/useRecognition*"
+      - "frontend/src/utilities/recognition-foreground*"
+      - "frontend/src/utilities/recognition-host*"
+      - "frontend/src/utilities/image-molecule.*"
+      - "frontend/src/operations/AssetPickerImageSource.test.tsx"
+      - "src/opendde_workbench/recognition_companion.py"
+      - "src/opendde_workbench/data/recognition_locale/patch.json"
+      - "tests/test_recognition_companion*.py"
+      - "tests/fixtures/utility_image/**"
+      - "server_tests/test_utility_image_browser.py"
+      - "frontend/src/diffsbdd/ReferencePicker.tsx"
+      - "frontend/src/diffsbdd/useReferenceSelection.ts"
+      - "frontend/src/operations/AssetPicker.tsx"
+      - "frontend/src/research/MaterialInput.tsx"
+      - "frontend/src/chemistry/LibraryScreenResults.tsx"
+      - "frontend/src/chemistry/LibraryScreenRecords.tsx"
+      - "frontend/src/operations/PropertyResults.tsx"
+      - "frontend/src/operations/PropertyResultViews.tsx"
+      - "frontend/src/operations/AssetPickerSources.ts"
+      - "frontend/src/operations/AssetPickerUpload.tsx"
+      - "frontend/src/utilities/ImageMoleculeInput*"
+      - "frontend/src/utilities/ImageMoleculeDialog*"
+      - "frontend/src/utilities/useImageInputSession*"
+      - "frontend/src/admet/**"
+      - "frontend/src/guided/MolecularReview*"
+      - "frontend/src/guided/InputActionScope*"
+      - "frontend/src/guided/useInputTaskSubmit*"
+      - "frontend/src/guided/TaskPresentation*"
+      - "frontend/src/guided/SinglePage*"
+      - "frontend/src/examples/ExampleActions*"
+      - "frontend/src/guided/molecular-review.css"
+      - "frontend/src/guided/desktop-questionnaire.css"
+      - "frontend/src/guided/questionnaire.css"
+      - "server_tests/test_guided_desktop_browser.py"
+      - "frontend/src/operations/PropertyForm.tsx"
+      - "frontend/src/chemistry/StateForm.tsx"
+      - "frontend/src/chemistry/LibraryScreenForm.tsx"
+      - "frontend/src/chemistry/LibraryScreenQuestions.tsx"
+      - "frontend/src/chemistry/MolecularToolReview.test.tsx"
+      - "frontend/src/utilities/UtilityWorkspace*"
+      - "frontend/src/studio/HelpWorkspace*"
+      - "server_tests/test_desktop_help_browser.py"
+      - "frontend/src/integrations/RefinementSummary.tsx"
+      - "frontend/src/integrations/refinement-summary.css"
+      - "frontend/src/integrations/refinement-energy-labels.ts"
+      - "server_tests/test_refinement_review_browser.py"
+      - "frontend/src/presentation/SpatialResultSummary.tsx"
+      - "frontend/src/presentation/spatial-results.css"
+      - "frontend/src/presentation/spatial-result-review.css"
+      - "server_tests/test_short_protein_viewports.py"
+      - "server_tests/test_spatial_results_desktop.py"
+      - "server_tests/test_spatial_canvas_review_browser.py"
+      - "server_tests/test_spatial_inspection_followups_browser.py"
+      - "server_tests/test_sequence_review_desktop.py"
+      - "frontend/src/operations/CandidateChainComparison.tsx"
+      - "frontend/src/operations/CandidateSequenceResults*"
+      - "frontend/src/presentation/sequence-review.css"
+      - "server_tests/test_protein_review_desktop.py"
+      - ".github/workflows/refinement-input-checks.yml"
+      - "frontend/src/utilities/UtilityTask*"
+      - "frontend/src/utilities/UtilitySinglePage*"
+      - "server_tests/test_utility_result_desktop.py"
+      - "frontend/src/utilities/utility-task.css"
+      - "frontend/src/utilities/UtilityBrainSubmission.test.tsx"
+      - "frontend/src/operations/ToolCenter.tsx"
+      - "frontend/src/operations/catalog.ts"
+      - "frontend/src/studio/research-modules.ts"
+      - "frontend/src/studio/method-choices.ts"
+      - "frontend/src/studio/task-kind-rules.ts"
+      - "src/opendde_workbench/admet/contract.py"
+      - "src/opendde_workbench/admet/presentation.py"
+      - "src/opendde_workbench/capabilities/definitions.py"
+      - "src/opendde_workbench/capabilities/modalities.py"
+      - "src/opendde_workbench/task_history/kinds.py"
+      - "src/opendde_workbench/examples/catalogue.json"
+      - "src/opendde_workbench/examples/preparation.py"
+      - "src/opendde_workbench/examples/pin_validation.py"
+      - "src/opendde_workbench/examples/stat6/guidance.py"
+      - "src/opendde_workbench/examples/stat6/task_requests.py"
+      - "src/opendde_workbench/examples/stat6/catalogue-profiles.json"
+      - "scripts/molecular-utility-scope.py"
+      - "scripts/record-study-catalogue.py"
+      - "tests/test_brain_profile*.py"
+      - "tests/test_molecular_utility_scope.py"
+      - "server_tests/test_brain_profile_browser.py"
+      - "server_tests/test_molecular_review_workspace_browser.py"
+      - "server_tests/molecular_review_capture.py"
+      - "server_tests/utility_workspace_capture.py"
+      - "server_tests/test_utility_navigation_browser.py"
+      - "server_tests/test_molecular_review_controls_browser.py"
+      - "src/opendde_workbench/runtime_controls.py"
+      - "frontend/src/utilities/backend-runtime.ts"
+      - "frontend/src/utilities/backend-control-scope.ts"
+      - "frontend/src/utilities/BackendControls.tsx"
+      - "frontend/src/utilities/BackendControls.test.tsx"
+      - "frontend/src/utilities/BackendPanelList.tsx"
+      - "frontend/src/utilities/BackendPowerSwitch.tsx"
+      - "frontend/src/utilities/ComputeSwitch.tsx"
+      - "frontend/src/utilities/RuntimeSwitch.tsx"
+      - "frontend/src/utilities/TaskBackendControl.tsx"
+      - "frontend/src/utilities/RecognitionBackendEntry.tsx"
+      - "frontend/src/utilities/recognition-power.ts"
+      - "scripts/check-recognition-idle-power.mjs"
+      - "scripts/recognition-idle-power.patch"
+      - "tests/fixtures/recognition_idle_power/**"
+      - "src/opendde_workbench/utility_routes.py"
+      - "frontend/src/studio/TaskHistoryToolbar.tsx"
+      - "frontend/src/utilities/runtime-switch.css"
+      - "frontend/src/datasets/ScreeningForm*"
+      - "server_tests/test_screening_power_browser.py"
+      - "server_tests/test_module_backend_switch_browser.py"
+      - "server_tests/test_runtime_entry_browser.py"
+      - "server_tests/test_result_handoffs_desktop.py"
+      - "tests/test_utility_tools.py"
+      - "tests/test_compute_power_admission.py"
+      - ".github/workflows/molecular-utility-checks.yml"
+  pull_request:
+    paths: *utility_paths
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      scope_only:
+        type: boolean
+        default: false
+    outputs:
+      aligned_comparison_only:
+        value: ${{ jobs.scope.outputs.aligned_comparison_only }}
+      desktop_structure_focus_only:
+        value: ${{ jobs.scope.outputs.desktop_structure_focus_only }}
+      result_handoff_desktop_only:
+        value: ${{ jobs.scope.outputs.result_handoff_desktop_only }}
+      molecule_results_only:
+        value: ${{ jobs.scope.outputs.molecule_results_only }}
+      ligand_camera_only:
+        value: ${{ jobs.scope.outputs.ligand_camera_only }}
+      utility_only:
+        value: ${{ jobs.scope.outputs.utility_only }}
+      editor_drawing_only:
+        value: ${{ jobs.scope.outputs.editor_drawing_only }}
+      paired_figure_only:
+        value: ${{ jobs.scope.outputs.paired_figure_only }}
+      native_color_figure_only:
+        value: ${{ jobs.scope.outputs.native_color_figure_only }}
+      potential_display_only:
+        value: ${{ jobs.scope.outputs.potential_display_only }}
+      runtime_switch_only:
+        value: ${{ jobs.scope.outputs.runtime_switch_only }}
+      backend_placement_only:
+        value: ${{ jobs.scope.outputs.backend_placement_only }}
+      composed_power_only:
+        value: ${{ jobs.scope.outputs.composed_power_only }}
+      task_power_only:
+        value: ${{ jobs.scope.outputs.task_power_only }}
+      native_state_only:
+        value: ${{ jobs.scope.outputs.native_state_only }}
+      compact_example_only:
+        value: ${{ jobs.scope.outputs.compact_example_only }}
+      mobile_header_only:
+        value: ${{ jobs.scope.outputs.mobile_header_only }}
+      desktop_header_only:
+        value: ${{ jobs.scope.outputs.desktop_header_only }}
+      desktop_complex_review_only:
+        value: ${{ jobs.scope.outputs.desktop_complex_review_only }}
+      initial_pose_power_only:
+        value: ${{ jobs.scope.outputs.initial_pose_power_only }}
+      mobile_viewer_only:
+        value: ${{ jobs.scope.outputs.mobile_viewer_only }}
+      recognition_power_only:
+        value: ${{ jobs.scope.outputs.recognition_power_only }}
+      utility_desktop_only:
+        value: ${{ jobs.scope.outputs.utility_desktop_only }}
+      result_header_only:
+        value: ${{ jobs.scope.outputs.result_header_only }}
+      refinement_desktop_only:
+        value: ${{ jobs.scope.outputs.refinement_desktop_only }}
+      spatial_desktop_only:
+        value: ${{ jobs.scope.outputs.spatial_desktop_only }}
+      spatial_review_only:
+        value: ${{ jobs.scope.outputs.spatial_review_only }}
+      short_structure_review_only:
+        value: ${{ jobs.scope.outputs.short_structure_review_only }}
+      sequence_desktop_only:
+        value: ${{ jobs.scope.outputs.sequence_desktop_only }}
+      protein_desktop_only:
+        value: ${{ jobs.scope.outputs.protein_desktop_only }}
+      history_desktop_only:
+        value: ${{ jobs.scope.outputs.history_desktop_only }}
+      candidate_desktop_only:
+        value: ${{ jobs.scope.outputs.candidate_desktop_only }}
+      del_desktop_only:
+        value: ${{ jobs.scope.outputs.del_desktop_only }}
+      simulation_desktop_only:
+        value: ${{ jobs.scope.outputs.simulation_desktop_only }}
+      proximity_desktop_only:
+        value: ${{ jobs.scope.outputs.proximity_desktop_only }}
+permissions:
+  contents: read
+jobs:
+  scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      aligned_comparison_only: ${{ steps.select.outputs.aligned_comparison_only }}
+      utility_only: ${{ steps.select.outputs.utility_only }}
+      inline_recognition_only: ${{ steps.select.outputs.inline_recognition_only }}
+      editor_drawing_only: ${{ steps.select.outputs.editor_drawing_only }}
+      portable_smiles_only: ${{ steps.select.outputs.portable_smiles_only }}
+      archived_pose_review_only: ${{ steps.select.outputs.archived_pose_review_only }}
+      guided_desktop_only: ${{ steps.select.outputs.guided_desktop_only }}
+      prediction_input_layout: ${{ steps.select.outputs.prediction_input_layout }}
+      utility_query_only: ${{ steps.select.outputs.utility_query_only }}
+      compact_material_only: ${{ steps.select.outputs.compact_material_only }}
+      paired_figure_only: ${{ steps.select.outputs.paired_figure_only }}
+      native_color_figure_only: ${{ steps.select.outputs.native_color_figure_only }}
+      touch_controls_only: ${{ steps.select.outputs.touch_controls_only }}
+      utility_navigation_only: ${{ steps.select.outputs.utility_navigation_only }}
+      utility_desktop_only: ${{ steps.select.outputs.utility_desktop_only }}
+      desktop_help_only: ${{ steps.select.outputs.desktop_help_only }}
+      refinement_desktop_only: ${{ steps.select.outputs.refinement_desktop_only }}
+      spatial_desktop_only: ${{ steps.select.outputs.spatial_desktop_only }}
+      spatial_review_only: ${{ steps.select.outputs.spatial_review_only }}
+      short_structure_review_only: ${{ steps.select.outputs.short_structure_review_only }}
+      short_paired_comparison_only: ${{ steps.select.outputs.short_paired_comparison_only }}
+      sequence_desktop_only: ${{ steps.select.outputs.sequence_desktop_only }}
+      protein_desktop_only: ${{ steps.select.outputs.protein_desktop_only }}
+      history_desktop_only: ${{ steps.select.outputs.history_desktop_only }}
+      candidate_desktop_only: ${{ steps.select.outputs.candidate_desktop_only }}
+      screening_desktop_only: ${{ steps.select.outputs.screening_desktop_only }}
+      del_desktop_only: ${{ steps.select.outputs.del_desktop_only }}
+      result_theme_only: ${{ steps.select.outputs.result_theme_only }}
+      desktop_result_layout_only: ${{ steps.select.outputs.desktop_result_layout_only }}
+      simulation_desktop_only: ${{ steps.select.outputs.simulation_desktop_only }}
+      proximity_desktop_only: ${{ steps.select.outputs.proximity_desktop_only }}
+      result_handoff_desktop_only: ${{ steps.select.outputs.result_handoff_desktop_only }}
+      molecule_results_only: ${{ steps.select.outputs.molecule_results_only }}
+      short_chemistry_desktop_only: ${{ steps.select.outputs.short_chemistry_desktop_only }}
+      molecule_workbench_only: ${{ steps.select.outputs.molecule_workbench_only }}
+      ligand_camera_only: ${{ steps.select.outputs.ligand_camera_only }}
+      desktop_structure_focus_only: ${{ steps.select.outputs.desktop_structure_focus_only }}
+      runtime_entry_only: ${{ steps.select.outputs.runtime_entry_only }}
+      utility_result_desktop_only: ${{ steps.select.outputs.utility_result_desktop_only }}
+      recognition_power_only: ${{ steps.select.outputs.recognition_power_only }}
+      recognition_access_only: ${{ steps.select.outputs.recognition_access_only }}
+      recognition_entry_only: ${{ steps.select.outputs.recognition_entry_only }}
+      potential_display_only: ${{ steps.select.outputs.potential_display_only }}
+      runtime_switch_only: ${{ steps.select.outputs.runtime_switch_only }}
+      backend_placement_only: ${{ steps.select.outputs.backend_placement_only }}
+      task_power_only: ${{ steps.select.outputs.task_power_only }}
+      module_backend_only: ${{ steps.select.outputs.module_backend_only }}
+      module_power_only: ${{ steps.select.outputs.module_power_only }}
+      composed_power_only: ${{ steps.select.outputs.composed_power_only }}
+      module_power_changed: ${{ steps.select.outputs.module_power_changed }}
+      native_state_only: ${{ steps.select.outputs.native_state_only }}
+      compact_example_only: ${{ steps.select.outputs.compact_example_only }}
+      mobile_header_only: ${{ steps.select.outputs.mobile_header_only }}
+      desktop_header_only: ${{ steps.select.outputs.desktop_header_only }}
+      desktop_complex_review_only: ${{ steps.select.outputs.desktop_complex_review_only }}
+      initial_pose_power_only: ${{ steps.select.outputs.initial_pose_power_only }}
+      mobile_viewer_only: ${{ steps.select.outputs.mobile_viewer_only }}
+      print_labels_only: ${{ steps.select.outputs.print_labels_only }}
+      result_header_only: ${{ steps.select.outputs.result_header_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: select
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/molecular-utility-scope.py
+  utility-inputs:
+    needs: scope
+    if: >-
+      !inputs.scope_only && needs.scope.outputs.recognition_power_only != 'true' &&
+      needs.scope.outputs.recognition_access_only != 'true' &&
+      needs.scope.outputs.inline_recognition_only != 'true' &&
+      needs.scope.outputs.editor_drawing_only != 'true' &&
+      needs.scope.outputs.portable_smiles_only != 'true' &&
+      needs.scope.outputs.archived_pose_review_only != 'true' &&
+      needs.scope.outputs.guided_desktop_only != 'true' &&
+      needs.scope.outputs.prediction_input_layout != 'true' &&
+      needs.scope.outputs.utility_query_only != 'true' &&
+      needs.scope.outputs.compact_material_only != 'true' &&
+      needs.scope.outputs.paired_figure_only != 'true' &&
+      needs.scope.outputs.native_color_figure_only != 'true' &&
+      needs.scope.outputs.recognition_entry_only != 'true' &&
+      needs.scope.outputs.touch_controls_only != 'true' && needs.scope.outputs.runtime_switch_only != 'true' &&
+      needs.scope.outputs.result_header_only != 'true' && needs.scope.outputs.utility_navigation_only != 'true' &&
+      needs.scope.outputs.potential_display_only != 'true' && needs.scope.outputs.native_state_only != 'true' &&
+      needs.scope.outputs.compact_example_only != 'true' && needs.scope.outputs.mobile_header_only != 'true' &&
+      needs.scope.outputs.desktop_header_only != 'true' &&
+      needs.scope.outputs.initial_pose_power_only != 'true' &&
+      needs.scope.outputs.mobile_viewer_only != 'true' && needs.scope.outputs.print_labels_only != 'true' &&
+      needs.scope.outputs.utility_desktop_only != 'true' && needs.scope.outputs.desktop_help_only != 'true' &&
+      needs.scope.outputs.refinement_desktop_only != 'true' &&
+      needs.scope.outputs.spatial_desktop_only != 'true' &&
+      needs.scope.outputs.short_structure_review_only != 'true' &&
+      needs.scope.outputs.sequence_desktop_only != 'true' &&
+      needs.scope.outputs.protein_desktop_only != 'true' &&
+      needs.scope.outputs.history_desktop_only != 'true' &&
+      needs.scope.outputs.candidate_desktop_only != 'true' &&
+      needs.scope.outputs.del_desktop_only != 'true' &&
+      needs.scope.outputs.simulation_desktop_only != 'true' &&
+      needs.scope.outputs.proximity_desktop_only != 'true' &&
+      needs.scope.outputs.result_handoff_desktop_only != 'true' &&
+      needs.scope.outputs.desktop_structure_focus_only != 'true' &&
+      needs.scope.outputs.aligned_comparison_only != 'true' &&
+      needs.scope.outputs.runtime_entry_only != 'true' &&
+      needs.scope.outputs.utility_result_desktop_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev --group browser
+      - name: Exact committed catalogue, frontend and direct native ADMET contracts
+        run: |
+          uv run --locked python scripts/record-study-catalogue.py --check
+          uv run --locked python scripts/generate-capability-catalog.py --check
+          cd frontend
+          npx vitest run \
+            src/examples/ExampleActions.test.tsx \
+            src/guided/MolecularReview.test.tsx \
+            src/guided/Questionnaire.test.tsx \
+            src/guided/QuestionnaireGuidance.test.tsx \
+            src/guided/SinglePageTask.test.tsx \
+            src/App.test.tsx \
+            src/operations/PropertyForm.test.tsx \
+            src/operations/PropertyFormFileVerification.test.tsx \
+            src/chemistry/StateForm.test.tsx \
+            src/chemistry/LibraryScreenForm.test.tsx \
+            src/chemistry/LibraryScreenTemplate.test.tsx \
+            src/chemistry/MolecularToolReview.test.tsx \
+            src/utilities/ImageMoleculeInput.test.tsx \
+            src/utilities/ImageMoleculeInput.action.test.tsx \
+            src/utilities/useRecognitionBridge.test.tsx \
+            src/utilities/useRecognitionRequest.test.tsx \
+            src/utilities/recognition-foreground.test.ts \
+            src/utilities/recognition-host-bridge.test.ts \
+            src/utilities/recognition-host-foreground.test.ts \
+            src/utilities/UtilityImageTask.test.tsx \
+            src/utilities/ImageRecognition.test.tsx \
+            src/utilities/recognition-locale.test.tsx \
+            src/utilities/BackendControls.test.tsx \
+            src/operations/AssetPicker.test.tsx \
+            src/operations/AssetPickerSources.test.tsx \
+            src/operations/AssetPickerImageSource.test.tsx \
+            src/diffsbdd/ReferencePicker.test.tsx \
+            src/diffsbdd/ReferencePickerUpload.test.tsx \
+            src/diffsbdd/ReferencePickerLifecycle.test.tsx \
+            src/diffsbdd/useReferenceSelection.test.tsx \
+            src/editors/native-molecular-viewport.test.ts \
+            src/editors/molecule-readiness.test.ts \
+            src/editors/recognition-host-editor.test.ts \
+            src/editors/ketcher-conversions.test.ts \
+            src/operations/useAssetUpload.image.test.tsx \
+            src/integrations/BoltzInputs.test.tsx \
+            src/integrations/Mol1Form.test.tsx \
+            src/presentation/PredictionEntityEditing.test.tsx \
+            src/research/SdfRecordPicker.test.tsx \
+            src/presentation/MoleculeImage.test.tsx \
+            src/presentation/depiction-renderer.test.ts \
+            src/publication/FigureExport.test.tsx \
+            src/admet/AdmetForm.test.tsx \
+            src/admet/AdmetResults.test.tsx \
+            src/admet/EndpointValue.test.tsx \
+            src/utilities/UtilityBrainSubmission.test.tsx \
+            src/utilities/UtilityTask.test.tsx \
+            src/utilities/UtilityTaskResult.test.tsx \
+            src/utilities/UtilitySinglePage.test.tsx \
+            src/admet/BrainScope.test.tsx \
+            src/utilities/UtilityWorkspace.test.tsx \
+            src/studio/Navigation.test.tsx \
+            src/studio/MethodSwitch.test.tsx \
+            src/studio/research-modules.test.ts \
+            src/presentation/ResearchTable.test.tsx \
+            src/presentation/MetricScatter.test.tsx \
+            src/viewer/PoseSession.test.tsx \
+            src/viewer/pose-plan.test.ts
+          cd ..
+          uv run --locked pytest -q tests/test_admet.py tests/test_brain_profile.py tests/test_molecular_utility_scope.py tests/test_capabilities.py tests/test_example_pins.py tests/test_library_screen.py tests/test_library_evidence.py
+          uv run --locked ruff check src/opendde_workbench/recognition_companion.py tests/test_recognition_companion.py tests/test_recognition_companion_wheel.py server_tests/test_utility_image_browser.py
+          uv build --wheel
+          uv run --locked pytest -q tests/test_recognition_companion.py tests/test_recognition_companion_wheel.py tests/test_utility_tools.py tests/test_compute_service.py tests/test_compute_msa_protocol.py tests/test_harness_admission.py
+          uv run --locked ruff check server_tests/utility_workspace_capture.py
+          uv run --locked ruff check scripts/record-study-catalogue.py scripts/molecular-utility-scope.py tests/test_brain_profile.py tests/test_molecular_utility_scope.py server_tests/test_brain_profile_browser.py server_tests/test_molecular_review_workspace_browser.py server_tests/molecular_review_capture.py src/opendde_workbench/admet/contract.py src/opendde_workbench/admet/presentation.py src/opendde_workbench/capabilities/definitions.py src/opendde_workbench/capabilities/modalities.py src/opendde_workbench/task_history/kinds.py src/opendde_workbench/examples/stat6/task_requests.py src/opendde_workbench/examples/stat6/guidance.py src/opendde_workbench/examples/pin_validation.py
+      - name: Retrieve sealed native outputs without starting a prediction engine
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv run --locked python - <<'PY'
+          import os, urllib.request
+          from pathlib import Path
+          from opendde_workbench.examples.stat6_bundle_release import URL
+          target = Path(os.environ["RUNNER_TEMP"]) / "stat6-reviewed-results.zip"
+          urllib.request.urlretrieve(URL, target)
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"WB_REVIEWED_STAT6_ARCHIVE={target}\n")
+          PY
+      - name: Native retained-output browser acceptance with prediction disabled
+        run: |
+          uv run --locked playwright install --with-deps chromium
+          google-chrome --version
+          uv run --locked python -c 'from server_tests.molecular_review_capture import verify_review_fonts; print(verify_review_fonts())'
+          uv run --locked python -m pytest -q server_tests/test_brain_profile_browser.py server_tests/test_molecular_review_workspace_browser.py --basetemp "$RUNNER_TEMP/brain-profile-browser"
+          uv run --locked python -m pytest -q server_tests/test_recognition_locale_browser.py server_tests/test_utility_image_browser.py --basetemp "$RUNNER_TEMP/utility-image-browser"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: molecular-utility-native-evidence
+          path: |
+            outputs/brain-profile
+            outputs/molecular-review-workspace
+            outputs/recognition-locale
+            outputs/utility-image
+          if-no-files-found: warn
+
+  recognition-backend-entry:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.recognition_entry_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Shared backend controls and recognition workspace navigation
+        working-directory: frontend
+        run: >-
+          npx vitest run src/studio/Header.test.tsx src/utilities/BackendControls.test.tsx
+          src/utilities/UtilityWorkspace.test.tsx src/utilities/ImageRecognition.test.tsx
+      - name: Recognition state, explicit power, and module switches in Chrome
+        run: |
+          fixture="$PWD/tests/fixtures/recognition_idle_power"
+          (cd "$fixture" && sha256sum -c SHA256SUMS)
+          candidate=$(mktemp -d "$RUNNER_TEMP/recognition-idle-power.XXXXXXXX")
+          cp -R "$fixture/desktop" "$candidate/"
+          git -C "$candidate" apply "$PWD/scripts/recognition-idle-power.patch"
+          node scripts/check-recognition-idle-power.mjs "$candidate/desktop/server.mjs"
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check src/opendde_workbench/runtime_controls.py src/opendde_workbench/utility_routes.py tests/test_utility_tools.py scripts/molecular-utility-scope.py server_tests/test_module_backend_switch_browser.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py tests/test_utility_tools.py -k 'discovery_only_reads or discovery_failure or recognition_status or recognition_power or managed_engine_default_off or test_molecular_utility_scope'
+          uv run --locked python -m pytest -xq server_tests/test_module_backend_switch_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recognition-backend-entry-evidence
+          path: outputs/module-backend-switches/
+
+  explicit-recognition-power:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.recognition_power_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Image import, explicit service power and checked bridge state
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/useRecognitionRequest.test.tsx
+          src/utilities/useRecognitionBridge.test.tsx src/utilities/recognition-host-bridge.test.ts
+          src/utilities/recognition-host-foreground.test.ts src/utilities/recognition-foreground.test.ts
+          src/utilities/ImageMoleculeInput.test.tsx src/utilities/ImageMoleculeInput.action.test.tsx
+          src/utilities/UtilityImageTask.test.tsx src/workflows/WorkflowCenter.test.tsx
+      - name: Wheel resources and default-off task and import controls in Chrome
+        run: |
+          uv sync --locked --group dev --group browser
+          google-chrome --version
+          uv run --locked ruff check scripts/molecular-utility-scope.py server_tests/test_{utility_image,module_backend_switch}_browser.py
+          uv build --wheel
+          uv run --locked pytest -q tests/test_recognition_companion.py tests/test_recognition_companion_wheel.py tests/test_molecular_utility_scope.py
+          uv run --locked python -m pytest -q server_tests/test_utility_image_browser.py server_tests/test_module_backend_switch_browser.py --basetemp "$RUNNER_TEMP/explicit-power"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: explicit-backend-power-evidence
+          path: |
+            outputs/utility-image
+            outputs/module-backend-switches
+          if-no-files-found: warn
+
+  utility-query:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.utility_query_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Utility forms, drawing and image ownership
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/UtilityWorkspace.test.tsx src/utilities/UtilityTask.test.tsx
+          src/utilities/ImageRecognition.test.tsx src/utilities/ImageMoleculeInput.test.tsx
+          src/utilities/ImageMoleculeInput.action.test.tsx src/chemistry/LibraryScreenForm.test.tsx
+          src/chemistry/LibraryScreenTemplate.test.tsx src/chemistry/MolecularToolReview.test.tsx
+          src/operations/AssetPicker.test.tsx src/diffsbdd/ReferencePicker.test.tsx
+      - name: Verify query handoff and retained library in Chrome
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_utility_image_browser.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          uv run --locked python -m pytest -xq server_tests/test_utility_image_browser.py \
+            -k 'editor_drawing or purpose_field or 1440' --basetemp "$RUNNER_TEMP/utility-query"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: utility-query-browser-evidence
+          path: outputs/utility-image/
+          if-no-files-found: warn
+
+  compact-utility-materials:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.compact_material_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Utility readiness, guided form continuity and direct state consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/guided/SinglePageTask.test.tsx src/guided/Questionnaire.test.tsx
+          src/utilities/UtilitySinglePage.test.tsx src/utilities/UtilityImageTask.test.tsx
+          src/chemistry/StateForm.test.tsx src/chemistry/MolecularToolReview.test.tsx
+      - name: Check first-screen actions and retry in desktop Chrome
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_molecular_review_controls_browser.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          export WB_HOME="$RUNNER_TEMP/x-dde-utility-readiness"
+          export WB_STATE_DIR="$WB_HOME/state"
+          uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked python -m pytest -xq server_tests/test_molecular_review_controls_browser.py \
+            -k utility_readiness --basetemp "$RUNNER_TEMP/compact-material"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compact-utility-material-browser-evidence
+          path: outputs/utility-navigation/utility-readiness/
+          if-no-files-found: warn
+
+  editor-drawing-handoff:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.editor_drawing_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Exact editor snapshot, utility forms and input ownership
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/ImageRecognition.test.tsx
+          src/utilities/recognition-host-bridge.test.ts src/utilities/recognition-host-foreground.test.ts
+          src/utilities/useRecognitionBridge.test.tsx src/utilities/UtilityImageTask.test.tsx
+          src/utilities/UtilityWorkspace.test.tsx src/utilities/UtilityTask.test.tsx
+          src/utilities/ImageMoleculeInput.action.test.tsx
+          src/editors/recognition-host-editor.test.ts
+      - name: Chrome handoff, native resources and legacy image import
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_utility_image_browser.py
+          uv build --wheel
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py tests/test_recognition_companion.py tests/test_recognition_companion_wheel.py
+          uv run --locked python -m pytest -q server_tests/test_utility_image_browser.py -k 'editor_drawing or 1440' --basetemp "$RUNNER_TEMP/editor-handoff"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: editor-handoff-browser-evidence
+          path: outputs/utility-image/
+          if-no-files-found: warn
+
+  recognition-smiles-export:
+    needs: scope
+    if: >-
+      ${{ !inputs.scope_only && (needs.scope.outputs.portable_smiles_only == 'true' ||
+      needs.scope.outputs.short_chemistry_desktop_only == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: SMILES export and host embedding
+        working-directory: frontend
+        run: npx vitest run src/editors/portable-smiles.test.ts src/utilities/ImageRecognition.test.tsx
+      - name: Companion migrations, wheel resources and focus scope
+        run: |
+          uv sync --locked --group dev
+          uv run --locked ruff check scripts/molecular-utility-scope.py src/opendde_workbench/recognition_companion.py tests/test_molecular_utility_scope.py tests/test_recognition_companion.py tests/test_recognition_companion_wheel.py
+          uv build --wheel
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py tests/test_recognition_companion.py tests/test_recognition_companion_wheel.py
+
+  guided-desktop:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.guided_desktop_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Questionnaire navigation and step validation
+        working-directory: frontend
+        run: >-
+          npx vitest run src/guided/Questionnaire.test.tsx
+          src/guided/QuestionnaireGuidance.test.tsx src/guided/SinglePageTask.test.tsx
+      - name: Check supported desktop sizes and choose a region on the native structure
+        env:
+          WB_HOME: ${{ runner.temp }}/guided-desktop
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py server_tests/test_guided_desktop_browser.py
+          uv run --locked python -m pytest -q tests/test_molecular_utility_scope.py server_tests/test_guided_desktop_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guided-desktop-evidence
+          path: outputs/guided-desktop/
+
+  recognition-power-in-task:
+    needs: scope
+    if: >-
+      !inputs.scope_only && (needs.scope.outputs.recognition_access_only == 'true' ||
+      needs.scope.outputs.inline_recognition_only == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Image inputs and shared backend switches
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/ImageMoleculeInput.test.tsx
+          src/utilities/ImageMoleculeInput.action.test.tsx src/utilities/useRecognitionBridge.test.tsx
+          src/utilities/useRecognitionRequest.test.tsx
+          src/utilities/UtilityImageTask.test.tsx src/utilities/BackendControls.test.tsx
+          src/admet/AdmetForm.test.tsx src/operations/PropertyForm.test.tsx
+          src/integrations/BoltzInputs.test.tsx src/presentation/PredictionEntityEditing.test.tsx
+      - name: Close the recognition service without leaving the current task
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py server_tests/test_{utility_image,module_backend_switch}_browser.py
+          uv run --locked python -m pytest -q tests/test_molecular_utility_scope.py
+          uv run --locked python -m pytest -q server_tests/test_utility_image_browser.py server_tests/test_module_backend_switch_browser.py --basetemp "$RUNNER_TEMP/recognition-in-task"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: recognition-power-in-task-evidence
+          path: |
+            outputs/utility-image/
+            outputs/module-backend-switches/
+          if-no-files-found: warn
+
+  contextual-backends:
+    needs: scope
+    if: >-
+      !inputs.scope_only && needs.scope.outputs.runtime_switch_only == 'true' &&
+      needs.scope.outputs.module_power_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Contextual backend, utility, workflow and example switches
+        if: needs.scope.outputs.backend_placement_only == 'true' && needs.scope.outputs.module_backend_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/BackendControls.test.tsx
+          src/utilities/UtilityWorkspace.test.tsx src/studio/TaskWorkspace.test.tsx
+          src/examples/ExampleActions.test.tsx src/examples/ExampleResultSet.test.tsx
+          src/workflows/WorkflowCenter.test.tsx src/App.test.tsx
+      - name: Module navigation, task switches and utility controls
+        if: needs.scope.outputs.module_backend_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/BackendControls.test.tsx
+          src/utilities/UtilityWorkspace.test.tsx
+          src/studio/TaskWorkspace.test.tsx src/studio/ModuleWorkspaceNavigation.test.tsx
+          src/studio/MethodSwitch.test.tsx src/App.test.tsx
+          src/discovery/TargetResearchForm.test.tsx
+      - name: Backend switches and directly changed surfaces
+        if: needs.scope.outputs.backend_placement_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/BackendControls.test.tsx src/utilities/UtilityWorkspace.test.tsx
+          src/studio/MethodSwitch.test.tsx src/studio/TaskWorkspace.test.tsx src/App.test.tsx
+          src/workflows/WorkflowCenter.test.tsx src/poses/PosePlanRun.test.tsx
+          src/poses/PoseWorkspace.test.tsx src/regions/RegionWorkspace.test.tsx
+          src/viewer/PreviewAvailability.test.tsx src/discovery/TargetResearchForm.test.tsx
+          src/editors/AlignedEditAction.test.tsx src/operations/CovalentEditor.test.tsx
+          src/admet/AdmetResults.test.tsx src/chemistry/LibraryScreenResults.test.tsx
+          src/chemistry/StateResults.test.tsx src/datasets/CandidateHandoff.test.tsx
+          src/diffsbdd/DiffResults.test.tsx src/discovery/ReferenceImportResults.test.tsx
+          src/discovery/TargetResearchResults.test.tsx src/docking/DockingResults.test.tsx
+          src/humanization/HumanizationResults.test.tsx src/pockets/PocketResults.test.tsx
+          src/pockets/PocketResults.return.test.tsx src/poses/PoseResults.test.tsx
+          src/receptors/ReceptorResults.test.tsx src/research/ResearchWorkspace.test.tsx
+          src/simulations/SimulationResults.test.tsx src/operations/StructureComparisonResults.test.tsx
+      - name: Canonical mappings and default-off admission
+        if: needs.scope.outputs.backend_placement_only != 'true'
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check src/opendde_workbench/runtime_controls.py src/opendde_workbench/discovery/routes.py server_tests/test_module_backend_switch_browser.py tests/test_utility_tools.py scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py
+          uv run --locked pytest -q tests/test_utility_tools.py tests/test_discovery.py tests/test_engine_registry.py tests/test_harness_admission.py tests/test_molecular_utility_scope.py
+      - name: Check precise CI scope and browser test sources
+        if: needs.scope.outputs.backend_placement_only == 'true'
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py server_tests/test_module_backend_switch_browser.py server_tests/test_result_handoff_browser.py tests/test_molecular_utility_scope.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+      - name: Compute power admission protects unresolved native launches
+        if: needs.scope.outputs.task_power_only == 'true'
+        run: |
+          uv run --locked ruff check src/opendde_workbench/api.py src/opendde_workbench/harness_service.py tests/test_compute_power_admission.py
+          uv run --locked pytest -q tests/test_compute_power_admission.py
+      - name: Exercise the actual backend switches in Chrome
+        run: |
+          google-chrome --version
+          uv run --locked python -m pytest -x -q server_tests/test_module_backend_switch_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: contextual-backend-evidence
+          path: outputs/module-backend-switches/
+
+  module-power:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.module_power_changed == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Shared switches and selected screening stages
+        if: needs.scope.outputs.composed_power_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/BackendControls.test.tsx
+          src/datasets/ScreeningForm.test.tsx src/datasets/screening-readiness.test.ts
+          src/studio/Header.test.tsx src/studio/ModuleWorkspaceNavigation.test.tsx
+          src/studio/TaskWorkspace.test.tsx src/studio/HomeWorkspace.test.tsx
+          src/examples/ExampleActions.test.tsx src/utilities/UtilityWorkspace.test.tsx
+          src/utilities/ImageRecognition.test.tsx
+      - name: Backend switches for compound tools, example previews and selected workflow steps
+        if: needs.scope.outputs.composed_power_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/BackendControls.test.tsx
+          src/examples/ExampleActions.test.tsx src/operations/ToolCenter.test.tsx
+          src/poses/PoseWorkspace.test.tsx src/regions/RegionWorkspace.test.tsx
+          src/workflows/WorkflowCenter.test.tsx
+      - name: Default-off behavior and operation-to-engine mapping
+        if: needs.scope.outputs.composed_power_only == 'true'
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check src/opendde_workbench/runtime_controls.py tests/test_utility_tools.py
+          uv run --locked pytest -q tests/test_utility_tools.py
+      - name: Contextual power controls in Chrome without scientific execution
+        if: needs.scope.outputs.composed_power_only != 'true'
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/browser_platform.py server_tests/test_{module_backend_switch,screening_power}_browser.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          uv run --locked python -m pytest -x -q server_tests/test_{module_backend_switch,screening_power}_browser.py
+      - name: Verify every research module and task switch in Chrome
+        if: needs.scope.outputs.composed_power_only == 'true'
+        run: |
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_module_backend_switch_browser.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          uv run --locked python -m pytest -x -q server_tests/test_module_backend_switch_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: module-power-evidence
+          path: |
+            outputs/module-backend-switches/
+            outputs/screening-power/
+
+  image-input-touch-controls:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.touch_controls_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Direct image input and button consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/ImageMoleculeInput.test.tsx
+          src/utilities/ImageMoleculeInput.action.test.tsx src/utilities/UtilityImageTask.test.tsx
+          src/operations/AssetPickerImageSource.test.tsx
+          src/diffsbdd/ReferencePickerUpload.test.tsx
+      - name: Chrome keyboard order, touch size and image-input transport
+        run: |
+          uv sync --locked --group dev --group browser
+          google-chrome --version
+          uv run --locked ruff check scripts/molecular-utility-scope.py server_tests/test_utility_image_browser.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py server_tests/test_utility_image_browser.py --basetemp "$RUNNER_TEMP/utility-touch-browser"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: utility-touch-evidence
+          path: outputs/utility-image
+
+  desktop-candidate-inspection:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.candidate_desktop_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 13
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Original candidate identity, selection, data and pose controls
+        if: >-
+          needs.scope.outputs.screening_desktop_only != 'true' &&
+          needs.scope.outputs.result_theme_only != 'true' &&
+          needs.scope.outputs.desktop_result_layout_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/datasets/CandidateView.test.tsx src/datasets/CandidateTable.test.tsx
+          src/datasets/DatasetResults.test.tsx src/datasets/CandidateHandoff.test.tsx
+          src/datasets/DELCandidateEvidence.test.tsx src/diffsbdd/GeneratedCandidates.test.tsx
+          src/diffsbdd/GeneratedCandidateDownload.test.tsx src/diffsbdd/DiffResults.test.tsx
+          src/viewer/pose-plan.test.ts src/viewer/PoseSession.test.tsx
+          src/viewer/StructureViewer.test.tsx src/chemistry/StateCollectionPreview.test.tsx
+      - name: Screening table continuity, native coordinates and indexed file controls
+        if: needs.scope.outputs.screening_desktop_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/datasets/CandidateView.test.tsx src/datasets/CandidateTable.test.tsx
+          src/datasets/DatasetResults.test.tsx src/datasets/CandidateHandoff.test.tsx
+          src/datasets/IndexedLibraryResults.test.tsx src/datasets/ResearchTable.test.tsx
+      - name: Shared result titles, table controls and native chain menu
+        if: needs.scope.outputs.result_theme_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/datasets/DatasetResults.test.tsx src/datasets/CandidateView.test.tsx
+          src/datasets/IndexedLibraryResults.test.tsx src/datasets/ResearchTable.test.tsx
+          src/viewer/StructureViewer.test.tsx
+      - name: Screening, DEL and interaction workspace controls
+        if: needs.scope.outputs.desktop_result_layout_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/datasets/IndexedLibraryResults.test.tsx src/datasets/DatasetResults.test.tsx
+          src/datasets/CandidateView.test.tsx src/integrations/InteractionResults.test.tsx
+      - name: Restore reviewed retained candidates into isolated scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WB_HOME: ${{ runner.temp }}/x-dde-candidate-inspection
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-candidate-inspection/state
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_candidate_inspection_desktop.py
+          if [[ '${{ needs.scope.outputs.screening_desktop_only }}' == 'true' ]]; then
+            uv run --locked ruff check server_tests/test_del_desktop_review.py
+          fi
+          if [[ '${{ needs.scope.outputs.result_theme_only }}' == 'true' ]]; then
+            uv run --locked ruff check server_tests/test_native_result_theme_browser.py
+          fi
+          if [[ '${{ needs.scope.outputs.desktop_result_layout_only }}' == 'true' ]]; then
+            uv run --locked ruff check server_tests/test_compact_result_header_browser.py
+          fi
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          families=(stat6 del)
+          for family in "${families[@]}"; do
+            readarray -t source < <(.venv/bin/python -c "from opendde_workbench.examples.${family}_bundle_release import URL; print('\\n'.join(URL.rsplit('/', 2)[-2:]))")
+            test "${#source[@]}" -eq 2
+            [[ "${source[0]}" == examples-v2 || "${source[0]}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            [[ "${source[1]}" =~ ^(stat6|del6)-reviewed-results-v[0-9]+\.zip$ ]]
+            gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+            .venv/bin/python -c "import sys; from pathlib import Path; from opendde_workbench.examples.${family}_bundle_release import SHA256; from opendde_workbench.examples.bundle import restore_bundle; from opendde_workbench.settings import Settings; print(restore_bundle(Path(sys.argv[1]), Settings.from_env(), SHA256))" "$RUNNER_TEMP/${source[1]}"
+          done
+          .venv/bin/python server_tests/prepare_visual_components.py --components ketcher
+      - name: Native Chrome selection, original bytes and research figure
+        env:
+          WB_HOME: ${{ runner.temp }}/x-dde-candidate-inspection
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-candidate-inspection/state
+        run: |
+          google-chrome --version
+          scenarios=(server_tests/test_candidate_inspection_desktop.py::test_retained_candidate_desktop_workspaces)
+          if [[ '${{ needs.scope.outputs.desktop_result_layout_only }}' == 'true' ]]; then
+            scenarios=(server_tests/test_compact_result_header_browser.py::test_retained_result_headers_at_desktop_sizes)
+          elif [[ '${{ needs.scope.outputs.result_theme_only }}' == 'true' ]]; then
+            scenarios=(server_tests/test_native_result_theme_browser.py::test_native_result_controls_follow_theme)
+          elif [[ '${{ needs.scope.outputs.screening_desktop_only }}' == 'true' ]]; then
+            scenarios=(
+              server_tests/test_candidate_inspection_desktop.py::test_retained_screening_desktop
+              server_tests/test_del_desktop_review.py::test_del_first_screen_at_1024_by_600
+            )
+          fi
+          uv run --locked python -m pytest -x -q "${scenarios[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: candidate-inspection-desktop
+          path: outputs/candidate-inspection/
+
+  desktop-del-results:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.del_desktop_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 14
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: DEL result navigation and directly shared record controls
+        working-directory: frontend
+        run: >-
+          npx vitest run src/datasets/DatasetResults.test.tsx src/datasets/ResearchTable.test.tsx
+          src/datasets/IndexedLibraryResults.test.tsx src/datasets/CandidateView.test.tsx
+          src/datasets/CandidateTable.test.tsx src/datasets/DELCandidateEvidence.test.tsx
+          src/datasets/DELSeriesContext.test.tsx src/datasets/DatasetCharts.test.tsx
+          src/diffsbdd/GeneratedCandidates.test.tsx
+      - name: Set isolated DEL state paths
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-del-desktop" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-del-desktop/state" >> "$GITHUB_ENV"
+      - name: Restore the reviewed DEL006 result bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv sync --locked --group dev --group browser
+          readarray -t bundle < <(.venv/bin/python -c 'from opendde_workbench.examples.del_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          test "${#bundle[@]}" -eq 2
+          [[ "${bundle[0]}" == examples-v2 || "${bundle[0]}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${bundle[1]}" =~ ^del6-reviewed-results-v[0-9]+\.zip$ ]]
+          gh release download "${bundle[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${bundle[1]}" --dir "$RUNNER_TEMP"
+          .venv/bin/python -c "import sys; from pathlib import Path; from opendde_workbench.examples.del_bundle_release import SHA256; from opendde_workbench.examples.bundle import restore_bundle; from opendde_workbench.settings import Settings; print(restore_bundle(Path(sys.argv[1]), Settings.from_env(), SHA256))" "$RUNNER_TEMP/${bundle[1]}"
+          .venv/bin/python server_tests/prepare_visual_components.py --components ketcher
+      - name: Chrome DEL results, native structures and figure export
+        run: |
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_del_desktop_review.py
+          uv run --locked pytest -x -q tests/test_molecular_utility_scope.py
+          uv run --locked python -m pytest -x -q server_tests/test_del_desktop_review.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: del-desktop-review
+          path: outputs/del-desktop-review/
+
+  desktop-protein-results:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.protein_desktop_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Exact endpoint focus, comparison controls and tables
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/ProteinInterfaceResults.test.tsx
+          src/guided/Hint.test.tsx
+          src/structure-comparison/ComparisonScene.test.ts
+          src/presentation/ResearchTable.test.tsx src/presentation/ResearchTabs.test.tsx
+      - name: Verify both retained protein workspaces in Chrome
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WB_HOME: ${{ runner.temp }}/x-dde-protein-review
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-protein-review/state
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_protein_review_desktop.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          readarray -t source < <(.venv/bin/python -c 'from opendde_workbench.examples.stat6_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          test "${#source[@]}" -eq 2
+          [[ "${source[0]}" == examples-v2 || "${source[0]}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${source[1]}" =~ ^stat6-reviewed-results-v[0-9]+\.zip$ ]]
+          gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+          .venv/bin/python server_tests/prepare_reviewed_stat6_cases.py "$RUNNER_TEMP/${source[1]}"
+          google-chrome --version
+          .venv/bin/python -m pytest -x -q server_tests/test_protein_review_desktop.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-protein-review-evidence
+          path: outputs/protein-review-desktop/
+
+  desktop-sequence-results:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.sequence_desktop_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Candidate identity, sequence figures and native file links
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/ScientificResults.test.tsx
+          src/integrations/SequenceDesignOverview.test.tsx
+          src/operations/CandidateSequenceResults.test.tsx
+          src/presentation/SequenceTrack.test.tsx src/presentation/ResearchTable.test.tsx
+          src/research/SequenceFilePreview.test.tsx
+      - name: Verify the two retained sequence workspaces in Chrome
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WB_HOME: ${{ runner.temp }}/x-dde-sequence
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-sequence/state
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_sequence_review_desktop.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          readarray -t source < <(.venv/bin/python -c 'from opendde_workbench.examples.stat6_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          test "${#source[@]}" -eq 2
+          [[ "${source[0]}" == examples-v2 || "${source[0]}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${source[1]}" =~ ^stat6-reviewed-results-v[0-9]+\.zip$ ]]
+          gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+          .venv/bin/python server_tests/prepare_reviewed_stat6_cases.py "$RUNNER_TEMP/${source[1]}"
+          google-chrome --version
+          .venv/bin/python -m pytest -x -q server_tests/test_sequence_review_desktop.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-sequence-evidence
+          path: outputs/sequence-review-desktop/
+
+  desktop-spatial-results:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.spatial_desktop_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Direct native viewer, selected region, and export consumers
+        if: needs.scope.outputs.spatial_review_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/receptors/SurfaceResults.test.tsx
+          src/viewer/StructureViewer.test.tsx src/viewer/channel-geometry.test.ts
+          src/publication/FigureExport.test.tsx
+      - name: Candidate rails, layout and direct result consumers
+        if: needs.scope.outputs.spatial_review_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/ResearchTable.test.tsx
+          src/integrations/InteractionResults.test.tsx src/integrations/ScientificResults.test.tsx
+          src/quality/tests/QualityResults.test.tsx src/presentation/WorkspaceFullscreenControl.test.tsx
+      - name: Restore retained sources and review the affected desktop views in Chrome
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WB_HOME: ${{ runner.temp }}/x-dde-spatial
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-spatial/state
+          SPATIAL_REVIEW_ONLY: ${{ needs.scope.outputs.spatial_review_only }}
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_spatial_results_desktop.py server_tests/test_spatial_inspection_followups_browser.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          readarray -t source < <(.venv/bin/python -c 'from opendde_workbench.examples.stat6_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          test "${#source[@]}" -eq 2
+          [[ "${source[0]}" == examples-v2 || "${source[0]}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${source[1]}" =~ ^stat6-reviewed-results-v[0-9]+\.zip$ ]]
+          gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+          .venv/bin/python server_tests/prepare_reviewed_stat6_cases.py "$RUNNER_TEMP/${source[1]}"
+          google-chrome --version
+          if [[ "$SPATIAL_REVIEW_ONLY" == true ]]; then
+            .venv/bin/python -m pytest -x -q server_tests/test_spatial_inspection_followups_browser.py
+          else
+            .venv/bin/python -m pytest -x -q server_tests/test_spatial_results_desktop.py
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-spatial-evidence
+          path: |
+            outputs/spatial-results-desktop/
+            outputs/spatial-inspection-followups/
+
+  desktop-structure-review:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.short_structure_review_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Protein interface, aligned structures and receptor workspace components
+        if: needs.scope.outputs.short_paired_comparison_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/ProteinInterfaceResults.test.tsx
+          src/receptors/ReceptorResults.test.tsx src/operations/StructureComparisonResults.test.tsx
+          src/presentation/WorkspaceFullscreenControl.test.tsx
+      - name: Paired structure state, camera and figure consumers
+        if: needs.scope.outputs.short_paired_comparison_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/structure-comparison/ComparisonScene.test.ts
+          src/viewer/structure-camera.test.tsx src/viewer/StructureViewer.test.tsx
+          src/presentation/WorkspaceFullscreenControl.test.tsx src/publication/FigureExport.test.tsx
+      - name: Prepare the sealed protein results and browser checks without inference
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WB_HOME: ${{ runner.temp }}/short-structure-review
+          WB_STATE_DIR: ${{ runner.temp }}/short-structure-review/state
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_short_protein_viewports.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          readarray -t source < <(.venv/bin/python -c 'from opendde_workbench.examples.stat6_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          test "${#source[@]}" -eq 2
+          [[ "${source[0]}" == examples-v2 || "${source[0]}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${source[1]}" =~ ^stat6-reviewed-results-v[0-9]+\.zip$ ]]
+          gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+          .venv/bin/python server_tests/prepare_reviewed_stat6_cases.py "$RUNNER_TEMP/${source[1]}"
+      - name: Inspect three retained protein results in short desktop Chrome
+        if: needs.scope.outputs.short_paired_comparison_only != 'true'
+        env:
+          WB_HOME: ${{ runner.temp }}/short-structure-review
+          WB_STATE_DIR: ${{ runner.temp }}/short-structure-review/state
+        run: .venv/bin/python -m pytest -x -q server_tests/test_short_protein_viewports.py
+      - name: Aligned protein scenes, matched cameras, original CIFs and 600 dpi PNG
+        if: needs.scope.outputs.short_paired_comparison_only == 'true'
+        env:
+          WB_HOME: ${{ runner.temp }}/short-structure-review
+          WB_STATE_DIR: ${{ runner.temp }}/short-structure-review/state
+        run: >-
+          .venv/bin/python -m pytest -x -q server_tests/test_short_protein_viewports.py
+          -k paired_short
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: short-protein-viewports
+          path: outputs/short-protein-viewports/
+
+  desktop-refinement:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.refinement_desktop_only == 'true' }}
+    uses: ./.github/workflows/refinement-input-checks.yml
+    with:
+      check: desktop-preview
+
+  desktop-help:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.desktop_help_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Help navigation and retained utility inputs
+        working-directory: frontend
+        run: npx vitest run src/studio/Navigation.test.tsx src/utilities/UtilityWorkspace.test.tsx
+      - name: Desktop Chrome and scope checks
+        run: |
+          uv sync --locked --group dev --group browser
+          uv run --locked ruff check server_tests/test_desktop_help_browser.py scripts/molecular-utility-scope.py
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py
+          uv run --locked python -m pytest -x -q server_tests/test_desktop_help_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-help-evidence
+          path: outputs/desktop-help/
+
+  runtime-entry:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.runtime_entry_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Runtime entry and shared backend switches
+        working-directory: frontend
+        run: >-
+          npx vitest run src/studio/task-entry-route.test.ts src/studio/RuntimeStatus.test.tsx
+          src/utilities/BackendControls.test.tsx
+      - run: uv sync --locked --group dev --group browser
+      - name: Scoped contracts and explicit backend actions in Chrome
+        run: |
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_runtime_entry_browser.py
+          uv run --locked python -m pytest -x -q tests/test_molecular_utility_scope.py server_tests/test_runtime_entry_browser.py server_tests/test_module_backend_switch_browser.py
+
+  result-handoff-desktop:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.result_handoff_desktop_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Library and ADMET inspection and pending preparation
+        if: needs.scope.outputs.molecule_results_only != 'true' && needs.scope.outputs.ligand_camera_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/admet/AdmetResults.test.tsx
+          src/chemistry/LibraryScreenResults.test.tsx src/chemistry/StatePreparationHandoff.test.tsx
+          src/utilities/UtilityImageTask.test.tsx src/studio/TaskWorkspace.test.tsx
+          src/App.test.tsx src/studio/ModuleWorkspaceNavigation.test.tsx
+          src/TaskDetail.actions.test.tsx src/TaskDetail.test.tsx
+          src/operations/useTaskSubmit.test.ts
+      - name: Candidate paging, selected properties and exact source handoffs
+        if: needs.scope.outputs.molecule_results_only == 'true' && needs.scope.outputs.molecule_workbench_only != 'true' && needs.scope.outputs.short_chemistry_desktop_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/chemistry/LibraryScreenResults.test.tsx
+          src/operations/PropertyResults.test.tsx src/operations/property-source.test.ts
+          src/chemistry/StatePreparationHandoff.test.tsx src/admet/AdmetResults.test.tsx
+          src/pockets/PocketResults.test.tsx src/docking/DockingResults.test.tsx
+          src/diffsbdd/DiffResults.test.tsx
+      - name: Short desktop molecule inspection and preparation continuity
+        if: needs.scope.outputs.short_chemistry_desktop_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/chemistry/LibraryScreenResults.test.tsx
+          src/chemistry/StatePreparationHandoff.test.tsx src/admet/AdmetResults.test.tsx
+          src/operations/PropertyResults.test.tsx
+      - name: Compact molecule views, keyboard actions and exact downloads
+        if: needs.scope.outputs.molecule_workbench_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/operations/PropertyResults.test.tsx
+          src/admet/AdmetResults.test.tsx src/presentation/ResearchTabs.test.tsx
+          src/viewer/StructureViewer.test.tsx
+      - name: Native ligand fit, camera resize and figure export
+        if: needs.scope.outputs.ligand_camera_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/viewer/ligand-framing.test.ts
+          src/viewer/camera-resize.test.ts src/viewer/capture.test.ts
+          src/viewer/StructureViewer.test.tsx src/viewer/source-layout.test.ts
+      - name: Verify native results and exact retained selection in Chrome
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LIGAND_CAMERA_ONLY: ${{ needs.scope.outputs.ligand_camera_only }}
+          SHORT_CHEMISTRY_DESKTOP_ONLY: ${{ needs.scope.outputs.short_chemistry_desktop_only }}
+        run: |
+          uv sync --locked --group dev --group browser
+          if [[ "$LIGAND_CAMERA_ONLY" != true ]]; then
+            gh release download examples-v1 --repo "$GITHUB_REPOSITORY" \
+              --pattern x-dde-public-cases-v1.zip --dir "$RUNNER_TEMP"
+            export WB_RETAINED_UTILITY="$RUNNER_TEMP/x-dde-public-cases-v1.zip"
+          fi
+          export WB_UTILITY_GRAPHICS="$RUNNER_TEMP/utility-graphics/state/deployment.json"
+          readarray -t source < <(.venv/bin/python -c 'from opendde_workbench.examples.stat6_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          [[ "${source[0]}" == examples-v2 || "${source[0]}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "${source[1]}" =~ ^stat6-reviewed-results-v[0-9]+\.zip$ ]]
+          gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+          export WB_REVIEWED_STAT6_ARCHIVE="$RUNNER_TEMP/${source[1]}"
+          WB_HOME="$RUNNER_TEMP/utility-graphics" WB_STATE_DIR="$RUNNER_TEMP/utility-graphics/state" \
+            uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_result_handoffs_desktop.py
+          uv run --locked python -m pytest -x -q tests/test_molecular_utility_scope.py
+          run_selection=()
+          if [[ "$LIGAND_CAMERA_ONLY" == true ]]; then
+            run_selection=(-k reviewed_property_poses_open_without_new_calculation)
+          fi
+          if [[ "$SHORT_CHEMISTRY_DESKTOP_ONLY" == true ]]; then
+            uv run --locked ruff check server_tests/test_short_chemistry_desktop.py
+            run_selection+=(server_tests/test_short_chemistry_desktop.py)
+          fi
+          uv run --locked python -m pytest -x -q server_tests/test_result_handoffs_desktop.py "${run_selection[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-handoff-desktop-evidence
+          path: outputs/result-handoffs-desktop/
+          if-no-files-found: warn
+
+  utility-result-desktop:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.utility_result_desktop_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Accepted results, exact input identity and direct questionnaire consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/UtilitySinglePage.test.tsx
+          src/utilities/UtilityTaskResult.test.tsx src/utilities/UtilityWorkspace.test.tsx
+          src/utilities/UtilityImageTask.test.tsx src/guided/SinglePageTask.test.tsx
+          src/guided/Questionnaire.test.tsx
+      - name: Verify the result workspace against a retained native utility result
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          uv sync --locked --group dev --group browser
+          gh release download examples-v1 --repo "$GITHUB_REPOSITORY" \
+            --pattern x-dde-public-cases-v1.zip --dir "$RUNNER_TEMP"
+          export WB_RETAINED_UTILITY="$RUNNER_TEMP/x-dde-public-cases-v1.zip"
+          export WB_UTILITY_GRAPHICS="$RUNNER_TEMP/utility-graphics/state/deployment.json"
+          WB_HOME="$RUNNER_TEMP/utility-graphics" WB_STATE_DIR="$RUNNER_TEMP/utility-graphics/state" \
+            uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py server_tests/test_utility_result_desktop.py
+          uv run --locked python -m pytest -x -q tests/test_molecular_utility_scope.py server_tests/test_utility_result_desktop.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: utility-result-desktop-evidence
+          path: outputs/utility-result-desktop/
+          if-no-files-found: warn
+
+  utility-desktop:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.utility_desktop_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Tool selection, input persistence and screenshot actions
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/UtilityWorkspace.test.tsx
+          src/utilities/ImageRecognition.test.tsx src/utilities/ImageMoleculeInput.test.tsx
+          src/utilities/UtilityImageTask.test.tsx
+      - name: Desktop Chrome tool rail and native molecule review
+        run: |
+          uv sync --locked --group dev --group browser
+          export WB_HOME="$RUNNER_TEMP/x-dde-desktop-utility"
+          export WB_STATE_DIR="$WB_HOME/state"
+          uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked ruff check scripts/molecular-utility-scope.py server_tests/test_utility_{navigation,image}_browser.py
+          uv build --wheel
+          uv run --locked pytest -q tests/test_molecular_utility_scope.py tests/test_recognition_companion.py tests/test_recognition_companion_wheel.py
+          uv run --locked python -m pytest -q server_tests/test_utility_navigation_browser.py::test_short_desktop_recognition_tools_remain_visible_together server_tests/test_utility_navigation_browser.py::test_desktop_tools_fit_one_strip_and_keep_a_large_preview
+          uv run --locked python -m pytest -q server_tests/test_utility_image_browser.py::test_short_desktop_image_dialog_leaves_room_for_the_editor --basetemp "$RUNNER_TEMP/recognition-desktop"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: utility-desktop-evidence
+          path: outputs/utility-navigation/
+
+  utility-navigation:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.utility_navigation_only == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Utility selection and preserved forms
+        working-directory: frontend
+        run: >-
+          npx vitest run src/utilities/UtilityWorkspace.test.tsx
+          src/utilities/UtilitySinglePage.test.tsx
+      - name: Chrome layout, focus and native 2D review
+        run: |
+          uv sync --locked --group dev --group browser
+          google-chrome --version
+          export WB_HOME="$RUNNER_TEMP/x-dde-review-controls"
+          export WB_STATE_DIR="$WB_HOME/state"
+          uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked ruff check scripts/molecular-utility-scope.py server_tests/test_utility_navigation_browser.py server_tests/test_molecular_review_controls_browser.py
+          uv run --locked python -m pytest -q tests/test_molecular_utility_scope.py server_tests/test_utility_navigation_browser.py server_tests/test_molecular_review_controls_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: utility-navigation-evidence
+          path: outputs/utility-navigation/

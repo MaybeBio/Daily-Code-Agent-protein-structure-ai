@@ -1,0 +1,120 @@
+# flowmatch examples
+
+The Riemannian and CTMC examples are small experimental demonstrations,
+not paper reproductions or benchmark evidence.
+
+## Where to start
+
+| I want to... | Run |
+|---|---|
+| See the smallest semidiscrete flow matching loop | `sd_fm_semidiscrete_linear` |
+| Compare semidiscrete FM with minibatch OT pairing | `rfm_minibatch_ot_linear` |
+| Check ODE solver error on a known trajectory | `ode_comparison` |
+| Train on a 2D multimodal target | `rfm_two_moons` |
+| Add class conditioning | `rfm_conditional_2d` |
+| Use Fenchel-Young regularizers as Bregman energies | `fynch_bregman_energy` |
+| Inspect the low-level OT-CFM training step | `ot_cfm_training_loop` |
+| Evaluate samples with MMD | `mmd_flow_eval` |
+| See discrete CTMC path evolution | `discrete_ctmc_path_evolution` |
+
+```sh
+cargo run --release --example sd_fm_semidiscrete_linear
+cargo run --release --example rfm_minibatch_ot_linear
+cargo run --release --example ode_comparison
+cargo run --release --example rfm_two_moons
+cargo run --release --example rfm_conditional_2d
+cargo run --release --example fynch_bregman_energy
+cargo run --release --example ot_cfm_training_loop
+cargo run --release --example mmd_flow_eval
+cargo run --release --example discrete_ctmc_path_evolution
+```
+
+## Does the sample cover both moons?
+
+The two-moons example trains on one draw and evaluates against another. It
+reports the mean distance to the nearest point in each direction. Repeating
+one good point can score well from samples to held-out points. The reverse
+direction exposes the missing moon. The fresh draw shows typical distances
+at this sample size. The trained sampler is conditioned on assigned training
+points.
+
+To score your own two-dimensional point sets without training, supply two JSON
+arrays of coordinate pairs. Use the same units for both sets. Here the closest
+sample is five units from the second held-out point:
+
+```sh
+printf '[[0,0],[0,0]]\n' > samples.json
+printf '[[0,0],[3,4]]\n' > held-out.json
+cargo run --release --example rfm_two_moons -- --compare samples.json held-out.json
+# input: samples -> held-out = 0.0000, held-out -> samples = 2.5000
+```
+
+Distances depend on the number of points. Compare methods at the same sample
+size against the same held-out points. Scoring compares every sample with
+every held-out point.
+
+## Small checked-in datasets
+
+These examples fit and score the same small checked-in data artifacts. Their
+metrics are distributional comparisons, not out-of-sample quality estimates or
+domain predictions.
+
+| Data | Examples | What to read from the output |
+|---|---|---|
+| Protein torsions | `rfm_protein_torsions_1bpi`, `rfm_torsions_nfe_curve`, `profile_breakdown_torsions` | Ramachandran JS divergence, NFE curve, training-time split |
+| USGS earthquakes | `rfm_usgs_earthquakes_sphere`, `rfm_usgs_nfe_curve`, `rfm_usgs_solver_nfe_tradeoff`, `profile_breakdown_usgs` | OT cost, Euler vs Heun at equal NFE, timing split |
+| Text-like tokens | `rfm_textish_tokens` | Weighted support matching over token embeddings |
+
+```sh
+cargo run --release --example rfm_protein_torsions_1bpi
+cargo run --release --example rfm_torsions_nfe_curve
+cargo run --release --example rfm_usgs_earthquakes_sphere
+cargo run --release --example rfm_usgs_nfe_curve
+cargo run --release --example rfm_usgs_solver_nfe_tradeoff
+cargo run --release --example rfm_textish_tokens
+```
+
+## Pairing diagnostics
+
+| Example | What it checks |
+|---|---|
+| `rfm_minibatch_outlier_partial` | One-to-one and selective pairings when one target is a distant outlier |
+| `profile_breakdown_usgs` | Time spent in sampling, pairing, SGD, and evaluation |
+| `profile_breakdown_torsions` | Same timing split on torsion data |
+
+```sh
+cargo run --release --example rfm_minibatch_outlier_partial
+cargo run --release --example profile_breakdown_usgs
+cargo run --release --example profile_breakdown_torsions
+```
+
+## Feature-gated examples
+
+| Feature | Examples |
+|---|---|
+| `burn` | `burn_sd_fm_semidiscrete_linear`, `burn_rfm_minibatch_ot_linear` |
+| `riemannian` | `rfm_poincare_geodesic_ode`, `riemannian_fm_poincare`, `rfm_fisher_simplex` |
+| `sheaf-evals` | `rfm_usgs_earthquakes_cluster_mass`, `rfm_usgs_knn_leiden`, `rfm_usgs_full_pipeline_report` |
+
+```sh
+cargo run --release --features burn --example burn_sd_fm_semidiscrete_linear
+cargo run --release --features burn --example burn_rfm_minibatch_ot_linear
+cargo run --release --features riemannian --example rfm_poincare_geodesic_ode
+cargo run --release --features riemannian --example riemannian_fm_poincare
+cargo run --release --features riemannian --example rfm_fisher_simplex
+cargo run --release --features sheaf-evals --example rfm_usgs_earthquakes_cluster_mass
+cargo run --release --features sheaf-evals --example rfm_usgs_knn_leiden
+cargo run --release --features sheaf-evals --example rfm_usgs_full_pipeline_report
+```
+
+`rfm_usgs_full_pipeline_report` also writes a structured JSON report when
+`FLOWMATCH_REPORT_OUT` is set:
+
+```sh
+FLOWMATCH_REPORT_OUT=target/flowmatch-usgs-report.json \
+  cargo run --release --features sheaf-evals --example rfm_usgs_full_pipeline_report
+```
+
+## Shared data loaders
+
+`examples/common/` holds the checked-in torsion, USGS, and text-token helpers used by the examples above. They are example-only utilities, not public API.

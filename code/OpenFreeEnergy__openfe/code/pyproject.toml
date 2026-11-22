@@ -1,0 +1,81 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = [
+  "setuptools>=77.0.3",
+  "setuptools-scm>=8",
+]
+
+[project]
+name = "openfe"
+description = ""
+readme = "README.md"
+license = "MIT"
+license-files = [ "LICENSE" ]
+authors = [ { name = "The OpenFE developers", email = "openfreeenergy@omsf.io" } ]
+requires-python = ">=3.11,<3.15"
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Topic :: Scientific/Engineering :: Chemistry",
+]
+dynamic = [ "version" ]
+urls = { Homepage = "https://github.com/OpenFreeEnergy/openfe" }
+scripts.openfe = "openfecli.cli:main"
+
+[tool.setuptools]
+packages.find.where = [ "src" ]
+packages.find.namespaces = false
+include-package-data = true
+package-data.openfe = [ '"./src/openfe/tests/data/lomap_basic/toluene.mol2"' ]
+zip-safe = false
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0"
+
+[tool.ruff]
+line-length = 100
+format.docstring-code-format = true
+# Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
+lint.select = [
+  "E", # pycodestyle errors
+  "F", # Pyflakes
+  "I", # isort
+  "W", # pycodestyle warnings
+  # "C901"  # mccabe complexity  TODO: add this back in
+  # "UP", # TODO: add this in
+]
+lint.ignore = [
+  "E402", # module-level import not at top (conflicts w/ isort)
+  "E501", # line length too long, resolve this for comments
+  "F401", # unused imports (TODO: we should fix these)
+  "F811",
+  "F841",
+  "UP03", # pyupgrade linting (TODO: we should fix these)
+]
+lint.isort.known-first-party = [ "openfe" ]
+
+[tool.mypy]
+files = "src/openfe"  # TODO: add src/openfecli
+ignore_missing_imports = true
+warn_unused_ignores = true
+
+[tool.coverage]
+run.omit = [
+  "src/*/tests/dev/*py",
+  "src/*/tests/protocols/test_openmm_rfe_slow.py",
+  "src/openfe/due.py",
+]
+report.exclude_lines = [
+  "-no-cov",
+  'if __name__ == "__main__"',
+  "pragma: no cover",
+  "pragma: no-cover",
+  "raise NotImplementedError",
+]

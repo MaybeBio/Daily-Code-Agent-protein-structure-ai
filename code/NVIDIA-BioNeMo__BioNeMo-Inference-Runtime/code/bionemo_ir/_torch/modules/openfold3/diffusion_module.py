@@ -1,0 +1,563 @@
+# Copyright 2025 AlQuraishi Laboratory
+# Copyright 2021 DeepMind Technologies Limited
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Diffusion module. Implements the algorithms in section 3.7 of the
+Supplementary Information.
+"""
+
+import torch
+import torch.nn as nn
+
+from bionemo_ir._torch.attention_backend import AttentionMetadata
+from bionemo_ir._torch.graph_optimization.region import GraphRegion
+from bionemo_ir._torch.layers.conditioning import DiffusionConditioning
+from bionemo_ir._torch.layers.linear import Linear
+from bionemo_ir._torch.layers.random_augmentation import broadcast_atom_mask
+from bionemo_ir._torch.layers.transformers.diffusion_transformer import (
+    OpenFold3DiffusionTransformer as DiffusionTransformer,
+)
+from bionemo_ir._torch.modules.openfold3.sequence_local_atom_attention import (
+    AtomAttentionDecoder,
+    AtomAttentionEncoder,
+)
+from bionemo_ir._torch.modules.openfold3.utils.atomize_utils import compute_atom_broadcast_index, prepare_atom_reduction
+from bionemo_ir._torch.sampling import (
+    AF3EDMIntegrator,
+    EDMIntegratorConfig,
+    EDMRolloutPlan,
+    GenerativeRunner,
+    SamplingContext,
+)
+from bionemo_ir._torch.sampling.frame_reuse import wrap_for_frame_reuse
+from bionemo_ir._torch.utils import recursive_calling_load_weights
+from bionemo_ir.configs import BaseConfig
+
+
+class DiffusionModule(nn.Module):
+    """
+    Implements AF3 Algorithm 20.
+    """
+
+    def __init__(self, config: BaseConfig):
+        """
+        Args:
+            config:
+                Configuration dictionary for diffusion module
+        """
+        super().__init__()
+        self.config = config
+        self.c_s = config.c_s
+        self.c_token = config.c_token
+        self.sigma_data = config.sigma_data
+        self.dtype = config.torch_dtype
+        self.skip_create_weights = config.skip_create_weights
+        self.sq_sigma_data = config.sigma_data**2
+
+        self.diffusion_conditioning = DiffusionConditioning(
+            c_s_input=config.c_s_input,
+            c_s=config.c_s,
+            c_z=config.c_z,
+            c_fourier_emb=config.diffusion_conditioning_config.c_fourier_emb,
+            max_relative_idx=config.diffusion_conditioning_config.max_relative_idx,
+            max_relative_chain=config.diffusion_conditioning_config.max_relative_chain,
+            sigma_data=config.sigma_data,
+            eps=config.eps,
+            dtype=config.torch_dtype,
+            skip_create_weights=config.skip_create_weights,
+        )
+
+        self.atom_attn_enc = AtomAttentionEncoder(
+            c_atom_ref_element=config.c_atom_ref_element,
+            c_atom_ref_name_chars=config.c_atom_ref_name_chars,
+            c_atom=config.c_atom,
+            c_atom_pair=config.c_atom_pair,
+            c_token=config.c_token,
+            atom_transformer_config=config.atom_transformer_encoder_config,
+            n_query=config.n_query,
+            n_key=config.n_key,
+            c_s=config.c_s,
+            c_z=config.c_z,
+            inf=config.inf,
+            eps=config.eps,
+            add_noisy_pos=config.add_noisy_pos,
+            dtype=config.torch_dtype,
+            skip_create_weights=config.skip_create_weights,
+        )
+
+        self.layer_norm_s = nn.LayerNorm(self.c_s, bias=False, dtype=self.dtype, eps=config.eps)
+        self.linear_s = Linear(
+            self.c_s, self.c_token, bias=False, dtype=self.dtype, skip_create_weights=self.skip_create_weights
+        )
+
+        self.diffusion_transformer = DiffusionTransformer(config=config.diffusion_transformer_config.token_transformer)
+
+        self.layer_norm_a = nn.LayerNorm(self.c_token, bias=False, dtype=self.dtype, eps=config.eps)
+
+        self.atom_attn_dec = AtomAttentionDecoder(
+            c_atom=config.c_atom,
+            c_atom_pair=config.c_atom_pair,
+            c_token=config.c_token,
+            c_hidden=config.c_hidden,
+            n_query=config.n_query,
+            n_key=config.n_key,
+            atom_attn_decoder_config=config.atom_transformer_decoder_config,
+            inf=config.inf,
+            eps=config.eps,
+            dtype=config.torch_dtype,
+            skip_create_weights=config.skip_create_weights,
+        )
+
+    def load_weights(self, weights: dict):
+        loaded_weight = recursive_calling_load_weights(self, weights)
+        # Every entry of ``weights`` must have been consumed.
+        not_loaded_weights = set(weights.keys()) - loaded_weight
+        if not_loaded_weights:
+            raise ValueError(f"The following weights are not loaded: {not_loaded_weights}")
+
+    def forward(
+        self,
+        batch: dict,
+        xl_noisy: torch.Tensor,
+        token_mask: torch.Tensor,
+        atom_mask: torch.Tensor,
+        t: torch.Tensor,
+        si_input: torch.Tensor,
+        si_trunk: torch.Tensor,
+        zij_trunk: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        use_conditioning: bool = True,
+        prepared_zij: torch.Tensor | None = None,
+        prepared_si: torch.Tensor | None = None,
+        prepared_atom_cl: torch.Tensor | None = None,
+        prepared_atom_plm: torch.Tensor | None = None,
+        prepared_atom_encoder_pair_biases: list[torch.Tensor] | None = None,
+        prepared_atom_decoder_pair_biases: list[torch.Tensor] | None = None,
+        prepared_atom_encoder_conditioning: list[tuple[torch.Tensor, ...]] | None = None,
+        prepared_atom_decoder_conditioning: list[tuple[torch.Tensor, ...]] | None = None,
+        prepared_token_pair_biases: list[torch.Tensor] | None = None,
+        prepared_token_conditioning_weights: tuple[torch.Tensor, ...] | None = None,
+    ) -> torch.Tensor:
+        """
+        Note:
+            ``OpenFold3DiffusionSampler.forward`` calls this with a diffusion-samples axis
+            ``S`` at dim 1 — ``xl_noisy=[B, S, N_atom, 3]`` — which the atom
+            encoder carries onto ``ai=[B, S, N_token, c]``. The token-level
+            conditioning (``si``/``zij``/``token_mask``) carries a *size-1* sample
+            axis at dim 1 (``[B, 1, ...]``) and so broadcasts over ``S`` for any
+            batch size ``B``. Batch sizes > 1 are supported end-to-end and stay
+            CUDA-graph-capturable: the ``atom_broadcast_index`` fast path in
+            ``broadcast_token_feat_to_atoms`` (a static ``index_select`` in place
+            of a data-dependent ``repeat_interleave``) handles any batch size.
+
+        Args:
+            batch:
+                Feature dictionary
+            xl_noisy:
+                [*, N_atom, 3] Noisy atom positions
+            token_mask:
+                [*, N_token] Token mask
+            atom_mask:
+                [*, N_atom] Atom mask
+            t:
+                [*] Noise level at a diffusion step
+            si_input:
+                [*, N_token, c_s_input] Input embedding
+            si_trunk:
+                [*, N_token, c_s] Single representation
+            zij_trunk:
+                [*, N_token, N_token, c_z] Pair representation
+            use_conditioning:
+                Whether to condition with the trunk representations
+            prepared_zij:
+                Optional noise-independent pair conditioning prepared once by
+                the sampler owner. When set with conditioning enabled, only
+                single conditioning is recomputed for this denoising step.
+                Unconditioned calls ignore this cache and rebuild the pair.
+            prepared_si:
+                Optional noise-independent single projection from
+                ``DiffusionConditioning.prepare_single``; used only with
+                ``prepared_zij``.
+            prepared_atom_cl, prepared_atom_plm:
+                Optional reference/trunk atom conditioning and pair representation
+                shared by all denoising steps of a conditioned rollout.
+            prepared_atom_encoder_pair_biases, prepared_atom_decoder_pair_biases:
+                Optional atom-transformer biases projected from ``prepared_atom_plm``;
+                used only with that cache.
+            prepared_atom_encoder_conditioning, prepared_atom_decoder_conditioning:
+                Optional atom-transformer conditioning projected from ``prepared_atom_cl``;
+                used only with that cache and its pair biases.
+            prepared_token_pair_biases:
+                Optional token-transformer biases projected from ``prepared_zij``;
+                used only with that pair.
+            prepared_token_conditioning_weights:
+                Optional token AdaLN and gate weights stacked once per rollout.
+        Returns:
+            [*, N_atom, 3] Denoised atom positions
+        """
+        if prepared_zij is None or not use_conditioning:
+            si, zij = self.diffusion_conditioning(
+                batch=batch,
+                t=t,
+                si_input=si_input,
+                si_trunk=si_trunk,
+                zij_trunk=zij_trunk,
+                use_conditioning=use_conditioning,
+            )
+        else:
+            si = self.diffusion_conditioning.forward_single(
+                batch=batch,
+                t=t,
+                si_input=si_input,
+                si_trunk=si_trunk,
+                use_conditioning=use_conditioning,
+                prepared_si=prepared_si,
+            )
+            zij = prepared_zij
+
+        xl_noisy = xl_noisy * broadcast_atom_mask(xl_noisy, atom_mask)
+
+        rl_noisy = xl_noisy / torch.sqrt(t[..., None, None] ** 2 + self.sigma_data**2)
+
+        # Note: These modules are not memory-intensive compared to other parts of the
+        # model (i.e. TemplateStack) so chunking is unnecessary for now.
+
+        # Input (dim 0 = batch B, dim 1 = the diffusion-samples axis S; the
+        # token-level tensors carry a size-1 S placeholder that broadcasts):
+        #   atom_mask: [B, 1, N_atom]
+        #   rl_noisy:  [B, S, N_atom, 3]
+        #   si_trunk:  [B, 1, N_token, c_s=384]
+        #   zij:       [B, 1, N_token, N_token, c_z]
+        #
+        # Output
+        #   ai:  [B, S, N_token, c_atom=768]
+        #   ql:  [B, 1, N_atom, c_atom]
+        #   cl:  [B, 1, N_atom, c_atom]
+        #   plm: [B, S, N_blocks, N_query, N_key, c_atom_pair]
+        atom_encoder_kwargs = {
+            "batch": batch,
+            "atom_mask": atom_mask,
+            "rl": rl_noisy,
+            "si_trunk": si_trunk,
+            "zij_trunk": zij,
+            "attn_metadata": attn_metadata,
+        }
+        use_prepared_atoms = use_conditioning and prepared_atom_cl is not None and prepared_atom_plm is not None
+        if use_prepared_atoms:
+            atom_encoder_kwargs["prepared_cl"] = prepared_atom_cl
+            atom_encoder_kwargs["prepared_plm"] = prepared_atom_plm
+            if prepared_atom_encoder_pair_biases is not None:
+                atom_encoder_kwargs["prepared_pair_biases"] = prepared_atom_encoder_pair_biases
+                atom_encoder_kwargs["prepared_conditioning"] = prepared_atom_encoder_conditioning
+        ai, ql, cl, plm = self.atom_attn_enc(**atom_encoder_kwargs)
+
+        # Input
+        #   si: [B, 1, N_token, c_token=384]
+        #   ai: [B, S, N_token, c_atom=768]
+        #
+        # The output of the linear_s has shape [B, 1, N_token, c_atom],
+        # so broadcasts with ai for multiplicity S>1
+        ai = ai + self.linear_s(self.layer_norm_s(si))
+
+        token_dtype = self.diffusion_transformer.dtype
+        token_kwargs = {}
+        if prepared_token_pair_biases is not None and prepared_zij is not None and use_conditioning:
+            token_kwargs["prepared_pair_biases"] = prepared_token_pair_biases
+        # Prepared biases replace the pair, which then skips its cast.
+        z_token = zij if token_kwargs else zij.to(dtype=token_dtype)
+        if prepared_token_conditioning_weights is not None:
+            token_kwargs["prepared_conditioning_weights"] = prepared_token_conditioning_weights
+        ai = self.diffusion_transformer(
+            a=ai.to(dtype=token_dtype),
+            s=si.to(dtype=token_dtype),
+            z=z_token,
+            mask=token_mask.to(dtype=token_dtype),
+            **token_kwargs,
+        )
+        if token_dtype != torch.float32:
+            ai = ai.float()
+
+        ai = self.layer_norm_a(ai)
+        rl_update = self.atom_attn_dec(
+            batch=batch,
+            atom_mask=atom_mask,
+            ai=ai,
+            ql=ql,
+            cl=cl,
+            plm=plm,
+            attn_metadata=attn_metadata,
+            prepared_pair_biases=prepared_atom_decoder_pair_biases if use_prepared_atoms else None,
+            prepared_conditioning=prepared_atom_decoder_conditioning if use_prepared_atoms else None,
+        )
+        sq_t = t[..., None, None] ** 2
+        xl_out = (
+            self.sq_sigma_data / (self.sq_sigma_data + sq_t) * xl_noisy
+            + self.sigma_data * t[..., None, None] / torch.sqrt(self.sq_sigma_data + sq_t) * rl_update
+        )
+
+        xl_out = xl_out * broadcast_atom_mask(xl_out, atom_mask)
+
+        return xl_out
+
+
+class OpenFold3DiffusionSampler(nn.Module):
+    """OpenFold3 denoiser adapter composed with the shared AF3 EDM runtime."""
+
+    def __init__(
+        self,
+        config: BaseConfig,
+        diffusion_module: DiffusionModule,
+    ):
+        """
+        Args:
+            config:
+                Diffusion sampling configuration. This initializer reads
+                `gamma_0`, `gamma_min`, `noise_scale`, `step_scale`, and
+                `use_conditioning` from this config, and `frame_reuse_period`
+                when it has one.
+            diffusion_module:
+                Instantiated denoising diffusion module used at each sampling
+                step.
+        """
+        super().__init__()
+        self.diffusion_module = diffusion_module
+        self.graph = GraphRegion(self, "diffusion_module", diffusion_module.config.graph_optimization_config)
+        self.use_conditioning = config.use_conditioning
+        self.integrator = AF3EDMIntegrator(
+            EDMIntegratorConfig(
+                gamma0=config.gamma_0,
+                gamma_min=config.gamma_min,
+                noise_scale=config.noise_scale,
+                step_scale=config.step_scale,
+            )
+        )
+        self.runner = GenerativeRunner()
+        # Approximation: in the churn-free tail, evaluate the denoiser every ``frame_reuse_period``
+        # steps and map the previous prediction through each step's augmentation in between
+        # (0: off; "auto": on for the evaluated step counts).
+        self.frame_reuse_period = getattr(config, "frame_reuse_period", 0)
+
+    def denoise(
+        self,
+        x_noisy: torch.Tensor,
+        sigma_hat: torch.Tensor,
+        *,
+        batch: dict,
+        atom_mask: torch.Tensor,
+        si_input: torch.Tensor,
+        si_trunk: torch.Tensor,
+        zij_trunk: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        use_conditioning: bool,
+        prepared_zij: torch.Tensor | None = None,
+        prepared_si: torch.Tensor | None = None,
+        prepared_atom_cl: torch.Tensor | None = None,
+        prepared_atom_plm: torch.Tensor | None = None,
+        prepared_atom_encoder_pair_biases: list[torch.Tensor] | None = None,
+        prepared_atom_decoder_pair_biases: list[torch.Tensor] | None = None,
+        prepared_atom_encoder_conditioning: list[tuple[torch.Tensor, ...]] | None = None,
+        prepared_atom_decoder_conditioning: list[tuple[torch.Tensor, ...]] | None = None,
+        prepared_token_pair_biases: list[torch.Tensor] | None = None,
+        prepared_token_conditioning_weights: tuple[torch.Tensor, ...] | None = None,
+    ) -> torch.Tensor:
+        """Denoise atom positions at one noise level.
+
+        Args:
+            x_noisy: Noisy positions shaped ``[B, S, N_atom, 3]``.
+            sigma_hat: Noise level for this step.
+            batch: Input features, including the token mask.
+            atom_mask: Atom mask shaped ``[..., N_atom]``.
+            si_input: Input token embedding shaped ``[..., N_token, c_s_input]``.
+            si_trunk: Trunk single representation shaped ``[..., N_token, c_s]``.
+            zij_trunk: Trunk pair representation shaped ``[..., N_token, N_token, c_z]``.
+            attn_metadata: Metadata for local atom attention.
+            use_conditioning: Whether to use trunk conditioning.
+            prepared_zij: Optional pair conditioning shared across steps.
+            prepared_si: Optional noise-independent single projection.
+            prepared_atom_cl: Optional atom single conditioning shared across steps.
+            prepared_atom_plm: Optional atom pair conditioning shared across steps.
+            prepared_atom_encoder_pair_biases: Optional per-layer encoder pair biases.
+            prepared_atom_decoder_pair_biases: Optional per-layer decoder pair biases.
+            prepared_atom_encoder_conditioning: Optional per-layer encoder conditioning tuples.
+            prepared_atom_decoder_conditioning: Optional per-layer decoder conditioning tuples.
+            prepared_token_pair_biases: Optional per-layer token pair biases.
+            prepared_token_conditioning_weights: Optional packed token AdaLN and gate weights.
+
+        Returns:
+            Denoised positions shaped ``[B, S, N_atom, 3]``.
+        """
+        diffusion_kwargs = {
+            "batch": batch,
+            "xl_noisy": x_noisy,
+            "token_mask": batch["token_mask"],
+            "atom_mask": atom_mask,
+            "t": sigma_hat.to(x_noisy.device),
+            "si_input": si_input,
+            "si_trunk": si_trunk,
+            "zij_trunk": zij_trunk,
+            "attn_metadata": attn_metadata,
+            "use_conditioning": use_conditioning,
+        }
+        if prepared_zij is not None:
+            diffusion_kwargs["prepared_zij"] = prepared_zij
+            if prepared_si is not None:
+                diffusion_kwargs["prepared_si"] = prepared_si
+            if prepared_token_pair_biases is not None:
+                diffusion_kwargs["prepared_token_pair_biases"] = prepared_token_pair_biases
+        if prepared_token_conditioning_weights is not None:
+            diffusion_kwargs["prepared_token_conditioning_weights"] = prepared_token_conditioning_weights
+        if prepared_atom_cl is not None and prepared_atom_plm is not None:
+            diffusion_kwargs["prepared_atom_cl"] = prepared_atom_cl
+            diffusion_kwargs["prepared_atom_plm"] = prepared_atom_plm
+            if prepared_atom_encoder_pair_biases is not None:
+                diffusion_kwargs["prepared_atom_encoder_pair_biases"] = prepared_atom_encoder_pair_biases
+            if prepared_atom_decoder_pair_biases is not None:
+                diffusion_kwargs["prepared_atom_decoder_pair_biases"] = prepared_atom_decoder_pair_biases
+            if prepared_atom_encoder_conditioning is not None:
+                diffusion_kwargs["prepared_atom_encoder_conditioning"] = prepared_atom_encoder_conditioning
+            if prepared_atom_decoder_conditioning is not None:
+                diffusion_kwargs["prepared_atom_decoder_conditioning"] = prepared_atom_decoder_conditioning
+        return self.graph(**diffusion_kwargs)
+
+    def forward(
+        self,
+        batch: dict,
+        si_input: torch.Tensor,
+        si_trunk: torch.Tensor,
+        zij_trunk: torch.Tensor,
+        noise_schedule: torch.Tensor,
+        no_rollout_samples: int,
+        attn_metadata: AttentionMetadata,
+        use_conditioning: bool | None = None,
+        seed: int | None = None,
+        prepared_zij: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            batch:
+                Feature dictionary
+            si_input:
+                [*, N_token, c_s_input] Input embedding
+            si_trunk:
+                [*, N_token, c_s] Single representation
+            zij_trunk:
+                [*, N_token, N_token, c_z] Pair representation
+            noise_schedule:
+                [no_rollout_steps] Noise schedule
+            no_rollout_samples:
+                [no_rollout_samples] Number of samples to generate for rollout
+            attn_metadata:
+                Attention metadata
+            use_conditioning:
+                Whether to condition with the trunk representations
+            prepared_zij:
+                Optional pair conditioning shared by every denoising step.
+        Returns:
+            [*, N_atom, 3] Sampled atom positions
+        """
+        atom_mask = batch["atom_mask"]
+        batch_dim, num_atoms = atom_mask.shape[0], atom_mask.shape[-1]
+        # Eager token→atom gather index for CUDA-graph capture (avoids
+        # repeat_interleave inside AtomAttentionEncoder/Decoder).
+        if "atom_broadcast_index" not in batch and "token_mask" in batch and "num_atoms_per_token" in batch:
+            batch = dict(batch)
+            batch["atom_broadcast_index"] = compute_atom_broadcast_index(
+                batch["token_mask"],
+                batch["num_atoms_per_token"],
+            )
+        batch = prepare_atom_reduction(batch)
+        plan = EDMRolloutPlan(
+            schedule=noise_schedule,
+            coords_shape=(batch_dim, no_rollout_samples, num_atoms, 3),
+            device=atom_mask.device,
+            dtype=noise_schedule.dtype,
+            atom_mask=atom_mask,
+            integrator_config=self.integrator.config,
+        )
+        use_conditioning = self.use_conditioning if use_conditioning is None else use_conditioning
+
+        prepared_si = None
+        prepared_atom_cl = None
+        prepared_atom_plm = None
+        prepared_atom_encoder_pair_biases = None
+        prepared_atom_decoder_pair_biases = None
+        prepared_atom_encoder_conditioning = None
+        prepared_atom_decoder_conditioning = None
+        prepared_token_pair_biases = None
+        prepared_token_conditioning_weights = None
+        if prepared_zij is not None and use_conditioning:
+            # Reference and trunk conditioning do not depend on noisy atom
+            # coordinates or the diffusion time. Prepare them once before the
+            # denoiser's CUDA graph is captured and replayed for every step.
+            module = self.diffusion_module
+            prepared_si = module.diffusion_conditioning.prepare_single(si_input, si_trunk)
+            zero_positions = torch.zeros((*atom_mask.shape, 3), device=atom_mask.device, dtype=noise_schedule.dtype)
+            _, prepared_atom_cl, prepared_atom_plm = self.diffusion_module.atom_attn_enc.get_atom_reps(
+                batch=batch,
+                rl=zero_positions,
+                si_trunk=si_trunk,
+                zij_trunk=prepared_zij,
+                attn_metadata=attn_metadata,
+            )
+            # The decoder reuses the encoder's pair, so both project it once, and
+            # add the fixed atom mask's key mask once.
+            prepared_atom_encoder_pair_biases = module.atom_attn_enc.prepare_pair_biases(
+                prepared_atom_plm, atom_mask, attn_metadata
+            )
+            prepared_atom_decoder_pair_biases = module.atom_attn_dec.prepare_pair_biases(
+                prepared_atom_plm, atom_mask, attn_metadata
+            )
+            # Both atom transformers also condition on the fixed cl alone.
+            prepared_atom_encoder_conditioning = module.atom_attn_enc.prepare_conditioning(
+                prepared_atom_cl, attn_metadata
+            )
+            prepared_atom_decoder_conditioning = module.atom_attn_dec.prepare_conditioning(
+                prepared_atom_cl, attn_metadata
+            )
+            # The token transformer reads prepared_zij on every step. A wrapped
+            # or engine-backed replacement keeps its own bias path.
+            if isinstance(module.diffusion_transformer, DiffusionTransformer):
+                prepared_token_pair_biases = module.diffusion_transformer.prepare_pair_biases(prepared_zij)
+                prepared_token_conditioning_weights = module.diffusion_transformer.conditioning_weights()
+
+        def predict(x_noisy: torch.Tensor, sigma_hat: torch.Tensor) -> torch.Tensor:
+            return self.denoise(
+                x_noisy,
+                sigma_hat,
+                batch=batch,
+                atom_mask=atom_mask,
+                si_input=si_input,
+                si_trunk=si_trunk,
+                zij_trunk=zij_trunk,
+                attn_metadata=attn_metadata,
+                use_conditioning=use_conditioning,
+                prepared_zij=prepared_zij,
+                prepared_si=prepared_si,
+                prepared_atom_cl=prepared_atom_cl,
+                prepared_atom_plm=prepared_atom_plm,
+                prepared_atom_encoder_pair_biases=prepared_atom_encoder_pair_biases,
+                prepared_atom_decoder_pair_biases=prepared_atom_decoder_pair_biases,
+                prepared_atom_encoder_conditioning=prepared_atom_encoder_conditioning,
+                prepared_atom_decoder_conditioning=prepared_atom_decoder_conditioning,
+                prepared_token_pair_biases=prepared_token_pair_biases,
+                prepared_token_conditioning_weights=prepared_token_conditioning_weights,
+            )
+
+        integrator, predict = wrap_for_frame_reuse(
+            self.integrator, self.frame_reuse_period, plan, predict, training=self.training
+        )
+        with SamplingContext.graph_safe(atom_mask.device, seed) as context:
+            return self.runner.run(integrator, plan, predict, context).final_state

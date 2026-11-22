@@ -1,0 +1,685 @@
+from __future__ import annotations
+
+import json
+import re
+import tomllib
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+import yaml
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SETUP_ACTION = "./.github/actions/setup-artifex"
+
+
+def _load_pyproject() -> dict[str, object]:
+    return tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+
+
+def _load_yaml(relative_path: str) -> dict[str, object]:
+    with (REPO_ROOT / relative_path).open() as handle:
+        return yaml.load(handle, Loader=yaml.BaseLoader)
+
+
+def _read(relative_path: str) -> str:
+    return (REPO_ROOT / relative_path).read_text()
+
+
+def _ci_policy() -> dict[str, object]:
+    pyproject = _load_pyproject()
+    tool = pyproject["tool"]
+    artifex = tool["artifex"]
+    return artifex["ci"]
+
+
+def test_pyproject_declares_reviewed_ci_roles() -> None:
+    """The CI role split should live in pyproject; advisory ignores live in audit-lock's table."""
+    policy = _ci_policy()
+
+    assert policy["tooling_python"] == "3.12"
+    assert policy["compatibility_python"] == ["3.12", "3.13"]
+    assert policy["pyright_enforcement"] == "blocking"
+    assert policy["smoke_package"] == "artifex"
+    assert policy["smoke_exports"] == ["generative_models"]
+    assert policy["blocking_workflows"] == [
+        ".github/workflows/ci.yml",
+        ".github/workflows/build-verification.yml",
+        ".github/workflows/security.yml",
+    ]
+    assert policy["informational_workflows"] == [
+        ".github/workflows/quality-checks.yml",
+        ".github/workflows/upstream-compat.yml",
+    ]
+    # The audit and its ignores are substrax's audit-lock action and its table.
+    assert "security" not in policy
+
+
+def test_security_audits_the_whole_lock_through_substrax_audit_lock() -> None:
+    """Security runs the stack's shared lock audit, pinned by commit, and no pip-audit of its own.
+
+    An audit of the installed environment sees only the extras installed there; audit-lock
+    exports every extra and dependency group from the lock and audits each export against
+    PyPI and OSV. The scans after it run whatever it found, so a red job names every failure.
+    """
+    steps = _load_yaml(".github/workflows/security.yml")["jobs"]["security-audit"]["steps"]
+    audit = [step for step in steps if "audit-lock@" in step.get("uses", "")]
+
+    assert len(audit) == 1
+    assert re.fullmatch(
+        r"avitai/substrax/\.github/actions/audit-lock@[0-9a-f]{40}", audit[0]["uses"]
+    )
+    assert not [step for step in steps if "pip-audit" in step.get("run", "")]
+    scans = [step for step in steps if "bandit" in step.get("run", "")]
+    assert len(scans) == 1
+    assert scans[0].get("if") == "${{ !cancelled() }}"
+
+
+def test_policy_workflows_use_checked_in_setup_action_instead_of_inline_bootstrap() -> None:
+    """Tracked CI workflows should reuse one setup owner instead of copy-pasting bootstrap."""
+    policy = _ci_policy()
+
+    for relative_path in policy["blocking_workflows"] + policy["informational_workflows"]:
+        workflow = _load_yaml(relative_path)
+        contents = _read(relative_path)
+
+        assert "actions/setup-python@" not in contents
+        assert "astral-sh/setup-uv@" not in contents
+        assert "uv pip install -e" not in contents
+
+        for name, job in workflow["jobs"].items():
+            setup_steps = [step for step in job["steps"] if step.get("uses") == SETUP_ACTION]
+            runs_uv = any("uv " in step.get("run", "") for step in job["steps"])
+            # A job that needs no Python (the already-tested gate reads git and gh) sets up none.
+            assert len(setup_steps) == (1 if runs_uv else 0), f"{relative_path}: {name}"
+
+
+def test_the_upstream_compatibility_job_upgrades_through_the_setup_action() -> None:
+    """The newest JAX stack is resolved with the project's requirements by the one setup owner.
+
+    An inline ``uv pip install --upgrade <name>`` does not hold the installed packages' bounds:
+    it put protobuf 7 beside wandb, whose release requires protobuf below 7.
+    """
+    job = _load_yaml(".github/workflows/upstream-compat.yml")["jobs"]["latest-jax-stack"]
+    setup = [step for step in job["steps"] if step.get("uses") == SETUP_ACTION]
+
+    assert len(setup) == 1
+    assert setup[0]["with"]["upgrade-packages"].split() == [
+        "jax",
+        "jaxlib",
+        "flax",
+        "optax",
+        "orbax-checkpoint",
+    ]
+    assert not [step for step in job["steps"] if "uv pip install" in step.get("run", "")]
+
+
+def test_the_setup_action_upgrades_named_packages_with_the_project_s_requirements() -> None:
+    """Each named package is upgraded in one resolution of the editable target, then checked."""
+    action = _load_yaml(".github/actions/setup-artifex/action.yml")
+    install = next(
+        step
+        for step in action["runs"]["steps"]
+        if step.get("name") == "Install Artifex environment"
+    )
+
+    assert action["inputs"]["upgrade-packages"]["default"] == ""
+    assert install["env"]["UPGRADE_PACKAGES"] == "${{ inputs.upgrade-packages }}"
+    assert '--upgrade-package "$package"' in install["run"]
+    assert 'uv pip install -e "$editable_target" "${upgrade_args[@]}"' in install["run"]
+    assert "uv pip check" in install["run"]
+
+
+def test_shared_setup_action_uses_current_pinned_uv_toolchain() -> None:
+    """The shared setup action should not regress to an old uv that rejects uv.lock."""
+    action = _load_yaml(".github/actions/setup-artifex/action.yml")
+    install_uv = next(step for step in action["runs"]["steps"] if step.get("name") == "Install uv")
+
+    assert install_uv["uses"] == "astral-sh/setup-uv@v10.2.0"
+    assert install_uv["with"]["version"] == "0.12.21"
+
+
+def test_workflow_roles_and_blocking_quality_commands_are_explicit() -> None:
+    """Blocking checks should stay explicit, and security should run on the automatic gate."""
+    ci_workflow = _load_yaml(".github/workflows/ci.yml")
+    build_workflow = _load_yaml(".github/workflows/build-verification.yml")
+    quality_workflow = _load_yaml(".github/workflows/quality-checks.yml")
+    security_workflow = _load_yaml(".github/workflows/security.yml")
+
+    ci_contents = _read(".github/workflows/ci.yml")
+    build_contents = _read(".github/workflows/build-verification.yml")
+    quality_contents = _read(".github/workflows/quality-checks.yml")
+    security_contents = _read(".github/workflows/security.yml")
+
+    assert set(ci_workflow["on"]) == {"push", "pull_request", "workflow_dispatch"}
+    assert set(build_workflow["on"]) == {"push", "pull_request", "workflow_dispatch"}
+    assert set(quality_workflow["on"]) == {"workflow_dispatch"}
+    assert set(security_workflow["on"]) == {"push", "pull_request", "schedule", "workflow_dispatch"}
+
+    assert "uv run ruff check --output-format=github" in ci_contents
+    assert "uv run ruff format --check" in ci_contents
+    assert "uv run pyright --warnings" not in ci_contents
+
+    for contents in (build_contents, quality_contents, security_contents):
+        assert "uv run ruff check --output-format=github" not in contents
+        assert "uv run ruff format --check" not in contents
+        assert "continue-on-error" not in contents
+
+    assert "uv run pyright --warnings" not in build_contents
+    assert "uv run pyright --warnings --outputjson" in quality_contents
+    assert "uv run pyright --warnings" not in security_contents
+    assert "Advisory Security Audit" not in security_contents
+    assert security_workflow["jobs"]["security-audit"]["name"] == "Security Audit"
+    assert "scheduled and manual by design" not in security_contents
+
+
+def test_partial_ci_coverage_jobs_defer_threshold_to_combined_report() -> None:
+    """Partial coverage producers should not apply the repo-wide fail-under threshold."""
+    workflow = _load_yaml(".github/workflows/ci.yml")
+
+    for job_name, step_name in (
+        ("integration_tests", "Run integration tests"),
+        ("e2e_tests", "Run end-to-end tests"),
+    ):
+        step = next(
+            step for step in workflow["jobs"][job_name]["steps"] if step.get("name") == step_name
+        )
+        command = step["run"]
+
+        assert "--cov=src/artifex" in command
+        assert "--cov-fail-under=0" in command
+
+    coverage_step = next(
+        step
+        for step in workflow["jobs"]["coverage"]["steps"]
+        if step.get("name") == "Combine coverage reports"
+    )
+
+    assert "uv run coverage report" in coverage_step["run"]
+
+
+CAP_OVERRIDES = ("--cov-fail-under", "--no-cov", "-o addopts", "--override-ini")
+
+
+def coverage_cap_violations(workflow: dict, pyproject: dict) -> list[str]:
+    """Return why CI would not fail below the coverage cap, if it would not."""
+    addopts = pyproject["tool"]["pytest"]["ini_options"]["addopts"]
+    addopts = " ".join(addopts) if isinstance(addopts, list) else addopts
+    caps = [int(cap) for cap in re.findall(r"--cov-fail-under[= ](\d+)", addopts)]
+    report_cap = pyproject["tool"]["coverage"]["report"].get("fail_under")
+    unit_job = workflow["jobs"]["unit_tests"]
+    unit_command = next(
+        step["run"]
+        for step in unit_job["steps"]
+        if step.get("name") == "Run unit tests with coverage"
+    )
+    coverage_job = workflow["jobs"]["coverage"]
+    combine_command = next(
+        step["run"]
+        for step in coverage_job["steps"]
+        if step.get("name") == "Combine coverage reports"
+    )
+
+    problems = []
+    if not caps or min(caps) < 80:
+        problems.append(f"pytest addopts cap is {caps}, not at least 80")
+    if report_cap is None or float(report_cap) < 80:
+        problems.append(f"[tool.coverage.report] fail_under is {report_cap}, not at least 80")
+    if not {"push", "pull_request"} <= set(workflow["on"]):
+        problems.append(f"CI runs on {sorted(workflow['on'])}, not on both push and pull_request")
+    # A merge whose tree its pull request already tested (and so already held to the cap)
+    # may stand the combined report down; no other condition may.
+    problems += [
+        f"job {name} only runs when {job['if']}"
+        for name, job in (("unit_tests", unit_job), ("coverage", coverage_job))
+        if job.get("if", GATE_CONDITION) != GATE_CONDITION
+    ]
+    # A shard runs part of the suite, so it does not hold the cap itself (--cov-fail-under=0);
+    # the unit coverage job holds each leg's shards, combined, to it instead.
+    problems += [
+        f"the unit test command overrides the cap with {override}"
+        for override in CAP_OVERRIDES
+        if override in unit_command.replace("--cov-fail-under=0", "")
+    ]
+    problems += unit_coverage_violations(workflow)
+    if "uv run coverage report" not in combine_command or "--fail-under=0" in combine_command:
+        problems.append("the combined coverage job does not run coverage report against fail_under")
+    return problems
+
+
+UNIT_COVERAGE_STEP = "Hold the leg's combined shards to the coverage cap"
+
+
+def unit_coverage_violations(workflow: dict) -> list[str]:
+    """Return why a unit test leg could pass below the coverage cap, if it could."""
+    jobs = workflow["jobs"]
+    gate = jobs.get("unit_coverage")
+    if gate is None:
+        return ["no unit_coverage job holds each unit test leg's combined shards to the cap"]
+    unit_legs = {
+        axis: values
+        for axis, values in jobs["unit_tests"]["strategy"]["matrix"].items()
+        if axis != "group"
+    }
+    command = next(
+        (step["run"] for step in gate["steps"] if step.get("name") == UNIT_COVERAGE_STEP), ""
+    )
+
+    problems = []
+    if gate["strategy"]["matrix"] != unit_legs:
+        problems.append("unit_coverage does not run once per unit test leg")
+    if "unit_tests" not in _needs(gate):
+        problems.append("unit_coverage does not wait on the unit tests")
+    if "if" in gate:
+        problems.append(f"unit_coverage only runs when {gate['if']}")
+    if "uv run coverage report" not in command or "--fail-under" in command:
+        problems.append("unit_coverage does not run coverage report against fail_under")
+    if "UNIT_TEST_SHARDS" not in command:
+        problems.append("unit_coverage does not check that every shard's data arrived")
+    return problems
+
+
+def test_ci_fails_below_the_coverage_cap() -> None:
+    """Unit tests and the combined report both fail below pyproject's floor on every change."""
+    pyproject = _load_pyproject()
+
+    assert coverage_cap_violations(_load_yaml(".github/workflows/ci.yml"), pyproject) == []
+
+
+def _without_the_unit_coverage_job(workflow: dict) -> None:
+    del workflow["jobs"]["unit_coverage"]
+
+
+def _unit_coverage_overriding_the_cap(workflow: dict) -> None:
+    step = next(
+        step
+        for step in workflow["jobs"]["unit_coverage"]["steps"]
+        if step.get("name") == UNIT_COVERAGE_STEP
+    )
+    step["run"] = step["run"].replace("coverage report", "coverage report --fail-under=0")
+
+
+def _unit_coverage_over_one_python_only(workflow: dict) -> None:
+    workflow["jobs"]["unit_coverage"]["strategy"]["matrix"]["python-version"] = ["3.12"]
+
+
+def _a_shard_without_coverage(workflow: dict) -> None:
+    step = next(
+        step
+        for step in workflow["jobs"]["unit_tests"]["steps"]
+        if step.get("name") == "Run unit tests with coverage"
+    )
+    step["run"] += " --no-cov"
+
+
+@pytest.mark.parametrize(
+    "weaken",
+    [
+        _without_the_unit_coverage_job,
+        _unit_coverage_overriding_the_cap,
+        _unit_coverage_over_one_python_only,
+        _a_shard_without_coverage,
+    ],
+)
+def test_the_coverage_cap_check_fails_a_workflow_that_lets_a_leg_pass_below_it(
+    weaken: Callable[[dict], None],
+) -> None:
+    """The control: each way of letting a unit test leg pass below the cap is reported."""
+    workflow = _load_yaml(".github/workflows/ci.yml")
+    weaken(workflow)
+
+    assert coverage_cap_violations(workflow, _load_pyproject()) != []
+
+
+def test_every_shard_of_a_run_takes_its_group_of_one_collection_in_one_order() -> None:
+    """Each test runs in exactly one shard: one group per shard, one seed for every shard.
+
+    pytest-split assigns the collection after pytest-randomly orders it, and tests with the same
+    name keep that order, so shards seeded differently could each run or each skip one of them.
+    """
+    workflow = _load_yaml(".github/workflows/ci.yml")
+    shards = int(workflow["env"]["UNIT_TEST_SHARDS"])
+    job = workflow["jobs"]["unit_tests"]
+    command = next(
+        step["run"] for step in job["steps"] if step.get("name") == "Run unit tests with coverage"
+    )
+
+    assert job["strategy"]["matrix"]["group"] == [str(group) for group in range(1, shards + 1)]
+    assert '--splits "$UNIT_TEST_SHARDS"' in command
+    assert "--group ${{ matrix.group }}" in command
+    assert "--randomly-seed=${{ github.run_id }}" in command
+
+
+def test_ci_uploads_no_coverage_to_codecov() -> None:
+    """coverage.py in CI is the coverage gate; no workflow uploads to Codecov."""
+    uses = [
+        str(step.get("uses", ""))
+        for path in sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+        for job in _load_yaml(str(path.relative_to(REPO_ROOT))).get("jobs", {}).values()
+        for step in job.get("steps", [])
+    ]
+
+    assert any(action.startswith("actions/checkout@") for action in uses)
+    assert [action for action in uses if action.startswith("codecov/")] == []
+
+
+def test_ci_coverage_artifacts_include_hidden_coverage_data_files() -> None:
+    """Coverage aggregation needs the raw hidden .coverage files, not just XML reports."""
+    workflow = _load_yaml(".github/workflows/ci.yml")
+
+    for job_name in ("unit_tests", "integration_tests", "e2e_tests"):
+        upload_step = next(
+            step
+            for step in workflow["jobs"][job_name]["steps"]
+            if step.get("name") == "Upload test results"
+        )
+
+        assert ".coverage" in upload_step["with"]["path"]
+        assert upload_step["with"]["include-hidden-files"] == "true"
+
+
+def test_build_verification_matches_compatibility_matrix_and_install_smoke_policy() -> None:
+    """Build verification should cover the reviewed compatibility matrix and a clean import contract."""
+    policy = _ci_policy()
+    workflow = _load_yaml(".github/workflows/build-verification.yml")
+    job = workflow["jobs"]["build"]
+    smoke_step = next(
+        step for step in job["steps"] if step.get("name") == "Run install smoke contract"
+    )
+    smoke_command = smoke_step["run"]
+
+    assert job["strategy"]["matrix"]["python-version"] == policy["compatibility_python"]
+    assert f"import {policy['smoke_package']}" in smoke_command
+    assert "dir(artifex)" in smoke_command
+    assert "'generative_models'" in smoke_command or '"generative_models"' in smoke_command
+    assert "Successfully imported artifex" not in smoke_command
+    assert "uv run pyright" not in _read(".github/workflows/build-verification.yml")
+
+
+def _platform_matrix(expression: str) -> tuple[str, list[str], list[str]]:
+    """Split a conditional runner matrix into its condition and its two platform lists."""
+    match = re.fullmatch(
+        r"\$\{\{ fromJSON\((?P<condition>.+?) && '(?P<when_true>\[.*?\])'"
+        r" \|\| '(?P<when_false>\[.*?\])'\) \}\}",
+        expression,
+    )
+    assert match is not None, expression
+    return match["condition"], json.loads(match["when_true"]), json.loads(match["when_false"])
+
+
+def test_macos_runners_join_the_platform_matrix_on_main_only() -> None:
+    """macOS runners queue for hours; pushes to main measure both platforms, branches ubuntu only."""
+    job = _load_yaml(".github/workflows/build-verification.yml")["jobs"]["build"]
+
+    condition, on_main, elsewhere = _platform_matrix(job["strategy"]["matrix"]["os"])
+
+    assert condition == "github.ref == 'refs/heads/main'"
+    assert on_main == ["ubuntu-latest", "macos-15"]
+    assert elsewhere == ["ubuntu-latest"]
+
+
+def test_unit_tests_on_an_already_tested_tree_run_only_the_platform_no_pull_request_ran() -> None:
+    """A merge of a tree its pull request tested repeats ubuntu; macOS it has never measured.
+
+    Pull requests run ubuntu only, so the merge narrows to macOS rather than skipping, which
+    also keeps the main-only performance job (it waits on the unit tests) running.
+    """
+    expression = _load_yaml(".github/workflows/ci.yml")["jobs"]["unit_tests"]["strategy"]["matrix"][
+        "os"
+    ]
+
+    assert expression == (
+        "${{ fromJSON(needs.already_tested.outputs.skip == 'true' && '[\"macos-15\"]'"
+        " || (github.ref == 'refs/heads/main' && '[\"ubuntu-latest\", \"macos-15\"]'"
+        " || '[\"ubuntu-latest\"]')) }}"
+    )
+
+
+GATE_JOB = "already_tested"
+# The quality gate is not gated: every other job waits on it, including the main-only
+# performance job, and GitHub skips a job whose dependency skipped.
+UNGATED_JOBS = frozenset({GATE_JOB, "quality"})
+GATE_CONDITION = f"needs.{GATE_JOB}.outputs.skip != 'true'"
+
+
+def _ci_jobs() -> dict[str, dict]:
+    return _load_yaml(".github/workflows/ci.yml")["jobs"]
+
+
+def _needs(job: dict) -> list[str]:
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def _runs_only_on_main(job: dict) -> bool:
+    """Whether the job's own condition confines it to a push to main."""
+    return "refs/heads/main" in str(job.get("if", ""))
+
+
+def _consults_the_gate(job: dict) -> bool:
+    return f"needs.{GATE_JOB}.outputs.skip" in yaml.safe_dump(job)
+
+
+def _skipped_by_the_gate(job: dict) -> bool:
+    return f"needs.{GATE_JOB}.outputs.skip" in str(job.get("if", ""))
+
+
+def _transitive_needs(name: str, jobs: dict[str, dict]) -> set[str]:
+    """Every job ``name`` waits on, directly or through another."""
+    pending, seen = [name], set()
+    while pending:
+        for dependency in _needs(jobs.get(pending.pop(), {})):
+            if dependency not in seen:
+                seen.add(dependency)
+                pending.append(dependency)
+    return seen
+
+
+def test_the_gate_reports_a_skip_only_for_a_push() -> None:
+    """A manual run re-measures the tree on purpose and must not be skipped."""
+    gate = _ci_jobs()[GATE_JOB]
+    reported_by = gate["outputs"]["skip"]
+    writers = [step for step in gate["steps"] if f"steps.{step.get('id')}.outputs" in reported_by]
+
+    assert [step.get("if") for step in writers] == ["github.event_name == 'push'"]
+
+
+GATE_ACTION = re.compile(r"^avitai/substrax/\.github/actions/already-tested@[0-9a-f]{40}$")
+
+
+def test_the_gate_is_the_shared_action_pinned_to_a_commit() -> None:
+    """The compare is substrax's already-tested action, pinned by commit, not a copy of it.
+
+    The action finds the pull request a push merged (squash or rebase) and skips only when that
+    pull request tested this tree and every one of its checks succeeded; its rules are tested
+    in substrax. A full commit SHA pins exactly the code that runs.
+    """
+    compare = next(step for step in _ci_jobs()[GATE_JOB]["steps"] if step.get("id") == "compare")
+
+    assert GATE_ACTION.match(compare.get("uses", "")), compare.get("uses")
+    assert "run" not in compare, "the gate runs the shared action, not an inline script"
+
+
+def test_a_job_that_repeats_the_pull_request_consults_the_gate() -> None:
+    """Work a pull request already did over the same tree does not run again on the merge."""
+    jobs = _ci_jobs()
+    repeated = {
+        name
+        for name, job in jobs.items()
+        if name not in UNGATED_JOBS and not _runs_only_on_main(job)
+    }
+
+    ungated = sorted(name for name in repeated if not _consults_the_gate(jobs[name]))
+
+    assert repeated >= {"unit_tests", "integration_tests", "e2e_tests", "coverage"}
+    assert ungated == [], f"these repeat the pull request without consulting the gate: {ungated}"
+
+
+def test_nothing_a_main_only_job_waits_on_is_skipped_by_the_gate() -> None:
+    """A job confined to main must not be skipped because something it needs was.
+
+    The unit tests consult the gate only to narrow their platforms, so they still run and the
+    performance job that waits on them still runs.
+    """
+    jobs = _ci_jobs()
+    main_only = [name for name, job in jobs.items() if _runs_only_on_main(job)]
+
+    assert main_only == ["performance_tests"]
+    for name in main_only:
+        skipped = sorted(
+            dependency
+            for dependency in _transitive_needs(name, jobs)
+            if _skipped_by_the_gate(jobs[dependency])
+        )
+        assert skipped == [], f"{name} runs only on main but waits on gated {skipped}"
+
+
+def test_an_unanswered_gate_leaves_the_work_running() -> None:
+    """Where the gate answers nothing, every job runs as it would without it.
+
+    The compare step does not run for a pull request or a manual run, and its lookups answer
+    ``unknown`` rather than failing, so an empty output is ordinary. A consumer may only stand
+    work down on ``'true'``.
+    """
+    for name, job in _ci_jobs().items():
+        if name == GATE_JOB or not _consults_the_gate(job):
+            continue
+        assert GATE_JOB in _needs(job), name
+        assert job.get("if") in (None, GATE_CONDITION), f"{name} runs only when {job.get('if')}"
+
+        pattern = rf"needs\.{GATE_JOB}\.outputs\.skip\s*(==|!=)\s*'([a-z]+)'"
+        compared = set(re.findall(pattern, yaml.safe_dump(job, width=10_000)))
+        assert {value for _, value in compared} == {"true"}, f"{name} compares against {compared}"
+
+
+def test_every_uv_cache_is_pruned_before_it_is_saved() -> None:
+    """A saved uv cache holds only what uv built, not every wheel it downloaded.
+
+    setup-uv prunes only when asked (``prune-cache`` defaults to false from v9); unpruned, the
+    caches of the heavy extras grow to gigabytes each and evict the repository's other caches.
+    """
+    github = REPO_ROOT / ".github"
+    documents = [
+        *sorted(github.glob("workflows/*.yml")),
+        *sorted(github.glob("actions/*/action.yml")),
+    ]
+    checked = 0
+    unpruned: list[str] = []
+    for path in documents:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        owners = {**document.get("jobs", {}), "runs": document.get("runs") or {}}
+        for owner, body in owners.items():
+            for step in body.get("steps", []):
+                if not str(step.get("uses", "")).startswith("astral-sh/setup-uv@"):
+                    continue
+                checked += 1
+                if (step.get("with") or {}).get("prune-cache") is not True:
+                    unpruned.append(f"{path.relative_to(REPO_ROOT)}:{owner}")
+
+    assert checked, "no setup-uv step found; the contract is reading the wrong files"
+    assert unpruned == [], f"setup-uv steps saving an unpruned cache: {unpruned}"
+
+
+PULL_REQUEST_RUNS_ONLY = "${{ github.event_name == 'pull_request' }}"
+
+
+def _workflow_paths() -> list[Path]:
+    return sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+
+
+@pytest.mark.parametrize("path", _workflow_paths(), ids=lambda path: path.name)
+def test_a_newer_push_cancels_the_run_it_supersedes(path: Path) -> None:
+    """A newer push to a pull request cancels that pull request's superseded run.
+
+    The group is keyed on the workflow and the ref, so only a run of the same workflow for the
+    same pull request is cancelled. A push to main is never cancelled: each main commit keeps
+    its main-only jobs, such as the performance measurement.
+    """
+    workflow = _load_yaml(f".github/workflows/{path.name}")
+    if not set(workflow["on"]) & {"push", "pull_request"}:
+        return
+    concurrency = workflow.get("concurrency")
+    assert isinstance(concurrency, dict), f"{path.name} declares no concurrency group"
+    assert concurrency.get("group") == "${{ github.workflow }}-${{ github.ref }}", path.name
+    assert concurrency.get("cancel-in-progress") == PULL_REQUEST_RUNS_ONLY, path.name
+
+
+MATRIX_PYTHON = "${{ matrix.python-version }}"
+INPUT_PYTHON = "${{ inputs.python-version }}"
+REQUIRE_PYTHON = "scripts/require_python.py"
+SETUP_ACTION_FILE = ".github/actions/setup-artifex/action.yml"
+
+
+def _runs(step: dict, command: str) -> bool:
+    """Whether the step's script runs ``uv <command>``."""
+    return re.search(rf"\buv {command}\b", str(step.get("run", ""))) is not None
+
+
+def _python_matrix_jobs() -> dict[str, dict]:
+    """Every job, by ``workflow:job``, whose own steps run once per matrix Python version."""
+    return {
+        f"{path.name}:{name}": job
+        for path in _workflow_paths()
+        for name, job in _load_yaml(f".github/workflows/{path.name}")["jobs"].items()
+        if "python-version" in job.get("strategy", {}).get("matrix", {}) and "steps" in job
+    }
+
+
+def setup_action_python_violations(action: dict) -> list[str]:
+    """Why the setup action could install or run another Python than it was asked for, if so."""
+    steps = action["runs"]["steps"]
+    syncs = [index for index, step in enumerate(steps) if _runs(step, "sync")]
+    guards = [
+        index
+        for index, step in enumerate(steps)
+        if REQUIRE_PYTHON in str(step.get("run", "")) and INPUT_PYTHON in str(step.get("run", ""))
+    ]
+
+    problems = [
+        f"step {steps[index].get('name')!r} runs uv sync without UV_PYTHON={INPUT_PYTHON}"
+        for index in syncs
+        if (steps[index].get("env") or {}).get("UV_PYTHON") != INPUT_PYTHON
+    ]
+    if not syncs:
+        problems.append("no step runs uv sync")
+    if not guards or max(guards) < max(syncs, default=0):
+        problems.append(f"no step after the last uv sync runs {REQUIRE_PYTHON} {INPUT_PYTHON}")
+    return problems
+
+
+def matrix_job_python_violations(name: str, job: dict) -> list[str]:
+    """Why a leg of a Python version matrix could run another interpreter, if it could."""
+    passed = [
+        (step.get("with") or {}).get("python-version")
+        for step in job["steps"]
+        if step.get("uses") == SETUP_ACTION
+    ]
+    problems = []
+    if passed != [MATRIX_PYTHON]:
+        problems.append(f"{name} passes {passed} to the setup action, not [{MATRIX_PYTHON}]")
+    problems += [
+        f"{name}: step {step.get('name')!r} makes a venv and never checks it runs {MATRIX_PYTHON}"
+        for step in job["steps"]
+        if _runs(step, "venv") and f"{REQUIRE_PYTHON} {MATRIX_PYTHON}" not in step["run"]
+    ]
+    return problems
+
+
+def test_every_python_matrix_leg_runs_its_matrix_version() -> None:
+    """A leg named for a Python version runs that version, or fails.
+
+    ``uv sync`` is a project command and takes its interpreter from ``.python-version`` (3.12)
+    unless told otherwise. ``setup-python`` putting 3.13 first on the path does not change
+    that, and neither does ``uv venv --python 3.13`` before it: the sync replaces that venv with
+    one satisfying ``.python-version``. The "Python 3.13" legs ran CPython 3.12. ``UV_PYTHON``
+    on the sync holds it to the version asked for, and ``scripts/require_python.py`` fails a
+    leg whose interpreter is another version all the same, including the wheel's test venv.
+    """
+    jobs = _python_matrix_jobs()
+
+    assert {"ci.yml:unit_tests", "build-verification.yml:build"} <= set(jobs)
+    assert setup_action_python_violations(_load_yaml(SETUP_ACTION_FILE)) == []
+    assert [
+        problem for name, job in jobs.items() for problem in matrix_job_python_violations(name, job)
+    ] == []

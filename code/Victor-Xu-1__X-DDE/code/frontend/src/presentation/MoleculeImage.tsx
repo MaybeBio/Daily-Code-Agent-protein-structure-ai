@@ -1,0 +1,264 @@
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { LoadingOutlined } from "@ant-design/icons";
+import {
+  DepictionRenderer,
+  depictionDataUrl,
+  type DepictionSource,
+  type MolecularSourceSnapshot,
+} from "./depiction-renderer";
+import type { Language } from "../types";
+import "./molecule-image.css";
+import { FigureExport } from "../publication/FigureExport";
+import { FigureViewport } from "../publication/FigureViewport";
+import { hiddenFrameFocus } from "./hidden-frame-focus";
+import { molecularVector } from "../publication/molecular-vector";
+const DrawingContext = createContext<DepictionRenderer | null | undefined>(
+  undefined,
+);
+export function MoleculeDrawingProvider({ children }: { children: ReactNode }) {
+  const frame = useRef<HTMLIFrameElement>(null);
+  const protect = useRef<() => void>(() => undefined);
+  const [renderer, setRenderer] = useState<DepictionRenderer | null>(null),
+    [active, setActive] = useState(false);
+  useEffect(() => {
+    const focus = hiddenFrameFocus(() => frame.current);
+    protect.current = () => focus.protect();
+    const next = new DepictionRenderer(() => {
+      setActive(true);
+      focus.protect();
+      return frame.current;
+    });
+    setRenderer(next);
+    return () => {
+      next.close();
+      focus.close();
+      protect.current = () => undefined;
+    };
+  }, []);
+  return (
+    <DrawingContext.Provider value={renderer}>
+      {children}
+      {active && (
+        <iframe
+          ref={frame}
+          className="drawing-service-frame"
+          title="Local 2D molecule drawing service"
+          aria-hidden="true"
+          inert
+          onLoad={() => protect.current()}
+          tabIndex={-1}
+          src="/tools/ketcher/index.html"
+        />
+      )}
+    </DrawingContext.Provider>
+  );
+}
+export function MoleculeImage({
+  source,
+  language,
+  label,
+  compact = false,
+  verifiedSource,
+}: {
+  source: DepictionSource | null;
+  language: Language;
+  label: string;
+  compact?: boolean;
+  verifiedSource?: MolecularSourceSnapshot;
+}) {
+  const renderer = useContext(DrawingContext),
+    key = JSON.stringify(source),
+    zh = language === "zh";
+  const [drawing, setDrawing] = useState<{ key: string; url: string } | null>(
+      null,
+    ),
+    [failedKey, setFailedKey] = useState<string | null>(null),
+    [visible, setVisible] = useState(false),
+    [attempt, setAttempt] = useState(0);
+  const [bondThickness, setBondThickness] = useState(1.6);
+  const drawingKey = JSON.stringify([key, bondThickness]);
+  const url = drawing?.key === drawingKey ? drawing.url : "";
+  const error = failedKey === drawingKey;
+  const element = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (typeof IntersectionObserver === "undefined") {
+      setVisible(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisible(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "120px" },
+    );
+    if (element.current) observer.observe(element.current);
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    setDrawing(null);
+    setFailedKey(null);
+    if (!visible) return () => controller.abort();
+    if (!source || renderer === undefined) {
+      setFailedKey(drawingKey);
+      return () => controller.abort();
+    }
+    // The provider's first effect is still starting. This is loading, not a
+    // failed drawing that can be accepted as an unavailable result screenshot.
+    if (renderer === null) return () => controller.abort();
+    void renderer
+      .render(
+        source,
+        controller.signal,
+        bondThickness,
+        undefined,
+        verifiedSource,
+      )
+      .then(depictionDataUrl)
+      .then((value) => {
+        if (!controller.signal.aborted) {
+          setDrawing({ key: drawingKey, url: value });
+        }
+      })
+      .catch((reason) => {
+        if (!controller.signal.aborted) {
+          console.warn(
+            "Molecular drawing unavailable",
+            reason instanceof Error ? reason.message : String(reason),
+          );
+          setFailedKey(drawingKey);
+        }
+      });
+    return () => {
+      controller.abort();
+    };
+  }, [key, renderer, visible, attempt, bondThickness, verifiedSource]);
+  return (
+    <div
+      ref={element}
+      className={"molecule-image" + (compact ? " is-thumbnail" : "")}
+      data-drawing-state={
+        !source
+          ? "no-source"
+          : url
+            ? "ready"
+            : error
+              ? "unavailable"
+              : "loading"
+      }
+    >
+      {!compact && (
+        <label className="molecule-drawing-style">
+          {zh ? "图形线条" : "Drawing lines"}
+          <select
+            aria-label={zh ? "二维图线条粗细" : "2D drawing line weight"}
+            value={bondThickness}
+            onChange={(e) => setBondThickness(Number(e.target.value))}
+          >
+            <option value="1.2">{zh ? "精细" : "Fine"}</option>
+            <option value="1.6">
+              {zh ? "标准 · 推荐" : "Standard · Recommended"}
+            </option>
+            <option value="2.2">{zh ? "醒目" : "Bold"}</option>
+          </select>
+        </label>
+      )}
+      {compact ? (
+        url ? (
+          <img
+            src={url}
+            alt={(zh ? "二维分子结构 · " : "2D molecular structure · ") + label}
+          />
+        ) : error ? (
+          <span>{zh ? "二维图暂不可用" : "2D unavailable"}</span>
+        ) : (
+          <LoadingOutlined
+            aria-label={zh ? "绘制二维结构" : "Drawing 2D structure"}
+          />
+        )
+      ) : (
+        <div className="molecule-inspection-view">
+          <FigureViewport
+            key={url ?? "loading"}
+            language={language}
+            transparent={false}
+            ready={Boolean(url)}
+            label={zh ? "二维结构画布" : "2D structure canvas"}
+          >
+            {url ? (
+              <img
+                src={url}
+                draggable={false}
+                alt={
+                  (zh ? "二维分子结构 · " : "2D molecular structure · ") + label
+                }
+              />
+            ) : error ? (
+              <span
+                title={
+                  zh
+                    ? "二维结构暂不可绘制；请检查原始记录或 Ketcher 组件。三维与原始文件仍保留。"
+                    : "2D drawing unavailable. Check the original record or Ketcher component; 3D views and originals remain available."
+                }
+              >
+                {zh ? "二维图暂不可用" : "2D unavailable"}
+              </span>
+            ) : (
+              <LoadingOutlined
+                aria-label={zh ? "绘制二维结构" : "Drawing 2D structure"}
+              />
+            )}
+          </FigureViewport>
+        </div>
+      )}
+      {!compact && (
+        <FigureExport
+          sourceKey={JSON.stringify([source, label, bondThickness])}
+          sourceReady={Boolean(url) && !error}
+          disabled={!url || Boolean(error)}
+          language={language}
+          filename={label + "-structure"}
+          format="svg"
+          render={async (settings) => {
+            if (!renderer || !source)
+              throw new Error("Select a molecular structure first.");
+            const blob = await renderer.render(
+              source,
+              new AbortController().signal,
+              bondThickness,
+              {
+                widthMm: settings.widthMm,
+                fontPt: settings.fontPt,
+                transparent: settings.transparent,
+              },
+            );
+            return molecularVector(blob, settings);
+          }}
+        />
+      )}
+      {error && source && renderer && (
+        <button
+          type="button"
+          className={compact ? "text-button" : "secondary-button"}
+          aria-label={(zh ? "重新绘图" : "Retry drawing") + " · " + label}
+          onClick={() => {
+            renderer?.retryInitialization();
+            setAttempt((value) => value + 1);
+          }}
+        >
+          {zh ? "重新绘图" : "Retry drawing"}
+        </button>
+      )}
+    </div>
+  );
+}

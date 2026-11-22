@@ -1,0 +1,46 @@
+# @package data
+# Data pipeline settings: download, preprocessing, clustering and splits.
+# Override any value from the command line: --set data.clustering.seed=7
+
+uniprot:
+  # Swiss-Prot only (reviewed:true) — manually curated, high-quality EC labels
+  # ec:* means "has at least one EC annotation"
+  base_url: "https://rest.uniprot.org/uniprotkb/search"
+  query: "reviewed:true AND ec:*"
+  format: "json"
+  fields:
+    - "accession"        # UniProt ID — traceability, later links to PDB
+    - "sequence"         # Amino acid sequence — input to ESM-2
+    - "ec"               # EC number — our label
+    - "protein_name"     # Human-readable name — sanity checking
+    - "organism_name"    # Organism — useful for stratification analysis
+  page_size: 500         # Maximum allowed by UniProt API
+
+filtering:
+  min_length: 50         # Shorter = likely fragments, not full enzymes
+  max_length: 1024       # ESM-2 context window — longer sequences lose C-terminus
+  min_ec_digits: 2       # Need at least X.Y — "3.-.-.-" is too vague for sub-class task
+  min_class_count: 100   # Drop sub-classes with fewer sequences than this
+
+output:
+  raw_dir: "data/raw"
+  raw_filename: "uniprot_enzymes_raw.json"
+  checksums_file: "data/checksums.json"
+  processed_dir: "data/processed"
+  clusters_dir: "data/clusters"
+
+clustering:
+  min_seq_id: 0.30       # 30% identity threshold — community standard
+  train_frac: 0.70
+  val_frac: 0.15         # test_frac is implicit: 1 - train - val = 0.15
+  min_clusters_per_class: 20   # drop sub-classes with fewer clusters (unit of independence)
+  min_eval_clusters: 3         # guaranteed clusters per sub-class in val and in test
+  seed: 42               # fixed seed — reproducible splits
+
+identity:
+  # MMseqs2 search of test against train (src/data/identity.py, D14)
+  sensitivity: 7.5       # highest standard sensitivity, for remote homologues
+  max_evalue: 10         # permissive: keep weak hits, nearest neighbour gets its best chance
+  max_seqs: 300          # prefilter hits kept per test sequence
+  work_dir: data/identity
+  report_dir: experiments/baseline_similarity/results

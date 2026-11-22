@@ -1,0 +1,217 @@
+import math
+from decimal import Decimal, localcontext
+
+import numpy as np
+import pandas as pd
+import pytest
+from scipy.stats import binom, chi2, poisson
+
+from csubst import scan_statistics as stats
+
+
+def test_maximum_score_rejects_rows_without_a_score_column():
+    assert stats.maximum_score(pd.DataFrame()) == -np.inf
+    with pytest.raises(KeyError, match='score_rate_enrichment'):
+        stats.maximum_score(pd.DataFrame(index=[0]))
+
+
+def test_sparse_poisson_diagnostic_is_not_an_exact_test():
+    score, p = stats.rate_score(2, 1, 0, 1)
+    assert p == pytest.approx(.04794548357123278)
+    assert score == pytest.approx(-math.log10(p))
+    assert binom.sf(1, 2, .5) == .25
+    # Total=2, equal exposures: enumerating the conditional null gives a 25%
+    # rejection probability for the asymptotic diagnostic at nominal 5%.
+    rejection = sum(binom.pmf(x, 2, .5) for x in range(3) if stats.rate_score(x, 1, 2-x, 1)[1] <= .05)
+    assert rejection == pytest.approx(.25)
+
+
+@pytest.mark.parametrize('exposures', [(1., 1.), (.1, 10.), (5., .25)])
+def test_score_matches_independent_likelihood_calculation(exposures):
+    a, b = exposures
+    for x, y in [(2., 0.), (.7, .2), (20., 10.), (0., 0.)]:
+        score, p = stats.rate_score(x, a, y, b)
+        if x/a <= y/b:
+            assert (score, p) == (0., 1.)
+            continue
+        common = (x+y)/(a+b)
+        alt = poisson.logpmf(x, x) + poisson.logpmf(y, y) if x.is_integer() and y.is_integer() else None
+        if alt is not None:
+            null = poisson.logpmf(x, a*common) + poisson.logpmf(y, b*common)
+            expected = .5*chi2.sf(2*(alt-null), 1)
+        else:
+            terms = [v*math.log((v/exposure)/common) if v else 0 for v,exposure in [(x,a),(y,b)]]
+            expected = .5*chi2.sf(2*sum(terms), 1)
+        assert p == pytest.approx(expected)
+        assert score == pytest.approx(-math.log10(expected))
+
+
+def test_large_counts_keep_distinct_finite_scores_after_p_underflow():
+    score1, p1 = stats.rate_score(10000, 1, 0, 1)
+    score2, p2 = stats.rate_score(20000, 1, 0, 1)
+    assert p1 == p2 == 0.
+    assert np.isfinite([score1, score2]).all() and score2 > score1
+
+
+@pytest.mark.parametrize('other_count,other_exposure', [(0., 2.), (0., 9.), (1e308, 10.), (1e308, 60.)])
+def test_rate_score_survives_intermediate_deviance_overflow(other_count, other_exposure):
+    args = (1e308, 1., other_count, other_exposure)
+    with localcontext() as context:
+        context.prec = 80
+        x, a, y, b = map(Decimal.from_float, args)
+        pooled = (x + y) / (a + b)
+        likelihood_ratio = x * (x / (a * pooled)).ln()
+        if y:
+            likelihood_ratio += y * (y / (b * pooled)).ln()
+        # The correction to the leading normal log-tail term is O(log D),
+        # negligible compared with D at this scale.
+        expected = float(likelihood_ratio / Decimal(10).ln())
+    score, p = stats.rate_score(*args)
+    assert score == pytest.approx(expected, rel=3e-15)
+    assert p == 0.
+
+
+def test_extreme_exposure_ratios_do_not_make_valid_scores_undefined():
+    score, p = stats.rate_score(2, 1e20, 0, 1)
+    assert np.isfinite(score) and p == pytest.approx(.5)
+    assert stats.rate_score(1, 1e300, 1, 1e-300) == (0., 1.)
+    score, p = stats.rate_score(2, 1e-300, 0, 1e300)
+    # With y=0, the likelihood-ratio deviance is -2*x*log(p_target).
+    from scipy.special import log_ndtr
+    expected = -log_ndtr(-math.sqrt(4 * 600 * math.log(10))) / math.log(10)
+    assert score == pytest.approx(expected)
+    assert p == 0.
+
+
+@pytest.mark.parametrize('other_count', [0., 1e-21, 9e-21])
+def test_tiny_exposure_ratio_retains_finite_deviance_after_count_scaling(other_count):
+    args = (1e308, 1e308, other_count, 1e-20)
+    with localcontext() as context:
+        context.prec = 400
+        x, a, y, b = map(Decimal.from_float, args)
+        pooled = (x + y) / (a + b)
+        terms = x * (x / (a * pooled)).ln()
+        if y:
+            terms += y * (y / (b * pooled)).ln()
+    expected = .5 * math.erfc(math.sqrt(float(terms)))
+    score, p = stats.rate_score(*args)
+    assert expected < .5
+    assert p == pytest.approx(expected, rel=0., abs=1e-16)
+    assert score == pytest.approx(-math.log10(expected), rel=0., abs=1e-16)
+
+
+@pytest.mark.parametrize('counts_exposures', [
+    (1.00000001, 1., 1., 1.),
+    (1.000000001e18, 1., 1e18, 1.),
+    (1e16 + 2., 1., 1e16, 1.),
+    (1.000000001e17, 1e-2, 1e19, 1.),
+    (1e16, 1e100, 100., 1.0011e86),
+])
+def test_nearly_equal_rates_match_high_precision_likelihood(counts_exposures):
+    with localcontext() as context:
+        context.prec = 80
+        x, a, y, b = map(Decimal.from_float, counts_exposures)
+        common = (x + y) / (a + b)
+        deviance = 2 * (x * (x / (a * common)).ln() + y * (y / (b * common)).ln())
+    expected = .5 * math.erfc(math.sqrt(float(deviance) / 2))
+    score, p = stats.rate_score(*counts_exposures)
+    assert p == pytest.approx(expected, abs=1e-15, rel=0)
+    assert score == pytest.approx(-math.log10(expected), abs=1e-15, rel=0)
+    assert stats.rate_score(*counts_exposures[2:], *counts_exposures[:2]) == (0., 1.)
+
+
+@pytest.mark.parametrize('counts_exposures', [
+    (1e300, 1e300, 1e294, 1.0011e294),
+    (1e200, 1e200, 1e200, 1.0099e200),
+])
+def test_nearly_equal_large_rates_retain_significant_score_digits(counts_exposures):
+    with localcontext() as context:
+        context.prec = 80
+        x, a, y, b = map(Decimal.from_float, counts_exposures)
+        common = (x + y) / (a + b)
+        terms = x * (x / (a * common)).ln() + y * (y / (b * common)).ln()
+        # At these magnitudes the lower-order log-tail terms are below one ulp.
+        expected = float(terms / Decimal(10).ln())
+    score, p = stats.rate_score(*counts_exposures)
+    assert score == pytest.approx(expected, rel=3e-15)
+    assert p == 0.
+
+
+@pytest.mark.parametrize('values', [(-1,1,0,1), (1,0,0,1), (1,1,0,0), (np.nan,1,0,1), (1,np.inf,0,1)])
+def test_invalid_rate_inputs_remain_undefined(values):
+    assert np.isnan(stats.rate_score(*values)).all()
+
+
+def test_empirical_reference_preserves_ties_and_empty_draws():
+    assert stats.empirical_pvalue(3, [3, 3-1e-14, 3+1e-14], 3) == 1.
+    assert stats.empirical_pvalue(3, [-np.inf, 2, 4], 3) == .5
+    assert stats.empirical_pvalue(0, [-np.inf]*20, 20) == 1.
+    assert stats.empirical_pvalue(-np.inf, [-np.inf]*20, 20) == 1.
+    assert np.isnan(stats.empirical_pvalue(np.nan, [1, 2]))
+    assert np.isnan(stats.empirical_pvalue(np.inf, [1, 2]))
+    with pytest.raises(ValueError, match='undefined'):
+        stats.empirical_pvalue(3, [np.nan, 2])
+    with pytest.raises(ValueError, match='Missing'):
+        stats.empirical_pvalue(3, [2], 2)
+    with pytest.raises(ValueError, match='undefined'):
+        stats.empirical_pvalue(3, [2, np.inf], 2)
+
+
+@pytest.mark.parametrize('exact', [False, True])
+def test_batch_empirical_tails_preserve_scalar_ties(exact):
+    cutoff = 3. - 4e-12
+    reference = [-np.inf, np.nextafter(cutoff, 0.), cutoff, np.nextafter(cutoff, 4.), 3., 3., 5.]
+    observed = np.array([2., 3., np.nextafter(3., 4.), 3.1, 5., 6., 0., -np.inf, np.nan, np.inf])
+    expected = [stats.empirical_pvalue(score, reference, len(reference), exact=exact) for score in observed]
+    actual = stats.empirical_pvalues(observed, reference, len(reference), exact=exact)
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_empty_family_is_not_an_undefined_score():
+    assert stats.maximum_score(pd.DataFrame({'score_rate_enrichment': []})) == -np.inf
+    with pytest.raises(ValueError, match='Undefined'):
+        stats.maximum_score(pd.DataFrame({'score_rate_enrichment': [2., np.nan]}))
+
+
+def test_zero_exposure_is_a_declared_no_test_but_bad_data_still_fail():
+    row = dict(score_rate_enrichment=np.nan, target_event_count=2., other_event_count=.01,
+               target_exposure_branch_length=0., other_exposure_branch_length=0.)
+    assert stats.calibration_score(row) == -np.inf
+    assert stats.maximum_score(pd.DataFrame([row])) == -np.inf
+    with pytest.raises(ValueError, match='Undefined'):
+        stats.calibration_score(dict(row, target_event_count=np.nan))
+    with pytest.raises(ValueError, match='Undefined'):
+        stats.calibration_score(dict(row, target_event_count=-1.))
+    with pytest.raises(ValueError, match='Undefined'):
+        stats.calibration_score(dict(row, target_exposure_branch_length=1., other_exposure_branch_length=1.))
+
+
+@pytest.mark.parametrize('score,exposure,expected', [
+    (0, 0., 0.), (0, 1., 0.), (1e200, 1., 1e200), (np.float32(2.), 1., 2.), ('2', 0., 2.),
+    (np.nan, 0., -np.inf), (np.nan, 1., None),
+    (-1., 0., None), (-1., 1., None), (np.inf, 0., None), (np.inf, 1., None),
+    (-np.inf, 0., None), (-np.inf, 1., None),
+])
+def test_calibration_score_scalar_validation_preserves_no_test_and_errors(score, exposure, expected):
+    row = dict(score_rate_enrichment=score, target_event_count=2., other_event_count=.01,
+               target_exposure=exposure, other_exposure=1.)
+    if expected is None:
+        with pytest.raises(ValueError, match='Undefined rate score'):
+            stats.calibration_score(row)
+    else:
+        assert stats.calibration_score(row) == expected
+
+
+def test_enumerated_reference_includes_candidate_discovery():
+    # All eight equally probable outcomes of three independent binary features;
+    # discovery retains only positive features. Max-score reference includes
+    # the all-zero (empty-discovery) dataset and its probability mass.
+    from itertools import product
+    reference = []
+    for bits in product((0, 1), repeat=3):
+        frame = pd.DataFrame({'score_rate_enrichment': [i+1 for i,bit in enumerate(bits) if bit]})
+        reference.append(stats.maximum_score(frame))
+    assert reference.count(-np.inf) == 1
+    assert stats.empirical_pvalue(3., reference) == 5/9
+    # Searching any number of columns uses the maximum from the SAME draw.
+    assert max(reference) == 3.

@@ -1,0 +1,15 @@
+# mmb-irb/mddb-workflow Overview
+The [`mddb-workflow`](https://github.com/mmb-irb/mddb-workflow/README.md#L4) package orchestrates the lifecycle of Molecular Dynamics (MD) simulation projects. It converts raw simulation outputs into normalized files, executes automated Quality Assurance (QA) and analysis pipelines, and packages results with associated metadata. This system facilitates the standardization, validation, and analysis of MD simulation projects.
+
+The package's core manages individual MD simulations and collections of simulations using [`MD`](https://github.com/mmb-irb/mddb-workflow/mddb_workflow/mwf.py#L99) and [`Project`](https://github.com/mmb-irb/mddb-workflow/mddb_workflow/mwf.py#L1333) classes. These classes integrate with a [`Task`](https://github.com/mmb-irb/mddb-workflow/mddb_workflow/utils/tasks.py#L24) system for orchestrating input processing, remote data access, and lazy computation. See [Core Workflow Management and Data Lifecycle](#md-simulation-data-lifecycle-and-analysis-core-workflow-management-and-data-lifecycle) for more details.
+
+A command-line interface (CLI) provides entry points for user interaction with the workflow. The CLI, defined in [`/mmb-irb/mddb-workflow/mddb_workflow/__main__.py`](https://github.com/mmb-irb/mddb-workflow/mddb_workflow/__main__.py) and [`/mmb-irb/mddb-workflow/mddb_workflow/console.py`](https://github.com/mmb-irb/mddb-workflow/mddb_workflow/console.py), offers subcommands for executing the main workflow, setting up inputs, performing data conversions, filtering, and managing datasets. Further information is available in [Command-Line Interface and Entry Points](#md-simulation-data-lifecycle-and-analysis-command-line-interface-and-entry-points).
+
+Data management involves an SQLite database that tracks the status of projects and MD simulations. A distributed filesystem locking mechanism ensures data integrity, and Pydantic schemas validate complex input configurations. [Project and MD Dataset Management](#project-and-md-dataset-management) describes these mechanisms.
+
+The workflow includes a suite of tools for various biophysical and structural calculations. These analyses encompass area per lipid, channel analysis, clustering, density profiling, dihedral energies, and principal component analysis. [Comprehensive MD Analysis Suite](#md-simulation-data-lifecycle-and-analysis-comprehensive-md-analysis-suite) provides an overview of these capabilities.
+
+General-purpose utilities underpin the workflow's operations. These include persistent caching, file and path management, robust error handling, and reproducible argument checksums. The workflow integrates with external tools such as GROMACS, MDAnalysis, and Pytraj through specialized wrappers. Refer to [Workflow Utilities and Data Processing](#workflow-utilities-and-data-processing) for more information.
+
+The workflow is containerized using Docker to ensure consistent execution across different environments. A Docker image encapsulates the Miniconda3 environment, dependencies, and the software itself. [Containerized Workflow Execution](#containerized-workflow-execution) details this setup.
+

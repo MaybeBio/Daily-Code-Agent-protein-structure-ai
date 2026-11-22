@@ -1,0 +1,58 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "stable"
+          components: rustfmt, clippy
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: test
+        run: cargo test --all-targets --all-features
+
+      - name: doctests
+        run: cargo test --doc --all-features
+
+      - name: test (sheaf-evals)
+        run: cargo test --all-targets --features sheaf-evals
+
+      - name: check (burn)
+        run: cargo check --all-targets --features burn
+
+      # Only the deterministic (hand-rolled f32) examples are gated here. The
+      # burn_* examples assert a training-outcome bound that is environment
+      # dependent (burn-ndarray's parallel float reductions vary across hosts),
+      # so they are compile-checked via `check (burn)` but not run-gated.
+      - name: run example assertions
+        run: |
+          cargo run --example rfm_minibatch_ot_linear --release
+          cargo run --example sd_fm_semidiscrete_linear --release
+          cargo run --example rfm_fisher_simplex --features riemannian --release
+
+      - name: Semver check
+        if: github.event_name == 'pull_request'
+        run: |
+          cargo install cargo-semver-checks --locked || true
+          cargo semver-checks

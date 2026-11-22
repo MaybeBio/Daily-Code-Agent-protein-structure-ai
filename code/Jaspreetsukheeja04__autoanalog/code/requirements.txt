@@ -1,0 +1,16 @@
+streamlit
+pandas
+numpy
+matplotlib
+requests
+reportlab
+Pillow
+pyyaml
+scikit-learn
+rdkit
+transformers
+torch
+biopython
+chembl-webresource-client
+snakemake==7.32.4
+pulp==2.7.0

@@ -1,0 +1,324 @@
+import sys
+from types import ModuleType, SimpleNamespace
+
+import pytest
+import torch
+from _fake_dna_models import (
+    DNA_TO_ID,
+    FakeBpeTokenizer,
+    FakeCarbon,
+    FakeDnaBert,
+    FakeDnaTokenizer,
+    FakeKmerTokenizer,
+    FakePaddedKmerTokenizer,
+)
+
+from biointerp import dna, models
+from biointerp.dna import reverse_complement
+from biointerp.dna_task import (
+    _as_ids,
+    causal_dna_batch,
+    dna_token_positions,
+    masked_dna_batch,
+    token_spans,
+    variant_token_index,
+)
+
+
+def test_registry_dispatches_dna(monkeypatch, tmp_path):
+    (tmp_path / "custom.yaml").write_text(
+        "adapter: carbon\nhf_id: example/dna-model\nmodality: dna\ntokenizer: 6mer\n"
+    )
+    monkeypatch.setattr(models, "CONFIG_DIR", tmp_path)
+    calls = {}
+
+    def fake_load(spec, device=None):
+        calls.update(spec=spec, device=device)
+        return "model", "tokenizer", "cpu"
+
+    monkeypatch.setattr(dna, "load_dna_model", fake_load)
+    assert models.load_model("custom", device="cpu") == ("model", "tokenizer", "cpu")
+    assert calls["spec"]["modality"] == "dna"
+    assert calls["device"] == "cpu"
+
+
+def test_layer_and_ffn_discovery():
+    carbon = FakeCarbon(n_layers=3)
+    bert = FakeDnaBert(n_layers=3)
+
+    assert dna.get_layers(carbon, "carbon") is carbon.model.layers
+    assert dna.get_layers(bert, "dnabert") is bert.bert.encoder.layer
+    assert (
+        dna.get_ffn_output_proj(carbon.model.layers[0], "carbon")
+        is carbon.model.layers[0].mlp.down_proj
+    )
+    assert (
+        dna.get_ffn_output_proj(bert.bert.encoder.layer[0], "dnabert")
+        is bert.bert.encoder.layer[0].output.dense
+    )
+
+
+def test_unknown_adapter_raises():
+    with pytest.raises(ValueError):
+        dna.get_layers(object(), "bogus")
+
+
+def test_col_norms_shapes():
+    carbon = FakeCarbon(hidden=8, intermediate=12, n_layers=2)
+    bert = FakeDnaBert(hidden=8, intermediate=12, n_layers=2)
+    assert {k: tuple(v.shape) for k, v in dna.precompute_col_norms(carbon, "carbon").items()} == {
+        0: (12,),
+        1: (12,),
+    }
+    assert {k: tuple(v.shape) for k, v in dna.precompute_col_norms(bert, "dnabert").items()} == {
+        0: (12,),
+        1: (12,),
+    }
+
+
+def test_dequantize_weight_uses_bitsandbytes_state(monkeypatch):
+    calls = {}
+
+    def fake_dequantize_4bit(data, state):
+        calls["data"] = data
+        calls["state"] = state
+        return torch.ones(3, 5)
+
+    bnb = ModuleType("bitsandbytes")
+    functional = ModuleType("bitsandbytes.functional")
+    functional.dequantize_4bit = fake_dequantize_4bit
+    monkeypatch.setitem(sys.modules, "bitsandbytes", bnb)
+    monkeypatch.setitem(sys.modules, "bitsandbytes.functional", functional)
+
+    class QuantWeight:
+        data = torch.zeros(8, 1, dtype=torch.uint8)
+        quant_state = object()
+
+    dense = dna.dequantize_weight(QuantWeight())
+    assert dense.shape == (3, 5)
+    assert dense.dtype == torch.float32
+    assert calls["state"] is QuantWeight.quant_state
+
+
+def test_load_carbon_4bit_uses_quantization_config(monkeypatch):
+    import transformers
+
+    calls = {}
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        classmethod(lambda cls, *a, **k: "tokenizer"),
+    )
+
+    def fake_model(*args, **kwargs):
+        calls.update(kwargs)
+        return FakeCarbon(hidden=8, intermediate=12, n_layers=1)
+
+    class FakeBitsAndBytesConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    monkeypatch.setattr(transformers, "BitsAndBytesConfig", FakeBitsAndBytesConfig)
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", fake_model)
+    spec = {
+        "adapter": "carbon",
+        "hf_id": "HuggingFaceBio/Carbon-X",
+        "dtype": "bf16",
+        "load_in_4bit": True,
+        "compute_dtype": "bf16",
+    }
+    model, tokenizer, device = dna.load_dna_model(spec, device="cuda")
+    assert tokenizer == "tokenizer"
+    assert device == "cuda"
+    assert calls["device_map"] == {"": "cuda"}
+    assert calls["low_cpu_mem_usage"] is True
+    config = calls["quantization_config"]
+    assert config.load_in_4bit is True
+    assert config.bnb_4bit_quant_type == "nf4"
+    assert config.bnb_4bit_compute_dtype is torch.bfloat16
+    assert config.bnb_4bit_use_double_quant is True
+
+
+def test_col_norm_cache_hit_and_invalid(monkeypatch, tmp_path):
+    carbon = FakeCarbon(hidden=8, intermediate=12, n_layers=2)
+    calls = {"n": 0}
+    original = dna.dequantize_weight
+
+    def counted(weight):
+        calls["n"] += 1
+        return original(weight)
+
+    monkeypatch.setattr(dna, "dequantize_weight", counted)
+    first = dna.precompute_col_norms(carbon, "carbon", [0, 1], cache=True, cache_dir=tmp_path)
+    assert calls["n"] == 2
+    assert {layer: tuple(value.shape) for layer, value in first.items()} == {
+        0: (12,),
+        1: (12,),
+    }
+
+    second = dna.precompute_col_norms(carbon, "carbon", [0, 1], cache=True, cache_dir=tmp_path)
+    assert calls["n"] == 2
+    assert all(torch.equal(first[i], second[i]) for i in first)
+
+    cache_file = next(tmp_path.glob("col_norms_*.pt"))
+    cache_file.write_bytes(b"invalid cache")
+    dna.precompute_col_norms(carbon, "carbon", [0, 1], cache=True, cache_dir=tmp_path)
+    assert calls["n"] == 4
+
+    dna.precompute_col_norms(carbon, "carbon", [0], cache=True, cache_dir=tmp_path)
+    assert calls["n"] == 5
+
+
+def test_as_ids_accepts_batch_encoding_like_objects():
+    assert _as_ids(SimpleNamespace(input_ids=[[1, 2, 3]])) == [1, 2, 3]
+    assert _as_ids({"input_ids": torch.tensor([[4, 5]])}) == [4, 5]
+
+
+def test_kmer_spans_and_variant_index():
+    spans = token_spans("ACGTACGTAA", FakeKmerTokenizer(), "carbon")
+    assert spans == [None, (0, 6), (6, 10), None]
+    assert dna_token_positions(spans) == [1, 2]
+    assert variant_token_index(spans, 0) == 1
+    assert variant_token_index(spans, 7) == 2
+    with pytest.raises(ValueError):
+        variant_token_index(spans, 10)
+
+
+def test_carbon_tail_padding_is_clipped():
+    spans = token_spans("ACGTACGTAA", FakePaddedKmerTokenizer(), "carbon")
+    assert spans == [None, (0, 6), (6, 10), None]
+    assert variant_token_index(spans, 9) == 2
+
+
+def test_single_nucleotide_spans():
+    spans = token_spans("ACGT", FakeDnaTokenizer(), "dnabert")
+    assert spans == [None, (0, 1), (1, 2), (2, 3), (3, 4), None]
+
+
+def test_bpe_spans_strip_continuation_prefix():
+    spans = token_spans("ACGT", FakeBpeTokenizer(), "dnabert")
+    assert spans == [None, (0, 1), (1, 2), (2, 3), (3, 4), None]
+
+
+def test_masked_batch_alignment():
+    tokenizer = FakeDnaTokenizer()
+    sequences = ["ACGTAC", "ACGTAC"]
+    tokens, positions, true_ids, spans = masked_dna_batch(
+        sequences, tokenizer, "dnabert", masks_per_seq=1, seed=3
+    )
+
+    assert positions.shape == (2, 1)
+    assert true_ids.shape == (2, 1)
+    assert tokens["input_ids"].shape[0] == 2
+    for i, sequence in enumerate(sequences):
+        token_index = int(positions[i, 0])
+        span = spans[i][token_index]
+        assert tokens["input_ids"][i, token_index] == tokenizer.mask_token_id
+        assert int(true_ids[i, 0]) == DNA_TO_ID[sequence[span[0]]]
+        assert int(tokens["attention_mask"][i].sum()) == len(sequence) + 2
+
+
+def test_causal_batch_targets_last_dna_token():
+    tokenizer = FakeKmerTokenizer()
+    tokens, positions, targets = causal_dna_batch(["ACGTACGTAA", "ACGTACGTAC"], tokenizer, "carbon")
+    target_tokens = tokenizer.convert_ids_to_tokens(targets[:, 0].tolist())
+    assert target_tokens == ["GTAA", "GTAC"]
+    assert positions.shape == (2, 1)
+    assert tokens["input_ids"].shape[0] == 2
+
+
+def test_masked_cett_shapes_and_cleanup():
+    model = FakeDnaBert(hidden=16, intermediate=24, n_layers=3).eval()
+    tokenizer = FakeDnaTokenizer()
+    tokens, positions, _, _ = masked_dna_batch(["ACGTAC", "ACGTAC"], tokenizer, "dnabert", seed=0)
+    layers = [0, 2]
+    norms = dna.precompute_col_norms(model, "dnabert", layers)
+    result = dna.extract_cett_masked(model, tokens, positions, layers, norms, "dnabert")
+
+    assert result["cett"].shape == (2, 2 * 24)
+    assert result["logits"].shape == (2, 11)
+    assert (result["cett"] >= 0).all()
+    for layer in layers:
+        assert len(model.bert.encoder.layer[layer].output.dense._forward_hooks) == 0
+
+
+def test_masked_cett_captures_hidden_states():
+    model = FakeDnaBert(hidden=16, intermediate=24, n_layers=3).eval()
+    tokenizer = FakeDnaTokenizer()
+    tokens, positions, _, _ = masked_dna_batch(["ACGTAC", "ACGTAC"], tokenizer, "dnabert", seed=0)
+    layers = [0, 2]
+    norms = dna.precompute_col_norms(model, "dnabert", layers)
+    result = dna.extract_cett_masked(
+        model, tokens, positions, layers, norms, "dnabert", capture_hidden=True
+    )
+
+    assert len(result["hidden_states"]) == 3
+    assert result["hidden_states"][0].shape == (2, 16)
+
+
+def test_causal_cett_shapes_and_cleanup():
+    model = FakeCarbon(hidden=16, intermediate=24, n_layers=3).eval()
+    tokenizer = FakeKmerTokenizer()
+    tokens, positions, _ = causal_dna_batch(["ACGTACGTAA", "ACGTACGTAC"], tokenizer, "carbon")
+    layers = [0, 2]
+    norms = dna.precompute_col_norms(model, "carbon", layers)
+    result = dna.extract_cett_causal(model, tokens, positions, layers, norms, "carbon")
+
+    assert result["cett"].shape == (2, 2 * 24)
+    assert result["logits"].shape == (2, 128)
+    assert (result["cett"] >= 0).all()
+    for layer in layers:
+        assert len(model.model.layers[layer].mlp.down_proj._forward_hooks) == 0
+
+
+def test_causal_cett_captures_attention():
+    model = FakeCarbon(hidden=16, intermediate=24, n_layers=3).eval()
+    original = model.forward
+
+    def forward(input_ids, attention_mask=None, output_attentions=False):
+        out = original(input_ids, attention_mask)
+        if output_attentions:
+            length = input_ids.shape[1]
+            out.attentions = tuple(torch.ones(1, 2, length, length) for _ in range(3))
+        return out
+
+    model.forward = forward
+    tokenizer = FakeKmerTokenizer()
+    tokens, positions, _ = causal_dna_batch(["ACGTACGTAA"], tokenizer, "carbon")
+    norms = dna.precompute_col_norms(model, "carbon", [0])
+    result = dna.extract_cett_causal(
+        model, tokens, positions, [0], norms, "carbon", capture_attention=True
+    )
+    length = tokens["input_ids"].shape[1]
+    assert len(result["attentions"]) == 3
+    assert result["attentions"][0].shape == (1, 2, length, length)
+
+
+def test_cett_batch_equals_single_rows():
+    model = FakeDnaBert(hidden=8, intermediate=12, n_layers=2).eval()
+    tokenizer = FakeDnaTokenizer()
+    tokens, positions, _, _ = masked_dna_batch(["ACGTAC", "ACGTAC"], tokenizer, "dnabert", seed=4)
+    layers = [0, 1]
+    norms = dna.precompute_col_norms(model, "dnabert", layers)
+    batched = dna.extract_cett_masked(model, tokens, positions, layers, norms, "dnabert")
+
+    for i in range(2):
+        single_tokens = {key: value[i : i + 1] for key, value in tokens.items()}
+        single = dna.extract_cett_masked(
+            model, single_tokens, positions[i : i + 1], layers, norms, "dnabert"
+        )
+        torch.testing.assert_close(batched["cett"][i : i + 1], single["cett"])
+        torch.testing.assert_close(batched["logits"][i : i + 1], single["logits"])
+
+
+def test_score_ref_alt_is_finite():
+    model = FakeDnaBert().eval()
+    tokens = {"input_ids": torch.tensor([[0, 6, 7, 3]])}
+    score = dna.score_ref_alt(model, tokens, tokens, position=1, ref_id=6, alt_id=7)
+    assert isinstance(score, float)
+    assert torch.isfinite(torch.tensor(score))
+
+
+def test_reverse_complement():
+    assert reverse_complement("ACGTN") == "NACGT"
+    assert reverse_complement("AACCGGTT") == "AACCGGTT"

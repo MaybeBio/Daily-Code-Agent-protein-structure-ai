@@ -1,0 +1,294 @@
+import { useEffect, useRef, useState } from "react";
+import { api } from "../api";
+import { Hint } from "../guided/Hint";
+import { FileSelect } from "../presentation/FileSelect";
+import type { Asset } from "../operations/types";
+import type { Language } from "../types";
+import { researchError } from "../presentation/research-content";
+import {
+  PublicLibraryFiles,
+  type PublicLibraryFile,
+} from "./PublicLibraryFiles";
+import {
+  cancelUpload,
+  uploadDataset,
+  type DataKind,
+  type UploadState,
+} from "./upload";
+
+const formats = {
+  library: ".sdf,.csv,.tsv,.smi,.smiles,.sdf.gz,.csv.gz,.tsv.gz",
+  counts: ".csv,.tsv,.csv.gz,.tsv.gz",
+  reads: ".fastq,.fq,.fastq.gz,.fq.gz",
+};
+const sizeLabel = (size: number) =>
+  size >= 1024 ** 3
+    ? `${(size / 1024 ** 3).toFixed(2)} GB`
+    : `${(size / 1024 ** 2).toFixed(1)} MB`;
+export function DatasetPicker({
+  language,
+  kind,
+  value,
+  onChange,
+  label,
+  onResource,
+  sourceMode,
+  onBusyChange,
+}: {
+  language: Language;
+  kind: DataKind;
+  value: Asset | null;
+  onChange(value: Asset | null): void;
+  label: string;
+  onResource?(value: PublicLibraryFile): void;
+  sourceMode?: "new" | "history";
+  onBusyChange?(busy: boolean): void;
+}) {
+  const zh = language === "zh",
+    [history, setHistory] = useState(false),
+    [publicFiles, setPublicFiles] = useState(false),
+    [assets, setAssets] = useState<Asset[]>([]),
+    [file, setFile] = useState<File | null>(null),
+    [state, setState] = useState<UploadState | null>(null),
+    [busy, setBusy] = useState(false),
+    [progress, setProgress] = useState(0),
+    [error, setError] = useState("");
+  const showHistory = sourceMode ? sourceMode === "history" : history,
+    showPublic = !sourceMode && publicFiles;
+  const controller = useRef<AbortController | null>(null),
+    key = useRef(crypto.randomUUID());
+  useEffect(() => () => controller.current?.abort(), []);
+  useEffect(() => onBusyChange?.(busy), [busy, onBusyChange]);
+  useEffect(() => {
+    if (!showHistory) return;
+    const c = new AbortController();
+    void api
+      .assets(c.signal)
+      .then((items) => setAssets(items.filter((asset) => asset.kind === kind)))
+      .catch((e) => {
+        if (!c.signal.aborted) setError(String(e));
+      });
+    return () => c.abort();
+  }, [showHistory, kind]);
+  async function begin(selected: File, resume?: string) {
+    const activeUpload = new AbortController();
+    controller.current = activeUpload;
+    setBusy(true);
+    setError("");
+    onChange(null);
+    try {
+      const asset = await uploadDataset(selected, kind, {
+        signal: activeUpload.signal,
+        key: key.current,
+        resume,
+        onState: setState,
+        onProgress: (done, total) => setProgress(done / total),
+      });
+      activeUpload.signal.throwIfAborted();
+      onChange(asset);
+      setFile(null);
+      setState(null);
+      setProgress(1);
+    } catch (e) {
+      if (!activeUpload.signal.aborted)
+        setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (controller.current === activeUpload) setBusy(false);
+    }
+  }
+  async function discard() {
+    if (state) {
+      try {
+        await cancelUpload(state.id);
+        setState(null);
+        setFile(null);
+        setProgress(0);
+      } catch (e) {
+        setError(String(e));
+      }
+    }
+  }
+  return (
+    <section className="dataset-file-input">
+      <div className="dataset-field-heading">
+        <label>{label}</label>
+        <Hint label={zh ? "文件说明" : "File help"}>
+          {zh
+            ? "大文件分段上传，可暂停后继续；每一段都会核对内容。历史文件是可选项。"
+            : "Large files upload in verified parts and can be paused/resumed. History is optional."}
+        </Hint>
+      </div>
+      {!sourceMode && (
+        <div className="dataset-source-tabs" role="group" aria-label={label}>
+          <button
+            type="button"
+            aria-pressed={!history && !publicFiles}
+            disabled={busy}
+            onClick={() => {
+              setHistory(false);
+              setPublicFiles(false);
+              onChange(null);
+            }}
+          >
+            {zh ? "上传新文件" : "New file"}
+          </button>
+          <button
+            type="button"
+            aria-pressed={history}
+            disabled={busy}
+            onClick={() => {
+              setHistory(true);
+              setPublicFiles(false);
+              onChange(null);
+            }}
+          >
+            {zh ? "历史文件" : "History"}
+          </button>
+          {kind === "library" && (
+            <button
+              type="button"
+              aria-pressed={publicFiles}
+              disabled={busy}
+              onClick={() => {
+                setPublicFiles(true);
+                setHistory(false);
+                onChange(null);
+              }}
+            >
+              {zh ? "公开结构库" : "Public libraries"}
+            </button>
+          )}
+        </div>
+      )}
+      {showPublic ? (
+        <PublicLibraryFiles
+          language={language}
+          onChange={(resource) => {
+            onChange(resource?.asset ?? null);
+            if (resource) onResource?.(resource);
+          }}
+        />
+      ) : showHistory ? (
+        <select
+          aria-label={label}
+          value={value?.id ?? ""}
+          onChange={(e) =>
+            onChange(
+              assets.find((asset) => asset.id === e.target.value) ?? null,
+            )
+          }
+        >
+          <option value="">
+            {zh ? "选择历史文件" : "Choose a historical file"}
+          </option>
+          {assets.map((asset) => (
+            <option key={asset.id} value={asset.id}>
+              {asset.name} · {sizeLabel(asset.size)}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <>
+          {!busy && !state && (
+            <FileSelect
+              language={language}
+              variant="large"
+              title={zh ? "选择研究文件" : "Choose a research file"}
+              description={
+                kind === "counts"
+                  ? zh
+                    ? "CSV · TSV（支持 gzip 压缩）"
+                    : "CSV · TSV · gzip supported"
+                  : kind === "reads"
+                    ? zh
+                      ? "FASTQ（支持 gzip 压缩）"
+                      : "FASTQ · gzip supported"
+                    : zh
+                      ? "SDF · CSV · TSV · SMILES（支持 gzip 压缩）"
+                      : "SDF · CSV · TSV · SMILES · gzip supported"
+              }
+              accept={formats[kind]}
+              aria-label={label}
+              onChange={(e) => {
+                const selected = e.target.files?.[0];
+                if (!selected) return;
+                key.current = crypto.randomUUID();
+                setFile(selected);
+                setProgress(0);
+                void begin(selected);
+              }}
+            />
+          )}
+          {(busy || state) && (
+            <div className="dataset-upload-progress">
+              <strong>{file?.name ?? state?.name}</strong>
+              <progress value={progress} max={1} />
+              <span>
+                {Math.round(progress * 100)}% ·{" "}
+                {busy
+                  ? zh
+                    ? "上传与检查中"
+                    : "Uploading and checking"
+                  : zh
+                    ? "已暂停"
+                    : "Paused"}
+              </span>
+              {busy ? (
+                <button
+                  type="button"
+                  onClick={() => controller.current?.abort()}
+                >
+                  {zh ? "暂停" : "Pause"}
+                </button>
+              ) : (
+                <>
+                  {file ? (
+                    <button
+                      type="button"
+                      onClick={() => void begin(file, state?.id)}
+                    >
+                      {zh ? "继续上传" : "Resume"}
+                    </button>
+                  ) : (
+                    <FileSelect
+                      language={language}
+                      variant="compact"
+                      accept={formats[kind]}
+                      aria-label={
+                        zh
+                          ? "重新选择同一文件继续"
+                          : "Reselect the same file to resume"
+                      }
+                      onChange={(e) => {
+                        const selected = e.target.files?.[0];
+                        if (selected) {
+                          setFile(selected);
+                          void begin(selected, state?.id);
+                        }
+                      }}
+                    />
+                  )}
+                  <button type="button" onClick={() => void discard()}>
+                    {zh ? "重新选择" : "Start over"}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </>
+      )}
+      {value && (
+        <div className="dataset-selected-file">
+          <span>✓</span>
+          <strong>{value.name}</strong>
+          <span>{sizeLabel(value.size)}</span>
+        </div>
+      )}
+      {error && (
+        <p role="alert" className="error-box">
+          {researchError(error, zh)}
+        </p>
+      )}
+    </section>
+  );
+}

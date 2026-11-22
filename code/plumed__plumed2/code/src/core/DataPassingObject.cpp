@@ -1,0 +1,315 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2017-2023 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#include "DataPassingObject.h"
+#include "tools/OpenMP.h"
+#include "tools/Tools.h"
+
+#include <algorithm>
+
+namespace PLMD {
+
+#ifdef _OPENMP
+/// Number of threads used to copy n elements between the arrays of the MD code and PLUMED
+/// (see OpenMP.h: PLUMED is called once per step, often with the threads asleep).
+/// It is called outside the pragmas (and only with OpenMP), so that the call is visible also to static analysis.
+static unsigned getCopyNumThreads( const std::size_t& n ) {
+  return OpenMP::getGoodNumThreads<double>( nullptr, n );
+}
+#endif
+
+template<typename T>
+static void getPointer(const TypesafePtr & p, const std::vector<std::size_t>& shape, const unsigned& start, const unsigned& stride, T*&pp ) {
+  if( shape.size()==1 && stride==1 ) {
+    pp=p.get<T*>( {shape[0]} );
+  } else if( shape.size()==1 ) {
+    auto p_=p.get<T*>( {shape[0],stride} );
+    pp = p_+start;
+  } else if( shape.size()==2 ) {
+    // start and stride are only used for vectors that are interleaved in the same array (e.g. positions)
+    plumed_massert( start==0 && stride==1, "start and stride cannot be used when passing a matrix");
+    pp=p.get<T*>( {shape[0],shape[1]} );
+  } else {
+    plumed_merror("data with rank larger than two cannot be passed between PLUMED and the MD code");
+  }
+}
+
+template <class T>
+class DataPassingObjectTyped : public DataPassingObject {
+private:
+/// A pointer to the value
+  TypesafePtr v;
+/// A pointer to the force
+  TypesafePtr f;
+public:
+/// This convers a number from the MD code into a double
+  double MD2double(const TypesafePtr &) const override ;
+/// This is used when you want to save the passed object to a double variable in PLUMED rather than the pointer
+/// this can be used even when you don't pass a pointer from the MD code
+  void saveValueAsDouble( const TypesafePtr & val ) override;
+/// Set the pointer to the value
+  void setValuePointer( const TypesafePtr & p, const std::vector<std::size_t>& shape, const bool& isconst ) override;
+/// Set the pointer to the force
+  void setForcePointer( const TypesafePtr & p, const std::vector<std::size_t>& shape ) override;
+/// This gets the data in the pointer and passes it to the output value
+  void share_data( std::vector<double>& values ) const override ;
+/// Share the data and put it in the value from sequential data
+  void share_data( const unsigned& j, const unsigned& k, Value* value ) override;
+/// Share the data and put it in the value from a scattered data
+  void share_data( const std::vector<AtomNumber>&index, const std::vector<unsigned>& i, const std::size_t& nlocal, Value* value ) override;
+/// Check if the MD code passed an array to store the forces on this quantity
+  bool hasForcePointer() const override {
+    return static_cast<bool>(f);
+  }
+/// Pass the force from the value to the output value
+  void add_force( Value* vv ) override;
+  void add_force( const std::vector<int>& index, Value* value ) override;
+  void add_force( const std::vector<AtomNumber>& index, const std::vector<unsigned>& i, const std::size_t& nlocal, Value* value ) override;
+/// Rescale the force on the output value
+  void rescale_force( const unsigned& n, const double& factor, Value* value ) override;
+/// This transfers everything to the output
+  void setData( Value* value ) override;
+};
+
+std::unique_ptr<DataPassingObject> DataPassingObject::create(unsigned n) {
+  if(n==sizeof(double)) {
+    return std::make_unique<DataPassingObjectTyped<double>>();
+  } else  if(n==sizeof(float)) {
+    return std::make_unique<DataPassingObjectTyped<float>>();
+  }
+  std::string pp;
+  Tools::convert(n,pp);
+  plumed_merror("cannot create an MD interface with sizeof(real)=="+ pp);
+  return NULL;
+}
+
+template <class T>
+double DataPassingObjectTyped<T>::MD2double(const TypesafePtr & m) const {
+  double d=double(m.template get<T>());
+  return d;
+}
+
+template <class T>
+void DataPassingObjectTyped<T>::saveValueAsDouble( const TypesafePtr & val ) {
+  hasbackup=true;
+  bvalue=double(val.template get<T>());
+}
+
+template <>
+void DataPassingObjectTyped<float>::saveValueAsDouble( const TypesafePtr & val ) {
+  hasbackup=true;
+  bvalue=double(val.template get<float>());
+  // The following is to avoid extra digits in case the MD code uses floats
+  // e.g.: float f=0.002 when converted to double becomes 0.002000000094995
+  // To avoid this, we keep only up to 6 significant digits after first one.
+  // This is done only for quantities that the user writes in base ten, namely the timestep,
+  // because the resulting grid is coarser than the float itself and would discard
+  // information from quantities that the MD code computes, such as the energy.
+  // std::to_chars would express this better, as it writes the shortest decimal that reads
+  // back as the same float, but floating point <charconv> requires GCC 11 or libc++ 14
+  if( roundToBaseTen && bvalue != 0.0 ) {
+    double magnitude=std::pow(10,std::floor(std::log10(std::fabs(bvalue))));
+    bvalue = std::round(bvalue/magnitude*1e6)/1e6*magnitude;
+  }
+}
+
+template <class T>
+void DataPassingObjectTyped<T>::setValuePointer( const TypesafePtr & val, const std::vector<std::size_t>& shape, const bool& isconst ) {
+  if( shape.size()==0 ) {
+    if( isconst ) {
+      val.get<const T*>();
+    } else {
+      val.get<T*>();  // just check type and discard pointer
+    }
+  } else if( shape.size()==1 ) {
+    if( isconst )
+      val.get<const T*>({shape[0]});
+    else
+      val.get<T*>({shape[0]});  // just check type and discard pointer
+  } else if( shape.size()==2 ) {
+    if( isconst )
+      val.get<const T*>({shape[0],shape[1]});
+    else
+      val.get<T*>({shape[0],shape[1]});  // just check type and discard pointer
+  } else {
+    plumed_merror("data with rank larger than two cannot be passed between PLUMED and the MD code");
+  }
+  v=val.copy();
+}
+
+template <class T>
+void DataPassingObjectTyped<T>::setForcePointer( const TypesafePtr & val, const std::vector<std::size_t>& shape ) {
+  if( shape.size()==0 ) {
+    val.get<T*>();  // just check type and discard pointer
+  } else if( shape.size()==1 )
+    val.get<T*>({shape[0]});   // just check type and discard pointer
+  else if( shape.size()==2 )
+    val.get<T*>({shape[0],shape[1]});   // just check type and discard pointer
+  else {
+    plumed_merror("data with rank larger than two cannot be passed between PLUMED and the MD code");
+  }
+  f=val.copy();
+}
+
+template <class T>
+void DataPassingObjectTyped<T>::setData( Value* value ) {
+  if( value->getRank()==0 ) {
+    *v.template get<T*>() = static_cast<T>(value->get()) / unit;
+    return;
+  }
+  T* pp=nullptr;
+  getPointer( v, value->getShape(), start, stride, pp );
+  unsigned nvals=value->getNumberOfValues();
+  for(unsigned i=0; i<nvals; ++i) {
+    pp[i] = T( value->get(i) );
+  }
+}
+
+template <class T>
+void DataPassingObjectTyped<T>::share_data( const unsigned& j, const unsigned& k, Value* value ) {
+  if( value->getRank()==0 ) {
+    if( hasbackup ) {
+      value->set( unit*bvalue );
+    } else {
+      value->set( unit*double(v.template get<T>()) );
+    }
+    return;
+  }
+  std::vector<std::size_t> s(value->getShape());
+  if( s.size()==1 ) {
+    // elements j to k-1 are read, so the array passed by the MD code must contain at least k elements
+    s[0]=k;
+  }
+  const T* pp=nullptr;
+  getPointer( v, s, start, stride, pp );
+  std::vector<double> & d=value->data;
+#ifdef _OPENMP
+  const unsigned nt=getCopyNumThreads(k-j);
+#endif
+  #pragma omp parallel for num_threads(nt)
+  for(unsigned i=j; i<k; ++i) {
+    d[i]=unit*pp[i*stride];
+  }
+}
+
+template <class T>
+void DataPassingObjectTyped<T>::share_data( std::vector<double>& values ) const {
+  std::vector<std::size_t> maxel(1,values.size());
+  const T* pp=nullptr;
+  getPointer( v, maxel, start, stride, pp );
+#ifdef _OPENMP
+  const unsigned nt=getCopyNumThreads(values.size());
+#endif
+  #pragma omp parallel for num_threads(nt)
+  for(unsigned i=0; i<values.size(); ++i) {
+    values[i]=unit*pp[i*stride];
+  }
+}
+
+template <class T>
+void DataPassingObjectTyped<T>::share_data( const std::vector<AtomNumber>&index, const std::vector<unsigned>& i, const std::size_t& nlocal, Value* value ) {
+  plumed_dbg_assert( value->getRank()==1 );
+  plumed_dbg_assert( index.size()==i.size() );
+  plumed_dbg_assert( i.size()==0 || *std::max_element(i.begin(),i.end())<nlocal );
+  // the size of the array passed by the MD code is checked against the number of local atoms
+  std::vector<std::size_t> maxel(1,nlocal);
+  const T* pp=nullptr;
+  getPointer( v, maxel, start, stride, pp );
+  // cannot be parallelized with omp because access to data is not ordered
+  unsigned k=0;
+  for(const auto & p : index) {
+    value->data[p.index()]=unit*pp[i[k]*stride];
+    k++;
+  }
+}
+
+template <class T>
+void DataPassingObjectTyped<T>::add_force( Value* value ) {
+  if( value->getRank()==0 ) {
+    *f.template get<T*>() += funit*static_cast<T>(value->getForce(0));
+    return;
+  }
+  T* pp=nullptr;
+  getPointer( f, value->getShape(), start, stride, pp );
+  unsigned nvals=value->getNumberOfValues();
+#ifdef _OPENMP
+  const unsigned nt=getCopyNumThreads(nvals);
+#endif
+  #pragma omp parallel for num_threads(nt)
+  for(unsigned i=0; i<nvals; ++i) {
+    pp[i*stride] += funit*T(value->getForce(i));
+  }
+}
+
+template <class T>
+void DataPassingObjectTyped<T>::add_force( const std::vector<int>& index, Value* value ) {
+  plumed_assert( value->getRank()==1 );
+  std::vector<std::size_t> s(1,index.size());
+  T* pp=nullptr;
+  getPointer( f, s, start, stride, pp );
+#ifdef _OPENMP
+  const unsigned nt=getCopyNumThreads(index.size());
+#endif
+  #pragma omp parallel for num_threads(nt)
+  for(unsigned i=0; i<index.size(); ++i) {
+    pp[i*stride] += funit*T(value->getForce(index[i]));
+  }
+}
+
+template <class T>
+void DataPassingObjectTyped<T>::add_force( const std::vector<AtomNumber>& index, const std::vector<unsigned>& i, const std::size_t& nlocal, Value* value ) {
+  plumed_dbg_assert( value->getRank()==1 );
+  plumed_dbg_assert( index.size()==i.size() );
+  plumed_dbg_assert( i.size()==0 || *std::max_element(i.begin(),i.end())<nlocal );
+  // the size of the array passed by the MD code is checked against the number of local atoms
+  std::vector<std::size_t> maxel(1,nlocal);
+  T* pp=nullptr;
+  getPointer( f, maxel, start, stride, pp );
+  unsigned k=0;
+  for(const auto & p : index) {
+    pp[stride*i[k]] += funit*T(value->getForce(p.index()));
+    k++;
+  }
+}
+
+template <class T>
+void DataPassingObjectTyped<T>::rescale_force( const unsigned& n, const double& factor, Value* value ) {
+  plumed_assert( value->getRank()>0 );
+  std::vector<std::size_t> s( value->getShape() );
+  if( s.size()==1 ) {
+    s[0] = n;
+  }
+  T* pp=nullptr;
+  getPointer( f, s, start, stride, pp );
+  // The MD code might not pass this buffer on every rank (e.g. the virial)
+  if( !pp ) {
+    return;
+  }
+#ifdef _OPENMP
+  const unsigned nt=getCopyNumThreads(n);
+#endif
+  #pragma omp parallel for num_threads(nt)
+  for(unsigned i=0; i<n; ++i) {
+    pp[i*stride] *= T(factor);
+  }
+}
+
+}

@@ -1,0 +1,106 @@
+//! Minibatch pairing behavior with a distant target outlier.
+//!
+//! One target column is placed far from the source batch. The output reports
+//! whether each pairing strategy selects that column and the maximum pair
+//! distance it creates.
+//!
+//! Run:
+//! ```bash
+//! cargo run -p flowmatch --example rfm_minibatch_outlier_partial
+//! ```
+
+use flowmatch::rfm::apply_pairing;
+use flowmatch::sd_fm::{RfmMinibatchOtConfig, RfmMinibatchPairing};
+use ndarray::Array2;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+use rand_distr::{Distribution, StandardNormal};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let n = 64usize;
+    let d = 8usize;
+    let mut rng = ChaCha8Rng::seed_from_u64(123);
+
+    let mut x = Array2::<f32>::zeros((n, d));
+    let mut y = Array2::<f32>::zeros((n, d));
+    for i in 0..n {
+        for k in 0..d {
+            x[[i, k]] = StandardNormal.sample(&mut rng);
+            y[[i, k]] = StandardNormal.sample(&mut rng);
+        }
+    }
+
+    // Inject a rare outlier in y (very far from everything).
+    for k in 0..d {
+        y[[n - 1, k]] = 100.0;
+    }
+
+    let keep_frac: f32 = std::env::var("FLOWMATCH_PAIRING_PARTIAL_KEEP_FRAC")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.8);
+
+    let sinkhorn_cfg = RfmMinibatchOtConfig {
+        reg: 0.2,
+        max_iter: 2_000,
+        tol: 2e-3,
+        pairing: RfmMinibatchPairing::SinkhornGreedy,
+        pairing_every: 1,
+    };
+
+    let perm_full = apply_pairing(
+        &RfmMinibatchPairing::RowwiseNearest,
+        &x.view(),
+        &y.view(),
+        &sinkhorn_cfg,
+    )?;
+    let perm_part = apply_pairing(
+        &RfmMinibatchPairing::PartialRowwise { keep_frac },
+        &x.view(),
+        &y.view(),
+        &sinkhorn_cfg,
+    )?;
+
+    // Also show Sinkhorn-based variants (slower, but more "RFM-faithful").
+    let perm_sinkhorn = apply_pairing(
+        &RfmMinibatchPairing::SinkhornGreedy,
+        &x.view(),
+        &y.view(),
+        &sinkhorn_cfg,
+    )?;
+    let perm_sinkhorn_sel = apply_pairing(
+        &RfmMinibatchPairing::SinkhornSelective { keep_frac },
+        &x.view(),
+        &y.view(),
+        &sinkhorn_cfg,
+    )?;
+
+    fn summarize(name: &str, x: &Array2<f32>, y: &Array2<f32>, perm: &[usize]) {
+        let n = x.nrows();
+        let d = x.ncols();
+        let mut used_outlier = 0usize;
+        let mut max_d = 0.0f64;
+        for i in 0..n {
+            let j = perm[i];
+            if j == n - 1 {
+                used_outlier += 1;
+            }
+            let mut s = 0.0f64;
+            for k in 0..d {
+                let dk = (x[[i, k]] - y[[j, k]]) as f64;
+                s += dk * dk;
+            }
+            max_d = max_d.max(s.sqrt());
+        }
+        println!("- {name}: used_outlier_col={used_outlier}  max_pair_dist={max_d:.3}");
+    }
+
+    println!("minibatch outlier demo (n={n}, d={d})");
+    println!("- keep_frac={keep_frac}");
+    summarize("rowwise_one_to_one", &x, &y, &perm_full);
+    summarize("partial_rowwise", &x, &y, &perm_part);
+    summarize("sinkhorn_greedy", &x, &y, &perm_sinkhorn);
+    summarize("sinkhorn_selective", &x, &y, &perm_sinkhorn_sel);
+
+    Ok(())
+}

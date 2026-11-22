@@ -1,0 +1,502 @@
+// Accumulation of the destinations of loops that a loop over particles adds.
+//
+// See the description of the pass in Passes.td.
+
+#include "mdir/Dialect/MDExec/Transforms/Passes.h"
+
+#include "mdir/Dialect/MDExec/Algebra.h"
+#include "mdir/Dialect/MDExec/MDExecOps.h"
+#include "mdir/Dialect/MDRT/SegmentRegions.h"
+#include "llvm/ADT/DenseMap.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallVector.h"
+
+using namespace mlir;
+using namespace mdir;
+using namespace mdir::md_exec;
+
+namespace {
+/// A field that a loop over pairs or tuples gives, accumulated from zero.
+struct Term {
+  Operation *loop = nullptr;
+  unsigned out = 0;
+};
+} // namespace
+
+/// Returns the loop and destination that give `field`, if a loop over pairs
+/// or tuples in the value form gives it from a field of zeros, and nothing
+/// else uses it than `user`.
+static std::optional<Term> getTerm(Value field, Operation *user) {
+  auto result = dyn_cast<OpResult>(field);
+  if (!result || !result.hasOneUse() || *result.getUsers().begin() != user)
+    return std::nullopt;
+  Operation *loop = result.getOwner();
+  ValueRange outs;
+  if (auto pair = dyn_cast<PairForOp>(loop)) {
+    if (pair.isStorageForm())
+      return std::nullopt;
+    outs = pair.getOuts();
+  } else if (auto tuple = dyn_cast<TupleForOp>(loop)) {
+    if (tuple.isStorageForm())
+      return std::nullopt;
+    outs = tuple.getOuts();
+  } else if (auto segments = dyn_cast<SegmentForOp>(loop)) {
+    if (segments.isStorageForm())
+      return std::nullopt;
+    outs = segments.getOuts();
+  } else {
+    return std::nullopt;
+  }
+  unsigned index = result.getResultNumber();
+  if (index >= outs.size() || !outs[index].getDefiningOp<ZerosOp>() ||
+      loop->getBlock() != user->getBlock())
+    return std::nullopt;
+  return Term{loop, index};
+}
+
+/// The destinations of `loop`, which can be set.
+static MutableOperandRange getOutsMutable(Operation *loop) {
+  if (auto pair = dyn_cast<PairForOp>(loop))
+    return pair.getOutsMutable();
+  if (auto segments = dyn_cast<SegmentForOp>(loop))
+    return segments.getOutsMutable();
+  return cast<TupleForOp>(loop).getOutsMutable();
+}
+
+namespace {
+/// A chain of sums ((a0 + a1) + a2) + ... in the kernel of a loop over
+/// particles, each sum used by the next alone: the arguments of the kernel
+/// that it adds, in order, and the sums, `sums[k]` adding argument k + 1.
+struct Chain {
+  SmallVector<unsigned> arguments;
+  SmallVector<arith::AddFOp> sums;
+};
+} // namespace
+
+/// The chains of sums of the kernel of `op`, from the first.
+static SmallVector<Chain> getChains(ParticleForOp op) {
+  Block &kernel = op.getKernel().front();
+  auto argumentIndex = [&](Value value) -> int {
+    auto argument = dyn_cast<BlockArgument>(value);
+    return argument && argument.getOwner() == &kernel
+               ? static_cast<int>(argument.getArgNumber())
+               : -1;
+  };
+  SmallVector<Chain> chains;
+  for (Operation &start : kernel.without_terminator()) {
+    auto first = dyn_cast<arith::AddFOp>(start);
+    if (!first || argumentIndex(first.getLhs()) < 0 ||
+        argumentIndex(first.getRhs()) < 0)
+      continue;
+    Chain chain;
+    chain.arguments = {static_cast<unsigned>(argumentIndex(first.getLhs())),
+                       static_cast<unsigned>(argumentIndex(first.getRhs()))};
+    chain.sums = {first};
+    while (chain.sums.back()->hasOneUse()) {
+      auto next =
+          dyn_cast<arith::AddFOp>(*chain.sums.back()->getUsers().begin());
+      if (!next || next.getLhs() != chain.sums.back().getResult() ||
+          argumentIndex(next.getRhs()) < 0)
+        break;
+      chain.arguments.push_back(argumentIndex(next.getRhs()));
+      chain.sums.push_back(next);
+    }
+    chains.push_back(std::move(chain));
+  }
+  return chains;
+}
+
+/// Replaces `loop` with a loop whose destination `into` holds the sum of
+/// its destinations `into` and `from`, and that has no destination `from`:
+/// the kernel yields the sum of the two contributions of each member.
+/// `from` must have no use.
+static void mergeOuts(TupleForOp loop, unsigned into, unsigned from) {
+  OpBuilder builder(loop);
+  Location loc = loop.getLoc();
+  int64_t arity = loop.getArity();
+  unsigned numOuts = loop.getOuts().size();
+
+  SmallVector<Value> outs(loop.getOuts().begin(), loop.getOuts().end());
+  Value dropped = outs[from];
+  outs.erase(outs.begin() + from);
+  SmallVector<Type> resultTypes;
+  for (Value value : llvm::concat<Value>(outs, loop.getReduce()))
+    resultTypes.push_back(value.getType());
+  auto merged = TupleForOp::create(
+      builder, loc, resultTypes, loop.getIncidence(), loop.getPositions(),
+      loop.getCell(), loop.getIns(), loop.getParameters(), outs,
+      loop.getReduce(), /*scratch=*/ValueRange(), loop.getCoordinateKindsAttr(),
+      loop.getCoordinateMembersAttr(), loop.getArityAttr(),
+      /*overwrite=*/DenseBoolArrayAttr(), loop.getDisjointAttr(),
+      // Chosen later, for the loop as it is then (md-exec-choose-scatter).
+      /*scatter=*/ScatterAttr());
+  merged.getKernel().takeBody(loop.getKernel());
+
+  // Each member takes the sum of its two contributions, in the destination
+  // `into`.
+  auto yield = cast<YieldOp>(merged.getKernel().front().getTerminator());
+  OpBuilder kernel(yield);
+  SmallVector<Value> values(yield->getOperands());
+  SmallVector<Value> yielded;
+  for (unsigned out = 0; out != numOuts; ++out) {
+    if (out == from)
+      continue;
+    for (int64_t member = 0; member != arity; ++member) {
+      Value value = values[out * arity + member];
+      if (out == into)
+        value = arith::AddFOp::create(kernel, loc, value,
+                                      values[from * arity + member]);
+      yielded.push_back(value);
+    }
+  }
+  yielded.append(values.begin() + numOuts * arity, values.end());
+  yield->setOperands(yielded);
+
+  for (unsigned i = 0, e = loop->getNumResults(); i != e; ++i) {
+    if (i == from)
+      continue;
+    loop->getResult(i).replaceAllUsesWith(
+        merged->getResult(i < from ? i : i - 1));
+  }
+  loop->erase();
+  if (Operation *zeros = dropped.getDefiningOp(); zeros && zeros->use_empty())
+    zeros->erase();
+}
+
+/// Replaces the loop over pairs `loop` with one whose destination `into`
+/// holds the sum of its destinations `into` and `from`, which have the same
+/// contract of exchange, and that has no destination `from`: the kernel
+/// yields the sum of the two contributions of each pair (D157). `from`
+/// must have no use.
+static void mergeOuts(PairForOp loop, unsigned into, unsigned from) {
+  OpBuilder builder(loop);
+  Location loc = loop.getLoc();
+  unsigned numOuts = loop.getOuts().size();
+
+  SmallVector<Value> outs(loop.getOuts().begin(), loop.getOuts().end());
+  Value dropped = outs[from];
+  outs.erase(outs.begin() + from);
+  SmallVector<Type> resultTypes;
+  for (Value value : llvm::concat<Value>(outs, loop.getReduce()))
+    resultTypes.push_back(value.getType());
+  ArrayAttr exchange;
+  if (loop.getExchange()) {
+    SmallVector<Attribute> kinds(loop.getExchange()->begin(),
+                                 loop.getExchange()->end());
+    kinds.erase(kinds.begin() + from);
+    exchange = builder.getArrayAttr(kinds);
+  }
+  auto merged = PairForOp::create(
+      builder, loc, resultTypes, loop.getNeighbors(), loop.getPositions(),
+      loop.getCell(), loop.getIns(), outs, loop.getReduce(),
+      /*scratch=*/ValueRange(), loop.getCutoffAttr(), loop.getWeightsAttr(),
+      /*overwrite=*/DenseBoolArrayAttr(), loop.getTraversalAttr(),
+      loop.getConflictAttr(), exchange, loop.getCenters(),
+      loop.getCenterSet(), loop.getGhostFreeAttr(),
+      loop.getImagesAttr(),
+      // Chosen later, for the loop as it is then (md-exec-choose-scatter).
+      /*scatter=*/ScatterAttr(),
+      /*hostLanes=*/IntegerAttr());
+  merged.getKernel().takeBody(loop.getKernel());
+
+  auto yield = cast<YieldOp>(merged.getKernel().front().getTerminator());
+  OpBuilder kernel(yield);
+  SmallVector<Value> values(yield->getOperands());
+  SmallVector<Value> yielded;
+  for (unsigned out = 0; out != numOuts; ++out) {
+    if (out == from)
+      continue;
+    Value value = values[out];
+    if (out == into)
+      value = arith::AddFOp::create(kernel, loc, value, values[from]);
+    yielded.push_back(value);
+  }
+  yielded.append(values.begin() + numOuts, values.end());
+  yield->setOperands(yielded);
+
+  for (unsigned i = 0, e = loop->getNumResults(); i != e; ++i) {
+    if (i == from)
+      continue;
+    loop->getResult(i).replaceAllUsesWith(
+        merged->getResult(i < from ? i : i - 1));
+  }
+  loop->erase();
+  if (Operation *zeros = dropped.getDefiningOp(); zeros && zeros->use_empty())
+    zeros->erase();
+}
+
+/// The same for a loop over a list of units (D417): each site
+/// pair that yields to `from` yields to `into` instead, and one that yields
+/// to both yields their sum.
+static void mergeOuts(SegmentForOp loop, unsigned into, unsigned from) {
+  OpBuilder builder(loop);
+  Location loc = loop.getLoc();
+  MLIRContext *context = loop.getContext();
+  SmallVector<Value> outs(loop.getOuts().begin(), loop.getOuts().end());
+  Value dropped = outs[from];
+  outs.erase(outs.begin() + from);
+  SmallVector<Type> resultTypes;
+  for (Value value : llvm::concat<Value>(outs, loop.getReduce()))
+    resultTypes.push_back(value.getType());
+  SmallVector<Attribute> exchange(loop.getExchange()->begin(),
+                                  loop.getExchange()->end());
+  exchange.erase(exchange.begin() + from);
+  auto renumber = [&](unsigned value) {
+    if (value == from)
+      return into < from ? into : into - 1;
+    return value > from ? value - 1 : value;
+  };
+  SmallVector<Attribute> tables;
+  for (unsigned index = 0, e = loop.getKernels().size(); index != e; ++index) {
+    SmallVector<mdrt::SitePair> pairs =
+        mdrt::getSitePairs(loop.getSites(), index);
+    for (mdrt::SitePair &pair : pairs) {
+      SmallVector<unsigned, 4> values;
+      for (unsigned value : pair.values)
+        if (!llvm::is_contained(values, renumber(value)))
+          values.push_back(renumber(value));
+      llvm::sort(values);
+      pair.values = values;
+    }
+    tables.push_back(mdrt::getSitesAttr(context, pairs));
+  }
+  auto merged = SegmentForOp::create(
+      builder, loc, resultTypes, loop.getList(), loop.getPositions(),
+      loop.getCell(), loop.getIns(), outs, loop.getReduce(),
+      /*scratch=*/ValueRange(), loop.getCutoffAttr(), loop.getWeightsAttr(),
+      builder.getArrayAttr(exchange), /*overwrite=*/DenseBoolArrayAttr(),
+      loop.getSegmentsAttr(), builder.getArrayAttr(tables),
+      loop.getKernels().size());
+  algebra::carry(loop, merged);
+  if (auto algebras = algebra::getAlgebras(loop)) {
+    algebras->erase(algebras->begin() + from);
+    algebra::setAlgebras(merged, *algebras);
+  }
+  for (unsigned index = 0, e = loop.getKernels().size(); index != e; ++index) {
+    SmallVector<mdrt::SitePair> pairs =
+        mdrt::getSitePairs(loop.getSites(), index);
+    Region &region = merged.getKernels()[index];
+    region.takeBody(loop.getKernels()[index]);
+    Operation *terminator = region.front().getTerminator();
+    OpBuilder end(terminator);
+    SmallVector<Value> yielded;
+    unsigned operand = 0;
+    for (const mdrt::SitePair &pair : pairs) {
+      llvm::DenseMap<unsigned, Value> byValue;
+      SmallVector<unsigned> order;
+      for (unsigned value : pair.values) {
+        Value contribution = terminator->getOperand(operand++);
+        unsigned target = renumber(value);
+        auto [found, inserted] = byValue.try_emplace(target, contribution);
+        if (inserted) {
+          order.push_back(target);
+          continue;
+        }
+        // `into` first, then `from`.
+        Value lhs = value == from ? found->second : contribution;
+        Value rhs = value == from ? contribution : found->second;
+        found->second = arith::AddFOp::create(end, loc, lhs, rhs);
+      }
+      llvm::sort(order);
+      for (unsigned target : order)
+        yielded.push_back(byValue.lookup(target));
+    }
+    YieldOp::create(end, terminator->getLoc(), yielded);
+    terminator->erase();
+  }
+  unsigned numOuts = loop.getOuts().size();
+  for (unsigned i = 0, e = loop.getNumResults(); i != e; ++i) {
+    if (i == from)
+      continue;
+    unsigned target = i < numOuts && i > from ? i - 1 : (i >= numOuts ? i - 1 : i);
+    loop.getResult(i).replaceAllUsesWith(merged.getResult(target));
+  }
+  loop->erase();
+  if (Operation *zeros = dropped.getDefiningOp())
+    if (zeros->use_empty())
+      zeros->erase();
+}
+
+/// Merges two destinations of one loop over tuples that a chain of sums of
+/// `op` adds one after the other, as the forces of the sums over the
+/// centers of groups that one loop gives (D139): the loop gives their sum
+/// in one destination, and the chain adds it once. A loop with one
+/// destination less writes one field less, and may then accumulate onto
+/// another (accumulateOnce). Returns true if it merged two.
+static bool mergeOnce(ParticleForOp op) {
+  Block &kernel = op.getKernel().front();
+  for (Chain &chain : getChains(op)) {
+    for (unsigned k = 1, e = chain.arguments.size(); k != e; ++k) {
+      unsigned before = chain.arguments[k - 1], after = chain.arguments[k];
+      if (!kernel.getArgument(before).hasOneUse() ||
+          !kernel.getArgument(after).hasOneUse())
+        continue;
+      std::optional<Term> a = getTerm(op.getIns()[before], op);
+      std::optional<Term> b = getTerm(op.getIns()[after], op);
+      if (!a || !b || a->loop != b->loop)
+        continue;
+      // Two destinations of a loop over pairs merge when the pair gives
+      // them by the same contract, as the forces of two terms over the
+      // pairs of one neighborhood do (D157).
+      auto pair = dyn_cast<PairForOp>(a->loop);
+      if (pair && (pair.getOverwrite() ||
+                   pair.getExchange(a->out) != pair.getExchange(b->out)))
+        continue;
+      auto segments = dyn_cast<SegmentForOp>(a->loop);
+      if (segments && (segments.getOverwrite() ||
+                       segments.getExchange(a->out) !=
+                           segments.getExchange(b->out)))
+        continue;
+      // The chain adds argument `after` no longer.
+      arith::AddFOp sum = chain.sums[k - 1];
+      sum.getResult().replaceAllUsesWith(sum.getLhs());
+      sum->erase();
+      op.getInsMutable().erase(after);
+      kernel.eraseArgument(after);
+      if (pair)
+        mergeOuts(pair, a->out, b->out);
+      else if (segments)
+        mergeOuts(segments, a->out, b->out);
+      else
+        mergeOuts(cast<TupleForOp>(a->loop), a->out, b->out);
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Moves `loop` down to follow `after`, which comes later in its block,
+/// with the ops between the two that use a result of `loop`, directly or
+/// through one another, if those are pure ops without regions and `after`
+/// uses none of them (the sums of the energies and of the virials of the
+/// terms, which read the sums of `loop`). Returns true if it moved them.
+///
+/// A loop that gives the energy of a term with its forces stands where the
+/// energy is computed (md-exec-fuse-loops), before the forces of a term
+/// whose forces need a number computed from its sums (a term over the
+/// centers of groups, D139), though the sum of the forces adds it after
+/// that term; in a step without energies the loops stand in the order of
+/// the sum.
+static bool sinkAfter(Operation *loop, Operation *after) {
+  llvm::SetVector<Operation *> dependent;
+  dependent.insert(loop);
+  for (Operation *between = loop->getNextNode(); between != after;
+       between = between->getNextNode()) {
+    bool depends = false;
+    between->walk([&](Operation *nested) {
+      for (Value operand : nested->getOperands())
+        if (Operation *definition = operand.getDefiningOp())
+          depends |= dependent.contains(definition);
+    });
+    if (!depends)
+      continue;
+    if (!isPure(between) || between->getNumRegions() != 0)
+      return false;
+    dependent.insert(between);
+  }
+  bool used = false;
+  after->walk([&](Operation *nested) {
+    for (Value operand : nested->getOperands())
+      if (Operation *definition = operand.getDefiningOp())
+        used |= dependent.contains(definition);
+  });
+  if (used)
+    return false;
+  for (Operation *moved : llvm::reverse(dependent.getArrayRef()))
+    moved->moveAfter(after);
+  return true;
+}
+
+/// Rewrites the first chain of sums in the kernel of `op` that it can.
+/// Returns true if it did.
+static bool accumulateOnce(ParticleForOp op) {
+  Block &kernel = op.getKernel().front();
+  for (Chain &chain : getChains(op)) {
+    ArrayRef<unsigned> arguments = chain.arguments;
+    ArrayRef<arith::AddFOp> sums = chain.sums;
+    // The prefix whose fields are terms of loops in the order of the chain.
+    // A loop that stands before the loop of the term before it moves down
+    // to follow it where it can (sinkAfter), so that the terms are added
+    // in the order of the chain, each onto the last, wherever the loops
+    // stand: the sum of the forces is then the same, to the bit, in a step
+    // that computes energies and in one that does not (#240).
+    SmallVector<Term> terms;
+    for (unsigned index : arguments) {
+      if (!kernel.getArgument(index).hasOneUse())
+        break;
+      std::optional<Term> term = getTerm(op.getIns()[index], op);
+      if (!term)
+        break;
+      if (!terms.empty() && !terms.back().loop->isBeforeInBlock(term->loop)) {
+        // Two destinations of one loop that did not merge stay apart.
+        bool same = llvm::any_of(
+            terms, [&](const Term &other) { return other.loop == term->loop; });
+        if (same || !sinkAfter(term->loop, terms.back().loop))
+          break;
+      }
+      terms.push_back(*term);
+    }
+    if (terms.size() < 2)
+      continue;
+
+    // Each loop accumulates onto what the loop before it gave.
+    for (unsigned k = 1; k != terms.size(); ++k) {
+      Value previous = terms[k - 1].loop->getResult(terms[k - 1].out);
+      MutableOperandRange outs = getOutsMutable(terms[k].loop);
+      Operation *zeros = outs[terms[k].out].get().getDefiningOp();
+      outs[terms[k].out].set(previous);
+      if (zeros->use_empty())
+        zeros->erase();
+    }
+    // The loop over particles reads the last, in place of the sums.
+    unsigned kept = arguments[0];
+    Value last = terms.back().loop->getResult(terms.back().out);
+    arith::AddFOp through = sums[terms.size() - 2];
+    through.getResult().replaceAllUsesWith(kernel.getArgument(kept));
+    for (int k = static_cast<int>(terms.size()) - 2; k >= 0; --k)
+      sums[k]->erase();
+    op.getInsMutable()[kept].set(last);
+    SmallVector<unsigned> dropped(arguments.begin() + 1,
+                                  arguments.begin() + terms.size());
+    llvm::sort(dropped, std::greater<unsigned>());
+    for (unsigned index : dropped) {
+      op.getInsMutable().erase(index);
+      kernel.eraseArgument(index);
+    }
+    return true;
+  }
+  return false;
+}
+
+namespace mdir {
+namespace md_exec {
+
+#define GEN_PASS_DEF_ACCUMULATEDESTINATIONS
+#include "mdir/Dialect/MDExec/Transforms/Passes.h.inc"
+
+namespace {
+class AccumulateDestinations
+    : public impl::AccumulateDestinationsBase<AccumulateDestinations> {
+public:
+  using impl::AccumulateDestinationsBase<
+      AccumulateDestinations>::AccumulateDestinationsBase;
+
+  void runOnOperation() final {
+    SmallVector<ParticleForOp> loops;
+    getOperation()->walk([&](ParticleForOp op) {
+      if (!op.isStorageForm())
+        loops.push_back(op);
+    });
+    for (ParticleForOp op : loops) {
+      while (mergeOnce(op)) {
+      }
+      while (accumulateOnce(op)) {
+      }
+    }
+  }
+};
+} // namespace
+
+} // namespace md_exec
+} // namespace mdir

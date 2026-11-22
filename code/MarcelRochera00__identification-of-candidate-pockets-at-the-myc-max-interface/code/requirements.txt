@@ -1,0 +1,9 @@
+MDAnalysis==2.10
+numpy==1.26.4
+matplotlib==3.7.3
+seaborn==0.11.2
+pandas==1.5.3
+scipy==1.14.1
+GridDataFormats==1.1.0
+
+# Note: gmx_MMPBSA (v1.6.4.35), fpocket 4.2.3, VMD 2.0, and ChimeraX 1.12 must be installed separately.

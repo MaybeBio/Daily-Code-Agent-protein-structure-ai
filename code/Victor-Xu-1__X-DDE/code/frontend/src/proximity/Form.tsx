@@ -1,0 +1,156 @@
+import { useState } from "react";
+import { useExampleTask } from "../examples/context";
+import {
+  defaultExecution,
+  validExecution,
+  type TernaryExecution,
+} from "./execution";
+import { Questionnaire } from "../guided/Questionnaire";
+import { useTaskSubmit } from "../operations/useTaskSubmit";
+import { useTaskReadiness } from "../guided/useTaskReadiness";
+import { PartnerQuestion } from "./PartnerQuestion";
+import { useProximityDraft } from "./useProximityDraft";
+import { InitialMaterials } from "./InitialMaterials";
+import { ProximityPlan } from "./Plan";
+import { partnerRoles } from "./types";
+import type { Job, Language } from "../types";
+import { TernaryJobReview } from "./FormReview";
+import "./proximity.css";
+
+export function ProximityForm({
+  language,
+  onCreated,
+}: {
+  language: Language;
+  onCreated(job: Job): void;
+}) {
+  const example = useExampleTask("ternary_model");
+  const [name, setName] = useState(example?.name ?? "");
+  const validName =
+    Array.from(name).length <= 80 && !/[\u0000-\u001f\u007f]/.test(name);
+  const [execution, setExecution] = useState<TernaryExecution>(() => ({
+    ...(example?.options ?? defaultExecution),
+  }));
+  const zh = language === "zh",
+    draft = useProximityDraft(language);
+  const {
+    ligand,
+    first,
+    second,
+    armA,
+    armB,
+    firstReady,
+    secondReady,
+    planReady,
+    payload,
+    setPayload,
+    onLigand,
+  } = draft;
+  const roles = partnerRoles(payload.mechanism, zh);
+  const run = useTaskSubmit(onCreated),
+    readiness = useTaskReadiness("deepternary.model");
+  const unavailable = zh
+    ? "请在安装与组件中配置三元建模环境。"
+    : "Configure the ternary-modeling environment in Components.";
+  return (
+    <Questionnaire
+      language={language}
+      busy={run.busy}
+      ready={readiness.ready}
+      onCheckEnvironment={readiness.recheck}
+      error={run.error || readiness.error}
+      unavailable={unavailable}
+      submitLabel={zh ? "预览任务" : "Preview job"}
+      renderReview={({ confirm, dismiss }) => (
+        <TernaryJobReview
+          input={{
+            language,
+            name,
+            ligand,
+            first,
+            second,
+            armA,
+            armB,
+            payload,
+            execution,
+          }}
+          language={language}
+          ready={readiness.ready}
+          unavailable={unavailable}
+          recheck={readiness.recheck}
+          busy={run.busy}
+          error={run.error || readiness.error}
+          confirm={confirm}
+          onClose={dismiss}
+          submit={run.submit}
+        />
+      )}
+      steps={[
+        {
+          title: zh ? "选择分子与目标" : "Choose molecule and mechanism",
+          valid: Boolean(ligand),
+          content: (
+            <InitialMaterials
+              payload={payload}
+              setPayload={setPayload}
+              ligand={ligand}
+              setLigand={onLigand}
+              language={language}
+            />
+          ),
+        },
+        {
+          title: roles[0],
+          valid: firstReady && Boolean(payload.partner_a_name.trim()),
+          content: (
+            <PartnerQuestion side="a" draft={draft} language={language} />
+          ),
+        },
+        {
+          title: roles[1],
+          valid: secondReady && Boolean(payload.partner_b_name.trim()),
+          content: (
+            <PartnerQuestion side="b" draft={draft} language={language} />
+          ),
+        },
+        {
+          title: zh ? "确认探索方案" : "Review exploration",
+          valid:
+            Boolean(ligand) &&
+            firstReady &&
+            secondReady &&
+            planReady &&
+            validName &&
+            validExecution(execution),
+          content: (
+            <>
+              <label className="field">
+                {zh ? "任务名称（可选）" : "Task name (optional)"}
+                <input
+                  value={name}
+                  maxLength={80}
+                  aria-invalid={!validName}
+                  onChange={(event) => setName(event.target.value)}
+                />
+              </label>
+              {!validName && (
+                <p role="alert">
+                  {zh
+                    ? "任务名称最多 80 个字符，且不能包含控制字符。"
+                    : "Use at most 80 characters without control characters."}
+                </p>
+              )}
+              <ProximityPlan
+                execution={execution}
+                setExecution={setExecution}
+                payload={payload}
+                setPayload={setPayload}
+                language={language}
+              />
+            </>
+          ),
+        },
+      ]}
+    />
+  );
+}

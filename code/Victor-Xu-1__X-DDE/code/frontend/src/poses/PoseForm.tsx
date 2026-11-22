@@ -1,0 +1,342 @@
+import { useEffect, useRef, useState } from "react";
+import { api } from "../api";
+import { Hint } from "../guided/Hint";
+import { GuidedSteps } from "../guided/Questionnaire";
+import { JsonEditor } from "../operations/ScientificInputs";
+import type { StateSet } from "../chemistry/types";
+import type { SiteSet } from "../sites/types";
+import { siteChoices } from "../sites/site-labels";
+import type { Language } from "../types";
+import { defaults } from "./generated";
+import { LigandChoice } from "./LigandChoice";
+import type {
+  Exploration,
+  ExplorationInput,
+  LigandSelection,
+  Options,
+} from "./types";
+export function PoseForm({
+  sites,
+  states,
+  language,
+  onSaved,
+  initial,
+}: {
+  sites: SiteSet;
+  states: StateSet[];
+  language: Language;
+  onSaved(v: Exploration): void;
+  initial?: ExplorationInput;
+}) {
+  const zh = language === "zh";
+  const [ids, setIds] = useState<string[]>(initial?.site_ids ?? []),
+    [ligands, setLigands] = useState<
+      { key: number; value: LigandSelection | null }[]
+    >(
+      initial
+        ? initial.ligands.map((value, key) => ({ key, value }))
+        : [{ key: 0, value: null }],
+    ),
+    [name, setName] = useState(initial?.name ?? ""),
+    [choice, setChoice] = useState(initial ? "case" : "quick"),
+    [expert, setExpert] = useState(false),
+    [raw, setRaw] = useState<Record<string, unknown>>({
+      ...(initial?.options ?? defaults),
+    }),
+    [busy, setBusy] = useState(false),
+    [error, setError] = useState("");
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const serial = useRef(initial?.ligands.length ?? 1),
+    intent = useRef({ body: "", key: crypto.randomUUID() });
+  function options(kind = choice): Options {
+    if (kind === "case" && initial) return structuredClone(initial.options);
+    return {
+      ...defaults,
+      docking: {
+        ...defaults.docking,
+        exhaustiveness: kind === "quick" ? 4 : 8,
+        num_modes: kind === "quick" ? 5 : 9,
+      },
+      seed_count: kind === "multi" ? 3 : 1,
+      max_jobs: kind === "multi" ? 30 : 12,
+      wall_seconds: kind === "multi" ? 28800 : 14400,
+    };
+  }
+  const combinations =
+    ids.length *
+    ligands.length *
+    (expert ? Number(raw.seed_count ?? 1) : options().seed_count);
+  async function submit() {
+    setError("");
+    if (ligands.some((l) => !l.value)) {
+      setError(
+        zh
+          ? "请选择并保存每个分子的具体版本。"
+          : "Select a saved exact version for every ligand.",
+      );
+      return;
+    }
+    const body = {
+      name:
+        name.trim() ||
+        (zh ? "多假设结合姿势探索" : "Multi-hypothesis pose exploration"),
+      site_set_id: sites.id,
+      site_ids: ids,
+      ligands: ligands.map((l) => l.value),
+      options: expert ? raw : options(),
+    };
+    const encoded = JSON.stringify(body);
+    if (intent.current.body !== encoded)
+      intent.current = { body: encoded, key: crypto.randomUUID() };
+    setBusy(true);
+    try {
+      const saved = await api.post<Exploration>(
+        "/research/pose-explorations",
+        body,
+        intent.current.key,
+      );
+      if (mounted.current) {
+        onSaved(saved);
+        return saved;
+      }
+    } catch (e) {
+      if (mounted.current) setError(String(e));
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  }
+  const sitesQuestion = (
+    <>
+      {" "}
+      <div
+        className="pose-site-choices"
+        role="group"
+        aria-label={zh ? "探索哪些位点？" : "Which sites should be explored?"}
+      >
+        {siteChoices(sites, language).map((s) => (
+          <label key={s.id}>
+            <input
+              type="checkbox"
+              checked={ids.includes(s.id)}
+              disabled={!ids.includes(s.id) && ids.length >= 12}
+              onChange={(e) =>
+                setIds((v) =>
+                  e.target.checked
+                    ? [...v, s.id]
+                    : v.filter((id) => id !== s.id),
+                )
+              }
+            />
+            {s.label}
+            {s.limited
+              ? " · " +
+                (zh ? "跨构象对应不足" : "Limited cross-conformation mapping")
+              : ""}
+          </label>
+        ))}
+      </div>
+    </>
+  );
+  const ligandsQuestion = (
+    <>
+      {" "}
+      {ligands.map((l, i) => (
+        <div key={l.key}>
+          <LigandChoice
+            index={i}
+            value={l.value}
+            states={states}
+            language={language}
+            onChange={(v) =>
+              setLigands((old) =>
+                old.map((row) =>
+                  row.key === l.key ? { ...row, value: v } : row,
+                ),
+              )
+            }
+          />
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={ligands.length < 2}
+            onClick={() =>
+              setLigands((v) => v.filter((row) => row.key !== l.key))
+            }
+          >
+            {zh ? "移除此探索分子" : "Remove this ligand"}
+          </button>
+        </div>
+      ))}
+      <button
+        className="secondary-button"
+        type="button"
+        disabled={ligands.length >= 12}
+        onClick={() =>
+          setLigands((v) => [...v, { key: serial.current++, value: null }])
+        }
+      >
+        {zh ? "增加分子或构象" : "Add ligand or conformer"}
+      </button>
+    </>
+  );
+  const settings = (
+    <>
+      {" "}
+      <label className="field">
+        {zh ? "探索深度" : "Exploration depth"}
+        <select
+          value={choice}
+          onChange={(e) => {
+            setChoice(e.target.value);
+            setRaw(options(e.target.value));
+          }}
+        >
+          {initial && (
+            <option value="case">
+              {zh ? "复用真实案例方案" : "Reuse the real case settings"}
+            </option>
+          )}
+          <option value="quick">
+            {zh ? "先做小规模探索" : "Small initial exploration"}
+          </option>
+          <option value="standard">
+            {zh ? "常规多姿势探索" : "Standard multi-pose exploration"}
+          </option>
+          <option value="multi">
+            {zh ? "三个随机初始化" : "Three random initializations"}
+          </option>
+        </select>
+      </label>
+      <p className="field-help">
+        {zh ? "组合任务数" : "Combination tasks"}: {combinations}
+        <Hint label={zh ? "任务预算说明" : "Task budget help"}>
+          {zh
+            ? "位点数 × 分子/构象数 × 初始化次数。每个组合保留多个姿势；20 Å 是可调搜索框，不是测得的口袋体积。"
+            : "Sites × ligands/conformers × initializations. Each combination retains multiple poses; 20 Å is an editable search box, not measured pocket volume."}
+        </Hint>
+      </p>
+      <button
+        className="secondary-button"
+        type="button"
+        aria-pressed={expert}
+        onClick={() => {
+          if (!expert) setRaw(options());
+          setExpert(!expert);
+        }}
+      >
+        {expert
+          ? zh
+            ? "返回选择模式"
+            : "Return to guided choices"
+          : zh
+            ? "专家完整参数"
+            : "Expert parameters"}
+      </button>
+      {expert && (
+        <JsonEditor
+          value={raw}
+          onChange={setRaw}
+          label={
+            zh
+              ? "完整探索参数（服务端校验）"
+              : "Complete exploration parameters (server validated)"
+          }
+        />
+      )}
+      <label className="field">
+        {zh ? "探索名称（可选）" : "Exploration name (optional)"}
+        <input
+          maxLength={120}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
+      </label>
+      {(!Number.isFinite(combinations) || combinations > 30) && (
+        <p role="alert">
+          {zh
+            ? "组合超过30个任务的上限。请减少位点、分子或初始化次数。"
+            : "The combination exceeds the 30-task limit. Reduce sites, ligands or initializations."}
+        </p>
+      )}
+    </>
+  );
+  const selectionValid = ligands.every((l) => Boolean(l.value));
+  const budgetValid =
+    Number.isFinite(combinations) &&
+    combinations > 0 &&
+    combinations <= 30 &&
+    combinations <= Number(expert ? raw.max_jobs : options().max_jobs);
+  const review = (
+    <dl className="questionnaire-review">
+      <dt>{zh ? "位点" : "Sites"}</dt>
+      <dd>{ids.length}</dd>
+      <dt>{zh ? "分子或构象" : "Ligands or conformers"}</dt>
+      <dd>{ligands.length}</dd>
+      <dt>{zh ? "组合任务" : "Combination tasks"}</dt>
+      <dd>{combinations}</dd>
+      <dt>{zh ? "此步操作" : "This action"}</dt>
+      <dd>
+        {zh
+          ? "保存计划；之后审阅并启动计算"
+          : "Save the plan; review and launch computation afterward"}
+      </dd>
+    </dl>
+  );
+  return (
+    <GuidedSteps<Exploration>
+      language={language}
+      busy={busy}
+      error={error}
+      ready={true}
+      submitLabel={
+        zh ? "保存并审阅探索计划" : "Save and review exploration plan"
+      }
+      resultTitle={zh ? "查看计划" : "View plan"}
+      onSubmit={submit}
+      renderResult={(saved) => (
+        <section>
+          <p role="status">
+            {zh
+              ? "探索计划已保存，尚未开始计算。"
+              : "Exploration plan saved; computation has not started."}
+          </p>
+          <button
+            type="button"
+            className="primary-button"
+            onClick={() => onSaved(saved)}
+          >
+            {zh ? "打开已保存计划" : "Open saved plan"}
+          </button>
+        </section>
+      )}
+      steps={[
+        {
+          title: zh ? "选择位点" : "Choose sites",
+          content: sitesQuestion,
+          valid: ids.length > 0,
+        },
+        {
+          title: zh ? "选择分子" : "Choose ligands",
+          content: ligandsQuestion,
+          valid: selectionValid,
+        },
+        {
+          title: zh ? "选择方案" : "Choose settings",
+          content: settings,
+          valid: budgetValid,
+        },
+        {
+          title: zh ? "确认保存" : "Review & save",
+          content: review,
+          valid: selectionValid && budgetValid,
+        },
+      ]}
+    />
+  );
+}

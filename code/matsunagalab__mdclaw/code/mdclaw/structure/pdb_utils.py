@@ -1,0 +1,1404 @@
+"""
+Structure Server - PDB retrieval and structure cleaning tools.
+
+Provides tools for:
+- Automatic retrieval of structure files from PDB/AlphaFold/PDB-REDO (prefers mmCIF)
+- Chain separation and classification using gemmi
+- Structure cleaning, missing residue modeling, water/heterogen removal, and protonation using PDBFixer
+- Automatic detection of disulfide bonds and CYS->CYX renaming
+- Mutation modeling with HPacker
+- Ligand chemistry preparation with SMILES/SDF template matching
+- LLM-friendly structure validation and error reporting at each step
+"""
+
+# Configure logging early to suppress noisy third-party logs
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from mdclaw._common import setup_logger  # noqa: E402
+from mdclaw.chemistry_constants import WATER_NAMES  # noqa: E402
+
+logger = setup_logger(__name__)
+
+import re  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Optional, Dict, Any, Tuple  # noqa: E402
+
+from mdclaw._common import (  # noqa: E402
+    BaseToolWrapper,
+)
+
+# Default working directory for prepare_complex when output_dir is not specified
+WORKING_DIR = Path(".")
+PDB_CHAIN_ID_POOL = (
+    list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    + list("abcdefghijklmnopqrstuvwxyz")
+    + list("0123456789")
+)
+_DEUTERIUM_FALLBACK_ATOM_NAME_RE = re.compile(r"^D[0-9]*$")
+DEFAULT_TERMINAL_CAP_FORCEFIELD = "ff19SB"
+SUPPORTED_N_TERMINAL_CAPS = {"ACE"}
+SUPPORTED_C_TERMINAL_CAPS = {"NME"}
+TERMINAL_CAP_RESIDUES = SUPPORTED_N_TERMINAL_CAPS | SUPPORTED_C_TERMINAL_CAPS
+SUPPORTED_PREP_SOLVENT_TYPES = {"explicit", "implicit", "vacuum"}
+
+# Initialize tool wrappers
+pdb2pqr_wrapper = BaseToolWrapper("pdb2pqr")
+pdb4amber_wrapper = BaseToolWrapper("pdb4amber")
+
+
+def _pdb_chain_id_for_index(index: int) -> str:
+    """Return a PDB-compatible one-character chain label.
+
+    The label is intentionally not a canonical identity.  PDB only has one
+    chain-ID column, so large assemblies must reuse labels and rely on the
+    chain identity map for unambiguous component tracking.
+    """
+    return PDB_CHAIN_ID_POOL[index % len(PDB_CHAIN_ID_POOL)]
+
+
+def _path_lookup_keys(path: str | Path | None) -> set[str]:
+    """Return stable path spellings for joins across preparation steps."""
+    if path is None:
+        return set()
+    p = Path(path)
+    keys = {str(path), str(p)}
+    try:
+        keys.add(str(p.resolve()))
+    except OSError:
+        pass
+    return keys
+
+
+def preserve_long_resnames_in_pdb_text(pdb_text: str, topology: Any) -> str:
+    """Rewrite 4-character residue names so they survive a PDB round-trip.
+
+    ``openmm.app.PDBFile.writeFile`` truncates residue names longer than three
+    characters to their first three characters (``POPC`` -> ``POP``), which both
+    collapses distinct lipids (``POPC``/``POPE`` -> ``POP``) and prevents any
+    downstream reader from recovering the canonical name. PDB readers (including
+    OpenMM's own) accept a 4-character residue name written into columns 18-21,
+    so we left-justify the full (<=4 char) name into that field. Names of three
+    characters or fewer are untouched, so this is a no-op for proteins, water,
+    and ions.
+
+    The residue name for each ``ATOM``/``HETATM`` record is taken from
+    ``topology.atoms()`` in order, matching the order ``writeFile`` emits.
+    """
+    names = [atom.residue.name for atom in topology.atoms()]
+    out_lines: list[str] = []
+    atom_index = 0
+    for line in pdb_text.splitlines():
+        if line.startswith(("ATOM  ", "HETATM")):
+            if atom_index < len(names):
+                resname = names[atom_index]
+                atom_index += 1
+                if resname and len(resname) >= 4:
+                    padded = line.ljust(80)
+                    line = (padded[:17] + f"{resname[:4]:<4}" + padded[21:]).rstrip()
+        out_lines.append(line)
+    trailing = "\n" if pdb_text.endswith("\n") else ""
+    return "\n".join(out_lines) + trailing
+
+
+def strip_conect_records_from_pdb_text(pdb_text: str) -> str:
+    """Remove PDB ``CONECT`` records without changing any other bytes.
+
+    The final ``system.topology.pdb`` is an atom identity, order, coordinate,
+    and box companion to ``system.xml``; the XML is the authoritative
+    force-bearing topology.  OpenMM writes large atom serials in hybrid-36
+    notation inside ``CONECT`` records, which MDAnalysis' PDB parser does not
+    accept.  Source and intermediate PDBs must retain their connectivity, so
+    callers apply this helper only at the final topology-contract boundary.
+    """
+    return "".join(
+        line
+        for line in pdb_text.splitlines(keepends=True)
+        if not line.startswith("CONECT")
+    )
+
+
+def _residue_key(line: str) -> tuple[str, str, str]:
+    """(chainID, resSeq, iCode) from a PDB ATOM/HETATM record."""
+    return (line[21], line[22:26].strip(), line[26])
+
+
+def restore_residue_numbering_from_reference(
+    target_pdb: str | Path, reference_pdb: str | Path
+) -> Optional[str]:
+    """Rewrite each residue's chain/resSeq/iCode in ``target_pdb`` from
+    ``reference_pdb``, matched by residue ORDER.
+
+    ``pdb4amber`` renumbers residues (e.g. it makes numbering continuous across
+    chains, turning chain B 1-99 into 215-430) while preserving residue order
+    and count — it only adds hydrogens *within* residues. Any site-keyed input
+    (``protonation_states`` / ``histidine_states`` keyed by ``chain:resnum``, or
+    a detected PTM resnum) captured against the original numbering then points
+    at the wrong residue. This copies the reference (pre-pdb4amber)
+    chain/resSeq/iCode onto the target, by residue order, leaving every atom,
+    coordinate and hydrogen untouched.
+
+    Returns ``target_pdb`` on success, or ``None`` when the residue counts
+    differ (caller should then leave the file unchanged — fail safe).
+    """
+    target_path, ref_path = Path(target_pdb), Path(reference_pdb)
+    try:
+        ref_lines = ref_path.read_text().splitlines()
+        tgt_lines = target_path.read_text().splitlines()
+    except OSError:
+        return None
+
+    ref_keys: list[tuple[str, str, str]] = []
+    for line in ref_lines:
+        if line.startswith(("ATOM  ", "HETATM")):
+            key = _residue_key(line)
+            if not ref_keys or ref_keys[-1] != key:
+                ref_keys.append(key)
+
+    # Count target residues first; bail out on any mismatch.
+    tgt_residue_count = 0
+    last: Optional[tuple[str, str, str]] = None
+    for line in tgt_lines:
+        if line.startswith(("ATOM  ", "HETATM")):
+            key = _residue_key(line)
+            if key != last:
+                tgt_residue_count += 1
+                last = key
+    if tgt_residue_count != len(ref_keys) or not ref_keys:
+        return None
+
+    out: list[str] = []
+    res_idx = -1
+    last = None
+    for line in tgt_lines:
+        if line.startswith(("ATOM  ", "HETATM")):
+            key = _residue_key(line)
+            if key != last:
+                res_idx += 1
+                last = key
+            chain, resseq, icode = ref_keys[res_idx]
+            padded = line.ljust(80)
+            line = (
+                padded[:21] + f"{chain[:1]:1}" + f"{resseq[:4]:>4}"
+                + f"{icode[:1]:1}" + padded[27:]
+            ).rstrip()
+        out.append(line)
+    trailing = "\n" if target_path.read_text().endswith("\n") else "\n"
+    target_path.write_text("\n".join(out) + trailing)
+    return str(target_path)
+
+
+def restore_topology_resnames_from_pdb(topology: Any, source_pdb: str | Path) -> Optional[dict]:
+    """Put a PDB's residue names back on the ``openmm.app.Topology`` that was
+    loaded from it, matched by atom order.
+
+    ``PDBFile`` normalizes Amber protonation-state and water names on load
+    (``HIE``/``HID``/``HIP``->``HIS``, ``CYX``->``CYS``, ``ASH``->``ASP``,
+    ``GLH``->``GLU``, ``LYN``->``LYS``, ``WAT``->``HOH``). Code that goes on to
+    *derive* a new Topology from the loaded one (the FEP hybrid topology, which
+    appends atoms to one residue) cannot restore the names on the text it
+    writes with the by-index helper (atom counts differ) nor with the by-key
+    helper (a solvated ``topology.pdb`` numbers its waters over the protein's
+    residue numbers in the same chain, so every protein key is ambiguous and
+    the overlay refuses). Fixing the names on the loaded object, before the
+    derivation, is exact: ``PDBFile`` keeps the record order and count.
+
+    Returns ``{"n_atoms", "renamed_residues"}`` or ``None`` when the source
+    cannot be read or its ``ATOM``/``HETATM`` count differs from the topology
+    (nothing is changed then).
+    """
+    try:
+        lines = Path(source_pdb).read_text().splitlines()
+    except OSError:
+        return None
+    names = [line.ljust(21)[17:21].strip().upper() for line in lines if line.startswith(("ATOM  ", "HETATM"))]
+    atoms = list(topology.atoms())
+    if len(names) != len(atoms) or not names:
+        return None
+    renamed: set = set()
+    for atom, name in zip(atoms, names):
+        if name and atom.residue.name != name:
+            atom.residue.name = name
+            renamed.add(atom.residue.index)
+    return {"n_atoms": len(atoms), "renamed_residues": len(renamed)}
+
+
+def restore_resnames_from_source_pdb(
+    pdb_text: str, source_pdb: str | Path, *, atom_indices: Any = None
+) -> Optional[str]:
+    """Overlay residue names from a source PDB onto an exported PDB, by index.
+
+    ``openmm.app.PDBFile`` normalizes Amber protonation-state and water residue
+    names when it *loads* a structure (``GLH``->``GLU``, ``ASH``->``ASP``,
+    ``HID``/``HIE``/``HIP``->``HIS``, ``CYX``->``CYS``, ``WAT``->``HOH``,
+    ...). ``LYN`` and ``CYM`` are not aliases. A structure written back out
+    from that loaded topology therefore loses the protonation-state name even
+    though the protons (``HE2`` etc.) are still present and the chemistry is
+    unchanged. The source
+    ``topology.pdb`` emitted by the topo build carries the canonical names; this
+    rewrites the residue-name column (cols 18-21) of each ``ATOM``/``HETATM``
+    record from that source, matched by record order (identical atom order,
+    since the export was written from a topology loaded out of the same file).
+
+    This is a pure text relabel of the exported artifact — it does not touch
+    coordinates, the OpenMM ``System``, the restart ``state.xml``, or anything
+    the run side consumes, so it cannot affect the MD result.
+
+    ``atom_indices``, when given, says which of the source's records the export
+    holds, in the order it holds them.  An analysis writes a *subset*: the
+    trajectory was read with the same index array, so the export's record *i* is
+    the source's record ``atom_indices[i]``, and without saying so the counts
+    simply disagree and no restore happens.
+
+    Returns the rewritten text, or ``None`` when the source cannot be read or
+    its ``ATOM``/``HETATM`` count does not match (caller should then fall back).
+    """
+    try:
+        source_names = [
+            line[17:21].strip()
+            for line in Path(source_pdb).read_text().splitlines()
+            if line.startswith(("ATOM  ", "HETATM"))
+        ]
+    except OSError:
+        return None
+    if atom_indices is not None:
+        try:
+            source_names = [source_names[int(i)] for i in atom_indices]
+        except (IndexError, TypeError, ValueError):
+            return None
+    lines = pdb_text.splitlines()
+    n_records = sum(1 for ln in lines if ln.startswith(("ATOM  ", "HETATM")))
+    if n_records != len(source_names) or n_records == 0:
+        return None
+    out_lines: list[str] = []
+    idx = 0
+    for line in lines:
+        if line.startswith(("ATOM  ", "HETATM")):
+            name = source_names[idx]
+            idx += 1
+            if name:
+                padded = line.ljust(80)
+                line = (padded[:17] + f"{name[:4]:<4}" + padded[21:]).rstrip()
+        out_lines.append(line)
+    trailing = "\n" if pdb_text.endswith("\n") else ""
+    return "\n".join(out_lines) + trailing
+
+
+def stamp_source_resnames(topology: Any, source_pdb: str | Path) -> Optional[int]:
+    """Put the source file's residue names onto a freshly loaded topology.
+
+    The write-side overlays match a written file against the source, which needs
+    the two to carry the same atoms. That holds for an export and not for a
+    build: ``addExtraParticles`` inserts an M site per water for a four-site
+    model -- measured, 4239 atoms became 5651 -- and the overlay then has
+    nothing to align, so a build with OPC lost every name the reader had
+    normalised. Stamping the topology instead is done while it still corresponds
+    to the file, one atom per record.
+
+    Only safe immediately after the load, and only where nothing downstream
+    reads a residue name: OpenMM's ``Modeller`` keys ``addHydrogens`` on
+    ``residue.name`` and tests for HIS and CYS by name, and ``addSolvent``
+    hardcodes HOH, so a topology stamped before those runs silently loses its
+    hydrogens. ``addExtraParticles`` and ``createSystem`` are template-driven
+    and do not care.
+
+    Returns how many residues were renamed, or ``None`` when the file and the
+    topology do not correspond and nothing was touched.
+    """
+    try:
+        with open(source_pdb) as handle:
+            records = [line for line in handle
+                       if line.startswith(("ATOM  ", "HETATM"))]
+    except OSError:
+        return None
+    atoms = list(topology.atoms())
+    if len(records) != len(atoms):
+        return None
+    name_by_residue: dict = {}
+    for line, atom in zip(records, atoms):
+        on_disk = line[17:21].strip()
+        if not on_disk:
+            continue
+        residue = atom.residue
+        if name_by_residue.setdefault(id(residue), on_disk) != on_disk:
+            # One residue's atoms disagreeing about its name means the two files
+            # are not the same residues in the same order, whatever the counts.
+            return None
+    renamed = 0
+    for residue in topology.residues():
+        wanted = name_by_residue.get(id(residue))
+        if wanted and str(residue.name).strip() != wanted:
+            residue.name = wanted
+            renamed += 1
+    return renamed
+
+
+def overlay_source_resnames(pdb_path, source_pdb, atom_indices=None) -> bool:
+    """Put a source PDB's residue names back on a file mdtraj just wrote.
+
+    mdtraj normalises on load exactly as OpenMM does -- HID, HIE and HIP arrive
+    as HIS, CYX as CYS, WAT as HOH -- so an artifact written from a loaded
+    topology carries the collapsed names whatever the source said. Only the
+    residue-name column is rewritten; the coordinates are the frame's and stay
+    the frame's, which is the point: taking whole records from the source would
+    put build-time geometry into a file that claims to be a trajectory frame,
+    and its CRYST1 would be the build box rather than the run's.
+
+    ``atom_indices`` says which of the source's records this file holds, in the
+    order it holds them, for the subset an analysis selects.
+
+    Returns whether the names were restored; a caller that cannot say so in its
+    own result at least leaves the warning in the log.
+    """
+    if not source_pdb:
+        return False
+    try:
+        text = Path(pdb_path).read_text()
+    except OSError:
+        return False
+    restored = restore_resnames_from_source_pdb(
+        text, source_pdb, atom_indices=atom_indices)
+    if restored is None:
+        logger.warning(
+            "Residue names in %s were not restored from %s; mdtraj collapses "
+            "HID/HIE/HIP to HIS, CYX to CYS and WAT to HOH on load, and this "
+            "file keeps the collapsed names.", pdb_path, source_pdb)
+        return False
+    Path(pdb_path).write_text(restored)
+    return True
+
+
+# pdb2pqr writes Amber protonation-state residue names, and openmm.app.PDBFile
+# normalizes most of them back to a parent it knows: HID/HIE/HIP -> HIS,
+# CYX -> CYS, ASH -> ASP, GLH -> GLU. LYN (neutral lysine) and CYM
+# (deprotonated cysteine) have no such alias. PDBFile keeps those names, finds
+# no residue definition for them, and so builds *no* bonds for the residue at
+# all -- not its internal ones, and not the peptide bond to the residue before
+# it. (The bond to the residue after it survives, because that one is declared
+# by the *next* residue's own "-C" definition, which is why the damage looks
+# one-sided.)
+#
+# Two things then go wrong downstream, both quietly. A force field rejects the
+# residue *before* the variant with "the set of externally bonded atoms is
+# missing 1 C atom. Is the chain missing a terminal capping group?", naming the
+# chain terminus when the cause is a residue in the middle. And
+# ``Modeller.addHydrogens`` cannot see which hydrogens are already attached to
+# an unbonded residue, so it adds a second complete set.
+def resolve_residue_site(candidates, chain, resnum, icode):
+    """Pick the one residue a disulfide endpoint names, or say why it cannot.
+
+    ``candidates`` is a mapping keyed ``(chain, resnum, icode)``. ``icode`` of
+    ``None`` means the caller did not state one -- which is what every artifact
+    written before insertion codes were carried says, so it must keep resolving
+    wherever only one residue answers to the number. An explicit ``""`` names the
+    residue that has no code.
+
+    Returns ``(key, error)``. A covalent bond addressed to the wrong residue is
+    worse than one that is refused, so an ambiguous number is an error rather
+    than a pick.
+    """
+    chain = str(chain)[:1]
+    resnum = int(resnum)
+    if icode is not None:
+        key = (chain, resnum, str(icode).strip())
+        if key in candidates:
+            return key, None
+        return None, f"{chain}:{resnum}{str(icode).strip()} is not present"
+
+    matches = [key for key in candidates if key[0] == chain and key[1] == resnum]
+    if not matches:
+        return None, f"{chain}:{resnum} is not present"
+    if len(matches) > 1:
+        codes = sorted(key[2] or "(blank)" for key in matches)
+        return None, (
+            f"{chain}:{resnum} matches {len(matches)} residues "
+            f"(insertion codes {', '.join(codes)}); name the insertion code"
+        )
+    return matches[0], None
+
+
+_PDB2PQR_UNALIASED_VARIANTS = {"LYN": "LYS", "CYM": "CYS"}
+
+
+def _load_pdb_with_variant_bonds(input_path):
+    """Read a pdb2pqr Amber PDB so LYN/CYM keep their names *and* get bonded.
+
+    Parses under the parent residue name so PDBFile builds every standard bond,
+    then puts the variant name back on the Topology before anything else sees
+    it. The order matters: handing ``LYS`` to ``Modeller.addHydrogens`` grows the
+    third NZ hydrogen and silently turns a neutral lysine into a charged one
+    (likewise ``HG`` on a CYM), and renaming the residue back afterwards would
+    keep the name while the chemistry had already changed. ff19SB carries real
+    ``LYN``/``CYM`` templates, so once the name is restored the match is exact
+    and no hydrogen is added or removed.
+
+    The name goes back by residue *order*, not by residue key. The parse happens
+    here, on text written here, so the two agree position by position -- whereas
+    a key has two spellings that do not always meet: PDBFile re-encodes a
+    hybrid-36 residue number, so a file's ``A000`` comes back as ``10000`` and a
+    reconstructed key would miss a perfectly valid structure. Each restore is
+    still checked against the parent name it was rewritten to, and a mismatch
+    raises: failing open would hand the residue to the force field under its
+    parent name and re-protonate it.
+    """
+    import io
+
+    from openmm.app import PDBFile
+
+    input_path = Path(input_path)
+    # Ordinal of each residue in file order -> the variant name it was written
+    # with. Residue boundaries are the raw columns, which is what makes the
+    # ordinals line up with the reader's own residue order.
+    renamed: dict[int, str] = {}
+    rewritten: list[str] = []
+    ordinal = -1
+    previous_key: tuple | None = None
+    for line in input_path.read_text().splitlines(True):
+        if line.startswith(("ATOM  ", "HETATM")) and len(line) >= 27:
+            key = (line[21], line[22:26], line[26])
+            if key != previous_key:
+                ordinal += 1
+                previous_key = key
+            name = line[17:20].strip()
+            parent = _PDB2PQR_UNALIASED_VARIANTS.get(name)
+            if parent is not None:
+                renamed[ordinal] = name
+                line = line[:17] + f"{parent:>3}" + line[20:]
+        rewritten.append(line)
+
+    if not renamed:
+        return PDBFile(str(input_path))
+
+    pdb = PDBFile(io.StringIO("".join(rewritten)))
+    residues = list(pdb.topology.residues())
+    for index, name in renamed.items():
+        parent = _PDB2PQR_UNALIASED_VARIANTS[name]
+        residue = residues[index] if index < len(residues) else None
+        if residue is None or str(residue.name).strip().upper() != parent:
+            raise ValueError(
+                f"could not restore the pdb2pqr protonation variant {name} at "
+                f"residue {index + 1} of {input_path.name}: the reader returned "
+                f"{'nothing' if residue is None else residue.name} where "
+                f"{parent} was written. Refusing to hand it to the force field "
+                "under the parent name, which would re-protonate it"
+            )
+        residue.name = name
+    return pdb
+
+
+def restore_resnames_by_residue_key(
+    pdb_text: str,
+    source_pdb: str | Path,
+    *,
+    exclude_keys: Optional[set] = None,
+) -> Optional[str]:
+    """Overlay residue names from a source PDB by residue KEY, not atom index.
+
+    Unlike :func:`restore_resnames_from_source_pdb` (atom-order match, requires
+    identical atom counts), this matches each output record to the source by
+    ``(chain, resnum, icode)``. It therefore tolerates round-trips that add or
+    drop atoms within residues or add whole residues — exactly the prep / solv /
+    mutation steps where OpenMM's ``PDBFile`` loader normalized Amber/PTM names
+    (``ASH``->``ASP``, ``HID``->``HIS``, ``GLH``->``GLU``, ``WAT``->``HOH`` ...)
+    and then hydrogens, solvent, or repacked side chains changed the atom count.
+
+    Residues absent from the source (e.g. freshly added water/ions) keep their
+    exported name. Residues whose key is in ``exclude_keys`` (e.g. a mutated
+    position whose residue name legitimately changed) are left untouched.
+
+    Pure text relabel of the residue-name column; coordinates and every other
+    field are unchanged. Returns the rewritten text, or ``None`` if the source
+    cannot be read.
+    """
+    try:
+        src_lines = Path(source_pdb).read_text().splitlines()
+    except OSError:
+        return None
+    name_by_key: dict[tuple, str] = {}
+    ambiguous: set = set()
+    for line in src_lines:
+        # Padded rather than length-gated: a record short of 27 columns used to
+        # be skipped here while still being written in the target, so a
+        # truncated line hid the collision it was half of -- a full TYR and a
+        # 26-column PA at one key came through unrefused and the PA was renamed
+        # TYR.
+        line = line.ljust(27)
+        if line.startswith(("ATOM  ", "HETATM")):
+            key = (line[21], line[22:26], line[26])
+            # Upper-cased, as the same key is read elsewhere: a source spelling
+            # a residue "hie" was refused as a collision with "HIE".
+            name = line[17:21].strip().upper()
+            if name_by_key.setdefault(key, name) != name:
+                ambiguous.add(key)
+    # The target's own keys have to be unique too, and found before anything is
+    # rewritten. The source scan cannot see a target that holds two residues at
+    # one key -- an ion sharing a water's number, say -- which would take the
+    # source's single name for both.
+    target_names: dict[tuple, str] = {}
+    for line in pdb_text.splitlines():
+        if line.startswith(("ATOM  ", "HETATM")):
+            padded = line.ljust(27)
+            key = (padded[21], padded[22:26], padded[26])
+            name = padded[17:21].strip().upper()
+            if target_names.setdefault(key, name) != name:
+                ambiguous.add(key)
+
+    if ambiguous:
+        # The key is only an identity while a file holds one molecule's worth of
+        # residues. An assembled system is not: Lipid21 writes its tails and
+        # heads into the same chain letters the protein uses and restarts their
+        # numbering, so in a real membrane topology 280 keys name both a lipid
+        # and an amino acid. Overlaying on that renames lipids to amino acids --
+        # measured, restoring one such file from *itself* rewrites 5449 atom
+        # records, PA to LEU 552 times. Refuse; the caller keeps the names it
+        # has, which are wrong in a way that is at least uniform.
+        logger.warning(
+            "Not restoring residue names between %s and the exported text: "
+            "%d residue key(s) name more than one residue, so the overlay would "
+            "rename by collision (e.g. %s). One of the two is an assembled "
+            "system rather than a single molecule's residues.",
+            source_pdb, len(ambiguous), sorted(ambiguous)[:3],
+        )
+        return None
+
+    exclude = exclude_keys or set()
+    out_lines: list[str] = []
+    for line in pdb_text.splitlines():
+        if line.startswith(("ATOM  ", "HETATM")):
+            padded_key = line.ljust(27)
+            key = (padded_key[21], padded_key[22:26], padded_key[26])
+            if key not in exclude and key not in ambiguous:
+                name = name_by_key.get(key)
+                if name:
+                    padded = line.ljust(80)
+                    line = (padded[:17] + f"{name[:4]:<4}" + padded[21:]).rstrip()
+        out_lines.append(line)
+    trailing = "\n" if pdb_text.endswith("\n") else ""
+    return "\n".join(out_lines) + trailing
+
+
+def _pdb_residue_blocks(lines: list[str]) -> list[list[int]]:
+    """Index every ATOM/HETATM line by the residue it belongs to, in order.
+
+    Segmented the way OpenMM's own reader segments (``pdbstructure``): a new
+    residue starts when the chain, residue number, insertion code *or residue
+    name* changes. Reading the (chain, number, icode) key alone would merge two
+    adjacent residues that a writer happened to number alike -- and a solvated
+    file is full of those.
+    """
+    blocks: list[list[int]] = []
+    marker = None
+    for index, line in enumerate(lines):
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        padded = line.ljust(27)
+        here = (padded[21], padded[22:26], padded[26], padded[17:21])
+        if here != marker:
+            blocks.append([])
+            marker = here
+        blocks[-1].append(index)
+    return blocks
+
+
+def _heavy_atom_names(lines: list[str], block: list[int]) -> tuple[str, ...]:
+    """A residue's non-hydrogen atom names, in file order.
+
+    Hydrogens are left out deliberately. A round trip through OpenMM renames the
+    N-terminal H1 to H -- 2 of 9745 atoms on a real antibody -- so an all-atom
+    comparison would refuse an overlay that is perfectly aligned, which is how
+    the packmol restore came to be skipped in 13 of 16 real runs over one
+    character of zinc's element column.
+    """
+    names: list[str] = []
+    for index in block:
+        padded = lines[index].ljust(78)
+        name = padded[12:16].strip().upper()
+        element = padded[76:78].strip().upper() or name.lstrip("0123456789")[:1]
+        if element not in ("H", "D"):
+            names.append(name)
+    return tuple(names)
+
+
+def restore_solute_identity_by_prefix(
+    pdb_text: str,
+    source_pdb: str | Path,
+    *,
+    restore_numbering: bool = True,
+) -> Optional[str]:
+    """Put a solute's identity back onto the leading residues of a solvated file.
+
+    Solvation appends. packmol-memgen and ``Modeller.addSolvent`` both emit the
+    solute as the first records of the output, in the input's order, and put the
+    water and ions after it, so the correspondence is a *prefix*: source residue
+    i is target residue i for every i the source has, and the trailing solvent
+    has no source at all. Processing the solute means ignoring the solvent.
+
+    That is what makes this different from :func:`restore_resnames_by_residue_key`,
+    which needs the (chain, number, icode) key to be an identity. In a solvated
+    file it is not: packmol writes its waters into the solute's own chain letters
+    numbered from 1, so the key names both an amino acid and a water 636 times in
+    a real antibody box. The key overlay then refuses -- or, on the OpenMM
+    fallback's output where the write reset the solute's own numbering, does not
+    refuse and renames 3002 of 4428 solute atoms, PHE to VAL 80 times.
+
+    Restores the residue name and, unless ``restore_numbering`` is False, the
+    chain id, residue number and insertion code -- the deposit numbering both
+    writers renumber away, and that the disulfide planner looks its cysteines up
+    by -- plus the element of any solute atom whose element the writer got
+    wrong. Coordinates, atom names, CRYST1 and every solvent record are left
+    exactly as the writer wrote them.
+
+    The element is restored because packmol-memgen destroys it for every
+    two-letter element written under a three-character atom name. Its
+    ``MembraneParams.pdb_reindex`` right-aligns such a name and then writes
+    ``atomname[0]`` into the element column, so a ligand's ``CL2`` comes back as
+    carbon, ``BR1`` as boron and ``ZN`` as an unknown ``Z``. Measured on
+    041_ligand_4erf, that turned a C25 Cl2 ligand into C27, OpenFF Pablo
+    rejected the residue for "wrong number of atoms", the topology fell back to
+    a graph with no CCD chemistry, and the build died several steps later
+    claiming no force-field template matched. An audit of 102 solvated files
+    found the same corruption on bare ZN and CA; those are repaired downstream
+    by the bare-ion sanitiser, but a metal or halogen inside a ligand is not.
+
+    Restoring it is safe under the same guarantee the rest of this overlay
+    rests on: the atoms are already matched one to one and checked by name. The
+    element is taken per atom and only where the two names agree, so a target
+    atom the source does not have keeps whatever the writer gave it.
+
+    The safety an ordinal match otherwise lacks is per residue: source residue
+    i's heavy-atom name tuple has to equal target residue i's or the whole
+    overlay is refused, because a silent off-by-one smears names down the rest of
+    the chain.
+
+    Returns the rewritten text, or ``None`` when the source cannot be read, the
+    target holds fewer residues than the source, or a residue disagrees.
+    """
+    try:
+        src_lines = Path(source_pdb).read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    out_lines = pdb_text.splitlines()
+    src_blocks = _pdb_residue_blocks(src_lines)
+    tgt_blocks = _pdb_residue_blocks(out_lines)
+    if not src_blocks or len(tgt_blocks) < len(src_blocks):
+        logger.warning(
+            "Not restoring solute identity from %s: the source holds %d "
+            "residue(s) and the written file %d, so the written file is not "
+            "that solute with solvent appended.",
+            source_pdb, len(src_blocks), len(tgt_blocks))
+        return None
+    for ordinal, (src_block, tgt_block) in enumerate(zip(src_blocks, tgt_blocks), 1):
+        src_names = _heavy_atom_names(src_lines, src_block)
+        tgt_names = _heavy_atom_names(out_lines, tgt_block)
+        # The heavy-atom tuple cannot see a shift inside a run of residues that
+        # share one -- three consecutive glycines, or the water the writer
+        # appended after them -- so the atom COUNT of the block is checked too,
+        # and the target block is refused outright when it is solvent. Without
+        # that a source solute residue could claim an appended water and rename
+        # it, which is the one way this overlay could touch a solvent record.
+        if len(src_block) != len(tgt_block):
+            logger.warning(
+                "Not restoring solute identity from %s: residue %d holds %d "
+                "atom(s) in the source and %d in the written file.",
+                source_pdb, ordinal, len(src_block), len(tgt_block))
+            return None
+        if out_lines[tgt_block[0]].ljust(21)[17:20].strip().upper() in WATER_NAMES:
+            logger.warning(
+                "Not restoring solute identity from %s: residue %d of the "
+                "written file is %s, so the solute prefix has run into the "
+                "appended solvent.",
+                source_pdb, ordinal,
+                out_lines[tgt_block[0]].ljust(21)[17:20].strip())
+            return None
+        if src_names != tgt_names:
+            logger.warning(
+                "Not restoring solute identity from %s: residue %d has heavy "
+                "atoms %s in the source and %s in the written file, so the two "
+                "are out of step and the overlay would rename by drift.",
+                source_pdb, ordinal, src_names, tgt_names)
+            return None
+    repaired_elements: list[str] = []
+    for src_block, tgt_block in zip(src_blocks, tgt_blocks):
+        identity = src_lines[src_block[0]].ljust(27)[17:27]
+        for src_index, index in zip(src_block, tgt_block):
+            padded = out_lines[index].ljust(80)
+            src_padded = src_lines[src_index].ljust(80)
+            fields = identity if restore_numbering else identity[:4] + padded[21:27]
+            element = padded[76:78]
+            if (src_padded[12:16].strip() == padded[12:16].strip()
+                    and src_padded[76:78].strip()
+                    and src_padded[76:78] != element):
+                repaired_elements.append(
+                    f"{padded[12:16].strip()} {element.strip() or '(blank)'}"
+                    f"->{src_padded[76:78].strip()}")
+                element = src_padded[76:78]
+            if fields != padded[17:27] or element != padded[76:78]:
+                out_lines[index] = (
+                    padded[:17] + fields + padded[27:76] + element
+                    + padded[78:]).rstrip()
+    if repaired_elements:
+        logger.info(
+            "Restored %d solute element field(s) the solvation writer lost: %s",
+            len(repaired_elements), ", ".join(sorted(set(repaired_elements))[:6]))
+    trailing = "\n" if pdb_text.endswith("\n") else ""
+    return "\n".join(out_lines) + trailing
+
+def _image_positions_for_export(topology: Any, positions: Any) -> Any:
+    """Whole-molecule image the coordinates that go into an exported PDB.
+
+    Run stages hand the exporter OpenMM's integrated positions, which drift out
+    of the cell as the run proceeds — after 2 ns of a membrane system the water
+    spanned more than twice the box edge, so the written PDB no longer showed a
+    system that fits its own box. The build side already images ``topology.pdb``
+    (:func:`mdclaw.structure.imaging.center_solute_and_wrap_solvent`); doing the
+    same on the way out keeps every PDB in the DAG in one frame. Export only:
+    ``state.xml`` / ``.chk`` / trajectory keep the integrated coordinates, so
+    restart and MD results are untouched.
+    """
+    import numpy as np
+    from openmm import unit
+
+    from mdclaw.structure.imaging import center_solute_and_wrap_solvent
+
+    box = topology.getPeriodicBoxVectors()
+    if box is None:
+        return positions
+    vectors = np.asarray(box.value_in_unit(unit.nanometer), dtype=float)
+    lengths = (float(vectors[0][0]), float(vectors[1][1]), float(vectors[2][2]))
+    if not all(v > 0.0 for v in lengths):
+        return positions
+    # Triclinic cells are left as they are: the imaging helper is orthorhombic,
+    # and folding a triclinic cell with its diagonal lengths would place
+    # molecules outside the real cell — a worse picture than an unimaged one.
+    off_diagonal = max(
+        abs(vectors[i][j]) for i in range(3) for j in range(3) if i != j
+    )
+    if off_diagonal > 1e-6 * max(lengths):
+        return positions
+    if unit.is_quantity(positions):
+        raw = np.asarray(positions.value_in_unit(unit.nanometer), dtype=float)
+    else:
+        raw = np.asarray(positions, dtype=float)
+    imaged = center_solute_and_wrap_solvent(topology, raw, lengths)
+    return unit.Quantity(imaged, unit.nanometer)
+
+
+def render_simulation_pdb_preserving_resnames(
+    topology: Any,
+    positions: Any,
+    source_topology_pdb: Optional[str | Path],
+    *,
+    box_vectors: Any = None,
+    image: bool = False,
+    keep_ids: bool = True,
+    warnings: Optional[list] = None,
+) -> str:
+    """Serialize an OpenMM topology+positions to PDB text, preserving the
+    Amber/PTM/water residue names that OpenMM's ``PDBFile`` loader normalized
+    away when the run stage loaded ``topology.pdb``.
+
+    This is the single export path shared by min / eq / prod: write to a buffer,
+    overlay the canonical names from the topo node's ``topology.pdb`` (the
+    authoritative, name-correct topology contract), and fall back to the
+    long-resname patch when that source is missing or its atom count does not
+    match. The relabel itself is pure text — it never touches coordinates,
+    ``system.xml``, or ``state.xml``, so the MD result is unaffected.
+
+    ``box_vectors`` is the box the coordinates actually belong to, normally the
+    final state's. Pass it: ``PDBFile`` takes CRYST1 from the *topology*, and a
+    run stage's topology was loaded from ``topology.pdb``, so it still carries
+    the build-time box. Under NPT that box is not the current one — a measured
+    membrane run wrote CRYST1 118.088 x 118.088 x 175.733 for a system whose
+    equilibrated box was 104.894 x 104.894 x 164.713, a 40% volume error that
+    every downstream PBC-aware reader would have believed.
+
+    ``image`` whole-molecule images the exported coordinates around the solute;
+    see :func:`_image_positions_for_export`.
+
+    ``warnings``, when given, collects the message written if the restore does
+    not happen, so a caller can report that its export carries the reader's names
+    rather than the source's instead of returning a quiet success.
+
+    ``keep_ids`` is on, and should stay on: without it ``PDBFile`` renumbers
+    every residue 1..N inside its chain and relabels chains by index, so the
+    export disagrees with the ``topology.pdb`` it came from. It is a parameter
+    only because ``export_state_pdb`` offers the choice to its callers.
+    """
+    import io
+
+    from openmm.app import PDBFile
+
+    restore_box = box_vectors is not None
+    original_box = topology.getPeriodicBoxVectors() if restore_box else None
+    if restore_box:
+        topology.setPeriodicBoxVectors(box_vectors)
+    try:
+        if image:
+            positions = _image_positions_for_export(topology, positions)
+        buffer = io.StringIO()
+        # keepIds, because without it PDBFile renumbers every residue 1..N within
+        # its chain and relabels chains A, B, C... by index (writeModel lines
+        # 42-55), so min / eq / prod exports disagreed with the topology.pdb they
+        # came from: 5ZK8's protein is 18-458 there and came out 1-273 here, and
+        # a system with more than 26 chains -- a solvated membrane easily has
+        # one -- reuses chain letters. Every other writeFile in this package
+        # already passes it, and export_state_pdb takes it as a documented
+        # parameter defaulting to True; this call was lifted verbatim from min's
+        # old inline block and the flag never came with it.
+        PDBFile.writeFile(topology, positions, buffer, keepIds=keep_ids)
+    finally:
+        # The caller's topology is reused after this call (eq builds the
+        # production handoff System from it), so borrow the box, do not keep it.
+        if restore_box:
+            topology.setPeriodicBoxVectors(original_box)
+    text = None
+    if source_topology_pdb:
+        text = restore_resnames_from_source_pdb(
+            buffer.getvalue(), source_topology_pdb
+        )
+    if text is None:
+        # The fallback un-truncates long names and nothing else, so the names the
+        # reader normalised stay normalised. That is the defect this function
+        # exists to prevent, and it used to happen in silence: a source whose
+        # atom count differs from the loaded topology -- a multi-MODEL PDB, for
+        # one -- made the restore return None and the caller reported success on
+        # an export carrying HIS where the source had HIE.
+        if source_topology_pdb:
+            message = (
+                f"Residue names were not restored from {source_topology_pdb}: the "
+                "source could not be read or its atom order does not match the "
+                "exported topology, so names OpenMM normalised on load (HIE and "
+                "HID as HIS, ASH as ASP, CYX as CYS, WAT as HOH) remain "
+                "normalised in this file")
+            logger.warning(message)
+            if warnings is not None:
+                warnings.append(message)
+        text = preserve_long_resnames_in_pdb_text(buffer.getvalue(), topology)
+    return text
+
+
+def _pdb_atom_descriptor(line: str) -> dict[str, Any]:
+    """Return a compact, serializable descriptor for a PDB atom record."""
+    chain = line[21].strip() if len(line) > 21 else ""
+    return {
+        "serial": line[6:11].strip(),
+        "atom_name": line[12:16].strip(),
+        "resname": line[17:20].strip(),
+        "chain": chain,
+        "resnum": line[22:26].strip(),
+        "icode": line[26].strip() if len(line) > 26 else "",
+        "element": line[76:78].strip() if len(line) >= 78 else "",
+    }
+
+
+def _is_deuterium_atom_record(line: str) -> bool:
+    """Return True for experimental deuterium atom records in PDB text."""
+    if not line.startswith(("ATOM", "HETATM")):
+        return False
+    atom_name = line[12:16].strip().upper()
+    element = line[76:78].strip().upper() if len(line) >= 78 else ""
+    if element == "D":
+        return True
+    if element:
+        return False
+    return bool(_DEUTERIUM_FALLBACK_ATOM_NAME_RE.fullmatch(atom_name))
+
+
+def _component_disposition_payload(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the v1 component disposition artifact payload."""
+    excluded_entries = [entry for entry in entries if entry.get("action_taken") == "excluded"]
+    isotope_atoms = sum(
+        int(entry.get("atom_count", 0))
+        for entry in excluded_entries
+        if entry.get("classification") == "experimental_isotope"
+    )
+    excluded_atoms = sum(int(entry.get("atom_count", 0)) for entry in excluded_entries)
+    return {
+        "schema_version": "mdclaw.component_disposition.v1",
+        "summary": {
+            "experimental_isotope_atoms_excluded": isotope_atoms,
+            "excluded_atom_count": excluded_atoms,
+            "excluded_component_count": len(excluded_entries),
+        },
+        "entries": entries,
+    }
+
+
+def _exclude_deuterium_atoms_from_pdb(input_path: Path, output_path: Path) -> dict[str, Any]:
+    """Write *output_path* with experimental deuterium atom records removed."""
+    lines = input_path.read_text().splitlines()
+    kept: list[str] = []
+    excluded_atoms: list[dict[str, Any]] = []
+    for line in lines:
+        if _is_deuterium_atom_record(line):
+            excluded_atoms.append(_pdb_atom_descriptor(line))
+            continue
+        kept.append(line)
+
+    if excluded_atoms:
+        output_path.write_text("\n".join(kept) + "\n")
+        entries = [
+            {
+                "component_id": "experimental_isotope_deuterium",
+                "classification": "experimental_isotope",
+                "default_action": "exclude",
+                "action_taken": "excluded",
+                "atom_count": len(excluded_atoms),
+                "reason": (
+                    "Experimental deuterium atoms are excluded from the default "
+                    "classical MD preparation path; standard hydrogens are rebuilt downstream."
+                ),
+                "sample_atoms": excluded_atoms[:20],
+            }
+        ]
+    else:
+        entries = []
+    return _component_disposition_payload(entries)
+
+
+def _normalize_prepare_solvent_type(solvent_type: Optional[str]) -> Optional[str]:
+    """Normalize prep-stage solvent intent; prep defaults to explicit solvent."""
+    if solvent_type is None:
+        return "explicit"
+    normalized = str(solvent_type).strip().lower().replace("-", "_")
+    aliases = {
+        "explicit_water": "explicit",
+        "explicit_solvent": "explicit",
+        "implicit_solvent": "implicit",
+        "no_solvent": "vacuum",
+        "none": "vacuum",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized == "":
+        return "explicit"
+    return normalized
+
+
+def _pdb_atom_record_count(path: Path) -> int:
+    """Count atom records in a PDB fragment for disposition summaries."""
+    try:
+        return sum(
+            1 for line in path.read_text().splitlines()
+            if line.startswith(("ATOM", "HETATM"))
+        )
+    except OSError:
+        return 0
+
+
+def _split_file_list_key(component_type: str) -> str:
+    return {
+        "protein": "protein_files",
+        "nucleic": "nucleic_files",
+        "glycan": "glycan_files",
+        "ligand": "ligand_files",
+        "ion": "ion_files",
+        "water": "water_files",
+    }.get(component_type, "ligand_files")
+
+
+def _replace_split_result_file(
+    split_result: dict,
+    *,
+    component_type: str,
+    old_path: str,
+    new_path: str,
+) -> None:
+    """Update split_molecules path bookkeeping after component normalization."""
+    key = _split_file_list_key(component_type)
+    split_result[key] = [
+        new_path if path == old_path else path
+        for path in split_result.get(key, [])
+    ]
+    for info in split_result.get("chain_file_info", []):
+        if info.get("file") == old_path:
+            info.setdefault("source_file", old_path)
+            info["file"] = new_path
+            info["normalized_file"] = new_path
+
+
+def _component_disposition_metadata(chain_info: dict, component_type: str) -> dict[str, Any]:
+    """Return shared component identity fields for disposition entries."""
+    metadata: dict[str, Any] = {
+        "component_type": component_type,
+        "chain_id": chain_info.get("chain_id"),
+        "author_chain": chain_info.get("author_chain"),
+        "resnum": chain_info.get("resnum"),
+        "unique_id": chain_info.get("unique_id"),
+        "nucleic_subtype": chain_info.get("nucleic_subtype"),
+    }
+    residue_names = chain_info.get("residue_names")
+    if isinstance(residue_names, dict):
+        names = residue_names.get("unique_residues", [])
+    elif isinstance(residue_names, list):
+        names = residue_names
+    else:
+        names = []
+    if names:
+        metadata["residue_names"] = sorted(set(names))
+        metadata["residue_name"] = metadata["residue_names"][0]
+    return {key: value for key, value in metadata.items() if value not in (None, [], {})}
+
+
+def _apply_component_disposition_to_split_result(
+    split_result: dict,
+    *,
+    solvent_type: Optional[str] = "explicit",
+) -> dict[str, Any]:
+    """Apply component-common prep disposition to split PDB fragments.
+
+    The split result is mutated in place so all downstream preparation steps
+    consume normalized component files.
+    """
+    entries: list[dict[str, Any]] = []
+    retained_ion_files: list[str] = []
+    excluded_ion_files: list[str] = []
+    all_chain_lookup = {
+        chain.get("chain_id"): chain
+        for chain in split_result.get("all_chains", []) or []
+    }
+
+    for info in split_result.get("chain_file_info", []) or []:
+        component_type = info.get("chain_type", "ligand")
+        current_file = info.get("file")
+        if not current_file:
+            continue
+        info = {
+            **all_chain_lookup.get(info.get("chain_id"), {}),
+            **info,
+        }
+        current_path = Path(current_file)
+        metadata = _component_disposition_metadata(info, component_type)
+
+        deuterium_stripped_file = current_path.parent / (
+            f"{current_path.stem}.deuterium_stripped{current_path.suffix}"
+        )
+        deuterium_payload = _exclude_deuterium_atoms_from_pdb(
+            current_path,
+            deuterium_stripped_file,
+        )
+        if deuterium_payload.get("entries"):
+            new_file = str(deuterium_stripped_file)
+            _replace_split_result_file(
+                split_result,
+                component_type=component_type,
+                old_path=current_file,
+                new_path=new_file,
+            )
+            info = {
+                **info,
+                "source_file": current_file,
+                "file": new_file,
+                "normalized_file": new_file,
+            }
+            current_file = new_file
+            current_path = deuterium_stripped_file
+            for entry in deuterium_payload.get("entries", []):
+                entries.append({
+                    **entry,
+                    **metadata,
+                    "source_file": str(info.get("source_file")),
+                    "normalized_file": new_file,
+                })
+
+        if component_type == "ion":
+            if solvent_type == "implicit":
+                atom_count = _pdb_atom_record_count(current_path)
+                excluded_ion_files.append(current_file)
+                entries.append({
+                    "component_id": (
+                        f"explicit_ion:{metadata.get('unique_id')}"
+                        if metadata.get("unique_id")
+                        else f"explicit_ion:{current_path.stem}"
+                    ),
+                    "classification": "explicit_ion",
+                    "default_action": "retain",
+                    "action_taken": "excluded",
+                    "atom_count": atom_count,
+                    "reason": (
+                        "Explicit ion particles are excluded from the prep "
+                        "output for implicit solvent; continuum solvent "
+                        "topology should not retain discrete ions."
+                    ),
+                    **metadata,
+                    "source_file": current_file,
+                })
+            else:
+                retained_ion_files.append(current_file)
+
+    return {
+        "component_disposition": _component_disposition_payload(entries),
+        "retained_ion_files": retained_ion_files,
+        "excluded_ion_files": excluded_ion_files,
+    }
+
+
+def _pdb_atom_count(pdb_file: str | Path) -> int:
+    """Count atom records in a PDB file."""
+    return sum(
+        1
+        for line in Path(pdb_file).read_text().splitlines()
+        if line.startswith(("ATOM  ", "HETATM"))
+    )
+
+
+def _pdb_hydrogen_count(pdb_file: str | Path) -> int:
+    """Count hydrogen-like atom records in a PDB file."""
+    count = 0
+    for line in Path(pdb_file).read_text().splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        element = line[76:78].strip().upper() if len(line) >= 78 else ""
+        atom_name = line[12:16].strip().upper()
+        if element in {"H", "D"} or atom_name.startswith(("H", "D")):
+            count += 1
+    return count
+
+
+def _pdb_residue_names(pdb_file: str | Path) -> set[str]:
+    """Return residue names present in a PDB file."""
+    names: set[str] = set()
+    for line in Path(pdb_file).read_text().splitlines():
+        if line.startswith(("ATOM", "HETATM")) and len(line) >= 20:
+            names.add(line[17:20].strip().upper())
+    return names
+
+
+def _pdb_hydrogen_counts_by_resname(
+    pdb_file: str | Path,
+    residue_names: set[str],
+) -> dict[str, int]:
+    """Count hydrogen-like atom records grouped by residue name."""
+    counts = {name: 0 for name in residue_names}
+    for line in Path(pdb_file).read_text().splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        resname = line[17:20].strip().upper()
+        if resname not in counts:
+            continue
+        element = line[76:78].strip().upper() if len(line) >= 78 else ""
+        atom_name = line[12:16].strip().upper()
+        if element in {"H", "D"} or atom_name.startswith(("H", "D")):
+            counts[resname] += 1
+    return counts
+
+
+def _pdb_noncap_protein_hydrogen_signature(
+    pdb_file: str | Path,
+) -> dict[str, tuple[str, ...]]:
+    """Return non-cap protein H atom-name sets keyed by residue identity."""
+    hydrogens: dict[str, list[str]] = {}
+    for line in Path(pdb_file).read_text().splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")):
+            continue
+        resname = line[17:20].strip().upper()
+        if resname in TERMINAL_CAP_RESIDUES:
+            continue
+        element = line[76:78].strip().upper() if len(line) >= 78 else ""
+        atom_name = line[12:16].strip().upper()
+        if element not in {"H", "D"} and not atom_name.startswith(("H", "D")):
+            continue
+        chain = line[21:22].strip()
+        resseq = line[22:26].strip()
+        icode = line[26:27].strip()
+        key = f"{chain}:{resseq}:{icode}:{resname}"
+        hydrogens.setdefault(key, []).append(atom_name)
+    return {
+        key: tuple(sorted(names))
+        for key, names in hydrogens.items()
+    }
+
+
+def _fix_amino_acid_hetatm_records(pdb_file: Path) -> None:
+    """Convert HETATM to ATOM for residues with amino acid backbone.
+
+    gemmi doesn't recognize Amber residue naming (HIE, NALA, etc.) and
+    writes them as HETATM. Detect amino acids by backbone atoms (N, CA, C)
+    instead of maintaining a residue name list.
+
+    Also removes HET header records for amino acid residues, which confuse
+    external tools like MEMEMBED (used by packmol-memgen for membrane embedding).
+    """
+    import gemmi
+
+    # Read structure to identify amino acid residues
+    st = gemmi.read_pdb(str(pdb_file))
+    amino_acid_residues = set()  # (chain_id, resnum, resname)
+    amino_acid_resnames = set()  # Just resnames for HET record filtering
+
+    for model in st:
+        for chain in model:
+            for res in chain:
+                atom_names = {a.name for a in res}
+                # Check for backbone atoms (N, CA, C)
+                if {"N", "CA", "C"}.issubset(atom_names):
+                    amino_acid_residues.add((chain.name, res.seqid.num, res.name))
+                    amino_acid_resnames.add(res.name)
+
+    if not amino_acid_residues:
+        return  # No amino acids to fix
+
+    # Fix HETATM records and remove HET header records for amino acids
+    with open(pdb_file) as f:
+        lines = f.readlines()
+
+    fixed_hetatm_count = 0
+    removed_het_count = 0
+    fixed_lines = []
+    for line in lines:
+        # Remove HET header records for amino acid residues
+        # Format: HET    resname chain resnum  natoms
+        if line.startswith("HET ") or line.startswith("HET\t"):
+            try:
+                parts = line.split()
+                if len(parts) >= 2:
+                    het_resname = parts[1].strip()
+                    if het_resname in amino_acid_resnames:
+                        removed_het_count += 1
+                        continue  # Skip this HET record
+            except (IndexError, ValueError):
+                pass
+        # Convert HETATM to ATOM for amino acid residues
+        elif line.startswith("HETATM"):
+            chain_id = line[21].strip() or line[21]
+            try:
+                resnum = int(line[22:26])
+                resname = line[17:20].strip()
+                if (chain_id, resnum, resname) in amino_acid_residues:
+                    line = "ATOM  " + line[6:]
+                    fixed_hetatm_count += 1
+            except ValueError:
+                pass
+        fixed_lines.append(line)
+
+    with open(pdb_file, 'w') as f:
+        f.writelines(fixed_lines)
+
+    if fixed_hetatm_count > 0:
+        logger.info(f"Fixed {fixed_hetatm_count} HETATM records to ATOM for amino acid residues")
+    if removed_het_count > 0:
+        logger.info(f"Removed {removed_het_count} HET header records for amino acid residues")
+
+
+def _iter_unique_conect_bonds(conect_map: dict) -> list[tuple[int, int, int]]:
+    """Return unique PDB CONECT bonds as ``(serial1, serial2, order)``.
+
+    Gemmi stores CONECT as a low-level serial-number map.  Some writers emit
+    both directions, and bond order is represented by repeating the partner
+    serial.  Collapse those records into one unordered bond while preserving
+    the maximum directional repeat count as the order.
+    """
+    directional_counts: Dict[Tuple[int, int], int] = {}
+    for serial1, partners in (conect_map or {}).items():
+        try:
+            s1 = int(serial1)
+        except (TypeError, ValueError):
+            continue
+        for partner in partners or []:
+            try:
+                s2 = int(partner)
+            except (TypeError, ValueError):
+                continue
+            if s1 <= 0 or s2 <= 0 or s1 == s2:
+                continue
+            directional_counts[(s1, s2)] = directional_counts.get((s1, s2), 0) + 1
+
+    pair_orders: Dict[Tuple[int, int], int] = {}
+    for (s1, s2), count in directional_counts.items():
+        key = (s1, s2) if s1 < s2 else (s2, s1)
+        pair_orders[key] = max(pair_orders.get(key, 0), count)
+
+    return [
+        (s1, s2, order)
+        for (s1, s2), order in sorted(pair_orders.items())
+    ]
+
+
+def _read_pdb_conect_bonds(pdb_file: str | Path) -> list[tuple[int, int, int]]:
+    """Read unique CONECT bonds directly from a PDB file.
+
+    Older gemmi releases do not expose ``Structure.conect_map``.  Prepared
+    ligand PDB files still need their internal bonds carried through merge, so
+    parse the records from text and reuse the same bond-order collapse logic.
+    """
+    conect_map: dict[int, list[int]] = {}
+    try:
+        lines = Path(pdb_file).read_text().splitlines()
+    except OSError:
+        return []
+
+    for line in lines:
+        if not line.startswith("CONECT"):
+            continue
+        fields = [
+            line[start:start + 5].strip()
+            for start in range(6, min(len(line), 31), 5)
+        ]
+        try:
+            serials = [int(field) for field in fields if field]
+        except ValueError:
+            tokens = line.split()[1:]
+            try:
+                serials = [int(token) for token in tokens]
+            except ValueError:
+                continue
+        if len(serials) < 2:
+            continue
+        source = serials[0]
+        conect_map.setdefault(source, []).extend(serials[1:])
+
+    return _iter_unique_conect_bonds(conect_map)
+
+
+def _read_pdb_unique_residues(pdb_file: str | Path) -> list[dict]:
+    """Read unique residue records from a PDB file without changing order."""
+    residues = []
+    seen = set()
+    for line in Path(pdb_file).read_text().splitlines():
+        if not line.startswith(("ATOM", "HETATM")) or len(line) < 27:
+            continue
+        chain = line[21].strip() or "A"
+        resnum = line[22:26].strip()
+        icode = line[26].strip()
+        resname = line[17:20].strip()
+        key = (chain, resnum, icode, resname)
+        if key in seen:
+            continue
+        seen.add(key)
+        residues.append({
+            "chain": chain,
+            "resnum": int(resnum) if resnum.lstrip("-").isdigit() else resnum,
+            "resnum_str": resnum,
+            "icode": icode,
+            "resname": resname,
+        })
+    return residues
+
+
+def _rename_pdb_residues(
+    input_pdb: Path,
+    output_pdb: Path,
+    rename_map: dict[tuple[str, str, str], str],
+) -> dict:
+    atom_count = 0
+    residue_keys = set()
+    renamed = 0
+    out_lines = []
+    for line in input_pdb.read_text().splitlines():
+        if line.startswith(("ATOM", "HETATM")) and len(line) >= 27:
+            atom_count += 1
+            chain = line[21].strip() or "A"
+            resnum = line[22:26].strip()
+            icode = line[26].strip()
+            residue_keys.add((chain, resnum, icode))
+            new_name = rename_map.get((chain, resnum, icode))
+            if new_name:
+                line = line[:17] + new_name.rjust(3)[:3] + line[20:]
+                renamed += 1
+        out_lines.append(line)
+    output_pdb.write_text("\n".join(out_lines) + "\n")
+    return {
+        "atom_count": atom_count,
+        "residue_count": len(residue_keys),
+        "renamed_atom_count": renamed,
+    }

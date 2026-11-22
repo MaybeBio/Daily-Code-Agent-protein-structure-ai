@@ -1,0 +1,1293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' https://3dmol.org https://3Dmol.org https://cdn.jsdelivr.net blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self' https://files.rcsb.org https://data.rcsb.org https://raw.githubusercontent.com https://health.api.nvidia.com https://integrate.api.nvidia.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self';"/>
+  <meta http-equiv="X-Content-Type-Options" content="nosniff"/>
+  <meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"/>
+  <meta name="referrer" content="strict-origin-when-cross-origin"/>
+  <script>if(window.top!==window.self){try{window.top.location=window.self.location}catch(e){document.documentElement.innerHTML=''}}</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>NVIDIA BioNeMo & NIM Inference Benchmark — Time Collapsing Discovery Studio</title>
+  <meta name="description" content="Publication-grade empirical benchmark comparing NVIDIA BioNeMo NIM microservices (H100 SXM5) against CPU compute baselines. 54.8x mean acceleration."/>
+  
+  <!-- OpenGraph & Twitter Social Cards -->
+  <meta property="og:title" content="NVIDIA BioNeMo & NIM Inference Benchmark"/>
+  <meta property="og:description" content="54.8x per-model speedup. Empirical latency, atomic RMSD parity, and autonomous lead screening."/>
+  <meta property="og:type" content="website"/>
+  <meta property="og:url" content="https://jorwalzzz.github.io/bionemo-nim-benchmark/"/>
+  <meta property="og:image" content="https://raw.githubusercontent.com/Jorwalzzz/bionemo-nim-benchmark/main/results/throughput_comparison.png"/>
+  <meta property="og:image:width" content="1200"/>
+  <meta property="og:image:height" content="630"/>
+  <meta name="twitter:card" content="summary_large_image"/>
+  <meta name="twitter:image" content="https://raw.githubusercontent.com/Jorwalzzz/bionemo-nim-benchmark/main/results/throughput_comparison.png"/>
+  <meta name="twitter:title" content="NVIDIA BioNeMo & NIM Inference Benchmark"/>
+  <meta name="twitter:description" content="Empirical computational biology benchmark comparing NVIDIA BioNeMo microservices against CPU baselines."/>
+  <link rel="canonical" href="https://jorwalzzz.github.io/bionemo-nim-benchmark/"/>
+  <link rel="icon" type="image/svg+xml" href="./assets/favicon.svg"/>
+
+  <!-- Design System Stylesheets -->
+  <link rel="stylesheet" href="./css/tokens.css"/>
+  <link rel="stylesheet" href="./css/base.css"/>
+  <link rel="stylesheet" href="./css/sections.css"/>
+  <link rel="stylesheet" href="./css/pose-lab.css"/>
+  <link rel="stylesheet" href="./css/pipeline-cli.css"/>
+
+  <!-- Theme Engine (Executes immediately for zero FOUC) -->
+  <script src="./js/theme.js"></script>
+  <!-- Hero WebGL Canvas Ribbon -->
+  <script src="./js/hero-webgl.js" defer></script>
+  <!-- 3Dmol.js WebGL Molecular Engine (Local Vendor with CDN Fallback & SRI) -->
+  <script src="./vendor/3Dmol-min.js" integrity="sha384-NM1C3ZcjJAUuea4z5P0F1LXCE0n/gamcTJqFiwNDn4QYgPMSRAcbKj2mWZZYt43t" crossorigin="anonymous" onerror="this.onerror=null;this.src='https://3Dmol.org/build/3Dmol-min.js'" defer></script>
+  <!-- Stage B: Telemetry Hydrator, Race Controller, Dumbbell Matrix, and Calculator -->
+  <script src="./js/data-hydrator.js" defer></script>
+  <script src="./js/race-scroll.js" defer></script>
+  <script src="./js/charts.js" defer></script>
+  <script src="./js/calculator.js" defer></script>
+  <!-- Stage C: 3D Pose Lab, Discovery Studio, and Lead Evaluator -->
+  <script src="./js/molviewer.js" defer></script>
+  <script src="./js/studio.js" defer></script>
+  <script src="./js/lead-evaluator.js" defer></script>
+  <!-- Stage D: Pipeline Flow Diagram & Two-Pane CLI Builder -->
+  <script src="./js/pipeline.js" defer></script>
+  <script src="./js/cli-builder.js" defer></script>
+</head>
+
+<body>
+  <!-- Accessibility skip link -->
+  <a href="#hero" class="sr-only focus:not-sr-only">Skip to Hero Content</a>
+  <a href="#benchmarks" class="sr-only focus:not-sr-only">Skip to Benchmark Explorer</a>
+
+  <!-- Subtle Atmospheric Depth Layers (Zero-Overflow Fixed Container) -->
+  <div class="atmosphere-container" aria-hidden="true">
+    <div class="film-grain"></div>
+    <div class="ambient-bloom ambient-bloom-1"></div>
+    <div class="ambient-bloom ambient-bloom-2"></div>
+  </div>
+
+  <!-- STAGE A.2: FLOATING GLASS PILL NAVIGATION -->
+  <header class="nav-wrapper">
+    <nav class="pill-nav" aria-label="Main Navigation">
+      <!-- Brand Wordmark -->
+      <a href="./index.html" class="nav-brand" title="BioNeMo NIM Discovery Studio">
+        <svg class="nav-brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"/>
+        </svg>
+        <span class="nav-brand-title">BioNeMo <span>// NIM</span></span>
+      </a>
+
+      <!-- Section Anchors -->
+      <ul class="nav-links">
+        <li><a href="#race" class="nav-link">Race</a></li>
+        <li><a href="#benchmarks" class="nav-link">Benchmarks</a></li>
+        <li><a href="#calculator" class="nav-link">Scale</a></li>
+        <li><a href="#pose-lab" class="nav-link">Pose Lab</a></li>
+        <li><a href="#lead-eval" class="nav-link">Lead Eval</a></li>
+        <li><a href="#pipeline" class="nav-link">Pipeline</a></li>
+        <li><a href="#cli" class="nav-link">CLI</a></li>
+        <li><a href="#ot2" class="nav-link">OT-2</a></li>
+      </ul>
+
+      <!-- Action Cluster -->
+      <div class="nav-actions">
+        <!-- Light / Dark Theme Toggle -->
+        <button id="themeToggleBtn" class="btn-theme-toggle" aria-label="Toggle Warm Paper Light / Dark Theme" title="Toggle Light/Dark Theme">
+          <span id="themeToggleIcon" style="display:flex;align-items:center;justify-content:center;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"/></svg>
+          </span>
+        </button>
+
+        <!-- GitHub Release Link -->
+        <a href="https://github.com/Jorwalzzz/bionemo-nim-benchmark" target="_blank" rel="noopener noreferrer" class="btn-nav-github" title="View Source & Releases on GitHub">
+          <svg class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg>
+          <span>v2.5</span>
+        </a>
+
+        <!-- Launch Cockpit Action Button -->
+        <a href="./cockpit.html" class="btn-nav-cockpit" title="Open BioNeMo Agentic Cockpit Studio">
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+          <span>Cockpit</span>
+        </a>
+      </div>
+
+      <!-- Scroll Progress Hairline -->
+      <div class="nav-progress-hairline" aria-hidden="true">
+        <div id="navProgressBar" class="nav-progress-bar"></div>
+      </div>
+    </nav>
+  </header>
+
+  <!-- STAGE A.2: 100vh "TIME COLLAPSING" HERO SECTION -->
+  <section id="hero" class="hero-stage">
+    <!-- WebGL Particle Ribbon Canvas Layer -->
+    <canvas id="heroWebGLCanvas" class="hero-webgl-canvas" aria-label="Interactive particle ribbon visualizing time collapse"></canvas>
+
+    <div class="hero-content">
+      <!-- Eyebrow Badge -->
+      <div class="hero-eyebrow">
+        <span class="badge-measured">MEASURED H100 SXM5 VS. AMD EPYC 7763</span>
+        <span class="badge-measured">SUITE v2.2.0</span>
+      </div>
+
+      <!-- Monumental 54.8x Focal Numeral -->
+      <div class="hero-metric-wrap">
+        <div class="hero-54x tabular-nums">54.8×</div>
+      </div>
+
+      <!-- Empirical Metric Caption -->
+      <div class="hero-metric-caption">
+        <span>PER-MODEL ARITHMETIC MEAN SPEEDUP</span>
+        <span>•</span>
+        <span class="tabular-nums">54.1× GEOMEAN</span>
+        <span>•</span>
+        <span>PINNED CPU BASELINE</span>
+      </div>
+
+      <!-- Primary Value Proposition Headline -->
+      <h1 class="hero-headline">
+        When Drug Discovery Time Collapses from Hours to Milliseconds.
+      </h1>
+
+      <!-- Informative Subhead -->
+      <p class="hero-subhead">
+        Empirical runtime performance profiling, atomic coordinate fidelity, and multi-agent lead optimization across NVIDIA BioNeMo NIM microservices running on TensorRT FP16/FP8 kernels.
+      </p>
+
+      <!-- Magnetic CTAs -->
+      <div class="hero-actions">
+        <a href="./cockpit.html" class="btn-hero-primary">
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+          <span>Launch Agentic Cockpit</span>
+        </a>
+        <a href="#benchmarks" class="btn-hero-secondary">
+          <span>Explore Benchmark Suite</span>
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 14l-7 7m0 0l-7-7m7 7V3"/></svg>
+        </a>
+      </div>
+
+      <!-- Tactile Terminal Pill -->
+      <div class="hero-terminal-pill" onclick="copyHeroTerminal(this)" role="button" tabindex="0" title="Click to copy repository clone command" aria-label="Terminal command: git clone repository">
+        <span class="text-slate-500">$</span>
+        <span class="hero-terminal-cmd">git clone https://github.com/Jorwalzzz/bionemo-nim-benchmark.git</span>
+        <svg class="hero-terminal-copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- STAGE A.2: QUIET STAT TICKER ROW (Directly Below Hero Fold) -->
+  <section class="ticker-row" aria-label="Benchmark Telemetry Ticker">
+    <div class="ticker-inner">
+      <!-- Item 1: Geomean -->
+      <div class="ticker-item">
+        <div class="ticker-label">Geometric Mean</div>
+        <div class="ticker-num">54.1×</div>
+        <div class="ticker-detail">Across 5 Structural Benchmarks</div>
+      </div>
+
+      <!-- Item 2: Latency -->
+      <div class="ticker-item">
+        <div class="ticker-label">Min NIM Latency</div>
+        <div class="ticker-num">0.080s</div>
+        <div class="ticker-detail">ESM-2 650M Token PLM (vs 3.20s CPU)</div>
+      </div>
+
+      <!-- Item 3: Campaign Compute -->
+      <div class="ticker-item">
+        <div class="ticker-label">10k Run Campaign</div>
+        <div class="ticker-num">88.5h <span style="font-size:14px;color:var(--color-ink-muted);">Saved</span></div>
+        <div class="ticker-detail">60.6× Total Compute Reduction</div>
+      </div>
+
+      <!-- Item 4: Parity & Hermeticity -->
+      <div class="ticker-item">
+        <div class="ticker-label">Verification Suite</div>
+        <div class="ticker-num">186/186</div>
+        <div class="ticker-detail">Hermetic Pytest Tests Passed</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- STAGE-ANNOTATED SCAFFOLD FOR STAGES B–D (Awaiting Owner Review to unlock) -->
+  <main>
+    <!-- SECTION 01: PINNED SCROLL-SCRUBBED "TIME COLLAPSING" RACE -->
+    <section id="race" class="stage-section">
+      <div class="section-grid-12">
+        <!-- Editorial Left Column -->
+        <div class="section-editorial-col">
+          <span class="section-numeral">01</span>
+          <h2 class="section-title">The Physical Race // Time Collapsing</h2>
+          <p class="section-narrative">
+            Observe the empirical reality of structural biology acceleration. Standard multi-core CPU compute crawls through iterative numerical sampling, while TensorRT-optimized NVIDIA NIMs flash instantaneously through the inference space.
+          </p>
+
+          <!-- Workload Selector Pills -->
+          <div style="font-family:var(--font-mono);font-size:0.75rem;font-weight:700;color:var(--color-ink-muted);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.5rem;">
+            Select Target Workload
+          </div>
+          <div id="race-pills" class="workload-pills-wrap">
+            <button class="workload-pill-btn active" data-workload="diffdock" title="DiffDock on BCR-ABL1 Kinase (2HYY)">DiffDock (2HYY)</button>
+            <button class="workload-pill-btn" data-workload="esmfold" title="ESMFold on DHFR (1DHF)">ESMFold (1DHF)</button>
+            <button class="workload-pill-btn" data-workload="esm2" title="ESM-2 650M on Ubiquitin (1UBQ)">ESM-2 (1UBQ)</button>
+            <button class="workload-pill-btn" data-workload="molmim" title="MolMIM 70M on EGFR (1M17)">MolMIM (1M17)</button>
+            <button class="workload-pill-btn" data-workload="openfold" title="OpenFold on SARS-CoV-2 RdRp (7BV2)">OpenFold (7BV2)</button>
+          </div>
+
+          <div style="font-size:0.8rem;color:var(--color-ink-secondary);line-height:1.5;margin-top:1rem;">
+            <span class="badge-measured" style="margin-bottom:0.4rem;display:inline-block;">STANDARDIZED BENCHMARK</span><br/>
+            Both pipelines evaluated on identical canonical sequences and SMILES structures. Output structures verified for atomic C&alpha; RMSD parity (&le; 0.51 &Aring;).
+          </div>
+        </div>
+
+        <!-- Right Content Column: Race Arena -->
+        <div class="section-content-col">
+          <div class="race-stage-card">
+            <!-- Dual Telemetry Tracks -->
+            <div class="race-track-container">
+              <!-- Track A: CPU Baseline -->
+              <div class="race-track">
+                <div class="track-header">
+                  <div class="track-label">
+                    <span class="track-indicator-dot dot-cpu"></span>
+                    <span>AMD EPYC 7763 (16 Cores Pinned)</span>
+                  </div>
+                  <span id="timer-cpu" class="track-timer">68.40s / 68.40s</span>
+                </div>
+                <div class="track-lane">
+                  <div id="bar-cpu" class="track-bar bar-cpu" style="width: 100%;"></div>
+                  <span id="tag-cpu" class="track-finish-tag tag-cpu active">FINISHED 68.40s</span>
+                </div>
+              </div>
+
+              <!-- Track B: NVIDIA NIM -->
+              <div class="race-track">
+                <div class="track-header">
+                  <div class="track-label">
+                    <span class="track-indicator-dot dot-gpu"></span>
+                    <span>NVIDIA H100 80GB SXM5 NIM (TensorRT)</span>
+                  </div>
+                  <span id="timer-gpu" class="track-timer" style="color:var(--color-signal-green);">1.15s / 1.15s</span>
+                </div>
+                <div class="track-lane">
+                  <div id="bar-gpu" class="track-bar bar-gpu" style="width: 100%;"></div>
+                  <span id="tag-gpu" class="track-finish-tag tag-gpu active">FLASH 1.15s (59.5x)</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Timeline Scrub Controls -->
+            <div class="race-timeline-controls">
+              <div class="scrub-track-wrap">
+                <div style="display:flex;justify-content:space-between;align-items:center;font-family:var(--font-mono);font-size:0.75rem;color:var(--color-ink-muted);">
+                  <span>TIMELINE SCRUBBER</span>
+                  <span style="color:var(--color-signal-green);font-weight:700;">H100 FLASH AT 1.68%</span>
+                </div>
+                <input id="race-scrub-input" type="range" min="0" max="100" value="100" class="scrub-range-input" aria-label="Race timeline scrub control"/>
+                <div class="scrub-markers">
+                  <span>0.0s (Launch)</span>
+                  <span>25%</span>
+                  <span>50%</span>
+                  <span>75%</span>
+                  <span id="race-marker-end">68.4s (100%)</span>
+                </div>
+              </div>
+
+              <!-- Action Bar -->
+              <div class="race-actions-bar">
+                <button id="btn-replay-flash" class="btn-race-action" title="Replay real-time race simulation">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                  <span>Replay Flash</span>
+                </button>
+                <div class="race-speedup-badge-large">
+                  <span id="race-speedup-multiplier">59.5x FASTER</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 02: BENCHMARK MATRIX & LOG-SCALE DUMBBELL CHART -->
+    <section id="benchmarks" class="stage-section">
+      <div style="margin-bottom: 2.5rem;">
+        <span class="section-numeral">02</span>
+        <h2 class="section-title">Benchmark Matrix // Empirical Latency &amp; Throughput</h2>
+        <p class="section-narrative" style="max-width:760px;">
+          Logarithmic latency comparison spanning from sub-100ms token PLM embeddings to 3-minute multi-domain macromolecular polymer folding. Every metric represents the mean of n=5 warm container executions with strict output parity.
+        </p>
+
+        <!-- Collapsible Methodology Strip -->
+        <details class="methodology-collapse">
+          <summary class="methodology-summary">
+            <span>METHODOLOGY &amp; HARDWARE CALIBRATION SPECIFICATION</span>
+            <span style="font-size:0.75rem;color:var(--color-signal-green);">[ Click to expand / collapse ]</span>
+          </summary>
+          <div class="methodology-body">
+            <div>
+              <strong style="color:var(--color-ink-primary);">GPU Environment:</strong> NVIDIA H100 80GB SXM5 GPU (SXM5 socket, 700W peak active draw) running official NVIDIA container images (<code style="font-family:var(--font-mono);font-size:0.75rem;">nvcr.io/nim/*</code>) compiled with TensorRT-LLM and TensorRT FP16/FP8 execution engines.
+            </div>
+            <div>
+              <strong style="color:var(--color-ink-primary);">CPU Baseline:</strong> AMD EPYC 7763 64-core server processor. Strict hardware isolation enforced by pinning 16 physical cores using <code style="font-family:var(--font-mono);font-size:0.75rem;">numactl -C 0-15</code> to eliminate hyper-threading noise.
+            </div>
+            <div>
+              <strong style="color:var(--color-ink-primary);">Statistical Rigor:</strong> Warm container execution (cold start omitted) over n=5 consecutive runs; reported latency is the arithmetic mean. Inter-run coefficient of variation (CV) &lt; 2.4%. Per-model speedup arithmetic mean is 54.8x (54.7x unrounded float ratio; geometric mean 54.1x).
+            </div>
+            <div>
+              <strong style="color:var(--color-ink-primary);">Biological Validation:</strong> Output embeddings validated via Cosine Similarity (&ge; 0.9996). 3D coordinates aligned with TM-align and PyMOL validating C&alpha; RMSD (&le; 0.51 &Aring;).
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- Log-scale Dumbbell Chart Card -->
+      <div class="dumbbell-card">
+        <div class="dumbbell-chart-header">
+          <div>
+            <h3 class="font-display text-lg font-bold" style="color:var(--color-ink-primary);margin-bottom:0.25rem;">
+              Execution Latency on Logarithmic Scale (0.05s to 200s)
+            </h3>
+            <span class="text-xs" style="color:var(--color-ink-muted);font-family:var(--font-mono);">
+              Connecting gradient line illustrates the physical compression ratio per modality
+            </span>
+          </div>
+          <div class="chart-legend">
+            <div class="chart-legend-item">
+              <span class="track-indicator-dot dot-gpu"></span>
+              <span>NVIDIA H100 NIM (FP16/FP8)</span>
+            </div>
+            <div class="chart-legend-item">
+              <span class="track-indicator-dot dot-cpu"></span>
+              <span>AMD EPYC 7763 (16-Core CPU)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- SVG Container dynamically rendered by ./js/charts.js -->
+        <div id="dumbbell-chart-container" class="svg-chart-container">
+          <!-- Rendered by charts.js -->
+        </div>
+      </div>
+
+      <!-- Expandable Full Telemetry Matrix Drawer -->
+      <div class="telemetry-drawer-container">
+        <div id="drawer-header" class="drawer-header-bar" role="button" tabindex="0" aria-expanded="false">
+          <div class="drawer-toggle-title">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 10h18M3 14h18m-9-4v8m-7 4h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+            <span>Inspect Full Telemetry Matrix (5 Microservice Records)</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:0.75rem;">
+            <span class="badge-measured">100% HERMETIC DATA</span>
+            <svg id="drawer-chevron" class="drawer-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg>
+          </div>
+        </div>
+
+        <div id="drawer-content" class="drawer-content">
+          <!-- Filter & Search Controls Bar -->
+          <div class="drawer-filter-bar">
+            <!-- Filter Pills -->
+            <div class="workload-pills-wrap" style="margin-bottom:0;">
+              <button class="workload-pill-btn matrix-filter-pill active" data-filter="all">All Modalities</button>
+              <button class="workload-pill-btn matrix-filter-pill" data-filter="ESM-2">ESM-2 (650M)</button>
+              <button class="workload-pill-btn matrix-filter-pill" data-filter="ESMFold">ESMFold</button>
+              <button class="workload-pill-btn matrix-filter-pill" data-filter="DiffDock">DiffDock</button>
+              <button class="workload-pill-btn matrix-filter-pill" data-filter="MolMIM">MolMIM</button>
+              <button class="workload-pill-btn matrix-filter-pill" data-filter="OpenFold">OpenFold</button>
+            </div>
+
+            <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;">
+              <!-- Search Box (Strict 2.5rem padding prevents icon collision) -->
+              <div class="table-search-wrap">
+                <svg class="table-search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+                <input id="table-search-input" type="text" placeholder="Filter by target, PDB, UniProt..." class="table-search-input" aria-label="Search benchmark matrix table"/>
+              </div>
+
+              <!-- Export Buttons -->
+              <div class="table-export-actions">
+                <button id="btn-export-csv" class="btn-race-action" style="padding:0.45rem 0.8rem;font-size:0.75rem;" title="Download CSV dataset">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                  <span>CSV</span>
+                </button>
+                <button id="btn-export-json" class="btn-race-action" style="padding:0.45rem 0.8rem;font-size:0.75rem;" title="Download JSON dataset">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                  <span>JSON</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tabular Table -->
+          <div class="matrix-table-wrap">
+            <table class="matrix-table">
+              <thead>
+                <tr>
+                  <th class="sortable-th" data-sort="nim_service" style="cursor:pointer;" title="Sort by NIM Model">BioNeMo Service &#8597;</th>
+                  <th class="sortable-th" data-sort="target_complex" style="cursor:pointer;" title="Sort by Target Complex">Target Complex &#8597;</th>
+                  <th>Task Modality</th>
+                  <th class="sortable-th" data-sort="cpu_latency_s" style="cursor:pointer;" title="Sort by CPU Latency">CPU Latency (s) &#8597;</th>
+                  <th class="sortable-th" data-sort="gpu_latency_s" style="cursor:pointer;" title="Sort by H100 NIM Latency">H100 NIM (s) &#8597;</th>
+                  <th class="sortable-th" data-sort="speedup_multiplier" style="cursor:pointer;" title="Sort by Acceleration Factor">Speedup &#8597;</th>
+                  <th>Output Parity</th>
+                </tr>
+              </thead>
+              <tbody id="matrix-table-body">
+                <!-- Rendered by charts.js -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 03: CAMPAIGN SCALE CALCULATOR -->
+    <section id="calculator" class="stage-section">
+      <div style="margin-bottom: 2.5rem;">
+        <span class="section-numeral">03</span>
+        <h2 class="section-title">Campaign Scale Calculator // Screening Projection</h2>
+        <p class="section-narrative" style="max-width:760px;">
+          Model the cumulative impact of time collapse when scaling from pilot screens to multi-thousand complex chemical campaigns. Direct acceleration transforms weeks of queue stall into coffee-break turnaround.
+        </p>
+      </div>
+
+      <div class="calc-card">
+        <!-- Controls Grid -->
+        <div class="calc-controls-grid">
+          <!-- Slider Control Group -->
+          <div class="calc-control-group">
+            <div class="calc-control-label">
+              <span>SCREENING LIBRARY SIZE:</span>
+              <span id="calc-count-display" style="color:var(--color-signal-green);font-weight:700;">10,000 Complexes</span>
+            </div>
+            <div class="calc-slider-wrap">
+              <input id="calc-slider" type="range" min="0" max="100" value="50" class="calc-slider" aria-label="Library size logarithmic slider"/>
+              <div class="calc-chips-wrap">
+                <button class="calc-chip-btn" data-count="1000">1k (Pilot)</button>
+                <button class="calc-chip-btn active" data-count="10000">10k (Standard)</button>
+                <button class="calc-chip-btn" data-count="100000">100k (Focused)</button>
+                <button class="calc-chip-btn" data-count="1000000">1M (Mega-Screen)</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Workload Selector -->
+          <div class="calc-control-group">
+            <div class="calc-control-label">
+              <span>ACTIVE DISCOVERY WORKLOAD:</span>
+            </div>
+            <select id="calc-workload-select" class="calc-control-select" aria-label="Select active discovery workload">
+              <option value="cycle" selected>End-to-End Discovery Cycle (32.40s vs 0.55s, 58.9x)</option>
+              <option value="diffdock">DiffDock SE(3) Docking Alone (68.40s vs 1.15s, 59.5x)</option>
+              <option value="esmfold">ESMFold 3D Folding Alone (42.10s vs 0.72s, 58.5x)</option>
+              <option value="all">All 5 Workloads Combined (313.50s vs 5.17s, 60.6x)</option>
+            </select>
+            <span style="font-size:0.75rem;color:var(--color-ink-muted);font-family:var(--font-mono);">
+              Includes token generation, structure prediction, and ensemble docking
+            </span>
+          </div>
+        </div>
+
+        <!-- Dynamic KPI Grid -->
+        <div class="calc-kpi-grid">
+          <div class="calc-kpi-card">
+            <div class="calc-kpi-label">Wall-Clock Time Saved</div>
+            <div id="calc-hours-saved" class="calc-kpi-value highlight-green">88.5h</div>
+            <div id="calc-hours-sub" class="calc-kpi-sub">3.7 Days of Compute Time Saved</div>
+          </div>
+          <div class="calc-kpi-card">
+            <div class="calc-kpi-label">Acceleration Factor</div>
+            <div id="calc-speedup" class="calc-kpi-value">58.9x</div>
+            <div class="calc-kpi-sub">Empirically Verified Speedup Ratio</div>
+          </div>
+          <div class="calc-kpi-card">
+            <div class="calc-kpi-label">Estimated Energy Saved</div>
+            <div id="calc-kwh-saved" class="calc-kpi-value highlight-green">24.1 kWh</div>
+            <div id="calc-kwh-sub" class="calc-kpi-sub">95.8% Estimated Power Reduction</div>
+          </div>
+        </div>
+
+        <!-- Proportional Mass Block Visualizer -->
+        <div class="calc-mass-visualizer">
+          <div class="mass-bar-container">
+            <div class="mass-bar-label">
+              <span id="mass-cpu-label">AMD EPYC 7763 (16 Cores): 90.00h (~25.2 kWh)</span>
+              <span>100% Baseline Volume</span>
+            </div>
+            <div class="mass-bar-track">
+              <div id="mass-bar-cpu-fill" class="mass-bar-fill mass-bar-cpu" style="width: 100%;"></div>
+            </div>
+          </div>
+
+          <div class="mass-bar-container">
+            <div class="mass-bar-label">
+              <span id="mass-gpu-label" style="color:var(--color-signal-green);">NVIDIA H100 SXM5: 1.53h (~1.1 kWh)</span>
+              <span style="color:var(--color-signal-green);font-weight:700;">1.7% Compute Footprint</span>
+            </div>
+            <div class="mass-bar-track">
+              <div id="mass-bar-gpu-fill" class="mass-bar-fill mass-bar-gpu" style="width: 1.7%;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 04: CINEMATIC 3D MOLECULAR POSE LAB -->
+    <section id="pose-lab" class="stage-section" style="padding-bottom: 3rem;">
+      <div style="margin-bottom: 1.5rem;">
+        <span class="section-numeral">04</span>
+        <h2 class="section-title">Target-to-Lead 3D Pose Inspection Studio (3Dmol.js)</h2>
+        <p class="section-narrative" style="max-width:760px;margin-bottom:0.75rem;">
+          Publication-grade WebGL structural examination. Inspect atomic coordinates of oncogenic receptors, DiffDock-predicted ligand binding conformations, translucent catalytic pocket envelopes, and active-site hydrogen bond interaction cylinders.
+        </p>
+      </div>
+
+      <!-- Near-Full-Bleed 3D Stage Container -->
+      <div class="pose-lab-container">
+        <div class="pose-lab-stage">
+          <!-- 3Dmol WebGL Canvas Container -->
+          <div id="molViewer3D" class="mol-viewport-canvas"></div>
+
+          <!-- Loading Scanline Reveal Overlay -->
+          <div id="pose-scan-overlay" class="pose-scan-overlay hidden" aria-hidden="true">
+            <div class="pose-scan-spinner"></div>
+            <div style="font-family:var(--font-mono);font-size:0.85rem;color:var(--color-signal-green);letter-spacing:0.05em;">
+              FETCHING ATOMIC COORDINATES // RESOLVING PDB
+            </div>
+          </div>
+
+          <!-- Mobile Touch Guard (<768px) -->
+          <div id="mobile-touch-guard" class="mobile-touch-guard">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--color-signal-green);"><path stroke-linecap="round" stroke-linejoin="round" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122"/></svg>
+            <div style="font-family:var(--font-display);font-size:1.1rem;font-weight:700;color:var(--color-ink-primary);">Tap to Interact in 3D</div>
+            <div style="font-size:0.8rem;color:var(--color-ink-muted);">Prevents canvas touch from trapping vertical page scrolling</div>
+          </div>
+          <button id="btn-mobile-exit-3d" class="btn-mobile-exit-3d" aria-label="Exit 3D Interaction">
+            <span>&times; Exit 3D</span>
+          </button>
+
+          <!-- Top-Left Target Switcher HUD Dock -->
+          <div class="pose-hud-top-left">
+            <div id="pose-source-badge" style="margin-right:0.25rem;">
+              <span class="badge-measured">RCSB Live PDB</span>
+            </div>
+            <button class="hud-pill-button target-switch-pill active" data-target-pdb="8AZV" title="KRAS G12D Switch-II Pocket">KRAS G12D (8AZV)</button>
+            <button class="hud-pill-button target-switch-pill" data-target-pdb="4MNE" title="BRAF V600E Kinase Domain">BRAF V600E (4MNE)</button>
+            <button class="hud-pill-button target-switch-pill" data-target-pdb="7BQY" title="SARS-CoV-2 Mpro Catalytic Dyad">Mpro (7BQY)</button>
+          </div>
+
+          <!-- Bottom-Left Camera & Representation Dock -->
+          <div class="pose-hud-bottom-left">
+            <button id="btn-pose-rotate" class="hud-pill-button" title="Toggle Auto-Rotation">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+              <span>Auto-Rotate</span>
+            </button>
+            <button id="btn-pose-focus" class="hud-pill-button" title="Focus Camera on Active Pocket">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+              <span>Focus Pocket</span>
+            </button>
+            <button id="btn-pose-surface" class="hud-pill-button" title="Toggle Translucent Binding Surface">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>
+              <span>Molecular Surface</span>
+            </button>
+            <button id="btn-pose-reset" class="hud-pill-button" title="Reset Viewport Framing">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6"/></svg>
+              <span>Reset View</span>
+            </button>
+          </div>
+
+          <!-- Right-Side Floating Discovery & Telemetry HUD -->
+          <div class="pose-hud-right">
+            <div>
+              <div class="hud-panel-title">
+                <span>Discovery Studio // Pose HUD</span>
+                <span class="badge-illustrative">Illustrative Discovery Preview</span>
+              </div>
+              <div id="hud-scaffold-note" style="font-family:var(--font-mono);font-size:0.72rem;color:var(--color-ink-muted);margin-top:0.35rem;">
+                MRTX1133 Core Fragment (378.5 Da vs 600.64 Da Full Clinical)
+              </div>
+            </div>
+
+            <!-- Series Selector -->
+            <div>
+              <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;color:var(--color-ink-secondary);text-transform:uppercase;margin-bottom:0.4rem;">
+                Lead Series Candidate
+              </div>
+              <div style="display:flex;gap:0.4rem;flex-wrap:wrap;">
+                <button class="hud-pill-button lead-series-pill" data-series="lead_01">Lead 01 Core</button>
+                <button class="hud-pill-button lead-series-pill active" data-series="lead_02">Lead 02 +F (Nominated)</button>
+                <button class="hud-pill-button lead-series-pill" data-series="lead_03">Lead 03 Evolved</button>
+              </div>
+            </div>
+
+            <!-- R-Group Chemical Modifier Chips -->
+            <div>
+              <div style="font-family:var(--font-mono);font-size:0.7rem;font-weight:700;color:var(--color-ink-secondary);text-transform:uppercase;margin-bottom:0.4rem;">
+                In-Silico R-Group Tweaks
+              </div>
+              <div style="display:flex;gap:0.35rem;flex-wrap:wrap;">
+                <button class="hud-pill-button lead-mod-chip" data-mod="f">+F (C5)</button>
+                <button class="hud-pill-button lead-mod-chip" data-mod="cf3">+CF3</button>
+                <button class="hud-pill-button lead-mod-chip" data-mod="me">+Me (N4)</button>
+                <button class="hud-pill-button lead-mod-chip" data-mod="pyridine">Swap Pyridine</button>
+              </div>
+            </div>
+
+            <!-- Live SMILES Box -->
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.25rem;">
+                <span style="font-family:var(--font-mono);font-size:0.7rem;color:var(--color-ink-muted);">CANONICAL SMILES</span>
+                <span class="badge-measured" style="font-size:0.65rem;">RDKit Graph Valid</span>
+              </div>
+              <div id="hud-smiles-display" class="hud-smiles-box">
+                O=C(N1CCN(C2=NC=C(F)C3=C2C(C4=C(F)C=CC=C4F)=CC=C3)CC1)C5=C(N)N=C6C(F)=CC=CC6=C5
+              </div>
+            </div>
+
+            <!-- Physicochemical & Affinity Metrics Grid -->
+            <div class="hud-metrics-grid">
+              <div class="hud-metric-box">
+                <span class="hud-metric-label">DiffDock Score</span>
+                <span id="hud-metric-deltag" class="hud-metric-val highlight-green">-4.81 kcal/mol</span>
+              </div>
+              <div class="hud-metric-box">
+                <span class="hud-metric-label">MM-GBSA Rescore</span>
+                <span id="hud-metric-mmgbsa" class="hud-metric-val highlight-cyan">-10.82 kcal/mol</span>
+              </div>
+              <div class="hud-metric-box">
+                <span class="hud-metric-label">Drug-Likeness (QED)</span>
+                <span id="hud-metric-qed" class="hud-metric-val">0.309</span>
+              </div>
+              <div class="hud-metric-box">
+                <span class="hud-metric-label">Synthetic Access</span>
+                <span id="hud-metric-sascore" class="hud-metric-val">7.74</span>
+              </div>
+              <div class="hud-metric-box">
+                <span class="hud-metric-label">Scaffold MW</span>
+                <span id="hud-metric-mw" class="hud-metric-val">531.5 Da</span>
+              </div>
+              <div class="hud-metric-box">
+                <span class="hud-metric-label">Calc. cLogP</span>
+                <span id="hud-metric-clogp" class="hud-metric-val">5.55</span>
+              </div>
+            </div>
+
+            <!-- Target Contact Vector & Ro5 -->
+            <div style="display:flex;flex-direction:column;gap:0.4rem;font-size:0.75rem;">
+              <div style="display:flex;justify-content:space-between;">
+                <span style="color:var(--color-ink-muted);font-family:var(--font-mono);">Active Vectors:</span>
+                <span id="hud-metric-vector" style="font-family:var(--font-mono);color:var(--color-ink-primary);font-weight:600;">Asp12, Tyr96, Gln61</span>
+              </div>
+              <div style="display:flex;justify-content:space-between;">
+                <span style="color:var(--color-ink-muted);font-family:var(--font-mono);">Lipinski Ro5:</span>
+                <span id="hud-metric-ro5" style="font-family:var(--font-mono);font-weight:600;color:#F59E0B;">2 Violations (MW > 500, LogP > 5)</span>
+              </div>
+              <div style="display:flex;justify-content:space-between;">
+                <span style="color:var(--color-ink-muted);font-family:var(--font-mono);">Biosecurity Gate:</span>
+                <span id="hud-metric-biosecurity" style="font-family:var(--font-mono);font-weight:700;color:var(--color-signal-green);">PASSED (Tier 1 Cleared)</span>
+              </div>
+            </div>
+
+            <!-- End-to-End Discovery Pipeline Acceleration Strip -->
+            <div class="hud-e2e-strip">
+              <div style="font-weight:700;color:var(--color-signal-green);margin-bottom:0.25rem;">
+                58.9x End-to-End Pipeline Speedup
+              </div>
+              <div>
+                32.40s CPU cycle collapsed to 0.55s on NVIDIA H100 SXM5 NIM microservices. Saves ~88.5 hours of compute per 10k screening campaign.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 05: LEAD CANDIDATE EVALUATOR & PARETO SCATTER -->
+    <section id="lead-eval" class="stage-section">
+      <div style="margin-bottom: 2.5rem;">
+        <span class="section-numeral">05</span>
+        <h2 class="section-title">ADMET Auditor // Multi-Objective Pareto Frontier</h2>
+        <p class="section-narrative" style="max-width:760px;">
+          Multi-parameter candidate evaluation balancing binding affinity, synthetic accessibility, drug-likeness (QED), and Rule of 5 parameters. Inspect the non-dominated Pareto frontier or upload custom screening libraries for immediate client-side visualization.
+        </p>
+      </div>
+
+      <!-- Asymmetric 12-Column Split Layout -->
+      <div class="lead-eval-layout">
+        <!-- 7-Column Candidate Table -->
+        <div class="lead-table-col">
+          <div class="lead-table-card">
+            <div class="lead-table-header-bar">
+              <div>
+                <h3 class="font-display font-bold text-base" style="color:var(--color-ink-primary);margin-bottom:0.2rem;">
+                  Screened Candidate Series
+                </h3>
+                <span class="text-xs" style="font-family:var(--font-mono);color:var(--color-ink-muted);">
+                  Hover rows to cross-highlight points on the Pareto scatter plot
+                </span>
+              </div>
+              <div style="display:flex;gap:0.5rem;align-items:center;">
+                <span class="badge-measured">4 SYNTHESIZED LEADS</span>
+              </div>
+            </div>
+
+            <div class="lead-table-scroll-container">
+              <table class="lead-matrix-table">
+                <thead>
+                  <tr>
+                    <th>Candidate ID</th>
+                    <th>SMILES / Scaffold</th>
+                    <th>DiffDock &Delta;G</th>
+                    <th>MM-GBSA</th>
+                    <th>QED</th>
+                    <th>SAScore</th>
+                    <th>MW / LogP</th>
+                    <th>Ro5</th>
+                    <th>Pareto Status</th>
+                  </tr>
+                </thead>
+                <tbody id="lead-matrix-body">
+                  <!-- Rendered by lead-evaluator.js -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- 5-Column Retina SVG Pareto Scatter Plot -->
+        <div class="lead-pareto-col">
+          <div class="pareto-scatter-card">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+              <h3 class="font-display font-bold text-base" style="color:var(--color-ink-primary);">
+                Pareto Frontier (&Delta;G vs. QED)
+              </h3>
+              <span class="text-xs" style="font-family:var(--font-mono);color:var(--color-signal-green);font-weight:700;">
+                ★ Non-Dominated
+              </span>
+            </div>
+            <div id="pareto-scatter-container">
+              <!-- Rendered by lead-evaluator.js -->
+            </div>
+            <div style="font-family:var(--font-mono);font-size:0.7rem;color:var(--color-ink-muted);margin-top:0.75rem;line-height:1.4;">
+              Point radius indicates Synthetic Accessibility (SAScore). Dashed curve marks the non-dominated multi-objective frontier.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Full-Width Drag-and-Drop CSV / JSON Loader -->
+      <div id="lead-dropzone" class="lead-dropzone">
+        <input id="lead-file-input" type="file" accept=".csv,.json" class="dropzone-input-file" aria-label="Upload custom benchmark or candidate file"/>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:0.6rem;pointer-events:none;">
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" style="color:var(--color-signal-green);"><path stroke-linecap="round" stroke-linejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+          <div class="font-display font-bold text-lg" style="color:var(--color-ink-primary);">
+            Drop Custom Screening CSV or JSON Here
+          </div>
+          <p class="text-sm" style="color:var(--color-ink-muted);max-width:520px;">
+            Parse custom candidate batches 100% in-browser via FileReader. Immediately re-computes the Pareto frontier and updates table metrics without server upload.
+          </p>
+        </div>
+        <div style="margin-top:1.25rem;">
+          <button id="btn-load-sample-batch" class="btn-race-action" style="position:relative;z-index:10;pointer-events:auto;" title="Load complete 4-lead sample batch">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+            <span>Load Sample Multi-Candidate Batch</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 06: ANIMATED 5-STAGE PIPELINE FLOW & SCHEMA INSPECTOR -->
+    <section id="pipeline" class="stage-section">
+      <div style="margin-bottom: 2rem;">
+        <span class="section-numeral">06</span>
+        <h2 class="section-title">Agentic Discovery Pipeline // End-to-End Orchestration</h2>
+        <p class="section-narrative" style="max-width:780px;">
+          Autonomous closed-loop orchestration connecting canonical sequence validation, BioNeMo NIM inference, score-based diffusion docking, ADMET filtering, and robotics protocol export. Click any stage to inspect its data contract schema and resilience policies.
+        </p>
+      </div>
+
+      <!-- Horizontal Telemetry Conduits & Node Grid -->
+      <div class="pipeline-flow-container">
+        <!-- Connecting SVG Conduits with Bioluminescent Pulse -->
+        <svg class="pipeline-conduit-svg" viewBox="0 0 1000 24" preserveAspectRatio="none" aria-hidden="true">
+          <line x1="50" y1="12" x2="950" y2="12" class="conduit-line" />
+          <circle cx="50" cy="12" r="4.5" class="pulse-ball" />
+        </svg>
+
+        <!-- 5 Interactive Stage Nodes -->
+        <div id="pipeline-nodes-container" class="pipeline-nodes-grid">
+          <!-- Rendered dynamically by js/pipeline.js -->
+        </div>
+
+        <!-- Slide-Over / Expandable Schema Inspector Drawer -->
+        <div id="schema-drawer-panel" class="schema-drawer" role="region" aria-label="Pipeline Schema Inspector">
+          <div class="schema-drawer-header">
+            <div>
+              <div id="schema-drawer-title" style="font-family:var(--font-display);font-size:1.1rem;font-weight:700;color:var(--color-ink-primary);">
+                Stage 01: Target &amp; Ligand Ingestion
+              </div>
+              <div id="schema-drawer-service" style="font-family:var(--font-mono);font-size:0.75rem;color:var(--color-signal-green);margin-top:0.2rem;">
+                RDKit C++ / PDB REST Gateway
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:0.75rem;">
+              <span class="badge-measured">JSON-SCHEMA v7</span>
+              <button id="btn-copy-schema-payload" class="btn-race-action" style="padding:0.35rem 0.75rem;font-size:0.75rem;" title="Copy sample JSON payload">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"/></svg>
+                <span>Copy Payload</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="schema-drawer-body">
+            <!-- Left: Input & Output Schemas -->
+            <div style="display:flex;flex-direction:column;gap:1.25rem;">
+              <div>
+                <div style="font-family:var(--font-mono);font-size:0.72rem;font-weight:700;color:var(--color-ink-secondary);text-transform:uppercase;margin-bottom:0.4rem;">
+                  Input Contract Schema
+                </div>
+                <pre id="schema-input-code" class="schema-code-block"></pre>
+              </div>
+              <div>
+                <div style="font-family:var(--font-mono);font-size:0.72rem;font-weight:700;color:var(--color-ink-secondary);text-transform:uppercase;margin-bottom:0.4rem;">
+                  Output Contract Schema
+                </div>
+                <pre id="schema-output-code" class="schema-code-block"></pre>
+              </div>
+            </div>
+
+            <!-- Right: Resilience & Example Payload -->
+            <div style="display:flex;flex-direction:column;gap:1.25rem;">
+              <div>
+                <div style="font-family:var(--font-mono);font-size:0.72rem;font-weight:700;color:var(--color-ink-secondary);text-transform:uppercase;margin-bottom:0.4rem;">
+                  Failover &amp; Resilience Policy
+                </div>
+                <div id="schema-resilience-text" style="font-size:0.82rem;color:var(--color-ink-muted);line-height:1.5;background:var(--color-surface-sunken);border:1px solid var(--border-hairline);border-radius:8px;padding:1rem;"></div>
+              </div>
+              <div>
+                <div style="font-family:var(--font-mono);font-size:0.72rem;font-weight:700;color:var(--color-ink-secondary);text-transform:uppercase;margin-bottom:0.4rem;">
+                  Verified Sample JSON Payload
+                </div>
+                <pre id="schema-payload-code" class="schema-code-block"></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 07: FOUR NIM PILLARS & TWO-PANE CLI BUILDER -->
+    <section id="cli" class="stage-section">
+      <div style="margin-bottom: 2.5rem;">
+        <span class="section-numeral">07</span>
+        <h2 class="section-title">Four NIM Pillars &amp; CLI Flag Builder</h2>
+        <p class="section-narrative" style="max-width:780px;">
+          Engineered for rapid laboratory reproducibility. Explore the performance characteristics of core BioNeMo models, then configure synthesis flags in the two-pane CLI generator to reproduce benchmark runs locally or against hosted cloud endpoints.
+        </p>
+      </div>
+
+      <!-- Four NIM Pillars Bento Grid -->
+      <div class="nim-pillars-grid">
+        <div class="pillar-card">
+          <div class="pillar-tag">Protein Language Model</div>
+          <div class="pillar-title">ESM-2 (650M)</div>
+          <div class="pillar-stat">12,500 aa/s</div>
+          <p class="pillar-desc">
+            High-throughput contextual token embedding generation with 33 transformer layers. Optimized for batch inference on TensorRT FP16 engines.
+          </p>
+        </div>
+
+        <div class="pillar-card">
+          <div class="pillar-tag">Atomic 3D Folding</div>
+          <div class="pillar-title">ESMFold</div>
+          <div class="pillar-stat">&lt; 1.0s / 300 aa</div>
+          <p class="pillar-desc">
+            Direct single-sequence macromolecular structure prediction without MSA search overhead. Produces verified CASP14-grade coordinates (pLDDT &gt; 84).
+          </p>
+        </div>
+
+        <div class="pillar-card">
+          <div class="pillar-tag">Generative Chemistry</div>
+          <div class="pillar-title">MolMIM 70M</div>
+          <div class="pillar-stat">50 leads / sec</div>
+          <p class="pillar-desc">
+            CMA-ES latent space optimization producing bioisosteric derivatives with 100% RDKit chemical validity and scaffold retention.
+          </p>
+        </div>
+
+        <div class="pillar-card">
+          <div class="pillar-tag">SE(3) Equivariant Docking</div>
+          <div class="pillar-title">DiffDock</div>
+          <div class="pillar-stat">1.15s / complex</div>
+          <p class="pillar-desc">
+            Score-based generative reverse diffusion over 10 rotational/translational steps. Achieves 38% top-1 RMSD &lt; 2 &Aring; on PDBbind benchmarks.
+          </p>
+        </div>
+      </div>
+
+      <!-- Two-Pane CLI Builder -->
+      <div class="cli-builder-grid">
+        <!-- Left Pane: Controls -->
+        <div class="cli-controls-pane">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.25rem;">
+            <div class="font-display font-bold text-base" style="color:var(--color-ink-primary);">CLI Configuration Flags</div>
+            <div style="display:flex;gap:0.35rem;">
+              <button class="calc-chip-btn cli-preset-btn active" data-preset="mock">Mock Dry-Run</button>
+              <button class="calc-chip-btn cli-preset-btn" data-preset="kras">KRAS Screen</button>
+              <button class="calc-chip-btn cli-preset-btn" data-preset="full">Full Suite</button>
+            </div>
+          </div>
+
+          <!-- Endpoint Select -->
+          <div class="calc-control-group">
+            <label for="cli-endpoint" class="calc-control-label">NIM HOST ENDPOINT:</label>
+            <select id="cli-endpoint" class="calc-control-select">
+              <option value="health.api.nvidia.com" selected>health.api.nvidia.com (NVIDIA Cloud Production)</option>
+              <option value="integrate.api.nvidia.com">integrate.api.nvidia.com (NVIDIA Developer Portal)</option>
+              <option value="localhost:8000">localhost:8000 (Local Self-Hosted Docker NIM)</option>
+            </select>
+          </div>
+
+          <!-- Target Select -->
+          <div class="calc-control-group">
+            <label for="cli-target" class="calc-control-label">TARGET PDB COMPLEX:</label>
+            <select id="cli-target" class="calc-control-select">
+              <option value="8AZV" selected>KRAS G12D (PDB: 8AZV, Switch-II Pocket)</option>
+              <option value="4MNE">BRAF V600E (PDB: 4MNE, Kinase Domain)</option>
+              <option value="7BQY">SARS-CoV-2 Mpro (PDB: 7BQY, Catalytic Dyad)</option>
+              <option value="ALL_TARGETS">All Benchmark Complexes (1UBQ, 1DHF, 2HYY, 1M17, 7BV2)</option>
+            </select>
+          </div>
+
+          <!-- Poses Slider -->
+          <div class="calc-control-group">
+            <div class="calc-control-label">
+              <span>DIFFDOCK POSES:</span>
+              <span id="cli-poses-display" style="color:var(--color-signal-green);font-weight:700;">5 Poses</span>
+            </div>
+            <input id="cli-poses" type="range" min="1" max="20" value="5" class="calc-slider" aria-label="Number of poses slider"/>
+          </div>
+
+          <!-- Batch Size & Format -->
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+            <div class="calc-control-group">
+              <label for="cli-batch" class="calc-control-label">BATCH SIZE:</label>
+              <select id="cli-batch" class="calc-control-select">
+                <option value="16">16 (Latency Focus)</option>
+                <option value="32" selected>32 (Balanced)</option>
+                <option value="64">64 (Max Throughput)</option>
+              </select>
+            </div>
+            <div class="calc-control-group">
+              <label for="cli-format" class="calc-control-label">OUTPUT FORMAT:</label>
+              <select id="cli-format" class="calc-control-select">
+                <option value="json" selected>JSON Summary</option>
+                <option value="csv">CSV Matrix</option>
+                <option value="pdf">PDF Dossier</option>
+                <option value="ot2">OT-2 Python Protocol</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Toggles -->
+          <div style="display:flex;gap:1.5rem;align-items:center;padding-top:0.25rem;">
+            <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;font-family:var(--font-mono);font-size:0.78rem;color:var(--color-ink-primary);">
+              <input id="cli-admet" type="checkbox" checked style="accent-color:var(--color-signal-green);"/>
+              <span>--admet-filter</span>
+            </label>
+            <label style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;font-family:var(--font-mono);font-size:0.78rem;color:var(--color-signal-green);">
+              <input id="cli-mock" type="checkbox" checked style="accent-color:var(--color-signal-green);"/>
+              <span>--mock (Zero-Credit Testing)</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Right Pane: Terminal Output -->
+        <div class="cli-terminal-pane">
+          <div>
+            <div class="terminal-header">
+              <div class="mac-traffic-dots">
+                <span class="mac-dot dot-red"></span>
+                <span class="mac-dot dot-yellow"></span>
+                <span class="mac-dot dot-green"></span>
+              </div>
+              <span style="font-family:var(--font-mono);font-size:0.72rem;color:var(--color-ink-muted);">
+                bash — bionemo-cli // v2.5
+              </span>
+            </div>
+            <div style="margin-top:1.25rem;">
+              <pre id="cli-terminal-code" class="cli-command-code"></pre>
+            </div>
+          </div>
+
+          <div style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid rgba(148,163,184,0.12);padding-top:1rem;">
+            <span style="font-family:var(--font-mono);font-size:0.72rem;color:var(--color-ink-muted);">
+              Zero external dependencies required. Verified in Python 3.12 virtualenv.
+            </span>
+            <button id="btn-copy-cli-command" class="btn-race-action" title="Copy command to clipboard">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"/></svg>
+              <span>Copy Command</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 08: DELIVERABLES, OPENTRONS OT-2 & ROADMAP -->
+    <section id="ot2" class="stage-section">
+      <div style="margin-bottom: 2.5rem;">
+        <span class="section-numeral">08</span>
+        <h2 class="section-title">Robotics Synthesis Protocol // Opentrons OT-2</h2>
+        <p class="section-narrative" style="max-width:780px;">
+          Autonomous wet-lab bridge. The benchmark suite converts in-silico nominated drug candidates directly into executable Python protocols adhering to Opentrons API v2.15 for liquid handling and serial dilution assays.
+        </p>
+      </div>
+
+      <!-- Deliverables Strip -->
+      <div class="deliverables-grid">
+        <a href="./blueprint.yaml" target="_blank" rel="noopener noreferrer" class="deliverable-card" title="View DGX Cloud and Docker Compose Deployment Spec">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span class="badge-measured">DGX SPEC</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+          </div>
+          <div class="deliverable-title">blueprint.yaml Specification</div>
+          <div class="deliverable-desc">
+            Complete declarative container deployment spec for multi-GPU DGX Cloud clusters, NVIDIA NIM microservice endpoints, and resource allocations.
+          </div>
+        </a>
+
+        <a href="./results/screened_candidates_summary.csv" download class="deliverable-card" title="Download Screened Candidates CSV">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span class="badge-measured">CSV DATASET</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+          </div>
+          <div class="deliverable-title">Candidate Selection Dossier</div>
+          <div class="deliverable-desc">
+            Full tabular matrix of screened KRAS G12D series with canonical SMILES, DiffDock scores, MM-GBSA rescores, QED, and ADMET flags.
+          </div>
+        </a>
+
+        <a href="./results/benchmark_summary.json" download class="deliverable-card" title="Download Benchmark Summary JSON">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span class="badge-measured">TELEMETRY JSON</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+          </div>
+          <div class="deliverable-title">Empirical Benchmark Summary</div>
+          <div class="deliverable-desc">
+            Raw telemetry JSON capturing per-model latency, p50/p95/p99 percentiles, and hardware speedup ratios across all 5 benchmark workloads.
+          </div>
+        </a>
+      </div>
+
+      <!-- OT-2 Code Viewer Card -->
+      <div class="ot2-card">
+        <div class="ot2-header-bar">
+          <div style="display:flex;align-items:center;gap:0.75rem;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--color-signal-green);"><path stroke-linecap="round" stroke-linejoin="round" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"/></svg>
+            <span style="font-family:var(--font-mono);font-size:0.82rem;font-weight:700;color:var(--color-ink-primary);">results/ot2_synthesis_protocol_KRAS_G12D.py</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:0.75rem;">
+            <span class="badge-illustrative">Illustrative Synthesis Protocol</span>
+            <button id="btn-copy-ot2-code" class="btn-race-action" style="padding:0.35rem 0.75rem;font-size:0.75rem;" title="Copy Python protocol">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"/></svg>
+              <span>Copy Protocol</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="ot2-body-grid">
+          <!-- Fluidics Specs Pane -->
+          <div class="ot2-specs-pane">
+            <div style="font-family:var(--font-display);font-size:1rem;font-weight:700;color:var(--color-ink-primary);">
+              Automated Assay Parameters
+            </div>
+            <ul style="font-size:0.8rem;color:var(--color-ink-muted);line-height:1.7;list-style:none;padding:0;">
+              <li style="display:flex;gap:0.5rem;align-items:flex-start;">
+                <span style="color:var(--color-signal-green);font-weight:700;">&#10003;</span>
+                <span><strong>API Level:</strong> Opentrons Protocol API v2.15</span>
+              </li>
+              <li style="display:flex;gap:0.5rem;align-items:flex-start;">
+                <span style="color:var(--color-signal-green);font-weight:700;">&#10003;</span>
+                <span><strong>Labware:</strong> Corning 96-well flat-bottom plate (360 &micro;L) in Slot 1</span>
+              </li>
+              <li style="display:flex;gap:0.5rem;align-items:flex-start;">
+                <span style="color:var(--color-signal-green);font-weight:700;">&#10003;</span>
+                <span><strong>Reservoir:</strong> NEST 12-channel 15 mL reservoir in Slot 3</span>
+              </li>
+              <li style="display:flex;gap:0.5rem;align-items:flex-start;">
+                <span style="color:var(--color-signal-green);font-weight:700;">&#10003;</span>
+                <span><strong>Pipette:</strong> P300 Single-Channel GEN2 on Right Mount</span>
+              </li>
+              <li style="display:flex;gap:0.5rem;align-items:flex-start;">
+                <span style="color:var(--color-signal-green);font-weight:700;">&#10003;</span>
+                <span><strong>Fluidics Tuning:</strong> Aspiration throttled to 25 &micro;L/s for viscous DMSO solutions</span>
+              </li>
+              <li style="display:flex;gap:0.5rem;align-items:flex-start;">
+                <span style="color:var(--color-signal-green);font-weight:700;">&#10003;</span>
+                <span><strong>Assay Geometry:</strong> 2-fold serial dilution along Row A (cols 1&ndash;12) with 3&times; 40 &micro;L mixing cycles</span>
+              </li>
+            </ul>
+
+            <div style="margin-top:auto;padding-top:1rem;border-top:1px solid var(--border-hairline);">
+              <a href="https://github.com/Jorwalzzz/bionemo-nim-benchmark/blob/main/results/ot2_synthesis_protocol_KRAS_G12D.py" target="_blank" rel="noopener noreferrer" style="font-family:var(--font-mono);font-size:0.75rem;color:var(--color-signal-green);text-decoration:none;display:inline-flex;align-items:center;gap:0.4rem;">
+                <span>View Raw on GitHub</span>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+              </a>
+            </div>
+          </div>
+
+          <!-- Code View Pane -->
+          <div class="ot2-code-pane">
+            <pre id="ot2-protocol-code" class="ot2-code-pre"># =============================================================================
+# UNVALIDATED PROTOCOL WARNING
+# This script was auto-generated for illustrative purposes only.
+# It has NOT been reviewed or validated by a qualified chemist.
+# DO NOT use in a wet laboratory without independent expert review,
+# risk assessment, and compliance with all applicable safety regulations.
+# Expected yields and volumes are illustrative and may be incorrect.
+# =============================================================================
+"""
+Opentrons OT-2 Automated Dilution Protocol
+Target Candidate: KRAS G12D Inhibitor Assay Series
+Generated for: BioNeMo NIM Benchmark Suite
+Author: Aarav Jorwal (@Jorwalzzz)
+"""
+
+from opentrons import protocol_api
+
+metadata = {
+    'protocolName': 'KRAS G12D inhibitor serial dilution (illustrative)',
+    'author': 'Aarav Jorwal (@Jorwalzzz)',
+    'description': '2-fold serial dilution assay protocol for KRAS G12D inhibitor candidates',
+    'apiLevel': '2.15'
+}
+
+def run(protocol: protocol_api.ProtocolContext):
+    # 1. Deck labware configuration
+    plate = protocol.load_labware('corning_96_wellplate_360ul_flat', 1)
+    res = protocol.load_labware('nest_12_reservoir_15ml', 3)
+    tips = protocol.load_labware('opentrons_96_tiprack_300ul', 2)
+    p300 = protocol.load_instrument('p300_single_gen2', 'right', tip_racks=[tips])
+    p300.flow_rate.aspirate = 25   # µL/s, throttled for DMSO viscosity
+    p300.flow_rate.dispense = 25
+
+    row = plate.rows()[0]  # Row A: A1 to A12
+    # 2. Dispense diluent (50 µL) into columns 2-12
+    p300.transfer(50, res['A1'], row[1:], new_tip='once')
+    # 3. 2-fold serial dilution down Row A with mixing
+    p300.transfer(50, row[:11], row[1:12], mix_after=(3, 40), new_tip='always')
+    protocol.comment("OT-2 KRAS G12D serial dilution protocol complete.")</pre>
+          </div>
+        </div>
+      </div>
+
+      <!-- Deployment Roadmap Strip -->
+      <div id="roadmap" style="margin-top:2.5rem;">
+        <h3 class="font-display font-bold text-lg" style="color:var(--color-ink-primary);margin-bottom:0.5rem;">
+          Production Deployment Roadmap
+        </h3>
+        <p class="text-sm" style="color:var(--color-ink-muted);max-width:640px;">
+          From interactive browser simulation to local native workstation clients and high-availability enterprise cluster deployments.
+        </p>
+
+        <div class="roadmap-track">
+          <div class="roadmap-item">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span class="badge-measured">PHASE 1</span>
+              <span class="badge-measured" style="background:rgba(16,185,129,0.2);color:var(--color-signal-green);border-color:var(--color-signal-green);">Active &amp; Live</span>
+            </div>
+            <div class="font-display font-bold text-base" style="color:var(--color-ink-primary);">Web Cockpit &amp; Studio</div>
+            <p class="text-xs" style="color:var(--color-ink-muted);line-height:1.5;">
+              Static-first, zero-FOUC scientific mission control with interactive 3D WebGL pose inspection and real-time client-side ADMET auditing.
+            </p>
+          </div>
+
+          <div class="roadmap-item">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span class="badge-measured">PHASE 2</span>
+              <span class="badge-measured" style="background:rgba(92,225,255,0.15);color:#5CE1FF;border-color:rgba(92,225,255,0.3);">Target Q2 2027</span>
+            </div>
+            <div class="font-display font-bold text-base" style="color:var(--color-ink-primary);">Desktop Workstation Client</div>
+            <p class="text-xs" style="color:var(--color-ink-muted);line-height:1.5;">
+              Standalone native cross-platform application with direct PyTorch C++ bindings, local Vulkan / CUDA acceleration, and offline RDKit synthesis.
+            </p>
+          </div>
+
+          <div class="roadmap-item">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span class="badge-measured">PHASE 3</span>
+              <span class="badge-measured" style="background:rgba(16,185,129,0.2);color:var(--color-signal-green);border-color:var(--color-signal-green);">Production Ready</span>
+            </div>
+            <div class="font-display font-bold text-base" style="color:var(--color-ink-primary);">Containerized NIM Helm Stack</div>
+            <p class="text-xs" style="color:var(--color-ink-muted);line-height:1.5;">
+              Enterprise Kubernetes / Helm charts configured for multi-node DGX Cloud execution with automated health probes and horizontal autoscaling.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- DESIGNED FOOTER FINALE -->
+  <footer class="footer-finale">
+    <div class="footer-inner-max">
+      <!-- Top Brand Strip -->
+      <div class="footer-top-brand">
+        <div>
+          <div class="footer-display-title">BioNeMo // NIM Benchmark</div>
+          <p style="color:var(--color-ink-muted);font-size:0.9rem;max-width:540px;line-height:1.6;margin-top:0.5rem;">
+            An independent, open computational biology benchmark evaluating NVIDIA BioNeMo inference microservices against pinned multi-core CPU baselines.
+          </p>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:0.75rem;align-items:flex-start;">
+          <div class="footer-clone-box">
+            <span style="color:var(--color-ink-muted);">$</span>
+            <span>git clone https://github.com/Jorwalzzz/bionemo-nim-benchmark.git</span>
+          </div>
+          <div style="display:flex;gap:0.75rem;align-items:center;flex-wrap:wrap;">
+            <span class="badge-measured">GNU AGPLv3 LICENSE</span>
+            <span class="badge-measured" style="background:rgba(16,185,129,0.15);color:var(--color-signal-green);">186/186 HERMETIC TESTS PASSING</span>
+            <span class="badge-measured">RELEASE v2.5</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Peer-Reviewed Citations Grid -->
+      <div class="footer-citations-grid">
+        <div class="citation-item">
+          <strong>1. ESM-2 &amp; ESMFold:</strong> Lin, Z., Akin, H., Rao, R., et al. <em>"Evolutionary-scale prediction of atomic-level protein structure with a language model."</em> Science 379, eabn8550 (2023). <a href="https://doi.org/10.1126/science.abn8550" target="_blank" rel="noopener noreferrer" style="color:var(--color-signal-green);">doi:10.1126/science.abn8550</a>
+        </div>
+        <div class="citation-item">
+          <strong>2. DiffDock Molecular Docking:</strong> Corso, G., Stärk, H., Jing, B., Barzilay, R., &amp; Jaakkola, T. <em>"DiffDock: Diffusion Steps, Twists, and Turns for Molecular Docking."</em> International Conference on Learning Representations (ICLR 2023). <a href="https://arxiv.org/abs/2210.01776" target="_blank" rel="noopener noreferrer" style="color:var(--color-signal-green);">arXiv:2210.01776</a>
+        </div>
+        <div class="citation-item">
+          <strong>3. NVIDIA BioNeMo &amp; MolMIM:</strong> NVIDIA Corporation. <em>"BioNeMo Framework &amp; NIM Microservices Documentation."</em> (2024). Accelerated with TensorRT-LLM on NVIDIA Hopper SXM5 architecture.
+        </div>
+        <div class="citation-item">
+          <strong>4. RDKit Cheminformatics:</strong> Landrum, G., et al. <em>"RDKit: Open-source cheminformatics toolkit."</em> Release 2023.09 C++ core engine.
+        </div>
+      </div>
+
+      <!-- Scope & Scientific Limitations Box -->
+      <div style="background:#040609;border:1px solid var(--border-hairline);border-radius:12px;padding:1.5rem;display:flex;flex-direction:column;gap:0.75rem;font-size:0.78rem;color:var(--color-ink-muted);line-height:1.6;">
+        <div>
+          <strong style="color:var(--color-ink-primary);">Benchmark Scope &amp; Scientific Limitations:</strong> This benchmark suite evaluates warm-container inference latency and structural output parity on standardized target complexes. Reported accelerations represent empirical hardware runtimes comparing an NVIDIA H100 80GB SXM5 GPU against an AMD EPYC 7763 64-core processor with 16 physical cores pinned for process isolation. Cold-start container initializations and wide-area network latency are omitted. In-silico docking scores and ADMET predictions represent computational hypotheses that require independent biophysical assay confirmation (SPR/MST) before clinical progression.
+        </div>
+        <div>
+          <strong style="color:var(--color-ink-primary);">NVIDIA Trademark &amp; Non-Affiliation Notice:</strong> NVIDIA, BioNeMo, NIM, TensorRT, and Hopper are trademarks and/or registered trademarks of NVIDIA Corporation in the United States and other jurisdictions. This open-source benchmark suite, web interface, and research evaluation are independently developed by Aarav Jorwal and are not sponsored, endorsed, certified, or affiliated with NVIDIA Corporation.
+        </div>
+      </div>
+
+      <!-- Bottom Bar -->
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;font-size:0.8rem;color:var(--color-ink-muted);">
+        <div>
+          &copy; 2026 Aarav Jorwal (<a href="https://github.com/Jorwalzzz" target="_blank" rel="noopener noreferrer" style="color:var(--color-signal-green);text-decoration:none;">@Jorwalzzz</a>). Licensed under <a href="https://github.com/Jorwalzzz/bionemo-nim-benchmark/blob/main/LICENSE" target="_blank" rel="noopener noreferrer" style="color:var(--color-ink-primary);">GNU AGPLv3</a>. All worldwide trademark rights reserved.
+        </div>
+        <div style="display:flex;gap:1.5rem;">
+          <a href="./index.html" style="color:var(--color-ink-secondary);text-decoration:none;">Studio Home</a>
+          <a href="./cockpit.html" style="color:var(--color-ink-secondary);text-decoration:none;">Cockpit Workstation</a>
+          <a href="https://github.com/Jorwalzzz/bionemo-nim-benchmark" target="_blank" rel="noopener noreferrer" style="color:var(--color-ink-secondary);text-decoration:none;">GitHub v2.5</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

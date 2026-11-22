@@ -1,0 +1,520 @@
+"""Bathos parity and negative-control driver for ThermoMPNN (v1/v2) and ThermoMPNN-D.
+
+Executes:
+1. Single-mutant ``ThermoMPNN`` v1 and v2 parity in ``float64`` and ``float32``
+   against the PyTorch reference on ``tests/data/1ubq.pdb``.
+2. Wild-type self-mutation identity check (``ddg[i, S[i]] == 0.0``).
+3. Double-mutant ``ThermoMPNNDouble`` parity in ``float64`` and ``float32`` across
+   neighbor-connected and distant residue pairs.
+4. Siamese mutation-slot order invariance check.
+5. Four negative controls (reversing ``all_mpnn_hid``, omitting ``wt - mut``
+   embedding subtraction, zeroing edge features, permuting output rows).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sys
+from pathlib import Path
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+import torch
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+  sys.path.insert(0, str(_REPO_ROOT))
+if str(_REPO_ROOT / "src") not in sys.path:
+  sys.path.insert(0, str(_REPO_ROOT / "src"))
+if str(_REPO_ROOT / "scripts" / "parity") not in sys.path:
+  sys.path.insert(0, str(_REPO_ROOT / "scripts" / "parity"))
+if str(_REPO_ROOT / "tests" / "families") not in sys.path:
+  sys.path.insert(0, str(_REPO_ROOT / "tests" / "families"))
+
+from artifact_key import stable_artifact_key  # noqa: E402
+from test_thermo_mpnn_parity import (  # noqa: E402
+  _UBQ_PDB,
+  _corrupt_double_omit_seq_subtraction,
+  _corrupt_double_zero_edges,
+  _corrupt_single_unreversed_hidden,
+  _parse_pdb_backbone,
+  _run_torch_double_reference,
+  _run_torch_single_reference,
+  _select_neighbor_and_distant_mutations,
+  _x64_mode,
+  resolve_thermo_mpnn_parity_inputs,
+)
+
+from aminx.families.thermo_mpnn import (  # noqa: E402
+  cast_floating,
+  convert_thermo_mpnn_double_state_dict,
+  convert_thermo_mpnn_state_dict,
+)
+from aminx.families.thermo_mpnn.stats import pearson_r  # noqa: E402
+
+
+def run_parity_suite(
+  *, synthetic: bool = False, grade_float16: bool = True
+) -> dict[str, float | int | str | bool]:
+  """Run the ThermoMPNN / ThermoMPNN-D parity and negative-control suite.
+
+  ``grade_float16=False`` (the v2 vehicle) keeps every float16 number in the result but
+  leaves the float16 band out of the ``clean`` verdict: float16 is an accepted xfail
+  (deterministic ~2.8e-2 on v1 against the 1.5e-2 band), reported, not graded. The float16
+  values must still be finite so a crashed float16 path cannot pass silently.
+  """
+  coords, mask, residue_index, chain_index, sequence = _parse_pdb_backbone(_UBQ_PDB)
+  v1_sd, v2_single_sd, v2_double_sd, weight_meta = resolve_thermo_mpnn_parity_inputs(
+    synthetic=synthetic,
+  )
+
+  with _x64_mode(True):
+    v1_model_f64 = convert_thermo_mpnn_state_dict(v1_sd)
+    v2_model_f64 = convert_thermo_mpnn_state_dict(v2_single_sd)
+    double_model_f64 = convert_thermo_mpnn_double_state_dict(v2_double_sd)
+
+    mut_positions, mut_aas, n_neighbor_pairs, n_distant_pairs = (
+      _select_neighbor_and_distant_mutations(
+        coords,
+        mask,
+        residue_index,
+        chain_index,
+        sequence,
+        double_model_f64,
+      )
+    )
+
+    coords_f64 = jnp.asarray(coords, dtype=jnp.float64)
+    mask_f64 = jnp.asarray(mask, dtype=jnp.float64)
+    res_i32 = jnp.asarray(residue_index, dtype=jnp.int32)
+    chain_i32 = jnp.asarray(chain_index, dtype=jnp.int32)
+    seq_i32 = jnp.asarray(sequence, dtype=jnp.int32)
+    pos_i32 = jnp.asarray(mut_positions, dtype=jnp.int32)
+    aas_i32 = jnp.asarray(mut_aas, dtype=jnp.int32)
+
+    jax_v1_f64 = np.asarray(v1_model_f64(coords_f64, mask_f64, res_i32, chain_i32, seq_i32))
+    jax_v2_f64 = np.asarray(v2_model_f64(coords_f64, mask_f64, res_i32, chain_i32, seq_i32))
+    jax_double_f64 = np.asarray(
+      double_model_f64(coords_f64, mask_f64, res_i32, chain_i32, seq_i32, pos_i32, aas_i32),
+    )
+    jax_double_swapped_f64 = np.asarray(
+      double_model_f64(
+        coords_f64,
+        mask_f64,
+        res_i32,
+        chain_i32,
+        seq_i32,
+        pos_i32[:, ::-1],
+        aas_i32[:, ::-1],
+      ),
+    )
+
+    # Negative controls in float64
+    neg_hid = np.asarray(
+      _corrupt_single_unreversed_hidden(
+        v1_model_f64,
+        coords_f64,
+        mask_f64,
+        res_i32,
+        chain_i32,
+        seq_i32,
+      ),
+    )
+    neg_seq = np.asarray(
+      _corrupt_double_omit_seq_subtraction(
+        double_model_f64,
+        coords_f64,
+        mask_f64,
+        res_i32,
+        chain_i32,
+        seq_i32,
+        pos_i32,
+        aas_i32,
+      ),
+    )
+    neg_edges = np.asarray(
+      _corrupt_double_zero_edges(
+        double_model_f64,
+        coords_f64,
+        mask_f64,
+        res_i32,
+        chain_i32,
+        seq_i32,
+        pos_i32,
+        aas_i32,
+      ),
+    )
+    last_linear = v1_model_f64.mlp_layers[-1]
+    permuted_last = eqx.tree_at(
+      lambda mod: mod.weight,
+      last_linear,
+      jnp.roll(last_linear.weight, shift=1, axis=0),
+    )
+    permuted_model = eqx.tree_at(
+      lambda mod: mod.mlp_layers[-1],
+      v1_model_f64,
+      permuted_last,
+    )
+    neg_perm = np.asarray(permuted_model(coords_f64, mask_f64, res_i32, chain_i32, seq_i32))
+
+  torch_v1_f64 = _run_torch_single_reference(
+    v1_sd,
+    coords,
+    mask,
+    residue_index,
+    chain_index,
+    sequence,
+    dtype=torch.float64,
+  )
+  torch_v2_f64 = _run_torch_single_reference(
+    v2_single_sd,
+    coords,
+    mask,
+    residue_index,
+    chain_index,
+    sequence,
+    dtype=torch.float64,
+  )
+  torch_double_f64 = _run_torch_double_reference(
+    v2_double_sd,
+    coords,
+    mask,
+    residue_index,
+    chain_index,
+    sequence,
+    mut_positions,
+    mut_aas,
+    dtype=torch.float64,
+  )
+
+  with _x64_mode(False):
+    v1_model_f32 = convert_thermo_mpnn_state_dict(v1_sd)
+    v2_model_f32 = convert_thermo_mpnn_state_dict(v2_single_sd)
+    double_model_f32 = convert_thermo_mpnn_double_state_dict(v2_double_sd)
+
+    coords_f32 = jnp.asarray(coords, dtype=jnp.float32)
+    mask_f32 = jnp.asarray(mask, dtype=jnp.float32)
+    res_i32 = jnp.asarray(residue_index, dtype=jnp.int32)
+    chain_i32 = jnp.asarray(chain_index, dtype=jnp.int32)
+    seq_i32 = jnp.asarray(sequence, dtype=jnp.int32)
+    pos_i32 = jnp.asarray(mut_positions, dtype=jnp.int32)
+    aas_i32 = jnp.asarray(mut_aas, dtype=jnp.int32)
+
+    jax_v1_f32 = np.asarray(v1_model_f32(coords_f32, mask_f32, res_i32, chain_i32, seq_i32))
+    jax_v2_f32 = np.asarray(v2_model_f32(coords_f32, mask_f32, res_i32, chain_i32, seq_i32))
+    jax_double_f32 = np.asarray(
+      double_model_f32(coords_f32, mask_f32, res_i32, chain_i32, seq_i32, pos_i32, aas_i32),
+    )
+
+  torch_v1_f32 = _run_torch_single_reference(
+    v1_sd,
+    coords,
+    mask,
+    residue_index,
+    chain_index,
+    sequence,
+    dtype=torch.float32,
+  )
+  torch_v2_f32 = _run_torch_single_reference(
+    v2_single_sd,
+    coords,
+    mask,
+    residue_index,
+    chain_index,
+    sequence,
+    dtype=torch.float32,
+  )
+  torch_double_f32 = _run_torch_double_reference(
+    v2_double_sd,
+    coords,
+    mask,
+    residue_index,
+    chain_index,
+    sequence,
+    mut_positions,
+    mut_aas,
+    dtype=torch.float32,
+  )
+
+  coords_f16 = jnp.asarray(coords, dtype=jnp.float16)
+  mask_f16 = jnp.asarray(mask, dtype=jnp.float16)
+  v1_model_f16 = cast_floating(v1_model_f32, jnp.float16)
+  v2_model_f16 = cast_floating(v2_model_f32, jnp.float16)
+  double_model_f16 = cast_floating(double_model_f32, jnp.float16)
+
+  jax_v1_f16 = np.asarray(v1_model_f16(coords_f16, mask_f16, res_i32, chain_i32, seq_i32))
+  jax_v2_f16 = np.asarray(v2_model_f16(coords_f16, mask_f16, res_i32, chain_i32, seq_i32))
+  jax_double_f16 = np.asarray(
+    double_model_f16(coords_f16, mask_f16, res_i32, chain_i32, seq_i32, pos_i32, aas_i32),
+  )
+
+  torch_v1_f16 = _run_torch_single_reference(
+    v1_sd,
+    coords,
+    mask,
+    residue_index,
+    chain_index,
+    sequence,
+    dtype=torch.float16,
+  )
+  torch_v2_f16 = _run_torch_single_reference(
+    v2_single_sd,
+    coords,
+    mask,
+    residue_index,
+    chain_index,
+    sequence,
+    dtype=torch.float16,
+  )
+  torch_double_f16 = _run_torch_double_reference(
+    v2_double_sd,
+    coords,
+    mask,
+    residue_index,
+    chain_index,
+    sequence,
+    mut_positions,
+    mut_aas,
+    dtype=torch.float16,
+  )
+
+  v1_f64_max_abs_diff = float(np.max(np.abs(jax_v1_f64 - torch_v1_f64)))
+  v2_f64_max_abs_diff = float(np.max(np.abs(jax_v2_f64 - torch_v2_f64)))
+  double_f64_max_abs_diff = float(np.max(np.abs(jax_double_f64 - torch_double_f64)))
+
+  v1_f32_max_abs_diff = float(np.max(np.abs(jax_v1_f32 - torch_v1_f32)))
+  v2_f32_max_abs_diff = float(np.max(np.abs(jax_v2_f32 - torch_v2_f32)))
+  double_f32_max_abs_diff = float(np.max(np.abs(jax_double_f32 - torch_double_f32)))
+
+  v1_f16_max_abs_diff = float(np.max(np.abs(jax_v1_f16 - torch_v1_f16)))
+  v2_f16_max_abs_diff = float(np.max(np.abs(jax_v2_f16 - torch_v2_f16)))
+  double_f16_max_abs_diff = float(np.max(np.abs(jax_double_f16 - torch_double_f16)))
+
+  v1_f16_pearson_r = pearson_r(jax_v1_f16, torch_v1_f16)
+  v2_f16_pearson_r = pearson_r(jax_v2_f16, torch_v2_f16)
+  double_f16_pearson_r = pearson_r(jax_double_f16, torch_double_f16)
+
+  wt_v1 = jax_v1_f64[np.arange(sequence.shape[0]), sequence]
+  wt_v2 = jax_v2_f64[np.arange(sequence.shape[0]), sequence]
+  wt_self_max_abs_diff = float(max(np.max(np.abs(wt_v1)), np.max(np.abs(wt_v2))))
+
+  order_invariance_max_abs_diff = float(np.max(np.abs(jax_double_f64 - jax_double_swapped_f64)))
+
+  neg_ctrl_reversed_hidden_diff = float(np.max(np.abs(neg_hid - torch_v1_f64)))
+  neg_ctrl_omit_seq_sub_diff = float(np.max(np.abs(neg_seq - torch_double_f64)))
+  neg_ctrl_zero_edges_diff = float(np.max(np.abs(neg_edges - torch_double_f64)))
+  neg_ctrl_permuted_out_diff = float(np.max(np.abs(neg_perm - torch_v1_f64)))
+  neg_ctrl_min_max_abs_diff = float(
+    min(
+      neg_ctrl_reversed_hidden_diff,
+      neg_ctrl_omit_seq_sub_diff,
+      neg_ctrl_zero_edges_diff,
+      neg_ctrl_permuted_out_diff,
+    ),
+  )
+
+  statuses = {
+    "reversed_hidden": "failed" if neg_ctrl_reversed_hidden_diff > 1e-2 else "passed",
+    "omit_seq_subtraction": "failed" if neg_ctrl_omit_seq_sub_diff > 1e-2 else "passed",
+    "zero_edge_features": "failed" if neg_ctrl_zero_edges_diff > 1e-2 else "passed",
+    "permuted_output_weights": "failed" if neg_ctrl_permuted_out_diff > 1e-2 else "passed",
+  }
+
+  def _r_passes(r: float) -> bool:
+    # NaN (zero variance or NaN input) is a FAIL; NaN > x is False but say so explicitly.
+    return math.isfinite(r) and r > 0.999
+
+  f16_values = (
+    v1_f16_max_abs_diff,
+    v2_f16_max_abs_diff,
+    double_f16_max_abs_diff,
+    v1_f16_pearson_r,
+    v2_f16_pearson_r,
+    double_f16_pearson_r,
+  )
+  f16_finite = all(math.isfinite(v) for v in f16_values)
+  f16_within_v1_band = (
+    v1_f16_max_abs_diff < 1.5e-2
+    and v2_f16_max_abs_diff < 1.5e-2
+    and double_f16_max_abs_diff < 1.5e-2
+    and _r_passes(v1_f16_pearson_r)
+    and _r_passes(v2_f16_pearson_r)
+    and _r_passes(double_f16_pearson_r)
+  )
+  # v1 grades the float16 band; v2 only requires the float16 numbers to be finite.
+  f16_ok = f16_within_v1_band if grade_float16 else f16_finite
+
+  is_pass = (
+    weight_meta.get("weight_source") == "upstream_checkpoint"
+    and v1_f64_max_abs_diff < 1e-7
+    and v2_f64_max_abs_diff < 1e-7
+    and double_f64_max_abs_diff < 1e-7
+    and v1_f32_max_abs_diff < 1e-4
+    and v2_f32_max_abs_diff < 1e-4
+    and double_f32_max_abs_diff < 1e-4
+    and f16_ok
+    and wt_self_max_abs_diff == 0.0
+    and order_invariance_max_abs_diff == 0.0
+    and neg_ctrl_min_max_abs_diff > 1e-2
+  )
+  is_marginal = (
+    weight_meta.get("weight_source") == "upstream_checkpoint"
+    and v1_f64_max_abs_diff < 1e-5
+    and v2_f64_max_abs_diff < 1e-5
+    and double_f64_max_abs_diff < 1e-5
+    and v1_f32_max_abs_diff < 1e-3
+    and v2_f32_max_abs_diff < 1e-3
+    and double_f32_max_abs_diff < 1e-3
+    and f16_ok
+    and wt_self_max_abs_diff == 0.0
+    and order_invariance_max_abs_diff == 0.0
+    and neg_ctrl_min_max_abs_diff > 1e-2
+  )
+  clean = "pass" if is_pass else ("marginal" if is_marginal else "fail")
+
+  v2_fields: dict[str, bool | str] = (
+    {}
+    if grade_float16
+    else {
+      "float16_policy": "reported_not_graded",
+      "float16_within_v1_band": bool(f16_within_v1_band),
+    }
+  )
+  return {
+    "clean": clean,
+    **v2_fields,
+    "pdb_id": "1ubq",
+    "num_residues": int(sequence.shape[0]),
+    "n_neighbor_pairs": int(n_neighbor_pairs),
+    "n_distant_pairs": int(n_distant_pairs),
+    **weight_meta,
+    "v1_f64_max_abs_diff": v1_f64_max_abs_diff,
+    "v2_f64_max_abs_diff": v2_f64_max_abs_diff,
+    "double_f64_max_abs_diff": double_f64_max_abs_diff,
+    "v1_f32_max_abs_diff": v1_f32_max_abs_diff,
+    "v2_f32_max_abs_diff": v2_f32_max_abs_diff,
+    "double_f32_max_abs_diff": double_f32_max_abs_diff,
+    "v1_f16_max_abs_diff": v1_f16_max_abs_diff,
+    "v2_f16_max_abs_diff": v2_f16_max_abs_diff,
+    "double_f16_max_abs_diff": double_f16_max_abs_diff,
+    "v1_f16_pearson_r": v1_f16_pearson_r,
+    "v2_f16_pearson_r": v2_f16_pearson_r,
+    "double_f16_pearson_r": double_f16_pearson_r,
+    "wt_self_max_abs_diff": wt_self_max_abs_diff,
+    "order_invariance_max_abs_diff": order_invariance_max_abs_diff,
+    "neg_ctrl_reversed_hidden_diff": neg_ctrl_reversed_hidden_diff,
+    "neg_ctrl_omit_seq_sub_diff": neg_ctrl_omit_seq_sub_diff,
+    "neg_ctrl_zero_edges_diff": neg_ctrl_zero_edges_diff,
+    "neg_ctrl_permuted_out_diff": neg_ctrl_permuted_out_diff,
+    "neg_ctrl_min_max_abs_diff": neg_ctrl_min_max_abs_diff,
+    "_statuses": statuses,
+  }
+
+
+def _json_safe(value: object) -> object:
+  """Replace non-finite floats with ``None``: a bare NaN token is not valid JSON."""
+  if isinstance(value, float) and not math.isfinite(value):
+    return None
+  if isinstance(value, dict):
+    return {k: _json_safe(v) for k, v in value.items()}
+  if isinstance(value, list):
+    return [_json_safe(v) for v in value]
+  return value
+
+
+def main() -> None:
+  parser = argparse.ArgumentParser(description="Run ThermoMPNN & ThermoMPNN-D parity suite.")
+  parser.add_argument(
+    "--out",
+    type=Path,
+    default=Path("outputs/parity/thermo_mpnn_parity.json"),
+    help="Output JSON path (default: outputs/parity/thermo_mpnn_parity.json).",
+  )
+  parser.add_argument(
+    "--synthetic",
+    action="store_true",
+    default=False,
+    help=(
+      "Run with deterministic synthetic weights instead of upstream checkpoints "
+      "(records weight_source='synthetic' and cannot grade as 'pass' for promotion)."
+    ),
+  )
+  parser.add_argument(
+    "--no-grade-float16",
+    action="store_true",
+    default=False,
+    help=(
+      "v2: report float16 but leave its band out of the verdict (float16 is an accepted xfail). "
+      "Used by thermo_mpnn_parity_v2.py; v1 behaviour is unchanged by default."
+    ),
+  )
+  parser.add_argument(
+    "--mutants",
+    type=str,
+    default="reversed_hidden,omit_seq_subtraction,zero_edge_features,permuted_output_weights",
+    help="Comma-separated negative control mutant IDs.",
+  )
+  parser.add_argument(
+    "--controls-out",
+    type=Path,
+    default=None,
+    help="Output JSON path for branch_controls.json.",
+  )
+  parser.add_argument(
+    "--work-dir",
+    type=Path,
+    default=None,
+    help="Working directory for scratch/cache.",
+  )
+  args = parser.parse_args()
+
+  try:
+    result = run_parity_suite(synthetic=args.synthetic, grade_float16=not args.no_grade_float16)
+  except FileNotFoundError as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    raise SystemExit(1) from exc
+
+  statuses = result.pop("_statuses")
+  mutant_list = [m.strip() for m in args.mutants.split(",") if m.strip()]
+  mutants_report = {m: statuses.get(m, "error") for m in mutant_list}
+  n_listed = len(mutant_list)
+  n_failed = sum(1 for s in mutants_report.values() if s == "failed")
+  result["n_listed"] = n_listed
+  result["n_failed"] = n_failed
+  result = _json_safe(result)
+
+  weights: dict[str, str] = {}
+  if result.get("weight_source") == "upstream_checkpoint":
+    if result.get("v1_checkpoint_path"):
+      weights[stable_artifact_key(result["v1_checkpoint_path"])] = result["v1_checkpoint_sha256"]
+    if result.get("v2_single_checkpoint_path"):
+      weights[stable_artifact_key(result["v2_single_checkpoint_path"])] = result["v2_single_checkpoint_sha256"]
+    if result.get("v2_double_checkpoint_path"):
+      weights[stable_artifact_key(result["v2_double_checkpoint_path"])] = result["v2_double_checkpoint_sha256"]
+
+  if args.controls_out is not None:
+    args.controls_out.parent.mkdir(parents=True, exist_ok=True)
+    controls_data = {
+      "clean": result["clean"],
+      "mutants": mutants_report,
+      "weights": weights,
+    }
+    args.controls_out.write_text(json.dumps(controls_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+  args.out.parent.mkdir(parents=True, exist_ok=True)
+  args.out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+  bth_results = os.environ.get("BTH_RESULTS_PATH")
+  if bth_results:
+    bth_path = Path(bth_results)
+    bth_path.parent.mkdir(parents=True, exist_ok=True)
+    bth_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+  main()

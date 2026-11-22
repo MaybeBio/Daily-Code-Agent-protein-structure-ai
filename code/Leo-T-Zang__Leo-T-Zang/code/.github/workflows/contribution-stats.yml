@@ -1,0 +1,88 @@
+name: Update Contribution Stats
+
+on:
+  workflow_dispatch:
+  # Recalculate right away when the stats logic changes.
+  push:
+    branches: [main]
+    paths:
+      - .github/scripts/contribution-stats.js
+      - .github/workflows/contribution-stats.yml
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  update-stats:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0  # Fetch full history
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+      - name: Generate contribution stats
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/scripts/contribution-stats.js
+
+      - name: Commit and push changes
+        run: |
+          # Check if there are any changes to commit
+          if git diff --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          
+          # Stage changes
+          git add README.md
+          
+          # Check if there are staged changes
+          if git diff --staged --quiet; then
+            echo "No staged changes to commit"
+            exit 0
+          fi
+          
+          # Commit changes
+          git commit -m "🤖 Update code contribution stats [skip ci]"
+          
+          # Try to push with retry logic
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "Attempting to push (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+            
+            # Pull latest changes with rebase
+            if git pull --rebase origin main; then
+              echo "Successfully pulled latest changes"
+            else
+              echo "Pull failed, but continuing..."
+            fi
+            
+            # Try to push
+            if git push origin main; then
+              echo "Successfully pushed changes!"
+              exit 0
+            else
+              echo "Push failed, retrying..."
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              sleep 2
+            fi
+          done
+          
+          echo "Failed to push after $MAX_RETRIES attempts"
+          exit 1

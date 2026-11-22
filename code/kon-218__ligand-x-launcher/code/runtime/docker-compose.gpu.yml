@@ -1,0 +1,21 @@
+# GENERATED from the canonical overlay and selected runtime service set.
+x-gpu-reservation:
+  devices: &id001
+  - nvidia.com/gpu=all
+services:
+  md:
+    devices: *id001
+  worker-gpu-short:
+    devices: *id001
+  worker-proto:
+    devices: *id001
+  worker-bioemu:
+    devices: *id001
+  abfe:
+    devices: *id001
+  rbfe:
+    devices: *id001
+  boltz2:
+    devices: *id001
+  worker-gpu-long:
+    devices: *id001

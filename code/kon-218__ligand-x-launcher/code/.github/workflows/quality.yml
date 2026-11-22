@@ -1,0 +1,57 @@
+name: Required quality gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality:
+    name: Required quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Checkout Core entitlement authority
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kon-218/ligand-x
+          token: ${{ secrets.LIGANDX_SOURCE_READ_PAT }}
+          ref: main
+          path: .core-contracts
+          # The registry moved to lib/entitlements/; keep the old path for older refs.
+          sparse-checkout: |
+            lib/entitlements/module_registry.py
+            lib/licensing/module_registry.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Compare entitlements with Core
+        env:
+          LIGANDX_PUBLIC_ROOT: ${{ github.workspace }}/.core-contracts
+        run: |
+          git -C .core-contracts rev-parse HEAD
+          go test ./internal/license -run '^TestProEntitlementsMatchCoreRegistry$' -v
+
+      - name: Check documentation boundary and links
+        run: python3 scripts/check_documentation.py
+
+      - name: Test desktop probe isolation and cleanup
+        run: /usr/bin/python3 -m unittest discover -s scripts -p test_desktop_qualification.py
+
+      - name: Vet both build variants
+        run: |
+          go vet ./...
+          go vet -tags public ./...
+
+      - name: Run Go tests (developer and public builds)
+        run: |
+          go test ./...
+          go test -tags public ./...

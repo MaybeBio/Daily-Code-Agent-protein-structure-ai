@@ -1,0 +1,224 @@
+---
+name: "lacuna"
+description: "Find binding pockets in a protein, RNA or DNA structure, including cryptic sites that are closed or shallow in the unbound form and only open on ligand binding. Use when someone has a PDB or mmCIF file and asks where a ligand could bind, whether a target is druggable, where an allosteric or hidden pocket might be, or wants AutoDock Vina boxes or Boltz constraints prepared. Works on RNA targets too: riboswitches, aptamers, splice-site duplexes, viral elements and ribosomal fragments, with no extra flags. Also use to prepare docking artifacts from an existing pocket report."
+---
+
+# Lacuna: cryptic binding pocket discovery
+
+Lacuna generates a conformational ensemble from one structure, detects pockets in
+each conformer, clusters them across the ensemble, and ranks the sites. The point
+is sites a single static structure does not show: a cryptic pocket is closed or
+shallow in the apo form and opens on binding, so a detector looking at one
+snapshot finds nothing there.
+
+This skill describes **v1.5.0**. The default backend now writes the same
+`pocket_report.json` at any thread count and on Windows and Linux, with lower
+memory and, at the default 20 conformers, shorter run time, so a result can be
+reproduced on another machine. Reports differ from those 1.4.0 wrote for the
+same input; the ranker weights are
+unchanged. v1.4.0 added a per-residue `residue_propensity` map and per-pocket
+`chain_shares` / `interface` fields to `pocket_report.json`, and corrected the
+Boltz backend's frame handling. v1.3.0 added nucleic-acid support; v1.3.1
+corrected the ranker's burial term for it. On 1.2.0 or
+older, nucleic-acid input is NOT handled: Lacuna built its elastic network from
+CA atoms, found none in RNA, silently fell back to random perturbation, and still
+printed a ranked table with crypticity and persistence columns. That fallback
+recovered 0 of 10 held-out closed RNA sites and tore the backbone by 25% every
+time, so the numbers were not weak but meaningless. On an older version with an
+RNA or DNA input, say so and upgrade with `pip install -U lacuna-pockets` rather
+than reporting the numbers.
+
+`--detector surface-fusion` and `--no-sequence` are not new here; they arrived in
+1.1.0 and this skill previously mis-attributed them to 1.3.0.
+
+## Install
+
+```bash
+pip install lacuna-pockets          # core, no GPU needed
+pip install "lacuna-pockets[plm]"   # adds the sequence-aware ranker (torch)
+```
+
+Core dependencies are numpy, scipy, biopython, click, rich. MIT licensed.
+
+## The command to reach for
+
+```bash
+lacuna discover protein.pdb --detector surface-fusion
+```
+
+Writes `pocket_report.json` into `<input_stem>_lacuna/`, ranked best first.
+
+**Prefer `--detector surface-fusion` when recall matters.** The default is
+`alpha`, the geometric detector, which only proposes candidates where there is a
+concavity, and a cryptic site in its apo form frequently has none. Pooling both
+detectors, held out on CryptoBench, takes coverage from 68.5% to 86.4% and
+top-five recovery from 57.1% to 73.9% (measured with 1.4.0). It picks the
+matching ranker automatically. The default stays `alpha` for backwards
+compatibility, not because it is the better choice.
+
+It costs time: on 1AKE at ten conformers, 2.3 s for alpha against 20.7 s for
+surface-fusion (the surface-fusion time measured with 1.4.0), of which about
+half is the sequence pass. Use plain `lacuna discover protein.pdb` when
+screening many structures and speed dominates.
+
+## Choosing options
+
+**Ranking** (`--rank-by`, default `learned`)
+
+`learned` is the fitted ranker and roughly doubles recovery over the analytic
+rules. Use `learned-plm` if the `plm` extra is installed: it adds protein language
+model features and is the strongest option, reaching 66.1% top-five recovery on
+the CryptoBench test fold (measured with 1.4.0) against 57.8% for `learned`. Use
+`crypticity` only when you specifically want sites that open a lot relative to
+the input. Do not switch to `druggability` for always-open orthosteric sites:
+`learned` beats it there by +22.9 points on COACH420 (docs/BENCHMARKS.md).
+`druggability` is the legacy pre-model rule, kept for reproducibility.
+
+**Conformers** (`--conformers`, default 20)
+
+Twenty is the measured sweet spot. More does not help: at forty and eighty the
+ensemble finds more sites and surfaces none of them, because extra conformers
+multiply candidates and the ranking problem gets harder at the same rate. Ten is
+statistically indistinguishable from twenty at roughly half the wall clock.
+
+**Backend** (`--backend`, default `auto`)
+
+`nma` (normal mode analysis) is the fast, dependency-free default and is what
+`auto` selects on a base install. `openmm` runs implicit-solvent MD and `boltz`
+uses diffusion sampling, both needing their extras. Where the `boltz` extra is
+installed, `auto` picks `boltz`, which sends the sequence to the public
+ColabFold server; pass `-b nma` or `--no-msa-server` when the sequence must stay
+on the machine. Measured on CryptoBench, MD did **not** beat NMA (10% against
+13% at n=924, measured before 1.4.0), so prefer `nma` unless there is a specific
+reason.
+
+**Detector** (`--detector`, default `alpha`)
+
+| value | when |
+|---|---|
+| `surface-fusion` | when recall matters; best coverage and recovery |
+| `alpha` | speed, or reproducing older results |
+| `surface` | the learned surface model alone, without geometric candidates |
+| `p2rank` / `fusion` | only with P2Rank installed (Java 11+, `prank` on PATH or `LACUNA_P2RANK` set) |
+
+**Sequence signal** (`--no-sequence`)
+
+The surface detector uses ESM-2 by default. Passing `--no-sequence` runs it on
+geometry alone: faster, and no need for the `plm` extra. The cost is measured, not
+guessed. Against the alpha baseline on 746 training targets, the fused pool gains
++5.5 points [+2.4, +8.6] on geometry alone against +12.6 [+9.3, +16.0] with
+sequence, so geometry keeps a little under half the gain and still resolves clear
+of zero. An install without torch does this anyway.
+
+**Other flags worth knowing**
+
+- `--homodimer` is required for pockets at a dimer interface. It builds the
+  biological assembly from BIOMT / `_pdbx_struct_oper_list`. Without it those
+  sites cannot be detected at all. Prefer RCSB's biological assembly download.
+- `--ensemble PATH` uses conformers you already have (a multi-model file or a
+  directory) instead of generating them. Frames are matched by residue number and
+  atom name, so a frame missing a loop is still usable.
+- `--seed-from-sequence` proposes pockets where the sequence model scores highly
+  but geometry sees nothing. The measured gain is confined to small ensembles:
+  +8.5% (95% CI +4.0 to +13.6) at one conformer, and nothing separable from zero
+  at twenty. Only worth it in fast single-structure mode.
+
+## Docking preparation
+
+```bash
+lacuna discover protein.pdb --emit-vina-boxes --emit-boltz-constraints
+lacuna dock-prep pocket_report.json --top 3    # or from an existing report
+```
+
+`--emit-pocket-pdbs` writes pseudoatom PDBs for visualising pockets in PyMOL or
+ChimeraX.
+
+## Reading the output
+
+`pocket_report.json` lists pockets ranked best first. Per pocket: lining residues,
+volume, druggability, crypticity (how much it opens relative to the input),
+persistence (fraction of conformers it appears in), and centroid.
+
+**Report a ranked shortlist, not a single answer.** Lacuna's own benchmarking is
+the reason: on CryptoBench the site is usually proposed somewhere and then
+out-ranked. Top-five recovery is 73.9% with `surface-fusion` (measured with
+1.4.0), so the top hit alone is frequently not the answer even when the answer
+is in the list. Show the top three to five with their scores.
+
+## RNA and DNA
+
+No extra flags. `lacuna discover rna.cif` detects nucleic-acid input, builds the
+elastic network on nucleotide beads (C1', C2, P at 9 A) instead of CA atoms, and
+returns the same table and the same report files as protein. The only visible
+difference is two extra lines saying it detected nucleic acid and dropped
+hydrogens.
+
+What to expect, all measured on held-out structures with 1.3.1. Ranking is
+quoted against the random-ordering baseline it has to beat to mean anything,
+because on a short RNA with a handful of clusters a top-5 hit is close to free:
+
+| Input | What happens |
+|---|---|
+| RNA, site open in the input | top-5 in 67%, against a 47% baseline (660 structures) |
+| RNA, site shut in the input | top-5 in 61%, against a 50% baseline (61 structures) |
+| RNA 62 to 459 nt | site found at all in 87% (detection, independent of ranking) |
+| protein | not affected by the nucleic-acid correction |
+
+**Do not tell an RNA user the old advice that the true site "lands around rank
+10" and the list should be read far down.** That was the signature of a defect,
+not a property of RNA: the ranker's burial term is fitted on protein, where the
+ligand site is the shallower candidate, and it inverts on nucleic acid, where the
+site is the more buried one. Before v1.3.1 that put open RNA sites at top-5 in
+39% against a 47% baseline, which is worse than shuffling the list. v1.3.1
+corrects it and the site now ranks near the top as it does for protein.
+
+Still true: a 400 nt RNA yields 40 or more clusters where a 30-mer yields a
+handful, so quote top-10 above 200 nt rather than top-5. The correction shortens
+that distance, it does not remove it.
+
+Runtime on CPU, 20 conformers: about 1.5 s at 25 nt, 5.6 s at 200 nt, 27 s at 459 nt.
+
+Say plainly what this is NOT. There are no validated cryptic RNA pockets in the
+strict protein sense, and this tool recovers shallow sites a single structure
+misses far more reliably than sterically occluded ones. The defensible claim is
+"finds RNA sites single-structure detection misses", not "finds cryptic RNA
+pockets". If a user asks specifically for cryptic RNA pockets, give them that
+distinction rather than the headline.
+
+`-b rna-nma` forces the nucleic network if auto-detection is not wanted. A
+protein structure handed to that backend raises rather than silently degrading.
+
+## What to tell the user honestly
+
+- These are **predictions on one structure**, not experimental evidence. A high
+  rank is a hypothesis worth testing, not a validated site.
+- **Persistence matters.** A pocket appearing in two of twenty conformers is
+  weaker evidence than one appearing in eighteen, even at a similar rank.
+- **Results are reproducible.** With the default backend the same input gives
+  the same report at any thread count and on Windows and Linux, so a colleague
+  re-running the command gets the same pockets. The one exception announces
+  itself: if a run prints a `RuntimeWarning` that the elastic network is
+  under-constrained, the ensemble is not physically meaningful, so say that
+  instead of reporting its pockets.
+- Lacuna is at **statistical parity with P2Rank**, not better. With `learned-plm`
+  the paired difference on the CryptoBench test fold is +2.8% [-4.4, +9.4]
+  (measured with 1.4.0); with the default `learned` ranker it is -5.6 points
+  [-12.2, +1.1]. Both intervals include zero. Do not claim superiority.
+- On general open binding sites, rather than cryptic ones, **P2Rank is a strong
+  and faster alternative**. Lacuna is built for the closed-in-apo case.
+- Combining detectors beats any single one: across four detectors, the union
+  proposes a qualifying candidate for 92.1% of CryptoBench test targets against
+  74.2% for the best single tool. If a result matters, cross-check with another
+  method.
+
+## When not to use this
+
+Lacuna needs a 3D structure. It cannot work from sequence alone; fold the sequence
+first (AlphaFold, Boltz, Chai, ESMFold) and pass the model in. It also does not
+predict binding affinity, dock ligands, or tell you what to put in a pocket.
+
+## Reference
+
+- Docs: `docs/USAGE.md`, benchmarks in `docs/BENCHMARKS.md`
+- Repo: https://github.com/mooreneural/lacuna
+- Archive: https://doi.org/10.5281/zenodo.20533638

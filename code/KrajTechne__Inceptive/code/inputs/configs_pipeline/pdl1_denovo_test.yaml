@@ -1,0 +1,46 @@
+# One file per run. Each step reads its own section; run_name is shared.
+#   python -m modal run run_design.py     --config inputs/configs_pipeline/pdl1_denovo_test.yaml
+#   python -m modal run run_validation.py --config inputs/configs_pipeline/pdl1_denovo_test.yaml
+# Add --dry-run to either to print the plan without launching anything.
+# (On Windows set PYTHONUTF8=1 first, otherwise Modal's CLI crashes printing a checkmark.)
+
+run_name: pdl1_denovo_test   # results go to the inceptive-runs Volume under <run_name>/
+
+# ---- Step 1: BindCraft2 design (run_design.py) ----
+design:
+  gpu: A100                  # e.g. L40S, A100, H100, or "H100:4" for 4 GPUs
+  timeout_hours: 2
+  # Everything under `bindcraft:` is passed straight to BindCraft2 as its settings
+  # file. Any key from bindcraft2/examples/*.json works here.
+  # (project_folder is set automatically, do not add it.)
+  bindcraft:
+    target: hPDL1
+    binder_lengths: [60, 100]
+    number_of_final_designs: 2   # small on purpose for a first test
+    max_trajectories: 10
+    aa_bias:
+      C: 0
+
+# ---- Step 2: pick designs to validate (run_validation.py) ----
+selection:
+  top_n: 2                   # best N designs from BindCraft2's 3_Ranked/!_Ranked.csv
+  binder_chain: B            # BindCraft2 writes the binder as chain B (target is A)
+
+# ---- Step 3: Optimus validation (run_validation.py) ----
+# Passed to Optimus as its --config file, so any Optimus validation key works here
+# (see optimus/modal_run_validation.py). input and output_dir are set automatically.
+validate:
+  models: [of3, esmfold2]    # supported: of3, native_af3, esmfold2
+  seeds: [0]
+  num_samples: 5
+  gpu_type: H100
+  max_gpus: 5                # validation jobs running at once (one GPU each); the rest wait their turn
+  max_retries: 1             # extra attempts for a job that errors (0 = never retry)
+
+# ---- Step 4: final report (report.py) ----
+# A design "passes validation" when EVERY validation model meets all three thresholds.
+# Defaults follow Optimus's own gates.
+report:
+  min_iptm: 0.8
+  min_ipsae: 0.61
+  min_contact_pass_fraction: 1.0

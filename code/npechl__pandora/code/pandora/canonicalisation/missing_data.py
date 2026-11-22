@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+from collections import defaultdict
+
+from pandora.schemas.common import Diagnostic, DiagnosticBundle
+from pandora.schemas.structure import (
+    AsymRecord,
+    AtomSiteRecord,
+    EntityRecord,
+)
+
+_PROTEIN_BACKBONE = frozenset({"N", "CA", "C", "O"})
+# Sugar-phosphate backbone without P, which the 5'-terminal residue
+# normally lacks.
+_NUCLEIC_BACKBONE = frozenset({"O5'", "C5'", "C4'", "C3'", "O3'"})
+
+
+def _backbone_by_entity(
+    entities: list[EntityRecord],
+) -> dict[str, frozenset[str]]:
+    """Backbone atom names per nucleic-acid entity id (others: protein)."""
+
+    return {
+        e.id: _NUCLEIC_BACKBONE
+        for e in entities
+        if e.poly is not None and "nucleotide" in (e.poly.type or "")
+    }
+
+
+def _handle_missing_atoms(
+    atoms: list[AtomSiteRecord],
+    rules,
+    diagnostics: DiagnosticBundle,
+    entry_id: str,
+    entities: list[EntityRecord],
+) -> list[AtomSiteRecord]:
+    """Flag/drop polymer residues missing backbone atoms, per the
+    missing_atoms rules."""
+
+    strategy = rules.strategy
+    if strategy in ("preserve", "impute"):
+        return atoms
+
+    backbone_by_entity = _backbone_by_entity(entities)
+    polymer_by_residue: dict[tuple, list[AtomSiteRecord]] = defaultdict(list)
+    for a in atoms:
+        if a.group_PDB == "ATOM":
+            polymer_by_residue[
+                (
+                    a.label_asym_id,
+                    a.auth_seq_id,
+                    a.label_seq_id,
+                    a.label_comp_id,
+                )
+            ].append(a)
+
+    drop_residues: set[tuple] = set()
+    for key, res_atoms in polymer_by_residue.items():
+        present = {a.label_atom_id for a in res_atoms}
+        backbone = backbone_by_entity.get(
+            res_atoms[0].label_entity_id, _PROTEIN_BACKBONE
+        )
+        missing = backbone - present
+        if missing:
+            asym_id, _auth_seq_id, seq_id, comp_id = key
+            if rules.record_missingness:
+                diagnostics.warnings.append(
+                    Diagnostic(
+                        code="MISSING_ATOMS",
+                        severity="warning",
+                        message=(
+                            f"Residue {comp_id} {seq_id} in chain "
+                            f"{asym_id} missing backbone atoms"
+                        ),
+                        entry_id=entry_id,
+                        context={
+                            "chain": asym_id,
+                            "seq_id": seq_id,
+                            "comp_id": comp_id,
+                            "missing": sorted(missing),
+                        },
+                    )
+                )
+            if strategy == "drop_partial_residue":
+                drop_residues.add(key)
+
+    if not drop_residues:
+        return atoms
+
+    return [
+        a
+        for a in atoms
+        if a.group_PDB != "ATOM"
+        or (
+            a.label_asym_id,
+            a.auth_seq_id,
+            a.label_seq_id,
+            a.label_comp_id,
+        )
+        not in drop_residues
+    ]
+
+
+def _handle_missing_residues(
+    atoms: list[AtomSiteRecord],
+    rules,
+    diagnostics: DiagnosticBundle,
+    entry_id: str,
+) -> list[AtomSiteRecord]:
+    """Flag/drop chain segments with sequence gaps, per the
+    missing_residues rules."""
+
+    strategy = rules.strategy
+    record = rules.record_gaps
+
+    if strategy == "preserve" and not record:
+        return atoms
+
+    chain_seq_ids: dict[str, list[int]] = defaultdict(list)
+    chain_seen: dict[str, set] = defaultdict(set)
+    for a in atoms:
+        if a.group_PDB == "ATOM" and a.label_seq_id is not None:
+            if a.label_seq_id not in chain_seen[a.label_asym_id]:
+                chain_seen[a.label_asym_id].add(a.label_seq_id)
+                chain_seq_ids[a.label_asym_id].append(a.label_seq_id)
+
+    gap_chains: set[str] = set()
+    for chain, seq_ids in chain_seq_ids.items():
+        sorted_ids = sorted(seq_ids)
+        for i in range(len(sorted_ids) - 1):
+            if sorted_ids[i + 1] - sorted_ids[i] > 1:
+                gap_chains.add(chain)
+                if record:
+                    diagnostics.warnings.append(
+                        Diagnostic(
+                            code="SEQUENCE_GAP",
+                            severity="warning",
+                            message=(
+                                f"Sequence gap in chain {chain} between "
+                                f"residues {sorted_ids[i]} and "
+                                f"{sorted_ids[i + 1]}"
+                            ),
+                            entry_id=entry_id,
+                            context={
+                                "chain": chain,
+                                "gap_start": sorted_ids[i],
+                                "gap_end": sorted_ids[i + 1],
+                            },
+                        )
+                    )
+
+    if strategy == "drop_chain_segment" and gap_chains:
+        return [a for a in atoms if a.label_asym_id not in gap_chains]
+
+    return atoms
+
+
+def _handle_incomplete_chains(
+    atoms: list[AtomSiteRecord],
+    asym_units: list[AsymRecord],
+    rules,
+) -> tuple[list[AtomSiteRecord], list[AsymRecord]]:
+    """Exclude or truncate chains with non-contiguous residue numbering,
+    per the rules."""
+
+    strategy = rules.strategy
+    if strategy == "preserve":
+        return atoms, asym_units
+
+    chain_seq_ids: dict[str, set[int]] = defaultdict(set)
+    for a in atoms:
+        if a.group_PDB == "ATOM" and a.label_seq_id is not None:
+            chain_seq_ids[a.label_asym_id].add(a.label_seq_id)
+
+    incomplete = {
+        chain
+        for chain, seq_ids in chain_seq_ids.items()
+        if max(seq_ids) - min(seq_ids) + 1 > len(seq_ids)
+    }
+
+    if strategy == "exclude":
+        keep = {a.id for a in asym_units} - incomplete
+        return (
+            [a for a in atoms if a.label_asym_id in keep],
+            [a for a in asym_units if a.id in keep],
+        )
+
+    # truncate_to_complete_regions: keep longest contiguous run per
+    # incomplete chain
+    keep_ids = {
+        chain: _longest_run(chain_seq_ids[chain]) for chain in incomplete
+    }
+    return [
+        a
+        for a in atoms
+        if a.label_asym_id not in incomplete
+        or a.label_seq_id in keep_ids[a.label_asym_id]
+    ], asym_units
+
+
+def _drop_emptied_records(
+    atoms: list[AtomSiteRecord],
+    asym_units: list[AsymRecord],
+    entities: list[EntityRecord],
+    diagnostics: DiagnosticBundle,
+    entry_id: str,
+) -> tuple[list[AsymRecord], list[EntityRecord]]:
+    """asym_units and entities without the ones no atom refers to any more,
+    with a CHAIN_EMPTIED warning per dropped asym unit."""
+
+    asym_ids = {a.label_asym_id for a in atoms}
+    entity_ids = {a.label_entity_id for a in atoms}
+    entity_type = {e.id: e.type for e in entities}
+    for u in asym_units:
+        if u.id not in asym_ids:
+            diagnostics.warnings.append(
+                Diagnostic(
+                    code="CHAIN_EMPTIED",
+                    severity="warning",
+                    message=f"Every atom of asym {u.id} was removed",
+                    entry_id=entry_id,
+                    context={
+                        "asym_id": u.id,
+                        "entity_id": u.entity_id,
+                        "entity_type": entity_type.get(u.entity_id),
+                    },
+                )
+            )
+    return (
+        [u for u in asym_units if u.id in asym_ids],
+        [e for e in entities if e.id in entity_ids],
+    )
+
+
+def _longest_run(seq_ids: set[int]) -> set[int]:
+    """Longest run of consecutive numbers in seq_ids (the first one on a
+    tie)."""
+
+    s = sorted(seq_ids)
+    best: list[int] = []
+    run: list[int] = [s[0]]
+    for prev, cur in zip(s, s[1:]):
+        if cur == prev + 1:
+            run.append(cur)
+        else:
+            if len(run) > len(best):
+                best = run
+            run = [cur]
+    return set(run if len(run) > len(best) else best)

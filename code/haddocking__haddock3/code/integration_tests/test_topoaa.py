@@ -1,0 +1,1031 @@
+import copy
+import gzip
+import math
+import shutil
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from haddock.modules.topology.topoaa import DEFAULT_CONFIG as DEFAULT_TOPOAA_CONFIG
+from haddock.modules.topology.topoaa import HaddockModule as TopoaaModule
+
+from . import CNS_EXEC, EXAMPLE_DIR, GOLDEN_DATA, has_grid
+
+
+def improper_angle(coords, a1, a2, a3, a4) -> float:
+    """Improper dihedral a1-a2-a3-a4 in degrees, from a name -> xyz mapping.
+
+    Note that the sign convention is the opposite of the one CNS uses for the
+    IMPRoper target values in ``carbohydrate.param``.
+    """
+
+    def sub(u, v):
+        return [u[n] - v[n] for n in range(3)]
+
+    def cross(u, v):
+        return [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ]
+
+    def dot(u, v):
+        return sum(x * y for x, y in zip(u, v))
+
+    b1 = sub(coords[a2], coords[a1])
+    b2 = sub(coords[a3], coords[a2])
+    b3 = sub(coords[a4], coords[a3])
+    n1, n2 = cross(b1, b2), cross(b2, b3)
+    perp = cross(n1, b2)
+    return math.degrees(math.atan2(dot(perp, n2) / math.sqrt(dot(b2, b2)), dot(n1, n2)))
+
+
+def residue_coords(fpath, resname, resid) -> dict[str, tuple[float, float, float]]:
+    """Extract an atomname -> xyz mapping for one residue of a PDB file."""
+    coords = {}
+    with open(fpath, encoding="utf-8", mode="r") as fin:
+        for line in fin:
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            if line[17:20].strip() == resname and line[22:26].strip() == str(resid):
+                coords[line[12:16].strip()] = (
+                    float(line[30:38]),
+                    float(line[38:46]),
+                    float(line[46:54]),
+                )
+    return coords
+
+
+@pytest.fixture
+def topoaa_module():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        topoaa = TopoaaModule(
+            order=0, path=Path(tmpdir), initial_params=DEFAULT_TOPOAA_CONFIG
+        )
+        yield topoaa
+
+
+def extract_nter_cter(fpath) -> tuple[str, str]:
+    """Helper function to extract nter and cter residues as strings."""
+    nter, cter = "", ""
+    nter_resi, cter_resi = None, None
+    # Read file
+    with open(fpath, "r") as fin:
+        # Loop over lines
+        for _ in fin:
+            # Make sure we are looking at coordinates
+            if _.startswith(("ATOM", "HETATM")):
+                # Extract residue id
+                resid = _[22:26].strip()
+                # First residue should be Nter one
+                if nter_resi is None:
+                    nter_resi = resid
+                # Last residue should be Cter one
+                if cter_resi is None:
+                    cter_resi = resid
+                else:
+                    # Reset last residue to current residue
+                    # until we cannot do this anymore
+                    # should result in extracting last residue
+                    if cter_resi != resid:
+                        # Reset cter residue to empty string
+                        cter = ""
+                        cter_resi = resid
+                # Increment first residue
+                if resid == nter_resi:
+                    nter += _
+                # Increment last residue
+                cter += _
+    return nter, cter
+
+
+@pytest.mark.parametrize("autotoppar_flag", [False, True])
+def test_topoaa_prot_pep_ens_autotoppar(topoaa_module, autotoppar_flag):
+
+    _data_dir = Path(EXAMPLE_DIR, "docking-protein-peptide", "data")
+    topoaa_module.params["molecules"] = [
+        Path(_data_dir, "1NX1_protein.pdb"),
+        Path(_data_dir, "DAIDALSSDFT_3conformations.pdb"),
+    ]
+    topoaa_module.params["mol1"]["prot_segid"] = "A"
+    # Create mol2 parameters by copying the ones found for mol1
+    topoaa_module.params["mol2"] = copy.deepcopy(topoaa_module.params["mol1"])
+    topoaa_module.params["mol2"]["prot_segid"] = "B"
+    topoaa_module.params["debug"] = True
+    topoaa_module.params["autotoppar"] = autotoppar_flag
+    topoaa_module.run()
+
+    expected_files = [
+        "1NX1_protein.inp",
+        "1NX1_protein_haddock.psf",
+        "1NX1_protein_haddock.pdb",
+        "DAIDALSSDFT_3conformations_1.inp",
+        "DAIDALSSDFT_3conformations_1.pdb",
+        "DAIDALSSDFT_alpha_from_DAIDALSSDFT_3conformations_1_haddock.psf",
+        "DAIDALSSDFT_alpha_from_DAIDALSSDFT_3conformations_1_haddock.pdb",
+        "DAIDALSSDFT_3conformations_2.inp",
+        "DAIDALSSDFT_3conformations_2.pdb",
+        "DAIDALSSDFT_ext_from_DAIDALSSDFT_3conformations_2_haddock.psf",
+        "DAIDALSSDFT_ext_from_DAIDALSSDFT_3conformations_2_haddock.pdb",
+        "DAIDALSSDFT_3conformations_3.inp",
+        "DAIDALSSDFT_3conformations_3.pdb",
+        "DAIDALSSDFT_polyII_from_DAIDALSSDFT_3conformations_3_haddock.psf",
+        "DAIDALSSDFT_polyII_from_DAIDALSSDFT_3conformations_3_haddock.pdb",
+    ]
+
+    for f in expected_files:
+        assert Path(topoaa_module.path, f).exists(), f"{f} not found"
+
+
+@has_grid
+def test_topoaa_module_protein_grid(topoaa_module):
+    """Topoaa module with protein-protein input."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "e2aP_1F3G.pdb"),
+        Path(GOLDEN_DATA, "hpr_ensemble.pdb"),
+    ]
+    topoaa_module.params["mol1"]["prot_segid"] = "A"
+    # Create mol2 parameters by copying the ones found for mol1
+    topoaa_module.params["mol2"] = copy.deepcopy(topoaa_module.params["mol1"])
+    topoaa_module.params["mol2"]["prot_segid"] = "B"
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+    topoaa_module.params["mode"] = "grid"
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "e2aP_1F3G.inp")
+    expected_psf = Path(topoaa_module.path, "e2aP_1F3G_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "e2aP_1F3G_haddock.pdb")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    assert expected_inp.stat().st_size > 0, f"{expected_inp} is empty"
+
+    for i in range(1, 10 + 1):
+        expected_inp = Path(topoaa_module.path, f"hpr_ensemble_{i}.inp")
+        expected_psf = Path(topoaa_module.path, f"hpr_ensemble_{i}_haddock.psf")
+        expected_pdb = Path(topoaa_module.path, f"hpr_ensemble_{i}_haddock.pdb")
+
+        assert expected_inp.exists(), f"{expected_inp} does not exist"
+        assert expected_psf.exists(), f"{expected_psf} does not exist"
+        assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+        assert expected_inp.stat().st_size > 0, f"{expected_inp} is empty"
+        assert expected_psf.stat().st_size > 0, f"{expected_psf} is empty"
+        assert expected_pdb.stat().st_size > 0, f"{expected_pdb} is empty"
+
+
+def test_topoaa_module_protein(topoaa_module):
+    """Topoaa module with protein-protein input."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "e2aP_1F3G.pdb"),
+        Path(GOLDEN_DATA, "hpr_ensemble.pdb"),
+    ]
+    topoaa_module.params["mol1"]["prot_segid"] = "A"
+    # Create mol2 parameters by copying the ones found for mol1
+    topoaa_module.params["mol2"] = copy.deepcopy(topoaa_module.params["mol1"])
+    topoaa_module.params["mol2"]["prot_segid"] = "B"
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "e2aP_1F3G.inp")
+    expected_psf = Path(topoaa_module.path, "e2aP_1F3G_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "e2aP_1F3G_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "e2aP_1F3G.out.gz")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_gz.exists(), f"{expected_gz} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    assert expected_inp.stat().st_size > 0, f"{expected_inp} is empty"
+
+    for i in range(1, 10 + 1):
+        expected_inp = Path(topoaa_module.path, f"hpr_ensemble_{i}.inp")
+        expected_psf = Path(topoaa_module.path, f"hpr_ensemble_{i}_haddock.psf")
+        expected_pdb = Path(topoaa_module.path, f"hpr_ensemble_{i}_haddock.pdb")
+        expected_gz = Path(topoaa_module.path, f"hpr_ensemble_{i}.out.gz")
+
+        assert expected_inp.exists(), f"{expected_inp} does not exist"
+        assert expected_psf.exists(), f"{expected_psf} does not exist"
+        assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+        assert expected_gz.exists(), f"{expected_gz} does not exist"
+
+        assert expected_inp.stat().st_size > 0, f"{expected_inp} is empty"
+        assert expected_psf.stat().st_size > 0, f"{expected_psf} is empty"
+        assert expected_pdb.stat().st_size > 0, f"{expected_pdb} is empty"
+        assert expected_gz.stat().st_size > 0, f"{expected_gz} is empty"
+
+
+def test_topoaa_module_ligand(topoaa_module):
+    """Topoaa with ligand as input."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "oseltamivir.pdb"),
+    ]
+    topoaa_module.params["ligand_top_fname"] = Path(GOLDEN_DATA, "ligand.top")
+    topoaa_module.params["ligand_param_fname"] = Path(GOLDEN_DATA, "ligand.param")
+    topoaa_module.params["delenph"] = False
+    topoaa_module.params["preprocess"] = False
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "oseltamivir.inp")
+    expected_psf = Path(topoaa_module.path, "oseltamivir_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "oseltamivir_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "oseltamivir.out.gz")
+
+    assert expected_inp.exists()
+    assert expected_psf.exists()
+    assert expected_pdb.exists()
+    assert expected_gz.exists()
+
+
+def test_topoaa_module_ligand_hydrogen_build(topoaa_module):
+    """Topoaa with ligand as input and hydrogen_build set to unknown."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "oseltamivir.pdb"),
+    ]
+    topoaa_module.params["ligand_top_fname"] = Path(GOLDEN_DATA, "ligand.top")
+    topoaa_module.params["ligand_param_fname"] = Path(GOLDEN_DATA, "ligand.param")
+    topoaa_module.params["delenph"] = False
+    topoaa_module.params["hydrogen_build"] = "unknown"
+    topoaa_module.params["preprocess"] = False
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "oseltamivir.inp")
+    expected_psf = Path(topoaa_module.path, "oseltamivir_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "oseltamivir_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "oseltamivir.out.gz")
+
+    assert expected_inp.exists()
+    assert expected_psf.exists()
+    assert expected_pdb.exists()
+    assert expected_gz.exists()
+    file_content = gzip.open(
+        Path(topoaa_module.path, "oseltamivir.out.gz"), "rt"
+    ).read()
+    assert 'hydrogen_build="unknown"' in file_content
+
+
+def test_topoaa_module_ligand_automated(topoaa_module):
+    """Topoaa with ligand as input without providing topology/parameter files.
+
+    The module should automatically generate the CNS topology and parameters
+    for the unknown ligand using prodrg.
+    """
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "oseltamivir.pdb"),
+    ]
+    topoaa_module.params["autotoppar"] = True
+    topoaa_module.params["delenph"] = False
+    topoaa_module.params["preprocess"] = False
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "oseltamivir.inp")
+    expected_psf = Path(topoaa_module.path, "oseltamivir_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "oseltamivir_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "oseltamivir.out.gz")
+
+    assert expected_inp.exists()
+    assert expected_psf.exists()
+    assert expected_pdb.exists()
+    assert expected_gz.exists()
+
+
+def test_topoaa_module_ligand_ensemble_automated(topoaa_module):
+    """Topoaa with an ensemble of ligands as input without providing topology/parameter files.
+
+    The module should automatically generate the CNS topology and parameters
+    for the unknown ligand using prodrg.
+    """
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "ligand-ens.pdb"),
+        Path(GOLDEN_DATA, "protein-ens.pdb"),
+    ]
+    topoaa_module.params["mol1"]["prot_segid"] = "A"
+    # Create mol2 parameters by copying the ones found for mol1
+    topoaa_module.params["mol2"] = copy.deepcopy(topoaa_module.params["mol1"])
+    topoaa_module.params["mol2"]["prot_segid"] = "B"
+    topoaa_module.params["autotoppar"] = True
+    topoaa_module.params["preprocess"] = False
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected1_inp = Path(topoaa_module.path, "ligand-ens_1.inp")
+    expected1_psf = Path(
+        topoaa_module.path, "dock_1_model_ligand_from_ligand-ens_1_haddock.psf"
+    )
+    expected1_pdb = Path(
+        topoaa_module.path, "dock_1_model_ligand_from_ligand-ens_1_haddock.pdb"
+    )
+    expected2_inp = Path(topoaa_module.path, "ligand-ens_2.inp")
+    expected2_psf = Path(
+        topoaa_module.path, "dock_2_model_ligand_from_ligand-ens_2_haddock.psf"
+    )
+    expected2_pdb = Path(
+        topoaa_module.path, "dock_2_model_ligand_from_ligand-ens_2_haddock.pdb"
+    )
+
+    assert expected1_inp.exists()
+    assert expected1_psf.exists()
+    assert expected1_pdb.exists()
+    assert expected2_inp.exists()
+    assert expected2_psf.exists()
+    assert expected2_pdb.exists()
+
+    # Check if the property was added to the output
+    for structure in topoaa_module.output_models:
+        for model in structure:
+            pdb = structure[model]
+
+            # Check the contents
+            if "ligand" in pdb.file_name:
+                assert pdb.ligand_top_fname.exists()
+                assert pdb.ligand_param_fname.exists()
+
+
+def test_topoaa_cyclic(topoaa_module):
+    """Test the topoaa module to generate a cyclic peptide."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "cyclic-peptide.pdb"),
+    ]
+    topoaa_module.params["cyclicpept_dist"] = 3.5
+    topoaa_module.params["disulphide_dist"] = 4.0
+    topoaa_module.params["mol1"]["cyclicpept"] = True
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "cyclic-peptide.inp")
+    expected_psf = Path(topoaa_module.path, "cyclic-peptide_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "cyclic-peptide_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "cyclic-peptide.out.gz")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_gz.exists(), f"{expected_gz} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    with open(expected_psf, encoding="utf-8", mode="r") as f:
+        file_content = f.read()
+
+    assert "detected" in file_content
+    assert "disulphide" in file_content
+
+
+def test_topoaa_cyclic_ace_cys(topoaa_module):
+    """Test the topoaa module to generate a cyclic ACE-CYS peptide."""
+    src = Path(GOLDEN_DATA, "ace-cys-cyclic-peptide.pdb")
+    local_copy = shutil.copy(src, topoaa_module.path / src.name)
+    topoaa_module.params["molecules"] = [
+        Path(local_copy),
+    ]
+    topoaa_module.params["acecys_dist"] = 4.0
+    # next give a large value for the cyclic peptide distance
+    # to test it should not be generated
+    topoaa_module.params["cyclicpept_dist"] = 8.0
+    topoaa_module.params["mol1"]["cyclicpept"] = True
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "ace-cys-cyclic-peptide.inp")
+    expected_psf = Path(topoaa_module.path, "ace-cys-cyclic-peptide_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "ace-cys-cyclic-peptide_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "ace-cys-cyclic-peptide.out.gz")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_gz.exists(), f"{expected_gz} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    with open(expected_psf, encoding="utf-8", mode="r") as f:
+        file_content = f.read()
+
+    assert "COVAL-ACE-CYS" in file_content
+    assert "cyclic peptide detected" not in file_content
+
+
+def test_topoaa_THRglycosylation(topoaa_module):
+    """Test the topoaa module to detect THR-glycosylation."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "thr-glycosylation.pdb"),
+    ]
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "thr-glycosylation.inp")
+    expected_psf = Path(topoaa_module.path, "thr-glycosylation_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "thr-glycosylation_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "thr-glycosylation.out.gz")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_gz.exists(), f"{expected_gz} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    with open(expected_pdb, encoding="utf-8", mode="r") as f:
+        file_content = f.read()
+
+    assert "THR-glycosylation" in file_content
+    assert "detected" in file_content
+
+
+def test_topoaa_THRglycosylationAA(topoaa_module):
+    """Test the topoaa module to detect THR-glycosylation."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "thr-glycosylation.pdb"),
+    ]
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+    topoaa_module.params["delenph"] = False
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "thr-glycosylation.inp")
+    expected_psf = Path(topoaa_module.path, "thr-glycosylation_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "thr-glycosylation_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "thr-glycosylation.out.gz")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_gz.exists(), f"{expected_gz} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    with open(expected_pdb, encoding="utf-8", mode="r") as f:
+        file_content = f.read()
+
+    assert "THR-glycosylation" in file_content
+    assert "detected" in file_content
+    assert "HG21" in file_content
+
+
+def test_topoaa_SERglycosylation(topoaa_module):
+    """Test the topoaa module to detect SER-glycosylation."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "ser-glycosylation.pdb"),
+    ]
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "ser-glycosylation.inp")
+    expected_psf = Path(topoaa_module.path, "ser-glycosylation_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "ser-glycosylation_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "ser-glycosylation.out.gz")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_gz.exists(), f"{expected_gz} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    with open(expected_pdb, encoding="utf-8", mode="r") as f:
+        file_content = f.read()
+
+    assert "SER-glycosylation" in file_content
+    assert "detected" in file_content
+
+
+def test_topoaa_GalNAcOMe(topoaa_module):
+    """Test the topoaa module with 1-O-methyl-2-N-Acetyl-beta-D-glucopyranose."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "gal-nam.pdb"),
+    ]
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "gal-nam.inp")
+    expected_psf = Path(topoaa_module.path, "gal-nam_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "gal-nam_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "gal-nam.out.gz")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_gz.exists(), f"{expected_gz} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    with open(expected_pdb, encoding="utf-8", mode="r") as f:
+        file_content = f.read()
+
+    assert " C9 " in file_content
+
+
+def test_topoaa_GalNAcalphaOMe(topoaa_module):
+    """Test the topoaa module with 1-O-methyl-2-N-Acetyl-alpha-D-glucopyranose."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "gal-naa.pdb"),
+    ]
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "gal-naa.inp")
+    expected_psf = Path(topoaa_module.path, "gal-naa_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "gal-naa_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "gal-naa.out.gz")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_gz.exists(), f"{expected_gz} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    with open(expected_pdb, encoding="utf-8", mode="r") as f:
+        file_content = f.read()
+
+    assert " C9 " in file_content
+
+
+def test_topoaa_GalGalNacalphaOMe(topoaa_module):
+    """Test the topoaa module with 1-O-methyl-2-N-Acetyl-alpha-D-galactopyranose."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "gal-ngm.pdb"),
+    ]
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "gal-ngm.inp")
+    expected_psf = Path(topoaa_module.path, "gal-ngm_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "gal-ngm_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "gal-ngm.out.gz")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_gz.exists(), f"{expected_gz} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    with open(expected_pdb, encoding="utf-8", mode="r") as f:
+        file_content = f.read()
+
+    assert " C9 " in file_content
+    assert " O4 " in file_content
+
+
+def test_topoaa_GalGalNAcalpha(topoaa_module):
+    """Topoaa with alpha-GalNAc (A2G), the alpha anomer of NGA.
+
+    Input is the core-1/T-antigen disaccharide Gal-beta(1,3)-alpha-GalNAc.
+    The anomeric carbon and the C4 substituents are absent from the input and
+    have to be built by CNS, so this also checks that the A2G impropers pin the
+    right stereochemistry: alpha at C1 and galacto (axial O4) at C4.
+    """
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "gal-a2g.pdb"),
+    ]
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "gal-a2g.inp")
+    expected_psf = Path(topoaa_module.path, "gal-a2g_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "gal-a2g_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "gal-a2g.out.gz")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_gz.exists(), f"{expected_gz} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    with open(expected_pdb, encoding="utf-8", mode="r") as f:
+        file_content = f.read()
+
+    # the free anomeric hydroxyl and the C4 hydroxyl must have been built
+    assert " O1 " in file_content
+    assert " O4 " in file_content
+
+    # the beta(1,3) link to the galactose must have been patched in
+    with gzip.open(expected_gz, mode="rt", encoding="utf-8") as f:
+        log = f.read()
+    assert "B13 link added" in log
+
+    a2g = residue_coords(expected_pdb, "A2G", 2)
+    gal = residue_coords(expected_pdb, "GAL", 3)
+
+    # Alpha anomer. carbohydrate.top restrains IMPRoper H1 O5 O1 C2 of A2G to
+    # 67.6 degrees, the alpha-D value; the beta anomer NGA uses the j/k-swapped
+    # ordering H1 O1 O5 C2 and so has the opposite sign for this quadruple.
+    # improper_angle() follows the opposite sign convention to CNS, hence the
+    # negative reference value here.
+    anomeric = improper_angle(a2g, "H1", "O5", "O1", "C2")
+    assert -80.0 < anomeric < -55.0, (
+        f"A2G C1 is not the alpha anomer: H1-O5-O1-C2 is {anomeric:.1f} deg, "
+        "expected about -67.6"
+    )
+
+    # Galacto configuration at C4 (axial O4).  Compared against the galactose
+    # of the same molecule using the same atom ordering, so this holds whatever
+    # sign convention improper_angle() uses: the gluco epimer of A2G would come
+    # out with the opposite sign.
+    a2g_c4 = improper_angle(a2g, "H4", "O4", "C3", "C5")
+    gal_c4 = improper_angle(gal, "H4", "O4", "C3", "C5")
+    assert a2g_c4 * gal_c4 > 0, (
+        "A2G C4 has gluco, not galacto, configuration: H4-O4-C3-C5 is "
+        f"{a2g_c4:.1f} deg against {gal_c4:.1f} deg for the galactose"
+    )
+
+
+# alpha-Neu5Ac (SIA) stereochemistry, as carbohydrate.top restrains it.  The
+# values are the CNS improper targets; improper_angle() uses the opposite sign
+# convention, so a correct structure measures about the negative of each.
+SIA_STEREO = [
+    (("H4", "O4", "C5", "C3"), 66.9),
+    (("H5", "C4", "C6", "N5"), 66.8),
+    (("H6", "C7", "O6", "C5"), 66.8),
+    (("H7", "O7", "C8", "C6"), 66.9),
+    (("H8", "O8", "C9", "C7"), 66.9),
+    (("C1", "O1A", "O1B", "C2"), 0.0),
+    (("N5", "C10", "C5", "HN5"), 0.0),
+    (("C10", "C11", "N5", "O10"), 0.0),
+]
+
+
+def assert_stereo(coords, checks, label):
+    """Check impropers against their CNS targets, allowing for the sign flip."""
+    for atoms, target in checks:
+        assert all(a in coords for a in atoms), f"{label}: {atoms} not all built"
+        value = improper_angle(coords, *atoms)
+        if target == 0.0:
+            assert abs(value) < 12.0, (
+                f"{label} {' '.join(atoms)} should be planar, is {value:.1f} deg"
+            )
+        else:
+            assert value * target < 0 and 40.0 < abs(value) < 95.0, (
+                f"{label} {' '.join(atoms)} is {value:.1f} deg, expected about "
+                f"{-target:.1f}"
+            )
+
+
+def test_topoaa_sialic_acid(topoaa_module):
+    """Topoaa with alpha-N-acetyl neuraminic acid (SIA) on its own."""
+    topoaa_module.params["molecules"] = [Path(GOLDEN_DATA, "sia.pdb")]
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_psf = Path(topoaa_module.path, "sia_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "sia_haddock.pdb")
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    sia = residue_coords(expected_pdb, "SIA", 1)
+    # ring, carboxylate, N-acetyl and the full glycerol arm
+    for atom in (
+        "C1",
+        "O1A",
+        "O1B",
+        "C2",
+        "O2",
+        "O6",
+        "N5",
+        "C10",
+        "C11",
+        "O7",
+        "O8",
+        "O9",
+    ):
+        assert atom in sia, f"SIA {atom} missing from the topology output"
+    assert_stereo(sia, SIA_STEREO, "SIA")
+
+
+@pytest.mark.parametrize(
+    "pdb,patch,acceptor_oh",
+    [
+        ("sia-a2g-26.pdb", "A26S", "HO6"),  # sialyl-Tn
+        ("sia-a2g-23.pdb", "A23", "HO3"),
+    ],
+)
+def test_topoaa_sialyl_GalNAc(topoaa_module, pdb, patch, acceptor_oh):
+    """Topoaa detects SIA alpha(2,6) and alpha(2,3) linkages to alpha-GalNAc.
+
+    sia-a2g-26.pdb is the sialyl-Tn antigen.  Both cases check that
+    bondglycans.cns picks the linkage up, that the patch deletes the anomeric
+    hydroxyl of the sialic acid and the acceptor hydroxyl hydrogen, and that
+    neither residue loses its stereochemistry in the process.
+    """
+    topoaa_module.params["molecules"] = [Path(GOLDEN_DATA, pdb)]
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    stem = pdb.removesuffix(".pdb")
+    expected_psf = Path(topoaa_module.path, f"{stem}_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, f"{stem}_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, f"{stem}.out.gz")
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    with gzip.open(expected_gz, mode="rt", encoding="utf-8", errors="replace") as f:
+        log = f.read()
+    assert f"{patch} link added" in log, f"{patch} was not applied"
+
+    sia = residue_coords(expected_pdb, "SIA", 2)
+    a2g = residue_coords(expected_pdb, "A2G", 1)
+
+    # the patch replaces the anomeric hydroxyl of SIA with the glycosidic bond
+    assert "O2" not in sia, "SIA O2 should have been deleted by the patch"
+    assert "HO2" not in sia, "SIA HO2 should have been deleted by the patch"
+    assert acceptor_oh not in a2g, f"A2G {acceptor_oh} should have been deleted"
+
+    assert_stereo(sia, SIA_STEREO, "SIA")
+    assert_stereo(
+        a2g,
+        [
+            (("H1", "O5", "O1", "C2"), 67.6),
+            (("H4", "O4", "C3", "C5"), 66.9),
+            (("H2", "C1", "N2", "C3"), 66.8),
+            (("N2", "C7", "C2", "HN2"), 0.0),
+        ],
+        "A2G",
+    )
+
+
+def test_topoaa_module_protein_noCter(topoaa_module):
+    """Topoaa module with uncharged Cter and charged Nter."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "2oob_A.pdb"),
+    ]
+    topoaa_module.params["mol1"]["charged_nter"] = True
+    topoaa_module.params["mol1"]["charged_cter"] = False
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "2oob_A.inp")
+    expected_psf = Path(topoaa_module.path, "2oob_A_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "2oob_A_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "2oob_A.out.gz")
+    assert expected_inp.exists()
+    assert expected_psf.exists()
+    assert expected_pdb.exists()
+    assert expected_gz.exists()
+
+    nter, cter = extract_nter_cter(expected_pdb)
+    assert "OXT" not in cter
+    assert all(
+        [
+            nh in nter
+            for nh in (
+                "HT1",
+                "HT2",
+                "HT3",
+            )
+        ]
+    )
+
+
+def test_topoaa_module_protein_noNter(topoaa_module):
+    """Topoaa module with charged Cter and uncharged Nter."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "2oob_A.pdb"),
+    ]
+    topoaa_module.params["mol1"]["charged_nter"] = False
+    topoaa_module.params["mol1"]["charged_cter"] = True
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "2oob_A.inp")
+    expected_psf = Path(topoaa_module.path, "2oob_A_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "2oob_A_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "2oob_A.out.gz")
+    assert expected_inp.exists()
+    assert expected_psf.exists()
+    assert expected_pdb.exists()
+    assert expected_gz.exists()
+
+    nter, cter = extract_nter_cter(expected_pdb)
+    assert "OXT" in cter
+    assert not any(
+        [
+            nh in nter
+            for nh in (
+                "HT1",
+                "HT2",
+                "HT3",
+            )
+        ]
+    )
+
+
+def test_topoaa_module_protein_noter(topoaa_module):
+    """Topoaa module without charged termini."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "2oob_A.pdb"),
+    ]
+    topoaa_module.params["mol1"]["charged_nter"] = False
+    topoaa_module.params["mol1"]["charged_cter"] = False
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "2oob_A.inp")
+    expected_psf = Path(topoaa_module.path, "2oob_A_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "2oob_A_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "2oob_A.out.gz")
+    assert expected_inp.exists()
+    assert expected_psf.exists()
+    assert expected_pdb.exists()
+    assert expected_gz.exists()
+
+    nter, cter = extract_nter_cter(expected_pdb)
+    assert "OXT" not in cter
+    assert not any(
+        [
+            nh in nter
+            for nh in (
+                "HT1",
+                "HT2",
+                "HT3",
+            )
+        ]
+    )
+
+
+def test_topoaa_module_protein_charged_ters(topoaa_module):
+    """Topoaa module with charged termini."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "2oob_A.pdb"),
+    ]
+    topoaa_module.params["mol1"]["charged_nter"] = True
+    topoaa_module.params["mol1"]["charged_cter"] = True
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "2oob_A.inp")
+    expected_psf = Path(topoaa_module.path, "2oob_A_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "2oob_A_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "2oob_A.out.gz")
+    assert expected_inp.exists()
+    assert expected_psf.exists()
+    assert expected_pdb.exists()
+    assert expected_gz.exists()
+
+    nter, cter = extract_nter_cter(expected_pdb)
+    assert "OXT" in cter
+    assert all(
+        [
+            nh in nter
+            for nh in (
+                "HT1",
+                "HT2",
+                "HT3",
+            )
+        ]
+    )
+
+
+def test_topoaa_module_dna_5_phosphate(topoaa_module):
+    """Topoaa module with charged termini."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "mini_dna.pdb"),
+    ]
+    topoaa_module.params["mol1"]["5_phosphate"] = True
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "mini_dna.inp")
+    expected_psf = Path(topoaa_module.path, "mini_dna_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "mini_dna_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "mini_dna.out.gz")
+    assert expected_inp.exists()
+    assert expected_psf.exists()
+    assert expected_pdb.exists()
+    assert expected_gz.exists()
+
+    five_prime, _three_prime = extract_nter_cter(expected_pdb)
+    assert all(
+        [
+            fp in five_prime
+            for fp in (
+                "H5T",
+                "O5T",
+                "OP2",
+                "OP1",
+                "P",
+            )
+        ]
+    )
+
+
+def test_topoaa_module_dna_5_oh(topoaa_module):
+    """Topoaa module with charged termini."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "mini_dna.pdb"),
+    ]
+    topoaa_module.params["mol1"]["5_phosphate"] = False
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "mini_dna.inp")
+    expected_psf = Path(topoaa_module.path, "mini_dna_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "mini_dna_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "mini_dna.out.gz")
+    assert expected_inp.exists()
+    assert expected_psf.exists()
+    assert expected_pdb.exists()
+    assert expected_gz.exists()
+
+    five_prime, _three_prime = extract_nter_cter(expected_pdb)
+    assert not any(
+        [
+            fp in five_prime
+            for fp in (
+                "O5T",
+                "OP2",
+                "OP1",
+                "P",
+            )
+        ]
+    )
+    assert "H5T" in five_prime
+
+
+def test_topoaa_D_amino_acids(topoaa_module):
+    """Test the topoaa module to detect D-amino acids."""
+    topoaa_module.params["molecules"] = [
+        Path(GOLDEN_DATA, "PPCIVSMLPPDFLYAYS.pdb"),
+    ]
+    topoaa_module.params["cns_exec"] = CNS_EXEC
+    topoaa_module.params["debug"] = True
+
+    topoaa_module.run()
+
+    expected_inp = Path(topoaa_module.path, "PPCIVSMLPPDFLYAYS.inp")
+    expected_psf = Path(topoaa_module.path, "PPCIVSMLPPDFLYAYS_haddock.psf")
+    expected_pdb = Path(topoaa_module.path, "PPCIVSMLPPDFLYAYS_haddock.pdb")
+    expected_gz = Path(topoaa_module.path, "PPCIVSMLPPDFLYAYS.out.gz")
+
+    assert expected_inp.exists(), f"{expected_inp} does not exist"
+    assert expected_psf.exists(), f"{expected_psf} does not exist"
+    assert expected_gz.exists(), f"{expected_gz} does not exist"
+    assert expected_pdb.exists(), f"{expected_pdb} does not exist"
+
+    with open(expected_pdb, encoding="utf-8", mode="r") as f:
+        file_content = f.read()
+
+    assert "REMARK D-amino acid detected for PRO 1 of chain" in file_content
+    assert "REMARK D-amino acid detected for PRO 9 of chain" in file_content
+
+
+def test_topoaa_with_ensemble_ligand_files(topoaa_module):
+    """Test topoaa module with ensemble containing different ligand files."""
+    prot_src = Path(GOLDEN_DATA, "prot.pdb")
+    prot_copy = shutil.copy(prot_src, topoaa_module.path / prot_src.name)
+    molecules = [
+        Path(prot_copy),
+        Path(GOLDEN_DATA, "oseltamivir_ens.pdb"),
+    ]
+
+    topoaa_module.params["molecules"] = molecules
+    topoaa_module.params["mol1"]["prot_segid"] = "A"
+    topoaa_module.params["mol2"] = copy.deepcopy(topoaa_module.params["mol1"])
+    topoaa_module.params["mol2"]["prot_segid"] = "B"
+    topoaa_module.params["autotoppar"] = True
+
+    topoaa_module.run()
+
+    expected_files = [
+        "prot_haddock.pdb",
+        "prot_haddock.psf",
+        "oseltamivir_from_oseltamivir_ens_1_haddock.pdb",
+        "oseltamivir_from_oseltamivir_ens_1_haddock.psf",
+        "oseltamivir_from_oseltamivir_ens_2_haddock.pdb",
+        "oseltamivir_from_oseltamivir_ens_2_haddock.psf",
+        "oseltamivir_ens_1_prodrg.param",
+        "oseltamivir_ens_2_prodrg.param",
+        "oseltamivir_ens_1_prodrg.top",
+        "oseltamivir_ens_2_prodrg.top",
+    ]
+
+    for f in expected_files:
+        assert Path(topoaa_module.path, f).exists()

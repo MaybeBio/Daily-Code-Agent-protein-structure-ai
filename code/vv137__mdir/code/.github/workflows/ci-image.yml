@@ -1,0 +1,87 @@
+name: ci-image
+
+# The image of the CPU tier of CI (#611): HDF5, LLVM/MLIR 23.1.2, and the
+# tools of the tests, pushed to ghcr.io/vv137/mdir-ci with the tag
+# `llvm-23.1.2-<hash>`, a hash of packaging/Dockerfile and of the two build
+# scripts, which scripts/packaging/build.sh computes for this workflow and
+# for ci.yml (#639). LLVM is built by
+# scripts/build-llvm.sh in up to three parts that share a compile cache
+# (ci-llvm-part.yml), since one hosted job cannot build it in six hours;
+# the image is then the stage `ci-prebuilt` of packaging/Dockerfile over
+# that install (the stage `ci` builds the same image in one go where a
+# machine can). It pushes, so it runs only when the maintainer starts it
+# (workflow_dispatch; the maintainer, 2026-10-26), and builds nothing when
+# the tag is present already.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.tag.outputs.image }}
+      present: ${{ steps.present.outputs.yes }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: |
+          echo "image=$(scripts/packaging/build.sh ci --print-tag)" >> "$GITHUB_OUTPUT"
+      - id: present
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          if docker manifest inspect "${{ steps.tag.outputs.image }}" > /dev/null 2>&1; then
+            echo "yes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  part1:
+    needs: tag
+    uses: ./.github/workflows/ci-llvm-part.yml
+    with:
+      part: 1
+      skip: ${{ needs.tag.outputs.present == 'true' }}
+  part2:
+    needs: [tag, part1]
+    uses: ./.github/workflows/ci-llvm-part.yml
+    with:
+      part: 2
+      skip: ${{ needs.tag.outputs.present == 'true' || needs.part1.outputs.done == 'true' }}
+  part3:
+    needs: [tag, part1, part2]
+    uses: ./.github/workflows/ci-llvm-part.yml
+    with:
+      part: 3
+      skip: ${{ needs.tag.outputs.present == 'true' || needs.part1.outputs.done == 'true' || needs.part2.outputs.done == 'true' }}
+
+  image:
+    needs: [tag, part1, part2, part3]
+    if: ${{ always() && needs.tag.outputs.present != 'true' && (needs.part1.outputs.done == 'true' || needs.part2.outputs.done == 'true' || needs.part3.outputs.done == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: llvm-install
+      - name: The install of LLVM in the context
+        run: mkdir ci-llvm && tar -C ci-llvm -xzf llvm-install.tar.gz && rm llvm-install.tar.gz && du -sh ci-llvm
+      - name: Login
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      # The entry point of the packaging (#639) builds the stage ci-prebuilt
+      # over ci-llvm/ and pushes it under the tag of the job `tag`. A hosted
+      # runner has less free disk than the script's default floor.
+      - name: Build and push
+        env:
+          WORK: ${{ runner.temp }}
+          MIN_FREE_GB: "0"
+        run: |
+          test "$(scripts/packaging/build.sh ci-prebuilt --print-tag)" = "${{ needs.tag.outputs.image }}"
+          scripts/packaging/build.sh ci-prebuilt --push
+      - name: Size
+        run: |
+          docker pull -q "${{ needs.tag.outputs.image }}"
+          docker image inspect "${{ needs.tag.outputs.image }}" --format '{{.Size}}' |
+            awk '{printf "image size: %.2f GB\n", $1 / 1e9}' | tee -a "$GITHUB_STEP_SUMMARY"

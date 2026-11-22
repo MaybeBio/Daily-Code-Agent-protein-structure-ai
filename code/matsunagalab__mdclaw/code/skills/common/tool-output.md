@@ -1,0 +1,69 @@
+# Tool Output And Errors
+
+Use structured JSON fields to decide next steps. Do not parse stderr or warning
+strings when a stable field or guardrail `code` is available.
+
+Every failure (`success: false`) uses one uniform envelope, regardless of which
+tool produced it:
+
+- `code`: stable machine-readable guardrail or failure reason (always present).
+- `message`: one-line human summary.
+- `hints`: non-empty list; the first entry is the recommended action for `code`.
+- `next_action`: one concrete command/step to try next. For a failed workflow
+  node this is usually `mdclaw trace_failure --job-dir <...> --node-id <...>`.
+- `errors` / `warnings`: bounded diagnostic lists (long output is truncated).
+- `recoverable`: whether a corrected retry can succeed.
+
+Every result (success or failure) starts with the same envelope keys, in this
+order: `success`, `code`, `message`, `node_id`, `node_status`, `next_action`,
+`next`, `warnings_count`, `result_file`, `dag`, and ends with `status_line`
+(the same in one line, so `| tail -2` keeps it). With `--output id` a failure
+prints nothing on stdout and its reason on stderr. Workflow results carry:
+
+- `applied`: the receipt of a completed stage. `applied.options` lists every
+  option you passed with the value the tool used (`applied`, `changed`,
+  `not_reported`) and `applied.ignored_options` the ones the DAG superseded;
+  `applied.facts` carries the stage's figures (chains, pieces and gaps,
+  ligands and charges, disulfides, water model, box, ions, force-field
+  files, HMR, atoms, net charge, timestep, restraints, restart source) and
+  `applied.summary` is the one line that also forms `message`. Read the
+  receipt before writing a script over the artifacts; it is what the tool
+  did.
+- `dag`: the job's frontier (`leaves`) and the ids per status.
+- `next`: the structurally next command (`action` = `run`, `create`, `wait`,
+  `branch` or `done`, with `run_command` / `create_command` / `batch_command`
+  and `stage_tools`). It names tools and ids, never scientific parameters:
+  add the stage's options after the tool name (`options_from`) and the flags
+  in `required_args`. Its commands run as written; `"$NODE_ID"` is the node
+  `node_id_capture` creates in the same shell. `chain_command` submits the
+  next stage behind a queued parent (`--dependency afterok:<its job>`), so
+  there is nothing to wait for. When a parent blocks the node it names the
+  parent and sets `blocked_node_id`. `explain_node` answers `action` = `blocked` with
+  `blocking_codes` and `reason` when the node's inputs cannot be assembled
+  (`ready_to_run: false`); do not run it, branch on the code.
+- `result_file`: `<job_dir>/nodes/<node_id>/result.json`, the complete result.
+  In the default `--output brief` mode, top-level values larger than a few KB
+  are replaced by `{"_omitted": true, "chars": N, "see": "<result_file>#<key>"}`.
+
+Other common fields:
+
+- `success`: whether the tool completed its primary action.
+- `guardrails`: structured validation results where present.
+- `workflow_recommendation`: valid next actions when a tool cannot proceed.
+- `recovery_hint`: backward-compatible DAG repair hint for blocked inputs.
+- `recovery_options`: branch/repair choices returned by `trace_failure`.
+- `context.log_artifact`: on-disk path to the full external-tool log when the
+  inline `errors` were truncated. Read it only if the bounded error is not
+  enough; do not expect full logs inline.
+
+Rules:
+
+- Branch on `code`, then follow `next_action` / `hints`. Do not parse `errors`,
+  `warnings`, or logs when a stable field is available.
+- If a structured result says a retry with identical parameters will fail, do
+  not retry.
+- If a result returns valid `workflow_recommendation.options`, present those
+  options to the user.
+- For a failed workflow node, run `mdclaw trace_failure --job-dir <job_dir>
+  --node-id <node_id>` when `code` / `workflow_recommendation` is not enough.
+- If no safe automated choice exists, stop and ask the user.

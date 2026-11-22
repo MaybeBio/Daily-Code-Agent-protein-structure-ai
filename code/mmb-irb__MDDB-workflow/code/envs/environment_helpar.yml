@@ -1,0 +1,24 @@
+name: mwf_helpar
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.9
+  - pyyaml
+  - ambertools
+  - biopython>1.79
+  - curves
+  - gromacs
+  - mdanalysis
+  - mdtraj=1.9
+  - pip
+  - xmltodict
+  - rdkit
+  - mordred
+  - iminuit
+  - requests
+  - pymongo
+  - vmd
+  - pip:
+    - tmscoring

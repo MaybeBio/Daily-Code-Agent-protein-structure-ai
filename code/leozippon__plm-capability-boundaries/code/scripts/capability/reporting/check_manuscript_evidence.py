@@ -1,0 +1,1200 @@
+#!/usr/bin/env python3
+"""Check the manuscript against the derived-number table.
+
+Reads ``manuscript/submission/`` read-only and refuses when any of the
+following does not hold:
+
+* **traceability** --- every number in the manuscript's prose, tables and
+  captions resolves to an entry of the derived-number table, or to a declared
+  non-evidence class (LaTeX geometry, template markup and the like);
+* **one support per comparison** --- no two entries that differ only in their
+  support are quoted in one sentence or one table row;
+* **an interval carries its resampling unit** --- every interval in the
+  manuscript resolves to an entry whose resampling unit and draw count are
+  recorded, and the resampling unit is named in the manuscript;
+* **a quantity carries its unit** --- every quantity resolves to an entry with a
+  unit, and a unit that is not dimensionless is named where the quantity is
+  quoted;
+* **no bare point estimate** --- an estimate the table carries an interval for
+  is not quoted without one;
+* **an effective count names its convention** --- a Kish count is quoted only
+  where the weighting it was computed under is named, because a count computed
+  under a different weighting than its estimator applies is misleading even when
+  it is close;
+* **a provisional result is marked** --- a representation-level quantity is
+  quoted only in a paragraph that says it is provisional.
+
+A span written ``a--b`` with no interval label is a range over a set of
+quantities rather than one estimate with its uncertainty, so neither endpoint is
+read as a point estimate and none of the estimate conditions above is refused
+against one. The pair is instead matched against the recorded ``min``/``max``
+bounds of one span, and the report says for every quoted range whether it was
+verified that way or matches no recorded span. An unverified range is reported
+rather than refused: the table records only a minority of the spans the
+manuscript writes, and several of them --- residue numbering, requested product
+lengths --- are not estimates at all, so the honest statement is that the span is
+not covered. Its endpoints are still traced or reported untraced as any other
+number.
+
+Declared exceptions live in the policy file and each must name a live anchor in
+the manuscript, so an exception cannot outlive the sentence it was written for.
+The checker never edits the manuscript.
+
+    python scripts/capability/reporting/check_manuscript_evidence.py
+"""
+from __future__ import annotations
+
+from pathlib import Path
+import argparse
+from decimal import Decimal
+import json
+import re
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from src.capability.core.evidence_ledger import EVIDENCE_DIR, REPO_ROOT, load_table  # noqa: E402
+from scripts.capability.reporting import publication_paths  # noqa: E402
+from scripts.capability.reporting.validate_manuscript import locate, read_document_mapped  # noqa: E402
+
+MANUSCRIPT = REPO_ROOT / publication_paths.SUBMISSION
+#: The two documents, each read as LaTeX assembles it from its local inputs.
+SOURCES = ("main.tex", "supplementary-information.tex")
+
+#: LaTeX constructs whose numbers are markup rather than evidence. Each is
+#: removed from the prose before any number is read, so a geometry value cannot
+#: be mistaken for a measurement and a measurement cannot hide inside markup.
+NON_EVIDENCE_PATTERNS = (
+    r"(?<!\\)%[^\n]*",
+    r"\\documentclass(?:\[[^]]*\])?\{[^}]*\}",
+    r"\\usepackage(?:\[[^]]*\])?\{[^}]*\}",
+    r"\\(?:setcounter|setcitestyle|setlength|definecolor|newcommand|renewcommand)"
+    r"(?:\{[^{}]*\}|\[[^]]*\]|\{\\?[A-Za-z]+\}|\{[.\d]+\})+",
+    r"\\includegraphics(?:\[[^]]*\])?\{[^}]*\}",
+    r"\\(?:label|ref|cite|url|bibliography|input|include)\{[^}]*\}",
+    r"\\(?:author|affil)\*?(?:\[[\d,]+\])?",
+    r"\\rowcolor\{[^}]*\}",
+    r"\\arraybackslash",
+    r"[.\d]+\\(?:textwidth|linewidth|columnwidth|tabcolsep)",
+    r"p\{[.\d]*\\?[A-Za-z]*\}",
+    # A whisker or fence convention: the multiplier of the interquartile range
+    # a box plot's whiskers reach. It states how the figure is drawn, so it is
+    # a legend convention rather than a measurement.
+    r"(?:(?<=within )|(?<=beyond )|(?<=outside )|(?<=to ))"
+    r"\d+(?:\.\d+)?(?=\s*(?:interquartile ranges?|IQRs?)\b)",
+)
+
+#: A minus sign as typeset: the text macro, an empty math minus and the Unicode
+#: minus. Each is a sign only where a digit follows, because ``Profile $-$
+#: unguided`` is the operator of a difference and not the sign of a number.
+TYPESET_MINUS = r"(?:\\textminus\b\s*(?:\{\})?|\$-\$|\\\(-\\\)|\u2212)\s*(?=\d)"
+#: Spacing between a number and the interval or bound that follows it. It is
+#: read as a space only where it separates numeric material, so a unit written
+#: ``kcal\,mol`` keeps the spelling the unit table looks for.
+NUMERIC_SPACING = r"(?<=[\d$,}])(?:(?:\\[;:,!]|\\ |~|\\q?quad)\s*)+(?=[\[(\$\-+\d])"
+
+#: How the manuscript may name each unit whose absence changes what a number
+#: means. :func:`unit_named` consults this mapping and nothing else, and refuses
+#: a unit it finds no spelling for -- so a unit that must be named and is
+#: missing from here is refused however exactly the prose names it, for every
+#: number that carries it, silently and forever. Its keys must therefore be
+#: exactly :data:`PHYSICAL_UNITS`, which
+#: :func:`assert_unit_vocabularies_agree` requires at import instead of leaving
+#: it to be discovered by a number nobody could verify.
+PHYSICAL_UNIT_RENDERINGS = {
+    "kcal/mol": (r"kcal/mol", r"kcal\,mol"),
+    "kcal^2/mol^2": (r"kcal\$\^2\$/mol\$\^2\$", r"kcal\^2/mol\^2", r"squared kcal/mol"),
+    "percent": (r"\\%", r"per cent", r"percent"),
+    # The prose qualifies the denominator -- "nats per queried residue", "nats
+    # per native residue" -- and the unit is the same one.
+    "nats per residue": (r"nats per (?:[a-z-]+ )?residue",),
+    "nats per token": (r"nats per (?:[a-z-]+ )?token",),
+    "log2 enrichment": (r"log2 enrichment", r"log\$_2\$ enrichment", r"\$\\log_2\$ enrichment"),
+    # The table's name for the scale; the prose writes it "normalized-fitness".
+    "scaled-fitness units": (r"(?:normali[sz]ed|scaled)[- ]fitness unit",),
+}
+
+#: Spellings of the counting units, kept and deliberately never consulted: a
+#: counting unit is carried by the sentence's own noun, so :data:`PHYSICAL_UNITS`
+#: excludes it and :func:`unit_named` returns before reading any of these. They
+#: are declared apart from the renderings above precisely so that the import
+#: check can tell a deliberate counting entry from a physical unit someone
+#: forgot to make nameable -- which is the drift that put four physical units
+#: here with no spelling at all.
+COUNT_UNIT_RENDERINGS = {
+    "attempts": (r"attempt",),
+    "sequences": (r"sequence",),
+    "groups": (r"group",),
+    "checkpoints": (r"checkpoint", r"arms?\b", r"cells?\b"),
+    "checkpoint--seed cells": (r"cell",),
+    "family groups": (r"group",),
+    "double-mutant cycles": (r"cycle",),
+    "site pairs": (r"site pair",),
+    "effective site pairs": (r"site pair",),
+    "site tuples": (r"site tuple", r"site tripl"),
+    "effective site tuples": (r"site tuple", r"site tripl"),
+    "distinct measured states": (r"state",),
+    "backgrounds": (r"background",),
+    "assays": (r"assay",),
+    "variants": (r"variant",),
+    "source clusters": (r"cluster",),
+    "effective source clusters": (r"cluster",),
+    "effective family groups": (r"group",),
+    "emitted sequence": (r"sequence",),
+    "bootstrap draws": (r"bootstrap", r"draw", r"resample"),
+    "split seed": (r"seed",),
+    "profiles": (r"profile",),
+    "cells": (r"cell",),
+    "procedures": (r"procedure", r"checkpoint"),
+    "generator cohorts": (r"cohort", r"generator", r"control"),
+    "variants per assay": (r"variant",),
+    "rows": (r"row", r"variant", r"state"),
+    "units": (r"unit", r"group", r"cluster"),
+    "effective units": (r"effective", r"Kish"),
+    "wild-type clusters": (r"cluster",),
+    "residues": (r"residue",),
+}
+
+UNIT_RENDERINGS = {**PHYSICAL_UNIT_RENDERINGS, **COUNT_UNIT_RENDERINGS}
+
+#: Units whose absence changes what a number means. A counting unit is carried
+#: by the sentence's own noun ("14 of 33 checkpoints"), so requiring it again
+#: would report grammar rather than evidence; a physical or scaled unit is not,
+#: and a quantity quoted without one is not readable.
+PHYSICAL_UNITS = frozenset({"kcal/mol", "kcal^2/mol^2", "percent", "nats per token",
+                            "nats per residue", "scaled-fitness units", "log2 enrichment"})
+
+#: The measured scales a difference can only be taken within. A percentage or a
+#: ratio is a share *of* a quantity and pairs with it legitimately, so it is not
+#: one of these.
+MEASURED_SCALES = frozenset({"kcal/mol", "kcal^2/mol^2", "log2 enrichment", "nats per token",
+                             "nats per residue", "scaled-fitness units"})
+
+
+def assert_unit_vocabularies_agree(
+        physical: frozenset | None = None, physical_renderings: dict | None = None,
+        count_renderings: dict | None = None, measured: frozenset | None = None) -> None:
+    """Refuse at import if the unit vocabularies have drifted apart.
+
+    Three declarations describe one fact between them: which units a sentence
+    must name, how each is spelled, and which are measured scales. They are
+    written separately and nothing made them agree, so they drifted: four of the
+    seven physical units carried no spelling at all, which did not fail -- it
+    made :func:`unit_named` return False for every number in those units, so the
+    checker refused each of them whatever the prose said, and refused them
+    identically whether the prose was right or wrong. A check that is wrong
+    about a whole class of numbers and silent about it is worse than one that
+    cannot start, so the disagreement is raised here, at the only place a unit
+    is ever added.
+
+    Two of those four -- log2 enrichment and nats per token -- are the natural
+    units of cohorts this project actively measures, so the gap sat directly in
+    front of numbers not yet written.
+    """
+
+    physical = PHYSICAL_UNITS if physical is None else physical
+    physical_renderings = (PHYSICAL_UNIT_RENDERINGS if physical_renderings is None
+                           else physical_renderings)
+    count_renderings = COUNT_UNIT_RENDERINGS if count_renderings is None else count_renderings
+    measured = MEASURED_SCALES if measured is None else measured
+
+    problems = []
+    unspellable = sorted(set(physical) - set(physical_renderings))
+    if unspellable:
+        problems.append(f"{unspellable} must be named in the prose but have no spelling, so every "
+                        "number carrying one would be refused however it is written")
+    not_required = sorted(set(physical_renderings) - set(physical))
+    if not_required:
+        problems.append(f"{not_required} have spellings among the physical renderings but are not "
+                        "physical units, so those spellings are never read")
+    miscounted = sorted(set(count_renderings) & set(physical))
+    if miscounted:
+        problems.append(f"{miscounted} are declared as counting units and as physical units; a "
+                        "unit is one or the other")
+    unscaled = sorted(set(measured) - set(physical))
+    if unscaled:
+        problems.append(f"{unscaled} are measured scales that are not physical units, so a "
+                        "quantity may be quoted in one without naming it")
+    if problems:
+        raise ValueError("the unit vocabularies disagree -- " + "; ".join(problems))
+
+
+assert_unit_vocabularies_agree()
+
+DIMENSIONLESS = tuple(
+    unit for unit in ("dimensionless", "dimensionless Spearman", "dimensionless ratio",
+                      "dimensionless probability", "dimensionless fraction", "dimensionless R^2",
+                      "dimensionless rate", "dimensionless rate difference", "support_count")
+)
+
+#: A decimal with at least this many places identifies an entry on its own. A
+#: shorter one has to be attributed by what the sentence names, or be a count,
+#: a support size or a declared constant: otherwise a table of several thousand
+#: rows would match almost any number and the check would mean nothing.
+SPECIFIC_DECIMALS = 3
+#: The most decimal places the manuscript quotes. A value is indexed at every
+#: rounding up to this, so a number written to six places still finds the entry
+#: it came from.
+MAX_DECIMALS = 7
+COUNTING_KINDS = frozenset({"count", "support_count", "constant", "ratio", "census",
+                            "effective_count", "range_bound", "artifact_leaf"})
+
+PROVISIONAL_MARKERS = ("provisional", "held open", "pending", "not reported", "under reassessment")
+NUMBER = re.compile(r"(?<![\w.])([-+]?\d[\d,]*(?:\.\d+)?)")
+#: Checkpoint and label names carry digits --- ProGen3-3B, Qwen2.5-0.5b,
+#: order-3 --- and those digits are not quantities. They are blanked to spaces
+#: before numbers are read, which keeps every offset so an interval's extent
+#: still lines up, while the unblanked text remains what a quantity is
+#: attributed and its unit named against.
+NAME = re.compile(r"(?<![\w-])[A-Za-z][A-Za-z0-9.]*(?:-[A-Za-z0-9.]+)*(?![\w-])")
+SCIENTIFIC = re.compile(r"([-+]?\d+(?:\.\d+)?)\s*\$?\s*\\times\s*10\^\{(-?\d+)\}")
+BARE_POWER = re.compile(r"10\^\{(-?\d+)\}")
+#: One bound and the maths delimiters it may be written inside. The whitespace is
+#: not decorative: the scientific-notation rewrite above renders
+#: ``$-1.847\times10^{-6}$`` with spaces inside the maths delimiters, and a pattern
+#: that did not allow them read a correctly bracketed sentence as a bare point
+#: estimate.
+_BOUND = r"\$?\s*([-+]?[\d.,]+)\s*\$?\s*"
+#: An interval in either notation the manuscript writes: the bracketed pair
+#: ``[a, b]`` of tables and maths, and the parenthesised ``(95\% CI, a--b)`` the
+#: prose uses throughout. A pattern that read only the first reported every
+#: sentence in the prose as a bare point estimate and every interval bound in it
+#: as a second estimate on another support --- corrections to sentences that quote
+#: their intervals exactly as the convention requires.
+#:
+#: The parenthesised form's bounds are separated by an en dash, an em dash or a
+#: double hyphen, used interchangeably. ``strip_markup`` has already blanked the
+#: hyphenated dashes to spaces, so by the time this reads them the separator is a
+#: dash or whitespace --- but it is never nothing, or ``0.0116`` would read as the
+#: two bounds 0.011 and 6. Only the declared 95\% level is read: an interval
+#: quoted at another level is not the convention the manuscript states, and the
+#: checker reporting the estimate as bare is the right way for that to surface.
+#: Words that say which kind of interval a parenthesised one is. They may stand
+#: either side of the coverage level, as in ``marginal 95\% BCa CI``, and are
+#: recorded rather than skipped: which convention an interval uses is evidence.
+_QUALIFIER = (r"(?:marginal|simultaneous|pointwise|BCa|"
+              r"bias-corrected(?:\s+and)?\s+accelerated)")
+INTERVAL = re.compile(
+    r"\[\s*" + _BOUND + r",\s*" + _BOUND + r"\]"
+    r"|"
+    r"\(\s*(?:" + _QUALIFIER + r"\s+)*95\s*\\%\s*(?:" + _QUALIFIER + r"\s+)*CI\s*,\s*"
+    + _BOUND + r"(?:[–—-]\s*|\bto\s+|(?<=\s))" + _BOUND + r"(?:;[^()\[\]]*)?\)"
+)
+
+
+def interval_qualifiers(match: re.Match) -> list[str]:
+    """The convention words an interval names before its coverage label."""
+    head = match.group(0).split(",", 1)[0]
+    return [re.sub(r"\s+", " ", word) for word in re.findall(_QUALIFIER, head)]
+#: The dash a numeric range keeps once ``strip_markup`` has run. Every other
+#: dash is blanked, because an em or en dash elsewhere is punctuation and a
+#: hyphen before a digit would read as a sign; a dash *between two digits* is
+#: neither, and blanking it threw away the only evidence that the two numbers
+#: are one span.
+RANGE_DASH = "–"
+#: The dash itself, as the manuscript may write it between two numbers. The
+#: plain ``163--174`` puts a digit on each side of it, but a range of two
+#: typeset quantities closes and reopens maths around it -- ``$0.1313$--$0.5306$``
+#: -- and a rule that required a digit on each side never fired there. The dash
+#: was then blanked with every other dash, so the span read as two independent
+#: point estimates: the first was attributed and checked for an interval it does
+#: not have, the second went untraced, and a sentence that states one range
+#: correctly collected findings for both halves of it. The maths delimiters are
+#: part of the match so the replacement can keep the same length and leave the
+#: dash between the two numbers.
+RANGE_BETWEEN_NUMBERS = r"(?<=\d)\$?\s*--\s*\$?(?=\d)"
+#: A range over a set of quantities: two numbers the manuscript joins with an en
+#: dash, as in "resolved increments span 0.007--0.015". Only the dash itself
+#: classifies a range --- two numbers that merely sit near each other do not ---
+#: and a pair governed by a ``95\%`` CI label is that interval, which
+#: :data:`INTERVAL` reads and this must not take from it.
+#: The trailing guard forbids a truncated endpoint --- 0.0567 of 0.05678 --- while
+#: allowing the sentence's own full stop to follow the number it ends on.
+RANGE = re.compile(
+    r"(?<![\w.])([-+]?\d[\d,]*(?:\.\d+)?)\s*" + RANGE_DASH + r"\s*([-+]?\d[\d,]*(?:\.\d+)?)(?!\.?\d)"
+)
+
+
+def interval_bounds(match: re.Match) -> tuple[str, str]:
+    """The ordered pair of bounds, in whichever notation they were written."""
+    low, high = (group for group in match.groups() if group is not None)
+    return low, high
+
+
+def interval_extent(match: re.Match) -> tuple[int, int]:
+    """Where the bounds themselves sit, which is what makes a number an endpoint.
+
+    The notation around them is not part of the interval. The 95 in ``95\\% CI``
+    states the coverage, and counting it as a bound would report it as an endpoint
+    no recorded interval carries --- a correction to a sentence written correctly.
+    """
+    filled = [index for index, group in enumerate(match.groups(), start=1) if group is not None]
+    return match.start(filled[0]), match.end(filled[-1])
+
+
+def policy_path(directory: Path) -> Path:
+    return directory / "checker-policy.json"
+
+
+def default_policy() -> dict[str, object]:
+    return {
+        "schema": "manuscript_evidence_checker_policy_v1",
+        "rule": "every exception names a live anchor in the manuscript; a dead anchor is a refusal, so "
+                "an exception cannot outlive the sentence it was written for",
+        "interval_convention_statement":
+            "Brackets denote pointwise 95\\% percentile intervals over the stated biological resampling unit.",
+        "cross_support_exceptions": [],
+        "cross_unit_exceptions": [],
+        "bare_estimate_exceptions": [],
+        "effective_count_exceptions": [],
+        "provisional_exceptions": [],
+        "untraced_accepted": [],
+    }
+
+
+def load_policy(directory: Path) -> dict[str, object]:
+    path = policy_path(directory)
+    if not path.is_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(default_policy(), indent=2) + "\n")
+    return json.loads(path.read_text())
+
+
+def _fixed(value: float | Decimal) -> str:
+    """A decimal rendering with no exponent, so the number reads as one token."""
+    text = format(Decimal(str(value)), "f")
+    if "." in text:
+        text = text.rstrip("0")
+    return text + "0" if text.endswith(".") else text
+
+
+def _rewrite(text: str, origin: list[int], pattern: str, replacement) -> tuple[str, list[int]]:
+    """``re.sub`` that also carries, for each output character, the input offset
+    it stands for; a replacement stands for where the match began."""
+    pieces: list[str] = []
+    carried: list[int] = []
+    last = 0
+    for match in re.finditer(pattern, text):
+        pieces.append(text[last:match.start()])
+        carried += origin[last:match.start()]
+        rendered = replacement(match) if callable(replacement) else replacement
+        pieces.append(rendered)
+        carried += [origin[match.start()]] * len(rendered)
+        last = match.end()
+    pieces.append(text[last:])
+    carried += origin[last:]
+    return "".join(pieces), carried
+
+
+def strip_markup_mapped(text: str) -> tuple[str, list[int]]:
+    """:func:`strip_markup` and, for each character of its result, the offset in
+    ``text`` the character was read from."""
+    marker = text.find(r"\begin{document}")
+    start = marker + len(r"\begin{document}") if marker >= 0 else 0
+    body, origin = text[start:], list(range(start, len(text)))
+    for pattern in NON_EVIDENCE_PATTERNS:
+        body, origin = _rewrite(body, origin, pattern, " ")
+    # An em or en dash is punctuation, not a sign: "163--174" states two counts
+    # and "strata---19 native" one. Blanking them keeps every offset. A dash
+    # joining two digits is kept as one en dash, because it is what makes the
+    # two numbers a range rather than two estimates; the trailing space keeps
+    # every offset and keeps the dash out of the second number's sign.
+    body, origin = _rewrite(body, origin, TYPESET_MINUS, "-")
+    body, origin = _rewrite(body, origin, NUMERIC_SPACING, " ")
+    body, origin = _rewrite(body, origin, "---", "   ")
+    body, origin = _rewrite(body, origin, RANGE_BETWEEN_NUMBERS,
+                            lambda m: RANGE_DASH + " " * (len(m.group(0)) - 1))
+    body, origin = _rewrite(body, origin, "--", "  ")
+    # A scientific form is one number. Rendering it in exponent notation would
+    # re-tokenize as its mantissa, which reported 1.11 and 2.8 as numbers the
+    # manuscript never wrote; a fixed-point rendering keeps it whole.
+    body, origin = _rewrite(body, origin, SCIENTIFIC.pattern,
+                            lambda m: " " + _fixed(Decimal(m.group(1)) * Decimal(10) ** int(m.group(2))) + " ")
+    body, origin = _rewrite(body, origin, BARE_POWER.pattern,
+                            lambda m: " " + _fixed(Decimal(10) ** int(m.group(1))) + " ")
+    return body, origin
+
+
+def strip_markup(text: str) -> str:
+    return strip_markup_mapped(text)[0]
+
+
+def _braced(body: str, start: int) -> tuple[str, int]:
+    depth, position = 1, start
+    while depth and position < len(body):
+        if body[position] == "{" and body[position - 1] != "\\":
+            depth += 1
+        elif body[position] == "}" and body[position - 1] != "\\":
+            depth -= 1
+        position += 1
+    return body[start:position - 1], position
+
+
+def scopes(body: str) -> list[tuple[str, str, str]]:
+    """Split the prose into the units a comparison can happen inside.
+
+    Each unit carries the block it sits in, because the manuscript marks a
+    representation-level result as provisional once per paragraph rather than
+    once per sentence, and a check has to read it the way it is written.
+    """
+    units: list[tuple[str, str, str]] = []
+    remaining = body
+    for match in re.finditer(r"\\caption\{", body):
+        caption, _ = _braced(body, match.end())
+        remaining = remaining.replace(caption, " ")
+        units += [("caption", sentence, caption)
+                  for sentence in re.split(r"(?<=\.)\s+(?=[A-Z\\$])", caption) if sentence.strip()]
+    for match in re.finditer(r"\\begin\{tabular\}", body):
+        end = body.find(r"\end{tabular}", match.end())
+        if end < 0:
+            continue
+        table = body[match.end():end]
+        remaining = remaining.replace(table, " ")
+        # The enclosing caption supplies units; pair a following interval row
+        # with its estimates rather than treating the whole table as a sentence.
+        enclosing_start = body.rfind(r"\begin{table}", 0, match.start())
+        enclosing_end = body.find(r"\end{table}", end)
+        block = body[enclosing_start:enclosing_end] if enclosing_start >= 0 and enclosing_end >= 0 else table
+        rows = [row for row in re.split(r"\\\\", table) if "&" in row]
+        index = 0
+        while index < len(rows):
+            row = rows[index]
+            if index + 1 < len(rows) and re.search(r"interval", rows[index + 1].split("&")[0], re.I):
+                row += " " + rows[index + 1]
+                index += 1
+            units.append(("table row", row, block))
+            index += 1
+    for paragraph in re.split(r"\n\s*\n", remaining):
+        for sentence in re.split(r"(?<=\.)\s+(?=[A-Z\\$])", paragraph):
+            if sentence.strip():
+                units.append(("sentence", sentence, paragraph))
+    return units
+
+
+def parse(token: str) -> tuple[float, int]:
+    cleaned = token.replace(",", "")
+    decimals = len(cleaned.split(".")[1]) if "." in cleaned else 0
+    return float(cleaned), decimals
+
+
+class Index:
+    """Looks a manuscript number up among the table's entries.
+
+    A number matches an entry's value, or one end of its interval: the
+    manuscript quotes both, and an interval bound is traced to the estimate it
+    belongs to rather than treated as an untraced number.
+    """
+
+    def __init__(self, quantities: list[dict]) -> None:
+        self.quantities = quantities
+        self.by_rounding: dict[tuple[int, float], list[dict]] = {}
+        self.integers: dict[float, list[dict]] = {}
+        self.bounds: dict[tuple[int, float], list[dict]] = {}
+        # A value smaller than the smallest rounding the index carries would
+        # collapse to zero under absolute rounding, so tiny magnitudes are also
+        # indexed by significant figures. Without this a decomposition residual
+        # of 1.11e-16 could never match the row it came from.
+        self.significant: dict[str, list[dict]] = {}
+        # The recorded spans, each the ``min``/``max`` pair of one reduction
+        # over a named set of rows. A quoted range is checked against these as
+        # a pair, which is what makes it verifiable rather than merely exempt.
+        bounds_by_prefix: dict[str, dict[str, dict]] = {}
+        for entry in quantities:
+            if entry["kind"] == "range_bound":
+                prefix, _, bound = entry["id"].rpartition("/")
+                if bound in ("min", "max"):
+                    bounds_by_prefix.setdefault(prefix, {})[bound] = entry
+        self.spans = [(prefix, pair["min"], pair["max"])
+                      for prefix, pair in sorted(bounds_by_prefix.items()) if len(pair) == 2]
+        for entry in quantities:
+            value = entry["value"]
+            for decimals in range(0, MAX_DECIMALS + 1):
+                self.by_rounding.setdefault((decimals, round(value, decimals)), []).append(entry)
+            if float(value).is_integer():
+                self.integers.setdefault(float(value), []).append(entry)
+            for figures in (2, 3, 4):
+                self.significant.setdefault(f"{value:.{figures}e}", []).append(entry)
+            for key in ("interval_low", "interval_high"):
+                bound = entry.get(key)
+                if bound is None:
+                    continue
+                for decimals in range(0, MAX_DECIMALS + 1):
+                    self.bounds.setdefault((decimals, round(bound, decimals)), []).append(entry)
+
+    def candidates(self, token: str) -> list[dict]:
+        value, decimals = parse(token)
+        if decimals == 0:
+            # An integer has to match an integral entry exactly: rounding a
+            # measured 6.51 onto a count of 7 would trace a number that no
+            # entry states.
+            return self.integers.get(value, [])
+        return self.by_rounding.get((decimals, value), [])
+
+    def tiny_candidates(self, token: str) -> list[dict]:
+        """Entries matching a very small number by significant figures."""
+        value, _ = parse(token)
+        if value and abs(value) >= 1e-4:
+            return []
+        for figures in (2, 3, 4):
+            found = self.significant.get(f"{value:.{figures}e}")
+            if found:
+                return found
+        return []
+
+    def bound_candidates(self, token: str) -> list[dict]:
+        value, decimals = parse(token)
+        return self.bounds.get((decimals, value), [])
+
+    def span_candidates(self, low: str, high: str) -> list[tuple[str, dict, dict]]:
+        """The recorded spans whose own bounds are the quoted pair.
+
+        Both ends have to agree at the precision they are written to, which is
+        what distinguishes verifying a range from exempting it: a recorded
+        reduction over a named set of rows either has these two numbers as its
+        smallest and largest member, or the quoted span is not that reduction.
+        A bound is rounded onto the token rather than matched exactly, because
+        a span is quoted to the precision the sentence needs --- "100--124
+        residues" for 100.26 and 124.10 --- and the pair match plus the
+        ``range_bound`` kind is what keeps that from matching anything.
+        """
+        low_value, low_decimals = parse(low)
+        high_value, high_decimals = parse(high)
+        return [span for span in self.spans
+                if round(span[1]["value"], low_decimals) == low_value
+                and round(span[2]["value"], high_decimals) == high_value]
+
+
+def paired_interval_candidates(candidates: list[dict], interval: re.Match) -> list[dict]:
+    """Attribute a point by both ordered bounds at their quoted precision."""
+    quoted_low, quoted_high = interval_bounds(interval)
+    low, low_decimals = parse(quoted_low)
+    high, high_decimals = parse(quoted_high)
+    return [entry for entry in candidates
+            if entry.get("interval_low") is not None and entry.get("interval_high") is not None
+            and round(entry["interval_low"], low_decimals) == low
+            and round(entry["interval_high"], high_decimals) == high]
+
+
+def quoted_ranges(scope: str, intervals: list[tuple[int, int]]) -> list[re.Match]:
+    """The ranges the scope writes, excluding the ones an interval label governs.
+
+    The manuscript quotes a quantity's spread across a set of models as a bare
+    ``a--b``: "resolved increments span 0.007--0.015". Those endpoints are the
+    smallest and largest member of a set, not an estimate and its uncertainty,
+    and looking either up as an estimate of its own attributes it to whichever
+    unrelated row happens to share the number --- which then reports the
+    sentence as quoting an estimate without the interval the table carries for
+    that other row. Only the dash classifies a range; a labelled
+    ``(95\\% CI, a--b)`` is an interval and stays one.
+    """
+    return [match for match in RANGE.finditer(scope)
+            if not any(match.start() < end and start < match.end() for start, end in intervals)]
+
+
+def negated(token: str) -> str:
+    """The token with its sign reversed, so it can be looked up as written."""
+    return token[1:] if token.startswith("-") else "-" + token.lstrip("+")
+
+
+def reflected_interval_candidates(candidates: list[dict], interval: re.Match) -> list[dict]:
+    """Attribute a magnitude quoted against a stored signed difference.
+
+    The prose states a reduction as the amount reduced: "Stage 2 reduces the
+    rate by 0.1146 (95\\% CI, 0.0909--0.1383)", where the ledger stores the
+    signed difference -0.1146 on [-0.1383, -0.0909]. The sentence is the
+    correct statement and the double negative would not be, so the checker has
+    to read the one orientation against the other.
+
+    This is the same triple match ``paired_interval_candidates`` makes, applied
+    once under reflection through zero, which is a single map and not a
+    relaxation: negating an interval reverses it, so the quoted low bound can
+    only be the stored high bound's magnitude and the quoted high bound only
+    the stored low bound's. A point, a low bound and a high bound therefore all
+    have to flip together for the match to hold, and the stored triple has to
+    lie strictly on one side of zero --- an interval straddling zero has no
+    magnitude the prose could quote, and a bound at zero would make the
+    orientation carry no information. Callers reach this only after the
+    same-sign match has found nothing, so it can never displace one.
+    """
+    quoted_low, quoted_high = interval_bounds(interval)
+    low, low_decimals = parse(quoted_low)
+    high, high_decimals = parse(quoted_high)
+    reflected = []
+    for entry in candidates:
+        stored_low, stored_high = entry.get("interval_low"), entry.get("interval_high")
+        if stored_low is None or stored_high is None or not stored_low < stored_high:
+            continue
+        if not (stored_low < 0 and stored_high < 0) and not (stored_low > 0 and stored_high > 0):
+            continue
+        if round(-stored_high, low_decimals) == low and round(-stored_low, high_decimals) == high:
+            reflected.append(entry)
+    return reflected
+
+
+def _words(text: str) -> set[str]:
+    return {re.sub(r"[^a-z0-9]", "", word) for word in text.lower().split()}
+
+
+def _attribution(entry: dict) -> set[str]:
+    """The identifiers a sentence would have to name to be quoting this entry:
+    the distinctive segments of its id, such as a checkpoint name."""
+    tokens = set()
+    for segment in entry["id"].split("/"):
+        flat = re.sub(r"[^a-z0-9]", "", segment.lower())
+        if flat and any(character.isdigit() for character in flat) and \
+                any(character.isalpha() for character in flat):
+            tokens.add(flat)
+    return tokens
+
+
+#: Words that carry no attribution, so an overlap on them means nothing.
+STOPWORDS = frozenset("""a an and are as at be by each for from in is it its of on one or over own
+per same the their this those to under with without which what when where how much many its than
+that these both all any""".split())
+
+
+def _claim_words(entry: dict) -> set[str]:
+    return {word for word in _words(entry["claim"]) if word and word not in STOPWORDS}
+
+
+def identified_by(candidates: list[dict], scope_words: set[str]) -> list[dict]:
+    """The candidates this sentence identifies, not merely shares a number with.
+
+    In a table of thousands of quantities some row rounds to almost any number
+    the manuscript writes, so a value match on its own is no evidence that the
+    sentence is quoting that row --- and "only one row shares this number" is
+    evidence of coincidence rather than of identity once the table is large. A
+    sentence identifies a row by naming it, through a checkpoint or a date in
+    its id, or by repeating a word of the row's own claim. A hard refusal has to
+    be about a row identified that way, which is the rule the rest of the
+    checker already follows where it declines to refuse anything against a weak
+    attribution.
+    """
+
+    named = [entry for entry in candidates if _attribution(entry) & scope_words]
+    return named or [entry for entry in candidates if _claim_words(entry) & scope_words]
+
+
+def attributable(token: str, candidates: list[dict],
+                 scope_words: set[str]) -> tuple[list[dict], bool]:
+    """Narrow a value match to the entries the sentence is actually quoting.
+
+    First by what the sentence names --- a checkpoint name in the entry's id ---
+    and then by how much of the entry's own claim the sentence repeats. The
+    second flag says whether the narrowing was strong: the sentence named the
+    entry, or only one entry ever matched the value. A weak attribution still
+    counts as traced, because the value does come from the evidence, but no
+    condition is refused against it: a refusal has to be about a quantity the
+    table can pin down, not about whichever of several rows shares a number.
+    """
+    if not candidates:
+        return [], False
+    _, decimals = parse(token)
+    strong = len(candidates) == 1
+    # A declared threshold must be attributed by its declaration, even when
+    # the same sentence names a checkpoint whose fitted estimate rounds to it.
+    declared = [entry for entry in candidates if entry["kind"] == "constant"
+                and len(_claim_words(entry) & scope_words) >= 2]
+    if declared and scope_words & {"declared", "threshold", "gate", "minimum", "maximum"}:
+        return declared, True
+    named = [entry for entry in candidates if _attribution(entry) & scope_words]
+    if named:
+        candidates, strong = named, True
+    elif decimals < SPECIFIC_DECIMALS:
+        candidates = [entry for entry in candidates if entry["kind"] in COUNTING_KINDS]
+        strong = strong and bool(candidates)
+    if len({entry["family"] for entry in candidates}) > 1:
+        scored = [(len(_claim_words(entry) & scope_words), entry) for entry in candidates]
+        best = max(score for score, _ in scored)
+        if best:
+            candidates = [entry for score, entry in scored if score == best]
+    return candidates, strong
+
+
+def supports_named(descriptions: list[str], scope_words: set[str]) -> bool:
+    """Whether the sentence names every support involved.
+
+    A support's description carries its own counts and nouns; if one of each
+    support's distinctive words appears where the quantities are quoted, the
+    comparison is declared in the text and needs no exception.
+    """
+    for description in descriptions:
+        distinctive = {word for word in _words(description)
+                       if word and word not in STOPWORDS and (len(word) > 4 or word.isdigit())}
+        if not distinctive & scope_words:
+            return False
+    return True
+
+
+def agrees(candidates: list[dict], field: str) -> bool:
+    """Whether every surviving candidate answers one refusal the same way.
+
+    A refusal does not need the row pinned down; it needs the property it tests
+    to be the same whichever surviving row the sentence meant.
+    """
+    return len({entry[field] for entry in candidates}) == 1
+
+
+def anchors_live(policy: dict[str, object], text: str, findings: list[dict]) -> None:
+    for name in ("cross_support_exceptions", "cross_unit_exceptions", "bare_estimate_exceptions",
+                 "effective_count_exceptions", "provisional_exceptions"):
+        for exception in policy.get(name, []):
+            if exception["anchor"] not in text:
+                findings.append({
+                    "check": "dead_exception_anchor", "policy_list": name,
+                    "anchor": exception["anchor"],
+                    "detail": "the sentence this exception was written for is no longer in the "
+                              "manuscript, so the exception is withdrawn rather than carried",
+                })
+
+
+
+def interval_convention_present(policy: dict[str, object], texts: list[str]) -> bool:
+    statement = policy.get("interval_convention_statement")
+    return not statement or any(statement in text for text in texts)
+
+
+def exempt(policy: dict[str, object], name: str, scope: str) -> bool:
+    return any(exception["anchor"] in scope for exception in policy.get(name, []))
+
+
+def unit_named(unit: str, scope: str) -> bool:
+    if unit not in PHYSICAL_UNITS:
+        return True
+    for pattern in UNIT_RENDERINGS.get(unit, ()):
+        if re.search(pattern, scope):
+            return True
+    return False
+
+
+def check(directory: Path = EVIDENCE_DIR, manuscript: Path = MANUSCRIPT) -> dict[str, object]:
+    table = load_table(directory / "derived-numbers.json")
+    policy = load_policy(directory)
+    index = Index(table["quantities"])
+    supports = table["supports"]
+
+    findings: list[dict] = []
+    ambiguous: list[dict] = []
+    weak: list[dict] = []
+    unmatched_bounds: list[dict] = []
+    verified_ranges: list[dict] = []
+    unverified_ranges: list[dict] = []
+    interval_records: list[dict] = []
+    traced = 0
+    untraced: list[dict] = []
+    accepted = set(policy.get("untraced_accepted", []))
+
+    sections: dict[str, int] = {}
+    # Each document as LaTeX assembles it, so a number is read wherever the
+    # manuscript's own inputs put it and is attributed to the file it is in.
+    texts: dict[str, str] = {}
+    segments: dict[str, list] = {}
+    for name in SOURCES:
+        if (manuscript / name).is_file():
+            texts[name], _, segments[name] = read_document_mapped(
+                (manuscript / name).read_text(), manuscript, source=(manuscript / name).resolve())
+    if not texts:
+        raise FileNotFoundError(f"no manuscript source found under {manuscript}")
+    if not interval_convention_present(policy, list(texts.values())):
+        findings.append({"check": "interval_convention_statement_absent",
+                         "detail": policy["interval_convention_statement"]})
+    for name, text in texts.items():
+        # Where the declarative half of each source starts. A number that does
+        # not trace matters differently on each side: in the claim-bearing half
+        # it is a result a reader cannot check, and in the declarative half it
+        # is a design constant no declaration states.
+        marker = text.find("\\section{Methods}")
+        sections[name] = marker if marker >= 0 else 0
+    # An exception's anchor is live when it is in any source, not in each.
+    anchors_live(policy, "\n".join(texts.values()), findings)
+    for name, text in texts.items():
+        body, origin = strip_markup_mapped(text)
+        for kind, scope, block in scopes(body):
+            hint = body.find(scope.strip()[:60])
+
+            def where(offset: int = 0, token_length: int = 1, scope: str = scope, hint: int = hint,
+                      name: str = name, text: str = text, body: str = body, origin: list = origin) -> dict:
+                """The file and line of the character at ``offset`` in ``scope``.
+
+                A scope is usually one stretch of the body, but a table row is
+                joined to its interval row, so the character is found by the
+                few characters that follow it, searching on from where the
+                scope begins.
+
+                The probe starts at whichever is longer, twenty characters or
+                the token itself, and narrows from there. Twenty alone made the
+                range empty for any longer token, so the loop body never ran and
+                a number was refused as unplaceable *because of its own length*
+                -- which, since a scientific form is rewritten to a fixed-point
+                token, meant every value with an exponent at or beyond 16 was
+                excluded from checking for being too small to write briefly.
+                """
+                for length in range(max(20, token_length), token_length - 1, -1):
+                    position = body.find(scope[offset:offset + length], max(hint, 0))
+                    if position >= 0:
+                        file, line = locate(text, segments[name], origin[position])
+                        return {"file": file.relative_to(manuscript.resolve()).as_posix(), "line": line}
+                raise ValueError(f"cannot place {scope[offset:offset + 20]!r} in {name}")
+
+            def record_untraced(offset: int, token: str, kind: str = kind, name: str = name,
+                                scope: str = scope) -> None:
+                """A number the table cannot be read as supporting, where it sits.
+
+                Two paths reach this: a value no row carries, and a value whose
+                only matching rows the sentence does not identify. They are the
+                same conclusion -- the quantity is not in the table -- so they
+                are recorded the same way rather than one of them being reported
+                as a disagreement with a row nobody quoted.
+                """
+
+                if token in accepted:
+                    return
+                position = texts[name].find(scope.strip()[:60])
+                if name != "main.tex":
+                    half = "supplement"
+                elif sections[name] and position >= sections[name]:
+                    half = "main_declarative"
+                else:
+                    half = "main_claim_bearing"
+                untraced.append({"source": name, **where(offset, len(token)),
+                                 "scope_kind": kind, "token": token,
+                                 "half": half, "context": scope.strip()[:220]})
+
+            intervals = [interval_extent(match) for match in INTERVAL.finditer(scope)]
+            scope_words = _words(scope)
+            for interval in INTERVAL.finditer(scope):
+                interval_records.append({"source": name, **where(interval.start(), 1),
+                                         "interval": interval.group(0),
+                                         "qualifiers": interval_qualifiers(interval)})
+            numeric_scope = NAME.sub(lambda m: " " * len(m.group(0)), scope)
+            matched: list[tuple[str, list[dict], bool, bool, int]] = []
+            # Each quoted range, matched as a pair against the recorded spans.
+            # Where it matches, the endpoint is attributed to that span's own
+            # bound rather than to whatever else shares the number; where it
+            # does not, the range is recorded as uncovered. Either way the
+            # endpoint is not a point estimate, so the estimate conditions are
+            # not refused against it --- the same treatment an interval bound
+            # already gets.
+            range_extents: list[tuple[int, int]] = []
+            span_bounds: dict[int, list[dict]] = {}
+            for quoted in quoted_ranges(scope, intervals):
+                low, high = (group.rstrip(",") for group in quoted.groups())
+                spans = index.span_candidates(low, high)
+                record = {"source": name, "scope_kind": kind, "range": f"{low}{RANGE_DASH}{high}",
+                          "context": scope.strip()[:200], **where(quoted.start(1))}
+                range_extents.append((quoted.start(1), quoted.end(2)))
+                if spans:
+                    record["spans"] = sorted(prefix for prefix, _, _ in spans)[:4]
+                    verified_ranges.append(record)
+                    span_bounds[quoted.start(1)] = [span[1] for span in spans]
+                    span_bounds[quoted.start(2)] = [span[2] for span in spans]
+                else:
+                    unverified_ranges.append(record)
+            # Where a magnitude has been attributed to a stored interval of the
+            # opposite sign. Those bounds belong to that entry, so they are not
+            # looked up again on their own: a reflected bound cannot match a
+            # stored bound of its own sign, and reporting it as an endpoint no
+            # interval carries would correct a sentence written correctly.
+            reflected_extents: list[tuple[int, int]] = []
+            for match in NUMBER.finditer(numeric_scope):
+                # A trailing thousands comma belongs to the sentence, not the
+                # number: "1,614," is one count and a comma.
+                token = match.group(1).rstrip(",")
+                if not token or token in "+-":
+                    continue
+                matches = index.candidates(token) or index.tiny_candidates(token)
+                inside = any(start <= match.start() < end for start, end in intervals)
+                in_range = any(start <= match.start() < end for start, end in range_extents)
+                if match.start() in span_bounds:
+                    # This endpoint is one bound of a span the table records,
+                    # found by matching the quoted pair; it is that bound and
+                    # not another row that happens to share the number.
+                    matches = span_bounds[match.start()]
+                endpoint = inside or in_range
+                if not endpoint:
+                    following = re.search(r"[^\s$]", scope[match.end():])
+                    paired = INTERVAL.match(scope, match.end() + following.start()) if following else None
+                    if paired:
+                        narrowed = paired_interval_candidates(matches, paired) if matches else []
+                        if not narrowed:
+                            # The prose may quote a reduction as the amount
+                            # reduced while the ledger stores the signed
+                            # difference. That is the same triple reflected
+                            # through zero, and only a triple that flips whole
+                            # matches.
+                            narrowed = reflected_interval_candidates(
+                                index.candidates(negated(token)), paired)
+                            if narrowed:
+                                reflected_extents.append(interval_extent(paired))
+                        identified = identified_by(matches, scope_words) if matches else []
+                        if narrowed:
+                            matches = narrowed
+                        elif identified:
+                            traced += 1
+                            findings.append({
+                                "check": "point_interval_mismatch", "source": name,
+                                **where(match.start(), len(token)),
+                                "scope_kind": kind, "token": token,
+                                "interval": paired.group(0),
+                                "interval_qualifiers": interval_qualifiers(paired),
+                                "entries": sorted({entry["id"] for entry in identified})[:6],
+                                "detail": "the ordered pair of quoted bounds matches no interval "
+                                          "for this point at the bounds' stated precision, in "
+                                          "either orientation",
+                                "context": scope.strip()[:220],
+                            })
+                            continue
+                        elif matches:
+                            # The value matches only rows this sentence does not
+                            # identify, so there is no quantity here to disagree
+                            # with. A mismatch would be a refusal against a row
+                            # nobody quoted, and the honest description is that
+                            # the quantity is missing from the table. It is
+                            # recorded as missing here rather than left to fall
+                            # through, because below, a number equal to any of
+                            # the table's thirty-odd thousand interval bounds
+                            # counts as traced -- which for a point quoted with
+                            # its own bounds is one more coincidence, and would
+                            # retire the number silently instead of reporting
+                            # it.
+                            record_untraced(match.start(), token)
+                            continue
+                candidates, strong = attributable(token, matches, scope_words)
+                if not candidates:
+                    if attributable(token, index.bound_candidates(token), scope_words)[0]:
+                        traced += 1
+                        continue
+                    if inside:
+                        if any(start <= match.start() < end for start, end in reflected_extents):
+                            # This bound's own entry has already been found, by
+                            # the reflected triple its point was attributed by.
+                            traced += 1
+                            continue
+                        # An endpoint of a bracketed interval is not a point
+                        # estimate, and reporting it as an untraced number of
+                        # its own invites a correction to a sentence that is
+                        # written correctly. It is recorded as what it is.
+                        unmatched_bounds.append({"source": name, **where(match.start(), len(token)),
+                                                 "scope_kind": kind, "token": token,
+                                                 "context": scope.strip()[:180]})
+                        continue
+                    record_untraced(match.start(), token)
+                    continue
+                traced += 1
+                if not strong and len({entry["family"] for entry in candidates}) > 1:
+                    weak.append({"source": name, **where(match.start(), len(token)),
+                                 "scope_kind": kind, "token": token,
+                                 "families": sorted({entry["family"] for entry in candidates}),
+                                 "entries": sorted({entry["id"] for entry in candidates})[:6],
+                                 "context": scope.strip()[:180]})
+                    continue
+                matched.append((token, candidates, endpoint, strong, match.start()))
+
+            for token, candidates, endpoint, strong, offset in matched:
+                if endpoint:
+                    continue
+                families = {entry["family"] for entry in candidates}
+                if len(families) > 1:
+                    # The table does not attribute this number to one quantity,
+                    # so no condition can be checked against it. That is worth
+                    # reporting --- a number the table cannot attribute is a
+                    # number a reader cannot check --- but it is not a refusal.
+                    ambiguous.append({"source": name, **where(offset, len(token)),
+                                      "scope_kind": kind, "token": token,
+                                      "families": sorted(families),
+                                      "entries": sorted({entry["id"] for entry in candidates})[:6],
+                                      "context": scope.strip()[:180]})
+                    continue
+                estimates = [entry for entry in candidates if entry["kind"] == "estimate"]
+
+                # a quantity carries its unit. Only a number specific enough to
+                # identify its own entry is checked: a one-decimal token that
+                # happens to equal some recorded field would report a unit the
+                # sentence never claimed.
+                if parse(token)[1] >= SPECIFIC_DECIMALS and agrees(candidates, "unit") and \
+                        all(not unit_named(entry["unit"], block if kind == "table row" else scope) for entry in candidates):
+                    findings.append({
+                        "check": "unit_not_named", "source": name, **where(offset, len(token)),
+                        "scope_kind": kind, "token": token,
+                        "units": sorted({entry["unit"] for entry in candidates}),
+                        "entries": sorted({entry["id"] for entry in candidates})[:4],
+                        "context": scope.strip()[:220],
+                    })
+
+                # no bare point estimate
+                with_interval = [entry for entry in estimates if entry["interval_low"] is not None]
+                if with_interval and len(with_interval) == len(candidates) and not intervals \
+                        and not exempt(policy, "bare_estimate_exceptions", scope):
+                    findings.append({
+                        "check": "bare_point_estimate", "source": name, **where(offset, len(token)),
+                        "scope_kind": kind,
+                        "token": token, "entries": sorted({entry["id"] for entry in with_interval})[:4],
+                        "detail": "the table carries an interval for this estimate and the manuscript "
+                                  "quotes it without one",
+                        "context": scope.strip()[:220],
+                    })
+
+                # an interval carries its resampling unit, named here or by the
+                # manuscript-wide convention statement
+                for entry in with_interval:
+                    if not entry["resampling_unit"]:
+                        findings.append({
+                            "check": "interval_without_resampling_unit", "source": name,
+                            **where(offset, len(token)),
+                            "token": token, "entry": entry["id"], "context": scope.strip()[:220],
+                        })
+
+                # an effective count names its weighting convention
+                effective = [entry for entry in candidates if entry["kind"] == "effective_count"]
+                if effective and len(effective) == len(candidates) \
+                        and not exempt(policy, "effective_count_exceptions", scope):
+                    named = any(word in scope.lower()
+                                for word in ("weighting", "convention", "cycle share", "cycle-share",
+                                             "groups equal", "group-equal", "equally weighted", "site-pair-equal matching weights"))
+                    if not named:
+                        findings.append({
+                            "check": "effective_count_without_convention", "source": name,
+                            **where(offset, len(token)),
+                            "scope_kind": kind, "token": token,
+                            "entries": sorted({entry["id"] for entry in effective})[:4],
+                            "detail": "an effective (Kish) count computed under a weighting the "
+                                      "estimator does not apply is misleading even when it is close, so "
+                                      "the convention has to be named where the count is quoted",
+                            "context": scope.strip()[:220],
+                        })
+
+                # a provisional result is marked
+                provisional = [entry for entry in candidates if entry["provisional"]]
+                # Only a number specific enough to be this quantity, or one the
+                # sentence names, is held to the provisional marking: a bare
+                # count that happens to equal a provisional row would report a
+                # coincidence.
+                if provisional and len(provisional) == len(candidates) \
+                        and (strong or parse(token)[1] >= SPECIFIC_DECIMALS) \
+                        and not exempt(policy, "provisional_exceptions", scope):
+                    if not any(marker in block.lower() for marker in PROVISIONAL_MARKERS):
+                        findings.append({
+                            "check": "provisional_not_marked", "source": name, **where(offset, len(token)),
+                            "scope_kind": kind,
+                            "token": token,
+                            "entries": sorted({entry["id"] for entry in provisional})[:4],
+                            "context": scope.strip()[:220],
+                        })
+
+            # one support per comparison: refuse only when no assignment of the
+            # scope's estimates to candidate entries keeps them on one support
+            estimate_tokens = [(token, [entry for entry in candidates if entry["kind"] == "estimate"])
+                               for token, candidates, endpoint, *_ in matched
+                               if not endpoint and agrees(candidates, "support_id")]
+            estimate_tokens = [(token, entries) for token, entries in estimate_tokens if entries]
+            # one unit per comparison: two supports now carry different
+            # measured units --- kcal/mol and log2 enrichment --- and a
+            # difference between them is not a quantity at all.
+            unit_tokens = [(token, [entry for entry in candidates
+                                    if entry["unit"] in MEASURED_SCALES])
+                           for token, candidates, endpoint, *_ in matched if not endpoint]
+            unit_tokens = [(token, entries) for token, entries in unit_tokens if entries]
+            if len(unit_tokens) > 1 and not exempt(policy, "cross_unit_exceptions", scope):
+                shared_units = None
+                for _, entries in unit_tokens:
+                    units = {entry["unit"] for entry in entries}
+                    shared_units = units if shared_units is None else (shared_units & units)
+                if not shared_units:
+                    findings.append({
+                        "check": "cross_unit_comparison", "source": name, **where(), "scope_kind": kind,
+                        "tokens": [token for token, _ in unit_tokens],
+                        "units": sorted({entry["unit"] for _, entries in unit_tokens
+                                         for entry in entries}),
+                        "detail": "two quantities in different measured units are quoted in one "
+                                  "sentence or row; a difference between them is not a quantity",
+                        "context": scope.strip()[:260],
+                    })
+            if len(estimate_tokens) > 1 and not exempt(policy, "cross_support_exceptions", scope):
+                shared = None
+                for _, entries in estimate_tokens:
+                    ids = {entry["support_id"] for entry in entries}
+                    shared = ids if shared is None else (shared & ids)
+                involved = sorted({entry["support_id"]
+                                   for _, entries in estimate_tokens for entry in entries})
+                if not shared and not supports_named(
+                        [supports[key] for key in involved if key in supports], scope_words):
+                    findings.append({
+                        "check": "cross_support_comparison", "source": name, **where(), "scope_kind": kind,
+                        "tokens": [token for token, _ in estimate_tokens],
+                        "supports": sorted({entry["support_id"]
+                                            for _, entries in estimate_tokens for entry in entries}),
+                        "detail": "two quantities that differ in their support are quoted in one "
+                                  "sentence or row; the supports have to be named apart or the "
+                                  "comparison declared",
+                        "context": scope.strip()[:260],
+                    })
+
+    report = {
+        "schema": "manuscript_evidence_consistency_report",
+        "manuscript": manuscript.as_posix(),
+        "derived_number_table": {
+            "quantities": table["counts"]["quantities"],
+            "gaps": table["counts"]["gaps"],
+            "supports": len(supports),
+        },
+        "traced_numbers": traced,
+        "untraced_numbers": len(untraced),
+        "untraced_split": {
+            half: {
+                "occurrences": sum(entry["half"] == half for entry in untraced),
+                "distinct_tokens": len({entry["token"] for entry in untraced
+                                        if entry["half"] == half}),
+            }
+            for half in ("main_claim_bearing", "main_declarative", "supplement")
+        },
+        "untraced": untraced,
+        "numbers_the_table_cannot_attribute_to_one_quantity": len(ambiguous) + len(weak),
+        "numbers_matched_but_not_pinned_to_one_row": len(weak),
+        "interval_bounds_matching_no_recorded_interval": len(unmatched_bounds),
+        "unmatched_interval_bounds": unmatched_bounds,
+        "ranges_verified_against_a_recorded_span": len(verified_ranges),
+        "ranges_matching_no_recorded_span": len(unverified_ranges),
+        "verified_ranges": verified_ranges,
+        "ranges_without_a_recorded_span": unverified_ranges,
+        "intervals": interval_records,
+        "intervals_by_qualifier": _qualifier_tally(interval_records),
+        "ambiguous_matches": ambiguous,
+        "weak_attributions": weak,
+        "findings_by_check": _tally(findings),
+        "findings": findings,
+        "status": "refused" if findings or untraced or unmatched_bounds else "pass",
+    }
+    (directory / "consistency-report.json").write_text(json.dumps(report, indent=2) + "\n")
+    return report
+
+
+def _qualifier_tally(records: list[dict]) -> dict[str, int]:
+    tally: dict[str, int] = {}
+    for record in records:
+        key = " ".join(record["qualifiers"]) or "unqualified"
+        tally[key] = tally.get(key, 0) + 1
+    return dict(sorted(tally.items()))
+
+
+def _tally(findings: list[dict]) -> dict[str, int]:
+    tally: dict[str, int] = {}
+    for finding in findings:
+        tally[finding["check"]] = tally.get(finding["check"], 0) + 1
+    return dict(sorted(tally.items()))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--evidence-dir", type=Path, default=EVIDENCE_DIR)
+    options = parser.parse_args()
+    report = check(options.evidence_dir)
+    print(json.dumps({key: report[key] for key in
+                      ("status", "traced_numbers", "untraced_numbers", "findings_by_check",
+                       "ranges_verified_against_a_recorded_span",
+                       "ranges_matching_no_recorded_span",
+                       "derived_number_table")}, indent=2))
+    return 0 if report["status"] == "pass" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

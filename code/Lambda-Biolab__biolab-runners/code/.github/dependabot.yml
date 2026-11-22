@@ -1,0 +1,76 @@
+# Standard Dependabot config for Python projects in the org.
+#
+# Two ecosystems:
+# - "uv" parses pyproject.toml + uv.lock. The previous "pip" entry
+#   was a no-op for uv-managed projects because dependabot's pip
+#   ecosystem only handles requirements.txt-style files.
+# - "github-actions" keeps the SHA-pinned action references in
+#   .github/workflows/ up to date with new tags.
+#
+# Both ecosystems:
+# - Run weekly (daily produces too many stale PRs)
+# - Group patches/minors together (single PR per group)
+# - Use the org's standard commit prefixes
+# - Apply the same labels
+# - Produce signed commits (Dependabot's commits satisfy
+#   required_signatures: true on main).
+#
+# Repo rule: all `uses:` references MUST be full commit SHAs. This
+# dependabot config keeps them current with new upstream tags.
+#
+# Required labels (Dependabot will fail to add missing ones):
+# - "dependencies" (default in most repos; create if missing)
+# - "github_actions" (note the underscore — GitHub's default; the
+#   hyphenated form `github-actions` does NOT exist by default and
+#   will trigger a "label not found" error)
+#
+# Save as: .github/dependabot.yml
+#
+# Manual bumps (no Dependabot ecosystem available; Renovate handles
+# pre-commit-hooks instead — see renovate.json):
+# - llms.txt (auto-generated from .github/templates/llms.txt.tpl):
+#   run locally with
+#     envsubst < .github/templates/llms.txt.tpl > llms.txt
+#   commit, push. There is no automation for this.
+---
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+    groups:
+      python-deps:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - "dependencies"
+      - "github_actions"
+    groups:
+      github-actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+# Grant GITLEAKS_LICENSE to Dependabot via the GitHub UI:
+#   Settings > Secrets and variables > Dependabot > New repository secret
+# Name: GITLEAKS_LICENSE
+# Value: <the gitleaks.io license>
+#
+# The dependabot.yml `secrets:` block was tried first (see git history)
+# but Dependabot v2 schema does NOT support it — the property is
+# rejected with "The property '#/' contains additional properties
+# ['secrets'] outside of the schema when none are allowed". The
+# secret must be granted via the UI (Settings > Dependabot secrets)
+# which propagates it to all Dependabot PRs without exposing it
+# in the public config file.

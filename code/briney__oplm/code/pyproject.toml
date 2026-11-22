@@ -1,0 +1,138 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oplm"
+dynamic = ["version"]
+description = "open protein language model"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Bryan Briney", email = "briney@scripps.edu" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Typing :: Typed",
+]
+dependencies = [
+    # Upper bounds keep CI on the verified-good toolchain: torch 2.12 is untested,
+    # and transformers >=5.4 shifts PretrainedConfig attribute typing so `ty`
+    # reports resolved-Optional config fields (head_dim, intermediate_size, ...) as
+    # errors. Bump deliberately after re-running `ty check src/` + the test suite.
+    # Floor is 2.10 (verified in production training runs, incl. torch.optim.Muon,
+    # which ships in 2.10). torch 2.11 only adds the FlashAttention-4 SDPA backend on
+    # Blackwell — a perf gain, not a correctness requirement: on 2.10 SDPA falls back
+    # to the cuDNN/efficient/flash kernels. Raise the floor only if FA-4 becomes required.
+    "torch>=2.10.0,<2.12",
+    "transformers>=4.45,<5.4",
+    "omegaconf>=2.3",
+    "typer>=0.9",
+    "rich>=13.0",
+    "numpy>=1.26",
+    "pyarrow>=14.0",
+    # Remote checkpoint mirror (oplm.training.remote.RemoteStore, Phase 4): fsspec is
+    # already pulled in transitively (pyarrow/torch), but Task 4.1 uses its
+    # filesystem-resolution API (fsspec.core.url_to_fs) directly, so it is promoted to
+    # an explicit core dependency rather than relying on someone else's transitive pin.
+    "fsspec>=2023.1.0",
+]
+
+[project.optional-dependencies]
+s3 = [
+    # s3fs registers the "s3://" fsspec protocol; not required unless RemoteStore is
+    # pointed at an S3 (or S3-compatible) bucket. Credentials come from standard AWS
+    # env/config conventions, never from this codebase.
+    "s3fs>=2023.1.0",
+]
+train = [
+    # keep_torch_compile=False avoids mutating live compiled DDP wrappers during export/eval.
+    "accelerate>=1.3",
+    "deepspeed>=0.14",
+    "wandb>=0.16",
+    "datasets>=2.18",
+    "biopython>=1.83",
+    # μP coord-check / LR-sweep tooling (oplm.training.mup): tidy frames + plots.
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+]
+fold = [
+    # cuEquivariance fused triangle multiplication (oplm.fold.trimul dispatch). The
+    # staged PyTorch reference runs without it; CPU tests never import it. The cu13
+    # ops wheel matches the torch cu130 builds. Floor 0.12.0: the version whose own
+    # backward was verified at widths 128 and 256 on a B200 with torch 2.11.0+cu130
+    # (docs/FOLD.md §6, docs/fold/pip-freeze.txt).
+    "cuequivariance-torch>=0.12.0",
+    "cuequivariance-ops-torch-cu13>=0.12.0",
+    # mmCIF output (oplm.fold.predict.write_mmcif).
+    "gemmi>=0.7",
+]
+esmc = [
+    # Frozen ESM-C for the milestone-2 pipeline proof (oplm.fold.esmc, docs/FOLD.md §9). The
+    # package needs Python >= 3.12 and transformers < 5, both inside this repo's ranges; the
+    # repo's own dev venv is 3.11, so GPU jobs build a 3.12 venv (docs/fold/b200-m2b-measure.sbatch).
+    "esm==3.4.1.post1",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.8",
+    # ty is Astral's type checker (pre-1.0/beta). Pin an EXACT version: its
+    # diagnostics shift between releases, so an unpinned range lets CI pull a newer
+    # ty that flags code an older ty accepts. Bump deliberately. See
+    # [tool.ty.environment] below.
+    "ty==0.0.40",
+    # mmCIF round-trip in tests/fold/test_predict.py.
+    "gemmi>=0.7",
+]
+
+[project.scripts]
+oplm = "oplm.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/briney/oplm"
+Repository = "https://github.com/briney/oplm"
+Issues = "https://github.com/briney/oplm/issues"
+
+[tool.hatch.version]
+source = "vcs"
+
+# Versions come from v* tags only, so a run tag such as fold-m2c-runs on the same commit does not
+# break the build ("Can't parse version from tag").
+[tool.hatch.version.raw-options]
+scm.git.describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "TCH", # flake8-type-checking
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["oplm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+[tool.ty.environment]
+python-version = "3.11"

@@ -1,0 +1,64 @@
+# Copyright 2026 Korea Advanced Institute of Science and Technology (KAIST)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import NamedTuple
+
+import numpy as np
+
+from kfold.utils.registry import DATA_SAMPLER, BaseConfig
+
+
+class Sample(NamedTuple):
+    """Chain/Interface sample for model training, used in AlphaFold3.
+
+    Parameters
+    ----------
+    metadata : dict
+        The metadata of the sampled item.
+    asym_id : int | tuple[int, int] | None
+        The cropping constraint; asym_id(s) of chain / interface to include.
+        If None, no constraint is applied.
+    """
+
+    metadata: dict  # use dict instead of Metadata to save memory.
+    asym_id: int | tuple[int, int] | None
+
+
+@DATA_SAMPLER.register()
+class BaseSampler:
+    """Base class for samplers for model training."""
+
+    class Config(BaseConfig):
+        """Configuration for BaseSampler."""
+
+        pass
+
+    def get_samples(self, metadatas: list[dict]) -> tuple[list[Sample], np.ndarray]:
+        """Get samples and their weights from metadata.
+
+        Parameters
+        ----------
+        metadatas : list[dict]
+            The metadata to setup the sampler.
+
+        Returns
+        -------
+        samples : list[Sample]
+            The sampled items.
+        weights : np.ndarray
+            The weights for each sampled item.
+        """
+        samples: list[Sample] = [Sample(m, None) for m in metadatas]
+        weights = np.ones(len(samples), dtype=np.float64)
+        return samples, weights

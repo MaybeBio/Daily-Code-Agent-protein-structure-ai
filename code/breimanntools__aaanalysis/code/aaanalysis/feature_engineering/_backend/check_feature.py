@@ -1,0 +1,570 @@
+"""
+This is a script for the common SequenceFeature and CPP checking functions
+"""
+import copy
+import pandas as pd
+import numpy as np
+import warnings
+
+import aaanalysis.utils as ut
+from .cpp.utils_feature import get_part_positions
+
+# Helper functions
+def _return_empty_string(val=None):
+    val = "" if val is None else val
+    return val
+
+
+def _get_max_pos_split(split=None):
+    """Get maximum position required for split"""
+    if ut.STR_SEGMENT in split:
+        n_max = int(split.split(",")[1].replace(")", ""))
+    elif ut.STR_PERIODIC_PATTERN in split:
+        n_max = int(split.split(",")[-1].replace(")", ""))
+    elif ut.STR_PATTERN in split:
+        n_max = int(split.split(",")[-1].replace(")", ""))
+    else:
+        raise ValueError(f"Wrong 'split' ({split})")
+    return n_max
+
+
+def _get_split_kws_requirements(split_kws=None):
+    """Get per-split-type minimum part length required by split_kws.
+
+    Each split type imposes a minimum length on every sequence part: a ``Segment``
+    needs at least ``n_split_max`` residues (it cannot be split into more pieces than
+    it has residues), a ``Pattern`` at least ``len_max`` residues, and a
+    ``PeriodicPattern`` at least its first step (``steps[0]``). Returns a dict
+    ``{split_type: (required_len, param_name)}`` so callers can name the exact
+    parameter that binds the requirement.
+    """
+    reqs = {}
+    if ut.STR_SEGMENT in split_kws:
+        reqs[ut.STR_SEGMENT] = (split_kws[ut.STR_SEGMENT]["n_split_max"], "n_split_max")
+    if ut.STR_PATTERN in split_kws:
+        reqs[ut.STR_PATTERN] = (split_kws[ut.STR_PATTERN]["len_max"], "len_max")
+    if ut.STR_PERIODIC_PATTERN in split_kws:
+        reqs[ut.STR_PERIODIC_PATTERN] = (split_kws[ut.STR_PERIODIC_PATTERN]["steps"][0], "steps[0]")
+    return reqs
+
+
+def _get_max_pos_split_kws(split_kws=None):
+    """Get maximum position required for splits basd on split_kws"""
+    reqs = _get_split_kws_requirements(split_kws=split_kws)
+    if len(reqs) == 0:
+        raise ValueError(f"Wrong 'split_kws' ({split_kws})")
+    n_max = max(val for val, _ in reqs.values())
+    return n_max
+
+
+def clamp_split_kws_to_parts_(df_parts=None, split_kws=None):
+    """Auto-cap ``split_kws`` to the shortest sequence part (free-peptide safety net).
+
+    A sequence part of length ``L`` can only carry a ``Segment`` split with ``n_split_max <= L``
+    (it cannot be split into more pieces than it has residues), a ``Pattern`` with ``len_max <= L``,
+    and a ``PeriodicPattern`` with its first step ``steps[0] <= L``. When the shortest part across
+    ``df_parts`` is too short for the given ``split_kws``, the ``Segment`` ``n_split_max`` (and
+    ``n_split_min``) is capped to the shortest-part length and the ``Pattern`` / ``PeriodicPattern``
+    split types that cannot fit are dropped; ``Segment`` is the universal fallback (works down to
+    ``n=1``) and is always kept (inserted if every other type was dropped).
+
+    Returns ``(split_kws_clamped, changes)`` where ``changes`` is a list of human-readable
+    descriptions of what was capped/dropped. When nothing needs capping (every split fits the
+    shortest part) the **original** ``split_kws`` object is returned unchanged with an empty
+    ``changes`` list, so downstream feature engineering is byte-identical.
+    """
+    changes = []
+    if df_parts is None or split_kws is None:
+        return split_kws, changes
+    min_len = int(min(df_parts[part].map(len).min() for part in list(df_parts)))
+    clamped = copy.deepcopy(split_kws)
+    # Segment: cap so it never asks for more pieces than the shortest part has residues.
+    if ut.STR_SEGMENT in clamped:
+        seg = clamped[ut.STR_SEGMENT]
+        if seg["n_split_max"] > min_len:
+            new_max = max(1, min_len)
+            changes.append(f"capped Segment 'n_split_max' {seg['n_split_max']} -> {new_max} "
+                           f"(shortest part n={min_len})")
+            seg["n_split_max"] = new_max
+            seg["n_split_min"] = min(seg["n_split_min"], new_max)
+    # Pattern: drop when its span ('len_max') cannot fit the shortest part.
+    if ut.STR_PATTERN in clamped and clamped[ut.STR_PATTERN]["len_max"] > min_len:
+        changes.append(f"dropped 'Pattern' (len_max={clamped[ut.STR_PATTERN]['len_max']} "
+                       f"> shortest part n={min_len})")
+        del clamped[ut.STR_PATTERN]
+    # PeriodicPattern: drop when the shortest part is shorter than its first step.
+    if ut.STR_PERIODIC_PATTERN in clamped:
+        step0 = clamped[ut.STR_PERIODIC_PATTERN]["steps"][0]
+        if min_len < step0:
+            changes.append(f"dropped 'PeriodicPattern' (needs >= {step0} residues, "
+                           f"shortest part n={min_len})")
+            del clamped[ut.STR_PERIODIC_PATTERN]
+    # Never leave zero split types; Segment is the universal fallback (works down to n=1). Only
+    # insert it when every split type was dropped (an empty dict) — a surviving Segment-less config
+    # (e.g. a PeriodicPattern-only split_kws that still fits) is kept untouched.
+    if not clamped:
+        new_max = max(1, min_len)
+        clamped[ut.STR_SEGMENT] = {"n_split_min": 1, "n_split_max": new_max}
+        changes.append(f"added 'Segment' fallback (n_split_max={new_max}) so at least one "
+                       f"split type remains")
+    if not changes:
+        return split_kws, []
+    return clamped, changes
+
+
+# II Main Functions
+# Check splits
+def check_split_kws(split_kws=None, accept_none=True):
+    """Check if argument dictionary for splits is a valid input"""
+    # Define the expected structure and types for split_kws
+    split_kws_types = {ut.STR_SEGMENT: dict(n_split_min=int, n_split_max=int),
+                       ut.STR_PATTERN: dict(steps=list, n_min=int, n_max=int, len_max=int),
+                       ut.STR_PERIODIC_PATTERN: dict(steps=list)}
+    if accept_none and split_kws is None:
+        return None     # Skip check
+    if not isinstance(split_kws, dict):
+        raise ValueError(f"'split_kws' should be type dict (not {split_kws})")
+    if len(split_kws) == 0:
+        raise ValueError("'split_kws' should be not empty")
+    # Check if split_kws contains wrong split_types
+    invalid_split_types = [x for x in split_kws if x not in ut.LIST_SPLIT_TYPES]
+    if len(invalid_split_types) > 0:
+        error = f"Following 'split_types' are invalid: {invalid_split_types}." \
+                f"\n  'split_kws' should have following structure: {split_kws_types}."
+        raise ValueError(error)
+    # Validate split types and argument structure
+    for split_type in split_kws:
+        expected_args = split_kws_types[split_type]
+        missing_args = [arg for arg in expected_args if arg not in split_kws[split_type]]
+        if missing_args:
+            raise ValueError(f"Missing required arguments for '{split_type}': {missing_args}")
+        for arg in split_kws[split_type]:
+            if arg not in split_kws_types[split_type]:
+                error = f"'{arg}' arg in '{split_type}' of 'split_kws' is invalid." \
+                        f"\n  'split_kws' should have following structure: {split_kws_types}."
+                raise ValueError(error)
+            arg_val = split_kws[split_type][arg]
+            expected_arg_type = split_kws_types[split_type][arg]
+            if not isinstance(arg_val, expected_arg_type):
+                error = f"Type of '{arg}':'{arg_val}' ('{type(arg_val)}') should be '{expected_arg_type}'"
+                raise ValueError(error)
+            if isinstance(arg_val, list):
+                wrong_type = [x for x in arg_val if type(x) is not int]
+                if len(wrong_type) > 0:
+                    error = f"All list elements ({arg_val}) of '{arg}' should have type int."
+                    raise ValueError(error)
+    # Check Segment
+    if ut.STR_SEGMENT in split_kws:
+        segment_args = split_kws[ut.STR_SEGMENT]
+        n_split_min, n_split_max = segment_args["n_split_min"], segment_args["n_split_max"]
+        ut.check_number_range(name=f"{ut.STR_SEGMENT}[n_split_min]", val=n_split_min, just_int=True, min_val=1)
+        ut.check_number_range(name=f"{ut.STR_SEGMENT}[n_split_max]", val=n_split_max, just_int=True, min_val=1)
+        if n_split_min > n_split_max:
+            raise ValueError(f"For '{ut.STR_SEGMENT}', 'n_split_min' ({n_split_min}) should be smaller "
+                             f"or equal to 'n_split_max' ({n_split_max})")
+    # Check Pattern
+    if ut.STR_PATTERN in split_kws:
+        pattern_args = split_kws[ut.STR_PATTERN]
+        n_min, n_max = pattern_args["n_min"], pattern_args["n_max"]
+        steps_pattern, len_max = pattern_args["steps"], pattern_args["len_max"]
+        ut.check_number_range(name=f"{ut.STR_PATTERN}[n_min]", val=n_min, just_int=True, min_val=1)
+        ut.check_number_range(name=f"{ut.STR_PATTERN}[n_max]", val=n_max, just_int=True, min_val=1)
+        ut.check_number_range(name=f"{ut.STR_PATTERN}[len_max]", val=len_max, just_int=True, min_val=1)
+        if n_min > n_max:
+            raise ValueError(f"For '{ut.STR_PATTERN}', 'n_min' ({n_min}) should be smaller or equal to 'n_max' ({n_max})")
+        if not isinstance(steps_pattern, list) or len(steps_pattern) < 1:
+            raise ValueError(f"'steps_pattern' ({steps_pattern}) should be non-empty list of with at"
+                             f" least 1 non-negative integers")
+        if steps_pattern != sorted(steps_pattern):
+            raise ValueError(f"For '{ut.STR_PATTERN}', 'steps_pattern' ({steps_pattern}) should be ordered in ascending order.")
+        if steps_pattern[0] >= len_max:
+            raise ValueError(f"For '{ut.STR_PATTERN}', 'len_max' ({len_max}) should be greater than the smallest step "
+                             f"in 'steps_pattern' ({steps_pattern}).")
+        for i, step in enumerate(steps_pattern):
+            ut.check_number_range(name=f"{ut.STR_PATTERN}[steps_pattern](step{i+1})", val=step, just_int=True,
+                                  min_val=1)
+        # A Pattern config can pass every per-argument check yet still yield zero
+        # valid splits. A pattern of n repeats spans at minimum n * steps[0]
+        # (smallest step used throughout); since labels are part-length
+        # independent, the config produces no splits for ANY part when even the
+        # smallest repeat count exceeds len_max: n_min * steps[0] > len_max
+        # (e.g. steps=[3], n_min=2, len_max=4 -> 6 > 4). Such a config silently
+        # contributes zero Pattern features downstream — warn so the user can fix
+        # 'len_max'/'steps'/'n_min' rather than silently losing the split type.
+        if n_min * steps_pattern[0] > len_max:
+            warnings.warn(f"'{ut.STR_PATTERN}' split config (steps={steps_pattern}, n_min={n_min}, "
+                          f"n_max={n_max}, len_max={len_max}) yields no valid splits and will contribute "
+                          f"zero features. Increase 'len_max' or adjust 'steps'/'n_min'.", UserWarning)
+    # Check PeriodicPattern
+    if ut.STR_PERIODIC_PATTERN in split_kws:
+        periodicpattern_args = split_kws[ut.STR_PERIODIC_PATTERN]
+        steps_periodicpattern = periodicpattern_args["steps"]
+        if not isinstance(steps_periodicpattern, list) or len(steps_periodicpattern) != 2:
+            raise ValueError(f"'steps_periodicpattern' ({steps_periodicpattern}) should be list of"
+                             f" with exactly 2 non-negative integers")
+        if steps_periodicpattern != sorted(steps_periodicpattern):
+            raise ValueError(f"For '{ut.STR_PERIODIC_PATTERN}', 'steps_periodicpattern' ({steps_periodicpattern}) "
+                             f"should be ordered in ascending order.")
+        step1, step2 = steps_periodicpattern
+        ut.check_number_range(name=f"{ut.STR_PERIODIC_PATTERN}[steps_periodicpattern](step1)",
+                              val=step1, just_int=True, min_val=1)
+        ut.check_number_range(name=f"{ut.STR_PERIODIC_PATTERN}[steps_periodicpattern](step2)",
+                              val=step2, just_int=True, min_val=1)
+
+
+# Check parts
+def check_parts_len(tmd_len=None, jmd_n_len=None, jmd_c_len=None,
+                    accept_none_tmd_len=False, accept_none_jmd_len=False,
+                    tmd_seq=None, jmd_n_seq=None, jmd_c_seq=None,
+                    check_jmd_seq_len_consistent=False):
+    """Check length parameters and if they are matching with sequences if provided"""
+    ut.check_str(name="tmd_seq", val=tmd_seq, accept_none=True)
+    ut.check_str(name="jmd_n_seq", val=jmd_n_seq, accept_none=True)
+    ut.check_str(name="jmd_c_seq", val=jmd_c_seq, accept_none=True)
+    tmd_seq = _return_empty_string(val=tmd_seq)
+    jmd_n_seq = _return_empty_string(val=jmd_n_seq)
+    jmd_c_seq = _return_empty_string(val=jmd_c_seq)
+    # If sequences is not None, set length to sequence length
+    if len(jmd_n_seq + tmd_seq + jmd_c_seq) > 0:
+        if check_jmd_seq_len_consistent:
+            if jmd_n_len is None or jmd_n_len != len(jmd_n_seq):
+                raise ValueError(f"Not matching of 'jmd_n_len' ({jmd_n_len}) and 'jmd_n_seq' ({jmd_n_seq})")
+            if jmd_c_len is None or jmd_c_len != len(jmd_c_seq):
+                raise ValueError(f"Not matching of 'jmd_c_len' ({jmd_c_len}) and 'jmd_c_seq' ({jmd_c_seq})")
+        tmd_len, jmd_n_len, jmd_c_len = len(tmd_seq), len(jmd_n_seq), len(jmd_c_seq)
+    else:
+        tmd_seq = jmd_n_seq = jmd_c_seq = None
+    # Check lengths
+    ext_len = ut.options["ext_len"]
+    ut.check_number_range(name="tmd_len", val=tmd_len, accept_none=accept_none_tmd_len, min_val=1, just_int=True)
+    ut.check_number_range(name="jmd_n_len", val=jmd_n_len, accept_none=accept_none_jmd_len, min_val=0, just_int=True)
+    ut.check_number_range(name="jmd_c_len", val=jmd_c_len, accept_none=accept_none_jmd_len, min_val=0, just_int=True)
+    ut.check_number_range(name="ext_len", val=ext_len, min_val=0, accept_none=True, just_int=True)
+    # Check len_ext
+    if ext_len is not None and ext_len != 0:
+        # Check if ext_len exceeds either jmd_n_len or jmd_c_len
+        if ext_len > jmd_n_len:
+            raise ValueError(f"'ext_len' ({ext_len}) must be <= length of jmd_n ({jmd_n_len})")
+        if ext_len > jmd_c_len:
+            raise ValueError(f"'ext_len' ({ext_len}) must be <= length of jmd_c ({jmd_c_len})")
+    # Create out.dictionaries
+    args_len = dict(tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+    args_seq = dict(tmd_seq=tmd_seq, jmd_n_seq=jmd_n_seq, jmd_c_seq=jmd_c_seq)
+    return args_len, args_seq
+
+
+def check_match_features_seq_parts(features=None, tmd_seq=None, jmd_n_seq=None, jmd_c_seq=None,
+                                   tmd_len=20, jmd_n_len=10, jmd_c_len=10):
+    """Check if sequence lengths do match with length requirements of features"""
+    # Check match of part length and features
+    if None in [tmd_seq, jmd_n_seq, jmd_c_seq] or len(jmd_n_seq + tmd_seq + jmd_c_seq) == 0:
+        jmd_n, tmd, jmd_c = get_part_positions(start=1, jmd_n_len=jmd_n_len, tmd_len=tmd_len, jmd_c_len=jmd_c_len)
+        dict_part_seq = ut.get_dict_part_seq(tmd=tmd, jmd_n=jmd_n, jmd_c=jmd_c)
+        for feature in features:
+            part, split, scale = ut.split_feat_id(feat_id=feature)
+            n_max = _get_max_pos_split(split=split)
+            seq = dict_part_seq[part.lower()]
+            if len(seq) < n_max:
+                raise ValueError(f"Sequence length (n={len(seq)}) too short for '{feature}' feature (n_max={n_max})")
+    # Check match of sequence part length and features
+    else:
+        dict_part_seq = ut.get_dict_part_seq(tmd=tmd_seq, jmd_c=jmd_c_seq, jmd_n=jmd_n_seq)
+        for feature in features:
+            part, split, scale = ut.split_feat_id(feat_id=feature)
+            n_max = _get_max_pos_split(split=split)
+            seq = dict_part_seq[part.lower()]
+            if len(seq) < n_max:
+                raise ValueError(
+                    f"Sequence 'part' ({seq}, n={len(seq)}) too short for '{feature}' feature (n_max={n_max})")
+
+
+# Check df_seq
+def _get_tmd_positions(row):
+    """Get 1-based, start- & stop-inclusive [tmd_start, tmd_stop] of the TMD within the sequence.
+
+    Both columns express the same convention (see CONTEXT.md 'TMD coordinate convention'):
+    1-based and inclusive on both ends, so a TMD of length L spans ``tmd_stop - tmd_start + 1 == L``
+    residues. ``start0`` is the 0-based offset from ``str.find``; ``start0 + len(tmd)`` is the
+    1-based inclusive last position (algebraically ``tmd_start + len(tmd) - 1``).
+    """
+    tmd, seq = row[ut.COL_TMD], row[ut.COL_SEQ]
+    start0 = seq.find(tmd)
+    if start0 == -1 or len(tmd) == 0:  # TMD not found in sequence, or empty TMD
+        raise ValueError(f"'{ut.COL_TMD}' is not contained in '{ut.COL_SEQ}' for '{row[ut.COL_ENTRY]}' entry")
+    tmd_start = start0 + 1             # 1-based inclusive first residue
+    tmd_stop = start0 + len(tmd)       # 1-based inclusive last residue
+    return pd.Series([tmd_start, tmd_stop])
+
+
+def check_match_df_seq_jmd_len(df_seq=None, jmd_n_len=None, jmd_c_len=None):
+    """Check matching of df_seq and jmd lengths."""
+    df_seq = df_seq.copy()
+    pos_based = set(ut.COLS_SEQ_POS).issubset(set(df_seq))
+    part_based = set(ut.COLS_SEQ_PARTS).issubset(set(df_seq))
+    seq_based = ut.COL_SEQ in list(df_seq)
+    seq_tmd_based = set(ut.COLS_SEQ_TMD).issubset(set(df_seq))
+    # 'jmd_n_len' and 'jmd_c_len' should be already checked if None or int by interface
+    if [jmd_n_len, jmd_c_len].count(None) >= 1:
+        if not part_based:
+            raise ValueError(f"'jmd_n_len' and 'jmd_c_len' should be both given if '{ut.COLS_SEQ_PARTS}' are not provided")
+        else:
+            if [jmd_n_len, jmd_c_len].count(None) == 1:
+                raise ValueError(f"'jmd_n_len' and 'jmd_c_len' should be both given or both None "
+                                 f"if '{ut.COLS_SEQ_PARTS}' are provided")
+    # Get 'tmd_start' and 'tmd_stop'
+    elif [jmd_n_len, jmd_c_len].count(None) == 0:
+        if part_based and not pos_based:
+            df_seq[ut.COL_SEQ] = df_seq[ut.COL_JMD_N] + df_seq[ut.COL_TMD] + df_seq[ut.COL_JMD_C]
+            df_seq[[ut.COL_TMD_START, ut.COL_TMD_STOP]] = df_seq.apply(_get_tmd_positions, axis=1)
+    if not pos_based and not part_based:
+        if seq_tmd_based:
+            df_seq[[ut.COL_TMD_START, ut.COL_TMD_STOP]] = df_seq.apply(_get_tmd_positions, axis=1)
+        elif seq_based:
+            # tmd_start/tmd_stop stay 1-based & inclusive (CONTEXT.md 'TMD coordinate convention'):
+            # first TMD residue sits just after the jmd_n_len N-terminal residues; last sits just
+            # before the jmd_c_len C-terminal residues. Different arithmetic, same convention.
+            tmd_start = 1 + jmd_n_len
+            list_seq = []
+            list_tmd_stop = []
+            for seq in df_seq[ut.COL_SEQ]:
+                # If 'jmd_n_len' and 'jmd_c_len' exceed the sequence length, sequence is adjusted using gaps
+                dif_jmd_n_len_seq = jmd_n_len - len(seq)
+                if dif_jmd_n_len_seq >= 0:
+                    # Add one gap for TMD
+                    seq += ut.STR_AA_GAP * (dif_jmd_n_len_seq + 1)
+                dif_jmd_len_seq = jmd_c_len + jmd_n_len - len(seq)
+                if dif_jmd_len_seq >= 0:
+                    # If no jmd_n, add gaps to N-terminus of sequence
+                    if jmd_n_len == 0:
+                        seq = ut.STR_AA_GAP * (dif_jmd_len_seq + 1) + seq
+                    # If jmd_n, add gaps to C-terminus of sequence
+                    else:
+                        seq += ut.STR_AA_GAP * (dif_jmd_len_seq + 1)
+                    tmd_stop = tmd_start
+                else:
+                    tmd_stop = len(seq) - jmd_c_len
+                list_seq.append(seq)
+                list_tmd_stop.append(tmd_stop)
+            df_seq[ut.COL_TMD_START] = tmd_start
+            df_seq[ut.COL_TMD_STOP] = list_tmd_stop
+            df_seq[ut.COL_SEQ] = list_seq
+    return df_seq
+
+
+# Anchor (pos) input mode — D5a
+def _parse_anchor_cell(entry=None, val=None):
+    """Parse one ``pos`` cell into a list of 1-based int anchors (scalar or iterable).
+
+    DEV: mirrors ``seq_analysis/_backend/aa_window_sampler/_utils.py:_parse_pos_value``
+    — unify into a shared ``ut`` parser on the next touch of that file.
+    """
+    if val is None or (isinstance(val, float) and np.isnan(val)) \
+            or (isinstance(val, str) and val.strip() == ""):
+        return []
+    if isinstance(val, (list, tuple, np.ndarray, pd.Series)):
+        try:
+            return [int(v) for v in val]
+        except (TypeError, ValueError):
+            raise ValueError(f"'{ut.COL_POS}' for entry '{entry}' should contain "
+                             f"int-castable positions; got {val!r}")
+    try:
+        return [int(val)]
+    except (TypeError, ValueError):
+        raise ValueError(f"'{ut.COL_POS}' for entry '{entry}' should be an int or an "
+                         f"iterable of ints; got {type(val).__name__}")
+
+
+def expand_pos_anchors_(df_seq=None, tmd_len=None, jmd_n_len=None, jmd_c_len=None):
+    """Explode a (``sequence`` + ``pos``) df_seq into the position-based schema (D5a).
+
+    Each 1-based anchor in a row's ``pos`` cell becomes one row whose
+    ``tmd_start``/``tmd_stop`` come from the P1-anchor geometry
+    (``ut.get_window_offsets``; right-heavy for even ``tmd_len``), then the
+    existing position-based ``jmd_n_len``/``jmd_c_len`` extension applies
+    downstream. Returns the exploded position-based df_seq (columns
+    ``entry``/``sequence``/``tmd_start``/``tmd_stop``, fresh ``RangeIndex``) plus
+    the aligned ``entry_win`` ids ``<entry>_<win_start>-<win_stop>`` (the full
+    jmd_n|tmd|jmd_c span, 1-based inclusive). Raises if an anchor leaves no room
+    for the full window inside the sequence.
+    """
+    half_left, half_right = ut.get_window_offsets(tmd_len)
+    rows, list_entry_win, bad = [], [], []
+    for entry, seq, pos_cell in zip(df_seq[ut.COL_ENTRY], df_seq[ut.COL_SEQ], df_seq[ut.COL_POS]):
+        for c in _parse_anchor_cell(entry=entry, val=pos_cell):
+            tmd_start = c - half_left
+            tmd_stop = c + half_right - 1
+            win_start = tmd_start - jmd_n_len
+            win_stop = tmd_stop + jmd_c_len
+            if win_start < 1 or win_stop > len(seq):
+                bad.append((entry, c))
+                continue
+            rows.append([entry, seq, tmd_start, tmd_stop])
+            list_entry_win.append(f"{entry}_{win_start}-{win_stop}")
+    if bad:
+        preview = bad[:10]
+        more = "..." if len(bad) > 10 else ""
+        raise ValueError(
+            f"'pos' anchors {preview}{more} leave no room for the full "
+            f"jmd_n|tmd|jmd_c window (tmd_len={tmd_len}, jmd_n_len={jmd_n_len}, "
+            f"jmd_c_len={jmd_c_len}) inside the sequence. Provide anchors with "
+            f"enough flanking residues or reduce the lengths."
+        )
+    if not rows:
+        raise ValueError(f"'{ut.COL_POS}' contains no usable anchors "
+                         f"(all cells empty/missing).")
+    df_seq_pos = pd.DataFrame(
+        rows, columns=[ut.COL_ENTRY, ut.COL_SEQ, ut.COL_TMD_START, ut.COL_TMD_STOP])
+    return df_seq_pos, list_entry_win
+
+
+# Check df_parts matching
+def check_match_df_parts_features(df_parts=None, features=None):
+    """Check if df_parts does match with length requirements of features"""
+    if df_parts is None:
+        return # Skip check
+    for feature in features:
+        part, split, scale = ut.split_feat_id(feat_id=feature)
+        n_min = _get_max_pos_split(split=split)
+        if any(df_parts[part.lower()].map(len) < n_min):
+            mask = df_parts[part.lower()].map(len) < n_min
+            list_seq = df_parts[mask][part.lower()].to_list()
+            if len(list_seq) == 1:
+                seq = list_seq[0]
+                raise ValueError(f"Sequence 'part' ('{seq}', n={len(seq)}) is too short"
+                                 f"\n  for '{feature}' feature (n_min={n_min})")
+            else:
+                raise ValueError(
+                    f"For '{feature}' feature (n_min={n_min}),"
+                    f"\n  following sequence 'parts' are too short: {list_seq}")
+
+
+def check_match_df_parts_split_kws(df_parts=None, split_kws=None):
+    """Check if df_parts and split_kws match regarding the sequence size (raise on too-short parts).
+
+    Retained as a strict validator, but no longer called by ``CPP.__init__`` — which now auto-caps
+    too-short parts via :func:`clamp_split_kws_to_parts_` (cap + one ``UserWarning``) instead of
+    raising, so free peptides / short parts stay usable. Kept for callers that want the hard-fail
+    contract and for its actionable message.
+    """
+    n_max = _get_max_pos_split_kws(split_kws=split_kws)
+    reqs = _get_split_kws_requirements(split_kws=split_kws)
+    # Name the split type(s) whose required length binds 'n_max' so the message can point at the
+    # exact parameter to lower (or split type to drop) rather than only reporting the number.
+    driver = "/".join(f"{st} ({param}={val})" for st, (val, param) in reqs.items() if val == n_max)
+    for part in list(df_parts):
+        lengths = df_parts[part.lower()].map(len)
+        if any(lengths < n_max):
+            list_seq = df_parts[lengths < n_max][part.lower()].to_list()
+            seq = list_seq[0]
+            count = "a sequence" if len(list_seq) == 1 else f"{len(list_seq)} sequences"
+            raise ValueError(
+                f"'{part}' part contains {count} too short (e.g. '{seq}', n={len(seq)}) for the "
+                f"{driver} split length (n_max={n_max})."
+                f"\n  For free peptides with no flanking context, use Segment-only splits or reduce "
+                f"'len_max'/'n_split_max' (via SequenceFeature.get_split_kws),"
+                f"\n  or add flanking context (jmd_n/jmd_c).")
+
+
+# Check df_scales & df_cat
+def check_df_scales(df_scales=None, accept_none=False):
+    """Check if df_scales is a valid input and matching to df_parts"""
+    ut.check_df(name=ut.FILE_DF_SCALES, df=df_scales, accept_none=accept_none)
+    if df_scales is None and accept_none:
+        return  # Skip check
+    # Check if columns are unique
+    if len(list(df_scales)) != len(set(df_scales)):
+        raise ValueError("Column names in 'df_scales' must be unique. Drop duplicates!")
+    # Check if index is unique
+    if len(list(df_scales.index)) != len(set(df_scales.index)):
+        raise ValueError("Index in 'df_scales' must be unique. Drop duplicates!")
+    # Check if columns contain numbers
+    dict_dtype = dict(df_scales.dtypes)
+    cols_wrong_type = [col for col in dict_dtype if not np.issubdtype(dict_dtype[col], np.number)]
+    if len(cols_wrong_type) > 0:
+        error = "'df_scales' should only contain numbers." \
+                f"\n  Following columns contain no numerical values: {cols_wrong_type}"
+        raise ValueError(error)
+    # Check if NaN in df
+    cols_nans = [x for x in list(df_scales) if df_scales[x].isnull().any()]
+    if len(cols_nans) > 0:
+        error = "'df_scales' should not contain NaN." \
+                f"\n  Following columns contain NaN: {cols_nans}"
+        raise ValueError(error)
+
+
+def check_match_df_scales_features(df_scales=None, features=None):
+    """Check if scale ids from df_scales does match with features"""
+    if df_scales is None:
+        return # Skip check
+    scales_feat = [ut.split_feat_id(feat_id=x)[2] for x in features]
+    scales = list(df_scales)
+    missing_scales_in_df_scales = [x for x in scales_feat if x not in scales]
+    if len(missing_scales_in_df_scales) > 0:
+        raise ValueError(f"Following scale ids are missing in 'df_scales': {missing_scales_in_df_scales}")
+
+
+# Check df_cat
+def check_df_cat(df_cat=None, accept_none=True):
+    """Check if df_cat is valid"""
+    if df_cat is None and accept_none:
+        return  # Skip check
+    cols_cat = [ut.COL_SCALE_ID, ut.COL_CAT, ut.COL_SUBCAT, ut.COL_SCALE_NAME]
+    ut.check_df(name=ut.FILE_DF_CAT, df=df_cat, cols_required=cols_cat, accept_none=accept_none)
+
+
+def check_match_df_cat_features(df_cat=None, features=None):
+    """Check if scale ids from df_cat does match with features"""
+    if df_cat is None:
+        return # Skip check
+    scales_feat = [ut.split_feat_id(feat_id=x)[2] for x in features]
+    scales_cat = list(df_cat[ut.COL_SCALE_ID])
+    missing_scales_in_df_cat = [x for x in scales_feat if x not in scales_cat]
+    if len(missing_scales_in_df_cat) > 0:
+        raise ValueError(f"Following scale ids are missing in 'df_cat': {missing_scales_in_df_cat}")
+
+
+# Check matching of df_scales with df_parts and df_scales
+def check_match_df_parts_df_scales(df_parts=None, df_scales=None, accept_gaps=False):
+    """Check if characters from df_parts match with scales from df_scales"""
+    if df_parts is not None and df_scales is not None:
+        f = lambda x: set(x)
+        vf = np.vectorize(f)
+        char_parts = set().union(*vf(df_parts.values).flatten())
+        char_scales = list(set(df_scales.index))
+        if accept_gaps:
+            char_scales.append(ut.STR_AA_GAP)
+        missing_char = [x for x in char_parts if x not in char_scales]
+        # Replace gaps by default amino acid gap
+        if accept_gaps and missing_char:
+            df_parts = df_parts.copy()  # copy so we don't mutate the caller's df_parts in place
+            for col in list(df_parts):
+                for mc in missing_char:
+                    df_parts[col] = df_parts[col].str.replace(mc, ut.STR_AA_GAP)
+        elif len(missing_char) > 0:
+            error = f"Not all characters in sequences from 'df_parts' are covered!"\
+                    f"\n  Following characters are missing in 'df_scales': {missing_char}." \
+                    f"\n  Consider enabling 'accept_gaps'"
+            raise ValueError(error)
+    return df_parts
+
+
+def check_match_df_scales_df_cat(df_cat=None, df_scales=None, verbose=True):
+    """Check if scale ids matches from df_cat and df_scales"""
+    if df_scales is not None and df_cat is not None:
+        scales_cat = list(df_cat[ut.COL_SCALE_ID])
+        scales = list(df_scales)
+        overlap_scales = [x for x in scales if x in scales_cat]
+        difference_scales = list(set(scales).difference(set(scales_cat)))
+        # Adjust df_cat and df_scales
+        df_cat = df_cat[df_cat[ut.COL_SCALE_ID].isin(overlap_scales)]
+        df_scales = df_scales[overlap_scales]
+        if len(difference_scales) > 0:
+            missing_scales_in_df_scales = [x for x in scales_cat if x not in scales]
+            missing_scales_in_df_cat = [x for x in scales if x not in scales_cat]
+            # Error since all scale ids must be covered by df_cat
+            if missing_scales_in_df_cat:
+                raise ValueError(f"Following scale ids from 'df_scales' are missing in 'df_cat': {missing_scales_in_df_cat}")
+            # Only warning (excepted)
+            if verbose and len(missing_scales_in_df_scales) > 0:
+                warnings.warn(f"Following scale ids from 'df_cat' are missing in 'df_scales': {missing_scales_in_df_scales}")
+    return df_scales, df_cat

@@ -1,0 +1,610 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2011-2023 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#include "NeighborList.h"
+#include "Exception.h"
+#include "Vector.h"
+#include "Pbc.h"
+#include "AtomNumber.h"
+#include "Communicator.h"
+#include "OpenMP.h"
+#include "Tools.h"
+#include "core/Colvar.h"
+#include <string>
+#include "LinkCells.h"
+#include "View.h"
+#include <vector>
+#include <array>
+#include <algorithm>
+#include <numeric>
+#include <cstdlib>
+#include <limits>
+#include <functional>
+
+#pragma GCC diagnostic error "-Wswitch"
+
+namespace PLMD {
+
+NeighborList::NeighborList(const std::vector<AtomNumber>& list0,
+                           const std::vector<AtomNumber>& list1,
+                           const bool serial,
+                           const bool do_pair,
+                           const bool do_pbc,
+                           const Pbc& pbc,
+                           Communicator& cm,
+                           const double distance,
+                           const unsigned stride,
+                           const bool doCells)
+  : serial_(serial),
+    do_pbc_(do_pbc),
+    useCellList_(doCells),
+    style_(do_pair ? NNStyle::Pair : NNStyle::TwoList),
+    pbc_(&pbc),
+    comm(cm),
+    //copy-initialize fullatomlist_
+    fullatomlist_(list0),
+    distance_(distance),
+    nlist0_(list0.size()),
+    nlist1_(list1.size()),
+    stride_(stride) {
+  // store the rest of the atoms into fullatomlist_
+  fullatomlist_.insert(fullatomlist_.end(),list1.begin(),list1.end());
+  if(style_ != NNStyle::Pair) {
+    nallpairs_=nlist0_*nlist1_;
+  } else {
+    plumed_assert(!useCellList_ ) << "You can't use the cell implementation in Pair mode";
+    plumed_assert(nlist0_==nlist1_)
+        << "when using PAIR option, the two groups should have the same number"
+        " of elements\n" << "the groups you specified have size "
+        <<nlist0_<<" and "<<nlist1_;
+    nallpairs_=nlist0_;
+  }
+  initialize();
+}
+
+NeighborList::NeighborList(const std::vector<AtomNumber>& list0,
+                           const bool serial,
+                           const bool do_pbc,
+                           const Pbc& pbc,
+                           Communicator& cm,
+                           const double distance,
+                           const unsigned stride,
+                           const bool doCells)
+  : serial_(serial),
+    do_pbc_(do_pbc),
+    useCellList_(doCells),
+    style_(NNStyle::SingleList),
+    pbc_(&pbc),
+    comm(cm),
+    //copy-initialize fullatomlist_
+    fullatomlist_(list0),
+    distance_(distance),
+    nlist0_(list0.size()),
+    nallpairs_(nlist0_*(nlist0_-1)/2),
+    stride_(stride) {
+  initialize();
+}
+
+NeighborList::~NeighborList()=default;
+
+void NeighborList::initialize() {
+  // With the link cells the pairs within the cutoff are found from the cells: all the pairs
+  // are never stored nor indexed, so the two limits below on their number do not apply.
+  const bool allPairsIndexed=!(useCellList_ && stride_>0);
+  constexpr const char* envKey="PLUMED_IGNORE_NL_MEMORY_ERROR";
+  //this checks the upper limit of the memory
+  if(allPairsIndexed && !std::getenv(envKey)) {
+    //blocking memory allocation on more than 10 GB of memory
+    //A single list of more than 50000 atoms
+    //two different lists of more than 35355 atoms each (lista*listb < max, see below)
+    //that is more than 1250000000 pairs
+    //each pairIDs occupies 64 bit (where unsigned are 32bit integers)
+    //4294967296 is max(uint32)+1 and is more than 34 GB (correspond to a system of 65536 atoms)
+    if(nallpairs_ > 1250000000 ) {
+      const unsigned GB = sizeof(decltype(neighbors_)::value_type) * nallpairs_ / 1000000000;
+      plumed_error() << "A NeighborList is trying to allocate "
+                     + std::to_string( GB ) +" GB of data for the list of neighbors\n"
+                     "You can skip this error by exporting \""+envKey+"\"";
+    }
+  }
+  // all the pairs are indexed with unsigned integers (getClosePair, size): this limit cannot be skipped
+  plumed_assert(!allPairsIndexed || nallpairs_ <= std::numeric_limits<unsigned>::max())
+      << "A NeighborList cannot handle " << nallpairs_ << " pairs (the maximum is "
+      << std::numeric_limits<unsigned>::max() << ")";
+  try {
+    //preallocating some memory now to not spend too much time in the first update
+    // If the memory is underestimated it should be less than doubled if needed, the factor should depend on the implementation
+    //Asserting 20 maximun neighbors to occupy less memory
+    neighbors_.resize((stride_==0 || style_ == NNStyle::Pair) ?
+                      nallpairs_
+                      : (std::min((nlist0_*((useCellList_)?100:30)),nallpairs_)));
+  } catch (...) {
+    plumed_error_nested() << "An error happened while allocating the neighbor "
+                          "list, please decrease the number of atoms used";
+  }
+  if (nallpairs_ == neighbors_.size()) {
+    //TODO: test if this is feasible for accelerating the loop
+    //#pragma omp parallel for default(shared)
+    for(unsigned int i=0; i<nallpairs_; ++i) {
+      neighbors_[i]=getIndexPair(i);
+    }
+    listBuilded=true;
+  }
+}
+
+std::vector<AtomNumber>& NeighborList::getFullAtomList() {
+  return fullatomlist_;
+}
+
+NeighborList::pairIDs NeighborList::getIndexPair(const unsigned ipair) const {
+  pairIDs index;
+  switch (style_) {
+  case NNStyle::Pair : {
+    index=pairIDs(ipair,ipair+nlist0_);
+  }
+  break;
+  case NNStyle::TwoList : {
+    index=pairIDs(ipair/nlist1_,ipair%nlist1_+nlist0_);
+  }
+  break;
+  case NNStyle::SingleList: {
+    // 64-bit arithmetic: with more than 2^15 atoms 8*ii does not fit in 32 bits
+    const std::size_t ii = nallpairs_-1-std::size_t(ipair);
+    // K is the largest integer with K*(K-1)/2 <= ii
+    std::size_t K = std::size_t(std::floor((std::sqrt(8.0*double(ii)+1.0)+1.0)/2.0));
+    // guard against rounding in the square root
+    while(K*(K-1)/2>ii) {
+      --K;
+    }
+    while((K+1)*K/2<=ii) {
+      ++K;
+    }
+    const std::size_t jj = ii-K*(K-1)/2;
+    index=pairIDs(nlist0_-1-K,nlist0_-1-jj);
+  }
+  }
+  return index;
+}
+
+namespace {
+/// The visitor of NeighborList::update: appends to kept the candidates B within the
+/// cutoff from A (with a single list, only those that come after A)
+struct KeepPairs {
+  unsigned* kept;
+  std::size_t n;
+  unsigned A;
+  double d2;
+  bool twoLists;
+  const unsigned* lists;
+  inline void operator()( const std::size_t j, const Vector& d ) {
+    const unsigned B=lists[j];
+    // no branch: whether a candidate is within the cutoff, and whether it
+    // comes after A in a single list, cannot be predicted
+    kept[n]=B;
+    n+=( (modulo2(d)<=d2) & (twoLists | (B>A)) );
+  }
+};
+}
+
+void NeighborList::update(const std::vector<Vector>& positions) {
+  update(positions,*pbc_);
+}
+
+void NeighborList::update(const std::vector<Vector>& positions, const Pbc& pbc) {
+  neighbors_.clear();
+  // check if positions array has the correct length
+  plumed_assert(positions.size()==fullatomlist_.size());
+
+  const unsigned stride=(serial_)? 1 : comm.Get_size();
+  const unsigned rank  =(serial_)? 0 : comm.Get_rank();
+  const double d2=distance_*distance_;
+  // Each thread stores its pairs (as a flat list of indices) in its own buffer.
+  // Threads work on contiguous blocks (static schedule) and the buffers are
+  // concatenated in thread order, and the lists of the processes in rank order:
+  // the order of the pairs does not depend on the number of threads and processes,
+  // and the results are reproducible.
+
+  // with two lists and one of them small, the cells (sorting all the atoms) cost more than
+  // one distance per pair: the plain search is used (about the same cost with 8 atoms)
+  const bool useCells = useCellList_ && !(style_==NNStyle::TwoList && std::min(nlist0_,nlist1_)<=cellsMinimumGroup);
+  // Without the cells the pairs are computed in batches of batchSize
+  constexpr unsigned batchSize=1024;
+  // All the threads or one (see OpenMP.h). They share the atoms of the first list (with the
+  // cells), whose neighbors are searched, or the pairs (without), at least a batch each.
+  // The list is updated every few steps, often for a few atoms.
+  const std::size_t natomsSearched=(style_==NNStyle::TwoList ? nlist0_ : fullatomlist_.size());
+  const unsigned nt=serial_ ? 1 :
+                    useCells ? OpenMP::getGoodNumThreads(natomsSearched/stride,LinkCells::minAtomsPerThreadNeighborList) :
+                    OpenMP::getGoodNumThreads(nallpairs_/stride,batchSize);
+  std::vector<std::vector<unsigned>> thread_flat_nl(nt);
+  if(useCells) {
+    std::vector<unsigned> indexesForCells(fullatomlist_.size());
+    std::iota(indexesForCells.begin(),indexesForCells.end(),0);
+    LinkCells cells(comm);
+    cells.setCutoff(distance_);
+    // smaller cells: fewer candidate pairs beyond the cutoff
+    cells.setSubdivision(LinkCells::maxSubdivision);
+    // with few atoms in a large box most cells would be empty, and visiting them
+    // would cost more than the search
+    cells.setLimitCellsByAtoms(true);
+    if(do_pbc_) {
+      cells.setupCells(make_const_view(positions),pbc);
+    } else {
+      // without pbc the cells must enclose the atoms: cells built on the periodic
+      // box would split close pairs across the planes where scaled coordinates wrap
+      cells.setupCells(make_const_view(positions));
+    }
+    plumed_assert(style_!=NNStyle::Pair) << "Cell list should not be active with a Pair NL";
+    const bool twoLists = style_==NNStyle::TwoList;
+    const std::size_t nA=nlist0_;
+    // When the cell of an atom fixes its periodic image, the minimum image distance is not
+    // needed for each candidate pair (they are many more than the pairs within the cutoff):
+    // the candidates are stored with their wrapped positions and searched on a LinkCellsView
+    const bool useShifts=cells.cellsFixImages();
+    LinkCells::CellCollection listA;
+    LinkCells::CellCollection listB;
+    if(twoLists) {
+      listA = cells.getCollection(View{positions.data(),nlist0_},
+                                  View<const unsigned> {indexesForCells.data(),nlist0_});
+      listB = cells.getCollection(View{positions.data()+nlist0_,nlist1_},
+                                  View<const unsigned> {indexesForCells.data()+nlist0_,nlist1_},
+                                  useShifts);
+      plumed_assert((listA.lcell_lists.size()+listB.lcell_lists.size()) == positions.size())
+          << listA.lcell_lists.size()<<"+"<<listB.lcell_lists.size() <<"==" <<positions.size();
+    } else {
+      listA = cells.getCollection(View{positions.data(),nA},
+                                  View<const unsigned> {indexesForCells.data(),nA},
+                                  useShifts);
+    }
+    const LinkCells::CellCollection& candidates = twoLists ? listB : listA;
+    // cells are split among processes
+    const unsigned ncells=cells.getNumberOfCells();
+    const unsigned cellsPerRank=(ncells+stride-1)/stride;
+    const unsigned cstart=std::min(rank*cellsPerRank,ncells);
+    const unsigned cend=std::min(cstart+cellsPerRank,ncells);
+    const LinkCellsView view = useShifts ? cells.getView(candidates,do_pbc_) : LinkCellsView{};
+    // the largest number of candidates of an atom: the atoms in the most populated cells
+    const std::size_t side=2*view.nsub+1;
+    const std::size_t nsearched=side*side*side;
+    const std::size_t maxcandidates=useShifts ? candidates.getMaximimumCombination(nsearched) : 0;
+    #pragma omp parallel num_threads(nt)
+    {
+      auto & private_flat_nl=thread_flat_nl[OpenMP::getThreadNum()];
+      std::vector<unsigned> cells_required(cells.getNumberOfCells());
+      // one more element: a candidate is written before it is known if it is kept
+      std::vector<unsigned> kept(maxcandidates+1);
+      #pragma omp for schedule(static) nowait
+      for(unsigned c=cstart; c<cend; ++c) {
+        auto atomsInC= listA.getCellIndexes(c);
+        if(atomsInC.size()==0) {
+          continue;
+        }
+        if(useShifts) {
+          for (auto A : atomsInC) {
+            KeepPairs keep{kept.data(),0,A,d2,twoLists,view.lists};
+            forEachCandidate(view,positions[A],keep);
+            const std::size_t nkept=keep.n;
+            const std::size_t first=private_flat_nl.size();
+            private_flat_nl.resize(first+2*nkept);
+            for (std::size_t k=0; k<nkept; ++k) {
+              private_flat_nl[first+2*k]=A;
+              private_flat_nl[first+2*k+1]=kept[k];
+            }
+          }
+          continue;
+        }
+        auto cell = cells.findMyCell(c);
+        unsigned ncells_required=0;
+        cells.addRequiredCells(cell,ncells_required, cells_required,do_pbc_);
+        for (auto A : atomsInC) {
+          for (unsigned cb=0; cb <ncells_required ; ++cb) {
+            for (auto B : candidates.getCellIndexes(cells_required[cb])) {
+              if(!twoLists && B<=A) {
+                continue;
+              }
+              // the cells contain all the pairs within the cutoff, and many more:
+              // only the pairs within the cutoff are kept
+              const Vector distance=do_pbc_ ? pbc.distance(positions[A],positions[B]) :
+                                    delta(positions[A],positions[B]);
+              if(modulo2(distance)<=d2) {
+                private_flat_nl.push_back(A);
+                private_flat_nl.push_back(B);
+              }
+            }
+          }
+        }
+      }
+    }
+  } else {
+    const std::size_t elementsPerRank = (nallpairs_+stride-1)/stride;
+    const unsigned start= std::min<std::size_t>(rank*elementsPerRank,nallpairs_);
+    const unsigned end = std::min<std::size_t>(start + elementsPerRank, nallpairs_);
+    const unsigned work=end>start ? end-start : 0;
+    // Small lists do not amortize initializing the per-thread batch buffers.
+    // PAIR lists are linear searches and also perform better without batching.
+    const bool batchPbc=do_pbc_ && style_!=NNStyle::Pair && work/nt>=batchSize;
+
+    #pragma omp parallel num_threads(nt)
+    {
+      auto & private_flat_nl=thread_flat_nl[OpenMP::getThreadNum()];
+      if(batchPbc) {
+        // Bound the scratch space and keep enough batches for all threads.
+        const unsigned batchStep=nt>1 ? std::min(batchSize,std::max(1u,work/(4*nt))) : batchSize;
+        std::array<Vector,batchSize> distances;
+        std::array<pairIDs,batchSize> pairs;
+        #pragma omp for schedule(static) nowait
+        for(unsigned begin=start; begin<end; begin+=batchStep) {
+          const unsigned count=std::min(batchStep,end-begin);
+          for(unsigned j=0; j<count; ++j) {
+            const auto [index0,index1]=getIndexPair(begin+j);
+            pairs[j]= {index0,index1};
+            distances[j]=delta(positions[index0],positions[index1]);
+          }
+          pbc.apply(VectorView(distances[0].data(),count));
+          for(unsigned j=0; j<count; ++j) {
+            if(modulo2(distances[j])<=d2) {
+              private_flat_nl.push_back(pairs[j].first);
+              private_flat_nl.push_back(pairs[j].second);
+            }
+          }
+        }
+      } else {
+        #pragma omp for schedule(static) nowait
+        for(unsigned int i=start; i<end; ++i) {
+          auto [index0, index1 ] = getIndexPair(i);
+          const Vector distance=do_pbc_ ? pbc.distance(positions[index0],positions[index1]) :
+                                delta(positions[index0],positions[index1]);
+          double value=modulo2(distance);
+          if(value<=d2) {
+            private_flat_nl.push_back(index0);
+            private_flat_nl.push_back(index1);
+          }
+        }
+      }
+    }
+  }
+
+  // concatenate the lists of the threads, in thread order
+  std::vector<unsigned> local_flat_nl;
+  if(nt==1) {
+    local_flat_nl=std::move(thread_flat_nl[0]);
+  } else {
+    std::size_t local_size=0;
+    for(const auto & t : thread_flat_nl) {
+      local_size+=t.size();
+    }
+    local_flat_nl.reserve(local_size);
+    for(const auto & t : thread_flat_nl) {
+      local_flat_nl.insert(local_flat_nl.end(),t.begin(),t.end());
+    }
+  }
+
+  // find total dimension of neighborlist
+  std::vector <int> local_nl_size(stride, 0);
+  local_nl_size[rank] = local_flat_nl.size();
+  if(!serial_) {
+    comm.Sum(&local_nl_size[0], stride);
+  }
+  int tot_size = std::accumulate(local_nl_size.begin(), local_nl_size.end(), 0);
+  if(tot_size!=0) {
+    // merge
+    std::vector<unsigned> merge_nl;
+    if(comm.initialized()&&!serial_ && stride>1) {
+      merge_nl.assign(tot_size, 0);
+      // calculate vector of displacement
+      std::vector<int> disp(stride);
+      disp[0] = 0;
+      int rank_size = 0;
+      for(unsigned i=0; i<stride-1; ++i) {
+        rank_size += local_nl_size[i];
+        disp[i+1] = rank_size;
+      }
+      // Allgather neighbor list
+      comm.Allgatherv((!local_flat_nl.empty()?&local_flat_nl[0]:NULL),
+                      local_nl_size[rank],
+                      &merge_nl[0],
+                      &local_nl_size[0],
+                      &disp[0]);
+    } else {
+      merge_nl = std::move(local_flat_nl);
+    }
+    // resize neighbor stuff
+    neighbors_.resize(tot_size/2);
+    for(int i=0; i<tot_size/2; i++) {
+      unsigned j=2*i;
+      neighbors_[i] = std::make_pair(merge_nl[j],merge_nl[j+1]);
+    }
+  }
+  listBuilded=true;
+  // the reduced list changed, so it must be requested again
+  reducedRequested=false;
+  if (stride_ >1) {
+    setRequestList();
+  } else {
+    reduced=true;
+  }
+}
+
+void NeighborList::setRequestList() {
+  // at time of adding the `if (stride_>1)` in `update()`
+  // this function is called only from `update()` and it is private
+  // so as now it is not necessary to add extra logic in this function
+  // The atoms are marked in fullToRequest_ (one entry per element of fullatomlist_) and only
+  // the atoms that are used are sorted, instead of the two atoms of every pair
+  constexpr unsigned unused=std::numeric_limits<unsigned>::max();
+  fullToRequest_.assign(fullatomlist_.size(),unused);
+  for(unsigned int i=0; i<size(); ++i) {
+    fullToRequest_[neighbors_[i].first]=0;
+    fullToRequest_[neighbors_[i].second]=0;
+  }
+  requestlist_.clear();
+  if(std::adjacent_find(fullatomlist_.begin(),fullatomlist_.end(),std::greater_equal<AtomNumber>())==fullatomlist_.end()) {
+    // the full list is sorted and without repetitions (e.g. GROUPA=1 GROUPB=2-100):
+    // the used atoms are collected already sorted, and their positions are counted
+    for(unsigned i=0; i<fullatomlist_.size(); ++i) {
+      if(fullToRequest_[i]!=unused) {
+        fullToRequest_[i]=requestlist_.size();
+        requestlist_.push_back(fullatomlist_[i]);
+      }
+    }
+  } else {
+    for(unsigned i=0; i<fullatomlist_.size(); ++i) {
+      if(fullToRequest_[i]!=unused) {
+        requestlist_.push_back(fullatomlist_[i]);
+      }
+    }
+    Tools::removeDuplicates(requestlist_);
+    // position of each used atom in the sorted list, so that the pairs can be renumbered without searches
+    for(unsigned i=0; i<fullatomlist_.size(); ++i) {
+      if(fullToRequest_[i]!=unused) {
+        auto p = std::lower_bound(requestlist_.begin(), requestlist_.end(), fullatomlist_[i]);
+        plumed_dbg_assert(p!=requestlist_.end() && *p==fullatomlist_[i]);
+        fullToRequest_[i]=p-requestlist_.begin();
+      }
+    }
+  }
+  reduced=false;
+}
+
+std::vector<AtomNumber>& NeighborList::getReducedAtomList() {
+  if(stride_>1) {
+    if(!reduced) {
+      // the pairs refer to fullatomlist_: renumber them with the positions in requestlist_
+      for(unsigned int i=0; i<size(); ++i) {
+        neighbors_[i]=pairIDs(fullToRequest_[neighbors_[i].first],fullToRequest_[neighbors_[i].second]);
+      }
+    }
+    reduced=true;
+    return requestlist_;
+  } else {
+    //safeguard in case the stride is set to 0 or 1
+    return getFullAtomList();
+  }
+}
+
+unsigned NeighborList::getStride() const {
+  return stride_;
+}
+
+unsigned NeighborList::getLastUpdate() const {
+  return lastupdate_;
+}
+
+void NeighborList::setLastUpdate(const unsigned step) {
+  lastupdate_=step;
+}
+
+unsigned NeighborList::size() const {
+  if(!listBuilded) {
+    return nallpairs_;
+  }
+  return neighbors_.size();
+
+}
+
+NeighborList::pairIDs NeighborList::getClosePair(const unsigned i) const {
+  if(listBuilded) {
+    return neighbors_[i];
+  } else {
+    return getIndexPair(i);
+  }
+}
+
+NeighborList::pairIDs NeighborList::getUpdatedPair(const unsigned i) const {
+  plumed_dbg_assert(listBuilded) << "NeighborList::getUpdatedPair should be called after update()";
+  return neighbors_[i];
+}
+
+bool NeighborList::ready() const {
+  return listBuilded || neighbors_.size()==nallpairs_;
+}
+
+NeighborList::pairAtomNumbers
+NeighborList::getClosePairAtomNumber(const unsigned i) const {
+  if(listBuilded)
+    return pairAtomNumbers{
+    fullatomlist_[neighbors_[i].first],
+    fullatomlist_[neighbors_[i].second]};
+  else {
+    auto p = getIndexPair(i);
+    return pairAtomNumbers{
+      fullatomlist_[p.first],
+      fullatomlist_[p.second]};
+  }
+}
+
+std::vector<unsigned> NeighborList::getNeighbors(const unsigned index) const {
+  std::vector<unsigned> neighbors;
+  if (listBuilded) {
+    for(unsigned int i=0; i<size(); ++i) {
+      if(neighbors_[i].first==index) {
+        neighbors.push_back(neighbors_[i].second);
+      }
+      if(neighbors_[i].second==index) {
+        neighbors.push_back(neighbors_[i].first);
+      }
+    }
+  } else {
+    for(unsigned int i=0; i<size(); ++i) {
+      auto neigh = getClosePair(i);
+      if(neigh.first==index) {
+        neighbors.push_back(neigh.second);
+      }
+      if(neigh.second==index) {
+        neighbors.push_back(neigh.first);
+      }
+    }
+  }
+  return neighbors;
+}
+
+NeighborList::preparestatus NeighborList::prepare(Colvar* const aa,
+    bool firsttime,
+    bool invalidateList) {
+  if(stride_>0) {
+    if(stride_==1) {
+      invalidateList=true;
+      firsttime=false;
+    } else if(firsttime || (aa->getStep()%stride_==0 )) {
+      aa->requestAtoms(getFullAtomList());
+      reducedRequested=false;
+      invalidateList=true;
+      firsttime=false;
+    } else {
+      // The reduced list only changes when the list is updated, so it is requested once after each update.
+      // Requesting the same atoms at every step would make the action rebuild its lists of atoms,
+      // and PLUMED rebuild the lists of the atoms that are shared with the MD code, at every step.
+      if( !reducedRequested ) {
+        aa->requestAtoms(getReducedAtomList());
+        reducedRequested=true;
+      }
+      invalidateList=false;
+      if(aa->getExchangeStep()) {
+        aa->error("Neighbor lists should be updated on exchange steps - choose a NL_STRIDE which divides the exchange stride!");
+      }
+    }
+    if(aa->getExchangeStep()) {
+      firsttime=true;
+    }
+  }
+  return {firsttime,invalidateList};
+}
+} // namespace PLMD

@@ -1,0 +1,764 @@
+'''
+Functions for creating and rendering volume map visualizations in PyMOL.
+
+Each function can also be imported and used within a PyMOL session via the
+PyMOL run command:
+> run /path/to/glycographer/vis.py
+'''
+
+import os
+import sys
+
+import pandas as pd
+from pymol import cmd
+from pymol import stored
+
+
+def _bootstrap_repo_root():
+    '''
+    Put the repo root on sys.path so `import glycographer.*` works even when
+    this file is executed via PyMOL's `run /path/to/glycographer/vis.py`
+    (where the package is not otherwise importable).
+
+    PyMOL's `run` execs the script in the *pymol module's* namespace and sets a
+    `__script__` global to the script path (see pymol/parsing.py run_file). It
+    does NOT set `__file__`, so `globals()['__file__']` here would be PyMOL's own
+    __init__.py -- useless for locating this repo. So prefer `__script__`; only
+    fall back to `__file__` for the normal package-import case. Then walk up from
+    the script looking for the directory that actually contains the glycographer
+    package, rather than assuming a fixed number of levels.
+    '''
+    here = globals().get('__script__') or globals().get('__file__')
+    if not here:
+        return
+    here = os.path.abspath(os.path.expanduser(here))
+    d = os.path.dirname(here)
+    for _ in range(4):
+        if os.path.isdir(os.path.join(d, 'glycographer')):
+            if d not in sys.path:
+                sys.path.insert(0, d)
+            return
+        d = os.path.dirname(d)
+
+
+_bootstrap_repo_root()
+
+from glycographer.colors import get_snfg_color, color_by_magnitude, _CLUSTER_COLORS  # noqa: E402
+
+@cmd.extend
+def format_background(bg_rgb='white'):
+    '''
+    Standardize the viewing environment for the output in pymol or vmd.
+    '''
+    cmd.set('bg_rgb', bg_rgb)
+    cmd.set('depth_cue', 0)
+    cmd.set('ray_shadow', 0)
+
+def _obj_name(path_or_label: str, ext: str = '') -> str:
+    '''
+    PyMOL object name for a file path or label.
+
+    PyMOL rejects some characters our standard names use -- notably the {}
+    branch markers in probe names (glycographer.naming) -- and cmd.load
+    silently rewrites them to '_'. Any name we later pass back to PyMOL must
+    be the rewritten one, so derive every object name through here.
+    '''
+    stem = os.path.basename(path_or_label)
+    if ext and stem.endswith(ext):
+        stem = stem[:-len(ext)]
+    return cmd.get_legal_name(stem)
+
+@cmd.extend
+def vis_receptor(receptor_pdb: str):
+    '''
+    Load and display receptor as a white surface:
+    '''
+    rec_name = _obj_name(receptor_pdb, '.pdb')
+    cmd.load(receptor_pdb, rec_name)
+    cmd.hide('cartoon', rec_name)
+    cmd.show('surface', rec_name)
+    cmd.color('white', rec_name)
+
+    return rec_name
+
+@cmd.extend
+def vis_grid(grid_pdb: str):
+    '''
+    Load and display sampling grid.
+    '''
+    grid_name = _obj_name(grid_pdb, '.pdb')
+    cmd.load(grid_pdb, grid_name)
+
+    return grid_name
+
+@cmd.extend
+def vis_crystal_ligand(lig_pdb: str):
+    '''
+    Load and display known crystal glycoligand pose as licorice.
+    '''
+    lig_name = _obj_name(lig_pdb, '.pdb')
+    cmd.load(lig_pdb, lig_name)
+    cmd.show('licorice', lig_name)
+
+    stored.lig_residues = []
+    cmd.iterate(f'{lig_name} and name c1', 'stored.lig_residues.append(resn)')
+    unique_res = set(stored.lig_residues)
+
+    for res in unique_res:
+        cmd.color(get_snfg_color(res), f'{lig_name} and resn {res}')
+
+    return lig_name
+
+@cmd.extend
+def load_volmap_from_dx(map_dx: str):
+    '''
+    Load a volume density map from a dx file and create a pymol
+    object from it.
+    '''
+    map_name = _obj_name(map_dx, '.dx')
+    cmd.load(map_dx, map_name)
+
+    return map_name
+
+@cmd.extend
+def get_map_stats(map_source: str, occupied_only=True):
+    '''
+    Print and return distribution statistics for a map.
+
+    Pass a path to a .dx file for accurate numpy-computed statistics (preferred:
+    PyMOL's get_volume_histogram reports histogram bin edges, not true min/max,
+    and so disagrees with the values seen at map load). If a loaded PyMOL map
+    object name is passed instead, falls back to get_volume_histogram with a
+    note. Empty voxels (sentinel 0.0) are excluded by default.
+    '''
+    if os.path.isfile(map_source):
+        from glycographer.map import VolMap
+        from glycographer.analysis import map_stats
+        volmap = VolMap.from_dx(map_source)
+        stats = map_stats(volmap, occupied_only=occupied_only)
+        scope = 'occupied' if occupied_only else 'all'
+        print(f'Range ({scope}): [{stats["min"]}, {stats["max"]}]')
+        print(f'Mean: {stats["mean"]} (stdev: {stats["std"]})')
+        print(f'Occupied voxels: {stats["n_occupied"]} / {stats["n_voxels"]}')
+        return stats
+
+    print(f'"{map_source}" is not a file; reading the loaded PyMOL object via '
+          'get_volume_histogram (bin-edge bounds, may differ from true min/max '
+          '-- pass the .dx path for exact values).')
+    stats = cmd.get_volume_histogram(map_source, 0)
+    print(f'Range: [{stats[0]}, {stats[1]}]')
+    print(f'Mean: {stats[2]} (stdev: {stats[3]})')
+    return stats
+
+@cmd.extend
+def draw_contour(map_name: str, level: float):
+    '''
+    Draw an isomesh contour from a volume density map at a specified level.
+    '''
+    contour_name = '_'.join(['contour', map_name, str(level)])
+    cmd.isomesh(contour_name, map_name, float(level))
+
+    return contour_name
+
+@cmd.extend
+def draw_map_contours(map_dx: str, base_color='red', n=4, mode='absolute',
+                      step=1.0, smooth_sigma=None):
+    '''
+    Draw a set of isocontours for one map at programmatically chosen levels,
+    each shaded by its level (deepest = full base_color, shallower = lighter).
+
+    Replaces the by-hand "start near the minimum, step up until they bleed"
+    workflow. Levels come from analysis.choose_contour_levels; see it for the
+    modes:
+      'absolute'   -- start at the map minimum, step up by `step` REU (default).
+      'quantile'   -- tail quantiles of the favorable distribution.
+      'components' -- data-driven anti-bleed: stops below where sites merge.
+
+    Requires the .dx path (not a loaded object name) so the levels can be
+    computed from the voxel array. For a per-probe overlay, pass each probe a
+    distinct base_color from colors.probe_palette.
+
+    Returns
+    -------
+    (contour_names, levels)
+    '''
+    from glycographer.map import VolMap
+    from glycographer.analysis import choose_contour_levels
+
+    n = int(n)
+    step = float(step)
+    smooth_sigma = float(smooth_sigma) if smooth_sigma else None
+
+    volmap = VolMap.from_dx(map_dx)
+    levels = choose_contour_levels(volmap, n=n, mode=mode, step=step,
+                                   smooth_sigma=smooth_sigma)
+    if not levels:
+        print(f'No favorable (negative) voxels in {map_dx}; nothing to contour.')
+        return [], []
+
+    map_name = load_volmap_from_dx(map_dx)
+
+    # Shade deepest level at full base_color, shallower toward (but not to)
+    # white: map the shallowest level to t~0.5 by doubling the range span so
+    # every contour stays visible on a light background.
+    lo, hi = min(levels), max(levels)
+    span = hi - lo
+    lvl_range = (lo, hi + span) if span > 0 else (lo, lo + 1.0)
+
+    contour_names = []
+    for i, lvl in enumerate(levels):
+        contour_name = draw_contour(map_name, lvl)
+        rgb = color_by_magnitude(base_color, lvl, lvl_range,
+                                 negative_is_better=True)
+        color_name = f'mag_{map_name}_{i}'
+        cmd.set_color(color_name, list(rgb))
+        cmd.color(color_name, contour_name)
+        contour_names.append(contour_name)
+
+    print(f'{map_name}: drew {len(levels)} contours at '
+          f'{[round(l, 2) for l in levels]} (mode={mode})')
+    return contour_names, levels
+
+@cmd.extend
+def draw_mapped_surface(rec_name: str, map_name: str,
+                        ramp_min=None, ramp_max=0.0,
+                        color_min='red', color_max='white',
+                        map_dx=None):
+    '''
+    Project a mapped molecular surface of probe score density onto the receptor.
+
+    For REU maps (favorable = negative), the ramp runs from ramp_min (the most
+    favorable value, colored color_min) to ramp_max=0 (empty, colored color_max),
+    so strong binding shows as saturated color fading to white. If ramp_min is
+    None it is auto-derived from the map's favorable minimum; pass map_dx (the
+    .dx path) so the value can be read from the array, or set ramp_min explicitly.
+
+    Best suited to a single continuous field -- a per-probe map, or a
+    consensus_min / consensus_mean map to show generalist binding strength.
+    '''
+    if ramp_min is None:
+        src = map_dx if (map_dx and os.path.isfile(map_dx)) else (
+            map_name if os.path.isfile(map_name) else None)
+        if src:
+            from glycographer.map import VolMap
+            from glycographer.analysis import map_stats
+            ramp_min = map_stats(VolMap.from_dx(src))['min']
+        if ramp_min is None:
+            raise ValueError('ramp_min could not be auto-derived; pass map_dx '
+                             '(the .dx path) or set ramp_min explicitly.')
+    ramp_min, ramp_max = float(ramp_min), float(ramp_max)
+
+    ramp_name = f'ramp_{map_name}'
+    cmd.ramp_new(ramp_name, map_name, [ramp_min, ramp_max],
+                 [color_min, color_max])
+
+    cmd.set('surface_color', ramp_name, rec_name)
+    cmd.set('surface_ramp_above_mode', 1)
+    cmd.set('surface_quality', 1)
+    cmd.show('surface', rec_name)
+
+    return ramp_name
+
+@cmd.extend
+def show_hotspots(map_dx: str, top_n=15, level=None, min_voxels=3,
+                  min_persistence=None, smooth_sigma=None):
+    '''
+    Segment a map into discrete hotspots and mark each ranked centroid as a
+    labeled pseudoatom sphere (rank 1 = most persistent). Prints the ranked
+    hotspot table (peak/mean energy, persistence, size, world-space centroid).
+
+    Hotspots come from persistence-ranked local minima + a marker-controlled
+    watershed (analysis.find_hotspots). A near-global scan has many small
+    favorable micro-pockets, so the interactive default caps the display to the
+    top_n=15 most persistent sites. smooth_sigma defaults to None on purpose:
+    these Boltzmann maps are already smooth, and smoothing balloons the basins
+    and pulls peaks toward zero. To narrow further, raise min_persistence or
+    lower top_n; to see everything, set top_n=None.
+    '''
+    from glycographer.map import VolMap
+    from glycographer.analysis import find_hotspots
+
+    top_n = int(top_n) if top_n not in (None, 'None', '') else None
+    level = float(level) if level not in (None, 'None') else None
+    min_voxels = int(min_voxels)
+    min_persistence = (float(min_persistence)
+                       if min_persistence not in (None, 'None', '') else None)
+    smooth_sigma = float(smooth_sigma) if smooth_sigma not in (None, 'None', '') else None
+
+    volmap = VolMap.from_dx(map_dx)
+    df = find_hotspots(volmap, level=level, min_voxels=min_voxels,
+                       min_persistence=min_persistence, top_n=top_n,
+                       smooth_sigma=smooth_sigma)
+    map_name = _obj_name(map_dx, '.dx')
+    if df.empty:
+        print(f'No hotspots found in {map_name}.')
+        return df
+
+    group = f'hotspots_{map_name}'
+    for _, row in df.iterrows():
+        name = f'{group}_{int(row["rank"])}'
+        cmd.pseudoatom(name, pos=[float(row.x), float(row.y), float(row.z)],
+                       b=float(row.peak_value))
+        cmd.show('spheres', name)
+        cmd.set('sphere_scale', 0.5, name)
+        cmd.label(name, f'"{int(row["rank"])}"')
+    cmd.group(group, f'{group}_*')
+
+    print(f'{map_name}: {len(df)} hotspots (level={df.attrs.get("level"):.2f})')
+    print(df.to_string(index=False))
+    return df
+
+@cmd.extend
+def show_hotspot_residues(map_dx: str, receptor_pdb: str, rank=1, radius=4.0,
+                          top_n=15, level=None, min_voxels=3,
+                          min_persistence=None, smooth_sigma=None,
+                          highlight='orange'):
+    '''
+    Attribute a hotspot to its lining receptor residues (geometry only) and
+    display them: shows those residues as sticks, colors and labels them, and
+    prints the ranked attribution table.
+
+    Pass rank='all' to display the lining residues of every hotspot. The
+    receptor is loaded (as a surface) if not already present. Answers "which
+    residues line hotspot N of this probe" -- the design-guidance view.
+
+    Uses the same interactive segmentation defaults as show_hotspots
+    (top_n=15, smooth_sigma=None) so attribution runs on the significant sites,
+    not every watershed basin.
+    '''
+    from glycographer.map import VolMap
+    from glycographer.analysis import attribute_hotspots_to_residues
+
+    radius = float(radius)
+    min_voxels = int(min_voxels)
+    top_n = int(top_n) if top_n not in (None, 'None', '') else None
+    level = float(level) if level not in (None, 'None') else None
+    min_persistence = (float(min_persistence)
+                       if min_persistence not in (None, 'None', '') else None)
+    smooth_sigma = float(smooth_sigma) if smooth_sigma not in (None, 'None', '') else None
+
+    rec_name = _obj_name(receptor_pdb, '.pdb')
+    if rec_name not in cmd.get_names('objects'):
+        vis_receptor(receptor_pdb)
+
+    volmap = VolMap.from_dx(map_dx)
+    att = attribute_hotspots_to_residues(volmap, receptor_pdb, level=level,
+                                         min_voxels=min_voxels,
+                                         min_persistence=min_persistence,
+                                         top_n=top_n, smooth_sigma=smooth_sigma,
+                                         radius=radius)
+    if att.empty:
+        print('No lining residues found (no hotspots or none within radius).')
+        return att
+
+    if str(rank).lower() != 'all':
+        att = att[att['hotspot_rank'] == int(rank)]
+        if att.empty:
+            print(f'No hotspot with rank {rank}.')
+            return att
+
+    # Build a residue selection and highlight it.
+    parts = []
+    for _, r in att.iterrows():
+        chain = str(r['chain']).strip()
+        resi = f'resi {int(r["resid"])}'
+        parts.append(f'(chain {chain} and {resi})' if chain else f'({resi})')
+    sel = f'{rec_name} and ({" or ".join(parts)})'
+
+    sel_name = f'lining_{_obj_name(map_dx, ".dx")}'
+    cmd.select(sel_name, sel)
+    cmd.show('sticks', sel_name)
+    cmd.color(highlight, f'{sel_name} and elem C')
+    cmd.set('label_size', 14)
+    cmd.label(f'{sel_name} and name CA', 'f"{resn}{resi}"')
+
+    print(f'Lining residues (radius {radius} A):')
+    print(att.to_string(index=False))
+    return att
+
+def draw_best_probe_surface(rec_name: str, best_probe_map: str, probe_labels):
+    '''
+    Color a single receptor surface by which probe wins at each voxel, using a
+    best_probe consensus map (1-based probe index per voxel, 0 where none).
+
+    This is the "compare all probes at a glance" view: one surface, each patch
+    colored by the identity of its strongest probe from a colorblind-safe
+    categorical palette. probe_labels is the ordered probe list matching the
+    map's 1..N indices (as written by map_ensembles.py's ConsensusMap).
+
+    Not @cmd.extend (takes a label list -> use from a script/notebook). Depends
+    on the consensus best_probe map, so it is ready for when that methodology is
+    finalized. Note PyMOL ramps interpolate, so boundaries between two probe
+    regions blend slightly; treat this as a qualitative identity view.
+    '''
+    from glycographer.colors import probe_palette
+
+    pal = probe_palette(list(probe_labels))
+    color_names, values = [], []
+    for i, label in enumerate(probe_labels, start=1):
+        cname = _obj_name(f'probe_{label}')
+        cmd.set_color(cname, list(pal[label]))
+        color_names.append(cname)
+        values.append(i)
+
+    ramp_name = f'ramp_best_probe_{best_probe_map}'
+    cmd.ramp_new(ramp_name, best_probe_map, values, color_names)
+    cmd.set('surface_color', ramp_name, rec_name)
+    cmd.set('surface_ramp_above_mode', 0)
+    cmd.set('surface_quality', 1)
+    cmd.show('surface', rec_name)
+
+    return ramp_name
+
+
+@cmd.extend
+def draw_probe_shells(map_source, probe_labels=None, n=3, mode='absolute',
+                      step=2.0, smooth_sigma=None, as_mesh=1):
+    '''
+    Overlay several probes' favorability maps as nested, color-coded "shells".
+
+    For each probe map, isocontours are drawn at programmatically chosen levels
+    (analysis.choose_contour_levels), colored by a distinct colorblind-safe
+    probe color (colors.probe_palette) shaded by depth (deepest = full color,
+    shallower = toward white). Rendered as wireframe mesh by default so probes
+    that overlap at the same site remain mutually visible.
+
+    This is the "see every probe's binding depth at one location" view, and the
+    complement to draw_best_probe_surface (which shows only the winning probe
+    per voxel). PyMOL cannot vary a *surface's* transparency by spatial location,
+    so mesh -- not opacity -- is what lets the inner shells show through; the
+    base color encodes probe identity and the color intensity encodes the 2-D
+    projection of binding depth, giving the concentric-shell effect without any
+    per-vertex alpha.
+
+    For a clean figure, point at 2-3 probes of interest rather than all of them.
+
+    Parameters
+    ----------
+    map_source : str or list of str
+        The per-probe .dx maps (favorable = negative). Accepts, in order:
+          * a directory  -- every '*.dx' in it except consensus maps
+            (any with 'consensus' in the filename);
+          * a glob pattern ('maps/*_boltzmann_b0p5.dx');
+          * a list of paths (script/notebook use).
+        From the PyMOL command line a string is required (PyMOL cannot pass a
+        Python list); a glob/dir is also space-safe, unlike splitting a
+        space-joined string, so it works with paths that contain spaces.
+    probe_labels : list of str, or comma/space-separated str, optional
+        Labels matching the resolved maps, used for colors and object names.
+        Defaults to each map's filename. Falls back to filenames if the count
+        does not match the number of maps.
+    n, mode, step, smooth_sigma
+        Passed to analysis.choose_contour_levels (see it for the level modes).
+    as_mesh : bool-ish
+        Wireframe isomesh (default, see-through) vs solid isosurface. Accepts
+        1/0 or true/false from the command line.
+
+    Returns
+    -------
+    dict {probe_label: [contour object names]}
+        Shells are named shell_<label>_<level>, with the level in REU to 2
+        decimals in naming.fmt_num form (-14.64 -> m14p64); in 'quantile'
+        mode the quantile is appended (shell_<label>_m14p64_q0p001).
+    '''
+    import glob
+    import re
+    from glycographer.map import VolMap
+    from glycographer.analysis import choose_contour_levels
+    from glycographer.colors import probe_palette, rgb_to_hex
+    from glycographer.naming import fmt_num
+
+    # Resolve map_source (directory | glob | list) -> list of .dx paths.
+    if isinstance(map_source, str):
+        if os.path.isdir(map_source):
+            paths = sorted(glob.glob(os.path.join(map_source, '*.dx')))
+        else:
+            paths = sorted(glob.glob(map_source))
+        paths = [p for p in paths
+                 if 'consensus' not in os.path.basename(p)]
+    else:
+        paths = list(map_source)
+    if not paths:
+        print(f'draw_probe_shells: no maps resolved from {map_source!r}.')
+        return {}
+
+    # Labels: list, comma/space-separated string, or default to filenames.
+    if probe_labels is None:
+        probe_labels = [os.path.basename(p).replace('.dx', '') for p in paths]
+    elif isinstance(probe_labels, str):
+        probe_labels = [s for s in re.split(r'[,\s]+', probe_labels.strip()) if s]
+    if len(probe_labels) != len(paths):
+        print(f'draw_probe_shells: {len(probe_labels)} labels for {len(paths)} '
+              'maps; using filenames instead.')
+        probe_labels = [os.path.basename(p).replace('.dx', '') for p in paths]
+
+    n = int(n)
+    step = float(step)
+    smooth_sigma = (float(smooth_sigma)
+                    if smooth_sigma not in (None, 'None', '') else None)
+    as_mesh = str(as_mesh).strip().lower() not in ('0', 'false', 'no', 'off')
+
+    pal = probe_palette(probe_labels)
+
+    all_names = {}
+    for dx, label in zip(paths, probe_labels):
+        volmap = VolMap.from_dx(dx)
+        levels, quants = choose_contour_levels(volmap, n=n, mode=mode,
+                                               step=step,
+                                               smooth_sigma=smooth_sigma,
+                                               return_quantiles=True)
+        if not levels:
+            print(f'{label}: no favorable (negative) voxels; skipping.')
+            continue
+
+        map_name = load_volmap_from_dx(dx)
+        base = pal[label]
+        # Shade deepest level at full probe color, shallower toward white
+        # (double the span so the shallowest shell stays visible, matching
+        # draw_map_contours).
+        lo, hi = min(levels), max(levels)
+        span = hi - lo
+        lvl_range = (lo, hi + span) if span > 0 else (lo, lo + 1.0)
+
+        # The label keys the palette and the return dict as given; PyMOL
+        # object/color names use its legal form ({} -> _).
+        obj_label = _obj_name(label)
+        names = []
+        for lvl, q in zip(levels, quants):
+            # Suffix = level in REU (2 dp) [+ quantile in 'quantile' mode],
+            # filename-safe per naming.fmt_num: -14.64 -> m14p64, 0.005 -> q0p005.
+            suffix = fmt_num(round(lvl, 2))
+            if q is not None:
+                suffix += f'_q{fmt_num(q)}'
+            cname = f'shell_{obj_label}_{suffix}'
+            if as_mesh:
+                cmd.isomesh(cname, map_name, float(lvl))
+            else:
+                cmd.isosurface(cname, map_name, float(lvl))
+            rgb = color_by_magnitude(base, lvl, lvl_range, negative_is_better=True)
+            color_name = f'shellcol_{obj_label}_{suffix}'
+            cmd.set_color(color_name, list(rgb))
+            cmd.color(color_name, cname)
+            names.append(cname)
+
+        cmd.group(f'shells_{obj_label}', ' '.join(names))
+        all_names[label] = names
+        print(f'{label}: {len(names)} shells at '
+              f'{[round(l, 2) for l in levels]} (probe color {rgb_to_hex(*base)})')
+
+    return all_names
+
+@cmd.extend
+def extract_pose_clusters(ens_name: str, scoredata: str, clusters: str = '',
+                          all_states: str = '1'):
+    '''
+    Split a PyMOL-loaded multistate ensemble into one multistate object per
+    pose cluster, using the model_num / cluster_id columns of a scoredata
+    CSV. Objects are named <ens_name>_cluster_<id> and grouped under
+    <ens_name>_clusters; re-running replaces them.
+
+    Parameters
+    ----------
+    ens_name : str
+        The loaded ensemble object (state N = model_num N).
+    scoredata : str
+        Path to the scoredata CSV.
+    clusters : str
+        Comma-separated cluster ids to extract, e.g. '1,2,13'. Default: all.
+    all_states : '1' or '0'
+        Overlay every pose of a cluster at once (default). With '0', each
+        object only draws at global frames up to its own state count, so a
+        small cluster looks empty while the movie sits on a later frame of
+        the full ensemble.
+
+    PyMOL usage:
+        extract_pose_clusters ens, data/scores/run_scoredata.csv, clusters=1,2,13
+    '''
+    df = pd.read_csv(scoredata)
+    if 'model_num' not in df.columns or 'cluster_id' not in df.columns:
+        print("Error: CSV file must contain 'model_num' and 'cluster_id' columns")
+        return {}
+
+    n_states = cmd.count_states(ens_name)
+    if n_states != df['model_num'].max():
+        print(f'Warning: {ens_name} has {n_states} states but scoredata '
+              f'contains {df["model_num"].max()} model samples')
+
+    df = df[df['cluster_id'].notna()]
+    ids = sorted(int(c) for c in df['cluster_id'].unique())
+    if clusters:
+        wanted = {int(x) for x in str(clusters).split(',') if x.strip()}
+        ids = [c for c in ids if c in wanted]
+    if not ids:
+        print('No matching clusters found in the scoredata file')
+        return {}
+
+    cluster_dict = {}
+    for cid in ids:
+        name = f'{ens_name}_cluster_{cid}'
+        cmd.delete(name)   # re-running must replace, not append states
+        models = [int(m) for m in df.loc[df['cluster_id'] == cid, 'model_num']]
+        skipped = [m for m in models if not 1 <= m <= n_states]
+        models = [m for m in models if 1 <= m <= n_states]
+        if skipped:
+            print(f'Warning: {name} skips model_num {skipped} (not in {ens_name})')
+        if not models:
+            continue
+        # Explicit target states: target_state=-1 appends after
+        # count_states(name), which PyMOL resolves by name prefix, so a new
+        # ens_cluster_1 would start after the states of ens_cluster_13.
+        for state, model in enumerate(models, start=1):
+            cmd.create(name, ens_name, source_state=model, target_state=state)
+        if str(all_states) not in ('0', 'false', 'False'):
+            cmd.set('all_states', 1, name)
+        cluster_dict[name] = models
+
+    cmd.group(f'{ens_name}_clusters', ' '.join(cluster_dict))
+
+    print('Cluster: Models')
+    for key, val in cluster_dict.items():
+        print(f'{key}: {val}')
+
+    return cluster_dict
+
+
+def _model_blocks(path):
+    '''Yield (model_num, pdb_text) for each MODEL...ENDMDL block in a file.'''
+    model, block = None, []
+    with open(path) as f:
+        for line in f:
+            if line.startswith('MODEL'):
+                model, block = int(line.split()[1]), []
+            elif line.startswith('ENDMDL'):
+                yield model, ''.join(block) + 'END\n'
+                model = None
+            elif model is not None:
+                block.append(line)
+
+
+@cmd.extend
+def load_cluster_pdbs(path: str, color_by: str = 'cluster', highlight: str = '',
+                      all_states: str = '1', prefix: str = '', group: str = ''):
+    '''
+    Load cluster PDBs written by analysis.write_cluster_pdbs (or the
+    process_glycandock_output.py --cluster-pdbs flag), one multistate object
+    per cluster.
+
+    Objects are named after their file, <prefix>_cluster_<id> (e.g.
+    2hrl-native2df3_2000p_cluster_01), and grouped per run under
+    <prefix>_clusters, so clusters from different runs never share a name.
+    Re-running the command replaces those objects instead of appending
+    states to them.
+
+    States follow the order in the file; the REMARK table at the top of each
+    file maps state order to model_num, and each atom's B-factor holds its
+    pose's score.
+
+    Parameters
+    ----------
+    path : str
+        Directory holding *_cluster_*.pdb files, or a glob.
+    color_by : {'cluster', 'score'}
+        'cluster': carbons of up to three highlighted clusters in the funnel
+        palette, the rest grey. 'score': B-factor spectrum on one shared
+        range across everything loaded, blue = most favorable. Score mode
+        loads each pose as its own object (<prefix>_cluster_<id>_m<model_num>,
+        grouped under <prefix>_cluster_<id>), since PyMOL shares colors and
+        B-factors across states -- keep n modest for this mode.
+    highlight : str
+        Comma-separated cluster ids to color with color_by='cluster', e.g.
+        '1,2,13' to match the funnel plot. Applied to each run loaded.
+        Default: the first three clusters of each run.
+    all_states : '1' or '0'
+        Overlay every pose of a cluster at once (default) instead of
+        stepping through states.
+    prefix : str
+        Only load files from this run (<prefix>_cluster_*.pdb) when path is a
+        directory shared by several runs. Default: every run in path.
+    group : str
+        Optional parent group; the per-run <prefix>_clusters groups are
+        nested inside it.
+
+    PyMOL usage:
+        load_cluster_pdbs data/clusters, prefix=2hrl-native2df3_2000p, highlight=1,2,13
+        load_cluster_pdbs data/clusters/2hrl-native2df3_2000p_cluster_*.pdb
+        load_cluster_pdbs data/clusters, color_by=score
+    '''
+    import glob
+    import re
+
+    path = os.path.expanduser(path)
+    if os.path.isdir(path):
+        pattern = os.path.join(path, f'{glob.escape(prefix) if prefix else "*"}_cluster_*.pdb')
+    else:
+        pattern = path
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        print(f'No cluster PDBs match {pattern}')
+        return {}
+
+    for name, rgb in _CLUSTER_COLORS.items():
+        cmd.set_color(name, rgb)
+
+    # {run prefix: [(cluster_id, object name), ...]}, in file order.
+    runs = {}
+    pose_objs = []
+    for p in paths:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        m = re.match(r'(?P<run>.+)_cluster_(?P<cid>\d+)$', stem)
+        run = m.group('run') if m else stem
+        cid = int(m.group('cid')) if m else len(runs.get(run, [])) + 1
+        name = cmd.get_legal_name(stem)
+        cmd.delete(name)   # reloading must replace, not append states
+        if color_by == 'score':
+            # Atom colors and B-factors are shared by all states of a PyMOL
+            # object, so each pose is read as its own object (named by its
+            # model_num) and nested under the cluster group.
+            parts = []
+            for model, block in _model_blocks(p):
+                part = f'{name}_m{model}'
+                cmd.read_pdbstr(block, part)
+                parts.append(part)
+            cmd.group(name, ' '.join(parts))
+            pose_objs += parts
+        else:
+            cmd.load(p, name)
+            if str(all_states) not in ('0', 'false', 'False'):
+                cmd.set('all_states', 1, name)
+        cmd.show_as('sticks', name)
+        runs.setdefault(run, []).append((cid, name))
+
+    names = [name for members in runs.values() for _, name in members]
+    if color_by == 'score':
+        objs = ' or '.join(pose_objs)
+        stored.b = []
+        cmd.iterate(objs, 'stored.b.append(b)')
+        lo, hi = min(stored.b), max(stored.b)
+        cmd.spectrum('b', 'blue_white_red', objs, minimum=lo, maximum=hi)
+        cmd.color('atomic', f'({objs}) and not elem C')
+        print(f'Colored by score (B-factor) from {lo:.2f} (blue) to {hi:.2f} (red)')
+    else:
+        wanted = [int(x) for x in str(highlight).split(',') if x.strip()]
+        for members in runs.values():
+            by_id = dict(members)
+            chosen = (wanted or [cid for cid, _ in members])[:3]
+            for _, name in members:
+                cmd.color('cluster_other', f'{name} and elem C')
+            for slot, cid in enumerate(chosen, start=1):
+                if cid in by_id:
+                    cmd.color(f'cluster_c{slot}', f'{by_id[cid]} and elem C')
+        cmd.color('atomic', f'({" or ".join(names)}) and not elem C')
+
+    groups = {}
+    for run, members in runs.items():
+        gname = cmd.get_legal_name(f'{run}_clusters')
+        cmd.group(gname, ' '.join(name for _, name in members))
+        groups[run] = gname
+        print(f'{gname}:')
+        for _, name in members:
+            count = (cmd.count_states(name) if color_by != 'score'
+                     else len(cmd.get_object_list(name)))
+            print(f'  {name}: {count} poses')
+    if group:
+        cmd.group(group, ' '.join(groups.values()))
+    return {run: [name for _, name in members] for run, members in runs.items()}

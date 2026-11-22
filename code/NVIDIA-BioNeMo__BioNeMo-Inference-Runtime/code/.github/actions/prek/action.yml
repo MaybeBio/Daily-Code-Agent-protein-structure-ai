@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: Set up prek
+description: >
+  Install uv and restore prek's hook environments, so CI runs the lint group
+  locked for contributors.
+
+inputs:
+  cache:
+    description: >
+      Restore and save the hook environments. Worth it for a job that builds
+      every hook in prek.toml; for one that builds a single hook the round trip
+      costs about what the build does.
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/uv
+
+    # prek builds one environment per hook repo under its cache root. Keying on
+    # prek.toml means a bumped `rev` builds fresh environments instead of reusing
+    # the ones pinned to the old revision, and `restore-keys` then hands that
+    # build the environments for the hooks that did *not* move -- prek's cache is
+    # keyed per repo+rev on disk, so a partial restore is additive, never stale.
+    # Without it, editing one `exclude` line rebuilds all nine.
+    - uses: actions/cache@v6
+      if: inputs.cache == 'true'
+      with:
+        path: ~/.cache/prek
+        key: prek-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('uv.lock', 'prek.toml') }}
+        restore-keys: |
+          prek-${{ runner.os }}-${{ runner.arch }}-

@@ -1,0 +1,649 @@
+"""This module handles the weight factors and scaling.
+   An adaptive restraints weight factor calculator is implemented, whereby the
+   weight factor is doubled if a sufficiently large bond-RMSD is observed.
+   Conversely, if a sufficiently small bond-RMSD is observed, then the weight
+   factor is halved.
+"""
+from __future__ import division
+from __future__ import print_function
+from __future__ import absolute_import
+import random, time
+from cctbx import xray
+from libtbx import adopt_init_args
+from scitbx.array_family import flex
+import cctbx.maptbx.real_space_refinement_simple
+import scitbx.lbfgs
+from . import refine
+from cctbx import maptbx
+
+def mapper_is_active(mapper):
+  """True when mapper (None or an mmtbx.hydrogens.xh_mapper.mapper) maps."""
+  return mapper is not None and not mapper.is_identity
+
+def assert_same_sites(sites_cart, xray_structure):
+  """
+  Without an active mapper the nuclear sites are those of the xray
+  structure. They are taken from it, which keeps results bit-identical to
+  the code before the mapper (setting the same Cartesian sites again changes
+  the fractional ones by round-off); the given sites must agree with them.
+  """
+  if(sites_cart is None): return
+  assert sites_cart.size() == xray_structure.scatterers().size()
+  assert xray_structure.sites_cart().rms_difference(sites_cart) < 1.e-6
+
+def compute_weight(fmodel, restraints_manager, shake_sites=False, hdm=None,
+                   exclude_selection=None, sites_cart=None, mapper=None):
+  """
+  Data weight: ratio of the filtered norms of the restraint and the data
+  gradients. sites_cart are the nuclear sites, required with an active
+  mapper; without one they must agree with those of fmodel, which are used
+  (None: those of fmodel). Shaking applies to the nuclear sites. With an
+  active mapper the data gradient is computed at the shrunk sites and mapped
+  back to the nuclear sites; the restraints see the nuclear sites. fmodel is
+  not changed.
+  """
+  active = mapper_is_active(mapper)
+  assert sites_cart is not None or not active
+  if(shake_sites):
+    random.seed(1)
+    flex.set_random_seed(1)
+  fmodel_dc = fmodel.deep_copy()
+  xrs = fmodel_dc.xray_structure.deep_copy_scatterers()
+  if(active):
+    xrs.set_sites_cart(sites_cart)
+  else:
+    assert_same_sites(sites_cart, xrs)
+  if(shake_sites):
+    xrs.shake_sites_in_place(mean_distance=0.2)
+  sites_cart = xrs.sites_cart()
+  if(active):
+    xrs.set_sites_cart(mapper.shrink(sites_cart))
+  fmodel_dc.update_xray_structure(xray_structure=xrs, update_f_calc=True)
+  x_target_functor = fmodel_dc.target_functor()
+  tgx = x_target_functor(compute_gradients=True)
+  gx = flex.vec3_double(tgx.\
+    gradients_wrt_atomic_parameters(site=True).packed())
+  if(active):
+    gx = mapper.gradients(sites_cart, gx)
+
+  if hdm is not None:
+    sites_cart = hdm.shrink(array=sites_cart)
+  if exclude_selection is not None:
+    sites_cart = sites_cart.select(~exclude_selection)
+
+  tc, gc = restraints_manager.target_and_gradients(sites_cart=sites_cart)
+  # filter out large contributions
+  gx_d = flex.sqrt(gx.dot())
+  sel = gx_d>flex.mean(gx_d)*6
+  y = gx.select(~sel).norm()
+  #
+  gc_d = flex.sqrt(gc.dot())
+  sel = gc_d>flex.mean(gc_d)*6
+  x = gc.select(~sel).norm()
+  #
+  if(y != 0.0): data_weight = x/y
+  else:         data_weight = 1.0 # ad hoc default fallback
+  return data_weight
+
+# Largest atom shift (A) of the first trial step of every lbfgs
+# minimization; the later steps start at the BFGS unit step. The cap on
+# every step is refine.stpmax (scitbx.lbfgs max_shift).
+FIRST_STEP_MAX_SHIFT = 0.05
+
+class cctbx_geometry(object):
+  def __init__(self, model):
+    restraints_manager = model.get_restraints_manager()
+    self.hd_sel = model.get_xray_structure().hd_selection()
+    self.restraints_manager = restraints_manager.select(~self.hd_sel)
+    self._energies_sites=None
+
+  def _compute(self, sites_cart):
+    assert self.hd_sel.size() == sites_cart.size()
+    self._energies_sites = self.restraints_manager.geometry.energies_sites(
+      sites_cart        = sites_cart.select(~self.hd_sel),
+      compute_gradients = False)
+
+  def bond_rmsd(self, sites_cart):
+    self._compute(sites_cart=sites_cart) # XXX DUPLICATE CALCULATION
+    return self._energies_sites.bond_deviations()[2]
+
+  def angle_rmsd(self, sites_cart):
+    self._compute(sites_cart=sites_cart) # XXX DUPLICATE CALCULATION
+    return self._energies_sites.angle_deviations()[2]
+
+class sites_opt(object):
+  """
+  General calculator for model geometry optimization. For native CCTBX
+  restraints, restraints_manager and model.restraints_manager are the same
+  things.
+  However, restraints_manager can be an external entity, such as coming from
+  external packeges (eg., QM).
+  Ideally, and this is probably a TODO item for the future, any
+  restraints_manager should always be in the model.
+  dump_gradients is used for debugging.
+  """
+
+  def __init__(self,
+               model,
+               max_shift,
+               restraints_manager,
+               shift_eval,
+               convergence_threshold=1.e-3,
+               convergence_reached_times=3,
+               use_callback_after_step=False,
+               exclude_selection=None,
+               freeze_selection=None,
+               debug=False):
+    assert [exclude_selection, freeze_selection].count(None) != 0, "untested"
+    self.freeze_selection = freeze_selection
+    self.use_callback_after_step = use_callback_after_step
+    self.model = model
+    self.restraints_manager = restraints_manager
+    self.convergence_threshold = convergence_threshold
+    self.convergence_reached_times = convergence_reached_times
+    self.meet_convergence_criteria = 0
+    self.x = flex.double(self.model.size()*3, 0)
+    self.n = self.x.size()
+    self.f = None
+    self.g = None
+    self.f_start = None
+    self.max_shift_between_resets = 0
+    self.sites_cart = self.model.get_sites_cart()
+    self.sites_cart_start = self.sites_cart.deep_copy()
+    self.bound_flags = flex.int(self.n, 2)
+    self.lower_bound = flex.double([-1*max_shift]*self.n)
+    self.upper_bound = flex.double([   max_shift]*self.n)
+    self.shift_eval = shift_eval
+    assert self.shift_eval in ["max", "mean"]
+    if(self.shift_eval == "mean"): self.shift_eval_func = flex.mean
+    else:                          self.shift_eval_func = flex.max
+    self.total_time = 0
+    self.number_of_target_and_gradients_calls = 0
+    self.sites_plus_x = self.set_sites_plus_x()
+    self._converged = False
+    self.exclude_selection = exclude_selection
+    self.keep_selection = None
+    if self.exclude_selection is not None:
+      self.keep_selection = ~self.exclude_selection
+    self.all_gradients = []
+    self.all_targets   = flex.double()
+    self.debug = debug
+
+  def set_sites_plus_x(self):
+    self.sites_plus_x = self.sites_cart+flex.vec3_double(self.x)
+    return self.sites_plus_x
+
+  def callback_after_step(self, minimizer=None):
+    if not self.use_callback_after_step: return None
+    shift_from_start = flex.mean(flex.sqrt(
+      (self.sites_plus_x - self.sites_cart_start).dot()))
+    if shift_from_start >= self.convergence_threshold:
+      self._converged = True
+      return True
+    else: return False
+
+  def target_and_gradients(self):
+    self.number_of_target_and_gradients_calls+=1
+    t0=time.time()
+    self.set_sites_plus_x()
+    # Apply keep
+    if self.keep_selection is not None:
+      self.f, self.g = self.restraints_manager.target_and_gradients(
+        sites_cart = self.sites_plus_x.select(self.keep_selection))
+      g = flex.vec3_double(self.model.size())
+      g = g.set_selected(self.keep_selection, self.g)
+      self.g = g
+    else:
+      self.f, self.g = self.restraints_manager.target_and_gradients(
+        sites_cart = self.sites_plus_x)
+    # Apply freeze
+    if self.freeze_selection is not None:
+      self.g = self.g.set_selected(self.freeze_selection, [0,0,0])
+    if self.debug:
+      self.all_gradients.append(self.g)
+      self.all_targets  .append(self.f)
+    self.g = self.g.as_double()
+    if(self.f_start is None):
+      self.f_start = self.f
+    self.max_shift_between_resets = self.shift_eval_func(flex.sqrt((
+      self.sites_cart - self.sites_plus_x).dot()))
+    self.total_time += (time.time()-t0)
+    return self.f, self.g
+
+  def compute_functional_and_gradients(self):
+    return self.target_and_gradients()
+
+  def update(self, x):
+    self.x = x
+    self.target_and_gradients()
+
+  def target(self): return self.f
+
+  def gradients(self): return self.g
+
+  def apply_x(self):
+    self.f_start = self.f
+    self.model.set_sites_cart(
+      sites_cart = self.sites_cart+flex.vec3_double(self.x))
+    self.x = flex.double(self.model.size()*3, 0)
+    self.sites_cart = self.model.get_sites_cart()
+    if(self.max_shift_between_resets < self.convergence_threshold):
+      self.meet_convergence_criteria += 1
+      if(self.meet_convergence_criteria >= self.convergence_reached_times):
+        self._converged = True
+
+  def converged(self):
+    return self._converged
+
+  def __call__(self):
+    f, g = self.target_and_gradients()
+    return self.x, f, g
+
+class sites(object):
+  """
+  Reciprocal-space target and gradients with respect to the nuclear sites.
+
+  The calculator owns the nuclear sites (sites_cart, sites_plus_x);
+  fmodel.xray_structure always holds _for_fmodel(sites_plus_x), the sites
+  shrunk by the X-H mapper when it is active. With an active mapper the
+  nuclear sites are never read back from fmodel. Without one (mapper None
+  or identity) they are fmodel's sites at start and reset, as before the
+  mapper existed; given sites_cart must then agree with them.
+  """
+  def __init__(self,
+               fmodel,
+               geometry_rmsd_manager,
+               max_bond_rmsd,
+               max_shift,
+               sites_cart=None,
+               mapper=None,
+               hdm=None,
+               exclude_selection=None,
+               restraints_manager=None,
+               dump_gradients=None,
+               working_folder=None):
+    """
+    dump_gradients (debugging): file name prefix; the first
+    target_and_gradients call pickles the data, restraints and total
+    gradients into <working_folder>/<dump_gradients>_{dg,rg,g} and raises a
+    Sorry.
+    """
+    adopt_init_args(self, locals())
+    #
+    self._initialize(fmodel = self.fmodel, sites_cart = sites_cart)
+    #
+    self.f                = None
+    self.g                = None
+    self.f_start          = None
+    #
+    self.bound_flags  = flex.int(self.n, 2)
+    self.lower_bound  = flex.double([-1*max_shift]*self.n)
+    self.upper_bound  = flex.double([   max_shift]*self.n)
+    #
+    self.data_weight = 1.
+    self.restraints_weight_scale = 1.
+    self.restraints_weight = 1.
+    #
+    self.keep_selection = None
+    if self.exclude_selection is not None:
+      self.keep_selection = ~self.exclude_selection
+
+  def set_sites_plus_x(self):
+    self.sites_plus_x = self.sites_cart+flex.vec3_double(self.x)
+    return self.sites_plus_x
+
+  @property
+  def sites_cart_nuclear(self):
+    """Current nuclear sites."""
+    return self.sites_plus_x
+
+  def _for_fmodel(self, sites_cart):
+    """The sites fmodel sees for the nuclear sites sites_cart."""
+    if(mapper_is_active(self.mapper)):
+      return self.mapper.shrink(sites_cart)
+    return sites_cart
+
+  def _initialize(self, fmodel, sites_cart=None):
+    """
+    Use fmodel. With an active mapper sites_cart (required) are the nuclear
+    sites; those on special positions are symmetrized
+    (apply_symmetry_sites), the others used as given, and fmodel receives
+    _for_fmodel of them. Without one the nuclear sites are fmodel's after
+    apply_symmetry_sites; sites_cart, if given, must agree with fmodel's
+    before it.
+    """
+    active = mapper_is_active(self.mapper)
+    assert sites_cart is not None or not active
+    self.fmodel = fmodel
+    if(not active):
+      assert_same_sites(sites_cart, self.fmodel.xray_structure)
+    self.fmodel.xray_structure.tidy_us()
+    self.fmodel.xray_structure.apply_symmetry_sites()
+    if(active):
+      # Atoms on special positions are snapped back on them, as fmodel's
+      # sites are in the inactive branch; the others are kept as given (no
+      # Cartesian-fractional round-off).
+      xrs = self.fmodel.xray_structure.deep_copy_scatterers()
+      xrs.set_sites_cart(sites_cart)
+      xrs.apply_symmetry_sites()
+      special = xrs.site_symmetry_table().special_position_indices()
+      sites_cart = sites_cart.deep_copy()
+      sites_cart.set_selected(special, xrs.sites_cart().select(special))
+      self.fmodel.xray_structure.set_sites_cart(
+        sites_cart = self._for_fmodel(sites_cart))
+    else:
+      sites_cart = self.fmodel.xray_structure.sites_cart()
+    self.fmodel.update_xray_structure(update_f_calc = True)
+    self.fmodel.xray_structure.scatterers().flags_set_grads(state=False)
+    xray.set_scatterer_grad_flags(
+      scatterers = self.fmodel.xray_structure.scatterers(),
+      site       = True)
+    self.sites_cart       = sites_cart
+    self.sites_cart_start = self.sites_cart.deep_copy()
+    self.x                = flex.double(self.sites_cart.size()*3, 0)
+    self.sites_plus_x     = self.set_sites_plus_x()
+    self.n                = self.x.size()
+    self.x_target_functor = self.fmodel.target_functor()
+    self.n_tg_calls       = 0
+
+  def reset_fmodel(self, fmodel, sites_cart=None):
+    """
+    Use the new fmodel. sites_cart are the nuclear sites; None keeps the
+    current ones when the mapper is active (fmodel must then hold
+    _for_fmodel of them, rms difference < 1e-6) and, without an active
+    mapper, takes those of fmodel as before (see _initialize).
+    """
+    if(sites_cart is None and mapper_is_active(self.mapper)):
+      sites_cart = self.sites_cart_nuclear.deep_copy()
+      assert fmodel.xray_structure.sites_cart().rms_difference(
+        self._for_fmodel(sites_cart)) < 1.e-6
+    self._initialize(fmodel=fmodel, sites_cart=sites_cart)
+
+  def set_sites(self, sites_cart):
+    """
+    Set the nuclear sites sites_cart as the start point (x = 0) and give
+    fmodel _for_fmodel of them, with f_calc updated.
+    """
+    self.sites_cart       = sites_cart.deep_copy()
+    self.x                = flex.double(self.sites_cart.size()*3, 0)
+    self.set_sites_plus_x()
+    self.fmodel.xray_structure.set_sites_cart(
+      sites_cart = self._for_fmodel(self.sites_plus_x))
+    self.fmodel.update_xray_structure(
+      xray_structure = self.fmodel.xray_structure,
+      update_f_calc  = True)
+
+  def setw(self,
+           data_weight = None,
+           restraints_weight_scale = None,
+           restraints_weight = None):
+    if(data_weight is not None):
+      self.data_weight = data_weight
+    if(restraints_weight_scale is not None):
+      self.restraints_weight_scale = restraints_weight_scale
+    if(restraints_weight is not None):
+      self.restraints_weight = restraints_weight
+
+  def scale_restraints_weight_down(self, scale=2):
+    self.setw(restraints_weight_scale = self.restraints_weight_scale/scale)
+
+  def scale_restraints_weight_up(self, scale=2):
+    self.setw(restraints_weight_scale = self.restraints_weight_scale*scale)
+
+  def update(self, x):
+    self.x = flex.vec3_double(x)
+    self.set_sites_plus_x()
+    self.fmodel.xray_structure.set_sites_cart(
+      sites_cart = self._for_fmodel(self.sites_plus_x))
+    self.fmodel.update_xray_structure(
+      xray_structure = self.fmodel.xray_structure,
+      update_f_calc  = True)
+    self.target_and_gradients(x=x)
+    self.sites_cart_start = self.sites_plus_x.deep_copy()
+
+  def converged(self):
+    return False
+
+  def target(self): return self.f
+
+  def gradients(self): return self.g
+
+  def apply_x(self):
+    self.update(x = self.x)
+
+  def target_and_gradients(self, x):
+    self.n_tg_calls+=1
+
+    XG = self.sites_plus_x
+    if self.hdm is not None:
+      XG = self.hdm.shrink(array=XG)
+    if self.keep_selection is not None:
+      XG = XG.select(self.keep_selection)
+
+    rt, rg = self.restraints_manager.target_and_gradients(sites_cart = XG)
+
+    if self.hdm is not None:
+      rg = self.hdm.expand(g_short = rg)
+
+    tgx = self.x_target_functor(compute_gradients=True)
+    dt = tgx.target_work()
+    dg = flex.vec3_double(tgx.\
+      gradients_wrt_atomic_parameters(site=True).packed())
+    # Map to the nuclear sites before any selection or averaging.
+    if mapper_is_active(self.mapper):
+      dg = self.mapper.gradients(self.sites_plus_x, dg)
+
+    if self.keep_selection is not None:
+      dg = dg.set_selected(self.exclude_selection, [0,0,0])
+      tmp = flex.vec3_double(dg.size(), [0,0,0])
+      rg = tmp.set_selected(self.keep_selection, rg)
+
+    if self.hdm is not None:
+      dg = self.hdm.average(array = dg)
+
+    t = dt*self.data_weight + \
+      self.restraints_weight*rt*self.restraints_weight_scale
+    g = dg*self.data_weight + \
+      self.restraints_weight*rg*self.restraints_weight_scale
+
+    if(self.dump_gradients is not None):
+      from libtbx import easy_pickle
+      from libtbx.utils import Sorry
+      import os
+      if(self.working_folder is None):
+        raise Sorry("dump_gradients needs a working folder")
+      os.makedirs(self.working_folder, exist_ok=True)
+      path = os.path.join(self.working_folder, self.dump_gradients)
+      easy_pickle.dump(path+"_dg", dg.as_double())
+      easy_pickle.dump(path+"_rg", rg.as_double())
+      easy_pickle.dump(path+"_g", g.as_double())
+      raise Sorry(
+        "dump_gradients: gradients dumped to %s_{dg,rg,g}, stopping." % path)
+    self.f = t
+    self.g = g.as_double()
+    return self.f, self.g
+
+class sites_real_space(object):
+  def __init__(self,
+               model,
+               geometry_rmsd_manager,
+               max_bond_rmsd,
+               stpmax,
+               gradient_only,
+               line_search,
+               data_weight,
+               refine_cycles,
+               number_of_weight_search_cycles,
+               log,
+               map_data=None,
+               restraints_manager=None,
+               max_iterations=None):
+    adopt_init_args(self, locals())
+    self.gradient_only = True
+    self.max_iterations = 100
+    self.weight = data_weight
+    self.sites_cart_start = self.model.get_xray_structure().sites_cart()
+    self.show(model=self.model, weight = data_weight)
+    #
+    self.rama_fav_best = None
+    self.cbeta_best    = None
+    self.rota_best     = None
+    self.clash_best    = None
+    #
+    if(self.weight is None):
+      self.weight = 1.
+    self.refine_cycles = refine_cycles
+    self.lbfgs_termination_params = scitbx.lbfgs.termination_parameters(
+      max_iterations = self.max_iterations)
+    self.lbfgs_core_params = scitbx.lbfgs.core_parameters(
+      max_shift            = stpmax,
+      first_step_max_shift = FIRST_STEP_MAX_SHIFT)
+    self.lbfgs_exception_handling_params = scitbx.lbfgs.\
+      exception_handling_parameters(
+        ignore_line_search_failed_step_at_lower_bound = False,
+        ignore_line_search_failed_step_at_upper_bound = False,
+        ignore_line_search_failed_maxfev              = False)
+    self.sites_cart_refined = None
+    self.final_weight = None # the weight of the refinement cycles
+
+  def get_shift(self, other):
+    s1 = self.sites_cart_start
+    s2 = other.sites_cart()
+    return flex.mean(flex.sqrt((s1 - s2).dot()))
+
+  def geometry_is_good(self, stats):
+    b, a = stats.bond().mean, stats.angle().mean
+    return b <= self.max_bond_rmsd and a <= 1.7
+
+  def macro_cycle(self, weight):
+    def stalled(x):
+      for it in x:
+        if x.count(it) > 3:
+          return True
+      return False
+    up   = 0
+    down = 0
+    slow_down = 0
+    previous_good = None
+    bond_rmsds = []
+    cntr = 0
+    sites_cart_start = self.model.get_sites_cart().deep_copy()
+    while True: # Termination at the bottom of the loop
+      self.model.set_sites_cart(sites_cart = sites_cart_start.deep_copy())
+      print("cycle:", cntr, file=self.log)
+      cntr+=1
+      self.show(model = self.model, weight = weight, prefix="  start:")
+      model = self.run_one(weight = weight)
+      stats = self.show(model = model, weight = weight, prefix="  final:")
+      b = stats.bond().mean
+      bond_rmsds.append(round(b,3))
+      if(stalled(bond_rmsds)):
+        print("<<<<< weight optimization stalled: quitting >>>>>", file=self.log)
+        break
+      if(self.geometry_is_good(stats)):
+        up += 1
+        previous_good = weight
+        if(b<0.03 or stalled(bond_rmsds)): weight = weight*2
+        else:
+          weight = weight + 0.3*weight
+        self.model.set_sites_cart(sites_cart = model.get_sites_cart())
+        sites_cart_start = self.model.get_sites_cart().deep_copy()
+      else:
+        down += 1
+        if(b>0.03):
+          weight = weight/2
+        else:
+          slow_down += 1
+          if(slow_down<3):
+            weight = weight - 0.3*weight
+          else:
+            weight = weight/2
+            slow_down = 0
+      if(up>0 and down>0):
+        print("<<<<< weight optimization oscillates: quitting >>>>>", file=self.log)
+        break
+      if cntr > self.number_of_weight_search_cycles:
+        print("number_of_weight_search_cycles exceeded, stopping now", file=self.log)
+        break
+    ####
+    print(file=self.log)
+    if(previous_good is None):
+      print("Using last weight to continue:", weight, file=self.log)
+      previous_good = weight
+    self.final_weight = previous_good
+    ####
+    for it in range(self.refine_cycles):
+      self.show(model = self.model, weight = previous_good, prefix="  start:")
+      model = self.run_one(weight = previous_good)
+      self.show(model = model, weight = previous_good, prefix="  final:")
+      self.model.set_sites_cart(sites_cart = model.get_sites_cart())
+
+  def show(self, model, weight, prefix=""):
+    stats = model.geometry_statistics(use_hydrogens=False)
+    s = stats.show_short()
+    s = s.split()
+    s = " ".join(s)
+    dist = self.get_shift(other=model.get_xray_structure())
+    if(weight is not None): w = "%8.4f"%weight
+    else:                   w = "%5s"%str(None)
+    cc_mask = refine.show_cc(
+      map_data=self.map_data, xray_structure=model.get_xray_structure())
+    print(prefix, "weight=%s"%w, s, "shift=%6.4f"%dist, \
+      "cc_mask=%6.4f"%cc_mask, file=self.log)
+    return stats
+
+  def get_weight(self):
+    o = maptbx.target_and_gradients_simple(
+      unit_cell     = self.model.crystal_symmetry().unit_cell(),
+      map_target    = self.map_data,
+      sites_cart    = self.model.get_sites_cart(),
+      selection     = flex.bool(self.model.size(), True),
+      interpolation = "tricubic"
+      )
+    hd_sel = self.model.get_xray_structure().hd_selection()
+    g_map = o.gradients().select(~hd_sel)
+    _, g_geo = self.restraints_manager.target_and_gradients(
+      sites_cart = self.model.get_sites_cart())
+    g_geo = g_geo.select(~hd_sel)
+    #
+    g_map_d = flex.sqrt(g_map.dot())
+    sel = g_map_d>flex.mean(g_map_d)*3
+    y = g_map.select(~sel).norm()
+    #-
+    g_geo_d = flex.sqrt(g_geo.dot())
+    sel = g_geo_d>flex.mean(g_geo_d)*3
+    x = g_geo.select(~sel).norm()
+    #
+    if(y != 0.0): return x/y
+    else:         return 1.0 # ad hoc default fallback
+
+  def run(self):
+    if self.weight is None:
+      self.weight = self.get_weight()
+      print("Initial weight estimate from ratio of grad norms:", self.weight, file=self.log)
+    else:
+      print(f"Initial weight by user input: {self.weight}", file=self.log)
+    self.macro_cycle(weight = self.weight)
+    return self.model
+
+  def run_one(self, weight):
+    model = self.model.deep_copy()
+    xrs = model.get_xray_structure()
+    uc = xrs.crystal_symmetry().unit_cell()
+    not_hd_sel = ~model.selection(string = "element H or element D")
+    refined = cctbx.maptbx.real_space_refinement_simple.lbfgs(
+      unit_cell                       = uc,
+      gradients_method                = "tricubic",
+      sites_cart                      = xrs.sites_cart(),
+      density_map                     = self.map_data,
+      geometry_restraints_manager     = self.restraints_manager,
+      selection_variable_real_space   = not_hd_sel,
+      real_space_target_weight        = weight,
+      real_space_gradients_delta      = 0.25,
+      gradient_only                   = self.gradient_only,
+      line_search                     = self.line_search,
+      lbfgs_core_params               = self.lbfgs_core_params,
+      lbfgs_termination_params        = self.lbfgs_termination_params,
+      lbfgs_exception_handling_params = self.lbfgs_exception_handling_params)
+    model.set_sites_cart(sites_cart=refined.sites_cart)
+    return model

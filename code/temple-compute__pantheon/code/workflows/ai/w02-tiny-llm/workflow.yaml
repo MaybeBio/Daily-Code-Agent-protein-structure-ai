@@ -1,0 +1,328 @@
+kind: horus_workflow
+name: Tiny LLM From Scratch - TinyStories Pretrain and Sample
+
+_executor: &executor
+  kind: conda_python_environment
+  environment_dir: "../../.horus_conda_env" # one env per run, shared by all tasks
+  conda: micromamba
+  environment_file: conda_env.yaml
+
+_shell: &shell
+  kind: shell
+
+artifacts:
+  - &config_scale
+    id: config_scale
+    name: Model and training scale
+    description: >-
+      Config set of the training repo for the model and pretraining. Smoke is a
+      2-block model trained for 20 steps on CPU (minutes); full is the repo's
+      24-block, 50k-step setup (days on one GPU).
+    kind: choice
+    path: params/config_scale.txt
+    value: configs/smoke
+    options:
+      - {value: configs/smoke, label: "Smoke (tiny model, minutes)"}
+      - {value: configs, label: "Full (24 blocks, 50k steps)"}
+  - id: pretrain_steps
+    name: Pretraining steps
+    description: Optimizer steps for pretraining; 0 keeps the config's value (smoke 20).
+    kind: number
+    path: params/pretrain_steps.txt
+    value: 0
+    min: 0
+    max: 200000
+    step: 10
+  - id: train_docs
+    name: Training stories
+    description: TinyStories training documents to tokenize (the full split has ~2.1M).
+    kind: number
+    path: params/train_docs.txt
+    value: 20000
+    min: 1000
+    max: 2200000
+    step: 1000
+  - id: val_docs
+    name: Validation stories
+    description: TinyStories validation documents to tokenize (the full split has ~22k).
+    kind: number
+    path: params/val_docs.txt
+    value: 2000
+    min: 100
+    max: 22000
+    step: 100
+  - id: prompt
+    name: Story prompt
+    description: Opening the trained model continues in the sample.
+    kind: string
+    path: params/prompt.txt
+    value: "Once upon a time,"
+    max_length: 500
+  - id: max_new_tokens
+    name: Sample length (tokens)
+    description: Tokens to generate for the sample story.
+    kind: number
+    path: params/max_new_tokens.txt
+    value: 200
+    min: 8
+    max: 1024
+    step: 8
+
+tasks:
+  - kind: horus_task
+    id: clone_repo
+    name: Clone train-llm-from-scratch
+    description: Shallow-clones the training repo so its scripts/src modules are on disk.
+    outputs:
+      - id: repo_dir
+        name: Repository checkout
+        kind: folder
+        path: repo
+    executor: *shell
+    runtime:
+      kind: command
+      # Pinned commit so a rerun trains the same code.
+      command: >-
+        git clone -q --filter=blob:none
+        https://github.com/FareedKhan-dev/train-llm-from-scratch.git $repo_dir &&
+        git -C $repo_dir checkout -q bdd480a518094ca834e05ab32131dc126b522d3d
+    target:
+      kind: local
+
+  - kind: horus_task
+    id: prepare_tinystories_train
+    name: Prepare TinyStories train split
+    description: >-
+      Downloads TinyStories from Hugging Face and batch-tokenizes it into a
+      flat-token HDF5, capped to a small doc count for a fast tiny run.
+    inputs:
+      - id: repo_dir
+        name: Repository checkout
+        kind: folder
+        path: repo
+      - id: train_docs
+        name: Training stories
+        kind: number
+        path: params/train_docs.txt
+    outputs:
+      - id: tinystories_train_h5
+        name: TinyStories train tokens
+        kind: file
+        path: data/tinystories_train.h5
+    executor: *executor
+    resources:
+      cpus: 4
+      memory_gb: 16
+      walltime: "04:00:00"
+    runtime:
+      kind: python_script
+      script: scripts/prepare_tinystories.py
+      args: >-
+        --split train --max_docs ${train_docs} --out $tinystories_train_h5
+    target:
+      kind: local
+
+  - kind: horus_task
+    id: prepare_tinystories_val
+    name: Prepare TinyStories validation split
+    description: >-
+      Downloads the TinyStories validation split and batch-tokenizes it into a
+      flat-token HDF5, capped to a small doc count for a fast tiny run.
+    inputs:
+      - id: repo_dir
+        name: Repository checkout
+        kind: folder
+        path: repo
+      - id: val_docs
+        name: Validation stories
+        kind: number
+        path: params/val_docs.txt
+    outputs:
+      - id: tinystories_val_h5
+        name: TinyStories validation tokens
+        kind: file
+        path: data/tinystories_val.h5
+    executor: *executor
+    resources:
+      cpus: 2
+      memory_gb: 8
+      walltime: "01:00:00"
+    runtime:
+      kind: python_script
+      script: scripts/prepare_tinystories.py
+      args: >-
+        --split validation --max_docs ${val_docs} --out $tinystories_val_h5
+    target:
+      kind: local
+
+  - kind: horus_task
+    id: train_pretrain_tiny
+    name: Pretrain tiny model on TinyStories
+    description: >-
+      Trains the from-scratch decoder-only Transformer on tokenized TinyStories,
+      at the scale chosen by config_scale.
+    inputs:
+      - id: repo_dir
+        name: Repository checkout
+        kind: folder
+        path: repo
+      - id: tinystories_train_h5
+        name: TinyStories train tokens
+        kind: file
+        path: data/tinystories_train.h5
+      - id: tinystories_val_h5
+        name: TinyStories validation tokens
+        kind: file
+        path: data/tinystories_val.h5
+      - *config_scale
+      - id: pretrain_steps
+        name: Pretraining steps
+        kind: number
+        path: params/pretrain_steps.txt
+    outputs:
+      - id: pretrained_ckpt
+        name: Pretrained tiny checkpoint
+        kind: file
+        path: ckpts/tinystories_pretrained.pt
+      - id: pretrain_log
+        name: Pretraining metrics log
+        kind: file
+        path: logs/pretrain.jsonl
+    resources:
+      cpus: 4
+      gpus: 1
+      memory_gb: 16
+      walltime: "24:00:00"
+    executor: *executor
+    runtime:
+      kind: command
+      command: >-
+        PYTHONPATH=${repo_dir} python ${repo_dir}/scripts/pretrain_base.py
+        --config ${repo_dir}/${config_scale}/pretrain.json
+        --train_path $tinystories_train_h5
+        --dev_path $tinystories_val_h5
+        --out_ckpt $pretrained_ckpt
+        --ckpt_dir ckpts
+        --log_dir logs
+        $$([ ${config_scale} = configs ] && echo --batch_size 2 --grad_accum 48)
+        $$([ ${pretrain_steps} -gt 0 ] && echo --train_steps ${pretrain_steps}
+        --warmup_steps $$(( ${pretrain_steps} / 20 + 1 ))) &&
+        cp "$$(ls -t logs/pretrain_*.jsonl | head -1)" ${pretrain_log}
+    target:
+      kind: local
+
+  - kind: horus_task
+    id: sample_story
+    name: Sample a story from the pretrained model
+    description: >-
+      Runs raw (non-chat) greedy generation from the pretrained checkpoint to
+      spot-check that it learned to continue a story prompt.
+    inputs:
+      - id: repo_dir
+        name: Repository checkout
+        kind: folder
+        path: repo
+      - id: pretrained_ckpt
+        name: Pretrained tiny checkpoint
+        kind: file
+        path: ckpts/tinystories_pretrained.pt
+      - id: prompt
+        name: Story prompt
+        kind: string
+        path: params/prompt.txt
+      - id: max_new_tokens
+        name: Sample length (tokens)
+        kind: number
+        path: params/max_new_tokens.txt
+    outputs:
+      - id: sample_story_txt
+        name: Sample generated story
+        kind: file
+        path: samples/tinystories_sample.txt
+    resources:
+      cpus: 2
+      memory_gb: 8
+      walltime: "00:30:00"
+    executor: *executor
+    runtime:
+      kind: command
+      command: >-
+        PYTHONPATH=${repo_dir} python ${repo_dir}/scripts/chat.py
+        --ckpt $pretrained_ckpt
+        --raw
+        --greedy
+        --prompt "$$(cat ${prompt.path})"
+        --max_new_tokens ${max_new_tokens}
+        > $sample_story_txt
+    target:
+      kind: local
+
+edges:
+  - source: clone_repo
+    source_output: repo_dir
+    target: prepare_tinystories_train
+    target_input: repo_dir
+
+  - source: clone_repo
+    source_output: repo_dir
+    target: prepare_tinystories_val
+    target_input: repo_dir
+
+  - source: clone_repo
+    source_output: repo_dir
+    target: train_pretrain_tiny
+    target_input: repo_dir
+
+  - source: prepare_tinystories_train
+    source_output: tinystories_train_h5
+    target: train_pretrain_tiny
+    target_input: tinystories_train_h5
+
+  - source: prepare_tinystories_val
+    source_output: tinystories_val_h5
+    target: train_pretrain_tiny
+    target_input: tinystories_val_h5
+
+  - source: clone_repo
+    source_output: repo_dir
+    target: sample_story
+    target_input: repo_dir
+
+  - source: train_pretrain_tiny
+    source_output: pretrained_ckpt
+    target: sample_story
+    target_input: pretrained_ckpt
+
+  - source: artifact-train_docs
+    source_output: train_docs
+    target: prepare_tinystories_train
+    target_input: train_docs
+
+  - source: artifact-val_docs
+    source_output: val_docs
+    target: prepare_tinystories_val
+    target_input: val_docs
+
+  - source: artifact-config_scale
+    source_output: config_scale
+    target: train_pretrain_tiny
+    target_input: config_scale
+
+  - source: artifact-pretrain_steps
+    source_output: pretrain_steps
+    target: train_pretrain_tiny
+    target_input: pretrain_steps
+
+  - source: artifact-prompt
+    source_output: prompt
+    target: sample_story
+    target_input: prompt
+
+  - source: artifact-max_new_tokens
+    source_output: max_new_tokens
+    target: sample_story
+    target_input: max_new_tokens
+
+orchestrator_target:
+  kind: local
+  working_directory: "./workflow_results"

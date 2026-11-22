@@ -1,0 +1,32 @@
+name: Lint
+
+# There are no unit tests yet. The FiuMD checks used for the paper are the
+# drivers in paper/benchmark/, which need a GPU and the downloaded inputs.
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Lint with flake8
+        run: |
+          pip install flake8
+          # stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Byte-compile
+        run: python -m compileall -q fiumd paper examples
+
+      - name: Build package
+        run: |
+          pip install build
+          python -m build --sdist

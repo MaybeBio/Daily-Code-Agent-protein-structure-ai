@@ -1,0 +1,111 @@
+base: df3-stage0-r16.yaml
+
+# r18 — no triangle attention, plain AF3 TriangleMul. From scratch.
+# Design note + measurements: export/mhr-trimul/README.md
+#
+# This is the baseline r17 should have had. r17 changed two things at once —
+# triangle attention deleted AND TriangleMul -> MHR-TriMul — so every r17-vs-r16
+# number is charged to the pair of them. §9 argued for splitting the arm; it was
+# combined anyway, and r18 is the cost of that.
+#
+# One run, two answers:
+#
+#   vs r16  →  what deleting triangle attention costs, on its own.
+#   vs r17  →  what MHR-TriMul is worth, on its own.
+#
+# The first is the headline. r17 matches r16 across every scored category at
+# step 8000 (all inside 1 SE) while its trunk infers 1.58x faster at N>=768 and
+# carries 431M parameters against 465M. "Triangle attention is removable" is the
+# result worth having, and right now it rests on a confounded arm.
+#
+# ── Why this and not the MHR variants ────────────────────────────────────────
+#
+# The original r18 (head_rms, warm-started from r17) is withdrawn. It carried
+# per-head normalization, which §14 shows is the wrong axis, and it warm-started
+# across a pair-track normalization change, which is what §12's incident was.
+#
+# The evidence on the router has kept shrinking, and none of it is about speed —
+# the head axis is a channel partition, so MHR saves no FLOPs at all:
+#
+#   * It provably carries no pair information `out_gate` does not already have.
+#     Both read the same LN(z); W_og is 256x256 and invertible, so W_r is a
+#     linear function of it. The numerical escape is closed too: only 2-3% of
+#     W_r's energy sits in W_og's weakest 10% of directions, against 10% for a
+#     random W_r (§13).
+#   * Over half of what the top-layer routers condition on is distance the pair
+#     representation already encodes — 53-57% at L43-47 (§13).
+#   * Its strongest single factor, chain, is `asym_id`: an input feature. The
+#     intra/inter separation is identical on antibody-antigen targets r17 docks
+#     and targets it misses by 11-13 Å (§15).
+#   * Sharpening inflates the branch. `sum_h g = H` pins the mean of g, not its
+#     norm, so what reaches out_proj grew to 2.26x uniform in the deep trunk by
+#     step 8000 (§14).
+#
+# The router is not inert — specialization rises monotonically all through
+# training — but nothing yet shows it is worth its slot. The burden belongs on
+# MHR, and this run is the cheapest way to put it there.
+#
+# `head_norm: post_channel` (normalize after the gate, added in bb262b5) fixes
+# the inflation and would let `router_kind: sigmoid` work. It is deliberately
+# NOT r18: fixing a defect in a component whose value is unestablished is the
+# wrong order, and the defect has no demonstrated quality cost — out_gate has
+# been absorbing it and r17 still tracks r16. If r18 shows MHR earns something,
+# post_channel + sigmoid is r19. If r18 ties r17, MHR is dead weight and the
+# question closes.
+#
+# ── What this cell is ────────────────────────────────────────────────────────
+#
+# trimul_num_heads: 0 turns the MHR path off entirely (`is_mhr` is False), so
+# the module is AF3 TriangleMul exactly — and it gets the fused center-proj
+# kernel back, which the MHR path cannot use. So this is also the fastest cell
+# in the grid, and its step time is a real data point rather than a handicap.
+#
+# From scratch. Not warm-startable from r17 (the router weights do not exist
+# here and the normalization differs) and not from r16 (r16 has the triangle
+# attention blocks). Depth 48 and crop 384 held at r16's values, lr at r17's, so
+# the only difference from r17 is the pair-track composition.
+#
+# Read at both iso-step and iso-wall-clock. r18 should be faster per step than
+# both r16 (no triangle attention) and r17 (no MHR path, fusion restored), so
+# iso-step alone understates it.
+#
+# ── Remaining grid cells, no config file needed ──────────────────────────────
+# Pass through EXTRA_ARGS so the trainjob YAML is never edited:
+#
+#   router only, AF3 normalization (isolates the router against this baseline):
+#     --config configs/df3-stage0-r17.yaml \
+#     --override model.evoformer.trimul_head_norm=channel \
+#     --override model.pairformer.trimul_head_norm=channel
+#
+#   post-gate normalization + independent heads (r19 if r18 says MHR earns it):
+#     --config configs/df3-stage0-r17.yaml \
+#     --override model.evoformer.trimul_head_norm=post_channel \
+#     --override model.pairformer.trimul_head_norm=post_channel \
+#     --override model.evoformer.trimul_router_kind=sigmoid \
+#     --override model.pairformer.trimul_router_kind=sigmoid
+#
+# ── What to read ─────────────────────────────────────────────────────────────
+#
+# `eval/distogram` split against `eval/distogram_entropy`: r17's deficit against
+# r16 was 100% sharpness and 0% calibration (§11). If r18 shows the same split,
+# it belongs to deleting triangle attention — summing over every k instead of
+# selecting a few costs entropy, not correctness — and MHR had nothing to do
+# with it. If r18's distogram is clean and r17's is not, MHR is the cause.
+#
+# Do NOT re-run the strand/helix ratio as a discriminator. It converged at step
+# 4000 and now reads the same in r16 and r17; §10 records why it looked like an
+# architectural signature and was not.
+
+training:
+  wandb_project: deepfold3-v2
+  # r17's value, kept so the pair-track composition is the only difference.
+  lr: 0.9e-3
+
+model:
+  evoformer:
+    use_triangle_attention: false
+    trimul_num_heads: 0 # 0 = MHR off = AF3 TriangleMul, fused path available
+
+  pairformer:
+    use_triangle_attention: false
+    trimul_num_heads: 0

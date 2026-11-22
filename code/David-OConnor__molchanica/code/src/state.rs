@@ -1,0 +1,1394 @@
+//! Contains the most important application state structs.
+
+use std::{
+    collections::{HashMap, HashSet},
+    env, fmt,
+    fmt::{Display, Formatter},
+    path::PathBuf,
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
+    time::Instant,
+};
+
+#[cfg(feature = "adme")]
+use adme::{DatasetTdc, infer::Infer};
+use bincode::{Decode, Encode};
+use bio_apis::amber_geostd::GeostdItem;
+use bio_files::{ResidueType, md_params::ForceFieldParams, mol_templates::TemplateData};
+use chrono::{DateTime, Utc};
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaFunction;
+use dynamics::{
+    ComputationDevice, Integrator, LANGEVIN_GAMMA_DEFAULT, MdConfig, PRESSURE_DEFAULT, SimBoxInit,
+    TAU_PRESSURE_DEFAULT, TAU_TEMP_DEFAULT, params::FfParamSet,
+};
+use egui::{FontId, Galley, Pos2};
+use graphics::{Camera, ControlScheme, GraphicsSettings, InputsCommanded, event::Modifiers};
+use lin_alg::f32::{Quaternion, Vec3};
+use mol_defs::{
+    molecules::{
+        MolGenericRef, MolGenericRefMut, MolType,
+        amino_acid::AminoAcidTemplates,
+        lipid::{LipidShape, MoleculeLipid},
+        nucleic_acid::{MoleculeNucleicAcid, NucleicAcidType, Strands},
+        peptide::MoleculePeptide,
+        pocket::Pocket,
+        small::MoleculeSmall,
+    },
+    screening::pharmacophore::{PharmacophoreFeatType, PharmacophoreState},
+    sfc_mesh::MeshColoring,
+};
+use na_seq::{AaIdent, AminoAcid, Sequence};
+
+use crate::{
+    drawing::MoleculeView,
+    external_tools::data_root,
+    file_io::FileDialogs,
+    md::{MdStateLocal, trajectory::Trajectory},
+    mol_alignment::StateAlignment,
+    mol_db::ParquetMolDb,
+    mol_editor::MolEditorState,
+    mol_manip::MolManip,
+    nucleic_acid_creation::ResidueGrouping,
+    peptide_creation::PeptideGeometry,
+    peptide_ligands::LigAttachUi,
+    prefs::{DepthMode, OpenType, ToSave},
+    selection::{Selection, ViewSelLevel},
+    threads::ThreadReceivers,
+    ui::popup::{
+        external_tools::ExternalToolsUi, ff_params::FfParamsUi, protein_design::ProteinDesignUi,
+        tool_runner::ToolWindows,
+    },
+};
+
+pub struct ComputationResources {
+    pub device: ComputationDevice,
+    #[cfg(feature = "cuda")]
+    pub kernel_reflections: Option<CudaFunction>,
+}
+
+pub struct State {
+    pub publication: crate::publication::Publication,
+    pub ui: StateUi,
+    pub volatile: StateVolatile,
+    pub peptides: Vec<MoleculePeptide>,
+    pub ligands: Vec<MoleculeSmall>,
+    pub nucleic_acids: Vec<MoleculeNucleicAcid>,
+    pub lipids: Vec<MoleculeLipid>,
+    // We are, for now at least, deprecating standalone Pharmacophores in state, in favor
+    // of their small-molecule-based state approach.
+    // pub pharmacophores: Vec<Pharmacophore>,
+    pub pockets: Vec<Pocket>,
+    pub sequences: Vec<Sequence>,
+    pub trajectories: Vec<Trajectory>,
+    pub cam_snapshots: Vec<CamSnapshot>,
+    /// This allows us to keep in-memory data for other molecules.
+    pub to_save: ToSave,
+    /// Initialized on first computation.
+    pub computation: OnceLock<ComputationResources>,
+    /// Amber templates and GAFF2 data used for structural preparation and
+    /// Amber-trained analysis. The selected display/MD family is separate.
+    pub ff_param_set: FfParamSet,
+    pub force_fields: crate::force_fields::ForceFields,
+    pub mol_specific_params: HashMap<String, ForceFieldParams>,
+    pub templates: Templates,
+    pub mol_editor: MolEditorState,
+    /// For pharmacophore-based screening
+    /// todo: Pharmacophore state
+    pub pharmacophore: PharmacophoreState,
+    pub graphics_settings: GraphicsSettings,
+    /// A curated set of common small molecules embedded in the binary and loaded on demand when
+    /// the database popup first opens. Read-only; unlike `StateVolatile::parquet_dbs`, it can't be
+    /// added to or deleted from. `None` before loading, if this build has no database embedded, or
+    /// if it failed to load.
+    ///
+    /// We use [HMDB (Human Metabolome Database)](hmdb.ca/downloads) for this; it's provided as a single
+    /// SDF ("Metabolite Structures"), and an archive of data in XML format; we use both.
+    /// This isn't source controlled. To build it, download these directly. Create a DB in
+    /// the GUI. Add this molecule to the DB. Name/rename the file `hmdb_mol_db.parquet`.
+    /// Note: We also run `python scripts/populate_hmdb_cids.py ~/Desktop` etc to copy the PubChem
+    /// CIDs and ChEBI, DrugBank and KEGG accessions from the XML into the SDF prior to loading.
+    /// Requires you to have the .sdf and the associated XML in the selected directory.
+    pub hmdb_mol_db: Option<ParquetMolDb>,
+    /// [Chebi SDF files](https://ftp.ebi.ac.uk/pub/databases/chebi/SDF/)
+    /// Download `chebi_3_stars.sdf.gz`. (3 stars implies they are vetted, I believe). Don't
+    /// use the Lite version; we need the additional metadata fields e.g. PubChem CID that aren't
+    /// in it. Like with the built-in HMDB database, load it using the GUI. (No pre-processing required, unlike
+    /// HMDB)
+    pub chebi_mol_db: Option<ParquetMolDb>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        // Many other UI defaults are loaded after the initial prefs load in `main`.
+        let ui = StateUi {
+            nearby_dist_thresh: 15,
+            density_iso_level: 1.8,
+            mol_view_peptide: MoleculeView::default(),
+            mol_view: MoleculeView::DEFAULT_NON_PEPTIDE,
+            ..Default::default()
+        };
+
+        Self {
+            ui,
+            publication: Default::default(),
+            volatile: StateVolatile::new(),
+            peptides: Default::default(),
+            ligands: Default::default(),
+            nucleic_acids: Default::default(),
+            lipids: Default::default(),
+            pockets: Default::default(),
+            sequences: Default::default(),
+            trajectories: Default::default(),
+            cam_snapshots: Default::default(),
+            to_save: Default::default(),
+            computation: Default::default(),
+            ff_param_set: Default::default(),
+            force_fields: Default::default(),
+            mol_specific_params: Default::default(),
+            templates: Default::default(),
+            mol_editor: Default::default(),
+            pharmacophore: Default::default(),
+            // The defaults live in `prefs::Graphics`; `load_prefs` then replaces this wholesale
+            // with whatever the user last saved.
+            graphics_settings: crate::prefs::Graphics::default().to_engine(),
+            // These embedded databases are large enough that decoding and indexing them delays
+            // the first window. They are loaded on demand when the database popup is first opened.
+            hmdb_mol_db: None,
+            chebi_mol_db: None,
+        }
+    }
+}
+
+impl State {
+    pub fn computation_resources(&self) -> &ComputationResources {
+        self.computation.get_or_init(|| {
+            #[cfg(feature = "cuda")]
+            let (device, kernel_reflections) = crate::util::get_computation_device();
+            #[cfg(not(feature = "cuda"))]
+            let device = ComputationDevice::Cpu;
+
+            println!("Using computing device: {device:?}");
+
+            ComputationResources {
+                device,
+                #[cfg(feature = "cuda")]
+                kernel_reflections,
+            }
+        })
+    }
+
+    pub fn computation_device(&self) -> ComputationDevice {
+        self.computation_resources().device.clone()
+    }
+
+    /// E.g. when loading a new molecule.
+    pub fn reset_selections(&mut self) {
+        self.ui.selection = Selection::None;
+        self.cam_snapshots = Vec::new();
+        self.ui.cam_snapshot = None;
+    }
+
+    // todo: Re-implement with v2 A/R
+    // /// Gets the docking setup, creating it if it doesn't exist. Returns `None` if molecule
+    // /// or ligand are absent.
+    // pub fn get_make_docking_setup(&mut self) -> Option<&DockingSetup> {
+    //     None
+    //     let (Some(mol), Some(lig)) = (&self.molecule, &mut self.ligand) else {
+    //         return None;
+    //     };
+    //
+    //     Some(self.volatile.docking_setup.get_or_insert_with(|| {
+    //         DockingSetup::new(mol, lig, &self.volatile.lj_lookup_table, &self.bh_config)
+    //     }))
+    // }
+
+    // pub fn update_docking_site(&mut self, posit: Vec3F64) {
+    //     // if let Some(lig) = &mut self.ligand {
+    //     //     if let Some(data) = &mut lig.lig_data {
+    //     //         data.docking_site.site_center = posit;
+    //     //
+    //     //         self.ui.docking_site_x = posit.x.to_string();
+    //     //         self.ui.docking_site_y = posit.y.to_string();
+    //     //         self.ui.docking_site_z = posit.z.to_string();
+    //     //     }
+    //     // }
+    // }
+
+    /// Helper
+    pub fn active_mol(&self) -> Option<MolGenericRef<'_>> {
+        match self.volatile.active_mol {
+            Some((mol_type, i)) => self.get_mol(mol_type, i),
+            None => None,
+        }
+    }
+
+    /// Helper
+    /// todo: DRy with the non-mutable variant.
+    pub fn active_mol_mut(&mut self) -> Option<MolGenericRefMut<'_>> {
+        match self.volatile.active_mol {
+            Some((mol_type, i)) => self.get_mol_mut(mol_type, i),
+            None => None,
+        }
+    }
+
+    pub fn get_mol(&self, mol_type: MolType, i: usize) -> Option<MolGenericRef<'_>> {
+        match mol_type {
+            MolType::Peptide => self.get_peptide(i).map(MolGenericRef::Peptide),
+            MolType::Ligand => self.get_small(i).map(MolGenericRef::Small),
+            MolType::NucleicAcid => self.get_nucleic_acid(i).map(MolGenericRef::NucleicAcid),
+            MolType::Lipid => self.get_lipid(i).map(MolGenericRef::Lipid),
+            MolType::Pocket => self.get_pocket(i).map(MolGenericRef::Pocket),
+            MolType::Water => None,
+        }
+    }
+
+    pub fn get_mol_mut(&mut self, mol_type: MolType, i: usize) -> Option<MolGenericRefMut<'_>> {
+        match mol_type {
+            MolType::Peptide => self.get_peptide_mut(i).map(MolGenericRefMut::Peptide),
+            MolType::Ligand => self.get_small_mut(i).map(MolGenericRefMut::Small),
+            MolType::NucleicAcid => self
+                .get_nucleic_acid_mut(i)
+                .map(MolGenericRefMut::NucleicAcid),
+            MolType::Lipid => self.get_lipid_mut(i).map(MolGenericRefMut::Lipid),
+            MolType::Pocket => self.get_pocket_mut(i).map(MolGenericRefMut::Pocket),
+            MolType::Water => None,
+        }
+    }
+
+    pub fn get_peptide(&self, i: usize) -> Option<&MoleculePeptide> {
+        self.peptides.get(i)
+    }
+
+    pub fn get_peptide_mut(&mut self, i: usize) -> Option<&mut MoleculePeptide> {
+        self.peptides.get_mut(i)
+    }
+
+    /// Returns the active peptide index. When another molecule type is active, peptide-wide tools
+    /// continue to target the most recently active peptide, preserving the old single-peptide flow.
+    pub fn peptide_for_tools_i(&self) -> Option<usize> {
+        if let Some((MolType::Peptide, i)) = self.volatile.active_mol
+            && i < self.peptides.len()
+        {
+            return Some(i);
+        }
+        self.volatile
+            .active_peptide
+            .filter(|i| *i < self.peptides.len())
+            .or_else(|| (!self.peptides.is_empty()).then_some(0))
+    }
+
+    pub fn peptide_for_tools(&self) -> Option<&MoleculePeptide> {
+        self.peptide_for_tools_i().and_then(|i| self.get_peptide(i))
+    }
+
+    /// Mutable counterpart to [`Self::peptide_for_tools`].
+    pub fn peptide_for_tools_mut(&mut self) -> Option<&mut MoleculePeptide> {
+        let i = self.peptide_for_tools_i()?;
+        self.get_peptide_mut(i)
+    }
+    pub fn get_small(&self, i: usize) -> Option<&MoleculeSmall> {
+        if i < self.ligands.len() {
+            Some(&self.ligands[i])
+        } else {
+            None
+        }
+    }
+
+    pub fn get_small_mut(&mut self, i: usize) -> Option<&mut MoleculeSmall> {
+        if i < self.ligands.len() {
+            Some(&mut self.ligands[i])
+        } else {
+            None
+        }
+    }
+
+    pub fn get_lipid(&self, i: usize) -> Option<&MoleculeLipid> {
+        if i < self.lipids.len() {
+            Some(&self.lipids[i])
+        } else {
+            None
+        }
+    }
+
+    pub fn get_lipid_mut(&mut self, i: usize) -> Option<&mut MoleculeLipid> {
+        if i < self.lipids.len() {
+            Some(&mut self.lipids[i])
+        } else {
+            None
+        }
+    }
+
+    pub fn get_nucleic_acid(&self, i: usize) -> Option<&MoleculeNucleicAcid> {
+        if i < self.nucleic_acids.len() {
+            Some(&self.nucleic_acids[i])
+        } else {
+            None
+        }
+    }
+
+    pub fn get_nucleic_acid_mut(&mut self, i: usize) -> Option<&mut MoleculeNucleicAcid> {
+        if i < self.nucleic_acids.len() {
+            Some(&mut self.nucleic_acids[i])
+        } else {
+            None
+        }
+    }
+
+    pub fn get_pocket(&self, i: usize) -> Option<&Pocket> {
+        if i < self.pockets.len() {
+            Some(&self.pockets[i])
+        } else {
+            None
+        }
+    }
+
+    pub fn get_pocket_mut(&mut self, i: usize) -> Option<&mut Pocket> {
+        if i < self.pockets.len() {
+            Some(&mut self.pockets[i])
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ComputationType {
+    /// Or uninstall. For third party tools.
+    Install,
+    /// E.g. *Dynamic*, *GROMACS*, *ORCA*.
+    MolecularDynamics,
+    /// Structure prediction, sequence prediction, backbone generation, etc.
+    /// Generally from a third-aprty tool.
+    MachineLearning,
+    /// Quantum chemistry, e.g. ORCA single points, geometry optimization, and charges.
+    QuantumMechanics,
+    Other,
+}
+
+impl Display for ComputationType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let v = match self {
+            Self::Install => "[un]Install",
+            Self::MolecularDynamics => "MD",
+            Self::MachineLearning => "ML",
+            Self::QuantumMechanics => "QM",
+            Self::Other => "Other",
+        };
+
+        write!(f, "{v}")
+    }
+}
+
+/// Represents an ongoing computation; one which can run for a long time. (Seconds, minutes, or longer).
+/// For example: MD, ML etc. Used to maintain status of background processes.
+#[derive(Clone)]
+pub struct Computation {
+    /// Identifies this computation for its guard, which removes it when dropped.
+    id: u64,
+    pub comp_type: ComputationType,
+    pub tool_name: String,
+    pub description: Option<String>,
+    pub start: DateTime<Utc>,
+    // todo: End and result, if required later.
+}
+
+impl Computation {
+    /// Time since the computation started, e.g. "12s", "3m 04s", or "1h 02m".
+    pub fn elapsed_str(&self) -> String {
+        let secs = (Utc::now() - self.start).num_seconds().max(0);
+
+        if secs < 60 {
+            format!("{secs}s")
+        } else if secs < 3_600 {
+            format!("{}m {:02}s", secs / 60, secs % 60)
+        } else {
+            format!("{}h {:02}m", secs / 3_600, (secs % 3_600) / 60)
+        }
+    }
+}
+
+impl Display for Computation {
+    /// Terse, e.g. "ML: Boltz-2 (3m 12s)", or "MD: GROMACS, 5 mols (12s)".
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.comp_type, self.tool_name)?;
+
+        if let Some(descrip) = &self.description {
+            write!(f, ", {descrip}")?;
+        }
+
+        write!(f, " ({})", self.elapsed_str())
+    }
+}
+
+#[derive(Default)]
+struct ComputationsInner {
+    items: Vec<Computation>,
+    next_id: u64,
+}
+
+/// The computations currently running. A computation is added by [`Self::start`], and removed when
+/// the returned [`ComputationGuard`] drops. The guard is generally moved into the worker thread
+/// doing the computation, so the entry is removed when that thread ends however it ends: with a
+/// result, with an error, or by panicking. This doesn't depend on a UI window being open to poll
+/// for the result.
+///
+/// Shared with those worker threads, hence the mutex. It's only held briefly, to add, remove, or
+/// copy the list for display.
+#[derive(Clone, Default)]
+pub struct Computations {
+    inner: Arc<Mutex<ComputationsInner>>,
+}
+
+impl Computations {
+    fn lock(&self) -> MutexGuard<'_, ComputationsInner> {
+        // A poisoned lock only means a thread panicked while holding it; the list itself is still
+        // usable, and a status indicator must not take the UI down with it.
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Register a computation. Keep the guard alive for as long as the computation runs.
+    #[must_use = "The computation is removed as soon as its guard drops"]
+    pub fn start(
+        &self,
+        comp_type: ComputationType,
+        tool_name: impl Into<String>,
+        description: Option<String>,
+    ) -> ComputationGuard {
+        let mut inner = self.lock();
+
+        let id = inner.next_id;
+        inner.next_id += 1;
+
+        inner.items.push(Computation {
+            id,
+            comp_type,
+            tool_name: tool_name.into(),
+            description,
+            start: Utc::now(),
+        });
+
+        ComputationGuard {
+            computations: self.clone(),
+            id,
+        }
+    }
+
+    /// A copy of the current list, in the order started.
+    pub fn list(&self) -> Vec<Computation> {
+        self.lock().items.clone()
+    }
+}
+
+/// Removes its computation from [`Computations`] when dropped.
+pub struct ComputationGuard {
+    computations: Computations,
+    id: u64,
+}
+
+impl Drop for ComputationGuard {
+    fn drop(&mut self) {
+        self.computations
+            .lock()
+            .items
+            .retain(|comp| comp.id != self.id);
+    }
+}
+
+/// Temporary, and generated state.
+#[derive(Default)]
+pub struct StateVolatile {
+    pub representations: crate::drawing::representations::RepresentationCache,
+    pub dialogs: FileDialogs,
+    pub thread_receivers: ThreadReceivers,
+    /// Prevents repeatedly starting the built-in database worker if an embedded database is
+    /// absent or failed to decode.
+    pub builtin_mol_db_load_started: bool,
+    /// Session restoration starts after egui has produced its first frame, instead of delaying
+    /// creation of the native window and graphics surface.
+    pub session_restore_started: bool,
+    /// Set once the MSAA default has been matched to the GPU; see `render::apply_msaa_gpu_default`.
+    pub msaa_gpu_default_applied: bool,
+    /// We Use this to keep track of key press state for the camera movement, so we can continuously
+    /// update the flashlight when moving.
+    pub inputs_commanded: InputsCommanded,
+    /// The one folder Molchanica writes to: the prefs file, `managed_molecules/`, and
+    /// `gpu_cache/` all sit directly in it, alongside `process_executables/`. Resolved once at
+    /// startup by `external_tools::data_root`, so that CLI navigation changing the working
+    /// directory cannot move it.
+    pub prefs_dir: PathBuf,
+    /// Entered by the user, for this session.
+    pub cli_input_history: Vec<String>,
+    pub cli_input_selected: usize,
+    /// Pre-computed from the molecule
+    pub aa_seq_text: String,
+    /// The residue index, in the active peptide, of each character of `aa_seq_text`. The
+    /// sequence skips non-amino-acid residues (water, ions, ligands), so a position in the text
+    /// is not a residue index; this is what maps one back to the other.
+    pub aa_seq_res_indices: Vec<usize>,
+    /// The residue serial number of each character of `aa_seq_text`; used to label the sequence.
+    pub aa_seq_res_sns: Vec<u32>,
+    pub aa_seq_display_cache: AaSeqDisplayCache,
+    /// Cached letters and positions for the selected standalone sequence.
+    pub seq_text: String,
+    pub seq_positions: Vec<usize>,
+    pub seq_numbers: Vec<u32>,
+    pub seq_display_cache: AaSeqDisplayCache,
+    /// The 3D selection cleared when a standalone sequence became active.
+    pub pending_selection_redraw: Option<Selection>,
+    pub last_prefs_save_check: Option<Instant>,
+    pub flags: SceneFlags,
+    pub active_mol: Option<(MolType, usize)>,
+    /// Most recently active peptide, retained while another molecule type is active.
+    /// todo: This concept of Active Peptide separate from `active_mol` may be removed
+    /// in the future, and I'm not sure what it's used for (2026-09-23).
+    pub active_peptide: Option<usize>,
+    pub mol_manip: MolManip,
+    pub(crate) history: crate::edit_history::EditHistory,
+    pub(crate) region_selection: crate::region_select::RegionSelection,
+    pub(crate) handled_window_keys: Vec<graphics::winit::keyboard::KeyCode>,
+    pub(crate) last_interaction_frame: Option<u64>,
+    /// For restoring after temprarily disabling mouse look.
+    pub control_scheme_prev: ControlScheme,
+    pub orbit_center_prev: Option<(MolType, usize)>,
+    pub depth_mode_prev: DepthMode,
+    /// Ctrl, alt, shift etc.
+    pub key_modifiers: Modifiers,
+    pub operating_mode: OperatingMode,
+    /// Saved on entering the mol editor, and restored on exiting it.
+    pub primary_mode_cam: Option<PrimaryModeCam>,
+    pub md_local: MdStateLocal,
+    pub mdposit: crate::md::mdposit::Import,
+    pub orbit_center: Option<(MolType, usize)>,
+    pub alignment: StateAlignment,
+    #[cfg(feature = "adme")]
+    /// Key: target name, corresponding to TDC CSVs.
+    pub inference_models: HashMap<DatasetTdc, Infer>,
+    pub parquet_dbs: Vec<ParquetMolDb>,
+    /// The database the DB popup is showing, and that screening runs against.
+    pub parquet_db_active: Option<DbSel>,
+    #[cfg(feature = "sonification")]
+    /// Playback handle for the molecule currently being sonified, if any.
+    pub playing_audio: Option<crate::sonification::PlayingAudio>,
+    /// Long-running computations in progress, e.g. MD, ML inference, and tool installs. Displayed
+    /// as a status indicator.
+    pub ongoing_computations: Computations,
+    /// The selected sequence, as an index into `State::sequences`.
+    pub active_seq: Option<usize>,
+}
+
+impl StateVolatile {
+    pub fn new() -> Self {
+        Self {
+            // Falling back to the working directory keeps a session usable even if no data
+            // directory could be resolved; the prefs file is a convenience, not a requirement.
+            prefs_dir: data_root().unwrap_or_else(|| env::current_dir().unwrap()),
+            ..Default::default()
+        }
+    }
+
+    /// Rebuild the cached one-letter sequence and its residue-index map for `peptide`, and mark
+    /// the display cache dirty. Both are derived from the residue list in one pass, so a
+    /// character and its residue index can't drift apart.
+    pub fn set_aa_seq(&mut self, peptide: Option<&MoleculePeptide>) {
+        self.aa_seq_text.clear();
+        self.aa_seq_res_indices.clear();
+        self.aa_seq_res_sns.clear();
+
+        if let Some(peptide) = peptide {
+            for (res_i, res) in peptide.residues.iter().enumerate() {
+                if let ResidueType::AminoAcid(aa) = res.res_type {
+                    self.aa_seq_text.push_str(&aa.to_str(AaIdent::OneLetter));
+                    self.aa_seq_res_indices.push(res_i);
+                    self.aa_seq_res_sns.push(res.serial_number);
+                }
+            }
+        }
+
+        self.aa_seq_display_cache.dirty = true;
+    }
+
+    pub fn set_seq_display(&mut self, sequence: Option<&Sequence>) {
+        self.seq_text = sequence
+            .map(|seq| seq.data.to_letters())
+            .unwrap_or_default();
+        self.seq_positions = (0..self.seq_text.len()).collect();
+        self.seq_numbers = (1..=self.seq_text.len())
+            .map(|number| number as u32)
+            .collect();
+        self.seq_display_cache.dirty = true;
+    }
+}
+
+/// Which molecule database the UI is acting on. The ones embedded in the binary live in
+/// `State::hmdb_mol_db` and `State::chebi_mol_db`, and the rest, which the user opened, in
+/// `StateVolatile::parquet_dbs`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DbSel {
+    /// `State::hmdb_mol_db`; read-only.
+    Hmdb,
+    /// `State::chebi_mol_db`; read-only.
+    Chebi,
+    /// Index into `StateVolatile::parquet_dbs`.
+    Loaded(usize),
+}
+
+/// Holds data related to filters, selections, etc used to help with amino acid-specific
+/// visualizations.
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct AaSelection {
+    pub enabled: bool,
+    pub amino_acids: HashSet<AminoAcid>,
+    /// Helix, sheet, and coil/unassigned, respectively. Combined with AA types using AND.
+    pub secondary: [bool; 3],
+    pub color_by_aa: bool,
+    pub highlight_color: [f32; 3],
+    pub neutral_color: [f32; 3],
+}
+
+impl Default for AaSelection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            amino_acids: crate::drawing::aa_highlight::AMINO_ACIDS
+                .into_iter()
+                .collect(),
+            secondary: [true; 3],
+            color_by_aa: true,
+            highlight_color: [1., 0.65, 0.1],
+            neutral_color: [0.22, 0.22, 0.22],
+        }
+    }
+}
+
+// todo: UI state structs in their own module?
+/// Ui text fields and similar.
+#[derive(Default)]
+pub struct StateUi {
+    pub command_files: crate::ui::popup::command_files::CommandFiles,
+    /// Last error from centering the slab.
+    pub slab_error: String,
+    pub inspection: crate::ui::measurements::InspectionUi,
+    pub binding: crate::ui::popup::binding::BindingUi,
+    pub protein_comparison: crate::ui::popup::protein_comparison::ProteinComparison,
+    pub selection_editor: crate::ui::popup::selections::SelectionEditor,
+    pub reactions: crate::reactions::ReactionsState,
+    #[cfg(feature = "synthesis")]
+    pub synthesis_reactions: crate::reactions_synthesis::SynthesisReactionsState,
+    /// View mode for proteins/peptides.
+    pub mol_view_peptide: MoleculeView,
+    /// View mode for everything other than proteins/peptides.
+    pub mol_view: MoleculeView,
+    pub view_sel_level: ViewSelLevel,
+    /// Mouse cursor
+    pub cursor_pos: Option<(f32, f32)>,
+    pub db_input: String,
+    pub db_input_trimmed: String,
+    pub db_input_lowercase: String,
+    pub cam_snapshot_name: String,
+    pub atom_res_search: String,
+    /// `atom_res_search` matches nothing in the active molecule; shown by coloring the query.
+    pub atom_res_search_miss: bool,
+    /// Hide protein atoms that aren't near the selection, ligand, or protein surface.
+    pub dist_filter: DistFilter,
+    /// Angstrom. Used by `dist_filter`.
+    pub nearby_dist_thresh: u16,
+    pub cam_snapshot: Option<usize>,
+    pub dt_render: f32, // Seconds
+    /// Workaround for a bug or limitation in EGUI's `is_pointer_button_down_on`.
+    pub visibility: Visibility,
+    pub selection: Selection,
+    /// First atom in the two-step ligand joining workflow; never persisted.
+    pub join_ligand: Option<crate::split_join::JoinLigand>,
+    pub left_click_down: bool,
+    pub middle_click_down: bool,
+    pub mouse_in_window: bool,
+    /// For the arc/orbit cam only.
+    pub orbit_selected_atom: bool,
+    /// `Some` if shown.
+    pub floor: Option<crate::drawing::floor::Floor>,
+    /// A flag so we know to update the flashlight upon loading a new model; this should be done within
+    /// a callback.
+    pub show_docking_tools: bool,
+    pub label_sizes: LabelSizes,
+    pub cmd_line_input: String,
+    pub cmd_line_output: String,
+    /// Indicates CLI, or errors more broadly by changing its displayed color.
+    pub cmd_line_out_is_err: bool,
+    pub ui_vis: UiVisibility,
+    /// Use a viridis or simialar colr scheme to color residues gradually based on their
+    /// position in the sequence.
+    pub res_coloring: ResColoring,
+    pub atom_color_by_charge: bool,
+    /// Affects the electron density mesh.
+    pub density_iso_level: f32,
+    // /// E.g. set to original for from the mmCIF file, or Dynamics to view it after MD.
+    // peptide_atom_posits: PeptideAtomPosits,
+    pub popup: PopupState,
+    pub md: StateUiMd,
+    /// Selection state for the force-field parameter viewer/editor popup.
+    pub ff_params: FfParamsUi,
+    /// Forms, jobs, and results for the bio_tools shared-adapter tool windows.
+    pub tool_windows: ToolWindows,
+    /// Cached results of the third-party tools status probe.
+    pub external_tools: ExternalToolsUi,
+    /// Input and results for the sequence-design, ΔΔG, and antibody tools.
+    pub protein_design: ProteinDesignUi,
+    pub ph_input: String,
+    pub mesh_coloring: MeshColoring,
+    /// Color ligands by molecule, to contrast.
+    pub color_by_mol: bool,
+    // todo: Dedicated pharmacophore sub-state A/R.
+    pub pharmacaphore_type: PharmacophoreFeatType,
+    pub editing_metadata: bool,
+    pub metadata_edit: MetadataEdit,
+    /// Zero-based positions selected in the active standalone sequence.
+    pub seq_selection: Vec<usize>,
+    pub sequence_edit: SequenceEdit,
+    pub aa_selection: AaSelection,
+    pub mol_picker: MolPickerState,
+    /// Single-letter amino acid codes, for creating peptides and sequences.
+    pub aa_seq_to_create: String,
+    /// Initial backbone geometry shared by the peptide creation controls.
+    pub aa_geometry_to_create: PeptideGeometry,
+    pub na_residue_grouping: ResidueGrouping,
+}
+
+/// Search, filters, sorting, and manual order of the sidebar's molecule picker.
+#[derive(Default)]
+pub struct MolPickerState {
+    pub search: String,
+    /// Molecule types not shown.
+    pub hidden_types: Vec<MolType>,
+    pub sort: MolSort,
+    pub sort_descending: bool,
+    /// Display order, used by `MolSort::Manual`. Rearranged by dragging rows.
+    pub order: Vec<(MolType, usize)>,
+}
+
+impl MolPickerState {
+    /// Keeps `order` in sync when a molecule is closed: later molecules of its type shift down.
+    pub fn on_close(&mut self, mol_type: MolType, i: usize) {
+        self.order.retain(|&id| id != (mol_type, i));
+
+        for (t, j) in &mut self.order {
+            if *t == mol_type && *j > i {
+                *j -= 1;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum MolSort {
+    /// Grouped by type, in the order opened, unless rearranged by dragging.
+    #[default]
+    Manual,
+    Name,
+    Type,
+    AtomCount,
+    Weight,
+    // These are from small-molecule characterization. Other molecules sort last.
+    LogP,
+    Tpsa,
+    Rings,
+    RotatableBonds,
+    HBondDonors,
+    HBondAcceptors,
+}
+
+#[derive(Default)]
+pub struct SequenceEdit {
+    pub target: Option<usize>,
+    pub text: String,
+    pub error: Option<String>,
+}
+
+/// What the metadata popup shows, and edits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MetadataTarget {
+    Mol(MolType, usize),
+    /// An index into `State::sequences`.
+    Seq(usize),
+}
+
+/// Rows shown by the metadata editor, populated from the molecule when editing is enabled.
+/// A `Vec` instead of the molecule's `HashMap`: rows need a stable order between frames, and
+/// may transiently hold blank or duplicate keys while the user types them.
+#[derive(Default)]
+pub struct MetadataEdit {
+    /// The molecule or sequence these rows were loaded from. Rows are discarded when the metadata
+    /// popup moves to a different one, so edits can't be applied to the wrong one.
+    pub target: Option<MetadataTarget>,
+    pub rows: Vec<(String, String)>,
+    pub sequence_text: String,
+    pub sequence_error: Option<String>,
+}
+
+/// Cached egui layout for a peptide or standalone sequence. Its letters remain in
+/// `StateVolatile`; producers mark this cache dirty when replacing them.
+pub struct AaSeqDisplayCache {
+    pub dirty: bool,
+    /// Residue indices, as the selection holds them; the galley is rebuilt when they change.
+    pub selected: Vec<usize>,
+    pub font_id: Option<FontId>,
+    pub wrap_width: f32,
+    pub pixels_per_point: f32,
+    pub galley: Option<Arc<Galley>>,
+    /// Residue number labels, positioned relative to `galley`, in the gaps above its rows.
+    /// Painted separately, so they're neither selectable nor copied with the sequence.
+    pub num_labels: Vec<(Pos2, Arc<Galley>)>,
+    /// Sequence position a drag-selection started at, while the drag is in progress.
+    pub drag_anchor: Option<usize>,
+}
+
+impl Default for AaSeqDisplayCache {
+    fn default() -> Self {
+        Self {
+            dirty: true,
+            selected: Vec::new(),
+            font_id: None,
+            wrap_width: 0.0,
+            pixels_per_point: 0.0,
+            galley: None,
+            num_labels: Vec::new(),
+            drag_anchor: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct LabelVis {
+    pub residue_letter: bool,
+    pub mol: bool,
+    pub atom_sn: bool,
+    pub atom_q: bool,
+    pub atom_detailed: bool,
+    pub bond: bool,
+    pub chain: bool,
+}
+
+impl Default for LabelVis {
+    fn default() -> Self {
+        Self {
+            residue_letter: false,
+            mol: true,
+            atom_sn: false,
+            atom_q: false,
+            atom_detailed: false,
+            bond: false,
+            chain: false,
+        }
+    }
+}
+
+/// Font sizes of the text labels drawn over the 3D render. (`TextOverlay` has no separate stroke
+/// weight; the size is also what controls thickness.)
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct LabelSizes {
+    /// Small molecule, lipid, and nucleic acid names.
+    pub mol: f32,
+    /// Protein names.
+    pub protein: f32,
+    /// Protein chain IDs.
+    pub chain: f32,
+    /// One-letter amino acid codes.
+    pub residue: f32,
+    /// Atom serial numbers, including in the molecule editor, and pharmacophore feature numbers.
+    pub atom_sn: f32,
+}
+
+impl LabelSizes {
+    pub const MIN: f32 = 6.;
+    pub const MAX: f32 = 80.;
+}
+
+impl Default for LabelSizes {
+    fn default() -> Self {
+        Self {
+            mol: 18.,
+            protein: 40.,
+            chain: 30.,
+            residue: 16.,
+            atom_sn: 16.,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct Visibility {
+    pub hide_sidechains: bool,
+    pub hide_water: bool,
+    /// Hide hetero atoms: i.e. ones not part of a polypeptide.
+    pub hide_hetero: bool,
+    pub hide_protein: bool,
+    pub hide_ligand: bool,
+    pub hide_nucleic_acids: bool,
+    pub hide_lipids: bool,
+    pub hide_hydrogen: bool,
+    pub hide_pharmacophore: bool,
+    pub hide_h_bonds: bool,
+    /// Unused; formerly `dim_peptide`. Keeps the encoded layout of saved projects.
+    pub(crate) reserved_0: bool,
+    pub hide_density_point_cloud: bool,
+    pub hide_density_surface: bool,
+    pub hide_pockets: bool,
+    pub labels: LabelVis,
+}
+
+impl Default for Visibility {
+    fn default() -> Self {
+        Self {
+            hide_sidechains: false,
+            hide_water: false,
+            hide_hetero: false,
+            hide_protein: false,
+            hide_ligand: false,
+            hide_nucleic_acids: false,
+            hide_lipids: false,
+            hide_hydrogen: true,
+            hide_pharmacophore: true,
+            hide_h_bonds: false,
+            reserved_0: false,
+            hide_density_point_cloud: false,
+            hide_density_surface: false,
+            hide_pockets: false,
+            labels: Default::default(),
+        }
+    }
+}
+
+/// Cached, sorted, and search-filtered view of a molecule DB's table.
+///
+/// The DB's index can hold tens of thousands of molecules, and egui redraws the open popup every
+/// frame. Collecting, sorting, and filtering the whole index each frame makes the popup hang, so
+/// the result is cached here and rebuilt only when an input changes: the selected DB, its molecule
+/// count (an add or delete), or the search text.
+#[derive(Default, Debug)]
+pub struct MolDbTableView {
+    /// The DB this view was built for; `None` until the first build, forcing an initial rebuild.
+    pub db_sel: Option<DbSel>,
+    /// The DB's molecule count when built. A change means rows were added or removed.
+    pub mol_count: usize,
+    /// The trimmed, lowercased search text the keys were filtered by.
+    pub search: String,
+    /// SMILES keys of the matching rows, in display order. Owned, so this doesn't borrow the DB.
+    pub keys: Vec<String>,
+}
+
+/// Which residues the residue management popup lists.
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
+pub enum ResMgmtFilter {
+    #[default]
+    Hetero,
+    AminoAcid,
+    Both,
+}
+
+/// Defines which UI popups are displayed.
+#[derive(Default, Debug)]
+pub struct PopupState {
+    pub protein_comparison: bool,
+    pub selections: bool,
+    pub measurement: bool,
+    pub reactions: bool,
+    #[cfg(feature = "synthesis")]
+    pub synthesis_reactions: bool,
+    pub show_get_geostd: bool,
+    pub show_associated_structures: bool,
+    pub show_settings: bool,
+    pub get_geostd_items: Vec<GeostdItem>,
+    pub rama_plot: bool,
+    pub recent_files: bool,
+    /// Current page in the recent-files popup.
+    pub recent_files_page: usize,
+    /// Filename or identifier filter text for the recent-files popup.
+    pub recent_files_filter: String,
+    /// File types toggled off in the recent-files popup.
+    pub recent_files_hidden_types: Vec<OpenType>,
+    pub metadata: Option<MetadataTarget>,
+    pub alignment: bool,
+    pub alignment_screening: bool,
+    pub pharmacophore_boolean: bool,
+    pub pharmacophore_screening: bool,
+    pub lig_pocket_creation: bool,
+    /// Include smaller disconnected components when creating or detaching a ligand.
+    pub lig_include_disconnected: bool,
+    pub res_mgmt_filter: ResMgmtFilter,
+    /// Matches residue name, serial number, or chain.
+    pub res_mgmt_search: String,
+    /// Adding a ligand to a protein. `Some` while that popup is open.
+    pub lig_attach: Option<LigAttachUi>,
+    pub parquet_db: bool,
+    /// A molecule the user has asked to delete from a molecule DB, pending confirmation:
+    /// (index into `parquet_dbs`, SMILES key of the row).
+    pub parquet_db_mol_del: Option<(usize, String)>,
+    /// Search text for the active molecule DB's table; matches on CID, title, or SMILES.
+    pub parquet_db_search: String,
+    /// Current page in the active molecule DB's table.
+    pub parquet_db_page: usize,
+    /// Cached sorted/filtered key list for the active molecule DB's table; see `MolDbTableView`.
+    pub parquet_db_view: MolDbTableView,
+    pub md_mol_set_editor: bool,
+    pub ff_params: bool,
+    /// The tabbed "Protein design" window.
+    pub protein_tools: bool,
+    pub protein_tools_tab: crate::ui::popup::ProteinToolsTab,
+    pub quantum_chem: bool,
+    /// The third-party tools status panel.
+    pub external_tools: bool,
+    /// Sequence design, ΔΔG scanning, and antibody annotation.
+    pub protein_design: bool,
+    /// Program name, version, and links.
+    pub about: bool,
+    /// Why the About window's "Open data folder" button last failed, if it did. Reported in the
+    /// window rather than only on stderr, which a GUI launch has nowhere to show.
+    pub about_folder_error: Option<String>,
+    /// Checking for, downloading, and installing a newer release, from the About window.
+    pub updater: software_manager::Updater,
+}
+
+#[derive(Clone, PartialEq, Encode, Decode)]
+pub struct LipidUi {
+    /// For the combo box. Stays at 0 if none loaded.
+    pub lipid_to_add: usize,
+    pub shape: LipidShape,
+    pub mol_count: u16,
+}
+
+impl Default for LipidUi {
+    fn default() -> Self {
+        Self {
+            lipid_to_add: 0,
+            shape: Default::default(),
+            mol_count: 10,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Encode, Decode)]
+pub struct NucleicAcidUi {
+    pub seq_to_create: String,
+    pub na_type: NucleicAcidType,
+    pub strands: Strands,
+}
+
+impl Default for NucleicAcidUi {
+    fn default() -> Self {
+        Self {
+            seq_to_create: String::from("ATCG"),
+            na_type: Default::default(),
+            strands: Default::default(),
+        }
+    }
+}
+
+pub struct StateUiMd {
+    /// The state we store for this is a float, so we need to store state text too.
+    pub dt_input: String,
+    pub temp_tgt: String,
+    pub temp_tau: String,
+    pub langevin_γ: String,
+    pub pressure_tgt: String,
+    pub pressure_tau: String,
+    //
+    pub simbox_pad_input: String,
+    pub simbox_x_min_input: String,
+    pub simbox_y_min_input: String,
+    pub simbox_z_min_input: String,
+    pub simbox_x_max_input: String,
+    pub simbox_y_max_input: String,
+    pub simbox_z_max_input: String,
+    //
+    /// Only perform MD on peptide atoms near a ligand.
+    pub peptide_only_near_ligs: bool,
+    /// Peptide atoms don't move, but exert forces.
+    pub peptide_static: bool,
+    /// Output control settings which don't directly map to `OutputControl`, but
+    /// change them.
+    pub trr_enabled: bool,
+    pub dcd_enabled: bool,
+    pub xtc_enabled: bool,
+    pub set_editor_active_set: Option<usize>,
+    /// Text input for the "fill rest with water" final atom index.
+    pub water_fill_end_input: String,
+    /// If true, enable alchemical decoupling of the first selected molecule at
+    /// `alchemical_lambda`. Used to inspect trajectories at a single lambda window.
+    pub alchemical_enabled: bool,
+    /// Lambda value in [0, 1] applied via `configure_alchemical_window` when
+    /// `alchemical_enabled` is set. 0 = full interaction, 1 = fully decoupled.
+    pub alchemical_lambda: f64,
+    pub alchemical_lambda_input: String,
+}
+
+impl Default for StateUiMd {
+    fn default() -> Self {
+        Self {
+            dt_input: Default::default(),
+            temp_tgt: Default::default(),
+            temp_tau: Default::default(),
+            pressure_tgt: Default::default(),
+            pressure_tau: Default::default(),
+            simbox_pad_input: Default::default(),
+            simbox_x_min_input: Default::default(),
+            simbox_y_min_input: Default::default(),
+            simbox_z_min_input: Default::default(),
+            simbox_x_max_input: Default::default(),
+            simbox_y_max_input: Default::default(),
+            simbox_z_max_input: Default::default(),
+            langevin_γ: Default::default(),
+            peptide_only_near_ligs: false,
+            peptide_static: false,
+            trr_enabled: true,
+            dcd_enabled: false,
+            xtc_enabled: true,
+            set_editor_active_set: Default::default(),
+            water_fill_end_input: Default::default(),
+            alchemical_enabled: false,
+            alchemical_lambda: 0.5,
+            alchemical_lambda_input: "0.5".to_string(),
+        }
+    }
+}
+
+impl StateUiMd {
+    /// Updates these variables based on state.
+    pub fn sync(&mut self, md_cfg: &MdConfig, dt: f32) {
+        self.dt_input = dt.to_string();
+        self.temp_tgt = md_cfg.temp_target.to_string();
+
+        let (temp_tau, langevin_γ) = match md_cfg.integrator {
+            Integrator::Leapfrog { thermostat } | Integrator::VerletVelocity { thermostat } => {
+                match thermostat {
+                    Some(tau) => (tau, LANGEVIN_GAMMA_DEFAULT),
+                    None => (TAU_TEMP_DEFAULT, LANGEVIN_GAMMA_DEFAULT),
+                }
+            }
+            Integrator::LangevinMiddle { gamma } => (TAU_TEMP_DEFAULT, gamma),
+        };
+
+        self.temp_tau = temp_tau.to_string();
+        self.langevin_γ = langevin_γ.to_string();
+
+        let (p_tau, p_tgt) = match &md_cfg.barostat_cfg {
+            Some(bc) => (bc.tau, bc.pressure_target),
+            None => (TAU_PRESSURE_DEFAULT, PRESSURE_DEFAULT),
+        };
+
+        self.pressure_tau = p_tau.to_string();
+        self.pressure_tgt = p_tgt.to_string();
+
+        match md_cfg.sim_box {
+            SimBoxInit::Pad(p) => {
+                self.simbox_pad_input = (p as u16).to_string();
+            }
+            SimBoxInit::Fixed((start, end)) => {
+                self.simbox_x_min_input = format!("{:.1}", start.x);
+                self.simbox_y_min_input = format!("{:.1}", start.y);
+                self.simbox_z_min_input = format!("{:.1}", start.z);
+
+                self.simbox_x_max_input = format!("{:.1}", end.x);
+                self.simbox_y_max_input = format!("{:.1}", end.y);
+                self.simbox_z_max_input = format!("{:.1}", end.z);
+            }
+        }
+
+        let sh = &md_cfg.snapshot_handlers;
+
+        self.trr_enabled = sh.gromacs.nstxout.is_some()
+            || sh.gromacs.nstvout.is_some()
+            || sh.gromacs.nstfout.is_some();
+        self.xtc_enabled = sh.gromacs.nstxout_compressed.is_some();
+        self.dcd_enabled = sh.dcd.is_some();
+    }
+}
+
+// todo: Rename A/R
+#[derive(Clone, Copy, PartialEq, Default, Debug)]
+pub enum OperatingMode {
+    #[default]
+    Primary,
+    /// For editing small molecules
+    MolEditor,
+    /// For editing proteins
+    ProteinEditor,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Default, Encode, Decode)]
+pub enum MsaaSetting {
+    None = 1,
+    // Two = 2, // todo: Not supported on this depth texture, but we could switch to a different one.
+    #[default]
+    Four = 4,
+}
+
+impl MsaaSetting {
+    pub fn to_str(self) -> String {
+        match self {
+            Self::None => "None",
+            // Self::Two => "2×",
+            Self::Four => "4×",
+        }
+        .to_owned()
+    }
+}
+
+/// Hides protein atoms based on their distance to something.
+#[derive(Clone, Copy, PartialEq, Default, Debug, Encode, Decode)]
+pub enum DistFilter {
+    #[default]
+    None,
+    /// Show only atoms near the selected atom(s), bond(s), or residue(s).
+    NearSel,
+    /// Show only atoms near the active (non-protein) molecule, e.g. a ligand.
+    NearLig,
+    /// Show only atoms near the protein's surface; hide internal ones.
+    NearSfc,
+}
+
+#[derive(Clone, Copy, PartialEq, Default, Debug, Encode, Decode)]
+pub enum ResColoring {
+    /// A unique color per amino acid, to quickly differentiate them.
+    AminoAcid,
+    #[default]
+    /// Position in sequence, e.g. mapped using viridis
+    Position,
+    /// Also with a Viridis-style approach.
+    Hydrophobicity,
+    /// SIFTS (UniProt-PDBe residue mappings; requires an API call to pdbe)
+    SiftsUniprot,
+    Chain,
+}
+
+impl Display for ResColoring {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let v = match self {
+            Self::AminoAcid => "AA",
+            Self::Position => "Posit",
+            Self::Hydrophobicity => "Hydro",
+            Self::SiftsUniprot => "SIFTS",
+            Self::Chain => "Chain",
+        };
+
+        write!(f, "{v}")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+/// For showing and hiding UI sections.
+pub struct UiVisibility {
+    pub aa_seq: bool,
+    pub selfies: bool,
+    pub lipids: bool,
+    pub nucleic_acids: bool,
+    pub amino_acids: bool,
+    pub dynamics: bool,
+    pub sidebar_mol_properties: bool,
+    pub mol_picker_details: bool,
+    pub pharmacophore_list: bool,
+    /// The left-side panel. When hidden, a narrow strip with a button to re-show it remains.
+    pub sidebar: bool,
+    pub aa_selection: bool,
+}
+
+impl Default for UiVisibility {
+    fn default() -> Self {
+        Self {
+            aa_seq: false,
+            selfies: false,
+            lipids: false,
+            nucleic_acids: false,
+            amino_acids: false,
+            dynamics: false,
+            mol_picker_details: true,
+            sidebar_mol_properties: true,
+            pharmacophore_list: false,
+            sidebar: true,
+            aa_selection: false,
+        }
+    }
+}
+
+/// The primary-mode camera, saved on entering the mol editor, and restored on exiting it. We don't
+/// store the whole `Camera`: Its aspect ratio and projection matrix may be stale by the time we exit,
+/// e.g. from a window resize.
+#[derive(Clone, Debug)]
+pub struct PrimaryModeCam {
+    pub position: Vec3,
+    pub orientation: Quaternion,
+    /// Separate from `StateVolatile::control_scheme_prev`, which molecule manipulation in the
+    /// editor overwrites.
+    pub control_scheme: ControlScheme,
+}
+
+impl PrimaryModeCam {
+    pub fn new(cam: &Camera, control_scheme: ControlScheme) -> Self {
+        Self {
+            position: cam.position,
+            orientation: cam.orientation,
+            control_scheme,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub struct CamSnapshot {
+    // We don't use camera directly, so we don't have to store the projection matrix, and so we can impl
+    // Encode/Decode
+    pub position: Vec3,
+    pub orientation: Quaternion,
+    pub far: f32,
+    pub name: String,
+    pub scene: Option<crate::inspection::SceneState>,
+}
+
+impl CamSnapshot {
+    pub fn from_cam(cam: &Camera, name: String) -> Self {
+        Self {
+            position: cam.position,
+            orientation: cam.orientation,
+            far: cam.far,
+            name,
+            scene: None,
+        }
+    }
+}
+
+#[derive(Default)]
+/// Molecule templates for building-block molecules.
+pub struct Templates {
+    /// Common lipid types, e.g. as derived from Amber's `lipids21.lib`, but perhaps not exclusively.
+    /// These are loaded at init; there will be one of each type.
+    pub lipid: Vec<MoleculeLipid>,
+    // pub dna: Vec<MoleculeNucleicAcid>,
+    // pub rna: Vec<MoleculeNucleicAcid>,
+    pub dna: HashMap<String, TemplateData>,
+    pub rna: HashMap<String, TemplateData>,
+    pub amino_acid: AminoAcidTemplates,
+}
+
+/// Flags to accomplish things that must be done somewhere with access to `Scene`.
+#[derive(Default)]
+pub struct SceneFlags {
+    pub scene_restored: bool,
+    /// Secondary structure
+    pub update_ss_mesh: bool,
+    /// Selection whose colors are currently baked into the ribbon mesh.
+    pub ss_mesh_selection: Selection,
+    /// Set when chain visibility changes while NOT in Ribbon mode; flushed to
+    /// `update_ss_mesh` the next time Ribbon mode is active.
+    pub ss_mesh_dirty: bool,
+    /// Solvent-accessible surface.
+    pub update_sas_mesh: bool,
+    pub update_sas_coloring: bool,
+    pub ss_mesh_created: bool,
+    /// Peptide currently occupying the active ribbon mesh slot.
+    pub ss_mesh_peptide: Option<usize>,
+    /// Visibility of the peptides represented by the cached ribbon meshes.
+    pub ss_mesh_visible: Vec<bool>,
+    pub sas_mesh_created: bool,
+    pub make_density_iso_mesh: bool,
+    pub clear_density_drawing: bool,
+    pub new_density_loaded: bool,
+    pub new_mol_loaded: bool,
+}

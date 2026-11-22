@@ -1,0 +1,90 @@
+# mliport repository tooling configuration.
+#
+# This is intentionally NOT a Python runtime project.  Each engine (UMA,
+# MACE, DPA, GRACE) installs into its own isolated environment via
+# `scripts/install_mliport.sh` (see mliport/install/compatibility.py).  The four
+# stacks have mutually exclusive dependencies, so no single workspace lockfile
+# is maintained here.
+#
+# The actual `mliport` package metadata lives in `mliport/pyproject.toml`.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Explicit, so pytest-asyncio does not warn that the default is about to change.
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+include = [
+    "mliport/mliport/**/*.py",
+    "tests/**/*.py",
+    "scripts/*.py",
+]
+
+[tool.ruff.lint]
+select = [
+  "B",      # flake8-bugbear
+  "C4",     # flake8-comprehensions
+  "E",      # pycodestyle error
+  "F",      # pyflakes
+  "FA",     # flake8-future-annotations
+  "I",      # isort
+  "ICN",    # flake8-import-conventions
+  "PERF",   # perflint
+  "PIE",    # flake8-pie
+  "PL",     # pylint
+  "PT",     # flake8-pytest-style
+  "Q",      # flake8-quotes
+  "RET",    # flake8-return
+  "RUF",    # Ruff-specific rules
+  "SIM",    # flake8-simplify
+  "TCH",    # flake8-type-checking
+  "UP",     # pyupgrade
+  "W",      # pycodestyle warning
+]
+ignore = [
+  "E501",   # Line too long
+  "PLR",    # Design related pylint codes
+  "B028",   # No explicit stacklevel
+  "RET505", # Unnecessary `elif` after `return`
+  "PT011",  # pytest.raises
+  "UP007",  # Use `X | Y` for type annotations
+  "SIM108", # Use ternary operator
+  # Test-style / historical preferences kept in the existing suite:
+  "PLC0415", # Import outside toplevel (intentional lazy imports)
+  "PT018",   # Assertion should be broken into multiple parts
+  "PT006",   # pytest.raises positional arg
+  "PT023",   # pytest.mark.decorator
+  "TCH003",  # stdlib import in type-checking block
+  "E741",    # Ambiguous variable name in existing tests
+  "B007",    # Unused loop control variable
+  "PERF102", # Use values() of dict
+  "RUF001",  # Ambiguous unicode character
+  "RUF100",  # Unused noqa directive
+  # Rules that are enforced on the package but deliberately not for these
+  # families (style/micro-performance, or the fix can change runtime behavior):
+  "UP038",   # isinstance(x, A | B): deprecated upstream, slower than a tuple
+  "PERF203", # try/except in a loop (needed for per-item error handling)
+  "PERF401", # manual list comprehension (output-formatting loops read better)
+  "PERF403", # manual dict comprehension
+  "TCH001",  # first-party import into TYPE_CHECKING (runtime annotation users)
+  "TCH002",  # third-party import into TYPE_CHECKING (textual/dataclass runtime)
+  "RUF002",  # Ambiguous unicode in docstrings (units, symbols)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mliport"]
+combine-as-imports = true
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"mliport/mliport/install/__init__.py" = ["F401"]
+# placement.py defines ``objective``/``positions_at`` inside the sampling loop
+# and calls them within the same iteration, so late binding is not an issue.
+"mliport/mliport/confsearch/placement.py" = ["B023"]
+# Test-only style rules stay scoped to tests instead of masking production.
+"tests/**" = ["F841", "B017"]

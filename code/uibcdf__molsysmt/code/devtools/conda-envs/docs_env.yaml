@@ -1,0 +1,46 @@
+channels:
+  - uibcdf
+  - conda-forge
+dependencies:
+  - python
+  - pip
+  - setuptools >=77.0.3
+  - versioningit >=3.0
+  # Bounds identical to the `dependencies` list in pyproject.toml. Without them the
+  # solver silently satisfies conda while violating the package: with python 3.12 it
+  # resolved pyunitwizard 0.17.0 against a requirement of >=0.22.0, because the uibcdf
+  # channel only builds py313 from 0.18.1 onwards, and `pip install . --no-deps` does
+  # not check. An unsolvable environment is the correct failure here.
+  - numpy >=1.26
+  - pandas >=2.2.2
+  - jinja2 >=3.1.2
+  - h5py >=3.11.0
+  - networkx >=3.3
+  - tqdm >=4.65.0
+  # Autodoc imports the installed package. The controlled portable Viewer source
+  # is supplied by the workflow; declare its additional runtime requirements here.
+  - anywidget >=0.9.15
+  - traitlets >=5
+  - packaging >=23
+  # scipy is nobody's declared dependency and everybody's import: configuring
+  # PyUnitWizard's pint form imports pint, and pint imports scipy. Both MolSysMT and
+  # MolSysViewer do that configuration at import time.
+  - scipy
+  - matplotlib >=3.8.4
+  # Regenerating the NGLView showcase contact-map HTML.
+  - plotly
+  - argdigest >=0.14.0
+  - depdigest >=0.15.1
+  - smonitor >=0.16.0
+  - pyunitwizard >=0.29.2
+  - py-mmcif >=1.1.1
+  - sphinx
+  - pydata-sphinx-theme
+  - myst-nb
+  - nbformat >=5.1.3
+  - sphinx-design
+  - sphinx-copybutton
+  - sphinx-favicon
+  - sphinx-togglebutton
+  - sphinxcontrib-bibtex
+  - sphinx-remove-toctrees

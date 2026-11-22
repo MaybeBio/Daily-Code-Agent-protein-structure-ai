@@ -1,0 +1,154 @@
+name: Native space analysis scoped checks
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/opendde_workbench/space/**'
+      - 'src/opendde_workbench/receptors/image.py'
+      - 'scripts/generate-channel-lock.py'
+      - '.github/workflows/space-analysis-checks.yml'
+      - 'server_tests/caver*_probe.py'
+      - 'server_tests/channel*.py'
+      - 'server_tests/test_channel_browser.py'
+      - 'frontend/src/space/**'
+      - '!frontend/src/space/ChannelForm.tsx'
+      - 'frontend/src/viewer/channel-geometry*'
+      - 'tests/test_space_frame.py'
+      - 'tests/test_caver_profiles.py'
+      - 'tests/test_channel_analysis.py'
+      - 'tests/test_channel_runtime.py'
+      # Native execution is selected by scientific source changes or explicit dispatch.
+      # Shared print sizing has a readonly retained-case gate; no channel recomputation for styles.
+      - '!frontend/src/space/ChannelProfile.tsx'
+      - '!frontend/src/space/ChannelResults.tsx'
+      - '!frontend/src/viewer/channel-geometry*'
+permissions:
+  contents: read
+jobs:
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      runtime_only: ${{ steps.changed.outputs.runtime_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: changed
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          python - <<'PY'
+          import fnmatch, os, subprocess
+          patterns = (
+              'src/opendde_workbench/space/*', 'src/opendde_workbench/receptors/image.py',
+              'server_tests/caver*_probe.py', 'server_tests/channel*.py',
+              'server_tests/test_channel_browser.py', 'frontend/src/space/*',
+              'tests/test_space_frame.py', 'tests/test_caver_profiles.py',
+              'tests/test_channel_analysis.py', 'tests/test_channel_runtime.py',
+              'scripts/generate-channel-lock.py', '.github/workflows/space-analysis-checks.yml',
+          )
+          allowed = {
+              'src/opendde_workbench/space/image.py',
+              'src/opendde_workbench/space/native-requirements.in',
+              'src/opendde_workbench/space/native-requirements.txt',
+              'scripts/generate-channel-lock.py', 'tests/test_channel_runtime.py',
+              'server_tests/channel_runtime_probe.py', '.github/workflows/space-analysis-checks.yml',
+          }
+          before = os.environ.get('BEFORE', '')
+          only = False
+          if os.environ['GITHUB_EVENT_NAME'] == 'push' and before.strip('0'):
+              changed = subprocess.check_output(
+                  ['git', 'diff', '--name-only', before, os.environ['GITHUB_SHA']], text=True
+              ).splitlines()
+              relevant = {p for p in changed if any(fnmatch.fnmatch(p, q) for q in patterns)}
+              only = bool(relevant) and relevant <= allowed
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('runtime_only=' + str(only).lower() + '\n')
+          PY
+  runtime:
+    needs: scope
+    if: needs.scope.outputs.runtime_only == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --group dev
+      - run: uv run --locked ruff check src/opendde_workbench/space/image.py scripts/generate-channel-lock.py tests/test_channel_runtime.py server_tests/channel_runtime_probe.py
+      - run: uv run --locked python scripts/generate-channel-lock.py --check
+      - run: uv run --locked pytest -q tests/test_channel_runtime.py tests/test_channel_analysis.py
+      - name: Real native installation, dependency imports and exact readiness
+        run: uv run --locked python server_tests/channel_runtime_probe.py --output "$RUNNER_TEMP/channel-runtime"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: channel-runtime-evidence
+          path: ${{ runner.temp }}/channel-runtime/acceptance.json
+  native:
+    needs: [scope, utility-scope]
+    if: needs.scope.outputs.runtime_only != 'true' && needs.utility-scope.outputs.spatial_desktop_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked --group dev --group browser
+      - run: uv run --locked pytest -q tests/test_caver_profiles.py tests/test_space_frame.py tests/test_channel_analysis.py tests/test_channel_runtime.py tests/test_structure_preparation.py tests/test_surface_exposure.py tests/test_capabilities.py tests/test_research_assets.py tests/test_examples.py tests/test_example_pins.py tests/test_case_bundle.py tests/test_case_bundle_sources.py
+      - name: Stable native protocol on official and real drug-complex inputs
+        run: uv run --locked python server_tests/caver_native_probe.py --output "$RUNNER_TEMP/caver-native"
+      - name: Actual composed adapter, reusable structure and undefined-radius rejection
+        run: uv run --locked python server_tests/caver_adapter_probe.py --protocol "$RUNNER_TEMP/caver-native"
+      - name: Changed channel questionnaire and geometry display boundary
+        working-directory: frontend
+        run: npx vitest run src/space/ChannelForm.test.tsx src/viewer/channel-geometry.test.ts src/receptors/SurfaceForm.test.tsx src/operations/OperationResults.test.tsx
+      - name: Managed installer, actual task authority, indexed versions and fixed archive
+        run: uv run --locked python server_tests/channel_api_acceptance.py --protocol "$RUNNER_TEMP/caver-native"
+      - name: Stage and install the frozen accepted channel case through the single release pipeline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download examples-v1 --repo "$GITHUB_REPOSITORY" --pattern x-dde-public-cases-v1.zip --dir "$RUNNER_TEMP"
+          uv run --locked python scripts/stage-release-examples.py --tag v0.4.36 --destination "$RUNNER_TEMP/accepted-channel-case"
+          uv run --locked python server_tests/channel_case_install_acceptance.py --base "$RUNNER_TEMP/x-dde-public-cases-v1.zip" --archive "$RUNNER_TEMP/accepted-channel-case/x-dde-channel-cases-v1.zip" --output "$RUNNER_TEMP/caver-native/platform/data-install"
+      - run: uv run --locked python -m playwright install --with-deps chromium
+      - name: Real channel geometry, downloads, module case and fresh questionnaire submission
+        env:
+          WB_CHANNEL_CASE: ${{ runner.temp }}/caver-native/platform
+        run: uv run --locked python -m pytest -q server_tests/test_channel_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: caver-native-evidence
+          path: |
+            ${{ runner.temp }}/caver-native/platform/data-install/installation.json
+            ${{ runner.temp }}/caver-native/platform/*.png
+            ${{ runner.temp }}/caver-native/platform/*.zip
+            ${{ runner.temp }}/caver-native/platform/*.json
+            ${{ runner.temp }}/caver-native/platform/*.csv
+            ${{ runner.temp }}/caver-native/platform/*.svg
+            ${{ runner.temp }}/caver-native/platform/*.log
+            ${{ runner.temp }}/caver-native/adapter-acceptance.json
+            ${{ runner.temp }}/caver-native/adapter-acceptance/actual/result.json
+            ${{ runner.temp }}/caver-native/adapter-acceptance/actual/*.csv
+            ${{ runner.temp }}/caver-native/adapter-acceptance/actual/*.pdb
+            ${{ runner.temp }}/caver-native/adapter-acceptance/actual/*.cif
+            ${{ runner.temp }}/caver-native/adapter-acceptance/actual/context-map.json
+            ${{ runner.temp }}/caver-native/adapter-acceptance/*/probe.log
+            ${{ runner.temp }}/caver-native/adapter-acceptance/actual/native.log
+            ${{ runner.temp }}/caver-native/protocol-acceptance.json
+            ${{ runner.temp }}/caver-native/drug-channels.json
+            ${{ runner.temp }}/caver-native/*/native.log
+            ${{ runner.temp }}/caver-native/*/native/analysis/*.csv

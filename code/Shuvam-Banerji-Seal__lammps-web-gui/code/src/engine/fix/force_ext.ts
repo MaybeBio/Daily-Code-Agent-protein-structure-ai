@@ -1,0 +1,671 @@
+import { Fix } from './fix';
+import { StyleError } from '../force/types';
+import type { System } from '../system';
+import { parseNumOrVar, valueOf, type NumOrVar } from './util';
+import { massOf, hasChargeStyle } from '../atoms';
+import { libm } from '../libm';
+import { inumeric, missingArgs, numeric } from '../force/util';
+import { EQUAL_STYLES } from '../argInfo';
+
+/*
+ * Force-style fixes from wave "force_ext", written only from the LAMMPS
+ * documentation (docs.lammps.org pages cited per class). The engine stores
+ * forces in LAMMPS force units, the same as the pair styles write them into
+ * state.f (the integrators apply v += dt * ftm2v * F / m, see fix/nve.ts), so
+ * a fix force needs no ftm2v factor; energies in LAMMPS energy units, velocities
+ * and positions in LAMMPS units. Measured with native LAMMPS (black box) in
+ * units real and metal: fix viscous 0.5 gives F = -0.5 v, fix gravity 1.0 gives
+ * F = m * 1.0 (m = 12: fz = -12), fix efield 0 0 0.5 with q = 2 gives F = q E qe2f
+ * (fz = 23.060549 in real, 1 in metal).
+ */
+
+/**
+ * fix ID group-ID viscous gamma keyword values ... —
+ * docs.lammps.org/fix_viscous.html, Syntax:
+ *
+ *   fix ID group-ID viscous gamma keyword values ...
+ *
+ * "keyword = *scale*", "*scale* values = type ratio", "type = atom type
+ * (1-N)", "ratio = factor to scale the damping coefficient by".
+ * Description: "The damping force :math:`F_i` is given by
+ * :math:`F_i = - \gamma v_i`." and "If the optional keyword *scale* is used, :math:`\gamma` can scaled up or
+ * down by the specified factor for atoms of that type.  It can be used
+ * multiple times to adjust :math:`\gamma` for several atom types."
+ * "You should specify gamma in force/velocity units."
+ * "The forces due to this fix are imposed during an energy minimization,
+ * invoked by the :doc:`minimize <minimize>` command." Default: "none".
+ * "None of the :doc:`fix_modify <fix_modify>` options are
+ * relevant to this fix.  No global or per-atom quantities are stored by
+ * this fix for access by various :doc:`output commands <Howto_output>`."
+ */
+export class FixViscous extends Fix {
+  readonly style = 'viscous';
+  private gamma = 0;
+  private ratio: Float64Array = new Float64Array(1).fill(1);
+
+  constructor(sys: System, id: string, group: string, args: string[]) {
+    super(sys, id, group, args);
+    // As native LAMMPS does (src/fix_viscous.cpp at b332f28): gamma, then scale type ratio; any bad word is "Illegal
+    // fix viscous command"
+    if (args.length < 1) throw new StyleError('Illegal fix viscous command');
+    this.gamma = numeric(args[0]);
+    const s = sys.state;
+    this.ratio = new Float64Array(s.ntypes + 1).fill(1);
+    for (let k = 1; k < args.length;) {
+      if (args[k] !== 'scale' || k + 3 > args.length) throw new StyleError('Illegal fix viscous command');
+      const t = inumeric(args[k + 1]), r = numeric(args[k + 2]);
+      if (t <= 0 || t > s.ntypes) throw new StyleError('Illegal fix viscous command');
+      this.ratio[t] = r;
+      k += 3;
+    }
+  }
+
+  /** F_i = -gamma_type v_i, gamma_type = gamma * ratio (scale keyword). */
+  postForce(): void {
+    const s = this.sys.state;
+    const { f, v, type, mask } = s;
+    const k = -this.gamma;
+    const bit = this.groupBit;
+    for (let i = 0; i < s.n; i++) {
+      if (!(mask[i] & bit)) continue;
+      const c = k * this.ratio[type[i]];
+      f[3 * i] += c * v[3 * i];
+      f[3 * i + 1] += c * v[3 * i + 1];
+      f[3 * i + 2] += c * v[3 * i + 2];
+    }
+  }
+
+  minPostForce(): void { this.postForce(); }
+}
+
+/**
+ * fix ID group gravity magnitude style args — docs.lammps.org/fix_gravity.html,
+ * Syntax:
+ *
+ *   fix ID group gravity magnitude style args
+ *
+ * "*chute* args = angle", "angle = angle in +x away from -z or -y axis in
+ * 3d/2d (in degrees)"; "*spherical* args = phi theta", "phi = azimuthal angle
+ * from +x axis (in degrees)", "theta = angle from +z or +y axis in 3d/2d (in
+ * degrees)"; "*vector* args = x y z", "x y z = vector direction to apply the
+ * acceleration". Description: "Impose an additional acceleration on each
+ * particle in the group." "The *magnitude* of the acceleration is specified
+ * in force/mass units." Chute: "For 3d systems, the tilt is away from the z axis; for 2d
+ * systems, the tilt is away from the y axis." Spherical: "Thus for acceleration acting in the -z
+ * direction, *theta* would be 180.0 (or -180.0).  *Theta* = 90.0 and
+ * *phi* = -90.0 would mean acceleration acts in the -y direction.  For
+ * 2d systems, *phi* is ignored and *theta* is an angle in the xy plane
+ * where *theta* = 0.0 is the y-axis." Vector: "Only the direction of the vector is important; it's
+ * length is ignored.  For 2d systems, the *z* component is ignored."
+ * "Any of the quantities *magnitude*, *angle*, *phi*, *theta*, *x*, *y*,
+ * *z* which define the gravitational magnitude and direction, can be
+ * specified as an equal-style :doc:`variable <variable>`." ... "the variable will be evaluated each
+ * timestep, and its value used to determine the quantity."
+ *
+ * Output: "This scalar is the
+ * gravitational potential energy of the particles in the defined field,
+ * namely mass \* (g dot x) for each particles, where x and mass are the
+ * particles position and mass, and g is the gravitational field.  The
+ * scalar value calculated by this fix is "extensive"." The
+ * The fix_modify energy option is supported: "The :doc:`fix_modify
+ * <fix_modify>` *energy* option is supported by this fix to add the
+ * gravitational potential energy of the system to the global potential energy
+ * of the system as part of :doc:`thermodynamic output <thermo_style>`."
+ * "The default setting for this fix is :doc:`fix_modify energy no
+ * <fix_modify>`." "This fix is not invoked during :doc:`energy minimization
+ * <minimize>`." Default: "none".
+ */
+export class FixGravity extends Fix {
+  readonly style = 'gravity';
+  private magnitude: NumOrVar;
+  private kind: 'chute' | 'spherical' | 'vector';
+  private a1: NumOrVar;
+  private a2: NumOrVar | null = null;
+  private a3: NumOrVar | null = null;
+  /**
+   * Keyword "disable" (a trailing flag with no value). The docs copy this engine is written from
+   * (docs.lammps.org/fix_gravity.html) does not describe it, so the behaviour is measured with native
+   * LAMMPS (black box): the atoms get no force (their forces stay 0), while fix rigid/small ... gravity
+   * still reads the acceleration through accel(); the scalar and the fix_modify energy term are 0.
+   */
+  private disabled = false;
+
+  constructor(sys: System, id: string, group: string, argsIn: string[]) {
+    super(sys, id, group, argsIn);
+    // As native LAMMPS does (src/fix_gravity.cpp FixGravity::FixGravity at b332f28): the magnitude and the style words are read by
+    // position, the style's arguments follow, and then only the keyword "disable" (no value) may come; any other word is
+    // "Illegal fix gravity command". A style or a short argument list gives the same message.
+    const args = argsIn.slice();
+    if (args.length < 2) throw new StyleError('Illegal fix gravity command');
+    this.magnitude = parseNumOrVar(args[0], 'gravity magnitude');
+    const style = args[1];
+    const styleArgs = style === 'chute' ? 3 : style === 'spherical' ? 4 : style === 'vector' ? 5 : 0;
+    if (styleArgs === 0 || args.length < styleArgs) throw new StyleError('Illegal fix gravity command');
+    if (style === 'chute') {
+      this.a1 = parseNumOrVar(args[2], 'gravity chute angle');
+      this.kind = 'chute';
+    } else if (style === 'spherical') {
+      this.a1 = parseNumOrVar(args[2], 'gravity spherical phi');
+      this.a2 = parseNumOrVar(args[3], 'gravity spherical theta');
+      this.kind = 'spherical';
+    } else {
+      this.a1 = parseNumOrVar(args[2], 'gravity vector x');
+      this.a2 = parseNumOrVar(args[3], 'gravity vector y');
+      this.a3 = parseNumOrVar(args[4], 'gravity vector z');
+      this.kind = 'vector';
+    }
+    for (const w of args.slice(styleArgs)) {
+      if (w !== 'disable') throw new StyleError('Illegal fix gravity command');
+      this.disabled = true;
+    }
+    if (this.kind === 'vector') {
+      // a constant zero direction is rejected when the fix is defined; a
+      // variable that evaluates to zero at some step is caught in gvec().
+      // A disabled fix never evaluates its direction for the atoms, so it is not rejected here.
+      if (!this.disabled && typeof this.a1 === 'number' && typeof this.a2 === 'number' && typeof this.a3 === 'number'
+        && this.a1 === 0 && this.a2 === 0 && this.a3 === 0) {
+        throw new StyleError(`fix ${id} gravity: the vector direction must be non-zero`);
+      }
+    }
+    this.scalarFlag = true;
+    this.extscalar = 1;
+    this.energyGlobal = true;
+  }
+
+  /** Current gravitational field g (force/mass units); variables evaluated now. */
+  private gvec(out: Float64Array): void {
+    const two = this.sys.state.dimension === 2;
+    const rad = Math.PI / 180;
+    if (this.kind === 'chute') {
+      const a = valueOf(this.sys, this.a1) * rad;
+      // "angle in +x away from -z or -y axis": tilt toward +x from -z (3d) / -y (2d)
+      out[0] = libm.sin(a);
+      out[1] = two ? -libm.cos(a) : 0;
+      out[2] = two ? 0 : -libm.cos(a);
+    } else if (this.kind === 'spherical') {
+      const phi = valueOf(this.sys, this.a1) * rad;
+      const theta = valueOf(this.sys, this.a2!) * rad;
+      if (two) {
+        // "theta is an angle in the xy plane where theta = 0.0 is the y-axis"
+        out[0] = libm.sin(theta);
+        out[1] = libm.cos(theta);
+        out[2] = 0;
+      } else {
+        const st = libm.sin(theta);
+        out[0] = st * libm.cos(phi);
+        out[1] = st * libm.sin(phi);
+        out[2] = libm.cos(theta);
+      }
+    } else {
+      const x = valueOf(this.sys, this.a1);
+      const y = valueOf(this.sys, this.a2!);
+      const z = two ? 0 : valueOf(this.sys, this.a3!);
+      const len = Math.sqrt(x * x + y * y + z * z);
+      if (!(len > 0)) throw new StyleError(`fix ${this.id} gravity: the vector direction must be non-zero`);
+      out[0] = x / len;
+      out[1] = y / len;
+      out[2] = z / len;
+    }
+  }
+
+  /**
+   * Acceleration this fix imposes, in LAMMPS force/mass units (magnitude * direction; the page says the
+   * magnitude "is specified in force/mass units"), whether or not the fix is disabled: fix rigid ...
+   * gravity reads it for each body. Measured with native LAMMPS (black box): with the gravity keyword
+   * the body force is the body mass times this acceleration.
+   */
+  accel(out: Float64Array): void {
+    this.gvec(out);
+    const c = valueOf(this.sys, this.magnitude);
+    out[0] *= c; out[1] *= c; out[2] *= c;
+  }
+
+  /** F = mass * magnitude * direction; "the same acceleration to each atom". */
+  postForce(): void {
+    if (this.disabled) return;
+    const s = this.sys.state;
+    const g = new Float64Array(3);
+    this.gvec(g);
+    const c = valueOf(this.sys, this.magnitude);
+    const { f, mask } = s;
+    const bit = this.groupBit;
+    for (let i = 0; i < s.n; i++) {
+      if (!(mask[i] & bit)) continue;
+      const m = massOf(s, i) * c;
+      f[3 * i] += m * g[0];
+      f[3 * i + 1] += m * g[1];
+      f[3 * i + 2] += m * g[2];
+    }
+  }
+
+  /**
+   * Potential energy of the field: -mass * (g dot x) for each particle in the
+   * group. The doc names the expression "mass \* (g dot x)"; the potential
+   * energy of the field is its negative, so that -Grad(U) = F = +mass * g (the
+   * same -x.qE convention the fix_efield page states explicitly), which is also
+   * what native LAMMPS outputs (oracle cases w2fdamp_gravity /
+   * w2fdamp_gravity_chute). The mass times the force/mass-unit acceleration is
+   * already an energy (force times distance), so no mvv2e factor: measured with
+   * native LAMMPS (black box), units real, mass 12 at (5,5,5) with
+   * gravity 1.0 vector 0 0 -1 and fix_modify energy yes gives pe = 60, the same
+   * as in metal.
+   */
+  private energyNow(): number {
+    // Measured with native LAMMPS (black box): with disable the scalar and the fix_modify energy term are 0.
+    if (this.disabled) return 0;
+    const s = this.sys.state;
+    const g = new Float64Array(3);
+    this.gvec(g);
+    const k = valueOf(this.sys, this.magnitude);
+    const { x, mask } = s;
+    const bit = this.groupBit;
+    let e = 0;
+    for (let i = 0; i < s.n; i++) {
+      if (!(mask[i] & bit)) continue;
+      e += massOf(s, i) * (g[0] * x[3 * i] + g[1] * x[3 * i + 1] + g[2] * x[3 * i + 2]);
+    }
+    return -e * k;
+  }
+
+  energy(): number { return this.energyNow(); }
+  computeScalar(): number { return this.energyNow(); }
+}
+
+/**
+ * fix ID group-ID lineforce x y z — docs.lammps.org/fix_lineforce.html,
+ * Syntax:
+ *
+ *   fix ID group-ID lineforce x y z
+ *
+ * "x y z = direction of line as a 3-vector". Description: "Adjust the forces on each atom in the group so that only the component
+ * of force along the linear direction specified by the vector (x,y,z)
+ * remains.  This is done by subtracting out components of force in the
+ * plane perpendicular to the line." "The forces due to this fix are imposed during an energy minimization,
+ * invoked by the :doc:`minimize <minimize>` command." Default: "none".
+ */
+export class FixLineforce extends Fix {
+  readonly style = 'lineforce';
+  private n = new Float64Array(3);
+
+  constructor(sys: System, id: string, group: string, args: string[]) {
+    super(sys, id, group, args);
+    if (args.length !== 3) throw new StyleError('usage: fix ID group-ID lineforce x y z');
+    let len = 0;
+    for (let d = 0; d < 3; d++) {
+      // As native LAMMPS does (src/fix_lineforce.cpp FixLineForce::FixLineForce at b332f28): read with utils::numeric
+      const v = numeric(args[d]);
+      this.n[d] = v;
+      len += v * v;
+    }
+    len = Math.sqrt(len);
+    if (!(len > 0)) throw new StyleError('Illegal fix lineforce command');
+    for (let d = 0; d < 3; d++) this.n[d] /= len;
+  }
+
+  /** Keep only the force component along the (unit) line direction. */
+  postForce(): void {
+    const s = this.sys.state;
+    const { f, mask } = s;
+    const [nx, ny, nz] = this.n;
+    const bit = this.groupBit;
+    for (let i = 0; i < s.n; i++) {
+      if (!(mask[i] & bit)) continue;
+      const d = f[3 * i] * nx + f[3 * i + 1] * ny + f[3 * i + 2] * nz;
+      f[3 * i] = d * nx;
+      f[3 * i + 1] = d * ny;
+      f[3 * i + 2] = d * nz;
+    }
+  }
+
+  minPostForce(): void { this.postForce(); }
+}
+
+/**
+ * fix ID group-ID planeforce x y z — docs.lammps.org/fix_planeforce.html,
+ * Syntax:
+ *
+ *   fix ID group-ID planeforce x y z
+ *
+ * "x y z = 3-vector that is normal to the plane". Description: "Adjust the
+ * forces on each atom in the group so that only the
+ * components of force in the plane specified by the normal vector
+ * (x,y,z) remain.  This is done by subtracting out the component of
+ * force perpendicular to the plane." "The
+ * forces due to this fix are imposed during an energy minimization,
+ * invoked by the :doc:`minimize <minimize>` command." Default: "none".
+ */
+export class FixPlaneforce extends Fix {
+  readonly style = 'planeforce';
+  private n = new Float64Array(3);
+
+  constructor(sys: System, id: string, group: string, args: string[]) {
+    super(sys, id, group, args);
+    if (args.length !== 3) throw new StyleError('usage: fix ID group-ID planeforce x y z');
+    let len = 0;
+    for (let d = 0; d < 3; d++) {
+      // As native LAMMPS does (src/fix_planeforce.cpp FixPlaneForce::FixPlaneForce at b332f28): read with utils::numeric
+      const v = numeric(args[d]);
+      this.n[d] = v;
+      len += v * v;
+    }
+    len = Math.sqrt(len);
+    if (!(len > 0)) throw new StyleError('Illegal fix planeforce command');
+    for (let d = 0; d < 3; d++) this.n[d] /= len;
+  }
+
+  /** Remove the force component along the (unit) plane normal. */
+  postForce(): void {
+    const s = this.sys.state;
+    const { f, mask } = s;
+    const [nx, ny, nz] = this.n;
+    const bit = this.groupBit;
+    for (let i = 0; i < s.n; i++) {
+      if (!(mask[i] & bit)) continue;
+      const d = f[3 * i] * nx + f[3 * i + 1] * ny + f[3 * i + 2] * nz;
+      f[3 * i] -= d * nx;
+      f[3 * i + 1] -= d * ny;
+      f[3 * i + 2] -= d * nz;
+    }
+  }
+
+  minPostForce(): void { this.postForce(); }
+}
+
+/** One E-field component: a constant, or a variable (equal-style or atom-style). */
+type EComp = { const: number } | { var: string };
+
+/**
+ * fix ID group-ID efield ex ey ez keyword value ... —
+ * docs.lammps.org/fix_efield.html, Syntax:
+ *
+ *   fix ID group-ID style ex ey ez keyword value ...
+ *
+ * "ex,ey,ez = E-field component values (electric field units)", "any of
+ * ex,ey,ez can be a variable", "keyword = *region* or *energy* or
+ * *potential*". Description: "Add a force :math:`\vec{F} = q\vec{E}` to each charged atom in the group due to an
+ * external electric field being applied to the system." "If the *region* keyword is used, the atom must also be in the
+ * specified geometric :doc:`region <region>` in order to have force added
+ * to it." Energy: "The *energy* keyword is not allowed if the added field is a constant
+ * vector (ex,ey,ez), with all components defined as numeric constants
+ * and not as variables." ... the energy is computed directly as
+ * "U_{efield} = -\vec{x} \cdot q\vec{E} = -q (x\cdot E_x + y\cdot E_y + z\cdot Ez),".
+ * "If the keyword is not used, LAMMPS will set
+ * the energy to 0.0, which is typically fine for dynamics." Potential:
+ * "The energy added by this
+ * fix is then calculated as the electric potential multiplied by charge."
+ * "Thus, when the *potential*
+ * keyword is specified, the *energy* keyword must not be used."
+ * "the *potential* keyword is not allowed if the added field is a
+ * constant vector". Output: "This fix computes a global scalar and a global 3-vector of forces,
+ * which can be accessed by various :doc:`output commands
+ * <Howto_output>`.  The scalar is the potential energy discussed above.
+ * The vector is the total force added to the group of atoms.  The scalar
+ * and vector values calculated by this fix are "extensive"."
+ * "The :doc:`fix_modify <fix_modify>` *energy* option is supported by this
+ * fix to add the potential energy inferred by the added force due to the
+ * electric field to the global potential energy of the system as part of"
+ * ("The default setting for
+ * this fix is :doc:`fix_modify energy no <fix_modify>`"), same for virial
+ * ("The :doc:`fix_modify <fix_modify>` *virial* option is supported by this
+ * fix to add the contribution due to the added forces on atoms").
+ * "The forces due to this fix are imposed during an energy minimization,
+ * invoked by the :doc:`minimize <minimize>` command." Default: "none".
+ *
+ * Point dipoles (the page's point-dipole paragraph): torque mu x E (times qe2f) and energy -mu . E
+ * for equal-style fields; atom-style
+ * variables on dipoles and dipoles without torque storage are StyleErrors. The dipole
+ * force (p . grad) E is not computed (the page points to fix efield/lepton).
+ */
+export class FixEfield extends Fix {
+  readonly style = 'efield';
+  private comp: EComp[] = [];
+  private allConst = true;
+  private regionId: string | null = null;
+  private energyVar: string | null = null;
+  private potentialVar: string | null = null;
+  /** Per-atom force added by the last postForce, in LAMMPS force units. */
+  private fadd: Float64Array = new Float64Array(0);
+
+  /** The style the native messages name (efield, or efield/tip4p for the wrapper of fix_efield_tip4p.ts). */
+  private readonly msgStyle: string;
+
+  constructor(sys: System, id: string, group: string, args: string[], keywordStyle = 'efield') {
+    super(sys, id, group, args);
+    this.msgStyle = keywordStyle;
+    // As native LAMMPS does (src/fix_efield.cpp FixEfield::FixEfield at b332f28): the three components (a v_name, whose
+    // variable is looked up at init, or utils::numeric), then the keywords
+    if (args.length < 3) throw missingArgs(`fix ${keywordStyle}`);
+    this.comp = [FixEfield.parseComp(args[0]), FixEfield.parseComp(args[1]), FixEfield.parseComp(args[2])];
+    this.allConst = this.comp.every((c) => 'const' in c);
+    for (let k = 3; k < args.length; k += 2) {
+      const key = args[k];
+      const val = args[k + 1];
+      if (key === 'region') {
+        if (val === undefined) throw missingArgs(`fix ${keywordStyle} region`);
+        if (!sys.regions.has(val)) throw new StyleError(`Region ${val} for fix ${keywordStyle} does not exist`);
+        this.regionId = val;
+      } else if (key === 'energy' || key === 'potential') {
+        // native's count message has no blank before the keyword ("fix efieldenergy"), and both keywords report a
+        // value that is no v_name as "energy command" naming the keyword
+        if (val === undefined) throw missingArgs(`fix ${keywordStyle}${key}`);
+        if (!val.startsWith('v_')) throw new StyleError(`Unsupported argument for fix ${keywordStyle} energy command: ${key}`);
+        if (key === 'energy') this.energyVar = val.slice(2);
+        else this.potentialVar = val.slice(2);
+      } else {
+        throw new StyleError(`Unknown keyword for fix ${keywordStyle} command: ${key}`);
+      }
+    }
+    if (this.energyVar !== null && this.potentialVar !== null) throw new StyleError('Must not use energy and potential keywords at the same time with fix efield');
+    this.scalarFlag = true;
+    this.vectorFlag = true;
+    this.sizeVector = 3;
+    this.extscalar = 1;
+    this.extvector = 1;
+    this.energyGlobal = true;
+    this.virialGlobal = true;
+    this.fadd = new Float64Array(3 * sys.state.n);
+  }
+
+  /** A component: a v_name (its style is found at init) or a number (utils::numeric). */
+  private static parseComp(w: string): EComp {
+    if (w.startsWith('v_')) return { var: w.slice(2) };
+    return { const: numeric(w) };
+  }
+
+  /**
+   * As native LAMMPS does (src/fix_efield.cpp FixEfield::init at b332f28): the atoms have charges or point dipoles; each
+   * component variable exists and is equal- or atom-style; the energy and potential variables are atom-style; the
+   * region exists; dipoles take no atom-style field, and a constant field takes no energy or potential variable.
+   */
+  init(): void {
+    const s = this.sys.state;
+    const st = this.msgStyle;
+    const qflag = hasChargeStyle(s.atomStyle);
+    const muflag = !!s.mu && !!s.torque;
+    if (!qflag && !muflag) throw new StyleError(`Fix ${st} requires atom attribute q or mu`);
+    ['x', 'y', 'z'].forEach((axis, d) => {
+      const c = this.comp[d];
+      if ('const' in c) return;
+      const v = this.sys.vars.get(c.var);
+      if (!v) throw new StyleError(`Variable ${c.var} for ${axis}-field in fix ${st} does not exist`);
+      if (!EQUAL_STYLES.has(v.style) && v.style !== 'atom' && v.style !== 'atomfile') throw new StyleError(`Variable ${c.var} for ${axis}-field in fix ${st} is invalid style`);
+    });
+    for (const [name, what] of [[this.energyVar, 'energy'], [this.potentialVar, 'potential']] as const) {
+      if (name === null) continue;
+      const v = this.sys.vars.get(name);
+      if (!v) throw new StyleError(`Variable ${name} for ${what} in fix ${st} does not exist`);
+      if (v.style !== 'atom' && v.style !== 'atomfile') throw new StyleError(`Variable ${name} for ${what} in fix ${st} must be atom-style`);
+    }
+    if (this.regionId !== null && !this.sys.regions.has(this.regionId)) throw new StyleError(`Region ${this.regionId} for fix ${st} does not exist`);
+    const atomField = this.comp.some((c) => this.isAtomComp(c));
+    if (muflag && atomField) throw new StyleError(`Fix ${st} with dipoles cannot use atom-style variables`);
+    if (this.allConst && this.energyVar !== null) throw new StyleError(`Cannot use variable energy with constant efield in fix ${st}`);
+    if (this.allConst && this.potentialVar !== null) throw new StyleError(`Cannot use variable potential with constant efield in fix ${st}`);
+  }
+
+  /**
+   * Read-only view of the field for the current step: each component's value (a number for a constant
+   * or equal-style variable, one value per atom for an atom-style variable, evaluated at the call),
+   * whether it is a constant and whether it is atom-style; plus the region keyword's ID (or null).
+   */
+  fieldState(): { comp: { value: number | Float64Array; constant: boolean; atomStyle: boolean }[]; region: string | null } {
+    return {
+      comp: this.comp.map((c) => ({
+        value: this.resolve(c),
+        constant: 'const' in c,
+        atomStyle: this.isAtomComp(c),
+      })),
+      region: this.regionId,
+    };
+  }
+
+  /**
+   * A component given by an atom-style variable. The variable's style is read at the call, so the fixes that read the
+   * field before this fix's init (qeq/reaxff and the other charge-equilibration fixes) see it too.
+   */
+  private isAtomComp(c: EComp): boolean {
+    if ('const' in c) return false;
+    const v = this.sys.vars.get(c.var);
+    return v !== undefined && (v.style === 'atom' || v.style === 'atomfile');
+  }
+
+  /** Resolves one component now: a number, or per-atom values. */
+  private resolve(c: EComp): number | Float64Array {
+    if ('const' in c) return c.const;
+    if (this.isAtomComp(c)) return this.sys.atomVariable(c.var);
+    return this.sys.equalVariable(c.var);
+  }
+
+  private compAt(r: number | Float64Array, i: number): number {
+    return typeof r === 'number' ? r : r[i];
+  }
+
+  private inRegion(i: number): boolean {
+    if (this.regionId === null) return true;
+    const s = this.sys.state;
+    return this.sys.region(this.regionId).match(s.x[3 * i], s.x[3 * i + 1], s.x[3 * i + 2]);
+  }
+
+  /** F = q E on each charged atom of the group (and region, if given). */
+  postForce(): void {
+    const sys = this.sys;
+    const s = sys.state;
+    const [rx, ry, rz] = [this.resolve(this.comp[0]), this.resolve(this.comp[1]), this.resolve(this.comp[2])];
+    // F = q E qe2f in LAMMPS force units (fix_efield page: F = qE; the qe2f factor converts the field units)
+    const k = s.units.qe2f;
+    const { f, q, mask } = s;
+    const bit = this.groupBit;
+    const fadd = this.fadd;
+    fadd.fill(0);
+    // fix_efield.html: "also add a torque" p x E "on the dipoles due to the external electric field";
+    // the torque uses the charge-to-force factor qe2f alone (measured with native LAMMPS, black box).
+    const mu = s.mu, tq = s.torque;
+    if (mu && tq) {
+      const kt = s.units.qe2f;
+      for (let i = 0; i < s.n; i++) {
+        if (!(mask[i] & bit) || !this.inRegion(i)) continue;
+        const ex = this.compAt(rx, i), ey = this.compAt(ry, i), ez = this.compAt(rz, i);
+        const px = mu[4 * i], py = mu[4 * i + 1], pz = mu[4 * i + 2];
+        tq[3 * i] += kt * (py * ez - pz * ey);
+        tq[3 * i + 1] += kt * (pz * ex - px * ez);
+        tq[3 * i + 2] += kt * (px * ey - py * ex);
+      }
+    }
+    for (let i = 0; i < s.n; i++) {
+      if (!(mask[i] & bit)) continue;
+      if (!this.inRegion(i)) continue;
+      const fx = q[i] * this.compAt(rx, i) * k;
+      const fy = q[i] * this.compAt(ry, i) * k;
+      const fz = q[i] * this.compAt(rz, i) * k;
+      fadd[3 * i] = fx;
+      fadd[3 * i + 1] = fy;
+      fadd[3 * i + 2] = fz;
+      f[3 * i] += fx;
+      f[3 * i + 1] += fy;
+      f[3 * i + 2] += fz;
+    }
+    if (this.thermoVirial) this.tallyVirial();
+  }
+
+  /** Virial of the added forces, in the pressure compute's internal units. */
+  private tallyVirial(): void {
+    const s = this.sys.state;
+    const v = this.virial;
+    v.fill(0);
+    const { x } = s;
+    const fadd = this.fadd;
+    for (let i = 0; i < s.n; i++) {
+      const fx = fadd[3 * i], fy = fadd[3 * i + 1], fz = fadd[3 * i + 2];
+      if (fx === 0 && fy === 0 && fz === 0) continue;
+      const px = x[3 * i], py = x[3 * i + 1], pz = x[3 * i + 2];
+      v[0] += fx * px;
+      v[1] += fy * py;
+      v[2] += fz * pz;
+      v[3] += 0.5 * (fx * py + fy * px);
+      v[4] += 0.5 * (fx * pz + fz * px);
+      v[5] += 0.5 * (fy * pz + fz * py);
+    }
+  }
+
+  /**
+   * The fix's scalar energy: -q (x.E) for a constant vector, an atom-style
+   * energy variable, an electric potential times charge, or 0.0 with
+   * variables and no keyword.
+   */
+  private energyNow(): number {
+    const s = this.sys.state;
+    const { x, q, mask } = s;
+    const bit = this.groupBit;
+    if (this.energyVar !== null) {
+      const ev = this.sys.atomVariable(this.energyVar);
+      let e = 0;
+      for (let i = 0; i < s.n; i++) {
+        if (!(mask[i] & bit) || !this.inRegion(i)) continue;
+        e += ev[i];
+      }
+      return e;
+    }
+    if (this.potentialVar !== null) {
+      // "the electric potential multiplied by charge" (qe2f: potential*charge -> energy)
+      const pv = this.sys.atomVariable(this.potentialVar);
+      const k = s.units.qe2f;
+      let e = 0;
+      for (let i = 0; i < s.n; i++) {
+        if (!(mask[i] & bit) || !this.inRegion(i)) continue;
+        e += pv[i] * q[i] * k;
+      }
+      return e;
+    }
+    if (this.allConst) {
+      const [ex, ey, ez] = [this.compAt(this.resolve(this.comp[0]), 0), this.compAt(this.resolve(this.comp[1]), 0), this.compAt(this.resolve(this.comp[2]), 0)];
+      const k = s.units.qe2f;
+      let e = 0;
+      const u: number[] = [0, 0, 0];
+      for (let i = 0; i < s.n; i++) {
+        if (!(mask[i] & bit) || !this.inRegion(i)) continue;
+        // the energy is -x . qE on the unwrapped position (image flags), so periodic images count
+        this.sys.geom.unwrap(x, s.image, i, u);
+        e -= q[i] * (u[0] * ex + u[1] * ey + u[2] * ez) * k;
+        // fix_efield.html gives the dipole energy U_efield = -mu . E (the page's U_{efield} = -mu E form),
+        // with the same conversion factor as the charges
+        if (s.mu) e -= (s.mu[4 * i] * ex + s.mu[4 * i + 1] * ey + s.mu[4 * i + 2] * ez) * k;
+      }
+      return e;
+    }
+    return 0;
+  }
+
+  energy(): number { return this.energyNow(); }
+  computeScalar(): number { return this.energyNow(); }
+
+  /** "The vector is the total force added to the group of atoms" (LAMMPS force units). */
+  computeVector(i: number): number {
+    const s = this.sys.state;
+    const fadd = this.fadd;
+    let sum = 0;
+    for (let a = 0; a < s.n; a++) sum += fadd[3 * a + i];
+    return sum;
+  }
+
+  minPostForce(): void { this.postForce(); }
+}

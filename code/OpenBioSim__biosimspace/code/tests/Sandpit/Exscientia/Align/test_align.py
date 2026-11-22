@@ -1,0 +1,1345 @@
+import sys
+import warnings
+
+import pytest
+from sire.legacy.Maths import Vector
+from sire.legacy.MM import InternalFF, IntraCLJFF, IntraFF
+from sire.legacy.Mol import AtomIdx, Element, PartialMolecule
+
+import BioSimSpace.Sandpit.Exscientia as BSS
+from tests.Sandpit.Exscientia.conftest import (
+    has_antechamber,
+    has_openff,
+    has_tleap,
+    url,
+)
+
+
+@pytest.fixture(scope="session")
+def system0():
+    return BSS.IO.readMolecules(
+        [f"{url}/ligand01.prm7.bz2", f"{url}/ligand01.rst7.bz2"]
+    )
+
+
+@pytest.fixture(scope="session")
+def system1():
+    return BSS.IO.readMolecules(
+        [f"{url}/ligand02.prm7.bz2", f"{url}/ligand02.rst7.bz2"]
+    )
+
+
+def test_flex_align(system0, system1):
+    # This tests that the flex align functionality runs. We can't test
+    # for consistent output, since we have occasionally observed different
+    # mappings across platforms.
+
+    # Extract the molecules.
+    m0 = system0.getMolecules()[0]
+    m1 = system1.getMolecules()[0]
+
+    # Get the best mapping between the molecules that contains the prematch.
+    mapping = BSS.Align.matchAtoms(
+        m0, m1, timeout=BSS.Units.Time.second, scoring_function="rmsd_flex_align"
+    )
+
+
+# Parameterise the function with a set of valid atom pre-matches.
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Sire MCS currently not supported on Windows"
+)
+@pytest.mark.parametrize("prematch", [{3: 1}, {5: 9}, {4: 5}, {1: 0}])
+def test_prematch(system0, system1, prematch):
+    # Extract the molecules.
+    m0 = system0.getMolecules()[0]
+    m1 = system1.getMolecules()[0]
+
+    # Get the best mapping between the molecules that contains the prematch.
+    mapping = BSS.Align.matchAtoms(
+        m0, m1, timeout=BSS.Units.Time.second, prematch=prematch
+    )
+
+    # Check that the prematch key:value pair is in the mapping.
+    for key, value in prematch.items():
+        assert mapping[key] == value
+
+
+# Parameterise the function with a set of invalid atom pre-matches.
+@pytest.mark.parametrize("prematch", [{-1: 1}, {50: 9}, {4: 48}, {1: -1}])
+def test_invalid_prematch(system0, system1, prematch):
+    # Extract the molecules.
+    m0 = system0.getMolecules()[0]
+    m1 = system1.getMolecules()[0]
+
+    # Assert that the invalid prematch raises a ValueError.
+    with pytest.raises(ValueError):
+        mapping = BSS.Align.matchAtoms(
+            m0, m1, timeout=BSS.Units.Time.second, prematch=prematch
+        )
+
+
+@pytest.fixture()
+def propane():
+    return BSS.Parameters.parameterise(
+        "CCC", "openff_unconstrained-2.0.0", use_nagl=False
+    ).getMolecule()
+
+
+@pytest.fixture()
+def butane():
+    return BSS.Parameters.parameterise(
+        "CCCC", "openff_unconstrained-2.0.0", use_nagl=False
+    ).getMolecule()
+
+
+@pytest.fixture()
+def propane_butane(propane, butane):
+    # Hardcoded mapping to avoid non-deterministic MCS results on symmetric
+    # molecules. Atom 3 (H4 on C1) is excluded to ensure a dummy in both
+    # end states. Generated with matchAtoms then pop(3) on a reference run:
+    #   propane: C1(0) C2(1) C3(2) H4(3) H5(4) H6(5) H7(6) H8(7) H9(8) H10(9) H11(10)
+    #   butane:  C1(0) C2(1) C3(2) C4(3) H5(4) H6(5) H7(6) H8(7) H9(8) H10(9) H11(10) H12(11) H13(12) H14(13)
+    mapping = {0: 2, 1: 1, 2: 0, 4: 3, 5: 10, 6: 7, 7: 8, 8: 6, 9: 5, 10: 4}
+    return BSS.Align.merge(propane, butane, mapping)
+
+
+@pytest.mark.skipif(
+    has_antechamber is False or has_openff is False,
+    reason="Requires AmberTools/antechamber and OpenFF to be installed.",
+)
+def test_propane_butane_1_4(propane_butane, tmp_path_factory):
+    # This is a regression test for a bug introduced in a recent commit
+    # I don't know of a more rational way of checking it so I am doing it the old-fashioned way
+    tmpdir = tmp_path_factory.mktemp("TestMerge")
+    BSS.IO.saveMolecules(str(tmpdir / "propane_butane"), propane_butane, "grotop")
+    contents = open(tmpdir / "propane_butane.top").readlines()
+    n_nb = 0
+    reached_nb = False
+
+    # Get the number of 1-4 interactions
+    for line in contents:
+        if line[0] == ";":
+            continue
+        if reached_nb:
+            if line.strip():
+                n_nb += 1
+            else:
+                break
+        if "[ pairs ]" in line:
+            reached_nb = True
+
+    assert n_nb == 33
+
+
+@pytest.mark.parametrize(
+    "s0_files,s1_files",
+    [
+        (
+            [f"{url}/ligand31.prm7.bz2", f"{url}/ligand31.rst7.bz2"],
+            [f"{url}/ligand38.prm7.bz2", f"{url}/ligand38.rst7.bz2"],
+        ),
+        pytest.param(
+            [f"{url}/glycam_M5.gro.bz2", f"{url}/glycam_M5.top.bz2"],
+            [f"{url}/glycam_M5G0.gro.bz2", f"{url}/glycam_M5G0.top.bz2"],
+            marks=pytest.mark.slow,
+        ),
+    ],
+)
+def test_merge(s0_files, s1_files):
+    # Load the molecules.
+    s0 = BSS.IO.readMolecules(s0_files)
+    s1 = BSS.IO.readMolecules(s1_files)
+
+    # Extract the molecules.
+    m0 = s0.getMolecules()[0]
+    m1 = s1.getMolecules()[0]
+
+    # Get the best mapping between the molecules.
+    mapping = BSS.Align.matchAtoms(m0, m1, timeout=BSS.Units.Time.second)
+
+    # Align m0 to m1 based on the mapping.
+    m0 = BSS.Align.rmsdAlign(m0, m1, mapping)
+
+    # Create the merged molecule.
+    m2 = BSS.Align.merge(m0, m1, mapping, allow_ring_breaking=True)
+
+    # Store the number of atoms in m0.
+    n0 = m0._sire_object.num_atoms()
+
+    # Test that the intramolecular energies are the same.
+
+    # IntraCLJFF:
+    #  Old interface. Uses the "intrascale" matrix. Validate that this
+    #  is consistent.
+    # IntraFF:
+    #  New interface. Uses atom "connectivity". Validate that the bonding
+    #  is consistent.
+
+    intraclj0 = IntraCLJFF("intraclj")
+    intraclj0.add(m0._sire_object)
+
+    intraff0 = IntraFF("intraclj")
+    intraff0.add(m0._sire_object)
+
+    intraclj1 = IntraCLJFF("intraclj")
+    intraclj1.add(m1._sire_object)
+
+    intraff1 = IntraFF("intraclj")
+    intraff1.add(m1._sire_object)
+
+    intraclj2 = IntraCLJFF("intraclj")
+    intraff2 = IntraFF("intraclj")
+
+    # Create maps between property names: { "prop" : "prop0" }, { "prop" : "prop1" }
+    pmap0 = {}
+    pmap1 = {}
+    for prop in m2._sire_object.property_keys():
+        if prop[-1] == "0":
+            pmap0[prop[:-1]] = prop
+        elif prop[-1] == "1":
+            pmap1[prop[:-1]] = prop
+
+    intraclj2.add(m2._sire_object, pmap0)
+    intraff2.add(m2._sire_object, pmap0)
+
+    assert intraclj0.energy().value() == pytest.approx(intraclj2.energy().value())
+    assert intraff0.energy().value() == pytest.approx(intraff2.energy().value())
+
+    intraclj2 = IntraCLJFF("intraclj")
+    intraff2 = IntraFF("intraclj")
+
+    intraclj2.add(m2._sire_object, pmap1)
+    intraff2.add(m2._sire_object, pmap1)
+
+    assert intraclj1.energy().value() == pytest.approx(intraclj2.energy().value())
+    assert intraff1.energy().value() == pytest.approx(intraff2.energy().value())
+
+    # Test that the internal energies are consistent. This will validate that
+    # bond, angle, dihedral, and improper energies are correct.
+
+    internalff0 = InternalFF("internal")
+    internalff0.set_strict(True)
+    internalff0.add(m0._sire_object)
+
+    internalff1 = InternalFF("internal")
+    internalff1.set_strict(True)
+    internalff1.add(m1._sire_object)
+
+    # First extract a partial molecule using the atoms from molecule0 in
+    # the merged molecule.
+    selection = m2._sire_object.selection()
+    selection.deselect_all()
+    for atom in m0._sire_object.atoms():
+        selection.select(atom.index())
+    partial_mol = PartialMolecule(m2._sire_object, selection)
+
+    internalff2 = InternalFF("internal")
+    internalff2.set_strict(True)
+    internalff2.add(partial_mol, pmap0)
+
+    assert internalff0.energy().value() == pytest.approx(internalff2.energy().value())
+
+    # Extract the original molecule for the lambda=0 end state.
+    amber_mol, _ = m2._extractMolecule()
+
+    internalff2 = InternalFF("internal")
+    internalff2.set_strict(True)
+    internalff2.add(amber_mol._sire_object)
+
+    assert internalff0.energy().value() == pytest.approx(internalff2.energy().value())
+
+    # Now extract a partial molecule using the atoms from molecule1 in
+    # the merged molecule.
+    selection = m2._sire_object.selection()
+    selection.deselect_all()
+    for idx in mapping.keys():
+        selection.select(AtomIdx(idx))
+    for idx in range(n0, m2._sire_object.num_atoms()):
+        selection.select(AtomIdx(idx))
+    partial_mol = PartialMolecule(m2._sire_object, selection)
+
+    internalff2 = InternalFF("internal")
+    internalff2.set_strict(True)
+    internalff2.add(partial_mol, pmap1)
+
+    assert internalff1.energy().value() == pytest.approx(internalff2.energy().value())
+
+    # Extract the original molecule for the lambda=1 end state.
+    amber_mol, _ = m2._extractMolecule(is_lambda1=True)
+
+    internalff2 = InternalFF("internal")
+    internalff2.set_strict(True)
+    internalff2.add(amber_mol._sire_object)
+
+    assert internalff1.energy().value() == pytest.approx(internalff2.energy().value())
+
+
+@pytest.fixture(scope="module")
+def roi_mol0():
+    files = BSS.IO.expand(url, ["wild.prmtop", "wild.inpcrd"], ".bz2")
+    return BSS.IO.readMolecules(files)[0]
+
+
+@pytest.fixture(scope="module")
+def roi_mol1():
+    files = BSS.IO.expand(url, ["mutated.prmtop", "mutated.inpcrd"], ".bz2")
+    return BSS.IO.readMolecules(files)[0]
+
+
+@pytest.fixture(scope="module")
+def roi_merged_mol(roi_mol0, roi_mol1):
+    # Extract the residue name and index
+    def get_res_info(mol):
+        mol_res_name = []
+        mol_res_idx = []
+        for bss_res in mol.getResidues():
+            mol_res_name.append(bss_res.name())
+            mol_res_idx.append([x.index() for x in bss_res.getAtoms()])
+        return mol_res_name, mol_res_idx
+
+    def recover_mapping(mut1_idx, mut2_idx, mapping):
+        new_mapping = {}
+        for k, v in mapping.items():
+            new_mapping[mut1_idx[k]] = mut2_idx[v]
+        return new_mapping
+
+    def update_coordinate(mol, coord_dict):
+        edit_mol = mol._sire_object.edit()
+        for idx in range(0, mol.nAtoms()):
+            if idx in coord_dict:
+                vec = coord_dict[idx]
+                vec = Vector(
+                    vec.x().angstroms().value(),
+                    vec.y().angstroms().value(),
+                    vec.z().angstroms().value(),
+                )
+                edit_mol = (
+                    edit_mol.atom(AtomIdx(idx))
+                    .set_property("coordinates", vec)
+                    .molecule()
+                )
+        mol._sire_object = edit_mol.commit()
+
+    mol0_res_name, mol0_res_idx = get_res_info(roi_mol0)
+    mol1_res_name, mol1_res_idx = get_res_info(roi_mol1)
+
+    # Get the best mapping between the molecules.
+    mapping = {}
+    for i in range(len(mol0_res_name)):
+        # The mutated residue would have different name
+        if mol0_res_name[i] == mol1_res_name[i]:
+            for k, v in zip(mol0_res_idx[i], mol1_res_idx[i]):
+                mapping[k] = v
+        else:
+            # Assume the atom order is kept during conversion
+            mut0 = roi_mol0.getResidues()[i].toMolecule()
+            mut1 = roi_mol1.getResidues()[i].toMolecule()
+            mut0_idx = [x.index() for x in roi_mol0.getResidues()[i].getAtoms()]
+            mut1_idx = [x.index() for x in roi_mol1.getResidues()[i].getAtoms()]
+
+            mapping_mut = BSS.Align.matchAtoms(mut0, mut1)
+
+            # We should also translate the moelcule according to the mapping
+            # or there will be odd dummy atom in the merged topology
+            mut0 = BSS.Align.rmsdAlign(mut0, mut1, mapping=mapping_mut)
+            aligned_coordinates = mut0.coordinates()
+            coord_dict = dict(zip(mut0_idx, aligned_coordinates))
+
+            mapping_recovered = recover_mapping(mut0_idx, mut1_idx, mapping_mut)
+    mapping.update(mapping_recovered)
+    update_coordinate(roi_mol0, coord_dict)
+
+    # Create the merged molecule.
+    merged_mol = BSS.Align.merge(
+        roi_mol0, roi_mol1, mapping=mapping, roi=[mut0_idx, mut1_idx]
+    )
+
+    return merged_mol
+
+
+# IntraCLJFF:
+#  Old interface. Uses the "intrascale" matrix. Validate that this
+#  is consistent.
+# IntraFF:
+#  New interface. Uses atom "connectivity". Validate that the bonding
+#  is consistent.
+@pytest.fixture(scope="module")
+def roi_intraclj0(roi_mol0):
+    res = IntraCLJFF("intraclj")
+    res.add(roi_mol0._sire_object)
+    return res
+
+
+@pytest.fixture(scope="module")
+def roi_intraclj1(roi_mol1):
+    res = IntraCLJFF("intraclj")
+    res.add(roi_mol1._sire_object)
+    return res
+
+
+@pytest.fixture(scope="module")
+def roi_intraff0(roi_mol0):
+    res = IntraFF("intraclj")
+    res.add(roi_mol0._sire_object)
+    return res
+
+
+@pytest.fixture(scope="module")
+def roi_intraff1(roi_mol1):
+    res = IntraFF("intraclj")
+    res.add(roi_mol1._sire_object)
+    return res
+
+
+@pytest.fixture(scope="module")
+def roi_internal0(roi_mol0):
+    res = InternalFF("internal")
+    res.set_strict(True)
+    res.add(roi_mol0._sire_object)
+    return res
+
+
+@pytest.fixture(scope="module")
+def roi_internal1(roi_mol1):
+    res = InternalFF("internal")
+    res.set_strict(True)
+    res.add(roi_mol1._sire_object)
+    return res
+
+
+@pytest.fixture(scope="module")
+def roi_pmap0(roi_merged_mol):
+    res = {}
+    for prop in roi_merged_mol._sire_object.property_keys():
+        if prop[-1] == "0":
+            res[prop[:-1]] = prop
+    return res
+
+
+@pytest.fixture(scope="module")
+def roi_pmap1(roi_merged_mol):
+    res = {}
+    for prop in roi_merged_mol._sire_object.property_keys():
+        if prop[-1] == "1":
+            res[prop[:-1]] = prop
+    return res
+
+
+def test_roi_nonbonded0(roi_merged_mol, roi_intraclj0, roi_intraff0, roi_pmap0):
+    # Test that the nonbonded energies are the same in mol0.
+    intraclj_merged = IntraCLJFF("intraclj")
+    intraff_merged = IntraFF("intraclj")
+    intraclj_merged.add(roi_merged_mol._sire_object, roi_pmap0)
+    intraff_merged.add(roi_merged_mol._sire_object, roi_pmap0)
+    assert roi_intraclj0.energy().value() == pytest.approx(
+        intraclj_merged.energy().value()
+    )
+    assert roi_intraff0.energy().value() == pytest.approx(
+        intraff_merged.energy().value()
+    )
+
+
+def test_roi_nonbonded1(roi_merged_mol, roi_intraclj1, roi_intraff1, roi_pmap1):
+    # Test that the nonbonded energies are the same in mol1.
+    intraclj_merged = IntraCLJFF("intraclj")
+    intraff_merged = IntraFF("intraclj")
+    intraclj_merged.add(roi_merged_mol._sire_object, roi_pmap1)
+    intraff_merged.add(roi_merged_mol._sire_object, roi_pmap1)
+    assert roi_intraclj1.energy().value() == pytest.approx(
+        intraclj_merged.energy().value()
+    )
+    assert roi_intraff1.energy().value() == pytest.approx(
+        intraff_merged.energy().value()
+    )
+
+
+def test_roi_bonded0(roi_mol0, roi_merged_mol, roi_pmap0, roi_internal0):
+    # Test that the internal energies are consistent. This will validate that
+    # bond, angle, dihedral, and improper energies are correct.
+    # In this test, we extract the original molecule for the lambda=0 end state.
+    amber_mol, _ = roi_merged_mol._extractMolecule()
+    roi_internal_merged = InternalFF("internal")
+    roi_internal_merged.set_strict(True)
+    roi_internal_merged.add(amber_mol._sire_object)
+    assert roi_internal0.energy().value() == pytest.approx(
+        roi_internal_merged.energy().value()
+    )
+
+
+def test_roi_bonded1(roi_mol1, roi_merged_mol, roi_pmap1, roi_internal1):
+    # Test that the internal energies are consistent. This will validate that
+    # bond, angle, dihedral, and improper energies are correct.
+    # In this test, we extract the original molecule for the lambda=1 end state.
+    amber_mol, _ = roi_merged_mol._extractMolecule(is_lambda1=True)
+    roi_internal_merged = InternalFF("internal")
+    roi_internal_merged.set_strict(True)
+    roi_internal_merged.add(amber_mol._sire_object)
+    assert roi_internal1.energy().value() == pytest.approx(
+        roi_internal_merged.energy().value()
+    )
+
+
+@pytest.mark.xfail(
+    reason="Mapping generated with latest RDKit which requires sanitization no longer triggers the exception"
+)
+def test_ring_breaking_three_membered():
+    # Load the ligands.
+    s0 = BSS.IO.readMolecules([f"{url}/CAT-13a.prm7.bz2", f"{url}/CAT-13a.rst7.bz2"])
+    s1 = BSS.IO.readMolecules([f"{url}/CAT-17g.prm7.bz2", f"{url}/CAT-17g.rst7.bz2"])
+
+    # Extract the molecules.
+    m0 = s0.getMolecules()[0]
+    m1 = s1.getMolecules()[0]
+
+    # Generate the mapping.
+    mapping = BSS.Align.matchAtoms(m0, m1)
+
+    # Align m0 to m1 based on the mapping.
+    m0 = BSS.Align.rmsdAlign(m0, m1, mapping)
+
+    # Try to merge the molecule without allowing ring breaking.
+    with pytest.raises(BSS._Exceptions.IncompatibleError):
+        m2 = BSS.Align.merge(m0, m1, mapping)
+
+    # Now check that we can merge if we allow ring breaking.
+    m2 = BSS.Align.merge(m0, m1, mapping, allow_ring_breaking=True)
+
+
+@pytest.mark.xfail(
+    reason="Mapping generated with latest RDKit which requires sanitization no longer triggers the exception"
+)
+def test_ring_breaking_five_membered():
+    # Load the ligands.
+    s0 = BSS.IO.readMolecules([f"{url}/ligand31.prm7.bz2", f"{url}/ligand31.rst7.bz2"])
+    s1 = BSS.IO.readMolecules([f"{url}/ligand04.prm7.bz2", f"{url}/ligand04.rst7.bz2"])
+
+    # Extract the molecules.
+    m0 = s0.getMolecules()[0]
+    m1 = s1.getMolecules()[0]
+
+    # Load the pre-defined mapping.
+    mapping = BSS.Align.matchAtoms(m0, m1)
+
+    # Align m0 to m1 based on the mapping.
+    m0 = BSS.Align.rmsdAlign(m0, m1, mapping)
+
+    # Try to merge the molecule without allowing ring breaking.
+    with pytest.raises(BSS._Exceptions.IncompatibleError):
+        m2 = BSS.Align.merge(m0, m1, mapping)
+
+    # Now check that we can merge if we allow ring breaking.
+    m2 = BSS.Align.merge(m0, m1, mapping, allow_ring_breaking=True)
+
+
+@pytest.mark.xfail(
+    reason="Mapping generated with latest RDKit which requires sanitization no longer triggers the exception"
+)
+def test_ring_breaking_six_membered():
+    # Load the ligands.
+    s0 = BSS.IO.readMolecules([f"{url}/ligand31.prm7.bz2", f"{url}/ligand31.rst7.bz2"])
+    s1 = BSS.IO.readMolecules([f"{url}/ligand38.prm7.bz2", f"{url}/ligand38.rst7.bz2"])
+
+    # Extract the molecules.
+    m0 = s0.getMolecules()[0]
+    m1 = s1.getMolecules()[0]
+
+    # Load the pre-defined mapping.
+    mapping = BSS.Align.matchAtoms(m0, m1)
+
+    # Align m0 to m1 based on the mapping.
+    m0 = BSS.Align.rmsdAlign(m0, m1, mapping)
+
+    # Try to merge the molecule without allowing ring breaking.
+    with pytest.raises(BSS._Exceptions.IncompatibleError):
+        m2 = BSS.Align.merge(m0, m1, mapping)
+
+    # Now check that we can merge if we allow ring breaking.
+    m2 = BSS.Align.merge(m0, m1, mapping, allow_ring_breaking=True)
+
+
+@pytest.mark.parametrize(
+    "ligands",
+    [
+        pytest.param(
+            ["CAT-13c", "CAT-17i"],
+            marks=pytest.mark.xfail(
+                reason="Mapping generated with latest RDKit which requires sanitization no longer triggers the exception"
+            ),
+        ),
+        pytest.param(
+            ["CAT-13e", "CAT-17g"],
+            marks=pytest.mark.xfail(
+                reason="Mapping generated with latest RDKit which requires sanitization no longer triggers the exception"
+            ),
+        ),
+    ],
+)
+def test_ring_size_change(ligands):
+    # Load the ligands.
+    s0 = BSS.IO.readMolecules(
+        [f"{url}/{ligands[0]}.prm7.bz2", f"{url}/{ligands[0]}.rst7.bz2"]
+    )
+    s1 = BSS.IO.readMolecules(
+        [f"{url}/{ligands[1]}.prm7.bz2", f"{url}/{ligands[1]}.rst7.bz2"]
+    )
+
+    # Extract the molecules.
+    m0 = s0.getMolecules()[0]
+    m1 = s1.getMolecules()[0]
+
+    # Generate the mapping.
+    mapping = BSS.Align.matchAtoms(m0, m1)
+
+    # Align m0 to m1 based on the mapping.
+    m0 = BSS.Align.rmsdAlign(m0, m1, mapping)
+
+    # Try to merge the molecule without allowing ring breaking.
+    with pytest.raises(BSS._Exceptions.IncompatibleError):
+        m2 = BSS.Align.merge(m0, m1, mapping)
+
+    # Now check that we can merge if we allow ring breaking.
+    m2 = BSS.Align.merge(
+        m0, m1, mapping, allow_ring_breaking=True, allow_ring_size_change=True
+    )
+
+
+# Parameterise the function with a valid mapping.
+@pytest.mark.parametrize(
+    "ligands, mapping",
+    [
+        (
+            ("grow1", "grow2"),
+            {
+                2: 21,
+                4: 23,
+                6: 25,
+                8: 27,
+                10: 18,
+                1: 19,
+                0: 20,
+                11: 16,
+                12: 17,
+                13: 14,
+                15: 13,
+                18: 11,
+                20: 9,
+                22: 8,
+                23: 5,
+                16: 6,
+                24: 3,
+                26: 1,
+                27: 0,
+                9: 28,
+                5: 24,
+                3: 22,
+                7: 26,
+                14: 15,
+                19: 12,
+                21: 10,
+                17: 7,
+                25: 4,
+            },
+        ),
+        (
+            ("grow3", "grow4"),
+            {
+                1: 6,
+                2: 7,
+                3: 8,
+                4: 9,
+                5: 10,
+                6: 11,
+                14: 21,
+                13: 20,
+                12: 19,
+                11: 18,
+                10: 17,
+            },
+        ),
+    ],
+)
+def test_grow_whole_ring(ligands, mapping):
+    # Load the ligands.
+    s0 = BSS.IO.readMolecules(
+        [f"{url}/{ligands[0]}.prm7.bz2", f"{url}/{ligands[0]}.rst7.bz2"]
+    )
+    s1 = BSS.IO.readMolecules(
+        [f"{url}/{ligands[1]}.prm7.bz2", f"{url}/{ligands[1]}.rst7.bz2"]
+    )
+
+    # Extract the molecules.
+    m0 = s0.getMolecules()[0]
+    m1 = s1.getMolecules()[0]
+
+    # Align m0 to m1 based on the mapping.
+    m0 = BSS.Align.rmsdAlign(m0, m1, mapping)
+
+    # Check that we can merge without allowing ring breaking.
+    m2 = BSS.Align.merge(m0, m1, mapping)
+
+
+def test_hydrogen_mass_repartitioning():
+    # Load the ligands.
+    s0 = BSS.IO.readMolecules([f"{url}/ligand31.prm7.bz2", f"{url}/ligand31.rst7.bz2"])
+    s1 = BSS.IO.readMolecules([f"{url}/ligand38.prm7.bz2", f"{url}/ligand38.rst7.bz2"])
+
+    # Extract the molecules.
+    m0 = s0.getMolecules()[0]
+    m1 = s1.getMolecules()[0]
+
+    # Get the best mapping between the molecules.
+    mapping = BSS.Align.matchAtoms(m0, m1, timeout=BSS.Units.Time.second)
+
+    # Align m0 to m1 based on the mapping.
+    m0 = BSS.Align.rmsdAlign(m0, m1, mapping)
+
+    # Create the merged molecule.
+    merged = BSS.Align.merge(m0, m1, mapping, allow_ring_breaking=True)
+
+    # Create a dummy element.
+    dummy = Element("Xx")
+
+    # Get the elements in either end state.
+    elements0 = merged._sire_object.property("element0").to_vector()
+    elements1 = merged._sire_object.property("element1").to_vector()
+
+    # Work out the initial mass of the system.
+    initial_mass0 = 0
+    for idx, mass in enumerate(merged._sire_object.property("mass0").to_vector()):
+        if elements0[idx] != dummy:
+            initial_mass0 += mass.value()
+    initial_mass1 = 0
+    for idx, mass in enumerate(merged._sire_object.property("mass1").to_vector()):
+        if elements1[idx] != dummy:
+            initial_mass1 += mass.value()
+
+    # Repartition the hydrogen mass.
+    merged.repartitionHydrogenMass()
+
+    # Lists to store the mass of dummy atoms in the two end states.
+    dummy_masses0 = []
+    dummy_masses1 = []
+
+    # Extract the modified end state masses.
+    masses0 = merged._sire_object.property("mass0").to_vector()
+    masses1 = merged._sire_object.property("mass1").to_vector()
+
+    # Work out the final mass of the system.
+    final_mass0 = 0
+    for idx, mass in enumerate(masses0):
+        if elements0[idx] != dummy:
+            final_mass0 += mass.value()
+        else:
+            dummy_masses0.append((idx, mass))
+    final_mass1 = 0
+    for idx, mass in enumerate(masses1):
+        if elements1[idx] != dummy:
+            final_mass1 += mass.value()
+        else:
+            dummy_masses1.append((idx, mass))
+
+    # Assert the the masses are approximately the same.
+    assert final_mass0 == pytest.approx(initial_mass0)
+    assert final_mass1 == pytest.approx(initial_mass1)
+
+    # Assert that the dummy atom masses are the same in both end states.
+    for idx, mass0 in dummy_masses0:
+        assert mass0 == masses1[idx]
+    for idx, mass1 in dummy_masses1:
+        assert mass1 == masses0[idx]
+
+
+def test_ion_merge():
+    from sire.legacy.IO import createSodiumIon
+
+    from tests.conftest import root_fp
+
+    # Extract a water molecule from the system.
+    water = BSS.IO.readMolecules(
+        [f"{root_fp}/input/ala.crd", f"{root_fp}/input/ala.top"]
+    )[-1]
+
+    # Create a sodium ion using the water coordinates.
+    ion = createSodiumIon(
+        water.getAtoms()[0]._sire_object.property("coordinates"), "tip3p"
+    )
+
+    # Merge the water and ion.
+    merged = BSS.Align.merge(water, BSS._SireWrappers.Molecule(ion))
+
+    # Make sure the ion has the coordintes of the oxygen atom.
+    coords0 = merged._sire_object.property("coordinates0").to_vector()[0]
+    coords1 = merged._sire_object.property("coordinates1").to_vector()[0]
+    water_coords = water._sire_object.property("coordinates").to_vector()[0]
+    assert coords0 == coords1
+    assert coords0 == water_coords
+
+
+@pytest.mark.skipif(
+    has_antechamber is False, reason="Requires AnteChamber to be installed."
+)
+@pytest.mark.skipif(has_openff is False, reason="Requires OpenFF to be installed.")
+@pytest.mark.parametrize(
+    "ligands, mapping",
+    [
+        (
+            ("Schindler_SYK_CHEMBL3265035", "Schindler_SYK_CHEMBL3265033"),
+            {
+                5: 8,
+                6: 32,
+                7: 31,
+                8: 11,
+                9: 12,
+                10: 13,
+                11: 14,
+                12: 15,
+                13: 16,
+                14: 17,
+                15: 18,
+                16: 19,
+                17: 20,
+                18: 21,
+                19: 22,
+                20: 23,
+                21: 24,
+                22: 25,
+                23: 26,
+                24: 27,
+                25: 28,
+                26: 29,
+                27: 30,
+                28: 10,
+                29: 9,
+                38: 53,
+                39: 52,
+                40: 43,
+                41: 44,
+                42: 45,
+                43: 46,
+                44: 47,
+                45: 48,
+                46: 49,
+                47: 50,
+                48: 51,
+                49: 42,
+                50: 41,
+                1: 1,
+                2: 4,
+                34: 36,
+                33: 35,
+                3: 3,
+                4: 34,
+                35: 1,
+                0: 6,
+                32: 37,
+                31: 7,
+                36: 33,
+            },
+        ),
+        (
+            ("Schindler_SYK_CHEMBL3265035", "Schindler_SYK_CHEMBL3265036"),
+            {
+                5: 7,
+                6: 31,
+                7: 30,
+                8: 10,
+                9: 11,
+                10: 12,
+                11: 13,
+                12: 14,
+                13: 15,
+                14: 16,
+                15: 17,
+                16: 18,
+                17: 19,
+                18: 20,
+                19: 21,
+                20: 22,
+                21: 23,
+                22: 24,
+                23: 25,
+                24: 26,
+                25: 27,
+                26: 28,
+                27: 29,
+                28: 9,
+                29: 8,
+                38: 54,
+                39: 53,
+                40: 44,
+                41: 45,
+                42: 46,
+                43: 47,
+                44: 48,
+                45: 49,
+                46: 50,
+                47: 51,
+                48: 52,
+                49: 43,
+                50: 42,
+                0: 4,
+                1: 5,
+                2: 6,
+                3: 0,
+                4: 1,
+                30: 3,
+                31: 39,
+                32: 38,
+                33: 40,
+                34: 41,
+                35: 32,
+                36: 33,
+                37: 34,
+            },
+        ),
+    ],
+)
+def test_ring_opening_and_size_change(ligands, mapping):
+    # These perturbations involve ring formation (acyclic atoms in mol0 become
+    # ring members in mol1) combined with ring size changes in the existing
+    # fused bicyclic core. Check that the merge succeeds when both flags are
+    # allowed.
+    m0 = BSS.IO.readMolecules(f"{url}/{ligands[0]}.sdf.bz2")[0]
+    m1 = BSS.IO.readMolecules(f"{url}/{ligands[1]}.sdf.bz2")[0]
+
+    m0 = BSS.Parameters.openff_unconstrained_2_1_1(m0, use_nagl=False).getMolecule()
+    m1 = BSS.Parameters.openff_unconstrained_2_1_1(m1, use_nagl=False).getMolecule()
+
+    m0 = BSS.Align.rmsdAlign(m0, m1, mapping)
+
+    BSS.Align.merge(
+        m0, m1, mapping, allow_ring_breaking=True, allow_ring_size_change=True
+    )
+
+
+@pytest.fixture(scope="session")
+def ejm31():
+    return BSS.IO.readMolecules(
+        [f"{url}/lig_ejm31.prm7.bz2", f"{url}/lig_ejm31.rst7.bz2"]
+    ).getMolecules()[0]
+
+
+@pytest.fixture(scope="session")
+def jmc28():
+    return BSS.IO.readMolecules(
+        [f"{url}/lig_jmc28.prm7.bz2", f"{url}/lig_jmc28.rst7.bz2"]
+    ).getMolecules()[0]
+
+
+def test_default_mcs_options():
+    # The MCS defaults should be discoverable, and ring matching is on.
+    options = BSS.Align.defaultMCSOptions()
+    assert options["ringMatchesRingOnly"] is True
+    assert options["completeRingsOnly"] is True
+
+    # The returned dictionary is a copy, so mutating it has no side effects.
+    options["ringMatchesRingOnly"] = False
+    assert BSS.Align.defaultMCSOptions()["ringMatchesRingOnly"] is True
+
+
+def test_mcs_kwargs_ring_matches_ring_only(ejm31, jmc28):
+    # Perturbing a methyl to a 2-methylcyclopropyl. Atom 19 is the methyl
+    # carbon in ejm31 and the ring carbon bonded to the carbonyl in jmc28.
+
+    # By default an acyclic atom can't map onto a ring atom, so the whole
+    # substituent is unmapped.
+    mapping = BSS.Align.matchAtoms(ejm31, jmc28)
+    assert 19 not in mapping
+
+    # Allowing the match maps the two carbons onto each other, along with one
+    # of the methyl hydrogens.
+    mapping = BSS.Align.matchAtoms(
+        ejm31, jmc28, mcs_kwargs={"ringMatchesRingOnly": False}
+    )
+    assert mapping[19] == 19
+    assert len(mapping) == 30
+
+    # Only two hydrogens are removed and the ring is grown from dummy atoms.
+    assert sorted(set(range(32)) - set(mapping)) == [27, 28]
+
+
+def test_mcs_kwargs_merge(ejm31, jmc28):
+    # The options are used when merge autogenerates a mapping.
+    merged = BSS.Align.merge(ejm31, jmc28, mcs_kwargs={"ringMatchesRingOnly": False})
+    sire_mol = merged._sire_object
+
+    # A ring grown entirely from dummy atoms breaks no bond between mapped
+    # atoms, so the merge doesn't require 'allow_ring_breaking' and the end
+    # states have the same number of bonds.
+    assert sire_mol.num_atoms() == 41
+    assert len(sire_mol.property("bond0").potentials()) == len(
+        sire_mol.property("bond1").potentials()
+    )
+
+    # No ring is broken or made, so neither property is set.
+    assert not sire_mol.has_property("ring_breaking_bonds")
+    assert not sire_mol.has_property("ring_making_bonds")
+
+
+def test_unmapped_attachment_warning(ejm31, jmc28):
+    # The default mapping stops at the carbonyl carbon (atom 17), leaving
+    # heavy atoms unmapped on both sides, so we should be told about it.
+    with pytest.warns(UserWarning, match="ringMatchesRingOnly"):
+        BSS.Align.matchAtoms(ejm31, jmc28)
+
+    # No warning once the option has been set explicitly. Only promote the
+    # warning we care about, so that unrelated warnings from RDKit or Sire
+    # don't fail the test.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*ringMatchesRingOnly.*")
+        BSS.Align.matchAtoms(ejm31, jmc28, mcs_kwargs={"ringMatchesRingOnly": False})
+
+    # The returned mapping must be unchanged by the check, since it is only
+    # meant to be an observation.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        checked = BSS.Align.matchAtoms(ejm31, jmc28)
+        unchecked = BSS.Align.matchAtoms(
+            ejm31, jmc28, mcs_kwargs=BSS.Align.defaultMCSOptions()
+        )
+    assert checked == unchecked
+
+
+def test_unmapped_attachment_no_warning(ejm31):
+    # A molecule mapped to itself leaves nothing unmapped, so there is
+    # nothing to flag.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*ringMatchesRingOnly.*")
+        BSS.Align.matchAtoms(ejm31, ejm31)
+
+
+@pytest.mark.skipif(
+    not has_antechamber or not has_tleap,
+    reason="Requires antechamber and tLEaP to be installed.",
+)
+def test_unmapped_attachment_no_warning_r_group(monkeypatch):
+    """
+    Regression test for the check running on the pruned mapping. Pruning
+    deletes correctly mapped heavy atom pairs, which looks identical to an
+    MCS that stopped short, so these ordinary R-group edits used to be
+    flagged and pay for a second MCS search for nothing.
+
+    No warning was ever emitted for them, since the gate rejected the retry,
+    so the flagged atoms are spied on directly rather than the warning.
+    """
+    from BioSimSpace.Sandpit.Exscientia.Align import _align
+
+    pairs = [
+        ("Cc1ccccc1", "CCc1ccccc1"),  # methyl -> ethyl
+        ("CCc1ccccc1", "CCCc1ccccc1"),  # ethyl -> propyl
+        ("COc1ccccc1", "CCOc1ccccc1"),  # methoxy -> ethoxy
+        ("O=C(N)c1ccccc1", "O=C(N)c1ccccc1Cl"),  # hydrogen -> chlorine
+    ]
+
+    flagged = []
+    original = _align._flag_unmapped_attachments
+
+    def _spy(*args, **kwargs):
+        result = original(*args, **kwargs)
+        flagged.append(result)
+        return result
+
+    monkeypatch.setattr(_align, "_flag_unmapped_attachments", _spy)
+
+    for smiles0, smiles1 in pairs:
+        molecule0 = BSS.Parameters.gaff2(smiles0).getMolecule()
+        molecule1 = BSS.Parameters.gaff2(smiles1).getMolecule()
+
+        del flagged[:]
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*ringMatchesRingOnly.*")
+            warnings.filterwarnings("error", message=".*Unable to check.*")
+            BSS.Align.matchAtoms(
+                molecule0,
+                molecule1,
+                prune_perturbed_constraints=True,
+                prune_crossing_constraints=True,
+            )
+
+        # The check should run once, on the unpruned mapping, and find
+        # nothing. A second entry would mean the retry had run too.
+        assert flagged == [[]]
+
+
+def test_unmapped_attachment_warning_other_branches(ejm31, jmc28):
+    # The check must cope with the alternative return shapes, and must not
+    # change what is returned in any of them.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        reference = BSS.Align.matchAtoms(
+            ejm31, jmc28, mcs_kwargs=BSS.Align.defaultMCSOptions()
+        )
+
+        mappings = BSS.Align.matchAtoms(ejm31, jmc28, matches=5)
+        assert isinstance(mappings, list)
+        assert mappings[0] == reference
+
+        mapping, score = BSS.Align.matchAtoms(ejm31, jmc28, return_scores=True)
+        assert mapping == reference
+
+        mappings, scores = BSS.Align.matchAtoms(
+            ejm31, jmc28, matches=5, return_scores=True
+        )
+        assert len(mappings) == len(scores)
+        assert mappings[0] == reference
+
+    # A prematch skips the check, since the retry could fall back on the Sire
+    # MCS, which ignores 'mcs_kwargs'.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*ringMatchesRingOnly.*")
+        BSS.Align.matchAtoms(ejm31, jmc28, prematch={0: 0})
+
+
+def test_flag_unmapped_attachments(ejm31):
+    """
+    Unit test for the attachment point check, using hand-built mappings so
+    that no MCS search is involved.
+    """
+    from sire.legacy import Mol as _SireMol
+
+    from BioSimSpace.Sandpit.Exscientia.Align._align import _flag_unmapped_attachments
+
+    sire_mol = ejm31._sire_object
+    connectivity = _SireMol.Connectivity(sire_mol, _SireMol.CovalentBondHunter())
+
+    # Map the molecule onto itself. Nothing is unmapped, so nothing is flagged.
+    identity = {x: x for x in range(sire_mol.num_atoms())}
+    assert _flag_unmapped_attachments(ejm31, ejm31, identity) == []
+
+    # Find a heavy atom with a heavy atom neighbour.
+    for atom in sire_mol.atoms():
+        idx = atom.index().value()
+        if atom.property("element").num_protons() == 1:
+            continue
+        neighbours = [
+            i.value()
+            for i in connectivity.connections_to(_SireMol.AtomIdx(idx))
+            if sire_mol.atom(i).property("element").num_protons() > 1
+        ]
+        if neighbours:
+            break
+
+    # Drop the neighbour from the mapping. It is now an unmapped heavy atom
+    # of the same element on both sides of 'idx', so 'idx' is flagged.
+    truncated = dict(identity)
+    del truncated[neighbours[0]]
+    assert idx in _flag_unmapped_attachments(ejm31, ejm31, truncated)
+
+    # Hydrogens are ignored, so dropping one flags nothing.
+    hydrogen = next(
+        a.index().value()
+        for a in sire_mol.atoms()
+        if a.property("element").num_protons() == 1
+    )
+    truncated = dict(identity)
+    del truncated[hydrogen]
+    assert _flag_unmapped_attachments(ejm31, ejm31, truncated) == []
+
+
+def test_is_sensible_extension(ejm31):
+    """
+    Unit test for the heavy/hydrogen check on the atoms that the retry adds.
+    """
+    from BioSimSpace.Sandpit.Exscientia.Align._align import _is_sensible_extension
+
+    sire_mol = ejm31._sire_object
+
+    heavy = [
+        a.index().value()
+        for a in sire_mol.atoms()
+        if a.property("element").num_protons() > 1
+    ]
+    hydrogens = [
+        a.index().value()
+        for a in sire_mol.atoms()
+        if a.property("element").num_protons() == 1
+    ]
+
+    mapping = {heavy[0]: heavy[0]}
+
+    # Heavy to heavy and hydrogen to hydrogen are both sensible.
+    extended = dict(mapping)
+    extended[heavy[1]] = heavy[1]
+    extended[hydrogens[0]] = hydrogens[0]
+    assert _is_sensible_extension(ejm31, ejm31, mapping, extended)
+
+    # Pairing a heavy atom with a hydrogen is not.
+    extended = dict(mapping)
+    extended[heavy[1]] = hydrogens[0]
+    assert not _is_sensible_extension(ejm31, ejm31, mapping, extended)
+
+    # Adding nothing is trivially sensible.
+    assert _is_sensible_extension(ejm31, ejm31, mapping, dict(mapping))
+
+
+def test_unmapped_attachment_check_suppressed(ejm31, jmc28):
+    """
+    The check should only fire where the user can act on its advice, i.e.
+    where 'mcs_kwargs' can be passed through.
+    """
+    # 'rmsdAlign' doesn't take 'mcs_kwargs'. 'flexAlign' is suppressed for the
+    # same reason, but isn't exercised here since it needs fkcombu. Nor is
+    # 'viewMapping', which keeps the check but returns early outside a
+    # notebook, before it ever reaches 'matchAtoms'.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*ringMatchesRingOnly.*")
+        BSS.Align.rmsdAlign(ejm31, jmc28)
+
+    # 'merge' does, so the check stays on.
+    with pytest.warns(UserWarning, match="ringMatchesRingOnly"):
+        BSS.Align.merge(ejm31, jmc28, force=True)
+
+
+def test_unmapped_attachment_warning_not_swallowed(ejm31, jmc28):
+    # Promoting the warning to an error must surface the warning itself, not
+    # a report that the check failed. The warning is emitted outside the
+    # try/except that guards the check for exactly this reason.
+    # Anchored, since the wrapped "Unable to check ..." message quotes the
+    # original and would otherwise match too.
+    with pytest.raises(UserWarning, match=r"^Mapping leaves heavy atoms"):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*ringMatchesRingOnly.*")
+            BSS.Align.matchAtoms(ejm31, jmc28)
+
+
+@pytest.fixture(scope="module")
+def network_ligands():
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    smiles = ["c1ccccc1C", "c1ccccc1CC", "c1ccccc1O", "c1ccccc1N", "C1CCCCC1C(=O)O"]
+    ligands = []
+    for s in smiles:
+        mol = Chem.AddHs(Chem.MolFromSmiles(s))
+        AllChem.EmbedMolecule(mol, randomSeed=42)
+        ligands.append(mol)
+    return ligands
+
+
+def test_network_reused_work_dir(network_ligands, tmp_path):
+    names = [f"lig{x}" for x in range(len(network_ligands))]
+
+    expected = BSS.Align.generateNetwork(
+        network_ligands, names=names, work_dir=str(tmp_path / "fresh")
+    )
+
+    # Run with a subset of ligands, then the full set, in the same directory.
+    work_dir = str(tmp_path / "reused")
+    BSS.Align.generateNetwork(network_ligands[1:], names=names[1:], work_dir=work_dir)
+    result = BSS.Align.generateNetwork(network_ligands, names=names, work_dir=work_dir)
+
+    assert result == expected
+
+
+def test_network_links_file(network_ligands, tmp_path):
+    names = [f"lig{x}" for x in range(len(network_ligands))]
+
+    links_file = tmp_path / "links.txt"
+    links_file.write_text("lig1 lig4 -0.5 force\n")
+
+    edges, scores = BSS.Align.generateNetwork(
+        network_ligands,
+        names=names,
+        links_file=str(links_file),
+        work_dir=str(tmp_path / "lomap"),
+    )
+
+    assert (1, 4) in edges
+    assert scores[edges.index((1, 4))] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(
+    "smiles0, smiles1",
+    [
+        ("c1ccccc1", "Cc1ccccc1"),
+        ("Cc1ccccc1", "c1ccccc1"),
+        ("C1CCCCC1", "C1CCCC1"),
+        ("CCO", "CCCO"),
+        ("CC(C)(C)O", "CC(C)(C)C"),
+    ],
+)
+@pytest.mark.parametrize("scoring_function", ["RMSD", "RMSDALIGN"])
+@pytest.mark.parametrize("use_prematch", [False, True])
+def test_score_rdkit_mappings(smiles0, smiles1, scoring_function, use_prematch):
+    # Check the scored mappings against a brute-force reference: every unique
+    # mapping from every pair of substructure matches, each scored independently,
+    # using Horn's quaternion method for the aligned RMSD.
+    import numpy as np
+    from rdkit import Chem
+    from rdkit.Chem import rdFMCS
+    from sire.legacy.Maths import getRMSD
+
+    from BioSimSpace.Sandpit.Exscientia.Align._align import _score_rdkit_mappings
+
+    max_matches = 50
+
+    mol0 = BSS.Convert.smiles(smiles0)
+    mol1 = BSS.Convert.smiles(smiles1)
+    rdmol0 = BSS.Convert.toRDKit(mol0)
+    rdmol1 = BSS.Convert.toRDKit(mol1)
+    mcs = rdFMCS.FindMCS([rdmol0, rdmol1], **BSS.Align.defaultMCSOptions())
+    smarts = Chem.MolFromSmarts(mcs.smartsString)
+
+    matches0 = rdmol0.GetSubstructMatches(
+        smarts, uniquify=False, maxMatches=max_matches, useChirality=False
+    )
+    matches1 = rdmol1.GetSubstructMatches(
+        smarts, uniquify=False, maxMatches=max_matches, useChirality=False
+    )
+    expected = {tuple(sorted(zip(m0, m1))) for m0 in matches0 for m1 in matches1}
+
+    prematch = {}
+    if use_prematch:
+        idx0, idx1 = sorted(expected)[0][0]
+        prematch = {idx0: idx1}
+        expected = {m for m in expected if (idx0, idx1) in m}
+
+    mappings, scores = _score_rdkit_mappings(
+        mol0._sire_object,
+        mol1._sire_object,
+        rdmol0,
+        rdmol1,
+        smarts,
+        prematch,
+        scoring_function,
+        max_matches,
+        {},
+        {},
+    )
+
+    found = [tuple(sorted(mapping.items())) for mapping in mappings]
+    assert len(found) == len(set(found))
+    assert set(found) == expected
+
+    scores = [score.value() for score in scores]
+    assert scores == sorted(scores)
+
+    def xyz(coords):
+        return np.array([[c.x().value(), c.y().value(), c.z().value()] for c in coords])
+
+    def aligned_rmsd(x, y):
+        x = x - x.mean(axis=0)
+        y = y - y.mean(axis=0)
+        (sxx, sxy, sxz), (syx, syy, syz), (szx, szy, szz) = x.T @ y
+        k = np.array(
+            [
+                [sxx + syy + szz, syz - szy, szx - sxz, sxy - syx],
+                [syz - szy, sxx - syy - szz, sxy + syx, szx + sxz],
+                [szx - sxz, sxy + syx, -sxx + syy - szz, syz + szy],
+                [sxy - syx, szx + sxz, syz + szy, -sxx - syy + szz],
+            ]
+        )
+        msd = ((x**2).sum() + (y**2).sum() - 2 * np.linalg.eigvalsh(k)[-1]) / len(x)
+        return np.sqrt(max(msd, 0.0))
+
+    sire0 = mol0._sire_object
+    sire1 = mol1._sire_object
+    for mapping, score in zip(mappings, scores):
+        c0 = [sire0.atom(AtomIdx(i)).property("coordinates") for i in mapping]
+        c1 = [sire1.atom(AtomIdx(j)).property("coordinates") for j in mapping.values()]
+        if scoring_function == "RMSDALIGN":
+            reference = aligned_rmsd(xyz(c0), xyz(c1))
+        else:
+            reference = getRMSD(c0, c1)
+        assert score == pytest.approx(reference, abs=1e-6)

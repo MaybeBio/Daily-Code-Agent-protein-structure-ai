@@ -1,0 +1,76 @@
+[workspace]
+name = "biosimspace"
+channels = ["conda-forge", "openbiosim/label/dev"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", "win-64"]
+
+[dependencies]
+python = ">=3.12"
+configargparse = "*"
+ipywidgets = "*"
+kcombu_bss = "*"
+loguru = "*"
+lomap2 = "*"
+networkx = "*"
+nglview = "*"
+openff-interchange-base = ">=0.5.0"
+openff-toolkit-base = "*"
+parmed = "*"
+pyarrow = "*"
+py3dmol = "*"
+pydot = "*"
+pyyaml = "*"
+rdkit = "*"
+
+[target.linux-64.dependencies]
+# main
+#sire = ">=2026.2.0,<2026.3.0"
+# devel
+sire = "==2026.3.0.dev"
+ambertools = ">=22"
+gromacs = "*"
+alchemlyb = "*"
+mdtraj = "*"
+mdanalysis = ">=2.10.0"
+
+
+[target.linux-aarch64.dependencies]
+# main
+#sire = ">=2026.2.0,<2026.3.0"
+# devel
+sire = "==2026.3.0.dev"
+gromacs = "*"
+
+[target.osx-arm64.dependencies]
+# main
+#sire = ">=2026.2.0,<2026.3.0"
+# devel
+sire = "==2026.3.0.dev"
+ambertools = ">=22"
+alchemlyb = "*"
+mdtraj = "*"
+mdanalysis = ">=2.10.0"
+
+[target.win-64.dependencies]
+# main
+#sire = ">=2026.2.0,<2026.3.0"
+# devel
+sire = "==2026.3.0.dev"
+alchemlyb = "*"
+mdtraj = "*"
+mdanalysis = ">=2.10.0"
+
+[feature.test.dependencies]
+pytest = "*"
+
+[feature.lint.dependencies]
+pre-commit = "*"
+rattler-build = "*"
+ruff = "*"
+
+[environments]
+default = []
+test = ["test"]
+dev = ["test", "lint"]
+
+[activation]
+scripts = ["pixi.sh"]

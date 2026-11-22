@@ -1,0 +1,219 @@
+from .data_handling import (load_dataset, load_scales, load_features, get_labels,
+                            read_fasta, to_fasta, to_table,
+                            SequencePreprocessor,
+                            EmbeddingPreprocessor,
+                            combine_dict_nums)
+from .seq_analysis import AALogo, AALogoPlot, AAWindowSampler
+from .feature_engineering import (AAclust, AAclustPlot, SequenceFeature, NumericalFeature, CPP,
+                                  CPPGrid, CPPPlot, SequenceFeatureTransformer)
+from .pu_learning import dPULearn, dPULearnPlot
+from .explainable_ai import TreeModel
+from .prediction import (AAPred, AAPredPlot, ReliabilityModel, ReliabilityModelPlot,
+                         ModelEvaluator, ModelEvaluatorPlot, bind_groups, audit_leakage)
+from .protein_engineering import (DesignConstraints,
+                                  AAMut, AAMutPlot, SeqMut, SeqMutPlot, SeqOpt, SeqOptPlot)
+from .plotting import (plot_get_clist, plot_get_cmap, plot_get_cdict,
+                       plot_settings, plot_legend, plot_gcfs)
+from .metrics import (comp_auc_adjusted, comp_bic_score, comp_kld,
+                      comp_per_protein_ap, comp_detection_metrics,
+                      comp_bootstrap_ci, comp_smooth_scores)
+from .config import options
+from ._provenance import get_provenance
+from ._constants import (COLOR_SAMPLES_POS, COLOR_SAMPLES_NEG,
+                        COLOR_SAMPLES_UNL, COLOR_SAMPLES_REL_NEG)
+
+from importlib.metadata import version as _version, PackageNotFoundError
+
+try:
+    __version__ = _version("aaanalysis")
+except PackageNotFoundError:        # not installed (e.g. source tree without metadata)
+    __version__ = "0.0.0+unknown"
+
+
+# Import of base version features
+__all__ = [
+    "load_dataset",
+    "load_scales",
+    "load_features",
+    "get_labels",
+    "read_fasta",
+    "to_fasta",
+    "to_table",
+    "SequencePreprocessor",
+    "EmbeddingPreprocessor",
+    "combine_dict_nums",
+    # "comp_seq_sim",       BioPython
+    # "filter_seq",         BioPython
+    # "scan_motif",         MEME Suite
+    "AALogo",
+    "AALogoPlot",
+    "AAWindowSampler",
+    # "StructurePreprocessor",   # DSSP + biopython (pro)
+    # "AnnotationPreprocessor",  # UniProt fetch + requests (pro)
+    "AAclust",
+    "AAclustPlot",
+    "SequenceFeature",
+    "NumericalFeature",
+    "CPP",
+    "CPPGrid",
+    "CPPPlot",
+    "SequenceFeatureTransformer",
+    "dPULearn",
+    "dPULearnPlot",
+    "DesignConstraints",
+    "AAMut",
+    "AAMutPlot",
+    "SeqMut",
+    "SeqMutPlot",
+    "SeqOpt",
+    "SeqOptPlot",
+    "TreeModel",
+    "AAPred",
+    "AAPredPlot",
+    "ReliabilityModel",
+    "ReliabilityModelPlot",
+    "ModelEvaluator",
+    "ModelEvaluatorPlot",
+    "bind_groups",
+    "audit_leakage",
+    # "ShapModel"       # SHAP
+    "plot_get_clist",
+    "plot_get_cmap",
+    "plot_get_cdict",
+    "plot_settings",
+    "plot_legend",
+    "plot_gcfs",
+    "comp_auc_adjusted",
+    "comp_bic_score",
+    "comp_kld",
+    "comp_per_protein_ap",
+    "comp_detection_metrics",
+    "comp_bootstrap_ci",
+    "comp_smooth_scores",
+    "COLOR_SAMPLES_POS",
+    "COLOR_SAMPLES_NEG",
+    "COLOR_SAMPLES_UNL",
+    "COLOR_SAMPLES_REL_NEG",
+    "options",
+    "get_provenance"
+]
+
+
+# Dynamically import professional (pro) or development (dev) features if dependencies are available.
+# Optional-dependency import names per install extra. missing_feature_stub uses these to tell a
+# genuinely-missing optional dependency apart from a real bug inside an extra module: it branches on
+# the ImportError's ``.name`` (reliable for ModuleNotFoundError on the Python 3.11+ floor), never on a
+# substring of the message. See .claude/rules/pro-core-boundary.md.
+_EXTRA_MODULES = {
+    "pro": {"shap", "Bio", "biopython", "upsetplot", "UpSetPlot", "requests", "afragmenter", "py3Dmol", "ipywidgets"},
+    "embed": {"torch", "transformers", "sentencepiece", "huggingface_hub"},
+    "dev": {"IPython"},
+}
+_EXTRA_INSTALL = {"pro": "aaanalysis[pro]", "embed": "aaanalysis[embed]", "dev": "aaanalysis[dev]"}
+
+
+def _raise_missing_feature(feature_name, error, mode):
+    """Raise an install hint if ``error`` names a known optional dependency, else re-raise it unchanged."""
+    if getattr(error, "name", None) in _EXTRA_MODULES[mode]:
+        raise ImportError(
+            f"'{feature_name}' needs additional dependencies. Install via:\n"
+            f"\n\tpip install '{_EXTRA_INSTALL[mode]}'"
+        ) from error
+    raise error
+
+
+def missing_feature_stub(feature_name, error, mode="pro"):
+    """Return a callable that raises an ImportError when used.
+
+    This acts as a stub — a placeholder function that represents a missing feature.
+    Instead of breaking the import, the stub delays the error until the user tries to use
+    the unavailable feature. When invoked, it raises a friendly install hint only if the
+    original ImportError names a known optional dependency for ``mode`` (via ``error.name``);
+    otherwise it re-raises the original error unchanged so real bugs surface with a full traceback.
+    """
+    if mode not in _EXTRA_MODULES:
+        raise ValueError("mode must be 'pro' or 'dev'")
+    return lambda *args, **kwargs: _raise_missing_feature(feature_name, error, mode)
+
+try:
+    from .explainable_ai_pro import ShapModel
+    __all__.append("ShapModel")
+except ImportError as e:
+    ShapModel = None
+    globals()["ShapModel"] = missing_feature_stub("ShapModel", e, mode="pro")
+
+
+try:
+    from .seq_analysis_pro import comp_seq_sim
+    __all__.append("comp_seq_sim")
+except ImportError as e:
+    comp_seq_sim = None
+    globals()["comp_seq_sim"] = missing_feature_stub("comp_seq_sim", e, mode="pro")
+
+
+try:
+    from .seq_analysis_pro import filter_seq
+    __all__.append("filter_seq")
+except ImportError as e:
+    filter_seq = None
+    globals()["filter_seq"] = missing_feature_stub("filter_seq", e, mode="pro")
+
+
+try:
+    from .seq_analysis_pro import scan_motif
+    __all__.append("scan_motif")
+except ImportError as e:
+    scan_motif = None
+    globals()["scan_motif"] = missing_feature_stub(
+        "scan_motif", e, mode="pro")
+
+
+try:
+    from .data_handling_pro import StructurePreprocessor
+    __all__.append("StructurePreprocessor")
+except ImportError as e:
+    StructurePreprocessor = None
+    globals()["StructurePreprocessor"] = missing_feature_stub(
+        "StructurePreprocessor", e, mode="pro")
+
+
+try:
+    from .data_handling_pro import AnnotationPreprocessor
+    __all__.append("AnnotationPreprocessor")
+except ImportError as e:
+    AnnotationPreprocessor = None
+    globals()["AnnotationPreprocessor"] = missing_feature_stub(
+        "AnnotationPreprocessor", e, mode="pro")
+
+
+try:
+    from .feature_engineering_pro import CPPStructurePlot
+    __all__.append("CPPStructurePlot")
+except ImportError as e:
+    CPPStructurePlot = None
+    globals()["CPPStructurePlot"] = missing_feature_stub(
+        "CPPStructurePlot", e, mode="pro")
+
+
+try:
+    from .show_html import display_df
+    __all__.append("display_df")
+except ImportError as e:
+    display_df = None
+    globals()["display_df"] = missing_feature_stub("display_df", e, mode="dev")
+
+
+# Deprecated class-name aliases: AAlogo/AAlogoPlot were renamed to PascalCase
+# (AALogo/AALogoPlot). The old names remain importable for backward compatibility,
+# resolved lazily so they stay out of ``__all__`` and the abbreviation registry.
+_DEPRECATED_CLASS_ALIASES = {"AAlogo": "AALogo", "AAlogoPlot": "AALogoPlot"}
+
+
+def __getattr__(name):
+    canonical = _DEPRECATED_CLASS_ALIASES.get(name)
+    if canonical is not None:
+        import warnings
+        warnings.warn(f"'aaanalysis.{name}' is deprecated; use 'aaanalysis.{canonical}'.",
+                      DeprecationWarning, stacklevel=2)
+        return globals()[canonical]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

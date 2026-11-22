@@ -1,0 +1,961 @@
+'''
+Dataclasses and tools for glycan conformation sampling during docking.
+
+This module holds the PyRosetta-facing half of the glycographer pipeline: the
+GlycanDock protocol parameters (`GlycanDockConfig`), Rosetta session setup, and
+the decoy-generation loop that `scripts/run_glycandock.py` drives.
+
+PyRosetta is imported lazily inside the functions that need it, so the module
+stays importable on machines without a PyRosetta build. Config objects can be
+constructed, serialized, compared and inspected anywhere -- which is what makes
+a run's provenance readable from the analysis side (Windows, notebooks) rather
+than only on the HPC partition.
+
+Parallelism
+-----------
+A decoy is an independent sample, so the unit of parallel work is a *block* of
+decoy indices run by one process, i.e. one SLURM array task. Nothing is shared
+between blocks except the read-only input PDBs, and decoy indices are assigned
+up front so blocks can never collide on an output filename. (The SLURM array
+driver that calls run_block() once per task is not written yet.)
+
+Staging
+-------
+`GlycanDockConfig.prepack_mode` selects how Stage 0 pre-packing is handled:
+
+    'per_decoy'  legacy glycographer behavior -- prepack inside the decoy loop,
+                 in the same Rosetta session as Stages 1/2. This is what every
+                 existing glycographer ensemble was generated with, so the
+                 `probe()` preset uses it; probe results stay comparable.
+    'once'       the input PDB is expected to be ALREADY prepacked by a
+                 separate `prepack()` job, run as its own process.
+                 Stage 0 is skipped here. This matches the published GlycanDock
+                 workflow, where prepacking runs under different Rosetta flags
+                 (-ex3 -ex4 -ex1aro -ex2aro) than refinement (-ex1 -ex2) and
+                 therefore cannot share a process. It is the field default, so
+                 `refinement()` and `publication()` use it.
+    'none'       no pre-packing at all, deliberately -- e.g. a prepacking
+                 ablation, or an input whose side chains should stay as given.
+
+'once' and 'none' run identically in the decoy loop: neither applies Stage 0.
+The difference is only in what the run records. 'once' asserts the input
+was prepacked, while 'none' says the run was meant to have no Stage 0. The
+manifest keeps that intent, so an ensemble can later be described correctly in
+a methods section.
+'''
+
+from dataclasses import dataclass, asdict, replace, fields
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Sequence, get_type_hints
+import json
+import os
+import shutil
+import tarfile
+import tempfile
+import time
+import zlib
+
+from glycographer.archive import META_DIR, add_bytes, block_archive_name
+
+_TRUE = {'true', 't', 'yes', 'y', '1', 'on'}
+_FALSE = {'false', 'f', 'no', 'n', '0', 'off'}
+
+
+def _coerce(field_type, raw: str, key: str):
+    '''
+    Coerce a CLI string to a config field's declared type.
+
+    bool is special-cased because bool('false') is True -- silently turning
+    `--set ramp_sf=false` into ramp_sf=True would change the score function
+    without any visible error.
+    '''
+    if field_type is bool:
+        low = raw.lower()
+        if low in _TRUE:
+            return True
+        if low in _FALSE:
+            return False
+        raise ValueError(
+            f'{key}: expected a boolean, got {raw!r} '
+            f'(try true/false)')
+    try:
+        return field_type(raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f'{key}: cannot read {raw!r} as {field_type.__name__}: {e}')
+
+# --- option file locations -------------------------------------------------
+# CONFIG_DIR and the Rosetta session helpers live in utils.py (shared with
+# model.py); re-exported here so existing `from glycographer.sample import
+# init_rosetta` style imports keep working.
+from glycographer.utils import (  # noqa: E402,F401
+    CONFIG_DIR, init_rosetta, read_option_flags, seed_flags as _seed_flags,
+)
+
+STAGE_0_OPTIONS = os.path.join(CONFIG_DIR, 'glycandock_stage_0.init')
+STAGE_1_2_OPTIONS = os.path.join(CONFIG_DIR, 'glycandock_stage_1_stage_2.init')
+STAGE_2_OPTIONS = os.path.join(CONFIG_DIR, 'glycandock_stage_2.init')
+
+
+@dataclass(frozen=True)
+class GlycanDockConfig:
+    '''
+    Protocol parameters for a GlycanDock run.
+
+    Field defaults are the GlycanDock publication defaults (Nance et al. 2021);
+    descriptions are taken from that paper's supplemental information and the
+    PyRosetta glycan_docking API docs. Use the `probe()` / `refinement()`
+    presets rather than the bare constructor unless you specifically want the
+    publication baseline -- see the class docstring table below.
+
+    This object holds *protocol* parameters only. Input paths (complex, grid,
+    native, constraint file) are arguments to the run functions instead, so a
+    config stays portable between machines and serializes cleanly for
+    provenance.
+    '''
+
+    # Full protocol parameters:
+    partners: str = 'A_X' # Set the chain IDs identifying the protein-glycoligand complex protein is chain A, glycoligand is chain X –> partners = A_X
+    refine_only: bool = False # Skip the Stage 1 initial perturbation and employ only the uniform ± 15° glycosidic torsion angle perturbations using the SmallBBSampler during Stage 2 docking and refinement
+    prepack_only: bool = False # Perform only Stage 0 pre-packing
+    intf_pack_dist: float = 16.0 # (Angstroms) Cutoff distance to define protein-glycan interface residues to be considered during packing
+    slide: bool = True # Allow the glycoligand’s center-of-mass to be periodically translated toward the protein receptor’s center-of-mass during rigid-body sampling
+    rand_glyc_jump: bool = False # Set whether to use a random, non-branch-point residue of the glycoligand to set as the Jump residue for the docking FoldTree
+
+    # Stage 1-specific parameters:
+    stage1_rand_rot: bool = False # During Stage 1 initial perturbation, randomly rotate the glycoligand about its center-of-mass in 360˚ space
+    stage1_trans_mag: float = 0.5 # (Angstroms) The translational magnitude of the Gaussian perturbation on the glycoligand’s center-of-mass performed during Stage 1
+    stage1_rot_mag: float = 7.5 # (Degrees) The rotational magnitude of the Gaussian perturbation on the glycoligand’s center-of-mass performed during Stage 1
+    stage1_tor_mag: float = 12.5 # (Degrees) The magnitude of the uniform perturbation on each glycosidic torsion angle
+
+    # Stage 2-specific parameters:
+    n_repeats: int = 3 # Number of times to repeat Stage 2 of GlycanDock if the final model does not have a negative interface score
+    n_cycles: int = 10 # Number of stage 2 outer cycles to perform
+    rb_rounds: int = 8 # The number of inner cycles of rigid-body perturbations to perform
+    tor_rounds: int = 8 # The number of inner cycles of glycosidic torsion perturbations to perform
+    stage2_trans_mag: float = 0.5 # (Angstroms) During Stage 2 docking and refinement, this is the magnitude for performing a translational Gaussian perturbation on the glycoligand's center-of-mass
+    stage2_rot_mag: float = 7.5 # (Degrees) During Stage 2 docking and refinement, this is the magnitude for performing a rotational Gaussian perturbation on the glycoligand's center-of-mass
+    full_pack_freq: int = 8 # When packing after each sampling perturbation in Stage 2, at what frequency should the PackRotamersMover be called? Set to 0 to use only the EnergyCutRotamerTrialsMover after every perturbation. Set to the value of n_rigid_body_rounds and n_torsion_rounds to use the PackRotamersMover only after the last perturbation
+    mc_kt: float = 0.6 # (a.u.) During Stage 2 docking and refinement, the value of kT used to accept or reject moves based on the Metropolis criterion
+    ramp_sf: bool = True # Set whether to ramp the fa_atr and fa_rep score terms of the ScoreFunction used during Stage 2 sampling and optimization
+
+    # Glycographer staging parameters (not GlycanDock mover settings):
+    prepack_mode: str = 'once' # How Stage 0 is handled: 'once' (input is pre-prepacked, publication workflow), 'per_decoy' (legacy, probe preset), or 'none'. See module docstring.
+    random_start: bool = False # Randomize glycoligand orientation with RigidBodyRandomizeMover before docking. Off by default: a standard run starts from the glycoligand's known pose. The probe preset turns it on.
+
+    _PREPACK_MODES = ('per_decoy', 'once', 'none')
+
+    def __post_init__(self):
+        if self.prepack_mode not in self._PREPACK_MODES:
+            raise ValueError(
+                f'prepack_mode must be one of {self._PREPACK_MODES}, '
+                f'got {self.prepack_mode!r}')
+        if self.n_cycles < 1:
+            raise ValueError(f'n_cycles must be >= 1, got {self.n_cycles}')
+        if self.n_repeats < 1:
+            raise ValueError(f'n_repeats must be >= 1, got {self.n_repeats}')
+
+    # ---- presets ---------------------------------------------------------
+    #
+    # `probe` and `refinement` reproduce scripts/run_glycandock.py as it stood
+    # before this module existed, so ensembles generated through sample.py stay
+    # comparable with everything already in the archive. Where they differ from
+    # the publication defaults:
+    #
+    #   field              publication   probe       refinement
+    #   n_cycles                    10       1               10
+    #   stage1_rand_rot          False    True            False
+    #   stage1_rot_mag             7.5   180.0              7.5
+    #   stage2_trans_mag           0.5     0.2              0.5
+    #   stage2_rot_mag             7.5    45.0              7.5
+    #   rb_rounds                    8      20                8
+    #   tor_rounds                   8      20                8
+    #   prepack_mode              once   per_decoy        once
+    #   random_start             False    True            False
+    #
+    # `refinement` therefore currently equals `publication`. It stays a
+    # separate preset so that refinement-specific choices can diverge later
+    # without changing what "publication" means. Note `stage1_rand_rot`: the
+    # old script set it True for refinement too, which rotates the glycoligand
+    # 360 degrees about its center of mass in Stage 1 and throws away the
+    # known starting orientation. It is False here, as published.
+    #
+    # Note `tor_rounds`: the old script set n_torsion_rounds = 20
+    # unconditionally, so it applied to refinement as well as probe sampling,
+    # although only probe sampling wanted it. `probe` keeps 20 because the
+    # existing glycographer ensembles were generated with it. `refinement`
+    # uses the publication's 8, since no refinement ensembles predate this
+    # module and there is nothing to stay comparable with -- measured on a
+    # 5-residue branched glycan with two sialic acids, 20 rounds cost roughly
+    # 1.75x the wall time of 8 for no documented benefit.
+
+    @classmethod
+    def probe(cls, **overrides) -> 'GlycanDockConfig':
+        '''
+        Glycographer grid-probe sampling preset.
+
+        Probes are small (one or a few residues) compared with a full glycan
+        chain, so Stage 1 places them with a full 360 degree randomization,
+        Stage 2 runs a single ramping cycle, and sampling is weighted toward
+        rigid-body moves with tighter translational steps. Each decoy's start
+        orientation is randomized, and Stage 0 runs per decoy, as in every
+        existing glycographer probe ensemble.
+        '''
+        base = dict(
+            n_cycles=1,
+            stage1_rand_rot=True,
+            stage1_rot_mag=180.0,
+            stage2_trans_mag=0.2,
+            stage2_rot_mag=45.0,
+            rb_rounds=20,
+            tor_rounds=20,
+            prepack_mode='per_decoy',
+            random_start=True,
+        )
+        base.update(overrides)
+        return cls(**base)
+
+    @classmethod
+    def refinement(cls, **overrides) -> 'GlycanDockConfig':
+        '''
+        Preset for refining a known or designed protein-glycan complex, i.e. a
+        standard GlycanDock run rather than grid probing.
+
+        The glycoligand starts from its input pose (no random start), and
+        the input must already be prepacked by prepack() (prepack_mode='once').
+
+        Pass `refine_only=True` to bypass Stage 1 entirely; the stage1_* fields
+        are then unused.
+        '''
+        base = dict(
+            n_cycles=10,
+            stage1_rand_rot=False,
+            stage1_rot_mag=7.5,
+            stage2_trans_mag=0.5,
+            stage2_rot_mag=7.5,
+            rb_rounds=8,
+            tor_rounds=8,
+            prepack_mode='once',
+            random_start=False,
+        )
+        base.update(overrides)
+        return cls(**base)
+
+    @classmethod
+    def publication(cls, **overrides) -> 'GlycanDockConfig':
+        '''GlycanDock defaults exactly as published (Nance et al. 2021).'''
+        return cls(**overrides)
+
+    # ---- serialization ---------------------------------------------------
+    def as_dict(self) -> Dict:
+        return asdict(self)
+
+    def to_json(self, outname: str) -> str:
+        with open(outname, 'w') as f:
+            json.dump(self.as_dict(), f, indent=2, sort_keys=True)
+        return outname
+
+    @classmethod
+    def from_json(cls, path: str) -> 'GlycanDockConfig':
+        with open(path) as f:
+            return cls(**json.load(f))
+
+    def replace(self, **changes) -> 'GlycanDockConfig':
+        '''Return a copy with `changes` applied (the config is frozen).'''
+        return replace(self, **changes)
+
+    def with_overrides(self, pairs: Sequence[str]) -> 'GlycanDockConfig':
+        '''
+        Apply "field=value" strings, coercing each value to the field's
+        declared type. Backs the CLI's repeatable --set flag, so any protocol
+        parameter can be swept without adding a flag per field.
+
+        >>> GlycanDockConfig.probe().with_overrides(['n_cycles=3', 'ramp_sf=false'])
+        '''
+        hints = get_type_hints(type(self))
+        changes = {}
+        for pair in pairs:
+            if '=' not in pair:
+                raise ValueError(
+                    f'--set expects field=value, got {pair!r}')
+            key, _, raw = pair.partition('=')
+            key, raw = key.strip(), raw.strip()
+            if key not in hints:
+                valid = ', '.join(sorted(hints))
+                raise ValueError(
+                    f'unknown config field {key!r}. Valid fields: {valid}')
+            changes[key] = _coerce(hints[key], raw, key)
+        return replace(self, **changes)
+
+    def diff(self, other: 'GlycanDockConfig') -> Dict:
+        '''
+        Fields that differ between two configs, as {field: (self, other)}.
+        Useful for stating in a methods section exactly how two ensembles were
+        sampled differently.
+        '''
+        return {f.name: (getattr(self, f.name), getattr(other, f.name))
+                for f in fields(self)
+                if getattr(self, f.name) != getattr(other, f.name)}
+
+
+# --- config field -> GlycanDockProtocol setter ------------------------------
+# Kept as an explicit table rather than getattr-by-convention so that a rename
+# on either side fails loudly and in one place.
+_SETTERS = {
+    'partners': 'set_partners',
+    'refine_only': 'set_refine_only',
+    'intf_pack_dist': 'set_interface_packing_distance',
+    'slide': 'set_slide_glycan_into_contact',
+    'rand_glyc_jump': 'set_rand_glycan_jump_res',
+    'stage1_rand_rot': 'set_stage1_rotate_glycan_about_com',
+    'stage1_trans_mag': 'set_stage1_perturb_glycan_com_trans_mag',
+    'stage1_rot_mag': 'set_stage1_perturb_glycan_com_rot_mag',
+    'stage1_tor_mag': 'set_stage1_torsion_uniform_pert_mag',
+    'n_repeats': 'set_n_repeats',
+    'rb_rounds': 'set_n_rigid_body_rounds',
+    'tor_rounds': 'set_n_torsion_rounds',
+    'stage2_trans_mag': 'set_stage2_trans_mag',
+    'stage2_rot_mag': 'set_stage2_rot_mag',
+    'full_pack_freq': 'set_full_packing_frequency',
+    'mc_kt': 'set_mc_kt',
+    'ramp_sf': 'set_ramp_scorefxn',
+}
+
+# Fields with no corresponding mover setter:
+#   n_cycles      GlycanDockProtocol exposes no set_n_cycles; the publication's
+#                 own CLI examples pass -n_cycles as a Rosetta flag, and the
+#                 mover reads it from the option system when constructed. It is
+#                 therefore applied at init_rosetta() time, which means
+#                 n_cycles is FIXED FOR THE LIFETIME OF A PROCESS and a block
+#                 cannot mix cycle counts. Run probe and refinement separately.
+#   prepack_only  set explicitly by _build_protocol, not driven from config.
+#   prepack_mode, random_start
+#                 glycographer staging, not mover settings.
+_NO_SETTER_FIELDS = ('n_cycles', 'prepack_only', 'prepack_mode', 'random_start')
+
+# Every config field must be accounted for: either it maps to a mover setter or
+# it is explicitly listed as handled elsewhere. Checked at import (pure Python,
+# no PyRosetta needed) so that adding a field to GlycanDockConfig without
+# wiring it up fails immediately, rather than silently never reaching Rosetta.
+_unmapped = ({f.name for f in fields(GlycanDockConfig)}
+             - set(_SETTERS) - set(_NO_SETTER_FIELDS))
+if _unmapped:
+    raise RuntimeError(
+        f'GlycanDockConfig field(s) {sorted(_unmapped)} are neither in '
+        f'_SETTERS nor _NO_SETTER_FIELDS, so they would never be applied to '
+        f'the GlycanDockProtocol mover. Add them to one or the other.')
+del _unmapped
+
+
+def check_setters(verbose: bool = True) -> Dict[str, bool]:
+    '''
+    Verify that every setter name in `_SETTERS` actually exists on
+    GlycanDockProtocol in the installed PyRosetta build.
+
+    Run this once on the HPC partition after any PyRosetta upgrade. It is much
+    cheaper than discovering a renamed setter partway through an array job, and
+    it is the intended way to resolve the two names that could not be verified
+    off-cluster (`set_rand_glycan_jump_res` in particular).
+
+    Returns
+    -------
+    dict : {config_field: setter_exists}
+    '''
+    from pyrosetta.rosetta.protocols.glycan_docking import GlycanDockProtocol
+
+    available = set(dir(GlycanDockProtocol))
+    result = {field: (setter in available)
+              for field, setter in _SETTERS.items()}
+
+    if verbose:
+        missing = {f: _SETTERS[f] for f, ok in result.items() if not ok}
+        if missing:
+            print('MISSING setters on GlycanDockProtocol:')
+            for field, setter in missing.items():
+                print(f'  {field:20s} -> {setter}')
+            print('\nCandidate setter names in this build:')
+            for name in sorted(n for n in available if n.startswith('set_')):
+                print(f'  {name}')
+        else:
+            print(f'All {len(result)} setters resolve on GlycanDockProtocol.')
+
+    return result
+
+
+def _build_protocol(config: GlycanDockConfig, prepack_only: bool = False):
+    '''
+    Construct a GlycanDockProtocol mover from `config`.
+
+    With prepack_only=True only the three settings that Stage 0 actually
+    consults are applied (partners, prepack_only, slide) -- matching both the
+    legacy script and the publication's prepack invocation. Sampling parameters
+    are meaningless for a pre-pack and are deliberately left at their defaults.
+    '''
+    from pyrosetta.rosetta.protocols.glycan_docking import GlycanDockProtocol
+
+    mover = GlycanDockProtocol()
+
+    if prepack_only:
+        mover.set_partners(config.partners)
+        mover.set_prepack_only(True)
+        mover.set_slide_glycan_into_contact(config.slide)
+        return mover
+
+    mover.set_prepack_only(False)
+    for field, setter_name in _SETTERS.items():
+        setter = getattr(mover, setter_name, None)
+        if setter is None:
+            raise AttributeError(
+                f'GlycanDockProtocol has no {setter_name!r} (for config field '
+                f'{field!r}) in this PyRosetta build. Run '
+                f'glycographer.sample.check_setters() to list the setters this '
+                f'build does expose, then update sample._SETTERS.')
+        setter(getattr(config, field))
+
+    return mover
+
+
+# --- timing -----------------------------------------------------------------
+@contextmanager
+def _timed(record: Dict[str, float], key: str):
+    '''
+    Accumulate wall time for a named step into `record`.
+
+    perf_counter is the right clock here: each mover's .apply() is a blocking
+    C++ call on this thread, so on a dedicated core wall time is CPU time. The
+    overhead is nanoseconds against minute-scale movers, so timing stays on
+    permanently -- profiling data comes from real production runs rather than a
+    separate benchmark.
+    '''
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        record[key] = record.get(key, 0.0) + (time.perf_counter() - t0)
+
+
+# --- Rosetta session --------------------------------------------------------
+def block_seed(run_id: str, block_index: int) -> int:
+    '''
+    Deterministic RNG seed for one block of decoys.
+
+    Seeding is per *block*, not per decoy: a block shares one Rosetta session,
+    so all its decoys draw from a single RNG stream that advances naturally
+    across the loop. Re-seeding per decoy would require re-initializing Rosetta,
+    which is not supported.
+
+    crc32 of "<run_id>:<block_index>" spreads adjacent block indices across the
+    seed space, so array tasks launched in the same instant cannot collide the
+    way time-derived seeds can, and a given (run_id, block) is reproducible.
+    '''
+    key = f'{run_id}:{block_index}'.encode()
+    return (zlib.crc32(key) & 0x7fffffff) or 1
+
+
+def block_slice(total: int, n_blocks: int, block_index: int,
+                start: int = 1) -> List[int]:
+    '''
+    Decoy indices belonging to one block of a split run.
+
+    Replaces the manual --start-count-from bookkeeping: give the total decoy
+    count and how many blocks to split it into, and each SLURM array task asks
+    for its own slice. Coverage is exact -- the blocks partition
+    [start, start + total) with no gaps and no overlaps -- so two tasks can
+    never write the same output file, and no decoy is silently dropped when
+    `total` is not divisible by `n_blocks` (the remainder is spread one extra
+    decoy at a time across the leading blocks rather than dumped on the last).
+
+    Parameters
+    ----------
+    total : int
+        Total decoys across the whole run.
+    n_blocks : int
+        Number of blocks (i.e. array tasks) to split across.
+    block_index : int
+        Which block to return, 0-based (i.e. $SLURM_ARRAY_TASK_ID).
+    start : int
+        Index of the first decoy of the whole run (default 1).
+
+    Returns
+    -------
+    list of int : this block's decoy indices. May be empty if n_blocks exceeds
+        total, which is not an error -- that task simply has nothing to do.
+    '''
+    if total < 1:
+        raise ValueError(f'total must be >= 1, got {total}')
+    if n_blocks < 1:
+        raise ValueError(f'n_blocks must be >= 1, got {n_blocks}')
+    if not 0 <= block_index < n_blocks:
+        raise ValueError(
+            f'block_index must be in [0, {n_blocks}), got {block_index}')
+
+    base, remainder = divmod(total, n_blocks)
+    offset = block_index * base + min(block_index, remainder)
+    size = base + (1 if block_index < remainder else 0)
+    return list(range(start + offset, start + offset + size))
+
+
+def check_options(options_file: str, config: GlycanDockConfig) -> List[str]:
+    '''
+    Preflight the options file against the config, returning human-readable
+    problem descriptions (empty when nothing looks wrong).
+
+    Each check corresponds to a way of silently wasting a cluster job rather
+    than failing fast, so this runs both in --dry-run and at the top of
+    run_block().
+    '''
+    problems = []
+    try:
+        flags = read_option_flags(options_file)
+    except OSError as e:
+        return [f'could not read options file {options_file}: {e}']
+
+    # Reading a raw PDB needs geometric connection detection; -maintain_links
+    # only preserves LINK records that already exist in the file.
+    if (config.prepack_mode == 'per_decoy'
+            and '-auto_detect_glycan_connections' not in flags):
+        problems.append(
+            f"prepack_mode='per_decoy' runs Stage 0 in this session, so the "
+            f"input is a RAW pdb, but {os.path.basename(options_file)} has no "
+            f"-auto_detect_glycan_connections. Every sugar will load "
+            f"unlinked (one glycan tree per residue), and rebuilding their "
+            f"anomeric oxygens will blow up the packer. Add the flag, or use "
+            f"prepack_mode='once' with a prepacked input.")
+
+    # A prepack-only options file turns the whole sampling run into a no-op.
+    if '-carbohydrates:glycan_dock:prepack_only' in flags:
+        problems.append(
+            f'{os.path.basename(options_file)} sets prepack_only, which would '
+            f'make every decoy a pre-pack rather than a docking run. This is '
+            f'the Stage 0 options file -- use it with prepack(), not '
+            f'run_block().')
+
+    # refine_only set in the options file but not the config (or vice versa)
+    # silently changes whether Stage 1 runs at all.
+    opt_refine = '-carbohydrates:glycan_dock:refine_only' in flags
+    if opt_refine != config.refine_only:
+        problems.append(
+            f'refine_only disagrees: config says {config.refine_only}, '
+            f'{os.path.basename(options_file)} says {opt_refine}. Stage 1 '
+            f'would run differently than the config records, making the '
+            f'manifest misleading.')
+
+    if '-include_sugars' not in flags:
+        problems.append(
+            f'{os.path.basename(options_file)} has no -include_sugars; '
+            f'glycan residues will not be typed as carbohydrates.')
+
+    return problems
+
+
+# --- Stage 0 ----------------------------------------------------------------
+def prepack(complex_pdb: str, out_pdb: str, *,
+            config: Optional[GlycanDockConfig] = None,
+            options_file: str = STAGE_0_OPTIONS,
+            native: Optional[str] = None,
+            seed: Optional[int] = None,
+            initialize: bool = True) -> str:
+    '''
+    Run GlycanDock Stage 0 pre-packing once and write the prepacked complex.
+
+    Stage 0 separates the docking partners, repacks each in its unbound state,
+    and re-forms the complex, so the result is essentially independent of where
+    the glycoligand started. That is what makes it safe to run once per complex
+    rather than once per decoy -- and why the legacy per-decoy call repeats the
+    same work for every sample.
+
+    This is intended to run as its own job, under STAGE_0_OPTIONS, whose finer
+    rotamer sampling (-ex3 -ex4 -ex1aro -ex2aro) is affordable once and not
+    thousands of times. Feed `out_pdb` to run_block() with
+    prepack_mode='once'.
+
+    Parameters
+    ----------
+    initialize : bool
+        Call init_rosetta() first. Pass False only if this process already
+        initialized Rosetta with Stage 0 flags.
+
+    Returns
+    -------
+    str : path to the written prepacked PDB.
+    '''
+    from pyrosetta import pose_from_pdb
+
+    if initialize:
+        init_rosetta(options_file, complex_pdb, native=native, seed=seed)
+
+    config = config or GlycanDockConfig()
+    timings: Dict[str, float] = {}
+
+    with _timed(timings, 'pose_from_pdb'):
+        pose = pose_from_pdb(complex_pdb)
+    with _timed(timings, 'prepack'):
+        _build_protocol(config, prepack_only=True).apply(pose)
+
+    out_dir = os.path.dirname(os.path.abspath(out_pdb))
+    os.makedirs(out_dir, exist_ok=True)
+    pose.dump_pdb(out_pdb)
+
+    print(f'Prepacked {complex_pdb} -> {out_pdb} '
+          f'({timings["prepack"]:.1f}s pack, '
+          f'{timings["pose_from_pdb"]:.1f}s read)')
+    return out_pdb
+
+
+# --- Stages 1/2 -------------------------------------------------------------
+class GlycanDockRunner:
+    '''
+    Holds the per-process state for generating decoys: the template pose, the
+    movers built from a config, and the grid StartFrom mover.
+
+    Everything expensive is built once here and reused across the block. The
+    only things rebuilt per decoy are the pose copy and RigidBodyRandomizeMover
+    (which needs the pose at construction).
+
+    Rosetta must already be initialized -- call init_rosetta() first, or use the
+    module-level run_block(), which does both.
+    '''
+
+    def __init__(self, config: GlycanDockConfig, complex_pdb: str, *,
+                 grid_pdb: Optional[str] = None,
+                 reuse_template: bool = True):
+        from pyrosetta import pose_from_pdb
+        from pyrosetta.rosetta.protocols.ligand_docking import StartFrom
+
+        self.config = config
+        self.complex_pdb = complex_pdb
+        self.grid_pdb = grid_pdb
+        self.reuse_template = reuse_template
+
+        self._lig_chain = config.partners.split('_')[-1]
+
+        # Parsing a glycan PDB under -include_sugars
+        # -auto_detect_glycan_connections is not cheap, so read it once and
+        # deep-copy per decoy. NOTE: the legacy script re-read the file every
+        # iteration. Copying yields an identical starting pose, but if PDB
+        # reading consumes RNG draws (rebuilding missing density, idealizing
+        # geometry) the downstream RNG stream will differ from a legacy run --
+        # so legacy comparison is statistical, not bitwise. Set
+        # reuse_template=False to restore the old read-per-decoy behavior.
+        self._template = pose_from_pdb(complex_pdb) if reuse_template else None
+
+        self.start_from = None
+        if grid_pdb:
+            self.start_from = StartFrom()
+            self.start_from.chain(self._lig_chain)
+            self.start_from.parse_pdb_file(grid_pdb)
+
+        self.gdock_full = _build_protocol(config, prepack_only=False)
+        self.gdock_prepack = (
+            _build_protocol(config, prepack_only=True)
+            if config.prepack_mode == 'per_decoy' else None)
+
+    def _fresh_pose(self, timings: Dict[str, float]):
+        from pyrosetta import Pose, pose_from_pdb
+
+        with _timed(timings, 'pose_load'):
+            if self._template is not None:
+                return Pose(self._template)
+            return pose_from_pdb(self.complex_pdb)
+
+    def run_decoy(self, index: int, outname: str) -> Dict[str, float]:
+        '''
+        Generate one decoy and write it to `outname`.
+
+        Returns the step timing record for this decoy. The step order matches
+        the legacy script exactly: read -> grid placement -> randomize ->
+        prepack -> GlycanDock.
+        '''
+        from pyrosetta import Vector1
+        from pyrosetta.rosetta.protocols.rigid import (
+            RigidBodyRandomizeMover, partner_downstream)
+        from pyrosetta.rosetta.protocols.docking import setup_foldtree
+
+        cfg = self.config
+        timings: Dict[str, float] = {}
+
+        pose = self._fresh_pose(timings)
+
+        if self.start_from is not None:
+            # StartFrom picks one of the grid's pseudo-atom coordinates and
+            # moves the glycoligand there, so decoys are distributed across
+            # sampling points rather than fixed to one.
+            with _timed(timings, 'start_from'):
+                self.start_from.apply(pose)
+
+        if cfg.random_start:
+            with _timed(timings, 'randomize'):
+                # Jump 1 is the glycoligand jump. RigidBodyRandomizeMover
+                # rotates the downstream partner about its own center of mass,
+                # so a StartFrom placement survives the randomization.
+                setup_foldtree(pose, cfg.partners, Vector1([1]))
+                RigidBodyRandomizeMover(pose, 1, partner_downstream).apply(pose)
+
+        if self.gdock_prepack is not None:
+            with _timed(timings, 'prepack'):
+                self.gdock_prepack.apply(pose)
+
+        with _timed(timings, 'glycandock'):
+            self.gdock_full.apply(pose)
+
+        with _timed(timings, 'dump'):
+            pose.dump_pdb(outname)
+
+        timings['total'] = sum(v for k, v in timings.items() if k != 'total')
+        timings['index'] = index
+        return timings
+
+
+def decoy_name(outprefix: str, index: int) -> str:
+    '''
+    Output filename for one decoy.
+
+    Zero-padded to 4 digits, matching the legacy naming that
+    utils.build_pose_list / POSE_NUM_RE already parse. Indices above 9999 widen
+    gracefully and still parse.
+    '''
+    return f'{outprefix}_{index:04d}.pdb'
+
+
+def default_outprefix(complex_pdb: str) -> str:
+    return os.path.basename(complex_pdb).replace('.pdb', '')
+
+
+def run_block(config: GlycanDockConfig, complex_pdb: str, *,
+              start: int = 1, count: int = 1,
+              indices: Optional[Sequence[int]] = None,
+              grid_pdb: Optional[str] = None,
+              native: Optional[str] = None,
+              cst_file: Optional[str] = None,
+              options_file: Optional[str] = None,
+              outprefix: Optional[str] = None,
+              outdir: str = '.',
+              run_id: Optional[str] = None,
+              block_index: int = 0,
+              n_blocks: Optional[int] = None,
+              seed: Optional[int] = None,
+              reuse_template: bool = True,
+              archive: bool = True,
+              write_manifest: bool = True,
+              initialize: bool = True,
+              verbose: bool = True) -> Dict:
+    '''
+    Generate one block of decoys in this process. This is the unit of parallel
+    work: one call per SLURM array task.
+
+    Decoy indices are assigned explicitly (either `indices`, or `count` of them
+    starting at `start`), so blocks can never collide on an output filename and
+    the old --start-count-from bookkeeping goes away.
+
+    By default the block is written as a single <run_id>_block<NNN>.tar.xz in
+    `outdir` rather than one PDB per decoy, to keep inode usage down. Each
+    decoy is dumped to a node-local temporary directory ($TMPDIR, else /tmp),
+    added to <archive>.partial, and deleted; the manifest and timings are
+    added under meta/ last, and the archive is renamed into place only once
+    the block has finished. A block killed mid-run therefore leaves only a
+    .partial file, which a rerun replaces.
+
+    Parameters
+    ----------
+    config : GlycanDockConfig
+        Protocol parameters. If config.prepack_mode == 'once', `complex_pdb`
+        must ALREADY be a prepacked structure from prepack().
+    start, count : int
+        Decoy index range, used when `indices` is not given.
+    indices : sequence of int, optional
+        Explicit decoy indices, overriding start/count.
+    options_file : str, optional
+        Rosetta flags file. Defaults to STAGE_2_OPTIONS when
+        config.refine_only is set, otherwise STAGE_1_2_OPTIONS.
+    run_id : str, optional
+        Identifier for the whole multi-block run; also seeds block_seed().
+        Defaults to the output prefix.
+    block_index : int
+        Which block this is (e.g. $SLURM_ARRAY_TASK_ID). Only used for seeding
+        and provenance.
+    n_blocks : int, optional
+        How many blocks the whole run has. Recorded in the manifest so that
+        merge_block_archives() can tell when a block is missing.
+    seed : int, optional
+        Explicit RNG seed, overriding block_seed(run_id, block_index). Pass
+        seed=-1 to disable seeding and use Rosetta's default.
+    archive : bool
+        Pack the block into one tar.xz (default). False writes loose decoy
+        PDBs, manifest and timings into `outdir`, as before.
+    write_manifest : bool
+        Write the manifest JSON (loose mode only; an archive always gets one,
+        since it marks the block as finished).
+    initialize : bool
+        Call init_rosetta() first. Pass False if the caller already did.
+
+    Returns
+    -------
+    dict : run manifest (config, inputs, seed, outputs, timing summary). Also
+        packed into the block archive under meta/, or in loose mode written to
+        <outdir>/<run_id>_block<NNN>_manifest.json unless write_manifest is
+        False. `outputs` lists decoy names within the archive, or decoy paths
+        in loose mode.
+    '''
+    if indices is None:
+        if count < 1:
+            raise ValueError(f'count must be >= 1, got {count}')
+        if start < 1:
+            raise ValueError(f'decoy indices must start at 1 or above, got {start}')
+        indices = list(range(start, start + count))
+    else:
+        indices = list(indices)
+        if not indices:
+            raise ValueError('indices is empty; nothing to run')
+
+    if config.prepack_mode == 'once' and verbose:
+        print(f"prepack_mode='once': assuming {complex_pdb} is already "
+              f"prepacked (Stage 0 will NOT run in this process). If it is "
+              f"a raw structure, run prepack_complex.py on it first.")
+
+    outprefix = outprefix or default_outprefix(complex_pdb)
+    run_id = run_id or outprefix
+    if options_file is None:
+        options_file = STAGE_2_OPTIONS if config.refine_only else STAGE_1_2_OPTIONS
+
+    for problem in check_options(options_file, config):
+        print(f'OPTIONS PREFLIGHT: {problem}\n')
+
+    if seed is None:
+        seed = block_seed(run_id, block_index)
+    elif seed < 0:
+        seed = None
+
+    os.makedirs(outdir, exist_ok=True)
+
+    flag_string = None
+    if initialize:
+        flag_string = init_rosetta(
+            options_file, complex_pdb, native=native,
+            n_cycles=config.n_cycles, cst_file=cst_file, seed=seed)
+
+    setup_timings: Dict[str, float] = {}
+    with _timed(setup_timings, 'runner_setup'):
+        runner = GlycanDockRunner(config, complex_pdb, grid_pdb=grid_pdb,
+                                  reuse_template=reuse_template)
+
+    block_tag = f'{run_id}_block{block_index:03d}'
+    timings_name = f'{block_tag}_timings.jsonl'
+    manifest_name = f'{block_tag}_manifest.json'
+    outputs: List[str] = []
+    per_decoy: List[Dict[str, float]] = []
+
+    tar = scratch = None
+    if archive:
+        archive_path = os.path.join(outdir, block_archive_name(run_id, block_index))
+        scratch = tempfile.mkdtemp(prefix=f'{block_tag}_')
+        decoy_dir = scratch
+        timings_path = os.path.join(scratch, timings_name)
+        tar = tarfile.open(archive_path + '.partial', 'w:xz')
+    else:
+        decoy_dir = outdir
+        timings_path = os.path.join(outdir, timings_name)
+
+    try:
+        with open(timings_path, 'w') as tf:
+            for i in indices:
+                name = decoy_name(outprefix, i)
+                outname = os.path.join(decoy_dir, name)
+                t = runner.run_decoy(i, outname)
+                if tar is not None:
+                    with _timed(t, 'archive'):
+                        tar.add(outname, arcname=name)
+                        os.remove(outname)
+                    t['total'] += t['archive']
+                    outputs.append(name)
+                else:
+                    outputs.append(os.path.abspath(outname))
+                per_decoy.append(t)
+                tf.write(json.dumps(t) + '\n')
+                tf.flush()  # loose mode: survive a walltime kill with partial timings
+                if verbose:
+                    print(f'[{run_id} block {block_index}] decoy {i} '
+                          f'-> {name} ({t["total"]:.1f}s)')
+
+        summary = _summarize_timings(per_decoy)
+        manifest = {
+            'run_id': run_id,
+            'block_index': block_index,
+            'n_blocks': n_blocks,
+            'indices': indices,
+            'seed': seed,
+            'config': config.as_dict(),
+            'inputs': {
+                'complex_pdb': os.path.abspath(complex_pdb),
+                'grid_pdb': os.path.abspath(grid_pdb) if grid_pdb else None,
+                'native': os.path.abspath(native) if native else None,
+                'cst_file': os.path.abspath(cst_file) if cst_file else None,
+                'options_file': os.path.abspath(options_file),
+            },
+            'rosetta_flags': flag_string,
+            'outputs': outputs,
+            'timing_summary': summary,
+            'setup_seconds': setup_timings.get('runner_setup'),
+        }
+
+        if tar is not None:
+            manifest['archive'] = os.path.abspath(archive_path)
+            manifest['timings_jsonl'] = f'{META_DIR}/{timings_name}'
+            tar.add(timings_path, arcname=manifest['timings_jsonl'])
+            # Written last: a readable manifest means the block finished.
+            add_bytes(tar, f'{META_DIR}/{manifest_name}',
+                      json.dumps(manifest, indent=2).encode())
+            tar.close()
+            os.replace(archive_path + '.partial', archive_path)
+        else:
+            manifest['timings_jsonl'] = os.path.abspath(timings_path)
+            if write_manifest:
+                manifest_path = os.path.join(outdir, manifest_name)
+                with open(manifest_path, 'w') as f:
+                    json.dump(manifest, f, indent=2)
+                manifest['manifest_path'] = os.path.abspath(manifest_path)
+    finally:
+        if tar is not None and not tar.closed:
+            tar.close()
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    if verbose:
+        _print_timing_summary(summary, len(indices))
+
+    return manifest
+
+
+def _summarize_timings(per_decoy: List[Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+    '''Mean/total per step across a block's decoys.'''
+    if not per_decoy:
+        return {}
+    keys = [k for k in per_decoy[0] if k != 'index']
+    summary = {}
+    for k in keys:
+        vals = [d[k] for d in per_decoy if k in d]
+        summary[k] = {
+            'total': sum(vals),
+            'mean': sum(vals) / len(vals),
+            'n': len(vals),
+        }
+    return summary
+
+
+def _print_timing_summary(summary: Dict, n_decoys: int) -> None:
+    if not summary:
+        return
+    total = summary.get('total', {}).get('total', 0.0)
+    print(f'\n--- timing over {n_decoys} decoys ({total / 60:.1f} min) ---')
+    for step, s in sorted(summary.items(),
+                          key=lambda kv: -kv[1]['total']):
+        if step == 'total':
+            continue
+        share = (100 * s['total'] / total) if total else 0.0
+        print(f'  {step:14s} {s["mean"]:8.2f}s/decoy  {share:5.1f}%')
+    prepack = summary.get('prepack', {}).get('total', 0.0)
+    gdock = summary.get('glycandock', {}).get('total', 0.0)
+    if prepack and gdock:
+        print(f'\n  prepack / (prepack + glycandock) = '
+              f'{100 * prepack / (prepack + gdock):.1f}%')
+        print('  This is the number that decides whether hoisting Stage 0 out '
+              'of the loop is worth a protocol change.')

@@ -1,0 +1,706 @@
+import { Pair, StyleError, typeBounds, type BondedEquilibria, type KSpace, type PairCompute, type PairSep, type StyleContext, type PairConstructorWhere, newAccum, clearAccum, type Accum, pairCoeffArgs } from '../types';
+import { NEIGHMASK, type NeighList } from '../../neighbor';
+import { inumeric, missingArgs, numeric } from '../util';
+import { removedStyleError } from '../../deprecated';
+import { unknownStyleError } from '../../nativeStyles';
+
+/*
+ * pair_style hybrid, hybrid/overlay, hybrid/scaled, hybrid/molecular —
+ * docs.lammps.org/pair_hybrid.html.
+ *
+ *   "With the hybrid style, exactly one pair style is assigned to each pair
+ *   of atom types. With the hybrid/overlay and hybrid/scaled styles, one or
+ *   more pair styles can be assigned to each pair of atom types. With the
+ *   hybrid/molecular style, pair styles are assigned to either intra- or
+ *   inter-molecular interactions."
+ *   "In the pair_coeff commands, the name of a pair style must be added after
+ *   the I,J type specification, with the remaining coefficients being those
+ *   appropriate to that style. If the pair style is used multiple times in
+ *   the pair_style command, then an additional numeric argument must also be
+ *   specified which is a number from 1 to M where M is the number of times
+ *   the sub-style was listed in the pair style command."
+ *   "For the hybrid style, each atom type pair I,J is assigned to exactly one
+ *   sub-style. Just as with a simulation using a single pair style, if you
+ *   specify the same atom type pair in a second pair_coeff command, the
+ *   previous assignment will be overwritten."
+ *   "If you specify the same atom type pair in a second pair_coeff command
+ *   with a new sub-style, then the second sub-style is added to the list of
+ *   potentials that will be calculated for two interacting atoms of those
+ *   types."
+ *   "If an assignment to none is made in a simulation with the hybrid/overlay
+ *   or hybrid/scaled pair style, it wipes out all previous assignments of
+ *   that pair of atom types to sub-styles."
+ *   "every atom type pair I,J (where I <= J) must be assigned to at least one
+ *   sub-style via the pair_coeff command as in the examples above, or in the
+ *   data file read by the read_data, or by mixing as described below. Also
+ *   all sub-styles must be used at least once in a pair_coeff command."
+ *   "For atom type pairs I,J and I != J, if the sub-style assigned to I,I and
+ *   J,J is the same, and if the sub-style allows for mixing, then the
+ *   coefficients for I,J can be mixed." "For the hybrid/overlay and
+ *   hybrid/scaled style, there is an additional requirement that both the
+ *   I,I and J,J pairs are assigned to a single sub-style."
+ *   "The NULL keyword is used by many such potentials (eam/alloy, Tersoff,
+ *   AIREBO, etc), to denote an atom type that will be assigned to a
+ *   different sub-style."
+ *   "Any pair potential settings made via the pair_modify command are passed
+ *   along to all sub-styles of the hybrid potential."
+ *   hybrid/scaled: "the scale factor for each sub-style may be a constant, an
+ *   equal style variable, or an atom style variable" (atom-style factors are
+ *   not supported by the browser engine and are rejected).
+ *   hybrid/molecular: "accepts only two sub-styles: the first is assigned to
+ *   intra-molecular interactions (i.e. both atoms have the same molecule ID),
+ *   the second to inter-molecular interactions (i.e. interacting atoms have
+ *   different molecule IDs)." "Pair style hybrid/molecular is not compatible
+ *   with manybody potentials."
+ *   "You must ensure that the short-range Coulombic cutoff used by each of
+ *   these long pair styles is the same or else LAMMPS will generate an
+ *   error."
+ *
+ * Each sub-style computes on a "skip list": the main neighbor list filtered to
+ * the type pairs (and, for hybrid/molecular, the molecule relation) assigned
+ * to it, so a sub-style never sees pairs that belong to another one.
+ * Sub-styles initialize only their assigned type pairs; their cutoff stays 0
+ * elsewhere, which also restricts their tail corrections to those pairs.
+ */
+
+export type HybridMode = 'hybrid' | 'hybrid/overlay' | 'hybrid/scaled' | 'hybrid/molecular';
+
+interface Sub {
+  style: Pair;
+  name: string;
+  /** 1-based instance number among sub-styles of the same name. */
+  instance: number;
+  /** hybrid/scaled factor: a number or an equal-style variable name. */
+  scale: number | string;
+  /** pair_modify pair ... special overrides: [1, w12, w13, w14]. */
+  specialLJ: Float64Array | null;
+  specialCoul: Float64Array | null;
+  used: boolean;
+  half: NeighList | null;
+  full: NeighList | null;
+  /**
+   * Energies of the last evaluation for compute pair (docs.lammps.org/compute_pair.html): evdwl and
+   * ecoul of this sub-style alone, unscaled and without tail corrections. evaluated is false when the
+   * sub-style did not run (hybrid/scaled factor 0).
+   */
+  evdwl: number;
+  ecoul: number;
+  evaluated: boolean;
+  /** With perSubVirial: the global virial of this sub-style alone (unscaled), from its last evaluation. */
+  virial: Float64Array;
+}
+
+/**
+ * A sub-style that tallies its global virial itself: a style without the fdotr virial (TIP4P, from the M-site
+ * displacements) or one that switches to explicit tallies in its init (pair rheo with newton off, Pair.explicitVirial).
+ */
+const explicitSub = (st: Pair): boolean => !st.virialFdotr || st.explicitVirial;
+
+export class PairHybrid extends Pair {
+  readonly name: string;
+  /** Sub-style selector for one run_style respa level (set by ForceField.compute); null computes all. */
+  subSelect: ((k: number) => boolean) | null = null;
+  /**
+   * Runs sub-style k on the pair threads (cpu/pairThreads.ts, pair slot 1 + k), or returns false to run it here; set by
+   * the force field for an ordinary force evaluation. Only sub-styles on the direct path use it (each adds to the shared
+   * forces and accumulators, as on the threads).
+   */
+  subRunner: ((style: Pair, pc: PairCompute, k: number) => boolean) | null = null;
+  subs: Sub[] = [];
+  /** The arguments of the last settings() call (pair_style args), kept for write_restart (restart.ts replays them). */
+  settingsArgs: string[] = [];
+  /** Sub-style indices per type pair ((ntypes+1)^2, symmetric); null = never assigned. */
+  private map: (number[] | null)[] = [];
+  private listsBuilt = -1;
+  private lastHalf: NeighList | null = null;
+  private lastFull: NeighList | null = null;
+  /** Some sub-style tallies its virial explicitly (TIP4P), so the hybrid tallies every virial itself. */
+  private mixedVirial = false;
+  /**
+   * compute pressure ... pair/hybrid: as native LAMMPS does (src/compute_pressure.cpp at b332f28 sets the hybrid's
+   * no_virial_fdotr_compute), every sub-style tallies its own global virial (Sub.virial) and the hybrid's virial is
+   * their sum, in place of one x.f sum over all forces. Here each sub-style runs on its own force array and its
+   * virial is x.f over that array (or its own tally for an explicit one). Set for good once such a compute exists.
+   */
+  perSubVirial = false;
+
+  enablePerSubVirial(): void {
+    this.perSubVirial = true;
+    this.virialFdotr = false;
+  }
+  /** Equal-style variable evaluation for hybrid/scaled factors. */
+  private evalVar: ((name: string) => number) | null = null;
+
+  constructor(readonly mode: HybridMode, private registry: Record<string, () => Pair>) {
+    super();
+    this.name = mode;
+    this.virialFdotr = true;
+  }
+
+  settings(args: string[], ctx: StyleContext): void {
+    if (args.length === 0) throw new StyleError(`usage: pair_style ${this.mode} style1 args style2 args ...`);
+    this.settingsArgs = [...args];
+    const subs: Sub[] = [];
+    const scaled = this.mode === 'hybrid/scaled';
+    let k = 0;
+    while (k < args.length) {
+      let scale: number | string = 1;
+      if (scaled) {
+        // As native LAMMPS does (src/pair_hybrid_scaled.cpp PairHybridScaled::settings at b332f28): a scale factor
+        // (utils::numeric, or v_name) is read only while a word follows it; a last word alone is left unread
+        if (k >= args.length - 1) break;
+        const w = args[k++];
+        if (w.startsWith('v_')) scale = w.slice(2);
+        else scale = numeric(w);
+      }
+      const name = args[k];
+      if (name === undefined) throw new StyleError(`pair_style ${this.mode}: a scale factor must be followed by a sub-style`);
+      if (name.startsWith('hybrid')) throw new StyleError(`pair_style ${this.mode}: a hybrid style cannot be a sub-style`);
+      if (name === 'none') throw new StyleError(`pair_style ${this.mode}: none is not a sub-style (use pair_coeff I J none)`);
+      const make = this.registry[name];
+      if (!make) {
+        throw unknownStyleError('pair', name, () => removedStyleError('pair_style', name) ?? new StyleError(`pair_style ${this.mode}: sub-style '${name}' is not supported by the browser engine; supported: ${Object.keys(this.registry).filter((n) => !n.startsWith('hybrid')).sort().join(', ')}`));
+      }
+      // the sub-style's arguments run up to the next sub-style name (or scale factor)
+      let e = k + 1;
+      while (e < args.length && !this.startsSub(args, e)) e++;
+      const style = make();
+      // As native LAMMPS does (src/pair_hybrid.cpp PairHybrid::settings at b332f28): each sub-style is constructed
+      // (its constructor checks) right before its settings()
+      if (this.constructorWhere) style.constructorCheck?.(this.constructorWhere);
+      const subArgs = args.slice(k + 1, e);
+      style.hybridOverlay = this.mode === 'hybrid/overlay';
+      style.hybridSub = true;
+      try {
+        const argMsg = this.subArgCheck?.(name, subArgs.length);
+        if (argMsg) throw new StyleError(argMsg);
+        style.settings(subArgs, ctx);
+      } catch (err) {
+        if (!(err instanceof StyleError)) throw err;
+        // an unsupported sub-style's name lands in the previous sub-style's arguments
+        const words = subArgs.filter((w) => /^[A-Za-z]/.test(w) && !w.startsWith('v_'));
+        // a removed LAMMPS style (deprecated.ts) gets native's note
+        for (const w of words) {
+          const removed = removedStyleError('pair_style', w);
+          if (removed) throw removed;
+        }
+        // the sub-style's own message comes first, as native's; the engine's note on the words follows it
+        const hint = words.length
+          ? `. If ${words.map((w) => `'${w}'`).join(' or ')} is meant as a pair style, the browser engine does not support it; supported: ${Object.keys(this.registry).filter((n) => !n.startsWith('hybrid')).sort().join(', ')}`
+          : '';
+        throw new StyleError(`${err.message}\n(pair_style ${this.mode}: sub-style ${name} ${subArgs.join(' ')}${hint})`);
+      }
+      const instance = subs.filter((s) => s.name === name).length + 1;
+      subs.push({ style, name, instance, scale, specialLJ: null, specialCoul: null, used: false, half: null, full: null, evdwl: 0, ecoul: 0, evaluated: false, virial: new Float64Array(6) });
+      k = e;
+    }
+    if (this.mode === 'hybrid/molecular') {
+      if (subs.length !== 2) throw new StyleError('pair_style hybrid/molecular accepts only two sub-styles (intra-molecular, then inter-molecular)');
+      if (subs.some((s) => s.style.manybody)) throw new StyleError('pair_style hybrid/molecular is not compatible with manybody potentials');
+    }
+    this.subs = subs;
+    // Virial (src/pair_hybrid.cpp at b332f28, PairHybrid::compute): when every sub-style takes the virial as
+    // sum x.f (fdotr), the hybrid does too, once, over the summed forces. When a sub-style cannot (TIP4P
+    // tallies its virial from the M-site displacements), native switches every sub-style to explicit
+    // tallies; here the fdotr sub-styles get their virial from their own force array (see compute) and the
+    // force field skips the global dot product (Pair.virialFdotr false).
+    const anyExplicit = subs.some((q) => explicitSub(q.style));
+    this.mixedVirial = anyExplicit && subs.some((q) => !explicitSub(q.style));
+    this.virialFdotr = !anyExplicit;
+    this.needsHalf = subs.some((s) => s.style.needsHalf);
+    this.needsFull = subs.some((s) => s.style.needsFull);
+    this.coulLong = subs.some((s) => s.style.coulLong);
+    // As native LAMMPS does (src/pair_hybrid.cpp at b332f28): dispersionflag is set if any sub-style sets it
+    this.dispersionFlag = subs.some((s) => s.style.dispersionFlag);
+    this.keepExcluded = subs.some((s) => s.style.keepExcluded);
+    // special_bonds weights do not apply to many-body sub-styles; pairwise ones need them
+    this.manybody = subs.every((s) => s.style.manybody);
+    if (this.ntypes > 0) this.allocate(this.ntypes);
+  }
+
+  /** Does a sub-style (or, for hybrid/scaled, its scale factor) start at args[k]? */
+  private startsSub(args: string[], k: number): boolean {
+    if (this.mode === 'hybrid/scaled') {
+      const w = args[k], next = args[k + 1];
+      const isFactor = w.startsWith('v_') || (w.trim() !== '' && Number.isFinite(Number(w)));
+      return isFactor && next !== undefined && next in this.registry;
+    }
+    return args[k] in this.registry;
+  }
+
+  allocate(ntypes: number): void {
+    super.allocate(ntypes);
+    for (const s of this.subs) s.style.allocate(ntypes);
+    this.map = new Array((ntypes + 1) * (ntypes + 1)).fill(null);
+  }
+
+  /** The sub-style named by words[0] (with an instance number in words[1] when it is listed more than once). */
+  selectSub(words: string[], what: string): { sub: Sub; used: number } {
+    const name = words[0];
+    const all = this.subs.filter((s) => s.name === name);
+    if (all.length === 0) throw new StyleError(`${what}: '${name}' is not a sub-style of pair_style ${this.mode} (${this.subs.map((s) => s.name).join(', ')})`);
+    if (all.length === 1) return { sub: all[0], used: 1 };
+    const m = /^\d+$/.test(words[1] ?? '') ? Number(words[1]) : 0;
+    if (m < 1 || m > all.length) {
+      throw new StyleError(`${what}: sub-style ${name} is listed ${all.length} times; give its number 1..${all.length} after the name`);
+    }
+    return { sub: all[m - 1], used: 2 };
+  }
+
+  /**
+   * The sub-style a pair_coeff line names (args[2], and its instance number in args[3] when the name is listed more
+   * than once), or null for "none". As native LAMMPS does (src/pair_hybrid.cpp PairHybrid::coeff, and
+   * src/pair_hybrid_overlay.cpp and pair_hybrid_scaled.cpp coeff at b332f28): hybrid requires an integer word
+   * (utils::is_integer) in the range of the listings; the other modes read it with utils::inumeric, and a number that
+   * matches no listing leaves the name unmatched.
+   */
+  private coeffSub(args: string[]): { sub: Sub | null; used: number } {
+    const name = args[2];
+    const all = this.subs.filter((s) => s.name === name);
+    const unknown = () => new StyleError(`Expected hybrid sub-style instead of ${name} in pair_coeff command`);
+    if (all.length > 1) {
+      if (this.mode === 'hybrid') {
+        const w = args[3] ?? '';
+        if (!/^[+-]?\d+$/.test(w)) {
+          throw new StyleError(`Pair style ${name} was listed multiple times, but there is no index in the pair_coeff command (expected 1-${all.length} but found ${w})`);
+        }
+        const mult = inumeric(w);
+        if (mult < 1 || mult > all.length) {
+          throw new StyleError(`Pair style ${name} was listed multiple times but its pair_coeff index of ${mult} is out of range (1-${all.length})`);
+        }
+        return { sub: all[mult - 1], used: 2 };
+      }
+      if (args.length < 4) throw pairCoeffArgs(`usage: pair_coeff I J ${name} N args (pair_style ${this.mode})`);
+      const mult = inumeric(args[3]);
+      const sub = all.find((s) => s.instance === mult);
+      if (!sub) throw unknown();
+      return { sub, used: 2 };
+    }
+    if (all.length === 1) return { sub: all[0], used: 1 };
+    if (name === 'none') return { sub: null, used: 1 };
+    throw unknown();
+  }
+
+  coeff(args: string[], ctx: StyleContext): void {
+    // As native LAMMPS does (src/pair_hybrid.cpp PairHybrid::coeff at b332f28): hybrid reports the missing words as
+    // utils::missing_cmd_args, the other modes as "Incorrect args for pair coefficients"
+    if (args.length < 3) throw this.mode === 'hybrid' ? missingArgs('pair_coeff') : pairCoeffArgs(`usage: pair_coeff I J sub-style args (pair_style ${this.mode})`);
+    const n = this.ntypes;
+    const [ilo, ihi] = typeBounds(args[0], n);
+    const [jlo, jhi] = typeBounds(args[1], n);
+    const pairs: [number, number][] = [];
+    for (let i = ilo; i <= ihi; i++) for (let j = Math.max(jlo, i); j <= jhi; j++) pairs.push([i, j]);
+    if (pairs.length === 0 && ilo === ihi && jlo === jhi) pairs.push([jlo, ilo]);
+    if (pairs.length === 0) throw new StyleError(`pair_coeff: no type pairs with I <= J in ${args[0]} ${args[1]}`);
+    const { sub, used } = this.coeffSub(args);
+    if (!sub) {
+      for (const [i, j] of pairs) this.assign(i, j, []);
+      return;
+    }
+    const rest = args.slice(2 + used);
+    sub.style.coeff([args[0], args[1], ...rest], ctx);
+    sub.used = true;
+    const idx = this.subs.indexOf(sub);
+    // many-body styles map elements to all types with "* *"; NULL types are left to other sub-styles
+    let active: ((t: number) => boolean) | null = null;
+    if (sub.style.manybody && args[0] === '*' && args[1] === '*') {
+      const elems = rest.slice(rest.length - n);
+      active = (t) => elems[t - 1] !== 'NULL';
+    }
+    for (const [i, j] of pairs) {
+      if (active && (!active(i) || !active(j))) continue;
+      // pair_hybrid.cpp: the sub-style takes only the type pairs its own pair_coeff set (setflag)
+      if (sub.style.setsPair && !sub.style.setsPair(i, j)) continue;
+      const cur = this.map[i * (n + 1) + j];
+      if (this.mode === 'hybrid') this.assign(i, j, [idx]);
+      else if (!cur || !cur.includes(idx)) this.assign(i, j, [...(cur ?? []), idx]);
+    }
+  }
+
+  private assign(i: number, j: number, subs: number[]): void {
+    const nt = this.ntypes + 1;
+    this.map[i * nt + j] = subs;
+    this.map[j * nt + i] = subs;
+  }
+
+  /**
+   * The energies of the last evaluation of sub-style `name`, its `instance`-th listing (1-based), for
+   * compute pair; null when no such sub-style exists.
+   */
+  subEnergy(name: string, instance: number): { style: Pair; evdwl: number; ecoul: number; evaluated: boolean } | null {
+    const s = this.subs.find((x) => x.name === name && x.instance === instance);
+    return s ? { style: s.style, evdwl: s.evdwl, ecoul: s.ecoul, evaluated: s.evaluated } : null;
+  }
+
+  /** Force-field hook: the kspace style reaches every sub-style (the coul/msm ones read MSM's splitting function). */
+  linkKSpace(kspace: KSpace | null): void {
+    for (const s of this.subs) s.style.linkKSpace?.(kspace);
+  }
+
+  /** Force-field hook: the bond and angle equilibria reach every sub-style (the TIP4P ones place their M site from them). */
+  linkBonded(link: BondedEquilibria): void {
+    for (const s of this.subs) s.style.linkBonded?.(link);
+  }
+
+  /** Sub-styles assigned to the type pair (after init: including mixed pairs). */
+  subsOf(i: number, j: number): readonly number[] {
+    return this.map[i * (this.ntypes + 1) + j] ?? [];
+  }
+
+  /** setflag of the hybrid: the type pair was assigned to sub-styles (or to none) by pair_coeff. */
+  override coeffSet(i: number, j: number): boolean | null {
+    const nt = this.ntypes + 1;
+    return this.map.length === nt * nt ? this.map[i * nt + j] !== null : null;
+  }
+
+  init(ctx: StyleContext): void {
+    // pair_modify.html: "You cannot use shift yes with tail yes, since those are conflicting
+    // options." — per-sub-style settings also set the hybrid's own flags, as in native LAMMPS
+    if (this.shift && this.tail) throw new StyleError('Cannot have both pair_modify shift and tail set to yes');
+    // As native LAMMPS does (src/pair_hybrid.cpp at b332f28): Pair::init's check of the I,I pairs, then init_style's
+    // check of the sub-styles, then init_one's mixing of the unassigned pairs
+    this.checkCoeffsSet();
+    const unused = this.subs.find((s) => !s.used);
+    if (unused) throw new StyleError(`Pair hybrid sub-style ${unused.name} is not used`);
+    const n = this.ntypes, nt = n + 1;
+    // mixing: an unassigned I,J takes the sub-style shared by I,I and J,J
+    for (let i = 1; i <= n; i++) {
+      for (let j = i; j <= n; j++) {
+        if (this.map[i * nt + j]) continue;
+        const a = this.map[i * nt + i], b = this.map[j * nt + j];
+        const single = (m: number[] | null) => m !== null && m.length === 1;
+        if (i !== j && single(a) && single(b) && a![0] === b![0]) this.assign(i, j, [a![0]]);
+        else throw new StyleError(`All pair coeffs are not set. Status:\n${this.coeffStatus()}`);
+      }
+    }
+    this.cut = new Float64Array(nt * nt);
+    this.cutsq = new Float64Array(nt * nt);
+    this.etail = this.ptail = 0;
+    let coulCut: number | null = null;
+    for (let k = 0; k < this.subs.length; k++) {
+      const st = this.subs[k].style;
+      // pair.html: shift and tail conflict; tail is not defined in 2d (checked per sub-style)
+      if (st.shift && st.tail) throw new StyleError('Cannot have both pair_modify shift and tail set to yes');
+      if (st.tail && ctx.s?.dimension === 2) throw new StyleError('Cannot use pair tail corrections with 2d simulations');
+      st.gEwald = this.gEwald;
+      // the sub-style's init_style, which may begin by requiring charges (Pair.init)
+      const q = ctx.pairNeedsQ?.(st.name);
+      if (q) throw new StyleError(q);
+      st.initStyle(ctx);
+      st.cut = new Float64Array(nt * nt);
+      st.cutsq = new Float64Array(nt * nt);
+      for (let i = 1; i <= n; i++) {
+        for (let j = i; j <= n; j++) {
+          if (!this.map[i * nt + j]!.includes(k)) continue;
+          const c = st.initOne(i, j);
+          st.cut[i * nt + j] = st.cut[j * nt + i] = c;
+          st.cutsq[i * nt + j] = st.cutsq[j * nt + i] = c * c;
+          if (c > this.cut[i * nt + j]) {
+            this.cut[i * nt + j] = this.cut[j * nt + i] = c;
+            this.cutsq[i * nt + j] = this.cutsq[j * nt + i] = c * c;
+          }
+        }
+      }
+      if (st.coulLong) {
+        const cc = st.extract('cut_coul');
+        if (typeof cc === 'number') {
+          if (coulCut !== null && cc !== coulCut) throw new StyleError(`pair_style ${this.mode}: the long-range Coulomb sub-styles must use the same Coulomb cutoff (${coulCut} vs ${cc})`);
+          coulCut = cc;
+        }
+      }
+    }
+    // The virial mode, once every sub-style is initialized (pair rheo decides explicitVirial in its init): with no
+    // explicit sub-style the force field takes one x.f sum; with only explicit ones each tallies its own; a mix tallies
+    // the fdotr sub-styles from their own force arrays (compute).
+    for (const q of this.subs) if (q.style.explicitInHybrid) q.style.explicitVirial = false;
+    const anyExplicit = this.subs.some((q) => explicitSub(q.style));
+    // a style whose pair-by-pair virial is not x.f over its forces tallies pair by pair as native does there
+    if (anyExplicit) for (const q of this.subs) if (q.style.explicitInHybrid) q.style.explicitVirial = true;
+    this.mixedVirial = anyExplicit && this.subs.some((q) => !explicitSub(q.style));
+    this.virialFdotr = !anyExplicit && !this.perSubVirial;
+    // one list serves every sub-style, so it is a size list only when each sub-style asks for one (after their initStyle)
+    this.sizeList = this.subs.every((q) => q.style.sizeList);
+    this.listsBuilt = -1;
+  }
+
+  /** The merged cutoff of the type pair (init() initializes the sub-styles). */
+  initOne(i: number, j: number): number {
+    return this.cut[i * (this.ntypes + 1) + j];
+  }
+
+  /**
+   * As native LAMMPS does (src/pair.cpp Pair::reinit with src/pair_hybrid.cpp init_one at b332f28): each sub-style's
+   * initOne for its type pairs again, and the sub-style's cutoffs from what it returns; the hybrid's own cutoffs (the
+   * neighbor lists) stay those of the last init.
+   */
+  override reinit(): void {
+    const n = this.ntypes, nt = n + 1;
+    for (let i = 1; i <= n; i++) {
+      for (let j = i; j <= n; j++) {
+        for (const k of this.map[i * nt + j] ?? []) {
+          const st = this.subs[k].style;
+          const c = st.initOne(i, j);
+          st.cut[i * nt + j] = st.cut[j * nt + i] = c;
+          st.cutsq[i * nt + j] = st.cutsq[j * nt + i] = c * c;
+        }
+      }
+    }
+  }
+
+  tailSums(counts: Float64Array): { etail: number; ptail: number } {
+    let etail = 0, ptail = 0;
+    for (const s of this.subs) {
+      const t = s.style.tailSums(counts);
+      const f = this.scaleOf(s);
+      etail += f * t.etail;
+      ptail += f * t.ptail;
+    }
+    return { etail, ptail };
+  }
+
+  /** The sub-style's current scale factor (1 except for hybrid/scaled). */
+  scaleOf(s: Sub): number {
+    if (typeof s.scale === 'number') return s.scale;
+    if (!this.evalVar) throw new StyleError(`pair_style hybrid/scaled: cannot evaluate variable ${s.scale} here`);
+    return this.evalVar(s.scale);
+  }
+
+  /** Lets the force field supply equal-style variable values for hybrid/scaled. */
+  setVariableEvaluator(fn: (name: string) => number): void {
+    this.evalVar = fn;
+  }
+
+  /** The atom and unit style the sub-styles' constructor checks see (set by pair_style before settings). */
+  constructorWhere: PairConstructorWhere | null = null;
+  /** Native's count check of a sub-style's settings words (set by pair_style; null: none), run before its settings(). */
+  subArgCheck: ((style: string, narg: number) => string | null) | null = null;
+
+  /**
+   * Filters `list` to the pairs sub-style k owns (and, for hybrid/molecular,
+   * to intra- or inter-molecular pairs).
+   */
+  private skipList(list: NeighList, k: number, type: Int32Array, mol: Int32Array | null): NeighList {
+    const nt = this.ntypes + 1;
+    const own = new Uint8Array(nt * nt);
+    for (let a = 1; a < nt; a++) for (let b = 1; b < nt; b++) if (this.map[a * nt + b]?.includes(k)) own[a * nt + b] = 1;
+    const intra = this.mode === 'hybrid/molecular' ? k === 0 : null;
+    const { inum, numneigh, firstneigh, neighbors } = list;
+    const out = new Int32Array(neighbors.length);
+    const num = new Int32Array(inum), first = new Int32Array(inum + 1);
+    let c = 0;
+    for (let i = 0; i < inum; i++) {
+      first[i] = c;
+      const ti = type[i];
+      const k0 = firstneigh[i], k1 = k0 + numneigh[i];
+      for (let kk = k0; kk < k1; kk++) {
+        const jj = neighbors[kk];
+        const j = jj & NEIGHMASK;
+        if (!own[ti * nt + type[j]]) continue;
+        if (intra !== null && mol && (mol[i] === mol[j]) !== intra) continue;
+        out[c++] = jj;
+      }
+      num[i] = c - first[i];
+    }
+    first[inum] = c;
+    return { inum, numneigh: num, firstneigh: first, neighbors: out.subarray(0, c) };
+  }
+
+  compute(pc: PairCompute): void {
+    const nb = pc.nb;
+    if (this.listsBuilt !== nb.nbuild || pc.half !== this.lastHalf || pc.full !== this.lastFull) {
+      const mol = this.mode === 'hybrid/molecular' ? this.ghostMolecules(pc) : null;
+      for (let k = 0; k < this.subs.length; k++) {
+        const s = this.subs[k];
+        s.half = s.style.needsHalf && pc.half ? this.skipList(pc.half, k, pc.type, mol) : null;
+        s.full = s.style.needsFull && pc.full ? this.skipList(pc.full, k, pc.type, mol) : null;
+      }
+      this.listsBuilt = nb.nbuild;
+      this.lastHalf = pc.half;
+      this.lastFull = pc.full;
+    }
+    const scaled = this.mode === 'hybrid/scaled';
+    for (let k = 0; k < this.subs.length; k++) {
+      const s = this.subs[k];
+      s.evaluated = false;
+      // pair_modify pair X compute no: the sub-style is skipped (pair_modify.html: "compute ... turned off")
+      if (!s.style.computeOn) continue;
+      // run_style respa: a level evaluation computes only the sub-styles assigned to it (run/respa.ts)
+      if (this.subSelect && !this.subSelect(k)) continue;
+      s.style.gEwald = this.gEwald;
+      const sub: PairCompute = {
+        ...pc, half: s.half, full: s.full,
+        specialLJ: s.specialLJ ?? pc.specialLJ,
+        specialCoul: s.specialCoul ?? pc.specialCoul,
+      };
+      // a sub-style that tallies its own virial (TIP4P) or any unscaled sub-style of an all-fdotr hybrid
+      // runs directly on the shared accumulators; the fast path is unchanged
+      const ownFdotr = (this.mixedVirial || this.perSubVirial) && !explicitSub(s.style);
+      const direct = !scaled && !ownFdotr && !this.perSubVirial;
+      if (direct) {
+        // the sub-style's own energy is the change of the shared accumulator over its call
+        const e0 = pc.acc.evdwl, c0 = pc.acc.ecoul;
+        if (!this.subRunner?.(s.style, sub, k)) s.style.compute(sub);
+        s.evdwl = pc.acc.evdwl - e0;
+        s.ecoul = pc.acc.ecoul - c0;
+        s.evaluated = true;
+        continue;
+      }
+      const f = scaled ? this.scaleOf(s) : 1;
+      if (f === 0) continue;
+      // separate force array: its virial (fdotr sub-styles of a mixed hybrid) is the dot product of this array
+      const fbuf = new Float64Array(pc.f.length);
+      const acc: Accum = newAccum();
+      clearAccum(acc);
+      const eatom = pc.eatom ? new Float64Array(pc.eatom.length) : null;
+      const vatom = pc.vatom ? new Float64Array(pc.vatom.length) : null;
+      s.style.compute({ ...sub, f: fbuf, acc, eatom, vatom });
+      s.evdwl = acc.evdwl;
+      s.ecoul = acc.ecoul;
+      s.evaluated = true;
+      for (let q = 0; q < fbuf.length; q++) pc.f[q] += f * fbuf[q];
+      pc.acc.evdwl += f * acc.evdwl;
+      pc.acc.ecoul += f * acc.ecoul;
+      if (ownFdotr) {
+        // as force-field fdotr: sum_k x_k . f_k over owned and ghost atoms (forcefield.ts), for this sub-style's forces
+        const xa = pc.x, v = pc.acc.virial;
+        let v0 = 0, v1 = 0, v2 = 0, v3 = 0, v4 = 0, v5 = 0;
+        for (let k3 = 0; k3 < 3 * pc.nall; k3 += 3) {
+          const x = xa[k3], y = xa[k3 + 1], z = xa[k3 + 2];
+          const fx = fbuf[k3], fy = fbuf[k3 + 1], fz = fbuf[k3 + 2];
+          v0 += x * fx; v1 += y * fy; v2 += z * fz; v3 += x * fy; v4 += x * fz; v5 += y * fz;
+        }
+        v[0] += f * v0; v[1] += f * v1; v[2] += f * v2; v[3] += f * v3; v[4] += f * v4; v[5] += f * v5;
+        if (this.perSubVirial) s.virial.set([v0, v1, v2, v3, v4, v5]);
+      } else {
+        for (let c = 0; c < 6; c++) pc.acc.virial[c] += f * acc.virial[c];
+        if (this.perSubVirial) s.virial.set(acc.virial);
+      }
+      if (eatom) for (let q = 0; q < eatom.length; q++) pc.eatom![q] += f * eatom[q];
+      if (vatom) for (let q = 0; q < vatom.length; q++) pc.vatom![q] += f * vatom[q];
+    }
+  }
+
+  /** Molecule IDs of owned and ghost atoms (ghosts take their owner's). */
+  private ghostMolecules(pc: PairCompute): Int32Array {
+    const owner = pc.nb.owner;
+    const mol = pc.s.molecule;
+    const out = new Int32Array(pc.nall);
+    for (let k = 0; k < pc.nall; k++) out[k] = mol[owner[k]];
+    return out;
+  }
+
+  /**
+   * Native single_extra of the hybrid style: hybrid and hybrid/molecular take the largest sub-style value
+   * (pair_hybrid.cpp init_svector: "single_extra = MAX(single_extra,styles[m]->single_extra)"); hybrid/overlay and
+   * hybrid/scaled sum them (pair_hybrid_overlay.cpp and pair_hybrid_scaled.cpp init_svector).
+   */
+  singleExtra(): number {
+    const summed = this.mode === 'hybrid/overlay' || this.mode === 'hybrid/scaled';
+    let n = 0;
+    for (const s of this.subs) n = summed ? n + s.style.singleExtra() : Math.max(n, s.style.singleExtra());
+    return n;
+  }
+
+  /** A hybrid needs the separation vector when one of its sub-styles does. */
+  singleNeedsSeparation(): boolean { return this.subs.some((s) => s.style.singleNeedsSeparation()); }
+
+  private svecBuf = new Float64Array(0);
+
+  /**
+   * Native PairHybrid::single: the sub-styles of the pair type add their energy and fforce (scaled for hybrid/scaled), and
+   * the svector is copied from one sub-style (pair_hybrid.cpp copy_svector: map[itype][jtype][0]; pair_hybrid_overlay.cpp
+   * and pair_hybrid_scaled.cpp: the sub-styles' svectors side by side, zeros for the sub-styles that are not the active one,
+   * and the active one is the last mapped sub-style, as the native loop leaves it). The pN values are not scaled.
+   * Deviation: native copies the active sub-style's svector even when the pair is outside that sub-style's cutoff (a stale
+   * value of its previous call); here that case gives zeros.
+   */
+  /** As native LAMMPS does (src/pair_hybrid.cpp flags() at b332f28): single_enable when every sub-style has it. */
+  singleEnabled(): boolean { return this.subs.every((s) => s.style.singleEnabled()); }
+
+  single(i: number, j: number, itype: number, jtype: number, rsq: number, factorCoul: number, factorLJ: number, qi: number, qj: number, del?: PairSep): { eng: number; fforce: number; svector?: Float64Array } {
+    let eng = 0, fforce = 0;
+    const nt = this.ntypes + 1;
+    const ids = this.subsOf(itype, jtype);
+    const summed = this.mode === 'hybrid/overlay' || this.mode === 'hybrid/scaled';
+    const active = ids.length === 0 ? -1 : summed ? ids[ids.length - 1] : ids[0];
+    let activeSvec: Float64Array | undefined;
+    for (const k of ids) {
+      const s = this.subs[k];
+      if (!(rsq < s.style.cutsq[itype * nt + jtype])) continue;
+      if (!s.style.single) throw new StyleError(`pair sub-style ${s.name} does not provide single-pair energies`);
+      const r = s.style.single(i, j, itype, jtype, rsq, factorCoul, factorLJ, qi, qj, del);
+      const f = this.scaleOf(s);
+      eng += f * r.eng;
+      fforce += f * r.fforce;
+      if (k === active) activeSvec = r.svector;
+    }
+    const n = this.singleExtra();
+    if (n === 0) return { eng, fforce };
+    if (this.svecBuf.length !== n) this.svecBuf = new Float64Array(n);
+    const out = this.svecBuf;
+    out.fill(0);
+    if (activeSvec) {
+      if (summed) {
+        let off = 0;
+        for (let m = 0; m < this.subs.length; m++) {
+          const e = this.subs[m].style.singleExtra();
+          if (m === active) for (let l = 0; l < e; l++) out[off + l] = activeSvec[l];
+          off += e;
+        }
+      } else {
+        const e = this.subs[active].style.singleExtra();
+        for (let l = 0; l < e; l++) out[l] = activeSvec[l];
+      }
+    }
+    return { eng, fforce, svector: out };
+  }
+
+  /** Coefficients are not written to data files for hybrid styles (pair_hybrid.html: "The same is true for data files."). */
+  dataCoeffs(): string[] | null { return null; }
+
+  extract(name: string): unknown {
+    if (name === 'cut_coul') {
+      for (const s of this.subs) {
+        const v = s.style.extract('cut_coul');
+        if (v !== undefined) return v;
+      }
+      return undefined;
+    }
+    for (const s of this.subs) {
+      const v = s.style.extract(name);
+      if (v !== undefined) return v;
+    }
+    return undefined;
+  }
+
+  /** pair_modify pair ... special which w1 w2 w3 for one sub-style. */
+  setSpecial(sub: Sub, which: string, w: [number, number, number]): void {
+    if (which !== 'lj' && which !== 'coul' && which !== 'lj/coul') throw new StyleError(`pair_modify special: which must be lj, coul or lj/coul, not '${which}'`);
+    if (w.some((v) => !(v >= 0 && v <= 1))) throw new StyleError('pair_modify special: weights must be between 0.0 and 1.0');
+    if (which === 'lj' || which === 'lj/coul') sub.specialLJ = Float64Array.from([1, ...w]);
+    if (which === 'coul' || which === 'lj/coul') sub.specialCoul = Float64Array.from([1, ...w]);
+  }
+
+  /**
+   * A sub-style's special weights must keep the neighbor list valid: where
+   * the global special_bonds weight is 0 (pair excluded) or 1 (pair not
+   * flagged) the sub-style's weight must be the same. Measured with native
+   * LAMMPS (2 Sep 2026), which stops with an error that the Pair_modify
+   * special lj 1-2 setting for pair hybrid substyle lj/cut is incompatible
+   * with the global special_bonds setting; weights strictly between 0 and 1 globally allow
+   * any sub-style weight.
+   */
+  checkSpecial(global: { lj: readonly number[]; coul: readonly number[] }): void {
+    for (const s of this.subs) {
+      for (const [kind, mine, g] of [['lj', s.specialLJ, global.lj], ['coul', s.specialCoul, global.coul]] as const) {
+        if (!mine) continue;
+        for (let o = 0; o < 3; o++) {
+          const gw = g[o], sw = mine[o + 1];
+          if ((gw === 0 || gw === 1) && sw !== gw) {
+            throw new StyleError(`pair_modify special ${kind} 1-${o + 2} setting for pair hybrid sub-style ${s.name} is incompatible with the global special_bonds setting (${gw})`);
+          }
+        }
+      }
+    }
+  }
+}

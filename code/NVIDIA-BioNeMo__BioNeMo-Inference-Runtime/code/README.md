@@ -1,0 +1,285 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{}
+---
+
+<div align="center">
+
+# BioNeMo Inference Runtime
+
+Easy, fast, and memory-efficient structure prediction inference
+
+GPU-accelerated inference for protein, nucleic-acid, and ligand structure
+prediction models — from FASTA/MSA to PDB/mmCIF.
+
+[![Documentation][docs-badge]][docs-site] [![License][license-badge]][license]
+[![CUDA][cuda-badge]][cuda-downloads] [![PyTorch][torch-badge]][pytorch]
+[![PyPI][pypi-badge]][pypi]
+
+![Speedup against input size on H100](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/raw/HEAD/docs/assets/speedup-vs-residues.png)
+
+</div>
+
+## About
+
+BioNeMo Inference Runtime (BioIR) is NVIDIA's library for structure-prediction
+inference. A five-stage GPU pipeline turns AlphaFold-lineage and all-atom models
+into PDB/mmCIF with confidence scores. Models stay ordinary `nn.Module`s — no
+TensorRT engine build.
+
+## Disclaimer
+
+BioIR is in a Beta state, may not be fully functional, may contain errors or
+design flaws, and may be changed at any time without notice. We appreciate your
+feedback to improve and iterate on our products.
+
+## Getting Started
+
+The [notice and disclaimer](#notice-and-disclaimer) applies to separately
+downloaded dependencies, model checkpoints, and metadata.
+
+### Prerequisites
+
+- **Linux, x86_64 or aarch64**, with an NVIDIA GPU. The wheels are
+  `manylinux_2_34`, so the host needs glibc 2.34 or newer — Ubuntu 22.04, RHEL 9
+  or later.
+- **Driver 580 or newer.** The dev image carries a CUDA 13.4 build of PyTorch.
+  An older driver runs it only through the forward-compatibility shim, which we
+  have measured hanging and crashing part-way through a run rather than merely
+  running slowly — results taken on one are discarded, not corrected.
+  Vera Rubin (SM107) needs the R615 driver; the CUDA 13.4 preview driver is
+  not enough.
+- **CPython 3.12, 3.13, or 3.14.** Each architecture's wheel uses the
+  `cp312-abi3` stable ABI and supports all three versions.
+- **Docker** and the **NVIDIA Container Toolkit**, to build from source in the
+  dev container. Installing the wheel needs neither.
+
+PyTorch and the CUDA math libraries arrive as wheel dependencies, or in
+`nvcr.io/nvidia/pytorch:26.09-py3` when you use the container. Building the
+extension from source outside a container needs a C++17 compiler and CUDA
+headers as well — [`docs/dev.md`][dev-prerequisites].
+
+[dev-prerequisites]: https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/dev.md#prerequisites-for-bioir-development-workflow
+
+### Supported GPUs
+
+BioIR runs on the Ampere, Ada Lovelace, Hopper, and Blackwell GPUs listed in the
+[support matrix](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/support-matrix.md#gpus). The doc also shows which
+fused kernels apply to each architecture. [Benchmarks](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/benchmark.md)
+page shows detailed speedup, memory, and accuracy for these GPUs: H200, H100,
+A100, L40S, GB200, and GB300.
+
+### Install
+
+BioIR is published on PyPI, one wheel per CPU architecture:
+
+```bash
+pip install bionemo-ir
+```
+
+The wheel ships the kernels precompiled. It needs the driver's `libcuda.so.1`,
+but no local CUDA Toolkit or NGC image. pip installs PyTorch, CUDA libraries,
+and other dependencies separately. Some dependencies build from source, and
+Triton needs a C compiler and Python headers on first use. See
+[`docs/install.md`](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/install.md) for the full requirements. The container
+below is for working on BioIR itself.
+
+### Build from source
+
+Configure [SSH authentication with GitHub][github-ssh], then clone the
+repository and fetch its submodules and LFS objects.
+
+```bash
+git lfs install &&
+  GIT_LFS_SKIP_SMUDGE=0 \
+    git clone --recurse-submodules \
+    git@github.com:NVIDIA-BioNeMo/BioNeMo-Inference-Runtime.git &&
+  cd BioNeMo-Inference-Runtime
+```
+
+On a host with the required compiler and CUDA headers, uv provisions the pinned
+Python and exact dependency set, builds the editable extension, and runs tools
+inside that environment:
+
+```bash
+uv sync --locked
+uv run --locked scripts/fetch_weights.sh --model boltz-2
+uv run --locked python examples/folding/run_demo.py --output-dir output
+```
+
+The supported container workflow remains available when the host is not
+configured:
+
+```bash
+docker/dev.sh
+```
+
+Then run inside its shell:
+
+```bash
+uv lock --check
+uv pip install --no-deps -e .
+scripts/fetch_weights.sh --model boltz-2
+python examples/folding/run_demo.py --output-dir output
+```
+
+Checkpoints come from their upstream publishers and need no NVIDIA credentials;
+anything that cannot be fetched is skipped, and the tests needing it skip too.
+Running `uv run --locked scripts/run_tests.sh` on the host, or
+`scripts/run_tests.sh` in the container, stages weights and runs the suite the
+way CI does.
+
+See [`docs/dev.md`](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/dev.md#prerequisites-for-bioir-development-workflow)
+for the host prerequisites, environment details and wheel build.
+[`docs/ref/docker-images.md`](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/docker-images.md) covers the images and
+what `docker/dev.sh` mounts.
+
+## Documentation
+
+BioIR documentation lives under [`docs/`](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs) and is published with Fern:
+
+- [Overview](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/overview.mdx) — what BioIR is and how to start
+- [Installation](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/install.md) — requirements and release-wheel installation
+- [Quickstart](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/quickstart.md) — run a serial Boltz-2 prediction
+- [Ray multi-GPU inference](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ray.md) — scale independent requests across
+  visible GPUs
+- [Accelerate a custom model](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/advanced/accelerate-custom-model.md) — swap
+  BioIR modules into your own PyTorch model
+- [Port a data pipeline](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/advanced/port-data-pipeline.md) — run a new model
+  family through `build_processor`
+- [Validate a ported pipeline](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/advanced/validate-data-pipeline.md) —
+  feature equivalence and end-to-end accuracy against upstream
+- [Developer guide](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/dev.md) — build, test, stage weights, contribute
+- [API reference](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/api.md) — `build_processor`, model constructors,
+  inputs/outputs
+- [Architecture](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/architecture.md) — five-stage pipeline and runtime
+  design
+- [Config architecture](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/config.md) — model `BaseConfig` tree and
+  pipeline stage configs
+- [Support matrix](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/support-matrix.md) — models, GPUs, and fused kernels
+- [Token padding](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/token-padding.md) — what BioIR pads to a multiple
+  of 8 tokens, and why it runs faster
+- [Benchmarks](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/benchmark.md) — measured speedup and memory against OSS
+  PyTorch
+- [Model weights](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/model-weights.md) — checkpoint resolution and staging
+- [Docker images](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/docker-images.md) — development and runtime images
+- [Coding guidelines](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/coding.md) — style, naming, and tooling
+- [Folding example](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/examples/folding/README.md) — runnable `build_processor`
+  demo
+
+## Benchmarks
+
+### Methodology
+
+Folding benchmarks over a bench set the shipped
+[`rebuild_dataset.py`](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/skills/bench-perf-oss/dataset) builds from RCSB
+and NVIDIA's MSA Search NIM — there is no dataset release to download.
+Template-bearing samples included: both sides load every bundled MSA and attach
+every listed template.
+
+- One GPU, serial, one structure per forward call.
+- Time only GPU-synchronized `model.forward()`. Featurization, transfers,
+  postprocessing, writing, and scoring stay outside the window.
+- Discard one warmup forward, then report one measured forward per sample.
+- BioIR runs its default optimized config, which captures CUDA graphs of each
+  model's trunk recycle, diffusion step, and confidence Pairformer (OpenFold2:
+  trunk recycle only) for inputs up to 1024 tokens, or 2048 for the diffusion
+  step on GPUs with at least 64 GiB; larger inputs run those regions eagerly.
+  The results below were measured 2026-10-14.
+- OSS runs its own inference script: eager always, plus `torch.compile` when it
+  passes a dynamic-shape probe.
+- Runtime knobs match on both sides — 200 sampling steps, 3 or 5 diffusion
+  samples, and per-model recycling.
+- Score written structures with OpenStructure lDDT and DockQ. Speedup is
+  `OSS forward / BioIR forward`; above 1 favors BioIR.
+- Future work will add additional Blackwell-optimized kernels.
+
+### Results
+
+<!-- BEGIN generated: benchmark summary -->
+
+| Model                           | H100          | H200          |
+| ------------------------------- | ------------- | ------------- |
+| Boltz-2                         | 3.81x / 6.35x | 4.33x / 6.19x |
+| OpenFold3                       | 6.27x / 8.20x | 5.63x / 7.93x |
+| OpenFold2 / AlphaFold2 monomer  | 6.08x / 5.70x | 5.98x / 6.02x |
+| OpenFold2 / AlphaFold2 multimer | 5.27x / 6.03x | 5.25x / 6.09x |
+| Protenix                        | — / 5.37x     | — / 5.03x     |
+
+Geomean speedup, `vs OSS torch.compile / vs OSS PyTorch eager`; above 1 favours
+BioIR. Protenix has no `torch.compile` path. Twelve GPUs, per-model accuracy
+and peak memory, and how to reproduce any of it:
+[`docs/ref/benchmark.md`](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/ref/benchmark.md).
+
+<!-- END generated: benchmark summary -->
+
+The [`bench-perf-oss` agent skill](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/skills/bench-perf-oss/SKILL.md) has
+the full gates, environment isolation, result schema, and charting protocol.
+
+[github-ssh]:
+  https://docs.github.com/en/authentication/connecting-to-github-with-ssh
+
+## Contributing
+
+We welcome contributions. See [`contributing.md`](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/contributing.md) for
+policy and [`docs/dev.md`](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/dev.md) for the development workflow.
+
+## Citation
+
+If you use BioIR in your research, please cite it via
+[`CITATION.cff`](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/CITATION.cff).
+
+## Contact / Support
+
+- Bugs and feature requests:
+  [GitHub Issues](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/issues/new/choose)
+- Usage questions:
+  [GitHub Discussions](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/discussions)
+- Security vulnerabilities: see [`SECURITY.md`](https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/docs/SECURITY.md) — do **not**
+  file a public issue
+
+## License
+
+NVIDIA-authored BioIR code is licensed under the [Apache License 2.0][license].
+Distribution compliance material is available here:
+
+- [Third-party notices and attributions][third-party-notices]
+- [Full third-party license texts][third-party-licenses]
+- [Gemmi 0.7.5 corresponding source][gemmi-source], licensed under MPL-2.0 or
+  LGPL-3.0-or-later; BioIR distributes it under the MPL-2.0 option
+
+## Notice and Disclaimer
+
+The following notice applies to separately downloaded components, including
+runtime dependencies, model checkpoints, and chemical metadata.
+
+**NOTICE AND DISCLAIMER:** This software automatically retrieves, accesses or
+interacts with external materials. Those retrieved materials are not distributed
+with this software and are governed solely by separate terms, conditions and
+licenses. You are solely responsible for finding, reviewing and complying with
+all applicable terms, conditions, and licenses, and for verifying the security,
+integrity and suitability of any retrieved materials for your specific use case.
+This software is provided "AS IS", without warranty of any kind. The author
+makes no representations or warranties regarding any retrieved materials, and
+assumes no liability for any losses, damages, liabilities or legal consequences
+from your use or inability to use this software or any retrieved materials. Use
+this software and the retrieved materials at your own risk.
+
+[gemmi-source]: https://github.com/project-gemmi/gemmi/tree/v0.7.5
+[cuda-badge]:
+https://img.shields.io/badge/CUDA-13.2-76B900.svg?style=flat&logo=nvidia&logoColor=white
+[cuda-downloads]: https://developer.nvidia.com/cuda-downloads
+[docs-badge]:
+  https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat
+[docs-site]: https://docs.nvidia.com/bionemo/inference-runtime/
+[license]: https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/LICENSE
+[license-badge]:
+  https://img.shields.io/badge/license-Apache%202.0-blue.svg?style=flat
+[pypi]: https://pypi.org/project/bionemo-ir/
+[pypi-badge]: https://img.shields.io/pypi/v/bionemo-ir.svg?style=flat&label=PyPI
+[pytorch]: https://pytorch.org/
+[torch-badge]:
+https://img.shields.io/badge/PyTorch-%3E%3D2.11-EE4C2C.svg?style=flat&logo=pytorch&logoColor=white
+[third-party-licenses]: https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/LICENSES
+[third-party-notices]: https://github.com/NVIDIA-BioNeMo/BioNeMo-Inference-Runtime/blob/HEAD/THIRD_PARTY_NOTICES.md

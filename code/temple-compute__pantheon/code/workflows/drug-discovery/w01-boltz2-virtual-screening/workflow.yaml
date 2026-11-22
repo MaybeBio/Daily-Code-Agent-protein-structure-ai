@@ -1,0 +1,196 @@
+kind: horus_workflow
+name: Boltz-2 Virtual Screening
+artifacts:
+  - id: ligands
+    name: Candidate ligand library (SMILES)
+    description: >-
+      One `SMILES [name]` per line; the name becomes the id in the ranked
+      output. Lines starting with # are skipped.
+    kind: file
+    path: examples/ligands.smi
+
+  - id: fasta
+    name: Target protein sequence (FASTA)
+    description: FASTA of the target protein; the first record is used.
+    kind: file
+    path: examples/target.fasta
+
+  - &use_msa
+    id: use_msa
+    name: Use MSA server
+    description: >-
+      Fetch the protein MSA from the ColabFold MMseqs2 server. Better
+      structures and affinities on real targets, but needs internet.
+    kind: boolean
+    path: params/use_msa.json
+    value: true
+    "on": {value: --use_msa_server, label: MSA server}
+    "off": {value: "", label: Single sequence}
+
+  - &recycling_steps
+    id: recycling_steps
+    name: Recycling steps
+    description: Trunk recycling iterations (Boltz default 3).
+    kind: number
+    path: params/recycling_steps.json
+    value: 3
+    min: 1
+    max: 10
+    step: 1
+
+  - &sampling_steps
+    id: sampling_steps
+    name: Diffusion sampling steps
+    description: Structure diffusion steps (Boltz default 200).
+    kind: number
+    path: params/sampling_steps.json
+    value: 200
+    min: 50
+    max: 500
+    step: 50
+
+  - &diffusion_samples
+    id: diffusion_samples
+    name: Structure samples per ligand
+    description: Diffusion samples per complex; the best-ranked one is kept.
+    kind: number
+    path: params/diffusion_samples.json
+    value: 1
+    min: 1
+    max: 10
+    step: 1
+
+  - &accelerator
+    id: accelerator
+    name: Accelerator
+    description: Hardware Boltz runs on; cpu works but is slow.
+    kind: choice
+    path: params/accelerator.txt
+    value: gpu
+    options:
+      - {value: gpu, label: GPU}
+      - {value: cpu, label: CPU}
+
+tasks:
+  - kind: horus_task
+    id: prep
+    name: Build Boltz-2 inputs
+    description: Converts the target FASTA and ligand SMILES into Boltz-2 formatted input files, packaged as a tarball.
+    skip_if_complete: false
+    inputs:
+      - id: fasta
+        name: Target protein sequence (FASTA)
+        kind: file
+        path: examples/target.fasta
+      - id: ligands
+        name: Candidate ligand library (SMILES)
+        kind: file
+        path: examples/ligands.smi
+    outputs:
+      - id: boltz_inputs
+        name: Boltz-2 input archive
+        path: results/boltz_inputs.tar.gz
+        kind: file
+    executor:
+      kind: shell
+    runtime:
+      kind: python_script
+      script: scripts/prep.py
+      python: python3 # stdlib only; GPU nodes have no bare `python`
+      args: --fasta ${fasta} --ligands ${ligands} --out ${boltz_inputs}
+    target:
+      kind: local
+  - kind: horus_task
+    id: predict
+    name: Boltz-2 structure + affinity
+    description: Runs Boltz-2 to predict binding structure and affinity for each protein-ligand pair.
+    inputs:
+      - id: boltz_inputs
+        name: Boltz-2 input archive
+        path: results/boltz_inputs.tar.gz
+        kind: file
+      - *use_msa
+      - *recycling_steps
+      - *sampling_steps
+      - *diffusion_samples
+      - *accelerator
+    outputs:
+      - id: predictions
+        name: Boltz-2 predictions archive
+        path: results/predictions.tar.gz
+        kind: file
+    # One L4-class GPU fits Boltz-2 for single-chain targets of a few hundred residues.
+    resources:
+      cpus: 4
+      gpus: 1
+      memory_gb: 16
+      walltime: "08:00:00"
+    executor:
+      kind: uv_python_environment
+      python: "3.11"
+      requirements:
+        # [cuda]: cuEquivariance kernels (CUDA 12 builds), which Boltz uses by
+        # default; on CPU they are switched off with --no_kernels.
+        - boltz[cuda]==2.2.1
+    runtime:
+      kind: command
+      command: >-
+        tar xzf ${boltz_inputs} -C . && boltz predict inputs --out_dir out ${use_msa}
+        --accelerator ${accelerator} --recycling_steps ${recycling_steps}
+        --sampling_steps ${sampling_steps} --diffusion_samples ${diffusion_samples}
+        $$([ ${accelerator} = cpu ] && echo --no_kernels) &&
+        tar czf ${predictions} -C out .
+    target:
+      kind: local
+  - kind: horus_task
+    id: rank
+    name: Rank hits
+    description: Parses the Boltz-2 predictions and produces a ranked shortlist of top-scoring hits.
+    inputs:
+      - id: predictions
+        name: Boltz-2 predictions archive
+        path: results/predictions.tar.gz
+        kind: file
+    outputs:
+      - id: top_hits
+        name: Ranked hit list
+        path: results/top_hits.csv
+        kind: file
+    executor:
+      kind: shell
+    runtime:
+      kind: python_script
+      script: scripts/rank.py
+      python: python3 # stdlib only; GPU nodes have no bare `python`
+      args: --predictions ${predictions} --out ${top_hits}
+    target:
+      kind: local
+edges:
+  - source: prep
+    source_output: boltz_inputs
+    target: predict
+    target_input: boltz_inputs
+  - source: predict
+    source_output: predictions
+    target: rank
+    target_input: predictions
+
+  - source: artifact-ligands
+    source_output: ligands
+    target: prep
+    target_input: ligands
+
+  - source: artifact-fasta
+    source_output: fasta
+    target: prep
+    target_input: fasta
+
+  - {source: artifact-use_msa, source_output: use_msa, target: predict, target_input: use_msa}
+  - {source: artifact-recycling_steps, source_output: recycling_steps, target: predict, target_input: recycling_steps}
+  - {source: artifact-sampling_steps, source_output: sampling_steps, target: predict, target_input: sampling_steps}
+  - {source: artifact-diffusion_samples, source_output: diffusion_samples, target: predict, target_input: diffusion_samples}
+  - {source: artifact-accelerator, source_output: accelerator, target: predict, target_input: accelerator}
+
+orchestrator_target:
+  kind: local
+  working_directory: horus_workflow_results

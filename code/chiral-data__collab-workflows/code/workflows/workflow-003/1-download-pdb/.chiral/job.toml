@@ -1,0 +1,9 @@
+name = "1 Download PDB"
+description = "Download a PDB file from the RCSB Protein Data Bank."
+outputs = ["*.pdb"]
+
+[container]
+image = "ghcr.io/chiral-data/smina:2025_11_06"
+
+[scripts]
+run = "run.sh"

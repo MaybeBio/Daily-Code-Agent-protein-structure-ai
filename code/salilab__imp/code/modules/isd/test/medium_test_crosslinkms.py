@@ -1,0 +1,657 @@
+import IMP
+import IMP.core
+import IMP.isd
+import IMP.test
+import pickle
+from random import sample
+from math import pi, log, exp
+try:
+    import jax
+    import jax.numpy as jnp
+    import IMP.jax
+except ImportError:
+    jax = None
+
+
+def setupnuisance(m, initialvalue, minvalue, maxvalue, isoptimized=True):
+
+    nuisance = IMP.isd.Scale.setup_particle(IMP.Particle(m), initialvalue)
+    if minvalue:
+        nuisance.set_lower(minvalue)
+    if maxvalue:
+        nuisance.set_upper(maxvalue)
+
+    nuisance.set_is_optimized(nuisance.get_nuisance_key(), isoptimized)
+
+    return nuisance
+
+
+def setup_system():
+    slope = 0.01
+    length = 10
+
+    m = IMP.Model()
+    p1 = IMP.Particle(m)
+    p2 = IMP.Particle(m)
+    p3 = IMP.Particle(m)
+
+    xyz1 = IMP.core.XYZ.setup_particle(p1)
+    xyz2 = IMP.core.XYZ.setup_particle(p2)
+    xyz3 = IMP.core.XYZ.setup_particle(p3)
+
+    xyz1.set_coordinates((0, 5, 0))
+    xyz2.set_coordinates((5, 0, 0))
+    xyz3.set_coordinates((0, 0, 15))
+
+    sigma1 = setupnuisance(m, 5, 0, 100, False)
+    sigma2 = setupnuisance(m, 5, 0, 100, False)
+    psi1 = setupnuisance(m, 0.1, 0.0, 0.5, False)
+    psi2 = setupnuisance(m, 0.2, 0.0, 0.5, False)
+
+    dr1 = IMP.isd.CrossLinkMSRestraint(m, length, slope)
+    # Weights should be ignored
+    dr1.set_weight(9999.0)
+    dr1.add_contribution((p1, p2), (sigma1, sigma2), psi1)
+    dr1.add_contribution((p2, p3), (sigma1, sigma2), psi2)
+
+    dr2 = IMP.isd.CrossLinkMSRestraint(m, length, slope)
+    dr2.add_contribution((p1, p3), (sigma1, sigma2), psi1)
+    lw = IMP.isd.LogWrapper([dr1, dr2], 1.0)
+
+    return m, p1, p2, p3, sigma1, sigma2, psi1, psi2, lw
+
+
+def make_test_restraint():
+    m = IMP.Model()
+    p1 = IMP.Particle(m)
+    p2 = IMP.Particle(m)
+
+    slope = 0.01
+    length = 10
+
+    xyz1 = IMP.core.XYZ.setup_particle(p1)
+    xyz2 = IMP.core.XYZ.setup_particle(p2)
+
+    xyz1.set_coordinates((0, 0, 0))
+    xyz2.set_coordinates((0, 0, 0))
+
+    sigma1 = setupnuisance(m, 5, 0, 100, False)
+    sigma2 = setupnuisance(m, 5, 0, 100, False)
+    psi = setupnuisance(m, 0.1, 0.0, 0.5, False)
+
+    dr = IMP.isd.CrossLinkMSRestraint(m, length, slope)
+    dr.set_weight(0.10)
+    dr.set_name("test restraint")
+    dr.add_contribution((p1, p2), (sigma1, sigma2), psi)
+    return m, p1, p2, sigma1, sigma2, psi, dr
+
+
+class CrossLinkMS:
+    """Defining a dummy python restraint
+    with the same interface as the one that has to be tested
+    """
+
+    def __init__(self,length,slope):
+        self.pairs=[]
+        self.length=length
+        self.slope=slope
+
+    def add_contribution(self,p1,p2,sigma1,sigma2,psi):
+        self.pairs.append((p1,p2,sigma1,sigma2,psi))
+
+    def get_probability(self):
+
+        onemprob = 1.0
+
+        for (p1,p2,sigma1,sigma2,psi) in self.pairs:
+            if p1 is not p2:
+                dist = IMP.core.get_distance(IMP.core.XYZ(p1), IMP.core.XYZ(p2))
+            else:
+                R=IMP.core.XYZR(p1).get_radius()
+                dist=36.0/35.0*R
+            if dist <= 0.001:
+                dist = 0.001
+            psi = psi.get_scale()
+            sigmai = sigma1.get_scale()
+            sigmaj = sigma2.get_scale()
+
+            voli = 4.0 / 3.0 * pi * sigmai * sigmai * sigmai
+            volj = 4.0 / 3.0 * pi * sigmaj * sigmaj * sigmaj
+
+            fi = 0
+            fj = 0
+
+            if dist < sigmai + sigmaj:
+                xlvol = 4.0 / 3.0 * pi * (self.length / 2) * (self.length / 2) * \
+                    (self.length / 2)
+                fi = min(voli, xlvol)
+                fj = min(volj, xlvol)
+            else:
+                di = dist - sigmaj - self.length / 2
+                dj = dist - sigmai - self.length / 2
+                fi = self.sphere_cap(sigmai, self.length / 2, abs(di))
+                fj = self.sphere_cap(sigmaj, self.length / 2, abs(dj))
+
+            pofr = fi * fj / voli / volj
+            onemprob = onemprob * \
+                (1.0 - (psi * (1.0 - pofr) + pofr * (1 - psi))
+                 * exp(-self.slope * dist))
+
+        prob = 1.0 - onemprob
+
+        return prob
+
+    def sphere_cap(self,r1, r2, d):
+        sc = 0.0
+        if d <= max(r1, r2) - min(r1, r2):
+            sc = min(4.0 / 3 * pi * r1 * r1 * r1,
+                     4.0 / 3 * pi * r2 * r2 * r2)
+        elif d >= r1 + r2:
+            sc = 0
+        else:
+            sc = (pi / 12 / d * (r1 + r2 - d) * (r1 + r2 - d)) * \
+                 (d * d + 2 * d * r1 - 3 * r1 * r1 + 2 * d * r2 + 6 * r1 * r2 -
+                  3 * r2 * r2)
+        return sc
+
+
+class TestXLRestraintSimple(IMP.test.TestCase):
+    def test_default(self):
+        """Test default-constructed restraint"""
+        dr = IMP.isd.CrossLinkMSRestraint()
+        self.assertRaisesUsageException(dr.evaluate, False)
+
+    def test_score_simple(self):
+        """
+        Test the straight pairwise restraint
+        """
+        #IMP.test.TestCase.setUp(self)
+
+        m = IMP.Model()
+        p1 = IMP.Particle(m)
+        p2 = IMP.Particle(m)
+
+        slope = 0.01
+        length = 10
+
+        xyz1 = IMP.core.XYZ.setup_particle(p1)
+        xyz2 = IMP.core.XYZ.setup_particle(p2)
+
+        xyz1.set_coordinates((0, 0, 0))
+        xyz2.set_coordinates((0, 0, 0))
+
+        sigma1 = setupnuisance(m, 5, 0, 100, False)
+        sigma2 = setupnuisance(m, 5, 0, 100, False)
+        psi = setupnuisance(m, 0.1, 0.0, 0.5, False)
+
+        dr = IMP.isd.CrossLinkMSRestraint(m, length, slope)
+        dr.add_contribution((p1, p2), (sigma1, sigma2), psi)
+        self.assertEqual(dr.get_number_of_contributions(), 1)
+        self.assertEqual(dr.get_contribution_particle_indexes(0),
+                         (p1.get_index(), p2.get_index()))
+        self.assertEqual(dr.get_contribution_psi_index(0),
+                         psi.get_particle_index())
+        self.assertEqual(dr.get_contribution_sigma_indexes(0),
+                         (sigma1.get_particle_index(),
+                          sigma2.get_particle_index()))
+        self.assertAlmostEqual(dr.get_slope(), 0.01, delta=1e-4)
+        self.assertAlmostEqual(dr.get_length(), 10.0, delta=1e-4)
+
+        lw = IMP.isd.LogWrapper([dr],1.0)
+
+        # initialize also a restraint which output -log(prob)
+        dr_lp = IMP.isd.CrossLinkMSRestraint(m, length, slope, True)
+        dr_lp.add_contribution((p1, p2), (sigma1, sigma2), psi)
+        if jax:
+            ji = dr_lp._get_jax(space=IMP.jax.FreeSpace)
+            X = ji.get_jax_model()
+            jax_score_func = jax.jit(ji.score_func)
+
+        testdr= CrossLinkMS(length, slope)
+        testdr.add_contribution(xyz1,xyz2,sigma1,sigma2,psi)
+
+        maxdist = 40.0
+        npoints = 100
+
+        sigmas1=sample([0.01,0.1,0.5,1.0,5.0,10.0,50.0,100.0],5)
+        sigmas2=sample([0.01,0.1,0.5,1.0,5.0,10.0,50.0,100.0],5)
+        psis=sample([0.01,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.49],5)
+
+        for s1 in sigmas1:
+            sigma1.set_scale(s1)
+            for s2 in sigmas2:
+                sigma2.set_scale(s2)
+                for p1 in psis:
+                    psi.set_scale(p1)
+                    for i in range(npoints):
+                        xyz2.set_coordinates(
+                            IMP.algebra.Vector3D(maxdist / npoints * float(i), 0.0, 0.0))
+                        dist = IMP.core.get_distance(xyz1, xyz2)
+                        scoretest = - \
+                            log(testdr.get_probability())
+                        score = lw.unprotected_evaluate(None)
+                        score_lp = dr_lp.unprotected_evaluate(None)
+                        self.assertAlmostEqual(score,scoretest,places=4)
+                        self.assertAlmostEqual(score_lp,scoretest,places=4)
+                        if jax:
+                            # Update JAX nuisance values to match
+                            X['nuisance'].data = jnp.array([s1, s2, p1, 0.0])
+                            score_jax = jax_score_func(X)
+                            self.assertAlmostEqual(score_lp,
+                                                   score_jax, delta=1e-3)
+
+    def test_score_multiple(self):
+        """Test crosslink restraint with multiple contributions"""
+        m, p1, p2, p3, sigma1, sigma2, psi1, psi2, lw = setup_system()
+
+        imp_score = lw.evaluate(False)
+        self.assertAlmostEqual(imp_score, 2.25585, delta=1e-3)
+        if jax:
+            jax_score = lw._evaluate_jax()
+            self.assertAlmostEqual(jax_score, imp_score, delta=1e-3)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_score_multi_attrset(self):
+        """Test JAX implementation with multiple attrsets"""
+        import IMP.jax
+        m, p1, p2, p3, sigma1, sigma2, psi1, psi2, lw = setup_system()
+        # First attribute set
+        imp_score1 = lw.evaluate(False)
+
+        # Second attribute set
+        fk = IMP.isd.Scale.get_scale_key()
+        m.set_number_of_sphere_attribute_sets(2)
+        m.set_number_of_attribute_sets(fk, 2)
+        m.set_active_sphere_attribute_set(1)
+        m.set_active_attribute_set(fk, 1)
+
+        IMP.core.XYZ.setup_particle(p1, IMP.algebra.Vector3D(0, 6, 0))
+        IMP.core.XYZ.setup_particle(p2, IMP.algebra.Vector3D(6, 0, 0))
+        IMP.core.XYZ.setup_particle(p3, IMP.algebra.Vector3D(0, 0, 16))
+        IMP.isd.Scale.setup_particle(sigma1, 10)
+        IMP.isd.Scale.setup_particle(sigma2, 10)
+        IMP.isd.Scale.setup_particle(psi1, 0.3)
+        IMP.isd.Scale.setup_particle(psi2, 0.4)
+        imp_score2 = lw.evaluate(False)
+        jax_score = lw._evaluate_jax()
+        self.assertEqual(jax_score.shape, (2,))
+        self.assertAlmostEqual(jax_score[0], imp_score1, delta=1e-4)
+        self.assertAlmostEqual(jax_score[1], imp_score2, delta=1e-4)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_derivatives_finite(self):
+        """Test JAX derivatives are finite in degenerate configurations"""
+        def get_grad(c1, c2, same_particle):
+            m = IMP.Model()
+            p1 = IMP.core.XYZR.setup_particle(
+                IMP.Particle(m), IMP.algebra.Sphere3D(c1, 4.0))
+            p2 = IMP.core.XYZR.setup_particle(
+                IMP.Particle(m), IMP.algebra.Sphere3D(c2, 4.0))
+            sigma1 = setupnuisance(m, 5, 0, 100, False)
+            sigma2 = setupnuisance(m, 5, 0, 100, False)
+            psi = setupnuisance(m, 0.1, 0.0, 0.5, False)
+            r = IMP.isd.CrossLinkMSRestraint(m, 10.0, 0.01, True)
+            r.add_contribution((p1, p1 if same_particle else p2),
+                               (sigma1, sigma2), psi)
+            ji = r._get_jax(space=IMP.jax.FreeSpace)
+            X = ji.get_jax_model()
+            score = ji.score_func(X)
+            self.assertAlmostEqual(float(jnp.sum(score)),
+                                   r.evaluate(False), delta=1e-4)
+            g = jax.grad(lambda X: jnp.sum(ji.score_func(X)))(X)
+            for leaf in jax.tree_util.tree_leaves(g):
+                self.assertTrue(bool(jnp.all(jnp.isfinite(leaf))),
+                                "Non-finite derivative: %s" % leaf)
+
+        # Coincident particles (zero distance)
+        get_grad((0, 0, 0), (0, 0, 0), False)
+        # Both ends of the cross-link on the same particle
+        get_grad((0, 0, 0), (10, 0, 0), True)
+        # dist == sigma + length/2, so sphere_cap is evaluated at d == 0
+        get_grad((0, 0, 0), (10, 0, 0), False)
+        # Regular configuration
+        get_grad((0, 0, 0), (15, 0, 0), False)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_derivatives_multiple(self):
+        """Test JAX derivatives with multiple contributions"""
+        m, p1, p2, p3, sigma1, sigma2, psi1, psi2, lw = setup_system()
+        ji = lw._get_jax(space=IMP.jax.FreeSpace)
+        X = ji.get_jax_model()
+        g = jax.jit(jax.grad(lambda X: jnp.sum(ji.score_func(X))))(X)
+
+        # The C++ restraint does not provide derivatives, so compare
+        # with finite differences of the C++ score. The C++ code does some
+        # calculations in single precision, so use a fairly large step.
+        def numerical_deriv(get, set):
+            h = 1e-3
+            orig = get()
+            set(orig + h)
+            up = lw.evaluate(False)
+            set(orig - h)
+            down = lw.evaluate(False)
+            set(orig)
+            return (up - down) / (2. * h)
+
+        for i, p in enumerate((p1, p2, p3)):
+            xyz = IMP.core.XYZ(p)
+            for k in range(3):
+                d = numerical_deriv(
+                    lambda: xyz.get_coordinate(k),
+                    lambda v: xyz.set_coordinate(k, v))
+                self.assertAlmostEqual(float(g['xyz'][i][k]), d, delta=1e-4)
+        # Nuisance storage is in particle setup order
+        for i, s in enumerate((sigma1, sigma2, psi1, psi2)):
+            d = numerical_deriv(s.get_scale, s.set_scale)
+            self.assertAlmostEqual(float(g['nuisance'].data[i]), d,
+                                   delta=1e-4)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_derivatives_zero_contribution(self):
+        """Test JAX derivatives when one contribution is certain"""
+        m = IMP.Model()
+        ps = [IMP.core.XYZ.setup_particle(IMP.Particle(m),
+                                          IMP.algebra.Vector3D(x, 0, 0))
+              for x in (0, 1, 30, 50)]
+        sigma = setupnuisance(m, 2, 0, 100, False)
+        # With psi=0, no slope, and particles closer than 2*sigma,
+        # the first contribution has probability exactly 1
+        psi1 = setupnuisance(m, 0.0, 0.0, 0.5, False)
+        psi2 = setupnuisance(m, 0.1, 0.0, 0.5, False)
+        r = IMP.isd.CrossLinkMSRestraint(m, 10.0, True)
+        r.add_contribution((ps[0], ps[1]), (sigma, sigma), psi1)
+        r.add_contribution((ps[2], ps[3]), (sigma, sigma), psi2)
+        self.assertAlmostEqual(r.evaluate(False), 0.0, delta=1e-8)
+        # Restraint containing only the other contribution
+        r_other = IMP.isd.CrossLinkMSRestraint(m, 10.0, True)
+        r_other.add_contribution((ps[2], ps[3]), (sigma, sigma), psi2)
+
+        ji = r._get_jax(space=IMP.jax.FreeSpace)
+        X = ji.get_jax_model()
+        self.assertAlmostEqual(float(jnp.sum(ji.score_func(X))), 0.0,
+                               delta=2e-7)
+        g = jax.grad(lambda X: jnp.sum(ji.score_func(X)))(X)
+        for leaf in jax.tree_util.tree_leaves(g):
+            self.assertTrue(bool(jnp.all(jnp.isfinite(leaf))),
+                            "Non-finite derivative: %s" % leaf)
+        # The first contribution's 1-p is psi1, so d(score)/d(psi1) is
+        # the product of 1-p for all other contributions
+        self.assertAlmostEqual(float(g['nuisance'].data[1]),
+                               1.0 - r_other.get_probability(), delta=1e-6)
+        # Score does not depend on anything else
+        self.assertAlmostEqual(float(jnp.sum(jnp.abs(g['xyz']))), 0.0,
+                               delta=1e-8)
+        self.assertAlmostEqual(float(g['nuisance'].data[0]), 0.0, delta=2e-7)
+        self.assertAlmostEqual(float(g['nuisance'].data[2]), 0.0, delta=2e-7)
+
+    def test_serialize(self):
+        """Test (un-)serialize of CrossLinkMSRestraint"""
+        m, p1, p2, sigma1, sigma2, psi, dr = make_test_restraint()
+        dr.set_source_residue1(1)
+        dr.set_source_residue2(4)
+        dr.set_source_protein1("r1")
+        dr.set_source_protein2("r2")
+        dump = pickle.dumps(dr)
+        del dr
+
+        # Should be able to restore restraint parameters
+        newdr = pickle.loads(dump)
+        self.assertAlmostEqual(newdr.get_weight(), 0.10, 0.01)
+        self.assertEqual(newdr.get_name(), "test restraint")
+        self.assertEqual(newdr.get_number_of_contributions(), 1)
+        self.assertEqual(newdr.get_contribution_particle_indexes(0),
+                         (p1.get_index(), p2.get_index()))
+        self.assertEqual(newdr.get_contribution_psi_index(0),
+                         psi.get_particle_index())
+        self.assertEqual(newdr.get_contribution_sigma_indexes(0),
+                         (sigma1.get_particle_index(),
+                          sigma2.get_particle_index()))
+        self.assertAlmostEqual(newdr.get_slope(), 0.01, delta=1e-4)
+        self.assertAlmostEqual(newdr.get_length(), 10.0, delta=1e-4)
+
+        self.assertEqual(newdr.get_source_residue1(), 1)
+        self.assertEqual(newdr.get_source_residue2(), 4)
+        self.assertEqual(newdr.get_source_protein1(), "r1")
+        self.assertEqual(newdr.get_source_protein2(), "r2")
+
+        del newdr
+        m2 = IMP.Model()
+        del m
+        # Cannot restore a Restraint if the Model it acts on is gone
+        self.assertRaises(ValueError, pickle.loads, dump)
+
+    def test_serialize_polymorphic(self):
+        """Test (un-)serialize of CrossLinkMSRestraint via polymorphic
+           pointer"""
+        m, p1, p2, sigma1, sigma2, psi, dr = make_test_restraint()
+        sf = IMP.core.RestraintsScoringFunction([dr])
+        dump = pickle.dumps(sf)
+
+        newsf = pickle.loads(dump)
+        newdr, = newsf.restraints
+        self.assertEqual(newdr.get_name(), "test restraint")
+
+    def test_score_multiple_restraints(self):
+        """Intensive random test, it tests manifold ambiguity, sameparticle, particle positions
+        totality of the score, individual scores, get_log_prob=True, multiple radii, multiple sigma,
+        multiple psi"""
+        import random
+
+        m = IMP.Model()
+
+        bb = IMP.algebra.BoundingBox3D(IMP.algebra.Vector3D(0, 0, 0),
+                                       IMP.algebra.Vector3D(30, 30, 30))
+
+        restraints=[]
+        restraints_lp=[]
+        test_restraints=[]
+        for n in range(100):
+            length=random.uniform(1,40)
+            slope=random.uniform(0,0.1)
+            dr = IMP.isd.CrossLinkMSRestraint(
+                                    m,
+                                    length,
+                                    slope)
+
+            dr_lp = IMP.isd.CrossLinkMSRestraint(
+                                    m,
+                                    length,
+                                    slope,
+                                    True)
+
+            testdr= CrossLinkMS(length, slope)
+
+            ambiguity=random.randint(1,6)
+            for a in range(ambiguity):
+                sameparticle=bool(random.randint(0,1))
+
+                p1=IMP.Particle(m)
+                d1 = IMP.core.XYZR.setup_particle(p1)
+                d1.set_radius(random.uniform(1.0,10.0))
+                d1.set_coordinates(IMP.algebra.get_random_vector_in(bb))
+                d1.set_coordinates_are_optimized(True)
+                s1 = setupnuisance(m, random.uniform(1.0,11.0), 0, 100, False)
+
+                if sameparticle:
+                    p2=p1
+                    s2=s1
+                else:
+                    p2=IMP.Particle(m)
+                    d2 = IMP.core.XYZR.setup_particle(p2)
+                    d2.set_radius(random.uniform(1.0,10.0))
+                    d2.set_coordinates(IMP.algebra.get_random_vector_in(bb))
+                    d2.set_coordinates_are_optimized(True)
+                    s2 = setupnuisance(m, random.uniform(1.0,11.0), 0, 100, False)
+
+                psi = setupnuisance(m, random.uniform(0.01,0.49), 0.0, 0.5, False)
+
+                dr.add_contribution((p1, p2), (s1, s2), psi)
+                dr_lp.add_contribution((p1, p2), (s1, s2), psi)
+                testdr.add_contribution(p1,p2,s1,s2,psi)
+
+            restraints.append(dr)
+            restraints_lp.append(dr_lp)
+            test_restraints.append(testdr)
+
+        lw = IMP.isd.LogWrapper(restraints,1.0)
+        restraint_set_lp=IMP.RestraintSet(restraints_lp,1.0)
+        test_score=sum([-log(r.get_probability()) for r in test_restraints])
+        for nr,r in enumerate(restraints):
+            score=-log(r.unprotected_evaluate(None))
+            score_lp=restraints_lp[nr].unprotected_evaluate(None)
+            score_test=-log(test_restraints[nr].get_probability())
+            self.assertAlmostEqual(score,score_test,places=4)
+            self.assertAlmostEqual(score_lp,score_test,places=4)
+        self.assertAlmostEqual(lw.unprotected_evaluate(None),restraint_set_lp.unprotected_evaluate(None),places=4)
+        self.assertAlmostEqual(lw.unprotected_evaluate(None),test_score,places=4)
+        self.assertAlmostEqual(restraint_set_lp.unprotected_evaluate(None),test_score,places=4)
+
+    def test_score_same_bead(self):
+        """
+        This test checks when the cross-linked residues are assigned
+        to the same particle
+        """
+        IMP.test.TestCase.setUp(self)
+
+        m = IMP.Model()
+        p1 = IMP.Particle(m)
+
+        slope = 0.01
+        length = 10
+
+        xyz1 = IMP.core.XYZR.setup_particle(p1)
+
+        xyz1.set_coordinates((0, 0, 0))
+
+        sigma1 = setupnuisance(m, 5, 0, 100, False)
+        psi = setupnuisance(m, 0.1, 0.0, 0.5, False)
+
+        dr = IMP.isd.CrossLinkMSRestraint(m, length, slope)
+        dr.add_contribution((p1, p1), (sigma1, sigma1), psi)
+        lw = IMP.isd.LogWrapper([dr],1.0)
+
+        # initialize also a restraint which output -log(prob)
+        dr_lp = IMP.isd.CrossLinkMSRestraint(m, length, slope, True)
+        dr_lp.add_contribution((p1, p1), (sigma1, sigma1), psi)
+
+        if jax:
+            ji = dr_lp._get_jax(space=IMP.jax.FreeSpace)
+            X = ji.get_jax_model()
+            jax_score_func = jax.jit(ji.score_func)
+
+        testdr= CrossLinkMS(length, slope)
+        testdr.add_contribution(xyz1,xyz1,sigma1,sigma1,psi)
+
+        maxradius = 40.0
+        npoints = 100
+
+        sigmas1=sample([0.01,0.1,0.5,1.0,5.0,10.0,50.0,100.0],5)
+        psis=sample([0.01,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.49],5)
+
+        for s1 in sigmas1:
+            sigma1.set_scale(s1)
+            for p1 in psis:
+                psi.set_scale(p1)
+                for i in range(npoints):
+                    radius=maxradius / npoints * float(i)
+                    xyz1.set_radius(radius)
+                    scoretest = - \
+                        log(testdr.get_probability())
+                    score = lw.unprotected_evaluate(None)
+                    score_lp = dr_lp.unprotected_evaluate(None)
+                    self.assertAlmostEqual(score,scoretest,places=4)
+                    self.assertAlmostEqual(score_lp,scoretest,places=4)
+                    if jax:
+                        # Update JAX nuisance values to match
+                        X['nuisance'].data = jnp.array([s1, p1, 0.0])
+                        score_jax = jax_score_func(X)
+                        self.assertAlmostEqual(score_lp, score_jax, delta=1e-3)
+
+    def test_score_two_fold_ambiguity(self):
+        IMP.test.TestCase.setUp(self)
+
+        m = IMP.Model()
+        p1 = IMP.Particle(m)
+        p2 = IMP.Particle(m)
+        p3 = IMP.Particle(m)
+
+        slope = 0.01
+        length = 10
+
+        xyz1 = IMP.core.XYZ.setup_particle(p1)
+        xyz2 = IMP.core.XYZ.setup_particle(p2)
+        xyz3 = IMP.core.XYZ.setup_particle(p3)
+
+        xyz1.set_coordinates((0, 0, 0))
+        xyz2.set_coordinates((0, 0, 0))
+        xyz3.set_coordinates((40, 0, 0))
+
+        sigma1 = setupnuisance(m, 5, 0, 100, False)
+        sigma2 = setupnuisance(m, 5, 0, 100, False)
+        sigma3 = setupnuisance(m, 5, 0, 100, False)
+        psi = setupnuisance(m, 0.1, 0.0, 0.5, False)
+
+        dr = IMP.isd.CrossLinkMSRestraint(m, length, slope)
+        dr.add_contribution((p1, p2), (sigma1, sigma2), psi)
+        dr.add_contribution((p3, p2), (sigma3, sigma2), psi)
+        lw = IMP.isd.LogWrapper([dr],1.0)
+
+        testdr= CrossLinkMS(length, slope)
+        testdr.add_contribution(xyz1,xyz2,sigma1,sigma2,psi)
+        testdr.add_contribution(xyz3,xyz2,sigma3,sigma2,psi)
+
+        # initialize also a restraint which output -log(prob)
+        dr_lp = IMP.isd.CrossLinkMSRestraint(m, length, slope, True)
+        dr_lp.add_contribution((p1, p2), (sigma1, sigma2), psi)
+        dr_lp.add_contribution((p3, p2), (sigma3, sigma2), psi)
+
+        maxdist = 40.0
+        npoints = 30
+
+        sigmas1=sample([0.01,0.1,0.5,1.0,5.0,10.0,50.0,100.0],5)
+        sigmas2=sample([0.01,0.1,0.5,1.0,5.0,10.0,50.0,100.0],5)
+        sigmas3=sample([0.01,0.1,0.5,1.0,5.0,10.0,50.0,100.0],5)
+        psis=sample([0.01,0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.49],5)
+
+        for s1 in sigmas1:
+            sigma1.set_scale(s1)
+            for s2 in sigmas2:
+                sigma2.set_scale(s2)
+                for s3 in sigmas3:
+                    sigma3.set_scale(s3)
+                    for p1 in psis:
+                        psi.set_scale(p1)
+                        for i in range(npoints):
+                            xyz2.set_coordinates(
+                                IMP.algebra.Vector3D(maxdist / npoints * float(i), 0.0, 0.0))
+                            dist = IMP.core.get_distance(xyz1, xyz2)
+                            scoretest = - \
+                                log(testdr.get_probability())
+                            score = lw.unprotected_evaluate(None)
+                            score_lp = dr_lp.unprotected_evaluate(None)
+                            self.assertAlmostEqual(score,scoretest,places=4)
+                            self.assertAlmostEqual(score_lp,scoretest,places=4)
+
+    def test_static_info(self):
+        """Test restraint static info"""
+        m, p1, p2, sigma1, sigma2, psi, dr = make_test_restraint()
+        self.assertIsNone(dr.get_static_info())
+        dr.set_source_residue1(1)
+        dr.set_source_residue2(4)
+        dr.set_source_protein1("foo")
+        dr.set_source_protein2("bar")
+        s = dr.get_static_info()
+        self.assertEqual(s.get_number_of_string(), 2)
+        self.assertEqual(s.get_string_key(0), "protein1")
+        self.assertEqual(s.get_string_value(0), "foo")
+        self.assertEqual(s.get_string_key(1), "protein2")
+        self.assertEqual(s.get_string_value(1), "bar")
+        self.assertEqual(s.get_number_of_int(), 2)
+        self.assertEqual(s.get_int_key(0), "residue1")
+        self.assertEqual(s.get_int_value(0), 1)
+        self.assertEqual(s.get_int_key(1), "residue2")
+        self.assertEqual(s.get_int_value(1), 4)
+
+
+if __name__ == '__main__':
+    IMP.test.main()

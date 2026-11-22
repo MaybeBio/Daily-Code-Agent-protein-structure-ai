@@ -1,0 +1,331 @@
+"""Independent state enumeration, not replication of the pruning algorithm."""
+import itertools
+
+import numpy as np
+import pytest
+from scipy.linalg import expm
+
+from csubst.endpoint import EndpointModel
+from csubst.endpoint_pair import count_any2spe
+
+
+def enumerate_model(parents, lengths, q, pi, tips, rates, weights):
+    n, k = len(parents), len(pi)
+    size = next(iter(tips.values())).shape[0]
+    nodes = np.zeros((n, size, k))
+    edges = {i: np.zeros((size, k, k)) for i, p in enumerate(parents) if p >= 0}
+    prediction = {i: np.zeros((size, k, k)) for i in edges}
+    norm = np.zeros(size)
+    root = list(parents).index(-1)
+    for rate, weight in zip(rates, weights):
+        transitions = {i: expm(q * lengths[i] * rate) for i in edges}
+        for assignment in itertools.product(range(k), repeat=n):
+            mass = np.full(size, weight * pi[assignment[root]])
+            for child in edges:
+                mass *= transitions[child][assignment[parents[child]], assignment[child]]
+            for leaf, likelihood in tips.items():
+                mass *= likelihood[:, assignment[leaf]]
+            norm += mass
+            for node, state in enumerate(assignment):
+                nodes[node, :, state] += mass
+            for child in edges:
+                a, d = assignment[parents[child]], assignment[child]
+                edges[child][:, a, d] += mass
+                prediction[child][:, a, :] += mass[:, None] * transitions[child][a]
+    nodes /= norm[None, :, None]
+    for child in edges:
+        edges[child] /= norm[:, None, None]
+        prediction[child] /= norm[:, None, None]
+    return nodes, edges, prediction, np.log(norm)
+
+
+@pytest.mark.parametrize('first_tip', [[0., 1., 0.], [1., 1., 0.]])
+@pytest.mark.parametrize('exclude_missing', [False, True])
+def test_pair_any2spe_matches_enumeration_with_missing_events(first_tip, exclude_missing):
+    parents = [-1, 0, 1, 1, 0]
+    lengths = [0., .3, .7, .2, .5]
+    pi = np.array([.2, .3, .5])
+    q = np.tile(pi, (3, 1)) - np.eye(3)
+    rates, weights = [0., .2, 2.], [.2, .4, .4]
+    tips = {2: np.array([first_tip, [0., 0., 0.], [1., 0., 0.]]),
+            3: np.eye(3)[[0, 2, 1]], 4: np.eye(3)[[0, 2, 0]]}
+    missing = {2: np.array([False, True, False])}
+    eligible = np.ones((len(parents), 3), dtype=bool)
+    if exclude_missing:
+        eligible[2] = ~missing[2]
+    pairs = [(2, 3), (2, 4), (1, 4), (3, 4)]
+    amino = np.array([0, 0, 1])
+    states = np.array(list(itertools.product(range(3), repeat=len(parents))))
+    mass = np.zeros((len(states), 3))
+    for rate, weight in zip(rates, weights):
+        prior = weight * pi[states[:, 0]]
+        for child in range(1, len(parents)):
+            p = expm(q * lengths[child] * rate)
+            prior *= p[states[:, parents[child]], states[:, child]]
+        likelihood = np.broadcast_to(prior[:, None], mass.shape).copy()
+        for leaf, emissions in tips.items():
+            rows = np.where(missing[leaf][:, None], 1., emissions) if leaf in missing else emissions
+            likelihood *= rows[:, states[:, leaf]].T
+        mass += likelihood
+    posterior = mass / mass.sum(axis=0)
+    expected = []
+    filtered = []
+    for a, b in pairs:
+        aa, ab = states[:, parents[a]], states[:, parents[b]]
+        da, db = states[:, a], states[:, b]
+        ena, enb = amino[aa] != amino[da], amino[ab] != amino[db]
+        n = ena & enb & (amino[da] == amino[db])
+        s = ~ena & ~enb & (da == db) & (aa != da) & (ab != db)
+        expected.append([posterior[event][:, eligible[a] & eligible[b]].sum() for event in (n, s)])
+        pp = posterior[n][:, eligible[a] & eligible[b]].sum(axis=0)
+        filtered.append(pp[pp >= .05].sum())
+    model = EndpointModel(parents, lengths, q, pi, rates, weights)
+    for block_size in (1, 2, 4):
+        values = count_any2spe(model, tips, amino, pairs, block_size, tip_missing=missing, eligible=eligible)
+        np.testing.assert_allclose(values, expected, atol=2e-14, rtol=0)
+    called = count_any2spe(model, tips, amino, pairs, 4, tip_missing=missing, eligible=eligible, min_ocn_site_pp=.05)
+    np.testing.assert_allclose(called, np.column_stack([expected, filtered]), atol=2e-14, rtol=0)
+
+
+def test_pair_any2spe_compresses_called_patterns_with_explicit_tip_masks():
+    pi = np.array([.2, .3, .5])
+    q = np.tile(pi, (3, 1)) - np.eye(3)
+    model = EndpointModel([-1, 0, 0], [0., .6, .3], q, pi)
+    tips = {1: np.eye(3)[[0, 0, 1, 0]], 2: np.eye(3)[[0, 0, 1, 0]]}
+    amino = np.array([0, 0, 1])
+    expected = count_any2spe(model, tips, amino, [(1, 2)], 2)
+    masks = {leaf: np.zeros(4, dtype=bool) for leaf in tips}
+    actual = count_any2spe(model, tips, amino, [(1, 2)], 2, tip_missing=masks)
+    np.testing.assert_array_equal(actual, expected)
+    separately = [count_any2spe(model, {k: v[i:i+1] for k, v in tips.items()}, amino, [(1, 2)], 1)[0, 0]
+                  for i in range(4)]
+    threshold = (min(separately) + max(separately)) / 2
+    filtered = count_any2spe(model, tips, amino, [(1, 2)], 4, min_ocn_site_pp=threshold)
+    np.testing.assert_allclose(filtered[0, 2], sum(x for x in separately if x >= threshold), atol=1e-14)
+
+
+@pytest.mark.parametrize('block_size', [1, 2, 64])
+@pytest.mark.parametrize('rates,weights', [([1.], [1.]), ([0., .2, 2.], [.2, .4, .4])])
+def test_joint_and_prediction_match_exhaustive_assignments(block_size, rates, weights):
+    parents = [-1, 0, 1, 1, 0]
+    lengths = [0, .03, .4, .2, .7]
+    pi = np.array([.2, .3, .5])
+    q = np.tile(pi, (3, 1)) - np.eye(3)
+    tips = {2: np.array([[1., 0, 0], [0, 1, 0], [1, 1, 1]]),
+            3: np.array([[0., 1, 0], [0, 1, 0], [1, 1, 1]]),
+            4: np.array([[1., 1, 0], [.1, .5, .8], [1, 1, 1]])}
+    nodes, edges, predictions, log_likelihood = enumerate_model(parents, lengths, q, pi, tips, rates, weights)
+    model = EndpointModel(parents, lengths, q, pi, rates, weights)
+    evidence = list(model.iter_blocks(tips, block_size=block_size, likelihood_only=True))
+    assert all(record.child == model.root for record in evidence)
+    np.testing.assert_allclose(np.concatenate([r.site_log_likelihood for r in evidence]), log_likelihood, atol=2e-14)
+    for record in model.iter_blocks(tips, block_size=block_size, predictive=True):
+        sl = slice(record.start, record.stop)
+        np.testing.assert_allclose(record.node, nodes[record.child, sl], atol=2e-14, rtol=0)
+        if record.parent >= 0:
+            np.testing.assert_allclose(record.joint, edges[record.child][sl], atol=2e-14, rtol=0)
+            np.testing.assert_allclose(record.predictive, predictions[record.child][sl], atol=2e-14, rtol=0)
+            np.testing.assert_allclose(record.joint.sum(2), nodes[record.parent, sl], atol=2e-14, rtol=0)
+            np.testing.assert_allclose(record.joint.sum(1), record.node, atol=2e-14, rtol=0)
+
+
+@pytest.mark.parametrize('length', [0., 1e-10, 1e-5, .1, 10.])
+def test_ambiguous_zero_and_short_branch(length):
+    model = EndpointModel([-1, 0, 1, 1, 0], [0, length, 1, 1, 1],
+                          [[-1, 1], [1, -1]], [.5, .5])
+    tips = {2: np.array([[1., 0]]), 3: np.array([[0., 1]]), 4: np.ones((1, 2))}
+    records = {x.child: x for x in model.iter_blocks(tips, predictive=True)}
+    edge = records[1]
+    expected = -np.expm1(-2 * length) / 2
+    assert edge.joint[0, 0, 1] + edge.joint[0, 1, 0] == pytest.approx(expected, abs=1e-15)
+    assert edge.predictive[0, 0, 1] + edge.predictive[0, 1, 0] == pytest.approx(expected, abs=1e-15)
+    # Same marginals give a spurious .5 under the previous estimator.
+    np.testing.assert_allclose(records[0].node, [[.5, .5]], atol=1e-14)
+    np.testing.assert_allclose(edge.node, [[.5, .5]], atol=1e-14)
+
+
+def test_zero_likelihood_fails_instead_of_fabricating_posterior():
+    model = EndpointModel([-1, 0, 0], [0, 0, 0], [[-1, 1], [1, -1]], [.5, .5])
+    with pytest.raises(ValueError, match='Zero likelihood'):
+        list(model.iter_blocks({1: np.array([[1., 0]]), 2: np.array([[0., 1]])}))
+
+
+def test_pruning_retains_all_states_when_sibling_likelihood_products_are_tiny():
+    # Each root state matches one tip and needs two changes on the other
+    # edges. The three possible root states therefore have equal likelihood
+    # by symmetry, even though each unscaled product is below float64 range.
+    model = EndpointModel([-1, 0, 0, 0], [0., 1e-170, 1e-170, 1e-170],
+                          np.ones((3, 3)) - 3 * np.eye(3), np.ones(3) / 3,
+                          rates=[0., 1.], weights=[.5, .5])
+    tips = {i: np.eye(3)[[i - 1]] for i in (1, 2, 3)}
+    records = list(model.iter_blocks(tips, category_nodes=True))
+    np.testing.assert_allclose(records[0].node[0], np.ones(3) / 3, rtol=2e-13)
+    np.testing.assert_array_equal(records[0].category_node[0], 0.)
+    for record in records[1:]:
+        np.testing.assert_allclose(record.joint[0, :, record.child - 1], np.ones(3) / 3, rtol=2e-13)
+        np.testing.assert_allclose(record.node, tips[record.child], rtol=2e-13)
+
+
+@pytest.mark.parametrize('reduce_events', [False, True])
+def test_forward_pass_normalizes_before_weighting_improbable_transitions(reduce_events):
+    # The first tip fixes the root in state 0, while the second tip on the
+    # first site fixes a change to state 1 with a subnormal likelihood.
+    model = EndpointModel([-1, 0, 0], [0., 0., 1e-310],
+                          [[-1., 1.], [1., -1.]], [.5, .5],
+                          rates=[0., 1.], weights=[.5, .5])
+    tips = {1: np.array([[1., 0.], [1., 0.]]), 2: np.array([[0., 1.], [1., 0.]])}
+
+    def transform(left, right, transition):
+        return {'joint': left[:, :, None] * transition * right[:, None, :]}
+
+    with np.errstate(over='raise', invalid='raise'):
+        records = list(model.iter_blocks(tips, predictive=True,
+                                        transform=transform if reduce_events else None))
+    leaf = records[2]
+    np.testing.assert_array_equal(leaf.node, tips[2])
+    expected = np.zeros((2, 2, 2))
+    expected[:, 0, :] = tips[2]
+    joint = leaf.reduced['joint'] if reduce_events else leaf.joint
+    np.testing.assert_array_equal(joint, expected)
+    prediction = leaf.reduced_predictive['joint'] if reduce_events else leaf.predictive
+    assert prediction[0, 0, 1] == pytest.approx(1e-310, rel=1e-12, abs=0.)
+    assert prediction[1, 0, 1] == pytest.approx(5e-311, rel=1e-12, abs=0.)
+
+
+def test_state_permutation_and_selected_edges():
+    tips = {1: np.array([[.1, .9]]), 2: np.array([[1., 0.]])}
+    q = np.array([[-.3, .3], [.7, -.7]])
+    m = EndpointModel([-1, 0, 0], [0, .4, .3], q, [.7, .3])
+    reference = list(m.iter_blocks(tips))
+    m2 = EndpointModel([-1, 0, 0], [0, .4, .3], q[::-1, ::-1], [.3, .7])
+    reordered = list(m2.iter_blocks({i: t[:, ::-1] for i, t in tips.items()}, branch_ids=[1]))
+    for a, b in zip(reference, reordered):
+        np.testing.assert_allclose(a.node, b.node[:, ::-1])
+    np.testing.assert_allclose(reference[1].joint, reordered[1].joint[:, ::-1, ::-1])
+    assert reordered[2].joint is None
+
+
+@pytest.mark.parametrize('predictive', [False, True])
+@pytest.mark.parametrize('block_size', [1, 2, 64])
+@pytest.mark.parametrize('rates,weights', [([1.], [1.]), ([0., .2, 2.], [.2, .4, .4])])
+def test_transformed_selected_and_unselected_edges_match_enumeration(predictive, block_size, rates, weights):
+    parents, lengths = [-1, 0, 1, 1, 0], [0, .03, .4, .2, .7]
+    pi = np.array([.2, .3, .5])
+    q = np.tile(pi, (3, 1)) - np.eye(3)
+    tips = {2: np.array([[1., 0, 0], [0, 1, 0], [1, 1, 1]]),
+            3: np.array([[0., 1, 0], [0, 1, 0], [1, 1, 1]]),
+            4: np.array([[1., 1, 0], [.1, .5, .8], [1, 1, 1]])}
+    nodes, edges, predictions, _ = enumerate_model(parents, lengths, q, pi, tips, rates, weights)
+    prediction_calls = []
+
+    def full(left, right, transition):
+        return {'mass': left[:, :, None] * transition * right[:, None, :]}
+
+    def coarse(left, right, transition):
+        return {'total': ((left @ transition) * right).sum(axis=1)}
+
+    def prediction(left, right, transition):
+        np.testing.assert_array_equal(right, np.ones(right.shape))
+        prediction_calls.append(1)
+        return full(left, right, transition)
+
+    model = EndpointModel(parents, lengths, q, pi, rates, weights)
+    for record in model.iter_blocks(tips, block_size, branch_ids=[1], joint=False,
+                                    predictive=predictive, transform=full,
+                                    unselected_transform=coarse, predictive_transform=prediction):
+        sl = slice(record.start, record.stop)
+        np.testing.assert_allclose(record.node, nodes[record.child, sl], atol=2e-14, rtol=0)
+        assert record.joint is None and record.predictive is None
+        if record.parent < 0:
+            continue
+        expected = {'mass': edges[record.child][sl]} if record.child == 1 else {
+            'total': edges[record.child][sl].sum(axis=(1, 2))}
+        for key, value in expected.items():
+            np.testing.assert_allclose(record.reduced[key], value, atol=2e-14, rtol=0)
+        if predictive:
+            np.testing.assert_allclose(record.reduced_predictive['mass'], predictions[record.child][sl],
+                                       atol=2e-14, rtol=0)
+        else:
+            assert record.reduced_predictive == {}
+    assert bool(prediction_calls) == predictive
+
+
+def test_inactive_structural_states_and_missing_tips():
+    q = np.array([[-1., 1, 0], [1, -1, 0], [0, 0, 0]])
+    m = EndpointModel([-1, 0, 0], [0, .1, .2], q, [.5, .5, 0])
+    records = list(m.iter_blocks({1: np.ones((2, 3)), 2: np.ones((2, 3))}))
+    for record in records:
+        np.testing.assert_allclose(record.node, [[.5, .5, 0]] * 2)
+
+
+@pytest.mark.parametrize('parents,lengths', [([-1, 2, 1], [0, 1, 1]), ([-1, -1], [0, 0]),
+                                           ([-1, 0], [0, -1]), ([-1, 0], [1, 1])])
+def test_invalid_tree_rejected(parents, lengths):
+    with pytest.raises(ValueError):
+        EndpointModel(parents, lengths, [[-1, 1], [1, -1]], [.5, .5])
+
+
+@pytest.mark.parametrize('length', [0, 1e-10, 1e-5, .1, 1, 10, 100])
+def test_shared_transition_powers_match_expm_for_rare_events(length):
+    # A chain forces transitions across many jumps, exercising tiny entries
+    # that can lose relative accuracy under spectral reconstruction.
+    k = 8
+    q = np.zeros((k, k))
+    for i in range(k - 1):
+        q[i, i + 1] = q[i + 1, i] = .7
+    np.fill_diagonal(q, -q.sum(axis=1))
+    model = EndpointModel([-1, 0], [0, length], q, np.ones(k) / k)
+    expected = expm(q * length)
+    if 0 < length < .01:
+        # Pade is not an entrywise-relative reference for these tiny multi-hop
+        # probabilities. Independently sum exp(Qt) in decimal arithmetic.
+        from decimal import Decimal, localcontext
+        with localcontext() as ctx:
+            ctx.prec = 110
+            operator = [[Decimal(str(q[i, j])) * Decimal(str(length)) for j in range(k)] for i in range(k)]
+            term = [[Decimal(int(i == j)) for j in range(k)] for i in range(k)]
+            total = [row.copy() for row in term]
+            for n in range(1, 50):
+                term = [[sum(term[i][z] * operator[z][j] for z in range(k)) / n
+                         for j in range(k)] for i in range(k)]
+                total = [[total[i][j] + term[i][j] for j in range(k)] for i in range(k)]
+                if max(abs(x) for row in term for x in row) < Decimal('1e-100'):
+                    break
+            expected = np.array(total, dtype=float)
+    np.testing.assert_allclose(model.transition(1, 0), expected, atol=1e-300, rtol=3e-14)
+    assert model._transition_series._powers.nbytes <= 8 * 1024 * 1024
+
+
+def test_shared_transition_nonreversible_and_zero_generator():
+    q = np.array([[-1., 1, 0], [0, -1., 1], [1, 0, -1.]])
+    model = EndpointModel([-1, 0, 0], [0, .3, .8], q, np.ones(3) / 3)
+    for branch in [1, 2]:
+        np.testing.assert_allclose(model.transition(branch, 0), expm(q * model.lengths[branch]), atol=1e-15)
+    zero = EndpointModel([-1, 0], [0, 10], np.zeros((3, 3)), np.ones(3) / 3)
+    np.testing.assert_array_equal(zero.transition(1, 0), np.eye(3))
+
+
+def test_short_transition_series_covers_disconnected_components():
+    n = 16
+    t = 1e-8
+    q = np.kron(np.eye(n // 2), [[-1., 1.], [1., -1.]])
+    model = EndpointModel([-1, 0], [0, t], q, np.full(n, 1/n))
+    change = -.5 * np.expm1(-2 * t)
+    expected = np.kron(np.eye(n // 2), [[1 - change, change], [change, 1 - change]])
+    np.testing.assert_allclose(model.transition(1, 0), expected, rtol=2e-14, atol=0.)
+    assert model._transition_series._count < n
+
+
+def test_tip_mask_matches_explicit_unknown_likelihoods_without_mutation():
+    model = EndpointModel([-1, 0, 0], [0, .2, .3], [[-1., 1.], [1., -1.]], [.5, .5])
+    first = np.array([[1., 0.], [0., 0.], [.4, .4]])
+    second = np.array([[0., 1.], [1., 0.], [0., 1.]])
+    mask = np.array([False, True, True])
+    filled = first.copy()
+    filled[mask] = 1.
+    reference = list(model.iter_blocks({1: filled, 2: second}, block_size=2))
+    actual = list(model.iter_blocks({1: first, 2: second}, block_size=2, tip_missing={1: mask}))
+    for observed, expected in zip(actual, reference):
+        np.testing.assert_array_equal(observed.node, expected.node)
+        np.testing.assert_array_equal(observed.joint, expected.joint)
+    np.testing.assert_array_equal(first, [[1., 0.], [0., 0.], [.4, .4]])

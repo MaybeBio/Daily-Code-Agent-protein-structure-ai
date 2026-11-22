@@ -1,0 +1,4510 @@
+"""OpenMM simulation runner.
+
+Takes the serialized ``System`` + ``State`` produced by the setup phase
+and runs a standard four-stage MD pipeline:
+
+  1. Minimization  -- local energy minimizer to a force-tolerance
+  2. NVT equilibration  -- fixed volume, Langevin thermostat
+  3. NPT equilibration  -- Monte Carlo barostat added, box equilibrates
+  4. Production  -- the trajectory frames the analysis phase consumes
+
+The runner is intentionally separate from the orchestrator-facing
+:mod:`fastmdxplora.simulation.pipeline` so it can be exercised
+directly from Python for tests and ad-hoc scripts.
+
+OpenMM is a conda-forge package and is imported lazily — without it the
+runner raises a helpful ImportError on first use, but importing this
+module does not.
+"""
+
+from __future__ import annotations
+
+import functools
+
+import time as _time
+
+import csv
+import json
+import math
+import shutil
+import threading as _threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+from fastmdxplora import record_access as _records
+from fastmdxplora.utils.logging import get_logger
+from fastmdxplora.simulation.ensembles import resolve_ensemble
+from fastmdxplora.simulation.lengths import (
+    DEFAULT_NPT_NS, DEFAULT_NVT_NS, DEFAULT_PRODUCTION_NS, DEFAULT_TIMESTEP_FS, steps_in,
+)
+from fastmdxplora.refusals import (
+    BackendUnavailable,
+    MissingResultError,
+    StudyError,
+    UnstableRun,
+)
+
+logger = get_logger("simulation.runner")
+
+#: The OpenMM platforms that take a `Precision` property (the GPU platforms).
+#: On any other the precision asked for is not applied, and nothing may say
+#: it was.
+PRECISION_PLATFORMS = ("CUDA", "OpenCL", "HIP")
+
+
+# ---------------------------------------------------------------------------
+# Defaults — production-cadence reporters and standard
+# stage lengths.
+# ---------------------------------------------------------------------------
+DEFAULT_TEMPERATURE_K = 300.0
+DEFAULT_FRICTION_PER_PS = 1.0          # Langevin collision frequency
+DEFAULT_PRESSURE_BAR = 1.0
+DEFAULT_BAROSTAT_FREQUENCY = 25        # MC barostat step interval
+DEFAULT_INTEGRATOR = "langevin_middle"
+DEFAULT_INTEGRATOR_ERROR_TOLERANCE = 0.001  # for the variable-step integrators
+
+# Atmospheres to bar (OpenMM's barostat takes bar). 1 atm = 1.01325 bar.
+ATM_TO_BAR = 1.01325
+
+# Integrators this can construct. langevin_middle is the modern default
+# (better configurational sampling than the legacy LangevinIntegrator).
+#: The integrators that choose their own step: a step count is no time,
+#: so a frame's time cannot be taken from the steps between frames.
+VARIABLE_STEP_INTEGRATORS = ("variable_langevin", "variable_verlet")
+
+SUPPORTED_INTEGRATORS = (
+    "langevin",
+    "langevin_middle",
+    "brownian",
+    "verlet",
+    *VARIABLE_STEP_INTEGRATORS,
+)
+
+#: The integrators with no thermostat. Every stage this runner has holds a
+#: temperature (the NVT stage, NPT, and production in either ensemble), and
+#: nothing else in the system keeps one, so with these each of them is
+#: constant-energy dynamics instead: a "300 K" run from a minimised structure
+#: settles near 175 K as the kinetic energy it starts with fills the
+#: potential, and a Monte Carlo barostat over it samples no defined ensemble.
+WITHOUT_A_THERMOSTAT = ("verlet", "variable_verlet")
+
+#: How far a hydrogen's random displacement in one Brownian step may go,
+#: in nm. The step is sqrt(2 kT dt / (m gamma)) and the dynamics has no
+#: inertia to soften it, so the friction must grow with the timestep. On a
+#: water box at 300 K this bound separated every case that ran from every
+#: case that went to NaN (0.5, 2 and 4 fs, frictions 12 to 200 per ps): the
+#: least friction it allows ran and half of it did not. It is a floor below
+#: which the run fails, not a promise above it.
+BROWNIAN_LARGEST_STEP_NM = 0.01
+_HYDROGEN_AMU = 1.008
+_GAS_CONSTANT_KJMOL_PER_K = 0.0083144626
+
+
+def least_brownian_friction(temperature_K: float, timestep_fs: float) -> float:
+    """The friction, per ps, below which a Brownian step moves a hydrogen
+    more than :data:`BROWNIAN_LARGEST_STEP_NM`: 2 kT dt / (m s^2)."""
+    kT = _GAS_CONSTANT_KJMOL_PER_K * float(temperature_K)
+    return 2.0 * kT * (float(timestep_fs) / 1000.0) / (
+        _HYDROGEN_AMU * BROWNIAN_LARGEST_STEP_NM ** 2)
+
+
+def check_integrator(name: str, *, temperature_K: float, friction_per_ps: float,
+                     timestep_fs: float) -> None:
+    """Refuse an integrator that cannot do what every stage asks of it.
+
+    Raised before anything runs, from the config check and again where the
+    integrator is built, so a direct call is held to the same rule.
+    """
+    key = str(name).lower()
+    if key in WITHOUT_A_THERMOSTAT:
+        raise StudyError(
+            f"The {key} integrator has no thermostat, and every stage of a run "
+            "holds a temperature: the NVT stage, NPT, and production in either "
+            "ensemble. With it each would be constant-energy dynamics, settling "
+            "well below the temperature asked for, and a barostat over it "
+            "samples no defined ensemble. Use `langevin_middle`.",
+            code="config.option.not_permitted", option="integrator",
+            context="simulation", given=key,
+            # The suggestion first; brownian last, permitted too, with the
+            # friction it needs (refused below where it has too little).
+            permitted=["langevin_middle", "langevin", "variable_langevin", "brownian"],
+            suggestion="langevin_middle")
+    if key == "brownian":
+        least = least_brownian_friction(temperature_K, timestep_fs)
+        if float(friction_per_ps) < least:
+            raise StudyError(
+                f"Brownian dynamics at {float(timestep_fs):g} fs and "
+                f"{float(temperature_K):g} K needs a friction of at least "
+                f"{math.ceil(least)} per ps; {float(friction_per_ps):g} was given. "
+                "Its random step is sqrt(2 kT dt / (m gamma)), with no inertia "
+                f"to soften it, and below that a hydrogen moves more than "
+                f"{BROWNIAN_LARGEST_STEP_NM:g} nm a step and the run goes to "
+                "NaN within a few hundred steps. Raise `friction_per_ps` or "
+                "shorten `timestep_fs`, or use `langevin_middle`.",
+                code="config.option.conflicting",
+                options=["simulation.integrator", "simulation.friction_per_ps",
+                         "simulation.timestep_fs"])
+
+
+def chose_its_own_step(simulation_dir: str | Path) -> bool:
+    """Whether the run in ``simulation_dir`` had an integrator that chose its
+    own step: its frames are a fixed number of steps apart, not a fixed
+    time, and the time each was saved at is not recorded.
+
+    Read from the run's record (`simulation_parameters.json`, written when
+    it ends), else from the study's resolved config, which is there while
+    it runs and for a run killed before its record."""
+    folder = Path(simulation_dir)
+    try:
+        record = json.loads(_records.read_text(folder / "simulation_parameters.json",
+                                               encoding="utf-8"))
+        parameters = record.get("parameters") if isinstance(record, dict) else None
+        if isinstance(parameters, dict) and parameters.get("integrator"):
+            return parameters["integrator"] in VARIABLE_STEP_INTEGRATORS
+    except (OSError, ValueError):
+        pass
+    for config in (folder.parent / "resolved_config.yml", folder / "resolved_config.yml"):
+        if _records.is_file(config):
+            try:
+                import yaml
+
+                data = yaml.safe_load(_records.read_text(config, encoding="utf-8")) or {}
+                simulation = data.get("simulation") if isinstance(data, dict) else None
+                return isinstance(simulation, dict) and \
+                    simulation.get("integrator") in VARIABLE_STEP_INTEGRATORS
+            except Exception:  # noqa: BLE001 - an unreadable config says nothing
+                return False
+    return False
+
+
+# The default stage lengths are times (simulation/lengths.py), and a run
+# takes its steps from them at its own timestep (plan_stages).
+DEFAULT_MINIMIZE_TOLERANCE_KJMOL_PER_NM = 10.0
+DEFAULT_MINIMIZE_MAX_ITERATIONS = 0     # 0 == until convergence
+
+# Reporter cadence
+DEFAULT_TRAJECTORY_INTERVAL_STEPS = 1000
+DEFAULT_STATE_INTERVAL_STEPS = 1000
+DEFAULT_CHECKPOINT_INTERVAL_STEPS = 10_000
+
+
+# ---------------------------------------------------------------------------
+# Result struct
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class SimulationResult:
+    """What the runner returns. All paths are absolute."""
+
+    trajectory: Path
+    topology: Path
+    final_state: Path
+    energy_csv: Path
+    log_file: Path
+    platform_used: str
+    n_production_frames: int
+    duration_ns_actual: float
+    #: The pressure the constant-pressure stages actually ran at. Settable as
+    #: bar or as atmospheres, and unset means one bar -- so the number the
+    #: barostat used was known only inside the runner, and a methods section
+    #: had to report the pressure of an NPT run as unrecorded.
+    pressure_bar_used: float | None = None
+    #: Which barostat the constant-pressure stages used: "membrane" (x and y
+    #: coupled, z free, no surface tension) or "isotropic"; None where no
+    #: stage ran at constant pressure. The methods section states it.
+    barostat: str | None = None
+    minimized_state: Path | None = None
+    #: Settings this run decided for itself, under their config names.
+    #:
+    #: Decisions, not outcomes. A step count worked out from a duration
+    #: belongs here; the duration the run actually reached does not, and
+    #: stays under ``duration_ns_actual``. The difference matters on
+    #: replay: repeating what a run set out to do reproduces the study,
+    #: and repeating what it managed to do before it was interrupted
+    #: reproduces the interruption.
+    resolved: dict[str, Any] = field(default_factory=dict)
+    #: What this run said of how it went, for the manifest's notes.
+    notes: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Lazy OpenMM import
+# ---------------------------------------------------------------------------
+def _import_openmm() -> dict:
+    """Return a dict of the OpenMM symbols the runner needs.
+
+    Raises a clean ImportError when OpenMM isn't installed. Bundling the
+    imports into one function means the runner module itself imports
+    cheaply, and tests can substitute the dict via monkeypatching.
+    """
+    try:
+        import openmm
+        from openmm import unit
+        from openmm.app import (
+            CheckpointReporter,
+            DCDReporter,
+            PDBFile,
+            Simulation,
+            StateDataReporter,
+        )
+    except ImportError as exc:
+        raise BackendUnavailable(
+            "Simulation phase requires OpenMM. Install via conda "
+            "(recommended): conda install -c conda-forge openmm — or via "
+            "pip with the optional [md] extras: "
+            "pip install fastmdxplora[md]."
+        , code="environment.backend.missing") from exc
+
+    return {
+        "openmm": openmm,
+        "unit": unit,
+        "CheckpointReporter": CheckpointReporter,
+        "DCDReporter": DCDReporter,
+        "PDBFile": PDBFile,
+        "Simulation": Simulation,
+        "StateDataReporter": StateDataReporter,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Platform selection
+# ---------------------------------------------------------------------------
+def _probe_platform(omm: Any, platform: Any, name: str,
+                props: dict[str, str]) -> bool:
+    """A registered platform may still be unusable. Probe it by actually
+    computing a force; only meaningful for the GPU platforms.
+    CPU/Reference are always usable.
+
+    The probe used to build a Context around a System holding one
+    particle and no forces. That loads almost no kernels, so a platform
+    whose kernels will not compile passed the probe and failed on the
+    real system a second later. Seen on a workstation whose driver
+    rejected the installed build's PTX: `auto` chose CUDA, the probe
+    said yes, and `Simulation(...)` raised
+    `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` -- with a working OpenCL
+    platform sitting next in the candidate list, unused.
+
+    `openmm.testInstallation` catches that case because it computes
+    forces. So does this now: two particles and a NonbondedForce, which
+    is the kernel every real system needs.
+    """
+    if name not in PRECISION_PLATFORMS:
+        return True
+    try:
+        mm = omm["openmm"]
+        unit = omm["unit"]
+        sys_ = mm.System()
+        sys_.addParticle(1.0)
+        sys_.addParticle(1.0)
+        force = mm.NonbondedForce()
+        force.addParticle(0.0, 1.0, 0.0)
+        force.addParticle(0.0, 1.0, 0.0)
+        sys_.addForce(force)
+        integ = mm.VerletIntegrator(0.001 * unit.picoseconds)
+        ctx = mm.Context(sys_, integ, platform, props)
+        ctx.setPositions([[0.0, 0.0, 0.0], [0.0, 0.0, 0.2]] * unit.nanometers)
+        # The kernels compile here, not at Context construction.
+        ctx.getState(getForces=True).getForces(asNumpy=True)
+        del ctx, integ, sys_
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.info(
+            "Platform %s is registered but not usable (%s); "
+            "trying next candidate.", name, exc,
+        )
+        return False
+
+
+def _platform_of_plugin(failure: str) -> str | None:
+    """The platform a plugin load failure belongs to, from the library named
+    in it: libOpenMMCUDA.so and libOpenMMRPMDCUDA.so are both CUDA's. None
+    where no platform library is named."""
+    import re
+
+    match = re.search(r"OpenMM[A-Za-z]*?(CUDA|OpenCL|HIP|CPU)\.(?:so|dylib|dll)", failure)
+    return match.group(1) if match else None
+
+
+def _say_what_is_available(omm: dict, wanted: "list[str]") -> None:
+    """Name the platforms OpenMM found, and why a wanted one is missing.
+
+    A platform that is not registered is skipped silently, and the silence is
+    expensive. On a cluster with two GPUs, OpenMM offered `Reference` alone
+    and reported no load failures -- because with `OPENMM_PLUGIN_DIR` unset it
+    had not looked, so there was nothing to fail. A run would have finished,
+    correct and about a hundred times slower, with nothing anywhere saying
+    why.
+
+    `getPluginLoadFailures` holds the answer whenever the directory is right
+    and a library still would not load: on that machine, once the path was
+    set, it said `libcuda.so.1: cannot open shared object file`, which is the
+    whole diagnosis in one line.
+    """
+    mm = omm.get("openmm")
+    if mm is None:
+        return
+    try:
+        found = [mm.Platform.getPlatform(i).getName()
+                 for i in range(mm.Platform.getNumPlatforms())]
+    except Exception:  # noqa: BLE001 - a toolkit that will not enumerate
+        return
+
+    logger.info("OpenMM platforms available: %s", ", ".join(found) or "none")
+
+    # Only what could have changed the choice: the wanted platforms ahead of
+    # the first one that is there. Every load failure was printed whenever
+    # any wanted platform was absent, so a CUDA machine with no OpenCL
+    # listed the AMD libraries it had never been asked to use, marked as
+    # information, above the line saying CUDA was selected.
+    first_found = next((i for i, name in enumerate(wanted) if name in found), len(wanted))
+    missing = list(wanted[:first_found])
+
+    try:
+        failures = [str(f) for f in mm.Platform.getPluginLoadFailures()]
+    except Exception:  # noqa: BLE001
+        failures = []
+
+    explaining = [f for f in failures if _platform_of_plugin(f) in (*missing, None)]
+    for failure in failures:
+        if failure not in explaining or not missing:
+            logger.debug("  a plugin did not load: %s", failure)
+    if not missing:
+        return
+
+    if explaining:
+        for failure in explaining:
+            logger.warning("  a plugin did not load: %s", failure)
+    elif "CPU" in missing:
+        # Nothing failed and the CPU platform is absent, which means nothing
+        # was attempted: the plugin directory is wrong or unset. Worth saying,
+        # because the fallback that follows is the slow one.
+        logger.info(
+            "  no %s, and no plugin reported a failure, which means "
+            "none was tried. OpenMM loads its platforms from a directory "
+            "fixed at build time; where that path does not exist -- a "
+            "relocated or shared installation -- set OPENMM_PLUGIN_DIR to "
+            "the `lib/plugins` beside the OpenMM library.",
+            ", ".join(missing))
+
+
+def select_platform(
+    omm: dict,
+    requested: str = "auto",
+    precision: str = "mixed",
+    device_index: str | int | None = None,
+) -> tuple[Any, dict[str, str], str]:
+    """Pick the best available OpenMM Platform.
+
+    Parameters
+    ----------
+    omm : dict
+        Output of :func:`_import_openmm`.
+    requested : str, default "auto"
+        One of ``"auto"``, ``"CUDA"``, ``"OpenCL"``, ``"CPU"``, ``"HIP"``.
+        ``"auto"`` tries CUDA → OpenCL → CPU and uses the first that loads.
+    precision : str, default "mixed"
+        Numerical precision for GPU platforms. ``"single"``, ``"mixed"``,
+        or ``"double"``. Ignored for CPU.
+    device_index : str | int | None
+        GPU device index for multi-GPU machines (e.g. ``"0"`` or ``"0,1"``).
+        Maps to ``CudaDeviceIndex`` / ``OpenCLDeviceIndex``. Ignored for CPU.
+
+    Returns
+    -------
+    platform : openmm.Platform
+    properties : dict[str, str]
+        Per-platform properties to pass to ``Simulation(...)``.
+    name : str
+        The platform's name as a string for logging.
+    """
+    Platform = omm["openmm"].Platform
+
+    auto = requested == "auto"
+    if auto:
+        candidates = ["CUDA", "OpenCL", "CPU"]
+    else:
+        candidates = [requested]
+
+    def _make_props(name: str) -> dict[str, str]:
+        props: dict[str, str] = {}
+        if name in PRECISION_PLATFORMS:
+            props["Precision"] = precision
+            if device_index is not None:
+                prop_key = {
+                    "CUDA": "CudaDeviceIndex",
+                    "OpenCL": "OpenCLDeviceIndex",
+                    "HIP": "HipDeviceIndex",
+                }[name]
+                props[prop_key] = str(device_index)
+        return props
+
+    _say_what_is_available(omm, candidates)
+
+    for name in candidates:
+        try:
+            platform = Platform.getPlatformByName(name)
+        except Exception:  # noqa: BLE001 -- OpenMM raises different types
+            continue
+        props = _make_props(name)
+        # For auto-selection, verify the platform actually works before
+        # committing to it — a registered OpenCL/CUDA platform with no
+        # usable device otherwise fails later at Context construction with
+        # a confusing error. For an explicit request it is honored as-is so
+        # the user sees the real error if their chosen platform is broken.
+        if auto and not _probe_platform(omm, platform, name, props):
+            continue
+        # What was applied, not what was asked for. `Precision` is a property
+        # of the GPU platforms; the CPU platform has only `Threads` and
+        # `DeterministicForces`, so it has no precision setting and the one
+        # requested is not applied. Reporting the request made the banner say
+        # "CPU (precision=mixed)", and the diagnosis printed after a
+        # non-finite coordinate suggests `--simulate-precision double` --
+        # which on CPU changes nothing at all, so somebody chasing an
+        # unstable run would try it and learn nothing.
+        applied = props.get("Precision")
+        logger.info(
+            "Selected OpenMM platform: %s (%s%s)",
+            name,
+            f"precision={applied}" if applied
+            else f"{precision} precision requested; this platform has no such "
+                 "setting",
+            f", device={device_index}" if device_index is not None else "",
+        )
+        return platform, props, name
+
+    raise BackendUnavailable(
+        f"No usable OpenMM platform among {candidates}. "
+        f"Install GPU drivers + a matching OpenMM build, or pass platform='CPU'."
+    , code="environment.platform.unavailable")
+
+
+# ---------------------------------------------------------------------------
+# Integrator + barostat helpers
+# ---------------------------------------------------------------------------
+def _make_integrator(
+    omm: dict,
+    *,
+    name: str,
+    temperature_K: float,
+    friction_per_ps: float,
+    timestep_fs: float,
+    error_tolerance: float,
+    random_seed: int | None,
+):
+    """Construct an OpenMM integrator by name.
+
+    Supported names (see :data:`SUPPORTED_INTEGRATORS`):
+
+      - ``langevin_middle`` -- LangevinMiddleIntegrator (default; best
+        configurational sampling, the modern recommendation)
+      - ``langevin``        -- LangevinIntegrator (legacy)
+      - ``brownian``        -- BrownianIntegrator (overdamped)
+      - ``verlet``          -- VerletIntegrator (constant energy)
+      - ``variable_langevin`` -- VariableLangevinIntegrator (adaptive dt)
+      - ``variable_verlet``   -- VariableVerletIntegrator (adaptive dt)
+
+    The fixed-timestep integrators take ``timestep_fs``; the variable
+    ones take ``error_tolerance`` instead. The thermostatted integrators
+    take ``temperature_K`` and ``friction_per_ps``. The Verlet variants
+    have no thermostat and nothing here adds one, so
+    :func:`check_integrator` refuses them while every stage holds a
+    temperature. Their branches below are kept for constant-energy
+    production after a thermostatted equilibration, which needs the
+    integrator swapped between stages and is not offered yet.
+    """
+    unit = omm["unit"]
+    openmm = omm["openmm"]
+    key = str(name).lower()
+    check_integrator(key, temperature_K=temperature_K,
+                     friction_per_ps=friction_per_ps, timestep_fs=timestep_fs)
+
+    T = temperature_K * unit.kelvin
+    gamma = friction_per_ps / unit.picoseconds
+    dt = timestep_fs * unit.femtoseconds
+
+    if key == "langevin_middle":
+        integ = openmm.LangevinMiddleIntegrator(T, gamma, dt)
+    elif key == "langevin":
+        integ = openmm.LangevinIntegrator(T, gamma, dt)
+    elif key == "brownian":
+        integ = openmm.BrownianIntegrator(T, gamma, dt)
+    elif key == "verlet":
+        integ = openmm.VerletIntegrator(dt)
+    elif key == "variable_langevin":
+        integ = openmm.VariableLangevinIntegrator(T, gamma, float(error_tolerance))
+    elif key == "variable_verlet":
+        integ = openmm.VariableVerletIntegrator(float(error_tolerance))
+    else:
+        raise StudyError(
+            f"Unknown integrator {name!r}. Supported: "
+            f"{', '.join(SUPPORTED_INTEGRATORS)}."
+        , code="simulation.cv.unknown")
+
+    if random_seed is not None and hasattr(integ, "setRandomNumberSeed"):
+        integ.setRandomNumberSeed(int(random_seed))
+    return integ
+
+
+def is_membrane_system(topology: Any) -> bool:
+    """Whether this system contains a lipid bilayer.
+
+    Detected from the topology rather than taken as a setting, because the
+    barostat has to be right whether or not anybody remembered to say so.
+    A membrane run given an isotropic barostat completes and is wrong, which
+    is not a failure mode worth leaving to somebody's memory. The names are
+    :mod:`fastmdxplora.lipids`': the list kept here missed the names OpenMM
+    gives five of its seven built lipids. And a count, not one name: `POP`
+    is also pyrophosphate, and an enzyme with one bound is not a membrane.
+    """
+    from fastmdxplora.lipids import is_bilayer
+
+    return is_bilayer(residue.name for residue in topology.residues())
+
+
+def _add_barostat(omm: dict, system: Any, *, temperature_K: float,
+                  pressure_bar: float, frequency: int,
+                  membrane: bool = False) -> int:
+    """Add a Monte Carlo barostat. Returns the force index for later removal.
+
+    A membrane gets a different one. An ordinary barostat scales x, y and z
+    together, which squeezes a bilayer that should be free to change thickness
+    independently of its area -- and area per lipid is the number membrane
+    simulations are validated against, so getting it wrong invalidates the run
+    without stopping it. ``MonteCarloMembraneBarostat`` couples x and y (the
+    membrane plane) and lets z move separately.
+
+    The surface tension is zero, which is the usual choice: a bilayer at
+    equilibrium has none, and imposing one is a modelling decision that should
+    be made deliberately rather than inherited from a default.
+    """
+    unit = omm["unit"]
+    openmm = omm["openmm"]
+
+    if membrane:
+        barostat = openmm.MonteCarloMembraneBarostat(
+            pressure_bar * unit.bar,
+            0.0 * unit.bar * unit.nanometer,  # surface tension
+            temperature_K * unit.kelvin,
+            openmm.MonteCarloMembraneBarostat.XYIsotropic,
+            openmm.MonteCarloMembraneBarostat.ZFree,
+            int(frequency),
+        )
+        logger.info(
+            "Membrane barostat: x and y coupled, z free, surface tension 0. "
+            "An isotropic barostat would squeeze the bilayer and give the "
+            "wrong area per lipid."
+        )
+    else:
+        barostat = openmm.MonteCarloBarostat(
+            pressure_bar * unit.bar,
+            temperature_K * unit.kelvin,
+            int(frequency),
+        )
+    return system.addForce(barostat)
+
+
+def _remove_force(system: Any, force_index: int) -> None:
+    """Remove a force previously added by index."""
+    system.removeForce(force_index)
+
+
+# ---------------------------------------------------------------------------
+# Reporter attach/detach helpers
+# ---------------------------------------------------------------------------
+def _attach_state_reporter(
+    omm: dict,
+    simulation: Any,
+    csv_path: Path,
+    *,
+    interval: int,
+    total_steps: int,
+) -> Any:
+    """Attach a CSV StateDataReporter with the standard observables."""
+    # OpenMM's StateDataReporter writes a one-line header automatically.
+    # Opened with newline="" so the line endings are consistent
+    # cross-platform and so the CSV opens cleanly in Excel.
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    reporter = omm["StateDataReporter"](
+        str(csv_path),
+        interval,
+        step=True,
+        time=True,
+        potentialEnergy=True,
+        kineticEnergy=True,
+        totalEnergy=True,
+        temperature=True,
+        volume=True,
+        density=True,
+        progress=True,
+        remainingTime=True,
+        speed=True,
+        totalSteps=total_steps,
+        separator=",",
+    )
+    simulation.reporters.append(reporter)
+    return reporter
+
+
+def _anchor_the_pull_where_it_starts(simulation: Any, topology: Any,
+                                     reanchor: dict, script_path: "Path",
+                                     topology_path: Any) -> None:
+    """Rewrite the pull's script with the anchor equilibration produced.
+
+    A moving restraint travels from one value to another, and the first is
+    where the system is when the pull starts. That is not where the prepared
+    structure sat: minimisation, NVT and NPT all run first and all move it.
+    Anchoring at the earlier value leaves the restraint a little behind the
+    system, pulling backwards for an instant before the anchor overtakes --
+    small over a pull of a nanometre and a half, and avoidable, since by the
+    time the force is attached the right positions exist.
+
+    Failure here is not fatal. The script written from the starting structure
+    is already a working pull, so a problem reading the current state costs
+    the refinement and says so rather than costing the run.
+    """
+    from fastmdxplora.simulation.steered import (
+        build_steered_script, plan_steered)
+
+    try:
+        import mdtraj as md
+        from openmm import unit as openmm_unit
+
+        state = simulation.context.getState(getPositions=True)
+        positions = state.getPositions(asNumpy=True).value_in_unit(
+            openmm_unit.nanometer)
+        mdtop = (topology if isinstance(topology, md.Topology)
+                 else md.Topology.from_openmm(topology))
+        frame = md.Trajectory(positions[None, :, :], mdtop)
+        vectors = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(
+            openmm_unit.nanometer)
+        frame.unitcell_vectors = vectors[None, :, :]
+
+        plan = plan_steered(reanchor["spec"], mdtop,
+                            temperature_K=reanchor["temperature_K"],
+                            structure=frame)
+        script_path.write_text(
+            build_steered_script(
+                plan, reference_pdb=str(topology_path)
+                if plan.cv.collective_variable == "ligand_rmsd" else None,
+                # Where PLUMED's counter actually is. Equilibration has
+                # already run, and a restraint told to start at step zero
+                # starts production part-way along its path.
+                first_step=int(getattr(simulation, "currentStep", 0) or 0)),
+            encoding="utf-8")
+        logger.info(
+            "Pull re-anchored at %.4f nm, computed from the equilibrated "
+            "state rather than the structure the run started from.",
+            plan.from_value)
+    except Exception as exc:  # noqa: BLE001 -- a refinement, not the run
+        logger.warning(
+            "Could not recompute the pull's anchor from the equilibrated "
+            "state (%s). The script written from the starting structure "
+            "stands, and its anchor is that structure's value.", exc)
+
+
+def resolve_save_selection(topology: Any, selection: str | None
+                           ) -> "tuple[list[int] | None, str]":
+    """Which atoms go into the trajectory, and a sentence about it.
+
+    ``None`` means every atom, which is what OpenMM's own reporter writes
+    and what this did before there was a choice.
+
+    Water dominates a solvated system by a factor of ten or more, so a
+    trajectory that leaves it out is a tenth the size. What it can no
+    longer answer is any question about the water itself, which is why the
+    saved topology is written beside it and the analyses that need solvent
+    say so rather than reporting an empty result.
+    """
+    if selection is None or str(selection).strip().lower() in ("all", "*"):
+        return None, "every atom"
+
+    import mdtraj as md
+
+    try:
+        mdtop = (topology if isinstance(topology, md.Topology)
+                 else md.Topology.from_openmm(topology))
+    except (TypeError, ValueError, AttributeError, ImportError):
+        # A topology this cannot read is not a reason to fail the run: the
+        # trajectory is still writable, it just holds everything. Said out
+        # loud, because a study that asked for the solvent to be left out
+        # and got it anyway should hear why rather than find out from the
+        # file size.
+        #
+        # ImportError belongs here and was missing. MDTraj raises it, not a
+        # TypeError, when `openmm.app` is absent -- and this function runs
+        # on every simulation path, so the omission failed eight tests on
+        # the one CI leg without the `[md]` extra, none of which were about
+        # saving a subset.
+        return None, "every atom (the topology could not be read to select)"
+
+    try:
+        kept = [int(i) for i in mdtop.select(str(selection))]
+    except (ValueError, SyntaxError) as exc:
+        # A selection that will not parse is a mistake in the study file,
+        # not a fact about the system, and it is fixable in one edit. That
+        # is worth stopping for, where a valid selection matching nothing
+        # is not.
+        raise StudyError(
+            f"`save_selection` {selection!r} is not a selection this can "
+            f"read: {exc}. It is written in MDTraj's language -- `not "
+            "water`, `protein`, `all` -- and a run will not start on one "
+            "that cannot be parsed, because every frame would be affected."
+        , code="simulation.cv.selection_empty") from exc
+    if not kept:
+        # Everything, rather than nothing or a refusal. A box of pure water
+        # is a legitimate study -- it is how a water model's density is
+        # checked -- and `not water` selects nothing in one, so a default
+        # that refused would refuse the very study it cannot help with. A
+        # mistyped selection lands here too, which is why the sentence
+        # returned names it.
+        return None, (
+            f"every atom ({selection!r} matched none, so nothing was left "
+            "out)")
+    if len(kept) == mdtop.n_atoms:
+        # Named, rather than reported as though `all` had been asked for.
+        # A selection can parse, be wrong, and still match: `not resname
+        # WAT` on a system whose water is HOH keeps every atom, and a
+        # study that meant to leave the solvent out would otherwise get a
+        # full-size trajectory and a line saying "every atom" with nothing
+        # to suggest the selection had done nothing.
+        return None, f"every atom ({selection!r} excluded none of them)"
+    return kept, (
+        f"{len(kept)} of {mdtop.n_atoms} atoms ({selection})")
+
+
+def _attach_dcd_reporter(
+    omm: dict, simulation: Any, dcd_path: Path, *, interval: int,
+    atom_subset: "list[int] | None" = None,
+) -> Any:
+    dcd_path.parent.mkdir(parents=True, exist_ok=True)
+    if atom_subset is None:
+        reporter = omm["DCDReporter"](str(dcd_path), interval)
+    else:
+        # MDTraj's reporter, because OpenMM's writes every atom and has no
+        # way to be told otherwise. The topology that matches this subset
+        # is written beside it: a trajectory of 2,600 atoms read against a
+        # topology of 30,750 does not fail, it misaligns, and every
+        # measurement afterwards is of the wrong atoms.
+        reporter = _subset_dcd_reporter()(
+            str(dcd_path), interval, atomSubset=atom_subset)
+    simulation.reporters.append(reporter)
+    return reporter
+
+
+def _subset_dcd_reporter() -> type:
+    """MDTraj's DCD reporter, without its warning about its own coordinates.
+
+    It hands the DCD writer the double-precision positions OpenMM returns,
+    and the writer, which stores single precision as every DCD does, warns
+    about the cast: a line of MDTraj's source on the console at the start of
+    every production run that saves a subset, which is every run by default.
+    The cast loses nothing the file could hold.
+    """
+    import warnings
+
+    from mdtraj.reporters import DCDReporter
+
+    class _SubsetDCDReporter(DCDReporter):
+        def report(self, simulation: Any, state: Any) -> None:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", message="Casting xyz dtype=float64")
+                super().report(simulation, state)
+
+    return _SubsetDCDReporter
+
+
+def write_trajectory_topology(
+    topology: Any, positions: Any, path: Path,
+    atom_subset: "list[int] | None",
+) -> Path | None:
+    """The topology that matches what the trajectory actually holds.
+
+    Written only when a subset was saved, because otherwise the setup
+    phase's own topology already describes it and a second copy is a
+    second thing to keep in step.
+    """
+    if atom_subset is None:
+        return None
+
+    # Written by OpenMM from OpenMM's topology where there is one, keeping the
+    # deposited residue numbers, insertion codes and chain IDs. Through
+    # MDTraj the insertion codes were dropped, so trypsin's 184A and 184
+    # became two residues numbered 184 in every file analysis read, and no
+    # later step could tell them apart.
+    kept = [int(i) for i in atom_subset]
+    if hasattr(topology, "atoms") and callable(topology.atoms) and kept == sorted(set(kept)):
+        from openmm.app import Modeller, PDBFile
+
+        modeller = Modeller(topology, positions)
+        keep = set(kept)
+        modeller.delete([atom for atom in topology.atoms() if atom.index not in keep])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            PDBFile.writeFile(modeller.topology, modeller.positions, handle, keepIds=True)
+        return path
+
+    import mdtraj as md
+
+    mdtop = (topology if isinstance(topology, md.Topology)
+             else md.Topology.from_openmm(topology))
+    import numpy as _np
+
+    coordinates = _np.asarray(
+        positions.value_in_unit(__import__("openmm").unit.nanometer)
+        if hasattr(positions, "value_in_unit") else positions, dtype=float)
+    frame = md.Trajectory(coordinates[None, ...], mdtop)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.atom_slice(atom_subset).save_pdb(str(path))
+    return path
+
+
+def _grid_by_the_cell(simulation: Any, script_in: Callable[[Any], str],
+                      path: Path, *, unit: Any) -> None:
+    """Rewrite the metadynamics input with the cell production starts in.
+
+    A distance is measured by the minimum image, so the cell bounds it, and
+    with the cell known the bias can be kept on a grid rather than summed
+    over every hill at every step, which slows a long run without bound.
+    """
+    import numpy as np
+
+    box_nm = np.asarray(simulation.context.getState().getPeriodicBoxVectors(
+        asNumpy=True).value_in_unit(unit.nanometer), dtype=float)
+    before = path.read_text(encoding="utf-8")
+    after = script_in(box_nm=box_nm)
+    if after != before:
+        path.write_text(after, encoding="utf-8")
+        logger.info("Metadynamics bias kept on a grid bounded by the periodic "
+                    "cell as equilibration left it.")
+
+
+def _write_checkpoint_set(simulation: Any, chk_path: Path, sidecar: dict[str, Any]) -> None:
+    """Write the context's checkpoint, its sidecar and its seal as one set.
+
+    The three are one fact in three files. Each is written whole beside its
+    place (``.new``), then put in place, the checkpoint first, its sidecar
+    second and its seal last. A kill while they are written leaves the set
+    before it as it was; a kill between the moves leaves a checkpoint whose
+    seal still waits beside it (``.new``), and the readers take the set it
+    seals (`verify_checkpoint`, `read_checkpoint_sidecar`). The sidecar and
+    the seal were written in place after the checkpoint, so a kill there
+    left a checkpoint at the new step, its sidecar at the old one and an
+    empty seal, which nothing could resume.
+    """
+    import hashlib
+    import os as _os
+
+    # A set a kill left part moved is finished first, and what is left of an
+    # earlier write cleared, so this write's files never pair with its.
+    _finish_checkpoint_set(chk_path)
+    payload = simulation.context.createCheckpoint()
+    side_path = chk_path.with_suffix(chk_path.suffix + CHECKPOINT_SIDECAR_SUFFIX)
+    seal_path = chk_path.with_suffix(chk_path.suffix + CHECKPOINT_DIGEST_SUFFIX)
+    new_chk, new_side, new_seal = (path.with_suffix(path.suffix + ".new")
+                                   for path in (chk_path, side_path, seal_path))
+    new_chk.write_bytes(payload)
+    write_checkpoint_sidecar(chk_path, into=new_side, **sidecar)
+    new_seal.write_text(f"{len(payload)} {hashlib.sha256(payload).hexdigest()}\n",
+                        encoding="utf-8")
+    _os.replace(new_chk, chk_path)
+    _os.replace(new_side, side_path)
+    _os.replace(new_seal, seal_path)
+
+
+# ---------------------------------------------------------------------------
+# Stopping where a run can be carried on.
+#
+# A job scheduler, a cloud provider taking a machine back, a container being
+# replaced, and the GUI's Stop button all ask a run to end with SIGTERM, and
+# a person at a terminal with Ctrl-C. Obeyed at once, the run keeps only its
+# last interval checkpoint, and up to `checkpoint_interval_steps` of
+# production are run again. A checkpoint written the moment the signal
+# arrives would sit between two frames, and the frames of the run that
+# carries it on would then fall off the grid of the ones before, changing
+# the joined trajectory's spacing at the join -- which `fastmdx resume`
+# refuses. So a stop during production steps on to the next frame, where a
+# checkpoint belongs, when that can be done inside the time a scheduler
+# allows between asking and killing; writes the checkpoint there; and ends
+# with a refusal marked retryable, which is what `fastmdx resume` reads as
+# an interruption.
+# ---------------------------------------------------------------------------
+
+#: Seconds a run asked to stop may keep integrating to reach the next frame.
+#: Schedulers allow about 30 between SIGTERM and SIGKILL (Slurm's KillWait,
+#: Kubernetes' grace period, a preemptible cloud VM), so 20 leaves time to
+#: write the checkpoint. Set by the environment variable below, for a
+#: platform that allows more or less.
+DEFAULT_STOP_GRACE_SECONDS = 20.0
+STOP_GRACE_ENV = "FASTMDX_STOP_GRACE_SECONDS"
+
+#: While a stop can be asked for, no single call into OpenMM runs longer than
+#: this, because a signal is only noticed between calls.
+STOP_NOTICE_SECONDS = 5.0
+
+#: The refusal a stopped run ends with; retryable, so resume carries it on.
+STOPPED_CODE = "simulation.run.stopped"
+
+#: A second SIGTERM this soon after the first is the same request arriving
+#: twice, not a second request: one sent to a process group and the one the
+#: parent of a parallel study passes on both reach its workers. Not Ctrl-C,
+#: which a terminal sends to the whole group itself, so the parent does not
+#: pass it on, and pressed twice, however quickly, means stop now.
+STOP_REPEAT_SECONDS = 2.0
+
+#: When this process was first asked to stop, shared by everything here that
+#: listens, so the request is counted once whichever of them hears it.
+_first_stop_at: float | None = None
+#: Whether a Ctrl-C (SIGINT) was among the stops heard.
+_ctrl_c_heard = False
+#: The signal of the first stop heard (SIGTERM for the GUI's Stop), so a
+#: stop now is named by both it took (`StopNow.said`).
+_first_stop_signal: int | None = None
+#: How many stops now this process has raised (`_a_stop_now`), and the
+#: signals of the last, so what records a phase it ended as stopped
+#: (`orchestrator._run_phase`) can be told it was one and let it on
+#: (`BatchExplorer._report_again`). Counted, not held: the exception
+#: held its frames, a study's, for the life of the process.
+_stops_now = 0
+_last_stop_now_signals: tuple[int, int] | None = None
+
+
+class StopNow(KeyboardInterrupt):
+    """A second stop obeyed at once (`_stop_now`), carrying the signal that
+    asked it: a stop asked, which a run's phase, its study's rounds and the
+    study record as such, named by that signal (a second SIGTERM was
+    recorded as Ctrl+C). A KeyboardInterrupt, so what no listener here
+    handles ends as one did; a bare KeyboardInterrupt, which no listener
+    heard, is not a stop asked, and keeps its meaning (a round it reaches
+    is cut, as a kill leaves it)."""
+
+    def __init__(self, number: int, first: int | None = None) -> None:
+        super().__init__(number)
+        self.number = int(number)
+        #: The first of the two stops it took (a Ctrl-C, then a SIGTERM).
+        self.first = int(first) if first is not None else self.number
+
+    @property
+    def signal_name(self) -> str:
+        return _signal_said(self.number, ctrl_c=False)
+
+    def said(self) -> str:
+        """The two stops it took, as a person reads them: "SIGTERM twice",
+        "Ctrl+C twice", or "Ctrl+C, then SIGTERM" where they differed (a
+        Ctrl-C then a SIGTERM was named by the last alone)."""
+        if self.first == self.number:
+            return f"{_signal_said(self.number)} twice"
+        return f"{_signal_said(self.first)}, then {_signal_said(self.number)}"
+
+
+def _signal_said(number: int, *, ctrl_c: bool = True) -> str:
+    import signal as _signal
+
+    if ctrl_c and number == _signal.SIGINT:
+        return "Ctrl+C"
+    try:
+        return _signal.Signals(number).name
+    except ValueError:
+        return f"signal {number}"
+
+
+def stop_said(stopped: BaseException) -> str:
+    """How a stop that ended something is named to a person: "Ctrl+C" for
+    SIGINT, or a bare KeyboardInterrupt, else its signal."""
+    import signal as _signal
+
+    if isinstance(stopped, StopNow) and stopped.number != _signal.SIGINT:
+        return stopped.signal_name
+    return "Ctrl+C"
+
+
+def _listen_afresh() -> None:
+    """Forget an earlier stop: a new run, or its production, is starting.
+    Not where the study in this process has heard one (`_StopInTheStudy`):
+    the count is the study's, never reset inside it, so a second stop is
+    obeyed at once wherever it lands (a run's report written again after
+    the rule's last round forgot the first, and the second was dropped)."""
+    global _first_stop_at, _ctrl_c_heard, _first_stop_signal
+    if any(isinstance(listener, _StopInTheStudy) and listener.signal is not None
+           for listener in list(_LISTENING)):
+        return
+    _first_stop_at = None
+    _ctrl_c_heard = False
+    _first_stop_signal = None
+
+
+def _a_stop_asked_here() -> None:
+    """A stop asked without a signal (the GUI's Stop in this process),
+    counted as a first SIGTERM is: a Ctrl-C after it is the stop under way,
+    and a second one means now. Not counted, a Ctrl-C after the GUI's Stop
+    stopped a run at once, before its frame."""
+    import time
+
+    global _first_stop_at, _ctrl_c_heard, _first_stop_signal
+    if _first_stop_at is None:
+        import signal as _signal
+
+        _first_stop_at = time.monotonic()
+        _ctrl_c_heard = False
+        _first_stop_signal = _signal.SIGTERM
+
+
+#: Said where a Ctrl-C is the stop under way (`_a_stop_heard`'s "again"
+#: for a Ctrl-C), by the study's process and a run's production: nothing
+#: said, a person pressed again, and that meant now.
+CTRL_C_UNDER_WAY = ("Ctrl+C received: the stop asked already is under way (a run still in "
+                    "production ends at its next frame; after a broken pool, the run whose "
+                    "worker was killed has ended already). Press Ctrl+C again to stop now.")
+
+
+#: Set in a worker of a parallel study's pool: its parent says the stop
+#: lines, once, and the workers say none of what a person reads.
+_IN_A_POOL_WORKER = False
+#: The terminal while a run's output goes to its own log (`_QuietBanner`
+#: of a study of several runs, one after another): a stop's lines are said
+#: there too, where the person who asked reads.
+_TERMINAL_FD: int | None = None
+#: Held to read and write that terminal, and to give it back: the GUI's
+#: Stop, in a thread of its own, wrote to a descriptor the run had closed,
+#: or one since handed to another file. Reentrant, as a signal's listener
+#: may say a line on the thread that holds it.
+_TERMINAL_LOCK = _threading.RLock()
+
+
+def _say_stop(text: str) -> None:
+    """A stop's line: logged, and said on the terminal where a run's output
+    goes to its log. Not in a pool worker, whose parent says it."""
+    import os as _os
+
+    if _IN_A_POOL_WORKER:
+        return
+    logger.warning("%s", text)
+    with _TERMINAL_LOCK:
+        terminal = _TERMINAL_FD
+        if terminal is not None:
+            try:
+                _os.write(terminal, (text + "\n").encode("utf-8", "replace"))
+            except OSError:
+                pass
+
+
+def _the_study_of(folder: Any) -> str:
+    """The study a listener's folder is of, as `fastmdx resume` takes it: a
+    run of a study of several (``runs/<run>``), or a piece of one
+    (``segment-NNN``), is resumed by its study. Decided by the study's own
+    records, its batch manifest naming the run, never by a folder's name: a
+    study of one run is its own folder, and one in a folder named
+    ``runs`` was taken for a run of the folder above."""
+    from pathlib import Path as _Path
+
+    if not folder:
+        return ""
+    here = _Path(folder)
+    if here.name.startswith("segment-"):
+        here = here.parent
+    if here.parent.name == "runs" and _names_the_run(here.parent.parent, here.name):
+        here = here.parent.parent
+    return str(here)
+
+
+def _names_the_run(study: Any, run: str) -> bool:
+    """Whether ``study``'s batch manifest names ``run`` among its runs, planned
+    or ended."""
+    try:
+        manifest = json.loads((Path(study) / "batch_manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(manifest, dict):
+        return False
+    named = [entry for key in ("planned", "runs")
+             for entry in (manifest.get(key) if isinstance(manifest.get(key), list) else [])]
+    return any(isinstance(entry, dict) and str(entry.get("run_id")) == run for entry in named)
+
+
+def _stop_now(number: int) -> None:
+    """A second stop obeyed at once. In the study's own process it is raised
+    as :class:`StopNow`, whatever the signal, so the study's records say it
+    stopped when asked, by that signal, before it ends (a SIGTERM ended it
+    there and then, its round's record left "running"); a pool worker ends
+    as the signal would end it, its parent saying the rest."""
+    import os as _os
+    import signal as _signal
+
+    if number == _signal.SIGINT or not _IN_A_POOL_WORKER:
+        now = _a_stop_now(number)
+        raise now
+    _os.kill(_os.getpid(), number)
+
+
+def _a_stop_now(number: int) -> StopNow:
+    """The :class:`StopNow` to raise for ``number``, counted (`_stops_now`),
+    and every study and round listening here told it is under way: a
+    further stop is that one, and says nothing (a third stop was another
+    stop now, said twice, and cut the study's records as they were
+    written)."""
+    global _stops_now, _last_stop_now_signals
+    now = StopNow(number, first=_first_stop_signal)
+    _stops_now += 1
+    _last_stop_now_signals = (now.number, now.first)
+    for listener in list(_LISTENING):
+        if isinstance(listener, _StopInTheRounds):
+            listener.now_under_way = True
+    return now
+
+
+def _the_last_stop_now() -> StopNow:
+    """The last stop now raised here (`_a_stop_now`), raised again where what
+    it ended took it as its own."""
+    import signal as _signal
+
+    number, first = _last_stop_now_signals or (_signal.SIGINT, _signal.SIGINT)
+    return StopNow(number, first=first)
+
+
+def _a_stop_now_absorbed(before: int, what: str = "the run", *,
+                         next_: str = "the study writes its records and comparison") -> None:
+    """A stop now raised since ``before`` (`_stops_now`) that what it
+    ended took as its own (a run's phase recorded it, `orchestrator._run_phase`;
+    a round's extension, `resume.extend_study`) while the study goes on: no
+    longer under way, so a further stop is a stop now again, and ends the
+    study, and said so (its line had said the study ends at once). Left
+    under way, every further stop was ignored while the study finished,
+    minutes perhaps, and only a kill ended it."""
+    if _stops_now == before:
+        return
+    under_way = [listener for listener in list(_LISTENING)
+                 if isinstance(listener, _StopInTheRounds) and listener.now_under_way]
+    for listener in under_way:
+        listener.now_under_way = False
+    if under_way:
+        _say_stop(f"Stopped at once: {what} ends where `fastmdx resume` carries it on, and "
+                  f"{next_}. A further stop ends it at once.")
+
+
+def stop_now_said(number: int) -> str:
+    """How a first stop's line says to stop now: a Ctrl-C after a SIGTERM
+    is the same stop, so after one it takes two."""
+    import signal as _signal
+
+    return ("Press Ctrl+C again to stop now." if number == _signal.SIGINT
+            else "Send SIGTERM again, or press Ctrl+C twice, to stop now.")
+
+
+def _a_stop_heard(number: int | None = None) -> str:
+    """How a stop signal arriving now is to be taken.
+
+    ``"first"`` for the first; ``"again"`` for the same SIGTERM delivered
+    twice within :data:`STOP_REPEAT_SECONDS`; ``"now"`` for a later one, or
+    a second Ctrl-C, which means stop at once. A first Ctrl-C after a
+    SIGTERM is ``"again"``: the stop it asks is the one under way. A worker
+    of a broken pool has the pool's SIGTERM before a person's Ctrl-C reaches
+    its group, and took that Ctrl-C as stop now, losing the save at its
+    frame; two Ctrl-C still mean now.
+    """
+    import signal as _signal
+    import time
+
+    global _first_stop_at, _ctrl_c_heard, _first_stop_signal
+    now = time.monotonic()
+    ctrl_c = number == _signal.SIGINT
+    if _first_stop_at is None:
+        _first_stop_at = now
+        _ctrl_c_heard = ctrl_c
+        _first_stop_signal = number
+        return "first"
+    if ctrl_c:
+        if _ctrl_c_heard:
+            return "now"
+        _ctrl_c_heard = True
+        return "again"
+    return "again" if now - _first_stop_at < STOP_REPEAT_SECONDS else "now"
+
+
+def stop_grace_seconds() -> float:
+    """The grace period, from the environment or the default."""
+    import os as _os
+
+    try:
+        value = float(_os.environ.get(STOP_GRACE_ENV, DEFAULT_STOP_GRACE_SECONDS))
+    except ValueError:
+        return DEFAULT_STOP_GRACE_SECONDS
+    return max(0.0, value)
+
+
+class _StopRequests:
+    """SIGTERM and SIGINT during production, noted rather than obeyed at once.
+
+    A second signal is obeyed at once, as the first would have been: a
+    person pressing Ctrl-C twice means now. Installed only on the main
+    thread, the only one Python lets set a handler; elsewhere a run keeps
+    the old behaviour.
+    """
+
+    def __init__(self, folder: Any = None) -> None:
+        #: The study whose production this is, so a stop asked without a
+        #: signal reaches this one (`stop_what_listens_here`).
+        self.folder = folder
+        self.signal: int | None = None
+        #: Asked without a signal, by the GUI in this process.
+        self.asked_here = False
+        #: Asked before this production began (the study's round noted it):
+        #: it takes no step.
+        self.before_it_began = False
+        self.at_step: int | None = None
+        self.on_frame = False
+        self._previous: dict[int, Any] = {}
+
+    @property
+    def requested(self) -> bool:
+        return self.signal is not None
+
+    @property
+    def name(self) -> str:
+        import signal as _signal
+
+        if self.asked_here:
+            return "GUI"
+        try:
+            return _signal.Signals(self.signal).name
+        except (ValueError, TypeError):
+            return f"signal {self.signal}"
+
+    def __enter__(self) -> "_StopRequests":
+        import signal as _signal
+        import threading
+
+        _LISTENING.append(self)
+        if threading.current_thread() is not threading.main_thread():
+            return self
+        _listen_afresh()
+        for number in (_signal.SIGTERM, _signal.SIGINT):
+            try:
+                self._previous[number] = _signal.signal(number, self._note)
+            except (ValueError, OSError):  # pragma: no cover - a platform without it
+                continue
+        # A stop the study's round noted before this production began (a
+        # catch-up piece's start): it stops at its first frame.
+        pending = next((listener for listener in reversed(_LISTENING[:-1])
+                        if isinstance(listener, _StopInTheRounds)
+                        and listener.signal is not None), None)
+        if pending is not None and self.signal is None:
+            self.signal, self.asked_here = pending.signal, pending.asked_here
+            self.before_it_began = True
+            # Still the one stop: a Ctrl-C now is it under way.
+            global _first_stop_at, _ctrl_c_heard, _first_stop_signal
+            import time
+
+            if _first_stop_at is None:
+                # Counted afresh; left as it is where the study counts it already.
+                _first_stop_at = time.monotonic()
+                _ctrl_c_heard = pending.signal == _signal.SIGINT and not pending.asked_here
+                _first_stop_signal = pending.signal
+            #: The study whose round noted it: its resume carries the round on.
+            self.study = pending.folder
+        return self
+
+    def _note(self, number: int, _frame: Any) -> None:
+        import signal as _signal
+
+        heard = _a_stop_heard(number)
+        if heard == "again" or (heard == "first" and self.signal is not None):
+            if number == _signal.SIGINT:
+                _say_stop(CTRL_C_UNDER_WAY)
+            return
+        if heard == "first":
+            self.signal = number
+            _say_stop(
+                f"{self.name} received: production will stop at the next frame, where it "
+                f"can be carried on, if that can be reached within {stop_grace_seconds():.0f} "
+                f"s. {stop_now_said(number)}")
+            return
+        _say_stop(f"Stopping now: the run ends at once; `fastmdx resume "
+                  f"{_the_study_of(self.folder)}` carries it on from its last checkpoint.")
+        self._restore()
+        _stop_now(number)
+
+    def _restore(self) -> None:
+        import signal as _signal
+
+        for number, previous in self._previous.items():
+            try:
+                _signal.signal(number, previous)
+            except (ValueError, OSError, TypeError):  # pragma: no cover
+                pass
+        self._previous = {}
+
+    def __exit__(self, *_exc: Any) -> bool:
+        if self in _LISTENING:
+            _LISTENING.remove(self)
+        self._restore()
+        _the_study_heard(self)
+        return False
+
+    def ask_here(self) -> str:
+        return _asked_here(self)
+
+
+class _StopInTheRounds(_StopRequests):
+    """SIGTERM and SIGINT while a study's stopping rule judges and extends
+    its runs, outside a run's production (a piece's join and analyses,
+    between runs, a catch-up piece's start), noted rather than obeyed at
+    once, as production notes them: the round ends stopped when asked once
+    the run it extends has answered, and a production begun after the stop
+    stops at its first frame. A KeyboardInterrupt raised there recorded the
+    round cut, or was lost where Python ignores it (in a weakref callback),
+    and the study ran on. A second is obeyed at once, and any after it is
+    that one (``now_under_way``), until it ends."""
+
+    #: A stop now is under way (`_a_stop_now`): a further stop says nothing.
+    now_under_way = False
+    #: The rule's decision is said (`stopping.run_until_known`): every run
+    #: has ended, and a first stop ends no round.
+    decided = False
+
+    def _note(self, number: int, _frame: Any) -> None:
+        import signal as _signal
+
+        if self.now_under_way:
+            return
+        heard = _a_stop_heard(number)
+        if heard == "again" or (heard == "first" and self.signal is not None):
+            if number == _signal.SIGINT:
+                _say_stop(CTRL_C_UNDER_WAY)
+            return
+        if heard == "first":
+            self.signal = number
+            if self.decided:
+                _say_stop(f"{self.name} received: its stopping rule has decided, every run has "
+                          "ended, and the study finishes writing its reports and comparison. "
+                          f"{stop_now_said(number)}")
+                return
+            _say_stop(
+                f"{self.name} received: the study's round ends once the run it extends has "
+                f"answered, where `fastmdx resume` carries it on. {stop_now_said(number)}")
+            return
+        _say_stop(f"Stopping now: the study's round ends at once; `fastmdx resume "
+                  f"{_the_study_of(self.folder)}` carries it on from its last checkpoints.")
+        self._listening_on_until_it_ends()
+        _stop_now(number)
+
+    def _listening_on_until_it_ends(self) -> None:
+        """After a stop now, still listening, silent, until this listener
+        ends: Python's own handlers put back, a fourth SIGTERM ended the
+        process (143) and a fourth Ctrl-C raised a bare KeyboardInterrupt.
+        Not in a pool worker, which ends by the signal itself."""
+        if _IN_A_POOL_WORKER:
+            self._restore()
+
+
+    def ask_here(self) -> str:
+        """Asked to stop without a signal (the GUI in this process), as a
+        first SIGTERM asks, said as the rounds stop: no production need be
+        running (a join, between runs)."""
+        import signal as _signal
+
+        if self.signal is not None:
+            return "Stopping: asked already."
+        self.signal, self.asked_here = _signal.SIGTERM, True
+        _a_stop_asked_here()
+        _say_stop("Stop asked from the GUI: the study's round ends once the run it "
+                  "extends has answered, where `fastmdx resume` carries it on.")
+        return ("Stopping: the study's round ends once the run it extends has answered, "
+                "and `fastmdx resume` carries it on.")
+
+
+#: Set by the CLI's command (`cli.main.main`) while it runs: a study that
+#: heard a stop notes it (`_A_STUDY_HEARD_A_STOP`), and once the command's
+#: work is done (`_quiet_if_a_study_heard_a_stop`) a further stop is the
+#: stop under way (`_quiet_once_stopped`).
+_QUIET_ONCE_STOPPED = False
+#: A study of the command heard a stop (`_StopInTheStudy.__exit__`).
+_A_STUDY_HEARD_A_STOP = False
+#: Whether the last study in this process heard a stop, set as it ends
+#: (`_StopInTheStudy.__exit__`), whoever called it.
+_THE_LAST_STUDY_HEARD_A_STOP = False
+#: In the environment, so a pool's workers read it too, while a study with
+#: a budget runs its setup stage and its pricing (`agent.staged`): what runs
+#: it again, said in place of `fastmdx resume` by its stop lines, which ran
+#: setup alone there and read the study finished.
+RUN_AGAIN_BEFORE_ITS_PRICE = "FASTMDXPLORA_RUN_AGAIN_BEFORE_ITS_PRICE"
+
+
+def _run_again() -> dict[str, Any]:
+    import os
+
+    given = os.environ.get(RUN_AGAIN_BEFORE_ITS_PRICE) or ""
+    try:
+        said = json.loads(given) if given else {}
+    except ValueError:
+        said = {"said": given}
+    return said if isinstance(said, dict) else {}
+
+
+def run_again_before_its_price() -> str | None:
+    """What runs the study again, where its setup stage and pricing run
+    (`RUN_AGAIN_BEFORE_ITS_PRICE`), as a clause; else None."""
+    return str(_run_again().get("said") or "") or None
+
+
+def run_again_argv() -> list[str]:
+    """The command that runs it again there, as the arguments after
+    `fastmdx`: none where the study was not run from a command line."""
+    return [str(word) for word in _run_again().get("argv") or []]
+
+
+def run_again_cwd() -> str:
+    """Where that command was run from, so its paths, as typed, mean what
+    they meant there: "" where there is no command."""
+    return str(_run_again().get("cwd") or "")
+
+
+#: A study of the command said its summary once asked to stop, with what
+#: carries it on (`BatchExplorer._print_summary`): a further stop then
+#: says nothing more (`cli.main`).
+_ITS_STOP_SAID = False
+
+
+def _quiet_if_a_study_heard_a_stop() -> None:
+    """Quiet for the rest of the command (`_quiet_once_stopped`), where one
+    of its studies heard a stop: called once the command's work is done
+    (`cli.main._then_quiet_once_stopped`), not as each study ends. As a
+    study ended, the work after it (a resume's join, a budget's pricing,
+    a second study) ran with SIGINT and SIGTERM ignored."""
+    if _QUIET_ONCE_STOPPED and _A_STUDY_HEARD_A_STOP:
+        _quiet_once_stopped()
+
+
+class StoppedAgain(KeyboardInterrupt):
+    """A further stop once the command's study heard one
+    (`_stopped_when_asked_again`), carrying its signal: a bare
+    KeyboardInterrupt was said "(Ctrl+C)" for a SIGTERM."""
+
+    def __init__(self, number: int) -> None:
+        super().__init__(number)
+        self.number = int(number)
+
+    def said(self) -> str:
+        return _signal_said(self.number)
+
+
+def _stopped_when_asked_again(number: int, _frame: Any) -> None:
+    """A further stop once the command's study heard one, until its work is
+    done: a KeyboardInterrupt (:class:`StoppedAgain`), which the command
+    says "stopped when asked" and exits 130 for. A SIGTERM after a resume's
+    summary, as it read its runs' records, ended the process by the signal
+    (143)."""
+    raise StoppedAgain(number)
+
+
+def _a_further_stop_ends_the_command() -> None:
+    """SIGINT and SIGTERM raise KeyboardInterrupt (`_stopped_when_asked_again`)
+    for the rest of the command's work, its study having heard a stop; then
+    quiet (`_quiet_if_a_study_heard_a_stop`), and the command's own handlers
+    put back as `cli.main.main` returns."""
+    import signal as _signal
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for number in (_signal.SIGINT, _signal.SIGTERM):
+        try:
+            _signal.signal(number, _stopped_when_asked_again)
+        except (ValueError, OSError):  # pragma: no cover - a platform without it
+            continue
+
+
+def _quiet_once_stopped() -> None:
+    """SIGINT and SIGTERM ignored for the rest of the command, its study
+    stopped and recorded: a stop after its summary is the stop under way."""
+    import signal as _signal
+    import threading
+
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for number in (_signal.SIGINT, _signal.SIGTERM):
+        try:
+            _signal.signal(number, _signal.SIG_IGN)
+        except (ValueError, OSError):  # pragma: no cover - a platform without it
+            continue
+
+
+class _StopInTheStudy(_StopInTheRounds):
+    """SIGTERM and SIGINT to a study's own process for the whole of it
+    (`BatchExplorer.run`), wherever nothing nearer listens: its first
+    pieces, between its runs, before and after its rounds, while its
+    comparison and summary are written. A second stop at any of these ended
+    the process (a SIGTERM's 143) with its records left "running". A stop a
+    nearer listener noted is noted here as it ends (`_the_study_heard`).
+
+    A first stop noted where no run is going: no further run starts, and a
+    production or a round begun after it stops at once where it can be
+    carried on (`_StopRequests.__enter__`). Where a run is going outside
+    its production (``in_a_run``), that run's phase ends there as the stop
+    it is, which `fastmdx resume` runs again: a Ctrl-C as one with no
+    listener (a KeyboardInterrupt), a SIGTERM as a pool worker's
+    (`RunStopped`). A second is obeyed at once (:class:`StopNow`). Not asked
+    by the GUI in this process (`_listener_for`)."""
+
+    #: A run of the study is going in this process (one after another).
+    in_a_run = False
+    #: What the study is doing where no run goes, as a first stop says what
+    #: it does: "preparation" (one preparation shared by its windows, which
+    #: goes on), "finishing" (every run ended: its reports and comparison
+    #: are written, and nothing is left to resume), or None (between runs).
+    stage: str | None = None
+
+    def _note(self, number: int, _frame: Any) -> None:
+        import signal as _signal
+
+        if self.now_under_way:
+            return
+        heard = _a_stop_heard(number)
+        if heard == "again" or (heard == "first" and self.signal is not None):
+            if number == _signal.SIGINT:
+                _say_stop(CTRL_C_UNDER_WAY)
+            return
+        again = run_again_before_its_price()
+        if heard == "first":
+            self.signal = number
+            if self.in_a_run:
+                _say_stop(f"{self.name} received: the run ends in the phase it is in, "
+                          + (f"and no further run starts; {again}. " if again else
+                             "which `fastmdx resume` runs again, and no further run starts. ")
+                          + stop_now_said(number))
+                if number == _signal.SIGINT:
+                    raise KeyboardInterrupt
+                from fastmdxplora.refusals import RunStopped
+
+                raise RunStopped(self.name)
+            _say_stop(f"{self.name} received: " + {
+                "preparation": "the shared preparation goes on to its end, and no run "
+                               "starts after it; " + (f"{again}." if again else
+                                                      "`fastmdx resume` runs them."),
+                "finishing": "every run has ended, and the study finishes writing its "
+                             "reports and comparison.",
+            }.get(self.stage, f"no further run starts, and the study ends; {again}." if again
+                  else "no further run starts, and the study ends where "
+                       "`fastmdx resume` carries it on.")
+                + f" {stop_now_said(number)}")
+            return
+        _say_stop(f"Stopping now: the study ends at once; {again}." if again else
+                  f"Stopping now: the study ends at once; `fastmdx resume "
+                  f"{_the_study_of(self.folder)}` carries it on from its last checkpoints.")
+        self._listening_on_until_it_ends()
+        _stop_now(number)
+
+    def __enter__(self) -> "_StopInTheStudy":
+        global _ITS_STOP_SAID
+        # A new study: what an earlier one's summary said is not of this one.
+        _ITS_STOP_SAID = False
+        super().__enter__()
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        global _A_STUDY_HEARD_A_STOP, _THE_LAST_STUDY_HEARD_A_STOP
+        # Whatever the caller (the Agent, a notebook): a stop heard as the
+        # study ended leaves every run of it ok (`agent.staged`).
+        _THE_LAST_STUDY_HEARD_A_STOP = self.signal is not None
+        if _QUIET_ONCE_STOPPED and self.signal is not None:
+            # Put back as the raising handler, not the command's own and
+            # then it: a SIGTERM between the two ended the process (143).
+            for number in self._previous:
+                self._previous[number] = _stopped_when_asked_again
+        super().__exit__(*exc)
+        if _QUIET_ONCE_STOPPED and self.signal is not None:
+            _A_STUDY_HEARD_A_STOP = True
+            _a_further_stop_ends_the_command()
+        return False
+
+
+def _the_study_heard(listener: Any) -> None:
+    """A stop ``listener`` noted, noted by the study it is of as that listener
+    ends (`_StopInTheStudy`), where the study has none: what the study does
+    after it (its next run, its rounds) is asked to stop as well."""
+    number = getattr(listener, "signal", None)
+    if number is None or number < 0 or isinstance(listener, _StopInTheStudy):
+        return
+    study = next((one for one in reversed(list(_LISTENING))
+                  if isinstance(one, _StopInTheStudy)), None)
+    if study is not None and study.signal is None:
+        study.signal, study.asked_here = number, bool(getattr(listener, "asked_here", False))
+
+
+def listening_for_the_study(folder: Any) -> Any:
+    """The listener for the whole of the study at ``folder`` (`_StopInTheStudy`),
+    as a context; one that listens for nothing in a worker of a parallel
+    study's pool, whose own listener stops its run, and within what listens
+    already (a run's extension in its study's round, whose listener notes a
+    stop in its join and stops its production at its first frame)."""
+    from contextlib import nullcontext
+
+    if _IN_A_POOL_WORKER or _LISTENING:
+        return nullcontext(None)
+    return _StopInTheStudy(folder=folder)
+
+
+def a_stop_asked_in_the_rounds() -> bool:
+    """Whether a stop was asked while the study's rule extends its runs
+    (`_StopInTheRounds`): no further run's extension is begun."""
+    return any(isinstance(listener, _StopInTheRounds) and listener.signal is not None
+               for listener in list(_LISTENING))
+
+
+#: What in this process listens for a stop now, newest last: a production
+#: (`_StopRequests`), or the parent of a parallel study (its `_StudyStop`).
+#: Each has ``folder``, its study, and ``ask_here()``, which asks it to stop
+#: as a first SIGTERM does, without a signal, and says how it will stop.
+_LISTENING: list[Any] = []
+
+
+def _asked_here(stop: "_StopRequests") -> str:
+    import signal as _signal
+
+    if stop.signal is not None:
+        return "Stopping: asked already."
+    stop.signal = _signal.SIGTERM
+    stop.asked_here = True
+    _a_stop_asked_here()
+    _say_stop(
+        "Stop asked from the GUI: production will stop at the next frame, where it "
+        f"can be carried on, if that can be reached within {stop_grace_seconds():.0f} s.")
+    return ("Stopping: production ends at its next frame with a checkpoint there, "
+            "and `fastmdx resume` carries it on.")
+
+
+def stop_what_listens_here(root: Any = None) -> str | None:
+    """Ask what in this process listens for a stop, for the study at
+    ``root`` (or within it), to stop as SIGTERM asks, without a signal: for
+    the GUI of `fastmdx explore --dashboard`, which runs in the run's own
+    process and must not signal it. What it said, where something listens;
+    None where nothing does (a phase outside production), and nothing is
+    asked."""
+    listener = _listener_for(root)
+    return None if listener is None else listener.ask_here()
+
+
+def listens_here(root: Any = None) -> bool:
+    """Whether something in this process listens for a stop of the study at
+    ``root`` (`stop_what_listens_here`), asking nothing."""
+    return _listener_for(root) is not None
+
+
+def _listener_for(root: Any) -> Any:
+    import os as _os
+
+    def within(folder: Any) -> bool:
+        # One of no known study is not taken for the study named.
+        if root is None:
+            return True
+        if folder is None:
+            return False
+        there, here = _os.path.realpath(folder), _os.path.realpath(root)
+        return there == here or there.startswith(here.rstrip(_os.sep) + _os.sep)
+
+    for listener in reversed(list(_LISTENING)):
+        # The study's own (`_StopInTheStudy`) hears signals only: the GUI in
+        # the run's process is refused outside production, as it was, and
+        # says where to stop the run, never "Stopping" where nothing stops.
+        if isinstance(listener, _StopInTheStudy):
+            continue
+        if within(getattr(listener, "folder", None)):
+            return listener
+    return None
+
+
+def _cap_for_stopping(chunk: int, done: int, elapsed: float) -> int:
+    """A chunk short enough that a stop is noticed within STOP_NOTICE_SECONDS."""
+    if done <= 0 or elapsed <= 0:
+        return chunk
+    return max(1, min(chunk, int(STOP_NOTICE_SECONDS * done / elapsed)))
+
+
+def _step_to_a_frame(simulation: Any, stop: _StopRequests, *, done: int,
+                     frame_interval: int | None, elapsed: float,
+                     limit: int | None = None) -> int:
+    """Steps taken to reach the next frame, after a stop was asked for.
+
+    None taken where the frame is further than the grace period allows, or
+    lies past the ``limit`` steps left of production: the last interval
+    checkpoint then stands, and the run says so.
+    """
+    stop.at_step = done
+    interval = int(frame_interval or 0)
+    if interval <= 0:
+        stop.on_frame = False
+        return 0
+    to_go = (-done) % interval
+    if to_go == 0:
+        stop.on_frame = True
+        return 0
+    seconds = to_go * elapsed / done if done > 0 and elapsed > 0 else float("inf")
+    if (limit is not None and to_go > int(limit)) or seconds > stop_grace_seconds():
+        stop.on_frame = False
+        return 0
+    simulation.step(to_go)
+    stop.at_step = done + to_go
+    stop.on_frame = True
+    return to_go
+
+
+def _end_the_stopped_run(simulation: Any, stop: _StopRequests, *,
+                         checkpoint: Path, sidecar: dict[str, Any],
+                         planned_steps: int, trajectory_interval_steps: int | None,
+                         timestep_fs: float) -> None:
+    """Write the checkpoint a stopped run is carried on from, and end it.
+
+    Raises the retryable refusal a resume reads as an interruption. A stop
+    landing at or past the run's planned end (in its last frame interval)
+    ends a run whose production is whole: its sidecar says it finished, and
+    its live record says production completed, the run stopped (the
+    exception's ``finished``), so the join and every page read the piece
+    as whole. It still raises, so the study stops where it was asked to.
+    """
+    from fastmdxplora.refusals import StudyError
+
+    step = int(stop.at_step or 0)
+    whole = bool(stop.on_frame) and 0 < int(planned_steps) <= step
+    done_ns = step * float(timestep_fs) / 1e6
+    planned_ns = int(planned_steps) * float(timestep_fs) / 1e6
+    frame = step // int(trajectory_interval_steps) if trajectory_interval_steps else None
+    where = checkpoint.parent.parent
+    if step == 0 and getattr(stop, "before_it_began", False):
+        said = ("It was asked before its first step, so nothing of it is saved; `fastmdx "
+                f"resume {getattr(stop, 'study', None) or where}` carries the study's round "
+                "on, this run from the piece before it.")
+    elif stop.on_frame and step > 0:
+        _write_checkpoint_set(simulation, checkpoint, dict(
+            step=step, finished=whole, time_ps=_time_ps(simulation), **sidecar))
+        said = (f"Its production had reached its end, so the run is whole; `fastmdx "
+                f"resume {where}` goes on from there." if whole else
+                f"A checkpoint was written on frame {frame}, so `fastmdx resume "
+                f"{where}` carries it on from there, and the joined trajectory "
+                "keeps its spacing.")
+    else:
+        said = ("The next frame was further than the "
+                f"{stop_grace_seconds():.0f} s allowed ({STOP_GRACE_ENV}), so the "
+                "last interval checkpoint stands; `fastmdx resume "
+                f"{where}` carries the run on from it, running again the steps "
+                "after it.")
+    from fastmdxplora.simulation.sampling_ask import length_said
+
+    error = StudyError(
+        f"Production was stopped by {_who_asked(stop.name)} at step {step:,} "
+        f"({length_said(done_ns)} of {length_said(planned_ns)}). {said}",
+        code=STOPPED_CODE,
+        details={"signal": stop.name, "step": step,
+                 "checkpoint_on_frame": bool(stop.on_frame and step > 0)})
+    #: Production whole: said completed in its live record, with its frames
+    #: and its length (steps times the timestep, as a run that ended says it).
+    error.finished, error.frames = whole, frame
+    error.duration_ns = done_ns if whole else None
+    raise error
+
+
+def _who_asked(signal_name: str) -> str:
+    """A stop by what asked for it: Stop in the GUI, a scheduler and `kill`
+    all send SIGTERM, which the page said as "stopped by SIGTERM"."""
+    return {"SIGINT": "Ctrl+C",
+            "SIGTERM": "a request to stop (SIGTERM)",
+            "GUI": "a request to stop from the GUI"}.get(signal_name, signal_name)
+
+
+def _attach_checkpoint_reporter(
+    omm: dict, simulation: Any, chk_path: Path, *, interval: int,
+    sidecar: dict[str, Any] | None = None,
+) -> Any:
+    """Attach a binary CheckpointReporter for crash recovery / restart.
+
+    OpenMM writes a portable ``.chk`` file every ``interval`` steps.
+
+    A study stopped part-way is carried on from its last checkpoint by
+    `fastmdx resume` (``simulation/resume.py``). The positions and velocities
+    come back; a biasing state does not, which is why only a study that
+    `segmentability` allows is continued: an unbiased run, or an umbrella
+    window, whose restraint does not depend on time. A metadynamics run
+    resumed without ``RESTART`` would begin again from zero bias in a well it
+    had already filled, and a steered pull places its restraint by absolute
+    step, so both are refused rather than resumed. The continuation is
+    recorded as a segment of the study, and the joined trajectory says where
+    the pieces meet.
+
+    Skipped cleanly when ``interval <= 0``.
+    """
+    if interval <= 0:
+        return None
+    chk_path.parent.mkdir(parents=True, exist_ok=True)
+    reporter = omm["CheckpointReporter"](str(chk_path), interval)
+    if sidecar is not None:
+        # Each time OpenMM writes the checkpoint, the sidecar is written
+        # with the step it was taken at, so the file can say what it is.
+        inner = reporter
+
+        class _WithSidecar:
+            def describeNextReport(self, sim):  # noqa: N802 - OpenMM API
+                return inner.describeNextReport(sim)
+
+            def report(self, sim, state):
+                # Sealed as it is written, not only at a clean finish: the
+                # seal says the file is whole, as true of a checkpoint at
+                # step 2,000 as of the last one. Written as one set with
+                # its sidecar (`_write_checkpoint_set`).
+                _write_checkpoint_set(sim, chk_path, dict(
+                    step=int(sim.currentStep), finished=False, time_ps=_time_ps(sim),
+                    **sidecar))
+
+        reporter = _WithSidecar()
+    simulation.reporters.append(reporter)
+    return reporter
+
+
+def _close_one_reporter(simulation: Any, reporter: Any) -> None:
+    """Close and remove a single reporter, leaving the rest attached.
+
+    Not `_detach_all_reporters`: that one is the cleanup path, it belongs in
+    a `finally`, and there is a test asserting it sits there. Closing the
+    equilibration log when production begins is a different act with a
+    different meaning, and giving it the same name would have made the two
+    indistinguishable to anybody reading -- including that test.
+    """
+    if reporter is None:
+        return
+    _close_the_file_of(reporter)
+    try:
+        simulation.reporters.remove(reporter)
+    except ValueError:
+        pass
+
+
+def _close_the_file_of(reporter: Any) -> None:
+    """Close the file a reporter writes to, where the reporter opened it.
+
+    OpenMM's own reporters have no close(), so a reporter's `close` alone
+    closed nothing for them: the equilibration log, taken off when production
+    began, kept its file open until the reporter was collected, which in a
+    study of several runs in one process was never, one file per run.
+    """
+    import sys as _sys
+
+    close = getattr(reporter, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    borrowed = {id(stream) for stream in (_sys.stdout, _sys.stderr,
+                                          _sys.__stdout__, _sys.__stderr__)}
+    out = getattr(reporter, "_out", None)
+    opened_here = getattr(reporter, "_openedFile", True)
+    if (out is not None and opened_here and id(out) not in borrowed
+            and callable(getattr(out, "close", None))):
+        try:
+            out.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _detach_all_reporters(simulation: Any) -> None:
+    """Close every reporter's file and take the reporters off the simulation.
+
+    Closing the trajectory reporter is what flushes the DCD header. OpenMM's
+    own reporters -- DCDReporter, StateDataReporter -- have no close(): they
+    release their file in __del__, which waits on whatever still holds the
+    simulation, and after a failure the traceback does. So this closed
+    nothing on any path, and a sweep run in this process kept two files open
+    for every run that failed. Their file is closed here directly, where the
+    reporter opened it; one handed a stream it did not open, such as
+    StateDataReporter writing to stdout, is left alone.
+    """
+    for r in simulation.reporters:
+        _close_the_file_of(r)
+    simulation.reporters.clear()
+
+
+# ---------------------------------------------------------------------------
+# Stage runners
+# ---------------------------------------------------------------------------
+def _velocities_assigned_at(state_xml: Path) -> float | None:
+    """The temperature setup assigned a prepared system's velocities at.
+
+    Read from the setup record beside its `state.xml`; None where there is
+    no record, or it does not say.
+    """
+    record = Path(state_xml).parent / "setup_parameters.json"
+    try:
+        value = json.loads(record.read_text(encoding="utf-8"))["parameters"]["temperature_K"]
+        return None if value is None else float(value)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _run_minimize(
+    omm: dict,
+    simulation: Any,
+    *,
+    tolerance_kjmol_per_nm: float,
+    max_iterations: int,
+    on_progress: Callable[[str], None] | None = None,
+    on_explain: Callable[[str | None], None] | None = None,
+) -> None:
+    unit = omm["unit"]
+    if on_progress:
+        on_progress("Minimizing energy...")
+        if on_explain:
+            on_explain("minimize")
+    simulation.minimizeEnergy(
+        tolerance=tolerance_kjmol_per_nm * unit.kilojoules_per_mole / unit.nanometer,
+        maxIterations=int(max_iterations),
+    )
+
+
+def _flatten_numbers(value: Any):
+    """Yield numeric leaves from nested OpenMM/numpy/list containers."""
+    if isinstance(value, (int, float)):
+        yield float(value)
+        return
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (str, bytes)):
+        return
+    try:
+        iterator = iter(value)
+    except TypeError:
+        return
+    for item in iterator:
+        yield from _flatten_numbers(item)
+
+
+def _value_in_unit(quantity: Any, unit_value: Any) -> Any:
+    if hasattr(quantity, "value_in_unit"):
+        return quantity.value_in_unit(unit_value)
+    return quantity
+
+
+def _step_fs(simulation: Any) -> float | None:
+    """The integrator's timestep in fs, where it has a fixed one."""
+    try:
+        from openmm import unit as omm_unit
+
+        return float(simulation.integrator.getStepSize().value_in_unit(omm_unit.femtoseconds))
+    except Exception:  # noqa: BLE001 - a variable or foreign integrator
+        return None
+
+
+def _validation_error(stage: str, detail: str, *, topology: Any = None,
+                      positions: Any = None, platform: str | None = None,
+                      timestep_fs: float | None = None) -> "UnstableRun":
+    """Say what failed, reading the state where one is available.
+
+    The remedies this used to list -- lower the timestep, lower the
+    temperature, raise the friction -- are things that sometimes help, offered
+    without knowing which applies. Sometimes none of them do, because the
+    problem is a ligand whose parameters are wrong, and no timestep is small
+    enough for that.
+    """
+    if topology is not None and positions is not None:
+        try:
+            from fastmdxplora.simulation.diagnose import diagnose_failure
+
+            # OpenMM's own words are kept beside the diagnosis rather than
+            # replaced by it. They say what the integrator noticed, which is
+            # searchable and links to its FAQ; the diagnosis says which atoms
+            # it happened to. Neither substitutes for the other.
+            return UnstableRun(
+                f"{diagnose_failure(topology, positions, stage=stage, platform=platform, timestep_fs=timestep_fs).as_text()}"
+                f"\n\nOpenMM reported: {detail}.",
+                stage=stage, diagnosis=detail)
+        except Exception:  # noqa: BLE001 - a diagnosis that fails is not the
+            # failure worth reporting; fall through to the general message.
+            pass
+
+    return UnstableRun(
+        f"Invalid simulation state after {stage}: {detail}. "
+        "Try safer settings: lower --simulate-timestep-fs, lower "
+        "--simulate-temperature-K, increase --simulate-friction-per-ps, use "
+        "--simulate-precision double, or disable NPT for the first smoke test "
+        "with --simulate-npt-steps 0.",
+        stage=stage, diagnosis=detail,
+    )
+
+
+#: Words OpenMM uses where the integration itself went wrong: a coordinate
+#: or an energy that is NaN or infinite, a constraint it could not hold.
+_NUMERICAL_WORDS = ("nan", "infinit", "energy", "coordinate", "constraint")
+
+
+def _integration_failed(stage: str, exc: Exception, simulation: Any) -> Exception:
+    """What to raise for an error inside ``simulation.step``.
+
+    A state that is not a physical one is diagnosed as an instability, with
+    the atoms it happened to. Every other error was called one too: a
+    reporter given an interval of zero stopped on Python's modulo by zero
+    and was told to minimize for longer. That error is said as it is.
+    """
+    said = str(exc)
+    if (not isinstance(exc, (ZeroDivisionError, TypeError, ValueError,
+                             AttributeError, KeyError, IndexError))
+            and any(word in said.lower() for word in _NUMERICAL_WORDS)):
+        failed_topology, failed_positions = _state_for_diagnosis(simulation)
+        return _validation_error(
+            stage, f"OpenMM integration failed ({exc})",
+            topology=failed_topology, positions=failed_positions,
+            timestep_fs=_step_fs(simulation))
+    return StudyError(
+        f"The {stage} stopped on an error that is not an unstable state: "
+        f"{type(exc).__name__}: {said}. The positions and energies were not "
+        "the cause; the settings of the run or the engine are.",
+        code="simulation.run.engine_failed", stage=stage,
+        error=f"{type(exc).__name__}: {said}")
+
+
+def _validate_state_finite(omm: dict, simulation: Any, *, stage: str) -> None:
+    """Validate finite positions and potential energy at a stage boundary."""
+    unit = omm["unit"]
+    # Asked of the context rather than threaded down, because the context is
+    # the thing that knows, and the advice that follows depends on it: on
+    # CPU there is no `Precision` property to change.
+    try:
+        running_on = simulation.context.getPlatform().getName()
+    except Exception:  # noqa: BLE001 - a platform that will not say its name
+        running_on = None
+    try:
+        state = simulation.context.getState(
+            getPositions=True,
+            getEnergy=True,
+            enforcePeriodicBox=True,
+        )
+    except TypeError:
+        try:
+            state = simulation.context.getState()
+        except Exception as exc:  # noqa: BLE001
+            raise _validation_error(stage, f"could not evaluate state ({exc})") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise _validation_error(stage, f"could not evaluate state ({exc})") from exc
+
+    try:
+        positions = state.getPositions(asNumpy=True)
+    except TypeError:
+        positions = state.getPositions()
+    except AttributeError as exc:
+        raise _validation_error(stage, "positions unavailable") from exc
+
+    try:
+        position_values = _value_in_unit(positions, unit.nanometer)
+    except Exception as exc:  # noqa: BLE001
+        raise _validation_error(stage, f"could not read positions ({exc})") from exc
+    position_numbers = list(_flatten_numbers(position_values))
+    if not position_numbers:
+        raise _validation_error(stage, "no positions found")
+    if not all(math.isfinite(x) for x in position_numbers):
+        # The state is the evidence: which atoms went non-finite, and what
+        # they belong to, distinguishes a wrong ligand parameter from a
+        # packing problem from an integration failure. The remedies differ.
+        raise _validation_error(
+            stage, "positions contain NaN or Inf",
+            topology=simulation.topology, positions=positions,
+            platform=running_on, timestep_fs=_step_fs(simulation))
+
+    try:
+        energy = state.getPotentialEnergy()
+    except AttributeError as exc:
+        raise _validation_error(stage, "potential energy unavailable") from exc
+    try:
+        energy_value = _value_in_unit(energy, unit.kilojoules_per_mole)
+    except Exception as exc:  # noqa: BLE001
+        raise _validation_error(stage, f"could not read potential energy ({exc})") from exc
+    energy_numbers = list(_flatten_numbers(energy_value))
+    if not energy_numbers:
+        raise _validation_error(stage, "potential energy missing")
+    if not all(math.isfinite(x) for x in energy_numbers):
+        raise _validation_error(
+            stage, "potential energy is NaN or Inf",
+            topology=simulation.topology, positions=positions,
+            platform=running_on, timestep_fs=_step_fs(simulation))
+
+
+def _warn_density_was_never_equilibrated(
+        simulation: Any, system: Any, *, temperature_K: float) -> None:
+    """Say what density a run without a barostat is actually simulating at.
+
+    The number is already measured every reporting interval and written to
+    `energy.csv`, where nobody looks until something has gone wrong. Said once
+    at the point the choice takes effect, it is a fact about the run rather
+    than a forensic exercise.
+    """
+    try:
+        # OpenMM is present in any real run. Where it is not, the quantities
+        # still carry `value_in_unit` and the arithmetic is the same, so the
+        # import is not allowed to decide whether the number gets reported.
+        try:
+            from openmm import unit  # noqa: PLC0415 -- optional backend
+
+            volume_unit, mass_unit = unit.nanometer ** 3, unit.dalton
+        except ImportError:
+            volume_unit = mass_unit = None
+
+        state = simulation.context.getState()
+        # Coerced here so that anything which is not a number -- an unusual
+        # state, a stub -- takes the same quiet path as a state that could
+        # not be read at all, rather than raising further down.
+        volume = float(
+            state.getPeriodicBoxVolume().value_in_unit(volume_unit))
+        mass = float(sum(
+            system.getParticleMass(i).value_in_unit(mass_unit)
+            for i in range(system.getNumParticles())))
+    except Exception:  # noqa: BLE001 -- a missing number is not a reason to
+        # stop a run that is otherwise fine.
+        return
+
+    if volume <= 0:
+        return
+    # 1 Da / nm^3 = 1.66054 g/mL.
+    density = mass / volume * 1.66054e-3
+    logger.warning(
+        "No NPT stage, so the density is whatever solvation produced and "
+        "stays there: %.3f g/mL. Liquid water is near 1.0, and a box below "
+        "that has voids in it. Add `npt_steps` to let a barostat correct it, "
+        "or accept that the run is not at the density of water.",
+        density)
+
+
+def _state_for_diagnosis(simulation: Any) -> tuple[Any, Any]:
+    """The positions a failed step left behind, where they can be read.
+
+    OpenMM detects a non-finite coordinate during integration and throws, so
+    the stage-boundary check that would have read the state never runs -- and
+    that is the common way a simulation dies, not the rare one. The context
+    survives the exception and still holds the positions that went wrong,
+    which are the whole evidence: which atoms, and what they belong to,
+    separates a bad ligand parameter from a packing problem from an
+    integration failure, and the remedies differ.
+    """
+    try:
+        state = simulation.context.getState(getPositions=True)
+        try:
+            positions = state.getPositions(asNumpy=True)
+        except TypeError:
+            positions = state.getPositions()
+        return simulation.topology, positions
+    except Exception:  # noqa: BLE001 - a state that cannot be read is not
+        # the failure worth reporting; the caller falls back to the general
+        # message rather than losing the original error.
+        return None, None
+
+
+#: The explanation that belongs to each stage, keyed by the label the stage
+#: announces itself under. A mapping rather than an argument threaded through
+#: both stage runners, because the two of them announce in one place each and
+#: the label is already there.
+_STAGE_EXPLANATIONS: dict[str, str] = {
+    "NVT equilibration": "nvt",
+    "NPT equilibration": "npt",
+    "Production": "production",
+}
+
+
+def _explanation_for(label: str) -> str | None:
+    """Which explanation a stage's label calls for, if any."""
+    for prefix, key in _STAGE_EXPLANATIONS.items():
+        if label.startswith(prefix):
+            return key
+    return None
+
+
+def _run_md_stage(
+    simulation: Any,
+    *,
+    n_steps: int,
+    label: str,
+    on_progress: Callable[[str], None] | None = None,
+    on_explain: Callable[[str | None], None] | None = None,
+    on_step_progress: Callable[..., None] | None = None,
+    timestep_fs: float | None = None,
+    on_fraction: Callable[[float], None] | None = None,
+    stop: _StopRequests | None = None,
+    frame_interval: int | None = None,
+) -> int:
+    """Run ``n_steps`` of MD, returning the steps run. Skips cleanly if
+    ``n_steps <= 0``.
+
+    With ``stop``, a stop asked for part-way ends the stage at the next
+    frame (``frame_interval`` steps apart) where the grace period allows,
+    and the steps run are fewer than asked.
+
+    ``on_fraction`` is told how far through the stage it is after each
+    chunk, exactly as the live-metrics stage tells it -- which is what steps
+    the restraints down during equilibration. Only that stage used to take
+    it, so a run without live telemetry held its restraints at full strength
+    through NVT and NPT and let go of them all at once at production.
+    """
+    if n_steps <= 0:
+        return 0
+    if on_progress:
+        on_progress(f"{label}: {n_steps:,} steps")
+    if on_explain:
+        on_explain(_explanation_for(label))
+
+    # Stepped in chunks so the run can say how far through it is. A single
+    # blocking call to step() printed the count and then nothing until the
+    # stage finished, which for production is half an hour of a terminal that
+    # looks exactly like a hung one. The chunk is a fiftieth of the stage,
+    # bounded so that a short stage still reports and a long one does not pay
+    # for the interruption: OpenMM's overhead per call is small beside the
+    # steps in it, and at a fiftieth it is under a percent.
+    total = int(n_steps)
+    chunk = min(max(total // 50, 1), 5000)
+    done = 0
+    started = _time.monotonic()
+    if stop is not None and getattr(stop, "before_it_began", False):
+        # A stop the study's round noted before this production began: it
+        # takes no step, nothing of it is owed, and none is run past the
+        # grace a frame further on would cost.
+        stop.at_step, stop.on_frame = 0, False
+        return 0
+    while done < total:
+        this = min(chunk, total - done)
+        if stop is not None:
+            this = _cap_for_stopping(this, done, _time.monotonic() - started)
+        try:
+            simulation.step(this)
+        except Exception as exc:  # noqa: BLE001
+            raise _integration_failed(label, exc, simulation) from exc
+        done += this
+        if stop is not None and stop.requested:
+            done += _step_to_a_frame(simulation, stop, done=done,
+                                     frame_interval=frame_interval,
+                                     elapsed=_time.monotonic() - started,
+                                     limit=total - done)
+            return done
+        if on_fraction is not None:
+            on_fraction(done / total)
+        if on_step_progress is not None:
+            elapsed = _time.monotonic() - started
+            rate = None
+            left = None
+            if elapsed > 0:
+                steps_per_second = done / elapsed
+                if timestep_fs and steps_per_second > 0:
+                    ns_per_day = (steps_per_second * timestep_fs * 1e-6
+                                  * 86_400)
+                    rate = ns_per_day
+                    left = (total - done) / steps_per_second
+            on_step_progress(label, done, total, rate, left)
+    return done
+
+
+def _run_md_stage_with_live_metrics(
+    omm: dict,
+    simulation: Any,
+    telemetry: Any,
+    *,
+    n_steps: int,
+    label: str,
+    on_progress: Callable[[str], None] | None,
+    on_explain: Callable[[str | None], None] | None = None,
+    current_step: int,
+    total_steps: int,
+    timestep_fs: float,
+    telemetry_interval: int,
+    trajectory_interval_steps: int | None = None,
+    on_step_progress: Callable[..., None] | None = None,
+    on_fraction: Callable[[float], None] | None = None,
+    stop: _StopRequests | None = None,
+) -> int:
+    """Run an MD stage in chunks so live telemetry can sample real state.
+
+    With ``stop``, a stop asked for part-way ends the stage at the next
+    frame, as in :func:`_run_md_stage`; the step returned is where it ended.
+
+    ``trajectory_interval_steps`` is passed only where a trajectory is being
+    written, so the frame count reports the frames on disk. Left unset during
+    equilibration, where a count of zero would be a claim rather than a gap.
+    """
+    if n_steps <= 0:
+        return current_step
+    if on_progress:
+        on_progress(f"{label}: {n_steps:,} steps")
+    if on_explain:
+        on_explain(_explanation_for(label))
+    remaining = int(n_steps)
+    interval = max(1, int(telemetry_interval or DEFAULT_STATE_INTERVAL_STEPS))
+    started = _time.monotonic()
+    if stop is not None and getattr(stop, "before_it_began", False):
+        # A stop the study's round noted before this production began: it
+        # takes no step (`_end_the_stopped_run` says so), where it ran a
+        # frame interval past the grace; a stop heard as a plain run's
+        # production begins is taken after its first chunk, as always.
+        stop.at_step, stop.on_frame = 0, False
+        return current_step
+    while remaining > 0:
+        chunk = min(interval, remaining)
+        if stop is not None:
+            chunk = _cap_for_stopping(chunk, int(n_steps) - remaining,
+                                      _time.monotonic() - started)
+        try:
+            simulation.step(chunk)
+        except Exception as exc:  # noqa: BLE001
+            raise _integration_failed(label, exc, simulation) from exc
+        current_step += chunk
+        remaining -= chunk
+        if stop is not None and stop.requested:
+            extra = _step_to_a_frame(
+                simulation, stop, done=int(n_steps) - remaining,
+                frame_interval=trajectory_interval_steps,
+                elapsed=_time.monotonic() - started, limit=remaining)
+            return current_step + extra
+        # Frames written so far, from steps actually run. The count used to
+        # arrive once, when production ended, so a page watching a run showed
+        # a dash where the frame count goes for the whole of it.
+        frames_written = (
+            (int(n_steps) - remaining) // trajectory_interval_steps
+            if trajectory_interval_steps
+            else None
+        )
+        _append_live_metric(
+            omm,
+            simulation,
+            telemetry,
+            stage=label,
+            step=current_step,
+            total_steps=total_steps,
+            timestep_fs=timestep_fs,
+            frame_count=frames_written,
+        )
+        # The bar, which this stage could not drive because it had no
+        # parameter for it. `_run_md_stage` took `on_step_progress` and this
+        # one did not, and this one is the branch taken whenever live
+        # telemetry is on -- which is the default. So production, the stage
+        # that takes the hours, was the one stage with no progress shown:
+        # "Production: 1,000,000 steps" and then fifty minutes of silence.
+        # Anything that changes through a stage changes here: the restraint
+        # ladder steps as equilibration runs rather than at its boundaries.
+        if on_fraction is not None:
+            on_fraction((int(n_steps) - remaining) / max(1, int(n_steps)))
+        if on_step_progress is not None:
+            done = int(n_steps) - remaining
+            elapsed = _time.monotonic() - started
+            rate = None
+            left = None
+            if elapsed > 0 and done > 0:
+                per_step = elapsed / done
+                left = per_step * remaining
+                rate = (done * timestep_fs * 1e-6) / (elapsed / 86400.0)
+            on_step_progress(label, done, int(n_steps), rate, left)
+    return current_step
+
+
+# ---------------------------------------------------------------------------
+# Stage planning
+# ---------------------------------------------------------------------------
+def plan_stages(
+    *,
+    duration_ns: float | None,
+    timestep_fs: float,
+    nvt_steps: int | None,
+    npt_steps: int | None,
+    production_steps: int | None,
+    nvt_duration_ns: float | None = None,
+    npt_duration_ns: float | None = None,
+) -> dict[str, int]:
+    """Resolve per-stage step counts from a user's duration spec.
+
+    Equilibration and production are independent. ``duration_ns`` sets
+    *production* time only — standard MD convention, what people mean
+    when they say "I ran a 10 ns simulation." Equilibration uses the
+    the standard default lengths (500 ps NVT + 1 ns NPT) regardless
+    of production length, because reaching a stable ensemble takes the
+    same simulated time whether the production run is 10 ns or 1000 ns.
+    Every default is a time and becomes steps at this run's timestep: they
+    were step counts, which at 4 fs ran twice the time they were said to.
+
+    Three ways to override the defaults:
+
+      - ``nvt_steps`` / ``npt_steps`` / ``production_steps``: explicit
+        step counts.
+      - ``nvt_duration_ns`` / ``npt_duration_ns``: time-flavored
+        equivalents for the equilibration stages.
+      - ``duration_ns``: production time.
+
+    Step-count overrides win over duration-ns overrides if both are
+    supplied (lower-level wins; explicit beats inferred). ``duration_ns: 0``
+    is a study that equilibrates and stops, with no production. A stated
+    equilibration length of zero is zero, as ``npt_steps: 0`` is: it was
+    read as unset, so ``npt_duration_ns: 0`` ran the default nanosecond of
+    NPT while the ensemble resolver, the cost estimate and the record read
+    it as no NPT stage and constant-volume production.
+    """
+    if production_steps is not None:
+        auto_prod = int(production_steps)
+    elif duration_ns is not None and duration_ns >= 0:
+        auto_prod = steps_in(duration_ns, timestep_fs)
+    else:
+        auto_prod = steps_in(DEFAULT_PRODUCTION_NS, timestep_fs)
+
+    # NVT: fixed default, optionally overridden by ns-flavored kwarg
+    if nvt_steps is not None:
+        auto_nvt = int(nvt_steps)
+    elif nvt_duration_ns is not None and nvt_duration_ns >= 0:
+        auto_nvt = steps_in(nvt_duration_ns, timestep_fs)
+    else:
+        auto_nvt = steps_in(DEFAULT_NVT_NS, timestep_fs)
+
+    # NPT: same pattern
+    if npt_steps is not None:
+        auto_npt = int(npt_steps)
+    elif npt_duration_ns is not None and npt_duration_ns >= 0:
+        auto_npt = steps_in(npt_duration_ns, timestep_fs)
+    else:
+        auto_npt = steps_in(DEFAULT_NPT_NS, timestep_fs)
+
+    return {
+        "nvt_steps": auto_nvt,
+        "npt_steps": auto_npt,
+        "production_steps": auto_prod,
+    }
+
+
+def trajectory_interval_for(
+    production_steps: int,
+    target_frames: int = 2000,
+    min_interval: int = 100,
+) -> int:
+    """Compute a sensible DCD reporter interval.
+
+    Aims for ~``target_frames`` frames in the production run, with a
+    floor at ``min_interval`` to avoid absurd write rates on short runs.
+    """
+    if production_steps <= 0:
+        return DEFAULT_TRAJECTORY_INTERVAL_STEPS
+    interval = max(production_steps // target_frames, min_interval)
+    return int(interval)
+
+
+# ---------------------------------------------------------------------------
+# Top-level runner
+# ---------------------------------------------------------------------------
+
+CHECKPOINT_DIGEST_SUFFIX = ".sha256"
+
+
+CHECKPOINT_SIDECAR_SUFFIX = ".json"
+
+
+def write_checkpoint_sidecar(path: str | Path, *, stage: str, step: int,
+                             ensemble: str, temperature_K: float,
+                             timestep_fs: float, study: str | Path | None = None,
+                             system_digest: str | None = None,
+                             finished: bool | None = None,
+                             trajectory_interval_steps: int | None = None,
+                             time_ps: float | None = None, into: Path | None = None) -> Path:
+    """What a checkpoint is, beside it: the stage that wrote it, the step,
+    the ensemble and temperature, the timestep, and the study.
+
+    A checkpoint carries positions, velocities and the integrator's state,
+    and nothing that says where in a run it was taken. Loading one from
+    production into a run that then minimises and equilibrates it throws
+    the velocities away and makes the continuation a new run from a
+    snapshot rather than the same trajectory; nothing refused, because
+    nothing knew. This is how the loader knows.
+
+    ``finished`` says whether the run reached its end: false for the
+    checkpoints written along the way, true for the one written at a clean
+    finish. The seal cannot say it, because every checkpoint is sealed as
+    it is written; it says the file is whole, not that the run finished.
+
+    ``trajectory_interval_steps`` is the interval the trajectory was
+    actually written at, resolved from the adaptive default where none was
+    set. A killed run never reaches the record written at the end of the
+    phase, and without the interval the frames that precede a checkpoint
+    cannot be counted, nor the time a frame represents.
+
+    ``time_ps`` is the state's time at the checkpoint, the production's own
+    clock (reset to zero as production begins). A variable-step integrator
+    chooses its own step, so a stopped piece's length in time is this, and
+    nothing else gives it where the energy log wrote no row at that step.
+    """
+    import json
+
+    checkpoint = Path(path)
+    sidecar = (Path(into) if into is not None
+               else checkpoint.with_suffix(checkpoint.suffix + CHECKPOINT_SIDECAR_SUFFIX))
+    sidecar.write_text(json.dumps({
+        "stage": str(stage), "step": int(step), "ensemble": str(ensemble),
+        "temperature_K": float(temperature_K), "timestep_fs": float(timestep_fs),
+        "study": str(study) if study else None,
+        "system_digest": system_digest,
+        **({} if finished is None else {"finished": bool(finished)}),
+        **({} if trajectory_interval_steps is None
+           else {"trajectory_interval_steps": int(trajectory_interval_steps)}),
+        **({} if time_ps is None else {"time_ps": float(time_ps)}),
+        "written_at": datetime.now(timezone.utc).isoformat(),
+    }, indent=1), encoding="utf-8")
+    return sidecar
+
+
+def _time_ps(simulation: Any) -> float | None:
+    """The simulation's time in ps, None where it does not say."""
+    try:
+        from openmm import unit
+
+        time = simulation.context.getTime().value_in_unit(unit.picosecond)
+        time = float(time)
+    except Exception:  # noqa: BLE001 - a record of a checkpoint, never its failure
+        return None
+    return time if time == time and time >= 0 else None
+
+
+def read_checkpoint_sidecar(path: str | Path) -> dict[str, Any] | None:
+    """The sidecar, or None for a checkpoint that has none: one a person
+    made by hand, or one from before the sidecar existed."""
+    import json
+
+    checkpoint = Path(path)
+    sidecar = checkpoint.with_suffix(checkpoint.suffix + CHECKPOINT_SIDECAR_SUFFIX)
+    if _the_set_s_sidecar_waits(checkpoint):
+        # Put in place before its sidecar, which waits beside it (a kill
+        # between the moves, `_write_checkpoint_set`).
+        sidecar = sidecar.with_suffix(sidecar.suffix + ".new")
+    if not _records.is_file(sidecar):
+        return None
+    try:
+        data = json.loads(_records.read_text(sidecar, encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _seals(checkpoint: Path, seal: Path) -> bool:
+    """Whether ``seal`` is the seal of the checkpoint in place."""
+    import hashlib
+
+    try:
+        size, digest = seal.read_text(encoding="utf-8").split()
+        payload = checkpoint.read_bytes()
+        return len(payload) == int(size) and hashlib.sha256(payload).hexdigest() == digest
+    except (OSError, ValueError):
+        return False
+
+
+def _finish_checkpoint_set(checkpoint: Path) -> None:
+    """A checkpoint's set left part moved by a kill (`_write_checkpoint_set`)
+    finished: its waiting sidecar and seal moved in where they belong to the
+    checkpoint in place; then what is left of a write (``.new``) removed.
+    Called only where nothing else writes the set: by its writer, and by a
+    resume that has loaded it."""
+    import os as _os
+
+    checkpoint = Path(checkpoint)
+    side = checkpoint.with_suffix(checkpoint.suffix + CHECKPOINT_SIDECAR_SUFFIX)
+    seal = checkpoint.with_suffix(checkpoint.suffix + CHECKPOINT_DIGEST_SUFFIX)
+    waiting = [path.with_suffix(path.suffix + ".new") for path in (checkpoint, side, seal)]
+    try:
+        if _the_set_s_sidecar_waits(checkpoint):
+            _os.replace(waiting[1], side)
+        if waiting[2].is_file() and _seals(checkpoint, waiting[2]):
+            _os.replace(waiting[2], seal)
+        for leftover in waiting:
+            leftover.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _the_set_s_sidecar_waits(checkpoint: Path) -> bool:
+    """Whether the checkpoint in place is the one the seal waiting beside it
+    seals, with its sidecar waiting too: a kill between the moves of
+    `_write_checkpoint_set`. Read only where those wait, so a checkpoint's
+    readers hash it only then."""
+    import hashlib
+
+    seal = checkpoint.with_suffix(checkpoint.suffix + CHECKPOINT_DIGEST_SUFFIX + ".new")
+    side = checkpoint.with_suffix(checkpoint.suffix + CHECKPOINT_SIDECAR_SUFFIX + ".new")
+    try:
+        if not (seal.is_file() and side.is_file()):
+            return False
+        size, digest = seal.read_text(encoding="utf-8").split()
+        payload = checkpoint.read_bytes()
+        return len(payload) == int(size) and hashlib.sha256(payload).hexdigest() == digest
+    except (OSError, ValueError):
+        return False
+
+
+def check_continuation(path: str | Path, *, minimize: bool, nvt_steps: int,
+                       npt_steps: int, timestep_fs: float) -> dict[str, Any] | None:
+    """Refuse a plan that would not continue the checkpoint.
+
+    A production checkpoint continues only into a run that neither
+    minimises nor equilibrates and keeps the timestep. A checkpoint with no
+    sidecar loads as it always did, with a warning naming the risk: there
+    is nothing to check it against, and refusing would lock out every
+    checkpoint made before this existed.
+    """
+    side = read_checkpoint_sidecar(path)
+    if side is None:
+        logger.warning(
+            "%s has no sidecar, so nothing says which stage wrote it; it is "
+            "loaded as given. If it came from production and this run "
+            "minimises or equilibrates, the continuation is a new run from a "
+            "snapshot, not the same trajectory.", Path(path).name)
+        return None
+    stage = str(side.get("stage") or "").lower()
+    if stage == "production" and (minimize or nvt_steps > 0 or npt_steps > 0):
+        from fastmdxplora.refusals import StudyError
+
+        raise StudyError(
+            f"{Path(path).name} was written during production at step "
+            f"{side.get('step')}; this run would "
+            + ", ".join(w for w, on in (("minimise it", minimize),
+                                        (f"run {nvt_steps} NVT steps on it", nvt_steps > 0),
+                                        (f"run {npt_steps} NPT steps on it", npt_steps > 0)) if on)
+            + ", which throws away its velocities and makes the continuation "
+              "a new run from a snapshot rather than the same trajectory. Set "
+              "`minimize: false`, `nvt_steps: 0`, `npt_steps: 0` -- or use "
+              "segments, which do this.",
+            code="simulation.resume.would_reequilibrate",
+            details={"path": str(path), "stage": stage, "step": side.get("step"),
+                     "minimize": minimize, "nvt_steps": nvt_steps, "npt_steps": npt_steps})
+    written_fs = side.get("timestep_fs")
+    if isinstance(written_fs, (int, float)) and abs(float(written_fs) - float(timestep_fs)) > 1e-9:
+        from fastmdxplora.refusals import StudyError
+
+        raise StudyError(
+            f"{Path(path).name} was written with a {written_fs} fs timestep; "
+            f"this run asks for {timestep_fs} fs. The integrator state it "
+            "carries is for the other. Keep the timestep the run had.",
+            code="simulation.resume.timestep_differs",
+            details={"path": str(path), "written_fs": written_fs, "requested_fs": timestep_fs})
+    return side
+
+
+def seal_checkpoint(path: str | Path) -> Path:
+    """Record a written checkpoint's size and digest beside it.
+
+    Written after every checkpoint, along the way and at the end, so the
+    seal says one thing: the file is whole. A process killed mid-write
+    leaves a checkpoint and no seal, and a resume refuses rather than
+    continuing from a partial one. Whether the run finished is said in the
+    checkpoint's sidecar, not here.
+
+    Necessary because OpenMM will not catch this. A checkpoint truncated
+    to half its length loads without complaint and yields the right
+    positions; truncated to a tenth it loads without complaint and yields
+    wrong ones. Measured, not assumed -- see
+    ``tests/test_a_resumed_run_continues_the_one_before.py``. There is no
+    length or checksum in the format, so the only way to know a checkpoint
+    is whole is to have written down what whole meant.
+    """
+    import hashlib
+
+    import os as _os
+
+    checkpoint = Path(path)
+    payload = checkpoint.read_bytes()
+    seal = checkpoint.with_suffix(checkpoint.suffix + CHECKPOINT_DIGEST_SUFFIX)
+    # Whole or not at all: a seal cut by a kill was empty, and refused.
+    beside = seal.with_name(seal.name + ".tmp")
+    beside.write_text(
+        f"{len(payload)} {hashlib.sha256(payload).hexdigest()}\n",
+        encoding="utf-8")
+    _os.replace(beside, seal)
+    return seal
+
+
+def _seal_candidates(checkpoint: Path) -> list[Path]:
+    """The seal, and the one a rename had not yet landed. A checkpoint is
+    renamed into place before its seal is, so the pair can be caught a
+    moment apart; the seal written alongside that checkpoint is still on
+    disk under its temporary name and verifies it exactly."""
+    seal = checkpoint.with_suffix(checkpoint.suffix + CHECKPOINT_DIGEST_SUFFIX)
+    return [seal, seal.with_suffix(seal.suffix + ".new")]
+
+
+def verify_checkpoint(path: str | Path, *, require_seal: bool = False) -> bool:
+    """Whether a checkpoint is the whole file that was written.
+
+    Returns True when a seal exists and matches. Raises when a seal exists
+    and does not, or when one is required and absent.
+
+    ``require_seal`` is on for segments and off for anything else. A
+    segment's predecessor was written by this software and always sealed,
+    so a missing seal there means the run was killed mid-write. A
+    checkpoint a person produced by hand has no seal and no reason to,
+    and refusing it would be refusing a legitimate use over a convention
+    they never agreed to.
+    """
+    import hashlib
+
+    checkpoint = Path(path)
+    candidates = [candidate for candidate in _seal_candidates(checkpoint) if candidate.is_file()]
+    if len(candidates) > 1:
+        # The seal in place and one waiting beside it: whichever seals the
+        # checkpoint in place is its seal (a kill between the moves of
+        # `_write_checkpoint_set`, or before them).
+        payload = checkpoint.read_bytes()
+        for candidate in candidates:
+            try:
+                size_text, digest = candidate.read_text(encoding="utf-8").split()
+                size = int(size_text)
+            except (OSError, ValueError):
+                continue
+            if len(payload) == size and hashlib.sha256(payload).hexdigest() == digest:
+                return True
+    seal = candidates[0] if candidates else _seal_candidates(checkpoint)[0]
+    if not seal.is_file():
+        if require_seal:
+            raise MissingResultError(
+                f"The checkpoint at {checkpoint} has no seal beside it, so "
+                "the segment that wrote it did not finish. Continuing from "
+                "a partially written checkpoint is not something this can "
+                "detect afterwards -- OpenMM loads a truncated one without "
+                "complaint. Rerun that segment.",
+                code="simulation.resume.unsealed", path=str(checkpoint),
+            )
+        return False
+
+    try:
+        size_text, digest = seal.read_text(encoding="utf-8").split()
+        expected_size = int(size_text)
+    except ValueError as exc:
+        raise UnstableRun(
+            f"The seal beside {checkpoint} is not readable, so whether the "
+            "checkpoint is whole cannot be established.",
+            code="simulation.resume.checkpoint_rejected",
+            path=str(checkpoint),
+        ) from exc
+
+    payload = checkpoint.read_bytes()
+    if len(payload) != expected_size or hashlib.sha256(
+            payload).hexdigest() != digest:
+        raise UnstableRun(
+            f"The checkpoint at {checkpoint} is {len(payload)} bytes and "
+            f"its seal says {expected_size}. It was truncated or altered "
+            "after it was written. OpenMM would load it without "
+            "complaint and, past a point, give the wrong positions.",
+            code="simulation.resume.checkpoint_truncated",
+            path=str(checkpoint), found=len(payload), expected=expected_size,
+        )
+    return True
+
+
+def load_checkpoint(omm: dict, simulation: Any, path: str | Path, *,
+                    require_seal: bool = False) -> Path:
+    """Continue this run from a checkpoint, or refuse.
+
+    A checkpoint supersedes ``state.xml``: it holds the positions and
+    velocities this segment continues from, while ``state.xml`` is
+    whatever the study started at.
+
+    Loaded after the System and Platform exist rather than before, because
+    a checkpoint is only valid against the exact pair it was written from.
+    OpenMM raises when they do not match -- "Checkpoint contains the wrong
+    number of particles" and the like -- and that raise is the only check
+    available. There is no cheaper way to ask whether a checkpoint belongs
+    to this system, so it is turned into a refusal and never swallowed. A
+    mismatched checkpoint that loaded quietly would continue somebody's
+    run from another system's coordinates, and nothing downstream would
+    look wrong.
+
+    Separated from :func:`run_simulation` so it can be exercised on a real
+    System without a two-thousand-line function around it. The claim that
+    a resumed run continues the one before is worth testing rather than
+    reading.
+    """
+    checkpoint = Path(path)
+    if not checkpoint.is_file():
+        raise MissingResultError(
+            f"No checkpoint at {checkpoint}. A segment after the first "
+            "continues from the one before, so the previous segment must "
+            "have finished and written one.",
+            code="analysis.data.absent", path=str(checkpoint),
+        )
+    verify_checkpoint(checkpoint, require_seal=require_seal)
+    try:
+        with checkpoint.open("rb") as fh:
+            simulation.context.loadCheckpoint(fh.read())
+    except Exception as exc:  # noqa: BLE001 - reported with its cause
+        raise UnstableRun(
+            f"The checkpoint at {checkpoint} could not be loaded into this "
+            f"system: {exc}. A checkpoint is only valid for the exact "
+            "system, platform and precision it was written from, so this "
+            "usually means it was written by a different study or on "
+            "different hardware.",
+            code="simulation.resume.checkpoint_rejected",
+            path=str(checkpoint),
+        ) from exc
+    # A killed write's leftovers beside the set it read, cleared.
+    _finish_checkpoint_set(checkpoint)
+    return checkpoint
+
+
+def run_simulation(
+    *,
+    system_xml: str | Path,
+    state_xml: str | Path,
+    topology_pdb: str | Path,
+    output_dir: str | Path,
+    save_selection: str | None = "not water",
+    # Stage controls
+    minimize: bool = True,
+    minimize_tolerance_kjmol_per_nm: float = DEFAULT_MINIMIZE_TOLERANCE_KJMOL_PER_NM,
+    minimize_max_iterations: int = DEFAULT_MINIMIZE_MAX_ITERATIONS,
+    nvt_steps: int | None = None,
+    npt_steps: int | None = None,
+    production_steps: int | None = None,
+    duration_ns: float | None = None,
+    nvt_duration_ns: float | None = None,
+    npt_duration_ns: float | None = None,
+    # Integrator
+    integrator: str = DEFAULT_INTEGRATOR,
+    integrator_error_tolerance: float = DEFAULT_INTEGRATOR_ERROR_TOLERANCE,
+    timestep_fs: float = DEFAULT_TIMESTEP_FS,
+    temperature_K: float = DEFAULT_TEMPERATURE_K,
+    friction_per_ps: float = DEFAULT_FRICTION_PER_PS,
+    pressure_bar: float | None = None,
+    pressure_atm: float | None = None,
+    barostat_frequency: int = DEFAULT_BAROSTAT_FREQUENCY,
+    random_seed: int | None = None,
+    # Hardware
+    platform: str = "auto",
+    precision: str = "mixed",
+    device_index: str | int | None = None,
+    # Reporters
+    trajectory_interval_steps: int | None = None,
+    state_interval_steps: int = DEFAULT_STATE_INTERVAL_STEPS,
+    checkpoint_interval_steps: int = DEFAULT_CHECKPOINT_INTERVAL_STEPS,
+    resume_from: str | Path | None = None,
+    #: Accept a checkpoint with no seal -- a run that was killed. Said by
+    #: the caller, never guessed, because the seal is the only marker
+    #: that separates a clean finish from an interrupted one.
+    resume_unsealed: bool = False,
+    ensemble: str | None = None,
+    live_telemetry: bool = False,
+    telemetry_interval: int = DEFAULT_STATE_INTERVAL_STEPS,
+    # Hooks
+    on_progress: Callable[[str], None] | None = None,
+    on_explain: Callable[[str | None], None] | None = None,
+    on_step_progress: Callable[..., None] | None = None,
+    # Enhanced sampling
+    plumed: dict[str, Any] | None = None,
+    restrain: Any = None,
+    restraint_release: Any = None,
+    restrain_production: bool = False,
+    metadynamics: dict[str, Any] | None = None,
+    steered: dict[str, Any] | None = None,
+    umbrella: dict[str, Any] | None = None,
+) -> SimulationResult:
+    """Run minimize → NVT → NPT → production and return paths to outputs.
+
+    This is the function the orchestrator-facing
+    :mod:`fastmdxplora.simulation.pipeline` calls. It can also be used
+    directly from Python:
+
+    >>> from fastmdxplora.simulation.runner import run_simulation
+    >>> result = run_simulation(                          # doctest: +SKIP
+    ...     system_xml="setup/system.xml",
+    ...     state_xml="setup/state.xml",
+    ...     topology_pdb="setup/topology.pdb",
+    ...     output_dir="simulation/",
+    ...     duration_ns=10.0,
+    ... )
+    """
+    omm = _import_openmm()
+    unit = omm["unit"]
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Resolve pressure (OpenMM's barostat is in bar) ----------------
+    # Accept either pressure_bar or pressure_atm; atm is the unit lab
+    # scientists think in (and what AMBER uses), bar is
+    # OpenMM-native. If both are given, bar wins (it's the native unit);
+    # if neither, default to 1 bar.
+    if pressure_bar is not None:
+        resolved_pressure_bar = float(pressure_bar)
+    elif pressure_atm is not None:
+        resolved_pressure_bar = float(pressure_atm) * ATM_TO_BAR
+    else:
+        resolved_pressure_bar = DEFAULT_PRESSURE_BAR
+
+    # ---- Resolve stage step counts -------------------------------------
+    plan = plan_stages(
+        duration_ns=duration_ns,
+        timestep_fs=timestep_fs,
+        nvt_steps=nvt_steps,
+        npt_steps=npt_steps,
+        production_steps=production_steps,
+        nvt_duration_ns=nvt_duration_ns,
+        npt_duration_ns=npt_duration_ns,
+    )
+    if trajectory_interval_steps is None:
+        trajectory_interval_steps = trajectory_interval_for(plan["production_steps"])
+    total_planned_steps = plan["nvt_steps"] + plan["npt_steps"] + plan["production_steps"]
+
+    # ---- Deserialize System + State + Topology -------------------------
+    if on_progress:
+        on_progress("Loading System, State, and topology")
+
+    system_xml_path = Path(system_xml)
+    state_xml_path = Path(state_xml)
+    topology_path = Path(topology_pdb)
+
+    for label, path in [("system_xml", system_xml_path), ("state_xml", state_xml_path),
+                        ("topology_pdb", topology_path)]:
+        if not path.exists():
+            raise MissingResultError(f"{label} not found: {path}", code="analysis.data.absent")
+
+    with system_xml_path.open(encoding="utf-8") as fh:
+        system = omm["openmm"].XmlSerializer.deserialize(fh.read())
+    with state_xml_path.open(encoding="utf-8") as fh:
+        state = omm["openmm"].XmlSerializer.deserialize(fh.read())
+
+    pdb = omm["PDBFile"](str(topology_path))
+    topology = pdb.topology
+
+    # ---- Restraints -----------------------------------------------------
+    # Added before the context exists, because a force cannot join a System
+    # afterwards. Their strength is a global parameter, so the release
+    # schedule below can weaken them without rebuilding anything.
+    #
+    # The reference positions come from the state the setup phase wrote --
+    # the prepared structure, before minimisation, which runs with the
+    # restraints on and so relaxes toward it -- rather than from wherever the
+    # run has got to, so "hold it where it is" means where it started rather
+    # than where it drifted.
+    from dataclasses import replace as _with
+
+    from fastmdxplora.simulation.restraints import (
+        ReleaseSchedule,
+        build_resolved_restraint_forces,
+        parse_restraints,
+    )
+
+    release = ReleaseSchedule(
+        steps=tuple(float(x) for x in restraint_release)
+        if restraint_release else ReleaseSchedule().steps
+    )
+    wanted_restraints = parse_restraints(restrain)
+    # Each restraint's parameter and the force constant it holds at full
+    # strength. The ladder used to be written into every parameter as it
+    # stood, so a torsion asked for at 50 kJ/mol/rad^2 ran at 1000, 500, 100
+    # and a position restraint asked for at 200 at 1000: each restraint's
+    # own constant was never applied. The ladder now steps each down in its
+    # proportions, and one with no constant of its own starts at its first
+    # step, which is what a ladder written in kJ/mol/nm^2 always meant.
+    restraint_parameters: list[str] = []
+    restraint_constants: dict[str, float] = {}
+    resolved_restraints: list[dict[str, Any]] = []
+    if wanted_restraints and restrain_production and restraint_release \
+            and release.steps != ReleaseSchedule().steps:
+        # Kept through production, the restraints are never stepped down, so
+        # a ladder would be ignored; a study giving both meant something
+        # neither reading of them does.
+        raise StudyError(
+            "`restraint_release` and `restrain_production` were both given. "
+            "Restraints kept through production are held at their full force "
+            "constants from the first step, so the ladder would not be used. "
+            "To hold production at a weaker restraint, give that restraint "
+            "the force constant wanted and leave out `restraint_release`.",
+            code="config.option.conflicting",
+            options=["simulation.restraint_release", "simulation.restrain_production"])
+    if wanted_restraints:
+        release.check()
+        wanted_restraints = [
+            r if r.stated else _with(r, force_constant=float(release.steps[0]))
+            for r in wanted_restraints]
+        reference = state.getPositions(asNumpy=True)
+        # Each molecule is written wrapped into the box, so a separation
+        # between two of them is the nearest image, as the forces measure it.
+        box = (state.getPeriodicBoxVectors(asNumpy=True)
+               if system.usesPeriodicBoundaryConditions() else None)
+        for force, parameter, restraint, atoms in build_resolved_restraint_forces(
+                omm["openmm"], topology, reference, wanted_restraints, box=box):
+            system.addForce(force)
+            restraint_parameters.append(parameter)
+            restraint_constants[parameter] = float(restraint.force_constant)
+            resolved_restraints.append({
+                **restraint.as_record(),
+                # The atoms in the order that defines the restraint; a count
+                # for a position restraint, which may hold thousands.
+                "atoms": len(atoms) if restraint.kind == "position"
+                else [int(a) for a in atoms]})
+        logger.info(
+            "Restraints: %s",
+            "; ".join(f"{r['kind']} on {r['selection']} at "
+                      f"{r['force_constant']:g} {r['units']}"
+                      + (f", target {r['target']:.4g}" if r["target"] is not None
+                         else "")
+                      for r in resolved_restraints),
+        )
+
+    def _hold_at(fraction: float) -> float:
+        """Set every restraint to the share of its own force constant this
+        point in equilibration calls for, and return that share. With the
+        restraints kept through production nothing is released at all:
+        letting go during equilibration only to take hold again at full
+        strength when production starts is the sudden change a ladder is
+        there to avoid."""
+        if not restraint_parameters:
+            return 0.0
+        share = 1.0 if restrain_production else release.fraction_at(fraction)
+        _hold_by(share)
+        return share
+
+    def _hold_by(share: float) -> None:
+        for parameter in restraint_parameters:
+            simulation.context.setParameter(
+                parameter, restraint_constants[parameter] * share)
+
+    if umbrella:
+        # One window. The set of them is expanded above, so what arrives here
+        # is a coordinate and the position this run holds it at.
+        from fastmdxplora.simulation.metadynamics import cv_lines, plan_from_config
+        from fastmdxplora.simulation.umbrella import (
+            ConeToMeasure,
+            Window,
+            cone_from_config,
+        )
+
+        centre = umbrella.get("centre")
+        if centre is None:
+            raise StudyError(
+                "An umbrella run needs a `centre`: the value of the "
+                "collective variable this window holds. A block describing a "
+                "whole set of windows is expanded into runs before it reaches "
+                "here."
+            , code="simulation.bias.parameter_missing")
+        force = umbrella.get("force_constant")
+        if force is None:
+            raise StudyError("An umbrella window needs a `force_constant`.", code="simulation.bias.parameter_missing")
+
+        # Both spellings. This listed `centres` and not `centers`, so a
+        # study written the American way carried a key with no meaning into
+        # a collective-variable plan. Every other site in the tree named
+        # both; a sweep of the source found this one and only this one.
+        # `cone` is umbrella's own and means nothing to the coordinate
+        # layer, which refuses a key it does not know.
+        spec = {k: v for k, v in umbrella.items()
+                if k not in ("centre", "force_constant", "n_windows",
+                             "centres", "centers", "from", "to", "cone")}
+        spec.setdefault("sigma", 0.05)
+        spec.setdefault("unbounded", True)
+        # The ligand's residue name, which a ligand variable needs and the
+        # metadynamics path already passes. Without it, ligand_distance in an
+        # umbrella window refused for want of something the run knew.
+        cv_plan = plan_from_config(
+            spec, topology, temperature_K=temperature_K,
+            ligand_resname=umbrella.get("ligand_resname"))
+
+        window = Window(index=int(umbrella.get("index", 0)),
+                        centre=float(centre), force_constant=float(force))
+        lines = cv_lines(cv_plan, str(topology_path))
+
+        # A wall on the angle, where the study asked for one. The axis is the
+        # direction from the named group's centre to the site, so "straight
+        # out" is away from the protein and the cone opens into solvent. The
+        # selection is resolved here rather than carried as text, because a
+        # selection matching nothing has to fail before a window runs for a
+        # day rather than inside PLUMED's parser afterwards.
+        cone = cone_from_config(umbrella.get("cone"))
+        if cone is not None:
+            if cv_plan.collective_variable not in ("ligand_distance",
+                                                   "distance"):
+                raise StudyError(
+                    "A cone restrains the angle between an axis and the "
+                    "line from the site to the ligand, which needs a "
+                    "coordinate that is a distance between two groups. This "
+                    f"study biases {cv_plan.collective_variable!r}.", code="simulation.bias.parameter_missing")
+            if isinstance(cone, ConeToMeasure):
+                raise StudyError(
+                    "This window's cone was never determined. `cone: auto` is "
+                    "read off the pull that seeds the windows, so it needs a "
+                    "study that pulls -- a `steered` block beside the "
+                    "`umbrella` one, or `seed_from` naming a finished pull. "
+                    "Without one, give the cone a `half_angle_deg` and an "
+                    "`axis_selection` outright.", code="simulation.cone.unmeasured")
+            # The atoms a measurement chose, where there was one. Otherwise
+            # the selection, resolved here rather than carried as text: a
+            # selection matching nothing has to fail before a window runs for
+            # a day rather than inside PLUMED's parser afterwards.
+            axis_atoms = list(cone.axis_atoms or ())
+            if not axis_atoms:
+                import mdtraj as _md
+
+                mdtop = _md.load(str(topology_path)).topology
+                axis_atoms = [int(i) for i in mdtop.select(cone.axis_selection)]
+            if not axis_atoms:
+                raise StudyError(
+                    f"The cone's axis selection {cone.axis_selection!r} "
+                    "matched no atoms, so there is no direction for the cone "
+                    "to point away from.", code="simulation.cv.selection_empty")
+            site, ligand = (("site", "lig")
+                            if cv_plan.collective_variable == "ligand_distance"
+                            else ("b", "a"))
+            lines = lines + cone.plumed_lines(axis_atoms, site=site,
+                                              ligand=ligand)
+            logger.info(
+                "Cone: the ligand is held within %g degrees of the axis out "
+                "of %r, a cap %.1f%% of a sphere. A binding free energy "
+                "computed under it needs %+.2f kJ/mol adding back, and the "
+                "run records the angle so the wall can be checked against "
+                "the bound state.",
+                cone.half_angle_deg, cone.axis_selection,
+                100.0 * cone.solid_angle(temperature_K) / (4.0 * math.pi),
+                cone.correction_kjmol(temperature_K))
+        script_path = Path(output_dir) / "umbrella.plumed"
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text(window.plumed_lines(lines, cone=cone),
+                               encoding="utf-8")
+        # The same restraint, writing somewhere else. A held window runs
+        # through equilibration too, and putting both in COLVAR left a file
+        # that began at 500 ps, lost what NVT wrote, and ran its clock
+        # backwards in the middle -- because production resets the counter.
+        # Every reader of that file, FastMDXplora's and the user's, had to know all
+        # three things. COLVAR is production and nothing else, as it has
+        # always been; the equilibration has its own name.
+        settling_path = Path(output_dir) / "umbrella_equilibration.plumed"
+        settling_path.write_text(
+            window.plumed_lines(lines, colvar="COLVAR.equilibration",
+                                restart=True, cone=cone),
+            encoding="utf-8")
+        logger.info(
+            "Umbrella window %d prepared: %s held at %g with k=%g. "
+            "The restraint is on from minimisation onwards, not from "
+            "production: a window left free while it equilibrates "
+            "equilibrates somewhere else.",
+            window.index, cv_plan.collective_variable, window.centre,
+            window.force_constant)
+        # Held from the first step, not from production. A window is a
+        # restraint at a position, and equilibrating without it equilibrates
+        # a different system: the structure this window starts from is the
+        # one frame of a pull that sits at this centre, and left free it
+        # relaxes down the gradient it was chosen from. C1b seeded thirty
+        # windows to within 0.0006 nm of their centres and twenty-six of them
+        # began production more than four sigma away -- the window seeded at
+        # 2.0020 nm started at 0.8879, having slid 1.11 nm while nothing held
+        # it. The restraint then dragged each back out, which mostly works
+        # and did not work at the one window whose centre sits just past a
+        # barrier.
+        #
+        # Metadynamics is the opposite case and keeps the old behaviour:
+        # there is no position to hold, and hills deposited during
+        # equilibration would bias a surface with a system still equilibrating.
+        plumed = {"enabled": True, "script": str(settling_path),
+                  "hold_from_the_start": True,
+                  "production_script": str(script_path)}
+
+    if len([x for x in (steered, metadynamics, umbrella) if x]) > 1:
+        raise StudyError(
+            "A run can be steered, biased with metadynamics, or held in an "
+            "umbrella window -- not more than one. They are different ways "
+            "of moving the same coordinate and their forces would add."
+        , code="config.option.conflicting")
+
+    if steered and metadynamics:
+        raise StudyError(
+            "A run can be steered or biased with metadynamics, not both: "
+            "they are two ways of moving the same coordinate and their "
+            "forces would add. Pick one."
+        , code="config.option.conflicting")
+
+    if steered:
+        from fastmdxplora.simulation.steered import (
+            build_steered_script,
+            plan_steered,
+        )
+
+        # The structure is handed over so `from` can default to where the
+        # system already is. Without it the user has to measure the
+        # variable by hand and type it back in -- a number this already
+        # holds.
+        #
+        # Measured twice where it was not given. Here, from the structure
+        # the run starts out with, so the script on disk is complete and a
+        # reader can see what it will do; and again at production, from the
+        # state equilibration actually produced, which is where the pull
+        # begins and therefore where its anchor belongs. The two differ by
+        # a few hundredths of a nanometre -- 0.287 against 0.334 in the
+        # study this was written for -- which is small and is not nothing,
+        # since an anchor behind the system pulls backwards on the first
+        # step.
+        measure_the_anchor_again = steered.get("from") is None
+        steered_plan = plan_steered(
+            steered, topology, temperature_K=temperature_K,
+            structure=str(topology_path) if topology_path else None)
+        script = build_steered_script(
+            steered_plan, reference_pdb=str(topology_path)
+            if steered_plan.cv.collective_variable == "ligand_rmsd" else None)
+        script_path = Path(output_dir) / "steered.plumed"
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text(script, encoding="utf-8")
+        if measure_the_anchor_again:
+            # Read again at production, from the state equilibration made.
+            # This belongs to the pull and lived, for one release, in the
+            # umbrella branch above -- where the name it tests is never
+            # assigned, so every window raised UnboundLocalError on its
+            # first second. Three `plumed = {...}` lines in one function and
+            # the edit landed on the wrong one.
+            reanchor_after_equilibration = {"spec": dict(steered),
+                                            "temperature_K": temperature_K}
+        else:
+            reanchor_after_equilibration = None
+
+        rate = steered_plan.rate_per_ns(timestep_fs)
+        logger.info(
+            "Steered pull prepared: production steers %s to %g over %s "
+            "steps%s. This gives a pathway and the work done along it, not a "
+            "free energy.",
+            steered_plan.cv.collective_variable, steered_plan.to_value,
+            f"{steered_plan.steps:,}",
+            f" ({rate:.3g} per ns)" if rate is not None else "",
+        )
+        plumed = {"enabled": True, "script": str(script_path)}
+        if reanchor_after_equilibration:
+            plumed["reanchor"] = reanchor_after_equilibration
+
+    # The metadynamics input again, with the cell known: a distance is
+    # bounded by the periodic cell, so it can be gridded once equilibration
+    # has equilibrated the cell, which is when the bias goes on.
+    metad_script_in: Callable[[Any], str] | None = None
+    if metadynamics:
+        # A named collective variable becomes PLUMED input, which the existing
+        # integration then runs. Written to the output directory rather than
+        # kept in memory: it decides what the run measures, and somebody
+        # checking a result should be able to read it.
+        from fastmdxplora.simulation.metadynamics import (
+            build_plumed_script,
+            build_plumed_script_pair,
+            plan_from_config,
+            plan_pair_from_config,
+        )
+
+        # Variables that are defined against a reference structure. Passing
+        # the reference only for ligand_rmsd left `q` raising "no reference
+        # structure was given" the first time anyone ran it from a config,
+        # because the set of native contacts is fixed by that structure the
+        # same way a reference RMSD is.
+        needs_reference = {"ligand_rmsd", "q"}
+
+        # `bias_plan`, not `plan`: `plan` is the stage plan -- a dict of step
+        # counts that the rest of this function subscripts. Rebinding it to a
+        # MetadynamicsPlan made the next `plan["nvt_steps"]` raise
+        # "'MetadynamicsPlan' object is not subscriptable", so metadynamics
+        # failed on the first line of use. Thirty-eight tests cover the module
+        # and twenty-three the surface; none of them runs the runner, which is
+        # where the two names met.
+        if metadynamics.get("variables"):
+            bias_plan = plan_pair_from_config(
+                metadynamics, topology, temperature_K=temperature_K)
+            biased = bias_plan.collective_variables
+            reference = (str(topology_path)
+                         if needs_reference & set(biased) else None)
+            script = build_plumed_script_pair(
+                bias_plan, reference_pdb=reference)
+            metad_script_in = functools.partial(
+                build_plumed_script_pair, bias_plan, reference_pdb=reference)
+            described = " and ".join(biased)
+            bias_factor = bias_plan.first.bias_factor
+        else:
+            bias_plan = plan_from_config(
+                metadynamics, topology, temperature_K=temperature_K)
+            reference = (str(topology_path)
+                         if bias_plan.collective_variable in needs_reference
+                         else None)
+            script = build_plumed_script(bias_plan, reference_pdb=reference)
+            metad_script_in = functools.partial(
+                build_plumed_script, bias_plan, reference_pdb=reference)
+            described = bias_plan.collective_variable
+            bias_factor = bias_plan.bias_factor
+
+        script_path = Path(output_dir) / "metadynamics.plumed"
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text(script, encoding="utf-8")
+        logger.info(
+            "Metadynamics prepared on %s. %s The bias is applied to "
+            "production only; minimisation and equilibration run unbiased.",
+            described,
+            "Well-tempered." if bias_factor > 1 else
+            "Not well-tempered: the bias will not converge and the surface "
+            "will not converge.",
+        )
+        plumed = {"enabled": True, "script": str(script_path)}
+
+    # PLUMED biasing is added just before production for metadynamics and for
+    # a pull, which is the standard protocol: equilibrate unbiased, then bias.
+    # An umbrella window sets `hold_from_the_start` and is attached before
+    # minimisation instead -- see `_attach_the_bias` and Stage 4 below.
+
+    # ---- Platform ------------------------------------------------------
+    platform_obj, platform_props, platform_name = select_platform(
+        omm, requested=platform, precision=precision, device_index=device_index
+    )
+
+    # ---- Integrator + Simulation ---------------------------------------
+    integrator = _make_integrator(
+        omm,
+        name=integrator,
+        temperature_K=temperature_K,
+        friction_per_ps=friction_per_ps,
+        timestep_fs=timestep_fs,
+        error_tolerance=integrator_error_tolerance,
+        random_seed=random_seed,
+    )
+    simulation = omm["Simulation"](
+        topology, system, integrator, platform_obj, platform_props
+    )
+    simulation.context.setState(state)
+    _validate_state_finite(omm, simulation, stage="loading state.xml")
+
+    if resume_from is not None:
+        # Before the load: would this run continue the checkpoint, or
+        # minimise and equilibrate it again? The sidecar says what stage
+        # wrote it; the plan says what this run would do to it.
+        check_continuation(resume_from, minimize=bool(minimize),
+                           nvt_steps=int(plan["nvt_steps"]), npt_steps=int(plan["npt_steps"]),
+                           timestep_fs=float(timestep_fs))
+        # require_seal: the predecessor is sealed on a clean finish, so a
+        # missing seal means it was killed. Resuming one is allowed only
+        # when the caller says so by passing resume_unsealed, which a study
+        # continuation does for itself; OpenMM still refuses a checkpoint it
+        # cannot read, which is what a torn write leaves. Nothing is
+        # assumed about the file beyond its own validation.
+        load_checkpoint(omm, simulation, resume_from,
+                        require_seal=not bool(resume_unsealed))
+        _validate_state_finite(omm, simulation, stage="loading the checkpoint")
+        logger.info("Resumed from %s", Path(resume_from).as_posix())
+
+    # Output paths
+    traj_path = output_dir / "production.dcd"
+    minimized_state_path = output_dir / "state_minimized.xml"
+    final_state_path = output_dir / "state_final.xml"
+    energy_csv = output_dir / "energy.csv"
+    log_path = output_dir / "simulation.log"
+    # Copy topology so the analysis phase finds it at the expected path.
+    topo_out = output_dir / "topology.pdb"
+    if not topo_out.exists() or topo_out.resolve() != topology_path.resolve():
+        shutil.copy2(topology_path, topo_out)
+
+    # Open the log file once and route the per-stage progress notes
+    # through it in addition to whatever on_progress does.
+    log_fh = log_path.open("w", encoding="utf-8")
+    #: What the run's record should say of how it went, for its manifest.
+    run_notes: list[str] = []
+    telemetry = None
+    if live_telemetry:
+        from fastmdxplora.gui.telemetry import TelemetryWriter
+
+        planned_frames = (
+            plan["production_steps"] // trajectory_interval_steps
+            if trajectory_interval_steps and plan["production_steps"] > 0 else 0
+        )
+        telemetry = TelemetryWriter(
+            output_dir,
+            enabled=True,
+            total_steps=total_planned_steps,
+            planned_frames=planned_frames,
+            timestep_fs=timestep_fs,
+            platform=platform_name,
+            # `Precision` is a property of the GPU platforms only, so whether
+            # the requested value is in force depends on what was selected.
+            # The page needs both to say which happened.
+            precision=precision,
+            precision_applied=bool(platform_props.get("Precision")),
+            target_temperature_K=temperature_K,
+        )
+        # The explanations reach the GUI's log as well as the terminal. The
+        # Log tab's "why" filter had nothing to show: the explain text was
+        # printed by the caller's hook and never written as an event.
+        _print_explanation = on_explain
+
+        def on_explain(key: str | None) -> None:  # noqa: F811 - deliberate
+            if _print_explanation is not None:
+                _print_explanation(key)
+            if key and telemetry is not None:
+                from fastmdxplora.explain import explain as _explain
+
+                found = _explain(key)
+                if found is not None:
+                    text = found.why.strip()
+                    if found.reference:
+                        text += f"\n\u2192 {found.reference}"
+                    try:
+                        telemetry.event(text, level="explain")
+                    except Exception:  # noqa: BLE001 - not load-bearing
+                        pass
+        telemetry.event("Live simulation telemetry started")
+        telemetry.write_status(
+            stage="loading",
+            status="running",
+            current_step=0,
+            total_planned_steps=total_planned_steps,
+            # Each stage's steps, so the page can say how far production
+            # has run rather than the steps of every stage together.
+            nvt_steps_planned=int(plan["nvt_steps"]),
+            npt_steps_planned=int(plan["npt_steps"]),
+            production_steps_planned=int(plan["production_steps"]),
+            current_checkpoint_path=(output_dir / "checkpoint.chk").as_posix(),
+        )
+
+    def _bar(label: str, done: int, total: int, rate, left) -> None:
+        """Show how far through a stage the run is, without logging it.
+
+        Deliberately not written to the run log: a bar is for somebody
+        watching, and a file full of the same line at one per cent intervals
+        is noise where the log's job is to record what happened.
+        """
+        if on_step_progress is not None:
+            on_step_progress(label, done, total, rate, left)
+
+    def _log_step(msg: str) -> None:
+        log_fh.write(msg + "\n")
+        log_fh.flush()
+        if telemetry is not None:
+            telemetry.event(msg)
+        if on_progress:
+            on_progress(msg)
+
+    bias_is_attached: list[int] = []
+
+    def _attach_the_bias(*, resolved_name: str = "plumed.dat") -> None:
+        """Put the PLUMED force on the system, once.
+
+        Called either before minimisation -- for an umbrella window, which
+        has to be held while it equilibrates or it equilibrates somewhere
+        else -- or immediately before production, which is right for
+        metadynamics and for a pull. The list is the guard: attaching twice
+        would apply the restraint twice and halve the width of every window.
+        It holds the force's index, so `_swap_in_the_production_bias` can
+        take the equilibration one off again.
+        """
+        if not plumed or bias_is_attached:
+            return
+        from fastmdxplora.simulation.plumed import add_plumed_force
+        from fastmdxplora.utils.native_output import suppress_native_output
+
+        # The anchor, from the state equilibration produced rather than the
+        # one it started from. The force is attached here, so the script is
+        # still FastMDXplora's to rewrite, and this is the first moment the positions
+        # the pull will actually begin at exist. An umbrella window never
+        # carries one: its centre is fixed by the plan, and a window
+        # re-anchored to wherever it drifted is a different window.
+        reanchor = plumed.pop("reanchor", None)
+        if reanchor:
+            _anchor_the_pull_where_it_starts(
+                simulation, topology, reanchor,
+                Path(plumed["script"]), topology_path)
+        if metad_script_in is not None:
+            _grid_by_the_cell(simulation, metad_script_in, Path(plumed["script"]),
+                              unit=omm["unit"])
+
+        # PLUMED prints its whole setup at the moment the context takes the
+        # force: which atoms the variable is built from, the hill width, the
+        # pace, the bias factor, the temperature it inferred. Forty lines,
+        # written from C++ straight to the file descriptor, arriving in the
+        # middle of a progress bar. It is provenance and worth keeping, so it
+        # goes to a file beside the run rather than to the terminal or to
+        # nowhere.
+        plumed_log = Path(output_dir) / "plumed.log"
+        with suppress_native_output(into=plumed_log):
+            plumed_force = add_plumed_force(
+                omm, system, plumed, Path(output_dir),
+                resolved_name=resolved_name)
+            if plumed_force is not None:
+                simulation.context.reinitialize(preserveState=True)
+        # `addForce` appends, so the force just added is the last one.
+        bias_is_attached.append(system.getNumForces() - 1)
+        if plumed_force is not None:
+            logger.info(
+                "PLUMED enabled: biasing force added; resolved script "
+                "-> %s", (Path(output_dir) / resolved_name).as_posix())
+        if plumed_log.is_file():
+            logger.info("PLUMED's own setup log -> %s", plumed_log.as_posix())
+
+    def _swap_in_the_production_bias() -> None:
+        """Change which file the restraint writes to, at production.
+
+        The window is held throughout, but the trace belongs in two files.
+        `COLVAR` is production and nothing else -- what it has always been,
+        what `collect_samples` reads, and what a person plots. The
+        equilibration goes to `COLVAR.equilibration`.
+
+        The script is fixed when the force is built, so pointing it at a
+        different file means a different force: the equilibration one comes
+        off and the production one goes on. Both hold the same coordinate at
+        the same centre with the same constant, so nothing the system feels
+        changes across the swap.
+        """
+        production = (plumed or {}).get("production_script")
+        if not production or not bias_is_attached:
+            return
+        _remove_force(system, bias_is_attached.pop())
+        plumed["script"] = production
+        _attach_the_bias(resolved_name="plumed.dat")
+
+    try:
+        # The window is held before anything moves. Minimisation alone will
+        # not carry a ligand across a barrier, but it is the first stage that
+        # moves atoms and there is no reason for it to run free.
+        if plumed and plumed.get("hold_from_the_start"):
+            _attach_the_bias(resolved_name="plumed_equilibration.dat")
+
+        if not minimize and resume_from is None:
+            assigned = _velocities_assigned_at(state_xml_path)
+            if assigned is not None and abs(assigned - float(temperature_K)) > 1e-6:
+                said = (f"Starting from the prepared system's velocities, assigned "
+                        f"at {assigned:.1f} K, for a run at {float(temperature_K):.1f} K: "
+                        "minimization is off, so they are not reassigned. With "
+                        "`minimize: true` they are assigned at the run's own.")
+                # Printed once, by the logger; the log file, the live
+                # events (as a warning) and the run's record carry it too.
+                logger.warning(said)
+                log_fh.write(said + "\n")
+                log_fh.flush()
+                if telemetry is not None:
+                    telemetry.event(said, level="warning")
+                run_notes.append(said)
+
+        # ---- Stage 1: Minimize ----------------------------------------
+        if minimize:
+            if telemetry is not None:
+                telemetry.mark_stage("minimization", "current", status="running", current_step=0)
+                telemetry.event("Minimization started")
+            _run_minimize(
+                omm,
+                simulation,
+                tolerance_kjmol_per_nm=minimize_tolerance_kjmol_per_nm,
+                max_iterations=minimize_max_iterations,
+                on_progress=_log_step,
+                on_explain=on_explain,
+            )
+            _validate_state_finite(omm, simulation, stage="minimization")
+            if random_seed is None:
+                simulation.context.setVelocitiesToTemperature(
+                    temperature_K * unit.kelvin
+                )
+            else:
+                simulation.context.setVelocitiesToTemperature(
+                    temperature_K * unit.kelvin,
+                    int(random_seed),
+                )
+            _log_step(f"Reset velocities to {temperature_K:.1f} K after minimization")
+            minimized_state = simulation.context.getState(
+                getPositions=True,
+                getVelocities=True,
+                enforcePeriodicBox=True,
+            )
+            with minimized_state_path.open("w", encoding="utf-8") as fh:
+                fh.write(omm["openmm"].XmlSerializer.serialize(minimized_state))
+            if telemetry is not None:
+                _append_live_metric(
+                    omm,
+                    simulation,
+                    telemetry,
+                    stage="minimization",
+                    step=0,
+                    total_steps=total_planned_steps,
+                    timestep_fs=timestep_fs,
+                )
+                telemetry.mark_stage("minimization", "completed", status="running", current_step=0)
+                telemetry.event("Minimization completed")
+        elif telemetry is not None:
+            telemetry.mark_stage("minimization", "skipped", status="running", current_step=0)
+            telemetry.event("Minimization skipped")
+
+        # ---- Stage 2: NVT equilibration -------------------------------
+        # Use the integrator's existing thermostat (Langevin). No barostat.
+        # Restraints start at full strength: this is the stage they exist for,
+        # where the solvent is finding its arrangement and the solute should
+        # not be moving while it does.
+        _hold_at(0.0)
+        if restraint_parameters and plan["nvt_steps"] + plan["npt_steps"] > 0:
+            if restrain_production:
+                # Not let go in stages, which is what the explanation says.
+                _log_step("The solute is held by its restraints, through "
+                          "production as asked")
+            else:
+                _log_step("The solute is held by its restraints while the "
+                          "water equilibrates")
+                if on_explain:
+                    on_explain("restraints")
+
+        # The ladder was sampled at two points -- once before NVT and once
+        # before NPT -- so a four-rung ladder reached 1000 and 100 and never
+        # 500 or 0. With `npt_steps: 0` the second sat inside a branch that
+        # did not run, so the restraint held at full strength for the whole
+        # of equilibration and dropped to zero at production: the release all
+        # at once that the ladder exists to prevent, from a setting the user
+        # had written out in four steps.
+        #
+        # Equilibration is one span whether or not a barostat runs in part of
+        # it, so the fraction is measured across both stages together.
+        _equilibration_steps = plan["nvt_steps"] + plan["npt_steps"]
+
+        def _ladder_over(stage_steps: int, already_done: int):
+            """Step the restraints as a stage runs, or nothing to do."""
+            if not restraint_parameters or _equilibration_steps <= 0:
+                return None
+            last_reported: list[float] = []
+
+            def _hook(fraction_of_stage: float) -> None:
+                through = (already_done + fraction_of_stage * stage_steps) / (
+                    _equilibration_steps)
+                share = _hold_at(min(1.0, through))
+                if not last_reported or last_reported[-1] != share:
+                    last_reported.append(share)
+                    logger.info(
+                        "Restraints now at %.0f%% of their force constants "
+                        "(%.0f%% through equilibration).", 100.0 * share,
+                        100.0 * through)
+
+            return _hook
+
+        # Equilibration's own log, under its own name. It used to share
+        # `energy.csv` with production, so a reader could not tell which
+        # rows were the system being driven and which were the system being
+        # measured, and neither could anything computing a statistic.
+        equilibration_log = _attach_state_reporter(
+            omm, simulation, Path(output_dir) / "equilibration_energy.csv",
+            interval=state_interval_steps,
+            total_steps=plan["nvt_steps"] + plan["npt_steps"],
+        )
+        current_step = 0
+        # The clock for what this run cost. Started after the system is
+        # built and before the first step, so it times integration rather
+        # than setup -- setup does not scale with step count and charging
+        # it to the constant would overstate short runs badly.
+        run_started = datetime.now(timezone.utc)
+        if telemetry is not None:
+            if plan["nvt_steps"] > 0:
+                telemetry.mark_stage("nvt", "current", status="running", current_step=current_step)
+                telemetry.event("NVT started")
+            else:
+                telemetry.mark_stage("nvt", "skipped", status="running", current_step=current_step)
+                telemetry.event("NVT skipped (0 steps)")
+        if telemetry is not None:
+            current_step = _run_md_stage_with_live_metrics(
+                omm,
+                simulation,
+                telemetry,
+                n_steps=plan["nvt_steps"],
+                label="NVT equilibration",
+                on_progress=_log_step,
+                on_explain=on_explain,
+                current_step=current_step,
+                total_steps=total_planned_steps,
+                timestep_fs=timestep_fs,
+                telemetry_interval=telemetry_interval,
+                on_step_progress=_bar,
+                on_fraction=_ladder_over(plan["nvt_steps"], 0),
+            )
+        else:
+            _run_md_stage(
+                simulation,
+                n_steps=plan["nvt_steps"],
+                label="NVT equilibration",
+                on_progress=_log_step,
+                on_explain=on_explain,
+                on_step_progress=_bar,
+                timestep_fs=timestep_fs,
+                on_fraction=_ladder_over(plan["nvt_steps"], 0),
+            )
+            current_step += plan["nvt_steps"]
+        _validate_state_finite(omm, simulation, stage="NVT equilibration")
+        if telemetry is not None:
+            _append_live_metric(
+                omm,
+                simulation,
+                telemetry,
+                stage="NVT",
+                step=current_step,
+                total_steps=total_planned_steps,
+                timestep_fs=timestep_fs,
+            )
+            if plan["nvt_steps"] > 0:
+                telemetry.mark_stage("nvt", "completed", status="running", current_step=current_step)
+                telemetry.event("NVT completed")
+
+        # No boundary sample here any more: the ladder steps continuously
+        # across equilibration, so setting it to the halfway value at the
+        # start of NPT would jump it backwards or forwards depending on how
+        # the two stages are divided.
+
+        # ---- Stage 3: NPT equilibration -------------------------------
+        # Which ensemble production runs in, decided once and read by both
+        # the warning below and the barostat above it. They used to ask
+        # `npt_steps > 0` separately, which was fine while that number
+        # answered both questions and wrong the moment it stopped: a
+        # resumed segment with `ensemble: npt` and no equilibration got its
+        # barostat and a warning saying it had none.
+        #
+        # A warning that says the opposite of what happened is worse than
+        # no warning. Somebody reads it, believes the run was at fixed
+        # volume, and discards or defends a result on that basis.
+        wants_npt_production = resolve_ensemble({
+            "ensemble": ensemble,
+            "npt_steps": plan["npt_steps"],
+        }) == "npt"
+
+        if not plan["npt_steps"] > 0 and not wants_npt_production:
+            # Solvation packs a box that is not at the density of water. A
+            # real run measured 0.92 g/mL and held it there for every step,
+            # because the barostat is the only thing that fixes it: the same
+            # system under NPT contracted by 11% by volume to reach 1.03.
+            # An under-dense box has voids, water accelerates into them, and
+            # that is a plausible route to the integration failures seen on
+            # exactly these runs. Reported rather than corrected, because
+            # skipping NPT is a legitimate choice and how far off the density
+            # is depends on the system -- but it should not be silent.
+            _warn_density_was_never_equilibrated(
+                simulation, system, temperature_K=temperature_K)
+            # The measured number, then why it is a number worth reading.
+            if on_explain:
+                on_explain("ensemble_choice")
+
+        # `npt_steps` says how long to equilibrate at constant pressure;
+        # `ensemble` says what production runs in. Resolved above, because
+        # the warning needs the same answer.
+        barostat_index = None
+        barostat_kind = None
+        if plan["npt_steps"] > 0 or wants_npt_production:
+            membrane_system = is_membrane_system(topology)
+            barostat_kind = "membrane" if membrane_system else "isotropic"
+            barostat_index = _add_barostat(
+                omm, system,
+                temperature_K=temperature_K,
+                pressure_bar=resolved_pressure_bar,
+                membrane=membrane_system,
+                frequency=barostat_frequency,
+            )
+            simulation.context.reinitialize(preserveState=True)
+            if membrane_system:
+                _log_step("Pressure coupled in the membrane plane and along "
+                          "its normal separately")
+                if on_explain:
+                    on_explain("membrane_barostat")
+        if plan["npt_steps"] > 0:
+            if telemetry is not None:
+                telemetry.mark_stage("npt", "current", status="running", current_step=current_step)
+                telemetry.event("NPT started")
+            if telemetry is not None:
+                current_step = _run_md_stage_with_live_metrics(
+                    omm,
+                    simulation,
+                    telemetry,
+                    n_steps=plan["npt_steps"],
+                    label="NPT equilibration",
+                    on_progress=_log_step,
+                on_explain=on_explain,
+                    current_step=current_step,
+                    total_steps=total_planned_steps,
+                    timestep_fs=timestep_fs,
+                    telemetry_interval=telemetry_interval,
+                    on_step_progress=_bar,
+                    on_fraction=_ladder_over(
+                        plan["npt_steps"], plan["nvt_steps"]),
+                )
+            else:
+                _run_md_stage(
+                    simulation,
+                    n_steps=plan["npt_steps"],
+                    label="NPT equilibration",
+                    on_progress=_log_step,
+                    on_explain=on_explain,
+                    on_step_progress=_bar,
+                    timestep_fs=timestep_fs,
+                    on_fraction=_ladder_over(
+                        plan["npt_steps"], plan["nvt_steps"]),
+                )
+                current_step += plan["npt_steps"]
+            _validate_state_finite(omm, simulation, stage="NPT equilibration")
+            if telemetry is not None:
+                _append_live_metric(
+                    omm,
+                    simulation,
+                    telemetry,
+                    stage="NPT",
+                    step=current_step,
+                    total_steps=total_planned_steps,
+                    timestep_fs=timestep_fs,
+                )
+                telemetry.mark_stage("npt", "completed", status="running", current_step=current_step)
+                telemetry.event("NPT completed")
+        elif telemetry is not None:
+            telemetry.mark_stage("npt", "skipped", status="running", current_step=current_step)
+            telemetry.event("NPT skipped (0 steps)")
+
+        # The barostat comes off before production for an NVT run, the same
+        # way restraints do below and for the same reason: production must
+        # be in the ensemble the study asked for, not whatever
+        # equilibration happened to leave behind.
+        #
+        # This is the combination that could not be expressed while one
+        # setting answered both questions -- equilibrate at constant
+        # pressure so the density is one a barostat found, then fix the box
+        # there and produce at constant volume. Asking for NVT without the
+        # first half fixes the box at whatever solvation produced, which
+        # this package's own explain text calls the option nobody intends.
+        if barostat_index is not None and not wants_npt_production:
+            _remove_force(system, barostat_index)
+            simulation.context.reinitialize(preserveState=True)
+            logger.info(
+                "Barostat removed before production: NVT at the density "
+                "NPT equilibration arrived at, rather than the one "
+                "solvation produced."
+            )
+            if on_explain:
+                on_explain("ensemble_choice")
+
+        # Restraints come off before production, because a biased production
+        # run measures the bias. Keeping them is possible and has to be asked
+        # for by name, and the manifest records that the trajectory was
+        # restrained -- a reader comparing it against a free one otherwise has
+        # no way to know.
+        if restraint_parameters:
+            if restrain_production:
+                _hold_by(1.0)
+                logger.warning(
+                    "Restraints are still applied during production, at "
+                    "their full force constants (%s), and were not released "
+                    "during equilibration. The trajectory is biased and "
+                    "flexibility analyses run on it -- RMSF, clustering, "
+                    "dimensionality reduction -- describe the restraint as "
+                    "much as the system.",
+                    ", ".join(f"{r['kind']} {r['force_constant']:g} {r['units']}"
+                              for r in resolved_restraints),
+                )
+            else:
+                # Zero, not the ladder's last step: a ladder ending above
+                # zero ended equilibration there, and production is free.
+                _hold_by(0.0)
+                logger.info("Restraints released for production.")
+
+        # ---- The clock starts here ------------------------------------
+        #
+        # Production is what a user means by "the simulation": the frames
+        # the analysis reads, the nanoseconds a methods section quotes, the
+        # time axis of every plot. Equilibration is what it took to reach
+        # somewhere worth measuring from, and it is a separate quantity.
+        #
+        # OpenMM counts from the beginning of the run, and nothing here
+        # said otherwise -- so a 10 ns production after 1.5 ns of
+        # equilibration began at step 750,000 and at time 1500 ps, and
+        # everything downstream inherited the offset. COLVAR's time column.
+        # The energy log. And, expensively, PLUMED's MOVINGRESTRAINT: its
+        # `STEP0=0` meant "1.5 nanoseconds ago", so the anchor entered
+        # production already 15% along its path, sat 0.243 nm outside the
+        # ligand it was supposed to be sitting on, and threw it out of the
+        # binding well with 147 kJ/mol before a single frame was written.
+        #
+        # Reset before the force is attached, so PLUMED is built against a
+        # counter that starts where the pull starts.
+        simulation.context.setStepCount(0)
+        simulation.context.setTime(0.0)
+        simulation.currentStep = 0
+
+        # The energy log follows the same rule. It held equilibration and
+        # production in one file with one step column, so every statistic
+        # computed from it -- correlation time, effective sample size,
+        # anything with an equilibration region -- was measured over a series
+        # that begins with a system deliberately being driven somewhere.
+        # Equilibration is still recorded, beside the run, under its own
+        # name; `energy.csv` is production.
+        _close_one_reporter(simulation, equilibration_log)
+        _attach_state_reporter(
+            omm, simulation, energy_csv,
+            interval=state_interval_steps,
+            total_steps=plan["production_steps"],
+        )
+
+        # ---- Stage 4: Production --------------------------------------
+        # Production runs in NPT (the standard default ensemble).
+        #
+        # Metadynamics and a pull are biased from here: the standard
+        # protocol equilibrates unbiased and biases production. An umbrella
+        # window has been held since before minimisation and only changes
+        # which file it writes to -- the same rule the energy log above
+        # follows, where equilibration is kept under its own name and
+        # `energy.csv` is production. Both happen after the counter and the
+        # clock are reset, so COLVAR starts at zero like everything else.
+        _swap_in_the_production_bias()
+        _attach_the_bias()
+        saved_atoms, saved_description = resolve_save_selection(
+            topology, save_selection)
+        _attach_dcd_reporter(
+            omm, simulation, traj_path,
+            interval=trajectory_interval_steps, atom_subset=saved_atoms,
+        )
+        saved_topology = write_trajectory_topology(
+            topology,
+            simulation.context.getState(getPositions=True).getPositions(),
+            output_dir / "trajectory_topology.pdb", saved_atoms,
+        )
+        logger.info(
+            "Saving %s to the trajectory.%s",
+            saved_description,
+            "" if saved_atoms is None else
+            f" The topology that matches it is {saved_topology.name}; the "
+            "full system is still in setup/. Analyses of the solvent "
+            "itself need `save_selection: all`.",
+        )
+        # Where production begins, so what it produced can be measured from
+        # steps actually run rather than from the steps that were planned.
+        production_start_step = current_step
+        if umbrella:
+            # What this window was, beside the window. Read by anything
+            # asking what the run held and how hard, which otherwise has to
+            # find the study's plan and index into it.
+            #
+            # It does not say where production begins, and an earlier version
+            # did. The step count above is the runner's own, and a few lines
+            # up production reset the context's counter and clock to zero --
+            # so a record saying "production starts at 100 ps" described a
+            # file whose production rows begin at 0.2. `collect_samples`
+            # reads the boundary off the clock instead, where it is visible:
+            # the time column jumps backwards exactly once, at this reset.
+            (Path(output_dir) / "umbrella_window.json").write_text(
+                json.dumps({
+                    "index": int(umbrella.get("index", 0)),
+                    "centre": float(umbrella["centre"]),
+                    "force_constant": float(umbrella["force_constant"]),
+                    "held_from_the_start": True,
+                    "equilibration_steps": int(production_start_step),
+                    "equilibration_ps": float(
+                        production_start_step * timestep_fs / 1000.0),
+                    # Which file holds what, said once, beside the files.
+                    "colvar": "COLVAR is production only",
+                    "equilibration_colvar": "COLVAR.equilibration",
+                    # The cone this window ran under, where it ran under one.
+                    # Carried per window rather than only in the study's plan
+                    # because the correction it implies belongs to the window
+                    # that was restrained, and a study recombined from runs on
+                    # disk should not need the config to know.
+                    "cone": (cone.as_record(temperature_K)
+                             if cone is not None else None),
+                }, indent=2),
+                encoding="utf-8")
+        # Checkpoints on frames. A continuation's frames start from its own
+        # zero at the checkpoint, so a checkpoint between frames made the
+        # joined trajectory's spacing change at the join: 100,000 steps
+        # against the 750 a 3 ns run chooses leaves every checkpoint 250
+        # steps off a frame.
+        if (trajectory_interval_steps and checkpoint_interval_steps
+                and checkpoint_interval_steps % trajectory_interval_steps):
+            on_frames = -(-checkpoint_interval_steps // trajectory_interval_steps) * trajectory_interval_steps
+            logger.info(
+                "Checkpoints every %s steps rather than %s: the nearest multiple of the "
+                "%s steps between frames, so a run resumed from one continues the "
+                "trajectory at the same spacing.",
+                f"{on_frames:,}", f"{checkpoint_interval_steps:,}", f"{trajectory_interval_steps:,}")
+            checkpoint_interval_steps = on_frames
+        # Checkpoint reporter for crash recovery / restart.
+        _attach_checkpoint_reporter(
+            omm, simulation, output_dir / "checkpoint.chk",
+            interval=checkpoint_interval_steps,
+            sidecar={"stage": "production", "ensemble": "npt" if wants_npt_production else "nvt",
+                     "temperature_K": float(temperature_K),
+                     "timestep_fs": float(timestep_fs),
+                     "study": str(output_dir.parent),
+                     "trajectory_interval_steps": int(trajectory_interval_steps)},
+        )
+        if telemetry is not None:
+            if plan["production_steps"] > 0:
+                telemetry.mark_stage("production", "current", status="running", current_step=current_step)
+                telemetry.event("Production started")
+            else:
+                telemetry.mark_stage("production", "skipped", status="running", current_step=current_step)
+                telemetry.event("Production skipped (0 steps)")
+        # A stop asked for now ends production on a frame, with a
+        # checkpoint there (see `_StopRequests`).
+        with _StopRequests(folder=output_dir.parent) as stop:
+            if telemetry is not None:
+                current_step = _run_md_stage_with_live_metrics(
+                    omm,
+                    simulation,
+                    telemetry,
+                    n_steps=plan["production_steps"],
+                    label="Production",
+                    on_progress=_log_step,
+                    on_explain=on_explain,
+                    current_step=current_step,
+                    total_steps=total_planned_steps,
+                    timestep_fs=timestep_fs,
+                    telemetry_interval=telemetry_interval,
+                    trajectory_interval_steps=trajectory_interval_steps,
+                    on_step_progress=_bar,
+                    stop=stop,
+                )
+            else:
+                current_step += _run_md_stage(
+                    simulation,
+                    n_steps=plan["production_steps"],
+                    label="Production",
+                    on_progress=_log_step,
+                    on_explain=on_explain,
+                    on_step_progress=_bar,
+                    timestep_fs=timestep_fs,
+                    stop=stop,
+                    frame_interval=trajectory_interval_steps,
+                )
+        if stop.requested:
+            _end_the_stopped_run(
+                simulation, stop, checkpoint=output_dir / "checkpoint.chk",
+                sidecar={"stage": "production",
+                         "ensemble": "npt" if wants_npt_production else "nvt",
+                         "temperature_K": float(temperature_K),
+                         "timestep_fs": float(timestep_fs),
+                         "study": str(output_dir.parent),
+                         "trajectory_interval_steps": int(trajectory_interval_steps)},
+                planned_steps=int(plan["production_steps"]),
+                trajectory_interval_steps=trajectory_interval_steps,
+                timestep_fs=float(timestep_fs))
+
+        # ---- Finalize -------------------------------------------------
+        # Capture the final State for restarts.
+        final_state = simulation.context.getState(
+            getPositions=True,
+            getVelocities=True,
+            enforcePeriodicBox=True,
+        )
+        with final_state_path.open("w", encoding="utf-8") as fh:
+            fh.write(omm["openmm"].XmlSerializer.serialize(final_state))
+
+        # What this run cost, in the three numbers an estimate is built
+        # from. Written because the cost model can otherwise only be
+        # calibrated from a synthetic benchmark, and a machine that has run
+        # real studies knows more about itself than argon does.
+        #
+        # Beside the run rather than in the manifest's phase record because
+        # it belongs to the simulation and not to the orchestration: a study
+        # run through the API without an orchestrator should leave one too.
+        try:
+            wall_seconds = (datetime.now(timezone.utc)
+                            - run_started).total_seconds()
+            (output_dir / "cost.json").write_text(json.dumps({
+                "particles": int(system.getNumParticles()),
+                # Steps integrated in this run. For a resumed segment that
+                # is the segment's own steps, which is what it cost -- the
+                # earlier ones were paid for by an earlier run and are in
+                # its own record.
+                "steps": int(current_step),
+                "seconds": float(wall_seconds),
+                "platform": platform_name,
+                "precision": str(precision),
+                "timestep_fs": float(timestep_fs),
+            }, indent=2), encoding="utf-8")
+        except Exception:  # noqa: BLE001 - a run that finished still finished
+            logger.debug("Could not record what this run cost.")
+
+        # The run reached the end, so write a final checkpoint, seal it, and
+        # record in its sidecar that the run finished. The seal says only
+        # that the file is whole -- every checkpoint along the way is sealed
+        # too -- so "finished" is said in the sidecar, where a join reads it
+        # to know that a run's trajectory has no frames past its checkpoint.
+        checkpoint_path = output_dir / "checkpoint.chk"
+        try:
+            _write_checkpoint_set(simulation, checkpoint_path, dict(
+                stage="production", step=int(simulation.currentStep),
+                ensemble="npt" if wants_npt_production else "nvt", temperature_K=float(temperature_K),
+                timestep_fs=float(timestep_fs), study=str(output_dir.parent), finished=True,
+                trajectory_interval_steps=int(trajectory_interval_steps),
+                time_ps=_time_ps(simulation)))
+        except Exception:  # noqa: BLE001 - a run that finished still finished
+            logger.warning(
+                "Could not write a sealed checkpoint to %s; this run is "
+                "complete but cannot be continued from.",
+                checkpoint_path.as_posix())
+        if telemetry is not None:
+            n_frames = _frames_written(
+                current_step - production_start_step, trajectory_interval_steps
+            )
+            _append_live_metric(
+                omm,
+                simulation,
+                telemetry,
+                stage="production",
+                step=current_step,
+                total_steps=total_planned_steps,
+                timestep_fs=timestep_fs,
+                frame_count=n_frames,
+            )
+            if plan["production_steps"] > 0:
+                telemetry.mark_stage(
+                    "production",
+                    "completed",
+                    status="running",
+                    current_step=current_step,
+                    current_frame_count=n_frames,
+                    simulation_time_completed_ns=(
+                        float(current_step) * float(timestep_fs) / 1_000_000.0
+                    ),
+                )
+                telemetry.event("Production completed")
+            telemetry.write_status(
+                status="running",
+                current_step=current_step,
+                current_frame_count=n_frames,
+                simulation_time_completed_ns=(
+                    float(current_step) * float(timestep_fs) / 1_000_000.0
+                ),
+            )
+
+    except Exception as exc:
+        if (telemetry is not None and getattr(exc, "code", None) == STOPPED_CODE
+                and getattr(exc, "finished", False)):
+            # Stopped at its end: its production is whole, as its sidecar
+            # says, and the run stopped where it was asked to, its later
+            # phases still to run (a piece's run ends here: the join reads
+            # it whole, `joining.piece_finished`).
+            telemetry.event(str(exc), level="warning")
+            # The run's own step (its equilibration's and this), and every
+            # frame its production wrote: the pages count the whole run on.
+            telemetry.mark_stage("production", "completed", status="stopped",
+                                 latest_error=str(exc), current_step=current_step,
+                                 current_frame_count=exc.frames,
+                                 simulation_time_completed_ns=(
+                                     float(current_step) * float(timestep_fs) / 1_000_000.0))
+        elif telemetry is not None and getattr(exc, "code", None) == STOPPED_CODE:
+            # Asked to stop, and stopped where it can be carried on: the
+            # stage it was in stays the one it was in, not a failed one.
+            telemetry.event(str(exc), level="warning")
+            telemetry.write_status(status="stopped", latest_error=str(exc))
+        elif telemetry is not None:
+            telemetry.event(f"error: {type(exc).__name__}: {exc}", level="error")
+            try:
+                from fastmdxplora.gui.telemetry import read_status
+
+                current = str(read_status(output_dir.parent).get("stage") or "production").lower()
+                if current in {"minimization", "nvt", "npt", "production"}:
+                    telemetry.mark_stage(
+                        current,
+                        "failed",
+                        status="failed",
+                        latest_error=f"{type(exc).__name__}: {exc}",
+                    )
+                else:
+                    telemetry.write_status(
+                        status="failed", latest_error=f"{type(exc).__name__}: {exc}"
+                    )
+            except Exception:
+                telemetry.write_status(status="failed", latest_error=f"{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        # Detached here rather than at the end of the `try`, where it was.
+        # Any exception between attaching a reporter and that last statement
+        # -- a NaN state from _validate_state_finite, an OpenMM integration
+        # error, a PLUMED failure -- skipped it entirely and the `except`
+        # re-raised without cleanup. mdtraj's DCD writer flushes per write so
+        # no data was lost, but `_run_sequential` calls `_execute_run` in the
+        # parent process rather than through a pool, so a long sweep leaked
+        # three descriptors per failed run in one long-lived process. The
+        # suite already needs an ulimit of 65536 to finish.
+        _detach_all_reporters(simulation)
+        log_fh.close()
+
+    # Counted from the steps production actually ran, not from the steps it
+    # was planned to run. Reading the DCD header would mean a hard dependency
+    # on mdtraj; step / interval is exact for a fixed reporter interval, and
+    # unlike the plan it is still right when a run stops early -- which is
+    # when a field labelled "actual" matters most.
+    produced_steps = current_step - production_start_step
+    n_frames = _frames_written(produced_steps, trajectory_interval_steps)
+    duration_ns_actual = produced_steps * timestep_fs / 1_000_000.0
+
+    return SimulationResult(
+        notes=list(run_notes),
+        trajectory=traj_path,
+        topology=topo_out,
+        final_state=final_state_path,
+        energy_csv=energy_csv,
+        log_file=log_path,
+        platform_used=platform_name,
+        pressure_bar_used=resolved_pressure_bar,
+        barostat=barostat_kind,
+        n_production_frames=int(n_frames),
+        duration_ns_actual=float(duration_ns_actual),
+        minimized_state=minimized_state_path if minimize else None,
+        # The step plan as this run decided it, and the reporter interval
+        # derived from it. Both were worked out here and went no further,
+        # so a study asking for 50 ns left no record of how many steps that
+        # was -- and the file meant to reproduce it had to ask the same
+        # question again, of whatever version happened to be answering.
+        resolved={
+            "nvt_steps": int(plan["nvt_steps"]),
+            "npt_steps": int(plan["npt_steps"]),
+            "production_steps": int(plan["production_steps"]),
+            # What production ran in, as decided above. A default study's
+            # parameters leave both the ensemble and the NPT stage unset, so
+            # a reader inferring it from them has to know this runner's
+            # defaults to get it right.
+            "ensemble": "npt" if wants_npt_production else "nvt",
+            "trajectory_interval_steps": int(trajectory_interval_steps),
+            # As placed, on frames, which may be later than was asked.
+            "checkpoint_interval_steps": int(checkpoint_interval_steps),
+            "pressure_bar": resolved_pressure_bar,
+            # Only where restraints were applied. The schedule has a
+            # built-in default that a release could change, and a run that
+            # restrained nothing has no schedule to record -- writing one
+            # would put a setting into the config of a study that never
+            # used it.
+            **({**({} if restrain_production else
+                   {"restraint_release": [float(s) for s in release.steps]}),
+                # What was held, at what full strength, toward what target
+                # and in which energy form: the targets a restraint given
+                # none was held at are found here and nowhere else.
+                "restraints_resolved": resolved_restraints}
+               if restraint_parameters else {}),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Convenience reader -- a tiny CSV reader for the energy log (no pandas)
+# ---------------------------------------------------------------------------
+def read_energy_csv(path: str | Path) -> list[dict[str, str]]:
+    """Read an energy.csv file and return a list of dict rows."""
+    p = Path(path)
+    with p.open(newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        return list(reader)
+
+
+def _frames_written(steps: int, interval: int | None) -> int:
+    """Frames a reporter on ``interval`` has written over ``steps`` steps."""
+    if not interval or steps <= 0:
+        return 0
+    return int(steps) // int(interval)
+
+
+def _append_live_metric(
+    omm: dict,
+    simulation: Any,
+    telemetry: Any,
+    *,
+    stage: str,
+    step: int,
+    total_steps: int,
+    timestep_fs: float,
+    frame_count: int | None = None,
+) -> None:
+    """Append one real state sample to live telemetry if OpenMM can provide it."""
+    unit = omm["unit"]
+    try:
+        state = simulation.context.getState(getEnergy=True, enforcePeriodicBox=True)
+    except Exception as exc:  # noqa: BLE001
+        telemetry.event(f"warning: could not sample live metrics ({exc})", level="warning")
+        return
+    potential = _quantity_to_float(state.getPotentialEnergy(), unit.kilojoules_per_mole)
+    kinetic = _quantity_to_float(state.getKineticEnergy(), unit.kilojoules_per_mole)
+    total = None
+    if potential is not None and kinetic is not None:
+        total = potential + kinetic
+    sim_time_ns = float(step) * float(timestep_fs) / 1_000_000.0
+    progress = (float(step) / float(total_steps) * 100.0) if total_steps else None
+    temperature = _temperature_from_kinetic_energy(simulation, kinetic)
+    volume_nm3 = _periodic_volume_nm3(state, unit)
+    density_g_ml = _system_density_g_ml(simulation, unit, volume_nm3)
+    speed_ns_day = _telemetry_speed_ns_day(telemetry, sim_time_ns)
+    telemetry.append_metric(
+        stage=stage,
+        step=step,
+        simulation_time_ns=sim_time_ns,
+        potential_energy=potential,
+        kinetic_energy=kinetic,
+        total_energy=total,
+        temperature=temperature,
+        volume=volume_nm3,
+        density=density_g_ml,
+        speed=speed_ns_day,
+        current_frame_count=frame_count,
+        progress_percent=progress,
+    )
+    stage_text = str(stage).lower()
+    if "minim" in stage_text:
+        stage_key = "minimization"
+    elif "nvt" in stage_text:
+        stage_key = "nvt"
+    elif "npt" in stage_text:
+        stage_key = "npt"
+    elif "production" in stage_text:
+        stage_key = "production"
+    else:
+        stage_key = stage_text
+    telemetry.mark_stage(
+        stage_key,
+        "current",
+        status="running",
+        current_step=step,
+        current_frame_count=frame_count,
+        simulation_time_completed_ns=sim_time_ns,
+    )
+    _maybe_write_live_frame(
+        omm,
+        simulation,
+        telemetry,
+        step,
+        stage=stage_key,
+        simulation_time_ns=sim_time_ns,
+    )
+
+
+def _temperature_from_kinetic_energy(
+    simulation: Any,
+    kinetic_kj_per_mol: float | None,
+) -> float | None:
+    """Estimate instantaneous temperature using OpenMM's standard DOF rule.
+
+    ``T = 2 KE / (N_dof R)`` with ``N_dof = 3 N_massive - N_constraints - 3``
+    (the last only with a ``CMMotionRemover``), where ``N_massive`` counts
+    particles with nonzero mass, as OpenMM's StateDataReporter does. A
+    virtual site, the massless M site of TIP4P-Ew among them, carries no
+    kinetic energy and is no degree of freedom: counting it read a TIP4P-Ew
+    box at 300 K as 197.5 K against OpenMM's 296.4 K, which the GUI then
+    flagged as far from its target.
+    """
+
+    if kinetic_kj_per_mol is None:
+        return None
+    try:
+        system = simulation.system
+        # Counted once per simulation: a sample should not walk every
+        # particle, and a Simulation's System does not change under it.
+        cached = getattr(simulation, "_fastmdx_degrees_of_freedom", None)
+        if cached is not None and cached[0] is system:
+            dof = cached[1]
+        else:
+            dof = _degrees_of_freedom(system)
+            try:
+                simulation._fastmdx_degrees_of_freedom = (system, dof)
+            except AttributeError:
+                pass
+        for index in range(int(system.getNumForces())):
+            force = system.getForce(index)
+            if force.__class__.__name__ == "CMMotionRemover":
+                dof -= 3
+                break
+        if dof <= 0:
+            return None
+        # R in kJ mol^-1 K^-1.  OpenMM's StateDataReporter uses the same
+        # equipartition relation for its Temperature column.
+        gas_constant = 0.00831446261815324
+        return (2.0 * float(kinetic_kj_per_mol)) / (float(dof) * gas_constant)
+    except Exception:  # noqa: BLE001 - telemetry is best-effort
+        return None
+
+
+def _degrees_of_freedom(system: Any) -> int:
+    """``3 N_massive - N_constraints``, without the centre-of-mass term,
+    counting only particles with mass and constraints touching one."""
+    dof = 3 * sum(
+        1 for index in range(int(system.getNumParticles()))
+        if _particle_has_mass(system, index))
+    for index in range(int(system.getNumConstraints())):
+        # A constraint between two massless particles removes nothing, and
+        # OpenMM leaves it out of its count too.
+        first, second, _distance = system.getConstraintParameters(index)
+        if (_particle_has_mass(system, int(first))
+                or _particle_has_mass(system, int(second))):
+            dof -= 1
+    return dof
+
+
+def _particle_has_mass(system: Any, index: int) -> bool:
+    """Whether a particle carries mass, read from OpenMM's mass in daltons."""
+    mass = system.getParticleMass(index)
+    value = getattr(mass, "_value", mass)
+    return float(value) > 0.0
+
+
+def _periodic_volume_nm3(state: Any, unit: Any) -> float | None:
+    try:
+        volume = state.getPeriodicBoxVolume()
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return _quantity_to_float(volume, unit.nanometer**3)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _system_density_g_ml(
+    simulation: Any,
+    unit: Any,
+    volume_nm3: float | None,
+) -> float | None:
+    if volume_nm3 is None or volume_nm3 <= 0:
+        return None
+    try:
+        system = simulation.system
+        mass_dalton = 0.0
+        for index in range(int(system.getNumParticles())):
+            mass_dalton += float(
+                _value_in_unit(system.getParticleMass(index), unit.dalton)
+            )
+        # 1 Da / nm^3 = 1.66053906660e-3 g/mL.
+        return mass_dalton * 1.66053906660e-3 / float(volume_nm3)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _telemetry_speed_ns_day(telemetry: Any, sim_time_ns: float) -> float | None:
+    try:
+        elapsed = (
+            datetime.now(timezone.utc) - telemetry.start_time
+        ).total_seconds()
+    except Exception:  # noqa: BLE001
+        return None
+    if elapsed <= 0:
+        return None
+    return float(sim_time_ns) * 86400.0 / float(elapsed)
+
+
+def _maybe_write_live_frame(
+    omm: dict,
+    simulation: Any,
+    telemetry: Any,
+    step: int,
+    *,
+    stage: str,
+    simulation_time_ns: float,
+) -> None:
+    """Snapshot the current positions to ``simulation/live_frame.pdb``.
+
+    Best-effort. Called from the telemetry loop so the dashboard's
+    molecular viewer can refresh without disturbing the simulation.
+    All exceptions are swallowed: live frames are a UI affordance and
+    must never terminate the run.
+    """
+    try:
+        from fastmdxplora.gui.live_frames import write_openmm_live_frame
+        positions_state = simulation.context.getState(
+            getPositions=True, enforcePeriodicBox=True
+        )
+        # The box the positions were wrapped in: PDBFile writes the
+        # topology's, the box the run started with, which a barostat has
+        # since changed.
+        try:
+            box_vectors = positions_state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(
+                omm["unit"].nanometer)
+        except Exception:  # noqa: BLE001 - a run with no box
+            box_vectors = None
+        write_openmm_live_frame(
+            telemetry.root,
+            pdbfile_writer=omm["PDBFile"].writeFile,
+            topology=simulation.topology,
+            positions=positions_state.getPositions(),
+            box_vectors=box_vectors,
+            frame_index=step,
+            stage=stage,
+            simulation_time_ns=simulation_time_ns,
+            archive=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - dashboard failures must not crash sim
+        logger.debug("live frame snapshot skipped: %s", exc)
+
+
+def _quantity_to_float(quantity: Any, unit_value: Any) -> float | None:
+    try:
+        value = _value_in_unit(quantity, unit_value)
+    except Exception:  # noqa: BLE001
+        return None
+    numbers = list(_flatten_numbers(value))
+    return numbers[0] if numbers else None

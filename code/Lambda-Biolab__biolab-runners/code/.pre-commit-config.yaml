@@ -1,0 +1,111 @@
+# Pre-commit gates — runs before every commit, blocks if any fail.
+# Install once per repo: `uv run pre-commit install`
+# Run manually: `uv run pre-commit run --all-files`
+#
+# What this enforces (Andre's advice, April 2026):
+#   - ruff lint + format on all Python
+#   - pyright type-check on src/ only — tests are caught by the CI gate
+#     (see .github/workflows/ci.yml). The pre-commit hook excludes
+#     tests/ to keep the commit-time signal-to-noise ratio usable
+#     (hypothesis stubs and complex mock chains produce many
+#     "object is not iterable" warnings that are not bugs in the
+#     user's code).
+#   - complexipy cognitive complexity <=15 per function
+#     (the threshold must match `[tool.complexipy].max-complexity-allowed`
+#     in pyproject.toml — edit the `--max-complexity-allowed` flag
+#     below if your repo uses a different value. Common variants
+#     in the org: bioml-tools=22, vastai-gpu-runner=10, biolab-runners=10)
+#   - no committing giant files (>500KB)
+#   - no secrets in commits
+#   - commit messages follow Conventional Commits
+#
+# The git hooks in .git/hooks/pre-commit and .git/hooks/pre-push
+# (installed by bootstrap.sh) ALSO run gitleaks + semgrep + trufflehog
+# + detect-secrets. Those are org-level secret scanners, not quality
+# gates. This file is for quality gates; both layers run in sequence.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+      - id: detect-private-key
+
+  # Markdownlint — catches MD040 (missing code language), MD022/MD032 (blanks
+  # around headings/lists), MD034 (bare URLs), and similar real rendering bugs.
+  # Strict-but-permissive config in .markdownlint.jsonc. Many style rules
+  # (MD013 line-length, MD033 inline-html, etc.) are explicitly disabled.
+  # The --config argument is required to prevent the CLI from auto-discovering
+  # a parent directory's .markdownlint.json (which would pull in unrelated
+  # opencode-config skill files when this template is generated).
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.49.0
+    hooks:
+      - id: markdownlint
+        args: [--config, .markdownlint.jsonc]
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff (uses uv-locked version)
+        # Use `uv run` so the pre-commit hook uses the same ruff
+        # version pinned in uv.lock. SRC_DIR is auto-detected by
+        # scripts/detect_src_dir.py (same logic as the Makefile).
+        entry: |
+          scripts/pre-commit-ruff.sh
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: ruff-format
+        name: ruff-format (uses uv-locked version)
+        entry: |
+          scripts/pre-commit-ruff-format.sh
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: pyright
+        name: pyright (SRC_DIR + tests)
+        # PATH must include ~/.local/bin so `uv` is found. The
+        # pre-commit framework doesn't source the user's shell
+        # profile, so we expand PATH inline. SRC_DIR is
+        # auto-detected by scripts/detect_src_dir.py.
+        entry: |
+          scripts/pre-commit-pyright.sh
+        language: system
+        pass_filenames: false
+        types: [python]
+
+      - id: complexipy
+        name: complexipy (cognitive complexity, threshold auto-detected)
+        entry: |
+          scripts/pre-commit-complexipy.sh
+        language: system
+        pass_filenames: false
+        types: [python]
+
+  # actionlint — lints .github/workflows/*.yml for syntax errors, context
+  # availability (e.g. hashFiles() at job-level if:), and unknown runner
+  # labels. The `actionlint-system` hook uses the locally-installed binary
+  # (installed via `make install_tools` or scripts/install-actionlint.sh)
+  # rather than downloading via Go toolchain — keeps CI fast and matches
+  # the org's single-version policy (ACTIONLINT_VERSION pin in Makefile).
+  # Found biolab-runners' links.yml reusable-workflow-not-found bug.
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint-system
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.6.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: []

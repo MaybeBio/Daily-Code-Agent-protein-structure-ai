@@ -1,0 +1,110 @@
+# File Formats
+
+LAMMPS Web GUI auto-detects formats by extension **and** content sniffing, so
+`.txt` files and pasted data usually work too.
+
+---
+
+## LAMMPS data files (`.data`, `.lmp`, `.lammps`)
+
+Supported atom styles for the `Atoms` section (declared via `Atoms # style`,
+or auto-detected per row):
+
+| Style | Columns |
+|---|---|
+| `atomic` | `id type x y z` |
+| `charge` | `id type q x y z` |
+| `molecular` | `id molecule type x y z` |
+| `full` | `id molecule type q x y z` |
+
+Also parsed:
+
+- **Box bounds**: `-10.0 4.9 xlo xhi` lines → simulation box rendering (`X`)
+- **Triclinic tilt**: `0.0 1.0 0.5 xy xz yz` → true parallelepiped rendering
+- **Masses section**: element identification by comment symbol ("C"),
+  element name ("Carbon"), or nearest IUPAC mass (±0.5 u); type-id-as-atomic-number fallback
+- Sections other than Masses/Atoms/Bonds (Velocities, coefficients…) are skipped
+
+```text
+# Example header
+60 atoms
+90 bonds
+-10.0 4.9 xlo xhi          <- box bounds
+Masses
+1 12.011 # Carbon           <- element from comment/mass
+Atoms # full                <- style declaration
+   1 1 6 0.0  -1.18 -5.22 0.52
+Bonds
+   1 1 1 2
+```
+
+## XYZ (`.xyz`)
+
+Standard two-line-header format. The **first frame** of a trajectory is shown.
+Bonds are inferred automatically using an O(n) spatial hash over Cordero
+covalent radii (tolerance ×1.2) — H₂ at 0.74 Å bonds, non-bonded contacts at
+3 Å don't. Extended-XYZ extra columns are tolerated.
+
+## LAMMPS dump trajectories (`.lammpstrj`, `.dump`)
+
+Native `ITEM:`-block dump format from `dump custom` / `dump atom`. Every frame
+is captured and the built-in scrubber plays them back (`P` play/pause, `,`/`.`
+step). Handled per docs.lammps.org (dump.html, re-verified 2026-09-22):
+
+- **Boxes** — orthogonal (`BOX BOUNDS pp pp pp`) as-is; restricted triclinic
+  (`BOX BOUNDS xy xz yz …`) converted from the bounding box to the true cell
+  (`xlo = xlo_bound − MIN(0, xy, xz, xy+xz)` per Howto triclinic) and rendered
+  as true parallelepipeds. **Every frame keeps its own cell**, so an NPT box
+  that breathes is drawn correctly rather than frozen at frame 0.
+- **Coordinates** — all four documented forms:
+
+  | Columns | Meaning | Notes |
+  |---|---|---|
+  | `x y z` | wrapped, distance units | preferred for rendering |
+  | `xu yu zu` | unwrapped by the image flags | |
+  | `xs ys zs` | scaled to 0–1 | de-scaled in the triclinic vector basis |
+  | `xsu ysu zsu` | scaled **and** unwrapped | values run outside 0–1 |
+
+- **Image flags** — `ix iy iz` are read and kept **separate** from the
+  rendered position, which stays wrapped. This matters:
+
+  - rendering wants **wrapped** coordinates, or a diffusing system scatters
+    across periodic images and looks broken;
+  - **MSD wants unwrapped**. With no image flags the only option is the
+    minimum-image convention, which clamps every displacement to half a box,
+    so MSD *saturates near (L/2)²* and can never show linear diffusion. The
+    Analysis tab says which mode it is using.
+
+  **If you care about long-time diffusion, dump `ix iy iz` (or `xu yu zu`):**
+
+  ```
+  dump 1 all custom 1000 traj.lammpstrj id type x y z ix iy iz
+  ```
+
+- **Columns** — arbitrary `ITEM: ATOMS` layouts; `element` resolves CPK colors
+  directly, otherwise type-as-atomic-number; `q`, `mol` and `vx vy vz`
+  honored (velocities feed the speed histogram).
+- **Bonds** — inferred on the first frame (dumps carry no topology).
+
+## PDB (`.pdb`, `.ent`)
+
+- `ATOM` / `HETATM` coordinates
+- Element resolution: columns 77–78 first, then the atom-name heuristic that
+  respects the right-justified two-letter convention (`" CL "` is chlorine,
+  `" CA "` starting at column 13 is alpha-carbon)
+- `CONECT` bonds (deduplicated)
+- `CRYST1` unit cell → box rendering
+
+## CIF (`.cif`, `.mmcif`)
+
+- `_cell_length_*` / `_cell_angle_*` → cell vectors
+- `_atom_site` loop with fractional (`fract_x/y/z`) or Cartesian (`Cartn_x/y/z`) coords
+- Element from `_atom_site_type_symbol` (charges like `Fe3+` stripped) or the
+  alphabetic prefix of `_atom_site_label` (`Cl2` → Cl)
+- Triclinic cells render as true parallelepipeds via LAMMPS-convention tilt factors
+- First `data_` block only; symmetry expansion is **not** performed — use P1 files
+
+## Element colors across all formats
+
+Every parser maps atoms to atomic numbers, which index the built-in
+CPK/Jmol palette for all 118 elements. Unknown types render magenta.

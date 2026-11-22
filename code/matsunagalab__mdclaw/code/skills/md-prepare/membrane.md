@@ -1,0 +1,199 @@
+# Membrane Embedding
+
+Read this only for membrane systems (`solvent_regime = membrane`). Membrane
+embedding replaces bulk solvation: use the same `solv` node type but run
+`embed_in_membrane` instead of `solvate_structure`. First complete a `prep` node
+per the `skills/md-prepare/SKILL.md` workflow.
+
+## Force field and water
+
+Decide these before solvating. A pairing MDClaw refuses is reported at the solv
+node, and rebuilding solv to try another combination is the expensive way to
+find out.
+
+Lipid21 was developed and validated in Amber membrane simulations using TIP3P
+water, and `leaprc.lipid21` loads no water model of its own — it is meant to be
+sourced alongside a protein force field, and the choice of water stays open.
+
+When the request fixes the water at TIP3P, ff14SB is the conservative choice:
+its empirical tuning is associated with TIP3P, so lipid, water and protein all
+sit inside the same validation history.
+
+ff19SB is Amber's newer protein force field and Amber recommends it with OPC,
+and recommends against TIP3P for it. MDClaw enforces that as a hard refusal
+(`forcefield_water_blocked`), and the refusal text suggests moving the water to
+OPC. Read that suggestion against who owns each parameter:
+
+| what the request fixes | what to change |
+|---|---|
+| water fixed at TIP3P | keep it; choose ff14SB |
+| protein fixed at ff19SB, water open | move the water to OPC |
+| both fixed | say so and ask, rather than silently changing either |
+
+The failure mode to avoid is taking the refusal text literally when the water
+is not yours to change: swapping to OPC then contradicts the request, and
+rebuilding solv with the same protein force field just hits the same refusal.
+
+Amber recommends against ff19SB with TIP3P; it does not call the combination
+invalid, and published membrane work has used it. The point here is not that
+one pairing is wrong but that MDClaw will not build this one, so pick the
+protein force field with that in mind.
+
+## Run
+
+```bash
+mdclaw create_node --job-dir <job_dir> --node-type solv
+mdclaw explain_node --job-dir <job_dir> --node-id <solv_node_id>
+mdclaw --job-dir <job_dir> --node-id <solv_node_id> embed_in_membrane \
+  --lipids POPC --ratio "1" --dist 15.0 --dist-wat 17.5 \
+  --water-model <opc|tip3p> --salt --saltcon 0.15
+```
+
+## What decides the embed time
+
+Embedding is fast when the lipid patch comes from the cache and slow when it
+has to be built. The cache key is the patch, not the protein: `--lipids`,
+`--ratio`, `--water-model`, `--salt`/`--saltcon`, `--dist-wat`, `--leaflet`
+and `--membrane-patch-side` select the cached patch; `--dist` (lateral buffer)
+does not. Changing any key value, even `--dist-wat 10.0` to get a smaller box,
+misses the cache and rebuilds the patch on the host running
+`embed_in_membrane`: minutes on a GPU, about 20 minutes on a CPU login node.
+Outside a Slurm job a miss is refused before any work
+(`membrane_patch_cache_miss`); its `next_action` names the values of the
+closest cached patch. Use them, or, when the request fixes the uncached
+values, rerun with `--allow-patch-build` (or through `submit_job`).
+
+The package bundles equilibrated patches for POPC, POPE, DPPC,
+POPC:CHL1 4:1, POPC:POPE:CHL1 2:1:1 and DPPC:DOPC:CHL1 1:1:1, each with TIP3P
+and with OPC, and for DOPC with OPC only, all at the defaults `--dist-wat 17.5 --leaflet 23.0
+--saltcon 0.15`. For these, keep the defaults: a smaller box does not make
+embedding or MD meaningfully faster, a cache hit does. Change `--dist-wat` or
+`--leaflet` only when the request asks for a thicker water slab or membrane,
+and say so in the report.
+
+After the run, `result["patch_build"]` and `parameters.patch_equilibration_ran`
+say whether the patch was built or reused.
+
+`pdb_file` auto-resolves from the `prep` parent's `merged_pdb` artifact. If a
+manually oriented structure is required, register it on an explicit prep
+branch instead of overriding the solv input path. On success the solv node
+records `is_membrane=true` and its water model, so build topology with
+`build_amber_system --forcefield <chosen-forcefield>`; both are inherited
+(see `explicit-water.md`).
+
+## Orientation
+
+`embed_in_membrane` orients the protein itself before packing; no separate command is needed:
+
+```bash
+mdclaw --job-dir <job_dir> --node-id <solv_node_id> embed_in_membrane \
+  --lipids POPC --ratio "1" --dist 15.0 --dist-wat 17.5 \
+  --water-model <opc|tip3p> --salt --saltcon 0.15
+```
+
+`auto` transfers the membrane frame from an OPM homolog when one passes the
+quality gates, and otherwise runs PPM3. Every protein chain is searched, longest
+first, so a complex whose membrane subunit is not its longest chain still uses
+the homolog path, and every candidate a chain returns is judged so the
+best-supported donor wins rather than whichever RCSB ranked first. Read
+`result["orientation"]` to see which backend was used and why; each query
+chain's hits, errors, rejected candidates and the ranking behind the choice are
+in `opm_homolog_search.json`. Select a backend explicitly with
+`--orientation-method opm-homolog|ppm|memembed`, and disable the lookup with
+`--no-opm-homolog-search` when working offline.
+
+Pass `--n-terminal-side in|out` when you know which side the first residue
+faces. Without it the up/down assignment is unverified and reported as assumed.
+
+Use `--preoriented` only for structures already in a membrane frame (for
+example OPM/PPM-derived coordinates). For beta-barrel membrane proteins with
+MEMEMBED, pass `--memembed-beta-barrel`.
+
+`--dist-wat` is water beyond the membrane **or the protein**, whichever reaches
+further. A receptor with a large extracellular domain therefore gets a taller
+cell rather than a box shorter than itself. The cached bilayer patch is reused
+unchanged; only the water above and below is fitted to the protein.
+
+By default the tool writes `membrane_embedding_geometry.json` and fails with
+`membrane_embedding_geometry_failed` when a PBC-aware post-build check shows
+that the protein does not intersect the lipid headgroup span, or that it is
+longer than the periodic box in z. Treat both as real membrane-placement
+failures, not cosmetic rendering issues: a protein taller than the box overlaps
+its own periodic image, and the same box becomes the periodic vectors that
+minimization and MD run under.
+
+## Backend
+
+Membrane embedding defaults to the `patch-tile` backend
+(`--membrane-backend patch-tile`): it builds a small composition-keyed lipid
+patch once, equilibrates it under PBC, caches it, tiles it around the oriented
+protein, and neutralizes net charge by swapping bulk waters for ions. This
+converges reliably for cholesterol mixtures (e.g. `POPC:POPE:CHL1 2:1:1`) that
+full-box packing struggles with.
+
+- `--membrane-backend packmol-memgen`: the legacy full-box packing path. It
+  packs every lipid and water with Packmol on the CPU of the current host
+  (25 minutes or more for a GPCR on a login node) and is for debugging a
+  patch-tile failure only. It is not a way to avoid a patch cold build: for a
+  bundled composition there is no cold build to avoid.
+- `--membrane-backend auto`: try patch-tile first, fall back to packmol-memgen.
+
+## Timing and cold-build
+
+When the patch is not in the writable or bundled cache and the build is
+allowed (`--allow-patch-build`, or inside a Slurm job), the `solv` step packs
+and equilibrates it once (minimization + a few hundred ps of MD) and caches
+it. The tool prints a `[mdclaw] patch-tile: ...` notice to stderr, adds it to
+`warnings`, sets `patch_cold_build_notice`, and reports `patch_build` /
+`parameters.patch_equilibration_ran`. Tell the user up front that the first
+build of a new composition takes extra time. Switching backends to keep the
+build off the login node makes it slower, not faster.
+
+Membrane embedding is long-running: tens of minutes are normal for large or
+mixed systems, and CPU runs (including a cold patch equilibration) may exceed an
+hour. Do not assume a running membrane `solv` node is hung just because it has
+run for 10-30 minutes. Continue monitoring or `explain_node` the same node until
+it completes, fails, or reaches its timeout; do not create a sibling `solv` node
+to retry an in-progress build. Run it in the foreground for autonomous
+benchmark-style tasks and do not package a final submission while it is still
+`running`. For a simple blocking check:
+
+```bash
+mdclaw wait_node --job-dir <job_dir> --node-id <solv_node_id> \
+  --timeout-seconds 7200 --poll-interval-seconds 30
+```
+
+## Packmol race
+
+Membrane embedding runs MDClaw's bounded Packmol retry plan as a 4-lane parallel
+race by default (`--packmol-race-lanes 4`). Use `--packmol-race-lanes 1` only on
+CPU-constrained/shared hosts when sequential behavior matters more than wall
+time. Ion recipes and `--salt-override` behavior are canonical in
+`skills/common/solvent-regimes.md#ion-intent---exact-flags`.
+
+On retry, keep the requested lipid species, ratios, solute identity, solvent
+regime, and force-field intent fixed. Retries may adjust packing controls,
+random seed, or the recommended lateral box/buffer via `dist`; keep `leaflet`
+and `dist_wat` unchanged unless the user explicitly asks for a thicker
+membrane/water slab (they are cache keys, see "What decides the embed time"). Do not manually increase Packmol loop counts after a
+failure unless running a deliberate debugging experiment. If the requested
+target appears infeasible, stop and report it rather than silently simplifying
+the system. Packmol may also write a raw `*_FORCED` PDB when it cannot find a
+perfect packing; never pass that to topology generation (it bypasses final
+AMBER/LIPID residue-name postprocessing).
+
+## Structured outcomes
+
+| `code` / metadata | Meaning | Agent response |
+|---|---|---|
+| `packmol_imperfect_primary_output_candidate` | Packmol did not reach perfect packing after the bounded retry, but a postprocessed primary PDB was written. | Continue to `build_amber_system` and `run_minimization`; trust it only if topology load, finite energy, and minimization checks pass. |
+| `packmol_packing_quality_failed` + `retry_membrane_with_larger_box` | No perfect packing after bounded adaptive retry; the box is not MD-ready. | Retry only with the CLI-provided larger xy/lateral box suggestion unless geometry was explicitly fixed. |
+| `forced_output_available` metadata | A `*_FORCED` PDB was written during a failed attempt. | Keep for debugging/provenance only; do not feed to topology generation. |
+| `membrane_embedding_geometry_failed` | Protein/lipid placement failed the post-build PBC-aware bilayer-intersection check. | Retry only after fixing orientation or membrane settings; for beta barrels use `--memembed-beta-barrel` and avoid `--preoriented` unless the input is truly pre-oriented. |
+
+The selected prep also supplies the disulfide plan to the patch-tile
+neutralization System. Keep that plan attached to the same prep branch;
+standalone `embed_in_membrane` accepts `--disulfide-bonds` and
+`--ligand-chemistry` for declared chemistry. Do not replace a DAG-derived plan
+with one from another branch. See [chemistry diagnostics](https://github.com/matsunagalab/mdclaw/blob/HEAD/skills/common/chemistry-diagnostics.md)
+when neutralization or a sulfur-state check fails.

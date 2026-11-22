@@ -1,0 +1,24 @@
+# Copyright 2024 Sebastian Eibl
+# Copyright 2026 Julian Friedrich Hille
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     https://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+add_subdirectory(00_IdealGas_NVE)
+add_subdirectory(01_IdealGas_NVT)
+add_subdirectory(02_LennardJones_NVT)
+add_subdirectory(03_LennardJones_NVE)
+add_subdirectory(04_LennardJones_IdealGas_LocalCap)
+add_subdirectory(05_LennardJones_Equilibration)
+add_subdirectory(06_LennardJones_ProductionAtomistic)
+add_subdirectory(07_LennardJones_ThermoForce)
+add_subdirectory(08_LennardJones_ProductionTracer)

@@ -1,0 +1,3263 @@
+# Overview
+
+
+
+AtomWorks is an open-source platform designed to maximize research velocity for biomolecular modeling tasks. Much like how Torchdata enables rapid prototyping within vision and language domains, AtomWorks accelerates development and experimentation in computational biology and structural bioinformatics.
+
+![AtomWorks Logo](https://github.com/RosettaCommons/atomworks/blob/main/docs/_static/atomworks_logo_color.svg?raw=true)
+
+## Architecture Overview
+
+AtomWorks is composed of two symbiotic libraries that work together to provide a complete pipeline for biological data processing and machine learning:
+
+```mermaid
+graph TB
+    A[atomworks.io] --> B[atomworks.ml]
+    
+    subgraph "Data Input & Processing"
+        A --> A1[Parser Module]
+        A --> A2[Transforms Module]
+        A --> A3[Utils Module]
+        A --> A4[Tools Module]
+    end
+    
+    subgraph "ML Pipeline & Featurization"
+        B --> B1[Datasets Module]
+        B --> B2[Transforms Module]
+        B --> B3[Pipelines Module]
+        B --> B4[Samplers Module]
+        B --> B5[Preprocessing Module]
+    end
+    
+    A1 --> C[AtomArray Structure]
+    A2 --> C
+    C --> B1
+    C --> B2
+    
+    D[External Formats<br/>PDB, mmCIF, FASTA] --> A1
+    B3 --> E[ML-Ready Features]
+```
+
+## Core Components
+
+### atomworks.io: Universal Data Toolkit
+
+**atomworks.io** serves as the foundation for all biological data operations, built upon the robust [biotite](https://www.biotite-python.org/) API. It provides a universal Python toolkit for parsing, cleaning, manipulating, and converting biological data including structures, sequences, and small molecules.
+
+Key capabilities include:
+- **Universal parsing** of common biological file formats (mmCIF, PDB, FASTA, etc.)
+- **Structure cleaning and validation** including identification and removal of leaving groups, bond order correction, charge fixing, and proper handling of multiple occupancies
+- **Consistent AtomArray representation** that transforms all data to a unified format for downstream analysis
+- **Missing atom modeling** for atoms implied by sequence but not represented in coordinates
+- **Assembly generation** and symmetry operations for biological complexes
+
+The module is organized into several key components:
+
+| Module | Purpose | Key Features |
+|--------|---------|--------------|
+| **parser** | File format parsing | Multi-format support, assembly building, metadata extraction |
+| **transforms** | Data transformation | AtomArray operations, category management |
+| **utils** | Utility functions | Assembly operations, visualization, testing, selection tools |
+| **tools** | Specialized operations | FASTA processing, RDKit integration, inference tools |
+
+### atomworks.ml: Machine Learning Pipeline Framework
+
+**atomworks.ml** provides a modular, component-based library for dataset featurization within biomolecular deep learning workflows. It uses `atomworks.io` as its structural backbone and maintains a consistent vocabulary throughout the pipeline.
+
+Key capabilities include:
+- **Pre-built Transform library** with well-tested components for common ML tasks
+- **Extensible framework** for writing custom transforms for arbitrary use cases
+- **Database preprocessing** scripts for PDB and other biological databases
+- **Efficient sampling and batching** utilities for training machine learning models
+
+The ML module structure includes:
+
+| Module | Purpose | Key Features |
+|--------|---------|--------------|
+| **datasets** | Data loading and management | Database parsers, dataset classes |
+| **transforms** | Feature engineering | Atomization, encoding, featurization, augmentation |
+| **pipelines** | End-to-end workflows | AF3, RF2AA integration |
+| **samplers** | Data sampling strategies | Efficient batching strategies |
+| **preprocessing** | Data preparation | Constants, utilities, preprocessing scripts |
+
+## Key Design Principles
+
+### Unified Structural Representation
+
+At the heart of AtomWorks is the **AtomArray** data structure from Biotite, which provides a consistent representation regardless of the input source. This unified approach ensures that operations within and between pipelines maintain a common vocabulary, eliminating the need for format-specific conversions.
+
+### Transform-Based Architecture
+
+Both `atomworks.io` and `atomworks.ml` utilize a transform-based architecture where each operation updates the AtomArray representation. This design pattern enables:
+
+- **Composable pipelines** where transforms can be easily combined
+- **Transparent data flow** with clear input/output relationships
+- **Extensible framework** for custom operations
+- **Consistent interface** across different processing stages
+
+### Research Velocity Focus
+
+AtomWorks is designed specifically for research environments where rapid prototyping and experimentation are crucial. The framework emphasizes:
+
+- **Minimal boilerplate** for common operations
+- **Rich metadata preservation** throughout the pipeline
+- **Flexible configuration** for different experimental setups
+- **Integration-ready** outputs for downstream ML frameworks
+
+## When to Use AtomWorks
+
+| Use Case | Recommended Component | Example Applications |
+|----------|----------------------|---------------------|
+| **File format conversion** | atomworks.io | PDB → mmCIF, structure cleaning, format standardization |
+| **Structure analysis** | atomworks.io | Distance calculations, neighbor searches, geometric analysis |
+| **Dataset preparation** | atomworks.io + atomworks.ml | Large-scale PDB processing, feature extraction |
+| **ML model training** | atomworks.ml | Dataset sampling, batching, feature pipelines |
+| **Custom pipeline development** | Both modules | Novel featurization schemes, specialized preprocessing |
+
+## Getting Started
+
+The quickest way to begin using AtomWorks is through the unified parser interface:
+
+```python
+from atomworks.io.parser import parse
+
+# Parse a structure with common preprocessing options
+result = parse(
+    filename="protein.cif",
+    build_assembly=["1"],        # Build biological assembly
+    add_missing_atoms=True,      # Model missing atoms
+    remove_waters=True,          # Clean up structure
+    hydrogen_policy="remove"     # Handle hydrogens
+)
+
+# Access parsed components
+asym_unit = result["asym_unit"][0]      # Asymmetric unit
+assembly = result["assemblies"]["1"][0]  # Built assembly
+chain_info = result["chain_info"]       # Chain metadata
+ligand_info = result["ligand_info"]     # Ligand information
+```
+
+## Integration with ModelForge
+
+For researchers looking for pre-trained models (RF3, MPNN, etc.) that integrate with AtomWorks, the companion [ModelForge](https://github.com/RosettaCommons/modelforge) repository provides model implementations and training scripts specifically designed to work with AtomWorks data pipelines.
+
+## Next Steps
+
+To continue your AtomWorks journey:
+
+- **[Quick Start](2-quick-start)** - Hands-on tutorial with practical examples
+- **[Installation Guide](3-installation-guide)** - Detailed setup instructions for different environments  
+- **[Basic Usage Examples](4-basic-usage-examples)** - Common workflows and patterns
+- **[AtomWorks Framework Architecture](5-atomworks-framework-architecture)** - Deep dive into system design
+
+For researchers ready to explore specific capabilities, the documentation is organized into comprehensive guides covering everything from basic file parsing to advanced machine learning pipeline construction.
+
+---
+
+*AtomWorks is developed by the Institute for Protein Design and built upon the excellent Biotite library. We welcome contributions and feedback from the computational biology community.*
+
+# Quick Start
+
+
+
+**AtomWorks** is a unified Python platform that accelerates biomolecular modeling research by providing seamless data I/O and machine learning capabilities. This guide will get you up and running with basic structure parsing and analysis in minutes.
+
+<img src="https://github.com/RosettaCommons/atomworks/blob/main/docs/_static/atomworks_logo_color.svg?raw=true" width="450" alt="atomworks logo">
+
+## Installation
+
+Choose the installation that matches your needs:
+
+```bash
+# Basic installation (I/O operations only)
+pip install atomworks
+
+# Full installation with ML dependencies
+pip install "atomworks[ml]"
+
+# Development installation
+pip install "atomworks[dev]"
+
+# All dependencies
+pip install "atomworks[ml,dev]"
+```
+
+For users with [uv](https://docs.astral.sh/uv/) package manager:
+```bash
+uv pip install "atomworks[ml,openbabel,dev]"
+```
+
+## Architecture Overview
+
+AtomWorks consists of two symbiotic modules that work together to provide a complete biomolecular data processing pipeline:
+
+```mermaid
+graph TD
+    A[atomworks.io] --> B[Structure Parsing & Cleaning]
+    A --> C[Format Conversion]
+    A --> D[AtomArray Representation]
+    
+    E[atomworks.ml] --> F[Feature Engineering]
+    E --> G[Dataset Sampling]
+    E --> H[ML Pipeline Integration]
+    
+    B --> D
+    C --> D
+    D --> F
+    F --> G
+    G --> H
+    
+    I[Input Files] --> A
+    H --> J[ML Models]
+    
+    style A fill:#e1f5fe
+    style E fill:#f3e5f5
+    style D fill:#fff3e0
+```
+
+## Your First Structure Analysis
+
+Let's start with a simple example that demonstrates the core functionality of AtomWorks:
+
+```python
+from atomworks.io.parser import parse
+
+# Parse a structure file (supports PDB, mmCIF, and compressed formats)
+result = parse(filename="3nez.cif.gz")
+
+# Explore the results
+for chain_id, info in result["chain_info"].items():
+    print(f"Chain {chain_id}: {info['sequence']}")
+```
+
+### Understanding the Output
+
+The `parse()` function returns a comprehensive dictionary containing:
+
+| Key | Description | Use Case |
+|-----|-------------|----------|
+| **chain_info** | Chain sequences and metadata | Sequence analysis, chain selection |
+| **ligand_info** | Ligand annotations and metrics | Small molecule analysis |
+| **asym_unit** | Asymmetric unit as AtomArrayStack | Basic structure analysis |
+| **assemblies** | Biological assemblies | Functional structure analysis |
+| **metadata** | Experimental and source information | Data provenance |
+
+## Working with AtomArrays
+
+AtomWorks uses Biotite's `AtomArray` and `AtomArrayStack` as the unified data structure for all molecular representations:
+
+```python
+# Access the first biological assembly
+assembly = result["assemblies"]["1"][0]
+
+# Filter for high-occupancy atoms
+assembly = assembly[assembly.occupancy > 0]
+
+# Extract specific atom types
+ca_atoms = assembly[assembly.atom_name == "CA"]
+print(f"C-alpha coordinates shape: {ca_atoms.coord.shape}")
+
+# Extract specific chains
+chain_a = assembly[assembly.chain_id == "A"]
+print(f"Chain A coordinates shape: {chain_a.coord.shape}")
+```
+
+## Basic Structure Operations
+
+### Distance Calculations
+
+```python
+import biotite.structure as struc
+
+# Distance between two atoms
+distance = struc.distance(ca_atoms.coord[0], ca_atoms.coord[1])
+print(f"Distance: {distance:.2f} Å")
+
+# Distance from one atom to all others
+distances = struc.distance(ca_atoms[0], ca_atoms)
+```
+
+### Efficient Spatial Queries
+
+```python
+# Create a cell list for neighbor searching
+cell_list = struc.CellList(assembly, cell_size=5.0)
+
+# Find atoms within radius
+near_atoms = cell_list.get_atoms(assembly[0].coord, radius=4.0)
+print(f"Found {near_atoms.shape[0]} atoms within 4 Å")
+
+# Access neighbor information
+print(f"Chains: {assembly.chain_id[near_atoms]}")
+print(f"Residues: {assembly.res_name[near_atoms]}")
+```
+
+## Common Parsing Options
+
+Customize your parsing with these frequently used options:
+
+```python
+result = parse(
+    filename="structure.cif",
+    add_missing_atoms=True,      # Add unresolved atoms
+    remove_waters=True,           # Remove water molecules
+    build_assembly="all",         # Build all biological assemblies
+    hydrogen_policy="keep",        # Keep, remove, or infer hydrogens
+    fix_formal_charges=True,      # Fix charge assignments
+    convert_mse_to_met=False      # Keep selenomethionine as MSE
+)
+```
+
+> [!TIP]
+> The `add_missing_atoms=True` option is particularly useful for incomplete structures, as it adds unresolved atoms and creates proper intra- and inter-residue bonds based on sequence information.
+
+## When to Use Each Module
+
+| Task | Use atomworks.io | Use atomworks.ml |
+|------|------------------|------------------|
+| Parse PDB/mmCIF files | ✅ | ❌ |
+| Convert between formats | ✅ | ❌ |
+| Clean and validate structures | ✅ | ❌ |
+| Generate biological assemblies | ✅ | ❌ |
+| Feature engineering for ML | ❌ | ✅ |
+| Dataset sampling and batching | ❌ | ✅ |
+| Pipeline composition | ❌ | ✅ |
+
+## Next Steps
+
+Now that you've mastered the basics, explore these advanced topics:
+
+- **[Installation Guide](3-installation-guide)** - Advanced setup options and environment configuration
+- **[Basic Usage Examples](4-basic-usage-examples)** - More comprehensive examples and workflows  
+- **[AtomWorks Framework Architecture](5-atomworks-framework-architecture)** - Deep dive into the system design
+- **[atomworks.io vs atomworks.ml Modules](6-atomworks-io-vs-atomworks-ml-modules)** - Detailed module comparison
+
+## Resources
+
+- **Documentation**: [https://baker-laboratory.github.io/atomworks-dev/latest](https://baker-laboratory.github.io/atomworks-dev/latest)
+- **Examples**: Browse the [examples gallery](https://baker-laboratory.github.io/atomworks-dev/latest/auto_examples/) for more use cases
+- **GitHub Repository**: [RosettaCommons/atomworks](https://github.com/RosettaCommons/atomworks)
+
+> [!TIP]
+> For production workflows, consider enabling caching with `save_to_cache=True` and `load_from_cache=True` to dramatically speed up repeated parsing of the same files.
+
+# Installation Guide
+
+
+
+This guide covers all available installation methods for AtomWorks, from quick pip installations to development setups and containerized deployments. AtomWorks is a research-oriented data toolkit for training biomolecular deep-learning foundation models, composed of two symbiotic libraries: `atomworks.io` for biological data processing and `atomworks.ml` for machine learning workflows [README.md](README.md#L13-L18).
+
+## System Requirements
+
+Before installing AtomWorks, ensure your system meets these requirements:
+
+| Requirement | Minimum Version | Recommended |
+|-------------|-----------------|-------------|
+| Python | 3.12+ | Latest 3.12.x |
+| Operating System | Linux, macOS, Windows | Linux for optimal performance |
+| Memory | 4GB RAM | 8GB+ for large datasets |
+| Storage | 1GB free space | 5GB+ for development |
+
+> [!TIP]
+> AtomWorks requires Python 3.12 or higher. Use `pyenv` or conda to manage Python versions if your system defaults to an older version.
+
+## Installation Methods
+
+### 1. Quick Installation via pip (Recommended)
+
+The fastest way to get started with AtomWorks is through pip. Choose the installation variant based on your needs:
+
+```bash
+# Base installation (atomworks.io only)
+pip install atomworks
+
+# Full ML installation (includes PyTorch and ML dependencies)
+pip install "atomworks[ml]"
+
+# Development installation (includes testing and linting tools)
+pip install "atomworks[dev]"
+
+# Complete installation (all dependencies)
+pip install "atomworks[ml,dev]"
+```
+
+![AtomWorks Logo](https://github.com/RosettaCommons/atomworks/blob/main/docs/_static/atomworks_logo_color.svg?raw=true)
+
+#### Installation Variants
+
+| Variant | Includes | Use Case |
+|---------|----------|----------|
+| `atomworks` | Core IO functionality [pyproject.toml](pyproject.toml#L17-L50) | Basic file parsing and data manipulation |
+| `atomworks[ml]` | Core + PyTorch, ML transforms [pyproject.toml](pyproject.toml#L52-L56) | Deep learning pipeline development |
+| `atomworks[dev]` | Core + development tools [pyproject.toml](pyproject.toml#L58-L72) | Contributing to AtomWorks |
+| `atomworks[openbabel]` | Core + OpenBabel [pyproject.toml](pyproject.toml#L74-L77) | Advanced chemistry operations |
+
+### 2. UV Package Manager Installation
+
+For users preferring [uv](https://docs.astral.sh/uv/) for faster package management:
+
+```bash
+# Install with all optional dependencies
+uv pip install "atomworks[ml,openbabel,dev]"
+
+# Install specific variant
+uv pip install "atomworks[ml]"
+```
+
+> [!TIP]
+> UV provides significantly faster installation times and better dependency resolution compared to pip, especially for complex ML environments.
+
+### 3. Local Development Installation
+
+For developers who want to modify AtomWorks or contribute to the project:
+
+```bash
+# Clone the repository
+git clone https://github.com/RosettaCommons/atomworks.git
+cd atomworks
+
+# Install in development mode with all dependencies
+make install
+# or manually:
+pip install -e ".[dev,ml,openbabel]"
+```
+
+The development installation creates an editable install that links to your local source code, allowing immediate testing of changes [Makefile](Makefile#L35-L38).
+
+#### Development Workflow
+
+```mermaid
+flowchart TD
+    A[Clone Repository] --> B[Install Dependencies]
+    B --> C[Run Tests]
+    C --> D[Make Changes]
+    D --> E[Run Tests Again]
+    E --> F{Tests Pass?}
+    F -->|Yes| G[Submit Pull Request]
+    F -->|No| D
+```
+
+### 4. Containerized Installation
+
+#### Standalone Apptainer
+
+For production environments or HPC systems, use the pre-built Apptainer container:
+
+```bash
+# Set up IPD-specific environment variables (if applicable)
+source ./.ipd/setup.sh
+
+# Run the provided apptainer image
+./.ipd/atomworks.sif
+```
+
+This method provides a controlled environment ideal for dataset parsing and generation [docs/installation.rst](docs/installation.rst#L25-L31).
+
+#### Integration in Custom Apptainer
+
+To include AtomWorks in your own container:
+
+```bash
+# Add to PYTHONPATH
+export PYTHONPATH=$PWD/src:$PYTHONPATH
+
+# Or use IPD setup script
+source ./.ipd/setup.sh
+```
+
+See the `apptainer.spec` file for detailed integration instructions [docs/installation.rst](docs/installation.rst#L55-L61).
+
+## Post-Installation Setup
+
+### Environment Configuration
+
+Create a `.env` file for custom paths and configurations (see `.env.sample` for template):
+
+```bash
+# Example .env file
+CCD_PATH=/path/to/chemical/component/directory
+PDB_PATH=/path/to/pdb/files
+```
+
+### Verification
+
+Test your installation with the following Python code:
+
+```python
+from atomworks.io.parser import parse
+
+# Test basic parsing functionality
+result = parse(filename="example.pdb")  # Replace with actual file
+print("Installation successful!")
+print(f"Found {len(result['chain_info'])} chains")
+```
+
+## Architecture Overview
+
+AtomWorks follows a modular architecture that separates concerns between data processing and machine learning:
+
+```mermaid
+graph TB
+    subgraph "AtomWorks Architecture"
+        A[atomworks.io] --> B[atomworks.ml]
+        A --> C[Biotite Core]
+        B --> D[PyTorch Integration]
+        
+        subgraph "IO Components"
+            A1[Parser]
+            A2[Transforms]
+            A3[Validators]
+            A --> A1
+            A --> A2
+            A --> A3
+        end
+        
+        subgraph "ML Components"
+            B1[Dataset Featurization]
+            B2[Sampling Utilities]
+            B3[Pipeline Framework]
+            B --> B1
+            B --> B2
+            B --> B3
+        end
+    end
+```
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue | Solution |
+|-------|----------|
+| Python version error | Upgrade to Python 3.12+ using pyenv or conda |
+| Missing dependencies | Install with `pip install "atomworks[ml,dev]"` for complete setup |
+| Permission errors | Use `pip install --user` or virtual environments |
+| Import errors | Verify installation with `pip show atomworks` |
+
+### Performance Optimization
+
+For optimal performance with large datasets:
+
+1. **Use Linux**: Better performance for file I/O operations
+2. **SSD Storage**: Faster file parsing for large structure files
+3. **Sufficient RAM**: 8GB+ recommended for processing multiple structures
+4. **Parallel Processing**: Leverage built-in parallelization in atomworks.ml
+
+## Next Steps
+
+After successful installation, explore these resources:
+
+- **[Quick Start](2-quick-start)**: Learn basic usage patterns and get hands-on experience
+- **[Basic Usage Examples](4-basic-usage-examples)**: Practical examples for common workflows
+- **[AtomWorks Framework Architecture](5-atomworks-framework-architecture)**: Deep dive into the system design
+
+For detailed API documentation and advanced tutorials, visit the [official documentation](https://baker-laboratory.github.io/atomworks-dev/latest).
+
+# Basic Usage Examples
+
+
+
+Welcome to the basic usage examples for **atomworks**! This page provides hands-on examples to help you get started with parsing, visualizing, and manipulating biological structure data. These examples demonstrate the core functionality of atomworks and serve as a foundation for more advanced workflows.
+
+## Core Architecture Overview
+
+AtomWorks provides a unified interface for biological data processing through two main modules:
+
+```mermaid
+graph TB
+    A[atomworks] --> B[io module]
+    A --> C[ml module]
+    
+    B --> D[parse]
+    B --> E[load_any]
+    B --> F[view]
+    B --> G[transforms]
+    
+    C --> H[datasets]
+    C --> I[pipelines]
+    C --> J[preprocessing]
+    
+    D --> K[mmCIF/PDB/FASTA]
+    E --> L[File formats]
+    F --> M[3D visualization]
+    
+    style A fill:#e1f5fe
+    style B fill:#f3e5f5
+    style C fill:#e8f5e8
+```
+
+## Example 1: Loading and Visualizing mmCIF Structures
+
+This example demonstrates how to load a protein structure from an mmCIF file and visualize it using atomworks.io [`plot_basics.py`](docs/examples/plot_basics.py#L1-L119).
+
+### Loading Structures
+
+The primary entry point for parsing biological structures is the `parse` function:
+
+```python
+from atomworks.io import parse
+from atomworks.io.utils.testing import get_pdb_path
+from atomworks.io.utils.visualize import view
+from biotite.database import rcsb
+import io
+
+def get_example_path_or_buffer(pdb_id: str) -> str | io.StringIO:
+    try:
+        return get_pdb_path(pdb_id)
+    except FileNotFoundError:
+        return rcsb.fetch(pdb_id, format="cif")
+
+# Parse structure with various options
+result_dict = parse(
+    filename=get_example_path_or_buffer("6lyz"),
+    build_assembly=["1"],
+    add_missing_atoms=True,
+    remove_waters=True,
+    hydrogen_policy="remove",
+    model=1,
+)
+```
+
+### Visualization
+
+AtomWorks provides built-in 3D visualization capabilities:
+
+```python
+# Visualize asymmetric unit
+asym_unit = result_dict["asym_unit"][0]
+asym_unit = asym_unit[asym_unit.occupancy > 0]
+view(asym_unit)
+
+# Visualize assembly
+assembly = result_dict["assemblies"]["1"][0]
+assembly = assembly[assembly.occupancy > 0]
+view(assembly)
+```
+
+## Example 2: Structure Inspection and Manipulation
+
+### Accessing Metadata
+
+The parsed result contains rich metadata for downstream analysis:
+
+```python
+print("Chain info:", result_dict["chain_info"])
+print("Ligand info:", result_dict["ligand_info"])
+print("Metadata:", result_dict["metadata"])
+print("Annotation categories:", result_dict["asym_unit"][0].get_annotation_categories())
+```
+
+### AtomArray Manipulation
+
+AtomWorks extends biotite's AtomArray with powerful manipulation capabilities:
+
+```python
+# Extract specific atoms
+ca = assembly[(assembly.atom_name == "CA") & (assembly.occupancy > 0)]
+print("Coordinates of all resolved CA atoms:", ca.coord.shape)
+
+# Extract specific chains
+chain = assembly[assembly.chain_id == "A"]
+print("Coordinates of chain A (all heavy atoms):", chain.coord.shape)
+
+# Access bond information
+print("Bond array:", assembly.bonds.as_array())
+```
+
+## Example 3: Distance Computations and Spatial Queries
+
+### Distance Calculations
+
+```python
+import biotite.structure as struc
+
+# Distance between specific atoms
+distance = struc.distance(ca.coord[0], ca.coord[1])
+print(f"Distance between first two C-alpha atoms: {distance:.2f} Å")
+
+# Distance from one atom to all others
+distance = struc.distance(ca[0], ca)
+print(f"Distances between first C-alpha atom and all other C-alpha atoms: {distance}")
+```
+
+### Efficient Neighbor Search
+
+For performance-critical spatial queries, use CellList:
+
+```python
+resolved_atom_array = assembly[assembly.occupancy > 0]
+cell_list = struc.CellList(resolved_atom_array, cell_size=5.0)
+
+near_atoms = cell_list.get_atoms(resolved_atom_array[0].coord, radius=4)
+print(f"Number of atoms within 4 Å of the first atom: {near_atoms.shape[0]}")
+print(f"Atom indices: {near_atoms}")
+print(f"Chain IDs: {resolved_atom_array.chain_id[near_atoms]}")
+print(f"Residue IDs: {resolved_atom_array.res_id[near_atoms]}")
+print(f"Residue names: {resolved_atom_array.res_name[near_atoms]}")
+```
+
+## Example 4: Simple Structure Loading
+
+For quick structure loading without the full parsing options, use `load_any`:
+
+```python
+from atomworks.io.utils.io_utils import load_any
+
+example = get_example_path_or_buffer("6lyz")
+atom_array = load_any(example, model=1, extra_fields=["charge", "occupancy"])
+
+print(f"Structure has {atom_array.array_length()} atoms. First 15 atoms:")
+atom_array[:15]
+
+# Visualize specific chain
+view(atom_array[atom_array.chain_id == "A"])
+```
+
+## Common Usage Patterns
+
+| Task | Function | Key Parameters |
+|------|----------|----------------|
+| Load structure | `parse()` | `build_assembly`, `add_missing_atoms`, `remove_waters` |
+| Quick load | `load_any()` | `model`, `extra_fields` |
+| Visualize | `view()` | AtomArray object |
+| Distance calc | `struc.distance()` | coordinates |
+| Neighbor search | `CellList()` | `cell_size`, `radius` |
+
+> [!TIP]
+> The `parse()` function returns a comprehensive dictionary with multiple data structures including asymmetric units, assemblies, chain info, and ligand info. Use specific keys based on your analysis needs.
+
+> [!TIP]
+> Always filter by occupancy (`occupancy > 0`) when working with experimental structures to exclude alternative conformations and low-occupancy atoms.
+
+## Next Steps
+
+Now that you've mastered the basics, explore these advanced topics:
+
+- **[AtomWorks Framework Architecture](5-atomworks-framework-architecture)** - Understand the complete system design
+- **[Parsing Biological Files](8-parsing-biological-files-pdb-mmcif-fasta)** - Deep dive into file format support
+- **[AtomArray Data Structure](9-atomarray-data-structure)** - Learn about the core data representation
+- **[Transform System Fundamentals](12-transform-system-fundamentals)** - Discover the machine learning pipeline system
+
+![AtomWorks Logo](https://github.com/RosettaCommons/atomworks/blob/main/docs/_static/atomworks_logo_color.svg?raw=true)
+
+# AtomWorks Framework Architecture
+
+
+
+AtomWorks is a research-oriented data toolkit specifically designed for training biomolecular deep-learning foundation models. The framework provides a unified interface that combines robust I/O operations for biological data structures with comprehensive machine learning utilities, enabling seamless data processing pipelines from raw biological files to ML-ready datasets.
+
+## Core Architecture Overview
+
+The AtomWorks framework follows a **dual-module architecture** that cleanly separates concerns between data input/output operations and machine learning processing:
+
+```mermaid
+graph TB
+    subgraph "AtomWorks Core Framework"
+        A[atomworks package] --> B[io module]
+        A --> C[ml module]
+        A --> D[Shared Components]
+    end
+    
+    subgraph "I/O Operations"
+        B --> E[Parser]
+        B --> F[Tools]
+        B --> G[Transforms]
+        B --> H[Utils]
+    end
+    
+    subgraph "ML Pipeline"
+        C --> I[Datasets]
+        C --> J[Transforms]
+        C --> K[Pipelines]
+        C --> L[Preprocessing]
+    end
+    
+    subgraph "Shared Infrastructure"
+        D --> M[Enums]
+        D --> N[Common Utilities]
+        D --> O[CLI Interface]
+    end
+```
+
+## Module Organization
+
+### Primary Modules
+
+The framework is organized into two main functional areas:
+
+- **`atomworks.io`**: Handles biological data parsing, conversion, and manipulation operations [src/atomworks/io/__init__.py](src/atomworks/io/__init__.py#L1-L6)
+- **`atomworks.ml`**: Provides machine learning utilities, datasets, and preprocessing pipelines [src/atomworks/ml/__init__.py](src/atomworks/ml/__init__.py#L1-L6)
+
+### Supporting Infrastructure
+
+- **`enums.py`**: Centralized enumeration definitions used across the entire framework [src/atomworks/enums.py](src/atomworks/enums.py#L1)
+- **`cli/`**: Command-line interface tools for various operations
+- **Shared utilities**: Common functionality accessible from both modules
+
+## Transform System Architecture
+
+At the heart of AtomWorks lies a sophisticated **transform-based architecture** that enables flexible, composable data processing pipelines:
+
+### Base Transform Framework
+
+The transform system is built on an abstract base class that provides:
+
+- **Input validation**: Automatic checking of data validity before processing
+- **Transform history tracking**: Complete audit trail of applied transformations
+- **Error handling**: Comprehensive error reporting with debugging information
+- **Composability**: Easy chaining and combination of transforms [src/atomworks/ml/transforms/base.py](src/atomworks/ml/transforms/base.py#L81-L252)
+
+### Pipeline Composition
+
+The `Compose` class enables sophisticated pipeline creation with features like:
+
+- **Random routing**: Probabilistic selection between different transform paths
+- **Conditional routing**: Decision-based pipeline branching
+- **State management**: RNG state tracking for reproducible results [src/atomworks/ml/transforms/base.py](src/atomworks/ml/transforms/base.py#L323-L475)
+
+## Data Flow Architecture
+
+### I/O Pipeline
+
+The I/O module processes biological data through a structured pipeline:
+
+```mermaid
+flowchart LR
+    A[Raw Files<br/>PDB, mmCIF] --> B[Parser]
+    B --> C[Validation & Cleaning]
+    C --> D[Structure Assembly]
+    D --> E[AtomArray Generation]
+    E --> F[Metadata Annotation]
+```
+
+The main entry point is the `parse()` function which handles:
+- Multiple file formats (PDB, CIF) with automatic detection
+- Comprehensive structure validation and cleaning
+- Assembly generation and symmetry operations
+- Rich metadata annotation [src/atomworks/io/parser.py](src/atomworks/io/parser.py#L73-L96)
+
+### ML Pipeline
+
+The ML module transforms I/O output into ML-ready datasets:
+
+```mermaid
+flowchart LR
+    A[AtomArray Data] --> B[Preprocessing]
+    B --> C[Feature Encoding]
+    C --> D[Tokenization]
+    D --> E[Batch Generation]
+    E --> F[Model Input]
+```
+
+## Key Design Patterns
+
+### Enum-Driven Configuration
+
+The framework extensively uses enums for type safety and configuration:
+
+- **`ChainType`**: Comprehensive classification of biological molecule types [src/atomworks/enums.py](src/atomworks/enums.py#L19-L142)
+- **`HydrogenPolicy`**: Standardized hydrogen handling strategies [src/atomworks/enums.py](src/atomworks/enums.py#L269-L280)
+- **`GroundTruthConformerPolicy`**: Conformer handling options [src/atomworks/enums.py](src/atomworks/enums.py#L252-L266)
+
+### Unified Data Dictionary
+
+All transforms operate on a standardized dictionary structure that:
+- Maintains data provenance through transform history
+- Supports flexible key-value storage for diverse data types
+- Enables easy debugging and inspection [src/atomworks/ml/transforms/base.py](src/atomworks/ml/transforms/base.py#L42-L80)
+
+## Technology Stack
+
+### Core Dependencies
+
+The framework builds upon a carefully selected technology stack:
+
+| Category | Libraries | Purpose |
+|----------|-----------|---------|
+| **Bioinformatics** | biotite, hydride | Core biological data structures |
+| **Chemistry** | rdkit | Small molecule processing |
+| **ML/Data** | numpy, scipy, pandas, pyarrow | Numerical computing and data handling |
+| **CLI** | typer, fire | Command-line interfaces |
+
+### Integration Architecture
+
+AtomWorks is designed to integrate seamlessly with the broader bioinformatics ecosystem while providing a consistent, opinionated interface for ML workflows.
+
+## Extensibility Model
+
+The framework supports several extension points:
+
+1. **Custom Transforms**: Inherit from the base `Transform` class
+2. **New Parsers**: Extend the parsing system for additional file formats
+3. **Pipeline Components**: Add new preprocessing and encoding strategies
+4. **CLI Commands**: Extend the command-line interface with new operations
+
+## Logging and Debugging
+
+Comprehensive logging infrastructure provides:
+- Module-level log configuration
+- Transform history tracking
+- Performance monitoring
+- Debug mode with detailed tracebacks [src/atomworks/__init__.py](src/atomworks/__init__.py#L19-L25)
+
+## Next Steps
+
+To understand how the architectural components work together in practice, continue with:
+
+- **[atomworks.io vs atomworks.ml Modules](6-atomworks-io-vs-atomworks-ml-modules)**: Detailed comparison of the two primary modules
+- **[Transform Pipeline System](7-transform-pipeline-system)**: In-depth exploration of the transform architecture
+- **[Parsing Biological Files](8-parsing-biological-files-pdb-mmcif-fasta)**: Practical guide to file parsing capabilities
+
+# atomworks.io vs atomworks.ml Modules
+
+
+
+The atomworks framework is organized into two primary modules that serve distinct but complementary purposes in the biological data processing pipeline. Understanding the separation and interaction between these modules is crucial for effective utilization of the framework.
+
+## Module Architecture Overview
+
+```mermaid
+graph TB
+    subgraph "atomworks Framework"
+        A[atomworks.io] -->|Input/Output| B[atomworks.ml]
+        B -->|ML Processing| C[Model Training/Inference]
+    end
+    
+    subgraph "atomworks.io Module"
+        D[Parser] --> E[AtomArray]
+        F[Tools] --> G[Transforms]
+        H[Utils] --> I[Assembly Operations]
+    end
+    
+    subgraph "atomworks.ml Module"
+        J[Datasets] --> K[Pipelines]
+        L[Transforms] --> M[Preprocessing]
+        N[Utils] --> O[Feature Engineering]
+    end
+```
+
+## atomworks.io Module: Data Foundation
+
+The `atomworks.io` module serves as the **data ingestion and structural processing layer** of the framework. It focuses on parsing, validating, and transforming biological structure files into standardized data representations.
+
+### Core Responsibilities
+
+**File Parsing and Structure Processing**
+- Primary entry point through the `parse()` function [src/atomworks/io/parser.py](src/atomworks/io/parser.py#L73-L96)
+- Supports PDB and CIF file formats with comprehensive parsing options
+- Handles assembly generation, symmetry operations, and structure cleaning
+
+**Data Structure Management**
+- Utilizes Biotite's `AtomArray` and `AtomArrayStack` as core data structures
+- Provides utilities for bond detection, chain operations, and assembly generation [src/atomworks/io/utils/](src/atomworks/io/utils/)
+- Implements structure validation and cleaning protocols
+
+**Tooling and Transformations**
+- Chemical structure tools including RDKit integration [src/atomworks/io/tools/](src/atomworks/io/tools/)
+- Structure-specific transforms for biological data [src/atomworks/io/transforms/](src/atomworks/io/transforms/)
+- Common utilities for data manipulation and validation [src/atomworks/io/common.py](src/atomworks/io/common.py#L14-L52)
+
+## atomworks.ml Module: Machine Learning Pipeline
+
+The `atomworks.ml` module provides the **machine learning infrastructure** built upon the data foundation established by `atomworks.io`. It implements datasets, transforms, and pipelines specifically designed for ML workflows.
+
+### Core Responsibilities
+
+**Dataset Management**
+- Abstract base classes for flexible dataset implementations [src/atomworks/ml/datasets/datasets.py](src/atomworks/ml/datasets/datasets.py#L28-L58)
+- Specialized datasets for structural files and pandas data integration
+- Support for concatenated datasets with ID-based access patterns
+
+**Transform System**
+- Comprehensive transform framework with history tracking [src/atomworks/ml/transforms/base.py](src/atomworks/ml/transforms/base.py#L81-L252)
+- Composable transforms using the `Compose` class for pipeline construction
+- Specialized transforms for atomization, encoding, and feature extraction
+
+**Pipeline Infrastructure**
+- Preprocessing utilities for ML-specific data preparation [src/atomworks/ml/preprocessing/](src/atomworks/ml/preprocessing/)
+- Integration with popular ML frameworks through standardized interfaces
+- Sampling strategies and batching utilities for training workflows
+
+## Key Differences and Integration Patterns
+
+| Aspect | atomworks.io | atomworks.ml |
+|--------|-------------|-------------|
+| **Primary Focus** | Data ingestion and structure processing | ML pipeline and dataset management |
+| **Core Data Types** | AtomArray, AtomArrayStack | PyTorch tensors, ML-ready datasets |
+| **Transform Types** | Structure-specific transformations | ML feature engineering transforms |
+| **Dependencies** | Biotite, RDKit for chemistry | PyTorch, pandas for ML workflows |
+
+### Data Flow Integration
+
+The modules follow a **layered architecture** where `atomworks.io` provides the foundation and `atomworks.ml` builds upon it:
+
+1. **Input Layer**: `atomworks.io` parses raw biological files into structured `AtomArray` objects
+2. **Processing Layer**: `atomworks.io` transforms clean and validate structures
+3. **ML Preparation Layer**: `atomworks.ml` converts structures into ML-ready features
+4. **Training Layer**: `atomworks.ml` manages datasets and training pipelines
+
+> [!TIP]
+> The unified interface in the main `atomworks` package [src/atomworks/__init__.py](src/atomworks/__init__.py#L42-L48) re-exports key functionality from both modules, providing convenient access to commonly used functions like `parse()` from `atomworks.io` while maintaining clear module boundaries.
+
+## Usage Patterns and Best Practices
+
+### When to Use Each Module
+
+**Use atomworks.io directly when:**
+- Parsing and analyzing biological structures
+- Performing structure validation and cleaning
+- Working with assembly generation and symmetry operations
+- Implementing custom structure-specific transformations
+
+**Use atomworks.ml directly when:**
+- Building ML datasets from structural data
+- Creating training pipelines with feature engineering
+- Implementing custom ML transforms
+- Managing large-scale dataset operations
+
+**Use both modules together when:**
+- Building end-to-end ML workflows for structural biology
+- Converting parsed structures into ML-ready features
+- Implementing custom data augmentation strategies
+- Creating specialized datasets for specific ML tasks
+
+### Logging and Configuration
+
+Both modules implement independent logging configurations:
+- `atomworks.io` uses `ATOMWORKS_IO_LOG_LEVEL` environment variable [src/atomworks/io/__init__.py](src/atomworks/io/__init__.py#L14-L15)
+- `atomworks.ml` uses `ATOMWORKS_ML_LOG_LEVEL` environment variable [src/atomworks/ml/__init__.py](src/atomworks/ml/__init__.py#L15-L16)
+
+This allows fine-grained control over logging output for each module independently.
+
+> [!TIP]
+> The transform systems in both modules share similar architectural patterns but serve different purposes. `atomworks.io` transforms focus on structural correctness, while `atomworks.ml` transforms emphasize feature engineering and ML pipeline compatibility.
+
+## Next Steps
+
+To deepen your understanding of the AtomWorks architecture:
+
+- Explore the [Transform Pipeline System](7-transform-pipeline-system) for detailed pipeline construction patterns
+- Learn about [Parsing Biological Files](8-parsing-biological-files-pdb-mmcif-fasta) for comprehensive file format handling
+- Dive into [Transform System Fundamentals](12-transform-system-fundamentals) for ML-specific transform implementations
+- Review [AtomArray Data Structure](9-atomarray-data-structure) for the core data representation that bridges both modules
+
+The modular design ensures that you can use either module independently or combine them for comprehensive biological data processing and machine learning workflows.
+
+# Transform Pipeline System
+
+
+
+The Transform Pipeline System in AtomWorks provides a powerful, composable framework for processing biological structure data through a sequence of modular transformations. This system enables both deterministic and stochastic data processing pipelines with built-in validation, error handling, and debugging capabilities.
+
+## Core Architecture
+
+At the heart of the transform system lies the abstract `Transform` class, which serves as the foundation for all data processing operations. Each transform operates on dictionary-based data structures, allowing flexible data flow through the pipeline while maintaining type safety and validation.
+
+### Base Transform Class
+
+The `Transform` abstract class defines the essential contract for all transformations:
+
+- **Validation Framework**: Built-in input validation with configurable error handling
+- **Dependency Management**: Transform dependency tracking through `requires_previous_transforms` and `incompatible_previous_transforms` attributes
+- **History Tracking**: Optional transform history recording for debugging and reproducibility
+- **Processing Time Monitoring**: Automatic timing of transform execution for performance analysis
+
+```python
+class Transform(ABC):
+    validate_input: bool = True
+    raise_if_invalid_input: bool = True
+    requires_previous_transforms: ClassVar[list[str]] = []
+    incompatible_previous_transforms: ClassVar[list[str]] = []
+    previous_transforms_order_matters: bool = False
+    _track_transform_history: bool = True
+```
+
+### Pipeline Composition
+
+The `Compose` class enables sophisticated pipeline construction by chaining multiple transforms sequentially:
+
+```python
+class Compose(Transform):
+    def __init__(self, transforms: list[Transform], track_rng_state: bool = True, print_rng_state: bool = False)
+```
+
+Key features include:
+- **RNG State Tracking**: Essential for debugging stochastic pipelines
+- **Flexible Composition**: Support for adding transforms dynamically using the `+` operator
+- **Error Propagation**: Comprehensive error reporting with pipeline context
+
+## Transform Categories
+
+### Data Manipulation Transforms
+
+These transforms handle basic dictionary operations:
+
+| Transform | Purpose | Key Features |
+|-----------|---------|--------------|
+| `RemoveKeys` | Remove specified keys from data dictionary | Configurable key existence validation |
+| `SubsetToKeys` | Keep only specified keys | Inverse of RemoveKeys operation |
+| `AddData` | Add new data to dictionary | Overwrite protection options |
+| `Identity` | Pass-through operation | No-op transform for pipeline structure |
+
+### Conditional Routing
+
+Advanced routing transforms enable dynamic pipeline behavior:
+
+#### RandomRoute
+Probabilistic selection between transforms, useful for data augmentation strategies:
+
+```python
+RandomRoute(transforms=[Transform1(), Transform2()], probs=[0.7, 0.3])
+```
+
+#### ConditionalRoute
+Condition-based routing for training/inference mode switching:
+
+```python
+ConditionalRoute(
+    condition_func=lambda data: data.get("mode", "inference"),
+    transform_map={
+        "train": TrainingTransform(),
+        "inference": Identity()
+    }
+)
+```
+
+> [!TIP]
+> RandomRoute automatically tracks RNG state when `track_rng_state=True`, enabling exact reproduction of stochastic pipeline behavior for debugging.
+
+## Specialized Transform Domains
+
+### Atom Array Processing
+
+The atomworks.ml.transforms.atom_array module provides transforms for structural data manipulation:
+
+#### Annotation Management
+- `AddGlobalAtomIdAnnotation`: Unique atom identification for tracking
+- `AddGlobalTokenIdAnnotation`: Token-level identification for ML models
+- `AddProteinTerminiAnnotation`: N- and C-terminus detection and annotation
+
+#### Structural Organization
+- `SortLikeRF2AA`: Three-tier sorting (polymers → covalent modifications → free ligands)
+- `SortPolyThenNonPoly`: Polymer-first ordering with configurable atomized token handling
+
+### Cropping and Sampling
+
+The crop module implements sophisticated structure cropping strategies:
+
+#### CropContiguousLikeAF3
+Contiguous residue selection following AlphaFold 3 methodology:
+- Respects chain boundaries
+- Maintains biological context
+- Configurable crop size and atom limits
+
+#### CropSpatialLikeAF3
+Spatial proximity-based cropping:
+- Distance-based center selection
+- Jitter for stochasticity
+- Query-driven cropping around specific regions
+
+### Atomization and Encoding
+
+The atomize and encoding modules handle the critical transformation from biological structures to ML-ready representations:
+
+#### AtomizeByCCDName
+Converts residues to individual atoms based on Chemical Component Dictionary:
+- Configurable default atomization behavior
+- Selective residue targeting
+- Validation of atomization consistency
+
+#### EncodeAtomArray
+Transforms AtomArray objects to tokenized numerical representations:
+- Multiple encoding schemes support
+- Coordinate and mask generation
+- Annotation preservation
+
+## Pipeline Integration
+
+### AlphaFold 3 Integration
+
+The system provides specialized pipelines for AlphaFold 3 workflows through `build_af3_transform_pipeline()`:
+
+```python
+def build_af3_transform_pipeline(
+    *,
+    is_inference: bool,
+    protein_msa_dirs: list[dict],
+    rna_msa_dirs: list[dict],
+    n_recycles: int = 5,
+    crop_size: int = 384,
+    # ... extensive configuration options
+) -> Transform
+```
+
+This pipeline integrates:
+- MSA processing and selection
+- Template searching and alignment
+- Structure cropping and augmentation
+- Feature encoding for model input
+
+### Error Handling and Debugging
+
+The transform system includes comprehensive error management:
+
+- **TransformPipelineError**: Custom exception with RNG state capture
+- **TransformedDict**: Dictionary wrapper with history tracking
+- **LogData**: Debug transform for pipeline inspection
+- **PickleToDisk**: Intermediate result saving for analysis
+
+## Best Practices
+
+### Pipeline Design
+
+1. **Dependency Management**: Use `requires_previous_transforms` to ensure proper transform ordering
+2. **Validation Strategy**: Enable input validation during development, disable for production performance
+3. **History Tracking**: Keep enabled during debugging, disable for memory efficiency
+4. **RNG State**: Track in stochastic pipelines, disable in deterministic workflows
+
+### Performance Optimization
+
+- Use `Identity` transforms for conditional pipeline branches
+- Leverage `RemoveKeys` to reduce memory footprint
+- Implement efficient `check_input` methods for early validation
+- Consider `_track_transform_history=False` for long-running pipelines
+
+## Advanced Features
+
+### Custom Transform Development
+
+Create custom transforms by extending the base class:
+
+```python
+class CustomTransform(Transform):
+    requires_previous_transforms = ["AtomizeByCCDName"]
+    
+    def check_input(self, data: dict[str, Any]) -> None:
+        # Validation logic
+        pass
+    
+    def forward(self, data: dict[str, Any]) -> dict[str, Any]:
+        # Transformation logic
+        return data
+```
+
+### Pipeline Composition Patterns
+
+The system supports multiple composition strategies:
+- **Sequential Chaining**: Using `+` operator for linear pipelines
+- **Conditional Branching**: Using `ConditionalRoute` for mode-dependent processing
+- **Stochastic Selection**: Using `RandomRoute` for data augmentation
+- **Nested Composition**: Combining `Compose` instances for modular design
+
+> [!TIP]
+> The transform system's dictionary-based approach enables seamless integration with existing ML frameworks while maintaining biological data context throughout the processing pipeline.
+
+## Next Steps
+
+For deeper understanding of transform implementation, explore [Transform System Fundamentals](12-transform-system-fundamentals). To learn about specific encoding schemes, see [Feature Encoding Schemes](14-feature-encoding-schemes). For practical pipeline examples, refer to [Custom Transform Development](16-custom-transform-development).
+
+
+# Parsing Biological Files (PDB, mmCIF, FASTA)
+
+
+
+AtomWorks provides a comprehensive parsing system for biological structure files, supporting the most common formats used in structural biology and computational chemistry. The parsing functionality is centered around a unified interface that converts various file formats into Biotite's AtomArray data structure, enabling consistent downstream processing.
+
+## Supported File Formats
+
+AtomWorks supports parsing of three primary biological file formats, each with specific use cases and capabilities:
+
+| Format | Extension | Primary Use | Recommended For |
+|--------|-----------|-------------|-----------------|
+| **mmCIF** | .cif, .cif.gz, .bcif | Modern crystallographic data exchange | Production structures, detailed metadata |
+| **PDB** | .pdb | Legacy protein structure format | Historical data, simple structures |
+| **FASTA** | .fasta, .fa | Sequence information | Sequence-only workflows, custom pipelines |
+
+> [!TIP]
+> While PDB files are supported for compatibility, mmCIF format is strongly recommended for all new work as it provides better handling of complex structures, more comprehensive metadata, and superior support for modern structural biology data.
+
+## Core Parser Architecture
+
+The parsing system follows a unified architecture where all file formats ultimately converge to the same internal representation:
+
+```mermaid
+flowchart TD
+    A[Input File] --> B{File Type Detection}
+    B -->|mmCIF| C[CIF Parser]
+    B -->|PDB| D[PDB Parser]
+    B -->|FASTA| E[FASTA Utils]
+    
+    C --> F[AtomArray Stack]
+    D --> F
+    E --> G[Sequence Processing]
+    
+    F --> H[Structure Processing Pipeline]
+    G --> H
+    
+    H --> I[Annotation & Validation]
+    I --> J[Assembly Generation]
+    J --> K[Final Dictionary Output]
+    
+    style A fill:#e1f5fe
+    style K fill:#c8e6c9
+```
+
+The main entry point is the `parse()` function in `src/atomworks/io/parser.py` [src/atomworks/io/parser.py#L73-L96], which handles file type detection and routes to appropriate parsers. This unified approach ensures consistent behavior regardless of input format.
+
+## PDB and mmCIF Structure Parsing
+
+### Basic Usage
+
+The core parsing functionality is accessed through the `parse()` function:
+
+```python
+from atomworks.io.parser import parse
+
+# Parse a structure file
+result = parse("/path/to/structure.cif")
+print(result["chain_info"])
+```
+
+The parser returns a comprehensive dictionary containing:
+
+- **chain_info**: Chain metadata, sequences, and entity information
+- **ligand_info**: Detailed ligand data and annotations  
+- **asym_unit**: AtomArrayStack representing the asymmetric unit
+- **assemblies**: Dictionary of built biological assemblies
+- **metadata**: Structure-level metadata (resolution, deposition date, etc.)
+- **extra_info**: Internal caching and compatibility data
+
+### Advanced Parsing Options
+
+The parser supports extensive customization through keyword arguments:
+
+#### Structure Processing Options
+- `add_missing_atoms`: Automatically add missing atoms from unresolved residues
+- `add_id_and_entity_annotations`: Include chain and entity-level annotations
+- `remove_waters`: Filter out water molecules (default: True)
+- `fix_ligands_at_symmetry_centers`: Patch ligands at symmetry centers
+- `fix_arginines`: Resolve arginine naming ambiguities
+- `convert_mse_to_met`: Convert selenomethionine to methionine
+
+#### Bond and Chemical Features
+- `add_bond_types_from_struct_conn`: Specify bond types to include from struct_conn
+- `fix_formal_charges`: Correct charges on inter-residue bonds
+- `fix_bond_types`: Fix nucleophilic additions on bonded atoms
+
+#### Assembly and Model Control
+- `build_assembly`: Control which assemblies to build ("first", "all", specific IDs)
+- `model`: Select specific model for NMR structures
+- `extra_fields`: Include additional CIF fields in the output
+
+> [!TIP]
+> The parser includes intelligent defaults for most use cases. Start with default settings and gradually add specific options based on your workflow requirements.
+
+### File Type Specific Considerations
+
+#### mmCIF Files
+mmCIF files are parsed using the `_parse_from_cif()` function [src/atomworks/io/parser.py#L591-L598], which directly reads CIF blocks and extracts comprehensive structural information. This format supports:
+
+- Complete metadata preservation
+- Advanced bond information from struct_conn
+- Multiple model handling
+- Detailed assembly instructions
+
+#### PDB Files
+PDB files are handled by `_parse_from_pdb()` [src/atomworks/io/parser.py#L677-L710], which converts PDB format to CIF internally. Important limitations:
+
+- Requires single-chain polymer/non-polymer separation
+- Assumes all residues are resolved
+- Limited metadata compared to mmCIF
+
+## FASTA Sequence Processing
+
+FASTA file support is provided through utilities in `src/atomworks/io/tools/fasta.py` [src/atomworks/io/tools/fasta.py#L1-L3], focusing on sequence-to-structure conversion workflows.
+
+### Sequence Processing Functions
+
+#### Generalized FASTA Handling
+The `split_generalized_fasta_sequence()` function handles complex FASTA formats with parenthesized groups:
+
+```python
+from atomworks.io.tools.fasta import split_generalized_fasta_sequence
+
+sequence = "ABC(DEF)GH(IJ)K"
+tokens = split_generalized_fasta_sequence(sequence)
+# Returns: ['A', 'B', 'C', '(DEF)', 'G', 'H', '(IJ)', 'K']
+```
+
+#### One-Letter to CCD Code Conversion
+The `one_letter_to_ccd_code()` function converts sequences to Chemical Component Dictionary codes:
+
+```python
+from atomworks.io.tools.fasta import one_letter_to_ccd_code
+from atomworks.enums import ChainType
+
+sequence = ['A', 'B', 'C', '(HEM)']
+ccd_codes = one_letter_to_ccd_code(sequence, ChainType.POLYPEPTIDE_L)
+```
+
+This function handles both standard amino acids and non-standard chemical components, making it suitable for complex protein engineering workflows.
+
+## Caching and Performance
+
+For large-scale processing, the parser includes built-in caching capabilities:
+
+- `save_to_cache`: Store parsed results for faster retrieval
+- `load_from_cache`: Load pre-compiled results from cache
+- `cache_dir`: Specify cache storage location
+
+> [!TIP]
+> Enable caching when processing large datasets or frequently accessed structures. The cache stores processed AtomArray objects, significantly reducing parsing time for repeated access.
+
+## Integration with Workflows
+
+The parsed structures integrate seamlessly with other AtomWorks components:
+
+- **Transform Pipeline**: Parsed structures can be processed through transform pipelines
+- **ML Datasets**: Structures can be converted to ML-ready formats
+- **Visualization**: AtomArray objects support direct visualization
+
+## Next Steps
+
+After mastering file parsing, explore these related topics:
+
+- [AtomArray Data Structure](9-atomarray-data-structure) - Understanding the core data representation
+- [Structure Cleaning and Validation](10-structure-cleaning-and-validation) - Advanced structure processing
+- [Assembly Generation and Symmetry Operations](11-assembly-generation-and-symmetry-operations) - Working with biological assemblies
+- [Transform System Fundamentals](12-transform-system-fundamentals) - Processing parsed structures
+
+The parsing system provides the foundation for all structure-based workflows in AtomWorks, enabling consistent and reliable access to biological structure data across multiple formats and use cases.
+
+# AtomArray Data Structure
+
+
+
+The AtomArray data structure is the fundamental container for molecular structure data in AtomWorks, built as an extension of Biotite's AtomArray with enhanced capabilities for biological data processing and machine learning applications.
+
+## Core Architecture
+
+AtomArray represents molecular structures as collections of atoms with associated annotations and coordinates. The architecture follows a layered approach:
+
+```mermaid
+graph TD
+    A[AtomArray Core] --> B[Standard Annotations]
+    A --> C[Coordinate Data]
+    A --> D[Bond Information]
+    
+    E[AtomArrayPlus Extension] --> F[2D Pairwise Annotations]
+    E --> G[Enhanced Slicing]
+    E --> H[Per-Stack Annotations]
+    
+    I[Monkey Patches] --> J[Query Methods]
+    I --> K[Enhanced Representation]
+    I --> L[Segment Slicing]
+    
+    A --> E
+    A --> I
+```
+
+### Base AtomArray Structure
+
+The core AtomArray extends Biotite's foundation with enhanced functionality through monkey patching [biotite_patch.py](src/atomworks/biotite_patch.py#L1-L422):
+
+- **Query Interface**: Pandas-like syntax for atom selection with methods like `query()`, `mask()`, and `idxs()`
+- **Enhanced Representation**: Lean display showing at most 20 atoms for improved debugging
+- **Segment Slicing**: Support for `SegmentSlice` objects in array indexing
+- **Preserved Data Types**: Improved array function that maintains annotation data types
+
+### AtomArrayPlus Extension
+
+For advanced use cases requiring pairwise data, AtomArrayPlus provides 2D annotation support [atom_array_plus.py](src/atomworks/io/utils/atom_array_plus.py#L359-L400):
+
+```python
+class AtomArrayPlus(_AtomArrayPlusBase, AtomArray):
+    """
+    Extension of AtomArray supporting arbitrary 2D (pairwise) annotations.
+    
+    2D annotations are stored as sparse lists of (i, j, value), accessible via set/get_annotation_2d methods.
+    Automatically filters 2D annotations on slicing, following BondList semantics.
+    """
+```
+
+Key features include:
+- **Sparse 2D Annotations**: Efficient storage of pairwise data like distances, interactions, or custom features
+- **Automatic Filtering**: 2D annotations are properly filtered when slicing, similar to BondList behavior
+- **Conversion Methods**: Seamless conversion between AtomArray and AtomArrayPlus formats
+
+## Annotation System
+
+### Standard Annotations
+
+AtomArray supports a comprehensive set of biological annotations:
+
+| Annotation | Description | Type | Example |
+|------------|-------------|------|---------|
+| `chain_id` | Chain identifier | str | "A", "B" |
+| `res_id` | Residue sequence number | int | 1, 2, 3 |
+| `res_name` | Residue name | str | "ALA", "GLY" |
+| `atom_name` | Atom name | str | "CA", "N", "C" |
+| `element` | Chemical element | str | "C", "N", "O" |
+| `b_factor` | Temperature factor | float | 20.5 |
+
+### Enhanced Annotations
+
+AtomWorks adds ML-specific annotations through transforms:
+
+#### Instance Annotations
+- `chain_iid`: Chain instance ID for distinguishing symmetry copies
+- `pn_unit_iid`: Polymer/non-polymer unit instance ID
+- `molecule_iid`: Molecule instance ID
+
+#### Entity Annotations
+- `chain_entity`: Chain entity type
+- `pn_unit_entity`: Polymer/non-polymer unit entity
+- `molecule_entity`: Molecule entity type
+
+#### Global Identifiers
+- `atom_id`: Global atom identifier for tracking after transformations
+- `token_id`: Token identifier for ML applications
+- `res_id`: Global residue identifier
+
+## Transform Operations
+
+### I/O Transforms
+
+The `io.transforms.atom_array` module provides fundamental structure operations [io/transforms/atom_array.py](src/atomworks/io/transforms/atom_array.py#L34-L85):
+
+```python
+def subset_atom_array(atom_array: AtomArray | AtomArrayStack, keep: np.ndarray) -> AtomArray | AtomArrayStack:
+    """Subsets an AtomArray or AtomArrayStack by a boolean mask."""
+
+def remove_nan_coords(atom_array: AtomArray | AtomArrayStack) -> AtomArray | AtomArrayStack:
+    """Returns a copy with rows where any coordinate is NaN removed."""
+
+def remove_hydrogens(atom_array: AtomArray | AtomArrayStack) -> AtomArray | AtomArrayStack:
+    """Removes hydrogens from the AtomArray or AtomArrayStack."""
+```
+
+### ML Transforms
+
+The `ml.transforms.atom_array` module provides ML-specific operations [ml/transforms/atom_array.py](src/atomworks/ml/transforms/atom_array.py#L35-L67):
+
+```python
+def get_chain_instance_starts(array: AtomArray, add_exclusive_stop: bool = False) -> np.ndarray:
+    """Get indices indicating the beginning of each chain instance."""
+
+def chain_instance_iter(array: AtomArray) -> Iterator[AtomArray]:
+    """Returns an iterator over chain instances in the atom array."""
+```
+
+## Selection and Querying
+
+### String-Based Selection
+
+AtomArray supports powerful string-based selection syntax:
+
+```python
+# Function calls and attribute combinations
+array.query("~has_nan_coord() & has_bonds() & (chain_id == 'A') & (atom_name == 'CA')")
+
+# PyMOL-style selections
+array.query("A/ASP`37/OD2")
+```
+
+### Programmatic Selection
+
+The selection system provides structured classes for precise atom selection [selection.py](src/atomworks/io/utils/selection.py#L211-L304):
+
+```python
+class AtomSelection:
+    def __init__(self, chain_id: str = "*", res_name: str = "*", 
+                 res_id: int | str = "*", atom_name: str = "*"):
+        # Selection criteria
+```
+
+## Data Processing Patterns
+
+### Residue-wise Operations
+
+```python
+def apply_and_spread_residue_wise(
+    atom_array: AtomArray, data: np.ndarray, 
+    function: Callable[[np.ndarray], np.generic], axis: int | None = None
+) -> np.ndarray:
+    """Apply a function residue wise and then spread the result to atoms."""
+```
+
+### Chain-wise Operations
+
+```python
+def apply_and_spread_chain_wise(
+    atom_array: AtomArray, data: np.ndarray,
+    function: Callable[[np.ndarray], np.generic], axis: int | None = None
+) -> np.ndarray:
+    """Apply a function chain wise and then spread the result to atoms."""
+```
+
+## Integration with ML Pipeline
+
+AtomArray serves as the primary data structure throughout the ML pipeline:
+
+1. **Parsing**: Raw PDB/mmCIF files are parsed into AtomArray objects
+2. **Preprocessing**: Transforms clean and annotate the structure
+3. **Featurization**: Atomic and residue-level features are extracted
+4. **Tokenization**: Structures are converted to token sequences for models
+5. **Batching**: Multiple structures are combined for training
+
+> [!TIP]
+> The AtomArray design emphasizes compatibility with both traditional structural biology workflows and modern ML pipelines. All transforms maintain the core AtomArray interface while adding ML-specific annotations and capabilities.
+
+> [!TIP]
+> For memory-intensive applications, consider using AtomArrayPlus only when 2D annotations are required, as the sparse storage format provides significant memory savings for pairwise data.
+
+## Next Steps
+
+To understand how AtomArray fits into the broader AtomWorks architecture:
+
+- **[Parsing Biological Files](8-parsing-biological-files-pdb-mmcif-fasta)**: Learn how files are converted to AtomArray objects
+- **[Transform System Fundamentals](12-transform-system-fundamentals)**: Understand the transform pipeline that processes AtomArray data
+- **[Atomization and Tokenization](13-atomization-and-tokenization)**: See how AtomArray structures are converted to ML-ready tokens
+
+# Structure Cleaning and Validation
+
+
+
+Structure cleaning and validation in AtomWorks provides a comprehensive toolkit for ensuring atomic structures meet quality standards before downstream processing. These operations address common issues found in biological structure data from sources like the Protein Data Bank, including coordinate problems, chemical inconsistencies, and annotation gaps.
+
+## Core Cleaning Operations
+
+AtomWorks implements a systematic approach to structure cleaning through a series of atomic-level transformations that operate on Biotite's `AtomArray` and `AtomArrayStack` objects [src/atomworks/io/transforms/atom_array.py](src/atomworks/io/transforms/atom_array.py#L1-L4).
+
+### Coordinate Validation and Repair
+
+The foundation of structure cleaning begins with coordinate validation:
+
+```python
+def is_any_coord_nan(atom_array: AtomArray | AtomArrayStack) -> np.ndarray:
+    """Returns a boolean mask indicating whether any coordinate is NaN for each atom."""
+```
+
+This function identifies atoms with missing or invalid coordinates, enabling their removal through `remove_nan_coords()` which filters out problematic atoms while preserving the overall structure integrity [src/atomworks/io/transforms/atom_array.py#L42-L52].
+
+### Chemical Component Filtering
+
+AtomWorks provides utilities for removing unwanted chemical components:
+
+- **Hydrogen removal**: `remove_hydrogens()` eliminates hydrogen atoms using predefined hydrogen-like symbols
+- **Water removal**: `remove_waters()` filters out water molecules based on CCD codes
+- **Custom component filtering**: `remove_ccd_components()` allows specification of particular CCD codes to exclude [src/atomworks/io/transforms/atom_array.py#L55-L80]
+
+### Chemical Standardization
+
+The system handles common chemical inconsistencies through targeted transformations:
+
+**MSE to MET conversion**: Selenomethionine residues are converted to standard methionine, updating residue names, hetero flags, and atomic properties while maintaining canonical atom ordering [src/atomworks/io/transforms/atom_array.py#L133-L162].
+
+**Arginine naming ambiguity resolution**: Ensures NH1 is always positioned closer to CD than NH2, maintaining structural consistency across arginine residues [src/atomworks/io/transforms/atom_array.py#L93-L132].
+
+## Advanced Structure Validation
+
+### Hydrogen Addition and Management
+
+AtomWorks incorporates sophisticated hydrogen handling through biotite's hydride library:
+
+```python
+def add_hydrogen_atom_positions(
+    atom_array: AtomArray | AtomArrayStack,
+    residue_level_annots_to_copy_to_hydrogens: list[str] = [],
+) -> AtomArray | AtomArrayStack:
+```
+
+This function provides NaN-tolerant hydrogen addition, managing cases where heavy atoms have missing coordinates by temporarily setting them to zero during hydrogen placement, then restoring NaN values appropriately [src/atomworks/io/transforms/atom_array.py#L423-L511].
+
+> [!TIP]
+> The hydrogen addition system intelligently handles coordinate ambiguity by setting newly-added hydrogens to NaN coordinates when bonded to heavy atoms with missing positions, preventing false geometry assumptions.
+
+### RDKit Integration for Chemical Validation
+
+For small molecules and ligands, AtomWorks leverages RDKit's chemistry engine through specialized tools:
+
+**ChEMBL Normalizer**: Implements the ChEMBL structure pipeline normalization rules using SMIRKS transformations, providing rescue capabilities for molecules that fail standard RDKit sanitization [src/atomworks/io/tools/rdkit.py#L105-L124].
+
+**Molecule fixing**: The `fix_mol()` function attempts to infer aromaticity, valences, implicit hydrogens, and formal charges to produce chemically valid molecules without altering heavy atom frameworks [src/atomworks/io/tools/rdkit.py#L266-L280].
+
+## Annotation and Metadata Management
+
+### Entity and Chain Identification
+
+Structure cleaning extends to proper annotation management:
+
+- **Polymer annotation**: `add_polymer_annotation()` marks polymer chains based on chain information dictionaries
+- **Entity assignment**: `annotate_entities()` establishes hierarchical relationships between chains, polymer/non-polymer units, and molecules [src/atomworks/io/transforms/atom_array.py#L607-L706]
+
+### Instance ID Management
+
+For assembly handling and multi-model structures, AtomWorks manages instance IDs across different organizational levels:
+
+```python
+def add_iid_annotations_to_assemblies(
+    assemblies_dict: dict[str | int, AtomArray | AtomArrayStack],
+) -> dict[str | int, AtomArray | AtomArrayStack]:
+```
+
+This ensures proper tracking of chain, PN unit, and molecule instances across complex assemblies [src/atomworks/io/transforms/atom_array.py#L719-L742].
+
+## Error Handling and Validation
+
+AtomWorks implements robust error handling through context managers that provide detailed traceback formatting and cleanup capabilities [src/atomworks/io/utils/error.py#L30-L112]. This ensures that structure cleaning operations fail gracefully with informative error messages, facilitating debugging of structure processing pipelines.
+
+## Integration with Processing Pipelines
+
+Structure cleaning functions are designed to work seamlessly within AtomWorks transform pipelines, allowing composition of multiple cleaning operations into efficient processing workflows. The modular nature enables selective application of cleaning steps based on specific data requirements and quality standards.
+
+For comprehensive structure processing, these cleaning operations should be combined with parsing operations described in [Parsing Biological Files (PDB, mmCIF, FASTA)](8-parsing-biological-files-pdb-mmcif-fasta) and followed by assembly generation detailed in [Assembly Generation and Symmetry Operations](11-assembly-generation-and-symmetry-operations).
+
+# Assembly Generation and Symmetry Operations
+
+
+
+Assembly generation and symmetry operations are fundamental capabilities in AtomWorks for reconstructing complete biological macromolecular complexes from their asymmetric units. These operations enable the transformation of crystallographic data into biologically relevant assemblies through the application of symmetry operations defined in PDB and mmCIF files.
+
+## Core Assembly Generation Framework
+
+The assembly generation system in AtomWorks is built around the principle of applying rototranslation operations to asymmetric unit coordinates. The main entry point is the `build_assemblies_from_asym_unit` function in [`assembly.py`](src/atomworks/io/utils/assembly.py#L163-L200), which orchestrates the entire assembly construction process.
+
+```mermaid
+flowchart TD
+    A[Asymmetric Unit] --> B[Parse Transformations]
+    B --> C[Apply Rotation Matrices]
+    C --> D[Apply Translation Vectors]
+    D --> E[Generate Sub-assemblies]
+    E --> F[Merge Operations]
+    F --> G[Add Instance Annotations]
+    G --> H[Fix Symmetry Centers]
+    H -->I[Final Assemblies]
+```
+
+### Transformation Operations
+
+The system parses transformation operations from the `pdbx_struct_oper_list` category in mmCIF files, extracting rotation matrices and translation vectors for each operation ID. The [`_parse_transformations`](src/atomworks/io/utils/assembly.py#L45-L61) function converts these into mathematical operations:
+
+- **Rotation matrices**: 3×3 matrices defining rotational transformations
+- **Translation vectors**: 3D vectors defining translational components
+- **Operation expressions**: Combinations of multiple transformation steps
+
+Each transformation is applied sequentially using the [`_apply_assembly_transformation`](src/atomworks/io/utils/assembly.py#L62-L86) function, which performs matrix rotations followed by vector translations on atomic coordinates.
+
+### Assembly Building Process
+
+The core assembly construction occurs in [`_build_bioassembly_from_asym_unit`](src/atomworks/io/utils/assembly.py#L87-L162), which:
+
+1. **Filters affected chains** based on `asym_id_list` specifications
+2. **Applies operation expressions** parsed from `oper_expression` fields
+3. **Merges transformed coordinates** into complete assemblies
+4. **Adds transformation annotations** for tracking applied operations
+
+The system supports flexible assembly selection through the `assembly_ids` parameter, allowing construction of specific assemblies, the first assembly only, or all available assemblies.
+
+## Symmetry Resolution and Automorphisms
+
+Beyond basic assembly generation, AtomWorks provides sophisticated symmetry resolution capabilities for machine learning applications, particularly for protein structure prediction models like AlphaFold-Multimer and RoseTTAFold2.
+
+### Graph-Based Symmetry Detection
+
+The [`symmetry.py`](src/atomworks/ml/transforms/symmetry.py) module implements graph-based automorphism detection using NetworkX:
+
+```python
+def generate_automorphisms_from_atom_array_with_networkx(
+    atom_array: AtomArray,
+    max_automorphs: int = 1000,
+    node_features: str | list = "element",
+    ignore_bond_type: bool = True
+) -> np.ndarray
+```
+
+This function constructs molecular graphs and identifies automorphisms—symmetry operations that map the molecule onto itself while preserving connectivity.
+
+### Instance-Level Symmetry Mapping
+
+The system creates mappings between molecular entities and their instances through [`instance_to_token_lvl_isomorphisms`](src/atomworks/ml/transforms/symmetry.py#L237-L288), enabling:
+
+- **Chain-level isomorphisms** for symmetric polymer chains
+- **Ligand-level automorphisms** for symmetric small molecules
+- **Token-level mappings** for ML model integration
+
+### RF2AA-Style Symmetry Integration
+
+The [`CreateSymmetryCopyAxisLikeRF2AA`](src/atomworks/ml/transforms/symmetry.py#L399-L854) transform implements RoseTTAFold2-style symmetry resolution:
+
+```mermaid
+graph LR
+    A[Input Structure] --> B[Identify Symmetric Chains]
+    B --> C[Generate Chain Isomorphisms]
+    C --> D[Process Polymer Symmetry]
+    D --> E[Process Non-polymer Automorphisms]
+    E --> F[Create Symmetry Copy Axis]
+    F --> G[Output for ML Pipeline]
+```
+
+This transform handles both polymer chain symmetry and non-polymer ligand automorphisms, creating the symmetry-aware representations needed for structure prediction models.
+
+## Symmetry Center Conflict Resolution
+
+A critical challenge in assembly generation is handling non-polymer molecules placed at symmetry centers that clash with themselves during symmetry operations. AtomWorks addresses this through [`maybe_fix_non_polymer_at_symmetry_center`](src/atomworks/io/transforms/atom_array.py#L197-L294).
+
+### Conflict Detection Algorithm
+
+The system identifies clashing non-polymers using:
+
+1. **Cell list construction** for efficient distance calculations
+2. **Clash matrix generation** comparing atoms within `clash_distance` threshold
+3. **Transformation ID analysis** to identify problematic symmetry operations
+4. **Clash ratio evaluation** using configurable `clash_ratio` threshold
+
+### Resolution Strategy
+
+When conflicts are detected, the system:
+
+- **Preserves identity transformations** (transformation ID "1")
+- **Removes clashing copies** that exceed the clash ratio threshold
+- **Maintains chain instance IDs** for proper annotation tracking
+
+This approach handles real-world cases like PDB entries `7mub` (potassium ion at symmetry center) and `1xan` (ligand symmetry center clashes).
+
+## Instance Annotation System
+
+Assembly generation includes comprehensive instance-level annotation through [`add_iid_annotations_to_assemblies`](src/atomworks/io/transforms/atom_array.py#L719-L742):
+
+| Annotation Level | ID Type | Entity Type | Purpose |
+|------------------|---------|-------------|---------|
+| Chain | `chain_id`, `chain_iid` | `chain_entity` | Track chain instances and entities |
+| PN Unit | `pn_unit_id`, `pn_unit_iid` | `pn_unit_entity` | Polymer/non-polymer unit tracking |
+| Molecule | `molecule_id`, `molecule_iid` | `molecule_entity` | Chemical molecule identification |
+
+These annotations enable precise tracking of how asymmetric units map to assembly positions, essential for downstream analysis and machine learning applications.
+
+## Testing and Validation
+
+The assembly generation system is thoroughly validated through comprehensive test suites:
+
+### Assembly Count Validation
+[`test_assembly_counts`](tests/io/components/test_bioassemblies.py#L17-L36) verifies correct assembly enumeration across multiple PDB entries with varying assembly counts.
+
+### Coordinate Accuracy Validation
+[`test_assembly_atom_coordinates`](tests/io/components/test_bioassemblies.py#L37-L74) compares AtomWorks-generated assemblies against Biotite reference implementations, ensuring coordinate accuracy and proper transformation application.
+
+### Symmetry Center Testing
+Dedicated tests validate symmetry center conflict resolution, ensuring proper handling of edge cases where molecules clash with their symmetric copies.
+
+## Integration with ML Pipelines
+
+The symmetry operations integrate seamlessly with AtomWorks' machine learning transforms:
+
+- **Preprocessing transforms** prepare structures for symmetry analysis
+- **Encoding transforms** incorporate symmetry information into ML features  
+- **Dataset transforms** ensure consistent symmetry handling across training data
+
+This integration enables the development of symmetry-aware machine learning models for protein structure prediction and design applications.
+
+## Next Steps
+
+For understanding how assembly generation fits into the broader data processing workflow, explore the [AtomArray Data Structure](9-atomarray-data-structure) documentation. To learn about the transform system that enables these operations, see the [Transform Pipeline System](7-transform-pipeline-system). For machine learning applications, the [Transform System Fundamentals](12-transform-system-fundamentals) provides the theoretical foundation for symmetry-aware processing.
+
+# Transform System Fundamentals
+
+
+
+The AtomWorks transform system provides a powerful, composable framework for processing biological structure data through a pipeline of modular operations. This system enables systematic data preprocessing for machine learning applications while maintaining transparency, reproducibility, and error handling throughout the transformation pipeline.
+
+## Core Architecture
+
+### Transform Base Class
+
+All transforms inherit from the abstract `Transform` base class [base.py#L81-L120](src/atomworks/ml/transforms/base.py#L81-L120), which establishes the fundamental interface and behavior:
+
+```python
+class Transform(ABC):
+    validate_input: bool = True
+    raise_if_invalid_input: bool = True
+    requires_previous_transforms: ClassVar[list[str]] = []
+    incompatible_previous_transforms: ClassVar[list[str]] = []
+    previous_transforms_order_matters: bool = False
+    _track_transform_history: bool = True
+```
+
+Each transform implements two key methods:
+- `check_input(data: dict)`: Validates input data and raises errors if invalid
+- `forward(data: dict)`: Applies the transformation and returns transformed data
+
+The transform lifecycle follows a structured pattern [base.py#L245-L295](src/atomworks/ml/transforms/base.py#L245-L295):
+
+1. **History Tracking**: Ensures data is wrapped in `TransformedDict` for tracking
+2. **Input Validation**: Checks both transform history compatibility and data validity
+3. **History Update**: Records the current transform in the execution history
+4. **Transformation**: Applies the `forward` method
+5. **History Restoration**: Ensures transform history persists even if data is copied
+6. **Performance Tracking**: Records processing time for optimization
+
+### Data Flow and History Tracking
+
+The system uses `TransformedDict` [base.py#L42-L80](src/atomworks/ml/transforms/base.py#L42-L80) to maintain an immutable history of all applied transformations:
+
+```python
+class TransformedDict(dict):
+    """A thin wrapper around a dictionary that can be used to track the transform history."""
+```
+
+This enables complete reproducibility by tracking exactly which transforms were applied in what order, crucial for debugging complex pipelines and ensuring consistent preprocessing across training and inference.
+
+## Pipeline Composition
+
+### Compose Transform
+
+The `Compose` class [base.py#L323-L380](src/atomworks/ml/transforms/base.py#L323-L380) enables chaining multiple transforms into a single pipeline:
+
+```python
+class Compose(Transform):
+    def __init__(self, transforms: list[Transform], track_rng_state: bool = True, print_rng_state: bool = False):
+```
+
+Key features include:
+- **Sequential Execution**: Transforms are applied in order
+- **RNG State Tracking**: Essential for reproducible stochastic transformations
+- **Error Propagation**: Failed transforms include RNG state for debugging
+- **Flexible Composition**: Supports adding transforms with `+` operator
+
+### Routing and Control Flow
+
+The system provides sophisticated routing capabilities:
+
+**RandomRoute** [base.py#L636-L700](src/atomworks/ml/transforms/base.py#L636-L700): Probabilistically selects between transforms, useful for data augmentation strategies like different cropping approaches.
+
+**ConditionalRoute** [base.py#L704-L740](src/atomworks/ml/transforms/base.py#L704-L740): Routes based on conditions, enabling different processing paths for training vs inference.
+
+## Transform Categories
+
+### Atom Array Operations
+
+Atom array transforms manipulate the core biological structure representation:
+
+**Annotation Management**: 
+- `AddGlobalAtomIdAnnotation` [atom_array.py#L479-L500](src/atomworks/ml/transforms/atom_array.py#L479-L500): Tracks atoms across operations
+- `AddGlobalTokenIdAnnotation` [atom_array.py#L523-L536](src/atomworks/ml/transforms/atom_array.py#L523-L536): Maintains token-level tracking
+- `CopyAnnotation` [atom_array.py#L381-L398](src/atomworks/ml/transforms/atom_array.py#L381-L398): Duplicates annotations with new names
+
+**Structural Organization**:
+- `SortLikeRF2AA` [atom_array.py#L660-L683](src/atomworks/ml/transforms/atom_array.py#L660-L683): Organizes atoms for RF2AA compatibility
+- `SortPolyThenNonPoly` [atom_array.py#L690-L717](src/atomworks/ml/transforms/atom_array.py#L690-L717): Separates polymer and non-polymer components
+
+### Atomization and Tokenization
+
+**AtomizeByCCDName** [atomize.py#L119-L200](src/atomworks/ml/transforms/atomize.py#L119-L200): Converts residues to atomic representation based on Chemical Component Dictionary names, enabling detailed atomic-level analysis.
+
+**FlagNonPolymersForAtomization** [atomize.py#L16-L34](src/atomworks/ml/transforms/atomize.py#L16-L34): Identifies non-polymer residues that should be atomized, handling edge cases like individual amino acids bonded to sugars.
+
+### Encoding Transforms
+
+**EncodeAtomArray** [encoding.py#L299-L350](src/atomworks/ml/transforms/encoding.py#L299-L350): Converts AtomArray objects to numerical representations suitable for machine learning models:
+
+```python
+def atom_array_to_encoding(
+    atom_array: AtomArray,
+    encoding: TokenEncoding,
+    default_coord: np.ndarray | float = float("nan"),
+    occupancy_threshold: float = 0.0,
+    extra_annotations: list[str] = [...]
+) -> dict:
+```
+
+This transform handles the critical conversion from biological structure data to tensor format, managing coordinates, masks, and sequence encoding while preserving structural relationships.
+
+## Validation and Compatibility
+
+### Transform Dependencies
+
+The system enforces strict compatibility through class attributes:
+
+- `requires_previous_transforms`: Specifies prerequisite transforms
+- `incompatible_previous_transforms`: Prevents conflicting operations
+- `previous_transforms_order_matters`: Ensures correct sequencing
+
+For example, `SortLikeRF2AA` requires `AtomizeByCCDName` [atom_array.py#L668](src/atomworks/ml/transforms/atom_array.py#L668), ensuring proper atomization before sorting.
+
+### Error Handling
+
+Custom `TransformPipelineError` [base.py#L33-L36](src/atomworks/ml/transforms/base.py#L33-L36) provides detailed error reporting with RNG state for stochastic transforms, enabling precise debugging of complex pipelines.
+
+## Utility Transforms
+
+The system includes essential utility transforms:
+
+- `RemoveKeys` [base.py#L483-L497](src/atomworks/ml/transforms/base.py#L483-L497): Cleans up unnecessary data
+- `AddData` [base.py#L518-L532](src/atomworks/ml/transforms/base.py#L518-L532): Injects additional information
+- `LogData` [base.py#L535-L553](src/atomworks/ml/transforms/base.py#L535-L553): Debugging support with configurable logging
+- `ConvertToTorch` [base.py#L804-L818](src/atomworks/ml/transforms/base.py#L804-L818): Converts data to PyTorch tensors
+
+## Integration Patterns
+
+The transform system seamlessly integrates with the broader AtomWorks ecosystem:
+
+```mermaid
+graph TD
+    A[Raw Structure Data] --> B[Transform Pipeline]
+    B --> C[Encoded Tensors]
+    B --> D[Annotations]
+    B --> E[Metadata]
+    
+    B --> F[Compose]
+    F --> G[AtomArray Transforms]
+    F --> H[Encoding Transforms]
+    F --> I[Utility Transforms]
+    
+    G --> J[Atomization]
+    G --> K[Sorting]
+    G --> L[Annotation]
+    
+    H --> M[Token Encoding]
+    H --> N[Coordinate Conversion]
+```
+
+The transform system serves as the backbone of AtomWorks' machine learning pipeline, providing a robust, extensible framework for biological structure preprocessing. Its modular design enables custom transform development while maintaining compatibility with existing components.
+
+## Next Steps
+
+To deepen your understanding of the transform system:
+
+- Explore [Atomization and Tokenization](13-atomization-and-tokenization) for detailed conversion strategies
+- Learn about [Feature Encoding Schemes](14-feature-encoding-schemes) for ML-specific representations
+- Study [Custom Transform Development](16-custom-transform-development) to extend the system
+- Review [Pipeline Composition and Routing](17-pipeline-composition-and-routing) for advanced patterns
+
+# Atomization and Tokenization
+
+
+
+Atomization and tokenization are fundamental processes in AtomWorks that transform biological structures into machine-readable formats suitable for deep learning models. These processes bridge the gap between atomic-level structural data and the token-based representations required by modern protein and nucleic acid prediction models.
+
+## Understanding the Atomization Process
+
+Atomization is the process of breaking down complex molecular residues into their constituent atoms or maintaining them as unified tokens depending on the model requirements. This flexible approach enables compatibility with different machine learning architectures that operate at varying levels of molecular granularity.
+
+The core atomization functionality is implemented in the `AtomizeByCCDName` transform, which processes residues based on the Chemical Component Dictionary (CCD) naming convention [src/atomworks/ml/transforms/atomize.py](src/atomworks/ml/transforms/atomize.py#L119-L212). This transform determines whether each residue should be treated as a single token or broken down into individual atoms.
+
+```mermaid
+flowchart TD
+    A[Input AtomArray] --> B{Atomize Decision}
+    B -->|atomize_by_default=True| C[Atomize All Residues]
+    B -->|res_names_to_atomize| D[Atomize Specific Residues]
+    B -->|res_names_to_ignore| E[Skip Atomization]
+    C --> F[Set atomize=True Flag]
+    D --> F
+    E --> G[Set atomize=False Flag]
+    F --> H{move_atomized_part_to_end?}
+    G --> I[Final AtomArray]
+    H -->|True| J[Reorder: Non-atomized + Atomized]
+    H -->|False| I
+    J --> I
+```
+
+### Key Atomization Components
+
+The `FlagNonPolymersForAtomization` transform provides a complementary approach by automatically flagging all non-polymer residues for atomization [src/atomworks/ml/transforms/atomize.py](src/atomworks/ml/transforms/atomize.py#L16-L45). This is particularly useful for structures like PDB entry `6w12`, which contains protein residues outside of polymers that should be atomized for proper model input.
+
+The atomization process respects several important constraints:
+- **Residue Consistency**: All atoms within a given residue must either be atomized or not atomized - partial atomization is prohibited [src/atomworks/ml/transforms/atomize.py](src/atomworks/ml/transforms/atomize.py#L98-L100)
+- **Precedence Handling**: Previously set `atomize` flags take precedence over default settings, enabling manual control for data augmentation scenarios [src/atomworks/ml/transforms/atomize.py](src/atomworks/ml/transforms/atomize.py#L94-L96)
+- **RF2AA Compatibility**: The option to move atomized parts to the end of the array supports RF2AA's convention of grouping atomized components [src/atomworks/ml/transforms/atomize.py](src/atomworks/ml/transforms/atomize.py#L105-L114)
+
+## Tokenization Fundamentals
+
+Tokenization defines the boundaries between meaningful units in molecular structures. Unlike traditional residue-based approaches, AtomWorks implements a flexible tokenization system that can operate at both residue and atom levels.
+
+The `get_token_starts` function determines token boundaries based on multiple criteria [src/atomworks/ml/utils/token.py](src/atomworks/ml/utils/token.py#L17-L72):
+
+```mermaid
+flowchart LR
+    A[Token Start Detection] --> B[atomize Flag Changes]
+    A --> C[Chain ID Changes]
+    A --> D[Residue ID Changes]
+    A --> E[Insertion Code Changes]
+    A --> F[Residue Name Changes]
+    B --> G[New Token Boundary]
+    C --> G
+    D --> G
+    E --> G
+    F --> G
+```
+
+A new token begins when any of these conditions are met:
+- The `atomize` flag transitions from False to True
+- Chain identifier changes
+- Residue ID changes  
+- Insertion code changes
+- Residue name changes
+
+This approach ensures that atomized residues become individual tokens while maintaining traditional residue boundaries for non-atomized components.
+
+## Token Operations and Utilities
+
+AtomWorks provides comprehensive utilities for working with tokenized structures:
+
+### Token Iteration and Processing
+
+The `token_iter` function enables iteration over tokens in an AtomArray, seamlessly handling both atomized and non-atomized scenarios [src/atomworks/ml/utils/token.py](src/atomworks/ml/utils/token.py#L141-L150). This matches the behavior of `biotite.structure.residue_iter` when no atomization is present.
+
+### Token-wise Operations
+
+Several functions enable token-level data manipulation:
+- **`spread_token_wise`**: Distributes token-level data to constituent atoms [src/atomworks/ml/utils/token.py](src/atomworks/ml/utils/token.py#L153-L157)
+- **`apply_token_wise`**: Applies functions token-wise and returns token-level results [src/atomworks/ml/utils/token.py](src/atomworks/ml/utils/token.py#L160-L170)
+- **`apply_and_spread_token_wise`**: Combines token-wise function application with atom-level distribution [src/atomworks/ml/utils/token.py](src/atomworks/ml/utils/token.py#L173-L180)
+
+## Model-Specific Token Representations
+
+### AlphaFold 3 Token Representatives
+
+AtomWorks implements AlphaFold 3's token representation scheme, which uses specific atoms as representatives for different molecular types [src/atomworks/ml/utils/token.py](src/atomworks/ml/utils/token.py#L233-L282):
+
+| Molecular Type | Representative Atom | Rationale |
+|----------------|-------------------|-----------|
+| Standard Amino Acids | CB (CA for glycine) | Side chain center for distance calculations |
+| Pyrimidines | C2 | Consistent position in pyrimidine ring |
+| Purines | C4 | Consistent position in purine ring |
+| Atomized Ligands | All atoms | Each atom is its own token |
+
+> [!TIP]
+> The distinction between "representative" atoms (used for distance calculations) and "center" atoms (used during cropping) is crucial for understanding AF3's token processing pipeline.
+
+## Encoding Schemes and Token Integration
+
+The encoding system transforms tokenized structures into numerical representations suitable for machine learning models. The `TokenEncoding` class defines the mapping between tokens and their atomic composition [src/atomworks/ml/encoding_definitions.py](src/atomworks/ml/encoding_definitions.py#L36-L250).
+
+### Standard Encoding Conventions
+
+AtomWorks follows CCD-compatible conventions for token definitions:
+- **Residue Tokens**: Use standardized 3-letter CCD names (e.g., 'ALA' for Alanine, 'DA' for Deoxyadenosine)
+- **Atom Tokens**: Use atomic numbers as strings (e.g., '6' for Carbon, '8' for Oxygen)
+- **Unknown Tokens**: Use angle bracket syntax (e.g., '<M>' for generic mask, '<MP>' for protein mask)
+- **Mask Tokens**: Follow `<...>` format to avoid conflicts with existing residue names
+
+### Supported Encoding Schemes
+
+AtomWorks provides multiple encoding schemes optimized for different model architectures:
+
+| Encoding Scheme | Target Model | Atom Coverage | Unknown Tokens |
+|----------------|-------------|---------------|----------------|
+| `AF2_ATOM14_ENCODING` | AlphaFold 2 | 14 heavy atoms per residue | Single UNK token |
+| `RF2AA_ATOM36_ENCODING` | RoseTTAFold2AA | 36 atoms (heavy + H) per residue | UNK, DN, N tokens |
+| `AF3_TOKENS` | AlphaFold 3 | Variable based on atomization | Multiple unknown types |
+
+## Pipeline Integration
+
+Atomization and tokenization integrate seamlessly into AtomWorks' transform pipeline system. The `EncodeAtomArray` transform converts tokenized AtomArrays into numerical encodings [src/atomworks/ml/transforms/encoding.py](src/atomworks/ml/transforms/encoding.py#L299-L348), supporting various downstream tasks.
+
+> [!TIP]
+> Transform compatibility is crucial - atomization must occur before transforms that depend on established tokens, such as `AddTokenBondAdjacency` or encoding transforms.
+
+The pipeline enforces strict ordering constraints to ensure data integrity:
+1. Atomization transforms must run before token-dependent transforms
+2. Encoding transforms must run after token boundaries are established
+3. Validation ensures consistent token-to-atom relationships
+
+## Practical Applications
+
+### Data Augmentation
+
+The atomization system enables sophisticated data augmentation strategies. By manually setting the `atomize` flag before applying `AtomizeByCCDName`, users can selectively atomize residues for augmentation while preserving overall structure [src/atomworks/ml/transforms/atomize.py](src/atomworks/ml/transforms/atomize.py#L160-L164).
+
+### Multi-Model Compatibility
+
+The flexible tokenization approach enables compatibility across different model architectures:
+- **Residue-level models**: Use traditional tokenization without atomization
+- **Atom-level models**: Apply full atomization for fine-grained predictions
+- **Hybrid models**: Selectively atomize specific residue types
+
+### Structure Processing
+
+The system handles complex biological scenarios including:
+- Non-polymer residues requiring atomization
+- Covalently bound ligands and polymers
+- Mixed nucleic acid and protein structures
+- Modified residues and chemical components
+
+## Next Steps
+
+To deepen your understanding of AtomWorks' tokenization system, explore these related topics:
+
+- **[Feature Encoding Schemes](14-feature-encoding-schemes)**: Learn about the detailed encoding definitions and their applications
+- **[Transform System Fundamentals](12-transform-system-fundamentals)**: Understand the transform pipeline architecture
+- **[Custom Transform Development](16-custom-transform-development)**: Create custom atomization and tokenization transforms
+
+The atomization and tokenization system provides a robust foundation for converting complex biological structures into machine-learning-ready representations while maintaining flexibility for diverse model requirements and research applications.
+
+# Feature Encoding Schemes
+
+
+
+AtomWorks provides a comprehensive framework for encoding molecular structures into numerical representations suitable for machine learning applications. The encoding system bridges the gap between biological data structures and tensor-based neural network inputs through standardized tokenization schemes.
+
+## TokenEncoding Architecture
+
+The core of the encoding system is the `TokenEncoding` class, which defines how molecular components are mapped to numerical indices and coordinate arrays [encoding_definitions.py#L36-L250](src/atomworks/ml/encoding_definitions.py#L36-L250). Each encoding scheme consists of:
+
+- **Token-to-atom mappings**: Fixed-length arrays defining which atoms belong to each residue type
+- **Unknown token handling**: Chemical component type mappings for unresolved residues
+- **Bidirectional lookups**: Efficient token/atom index conversion for encoding and decoding operations
+
+> [!TIP]
+> The encoding system follows CCD conventions where residues use 3-letter standardized names, atoms use atomic numbers as tokens, and masked tokens use angle bracket syntax (e.g., `<M>`) to avoid conflicts with existing residue names.
+
+## Standard Encoding Schemes
+
+### AlphaFold 2 Encodings
+
+**AF2_ATOM14_ENCODING**: Heavy atom encoding for proteins with maximum 14 atoms per residue [encoding_definitions.py#L254-L281](src/atomworks/ml/encoding_definitions.py#L254-L281). Covers all 20 standard amino acids plus an unknown token (`UNK`), with atoms ordered consistently across residue types.
+
+**AF2_ATOM37_ENCODING**: Extended protein encoding with 37 atom positions per residue [encoding_definitions.py#L288-L332](src/atomworks/ml/encoding_definitions.py#L288-L332). Includes additional atom positions for comprehensive structural representation, maintaining compatibility with AlphaFold 2's coordinate system.
+
+### RoseTTAFold 2 Encodings
+
+**RF2_ATOM14_ENCODING**: Protein-specific heavy atom encoding similar to AF2 but with RoseTTAFold conventions [encoding_definitions.py#L422-L449](src/atomworks/ml/encoding_definitions.py#L422-L449). Supports 20 amino acids with unknown and mask tokens.
+
+**RF2_ATOM23_ENCODING**: Extended encoding supporting both proteins and nucleic acids [encoding_definitions.py#L455-L500](src/atomworks/ml/encoding_definitions.py#L455-L500). Handles up to 23 heavy atoms per residue, covering DNA/RNA bases with type-specific unknown tokens (`DN` for DNA, `N` for RNA).
+
+**RF2AA_ATOM36_ENCODING**: Comprehensive all-atom encoding for proteins, nucleic acids, and ligands [encoding_definitions.py#L545-L643](src/atomworks/ml/encoding_definitions.py#L545-L643). Includes both heavy atoms and hydrogens (maximum 36 atoms), supporting:
+- 20 amino acids + unknown + mask tokens
+- 4 DNA bases + unknown
+- 4 RNA bases + unknown  
+- 45 atom-level tokens for elemental representation
+- Legacy histidine token (`HIS_D`) for backward compatibility
+
+### AlphaFold 3 Sequence Encoding
+
+The `AF3SequenceEncoding` class provides sequence-level tokenization [encoding_definitions.py#L689-L753](src/atomworks/ml/encoding_definitions.py#L689-L753), mapping residue names to integer indices for:
+- Standard amino acids (20 tokens)
+- RNA bases (4 tokens) + unknown
+- DNA bases (4 tokens) + unknown
+- Gap tokens for alignment operations
+
+## Encoding Process
+
+The `atom_array_to_encoding` function transforms `AtomArray` objects into tensor-ready representations [encoding.py#L34-L100](src/atomworks/ml/transforms/encoding.py#L34-L100):
+
+```python
+encoded_data = atom_array_to_encoding(
+    atom_array=structure,
+    encoding=RF2AA_ATOM36_ENCODING,
+    default_coord=float("nan"),
+    occupancy_threshold=0.0
+)
+```
+
+This generates:
+- **xyz**: Coordinate tensor of shape `[n_tokens, n_atoms_per_token, 3]`
+- **mask**: Resolution mask indicating which atoms are present
+- **seq**: Integer sequence of token indices
+- **token_is_atom**: Boolean flag distinguishing residue vs atom tokens
+- **annotations**: Additional metadata (chain IDs, entity IDs, etc.)
+
+> [!TIP]
+> The encoding system automatically handles atomization - when the `atomize` annotation is present, individual atoms become separate tokens, enabling mixed residue/atom representations within the same structure.
+
+## Encoding Selection Guide
+
+| Use Case | Recommended Encoding | Atoms per Token | Coverage |
+|----------|---------------------|-----------------|----------|
+| Protein structure prediction | AF2_ATOM14_ENCODING | 14 | 20 amino acids |
+| Protein-ligand complexes | RF2AA_ATOM36_ENCODING | 36 | Proteins, nucleic acids, ligands |
+| Nucleic acid modeling | RF2_ATOM23_ENCODING | 23 | Proteins + DNA/RNA |
+| Sequence-only tasks | AF3SequenceEncoding | N/A | All standard biomolecules |
+
+## Integration with ML Pipelines
+
+Feature encoding integrates seamlessly with AtomWorks' transform system through the `EncodeAtomArray` transform [encoding.py#L299-L362](src/atomworks/ml/transforms/encoding.py#L299-L362). This enables encoding as part of larger preprocessing pipelines:
+
+```python
+pipeline = Transform([
+    AtomizeResidues(),
+    EncodeAtomArray(encoding=RF2AA_ATOM36_ENCODING),
+    AddTokenAnnotation(encoding=RF2AA_ATOM36_ENCODING)
+])
+```
+
+The encoding system provides the foundational representation layer for downstream machine learning tasks, ensuring consistent and efficient conversion from biological structures to neural network inputs.
+
+For practical implementation details and examples of encoding usage in ML pipelines, see [Dataset Sampling and Batching](15-dataset-sampling-and-batching).
+
+# Dataset Sampling and Batching
+
+
+
+Dataset sampling and batching in AtomWorks provides sophisticated strategies for handling large-scale structural biology datasets, with specialized support for distributed training, load balancing, and weighted sampling based on biological properties.
+
+## Core Sampling Architecture
+
+The sampling system is built around several key components that work together to provide flexible and efficient data access patterns for machine learning pipelines.
+
+### DistributedMixedSampler
+
+The `DistributedMixedSampler` enables sampling from multiple datasets with specified probabilities across distributed training environments [samplers.py#L197](src/atomworks/ml/samplers.py#L197). This is particularly useful when combining datasets with different characteristics or sampling strategies.
+
+```mermaid
+graph TD
+    A[DistributedMixedSampler] --> B[Sampler1 0.8]
+    A --> C[MixedSampler 0.2]
+    C --> D[Sampler2 0.9]
+    C --> E[Sampler3 0.1]
+    
+    F[Node 1] --> G[50 samples]
+    H[Node 2] --> I[50 samples]
+    
+    A --> F
+    A --> H
+```
+
+The sampler follows a hierarchical sampling tree where child samplers can be any type of non-distributed sampler, including other `MixedSampler` instances. After collecting samples according to the specified probabilities, it shards the results across nodes to ensure each process receives a unique slice of the dataset.
+
+### Weighted Sampling Strategies
+
+AtomWorks implements sophisticated weighted sampling inspired by AlphaFold 3 methodology, where example weights are calculated based on multiple biological factors [samplers.py#L15](src/atomworks/ml/samplers.py#L15):
+
+```python
+w ∝ (β_r / N_clust) * (a_prot * n_prot + a_peptide * n_peptide + a_nuc * n_nuc + a_ligand * n_ligand + a_loi * is_loi)
+```
+
+The weighting considers:
+- **Cluster size** (`N_clust`): Larger clusters receive lower weights to prevent over-representation
+- **Molecule composition**: Separate weights for proteins, peptides, nucleic acids, and ligands
+- **Ligands of Interest** (LOI): Special weighting for biologically relevant ligands
+- **Interface vs Chain type**: Different β parameters for interfaces and chains
+
+## Advanced Sampler Implementations
+
+### LazyWeightedRandomSampler
+
+The `LazyWeightedRandomSampler` extends PyTorch's `WeightedRandomSampler` with prefetching capabilities to improve performance [samplers.py#L439](src/atomworks/ml/samplers.py#L439):
+
+```python
+class LazyWeightedRandomSampler(WeightedRandomSampler):
+    def __init__(self, weights: Sequence[float], num_samples: int, 
+                 replacement: bool = True, generator: torch.Generator | None = None,
+                 prefetch_buffer_size: int = 1) -> None:
+```
+
+This sampler uses a prefetch buffer to reduce the overhead of repeated `torch.multinomial` calls, particularly beneficial when sampling large numbers of examples with replacement.
+
+### LoadBalancedDistributedSampler
+
+For validation scenarios where processing time varies significantly between examples, the `LoadBalancedDistributedSampler` ensures even workload distribution across replicas [samplers.py#L465](src/atomworks/ml/samplers.py#L465):
+
+```python
+class LoadBalancedDistributedSampler(DistributedSampler):
+    def __init__(self, dataset: Dataset, key_to_balance: str,
+                 num_replicas: int | None = None, rank: int | None = None,
+                 drop_last: bool = False):
+```
+
+This sampler balances examples based on a specified key (e.g., token count or structure size) to prevent situations where some GPUs process many large, slow examples while others handle small, fast ones.
+
+## Batching Strategies
+
+### Work-Stealing Data Loader
+
+The `WorkStealDataLoader` implements an advanced multiprocessing strategy with work-stealing capabilities for improved load balancing [worksteal.py#L52](src/atomworks/ml/loaders/worksteal.py#L52):
+
+```mermaid
+graph LR
+    A[Main Process] --> B[Work Queue]
+    C[Worker 1] --> B
+    D[Worker 2] --> B
+    E[Worker 3] --> B
+    
+    B --> F[Result Queue]
+    F --> A
+    
+    C -.->|Steal Work| D
+    D -.->|Steal Work| E
+```
+
+Key features include:
+- **Dynamic work stealing**: Idle workers can steal tasks from busy workers' queues
+- **Worker health monitoring**: Tracks processing statistics and error rates
+- **Graceful shutdown**: Proper cleanup of worker processes
+- **Configurable timeouts**: Prevents hanging on problematic examples
+
+### Structure Batching for Diffusion
+
+The `BatchStructuresForDiffusionNoising` transform handles batching for diffusion-based training, where structures need to be tiled across the diffusion batch dimension [batch_structures.py#L7](src/atomworks/ml/transforms/diffusion/batch_structures.py#L7):
+
+```python
+class BatchStructuresForDiffusionNoising(Transform):
+    def forward(self, data: dict[str, Any]) -> dict[str, Any]:
+        # Transforms (n_atoms, 3) -> (diffusion_batch_size, n_atoms, 3)
+        data["coord_atom_lvl_to_be_noised"] = data["ground_truth"]["coord_atom_lvl"].repeat(self.batch_size, 1, 1)
+```
+
+This enables differential noising and augmentation of each structure in the batch, following the AlphaFold 3 training paradigm.
+
+## Dataset Integration
+
+### Base Dataset Architecture
+
+All datasets inherit from `BaseDataset`, which provides a consistent interface for indexing and ID management [datasets.py#L24](src/atomworks/ml/datasets/datasets.py#L24):
+
+```python
+class BaseDataset(Dataset):
+    @abstractmethod
+    def __contains__(self, example_id: str) -> bool:
+        """Check if the dataset contains the example ID."""
+    
+    @abstractmethod
+    def id_to_idx(self, example_id: str | list[str]) -> int | list[int]:
+        """Convert example IDs to indices."""
+    
+    @abstractmethod
+    def idx_to_id(self, idx: int | list[int]) -> str | list[str]:
+        """Convert indices to example IDs."""
+```
+
+### Specialized Dataset Types
+
+- **PandasDataset**: Wrapper around pandas DataFrames with filtering and column selection [datasets.py#L295](src/atomworks/ml/datasets/datasets.py#L295)
+- **StructuralFileDataset**: File-based dataset with directory scanning and filtering [datasets.py#L67](src/atomworks/ml/datasets/datasets.py#L67)
+- **StructuralDatasetWrapper**: Decorator that adds structural data loading and transformation capabilities [datasets.py#L119](src/atomworks/ml/datasets/datasets.py#L119)
+
+## Configuration and Usage
+
+### Sampler Configuration
+
+Samplers are configured through datasets_info dictionaries that specify:
+
+```python
+datasets_info = [
+    {
+        "sampler": sampler_instance,
+        "dataset": dataset_instance,
+        "probability": 0.8,
+        "name": "primary_dataset"
+    },
+    {
+        "sampler": secondary_sampler,
+        "dataset": secondary_dataset,
+        "probability": 0.2,
+        "name": "secondary_dataset"
+    }
+]
+```
+
+### Weight Calculation
+
+AF-3 style weights are calculated using the `calculate_af3_example_weights` function [samplers.py#L15](src/atomworks/ml/samplers.py#L15):
+
+```python
+weights = calculate_af3_example_weights(
+    df=dataset_df,
+    alphas={"a_prot": 1.0, "a_nuc": 0.5, "a_ligand": 0.3, "a_peptide": 0.2, "a_loi": 2.0},
+    beta=1.0
+)
+```
+
+> [!TIP]
+> The cluster-based weighting strategy prevents over-representation of similar structures while maintaining biological diversity in the training data.
+
+## Performance Considerations
+
+### Memory Efficiency
+
+- **Lazy evaluation**: Samplers generate indices on-demand rather than materializing full lists
+- **Prefetching**: `LazyWeightedRandomSampler` uses buffers to reduce computational overhead
+- **Work stealing**: Dynamic load balancing prevents worker idle time
+
+### Distributed Training
+
+- **Deterministic sharding**: Each process receives a unique, non-overlapping subset of data
+- **Epoch synchronization**: `set_sampler_epoch()` ensures consistent randomization across epochs
+- **Load balancing**: Specialized samplers prevent GPU idle time in validation scenarios
+
+> [!TIP]
+> For large-scale distributed training, use `DistributedMixedSampler` with `LoadBalancedDistributedSampler` for validation to ensure optimal GPU utilization.
+
+## Integration with Pipeline System
+
+The sampling and batching system integrates seamlessly with the broader AtomWorks transform pipeline system:
+
+1. **Dataset wrappers** handle data loading and preprocessing
+2. **Samplers** control which examples are selected for each batch
+3. **Data loaders** manage multiprocessing and work distribution
+4. **Batch transforms** prepare data for model-specific requirements
+
+This modular design allows for flexible composition of different sampling strategies with various dataset types and preprocessing pipelines.
+
+## Next Steps
+
+For comprehensive understanding of the data processing pipeline, explore:
+- [Transform System Fundamentals](12-transform-system-fundamentals) for the preprocessing architecture
+- [Atomization and Tokenization](13-atomization-and-tokenization) for data representation details
+- [Pipeline Composition and Routing](17-pipeline-composition-and-routing) for end-to-end workflow construction
+
+# Custom Transform Development
+
+
+
+The AtomWorks transform system provides a robust framework for creating custom data processing pipelines for molecular structures. This guide covers the essential patterns and best practices for developing custom transforms that integrate seamlessly with the existing ecosystem.
+
+## Transform Architecture Overview
+
+The transform system is built around an abstract base class that provides standardized interfaces for data validation, processing, and pipeline integration. Every transform operates on dictionary-based data structures, enabling flexible composition and routing.
+
+```mermaid
+classDiagram
+    class Transform {
+        <<abstract>>
+        +validate_input: bool
+        +raise_if_invalid_input: bool
+        +requires_previous_transforms: list[str]
+        +incompatible_previous_transforms: list[str]
+        +check_input(data: dict) void
+        +forward(data: dict) dict
+        +__call__(data: dict) dict
+    }
+    
+    class CustomTransform {
+        +__init__(params) void
+        +check_input(data: dict) void
+        +forward(data: dict) dict
+    }
+    
+    class Compose {
+        -transforms: list[Transform]
+        +forward(data: dict) dict
+        +__add__(transform: Transform) Compose
+    }
+    
+    Transform <|-- CustomTransform
+    Transform <|-- Compose
+    Compose --> Transform
+```
+
+## Core Transform Interface
+
+The `Transform` base class defines the essential contract that all custom transforms must implement. Located in [`src/atomworks/ml/transforms/base.py`](src/atomworks/ml/transforms/base.py#L81), it provides several key attributes and methods:
+
+### Class-Level Configuration
+
+Transforms support declarative configuration through class attributes:
+
+- **`validate_input`**: Controls whether input validation is performed (default: `True`)
+- **`raise_if_invalid_input`**: Determines whether invalid input raises exceptions (default: `True`)
+- **`requires_previous_transforms`**: Lists required preceding transforms
+- **`incompatible_previous_transforms`**: Lists incompatible preceding transforms
+- **`previous_transforms_order_matters`**: Indicates if transform order is critical
+- **`_track_transform_history`**: Controls transform history tracking (default: `True`)
+
+### Required Methods
+
+Every custom transform must implement:
+
+1. **`check_input(data: dict) -> None`**: Validates input data and raises exceptions for invalid inputs
+2. **`forward(data: dict) -> dict`**: Applies the transformation and returns modified data
+
+## Creating a Basic Custom Transform
+
+Here's the fundamental pattern for creating a custom transform:
+
+```python
+from atomworks.ml.transforms.base import Transform
+from typing import Any, Dict
+
+class CustomStructureProcessor(Transform):
+    """Example transform that processes molecular structures."""
+    
+    def __init__(self, processing_parameter: float = 1.0):
+        self.processing_parameter = processing_parameter
+    
+    def check_input(self, data: Dict[str, Any]) -> None:
+        """Validate that required keys exist in the input data."""
+        if "atom_array" not in data:
+            raise ValueError("Input data must contain 'atom_array' key")
+    
+    def forward(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply the custom processing logic."""
+        atom_array = data["atom_array"]
+        
+        # Your custom processing logic here
+        processed_array = self._process_structure(atom_array)
+        
+        # Update the data dictionary
+        data["atom_array"] = processed_array
+        data["processing_applied"] = True
+        
+        return data
+    
+    def _process_structure(self, atom_array):
+        """Internal method for the actual processing logic."""
+        # Implementation details
+        pass
+```
+
+## Advanced Transform Patterns
+
+### Transform Dependencies and Ordering
+
+The transform system supports dependency management through class attributes. For example, the [`FeaturizeTemplatesLikeRF2AA`](src/atomworks/ml/transforms/template.py#L462) transform demonstrates dependency specification:
+
+```python
+class FeaturizeTemplatesLikeRF2AA(Transform):
+    requires_previous_transforms: ClassVar[list[str | Transform]] = [
+        AddRFTemplates, 
+        "AddWithinPolyResIdx"  # Can use string names or classes
+    ]
+    
+    def forward(self, data: dict[str, Any]) -> dict[str, Any]:
+        # Implementation that depends on previous transforms
+        pass
+```
+
+### Conditional Processing
+
+Transforms can implement conditional logic based on data content. The [`ConditionalRoute`](src/atomworks/ml/transforms/base.py#L704) transform provides a pattern for routing different processing paths:
+
+```python
+class ConditionalProcessing(Transform):
+    """Apply different processing based on data characteristics."""
+    
+    def __init__(self, condition_key: str, processor_map: dict):
+        self.condition_key = condition_key
+        self.processor_map = processor_map
+    
+    def forward(self, data: dict[str, Any]) -> dict[str, Any]:
+        condition_value = data.get(self.condition_key)
+        processor = self.processor_map.get(condition_value)
+        
+        if processor:
+            return processor(data)
+        return data
+```
+
+### Data Validation and Error Handling
+
+Robust error handling is essential for production transforms. The base class provides comprehensive error formatting and history tracking:
+
+```python
+class RobustProcessor(Transform):
+    def check_input(self, data: dict[str, Any]) -> None:
+        """Comprehensive input validation."""
+        required_keys = ["atom_array", "metadata"]
+        missing_keys = [key for key in required_keys if key not in data]
+        
+        if missing_keys:
+            raise ValueError(f"Missing required keys: {missing_keys}")
+        
+        # Additional validation logic
+        atom_array = data["atom_array"]
+        if len(atom_array) == 0:
+            raise ValueError("Atom array cannot be empty")
+    
+    def forward(self, data: dict[str, Any]) -> dict[str, Any]:
+        try:
+            # Processing logic with error handling
+            result = self._safe_process(data)
+            return result
+        except Exception as e:
+            # Custom error handling
+            logger.error(f"Processing failed: {e}")
+            raise
+```
+
+## Integration with Existing Transform Categories
+
+### IO Transforms
+
+For transforms that handle input/output operations, follow patterns from [`src/atomworks/io/transforms/`](src/atomworks/io/transforms/):
+
+```python
+class CustomIOTransform(Transform):
+    """Transform that handles custom file formats."""
+    
+    def __init__(self, file_path: str, format_options: dict = None):
+        self.file_path = file_path
+        self.format_options = format_options or {}
+    
+    def forward(self, data: dict[str, Any]) -> dict[str, Any]:
+        # Load or save custom format
+        custom_data = self._load_custom_format()
+        data.update(custom_data)
+        return data
+```
+
+### ML Pipeline Transforms
+
+For machine learning pipeline transforms, follow patterns from [`src/atomworks/ml/transforms/`](src/atomworks/ml/transforms/). The [`EncodeAtomArray`](src/atomworks/ml/transforms/encoding.py#L299) transform provides a good example:
+
+```python
+class CustomMLEncoding(Transform):
+    """Custom encoding for machine learning pipelines."""
+    
+    requires_previous_transforms = ["AtomizeByCCDName"]
+    
+    def __init__(self, encoding_scheme: str, feature_dimensions: dict):
+        self.encoding_scheme = encoding_scheme
+        self.feature_dimensions = feature_dimensions
+    
+    def forward(self, data: dict[str, Any]) -> dict[str, Any]:
+        atom_array = data["atom_array"]
+        
+        # Custom encoding logic
+        encoded_features = self._encode_custom_features(atom_array)
+        
+        data.update(encoded_features)
+        return data
+```
+
+## Testing Custom Transforms
+
+The test suite in [`tests/ml/transforms/`](tests/ml/transforms/) provides patterns for comprehensive testing:
+
+```python
+import pytest
+from atomworks.ml.transforms.base import Transform
+
+class TestCustomTransform:
+    def test_check_input_valid(self):
+        """Test valid input validation."""
+        transform = CustomStructureProcessor()
+        valid_data = {"atom_array": mock_atom_array()}
+        
+        # Should not raise exception
+        transform.check_input(valid_data)
+    
+    def test_check_input_invalid(self):
+        """Test invalid input detection."""
+        transform = CustomStructureProcessor()
+        invalid_data = {"wrong_key": "value"}
+        
+        with pytest.raises(ValueError, match="atom_array"):
+            transform.check_input(invalid_data)
+    
+    def test_forward_processing(self):
+        """Test the main processing logic."""
+        transform = CustomStructureProcessor(processing_parameter=2.0)
+        input_data = {"atom_array": mock_atom_array()}
+        
+        result = transform.forward(input_data)
+        
+        assert "processing_applied" in result
+        assert result["processing_applied"] is True
+```
+
+## Pipeline Composition
+
+Custom transforms integrate seamlessly with the composition system. The [`Compose`](src/atomworks/ml/transforms/base.py#L323) class enables sophisticated pipeline construction:
+
+```python
+# Create custom pipeline
+custom_pipeline = Compose([
+    CustomStructureProcessor(processing_parameter=1.5),
+    CustomMLEncoding(encoding_scheme="custom_v1"),
+    ConditionalProcessing(
+        condition_key="model_type",
+        processor_map={
+            "protein": ProteinSpecificProcessor(),
+            "rna": RNASpecificProcessor()
+        }
+    )
+])
+
+# Use in pipeline
+result = custom_pipeline(input_data)
+```
+
+## Best Practices and Guidelines
+
+### Performance Considerations
+
+1. **Lazy Loading**: For expensive operations, consider lazy evaluation patterns
+2. **Memory Management**: Handle large structures efficiently to avoid memory issues
+3. **Caching**: Implement caching for computationally expensive operations
+
+### Documentation Standards
+
+1. **Clear Docstrings**: Document parameters, return values, and exceptions
+2. **Type Hints**: Use comprehensive type annotations for better IDE support
+3. **Examples**: Provide usage examples in docstrings
+
+### Error Handling
+
+1. **Specific Exceptions**: Use descriptive exception types and messages
+2. **Graceful Degradation**: Implement fallback behavior where appropriate
+3. **Logging**: Include informative log messages for debugging
+
+> [!TIP]
+> Always implement comprehensive input validation in `check_input()` method. The transform system provides automatic error formatting and history tracking that makes debugging much easier when validation fails early.
+
+> [!TIP]
+> Consider transform dependencies carefully. Use `requires_previous_transforms` and `incompatible_previous_transforms` to ensure pipeline integrity and prevent subtle bugs from transform ordering issues.
+
+## Next Steps
+
+For deeper understanding of the transform system, explore:
+- [Transform System Fundamentals](12-transform-system-fundamentals) for core concepts
+- [Pipeline Composition and Routing](17-pipeline-composition-and-routing) for advanced patterns
+- [AtomArray Data Structure](9-atomarray-data-structure) for data format details
+
+The transform system's modular design enables rapid development of custom molecular processing workflows while maintaining compatibility with the broader AtomWorks ecosystem.
+
+# Pipeline Composition and Routing
+
+
+
+The AtomWorks framework provides a sophisticated pipeline composition and routing system that enables flexible data processing workflows for machine learning applications. This system is built around the `Transform` base class and offers powerful mechanisms for creating, combining, and conditionally executing data processing steps.
+
+## Core Architecture
+
+The pipeline system centers on three key components: individual transforms, sequential composition, and conditional routing. These components work together to create flexible, reusable data processing pipelines that can adapt to different scenarios such as training versus inference.
+
+### Transform Base Class
+
+All pipeline operations inherit from the abstract `Transform` class [src/atomworks/ml/transforms/base.py#L81](src/atomworks/ml/transforms/base.py#L81), which provides:
+
+- **Input validation**: Automatic checking of input data compatibility
+- **Transform history tracking**: Optional recording of processing steps for debugging
+- **Error handling**: Comprehensive error reporting with context
+- **Composability**: Native support for pipeline combination through operator overloading
+
+```python
+class Transform(ABC):
+    @abstractmethod
+    def forward(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Apply the transformation to the input data."""
+        pass
+```
+
+### Sequential Composition with Compose
+
+The `Compose` class enables sequential chaining of transforms [src/atomworks/ml/transforms/base.py#L323](src/atomworks/ml/transforms/base.py#L323). This is the primary mechanism for building linear processing pipelines:
+
+```python
+pipeline = Compose([
+    RemoveHydrogens(),
+    AddAnnotations(),
+    AtomizeResidues(),
+    EncodeFeatures()
+])
+```
+
+> [!TIP]
+> The `Compose` class tracks random number generator states when `track_rng_state=True`, enabling reproducible debugging of stochastic pipelines by capturing the exact RNG state at failure points.
+
+## Conditional Routing System
+
+AtomWorks provides two powerful routing mechanisms that enable dynamic pipeline behavior based on data content or random selection.
+
+### ConditionalRoute: Data-Driven Branching
+
+The `ConditionalRoute` transform enables conditional execution based on data content [src/atomworks/ml/transforms/base.py#L704](src/atomworks/ml/transforms/base.py#L704):
+
+```python
+ConditionalRoute(
+    condition_func=lambda data: data.get("is_inference", False),
+    transform_map={
+        True: Identity(),  # Skip processing during inference
+        False: CropTransform(),  # Apply cropping during training
+    }
+)
+```
+
+This pattern is extensively used in production pipelines to handle training/inference mode switching, as seen in the AF3 pipeline [src/atomworks/ml/pipelines/af3.py#L175-183](src/atomworks/ml/pipelines/af3.py#L175-183).
+
+### RandomRoute: Probabilistic Branching
+
+The `RandomRoute` transform enables probabilistic selection between different processing paths [src/atomworks/ml/transforms/base.py#L636](src/atomworks/ml/transforms/base.py#L636):
+
+```python
+RandomRoute(
+    transforms=[
+        CropContiguousLikeAF3(crop_size=384),
+        CropSpatialLikeAF3(crop_size=384, cutoff_distance=15.0)
+    ],
+    probs=[0.5, 0.5]  # Equal probability selection
+)
+```
+
+This is particularly useful for data augmentation strategies where different cropping or transformation methods should be applied randomly during training.
+
+## Pipeline Building Patterns
+
+### Model-Specific Pipelines
+
+AtomWorks provides pre-built pipelines for major protein structure prediction models:
+
+#### AlphaFold 3 Pipeline
+
+The AF3 pipeline demonstrates advanced composition patterns with extensive conditional routing [src/atomworks/ml/pipelines/af3.py#L84](src/atomworks/ml/pipelines/af3.py#L84):
+
+```mermaid
+graph TD
+    A[Input Structure] --> B[Remove Hydrogens]
+    B --> C[Add Annotations]
+    C --> D{Inference Mode?}
+    D -->|No| E[Apply Cropping]
+    D -->|Yes| F[Skip Cropping]
+    E --> G[Load Templates]
+    F --> G
+    G --> H[Encode Features]
+    H --> I[Load MSAs]
+    I --> J[Final Processing]
+```
+
+Key features include:
+- **Conditional cropping**: Different strategies for training vs inference
+- **Template handling**: Separate paths for template loading from disk vs structure
+- **MSA processing**: Complex multi-sequence alignment workflows
+- **Feature aggregation**: Model-specific feature preparation
+
+#### RF2AA Pipeline
+
+The RF2AA pipeline follows similar patterns but with model-specific parameter configurations [src/atomworks/ml/pipelines/rf2aa.py#L154](src/atomworks/ml/pipelines/rf2aa.py#L154):
+
+```python
+def build_rf2aa_transform_pipeline(
+    *,
+    protein_msa_dirs: list[dict],
+    rna_msa_dirs: list[dict],
+    n_recycles: int = 5,
+    crop_size: int = 256,
+    # ... extensive parameter list
+) -> Compose:
+```
+
+### Pipeline Composition Patterns
+
+#### Progressive Enhancement
+
+Common pattern of building complex pipelines incrementally:
+
+```python
+transforms = [
+    AddData({"is_inference": is_inference}),
+    RemoveHydrogens(),
+    FilterToSpecifiedPNUnits(),
+    # ... base processing
+]
+
+# Conditional additions based on mode
+if not is_inference:
+    transforms.append(cropping_transform)
+
+transforms.extend([
+    TemplateProcessing(),
+    FeatureEncoding(),
+    FinalAggregation()
+])
+```
+
+#### Nested Conditional Logic
+
+Complex conditional routing can be nested for sophisticated behavior:
+
+```python
+transforms.append(
+    ConditionalRoute(
+        condition_func=lambda data: data["is_inference"],
+        transform_map={
+            False: training_template_loading_transforms,
+            True: ConditionalRoute(
+                condition_func=lambda data: "is_input_file_templated" in data["atom_array"].get_annotation_categories(),
+                transform_map={
+                    True: inference_template_load_from_structure,
+                    False: inference_template_loading_from_disk,
+                },
+            ),
+        },
+    )
+)
+```
+
+## Advanced Features
+
+### Error Handling and Debugging
+
+The pipeline system includes sophisticated error handling [src/atomworks/ml/transforms/base.py#L440-465](src/atomworks/ml/transforms/base.py#L440-465):
+
+- **RNG state capture**: Automatically captures random generator states for reproducible debugging
+- **Transform history**: Optional tracking of all applied transformations
+- **Contextual error messages**: Detailed error reporting with pipeline state
+
+### Pipeline Inspection
+
+Pipelines support introspection operations:
+
+```python
+len(pipeline)  # Number of transforms
+pipeline[2:5]  # Slice to create sub-pipeline
+pipeline.__repr__()  # Human-readable representation
+```
+
+### Memory and Performance Optimization
+
+The system includes transforms for memory management:
+
+```python
+SubsetToKeys(keys_to_keep)  # Remove unnecessary data
+ConvertToTorch(keys=["feats", "coords"], device="cuda")  # Device transfer
+```
+
+## Best Practices
+
+### Pipeline Design Principles
+
+1. **Modular transforms**: Each transform should perform a single, well-defined operation
+2. **Conditional routing**: Use `ConditionalRoute` for training/inference differences
+3. **Parameter validation**: Leverage built-in input validation for robust pipelines
+4. **Reproducibility**: Enable RNG state tracking for stochastic pipelines
+
+### Common Patterns
+
+| Pattern | Use Case | Implementation |
+|---------|----------|----------------|
+| **Mode switching** | Training vs inference behavior | `ConditionalRoute` with `is_inference` flag |
+| **Data augmentation** | Random transformation selection | `RandomRoute` with probability weights |
+| **Feature branching** | Different processing for data types | `ConditionalRoute` with data content checks |
+| **Pipeline composition** | Building complex workflows | `Compose` with transform lists |
+
+## Integration Points
+
+The pipeline system integrates tightly with other AtomWorks components:
+
+- **Transform ecosystem**: Extensive library of pre-built transforms for structure processing
+- **Model compatibility**: Specialized pipelines for different ML models
+- **Data flow**: Seamless integration with AtomArray data structures
+- **Configuration**: Parameterized pipeline construction for different use cases
+
+This composition and routing system provides the flexibility needed for complex machine learning workflows while maintaining code reusability and debugging capabilities.
+
+## Next Steps
+
+For practical implementation details, see [Custom Transform Development](16-custom-transform-development) to learn how to create your own transforms, or refer to [Transform System Fundamentals](12-transform-system-fundamentals) for deeper architectural understanding.
+
+# Integration with ModelForge
+
+
+
+AtomWorks serves as the foundational data processing framework for ModelForge, providing the essential preprocessing and featurization capabilities that enable advanced biomolecular modeling. This integration creates a seamless workflow from raw biological data to model-ready inputs, leveraging AtomWorks' specialized transforms and data structures.
+
+## Architecture Overview
+
+The integration between AtomWorks and ModelForge follows a modular architecture where AtomWorks handles data preparation and ModelForge focuses on model execution. This separation of concerns allows researchers to mix and match different preprocessing pipelines with various model architectures.
+
+```mermaid
+graph TD
+    A[Raw Biological Data<br/>PDB, mmCIF, FASTA] --> B[AtomWorks.io<br/>Parsing & Cleaning]
+    B --> C[AtomWorks.ml<br/>Transform Pipeline]
+    C --> D[Featurized Data<br/>Model-Ready Tensors]
+    D --> E[ModelForge<br/>Model Execution]
+    E --> F[Predictions & Results]
+    
+    G[atomworks.io] --> H[Structure Processing]
+    G --> I[Sequence Analysis]
+    G --> J[Ligand Handling]
+    
+    K[atomworks.ml] --> L[AF3 Pipeline]
+    K --> M[RF2AA Pipeline]
+    K --> N[Custom Transforms]
+    
+    L --> D
+    M --> D
+    N --> D
+```
+
+## Core Integration Points
+
+### Data Pipeline Architecture
+
+AtomWorks provides two primary pipeline implementations that integrate with ModelForge:
+
+**AlphaFold 3 Pipeline**: The `build_af3_transform_pipeline()` function in [src/atomworks/ml/pipelines/af3.py](src/atomworks/ml/pipelines/af3.py) creates a comprehensive preprocessing pipeline that prepares structures for AF3-style models. This includes MSA loading, template processing, and feature aggregation specifically designed for diffusion-based structure prediction.
+
+**RF2AA Pipeline**: The `build_rf2aa_transform_pipeline()` function in [src/atomworks/ml/pipelines/rf2aa.py](src/atomworks/ml/pipelines/rf2aa.py) implements the preprocessing for RoseTTAFold2AA-style models, with specialized transforms for symmetry handling, atom frames, and bond features.
+
+### Data Flow Integration
+
+The integration follows this pattern:
+
+1. **Input Processing**: AtomWorks.io parses and standardizes input files into the unified `AtomArray` format
+2. **Transform Application**: AtomWorks.ml applies a sequence of transforms to convert structural data into model-ready features
+3. **Model Interface**: The final output provides standardized tensors and metadata that ModelForge models can directly consume
+
+## Supported Model Types
+
+### AlphaFold 3 Integration
+
+The AF3 pipeline supports:
+- **MSA Processing**: Loads and processes multiple sequence alignments with configurable parameters for depth and density
+- **Template Integration**: Incorporates structural templates with similarity-based filtering
+- **Diffusion Preparation**: Generates coordinates and noise for diffusion-based training
+- **Feature Aggregation**: Combines sequence, structure, and template information into unified features
+
+### RF2AA Integration
+
+The RF2AA pipeline provides:
+- **Symmetry Handling**: Advanced automorphism and isomorphism detection for proper symmetry resolution
+- **Atom Frames**: Order-independent atom frame prioritization for consistent coordinate systems
+- **Bond Features**: Comprehensive bond adjacency and traversal distance matrices
+- **Template Features**: RF2AA-specific template featurization with initialization strategies
+
+## Configuration and Customization
+
+### Pipeline Parameters
+
+Both pipelines offer extensive customization through parameters:
+
+| Parameter Category | AF3 Pipeline | RF2AA Pipeline | Description |
+|-------------------|---------------|----------------|-------------|
+| **Cropping** | `crop_size`, `crop_contiguous_probability` | `crop_size`, `crop_spatial_probability` | Spatial and contiguous cropping strategies |
+| **MSA** | `max_msa_sequences`, `dense_msa` | `max_msa_sequences`, `n_msa_cluster_representatives` | Multiple sequence alignment configuration |
+| **Templates** | `n_template`, `template_max_seq_similarity` | `n_template`, `pick_top_templates` | Template search and selection |
+| **Symmetry** | `max_automorphs` | `max_automorphs`, `max_isomorphs` | Symmetry resolution limits |
+| **Training** | `sigma_data`, `diffusion_batch_size` | `black_hole_init`, `unclamp_loss_probability` | Model-specific training parameters |
+
+### Custom Transform Development
+
+The integration supports custom transforms through the base `Transform` class in [src/atomworks/ml/transforms/base.py](src/atomworks/ml/transforms/base.py). This allows researchers to:
+- Implement domain-specific preprocessing steps
+- Add novel feature extraction methods
+- Create model-specific data augmentation strategies
+- Integrate external computational chemistry tools
+
+## Data Format Compatibility
+
+### Input Formats
+
+AtomWorks supports all major biological file formats:
+- **Structures**: PDB, mmCIF, mmCIF.gz
+- **Sequences**: FASTA, custom sequence formats
+- **Ligands**: SDF, MOL2 with RDKit integration
+- **Annotations**: Custom metadata files
+
+### Output Specifications
+
+The pipelines produce standardized outputs compatible with ModelForge:
+
+```python
+# AF3 Pipeline Output Structure
+{
+    "feats": "TensorDict with model features",
+    "t": "Diffusion timestep",
+    "noise": "Applied noise tensor", 
+    "ground_truth": "Original coordinates",
+    "automorphisms": "Symmetry information",
+    "example_id": "Unique identifier"
+}
+
+# RF2AA Pipeline Output Structure  
+{
+    "feats": "RF2AAInputs named tuple",
+    "ground_truth": "Original structure data",
+    "example_id": "Unique identifier"
+}
+```
+
+## Performance Optimizations
+
+### Caching Strategies
+
+The integration implements intelligent caching:
+- **MSA Caching**: Pre-computed MSAs stored in configurable cache directories
+- **Template Caching**: Template search results cached for rapid reuse
+- **Transform Caching**: Intermediate results cached where computationally expensive
+
+### Memory Management
+
+- **Lazy Loading**: Large datasets loaded incrementally to minimize memory footprint
+- **Batch Processing**: Configurable batch sizes for memory-constrained environments
+- **Garbage Collection**: Automatic cleanup of intermediate data structures
+
+## Installation and Setup
+
+### Required Dependencies
+
+For full ModelForge integration, install with ML dependencies:
+
+```bash
+pip install "atomworks[ml]"
+```
+
+Additional optional dependencies:
+```bash
+pip install "atomworks[openbabel]"  # For advanced small molecule processing
+pip install "atomworks[dev]"         # For development and testing
+```
+
+### Environment Configuration
+
+Key environment variables:
+- `ATOMWORKS_LOG_LEVEL`: Control logging verbosity
+- `MSA_CACHE_DIR`: Configure MSA caching location
+- `TEMPLATE_BASE_DIR`: Set template database location
+
+## Best Practices
+
+### Pipeline Selection
+
+Choose the appropriate pipeline based on your model architecture:
+- Use **AF3 pipeline** for diffusion-based structure prediction models
+- Use **RF2AA pipeline** for end-to-end sequence-to-structure models
+- Consider **custom pipelines** for specialized model architectures
+
+### Parameter Tuning
+
+- Start with default parameters and gradually adjust based on model performance
+- Monitor memory usage and batch size for optimal throughput
+- Validate symmetry resolution settings for complex molecular systems
+
+### Testing and Validation
+
+- Use the provided test suites in [tests/ml/](tests/ml/) to validate integration
+- Verify output formats match ModelForge expectations
+- Profile performance on representative datasets
+
+## Advanced Features
+
+### Multi-Modal Integration
+
+The pipelines support simultaneous processing of:
+- Protein sequences and structures
+- Nucleic acids (DNA/RNA) with specialized handling
+- Small molecules and ligands with atomization
+- Covalent modifications and cross-links
+
+### Extensibility Framework
+
+The integration provides hooks for:
+- Custom encoding schemes through `encoding_definitions.py`
+- Novel transform compositions via the `Compose` class
+- Model-specific feature aggregation strategies
+- External tool integration (RDKit, OpenBabel)
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Memory Errors**: Reduce batch size or enable memory-efficient transforms
+2. **Template Loading**: Verify template database configuration and paths
+3. **MSA Processing**: Check MSA directory structure and file naming conventions
+4. **Symmetry Resolution**: Adjust `max_automorphs` and `max_isomorphs` parameters
+
+### Debug Support
+
+Enable detailed logging for troubleshooting:
+```python
+import logging
+logging.getLogger("atomworks").setLevel("DEBUG")
+```
+
+## Future Development
+
+The AtomWorks-ModelForge integration is actively evolving with planned enhancements:
+- Support for additional model architectures
+- Enhanced GPU acceleration for transform pipelines
+- Real-time data streaming capabilities
+- Advanced visualization and analysis tools
+
+This integration represents a powerful foundation for biomolecular modeling research, combining the robust data processing capabilities of AtomWorks with the advanced modeling features of ModelForge. The modular design ensures flexibility while maintaining standardized interfaces for seamless workflow integration.

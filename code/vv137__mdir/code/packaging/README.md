@@ -1,0 +1,206 @@
+# Containers
+
+The recipes here build MDIR with CUDA in a container. A container carries
+LLVM/MLIR 23.1.2, HDF5 1.14.6, and MDIR, so a workstation or a cluster node
+needs only Docker or Apptainer and the NVIDIA driver.
+
+| File | Builds |
+|---|---|
+| [Dockerfile](https://github.com/vv137/mdir/blob/HEAD/packaging/Dockerfile) | A Docker image, in stages: system packages, HDF5, LLVM with MLIR and the OpenMP runtime, MDIR; the final stage holds only the installed tree on CUDA's runtime image |
+| [mdir.def](https://github.com/vv137/mdir/blob/HEAD/packaging/mdir.def) | An Apptainer (Singularity) image made from the Docker image |
+| [Dockerfile.manylinux](https://github.com/vv137/mdir/blob/HEAD/packaging/Dockerfile.manylinux) | The release tarball (D177) and the Python wheels (D228) for manylinux_2_28 (glibc 2.28 and later), built on the PyPA image of that baseline |
+
+## Targets
+
+`scripts/packaging/build.sh TARGET` builds each of them, from the root of a
+tree, and is what `scripts/release/publish.sh` and the workflows of CI call
+(#639). It takes the container program from `DOCKER` (default `docker`;
+one with `docker build` and BuildKit's `--output`, such as podman), the jobs
+of the CI image's LLVM from `JOBS` and `LINK_JOBS`, writes the build's output to a log
+(`LOG`, default `WORK/build-TARGET.log`), reports the commit of the tree
+(`MDIR_GIT_COMMIT`; `--commit SHA` checks it), and refuses to start with
+less than `MIN_FREE_GB` (default 30) free in `WORK`. `--dry-run` prints the
+command and stops, without Docker.
+
+| Target | File and stage | Result | Checked by |
+|---|---|---|---|
+| `runtime` | [Dockerfile](https://github.com/vv137/mdir/blob/HEAD/packaging/Dockerfile), the last stage | the image `mdir:VERSION` (`--tag NAME`) | `scripts/release/check-image.sh` |
+| `tarball` | [Dockerfile.manylinux](https://github.com/vv137/mdir/blob/HEAD/packaging/Dockerfile.manylinux), `tarball` | `mdir-VERSION-manylinux_2_28_x86_64.tar.gz` in `--out DIR` (default `dist/tarball`) | `scripts/release/check-binary.sh` |
+| `wheels` | [Dockerfile.manylinux](https://github.com/vv137/mdir/blob/HEAD/packaging/Dockerfile.manylinux), `wheels` | one wheel per CPython in `--out DIR` (default `dist/wheels`) | `scripts/release/check-wheel.sh`, `check-wheel-install.sh` |
+| `ci` | [Dockerfile](https://github.com/vv137/mdir/blob/HEAD/packaging/Dockerfile), `ci` (LLVM built in one go) | `ghcr.io/vv137/mdir-ci:llvm-23.1.2-<hash>`, the hash of the Dockerfile and the two build scripts (`--print-tag`) | the CPU tier of CI ([docs/workflow.md](https://github.com/vv137/mdir/blob/HEAD/docs/workflow.md#continuous-integration)) |
+| `ci-prebuilt` | [Dockerfile](https://github.com/vv137/mdir/blob/HEAD/packaging/Dockerfile), `ci-prebuilt` (over an install of LLVM in `ci-llvm/`) | the same tag | `.github/workflows/ci-image.yml` builds it |
+
+`VERSION` is that of `CMakeLists.txt` unless `--version` gives one. Only
+the CI image is pushed by the script (`--push`, with `--login` for the
+token of `gh`); pushing publishes, so only the maintainer runs it. The
+runtime image, the tarball, and the wheels are published by a release
+(docs/workflow.md, Releases).
+
+**Layers.** The stages go from what changes least to what changes most:
+the base image (pinned by digest) and its packages, HDF5 1.14.6, LLVM
+23.1.2, and MDIR's sources last. Each copies only the script it builds
+from, so a change to MDIR's sources leaves the HDF5 and LLVM layers cached,
+and MDIR is rebuilt incrementally in a BuildKit cache mount. Keep this
+order when the recipe changes: a file copied early invalidates every layer
+after it. `.dockerignore` keeps the repository metadata, build trees, and
+archives out of the context.
+
+## Docker
+
+Build from the root of the source tree. Building LLVM takes most of the
+time: about an hour with 32 jobs.
+
+```sh
+scripts/packaging/build.sh runtime          # mdir:VERSION
+```
+
+Build arguments:
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `DEVEL`, `RUNTIME` | CUDA 13.0.1 on Ubuntu 24.04, by digest | The base images. Change both together; their CUDA must not be newer than the host driver supports (`nvidia-smi` prints the highest version the driver supports). |
+| `JOBS`, `LINK_JOBS` | `16`, `4` | Parallel compile and link jobs of LLVM. Linking takes much memory. |
+| `MDIR_GIT_COMMIT` | empty | The commit that `mdir version` and logs report, since the context holds no `.git` |
+
+The image runs `mdir`. With no arguments it runs `mdir doctor`. The working
+directory is `/work`; mount the directory of the run there. On a GPU, the
+NVIDIA container toolkit passes the devices with `--gpus`:
+
+```sh
+docker run --rm --gpus all mdir:0.1.0                 # mdir doctor
+docker run --rm --gpus '"device=1"' -v "$PWD":/work mdir:0.1.0 run md.toml
+docker run --rm -v "$PWD":/work mdir:0.1.0 run md.toml # target = "CPU"
+```
+
+Files written in `/work` belong to root unless the run is given the
+user: `--user $(id -u):$(id -g)`. The examples of the repository are in
+the image under `/opt/mdir/share/mdir/examples`.
+
+## Apptainer
+
+Apptainer keeps no cache of layers, so its image is made from the Docker
+image, and LLVM is built once:
+
+```sh
+apptainer build mdir-0.1.0.sif packaging/mdir.def    # labels and a test
+apptainer build mdir-0.1.0.sif docker-daemon://mdir:0.1.0
+```
+
+On a cluster without Docker, push the Docker image to a registry and
+build from it (`Bootstrap: docker`, `From: <registry>/mdir:0.1.0`).
+
+`--nv` binds the host's NVIDIA driver into the container. Apptainer runs as
+the user and mounts the home and working directories:
+
+```sh
+apptainer run --nv mdir-0.1.0.sif doctor
+apptainer run --nv mdir-0.1.0.sif run md.toml
+CUDA_VISIBLE_DEVICES=1 apptainer run --nv mdir-0.1.0.sif run md.toml
+```
+
+## What the runtime image holds
+
+- `/opt/mdir/bin/mdir`, and in `/opt/mdir/lib` the runtime, the GPU
+  runtime, and the OpenMP runtime;
+- `/opt/mdir/share/mdir/LICENSE`, MDIR's license, and in
+  `/opt/mdir/share/mdir/licenses` the notices of the third parties whose
+  code the image holds in binary form beyond its base: `HDF5-COPYING`,
+  `pocketfft-LICENSE`, `tomlplusplus-LICENSE`, `LLVM-LICENSE.TXT`,
+  `OpenMP-LICENSE.TXT`;
+- HDF5's libraries in `/opt/hdf5/1.14.6/lib`, found through the RPATH;
+- from CUDA: the runtime libraries of the base image (cuFFT among them),
+  and `nvvm/libdevice` copied from the devel image, with
+  `CUDA_ROOT=/usr/local/cuda`. The kernels are compiled at the start of a
+  run and take their math functions from libdevice. The CUDA EULA, which
+  lists libdevice as distributable, is `/usr/local/cuda/EULA.txt`; the
+  license of NVIDIA's base image is `/NGC-DL-CONTAINER-LICENSE`.
+
+`scripts/release/check-image.sh mdir:0.1.0` checks that the image carries
+these notices; [licenses/README.md](https://github.com/vv137/mdir/blob/HEAD/packaging/licenses/README.md) gives the clause
+that asks for each, and the terms of the base image for an image that is
+distributed.
+
+## The release tarball (manylinux_2_28)
+
+`Dockerfile.manylinux` builds the binary tarball of a release on
+`quay.io/pypa/manylinux_2_28_x86_64` (AlmaLinux 8, glibc 2.28, GCC 14), so
+that it runs on RHEL, Rocky, and Alma 8 and later, Ubuntu 20.04 and later,
+and Debian 11 and later:
+
+```sh
+scripts/packaging/build.sh tarball --out out
+scripts/release/check-binary.sh <extracted tree>
+```
+
+The layers follow the same rule as the container: the base image and
+ninja, the parts of CUDA 13.0 for RHEL 8 that the build reads, HDF5, LLVM,
+then MDIR's sources. The tarball holds:
+
+| Path | What |
+|---|---|
+| `bin/mdir` | The driver; libstdc++ and libgcc are linked statically |
+| `lib/libmdrt.so`, `lib/libmdrt_cuda.so` | The runtime |
+| `lib/libomp.so` | The OpenMP runtime of LLVM, for threaded runs on the CPU |
+| `lib/libhdf5.so.*` | HDF5, for checkpoints |
+| `lib/libcufft.so.*` | cuFFT, for particle mesh Ewald on a GPU |
+| `lib/libcublas.so.*`, `lib/libcublasLt.so.*` | cuBLAS and the cuBLASLt that it loads, for the products of the shape of a GEMM in the stage bodies (D302) |
+| `share/mdir/cuda` | libdevice, the math functions the kernels link, with the CUDA EULA |
+| `share/mdir/examples`, `share/mdir/LICENSE` | The examples and MDIR's license |
+| `share/mdir/licenses` | The notices of the third parties whose code the tarball distributes in binary form: `HDF5-COPYING`, `pocketfft-LICENSE`, `tomlplusplus-LICENSE`, `LLVM-LICENSE.TXT`, `OpenMP-LICENSE.TXT` |
+
+cuFFT, cuBLAS, and libdevice are redistributable under Attachment A of the CUDA
+EULA, which the tarball carries. With them a GPU run needs only the NVIDIA
+driver: when `CUDA_ROOT`, `CUDA_HOME`, and `CUDA_PATH` are unset, the driver
+links the kernels against `share/mdir/cuda`. Setting `CUDA_ROOT` still
+selects another toolkit. `scripts/release/check-binary.sh` checks that no
+binary needs GLIBC newer than 2.28 or the system's libstdc++ (MDIR's own
+binaries), and that every library is bundled or one that manylinux_2_28
+allows from the system. It also checks the notices.
+
+**Notices.** The tarball bundles HDF5 and the OpenMP runtime, and its
+binaries hold pocketfft (`libmdrt.so`), toml++, and LLVM (`mdir`). Their
+licenses ask that a distribution in binary form carry their notices, which
+the install puts into `share/mdir/licenses` (HDF5's with
+`MDIR_BUNDLE_LIBRARIES`, which bundles it).
+libstdc++ and libgcc, linked statically, need none under the GCC Runtime
+Library Exception. [licenses/README.md](https://github.com/vv137/mdir/blob/HEAD/packaging/licenses/README.md) gives the
+component, the clause, and the conclusion for each.
+
+## The Python wheels (manylinux_2_28)
+
+The target `wheels` of `Dockerfile.manylinux` builds the wheels of the
+Python package `mdir`, one for each of CPython 3.10–3.13 of the image, on
+the same toolchain as the tarball, and repairs them with auditwheel to
+`manylinux_2_28_x86_64` (D228,
+[python-package.md](https://github.com/vv137/mdir/blob/HEAD/docs/python-package.md)):
+
+```sh
+scripts/packaging/build.sh wheels --out dist
+scripts/release/check-wheel.sh dist/*.whl
+scripts/release/check-wheel-install.sh --gpu 0 dist/*.whl
+```
+
+`check-wheel.sh` inspects the files; `check-wheel-install.sh` installs each
+wheel by pip into a fresh environment of its CPython (from `uv`), checks
+`import mdir` and its version, and runs 20 steps of the ala3 example on the
+CPU, and with `--gpu` the first wheel on that GPU. It needs the network
+for NVIDIA's wheels of the extra `cuda`. `scripts/release/publish.sh`
+builds the wheels with the tarball and runs both (docs/workflow.md,
+Releases).
+
+A wheel holds the extension, the runtime, libdevice with the CUDA EULA,
+and HDF5 (in `mdir.libs`); cuFFT, cuBLAS, and ptxas come from NVIDIA's
+wheels `nvidia-cufft`, `nvidia-cublas`, and `nvidia-cuda-nvcc` through the
+extra `mdir[cuda]`, and
+the driver's `libcuda` from the system. The `mdir` command is not in the wheels.
+
+**Notices.** A wheel holds pybind11, toml++, and LLVM in the extension,
+pocketfft in `libmdrt.so`, the OpenMP runtime, and HDF5, which auditwheel
+grafts. Their notices are in `mdir/licenses`, under the names they have in
+the tarball, beside MDIR's `LICENSE` and `pybind11-LICENSE`:
+`HDF5-COPYING`, `pocketfft-LICENSE`, `tomlplusplus-LICENSE`,
+`LLVM-LICENSE.TXT`, `OpenMP-LICENSE.TXT`; the CUDA EULA is beside
+libdevice, `mdir/cuda/EULA.txt`. `check-wheel.sh` fails without any of
+them, and on a library in `mdir.libs` other than libhdf5. The metadata
+names MDIR's own license (`License-Expression: MIT`, `License-File:
+LICENSE`); [licenses/README.md](https://github.com/vv137/mdir/blob/HEAD/packaging/licenses/README.md) says why.

@@ -1,0 +1,21 @@
+set(workflow_source_files
+        workflow/StructureCluster.cpp
+        workflow/StructureClusterUpdate.cpp
+        workflow/StructureIndex.cpp
+        workflow/StructureSearch.cpp
+        workflow/StructureRbh.cpp
+        workflow/EasyStructureRbh.cpp
+        workflow/EasyStructureSearch.cpp
+        workflow/EasyStructureCluster.cpp
+        workflow/EasyMultimerSearch.cpp
+        workflow/MultimerSearch.cpp
+        workflow/MultimerCluster.cpp
+        workflow/EasyMultimerCluster.cpp
+        workflow/CreateDimerDb.cpp
+        workflow/InterfaceSearch.cpp
+        workflow/EasyInterfaceSearch.cpp
+        workflow/InterfaceCluster.cpp
+        workflow/EasyInterfaceCluster.cpp
+        workflow/StructTTYView.cpp
+        PARENT_SCOPE
+        )

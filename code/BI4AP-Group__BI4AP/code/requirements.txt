@@ -1,0 +1,35 @@
+# ==============================================================================
+# BI4AP: Multimodal Knowledge Distillation Framework - Core Dependencies
+# Tested Environment: Python 3.9+ with CUDA-enabled PyTorch
+# ==============================================================================
+# Note: For GPU acceleration, please install PyTorch and TorchVision matching
+# your local CUDA version from https://pytorch.org/get-started/locally/
+# Example (CUDA 11.8):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+# --- Core Deep Learning ---
+torch>=2.0.0
+torchvision>=0.15.0
+
+# --- Stage 1: YOLOv8 Interaction Region Detection ---
+ultralytics>=8.0.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+PyYAML>=6.0
+
+# --- Stage 2 & 3: Cheminformatics & Molecular Transformers ---
+rdkit>=2023.3.1
+transformers>=4.35.0
+tokenizers>=0.15.0
+accelerate>=0.24.0
+safetensors>=0.4.0
+
+# --- Data Processing & Scientific Computing ---
+numpy>=1.24.0,<2.0.0
+pandas>=2.0.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+openpyxl>=3.1.0
+
+# --- Utilities ---
+tqdm>=4.65.0

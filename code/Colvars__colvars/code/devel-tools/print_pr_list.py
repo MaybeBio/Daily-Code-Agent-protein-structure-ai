@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+
+import sys
+import json
+import datetime
+from dateutil import parser as date_parser
+import subprocess
+
+
+backends = set(['GROMACS', 'LAMMPS', 'NAMD', 'TinkerHP', 'VMD'])
+
+
+def run_cmd(cmd):
+    try:
+        txt = subprocess.check_output(
+            cmd, shell=True, stderr=subprocess.STDOUT).decode('UTF-8')
+    except subprocess.CalledProcessError as e:
+        print(e.output.decode('UTF-8'))
+        raise Exception("Error calling gh command.")
+    return txt
+
+
+def affects_backend(labels, backend=None):
+    if backend is None:
+        # Without a backend specified, this PR affects everything
+        return True
+    if not backend in backends:
+        raise Exception("Invalid backend:", backend)
+    has_backend_labels = False
+    for label in labels:
+        if label in backends:
+            has_backend_labels = True
+    if (not has_backend_labels) or (backend in labels):
+        return True
+    return False
+
+
+def get_pr_list(state='merged', target='master', label=None):
+    # 10,000 sounds like a reasonable limit for the Colvars repo
+    cmd = f"gh pr list --base {target} --state {state} --limit 10000 --json number,url,mergedAt,mergeCommit,title,author,labels"
+    if label:
+        cmd += f" --label {label}"
+    txt = run_cmd(cmd)
+    return json.loads(txt)
+
+
+def get_pr_commits(number):
+    cmd = f"gh pr view {number} --json commits"
+    txt = run_cmd(cmd)
+    return json.loads(txt)['commits']
+
+
+def get_pr_commits_after_rebase(number):
+    cmd = f"gh pr view {number} --json headRefOid"
+    txt = run_cmd(cmd)
+    pr_head = json.loads(txt)['headRefOid']
+    cmd = f"git log --oneline master..{pr_head}"
+    txt = run_cmd(cmd)
+    return txt
+
+
+def get_commits_authors(commits):
+    authors = []
+    for commit in commits:
+        authors += [("@"+author['login']) for author in commit['authors']]
+    return sorted(list(set(authors)), key=str.casefold)
+
+
+def get_pr_authors(pr):
+    """
+    Return a PR's author first, along with others in alphabetical order
+    """
+    pr_authors = ["@"+pr['author']['login']]
+    pr_commits = get_pr_commits(pr['number'])
+    commit_authors = get_commits_authors(pr_commits)
+    for commit_author in commit_authors:
+        if not commit_author in pr_authors:
+            pr_authors += [commit_author]
+    return pr_authors
+
+
+def print_pr_report(kwargs):
+
+    since_date = kwargs.get('since')
+    until_date = kwargs.get('until')
+
+    msg = "The following is a list of"
+    if since_date is None and until_date is None:
+        msg += " all"
+    msg += " pull requests"
+
+    if kwargs.get('backend') is not None:
+        msg += f" affecting {kwargs['backend']}"
+
+    if since_date:
+        since_date_ts = date_parser.parse(since_date).timestamp()
+        msg += f" merged since {since_date}"
+    else:
+        since_date_ts = 0
+
+    if until_date:
+        until_date_ts = date_parser.parse(until_date).timestamp()
+        if since_date:
+            msg += f" and until {until_date}"
+        else:
+            msg += f" merged until {until_date}"
+    else:
+        until_date_ts = 2**36
+
+    if kwargs['format'] == 'message':
+        print(msg + ":")
+
+    if kwargs['format'] == 'notes':
+        print("The following is a list of all pull requests (PRs) merged into the `master` branch of the "
+              "Colvars GitHub repository.  Please note that we began using PRs routinely only since about "
+              "2019: earlier developments are described by individual commits.")
+        print()
+        print("PRs that are specific to certain engines or fix earlier bugs are marked accordingly.  "
+              "Bugfixes are also back-ported onto maintenance releases of the packages that embed Colvars.")
+        print()
+        notes_msg = ""
+
+    # Get a list of all PRs, optionally filtered by the selected label
+    pr_db = get_pr_list(state=kwargs['state'], target=kwargs['target'], label=kwargs['label'])
+    all_authors = []
+    for pr in pr_db:
+        date_merged = date_parser.parse(pr['mergedAt']).date()
+        date_merged_ts = date_parser.parse(pr['mergedAt']).timestamp()
+        pr_labels = [label['name'] for label in pr['labels']]
+
+        if date_merged_ts >= since_date_ts and date_merged_ts <= until_date_ts:
+
+            if (not affects_backend(pr_labels, kwargs.get('backend'))) or (
+                    'testing' in pr_labels) or ('maintenance' in pr_labels):
+                continue
+
+            if kwargs['format'] == 'commits':
+                print(get_pr_commits_after_rebase(pr['number']))
+
+            if kwargs['format'] == 'numbers':
+                print(pr['number'])
+
+            if kwargs['format'] == 'message':
+                pr_authors = get_pr_authors(pr)
+                all_authors += pr_authors
+                print()
+                print("-", pr['title'])
+                print(" ", pr['url'], "("+", ".join(pr_authors)+")")
+
+            if kwargs['format'] == 'notes':
+                print()
+                labels_to_list = []
+                for label in pr_labels:
+                    if label in backends or label == 'bugfix':
+                        labels_to_list += [
+                            f"[{label}](https://github.com/Colvars/colvars/pulls?q=is%3Apr+label%3A{label})"]
+                if len(labels_to_list):
+                    labels_to_list = f" (labels: {' '.join(labels_to_list)})"
+                else:
+                    labels_to_list = ''
+                notes_msg += (
+                    f"- **{date_merged}** {pr['title']} [[#{pr['number']}]({pr['url']})]{labels_to_list}\n")
+
+    if kwargs['format'] == 'message':
+        print()
+        print("Authors:", ", ".join(sorted(list(set(all_authors)), key=str.casefold)))
+
+    if kwargs['format'] == 'notes':
+        print('\n'.join(sorted(notes_msg.splitlines(), reverse=True)))
+        print()
+        print()
+        print(f"This page was last updated on: {datetime.date.today().isoformat()}")
+
+
+if __name__ == '__main__':
+
+    import argparse
+    parser = argparse.ArgumentParser(
+        description='''List of Colvars PRs with the given constraints''',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--since',
+                        type=str,
+                        help="List PRs merged since this date; default is all")
+    parser.add_argument('--until',
+                        type=str,
+                        help="List PRs merged until this date; default is all")
+    parser.add_argument('--backend',
+                        type=str,
+                        choices=backends,
+                        help="List PRs that affect only this backend; "
+                        "default is all")
+    parser.add_argument('--label',
+                        type=str,
+                        help="List only PRs with this label")
+    parser.add_argument('--state',
+                        default='merged',
+                        choices=['open', 'closed', 'merged', 'all'],
+                        help="List PRs in this state")
+    parser.add_argument('--target',
+                        default='master',
+                        type=str,
+                        help="List PRs targeting this branch")
+    parser.add_argument('--format',
+                        default='message',
+                        choices=['message', 'numbers', 'commits', 'notes'],
+                        help="Print the report as either a human-readable message, "
+                        "a list of PR numbers, a list of commits in the original branch, "
+                        "or a release notes-style list")
+    kwargs = vars(parser.parse_args())
+
+    print_pr_report(kwargs)

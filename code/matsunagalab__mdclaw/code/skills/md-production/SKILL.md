@@ -1,0 +1,168 @@
+---
+name: md-production
+description: "Production molecular dynamics simulation using MDClaw CLI tools and OpenMM. Runs MD from an equilibrated state, with HMR, restart, and HPC submission support."
+---
+
+# MD Production
+
+You are a computational biophysics expert running production MD simulations using MDClaw CLI tools.
+
+Follow `skills/common/preamble.md`, `skills/common/run-loop.md` (the canonical
+node loop), `skills/common/solvent-regimes.md`, and
+`skills/common/tool-output.md` for error handling.
+
+## Step 0: Parse and Confirm
+
+| Parameter | Value |
+|-----------|-------|
+| Target | (job directory) |
+| Execution mode | read `progress.json.params.execution_mode` |
+| Parent eq node | use a completed eq node from `inspect_job`, or an explicit branch parent |
+| Temperature | the eq node's, inherited (Prerequisites below); do not restate it |
+| Simulation time | user-specified, or per the Default Decision Rule below |
+| Other | (non-default parameters) |
+
+## Prerequisites
+
+Follow `skills/common/run-loop.md`. Start with
+`mdclaw inspect_job --job-dir <job_dir>` to confirm there is a completed `eq`
+node, no conflicting running work, and the intended `solvent_regime`. For an
+extension, use `--continue-from` (below) rather than a default forward edge.
+Topology and restart inputs auto-resolve from DAG ancestors, and so do the
+temperature and the pressure.
+
+**The temperature is given once, to `run_equilibration`.** Omit
+`--temperature-kelvin` on every production command, local or submitted: the
+run takes the temperature of the node its state restarts from — the eq node
+on a fresh eq → prod, the prod parent on `--continue-from` — even when that
+node was still queued at submission. Rounds segments run at the temperature
+`setup_rounds` pins (`rounds.md`). Pass the flag only to change the
+temperature on purpose: a value different from the eq's runs with a warning;
+one different from a prod parent is refused before anything runs
+(`production_restart_integrator_mismatch`; the result says whether the node is
+still pending or, when it had been submitted, must be replaced). The result
+records where the value came from (`temperature_kelvin_source`: `inherited`,
+`explicit` or `default`).
+
+`pressure_bar` defaults to the eq node's `metadata.final_ensemble` so the
+common eq → prod handoff matches by default; override `--pressure-bar` to
+switch ensembles freely (see `skills/md-production/restart.md` "Switching
+Ensembles Across Nodes").
+
+If no completed eq node exists, suggest running `skills/md-equilibration/SKILL.md`
+on the same `job_dir` first (`/md-equilibration <job_dir>` when slash commands
+are available).
+
+If the eq node descends from a hybrid topology (`build_hybrid_system`; the
+result's `next` then names a `fep` node, and `explain_node` on a prod node
+reports `hybrid_topology_production_blocked`), this skill does not apply:
+lambda windows are sampled by `run_fep` (`skills/md-fep/SKILL.md`), and
+wild-type production wants a plain `topo` node from the same `solv` node.
+
+## Default Decision Rule
+
+- If the current request asks for a scientific answer, use its explicit
+  production length or the study plan's
+  `budget.derived.target_ns_per_replicate` and
+  `target_replicates_per_job`. If neither exists, return to `md-study`
+  planning or ask for a length before creating a production node. Never use
+  the `0.1 ns` sanity default as evidence for a scientific conclusion.
+- If `execution_mode=autonomous`, the stopping point is production, and the
+  user omitted a length, adopt `simulation_time_ns=0.1` as a direct-run sanity
+  check. This is skill policy; the underlying CLI default remains the tool
+  signature.
+- If the job belongs to a study with `study_plan.json`, treat its plan as the
+  scientific intent. The plan may guide production length, replicates, and
+  branch labels, but it is not required for ordinary single-system runs.
+- If `execution_mode=human_in_the_loop` and the user did not specify a
+  production length, ask before choosing a run length.
+- If the user explicitly asks for a longer campaign or HPC submission, prefer
+  the user's stated intent. HPC submission still requires explicit current
+  authorization.
+
+## Node Setup
+
+```bash
+mdclaw create_node --job-dir <job_dir> --node-type prod \
+  --label "100ns" \
+  --conditions '{"simulation_time_ns": 100}'
+```
+`--conditions` is one JSON string argument; quote it as shown.
+Pass the same production length to `run_production --simulation-time-ns`.
+For node-linked SLURM submissions, inspect `condition_preflight`: a `skipped`
+check is not validation (`not_applicable` means the node is not a `prod`
+node). Keep declarations and the actual command consistent;
+see `docs/developer/tool-reference.md` for the supported submission forms. An
+omitted `--temperature-kelvin` is not compared before submission: a declared
+`temperature_kelvin` is then listed under `deferred_conditions`, and the run
+compares it with the inherited value.
+A production longer than one job's `--time-limit` is split into
+`--continue-from` prods, one per job: `submit_job` refuses a run that does
+not fit at the parent's measured `ns_per_day` (`production_exceeds_time_limit`
+sizes the pieces), and `run_production` stops before the job's deadline on its
+own, completes the node with what ran, and names the continuation in `next`.
+
+**Branching** (multiple prod from same eq):
+```bash
+mdclaw create_node --job-dir <dir> --node-type prod --parent-node-ids <eq_node_id> \
+  --label "100ns_seed42" --conditions '{"simulation_time_ns": 100, "random_seed": 42}'
+```
+
+**Extension** (continue from a completed prod — **preferred** way to extend):
+create a new prod node with `--continue-from <completed_prod_node_id>`; the
+canonical commands and restart/retry detail are in
+`skills/md-production/restart.md`.
+
+## Workflow
+
+This skill operates on one `job_dir`. Branch from the same `eq` node for
+replicates or alternate conditions, and use `--continue-from` when extending
+an existing production branch.
+
+If mode metadata is missing, infer it from the current request and persist it
+with `mdclaw update_workflow_state --params ...` before creating new prod nodes.
+
+1. Based on solvent type:
+   - Explicit water -> **Read and follow `skills/md-production/explicit-water.md`**
+   - Implicit solvent -> **Read and follow `skills/md-production/implicit-water.md`**
+
+For a harmonic atom/center-of-mass distance bias, distance steering, or
+preparing distance-based umbrella sampling windows, **read and follow
+`skills/md-production/distance-restraints.md`**. For an arbitrary potential or
+steering another CV (e.g. an angle or an ML-defined coordinate), **read and follow
+`skills/md-production/custom-force.md`**.
+For **PLUMED CV recording, steering or fixed umbrellas**, follow
+**`skills/md-production/plumed.md`**; this requires a PLUMED-capable runtime.
+For **enhanced sampling of a loop, peptide or binding site without a CV**
+(solute tempering, SST2), **read and follow `skills/md-production/sst2.md`**;
+the runtime image bundles the SST2 fork, and SST2 data is analyzed with
+`analyze_tempering` before any metric.
+For **a free-energy profile along one distance across a barrier** (one or
+several walkers, well-tempered metadynamics), **read and follow
+`skills/md-production/metadynamics.md`**.
+For **several replicas run and extended together** (N seeds x k segments
+without hand-made `--continue-from` chains), **read and follow
+`skills/md-production/rounds.md`**. For **a rate constant or mean
+first-passage time** (folding, conformational change, ligand unbinding or
+binding), this skill does not apply: use the weighted ensemble of
+`skills/md-we/SKILL.md`.
+
+## Handoff
+
+1. Verify the `prod` node is `completed`.
+2. For requested playback, rotation, a still image, a visual check, or the
+   progress of a running job, follow `skills/common/visual-qa.md` for display selection, preview style,
+   and review scope. If a requested review finds high severity, ask the user
+   before using the production output downstream.
+3. Follow the stopping rule in `skills/common/run-loop.md`. If the current
+   request requires analysis or a scientific answer, invoke
+   `skills/md-analyze/SKILL.md` on this `job_dir`. Otherwise present:
+   ```
+   Production complete. Next:
+     Continue with skills/md-analyze/SKILL.md on this job_dir.
+     Shortcut, if available: /md-analyze <job_dir>
+   
+   To branch from same equilibration:
+     Run this production skill again on the same job_dir.
+     Shortcut, if available: /md-production <job_dir>
+   ```

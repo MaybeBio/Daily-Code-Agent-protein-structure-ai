@@ -1,0 +1,189 @@
+"""Real SQLite/catalogue boundaries; metadata fixtures never become research results."""
+
+import hashlib
+from uuid import uuid4
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from opendde_workbench.assets import AssetStore
+from opendde_workbench.quality.contract import PoseQualityTask
+from opendde_workbench.research.contracts import VersionInput
+from opendde_workbench.research.input_catalog import input_page, register_input_catalog
+from opendde_workbench.research.storage import ScientificStore
+from opendde_workbench.store import Store
+
+
+@pytest.fixture
+def scientific(tmp_path):
+    store = Store(tmp_path / "jobs.sqlite3")
+    return ScientificStore(store, AssetStore(store, tmp_path / "assets"))
+
+
+def test_search_paging_passes_the_old_window_without_loading_every_asset(scientific):
+    assets = scientific.assets
+    original = assets.save(
+        "Original STAT6 %_ receptor.pdb", "structure", b"catalogue transport fixture"
+    )
+    with scientific.store.connect() as db:
+        db.execute("UPDATE assets SET created_at='2020-01-01T00:00:00Z' WHERE id=?", (original.id,))
+        db.executemany(
+            "INSERT INTO assets VALUES(?,?,?,?,?,?,?)",
+            [
+                (
+                    str(uuid4()),
+                    f"Metadata-only input {i:05}.pdb",
+                    "structure",
+                    ".pdb",
+                    10,
+                    "a" * 64,
+                    f"2026-10-10T12:{i // 60:03}:{i % 60:02}",
+                )
+                for i in range(10050)
+            ],
+        )
+    first = input_page(scientific, "structure", [".pdb"], limit=25)
+    assert first.total == 10051 and len(first.items) == 25
+    assert original.id not in {item.asset.id for item in first.items}
+    assert (
+        input_page(scientific, "structure", [".pdb"], offset=10050).items[0].asset.id == original.id
+    )
+    result = input_page(scientific, "structure", [".pdb"], query="%_")
+    assert [item.asset.id for item in result.items] == [original.id]
+    assert not input_page(scientific, "structure", [".pdb"], query="' OR 1=1 --").items
+    assert len(input_page(scientific, "structure", [".pdb"], offset=10025).items) == 25
+    assert hashlib.sha256(assets.path(original).read_bytes()).hexdigest() == original.sha256
+
+
+def test_file_collection_and_saved_record_keep_distinct_exact_identity(scientific):
+    source = scientific.assets.save("Library.sdf", "ligand", b"transport record\n$$$$\n" * 2)
+    version = scientific.create(
+        VersionInput(asset_id=source.id, kind="molecule", label="Saved record", record=1), uuid4()
+    )
+    both = input_page(scientific, "ligand", [".sdf"])
+    assert both.total == 2
+    record = next(item for item in both.items if item.origin == "saved")
+    file = next(item for item in both.items if item.origin == "upload")
+    assert record.reference == version.reference
+    assert record.reference.record == 1 and record.version == version
+    assert file.reference.record == 0 and file.reference.version_id is None
+    assert input_page(scientific, "ligand", [".sdf"], scope="files").total == 1
+    selected = input_page(
+        scientific, "ligand", [".sdf"], query="unmatched", selected="version:" + str(version.id)
+    )
+    assert (
+        selected.total == 0
+        and selected.items == []
+        and selected.selected.reference == version.reference
+    )
+
+
+def test_actual_catalogue_route_filters_kind_format_and_validates_requests(scientific):
+    file = scientific.assets.save("STAT6-library.sdf", "ligand", b"metadata-only\n$$$$\n")
+    scientific.assets.save("Unrelated.pdb", "structure", b"metadata-only")
+    app = FastAPI()
+    register_input_catalog(app, scientific)
+    with TestClient(app) as client:
+        result = client.get("/api/research/input-catalog?kind=ligand&formats=.sdf").json()
+        assert result["total"] == 1 and result["items"][0]["asset"]["id"] == file.id
+        for extra in (
+            "&formats=.json",
+            "&limit=51",
+            "&offset=-1",
+            "&selected=file:bad",
+            "&scope=unknown",
+            "&q=" + "x" * 181,
+        ):
+            assert (
+                client.get(
+                    "/api/research/input-catalog?kind=ligand&formats=.sdf" + extra
+                ).status_code
+                == 422
+            )
+        assert not scientific.store.list_jobs()
+
+
+@pytest.mark.parametrize(
+    "kind,name",
+    [
+        ("config", "STAT6-protocol.yaml"),
+        ("measurements", "STAT6-activity.csv"),
+        ("msa", "STAT6.a3m"),
+        ("template", "STAT6.hhr"),
+        ("sequences", "STAT6.fasta"),
+    ],
+)
+def test_generic_file_kinds_use_the_same_filtered_catalogue(scientific, kind, name):
+    content = (
+        b">STAT6 transport fixture\nMPAGAV\n"
+        if kind in {"msa", "sequences"}
+        else b"catalogue transport fixture"
+    )
+    source = scientific.assets.save(name, kind, content)
+    scientific.assets.save("Unrelated.sdf", "ligand", b"metadata transport fixture")
+    page = input_page(scientific, kind, [source.suffix], scope="files")
+    assert page.total == 1 and page.items[0].asset == source
+    assert page.items[0].reference.record == 0 and page.items[0].version is None
+
+
+def test_sequence_versions_keep_exact_identity_beyond_the_current_page(scientific):
+    source = scientific.assets.save("STAT6.fasta", "sequences", b">STAT6\nMPAGAV\n")
+    version = scientific.create(
+        VersionInput(asset_id=source.id, kind="sequence", label="STAT6 saved sequence"), uuid4()
+    )
+    with scientific.store.connect() as db:
+        db.execute(
+            "UPDATE scientific_objects SET created_at='2020-01-01' WHERE id=?", (str(version.id),)
+        )
+    for i in range(30):
+        scientific.assets.save(f"Sequence-file-{i}.fasta", "sequences", b">transport\nMPAGAV\n")
+    page = input_page(
+        scientific,
+        "sequences",
+        [".fasta"],
+        query="Sequence-file",
+        selected="version:" + str(version.id),
+    )
+    assert page.total == 30 and len(page.items) == 25
+    assert page.selected.reference == version.reference and page.selected.version == version
+    assert scientific.store.list_jobs() == []
+
+
+def test_source_task_search_keeps_shared_assets_and_exact_versions_distinct(scientific):
+    source = scientific.assets.save("pose-001.sdf", "ligand", b"catalogue fixture\n$$$$\n" * 2)
+    ref = dict(asset_id=source.id, sha256=source.sha256, record=0, conformer=0)
+    names = ["STAT6 neural recovery", "STAT6 local refinement"]
+    jobs, versions = [], []
+    for index, name in enumerate(names):
+        job = scientific.store.create(
+            PoseQualityTask(name=name, molecule=ref, scientific_inputs=[ref]),
+            str(uuid4()),
+            max_pending=10,
+            max_jobs=100,
+        )
+        jobs.append(job)
+        versions.append(
+            scientific.create(
+                VersionInput(
+                    asset_id=source.id, kind="molecule", label="pose-001.sdf", record=index
+                ),
+                uuid4(),
+                source_job=job.id,
+            )
+        )
+    page = input_page(scientific, "ligand", [".sdf"], query=names[0])
+    assert page.total == 1 and page.items[0].reference == versions[0].reference
+    assert str(page.items[0].source_task.id) == jobs[0].id
+    assert page.items[0].source_task.name == names[0]
+    assert page.items[0].version == versions[0]
+    assert input_page(scientific, "ligand", [".sdf"], query=names[0], scope="files").total == 0
+    all_choices = input_page(scientific, "ligand", [".sdf"])
+    assert all_choices.total == 3
+    assert next(item for item in all_choices.items if item.origin == "upload").source_task is None
+    selected = input_page(
+        scientific, "ligand", [".sdf"], query="unmatched", selected="version:" + str(versions[1].id)
+    )
+    assert selected.items == [] and selected.selected.reference == versions[1].reference
+    assert selected.selected.source_task.name == names[1]
+    assert scientific.store.get(jobs[0].id).request.name == names[0]

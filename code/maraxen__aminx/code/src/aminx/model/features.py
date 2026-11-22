@@ -1,0 +1,980 @@
+"""Feature extraction module for Aminx.
+
+This module contains the ProteinFeatures class that extracts and projects
+features from raw protein coordinates.
+
+PottsMPNN does not call this masking. Invalid pairs (``mask_i * mask_j == 0``)
+become ``+inf`` before ``top_k``, and every atom-pair RBF - including Ca-Ca -
+uses ``sqrt(|A_i - B_j|^2 + 1e-6)`` on backbone coordinates. Cb is
+``compute_c_beta`` with no mask, so a zeroed gap row has Cb at the origin.
+``top_k`` breaks distance ties lower-index-first.
+
+Upstream Potts ``ProteinFeatures._dist`` (``potts_mpnn_utils.py``) instead
+sets ``D = mask_2D * sqrt(|dCa|^2 + 1e-6)``, ``D_adjust = D + (1 - mask_2D) *
+D_max``, and feeds gathered ``D_adjust`` to the Ca-Ca RBF, so a present->gap
+edge uses the row max ``D_max``. The other 24 RBFs stay on raw coordinates.
+That path is ``aminx.families.potts_mpnn.features``, which reuses these weights.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, NamedTuple
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array, Int
+from proxide.physics.constants import BOLTZMANN_KCAL
+
+from aminx.utils.coordinates import (
+  apply_noise_to_coordinates,
+  compute_backbone_coordinates,
+  compute_backbone_distance,
+)
+from aminx.utils.graph import compute_neighbor_offsets
+from aminx.utils.radial_basis import compute_radial_basis
+
+if TYPE_CHECKING:
+  from aminx.types.arrays import (
+    AlphaCarbonMask,
+    ArrayLike,
+    BackboneNoise,
+    ChainIndex,
+    EdgeFeatures,
+    NeighborIndices,
+    NodeFeatures,
+    ResidueIndex,
+    StructureAtomicCoordinates,
+  )
+
+
+PRNGKeyArray = jax.Array
+
+LayerNorm = eqx.nn.LayerNorm
+
+# Feature extraction constants
+MAXIMUM_RELATIVE_FEATURES = 32
+POS_EMBED_DIM = 16
+
+
+def top_k(
+  x: jax.Array,
+  k: int,
+  *,
+  row_chunk: int | None = None,
+) -> tuple[jax.Array, jax.Array]:
+  """Select the ``k`` largest entries along the last axis, descending.
+
+  Deliberately NOT ``jax.lax.top_k``: JAX lowers that to a ``stablehlo.composite``
+  wrapping ``chlo.top_k``, and IREE's StableHLO importer marks that composite
+  explicitly illegal, so an otherwise-clean export dies at ``iree-compile`` with
+  ``failed to legalize operation 'stablehlo.composite'``. Measured 260911 against
+  ``iree-base-compiler 3.11.0rc20260316`` on every ``input_type`` IREE offers
+  (``stablehlo``, ``stablehlo_xla``, ``auto``) -- a gap in the importer, not a
+  flag we are missing.
+
+  Every kNN selection under ``aminx.model`` routes here, which is what makes the
+  model compilable; ``tests/export/test_top_k_export.py`` enforces that rather
+  than asserting it, because it was briefly untrue. When this function was first
+  introduced it was described as the package's only selection site while three
+  more ``jax.lax.top_k`` calls were live in ``ligand_features`` and ``packer``,
+  so the ligand and sidechain paths stayed uncompilable while the export tests
+  reported green.
+
+  Tie-breaking is stated here rather than inherited from the backend.
+  ``jax.lax.top_k`` breaks ties toward the lower index, and the obvious
+  replacement -- ``jnp.argsort(-x, stable=True)`` -- reproduces that only for as
+  long as whoever runs the artifact honours stable-sort tie order. IREE does not.
+  Measured 260911: an integer ``lax.sort_key_val`` over 64 slots holding 4
+  distinct keys disagreed with XLA at 45 of its 64 positions. Nothing in the
+  export pipeline catches that, because the divergence is carried entirely by the
+  integer indices while the gathered values stay bit-identical, so a float parity
+  check reports ``max_abs_diff 0.0`` and passes.
+
+  So the index is folded into the sort key: sorting lexicographically on
+  ``(-x, index)`` with ``num_keys=2`` is a strict total order -- no two entries
+  ever compare equal, because no two indices are equal -- and every correct sort
+  must then return the same permutation whether or not it is stable. That removes
+  the dependency rather than restating it, which is why ``is_stable`` is passed
+  ``False`` here: it is genuinely irrelevant, and asking for it would imply
+  otherwise.
+
+  ``row_chunk`` (T4, IREE stack-allocation fix): ``None`` (the default) runs the
+  single batched ``lax.sort`` below exactly as before -- byte-identical trace, zero
+  risk to any existing caller. When set, the leading (batch) axes are flattened,
+  padded up to a multiple of ``row_chunk``, and processed ``row_chunk`` rows at a
+  time inside a ``jax.lax.map`` loop instead of one call covering every row at once.
+
+  This exists because IREE's llvm-cpu codegen for the ``lax.sort`` below stack-
+  allocates a scratch buffer whose size is driven by an internal, undocumented
+  interaction between the batch-axis extent and the sort-axis extent -- NOT simply
+  the sort length ``k`` or ``x.shape[-1]`` alone. Measured 260928 compiling this
+  exact function in isolation at ``x.shape == (L, L)`` (``aminx.model.features.
+  select_neighbors``'s own shape, batch axis and sort axis both ``L``): IREE's
+  default 32768-byte limit is exceeded starting around ``L=360-400`` and the
+  reported allocation grows with ``L`` once it does (131072 bytes at ``L=512``,
+  262144 at ``L=1024``), while holding the batch axis fixed at a small size (e.g.
+  8) keeps the allocation under the default limit even at sort-axis length 1024.
+  Capping the batch axis actually processed per compiled call -- not the sort
+  length -- is what bounds the buffer: measured at ``row_chunk=32``, the compiled
+  per-function allocation is ~19KB (native) / 16KB (wasm32) at every one of
+  ``L in (128, 256, 512, 1024)``, versus scaling unboundedly with ``L`` at
+  ``row_chunk=None``. This is NOT a larger-stack workaround (contrast
+  ``--iree-llvmcpu-stack-allocation-limit``, which raises IREE's own compile-time
+  guard without changing the actual per-call footprint, and would be unverifiable
+  for wasm32: Emscripten's default linked stack is 64KiB, and a 256KB stack frame
+  would silently overflow it at runtime with no way to execute-verify here). The
+  chunked path genuinely shrinks the footprint instead, so it holds under the
+  existing default budget on every target this repo compiles for.
+
+  Correctness does not depend on ``row_chunk``: ``(-x, index)`` with ``num_keys=2``
+  is a strict total order (see above), so any correct top-k over it -- computed in
+  one shot or independently per row-chunk and reassembled -- returns the identical
+  permutation. Padding introduced to reach a ``row_chunk`` multiple lives only on
+  synthetic rows that are sliced away before return; it never mixes into a real
+  row's own (full-length) last axis.
+
+  Parameters
+  ----------
+  x : jax.Array
+    Input array whose ``k`` largest entries along the last axis are selected.
+  k : int
+    Number of top entries to select along the last axis.
+  row_chunk : int | None, optional
+    Optional batch row chunk size for bounded stack allocation during sort.
+
+  Returns
+  -------
+  tuple[jax.Array, jax.Array]
+    ``(values, indices)``, matching ``jax.lax.top_k``'s contract on finite input.
+    Non-finite input keeps the ordering ``jnp.argsort(-x)`` gave: NaNs sort last
+    rather than first, and signed zeros compare equal. That differs from
+    ``jax.lax.top_k`` and is unchanged from the previous implementation.
+  """
+  if row_chunk is None or x.ndim < 2:
+    return _top_k_unchunked(x, k)
+  return _top_k_row_chunked(x, k, row_chunk)
+
+
+def _top_k_unchunked(x: jax.Array, k: int) -> tuple[jax.Array, jax.Array]:
+  index = jax.lax.broadcasted_iota(jnp.int32, x.shape, x.ndim - 1)
+  _, order = jax.lax.sort((-x, index), dimension=-1, is_stable=False, num_keys=2)
+  order = order[..., :k]
+  return jnp.take_along_axis(x, order, axis=-1), order
+
+
+def _top_k_row_chunked(x: jax.Array, k: int, row_chunk: int) -> tuple[jax.Array, jax.Array]:
+  """``top_k`` with the batch axes flattened and processed ``row_chunk`` rows at a time.
+
+  See ``top_k``'s docstring ("``row_chunk`` (T4, ...)") for why this exists. Padding
+  rows (added only to reach a multiple of ``row_chunk``) are computed on but always
+  sliced away below, so they cannot affect a real row's result.
+  """
+  batch_shape = x.shape[:-1]
+  sort_len = x.shape[-1]
+  n_rows = 1
+  for dim in batch_shape:
+    n_rows *= dim
+
+  flat = x.reshape(n_rows, sort_len)
+  n_chunks = -(-n_rows // row_chunk)  # ceil division
+  pad = n_chunks * row_chunk - n_rows
+  if pad:
+    flat = jnp.pad(flat, ((0, pad), (0, 0)), constant_values=-jnp.inf)
+  grouped = flat.reshape(n_chunks, row_chunk, sort_len)
+
+  def body(chunk_x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Run unchunked top_k on one chunk of rows.
+
+    Parameters
+    ----------
+    chunk_x : jax.Array
+      Chunk of rows of shape ``(row_chunk, sort_len)``.
+
+    Returns
+    -------
+    tuple[jax.Array, jax.Array]
+      Top-k values and indices for ``chunk_x``.
+    """
+    return _top_k_unchunked(chunk_x, k)
+
+  vals, idx = jax.lax.map(body, grouped)
+  vals = vals.reshape(n_chunks * row_chunk, k)[:n_rows].reshape(*batch_shape, k)
+  idx = idx.reshape(n_chunks * row_chunk, k)[:n_rows].reshape(*batch_shape, k)
+  return vals, idx
+
+
+def select_neighbors(
+  distances: ArrayLike,
+  mask: ArrayLike,
+  k: int,
+  structure_mapping: ArrayLike | None = None,
+  *,
+  row_chunk: int | None = None,
+  mask_invalid_with_inf: bool = True,
+) -> Int[Array, "L k"]:
+  """Select the ``k`` nearest neighbors per residue from a masked distance matrix.
+
+  Extracted verbatim (260926, T1) from ``ProteinFeatures.forward_edge_stages``, which
+  used to inline this block with ``self.k_neighbors`` and ``structure_coordinates.shape[0]``
+  in place of ``k`` and ``distances.shape[0]`` respectively -- otherwise byte-for-byte the
+  same masking, ``structure_mapping`` isolation, clamp, and ``top_k`` call. Pulled out so
+  ``aminx.export.wrappers`` can compute neighbor indices RNG-free (D-B), without going
+  through ``forward_edge_stages``'s noise-augmentation branch at all.
+
+  Args:
+    distances: ``(L, L)`` pairwise distance matrix (e.g. from
+      ``aminx.utils.coordinates.compute_backbone_distance``).
+    mask: ``(L,)`` residue validity mask. Invalid pairs are pushed to ``+inf`` before
+      selection when ``mask_invalid_with_inf`` is ``True`` so they never win a neighbor slot.
+    k: Requested neighbor count. Clamped to ``L`` (``distances.shape[0]``) so a structure
+      shorter than ``k`` still returns a full ``(L, L)`` selection instead of erroring.
+    structure_mapping: Optional ``(L,)`` array mapping each residue to a structure id.
+      When given, cross-structure pairs are also pushed to ``+inf`` (multi-state isolation).
+    row_chunk: Forwarded to ``aminx.model.features.top_k`` (T4). ``None`` (the default,
+      used by the eager/training call in ``ProteinFeatures.forward_edge_stages``) is
+      byte-identical to this function's pre-T4 behavior. The IREE export wrappers
+      (``aminx.export.wrappers``) pass a fixed chunk size to keep the compiled
+      ``lax.sort``'s stack footprint bounded at the L=512/1024 export buckets; see
+      ``top_k``'s docstring for why.
+    mask_invalid_with_inf: When ``True`` (default), invalid ``mask_i * mask_j == 0`` pairs
+      are replaced with ``+inf``. Set ``False`` when ``distances`` already encodes masked-pair
+      distances (e.g. ``ProteinFeaturesCA``'s ``D_adjust``).
+
+  Returns
+  -------
+  Int[Array, "L k"]
+    ``(L, k_clamped)`` int32 neighbor indices, nearest first (``aminx.model.features.top_k``'s
+    tie-break order).
+  """
+  if mask_invalid_with_inf:
+    distances_masked = jnp.array(
+      jnp.where(
+        (mask[:, None] * mask[None, :]).astype(jnp.bool_),
+        distances,
+        jnp.inf,
+      ),
+    )
+  else:
+    distances_masked = jnp.asarray(distances)
+
+  if structure_mapping is not None:
+    same_structure = structure_mapping[:, jnp.newaxis] == structure_mapping[jnp.newaxis, :]
+    distances_masked = jnp.array(
+      jnp.where(
+        same_structure.astype(jnp.bool_),
+        distances_masked,
+        jnp.inf,
+      ),
+    ).squeeze()
+
+  k_clamped = min(k, distances.shape[0])
+  _, neighbor_indices = top_k(-distances_masked, k_clamped, row_chunk=row_chunk)
+  return jnp.array(neighbor_indices, dtype=jnp.int32)
+
+
+def _encode_and_project_edges(
+  w_pos: eqx.nn.Linear,
+  w_e: eqx.nn.Linear,
+  norm_edges: LayerNorm,
+  w_e_proj: eqx.nn.Linear,
+  residue_index: ResidueIndex,
+  chain_index: ChainIndex,
+  neighbor_indices: jax.Array,
+  *edge_tensors: jax.Array,
+  one_hot_dtype: jnp.dtype | None = None,
+  cyclic: bool | jax.Array = False,
+  mask: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+  """Compute positional offset embeddings and project concatenated edge features.
+
+  ``cyclic`` wraps intra-chain offsets over each chain's valid span (``mask`` selects the valid
+  residues); ``False`` returns the linear offsets bit-for-bit.
+  """
+  neighbor_offsets = compute_neighbor_offsets(
+    residue_index,
+    neighbor_indices,
+    cyclic=cyclic,
+    chain_index=chain_index,
+    mask=mask,
+  )
+  edge_chains = (chain_index[:, None] == chain_index[None, :]).astype(jnp.int32)
+  edge_chains_neighbors = jnp.take_along_axis(
+    edge_chains,
+    neighbor_indices,
+    axis=1,
+  )
+
+  max_rel = (w_pos.weight.shape[1] - 2) // 2
+  neighbor_offset_factor = jnp.minimum(
+    jnp.maximum(neighbor_offsets + max_rel, 0),
+    2 * max_rel,
+  )
+  edge_chain_factor = (1 - edge_chains_neighbors) * (2 * max_rel + 1)
+  encoded_offset = neighbor_offset_factor * edge_chains_neighbors + edge_chain_factor
+  encoded_offset_one_hot = (
+    jax.nn.one_hot(encoded_offset, 2 * max_rel + 2)
+    if one_hot_dtype is None
+    else jax.nn.one_hot(encoded_offset, 2 * max_rel + 2, dtype=one_hot_dtype)
+  )
+
+  encoded_positions = jax.vmap(jax.vmap(w_pos))(encoded_offset_one_hot)
+  edges_concat = jnp.concatenate([encoded_positions, *edge_tensors], axis=-1)
+  after_w_e = jax.vmap(jax.vmap(w_e))(edges_concat)
+  after_norm = jax.vmap(jax.vmap(norm_edges))(after_w_e)
+  final = jax.vmap(jax.vmap(w_e_proj))(after_norm)
+  return encoded_positions, edges_concat, after_w_e, after_norm, final
+
+
+class ProteinEdgeStageTensors(NamedTuple):
+  """Intermediate edge tensors for parity diagnosis (JAX protein feature path)."""
+
+  neighbor_indices: jax.Array
+  rbf: jax.Array
+  encoded_positions: jax.Array
+  edges_concat: jax.Array
+  after_w_e: jax.Array
+  after_norm: jax.Array
+  final: jax.Array
+  node_features_out: jax.Array | None
+  prng_key: jax.Array
+
+
+class ProteinFeatures(eqx.Module):
+  """Extracts and projects features from raw protein coordinates.
+
+  This module encapsulates k-NN, RBF, positional encodings, and edge projections.
+  Note: W_e projection is NOT here - it's in the main model (matches ColabDesign).
+  """
+
+  w_pos: eqx.nn.Linear
+  w_e: eqx.nn.Linear
+  norm_edges: LayerNorm
+  w_e_proj: eqx.nn.Linear  # Final edge projection
+  k_neighbors: int = eqx.field(static=True)
+  rbf_dim: int = eqx.field(static=True)
+  pos_embed_dim: int = eqx.field(static=True)
+  num_positional_embeddings: int = eqx.field(static=True)
+  cyclic: bool = eqx.field(static=True, default=False)
+
+  def __init__(
+    self,
+    node_features: int,
+    edge_features: int,
+    k_neighbors: int,
+    num_positional_embeddings: int = 16,
+    *,
+    cyclic: bool = False,
+    key: PRNGKeyArray,
+  ) -> None:
+    """Initialize feature extraction layers.
+
+    Parameters
+    ----------
+    node_features : int
+      Node feature dimension (unused in backbone edge feature projection).
+    edge_features : int
+      Edge feature output dimension.
+    k_neighbors : int
+      Number of nearest neighbors per residue.
+    num_positional_embeddings : int, optional
+      Maximum relative sequence offset ``max_relative_feature``.
+    cyclic : bool, optional
+      Whether to wrap intra-chain sequence offsets across cycle length.
+    key : PRNGKeyArray
+      PRNG key for parameter initialization.
+
+    Returns
+    -------
+    None
+      Initializes module attributes in place.
+    """
+    del node_features  # Unused, kept for API compatibility
+
+    keys = jax.random.split(key, 3)
+
+    self.k_neighbors = k_neighbors
+    self.rbf_dim = 16
+    self.pos_embed_dim = 16  # Fixed output dim
+    self.num_positional_embeddings = num_positional_embeddings
+    self.cyclic = cyclic
+
+    pos_one_hot_dim = 2 * num_positional_embeddings + 2
+    edge_embed_in_dim = 16 + 16 * 25  # Matches POS_EMBED_DIM + RBF_DIM * 25
+
+    # Positional encodings in reference models typically don't use bias
+    self.w_pos = eqx.nn.Linear(pos_one_hot_dim, 16, use_bias=True, key=keys[0])
+    self.w_e = eqx.nn.Linear(edge_embed_in_dim, edge_features, use_bias=False, key=keys[1])
+    self.norm_edges = LayerNorm(edge_features)
+    self.w_e_proj = eqx.nn.Linear(edge_features, edge_features, key=keys[2])
+
+  def forward_edge_stages(
+    self,
+    prng_key: PRNGKeyArray,
+    structure_coordinates: StructureAtomicCoordinates,
+    mask: AlphaCarbonMask,
+    residue_index: ResidueIndex,
+    chain_index: ChainIndex,
+    backbone_noise: BackboneNoise | None,
+    backbone_noise_mode: str = "direct",
+    structure_mapping: jnp.ndarray | None = None,
+    initial_node_features: jnp.ndarray | None = None,
+    rbf_features: jnp.ndarray | None = None,
+    neighbor_indices: jnp.ndarray | None = None,
+    *,
+    cyclic: bool | jax.Array | None = None,
+  ) -> ProteinEdgeStageTensors:
+    """Run the edge pipeline and return intermediates for JAX vs PyTorch diagnosis.
+
+    Stages mirror the reference ordering: concat embeddings → ``w_e`` → layer norm
+    → ``w_e_proj`` (final edge features returned from ``__call__``).
+
+    Parameters
+    ----------
+    prng_key : PRNGKeyArray
+      PRNG key for coordinate noise.
+    structure_coordinates : StructureAtomicCoordinates
+      Atomic coordinates ``(N, 4, 3)``.
+    mask : AlphaCarbonMask
+      Alpha carbon presence mask.
+    residue_index : ResidueIndex
+      Residue sequence indices.
+    chain_index : ChainIndex
+      Chain integer indices.
+    backbone_noise : BackboneNoise | None
+      Standard deviation of Gaussian coordinate noise.
+    backbone_noise_mode : str, optional
+      Mode for backbone noise (``"direct"`` or ``"thermal"``).
+    structure_mapping : jnp.ndarray | None, optional
+      Optional structure ID mapping to isolate multi-state neighbors.
+    initial_node_features : jnp.ndarray | None, optional
+      Optional initial node features.
+    rbf_features : jnp.ndarray | None, optional
+      Optional precomputed RBF features ``(N, K, 400)``.
+    neighbor_indices : jnp.ndarray | None, optional
+      Optional precomputed ``(N, K)`` neighbor indices.
+    cyclic : bool | jax.Array | None, optional
+      Optional override for cyclic intra-chain sequence offset wrapping.
+
+    Returns
+    -------
+    ProteinEdgeStageTensors
+      Named tuple of intermediate and final projected edge tensors.
+    """
+    node_features = None if initial_node_features is None else initial_node_features
+
+    if backbone_noise is None:
+      backbone_noise = jnp.array(0.0)
+
+    # Use precomputed RBF if available (skips noise augmentation on graph)
+    if rbf_features is not None:
+      if neighbor_indices is None:
+        # We still need neighbor indices to align sequence features
+        # We compute them on the static coordinates (assuming they match proxide's implicit indices)
+        backbone_atom_coordinates = compute_backbone_coordinates(structure_coordinates)
+        distances = compute_backbone_distance(backbone_atom_coordinates)
+      else:
+        # If neighbors provided, we just need coordinates for other ops, no distance calc needed
+        backbone_atom_coordinates = compute_backbone_coordinates(structure_coordinates)
+        # We set distances to None or dummy as we won't use them for K-NN
+        distances = None
+
+      # Logic for masking structure_mapping/mask is shared
+    else:
+      # Resolve Sigma and apply noise
+      if backbone_noise_mode == "thermal":
+        # Apply 0.5 factor here as well for consistency
+        thermal_energy = jnp.maximum(0.5 * BOLTZMANN_KCAL * backbone_noise, 0.0)
+        final_sigma = jnp.sqrt(thermal_energy)
+      else:
+        final_sigma = backbone_noise
+
+      noised_coordinates, prng_key = apply_noise_to_coordinates(
+        prng_key,
+        structure_coordinates,
+        backbone_noise=final_sigma,
+      )
+      backbone_atom_coordinates = compute_backbone_coordinates(noised_coordinates)
+      distances = compute_backbone_distance(backbone_atom_coordinates)
+
+    if distances is not None:
+      neighbor_indices = select_neighbors(distances, mask, self.k_neighbors, structure_mapping)
+
+    # At this point neighbor_indices must be populated (either passed in or computed)
+    if neighbor_indices is None:
+      raise ValueError(
+        "neighbor_indices is None. This could happen if distances is None and no neighbor_indices were provided.",
+      )
+    neighbor_indices = jnp.array(neighbor_indices, dtype=jnp.int32)
+
+    if rbf_features is not None:
+      rbf = rbf_features
+    else:
+      rbf = compute_radial_basis(backbone_atom_coordinates, neighbor_indices)
+
+    encoded_positions, edges_concat, after_w_e, after_norm, final = _encode_and_project_edges(
+      self.w_pos,
+      self.w_e,
+      self.norm_edges,
+      self.w_e_proj,
+      residue_index,
+      chain_index,
+      neighbor_indices,
+      rbf,
+      cyclic=self.cyclic if cyclic is None else cyclic,
+      mask=mask,
+    )
+
+    return ProteinEdgeStageTensors(
+      neighbor_indices=neighbor_indices,
+      rbf=rbf,
+      encoded_positions=encoded_positions,
+      edges_concat=edges_concat,
+      after_w_e=after_w_e,
+      after_norm=after_norm,
+      final=final,
+      node_features_out=node_features,
+      prng_key=prng_key,
+    )
+
+  def __call__(
+    self,
+    prng_key: PRNGKeyArray,
+    structure_coordinates: StructureAtomicCoordinates,
+    mask: AlphaCarbonMask,
+    residue_index: ResidueIndex,
+    chain_index: ChainIndex,
+    backbone_noise: BackboneNoise | None,
+    backbone_noise_mode: str = "direct",
+    structure_mapping: jnp.ndarray | None = None,
+    initial_node_features: jnp.ndarray | None = None,
+    rbf_features: jnp.ndarray | None = None,
+    neighbor_indices: jnp.ndarray | None = None,
+    *,
+    cyclic: bool | jax.Array | None = None,
+  ) -> tuple[EdgeFeatures, NeighborIndices, NodeFeatures | None, PRNGKeyArray]:
+    """Extract and project features from protein structure.
+
+    Parameters
+    ----------
+    prng_key : PRNGKeyArray
+      PRNG key for coordinate noise.
+    structure_coordinates : StructureAtomicCoordinates
+      Atomic coordinates (N, CA, C, O).
+    mask : AlphaCarbonMask
+      Alpha carbon mask.
+    residue_index : ResidueIndex
+      Residue indices.
+    chain_index : ChainIndex
+      Chain indices.
+    backbone_noise : BackboneNoise | None
+      Noise to add to backbone coordinates.
+    backbone_noise_mode : str, optional
+      Mode for backbone noise ("direct" or "thermal").
+    structure_mapping : jnp.ndarray | None, optional
+      Optional (N,) array mapping each residue to a structure ID.
+    initial_node_features : jnp.ndarray | None, optional
+      Optional initial node features.
+    rbf_features : jnp.ndarray | None, optional
+      Optional precomputed RBF features from proxide (N, K, 400).
+    neighbor_indices : jnp.ndarray | None, optional
+      Optional precomputed neighbor indices from proxide (N, K).
+    cyclic : bool | jax.Array | None, optional
+      Optional override for cyclic intra-chain sequence offset wrapping.
+
+    Returns
+    -------
+    tuple[EdgeFeatures, NeighborIndices, NodeFeatures | None, PRNGKeyArray]
+      Tuple of ``(edge_features, neighbor_indices, node_features_out, updated_prng_key)``.
+    """
+    stages = self.forward_edge_stages(
+      prng_key,
+      structure_coordinates,
+      mask,
+      residue_index,
+      chain_index,
+      backbone_noise,
+      backbone_noise_mode=backbone_noise_mode,
+      structure_mapping=structure_mapping,
+      initial_node_features=initial_node_features,
+      rbf_features=rbf_features,
+      neighbor_indices=neighbor_indices,
+      cyclic=cyclic,
+    )
+    return stages.final, stages.neighbor_indices, stages.node_features_out, stages.prng_key
+
+
+def _normalize(v: jax.Array, eps: float = 1e-12) -> jax.Array:
+  """Normalize vectors along the last axis, matching ``torch.nn.functional.normalize``."""
+  norm = jnp.linalg.norm(v, axis=-1, keepdims=True)
+  return v / jnp.maximum(norm, jnp.asarray(eps, dtype=v.dtype))
+
+
+def _quaternions(r_mat: jax.Array) -> jax.Array:
+  """Convert a batch of 3D rotation matrices ``(..., 3, 3)`` to quaternions ``(..., 4)``."""
+  diag = jnp.diagonal(r_mat, axis1=-2, axis2=-1)
+  rxx, ryy, rzz = diag[..., 0], diag[..., 1], diag[..., 2]
+  magnitudes = 0.5 * jnp.sqrt(
+    jnp.abs(
+      1.0
+      + jnp.stack(
+        [
+          rxx - ryy - rzz,
+          -rxx + ryy - rzz,
+          -rxx - ryy + rzz,
+        ],
+        axis=-1,
+      ),
+    ),
+  )
+  signs = jnp.sign(
+    jnp.stack(
+      [
+        r_mat[..., 2, 1] - r_mat[..., 1, 2],
+        r_mat[..., 0, 2] - r_mat[..., 2, 0],
+        r_mat[..., 1, 0] - r_mat[..., 0, 1],
+      ],
+      axis=-1,
+    ),
+  )
+  xyz = signs * magnitudes
+  w = jnp.sqrt(jax.nn.relu(1.0 + jnp.sum(diag, axis=-1, keepdims=True))) / 2.0
+  q = jnp.concatenate([xyz, w], axis=-1)
+  return _normalize(q)
+
+
+def _orientations_coarse(
+  ca: jax.Array,
+  neighbor_indices: jax.Array,
+  eps: float = 1e-6,
+) -> tuple[jax.Array, jax.Array]:
+  """Compute coarse CA-only orientation features matching ``CA_ProteinFeatures._orientations_coarse``."""
+  dx = ca[1:, :] - ca[:-1, :]
+  dx_norm = jnp.linalg.norm(dx, axis=-1)
+  dx_mask = (dx_norm > 3.6) & (dx_norm < 4.0)
+  dx = dx * dx_mask[:, None]
+  u = _normalize(dx)
+  u_2 = u[:-2, :]
+  u_1 = u[1:-1, :]
+  u_0 = u[2:, :]
+  n_2 = _normalize(jnp.cross(u_2, u_1))
+  n_1 = _normalize(jnp.cross(u_1, u_0))
+
+  cos_a = jnp.clip(-jnp.sum(u_1 * u_0, axis=-1), -1.0 + eps, 1.0 - eps)
+  angle_a = jnp.arccos(cos_a)
+  cos_d = jnp.clip(jnp.sum(n_2 * n_1, axis=-1), -1.0 + eps, 1.0 - eps)
+  angle_d = jnp.sign(jnp.sum(u_2 * n_1, axis=-1)) * jnp.arccos(cos_d)
+  ad_features = jnp.stack(
+    [jnp.cos(angle_a), jnp.sin(angle_a) * jnp.cos(angle_d), jnp.sin(angle_a) * jnp.sin(angle_d)],
+    axis=-1,
+  )
+  ad_features = jnp.pad(ad_features, ((1, 2), (0, 0)), mode="constant", constant_values=0.0)
+
+  o_1 = _normalize(u_2 - u_1)
+  o_mat = jnp.stack([o_1, n_2, jnp.cross(o_1, n_2)], axis=1)
+  o_mat = jnp.pad(o_mat, ((1, 2), (0, 0), (0, 0)), mode="constant", constant_values=0.0)
+  o_neighbors = o_mat[neighbor_indices]
+  ca_neighbors = ca[neighbor_indices]
+
+  dx_pair = ca_neighbors - ca[:, None, :]
+  du = jnp.matmul(o_mat[:, None, :, :], dx_pair[..., None])[..., 0]
+  du = _normalize(du)
+  r_mat = jnp.matmul(jnp.swapaxes(o_mat[:, None, :, :], -1, -2), o_neighbors)
+  q = _quaternions(r_mat)
+  o_features = jnp.concatenate([du, q], axis=-1)
+  return ad_features, o_features
+
+
+def _ca_rbf(d_neighbors: jax.Array, num_rbf: int = 16) -> jax.Array:
+  """Compute radial basis functions on neighbor distances ``(L, K)``."""
+  d_min, d_max = 2.0, 22.0
+  d_mu = jnp.linspace(d_min, d_max, num_rbf, dtype=d_neighbors.dtype)[None, None, :]
+  d_sigma = jnp.asarray((d_max - d_min) / num_rbf, dtype=d_neighbors.dtype)
+  return jnp.exp(-jnp.square((d_neighbors[..., None] - d_mu) / d_sigma))
+
+
+def _ca_pair_rbf(
+  coord_a: jax.Array,
+  coord_b: jax.Array,
+  neighbor_indices: jax.Array,
+  num_rbf: int = 16,
+) -> jax.Array:
+  """Compute gathered radial basis functions between ``coord_a`` and ``coord_b``."""
+  diff = coord_a[:, None, :] - coord_b[neighbor_indices]
+  d_ab_neighbors = jnp.sqrt(jnp.sum(diff * diff, axis=-1) + jnp.asarray(1e-6, dtype=coord_a.dtype))
+  return _ca_rbf(d_ab_neighbors, num_rbf)
+
+
+class ProteinFeaturesCA(eqx.Module):
+  """Extracts and projects CA-only features matching upstream ``CA_ProteinFeatures``."""
+
+  w_pos: eqx.nn.Linear
+  w_e: eqx.nn.Linear
+  norm_edges: LayerNorm
+  w_e_proj: eqx.nn.Linear
+  k_neighbors: int = eqx.field(static=True)
+  rbf_dim: int = eqx.field(static=True)
+  pos_embed_dim: int = eqx.field(static=True)
+  num_positional_embeddings: int = eqx.field(static=True)
+  cyclic: bool = eqx.field(static=True, default=False)
+
+  def __init__(
+    self,
+    node_features: int,
+    edge_features: int,
+    k_neighbors: int,
+    num_positional_embeddings: int = 16,
+    *,
+    cyclic: bool = False,
+    key: PRNGKeyArray,
+  ) -> None:
+    """Initialize CA-only feature extraction layers.
+
+    Parameters
+    ----------
+    node_features : int
+      Node feature dimension (unused in CA-only feature projection).
+    edge_features : int
+      Edge feature output dimension.
+    k_neighbors : int
+      Number of nearest neighbors per residue.
+    num_positional_embeddings : int
+      Maximum relative sequence offset ``max_relative_feature``.
+    cyclic : bool
+      Whether to wrap intra-chain sequence offsets across cycle length.
+    key : PRNGKeyArray
+      PRNG key for parameter initialization.
+
+    Returns
+    -------
+    None
+      Initializes module attributes in place.
+    """
+    del node_features
+
+    keys = jax.random.split(key, 3)
+
+    self.k_neighbors = k_neighbors
+    self.rbf_dim = 16
+    self.pos_embed_dim = 16
+    self.num_positional_embeddings = num_positional_embeddings
+    self.cyclic = cyclic
+
+    pos_one_hot_dim = 2 * num_positional_embeddings + 2
+    edge_embed_in_dim = 16 + 16 * 9 + 7  # 167
+
+    self.w_pos = eqx.nn.Linear(pos_one_hot_dim, 16, use_bias=True, key=keys[0])
+    self.w_e = eqx.nn.Linear(edge_embed_in_dim, edge_features, use_bias=False, key=keys[1])
+    self.norm_edges = LayerNorm(edge_features)
+    self.w_e_proj = eqx.nn.Linear(edge_features, edge_features, key=keys[2])
+
+  def forward_edge_stages(
+    self,
+    prng_key: PRNGKeyArray,
+    structure_coordinates: StructureAtomicCoordinates,
+    mask: AlphaCarbonMask,
+    residue_index: ResidueIndex,
+    chain_index: ChainIndex,
+    backbone_noise: BackboneNoise | None,
+    backbone_noise_mode: str = "direct",
+    structure_mapping: jnp.ndarray | None = None,
+    initial_node_features: jnp.ndarray | None = None,
+    rbf_features: jnp.ndarray | None = None,
+    neighbor_indices: jnp.ndarray | None = None,
+    *,
+    row_chunk: int | None = None,
+    cyclic: bool | jax.Array | None = None,
+  ) -> ProteinEdgeStageTensors:
+    """Run the CA-only edge pipeline and return intermediates.
+
+    Parameters
+    ----------
+    prng_key : PRNGKeyArray
+      PRNG key for coordinate noise.
+    structure_coordinates : StructureAtomicCoordinates
+      Atomic coordinates ``(N, 4, 3)`` or CA-only ``(N, 3)``.
+    mask : AlphaCarbonMask
+      Alpha carbon presence mask.
+    residue_index : ResidueIndex
+      Residue sequence indices.
+    chain_index : ChainIndex
+      Chain integer indices.
+    backbone_noise : BackboneNoise | None
+      Standard deviation of Gaussian coordinate noise.
+    backbone_noise_mode : str
+      Mode for backbone noise (``"direct"`` or ``"thermal"``).
+    structure_mapping : jnp.ndarray | None
+      Optional structure ID mapping to isolate multi-state neighbors.
+    initial_node_features : jnp.ndarray | None
+      Optional initial node features.
+    rbf_features : jnp.ndarray | None
+      Unused placeholder for API compatibility with ``ProteinFeatures``.
+    neighbor_indices : jnp.ndarray | None
+      Optional precomputed ``(N, K)`` neighbor indices.
+    row_chunk : int | None
+      Optional chunk size forwarded to :func:`select_neighbors`.
+    cyclic : bool | jax.Array | None
+      Optional override for cyclic intra-chain sequence offset wrapping.
+
+    Returns
+    -------
+    ProteinEdgeStageTensors
+      Named tuple of intermediate and final projected edge tensors.
+    """
+    del rbf_features
+    node_features = None if initial_node_features is None else initial_node_features
+
+    if backbone_noise is None:
+      backbone_noise = jnp.array(0.0, dtype=structure_coordinates.dtype)
+
+    if structure_coordinates.ndim == 2:
+      ca = structure_coordinates
+    elif structure_coordinates.shape[1] == 1:
+      ca = structure_coordinates[:, 0, :]
+    else:
+      ca = structure_coordinates[:, 1, :]
+
+    if backbone_noise_mode == "thermal":
+      thermal_energy = jnp.maximum(0.5 * BOLTZMANN_KCAL * backbone_noise, 0.0)
+      final_sigma = jnp.sqrt(thermal_energy)
+    else:
+      final_sigma = backbone_noise
+
+    ca, prng_key = apply_noise_to_coordinates(
+      prng_key,
+      ca,
+      backbone_noise=final_sigma,
+    )
+
+    mask_2d = (mask[:, None] * mask[None, :]).astype(ca.dtype)
+    dx = ca[:, None, :] - ca[None, :, :]
+    d_ca = mask_2d * jnp.sqrt(jnp.sum(dx * dx, axis=-1) + jnp.asarray(1e-6, dtype=ca.dtype))
+    d_max = jnp.max(d_ca, axis=-1, keepdims=True)
+    d_adjust = d_ca + (1.0 - mask_2d) * d_max
+
+    if neighbor_indices is None:
+      neighbor_indices = select_neighbors(
+        d_adjust,
+        mask,
+        self.k_neighbors,
+        structure_mapping,
+        row_chunk=row_chunk,
+        mask_invalid_with_inf=False,
+      )
+
+    neighbor_indices = jnp.asarray(neighbor_indices, dtype=jnp.int32)
+    d_neighbors = jnp.take_along_axis(d_adjust, neighbor_indices, axis=1)
+
+    ca_0 = jnp.zeros_like(ca).at[1:, :].set(ca[:-1, :])
+    ca_1 = ca
+    ca_2 = jnp.zeros_like(ca).at[:-1, :].set(ca[1:, :])
+
+    _, o_features = _orientations_coarse(ca, neighbor_indices)
+
+    rbf_all = jnp.concatenate(
+      [
+        _ca_rbf(d_neighbors, self.rbf_dim),
+        _ca_pair_rbf(ca_0, ca_0, neighbor_indices, self.rbf_dim),
+        _ca_pair_rbf(ca_2, ca_2, neighbor_indices, self.rbf_dim),
+        _ca_pair_rbf(ca_0, ca_1, neighbor_indices, self.rbf_dim),
+        _ca_pair_rbf(ca_0, ca_2, neighbor_indices, self.rbf_dim),
+        _ca_pair_rbf(ca_1, ca_0, neighbor_indices, self.rbf_dim),
+        _ca_pair_rbf(ca_1, ca_2, neighbor_indices, self.rbf_dim),
+        _ca_pair_rbf(ca_2, ca_0, neighbor_indices, self.rbf_dim),
+        _ca_pair_rbf(ca_2, ca_1, neighbor_indices, self.rbf_dim),
+      ],
+      axis=-1,
+    )
+
+    encoded_positions, edges_concat, after_w_e, after_norm, final = _encode_and_project_edges(
+      self.w_pos,
+      self.w_e,
+      self.norm_edges,
+      self.w_e_proj,
+      residue_index,
+      chain_index,
+      neighbor_indices,
+      rbf_all,
+      o_features,
+      one_hot_dtype=ca.dtype,
+      cyclic=self.cyclic if cyclic is None else cyclic,
+      mask=mask,
+    )
+
+    return ProteinEdgeStageTensors(
+      neighbor_indices=neighbor_indices,
+      rbf=rbf_all,
+      encoded_positions=encoded_positions,
+      edges_concat=edges_concat,
+      after_w_e=after_w_e,
+      after_norm=after_norm,
+      final=final,
+      node_features_out=node_features,
+      prng_key=prng_key,
+    )
+
+  def __call__(
+    self,
+    prng_key: PRNGKeyArray,
+    structure_coordinates: StructureAtomicCoordinates,
+    mask: AlphaCarbonMask,
+    residue_index: ResidueIndex,
+    chain_index: ChainIndex,
+    backbone_noise: BackboneNoise | None,
+    backbone_noise_mode: str = "direct",
+    structure_mapping: jnp.ndarray | None = None,
+    initial_node_features: jnp.ndarray | None = None,
+    rbf_features: jnp.ndarray | None = None,
+    neighbor_indices: jnp.ndarray | None = None,
+    *,
+    cyclic: bool | jax.Array | None = None,
+  ) -> tuple[EdgeFeatures, NeighborIndices, NodeFeatures | None, PRNGKeyArray]:
+    """Extract and project CA-only features from protein structure.
+
+    Parameters
+    ----------
+    prng_key : PRNGKeyArray
+      PRNG key for coordinate noise.
+    structure_coordinates : StructureAtomicCoordinates
+      Atomic coordinates ``(N, 4, 3)`` or CA-only ``(N, 3)``.
+    mask : AlphaCarbonMask
+      Alpha carbon presence mask.
+    residue_index : ResidueIndex
+      Residue sequence indices.
+    chain_index : ChainIndex
+      Chain integer indices.
+    backbone_noise : BackboneNoise | None
+      Standard deviation of Gaussian coordinate noise.
+    backbone_noise_mode : str
+      Mode for backbone noise (``"direct"`` or ``"thermal"``).
+    structure_mapping : jnp.ndarray | None
+      Optional structure ID mapping to isolate multi-state neighbors.
+    initial_node_features : jnp.ndarray | None
+      Optional initial node features.
+    rbf_features : jnp.ndarray | None
+      Unused placeholder for API compatibility with ``ProteinFeatures``.
+    neighbor_indices : jnp.ndarray | None
+      Optional precomputed ``(N, K)`` neighbor indices.
+    cyclic : bool | jax.Array | None
+      Optional override for cyclic intra-chain sequence offset wrapping.
+
+    Returns
+    -------
+    tuple[EdgeFeatures, NeighborIndices, NodeFeatures | None, PRNGKeyArray]
+      Tuple of ``(edge_features, neighbor_indices, node_features_out, prng_key)``.
+    """
+    stages = self.forward_edge_stages(
+      prng_key,
+      structure_coordinates,
+      mask,
+      residue_index,
+      chain_index,
+      backbone_noise,
+      backbone_noise_mode=backbone_noise_mode,
+      structure_mapping=structure_mapping,
+      initial_node_features=initial_node_features,
+      rbf_features=rbf_features,
+      neighbor_indices=neighbor_indices,
+      cyclic=cyclic,
+    )
+    return stages.final, stages.neighbor_indices, stages.node_features_out, stages.prng_key

@@ -1,0 +1,16 @@
+# RFdiffusion4 condition spec for a peptide binder.
+# Paths are resolved relative to the directory rfd4-generate is launched from,
+# so pdflow recommends absolute paths.
+binder:
+  input: /absolute/path/to/target_cropped.cif
+  # <binder length range>, chain break, <target residues kept fixed>
+  contig: "50-120, /0, A17-131"
+  conditions:
+    # Keep the target backbone rigid.
+    C_CRDGRP:
+      1:
+        - select: "sel('A/*/*/[N,CA,C,O]')"
+    # Keep the target sequence fixed.
+    C_SEQ:
+      true:
+        - select: "sel('A')"

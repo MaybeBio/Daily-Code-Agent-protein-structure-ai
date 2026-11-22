@@ -1,0 +1,1 @@
+../../skills/cuequivariance-torch/SKILL.md

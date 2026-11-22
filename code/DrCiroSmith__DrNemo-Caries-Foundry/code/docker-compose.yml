@@ -1,0 +1,42 @@
+services:
+  foundry-verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: drnemo-foundry-verify
+    environment:
+      - PYTHONHASHSEED=42
+      - OMP_NUM_THREADS=4
+    volumes:
+      - ./data:/app/data
+      - ./demo_data:/app/demo_data
+    command: ["pytest", "tests/test_foundry.py", "-v"]
+
+  foundry-hunter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: drnemo-foundry-hunter
+    environment:
+      - PYTHONHASHSEED=42
+      - OMP_NUM_THREADS=4
+    volumes:
+      - ./data:/app/data
+      - ./demo_data:/app/demo_data
+    command: ["python", "scripts/continuous_hunter.py"]
+    restart: unless-stopped
+
+  foundry-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: drnemo-foundry-dashboard
+    environment:
+      - PYTHONHASHSEED=42
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./demo_data:/app/demo_data
+    command: ["streamlit", "run", "dashboard.py", "--server.port", "8501", "--server.address", "0.0.0.0", "--server.headless", "true"]
+    restart: unless-stopped

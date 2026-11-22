@@ -1,0 +1,122 @@
+# Basic Mamba CI pipeline on top of CCTBX
+
+name: CI pipeline on Mamba
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  # run daily to ensure that changes to dependenices are not breaking tests
+  schedule:
+    - cron: "30 21 * * *"
+  workflow_dispatch:
+
+env:
+  # MOPAC_COMMAND: $CONDA_PREFIX/bin/mopac
+  # XTBHOME: $CONDA_PREFIX
+  PY: "python3.12"
+  #CLEANUP_TESTS: 'FALSE'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -leo pipefail {0} {0}
+
+    steps:
+      - name: checkout code
+        uses: actions/checkout@v7
+
+      - name: df
+        run: df -h
+
+      - uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-file: environment.yaml
+          cache-environment: false
+          environment-name: qrefine-ci-mamba
+          post-cleanup: all
+
+      - name: run installer
+        run: |
+          sh build_into_conda.sh
+
+      - name: smoke test
+        run: |
+          source $CONDA_PREFIX/lib/$PY/site-packages/build/setpaths.sh
+          qr.refine --help
+          env
+
+      - name: qr.test
+        run: |
+          cd  /home/runner/work/qrefine/qrefine/
+          pwd
+          mkdir testing_workdir
+          cd testing_workdir
+          source $CONDA_PREFIX/lib/$PY/site-packages/build/setpaths.sh
+          qr.test | tee ../qr_test.txt
+
+      - name: check tests and testing_workdir
+        id: check_tests
+        if: always()
+        run: |
+         ls -R
+         failed_names=$(sed -nE "s/^[[:space:]]*\\('([^']+\\.py)',[[:space:]]*True\\)[[:space:]]+[1-9][0-9]*[[:space:]]*$/\\1/p" ../qr_test.txt | sort -u)
+         if [ -n "$failed_names" ]; then
+           echo "$failed_names" | awk 'BEGIN{print "The following tests FAILED:"} {print " * "$1}' >> $GITHUB_STEP_SUMMARY
+         fi
+         {
+           echo "failed_tests<<EOF"
+           if [ -n "$failed_names" ]; then
+             echo "*Failed tests:*"
+             echo "$failed_names" | sed 's/^/• /'
+           fi
+           echo "EOF"
+         } >> "$GITHUB_OUTPUT"
+        working-directory: /home/runner/work/qrefine/qrefine/testing_workdir
+
+      - name: Archive qr test output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qr-test-output
+          path: ./qr_test.txt
+
+      - name: Archive qr-log files output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tests-dir
+          path: /home/runner/work/qrefine/qrefine/testing_workdir
+
+      - name: Report Status
+        if: ${{ success() || failure() }}
+        uses: slackapi/slack-github-action@v4.0.0
+        with:
+          webhook: ${{ secrets.ACTION_MONITORING_SLACK }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "${{ github.workflow }} ${{ job.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "${{ job.status == 'success' && ':white_check_mark:' || ':x:' }} *${{ github.workflow }}* ${{ job.status == 'success' && 'succeeded' || 'failed' }}\n<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|View Commit> | <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ${{ toJSON(job.status == 'success' && 'All tests passed.' || steps.check_tests.outputs.failed_tests || 'No failed-test names were captured.') }}
+                  }
+                }
+              ]
+            }

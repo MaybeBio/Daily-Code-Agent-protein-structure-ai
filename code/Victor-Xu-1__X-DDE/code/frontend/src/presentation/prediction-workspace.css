@@ -1,0 +1,90 @@
+@import url("./prediction-shell.css");
+@import url("./prediction-inputs.css");
+@import url("./prediction-results.css");
+
+:root[data-theme="dark"] .prediction-confidence-metrics > div {
+  background: #253632;
+}
+:root[data-theme="dark"] .studio-app .prediction-setup-layout textarea {
+  background: var(--surface-muted);
+  border-color: var(--line);
+}
+@media (max-width: 1250px) {
+  .prediction-setup-layout {
+    grid-template-columns: minmax(0, 1fr) 260px;
+    gap: 18px;
+  }
+  .prediction-setup {
+    padding: 20px;
+  }
+  .prediction-confidence-metrics {
+    flex-basis: 100%;
+  }
+}
+@media (max-width: 1000px) {
+  .prediction-setup-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .prediction-setup {
+    position: static;
+  }
+  .prediction-entity-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .prediction-setup dl {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 24px;
+  }
+}
+@media (max-width: 600px) {
+  .studio-app .studio-content[data-prediction-layout="true"] {
+    padding: 12px;
+  }
+  .prediction-sample-bar {
+    gap: 8px 10px;
+    padding: 6px 0;
+  }
+  .prediction-confidence-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .prediction-sample-picker nav {
+    min-width: 0;
+  }
+  .prediction-sample-options {
+    max-width: 180px;
+    min-width: 0;
+  }
+  .prediction-setup-layout .questionnaire-heading {
+    font-size: 20px;
+  }
+  .studio-app .prediction-setup-layout .questionnaire-steps {
+    grid-template-columns: none;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+    padding-bottom: 8px;
+    margin-bottom: 14px;
+  }
+  .prediction-setup-layout .questionnaire-steps button {
+    min-height: 44px;
+    justify-content: center;
+  }
+}
+
+@media (360px <= width <= 600px) {
+  .prediction-confidence-metrics {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .prediction-confidence-metrics > div {
+    display: grid;
+    align-content: start;
+    gap: 2px;
+    padding: 4px 6px;
+  }
+  .prediction-confidence-metrics dd {
+    font-size: 16px;
+  }
+}

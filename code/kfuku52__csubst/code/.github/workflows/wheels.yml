@@ -1,0 +1,76 @@
+name: Build wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build (defaults to the selected branch)
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      ref:
+        description: Tested release tag to build
+        type: string
+        required: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wheels-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  wheels:
+    name: ${{ matrix.name }} wheels
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            archs: x86_64
+          - name: macOS x86_64
+            os: macos-15-intel
+            archs: x86_64
+          - name: macOS arm64
+            os: macos-15
+            archs: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install cibuildwheel
+        run: python -m pip install --upgrade cibuildwheel
+
+      - name: Build binary wheels
+        env:
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_ARCHS: ${{ matrix.archs }}
+          CIBW_SKIP: "*-musllinux_*"
+          # The scientific parity runner records wall time/RSS via GNU time.
+          CIBW_BEFORE_ALL_LINUX: "yum install -y time"
+          CIBW_TEST_COMMAND: >-
+            python {project}/.github/scripts/sites_parity_check.py
+            --installed --numerical-only
+          CIBW_ENVIRONMENT: "CSUBST_STRICT_EXTENSIONS=1"
+        run: python -m cibuildwheel --output-dir wheelhouse
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: csubst-${{ matrix.os }}-${{ matrix.archs }}-wheels
+          path: wheelhouse/*.whl
+          retention-days: 14

@@ -1,0 +1,208 @@
+/**
+ * The guide's screenshots (help/img/*.webp), taken from the live page in headless Chrome: each scene is set up through
+ * the page itself, then captured once it has drawn. Re-run after the interface changes:
+ *
+ *   node tools/guide-shots.mjs [scene ...]
+ *
+ * Needs network (PDB entries, model and OpenBind-0 parameters) and a WebGPU-capable Chrome; the designs scene runs
+ * the model and a refold, so it takes a few minutes. Chrome is driven over its DevTools protocol (Node's WebSocket),
+ * so there is nothing to install.
+ */
+import { spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
+const OUT = join(ROOT, 'help', 'img');
+const CHROME = process.env.CHROME ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const PORT = 4321;
+const DEBUG_PORT = 9341;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const server = spawn(process.execPath, [join(ROOT, 'tools', 'serve.mjs'), String(PORT)], { stdio: 'ignore' });
+const profile = mkdtempSync(join(tmpdir(), 'guide-shots-'));
+const chrome = spawn(CHROME, [
+  '--headless=new', `--remote-debugging-port=${DEBUG_PORT}`, `--user-data-dir=${profile}`, '--window-size=1440,1000',
+  '--force-device-scale-factor=2', '--disable-gpu-sandbox', '--no-first-run', '--no-default-browser-check', 'about:blank',
+], { stdio: 'ignore' });
+
+let ws;
+let nextId = 0;
+const pending = new Map();
+const send = (method, params = {}) => new Promise((ok, fail) => {
+  const id = (nextId += 1);
+  pending.set(id, { ok, fail });
+  ws.send(JSON.stringify({ id, method, params }));
+});
+
+/** Run `fn` (source of an async function of `w`, the page's window) in the page and return its JSON result. */
+async function page(fn, timeoutMs = 600000) {
+  const expression = `(async () => { const w = window; const d = document; const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    return JSON.stringify(await (${fn})(w, d, sleep)); })()`;
+  const res = await Promise.race([send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }),
+    sleep(timeoutMs).then(() => { throw new Error('page step timed out'); })]);
+  if (res.exceptionDetails) throw new Error(res.exceptionDetails.exception?.description ?? res.exceptionDetails.text);
+  return JSON.parse(res.result.value ?? 'null');
+}
+
+/** Capture `rect` (CSS pixels, or the whole window) as help/img/<name>.webp, at `scale` of the device pixels. */
+async function shot(name, rect = null, scale = 1) {
+  const view = rect ? null : await page('async (w) => ({ width: w.innerWidth, height: w.innerHeight })');
+  const clip = rect ? { ...rect, scale } : { x: 0, y: 0, ...view, scale };
+  const { data } = await send('Page.captureScreenshot', { format: 'webp', quality: 86, clip, captureBeyondViewport: false });
+  writeFileSync(join(OUT, `${name}.webp`), Buffer.from(data, 'base64'));
+  console.log(`help/img/${name}.webp`);
+}
+
+const rectOf = (selector, pad = 0) => page(`async (w, d) => {
+  // Shown: not hidden and laid out (popups are position: fixed, so offsetParent says nothing).
+  const e = [...d.querySelectorAll(${JSON.stringify(selector)})].find((x) => !x.hidden && x.getClientRects().length);
+  if (!e) return null;
+  const r = e.getBoundingClientRect();
+  return { x: Math.max(0, r.left - ${pad}), y: Math.max(0, r.top - ${pad}), width: Math.min(1440, r.width + 2 * ${pad}),
+    height: Math.min(1000 - Math.max(0, r.top - ${pad}), r.height + 2 * ${pad}) };
+}`);
+
+/**
+ * The box around what a shot is about: the elements `selectors` match (shown ones), and with `structure` the middle
+ * of the viewer where the structure sits, padded and kept on screen.
+ */
+const around = (selectors, { pad = 10, structure = false, upTo = null } = {}) => page(`async (w, d) => {
+  const rs = ${JSON.stringify(selectors)}.flatMap((sel) => [...d.querySelectorAll(sel)])
+    .filter((e) => !e.hidden && e.getClientRects().length).map((e) => e.getBoundingClientRect());
+  if (${structure}) {
+    const v = d.getElementById('viewer').getBoundingClientRect();
+    const cx = v.left + v.width / 2;
+    const cy = v.top + v.height / 2;
+    rs.push({ left: cx - 230, top: cy - 170, right: cx + 230, bottom: cy + 170 });
+  }
+  if (!rs.length) return null;
+  let bottom = Math.max(...rs.map((r) => r.bottom));
+  ${upTo ? `const cap = d.querySelectorAll(${JSON.stringify(upTo)}); if (cap.length) bottom = Math.min(bottom, cap[cap.length - 1].getBoundingClientRect().bottom);` : ''}
+  // A shot of the structure stays inside the viewer: none of the card beside it.
+  const right = ${structure} ? d.getElementById('viewer').getBoundingClientRect().right : w.innerWidth;
+  const x = Math.max(0, Math.min(...rs.map((r) => r.left)) - ${pad});
+  const y = Math.max(0, Math.min(...rs.map((r) => r.top)) - ${pad});
+  return { x, y, width: Math.min(right, Math.max(...rs.map((r) => r.right)) + ${pad}) - x,
+    height: Math.min(w.innerHeight, bottom + ${pad}) - y };
+}`);
+
+/** Open the start screen and build an example from its card (Studio's Design card), as a visitor would. */
+const openExample = (example) => page(`async (w, d, sleep) => {
+  for (let i = 0; i < 600 && !d.querySelector('[data-example="${example}"]'); i++) await sleep(50);
+  if (d.getElementById('rfd4p-start').hidden) { d.getElementById('rfd4p-new').click(); await sleep(400); }
+  d.querySelector('[data-example="${example}"]').click(); await sleep(300);
+  // Built out of sight with the card's own controls, then shown once, finished (body.rfd4p-building meanwhile).
+  for (let i = 0; i < 2400 && (d.body.classList.contains('rfd4p-building') || !d.getElementById('rfd4p-start').hidden); i++) await sleep(50);
+  await sleep(3000);
+  return d.getElementById('rfd4p-task-label').textContent;
+}`);
+
+const SCENES = {
+  // The start screen: the parts to start from, then the examples.
+  async start() {
+    await page(`async (w, d, sleep) => { for (let i = 0; i < 600 && !d.querySelector('[data-example]'); i++) await sleep(50); await sleep(1500); }`);
+    // The parts to start from and the first examples: enough to see what is there.
+    await shot('start', await around(['.rfd4p-start-actions', '.rfd4p-task-card:nth-child(-n+4)']));
+  },
+  // The binder example: the card's pieces beside the target, hotspots in amber.
+  async card() {
+    await openExample('protein_binder');
+    await shot('card', await around(['#rfd4p-job']));
+  },
+  // A piece's popup, its crop bar dragged in: the residues to be cut fade in the structure.
+  async piece() {
+    await openExample('protein_binder');
+    await page(`async (w, d, sleep) => {
+      [...d.querySelectorAll('#rfd4p-chain-list .rfd4p-sub-open')].find((b) => /^A[0-9]/.test(b.innerText.trim())).click(); await sleep(1500);
+      const pop = [...d.querySelectorAll('.rfd4p-piece-pop')].find((x) => !x.hidden);
+      const h = pop.querySelector('.rfd4p-crop-lo'); const t = pop.querySelector('.rfd4p-crop-track').getBoundingClientRect();
+      const hb = h.getBoundingClientRect();
+      const ev = (type, x) => h.dispatchEvent(new PointerEvent(type, { bubbles: true, button: 0, pointerId: 1, clientX: x, clientY: hb.top + 5 }));
+      ev('pointerdown', hb.left + 4); ev('pointermove', t.left + t.width * 0.3); ev('pointerup', t.left + t.width * 0.3);
+      await sleep(2500);
+    }`);
+    // The structure and the popup beside it: the cut fading as the bar is dragged.
+    await shot('piece', await around(['.rfd4p-piece-pop:not(.rfd4p-sel-pop)'], { structure: true }));
+  },
+  // A few residues picked in the structure: the short popup, and the outline that marks a selection everywhere.
+  async select() {
+    await openExample('protein_binder');
+    await page(`async (w, d, sleep) => {
+      // The page's in-browser Studio API holds the open document; the card's popup opens where the pointer last was.
+      const store = (await import('/web/studio-api.js')).getSharedStudioStore();
+      const a = store.getSession(w.rfd4pApp.card.inputSessionId()).atoms; const pick = [];
+      for (let i = 0; i < a.nAtoms; i++) if (a.chain_id[i] === 'A' && a.res_id[i] >= 50 && a.res_id[i] <= 60) pick.push(i);
+      const r = d.getElementById('viewer').getBoundingClientRect();
+      d.getElementById('viewer').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: r.left + r.width * 0.6, clientY: r.top + r.height * 0.6 }));
+      w.atomworksStudio.setSelection(pick); await sleep(2500);
+    }`);
+    await shot('select', await around(['.rfd4p-sel-pop'], { structure: true }));
+  },
+  // Three designs from scratch, refolded with OpenBind-0 and ranked.
+  async designs() {
+    await page(`async (w, d, sleep) => {
+      for (let i = 0; i < 600 && !d.getElementById('rfd4p-start-seq'); i++) await sleep(50);
+      if (d.getElementById('rfd4p-start').hidden) { d.getElementById('rfd4p-new').click(); await sleep(400); }
+      d.getElementById('rfd4p-start-seq').click(); await sleep(3000);
+      d.getElementById('samples-input').value = '3';
+      d.getElementById('predict').click();
+      const app = w.rfd4pApp;
+      for (let i = 0; i < 400 && !app.running; i++) await sleep(50);
+      for (let i = 0; i < 12000 && app.running; i++) await sleep(100);
+      await sleep(1500);
+      d.getElementById('refold-model').value = 'openbind0';
+      d.getElementById('refold-model').dispatchEvent(new w.Event('change', { bubbles: true }));
+      d.getElementById('refold-btn').click(); await sleep(500);
+      for (let i = 0; i < 12000 && app.card.refold.session.isRunning; i++) await sleep(100);
+      await sleep(3000);
+    }`);
+    await shot('designs', await around(['#rfd4p-job']));
+  },
+};
+
+try {
+  mkdirSync(OUT, { recursive: true });
+  let target = null;
+  for (let i = 0; i < 100 && !target; i += 1) {
+    await sleep(200);
+    try { target = (await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).json()).find((t) => t.type === 'page'); } catch { /* not up yet */ }
+  }
+  if (!target) throw new Error('Chrome did not start');
+  ws = new WebSocket(target.webSocketDebuggerUrl);
+  await new Promise((ok, fail) => { ws.onopen = ok; ws.onerror = fail; });
+  ws.onmessage = (msg) => {
+    const m = JSON.parse(msg.data);
+    if (m.id && pending.has(m.id)) {
+      const p = pending.get(m.id);
+      pending.delete(m.id);
+      if (m.error) p.fail(new Error(m.error.message)); else p.ok(m.result);
+    }
+  };
+  await send('Page.enable');
+  await send('Runtime.enable');
+  // The guide shows the page as most people see it: dark (headless Chrome reports light). THEME=light for the other.
+  await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: process.env.THEME ?? 'dark' }] });
+  const wanted = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(SCENES);
+  for (const name of wanted) {
+    if (!SCENES[name]) throw new Error(`no scene ${name} (have ${Object.keys(SCENES).join(', ')})`);
+    // A fresh page for each scene: no state carried from the last.
+    await send('Page.navigate', { url: `http://127.0.0.1:${PORT}/index.html` });
+    await sleep(1500);
+    // The faster-WebGPU notice shows on a GPU without Chrome's experimental features (headless Chrome's): not part
+    // of what the guide shows.
+    await page(`async (w, d, sleep) => { for (let i = 0; i < 600 && !w.rfd4pApp?.card; i++) await sleep(50);
+      await sleep(500); d.getElementById('rfd4p-speed-dismiss')?.click(); }`);
+    await SCENES[name]();
+  }
+} finally {
+  ws?.close();
+  chrome.kill();
+  server.kill();
+  await sleep(500);
+  rmSync(profile, { recursive: true, force: true });
+}
+// Chrome's helpers and the open socket would keep Node alive.
+process.exit(0);

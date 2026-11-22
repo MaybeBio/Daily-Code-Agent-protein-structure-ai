@@ -1,0 +1,2011 @@
+"""Thin explicit scientific wrappers; no unknown mutating exports are proxied."""
+
+import inspect
+import re
+
+from argdigest import arg_digest
+from smonitor import signal
+
+
+def _native_documentation(name, module="basic", *, bind_primary=True):
+    def decorate(function):
+        import molsysmt
+
+        namespace = molsysmt
+        for part in module.split("."):
+            namespace = getattr(namespace, part)
+        native = getattr(namespace, name)
+        doc = inspect.getdoc(native) or ""
+        if module in {"supported", "supported.supported"}:
+            # These copied examples are native calls, with a standalone import
+            # so the documented native examples also execute as doctests.
+            doc = doc.replace(
+                "Examples\n--------\n",
+                f"Examples\n--------\n>>> from {native.__module__} import {name}\n",
+                1,
+            )
+        doc = re.sub(
+            r"(?m)^(?:molecular_system|to_molecular_system) :[^\n]*\n(?:[ \t]+[^\n]*\n|\n)*",
+            "",
+            doc,
+            count=1,
+        )
+        # Keep the provider's parameter/result definitions as the help source.
+        # Examples are explicitly native calls, not invented addon signatures.
+        first, _, rest = doc.partition("\n")
+        binding = (
+            "This utility keeps its explicit molecular_systems collection; "
+            "no current view.molsys is inserted. "
+            if name
+            in {"are_multiple_molecular_systems", "merge", "concatenate_structures"}
+            else (
+                "The primary molecular system is the current view.molsys. "
+                if bind_primary
+                else "This factory keeps its explicit scientific inputs; "
+                "no current view.molsys is inserted. "
+                if module == "physchem"
+                else "This utility keeps its explicit scientific inputs; "
+                "no current view.molsys is inserted. "
+            )
+        )
+        function.__doc__ = (
+            first
+            + "\n\n"
+            + binding
+            + "The remaining parameters and returns follow the native function below. "
+            "Its examples show ordinary MolSysMT calls.\n" + rest
+        )
+        if module == "structure" and name == "get_rotation_matrix_from_axis_angle":
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "An open empty view is sufficient. Axis and angle remain explicit; "
+                "the current primary, coordinates, box and pending edits are not "
+                "read or synchronized. Native validation, angular units, trusted "
+                "skip_digestion inputs and matrix ownership remain unchanged. "
+                "There is no selection, in_place or update_view control and no "
+                "scene/history change. The returned matrix remains caller-owned "
+                "after owner closure; new calls through a closed owner reject. "
+                "Applying the matrix is a separate structure.rotate operation.\n"
+            )
+        if module == "structure" and name in {
+            "get_pairwise_rmsd",
+            "get_distance_clusters",
+        }:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "Experimental bounded native analysis; no fitting, periodic "
+                "reconstruction, scene edit or automatic stored analysis is "
+                "added. Native work/memory limits, units, ordered member keys, "
+                "source indices and producer evidence remain unchanged. Results "
+                "are detached and remain caller-owned after view closure.\n"
+            )
+            if name == "get_pairwise_rmsd":
+                function.__doc__ += (
+                    "The serialized current-primary reader includes pending "
+                    "edits without synchronizing the scene. Requested structure "
+                    "order and repetitions remain distinct members; no visible "
+                    "structure is substituted. Chemical validation is limited "
+                    "to the selected native method.\n"
+                )
+            else:
+                function.__doc__ += (
+                    "An open empty view is sufficient. Matrix and cutoff remain "
+                    "explicit; no primary is read or synchronized. Clustering "
+                    "uses native canonical comparison units, independently of "
+                    "output-unit policy. Caller inputs must remain stable during "
+                    "the call. No molecular correspondence is inferred.\n"
+                )
+        if module == "chemical_states" and name == "normalize_indexed_hydrogen_policy":
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "The serialized current-primary reader returns the native "
+                "independent molecular_system/report, including pending edits. "
+                "The source, scene, history and synchronization status remain "
+                "unchanged; invalidation applies only to the returned system. "
+                "There is no in_place, update_view or implicit adoption. This "
+                "experimental representation policy neither adds hydrogens nor "
+                "chooses protonation. Returned data remain caller-owned after "
+                "owner closure; new calls require an open loaded owner.\n"
+            )
+        if module == "build" and name == "make_water_box":
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "An open empty view is sufficient. The box stays explicit; "
+                "the current primary and its box are not read or synchronized. "
+                "Returns a separate molecular system in the requested native "
+                "form, without replacing view.molsys or changing scene/history "
+                "or pending edits. There is no update_view control or implicit "
+                "adoption; use view.load(result) explicitly when desired. "
+                "The caller owns the box and must keep it stable during the "
+                "call. Native units, validation, output availability/errors "
+                "and whole-water reference geometry remain unchanged. No "
+                "solvation, force-field assignment, equilibration or overlap "
+                "repair is inferred. Results survive owner closure; new calls "
+                "through a closed owner are rejected.\n"
+            )
+        if module == "basic" and name == "view":
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "Creates a separate native visualization of the current "
+                "molecular system. An open loaded owner is required. Reads "
+                "use the serialized current target, including completed "
+                "pending edits; no parent synchronization or result adoption "
+                "occurs. This is not a clone of the parent's scene, camera "
+                "or history. Selectors, structure order, explicit viewer "
+                "backend, availability/errors and configured native HTML "
+                "embedding behavior remain native. No backend fallback or "
+                "implicit visible-frame selection is introduced. The newly "
+                "created visualization has its own lifetime and is caller-owned; "
+                "closing the parent does not close the result. Calls through "
+                "a closed owner are rejected. MolSysViewer receiving does not "
+                "qualify another backend's rendering.\n"
+            )
+        if module in {"supported", "supported.supported"}:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "An open empty view is sufficient. No molecular-system reader, "
+                "edit synchronization, scene update or history action is used. "
+                "Native output types and capability visibility are preserved. "
+                "Plain outputs do not construct a Styler; the native default "
+                "remains visual. Reports describe declarations and environment "
+                "metadata, not guaranteed execution or installed-pair qualification. "
+                "Returned metadata remains independent of subsequent view closure; "
+                "new calls through a closed owner are rejected.\n"
+            )
+        if module == "basic" and name in {
+            "add",
+            "append_structures",
+            "merge",
+            "concatenate_structures",
+        }:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "Native selection/list conventions, forms, units, chemistry/state "
+                "associations, attribute policies, warnings, mechanics and analysis "
+                "limitations remain unchanged. No molecular alignment, preparation, "
+                "analysis merge or implicit broadcasting is added.\n"
+            )
+            if name in {"merge", "concatenate_structures"}:
+                function.__doc__ += (
+                    "The explicit ordered molecular_systems collection is not "
+                    "prefixed by view.molsys. The native independent result is "
+                    "returned without adoption or scene update. This utility works "
+                    "on an open empty view; the caller keeps all inputs stable.\n"
+                )
+            else:
+                function.__doc__ += (
+                    "The destination to_molecular_system is the current view.molsys; "
+                    "from_molecular_system stays explicit, including complementary "
+                    "items interpreted as one source. Native in_place=True remains "
+                    "the default and returns None. False returns an independent "
+                    "system without adoption, under the serialized reader.\n"
+                    "update_view : bool, keyword-only, default=True\n"
+                    "    Reconcile an admitted in-place prefix addition; False leaves "
+                    "declared pending work for sync_view(), without deferring science. "
+                    "Old scene/source identities remain on the retained prefix. New "
+                    "atoms have unmapped source origin; new structures have no old "
+                    "scene origin. Per-structure shapes/trajectory cards with no new "
+                    "values reject before structure addition; clear them first. "
+                    "Native coverage/universes are retained, not recalculated. "
+                    "A source with analyses retains native rejection. Missing "
+                    "coordinates or unsupported rendering can fail synchronization "
+                    "after completed science; retry never repeats the operation. "
+                    "Requires the host axis_growth capability.\n"
+                )
+        if module == "basic" and name in {"compose_atom_maps", "permute_atoms"}:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "The native result remains independent; there is no scene update, "
+                "automatic result adoption or update_view control. Atom indices are "
+                "positions, not labels. Native types, errors, memory limits, "
+                "provenance and quantity records remain unchanged.\n"
+            )
+            if name == "compose_atom_maps":
+                function.__doc__ += (
+                    "Explicit caller-owned reports may be composed before loading a "
+                    "system while the view is open. No managed molecular lock is "
+                    "acquired for them; inputs must remain stable during the call. "
+                    "This transports declared correspondence, not matching, "
+                    "coordinates, generated atom positions, charges or authenticated "
+                    "identity. Keep direct absent-origin -1 distinct from merged "
+                    "representatives. The map is a sidecar, not an H5MSM 0.5 domain.\n"
+                )
+            else:
+                function.__doc__ += (
+                    "The current primary is read through the serialized reader, "
+                    "including pending edits. atom_indices is the full new-to-old "
+                    "bijection; output is a separate MolSys, not an extraction or "
+                    "an in-place scene reorder. Named interactions and scientific "
+                    "domains follow native remapping; historical reports keep their "
+                    "old axes. Output remains resident; numeric estimates do not "
+                    "guarantee process RSS. Unsupported domains retain rejection.\n"
+                )
+        if module == "h5msm":
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "Paths address the Python process filesystem. Native file effects "
+                "are explicit; they never load, replace or synchronize this view "
+                "automatically. Native schema, associations, coverage, original "
+                "producer metadata, units and error/overwrite behavior are retained. "
+                "This is molecular-domain I/O, not a Viewer scene/session save. "
+                "No browser download or implicit output filename is introduced.\n"
+            )
+            if name == "write":
+                function.__doc__ += (
+                    "The current primary is serialized through the managed reader, "
+                    "including pending native edits; the scene is not reconciled. "
+                    "The default format_version='0.5' rejects stored mechanics "
+                    "rather than discarding them. Explicit format_version='0.6' "
+                    "requests the experimental mechanics schema. No source "
+                    "arrays or saved analyses are modified.\n"
+                )
+            else:
+                function.__doc__ += (
+                    "All filenames, layers, structures and associations remain "
+                    "explicit and caller-owned. The utility works before a system "
+                    "is loaded while the view remains open; external inputs/files "
+                    "must remain stable during the native call. No molecular-edit "
+                    "lock, current structures or named analyses are inserted.\n"
+                )
+            if name == "read_layers":
+                function.__doc__ += (
+                    "Absent None and present-empty interaction layers remain "
+                    "distinct. analysis_names selects named analyses without "
+                    "attaching them; no public out-of-core query is implied.\n"
+                )
+            if name == "append_structures":
+                function.__doc__ += (
+                    "Only the explicit topology/interaction-free file is extended. "
+                    "The loaded primary is unchanged, even when its source path "
+                    "names that file. Native validation precedes resize, but append "
+                    "is not crash transactional. No structures/state links are "
+                    "inferred from the view.\n"
+                )
+            if name in {"migrate_04_to_05", "migrate_to_05"}:
+                function.__doc__ += (
+                    "Migration requires a distinct explicit output path and keeps "
+                    "the source file unchanged. Native legacy-version, ambiguous "
+                    "scaffolding and information-loss limits remain visible.\n"
+                )
+        if module == "form.file_fasta":
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "The current molecular system is not an input. Explicit text/file "
+                "operations work before loading while the view is open, without "
+                "a managed molecular lock or scene effect. Callers own file/input "
+                "stability. Native resident records preserve every occurrence, "
+                "header, original newline and decoded-character span; no sequence "
+                "normalization, molecular admission, identity authentication, "
+                "topology, coordinates or optional Biopython import is introduced. "
+                "The result remains a fresh native JSON-compatible document.\n"
+            )
+        if module == "pbc" and name not in {"wrap_to_pbc", "wrap_to_mic", "unwrap"}:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "The native scientific value is returned without a scene object, "
+                "molecular edit, box assignment, result adoption or scene update. "
+                "Box vectors are rows. Native unit policy, numerical rounding and "
+                "angle-based shape classification are preserved. Shape labels "
+                "summarize the native mean-angle criterion, not edge equality.\n"
+            )
+            if bind_primary:
+                function.__doc__ += (
+                    "has_pbc reads the current primary through the managed reader, "
+                    "including pending scientific edits. Its native criterion uses "
+                    "the first structure, not an all-structures aggregation.\n"
+                )
+            else:
+                function.__doc__ += (
+                    "This explicit-input utility works before a system is loaded, "
+                    "while its owning view remains open. Inputs stay caller-owned "
+                    "and must remain stable during the call; no managed molecular "
+                    "edit lock is acquired for them. Obtain selected boxes explicitly "
+                    "with basic.get(box=True, structure_indices=...).\n"
+                )
+            if "skip_digestion" not in inspect.signature(native).parameters:
+                function.__doc__ += (
+                    "skip_digestion : bool, keyword-only, default=False\n"
+                    "    Control addon digestion only. The native callable has no "
+                    "declared skip_digestion parameter and retains ordinary validation.\n"
+                )
+            if name == "get_box_from_lengths_and_angles":
+                function.__doc__ += (
+                    "Omitted or None angles delegate to the native orthogonal "
+                    "box default. The addon does not synthesize angles. Native output "
+                    "has shape (n_structures, 3, 3).\n"
+                )
+        if name in {
+            "get_form",
+            "is_a_molecular_system",
+            "are_multiple_molecular_systems",
+        }:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "skip_digestion : bool, keyword-only, default=False\n"
+                "    Control addon argument digestion only. The native helper deliberately "
+                "has no digestion escape hatch and receives no such argument. View lifetime "
+                "checks remain active.\n"
+            )
+        if name == "are_multiple_molecular_systems":
+            function.__doc__ += (
+                "The explicit collection may be checked before this view loads a system. "
+                "Inputs are caller-owned and must remain stable during the native call; "
+                "the utility acquires no managed-edit locks for them. It neither combines "
+                "systems nor loads or adopts a result into the view.\n"
+            )
+        if name == "where_is_attribute":
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "The native item/form pair is returned without copying. Its item may be "
+                "the actual current view.molsys; later external edits retain explicit "
+                "reconciliation responsibilities.\n"
+            )
+        if module == "physchem":
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "The native scientific value is returned, not a scene object. "
+                "No assignment to the source, implicit preparation, automatic adoption or scene update "
+                "is introduced. Native derived/cache behavior, definitions, units, "
+                "container types and supported element scopes remain unchanged. "
+            )
+        if module == "physchem" and name in {
+            "get_mass",
+            "get_charge",
+            "get_atomic_radius",
+            "get_electronegativity",
+            "get_hydrophobicity",
+            "get_polarity",
+            "get_transmembrane_tendency",
+            "get_surface_area",
+            "get_volume",
+            "get_area_buried",
+            "get_buried_fraction",
+        }:
+            function.__doc__ += (
+                "Group scales require names present in their native table; missing "
+                "chemical groups are not silently assigned neutral values. "
+                "OpenMM definitions retain their native form/parameterization limits; "
+                "a table charge is not an assigned partial charge or a protonation model.\n"
+                "Selection syntax and element scopes follow the repaired native "
+                "contract under uibcdf/molsysmt#470 and uibcdf/molsysmt#471. "
+                "Unsupported levels reject explicitly; no aggregation is invented. "
+                "OpenMM charge conversion of a multi-frame periodic box is rejected; "
+                "the addon never selects a frame implicitly.\n"
+            )
+        if (
+            module == "physchem"
+            and "skip_digestion" not in inspect.signature(native).parameters
+        ):
+            function.__doc__ += (
+                "skip_digestion : bool, keyword-only, default=False\n"
+                "    Control addon digestion only; this native callable has no "
+                "declared skip_digestion parameter and retains ordinary validation.\n"
+            )
+        if module == "physchem" and name.startswith("get_protor"):
+            function.__doc__ += (
+                "ProtOr returns native atom types/provenance or radii in nm. "
+                "It does not add hydrogens, store chemical assignments or prepare "
+                "the primary. Native heavy-atom rules, ignored hydrogen typing "
+                "and radius fallbacks remain distinct.\n"
+            )
+        if module == "physchem" and name in {
+            "get_surface_area",
+            "get_volume",
+            "get_area_buried",
+            "get_buried_fraction",
+        }:
+            function.__doc__ += (
+                "These are reference-table values per group, not geometry calculated "
+                "from the visible structure. Native containers and quantities are preserved; "
+                "the addon adds no quantity units, conversion or normalization. "
+                "Use get_sasa for an explicit conformational "
+                "surface calculation, with its separate native engine limitations. "
+                "get_area_buried has no native syntax argument. Other native syntax "
+                "and supported-level choices retain ordinary public validation.\n"
+            )
+        if module == "physchem" and name in {
+            "get_hydrogen_inventory",
+            "get_chemical_readiness",
+        }:
+            function.__doc__ += (
+                "This is a detached stored-chemistry report, not a preparation "
+                "operation or chemical-validity certificate. Select one distinct "
+                "structure when coordinates exist; the addon does not substitute "
+                "the visible structure for the native default. Native chemical "
+                "state/reference resolution, sorted unique source indices, empty "
+                "arrays and issue/coverage semantics are retained. Missing data "
+                "remain unknown; no valence, protonation or missing atoms are inferred. "
+                "No hydrogen placement dependency is added. Returned report edits "
+                "do not update the primary or scene.\n"
+            )
+        if module == "physchem" and name == "get_hydrogen_inventory":
+            function.__doc__ += (
+                "Indexed H neighbors and stored virtual H annotations are separate. "
+                "Counts are dimensionless int64; -1 is unknown, not zero. The full "
+                "graph is audited before filtering selected parents, whose H pairs "
+                "may include H atoms outside the output atom selection.\n"
+            )
+        if module == "physchem" and name == "get_chemical_readiness":
+            function.__doc__ += (
+                "Incident/crossing bonds retain source indices, including external "
+                "endpoints. Coordinate values are finite-position booleans, not "
+                "coordinate arrays. Stored-field availability and declared evidence "
+                "do not establish a universal ready flag or downstream suitability. "
+                "Default-reference external syntax follows the native #480 repair. "
+                "Explicit/associated states retain the public selector's restrictions; "
+                "no selector translation or implicit state choice is added.\n"
+            )
+        if module == "physchem" and name in {"get_aromatic_rings", "get_aromaticity"}:
+            function.__doc__ += (
+                "The selected native chemical state supplies the full graph before "
+                "output selection. Results are detached source-indexed chemical "
+                "data, not geometry, contacts or scene objects. No aromatic flags, "
+                "charges, hydrogens or connectivity are assigned or repaired. "
+                "State association across structures remains explicit; this is "
+                "not a per-structure occurrence detector. Native external reference "
+                "syntax follows the repaired contract under uibcdf/molsysmt#482.\n"
+            )
+        if module == "physchem" and name in {
+            "get_charge_centers",
+            "get_hydrophobic_sites",
+            "get_halogen_bond_sites",
+        }:
+            function.__doc__ += (
+                "Chemical features are detached source-indexed results, not "
+                "interaction occurrences, coordinates or scene objects. Native "
+                "full-graph prerequisites and explicit chemical-state/structure "
+                "resolution are retained. No charges, hydrogens, bonds or aromatic "
+                "flags are assigned. Readers neither synchronize pending edits "
+                "nor accept update_view.\n"
+            )
+        if module == "physchem" and name == "get_charge_centers":
+            function.__doc__ += (
+                "Formal-charge centers retain whole sparse participant memberships, "
+                "distinct geometry-reference atoms and native elementary-charge "
+                "quantities. A cut compound center rejects. The bounded recognition "
+                "does not parameterize partial charges or prove an ionic interaction.\n"
+            )
+        if module == "physchem" and name in {
+            "get_hydrophobic_sites",
+            "get_halogen_bond_sites",
+        }:
+            function.__doc__ += (
+                "The explicit native SMARTS profile uses optional RDKit on declared "
+                "chemistry; ProLIF is a reference, not an executed dependency. "
+                "Matching and match limits precede output selection; no truncation "
+                "or hidden preparation is added. Attribution stays native.\n"
+            )
+        if module == "physchem" and name == "get_hydrophobic_sites":
+            function.__doc__ += (
+                "Typed hydrophobic atom sites are not group hydrophobicity scales "
+                "or geometric contact observations.\n"
+            )
+        if module == "physchem" and name == "get_halogen_bond_sites":
+            function.__doc__ += (
+                "Pair columns preserve donor-halogen and acceptor-reference roles. "
+                "Only complete selected pairs survive; matching one endpoint does "
+                "not expand the selection or create a halogen-bond observation.\n"
+            )
+        if module == "physchem" and name == "get_aromatic_rings":
+            function.__doc__ += (
+                "All atoms and bonds need declared aromatic flags, including False "
+                "for nonaromatic entries. Whole ring selection is required, including "
+                "intersected fused rings. Packed memberships are sorted atom sets, "
+                "not cyclic traversal order; the minimum basis can be nonunique. "
+                "Completeness assumptions and cyclic-block limits are forwarded "
+                "and recorded without changing the primary. Native explicit "
+                "structure indices retain the repaired validation under uibcdf/molsysmt#483.\n"
+            )
+        if module == "physchem" and name == "get_aromaticity":
+            function.__doc__ += (
+                "The explicit optional RDKit model perceives flags on a detached "
+                "complete graph and retains its own prerequisites, contradictions "
+                "and attribution. Selecting atoms filters results after perception; "
+                "only bonds with both endpoints selected are returned. Two aromatic "
+                "atoms need not have an aromatic joining bond. Returned flags are "
+                "not stored automatically or passed to ring recognition implicitly.\n"
+            )
+        if module == "physchem" and name in {
+            "get_bulkiness",
+            "get_secondary_structure_propensity",
+        }:
+            function.__doc__ += (
+                "This is a strict reference lookup per group, not a measurement "
+                "of the visible conformation. Native group order, repetitions, "
+                "scalar/empty axes and selection syntax are preserved. Missing, "
+                "modified, terminal and placeholder group names retain native "
+                "rejection; no parent substitution, zero or sum is inferred. "
+                "The lookup does not require coordinates, but rich selections "
+                "retain their native coordinate requirements. No visible-frame "
+                "selection, scene color, assignment or synchronization is added.\n"
+            )
+        if module == "physchem" and name == "get_bulkiness":
+            function.__doc__ += (
+                "The native area quantity retains the Zimmerman table scale and "
+                "published later angstrom-squared interpretation before unit "
+                "standardization. The addon adds no scaling. This is not a "
+                "molecule's measured cross-section or SASA; original 1968 "
+                "derivation/normalization remains outside the audited claim.\n"
+            )
+        if module == "physchem" and name == "get_secondary_structure_propensity":
+            function.__doc__ += (
+                "Conformation is required. Native Levitt weighted frequency ratios "
+                "are dimensionless float64 arrays, not probabilities, prediction "
+                "or coordinate-based secondary-structure assignment. Values can "
+                "exceed one; categories need not sum to one. No clipping, "
+                "renormalization or implicit coil remainder is introduced.\n"
+            )
+        if module in {
+            "interactions.hbonds",
+            "interactions.disulfides",
+            "interactions.ionic",
+            "interactions.hydrophobic",
+            "interactions.halogen_bonds",
+            "interactions.metal_coordination",
+            "interactions.pi_pi",
+            "interactions.cation_pi",
+            "interactions.water_bridges",
+        }:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "The result remains a native scientific value, not a scene object. "
+                "Calls read the current primary through the serialized reader, "
+                "including pending scientific edits. No hydrogens, connectivity, "
+                "protonation, aromatic flags or coordinates are prepared. There "
+                "is no automatic result attachment, named storage, visual selection, "
+                "representation or synchronization; update_view is not accepted. "
+                "The visible structure is never substituted for explicit native "
+                "structure scope.\n"
+            )
+            if name in {
+                "get_donor_atoms",
+                "get_acceptor_atoms",
+                "get_hbond_sites",
+                "get_hbond_site_directions",
+            }:
+                function.__doc__ += (
+                    "These tools do not detect interaction occurrences.\n"
+                )
+            if name in {
+                "get_buch_hbonds",
+                "get_luzard_chandler_hbonds",
+                "get_hbonds",
+                "get_disulfide_candidates",
+                "get_ionic_interactions",
+                "get_hydrophobic_interactions",
+                "get_halogen_bonds",
+                "get_metal_coordination",
+                "get_pi_pi_interactions",
+                "get_cation_pi_interactions",
+                "get_water_bridges",
+            }:
+                function.__doc__ += (
+                    "Results use the native output_type default and remain independent. "
+                    "Tuple order/repetitions and sparse evaluated coverage follow their "
+                    "own native contracts; there is no common reorder or deduplication. "
+                    "Evaluated-empty and unevaluated structures remain distinct. "
+                    "Returned analyses are not saved into view.molsys.interactions. "
+                    "Occurrence references belong to one analysis version, not global identities.\n"
+                )
+            if name in {"get_buch_hbonds", "get_luzard_chandler_hbonds"}:
+                function.__doc__ += (
+                    "The primary alone is managed by the view. The explicit "
+                    "molecular_system_2 and supplied role/secondary-axis inputs "
+                    "remain caller-owned; native unsupported combinations reject. "
+                    "No second system is inferred, copied or aligned. Legacy eager "
+                    "calculation and optional sparse-output limits stay visible. "
+                    "The supplied-donor tuple mismatch is tracked in "
+                    "uibcdf/molsysmt#511; no mask flattening or reconstructed "
+                    "donor-H pairs are introduced here.\n"
+                )
+            if name == "get_hbonds":
+                function.__doc__ += (
+                    "Methods/profiles, explicit donor-H/acceptor arrays, selection "
+                    "modes, chemical state, thresholds, heavy execution and match "
+                    "budgets remain native scientific choices. No hydrogen network "
+                    "or recognition profile is substituted. Sparse measurements "
+                    "carry their declared nm/radian units; budget estimates exclude "
+                    "some caller/source/Python overhead and are not an RSS guarantee.\n"
+                )
+            if name == "get_disulfide_candidates":
+                function.__doc__ += (
+                    "These are per-structure geometric sulfur candidates, not a "
+                    "covalent assignment or proof that a bond is absent. Native "
+                    "eligible group names, cutoff, sorting, PBC images and source "
+                    "indices remain explicit. No bond is inserted or removed.\n"
+                )
+            if name in {
+                "get_ionic_interactions",
+                "get_hydrophobic_interactions",
+                "get_halogen_bonds",
+            }:
+                function.__doc__ += (
+                    "These experimental detectors keep native internal/incident/between "
+                    "scopes and full-source chemistry before selection. Repeated structure "
+                    "indices are evaluated once in sorted order; no query-mode alias or "
+                    "visible-structure default is substituted. Heavy execution is native; "
+                    "bounded coordinate processing does not make the resident sparse result "
+                    "out-of-core or guarantee process RSS. Thresholds, profiles, chemical "
+                    "state, connectivity declarations and evidence remain explicit.\n"
+                )
+            if name == "get_ionic_interactions":
+                function.__doc__ += (
+                    "A unit-bearing distance_threshold is required; no cutoff is guessed. "
+                    "Formal-charge centers can be compound participants and must be selected "
+                    "whole. Distances use their recorded geometry references, not every "
+                    "participant atom or a center-of-mass substitution. This is proximity "
+                    "evidence, not electrostatic energy, a salt-bridge assignment or "
+                    "parameterized partial charge. Split periodic centers retain native "
+                    "rejection; no internal unwrapping is introduced.\n"
+                )
+            if name == "get_hydrophobic_interactions":
+                function.__doc__ += (
+                    "Chemically typed unordered atom pairs retain canonical source-index "
+                    "order and native MIC images; roles do not encode ligand ownership. "
+                    "The recognition profile and inclusive distance core are not a "
+                    "hydrophobicity scale, energy, Mol* rule or residue fingerprint. "
+                    "Optional RDKit availability and max_matches retain native validation.\n"
+                )
+            if name == "get_halogen_bonds":
+                function.__doc__ += (
+                    "All four D-X-A-R roles define selection membership; X-A selection "
+                    "alone does not imply internal coverage. Preserve separate acceptor "
+                    "reference observations, distances in nm, angles in radians and "
+                    "coherent chain MIC images. Undefined angles remain unobserved. "
+                    "This is the declared profile's geometric core, not proof of an "
+                    "attractive energy or the paper's exact element-specific criterion.\n"
+                )
+            if name in {
+                "get_metal_coordination",
+                "get_pi_pi_interactions",
+                "get_cation_pi_interactions",
+                "get_water_bridges",
+            }:
+                function.__doc__ += (
+                    "These experimental observations preserve native chemical state, "
+                    "method/profile choices, internal/incident/between atom scopes, "
+                    "sorted unique evaluated structures and declared units/evidence. "
+                    "Selections do not silently complete participants. Bounded "
+                    "coordinate processing leaves accepted sparse results resident; "
+                    "working estimates are not a universal process-RSS guarantee.\n"
+                )
+            if name == "get_metal_coordination":
+                function.__doc__ += (
+                    "Metal/ligand roles are directed, including reversed role "
+                    "assignments when the native profile permits both. This "
+                    "experimental proximity criterion is not a metal-specific "
+                    "physical model, assigned coordination bond/number, oxidation "
+                    "state or energy. Stored dative bonds remain separate and "
+                    "unchanged; no preparation or bond assignment is introduced.\n"
+                )
+            if name in {"get_pi_pi_interactions", "get_cation_pi_interactions"}:
+                function.__doc__ += (
+                    "Whole declared aromatic rings and any compound centers keep "
+                    "source memberships. Native reference profiles, normal/plane "
+                    "construction, exclusions and the custom least-squares proposal "
+                    "are distinct scientific definitions. The custom "
+                    "centroid_angle_offset method requires four explicit cutoffs; "
+                    "none is guessed. Split periodic participants retain native "
+                    "rejection rather than hidden unwrapping. NaN in an "
+                    "inapplicable reference measurement is preserved. Native "
+                    "reference-state MDTraj string selections currently reject "
+                    "while equivalent atom indices work; the facade does not "
+                    "translate selectors or override the requested state.\n"
+                )
+            if name == "get_pi_pi_interactions":
+                function.__doc__ += (
+                    "The default custom method does not supply its required "
+                    "cutoffs. geometry preserves parallel/edge_to_face/both "
+                    "filters. A complete adapted reference geometry tester does "
+                    "not imply a complete Mol*/MDTraj/ProLIF feature pipeline "
+                    "or attractive interaction energy.\n"
+                )
+            if name == "get_water_bridges":
+                function.__doc__ += (
+                    "order is exactly one or two indexed mediator waters, not "
+                    "an upper bound. Six/nine D-H-A roles retain every actual "
+                    "leg and repeated oxygen image, alternative H paths and "
+                    "per-leg parameters. Internal/between scopes include used "
+                    "mediator atoms; endpoint-only requests need the explicit "
+                    "native incident scope. Waters need two indexed hydrogens. "
+                    "No water, H, protonation or optimized network is generated. "
+                    "Accepted legs, joins and bridges remain resident; this is "
+                    "not an incremental file writer or a frequency analysis.\n"
+                )
+            if "skip_digestion" not in inspect.signature(native).parameters:
+                function.__doc__ += (
+                    "skip_digestion : bool, keyword-only, default=False\n"
+                    "    Control addon digestion only. Native validation still "
+                    "runs and receives no such keyword.\n"
+                )
+            if name in {"get_donor_atoms", "get_acceptor_atoms"}:
+                function.__doc__ += (
+                    "These are legacy rule-based candidates, distinct from "
+                    "get_hbond_sites profiles and their chemical-state contract. "
+                    "Native uibcdf/molsysmt#506 and uibcdf/molsysmt#507 repairs "
+                    "preserve caller rule containers and evaluate built-in "
+                    "MolSysMT rules separately from the declared custom-rule "
+                    "syntax. No consumer copy or selector translation is added. "
+                    "Custom rules keep the caller's chosen language. "
+                    "No universal acceptor chemistry "
+                    "or complete hydrogen inventory is certified.\n"
+                )
+            if name == "get_hbond_sites":
+                function.__doc__ += (
+                    "Recognition uses the full declared graph before output "
+                    "filtering. Both donor and indexed H must be selected. "
+                    "Elemental and SMARTS rules are distinct scientific choices; "
+                    "recognition itself needs no coordinates, but the resident "
+                    "view and spatial selection retain their own requirements. "
+                    "Unknown connectivity requires the native explicit assumption; "
+                    "no assumption is inserted. Match limits reject truncation. "
+                    "Native resident reference-state requests currently differ "
+                    "from H5MSM in validating unused structure indices; the "
+                    "facade adds no independent frame-validation policy.\n"
+                )
+            if name == "get_hbond_site_directions":
+                function.__doc__ += (
+                    "Directions are experimental local hypotheses, not detected "
+                    "bonds, orbitals or an optimized H network. Keep evaluated "
+                    "structure positions distinct from source indices when "
+                    "requests repeat. Origins retain length units; directions "
+                    "are dimensionless. Packed support images use row-vector "
+                    "boxes and the site anchor reference. Unsupported/undefined "
+                    "status does not become a fabricated axis or virtual H. "
+                    "Native block/output budgets exclude some Python/source "
+                    "overhead and are not an RSS guarantee.\n"
+                )
+        if module == "build" and name in {
+            "get_residue_chemical_coverage",
+            "get_covalent_bond_candidates",
+            "get_peptide_bond_candidates",
+            "get_missing_heavy_atoms",
+            "get_missing_bonds",
+            "get_missing_residues",
+            "get_missing_terminal_cappings",
+            "get_non_standard_residues",
+            "get_disulfide_bonds",
+            "has_hydrogens",
+            "is_solvated",
+        }:
+            function.__doc__ += (
+                "The result is an independent native diagnostic or candidate report, "
+                "not a scene object, preparation edit or inserted bond. Explicit "
+                "scientific scope, native units and unassessed outcomes are retained. "
+                "Select one structure when required; the visible structure is never "
+                "substituted for the native default. No hydrogen, protonation, "
+                "template matching, inferred bond assignment or synchronization "
+                "is added. A candidate is not a declared covalent bond or a "
+                "chemical-validity certificate. update_view is not accepted.\n"
+            )
+        if (
+            module == "build"
+            and "skip_digestion" not in inspect.signature(native).parameters
+        ):
+            function.__doc__ += (
+                "skip_digestion : bool, keyword-only, default=False\n"
+                "    Control addon digestion only. The native callable receives no "
+                "such parameter and keeps its ordinary validation.\n"
+            )
+        if module == "build" and name in {
+            "get_missing_heavy_atoms",
+            "get_missing_terminal_cappings",
+            "get_non_standard_residues",
+        }:
+            function.__doc__ += (
+                "Numeric selection addresses source groups, not atom indices. "
+                "Native template/provider coverage and selected-scope terminal "
+                "interpretation are preserved; an empty report is not proof of "
+                "complete chemistry. No replacement is performed.\n"
+            )
+        if module == "build" and name == "get_missing_residues":
+            function.__doc__ += (
+                "The bound primary is the resident MolSys, not the original PDB/BCIF "
+                "file. Pass sequence explicitly as the native chain-ID mapping. "
+                "Without a usable reference, native MolSysMT warns and returns an "
+                "empty dict; that is not a complete-sequence certificate. Returned "
+                "chain indices/insertion positions describe the selected subsystem. "
+                "Reference extraction, selection and backend limitations remain native.\n"
+            )
+        if module == "build" and name in {"get_missing_bonds", "get_disulfide_bonds"}:
+            function.__doc__ += (
+                "Numeric selection addresses source atoms; returned candidate pairs "
+                "use source indices with both endpoints selected. structure_index "
+                "is singular and defaults to zero, independently of navigation. "
+                "Heuristic candidates are not a validated chemical graph.\n"
+            )
+        if module == "build" and name == "has_hydrogens":
+            function.__doc__ += (
+                "This predicate detects any selected indexed hydrogen, not hydrogen "
+                "completeness, protonation correctness or virtual/implicit H.\n"
+            )
+        if module == "build" and name == "is_solvated":
+            function.__doc__ += (
+                "This whole-system native density predicate uses stored water count "
+                "and box volume, not solvent completeness or a preparation protocol. "
+                "Explicit structure_indices retain order and repetitions. One "
+                "selected structure returns bool; multiple or empty selections "
+                "return a Boolean vector. There is no implicit aggregation or "
+                "visible-structure substitution.\n"
+            )
+        if module == "build" and name == "get_residue_chemical_coverage":
+            function.__doc__ += (
+                "Numeric selection addresses source groups and atom expressions "
+                "select whole containing groups, preserving exact native residue "
+                "template identity and unsupported-template limits.\n"
+            )
+        if module == "build" and name in {
+            "get_covalent_bond_candidates",
+            "get_peptide_bond_candidates",
+        }:
+            function.__doc__ += (
+                "Numeric selection addresses source atoms; both candidate endpoints "
+                "must be selected. Whole-group audits and full-source competition "
+                "precede output filtering where the chosen native method requires "
+                "them. No candidate truncation or method substitution is added.\n"
+            )
+        if module == "physchem" and name in {
+            "get_water_sites",
+            "get_metal_coordination_sites",
+        }:
+            function.__doc__ += (
+                "Full-source chemistry is recognized before output selection. "
+                "Results are independent chemical participant candidates, not "
+                "interaction occurrences, measured contacts or scene objects. "
+                "Native explicit state/structure scopes and match limits are "
+                "preserved; no coordinate, hydrogen, aromaticity or charge "
+                "preparation, source assignment or scene synchronization is added.\n"
+            )
+        if module == "physchem" and name == "get_water_sites":
+            function.__doc__ += (
+                "Retain only whole neutral indexed O-H-H participants. An oxygen-only "
+                "water name or implicit H does not qualify. Selecting a fragment "
+                "does not expand the selection or add its missing atoms.\n"
+            )
+        if module == "physchem" and name == "get_metal_coordination_sites":
+            function.__doc__ += (
+                "The bounded native metal and ligand roles remain distinct. "
+                "Recognition does not prove a coordination bond, oxidation state "
+                "or geometry. ProLIF is a reference, not an executed provider.\n"
+            )
+        if module == "physchem" and name in {
+            "assess_chemical_template",
+            "apply_chemical_template",
+        }:
+            function.__doc__ += (
+                "The current primary is the source; template, provenance and atom "
+                "correspondence stay explicit and caller-owned. No atom matching, "
+                "authentication, protonation choice or coordinate inference is "
+                "introduced. Explicit context and connectivity policies remain "
+                "native, with original source/template index domains.\n"
+            )
+        if module == "physchem" and name == "assess_chemical_template":
+            function.__doc__ += (
+                "The returned assessment changes neither input nor the scene. "
+                "Compatible describes the declared mapped scope, not universal "
+                "chemical readiness.\n"
+            )
+        if module == "physchem" and name in {
+            "apply_chemical_template",
+            "normalize_aromatic_bond_orders",
+        }:
+            function.__doc__ += (
+                "The native result contains an independent molecular_system and "
+                "report; it is not a managed in-place edit and is never adopted "
+                "automatically. Source view.molsys and its scene/coverage remain "
+                "unchanged; native invalidation affects the returned copy only. "
+                "No update_view argument or synchronization is added. History "
+                "retains original operation indices and producer provenance.\n"
+            )
+        if module == "physchem" and name == "normalize_aromatic_bond_orders":
+            function.__doc__ += (
+                "Only already declared aromatic bonds are normalized to fractional "
+                "order 1.5. This does not perceive aromaticity or guess chemistry.\n"
+            )
+        if module == "topology" and name == "get_atom_name_correspondence":
+            function.__doc__ += (
+                "\nView integration\n----------------\n"
+                "Reads stable atom names/elements from the serialized current "
+                "primary, including completed pending edits. The explicit "
+                "reference remains caller-owned; keep it stable for the call. "
+                "Native None defaults, selection order, duplicate-name/index "
+                "refusal and detached int64 query/reference source-index pairs "
+                "remain unchanged. This exact label match neither proves "
+                "chemical identity nor assigns chemistry, aligns coordinates "
+                "or adopts a reference. No scene/history change, visible-frame "
+                "choice, synchronization or update_view control is added.\n"
+            )
+        if module == "build" and name == "assess_protonation":
+            function.__doc__ += (
+                "\nView integration\n----------------\n"
+                "Prepares one native source-bound assessment through the "
+                "serialized current-primary reader, including pending edits. "
+                "It does not remove atoms, copy the coordinate trajectory, "
+                "synchronize the scene or attach a stored analysis. Native pH "
+                "approximation, naming/reference coverage, bidirectional atom "
+                "maps and one-use/stale-source guards remain explicit. The "
+                "returned native object's to_dict() owns its report data. Its "
+                "apply() is an ordinary native operation with an explicit "
+                "source argument, not a managed addon edit; use independent "
+                "output by default and adopt it deliberately. Raw native "
+                "in-place mutation is not automatically observed by the view. "
+                "No proxy, chemistry inference, automatic application or "
+                "update_view control is introduced here.\n"
+            )
+        if module == "physchem" and name == "get_chemical_template":
+            function.__doc__ += (
+                "\nView integration\n----------------\n"
+                "Explicit-input factory available before loading a system while "
+                "the owner remains open. component_id names the selected CCD "
+                "definition, not a current-system atom/group/component index. "
+                "The required source stays explicit; offline input never "
+                "silently selects the network. Native method, H policy, "
+                "descriptor/search limits, optional engines, source digests "
+                "and detached attribution remain unchanged. The independent "
+                "coordinate-free template is not applied or loaded. No "
+                "current-primary read, synchronization, preparation, "
+                "update_view control or scene/history change is added.\n"
+            )
+        if module == "physchem" and name == "get_peptide_chemical_template":
+            function.__doc__ += (
+                "This explicit-input factory works before a system is loaded while "
+                "its view remains open. The returned coordinate-free template is "
+                "independent of the primary and is not loaded or adopted. Required "
+                "sequence/terminal states and declared disulfides remain native; "
+                "no H geometry, L stereochemistry or protonation model is inferred.\n"
+            )
+        if module == "physchem" and name in {
+            "get_autodock_atom_types",
+            "get_cip_stereochemistry",
+            "get_partial_charges",
+        }:
+            function.__doc__ += (
+                "The current primary supplies the complete chemical graph before "
+                "native output selection. Atom indices are sorted and deduplicated; "
+                "the visible structure is never substituted for explicit native "
+                "state/structure scope. Returned chemical results are not a scene object "
+                "or a stored assignment. No hydrogen/protonation preparation, parameter "
+                "guessing, provider fallback, result adoption, atom coloring or scene "
+                "synchronization is added. Readers remain usable during pending edits; "
+                "update_view is not accepted. Attribution stays with native MolSysMT.\n"
+            )
+        if module == "physchem" and name == "get_autodock_atom_types":
+            function.__doc__ += (
+                "typing_scheme is required. AutoDock labels are distinct from element "
+                "symbols and do not assign atom_ff_type to the primary. All H must "
+                "already be indexed. This bounded profile does not establish docking "
+                "readiness or a universal donor/acceptor definition.\n"
+            )
+        if module == "physchem" and name == "get_cip_stereochemistry":
+            function.__doc__ += (
+                "CIP atom and bond labels retain source maps and declared/coordinate "
+                "evidence. Keyword-only from_coordinates requires one explicit 3D "
+                "structure; no periodic reconstruction or structure choice is added. "
+                "Only bonds with both selected endpoints survive.\n"
+            )
+        if module == "physchem" and name == "get_partial_charges":
+            function.__doc__ += (
+                "method is required. Gasteiger-Marsili and explicit force-field "
+                "calculations preserve native charge units, full-source conservation "
+                "checks and provider prerequisites. Values are distinct from stored "
+                "formal charge and the existing get_charge table lookup. Source "
+                "partial charges are neither reused nor replaced. No electrostatic "
+                "accuracy or ligand parameterization guarantee is inferred.\n"
+            )
+        if module == "physchem" and name in {"get_tpsa", "get_lipophilicity"}:
+            function.__doc__ += (
+                "Molecule indices address the source molecule axis, not atoms or "
+                "scene regions, at the default molecule level. Other native "
+                "element levels retain their own indices and return atomic "
+                "contributions or explicit sums in complete molecular context. "
+                "Native order, repetitions, scalar and empty outputs are preserved; "
+                "system selects atoms for a scalar sum. Output element maps are "
+                "distinct from evaluated molecule context maps. Indexed H retains "
+                "its row; nonindexed H is attributed to its attachment atom. "
+                "These graph descriptors have no structure axis; explicit "
+                "structures resolve chemistry and spatial selectors, never "
+                "implicitly the visible frame. No fragment capping, hydrogen "
+                "guessing, molecular preparation, implicit aggregation, coloring, "
+                "adoption or scene synchronization is added. Native RDKit "
+                "requirements and chemistry errors remain explicit.\n"
+            )
+        if module == "physchem" and name == "get_tpsa":
+            function.__doc__ += (
+                "Native squared area units and the explicit N/O versus N/O/S/P "
+                "choice are retained. Grouped values are model contribution sums, "
+                "not measured exposed areas or permeability predictions.\n"
+            )
+        if module == "physchem" and name == "get_lipophilicity":
+            function.__doc__ += (
+                "The native float64 scores and scalar sums are dimensionless, "
+                "not area quantities. Charged sites remain explicit, including "
+                "net-neutral zwitterions. No neutralization or counterion removal "
+                "is performed; a charged graph score does not establish logP or "
+                "logD applicability and a cross-molecule sum is not mixture logP. "
+                "Optional reports retain method, source maps and provenance; "
+                "the addon adds no duplicate scientific attribution.\n"
+            )
+        if module == "physchem" and name == "get_sasa":
+            function.__doc__ += (
+                "This is a conformational surface calculation. All primary atoms "
+                "remain occluders; selection filters the reported elements. Native "
+                "structure ordering, probe units, sampling and execution options "
+                "are forwarded without hidden preparation or engine overrides. "
+                "Periodic control pbc is forwarded explicitly: native MIC screening "
+                "uses other atom indices and excludes self-images; MDTraj requires "
+                "pbc=False for boxed input. Area units follow the squared configured "
+                "standard length unit. Native corrections are guarded under "
+                "uibcdf/molsysmt#478 and uibcdf/molsysmt#479. "
+                "CPU receiving uses explicit use_gpu=False; GPU support requires "
+                "its own native qualification. No color or representation is added.\n"
+            )
+        if module == "physchem" and name == "get_surface_area":
+            function.__doc__ += (
+                "Collantes ISA uses the native provisional angstrom-squared "
+                "convention and PyUnitWizard standardization under "
+                "uibcdf/molsysmt#473. Original units/normalization still need "
+                "paper verification; the addon adds no scaling or geometry.\n"
+            )
+        if module in {"topology", "chemical_states", "structure"} and name not in {
+            "translate",
+            "rotate",
+            "flip",
+            "least_rmsd_fit",
+            "least_rmsd_align",
+            "center",
+            "move_away",
+            "align_principal_axes",
+            "set_dihedral_angles",
+            "shift_dihedral_angles",
+        }:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "The result is a native scientific value, not a scene object. "
+                "No molecular edit, implicit preparation, adoption or scene update "
+                "is introduced. Native derived/cache behavior is unchanged.\n"
+            )
+            if "skip_digestion" not in inspect.signature(native).parameters:
+                function.__doc__ += (
+                    "skip_digestion : bool, keyword-only, default=False\n"
+                    "    Control addon digestion only; the native callable has no "
+                    "declared skip_digestion parameter and is invoked with its ordinary "
+                    "public validation. The flag is not added to scientific **kwargs.\n"
+                )
+        if module == "structure" and name in {
+            "translate",
+            "rotate",
+            "flip",
+            "least_rmsd_fit",
+            "least_rmsd_align",
+            "center",
+            "move_away",
+            "align_principal_axes",
+            "set_dihedral_angles",
+            "shift_dihedral_angles",
+        }:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "update_view : bool, keyword-only, default=True\n"
+                "    Synchronize an admitted in-place coordinate edit immediately. "
+                "False defers projection only; sync_view() finishes pending work. "
+                "The native in_place=False default returns an independent native result "
+                "without adoption or scene update. Native quantities, broadcasting "
+                "and returns remain unchanged. Source identities and axes are retained; "
+                "named interactions follow native edited-structure invalidation. "
+                "A synchronization failure exposes science_completed=True and the "
+                "native scientific_result; retry synchronization, not the scientific operation. "
+                "Potential partial scientific writes require explicit recovery.\n"
+            )
+        if module == "pbc" and name in {"wrap_to_pbc", "wrap_to_mic", "unwrap"}:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "update_view : bool, keyword-only, default=True\n"
+                "    Synchronize an admitted in-place coordinate edit immediately. "
+                "False defers projection only; sync_view() finishes pending work. "
+                "The native in_place=False default returns an independent native result "
+                "without adoption or scene update. Native row-vector boxes, units, "
+                "ordered structure indices and results remain scientific-owner behavior. "
+                "Named interactions follow native edited-structure invalidation. "
+                "A synchronization failure exposes science_completed=True and the "
+                "scientific_result; retry synchronization, not scientific work. "
+                "The addon adds no minimum-image algorithm, reconstruction or "
+                "implicit periodic preparation.\n"
+            )
+            if name == "unwrap":
+                function.__doc__ += (
+                    "Unwrapping follows the supplied structure order and restores "
+                    "per-atom temporal continuity; it is not covalent reconstruction "
+                    "inside one structure. No unsupplied trajectory history is inferred.\n"
+                )
+            else:
+                function.__doc__ += (
+                    "compact='component' keeps covalent blocks whole; False wraps "
+                    "atoms independently. Origins and centers remain explicit native "
+                    "parameters. Centered in-place wrapping publishes to the original "
+                    "primary through the native repair under uibcdf/molsysmt#467. "
+                    "The centering reference must be contained in the moved selection. "
+                    "Independent centered outputs remain separate.\n"
+                )
+        if module == "structure" and name == "flip":
+            function.__doc__ += (
+                "skip_digestion : bool, keyword-only, default=False\n"
+                "    Control addon digestion only; the native flip callable has no "
+                "declared escape hatch and always receives ordinary validation.\n"
+                "Reflection can invert chirality; it is not a proper rotation or "
+                "an automatic change to topology or chemical-state assignments.\n"
+                "The native None default uses the z normal. Finite nonzero normals "
+                "are normalized by native validation; their scale or sign does not "
+                "change the plane. Undefined normals and invalid plane points reject "
+                "before coordinate writes (uibcdf/molsysmt#460). The addon forwards "
+                "these inputs unchanged and supplies no reflection algorithm.\n"
+            )
+        if module == "structure" and name in {
+            "set_dihedral_angles",
+            "shift_dihedral_angles",
+        }:
+            function.__doc__ += (
+                "Native quartets, angular units, ordered structure axes and "
+                "moving covalent blocks determine the edit. The addon adds no "
+                "torsion formula, graph cut, block correction or periodic preparation. "
+                "Native editors reject nonfinite edit requests before coordinate "
+                "publication and preserve explicit block pools, including shifting "
+                "(uibcdf/molsysmt#461 and #462, source repair 6f6ed6bf1). "
+                "Only bounded finite scientific routes are received; this is not "
+                "unconditional scientific or installed-package qualification.\n"
+            )
+            if name == "set_dihedral_angles":
+                function.__doc__ += (
+                    "skip_digestion : bool, keyword-only, default=False\n"
+                    "    Control addon digestion only. Native set_dihedral_angles "
+                    "has no skip_digestion parameter and retains ordinary validation.\n"
+                )
+        if module == "structure" and name == "align_principal_axes":
+            function.__doc__ += (
+                "skip_digestion : bool, keyword-only, default=False\n"
+                "    Control addon digestion only. The native callable has no "
+                "skip_digestion argument and always receives ordinary validation. "
+                "Native principal_axes_of_selection defines the fitting population "
+                "independently of the atoms moved by selection. Target axes are rows "
+                "of a right-handed orthonormal basis; degenerate moments reject. "
+                "The center flag controls translation relative to the initial "
+                "weighted fitting center. The addon adds no eigensolver, sign choice, "
+                "periodic reconstruction, box rotation or scientific preparation.\n"
+            )
+        if module == "structure" and name == "move_away":
+            function.__doc__ += (
+                "Only single-structure nondegenerate displacement is qualified at the "
+                "reviewed source. Auto direction adds distance to the existing separation; "
+                "explicit direction places the source center at the initial reference "
+                "center plus distance along the normalized direction. The reference "
+                "remains caller-owned and is not locked or synchronized by this call. "
+                "Undefined, zero or nonfinite directions and multiple structures "
+                "are rejected by the native tool before coordinate writes "
+                "(uibcdf/molsysmt#456 and #457). Rejection preserves coordinates "
+                "and interaction coverage. "
+                "The addon supplies no substitute geometry or periodic preparation.\n"
+            )
+        if module == "structure" and name == "center":
+            function.__doc__ += (
+                "All three atom populations address the current view.molsys. "
+                "Native centering owns source containment, destination snapshots, "
+                "weights, units and refinement. The addon introduces no center "
+                "calculation, legacy keyword alias or automatic periodic preparation.\n"
+            )
+        if module == "structure" and name in {"least_rmsd_fit", "least_rmsd_align"}:
+            function.__doc__ += (
+                "An external reference remains caller-owned; keep it stable for "
+                "the call. Only the bound primary view is serialized, with no automatic "
+                "locking or synchronization of another reference view. No periodic "
+                "reimaging, molecular preparation or scientific fitting is added here.\n"
+            )
+        if module == "structure" and name == "least_rmsd_fit":
+            function.__doc__ += (
+                "selection_fit and reference_selection_fit define the ordered native "
+                "fit anchors; selection defines the atoms moved. to_form affects the "
+                "native independent output only, without adopting that result.\n"
+            )
+        if module == "structure" and name == "least_rmsd_align":
+            function.__doc__ += (
+                "selection and reference_selection define sequence-derived anchors; "
+                "the native operation moves complete selected components, not only "
+                "those anchor atoms. Native omitted/None self-reference uses the "
+                "original reference_structure_index, including in-place edits. "
+                "Native atom indices and full-axis Boolean masks are resolved before "
+                "sequence-group projection; selected names stay paired within each "
+                "identically aligned group. These repairs are tracked under "
+                "uibcdf/molsysmt#452 and uibcdf/molsysmt#453. The addon forwards "
+                "arguments without replacing references or calculating correspondences.\n"
+            )
+        if name in {"copy", "convert", "get_conversion_report"}:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "The result is not adopted and no scene update is requested. "
+                "Explicit filenames address the Python host filesystem, not a browser download. "
+                "Conversion ownership and optional converter dependencies remain native; "
+                "copy_if_all=False may expose shared/live data. Reports describe only their "
+                "declared audited scopes and are not a guarantee of complete format fidelity.\n"
+            )
+        if name in {"contains", "is_composed_of", "compare"}:
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "The current view is the primary system. Native queries return their "
+                "ordinary results without adopting data, attaching analyses or requesting "
+                "a scene update. Native derived/cache behavior is unchanged.\n"
+            )
+        if name == "compare":
+            function.__doc__ += (
+                "The second molecular_system_2 input remains explicit. The initial "
+                "receiver admits redefine_indices=False only. True rebuilds topology "
+                "in both native inputs and raises NotImplementedError before edits, "
+                "also with skip_digestion=True. This mutating route needs separate "
+                "receiving and reconciliation.\n"
+            )
+        if name == "remove":
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "update_view : bool, keyword-only, default=True\n"
+                "    Reconcile an in-place edit immediately. False defers only the scene update; "
+                "call tools.sync_view() to apply pending edits. Independent outputs are never adopted. "
+                "The initial retained-axis receiver rejects removal of every atom or structure "
+                "before executing in-place science. Use in_place=False for those outputs.\n"
+                "A scene update failure raises SystemEditSyncError with science_completed=True, "
+                "operation_id and scientific_result; retry synchronization, not removal.\n"
+            )
+        if name == "set":
+            function.__doc__ += (
+                "\n\nView integration\n----------------\n"
+                "update_view : bool, keyword-only, default=True\n"
+                "    Reconcile the bound edit immediately; False defers projection only. "
+                "The initial receiver admits coordinates and box with retained atom/structure "
+                "axes, native units/selection/order and native None return. Other attributes "
+                "are rejected before scientific execution. Native setters invalidate only "
+                "affected structures; no detector runs. Use sync_view() to retry projection, "
+                "not set() again. Potentially partial writes require explicit recovery.\n"
+            )
+        return function
+
+    return decorate
+
+
+class _BasicTools:
+    _NAMES = (
+        "get",
+        "select",
+        "info",
+        "get_attributes",
+        "has_attribute",
+        "get_label",
+        "get_form",
+        "where_is_attribute",
+        "is_a_molecular_system",
+        "are_multiple_molecular_systems",
+        "contains",
+        "is_composed_of",
+        "compare",
+        "extract",
+        "copy",
+        "convert",
+        "get_conversion_report",
+        "compose_atom_maps",
+        "permute_atoms",
+        "add",
+        "append_structures",
+        "merge",
+        "concatenate_structures",
+        "remove",
+        "set",
+        "view",
+    )
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    def __dir__(self):
+        return list(self._NAMES)
+
+    def _call(self, name, parameters, extra=None):
+        from molsysmt import basic
+
+        return self._owner._read(getattr(basic, name), parameters, extra)
+
+    @_native_documentation("view")
+    @signal(tags=["addon", "view"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def view(
+        self,
+        selection="all",
+        structure_indices="all",
+        viewer="MolSysViewer",
+        syntax="MolSysMT",
+        skip_digestion=False,
+    ):
+        parameters = {
+            "selection": selection,
+            "structure_indices": structure_indices,
+            "viewer": viewer,
+            "syntax": syntax,
+            "skip_digestion": skip_digestion,
+        }
+        return self._call("view", parameters)
+
+    @_native_documentation("get")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get(
+        self,
+        element="system",
+        selection="all",
+        structure_indices="all",
+        mask=None,
+        syntax="MolSysMT",
+        get_missing_bonds=True,
+        output_type="values",
+        chemical_state="reference",
+        skip_digestion=False,
+        **kwargs,
+    ):
+        return self._call(
+            "get",
+            {
+                "element": element,
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "mask": mask,
+                "syntax": syntax,
+                "get_missing_bonds": get_missing_bonds,
+                "output_type": output_type,
+                "chemical_state": chemical_state,
+                "skip_digestion": skip_digestion,
+            },
+            kwargs,
+        )
+
+    @_native_documentation("select")
+    @signal(tags=["addon", "selection"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def select(
+        self,
+        selection="all",
+        structure_indices="all",
+        element="atom",
+        mask=None,
+        syntax="MolSysMT",
+        to_syntax=None,
+        chemical_state="reference",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "select",
+            {
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "element": element,
+                "mask": mask,
+                "syntax": syntax,
+                "to_syntax": to_syntax,
+                "chemical_state": chemical_state,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("info")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def info(
+        self,
+        element="system",
+        selection="all",
+        structure_indices="all",
+        syntax="MolSysMT",
+        output_type="styler",
+        skip_digestion=False,
+        *,
+        mask=None,
+    ):
+        return self._call(
+            "info",
+            {
+                "element": element,
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "syntax": syntax,
+                "output_type": output_type,
+                "skip_digestion": skip_digestion,
+                "mask": mask,
+            },
+        )
+
+    @_native_documentation("get_attributes")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_attributes(
+        self,
+        include_none=False,
+        attribute_type="all",
+        output_type="list",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "get_attributes",
+            {
+                "include_none": include_none,
+                "attribute_type": attribute_type,
+                "output_type": output_type,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("has_attribute")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def has_attribute(
+        self,
+        attribute,
+        include_none=False,
+        structure_indices="all",
+        chemical_state="reference",
+        skip_digestion=False,
+    ):
+        return self._call(
+            "has_attribute",
+            {
+                "attribute": attribute,
+                "include_none": include_none,
+                "structure_indices": structure_indices,
+                "chemical_state": chemical_state,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("get_label")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_label(
+        self,
+        element="atom",
+        selection="all",
+        string="{name}-{id}@{index}",
+        syntax="MolSysMT",
+        skip_digestion=False,
+        **kwargs,
+    ):
+        return self._call(
+            "get_label",
+            {
+                "element": element,
+                "selection": selection,
+                "string": string,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+            },
+            kwargs,
+        )
+
+    @_native_documentation("get_form")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_form(self, *, skip_digestion=False):
+        return self._call("get_form", {})
+
+    @_native_documentation("is_a_molecular_system")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def is_a_molecular_system(self, *, skip_digestion=False):
+        return self._call("is_a_molecular_system", {})
+
+    @_native_documentation("are_multiple_molecular_systems")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def are_multiple_molecular_systems(
+        self, molecular_systems, *, skip_digestion=False
+    ):
+        self._owner._view()
+        from molsysmt.basic import are_multiple_molecular_systems
+
+        # This is an explicit-input utility, not a bound-primary reader. Its
+        # collection remains caller-owned, including before a view is loaded.
+        return are_multiple_molecular_systems(molecular_systems)
+
+    @_native_documentation("where_is_attribute")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def where_is_attribute(self, attribute, include_none=False, skip_digestion=False):
+        return self._call(
+            "where_is_attribute",
+            {
+                "attribute": attribute,
+                "include_none": include_none,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("contains")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def contains(
+        self,
+        selection="all",
+        syntax="MolSysMT",
+        skip_digestion=False,
+        *,
+        chemical_state="reference",
+        **kwargs,
+    ):
+        return self._call(
+            "contains",
+            {
+                "selection": selection,
+                "syntax": syntax,
+                "chemical_state": chemical_state,
+                "skip_digestion": skip_digestion,
+            },
+            kwargs,
+        )
+
+    @_native_documentation("is_composed_of")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def is_composed_of(
+        self,
+        selection="all",
+        syntax="MolSysMT",
+        skip_digestion=False,
+        *,
+        chemical_state="reference",
+        **kwargs,
+    ):
+        return self._call(
+            "is_composed_of",
+            {
+                "selection": selection,
+                "syntax": syntax,
+                "chemical_state": chemical_state,
+                "skip_digestion": skip_digestion,
+            },
+            kwargs,
+        )
+
+    @_native_documentation("compare")
+    @signal(tags=["addon", "compare"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def compare(
+        self,
+        molecular_system_2,
+        selection="all",
+        structure_indices="all",
+        selection_2="all",
+        structure_indices_2="all",
+        syntax="MolSysMT",
+        rule="equal",
+        output_type="boolean",
+        attribute_type=None,
+        include_none=False,
+        redefine_indices=False,
+        skip_digestion=False,
+        **kwargs,
+    ):
+        self._owner._target()
+        from molsysmt._private.argdigest.argument.redefine_indices import (
+            digest_redefine_indices,
+        )
+
+        # The forced native branch rebuilds BOTH inputs. It is an edit family,
+        # not an ordinary reader, including for a trusted skip_digestion call.
+        redefine_indices = digest_redefine_indices(
+            redefine_indices, caller="molsysmt.basic.compare.compare"
+        )
+        if redefine_indices:
+            raise NotImplementedError(
+                "Bound compare does not yet receive redefine_indices=True, which "
+                "rebuilds topology in both systems. Use native MolSysMT with explicit "
+                "reconciliation of affected views for that edit."
+            )
+        return self._call(
+            "compare",
+            {
+                "molecular_system_2": molecular_system_2,
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "selection_2": selection_2,
+                "structure_indices_2": structure_indices_2,
+                "syntax": syntax,
+                "rule": rule,
+                "output_type": output_type,
+                "attribute_type": attribute_type,
+                "include_none": include_none,
+                "redefine_indices": redefine_indices,
+                "skip_digestion": skip_digestion,
+            },
+            kwargs,
+        )
+
+    @_native_documentation("extract")
+    @signal(tags=["addon", "extract"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def extract(
+        self,
+        selection="all",
+        structure_indices="all",
+        to_form=None,
+        output_filename=None,
+        copy_if_all=True,
+        syntax="MolSysMT",
+        skip_digestion=False,
+        *,
+        element=None,
+    ):
+        return self._call(
+            "extract",
+            {
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "to_form": to_form,
+                "output_filename": output_filename,
+                "copy_if_all": copy_if_all,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+                "element": element,
+            },
+        )
+
+    @_native_documentation("copy")
+    @signal(tags=["addon", "copy"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def copy(self, output_filename=None, skip_digestion=False):
+        return self._call(
+            "copy",
+            {"output_filename": output_filename, "skip_digestion": skip_digestion},
+        )
+
+    @_native_documentation("convert")
+    @signal(tags=["addon", "conversion"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def convert(
+        self,
+        to_form="molsysmt.MolSys",
+        selection="all",
+        structure_indices="all",
+        syntax="MolSysMT",
+        strict=False,
+        return_report=False,
+        skip_digestion=False,
+        *,
+        from_naming_scheme=None,
+        **kwargs,
+    ):
+        return self._call(
+            "convert",
+            {
+                "to_form": to_form,
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "syntax": syntax,
+                "strict": strict,
+                "return_report": return_report,
+                "skip_digestion": skip_digestion,
+                "from_naming_scheme": from_naming_scheme,
+            },
+            kwargs,
+        )
+
+    @_native_documentation("get_conversion_report")
+    @signal(tags=["addon", "get"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def get_conversion_report(
+        self,
+        to_form="molsysmt.MolSys",
+        selection="all",
+        structure_indices="all",
+        syntax="MolSysMT",
+        skip_digestion=False,
+        *,
+        from_naming_scheme=None,
+    ):
+        return self._call(
+            "get_conversion_report",
+            {
+                "to_form": to_form,
+                "selection": selection,
+                "structure_indices": structure_indices,
+                "syntax": syntax,
+                "skip_digestion": skip_digestion,
+                "from_naming_scheme": from_naming_scheme,
+            },
+        )
+
+    @_native_documentation("compose_atom_maps", bind_primary=False)
+    @signal(tags=["addon", "basic", "maps"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def compose_atom_maps(self, atom_maps, skip_digestion=False):
+        from molsysmt.basic import compose_atom_maps
+
+        self._owner._view()
+        return compose_atom_maps(atom_maps, skip_digestion=skip_digestion)
+
+    @_native_documentation("permute_atoms")
+    @signal(tags=["addon", "basic", "maps"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def permute_atoms(self, atom_indices, return_report=False, skip_digestion=False):
+        return self._call(
+            "permute_atoms",
+            {
+                "atom_indices": atom_indices,
+                "return_report": return_report,
+                "skip_digestion": skip_digestion,
+            },
+        )
+
+    @_native_documentation("add")
+    @signal(tags=["addon", "basic", "edit"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def add(
+        self,
+        from_molecular_system,
+        selection="all",
+        structure_indices="all",
+        keep_ids=True,
+        in_place=True,
+        syntax="MolSysMT",
+        attribute_policy="intersection",
+        skip_digestion=False,
+        *,
+        update_view=True,
+    ):
+        from ._composition import _compose_bound
+
+        return _compose_bound(
+            self._owner,
+            "add",
+            dict(
+                from_molecular_system=from_molecular_system,
+                selection=selection,
+                structure_indices=structure_indices,
+                keep_ids=keep_ids,
+                in_place=in_place,
+                syntax=syntax,
+                attribute_policy=attribute_policy,
+                skip_digestion=skip_digestion,
+            ),
+            update_view,
+        )
+
+    @_native_documentation("append_structures")
+    @signal(tags=["addon", "basic", "edit"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def append_structures(
+        self,
+        from_molecular_system,
+        selection="all",
+        structure_indices="all",
+        syntax="MolSysMT",
+        in_place=True,
+        attribute_policy="intersection",
+        skip_digestion=False,
+        *,
+        update_view=True,
+    ):
+        from ._composition import _compose_bound
+
+        return _compose_bound(
+            self._owner,
+            "append_structures",
+            dict(
+                from_molecular_system=from_molecular_system,
+                selection=selection,
+                structure_indices=structure_indices,
+                syntax=syntax,
+                in_place=in_place,
+                attribute_policy=attribute_policy,
+                skip_digestion=skip_digestion,
+            ),
+            update_view,
+        )
+
+    @_native_documentation("merge", bind_primary=False)
+    @signal(tags=["addon", "basic"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def merge(
+        self,
+        molecular_systems,
+        selections="all",
+        structure_indices="all",
+        keep_ids=True,
+        syntax="MolSysMT",
+        to_form=None,
+        skip_digestion=False,
+    ):
+        from molsysmt.basic import merge
+
+        self._owner._view()
+        return merge(
+            molecular_systems,
+            selections=selections,
+            structure_indices=structure_indices,
+            keep_ids=keep_ids,
+            syntax=syntax,
+            to_form=to_form,
+            skip_digestion=skip_digestion,
+        )
+
+    @_native_documentation("concatenate_structures", bind_primary=False)
+    @signal(tags=["addon", "basic"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def concatenate_structures(
+        self,
+        molecular_systems,
+        selections="all",
+        structure_indices="all",
+        to_form=None,
+        syntax="MolSysMT",
+        attribute_policy="intersection",
+        skip_digestion=False,
+    ):
+        from molsysmt.basic import concatenate_structures
+
+        self._owner._view()
+        return concatenate_structures(
+            molecular_systems,
+            selections=selections,
+            structure_indices=structure_indices,
+            to_form=to_form,
+            syntax=syntax,
+            attribute_policy=attribute_policy,
+            skip_digestion=skip_digestion,
+        )
+
+    @_native_documentation("remove")
+    @signal(tags=["addon", "edit"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def remove(
+        self,
+        selection=None,
+        structure_indices=None,
+        to_form=None,
+        syntax="MolSysMT",
+        in_place=False,
+        skip_digestion=False,
+        *,
+        update_view=True,
+    ):
+        parameters = {
+            "selection": selection,
+            "structure_indices": structure_indices,
+            "to_form": to_form,
+            "syntax": syntax,
+            "in_place": in_place,
+            "skip_digestion": skip_digestion,
+        }
+        # This branch determines integration, so it remains validated even when
+        # native argument digestion is explicitly skipped.
+        from molsysmt._private.argdigest.argument.in_place import digest_in_place
+
+        in_place = digest_in_place(
+            in_place, caller="molsysviewer_molsysmt.basic.remove"
+        )
+        if not isinstance(update_view, bool):
+            raise TypeError("update_view must be a boolean.")
+        if not in_place:
+            return self._call("remove", parameters)
+
+        view = self._owner._view_ref()
+        self._owner._target()  # Closed/empty rejection before host access.
+        coordinator = getattr(view.addons.manager, "system_edits", None)
+        if coordinator is None:
+            raise RuntimeError(
+                "This Viewer host lacks managed molecular-edit receiving. Update the host before in-place edits."
+            )
+        return coordinator.execute(
+            lambda target: self._prepare_removal(target, parameters),
+            name="molsysmt.basic.remove",
+            update_view=update_view,
+        )
+
+    @staticmethod
+    def _prepare_removal(target, parameters):
+        from molsysmt import basic
+        from molsysmt._private.variables import is_all
+        from molsysmt.basic._index_validation import (
+            validate_element_indices,
+            validate_structure_indices,
+        )
+        from molsysmt.native._subset import validate_removal_target
+
+        validate_removal_target(target, parameters["to_form"])
+        selection = parameters["selection"]
+        atoms = (
+            []
+            if selection is None
+            else basic.select(
+                target,
+                selection=selection,
+                syntax=parameters["syntax"],
+                skip_digestion=parameters["skip_digestion"],
+            )
+        )
+        atoms = validate_element_indices(
+            target, atoms, "atom", "selection", "molsysmt.remove"
+        )
+        n_atoms, n_frames = (
+            int(target.get_n_atoms()),
+            int(target.structures.n_structures),
+        )
+        removed_atoms = set(range(n_atoms)) if is_all(atoms) else set(atoms)
+        frames = validate_structure_indices(
+            target, parameters["structure_indices"], "molsysmt.remove"
+        )
+        removed_frames = (
+            set(range(n_frames))
+            if is_all(frames)
+            else set([] if frames is None else frames)
+        )
+        atom_map = (
+            None
+            if not removed_atoms
+            else {
+                old: new
+                for new, old in enumerate(
+                    i for i in range(n_atoms) if i not in removed_atoms
+                )
+            }
+        )
+        frame_map = (
+            None
+            if not removed_frames
+            else [i for i in range(n_frames) if i not in removed_frames]
+        )
+        return {
+            "run": lambda: basic.remove(target, **parameters),
+            "changed": bool(removed_atoms or removed_frames),
+            "atom_index_map": atom_map if removed_atoms else None,
+            "structure_index_map": frame_map if removed_frames else None,
+            "interactions_policy": "preserve",
+            # Native removal prepares an extracted candidate and publishes a
+            # new state dictionary once. The host also checks dictionary identity
+            # before accepting this atomic-rejection declaration.
+            "failure_atomic": True,
+        }
+
+    @_native_documentation("set")
+    @signal(tags=["addon", "edit"])
+    @arg_digest(config="molsysviewer_molsysmt._argdigest")
+    def set(
+        self,
+        element=None,
+        selection="all",
+        structure_indices="all",
+        syntax="MolSysMT",
+        chemical_state="reference",
+        skip_digestion=False,
+        *,
+        update_view=True,
+        **kwargs,
+    ):
+        if "molecular_system" in kwargs:
+            raise TypeError(
+                "The primary molecular_system is bound to view.molsys and cannot be overridden."
+            )
+        if not isinstance(update_view, bool):
+            raise TypeError("update_view must be a boolean.")
+        self._owner._target()
+        from ._geometry import _geometry_token, _prepare_geometry_set
+
+        view = self._owner._view_ref()
+        coordinator = getattr(view.addons.manager, "system_edits", None)
+        if coordinator is None:
+            raise RuntimeError(
+                "This Viewer host lacks managed molecular-edit receiving."
+            )
+        parameters = {
+            "element": element,
+            "selection": selection,
+            "structure_indices": structure_indices,
+            "syntax": syntax,
+            "chemical_state": chemical_state,
+            "skip_digestion": skip_digestion,
+        }
+        return coordinator.execute(
+            lambda target: _prepare_geometry_set(target, parameters, kwargs),
+            name="molsysmt.basic.set",
+            update_view=update_view,
+            rejection_check=_geometry_token,
+        )

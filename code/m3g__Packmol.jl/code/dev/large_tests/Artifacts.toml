@@ -1,0 +1,26 @@
+# The Zika virion tutorial, from https://github.com/m3g/MolSimTestFiles (downloaded only when needed)
+[packmol_zika]
+git-tree-sha1 = "ce933b9393bca9f26d31577873b7dae55f8b9b3d"
+lazy = true
+
+    [[packmol_zika.download]]
+    url = "https://github.com/m3g/MolSimTestFiles/releases/download/packmol_zika-v2/packmol_zika.tar.gz"
+    sha256 = "c736719c3a210ceedf790dade5e5903885d7a845e01e98c004ef6b3694d749af"
+
+# The exosome tutorial (13.6 million atoms), from https://github.com/m3g/MolSimTestFiles (downloaded only when needed)
+[packmol_exosome]
+git-tree-sha1 = "1d09e67cb02c3d8ef77d564352693e59f14a1610"
+lazy = true
+
+    [[packmol_exosome.download]]
+    url = "https://github.com/m3g/MolSimTestFiles/releases/download/packmol_exosome-v1/packmol_exosome.tar.gz"
+    sha256 = "d444c4f6c6e3626b4b37668644a1780b665730f6b292c22bcd5000f22b622dfe"
+
+# The lipid nanoparticle tutorial (5.6 million SIRAH particles), from https://github.com/m3g/MolSimTestFiles (downloaded only when needed)
+[packmol_lnp]
+git-tree-sha1 = "1ed88b3a03c8fad39df18205823c671c0e88fcab"
+lazy = true
+
+    [[packmol_lnp.download]]
+    url = "https://github.com/m3g/MolSimTestFiles/releases/download/packmol_lnp-v1/packmol_lnp.tar.gz"
+    sha256 = "55b140d7c184b8b1767689cea4a5cf4da87b407c161d7d42547d4cafa0afe12f"

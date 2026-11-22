@@ -1,0 +1,47 @@
+fail_fast: false
+
+default_install_hook_types:
+  - pre-commit
+  - post-checkout
+  - post-merge
+  - post-rewrite
+
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v5.0.0
+  hooks:
+    - id: check-merge-conflict
+
+- repo: https://github.com/abravalheri/validate-pyproject
+  rev: v0.24.1
+  hooks:
+    - id: validate-pyproject
+
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.11.7
+  hooks:
+    - id: ruff-format
+    - id: ruff
+      args: [--fix, --exit-non-zero-on-fix]
+      types_or: [python, pyi]
+      require_serial: true
+
+- repo: https://github.com/astral-sh/uv-pre-commit
+  # uv version.
+  rev: 0.6.1
+  hooks:
+    # Update the uv lockfile.
+    - id: uv-lock
+    # Synchronize the dependencies upon branch checkout, pull or rebase.
+    - id: uv-sync
+
+- repo: local
+  hooks:
+    - id: pyrefly
+      name: pyrefly type checker
+      entry: uv run pyrefly check
+      language: system
+      types: [python]
+      files: ^src/
+      pass_filenames: true
+      require_serial: true

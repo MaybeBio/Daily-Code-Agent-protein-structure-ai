@@ -1,0 +1,612 @@
+name: Scientific upgrade scoped checks
+on:
+  workflow_dispatch:
+    inputs:
+      check:
+        description: Run only the changed scientific program; native execution is explicit
+        type: choice
+        default: contracts
+        options:
+          [
+            contracts,
+            boltz-msa,
+            boltz-template,
+            boltz-runtime,
+            case-inputs,
+            result-completeness,
+            alignment-views,
+            structure-query-inputs,
+            binder-budget,
+            domain-inputs,
+            binder-runtime,
+            reviewed-view,
+            binder-quality,
+            native-sequence-views,
+            model-identity,
+            install-probe,
+            chemistry,
+            admet,
+            openmm,
+            apbs,
+            plip,
+            plip-lock,
+            chemprop,
+            property-review,
+            refinement-input,
+            refinement-preview,
+            ligandmpnn-input,
+            ligandmpnn-startup,
+            study-templates,
+            local-scope,
+            source-stereo,
+            simulation-lock,
+            simulation-native,
+            simulation-views,
+            all,
+          ]
+      runner:
+        description: Hosted Linux runner; native containers retain their fixed base images
+        type: choice
+        default: ubuntu-24.04
+        options: [ubuntu-24.04, ubuntu-22.04]
+  push:
+    paths:
+      - "src/opendde_workbench/integrations/**"
+      # Runtime location is covered with its direct consumers in native-container-checks.
+      - "!src/opendde_workbench/integrations/runtime.py"
+      - "src/opendde_workbench/deployment/native_readiness.py"
+      - "src/opendde_workbench/deployment/scientific_install.py"
+      - "src/opendde_workbench/deployment/scientific_cache.py"
+      - "tests/test_reinvent_scope.py"
+      - "tests/test_reinvent_origin.py"
+      - "tests/test_scientific_cache.py"
+      # Image composition is a native runtime contract; model execution stays opt-in.
+      - "tests/test_integrated_science.py"
+      - "tests/test_scientific_identity.py"
+      - "tests/test_scientific_entrypoint.py"
+      - "tests/test_native_lock_retention.py"
+      - "scripts/resolve-openfe-lock.py"
+      - "tests/test_apbs_protocol.py"
+      - "tests/test_plip_coordinates.py"
+      - "tests/test_plip_contacts.py"
+      - "server_tests/test_native_structure_format.py"
+      - "server_tests/test_native_stat6_plip.py"
+      - ".github/workflows/scientific-upgrade-checks.yml"
+permissions:
+  contents: read
+jobs:
+  install-probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'install-probe'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Changed installation probe, native admission and shared cleanup only
+        run: >-
+          uv run --locked pytest -q tests/test_install_probe_lifecycle.py
+          tests/test_scientific_entrypoint.py tests/test_scientific_cache.py
+          tests/test_native_container_cleanup.py
+      - name: Real offline native exit and removal on the locked official base; no models or science
+        env:
+          WB_TEST_NATIVE_INSTALL_PROBE: "1"
+        run: uv run --locked pytest -x -q server_tests/test_install_probe_native.py
+  model-identity:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'model-identity'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Exact model identity, native manifest guards and shared direct consumers
+        run: >-
+          uv run --locked --python 3.12 --with numpy==1.26.4 --with PyYAML==6.0.3
+          pytest -q tests/test_model_recipe_compatibility.py
+          tests/test_integrated_science.py tests/test_boltzgen_molecule_layout.py
+  native-sequence-views:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'native-sequence-views'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      WB_AUTO_DEPLOY: "0"
+      WB_BROWSER_URL: http://127.0.0.1:4330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev --group browser
+      - name: Restore the exact immutable native STAT6 study archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-native-sequences" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-native-sequences/state" >> "$GITHUB_ENV"
+          gh release download examples-v2 --repo "$GITHUB_REPOSITORY" --pattern stat6-reviewed-results-v30.zip --dir "$RUNNER_TEMP"
+      - name: Exact native sequence and original download verification in hosted Chromium
+        run: |
+          uv run --locked python server_tests/prepare_reviewed_stat6_cases.py "$RUNNER_TEMP/stat6-reviewed-results-v30.zip"
+          uv run --locked python -m playwright install --with-deps chromium
+          mkdir -p server_tests/evidence/native-surface-sequences
+          uv run --locked python -m opendde_workbench --port 4330 > server_tests/evidence/native-surface-sequences/service.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for n in $(seq 1 30); do curl --silent --fail "$WB_BROWSER_URL/api/health" > /dev/null && break; sleep 1; done
+          curl --silent --fail "$WB_BROWSER_URL/api/health" > /dev/null
+          uv run --locked pytest -x -q server_tests/test_native_surface_sequences_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-surface-sequence-browser-evidence
+          path: server_tests/evidence/native-surface-sequences
+          if-no-files-found: error
+  binder-quality:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'binder-quality'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Actual native rejection report, exact structure copies and existing result boundary
+        run: >-
+          uv run --locked pytest -q tests/test_binder_quality_report.py
+          tests/test_integrated_science.py tests/test_example_initial_candidate.py
+      - name: Exact bilingual quality, candidate switching and scientific result consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/BinderQuality.test.tsx
+          src/integrations/ScientificResults.test.tsx
+          src/integrations/ScientificResultsBinderColumn.test.tsx
+  reviewed-view:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'reviewed-view'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Guarded initial candidate and immutable example pointers
+        run: >-
+          uv run --locked pytest -q tests/test_example_initial_candidate.py tests/test_example_pins.py
+      - name: Exact reviewed selection, stage switching and example result consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/ScientificResults.test.tsx
+          src/examples/ExampleResultSet.test.tsx src/examples/ExampleJobResult.test.tsx
+          src/examples/ExampleActions.test.tsx
+          src/operations/CandidateSequenceResults.test.tsx
+          src/operations/HarnessResults.test.tsx src/presentation/SequenceTrack.test.tsx
+      - name: Fetch the exact immutable SH2 case archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          readarray -t source < <(uv run --locked python -c 'from opendde_workbench.examples.stat6_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          test "${source[0]}" = examples-v2
+          test "${source[1]}" = stat6-reviewed-results-v30.zip
+          gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+          echo "WB_REVIEWED_STAT6_ARCHIVE=$RUNNER_TEMP/${source[1]}" >> "$GITHUB_ENV"
+      - name: Real native case restore, unchanged original recipes and monomer replay
+        run: >-
+          uv run --locked pytest -q tests/test_reviewed_stat6_case_data.py
+          tests/test_stat6_recipe_replay.py
+  binder-runtime:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'binder-runtime'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Exact archive layout, native command dispatch and monomer template guidance
+        run: >-
+          uv run --locked --with PyYAML==6.0.3 pytest -q
+          tests/test_boltzgen_molecule_layout.py tests/test_integrated_science.py
+          tests/test_stat6_guidance.py tests/test_reviewed_sh2_inputs.py
+  domain-inputs:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'domain-inputs'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Exact derived SH2 inputs, immutable native parents and guarded pin consumers
+        run: >-
+          uv run --locked pytest -q tests/test_reviewed_sh2_inputs.py
+          tests/test_curated_native_case_inputs.py tests/test_example_native_lineage.py
+          tests/test_stat6_templates.py
+      - name: Exact native sequence-source ownership and detachment after editing
+        working-directory: frontend
+        run: npx vitest run src/examples/harness.test.ts
+  binder-budget:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'binder-budget'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Exact bounded design choices and existing submission consumer
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/ScientificChoices.test.tsx
+          src/integrations/ScientificReview.test.tsx
+          src/integrations/validation.test.ts src/integrations/ScientificForm.test.tsx
+  structure-query-inputs:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'structure-query-inputs'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Exact reference-domain selection and existing scientific input authority
+        run: >-
+          uv run --locked pytest -q tests/test_antibody_structure_query_input.py
+          tests/test_stat6_templates.py tests/test_stat6_guidance.py tests/test_capabilities.py
+          tests/test_harness_alignments.py tests/test_harness_standalone.py
+      - name: Actual native report formats, source structure and sequence-view consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/operations/SequenceSearchResults.test.tsx
+          src/operations/HarnessResults.test.tsx src/presentation/SequenceTrack.test.tsx
+  alignment-views:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'alignment-views'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Exact alignment bytes, task switching, retry and complete holdout rendering
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/alignment/alignment-data.test.ts
+          src/presentation/alignment/AlignmentResults.test.tsx
+          src/presentation/alignment/AlignmentCanvas.test.tsx
+          src/presentation/visual-export.test.ts
+          src/publication/FigureExport.test.tsx src/presentation/SequenceTrack.test.tsx
+          src/operations/TargetMsaResults.test.tsx
+          src/datasets/ModelValidationPlot.test.tsx
+          src/operations/HarnessResults.test.tsx
+          src/presentation/artifact-digest.test.ts
+  result-completeness:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'result-completeness'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Exact MSA output authority, standalone bridge and scored-case guidance
+        run: >-
+          uv run --locked pytest -q tests/test_harness_alignments.py
+          tests/test_harness_standalone.py tests/test_harness_sequences.py
+          tests/test_stat6_guidance.py tests/test_curated_native_case_inputs.py
+      - name: Complete heldout points, native lineage, cancellation and research downloads
+        working-directory: frontend
+        run: >-
+          npx vitest run src/datasets/FullHoldoutCharts.test.tsx
+          src/datasets/DatasetCharts.test.tsx src/datasets/ModelValidationPlot.test.tsx
+          src/datasets/chart-documents.test.ts src/operations/DesignLineagePlot.test.tsx
+          src/operations/HarnessResults.test.tsx src/presentation/artifact-digest.test.ts
+          src/presentation/research-files.test.tsx src/TaskDetail.test.tsx
+  case-inputs:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'case-inputs'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Exact reviewed input derivation, source integrity and shared template consumers
+        run: >-
+          uv run --locked pytest -q tests/test_curated_native_case_inputs.py
+          tests/test_stat6_templates.py tests/test_stat6_guidance.py
+          tests/test_stat6_prepared_handoff.py tests/test_stat6_preparation_presets.py
+      - name: Exact prepared-request authority in the frontend
+        working-directory: frontend
+        run: npx vitest run src/examples/stat6-harness.test.ts src/integrations/ScientificForm.test.tsx
+  boltz-msa:
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["boltz-msa","boltz-template","boltz-runtime"]'), inputs.check)
+    name: ${{ inputs.check }}
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Exact alignment admission, file/version authority and existing task envelope
+        if: inputs.check == 'boltz-msa'
+        run: >-
+          uv run --locked pytest -q tests/test_boltz_msa.py
+          tests/test_integrated_science.py
+          tests/test_research_assets.py
+          tests/test_property_model_context.py
+      - name: Changed guided inputs, cancellation and exact declared scientific files
+        if: inputs.check == 'boltz-msa'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/BoltzInputs.test.tsx
+          src/integrations/useBoltzMsa.test.ts
+          src/integrations/ScientificForm.test.tsx
+          src/integrations/validation.test.ts
+      - name: Exact template input ownership and direct shared-form consumers
+        if: inputs.check == 'boltz-template'
+        working-directory: frontend
+        run: npx vitest run src/integrations/ScientificForm.test.tsx
+      - name: Scientific alignment downloads and engineering-file isolation
+        if: inputs.check == 'boltz-runtime'
+        working-directory: frontend
+        run: npx vitest run src/TaskDetail.test.tsx src/presentation/research-files.test.tsx
+      - name: Exact provider CLI and CPU operators, without weights or optional CUDA kernels
+        if: inputs.check == 'boltz-runtime'
+        run: uv pip install --python .venv/bin/python boltz==2.2.1 torch==2.8.0 --torch-backend cpu
+      - name: Actual official CLI argument parsing and triangular operators only
+        if: inputs.check == 'boltz-runtime'
+        run: .venv/bin/python -m pytest -q server_tests/test_native_boltz_runtime.py
+      - name: Install only the official parser's dependencies, without model or GPU libraries
+        if: inputs.check == 'boltz-msa'
+        run: |
+          uv pip install --python .venv/bin/python --no-deps boltz==2.2.1
+          uv pip install --python .venv/bin/python numpy==1.26.4 pandas==2.2.3 mashumaro==3.14 rdkit==2026.3.6
+      - name: Unmodified Boltz 2.2.1 parser consumes the actual hashed snapshot and normalized transport
+        if: inputs.check == 'boltz-msa'
+        run: .venv/bin/python -m pytest -q server_tests/test_native_boltz_msa.py
+  local-scope:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'local-scope'
+    uses: ./.github/workflows/local-scope-checks.yml
+  study-templates:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'study-templates'
+    uses: ./.github/workflows/del-template-checks.yml
+  ligandmpnn-startup:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'ligandmpnn-startup'
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Related offline nonroot entrypoint contracts
+        run: uv run --locked pytest -q tests/test_scientific_entrypoint.py
+      - name: Exact managed LigandMPNN runtime; native help only, no models or science
+        env:
+          WB_TEST_NATIVE_LIGANDMPNN_STARTUP: "1"
+        run: uv run --locked pytest -x -q server_tests/test_ligandmpnn_startup.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ligandmpnn-native-startup
+          path: server_tests/evidence/ligandmpnn-startup
+          if-no-files-found: warn
+  ligandmpnn-input:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'ligandmpnn-input'
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Native startup permissions and exact prepared example handoff
+        run: >-
+          uv run --locked pytest -q tests/test_scientific_entrypoint.py
+          tests/test_stat6_prepared_handoff.py
+      - name: Real molecular parser preserves identifiers and rejects unresolved alternates
+        run: >-
+          uv run --no-project --python 3.10
+          --with pytest==9.1.1 --with numpy==1.26.4 --with biopython==1.88
+          python -m pytest -q server_tests/test_native_structure_format.py
+  plip-lock:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'plip-lock'
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve the missing mmCIF parser without changing existing native packages
+        run: python scripts/resolve-openfe-lock.py --program plip --preserve-existing
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plip-reviewed-lock
+          path: src/opendde_workbench/integrations/recipes/plip.conda.txt
+  simulations:
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["simulation-lock","simulation-native","simulation-views"]'), inputs.check)
+    uses: ./.github/workflows/simulation-checks.yml
+    with:
+      check: ${{ inputs.check == 'simulation-lock' && 'locks' || inputs.check == 'simulation-views' && 'md-views' || 'native' }}
+  property-model-review:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'property-review'
+    uses: ./.github/workflows/property-model-review-checks.yml
+    with:
+      runner: ${{ inputs.runner || 'ubuntu-24.04' }}
+  source-stereo:
+    if: github.event_name == 'workflow_dispatch' && inputs.check == 'source-stereo'
+    uses: ./.github/workflows/diffsbdd-source-stereo-checks.yml
+  refinement-input:
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["refinement-input","refinement-preview"]'), inputs.check)
+    uses: ./.github/workflows/refinement-input-checks.yml
+    with:
+      check: ${{ inputs.check == 'refinement-preview' && 'preview' || 'input' }}
+  contracts:
+    if: github.event_name != 'workflow_dispatch' || inputs.check == 'contracts' || inputs.check == 'all'
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: confidence_scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/prediction-workspace-scope.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Changed adapter and dispatch contracts only
+        if: steps.confidence_scope.outputs.boltz_confidence != 'true'
+        run: >-
+          uv run --locked pytest -q tests/test_integrated_science.py
+          tests/test_scientific_identity.py
+          tests/test_scientific_entrypoint.py
+          tests/test_native_lock_retention.py
+          tests/test_reinvent_origin.py tests/test_scientific_cache.py
+          tests/test_apbs_protocol.py
+          tests/test_plip_coordinates.py
+          tests/test_plip_contacts.py
+          tests/test_capabilities.py tests/test_operations.py
+      - name: Boltz confidence declarations and direct shared task consumers
+        if: steps.confidence_scope.outputs.boltz_confidence == 'true'
+        run: >-
+          uv run --locked pytest -q tests/test_integrated_science.py
+          tests/test_scientific_identity.py tests/test_scientific_entrypoint.py tests/test_boltz_msa.py
+      - name: Original molecular identities and bounded PDB transport with the real parser
+        if: steps.confidence_scope.outputs.boltz_confidence != 'true'
+        run: >-
+          uv run --no-project --python 3.10
+          --with pytest==9.1.1 --with numpy==1.26.4 --with biopython==1.88
+          python -m pytest -q server_tests/test_native_structure_format.py
+      - name: Exact chemical-core and declared attachment-site counterexamples
+        if: steps.confidence_scope.outputs.boltz_confidence != 'true'
+        run: uv run --locked --with rdkit==2026.3.6 pytest -q tests/test_reinvent_scope.py
+      - name: Native overlays and related preview contracts only
+        working-directory: frontend
+        run: npx vitest run src/integrations/validation.test.ts src/viewer/scientific-overlay.test.ts src/viewer/source-layout.test.ts src/viewer/StructureViewer.test.tsx src/studio/research-modules.test.ts
+  native-chemistry:
+    if: github.event_name == 'workflow_dispatch' && (inputs.check == 'chemistry' || inputs.check == 'all')
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Changed chemistry container through the actual queue and API
+        env:
+          WB_TEST_NATIVE_STATES: "1"
+        run: uv run --locked pytest -q server_tests/test_native_states.py
+  native-admet:
+    if: github.event_name == 'workflow_dispatch' && (inputs.check == 'admet' || inputs.check == 'all')
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Changed ADMET runtime with actual pretrained models and API
+        env:
+          WB_TEST_NATIVE_ADMET: "1"
+        run: uv run --locked pytest -q server_tests/test_native_admet.py
+  native-physics-and-contacts:
+    if: github.event_name == 'workflow_dispatch' && contains(fromJSON('["all","openmm","apbs","plip"]'), inputs.check)
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        program: ${{ fromJSON(inputs.check == 'all' && '["plip","apbs","openmm"]' || format('["{0}"]', inputs.check)) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Real public structure through the changed native program and API
+        env:
+          WB_TEST_INTEGRATED_NATIVE_CPU: "1"
+          WB_SCIENTIFIC_PROGRAM: ${{ matrix.program }}
+        run: >-
+          uv run --locked --with biopython==1.88 pytest -q
+          server_tests/test_integrated_native_cpu.py server_tests/test_native_stat6_plip.py
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.program == 'plip'
+        with:
+          name: stat6-plip-native-evidence
+          path: server_tests/evidence/stat6-plip/**
+  native-property-model:
+    if: github.event_name == 'workflow_dispatch' && (inputs.check == 'chemprop' || inputs.check == 'all')
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Experimental EGFR library through actual training and checkpoint reuse
+        env:
+          WB_TEST_NATIVE_PROPERTY_MODEL: "1"
+        run: uv run --locked pytest -q server_tests/test_native_property_model.py

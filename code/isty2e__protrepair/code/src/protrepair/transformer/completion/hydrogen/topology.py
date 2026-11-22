@@ -1,0 +1,142 @@
+"""Materialization of supported, already-present polymer hydrogen bonds."""
+
+from protrepair.chemistry.component.library import ComponentLibrary
+from protrepair.chemistry.microstate.context import PolymerMicrostateContext
+from protrepair.chemistry.microstate.preparation import AminoAcidPreparation
+from protrepair.diagnostics.events import RepairEvent, ValidationIssue
+from protrepair.diagnostics.kinds import (
+    IssueSeverity,
+    RepairEventKind,
+    ValidationIssueKind,
+)
+from protrepair.diagnostics.polymer_hydrogen import unresolved_fixed_hydrogen_issue
+from protrepair.structure.aggregate import ProteinStructure
+from protrepair.structure.labels import ResidueId
+from protrepair.structure.peptide import PEPTIDE_CAP_COMPONENT_IDS
+from protrepair.structure.topology import StructureTopology
+from protrepair.transformer.completion.hydrogen.linked_caps import (
+    publish_linked_cap_topology,
+)
+from protrepair.transformer.result import TransformationResult
+
+
+def resolve_fixed_hydrogen_topology(
+    structure: ProteinStructure,
+    component_library: ComponentLibrary,
+    *,
+    target_residue_ids: frozenset[ResidueId] | None = None,
+    observed_preparation: AminoAcidPreparation | None = None,
+) -> TransformationResult:
+    """Resolve fixed H and linked-cap bonds without changing atom payloads.
+
+    Parameters
+    ----------
+    structure : ProteinStructure
+        Current canonical structure and preserved source evidence.
+    component_library : ComponentLibrary
+        Component definitions used to interpret names and fixed H inventory.
+    target_residue_ids : frozenset[ResidueId] or None
+        Polymer residues to update; None selects all polymer residues.
+    observed_preparation : AminoAcidPreparation or None
+        Seed rebound to this exact snapshot and library without new requests.
+        Not acquired when no selected residue has H or a stock cap component.
+
+    Returns
+    -------
+    TransformationResult
+        Topology-only edits and residue-local diagnostics. Unresolved fixed
+        parents are excluded while independently known parents can be attached.
+        Coupled microstate sites retain their separate atomic
+        realization path; this operation neither selects nor changes protonation.
+    """
+    prepared: AminoAcidPreparation | None = None
+    updates = []
+    repairs = []
+    issues = []
+    for chain in structure.constitution.chains:
+        for residue in chain.residues:
+            if (
+                target_residue_ids is not None
+                and residue.residue_id not in target_residue_ids
+            ):
+                continue
+            has_hydrogens = any(atom.is_hydrogen() for atom in residue.atom_sites)
+            if (
+                not has_hydrogens
+                and residue.component_id not in PEPTIDE_CAP_COMPONENT_IDS
+            ):
+                continue
+            if prepared is None:
+                prepared = (
+                    AminoAcidPreparation(
+                        PolymerMicrostateContext(structure), component_library
+                    )
+                    if observed_preparation is None
+                    else observed_preparation.for_inputs(structure, component_library)
+                )
+            cap = prepared.linked_peptide_cap(residue.residue_id)
+            if cap is not None:
+                result = publish_linked_cap_topology(structure, cap)
+                repairs.extend(result.repairs)
+                issues.extend(result.issues)
+                if result.structure is not structure:
+                    structure = result.structure
+                    prepared = prepared.for_inputs(structure, component_library)
+                continue
+            if not has_hydrogens:
+                continue
+            try:
+                issue = unresolved_fixed_hydrogen_issue(prepared, residue.residue_id)
+                if issue is not None:
+                    issues.append(issue)
+                bonds = prepared.fixed_hydrogen_topology_updates(residue.residue_id)
+            except ValueError as error:
+                issues.append(
+                    ValidationIssue.for_residue(
+                        kind=ValidationIssueKind.UNSUPPORTED_HYDROGENATION,
+                        severity=IssueSeverity.WARNING,
+                        message=f"Preserved H topology was not resolved: {error}",
+                        residue_id=residue.residue_id,
+                        component_id=residue.component_id,
+                    )
+                )
+                continue
+            if not bonds:
+                continue
+            updates.extend(bonds)
+            repairs.append(
+                RepairEvent.for_residue(
+                    kind=RepairEventKind.HYDROGEN_TOPOLOGY_RESOLVED,
+                    residue_id=residue.residue_id,
+                    component_id=residue.component_id,
+                    atom_names=tuple(
+                        structure.constitution.atom_ref_at(index).atom_name
+                        for bond in bonds
+                        for index in bond.endpoint_pair()
+                        if structure.constitution.atom_site_at(index).is_hydrogen()
+                    ),
+                )
+            )
+    if not updates:
+        return TransformationResult(
+            structure, repairs=tuple(repairs), issues=tuple(issues)
+        )
+
+    bonds_by_pair = {bond.endpoint_pair(): bond for bond in structure.topology.bonds}
+    bonds_by_pair.update((bond.endpoint_pair(), bond) for bond in updates)
+    topology = StructureTopology(
+        constitution=structure.constitution,
+        atom_topologies=structure.topology.atom_topologies,
+        bonds=tuple(bonds_by_pair.values()),
+    )
+    return TransformationResult(
+        structure=ProteinStructure.from_payload(
+            constitution=structure.constitution,
+            geometry=structure.geometry,
+            topology=topology,
+            polymer_blueprint=structure.polymer_blueprint,
+            provenance=structure.provenance,
+        ),
+        repairs=tuple(repairs),
+        issues=tuple(issues),
+    )

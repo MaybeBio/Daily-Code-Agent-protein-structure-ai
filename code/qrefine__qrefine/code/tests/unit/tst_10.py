@@ -1,0 +1,127 @@
+from __future__ import division
+from __future__ import print_function
+from __future__ import absolute_import
+
+import os
+import random
+import iotbx.pdb
+import mmtbx.command_line
+import libtbx.load_env
+from scitbx.array_family import flex
+from qrefine.cluster_restraints import from_cluster
+from qrefine.restraints import from_qm, from_cctbx
+from qrefine.fragment import fragments
+from qrefine.clustering import betweenness_centrality_clustering
+from libtbx.utils import null_out
+
+import mmtbx.monomer_library.server
+import mmtbx.monomer_library.pdb_interpretation
+import mmtbx.restraints
+from mmtbx import monomer_library
+from qrefine.command_line import granalyse
+
+qrefine = libtbx.env.find_in_repositories("qrefine")
+qr_unit_tests = os.path.join(qrefine, "tests","unit")
+
+# fix random seed in this script
+random.seed(0)
+flex.set_random_seed(0)
+
+
+master_params_str ="""
+method = *multiprocessing pbs sge lsf threading
+.type = choice(multi=False)
+nproc = 1
+.type = int
+qsub_command = None
+.type = str
+"""
+
+def get_master_phil():
+  return mmtbx.command_line.generate_master_phil_with_inputs(
+    phil_string=master_params_str)
+
+def get_model():
+  file_name = os.path.join(qr_unit_tests,"data_files","helix.pdb")
+  pdb_inp = iotbx.pdb.input(file_name=file_name)
+  h = pdb_inp.construct_hierarchy()
+  #
+  mon_lib_srv = mmtbx.monomer_library.server.server()
+  ener_lib    = mmtbx.monomer_library.server.ener_lib(
+    use_neutron_distances = True)
+  #
+  params = mmtbx.monomer_library.pdb_interpretation.master_params.extract()
+  params.use_neutron_distances = True
+  params.restraints_library.cdl = False
+  params.sort_atoms = False
+  processed_pdb_file = mmtbx.monomer_library.pdb_interpretation.process(
+    mon_lib_srv              = mon_lib_srv,
+    ener_lib                 = ener_lib,
+    params                   = params,
+    pdb_hierarchy            = h,
+    strict_conflict_handling = False,
+    crystal_symmetry         = pdb_inp.crystal_symmetry(),
+    force_symmetry           = True,
+    log                      = null_out())
+  xrs = processed_pdb_file.xray_structure()
+  sctr_keys = xrs.scattering_type_registry().type_count_dict().keys()
+  has_hd = "H" in sctr_keys or "D" in sctr_keys
+  geometry = processed_pdb_file.geometry_restraints_manager(
+    show_energies                = False,
+    assume_hydrogens_all_missing = not has_hd,
+    plain_pairs_radius           = 5.0)
+  return mmtbx.restraints.manager(
+     geometry = geometry, normalization = False), pdb_inp.crystal_symmetry(),h
+
+def run(prefix = "qrefine_"+os.path.basename(__file__).replace(".py","")):
+  """
+  Exercise combined energy and gradients from cluster qm.
+  """
+  os.makedirs(prefix, exist_ok=True)
+  os.chdir(prefix)
+  #
+  for restraints in ["cctbx","qm"]:
+    result = []
+    for clustering in [True, False]:
+      rm, cs, h = get_model()
+      if(restraints=="qm"):
+        fq = from_qm(
+          pdb_hierarchy    = h,
+          qm_engine_name   = "mopac",
+          method           = "PM3",
+          crystal_symmetry = cs,
+          clustering       = clustering,
+          file_name        = "./ase/tmp_ase.pdb")
+      else:
+        fq = from_cctbx(restraints_manager = rm)
+      if(clustering):
+        fm = fragments(
+          working_folder             = os.path.split("./ase/tmp_ase.pdb")[0]+ "/",
+          clustering_method          = betweenness_centrality_clustering,
+          maxnum_residues_in_cluster = 3, # 2: one nonbonded term escapes a buffer
+          charge_embedding           = False,
+          two_buffers                = False,
+          pdb_hierarchy              = h.deep_copy(), # deep copy just in case
+          qm_engine_name             = "mopac",
+          crystal_symmetry           = cs)
+        fragment_sizes = [f.iselection().size() for f in fm.fragment_selections]
+        fragment_sizes.sort()
+        assert fragment_sizes == [50, 51, 64, 65, 77], fragment_sizes
+        fc = from_cluster(
+          restraints_manager = fq,
+          fragment_manager   = fm,
+          parallel_params    = get_master_phil().extract())
+      else:
+        fc = fq
+      energy, gradients = fc.target_and_gradients(sites_cart=h.atoms().extract_xyz())
+      result.append(gradients.deep_copy())
+    #
+    d = max(granalyse.get_grad_wdelta(ref=result[0], g=result[1]))
+    print("get_grad_wdelta:", d)
+    if(restraints=="cctbx"):
+      assert d < 1.e-9
+    else:
+      assert d < 0.5
+
+if(__name__ == "__main__"):
+  run()

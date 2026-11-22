@@ -1,0 +1,2446 @@
+import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
+import {
+  ALL_COMMANDS,
+  COMMAND_BY_ID,
+  SECTION_LABELS,
+  SECTION_ORDER,
+  ScriptBranch,
+  ScriptModel,
+  ScriptStep,
+  ScriptTab,
+  ScriptWorkspace,
+  defaultParams,
+  emptyScriptModel,
+  newTabId,
+  ParamDef,
+} from '../../lammps/catalog';
+import {
+  generateScript, deriveFlowchart, FlowGraph, resolvePath,
+  skippedTrunkUids, sortStepsBySection, isSectionSorted, branchesOf, missingParams,
+} from '../../lammps/generator';
+import {
+  addBranch, takeBranchAtFork, promoteBranch, removeBranch, updateBranch,
+  branchesByFork, findLane, laneSteps, appendToLane, insertStepAtPathIndex,
+  findStepInModel, canForkAfter,
+  moveStepToPathIndex, moveStepInModel, removeStepFromModel,
+  duplicateStepInModel, updateStepInModel, updateParamInModel, freshUid,
+} from '../../lammps/model';
+import { validateScript, Diagnostic, diagnosticCounts } from '../../lammps/validate';
+import { loadPotentialIndex, pairStyleWords, type PotentialIndex } from '../../lammps/potentialIndex';
+import { PotentialPicker } from './builder/PotentialPicker';
+import { parseScript, ImportResult } from '../../lammps/scriptParser';
+import { isLammpsScript, scriptTitle } from '../../lammps/scriptDetect';
+import { FILESTORE_EVENT } from '../../services/fileStoreEvent';
+import type { BuilderIncoming } from '../../lammps/notebookBridge';
+import { downloadTextFile } from '../../lammps/exporter';
+import { SCRIPT_TEMPLATES, buildTemplate } from '../../lammps/templates';
+import { downloadFlowchart } from '../../lammps/flowchartSvg';
+import { useUndoableState } from '../../hooks/useUndoableState';
+import { browserStore, loadJson, saveJson } from '../../services/persistence';
+import { getThemeTokens, isDarkTheme, ThemeTokens, Theme } from '../../theme';
+import {
+  Plus, Trash2, Copy, Download, Eye, EyeOff, Upload,
+  FileCode2, Workflow, ChevronDown, ChevronRight, ChevronUp, ChevronLeft, Search,
+  Atom as AtomIcon, PencilLine, X, GripVertical, Link2, Undo2, Redo2,
+  LayoutTemplate, ZoomIn, ZoomOut, Maximize2, FileInput, ImageDown, FileImage,
+  GitBranch, Split, ArrowDownUp, AlertTriangle, ShieldCheck, Check, CornerDownRight, NotebookPen,
+} from 'lucide-react';
+
+interface ScriptBuilderProps {
+  theme: Theme;
+  onOpenViewer?: () => void;
+  /** Sends the current script to the MD Notebook. */
+  onRunInNotebook?: (script: string) => void;
+  /** A script sent from the MD Notebook, imported as a new tab once. */
+  incoming?: BuilderIncoming | null;
+  onIncomingTaken?: () => void;
+}
+
+let uidCounter = 1;
+const newUid = () => `step-${uidCounter++}`;
+
+/** Merge a stored payload onto fresh defaults; drop unknown commands. */
+const reviveSteps = (raw: unknown): ScriptStep[] => {
+  const steps: ScriptStep[] = [];
+  if (!Array.isArray(raw)) return steps;
+  for (const s of raw) {
+    if (!s || typeof s !== 'object') continue;
+    const rec = s as Partial<ScriptStep>;
+    const def = rec.defId ? COMMAND_BY_ID[rec.defId] : undefined;
+    if (!def) continue;
+    steps.push({
+      uid: typeof rec.uid === 'string' ? rec.uid : newUid(),
+      defId: def.id,
+      params: { ...defaultParams(def), ...(rec.params ?? {}) },
+      enabled: rec.enabled !== false,
+      note: typeof rec.note === 'string' ? rec.note : undefined,
+    });
+  }
+  return steps;
+};
+
+const reviveModel = (raw: unknown): ScriptModel | null => {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const r = raw as Partial<ScriptModel>;
+  if (!Array.isArray(r.steps)) return null;
+  const steps = reviveSteps(r.steps);
+  const branches: ScriptBranch[] = [];
+  if (Array.isArray(r.branches)) {
+    for (const raw of r.branches) {
+      if (!raw || typeof raw !== 'object') continue;
+      const b = raw as Partial<ScriptBranch>;
+      if (typeof b.id !== 'string') continue;
+      branches.push({
+        id: b.id,
+        label: typeof b.label === 'string' ? b.label : 'Concept',
+        forkAfter: typeof b.forkAfter === 'string' ? b.forkAfter : null,
+        steps: reviveSteps(b.steps),
+        rejoin: b.rejoin === true,
+        note: typeof b.note === 'string' ? b.note : undefined,
+      });
+    }
+  }
+  // Re-anchor or drop branches whose fork step no longer exists. A stored
+  // workspace can outlive the step it forked after — the step may have been
+  // deleted in a build that did not re-anchor, or dropped here because its
+  // command id is gone. An orphan branch can never be spliced in, so it would
+  // sit in the Concepts bar doing nothing.
+  const stepUids = new Set(steps.map(st => st.uid));
+  const anchored = branches.filter(
+    b => b.forkAfter === null || stepUids.has(b.forkAfter),
+  );
+
+  const knownBranchIds = new Set(anchored.map(b => b.id));
+  // At most one branch may be taken per fork point.
+  const seenForks = new Set<string>();
+  const activeBranchIds = (Array.isArray(r.activeBranchIds) ? r.activeBranchIds : [])
+    .filter((id): id is string => typeof id === 'string' && knownBranchIds.has(id))
+    .filter(id => {
+      const fork = anchored.find(b => b.id === id)!.forkAfter ?? '__start__';
+      if (seenForks.has(fork)) return false;
+      seenForks.add(fork);
+      return true;
+    });
+
+  return {
+    title: typeof r.title === 'string' ? r.title : 'My LAMMPS Simulation',
+    steps,
+    branches: anchored.length > 0 ? anchored : undefined,
+    activeBranchIds: activeBranchIds.length > 0 ? activeBranchIds : undefined,
+    manualText: typeof r.manualText === 'string' ? r.manualText : undefined,
+    manualBase: typeof r.manualBase === 'string' ? r.manualBase : undefined,
+  };
+};
+
+const WORKSPACE_KEY = 'm3d.scriptTabs.v1';
+const LEGACY_MODEL_KEY = 'm3d.scriptModel.v1';
+
+const DEFAULT_MODEL: ScriptModel = emptyScriptModel('My LAMMPS Simulation');
+
+/** Revive the multi-tab workspace; migrate the legacy single-model key. */
+const reviveWorkspace = (raw: unknown): ScriptWorkspace | null => {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const r = raw as Partial<ScriptWorkspace>;
+  if (!Array.isArray(r.tabs) || r.tabs.length === 0) return null;
+  const tabs: ScriptTab[] = [];
+  for (const t of r.tabs) {
+    if (!t || typeof t !== 'object') continue;
+    const rec = t as Partial<ScriptTab>;
+    const model = reviveModel(rec.model);
+    if (!model) continue;
+    tabs.push({ id: typeof rec.id === 'string' ? rec.id : newTabId(), model });
+  }
+  if (tabs.length === 0) return null;
+  const activeId =
+    typeof r.activeId === 'string' && tabs.some(t => t.id === r.activeId)
+      ? r.activeId
+      : tabs[0].id;
+  return { tabs, activeId };
+};
+
+const loadWorkspace = (): ScriptWorkspace => {
+  const stored = reviveWorkspace(loadJson(browserStore(), WORKSPACE_KEY));
+  if (stored) return stored;
+  // Migrate the pre-tabs single model so nobody loses work on upgrade.
+  const legacy = reviveModel(loadJson(browserStore(), LEGACY_MODEL_KEY));
+  const first: ScriptTab = {
+    id: newTabId(),
+    model: legacy ?? { title: 'My LAMMPS Simulation', steps: [] },
+  };
+  return { tabs: [first], activeId: first.id };
+};
+/**
+ * Zoom floor. 0.35 was too high for "Fit" to mean anything: an 18-step
+ * pipeline is ~2800px tall, so fitting it into a 540px canvas needs ~0.19x.
+ * At 0.15x the cards read as shapes rather than text, which is exactly what a
+ * bird's-eye overview of a long pipeline is for.
+ */
+const ZOOM_MIN = 0.15;
+const ZOOM_MAX = 2.5;
+
+interface Transform {
+  x: number;
+  y: number;
+  k: number;
+}
+
+const ScriptBuilder: React.FC<ScriptBuilderProps> = ({ theme, onOpenViewer, onRunInNotebook, incoming = null, onIncomingTaken }) => {
+  const ct = getThemeTokens(theme);
+  // Undoable WORKSPACE (multi-tab); persists to localStorage for durability.
+  const [workspace, setWorkspace, replaceWorkspace, undo, redo, canUndo, canRedo] = (() => {
+    const api = useUndoableState<ScriptWorkspace>(loadWorkspace);
+    return [api.value, api.set, api.replace, api.undo, api.redo, api.canUndo, api.canRedo] as const;
+  })();
+
+  const activeTab: ScriptTab =
+    workspace.tabs.find(t => t.id === workspace.activeId) ?? workspace.tabs[0];
+  const model = activeTab.model;
+
+  /** Update the ACTIVE tab's model (pushes undo history). */
+  const setModel = useCallback(
+    (next: ScriptModel | ((prev: ScriptModel) => ScriptModel)) => {
+      setWorkspace(ws => ({
+        ...ws,
+        tabs: ws.tabs.map(t =>
+          t.id === ws.activeId
+            ? { ...t, model: typeof next === 'function' ? next(t.model) : next }
+            : t
+        ),
+      }));
+    },
+    [setWorkspace],
+  );
+
+  /** Switch tabs WITHOUT pushing undo history. */
+  const switchTab = useCallback(
+    (id: string) => {
+      setEdgeMenuIndex(null); // a menu left open must not retarget the new tab
+      replaceWorkspace(ws => ({ ...ws, activeId: id }));
+    },
+    [replaceWorkspace],
+  );
+
+  const addTab = useCallback(() => {
+    const tab: ScriptTab = { id: newTabId(), model: emptyScriptModel(`Untitled ${workspace.tabs.length + 1}`) };
+    setWorkspace(ws => ({ tabs: [...ws.tabs, tab], activeId: tab.id }));
+  }, [setWorkspace, workspace.tabs.length]);
+
+  const closeTab = useCallback(
+    (id: string) => {
+      setWorkspace(ws => {
+        const idx = ws.tabs.findIndex(t => t.id === id);
+        if (idx < 0) return ws;
+        const tabs = ws.tabs.filter(t => t.id !== id);
+        if (tabs.length === 0) {
+          const fresh: ScriptTab = { id: newTabId(), model: emptyScriptModel('Untitled') };
+          return { tabs: [fresh], activeId: fresh.id };
+        }
+        const activeId = id === ws.activeId ? tabs[Math.min(idx, tabs.length - 1)].id : ws.activeId;
+        return { tabs, activeId };
+      });
+    },
+    [setWorkspace],
+  );
+
+  /** Clear the ACTIVE flowchart (undoable). */
+  const clearActive = useCallback(() => {
+    setModel(prev => ({ ...prev, steps: [], manualText: undefined, manualBase: undefined }));
+    setSelectedUid(null);
+    setImportStats(null);
+  }, [setModel]);
+  const [templatesOpen, setTemplatesOpen] = useState(false);
+  const [selectedUid, setSelectedUid] = useState<string | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth >= 768 : true);
+  const [view, setView] = useState<'flow' | 'script'>('flow');
+  const [search, setSearch] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  // Script import (in.* → flowchart)
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const [importStats, setImportStats] = useState<ImportResult['stats'] | null>(null);
+  const [exporting, setExporting] = useState<'svg' | 'png' | null>(null);
+
+  const exportFlowchart = useCallback(async (format: 'svg' | 'png') => {
+    setExporting(format);
+    try {
+      await downloadFlowchart(model, format, { theme: isDarkTheme(theme) ? 'dark' : 'light' });
+    } catch {
+      /* download failed — non-fatal */
+    } finally {
+      setExporting(null);
+    }
+  }, [model, theme]);
+
+  // Pointer drag-to-reorder (grab a card, drop between two others)
+  const [drag, setDrag] = useState<{ uid: string; label: string; x: number; y: number } | null>(null);
+  const [overIndex, setOverIndex] = useState<number | null>(null);
+  const nodeRefs = useRef<Map<string, HTMLElement>>(new Map());
+  const dragState = useRef<{ uid: string; startX: number; startY: number; active: boolean } | null>(null);
+
+  // Flowchart canvas pan/zoom
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [viewTf, setViewTf] = useState<Transform>({ x: 0, y: 0, k: 1 });
+  /**
+   * Width of the flowchart column: 640px, or the canvas width on a phone. A
+   * fixed 640px column had to be scaled to ~0.5 to fit 360px, which shrank
+   * every card button below the 24px WCAG 2.5.8 target size.
+   */
+  const [columnWidth, setColumnWidth] = useState(640);
+  /** Cleared the first time the user pans or zooms, so auto-centring stops. */
+  const viewUntouched = useRef(true);
+  const panRef = useRef<{ startX: number; startY: number; ox: number; oy: number } | null>(null);
+  const [panning, setPanning] = useState(false);
+
+  // Connection-editing menu + insert-at-edge picker
+  const [edgeMenuIndex, setEdgeMenuIndex] = useState<number | null>(null);
+  const [insertAt, setInsertAt] = useState<number | null>(null);
+  const [insertSearch, setInsertSearch] = useState('');
+
+  // Outside-click + focus management. The refs cover each open menu's
+  // CONTAINER (toggle button included, so pressing the toggle still reaches
+  // its own onClick and toggles) and the insert dialog's opener.
+  const templatesMenuRef = useRef<HTMLDivElement>(null);
+  const edgePillRefs = useRef<Map<number, HTMLButtonElement>>(new Map());
+  const edgeMenuRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const insertDialogRef = useRef<HTMLDivElement>(null);
+  const insertReturnFocusRef = useRef<HTMLElement | null>(null);
+  const registerEdgePillRef = useCallback((i: number, el: HTMLButtonElement | null) => {
+    if (el) edgePillRefs.current.set(i, el);
+    else edgePillRefs.current.delete(i);
+  }, []);
+  const registerEdgeMenuRef = useCallback((i: number, el: HTMLDivElement | null) => {
+    if (el) edgeMenuRefs.current.set(i, el);
+    else edgeMenuRefs.current.delete(i);
+  }, []);
+
+  /** Close the insert dialog and hand focus back to the element that opened it. */
+  const closeInsertAt = useCallback(() => {
+    setInsertAt(null);
+    const opener = insertReturnFocusRef.current;
+    insertReturnFocusRef.current = null;
+    opener?.focus();
+  }, []);
+
+  /** Escape closes the dialog even from its input; Tab cycles inside it. */
+  const onInsertDialogKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeInsertAt();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    const container = insertDialogRef.current;
+    if (!container) return;
+    const focusables = Array.from(
+      container.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    if (focusables.length === 0) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    const outside = !active || !container.contains(active);
+    if (e.shiftKey ? outside || active === first : outside || active === last) {
+      e.preventDefault();
+      (e.shiftKey ? last : first).focus();
+    }
+  }, [closeInsertAt]);
+
+  // Mobile: palette/editor become overlay drawers
+  const [isMobile, setIsMobile] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth < 768 : false);
+  // Below lg the step editor is an overlay drawer too: as a fixed 320 px column
+  // next to the 288 px palette it left the flowchart 160 px at 768 px (tablet).
+  const [editorOverlay, setEditorOverlay] = useState(() =>
+    typeof window !== 'undefined' ? window.innerWidth < 1024 : false);
+  const [editorOpenMobile, setEditorOpenMobile] = useState(false);
+  useEffect(() => {
+    // Crossing into phone width (e.g. a desktop window narrowed or a tablet
+    // rotated) must close the palette drawer: it was opened at desktop width,
+    // and its full-screen backdrop otherwise covers the whole toolbar, so
+    // "Run in Notebook" and the rest cannot be clicked. Only the flip
+    // desktop -> phone closes it, so mobile address-bar resizes do not.
+    const check = () => {
+      const mobile = window.innerWidth < 768;
+      setIsMobile(prev => {
+        if (mobile && !prev) setPaletteOpen(false);
+        return mobile;
+      });
+      setEditorOverlay(window.innerWidth < 1024);
+    };
+    check();
+    window.addEventListener('resize', check);
+    return () => window.removeEventListener('resize', check);
+  }, []);
+  // Close the mobile editor drawer whenever no step is selected
+  useEffect(() => {
+    if (!selectedUid) setEditorOpenMobile(false);
+  }, [selectedUid]);
+
+  // Close the templates menu and any connection menu on a pointer press
+  // outside them. Listener is document-level so it also fires when the press
+  // lands on the canvas or another card.
+  useEffect(() => {
+    if (!templatesOpen && edgeMenuIndex === null) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node | null;
+      if (
+        templatesOpen && templatesMenuRef.current &&
+        (!target || !templatesMenuRef.current.contains(target))
+      ) {
+        setTemplatesOpen(false);
+      }
+      if (edgeMenuIndex !== null) {
+        const pill = edgePillRefs.current.get(edgeMenuIndex);
+        const menu = edgeMenuRefs.current.get(edgeMenuIndex);
+        const inside = (el?: Element) => !!el && !!target && el.contains(target);
+        if (!inside(pill) && !inside(menu)) setEdgeMenuIndex(null);
+      }
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => document.removeEventListener('pointerdown', onPointerDown);
+  }, [templatesOpen, edgeMenuIndex]);
+
+  const isManual = model.manualText !== undefined;
+  const manualStale =
+    isManual && model.manualBase !== undefined && JSON.stringify(model.steps) !== model.manualBase;
+
+  const generated = useMemo(() => generateScript(model), [model]);
+  const flow = useMemo(() => deriveFlowchart(model), [model]);
+  /** Steps along the CURRENTLY TAKEN path — what the flowchart renders. */
+  const pathSteps = useMemo(() => resolvePath(model).map(r => r.step), [model]);
+  /** Trunk steps a divergent branch cut off (rendered ghosted). */
+  const ghostedUids = useMemo(() => skippedTrunkUids(model), [model]);
+  const forkMap = useMemo(() => branchesByFork(model), [model]);
+  const hasBranches = (model.branches?.length ?? 0) > 0;
+  const activeBranches = useMemo(
+    () => branchesOf(model).filter(b => (model.activeBranchIds ?? []).includes(b.id)),
+    [model],
+  );
+  const sectionSorted = useMemo(() => isSectionSorted(model.steps), [model.steps]);
+
+  /** The text currently shown/copied/downloaded. */
+  const activeText = isManual ? (model.manualText ?? '') : generated.text;
+
+  /** The LAMMPS potential library index, once loaded (the lint's units rule and the file picker use it). */
+  const [potentialIndex, setPotentialIndex] = useState<PotentialIndex | null>(null);
+  useEffect(() => {
+    let live = true;
+    loadPotentialIndex()
+      .then((i) => { if (live) setPotentialIndex(i); })
+      .catch(() => { /* offline or missing: the lint runs without the library */ });
+    return () => { live = false; };
+  }, []);
+
+  /** Doc-grounded LAMMPS lint over the EXACT text the user will run. */
+  const diagnostics = useMemo<Diagnostic[]>(() => {
+    try {
+      return validateScript(activeText, { potentials: potentialIndex });
+    } catch {
+      return [];
+    }
+  }, [activeText, potentialIndex]);
+  const lintCounts = useMemo(() => diagnosticCounts(diagnostics), [diagnostics]);
+  const [lintOpen, setLintOpen] = useState(false);
+
+  // Persist the workspace whenever it changes (history itself is in-memory).
+  useEffect(() => {
+    saveJson(browserStore(), WORKSPACE_KEY, workspace);
+  }, [workspace]);
+
+  // The builder's keyboard layer lives further down, after the view and
+  // branch callbacks it drives, so their consts are initialised by the time
+  // its dependency array is evaluated.
+  const removeStepRef = useRef<(uid: string) => void>(() => {});
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  // ---- model mutations (lane-aware: trunk OR the branch that owns the step) --
+  const insertStepAt = useCallback((defId: string, index: number) => {
+    const def = COMMAND_BY_ID[defId];
+    if (!def) return;
+    const step: ScriptStep = {
+      uid: newUid(), defId, params: defaultParams(def), enabled: true,
+    };
+    setModel(prev => insertStepAtPathIndex(prev, step, index));
+    setSelectedUid(step.uid);
+  }, [setModel]);
+
+  /**
+   * Palette add. Lands in the lane the user is currently working in (the
+   * selected step's lane, else the trunk), grouped after the last step of the
+   * same section.
+   */
+  const addStep = useCallback((defId: string) => {
+    const def = COMMAND_BY_ID[defId];
+    if (!def) return;
+    const step: ScriptStep = {
+      uid: newUid(), defId, params: defaultParams(def), enabled: true,
+    };
+    setModel(prev => {
+      const lane = selectedUid ? findLane(prev, selectedUid) ?? null : null;
+      return appendToLane(prev, lane, step);
+    });
+    setSelectedUid(step.uid);
+  }, [setModel, selectedUid]);
+
+  const updateStep = useCallback((uid: string, patch: Partial<ScriptStep>) => {
+    setModel(prev => updateStepInModel(prev, uid, patch));
+  }, [setModel]);
+
+  const updateParam = useCallback((uid: string, key: string, value: string) => {
+    setModel(prev => updateParamInModel(prev, uid, key, value));
+  }, [setModel]);
+
+  const removeStep = useCallback((uid: string) => {
+    setModel(prev => removeStepFromModel(prev, uid));
+    setSelectedUid(prev => (prev === uid ? null : prev));
+    setEdgeMenuIndex(null);
+  }, [setModel]);
+  removeStepRef.current = removeStep;
+
+  /** Chevron move: swap with the neighbour inside the owning lane. */
+  const moveStep = useCallback((uid: string, dir: -1 | 1) => {
+    setModel(prev => moveStepInModel(prev, uid, dir));
+  }, [setModel]);
+
+  /** Move a dragged step so that it lands at insertion position `toIndex`. */
+  const moveStepToIndex = useCallback((uid: string, toIndex: number) => {
+    setModel(prev => moveStepToPathIndex(prev, uid, toIndex));
+  }, [setModel]);
+
+  /** Duplicate a step (same command + params) right below it. */
+  const duplicateStep = useCallback((uid: string) => {
+    setModel(prev => duplicateStepInModel(prev, uid));
+  }, [setModel]);
+
+  /** Physically reorder the trunk into canonical section order. */
+  const sortBySection = useCallback(() => {
+    setModel(prev => ({ ...prev, steps: sortStepsBySection(prev.steps) }));
+  }, [setModel]);
+
+  // ---- branching --------------------------------------------------------
+  const forkHere = useCallback((afterUid: string | null) => {
+    // A concept may only be anchored to the start or a TRUNK step: addBranch
+    // resolves the fork against the trunk, so a branch uid would create a
+    // concept nothing can ever display.
+    if (!canForkAfter(model, afterUid)) return;
+    setModel(prev => addBranch(prev, afterUid).model);
+  }, [setModel, model]);
+
+  const forkHereEmpty = useCallback((afterUid: string | null) => {
+    setModel(prev => addBranch(prev, afterUid, { seed: 'empty' }).model);
+  }, [setModel]);
+
+  const chooseBranch = useCallback((forkAfter: string | null, branchId: string | null) => {
+    setModel(prev => takeBranchAtFork(prev, forkAfter, branchId));
+    setSelectedUid(null);
+    setEdgeMenuIndex(null);
+  }, [setModel]);
+
+  const renameBranch = useCallback((branchId: string, label: string) => {
+    setModel(prev => updateBranch(prev, branchId, { label }));
+  }, [setModel]);
+
+  const setBranchRejoin = useCallback((branchId: string, rejoin: boolean) => {
+    setModel(prev => updateBranch(prev, branchId, { rejoin }));
+  }, [setModel]);
+
+  const dropBranch = useCallback((branchId: string) => {
+    setModel(prev => removeBranch(prev, branchId));
+    setSelectedUid(null);
+  }, [setModel]);
+
+  const makeBranchMain = useCallback((branchId: string) => {
+    setModel(prev => promoteBranch(prev, branchId));
+    setSelectedUid(null);
+  }, [setModel]);
+
+  /** Copy the taken path of this flowchart into a brand-new tab. */
+  const branchToNewTab = useCallback((branchId: string) => {
+    setWorkspace(ws => {
+      const current = ws.tabs.find(t => t.id === ws.activeId);
+      if (!current) return ws;
+      const branch = branchesOf(current.model).find(b => b.id === branchId);
+      if (!branch) return ws;
+      const taken = takeBranchAtFork(current.model, branch.forkAfter, branch.id);
+      const flat: ScriptModel = {
+        title: `${current.model.title || 'Untitled'} — ${branch.label}`,
+        steps: resolvePath(taken).map(r => ({
+          ...r.step, uid: freshUid(), params: { ...r.step.params },
+        })),
+      };
+      const tab: ScriptTab = { id: newTabId(), model: flat };
+      return { tabs: [...ws.tabs, tab], activeId: tab.id };
+    });
+  }, [setWorkspace]);
+
+  // ---- script import ----------------------------------------------------
+  const handleImportFile = useCallback((file: File) => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      const text = (e.target?.result as string) ?? '';
+      const result = parseScript(text, scriptTitle(file.name));
+      setModel(result.model);
+      setImportStats(result.stats);
+      setSelectedUid(null);
+      setView('flow');
+    };
+    reader.readAsText(file);
+  }, [setModel]);
+
+  // ---- drag and drop: every dropped file is kept in browser storage (the MD Notebook reads it by name in read_data,
+  // include, pair_coeff), and each LAMMPS script also opens as a NEW tab (the open tabs are kept) ----
+  const [dropActive, setDropActive] = useState(false);
+  const [dropNote, setDropNote] = useState<string | null>(null);
+  const importDropped = useCallback(async (files: File[]) => {
+    const { getFileStore, readInputText } = await import('../../services/fileStore');
+    const opened: string[] = [], stored: string[] = [], failed: string[] = [];
+    const tabs: ScriptTab[] = [];
+    let stats: ImportResult['stats'] | null = null;
+    for (const file of files) {
+      const text = await readInputText(file);
+      if (!/\.gz$/i.test(file.name) && isLammpsScript(file.name, text)) {
+        const result = parseScript(text, scriptTitle(file.name));
+        tabs.push({ id: newTabId(), model: result.model });
+        stats = result.stats;
+        opened.push(file.name);
+      }
+      try {
+        await getFileStore().put({ name: file.name, text, size: file.size });
+        stored.push(file.name);
+      } catch {
+        failed.push(file.name);
+      }
+    }
+    if (tabs.length) {
+      setWorkspace(ws => ({ ...ws, tabs: [...ws.tabs, ...tabs], activeId: tabs[tabs.length - 1].id }));
+      setImportStats(stats);
+      setSelectedUid(null);
+      setView('flow');
+    }
+    const note: string[] = [];
+    if (opened.length) note.push(`Opened ${opened.join(', ')} as ${opened.length === 1 ? 'a new tab' : 'new tabs'}.`);
+    if (stored.length) note.push(`Kept ${stored.join(', ')} in browser storage, where the MD Notebook reads files by name (read_data, include, pair_coeff).`);
+    if (failed.length) note.push(`Could not store ${failed.join(', ')}: browser storage is full or unavailable.`);
+    setDropNote(note.join(' '));
+  }, [setWorkspace]);
+  useEffect(() => {
+    let depth = 0;
+    const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types ?? []).includes('Files');
+    const onEnter = (e: DragEvent) => { if (hasFiles(e)) { depth++; setDropActive(true); } };
+    const onOver = (e: DragEvent) => { if (hasFiles(e)) e.preventDefault(); };
+    const onLeave = (e: DragEvent) => { if (hasFiles(e) && --depth <= 0) { depth = 0; setDropActive(false); } };
+    const onDrop = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      depth = 0;
+      setDropActive(false);
+      // a drop the browser-storage drawer already took (it stores the files) is not handled twice
+      if (e.defaultPrevented) return;
+      e.preventDefault();
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      if (files.length) void importDropped(files);
+    };
+    window.addEventListener('dragenter', onEnter);
+    window.addEventListener('dragover', onOver);
+    window.addEventListener('dragleave', onLeave);
+    window.addEventListener('drop', onDrop);
+    return () => {
+      window.removeEventListener('dragenter', onEnter);
+      window.removeEventListener('dragover', onOver);
+      window.removeEventListener('dragleave', onLeave);
+      window.removeEventListener('drop', onDrop);
+    };
+  }, [importDropped]);
+
+  // ---- script from the MD Notebook: imported once, as a NEW tab (the open tabs are kept) ----
+  const takenIncoming = useRef<BuilderIncoming | null>(null);
+  useEffect(() => {
+    if (!incoming || takenIncoming.current === incoming) return;
+    takenIncoming.current = incoming;
+    const result = parseScript(incoming.text, incoming.name);
+    setWorkspace(ws => {
+      const tab: ScriptTab = { id: newTabId(), model: result.model };
+      return { ...ws, tabs: [...ws.tabs, tab], activeId: tab.id };
+    });
+    setImportStats(result.stats);
+    setSelectedUid(null);
+    setView('flow');
+    onIncomingTaken?.();
+  }, [incoming, onIncomingTaken, setWorkspace]);
+
+  // ---- manual script editing -------------------------------------------
+  const enterManualMode = useCallback(() => {
+    setModel(prev => ({
+      ...prev,
+      manualBase: JSON.stringify(prev.steps),
+      manualText: prev.manualText ?? generateScript({ ...prev }).text,
+    }));
+    setView('script');
+  }, [setModel]);
+
+  const exitManualMode = useCallback(() => {
+    setModel(prev => {
+      const { manualText: _drop, manualBase: _base, ...rest } = prev;
+      void _drop;
+      void _base;
+      return rest;
+    });
+  }, [setModel]);
+
+  const setManualText = useCallback((text: string) => {
+    setModel(prev => ({ ...prev, manualText: text }));
+  }, [setModel]);
+
+  const copyScript = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(activeText);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch { /* clipboard blocked */ }
+  }, [activeText]);
+
+  /**
+   * Commands offered for ADDING. Deprecated defs stay in ALL_COMMANDS so the
+   * script importer can still recognise them, but they are never offered for
+   * a new pipeline — a palette that suggests a command LAMMPS removed four
+   * years ago is worse than one that omits it.
+   */
+  const addableCommands = useMemo(
+    () => ALL_COMMANDS.filter(d => !d.deprecated),
+    [],
+  );
+
+  const filteredCommands = useMemo(() => {
+    if (!search.trim()) return addableCommands;
+    const q = search.toLowerCase();
+    return addableCommands.filter(d =>
+      d.label.toLowerCase().includes(q) ||
+      d.command.toLowerCase().includes(q) ||
+      d.category.toLowerCase().includes(q)
+    );
+  }, [search, addableCommands]);
+
+  const insertCandidates = useMemo(() => {
+    if (!insertSearch.trim()) return addableCommands;
+    const q = insertSearch.toLowerCase();
+    return addableCommands.filter(d =>
+      d.label.toLowerCase().includes(q) ||
+      d.command.toLowerCase().includes(q)
+    );
+  }, [insertSearch, addableCommands]);
+
+  // Lane-aware: the selected uid may live in the trunk or in a branch.
+  const selectedStep = selectedUid ? findStepInModel(model, selectedUid) ?? null : null;
+  const selectedDef = selectedStep ? COMMAND_BY_ID[selectedStep.defId] : null;
+
+  // Group palette commands by section
+  const paletteBySection = useMemo(() => {
+    const map = new Map<string, typeof ALL_COMMANDS>();
+    for (const cmd of filteredCommands) {
+      const list = map.get(cmd.section) ?? [];
+      list.push(cmd);
+      map.set(cmd.section, list);
+    }
+    return map;
+  }, [filteredCommands]);
+
+  // ---- pointer drag-to-reorder ------------------------------------------
+  const computeInsertIndex = useCallback((clientY: number): number => {
+    let idx = 0;
+    // Cards are laid out in RESOLVED-PATH order, so measure against the path,
+    // not the trunk — with a concept taken the two disagree.
+    for (const s of pathSteps) {
+      const el = nodeRefs.current.get(s.uid);
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (clientY > r.top + r.height / 2) idx++;
+    }
+    return idx;
+  }, [pathSteps]);
+
+  const cardPointerDown = useCallback((uid: string) => (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.stopPropagation(); // keep the canvas pan handler out of card drags
+    // A press on one of the card's own buttons (fork, move, enable, duplicate, remove) is a click, not a drag: capturing
+    // the pointer here would send the click to the card instead of the button, so none of them worked.
+    if (startsOnControl(e)) return;
+    dragState.current = { uid, startX: e.clientX, startY: e.clientY, active: false };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }, []);
+
+  const cardPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const st = dragState.current;
+    if (!st) return;
+    if (!st.active) {
+      if (Math.hypot(e.clientX - st.startX, e.clientY - st.startY) < 6) return;
+      st.active = true;
+      const step = findStepInModel(model, st.uid);
+      setDrag({
+        uid: st.uid,
+        label: COMMAND_BY_ID[step?.defId ?? '']?.command ?? step?.defId ?? '',
+        x: e.clientX, y: e.clientY,
+      });
+    }
+    setDrag(d => (d ? { ...d, x: e.clientX, y: e.clientY } : d));
+    setOverIndex(computeInsertIndex(e.clientY));
+  }, [model, computeInsertIndex]);
+
+  const cardPointerUp = useCallback(() => {
+    const st = dragState.current;
+    dragState.current = null;
+    if (st?.active && overIndex !== null) {
+      moveStepToIndex(st.uid, overIndex);
+    }
+    setDrag(null);
+    setOverIndex(null);
+  }, [overIndex, moveStepToIndex]);
+
+  // ---- flowchart canvas pan/zoom ----------------------------------------
+  useEffect(() => {
+    const el = canvasRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      viewUntouched.current = false;
+      const rect = el.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      setViewTf(t => {
+        const factor = Math.exp(-e.deltaY * 0.0015);
+        const k = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, t.k * factor));
+        const f = k / t.k;
+        return { k, x: cx - (cx - t.x) * f, y: cy - (cy - t.y) * f };
+      });
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [view]);
+
+  const bgPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 && e.button !== 1) return;
+    // the connector pills and their menu are buttons on the canvas: pressing one must not capture the pointer for a pan
+    if (startsOnControl(e)) return;
+    panRef.current = { startX: e.clientX, startY: e.clientY, ox: viewTf.x, oy: viewTf.y };
+    viewUntouched.current = false;
+    setPanning(true);
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }, [viewTf]);
+
+  const bgPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const p = panRef.current;
+    if (!p) return;
+    setViewTf(t => ({ ...t, x: p.ox + (e.clientX - p.startX), y: p.oy + (e.clientY - p.startY) }));
+  }, []);
+
+  const bgPointerUp = useCallback(() => {
+    panRef.current = null;
+    setPanning(false);
+  }, []);
+
+  const zoomBy = useCallback((factor: number) => {
+    viewUntouched.current = false;
+    const el = canvasRef.current;
+    const cx = (el?.clientWidth ?? 800) / 2;
+    const cy = (el?.clientHeight ?? 600) / 2;
+    setViewTf(t => {
+      const k = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, t.k * factor));
+      const f = k / t.k;
+      return { k, x: cx - (cx - t.x) * f, y: cy - (cy - t.y) * f };
+    });
+  }, []);
+
+  /**
+   * Centre the column at 100%. The pipeline is rendered in a fixed-width
+   * column, so at k=1 in a wider canvas it used to sit flush against the left
+   * edge with dead space on the right.
+   */
+  const centerView = useCallback(() => {
+    const el = canvasRef.current;
+    const content = contentRef.current;
+    if (!el || !content) {
+      setViewTf({ x: 0, y: 0, k: 1 });
+      return;
+    }
+    const w = content.offsetWidth;
+    if (el.clientWidth < w) {
+      // Canvas narrower than even the 300px minimum column: the column
+      // would be clipped at k=1, so fit it to the width (zoom floor applies).
+      const k = Math.max(ZOOM_MIN, (el.clientWidth - 16) / w);
+      setViewTf({ k, x: (el.clientWidth - w * k) / 2, y: 8 });
+      return;
+    }
+    setViewTf({ x: Math.max(0, (el.clientWidth - w) / 2), y: 0, k: 1 });
+  }, []);
+
+  /**
+   * True fit-to-content. The button used to be labelled "Fit" but only reset
+   * the transform, which is not the same thing once the pipeline is taller
+   * than the canvas.
+   */
+  const fitToView = useCallback(() => {
+    const el = canvasRef.current;
+    const content = contentRef.current;
+    if (!el || !content) return;
+    const pad = 24;
+    const w = content.offsetWidth;
+    const h = content.offsetHeight;
+    if (w === 0 || h === 0) return;
+    // the user chose this view: the auto-centring (a pending frame after a template loads, or a canvas resize) must
+    // not snap it back to 100 %
+    viewUntouched.current = false;
+    const fitW = (el.clientWidth - pad * 2) / w;
+    const fitAll = Math.min(fitW, (el.clientHeight - pad * 2) / h);
+    // The whole pipeline, as the button says: a long one becomes the bird's-eye overview ZOOM_MIN is for (before,
+    // below 50 % the view only fitted the width and stayed at 100 %, so Fit did nothing on a desktop). Never above
+    // 100 % for a short one (a 3-step pipeline blown up to fill the canvas reads as a mistake).
+    const k = Math.min(1, Math.max(ZOOM_MIN, fitAll));
+    setViewTf({
+      x: (el.clientWidth - w * k) / 2,
+      y: Math.max(pad, (el.clientHeight - h * k) / 2),
+      k,
+    });
+  }, []);
+
+  const resetView = useCallback(() => centerView(), [centerView]);
+
+  /**
+   * Builder keyboard layer. Typing targets are skipped, so the manual-script
+   * textarea and every parameter field keep their native behaviour.
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      const mod = e.ctrlKey || e.metaKey;
+      const k = e.key.toLowerCase();
+
+      if (mod && !e.shiftKey && k === 'z') { e.preventDefault(); undo(); return; }
+      if ((mod && e.shiftKey && k === 'z') || (mod && k === 'y')) { e.preventDefault(); redo(); return; }
+      if (mod) return; // leave every other browser/OS chord alone
+
+      if (e.key === 'Delete' && selectedUid) { e.preventDefault(); removeStepRef.current(selectedUid); return; }
+      if (e.key === 'Escape') { setSelectedUid(null); setEdgeMenuIndex(null); closeInsertAt(); setTemplatesOpen(false); return; }
+
+      if (k === '/') { e.preventDefault(); setPaletteOpen(true); searchRef.current?.focus(); return; }
+      if (k === 'f') { e.preventDefault(); fitToView(); return; }
+      if (e.key === '0') { e.preventDefault(); centerView(); return; }
+      if (k === 's') { e.preventDefault(); setView(v => (v === 'flow' ? 'script' : 'flow')); return; }
+      if (k === 'c') { e.preventDefault(); setLintOpen(v => !v); return; }
+
+      // Branching: fork at the selected step, and cycle the concept taken at
+      // that fork with [ and ].
+      if (k === 'b' && !isManual) {
+        e.preventDefault();
+        forkHere(selectedUid ?? model.steps[model.steps.length - 1]?.uid ?? null);
+        return;
+      }
+      if (e.key === '[' || e.key === ']') {
+        const lane = selectedUid ? findLane(model, selectedUid) : null;
+        // The fork to cycle is the one anchored at the selected TRUNK step,
+        // else the first fork in the flowchart.
+        const anchorUid =
+          lane === null && selectedUid && forkMap.has(selectedUid)
+            ? selectedUid
+            : [...forkMap.keys()][0] ?? undefined;
+        if (anchorUid === undefined) return;
+        const list = forkMap.get(anchorUid) ?? [];
+        if (list.length === 0) return;
+        e.preventDefault();
+        // Options at this fork: main line (null) followed by each concept.
+        const options: (string | null)[] = [null, ...list.map(b => b.id)];
+        const current = list.find(b => (model.activeBranchIds ?? []).includes(b.id))?.id ?? null;
+        const at = options.indexOf(current);
+        const next = options[(at + (e.key === ']' ? 1 : options.length - 1) + options.length) % options.length];
+        chooseBranch(anchorUid, next);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [
+    undo, redo, selectedUid, fitToView, centerView, forkHere, chooseBranch,
+    forkMap, model, isManual, closeInsertAt,
+  ]);
+
+  // Track the canvas width to size the flowchart column (see columnWidth).
+  useEffect(() => {
+    if (view !== 'flow') return;
+    const el = canvasRef.current;
+    if (!el) return;
+    const update = () => setColumnWidth(Math.max(300, Math.min(640, el.clientWidth - 16)));
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [view]);
+
+  // Centre once the pipeline first has content, and keep it centred while the
+  // user has not taken over the view themselves.
+  useEffect(() => {
+    if (view !== 'flow' || !viewUntouched.current) return;
+    const el = canvasRef.current;
+    if (!el) return;
+    // checked again when the frame comes: a Fit (or a pan, zoom) before it is the user's view
+    const id = window.requestAnimationFrame(() => { if (viewUntouched.current) centerView(); });
+    const ro = new ResizeObserver(() => {
+      if (viewUntouched.current) centerView();
+    });
+    ro.observe(el);
+    return () => { window.cancelAnimationFrame(id); ro.disconnect(); };
+  }, [view, centerView, flow.nodes.length, columnWidth]);
+
+  return (
+    <div className="flex h-full min-h-0">
+      {/* Left: palette (overlay drawer on mobile) */}
+      <div
+        inert={isMobile && !paletteOpen}
+        className={`flex-col border-r transition-transform duration-300 ease-in-out ${ct.panel} ${
+          isMobile
+            ? `fixed inset-y-0 left-0 z-40 flex w-72 shadow-2xl ${paletteOpen ? 'translate-x-0' : '-translate-x-full'}`
+            : `${paletteOpen ? 'flex w-72' : 'hidden w-0 overflow-hidden'}`
+        }`}
+      >
+        <div className={`flex items-center justify-between px-4 py-3 border-b ${ct.divider}`}>
+          <span className={`text-sm font-bold tracking-tight ${ct.headerText} antialiased`}>Commands</span>
+          <button
+            onClick={() => setPaletteOpen(false)}
+            aria-label="Collapse command palette"
+            className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-1 ${ct.muted} ${ct.hoverSurface}`}
+          >
+            <ChevronLeft size={14} />
+          </button>
+          {isMobile && (
+            <button onClick={() => setPaletteOpen(false)} className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-1 ${ct.muted} ${ct.hoverSurface}`} title="Close">
+              <X size={14} />
+            </button>
+          )}
+        </div>
+        <div className={`border-b px-3 py-3 ${ct.divider}`}>
+          <div className={`flex items-center gap-2.5 rounded-xl border px-3 py-2.5 shadow-sm ${ct.input} focus-within:ring-2 focus-within:ring-[#7fa66b]/30 transition-all`}>
+            <Search size={16} className="shrink-0 opacity-60" />
+            <input
+              ref={searchRef}
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder={`Search ${addableCommands.length} commands… ( / )`}
+              className={`w-full bg-transparent text-sm font-medium ${ct.text} placeholder:text-[#6f6353]/70 focus:outline-none`}
+            />
+          </div>
+        </div>
+        <div className="flex-1 overflow-y-auto px-2 py-2 space-y-3">
+          {SECTION_ORDER.map(section => {
+            const cmds = paletteBySection.get(section);
+            if (!cmds || cmds.length === 0) return null;
+            return (
+              <div key={section} className="space-y-0.5">
+                <div className={`mb-2 flex items-center gap-2 px-1 pt-3`}>
+                  <div className="h-4 w-1 rounded-full bg-[#7fa66b]" />
+                  <span className={`text-xs font-bold uppercase tracking-widest ${ct.headerText}`}>
+                    {SECTION_LABELS[section]}
+                  </span>
+                  <span className="ml-auto text-[11px] font-mono opacity-40">{cmds.length}</span>
+                </div>
+                {cmds.map(cmd => (
+                  <button
+                    key={cmd.id}
+                    onClick={() => addStep(cmd.id)}
+                    title={cmd.doc ?? cmd.label}
+                    className={`group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-all border border-transparent hover:border-[#7fa66b]/20 hover:shadow-sm ${ct.muted} ${ct.hoverSurface}`}
+                  >
+                    <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[#7fa66b]/10 group-hover:bg-[#7fa66b]/20 transition-colors">
+                      <Plus size={14} className="opacity-60 transition-opacity group-hover:opacity-100" />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-[13px] font-semibold leading-tight tracking-tight">{cmd.label}</div>
+                      <code className={`text-xs font-mono font-medium tracking-wide opacity-70 ${ct.accentCode}`}>{cmd.command}</code>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Center: tabs + pipeline + step editor */}
+      <div className={`flex min-w-0 flex-1 flex-col ${ct.bg}`}>
+        {/* Tab strip */}
+        <div className={`flex h-9 shrink-0 items-center gap-1 border-b px-2 ${ct.divider}`}>
+          <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+            {/* display:contents keeps the tabs as flex items of the scroller
+                while giving them a proper tablist parent. */}
+            <div role="tablist" className="contents">
+              {workspace.tabs.map(tab => {
+                const active = tab.id === workspace.activeId;
+                return (
+                  <div
+                    key={tab.id}
+                    role="tab"
+                    aria-selected={active}
+                    tabIndex={0}
+                    onClick={() => switchTab(tab.id)}
+                    onKeyDown={e => {
+                      if (e.target !== e.currentTarget) return;
+                      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); switchTab(tab.id); }
+                    }}
+                    className={`group flex shrink-0 cursor-pointer items-center gap-1 rounded-t-lg border-b-2 px-1.5 py-1 text-[11px] font-medium transition-colors focus-visible:outline-none ${ct.tabFocusRing} sm:gap-1.5 sm:px-2.5 ${
+                      active ? ct.active : `${ct.muted} border-transparent ${ct.hoverSurface}`
+                    }`}
+                    title={tab.model.title || 'Untitled'}
+                  >
+                    <FileCode2 size={11} className="shrink-0 opacity-60" />
+                    <span className="max-w-[72px] truncate sm:max-w-[110px]">{tab.model.title || 'Untitled'}</span>
+                    <span className={`hidden text-[9px] tabular-nums opacity-50 sm:inline`}>{tab.model.steps.length}</span>
+                    <button
+                      onClick={e => { e.stopPropagation(); closeTab(tab.id); }}
+                      className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-0.5 opacity-100 transition-opacity hover:text-[#cf8b76] md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 ${
+                        active ? 'md:opacity-70' : ''
+                      }`}
+                      title="Close this flowchart (Ctrl+Z restores)"
+                      aria-label={`Close ${tab.model.title || 'tab'}`}
+                    >
+                      <X size={11} />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+            <button
+              onClick={addTab}
+              className={`shrink-0 rounded p-1.5 ${ct.muted} ${ct.hoverSurface}`}
+              title="New flowchart tab"
+              aria-label="New flowchart tab"
+            >
+              <Plus size={13} />
+            </button>
+          </div>
+          <button
+            onClick={clearActive}
+            disabled={model.steps.length === 0}
+            className={`flex min-h-6 min-w-6 shrink-0 items-center gap-1 rounded px-2 py-1 text-[10px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface} disabled:opacity-30 disabled:pointer-events-none`}
+            title="Clear this flowchart (Ctrl+Z restores it)"
+          >
+            <Trash2 size={12} />
+            <span className="hidden sm:inline">Clear</span>
+          </button>
+        </div>
+
+        {/* Toolbar (scrollable on mobile, two groups on desktop) */}
+        {/* a size container: the buttons' labels follow this row's width (the editor column, which the palette and the
+            step editor narrow), not the viewport, so the buttons fit in one row at every column width */}
+        <div className={`@container flex min-h-10 shrink-0 flex-wrap items-center justify-between gap-x-1 gap-y-1 border-b px-2 py-1 sm:gap-x-2 sm:px-3 ${ct.divider}`}>
+          <div className="flex min-w-0 flex-1 basis-72 items-center gap-1.5">
+            {!paletteOpen && (
+              <button onClick={() => setPaletteOpen(true)} className={`inline-flex min-h-6 min-w-6 shrink-0 items-center justify-center rounded p-1 ${ct.muted} ${ct.hoverSurface}`} title="Open palette">
+                <ChevronRight size={16} />
+              </button>
+            )}
+            <input
+              value={model.title}
+              onChange={e => setModel(prev => ({ ...prev, title: e.target.value }))}
+              title={model.title}
+              className={`w-24 min-w-0 flex-1 truncate rounded bg-transparent px-1 py-0.5 text-sm font-medium focus:outline-none focus:ring-1 focus:ring-[#7fa66b] sm:max-w-md sm:px-1.5 ${ct.headerText}`}
+              aria-label="Script title"
+            />
+            <span className={`hidden whitespace-nowrap text-[10px] md:block ${ct.muted}`}>
+              {isManual ? 'manual' : `${model.steps.length} steps · ${generated.emitted.length} lines`}
+            </span>
+          </div>
+          {/* Below md: one scrollable row keeps every button reachable at phone
+              widths. At md+ the group wraps its own buttons inside the editor
+              column. Before, its nowrap buttons overflowed the column and the
+              inspector sidebar painted over the right-hand ones (Run in
+              Notebook was unclickable at ~768-1200px). */}
+          {/* Phone: one scrolling strip whose buttons keep their width (shrunk
+              to 24 px, the "Script" label ran over the next icon). */}
+          {/* md+: the title group takes the row's leftover width (basis 18rem), so when the buttons do not fit beside
+              it the whole group moves to its own row (at 1440 px one icon used to wrap alone onto a second row, and
+              the title was cut at 10rem); on a narrow column the group wraps its own buttons. */}
+          <div className="flex min-w-0 items-center gap-0.5 max-md:overflow-x-auto max-md:*:shrink-0 md:ml-auto md:flex-wrap md:justify-end sm:gap-1.5">
+            <button
+              onClick={undo}
+              disabled={!canUndo}
+              className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface} disabled:opacity-30 disabled:pointer-events-none`}
+              title="Undo (Ctrl+Z)"
+              aria-label="Undo"
+            >
+              <Undo2 size={13} />
+            </button>
+            <button
+              onClick={redo}
+              disabled={!canRedo}
+              className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface} disabled:opacity-30 disabled:pointer-events-none`}
+              title="Redo (Ctrl+Shift+Z)"
+              aria-label="Redo"
+            >
+              <Redo2 size={13} />
+            </button>
+            <button
+              onClick={sortBySection}
+              disabled={sectionSorted || model.steps.length < 2}
+              className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface} disabled:opacity-30 disabled:pointer-events-none`}
+              title={sectionSorted
+                ? 'Already in canonical section order'
+                : 'Reorder the steps into canonical section order (setup → system → interactions → output → run control)'}
+              aria-label="Sort steps by section"
+            >
+              <ArrowDownUp size={13} />
+              <span className="hidden @6xl:inline">Sort</span>
+            </button>
+            <button
+              onClick={() => forkHere(model.steps[model.steps.length - 1]?.uid ?? null)}
+              disabled={isManual}
+              className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface} disabled:opacity-30 disabled:pointer-events-none`}
+              title="Fork a new concept branch at the end of the pipeline"
+            >
+              <GitBranch size={13} />
+              <span className="hidden @6xl:inline">Fork</span>
+            </button>
+            <button
+              onClick={() => setLintOpen(v => !v)}
+              className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${
+                lintOpen ? ct.active : `${ct.muted} ${ct.hoverSurface}`
+              }`}
+              title="Validate the script against the LAMMPS command ordering rules"
+              aria-label={`Script check: ${lintCounts.errors} errors, ${lintCounts.warnings} warnings`}
+            >
+              {lintCounts.errors > 0 ? (
+                <AlertTriangle size={13} className="text-[#cf8b76]" />
+              ) : lintCounts.warnings > 0 ? (
+                <AlertTriangle size={13} className="text-[#d9a05b]" />
+              ) : (
+                <ShieldCheck size={13} className={ct.accentText} />
+              )}
+              <span className="tabular-nums">
+                {lintCounts.errors > 0
+                  ? lintCounts.errors
+                  : lintCounts.warnings > 0
+                    ? lintCounts.warnings
+                    : ''}
+              </span>
+              <span className="hidden @6xl:inline">Check</span>
+            </button>
+            <div ref={templatesMenuRef} className="relative">
+              <button
+                onClick={() => setTemplatesOpen(v => !v)}
+                className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface}`}
+                title="Start from a ready-made pipeline"
+              >
+                <LayoutTemplate size={13} />
+                <span className="hidden @lg:inline">Templates</span>
+              </button>
+              {templatesOpen && (
+                <div
+                  className={`absolute right-0 top-full z-40 mt-1 w-72 rounded-lg border p-1.5 shadow-2xl ${ct.card}`}
+                  onClick={e => e.stopPropagation()}
+                >
+                  <p className={`px-2 pb-1 pt-0.5 text-[9px] uppercase tracking-wide ${ct.muted}`}>
+                    Starter pipelines (replaces the current steps — undo works)
+                  </p>
+                  {SCRIPT_TEMPLATES.map(tpl => (
+                    <button
+                      key={tpl.id}
+                      onClick={() => {
+                        setModel(buildTemplate(tpl));
+                        setSelectedUid(null);
+                        setTemplatesOpen(false);
+                      }}
+                      className={`flex w-full flex-col rounded px-2 py-1.5 text-left transition-colors ${ct.hoverSurface}`}
+                      title={tpl.description}
+                    >
+                      <span className="text-[11px] font-semibold">{tpl.label}</span>
+                      <span className={`text-[10px] ${ct.muted}`}>{tpl.description}</span>
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => setTemplatesOpen(false)}
+                    className={`mt-0.5 min-h-6 w-full rounded px-2 py-1 text-left text-[10px] ${ct.muted} ${ct.hoverSurface}`}
+                  >
+                    Close
+                  </button>
+                </div>
+              )}
+            </div>
+            <button
+              onClick={() => importInputRef.current?.click()}
+              className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface}`}
+              title="Import a LAMMPS input script — builds the flowchart"
+            >
+              <FileInput size={13} />
+              <span className="hidden @3xl:inline">Import</span>
+            </button>
+            <input
+              ref={importInputRef}
+              type="file"
+              accept=".in,.lammps,.lmp,.txt,.script,.mod"
+              className="hidden"
+              onChange={e => {
+                const f = e.target.files?.[0];
+                if (f) handleImportFile(f);
+                e.target.value = '';
+              }}
+            />
+            {view === 'flow' && !isManual && (
+              <>
+                <button
+                  onClick={() => exportFlowchart('svg')}
+                  disabled={exporting !== null || model.steps.length === 0}
+                  className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface} disabled:opacity-30 disabled:pointer-events-none`}
+                  title="Export the flowchart as a presentable SVG"
+                >
+                  <FileImage size={13} />
+                  <span className="hidden @5xl:inline">SVG</span>
+                </button>
+                <button
+                  onClick={() => exportFlowchart('png')}
+                  disabled={exporting !== null || model.steps.length === 0}
+                  className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface} disabled:opacity-30 disabled:pointer-events-none`}
+                  title="Export the flowchart as a 2x PNG image"
+                >
+                  <ImageDown size={13} />
+                  <span className="hidden @5xl:inline">PNG</span>
+                </button>
+              </>
+            )}
+            <button
+              onClick={() => setView(v => v === 'flow' ? 'script' : 'flow')}
+              className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${
+                view === 'script' ? ct.active : `${ct.muted} ${ct.hoverSurface}`
+              }`}
+              title={view === 'flow' ? 'View the generated script' : 'Back to the flowchart'}
+            >
+              {view === 'flow' ? <FileCode2 size={13} /> : <Workflow size={13} />}
+              {view === 'flow' ? 'Script' : 'Flowchart'}
+              {isManual && <span className="h-1.5 w-1.5 rounded-full bg-[#d9a05b]" title="Manual override active" />}
+            </button>
+            {isManual ? (
+              <button
+                onClick={exitManualMode}
+                className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium ${ct.warnAction}`}
+                title="Discard manual edits and regenerate from your steps"
+              >
+                <X size={13} />
+                <span className="hidden @6xl:inline">Exit manual</span>
+              </button>
+            ) : (
+              <button
+                onClick={() => { enterManualMode(); setView('script'); }}
+                className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface}`}
+                title="Override the generated script with hand-edited text"
+              >
+                <PencilLine size={13} />
+                <span className="hidden @6xl:inline">Override</span>
+              </button>
+            )}
+            <button
+              onClick={copyScript}
+              className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface}`}
+              title="Copy script to clipboard"
+            >
+              {copied ? <span className={ct.accentText}>✓ Copied</span> : <><Copy size={13} /><span className="hidden @3xl:inline">Copy</span></>}
+            </button>
+            <button
+              onClick={() => downloadTextFile('in.lammps', activeText)}
+              className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface}`}
+              title="Download in.lammps"
+            >
+              <Download size={13} />
+              <span className="hidden @6xl:inline">Download</span>
+            </button>
+            {onRunInNotebook && (
+              <button
+                onClick={() => onRunInNotebook(activeText)}
+                className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface}`}
+                title="Run this script in the MD Notebook (in your browser)"
+                aria-label="Run this script in the MD Notebook"
+              >
+                <NotebookPen size={13} />
+                <span className="hidden whitespace-nowrap @4xl:inline">Run in Notebook</span>
+              </button>
+            )}
+            {onOpenViewer && (
+              <button
+                onClick={onOpenViewer}
+                className={`flex min-h-6 min-w-6 items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${ct.muted} ${ct.hoverSurface}`}
+                title="Open 3D structure viewer"
+              >
+                <AtomIcon size={13} />
+                <span className="hidden @6xl:inline">Viewer</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Concept branches — divergent ideas living in one flowchart */}
+        {hasBranches && !isManual && (
+          <div className={`flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1.5 text-[11px] ${ct.card}`}>
+            <span className={`flex items-center gap-1 font-semibold ${ct.accentText}`}>
+              <GitBranch size={12} /> Concepts
+            </span>
+            {[...forkMap.entries()].map(([forkAfter, list]) => {
+              const anchorStep = forkAfter === null
+                ? null
+                : model.steps.find(st => st.uid === forkAfter);
+              const anchorLabel = forkAfter === null
+                ? 'start'
+                : COMMAND_BY_ID[anchorStep?.defId ?? '']?.command ?? 'step';
+              const taken = list.find(b => (model.activeBranchIds ?? []).includes(b.id)) ?? null;
+              return (
+                <div key={forkAfter ?? '__start__'} className="flex items-center gap-1">
+                  <span className={`text-[10px] ${ct.muted}`}>after <code className={ct.accentCode}>{anchorLabel}</code>:</span>
+                  <button
+                    onClick={() => chooseBranch(forkAfter, null)}
+                    className={`min-h-6 rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                      taken === null ? ct.active : `${ct.chipIdle} ${ct.hoverSurface}`
+                    }`}
+                    title="Follow the main line at this fork"
+                  >
+                    Main
+                  </button>
+                  {list.map(b => (
+                    <button
+                      key={b.id}
+                      onClick={() => chooseBranch(forkAfter, b.id)}
+                      className={`flex items-center gap-1 min-h-6 rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                        taken?.id === b.id ? ct.active : `${ct.chipIdle} ${ct.hoverSurface}`
+                      }`}
+                      title={`${b.label} — ${b.steps.length} steps, ${b.rejoin ? 'rejoins the main line' : 'replaces the tail'}`}
+                    >
+                      {taken?.id === b.id && <Check size={9} />}
+                      {b.label}
+                      <span className="tabular-nums opacity-60">{b.steps.length}</span>
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => forkHereEmpty(forkAfter)}
+                    className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded-full p-1 ${ct.muted} ${ct.hoverSurface}`}
+                    title="Add another empty concept at this fork"
+                    aria-label="Add concept"
+                  >
+                    <Plus size={10} />
+                  </button>
+                </div>
+              );
+            })}
+            {activeBranches.map(b => (
+              <div key={`ctl-${b.id}`} className="ml-auto flex items-center gap-1">
+                <input
+                  value={b.label}
+                  onChange={e => renameBranch(b.id, e.target.value)}
+                  className={`w-28 rounded border bg-transparent px-1.5 py-0.5 text-[10px] focus:outline-none ${ct.input}`}
+                  aria-label={`Rename ${b.label}`}
+                  title="Rename this concept"
+                />
+                <button
+                  onClick={() => setBranchRejoin(b.id, !b.rejoin)}
+                  className={`flex min-h-6 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+                    b.rejoin ? ct.active : `${ct.chipIdle} ${ct.hoverSurface}`
+                  }`}
+                  title={b.rejoin
+                    ? 'Rejoining: the main line resumes after this concept'
+                    : 'Divergent: this concept replaces everything after the fork'}
+                >
+                  <CornerDownRight size={10} /> {b.rejoin ? 'rejoins' : 'diverges'}
+                </button>
+                <button
+                  onClick={() => branchToNewTab(b.id)}
+                  className={`min-h-6 rounded px-1.5 py-0.5 text-[10px] font-medium ${ct.muted} ${ct.hoverSurface}`}
+                  title="Copy this concept into its own flowchart tab, flattened"
+                >
+                  <Copy size={10} className="inline" /> Tab
+                </button>
+                <button
+                  onClick={() => makeBranchMain(b.id)}
+                  className={`min-h-6 rounded px-1.5 py-0.5 text-[10px] font-medium ${ct.muted} ${ct.hoverSurface}`}
+                  title="This concept won — fold it into the main line and drop the others at this fork"
+                >
+                  Promote
+                </button>
+                <button
+                  onClick={() => dropBranch(b.id)}
+                  className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-1 ${ct.dangerItem}`}
+                  title="Delete this concept"
+                  aria-label={`Delete ${b.label}`}
+                >
+                  <Trash2 size={10} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Script check (doc-grounded LAMMPS lint) */}
+        {lintOpen && (
+          <div className={`max-h-48 shrink-0 overflow-y-auto border-b text-[11px] ${ct.card}`}>
+            <div className={`sticky top-0 flex items-center justify-between border-b px-3 py-1.5 ${ct.card} ${ct.divider}`}>
+              <span className="flex items-center gap-1.5 font-semibold">
+                {lintCounts.errors > 0
+                  ? <AlertTriangle size={12} className="text-[#cf8b76]" />
+                  : <ShieldCheck size={12} className={ct.accentText} />}
+                Script check — {lintCounts.errors} error{lintCounts.errors === 1 ? '' : 's'},{' '}
+                {lintCounts.warnings} warning{lintCounts.warnings === 1 ? '' : 's'}
+              </span>
+              <button onClick={() => setLintOpen(false)} className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-0.5 ${ct.muted}`} title="Close">
+                <X size={12} />
+              </button>
+            </div>
+            {diagnostics.length === 0 ? (
+              <p className={`px-3 py-2.5 ${ct.muted}`}>
+                No ordering or reference problems found — the command sequence matches the
+                LAMMPS input-script rules.
+              </p>
+            ) : (
+              <ul className="divide-y divide-transparent">
+                {diagnostics.map((d, i) => (
+                  <li key={`${d.rule}-${d.line}-${i}`} className="flex gap-2 px-3 py-1.5">
+                    <span className={`mt-0.5 shrink-0 rounded px-1 py-0.5 text-[9px] font-bold uppercase ${
+                      d.level === 'error' ? 'bg-[#cf8b76]/20 text-[#cf8b76]' : 'bg-[#d9a05b]/20 text-[#d9a05b]'
+                    }`}>
+                      {d.level}
+                    </span>
+                    <span className="min-w-0">
+                      {d.line > 0 && (
+                        <code className={`mr-1 text-[10px] ${ct.muted}`}>line {d.line}</code>
+                      )}
+                      <span className={ct.text}>{d.message}</span>
+                      {d.doc && (
+                        <a
+                          href={d.doc}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className={`ml-1.5 whitespace-nowrap text-[10px] ${ct.accentText} hover:underline`}
+                        >
+                          docs ↗
+                        </a>
+                      )}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {/* Import / manual notices */}
+        {dropActive && (
+          <div aria-hidden="true" className="pointer-events-none fixed inset-0 z-40 flex items-center justify-center bg-black/30 p-4">
+            <p className={`max-w-md rounded-lg border-2 border-dashed px-6 py-4 text-center text-sm ${ct.card}`}>
+              Drop LAMMPS scripts to open them as new tabs. Every dropped file (data, potentials, molecules) is also kept in browser storage for the MD Notebook.
+            </p>
+          </div>
+        )}
+        {dropNote && (
+          <div role="status" className={`flex shrink-0 items-center justify-between gap-2 border-b px-3 py-1.5 text-[11px] ${ct.card}`}>
+            <span className={`min-w-0 break-words ${ct.text}`}>{dropNote}</span>
+            <button onClick={() => setDropNote(null)} className={`inline-flex min-h-6 min-w-6 shrink-0 items-center justify-center rounded p-0.5 ${ct.muted}`} title="Dismiss" aria-label="Dismiss drop message">
+              <X size={12} />
+            </button>
+          </div>
+        )}
+        {importStats && (
+          <div className={`flex shrink-0 items-center justify-between border-b px-3 py-1.5 text-[11px] ${ct.card}`}>
+            <span className={ct.text}>
+              <FileInput size={11} className="mr-1 inline" />
+              Imported {importStats.total} statements — {importStats.recognized} recognized
+              {importStats.raw > 0 && `, ${importStats.raw} kept as verbatim raw lines`}
+              .
+            </span>
+            <button onClick={() => setImportStats(null)} className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-0.5 ${ct.muted}`} title="Dismiss">
+              <X size={12} />
+            </button>
+          </div>
+        )}
+        {isManual && (
+          <div className={`flex shrink-0 flex-wrap items-center justify-between gap-2 border-b px-3 py-1.5 text-[11px] ${ct.warn}`}>
+            <span>
+              ✎ Manual override — this text is emitted verbatim; builder changes do
+              <b> not </b>update it.
+            </span>
+            <button
+              onClick={exitManualMode}
+              className={`min-h-6 rounded px-2 py-0.5 font-semibold ${ct.button}`}
+              title="Discard the manual text and follow the builder steps again"
+            >
+              Discard & follow builder
+            </button>
+          </div>
+        )}
+        {manualStale && (
+          <div className={`flex shrink-0 flex-wrap items-center justify-between gap-2 border-b px-3 py-1.5 text-[11px] ${ct.warn}`}>
+            <span>⚠ Builder steps changed since your manual edit — the script text is stale.</span>
+            <button
+              onClick={exitManualMode}
+              className={`min-h-6 rounded px-2 py-0.5 font-semibold ${ct.button}`}
+              title="Discard the manual text and regenerate from the current steps"
+            >
+              Regenerate from steps
+            </button>
+          </div>
+        )}
+        {!isManual && generated.warnings.length > 0 && (
+          <div className={`shrink-0 border-t px-3 py-2 text-[11px] ${ct.warn}`}>
+            {generated.warnings.map((w, i) => <div key={i}>⚠ {w}</div>)}
+          </div>
+        )}
+
+        {/* Flowchart canvas (pan + zoom) or Script view */}
+        {view === 'flow' ? (
+          <div
+            ref={canvasRef}
+            onPointerDown={bgPointerDown}
+            onPointerMove={bgPointerMove}
+            onPointerUp={bgPointerUp}
+            onPointerCancel={bgPointerUp}
+            className={`relative min-h-0 flex-1 overflow-hidden ${panning ? 'cursor-grabbing' : ''}`}
+            style={{ touchAction: 'none' }}
+          >
+            <div
+              className="absolute left-0 top-0 origin-top-left"
+              style={{ transform: `translate(${viewTf.x}px, ${viewTf.y}px) scale(${viewTf.k})` }}
+            >
+              <div ref={contentRef} style={{ width: columnWidth }}>
+                <FlowchartView
+                  ct={ct}
+                  flow={flow}
+                  steps={pathSteps}
+                  trunkSteps={model.steps}
+                  forkMap={forkMap}
+                  activeBranchIds={model.activeBranchIds ?? []}
+                  ghostedUids={ghostedUids}
+                  onFork={forkHere}
+                  onForkEmpty={forkHereEmpty}
+                  onChooseBranch={chooseBranch}
+                  selectedUid={selectedUid}
+                  dragUid={drag?.uid ?? null}
+                  overIndex={overIndex}
+                  edgeMenuIndex={edgeMenuIndex}
+                  onSelect={(uid) => { setSelectedUid(uid); if (editorOverlay) setEditorOpenMobile(true); }}
+                  onToggle={(uid) => updateStep(uid, { enabled: !findStepInModel(model, uid)?.enabled })}
+                  onRemove={removeStep}
+                  onDuplicate={duplicateStep}
+                  onMove={moveStep}
+                  onCardPointerDown={cardPointerDown}
+                  onCardPointerMove={cardPointerMove}
+                  onCardPointerUp={cardPointerUp}
+                  registerNodeRef={(uid, el) => {
+                    if (el) nodeRefs.current.set(uid, el);
+                    else nodeRefs.current.delete(uid);
+                  }}
+                  registerEdgePillRef={registerEdgePillRef}
+                  registerEdgeMenuRef={registerEdgeMenuRef}
+                  onEdgeClick={(i) => setEdgeMenuIndex(prev => (prev === i ? null : i))}
+                  onEdgeInsertHere={(i) => {
+                    // The opener menu item unmounts with the connection menu;
+                    // its connector pill is the surviving focus target.
+                    insertReturnFocusRef.current = edgePillRefs.current.get(i) ?? null;
+                    setEdgeMenuIndex(null);
+                    setInsertAt(i);
+                  }}
+                  onEdgeDisableNext={(i) => {
+                    // Same array the menu labels use — NOT the trunk.
+                    const s = pathSteps[i];
+                    if (s) updateStep(s.uid, { enabled: !s.enabled });
+                    setEdgeMenuIndex(null);
+                  }}
+                  onEdgeRemoveNext={(i) => {
+                    const s = pathSteps[i];
+                    if (s) removeStep(s.uid);
+                    setEdgeMenuIndex(null);
+                  }}
+                  onCloseEdgeMenu={() => setEdgeMenuIndex(null)}
+                />
+              </div>
+            </div>
+
+            {/* Zoom controls */}
+            <div
+              className={`absolute bottom-3 right-3 z-20 flex items-center gap-0.5 rounded-full border px-1 py-0.5 shadow-lg sm:gap-1 sm:px-1.5 sm:py-1 ${ct.card}`}
+              onPointerDown={e => e.stopPropagation()}
+              onWheel={e => e.stopPropagation()}
+            >
+              <button
+                onClick={() => zoomBy(1 / 1.2)}
+                className={`rounded-full p-1.5 ${ct.muted} ${ct.hoverSurface}`}
+                title="Zoom out (mouse wheel)"
+                aria-label="Zoom out"
+              >
+                <ZoomOut size={14} />
+              </button>
+              <button
+                onClick={resetView}
+                className={`min-h-6 rounded-full px-2 py-1 text-[10px] font-mono tabular-nums ${ct.muted} ${ct.hoverSurface}`}
+                title="Back to 100%, centred"
+              >
+                {Math.round(viewTf.k * 100)}%
+              </button>
+              <button
+                onClick={() => zoomBy(1.2)}
+                className={`rounded-full p-1.5 ${ct.muted} ${ct.hoverSurface}`}
+                title="Zoom in (mouse wheel)"
+                aria-label="Zoom in"
+              >
+                <ZoomIn size={14} />
+              </button>
+              <div className={`mx-0.5 h-4 w-px ${ct.divider.split(' ')[0]}`} />
+              <button
+                onClick={fitToView}
+                className={`rounded-full p-1.5 ${ct.muted} ${ct.hoverSurface}`}
+                title="Fit the whole pipeline in view"
+                aria-label="Fit pipeline to view"
+              >
+                <Maximize2 size={14} />
+              </button>
+            </div>
+            <p className={`pointer-events-none absolute bottom-3 left-3 hidden max-w-[calc(100%-13rem)] truncate rounded-md border px-2 py-1 text-[10px] shadow-sm lg:block ${ct.card} ${ct.muted}`}>
+              wheel = zoom · drag = pan · <kbd>F</kbd> fit · <kbd>0</kbd> centre · <kbd>B</kbd> fork · <kbd>[</kbd><kbd>]</kbd> concept · <kbd>/</kbd> search · <kbd>S</kbd> script · <kbd>C</kbd> check
+            </p>
+          </div>
+        ) : isManual ? (
+          <textarea
+            value={model.manualText ?? ''}
+            onChange={e => setManualText(e.target.value)}
+            spellCheck={false}
+            className={`h-full min-h-full w-full resize-none p-4 text-[11px] leading-relaxed font-mono focus:outline-none ${ct.bg} ${ct.text}`}
+            aria-label="Manual LAMMPS script editor"
+          />
+        ) : (
+          <div className="min-h-0 flex-1 overflow-auto">
+            <p className={`sticky top-0 z-10 px-4 py-1.5 text-[10px] ${ct.muted} ${ct.bg}`}>
+              Auto-generated from your steps — edits in the flowchart update this live.{' '}
+              <button onClick={enterManualMode} className={`font-semibold ${ct.accentText} hover:underline`}>
+                Override by hand
+              </button>
+            </p>
+            <pre className={`px-4 pb-4 text-[11px] leading-relaxed font-mono whitespace-pre-wrap ${ct.text}`}>
+              {generated.text}
+            </pre>
+          </div>
+        )}
+      </div>
+
+      {/* Right: step editor (overlay drawer below lg) */}
+      <div
+        inert={editorOverlay && !(selectedStep && editorOpenMobile)}
+        className={`overflow-y-auto border-l transition-transform duration-300 ease-in-out ${ct.panel} ${
+          editorOverlay
+            ? `fixed inset-y-0 right-0 z-40 w-80 max-w-[85vw] shadow-2xl ${
+                selectedStep && editorOpenMobile ? 'translate-x-0' : 'translate-x-full'
+              }`
+            : 'w-80 shrink-0'
+        }`}
+      >
+        {editorOverlay && selectedStep && editorOpenMobile && (
+          <div className={`flex items-center justify-between border-b px-3 py-2 ${ct.divider}`}>
+            <span className={`text-xs font-semibold ${ct.headerText}`}>Step editor</span>
+            <button
+              onClick={() => { setEditorOpenMobile(false); setSelectedUid(null); }}
+              className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-1 ${ct.muted} ${ct.hoverSurface}`}
+              title="Close editor"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
+        {selectedStep && selectedDef ? (
+          <StepEditor
+            ct={ct}
+            step={selectedStep}
+            def={selectedDef}
+            pairWords={pairWordsAbove(model.steps, selectedStep.uid)}
+            onUpdateParam={(k, v) => updateParam(selectedStep.uid, k, v)}
+            onUpdateNote={(note) => updateStep(selectedStep.uid, { note })}
+            onToggle={() => updateStep(selectedStep.uid, { enabled: !selectedStep.enabled })}
+            onDuplicate={() => duplicateStep(selectedStep.uid)}
+            onRemove={() => removeStep(selectedStep.uid)}
+            onMoveUp={() => moveStep(selectedStep.uid, -1)}
+            onMoveDown={() => moveStep(selectedStep.uid, 1)}
+          />
+        ) : (
+          <div className={`flex h-full items-center justify-center p-6 text-center text-xs ${ct.muted}`}>
+            Select a step from the flowchart to edit its parameters.
+          </div>
+        )}
+      </div>
+
+      {/* Drawer backdrop (palette on phones, step editor below lg) */}
+      {((isMobile && paletteOpen) || (editorOverlay && selectedStep && editorOpenMobile)) && (
+        <div
+          className="fixed inset-0 z-30 bg-black/50"
+          onClick={() => { if (isMobile) setPaletteOpen(false); setEditorOpenMobile(false); if (editorOpenMobile) setSelectedUid(null); }}
+        />
+      )}
+
+      {/* Floating drag ghost */}
+      {drag && (
+        <div
+          className={`pointer-events-none fixed z-[60] rounded-lg border px-3 py-1.5 text-xs font-bold shadow-2xl ${ct.active}`}
+          style={{ left: drag.x + 12, top: drag.y + 10 }}
+        >
+          <GripVertical size={11} className="mr-1 inline opacity-60" />
+          {drag.label}
+        </div>
+      )}
+
+      {/* Insert-at-edge command picker */}
+      {insertAt !== null && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={closeInsertAt}
+          onKeyDown={onInsertDialogKeyDown}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Add command at connection"
+        >
+          <div
+            ref={insertDialogRef}
+            className={`flex max-h-[70vh] w-full max-w-md flex-col rounded-xl border shadow-2xl ${ct.card}`}
+            onClick={e => e.stopPropagation()}
+          >
+            <div className={`flex items-center justify-between border-b px-4 py-2.5 ${ct.divider}`}>
+              <span className="text-xs font-semibold">Add command at position {(insertAt ?? 0) + 1}</span>
+              <button
+                onClick={closeInsertAt}
+                aria-label="Close dialog"
+                className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-1 ${ct.muted}`}
+              >
+                <X size={14} />
+              </button>
+            </div>
+            <div className={`border-b px-3 py-2 ${ct.divider}`}>
+              <input
+                autoFocus
+                value={insertSearch}
+                onChange={e => setInsertSearch(e.target.value)}
+                placeholder="Filter commands…"
+                className={`w-full rounded border px-2 py-1.5 text-xs focus:outline-none ${ct.input}`}
+              />
+            </div>
+            <div className="overflow-y-auto p-2">
+              {insertCandidates.map(cmd => (
+                <button
+                  key={cmd.id}
+                  onClick={() => { insertStepAt(cmd.id, insertAt ?? model.steps.length); closeInsertAt(); setInsertSearch(''); }}
+                  title={cmd.doc ?? cmd.label}
+                  className={`flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-[11px] transition-colors ${ct.muted} ${ct.hoverSurface}`}
+                >
+                  <span className="truncate">{cmd.label}</span>
+                  <span className={`ml-2 shrink-0 rounded px-1 py-0.5 text-[9px] uppercase opacity-70 ${ct.chip}`}>
+                    {SECTION_LABELS[cmd.section].split('·')[0]}
+                  </span>
+                </button>
+              ))}
+              {insertCandidates.length === 0 && (
+                <p className={`p-3 text-center text-xs ${ct.muted}`}>No matching commands.</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Flowchart view                                                      */
+/* ------------------------------------------------------------------ */
+
+interface FlowchartViewProps {
+  ct: ThemeTokens;
+  flow: FlowGraph;
+  /** Steps along the taken path — index-aligned with `flow.nodes`. */
+  steps: ScriptStep[];
+  /** The trunk, for labelling fork anchors. */
+  trunkSteps: ScriptStep[];
+  forkMap: Map<string | null, ScriptBranch[]>;
+  activeBranchIds: string[];
+  ghostedUids: Set<string>;
+  onFork: (afterUid: string | null) => void;
+  onForkEmpty: (afterUid: string | null) => void;
+  onChooseBranch: (forkAfter: string | null, branchId: string | null) => void;
+  selectedUid: string | null;
+  dragUid: string | null;
+  overIndex: number | null;
+  edgeMenuIndex: number | null;
+  onSelect: (uid: string) => void;
+  onToggle: (uid: string) => void;
+  onRemove: (uid: string) => void;
+  onDuplicate: (uid: string) => void;
+  onMove: (uid: string, dir: -1 | 1) => void;
+  onCardPointerDown: (uid: string) => (e: React.PointerEvent<HTMLDivElement>) => void;
+  onCardPointerMove: (e: React.PointerEvent<HTMLDivElement>) => void;
+  onCardPointerUp: () => void;
+  registerNodeRef: (uid: string, el: HTMLDivElement | null) => void;
+  registerEdgePillRef: (index: number, el: HTMLButtonElement | null) => void;
+  registerEdgeMenuRef: (index: number, el: HTMLDivElement | null) => void;
+  onEdgeClick: (index: number) => void;
+  onEdgeInsertHere: (index: number) => void;
+  onEdgeDisableNext: (index: number) => void;
+  onEdgeRemoveNext: (index: number) => void;
+  onCloseEdgeMenu: () => void;
+}
+
+const DropLine: React.FC<{ ct: ThemeTokens; active: boolean }> = ({ ct, active }) =>
+  active ? (
+    <div className="my-1 flex items-center" data-drop-active>
+      <div className="h-1 w-full rounded-full bg-[#7fa66b] shadow-[0_0_8px_rgba(127,166,107,0.7)]" />
+    </div>
+  ) : null;
+
+/**
+ * Whether a pointer press starts on an interactive control (a button, link, form field or menu item). The flowchart's
+ * drag and pan handlers capture the pointer, and a captured pointer's click goes to the capturing element, so they leave
+ * presses on controls alone.
+ */
+const startsOnControl = (e: React.PointerEvent): boolean =>
+  e.target instanceof Element && e.target.closest('button, a, input, select, textarea, [role="menuitem"]') !== null;
+
+const FlowchartView: React.FC<FlowchartViewProps> = ({
+  ct, flow, steps, trunkSteps, forkMap, activeBranchIds, ghostedUids,
+  onFork, onForkEmpty, onChooseBranch,
+  selectedUid, dragUid, overIndex, edgeMenuIndex,
+  onSelect, onToggle, onRemove, onDuplicate, onMove,
+  onCardPointerDown, onCardPointerMove, onCardPointerUp, registerNodeRef,
+  registerEdgePillRef, registerEdgeMenuRef,
+  onEdgeClick, onEdgeInsertHere, onEdgeDisableNext, onEdgeRemoveNext, onCloseEdgeMenu,
+}) => {
+  const shortLabel = (s: ScriptStep): string => COMMAND_BY_ID[s.defId]?.command ?? s.defId;
+
+  const edgeRow = (i: number) => {
+    const menuOpen = edgeMenuIndex === i;
+    // A concept may only be forked from the start or after a TRUNK card:
+    // below a branch card the next step lives inside that concept, and
+    // addBranch cannot anchor to a branch uid.
+    const canForkHere = i === 0 || trunkSteps.some(t => t.uid === steps[i - 1]?.uid);
+    return (
+      <div key={`edge-${i}`} className="relative flex flex-col items-center">
+        <div className={`h-3 w-px ${ct.edgeLine}`} />
+        <button
+          ref={el => registerEdgePillRef(i, el)}
+          onClick={(e) => { e.stopPropagation(); onEdgeClick(i); }}
+          title="Edit this connection — insert or rewire steps here"
+          className={`flex h-6 items-center gap-1 rounded-full border px-2.5 text-[10px] font-medium transition-colors ${
+            menuOpen
+              ? ct.edgeActive
+              : ct.edgePill
+          }`}
+          aria-label={`Connection ${i + 1} actions`}
+        >
+          <Link2 size={10} />
+          connect
+        </button>
+        <div className={`h-3 w-px ${ct.edgeLine}`} />
+
+        {menuOpen && (
+          <div
+            ref={el => registerEdgeMenuRef(i, el)}
+            className={`absolute left-1/2 top-full z-30 w-56 -translate-x-1/2 rounded-lg border p-1.5 shadow-2xl ${ct.card}`}
+            onClick={e => e.stopPropagation()}
+          >
+            <p className={`px-2 pb-1 pt-0.5 text-[9px] uppercase tracking-wide ${ct.muted}`}>Edit pipeline here</p>
+            <MenuItem ct={ct} icon={<Plus size={12} />} label="Add command at this point…" onClick={() => onEdgeInsertHere(i)} />
+            {canForkHere && (
+              <MenuItem
+                ct={ct}
+                icon={<GitBranch size={12} />}
+                label={i === 0 ? 'Fork a concept from the start…' : 'Fork a concept here…'}
+                onClick={() => { onCloseEdgeMenu(); onFork(i === 0 ? null : steps[i - 1]?.uid ?? null); }}
+              />
+            )}
+            {steps[i] && (
+              <>
+                <MenuItem
+                  ct={ct}
+                  icon={steps[i].enabled ? <EyeOff size={12} /> : <Eye size={12} />}
+                  label={steps[i].enabled ? `Disable “${shortLabel(steps[i])}”` : `Enable “${shortLabel(steps[i])}”`}
+                  onClick={() => onEdgeDisableNext(i)}
+                />
+                <MenuItem ct={ct} icon={<Trash2 size={12} />} danger label={`Remove “${shortLabel(steps[i])}”`} onClick={() => onEdgeRemoveNext(i)} />
+              </>
+            )}
+            <button
+              onClick={onCloseEdgeMenu}
+              className={`mt-0.5 w-full rounded px-2 py-1 text-left text-[10px] ${ct.muted} ${ct.hoverSurface}`}
+            >
+              Close
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  /** Chips for choosing which concept the pipeline follows at a fork point. */
+  const forkRow = (forkAfter: string | null) => {
+    const list = forkMap.get(forkAfter);
+    if (!list || list.length === 0) return null;
+    const taken = list.find(b => activeBranchIds.includes(b.id)) ?? null;
+    const anchor =
+      forkAfter === null
+        ? 'start'
+        : COMMAND_BY_ID[trunkSteps.find(t => t.uid === forkAfter)?.defId ?? '']?.command ?? 'step';
+    return (
+      <div
+        key={`fork-${forkAfter ?? '__start__'}`}
+        className={`my-1 flex w-full flex-wrap items-center gap-1 rounded-xl border border-dashed px-3 py-2 ${ct.card}`}
+        onPointerDown={e => e.stopPropagation()}
+      >
+        <Split size={12} className={ct.accentText} />
+        <span className={`text-[10px] font-semibold uppercase tracking-wide ${ct.muted}`}>
+          fork after {anchor}
+        </span>
+        <button
+          onClick={e => { e.stopPropagation(); onChooseBranch(forkAfter, null); }}
+          className={`min-h-6 rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors ${
+            taken === null ? ct.active : `${ct.chipIdle} ${ct.hoverSurface}`
+          }`}
+        >
+          Main line
+        </button>
+        {list.map(b => (
+          <button
+            key={b.id}
+            onClick={e => { e.stopPropagation(); onChooseBranch(forkAfter, b.id); }}
+            className={`flex items-center gap-1 min-h-6 rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors ${
+              taken?.id === b.id ? ct.active : `${ct.chipIdle} ${ct.hoverSurface}`
+            }`}
+            title={`${b.steps.length} steps · ${b.rejoin ? 'rejoins the main line' : 'replaces the tail'}`}
+          >
+            {taken?.id === b.id && <Check size={9} />}
+            {b.label}
+          </button>
+        ))}
+        <button
+          onClick={e => { e.stopPropagation(); onForkEmpty(forkAfter); }}
+          className={`rounded-full p-1 ${ct.muted} ${ct.hoverSurface}`}
+          title="Add another concept at this fork"
+          aria-label="Add concept at this fork"
+        >
+          <Plus size={10} />
+        </button>
+      </div>
+    );
+  };
+
+  if (flow.nodes.length === 0) {
+    return (
+      <div className={`flex h-full items-center justify-center text-sm ${ct.muted}`}>
+        <div className="text-center">
+          <Workflow size={32} className="mx-auto mb-3 opacity-40" />
+          <p>Empty pipeline — add commands, import a script, or pick a template.</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`flex flex-col items-center gap-0 p-6 ${dragUid ? 'select-none' : ''}`}>
+      {/* START */}
+      <div className="flex items-center text-[10px]">
+        <span className={`rounded-full px-3 py-0.5 ${ct.startBadge}`}>
+          START
+        </span>
+      </div>
+      {edgeRow(0)}
+      {forkRow(null)}
+
+      {flow.nodes.map((node, i) => {
+        const step = steps.find(s => s.uid === node.uid);
+        const isSel = selectedUid === node.uid;
+        const isDragging = dragUid === node.uid;
+        const inBranch = !!node.branchId;
+        return (
+          <React.Fragment key={node.uid}>
+            <DropLine ct={ct} active={dragUid !== null && overIndex === i} />
+            <div
+              ref={el => registerNodeRef(node.uid, el)}
+              onPointerDown={onCardPointerDown(node.uid)}
+              onPointerMove={onCardPointerMove}
+              onPointerUp={onCardPointerUp}
+              onPointerCancel={onCardPointerUp}
+              onClick={() => onSelect(node.uid)}
+              role="button"
+              tabIndex={0}
+              aria-pressed={isSel}
+              aria-label={`${node.label} step`}
+              onKeyDown={e => {
+                if (e.target !== e.currentTarget) return; // inner buttons keep their own keys
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onSelect(node.uid);
+                }
+              }}
+              style={{ touchAction: 'none' }}
+              className={`group relative w-full cursor-grab rounded-xl border p-3 transition-shadow focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7fa66b] active:cursor-grabbing ${
+                inBranch ? 'border-l-4 border-l-[#d9a05b]' : ''
+              } ${
+                node.defId === 'raw_line'
+                  ? `border-dashed border-[#6b5124]/70 bg-[#332612]/25 ${isSel ? 'ring-1 ring-[#d9a05b]/60' : ''}`
+                  : isSel
+                    ? `${ct.active} ring-1 ring-[#7fa66b]/40`
+                    : node.enabled
+                      ? ct.nodeCard
+                      : `${ct.nodeDisabled} opacity-50`
+              } ${isDragging ? 'opacity-30' : ''}`}
+            >
+              <div className="mb-1 flex items-center justify-between">
+                <span className={`flex items-center gap-1.5 text-[9px] uppercase tracking-wide ${ct.muted}`}>
+                  <GripVertical size={9} className="inline opacity-50" />
+                  {SECTION_LABELS[node.section as keyof typeof SECTION_LABELS]?.split('·')[1]?.trim() ?? node.section}
+                  {inBranch && (
+                    <span className="flex items-center gap-0.5 rounded-full bg-[#d9a05b]/15 px-1.5 py-0.5 text-[8px] font-bold normal-case tracking-normal text-[#d9a05b]">
+                      <GitBranch size={8} />
+                      {node.branchLabel}
+                    </span>
+                  )}
+                </span>
+                {/* Desktop shows the step actions on hover or focus, and always on the
+                    selected step, so a click is enough to reach "Fork a concept here". */}
+                <div className={`flex items-center gap-1 opacity-100 transition-opacity ${isSel ? '' : 'md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100'}`}>
+                  {!inBranch && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); onFork(node.uid); }}
+                      className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-0.5 ${ct.muted} ${ct.hoverSurface}`}
+                      title="Fork a concept after this step — the rest is copied so you can try a variant"
+                      aria-label="Fork a concept here"
+                    >
+                      <GitBranch size={12} />
+                    </button>
+                  )}
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onMove(node.uid, -1); }}
+                    className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-0.5 ${ct.muted} ${ct.hoverSurface}`}
+                    title="Move up"
+                  >
+                    <ChevronUp size={12} />
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onMove(node.uid, 1); }}
+                    className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-0.5 ${ct.muted} ${ct.hoverSurface}`}
+                    title="Move down"
+                  >
+                    <ChevronDown size={12} />
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onToggle(node.uid); }}
+                    className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-0.5 ${ct.muted} ${ct.hoverSurface}`}
+                    title={node.enabled ? 'Disable' : 'Enable'}
+                  >
+                    {node.enabled ? <Eye size={12} /> : <EyeOff size={12} />}
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onDuplicate(node.uid); }}
+                    className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-0.5 ${ct.muted} ${ct.hoverSurface}`}
+                    title="Duplicate step"
+                  >
+                    <Copy size={12} />
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onRemove(node.uid); }}
+                    className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-0.5 ${ct.dangerItem}`}
+                    title="Remove"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <code className={`text-xs font-bold ${node.defId === 'raw_line' ? 'text-[#e4b877]' : ct.accentCode}`}>
+                  {node.defId === 'raw_line' ? 'raw' : node.label}
+                </code>
+                {node.defId === 'raw_line' && (
+                  <span className={`rounded px-1 py-0.5 text-[8px] font-semibold uppercase tracking-wide ${ct.warn.split(' ').slice(-1)}`}>
+                    not in library
+                  </span>
+                )}
+              </div>
+              {node.sublabel && (
+                <div className={`mt-1 truncate text-[11px] font-mono ${ct.muted}`}>{node.sublabel}</div>
+              )}
+            </div>
+            {i === flow.nodes.length - 1 && <DropLine ct={ct} active={dragUid !== null && overIndex === flow.nodes.length} />}
+            {!inBranch && forkRow(node.uid)}
+            {i < flow.nodes.length - 1 && edgeRow(i + 1)}
+          </React.Fragment>
+        );
+      })}
+
+      {ghostedUids.size > 0 && (
+        <div className="mt-4 w-full space-y-1 opacity-45">
+          <div className={`flex items-center gap-2 text-[9px] uppercase tracking-wide ${ct.muted}`}>
+            <div className={`h-px flex-1 ${ct.edgeLine}`} />
+            not in this concept
+            <div className={`h-px flex-1 ${ct.edgeLine}`} />
+          </div>
+          {trunkSteps
+            .filter(st => ghostedUids.has(st.uid))
+            .map(st => (
+              <div
+                key={`ghost-${st.uid}`}
+                className={`w-full rounded-lg border border-dashed px-3 py-1.5 text-[11px] ${ct.nodeDisabled}`}
+                title="A divergent concept replaced the rest of the main line — switch back to Main to restore it"
+              >
+                <code className={ct.accentCode}>{COMMAND_BY_ID[st.defId]?.command ?? st.defId}</code>
+              </div>
+            ))}
+        </div>
+      )}
+
+      <div className="mt-2 flex items-center text-[10px]">
+        <span className={`rounded-full px-3 py-0.5 ${ct.endBadge}`}>
+          END
+        </span>
+      </div>
+      <p className={`mt-3 text-center text-[10px] ${ct.muted}`}>
+        Grab a card and drop it between two others — it locks into place · click any <span className={ct.accentText}>connect</span> pill to insert there ·
+        hover a card and hit <GitBranch size={9} className="inline" /> to fork a divergent concept.
+      </p>
+    </div>
+  );
+};
+
+const MenuItem: React.FC<{ ct: ThemeTokens; icon: React.ReactNode; label: string; onClick: () => void; danger?: boolean }> = ({
+  ct, icon, label, onClick, danger,
+}) => (
+  <button
+    onClick={onClick}
+    className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[11px] transition-colors ${
+      danger ? ct.dangerItem : `${ct.text} ${ct.hoverSurface}`
+    }`}
+  >
+    {icon} {label}
+  </button>
+);
+
+/* ------------------------------------------------------------------ */
+/* Step editor panel                                                   */
+/* ------------------------------------------------------------------ */
+
+interface StepEditorProps {
+  ct: ThemeTokens;
+  step: ScriptStep;
+  def: import('../../lammps/catalog').CommandDef;
+  onUpdateParam: (key: string, value: string) => void;
+  onUpdateNote: (note?: string) => void;
+  onToggle: () => void;
+  onDuplicate: () => void;
+  onRemove: () => void;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
+  /** The pair_style words above this step (see pairWordsAbove). */
+  pairWords: string[];
+}
+
+/**
+ * The words of the pair_style that is in force above a step: the last enabled pair_style step before it
+ * in the trunk, as `[style]` or, for hybrid, `[mode, ...sub-styles]`. [] when there is none.
+ */
+const pairWordsAbove = (steps: ScriptStep[], uid: string): string[] => {
+  let words: string[] = [];
+  for (const s of steps) {
+    if (s.uid === uid) break;
+    if (!s.enabled) continue;
+    if (s.defId === 'pair_style_popular' && s.params.style) words = [s.params.style];
+    if (s.defId === 'pair_style_hybrid') words = [s.params.mode || 'hybrid', ...pairStyleWords(s.params.substyles ?? '')];
+  }
+  return words;
+};
+
+/**
+ * Commands whose `file` parameter names a file to read: the step editor suggests the files kept in browser storage
+ * (the storage panel's list), which the MD Notebook reads by name.
+ */
+const READS_FILE = new Set(['read_data', 'read_restart', 'molecule_cmd', 'read_dump', 'rerun']);
+
+/** Names of the files in browser storage, followed live (the store is loaded on first use). */
+const useStoredFileNames = (enabled: boolean): string[] => {
+  const [names, setNames] = useState<string[]>([]);
+  useEffect(() => {
+    if (!enabled) return;
+    let alive = true;
+    const load = () => {
+      void import('../../services/fileStore')
+        .then(({ getFileStore }) => getFileStore().list())
+        .then(list => { if (alive) setNames(list.map(f => f.name)); })
+        .catch(() => { /* no storage: no suggestions */ });
+    };
+    load();
+    window.addEventListener(FILESTORE_EVENT, load);
+    return () => { alive = false; window.removeEventListener(FILESTORE_EVENT, load); };
+  }, [enabled]);
+  return names;
+};
+
+const StepEditor: React.FC<StepEditorProps> = ({
+  ct, step, def, pairWords, onUpdateParam, onUpdateNote, onToggle, onDuplicate, onRemove, onMoveUp, onMoveDown,
+}) => {
+  const missing = useMemo(() => new Set(missingParams(def, step.params).map(p => p.key)), [def, step.params]);
+  const storedNames = useStoredFileNames(READS_FILE.has(def.id));
+  return (
+    <div className="space-y-4 p-4">
+      <div className="flex items-center justify-between">
+        <h3 className={`text-[15px] font-bold ${ct.headerText}`}>{def.label}</h3>
+        <div className="flex items-center gap-1">
+          <button onClick={onMoveUp} className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-1 ${ct.muted} ${ct.hoverSurface}`} title="Move up">
+            <ChevronUp size={14} />
+          </button>
+          <button onClick={onMoveDown} className={`inline-flex min-h-6 min-w-6 items-center justify-center rounded p-1 ${ct.muted} ${ct.hoverSurface}`} title="Move down">
+            <ChevronDown size={14} />
+          </button>
+        </div>
+      </div>
+
+      {def.deprecated && (
+        <div className={`rounded-lg border px-2.5 py-2 text-[11px] leading-relaxed ${ct.warn}`} role="alert">
+          ⚠ {def.deprecated}
+        </div>
+      )}
+
+      {def.doc && (
+        <a href={def.doc} target="_blank" rel="noopener noreferrer" className={`inline-block py-1 text-[11px] ${ct.accentText} hover:underline`}>
+          📖 LAMMPS docs ↗
+        </a>
+      )}
+
+      <div className="space-y-1">
+        <label htmlFor={`${step.uid}-note`} className={`text-[11px] font-semibold ${ct.muted}`}>Comment (optional)</label>
+        <input
+          id={`${step.uid}-note`}
+          value={step.note ?? ''}
+          onChange={e => onUpdateNote(e.target.value || undefined)}
+          placeholder="# your note…"
+          className={`w-full rounded border px-2.5 py-2 text-[13px] focus:border-[#7fa66b] focus:outline-none ${ct.input}`}
+        />
+      </div>
+
+      <div className="space-y-4">
+        {def.params.map(pd => (
+          <ParamControl key={pd.key} ct={ct} def={pd} id={`${step.uid}-${pd.key}`} missing={missing.has(pd.key)}
+            value={step.params[pd.key] ?? ''} onChange={v => onUpdateParam(pd.key, v)}
+            suggestions={pd.key === 'file' && READS_FILE.has(def.id) ? storedNames : undefined} />
+        ))}
+        {def.id === 'pair_coeff' && (
+          <PotentialPicker
+            ct={ct}
+            idPrefix={step.uid}
+            pairWords={pairWords}
+            onChoose={coeffs => onUpdateParam('coeffs', coeffs)}
+          />
+        )}
+      </div>
+
+      <div className={`flex flex-wrap items-center gap-2 border-t pt-3 ${ct.divider}`}>
+        <button
+          onClick={onToggle}
+          className={`flex min-h-6 items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium transition-colors ${
+            step.enabled ? ct.enabledBtn : ct.disabledBtn
+          }`}
+        >
+          {step.enabled ? <Eye size={13} /> : <EyeOff size={13} />}
+          {step.enabled ? 'Enabled' : 'Disabled'}
+        </button>
+        <button
+          onClick={onDuplicate}
+          className={`flex min-h-6 items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium ${ct.muted} ${ct.hoverSurface}`}
+          title="Duplicate this step with its parameters"
+        >
+          <Copy size={13} /> Duplicate
+        </button>
+        <button
+          onClick={onRemove}
+          className={`flex min-h-6 items-center gap-1.5 rounded px-2 py-1 text-[11px] font-medium ${ct.removeBtn}`}
+        >
+          <Trash2 size={13} /> Remove
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const ParamControl: React.FC<{
+  ct: ThemeTokens; def: ParamDef; id: string; value: string; onChange: (v: string) => void;
+  /** Blank, but LAMMPS needs a value here (generator missingParams): the step is skipped until it is filled. */
+  missing?: boolean;
+  /** Values offered while typing (the files in browser storage, for a file to read). */
+  suggestions?: string[];
+}> = ({
+  ct, def, id, value, onChange, missing = false, suggestions,
+}) => {
+  const label = (
+    <label id={`${id}-label`} htmlFor={id} className={`text-[11px] font-semibold ${ct.muted}`}>
+      {def.label}
+      {def.help && <span className={`ml-1 font-normal opacity-60`}>— {def.help}</span>}
+    </label>
+  );
+  const note = missing && (
+    <p id={`${id}-note`} className={`text-[11px] ${ct.invalidText}`}>Required: LAMMPS needs a value here, so this step is left out of the script until it is filled.</p>
+  );
+
+  if (def.type === 'enum' && def.options) {
+    const known = def.options.some(o => o.value === value);
+    return (
+      <div className="space-y-1">
+        {label}
+        <select
+          id={id}
+          value={value}
+          onChange={e => onChange(e.target.value)}
+          className={`w-full rounded border px-2.5 py-2 text-[13px] focus:border-[#7fa66b] focus:outline-none ${ct.input}`}
+        >
+          {!known && value !== '' && <option value={value}>{value} (imported)</option>}
+          {def.options.map(o => (
+            <option key={o.value} value={o.value}>{o.label ?? o.value}</option>
+          ))}
+        </select>
+      </div>
+    );
+  }
+
+  if (def.type === 'flag') {
+    return (
+      <div className="flex items-center justify-between">
+        {label}
+        <button
+          onClick={() => onChange(value === 'yes' ? 'no' : 'yes')}
+          aria-labelledby={`${id}-label`}
+          role="switch"
+          aria-checked={value === 'yes'}
+          className={`relative h-5 w-9 rounded-full transition-colors ${value === 'yes' ? ct.toggleOn : ct.toggleOff}`}
+        >
+          <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${value === 'yes' ? 'left-4' : 'left-0.5'}`} />
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-1">
+      {label}
+      <input
+        id={id}
+        type={def.type === 'number' ? 'number' : 'text'}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder={def.placeholder}
+        list={suggestions?.length ? `${id}-stored` : undefined}
+        aria-invalid={missing || undefined}
+        aria-describedby={missing ? `${id}-note` : undefined}
+        className={`w-full rounded border px-2.5 py-2 text-[13px] focus:border-[#7fa66b] focus:outline-none ${ct.input} ${missing ? ct.invalidField : ''}`}
+      />
+      {suggestions && suggestions.length > 0 && (
+        <>
+          <datalist id={`${id}-stored`}>
+            {suggestions.map(n => <option key={n} value={n} />)}
+          </datalist>
+          <p className={`text-[10px] ${ct.muted}`}>
+            Suggests the {suggestions.length} {suggestions.length === 1 ? 'file' : 'files'} in browser storage (the notebook reads them by name).
+          </p>
+        </>
+      )}
+      {note}
+    </div>
+  );
+};
+
+export default ScriptBuilder;

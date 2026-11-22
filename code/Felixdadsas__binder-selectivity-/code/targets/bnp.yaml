@@ -1,0 +1,21 @@
+# 靶点：人 BNP-32（B 型利钠肽，心衰的主要血液标志物）
+# 目标：设计一个能结合 BNP 的小蛋白
+# 肽序列直接写在这里，不需要 PDB 文件（官方 binding_disordered_peptides 例子就是这么做的）
+entities:
+  # 要设计的结合蛋白，长度固定 90 残基（固定是为了让三组可比，同时让批处理能用）
+  - protein:
+      id: A
+      sequence: 90
+
+  # 靶点：人 BNP-32，固定不变
+  # S P K M V Q G S G C F G R K M D R I S S S S G L G C K V L R R H
+  # 1 2 3 4 5 6 7 8 9 10            16        20        26      32
+  - protein:
+      id: B
+      sequence: SPKMVQGSGCFGRKMDRISSSSGLGCKVLRRH
+
+constraints:
+  # BNP 的 17 元环：Cys10 - Cys26 之间的二硫键
+  - bond:
+      atom1: [B, 10, SG]
+      atom2: [B, 26, SG]

@@ -1,0 +1,114 @@
+import numpy as np
+import pandas as pd
+
+from molsysmt._private.argdigest import arg_digest
+
+
+@arg_digest(form="molsysmt.GROFileHandler")
+def to_molsysmt_MolSys(
+    item,
+    atom_indices="all",
+    structure_indices="all",
+    get_missing_bonds=True,
+    skip_digestion=False,
+    *,
+    from_naming_scheme=None,
+):
+    """
+    Converting from molsysmt.GROFileHandler to molsysmt.MolSys.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    atom_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Atom indices (0-based) to include.
+    structure_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Structure indices (0-based) to include or process.
+    get_missing_bonds : object, default=True
+        Argument get_missing_bonds.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+    from_naming_scheme : str or none, optional
+        Explicit source group-name convention, applied before classification
+        and candidate connectivity inference. Defaults to None (undeclared).
+        No convention is inferred from the GRO file extension.
+
+    Returns
+    -------
+    molsysmt.MolSys
+        Resulting object in molsysmt.MolSys form.
+
+
+    .. versionadded:: 1.0.0
+    """
+
+    from molsysmt.build import get_missing_bonds as _get_missing_bonds
+    from molsysmt.native import MolSys
+
+    tmp_item = MolSys(
+        n_atoms=item.entry.n_atoms, n_groups=item.entry.n_groups, n_chains=1
+    )
+
+    tmp_item.topology.reset_groups(n_groups=item.entry.n_groups)
+    tmp_item.topology.reset_chains(n_chains=1)
+
+    tmp_item.topology.atoms.atom_id = item.entry.atom_ids
+    tmp_item.topology.atoms.atom_name = item.entry.atom_names
+    tmp_item.topology.atoms.group_index = item.entry.atom_group_index
+    tmp_item.topology.atoms.chain_index = np.zeros(
+        shape=[item.entry.n_atoms], dtype=int
+    )
+
+    tmp_item.topology.rebuild_atoms(redefine_ids=False, redefine_types=True)
+
+    tmp_item.topology.groups.group_id = item.entry.group_ids
+    tmp_item.topology.groups.group_name = item.entry.group_names
+
+    if from_naming_scheme is not None:
+        tmp_item.topology.set_group_naming_schemes(from_naming_scheme)
+
+    tmp_item.topology.rebuild_groups(redefine_ids=False, redefine_types=True)
+
+    tmp_item.topology.chains.iloc[0, 0] = "0"
+    tmp_item.topology.chains.iloc[0, 1] = "A"
+
+    tmp_item.structures.append(
+        coordinates=item.entry.coordinates,
+        box=item.entry.box,
+        velocities=item.entry.velocities,
+    )
+
+    if get_missing_bonds:
+        from molsysmt._private.amino_acid_templates import inference_selection
+
+        bonds = _get_missing_bonds(
+            tmp_item, selection=inference_selection(tmp_item.topology)
+        )
+        bonds = np.array(bonds)
+        tmp_item.chemical_states._set_chemical_state_bonds(
+            pd.DataFrame(columns=["atom1_index", "atom2_index"])
+        )
+        tmp_item.chemical_states._append_chemical_state_bonds(bonds, sort=False)
+
+        del bonds
+
+        tmp_item.rebuild_components()
+        tmp_item.topology.rebuild_molecules()
+        tmp_item.topology.rebuild_chains(
+            redefine_indices=False,
+            redefine_ids=False,
+            redefine_types=True,
+            redefine_names=False,
+        )
+        tmp_item.topology.rebuild_entities()
+
+    tmp_item = tmp_item.extract(
+        atom_indices=atom_indices,
+        structure_indices=structure_indices,
+        copy_if_all=False,
+        skip_digestion=True,
+    )
+
+    return tmp_item

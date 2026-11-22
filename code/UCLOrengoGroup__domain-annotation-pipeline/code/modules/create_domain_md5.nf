@@ -1,0 +1,22 @@
+process create_md5 {
+    label 'sge_low'
+    container "ghcr.io/uclorengogroup/domain-annotation-pipeline-cath-af-cli:${params.container_tag_name}" 
+
+    input:
+    tuple val(id), path(chopped_pdb_tar_file)
+    
+    output:
+    tuple val(id), path("output_${id}.tsv") 
+    
+    // added id to intermediate files and dos2unix to recognise end of lines correctly.
+    script:
+    """
+    mkdir -p pdb
+    tar -xzf ${chopped_pdb_tar_file} -C pdb
+    cath-af-cli pdb-to-md5 -d ./pdb -o output_${id}_tmp.tsv
+    dos2unix -n output_${id}_tmp.tsv output_${id}.unsorted.tsv || tr -d '\\r' < output_${id}_tmp.tsv > output_${id}.unsorted.tsv
+    head -n 1 output_${id}.unsorted.tsv > output_${id}.tsv
+    tail -n +2 output_${id}.unsorted.tsv | sort >> output_${id}.tsv
+    rm -rf pdb
+    """
+}

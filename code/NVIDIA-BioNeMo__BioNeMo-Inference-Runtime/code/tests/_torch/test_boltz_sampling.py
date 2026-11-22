@@ -1,0 +1,483 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Focused guards for Boltz's specialized EDM rollout."""
+
+from math import sqrt
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn as nn
+
+from bionemo_ir._torch.layers.random_augmentation import random_rotations
+from bionemo_ir._torch.modules.boltz import structure as boltz_structure
+from bionemo_ir._torch.modules.boltz.physical.steering import BoltzSteeringParams
+from bionemo_ir._torch.modules.boltz.structure import (
+    BoltzDiffusionSampler,
+    BoltzEDMDenoiseStep,
+    BoltzEDMIntegrator,
+)
+from bionemo_ir._torch.sampling import (
+    DenoiseHookPipeline,
+    DenoiseIntegratorTemplate,
+    EDMIntegratorConfig,
+    EDMRolloutPlan,
+    SamplingContext,
+)
+from bionemo_ir._torch.sampling.frame_reuse import FrameReusePeriod
+from bionemo_ir.models.boltz2.config import AtomDiffusionConfig
+
+
+class _RecordBeforeDenoise:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def before_denoise(
+        self,
+        step: BoltzEDMDenoiseStep,
+        context: SamplingContext,
+    ) -> BoltzEDMDenoiseStep:
+        del context
+        self.events.append("before")
+        return step
+
+
+class _RecordAfterDenoise:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def after_denoise(
+        self,
+        step: BoltzEDMDenoiseStep,
+        context: SamplingContext,
+    ) -> BoltzEDMDenoiseStep:
+        del context
+        self.events.append("after")
+        return step
+
+
+class _StubScoreModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()), requires_grad=False)
+        self.dtype = torch.float32
+
+
+class _StubBoltzDiffusionSampler(BoltzDiffusionSampler):
+    """Small sampler-only fixture that avoids constructing the score network."""
+
+    def __init__(self) -> None:
+        nn.Module.__init__(self)
+        self.diffusion_module = _StubScoreModel()
+        self.runner = boltz_structure.GenerativeRunner()
+        self.gamma0 = 0.8
+        self.gamma_min = 1.0
+        self.noise_scale = 1.003
+        self.step_scale = 1.0
+        self.edm_integrator_config = EDMIntegratorConfig(
+            gamma0=self.gamma0,
+            gamma_min=self.gamma_min,
+            noise_scale=self.noise_scale,
+            step_scale=self.step_scale,
+        )
+        self.sigma_min = 4e-4
+        self.sigma_max = 2.0
+        self.sigma_data = 1.0
+        self.rho = 7.0
+        self.num_sampling_steps = 4
+        self.version = "v2"
+        self.alignment_reverse_diff = False
+        self.coordinate_augmentation = True
+        self.out_token_feat_update = None
+        self.frame_reuse_period = 0
+        self.events: list[str] = []
+        self.record_hooks = False
+        self.network_calls = 0
+
+    def build_denoise_hook_pipeline(self, **kwargs) -> tuple[DenoiseHookPipeline, int]:
+        pipeline, multiplicity = super().build_denoise_hook_pipeline(**kwargs)
+        if not self.record_hooks:
+            return pipeline, multiplicity
+        return DenoiseHookPipeline(
+            (*pipeline.before_denoise_hooks, _RecordBeforeDenoise(self.events)),
+            (*pipeline.after_denoise_hooks, _RecordAfterDenoise(self.events)),
+        ), multiplicity
+
+    def denoise(
+        self,
+        *,
+        noised_atom_coords: torch.Tensor,
+        **_kwargs,
+    ) -> tuple[torch.Tensor, None]:
+        if self.record_hooks:
+            self.events.append("network")
+        self.network_calls += 1
+        return 0.7 * noised_atom_coords, None
+
+
+def _sampler_config() -> SimpleNamespace:
+    atom_diffusion = SimpleNamespace(
+        gamma_0=0.8,
+        gamma_min=1.0,
+        noise_scale=1.003,
+        step_scale=1.0,
+        sigma_min=4e-4,
+        sigma_max=2.0,
+        sigma_data=1.0,
+        rho=7.0,
+        P_mean=-1.2,
+        P_std=1.5,
+        num_sampling_steps=4,
+        coordinate_augmentation=True,
+        version="v2",
+        alignment_reverse_diff=False,
+        synchronize_sigmas=False,
+        accumulate_token_repr=False,
+    )
+    score_model = SimpleNamespace(dim_fourier=256, token_s=384, graph_optimization_config=None)
+    return SimpleNamespace(atom_diffusion=atom_diffusion, score_model=score_model)
+
+
+def test_boltz_sampler_owns_injected_diffusion_module():
+    diffusion_module = _StubScoreModel()
+    sampler = BoltzDiffusionSampler(_sampler_config(), diffusion_module)
+
+    assert sampler.diffusion_module is diffusion_module
+    assert "score_model" not in sampler._modules
+
+
+def test_boltz_sampler_maps_converted_score_model_weights(monkeypatch):
+    sampler = BoltzDiffusionSampler(_sampler_config(), _StubScoreModel())
+    converted_weight = object()
+    captured = {}
+
+    def record_weights(module, weights):
+        assert module is sampler
+        captured.update(weights)
+        return set(weights)
+
+    monkeypatch.setattr(boltz_structure, "recursive_calling_load_weights", record_weights)
+    sampler.load_weights({"score_model.token_transformer": converted_weight})
+
+    assert captured == {"diffusion_module.token_transformer": converted_weight}
+
+
+def test_boltz_diffusion_region_targets_sampler_graph():
+    from bionemo_ir.models.boltz1.modeling import Boltz1
+    from bionemo_ir.models.boltz2.modeling import Boltz2
+
+    for model_cls in (Boltz1, Boltz2):
+        assert model_cls.GRAPH_REGIONS["diffusion_module"] == "diffusion_sampler.graph"
+
+
+@pytest.fixture
+def no_potentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Steering without potentials, so the stub sampler needs no feature dict."""
+    monkeypatch.setattr(boltz_structure, "get_potentials", lambda *_args, **_kwargs: [])
+
+
+def _fk_steering() -> BoltzSteeringParams:
+    return BoltzSteeringParams(
+        fk_steering=True, num_particles=2, physical_guidance_update=False, contact_guidance_update=False
+    )
+
+
+def _network_condition() -> dict[str, torch.Tensor]:
+    return {
+        "q": torch.zeros(1),
+        "c": torch.zeros(1),
+        "atom_enc_bias": torch.zeros(1),
+        "token_trans_bias": torch.zeros(1),
+        "atom_dec_bias": torch.zeros(1),
+    }
+
+
+def _reference_sample(
+    sampler: _StubBoltzDiffusionSampler,
+    seed: int,
+    num_steps: int,
+    multiplicity: int,
+    num_atoms: int,
+    reused: frozenset[int] = frozenset(),
+) -> torch.Tensor:
+    generator = torch.Generator(device=sampler.device)
+    generator.manual_seed(seed)
+    sigmas = sampler.sample_schedule(num_steps)
+    gammas = torch.where(sigmas > sampler.gamma_min, sampler.gamma0, 0.0)
+    coords_shape = (1, multiplicity, num_atoms, 3)
+    atom_coords = sigmas[0] * torch.randn(coords_shape, generator=generator)
+    atom_coords_denoised = None
+
+    for step, (sigma_last, sigma_next, gamma) in enumerate(zip(sigmas[:-1], sigmas[1:], gammas[1:], strict=True)):
+        rotation = random_rotations(
+            multiplicity, device=atom_coords.device, dtype=atom_coords.dtype, generator=generator
+        ).view(1, multiplicity, 3, 3)
+        translation = torch.randn((1, multiplicity, 1, 3), dtype=atom_coords.dtype, generator=generator)
+        atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
+        atom_coords = torch.einsum("bmnd,bmds->bmns", atom_coords, rotation) + translation
+        if atom_coords_denoised is not None:
+            atom_coords_denoised = atom_coords_denoised - atom_coords_denoised.mean(dim=-2, keepdims=True)
+            atom_coords_denoised = torch.einsum("bmnd,bmds->bmns", atom_coords_denoised, rotation) + translation
+
+        sigma_last = sigma_last.item()
+        sigma_next = sigma_next.item()
+        sigma_hat = sigma_last * (1 + gamma.item())
+        noise_variance = sampler.noise_scale**2 * (sigma_hat**2 - sigma_last**2)
+        noise = sqrt(noise_variance) * torch.randn(coords_shape, generator=generator)
+        atom_coords_noisy = atom_coords + noise
+        if step not in reused:
+            atom_coords_denoised = 0.7 * atom_coords_noisy
+        atom_coords = (
+            atom_coords_noisy
+            + sampler.step_scale * (sigma_next - sigma_hat) * (atom_coords_noisy - atom_coords_denoised) / sigma_hat
+        )
+    return atom_coords
+
+
+def test_boltz_specialized_sampler_uses_explicit_seed():
+    sampler = _StubBoltzDiffusionSampler()
+    features = {"atom_pad_mask": torch.ones(1, 5)}
+    kwargs = {
+        "s_trunk": torch.zeros(1),
+        "s_inputs": torch.zeros(1),
+        "num_sampling_steps": 4,
+        "multiplicity": 2,
+        "max_parallel_samples": 1,
+        "feature_dict": features,
+        "sampling_seed": 17,
+    }
+
+    first = sampler(network_condition_kwargs=_network_condition(), **kwargs)
+    torch.manual_seed(123456)
+    second = sampler(network_condition_kwargs=_network_condition(), **kwargs)
+
+    first_coords = first["sample_atom_coords"]
+    assert first_coords.shape == (1, 2, 5, 3)
+    assert torch.isfinite(first_coords).all()
+    assert first["diff_token_repr"] is None
+    torch.testing.assert_close(first_coords, second["sample_atom_coords"])
+    torch.testing.assert_close(
+        first_coords,
+        _reference_sample(sampler, seed=17, num_steps=4, multiplicity=2, num_atoms=5),
+    )
+
+    graph_safe_kwargs = {**kwargs, "sampling_seed": None}
+    torch.manual_seed(19)
+    graph_safe_first = sampler(network_condition_kwargs=_network_condition(), **graph_safe_kwargs)
+    torch.manual_seed(19)
+    graph_safe_second = sampler(network_condition_kwargs=_network_condition(), **graph_safe_kwargs)
+    torch.testing.assert_close(graph_safe_first["sample_atom_coords"], graph_safe_second["sample_atom_coords"])
+
+
+def test_boltz_implements_template_directly_and_orders_hooks():
+    sampler = _StubBoltzDiffusionSampler()
+    integrator = sampler.build_edm_integrator(DenoiseHookPipeline())
+    assert isinstance(integrator, BoltzEDMIntegrator)
+    assert isinstance(integrator, DenoiseIntegratorTemplate)
+
+    sampler.record_hooks = True
+    sampler(
+        s_trunk=torch.zeros(1),
+        s_inputs=torch.zeros(1),
+        num_sampling_steps=2,
+        multiplicity=1,
+        max_parallel_samples=1,
+        network_condition_kwargs=_network_condition(),
+        feature_dict={"atom_pad_mask": torch.ones(1, 3)},
+        sampling_seed=5,
+    )
+
+    assert sampler.events == ["before", "network", "after"] * 2
+
+
+def test_potential_guidance_hook_owns_particle_resampling(no_potentials):
+    sampler = _StubBoltzDiffusionSampler()
+    steering = _fk_steering()
+    output = sampler(
+        s_trunk=torch.zeros(1),
+        s_inputs=torch.zeros(1),
+        num_sampling_steps=2,
+        multiplicity=2,
+        max_parallel_samples=2,
+        steering_args=steering,
+        network_condition_kwargs=_network_condition(),
+        feature_dict={"atom_pad_mask": torch.ones(1, 3)},
+        sampling_seed=11,
+    )
+
+    # The hook expands to particles internally and collapses them on the last
+    # step, so the public sample multiplicity remains unchanged.
+    assert output["sample_atom_coords"].shape == (1, 2, 3, 3)
+
+
+def test_coordinate_augmentation_gates_the_rigid_hook():
+    sampler = _StubBoltzDiffusionSampler()
+    kwargs = {
+        "steering_args": None,
+        "atom_mask": torch.ones(1, 3),
+        "multiplicity": 1,
+        "num_sampling_steps": 2,
+        "feature_dict": {"atom_pad_mask": torch.ones(1, 3)},
+    }
+
+    pipeline_on, _ = sampler.build_denoise_hook_pipeline(**kwargs)
+    assert isinstance(pipeline_on.before_denoise_hooks[0], boltz_structure.BoltzRandomRigidAugmentationHook)
+    assert isinstance(pipeline_on.before_denoise_hooks[1], boltz_structure.PotentialGuidanceHook)
+    assert isinstance(pipeline_on.before_denoise_hooks[2], boltz_structure.BoltzEDMChurnHook)
+
+    sampler.coordinate_augmentation = False
+    pipeline_off, _ = sampler.build_denoise_hook_pipeline(**kwargs)
+    assert not any(
+        isinstance(hook, boltz_structure.BoltzRandomRigidAugmentationHook) for hook in pipeline_off.before_denoise_hooks
+    )
+    assert isinstance(pipeline_off.before_denoise_hooks[0], boltz_structure.PotentialGuidanceHook)
+    assert isinstance(pipeline_off.before_denoise_hooks[1], boltz_structure.BoltzEDMChurnHook)
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+@pytest.mark.parametrize("alignment", [False, True])
+@pytest.mark.parametrize("steering", [False, True])
+def test_prepared_sampler_features(
+    monkeypatch: pytest.MonkeyPatch, no_potentials: None, version: str, alignment: bool, steering: bool
+) -> None:
+    sampler = _StubBoltzDiffusionSampler()
+    sampler.version = version
+    sampler.alignment_reverse_diff = alignment
+    steering_args = _fk_steering() if steering else None
+    kwargs = {
+        "s_trunk": torch.zeros(1),
+        "s_inputs": torch.zeros(1),
+        "num_sampling_steps": 4,
+        "multiplicity": 2,
+        "max_parallel_samples": 1,
+        "feature_dict": {"atom_pad_mask": torch.ones(1, 5)},
+        "sampling_seed": 17,
+        "steering_args": steering_args,
+    }
+    prepared = sampler(network_condition_kwargs=_network_condition(), **kwargs)
+    post_init = EDMRolloutPlan.__post_init__
+
+    def unprepared(self: EDMRolloutPlan, integrator_config: EDMIntegratorConfig | None) -> None:
+        del integrator_config
+        post_init(self, None)
+
+    monkeypatch.setattr(EDMRolloutPlan, "__post_init__", unprepared)
+    plain = sampler(network_condition_kwargs=_network_condition(), **kwargs)
+    torch.testing.assert_close(prepared["sample_atom_coords"], plain["sample_atom_coords"], atol=0, rtol=0)
+
+
+def _boltz2_schedule_sampler(frame_reuse_period: FrameReusePeriod) -> _StubBoltzDiffusionSampler:
+    sampler = _StubBoltzDiffusionSampler()
+    config = AtomDiffusionConfig()  # the Boltz-2 noise schedule
+    for name in ("sigma_min", "sigma_max", "sigma_data", "rho"):
+        setattr(sampler, name, getattr(config, name))
+    sampler.frame_reuse_period = frame_reuse_period
+    return sampler.eval()
+
+
+def _sample_kwargs(num_steps: int, **overrides) -> dict:
+    return {
+        "s_trunk": torch.zeros(1),
+        "s_inputs": torch.zeros(1),
+        "num_sampling_steps": num_steps,
+        "multiplicity": 2,
+        "max_parallel_samples": 2,
+        "network_condition_kwargs": _network_condition(),
+        "feature_dict": {"atom_pad_mask": torch.ones(1, 5)},
+        "sampling_seed": 17,
+        **overrides,
+    }
+
+
+def test_frame_reuse_takes_the_mapped_prediction_in_the_churn_free_tail():
+    # Boltz-2's schedule at 200 steps: churn stops at step 154, the last two steps stay fresh.
+    reused = frozenset(step for step in range(154, 198) if (step - 154) % 4)
+    assert len(reused) == 33
+
+    sampler = _boltz2_schedule_sampler(4)
+    output = sampler(**_sample_kwargs(200))["sample_atom_coords"]
+    assert sampler.network_calls == 200 - 33
+    torch.testing.assert_close(
+        output, _reference_sample(sampler, seed=17, num_steps=200, multiplicity=2, num_atoms=5, reused=reused)
+    )
+
+    exact = _boltz2_schedule_sampler(0)
+    exact_output = exact(**_sample_kwargs(200))["sample_atom_coords"]
+    assert exact.network_calls == 200
+    torch.testing.assert_close(
+        exact_output, _reference_sample(exact, seed=17, num_steps=200, multiplicity=2, num_atoms=5)
+    )
+
+
+def test_frame_reuse_rejects_what_it_cannot_reuse(no_potentials):
+    for steps in (50, 100, 150):
+        with pytest.raises(ValueError, match=f"only evaluated with \\(200, 400\\) sampling steps; got {steps}"):
+            _boltz2_schedule_sampler(4)(**_sample_kwargs(steps))
+
+    with pytest.raises(ValueError, match="steering"):
+        _boltz2_schedule_sampler(4)(**_sample_kwargs(200, steering_args=_fk_steering()))
+
+    with pytest.raises(ValueError, match="inference-only"):
+        _boltz2_schedule_sampler(4).train()(**_sample_kwargs(200))
+
+    sampler = _boltz2_schedule_sampler(4)
+    sampler.out_token_feat_update = nn.Identity()
+    with pytest.raises(ValueError, match="accumulate_token_repr"):
+        sampler(**_sample_kwargs(200))
+
+    sampler = _boltz2_schedule_sampler(4)
+    sampler.coordinate_augmentation = False
+    with pytest.raises(ValueError, match="coordinate augmentation"):
+        sampler(**_sample_kwargs(200))
+
+
+def test_boltz2_rejects_a_forced_period_before_the_trunk():
+    from bionemo_ir.models.boltz2.modeling import Boltz2
+
+    steering = _fk_steering()
+    # The check runs before the trunk, so the stand-in needs nothing the trunk would read.
+    model = SimpleNamespace(steering_args=None, diffusion_sampler=_boltz2_schedule_sampler(4))
+    with pytest.raises(ValueError, match="got 100"):
+        Boltz2.forward(model, feed_dict={}, num_sampling_steps=100)
+    with pytest.raises(ValueError, match="got 4"):  # None takes the sampler's own step count
+        Boltz2.forward(model, feed_dict={}, num_sampling_steps=None)
+    with pytest.raises(ValueError, match="steering"):
+        Boltz2.forward(model, feed_dict={}, num_sampling_steps=200, steering_args=steering)
+    for setting in (0, "auto"):
+        model.diffusion_sampler.frame_reuse_period = setting
+        model.diffusion_sampler.require_forced_frame_reuse_call(100, steering)
+
+
+@pytest.mark.parametrize("steps, calls", [(100, 100), (150, 150), (200, 167), (400, 334)])
+def test_auto_frame_reuse_runs_where_boltz_kept_its_accuracy(steps: int, calls: int) -> None:
+    sampler = _boltz2_schedule_sampler("auto")
+    sampler(**_sample_kwargs(steps))
+    assert sampler.network_calls == calls
+
+
+def test_auto_frame_reuse_falls_back_to_exact(no_potentials):
+    # Particles double the samples, so each step takes two denoiser chunks.
+    sampler = _boltz2_schedule_sampler("auto")
+    sampler(**_sample_kwargs(200, steering_args=_fk_steering()))
+    assert sampler.network_calls == 2 * 200
+
+    sampler = _boltz2_schedule_sampler("auto").train()
+    sampler(**_sample_kwargs(200))
+    assert sampler.network_calls == 200
+
+    sampler = _boltz2_schedule_sampler("auto")
+    sampler.coordinate_augmentation = False
+    sampler(**_sample_kwargs(200))
+    assert sampler.network_calls == 200

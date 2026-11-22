@@ -1,0 +1,919 @@
+//! Where simulated things are, and what a run of them looks like.
+//!
+//! The middle layer. [`pantometry-core`](https://docs.rs/pantometry-core) says what evolves and what it
+//! conserves; a view says how to draw it; this says **where things sit and what shape their
+//! output is**.
+//!
+//! # It knows no physics, and that is the point
+//!
+//! Nothing here names a domain. It asks each one what it offers —
+//! [`as_field`](pantometry_core::Domain::as_field) for a continuum,
+//! [`as_bodies`](pantometry_core::Domain::as_bodies) for a countable set,
+//! [`readings`](pantometry_core::Domain::readings) for scalars — and builds a [`Frame`] from the
+//! answers. A physics that arrives tomorrow gets captured without this crate being edited, which
+//! is the property the whole workspace is arranged around.
+//!
+//! That was not free. Pulling this layer out of the application found three places where it had
+//! been matching on domain types instead: one for scalars, one for bodies, one for a field's
+//! extent. The first two became trait methods on `Domain`. The third became [`Placement`].
+//!
+//! Knowing no physics does not make a layer complete, and this one was not. [`Extent`] described
+//! a *plane* until a domain with a genuinely three-dimensional field arrived, and the gap did not
+//! announce itself: the sampler built its position as `(u, v, 0)`, so a solid would have been
+//! captured as its `z = 0` face and drawn as a perfectly plausible picture of a block. Nothing
+//! here could have caught that, because every field this crate had ever been handed was flat. The
+//! lesson is not about `Extent` — it is that a layer's assumptions are only visible from below.
+//!
+//! # Two kinds of placement, and why they are one type with two fields
+//!
+//! A [`Pose`] changes what the physics computes: two solids in contact, a grid rotated against
+//! its neighbour. It lives in the kernel because physics needs it.
+//!
+//! A [`Placement::marker`] is a position handed to something that *has* no geometry, purely so a
+//! viewer can put it somewhere. A thermal network node has a capacity and not a position, and a
+//! conductance is not a distance — giving one a coordinate is a statement about a diagram.
+//!
+//! They are separated by **which crate they live in**, not by a naming convention. `Pose` is
+//! below; `marker` is here, above every domain, where no physics can reach it. If they shared a
+//! home a drawing coordinate would eventually arrive in a conductance and nothing would fail
+//! loudly.
+
+#![deny(missing_docs)]
+#![forbid(unsafe_code)]
+
+use pantometry_core::{Pose, Reading, ScalarField, Simulation};
+
+/// Where a field's samples sit inside the box it occupies, re-exported from the kernel.
+///
+/// [`PanelData::Field`] carries one, and `pantometry-view` deliberately does not depend on
+/// `pantometry-core` — the wire format is this crate's, so anything the format names has to be
+/// reachable from here or that boundary is a lie.
+pub use pantometry_core::Lattice;
+use pantometry_units::{Length, LengthVec, Time};
+use std::collections::BTreeMap;
+
+/// The region a field occupies, in its own coordinates, and how finely to sample it.
+///
+/// A [`ScalarField`] is a function of position and **does not know
+/// where it stops** — that is the right division, since a field that knew its own bounds would be
+/// a mesh, but it means somebody has to say. This is where.
+///
+/// `samples` is a request rather than a property: the same field can be captured coarsely for a
+/// thumbnail and finely for a paper, and neither is more true than the other.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Extent {
+    /// The low corner, in the domain's own coordinates.
+    pub min: LengthVec,
+    /// The high corner.
+    pub max: LengthVec,
+    /// How many samples along x, y and z. A count of one collapses that axis: `(n, 1, 1)` is a
+    /// line, `(n, m, 1)` a plane, and all three above one a volume.
+    ///
+    /// **Three, not two.** It was a pair until a domain with a genuinely three-dimensional field
+    /// arrived, and a pair does not fail when handed one — it samples the `z = min` slice and
+    /// returns a perfectly plausible picture of a solid. That is the shape of failure this
+    /// workspace keeps finding: not a wrong answer, a *narrower* one, with nothing to say so.
+    pub samples: (usize, usize, usize),
+}
+
+impl Extent {
+    /// A box from two corners, sampled `nx` by `ny` by `nz`.
+    pub fn new(min: LengthVec, max: LengthVec, nx: usize, ny: usize, nz: usize) -> Extent {
+        Extent {
+            min,
+            max,
+            samples: (nx.max(1), ny.max(1), nz.max(1)),
+        }
+    }
+
+    /// How many samples this asks for in total.
+    pub fn count(&self) -> usize {
+        self.samples.0 * self.samples.1 * self.samples.2
+    }
+
+    /// How many of the three axes actually vary — 1, 2 or 3.
+    ///
+    /// What a view should dispatch on, rather than on the counts directly: a `(60, 1, 1)` line
+    /// and a `(1, 60, 1)` line are the same kind of thing to draw and differ only in which way
+    /// they point.
+    pub fn dimensions(&self) -> usize {
+        let (nx, ny, nz) = self.samples;
+        [nx, ny, nz].iter().filter(|&&n| n > 1).count().max(1)
+    }
+
+    /// A line along x, for a domain with one dimension.
+    pub fn line(length: Length, cells: usize) -> Extent {
+        Extent::new(
+            LengthVec::ZERO,
+            LengthVec::from_si(glam::DVec3::new(length.to_si(), 0.0, 0.0)),
+            cells.max(2),
+            1,
+            1,
+        )
+    }
+
+    /// A rectangle in the x–y plane.
+    pub fn rectangle(width: Length, height: Length, nx: usize, ny: usize) -> Extent {
+        Extent::new(
+            LengthVec::ZERO,
+            LengthVec::from_si(glam::DVec3::new(width.to_si(), height.to_si(), 0.0)),
+            nx,
+            ny,
+            1,
+        )
+    }
+
+    /// A box from the origin, sampled on a regular grid.
+    ///
+    /// The counts are given separately from the size because they are different questions: a
+    /// block that is long and thin is still worth sampling evenly *in space*, which means more
+    /// samples along the long axis and not larger ones.
+    pub fn volume(size: LengthVec, nx: usize, ny: usize, nz: usize) -> Extent {
+        Extent::new(LengthVec::ZERO, size, nx, ny, nz)
+    }
+}
+
+/// Where one domain sits in the world, and how big it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Placement {
+    /// The rigid motion from the domain's coordinates into the world's. **Physical**: it changes
+    /// what the physics computes once anything reads across it.
+    pub pose: Pose,
+    /// The region to sample, for a domain that is a field. `None` for everything else.
+    pub extent: Option<Extent>,
+    /// A position for a domain that has no geometry at all, so a viewer can place it on a
+    /// diagram. **Presentational**, and unreachable from any physics — see the module docs.
+    pub marker: Option<LengthVec>,
+}
+
+impl Placement {
+    /// Placed by a pose, with no field and no marker.
+    pub fn at(pose: Pose) -> Placement {
+        Placement {
+            pose,
+            ..Placement::default()
+        }
+    }
+
+    /// A field of this extent, at the origin.
+    pub fn field(extent: Extent) -> Placement {
+        Placement {
+            extent: Some(extent),
+            ..Placement::default()
+        }
+    }
+
+    /// Somewhere to draw a domain that has nowhere to be.
+    pub fn marked(marker: LengthVec) -> Placement {
+        Placement {
+            marker: Some(marker),
+            ..Placement::default()
+        }
+    }
+
+    /// The same placement, moved.
+    pub fn with_pose(mut self, pose: Pose) -> Placement {
+        self.pose = pose;
+        self
+    }
+}
+
+/// One instant of a run: every domain's output, in whatever shape it has.
+#[derive(Clone, Debug)]
+pub struct Frame {
+    /// Simulation time, in seconds.
+    pub time_s: f64,
+    /// One per domain that had something to draw, in the order they were placed.
+    pub panels: Vec<Panel>,
+    /// Named scalars from every domain, drawable or not.
+    pub readings: Vec<Reading>,
+}
+
+/// Where a panel's own coordinates sit in the world.
+///
+/// # Why a run needs this at all
+///
+/// It did not have it, and the consequence was measured rather than argued: two blocks half a
+/// metre apart exported to glTF **on top of each other**, both at their local origin. `capture`
+/// held the placement and threw the pose away for fields (`let _ = pose`), while bodies and
+/// paths had it multiplied into their positions. Two coordinate conventions in one file, and
+/// nothing in the file saying which a panel used.
+///
+/// No shipped scene states a `poses` block, so every one of them has an identity pose and not
+/// one could show the defect.
+///
+/// # Local coordinates and a placement, not world coordinates
+///
+/// The alternative was to bake the pose into the values, which is what bodies used to do. Two
+/// reasons not to, and the second is the one that decides it:
+///
+/// - **A field's extent should not change when the field is moved.** `PanelData::Field`'s doc
+///   has said so since the key existed, and it is right: how long the bar is is a property of
+///   the bar.
+/// - **A rotated box has no axis-aligned extent.** Bodies used to pose their cell's two corners
+///   and take the min and max of the result, which for any rotation is a *bounding* box —
+///   bigger than the cell, and not recoverable. Carrying the pose keeps the cell exact.
+///
+/// # A quaternion, not an axis and an angle
+///
+/// The scene format states a turn as an axis and degrees, because a person writes it. This is
+/// written and read by programs, and a quaternion needs no conversion at either end — the same
+/// shape, in the same component order, that a glTF node's `rotation` takes, which is exactly
+/// where it is going. Spelling it as an axis and an angle here would mean a second copy of that
+/// conversion, and this workspace has already paid for second copies of arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placed {
+    /// The origin of the panel's own frame, in world metres.
+    pub at_m: [f64; 3],
+    /// The rotation about that origin, as a unit quaternion `[x, y, z, w]` — glTF's order.
+    pub turn: [f64; 4],
+}
+
+impl Placed {
+    /// At the origin, unrotated: a panel whose own coordinates are already the world's.
+    pub const HERE: Placed = Placed {
+        at_m: [0.0, 0.0, 0.0],
+        turn: [0.0, 0.0, 0.0, 1.0],
+    };
+
+    /// Whether this is [`Placed::HERE`] to the bit.
+    ///
+    /// Exact rather than approximate, and used to decide whether a writer emits a transform at
+    /// all: a pose that is identity in every scene ever shipped should not put a node transform
+    /// into every file, and "near enough" would make that decision depend on rounding.
+    pub fn is_here(&self) -> bool {
+        *self == Placed::HERE
+    }
+
+    /// A point in the panel's own frame, in the world's.
+    ///
+    /// **Turn first, then move** — a glTF node's composition and a USD
+    /// `xformOpOrder = [translate, orient]`, so a writer and a reader put the same run in the same
+    /// place. `v + 2 q⃗ × (q⃗ × v + w v)`, which is `q v q*` without building a matrix.
+    ///
+    /// There is a second copy of this in `viewer-core`, and that is the one duplication here that
+    /// is *paid for*: that crate deliberately does not link this one, because the wire format is
+    /// the boundary between them and a viewer that could reach the library would come to depend on
+    /// it. Everything on this side of the boundary calls this.
+    pub fn apply(&self, p: [f64; 3]) -> [f64; 3] {
+        let [qx, qy, qz, qw] = self.turn;
+        let t = [
+            qy * p[2] - qz * p[1] + qw * p[0],
+            qz * p[0] - qx * p[2] + qw * p[1],
+            qx * p[1] - qy * p[0] + qw * p[2],
+        ];
+        [
+            p[0] + 2.0 * (qy * t[2] - qz * t[1]) + self.at_m[0],
+            p[1] + 2.0 * (qz * t[0] - qx * t[2]) + self.at_m[1],
+            p[2] + 2.0 * (qx * t[1] - qy * t[0]) + self.at_m[2],
+        ]
+    }
+
+    /// The turn as an axis and an angle in **degrees**, which is how a scene writes one.
+    ///
+    /// A quaternion's four numbers carry a constraint between them that no file can express, so
+    /// the scene format states a rotation as an axis and an angle -- and anything that shows a
+    /// placement to a person has to come back the same way. A caption reading
+    /// `(0, 0, 0.707, 0.707)` tells nobody anything.
+    ///
+    /// **`atan2` rather than `acos(w)`, and the reason is the opposite of the one written down.**
+    /// The editor, where this arithmetic was worked out, said `acos` loses precision *near a half
+    /// turn*. It does not: at a half turn `w` is zero and `|d acos/dw|` is **1**, which is the
+    /// best-conditioned point on the curve. It is the *small* angle that hurts, where `w` → 1 and
+    /// the derivative goes as `1/sqrt(1 - w^2)` — 1.1e5 at a thousandth of a degree. Measured:
+    ///
+    /// | turn | `acos` | `atan2` |
+    /// | --- | --- | --- |
+    /// | 0.0001° | 4.6e-5 | 0 |
+    /// | 0.001° | 4.0e-7 | 2.2e-16 |
+    /// | 1° | 2.8e-13 | 0 |
+    /// | 180° | 0 | 0 |
+    ///
+    /// So the choice was right and the account of it was backwards, which is worth more than the
+    /// choice: a nudge of a rotation ring is exactly the small angle, and a reader told to worry
+    /// about half turns would have moved the guard to the wrong end.
+    ///
+    /// An identity returns `+z` and zero degrees rather than a `NaN` axis from normalising a zero
+    /// vector.
+    pub fn axis_angle(&self) -> ([f64; 3], f64) {
+        let [x, y, z, w] = self.turn;
+        let sin_half = (x * x + y * y + z * z).sqrt();
+        if sin_half < 1e-12 {
+            return ([0.0, 0.0, 1.0], 0.0);
+        }
+        (
+            [x / sin_half, y / sin_half, z / sin_half],
+            (2.0 * sin_half.atan2(w)).to_degrees(),
+        )
+    }
+
+    /// A [`Pose`] in the shape a writer emits: a translation and a unit quaternion in
+    /// `[x, y, z, w]`.
+    ///
+    /// **The one place a pose becomes a placement.** `capture` uses it for every panel and the
+    /// editor uses it for a scene's designed parts, and the two must not come to different
+    /// answers about the same pose -- a designed mesh drawn beside the cells it was rasterised
+    /// onto is the picture that shows how much the grid lost, and it only shows that if both are
+    /// in the same frame.
+    ///
+    /// `[x, y, z, w]` because that is a glTF node's `rotation` and glTF is where it first went.
+    /// USD writes `(w, x, y, z)` and its writer does the reordering; see `usd::write_xform`.
+    pub fn of(pose: Pose) -> Placed {
+        let t = pose.translation().to_si();
+        let q = pose.rotation();
+        Placed {
+            at_m: [t.x, t.y, t.z],
+            turn: [q.x, q.y, q.z, q.w],
+        }
+    }
+}
+
+impl Default for Placed {
+    fn default() -> Placed {
+        Placed::HERE
+    }
+}
+
+/// One domain, captured.
+#[derive(Clone, Debug)]
+pub struct Panel {
+    /// Which domain this came from.
+    pub name: String,
+    /// What the values mean, for a legend.
+    pub unit: &'static str,
+    /// Where this panel's own coordinates sit in the world. See [`Placed`].
+    pub place: Placed,
+    /// The shape of what was captured.
+    pub data: PanelData,
+}
+
+/// A continuum sampled on a grid, bodies at positions, runs of connected points, or a surface of
+/// triangles.
+///
+/// Four shapes, and the first two are why there is more than one: domains genuinely are two kinds
+/// of thing, and collapsing them would mean inventing a continuum for the bodies or a body count
+/// for the field. Paths are rays and trajectories; a surface is a solid a renderer can light.
+#[derive(Clone, Debug)]
+pub enum PanelData {
+    /// A field, sampled on a grid of one, two or three dimensions.
+    Field {
+        /// Samples along x.
+        nx: usize,
+        /// Samples along y. One for a line.
+        ny: usize,
+        /// Samples along z. One for a line or a plane.
+        ///
+        /// A view that ignores this draws the `z = 0` slice of a solid and calls it the solid.
+        /// It is a separate field rather than folded into `ny` for exactly that reason: an
+        /// `nx * (ny*nz)` grid would still *render*, as a plane with the slices stacked into a
+        /// stripe, and would look like a picture rather than like a mistake.
+        nz: usize,
+        /// The box that was sampled: `[x0, y0, z0, x1, y1, z1]`, in **metres**, in the domain's
+        /// own coordinates.
+        ///
+        /// Here so that a view can say how big the thing is. Without it every picture of a field
+        /// in this workspace was labelled in cells — "61 x 43", never "6.1 m by 4.3 m" — and a
+        /// cell count is the one number about a grid that says nothing about the object. An
+        /// engineer reading a thermal picture wants to know where on the part the hot spot is,
+        /// and no arrangement of cell indices answers that.
+        ///
+        /// **Not world coordinates**, unlike [`PanelData::Points`] and [`PanelData::Paths`],
+        /// which are. Two reasons: [`capture`] samples a field in the domain's own frame and
+        /// deliberately does not apply the pose, so this is the frame the values were taken in;
+        /// and a rotated pose has no axis-aligned box, so a world-space `[f64; 6]` would have to
+        /// be a bounding box, which is a different and larger thing. How long the bar is should
+        /// not change when the bar is moved.
+        extent_m: [f64; 6],
+        /// Where the samples sit inside [`extent_m`](PanelData::Field::extent_m).
+        ///
+        /// **The array alone does not say, and every consumer had to assume.** They assumed
+        /// corner to corner — `x_i = x0 + i·(x1−x0)/(n−1)` — which is right for a nodal field and
+        /// puts a cell-centred one half a cell out at every sample, drawing a block that reaches
+        /// the boundary with values that never did. Written beside the values so a reader is not
+        /// guessing, and so the two conventions this workspace genuinely has can both be exact.
+        ///
+        /// Absent in a file written before this existed, where it reads back as
+        /// [`Lattice::Nodal`] — which is what those files were.
+        lattice: Lattice,
+        /// `nx * ny * nz` values, x fastest, then y, then z.
+        values: Vec<f64>,
+    },
+    /// Runs of connected points in world coordinates — a ray through a lens train, a
+    /// trajectory, a field line.
+    ///
+    /// The third shape, and it took an optical bench to need it. A field is defined everywhere
+    /// and a body is somewhere; a **path** is a thing that went from one place to another, and
+    /// neither of the other two can say that. Drawing a traced ray as a scatter of its vertices
+    /// loses the one property that makes it a ray.
+    ///
+    /// Flat, with an index, rather than a `Vec<Vec<_>>`: it crosses to a wire format and to a
+    /// canvas, and both want one array. [`PanelData::paths`] does the flattening.
+    Paths {
+        /// Every vertex of every path, end to end.
+        vertices: Vec<[f64; 3]>,
+        /// Where each path begins in `vertices`. Path `k` runs from `starts[k]` to `starts[k+1]`,
+        /// and the last to the end.
+        starts: Vec<usize>,
+        /// One value per path, to colour it by — a wavelength, a field angle, a speed.
+        values: Vec<f64>,
+        /// `[x0, y0, z0, x1, y1, z1]`, the region to draw.
+        bounds: [f64; 6],
+    },
+    /// A triangle mesh: a surface that bounds a **solid**, rather than lines that suggest one.
+    ///
+    /// The fourth shape, and it took a lens to need it. [`PanelData::Paths`] can draw a doublet as
+    /// a wireframe of meridians and it is the real geometry -- but nothing in a set of lines can
+    /// be shaded, and the renderer that turns a field into a lit surface builds triangles for
+    /// [`PanelData::Field`] and for nothing else. An instrument could not reach it.
+    ///
+    /// Indices rather than three vertices per triangle: a closed solid shares every vertex between
+    /// six or so faces, and writing each one out again triples the file for a lens and multiplies
+    /// it worse for anything finer. What that costs is a per-vertex normal, which a renderer that
+    /// wants flat shading computes per face anyway.
+    Surface {
+        /// Every vertex, **in world coordinates** as [`PanelData::Points`] and
+        /// [`PanelData::Paths`] are.
+        positions: Vec<[f64; 3]>,
+        /// Three indices into `positions` per triangle, wound counter-clockwise seen from
+        /// outside.
+        ///
+        /// The winding is the caller's to get right and is not checked here: a mesh this crate
+        /// could verify the orientation of is a mesh it would have to know was closed, and an open
+        /// surface -- a mirror, a single refracting face -- is a thing somebody will want to draw.
+        triangles: Vec<[u32; 3]>,
+        /// One value per **vertex**, to colour it by.
+        values: Vec<f64>,
+        /// `[x0, y0, z0, x1, y1, z1]`, the region to draw.
+        bounds: [f64; 6],
+    },
+    /// Bodies at positions **in world coordinates**, each with a value to colour it by.
+    Points {
+        /// Where each body is.
+        positions: Vec<[f64; 3]>,
+        /// One per body.
+        values: Vec<f64>,
+        /// `[x0, y0, z0, x1, y1, z1]` — the region to draw, fixed for the whole run by
+        /// [`settle_framing`] so a body moving is a body moving and not the picture rescaling.
+        bounds: [f64; 6],
+        /// Whether that box is a **real wall** — a periodic cell — rather than a drawing margin.
+        boxed: bool,
+        /// What each body **is**, when the domain can say — `A:12:GLY` for a residue.
+        ///
+        /// **This is the difference between a picture and a measurement.** Without it a run
+        /// holding a protein is a point cloud: nothing in the file can be matched against the
+        /// entry it was read from, against a crystallographer's temperature factors, or against a
+        /// second structure. Empty when the domain has no name for its bodies beyond their order,
+        /// and one per body otherwise — see [`Bodies::label`](pantometry_core::Bodies::label).
+        labels: Vec<String>,
+        /// Which bodies are joined, as index pairs into `positions`.
+        ///
+        /// Empty for bodies that are not joined. A protein's backbone is here, **broken where its
+        /// residue numbering breaks**, because a bond drawn across a gap in a crystal structure is
+        /// a bond nobody measured. See [`Bodies::bonds`](pantometry_core::Bodies::bonds).
+        bonds: Vec<[u32; 2]>,
+    },
+}
+
+impl PanelData {
+    /// Build a [`PanelData::Paths`] from runs of points, flattening them and measuring the box.
+    ///
+    /// One value per path. A path with fewer than two points is dropped rather than kept as a
+    /// degenerate line — and the count of what was dropped is not hidden, because a caller whose
+    /// rays all failed to trace should see an empty panel rather than a sparse one.
+    pub fn paths(runs: impl IntoIterator<Item = Vec<[f64; 3]>>, values: Vec<f64>) -> PanelData {
+        let mut vertices = Vec::new();
+        let mut starts = Vec::new();
+        let mut kept = Vec::new();
+        for (k, run) in runs.into_iter().enumerate() {
+            if run.len() < 2 {
+                continue;
+            }
+            starts.push(vertices.len());
+            vertices.extend(run);
+            kept.push(values.get(k).copied().unwrap_or(0.0));
+        }
+        let mut bounds = [f64::MAX, f64::MAX, f64::MAX, f64::MIN, f64::MIN, f64::MIN];
+        for v in &vertices {
+            for a in 0..3 {
+                bounds[a] = bounds[a].min(v[a]);
+                bounds[a + 3] = bounds[a + 3].max(v[a]);
+            }
+        }
+        if vertices.is_empty() {
+            bounds = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+        }
+        PanelData::Paths {
+            vertices,
+            starts,
+            values: kept,
+            bounds,
+        }
+    }
+
+    /// Build a [`PanelData::Surface`] from vertices and the triangles over them, measuring the box.
+    ///
+    /// # Panics
+    ///
+    /// If `values` is not one per vertex, or if a triangle names a vertex that is not there.
+    ///
+    /// **Loudly, and this is the one constructor here that does.** [`PanelData::paths`] drops a
+    /// run of fewer than two points because a degenerate run is a shape the data can have; an
+    /// index past the end of `positions` is not. Dropping it would leave a hole in a solid, which
+    /// is the failure this workspace hunts hardest: something that comes out missing and looks
+    /// fine. A caller that built a mesh wrong should hear about it where it was built.
+    pub fn surface(
+        positions: Vec<[f64; 3]>,
+        triangles: Vec<[u32; 3]>,
+        values: Vec<f64>,
+    ) -> PanelData {
+        assert_eq!(
+            values.len(),
+            positions.len(),
+            "a surface is coloured per vertex, and this has {} values for {} vertices",
+            values.len(),
+            positions.len()
+        );
+        if let Some(bad) = triangles
+            .iter()
+            .flatten()
+            .find(|&&i| i as usize >= positions.len())
+        {
+            panic!(
+                "a triangle names vertex {bad} of {} — a hole in a solid is not a shape the data \
+                 can have",
+                positions.len()
+            );
+        }
+        let mut bounds = [f64::MAX, f64::MAX, f64::MAX, f64::MIN, f64::MIN, f64::MIN];
+        for v in &positions {
+            for a in 0..3 {
+                bounds[a] = bounds[a].min(v[a]);
+                bounds[a + 3] = bounds[a + 3].max(v[a]);
+            }
+        }
+        if positions.is_empty() {
+            bounds = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+        }
+        PanelData::Surface {
+            positions,
+            triangles,
+            values,
+            bounds,
+        }
+    }
+}
+
+impl Panel {
+    /// The scalar values, whichever shape this is.
+    pub fn values(&self) -> &[f64] {
+        match &self.data {
+            PanelData::Field { values, .. }
+            | PanelData::Points { values, .. }
+            | PanelData::Paths { values, .. }
+            | PanelData::Surface { values, .. } => values,
+        }
+    }
+
+    /// The vertices of path `k`, for a caller that wants one run at a time.
+    pub fn path(&self, k: usize) -> Option<&[[f64; 3]]> {
+        match &self.data {
+            PanelData::Paths {
+                vertices, starts, ..
+            } => {
+                let from = *starts.get(k)?;
+                let to = starts.get(k + 1).copied().unwrap_or(vertices.len());
+                Some(&vertices[from..to])
+            }
+            _ => None,
+        }
+    }
+
+    /// The grid shape, for a field.
+    pub fn grid(&self) -> Option<(usize, usize, usize)> {
+        match self.data {
+            PanelData::Field { nx, ny, nz, .. } => Some((nx, ny, nz)),
+            _ => None,
+        }
+    }
+
+    /// The box this panel occupies, `[x0, y0, z0, x1, y1, z1]` in metres, whichever shape it is.
+    ///
+    /// **In the panel's own frame**, for every shape, with [`Panel::place`] saying where that
+    /// frame is. A caller that overlays two panels applies each one's placement first.
+    ///
+    /// This used to be two frames: a field's extent was local and a body set's bounds were
+    /// world-space, and the doc here said so and declined to promise anything, which is the
+    /// shape of a known hazard being written down rather than closed. It was measurable —
+    /// two blocks half a metre apart exported on top of each other — and it is closed now.
+    pub fn bounds(&self) -> [f64; 6] {
+        match &self.data {
+            PanelData::Field { extent_m, .. } => *extent_m,
+            PanelData::Points { bounds, .. }
+            | PanelData::Paths { bounds, .. }
+            | PanelData::Surface { bounds, .. } => *bounds,
+        }
+    }
+
+    /// How long each axis of a field is, in metres, or `None` if this is not a field.
+    ///
+    /// A collapsed axis — one sample — has a real length as often as not: a plane cut through a
+    /// solid is a plane, and a slab asked for at one sample is still as thick as it is. The
+    /// length is what the extent says, and a zero here means the caller asked for a zero-thickness
+    /// slice rather than that the object is flat.
+    pub fn spans(&self) -> Option<[f64; 3]> {
+        match &self.data {
+            PanelData::Field { extent_m: e, .. } => Some([e[3] - e[0], e[4] - e[1], e[5] - e[2]]),
+            _ => None,
+        }
+    }
+
+    /// One z-slice of a field, as an `nx * ny` plane, or `None` if this is not a field or the
+    /// slice is out of range.
+    ///
+    /// What a two-dimensional view should call rather than reading `values` directly. A view that
+    /// takes the first `nx * ny` entries gets slice zero and no indication that there were
+    /// others; this makes the choice explicit and countable.
+    pub fn slice(&self, k: usize) -> Option<&[f64]> {
+        match &self.data {
+            PanelData::Field {
+                nx, ny, nz, values, ..
+            } => (k < *nz).then(|| &values[k * nx * ny..(k + 1) * nx * ny]),
+            _ => None,
+        }
+    }
+}
+
+/// Capture every placed domain at the simulation's current time.
+///
+/// Asks each domain what it is rather than being told: a field is sampled over its
+/// [`Extent`], a body set is read through [`Bodies`](pantometry_core::Bodies), and every domain
+/// contributes its [`readings`](pantometry_core::Domain::readings) whether or not it drew anything.
+///
+/// A domain with no placement is still read for scalars. A domain that is a field and has no
+/// extent is **not** drawn, because nobody said how big it is — and a guess would be a picture of
+/// a region the caller never chose.
+pub fn capture(sim: &Simulation, placed: &BTreeMap<String, Placement>) -> Frame {
+    let t = sim.time();
+    let mut panels = Vec::new();
+    let mut readings = Vec::new();
+
+    for domain in sim.domains() {
+        let name = domain.name().to_string();
+        readings.extend(domain.readings());
+        let placement = placed.get(&name).copied().unwrap_or_default();
+
+        if let (Some(field), Some(extent)) = (domain.as_field(), placement.extent) {
+            panels.push(sample(&name, field, extent, placement.pose, t));
+        } else if let Some(bodies) = domain.as_bodies() {
+            panels.push(points(&name, bodies, placement.pose));
+        }
+    }
+    Frame {
+        time_s: t.to_si(),
+        panels,
+        readings,
+    }
+}
+
+/// Sample a field over the extent it was placed with.
+/// Sample any field over an extent, as a [`Panel`] a [`Frame`] can carry.
+///
+/// [`capture`] uses this for the one field a domain nominates through
+/// [`as_field`](pantometry_core::Domain::as_field). It is public because **one field per domain is
+/// not enough**, and the limit is the trait's rather than the physics'. A domain can hold several
+/// fields that are all true at once — a porous bed has a temperature, a pressure, a flow speed and
+/// an extraction state on the same grid — and `as_field` can nominate exactly one of them.
+///
+/// So a caller that wants the other three builds them here and pushes them onto the frame. The
+/// alternative was a trait method returning a list, which would make every domain in the workspace
+/// answer a question five of them have one answer to.
+pub fn sample_field(
+    name: impl Into<String>,
+    field: &dyn ScalarField,
+    extent: Extent,
+    pose: Pose,
+    t: Time,
+) -> Panel {
+    sample(&name.into(), field, extent, pose, t)
+}
+
+/// A kernel [`Pose`] as the wire's [`Placed`].
+///
+/// `glam`'s quaternion is already `[x, y, z, w]`, which is glTF's order and this format's, so
+/// the conversion is a read rather than a rearrangement -- worth stating, because a quaternion
+/// silently transposed into `[w, x, y, z]` rotates everything by the wrong amount about a
+/// plausible-looking axis and nothing about the file looks wrong.
+fn sample(name: &str, field: &dyn ScalarField, extent: Extent, pose: Pose, t: Time) -> Panel {
+    let (nx, ny, nz) = extent.samples;
+    let (lo, hi) = (extent.min.to_si(), extent.max.to_si());
+    // **Where the field keeps its own values**, which it is now asked rather than assumed.
+    //
+    // This was `i/(n-1)` for everything — corner to corner, endpoints on the boundary. That is
+    // right for `Room`, `Hall` and `Well`, whose outermost values sit *on* the wall, and wrong
+    // for every cell-based field, whose values are averages with nothing on the boundary. On a
+    // six-cell block holding `0 0 100 0 0 0 °C` the six points landed on the cell boundaries and
+    // the file was written as `0 0 90 0 0 0`: the peak 10% low, in the array the viewer, the
+    // report, glTF, USD and the CSV all read.
+    //
+    // A single sample along an axis is still taken at the **middle** of it whichever the lattice.
+    // For a flat extent the two conventions meet there; for an extent with real thickness asked
+    // for at one sample, the middle is the honest representative and a corner is not.
+    let lattice = field.lattice();
+    let along = |i: usize, n: usize| lattice.along(i, n);
+    let mut values = Vec::with_capacity(extent.count());
+    for k in 0..nz {
+        for j in 0..ny {
+            for i in 0..nx {
+                let f = glam::DVec3::new(along(i, nx), along(j, ny), along(k, nz));
+                let local = LengthVec::from_si(lo + (hi - lo) * f);
+                // Sampled in the domain's own coordinates. The pose is where the *result* goes,
+                // not where the question is asked — a field does not know it has been placed.
+                // Sampled in the domain's own coordinates, still: the pose is where the
+                // *result* goes and a field does not know it has been placed. What changed is
+                // that the panel now carries the pose beside the values instead of dropping it.
+                values.push(field.at(local, t));
+            }
+        }
+    }
+    Panel {
+        name: name.to_string(),
+        unit: field.unit(),
+        place: Placed::of(pose),
+        data: PanelData::Field {
+            nx,
+            ny,
+            nz,
+            extent_m: [lo.x, lo.y, lo.z, hi.x, hi.y, hi.z],
+            lattice,
+            values,
+        },
+    }
+}
+
+/// Read a body set, in world coordinates.
+fn points(name: &str, bodies: &dyn pantometry_core::Bodies, pose: Pose) -> Panel {
+    let n = bodies.count();
+    let mut positions = Vec::with_capacity(n);
+    let mut values = Vec::with_capacity(n);
+    // **In the domain's own frame**, like a field's samples, with the pose carried beside them.
+    // These used to be multiplied through the pose here, which made bodies world coordinates and
+    // fields local ones in the same file with nothing saying which.
+    for i in 0..n {
+        let p = bodies.position(i).to_si();
+        positions.push([p.x, p.y, p.z]);
+        values.push(bodies.value(i));
+    }
+    let (bounds, boxed) = match bodies.cell() {
+        Some((lo, hi)) => {
+            // **The cell itself, not a box around it.** Posing the two corners and taking the
+            // min and max of the result is a *bounding* box for any rotation -- larger than the
+            // cell and not recoverable from the numbers written. Keeping it local keeps it exact,
+            // and the pose beside it says where it is.
+            let (lo, hi) = (lo.to_si(), hi.to_si());
+            (
+                [
+                    lo.x.min(hi.x),
+                    lo.y.min(hi.y),
+                    lo.z.min(hi.z),
+                    lo.x.max(hi.x),
+                    lo.y.max(hi.y),
+                    lo.z.max(hi.z),
+                ],
+                true,
+            )
+        }
+        None => {
+            // **The box the bodies are in, not a cube about the origin.**
+            //
+            // This was `max|coordinate| * 1.2` on every axis, which is the right box for a set
+            // centred on the origin and much too large for anything that is not: the half-side is
+            // driven by the distance to the *origin* rather than by the extent about the centre.
+            // Crambin's coordinates come out of a crystal file and sit about 10 Å off it, so 46
+            // atoms spanning 2.1 x 1.7 x 2.5 nm declared a **5.37 nm cube** — seventeen times the
+            // volume — and a viewer framing that drew the protein at a sixth of the width with
+            // the rest of the picture empty.
+            //
+            // Per axis, measured, with the same 20% margin. Nothing physical sits at this edge,
+            // and the run's own frames are unioned over it later.
+            let mut lo = [f64::MAX; 3];
+            let mut hi = [f64::MIN; 3];
+            for p in &positions {
+                for a in 0..3 {
+                    lo[a] = lo[a].min(p[a]);
+                    hi[a] = hi[a].max(p[a]);
+                }
+            }
+            if positions.is_empty() {
+                ([-1.0, -1.0, -1.0, 1.0, 1.0, 1.0], false)
+            } else {
+                // One margin for all three, from the largest side: a per-axis margin would make a
+                // flat set's thin axis vanish, and a box is a box.
+                let margin = (0..3).map(|a| hi[a] - lo[a]).fold(0.0f64, f64::max) * 0.1;
+                let margin = if margin > 0.0 { margin } else { 1.0 };
+                (
+                    [
+                        lo[0] - margin,
+                        lo[1] - margin,
+                        lo[2] - margin,
+                        hi[0] + margin,
+                        hi[1] + margin,
+                        hi[2] + margin,
+                    ],
+                    false,
+                )
+            }
+        }
+    };
+    Panel {
+        name: name.to_string(),
+        unit: bodies.value_unit(),
+        place: Placed::of(pose),
+        data: PanelData::Points {
+            // **What the bodies are, and which of them are joined.** A domain that has nothing to
+            // say gives nothing — `Bodies::label` and `Bodies::bonds` default to none — and one
+            // that does had nowhere to put it until this existed. A protein arrived here as
+            // anonymous points with a number each, which is arithmetic about a point cloud.
+            labels: {
+                let named: Vec<String> = (0..bodies.count())
+                    .map(|i| bodies.label(i).unwrap_or_default())
+                    .collect();
+                // All or nothing: a half-labelled set is worse than an unlabelled one, because a
+                // reader matching on the labels silently loses the bodies that have none.
+                if named.iter().all(|s| s.is_empty()) {
+                    Vec::new()
+                } else {
+                    named
+                }
+            },
+            bonds: {
+                let joined = bodies.bonds();
+                // **A bond has to name bodies that exist**, and this is the only place that can
+                // say so: past here it is a pair of numbers in a file. The same rule
+                // `PanelData::surface` applies to a triangle, for the same reason.
+                if let Some(bad) = joined
+                    .iter()
+                    .flatten()
+                    .find(|&&b| b as usize >= positions.len())
+                {
+                    panic!(
+                        "a bond names body {bad} of {} in `{name}` — a bond to a body that is not \
+                         there is not a measurement",
+                        positions.len()
+                    );
+                }
+                joined
+            },
+            positions,
+            values,
+            bounds,
+            boxed,
+        },
+    }
+}
+
+/// Give every body panel one framing for the whole run.
+///
+/// [`capture`] sees a frame at a time and cannot see the future, so a panel without a real wall
+/// comes back framed to *that* frame — and a body crossing the picture would look still while the
+/// picture moved. Call this once on a finished run.
+///
+/// Panels with a real wall are left alone: a periodic cell is a boundary condition and does not
+/// grow because a run is longer. So are [`PanelData::Paths`], whose box is measured from the
+/// geometry a caller handed over rather than from anything that moves.
+pub fn settle_framing(frames: &mut [Frame]) {
+    let names: Vec<String> = frames
+        .first()
+        .map(|f| {
+            f.panels
+                .iter()
+                .filter(|p| matches!(p.data, PanelData::Points { boxed: false, .. }))
+                .map(|p| p.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for name in names {
+        let mut widest = [0.0f64; 6];
+        for frame in frames.iter() {
+            if let Some(Panel {
+                data: PanelData::Points { bounds, .. },
+                ..
+            }) = frame.panels.iter().find(|p| p.name == name)
+            {
+                for k in 0..3 {
+                    widest[k] = widest[k].min(bounds[k]);
+                    widest[k + 3] = widest[k + 3].max(bounds[k + 3]);
+                }
+            }
+        }
+        for frame in frames.iter_mut() {
+            if let Some(Panel {
+                data: PanelData::Points { bounds, .. },
+                ..
+            }) = frame.panels.iter_mut().find(|p| p.name == name)
+            {
+                *bounds = widest;
+            }
+        }
+    }
+}

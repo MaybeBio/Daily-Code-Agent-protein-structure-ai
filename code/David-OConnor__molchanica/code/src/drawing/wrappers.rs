@@ -1,0 +1,666 @@
+//! Small mol update wrappers. This this focused on index management
+//! etc to update entities in place when able.
+
+// todo: Drawing module A/R.
+
+use graphics::{EngineUpdates, Entity, EntityUpdate, Scene};
+use mol_defs::molecules::{MolGeneric, MolGenericRef, MolType};
+
+use crate::{
+    drawing,
+    drawing::{EntityClass, MolTypeExt},
+    render::MESH_POCKET_START,
+    state::{OperatingMode, State},
+    util::clear_mol_entity_indices,
+};
+
+fn helper_a(scene: &Scene, class: u32) -> (usize, usize) {
+    // Assumes all entities are this class are contiguous in the entity list.
+    let initial_ent_count = scene.entities.iter().filter(|e| e.class == class).count();
+
+    let ent_i_start = scene
+        .entities
+        .iter()
+        .position(|ent| ent.class == class)
+        .unwrap_or(scene.entities.len());
+
+    (initial_ent_count, ent_i_start)
+}
+
+fn remove_class_entities(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    class: u32,
+) {
+    let len_before = scene.entities.len();
+    scene.entities.retain(|ent| ent.class != class);
+
+    if scene.entities.len() == len_before {
+        return;
+    }
+
+    clear_mol_entity_indices(state, None);
+    updates.entities = EntityUpdate::All;
+}
+
+/// Note: We can get rid of these helpers and simplify things further if we can abstract over
+/// mol types with traits of the Ref structs.
+fn helper_b(
+    state: &mut State,
+    scene: &mut Scene,
+    entities: Vec<Entity>,
+    class: u32,
+    initial_ent_count: usize,
+    ent_i_start: usize,
+    mol_type: MolType,
+    updates: &mut EngineUpdates,
+) {
+    let end = ent_i_start + initial_ent_count;
+    if entities.len() == initial_ent_count
+        && end <= scene.entities.len()
+        && scene.entities[ent_i_start..end]
+            .iter()
+            .zip(&entities)
+            .all(|(old, new)| old.mesh == new.mesh)
+    {
+        for (i, ent) in scene.entities[ent_i_start..end].iter_mut().enumerate() {
+            // This must include all fields which have changed.
+            ent.position = entities[i].position;
+            ent.orientation = entities[i].orientation;
+            ent.scale = entities[i].scale;
+            ent.scale_partial = entities[i].scale_partial;
+            ent.color = entities[i].color;
+            ent.overlay_text = entities[i].overlay_text.clone();
+            ent.outline = entities[i].outline;
+        }
+        updates.entities.push_class(class);
+    } else {
+        // Full rebuild
+        if initial_ent_count == 0 {
+            scene.entities.extend(entities);
+        } else if end <= scene.entities.len() {
+            scene.entities.splice(ent_i_start..end, entities);
+        } else {
+            scene.entities.retain(|ent| ent.class != class);
+            scene.entities.extend(entities);
+        }
+
+        clear_mol_entity_indices(state, Some(mol_type));
+        updates.entities = EntityUpdate::All;
+    }
+}
+
+// // todo: A helper which would be nice, but I'm unable to get working.
+// fn draw_all_mol_of_type(state: &mut State, scene: &mut Scene, mol_type: MolType) {
+//     let class = mol_type.entity_type() as u32;
+//     let (initial_ent_count, ent_i_start) = helper_a(scene, class);
+//
+//     if state.ui.visibility.hide_ligand || state.volatile.operating_mode == OperatingMode::MolEditor
+//     {
+//         scene.entities.retain(|ent| ent.class != class);
+//         return;
+//     }
+//
+//     // todo
+//     let mols = if state.volatile.md_local.draw_md_mols {
+//         &mut state.volatile.md_local.mols_small
+//     } else {
+//         &mut state.ligands
+//     };
+//
+//     let num_mols = mols.len();
+//
+//     let mut entities = Vec::new();
+//     for (i_mol, mol) in mols.iter_mut().enumerate() {
+//         let start_i_mol = ent_i_start + entities.len();
+//
+//         if let Some(m) = state.get_mol(mol_type, i_mol) {
+//             let ents_this_mol = drawing::draw_mol(
+//                 m,
+//                 i_mol,
+//                 &state.ui,
+//                 &state.volatile.active_mol,
+//                 state.volatile.mol_manip.mode,
+//                 state.volatile.operating_mode,
+//                 num_mols,
+//             );
+//
+//             // Note: This may already be set.
+//             let end_i_mol = start_i_mol + ents_this_mol.len();
+//             entities.extend(ents_this_mol);
+//
+//             mol.common.entity_i_range = Some((start_i_mol, end_i_mol));
+//         }
+//     }
+//
+//     helper_b(
+//         state,
+//         scene,
+//         entities,
+//         class,
+//         initial_ent_count,
+//         ent_i_start,
+//         mol_type,
+//     );
+// }
+
+// pub fn draw_all_ligs(state: &mut State, scene: &mut Scene, specify: Option<&[MoleculeSmall]>) {
+pub fn draw_all_ligs(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    let class = EntityClass::Ligand as u32;
+    let (initial_ent_count, ent_i_start) = helper_a(scene, class);
+
+    if state.ui.visibility.hide_ligand || state.volatile.operating_mode == OperatingMode::MolEditor
+    {
+        remove_class_entities(state, scene, updates, class);
+        return;
+    }
+
+    // let mols = if state.volatile.md_local.draw_md_mols {
+    //     &mut state.volatile.md_local.viewer.small
+    // } else {
+    //     &mut state.ligands
+    // };
+
+    // todo temp
+    let mols = &mut state.ligands;
+
+    let num_mols = mols.len();
+
+    let mut entities = Vec::new();
+    for (i_mol, mol) in mols.iter_mut().enumerate() {
+        if state
+            .to_save
+            .hidden_default_objects
+            .contains(&crate::selection::expression::object_key(
+                &MolGenericRef::Small(mol),
+            ))
+        {
+            mol.common.entity_i_range = None;
+            continue;
+        }
+        let start_i_mol = ent_i_start + entities.len();
+
+        let ents_this_mol = drawing::draw_mol(
+            MolGenericRef::Small(mol),
+            i_mol,
+            &state.ui,
+            &state.volatile.active_mol,
+            state.volatile.mol_manip.mode,
+            state.volatile.operating_mode,
+            num_mols,
+            false,
+        );
+
+        // Note: This may already be set.
+        let end_i_mol = start_i_mol + ents_this_mol.len();
+        entities.extend(ents_this_mol);
+
+        mol.common.entity_i_range = Some((start_i_mol, end_i_mol));
+    }
+
+    helper_b(
+        state,
+        scene,
+        entities,
+        class,
+        initial_ent_count,
+        ent_i_start,
+        MolType::Ligand,
+        updates,
+    );
+}
+
+// todo: You need to generalize your drawing code so you have less repetition, and it's more consistent.
+pub fn draw_all_nucleic_acids(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    // draw_all_mol_of_type(state, scene, &mut state.nucleic_acids, MolType::nucleic_acid, state.ui.visibility.hide_nucleic_acids);
+    // return;
+
+    let class = EntityClass::NucleicAcid as u32;
+    let (initial_ent_count, ent_i_start) = helper_a(scene, class);
+
+    if state.ui.visibility.hide_nucleic_acids
+        || state.volatile.operating_mode == OperatingMode::MolEditor
+    {
+        remove_class_entities(state, scene, updates, class);
+        return;
+    }
+
+    // let mols = if state.volatile.md_local.draw_md_mols {
+    //     &mut state.volatile.md_local.viewer.nucleic_acids
+    // } else {
+    //     &mut state.nucleic_acids
+    // };
+
+    let mols = &mut state.nucleic_acids; // todo temp
+
+    let num_mols = mols.len();
+
+    let mut entities = Vec::new();
+    for (i_mol, mol) in mols.iter_mut().enumerate() {
+        if state
+            .to_save
+            .hidden_default_objects
+            .contains(&crate::selection::expression::object_key(
+                &MolGenericRef::NucleicAcid(mol),
+            ))
+        {
+            mol.common.entity_i_range = None;
+            continue;
+        }
+        let start_i_mol = ent_i_start + entities.len();
+
+        let ents_this_mol = drawing::draw_mol(
+            MolGenericRef::NucleicAcid(mol),
+            i_mol,
+            &state.ui,
+            &state.volatile.active_mol,
+            state.volatile.mol_manip.mode,
+            state.volatile.operating_mode,
+            num_mols,
+            false,
+        );
+
+        // Note: This may already be set.
+        let end_i_mol = start_i_mol + ents_this_mol.len();
+        entities.extend(ents_this_mol);
+
+        mol.common.entity_i_range = Some((start_i_mol, end_i_mol));
+    }
+    helper_b(
+        state,
+        scene,
+        entities,
+        class,
+        initial_ent_count,
+        ent_i_start,
+        MolType::NucleicAcid,
+        updates,
+    );
+}
+
+// todo: You need to generalize your drawing code so you have less repetition, and it's more consistent.
+pub fn draw_all_lipids(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    // draw_all_mol_of_type(state, scene, &mut state.lipids, MolType::Lipid, state.ui.visibility.hide_lipids);
+    // return;
+
+    let class = EntityClass::Lipid as u32;
+    let (initial_ent_count, ent_i_start) = helper_a(scene, class);
+
+    if state.ui.visibility.hide_lipids || state.volatile.operating_mode == OperatingMode::MolEditor
+    {
+        remove_class_entities(state, scene, updates, class);
+        return;
+    }
+
+    // let mols = if state.volatile.md_local.draw_md_mols {
+    //     &mut state.volatile.md_local.viewer.lipids
+    // } else {
+    //     &mut state.lipids
+    // };
+
+    let mols = &mut state.lipids; // todo temp
+
+    let num_mols = mols.len();
+
+    let mut entities = Vec::new();
+    for (i_mol, mol) in mols.iter_mut().enumerate() {
+        if state
+            .to_save
+            .hidden_default_objects
+            .contains(&crate::selection::expression::object_key(
+                &MolGenericRef::Lipid(mol),
+            ))
+        {
+            mol.common.entity_i_range = None;
+            continue;
+        }
+        let start_i_mol = ent_i_start + entities.len();
+
+        let ents_this_mol = drawing::draw_mol(
+            MolGenericRef::Lipid(mol),
+            i_mol,
+            &state.ui,
+            &state.volatile.active_mol,
+            state.volatile.mol_manip.mode,
+            state.volatile.operating_mode,
+            num_mols,
+            false,
+        );
+
+        // Note: This may already be set.
+        let end_i_mol = start_i_mol + ents_this_mol.len();
+        entities.extend(ents_this_mol);
+
+        mol.common.entity_i_range = Some((start_i_mol, end_i_mol));
+    }
+
+    helper_b(
+        state,
+        scene,
+        entities,
+        class,
+        initial_ent_count,
+        ent_i_start,
+        MolType::Lipid,
+        updates,
+    );
+}
+
+// todo: You need to generalize your drawing code so you have less repetition, and it's more consistent.
+pub fn draw_all_pockets(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    let class = EntityClass::Pocket as u32;
+    let (initial_ent_count, ent_i_start) = helper_a(scene, class);
+
+    if state.ui.visibility.hide_pockets {
+        remove_class_entities(state, scene, updates, class);
+        return;
+    }
+
+    // Edit small molecules only; not proteins.
+    if state.volatile.operating_mode == OperatingMode::MolEditor {
+        remove_class_entities(state, scene, updates, class);
+        return;
+    }
+
+    let standalone_count = state.pockets.len();
+
+    let mut entities = Vec::new();
+    for (i, mol) in state.pockets.iter_mut().enumerate() {
+        if mol.mesh_i_rel != i {
+            mol.mesh_i_rel = i;
+            let mesh_i = MESH_POCKET_START + i;
+            scene
+                .meshes
+                .resize_with(scene.meshes.len().max(mesh_i + 1), Default::default);
+            scene.meshes[mesh_i] = mol.surface_mesh.clone();
+            updates.meshes = true;
+        }
+
+        if state
+            .to_save
+            .hidden_default_objects
+            .contains(&crate::selection::expression::object_key(
+                &MolGenericRef::Pocket(mol),
+            ))
+        {
+            mol.common.entity_i_range = None;
+            continue;
+        }
+        let start_i_mol = ent_i_start + entities.len();
+
+        let ents_this_mol =
+            // No H bonds or lig atoms in this context.
+            drawing::draw_pocket(mol, &[], &[], &state.ui.visibility,
+                                 &state.ui.selection, &state.volatile.mol_manip.mode);
+
+        // Note: This may already be set.
+        let end_i_mol = start_i_mol + ents_this_mol.len();
+        entities.extend(ents_this_mol);
+
+        mol.common.entity_i_range = Some((start_i_mol, end_i_mol));
+    }
+
+    // Also draw pockets embedded in ligand pharmacophores.
+    for lig_i in 0..state.ligands.len() {
+        // Assign a stable mesh slot that doesn't overlap with standalone pockets.
+        let expected_mesh_i_rel = standalone_count + lig_i;
+
+        if let Some(pocket) = &mut state.ligands[lig_i].pharmacophore.pocket
+            && pocket.mesh_i_rel != expected_mesh_i_rel
+        {
+            pocket.mesh_i_rel = expected_mesh_i_rel;
+            let mesh_i = MESH_POCKET_START + expected_mesh_i_rel;
+            while scene.meshes.len() <= mesh_i {
+                scene.meshes.push(Default::default());
+            }
+            scene.meshes[mesh_i] = pocket.surface_mesh.clone();
+            updates.meshes = true;
+        }
+
+        if let Some(pocket) = &state.ligands[lig_i].pharmacophore.pocket {
+            let lig_posits = &state.ligands[lig_i].common.atom_posits;
+            let ents = drawing::draw_pocket(
+                pocket,
+                &[], // H bonds not computed in primary mode.
+                lig_posits,
+                &state.ui.visibility,
+                &state.ui.selection,
+                &state.volatile.mol_manip.mode,
+            );
+            entities.extend(ents);
+        }
+    }
+
+    helper_b(
+        state,
+        scene,
+        entities,
+        class,
+        initial_ent_count,
+        ent_i_start,
+        MolType::Pocket,
+        updates,
+    );
+}
+
+pub fn _draw_all_mol_of_type<T: MolGeneric>(
+    state: &mut State,
+    scene: &mut Scene,
+    mols: &mut [T],
+    mol_type: MolType,
+    hide_flag: bool,
+) {
+    let initial_ent_count = scene.entities.len();
+    scene
+        .entities
+        .retain(|ent| ent.class != mol_type.entity_type() as u32);
+
+    if hide_flag {
+        return;
+    }
+
+    let mut entities = Vec::new();
+    for (i, mol) in mols.iter_mut().enumerate() {
+        let start_i = entities.len();
+
+        entities.extend(drawing::draw_mol(
+            // todo: Sort this out
+            mol.to_ref(),
+            i,
+            &state.ui,
+            &state.volatile.active_mol,
+            state.volatile.mol_manip.mode,
+            state.volatile.operating_mode,
+            state.ligands.len(),
+            false,
+        ));
+
+        let end_i = entities.len();
+        mol.common_mut().entity_i_range = Some((start_i, end_i));
+    }
+
+    if entities.len() == initial_ent_count {
+        // Repleace in-place
+    } else {
+        scene.entities.extend(entities);
+        clear_mol_entity_indices(state, None);
+    }
+}
+
+/// Updates a single molecule's entities.
+fn update_inplace_inner(
+    mol: MolGenericRef,
+    i: usize,
+    ent_i_start: usize,
+    ent_i_end: usize,
+    state: &State,
+    scene: &mut Scene,
+) {
+    let ents_updated = drawing::draw_mol(
+        mol,
+        i,
+        &state.ui,
+        &state.volatile.active_mol,
+        state.volatile.mol_manip.mode,
+        state.volatile.operating_mode,
+        state.ligands.len(),
+        false,
+    );
+
+    update_inplace_inner_part2(ent_i_start, ent_i_end, ents_updated, scene)
+}
+
+/// Split out to handle cases where we don't use `draw_mol`
+fn update_inplace_inner_part2(
+    ent_i_start: usize,
+    ent_i_end: usize,
+    ents_updated: Vec<Entity>,
+    scene: &mut Scene,
+) {
+    if ents_updated.len() != ent_i_end - ent_i_start {
+        eprintln!(
+            "Error: Mismatch between new and old mol et counts. Old: {}, new: {}",
+            ents_updated.len(),
+            ent_i_end - ent_i_start
+        );
+        return;
+    }
+
+    if ent_i_end > scene.entities.len() {
+        eprintln!("Error: Entity count out of bonds: {ent_i_end}",);
+        return;
+    }
+
+    for (i, ent) in scene.entities[ent_i_start..ent_i_end]
+        .iter_mut()
+        .enumerate()
+    {
+        ent.position = ents_updated[i].position;
+        ent.orientation = ents_updated[i].orientation;
+        ent.scale = ents_updated[i].scale;
+        ent.scale_partial = ents_updated[i].scale_partial;
+        ent.color = ents_updated[i].color;
+        ent.outline = ents_updated[i].outline;
+    }
+}
+
+/// Cheaper, but takes some care in synchronization. Only draws
+/// This should be run in conjunction with `engine_updates.entities.push_class(EntityClass::Ligand as u32)` or similar.
+/// We update entities, then command an instance buffer update only of these updates
+/// todo: You can go even further and do it one lig and a time, instead of all ligs.
+pub fn _update_all_ligs_inplace(state: &State, scene: &mut Scene) {
+    for (i, mol) in state.ligands.iter().enumerate() {
+        let Some((ent_i_start, ent_i_end)) = mol.common.entity_i_range else {
+            eprintln!("Unable to update mol entities in place; missing entity indices");
+            continue;
+        };
+
+        let mol = MolGenericRef::Small(mol);
+        update_inplace_inner(mol, i, ent_i_start, ent_i_end, state, scene);
+    }
+}
+
+pub fn _update_all_na_inplace(state: &State, scene: &mut Scene) {
+    for (i, mol) in state.nucleic_acids.iter().enumerate() {
+        let Some((ent_i_start, ent_i_end)) = mol.common.entity_i_range else {
+            eprintln!("Unable to update mol entities in place; missing entity indices");
+            continue;
+        };
+
+        let mol = MolGenericRef::NucleicAcid(mol);
+        update_inplace_inner(mol, i, ent_i_start, ent_i_end, state, scene);
+    }
+}
+
+pub fn _update_all_lipids_inplace(state: &State, scene: &mut Scene) {
+    for (i, mol) in state.lipids.iter().enumerate() {
+        let Some((ent_i_start, ent_i_end)) = mol.common.entity_i_range else {
+            eprintln!("Unable to update mol entities in place; missing entity indices");
+            continue;
+        };
+
+        let mol = MolGenericRef::Lipid(mol);
+        update_inplace_inner(mol, i, ent_i_start, ent_i_end, state, scene);
+    }
+}
+
+pub fn _update_all_pockets_inplace(state: &State, scene: &mut Scene) {
+    for (i, mol) in state.pockets.iter().enumerate() {
+        let Some((ent_i_start, ent_i_end)) = mol.common.entity_i_range else {
+            eprintln!("Unable to update mol entities in place; missing entity indices");
+            continue;
+        };
+
+        let mol = MolGenericRef::Pocket(mol);
+        update_inplace_inner(mol, i, ent_i_start, ent_i_end, state, scene);
+    }
+}
+
+pub fn update_single_peptide_inplace(i: usize, state: &State, scene: &mut Scene) {
+    let Some(mol) = state.peptides.get(i) else {
+        eprintln!("Unable to update peptide entities in place; invalid peptide index");
+        return;
+    };
+    let Some((ent_i_start, ent_i_end)) = mol.common.entity_i_range else {
+        eprintln!("Unable to update peptide entities in place; missing entity indices");
+        return;
+    };
+
+    let mol = MolGenericRef::Peptide(mol);
+    update_inplace_inner(mol, i, ent_i_start, ent_i_end, state, scene);
+}
+
+pub fn update_single_ligand_inplace(i: usize, state: &State, scene: &mut Scene) {
+    let mol = &state.ligands[i];
+    let Some((ent_i_start, ent_i_end)) = mol.common.entity_i_range else {
+        eprintln!("Unable to update mol entities in place; missing entity indices");
+        return;
+    };
+
+    let mol = MolGenericRef::Small(mol);
+    update_inplace_inner(mol, i, ent_i_start, ent_i_end, state, scene);
+}
+
+pub fn update_single_nucleic_acid_inplace(i: usize, state: &State, scene: &mut Scene) {
+    let mol = &state.nucleic_acids[i];
+    let Some((ent_i_start, ent_i_end)) = mol.common.entity_i_range else {
+        eprintln!("Unable to update mol entities in place; missing entity indices");
+        return;
+    };
+
+    let mol = MolGenericRef::NucleicAcid(mol);
+    update_inplace_inner(mol, i, ent_i_start, ent_i_end, state, scene);
+}
+
+pub fn update_single_lipid_inplace(i: usize, state: &State, scene: &mut Scene) {
+    let mol = &state.lipids[i];
+    let Some((ent_i_start, ent_i_end)) = mol.common.entity_i_range else {
+        eprintln!("Unable to update mol entities in place; missing entity indices");
+        return;
+    };
+
+    let mol = MolGenericRef::Lipid(mol);
+    update_inplace_inner(mol, i, ent_i_start, ent_i_end, state, scene);
+}
+
+pub fn update_single_pocket_inplace(i: usize, state: &State, scene: &mut Scene) {
+    let mol = &state.pockets[i];
+    let Some((ent_i_start, ent_i_end)) = mol.common.entity_i_range else {
+        eprintln!("Unable to update mol entities in place; missing entity indices");
+        return;
+    };
+
+    // Here we copy+paste+modify update_inplace_inner; we don't use "draw_mol" for pockets.
+
+    // No lig atoms or H bonds in this context.
+    let ents_updated = drawing::draw_pocket(
+        mol,
+        &[],
+        &[],
+        &state.ui.visibility,
+        &state.ui.selection,
+        &state.volatile.mol_manip.mode,
+    );
+    update_inplace_inner_part2(ent_i_start, ent_i_end, ents_updated, scene);
+}

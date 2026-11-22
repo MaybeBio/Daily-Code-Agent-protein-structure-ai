@@ -1,0 +1,107 @@
+# OPLM default model configuration (HuggingFace OplmConfig field names).
+# Authoritative defaults: loaded by oplm.config.load_config. Every OplmConfig
+# option appears here set to its run default, so this file doubles as the
+# reference for what can be overridden (presets/YAML/CLI). Derived fields
+# (head_dim, intermediate_size, rope_dim) are null so they resolve from the
+# source dimensions unless explicitly overridden.
+model:
+  # Core dimensions (~400M parameters)
+  vocab_size: 33
+  hidden_size: 1024
+  num_hidden_layers: 32
+  num_attention_heads: 16
+  head_dim: null # null -> hidden_size / num_attention_heads
+  intermediate_size: null # null -> round_up(8/3 * hidden_size, 256) (4x for relu2)
+  max_position_embeddings: 1024
+
+  # Shared transformer recurrence (physical layers are stored only once)
+  num_loops: 1 # total executions of each selected layer, including the first
+  loop_strategy: stack # stack | interleave
+  loop_start: 0 # zero-based, inclusive
+  loop_end: null # zero-based, exclusive; null -> num_hidden_layers
+
+  # Positional encoding (full RoPE by default: rope_dim resolves to head_dim)
+  rope_theta: 10000.0
+  rope_dim: null # null -> head_dim (and forces nope_dim to 0); rope_dim + nope_dim must equal head_dim
+  nope_dim: 0
+
+  # Normalization
+  norm_type: layernorm # layernorm | rmsnorm
+  norm_eps: 1.0e-6
+  norm_strategy: sandwich # pre | sandwich | hybrid | post_sdpa
+  qk_norm: true
+  qk_norm_mode: channel # channel (per-head LayerNorm/RMSNorm + 1/sqrt(d) scale) | l2 (L2-normalize + learned per-head scale) | full (ESM-C: one bias-free norm over all heads)
+  qk_norm_l2_scale_init: null # l2 mode only; per-head scale init (null -> sqrt(head_dim)); positive if set
+  post_embed_norm: false
+  mask_dropout: false # zero <mask> embeddings and rescale by expected/observed mask ratio
+  mask_dropout_reference_ratio: 0.12 # expected fraction of real tokens that are <mask> (mask_prob * mask_token_prob); in [0, 1)
+  residual_scaling: sqrt_num_layers # sqrt_num_layers (1/sqrt(L)) | esmc (1/sqrt(L/36)) | none
+  residual_gate: none # none | scalar | channel (learnable multiplicative refinement on residual writes); channel duplicates the sandwich post-norm gain, so production drops it
+  residual_gate_init: 1.0 # initial value for residual gate parameters
+  attn_output_gate: sigmoid # none | sigmoid | silu (post-SDPA G1 output gate, arXiv:2505.06708)
+  value_residual: learnable # none | fixed | learnable (ResFormer value residual, arXiv:2410.17897)
+  value_residual_lambda_init: 0.5 # constant lambda (fixed) or init (learnable); layers > 0 only
+  init_scale_output_projections: true
+
+  # Feed-forward
+  ffn_activation: swiglu # swiglu | geglu (gated, 3 proj) | relu2 (non-gated squared-ReLU, 2 proj)
+  ffn_bias: false
+
+  # Dropout
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+
+  # Attention kernel for packed batches (data.pack_sequences): sdpa (dense block-diagonal mask,
+  # cost grows with row width) | flex (FlexAttention block mask, skips blocks between sequences)
+  packed_attention: sdpa
+
+  # Embeddings / head
+  tie_word_embeddings: false
+  mlm_head_activation: gelu # gelu | silu | relu
+
+  # Classification head (sequence-classification fine-tuning only; inert for MLM training)
+  num_labels: 2
+  classifier_pool: mean # mean | cls (sequence-level pooling)
+  classifier_dropout: 0.0
+  pre_head_norm: false # apply a norm before the classification head
+
+  # Canon depthwise convolution (on by default: all four positions, k=7)
+  canon_enabled: true
+  canon_residual: true # residual Canon updates by default
+  canon_positions: [A, B, C, D] # subset of {A, B, C, D}
+  # int (broadcast to every layer) | per-layer list[int] (length num_hidden_layers)
+  # | {schedule: linear, min: N, max: M} | {schedule: constant, value: N}; entries >= 2
+  canon_kernel_sizes: 7
+  canon_activation: none # none | silu | gelu
+
+  # μP (maximal update parametrization) — LR transfer across width, ON by default.
+  # train.lr is the μP base LR and transfers across width automatically (no manual
+  # retune per size). At this default hidden_size (1024) over mup_base_width (768),
+  # m = 4/3, so μP actively scales init/LR. The ESM-C comparison recipe
+  # (configs/train/esm-c.yaml) carries its own μP set. See docs/mup-lr.md, "Recipe".
+  # (The bare OplmConfig() dataclass default is mup_enable=false.)
+  # base_width, output_mult, and train.{lr, mup_depth_lr_exponent, adamw_lr_mult,
+  # weight_decay_to_init} are one tuned set (μP refresh, Oct 2026: 170M proxy at
+  # 4M tokens/step, confirmed at 800M) — do not change one without re-validating
+  # the others.
+  mup_enable: true
+  mup_base_width: 768 # hidden_size of the proxy/base model where the width multiplier m = 1
+  mup_output_mult: 1.0 # tunable O(1) readout (output-logit) multiplier
+
+  # Init / checkpointing
+  initializer_range: 0.02
+  gradient_checkpointing: false
+  # full      -> recompute the entire block on backward (max memory savings, ~+30% compute)
+  # selective -> keep matmul/SDPA outputs resident, recompute only cheap ops
+  #              (less memory savings, much less extra compute). Inert unless
+  #              gradient_checkpointing is true. On multi-GPU + train.compile the
+  #              trainer auto-disables DDPOptimizer so SAC isn't collapsed to full
+  #              recompute (see docs/training.md, "What a training step does").
+  gradient_checkpointing_mode: full # full | selective
+
+  # Special token ids (must match the tokenizer; see docs/data.md, Tokenizer)
+  pad_token_id: 1
+  bos_token_id: 0
+  eos_token_id: 2
+  unk_token_id: 3
+  mask_token_id: 32

@@ -1,0 +1,57 @@
+# This workflow will install Python dependencies, run tests, and lint with a variety of Python versions
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
+
+name: PACKMAN Continuous Integration 
+
+on:
+  push:
+    branches: [ "master", "dev" ]
+  pull_request:
+    branches: [ "master", "dev" ]
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: python -m pip install --user ruff
+    - run: python -m ruff check --select=E4,E7,E9,F --exit-zero --line-length=320 --target-version=py38 --statistics . | sort -k 2
+    - run: python -m ruff check --select=E4,E7,E9,F --ignore=E402,E501,E701,E722,E741,F401,F403,F841
+                --output-format=github --target-version=py38 .
+
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install pytest
+        pip install typing-extensions
+    - run: pip install --editable .
+    - name: Test with pytest
+      run: pytest
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.12"
+    - name: Install documentation dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r docs/requirements.txt
+        python -m pip install --editable .
+    - name: Build documentation
+      run: python -m sphinx -b html -W --keep-going docs/source docs/_build/html

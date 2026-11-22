@@ -1,0 +1,721 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Pairwise attention backend using precompiled or source CuTe left-mask kernels.
+
+The kernel variant is selected from ``torch.cuda.get_device_capability()`` and
+the tuning bundle's ``kernel_abi``. If the source implementation is absent, the
+executable cache is populated from the packaged ``_cutedsl_kernels`` library
+instead.
+
+Requires the KV-side mask to be left-aligned (``1...1 0...0``). The kernel takes
+one ``actual_s_kv`` count of leading 1s per batch instead of a ``[B, Sk]`` mask.
+
+SM100, SM103 and SM107 run the Blackwell FMHA kernel, and the Ampere kernel for short
+sequences, from source or from CUBINs. On each, measured square BF16 problems
+with batch 1 and 16 heads use tuned source kernels when LSE is not requested;
+forced CUBIN and source-free installations keep the general route. A kernel
+library without a matching CUBIN falls back to SDPA.
+
+Logical input shapes, and the flattened / padded forms passed to the kernel:
+  Q, K, V, O  : [*, S, H, D]      ->  [B*mult, S, H, ceil(D / 16) * 16]
+  bias        : [*, H, Sq, Sk]    ->  [B, H, Sq, ceil(Sk / align) * align]
+  actual_s_kv : [B] int32         ->  [B]            broadcasts over mult
+                                      (an sm100-ABI kernel reads it as a
+                                      [mult, B] view with a zero mult stride)
+
+Every bias column must be finite, including padded columns and columns at or
+past a batch's valid-key count: the kernels mask those scores, but a NaN or
+Inf in the bias can reach valid outputs before the mask applies. Finite values
+there need not be zero; the backend's own key padding writes zeros.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+
+from bionemo_ir._torch.utils.kernel import (
+    CuTeDSLKernelLibraryError,
+    CuTeDSLKernelLibraryExecutable,
+    CutlassNumeric,
+    cute_numeric,
+    launch_compiled_kernel,
+    load_source_module,
+    populate_compiled_cache_from_library,
+)
+from bionemo_ir.dsl_kernels.cute_cache import FORCE_CUBIN_ENV, CuteKernelCache
+from bionemo_ir.logger import logger
+
+from .._common import _aligned
+from ..interface import AttentionBackend, AttentionMetadata
+from ._config import (
+    _PW_CONFIGS_DIR,
+    TUNED_HEAD_DIMS,
+    TUNED_SMS,
+    PairwiseAttentionLeftMaskKernelConfig,
+    get_bucket_kernel_abi,
+    get_kernel_config,
+    get_nearest_bucket,
+    tuned_key,
+)
+from ._cubin import PairwiseAttentionCubinExecutable, PairwiseAttentionCubinMissing
+from .sdpa import _empty_with_aligned_rows, _sum_with_aligned_rows
+
+__all__ = [
+    "PairwiseAttentionCuTeLeftMask",
+    "PairwiseAttentionCuTeLeftMaskMetadata",
+    "PairwiseAttentionLeftMaskKernelConfig",
+    "_PW_CONFIGS_DIR",
+    "get_kernel_config",
+    "get_nearest_bucket",
+]
+
+_DTYPES = (torch.float16, torch.bfloat16)
+# SMs whose CUBINs shipped after earlier kernel libraries: a library without
+# them runs the call on SDPA rather than failing.
+_SDPA_FALLBACK_SMS = frozenset({100, 103, 107})
+
+
+class PairwiseAttentionCuTeLeftMaskMetadata(AttentionMetadata):
+    kv_packed: bool = True
+
+
+# The Hopper kernel softmaxes via exp2 fastmath, so it takes a log2-form scale.
+_LOG2_E = 1.4426950408889634
+
+
+@dataclass(frozen=True)
+class _PairwiseAttentionVariant:
+    dtype: torch.dtype
+    head_dim: int
+    bucket: int
+    kv_packed: bool
+    kernel_abi: str = "sm80"
+
+
+@dataclass(frozen=True)
+class _PairwiseAttentionLaunchInputs:
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    bias: torch.Tensor
+    actual_s_kv: torch.Tensor
+    output: torch.Tensor
+    lse: torch.Tensor
+    variant: _PairwiseAttentionVariant
+    align_elems: int
+    softmax_scale: float
+    batch_shape: tuple[int, ...]
+    mult: int
+    seqlen_q: int
+    num_heads: int
+
+
+def _compute_S(seqlen_q: int, seqlen_kv: int) -> int:
+    """Map a possibly rectangular attention problem to its side-length axis."""
+    return int(round(math.sqrt(max(seqlen_q * seqlen_kv, 1))))
+
+
+def _align_up(x: int, align: int) -> int:
+    return ((x + align - 1) // align) * align
+
+
+def _pad_last_dim(t: torch.Tensor, new_size: int, value: float = 0.0) -> torch.Tensor:
+    cur = t.size(-1)
+    if cur >= new_size:
+        return t
+    return F.pad(t, (0, new_size - cur), value=value)
+
+
+def _pad_qkv(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad ``[B, S, H, D]`` Q, K and V to ``size`` columns.
+
+    Slices of one packed QKV projection (same storage, shape and strides, at
+    evenly spaced offsets) are padded with a single copy, and come back as
+    slices of the padded projection.
+    """
+    step = k.data_ptr() - q.data_ptr()
+    storage = q.untyped_storage().data_ptr()
+    if (
+        step > 0
+        and v.data_ptr() - k.data_ptr() == step
+        and step % q.element_size() == 0
+        and q.shape == k.shape == v.shape
+        and q.stride() == k.stride() == v.stride()
+        and k.untyped_storage().data_ptr() == storage == v.untyped_storage().data_ptr()
+    ):
+        packed = q.as_strided(
+            (*q.shape[:2], 3, *q.shape[2:]), (*q.stride()[:2], step // q.element_size(), *q.stride()[2:])
+        )
+        padded = F.pad(packed, (0, size - q.shape[-1]))
+        return padded[:, :, 0], padded[:, :, 1], padded[:, :, 2]
+    return _pad_last_dim(q, size), _pad_last_dim(k, size), _pad_last_dim(v, size)
+
+
+def _kernel_bias(bias: torch.Tensor, num_heads: int, seqlen_q: int, padded_seqlen_kv: int) -> torch.Tensor:
+    """``bias`` as the kernel reads it, ``[B, H, Sq, Sk_padded]``, copied only when its layout needs it.
+
+    The kernel takes any batch, head and row strides that are positive 16-byte multiples over a 16-byte aligned
+    base. One layer's heads sliced from a projection shared by several layers therefore go in as they lie, though
+    at batch > 1 they are not contiguous.
+    """
+    view = _pad_last_dim(bias, padded_seqlen_kv).reshape(-1, num_heads, seqlen_q, padded_seqlen_kv)
+    return view if _aligned(view, 3) else view.contiguous()
+
+
+def _resolve_lse_buffer(
+    output_lse: torch.Tensor | None,
+    shape: tuple,
+    device: torch.device,
+) -> torch.Tensor:
+    """Reuse ``output_lse`` if it matches the kernel contract, else pass a null LSE.
+
+    The contract is fixed: ``shape``, dtype float32 (qk_acc_dtype), ``device``.
+    ``None`` or a mismatch yields an empty tensor rather than failing, as the
+    ``output`` parameter does; its null data pointer makes the kernel skip the
+    LSE store.
+    """
+    if (
+        output_lse is not None
+        and tuple(output_lse.shape) == shape
+        and output_lse.dtype == torch.float32
+        and output_lse.device == device
+    ):
+        return output_lse
+    return torch.empty(0, *shape[1:], dtype=torch.float32, device=device)
+
+
+def _attend_with_sdpa(inputs: _PairwiseAttentionLaunchInputs) -> None:
+    """Write ``inputs.output`` with SDPA, the route a source-free build takes where no CUBIN ships.
+
+    Masks the keys at or past each batch's count, shares each batch's bias
+    across its samples, and sums mask and bias into 16-byte aligned rows, which
+    cuDNN needs for its fast kernel. Padded head columns are zero, so they leave
+    the scores and the output's valid columns unchanged. Skips the LSE store.
+    """
+    counts = inputs.actual_s_kv
+    q, k, v = (operand.transpose(1, 2) for operand in (inputs.q, inputs.k, inputs.v))
+    seqlen_kv = k.shape[-2]
+    masked = torch.arange(seqlen_kv, device=q.device) >= counts[:, None, None, None]
+    # SDPA defines an all-negative-infinity row as zero, like the kernel's
+    # empty prefix. A finite sentinel spreads such a row over invalid keys.
+    mask = torch.zeros(masked.shape, dtype=q.dtype, device=q.device).masked_fill_(masked, float("-inf"))
+    attn_mask = _sum_with_aligned_rows([mask, inputs.bias[..., :seqlen_kv]])
+    batch = attn_mask.shape[0]
+    if batch == 1:
+        attn_mask = attn_mask.expand(q.shape[0], *attn_mask.shape[1:])
+    elif inputs.mult > 1:
+        # Row b * mult + m reads batch b's mask; the fold has to copy, so it copies into aligned rows.
+        expanded = attn_mask[:, None].expand(batch, inputs.mult, *attn_mask.shape[1:])
+        attn_mask = _empty_with_aligned_rows(expanded, expanded.shape)
+        attn_mask.copy_(expanded)
+        attn_mask = attn_mask.flatten(0, 1)
+    output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=inputs.softmax_scale)
+    inputs.output.copy_(output.transpose(1, 2))
+
+
+def _to_actual_s_kv_int32(actual_s_kv: torch.Tensor) -> torch.Tensor:
+    """Normalize ``actual_s_kv`` to a contiguous ``[B]`` int32 tensor.
+
+    Accepts a ``[B]`` integer count of leading 1s, or a left-aligned ``[*, Sk]``
+    float binary mask whose leading dimensions collapse to the batch axis and
+    whose count is ``(mask > 0.5).sum(-1)``.
+    """
+    if actual_s_kv.is_floating_point():
+        if actual_s_kv.ndim < 2:
+            raise ValueError(f"binary mask must have ndim >= 2 (last dim = Sk); got shape {tuple(actual_s_kv.shape)}")
+        return (actual_s_kv > 0.5).sum(dim=-1, dtype=torch.int32).reshape(-1)
+    if actual_s_kv.dtype != torch.int32:
+        actual_s_kv = actual_s_kv.to(torch.int32)
+    return actual_s_kv.reshape(-1).contiguous()
+
+
+class PairwiseAttentionCuTeLeftMask(CuteKernelCache, AttentionBackend[PairwiseAttentionCuTeLeftMaskMetadata]):
+    """Pairwise attention backend for left-aligned KV masks.
+
+    Source kernels use the existing CuTeDSL JIT/disk cache. Public builds can
+    omit those source classes and transparently use packaged CUBIN launchers
+    through the same in-process executable cache. ``CUTEDSL_FORCE_CUBIN=1``
+    takes the CUBIN path even when the sources are importable.
+
+    Expects inputs in the kernel's logical shapes:
+      Q, K, V     : [*, Sq, H*D] or [B_flat, Sq, H, D]
+      biases      : [actual_s_kv, pair_bias]
+        actual_s_kv: [B] int32 (count of leading 1s), or a left-aligned
+                     ``[*, Sk]`` float binary mask reduced internally.
+        pair_bias  : [*, H, Sq, Sk]
+
+    Multiplicity (``mult``) is inferred from the batch-dimension ratio between
+    Q and the per-batch ``actual_s_kv``.
+    """
+
+    Metadata = PairwiseAttentionCuTeLeftMaskMetadata
+
+    _compiled_cache: dict[tuple, Any] = {}
+
+    def __init__(
+        self,
+        layer_idx: int,
+        num_heads: int,
+        head_dim: int,
+        num_kv_heads: int | None = None,
+    ):
+        super().__init__(layer_idx, num_heads, head_dim, num_kv_heads)
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+        assert num_heads == num_kv_heads, "num_heads must be equal to num_kv_heads"
+        major, minor = torch.cuda.get_device_capability()
+        self._sm_version = major * 10 + minor
+        self._last_executable = None
+        self._last_abi: str | None = None
+        self._last_call: tuple | None = None
+        # The measured SM100/SM103/SM107 kernels were tuned for 16 heads.
+        self._tunable = self._sm_version in TUNED_SMS and num_heads == 16 and head_dim in TUNED_HEAD_DIMS
+        self._last_variant_slot: tuple[tuple, _PairwiseAttentionVariant] | None = None
+        self._null_lse: tuple[tuple, torch.Tensor] | None = None
+
+    def _cache_key(self, variant: _PairwiseAttentionVariant) -> tuple[int, _PairwiseAttentionVariant, bool]:
+        """Key ``variant``'s executable per setting of ``CUTEDSL_FORCE_CUBIN``, so a forced call never runs a
+        source executable and clearing the switch runs the source one again."""
+        return (self._sm_version, variant, self.force_cubin())
+
+    def _disk_cache_key(
+        self, variant: _PairwiseAttentionVariant, config: PairwiseAttentionLeftMaskKernelConfig
+    ) -> tuple:
+        key = (
+            "attn_pair_bias_cute_left_mask",
+            2,
+            self._sm_version,
+            variant.dtype,
+            variant.head_dim,
+            variant.bucket,
+            variant.kv_packed,
+        )
+        # SM100, SM103 and SM107 anchors name their kernel, which also sets the
+        # actual_s_kv layout; keying on it and the tile keeps a retuned anchor
+        # from reloading a stale kernel.
+        if self._sm_version in _SDPA_FALLBACK_SMS:
+            return (*key, variant.kernel_abi, *config.cache_identity)
+        return key
+
+    def _resolve_source_kernel(
+        self,
+        variant: _PairwiseAttentionVariant,
+        ct_dtype: CutlassNumeric,
+    ) -> tuple[PairwiseAttentionLeftMaskKernelConfig, Any]:
+        config = get_kernel_config(self._sm_version, variant.head_dim, variant.bucket)
+        if not config.can_implement(ct_dtype, variant.head_dim):
+            raise RuntimeError(
+                f"Pairwise attention (left-mask) kernel cannot implement: dtype={ct_dtype}, D={variant.head_dim}"
+            )
+        return config, config.kernel_factory(variant.head_dim)
+
+    def _load_cubin_executable(
+        self,
+        variant: _PairwiseAttentionVariant,
+        source_error: Exception | None = None,
+    ):
+        cache_key = self._cache_key(variant)
+        try:
+            executable = populate_compiled_cache_from_library(
+                PairwiseAttentionCuTeLeftMask._compiled_cache,
+                cache_key,
+                "pairwise_attention",
+                lambda library, launcher: PairwiseAttentionCubinExecutable(
+                    library,
+                    launcher,
+                    self._sm_version,
+                    variant.head_dim,
+                    variant.bucket,
+                    variant.dtype,
+                    variant.kv_packed,
+                ),
+            )
+        except CuTeDSLKernelLibraryError as library_error:
+            if self._sm_version in _SDPA_FALLBACK_SMS and isinstance(library_error, PairwiseAttentionCubinMissing):
+                logger.warning(
+                    f"CuTeDSL pairwise attention (left-mask): the kernel library has no CUBIN for "
+                    f"SM{self._sm_version}, head_dim={variant.head_dim}, bucket={variant.bucket}; "
+                    f"running on SDPA: {library_error}"
+                )
+                return None
+            if source_error is None:
+                raise RuntimeError(
+                    f"{FORCE_CUBIN_ENV} is set but the precompiled kernel "
+                    f"library cannot provide this variant: {library_error}"
+                ) from library_error
+            raise RuntimeError(
+                "CuTeDSL pairwise attention source is unavailable and the "
+                "precompiled kernel library cannot provide this variant: "
+                f"{library_error}"
+            ) from source_error
+
+        logger.info(
+            f"CuTeDSL pairwise attention (left-mask): using precompiled "
+            f"CUBIN for SM{self._sm_version}, dtype={variant.dtype}, "
+            f"head_dim={variant.head_dim}, bucket={variant.bucket}, "
+            f"kv_packed={variant.kv_packed}"
+        )
+        return executable
+
+    def _load_or_compile_source(
+        self,
+        cache: dict,
+        cache_key: tuple,
+        disk_key: tuple,
+        arch: str,
+        description: str,
+        kernel,
+        compile_source: Any,
+        head_dim: int,
+        kv_packed: bool,
+        ct_dtype: CutlassNumeric,
+        align_elems: int,
+        sm_scale: float,
+        mult: int,
+    ):
+        executable = self.load_from_cache(disk_key)
+        if executable is not None:
+            logger.info(
+                f"CuTeDSL pairwise attention (left-mask): loaded cached kernel "
+                f"for SM{self._sm_version} ({arch}), {description}"
+            )
+            cache[cache_key] = executable
+            return executable
+
+        logger.info(
+            f"CuTeDSL pairwise attention (left-mask): compiling kernel for "
+            f"layer={self.layer_idx}, SM{self._sm_version} ({arch}), {description}"
+        )
+        executable = compile_source(
+            self.compile,
+            kernel,
+            arch,
+            head_dim,
+            kv_packed,
+            ct_dtype,
+            align_elems,
+            sm_scale,
+            mult,
+        )
+        cache[cache_key] = executable
+        self.save_to_cache(disk_key, executable)
+        logger.info(f"CuTeDSL pairwise attention (left-mask): compilation done for layer={self.layer_idx}")
+        return executable
+
+    def _get_executable(
+        self,
+        variant: _PairwiseAttentionVariant,
+        align_elems: int,
+        sm_scale: float,
+        mult: int,
+    ):
+        cache_key = self._cache_key(variant)
+        executable = PairwiseAttentionCuTeLeftMask._compiled_cache.get(cache_key)
+        if executable is not None:
+            return executable
+
+        if self.force_cubin():
+            return self._load_cubin_executable(variant)
+
+        try:
+            source = load_source_module(__package__)
+            ct_dtype = cute_numeric(variant.dtype)
+            config, kernel = self._resolve_source_kernel(variant, ct_dtype)
+        except ImportError as source_error:
+            return self._load_cubin_executable(variant, source_error)
+
+        return self._load_or_compile_source(
+            PairwiseAttentionCuTeLeftMask._compiled_cache,
+            cache_key,
+            self._disk_cache_key(variant, config),
+            config.arch,
+            f"dtype={variant.dtype}, head_dim={variant.head_dim}, "
+            f"bucket={variant.bucket}, kv_packed={variant.kv_packed}",
+            kernel,
+            source.compile_pairwise_attention_source,
+            variant.head_dim,
+            variant.kv_packed,
+            ct_dtype,
+            align_elems,
+            sm_scale,
+            mult,
+        )
+
+    def _get_tuned_executable(self, key: tuple, inputs: _PairwiseAttentionLaunchInputs) -> tuple[Any, str]:
+        """Load or compile a measured SM100, SM103 or SM107 source kernel and return it with its ABI.
+
+        Raises ``ImportError`` on a source-free installation.
+        """
+        source = load_source_module(__package__)
+        arch = source.tuned_sm100_kernel_arch(key)
+        # A persistent grid bakes the SM count in at compile time.
+        sm_count = source.persistent_grid_sm_count()
+        cache_key = ("tuned", self._sm_version, inputs.q.dtype, self.head_dim, inputs.variant.kv_packed, key, sm_count)
+        executable = PairwiseAttentionCuTeLeftMask._compiled_cache.get(cache_key)
+        if executable is None:
+            executable = self._load_or_compile_source(
+                PairwiseAttentionCuTeLeftMask._compiled_cache,
+                cache_key,
+                ("attn_pair_bias_cute_left_mask_tuned", 1, *cache_key[1:]),
+                arch,
+                f"tuned {key}, dtype={inputs.q.dtype}, head_dim={self.head_dim}",
+                source.build_tuned_sm100_kernel(key, self.head_dim),
+                source.compile_pairwise_attention_source,
+                self.head_dim,
+                inputs.variant.kv_packed,
+                cute_numeric(inputs.q.dtype),
+                inputs.align_elems,
+                inputs.softmax_scale,
+                inputs.mult,
+            )
+        return executable, arch
+
+    def _prepare_launch_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        actual_s_kv: torch.Tensor,
+        bias: torch.Tensor,
+        kv_packed: bool,
+        output: torch.Tensor | None,
+        output_lse: torch.Tensor | None,
+    ) -> _PairwiseAttentionLaunchInputs:
+        # Fold Q/K/V straight to [B_flat, S, H, D]: one reshape each, a view for packed slices.
+        if q.shape[-1] == self.num_heads * self.head_dim:
+            batch_shape = tuple(q.shape[:-2])
+            seqlen_q, num_heads, head_dim = q.shape[-2], self.num_heads, self.head_dim
+            seqlen_kv = k.shape[-2]
+        else:
+            batch_shape = tuple(q.shape[:-3])
+            seqlen_q, num_heads, head_dim = q.shape[-3], q.shape[-2], q.shape[-1]
+            seqlen_kv = k.shape[-3]
+        if num_heads != self.num_heads:
+            raise ValueError(f"num_heads mismatch: tensor H={num_heads}, expected {self.num_heads}")
+        if k.shape != v.shape:
+            raise ValueError("K and V must have the same shape")
+        batch_flat = math.prod(batch_shape) if batch_shape else 1
+        q_flat = q.reshape(batch_flat, seqlen_q, num_heads, head_dim)
+        k_flat = k.reshape(batch_flat, seqlen_kv, num_heads, head_dim)
+        v_flat = v.reshape(batch_flat, seqlen_kv, num_heads, head_dim)
+
+        padded_head_dim = _align_up(self.head_dim, 16)
+        if padded_head_dim != self.head_dim:
+            if kv_packed:
+                q_flat, k_flat, v_flat = _pad_qkv(q_flat, k_flat, v_flat, padded_head_dim)
+            else:
+                q_flat, k_flat, v_flat = (_pad_last_dim(t, padded_head_dim) for t in (q_flat, k_flat, v_flat))
+
+        if q.dtype not in _DTYPES:
+            raise TypeError(f"Pairwise attention expects float16 or bfloat16; got {q.dtype}")
+        align_elems = 128 // torch.finfo(q.dtype).bits
+
+        output_shape = (batch_flat, seqlen_q, num_heads, padded_head_dim)
+        if (
+            output is not None
+            and output.shape == output_shape
+            and output.dtype == q.dtype
+            and output.device == q.device
+        ):
+            output_flat = output
+        else:
+            output_flat = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+
+        # B comes from actual_s_kv; mult = B_flat // B is the sample multiplicity.
+        actual_s_kv_flat = _to_actual_s_kv_int32(actual_s_kv)
+        batch_size = actual_s_kv_flat.shape[0]
+        if batch_size == 0 or batch_flat % batch_size != 0:
+            raise ValueError(f"Q batch dim {batch_flat} is not a multiple of the actual_s_kv batch dim {batch_size}")
+        mult = batch_flat // batch_size
+        if actual_s_kv_flat.device != q.device:
+            raise ValueError(f"actual_s_kv must be on {q.device}; got {actual_s_kv_flat.device}")
+
+        padded_seqlen_kv = _align_up(seqlen_kv, align_elems)
+        bias_padded = _kernel_bias(bias, num_heads, seqlen_q, padded_seqlen_kv)
+        if bias_padded.shape[0] != batch_size:
+            raise ValueError(f"Pair bias batch dim {bias_padded.shape[0]} != actual_s_kv batch dim {batch_size}")
+
+        lse_shape = (batch_flat, seqlen_q, num_heads, 1)
+        if output_lse is None and self._null_lse is not None and self._null_lse[0] == (lse_shape, q.device):
+            # The null LSE carries no data; reuse it while the shape repeats.
+            lse_flat = self._null_lse[1]
+        else:
+            lse_flat = _resolve_lse_buffer(output_lse, lse_shape, q.device)
+            if lse_flat.numel() == 0:
+                self._null_lse = ((lse_shape, q.device), lse_flat)
+        # Bucket selection scans the tuning bundle; a layer repeats its shape across a forward.
+        variant_key = (self._sm_version, q_flat.dtype, padded_head_dim, seqlen_q, seqlen_kv, kv_packed)
+        last = self._last_variant_slot
+        if last is not None and last[0] == variant_key:
+            variant = last[1]
+        else:
+            bucket = get_nearest_bucket(self._sm_version, padded_head_dim, _compute_S(seqlen_q, seqlen_kv))
+            variant = _PairwiseAttentionVariant(
+                dtype=q_flat.dtype,
+                head_dim=padded_head_dim,
+                bucket=bucket,
+                kv_packed=kv_packed,
+                kernel_abi=get_bucket_kernel_abi(self._sm_version, padded_head_dim, bucket),
+            )
+            self._last_variant_slot = (variant_key, variant)
+        return _PairwiseAttentionLaunchInputs(
+            q=q_flat,
+            k=k_flat,
+            v=v_flat,
+            bias=bias_padded,
+            actual_s_kv=actual_s_kv_flat,
+            output=output_flat,
+            lse=lse_flat,
+            variant=variant,
+            align_elems=align_elems,
+            softmax_scale=float(self.head_dim**-0.5),
+            batch_shape=batch_shape,
+            mult=mult,
+            seqlen_q=seqlen_q,
+            num_heads=num_heads,
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        biases: list[torch.Tensor] | None = None,
+        metadata: PairwiseAttentionCuTeLeftMaskMetadata | None = None,
+        output: torch.Tensor | None = None,
+        output_lse: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run pairwise attention via the CuTe left-mask kernel.
+
+        Args:
+            q: ``[*, Sq, H*D]`` or ``[B_flat, Sq, H, D]``.
+            k: ``[*, Sk, H*D]`` or ``[B_flat, Sk, H, D]`` (may be
+                non-contiguous when kv_packed).
+            v: same shape as *k*.
+            biases: ``[actual_s_kv, pair_bias]``
+                actual_s_kv: ``[B]`` int32 — count of leading 1s along Sk. A
+                             left-aligned ``[*, Sk]`` float binary mask is
+                             accepted as a convenience.
+                pair_bias  : ``[*, H, Sq, Sk]``, finite in every column,
+                             masked and padded ones included.
+            output: Optional ``[B_flat, Sq, H, D_padded]`` buffer written in
+                place.
+            output_lse: Optional ``[B_flat, Sq, H, 1]`` float32 buffer written
+                in place, honored by every kernel.
+                ``None`` or a shape/dtype/device mismatch skips the LSE store,
+                as does the SDPA route on SM100, SM103 and SM107 (see below).
+
+        Returns:
+            Output tensor ``[*, Sq, H, D]``.
+
+        On SM100, SM103 and SM107, a call that cannot compile the kernel, under
+        ``CUTEDSL_FORCE_CUBIN=1`` or without the sources, runs on SDPA when
+        the kernel library predates their CUBINs.
+        """
+        if biases is None or len(biases) < 2:
+            raise ValueError("CuTeDSL pairwise attention (left-mask) expects biases=[actual_s_kv, pair_bias]")
+        actual_s_kv = biases[0]
+        bias = biases[1]
+        if metadata is None:
+            metadata = PairwiseAttentionCuTeLeftMaskMetadata()
+
+        launch_inputs = self._prepare_launch_inputs(
+            q,
+            k,
+            v,
+            actual_s_kv,
+            bias,
+            getattr(metadata, "kv_packed", True),
+            output,
+            output_lse,
+        )
+        force_cubin = self.force_cubin()
+        variant = launch_inputs.variant
+        # Measured kernels serve square, packed BF16 calls with batch 1 and no LSE.
+        tunable = (
+            self._tunable
+            and not force_cubin
+            and variant.dtype == torch.bfloat16
+            and variant.kv_packed
+            and launch_inputs.q.shape[0] == launch_inputs.mult
+            and launch_inputs.q.shape[1] == launch_inputs.k.shape[1]
+            and launch_inputs.lse.numel() == 0
+        )
+        # A tuned choice depends on mult and the sequence length; the general one does not.
+        call_key = (variant, force_cubin, tunable and (launch_inputs.mult, launch_inputs.seqlen_q))
+        if call_key == self._last_call:
+            executable, kernel_abi = self._last_executable, self._last_abi
+        else:
+            executable, kernel_abi = None, None
+            key = (
+                tuned_key(launch_inputs.mult, self.head_dim, launch_inputs.seqlen_q, self._sm_version)
+                if tunable
+                else None
+            )
+            if key is not None:
+                try:
+                    executable, kernel_abi = self._get_tuned_executable(key, launch_inputs)
+                except ImportError:
+                    # A source-free installation uses the normal CUBIN route.
+                    pass
+            if kernel_abi is None:
+                executable = self._get_executable(
+                    variant,
+                    launch_inputs.align_elems,
+                    launch_inputs.softmax_scale,
+                    launch_inputs.mult,
+                )
+                kernel_abi = variant.kernel_abi
+            self._last_call = call_key
+            self._last_executable, self._last_abi = executable, kernel_abi
+
+        actual_s_kv = launch_inputs.actual_s_kv
+        if kernel_abi == "sm100" and not isinstance(executable, CuTeDSLKernelLibraryExecutable):
+            # An sm100-ABI source kernel reads the count of row b * mult + m; a
+            # zero stride over mult lands it on count b. The CUBIN launcher
+            # builds that view itself from the counts and mult.
+            actual_s_kv = actual_s_kv.view(1, -1).expand(launch_inputs.mult, -1)
+
+        if executable is None:
+            _attend_with_sdpa(launch_inputs)
+        else:
+            launch_compiled_kernel(
+                executable,
+                launch_inputs.q,
+                launch_inputs.k,
+                launch_inputs.v,
+                launch_inputs.bias,
+                actual_s_kv,
+                launch_inputs.output,
+                launch_inputs.lse,
+                launch_inputs.softmax_scale * _LOG2_E,
+                launch_inputs.softmax_scale,
+                launch_inputs.mult,
+            )
+        output_shape = (
+            *launch_inputs.batch_shape,
+            launch_inputs.seqlen_q,
+            launch_inputs.num_heads,
+            launch_inputs.variant.head_dim,
+        )
+        return launch_inputs.output.view(output_shape)[..., : self.head_dim]

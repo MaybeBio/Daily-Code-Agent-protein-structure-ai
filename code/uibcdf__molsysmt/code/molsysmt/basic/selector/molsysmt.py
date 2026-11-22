@@ -1,0 +1,727 @@
+import re
+from inspect import stack
+from re import findall
+
+import numpy as np
+import pandas as pd
+
+from molsysmt._private.strings import get_parenthesis
+from molsysmt._private.variables import is_all
+from molsysmt.element import _element_index, _plural_elements_to_singular
+
+
+def select(molecular_system, selection="all", structure_indices="all"):
+
+    if isinstance(selection, str):
+        while selection_with_special_subsentences(selection):
+            sub_selection = selection_with_special_subsentences(selection)
+            # The selection evaluator resolves this local via @sub_atom_indices.
+            sub_atom_indices = select(  # noqa: F841
+                molecular_system, sub_selection, structure_indices
+            )
+            selection = selection.replace(
+                sub_selection, "atom_index==@sub_atom_indices"
+            )
+
+        if _in_elements_of(selection):
+            atom_indices = select_in_elements_of(molecular_system, selection)
+
+        elif "within" in selection:
+            atom_indices = select_within(molecular_system, selection, structure_indices)
+
+        elif "bonded to" in selection:
+            atom_indices = select_bonded_to(molecular_system, selection)
+
+        else:
+            atom_indices = select_standard(molecular_system, selection)
+
+    return atom_indices
+
+
+def select_standard(item, selection):
+
+    from molsysmt.basic import convert, get_form
+    from molsysmt.configure import selection_shortcuts
+    from molsysmt.form import _dict_modules
+
+    tmp_selection = selection
+
+    shortcuts = selection_shortcuts["MolSysMT"]
+
+    for key in shortcuts:
+        if key in selection:
+            tmp_selection = tmp_selection.replace(key, shortcuts[key])
+
+    form_in = get_form(item)
+
+    from molsysmt.native import ChemicalStates, MolSys, Topology
+
+    chemical_states = None
+    native_topologies = []
+    from molsysmt._private.h5msm import query_inventory_candidates
+
+    candidates, file_context = query_inventory_candidates(item)
+    for candidate in candidates:
+        if isinstance(candidate, Topology):
+            native_topologies.append(candidate)
+        elif isinstance(candidate, MolSys):
+            native_topologies.append(candidate.topology)
+            chemical_states = candidate.chemical_states
+        elif isinstance(candidate, ChemicalStates):
+            chemical_states = candidate
+
+    if file_context:
+        tmp_item = native_topologies[-1] if native_topologies else None
+    elif len(native_topologies) == 1:
+        tmp_item = native_topologies[0]
+    elif not native_topologies and chemical_states is not None:
+        tmp_item = None
+    else:
+        conversion_needs_missing_bonds = False
+
+        if isinstance(form_in, (list, tuple)):
+            for ii in form_in:
+                if (not _dict_modules[ii].bonds_are_explicit) and _dict_modules[
+                    ii
+                ].bonds_can_be_computed:
+                    conversion_needs_missing_bonds = True
+                    break
+        else:
+            if (not _dict_modules[form_in].bonds_are_explicit) and _dict_modules[
+                form_in
+            ].bonds_can_be_computed:
+                conversion_needs_missing_bonds = True
+
+        if conversion_needs_missing_bonds:
+            from molsysmt.attribute.bonds_are_required_to_get_attribute import (
+                bond_dependent_attributes,
+            )
+
+            bonds_required_by_selection = False
+            for attribute in bond_dependent_attributes:
+                if attribute in tmp_selection:
+                    bonds_required_by_selection = True
+                    break
+
+            tmp_item = convert(
+                item,
+                to_form="molsysmt.MolSys",
+                get_missing_bonds=bonds_required_by_selection,
+                skip_digestion=True,
+            )
+
+        else:
+            tmp_item = convert(item, to_form="molsysmt.MolSys", skip_digestion=True)
+
+    if isinstance(tmp_item, MolSys):
+        chemical_states = tmp_item.chemical_states
+        tmp_item = tmp_item.topology
+    query_local_dict = {}
+
+    if "@" in selection:
+        var_names = _var_names_in_selection(selection)
+        all_stack_frames = stack()
+
+        for var_name in var_names:
+            var_value = None
+            found = False
+
+            # Walk up the stack to find the variable
+            for frame_info in all_stack_frames:
+                frame = frame_info.frame
+                if var_name in frame.f_locals:
+                    var_value = frame.f_locals[var_name]
+                    found = True
+                    break
+                if var_name in frame.f_globals:
+                    var_value = frame.f_globals[var_name]
+                    found = True
+                    break
+
+            if not found:
+                from molsysmt._private.smonitor import ArgumentError
+
+                raise ArgumentError(
+                    argument="selection",
+                    value=selection,
+                    caller="molsysmt.basic.selector.molsysmt.select",
+                    message=f"The variable '@{var_name}' was not found in the call stack.",
+                )
+
+            tmp_selection = tmp_selection.replace(
+                "@" + var_name, "@auxiliar_variable_" + var_name
+            )
+            if isinstance(var_value, np.ndarray):
+                var_value = list(var_value)
+            query_local_dict["auxiliar_variable_" + var_name] = var_value
+
+    if tmp_item is None:
+        # Query only supplied attributes; do not invent a stable inventory for
+        # chemistry-only or coordinate-only domains.
+        from molsysmt.attribute import attributes
+        from molsysmt.basic import get
+
+        count = get(item, n_atoms=True)
+        if count is None:
+            raise ValueError("Atom selection requires a declared atom-index axis.")
+        positions = np.arange(count, dtype=np.int64)
+        if is_all(tmp_selection):
+            return positions
+        table = pd.DataFrame({"atom_index": positions})
+        requested = set(re.findall(r"\b[A-Za-z_]\w*\b", tmp_selection))
+        for name in sorted(requested.intersection(attributes) - {"atom_index"}):
+            values = get(item, element="atom", **{name: True})
+            if values is None:
+                from molsysmt._private.smonitor import StructuralInconsistencyError
+
+                raise StructuralInconsistencyError(
+                    reason=f"Selection requires unavailable attribute {name!r}.",
+                    caller="molsysmt.basic.selector.molsysmt.select",
+                )
+            table[name] = values
+        return table.query(
+            tmp_selection, engine="python", local_dict=query_local_dict
+        ).index.to_list()
+
+    if is_all(tmp_selection):
+        output = np.array(np.arange(tmp_item.atoms.shape[0]))
+
+    else:
+        atom_columns = []
+        group_columns = []
+        component_columns = []
+        molecule_columns = []
+        entity_columns = []
+        chain_columns = []
+        atom_state_columns = {
+            "formal_charge": "formal_charge",
+            "atom_is_aromatic": "is_aromatic",
+            "n_unpaired_electrons": "n_unpaired_electrons",
+            "n_implicit_hydrogens": "n_implicit_hydrogens",
+            "n_explicit_hydrogens": "n_explicit_hydrogens",
+            "allows_implicit_hydrogens": "allows_implicit_hydrogens",
+            "atom_stereochemistry": "stereochemistry",
+        }
+        requested_atom_state_columns = [
+            public_name
+            for public_name in atom_state_columns
+            if public_name in tmp_selection
+        ]
+
+        if "component_index" in tmp_selection:
+            atom_columns.append("component_index")
+
+        for column in tmp_item.atoms.keys():
+            if column in tmp_selection:
+                atom_columns.append(column)
+
+        for column in tmp_item.groups.keys():
+            if column in tmp_selection:
+                group_columns.append(column)
+
+        for column in ("component_id", "component_name", "component_type"):
+            if column in tmp_selection:
+                component_columns.append(column)
+
+        for column in tmp_item.molecules.keys():
+            if column in tmp_selection:
+                molecule_columns.append(column)
+
+        for column in tmp_item.entities.keys():
+            if column in tmp_selection:
+                entity_columns.append(column)
+
+        for column in tmp_item.chains.keys():
+            if column in tmp_selection:
+                chain_columns.append(column)
+
+        if len(entity_columns):
+            if "entity_index" not in molecule_columns:
+                molecule_columns.append("entity_index")
+
+        if len(molecule_columns):
+            if "molecule_index" not in group_columns:
+                group_columns.append("molecule_index")
+
+        if len(group_columns):
+            if "group_index" not in atom_columns:
+                atom_columns.append("group_index")
+
+        if len(component_columns):
+            if "component_index" not in atom_columns:
+                atom_columns.append("component_index")
+
+        if len(chain_columns):
+            if "chain_index" not in atom_columns:
+                atom_columns.append("chain_index")
+
+        from molsysmt._private.topology_expansion import expand_atom_dataframe
+
+        aux_df = expand_atom_dataframe(
+            tmp_item,
+            chemical_states=chemical_states,
+            atom_columns=atom_columns,
+            group_columns=group_columns,
+            component_columns=component_columns,
+            molecule_columns=molecule_columns,
+            entity_columns=entity_columns,
+            chain_columns=chain_columns,
+        )
+
+        for public_name in requested_atom_state_columns:
+            values = (
+                None
+                if chemical_states is None
+                else chemical_states._get_chemical_state_atom_attribute(
+                    atom_state_columns[public_name]
+                )
+            )
+            if values is None:
+                from molsysmt._private.smonitor import StructuralInconsistencyError
+
+                raise StructuralInconsistencyError(
+                    reason=(
+                        f"Selection requires chemical-state attribute {public_name!r}, "
+                        "but it is unavailable in the resolved state."
+                    ),
+                    caller="molsysmt.basic.selector.molsysmt.select",
+                )
+            aux_df[public_name] = values
+
+        id_columns = [column for column in aux_df.columns if column.endswith("_id")]
+        numeric_id_columns = _id_columns_with_numeric_comparisons(
+            tmp_selection, id_columns
+        )
+
+        for column in numeric_id_columns:
+            if _column_has_integer_strings(aux_df[column]):
+                aux_df[column] = pd.to_numeric(aux_df[column], errors="coerce")
+            else:
+                from smonitor.integrations import context_extra
+
+                from molsysmt._private.smonitor import SelectionWarning, warn
+
+                warn(
+                    f"Selection uses numeric comparison on '{column}', but values are not integer-like strings; "
+                    "comparison will fall back to string semantics.",
+                    SelectionWarning,
+                    extra=context_extra(
+                        caller="molsysmt.basic.selector.molsysmt.select",
+                        operation="select",
+                        extra={"requested_attribute": column},
+                    ),
+                )
+
+        tmp_selection = tmp_selection.replace("atom_index", "index")
+        output = aux_df.query(
+            tmp_selection, engine="python", local_dict=query_local_dict
+        ).index.to_list()
+
+        del aux_df
+
+    return output
+
+
+_PUBLIC_BOND_QUERY_COLUMNS = {
+    "bond_id": "bond_id",
+    "bond_order": "bond_order",
+    "fractional_bond_order": "fractional_bond_order",
+    "bond_type": "bond_type",
+    "bond_is_aromatic": "is_aromatic",
+    "bond_is_conjugated": "is_conjugated",
+    "bond_stereochemistry": "stereochemistry",
+    "bond_donor_atom_index": "donor_atom_index",
+    "bond_acceptor_atom_index": "acceptor_atom_index",
+    "bond_joins_components": "joins_components",
+    "bond_evidence": "evidence",
+}
+
+
+def selection_uses_bond_attributes(selection):
+    """
+    Return whether a query references a canonical bond-domain attribute.
+
+    Parameters
+    ----------
+    selection : str, list, tuple, or numpy.ndarray
+        Selection string or boolean/integer array specifying elements.
+    """
+
+    return any(attribute in selection for attribute in _PUBLIC_BOND_QUERY_COLUMNS)
+
+
+def select_bonds_standard(item, selection):
+    """
+    Evaluate a MolSysMT query directly on the resolved bond table.
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    selection : str, list, tuple, or numpy.ndarray
+        Selection string or boolean/integer array specifying elements.
+    """
+
+    from molsysmt._private.h5msm import query_inventory_candidates
+    from molsysmt._private.smonitor import StructuralInconsistencyError
+    from molsysmt.basic import convert
+    from molsysmt.native import ChemicalStates, MolSys
+
+    candidates, file_context = query_inventory_candidates(item)
+    owners = [
+        candidate.chemical_states if isinstance(candidate, MolSys) else candidate
+        for candidate in candidates
+        if isinstance(candidate, (MolSys, ChemicalStates))
+    ]
+    states = (
+        owners[0]
+        if len(owners) == 1
+        else owners[-1]
+        if file_context and owners
+        else convert(item, to_form="molsysmt.MolSys").chemical_states
+    )
+    if states is None:
+        raise StructuralInconsistencyError(
+            reason="Bond selection requires a ChemicalStates domain.",
+            caller="molsysmt.basic.select",
+        )
+    bonds = states._get_chemical_state_bonds()
+    query = selection
+    query_frame = pd.DataFrame(index=range(len(bonds)))
+    query_frame["bond_index"] = np.arange(len(bonds), dtype=np.int64)
+
+    for public_name, native_name in _PUBLIC_BOND_QUERY_COLUMNS.items():
+        if public_name not in query:
+            continue
+        if native_name not in bonds:
+            raise StructuralInconsistencyError(
+                reason=(
+                    f"Selection requires chemical-state attribute {public_name!r}, "
+                    "but it is unavailable in the resolved state."
+                ),
+                caller="molsysmt.basic.selector.molsysmt.select_bonds_standard",
+            )
+        query_frame[public_name] = bonds[native_name]
+
+    id_columns = [column for column in query_frame if column.endswith("_id")]
+    for column in _id_columns_with_numeric_comparisons(query, id_columns):
+        if _column_has_integer_strings(query_frame[column]):
+            query_frame[column] = pd.to_numeric(query_frame[column], errors="coerce")
+
+    query = query.replace("bond_index", "index")
+    return query_frame.query(query, engine="python").index.to_list()
+
+
+def select_within(molecular_system, selection, structure_indices):
+
+    from molsysmt._private.smonitor import ArgumentError
+    from molsysmt.basic import has_attribute
+    from molsysmt.structure.get_contacts import get_contacts
+
+    if not has_attribute(molecular_system, attribute="coordinates"):
+        raise ArgumentError(
+            "selection",
+            value=selection,
+            caller="molsysmt.select",
+            message="Spatial selection requires source coordinates.",
+        )
+
+    not_within = False
+
+    if "not within " in selection:
+        selection_1, tmp_selection = selection.split(" not within ")
+        not_within = True
+    else:
+        selection_1, tmp_selection = selection.split(" within ")
+
+    pbc = False
+
+    if "with pbc " in tmp_selection:
+        pbc = True
+        tmp_selection = tmp_selection.replace("with pbc ", "")
+    elif "without pbc " in tmp_selection:
+        tmp_selection = tmp_selection.replace("without pbc ", "")
+
+    threshold, selection_2 = tmp_selection.split(" of ")
+
+    atom_indices_1 = select(molecular_system, selection_1)
+    atom_indices_2 = select(molecular_system, selection_2)
+    cmap = get_contacts(
+        molecular_system,
+        selection=atom_indices_1,
+        selection_2=atom_indices_2,
+        structure_indices=structure_indices,
+        threshold=threshold,
+        pbc=pbc,
+    )
+
+    if not_within:
+        output = np.array(atom_indices_1)[np.where(~cmap.all(axis=2)[0])[0]].tolist()
+    else:
+        output = np.array(atom_indices_1)[np.where(cmap.any(axis=2)[0])[0]].tolist()
+
+    return output
+
+
+def select_bonded_to(molecular_system, selection):
+
+    from molsysmt.basic import get
+
+    not_bonded = False
+
+    if "not bonded to" in selection:
+        selection_1, selection_2 = selection.split(" not bonded to")
+        not_bonded = True
+    else:
+        selection_1, selection_2 = selection.split(" bonded to")
+
+    atom_indices_1 = select(molecular_system, selection=selection_1.strip())
+    atom_indices_2 = get(
+        molecular_system,
+        element="atom",
+        selection=selection_2.strip(),
+        bonded_atoms=True,
+    )
+    atom_indices_2 = (
+        np.unique(np.concatenate(atom_indices_2).ravel())
+        if len(atom_indices_2)
+        else np.empty(0, dtype=np.int64)
+    )
+
+    if not_bonded:
+        output = np.setdiff1d(
+            atom_indices_1, atom_indices_2, assume_unique=True
+        ).tolist()
+    else:
+        output = np.intersect1d(
+            atom_indices_1, atom_indices_2, assume_unique=True
+        ).tolist()
+
+    return output
+
+
+_aux_dict_in_elements_in = {
+    "groups": ["components", "molecules", "chains", "entities"],
+    "components": ["molecules", "chains", "entities"],
+    "molecules": ["chains", "entities"],
+    "chains": ["molecules", "entities"],
+    "entities": [],
+}
+
+
+def select_in_elements_of(molecular_system, selection):
+
+    from molsysmt.basic import get
+
+    for elements_1, list_elements_2 in _aux_dict_in_elements_in.items():
+        if "in " + elements_1 in selection:
+            before, after = selection.split("in " + elements_1)
+
+            before = before.strip()
+            after = after.strip()
+
+            if _in_elements_of(after):
+                for elements_2 in list_elements_2:
+                    if "in " + elements_2 in after:
+                        element_1 = _plural_elements_to_singular[elements_1]
+                        element_2 = _plural_elements_to_singular[elements_2]
+
+                        bbefore, aafter = after.split("in " + elements_2)
+
+                        bbefore = bbefore.strip()
+                        aafter = aafter.strip()
+
+                        bbefore = bbefore.replace("of ", "")
+                        aafter = aafter.replace("of ", "")
+
+                        if bbefore == "":
+                            bbefore = "all"
+
+                        if aafter == "":
+                            aafter = "all"
+
+                        kwarg = {_element_index[element_1]: True}
+                        pre_output = get(
+                            molecular_system,
+                            element=element_2,
+                            selection=aafter,
+                            skip_digestion=True,
+                            **kwarg,
+                        )
+                        if is_all(bbefore):
+                            output_2 = pre_output
+                        else:
+                            mask = get(
+                                molecular_system,
+                                element=element_1,
+                                selection=bbefore,
+                                skip_digestion=True,
+                                **kwarg,
+                            )
+                            output_2 = [
+                                np.intersect1d(ii, mask).tolist() for ii in pre_output
+                            ]
+                        output_2 = [ii for ii in output_2 if len(ii) > 0]
+
+                        output = []
+
+                        aux_output_2 = np.concatenate(output_2).tolist()
+                        pre_output = get(
+                            molecular_system,
+                            element=element_1,
+                            selection=aux_output_2,
+                            skip_digestion=True,
+                            atom_index=True,
+                        )
+                        aux_dict = {ii: jj for ii, jj in zip(aux_output_2, pre_output)}
+
+                        if before == "":
+                            before = "all"
+
+                        if is_all(before):
+                            for aux_after in output_2:
+                                pre_output = [aux_dict[ii] for ii in aux_after]
+                                aux_output = [ii for ii in pre_output if len(ii) > 0]
+                                output.append(aux_output)
+                        else:
+                            mask = select(molecular_system, selection=before)
+                            for aux_after in output_2:
+                                pre_output = [aux_dict[ii] for ii in aux_after]
+                                aux_output = [
+                                    np.intersect1d(ii, mask).tolist()
+                                    for ii in pre_output
+                                ]
+                                aux_output = [ii for ii in aux_output if len(ii) > 0]
+                                output.append(aux_output)
+
+                        return output
+
+            else:
+                element_1 = _plural_elements_to_singular[elements_1]
+
+                after = after.replace("of ", "")
+
+                if before == "":
+                    before = "all"
+
+                if after == "":
+                    after = "all"
+
+                pre_output = get(
+                    molecular_system,
+                    element=element_1,
+                    selection=after,
+                    skip_digestion=True,
+                    atom_index=True,
+                )
+                mask = select(molecular_system, selection=before)
+                output = [np.intersect1d(ii, mask).tolist() for ii in pre_output]
+                output = [ii for ii in output if len(ii) > 0]
+
+                return output
+
+    from molsysmt._private.smonitor import NotImplementedMethodError
+
+    raise NotImplementedMethodError(
+        caller="molsysmt.basic.selector.molsysmt.select_in_elements_of"
+    )
+
+
+# def select_in_groups_of(molecular_system, selection):
+#
+#    from molsysmt.basic import get
+#
+#    before, after = selection.split('in groups of')
+#    before = before.strip()
+#    after = after.strip()
+#
+#    if before == '' or is_all(before):
+#
+#        output = get(molecular_system, element='group', selection=after, atom_index=True)
+#        output = [ii for ii in output]
+#
+#    else:
+#
+#        pre_output = get(molecular_system, element='group', selection=after, atom_index=True)
+#        mask = select(molecular_system, selection=before)
+#        output = [np.intersect1d(ii, mask) for ii in pre_output]
+#        output = [ii for ii in output if ii.shape[0] > 0]
+#
+#    return output
+
+
+def selection_with_special_subsentences(selection):
+
+    output = None
+    parenthesis = get_parenthesis(selection)
+    for subselection in parenthesis:
+        if ("within " in subselection) or ("bonded to " in subselection):
+            output = subselection
+            break
+
+    return output
+
+
+def _var_names_in_selection(selection):
+
+    var_names = []
+
+    if isinstance(selection, str):
+        var_names = [ii[1:] for ii in findall(r"@[\w']+", selection)]
+
+    elif isinstance(selection, (tuple, list)):
+        for ii in selection:
+            var_names += _var_names_in_selection(ii)
+
+    return var_names
+
+
+def _in_elements_of(selection):
+
+    output = False
+
+    if "in groups" in selection:
+        output = True
+    elif "in components" in selection:
+        output = True
+    elif "in chains" in selection:
+        output = True
+    elif "in molecules" in selection:
+        output = True
+    elif "in entities" in selection:
+        output = True
+
+    return output
+
+
+def _id_columns_with_numeric_comparisons(selection, columns):
+
+    numeric_columns = []
+    for column in columns:
+        pattern = rf"\b{column}\b\s*(==|!=|<=|>=|<|>)\s*\d+"
+        if re.search(pattern, selection):
+            numeric_columns.append(column)
+    return numeric_columns
+
+
+def _column_has_integer_strings(series):
+
+    def _is_integer_string(value):
+        if pd.isna(value):
+            return True
+        if isinstance(value, (int, np.integer)):
+            return True
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped.lstrip("-").isdigit()
+        return False
+
+    subset = series.dropna()
+    if subset.empty:
+        return True
+
+    if not subset.map(_is_integer_string).all():
+        return False
+
+    numeric = pd.to_numeric(subset, errors="coerce")
+    return numeric.notna().all()

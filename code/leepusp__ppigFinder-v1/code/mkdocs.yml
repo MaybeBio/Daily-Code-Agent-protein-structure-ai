@@ -1,0 +1,106 @@
+site_name: ppigFinder
+site_description: Genomic analysis and protein–protein interaction candidate discovery
+site_url: https://leepusp.github.io/ppigFinder-v1/
+repo_url: https://github.com/leepusp/ppigFinder-v1
+repo_name: leepusp/ppigFinder-v1
+edit_uri: edit/main/docs/
+docs_dir: docs
+
+copyright: ppigFinder — open-source research software, MIT license
+
+theme:
+  name: material
+  language: en
+  logo: assets/figures/ppigfinder-mark.svg
+  favicon: assets/figures/ppigfinder-mark.svg
+  palette:
+    - scheme: default
+      primary: white
+      accent: blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: light-blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.footer
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+    - content.tabs.link
+
+extra_css:
+  - stylesheets/ppigfinder-white.css
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Start:
+      - Installation: user_manual/installation.md
+      - First launch: user_manual/getting_started.md
+      - Quick Start: user_manual/quick_start_v29_14.md
+      - Analysis workflow: workflows/analysis_workflow.md
+      - Xanthomonas Tutorial: tutorials/xanthomonas.md
+      - Interface Tour: user_manual/interface_tour.md
+  - User Manual:
+      - Complete Guide: user_manual/complete_guide.md
+      - Data and projects: user_manual/data_project.md
+      - Genome: user_manual/genome.md
+      - ORF Prediction: user_manual/orf_prediction.md
+      - ORF Browser: user_manual/orfs.md
+      - Annotation: user_manual/annotation.md
+      - Protein Interactions / AlphaFold: user_manual/alphafold.md
+      - AlphaFold 3 local installation: user_manual/af3_local_installation.md
+      - Results and Reports: user_manual/reports.md
+      - Troubleshooting: user_manual/troubleshooting.md
+  - Execution:
+      - Where to run predictions: user_manual/hpc_submission.md
+      - Optional remote connections: user_manual/remote_connections.md
+      - OpenSSH native transport: user_manual/openssh_native_transport.md
+  - Development:
+      - Feature status: developer/feature_status.md
+      - Capabilities and integrations: developer/capabilities.md
+      - Architecture: developer/software_architecture.md
+      - HPC portability: developer/hpc_portability.md
+      - SSH/SFTP transport contract: developer/remote_transport.md
+      - Directory map: developer/directory_layout.md
+      - Prediction internals:
+          - Overview: developer/structure_prediction/README.md
+          - Service layer: developer/structure_prediction/service_layer.md
+          - Batch builder: developer/structure_prediction/batch_builder.md
+          - Batch artifacts: developer/structure_prediction/batch_artifacts.md
+          - Input writers: developer/structure_prediction/input_writers.md
+          - AF3 input writer: developer/structure_prediction/af3_input_writer.md
+          - Boltz-2 input writer: developer/structure_prediction/boltz2_input_writer.md
+          - FoldCP input writer: developer/structure_prediction/foldcp_input_writer.md
+          - Job manifest: developer/structure_prediction/job_manifest.md
+          - Manifest validation: developer/structure_prediction/manifest_validation.md
+          - Slurm and layout: developer/structure_prediction/slurm_and_layout.md
+          - Slurm batch writer: developer/structure_prediction/slurm_batch_writer.md
+  - Publication: publication.md

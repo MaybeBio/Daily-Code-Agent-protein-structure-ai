@@ -1,0 +1,845 @@
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { App } from "./App";
+import { api } from "./api";
+import * as apiClient from "./api";
+import * as deployment from "./deployment/client";
+import { defaults } from "./form-model";
+import {
+  historyFixture,
+  identityFixture,
+} from "./studio/task-history.test-fixtures";
+import * as i18n from "./i18n";
+import type { Health, Job } from "./types";
+
+vi.mock("./chemistry/StateForm", async (importOriginal) => {
+  const original =
+    await importOriginal<typeof import("./chemistry/StateForm")>();
+  const { useInputTaskSubmit } = await import("./guided/useInputTaskSubmit");
+  const { defaults: options } = await import("./chemistry/generated");
+  return {
+    StateForm: (props: Parameters<typeof original.StateForm>[0]) => {
+      const { initialMolecule, onCreated } = props;
+      const task = useInputTaskSubmit(onCreated);
+      if (!initialMolecule) return <original.StateForm {...props} />;
+      return (
+        <button
+          type="button"
+          onClick={() =>
+            void task.submit({
+              name: "Prepare the selected record",
+              operation: "molecular_states",
+              molecule: initialMolecule,
+              options: { ...options, force_field: "MMFF94s" },
+            })
+          }
+        >
+          Submit preparation
+        </button>
+      );
+    },
+  };
+});
+
+function job(id: string, name: string, projectId: string | null): Job {
+  return {
+    id,
+    request: {
+      name,
+      project_id: projectId,
+      components: [{ kind: "protein", value: "ACDE", count: 1 }],
+      parameters: defaults,
+    },
+    status: "queued",
+    created_at: "2026-09-30T00:00:00Z",
+    started_at: null,
+    finished_at: null,
+    error: null,
+    parent_id: null,
+  };
+}
+const jobs = [
+  job("11111111-1111-4111-8111-111111111111", "Ungrouped task", null),
+  job("22222222-2222-4222-8222-222222222222", "Project A task", "project-a"),
+  job("33333333-3333-4333-8333-333333333333", "Project B task", "project-b"),
+  job("44444444-4444-4444-8444-444444444444", "Another A task", "project-a"),
+];
+const health: Health = {
+  version: "test",
+  engine: { ready: true, gpu: null, reason: null },
+  worker_ready: true,
+  worker_error: null,
+  free_disk_gib: 100,
+  disk_total_gib: 200,
+  capabilities: { prediction: true, msa: false, templates: false, llm: false },
+};
+
+beforeEach(() => {
+  window.history.replaceState(null, "", "/");
+  vi.spyOn(window, "scrollTo").mockImplementation(() => {});
+  vi.spyOn(i18n, "restoreLanguage").mockReturnValue("en");
+  vi.spyOn(deployment, "useDeployment").mockReturnValue({
+    data: null,
+    error: "",
+    refresh: vi.fn(),
+  });
+  vi.spyOn(api, "initialize").mockResolvedValue();
+  vi.spyOn(api, "jobs").mockResolvedValue(jobs);
+  vi.spyOn(apiClient, "request").mockImplementation(async (path) => {
+    const identity = path.match(/^\/task-history\/([^/]+)\/identity$/);
+    const selected = identity
+      ? (await api.jobs()).find((job) => job.id === identity[1])
+      : undefined;
+    if (!selected) throw new Error("Unhandled test request: " + path);
+    return identityFixture(selected) as never;
+  });
+  vi.spyOn(api, "taskHistory").mockImplementation(async (path) =>
+    historyFixture(await api.jobs(), path),
+  );
+  vi.spyOn(api, "health").mockResolvedValue(health);
+  vi.spyOn(api, "artifacts").mockResolvedValue([]);
+  vi.spyOn(api, "projects").mockResolvedValue([
+    {
+      id: "project-a",
+      name: "Study A",
+      description: "",
+      created_at: "2026-09-30",
+    },
+    {
+      id: "project-b",
+      name: "Study B",
+      description: "",
+      created_at: "2026-09-30",
+    },
+  ]);
+});
+afterEach(() => vi.restoreAllMocks());
+
+it("browses classified history during an unavailable environment-health read", async () => {
+  vi.mocked(api.health).mockRejectedValue(new Error("Unavailable"));
+  const user = userEvent.setup();
+  render(<App />);
+  const nav = screen.getByRole("navigation", { name: "Main navigation" });
+  await user.click(
+    within(nav).getByRole("button", { name: "Structure prediction" }),
+  );
+  await user.click(
+    within(
+      screen.getByRole("navigation", { name: "Module workspace" }),
+    ).getByRole("button", { name: "Task results" }),
+  );
+  expect(
+    await screen.findByRole("button", { name: "Ungrouped task" }),
+  ).toBeVisible();
+  expect(screen.queryByText(/Unable to load the latest tasks/)).toBeNull();
+});
+
+it("starts the chosen task module's questionnaire without reusing or submitting an old task", async () => {
+  vi.spyOn(apiClient, "request").mockResolvedValue({
+    availability: { configuration_present: false },
+  } as never);
+  const submit = vi.spyOn(api, "submit"),
+    user = userEvent.setup();
+  render(<App />);
+  const nav = await screen.findByRole("navigation", {
+    name: "Main navigation",
+  });
+  await user.click(
+    within(nav).getByRole("button", { name: "Pockets and docking" }),
+  );
+  await user.click(
+    within(
+      screen.getByRole("navigation", { name: "Module workspace" }),
+    ).getByRole("button", { name: "Task results" }),
+  );
+  await user.click(
+    within(
+      screen.getByRole("navigation", { name: "Module workspace" }),
+    ).getByRole("button", { name: "New task" }),
+  );
+  expect(
+    await screen.findByRole("heading", { name: "1. Choose structure" }),
+  ).toBeVisible();
+  expect(screen.getByRole("combobox", { name: "Research task" })).toHaveValue(
+    "p2rank.detect",
+  );
+  expect(window.location.hash).toBe("#view=new&tool=p2rank.detect");
+  expect(submit).not.toHaveBeenCalled();
+});
+
+it("opens the shared asset workspace through the integrated navigation", async () => {
+  vi.spyOn(apiClient, "request").mockImplementation(
+    async (path) =>
+      (path.startsWith("/research/graph")
+        ? { schema: 1, limit: 200, nodes: [], edges: [], truncated: false }
+        : []) as never,
+  );
+  const user = userEvent.setup();
+  render(<App />);
+  await user.click(screen.getByRole("button", { name: "Research workspace" }));
+  await user.click(screen.getByRole("button", { name: "Research files" }));
+  expect(
+    await screen.findByRole("heading", {
+      name: "Research files",
+    }),
+  ).toBeVisible();
+  expect(
+    await screen.findByText("Start with your first research asset"),
+  ).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "Research workspace" }),
+  ).toHaveAttribute("aria-current", "page");
+  expect(document.title).toBe("Research workspace · X-DDE");
+});
+
+it("keeps all projects visible when selecting a task from a module's unfiltered history", async () => {
+  const user = userEvent.setup();
+  render(<App />);
+  await user.click(
+    screen.getByRole("button", { name: "Structure prediction" }),
+  );
+  await user.click(
+    within(
+      screen.getByRole("navigation", { name: "Module workspace" }),
+    ).getByRole("button", { name: "Task results" }),
+  );
+  await user.click(
+    await screen.findByRole("button", { name: /Project A task/ }),
+  );
+
+  expect(
+    await screen.findByRole("heading", { name: "Project A task" }),
+  ).toBeVisible();
+  await user.click(
+    screen.getByRole("button", { name: "Back to task results" }),
+  );
+  expect(screen.queryByRole("group", { name: "Project filter" })).toBeNull();
+  expect(
+    await screen.findByRole("button", { name: /Project B task/ }),
+  ).toBeVisible();
+  expect(screen.getByRole("button", { name: /Ungrouped task/ })).toBeVisible();
+  await user.click(screen.getByRole("button", { name: /Project B task/ }));
+  expect(
+    await screen.findByRole("heading", { name: "Project B task" }),
+  ).toBeVisible();
+  await user.click(
+    screen.getByRole("button", { name: "Back to task results" }),
+  );
+  expect(
+    await screen.findByRole("button", { name: /Project A task/ }),
+  ).toBeVisible();
+});
+
+it("applies an explicitly chosen project until the user clears its filter", async () => {
+  const user = userEvent.setup();
+  render(<App />);
+  await user.click(screen.getByRole("button", { name: "Research workspace" }));
+  await user.click(await screen.findByRole("button", { name: /Study A/ }));
+
+  const filter = screen.getByRole("group", { name: "Project filter" });
+  expect(filter).toHaveTextContent("Study A");
+  const ownTask = await screen.findByRole("button", { name: /Another A task/ });
+  expect(screen.queryByRole("button", { name: /Project B task/ })).toBeNull();
+  await user.click(ownTask);
+  expect(
+    await screen.findByRole("heading", { name: "Another A task" }),
+  ).toBeVisible();
+  await user.click(
+    screen.getByRole("button", { name: "Back to task results" }),
+  );
+  expect(
+    await screen.findByRole("button", { name: /Project A task/ }),
+  ).toBeVisible();
+
+  await user.click(
+    within(filter).getByRole("button", { name: "Clear filter" }),
+  );
+  expect(screen.queryByRole("group", { name: "Project filter" })).toBeNull();
+  expect(
+    await screen.findByRole("button", { name: /Project B task/ }),
+  ).toBeVisible();
+  expect(screen.getByRole("button", { name: /Ungrouped task/ })).toBeVisible();
+});
+
+it("opens core scientific forms directly from the first navigation entries", async () => {
+  vi.spyOn(api, "assets").mockResolvedValue([]);
+  vi.spyOn(apiClient, "request").mockImplementation(
+    async (path) =>
+      (path.includes("capabilities")
+        ? {
+            availability: {
+              configuration_present: false,
+              missing: ["runtime"],
+            },
+          }
+        : []) as never,
+  );
+  const user = userEvent.setup(),
+    submit = vi.spyOn(api, "submit");
+  render(<App />);
+  const nav = screen.getByRole("navigation", { name: "Main navigation" });
+  const core = [
+    "Utilities",
+    "Target research",
+    "Structure prediction",
+    "Pockets and docking",
+    "Small-molecule design",
+    "Induced proximity",
+    "High-throughput screening",
+    "DEL research",
+    "Biologics research",
+    "Properties and safety",
+  ];
+  expect(
+    within(nav)
+      .getAllByRole("button")
+      .slice(0, core.length)
+      .map((button) => button.getAttribute("aria-label")),
+  ).toEqual(core);
+  await user.click(
+    within(nav).getByRole("button", { name: "Properties and safety" }),
+  );
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Research task" }),
+    "properties",
+  );
+  expect(
+    screen.getByRole("radiogroup", { name: "How will you provide molecules?" }),
+  ).toBeVisible();
+  await user.click(
+    screen.getByRole("radio", {
+      name: "Paste molecular structure text (SMILES)",
+    }),
+  );
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  expect(screen.getByRole("textbox", { name: "SMILES" })).toBeVisible();
+  await user.click(
+    within(nav).getByRole("button", { name: "Pockets and docking" }),
+  );
+  expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
+  await user.click(
+    within(nav).getByRole("button", { name: "Small-molecule design" }),
+  );
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Research task" }),
+    "chemistry.states",
+  );
+  expect(
+    screen.getByRole("radio", {
+      name: "Upload a new file",
+    }),
+  ).toBeVisible();
+  expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
+  expect(screen.queryByText("Install research software")).toBeNull();
+  expect(submit).not.toHaveBeenCalled();
+});
+
+it("keeps a linked non-prediction task in its task view across both history events", async () => {
+  const linked = {
+    ...jobs[0],
+    request: {
+      operation: "properties",
+      name: "Linked descriptors",
+      smiles: ["CCO"],
+      ligand_files: [],
+    },
+  } as Job;
+  vi.mocked(api.jobs).mockResolvedValue([linked]);
+  render(<App />);
+  act(() => {
+    window.history.replaceState(null, "", "/#task=" + linked.id);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  });
+  expect(
+    await screen.findByRole("heading", { name: "Linked descriptors" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Back to task results" }),
+  ).toBeVisible();
+  act(() => window.dispatchEvent(new HashChangeEvent("hashchange")));
+  expect(
+    await screen.findByRole("heading", { name: "Linked descriptors" }),
+  ).toBeInTheDocument();
+  expect(window.location.hash).toContain("module=evaluation");
+  expect(window.location.hash).toContain("task=" + linked.id);
+  expect(
+    screen.queryByRole("heading", { name: "Structure prediction" }),
+  ).not.toBeInTheDocument();
+});
+
+it("opens a fresh prediction form when the current task belongs to another engine", async () => {
+  const submit = vi.spyOn(api, "submit");
+  const linked = {
+    ...jobs[0],
+    request: {
+      operation: "properties",
+      name: "Descriptors",
+      smiles: [],
+      ligand_files: [],
+    },
+  } as Job;
+  vi.mocked(api.jobs).mockResolvedValue([linked]);
+  window.history.replaceState(null, "", "/#task=" + linked.id);
+  const user = userEvent.setup();
+  render(<App />);
+  const nav = await screen.findByRole("navigation", {
+    name: "Main navigation",
+  });
+  expect(
+    await screen.findByRole("heading", { name: "Descriptors" }),
+  ).toBeVisible();
+  await user.click(
+    within(nav).getByRole("button", { name: "Structure prediction" }),
+  );
+  expect(
+    await screen.findByRole("heading", { name: "Structure prediction" }),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("heading", { name: "Task results" }),
+  ).not.toBeInTheDocument();
+  expect(window.location.hash).toBe("#view=new&tool=predict");
+  expect(submit).not.toHaveBeenCalled();
+});
+
+it("returns to the full catalogue when its navigation entry is chosen inside a task", async () => {
+  vi.spyOn(apiClient, "request").mockImplementation(
+    async (path) =>
+      (path.startsWith("/capabilities/")
+        ? { availability: { configuration_present: true } }
+        : []) as never,
+  );
+  const submit = vi.spyOn(api, "submit"),
+    user = userEvent.setup();
+  render(<App />);
+  const nav = await screen.findByRole("navigation", {
+    name: "Main navigation",
+  });
+  await user.click(
+    within(nav).getByRole("button", { name: "All capabilities" }),
+  );
+  await user.click(
+    screen.getByRole("button", { name: "Calculate molecular properties" }),
+  );
+  expect(
+    screen.getByRole("heading", { name: "1. Choose source" }),
+  ).toBeVisible();
+  await user.click(
+    within(nav).getByRole("button", { name: "All capabilities" }),
+  );
+  expect(
+    screen.getByRole("button", { name: "Calculate molecular properties" }),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("heading", { name: "1. Choose source" }),
+  ).not.toBeInTheDocument();
+  expect(submit).not.toHaveBeenCalled();
+});
+
+it.each(["en", "zh"] as const)(
+  "preserves ongoing header typing when delayed legacy task ownership resolves (%s)",
+  async (language) => {
+    vi.mocked(i18n.restoreLanguage).mockReturnValue(language);
+    vi.mocked(api.jobs).mockResolvedValue([]);
+    window.history.replaceState(null, "", "/#task=" + jobs[0].id);
+    let resolve!: (value: Job) => void;
+    vi.mocked(apiClient.request).mockImplementation(async (path) => {
+      if (path === `/jobs/${jobs[0].id}`)
+        return new Promise<Job>((done) => {
+          resolve = done;
+        }) as never;
+      if (path === `/task-history/${jobs[0].id}/identity`)
+        return identityFixture(jobs[0]) as never;
+      throw new Error("Unhandled test request: " + path);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    const search = screen.getByRole("searchbox", {
+      name: language === "zh" ? "搜索任务" : "Search tasks",
+    });
+    await user.type(search, "STA");
+    expect(search).toHaveFocus();
+    expect(window.location.hash).toBe("#task=" + jobs[0].id);
+    await act(async () => {
+      resolve(jobs[0]);
+    });
+    expect(document.querySelector(".page-context-title")).toHaveTextContent(
+      language === "zh" ? "结构预测" : "Structure prediction",
+    );
+    expect(search).toHaveFocus();
+    await user.keyboard("T6");
+    expect(search).toHaveValue("STAT6");
+    expect(window.location.hash).toBe(
+      "#view=results&module=structures&task=" + jobs[0].id,
+    );
+  },
+);
+
+it("keeps initial and explicit keyboard navigation focus inside main", async () => {
+  const user = userEvent.setup();
+  render(<App />);
+  const main = screen.getByRole("main");
+  expect(main).toContainElement(document.activeElement as HTMLElement);
+  const target = within(
+    screen.getByRole("navigation", { name: "Main navigation" }),
+  ).getByRole("button", { name: "Structure prediction" });
+  target.focus();
+  await user.keyboard("{Enter}");
+  expect(document.querySelector(".page-context-title")).toHaveTextContent(
+    "Structure prediction",
+  );
+  expect(main).toContainElement(document.activeElement as HTMLElement);
+});
+
+it("focuses the selected result after keyboard selection from header search", async () => {
+  const user = userEvent.setup();
+  render(<App />);
+  const search = screen.getByRole("searchbox", { name: "Search tasks" });
+  await user.type(search, "Ungrouped");
+  const result = await screen.findByRole("button", { name: /Ungrouped task/ });
+  await user.keyboard("{ArrowDown}");
+  expect(result).toHaveFocus();
+  await user.keyboard("{Enter}");
+  expect(screen.getByRole("main")).toHaveFocus();
+  expect(
+    await screen.findByRole("heading", { name: "Ungrouped task" }),
+  ).toBeVisible();
+  expect(search).toHaveValue("");
+});
+
+it("focuses main after keyboard selection from task notifications", async () => {
+  vi.mocked(api.jobs).mockResolvedValue([{ ...jobs[0], status: "failed" }]);
+  const user = userEvent.setup();
+  render(<App />);
+  await user.click(screen.getByLabelText("Task notifications"));
+  const result = await screen.findByRole("button", {
+    name: /Ungrouped task.*Failed/,
+  });
+  result.focus();
+  await user.keyboard("{Enter}");
+  expect(screen.getByRole("main")).toHaveFocus();
+  expect(
+    await screen.findByRole("heading", { name: "Ungrouped task" }),
+  ).toBeVisible();
+});
+
+it("keeps confirmed project metadata through failed refresh, page reentry and GET-only recovery", async () => {
+  HTMLDialogElement.prototype.showModal = function () {
+    this.setAttribute("open", "");
+  };
+  vi.mocked(api.jobs).mockResolvedValue([]);
+  const project = {
+    id: "55555555-5555-4555-8555-555555555555",
+    name: "Created study",
+    description: "",
+    created_at: "2026-10-13",
+  };
+  const reads = vi
+    .mocked(api.projects)
+    .mockResolvedValueOnce([])
+    .mockRejectedValueOnce(new Error("temporary project read failure"))
+    .mockResolvedValue([project]);
+  const create = vi.spyOn(api, "createProject").mockResolvedValue(project);
+  const user = userEvent.setup();
+  render(<App />);
+  const nav = screen.getByRole("navigation", { name: "Main navigation" });
+  await waitFor(() => expect(reads).toHaveBeenCalledTimes(1));
+  await user.click(
+    within(nav).getByRole("button", { name: "Research workspace" }),
+  );
+  await user.click(screen.getByRole("button", { name: /New project/ }));
+  await user.type(
+    screen.getByRole("textbox", { name: "Project name" }),
+    project.name,
+  );
+  await user.click(screen.getByRole("button", { name: "Create project" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await user.click(
+    within(nav).getByRole("button", { name: "Research workspace" }),
+  );
+  expect(screen.getByRole("button", { name: /Created study/ })).toHaveClass(
+    "active",
+  );
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "temporary project read failure",
+  );
+  expect(
+    screen.getByText("Project “Created study” was created."),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole("button", { name: "Create your first project" }),
+  ).toBeNull();
+  await user.click(screen.getByRole("button", { name: "Research files" }));
+  await user.click(screen.getByRole("button", { name: "Projects" }));
+  await user.click(
+    within(nav).getByRole("button", { name: "Structure prediction" }),
+  );
+  await user.click(
+    within(nav).getByRole("button", { name: "Research workspace" }),
+  );
+  expect(screen.getByRole("button", { name: /Created study/ })).toHaveClass(
+    "active",
+  );
+  expect(reads).toHaveBeenCalledTimes(2);
+  await user.click(screen.getByRole("button", { name: "Retry" }));
+  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  expect(reads).toHaveBeenCalledTimes(3);
+  expect(create).toHaveBeenCalledExactlyOnceWith(project.name, "");
+  expect(screen.getAllByRole("button", { name: /Created study/ })).toHaveLength(
+    1,
+  );
+});
+
+it.each([
+  ["en", "p2rank.detect", "Pockets and docking"],
+  ["zh", "p2rank.detect", "口袋与对接"],
+  ["en", "deepternary.model", "Induced proximity"],
+  ["zh", "deepternary.model", "诱导邻近设计"],
+  ["en", "boltzgen.design", "Biologics research"],
+  ["zh", "boltzgen.design", "生物药研究"],
+] as const)(
+  "restores a new %s %s questionnaire without selecting historical inputs",
+  async (language, tool, title) => {
+    vi.mocked(i18n.restoreLanguage).mockReturnValue(language);
+    vi.mocked(apiClient.request).mockResolvedValue({
+      availability: { configuration_present: false },
+    } as never);
+    const submit = vi.spyOn(api, "submit");
+    window.history.replaceState(null, "", "/#view=new&tool=" + tool);
+    render(<App />);
+    expect(
+      await screen.findByRole("combobox", {
+        name: language === "zh" ? "研究任务" : "Research task",
+      }),
+    ).toHaveValue(tool);
+    expect(document.querySelector(".page-context-title")).toHaveTextContent(
+      title,
+    );
+    expect(api.artifacts).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+    expect(
+      vi
+        .mocked(apiClient.request)
+        .mock.calls.some(([path]) => path.startsWith("/jobs/")),
+    ).toBe(false);
+  },
+);
+
+it("restores the exact submodule after remounting at its new-task URL", async () => {
+  vi.mocked(apiClient.request).mockResolvedValue({
+    availability: { configuration_present: false },
+  } as never);
+  const user = userEvent.setup();
+  const first = render(<App />);
+  await user.click(
+    within(
+      screen.getByRole("navigation", { name: "Main navigation" }),
+    ).getByRole("button", { name: "Pockets and docking" }),
+  );
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Research task" }),
+    "gnina.dock",
+  );
+  expect(window.location.hash).toBe("#view=new&tool=gnina.dock");
+  first.unmount();
+  render(<App />);
+  expect(
+    await screen.findByRole("combobox", { name: "Research task" }),
+  ).toHaveValue("gnina.dock");
+  expect(api.artifacts).not.toHaveBeenCalled();
+});
+
+it("keeps the preceding filtered result location when opening a new questionnaire", async () => {
+  vi.mocked(apiClient.request).mockResolvedValue({
+    availability: { configuration_present: false },
+  } as never);
+  const original = "#view=results&module=binding&q=STAT6";
+  window.history.replaceState(null, "", "/" + original);
+  const user = userEvent.setup();
+  render(<App />);
+  const workspace = screen.getByRole("navigation", {
+    name: "Module workspace",
+  });
+  await user.click(within(workspace).getByRole("button", { name: "New task" }));
+  expect(window.location.hash).toBe("#view=new&tool=p2rank.detect");
+  act(() => window.history.back());
+  await waitFor(() => expect(window.location.hash).toBe(original));
+  expect(
+    await screen.findByRole("heading", { name: "Task results" }),
+  ).toBeVisible();
+  act(() => window.history.forward());
+  await waitFor(() =>
+    expect(window.location.hash).toBe("#view=new&tool=p2rank.detect"),
+  );
+  expect(
+    await screen.findByRole("combobox", { name: "Research task" }),
+  ).toHaveValue("p2rank.detect");
+  expect(api.artifacts).not.toHaveBeenCalled();
+});
+
+it("restores a newly typed history query after immediately opening a new task", async () => {
+  const savedPocket: Job = {
+    ...jobs[0],
+    id: "55555555-5555-4555-8555-555555555555",
+    status: "cancelled",
+    request: {
+      operation: "pocket_search",
+      name: "Existing pocket search",
+      protein: {
+        asset_id: "fixture",
+        sha256: "a".repeat(64),
+        record: 0,
+        conformer: 0,
+      },
+      profile: "experimental",
+      threads: 1,
+      memory_mib: 1024,
+      point_threshold: 0.5,
+      minimum_cluster: 5,
+      review_limit: 10,
+    },
+  };
+  vi.mocked(api.jobs).mockResolvedValue([...jobs, savedPocket]);
+  vi.mocked(apiClient.request).mockResolvedValue({
+    availability: { configuration_present: false },
+  } as never);
+  window.history.replaceState(null, "", "/#view=results&module=binding");
+  vi.useFakeTimers();
+  const view = render(<App />);
+  try {
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    fireEvent.change(
+      screen.getByRole("searchbox", { name: "Search this module" }),
+      { target: { value: "STAT6 fragment" } },
+    );
+    expect(new URLSearchParams(window.location.hash.slice(1)).get("q")).toBe(
+      "STAT6 fragment",
+    );
+    expect(
+      vi
+        .mocked(api.taskHistory)
+        .mock.calls.some(([path]) => path.includes("q=STAT6")),
+    ).toBe(false);
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Module workspace" }),
+      ).getByRole("button", { name: "New task" }),
+    );
+    expect(window.location.hash).toBe("#view=new&tool=p2rank.detect");
+    act(() => window.history.back());
+    await act(async () => vi.advanceTimersByTimeAsync(10));
+    expect(new URLSearchParams(window.location.hash.slice(1)).get("q")).toBe(
+      "STAT6 fragment",
+    );
+    expect(
+      screen.getByRole("searchbox", { name: "Search this module" }),
+    ).toHaveValue("STAT6 fragment");
+    expect(api.artifacts).not.toHaveBeenCalled();
+  } finally {
+    view.unmount();
+    vi.useRealTimers();
+  }
+});
+
+it.each([false, true])(
+  "retains the accepted preparation when browser Back is used: %s",
+  async (historyBack) => {
+    const reference = {
+      asset_id: "selected-sdf",
+      sha256: "a".repeat(64),
+      record: 0,
+      conformer: 0,
+    };
+    const library = {
+      ...jobs[0],
+      status: "succeeded",
+      request: { operation: "library_screen", name: "Library selection" },
+    } as Job;
+    const receipt = {
+      ...jobs[1],
+      request: { operation: "molecular_states", name: "Accepted preparation" },
+    } as Job;
+    const fetch = vi.mocked(apiClient.request).getMockImplementation()!;
+    vi.mocked(apiClient.request).mockImplementation(async (path, options) => {
+      if (path === "/jobs/" + library.id) return library as never;
+      if (path === "/jobs/" + receipt.id) return receipt as never;
+      return fetch(path, options);
+    });
+    vi.mocked(api.jobs).mockResolvedValue([library]);
+    vi.spyOn(api, "result").mockResolvedValue({
+      operation: "library_screen",
+      complete: true,
+      selected_records: [4],
+      artifact: "selected.sdf",
+      rows: [{ record: 4, selected: true, available: true, reference }],
+    });
+    let accept!: (job: Job) => void;
+    const submit = vi.spyOn(api, "submit").mockImplementation(
+      () =>
+        new Promise<Job>((resolve) => {
+          accept = resolve;
+        }),
+    );
+    const retry = vi.spyOn(api, "retry");
+    const newTask = "/#view=new&tool=chemistry.states";
+    window.history.replaceState(null, "", newTask);
+    window.history.pushState(null, "", "/#task=" + library.id);
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Prepare molecule" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Submit preparation" }));
+    const workspace = within(
+      screen.getByRole("navigation", { name: "Module workspace" }),
+    );
+    const navigation = [
+      workspace.getByRole("button", { name: "Task results" }),
+      workspace.getByRole("button", { name: "New task" }),
+      screen.getByRole("button", { name: "Back to task results" }),
+      screen.getByRole("button", { name: "Back to library results" }),
+      screen.getByRole("button", { name: "Run again" }),
+    ];
+    expect(submit).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        operation: "molecular_states",
+        molecule: reference,
+      }),
+      expect.any(String),
+    );
+    for (const button of navigation) {
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Target research" }));
+    expect(window.location.hash).toContain(library.id);
+    expect(retry).not.toHaveBeenCalled();
+    if (historyBack) {
+      window.history.back();
+      await waitFor(() => expect(window.location.hash).toBe(newTask.slice(1)));
+      expect(
+        screen.queryByRole("button", { name: "Submit preparation" }),
+      ).toBeNull();
+    }
+    await act(async () => {
+      vi.mocked(api.jobs).mockResolvedValue([library, receipt]);
+      accept(receipt);
+    });
+    if (historyBack) {
+      expect(window.location.hash).toBe(newTask.slice(1));
+      fireEvent.click(
+        await screen.findByRole("button", { name: "View submitted task" }),
+      );
+    }
+    expect(window.location.hash).toContain(receipt.id);
+    expect(
+      await screen.findByRole("heading", { name: "Accepted preparation" }),
+    ).toBeVisible();
+  },
+);

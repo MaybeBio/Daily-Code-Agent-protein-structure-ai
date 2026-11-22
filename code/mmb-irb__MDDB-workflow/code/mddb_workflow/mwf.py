@@ -1,0 +1,2974 @@
+# This is the starter script
+
+from os import mkdir, getcwd
+from os.path import exists, isdir, isabs, relpath, normpath, split, basename, join
+import sys
+import io
+import re
+import time
+import numpy
+from glob import glob
+from functools import partial
+
+# Constants
+# Importing constants first is important
+from mddb_workflow.utils.constants import *
+from mddb_workflow.core.dataset import Dataset, State
+from mddb_workflow.core.inputs import ProjectInputs, forced_value_wins
+# Import local utils
+from mddb_workflow.utils.auxiliar import InputError, InputsUpdated, MISSING_TOPOLOGY, REMOVED_MD, MISSING_VALUE, MISSING_BONDS
+from mddb_workflow.utils.auxiliar import warn, load_json, StatusLineStream
+from mddb_workflow.utils.auxiliar import is_glob, parse_glob, is_url, url_to_source_filename
+from mddb_workflow.utils.auxiliar import get_git_version, download_file
+from mddb_workflow.utils.auxiliar import is_standard_topology, unique, pairwise, safe_getattr
+from mddb_workflow.utils.auxiliar import parse_automatic_selection
+from mddb_workflow.utils.register import Register
+from mddb_workflow.utils.cache import Cache
+from mddb_workflow.utils.structures import Structure
+from mddb_workflow.utils.selections import Selection
+from mddb_workflow.utils.topologies import Topology
+from mddb_workflow.utils.file import File
+from mddb_workflow.utils.formats import is_amber_topology
+from mddb_workflow.utils.database import Database, Remote
+from mddb_workflow.utils.pyt_spells import get_average_structure
+from mddb_workflow.utils.gmx_spells import count_xtc_frames
+from mddb_workflow.utils.mda_spells import get_mda_universe
+from mddb_workflow.utils.tasks import Task
+from mddb_workflow.utils.type_hints import *
+
+# Import local tools
+from mddb_workflow.tools.get_first_frame import get_first_frame
+from mddb_workflow.tools.get_bonds import find_safe_bonds, get_bonds_reference_frame
+from mddb_workflow.tools.guess_cg_selection import guess_cg_selection, guess_ua_selection
+from mddb_workflow.tools.process_interactions import process_interactions
+from mddb_workflow.tools.generate_metadata import prepare_project_metadata, generate_md_metadata
+from mddb_workflow.tools.chains import prepare_chain_references
+from mddb_workflow.tools.generate_pdb_references import prepare_pdb_references
+from mddb_workflow.tools.generate_map import generate_protein_mapping
+from mddb_workflow.tools.multimerism import get_chain_contacts
+from mddb_workflow.tools.get_inchi_keys import generate_inchikeys, generate_inchi_references
+from mddb_workflow.tools.get_lipids import generate_lipid_references
+from mddb_workflow.tools.membrane_mapping import generate_membrane_mapping
+from mddb_workflow.tools.get_ligands import generate_ligand_references
+from mddb_workflow.tools.residue_mapping import generate_residue_mapping
+from mddb_workflow.tools.generate_topology import generate_topology
+from mddb_workflow.tools.get_charges import get_charges
+from mddb_workflow.tools.remove_trash import remove_trash
+from mddb_workflow.tools.get_project_screenshot import get_project_screenshot
+from mddb_workflow.tools.process_input_files import process_input_files
+from mddb_workflow.tools.provenance import produce_provenance
+from mddb_workflow.tools.get_reduced_trajectory import calculate_frame_step
+from mddb_workflow.tools.fix_gromacs_masses import add_fake_gromacs_masses
+from mddb_workflow.tools.structure_corrector import get_excluded_atoms_indices
+from mddb_workflow.tools.get_box_data import mine_simulation_box_data
+
+# Import local analyses
+from mddb_workflow.analyses.rmsds import rmsds
+from mddb_workflow.analyses.tmscores import tmscores
+from mddb_workflow.analyses.rmsf import rmsf
+from mddb_workflow.analyses.rgyr import rgyr
+from mddb_workflow.analyses.pca import pca
+from mddb_workflow.analyses.density import density
+from mddb_workflow.analyses.thickness import thickness
+from mddb_workflow.analyses.area_per_lipid import area_per_lipid
+from mddb_workflow.analyses.lipid_order import lipid_order
+from mddb_workflow.analyses.lipid_interactions import lipid_interactions
+from mddb_workflow.analyses.channels import channels
+# from mddb_workflow.analyses.pca_contacts import pca_contacts
+from mddb_workflow.analyses.rmsd_per_residue import rmsd_per_residue
+from mddb_workflow.analyses.rmsd_pairwise import rmsd_pairwise
+from mddb_workflow.analyses.clusters import clusters_analysis
+from mddb_workflow.analyses.distance_per_residue import distance_per_residue
+from mddb_workflow.analyses.hydrogen_bonds import hydrogen_bonds
+from mddb_workflow.analyses.sasa import sasa
+from mddb_workflow.analyses.energies import energies, DEFAULT_ENERGIES_ENGINE, check_gridfree_requirements
+from mddb_workflow.analyses.dihedral_energies import compute_dihedral_energies
+from mddb_workflow.analyses.pockets import pockets
+from mddb_workflow.analyses.allostery import allostery
+from mddb_workflow.analyses.chemical_shifts import chemical_shifts
+from mddb_workflow.analyses.rmsd_check import check_trajectory_integrity
+from mddb_workflow.analyses.mindist import check_cross_periodic_contacts
+from mddb_workflow.analyses.helical_parameters import helical_parameters
+from mddb_workflow.analyses.markov import markov
+
+# Make the system output stream to not be buffered
+# Only when not in a Jupyter notebook or using pytest
+# Check if we're in an interactive Python shell like Jupyter
+if not hasattr(sys, 'ps1') and 'pytest' not in sys.modules:
+    # This is useful to make prints work on time in Slurm
+    # Otherwise, output logs are written after the script has fully run
+    # Note that this fix affects all modules and built-ins
+    unbuffered = io.TextIOWrapper(open(sys.stdout.fileno(), 'wb', 0), write_through=True)
+    # Keep status lines (e.g. waiting messages) at the bottom so other logs do not mix with them
+    sys.stdout = StatusLineStream(unbuffered)
+
+# Set a special exception for missing inputs
+MISSING_INPUT_EXCEPTION = Exception('Missing input')
+
+
+def parse_input_glob(path: str, output_filenames: set[str]) -> list[str]:
+    """Parse a glob path into one or several results, leaving out the workflow output files.
+    A pattern such as '*xtc' would also catch the output trajectory once the workflow has run once.
+    If output files are the only results then they are kept, since the input file may have the output name.
+    """
+    parsed_paths = parse_glob(path)
+    if not is_glob(path): return parsed_paths
+    input_paths = [ parsed_path for parsed_path in parsed_paths if basename(parsed_path) not in output_filenames ]
+    if len(input_paths) == 0: return parsed_paths
+    return input_paths
+
+
+class MD:
+    """A Molecular Dynamics (MD) is the union of a structure and a trajectory.
+    Having this data several analyses are possible.
+    Note that an MD is always defined inside of a Project and thus it has additional topology and metadata.
+    """
+
+    def __init__(self,
+        project: 'Project',
+        name: str,
+        number: int,
+        directory: str,
+        input_topology_filepath: str,
+        input_structure_filepath: str,
+        input_trajectory_filepaths: list[str],
+    ):
+        """Initialize the MD object.
+
+        Args:
+            project (Project): The parent project this MD belongs to.
+            name (str): The name of the MD.
+            number (int): The number of the MD according to its accession.
+            directory (str): The local directory where the MD takes place.
+            input_topology_filepath (str): The input topology file path.
+            input_structure_filepath (str): The input structure file path.
+            input_trajectory_filepaths (list[str]): The input trajectory file paths.
+
+        """
+        # Save the inputs
+        self.project = project
+        if not project:
+            raise Exception('Project is mandatory to instantiate a new MD')
+        # Save the project directory
+        # This variable has its twin in the project class
+        # This is important to make some functions work in both classes at the same time
+        self.project_directory = self.project.directory
+        # Save the name
+        self.name = name
+        # Save the MD number and index
+        self.number = number
+        self.index = number - 1
+        # Set the remote project handler for this specific MD
+        self.accession = None
+        self.remote = None
+        if self.project.database and self.project.accession:
+            self.accession = f'{self.project.accession}.{self.number}'
+            self.remote = Remote(self.project.database, self.accession)
+        # Save the directory
+        self.directory = normpath(directory)
+        # Now set the director relative to the project
+        self.directory = self.project.pathify(self.directory)
+        if normpath(self.directory) == normpath(self.project_directory):
+            raise InputError(f'MD {self.number} has the same directory as the project: {self.directory}')
+        # Save the directory name alone apart
+        self.directory_location, self.directory_name = split(self.directory)
+        if not exists(self.directory):
+            mkdir(self.directory)
+        elif not isdir(self.directory):
+            raise InputError(f'MD directory {self.directory} already exists and it is not a directory')
+        # Save the input topology filepath and set the input topology file
+        # Note that even if the input topology path is passed we do not check it exists
+        # Never forget we can donwload some input files from the database on the fly
+        self.arg_input_topology_filepath = input_topology_filepath
+        self._input_topology_filepath = MISSING_VALUE
+        self._input_topology_url = None
+        # Set the internal variable for the input topology file, to be assigned later
+        self._input_topology_file = MISSING_VALUE
+        # Store also the output topology filepath
+        self._topology_filepath = MISSING_VALUE
+        # Save the input structure filepath
+        # They may be relative to the project directory (unique) or relative to the MD directory (one per MD)
+        # If the path is absolute then it is considered unique
+        # If the file does not exist and it is to be downloaded then it is downloaded for each MD
+        # Priorize the MD directory over the project directory
+        self.arg_input_structure_filepath = input_structure_filepath
+        self._input_structure_filepath = MISSING_VALUE
+        self._input_structure_url = None
+        # Set the internal variable for the input structure file, to be assigned later
+        self._input_structure_file = MISSING_VALUE
+        # Save the input trajectory filepaths
+        self.arg_input_trajectory_filepaths = input_trajectory_filepaths
+        self._input_trajectory_filepaths = MISSING_VALUE
+        self._input_trajectory_urls = None
+        # Set the internal variable for the input trajectory files, to be assigned later
+        self._input_trajectory_files = MISSING_VALUE
+
+        # Other values which may be found/calculated on demand
+        self.md_inputs = self.project.md_config[self.index]
+        self._structure = MISSING_VALUE
+        self._topology_reader = MISSING_VALUE
+        self._dihedrals = MISSING_VALUE
+        self._pbc_selection = MISSING_VALUE
+        self._pbc_residues = MISSING_VALUE
+        self._cg_selection = MISSING_VALUE
+        self._cg_residues = MISSING_VALUE
+        self._ua_selection = MISSING_VALUE
+        self._ua_residues = MISSING_VALUE
+        self._qm_selection = MISSING_VALUE
+        self._dummy_selection = MISSING_VALUE
+        self._forced_class_selections = MISSING_VALUE
+
+        # Tests
+        self._trajectory_integrity = MISSING_VALUE
+        self._cross_periodic_contacts = MISSING_VALUE
+
+        # The register is set the first time it is used (see get_register)
+        self._register = None
+
+        # Set a new MD specific cache
+        # In case the directory is the project directory itself, use the project cache
+        cache_filepath = self.pathify(CACHE_FILENAME)
+        cache_file = File(cache_filepath)
+        if cache_file.path == self.project.cache.file.path:
+            self.cache = self.project.cache
+        else:
+            self.cache = Cache(cache_file, self.project.cache.retrieve('uuid'))
+
+        # Set tasks whose output is to be overwritten
+        self.overwritables = set()
+
+    def __repr__(self):
+        """Return a string representation of the MD object."""
+        return f'<MD "{self.name}">'
+
+    def __str__(self):
+        """Return a string representation of the MD object."""
+        return f'MD "{self.name}"'
+
+    def pathify(self, filename_or_relative_path: str) -> str:
+        """Given a filename or relative path, add the MD directory path at the beginning."""
+        return normpath(self.directory + '/' + filename_or_relative_path)
+
+    # Input topology file ------------
+
+    def get_input_topology_filepath(self) -> Optional[str]:
+        """Get the input topology filepath from the inputs or try to guess it.
+
+        If the input topology filepath is a 'no' flag then we consider there is no topology at all
+        So far we extract atom charges and atom bonds from the topology file
+        In this scenario we can keep working but there are some consecuences:
+
+            1. Analysis using atom charges such as 'energies' will be skipped
+            2. The standard topology file will not include atom charges
+            3. Bonds will be guessed from atom radii and distance along multiple frames
+        """
+        # If we already have an internal value calculated then return it
+        if self._input_topology_filepath is not MISSING_VALUE:
+            return self._input_topology_filepath
+
+        def relativize_and_parse_path(input_filepath: str) -> str:
+            """Check and fix the input topology filepath.
+            If it is an URL then set the filepath where it is to be downloaded.
+            Find if the path is relative to the workflow caller directory or to the project.
+            If the path exists in both contexts then priorize the project-relative one.
+            Relativize the path to the workflow caller directory.
+            Also parse glob notation.
+            """
+            # If it is a URL then set the paths for the further download
+            if is_url(input_filepath):
+                self._input_topology_url = input_filepath
+                source_filename = url_to_source_filename(input_filepath)
+                source_filepath = self.pathify(source_filename)
+                return source_filepath
+            # Check if it is an absolute path
+            if isabs(input_filepath):
+                abs_glob_parse = parse_glob(input_filepath)
+                # If we had multiple results then we complain
+                if len(abs_glob_parse) > 1:
+                    raise InputError(f'Multiple topologies found with "{input_filepath}": {", ".join(abs_glob_parse)}')
+                # If we had no results then we complain
+                if len(abs_glob_parse) == 0:
+                    if self.remote:
+                        warn('Spread syntax is not supported to download remote files')
+                    raise InputError(f'No topology found with "{input_filepath}"')
+                abs_parsed_filepath = abs_glob_parse[0]
+                return abs_parsed_filepath
+            # Now iterate the different possible contexts in the following order:
+            # 1 - Path is relative to the MD directory
+            # 2 - Path is relative to the project directory
+            # 3 - Path is relative to the workflow caller directory
+            available_contexts = unique([self.directory, self.project_directory, '.'])
+            for available_context in available_contexts:
+                context_filepath = normpath(f'{available_context}/{input_filepath}')
+                if not is_glob(context_filepath):
+                    if not exists(context_filepath): continue
+                    return context_filepath
+                # If there is glob pattern then parse it
+                parsed_filepaths = glob(context_filepath)
+                if len(parsed_filepaths) == 1:
+                    return parsed_filepaths[0]
+                if len(parsed_filepaths) > 1:
+                    raise InputError(f'Multiple topologies found with "{context_filepath}": {", ".join(parsed_filepaths)}')
+            # If we found no topology file in any context then we complain
+            raise InputError(f'Input topology {input_filepath} is nowhere to be found.')
+        # Set the input topology filepath
+        input_topology_filepath = None
+        # If this value was passed through command line then it would be set as the internal value already
+        if self.arg_input_topology_filepath:
+            input_topology_filepath = self.arg_input_topology_filepath
+        # If the inputs file is available and has the value then use it
+        elif self.project.inputs.is_file_available:
+            # Get the input value, whose key must exist
+            input_topology_filepath = self.get_file_input(MD_INPUT_TOPOLOGY_FILEPATH)
+        # If this is the project and all MDs have an input topology then set the project topology as missing
+        # This should give no problems since this topology is not to be used
+        if input_topology_filepath is None and self == self.project and all(md.get_input_topology_filepath() for md in self.mds):
+            input_topology_filepath = 'no'
+        # If we have no input topology at this point then we surrender
+        if input_topology_filepath is None:
+            raise InputError('Missing input topology file path in the project and in at least one MD.\n' +
+                '  Please provide a topology file using the "-top" argument.\n' +
+                '  Note that you may run the workflow without a topology file. To do so, use the "-top no" argument.\n' +
+                '  However this has implications since we usually mine atom charges and bonds from the topology file.\n' +
+                '  Some analyses such us the interaction energies will be skiped.')
+        # If we have an input topology filepath then process it
+        # WARNING: the yaml parser automatically converts 'no' to False
+        if input_topology_filepath is False or input_topology_filepath.lower() in {'no', 'not', 'na'}:
+            self._input_topology_filepath = MISSING_TOPOLOGY
+            return self._input_topology_filepath
+        # Relativize and glob-parse the input filepath
+        self._input_topology_filepath = relativize_and_parse_path(input_topology_filepath)
+        return self._input_topology_filepath
+
+    def check_input_is_not_output(self, input_file: File, output_filepath: str):
+        """Make sure an input file is not where the workflow writes an output file.
+        Otherwise the input file would be deleted or overwritten when running the workflow.
+        """
+        output_file = File(output_filepath)
+        if not input_file.is_deleted_by_removing(output_file): return
+        raise InputError(f'The input file "{input_file.path}" is in the same place where the workflow writes the output file "{output_file.path}".\n'
+            ' The workflow would delete or overwrite it. Please rename or move the input file and update the inputs.')
+
+    def get_input_topology_file(self) -> Optional[File]:
+        """Get the input topology file.
+        If the file is not found try to download it.
+        """
+        # If we already have a value then return it
+        if self._input_topology_file is not MISSING_VALUE:
+            return self._input_topology_file
+        # Set the input topology filepath
+        input_topology_filepath = self.get_input_topology_filepath()
+        # If the input filepath is None then it menas we must proceed without a topology
+        if input_topology_filepath == MISSING_TOPOLOGY:
+            self._input_topology_file = MISSING_TOPOLOGY
+            return self._input_topology_file
+        # If no input is passed then we check the inputs file
+        # Set the file
+        input_topology_file = File(input_topology_filepath)
+        # If there is a topology URL then we may donwload the topology first
+        input_topology_url = self._input_topology_url
+        if input_topology_url and not input_topology_file.exists:
+            original_filename = input_topology_url.split('/')[-1]
+            # If there is a remote then use it
+            if self.remote:
+                # If the topology filename is the standard topology filename then use the topology endpoint instead
+                if original_filename == STANDARD_TOPOLOGY_FILENAME:
+                    self.remote.download_standard_topology(input_topology_file)
+                # Otherwise download the input strucutre file by its filename
+                else:
+                    self.remote.download_file(original_filename, input_topology_file)
+                # In case the topology is a '.top' file we consider it is a Gromacs topology
+                # It may come with additional itp files we must download as well
+                if input_topology_file.format == 'top':
+                    # Find available .itp files and download each of them
+                    itp_filenames = [filename for filename in self.remote.available_files if filename[-4:] == '.itp']
+                    for itp_filename in itp_filenames:
+                        itp_filepath = self.pathify(itp_filename)
+                        itp_file = File(itp_filepath)
+                        self.remote.download_file(itp_file.filename, itp_file)
+            # Otherwise use the URL as is
+            else:
+                if input_topology_file.format == 'top':
+                    warn('Automatic download of itp files is not supported without the "-proj" argument.' +
+                         ' Thus if the topology has associated itp files they will not be downloaded.')
+                download_file(input_topology_url, input_topology_file)
+            # Once the trajectory has been downloaded, change the inputs file to reflect its location
+            if self.project.inputs.is_file_available:
+                # The path must be relative to the project, no matter where the workflow is run
+                project_relative_path = relpath(input_topology_file.path, self.project_directory)
+                # Note that this URL may come either from the MD or from the project
+                # Check if it comes from the project and, if so, update it in the project
+                if self.project.inputs.get('input_topology_filepath') == input_topology_url:
+                    self.project.inputs.update_file_inputs('input_topology_filepath', project_relative_path)
+                # Otherwise it must come from the MD
+                else:
+                    self.update_file_inputs(MD_INPUT_TOPOLOGY_FILEPATH, project_relative_path)
+        # If the file finally exists then we are done
+        if input_topology_file.exists:
+            self._input_topology_file = input_topology_file
+            # Note that this function is also used by the project, which has no output topology of its own
+            if isinstance(self, MD): self.check_input_is_not_output(input_topology_file, self.topology_filepath)
+            return self._input_topology_file
+        raise InputError(f'Missing input topology file "{input_topology_file.path}"')
+    input_topology_file = property(get_input_topology_file, None, None, "Input topology file (read only)")
+
+    # Input structure file ------------
+
+    def get_input_structure_filepath(self) -> str:
+        """Set a function to get input structure file path."""
+        # Return the internal value if it is already assigned
+        if self._input_structure_filepath is not MISSING_VALUE:
+            return self._input_structure_filepath
+
+        def relativize_and_parse_path(input_filepath: str) -> Optional[str]:
+            """Find out if a path is relative to MD directories or to the project directory.
+
+            To do so just check if the file exists in any of those.
+            In case it exists in both or none then assume it is relative to MD directory.
+            Parse glob notation in the process.
+            """
+            # Check if it is a URL
+            if is_url(input_filepath):
+                self._input_structure_url = input_filepath
+                # Set the paths for the further download
+                source_filename = url_to_source_filename(input_filepath)
+                source_filepath = self.pathify(source_filename)
+                return source_filepath
+            # Check if it is an absolute path
+            if isabs(input_filepath):
+                abs_glob_parse = parse_input_glob(input_filepath, {STRUCTURE_FILENAME})
+                # If we had multiple results then we complain
+                if len(abs_glob_parse) > 1:
+                    raise InputError(f'Multiple structures found with "{input_filepath}": {", ".join(abs_glob_parse)}')
+                # If we had no results then we complain
+                if len(abs_glob_parse) == 0:
+                    if self.remote:
+                        warn('Spread syntax is not supported to download remote files')
+                    raise InputError(f'No structure found with "{input_filepath}"')
+                abs_parsed_filepath = abs_glob_parse[0]
+                return abs_parsed_filepath
+            # Now iterate the different possible contexts in the following order:
+            # 1 - Path is relative to the MD directory
+            # 2 - Path is relative to the project directory
+            # 3 - Path is relative to the workflow caller directory
+            available_contexts = unique([self.directory, self.project_directory, '.'])
+            for available_context in available_contexts:
+                context_filepath = normpath(f'{available_context}/{input_filepath}')
+                glob_parse = parse_input_glob(context_filepath, {STRUCTURE_FILENAME})
+                if len(glob_parse) > 1:
+                    raise InputError(f'Multiple structures found with "{context_filepath}": {", ".join(glob_parse)}')
+                parsed_filepath = glob_parse[0] if len(glob_parse) == 1 else None
+                if parsed_filepath and File(parsed_filepath).exists:
+                    return parsed_filepath
+            # If the path does not exist anywhere then we surrender
+            raise InputError(f'Input structure {input_filepath} is nowhere to be found.')
+        # Set the input structure filepath
+        input_structure_filepath = None
+        # If we have a value passed through command line
+        if self.arg_input_structure_filepath:
+            input_structure_filepath = self.arg_input_structure_filepath
+        # If we have a value passed through the inputs file has the value
+        elif self.project.inputs.is_file_available:
+            # Get the input value, whose key must exist
+            input_structure_filepath = self.get_file_input(MD_INPUT_STRUCTURE_FILEPATH)
+        # Find out if it is relative to MD directories or to the project directory
+        if input_structure_filepath:
+            self._input_structure_filepath = relativize_and_parse_path(input_structure_filepath)
+            return self._input_structure_filepath
+        # If there is not input structure anywhere then use the input topology
+        # We will extract the structure from it using a sample frame from the trajectory
+        # Note that topology input filepath must exist and an input error will raise otherwise
+        # However if we are using the standard topology file we can not extract the PDB from it (yet)
+        if self.input_topology_file != MISSING_TOPOLOGY and \
+            not is_standard_topology(self.input_topology_file):
+            return self.input_topology_file.path
+        # If we can not use the topology either then surrender
+        raise InputError('There is not input structure at all')
+
+    def get_input_structure_file(self) -> File:
+        """Get the input pdb filename from the inputs.
+        If the file is not found try to download it.
+        """
+        # If the input structure file is already defined then return it
+        if self._input_structure_file is not MISSING_VALUE:
+            return self._input_structure_file
+        # Otherwise we must set it
+        # First set the input structure filepath
+        input_structure_filepath = self.get_input_structure_filepath()
+        # Now set the input structure file
+        input_structure_file = File(input_structure_filepath)
+        # If there is a structure URL then we must donwload the structure first
+        input_structure_url = self._input_structure_url
+        if input_structure_url and not input_structure_file.exists:
+            original_filename = input_structure_url.split('/')[-1]
+            # If there is a remote then use it
+            if self.remote:
+                # If the structure filename is the standard structure filename then use the structure endpoint instead
+                if original_filename == STRUCTURE_FILENAME:
+                    self.remote.download_standard_structure(input_structure_file)
+                # Otherwise download the input strucutre file by its filename
+                else:
+                    self.remote.download_file(original_filename, input_structure_file)
+            # Otherwise use the URL as is
+            else:
+                download_file(input_structure_url, input_structure_file)
+            # Once the trajectory has been downloaded, change the inputs file to reflect its location
+            if self.project.inputs.is_file_available:
+                # The path must be relative to the project, no matter where the workflow is run
+                project_relative_path = relpath(input_structure_file.path, self.project_directory)
+                # Note that this URL may come either from the MD or from the project
+                # Check if it comes from the project and, if so, update it in the project
+                if self.project.inputs.get('input_structure_filepath') == input_structure_url:
+                    self.project.inputs.update_file_inputs('input_structure_filepath', project_relative_path)
+                # Otherwise it must come from the MD
+                else:
+                    self.update_file_inputs(MD_INPUT_STRUCTURE_FILEPATH, project_relative_path)
+        # If the file already exists then return it
+        if input_structure_file.exists:
+            self.check_input_is_not_output(input_structure_file, self.pathify(STRUCTURE_FILENAME))
+            self._input_structure_file = input_structure_file
+            return self._input_structure_file
+        raise InputError(f'Missing input structure file "{input_structure_file.path}"')
+    input_structure_file = property(get_input_structure_file, None, None, "Input structure filename (read only)")
+
+    # Input trajectory filename ------------
+
+    def get_input_trajectory_filepaths(self) -> list[str]:
+        """Get the input trajectory file paths."""
+        # Return the internal value if it is already assigned
+        if self._input_trajectory_filepaths is not MISSING_VALUE:
+            return self._input_trajectory_filepaths
+
+        def relativize_and_parse_paths(input_filepaths: list[str]) -> list[str]:
+            """Check and fix input trajectory filepaths.
+            Also relativize paths to the workflow caller directory and parse glob notation.
+            """
+            checked_paths = input_filepaths
+            # Input trajectory filepaths may be both a list or a single string
+            # However we must keep a list
+            if type(checked_paths) is list:
+                pass
+            elif type(checked_paths) is str:
+                checked_paths = [checked_paths]
+            else:
+                raise InputError('Input trajectory filepaths must be a list of strings or a string')
+            # Make sure all or none of the trajectory paths are URLs
+            url_count = sum([is_url(path) for path in checked_paths])
+            if not (url_count == 0 or url_count == len(checked_paths)):
+                raise InputError('All trajectory paths must be paths or URLs. Mixing is not supported')
+            # In case trajectory paths are URLs
+            if url_count > 0:
+                self._input_trajectory_urls = checked_paths
+                # Set the paths for the further download
+                parsed_paths = []
+                for path in checked_paths:
+                    source_filename = url_to_source_filename(path, self.project.sample_trajectory)
+                    source_filepath = self.pathify(source_filename)
+                    parsed_paths.append(source_filepath)
+                return parsed_paths
+            # Make sure all or none of the trajectory paths are absolute
+            abs_count = sum([isabs(path) for path in checked_paths])
+            if not (abs_count == 0 or abs_count == len(checked_paths)):
+                raise InputError('All trajectory paths must be relative or absolute. Mixing is not supported')
+
+            def parse_all_glob(paths: list[str]) -> list[str]:
+                """Glob-parse and merge all paths."""
+                parsed_paths = []
+                for path in paths:
+                    parsed_paths += parse_input_glob(path, {TRAJECTORY_FILENAME, TRAJECTORY_SAMPLE_FILENAME})
+                return parsed_paths
+            # In case trajectory paths are absolute
+            if abs_count > 0:
+                absolute_parsed_paths = parse_all_glob(checked_paths)
+                # Check we successfully defined some trajectory file
+                if len(absolute_parsed_paths) == 0:
+                    # Warn the user in case it was trying to use glob syntax to donwload remote files
+                    if self.remote:
+                        warn('Spread syntax is not supported to download remote files')
+                    raise InputError('No trajectory file was reached neither in the project directory or MD directories in path(s) ' + ', '.join(input_filepaths))
+                return absolute_parsed_paths
+            # Now if trajectory paths are not absolute then check if they are relative
+            # Iterate the different possible contexts in the following order:
+            # 1 - Path is relative to the MD directory
+            # 2 - Path is relative to the project directory
+            # 3 - Path is relative to the workflow caller directory
+            available_contexts = unique([self.directory, self.project_directory, '.'])
+            for available_context in available_contexts:
+                # Get paths relative to the current context
+                context_filepaths = [normpath(f'{available_context}/{path}') for path in checked_paths]
+                # In case there are glob characters we must parse the paths
+                parsed_paths = parse_all_glob(context_filepaths)
+                # Check we successfully defined some trajectory file
+                if len(parsed_paths) > 0:
+                    # If so, check at least one of the files do actually exist
+                    if any([exists(path) for path in parsed_paths]):
+                        return parsed_paths
+            # At this point we can conclude the input trajectory file does not exist
+            raise InputError(f'Input trajectories "{", ".join(input_filepaths)}" are nowhere to be found.')
+        # Set the input trajectory filepaths
+        input_trajectory_filepaths = None
+        # If we have a value passed through command line
+        if self.arg_input_trajectory_filepaths:
+            input_trajectory_filepaths = self.arg_input_trajectory_filepaths
+        # Check if the inputs file has the value
+        elif self.project.inputs.is_file_available:
+            # Get the input value
+            input_trajectory_filepaths = self.get_file_input(MD_INPUT_TRAJECTORY_FILEPATHS)
+        # If there is no trajectory available then we surrender
+        if input_trajectory_filepaths is None:
+            raise InputError('There is not input trajectory at all')
+        # Parse input paths by processing globs and making every path relative to the workflow caller
+        self._input_trajectory_filepaths = relativize_and_parse_paths(input_trajectory_filepaths)
+        return self._input_trajectory_filepaths
+
+    def get_input_trajectory_files(self) -> list[File]:
+        """Get the input trajectory filename(s) from the inputs.
+        If file(s) are not found try to download it.
+        """
+        # If we already defined input trajectory files then return them
+        if self._input_trajectory_files is not MISSING_VALUE:
+            return self._input_trajectory_files
+        # Otherwise we must set the input trajectory files
+        input_trajectory_filepaths = self.get_input_trajectory_filepaths()
+        input_trajectory_files = [File(path) for path in input_trajectory_filepaths]
+        # If there are input trajectory URLs then download the trajectories first
+        input_trajectory_urls = self._input_trajectory_urls
+        if input_trajectory_urls:
+            for trajectory_url, trajectory_file in zip(input_trajectory_urls, input_trajectory_files):
+                # If the trajectory file already exists then skip it
+                if trajectory_file.exists: continue
+                original_filename = trajectory_url.split('/')[-1]
+                # If there is a remote then use it
+                if self.remote:
+                    # If the trajectory filename is the standard trajectory filename then use the trajectory endpoint instead
+                    if original_filename == TRAJECTORY_FILENAME:
+                        frame_selection = None
+                        if self.project.sample_trajectory:
+                            remote_frames = self.remote.snapshots
+                            maximum_desired_frames = self.project.sample_trajectory
+                            step, final_frames = calculate_frame_step(remote_frames, maximum_desired_frames)
+                            frame_selection = f'1:{remote_frames}:{step}'
+                        self.remote.download_trajectory(trajectory_file, frame_selection=frame_selection, format='xtc')
+                    # Otherwise download the input trajectory file by its filename
+                    else:
+                        if self.project.sample_trajectory:
+                            raise InputError('The "-smp" argument is supported only when asking for the standard trajectory')
+                        self.remote.download_file(original_filename, trajectory_file)
+                # Otherwise use the URL as is
+                else:
+                    if self.project.sample_trajectory:
+                        raise InputError('The "-smp" argument is supported only when using the "-proj" argument')
+                    download_file(trajectory_url, trajectory_file)
+                # Once the trajectory has been downloaded, change the inputs file to reflect its location
+                if self.project.inputs.is_file_available:
+                    # Get the current file input value
+                    file_input_trajectory_filepaths = self.get_file_input(MD_INPUT_TRAJECTORY_FILEPATHS)
+                    if type(file_input_trajectory_filepaths) == str:
+                        file_input_trajectory_filepaths = [file_input_trajectory_filepaths]
+                    # Find the URL we just downloaded
+                    index = file_input_trajectory_filepaths.index(trajectory_url)
+                    if index == -1: raise ValueError('Missing trajectory URL we just downloaded')
+                    # The path must be relative to the project, no matter where the workflow is run
+                    project_relative_path = relpath(trajectory_file.path, self.project_directory)
+                    file_input_trajectory_filepaths[index] = project_relative_path
+                    self.update_file_inputs(MD_INPUT_TRAJECTORY_FILEPATHS, file_input_trajectory_filepaths)
+        # Find missing trajectory files
+        missing_input_trajectory_files = []
+        for trajectory_file in input_trajectory_files:
+            if not trajectory_file.exists:
+                missing_input_trajectory_files.append(trajectory_file)
+        # If all files already exists then we are done
+        if len(missing_input_trajectory_files) == 0:
+            for trajectory_file in input_trajectory_files:
+                self.check_input_is_not_output(trajectory_file, self.get_trajectory_filepath())
+            self._input_trajectory_files = input_trajectory_files
+            return self._input_trajectory_files
+        missing_filepaths = [trajectory_file.path for trajectory_file in missing_input_trajectory_files]
+        raise InputError('Missing input trajectory files: ' + ', '.join(missing_filepaths))
+    input_trajectory_files = property(get_input_trajectory_files, None, None, "Input trajectory filenames (read only)")
+
+    def get_file_input(self, name: str):
+        """Get a specific 'input' value from MD inputs."""
+        value = self.md_inputs.get(name, MISSING_INPUT_EXCEPTION)
+        # If we had a value then return it, unless it is replaced by a command line value
+        if value != MISSING_INPUT_EXCEPTION and not self.is_forced_input(name, value):
+            return value
+        return self.project.inputs.get(name)
+
+    def is_forced_input(self, name: str, md_value) -> bool:
+        """Check if an MD input value is replaced by a value forced from the command line."""
+        forced_inputs = self.project.inputs.forced_inputs
+        return name in forced_inputs and forced_value_wins(forced_inputs[name], md_value)
+
+    def update_file_inputs(self, key: str, new_value) -> bool:
+        """Permanently update current MD inputs in the inputs file.
+        Do it only if the project value is not already the same.
+        Return True if the inputs is updated correctly. Return False if there is no update.
+        """
+        # Check if the project value is already this value
+        # If so then there is no need to update this value specifically for the MD
+        project_value = self.project.inputs.get(key)
+        if project_value == new_value: return False
+        nested_key = f'mds.{self.index}.{key}'
+        return self.project.inputs.update_file_inputs(nested_key, new_value)
+
+    def update_pbc_selection_input(self, new_value: str) -> bool:
+        """Permanently update the PBC selection of this MD in the inputs file.
+        Return False if there is no update or if the new value would be replaced by a command line value.
+        """
+        if self.is_forced_input('pbc_selection', new_value): return False
+        return self.update_file_inputs('pbc_selection', new_value)
+
+    def update_image_input(self) -> bool:
+        """Permanently set the image of this MD as true in the inputs file, if it was automatic and the trajectory was not imaged.
+        Return False if there is no update or if the image is set from the command line.
+        """
+        if self.image != AUTOMATIC_FLAG: return False
+        if self.project.console_processing_inputs['image'] or 'image' in self.project.inputs.forced_inputs: return False
+        if self.cache.retrieve(AUTO_IMAGE_FLAG) is not False: return False
+        return self.project.inputs.update_file_inputs(f'mds.{self.index}.image', True)
+
+    # ---------------------------------
+
+    def get_file(self, target_file: File) -> bool:
+        """Check if a file exists. If not, try to download it from the database.
+        If the file is not found in the database it is fine, we do not even warn the user.
+        Note that this function is used to get populations and transitions files, which are not common.
+        """
+        # If it exists we are done
+        if target_file.exists:
+            return True
+        # Try to download the missing file
+        # If we do not have the required parameters to download it then we surrender here
+        if not self.remote:
+            return False
+        # Check if the file is among the available remote files
+        # If it is no then stop here
+        if target_file.filename not in self.remote.available_files:
+            return False
+        # Download the file
+        self.remote.download_file(target_file.filename, target_file)
+        return True
+
+    def print_tests_summary(self):
+        """Make a summary of tests and their status."""
+        print('Tests summary:')
+        for test_name in AVAILABLE_CHECKINGS:
+            test_result = self.register.tests.get(test_name, None)
+            # Print things pretty
+            test_nice_name = NICE_NAMES[test_name]
+            test_nice_result = None
+            if test_result is None:
+                test_nice_result = YELLOW_HEADER + 'Not run' + COLOR_END
+            elif test_result is False:
+                test_nice_result = RED_HEADER + 'Failed' + COLOR_END
+            elif test_result is True:
+                test_nice_result = GREEN_HEADER + 'Passed' + COLOR_END
+            elif test_result == 'na':
+                test_nice_result = BLUE_HEADER + 'Not applicable' + COLOR_END
+            else:
+                raise ValueError()
+
+            print(f' - {test_nice_name} -> {test_nice_result}')
+
+    # Issue some warnings if failed or never run tests are skipped
+    # This is run after processing input files
+    # RUBEN: mover a inpro?
+    def _issue_required_test_warnings(self):
+        for test_name in AVAILABLE_CHECKINGS:
+            # If test was not skipped then proceed
+            if test_name not in self.project.trust: continue
+            # If test passed in a previous run the proceed
+            test_result = self.register.tests.get(test_name)
+            if test_result is True: continue
+            # If test failed in a previous run we can also proceed
+            # The failing warning must be among the inherited warnings, so there is no need to add more warnings here
+            if test_result is False: continue
+            # If the test has been always skipped then issue a warning
+            if test_result is None:
+                # Remove previous warnings
+                self.register.remove_warnings(test_name)
+                # Get test pretty name
+                test_nice_name = NICE_NAMES[test_name]
+                # Issue the corresponding warning
+                self.register.add_warning(test_name, test_nice_name + ' was skipped and never run before')
+                continue
+            raise ValueError('Test value is not supported')
+
+    # Processed files ----------------------------------------------------
+
+    def inherit_topology_filename(self) -> Optional[str]:
+        """Set the expected output topology filename given the input topology filename.
+        Note that topology formats are conserved.
+        """
+        # If there is no topology at all
+        if self.input_topology_file == MISSING_TOPOLOGY:
+            return MISSING_TOPOLOGY
+        # Get the filename
+        filename = self.input_topology_file.filename
+        if not filename: raise RuntimeError('Unnamed file?')
+        # If it is the raw charges file then return it as is
+        if filename == RAW_CHARGES_FILENAME:
+            return filename
+        # If it is a standard topology then do not name it as the standard topology which is loaded in the database
+        # Otherwise the database document size check and the loader would take this one (e.g. a remote topology,
+        # with expanded atom names and elements) for the output standard topology
+        if is_standard_topology(self.input_topology_file):
+            return PROCESSED_STANDARD_TOPOLOGY_FILENAME
+        # Get the format
+        standard_format = self.input_topology_file.format
+        # If it is a .top topology then we have to check if it is a gromacs or an amber topology
+        if self.input_topology_file.extension == 'top' and is_amber_topology(self.input_topology_file):
+            standard_format = 'prmtop'
+        return 'topology.' + standard_format
+
+    def get_topology_filepath(self) -> str:
+        """Get the processed topology file path."""
+        # If we have a stored value then return it
+        if self._topology_filepath is not MISSING_VALUE:
+            return self._topology_filepath
+        # Otherwise we must find it
+        inherited_filename = self.inherit_topology_filename()
+        if inherited_filename == MISSING_TOPOLOGY:
+            self._topology_filepath = MISSING_TOPOLOGY
+        else:
+            # If the input topology is also the project input topology then keep the output in the project directory
+            # Otherwise keep the output in the MD directory
+            if self.input_topology_file == self.project.input_topology_file:
+                self._topology_filepath = self.project.pathify(inherited_filename)
+            else:
+                self._topology_filepath = self.pathify(inherited_filename)
+        return self._topology_filepath
+    topology_filepath = property(get_topology_filepath, None, None, "Topology file path (read only)")
+
+    # The trajectory output may also change depending on if we are using a sample of a remote trajectory
+    def get_trajectory_filepath(self) -> str:
+        if self.project.sample_trajectory: return self.pathify(TRAJECTORY_SAMPLE_FILENAME)
+        return self.pathify(TRAJECTORY_FILENAME)
+
+    def processing_input_getter(name: str):
+        """Get processing inputs (filter_selection, image, fit, translation) which may be set per MD.
+        Values passed through the command line apply to all MDs.
+        Otherwise the MD input is used and, if missing, the project value.
+        """
+        def getter(self):
+            if self.project.console_processing_inputs[name] or name in self.project.inputs.forced_inputs:
+                return getattr(self.project, name)
+            value = self.md_inputs.get(name, None)
+            if value is not None: return value
+            return getattr(self.project, name)
+        return getter
+
+    filter_selection = property(processing_input_getter('filter_selection'), None, None, "Atoms to be filtered (read only)")
+    image = property(processing_input_getter('image'), None, None, "Set if the trajectory is to be imaged (read only)")
+    fit = property(processing_input_getter('fit'), None, None, "Set if the trajectory is to be fitted (read only)")
+    translation = property(processing_input_getter('translation'), None, None, "Translation for the imaging process (read only)")
+
+    # Numbers of frames to be excluded from the beginning and from the end of the trajectory
+    # Note that it is None when there is nothing to skip so the processing is not run again in old projects
+    def get_input_skip_frames(self) -> Optional[tuple[int, int]]:
+        return self.project.skip_frames.get(self.index)
+    input_skip_frames = property(get_input_skip_frames, None, None, "Numbers of initial and final frames to be excluded from the processed trajectory (read only)")
+
+    # Run the actual processing to generate output processed files out of input raw files
+    # And by "files" I mean structure, trajectory and topology
+    input_files_processing = Task('inpro', 'Input files processing', process_input_files,
+        output_filenames={
+            'output_topology_file': get_topology_filepath,
+            'output_structure_file': STRUCTURE_FILENAME,
+            'output_trajectory_file': get_trajectory_filepath,
+        })
+
+    # Output main files
+    get_topology_file = input_files_processing.get_output_file_getter('output_topology_file')
+    topology_file = property(get_topology_file, None, None, "Topology file (read only)")
+    get_structure_file = input_files_processing.get_output_file_getter('output_structure_file')
+    structure_file = property(get_structure_file, None, None, "Structure file (read only)")
+    get_trajectory_file = input_files_processing.get_output_file_getter('output_trajectory_file')
+    trajectory_file = property(get_trajectory_file, None, None, "Trajectory file (read only)")
+
+    # ---------------------------------------------------------------------------------
+    # Others values which may be found/calculated and files to be generated on demand
+    # ---------------------------------------------------------------------------------
+
+    # Trajectory snapshots
+    get_snapshots = Task('frames', 'Count trajectory frames', count_xtc_frames)
+    snapshots = property(get_snapshots, None, None, "Trajectory snapshots (read only)")
+
+    def get_check_stable_bonds(self) -> bool:
+        """Check if we must check stable bonds."""
+        # WARNING: Do not return False if the test is already passed in the register
+        # WARNING: This value is an argument to the bonds task
+        # WARNING: Thus if its value changes then bonds will be mined again for no reason
+        return STABLE_BONDS_FLAG not in self.project.trust
+    must_check_stable_bonds = property(get_check_stable_bonds, None, None, "Check if we must check stable bonds (read only)")
+
+    # Reference bonds
+    get_reference_bonds = Task('refbonds', 'Reference bonds', find_safe_bonds)
+    reference_bonds = property(get_reference_bonds, None, None, "Atom bonds to be trusted (read only)")
+
+    # Atom charges
+    get_charges = Task('charges', 'Getting atom charges', get_charges)
+    charges = property(get_charges, None, None, "Atom charges (read only)")
+
+    def get_structure(self) -> 'Structure':
+        """Get the parsed structure."""
+        # If we already have a stored value then return it
+        if self._structure is not MISSING_VALUE:
+            return self._structure
+        # Otherwise we must set the structure
+        # Make sure the structure file exists at this point
+        if not self.structure_file.exists:
+            raise ValueError('Trying to set standard structure but file '
+                f'{self.structure_file.path} does not exist yet. Are you trying '
+                'to access the standard structure before processing input files?')
+        # Note that this is not only the structure class, but it also contains additional logic
+        self._structure = Structure.from_file(self.structure_file.path)
+        # Always force reference bonds in the structure
+        # Do not trust in the structure bonds even if they should belong to the reference structure
+        # There are several scenarios where they may be wrong:
+        # 1. Coarse grain
+        # 2. Stable bonds test failed and we had mercy
+        # 3. Ignored ions which may cause clashes
+        self._structure.bonds = self.reference_bonds
+        # Apply forced class selections, if any
+        if self.forced_class_selections:
+            self._structure.force_classifications(self.forced_class_selections)
+        return self._structure
+    structure: Structure = property(get_structure, None, None, "Parsed structure (read only)")
+
+    # First frame PDB file
+    get_first_frame = Task('firstframe', 'Get first frame structure',
+        get_first_frame, output_filenames={'output_file': FIRST_FRAME_FILENAME})
+    get_first_frame_file = get_first_frame.get_output_file_getter('output_file')
+    first_frame_file = property(get_first_frame_file, None, None, "First frame (read only)")
+
+    # Average structure filename
+    get_average_structure = Task('average', 'Get average structure',
+        get_average_structure, output_filenames={'output_file': AVERAGE_STRUCTURE_FILENAME})
+    get_average_structure_file = get_average_structure.get_output_file_getter('output_file')
+    average_structure_file = property(get_average_structure_file, None, None, "Average structure filename (read only)")
+
+    # Produce the MD metadata file to be uploaded to the database
+    prepare_metadata = Task('mdmeta', 'Prepare MD metadata',
+        generate_md_metadata, output_filenames={'output_file': OUTPUT_METADATA_FILENAME})
+
+    # The processed interactions
+    get_processed_interactions = Task('inter', 'Interactions processing',
+        process_interactions, {'frames_limit': 1000})
+    interactions = property(get_processed_interactions, None, None, "Processed interactions (read only)")
+
+    # MDAnalysis Universe object
+    get_MDAnalysis_Universe = Task('mda_univ', 'MDAnalysis Universe object',
+        get_mda_universe, use_cache=False)
+    universe = property(get_MDAnalysis_Universe, None, None, "MDAnalysis Universe object (read only)")
+
+    def input_getter(name: str):
+        """Get input values which may be MD specific.
+        If the MD input is missing then we use the project input value.
+        """
+        # Set the getter
+        def getter(self):
+            # Get the MD input, unless it is replaced by a command line value
+            value = self.md_inputs.get(name, None)
+            if value is not None and not self.is_forced_input(name, value):
+                return value
+            # If there is no MD input then return the project value
+            return safe_getattr(self.project, f'input_{name}')
+        return getter
+
+    # Assign the MD input getters
+    input_interactions = property(input_getter('interactions'), None, None, "Interactions to be analyzed (read only)")
+    # The following selection values should be system-specific, so they should be unique in the project
+    # However there would be no technical problem if they were different between MDs
+    input_pbc_selection = property(input_getter('pbc_selection'), None, None, "Selection of atoms which are still in periodic boundary conditions (read only)")
+    input_cg_selection = property(input_getter('cg_selection'), None, None, "Selection of atoms which are not actual atoms but coarse grain beads (read only)")
+    input_ua_selection = property(input_getter('ua_selection'), None, None, "Selection of atoms in united atom residues, whose carbons have their hydrogens absorbed (read only)")
+    input_qm_selection = property(input_getter('qm_selection'), None, None, "Selection of atoms which are treated with quantum mechanics (read only)")
+    input_dummy_selection = property(input_getter('dummy_selection'), None, None, "Selection of atoms which are not real atoms but dummy atoms (read only)")
+    input_forced_class_selections = property(input_getter('forced_class_selections'), None, None, "Custom forced selections for molecular classification (read only)")
+
+    # IMPORTANT: Note than input selections (periodic boundary conditions, coarse grain, dummy, forced class, etc.) are handled per MD
+    # This may seem wrong since system-specific selections should be handled per project, and not per MD
+    # However they all require a structure to be set and using the "project structure" implies getting the structure of every MD
+    # To make things faster and more efficient, every MD process these selections using its own structure
+    # Note that the project selections then are checked to be coherent among all MDs
+
+    def selection_getter(name: str, parse: Callable[['MD', 'Structure'], 'Selection']):
+        """Get the getter of an input selection, which is parsed with the processed structure the first time."""
+        attribute = f'_{name}_selection'
+        def getter(self: 'MD') -> 'Selection':
+            # If we already have a stored value then return it
+            if getattr(self, attribute) is not MISSING_VALUE:
+                return getattr(self, attribute)
+            # Get the structure first, since it may run the input files processing, which may set the definitive selection
+            structure = self.structure
+            if getattr(self, attribute) is MISSING_VALUE:
+                setattr(self, attribute, parse(self, structure))
+            return getattr(self, attribute)
+        return getter
+
+    # WARNING: Do not inherit project residues
+    # WARNING: It may trigger all the processing logic of the reference MD when there is no need
+    def residues_getter(name: str, label: str):
+        """Get the getter of the indices of residues with atoms in an input selection."""
+        attribute = f'_{name}_residues'
+        def getter(self: 'MD') -> list[int]:
+            # If we already have a stored value then return it
+            if getattr(self, attribute) is not MISSING_VALUE:
+                return getattr(self, attribute)
+            selection = getattr(self, f'{name}_selection')
+            # If there are no selected atoms then there are no residues
+            residues = self.structure.get_selection_residue_indices(selection) if selection else []
+            if selection: print(f'{label} residues "{getattr(self, f"input_{name}_selection")}" -> {len(residues)} residues')
+            setattr(self, attribute, residues)
+            return residues
+        return getter
+
+    def _parse_input_selection(
+        self,
+        name: str,
+        label: str,
+        selection_string: Optional[str],
+        reference_structure: 'Structure',
+        guess: Optional[Callable[[], 'Selection']],
+        must_select: bool = False,
+        fake_mass: Optional[int] = None,
+        verbose: bool = False,
+    ) -> 'Selection':
+        """Parse an input atom selection using the reference structure.
+        The input may be empty (no atoms), a VMD selection, or the automatic flag to guess atoms with the guess function.
+        The automatic flag may be followed by an additional VMD selection (e.g. auto + resname LIG).
+        If must select is set then a VMD selection which selects no atoms is an error.
+        If a fake mass is passed then selected atoms get it in the gromacs masses file, since they are not real atoms.
+        """
+        if verbose: print(f'Setting {name} atoms selection in {self}')
+        is_automatic, additional_selection_string = parse_automatic_selection(selection_string)
+        if is_automatic:
+            if not guess:
+                raise InputError(f'{label} atoms can not be guessed. Please provide an atom selection instead of "{AUTOMATIC_FLAG}"')
+            if verbose: print(f' Guessing {label} atoms')
+            parsed_selection = guess()
+            # Add the additional user selection, if any
+            if additional_selection_string:
+                if verbose: print(f' Adding {label} atoms "{additional_selection_string}"')
+                additional_selection = reference_structure.select(additional_selection_string)
+                if not additional_selection:
+                    raise InputError(f'{label} selection "{additional_selection_string}" selected no atoms')
+                parsed_selection += additional_selection
+        elif selection_string:
+            if verbose: print(f' Selecting {label} atoms "{selection_string}"')
+            parsed_selection = reference_structure.select(selection_string)
+            if must_select and not parsed_selection:
+                raise InputError(f'{label} selection "{selection_string}" selected no atoms')
+        else:
+            if verbose: print(f' Empty selection -> There are no {label} atoms')
+            parsed_selection = Selection()
+        # Log the selection size and a few of the selected residue names
+        if verbose:
+            print(f' {label} selection has {len(parsed_selection)} atoms')
+        if verbose and parsed_selection:
+            selected_residues = reference_structure.get_selection_residues(parsed_selection)
+            selected_residue_names = list(set([residue.name for residue in selected_residues]))
+            limit = 3  # Show a maximum of 3 residue names
+            example_residue_names = ', '.join(selected_residue_names[0:limit])
+            if len(selected_residue_names) > limit: example_residue_names += ', etc.'
+            print('  e.g. ' + example_residue_names)
+        if fake_mass is not None: add_fake_gromacs_masses(reference_structure, parsed_selection, fake_mass)
+        return parsed_selection
+
+    def _parse_pbc_selection(self, reference_structure: 'Structure', verbose: bool = False) -> 'Selection':
+        """Parse the periodic boundary conditions selection input.
+        Solvent, counter ions and lipids are guessed as PBC atoms.
+        """
+        def guess() -> 'Selection':
+            # To guess PBC atoms (with the current implementation) we must make sure there is no CG
+            if reference_structure.has_cg():
+                raise InputError('We can not guess which atoms are under Periodic Boundary Conditions (PBC) in Coarse Grained (CG) systems. Please set PBC atoms manually.\n'
+                    ' Please provide an atom selection (VMD syntax) aiming for all atoms under PBC.\n'
+                    ' Use the "-pbc" argument or set the "pbc_selection" field in the inputs file.\n'
+                    ' e.g. -pbc "resname DPPC"')
+            return reference_structure.select_pbc_guess()
+        return self._parse_input_selection('Periodic Boundary Conditions (PBC)', 'PBC', self.input_pbc_selection,
+            reference_structure, guess, must_select=True, verbose=verbose)
+
+    get_pbc_selection = selection_getter('pbc', lambda self, structure: self._parse_pbc_selection(structure))
+    pbc_selection = property(get_pbc_selection, None, None, "Periodic boundary conditions atom selection (read only)")
+    get_pbc_residues = residues_getter('pbc', 'PBC')
+    pbc_residues = property(get_pbc_residues, None, None, "Indices of residues in periodic boundary conditions (read only)")
+
+    def _parse_cg_selection(self, reference_structure: 'Structure', trajectory_file: 'File', topology_file: Union['File', Exception],
+        snapshots: Optional[int] = None, verbose: bool = False) -> 'Selection':
+        """Parse the coarse grain selection input.
+        Trajectory and topology files must match the reference structure, since they may be used to guess CG atoms.
+        Pass the number of trajectory frames, if known, so they are not counted again.
+        """
+        def guess() -> 'Selection':
+            # Say what is being guessed, since it reads the topology and the trajectory and it is not a task with its own header
+            if not verbose: print(f'Guessing coarse grain (CG) atoms in {self}')
+            return guess_cg_selection(reference_structure, trajectory_file, topology_file,
+                self.project.input_force_fields, snapshots=snapshots, verbose=verbose)
+        return self._parse_input_selection('Coarse Grained (CG)', 'CG', self.input_cg_selection,
+            reference_structure, guess, fake_mass=1, verbose=verbose)
+
+    get_cg_selection = selection_getter('cg', lambda self, structure: self._parse_cg_selection(structure, self.trajectory_file, self.topology_file, self.snapshots))
+    cg_selection = property(get_cg_selection, None, None, "Coarse grain atom selection (read only)")
+    get_cg_residues = residues_getter('cg', 'CG')
+    cg_residues = property(get_cg_residues, None, None, "Indices of residues in coarse grain (read only)")
+
+    def _parse_ua_selection(self, reference_structure: 'Structure', trajectory_file: 'File', cg_selection: 'Selection',
+        snapshots: Optional[int] = None, verbose: bool = True) -> 'Selection':
+        """Parse the united atom selection input.
+        The trajectory file must match the reference structure, since it may be used to guess UA atoms.
+        Pass the number of trajectory frames, if known, so they are not counted again.
+        """
+        def guess() -> 'Selection':
+            # Say what is being guessed, since it reads the trajectory and it is not a task with its own header
+            if not verbose: print(f'Guessing united atom (UA) atoms in {self}')
+            return guess_ua_selection(reference_structure, trajectory_file, cg_selection, snapshots=snapshots, verbose=verbose)
+        return self._parse_input_selection('United Atom (UA)', 'UA', self.input_ua_selection,
+            reference_structure, guess, verbose=verbose)
+
+    get_ua_selection = selection_getter('ua', lambda self, structure: self._parse_ua_selection(structure, self.trajectory_file, self.cg_selection, self.snapshots))
+    ua_selection = property(get_ua_selection, None, None, "United atom selection (read only)")
+    get_ua_residues = residues_getter('ua', 'UA')
+    ua_residues = property(get_ua_residues, None, None, "Indices of residues in united atom (read only)")
+
+    def _parse_qm_selection(self, reference_structure: 'Structure', verbose: bool = True) -> 'Selection':
+        """Parse the quantum mechanics selection input. QM atoms can not be guessed."""
+        return self._parse_input_selection('Quantum Mechanics (QM)', 'QM', self.input_qm_selection,
+            reference_structure, None, verbose=verbose)
+
+    get_qm_selection = selection_getter('qm', lambda self, structure: self._parse_qm_selection(structure))
+    qm_selection = property(get_qm_selection, None, None, "Quantum mechanics atom selection (read only)")
+
+    # NEVER FORGET: We use an input reference structure instead of self.structure for a reason
+    # This function may be called for the first time while in the 'inpro' task
+    # Thus this function is called when we still have no structure, but we us a provisional structure
+    def _parse_dummy_selection(self, reference_structure: 'Structure', verbose: bool = False) -> 'Selection':
+        """Parse the dummy atoms selection input.
+        Dummy atoms are guessed by their atom names.
+        """
+        def guess() -> 'Selection':
+            # Get atom indices of all atoms with names matching a dummy atom name patter
+            atom_indices = []
+            for dummy_name in STANDARD_DUMMY_ATOM_NAMES:
+                for atom_index, atom in enumerate(reference_structure.atoms):
+                    if re.fullmatch(dummy_name, atom.name):
+                        atom_indices.append(atom_index)
+            return Selection(atom_indices)
+        return self._parse_input_selection('dummy', 'dummy', self.input_dummy_selection,
+            reference_structure, guess, fake_mass=0, verbose=verbose)
+
+    get_dummy_selection = selection_getter('dummy', lambda self, structure: self._parse_dummy_selection(structure))
+    dummy_selection = property(get_dummy_selection, None, None, "Dummy atoms selection (read only)")
+
+    def _set_forced_class_selections(self, reference_structure: 'Structure', verbose: bool = True):
+        """Parse forced class selections."""
+        if self.input_forced_class_selections is None: return
+        # Make sure the input forced class is an object and not a list
+        # This may happen easily while editting the inputs yaml file
+        # Try to fix it automatically if possible
+        if type(self.input_forced_class_selections) is list:
+            if all(type(value) == dict for value in self.input_forced_class_selections):
+                print(' Forced class selections were not correctly formatted in the YAML inputs file. This is about to be fixed.')
+                fixed_forced_class_selections = {}
+                for dict_value in self.input_forced_class_selections:
+                    for key, value in dict_value.items():
+                        fixed_forced_class_selections[key] = value
+                # Update the inputs file with the correct format
+                self.project.inputs.update_file_inputs('forced_class_selections', fixed_forced_class_selections)
+            else: raise InputError('Forced class selections must be a dict, not a list.')
+        if verbose: print('Processing input forced class selections')
+        parsed_class_selections = {}
+        # Iterate input forced class selections
+        for classification, selection_string in self.input_forced_class_selections.items():
+            parsed_selection = reference_structure.select(selection_string)
+            if verbose: print(f' "{classification}" selection has {len(parsed_selection)} atoms.')
+            if not parsed_selection:
+                raise InputError(f'Empty forced class selection "{classification}": {selection_string}')
+            parsed_class_selections[classification] = parsed_selection
+        # Make sure there are no overlaps
+        for (class_a, selection_a), (class_b, selection_b) in pairwise(list(parsed_class_selections.items())):
+            selection_a_residues_indices = set(reference_structure.get_selection_residue_indices(selection_a))
+            selection_b_residues_indices = set(reference_structure.get_selection_residue_indices(selection_b))
+            intersection = selection_a_residues_indices.intersection(selection_b_residues_indices)
+            if intersection:
+                raise InputError('There is an overlap in the forced class selections:\n' +
+                    f' "{class_a}" selection ({self.input_forced_class_selections[class_a]})' +
+                    f' and "{class_b}" selection ({self.input_forced_class_selections[class_b]})' +
+                    f' have {len(intersection)} residues in common. There must be no overlaps.')
+        # Set the final value
+        self._forced_class_selections = parsed_class_selections
+
+    def get_forced_class_selections(self) -> dict[str, 'Selection'] | None:
+        """Get the forced class atoms selection."""
+        # If we already have a stored value then return it
+        if self._forced_class_selections is not MISSING_VALUE:
+            return self._forced_class_selections
+        # If there is no input forced class selections then skip this process already
+        if self.input_forced_class_selections is None:
+            return None
+        # Otherwise we must set the forced class selection
+        self._set_forced_class_selections(self.structure)
+        # Finally return the selection
+        return self._forced_class_selections
+    forced_class_selections = property(get_forced_class_selections, None, None, "Custom forced selections for molecular classification (read only)")
+
+    def get_excluded_atom_indices(self):
+        """Get the atom indices which are excluded from the analysis.
+        This includes coarse grain beads and dummy atoms.
+        """
+        return get_excluded_atoms_indices(self.structure, self.pbc_selection, self.cg_selection)
+    excluded_atom_indices = property(get_excluded_atom_indices, None, None, "Excluded atom indices (read only)")
+    
+    # Other input files
+
+    def get_populations(self) -> list[float]:
+        """Get equilibrium populations from a MSM from the project."""
+        return self.project.populations
+    populations = property(get_populations, None, None, "Equilibrium populations from a MSM (read only)")
+
+    def get_transitions(self) -> list[list[float]]:
+        """Get transition probabilities from a MSM from the project."""
+        return self.project.transitions
+    transitions = property(get_transitions, None, None, "Transition probabilities from a MSM (read only)")
+
+    def get_protein_map(self) -> dict:
+        """Get the residues mapping from the project."""
+        return self.project.protein_map
+    protein_map = property(get_protein_map, None, None, "Residues mapping (read only)")
+
+    # Reference frame
+    get_reference_frame = Task('reframe', 'Reference frame', get_bonds_reference_frame)
+    def get_reference_frame_number(self) -> int:
+        """Get the reference frame number, without the bonds check result."""
+        reference_frame, _ = self.get_reference_frame(self)
+        return reference_frame
+    reference_frame = property(get_reference_frame_number, None, None, "Reference frame to be used to represent the MD (read only)")
+
+    def get_topology_reader(self) -> 'Topology':
+        """Get the topology data reader."""
+        # If we already have a stored value then return it
+        if self._topology_reader is not MISSING_VALUE:
+            return self._topology_reader
+        # Instantiate the topology reader
+        self._topology_reader = Topology(self.topology_file)
+        return self._topology_reader
+    topology_reader = property(get_topology_reader, None, None, "Topology reader (read only)")
+
+    def get_dihedrals(self) -> list[dict]:
+        """Get the topology dihedrals."""
+        # If we already have a stored value then return it
+        if self._dihedrals is not MISSING_VALUE:
+            return self._dihedrals
+        # Calculate the dihedrals otherwise
+        self._dihedrals = self.topology_reader.get_dihedrals_data()
+        return self._dihedrals
+    dihedrals = property(get_dihedrals, None, None, "Topology dihedrals (read only)")
+
+    def is_box_ignored(self) -> bool:
+        """Check if the simulation box is to be ignored.
+        This happens when the user asks for it or when the processing finds the trajectory was fitted without rotating the box.
+        Note that this value is only right once the input files have been processed.
+        """
+        return self.project.ignore_box or self.cache.retrieve(BROKEN_PBC_FLAG, False)
+    box_ignored = property(is_box_ignored, None, None, "Set if the simulation box is to be ignored (read only)")
+
+    # Simulation box data
+    get_simulation_box_data = Task('simbox', 'Simulation box', mine_simulation_box_data)
+    simulation_box_data = property(get_simulation_box_data, None, None, "Simulation box vectors, size, constant and orthogonal flags and shape (read only)")
+
+    def get_simulation_box(self) -> Optional[tuple | str]:
+        """Box vectors in Å (rows of the box matrix), or 'dyn' if the box is dynamic.
+        Return None if it is missing."""
+        return self.simulation_box_data[0]
+    simulation_box = property(get_simulation_box, None, None, "Simulation box vectors, or 'dyn' if dynamic (read only)")
+
+    def get_simulation_box_size(self) -> Optional[tuple]:
+        """Box size (diagonal of the box matrix). Maximum size for every dimension if it is dynamic.
+        Return None if it is missing."""
+        return self.simulation_box_data[1]
+    simulation_box_size = property(get_simulation_box_size, None, None, "Simulation box size (read only)")
+
+    def check_is_simulation_box_constant(self) -> Optional[bool]:
+            """Check if the simulation box is constant (True) or dynamic (False).
+            Return None if is is missing."""
+            return self.simulation_box_data[2]
+    is_simulation_box_constant = property(check_is_simulation_box_constant, None, None, "Whether the simulation box is constant or dynamic (read only)")
+
+    def check_is_simulation_box_orthogonal(self) -> Optional[bool]:
+        """Check if the simulation box is orthogonal (True) or triclinic (False).
+        Return None if it is missing."""
+        return self.simulation_box_data[3]
+    is_simulation_box_orthogonal = property(check_is_simulation_box_orthogonal, None, None, "Whether the simulation box is orthogonal (read only)")
+
+    def get_simulation_box_shape(self) -> Optional[str]:
+        """Box shape: cubic, orthogonal, hexagonal, dodecahedral, octahedral or triclinic.
+        Several shapes joined by ' / ' if a dynamic box changes its shape.
+        Return None if it is missing.
+        """
+        return self.simulation_box_data[4]
+    simulation_box_shape = property(get_simulation_box_shape, None, None, "Simulation box shape (read only)")
+
+    # ---------------------------------------------------------------------------------
+    # Tests
+    # ---------------------------------------------------------------------------------
+
+    # RUBEN: TODO hacer task?
+    def is_trajectory_integral(self) -> Optional[bool]:
+        """Sudden jumps test."""
+        # If we already have a stored value then return it
+        if self._trajectory_integrity is not MISSING_VALUE:
+            return self._trajectory_integrity
+        # Otherwise we must find the value
+        skipped_first_frames, skipped_last_frames = self.input_skip_frames or (0, 0)
+        self._trajectory_integrity = check_trajectory_integrity(
+            input_structure_filename=self.structure_file.path,
+            input_trajectory_filename=self.trajectory_file.path,
+            view_script_filename=self.pathify(TRAJECTORY_INTEGRITY_VIEW_FILENAME),
+            structure=self.structure,
+            pbc_selection=self.pbc_selection,
+            mercy=self.project.mercy,
+            trust=self.project.trust,
+            register=self.register,
+            # time_length = self.time_length,
+            check_selection=ALL_ATOMS,
+            standard_deviations_cutoff=self.project.rmsd_cutoff,
+            update_image=self.update_image_input,
+            snapshots=self.snapshots,
+            md_index=self.index,
+            skipped_frames=skipped_first_frames,
+            skipped_last_frames=skipped_last_frames,
+        )
+        return self._trajectory_integrity
+
+    def are_there_cross_periodic_contacts(self) -> Optional[bool]:
+        """Check if there are contacts between non-PBC regions across periodic boundaries"""
+        # If we already have a stored value then return it
+        if self._cross_periodic_contacts is not MISSING_VALUE:
+            return self._cross_periodic_contacts
+        # Otherwise we must find the value
+        self._cross_periodic_contacts = check_cross_periodic_contacts(
+            input_structure_filename=self.structure_file.path,
+            input_trajectory_filename=self.trajectory_file.path,
+            view_script_filename=self.pathify(CROSS_PBC_VIEW_FILENAME),
+            structure=self.structure,
+            pbc_selection=self.pbc_selection,
+            input_pbc_selection=self.input_pbc_selection,
+            update_pbc_selection=self.update_pbc_selection_input,
+            chains_changed=self.cache.retrieve(CHAINS_CHANGED_FLAG, False),
+            mercy=self.project.mercy,
+            trust=self.project.trust,
+            register=self.register,
+            check_selection=ALL_ATOMS,
+            distance_cutoff=5, # In Ångstroms
+            snapshots=self.snapshots,
+            simulation_box=self.simulation_box,
+            ignore_box=self.box_ignored,
+        )
+        return self._cross_periodic_contacts
+
+    # ---------------------------------------------------------------------------------
+    # Analyses
+    # ---------------------------------------------------------------------------------
+
+    # RMSDs analysis
+    run_rmsds_analysis = Task('rmsds', 'RMSDs analysis',
+        rmsds, {'time_splits': 100})
+    global_rmsd = property(run_rmsds_analysis, None, None, "Global RMSD against the first frame as (mean, stdv, max) (read only)")
+
+    # TM scores analysis
+    run_tmscores_analysis = Task('tmscore', 'TM scores analysis',
+        tmscores, {'frames_limit': 200})
+
+    # RMSF, atom fluctuation analysis
+    run_rmsf_analysis = Task('rmsf', 'Fluctuation analysis', rmsf)
+
+    # Radius of gyration analysis
+    run_rgyr_analysis = Task('rgyr', 'Radius of gyration analysis',
+        rgyr, {'frames_limit': 5000})
+
+    # PCA, principal component analysis
+    run_pca_analysis = Task('pca', 'Principal component analysis',
+        pca, {'frames_limit': 2000, 'projection_frames': 20})
+
+    # PCA contacts
+    # DANI: Intenta usar mucha memoria, hay que revisar
+    # DANI: Puede saltar un error de imposible alojar tanta memoria
+    # DANI: Puede comerse toda la ram y que al final salte un error de 'Terminado (killed)'
+    # DANI: De momento me lo salto
+    # DANI: Lleva mucho tiempo sin mantenerse, habrá que cambiar varias cosas al recuperarlo
+    # run_pca_contacts('pcacons', 'PCA contacts', pca_contacts)
+
+    # RMSD per residue analysis
+    run_rmsd_perres_analysis = Task('perres', 'RMSD per residue analysis',
+        rmsd_per_residue, {'frames_limit': 100})
+
+    # RMSD pairwise
+    # Perform an analysis for the overall structure and then one more analysis for each interaction
+    run_rmsd_pairwise_analysis = Task('pairwise', 'RMSD pairwise',
+        rmsd_pairwise, {'frames_limit': 200, 'overall_selection': "name CA or name C5'"})
+
+    # Run the cluster analysis
+    run_clusters_analysis = Task('clusters', 'Clusters analysis',
+        clusters_analysis, {'frames_limit': 1000})
+
+    # Calculate the distance mean and standard deviation of each pair of residues
+    run_dist_perres_analysis = Task('dist', 'Distance per residue',
+        distance_per_residue, {'frames_limit': 200})
+
+    # Hydrogen bonds
+    run_hbonds_analysis = Task('hbonds', 'Hydrogen bonds analysis',
+        hydrogen_bonds, {'time_splits': 100})
+
+    # SASA, solvent accessible surface analysis
+    run_sas_analysis = Task('sas', 'Solvent accessible surface analysis',
+        sasa, {'frames_limit': 100})
+
+    # Perform the electrostatic and vdw energies analysis for each pair of interaction agents
+    run_energies_analysis = Task('energies', 'Energies analysis',
+        energies, {'frames_limit': 100})
+
+    # Calculate torsions and then dihedral energies for every dihedral along the trajectory
+    run_dihedral_energies = Task('dihedrals', 'Dihedral energies analysis',
+        compute_dihedral_energies, {'frames_limit': 100})
+
+    # Perform the pockets analysis
+    run_pockets_analysis = Task('pockets', 'Pockets analysis',
+        pockets, {'frames_limit': 100, 'maximum_pockets_number': 10})
+
+    # Allostery analysis: allosteric network, hotspots, communities and cliques
+    run_allostery_analysis = Task('allostery', 'Allostery analysis',
+        allostery, {'frames_limit': 1000})
+
+    # Chemical shifts analysis: NMR chemical shifts of protein backbone atoms along the trajectory
+    run_chemical_shifts_analysis = Task('chemshifts', 'Chemical shifts analysis',
+        chemical_shifts, {'frames_limit': 1000, 'time_splits': 10})
+
+    # Helical parameters
+    run_helical_analysis = Task('helical', 'Helical parameters', helical_parameters)
+
+    # Markov
+    run_markov_analysis = Task('markov', 'Markov', markov, {'rmsd_selection': PROTEIN_AND_NUCLEIC})
+
+    # Membrane density analysis
+    run_density_analysis = Task('density', 'Membrane density analysis',
+        density, {'frames_limit': 1000})
+
+    # Membrane thickness analysis
+    get_thickness_analysis = Task('thickness', 'Membrane thickness analysis', thickness, {'frames_limit': 100})
+    thickness_analysis = property(get_thickness_analysis, None, None, "Membrane thickness analysis")
+
+    # Area per lipid analysis
+    run_apl_analysis = Task('apl', 'Membrane area per lipid analysis', area_per_lipid)
+
+    # Calculate lipid order parameters for membranes
+    run_lipid_order_analysis = Task('lorder', 'Membrane lipid order analysis',
+        lipid_order, {'frames_limit': 100})
+
+    # Lipid-protein interactions analysis
+    run_lipid_interactions_analysis = Task('linter', 'Membrane lipid-protein interactions analysis',
+        lipid_interactions, {'frames_limit': 100})
+
+    run_channels_analysis = Task('channels', 'Membrane channels analysis',
+        channels, {'frames_limit': 10})
+
+    def get_warnings(self) -> list:
+        """Get the warnings.
+
+        The warnings list should not be reasigned, but it was back in the day.
+        To avoid silent bugs, we read it directly from the register every time.
+        """
+        return self.register.warnings
+    warnings = property(get_warnings, None, None, "MD warnings to be written in metadata")
+
+    def get_register(self) -> 'Register':
+        """Get the MD register.
+
+        It is not created on init since creating it writes a new entry in the register file.
+        This way commands which only read the project (e.g. 'mwf ds view') do not leave a trace.
+        """
+        if self._register is not None: return self._register
+        # In case the directory is the project directory itself, use the project register
+        register_file = File(self.pathify(REGISTER_FILENAME))
+        if register_file.path == self.project.register.file.path:
+            self._register = self.project.register
+        else:
+            self._register = Register(register_file)
+        return self._register
+    register = property(get_register, None, None, "Tracks MD workflow runs, test results and warnings")
+
+
+class Project:
+    """Class for the main project of an MDDB accession.
+    A project is a set of related MDs.
+    These MDs share all or most topology and metadata.
+    """
+
+    @staticmethod
+    def get_project_directory(directory: str) -> str:
+        """Get the project directory from the input directory."""
+        directory = normpath(directory)
+        # If it is an absolute path then make it relative to the workflow caller
+        if isabs(directory):
+            directory = relpath(directory)
+        # Make sure the directory exists
+        if not exists(directory):
+            raise InputError(f'Project directory {directory} does not exist')
+        if not isdir(directory):
+            raise InputError(f'Project directory {directory} exists and it is not a directory')
+        return directory
+
+    @staticmethod
+    def create_cache(directory: str = '.') -> Cache:
+        """Create or load the project cache. Cannot fail
+        unless the directory doesn't exist, which is a pre-condition anyway.
+        """
+        directory = Project.get_project_directory(directory)
+        return Cache(File(join(directory, CACHE_FILENAME)))
+
+    def __init__(self,
+        directory: str = '.',
+        accession: Optional[str] = None,
+        database_url: str = DEFAULT_API_URL,
+        inputs_filepath: Optional[str] = None,
+        input_topology_filepath: Optional[str] = None,
+        input_structure_filepath: Optional[str] = None,
+        input_trajectory_filepaths: Optional[list[str]] = None,
+        input_md_directories: Optional[list[str]] = None,
+        input_md_config: Optional[list[list[str]]] = None,
+        reference_md_index: Optional[int] = None,
+        forced_inputs: Optional[list[list[str]]] = None,
+        populations_filepath: str = DEFAULT_POPULATIONS_FILENAME,
+        transitions_filepath: str = DEFAULT_TRANSITIONS_FILENAME,
+        aiida_data_filepath: Optional[str] = None,
+        filter_selection: bool | str = False,
+        pbc_selection: Optional[str] = None,
+        cg_selection: Optional[str] = None,
+        ua_selection: Optional[str] = None,
+        qm_selection: Optional[str] = None,
+        dummy_selection: Optional[str] = None,
+        forced_class_selections: Optional[dict] = None,
+        image: bool | str = False,
+        fit: bool | str = False,
+        translation: Optional[list[float] | str] = None,
+        mercy: list[str] | bool = [],
+        trust: list[str] | bool = [],
+        faith: bool = False,
+        skip_frames: Optional[list[list[int]]] = None,
+        pca_analysis_selection: str = PROTEIN_AND_NUCLEIC_BACKBONE,
+        pca_fit_selection: str = PROTEIN_AND_NUCLEIC_BACKBONE,
+        rmsd_cutoff: float = DEFAULT_RMSD_CUTOFF,
+        interaction_cutoff: float = DEFAULT_INTERACTION_CUTOFF,
+        interactions_auto: Optional[str] = None,
+        energies_engine: str = DEFAULT_ENERGIES_ENGINE,
+        guess_bonds: bool = False,
+        ignore_bonds: bool = False,
+        ignore_box: bool = False,
+        sample_trajectory: Optional[int] = None,
+        screenshot_frame: Optional[int] = None,
+        local_blast: bool = False,
+        local_interproscan: bool = False,
+    ):
+        """Initialize a Project.
+
+        Args:
+            directory (str):
+                Project directory where the whole workflow is to be run.
+            accession (Optional[str]):
+                Project accession to download missing input files from the database (if already uploaded).
+            database_url (str):
+                API URL to download missing data. when an accession is provided.
+            inputs_filepath (str):
+                Path to a file with inputs for metadata, simulation parameters and analysis config.
+            input_topology_filepath (Optional[str]):
+                Path or glob pattern to input topology file relative to the project directory.
+            input_structure_filepath (Optional[str]):
+                Path or glob pattern to input structure file. It may be relative to the project or to each MD directory.
+                If this value is not passed then the standard structure file is used as input by default.
+            input_trajectory_filepaths (Optional[list[str]]):
+                Paths or glob patterns to input trajectory files relative to each MD directory.
+                If this value is not passed then the standard trajectory file path is used as input by default.
+            input_md_directories (Optional[list[str]]):
+                Path or glob pattern to the different MD directories.
+                Each directory is to contain an independent trajectory and structure.
+                Several output files will be generated in every MD directory.
+            input_md_config (Optional[list[list[str]]]):
+                Configuration of a specific MD. You may declare as many as you want.
+                Every MD requires a directory name and at least one trajectory path.
+                The structure is -md <directory> <trajectory_1> <trajectory_2> ...
+                Note that all trajectories from the same MD will be merged.
+                For legacy reasons, you may also provide a specific structure for an MD.
+                e.g. -md <directory> <structure> <trajectory_1> <trajectory_2> ...
+            reference_md_index (Optional[int]):
+                Index of the reference MD (used by project-level functions; defaults to first MD).
+            forced_inputs (Optional[list]):
+                Force a specific input through the command line.
+                Inputs passed through command line have priority over the ones from the inputs file.
+                In fact, these values will overwritten or be appended in the inputs file.
+                Every forced input requires an input name and a value.
+                The structure is -fi <input name> <new input value>
+            populations_filepath (str):
+                Path to equilibrium populations file (Markov State Model only)
+            transitions_filepath (str):
+                Path to transition probabilities file (Markov State Model only).
+            aiida_data_filepath (Optional[str]):
+                Path to the AiiDA data file.
+                This file may be generated by the aiida-gromacs plugin and contains provenance data.
+            filter_selection (bool|str):
+                Atoms selection to be filtered in VMD format.
+                If the argument is passed alone (i.e. with no selection) then water and counter ions are filtered.
+                Value passed through console overrides the one in inputs file.
+            pbc_selection (Optional[str]):
+                Selection of atoms which stay in Periodic Boundary Conditions even after imaging the trajectory.
+                e.g. remaining solvent, ions, membrane lipids, etc.
+                Selection passed through console overrides the one in inputs file.
+            cg_selection (Optional[str]):
+                Selection of atoms which are not actual atoms but Coarse Grained beads.
+                Use 'auto' to guess them.
+                Selection passed through console overrides the one in inputs file.
+            ua_selection (Optional[str]):
+                Selection of atoms in united atom residues, whose carbons have their hydrogens absorbed.
+                Use 'auto' to guess them.
+                Selection passed through console overrides the one in inputs file.
+            qm_selection (Optional[str]):
+                Selection of atoms which are treated with quantum mechanics in QM/MM simulations.
+                Selection passed through console overrides the one in inputs file.
+            dummy_selection (Optional[str]):
+                Selection of atoms which are not real atoms but dummy atoms.
+                Selection passed through console overrides the one in inputs file.
+            forced_class_selections:
+                Custom forced selections for molecular classification.
+                Value passed through arguments overrides the one in inputs file.
+            image (bool|str):
+                Set if the trajectory is to be imaged so atoms stay in the PBC box. See -pbc for more information.
+                Use 'auto' to image only if non-PBC molecules are split by the box boundaries or molecules drift away from the box in some frames.
+                If the image was not done and the trajectory integrity test fails then the workflow is run again with the image.
+                Value passed through console overrides the one in inputs file.
+            fit (bool|str):
+                Set if the trajectory is to be fitted (both rotation and translation) to minimize the RMSD to PROTEIN_AND_NUCLEIC_BACKBONE selection.
+                Use 'auto' to fit only if the trajectory does not seem to be fitted already.
+                Value passed through console overrides the one in inputs file.
+            translation (list[float]|str):
+                Set the x y z translation (nm) for the imaging process.
+                Use 'auto' to find a translation which keeps non-PBC atoms away from the box boundaries.
+                If all atoms are PBC then lipids are used instead, so membranes are not split along their normal.
+                e.g. -trans 0.5 -1 0
+                Value passed through console overrides the one in inputs file.
+            mercy (list[str]|bool):
+                Failures to be tolerated (or boolean to set all/none).
+                Value passed through console overrides the one in inputs file.
+            trust (list[str]|bool):
+                Tests to skip/trust (or boolean to set all/none).
+                Value passed through console overrides the one in inputs file.
+            faith (bool):
+                If True, require input files to match expected output files and skip processing.
+                Value passed through console overrides the one in inputs file.
+            skip_frames (list[list[int]]):
+                Pairs of MD index (starting at 0) and number of frames to be excluded from the beginning of its trajectory.
+                Negative numbers exclude frames from the end instead, so both ends may be set for the same MD.
+                An incomplete last frame (e.g. after an interrupted simulation or file transfer) counts as one frame.
+                e.g. -skip 0 100 -skip 0 -1 -skip 2 50
+                Value passed through console overrides the one in inputs file for the MDs it names, and it is saved there.
+            pca_analysis_selection (str):
+                Atom selection for PCA analysis in VMD syntax.
+            pca_fit_selection (str):
+                Atom selection for the PCA fitting in VMD syntax.
+            rmsd_cutoff (float):
+                Set the cutoff for the RMSD sudden jumps analysis to fail.
+                This cutoff stands for the number of standard deviations away from the mean an RMSD value is to be.
+            interaction_cutoff (float):
+                Set the cutoff for the interactions analysis to fail.
+                This cutoff stands for percent of the trajectory where the interaction happens (from 0 to 1).
+            interactions_auto (Optional[str]):
+                Guess input interactions automatically. A VMD selection may be passed to limit guessed interactions to a specific subset of atoms.
+            energies_engine (str):
+                Engine of the energies analysis: 'cmip' (default), CMIP's Poisson-Boltzmann electrostatics on a grid, or 'gridfree', Coulomb with a sigmoidal distance-dependent dielectric and CMIP's van der Waals parameters summed over atom pairs (much faster).
+            guess_bonds (bool):
+                Force the workflow to guess atom bonds based on distance and atom radii in different frames along the trajectory instead of mining topology bonds.
+            ignore_bonds (bool):
+                Force the workflow to ignore atom bonds. This will result in many check-ins being skipped
+            ignore_box (bool):
+                Force the workflow to ignore the simulation box, e.g. when the trajectory box is wrong.
+                Note that the box is ignored anyway if the trajectory was fitted without rotating the box.
+                Everything depending on the box will be skipped (e.g. cross-PBC contacts test and box metadata).
+            sample_trajectory (Optional[int]):
+                If passed, download the first 10 (by default) frames from the trajectory.
+                You can specify a different number by providing an integer value.
+            screenshot_frame (Optional[int]):
+                If passed, the project screenshot is made using the specified frame (0-based), from the reference MD.
+                Negative number may be passed to select frames starting by the end. e.g. -1 is the last frame.
+                By default the screenshot is made using the reference frame from the reference MD.
+            local_blast (bool):
+                Run the protein mapping blast locally against a Swiss-Prot database (downloaded on first use)
+                instead of using the remote NCBI blast service. Requires BLAST+ to be installed, which can
+                be done withc 'conda install -c bioconda blast' or 'apt install ncbi-blast+'.
+            local_interproscan (bool):
+                Run InterProScan 6 locally for the chain references instead of using the remote EBI service.
+                Requires Nextflow and Apptainer, Singularity or Docker, and a local setup done once with
+                'python -m mddb_workflow.utils.interproscan --setup' (about 37 GB of disk).
+                Local results lack the licensed analyses and InterPro-N, which EBI runs.
+                Known sequences take their precalculated matches from the InterPro Matches API, when it serves
+                the same InterPro release as the local data. Otherwise all matches are calculated locally.
+
+        """
+        # Save input parameters
+        self.directory = self.get_project_directory(directory)
+        self.directory_name = basename(getcwd() if self.directory == '.' else self.directory)
+
+        # Save some additional variables which have their twins in the MD class
+        # This is important to make some functions work in both classes at the same time
+        self.project = self
+        self.project_directory = self.directory
+
+        # Set the database handler
+        self.database = Database(database_url) if database_url else None
+        # Set the remote project handler
+        self.accession = accession
+        self.remote = None
+        if self.database and self.accession:
+            self.remote = Remote(self.database, accession)
+
+        # If an accession is passed then make sure no other inputs file paths are passed
+        # If input data files are to be downloaded then the workflow will automatically handle their paths
+        # NEVER FORGET we rely in input file names to track whether files belong to a specific database + accession
+        if accession:
+            if inputs_filepath:
+                raise InputError('User must not specify any input filepath when downloading input files from a database.\n' +
+                    ' Please either remove the "-inp" argument or the "-proj" argument.')
+            if input_topology_filepath:
+                raise InputError('User must not specify any input filepath when downloading input files from a database.\n' +
+                    ' Please either remove the "-top" argument or the "-proj" argument.')
+            if input_structure_filepath:
+                raise InputError('User must not specify any input filepath when downloading input files from a database.\n' +
+                    ' Please either remove the "-stru" argument or the "-proj" argument.')
+            if input_trajectory_filepaths:
+                raise InputError('User must not specify any input filepath when downloading input files from a database.\n' +
+                    ' Please either remove the "-traj" argument or the "-proj" argument.')
+            if input_md_directories:
+                raise InputError('User must not specify any input filepath when downloading input files from a database.\n' +
+                    ' Please either remove the "-mdir" argument or the "-proj" argument.')
+            if input_md_config:
+                raise InputError('User must not specify any input filepath when downloading input files from a database.\n' +
+                    ' Please either remove any "-md" argument or the "-proj" argument.')
+
+        # Make sure the new MD configuration (-md) was not passed as well as old MD inputs (-mdir, -traj)
+        if input_md_config and (input_md_directories or input_trajectory_filepaths):
+            raise InputError('MD configurations (-md) is not compatible with old MD inputs (-mdir, -traj)')
+
+        # Set the inputs file
+        self.inputs_filepath = None
+        # Set the filepath in case it was passed from the console arguments
+        # If this is the case then we must check here it exists
+        if inputs_filepath:
+            # Check if the path is relative to the project or to the workflow caller directory
+            self.inputs_filepath = self.pathify(inputs_filepath)
+            if not exists(self.inputs_filepath):
+                self.inputs_filepath = normpath(inputs_filepath)
+                if not exists(self.inputs_filepath):
+                    raise InputError(f'Inputs file {inputs_filepath} is nowhere to be found')
+        # If we have a remote accession to download data from then we also set the inputs filename accordingly
+        if self.remote:
+            inputs_filename = self.remote.get_inputs_file_source_filename()
+            self.inputs_filepath = self.pathify(inputs_filename)
+        # Try to guess which is the inputs file by searching for some supported names
+        if self.inputs_filepath is None:
+            candidates = []
+            for filename in ACCEPTED_INPUT_FILENAMES:
+                # No matter the header, as long as the filename ends as we expect
+                flexible_filename = '*' + filename
+                filepath = self.pathify(flexible_filename)
+                candidates += parse_glob(filepath)
+            if len(candidates) > 1:
+                raise InputError(f'Multiple files could be the inputs file: {", ".join(candidates)}\n' +
+                    ' Please specify which is the inputs file using the "-inp" argument.')
+            if len(candidates) == 1: self.inputs_filepath = candidates[0]
+        # Set the expected default name in case there is no inputs file since it may be downloaded
+        if self.inputs_filepath is None:
+            self.inputs_filepath = self.pathify(DEFAULT_INPUTS_FILENAME)
+        self._inputs_file = File(self.inputs_filepath)
+        # Set the input topology file
+        # Note that even if the input topology path is passed we do not check it exists
+        # Never forget we can donwload some input files from the database on the fly
+        self.arg_input_topology_filepath = input_topology_filepath
+        self._input_topology_filepath = MISSING_VALUE
+        self._input_topology_file = MISSING_VALUE
+        self._input_topology_url = None
+        # Input structure and trajectory filepaths
+        # Do not parse them to files yet, let this to the MD class
+        self.arg_input_structure_filepath = input_structure_filepath
+        self.arg_input_trajectory_filepaths = input_trajectory_filepaths
+        # Input populations and transitions for MSM
+        self.populations_filepath = populations_filepath
+        self._populations_file = File(self.populations_filepath)
+        self.transitions_filepath = transitions_filepath
+        self._transitions_file = File(self.transitions_filepath)
+        # Input AiiDA data
+        self.aiida_data_filepath = aiida_data_filepath
+        self._aiida_data_file = File(self.aiida_data_filepath) if aiida_data_filepath else None
+
+        # Set the processed topology filepath, which depends on the input topology filename
+        # Note that this file is different from the standard topology
+        self._topology_filepath = MISSING_VALUE
+
+        # Set the rest of inputs
+        self.pca_analysis_selection = pca_analysis_selection
+        self.pca_fit_selection = pca_fit_selection
+        self.rmsd_cutoff = rmsd_cutoff
+        self.interaction_cutoff = interaction_cutoff
+        self.sample_trajectory = sample_trajectory
+        self.screenshot_frame = screenshot_frame
+        self.interactions_auto = interactions_auto
+        self.energies_engine = energies_engine
+        self.guess_bonds = guess_bonds
+        self.ignore_bonds = ignore_bonds
+        self.ignore_box = ignore_box
+        self.local_blast = local_blast
+        self.local_interproscan = local_interproscan
+
+        # Other values which may be found/calculated on demand
+        self._cg_selection = MISSING_VALUE
+        self._cg_residues = MISSING_VALUE
+        self._ua_selection = MISSING_VALUE
+        self._ua_residues = MISSING_VALUE
+        self._qm_selection = MISSING_VALUE
+        self._dummy_selection = MISSING_VALUE
+        self._forced_class_selections = MISSING_VALUE
+        self._topology_reader = MISSING_VALUE
+        self._dihedrals = MISSING_VALUE
+        self._populations = MISSING_VALUE
+        self._transitions = MISSING_VALUE
+        self._pdb_ids = MISSING_VALUE
+        self._mds = MISSING_VALUE
+
+        # Selections and frames to skip passed through console override the ones in the inputs file
+        # Thus they are handled as forced inputs
+        forced_inputs = [ *(forced_inputs or []) ]
+        # Frames to skip come as pairs of MD index and number of frames, which are joined as in the inputs file
+        # e.g. -skip 0 100 -skip 0 -1 -> 0: [100, -1]
+        skip_frames_input = {}
+        for md_index, frames in skip_frames or []:
+            skip_frames_input.setdefault(md_index, []).append(frames)
+        argument_inputs = {
+            'pbc_selection': pbc_selection,
+            'cg_selection': cg_selection,
+            'ua_selection': ua_selection,
+            'qm_selection': qm_selection,
+            'dummy_selection': dummy_selection,
+            'forced_class_selections': forced_class_selections,
+            'skip_frames': skip_frames_input or None,
+        }
+        for input_name, input_value in argument_inputs.items():
+            if input_value is not None: forced_inputs.append([input_name, input_value])
+
+        # Input loading, validation, forced-value precedence, and defaults are
+        # handled by ProjectInputs.  The loader callback preserves the
+        # project's lazy remote input-file download behavior.
+        self.inputs = ProjectInputs(
+            self._inputs_file,
+            directory_name=self.directory_name,
+            forced_inputs=forced_inputs,
+            input_loader=self.remote.download_inputs_file if self.remote else None,
+        )
+
+        # Set the workflow control inputs, which may come from the console or from the inputs file
+        # Values passed through console override the ones in the inputs file
+        # Note that the filter selection variable is not further handled here
+        # This is just pased to the filtering function which knows how to handle the default
+        self.filter_selection = filter_selection if filter_selection else self.inputs.get('filter_selection', filter_selection)
+        # Keep track of values passed through console, since they also override MD values
+        self.console_processing_inputs = { 'filter_selection': filter_selection, 'image': image, 'fit': fit, 'translation': translation }
+        self.image = image if image else self.inputs.get('image', image)
+        self.fit = fit if fit else self.inputs.get('fit', fit)
+        self.translation = translation if translation else self.inputs.get('translation', AUTOMATIC_FLAG)
+        self.mercy = mercy if mercy else self.inputs.get('mercy', mercy)
+        self.trust = trust if trust else self.inputs.get('trust', trust)
+        self.faith = faith if faith else self.inputs.get('faith', faith)
+        # Convert boolean mercy and trust to their corresponding lists of values
+        # An empty field in the inputs file comes as None, which means nothing is set
+        if self.mercy is None or type(self.mercy) is bool:
+            self.mercy = AVAILABLE_FAILURES if self.mercy else []
+        if self.trust is None or type(self.trust) is bool:
+            self.trust = AVAILABLE_CHECKINGS if self.trust else []
+
+        # Set the MD configuration
+        self.md_config: list[dict] = self.inputs.merge_md_config(
+            input_md_config,
+            input_md_directories,
+            input_topology_filepath=self.arg_input_topology_filepath,
+            input_structure_filepath=self.arg_input_structure_filepath,
+            input_trajectory_filepaths=self.arg_input_trajectory_filepaths,
+        )
+
+        # Make sure the values make sense and fill any gaps (e.g. missing names or directories)
+        self.md_config = self.inputs.validate_md_config(self.md_config)
+
+        # Set the numbers of frames to skip from the beginning and from the end per MD index
+        self.skip_frames = self.inputs.get_skip_frames()
+
+        # Force a couple of extraordinary files which is generated if atoms are resorted
+        self.resorted_bonds_file = File(self.pathify(RESORTED_BONDS_FILENAME))
+        self.resorted_charges_file = File(self.pathify(RESORTED_CHARGES_FILENAME))
+
+        # Register: useful to track previous workflow runs and problems
+        # It is set the first time it is used (see get_register)
+        self._register = None
+        self.cache = Cache(File(self.pathify(CACHE_FILENAME)))
+
+        # Set tasks whose output is to be overwritten
+        self.overwritables = set()
+
+        # Set the reference MD
+        self._reference_md = None
+        self._reference_md_index = reference_md_index
+
+    def __repr__(self):
+        """Return a string representation of the Project object."""
+        return '<Project>'
+
+    def __str__(self):
+        """Return a string representation of the MD object."""
+        return 'project'
+
+    def pathify(self, filename_or_relative_path: str) -> str:
+        """Given a filename or relative path, add the project directory path at the beginning."""
+        return normpath(self.directory + '/' + filename_or_relative_path)
+
+    def get_reference_md_index(self) -> int:
+        """Get the reference MD index."""
+        # If we are already have a value then return it
+        if self._reference_md_index is not None:
+            return self._reference_md_index
+        # Otherwise we must find the reference MD index
+        # If the inputs file is available then it must declare the reference MD index
+        if self.inputs.is_file_available:
+            self._reference_md_index = self.inputs.get('mdref')
+        # Otherwise we simply set the first MD as the reference and warn the user about this
+        if self._reference_md_index is None:
+            self._reference_md_index = self.inputs.get_default('mdref')
+        return self._reference_md_index
+    reference_md_index = property(get_reference_md_index, None, None, "Reference MD index (read only)")
+
+    def get_reference_md(self) -> MD:
+        """Get the reference MD."""
+        # If we are already have a value then return it
+        if self._reference_md:
+            return self._reference_md
+        # Otherwise we must find the reference MD
+        md_count = len(self.mds)
+        if md_count <= self.reference_md_index:
+            message_end = 'there is only 1 MD' if md_count == 1 else f'there are only {md_count} MDs'
+            raise InputError(f'Reference MD index is {self.reference_md_index} but {message_end}.\n'
+                ' Note that the index of the reference MD is 0-based, so the first MD is "0".\n'
+                ' Please change or leave blank the field "mdref" in the inputs file.')
+        self._reference_md = self.mds[self.reference_md_index]
+        return self._reference_md
+    reference_md: MD = property(get_reference_md, None, None, "Reference MD (read only)")
+
+    def get_mds(self) -> list[MD]:
+        """Get the available MDs (read only)."""
+        # If MDs are already declared then return them
+        if self._mds is not MISSING_VALUE:
+            return self._mds
+        # Now instantiate a new MD for each declared MD and save the reference MD
+        self._mds = []
+        for md_index, md_inputs in enumerate(self.md_config, 1):
+            # Keep removed MDs to have stable MD indexes
+            if md_inputs.get(MD_REMOVED_FLAG):
+                self._mds.append(REMOVED_MD)
+                continue
+            # Instantiate the MD
+            md = MD(
+                project=self, name=md_inputs[MD_NAME], number=md_index, directory=md_inputs[MD_DIRECTORY],
+                input_topology_filepath=md_inputs.get(MD_INPUT_TOPOLOGY_FILEPATH, None),
+                input_structure_filepath=md_inputs.get(MD_INPUT_STRUCTURE_FILEPATH, None),
+                input_trajectory_filepaths=md_inputs.get(MD_INPUT_TRAJECTORY_FILEPATHS, None),
+            )
+            self._mds.append(md)
+        return self._mds
+    mds: list[MD] = property(get_mds, None, None, "Available MDs (read only)")
+
+    # Input topology file ------------
+
+    # Inherit MD function which should work the same for the project
+    # LORE: They were project functions before, when multiple topologies were not supported
+    get_input_topology_filepath = MD.get_input_topology_filepath
+    get_input_topology_file = MD.get_input_topology_file
+    input_topology_file = property(get_input_topology_file, None, None, "Input topology file (read only)")
+
+    def get_input_structure_file(self) -> File:
+        """Get the input structure file."""
+        return self.reference_md._input_structure_file
+    input_structure_file = property(get_input_structure_file, None, None, "Input structure file for each MD (read only)")
+
+    def get_input_trajectory_files(self) -> list[File]:
+        """Get the input trajectory file(s) from the reference MD.
+        If file(s) are not found then try to download them.
+        """
+        return self.reference_md._input_trajectory_files
+    input_trajectory_files = property(get_input_trajectory_files, None, None, "Input trajectory files for each MD (read only)")
+
+    def get_populations_file(self) -> Optional[File]:
+        """Get the MSM equilibrium populations file."""
+        if not self.get_file(self._populations_file):
+            return None
+        return self._populations_file
+    populations_file = property(get_populations_file, None, None, "MSM equilibrium populations file (read only)")
+
+    def get_transitions_file(self) -> Optional[File]:
+        """Get the MSM transition probabilities file."""
+        if not self.get_file(self._transitions_file):
+            return None
+        return self._transitions_file
+    transitions_file = property(get_transitions_file, None, None, "MSM transition probabilities file (read only)")
+
+    def get_aiida_data_file(self) -> Optional[File]:
+        """Get the AiiDA data file."""
+        if not self._aiida_data_file: return None
+        if not self.get_file(self._aiida_data_file): return None
+        return self._aiida_data_file
+    aiida_data_file = property(get_aiida_data_file, None, None, "AiiDA data file (read only)")
+
+    # ---------------------------------
+
+    def get_file(self, target_file: File) -> bool:
+        """Check if a file exists.
+        If not, try to download it from the database.
+        If the file is not found in the database it is fine, we do not even warn the user.
+        Note that nowadays this function is used to get populations and transitions files, which are not common.
+        """
+        return self.reference_md.get_file(target_file)
+
+    # Check input files exist when their filenames are read
+    # If they do not exist then try to download them
+    # If the download is not possible then raise an error
+
+    # Inputs filename ------------
+
+    def get_inputs_file(self) -> File:
+        """Set a function to load the inputs yaml file."""
+        # There must be an inputs filename
+        if not self._inputs_file:
+            raise InputError('Not defined inputs filename')
+        self._file_inputs = self.inputs.get_inputs_file()
+        return self._inputs_file
+    inputs_file = property(get_inputs_file, None, None, "Inputs filename (read only)")
+
+    # Input file values -----------------------------------------
+
+    # Input loading, validation, and value resolution are handled by
+    # ProjectInputs. Keep this property on Project as a compatibility layer
+    # for the rest of the workflow and for callers using the old API.
+
+    def get_file_inputs(self) -> dict:
+        """Get validated inputs through the project input manager."""
+        return self.inputs.file_inputs
+    file_inputs: dict = property(get_file_inputs, None, None, "Inputs from the inputs file (read only)")
+
+    def get_file_input(self, name: str) -> Any:
+        """Get a resolved input value through the project input manager."""
+        return self.inputs.get(name)
+
+    def update_cache_inputs(self, arg_key: str, new_value: Any, verbose: bool = False, mds: Optional[list['MD']] = None):
+        """Update an input argument cksum in the cache of all tasks using it.
+        This may be useful after updating an input value if you don't want all tasks using it to run again in the next workflow run.
+        If some MDs are passed then only the tasks of these MDs are updated, and not the project tasks.
+        """
+        # Iterate project available tasks
+        for requestable in project_requestables.values():
+            if mds is not None: break
+            # Ignore anything which is not a task
+            if not isinstance(requestable, Task): continue
+            # Make sure the cache already has this argument key
+            # Otherwise it means the task is not using the input or it did not run yet
+            # In either case there is nothing to update then
+            if not requestable.has_arg(self, arg_key): continue
+            if verbose: print(f'Updating project task "{requestable.name}" input "{arg_key}" to "{new_value}"')
+            # Update the task cache
+            requestable.update_inputs_cache(self, {arg_key: new_value})
+
+        # Iterate MD available tasks
+        for requestable in md_requestables.values():
+            # Ignore anything which is not a task
+            if not isinstance(requestable, Task): continue
+            # Iterate MDs since we will have to update the task cache in every MD
+            for md in (self.mds if mds is None else mds):
+                if md == REMOVED_MD: continue
+                # Make sure the cache already has this argument key
+                # Otherwise it means the task is not using the input or it did not run yet
+                # In either case there is nothing to update then
+                if not requestable.has_arg(md, arg_key): continue
+                if verbose: print(f'Updating MD "{md.name}" task "{requestable.name}" input "{arg_key}" to "{new_value}"')
+                # Update the task cache
+                requestable.update_inputs_cache(md, {arg_key: new_value})
+
+    def autofill_inputs(self):
+        """Make the workflow create (if does not exist yet) and automatically fill the inputs file.
+        Note that, by definition, most inputs are not to be defined by the workflow, but user inputs.
+        However there are a few exceptions where the workflow may attempt to guess some values.
+        For instance, the PBC selection or the dummy atoms selection are often correctly guessed.
+        In addition other selections will be parsed to atomic indices selections, which are safer.
+        """
+        # Get the final values to update in the input files
+        # WARNING: It is important to get these values before generating the inputs file
+        # WARNING: The inputs file is expected to either exists from the begining or not exist at all
+        # WARNING: Creating the inputs file mid run alters the order of things and it is not yet supported
+        # The PBC selection may be different in every MD
+        active_mds = [ md for md in self.mds if md != REMOVED_MD ]
+        md_pbc_selections = [ md.pbc_selection.to_vmd() if md.pbc_selection else None for md in active_mds ]
+        same_pbc_selections = len(set(md_pbc_selections)) == 1
+        final_pbc_selection = md_pbc_selections[0] if same_pbc_selections else None
+        final_cg_selection = self.cg_selection.to_vmd() if self.cg_selection else None
+        final_ua_selection = self.ua_selection.to_vmd() if self.ua_selection else None
+        final_qm_selection = self.qm_selection.to_vmd() if self.qm_selection else None
+        final_dummy_selection = self.dummy_selection.to_vmd() if self.dummy_selection else None
+        # Now start the actual autofilling process
+        print('Automatically filling inputs file')
+        # Make sure the inputs file exists before persisting generated values
+        self.inputs.ensure_file_from_template(File(INPUTS_TEMPLATE_FILEPATH))
+        # Now fill the inputs file with the selections we just processed
+        # Parse the selections to ranged VMD syntax guess
+        # Then to make sure some tasks are not repeated uselessly we must update some cache arguments cksums
+        # Note that this is done because we are updating inputs after using them
+        project_values = {
+            'cg_selection': final_cg_selection,
+            'ua_selection': final_ua_selection,
+            'qm_selection': final_qm_selection,
+            'dummy_selection': final_dummy_selection,
+        }
+        # If all MDs have the same PBC selection then set it for the whole project
+        if same_pbc_selections: project_values['pbc_selection'] = final_pbc_selection
+        input_updates = self.inputs.autofill(project_values)
+        # Fill the PBC selection
+        if same_pbc_selections:
+            # Remove MD values, since the project value is used by all MDs now
+            removed_md_values = [ self.inputs.remove_file_inputs(f'mds.{md.index}.pbc_selection') for md in active_mds ]
+            # Update the value in tasks caches only if there was an actual update
+            if input_updates['pbc_selection'] or any(removed_md_values):
+                self.update_cache_inputs('input_pbc_selection', final_pbc_selection)
+        # If MDs have different PBC selections then set them for every MD
+        else:
+            for md, md_pbc_selection in zip(active_mds, md_pbc_selections):
+                if md.update_file_inputs('pbc_selection', md_pbc_selection):
+                    self.update_cache_inputs('input_pbc_selection', md_pbc_selection, mds=[md])
+        # Fill the CG selection
+        if input_updates['cg_selection']:
+            # Update the value in tasks caches only if there was an actual update
+            self.update_cache_inputs('input_cg_selection', final_cg_selection)
+        # Fill the UA selection
+        if input_updates['ua_selection']:
+            # Update the value in tasks caches only if there was an actual update
+            self.update_cache_inputs('input_ua_selection', final_ua_selection)
+        # Fill the QM selection
+        if input_updates['qm_selection']:
+            # Update the value in tasks caches only if there was an actual update
+            self.update_cache_inputs('input_qm_selection', final_qm_selection)
+        # Fill the dummy atoms selection
+        if input_updates['dummy_selection']:
+            # Update the value in tasks caches only if there was an actual update
+            self.update_cache_inputs('input_dummy_selection', final_dummy_selection)
+        self.inputs.update_file_inputs('mds', self.md_config)
+
+    def inputs_property(name: str, doc: str = ""):
+        """Set a function to get a specific 'input' value by its key/name.
+        Note that we return the property without calling the getter.
+        """
+        def getter(self: 'Project'):
+            return self.inputs.get(name)
+        return property(getter, doc=doc)
+
+    # Assign the getters
+    input_interactions = inputs_property('interactions', "Interactions to be analyzed (read only)")
+    input_protein_references = inputs_property('forced_references', "Uniprot IDs to be used first when aligning protein sequences (read only)")
+    input_pdb_ids = inputs_property('pdb_ids', "Protein Data Bank IDs used for the setup of the system (read only)")
+    input_forced_lipids = inputs_property('forced_lipids', "Residue names to be treated as lipids (read only)")
+    input_type = inputs_property('type', "Set if its a trajectory or an ensemble (read only)")
+    input_ligands = inputs_property('ligands', "Input ligand references (read only)")
+    input_force_fields = inputs_property('ff', "Input force fields (read only)")
+    input_collections = inputs_property('collections', "Input collections (read only)")
+    input_chain_names = inputs_property('chainnames', "Input chain names (read only)")
+    input_framestep = inputs_property('framestep', "Input framestep (read only)")
+    input_name = inputs_property('name', "Input name (read only)")
+    input_description = inputs_property('description', "Input description (read only)")
+    input_authors = inputs_property('authors', "Input authors (read only)")
+    input_groups = inputs_property('groups', "Input groups (read only)")
+    input_contact = inputs_property('contact', "Input contact (read only)")
+    input_program = inputs_property('program', "Input program (read only)")
+    input_version = inputs_property('version', "Input version (read only)")
+    input_method = inputs_property('method', "Input method (read only)")
+    input_license = inputs_property('license', "Input license (read only)")
+    input_linkcense = inputs_property('linkcense', "Input license link (read only)")
+    input_citation = inputs_property('citation', "Input citation (read only)")
+    input_thanks = inputs_property('thanks', "Input acknowledgements (read only)")
+    input_links = inputs_property('links', "Input links (read only)")
+    input_timestep = inputs_property('timestep', "Input timestep (read only)")
+    input_temperature = inputs_property('temp', "Input temperature (read only)")
+    input_ensemble = inputs_property('ensemble', "Input ensemble (read only)")
+    input_water = inputs_property('wat', "Input water force field (read only)")
+    input_customs = inputs_property('customs', "Input custom representations (read only)")
+    input_orientation = inputs_property('orientation', "Input orientation (read only)")
+    input_dataset = inputs_property('dataset_path', "Dataset storage file. (read only)")
+    input_pbc_selection = inputs_property('pbc_selection', "Selection of atoms which are still in periodic boundary conditions (read only)")
+    input_cg_selection = inputs_property('cg_selection', "Selection of atoms which are not acutal atoms but Coarse Grained beads (read only)")
+    input_ua_selection = inputs_property('ua_selection', "Selection of atoms in united atom residues, whose carbons have their hydrogens absorbed (read only)")
+    input_qm_selection = inputs_property('qm_selection', "Selection of atoms which are treated with quantum mechanics (read only)")
+    input_dummy_selection = inputs_property('dummy_selection', "The original user input dummy atoms selection (read only)")
+    input_forced_class_selections = inputs_property('forced_class_selections', "The original input custom forced selections for molecular classification (read only)")
+    input_chainer = inputs_property('chainer', "Chain letters to be forced in the processed structure as letter: selection pairs (read only)")
+    input_metadditions = inputs_property('metadditions', "Author-customizable metadata additional fields (read only)")
+    # Additional topic-specific inputs
+    input_cv19_unit = inputs_property('cv19_unit', "Input Covid-19 Unit (read only)")
+    input_cv19_startconf = inputs_property('cv19_startconf', "Input Covid-19 starting conformation (read only)")
+    input_cv19_abs = inputs_property('cv19_abs', "Input Covid-19 antibodies (read only)")
+    input_cv19_nanobs = inputs_property('cv19_nanobs', "Input Covid-19 nanobodies (read only)")
+
+    def coherent_md_getter(name: str, description: str, key: Callable = lambda value: value):
+        """Get the getter of a value which is taken from the reference MD and must be the same in every MD.
+        The key makes values comparable (e.g. residue indices in any order).
+        """
+        attribute = f'_{name}'
+        def getter(self: 'Project'):
+            # If we already have a stored value then return it
+            if getattr(self, attribute) is not MISSING_VALUE:
+                return getattr(self, attribute)
+            # Make sure it is coherent among all MDs
+            md_values = set([ key(getattr(md, name)) for md in self.mds if md is not REMOVED_MD ])
+            if len(md_values) > 1:
+                raise InputError(f'{description} must be the same in every MD. Please change the input value.')
+            # Copy lists from the reference MD to prevent further mutation
+            value = getattr(self.reference_md, name)
+            setattr(self, attribute, list(value) if type(value) is list else value)
+            return getattr(self, attribute)
+        return getter
+
+    get_cg_selection = coherent_md_getter('cg_selection', 'Coarse grain selection')
+    cg_selection = property(get_cg_selection, None, None, "Coarse grain atom selection (read only)")
+    get_cg_residues = coherent_md_getter('cg_residues', 'Coarse grain residues', frozenset)
+    cg_residues = property(get_cg_residues, None, None, "Indices of residues in coarse grain (read only)")
+    get_ua_selection = coherent_md_getter('ua_selection', 'United atom selection')
+    ua_selection = property(get_ua_selection, None, None, "United atom selection (read only)")
+    get_ua_residues = coherent_md_getter('ua_residues', 'United atom residues', frozenset)
+    ua_residues = property(get_ua_residues, None, None, "Indices of residues in united atom (read only)")
+    get_qm_selection = coherent_md_getter('qm_selection', 'Quantum mechanics selection')
+    qm_selection = property(get_qm_selection, None, None, "Quantum mechanics atom selection (read only)")
+    get_dummy_selection = coherent_md_getter('dummy_selection', 'Dummy atoms selection')
+    dummy_selection = property(get_dummy_selection, None, None, "Dummy atoms selection (read only)")
+
+    # Set additional values infered from input values
+    # RUBEN: unused?
+    def check_is_time_dependent(self) -> bool:
+        """Set if MDs are time dependent."""
+        if self.input_type == 'trajectory':
+            return True
+        elif self.input_type == 'ensemble':
+            return False
+        raise InputError(f'Not supported input "type" value: {self.input_type}.' +
+            ' It must be either "trajectory" or "ensemble".\n' +
+            ' Please consider editting the inputs file or adding the input through command line.\n' +
+            ' e.g. -fin type trajectory')
+    is_time_dependent = property(check_is_time_dependent, None, None, "Check if trajectory frames are time dependent (read only)")
+
+    # Processed files ----------------------------------------------------
+
+    # Inherit MD function which should work the same for the project
+    # LORE: They were project functions before, when multiple topologies were not supported
+    inherit_topology_filename = MD.inherit_topology_filename
+    get_topology_filepath = MD.get_topology_filepath
+
+    # DANI: No se ha provado en profundidad
+    def get_topology_file(self) -> 'File':
+        """Get the processed topology from the reference MD."""
+        # Given a scenario where different MDs may have different topologies, find the MD to be used as reference for the topology
+        # By default we set the reference MD
+        topology_reference_md = self.reference_md
+        # Get the expected project topology, if any
+        topology_filepath = self.get_topology_filepath()
+        # If the project topology is missing then return here
+        if topology_filepath == MISSING_TOPOLOGY: return MISSING_TOPOLOGY
+        # If there is an input topology filepath for the project and it does not match with the reference MD then we must change
+        if topology_filepath != self.reference_md.get_topology_filepath():
+            # Iterate MDs until we find one using the project topology
+            for md in self.mds:
+                if md.get_topology_filepath() == topology_filepath:
+                    topology_reference_md = md
+                    break
+            # If no MD was found then surrender here
+            if topology_reference_md == self.reference_md:
+                raise RuntimeError(f'There is no MD using the project topology "{topology_filepath}"')
+        # Now call the 'inpro' getter from the topology reference MD
+        getter = topology_reference_md.input_files_processing.get_output_file_getter('output_topology_file')
+        return getter(self.reference_md)
+    topology_file = property(get_topology_file, None, None, "Topology file (read only)")
+
+    def get_structure_file(self) -> 'File':
+        """Get the processed structure from the reference MD."""
+        return self.reference_md.structure_file
+    structure_file = property(get_structure_file, None, None, "Structure filename from the reference MD (read only)")
+
+    def get_trajectory_file(self) -> 'File':
+        """Get the processed trajectory from the reference MD."""
+        return self.reference_md.trajectory_file
+    trajectory_file = property(get_trajectory_file, None, None, "Trajectory filename from the reference MD (read only)")
+
+    # ---------------------------------------------------------------------------------
+    # Others values which may be found/calculated and files to be generated on demand
+    # ---------------------------------------------------------------------------------
+
+    def get_structure(self) -> 'Structure':
+        """Get a reference structure.
+        Use the reference MD structure but make sure there are no inconsistency with other MDs.
+        """
+        # Get the structure form the reference MD
+        reference_structure = self.reference_md.structure
+        # Get the rest of MDs
+        other_mds = [md for md in self.mds if md is not self.reference_md]
+        if len(other_mds) == 0: return reference_structure
+        # Set a generic error message to be displayed as a tail in different scenarios
+        error_message_tail = ' All replicas in the same project must have identical systems.\n' + \
+            ' If you have different systems please consider arranging a different project for each system.'
+        # Iterate other MDs and make sure their structures match in a set of fields we expect to be constant
+        # Note that other MDs may be based in different input structure and input topology files
+        for other_md in other_mds:
+            if other_md == REMOVED_MD: continue
+            other_structure = other_md.structure
+            # If the structure is literally the same then skip the check
+            # This means this MD is using the same input files as the reference MD thus using as well the same structure
+            if other_structure is reference_structure: continue
+            # Set a generic error message to be displayed as a header in different scenarios
+            error_message_header = f'The structure in MD "{other_md.name}" does not match the structure in the reference MD "{self.reference_md.name}".\n'
+            # Make sure the number of atoms, residues and chains match
+            if reference_structure.atom_count != other_structure.atom_count:
+                raise InputError(error_message_header + f' The structure has {other_structure.atom_count} atoms while the reference structure has {reference_structure.atom_count} atoms".\n' + error_message_tail)
+            if reference_structure.residue_count != other_structure.residue_count:
+                raise InputError(error_message_header + f' The structure has {other_structure.residue_count} residues while the reference structure has {reference_structure.residue_count} residues".\n' + error_message_tail)
+            if reference_structure.chain_count != other_structure.chain_count:
+                raise InputError(error_message_header + f' The structure has {other_structure.chain_count} chains while the reference structure has {reference_structure.chain_count} chains".\n' + error_message_tail)
+            # Compare atoms one by one
+            for reference_atom, other_atom in zip(reference_structure.atoms, other_structure.atoms):
+                for field in ['name', 'element', 'residue_index']:
+                    if safe_getattr(reference_atom, field) == safe_getattr(other_atom, field): continue
+                    raise InputError(error_message_header + f' Atom {other_atom.label} does not match the reference atom {reference_atom.label} in the field "{field}".\n' + error_message_tail)
+            # Compare residues one by one
+            for reference_residue, other_residue in zip(reference_structure.residues, other_structure.residues):
+                for field in ['name', 'number', 'icode', 'chain_index']:
+                    if safe_getattr(reference_residue, field) == safe_getattr(other_residue, field): continue
+                    raise InputError(error_message_header + f' Residue {other_residue.label} does not match the reference residue {reference_residue.label} in the field "{field}".\n' + error_message_tail)
+            # Compare chains one by one
+            for reference_chain, other_chain in zip(reference_structure.chains, other_structure.chains):
+                for field in ['name']:
+                    if safe_getattr(reference_chain, field) == safe_getattr(other_chain, field): continue
+                    raise InputError(error_message_header + f' Chain {other_chain.name} does not match the reference chain {reference_chain.name} in the field "{field}".\n' + error_message_tail)
+            # Compare other structure properties
+            # Compare atom bonds
+            for atom_index, (reference_atom_bonds, other_atom_bonds) in enumerate(zip(reference_structure.bonds, other_structure.bonds)):
+                # Missing bonds only match other missing bonds
+                if reference_atom_bonds is MISSING_BONDS or other_atom_bonds is MISSING_BONDS:
+                    if reference_atom_bonds is other_atom_bonds: continue
+                elif set(reference_atom_bonds) == set(other_atom_bonds): continue
+                missmatch_atom = reference_structure.atoms[atom_index]
+                raise InputError(error_message_header + f' Atom bonds do not match: {missmatch_atom.label} -> {other_atom_bonds} while in the reference structure is {reference_atom_bonds}.\n' + error_message_tail)
+        # If we made it this far then there are not inconsistencies between structure
+        return reference_structure
+    structure = property(get_structure, None, None, "Parsed structure from the reference MD (read only)")
+
+    def get_snapshots(self) -> int:
+        """Get the reference MD snapshots."""
+        return self.reference_md.snapshots
+    snapshots = property(get_snapshots, None, None, "Reference MD snapshots (read only)")
+
+    def get_simulation_box(self) -> Optional[tuple | str]:
+        """Get the reference MD simulation box vectors, or 'dyn' if the box is dynamic."""
+        return self.reference_md.simulation_box
+    simulation_box = property(get_simulation_box, None, None, "Reference MD simulation box vectors, or 'dyn' if dynamic (read only)")
+
+    def get_reference_simulation_box_data(self) -> tuple:
+        """Get the reference MD simulation box data.
+        It has a different name than in the MD so MDs can compare their box with the reference MD box."""
+        return self.reference_md.simulation_box_data
+    reference_simulation_box_data = property(get_reference_simulation_box_data, None, None, "Reference MD simulation box data (read only)")
+
+    def get_simulation_box_size(self) -> Optional[tuple]:
+        """Get the reference MD simulation box size."""
+        return self.reference_md.simulation_box_size
+    simulation_box_size = property(get_simulation_box_size, None, None, "Reference MD simulation box size (read only)")
+
+    def check_is_simulation_box_constant(self) -> Optional[bool]:
+        """Check if the reference MD simulation box is constant (True) or dynamic (False)."""
+        return self.reference_md.is_simulation_box_constant
+    is_simulation_box_constant = property(check_is_simulation_box_constant, None, None, "Whether the reference MD simulation box is constant or dynamic (read only)")
+
+    def check_is_simulation_box_orthogonal(self) -> Optional[bool]:
+        """Check if the reference MD simulation box is orthogonal (True) or triclinic (False)."""
+        return self.reference_md.is_simulation_box_orthogonal
+    is_simulation_box_orthogonal = property(check_is_simulation_box_orthogonal, None, None, "Whether the reference MD simulation box is orthogonal (read only)")
+
+    def get_simulation_box_shape(self) -> Optional[str]:
+        """Get the reference MD simulation box shape."""
+        return self.reference_md.simulation_box_shape
+    simulation_box_shape = property(get_simulation_box_shape, None, None, "Reference MD simulation box shape (read only)")
+
+    def get_universe(self) -> int:
+        """Get the MDAnalysis Universe from the reference MD."""
+        return self.reference_md.universe
+    universe = property(get_universe, None, None, "MDAnalysis Universe object (read only)")
+
+    def get_processed_interactions(self) -> dict:
+        """Get the processed interactions from the reference replica, which are the same for all replicas."""
+        return self.reference_md.interactions
+    interactions = property(get_processed_interactions, None, None, "Processed interactions (read only)")
+
+    # DANI: Arreglo cutre para que las cosas funcionen
+    def get_charges(self):
+        return self.reference_md.charges
+    charges = property(get_charges, None, None, "Atom charges (read only)")
+
+    def get_md_charges(self):
+        return [md.charges for md in self.mds]
+    md_charges = property(get_md_charges, None, None, "Atom charges from each MD (read only)")
+
+    # Note that the PBC selection may be different in every MD so there is no project PBC selection
+    def get_md_pbc_selections(self) -> list['Selection']:
+        return [None if md is REMOVED_MD else md.pbc_selection for md in self.mds]
+    md_pbc_selections = property(get_md_pbc_selections, None, None, "Periodic boundary conditions atom selection from each MD (read only)")
+
+    # Topology reader (early stage)
+    get_topology_reader = MD.get_topology_reader
+    topology_reader = property(get_topology_reader, None, None, "Topology reader (read only)")
+    # Dihedrals
+    get_dihedrals = MD.get_dihedrals
+    dihedrals = property(get_dihedrals, None, None, "Topology dihedrals (read only)")
+
+    def get_populations(self) -> Optional[list[float]]:
+        """Get the equilibrium populations from a MSM."""
+        # If we already have a stored value then return it
+        if self._populations is not MISSING_VALUE:
+            return self._populations
+        # Otherwise we must find the value
+        if not self.populations_file:
+            return None
+        self._populations = read_file(self.populations_file)
+        return self._populations
+    populations = property(get_populations, None, None, "Equilibrium populations from a MSM (read only)")
+
+    def get_transitions(self) -> Optional[list[list[float]]]:
+        """Get the transition probabilities from a MSM."""
+        # If we already have a stored value then return it
+        if self._transitions is not MISSING_VALUE:
+            return self._transitions
+        # Otherwise we must find the value
+        if not self.transitions_file:
+            return None
+        self._transitions = read_file(self.transitions_file)
+        return self._transitions
+    transitions = property(get_transitions, None, None, "Transition probabilities from a MSM (read only)")
+
+    def get_pdb_ids(self) -> list[str]:
+        """Get the tested and standardized PDB ids."""
+        # If we already have a stored value then return it
+        if self._pdb_ids is not MISSING_VALUE:
+            return self._pdb_ids
+        # Otherwise test and standarize input PDB ids
+        self._pdb_ids = []
+        # If there is no input pdb ids (may be None) then stop here
+        if not self.input_pdb_ids:
+            return []
+        # If input PDB ids is a string instead of a list then fix it
+        input_pdb_ids = self.input_pdb_ids
+        if type(input_pdb_ids) is str:
+            input_pdb_ids = [input_pdb_ids]
+        # Iterate input PDB ids
+        # Note that the PDB id format is already validated on input
+        for input_pdb_id in input_pdb_ids:
+            # Make letters upper
+            pdb_id = input_pdb_id.upper()
+            self._pdb_ids.append(pdb_id)
+        return self._pdb_ids
+    pdb_ids = property(get_pdb_ids, None, None, "Tested and standarized PDB ids (read only)")
+
+    # Prepare the PDB references file to be uploaded to the database
+    get_pdb_references = Task('pdbs', 'Prepare PDB references',
+        prepare_pdb_references, output_filenames={'pdb_references_file': PDB_REFERENCES_FILENAME})
+    pdb_references_file = get_pdb_references.get_output_file_getter('pdb_references_file')
+    pdb_references = property(get_pdb_references, None, None, "PDB references (read only)")
+
+    # Map the structure aminoacids sequences against the Uniprot reference sequences
+    get_protein_map = Task('protmap', 'Protein residues mapping', generate_protein_mapping,
+        output_filenames={'protein_references_file': PROTEIN_REFERENCES_FILENAME})
+    protein_map = property(get_protein_map, None, None, "Protein residues mapping (read only)")
+
+    # Define the output file of the protein mapping including protein references
+    get_protein_references_file = get_protein_map.get_output_file_getter('protein_references_file')
+    protein_references_file = property(get_protein_references_file, None, None, "File including protein refereces data mined from UniProt (read only)")
+
+    get_chain_references = Task('chains', 'Chain references', prepare_chain_references,
+        output_filenames={'chains_references_file': OUTPUT_CHAINS_FILENAME})
+
+    get_inchikeys = Task('inchikeys', 'InChI keys residues mapping', generate_inchikeys)
+    inchikeys = property(get_inchikeys, None, None, "InChI keys (read only)")
+
+    get_lipid_references = Task('lipmap', 'Lipid references', generate_lipid_references)
+    lipid_references = property(get_lipid_references, None, None, "Lipid references (read only)")
+
+    get_membrane_map = Task('memmap', 'Membrane residues mapping', generate_membrane_mapping,
+        output_filenames={'output_file': MEMBRANE_MAPPING_FILENAME})
+    membrane_map = property(get_membrane_map, None, None, "Membrane mapping (read only)")
+
+    get_ligand_references = Task('ligmap', 'Ligand residues mapping', generate_ligand_references)
+    ligand_references = property(get_ligand_references, None, None, "Ligand references (read only)")
+
+    get_inchi_references = Task('inchimap', 'InChI references', generate_inchi_references,
+        output_filenames={'output_file': INCHIKEY_REFERENCES_FILENAME})
+    inchikey_map = property(get_inchi_references, None, None, "InChI references (read only)")
+
+    # Build the residue map from both proteins and ligands maps
+    # This is formatted as both the standard topology and metadata producers expect them
+    get_residue_map = Task('resmap', 'Residue mapping', generate_residue_mapping)
+    residue_map = property(get_residue_map, None, None, "Residue map (read only)")
+
+    # Find which polymer chains are in contact (and base paired) along the trajectory
+    get_chain_contacts = Task('chaincons', 'Chain contacts', get_chain_contacts)
+    chain_contacts = property(get_chain_contacts, None, None, "Polymer chain contacts along the trajectory (read only)")
+
+    # Prepare the project metadata file to be upload to the database
+    prepare_metadata = Task('pmeta', 'Prepare project metadata',
+        prepare_project_metadata, output_filenames={'output_file': OUTPUT_METADATA_FILENAME})
+
+    # Prepare the standard topology file to be uploaded to the database
+    prepare_standard_topology = Task('stopology', 'Standard topology file', generate_topology)
+    get_standard_topology_file = prepare_standard_topology.get_output_file_getter('output_file')
+    standard_topology_file = property(get_standard_topology_file, None, None, "Standard topology filename (read only)")
+
+    # Get a screenshot of the system
+    get_screenshot_filename = Task('screenshot', 'Screenshot file',
+        get_project_screenshot, output_filenames={'output_file': OUTPUT_SCREENSHOT_FILENAME})
+    screenshot_filename = property(get_screenshot_filename, None, None, "Screenshot filename (read only)")
+
+    # Provenance data
+    produce_provenance = Task('aiidata', 'Produce provenance', produce_provenance)
+
+    def get_warnings(self) -> list:
+        """Get the warnings.
+
+        The warnings list should not be reasigned, but it was back in the day.
+        To avoid silent bugs, we read it directly from the register every time.
+        """
+        return self.register.warnings
+    warnings = property(get_warnings, None, None, "Project warnings to be written in metadata")
+
+    def get_register(self) -> 'Register':
+        """Get the project register.
+
+        It is not created on init since creating it writes a new entry in the register file.
+        This way commands which only read the project (e.g. 'mwf ds view') do not leave a trace.
+        """
+        if self._register is None:
+            self._register = Register(File(self.pathify(REGISTER_FILENAME)))
+        return self._register
+    register = property(get_register, None, None, "Tracks project workflow runs, test results and warnings")
+
+
+# AUXILIAR FUNCTIONS ---------------------------------------------------------------------------
+
+# DANI: En cuanto se concrete el formato de los markov esta función no hará falta
+def read_file(target_file: File) -> dict:
+    """Set a function to read a file which may be in different formats."""
+    # Get the file format
+    file_format = target_file.filename.split('.')[-1]
+    # Read numpy files
+    if file_format == 'npy':
+        return numpy.load(target_file.path)
+    # Read JSON files
+    if file_format == 'json':
+        return load_json(target_file.path)
+
+# RUBEN: not used, borrar?
+def check_md_directory(directory: str):
+    """Check for problematic characters in a directory path."""
+    # Remove problematic characters
+    directory_characters = set(directory)
+    for character in FORBIDDEN_DIRECTORY_CHARACTERS:
+        if character in directory_characters:
+            raise InputError(f'Directory path "{directory}" includes the forbidden character "{character}"')
+
+
+# Project input files
+project_input_files = {
+    'itopology': Project.get_input_topology_file,
+    'inputs': Project.get_inputs_file,
+    'populations': Project.get_populations_file,
+    'transitions': Project.get_transitions_file
+}
+# MD input files
+md_input_files = {
+    'istructure': MD.get_input_structure_file,
+    'itrajectory': MD.get_input_trajectory_files
+}
+# Both project and MD input files
+input_files = {**project_input_files, **md_input_files}
+
+# Project processed files
+project_processed_files = {
+    'topology': Project.get_topology_file,
+    'autin': Project.autofill_inputs,
+}
+# MD processed files
+md_processed_files = {
+    'structure': MD.get_structure_file,
+    'trajectory': MD.get_trajectory_file
+}
+# Both project and MD processed files
+processed_files = {**project_processed_files, **md_processed_files}
+
+# Project requestable tasks
+project_requestables = {
+    **project_input_files,
+    **project_processed_files,
+}
+# Add available tasks to project requestables
+for callable in vars(Project).values():
+    if isinstance(callable, Task): project_requestables[callable.flag] = callable
+# MD requestable tasks
+md_requestables = {
+    **md_input_files,
+    **md_processed_files,
+}
+# Add available tasks to project requestables
+for callable in vars(MD).values():
+    if isinstance(callable, Task): md_requestables[callable.flag] = callable
+# Requestables for the console
+# Note that this constant is global
+requestables = {**project_requestables, **md_requestables}
+
+
+class TaskResolver:
+    """Resolves which tasks should run based on include/exclude/overwrite flags."""
+
+    # Dependency flag groups
+    DEPENDENCY_FLAGS = {
+        'download': list(input_files.keys()),
+        'setup': list(processed_files.keys()),
+        'meta': ['pmeta', 'mdmeta'],
+        'network': ['resmap', 'ligmap', 'lipmap', 'chains', 'pdbs', 'memmap'],
+        'minimal': ['pmeta', 'mdmeta', 'stopology'],
+        'interdeps': ['inter', 'pairwise', 'hbonds', 'energies', 'perres', 'clusters', 'dist'],
+        'membs': ['memmap', 'density', 'thickness', 'apl', 'lorder', 'linter', 'channels']
+    }
+    # Default analyses to be run when no task is specified
+    DEFAULT_ANALYSES = [
+        'clusters', 'dist', 'energies', 'hbonds', 'pca', 'pockets',
+        'rgyr', 'rmsds', 'perres', 'pairwise', 'rmsf', 'sas', 'tmscore',
+        'density', 'thickness', 'apl', 'lorder', 'linter'
+    ]
+
+    DEFAULT_PROJECT_TASKS = ['stopology', 'screenshot', 'pmeta', 'pdbs', 'chains']
+    DEFAULT_MD_TASKS = ['inpro', 'mdmeta', 'inter']
+
+    def __init__(
+        self,
+        include: Optional[list[str]] = None,
+        exclude: Optional[list[str]] = None,
+        overwrite: Optional[list[str] | bool] = None,
+        download: bool = False,
+        setup: bool = False,
+    ):
+        """Initialize the task resolver."""
+        if include and exclude:
+            raise InputError('Include (-i) and exclude (-e) are not compatible. Use one of these options.')
+
+        self.project_requestables = project_requestables
+        self.md_requestables = md_requestables
+        self.include = include
+        self.exclude = exclude
+        self.overwrite = overwrite
+        self.download = download
+        self.setup = setup
+
+        self._tasks: Optional[list[str]] = None
+        self._overwritables: Optional[set[str]] = None
+
+    def _expand_dependency_flags(self, flags: list[str]) -> list[str]:
+        """Expand special group flags into their individual tasks."""
+        expanded = set()
+        for flag in flags:
+            if flag in self.DEPENDENCY_FLAGS:
+                expanded.update(self.DEPENDENCY_FLAGS[flag])
+            else:
+                expanded.add(flag)
+        return list(expanded)
+
+    @property
+    def tasks(self) -> list[str]:
+        """Get the resolved list of tasks to run."""
+        if self._tasks is not None:
+            return self._tasks
+
+        if self.download:
+            warn('The "-d" or "--download" argument is deprecated. Please use "-i download" instead.')
+            self._tasks = list(input_files.keys())
+        elif self.setup:
+            warn('The "-s" or "--setup" argument is deprecated. Please use "-i setup" instead.')
+            self._tasks = list(processed_files.keys())
+        elif self.include and len(self.include) > 0:
+            self._tasks = self._expand_dependency_flags(self.include)
+        else:
+            # Default tasks
+            self._tasks = [
+                *self.DEFAULT_PROJECT_TASKS,
+                *self.DEFAULT_MD_TASKS,
+                *self.DEFAULT_ANALYSES,
+            ]
+            if self.exclude and len(self.exclude) > 0:
+                excluded = self._expand_dependency_flags(self.exclude)
+                # Remove excluded tasks
+                self._tasks = [t for t in self._tasks if t not in excluded]
+
+        return self._tasks
+
+    @property
+    def overwritables(self) -> set[str]:
+        """Get the set of tasks that should overwrite existing outputs."""
+        if self._overwritables is not None:
+            return self._overwritables
+
+        # If the user requested to overwrite something, make sure it is in the tasks list
+        # Update the overwritable variable with the requested overwrites
+        self._overwritables = set()
+        if self.overwrite:
+            # If the overwrite argument is simply true then add all requestables to the overwritable
+            if isinstance(self.overwrite, bool):
+                self._overwritables = set(self.tasks)
+            # If the overwrite argument is a list of tasks then iterate them
+            elif isinstance(self.overwrite, list):
+                for task in self.overwrite:
+                    # Make sure the task to be overwriten is among the tasks to be run
+                    if task not in self.tasks:
+                        self.tasks.append(task)
+                    self._overwritables.add(task)
+            else:
+                raise ValueError('Not supported overwrite type')
+
+        return self._overwritables
+
+    @property
+    def project_tasks(self) -> list[str]:
+        """Get tasks that apply to the project level."""
+        return [t for t in self.tasks if t in self.project_requestables]
+
+    @property
+    def md_tasks(self) -> list[str]:
+        """Get tasks that apply to individual MDs."""
+        return [t for t in self.tasks if t in self.md_requestables]
+
+    def get_project_overwritables(self) -> set[str]:
+        """Get overwritables for project-level tasks."""
+        # Get the overwritables first, since they add overwritten tasks which are not run by default (e.g. memmap)
+        overwritables = self.overwritables
+        return set(t for t in self.project_tasks if t in overwritables)
+
+    def get_md_overwritables(self) -> set[str]:
+        """Get overwritables for MD-level tasks."""
+        overwritables = self.overwritables
+        return set(t for t in self.md_tasks if t in overwritables)
+
+
+class ErrorHandling:
+    """Class to handle errors during workflow execution."""
+
+    # Class-level attribute to collect MD errors across all instances
+    md_errors: list[tuple[str, str]] = []
+
+    def __init__(self,
+        cache: 'Cache',
+        keep_going: bool = False,
+        dataset: Dataset = None,
+        clear_register: bool = False,
+    ):
+        """Initialize the error handling."""
+        self.cache = cache
+        self.uuids = {'uuid': cache.retrieve('uuid'),
+                      'project_uuid': cache.retrieve('project_uuid')}
+        self.is_md = True if self.uuids.get('project_uuid') else False
+        self.dir = cache.file.basepath
+        self.keep_going = keep_going
+        # Make the update function with partial so we do not have to repeat parameters
+        self.bind_dataset(dataset)
+        self.register = []
+        if clear_register:
+            ErrorHandling.md_errors.clear()
+
+    def bind_dataset(self, dataset: Dataset | None):
+        """Bind a dataset update function to the error handler."""
+        if dataset:
+            rel_path = dataset._abs_to_rel(self.dir)
+            if not dataset.get_uuid_status(**self.uuids):
+                # The cache UUID is not registered, which happens when the cache was deleted and regenerated
+                # If this directory is already registered then recover its UUID instead of replacing the entry
+                registered = dataset.get_registered_uuids(rel_path, is_md=self.is_md)
+                if registered:
+                    uuid, project_uuid = registered
+                    self.cache.update('uuid', uuid)
+                    if self.is_md: self.cache.update('project_uuid', project_uuid)
+                    self.uuids = {'uuid': uuid, 'project_uuid': project_uuid}
+            self.update_state = partial(dataset.update_status,
+                                        rel_path=rel_path,
+                                        **self.uuids)
+            if not dataset.get_uuid_status(**self.uuids):
+                # If no status is available, add a new entry
+                self.update_state(state=State.NEW, message='No information recorded yet.')
+        else:
+            # If no dataset is available, use a null function
+            self.update_state = lambda *args, **kwargs: None
+
+    def __enter__(self):
+        """Enter the context manager."""
+        # Update project status to running on entering the context.
+        self.update_state(state=State.RUNNING, message='Running workflow...')
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Exit the context manager."""
+        # The inputs file was updated and the workflow is to be relaunched, so this is not an error
+        if exc_type and issubclass(exc_type, InputsUpdated):
+            self.update_state(state=State.RUNNING, message='Relaunching workflow after updating the inputs file')
+            return False
+        if exc_type and issubclass(exc_type, Exception):
+            error = exc_value.__class__.__name__ + ': ' + str(exc_value)
+            self.update_state(state=State.ERROR, message=error)
+            if self.is_md and self.keep_going:
+                # Record error to print at the end of the run and continue
+                ErrorHandling.md_errors.append((self.dir, error))
+                print(error)
+                return True  # Suppress exception
+        else:
+            self.update_state(state=State.DONE, message='Done!')
+        return False  # Do not suppress other exceptions
+
+
+def workflow(
+    project_parameters: dict = {},
+    download: bool = False,
+    setup: bool = False,
+    include: Optional[list[str]] = None,
+    exclude: Optional[list[str]] = None,
+    overwrite: Optional[list[str] | bool] = None,
+    dataset_path: Optional[str] = None,
+    keep_going: bool = False
+):
+    """Run the MDDB workflow.
+
+    Args:
+        project_parameters (dict): Parameters to initiate the project.
+        download (bool): (Deprecated: use -i download) If passed, only download required files. Then exits.
+        setup (bool): (Deprecated: use -i setup) If passed, only download required files and run mandatory dependencies. Then exits.
+        include (list[str] | None): Set the unique analyses or tools to be run while all other steps will be skipped. If not passed, all default analyses will be run.
+        exclude (list[str] | None): List of analyses or tools to be skipped. All other steps will be run. Note that if we exclude a dependency of something else then it will be run anyway.
+        overwrite (list[str] | bool | None): List of tasks that will be re-run, overwriting previous output files. Use this flag alone to overwrite everything.
+        dataset_path (str | None): Path to the dataset where to register the workflow status.
+        keep_going (bool): If True, continue to the next MD if a task fails. Project tasks still stop on errors. Default is False.
+
+    """
+    # If the inputs file is changed during the run to fix a failed test then run the workflow again
+    # This does not repeat forever since every change is done once:
+    # every time a new fragment is added to the PBC selection, and the automatic image is set to true only once
+    while True:
+        try:
+            return run_workflow(project_parameters, download, setup, include, exclude, overwrite, dataset_path, keep_going)
+        except InputsUpdated as update:
+            print(f'\n{update}')
+            print(f'{CYAN_HEADER} Relaunching the workflow with the new inputs {COLOR_END}')
+
+
+def run_workflow(
+    project_parameters: dict,
+    download: bool,
+    setup: bool,
+    include: Optional[list[str]],
+    exclude: Optional[list[str]],
+    overwrite: Optional[list[str] | bool],
+    dataset_path: Optional[str],
+    keep_going: bool,
+):
+    """Run the MDDB workflow once. See the workflow function for the arguments."""
+    # Print workflow header
+    git_version = get_git_version()
+    print(f'\n{CYAN_HEADER}Running MDDB workflow ({git_version}){COLOR_END}')
+    # Store the working directory in the cache, for those auxiliar functions which may not have the context
+    project_directory = project_parameters.get('directory', '.')
+    GLOBALS['working_directory'] = project_directory
+    # Early creation of the cache and dataset to be able to register initialization errors
+    cache = Project.create_cache(project_directory)
+    dataset = Dataset(dataset_path) if dataset_path else None
+    with ErrorHandling(cache, keep_going, dataset) as error_handler:
+        # Initiate the project
+        project = Project(**project_parameters)
+        project_directory_label = project.directory
+        if project_directory_label == '.':
+            project_directory_label = 'current directory'
+        # Take dataset_path inputs file (CLI has preference)
+        if not dataset and project.input_dataset:
+            dataset = Dataset(project.input_dataset)
+            error_handler.bind_dataset(dataset)
+
+        print(f'Processing project at {project_directory_label}')
+        print(f'  {len(project.mds)} MDs are to be run')
+
+        # Set the tasks to be run
+        tasker = TaskResolver(
+            include=include,
+            exclude=exclude,
+            overwrite=overwrite,
+            download=download,
+            setup=setup,
+        )
+        # The grid-free energies engine needs numba, which older environments lack, so check it before any task runs
+        if project.energies_engine == 'gridfree' and 'energies' in tasker.tasks:
+            check_gridfree_requirements()
+        # Set overwritables
+        project.overwritables = tasker.get_project_overwritables()
+        for md in project.mds:
+            md.overwritables = tasker.get_md_overwritables()
+        # Create the registers now so every run is recorded, even if no task uses them
+        project.register
+        for md in project.mds:
+            if md != REMOVED_MD: md.register
+
+    # Run the project tasks and MD tasks as per the task resolver.
+    t0 = time.time()
+    with ErrorHandling(project.cache, keep_going, dataset, clear_register=True) as error_handler:
+        for task in tasker.project_tasks:
+            # Get the function to be called and call it
+            getter = requestables[task]
+            getter(project)
+
+        # Now iterate over the different MDs
+        if len(tasker.md_tasks) == 0:
+            print(f'\n{CYAN_HEADER} No MD tasks to run, skipping MD processing {COLOR_END}')
+        else:
+            for md in project.mds:
+                # If it is a removed MD then we must handle it apart
+                if md == REMOVED_MD: continue
+                print(f'\n{CYAN_HEADER} Processing MD at {md.directory}{COLOR_END}')
+                error_handler.update_state(state=State.RUNNING, message=f'Processing MD at {md.directory}')
+                # Run the MD tasks
+                with ErrorHandling(md.cache, keep_going, dataset):
+                    for task in tasker.md_tasks:
+                        # Get the function to be called and call it
+                        getter = requestables[task]
+                        getter(md)
+                # Remove gromacs backups and other trash files from this MD
+                remove_trash(md.directory)
+
+            # Remove gromacs backups and other trash files from the project
+            remove_trash(project.directory)
+    t = time.time() - t0
+    print(f'\n{CYAN_HEADER} Workflow finished in {t/60:.2f} minutes {COLOR_END}')
+
+    if ErrorHandling.md_errors and len(project.mds) > 1:
+        # If there is more than one replica with errors that may being hidden by the others working fine
+        print(f'\n{RED_HEADER}Finished with errors in MD replicas:{COLOR_END}')
+        for md_dir, error_msg in ErrorHandling.md_errors:
+            print(f'  - MD at {md_dir}: {error_msg}')
+        print('The rest of MD replicas were processed successfully.')
+    else:
+        print("Done!")

@@ -1,0 +1,114 @@
+# Changelog
+
+- 2026-11-20: Fix model paths in self-contained reports of cleaned runs - Issue #1785
+- 2026-11-17: Replaced the NGL viewer of the analysis report by the Mol* viewer (styles, side chains, surfaces), with sortable plain HTML
+  tables - Issue #1779
+- 2026-11-19: Added mybinder option to launch the notebooks
+- 2026-11-15: Updated the `deeprank` module to deeprank-gnn-esm 2.0.2 with all interfaces scored, models are ranked by the mean (default), minimum or one chain pair predicted fnat  - Issue #1671
+- 2026-11-15: Ensure that only CNS-related jobs are sent to the grid - Issue #1765
+- 2026-11-15: More efficient grid job polling - Issue #1766
+- 2026-11-15: Proper cleaning of grid /tmp directories - Issue #1771
+- 2026-11-15: Added retrial when dirac communication fails - Issue #1769
+- 2026-11-14: Modified the packaging of jobs for grid submission - Issue #1768
+- 2026-10-28: Added check to detect insertion codes and return an error message - Issue #1746
+- 2026-10-28: Turned true by default the generation of ligand topo/param files - Issue #1743
+- 2026-10-27: Fixed traceback when running caprieval with multimodel reference pdb - Issue #1737
+- 2026-10-26: Improved the consistency of CNS scripts across modules - Issue #1729
+- 2026-10-25: Removed the duplicate `B1S`, `B1SL` and `A1SL` PRESidue definitions from `carbohydrate.top` that CNS reported as `RTFRDR-ERR` on every topology read - Issue #1717
+- 2026-10-25: Made the `timestep` parameter of `mdref` and `mdscoring` effective; the CNS scripts hardcoded `timest=0.002` - Issue #1680
+- 2026-10-23: Specify usage of charset utf-8 when generating a plotly figure - Issue #1734
+- 2026-10-17: Added python script to automate regressions tests using the examples - Issue #1731
+- 2026-10-14: Corrected the restraints definition in contactairs - Issue #1727
+- 2026-10-13: Lowered the CG nucleic acid chain break cutoff from 10 to 6 Å to detect single missing nucleotide - Issue #1722
+- 2026-10-13: Fixed nucleobase selection for DNA default caprieval - Issue #1658
+- 2026-10-13: Made CG DNA/RNA base ring angles consistent with the ring bonds (deviating from original Martini values) - PR #1721
+- 2026-10-12: Corrected adenine CG parameters - issue #1720
+- 2026-10-13: Caps the number of core used for the cleaning - Issue #1708
+- 2026-10-11: Updated h-bond detection for DNA/RNA in both AA and CG modes and added Hoogsteen pairs detections - Issue #1659
+- 2026-09-23: Adapted the memory estimate of the contactmap module - Issue #1699
+- 2026-10-11: Removed the dead backwards `A23a`/`A26a` sialylation detection loops from `bondglycans.cns` - Issue #1711
+- 2026-10-11: Updated glycans linkage scripts - Issue #1714
+- 2026-10-11: Fixed the martinise library (libaa2cg) to make it deterministic - Issue #1657
+- 2026-10-03: Corrected mislabelled A2G glycan and fixed some parameters - Issue #1709
+- 2026-10-02: Corrected ssdihed: range for automatic alpha/beta dihedrals and the definition in yaml - Issue #1668 
+- 2026-09-23: Fixed various issues in notebooks - Issue #1697
+- 2026-09-21: Corrected seperate.cns - Issue #1392
+- 2026-09-18: Added `dnascan` module for mutagenesis scanning of DNA base pairs - Issue #1634
+- 2026-09-17: Implemented worflow validation again general parameters - Issue #1693
+- 2026-09-09: Adding missing execution modes to default.yaml - Issue #1690
+- 2026-09-02: Fixed identical seed per sampling_factor replica in flexref, mdref and emref - Issue #1685
+- 2026-08-10: Added missing improper for HYP - Issue #1662
+- 2026-08-05: Removed identical duplicate `ANGLe` statements from `protein-allhdg5-4.param` and `protein-CG-Martini-2-2.param` - Issue #1589
+- 2026-08-05: Harmonised running mode of test config files - Issue #1655
+- 2026-08-04: Added workflow module ordering validation - related to Issue #1530
+- 2026-08-02: Fixed logging/warning leaks - Issue #1647
+- 2026-08-01: Fixed autotoppar/PRODRG topology generation when the unknown ligand is embedded in a larger system - Issue #1645
+- 2026-07-31: Fixed D-amino acid detection - Issue #1636
+- 2026-07-31: Fixed topocg issue removing ligands - Issue #1638
+- 2026-07-27: Added `rnascan` module for mutagenesis scanning of RNA bases (mutating interface nucleotides to A, C, G, U) - Issue #1631
+- 2026-07-22: Added protein-DNA docking Jupyter notebook
+- 2026-07-21: Fixed `gen_archive=true` crash (`Directory not empty`) on non-local filesystems (NFS, gcsfuse/s3fs, overlayfs) - Issue #1626
+- 2026-07-13: Added option to select models/clusters in reverse order - Issue #1620
+- 2026-07-10: Corrected ranking in caprieval for reverse sorting - Issue #1621
+- 2026-07-09: Added `deeprank` scoring module using deeprank-gnn-esm - Issue #569
+- 2026-07-07: Re-add `gdock` as a sampling module
+- 2026-07-02: Added support 1-O-methyl-2-N-Acetyl-alpha-D-galactopyranose (NGM) - Issue #1608
+- 2026-07-01: Removed unused guard for “previous module produced iterable” - Issue #1604
+- 2026-06-30: Added caprifilter module, moved shared capri calculation to libcapri - Issue #1550
+- 2026-06-29: Added support 1-O-methyl-2-N-Acetyl-alpha-D-glucopyranose (NAA) - Issue #1593
+- 2026-06-29: Fixed the cgtoaa reading to cg-to-aa restraints - Issue #1592
+- 2026-06-26: Corrected net charge for O1-methylated NAM - Issue #1586
+- 2026-06-18: Added support for O1-methylated NAG - Issue #1579
+- 2026-06-18: Added support for O-glycosylated serine - Issue #1577
+- 2026-06-14: Dropped support for Python 3.9, minimum required version is now 3.10
+- 2026-06-11: Cosmetic fix in support of custom symmetry restraints - Issue #1563
+- 2026-06-07: Avoid potential double cyclic bonds in ACE-CYS cyclisation - Issue #1564
+- 2026-06-04: Added support for glucosamine (GCS) - Issue $1559
+- 2026-05-02: Fixed autoflex issue with solvent - Issue #1551
+- 2026-05-01: Allows for CG-based scoring workflows - Issues #1546, #1547, #1548
+- 2026-04-30: Fixes ligand ensemble topo/param files - Issue #1540
+- 2026-04-24: Exposing distance cutoff for ACE-CYS cyclisation - Issue #1535
+- 2026-04-23: Merging the coarse-graining branch into the main branch.
+- 2026-04-13: Fixed issue with shape in cgtoa module and added shape docking example
+- 2026-04-16: Added control of hydrogen building in topoaa - Issue #1522
+- 2026-04-15: Implemented separate control of separation and randome rotations of molecules - Issue #1491
+- 2026-04-15: Solve bug related to workflow restarting without analysis folder - Issue #1518
+- 2026-04-14: Increase max number of timesteps in openmm module - BioExcel forum 6072
+- 2026-04-12: Add possibility to run MD (mdref, mdscoring) without solvent - Issue #1512
+- 2026-04-10: Corrected the definition of ion restraints in flexref - Issue #1510
+- 2026-04-10: Removing analysis modules downstream when restarting - Issue #1495
+- 2026-04-08: Improved docstring in modules
+- 2026-04-08: Increased NOE restraints array size in scoring modules - Issue #1501
+- 2026-03-30: Added nucleosome-PCR1 CG docking example
+- 2026-03-09: Automated type casting for optional argument seed in haddock3-restraints random_removal - Issue #1485
+- 2026-02-28: Switched to ilRMSD clustering from protein-ligand examples - Issue #1481
+- 2026-02-24: Implement automated toppar generation for unknown atoms with PRODRG
+- 2026-02-20: Add fallback routine to use `Scheduler` if the GRID is not available
+- 2025-12-19: Implemented support for custom symmetry restaints - Issue #1465
+- 2025-12-15: Added missing NGA glycan parameters - Issue #1462
+- 2025-11-25: Simplify the use of multiple ambig archives
+- 2025-11-19: Corrected CNS verbosity settings - Issue #1446
+- 2025-11-19: Added zinc-finger docking example, related to Issue #1445
+- 2025-11-19: Corrected flexref module for Issue #1445
+- 2025-11-17: Added possibility to use alascan with ligands - Issue #1411
+- 2025-10-22: Allow the definition of chain combinations to be used for scoring - Issue #1414
+- 2025-09-11: Added `grid` mode
+- 2025-09-11: Corrected antibody-antigen notebook - Issue #1383
+- 2025-09-09: Removes undesired directory created when running the uni-tests - Issue #1380
+- 2025-09-09: Added notebooks with tutorials - Issue #1367
+- 2025-09-05: Consistancy in cluster naming in contactmap module - Issue #1359
+- 2025-09-03: Added support for THR-glycosylation - Issue #1371
+- 2025-08-25: Distribute the `haddock-restraints` binary
+- 2025-08-22: Added check for max/min possible coordinates in CNS scripts - Issue #1350
+- 2025-08-17: Combined bumps of packages version (coverage, hypothesis, pytest-random-order and kaleido)
+- 2025-08-06: Adding guardrail in rigidbody module when no restraints provided - Issue #1345
+- 2025-08-08: Allow to generate cluster with clustfcc when only one model provided - Issue #1327
+- 2025-08-01: Fix alascan bug when no contact found - Issue #1343
+- 2025-08-01: Increasing parallelism in alascan module - Issue #1333
+- 2025-07-30: Added per-residue parallelization in alascan module - Issue #1307
+- 2025-07-24: Added computation of standard deviation in alascan cluster analyses - Issue #1332
+- 2025-07-23: Added printing of covalent energies to the PDB headers - Issue #1323
+- 2025-06-12: Added new restrain_ligand sub-command in the haddock3-restraints CLI - Issue #1299
+- 2025-06-06: Added selection of Nter, Cter and 5'end states at topology generation - Issue #1269
+- 2025-06-05: Added support for pyroglutamic acid (PCA) - Issue #1228
+- 2025-05-XX: Added new random_removal sub-command in the haddock3-restraints CLI - Issue #1240

@@ -1,0 +1,805 @@
+from os import remove
+from os.path import abspath
+import numpy as np
+from mddb_workflow.analyses.mindist import remove_view_script, MIN_FOCUS_SIZE
+from mddb_workflow.tools.generate_topology import format_selection
+from mddb_workflow.tools.get_bonds import find_safe_bonds, do_bonds_match, find_bonds_reference_frame
+from mddb_workflow.tools.get_bonds import get_most_stable_bonds
+from mddb_workflow.tools.get_pdb_frames import get_pdb_frame
+from mddb_workflow.tools.get_charges import get_charges
+from mddb_workflow.utils.auxiliar import InputError, TestFailure, MISSING_BONDS
+from mddb_workflow.utils.auxiliar import save_json, warn
+from mddb_workflow.utils.constants import CORRECT_ELEMENTS, STABLE_BONDS_FLAG, COHERENT_BONDS_FLAG
+from mddb_workflow.utils.constants import STABLE_BONDS_VIEW_FILENAME, COHERENT_BONDS_VIEW_FILENAME
+from mddb_workflow.utils.constants import LARGE_AMINOACID_FLAG, AUTOMATIC_FLAG
+from mddb_workflow.utils.selections import Selection
+from mddb_workflow.utils.structures import Structure, Residue, get_next_letter, get_chain_name
+from mddb_workflow.utils.type_hints import *
+
+
+def write_updated_structure(structure: 'Structure', output_structure_file: 'File', reason: str) -> None:
+    """Write the updated structure and report the reason that triggered the write."""
+    print(f' The structure file has been {reason} -> {output_structure_file.filename}')
+    structure.generate_file(output_structure_file.path)
+
+
+def apply_chainer(structure: 'Structure', chainer: dict, missing_any_bonds: bool) -> set[int]:
+    """Set chains according to the 'chainer' input.
+    Keys are chain names or 'auto' and values are VMD selections.
+    The 'auto' key sets a new chain per fragment in its selection.
+    Return the indices of all atoms whose chain was set.
+    """
+    if type(chainer) is not dict:
+        raise InputError(f'The "chainer" input must be a dict of chain names and selections, not: {chainer}')
+    # Names explicitly requested by the user must not be used by the 'auto' logic
+    requested_names = set(key for key in chainer.keys() if key != 'auto')
+    forced_atom_indices = set()
+    for key, selection_string in chainer.items():
+        if key != 'auto' and not key.isalnum():
+            raise InputError(f'Wrong chain "{key}" in the "chainer" input. Keys must be letters and numbers or "auto".')
+        selection = structure.select(selection_string, syntax='vmd')
+        if not selection:
+            raise InputError(f'Empty selection for chain "{key}" in the "chainer" input: {selection_string}')
+        # Note that chains are set per whole residue so we save all atoms in the selected residues
+        for residue_index in structure.get_selection_residue_indices(selection):
+            forced_atom_indices.update(structure.residues[residue_index].atom_indices)
+        if key != 'auto':
+            print(f' Setting chain {key} to {len(selection)} atoms ({selection_string})')
+            structure.set_selection_chain_name(selection, key)
+            continue
+        # Set a new chain per fragment
+        if missing_any_bonds:
+            raise InputError('Cannot use the "auto" key in the "chainer" input with missing bonds.\n'
+                '  Please either set chain letters explicitly or provide a topology including bonds.')
+        for fragment in structure.find_fragments(selection):
+            current_names = set(chain.name for chain in structure.chains)
+            unavailable_names = current_names | requested_names
+            index = 0
+            while get_chain_name(index) in unavailable_names: index += 1
+            chain_name = get_chain_name(index)
+            print(f' Setting chain {chain_name} to a fragment of {len(fragment)} atoms ({selection_string})')
+            structure.set_selection_chain_name(fragment, chain_name)
+    return forced_atom_indices
+
+
+def get_excluded_atoms_indices(
+    structure: 'Structure',
+    pbc_selection: 'Selection',
+    cg_selection: 'Selection') -> 'Selection':
+    """Set some atoms which are to be skipped from bonding tests given their "fake" nature."""
+    # Get a selection of ion atoms which are not in PBC
+    # These ions are usually "tweaked" to be bonded to another atom although there is no real covalent bond
+    # They are not taken in count when testing coherent bonds or looking for the reference frame
+    non_pbc_ions_selection = structure.select_ions() - pbc_selection
+    # We also exclude coarse grain atoms since their bonds will never be found by a distance/radius guess
+    # Also dummy atoms are excluded since they are not real atoms
+    excluded_atoms_selection = non_pbc_ions_selection + cg_selection + structure.select_dummy()
+    return set(excluded_atoms_selection.atom_indices)
+
+
+def get_mismatching_bonds(
+    clashes: list[tuple[int, tuple[int, ...], tuple[int, ...]]],
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Split atom bond mismatches in bonds which are missing and bonds which should not be there.
+    Every bond is a sorted pair of atom indices.
+    """
+    missing_bonds, unexpected_bonds = set(), set()
+    for atom_index, actual_bonds, expected_bonds in clashes:
+        for bonded_index in set(expected_bonds) - set(actual_bonds):
+            missing_bonds.add(tuple(sorted((atom_index, bonded_index))))
+        for bonded_index in set(actual_bonds) - set(expected_bonds):
+            unexpected_bonds.add(tuple(sorted((atom_index, bonded_index))))
+    return sorted(missing_bonds), sorted(unexpected_bonds)
+
+
+def to_tcl_bonds(bonds: list[tuple[int, int]]) -> str:
+    """Format bonds as a Tcl list of atom index pairs."""
+    return '{' + ' '.join(f'{{{a} {b}}}' for a, b in bonds) + '}'
+
+
+def get_focus_commands(atoms: 'Selection') -> list[str]:
+    """Get VMD commands to center the view in some atoms of the main molecule and zoom in."""
+    return [
+        f'set focus [atomselect $main {{{atoms.to_vmd()}}}]',
+        'proc get_size {atoms} {',
+        '    lassign [measure minmax $atoms] lowest highest',
+        '    return [tcl::mathfunc::max {*}[vecsub $highest $lowest]]',
+        '}',
+        'display resetview',
+        'molinfo $main set center_matrix [list [transoffset [vecscale -1 [measure center $focus]]]]',
+        f'set zoom [expr {{[get_size [atomselect $main all]] / max([get_size $focus], {MIN_FOCUS_SIZE})}}]',
+        'if {$zoom > 1} { scale by $zoom }',
+    ]
+
+
+def write_stable_bonds_view_script(
+    script_filename: str,
+    structure_filename: str,
+    trajectory_filename: str,
+    frame: int,
+    failing_atoms: 'Selection',
+    missing_bonds: list[tuple[int, int]],
+    unexpected_bonds: list[tuple[int, int]],
+):
+    """Write a VMD script to see the wrong bonds in a frame.
+
+    Bonds are guessed by VMD from the coordinates in this frame, as the test does.
+    The failing atom and the atoms it is or should be bonded to are shown as spheres and their residues in licorice.
+    Missing bonds are drawn as red dashed lines and bonds which should not be there are highlighted in orange.
+    """
+    commands = [
+        f'# Wrong bonds in frame {frame}',
+        f'mol new {{{abspath(structure_filename)}}} waitfor all',
+        # Frames from the structure file are removed so frame numbers match the trajectory
+        'animate delete all',
+        f'mol addfile {{{abspath(trajectory_filename)}}} type xtc first {frame} last {frame} waitfor all',
+        'set main [molinfo top]',
+        # Bonds are guessed again from the coordinates in this frame
+        'mol bondsrecalc $main',
+        # Residues of the failing atoms
+        'mol representation Licorice 0.2',
+        'mol color Name',
+        f'mol selection {{same residue as ({failing_atoms.to_vmd()})}}',
+        'mol material Opaque',
+        'mol addrep $main',
+        # The failing atom and the atoms it is or should be bonded to
+        'mol representation VDW 0.4',
+        f'mol selection {{{failing_atoms.to_vmd()}}}',
+        'mol addrep $main',
+        # Draw a bond between the two atoms in a pair
+        'proc draw_bond {bond args} {',
+        '    global main',
+        '    set atoms [atomselect $main "index $bond"]',
+        '    lassign [$atoms get {x y z}] start end',
+        '    $atoms delete',
+        '    graphics $main {*}[linsert $args 1 $start $end]',
+        '}',
+        # Bonds which are missing
+        'graphics $main color red',
+        f'foreach bond {to_tcl_bonds(missing_bonds)} {{ draw_bond $bond line width 4 style dashed }}',
+        # Bonds which should not be there
+        'graphics $main color orange',
+        'graphics $main material Transparent',
+        f'foreach bond {to_tcl_bonds(unexpected_bonds)} {{ draw_bond $bond cylinder radius 0.4 }}',
+        # Center the view in the failing atoms and zoom in
+        *get_focus_commands(failing_atoms),
+        'puts "The failing atom and the atoms it is or should be bonded to are shown as spheres and their residues in licorice"',
+        'puts "Missing bonds are drawn as red dashed lines and bonds which should not be there are highlighted in orange"',
+    ]
+    with open(script_filename, 'w') as script_file:
+        script_file.write('\n'.join(commands) + '\n')
+
+
+def write_coherent_bonds_view_script(
+    script_filename: str,
+    structure_filename: str,
+    incoherent_atoms: 'Selection',
+    bonds: list[tuple[int, int]],
+):
+    """Write a VMD script to see the atoms with a wrong number of bonds.
+
+    Note that VMD guesses bonds from distances instead of reading them from the topology.
+    For this reason bonds in the topology of these atoms are passed and drawn apart.
+    Atoms with a wrong number of bonds are shown as big spheres and the atoms bonded to them as small spheres.
+    Their residues are shown in lines, with the bonds guessed by VMD.
+    """
+    bonded_atoms = Selection(sorted(set(index for bond in bonds for index in bond)))
+    commands = [
+        '# Atoms with a wrong number of bonds',
+        f'mol new {{{abspath(structure_filename)}}} waitfor all',
+        'set main [molinfo top]',
+        # Residues of the atoms with wrong bonds, with the bonds guessed by VMD
+        'mol representation Lines 2',
+        'mol color Name',
+        f'mol selection {{same residue as ({incoherent_atoms.to_vmd()})}}',
+        'mol material Opaque',
+        'mol addrep $main',
+        # Atoms with a wrong number of bonds
+        'mol representation VDW 0.4',
+        f'mol selection {{{incoherent_atoms.to_vmd()}}}',
+        'mol addrep $main',
+    ]
+    # Atoms bonded to them in the topology
+    if bonded_atoms:
+        commands += [
+            'mol representation VDW 0.2',
+            f'mol selection {{{bonded_atoms.to_vmd()}}}',
+            'mol addrep $main',
+        ]
+    commands += [
+        # Bonds in the topology
+        'graphics $main color yellow',
+        f'foreach bond {to_tcl_bonds(bonds)} {{',
+        '    set atoms [atomselect $main "index $bond"]',
+        '    lassign [$atoms get {x y z}] start end',
+        '    $atoms delete',
+        '    graphics $main cylinder $start $end radius 0.1',
+        '}',
+        # Center the view in the atoms with wrong bonds and zoom in
+        *get_focus_commands(incoherent_atoms),
+        'puts "Atoms with a wrong number of bonds are shown as big spheres and the atoms bonded to them as small spheres"',
+        'puts "Bonds in the topology are drawn in yellow, while lines show the bonds guessed by VMD from distances"',
+    ]
+    with open(script_filename, 'w') as script_file:
+        script_file.write('\n'.join(commands) + '\n')
+
+
+def structure_corrector(
+    # Note that this is an early provisional structure
+    structure: 'Structure',
+    input_trajectory_file: Optional['File'],
+    input_topology_file: Union['File', Exception],
+    output_structure_file: 'File',
+    output_trajectory_file: Optional['File'],
+    # Files which will hold the processed structure and trajectory once the processing is over
+    # They are used in the VMD scripts to see failed tests, since current files are renamed further
+    final_structure_file: 'File',
+    final_trajectory_file: 'File',
+    MD: 'MD',
+    # Note that this is an early provisional atom selection
+    pbc_selection: 'Selection',
+    cg_selection: 'Selection',
+    ua_selection: 'Selection',
+    dummy_selection: 'Selection',
+    snapshots: int,
+    register: 'Register',
+    mercy: list[str],
+    trust: list[str],
+    guess_bonds: bool,
+    ignore_bonds: bool,
+    # Bonds already mined from the topology file, so they are not mined again
+    topology_bonds: Optional[list[list[int]]],
+    chainer: Optional[dict] = None,
+) -> bool:
+    """Analyze the structure looking for irregularities and then modify the structure to standarize the format.
+
+    Supported cases:
+
+    * Missing/Non-standard elements -> Atom elements are guessed when missing and standarized (e.g. ZN -> Zn)
+    * Unstable atom bonds: A bond is formed / broken because its 2 atoms are too close / far in the structure
+      -> Coordinates in the pdb file are replaced by those of the first frame in the trajectory where bonds are stable
+    * Incoherent atom bonds -> If an atom has unexpected bonds then the simulation may be wrong
+      -> Stop the workflow and warn the user
+      -> Atoms in the united atom selection may have less bonds, since their hydrogens may be absorbed
+    * Forced chains -> Chains are set according to the 'chainer' input, if passed
+      -> Missing chains are not fixed and forced chains must not be modified by further corrections
+    * Chains -> Chains are always guessed for the whole system, unless forced by the 'chainer' input
+      -> Author chains with exactly the same residues as a guessed chain keep the author name
+    * Splitted chain -> Kill the process and warn the user. This should never happen by just reading a pdb, but after correcting
+    * Repeated chains -> Chains are renamed (e.g. A, G, B, G, C, G -> A, G, B, H, C, I)
+    * Splitted residues -> Atoms are sorted together by residue. Trajectory coordinates are also sorted
+    * Repeated residues -> Residues are renumerated (e.g. 1, 2, 3, 1, 2, 1, 2 -> 1, 2, 3, 4, 5, 6, 7)
+    * Repeated atoms -> Atoms are renamed with their numeration (e.g. C, C, C, O, O -> C1, C2, C3, O1, O2)
+
+    Note that the 'mercy' flag may be passed for critical checkings to not kill the process on fail.
+    Note that the 'trust' flag may be passed for critical checkings to skip them.
+
+    This function also sets some values in the passed MD.
+
+    Return True if the chain of any atom was changed.
+
+    """
+    # Write the initial output structure file which will be overwritten several times further
+    write_updated_structure(structure, output_structure_file, 'copied')
+
+    # ------------------------------------------------------------------------------------------
+    # Missing/Non-standard elements ------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # It is important to fix elements before trying to fix bonds, since elements have an impact on bonds
+    # VMD logic to find bonds relies in the atom element to set the covalent bond distance cutoff
+    if structure.fix_atom_elements(trust=(CORRECT_ELEMENTS in trust)):
+        # Update the structure file using the corrected structure
+        write_updated_structure(structure, output_structure_file, 'modified (fix atom elements)')
+
+    # ------------------------------------------------------------------------------------------
+    # Unstable atom bonds ----------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # Set if stable bonds have to be checked
+    # Note that we must not skip this even if the test already passed
+    # It may be a corrected structure the one which passed the structure, while this structure comes from the raw input
+    must_check_stable_bonds = STABLE_BONDS_FLAG not in trust
+
+    # Get safe bonds
+    # Use topology bonds if possible
+    # Otherwise guess bonds by guessing bonds according to coordinates and atom radius for 10 frames along the trajectory
+    safe_bonds = find_safe_bonds(
+        input_topology_file,
+        input_trajectory_file,
+        must_check_stable_bonds,
+        snapshots,
+        structure,
+        register,
+        cg_selection,
+        guess_bonds,
+        ignore_bonds,
+        topology_bonds=topology_bonds,
+    )
+
+    # Check if the structure is missing bonds
+    missing_any_bonds = any(bond == MISSING_BONDS for bond in safe_bonds)
+
+    # Failed tests to be reported at the end, once atoms are not to be sorted anymore
+    # Note that atom indices in warnings and VMD scripts would be wrong otherwise
+    pending_reports = []
+
+    # If safe bonds do not match structure bonds then we have to fix it
+    def check_stable_bonds():
+        # Save the current structure bonds to further compare with the safe bonds
+        current_bonds = structure.bonds
+        # Now force safe bonds in the structure even if they "match" already
+        # Note that some bonds are excluded from the check and they may be wrong in the structure
+        # e.g. coarse grain atom bonds
+        structure.bonds = safe_bonds
+        # If we have been requested to skip this test then we are done
+        if not must_check_stable_bonds or missing_any_bonds: return
+        # Reset warnings related to this analysis
+        register.remove_warnings(STABLE_BONDS_FLAG)
+        stable_bonds_view_filename = MD.pathify(STABLE_BONDS_VIEW_FILENAME)
+        remove_view_script(stable_bonds_view_filename)
+        # Set some atoms which are to be skipped from these test given their "fake" nature
+        excluded_atom_indices = get_excluded_atoms_indices(structure, pbc_selection, cg_selection)
+        # If bonds match from the begining we are done as well
+        print(f'Checking default structure bonds ({STABLE_BONDS_FLAG})')
+        if do_bonds_match(current_bonds, safe_bonds, excluded_atom_indices, verbose=True, atoms=structure.atoms):
+            register.update_test(STABLE_BONDS_FLAG, True)
+            print(' They are good')
+            return
+        # Explain the problem to the user
+        # Make clear this is not a problem but very normal or you will get mails from users
+        print(' There may be an atom clash or a bond overstretch in the default structure but this is normal.\n'
+        ' An atom clash means that two non-bonded atoms are too close.\n'
+        ' A bond overstretch means that two bonded atoms are too far away.\n'
+        ' Now we will look for a frame which has no clashes/overstretches at all.\n'
+        ' This frame will be considered as the "reference frame".')
+        # Find the first frame in the whole trajectory where safe bonds are respected
+        bonds_reference_frame, bonds_are_fine, bonds_failure = find_bonds_reference_frame(
+            structure=structure,
+            trajectory_file=input_trajectory_file,
+            snapshots=snapshots,
+            reference_bonds=safe_bonds,
+            excluded_atom_indices=excluded_atom_indices,
+        )
+        # Update the task output so it does not have to be repeated further
+        # IMPORTANT: Note that this is not always run, but only when default structure bonds are wrong
+        # IMPORTANT: Thus it is NORMAL when the reference frame is calculated further in the workflow
+        MD.get_reference_frame.prefill(MD, (bonds_reference_frame, bonds_are_fine), {
+            'structure_file': output_structure_file,
+            'trajectory_file': input_trajectory_file,
+            'snapshots': snapshots,
+            'reference_bonds': safe_bonds,
+            'structure': structure,
+            'pbc_selection': pbc_selection
+        })
+        # If there is no reference frame then stop here since there must be a problem
+        if not bonds_are_fine:
+            print('There is no reference frame for the safe bonds. Is the trajectory not imaged?')
+            message = 'Could not find a frame in the trajectory respecting all bonds if bonds were guessed according to atom coordinates and radius.'
+            # Most frequent wrong bonds, in the first frame where they happen
+            clash, clash_frames, checked_frames, failing_frame = bonds_failure
+            missing_bonds, unexpected_bonds = get_mismatching_bonds([clash])
+            # Get the distance between the atoms of every wrong bond in this frame
+            frame_filename = get_pdb_frame(output_structure_file.path, input_trajectory_file.path, failing_frame)
+            frame_coords = np.array([ atom.coords for atom in Structure.from_pdb_file(frame_filename).atoms ])
+            remove(frame_filename)
+            # Keep atoms instead of indices, since atoms may be sorted further
+            def to_atom_bonds(bonds: list[tuple[int, int]]) -> list[tuple['Atom', 'Atom', float]]:
+                return [ (structure.atoms[a], structure.atoms[b], float(np.linalg.norm(frame_coords[a] - frame_coords[b])))
+                    for a, b in bonds ]
+            missing_atom_bonds = to_atom_bonds(missing_bonds)
+            unexpected_atom_bonds = to_atom_bonds(unexpected_bonds)
+            atom_index, actual_bonds, expected_bonds = clash
+            failing_atom = structure.atoms[atom_index]
+            # The failing atom along with the atoms it is bonded to and the atoms it should be bonded to
+            clash_atoms = [ structure.atoms[index] for index in sorted({ atom_index, *actual_bonds, *expected_bonds }) ]
+            must_be_killed = STABLE_BONDS_FLAG not in mercy
+            def report_stable_bonds():
+                description = ('The main PDB structure is a default structure and it would be considered to have wrong bonds if they were predicted as previously stated.\n'
+                    f'The most failing atom is {failing_atom.label}, with the same wrong bonds in {clash_frames} of {checked_frames} checked frames.'
+                    f' First in frame {failing_frame}:')
+                for bonds, header in [(missing_atom_bonds, 'Atoms which should be bonded but are too far:'),
+                    (unexpected_atom_bonds, 'Atoms which should not be bonded but are too close:')]:
+                    if not bonds: continue
+                    description += f'\n {header}'
+                    for atom_a, atom_b, distance in bonds:
+                        description += f'\n  {atom_a.label} — {atom_b.label} ({distance:.2f} Å)'
+                # Atom indices are read now, once atoms are sorted
+                def to_index_pairs(bonds: list[tuple['Atom', 'Atom', float]]) -> list[tuple[int, int]]:
+                    return [ tuple(sorted((atom_a.index, atom_b.index))) for atom_a, atom_b, _ in bonds ]
+                missing_pairs, unexpected_pairs = to_index_pairs(missing_atom_bonds), to_index_pairs(unexpected_atom_bonds)
+                failing_atoms = Selection(sorted(atom.index for atom in clash_atoms))
+                # Frame and atoms to be shown in the client
+                data = {
+                    'frame': failing_frame,
+                    'selection': format_selection(structure, failing_atoms),
+                }
+                # Write a VMD script for the user to see the wrong bonds
+                # This is not part of the warning since it is only useful for the workflow user
+                # If the workflow is to be killed then current files will remain, otherwise they will be renamed
+                view_structure_file = output_structure_file if must_be_killed else final_structure_file
+                view_trajectory_file = input_trajectory_file if must_be_killed else final_trajectory_file
+                write_stable_bonds_view_script(stable_bonds_view_filename, view_structure_file.path,
+                    view_trajectory_file.path, failing_frame, failing_atoms, missing_pairs, unexpected_pairs)
+                view_hint = f'To see the wrong bonds run:\n  vmd -e {stable_bonds_view_filename}'
+                if must_be_killed:
+                    raise TestFailure(f'{message}\n{description}\n{view_hint}')
+                register.add_warning(STABLE_BONDS_FLAG, message, description, data)
+                print(f' {view_hint}')
+            if must_be_killed: report_stable_bonds()
+            register.update_test(STABLE_BONDS_FLAG, False)
+            pending_reports.append(report_stable_bonds)
+            return
+        # Set also the stable bonds frame structure to mine its coordinates
+        stable_bonds_frame_filename = get_pdb_frame(output_structure_file.path, input_trajectory_file.path, bonds_reference_frame)
+        stable_bonds_frame_structure = Structure.from_pdb_file(stable_bonds_frame_filename)
+        # Set all coordinates in the main structure by copying the stable bonds frame coordinates
+        for atom_1, atom_2 in zip(structure.atoms, stable_bonds_frame_structure.atoms):
+            atom_1.coords = atom_2.coords
+        # Remove the stable bonds frame since it is not required anymore
+        remove(stable_bonds_frame_filename)
+        write_updated_structure(structure, output_structure_file, 'modified (stable bonds)')
+        # Set the test as passed
+        register.update_test(STABLE_BONDS_FLAG, True)
+    check_stable_bonds()
+
+    # Write safe bonds back to the MD
+    MD.get_reference_bonds.prefill(MD, safe_bonds, {
+        'topology_file': input_topology_file,
+        'structure_file': output_structure_file,
+        'trajectory_file': input_trajectory_file,
+        'must_check_stable_bonds': must_check_stable_bonds,
+        'snapshots': snapshots,
+        'structure': structure,
+        'register': register,
+        'cg_selection': cg_selection,
+        'guess_bonds': guess_bonds,
+        'ignore_bonds': ignore_bonds,
+    })
+
+    # ------------------------------------------------------------------------------------------
+    # Incoherent residue length ----------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # Make sure every known residue has an expected number of atoms
+    # This number was obtained after checking the number of atoms pero aminoacid in many topologies
+    # DANI: No es muy fiable de esta forma, pero sirve para ligandos mal puestos
+    for residue in structure.residues:
+        if not residue.is_large_aa(): continue
+        msg = f'Residue {residue.name} in chain {residue.chain.name} has an aminoacid' + \
+              f' name but has {residue.atom_count} atoms (residue {residue.index}).'
+        if LARGE_AMINOACID_FLAG in mercy:
+            warn(msg)
+        else:
+            raise TestFailure(msg + f'\nUse the "-m {LARGE_AMINOACID_FLAG}" flag to ignore this warning and continue anyway.')
+
+    # ------------------------------------------------------------------------------------------
+    # Incoherent residue bonds -----------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # Set a variable to store guessed atoms, in case we need them
+    guessed_atoms_structure = None
+
+    # Make sure there are no disconnected groups of atoms in every residue
+    for residue in structure.residues:
+        # If the residue is missing bonds then we can not check if it is coherent
+        # We assume it is and continue
+        if residue.is_missing_any_bonds(): continue
+        # If the residue is coherent then continue
+        # WARNING: We cannot exclude dummy atoms here, since a dummy atom may connect groups of non-dummy atoms
+        # e.g. Martini Coarse Grain POPC residues
+        if residue.is_coherent(): continue
+        # Otherwise we report the problem
+        residue_selection = residue.get_selection() - dummy_selection
+        # WARNING: At this point we must get rid of fragments which are all made of dummy atoms
+        # These dummy atoms may be dissconnected from the residue entirely
+        fragments = list(structure.find_fragments(residue_selection, exclude_dummy_fragments=True))
+        n_fragments = len(fragments)
+        if n_fragments == 0: raise RuntimeError('Do we have an empty residue?')
+        if n_fragments == 1: raise RuntimeError('Test failed but should not')
+        warn(f'Multiple fragments ({n_fragments}) in residue {residue.index}: {residue}')
+        for f, fragment in enumerate(fragments, 1):
+            fragment_atoms = [structure.atoms[index] for index in fragment.atom_indices]
+            atom_names = [atom.label for atom in fragment_atoms]
+            print(f' Fragment {f}: {", ".join(atom_names)}')
+        # DANI: There are two possible scenarios here:
+        # 1 - Independent atom fragments are in the same residue by mistake
+        # 2 - Atom bonds are wrong for some atom(s) in this residue
+        # In the first case we could simply split the residue in multiple residues to fix the problem
+        # In the second scenario we must surrender
+        # We check if we are in the first scenario by looking at the distance between atoms fragments
+        # Guess atom bonds by distance and radii
+        if not guessed_atoms_structure:
+            guessed_atoms_structure = structure.copy()
+            guessed_bonds = get_most_stable_bonds(
+                structure,
+                input_trajectory_file.path,
+                snapshots)
+            guessed_atoms_structure.bonds = guessed_bonds
+        # Check if the number of fragments is the same or 1 lower using the guessed bonds
+        # If the number of guessed fragments matches perfectly the actual number of fragments then we assume it is scenario 1
+        # In any other scenario we complain
+        guessed_fragments = list(guessed_atoms_structure.find_fragments(residue_selection, exclude_dummy_fragments=True))
+        n_guessed_fragments = len(guessed_fragments)
+        if n_guessed_fragments != n_fragments:
+            raise TestFailure(f'Residue {residue.index}: {residue} is not coherent: some atoms are disconnected')
+        print('Guessed fragments match actual fragments, so we assume bonds are correct.')
+        print('This means that multiple residues are numbered as the same residue by mistake.')
+        print('In order to solve this issue, this residue will be splitted in new renumerated residues.')
+        # New residues keep the same number and get the next free insertion code
+        # Increasing the number instead could clash with the next residue in the chain
+        last_icode = residue.icode
+        for fragment in fragments[1:]:
+            last_icode = get_next_letter(last_icode)
+            while last_icode and residue.chain.find_residue(residue.number, last_icode):
+                last_icode = get_next_letter(last_icode)
+            if last_icode is None: raise RuntimeError(f'No more letters in the alphabet for icodes in residue {residue}')
+            # Set the new residue
+            new_residue = Residue(residue.name, residue.number, last_icode)
+            structure.set_new_residue(new_residue)
+            residue.chain.add_residue(new_residue)
+            # Add fragment atoms to the new residue
+            fragment_atoms = [structure.atoms[index] for index in fragment.atom_indices]
+            for atom in fragment_atoms:
+                new_residue.add_atom(atom)
+        write_updated_structure(structure, output_structure_file, 'modified (splitted independent residue)')
+
+    # ------------------------------------------------------------------------------------------
+    # Incoherent atom bonds ---------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # Set if coherent bonds have to be checked
+    must_check_coherent_bonds = COHERENT_BONDS_FLAG not in trust
+    if missing_any_bonds: must_check_coherent_bonds = False
+
+    # If this analysis has been already passed then we skip the process
+    if register.tests.get(COHERENT_BONDS_FLAG, None) is True:
+        must_check_coherent_bonds = False
+
+    # Run the coherent bonds analysis if necessary
+    if must_check_coherent_bonds:
+        # Reset warnings related to this analysis
+        register.remove_warnings(COHERENT_BONDS_FLAG)
+        coherent_bonds_view_filename = MD.pathify(COHERENT_BONDS_VIEW_FILENAME)
+        remove_view_script(coherent_bonds_view_filename)
+        # If the test is not passed then report it
+        incoherent_atom_indices = structure.check_incoherent_bonds(ua_selection)
+        if incoherent_atom_indices:
+            print('FAIL: Uncoherent bonds were found')
+            message = 'Some atoms may have a higher or lower number of bonds than they should according to their element.'
+            # Keep atoms instead of indices, since atoms may be sorted further
+            incoherent_atoms = [ structure.atoms[index] for index in incoherent_atom_indices ]
+            atom_bonded_atoms = [ (atom, [ structure.atoms[index] for index in atom.get_bonds() ]) for atom in incoherent_atoms ]
+            # Carbons with a single bond are usually methyl groups whose hydrogens were absorbed in a united atom force field
+            single_bond_carbons = any(atom.element == 'C' and len(bonded_atoms) == 1 for atom, bonded_atoms in atom_bonded_atoms)
+            must_be_killed = COHERENT_BONDS_FLAG not in mercy
+            def report_coherent_bonds():
+                description = f'{len(incoherent_atoms)} atoms have a wrong number of bonds:'
+                MAX_REPORTED_ATOMS = 5
+                for atom, bonded_atoms in atom_bonded_atoms[:MAX_REPORTED_ATOMS]:
+                    description += f'\n  {atom.label} is a {atom.element} atom with {len(bonded_atoms)} bonds'
+                    if bonded_atoms: description += ': ' + ', '.join(bonded_atom.label for bonded_atom in bonded_atoms)
+                if len(incoherent_atoms) > MAX_REPORTED_ATOMS:
+                    description += f'\n  etc. ({len(incoherent_atoms)} atoms)'
+                if single_bond_carbons:
+                    description += ('\nCarbons with a single bond may be methyl groups in a united atom force field (e.g. GROMOS, Berger lipids).'
+                        f'\nIf so, add them to the united atom selection (e.g. set the "ua_selection" input to "{AUTOMATIC_FLAG}").')
+                # Atom indices are read now, once atoms are sorted
+                incoherent_selection = Selection(sorted(atom.index for atom in incoherent_atoms))
+                bonds = sorted(set( tuple(sorted((atom.index, bonded_atom.index)))
+                    for atom, bonded_atoms in atom_bonded_atoms for bonded_atom in bonded_atoms ))
+                # Atoms to be shown in the client
+                data = { 'selection': format_selection(structure, incoherent_selection) }
+                # Write a VMD script for the user to see the atoms with wrong bonds
+                # This is not part of the warning since it is only useful for the workflow user
+                # If the workflow is to be killed then the current file will remain, otherwise it will be renamed
+                view_structure_file = output_structure_file if must_be_killed else final_structure_file
+                write_coherent_bonds_view_script(coherent_bonds_view_filename, view_structure_file.path,
+                    incoherent_selection, bonds)
+                view_hint = f'To see the atoms with wrong bonds run:\n  vmd -e {coherent_bonds_view_filename}'
+                if must_be_killed:
+                    raise TestFailure(f'{message}\n{description}\n{view_hint}')
+                register.add_warning(COHERENT_BONDS_FLAG, message, description, data)
+                print(f' {view_hint}')
+            if must_be_killed: report_coherent_bonds()
+            register.update_test(COHERENT_BONDS_FLAG, False)
+            pending_reports.append(report_coherent_bonds)
+        # Set the test as succeed if all was good
+        else:
+            register.update_test(COHERENT_BONDS_FLAG, True)
+
+    # ------------------------------------------------------------------------------------------
+    # Forced chains ----------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # Save the chain of every atom to further know if chains were changed
+    initial_atom_chains = [ atom.chain.name for atom in structure.atoms ]
+
+    # Set chains as requested by the user, if requested
+    # Save the forced chains so we can make sure they are not modified by further corrections
+    forced_atom_chains = None
+    if chainer:
+        forced_atom_indices = apply_chainer(structure, chainer, missing_any_bonds)
+        forced_atom_chains = { index: structure.atoms[index].chain.name for index in forced_atom_indices }
+        write_updated_structure(structure, output_structure_file, 'modified (chainer input)')
+
+    # ------------------------------------------------------------------------------------------
+    # Missing chains ---------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # Check if chains are missing. If so, create a new chainned structure and set it as the reference
+    chains = structure.chains
+
+    # Chains are always guessed for the whole system, unless they were forced by the user
+    # Author chains with exactly the same residues as a guessed chain keep the author name
+    # Atoms with no chain are not a problem for the workflow but they are for the web client
+    some_chain_is_missing = any(chain.name == ' ' for chain in chains)
+    single_x_chain = len(chains) == 1 and chains[0].name == 'X'
+    if not chainer:
+        # We rely in fragments (and thus in bonds) to guess chains
+        # If we have bonds guessed from coarse grain (i.e. we have no topology) then we keep author chains
+        if structure.is_missing_any_bonds():
+            if some_chain_is_missing or single_x_chain:
+                raise InputError('We cannot guess chains with bonds guessed from coarse grain.\n'
+                    ' Please either provide a topology including bonds or set chains in the structure PDB file.')
+            print(' Author chains are kept since we cannot guess chains with bonds guessed from coarse grain')
+        else:
+            print(' Guessing chains')
+            previous_atom_chains = [ atom.chain.name for atom in structure.atoms ]
+            structure.auto_chainer(keep_author_names=True)
+            if previous_atom_chains != [ atom.chain.name for atom in structure.atoms ]:
+                write_updated_structure(structure, output_structure_file, 'modified (guessed chains)')
+
+    # ------------------------------------------------------------------------------------------
+    # Splitted chains --------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # Note that this will never happen because of the pdb itself, duplicated chains are handled further
+    # This will only happen if chains were missing and guessed
+    # This may mean there is something wrong in the structure
+    # Check fragments with the VMD and searh for wrong bonds
+    if structure.check_splitted_chains(fix_chains=True, display_summary=True):
+        write_updated_structure(structure, output_structure_file, 'modified (splitted chains)')
+
+    # ------------------------------------------------------------------------------------------
+    # Repeated chains --------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    if structure.check_repeated_chains(fix_chains=True, display_summary=True):
+        write_updated_structure(structure, output_structure_file, 'modified (repeated chains)')
+
+    # ------------------------------------------------------------------------------------------
+    # Coherent chains --------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # Makes sure polymers with sequence are all bonded
+    # In other words, make sure there are not multiple proteins/nucleics labeled with the same chain
+    # Note that their sequences otherwise will be merged silently, thus not reflecting reality
+    # This would make protein mapping impossible for instance
+    sequence_polymers_selection = structure.select_protein() + structure.select_nucleic()
+
+    # We also want to support having a solution of free aminoacids/nucleotides
+    # So if residues in the chain are not bonded or bonded in very small fragments we accept it
+    N_RESIDUES_CUTOFF = 3
+
+    # Save if we splitted chains
+    had_to_split_chains = False
+
+    # Iterate sequence polymer chains
+    for chain in structure.get_selection_chains(sequence_polymers_selection):
+        # If the chain is missing bonds then we can not check if it is coherent
+        # We assume it is and continue
+        if chain.is_missing_any_bonds(): continue
+        # If there is only one fragment we are good
+        chain_selection = chain.get_selection()
+        fragments = list(structure.find_fragments(chain_selection, atom_bonds=safe_bonds))
+        if len(fragments) == 0: raise ValueError(f'No fragments found in chain {chain.name}')
+        if len(fragments) == 1: continue
+        # We also want to support having a solution of free aminoacids/nucleotides
+        # So if residues in the chain are not bonded or bonded in very small fragments we accept it
+        # Make a single fragments out of all small fragments
+        independent_fragments = []
+        merged_fragment = None
+        for fragment in fragments:
+            # If the fragments reaches the size cutoff then send it to the independent fragments list
+            residues = structure.get_selection_residues(fragment)
+            if len(residues) > N_RESIDUES_CUTOFF:
+                independent_fragments.append(fragment)
+                continue
+            # Otherwise merge it with other small fragments
+            if merged_fragment: merged_fragment += fragment
+            else: merged_fragment = fragment
+        # Add the merged fragment to the list as well
+        if merged_fragment:
+            independent_fragments.append(merged_fragment)
+        # If we have only one fragment after the merging then we are good
+        if len(independent_fragments) == 1: continue
+        # Otherwise rename fragments
+        warn(f'Chain {chain.name} has sequence polymer(s) but not all atoms are bonded.')
+        # We can skip the first fragment, so it can keep the original chain name
+        for independent_fragment in independent_fragments[1:]:
+            print(f' A fragment of this chain including {len(independent_fragment)} atoms will be splitted appart.')
+            had_to_split_chains = True
+            # Make a new chain for the current fragment
+            new_chain_name = structure.get_next_available_chain_name(chain.name)
+            print(f' This fragment will be renamed as chain "{new_chain_name}"')
+            structure.set_selection_chain_name(independent_fragment, new_chain_name)
+
+    # If we did any change then save the structure
+    if had_to_split_chains:
+        write_updated_structure(structure, output_structure_file, 'modified (coherent chains)')
+
+    # Make sure forced chains were not modified by any of the previous corrections
+    # Note that this must be checked before atoms are resorted
+    if forced_atom_chains:
+        modified_atom_indices = [ index for index, chain_name in forced_atom_chains.items()
+            if structure.atoms[index].chain.name != chain_name ]
+        if len(modified_atom_indices) > 0:
+            modified_atoms_vmd_selection = Selection(modified_atom_indices).to_vmd()
+            raise InputError(f'Chains set by the "chainer" input were modified for {len(modified_atom_indices)} atoms'
+                ' when correcting the structure (see the logs above).\n'
+                f'  Modified atoms: {modified_atoms_vmd_selection}\n'
+                '  Please make sure every chain is a continuous region and its polymers are bonded.')
+
+    # Warn if chains look wrongly assigned (e.g. every lipid has its own chain)
+    structure.check_suspicious_chains()
+
+    # Check if chains were changed
+    # Note that this must be checked before atoms are resorted
+    chains_changed = initial_atom_chains != [ atom.chain.name for atom in structure.atoms ]
+
+    # ------------------------------------------------------------------------------------------
+    # Merged residues ------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # There may be residues which contain unconnected (unbonded) atoms. They are not allowed.
+    # They may come from a wrong parsing and be indeed duplicated residues.
+    # NEVER FORGET: Merged residues may be generated when calling the structure.auto_chainer
+    # Note that we need bonds to check for merged residues
+    # If bonds are missing then we skip this check
+    if not missing_any_bonds and structure.check_merged_residues(fix_residues=True, display_summary=True):
+        write_updated_structure(structure, output_structure_file, 'modified (merged residues)')
+
+    # ------------------------------------------------------------------------------------------
+    # Splitted residues ------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # Note that we need bonds to check for splitted residues
+    # If bonds are missing then we skip this check
+    if not missing_any_bonds and structure.check_repeated_residues(fix_residues=True, display_summary=True):
+        write_updated_structure(structure, output_structure_file, 'modified (repeated residues)')
+
+        # Sort trajectory coordinates in case atoms were sorted
+        if input_trajectory_file.path and structure.trajectory_atom_sorter:
+            # Save a warning in the register
+            warn('Atoms have been sorted to solve splitted residues')
+            print('Creating resorted files for atom bonds and charges')
+            # Bonds are already resorted
+            save_json(safe_bonds, MD.project.resorted_bonds_file.path, indent=4)
+            # Charges are to be resorted
+            # DANI: Esto no se prueba desde hace tiempo y ha sufrido cambios
+            # DANI: Debería funcionar pero puede tener algun bug
+            charges = get_charges(input_topology_file)
+            resorted_charges = [charges[index] for index in structure.new_atom_order]
+            MD.get_charges.prefill(MD, resorted_charges, {
+                'topology_file': input_topology_file
+            })
+            save_json(resorted_charges, MD.project.resorted_charges_file.path, indent=4)
+            print('Sorting trajectory coordinates to fit the new structure atom sort...')
+            structure.trajectory_atom_sorter(output_structure_file, input_trajectory_file, output_trajectory_file)
+
+    # ------------------------------------------------------------------------------------------
+    # Repeated atoms ---------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    if structure.check_repeated_atoms(fix_atoms=True, display_summary=True):
+        write_updated_structure(structure, output_structure_file, 'modified (repeated atoms)')
+
+    # ------------------------------------------------------------------------------------------
+    # Failed tests -----------------------------------------------------------------------------
+    # ------------------------------------------------------------------------------------------
+
+    # Report failed tests with mercy now that atoms are in their final order
+    for report in pending_reports: report()
+
+    return chains_changed

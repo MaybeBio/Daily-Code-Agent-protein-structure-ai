@@ -1,0 +1,79 @@
+#
+# The initial placement of the molecules (`set_initial_approximation!`): the sequence of
+# its steps, each in its own file of this directory (see README.md).
+#
+
+
+#
+# Set the initial approximation for the packing problem.
+#
+# Steps:
+#   1. Random positions (initialize_molecules!): in the region of the constraints when
+#      they bound it, in the periodic cell, or else in a large sidemax box
+#   2. Constraint-only optimization (no movebad) to push molecules toward
+#      feasible regions, then compute CM bounds from the result
+#   3. Re-initialize molecules within estimated bounds (best-of-N per molecule)
+#   4. Full constraint adjustment with solver and movebad
+#   5. Clamp molecules whose CMs are still far outside the constraint bounds
+#
+function set_initial_approximation!(
+    packmol_system::PackmolSystem{D,T},
+    free_mol_indices::Vector{Int},
+    RNG;
+    restart::Bool=false,
+    nloop::Int=500,
+    buffers::Union{Nothing,MemoryBuffers{D,T}} = nothing,
+) where {D,T}
+    # Reference-coordinate centering must happen regardless of `restart`:
+    # skipping it would leave restarted molecules offset by their template's
+    # raw, uncentered PDB coordinates (see `_center_reference_coordinates!`).
+    _center_reference_coordinates!(packmol_system)
+
+    # `restart=true` means the caller has already set every molecule's
+    # position (packmol()'s whole-system restart_from) and the whole point
+    # is to skip the rest of this pipeline entirely — including step 1's
+    # random placement, which would otherwise unconditionally overwrite
+    # those positions before ever checking this flag.
+    restart && return true
+
+    # Step 1: Random initial placement
+    initialize_molecules!(packmol_system, RNG)
+
+    # Step 2: Constraint-only optimization (no movebad) to push molecules
+    # toward feasible regions, then compute CM bounds from the result.
+    converged = adjust_constraints!(packmol_system, free_mol_indices, RNG; domovebad=false, buffers)
+    # Under PBC, the centers of mass are where the constraints are evaluated (see
+    # `_wrap_molecule_positions!`), so that the bounds are those of the constraints
+    _wrap_molecule_positions!(packmol_system, free_mol_indices)
+    # Use only constraint-satisfying molecules for bounds: outliers still at
+    # sidemax (±1000 Å) would otherwise produce a huge bounding box, causing
+    # CellListMap to allocate a ~10⁹-cell grid in subsequent steps.
+    cm_min, cm_max = compute_cm_bounds(packmol_system; precision=packmol_system.constraint_precision)
+
+    # Step 3: Re-initialize molecules within the estimated bounds
+    # (best-of-N tries per molecule, checking constraints + fixed overlap)
+    reinitialize_with_bounds!(packmol_system, free_mol_indices, RNG;
+        precision=packmol_system.constraint_precision,
+        cm_min=cm_min, cm_max=cm_max,
+    )
+
+    # Step 4: Full constraint adjustment with the solver and movebad,
+    # randomizing bad molecules within the CM bounds from step 2, for as many
+    # loops as the packing (molecules with constraints on some of their atoms,
+    # as lipids in curved layers, can take hundreds of loops to fit)
+    if packmol_system.adjust_constraints_on_init
+        converged = adjust_constraints!(packmol_system, free_mol_indices, RNG;
+            nloop, cm_lo_type=cm_min, cm_hi_type=cm_max, buffers,
+        )
+        _wrap_molecule_positions!(packmol_system, free_mol_indices)
+    end
+
+    # Step 5: Clamp any molecules that do not satisfy the constraints and whose CMs
+    # are still far outside the constraint bounds (can happen when adjustment
+    # doesn't converge).
+    # This prevents a huge bounding box that would blow up CellListMap memory.
+    _clamp_molecules_to_bounds!(packmol_system, free_mol_indices, cm_min, cm_max, RNG)
+
+    # Whether the constraints were satisfied (see `packmol`)
+    return converged
+end

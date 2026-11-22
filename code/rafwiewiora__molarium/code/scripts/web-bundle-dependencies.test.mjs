@@ -1,0 +1,60 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { ARCHIVED_SOS1_VIDEO_PATH, browserModuleClosure, sos1ReleaseWebFiles } from './web-bundle-dependencies.mjs';
+import { sourceWebFiles } from './web-source-files.mjs';
+
+const root = await mkdtemp(join(tmpdir(), 'molarium-web-closure-test-'));
+try {
+  await mkdir(join(root, 'nested'));
+  await writeFile(join(root, 'app.js'), "import './nested/a.mjs';\n");
+  await writeFile(join(root, 'nested/a.mjs'), "export { x } from './b.mjs';\n");
+  await writeFile(join(root, 'nested/b.mjs'), "export const x = import('../worker.mjs');\n");
+  await writeFile(join(root, 'worker.mjs'), "new URL('./leaf.js', import.meta.url);\n");
+  await writeFile(join(root, 'leaf.js'), "import './nested/a.mjs';\n");
+  assert.deepEqual(await browserModuleClosure(root, ['app.js']),
+    ['app.js','nested/a.mjs','nested/b.mjs','worker.mjs','leaf.js']);
+  await mkdir(join(root,'scripts'));
+  await writeFile(join(root,'scripts/build-web.mjs'), "const files = [\n  'app.js', // public entry\n];\n");
+  assert.deepEqual(await sourceWebFiles(root),
+    ['app.js','nested/a.mjs','nested/b.mjs','worker.mjs','leaf.js']);
+  for(const value of ["getPrivateFiles()", "'../private.json'", "'.env'"]) {
+    await writeFile(join(root,'scripts/build-web.mjs'),`const files = [\n  ${value},\n];\n`);
+    await assert.rejects(sourceWebFiles(root),/declaration/);
+  }
+  await writeFile(join(root, 'bad.js'), "import '../outside.mjs';\n");
+  await assert.rejects(browserModuleClosure(root, ['bad.js']), /escapes/);
+  await writeFile(join(root, 'bad.js'), "import './missing.mjs';\n");
+  await assert.rejects(browserModuleClosure(root, ['bad.js']), /ENOENT/);
+  assert.deepEqual(await sos1ReleaseWebFiles(root), []);
+  const prefix = 'design-history/publications/sos1/designer-intent-2026-09-04';
+  await mkdir(join(root, prefix), { recursive:true });
+  const declaration = join(root, prefix, 'release.json');
+  await writeFile(declaration, JSON.stringify({ nested:{ asset:{ path:`${prefix}/movie.mp4` } },
+    archived:{ path:ARCHIVED_SOS1_VIDEO_PATH } }));
+  assert.deepEqual(await sos1ReleaseWebFiles(root), [`${prefix}/release.json`, 'sos1.html', 'sos1-movie.mjs', `${prefix}/movie.mp4`]);
+  await writeFile(declaration, JSON.stringify({ asset:{ path:`${prefix}/../escape` } }));
+  await assert.rejects(sos1ReleaseWebFiles(root));
+  const build = await readFile(resolve(import.meta.dirname, 'build-web.mjs'), 'utf8');
+  assert(!/^\s*['"]\/sos1 \/sos1\.html 30[1278]['"]/m.test(build),
+    'Cloudflare canonical HTML redirects must not form a /sos1 loop');
+  assert(build.includes('`/${ARCHIVED_SOS1_VIDEO_PATH} /sos1 302`'));
+  const page = await readFile(resolve(import.meta.dirname, '../sos1.html'), 'utf8');
+  assert(!page.includes(ARCHIVED_SOS1_VIDEO_PATH));
+  assert(!page.includes('Full calculation-by-calculation recording'));
+  const reproductions = await readFile(resolve(import.meta.dirname, '../reproductions.html'), 'utf8');
+  const home = await readFile(resolve(import.meta.dirname, '../index.html'), 'utf8');
+  assert.match(home, /href="\/reproductions">Reproductions<\/a>/);
+  assert(!home.includes('SOS1 movies'));
+  assert.match(reproductions, /<h1>Reproductions<\/h1>/);
+  assert.match(reproductions, /<ol[^>]+aria-label="Registered reproductions"/);
+  assert.match(reproductions, /<time datetime="2026-09-05">September 5, 2026<\/time>/);
+  assert.match(reproductions, /href="\/sos1"/);
+  assert.match(page, /href="\/reproductions">All reproductions<\/a>/);
+  assert((await sourceWebFiles(resolve(import.meta.dirname,'..'))).includes('reproductions.html'));
+  assert(!/^\s*['"]\/reproductions \/reproductions\.html 30[1278]['"]/m.test(build),
+    'Cloudflare canonical HTML redirects must not form a /reproductions loop');
+  console.log('Web bundle recursive dependencies and release paths: PASS');
+} finally { await rm(root, { recursive:true, force:true }); }

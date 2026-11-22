@@ -1,0 +1,307 @@
+# Domain Annotation Pipeline
+
+Data pipeline to provide individual, combined and consensus filtered domain annotations for protein structures using Chainsaw, Merizo and UniDoc.
+
+## Install (with docker)
+
+Clone the repo.
+https://github.com/UCLOrengoGroup/domain-annotation-pipeline
+
+Install Nextflow
+
+```
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install nextflow
+```
+
+**Nextflow version:** use **25.10 or newer** (tested with 25.10.3 and 26.04.4). These releases use Nextflow's strict (v2) config parser, which `nextflow.config` is written for. If `pip install nextflow` gives you an older release, set the version explicitly, e.g. `NXF_VER=26.04.4 nextflow run ...`.
+
+Install Docker
+https://docs.docker.com/compose/install/
+
+Build Docker containers and run
+
+```bash
+docker compose build
+```
+
+## Running the workflow
+
+The following runs the `debug` mode, which uses test data included in this repository.
+Note: either docker or singularity must be supplied as one the the profile arguments.
+
+```
+nextflow run workflows/annotate.nf -profile debug,docker
+```
+
+### Profiles
+
+Runs are configured by composing profiles with `-profile a,b,c`: pick **one container engine**, add a **cluster** profile on HPC, and a **data/mode** profile for the inputs.
+
+| Group | Profiles | Sets |
+|-------|----------|------|
+| Container engine *(pick one)* | `docker`, `singularity` | how containers run (also loads the `/app` script paths) |
+| Cluster *(optional, HPC/SGE)* | `cs_cluster`, `myriad_cluster`, `orengo` | executor + submit options (scratch, GPU, avx2) |
+| Data / mode | `debug`, `benchmark_test`, `stub_run`, `test_154`, … | test inputs / run parameters |
+
+A basic resource floor for every process lives in `conf/base.config` (always applied). The fuller per-process memory/retry ladders are HPC settings in `conf/singularity.config`, so they apply when you include the `singularity` profile — hence `-profile singularity,<cluster>` for real HPC jobs. (`container` is also available as a standalone profile: script paths only, for composing with a self-contained cluster profile such as `orengo`.)
+
+```bash
+# Local, Docker, bundled test data
+nextflow run workflows/annotate.nf -profile debug,docker
+
+# UCL CS cluster — Singularity, runs on shared /SAN (no node-local scratch)
+nextflow run workflows/annotate.nf -profile singularity,cs_cluster --input_zip_dir <dir>
+
+# UCL Myriad cluster
+nextflow run workflows/annotate.nf -profile singularity,myriad_cluster --input_zip_dir <dir>
+
+# Orengo-lab CS cluster — node-local scratch, project/avx2/GPU
+nextflow run workflows/annotate.nf -profile singularity,orengo --input_zip_dir <dir>
+
+# 154-id TED test set read from a public S3 bucket (no AWS login needed)
+nextflow run workflows/annotate.nf -profile test_154,singularity,cs_cluster
+```
+
+### Execution reports
+
+Execution timeline, report, trace and DAG files are generated **automatically** on every run — you do **not** need to pass `-with-timeline`, `-with-report`, `-with-trace` or `-with-dag`. They are written to the `reports/` folder (or under `--results_dir` if you set it) and the filenames include a per-launch timestamp, so successive runs never overwrite each other:
+
+```
+reports/execution_timeline_<timestamp>.html
+reports/execution_report_<timestamp>.html
+reports/execution_trace_<timestamp>.txt
+reports/pipeline_dag_<timestamp>.html
+```
+
+## Preparing data
+
+The pipeline expects two inputs:
+
+- a zip file containing PDB files
+- a file containing all the ids that should be processed
+
+Given the following directory:
+
+```bash
+pdb_files/A0A3G5A0R2.pdb
+pdb_files/A0A8S5U119.pdb
+pdb_files/A0A0B5IZ33.pdb
+pdb_files/UPI001E716444.pdb
+pdb_files/A0A6C0N656.pdb
+```
+
+Create a zip file from all PDB files in this directory:
+
+```bash
+cd pdb_files
+zip -r ../pdb_files.zip .
+```
+
+Create a file containing all the ids to process:
+
+```bash
+# list the files in the zip and remove the `.pdb` suffix
+zipinfo -1 pdb_files.zip | sed 's/.pdb//g' > ids.txt
+```
+
+Pass these parameters to nextflow:
+
+```bash
+nextflow run workflows/annotate.nf \
+    --pdb_zip_file pdb_files.zip \
+    --uniprot_csv_file ids.txt \
+    -profile debug,docker
+```
+
+### Preparing data from AlphaFold DB (BinaryCIF -> PDB zip)
+
+If you only have AlphaFold DB accessions, you can generate the required PDB zip with:
+
+Your IDs file should contain full AlphaFold DB IDs like `AF-O15552-F1-model_v6` (one per line).
+
+```bash
+nextflow run workflows/prepare_af_pdb_zip.nf \
+    --project_name my_af_prep \
+    --af_ids_file fixtures/bcif/afdb_ids.txt \
+    -profile docker
+```
+
+Outputs are written to:
+
+- `results/my_af_prep/prepared/pdb_files.zip` (root-level `<ID>.pdb` entries)
+- `results/my_af_prep/prepared/af_ids.txt` (sorted+unique)
+- `results/my_af_prep/prepared/failed_ids.txt` (IDs that could not be prepared)
+- `results/my_af_prep/prepared/prep_summary.txt` (counts)
+
+You can then run the main workflow using the generated files:
+
+```bash
+nextflow run workflows/annotate.nf \
+    --pdb_zip_file results/my_af_prep/prepared/pdb_files.zip \
+    --uniprot_csv_file results/my_af_prep/prepared/af_ids.txt \
+    --project_name my_annotation_run \
+    -profile docker
+```
+
+Also useful to note:
+
+The output directory can be controlled with the ```--project_name``` parameter. 
+The three chunk size parameters control how many IDs are processed concurrently at different stages of the workflow:
+
+```bash
+--chunk_size
+--light_chunk_size
+--heavy_chunk_size
+```
+
+The parameter `--heavy_chunk_size` sets the maximum models per segmentation chunk for Chainsaw and Merizo/UniDoc.
+
+Add `--adaptive_heavy_chunking` to reduce chunk sizes for longer chains. Fixed-size chunking remains the default.
+The supplied `--heavy_chunk_size` is the baseline:
+
+| Chain length (residues) | Maximum models per chunk | With baseline 1000 |
+| --- | --- | --- |
+| Below 700 | baseline | 1000 |
+| 700–899 | baseline / 2 | 500 |
+| 900–1099 | baseline / 4 | 250 |
+| 1100 and above | baseline / 8 | 125 |
+
+Capacities are rounded down, with a minimum of one model. Adaptive chunks stay within a single ZIP and
+do not cross the CPU/GPU boundary at 200 or the memory boundary between 500 and 501 residues.
+Models remain ordered longest-first within each chunk. Chunk counts, length ranges and capacities are
+logged in the chunking task's `.command.out`; the mapping file format is unchanged.
+
+For example: `--heavy_chunk_size 1000 --adaptive_heavy_chunking`.
+This changes task boundaries and increases downstream job counts; validate with a separate pilot run/results
+directory before adopting it for production. It does not change segmentation algorithm settings.
+
+## Inclusion of Foldseek
+
+The pipeline now runs ```Foldseek``` on output domains automatically.
+
+It will download the CATH databases required (currently V4.4.0 s95) to this folder ```../foldseek/assets/<url hash>```.
+
+If the database URL is changed or the Foldseek assets are missing or deleted, please run the pipeline without -resume to ensure correct download behaviour.
+
+## Testing without annotating (stub run)
+
+The pipeline can be run in dummy (stub) mode, in which it will use synthetic chain ids to assign precomputed domain boundaries.
+
+The run_ted_segmentation and get_uniprot processes will run stub code rather than production code. This feature allows users to 
+test pipeline parameters without using excess compute time.
+
+To run this feature, suffix the normal run comman with 
+
+```bash
+-stub_run
+```
+
+For the stub run to work, check that the following files are located in ```../assets/stub_run```:
+
+```bash
+chopping_chainsaw_sorted.txt
+chopping_merizo_sorted.txt
+chopping_unidoc_sorted.txt
+consensus_sorted.tsv
+consensus.tsv.changed.txt
+ted_stub_chain_ids.csv
+ted_stub_chain_ids.zip 
+```
+
+The default files are currently set up to run a test set of 50 chain ids, producing a final results output of 100 domains.
+
+## Automated tests (nf-test)
+
+The pipeline has an [nf-test](https://www.nf-test.com/) (`tests/`) that runs the full `annotate.nf` workflow against the test data located in `./assets/test_ids` and checks the results against a pre-generated snapshot.
+
+Install nf-test:
+
+```bash
+curl -fsSL https://get.nf-test.com | bash
+```
+
+Move `nf-test` to the `bin` folder in you `$PATH`.
+
+Run the test locally:
+
+```bash
+nf-test test --profile +docker
+```
+
+If the outputs are consistent with the pre-existing snapshot, the test will succeed.
+
+If a change intentionally alters pipeline outputs, generate a new snapshot with:
+
+```bash
+nf-test test --update-snapshot
+```
+
+Note: nf-test isn't wired into CI yet — `test-pipeline.yml` and `build-test-push.yml` run the pipeline directly with `-profile docker,git_actions_test` rather than through nf-test. The idea is to replace it the nf-test at some point.
+
+## Running on HPC
+
+## Install (with singularity)
+
+These instructions are specific to the HPC setup in UCL Computer Sciences:
+
+- Clone the GitHub repository
+- Request access to the NextFlow submit node: `askey`
+- Login to `askey`
+
+Set the following NextFlow environment variables interactively or add to ~/.bashrc.
+
+```bash
+export NXF_OPTS='-Xms3g -Xmx3g'
+export PATH=/share/apps/jdk-20.0.2/bin:$PATH
+export LD_LIBRARY_PATH=/share/apps/jdk-20.0.2/lib:$LD_LIBRARY_PATH
+export JAVA_HOME=/share/apps/jdk-20.0.2
+export PATH=/share/apps/genomics/nextflow-local-25.10.3:$PATH
+```
+
+Create a cache directory for NextFlow (not entirely necessary but will prevent warnings).
+
+```bash
+mkdir ~/scratch
+mkdir ~/scratch/nextflow_singularity_cache
+export NXF_SINGULARITY_CACHEDIR=$HOME/Scratch/nextflow_singularity_cache
+```
+
+Set the following Python environment variables interactively or add to ~/.bashrc.
+
+```bash
+export PATH=/share/apps/python-3.13.0a6-shared/bin:$PATH
+export LD_LIBRARY_PATH=/share/apps/python-3.13.0a6-shared/lib:$LD_LIBRARY_PATH
+source /share/apps/source_files/python/python-3.13.0a6.source
+```
+
+Set up the venv environment
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+The latest containers are built and stored in GitHub Container Reposity (ghrc.io) as part of the automated build.
+
+These can be downloaded as singularity images with `singularity pull`:
+
+
+```bash
+singularity pull domain-annotation-pipeline-script_latest.sif docker://ghcr.io/uclorengogroup/domain-annotation-pipeline-script:main-latest
+singularity pull domain-annotation-pipeline-cath-af-cli_latest.sif docker://ghcr.io/uclorengogroup/domain-annotation-pipeline-cath-af-cli:main-latest
+singularity pull domain-annotation-pipeline-ted-tools_latest.sif docker://ghcr.io/uclorengogroup/domain-annotation-pipeline-ted-tools:main-latest
+singularity pull domain-annotation-pipeline-foldseek_latest.sif docker://ghcr.io/uclorengogroup/domain-annotation-pipeline-foldseek:main-latest
+```
+
+You normally **don't** need to pull these manually — with `-profile singularity`, Nextflow pulls each image into its cache on first run. Control **where** they're stored (and share them across runs and users) with the `NXF_SINGULARITY_CACHEDIR` environment variable:
+
+```bash
+export NXF_SINGULARITY_CACHEDIR=/path/to/shared/singularity_cache
+```
+
+The `cs_cluster` profile (see below) honours this variable, falling back to `$HOME/.apptainer/pull` when it is unset. (The old `--singularity_image_dir` flag is no longer wired up — set the cache via the environment variable instead.)

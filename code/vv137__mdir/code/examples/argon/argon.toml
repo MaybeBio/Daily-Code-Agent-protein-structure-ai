@@ -1,0 +1,52 @@
+# Liquid argon at constant energy: 864 atoms, 2000 steps of 5 fs.
+#
+# The system is that of argon.mlir: the density is 1.374 g/cm³, and the
+# atoms interact through the Lennard-Jones potential with sigma = 3.4 Å and
+# epsilon / k_B = 120 K. The atoms start on a lattice with velocities of
+# 183 K; about half of the kinetic energy goes into the potential energy
+# within the first picosecond.
+#
+#   mdir run examples/argon/argon.toml
+
+[input]
+coordinates = "argon.pdb"
+
+[output]
+trajectory          = "argon.dcd"
+energy_interval     = 100
+trajectory_interval = 100
+
+[energy]
+switch_distance   = 7.5
+cutoff            = 8.5
+pairlist_distance = 9.5
+
+[[energy.pair]]
+name       = "lj"
+expression = "4*epsilon*((sigma/r)^12 - (sigma/r)^6)"
+mixing     = "lorentz-berthelot"
+
+[[energy.type]]
+name    = "AR"
+mass    = 39.95
+epsilon = 0.238465
+sigma   = 3.4
+
+[dynamics]
+integrator = "VELOCITY_VERLET"
+time_step  = 0.005
+steps      = 2000
+seed       = 314159
+
+[ensemble]
+ensemble    = "NVE"
+temperature = 183.0
+
+[boundary]
+type = "PERIODIC"
+box  = [34.7786, 34.7786, 34.7786]
+
+[execution]
+target    = "CPU"
+threads   = 16
+precision = "DOUBLE"

@@ -1,0 +1,13 @@
+# Arm C: predict the hidden letter. The standard masked-residue task, and the
+# comparison arm B has to beat.
+#
+# Fine-tuning finds the checkpoint at
+# results/checkpoints/encoder_C_{corpus}_seed{seed}.pt, so --seed and --corpus
+# are given once on the command line and both stages agree.
+
+arm: C
+pretrain:
+  target: letter
+
+finetune:
+  mode: frozen

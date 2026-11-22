@@ -1,0 +1,71 @@
+name: Harness scientific files and concrete review
+on:
+  workflow_dispatch:
+  push:
+    paths: &harness_input_paths
+      - 'frontend/src/operations/HarnessForm.tsx'
+      - 'frontend/src/operations/HarnessReview*'
+      - 'frontend/src/operations/HarnessFoldInputs*'
+      - 'frontend/src/operations/FoldReview*'
+      - 'frontend/src/operations/FoldJobReview.tsx'
+      - 'frontend/src/operations/fold-job-review.css'
+      - 'frontend/src/operations/harness-questionnaire-model.ts'
+      - 'frontend/src/operations/guided-contract.ts'
+      - 'frontend/src/operations/HarnessSourcesForm*'
+      - 'frontend/src/operations/HarnessSubmissionRecovery*'
+      - 'frontend/src/operations/harness-sources*'
+      - 'frontend/src/operations/useHarnessSources*'
+      - 'frontend/src/operations/harness-generated.ts'
+      - 'src/opendde_workbench/harness_tools.py'
+      - 'src/opendde_workbench/fold_review.py'
+      - 'src/opendde_workbench/harness_routes.py'
+      - 'src/opendde_workbench/harness_chains.py'
+      - 'tests/test_fold_review.py'
+      - 'scripts/generate-capability-catalog.py'
+      - '.github/workflows/harness-input-checks.yml'
+  pull_request:
+    paths: *harness_input_paths
+permissions:
+  contents: read
+jobs:
+  workflow-scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      workflow_only: ${{ steps.scope.outputs.workflow_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/workflow-quality-scope.py
+  input-identity-and-review:
+    needs: workflow-scope
+    if: needs.workflow-scope.outputs.workflow_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Native file-field authority and generated contract
+        run: |
+          uv sync --locked --group dev
+          uv run --locked python scripts/generate-capability-catalog.py --check
+      - name: Effective native fold preview and immutable alignment sources
+        run: |
+          uv run --locked ruff check src/opendde_workbench/fold_review.py src/opendde_workbench/harness_routes.py src/opendde_workbench/harness_chains.py tests/test_fold_review.py
+          uv run --locked pytest -q tests/test_fold_review.py tests/test_harness_msa.py
+      - name: Fresh files, saved versions, cancellation, review and direct consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/operations/harness-sources.test.ts
+          src/operations/useHarnessSources.test.tsx src/operations/HarnessSourcesForm.test.tsx
+          src/operations/HarnessSubmissionRecovery.test.tsx
+          src/operations/HarnessReview.test.tsx src/operations/HarnessFoldInputs.test.tsx
+          src/operations/ToolQuestionnaires.test.tsx
+          src/examples/harness.test.ts src/operations/HarnessResults.test.tsx

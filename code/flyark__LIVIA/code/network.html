@@ -1,0 +1,1204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LIVIA — PPI Network</title>
+<script src="js/livia-xlsx.js?v=20261104a"></script>
+<script src="js/livia-maps.js?v=20261117b"></script>
+<script src="js/clip-pipeline.js?v=20261006a"></script>
+<script src="js/livia-wasm.js?v=20261115a"></script>
+<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="stylesheet" href="css/livia.css?v=20261116a">
+<style>
+  /* network-specific — livia.css provides the shell (body, .header, .container, .card, .btn, .input-tabs, .footer) */
+  :root{ --accent:#2471A3; --ink:#1b2733; --mut:#566370; --line:#e2e8ee; }
+  .header{ padding-left:0; padding-right:0; }
+  .header > .container, body > .container{ max-width:1500px; }
+  .dz{ border:2px dashed #b7c6d6; border-radius:10px; padding:14px; text-align:center; color:#557; cursor:pointer; transition:.15s; background:#fff; min-height:96px; display:flex; flex-direction:column; justify-content:center; }
+  .dz:hover,.dz.drag{ border-color:var(--accent); background:#eef5fb; color:var(--accent); }
+  .dz b{ color:var(--accent); }
+  .hint a{ color:var(--accent); }   /* match clip.html tone — was inheriting the vivid browser-default link blue */
+  .zones3{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px; align-items:start; margin-top:10px; }
+  .convrow{ margin-top:10px; display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+  .convrow select{ font-size:12px; padding:2px 5px; border:1px solid var(--line); border-radius:5px; }
+  .optfiles{ margin-top:12px; border-top:1px solid var(--line); padding-top:10px; }
+  .optfiles > summary, details.pop > summary{ cursor:pointer; font-weight:600; font-size:.88rem; color:var(--accent); }
+  .optfiles .opt{ font-weight:400; font-size:.78rem; color:#5E6C6C; margin-left:4px; }
+  .loadrow{ margin-top:12px; display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }
+  #incard:not(.collapsed) #chgfiles{ display:none; }
+  #incard.collapsed .incoll{ display:none; }
+  #incard.collapsed .loadrow{ margin-top:0; }
+  #chgfiles{ color:var(--accent); font-weight:600; font-size:13px; }
+  details.pop{ position:relative; }
+  details.pop > summary{ list-style:none; background:#eef3f8; border-radius:7px; padding:8px 14px; font-size:14px; }
+  details.pop > summary::-webkit-details-marker{ display:none; }
+  details.pop .panel{ position:absolute; z-index:20; top:calc(100% + 6px); left:0; background:#fff; border:1px solid var(--line); border-radius:10px; box-shadow:0 6px 18px rgba(20,40,60,.14); padding:12px 14px; display:flex; flex-direction:column; gap:10px; min-width:220px; max-width:calc(100vw - 32px); }
+  details.pop .panel.menu{ gap:4px; }
+  details.pop .panel.menu button{ text-align:left; white-space:nowrap; }
+  #display .ctrlbar{ margin-bottom:.6rem; }
+  #display{ margin-bottom:.6rem; }
+  .zonehdr{ font-weight:600; font-size:.85rem; color:#556; margin-bottom:6px; }
+  .zonehdr .opt{ font-weight:400; font-size:.76rem; color:#5E6C6C; }
+  .ctrlbar{ background:#fff; border-radius:12px; box-shadow:0 1px 3px rgba(0,0,0,0.08); padding:.8rem 1.2rem; margin-bottom:1rem; display:flex; flex-wrap:wrap; align-items:center; gap:16px; }
+  .ctrlbar.tight{ gap:12px; }
+  label.lb{ font-weight:600; font-size:.85rem; color:#555; }
+  .val{ font-variant-numeric:tabular-nums; color:var(--accent); min-width:30px; display:inline-block; }
+  .sep{ width:1px; align-self:stretch; background:var(--line); min-height:22px; }
+  input[type=range]{ vertical-align:middle; width:108px; }
+  input[type=color]{ width:26px; height:22px; padding:0; border:1px solid var(--line); border-radius:4px; background:none; cursor:pointer; vertical-align:middle; }
+  .ctrlbar select, .ctrlbar input[type=number]{ height:32px; box-sizing:border-box; padding:3px 8px; border:1px solid var(--line); border-radius:6px; font:inherit; font-size:14px; background:#fff; color:var(--ink); vertical-align:middle; }
+  .ctrlbar input[type=number]{ -moz-appearance:textfield; }
+  .ctrlbar input[type=number]::-webkit-outer-spin-button, .ctrlbar input[type=number]::-webkit-inner-spin-button{ -webkit-appearance:none; margin:0; }
+  .ctrlbar button{ background:var(--accent); color:#fff; border:0; border-radius:7px; padding:8px 16px; font-weight:600; font-size:14px; cursor:pointer; }
+  .ctrlbar button:disabled{ opacity:.45; cursor:default; }
+  .ctrlbar button.ghost{ background:#eef3f8; color:var(--accent); }
+  .fpr-seg{ display:inline-flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; vertical-align:middle; margin-left:4px; }
+  .ctrlbar .fpr-seg button{ background:#fff; color:#4A596F; border:0; border-left:1px solid var(--line); border-radius:0; padding:0 9px; height:30px; font-size:12.5px; font-weight:600; cursor:pointer; }
+  .ctrlbar .fpr-seg button:first-child{ border-left:0; }
+  .ctrlbar .fpr-seg button:hover:not(.on){ background:#eef3f8; color:var(--accent); }
+  .ctrlbar .fpr-seg button.on{ background:var(--accent); color:#fff; }
+  #status{ color:var(--mut); font-size:.85rem; }
+  .statbar{ display:flex; gap:24px; flex-wrap:wrap; margin:0 2px 14px; }
+  .statbar .s{ font-size:13px; color:var(--mut); } .statbar .s b{ color:var(--ink); font-size:16px; }
+  .main{ display:grid; grid-template-columns:1fr 340px; gap:14px; align-items:start; }
+  .netwrap{ position:relative; }
+  #net{ height:720px; background:#fff; border:1px solid var(--line); border-radius:10px; }
+  #nodeinfo{ position:absolute; top:12px; right:12px; width:210px; background:#fff; border:1px solid var(--line); border-radius:9px; box-shadow:0 4px 14px rgba(20,40,60,.12); padding:11px 13px; font-size:13px; }
+  #nodeinfo .nm{ font-weight:700; font-size:14px; word-break:break-word; }
+  #nodeinfo .meta{ color:var(--mut); margin:3px 0 9px; }
+  #nodeinfo button{ width:100%; padding:7px; font-size:13px; background:var(--accent); color:#fff; border:0; border-radius:7px; font-weight:600; cursor:pointer; }
+  #nodeinfo .x{ position:absolute; top:6px; right:9px; color:var(--mut); cursor:pointer; font-size:15px; }
+  #netsearch{ position:absolute; top:12px; left:12px; z-index:5; background:#fff; border:1px solid var(--line); border-radius:9px; box-shadow:0 4px 14px rgba(20,40,60,.12); padding:6px 8px; display:flex; align-items:center; gap:6px; }
+  #netsearch input{ height:30px; box-sizing:border-box; padding:3px 9px; border:1px solid var(--line); border-radius:6px; font:inherit; font-size:13px; width:186px; outline:none; color:var(--ink); }
+  #netsearch input:focus{ border-color:var(--accent); }
+  #netsearch input.nf{ border-color:#e64a19; background:#fff5f2; }
+  #netsearch .clr{ color:var(--mut); cursor:pointer; font-size:15px; user-select:none; padding:0 2px; }
+  #modules{ max-height:720px; overflow:auto; }
+  #modules h3{ margin:0 0 10px; font-size:15px; }
+  .mod{ border:1px solid var(--line); border-radius:8px; padding:9px 11px; margin-bottom:8px; }
+  .mod .hd{ display:flex; align-items:center; gap:8px; font-weight:600; }
+  .mod .hd input[type=color]{ flex:none; }
+  .mod .clipbtn{ margin-left:auto; font-size:11.5px; background:#eef3f8; color:var(--accent); border-radius:5px; padding:3px 7px; cursor:pointer; font-weight:600; }
+  .mod .st{ font-size:12px; color:var(--mut); margin:3px 0 4px; }
+  .mod .mem{ font-size:12px; color:#556; word-break:break-word; }
+  .hint{ color:var(--mut); font-size:13px; }
+  .hint code{ background:#f0f0f0; padding:.1rem .3rem; border-radius:4px; }
+  .hidden{ display:none!important; }
+  @media(max-width:1000px){ .main{ grid-template-columns:1fr; } #modules{ max-height:none; } }
+  @media(max-width:760px){ .zones3{ grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="container" role="main">
+    <h1><span style="color:#2471A3;">LIVIA</span> &mdash; PPI Network Builder</h1>
+    <p>Build an interaction network from lis.py output</p>
+    <div class="header-links">
+      <a href="index.html">Home</a>
+      <a href="universal.html">Prediction Analysis</a>
+      <a href="flypredictome.html">FlyPredictome</a>
+      <a href="ortholog_predictome.html">Ortholog Interactome</a>
+      <a href="dimer.html">AFDB Dimer</a>
+      <a href="monomer.html">AFDB Monomer Subdomain</a>
+      <a href="clip.html">cLIP</a>
+      <a href="network.html" class="active">PPI Network</a>
+      <a href="https://flyark.github.io/livia-atlas/" target="_blank" rel="noopener">LIVIA Atlas<span class="new-tag">new</span></a>
+      <a href="tutorials.html">Tutorials</a>
+      <a href="about.html">About</a>
+      <a href="https://github.com/flyark/LIVIA" target="_blank">GitHub</a>
+    </div>
+  </div>
+</div>
+
+<div class="container">
+  <div class="card" id="incard">
+    <div class="incoll">
+      <div style="font-size:0.82rem; color:#6B6B6B; margin-bottom:0.8rem;">
+    Need the input? Generate it with <code style="background:#d6e9f8; color:#33414E; padding:0.1rem 0.3rem; border-radius:3px; font-size:0.75rem;">lis.py</code> from <a href="https://github.com/flyark/AFM-LIS" target="_blank" style="color:#2471A3; font-weight:600;">AFM-LIS</a>.
+      </div>
+      <div class="dz" id="dz">
+          <div style="font-size:14.5px"><b>Drop CSV files</b> (or click)</div>
+          <div class="hint" style="margin-top:3px">CSV, .zip or .xlsx (+ FASTA for the cLIP hand-off)</div>
+          <input id="in" type="file" accept=".csv,.zip,.xlsx,.fasta,.fa,.faa,.fas,.fna,.mfa,.pep,.seq" multiple class="hidden">
+        </div>
+      <div class="hint" style="margin-top:6px">▶ <a id="load-ex" href="#" style="font-weight:600">Try example</a> — fly small interactome · 565 proteins in the file; those with no pair past the cutoff are left out of the network (from <a href="https://doi.org/10.64898/2026.04.14.718529" target="_blank" style="color:var(--accent)">Kim et al. 2026</a>)</div>
+      <div class="hint convrow"><label><input type="checkbox" id="mg-auto" checked> Convert IDs to gene symbols on load</label> <select id="mg-species" aria-label="Species for name conversion"><option value="">all species</option><option value="7227">fly</option><option value="9606">human</option><option value="10090">mouse</option><option value="10116">rat</option><option value="6239">worm</option><option value="7955">zebrafish</option><option value="559292">yeast</option><option value="3702">arabidopsis</option><option value="83333">E. coli</option></select> · <a id="mg-convert" href="#">convert now</a> · <a href="https://github.com/flyark/LIVIA/issues" target="_blank">names not resolving?</a></div>
+      <details class="optfiles" id="optfiles">
+        <summary>Optional files <span class="opt">identity map · node subset · cluster map · saved settings</span></summary>
+        <div class="zones3">
+          <div class="zonecol">
+            <div class="zonehdr">Identity map</div>
+            <div class="dz" id="dzmeta">
+          <div style="font-size:14.5px"><b>Relabel nodes</b> to your names</div>
+          <div class="hint" style="margin-top:3px"><code>name,chain,&lt;id cols&gt;</code> · e.g. uniprot, gene</div>
+          <input id="inmeta" type="file" accept=".csv" multiple class="hidden">
+        </div>
+            <div id="tmpl-wrap" class="hint hidden" style="margin-top:6px"><a id="tmpl" href="#" style="font-weight:600">↓ template</a> pre-filled with your predictions — fill in the IDs, drop it here.</div>
+          </div>
+          <div class="zonecol">
+            <div class="zonehdr">Node subset</div>
+            <div class="dz" id="dzsub">
+          <div style="font-size:14.5px"><b>Rebuild with only these</b></div>
+          <div class="hint" style="margin-top:3px">one <code>node</code> per row · re-runs Leiden</div>
+          <input id="insub" type="file" accept=".csv,.txt,.tsv" multiple class="hidden">
+        </div>
+            <div class="hint" style="margin-top:6px"><a id="subtmpl" href="#" style="font-weight:600">↓ current nodes</a> template · <a id="subclear" href="#" class="hidden" style="color:#c0392b; font-weight:600">✕ clear</a></div>
+          </div>
+          <div class="zonecol">
+            <div class="zonehdr">Cluster map</div>
+            <div class="dz" id="dzclust">
+          <div style="font-size:14.5px"><b>Use your own clusters</b></div>
+          <div class="hint" style="margin-top:3px"><code>node,cluster</code> per row · overrides Leiden · unlisted nodes dropped</div>
+          <input id="inclust" type="file" accept=".csv,.txt,.tsv" multiple class="hidden">
+        </div>
+            <div class="hint" style="margin-top:6px"><a id="clusttmpl" href="#" style="font-weight:600">↓ current nodes</a> template · <a id="clustclear" href="#" class="hidden" style="color:#c0392b; font-weight:600">✕ clear</a></div>
+          </div>
+        </div>
+        <div class="hint" style="margin-top:8px"><a id="impset-btn" href="#" style="font-weight:600">↑ Load saved settings</a> (a settings JSON from Download)</div>
+        <input id="impset" type="file" accept=".json" class="hidden">
+      </details>
+    </div>
+    <div class="loadrow"><span id="loaded" class="hint">No files loaded.</span> <a id="chgfiles" href="#">Change files</a></div>
+  </div>
+
+  <div class="ctrlbar" id="buildbar">
+    <span><label class="lb">iLIS &ge;</label> <input id="cut" aria-label="iLIS cutoff" type="range" min="0" max="0.9" step="0.001" value="0.223"> <input id="cutv" aria-label="iLIS cutoff value" type="number" min="0" max="1" step="0.001" value="0.223" style="width:78px"> <span class="fpr-seg" id="cut-fpr" role="group" aria-label="iLIS FPR presets"><button type="button" data-cut="0.223" class="on" title="10% FPR cutoff (iLIS ≥ 0.223)">10% FPR</button><button type="button" data-cut="0.339" title="5% FPR cutoff (iLIS ≥ 0.339)">5% FPR</button><button type="button" data-cut="0.551" title="1% FPR cutoff (iLIS ≥ 0.551)">1% FPR</button></span></span>
+    <span id="clustmode-wrap" class="hidden"><label class="lb">clustering</label> <select id="clustmode" title="user-defined: color + group by your uploaded cluster map (Leiden not run). Leiden: ignore the map and detect communities."><option value="user">user-defined</option><option value="leiden">Leiden (auto)</option></select></span>
+    <span id="labelby-wrap" class="hidden"><label class="lb">Label by</label> <select id="labelby"></select></span>
+    <details class="pop" id="clustopts">
+      <summary>Clustering</summary>
+      <div class="panel">
+        <span><label class="lb">resolution</label> <input id="res" aria-label="Leiden resolution" type="range" min="0.1" max="5" step="0.05" value="1.0"> <input id="resv" aria-label="Leiden resolution value" type="number" min="0" max="50" step="0.05" value="1.0" style="width:62px"></span>
+        <span><label class="lb">objective</label> <select id="objfn" aria-label="Leiden objective" title="modularity: standard (resolution ~0.5–3). CPM: resolution-limit-free — finds small communities; use a lower resolution near the iLIS scale (~0.2–0.5)."><option value="modularity">modularity</option><option value="CPM">CPM</option></select></span>
+        <span><label class="lb" title="seeds both Leiden and the layout: the same data, settings and seed give the same picture">seed</label> <input id="seed" aria-label="Leiden seed" type="number" min="1" step="1" value="1" style="width:56px"></span>
+      </div>
+    </details>
+    <button id="build" disabled>Build network</button>
+    <details class="pop" id="dlmenu">
+      <summary>↓ Download</summary>
+      <div class="panel menu">
+        <button id="expsvg" class="ghost hidden" title="download the region currently visible (respects zoom)">SVG (current view)</button>
+        <button id="expsvgall" class="ghost hidden" title="download the whole network">SVG (whole network)</button>
+        <button id="expcsv" class="ghost hidden">CSVs</button>
+        <button id="expcyto" class="ghost hidden" title="GraphML — open in Cytoscape (File → Import → Network)">Cytoscape (GraphML)</button>
+        <button id="expset" class="ghost" title="download current settings as JSON (reproducibility)">Settings (JSON)</button>
+      </div>
+    </details>
+    <span id="status"></span>
+  </div>
+
+  <div id="display" class="hidden">
+    <div class="ctrlbar tight">
+      <span><label class="lb">color by</label> <select id="colorby"><option value="community">community</option><option value="degree">degree</option><option value="strength">strength (Σ iLIS)</option><option value="uniform">uniform</option></select> <input id="unicolor" type="color" value="#2471A3" class="hidden"></span>
+      <span id="colorlegend" class="hint hidden"></span>
+      <span><label class="lb">layout</label> <select id="layout"><option value="force">force (live)</option><option value="fr">spring (FR)</option><option value="kk">Kamada-Kawai</option><option value="drl">DrL</option><option value="community">community</option><option value="circle">circle</option><option value="grid">grid</option></select></span>
+      <span><label class="lb">node size</label> <input id="nsize" type="range" min="0.3" max="2.5" step="0.1" value="1"> <input id="nsizev" type="number" min="0.1" max="8" step="0.1" value="1" style="width:52px"></span>
+      <span><label class="lb" title="label only the N proteins with the most partners (0 = use labels ≥ deg)">label top N</label> <input id="lbltop" type="number" min="0" max="9999" step="1" value="0" style="width:52px"></span>
+      <button id="moredisp" class="ghost" type="button" aria-expanded="false">More display ▸</button>
+    </div>
+    <div class="ctrlbar tight hidden" id="dispmore">
+      <span><label class="lb">iterations</label> <input id="layiter" type="number" min="10" max="5000" step="50" value="500" style="width:64px"></span>
+      <button id="physbtn" class="ghost" type="button" title="the force layout stops once it has settled; resume it to let nodes move again">▶ physics</button>
+      <span class="sep"></span>
+      <span><label class="lb" title="keep only each protein's k strongest edges (by iLIS): a backbone of a dense network. Communities and partner counts are unchanged. 0 = every edge">top edges/node</label> <input id="topk" type="number" min="0" max="999" step="1" value="0" style="width:52px"></span>
+      <span><label class="lb" title="hide the edges between communities"><input type="checkbox" id="intraonly"> intra-community edges only</label></span>
+      <span><label class="lb">min edges/node</label> <input id="mindeg" type="range" min="1" max="20" step="1" value="1"> <input id="mindegv" type="number" min="1" max="9999" step="1" value="1" style="width:56px"></span>
+      <span><label class="lb">edge width (by iLIS)</label> <input id="emin" type="range" min="0.5" max="10" step="0.5" value="4"> <input id="eminv" type="number" min="0" max="50" step="0.5" value="4" style="width:52px"></span>
+      <span class="sep"></span>
+      <span><label class="lb">labels ≥ deg</label> <input id="lbldeg" type="range" min="1" max="40" step="1" value="1"> <input id="lbldegv" type="number" min="1" max="9999" step="1" value="1" style="width:56px"></span>
+      <span><label class="lb">label size</label> <input id="lblsize" type="range" min="6" max="30" step="1" value="12"> <input id="lblsizev" type="number" min="4" max="60" step="1" value="12" style="width:52px"></span>
+      <span><label class="lb"><input type="checkbox" id="lbloutline" checked> label outline</label> <input id="lblstroke" type="color" value="#ffffff" title="outline color"></span>
+      <span><label class="lb">label color</label> <input id="lblcolor" type="color" value="#000000"></span>
+      <span><label class="lb"><input type="checkbox" id="nborder" checked> node border</label> <input id="bcolor" type="color" value="#000000"></span>
+      <div id="nodecolor-upload" style="flex-basis:100%"></div>
+      <span class="hint">Community colors: click a swatch in the module list.</span>
+    </div>
+  </div>
+
+  <div id="layerbar" class="hint hidden" style="margin:0 2px 10px; padding:7px 11px; background:#f0f6fb; border-radius:8px">Layer view from <b id="layer-root"></b> (Leiden colors kept) · layout <select id="layer-mode" style="font-size:12px; padding:1px 4px; border:1px solid var(--line); border-radius:5px"><option value="concentric">concentric shells</option><option value="tree">tree</option></select> · <a id="layer-reset" href="#" style="font-weight:600">⟳ back to force layout</a></div>
+  <div id="egobar" class="hint hidden" style="margin:0 2px 10px; padding:7px 11px; background:#f0f6fb; border-radius:8px">Neighbors of <b id="ego-root"></b> and the edges among them · <a id="ego-reset" href="#" style="font-weight:600">⟳ show the whole network</a></div>
+  <div class="statbar" id="stats"></div>
+
+  <div class="main">
+    <div class="netwrap">
+      <div id="net"></div>
+      <div id="netsearch" class="hidden"><input id="net-search-input" type="search" list="net-node-list" placeholder="🔍 find protein…" autocomplete="off" spellcheck="false"><span class="clr" id="net-search-clr" title="clear">×</span><datalist id="net-node-list"></datalist></div>
+      <div id="nodeinfo" class="hidden"><span class="x" id="ni-x">×</span><div class="nm" id="ni-name"></div><div class="meta" id="ni-meta"></div><button id="ni-clip">Open in cLIP →</button><button id="ni-ego" style="margin-top:6px; background:#eef3f8; color:var(--accent)">◎ Neighbors only</button><button id="ni-layer" style="margin-top:6px; background:#eef3f8; color:var(--accent)">⊕ Layers from here</button></div>
+    </div>
+    <div id="modules"><h3>Modules</h3><div class="hint">Build a network to see communities.</div></div>
+  </div>
+</div>
+
+<div class="footer">
+  <a href="https://github.com/flyark/LIVIA" target="_blank">LIVIA GitHub</a> &middot; <a href="https://github.com/flyark/AFM-LIS" target="_blank">AFM-LIS GitHub</a>
+  <br>
+  <a href="https://doi.org/10.64898/2026.05.01.721633" target="_blank">Kim &amp; Perrimon (2026)</a>
+  <br>
+  Ah-Ram Kim &middot; Harvard Medical School
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const RAWPAIRS = new Map();         // prediction name -> {name, ci, cj, s1, s2, iLIS, ipTM}  (best iLIS per prediction)
+const FILES_RAW = [];              // [{name,text}] kept for the cLIP hand-off
+// A network the LIVIA Atlas sent (its pair table has scores, not interaction residues): cLIP for a protein opens that
+// protein's Atlas page, which clusters its full predictions. { url, sp, keys: { symbol: Atlas key } } or null
+let ATLAS_SRC = null;
+const ATLAS_OK = /^(https:\/\/flyark\.github\.io\/livia-atlas\/|http:\/\/(\[::1\]|localhost|127\.0\.0\.1)(:\d+)?\/)/;   // the published Atlas, or a local copy
+let FASTA_RAW = '';                 // concatenated FASTA text (paired or per-symbol) for the cLIP hand-off
+let NAME_OF = {};                  // resolved node id -> Set(original prediction names)  (for the hand-off filter)
+let FILECOUNT = 0, NETWORK = null, NODES = null, EDGES = null, LAST = null;
+let META = null, META_COL = null, COMMCOLORS = {}, SUBSET = null, LAYER_ROOT = null;   // SUBSET: node ids to keep (tab 3); LAYER_ROOT: BFS-shell root or null
+let USERCLUST = null;              // user-supplied node id -> cluster label (Map); overrides Leiden, drops unlisted nodes
+let NODECOLORS = {};               // per-node custom color override (node id -> hex); wins over the 'color by' mode
+let NET_HL = null;                 // node id currently highlighted by the search box (null = none)
+let EGO_ROOT = null, PHYS = false, DRAWN = '';   // neighbors-only view root; whether the force layout is running; the drawn node/edge set
+
+// ---------- helpers ----------
+// community colors, the Atlas's list: Tableau 10 without its gray (up to nine communities), then Tableau 20's pale pairs (up to 18),
+// Tableau 20b and 20c (grays dropped, up to 54), then golden-angle hues kept mid-tone. One list, so a community keeps its color whatever the count
+const COMM_TAB = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2','#bcbd22','#17becf',
+  '#aec7e8','#ffbb78','#98df8a','#ff9896','#c5b0d5','#c49c94','#f7b6d2','#dbdb8d','#9edae5',
+  '#393b79','#5254a3','#6b6ecf','#9c9ede','#637939','#8ca252','#b5cf6b','#cedb9c','#8c6d31','#bd9e39','#e7ba52','#e7cb94','#843c39','#ad494a','#d6616b','#e7969c','#7b4173','#a55194','#ce6dbd','#de9ed6',
+  '#3182bd','#6baed6','#9ecae1','#c6dbef','#e6550d','#fd8d3c','#fdae6b','#fdd0a2','#31a354','#74c476','#a1d99b','#c7e9c0','#756bb1','#9e9ac8','#bcbddc','#dadaeb'];
+function commColor(i){
+  if (i >= 0 && i < COMM_TAB.length) return COMM_TAB[i];
+  const h=(i*137.508)%360, s=(62+(i%2)*14)/100, l=(42+(i%3)*8)/100, a=s*Math.min(l,1-l);
+  const f=n=>{ const k=(n+h/30)%12, c=l-a*Math.max(-1,Math.min(k-3,9-k,1)); return Math.round(255*c).toString(16).padStart(2,'0'); };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+const commHex = c => COMMCOLORS[c] || commColor(c);
+// user-defined clustering: a loaded cluster map is used unless the toggle says Leiden
+function userClusterMode(){ return !!(USERCLUST && USERCLUST.size && (!$('clustmode') || $('clustmode').value === 'user')); }
+// display name for a community index: the user's label if any (a bare number → "Community N"), else 1-based "Community N"
+function commLabel(c){ const nm = LAST && LAST.commNames && LAST.commNames[c]; if (nm == null) return 'Community ' + (c + 1); return /^\d+$/.test(nm) ? 'Community ' + nm : nm; }
+// value written to exports for a community index: the user's raw label if any, else 1-based index
+const commOut = c => (LAST && LAST.commNames && LAST.commNames[c] != null) ? LAST.commNames[c] : (c + 1);
+// membership from the user's cluster map: distinct labels → indices ordered by size (largest first, matches Leiden)
+function userMembership(nodes){
+  const labelOf = nodes.map(s => USERCLUST.get(s));
+  const freq = new Map(); for (const l of labelOf) freq.set(l, (freq.get(l) || 0) + 1);
+  const order = [...freq.keys()].sort((a, b) => (freq.get(b) - freq.get(a)) || (a < b ? -1 : a > b ? 1 : 0));
+  const idx = new Map(order.map((l, i) => [l, i]));
+  return { membership: labelOf.map(l => idx.get(l)), commNames: order.map(String) };
+}
+// degree = incident unique-pair edges (what igraph g.degree() returns), for the Leiden-free path
+function degreesOf(nodes, edges){
+  const d = new Map(nodes.map(s => [s, 0]));
+  for (const e of edges){ d.set(e.a, (d.get(e.a) || 0) + 1); d.set(e.b, (d.get(e.b) || 0) + 1); }
+  return nodes.map(s => d.get(s) || 0);
+}
+function gradient(x){   // 0..1 -> hex (light gray-blue -> LIVIA blue -> dark)
+  x=Math.max(0,Math.min(1,x)); const S=[[237,242,247],[93,156,214],[26,58,92]];
+  const j=x<0.5?0:1, u=x<0.5?x*2:(x-0.5)*2, a=S[j], c=S[j+1], h=k=>Math.round(a[k]+(c[k]-a[k])*u).toString(16).padStart(2,'0');
+  return `#${h(0)}${h(1)}${h(2)}`;
+}
+function nodeColors(disp){   // per-displayed-node fill based on the 'color by' mode (custom overrides win)
+  const mode=$('colorby').value, { nodes, membership, degree }=disp;
+  let base;
+  if (mode==='uniform'){ const c=$('unicolor').value; base = nodes.map(()=>c); }
+  else if (mode==='community') base = nodes.map((s,i)=>commHex(membership[i]));
+  else {
+    const vals = mode==='strength' ? nodes.map(s=>(LAST.strengthMap.get(s)||0)) : degree.slice();
+    const lo=Math.min(...vals), hi=Math.max(...vals);
+    base = vals.map(v=>gradient(hi>lo?(v-lo)/(hi-lo):0.5));
+  }
+  return base.map((c,i)=> NODECOLORS[nodes[i]] || c);
+}
+function updateColorLegend(){
+  const mode=$('colorby').value, el=$('colorlegend'); $('unicolor').classList.toggle('hidden', mode!=='uniform');
+  if ((mode!=='degree'&&mode!=='strength')||!LAST){ el.classList.add('hidden'); return; }
+  const disp=getDisplay(), vals = mode==='strength' ? disp.nodes.map(s=>LAST.strengthMap.get(s)||0) : disp.degree;
+  const lo=Math.min(...vals), hi=Math.max(...vals), f=mode==='strength'?1:0;
+  el.innerHTML = `${mode==='strength'?'Σ iLIS':'degree'} ${lo.toFixed(f)} <span style="display:inline-block;width:70px;height:10px;border-radius:3px;vertical-align:middle;margin:0 4px;background:linear-gradient(90deg,${gradient(0)},${gradient(.5)},${gradient(1)})"></span> ${hi.toFixed(f)}`;
+  el.classList.remove('hidden');
+}
+// which nodes carry a label: the N with the most partners when "label top N" is set, else degree ≥ "labels ≥ deg"
+function labelSet(nodes, degree){
+  const top = +$('lbltop').value || 0;
+  if (top > 0) return new Set(nodes.map((s,i)=>[s,degree[i]]).sort((a,b)=>b[1]-a[1] || (a[0]<b[0]?-1:a[0]>b[0]?1:0)).slice(0, top).map(x=>x[0]));
+  const d = +$('lbldegv').value || 1; return new Set(nodes.filter((s,i)=>degree[i]>=d));
+}
+const nodeRadius = (deg, dmax, scale) => (6 + 30*Math.sqrt(deg/(dmax||1))) * (scale||1);
+const edgeWidth  = (il, imin, imax, scale) => 0.3 + (+scale) * Math.max(0, Math.min(1, (il - imin) / ((imax - imin) || 1)));   // width ∝ iLIS
+const esc = s => String(s).replace(/[<&>]/g, c=>({'<':'&lt;','&':'&amp;','>':'&gt;'}[c]));
+const nodeLabel = s => s;   // node id is already the resolved identity (see resolveId)
+function setStatus(t){ $('status').textContent = t || ''; }
+
+// ---------- identity map ----------
+function parseIdentityMap(text){
+  const rows = CLIPPipeline.parseCSV(text).rows;
+  if (!rows || !rows.length) return null;
+  const lc = s => String(s||'').toLowerCase(), ks = Object.keys(rows[0]);
+  const nameK = ks.find(k=>lc(k)==='name'), chainK = ks.find(k=>lc(k)==='chain');
+  if (nameK && chainK){                                 // mode 1: per-prediction (name, chain) -> ids (cLIP-style)
+    const skip = new Set([nameK, chainK, ks.find(k=>lc(k)==='start'), ks.find(k=>lc(k)==='end')]);
+    const cols = ks.filter(k=>!skip.has(k)), byKey = {};
+    for (const r of rows){ const nm=String(r[nameK]||'').trim(), ch=String(r[chainK]||'').trim(); if(!nm) continue; byKey[nm+'\x00'+ch]=r; }
+    return { mode:'namechain', byKey, cols, _raw:text };
+  }
+  const cols = ks.slice(), lookup = new Map();           // mode 2: lookup table (e.g. PANGEA) — any column value -> its row
+  for (const r of rows){ for (const k of cols){ const v=String(r[k]||'').trim(); if(v && !lookup.has(v)) lookup.set(v, r); } }
+  return { mode:'lookup', lookup, cols, _raw:text };
+}
+function identityLabel(name, chain, col){
+  if (!META || !META.byKey) return null;
+  const m = META.byKey[String(name).trim()+'\x00'+String(chain||'').trim()] || META.byKey[String(name).trim()+'\x00'];
+  if (!m) return null;
+  if (col && m[col] != null && String(m[col]).trim()) return String(m[col]).trim();
+  for (const c of META.cols){ if (m[c]!=null && String(m[c]).trim()) return String(m[c]).trim(); }
+  return null;
+}
+function resolveId(name, chain, sym){   // identity-map label if given, else the split Symbol
+  if (!META) return sym;
+  if (META.mode === 'lookup'){ const r = META.lookup.get(String(sym).trim()); return (r && META_COL && String(r[META_COL]||'').trim()) || sym; }
+  return identityLabel(name, chain, META_COL) || sym;
+}
+function rebuildIfBuilt(){ if (LAST) build(); }   // re-resolve identities / re-apply subset + re-run Leiden
+
+// ---------- load ----------
+async function routeFiles(list){
+  const FA = /\.(fasta|fa|faa|fas|fna|mfa|pep|seq)$/i;
+  const raw = [...list].filter(f=>/\.(csv|zip|xlsx|fasta|fa|faa|fas|fna|mfa|pep|seq)$/i.test(f.name)); if(!raw.length) return;
+  setStatus(`Reading ${raw.length} file(s)…`);
+  const items = [];                                     // {name,text} — a dropped .zip of lis.py CSVs (+ FASTA) is expanded here
+  let metaText = null;                                  // a bundled identity_map.csv → routed to the metadata parser, not the lis-CSV bucket
+  const looksLikeIdMap = (nm, tx) => {
+    if (/identity[_-]?map/i.test(nm)) return true;
+    const h = (String(tx).split(/\r?\n/)[0] || '').toLowerCase().split(',').map(s => s.trim());
+    return h.includes('name') && h.includes('chain') && (h.includes('uniprot') || h.includes('gene') || h.includes('label'));
+  };
+  const sortText = (name, text) => {
+    if (FA.test(name) || /^\s*>/.test(text)) { FASTA_RAW += (FASTA_RAW ? '\n' : '') + text; return; }
+    if (!metaText && !META && looksLikeIdMap(name, text)) { metaText = text; return; }
+    items.push({ name, text });
+  };
+  for (const f of raw){
+    if (/\.xlsx$/i.test(f.name)){                        // collaborator workbook → lis.py-style CSV, then the usual path
+      try {
+        const wb = LiviaXlsx.parseXlsx(new Uint8Array(await f.arrayBuffer()));
+        const sh = LiviaXlsx.pickPairSheet(wb);
+        if (!sh){ setStatus(`no sheet in ${f.name} has Symbol_1/Symbol_2/iLIS columns`); continue; }
+        const sp = $('mg-species'), tax = LiviaXlsx.speciesHint(sh.rows);
+        if (sp && tax && !sp.value && [...sp.options].some(o=>o.value===tax)) sp.value = tax;
+        items.push({ name:`${f.name} · ${sh.name}`, text: LiviaXlsx.sheetToCsv(sh, LiviaXlsx.lengthMap(wb)) });
+        const seqs = LiviaXlsx.sequenceSheet(wb); if (seqs){ const r = LiviaXlsx.sequenceSheetToFasta(seqs); if (r.fasta) FASTA_RAW += (FASTA_RAW ? '\n' : '') + r.fasta; }   // Sequence sheet → FASTA for the hand-off
+      } catch(e){ setStatus('could not read the workbook: '+e.message); }
+      continue;
+    }
+    if (/\.zip$/i.test(f.name)){
+      if (typeof fflate === 'undefined'){ setStatus('zip support failed to load (needs an internet connection)'); continue; }
+      try { const entries = fflate.unzipSync(new Uint8Array(await f.arrayBuffer())), dec = new TextDecoder();
+        for (const nm in entries){ if (nm.startsWith('__MACOSX/') || nm.endsWith('/')) continue; const base = nm.split('/').pop(); if (/\.(csv|fasta|fa|faa|fas|fna|mfa|pep|seq)$/i.test(base)) sortText(base, dec.decode(entries[nm])); }
+      } catch(e){ setStatus('could not read the zip: '+e.message); continue; }
+    } else { try { sortText(f.name, await f.text()); } catch(e){} }
+  }
+  if (metaText && !META){                               // a bundled identity map → set up META (same as the dedicated meta box)
+    try { META = parseIdentityMap(metaText); } catch(e){ META = null; }
+    if (META){
+      META_COL = (META.mode==='lookup' ? META.cols.find(c=>/symbol/i.test(c)) : null) || META.cols[0] || null;
+      $('labelby').innerHTML = META.cols.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
+      $('labelby').value = META_COL || '';
+      $('labelby-wrap').classList.remove('hidden');
+    }
+  }
+  if (!items.length){ setStatus(FASTA_RAW ? 'FASTA loaded, but no lis.py CSV in the upload — add the CSV/XLSX.' : 'No CSVs found in the upload.'); return; }
+  setStatus(`Parsing ${items.length} file(s)…`);
+  const seenCols = new Set();   // for the message when no file has lis.py's columns
+  for (const it of items){
+    let rows;
+    try { rows = CLIPPipeline.convertRows(CLIPPipeline.parseCSV(it.text).rows); } catch(e){ continue; }
+    if (rows[0]) Object.keys(rows[0]).forEach((k) => seenCols.add(k));
+    FILES_RAW.push({ name:it.name, text:it.text });
+    for (const r of rows){                              // one record per prediction, best-iLIS row (identities resolved at build)
+      const nm=r.name; if(!nm) continue;
+      const il=+r.iLIS||0, prev=RAWPAIRS.get(nm);
+      if(!prev||il>prev.iLIS) RAWPAIRS.set(nm,{ name:nm, ci:r.chain_i||'', cj:r.chain_j||'', s1:r.Symbol_1, s2:r.Symbol_2, iLIS:il, ipTM:+r.ipTM||0 });
+    }
+    FILECOUNT++;
+  }
+  if (!RAWPAIRS.size){ const cols=[...seenCols].slice(0,12).join(', '); setStatus(`No pair could be read: a network needs lis.py's columns, at least name (or Symbol_1 and Symbol_2) and iLIS. ${cols ? `This file has: ${cols}${seenCols.size>12?', …':''}.` : 'The file could not be read as a table.'}`); return; }
+  updateLoaded();
+  if (RAWPAIRS.size && $('mg-auto') && $('mg-auto').checked && !META) await maybeAutoConvert();
+}
+let _netExBusy = false;
+async function loadExample(){
+  if (_netExBusy) return;
+  if (location.protocol === 'file:'){   // file:// blocks fetch of the bundled zip; dropping your own CSVs still works
+    setStatus('Bundled example needs an http server. Run  python3 -m http.server 8000  in the LIVIA folder — or drop your own lis.py CSVs, which works offline.');
+    return;
+  }
+  _netExBusy = true;
+  setStatus('Loading example…');
+  RAWPAIRS.clear(); ATLAS_SRC = null; FILES_RAW.length=0; FASTA_RAW=''; FILECOUNT=0; META=null; META_COL=null;
+  try {
+    const resp = await fetch('examples/fly_pathway_interactome.zip');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const buf = await resp.arrayBuffer();
+    await routeFiles([new File([buf], 'fly_pathway_interactome.zip', {type:'application/zip'})]);
+    if (RAWPAIRS.size){ await build(); await afterBuild(URLP); }
+  } catch(e){ setStatus('Could not load the example: '+(e.message||e)); }
+  finally { _netExBusy = false; }
+}
+async function routeMeta(list){
+  const f=[...list].filter(x=>/\.csv$/i.test(x.name))[0]; if(!f) return;
+  try { META = parseIdentityMap(await f.text()); } catch(e){ META=null; }
+  if (META){
+    META_COL = (META.mode==='lookup' ? META.cols.find(c=>/symbol/i.test(c)) : null) || META.cols[0] || null;
+    $('labelby').innerHTML = META.cols.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
+    $('labelby').value = META_COL || '';
+    $('labelby-wrap').classList.remove('hidden');
+  }
+  updateLoaded(); rebuildIfBuilt();
+}
+async function routeSubset(list){                       // tab 3: a plain list of node names to keep
+  const f=[...list].filter(x=>/\.(csv|txt|tsv)$/i.test(x.name))[0]; if(!f) return;
+  const lines=(await f.text()).split(/\r?\n/).map(l=>l.split(/[,\t]/)[0].trim()).filter(Boolean);
+  if(lines[0] && /^(node|name|symbol|id|protein)$/i.test(lines[0])) lines.shift();
+  SUBSET = lines.length ? new Set(lines) : null;
+  $('subclear').classList.toggle('hidden', !SUBSET);
+  updateLoaded(); rebuildIfBuilt();
+}
+function clearSubset(){ SUBSET=null; $('subclear').classList.add('hidden'); updateLoaded(); rebuildIfBuilt(); }
+function parseClusterMap(text){                          // node -> cluster label; auto-detects LIVIA's own network_communities.csv (Symbol,community)
+  const rows = CLIPPipeline.parseCSV(text).rows; if(!rows || !rows.length) return null;
+  const ks = Object.keys(rows[0]);
+  const nodeK = ks.find(k=>/^(node|name|symbol|id|protein|gene)$/i.test(k)) || ks[0];
+  const clK = ks.find(k=>/^(cluster|community|module|group|class|label)$/i.test(k)) || ks.find(k=>k!==nodeK) || ks[1];
+  if(!clK) return null;
+  const m = new Map();
+  for (const r of rows){ const n=String(r[nodeK]!=null?r[nodeK]:'').trim(), c=String(r[clK]!=null?r[clK]:'').trim(); if(n && c!=='') m.set(n,c); }
+  return m.size ? m : null;
+}
+async function routeCluster(list){                       // tab 4: node -> cluster label; overrides Leiden, drops unlisted nodes
+  const f=[...list].filter(x=>/\.(csv|txt|tsv)$/i.test(x.name))[0]; if(!f) return;
+  try { USERCLUST = parseClusterMap(await f.text()); } catch(e){ USERCLUST=null; }
+  const on = !!(USERCLUST && USERCLUST.size);
+  if(!on) setStatus('Cluster map: no node,cluster rows found — check the header (node,cluster or Symbol,community).');
+  $('clustmode-wrap').classList.toggle('hidden', !on);
+  $('clustclear').classList.toggle('hidden', !on);
+  if(on && $('clustmode')) $('clustmode').value='user';
+  updateLoaded(); rebuildIfBuilt();
+}
+function clearCluster(){ USERCLUST=null; $('clustmode-wrap').classList.add('hidden'); $('clustclear').classList.add('hidden'); updateLoaded(); rebuildIfBuilt(); }
+async function convertViaMyGene(){   // node names/IDs -> official symbols: mygene.info (symbol/alias/entrez/FBgn/accession) + UniProt fallback (GENE_SPECIES entry names)
+  if (!RAWPAIRS.size){ setStatus('Load lis.py CSVs first.'); return; }
+  const ids = [...new Set([...RAWPAIRS.values()].flatMap(r=>[r.s1, r.s2]).filter(Boolean))];
+  const baseOf = new Map(ids.map(id=>[id, id.replace(/_\d+_\d+$/,'')]));   // drop fragment suffix (BASE_start_end)
+  const bases = [...new Set(baseOf.values())], species = $('mg-species').value, sym = new Map();
+  const warn = [];                                                          // each source is best-effort: one being down must not abort the other
+  try {                                                                     // 1) mygene.info (symbol/alias/entrez/FBgn/accession)
+    for (let i=0;i<bases.length;i+=800){
+      const chunk = bases.slice(i, i+800); setStatus(`Converting (mygene.info)… ${Math.min(i+800,bases.length)}/${bases.length}`);
+      const body = new URLSearchParams(); body.set('q', chunk.join(',')); body.set('scopes','symbol,alias,retired,entrezgene,flybase,uniprot,ensembl.protein,refseq,accession'); body.set('fields','symbol'); if(species) body.set('species', species);
+      const r = await fetch('https://mygene.info/v3/query', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body });
+      if (!r.ok) throw new Error('HTTP '+r.status);                          // a 502/503 has no CORS headers → surfaces as "Failed to fetch"; treat as unavailable
+      const res = await r.json();
+      for (const h of res){ if(!h.notfound && h.symbol && !sym.has(h.query)) sym.set(h.query, h.symbol); }
+    }
+  } catch(e){ warn.push('mygene.info unavailable ('+(e.message||e)+')'); }
+  try {                                                                     // 2) UniProt fallback for whatever mygene missed: entry names (GENE_YEAST) + accessions
+    const missing = bases.filter(b=>!sym.has(b));
+    for (let i=0;i<missing.length;i+=80){
+      const chunk = missing.slice(i, i+80); setStatus(`Converting (UniProt)… ${Math.min(i+80,missing.length)}/${missing.length}`);
+      const accRE = /^([OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2})$/;   // UniProt accession vs entry name
+      const q = chunk.map(x=>accRE.test(x) ? `accession:${x}` : `id:${x}`).join(' OR ');
+      const r = await fetch(`https://rest.uniprot.org/uniprotkb/search?query=${encodeURIComponent('('+q+')')}&fields=id,accession,gene_primary&format=json&size=500`);
+      if (!r.ok) throw new Error('HTTP '+r.status);
+      const res = await r.json();
+      const m = {}; for (const rr of (res.results||[])){ const g=rr.genes&&rr.genes[0]&&rr.genes[0].geneName&&rr.genes[0].geneName.value; if(g){ m[rr.uniProtkbId]=g; m[rr.primaryAccession]=g; } }
+      for (const b of chunk){ if(m[b]) sym.set(b, m[b]); }
+    }
+  } catch(e){ warn.push('UniProt unavailable ('+(e.message||e)+')'); }
+  const note = warn.length ? ' · ' + warn.join(' · ') : '';
+  const lookup = new Map();
+  for (const id of ids){ const s = sym.get(baseOf.get(id)); if(s) lookup.set(id, { input:id, symbol:s }); }
+  if (!lookup.size){ setStatus(`No names converted — keeping raw IDs.${warn.length ? ' ' + warn.join('; ') : ' Check the species / ID format.'} You can still build the network.`); return; }
+  META = { mode:'lookup', lookup, cols:['input','symbol'], _raw:null }; META_COL='symbol';
+  $('labelby').innerHTML = META.cols.map(c=>`<option value="${c}">${c}</option>`).join(''); $('labelby').value='symbol'; $('labelby-wrap').classList.remove('hidden');
+  setStatus(`Converted ${lookup.size}/${ids.length} names → symbols.${note}`);
+  updateLoaded(); rebuildIfBuilt();
+}
+function maybeAutoConvert(){   // auto-run name→symbol conversion when loaded names look like IDs (FBpp/FBgn/entry name/accession/entrez)
+  const syms=new Set(); for (const r of RAWPAIRS.values()){ if(r.s1) syms.add(r.s1); if(r.s2) syms.add(r.s2); }
+  const ids=[...syms], idLike=ids.filter(n=>/^FB(pp|gn|tr)\d+$/i.test(n)||/_(HUMAN|MOUSE|RAT|YEAST|DROME|CAEEL|DANRE|ARATH|SCHPO|BOVIN|CHICK|XENLA|PIG|HORSE|RABIT)(_\d+_\d+)?$/i.test(n)||/^[A-NR-Z][0-9][A-Z0-9]{3}[0-9]/.test(n)||/^\d+$/.test(n)).length;
+  if (ids.length && idLike/ids.length >= 0.3) return convertViaMyGene();
+}
+function rawIdFor(resolvedId){   // a raw split-symbol that resolves to this node (for the cLIP hand-off after a lookup relabel)
+  for (const r of RAWPAIRS.values()){ if(resolveId(r.name,r.ci,r.s1)===resolvedId) return r.s1; if(resolveId(r.name,r.cj,r.s2)===resolvedId) return r.s2; }
+  return resolvedId;
+}
+function updateLoaded(){
+  const nP = new Set(); for (const r of RAWPAIRS.values()){ nP.add(resolveId(r.name,r.ci,r.s1)); nP.add(resolveId(r.name,r.cj,r.s2)); }
+  $('loaded').innerHTML = FILECOUNT
+    ? `✓ ${FILECOUNT} file(s) · <b>${RAWPAIRS.size.toLocaleString()}</b> predictions · <b>${nP.size.toLocaleString()}</b> proteins${META?` · identity map ✓ (${META.mode==='lookup'?'lookup':'name+chain'}, ${META.cols.length} cols)`:''}${SUBSET?` · <b>subset ${SUBSET.size.toLocaleString()} nodes</b>`:''}${(USERCLUST&&USERCLUST.size)?` · <b>cluster map ${USERCLUST.size.toLocaleString()} nodes</b>`:''}`
+    : 'No files loaded.';
+  $('build').disabled = !RAWPAIRS.size;
+  $('tmpl-wrap').classList.toggle('hidden', !RAWPAIRS.size);
+}
+
+// ---------- vis-network: fetched on the first Build, not with the page ----------
+let VIS_P = null;
+function ensureVis(){
+  if (window.vis && window.vis.Network) return Promise.resolve(window.vis);
+  return VIS_P || (VIS_P = new Promise((res,rej)=>{ const s=document.createElement('script'); s.src='https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js'; s.onload=()=>res(window.vis); s.onerror=()=>{ VIS_P=null; rej(new Error('The network drawing library (vis-network) did not load.')); }; document.head.appendChild(s); }));
+}
+
+// ---------- WebAssembly Leiden + layouts (with pure-JS fallback inside livia-wasm.js) ----------
+let WASM_P = null;
+function ensureWasm(){
+  if (window.LiviaWasm) return window.LiviaWasm.ready();
+  if (!WASM_P){
+    WASM_P = new Promise((res)=>{
+      const s = document.createElement('script');
+      s.src = 'js/livia-wasm.js?v=20261115a';
+      s.onload = () => { if (!window.LiviaWasm) WASM_P = null; (window.LiviaWasm ? window.LiviaWasm.ready() : Promise.resolve(false)).then(res); };
+      s.onerror = () => { s.remove(); WASM_P = null; res(false); };
+      document.head.appendChild(s);
+    });
+  }
+  return WASM_P;
+}
+async function leiden(nodes, edges, res, obj, seed){
+  await ensureWasm();
+  if (!window.LiviaWasm) throw new Error('The graph engine (js/livia-wasm.js) did not load; reload the page and try again.');
+  const idx = new Map(nodes.map((s,i)=>[s,i]));
+  const idxEdges = edges.map(e=>[idx.get(e.a), idx.get(e.b), e.iLIS]);
+  return window.LiviaWasm.leidenNetwork(nodes.length, idxEdges, res, obj, 10, seed);
+}
+
+// ---------- build ----------
+function buildEdges(cut){                               // resolve identities, best iLIS per resolved pair, index original names for the hand-off
+  const best=new Map(); NAME_OF={}; let dup=0; const useUser=userClusterMode(), dropped=new Set();
+  for (const r of RAWPAIRS.values()){
+    const a=resolveId(r.name,r.ci,r.s1), b=resolveId(r.name,r.cj,r.s2);
+    if(a){ (NAME_OF[a]=NAME_OF[a]||new Set()).add(r.name); } if(b){ (NAME_OF[b]=NAME_OF[b]||new Set()).add(r.name); }
+    if(!a||!b||a===b||!(r.iLIS>=cut)) continue;
+    if(SUBSET && (!SUBSET.has(a) || !SUBSET.has(b))) continue;   // node-subset filter (tab 3)
+    if(useUser){                                        // user clusters: keep only nodes present in the map (unlisted dropped)
+      if(!USERCLUST.has(a)) dropped.add(a); if(!USERCLUST.has(b)) dropped.add(b);
+      if(!USERCLUST.has(a) || !USERCLUST.has(b)) continue;
+    }
+    const key=a<b?a+'\x01'+b:b+'\x01'+a, prev=best.get(key);
+    if(prev) dup++;                                     // same protein pair seen again -> keep the higher iLIS
+    if(!prev||r.iLIS>prev.iLIS) best.set(key,{a,b,iLIS:r.iLIS,ipTM:r.ipTM});
+  }
+  return { edges:[...best.values()], dup, dropped:dropped.size };
+}
+async function build(){
+  if (!RAWPAIRS.size) return;
+  $('build').disabled = true;
+  try {
+    const visP = ensureVis(); visP.catch(()=>{});   // alongside Leiden; awaited before the first draw
+    const useUser = userClusterMode();
+    const cut=+$('cutv').value, res=+$('resv').value, obj=$('objfn').value, seed=+$('seed').value||1;
+    const { edges, dup, dropped } = buildEdges(cut);
+    if(!edges.length){ setStatus(useUser?'No edges among the mapped nodes at this cutoff.':SUBSET?'No edges among the subset at this cutoff.':'No edges above this iLIS cutoff — lower the slider.'); $('build').disabled=false; return; }
+    const nodeSet=new Set(); edges.forEach(e=>{nodeSet.add(e.a);nodeSet.add(e.b);});
+    const nodes=[...nodeSet];
+    const t0=performance.now();
+    let membership, degree, commNames=null;
+    if (useUser){                                        // user-defined clusters — no Leiden needed
+      setStatus(`Applying your cluster map to ${nodes.length} nodes…`);
+      ({ membership, commNames } = userMembership(nodes));
+      degree = degreesOf(nodes, edges);
+    } else {
+      await ensureWasm();
+      setStatus(`Running Leiden on ${nodes.length} nodes / ${edges.length} edges…`);
+      ({ membership, degree } = await leiden(nodes, edges, res, obj, seed));
+      // Renumber Leiden communities so Community 1, 2, 3... match the Modules display order (≥3 proteins first, by intra-community edges then mean iLIS)
+      const cIdx0 = new Map(nodes.map((s, i) => [s, membership[i]]));
+      const stats = new Map();
+      membership.forEach((c) => { let o = stats.get(c); if (!o) { o = { c, n: 0, e: 0, sum: 0 }; stats.set(c, o); } o.n++; });
+      edges.forEach((e) => { const ca = cIdx0.get(e.a); if (ca === cIdx0.get(e.b)) { const o = stats.get(ca); if (o) { o.e++; o.sum += e.iLIS; } } });
+      const ordered = [...stats.values()].sort((a, b) => ((a.n >= 3 ? 0 : 1) - (b.n >= 3 ? 0 : 1)) || (b.e - a.e) || ((b.e ? b.sum / b.e : 0) - (a.e ? a.sum / a.e : 0)) || (b.n - a.n));
+      const remap = new Map(ordered.map((o, idx) => [o.c, idx]));
+      membership = membership.map((c) => remap.get(c));
+    }
+    const strengthMap=new Map(nodes.map(s=>[s,0])); edges.forEach(e=>{ strengthMap.set(e.a,strengthMap.get(e.a)+e.iLIS); strengthMap.set(e.b,strengthMap.get(e.b)+e.iLIS); });
+    await visP;
+    LAST = { nodes, edges, membership, degree, strengthMap, commNames };
+    render(getDisplay());
+    renderModules(LAST); updateColorLegend();
+    const nComm = Math.max(...membership)+1;
+    $('stats').innerHTML = [['proteins',nodes.length],['edges',edges.length],['communities',nComm],['iLIS &ge;',cut.toFixed(3)], useUser?['clusters','user-defined']:['Leiden',Math.round(performance.now()-t0)+' ms'], dup?['duplicate pairs',dup+' → max iLIS']:null, (useUser&&dropped)?['dropped',dropped+' unmapped']:null, SUBSET?['subset','on']:null]
+      .filter(Boolean).map(([k,v])=>`<span class="s">${k}<br><b>${v}</b></span>`).join('');
+    $('display').classList.remove('hidden'); $('incard').classList.add('collapsed'); $('expsvg').classList.remove('hidden'); $('expsvgall').classList.remove('hidden'); $('expcsv').classList.remove('hidden'); $('expcyto').classList.remove('hidden');
+    populateNetSearch();
+    setStatus('');
+  } catch(e){ setStatus('Error: '+(e.message||e)); }
+  $('build').disabled = false;
+}
+
+// ---------- render (vis-network) ----------
+function getDisplay(){                                  // what is drawn: min edges/node, top edges/node and intra-community filters (the Leiden result and partner counts are unchanged)
+  const minDeg = +$('mindegv').value, topk = +$('topk').value || 0, intra = $('intraonly').checked;
+  let d = LAST;
+  if (minDeg > 1){
+    const { nodes, edges, membership, degree } = LAST;
+    const keep=new Set(), dn=[], dm=[], dd=[];
+    nodes.forEach((s,i)=>{ if(degree[i]>=minDeg){ keep.add(s); dn.push(s); dm.push(membership[i]); dd.push(degree[i]); } });
+    d = { nodes:dn, membership:dm, degree:dd, edges: edges.filter(e=>keep.has(e.a)&&keep.has(e.b)) };
+  }
+  if (!(topk > 0) && !intra) return d;
+  let edges = d.edges;
+  if (intra){ const c=new Map(d.nodes.map((s,i)=>[s,d.membership[i]])); edges = edges.filter(e=>c.get(e.a)===c.get(e.b)); }
+  if (topk > 0){                                          // an edge stays when it is among the k strongest of either end (ties: the pair names)
+    const by=new Map(); edges.forEach(e=>{ for (const n of [e.a,e.b]){ if(!by.has(n)) by.set(n,[]); by.get(n).push(e); } });
+    const kept=new Set(), ord=(x,y)=>y.iLIS-x.iLIS || (x.a+x.b<y.a+y.b?-1:1);
+    for (const list of by.values()) list.sort(ord).slice(0, topk).forEach(e=>kept.add(e));
+    edges = edges.filter(e=>kept.has(e));
+  }
+  return { ...d, edges };
+}
+const drawnSig = (d) => d.nodes.join('\x01') + '\x02' + d.edges.map(e=>e.a+'\x01'+e.b).join('\x02');
+function render({ nodes, edges, membership, degree }, still){   // still: positions come from a fixed layout, no physics
+  DRAWN = drawnSig({ nodes, edges });
+  const dmax=Math.max(1,...degree), iv=edges.map(e=>e.iLIS), imax=(iv.length?Math.max(...iv):1)||1, imin=iv.length?Math.min(...iv):0;
+  const nsize=+$('nsizev').value, emin=+$('eminv').value, lbldeg=+$('lbldegv').value, border=$('nborder').checked, bcolor=$('bcolor').value, lblsize=+$('lblsizev').value, outline=$('lbloutline').checked, lblcolor=$('lblcolor').value, lblstroke=$('lblstroke').value;
+  const cIdx=new Map(nodes.map((s,i)=>[s,membership[i]])), fills=nodeColors({nodes, membership, degree}), lab=labelSet(nodes, degree);
+  NODES = new vis.DataSet(nodes.map((s,i)=>({
+    id:s, label: lab.has(s) ? nodeLabel(s) : '',
+    size: nodeRadius(degree[i],dmax,nsize),
+    color: nodeColor(fills[i], bcolor),
+    borderWidth: border?1.5:0, font:{ size:lblsize, color:lblcolor, strokeWidth:outline?2.5:0, strokeColor:lblstroke },
+    title:`${nodeLabel(s)} · ${commLabel(membership[i])} · ${degree[i]} partners`
+  })));
+  EDGES = new vis.DataSet(edges.map((e,i)=>{ const intra=cIdx.get(e.a)===cIdx.get(e.b);
+    return { id:i, from:e.a, to:e.b, width:edgeWidth(e.iLIS,imin,imax,emin),
+      color:{ color: intra?commHex(cIdx.get(e.a)):'#c7ced6', highlight:'#e67e22', hover:'#e67e22', opacity: intra?0.75:0.3 }, chosen:{ edge:EDGE_CHOSEN },
+      title:`${nodeLabel(e.a)}–${nodeLabel(e.b)} · iLIS ${e.iLIS.toFixed(3)}` }; }));
+  const opts={ nodes:{ shape:'dot', font:{ size:12, color:'#33414f' } }, edges:{ smooth:false }, layout:{ randomSeed: +$('seed').value||1 },
+    physics:{ enabled:!still, stabilization:{ enabled:!still, iterations: +$('layiter').value||250 }, barnesHut:{ gravitationalConstant:-9000, springLength:130, springConstant:0.03, damping:0.25 } },
+    interaction:{ hover:true, tooltipDelay:120 } };
+  NETWORK = new vis.Network($('net'), { nodes:NODES, edges:EDGES }, opts);
+  if (still) setPhysics(false);
+  else { setPhysics(true); NETWORK.once('stabilizationIterationsDone', ()=>setPhysics(false)); }   // settled: stop, so restyling and screenshots never move nodes
+  NETWORK.on('click', p=>{ if(p.nodes && p.nodes.length) showNodeInfo(p.nodes[0]); else hideNodeInfo(); });
+  LAYER_ROOT=null; NET_HL=null; EGO_ROOT=null; { const lb=$('layerbar'); if(lb) lb.classList.add('hidden'); } $('egobar').classList.add('hidden');
+}
+// a selected or hovered pair at full strength: a pair between communities is otherwise drawn at 0.3 and its highlight stays faint
+const EDGE_CHOSEN = (v) => { v.opacity = 1; };
+// a node's colors: its fill stays when selected or hovered (an orange ring marks it) instead of vis-network's pale default
+const nodeColor = (fill, border) => ({ background:fill, border, highlight:{ background:fill, border:'#e67e22' }, hover:{ background:fill, border:'#e67e22' } });
+function setPhysics(on){
+  PHYS = !!on; if (NETWORK) NETWORK.setOptions({ physics:{ enabled: PHYS } });
+  const b=$('physbtn'); if (b){ b.textContent = PHYS ? '❚❚ physics' : '▶ physics'; b.title = PHYS ? 'stop the layout here' : 'resume the force layout (nodes move again)'; }
+}
+function restyle(){
+  if (!LAST || !NODES) return;
+  const _d = getDisplay(); if (_d.nodes.length !== NODES.length){ applyLayout($('layout').value); return; }   // node set changed (mindeg) -> full re-layout, not a stale update
+  const { nodes, edges, membership, degree } = _d;
+  const dmax=Math.max(1,...degree), iv=edges.map(e=>e.iLIS), imax=(iv.length?Math.max(...iv):1)||1, imin=iv.length?Math.min(...iv):0;
+  const nsize=+$('nsizev').value, emin=+$('eminv').value, lbldeg=+$('lbldegv').value, border=$('nborder').checked, bcolor=$('bcolor').value, lblsize=+$('lblsizev').value, outline=$('lbloutline').checked, lblcolor=$('lblcolor').value, lblstroke=$('lblstroke').value;
+  const cIdx=new Map(nodes.map((s,i)=>[s,membership[i]])), fills=nodeColors({nodes, membership, degree}), lab=labelSet(nodes, degree);
+  NODES.update(nodes.map((s,i)=>({ id:s, label: lab.has(s)?nodeLabel(s):'', size:nodeRadius(degree[i],dmax,nsize),
+    color: nodeColor(fills[i], bcolor), borderWidth:border?1.5:0, font:{ size:lblsize, color:lblcolor, strokeWidth:outline?2.5:0, strokeColor:lblstroke }, title:`${nodeLabel(s)} · ${commLabel(membership[i])} · ${degree[i]} partners` })));
+  EDGES.update(edges.map((e,i)=>{ const intra=cIdx.get(e.a)===cIdx.get(e.b);
+    return { id:i, width:edgeWidth(e.iLIS,imin,imax,emin), color:{ color:intra?commHex(cIdx.get(e.a)):'#c7ced6', highlight:'#e67e22', hover:'#e67e22', opacity:intra?0.75:0.3 }, chosen:{ edge:EDGE_CHOSEN } }; }));
+}
+
+// ---------- modules ----------
+function renderModules({ nodes, edges, membership, degree }){
+  const cIdx=new Map(nodes.map((s,i)=>[s,membership[i]]));
+  const degMap=new Map(nodes.map((s,i)=>[s,degree[i]]));
+  const comm={};
+  nodes.forEach((s,i)=>{ const c=membership[i]; (comm[c]=comm[c]||{members:[],e:0,sum:0}).members.push(s); });
+  edges.forEach(e=>{ if(cIdx.get(e.a)===cIdx.get(e.b)){ const c=cIdx.get(e.a); comm[c].e++; comm[c].sum+=e.iLIS; } });
+  const mods=Object.entries(comm).map(([c,m])=>({ c:+c, n:m.members.length, e:m.e, mean:m.e?m.sum/m.e:0,
+      members:m.members.slice().sort((a,b)=>degMap.get(b)-degMap.get(a)) }))
+    .filter(m=>m.n>=3).sort((a,b)=>b.e-a.e||b.mean-a.mean);
+  $('modules').innerHTML = `<h3>Modules <span class="hint">(${mods.length}, ≥3 proteins)</span></h3>` +
+    (mods.length?'':'<div class="hint">No module with ≥3 proteins at this cutoff.</div>') +
+    mods.map(m=>{
+      const top=m.members[0], mem=m.members.slice(0,24).map(nodeLabel).join(', ')+(m.members.length>24?` … +${m.members.length-24}`:'');
+      return `<div class="mod">
+        <div class="hd"><input type="color" value="${commHex(m.c)}" data-c="${m.c}" title="community color">${esc(commLabel(m.c))}
+          <span class="clipbtn" data-sym="${esc(top)}" title="${atlasKey(top) ? 'the hub’s predicted interaction residues on its LIVIA Atlas page (cLIP)' : 'open the hub in cLIP'}">${esc(nodeLabel(top))} → ${atlasKey(top) ? 'Atlas (cLIP)' : 'cLIP'}</span></div>
+        <div class="st">${m.n} proteins · ${m.e} edges · mean iLIS ${m.mean.toFixed(3)}</div>
+        <div class="mem">${esc(mem)}</div></div>`;
+    }).join('');
+  $('modules').querySelectorAll('input[type=color]').forEach(inp=>inp.addEventListener('input',e=>{ COMMCOLORS[+e.target.dataset.c]=e.target.value; restyle(); }));
+  $('modules').querySelectorAll('.clipbtn').forEach(el=>el.addEventListener('click',()=>openInClip(el.dataset.sym)));
+}
+
+// ---------- node info + cLIP hand-off ----------
+function showNodeInfo(sym){
+  const i = LAST.nodes.indexOf(sym); if(i<0) return;
+  $('ni-name').textContent = nodeLabel(sym);
+  $('ni-meta').textContent = `${commLabel(LAST.membership[i])} · ${LAST.degree[i]} partners`;
+  $('ni-meta').title = 'partners: proteins whose best model with this one reaches the iLIS cutoff. cLIP clusters every model that reaches it (partners named phospho- or mutant left out).';
+  $('ni-clip').onclick = ()=>openInClip(sym);
+  $('ni-clip').textContent = atlasKey(sym) ? 'Interaction residues in the Atlas (cLIP) →' : 'Open in cLIP →';
+  $('ni-ego').onclick = ()=>egoView(sym);
+  $('ni-layer').onclick = ()=>layerLayout(sym);
+  $('nodeinfo').classList.remove('hidden');
+}
+function hideNodeInfo(){ $('nodeinfo').classList.add('hidden'); }
+
+// ---------- node search (locate + highlight a protein in the graph) ----------
+function populateNetSearch(){
+  const dl=$('net-node-list'); if(!dl||!LAST) return;
+  dl.innerHTML = LAST.nodes.slice().sort((a,b)=>a.toLowerCase()<b.toLowerCase()?-1:a.toLowerCase()>b.toLowerCase()?1:0)
+    .map(n=>`<option value="${String(n).replace(/"/g,'&quot;')}"></option>`).join('');
+  $('netsearch').classList.remove('hidden');
+}
+function netHighlightNode(id){
+  if(!NODES) return;
+  if(NET_HL && NET_HL!==id) restyle();          // revert the previous highlight (restyle recomputes every node from the controls)
+  NET_HL=id;
+  const cur=NODES.get(id); if(!cur) return;
+  const base=cur.size||10;
+  NODES.update({ id, borderWidth:4, color: nodeColor((cur.color&&cur.color.background)||'#2471A3', '#e67e22'), size:base*1.7, label:nodeLabel(id) });
+}
+function netClearHighlight(){ if(NET_HL){ NET_HL=null; if(NODES) restyle(); } }
+function netFocusNode(id){
+  netHighlightNode(id);
+  try{ NETWORK.selectNodes([id]); }catch(e){}
+  try{ const nb=NETWORK.getConnectedNodes(id);          // zoom so the node and its partners fit, whatever the network's size
+    if (nb.length) NETWORK.fit({ nodes:[id,...nb], animation:{ duration:650, easingFunction:'easeInOutQuad' } });
+    else NETWORK.focus(id,{ scale:1.5, locked:false, animation:{ duration:650, easingFunction:'easeInOutQuad' } }); }catch(e){}
+  showNodeInfo(id);
+}
+function netFind(q){
+  const inp=$('net-search-input');
+  q=(q||'').trim();
+  if(!q){ if(inp) inp.classList.remove('nf'); netClearHighlight(); return; }
+  if(!LAST || !NETWORK) return;
+  const lc=q.toLowerCase();
+  const id = LAST.nodes.find(n=>n.toLowerCase()===lc)          // exact
+          || LAST.nodes.find(n=>n.toLowerCase().startsWith(lc)) // prefix
+          || LAST.nodes.find(n=>n.toLowerCase().includes(lc));  // substring
+  if(!id){ if(inp) inp.classList.add('nf'); return; }
+  if(inp) inp.classList.remove('nf');
+  if(NODES && !NODES.get(id)){                                  // hidden by the min-edges filter → reveal, then focus once relaid out
+    $('mindeg').value=1; $('mindegv').value=1;
+    if(LAYER_ROOT) layerLayout(LAYER_ROOT); else applyLayout($('layout').value);
+    setTimeout(()=>{ if(NODES && NODES.get(id)) netFocusNode(id); }, 400);
+    return;
+  }
+  netFocusNode(id);
+}
+function atlasKey(nodeId){ if (!ATLAS_SRC) return null; const k = ATLAS_SRC.keys;   // own string values only: a node named "constructor" finds nothing
+  for (const id of [String(nodeId), String(nodeId).toUpperCase()]) if (Object.prototype.hasOwnProperty.call(k, id) && typeof k[id] === 'string') return k[id];
+  return null; }
+function openInClip(nodeId){
+  const ak = atlasKey(nodeId);
+  if (ak){ window.open(`${ATLAS_SRC.url}#/${encodeURIComponent(ATLAS_SRC.sp)}/${encodeURIComponent(ak)}`, '_blank', 'noopener'); return; }   // an Atlas network: its protein page runs cLIP on every prediction
+  const names = NAME_OF[nodeId] || new Set([nodeId]);   // original prediction names contributing this node
+  let header=null; const keep=[];
+  for (const f of FILES_RAW){ const lines=f.text.split(/\r?\n/); if(!header) header=lines[0];
+    for(let i=1;i<lines.length;i++){ const nf=(lines[i].split(',',1)[0]||'').trim(); if(names.has(nf)) keep.push(lines[i]); } }
+  // FASTA for exactly this node's predictions: paired records (>A___B) matched by prediction name,
+  // plus per-symbol records for the proteins involved. cLIP's sequence viewer picks these up directly.
+  const prot = new Set(); for (const nm of names) for (const part of String(nm).split('___')) prot.add(part.trim());
+  let fasta = '';
+  if (FASTA_RAW){
+    let h=null, buf=[];
+    const flush = () => { if (h!=null){ const bare=h.replace(/___.*$/,''); if (names.has(h) || (!h.includes('___') && prot.has(h)) || prot.has(bare)) fasta += `>${h}\n${buf.join('\n')}\n`; } h=null; buf=[]; };
+    for (const line of FASTA_RAW.split(/\r?\n/)){ if (line[0]==='>'){ flush(); h=line.slice(1).trim(); } else if (line.trim()) buf.push(line.trim()); }
+    flush();
+  }
+  const isLookup = META && META.mode==='lookup';
+  const payload = { csv:[header,...keep].join('\n'), meta: isLookup ? null : (META?META._raw:null), query: isLookup ? rawIdFor(nodeId) : nodeId, querySym: nodeId, fasta: fasta || undefined };
+  try { localStorage.setItem('livia_net2clip', JSON.stringify(payload)); window.open('clip.html','_blank'); }
+  catch(e){ try { delete payload.fasta; localStorage.setItem('livia_net2clip', JSON.stringify(payload)); window.open('clip.html','_blank'); }   // retry without sequences if over quota
+            catch(e2){ alert('This hub is too large to hand off automatically — open cLIP and drop the CSV, query = '+nodeId); } }
+}
+
+// ---------- neighbors only: a protein, its partners and the edges among them; the rest hidden, positions kept ----------
+function egoView(root){
+  if (!LAST || !NODES || !NETWORK) return;
+  const keep = new Set([root, ...NETWORK.getConnectedNodes(root)]);
+  NODES.update(NODES.getIds().map(id=>({ id, hidden: !keep.has(id) })));
+  NETWORK.fit({ nodes:[...keep], animation:{ duration:600 } });
+  EGO_ROOT=root; $('ego-root').textContent=nodeLabel(root); $('egobar').classList.remove('hidden');
+}
+function egoReset(){ if (!NODES) return; NODES.update(NODES.getIds().map(id=>({ id, hidden:false }))); EGO_ROOT=null; $('egobar').classList.add('hidden'); if (NETWORK) NETWORK.fit({ animation:{ duration:500 } }); }
+
+// ---------- layer (BFS-shell) view around a chosen vertex; Leiden colors kept ----------
+function layerLayout(root){
+  if (!LAST || !NODES) return;
+  const disp = getDisplay(); if (!disp.nodes.includes(root)) return;
+  const adj = new Map(disp.nodes.map(n=>[n,[]]));
+  disp.edges.forEach(e=>{ if(adj.has(e.a)&&adj.has(e.b)){ adj.get(e.a).push(e.b); adj.get(e.b).push(e.a); } });
+  const layer=new Map([[root,0]]), parent=new Map(), q=[root];   // BFS distances from the root
+  while(q.length){ const u=q.shift(); for(const v of adj.get(u)){ if(!layer.has(v)){ layer.set(v,layer.get(u)+1); parent.set(v,u); q.push(v); } } }
+  const reach=Math.max(0,...layer.values());
+  disp.nodes.forEach(n=>{ if(!layer.has(n)) layer.set(n, reach+1); });   // unreachable -> outer ring
+  const maxL=Math.max(...layer.values()), byLayer={};
+  disp.nodes.forEach(n=>{ (byLayer[layer.get(n)]=byLayer[layer.get(n)]||[]).push(n); });
+  const mode = $('layer-mode') ? $('layer-mode').value : 'concentric';
+  const key=new Map([[root,0]]), pos={ [root]:{x:0,y:0} };
+  for(let L=1;L<=maxL;L++){
+    const arr=(byLayer[L]||[]).slice().sort((a,b)=>(key.get(parent.get(a))||0)-(key.get(parent.get(b))||0));   // keep children near their parent
+    if (mode==='tree'){ const y=180*L, w=(arr.length-1)*84;                       // hierarchical: each layer a row going down
+      arr.forEach((node,i)=>{ const x=Math.round(i*84 - w/2); pos[node]={x,y}; key.set(node,x); }); }
+    else { const r=180*L;                                                          // concentric: BFS shells
+      arr.forEach((node,i)=>{ const a=(2*Math.PI*i)/arr.length - Math.PI/2; pos[node]={x:Math.round(r*Math.cos(a)),y:Math.round(r*Math.sin(a))}; key.set(node,a); }); }
+  }
+  const cIdx=new Map(disp.nodes.map((s,i)=>[s,disp.membership[i]])), degMap=new Map(disp.nodes.map((s,i)=>[s,disp.degree[i]]));
+  NODES.update(disp.nodes.map(n=>({ id:n, x:pos[n].x, y:pos[n].y, fixed:{x:true,y:true},
+    title:`${nodeLabel(n)} · ${commLabel(cIdx.get(n))} · ${degMap.get(n)} partners · layer ${layer.get(n)>reach?'\u221e':layer.get(n)}` })));
+  setPhysics(false);
+  NETWORK.fit({ animation:{ duration:600 } });
+  LAYER_ROOT=root; $('layer-root').textContent=nodeLabel(root); $('layerbar').classList.remove('hidden'); hideNodeInfo();
+}
+function resetLayout(){ if(LAST) render(getDisplay()); }   // render() restores force physics + clears the layer state
+function computeLayout(mode, disp){   // fixed positions for the overall network layouts
+  const { nodes, membership }=disp, pos={}, memb=new Map(nodes.map((n,i)=>[n,membership[i]]));
+  if (mode==='circle'){ const ord=nodes.slice().sort((a,b)=>memb.get(a)-memb.get(b)), R=80+nodes.length*3.5;
+    ord.forEach((n,i)=>{ const a=2*Math.PI*i/ord.length; pos[n]={x:Math.round(R*Math.cos(a)),y:Math.round(R*Math.sin(a))}; }); }
+  else if (mode==='grid'){ const ord=nodes.slice().sort((a,b)=>memb.get(a)-memb.get(b)), cols=Math.ceil(Math.sqrt(nodes.length)), G=68;
+    ord.forEach((n,i)=>{ pos[n]={x:(i%cols)*G, y:Math.floor(i/cols)*G}; }); }
+  else if (mode==='community'){                                              // each Leiden community clustered on its own island
+    const byC={}; nodes.forEach((n,i)=>{ (byC[membership[i]]=byC[membership[i]]||[]).push(n); });
+    const comms=Object.keys(byC).sort((a,b)=>byC[b].length-byC[a].length), CR=140+comms.length*55;
+    comms.forEach((c,ci)=>{ const ca=2*Math.PI*ci/comms.length, cx=CR*Math.cos(ca), cy=CR*Math.sin(ca), arr=byC[c], r=25+arr.length*3.5;
+      arr.forEach((n,i)=>{ const a=2*Math.PI*i/arr.length; pos[n]={x:Math.round(cx+r*Math.cos(a)),y:Math.round(cy+r*Math.sin(a))}; }); }); }
+  return pos;
+}
+async function wasmLayout(nodes, edges, method, niter){
+  await ensureWasm();
+  if (!window.LiviaWasm) throw new Error('The graph engine (js/livia-wasm.js) did not load; reload the page and try again.');
+  const idx = new Map(nodes.map((s,i)=>[s,i]));
+  const idxEdges = edges.map(e=>[idx.get(e.a), idx.get(e.b), e.iLIS]);
+  const c = window.LiviaWasm.graphLayout(method, nodes.length, idxEdges, niter || 500, +$('seed').value || 1);
+  const xs=c.map(p=>p[0]), ys=c.map(p=>p[1]);
+  const minX=Math.min(...xs), minY=Math.min(...ys), span=Math.max(Math.max(...xs)-minX, Math.max(...ys)-minY)||1;
+  const S=Math.min(1500, 80+nodes.length*13)/span, pos={};
+  nodes.forEach((s,i)=>{ pos[s]={ x:Math.round((c[i][0]-minX)*S), y:Math.round((c[i][1]-minY)*S) }; });
+  return pos;
+}
+let _layBusy=false;
+async function applyLayout(mode){
+  if (!LAST || !NODES) return;
+  LAYER_ROOT=null; { const lb=$('layerbar'); if(lb) lb.classList.add('hidden'); }
+  if (!mode || mode==='force'){ render(getDisplay()); return; }               // vis-network physics (live)
+  const disp=getDisplay(); let pos;
+  if (drawnSig(disp) !== DRAWN) render(disp, true);   // other nodes or edges shown: draw them afresh
+  if (mode==='fr'||mode==='kk'||mode==='drl'){ if(_layBusy) return; _layBusy=true; setStatus('Computing '+mode.toUpperCase()+' layout…'); try{ pos=await wasmLayout(disp.nodes, disp.edges, mode, +$('layiter').value||500); }catch(e){ setStatus('Layout error: '+(e.message||e)); _layBusy=false; return; } _layBusy=false; setStatus(''); }
+  else pos=computeLayout(mode, disp);
+  NODES.update(disp.nodes.map(n=>({ id:n, x:pos[n].x, y:pos[n].y, fixed:{x:true,y:true} })));
+  setPhysics(false); NETWORK.fit({ animation:{duration:500} });
+}
+
+// ---------- exports ----------
+function buildSVG(mode){   // mode='view' = the region currently visible (respects zoom/pan); else the whole network
+  const pos = NETWORK.getPositions();
+  const { nodes, edges, membership, degree } = getDisplay();
+  const cIdx=new Map(nodes.map((s,i)=>[s,membership[i]])), degMap=new Map(nodes.map((s,i)=>[s,degree[i]]));
+  const _f=nodeColors({nodes,membership,degree}), fillMap=new Map(nodes.map((s,i)=>[s,_f[i]]));
+  const dmax=Math.max(1,...degree), iv=edges.map(e=>e.iLIS), imax=(iv.length?Math.max(...iv):1)||1, imin=iv.length?Math.min(...iv):0;
+  const nsize=+$('nsizev').value, emin=+$('eminv').value, lbldeg=+$('lbldegv').value, border=$('nborder').checked, bcolor=$('bcolor').value, lblsize=+$('lblsizev').value, outline=$('lbloutline').checked, lblcolor=$('lblcolor').value, lblstroke=$('lblstroke').value;
+  let minX, minY, W, H;
+  if (mode === 'view'){                                 // current zoom/pan: exactly what the canvas shows
+    const c=NETWORK.getViewPosition(), scale=NETWORK.getScale(), net=$('net');
+    const hw=(net.offsetWidth/2)/scale, hh=(net.offsetHeight/2)/scale;
+    minX=c.x-hw; minY=c.y-hh; W=hw*2; H=hh*2;
+  } else {                                              // full network: bounding box of all nodes
+    const ids=nodes.filter(s=>pos[s]); if(!ids.length) return ''; const xs=ids.map(s=>pos[s].x), ys=ids.map(s=>pos[s].y), pad=70;
+    minX=Math.min(...xs)-pad; minY=Math.min(...ys)-pad; W=Math.max(...xs)-minX+pad; H=Math.max(...ys)-minY+pad;
+  }
+  let s=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="${minX.toFixed(1)} ${minY.toFixed(1)} ${W.toFixed(1)} ${H.toFixed(1)}" font-family="-apple-system,sans-serif"><rect x="${minX}" y="${minY}" width="${W}" height="${H}" fill="#ffffff"/>`;
+  for (const e of edges){ const a=pos[e.a], b=pos[e.b]; if(!a||!b) continue; const intra=cIdx.get(e.a)===cIdx.get(e.b);
+    s+=`<line x1="${a.x.toFixed(1)}" y1="${a.y.toFixed(1)}" x2="${b.x.toFixed(1)}" y2="${b.y.toFixed(1)}" stroke="${intra?commHex(cIdx.get(e.a)):'#c7ced6'}" stroke-width="${edgeWidth(e.iLIS,imin,imax,emin).toFixed(2)}" stroke-opacity="${intra?0.7:0.3}"/>`; }
+  for (const n of nodes){ const p=pos[n]; if(!p) continue; const r=nodeRadius(degMap.get(n),dmax,nsize);
+    s+=`<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${r.toFixed(1)}" fill="${fillMap.get(n)}"${border?` stroke="${bcolor}" stroke-width="1.5"`:''}/>`; }
+  const lab=labelSet(nodes, degree);
+  for (const n of nodes){ const p=pos[n]; if(!p||!lab.has(n)) continue; const r=nodeRadius(degMap.get(n),dmax,nsize);
+    s+=`<text x="${p.x.toFixed(1)}" y="${(p.y-r-3).toFixed(1)}" font-size="${lblsize}" ${outline?`stroke="${lblstroke}" stroke-width="2.8" paint-order="stroke" `:''}text-anchor="middle" fill="${lblcolor}">${esc(nodeLabel(n))}</text>`; }
+  s+='</svg>';
+  return s;
+}
+function exportSVG(mode){ if(!LAST||!NETWORK) return; const s=buildSVG(mode); if(!s){ setStatus('Nothing to export yet.'); return; } download(mode==='view'?'network_view.svg':'network.svg', s, 'image/svg+xml'); }
+function download(name, text, type){ const b=new Blob([text],{type:type||'text/csv'}); const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=name; a.click(); URL.revokeObjectURL(a.href); }
+const csvq = s => /[,"]/.test(s) ? '"'+String(s).replace(/"/g,'""')+'"' : s;
+function buildTemplate(){   // identity-map skeleton: name+chain (+ id auto-filled from the name split when it contains ___)
+  const seen=new Set(), rows=[['name','chain','id','uniprot','gene','label','start','end']];
+  for (const r of RAWPAIRS.values()){
+    const paired = String(r.name).includes('___');
+    for (const [ch, sym] of [[r.ci, r.s1], [r.cj, r.s2]]){ const k=r.name+'\x00'+ch; if(!seen.has(k)){ seen.add(k); rows.push([r.name, ch, paired?(sym||''):'', '','','','','']); } }
+  }
+  return rows.map(r=>r.map(csvq).join(',')).join('\n');
+}
+function downloadTemplate(){ download('identity_map_template.csv', buildTemplate()); }
+function buildSubsetTemplate(){   // node-subset skeleton: the current network's nodes (or all resolved proteins), one per row
+  const nodes = LAST ? LAST.nodes.slice() : [...new Set([...RAWPAIRS.values()].flatMap(r=>[resolveId(r.name,r.ci,r.s1),resolveId(r.name,r.cj,r.s2)]).filter(Boolean))];
+  return 'node\n'+nodes.map(csvq).join('\n');
+}
+function downloadSubset(){ download('node_subset_template.csv', buildSubsetTemplate()); }
+function buildClusterTemplate(){   // node,cluster skeleton prefilled with the current nodes (blank cluster to fill in)
+  const nodes = LAST ? LAST.nodes.slice() : [...new Set([...RAWPAIRS.values()].flatMap(r=>[resolveId(r.name,r.ci,r.s1),resolveId(r.name,r.cj,r.s2)]).filter(Boolean))];
+  return 'node,cluster\n'+nodes.map(n=>csvq(n)+',').join('\n');
+}
+function downloadCluster(){ download('cluster_map_template.csv', buildClusterTemplate()); }
+function exportCSVs(){
+  if (!LAST) return; const { nodes, edges, membership, degree } = LAST;
+  const cIdx=new Map(nodes.map((s,i)=>[s,membership[i]])), fills=nodeColors({nodes, membership, degree});
+  download('network_edges.csv','Symbol_1,Symbol_2,iLIS,ipTM,intra_community,community\n'+edges.map(e=>{ const intra=cIdx.get(e.a)===cIdx.get(e.b); return [csvq(nodeLabel(e.a)),csvq(nodeLabel(e.b)),e.iLIS.toFixed(4),e.ipTM.toFixed(3),intra?1:0,intra?csvq(commOut(cIdx.get(e.a))):''].join(','); }).join('\n'));
+  download('network_communities.csv','Symbol,community,degree\n'+nodes.map((s,i)=>[csvq(nodeLabel(s)),csvq(commOut(membership[i])),degree[i]].join(',')).join('\n'));   // 'community' carries the user label when set → re-importable
+}
+function buildGraphML(){   // Cytoscape-importable GraphML: node name/community/degree/x/y + edge iLIS/ipTM/intra_community
+  if (!LAST) return '';
+  const { nodes, edges, membership, degree } = LAST;
+  const cIdx=new Map(nodes.map((s,i)=>[s,membership[i]])), rid=new Map(nodes.map((s,i)=>[s,'n'+i]));
+  const pos = NETWORK ? NETWORK.getPositions() : {};
+  const xe=s=>String(s).replace(/[<&>"]/g,c=>({'<':'&lt;','&':'&amp;','>':'&gt;','"':'&quot;'}[c]));
+  let g='<?xml version="1.0" encoding="UTF-8"?>\n<graphml xmlns="http://graphml.graphdrawing.org/xmlns">\n'
+    +'<key id="label" for="node" attr.name="name" attr.type="string"/><key id="comm" for="node" attr.name="community" attr.type="int"/><key id="commname" for="node" attr.name="community_name" attr.type="string"/><key id="deg" for="node" attr.name="degree" attr.type="int"/><key id="x" for="node" attr.name="x" attr.type="double"/><key id="y" for="node" attr.name="y" attr.type="double"/>\n'
+    +'<key id="ilis" for="edge" attr.name="iLIS" attr.type="double"/><key id="iptm" for="edge" attr.name="ipTM" attr.type="double"/><key id="intra" for="edge" attr.name="intra_community" attr.type="int"/>\n'
+    +'<graph edgedefault="undirected">\n';
+  nodes.forEach((s,i)=>{ const p=pos[s]||{x:0,y:0}; g+=`<node id="n${i}"><data key="label">${xe(nodeLabel(s))}</data><data key="comm">${membership[i]}</data><data key="commname">${xe(commLabel(membership[i]))}</data><data key="deg">${degree[i]}</data><data key="x">${p.x.toFixed(1)}</data><data key="y">${p.y.toFixed(1)}</data></node>\n`; });
+  edges.forEach(e=>{ const intra=cIdx.get(e.a)===cIdx.get(e.b); g+=`<edge source="${rid.get(e.a)}" target="${rid.get(e.b)}"><data key="ilis">${e.iLIS.toFixed(4)}</data><data key="iptm">${e.ipTM.toFixed(3)}</data><data key="intra">${intra?cIdx.get(e.a):-1}</data></edge>\n`; });
+  return g+'</graph>\n</graphml>\n';
+}
+function exportGraphML(){ if(LAST) download('network.graphml', buildGraphML(), 'application/xml'); }
+const SETTING_IDS=['cutv','resv','objfn','seed','nsizev','mindegv','eminv','lbldegv','lbltop','lblsizev','lblcolor','lblstroke','bcolor','colorby','unicolor','layout','layiter','topk'];
+function collectSettings(){
+  const s={}; SETTING_IDS.forEach(id=>{ const el=$(id); if(el) s[id]=el.value; });
+  s.nborder=$('nborder').checked; s.lbloutline=$('lbloutline').checked; s.intraonly=$('intraonly').checked; s.commColors={...COMMCOLORS}; s.nodeColors={...NODECOLORS}; if(SUBSET) s.subset=[...SUBSET];
+  if (META && META_COL) s.labelby=META_COL;
+  s.method = { leiden_n_iterations: 10, edge_weight: 'iLIS', duplicate_pairs: 'the highest iLIS among all predictions of the same resolved pair (each prediction\'s best model)', engine: 'livia-wasm/1.0', livia: window.LIVIA_BUILD || '', saved: new Date().toISOString(), page: location.href.split('#')[0] };   // what the settings do not show but a rerun needs
+  if (USERCLUST && USERCLUST.size){ s.clusters=[...USERCLUST.entries()]; s.clustmode=$('clustmode')?$('clustmode').value:'user'; }
+  return s;
+}
+function exportSettings(){ download('network_settings.json', JSON.stringify(collectSettings(),null,2), 'application/json'); }
+async function importSettings(file){
+  let s; try{ s=JSON.parse(await file.text()); }catch(e){ setStatus('Invalid settings JSON.'); return; }
+  const pair={cutv:'cut',resv:'res',nsizev:'nsize',mindegv:'mindeg',eminv:'emin',lbldegv:'lbldeg'};
+  SETTING_IDS.forEach(id=>{ if(s[id]!=null && $(id)){ $(id).value=s[id]; const sl=pair[id]; if(sl&&$(sl)) $(sl).value=Math.max(+$(sl).min, Math.min(+$(sl).max, +s[id])); } });
+  if (s.nborder!=null) $('nborder').checked=s.nborder;
+  if (s.lbloutline!=null) $('lbloutline').checked=s.lbloutline;
+  if (s.intraonly!=null) $('intraonly').checked=s.intraonly;
+  if (s.commColors) COMMCOLORS={...s.commColors};
+  if (s.nodeColors) NODECOLORS={...s.nodeColors};
+  SUBSET = (s.subset&&s.subset.length) ? new Set(s.subset) : null; $('subclear').classList.toggle('hidden', !SUBSET);
+  USERCLUST = (s.clusters&&s.clusters.length) ? new Map(s.clusters) : null;
+  $('clustmode-wrap').classList.toggle('hidden', !USERCLUST); $('clustclear').classList.toggle('hidden', !USERCLUST);
+  if (USERCLUST && $('clustmode')) $('clustmode').value = s.clustmode || 'user';
+  if (s.labelby){ META_COL=s.labelby; if($('labelby')) $('labelby').value=s.labelby; }
+  $('unicolor').classList.toggle('hidden', $('colorby').value!=='uniform');
+  syncCutFpr();
+  if (RAWPAIRS.size){ await build(); await applyLayout($('layout').value); }
+  setStatus('Settings loaded.');
+}
+
+// ---------- wiring ----------
+function wireZone(dzId, inId, handler){
+  const dz=$(dzId), inp=$(inId);
+  dz.addEventListener('click', ()=>inp.click());
+  dz.addEventListener('dragover', e=>{ e.preventDefault(); dz.classList.add('drag'); });
+  dz.addEventListener('dragleave', ()=>dz.classList.remove('drag'));
+  dz.addEventListener('drop', e=>{ e.preventDefault(); dz.classList.remove('drag'); handler(e.dataTransfer.files); });
+  inp.addEventListener('change', e=>handler(e.target.files));
+}
+wireZone('dz','in',(fl)=>{ ATLAS_SRC = null; return routeFiles(fl); }); wireZone('dzmeta','inmeta',routeMeta); wireZone('dzsub','insub',routeSubset); wireZone('dzclust','inclust',routeCluster);   // the reader’s own files: not an Atlas network
+$('clustmode').addEventListener('change', rebuildIfBuilt);
+function linkSlider(sId, nId, effect){ const s=$(sId), n=$(nId);   // slider + typed number stay in sync; the number is authoritative (allows custom values)
+  s.addEventListener('input', ()=>{ n.value=s.value; if(effect) effect(); });
+  n.addEventListener('input', ()=>{ if(n.value==='') return; s.value=Math.max(+s.min, Math.min(+s.max, +n.value)); if(effect) effect(); });
+}
+function syncCutFpr(){
+  const v = +$('cutv').value;
+  const g = $('cut-fpr'); if (!g) return;
+  g.querySelectorAll('button[data-cut]').forEach((b) => {
+    const on = Math.abs(v - +b.dataset.cut) < 0.0005;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+  });
+}
+if ($('cut-fpr')) $('cut-fpr').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-cut]'); if (!b) return;
+  const v = b.dataset.cut;
+  $('cut').value = v; $('cutv').value = v;
+  syncCutFpr();
+  if (RAWPAIRS.size && !$('build').disabled) build();
+});
+linkSlider('cut','cutv', syncCutFpr); linkSlider('res','resv');                          // iLIS + resolution apply on the next Build
+syncCutFpr();
+linkSlider('nsize','nsizev', restyle); linkSlider('emin','eminv', restyle); linkSlider('lbldeg','lbldegv', restyle);
+$('mindeg').addEventListener('input', ()=>{ $('mindegv').value=$('mindeg').value; });     // min edges/node: re-layout is heavy -> apply on release / Enter
+$('mindegv').addEventListener('input', ()=>{ if($('mindegv').value!=='') $('mindeg').value=Math.max(1, Math.min(+$('mindeg').max, +$('mindegv').value)); });
+['mindeg','mindegv'].forEach(id=>$(id).addEventListener('change', ()=>{ if(LAST){ if(LAYER_ROOT) layerLayout(LAYER_ROOT); else applyLayout($('layout').value); hideNodeInfo(); } }));
+$('nborder').addEventListener('change', restyle);
+$('lbltop').addEventListener('change', restyle);
+['topk','intraonly'].forEach(id=>$(id).addEventListener('change', ()=>{ if(LAST){ hideNodeInfo(); if(LAYER_ROOT) layerLayout(LAYER_ROOT); else applyLayout($('layout').value); } }));   // other edges → lay out again
+$('physbtn').addEventListener('click', ()=>{ if (NETWORK) setPhysics(!PHYS); });
+$('ego-reset').addEventListener('click', e=>{ e.preventDefault(); egoReset(); });
+$('lbloutline').addEventListener('change', restyle);
+linkSlider('lblsize','lblsizev', restyle);
+$('colorby').addEventListener('change', ()=>{ restyle(); updateColorLegend(); });
+$('unicolor').addEventListener('input', restyle);
+['bcolor','lblcolor','lblstroke'].forEach(id=>$(id).addEventListener('input', restyle));
+$('labelby').addEventListener('change', e=>{ META_COL=e.target.value; updateLoaded(); rebuildIfBuilt(); });
+$('objfn').addEventListener('change', ()=>{ const cpm=$('objfn').value==='CPM'; $('resv').value=cpm?'0.01':'1.0'; $('res').value=cpm?0.01:1.0; });
+$('build').addEventListener('click', build);
+$('load-ex').addEventListener('click', e=>{ e.preventDefault(); loadExample(); });
+$('expsvg').addEventListener('click', ()=>exportSVG('view'));
+$('expsvgall').addEventListener('click', ()=>exportSVG('full'));
+$('expcsv').addEventListener('click', exportCSVs);
+$('expcyto').addEventListener('click', exportGraphML);
+$('expset').addEventListener('click', exportSettings);
+$('impset-btn').addEventListener('click', e=>{ e.preventDefault(); $('impset').click(); });
+$('chgfiles').addEventListener('click', e=>{ e.preventDefault(); $('incard').classList.remove('collapsed'); });
+$('moredisp').addEventListener('click', ()=>{ const open=$('dispmore').classList.toggle('hidden')===false; $('moredisp').textContent='More display '+(open?'▾':'▸'); $('moredisp').setAttribute('aria-expanded', open); });
+// one popover open at a time; a click outside or on a menu item closes it
+document.addEventListener('click', e=>{ document.querySelectorAll('details.pop[open]').forEach(d=>{ if(!d.contains(e.target) || e.target.closest('.panel.menu button')) d.open=false; }); });
+$('impset').addEventListener('change', e=>{ if(e.target.files[0]) importSettings(e.target.files[0]); });
+$('ni-x').addEventListener('click', hideNodeInfo);
+// Custom node colors: upload/paste "node,#hex" (node = protein id). Overrides win over the 'color by' mode.
+LiviaMaps.attachColorUpload($('nodecolor-upload'), {
+  label: 'node colors', keyHeader: 'node',
+  currentRows: () => { if (!LAST) return []; const disp=getDisplay(), fills=nodeColors(disp); return disp.nodes.map((n,i)=>({ key:n, color:fills[i] })); },
+  apply: (rows) => {
+    if (!LAST) return 0;
+    const byLc = new Map(LAST.nodes.map(n=>[n.toLowerCase(), n]));
+    let applied=0;
+    for (const {key,color} of rows){ const n=byLc.get(key.toLowerCase()); if(!n) continue; NODECOLORS[n]=color; applied++; }
+    if (applied) restyle();
+    return applied;
+  },
+});
+{ const si=$('net-search-input');
+  si.addEventListener('change', ()=>netFind(si.value));                                   // datalist pick / commit
+  si.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); netFind(si.value); } });
+  si.addEventListener('input', ()=>{ if(si.value===''){ si.classList.remove('nf'); netClearHighlight(); } });
+  $('net-search-clr').addEventListener('click', ()=>{ si.value=''; si.classList.remove('nf'); netClearHighlight(); si.focus(); });
+}
+$('tmpl').addEventListener('click', e=>{ e.preventDefault(); downloadTemplate(); });
+$('subtmpl').addEventListener('click', e=>{ e.preventDefault(); downloadSubset(); });
+$('subclear').addEventListener('click', e=>{ e.preventDefault(); clearSubset(); });
+$('clusttmpl').addEventListener('click', e=>{ e.preventDefault(); downloadCluster(); });
+$('clustclear').addEventListener('click', e=>{ e.preventDefault(); clearCluster(); });
+$('mg-convert').addEventListener('click', e=>{ e.preventDefault(); convertViaMyGene(); });
+$('layer-reset').addEventListener('click', e=>{ e.preventDefault(); resetLayout(); });
+$('layer-mode').addEventListener('change', ()=>{ if(LAYER_ROOT) layerLayout(LAYER_ROOT); });
+$('layout').addEventListener('change', ()=>applyLayout($('layout').value));
+$('layiter').addEventListener('change', ()=>{ const L=$('layout').value; if(['fr','kk','drl','force'].includes(L)) applyLayout(L); });
+
+// View options a link may carry, so a figure's exact view opens from one link (applied to the data loaded next):
+//   &seed=<n> (Leiden and layout) &res=<resolution> &obj=modularity|CPM &layout=force|fr|kk|drl|community|circle|grid
+//   &iter=<stabilization iterations> &nsize=<node size> &labels=<degree>|top:<N> &color=community|degree|strength|uniform
+//   &mindeg=<n> &topk=<edges per node> &intra=1 &clusters=<URL of a node,cluster CSV, used instead of Leiden> &focus=<protein>
+const URLP = new URLSearchParams(location.search);
+function setVal(id, v, slider){ if (v == null || v === '' || !$(id)) return; $(id).value = v; if (slider && $(slider)) $(slider).value = Math.max(+$(slider).min, Math.min(+$(slider).max, +v)); }
+function applyUrlOpts(P){
+  const obj = P.get('obj'); if (obj && [...$('objfn').options].some(o=>o.value===obj)) $('objfn').value = obj;
+  setVal('seed', P.get('seed')); setVal('resv', P.get('res'), 'res'); setVal('layiter', P.get('iter'));
+  setVal('nsizev', P.get('nsize'), 'nsize'); setVal('mindegv', P.get('mindeg'), 'mindeg'); setVal('topk', P.get('topk'));
+  const lb = P.get('labels');
+  if (lb){ const m = /^top:?(\d+)$/i.exec(lb); if (m) setVal('lbltop', m[1]); else if (isFinite(+lb)){ setVal('lbldegv', lb, 'lbldeg'); setVal('lbltop', 0); } }
+  const col = P.get('color'); if (col && [...$('colorby').options].some(o=>o.value===col)){ $('colorby').value = col; $('unicolor').classList.toggle('hidden', col !== 'uniform'); }
+  const lay = P.get('layout'); if (lay && [...$('layout').options].some(o=>o.value===lay)) $('layout').value = lay;
+  if (P.has('intra')) $('intraonly').checked = /^(1|true|yes|on)?$/i.test(P.get('intra'));
+}
+async function urlClusters(P){   // &clusters=<URL>: communities from a node,cluster CSV (Leiden and its Python download skipped)
+  const u = P.get('clusters'); if (!u) return;
+  try { const r = await fetch(u); if (!r.ok) throw new Error('HTTP ' + r.status); USERCLUST = parseClusterMap(await r.text()); }
+  catch(e){ USERCLUST = null; setStatus('Could not load the cluster map: ' + (e.message || e)); }
+  const on = !!(USERCLUST && USERCLUST.size); $('clustmode-wrap').classList.toggle('hidden', !on); $('clustclear').classList.toggle('hidden', !on); if (on) $('clustmode').value = 'user';
+}
+async function afterBuild(P){   // &layout and &focus act on the built network, once the force layout has settled
+  if (!LAST || !NETWORK) return;
+  const lay = $('layout').value; if (lay && lay !== 'force') await applyLayout(lay);
+  await new Promise((res)=>{ if (!PHYS) return res(); const t = setInterval(()=>{ if (!PHYS){ clearInterval(t); res(); } }, 100); });
+  const f = P.get('focus'); if (f){ $('net-search-input').value = f; netFind(f); }
+}
+applyUrlOpts(URLP);
+
+// Report options a hand-off link may carry: ?ilis=<cutoff> and ?species=<taxid>. Applied before the
+// build so the network a site links to opens at the threshold that site means, not the 0.223 default.
+function applyNetOpts(ilis, species){
+  if (ilis != null && ilis !== '' && isFinite(+ilis)){
+    const v = String(+ilis);
+    if ($('cut'))  $('cut').value  = v;
+    if ($('cutv')) $('cutv').value = v;
+    syncCutFpr();
+  }
+  if (species != null && species !== '' && $('mg-species')) $('mg-species').value = String(species);
+}
+
+// Direct data hand-off: network.html?data=<url>[&ilis=][&species=] — fetch a screen bundle (a .zip of
+// CSV+FASTA, or a bare CSV/.gz) and build the graph. Mirrors clip.html's ?data=, so a site can link
+// into either view over the same contract.
+(async function dataParam(){
+  const params = new URLSearchParams(location.search);
+  const url = params.get('data'); if (!url) return;
+  try {
+    setStatus('loading data…');
+    const resp = await fetch(url); if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const blob = await resp.blob();
+    RAWPAIRS.clear(); ATLAS_SRC = null; FILES_RAW.length=0; FASTA_RAW=''; FILECOUNT=0; META=null; META_COL=null;
+    applyNetOpts(params.get('ilis'), params.get('species'));
+    await routeFiles([new File([blob], (url.split('/').pop() || 'data.zip'), { type: blob.type })]);
+    applyNetOpts(params.get('ilis'), params.get('species'));   // routeFiles may reset the species hint
+    applyUrlOpts(params); await urlClusters(params);
+    if (RAWPAIRS.size){ await build(); await afterBuild(params); } else setStatus('no interactions found in the data');
+  } catch(e){ setStatus('Could not load data: ' + (e.message || e)); console.warn('dataParam', e); }
+})();
+
+// ── Pushed data via postMessage: network.html?post=1 — an opener (e.g. an offline network index served
+// on localhost) hands over the lis.py bundle's BYTES directly, so hosted LIVIA never fetches the local
+// file (sidesteps file:// / CORS / Private-Network-Access — postMessage is subject to none). Opt-in via
+// ?post=1 so a normal tab never accepts injected data. Handshake: opener pings {type:'livia-ping'} → we
+// reply {source:'livia',type:'livia-ready'} → opener posts {type:'livia-load', name, data}. Same
+// reset + routeFiles + build() as loadExample.
+(function(){
+  if (!new URLSearchParams(location.search).has('post')) return;
+  const ready = (src) => { try { src && src.postMessage({ source: 'livia', type: 'livia-ready' }, '*'); } catch (e) {} };
+  // Data another page sent are marked as such: a page opened by a third party cannot pass for the user's own files.
+  const showOrigin = (ev) => {
+    let from = ev.origin || 'another page'; try { if (ev.source && ev.source.location) from = ev.source.location.href.split('#')[0]; } catch (e) {}   // the page itself when same-origin
+    let n = document.getElementById('post-origin');
+    if (!n) { n = document.createElement('div'); n.id = 'post-origin'; n.setAttribute('role', 'status');
+      n.style.cssText = 'max-width:1100px; margin:0.6rem auto 0; padding:0.45rem 0.8rem; border:1px solid #d6e2ee; border-radius:8px; background:#f5f9fc; color:#33414E; font-size:0.85rem;';
+      const main = document.querySelector('[role="main"]'); main ? main.prepend(n) : document.body.prepend(n); }
+    n.textContent = 'Loaded from ' + from + ': these data were sent by another page, not opened from your files.';
+  };
+  // While the opener is still reading (the LIVIA Atlas reads the data first): a status line at the top of the page, fed by
+  // {type:'livia-status', text, error} from the opener only, so the tab is never a blank page with nothing happening.
+  const banner = (text, kind) => {
+    let n = document.getElementById('post-status');
+    if (!n) { n = document.createElement('div'); n.id = 'post-status'; n.setAttribute('role', 'status'); n.setAttribute('aria-live', 'polite');
+      const main = document.querySelector('[role="main"]'); main ? main.prepend(n) : document.body.prepend(n); }
+    if (!text) { n.remove(); return; }
+    const err = kind === 'error';
+    n.style.cssText = 'max-width:1100px; margin:0.6rem auto 0.8rem; padding:0.55rem 0.8rem; border-radius:8px; font-size:0.9rem; font-weight:600; '
+      + (err ? 'border:1px solid #e3b4ad; background:#fbefed; color:#8a2c1f;' : 'border:1px solid #c9dbe9; background:#eef5fb; color:#1f4e79;');
+    n.textContent = text;
+  };
+  if (window.opener) banner('Waiting for the data from the page that opened this tab…');   // opened by hand (no opener): nothing is coming, so no waiting line
+  window.addEventListener('message', async (ev) => {
+    const m = ev.data;
+    if (!m || typeof m !== 'object') return;
+    if (m.type === 'livia-ping') { ready(ev.source); return; }
+    if (m.type === 'livia-status') { if (ev.source && ev.source === window.opener && m.text) banner(String(m.text).slice(0, 400), m.error ? 'error' : ''); return; }
+    if (m.type !== 'livia-load' || m.data == null) return;
+    banner('');
+    showOrigin(ev);
+    try {
+      const blob = (m.data instanceof Blob) ? m.data : new Blob([m.data]);
+      const nm = (m.name ? String(m.name) : 'network').replace(/[^\w.\-]+/g, '_');
+      const fname = /\.(zip|gz|csv)$/i.test(nm) ? nm : nm + '.zip';
+      setStatus('Loading ' + (m.name || 'network') + '…');
+      RAWPAIRS.clear(); FILES_RAW.length=0; FASTA_RAW=''; FILECOUNT=0; META=null; META_COL=null;
+      const a = m.atlas; ATLAS_SRC = a && typeof a.url === 'string' && ATLAS_OK.test(a.url) && /^[a-z]+$/.test(String(a.sp || '')) && a.keys && typeof a.keys === 'object' ? { url: a.url, sp: a.sp, keys: a.keys } : null;
+      await routeFiles([new File([blob], fname, { type: 'application/zip' })]);
+      applyNetOpts(m.ilis, m.species);
+      if (RAWPAIRS.size){ await build(); await afterBuild(URLP); }
+    } catch (e) { setStatus('Could not load pushed data: ' + (e.message || e)); }
+  });
+  if (window.opener) ready(window.opener);   // announce readiness in case the opener is already waiting
+})();
+</script>
+<script>window.goatcounter = { path: function () { return location.pathname.replace(/index\.html$/, ''); }, title: 'LIVIA ' + (location.pathname.split('/').pop() || 'index.html') };   /* the page only: never the file, pair or query */</script>
+<script data-goatcounter="https://livia.goatcounter.com/count"
+        async src="https://gc.zgo.at/count.js"></script>
+<script src="js/livia-count.js?v=20261105a"></script>
+<script src="js/livia-version.js?v=20261117b"></script>
+</body>
+</html>

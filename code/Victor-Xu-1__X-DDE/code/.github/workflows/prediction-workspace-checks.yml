@@ -1,0 +1,731 @@
+name: Prediction workspace presentation checks
+on:
+  push:
+    paths: &paths
+      - "scripts/confidence-frame-scope.py"
+      - "tests/test_confidence_frame_scope.py"
+      - "server_tests/test_confidence_frame_browser.py"
+      - "frontend/src/presentation/plots/usePlotFrame.ts"
+      - "frontend/public/fonts/jetbrains-mono/*"
+      - "frontend/src/operations/EntityOptions.tsx"
+      - "frontend/src/operations/ExpertParameters.tsx"
+      - "frontend/src/operations/IntegerListField*"
+      - "frontend/src/operations/integer-list-model.ts"
+      - "frontend/src/operations/opendde-draft*"
+      - "frontend/src/operations/useOpenDdeEditor.ts"
+      - "frontend/src/TaskFormDrafts.test.tsx"
+      - "tests/test_opendde_drafts.py"
+      - "tests/test_draft_compatibility.py"
+      - "tests/test_draft_compatibility_process.py"
+      - "scripts/check-draft-compatibility.py"
+      - "server_tests/test_opendde_drafts_browser.py"
+      - "frontend/src/operations/operations.test.tsx"
+      - "server_tests/test_prediction_feature_settings_browser.py"
+      - "server_tests/test_prediction_entities_browser.py"
+      - "frontend/public/fonts/plus-jakarta/*"
+      - "frontend/src/tokens.css"
+      - "frontend/src/presentation/Prediction*"
+      - "frontend/src/presentation/SequenceTrack*"
+      - "frontend/src/presentation/prediction-feature-policy.ts"
+      - "src/opendde_workbench/science_routes.py"
+      - "src/opendde_workbench/prediction_sample_export.py"
+      - "src/opendde_workbench/integrations/native_boltz.py"
+      - "src/opendde_workbench/native_runtime/analysis.py"
+      - "tests/test_prediction_sample_export.py"
+      - "server_tests/test_prediction_sample_export_browser.py"
+      - "server_tests/test_prediction_reference_review_browser.py"
+      - "server_tests/test_prediction_history_input_browser.py"
+      - "server_tests/test_prediction_job_archive_browser.py"
+      - "src/opendde_workbench/prediction_archive.py"
+      - "frontend/src/presentation/HistoricalPredictionInput.tsx"
+      - "frontend/src/presentation/HistoricalPredictionInput.test.tsx"
+      - "frontend/src/presentation/HistoricalInputOverview.tsx"
+      - "frontend/src/presentation/prediction-history-*.ts"
+      - "frontend/src/presentation/prediction-*.css"
+      - "frontend/src/presentation/prediction-heading-focus*"
+      - "frontend/src/viewer/confidence-*"
+      - "frontend/src/viewer/ConfidenceControls*"
+      - "frontend/src/viewer/structure-bytes*"
+      - "frontend/src/operations/confidence-*"
+      - "frontend/src/presentation/plots/InteractivePlot*"
+      - "src/opendde_workbench/confidence_binding.py"
+      - "tests/test_confidence_binding.py"
+      - "frontend/src/viewer/ChainControls*"
+      - "frontend/src/viewer/chain-controls.css"
+      - "frontend/src/viewer/chain-visibility*"
+      - "frontend/src/viewer/StructureViewport.tsx"
+      - "frontend/src/presentation/StructureWorkbench.tsx"
+      - "frontend/src/presentation/structure-workbench.css"
+      - "frontend/src/presentation/WorkspaceFullscreenControl*"
+      - "frontend/src/presentation/useWorkspaceFullscreen.ts"
+      - "frontend/src/presentation/workspace-expansion.ts"
+      - "frontend/src/presentation/workspace-fullscreen.css"
+      - "frontend/src/viewer/StructureViewer.test.tsx"
+      - "frontend/src/viewer/scene.ts"
+      - "frontend/src/viewer/frame.ts"
+      - "frontend/src/viewer/style.test.ts"
+      - "frontend/src/viewer/style.ts"
+      - "frontend/src/viewer/protocol.ts"
+      - "frontend/src/viewer/StructureInspection*"
+      - "frontend/src/viewer/ViewerControls*"
+      - "frontend/src/viewer/structure-inspection.css"
+      - "frontend/src/viewer/polymer-detail.ts"
+      - "frontend/src/viewer/residue-selection*"
+      - "frontend/src/viewer/display-readiness*"
+      - "frontend/src/integrations/prediction-presentation*"
+      - "frontend/src/integrations/Mol1Form.tsx"
+      - "frontend/src/integrations/Mol1FeatureInputs.tsx"
+      - "frontend/src/integrations/Mol1FeatureInputs.test.tsx"
+      - "frontend/src/integrations/Mol1Form.test.tsx"
+      - "frontend/src/integrations/Mol1Composition.ts"
+      - "frontend/src/integrations/Mol1JobReview.tsx"
+      - "frontend/src/integrations/BoltzJobReview.tsx"
+      - "frontend/src/integrations/BoltzInputs.tsx"
+      - "frontend/src/integrations/BoltzInputs.test.tsx"
+      - "frontend/src/integrations/BoltzMsaInput.tsx"
+      - "frontend/src/integrations/boltz-input-settings.css"
+      - "server_tests/test_boltz_input_settings_browser.py"
+      - "frontend/src/integrations/ScientificInputs.tsx"
+      - "frontend/src/integrations/boltz-job-request.ts"
+      - "frontend/src/research/asset-download.ts"
+      - "frontend/src/integrations/ScientificReview.tsx"
+      - "server_tests/test_boltz_final_review_browser.py"
+      - "frontend/src/integrations/mol1-job-*"
+      - "frontend/src/guided/Questionnaire.tsx"
+      - "frontend/src/guided/desktop-questionnaire.css"
+      - "server_tests/test_mol1_final_review_browser.py"
+      - "server_tests/test_job_review_layout_browser.py"
+      - "server_tests/job_review_scene_case.py"
+      - "frontend/src/integrations/Mol1Settings.tsx"
+      - "frontend/src/integrations/Mol1SeedEditor*"
+      - "frontend/src/integrations/Mol1RuntimeSettings.tsx"
+      - "frontend/src/integrations/mol1-seeds.ts"
+      - "frontend/src/integrations/mol1-computation-settings.css"
+      - "server_tests/test_mol1_settings_browser.py"
+      - "frontend/src/presentation/prediction-draft-model.ts"
+      - "frontend/src/presentation/prediction-draft-contract.ts"
+      - "frontend/src/presentation/mol1-draft-adapter.ts"
+      - "frontend/src/presentation/SharedPredictionDraftControls.tsx"
+      - "frontend/src/presentation/BoltzDraftControls.test.tsx"
+      - "frontend/src/integrations/BoltzDraftBoundary.tsx"
+      - "frontend/src/integrations/boltz-draft.ts"
+      - "frontend/src/presentation/prediction-settings-summary.ts"
+      - "src/opendde_workbench/drafts/**"
+      - "src/opendde_workbench/api.py"
+      - "src/opendde_workbench/assets.py"
+      - "tests/test_prediction_drafts.py"
+      - "tests/test_boltz_drafts.py"
+      - "server_tests/test_prediction_drafts_browser.py"
+      - "server_tests/test_boltz_drafts_browser.py"
+      - "frontend/src/integrations/Mol1Confidence.tsx"
+      - "frontend/src/integrations/ScientificForm.tsx"
+      - "frontend/src/integrations/ScientificResults.tsx"
+      - "frontend/src/studio/PredictionResults.tsx"
+      - "frontend/src/studio/PredictionInspection.tsx"
+      - "frontend/src/studio/PredictionResults.test.tsx"
+      - "frontend/src/studio/CandidatePanel*"
+      - "frontend/src/studio/AnalysisGrid.tsx"
+      - "frontend/src/studio/HomeWorkspace.test.tsx"
+      - "frontend/src/studio/Header.tsx"
+      - "frontend/src/operations/ConfidencePanel*"
+      - "frontend/src/operations/ConfidencePlddt*"
+      - "frontend/src/operations/ConfidenceDownload*"
+      - "frontend/src/operations/confidence-data.ts"
+      - "frontend/src/presentation/usePredictionConfidence*"
+      - "frontend/src/viewer/confidence-*"
+      - "src/opendde_workbench/boltz_confidence*.py"
+      - "src/opendde_workbench/native_arrays.py"
+      - "src/opendde_workbench/integrations/boltz_result.py"
+      - "tests/confidence_array_fixture.py"
+      - "tests/test_native_arrays.py"
+      - "tests/test_boltz_confidence*.py"
+      - "server_tests/boltz_confidence_case.py"
+      - "server_tests/test_boltz_confidence*.py"
+      - "src/opendde_workbench/confidence.py"
+      - "tests/test_import_confidence.py"
+      - "server_tests/native_confidence_case.py"
+      - "server_tests/test_native_confidence_browser.py"
+      - "frontend/src/guided/MolecularInputs.tsx"
+      - "frontend/src/guided/MolecularInputs.test.tsx"
+      - "frontend/src/TaskForm.tsx"
+      - "frontend/src/TaskForm.test.tsx"
+      - "frontend/src/guided/workflows.test.tsx"
+      - "frontend/src/operations/OpenDdeJobReview.tsx"
+      - "frontend/src/operations/opendde-job-request.ts"
+      - "frontend/src/studio/HomeWorkspace.tsx"
+      - "server_tests/test_opendde_final_review_browser.py"
+      - "frontend/src/App.tsx"
+      - "server_tests/prediction_workspace_case.py"
+      - "server_tests/test_prediction_workspace_browser.py"
+      - "server_tests/test_prediction_input_preview_browser.py"
+      - "server_tests/test_prediction_entry_browser.py"
+      - "scripts/prediction-workspace-scope.py"
+      - "scripts/prediction-setup-scope.py"
+      - "tests/test_prediction_setup_scope.py"
+      - "server_tests/test_prediction_setup_browser.py"
+      - "scripts/job-review-scope.py"
+      - "tests/test_prediction_workspace_scope.py"
+      - ".github/workflows/prediction-workspace-checks.yml"
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      scope_only:
+        type: boolean
+        default: false
+    outputs:
+      target_evidence_only:
+        value: ${{ jobs.scope.outputs.target_evidence_only }}
+      interaction_only:
+        value: ${{ jobs.scope.outputs.interaction_only }}
+      reference_only:
+        value: ${{ jobs.scope.outputs.reference_only }}
+      utility_only:
+        value: ${{ jobs.utility-scope.outputs.utility_only }}
+      mobile_header_only:
+        value: ${{ jobs.utility-scope.outputs.mobile_header_only }}
+      desktop_header_only:
+        value: ${{ jobs.utility-scope.outputs.desktop_header_only }}
+      desktop_complex_review_only:
+        value: ${{ jobs.utility-scope.outputs.desktop_complex_review_only }}
+      task_power_only:
+        value: ${{ jobs.utility-scope.outputs.task_power_only }}
+      confidence_frame:
+        value: ${{ jobs.scope.outputs.confidence_frame }}
+      appearance_only:
+        value: ${{ jobs.scope.outputs.appearance_only }}
+      computation_settings:
+        value: ${{ jobs.scope.outputs.computation_settings }}
+      feature_settings:
+        value: ${{ jobs.scope.outputs.feature_settings }}
+      job_review_layout:
+        value: ${{ jobs.scope.outputs.job_review_layout }}
+      prediction_only:
+        value: ${{ jobs.scope.outputs.prediction_only }}
+      shared_workbench_only:
+        value: ${{ jobs.scope.outputs.shared_workbench_only }}
+      boltz_confidence:
+        value: ${{ jobs.scope.outputs.boltz_confidence }}
+      boltz_drafts:
+        value: ${{ jobs.scope.outputs.boltz_drafts }}
+permissions:
+  contents: read
+jobs:
+  framing-scope:
+    if: ${{ !inputs.scope_only }}
+    uses: ./.github/workflows/figure-framing-scope.yml
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      confidence_frame: ${{ steps.select.outputs.confidence_frame }}
+      appearance_only: ${{ steps.select.outputs.appearance_only }}
+      boltz_drafts: ${{ steps.select.outputs.boltz_drafts }}
+      boltz_inputs: ${{ steps.select.outputs.boltz_inputs }}
+      computation_settings: ${{ steps.select.outputs.computation_settings }}
+      prediction_only: ${{ steps.select.outputs.prediction_only }}
+      shared_workbench_only: ${{ steps.select.outputs.shared_workbench_only }}
+      entity_inputs: ${{ steps.select.outputs.entity_inputs }}
+      feature_settings: ${{ steps.select.outputs.feature_settings }}
+      job_review_layout: ${{ steps.select.outputs.job_review_layout }}
+      sample_export_only: ${{ steps.select.outputs.sample_export_only }}
+      sample_export_changed: ${{ steps.select.outputs.sample_export_changed }}
+      reference_review_only: ${{ steps.select.outputs.reference_review_only }}
+      reference_review_changed: ${{ steps.select.outputs.reference_review_changed }}
+      history_input_only: ${{ steps.select.outputs.history_input_only }}
+      history_input_changed: ${{ steps.select.outputs.history_input_changed }}
+      job_archive_only: ${{ steps.select.outputs.job_archive_only }}
+      job_archive_changed: ${{ steps.select.outputs.job_archive_changed }}
+      native_confidence: ${{ steps.select.outputs.native_confidence }}
+      boltz_confidence: ${{ steps.select.outputs.boltz_confidence }}
+      confidence_changed: ${{ steps.select.outputs.confidence_changed }}
+      input_preview: ${{ steps.select.outputs.input_preview }}
+      setup_summary: ${{ steps.select.outputs.setup_summary }}
+      preview_changed: ${{ steps.select.outputs.preview_changed }}
+      drafts_only: ${{ steps.select.outputs.drafts_only }}
+      drafts_changed: ${{ steps.select.outputs.drafts_changed }}
+      draft_compatibility: ${{ steps.select.outputs.draft_compatibility }}
+      draft_compatibility_only: ${{ steps.select.outputs.draft_compatibility_only }}
+      final_review_only: ${{ steps.select.outputs.final_review_only }}
+      final_review_changed: ${{ steps.select.outputs.final_review_changed }}
+      boltz_review_changed: ${{ steps.select.outputs.boltz_review_changed }}
+      opendde_review_changed: ${{ steps.select.outputs.opendde_review_changed }}
+      result_layout_only: ${{ steps.select.outputs.result_layout_only }}
+      target_evidence_only: ${{ steps.target_evidence.outputs.target_evidence_only }}
+      interaction_only: ${{ steps.reference.outputs.interaction_only }}
+      reference_only: ${{ steps.reference.outputs.reference_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: select
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/prediction-workspace-scope.py
+      - id: reference
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/interaction-workspace-scope.py
+      - id: target_evidence
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/target-evidence-scope.py
+  interface:
+    needs: [scope, utility-scope, framing-scope]
+    if: ${{ !inputs.scope_only && needs.framing-scope.outputs.framing_only != 'true' && needs.scope.outputs.target_evidence_only != 'true' && needs.scope.outputs.interaction_only != 'true' && needs.scope.outputs.reference_only != 'true' && needs.utility-scope.outputs.utility_only != 'true' && needs.scope.outputs.appearance_only != 'true' && needs.scope.outputs.computation_settings != 'true' && needs.scope.outputs.boltz_inputs != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Selected sample download, ranking and direct result consumers
+        if: needs.scope.outputs.sample_export_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/PredictionSamples.test.tsx src/studio/PredictionResults.test.tsx
+          src/integrations/ScientificResults.test.tsx src/integrations/prediction-presentation.test.ts
+      - name: Compact result workspace, source method and retained scene consumers
+        if: needs.scope.outputs.result_layout_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/PredictionSamples.test.tsx
+          src/studio/PredictionResults.test.tsx src/examples/ExampleJobResult.test.tsx
+          src/presentation/WorkspaceFullscreenControl.test.tsx
+          src/operations/ConfidencePanel.test.tsx src/presentation/usePredictionConfidence.test.tsx
+          src/viewer/StructureInspection.test.tsx src/viewer/StructureViewer.test.tsx
+          src/integrations/ScientificResults.test.tsx src/presentation/PredictionReferenceEvidence.test.tsx
+          src/TaskDetail.actions.test.tsx src/studio/CandidatePanel.test.tsx
+      - name: Prediction presentation, selection identity and direct form/navigation consumers
+        if: needs.scope.outputs.entity_inputs != 'true' && needs.scope.outputs.job_archive_only != 'true' && needs.scope.outputs.history_input_only != 'true' && needs.scope.outputs.reference_review_only != 'true' && needs.scope.outputs.sample_export_only != 'true' && needs.scope.outputs.native_confidence != 'true' && needs.scope.outputs.input_preview != 'true' && needs.scope.outputs.drafts_only != 'true' && needs.scope.outputs.final_review_only != 'true' && needs.scope.outputs.result_layout_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/PredictionSamples.test.tsx
+          src/presentation/PredictionSetup.test.tsx
+          src/presentation/PredictionInputPreview.test.tsx
+          src/presentation/prediction-heading-focus.test.tsx
+          src/viewer/ChainControls.test.tsx src/viewer/chain-visibility.test.ts
+          src/viewer/StructureInspection.test.tsx src/viewer/ViewerControls.test.tsx src/viewer/residue-selection.test.ts
+          src/viewer/confidence-mapping.test.ts src/viewer/structure-bytes.test.ts src/operations/confidence-plot.test.ts
+          src/presentation/plots/InteractivePlot.test.tsx
+          src/viewer/display-readiness.test.ts
+          src/viewer/StructureViewer.test.tsx src/viewer/style.test.ts
+          src/viewer/contacts.test.ts src/viewer/donor-hydrogens.test.ts
+          src/guided/MolecularInputs.test.tsx
+          src/integrations/prediction-presentation.test.ts src/operations/ConfidencePanel.test.tsx
+          src/studio/PredictionResults.test.tsx src/integrations/ScientificResults.test.tsx
+          src/studio/CandidatePanel.test.tsx
+          src/TaskForm.test.tsx src/integrations/Mol1Form.test.tsx
+          src/integrations/ScientificForm.test.tsx src/studio/MethodSwitch.test.tsx
+          src/studio/Header.test.tsx src/App.test.tsx src/App.live-status.test.tsx
+          src/studio/HomeWorkspace.test.tsx
+      - name: Entity input ownership, row editing and direct prediction form consumers
+        if: needs.scope.outputs.entity_inputs == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/PredictionEntityEditing.test.tsx
+          src/presentation/PredictionFeatureSettings.test.tsx
+          src/integrations/Mol1FeatureInputs.test.tsx
+          src/guided/MolecularInputs.test.tsx src/TaskForm.test.tsx
+          src/guided/workflows.test.tsx src/integrations/Mol1Form.test.tsx
+          src/integrations/ScientificForm.test.tsx src/integrations/BoltzInputs.test.tsx
+          src/presentation/PredictionInputPreview.test.tsx src/presentation/PredictionSetup.test.tsx
+      - name: Native evolutionary-parameter labels and effective settings
+        if: needs.scope.outputs.feature_settings == 'true'
+        working-directory: frontend
+        run: npx vitest run src/operations/operations.test.tsx -t "keeps form labels attached to scientific inputs"
+      - name: Current prediction input review and its direct form, sequence and depiction consumers
+        if: needs.scope.outputs.input_preview == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/PredictionInputPreview.test.tsx
+          src/presentation/PredictionSetup.test.tsx src/presentation/SequenceTrack.test.tsx
+          src/presentation/MoleculeImage.test.tsx src/guided/MolecularInputs.test.tsx
+          src/studio/HomeWorkspace.test.tsx
+          src/TaskForm.test.tsx src/integrations/Mol1Form.test.tsx src/integrations/ScientificForm.test.tsx
+      - name: Final review, exact task payload and shared dialog/questionnaire consumers
+        if: needs.scope.outputs.final_review_changed == 'true' && needs.scope.outputs.job_review_layout != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/Mol1Form.test.tsx src/integrations/mol1-job-request.test.ts
+          src/guided/Questionnaire.test.tsx src/presentation/PredictionInputPreview.test.tsx
+      - name: Shared review visibility, editing and retained overview state
+        if: needs.scope.outputs.job_review_layout == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/PredictionJobReview.test.tsx
+          src/presentation/SequenceTrack.test.tsx
+          src/presentation/PredictionInputPreview.test.tsx src/integrations/Mol1Form.test.tsx
+          src/integrations/mol1-job-request.test.ts src/integrations/ScientificForm.test.tsx
+          src/TaskForm.test.tsx src/operations/HarnessFoldInputs.test.tsx
+          src/docking/DockingForm.test.tsx src/diffsbdd/DiffForm.test.tsx
+          src/proximity/Form.test.tsx src/guided/Questionnaire.test.tsx
+      - name: Native confidence interpretation and direct prediction result consumer
+        if: needs.scope.outputs.native_confidence == 'true' && needs.scope.outputs.confidence_frame != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/operations/ConfidencePanel.test.tsx src/studio/PredictionResults.test.tsx
+          src/integrations/ScientificResults.test.tsx src/viewer/StructureInspection.test.tsx
+          src/viewer/confidence-mapping.test.ts src/presentation/usePredictionConfidence.test.tsx
+          src/operations/ConfidenceDownload.test.tsx
+          src/operations/ConfidencePlddt.test.tsx
+          src/operations/confidence-request.test.ts
+          src/viewer/style.test.ts src/viewer/StructureViewer.test.tsx
+      - name: Verified plot frames, confidence source identity and conservative default consumers
+        if: needs.scope.outputs.confidence_frame == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/plots/InteractivePlot.frame.test.tsx
+          src/presentation/PredictionPlotSize.test.tsx
+          src/presentation/plots/InteractivePlot.test.tsx src/presentation/plots/types.test.ts
+          src/operations/ConfidencePanel.test.tsx src/operations/ConfidencePlddt.test.tsx
+          src/operations/ConfidenceDownload.test.tsx src/presentation/usePredictionConfidence.test.tsx
+          src/publication/FigureExport.test.tsx src/publication/plotly.test.ts
+          src/presentation/MetricScatter.test.tsx src/datasets/DatasetCharts.test.tsx
+          src/simulations/FreeEnergyCycle.test.tsx src/simulations/OverlapHeatmap.test.tsx
+      - name: Exact Boltz-2 submit payload, MSA and shared review consumers
+        if: needs.scope.outputs.boltz_review_changed == 'true' && needs.scope.outputs.job_review_layout != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/ScientificForm.test.tsx
+          src/integrations/ScientificReview.test.tsx src/integrations/BoltzInputs.test.tsx
+      - name: OpenDDE request identity, project ownership and structure input consumers
+        if: needs.scope.outputs.opendde_review_changed == 'true' && needs.scope.outputs.job_review_layout != 'true'
+        working-directory: frontend
+        run: npx vitest run src/TaskForm.test.tsx src/guided/workflows.test.tsx src/studio/HomeWorkspace.test.tsx
+      - name: Unfinished saved drafts and their native form and shared setup consumers
+        if: needs.scope.outputs.drafts_changed == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/PredictionDraftControls.test.tsx
+          src/presentation/BoltzDraftControls.test.tsx src/integrations/ScientificForm.test.tsx
+          src/integrations/BoltzInputs.test.tsx src/integrations/ReinventForm.test.tsx
+          src/integrations/Mol1Form.test.tsx src/presentation/PredictionSetup.test.tsx
+          src/presentation/PredictionInputPreview.test.tsx
+          src/TaskFormDrafts.test.tsx src/operations/opendde-draft.test.ts
+          src/operations/IntegerListField.test.tsx
+      - name: Real SQLite, revision conflicts, asset retention and same-origin draft API
+        if: needs.scope.outputs.drafts_changed == 'true'
+        run: |
+          uv sync --locked --group dev
+          uv run --locked pytest -q tests/test_prediction_drafts.py tests/test_boltz_drafts.py tests/test_opendde_drafts.py tests/test_api_security.py
+          uv run --locked ruff check src/opendde_workbench/drafts tests/test_prediction_drafts.py tests/test_boltz_drafts.py tests/test_opendde_drafts.py server_tests/test_prediction_drafts_browser.py server_tests/test_boltz_drafts_browser.py server_tests/test_opendde_drafts_browser.py
+      - name: Real target-wheel schemas and read-only upgrade compatibility
+        if: needs.scope.outputs.draft_compatibility == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WB_DRAFT_LEGACY_WHEEL: ${{ runner.temp }}/draft-compatibility/x_dde-0.8.1-py3-none-any.whl
+          WB_DRAFT_CURRENT_WHEEL_DIR: ${{ runner.temp }}/draft-compatibility/current
+        run: |
+          uv sync --locked --group dev
+          mkdir -p "$RUNNER_TEMP/draft-compatibility"
+          gh release download v0.8.1 --repo "$GITHUB_REPOSITORY" --pattern x_dde-0.8.1-py3-none-any.whl --dir "$RUNNER_TEMP/draft-compatibility"
+          uv build --wheel --out-dir "$WB_DRAFT_CURRENT_WHEEL_DIR"
+          uv run --locked ruff check src/opendde_workbench/drafts/compatibility*.py scripts/check-draft-compatibility.py tests/test_draft_compatibility*.py
+          uv run --locked python -m pytest -q tests/test_draft_compatibility.py tests/test_draft_compatibility_process.py
+      - if: needs.scope.outputs.draft_compatibility_only != 'true'
+        run: uv sync --locked --group dev --group browser
+      - name: Scope contract and changed browser fixture checks
+        run: |
+          uv run --locked python -m pytest -q tests/test_prediction_workspace_scope.py
+          uv run --locked ruff check scripts/prediction-workspace-scope.py tests/test_prediction_workspace_scope.py server_tests/prediction_workspace_case.py server_tests/test_prediction_workspace_browser.py
+          if [[ '${{ needs.scope.outputs.confidence_frame }}' == 'true' ]]; then
+            uv run --locked python -m pytest -q tests/test_confidence_frame_scope.py
+            uv run --locked ruff check scripts/confidence-frame-scope.py tests/test_confidence_frame_scope.py server_tests/test_confidence_frame_browser.py
+          fi
+          if [[ '${{ needs.scope.outputs.setup_summary }}' == 'true' ]]; then
+            uv run --locked python -m pytest -q tests/test_prediction_setup_scope.py
+            uv run --locked ruff check scripts/prediction-setup-scope.py tests/test_prediction_setup_scope.py server_tests/test_prediction_setup_browser.py
+          fi
+      - name: Native fractional pLDDT contract and invalid source values
+        if: needs.scope.outputs.confidence_changed == 'true'
+        run: |
+          uv run --locked python -m pytest -q tests/test_import_confidence.py tests/test_confidence_binding.py
+          uv run --locked ruff check src/opendde_workbench/confidence.py src/opendde_workbench/confidence_binding.py tests/test_confidence_binding.py tests/test_import_confidence.py server_tests/native_confidence_case.py server_tests/test_native_confidence_browser.py
+      - name: Bounded native arrays, declared Boltz identities and retained raw exports
+        if: needs.scope.outputs.boltz_confidence == 'true'
+        run: |
+          uv run --locked python -m pytest -q tests/test_native_arrays.py tests/test_boltz_confidence.py tests/test_boltz_confidence_adapter.py
+          uv run --locked ruff check src/opendde_workbench/native_arrays.py src/opendde_workbench/boltz_confidence*.py src/opendde_workbench/integrations/boltz_result.py src/opendde_workbench/integrations/native_boltz.py tests/confidence_array_fixture.py tests/test_native_arrays.py tests/test_boltz_confidence*.py server_tests/boltz_confidence_case.py server_tests/test_boltz_confidence_format.py server_tests/test_boltz_confidence_browser.py
+      - name: Obtain the existing sealed STAT6 output archive without running engines
+        if: needs.scope.outputs.job_archive_changed == 'true' || needs.scope.outputs.confidence_changed == 'true' || needs.scope.outputs.sample_export_changed == 'true' || needs.scope.outputs.reference_review_changed == 'true' || needs.scope.outputs.history_input_changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          readarray -t source < <(uv run --locked python -c 'from opendde_workbench.examples.stat6_bundle_release import URL; print("\n".join(URL.rsplit("/", 2)[-2:]))')
+          test "${#source[@]}" -eq 2
+          [[ "${source[0]}" =~ ^examples-v[0-9]+$ ]]
+          [[ "${source[1]}" =~ ^stat6-reviewed-results-v[0-9]+\.zip$ ]]
+          gh release download "${source[0]}" --repo "$GITHUB_REPOSITORY" --pattern "${source[1]}" --dir "$RUNNER_TEMP"
+          echo "WB_REVIEWED_STAT6_ARCHIVE=$RUNNER_TEMP/${source[1]}" >> "$GITHUB_ENV"
+      - if: needs.scope.outputs.draft_compatibility_only != 'true'
+        run: uv run --locked playwright install chromium --with-deps
+      - name: Native Chrome for setup summaries
+        if: needs.scope.outputs.setup_summary == 'true' || needs.scope.outputs.input_preview == 'true'
+        run: uv run --locked playwright install chrome --with-deps
+      - name: Prepare the existing native drawing component in isolated CI state
+        if: needs.scope.outputs.reference_review_only != 'true' && needs.scope.outputs.sample_export_only != 'true' && (needs.scope.outputs.entity_inputs == 'true' || needs.scope.outputs.preview_changed == 'true' || needs.scope.outputs.drafts_changed == 'true' || needs.scope.outputs.final_review_changed == 'true' || needs.scope.outputs.boltz_review_changed == 'true' || needs.scope.outputs.opendde_review_changed == 'true')
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-input-preview" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-input-preview/state" >> "$GITHUB_ENV"
+          WB_HOME="$RUNNER_TEMP/x-dde-input-preview" WB_STATE_DIR="$RUNNER_TEMP/x-dde-input-preview/state" uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+      - name: Native Google Chrome for verified confidence-frame interactions
+        if: needs.scope.outputs.confidence_frame == 'true'
+        run: uv run --locked playwright install chrome --with-deps
+      - name: Actual STAT6 matrix continuity, pane sizing, native source and theme legend in Chrome
+        if: needs.scope.outputs.confidence_frame == 'true'
+        run: uv run --locked python -m pytest -x -q server_tests/test_confidence_frame_browser.py
+      - name: Bilingual shared entity editing, compact headers and preserved STAT6 inputs
+        if: needs.scope.outputs.entity_inputs == 'true'
+        run: |
+          uv run --locked ruff check server_tests/test_prediction_entities_browser.py
+          uv run --locked python -m pytest -x -q server_tests/test_prediction_entities_browser.py
+      - name: Focused MSA settings, cancellation, source guards and native consent
+        if: needs.scope.outputs.feature_settings == 'true'
+        run: |
+          uv run --locked ruff check server_tests/test_prediction_feature_settings_browser.py
+          uv run --locked python -m pytest -x -q server_tests/test_prediction_feature_settings_browser.py
+      - name: Bilingual desktop and narrow compiled UI, source-bound downloads, actual WebGL and Plotly; no inference
+        if: needs.scope.outputs.entity_inputs != 'true' && needs.scope.outputs.job_archive_only != 'true' && needs.scope.outputs.history_input_only != 'true' && needs.scope.outputs.reference_review_only != 'true' && needs.scope.outputs.sample_export_only != 'true' && needs.scope.outputs.native_confidence != 'true' && needs.scope.outputs.input_preview != 'true' && needs.scope.outputs.drafts_only != 'true' && needs.scope.outputs.final_review_only != 'true' && needs.scope.outputs.result_layout_only != 'true'
+        run: uv run --locked python -m pytest -x -q server_tests/test_prediction_workspace_browser.py
+      - name: Bilingual current inputs, native Ketcher depiction, return to edit and no submission
+        if: needs.scope.outputs.reference_review_only != 'true' && needs.scope.outputs.sample_export_only != 'true' && needs.scope.outputs.preview_changed == 'true' && needs.scope.outputs.result_layout_only != 'true'
+        run: |
+          uv run --locked ruff check server_tests/test_prediction_input_preview_browser.py
+          uv run --locked python -m pytest -x -q server_tests/test_prediction_input_preview_browser.py
+      - name: Check the shared desktop scope routes prediction inputs to this workflow
+        if: needs.scope.outputs.input_preview == 'true'
+        run: |
+          uv run --locked ruff check scripts/molecular-utility-scope.py tests/test_molecular_utility_scope.py
+          uv run --locked python -m pytest -q tests/test_molecular_utility_scope.py
+      - name: Guided setup, expandable settings and current values across all prediction forms
+        if: needs.scope.outputs.setup_summary == 'true'
+        run: uv run --locked python -m pytest -x -q server_tests/test_prediction_setup_browser.py
+      - name: Retained STAT6 scores, Plotly interactions, compact canvas and byte-exact downloads
+        if: needs.scope.outputs.confidence_changed == 'true'
+        run: uv run --locked python -m pytest -x -q server_tests/test_native_confidence_browser.py
+      - name: NumPy native interchange and bilingual real Plotly/WebGL linkage without inference
+        if: needs.scope.outputs.boltz_confidence == 'true'
+        run: >-
+          uv run --locked --python 3.12 --with numpy==1.26.4 python -m pytest -q
+          server_tests/test_boltz_confidence_format.py server_tests/test_boltz_confidence_browser.py
+      - name: Bilingual real saved-draft refresh, explicit resume and archive recovery without computation
+        if: needs.scope.outputs.drafts_changed == 'true'
+        run: uv run --locked python -m pytest -x -q server_tests/test_prediction_drafts_browser.py server_tests/test_boltz_drafts_browser.py server_tests/test_opendde_drafts_browser.py
+      - name: Bilingual final job preview with the real server and engine unavailable
+        if: needs.scope.outputs.final_review_changed == 'true'
+        run: |
+          uv run --locked ruff check server_tests/test_mol1_final_review_browser.py server_tests/test_mol1_browser.py
+          uv run --locked python -m pytest -x -q server_tests/test_mol1_final_review_browser.py
+      - name: Retained hidden editor and visible Mol-1 review layout
+        if: needs.scope.outputs.drafts_changed == 'true' && needs.scope.outputs.opendde_review_changed == 'true'
+        run: |
+          uv run --locked ruff check server_tests/test_job_review_layout_browser.py
+          uv run --locked python -m pytest -x -q server_tests/test_job_review_layout_browser.py -k shared_job_layout_and_retained_native_entity
+      - name: Shared layout and all four remaining native overview consumers
+        if: needs.scope.outputs.job_review_layout == 'true'
+        env:
+          PYTHONPATH: .:tests:src
+        run: |
+          export WB_DOCKING_VISUAL_STATE="$WB_STATE_DIR"
+          export WB_TERNARY_VISUAL_STATE="$WB_STATE_DIR"
+          uv run --locked ruff check scripts/job-review-scope.py server_tests/test_job_review_layout_browser.py server_tests/job_review_scene_case.py server_tests/test_fold_msa_sources_browser.py
+          uv run --locked python -m pytest -x -q server_tests/test_job_review_layout_browser.py server_tests/test_fold_msa_sources_browser.py server_tests/test_docking_job_review_browser.py server_tests/test_ternary_job_review_browser.py::test_ternary_review_uses_real_independent_binary_frames
+      - name: Bilingual Boltz-2 review of an exact ligand record and chain MSA
+        if: needs.scope.outputs.boltz_review_changed == 'true'
+        run: |
+          uv run --locked ruff check server_tests/test_boltz_final_review_browser.py
+          uv run --locked python -m pytest -x -q server_tests/test_boltz_final_review_browser.py
+      - name: Bilingual OpenDDE review with native 2D depiction and no submission
+        if: needs.scope.outputs.opendde_review_changed == 'true'
+        run: |
+          uv run --locked ruff check server_tests/test_opendde_final_review_browser.py
+          uv run --locked python -m pytest -x -q server_tests/test_opendde_final_review_browser.py
+      - name: Bilingual retained sample selection and exact structure and confidence ZIP
+        if: needs.scope.outputs.sample_export_changed == 'true'
+        env:
+          WB_HOME: ${{ runner.temp }}/x-dde-prediction-sample
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-prediction-sample/state
+        run: |
+          uv run --locked ruff check src/opendde_workbench/prediction_sample_export.py src/opendde_workbench/science_routes.py src/opendde_workbench/native_runtime/analysis.py src/opendde_workbench/integrations/native_boltz.py tests/test_prediction_sample_export.py server_tests/test_prediction_sample_export_browser.py
+          uv run --locked python -m pytest -x -q tests/test_prediction_sample_export.py server_tests/test_prediction_sample_export_browser.py
+
+      - name: Verified experimental receptor comparison and PLIP overlay
+        if: needs.scope.outputs.reference_review_changed == 'true'
+        env:
+          WB_HOME: ${{ runner.temp }}/x-dde-prediction-reference
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-prediction-reference/state
+        run: |
+          (cd frontend && npx vitest run src/presentation/PredictionReferenceEvidence.test.tsx src/integrations/ScientificResults.test.tsx src/viewer/source-layout.test.ts src/viewer/scientific-overlay.test.ts)
+          uv run --locked ruff check server_tests/test_prediction_reference_review_browser.py scripts/prediction-workspace-scope.py tests/test_prediction_workspace_scope.py
+          uv run --locked python -m pytest -x -q server_tests/test_prediction_reference_review_browser.py tests/test_prediction_workspace_scope.py
+
+      - name: Bilingual archived inputs, source labels and byte-exact downloads
+        if: needs.scope.outputs.history_input_changed == 'true'
+        env:
+          WB_HOME: ${{ runner.temp }}/x-dde-prediction-history
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-prediction-history/state
+        run: |
+          (cd frontend && npx vitest run src/presentation/prediction-history-model.test.ts src/presentation/HistoricalPredictionInput.test.tsx src/presentation/PredictionInputPreview.test.tsx)
+          uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked ruff check src/opendde_workbench/api.py tests/test_jobs.py server_tests/test_prediction_history_input_browser.py
+          uv run --locked python -m pytest -x -q tests/test_jobs.py::test_real_process_result_download_and_durable_request server_tests/test_prediction_history_input_browser.py
+
+      - name: Bilingual native prediction job archive and exact scientific files
+        if: needs.scope.outputs.job_archive_changed == 'true'
+        env:
+          WB_HOME: ${{ runner.temp }}/x-dde-prediction-archive
+          WB_STATE_DIR: ${{ runner.temp }}/x-dde-prediction-archive/state
+        run: |
+          (cd frontend && npx vitest run src/studio/PredictionResults.test.tsx src/TaskDetail.test.tsx src/TaskDetail.actions.test.tsx src/examples/useTaskLabel.test.tsx)
+          uv run --locked ruff check src/opendde_workbench/prediction_archive.py src/opendde_workbench/science_routes.py server_tests/test_prediction_job_archive_browser.py
+          uv run --locked python -m pytest -x -q tests/test_prediction_sample_export.py server_tests/test_prediction_job_archive_browser.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prediction-workspace-evidence
+          path: |
+            outputs/prediction-workspace/**
+            outputs/prediction-sample-package/**
+            outputs/prediction-reference-review/**
+            outputs/prediction-history-input/**
+            outputs/prediction-job-archive/**
+            outputs/opendde-final-review/**
+            outputs/native-confidence/**
+            outputs/confidence-frame/**
+            outputs/boltz-confidence/**
+            outputs/prediction-input-preview/**
+            outputs/prediction-setup/**
+            outputs/prediction-entities/**
+            outputs/prediction-feature-settings/**
+            outputs/prediction-drafts/**
+            outputs/mol1-final-review/**
+            outputs/boltz-final-review/**
+            outputs/job-review-layout/**
+            outputs/antibody-cdr/msa-source-*/**
+            outputs/docking-job-review/**
+            outputs/ternary-job-review/**
+            server_tests/evidence/prolif-contacts/**
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prediction-interface-web
+          path: src/opendde_workbench/web
+          retention-days: 3
+  boltz-inputs:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.boltz_inputs == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Chain MSA transaction and exact input ownership
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/BoltzInputs.test.tsx
+          src/integrations/useBoltzMsa.test.ts src/integrations/ScientificForm.test.tsx
+          src/integrations/ScientificReview.test.tsx
+      - run: uv sync --locked --group dev --group browser
+      - name: Closed scope and native alignment identity contracts
+        run: uv run --locked python -m pytest -x -q tests/test_prediction_workspace_scope.py tests/test_boltz_msa.py
+      - name: Scoped input source lint
+        run: >-
+          uv run --locked ruff check scripts/prediction-workspace-scope.py
+          tests/test_prediction_workspace_scope.py server_tests/test_boltz_input_settings_browser.py
+          server_tests/test_boltz_final_review_browser.py
+      - run: uv run --locked playwright install chromium --with-deps
+      - name: Prepare native drawing and isolated browser state
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-boltz-inputs" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-boltz-inputs/state" >> "$GITHUB_ENV"
+          WB_HOME="$RUNNER_TEMP/x-dde-boltz-inputs" WB_STATE_DIR="$RUNNER_TEMP/x-dde-boltz-inputs/state" uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+      - name: Native input dialogs and exact final review without inference
+        run: >-
+          uv run --locked python -m pytest -x -q server_tests/test_boltz_input_settings_browser.py
+          server_tests/test_boltz_final_review_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boltz-input-evidence
+          path: |
+            outputs/boltz-input-settings/**
+            outputs/boltz-final-review/**
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prediction-interface-web
+          path: src/opendde_workbench/web
+          retention-days: 3
+  computation-settings:
+    needs: scope
+    if: ${{ !inputs.scope_only && needs.scope.outputs.computation_settings == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Native settings, exact requests and unfinished draft consumers
+        working-directory: frontend
+        run: >-
+          npx vitest run src/integrations/Mol1Form.test.tsx
+          src/integrations/Mol1SeedEditor.test.tsx
+          src/integrations/mol1-job-request.test.ts
+          src/presentation/PredictionDraftControls.test.tsx
+      - run: uv sync --locked --group dev --group browser
+      - name: Closed scope, original drafts and native model contracts
+        run: >-
+          uv run --locked pytest -x -q tests/test_prediction_workspace_scope.py
+          tests/test_prediction_drafts.py tests/test_mol1.py tests/test_mol1_native_contract.py
+      - name: Scoped settings and browser source lint
+        run: >-
+          uv run --locked ruff check scripts/prediction-workspace-scope.py
+          tests/test_prediction_workspace_scope.py server_tests/test_mol1_settings_browser.py
+          server_tests/test_prediction_drafts_browser.py
+      - run: uv run --locked playwright install chromium --with-deps
+      - name: Prepare native drawing and isolated browser state
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-computation-settings" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-computation-settings/state" >> "$GITHUB_ENV"
+          WB_HOME="$RUNNER_TEMP/x-dde-computation-settings" WB_STATE_DIR="$RUNNER_TEMP/x-dde-computation-settings/state" uv run --locked python server_tests/prepare_visual_components.py --components ketcher
+      - name: Compiled settings, real draft recovery and exact review without inference
+        run: >-
+          uv run --locked python -m pytest -x -q server_tests/test_mol1_settings_browser.py
+          server_tests/test_prediction_drafts_browser.py server_tests/test_mol1_final_review_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mol1-computation-evidence
+          path: |
+            outputs/mol1-settings/**
+            outputs/prediction-drafts/**
+            outputs/mol1-final-review/**
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prediction-interface-web
+          path: src/opendde_workbench/web
+          retention-days: 3

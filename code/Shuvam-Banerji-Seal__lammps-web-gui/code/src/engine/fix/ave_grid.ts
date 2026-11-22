@@ -1,0 +1,493 @@
+import type { System } from '../system';
+import { Fix } from './fix';
+import { StyleError } from '../force/types';
+import { inumeric, parseNum } from '../force/util';
+import { expandWildcards, parseRef, peratomValues, type Ref } from '../refs';
+import { massOf } from '../atoms';
+import { expandGridRefs, gridColumn, resolveGridRef, type GridRef } from '../grid';
+
+/*
+ * fix ave/grid — per-atom mode, implemented from docs.lammps.org/fix_ave_grid.html
+ * (plans/lammps-docs/fix_ave_grid.rst). Quoted sentences are copied character
+ * for character from that page.
+ *
+ * Syntax: "fix ID group-ID ave/grid Nevery Nrepeat Nfreq Nx Ny Nz value1 value2 ...
+ * keyword args ...". "Overlay the 2d or 3d simulation box with a uniformly spaced
+ * 2d or 3d grid and use it to either (a) time-average per-atom quantities for the
+ * atoms in each grid cell". Grid cells are numbered with x varying fastest.
+ *
+ * Sampling: "The final averaged quantities are generated on time steps that are a
+ * multiples of Nfreq. The average is over Nrepeat quantities, computed in the
+ * preceding portion of the simulation every Nevery time steps." The page requires
+ * Nfreq to be a multiple of a non-zero Nevery, and "Also, the time steps
+ * contributing to the average value cannot overlap" (Nrepeat x Nevery <= Nfreq). Measured with native LAMMPS (black box): the
+ * output on Nfreq steps uses the samples of Nrepeat steps; an output whose
+ * window is not complete (step 0 with Nrepeat > 1) is left at zero.
+ *
+ * Normalization (keyword norm; "The output grid value on an Nfreq timestep is the sum
+ * of the grid values in each of the Nrepeat samples, divided by Nrepeat."):
+ *   all:    "Output = (Sum1 + Sum2 + ... + SumN) / (Count1 + Count2 + ... + CountN)"
+ *   sample: "Output = (Sum1/Count1 + Sum2/Count2 + ... + SumN/CountN) / Nrepeat"
+ *   none:   "Output = (Sum1 + Sum2 + ... SumN) / Nrepeat"
+ * Measured with native LAMMPS (black box): an empty cell in a sample counts as
+ * 0 in the sample average, and an empty cell gives 0 under norm all and none.
+ * density/number and density/mass: "the result is also divided by the grid cell
+ * volume". Measured: the output is (sum over samples of the count) / (Nrepeat x
+ * cell volume at the output step) for norm all and none, and the per-sample
+ * density averaged over Nrepeat for norm sample. The page gives the count output as
+ * "Output count = (Count1 + Count2 + ... CountN) / Nrepeat".
+ *
+ * temp: the page says the fix "computes the temperature for each grid cell, by the formula" KE = DOF/2 k_B T,
+ * with "The DOF is calculated as N\*adof + cdof" (defaults: adof = dimension,
+ * cdof = 0). For norm all and none the DOF is summed over the samples; for
+ * norm sample each sample gives its own temperature and the average over the
+ * Nrepeat samples is the output (measured: an empty sample contributes 0).
+ *
+ * ave: one (the default) outputs each produced value as it is; running is the
+ * cumulative average of all previous outputs; window M is the average of the M
+ * most recent outputs. "Outputs on early steps will average over less than M
+ * values if they are not available." (the running and window averages of count
+ * are taken the same way; not measured).
+ *
+ * Binning: as native LAMMPS does (src/fix_ave_grid.cpp atom2grid at b332f28), the cell index along a dimension is
+ * int((x - boxlo) * N / prd + OFFSET) - OFFSET with OFFSET = 16384, in lamda coordinates (boxlo 0, prd 1) for a
+ * triclinic box. In a periodic dimension an atom just outside the box lands in a ghost cell, which is summed into its
+ * periodic image. discard: the keyword list says "yes = discard an atom outside grid in a non-periodic dimension"
+ * and "no = assign an atom outside the grid to the closest grid cell", and native does so (yes, the default, skips
+ * the atom; no puts it in the first or last cell); the paragraph that says the opposite is not followed.
+ *
+ * bias ID: "compute ID of a temperature compute that removes a velocity bias"; as native does, the bias is removed
+ * for the temp value only (remove_bias_all and restore_bias_all around its kinetic energies), with the compute's
+ * checks: "Could not find compute ID {} for temperature bias", "Bias compute ID {} does not calculate temperature"
+ * and "... does not calculate a velocity bias".
+ *
+ * Output access: "For access by other commands, the name of the single grid
+ * produced by this fix is" grid. The per-grid data is read by dump grid as f_ID:grid:data (and f_ID:grid:count,
+ * the atom counts), valid on multiples of Nfreq (grid.ts), and here with gridValue() / gridCount(). This fix has no
+ * global scalar, vector or array,
+ * so f_ID and f_ID[i][j] are refused, as native LAMMPS refuses them (measured:
+ * the thermo keyword f_ag[1][1] fails with the message: fix ag does not compute an array).
+ *
+ * Per-grid inputs: "If a value begins with "c_" or "f_" and is followed by a colon-separated grid and data name,
+ * it is a per-grid quantity" (c_ID:gname:dname, c_ID:gname:dname[I], f_... ; grid.ts), and then "all of the input
+ * values must be per-grid". Each sample adds the referenced per-grid values cell by cell; on an Nfreq step the sum
+ * is multiplied by 1/Nrepeat (the norm keyword does not apply) and ave one / running / window follow as for
+ * per-atom values; there is no count data set. As native LAMMPS does (src/fix_ave_grid.cpp at b332f28), a mix of
+ * per-atom and per-grid values stops ("Fix ave/grid cannot operate on per-atom and per-grid values together"), and
+ * so does a referenced grid of another size ("Fix ave/grid value grid sizes do not match").
+ *
+ */
+
+type AttrName = 'vx' | 'vy' | 'vz' | 'fx' | 'fy' | 'fz' | 'mass';
+type Column =
+  | { t: 'attr'; name: AttrName; text: string }
+  | { t: 'ref'; ref: Ref; text: string }
+  | { t: 'dens'; mass: boolean; text: string }
+  | { t: 'temp'; text: string }
+  | { t: 'grid'; ref: GridRef; text: string };
+
+const ATTRS: AttrName[] = ['vx', 'vy', 'vz', 'fx', 'fy', 'fz', 'mass'];
+const KEYWORDS = new Set(['discard', 'norm', 'ave', 'bias', 'adof', 'cdof']);
+/** A word of the value list: an atom attribute, temp, a density, or a compute, fix or variable reference. */
+const isValueWord = (w: string): boolean =>
+  (ATTRS as readonly string[]).includes(w) || w === 'temp' || w === 'density/number' || w === 'density/mass' || /^[cfv]_/.test(w);
+/** Keeps an atom just outside the box from rounding toward cell 0 (fix_ave_grid.cpp OFFSET). */
+const OFFSET = 16384;
+
+
+export class FixAveGrid extends Fix {
+  readonly style = 'ave/grid';
+  readonly nEvery: number;
+  readonly nRepeat: number;
+  readonly nFreq: number;
+  readonly nx: number;
+  readonly ny: number;
+  readonly nz: number;
+  readonly ncell: number;
+  private readonly cols: Column[] = [];
+  private discard = true;
+  private norm: 'all' | 'sample' | 'none' = 'all';
+  private aveMode: 'one' | 'running' | 'window' = 'one';
+  private windowM = 1;
+  private adof: number;
+  private cdof = 0;
+
+  /** Current output: data[cell * ncol + col] and count[cell]. */
+  private data: Float64Array;
+  private count: Float64Array;
+  private runData: Float64Array | null = null;
+  private runCount: Float64Array | null = null;
+  private runN = 0;
+  private history: { data: Float64Array; count: Float64Array }[] = [];
+
+  // accumulators over the samples of the current window
+  private nSample = 0;
+  private accCnt: Float64Array;
+  private accCntSamp: Float64Array;
+  private accMass: Float64Array;
+  private accMassSamp: Float64Array;
+  private accKE: Float64Array;
+  private accDof: Float64Array;
+  private accTsamp: Float64Array;
+  private accSum: Float64Array[] = [];
+  private accSamp: Float64Array[] = [];
+  private lastStep = -1;
+  /** The values are per-grid references (else per-atom values). */
+  private modeGrid = false;
+  /** bias: the temperature compute whose velocity bias the temp value leaves out. */
+  private biasId: string | null = null;
+
+  constructor(sys: System, id: string, group: string, args: string[]) {
+    super(sys, id, group, args);
+    const what = `fix ${id} ave/grid`;
+    if (args.length < 7) throw new StyleError(`${what}: missing argument(s): Nevery Nrepeat Nfreq Nx Ny Nz value1 ...`);
+    // As native LAMMPS does (src/fix_ave_grid.cpp FixAveGrid::FixAveGrid at b332f28): utils::inumeric reads Nevery, Nrepeat
+    // and Nfreq, whose ranges are checked at once; the grid counts are read too and checked after the keywords
+    this.nEvery = inumeric(args[0]);
+    this.nRepeat = inumeric(args[1]);
+    this.nFreq = inumeric(args[2]);
+    if (this.nEvery <= 0) throw new StyleError(`Illegal fix ave/grid nevery value: ${this.nEvery}`);
+    if (this.nRepeat <= 0) throw new StyleError(`Illegal fix ave/grid nrepeat value: ${this.nRepeat}`);
+    if (this.nFreq <= 0) throw new StyleError(`Illegal fix ave/grid pergrid freq value: ${this.nFreq}`);
+    if (this.nFreq % this.nEvery !== 0 || this.nRepeat * this.nEvery > this.nFreq) throw new StyleError('Inconsistent fix ave/grid nevery/nrepeat/pergrid_nfreq values');
+    this.nx = inumeric(args[3]);
+    this.ny = inumeric(args[4]);
+    this.nz = inumeric(args[5]);
+    this.nevery = this.nEvery;
+    this.adof = sys.dimension;
+
+    // values, then keywords
+    let k = 6;
+    const values: string[] = [];
+    // As native LAMMPS does (src/fix_ave_grid.cpp FixAveGrid::FixAveGrid at b332f28): the value list ends at the first
+    // word that is not an input value; that word must then be one of the optional keywords.
+    while (k < args.length && !KEYWORDS.has(args[k]) && isValueWord(args[k])) values.push(args[k++]);
+    if (values.length === 0) throw new StyleError('No values in fix ave/grid command');
+    for (const w of expandWildcards(sys, expandGridRefs(sys, values), 'peratom')) {
+      this.cols.push(this.column(w, what));
+    }
+    this.modeGrid = this.cols.some((c) => c.t === 'grid');
+    if (this.modeGrid && this.cols.some((c) => c.t !== 'grid')) throw new StyleError('Fix ave/grid cannot operate on per-atom and per-grid values together');
+    let biasId: string | null = null;
+
+    while (k < args.length) {
+      const key = args[k];
+      if (!KEYWORDS.has(key)) throw new StyleError(`Unknown fix ave/grid keyword: ${key}`);
+      const val = args[k + 1];
+      // As native LAMMPS does (src/fix_ave_grid.cpp at b332f28): a keyword without its value, then each value's message
+      if (val === undefined) throw new StyleError(`Illegal fix ave/grid ${key} command: missing argument(s)`);
+      k += 2;
+      if (key === 'discard') {
+        // As native LAMMPS does (src/fix_ave_grid.cpp at b332f28)
+        if (val !== 'yes' && val !== 'no') throw new StyleError(`Illegal fix ave/grid discard argument: ${val}`);
+        this.discard = val === 'yes';
+      } else if (key === 'norm') {
+        if (val !== 'all' && val !== 'sample' && val !== 'none') throw new StyleError(`Illegal fix ave/grid norm argument: ${val}`);
+        this.norm = val;
+      } else if (key === 'ave') {
+        if (val === 'one' || val === 'running') this.aveMode = val;
+        else if (val === 'window') {
+          this.aveMode = 'window';
+          if (args[k] === undefined) throw new StyleError('Illegal fix ave/grid ave window command: missing argument(s)');
+          this.windowM = inumeric(args[k]);
+          if (this.windowM <= 0) throw new StyleError(`Illegal fix ave/grid ave window argument: ${args[k]}`);
+          k++;
+        } else throw new StyleError(`Illegal fix ave/grid ave argument: ${val}`);
+      } else if (key === 'bias') {
+        biasId = val;
+      } else if (key === 'adof') {
+        this.adof = parseNum(val, `${what} adof`);
+      } else if (key === 'cdof') {
+        this.cdof = parseNum(val, `${what} cdof`);
+      }
+    }
+    // As native LAMMPS does (src/fix_ave_grid.cpp at b332f28): after the keywords, the grid size, the 2d grid, the bias
+    // compute, then (with the other per-grid checks) the grid size of each per-grid value
+    if (this.nx < 1 || this.ny < 1 || this.nz < 1) throw new StyleError('Invalid fix ave/grid grid size');
+    if (sys.dimension === 2 && this.nz !== 1) throw new StyleError('Fix ave/grid grid Nz must be 1 for 2d simulation');
+    if (biasId !== null) {
+      const c = sys.computes.find((x) => x.id === biasId);
+      if (!c) throw new StyleError(`Could not find compute ID ${biasId} for temperature bias`);
+      if (!c.tempFlag) throw new StyleError(`Bias compute ID ${biasId} does not calculate temperature`);
+      if (!c.hasBias()) throw new StyleError(`Bias compute ID ${biasId} does not calculate a velocity bias`);
+      this.biasId = biasId;
+    }
+    for (const c of this.cols) {
+      if (c.t !== 'grid') continue;
+      const src = c.ref.kind === 'c' ? sys.compute(c.ref.id) : sys.fix(c.ref.id);
+      const [gx, gy, gz] = src.gridSize(c.ref.igrid);
+      if (gx !== this.nx || gy !== this.ny || (sys.dimension === 3 && gz !== this.nz)) throw new StyleError('Fix ave/grid value grid sizes do not match');
+    }
+    this.ncell = this.nx * this.ny * this.nz;
+    const ncol = this.cols.length;
+    this.data = new Float64Array(this.ncell * ncol);
+    this.count = new Float64Array(this.ncell);
+    this.pergridFlag = true;
+    this.pergridFreq = this.nFreq;
+    this.accCnt = new Float64Array(this.ncell);
+    this.accCntSamp = new Float64Array(this.ncell);
+    this.accMass = new Float64Array(this.ncell);
+    this.accMassSamp = new Float64Array(this.ncell);
+    this.accKE = new Float64Array(this.ncell);
+    this.accDof = new Float64Array(this.ncell);
+    this.accTsamp = new Float64Array(this.ncell);
+    for (let j = 0; j < ncol; j++) {
+      this.accSum.push(new Float64Array(this.ncell));
+      this.accSamp.push(new Float64Array(this.ncell));
+    }
+  }
+
+  private column(w: string, what: string): Column {
+    if ((ATTRS as string[]).includes(w)) return { t: 'attr', name: w as AttrName, text: w };
+    if (w === 'temp') return { t: 'temp', text: w };
+    if (w === 'density/number' || w === 'density/mass') return { t: 'dens', mass: w === 'density/mass', text: w };
+    if (/^[cf]_/.test(w) && w.includes(':')) return { t: 'grid', ref: resolveGridRef(this.sys, 'Fix ave/grid', w, this.nEvery), text: w };
+    if (/^[cfv]_/.test(w)) return { t: 'ref', ref: parseRef(w), text: w };
+    throw new StyleError(`${what}: invalid input value '${w}': expected vx, vy, vz, fx, fy, fz, mass, density/number, density/mass, temp, c_ID, c_ID[I], f_ID, f_ID[I] or v_name`);
+  }
+
+  /** The grid "grid": data set "data" (the values) and "count" (the atoms per cell, atom mode). */
+  gridByName(name: string): number { return name === 'grid' ? 0 : -1; }
+  gridSize(_igrid: number): [number, number, number] { return [this.nx, this.ny, this.nz]; }
+  griddataByName(igrid: number, name: string): { index: number; ncol: number } | null {
+    if (igrid !== 0) return null;
+    if (name === 'data') return { index: 0, ncol: this.cols.length === 1 ? 0 : this.cols.length };
+    // count is only produced for per-atom values (FixAveGrid::get_griddata_by_name)
+    if (name === 'count' && !this.modeGrid) return { index: 1, ncol: 0 };
+    return null;
+  }
+  griddata(index: number): Float64Array { return index === 0 ? this.data : this.count; }
+
+  /** Output for one grid cell (cell index x fastest) and column (0-based). */
+  gridValue(cell: number, col: number): number {
+    if (cell < 0 || cell >= this.ncell || col < 0 || col >= this.cols.length) throw new StyleError(`fix ${this.id}: grid index out of range`);
+    return this.data[cell * this.cols.length + col];
+  }
+
+  /** Number of atoms per grid cell (averaged as the data are). */
+  gridCount(cell: number): number {
+    if (cell < 0 || cell >= this.ncell) throw new StyleError(`fix ${this.id}: grid index out of range`);
+    return this.count[cell];
+  }
+
+  setup(): void { this.sampleStep(); }
+
+  endOfStep(): void { this.sampleStep(); }
+
+  private sampleStep(): void {
+    const step = this.sys.state.step;
+    if (step % this.nEvery !== 0 || step === this.lastStep) return;
+    this.lastStep = step;
+    const rem = step % this.nFreq;
+    const r = rem === 0 ? this.nFreq : rem;
+    if (r > this.nFreq - this.nRepeat * this.nEvery) this.sample();
+    if (rem !== 0) return;
+    if (this.nSample === this.nRepeat) this.produce();
+    this.clearWindow();
+  }
+
+  private boxVolume(): number {
+    const b = this.sys.state.box;
+    let v = 1;
+    for (let d = 0; d < this.sys.dimension; d++) v *= b.hi[d] - b.lo[d];
+    return v;
+  }
+
+  /**
+   * The cell along one dimension for the bin index k = int((x - boxlo) * dxinv + OFFSET) - OFFSET (atom2grid): a periodic
+   * dimension folds the ghost cells onto their images, a non-periodic one skips an atom outside the grid (-1) unless
+   * discard no, which puts it in the first or last cell.
+   */
+  private cellIndexOf(k: number, periodic: boolean, n: number): number {
+    if (k >= 0 && k < n) return k;
+    if (periodic) return ((k % n) + n) % n;
+    if (this.discard) return -1;
+    return k < 0 ? 0 : n - 1;
+  }
+
+  /** One sample: per-cell sums of the group atoms at this step. */
+  private sample(): void {
+    const s = this.sys.state;
+    if (this.modeGrid) {
+      // grid2grid: the referenced per-grid values added cell by cell
+      this.cols.forEach((col, j) => {
+        if (col.t !== 'grid') return;
+        const vals = gridColumn(this.sys, col.ref);
+        const acc = this.accSum[j];
+        for (let c = 0; c < this.ncell; c++) acc[c] += vals[c];
+      });
+      this.nSample++;
+      return;
+    }
+    const g = this.sys.geom;
+    const tri = s.box.triclinic;
+    const lam = [0, 0, 0];
+    // dxinv = N / prd (in lamda coordinates boxlo is 0 and prd is 1)
+    const ns = [this.nx, this.ny, this.nz];
+    const inv = [0, 1, 2].map((d) => ns[d] / (tri ? 1.0 : s.box.hi[d] - s.box.lo[d]));
+    // bias: the kinetic energies of the temp value without the velocity bias
+    let vT = s.v;
+    if (this.biasId && this.cols.some((c) => c.t === 'temp')) {
+      const t = this.sys.compute(this.biasId);
+      t.computeBias();
+      t.removeBiasAll();
+      vT = Float64Array.from(s.v.subarray(0, 3 * s.n));
+      t.restoreBiasAll();
+    }
+    const ncell = this.ncell;
+    const ncol = this.cols.length;
+    const vol = this.boxVolume();
+    const cellVol = vol / ncell;
+    const cnt = new Float64Array(ncell);
+    const sums: Float64Array[] = this.cols.map(() => new Float64Array(ncell));
+    const mass = new Float64Array(ncell);
+    const ke = new Float64Array(ncell);
+    const perAtom: (Float64Array | null)[] = this.cols.map((c) => (c.t === 'ref' ? peratomValues(this.sys, c.ref) : null));
+    const mvv2e = s.units.mvv2e;
+    for (let i = 0; i < s.n; i++) {
+      if (!(s.mask[i] & this.groupBit)) continue;
+      if (tri) g.toLamda(s.x[3 * i], s.x[3 * i + 1], s.x[3 * i + 2], lam);
+      const off = (d: number): number => (tri ? lam[d] : s.x[3 * i + d] - s.box.lo[d]);
+      const bin = (d: number, n: number): number => {
+        return this.cellIndexOf(Math.trunc(off(d) * inv[d] + OFFSET) - OFFSET, s.box.periodic[d], n);
+      };
+      const ix = bin(0, this.nx);
+      const iy = bin(1, this.ny);
+      const iz = this.sys.dimension === 2 ? 0 : bin(2, this.nz);
+      if (ix < 0 || iy < 0 || iz < 0) continue;
+      const c = ix + this.nx * (iy + this.ny * iz);
+      const m = massOf(s, i);
+      cnt[c] += 1;
+      mass[c] += m;
+      const vx = s.v[3 * i], vy = s.v[3 * i + 1], vz = s.v[3 * i + 2];
+      const tx = vT[3 * i], ty = vT[3 * i + 1], tz = vT[3 * i + 2];
+      ke[c] += 0.5 * mvv2e * m * (tx * tx + ty * ty + tz * tz);
+      for (let j = 0; j < ncol; j++) {
+        const col = this.cols[j];
+        let val = 0;
+        if (col.t === 'attr') {
+          switch (col.name) {
+            case 'vx': val = vx; break;
+            case 'vy': val = vy; break;
+            case 'vz': val = vz; break;
+            case 'fx': val = s.f[3 * i]; break;
+            case 'fy': val = s.f[3 * i + 1]; break;
+            case 'fz': val = s.f[3 * i + 2]; break;
+            case 'mass': val = m; break;
+          }
+        } else if (col.t === 'ref') {
+          val = perAtom[j]![i];
+        } else {
+          continue; // density and temp use cnt, mass and ke
+        }
+        sums[j][c] += val;
+      }
+    }
+    // fold the sample into the window
+    for (let c = 0; c < ncell; c++) {
+      const n = cnt[c];
+      this.accCnt[c] += n;
+      this.accCntSamp[c] += n / cellVol;
+      this.accMass[c] += mass[c];
+      this.accMassSamp[c] += mass[c] / cellVol;
+      const dof = this.cdof + n * this.adof;
+      this.accDof[c] += dof;
+      this.accKE[c] += ke[c];
+      this.accTsamp[c] += dof > 0 && this.sys.state.units.boltz > 0 ? (2 * ke[c]) / (dof * this.sys.state.units.boltz) : 0;
+      for (let j = 0; j < ncol; j++) {
+        const col = this.cols[j];
+        if (col.t === 'dens' || col.t === 'temp') continue;
+        this.accSum[j][c] += sums[j][c];
+        this.accSamp[j][c] += n > 0 ? sums[j][c] / n : 0;
+      }
+    }
+    this.nSample++;
+  }
+
+  private clearWindow(): void {
+    this.nSample = 0;
+    this.accCnt.fill(0);
+    this.accCntSamp.fill(0);
+    this.accMass.fill(0);
+    this.accMassSamp.fill(0);
+    this.accKE.fill(0);
+    this.accDof.fill(0);
+    this.accTsamp.fill(0);
+    for (const a of this.accSum) a.fill(0);
+    for (const a of this.accSamp) a.fill(0);
+  }
+
+  /** The output on an Nfreq step, then the averaging keyword applied to it. */
+  private produce(): void {
+    const ncell = this.ncell;
+    const ncol = this.cols.length;
+    const nr = this.nRepeat;
+    const cellVol = this.boxVolume() / ncell;
+    const data = new Float64Array(ncell * ncol);
+    const count = new Float64Array(ncell);
+    if (this.modeGrid) {
+      // normalize_grid: the sum of the samples times 1/Nrepeat
+      const invrepeat = 1.0 / nr;
+      for (let c = 0; c < ncell; c++) for (let j = 0; j < ncol; j++) data[c * ncol + j] = this.accSum[j][c] * invrepeat;
+      this.publish(data, count);
+      return;
+    }
+    for (let c = 0; c < ncell; c++) {
+      count[c] = this.accCnt[c] / nr;
+      for (let j = 0; j < ncol; j++) {
+        const col = this.cols[j];
+        let out: number;
+        if (col.t === 'dens') {
+          const acc = col.mass ? this.accMass[c] : this.accCnt[c];
+          const accS = col.mass ? this.accMassSamp[c] : this.accCntSamp[c];
+          out = this.norm === 'sample' ? accS / nr : acc / (nr * cellVol);
+        } else if (col.t === 'temp') {
+          out = this.norm === 'sample' ? this.accTsamp[c] / nr
+            : (this.accDof[c] > 0 && this.sys.state.units.boltz > 0 ? (2 * this.accKE[c]) / (this.accDof[c] * this.sys.state.units.boltz) : 0);
+        } else if (this.norm === 'all') {
+          out = this.accCnt[c] > 0 ? this.accSum[j][c] / this.accCnt[c] : 0;
+        } else if (this.norm === 'sample') {
+          out = this.accSamp[j][c] / nr;
+        } else {
+          out = this.accSum[j][c] / nr;
+        }
+        data[c * ncol + j] = out;
+      }
+    }
+    this.publish(data, count);
+  }
+
+  /** Applies ave one / running / window to the produced output. */
+  private publish(data: Float64Array, count: Float64Array): void {
+    if (this.aveMode === 'one') {
+      this.data = data;
+      this.count = count;
+      return;
+    }
+    if (this.aveMode === 'running') {
+      if (!this.runData || !this.runCount) {
+        this.runData = new Float64Array(data.length);
+        this.runCount = new Float64Array(count.length);
+      }
+      for (let k = 0; k < data.length; k++) this.runData[k] += data[k];
+      for (let k = 0; k < count.length; k++) this.runCount[k] += count[k];
+      this.runN++;
+      this.data = this.runData.map((v) => v / this.runN);
+      this.count = this.runCount.map((v) => v / this.runN);
+      return;
+    }
+    this.history.push({ data, count });
+    if (this.history.length > this.windowM) this.history.shift();
+    const n = this.history.length;
+    const d = new Float64Array(data.length);
+    const c = new Float64Array(count.length);
+    for (const h of this.history) {
+      for (let k = 0; k < d.length; k++) d[k] += h.data[k];
+      for (let k = 0; k < c.length; k++) c[k] += h.count[k];
+    }
+    for (let k = 0; k < d.length; k++) d[k] /= n;
+    for (let k = 0; k < c.length; k++) c[k] /= n;
+    this.data = d;
+    this.count = c;
+  }
+}

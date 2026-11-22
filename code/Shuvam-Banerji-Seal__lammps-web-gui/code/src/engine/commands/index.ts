@@ -1,0 +1,19 @@
+import type { Handler } from './args';
+import { SETUP_COMMANDS } from './setup';
+import { FORCEFIELD_COMMANDS } from './forcefield';
+import { RUN_COMMANDS } from './run';
+import { MISC_COMMANDS, UNAVAILABLE_COMMANDS } from './misc';
+import { RESTART_COMMANDS } from './restart';
+import { RERUN_COMMANDS } from './rerun';
+import { NEB_COMMANDS } from './neb';
+import { HYPER_COMMANDS } from './hyper';
+import { RESET_ATOMS_COMMANDS } from './reset_atoms';
+
+export { UNAVAILABLE_COMMANDS };
+
+export type { Ctx, Handler } from './args';
+
+/** Every command the browser engine implements (control flow lives in session.ts). */
+export const COMMANDS: Record<string, Handler> = {
+  ...SETUP_COMMANDS, ...FORCEFIELD_COMMANDS, ...RUN_COMMANDS, ...MISC_COMMANDS, ...RESTART_COMMANDS, ...RERUN_COMMANDS, ...NEB_COMMANDS, ...HYPER_COMMANDS, ...RESET_ATOMS_COMMANDS,
+};

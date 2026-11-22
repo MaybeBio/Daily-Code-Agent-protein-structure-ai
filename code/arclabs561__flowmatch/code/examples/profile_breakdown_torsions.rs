@@ -1,0 +1,134 @@
+//! Timing breakdown for the torsions (phi/psi) RFM loop.
+//!
+//! Run:
+//! ```bash
+//! cargo run -p flowmatch --example profile_breakdown_torsions
+//! ```
+
+mod common;
+
+use common::torsions::{build_torsion_support, parse_phi_psi_csv_6col};
+use flowmatch::linear::LinearCondField;
+use flowmatch::rfm::apply_pairing;
+use flowmatch::sd_fm::{RfmMinibatchOtConfig, RfmMinibatchPairing};
+use flowmatch::Result;
+use ndarray::{Array1, Array2};
+use rand::Rng;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+use rand_distr::{Distribution, StandardNormal};
+use std::time::Instant;
+
+use common::Timings;
+
+fn main() -> Result<()> {
+    let t0 = Instant::now();
+    let phi_psi = parse_phi_psi_csv_6col(20)?;
+    let load_time = t0.elapsed();
+
+    let (y, _b) = build_torsion_support(&phi_psi);
+    let n = phi_psi.len();
+    let d = 4usize;
+    let b_norm: Vec<f32> = vec![1.0 / (n as f32); n];
+
+    // Config
+    let steps = 600usize;
+    let batch_size = 64usize;
+    let lr = 2e-2f32;
+    let rfm_cfg = RfmMinibatchOtConfig {
+        reg: 1.0,
+        max_iter: 2_000,
+        tol: 2e-3,
+        pairing: flowmatch::sd_fm::RfmMinibatchPairing::SinkhornGreedy,
+        pairing_every: 1,
+    };
+    let seed = 123u64;
+
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut field = LinearCondField::new_zeros(d);
+
+    let mut x0s = Array2::<f32>::zeros((batch_size, d));
+    let mut ys = Array2::<f32>::zeros((batch_size, d));
+
+    let mut timings = Timings::default();
+    let t_train0 = Instant::now();
+
+    for _step in 0..steps {
+        // 1) Sample x0.
+        let t = Instant::now();
+        for i in 0..batch_size {
+            for k in 0..d {
+                x0s[[i, k]] = StandardNormal.sample(&mut rng);
+            }
+        }
+        timings.sample_x0 += t.elapsed();
+
+        // 2) Sample y indices uniformly.
+        let t = Instant::now();
+        for i in 0..batch_size {
+            // uniform categorical
+            let j = (rng.random::<f32>() * (n as f32))
+                .floor()
+                .min((n - 1) as f32) as usize;
+            let yj = y.row(j);
+            for k in 0..d {
+                ys[[i, k]] = yj[k];
+            }
+            let _ = b_norm[j]; // keep the contract explicit: y is uniform-weighted here
+        }
+        timings.sample_y += t.elapsed();
+
+        // 3) Pairing.
+        let t = Instant::now();
+        let perm = apply_pairing(
+            &RfmMinibatchPairing::SinkhornGreedy,
+            &x0s.view(),
+            &ys.view(),
+            &rfm_cfg,
+        )?;
+        timings.sinkhorn_pair += t.elapsed();
+
+        // 3b) Fast pairing (rowwise nearest). Purely for profiling comparison.
+        let t = Instant::now();
+        let _perm_fast = apply_pairing(
+            &RfmMinibatchPairing::RowwiseNearest,
+            &x0s.view(),
+            &ys.view(),
+            &rfm_cfg,
+        )?;
+        timings.fast_pair += t.elapsed();
+
+        // 4) SGD.
+        let t = Instant::now();
+        for (i, &p) in perm.iter().enumerate().take(batch_size) {
+            let x0 = x0s.row(i);
+            let y1 = ys.row(p);
+
+            let tt: f32 = rng.random();
+            let mut xt = Array1::<f32>::zeros(d);
+            for k in 0..d {
+                xt[k] = (1.0 - tt) * x0[k] + tt * y1[k];
+            }
+            let mut u = Array1::<f32>::zeros(d);
+            for k in 0..d {
+                u[k] = y1[k] - x0[k];
+            }
+
+            field.sgd_step(&xt.view(), tt, &y1, &u.view(), lr).unwrap();
+        }
+        timings.sgd += t.elapsed();
+    }
+
+    let train_time = t_train0.elapsed();
+    println!("Torsions profile breakdown (PDB 1BPI-derived)");
+    println!("- n_support={n} d={d} steps={steps} batch_size={batch_size}");
+    println!("- load_time: {:?}", load_time);
+    println!("- train_time: {:?}", train_time);
+    println!(
+        "- accounted_total: {:?} (compare with train_time)",
+        timings.accounted_total()
+    );
+    timings.print();
+
+    Ok(())
+}

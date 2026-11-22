@@ -1,0 +1,33 @@
+# Beyond Protify's own requirements (protify/requirements.txt); versions the figures were last reproduced with, and for
+# the native-unit study (plm_interpretability.units, scripts/units_atlas.py) the research lock's.
+# biopython: plm_interpretability.units.compendium reads the release's views through annotation_vocabulary, whose sources
+# package imports Bio.SwissProt.
+biopython>=1.88
+huggingface_hub>=1.32.0
+# igraph and leidenalg: E15c's community discovery (plm_interpretability.units.communities.leiden_communities), Leiden under the
+# Constant Potts Model. Neither is in a lock here; the floors are the releases installed for E15 on 2026-11-17.
+igraph>=1.0.0
+leidenalg>=0.12.0
+matplotlib>=3.10.8
+numpy>=1.26.4
+pandas>=2.3.3
+# psutil: foundry.pilot, which every pass of the native-unit study reports its memory through.
+psutil>=7.2.2
+pyarrow>=22.0.0
+pytest>=8.0
+pyyaml>=6.0.3
+scikit-learn>=1.9.1
+scipy>=1.18.1
+torch>=2.14.0
+transformers>=5.17.0
+xgboost>=3.4.1
+# E1 (`retest` and `retest-inputs`) runs InterPLM's code at the commit the preregistration pins. Its setup.py declares
+# no dependencies, so the packages the imported modules need are declared here: einops (sae.dictionary), h5py
+# (sae.inference), tqdm, wandb (train.wandb_manager, which loading an SAE imports) and typed-argument-parser
+# (`tap`, analysis.concepts). typed-argument-parser is in no lock here; its floor is the version InterPLM's env.yml pins.
+interplm @ git+https://github.com/ElanaPearl/InterPLM.git@5f4cbf90a0b3c1c031951ffd0b3b8e11b6f2ed61
+einops>=0.8.2
+h5py>=3.16.0
+tqdm>=4.70.1
+typed-argument-parser>=1.10.1
+wandb>=0.30.0

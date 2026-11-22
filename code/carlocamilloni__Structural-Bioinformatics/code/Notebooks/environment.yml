@@ -1,0 +1,47 @@
+# Conda environment to run the practicals locally (optional: all the practicals also run on Google Colab).
+#
+#   conda env create -f environment.yml
+#   conda activate sb
+#   jupyter lab
+#
+# To update an existing environment after a change of this file:
+#   conda env update -f environment.yml --prune
+#
+# Currently covers:
+#   T00 (Notebooks/t00_intro.ipynb, report_00.ipynb)
+#   T02 (Notebooks/t02_StructurePred.ipynb): the analysis of the predictions and S4PRED (PyTorch, CPU is enough).
+#       The structure predictions themselves are made with servers and GPUs and are not part of this environment.
+#   T03 (Notebooks/t03_docking.ipynb, report_3_docking.ipynb): Meeko, RDKit, AutoDock Vina, pdb2pqr.
+#   T04 (Notebooks/t04_MD.ipynb, report_4_MD.ipynb): GROMACS (CPU version: much slower than on a Colab GPU), MDAnalysis.
+#   T05 (Notebooks/t05_MDanalysis.ipynb, report_5_MDanalysis.ipynb): MDAnalysis, gdown.
+#   T06 (Notebooks/t06_MD_enhanced_martini.ipynb, report_6_MD_enhanced_martini.ipynb): GROMACS with PLUMED
+#       (the notebooks set PLUMED_KERNEL themselves), MDAnalysis, pandas, PeptideBuilder (report, group 1).
+#   T07 (Notebooks/t07_QM.ipynb, report_7_QM.ipynb): py3dmol, pandas; ORCA itself is not on conda-forge
+#       (free academic licence, personal download from the ORCA forum): set ORCA_DIR to its folder.
+name: sb
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - jupyterlab
+  - ipykernel
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - requests
+  - biopython        # T02, T05
+  - py3dmol
+  - pytorch          # for S4PRED in T02 (large download, a few hundred MB)
+  - rdkit            # T03
+  - gemmi            # T03 (needed by meeko)
+  - mdanalysis>=2.8  # T04, T05 (2.8 is the first version with DSSP)
+  - gromacs=2026.3=nompi*   # T04, T06 (the same version used on Colab; nompi: the gmx program, no MPI)
+  - plumed=2.10      # T06 (loaded by gmx mdrun -plumed)
+  - gdown            # T05 report (downloads the trajectories from Google Drive)
+  - pip
+  - pip:             # T03 (the AutoDock Vina program itself is downloaded by the notebook)
+      - meeko
+      - pdb2pqr
+      - PeptideBuilder   # T06 report (group 1)

@@ -1,0 +1,494 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+from torch import nn
+
+from bionemo_ir._torch.utils import CHUNK_REGISTRY, CONTACT_PROB, ChunkPolicy, chunk_apply
+from bionemo_ir._torch.utils.confidence import pair_expectations
+from bionemo_ir.pipeline.models.boltz2.const import chain_type_ids
+
+
+@dataclass(frozen=True)
+class ChainTable:
+    """Host-side chain layout of one feature batch (see :func:`chain_table`).
+
+    Attributes:
+        asym_ids: sorted distinct ``asym_id`` values over the batch.
+        frame_spans: per batch element, ``(token_start, atom_start, num_atoms)`` of
+            every nonpolymer chain with at least three atoms.
+    """
+
+    asym_ids: tuple[int, ...]
+    frame_spans: tuple[tuple[tuple[int, int, int], ...], ...]
+
+
+# Number of leading (nearest) distogram bins whose probability mass counts as a token-pair contact.
+NUM_CONTACT_BINS = 20
+
+
+def repeat_with_multiplicity(tensor: torch.Tensor, multiplicity: int) -> torch.Tensor:
+    """Repeat a tensor with multiplicity."""
+    return tensor.unsqueeze(1).repeat_interleave(multiplicity, 1)
+
+
+def compute_distogram(
+    x_pred: torch.Tensor,
+    boundaries: torch.Tensor,
+    token_to_rep_atom: torch.Tensor,
+    multiplicity: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute the distogram from the predicted atom coordinates.
+    Args:
+        x_pred: (B, mult, N_atoms, 3)
+        boundaries: (num_dist_bins - 1,)
+        token_to_rep_atom: (B, N_tokens, N_atoms)
+        multiplicity: int
+    Returns:
+        d: (B, mult, N_tokens, N_tokens) distances between the tokens' representative atoms
+        distogram: (B, mult, N_tokens, N_tokens) index of the bin each distance falls in
+    """
+    if len(x_pred.shape) == 4:
+        B, mult, N, _ = x_pred.shape
+    else:
+        BM, N, _ = x_pred.shape
+        B = BM // multiplicity
+        mult = multiplicity
+        x_pred = x_pred.view(B, mult, N, -1)
+    x_pred_repr = torch.einsum("bij,bmjk->bmik", token_to_rep_atom.float(), x_pred)
+    d = torch.cdist(x_pred_repr, x_pred_repr)  # [B, mult, N_tokens, N_tokens]
+    distogram = torch.bucketize(d, boundaries.to(d.dtype))  # [B, mult, N_tokens, N_tokens]
+    return d, distogram
+
+
+def _contact_prob_dense(logits: torch.Tensor, contacts: torch.Tensor) -> torch.Tensor:
+    """Contact probability for one row-slice of ``logits`` (see :func:`compute_contact_prob`)."""
+    return (torch.softmax(logits.float(), dim=-1) * contacts).sum(-1)
+
+
+def compute_contact_prob(
+    logits: torch.Tensor,
+    num_contact_bins: int = NUM_CONTACT_BINS,
+    policy: ChunkPolicy | None = None,
+) -> torch.Tensor:
+    """Reduce predicted distogram logits to the probability mass within the contact cutoff.
+
+    This is the only form in which the confidence heads read the predicted distogram, so call it at
+    the producer and never hold the ``[B, N, N, num_bins]`` logits. Row-chunked because ``softmax``
+    is independent per pair row, so a dense call would transiently allocate what this saves.
+
+    Args:
+        logits: (B, N_tokens, N_tokens, num_bins) predicted distogram logits.
+        num_contact_bins: number of leading (nearest) distance bins that count as a contact.
+        policy: row-chunking policy; defaults to the ``contact_prob`` registry entry.
+
+    Returns:
+        (B, N_tokens, N_tokens) fp32 probability that a token pair is in contact.
+    """
+    if policy is None:
+        policy = CHUNK_REGISTRY.get(CONTACT_PROB)
+    # Full-width 0/1 mask rather than a slice, so the sum over the bin dim stays bit-identical to the
+    # heads' original mask-then-sum.
+    contacts = logits.new_zeros(logits.shape[-1], dtype=torch.float32)
+    contacts[:num_contact_bins] = 1.0
+    return chunk_apply(_contact_prob_dense, logits, policy=policy, contacts=contacts)
+
+
+def compute_aggregated_metric(logits: torch.Tensor, end: float = 1.0) -> torch.Tensor:
+    """Compute the metric from the logits.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        The logits of the metric
+    end : float
+        Max value of the metric, by default 1.0
+
+    Returns
+    -------
+    Tensor
+        The metric value
+
+    """
+    num_bins = logits.shape[-1]
+    bin_width = end / num_bins
+    bounds = torch.arange(start=0.5 * bin_width, end=end, step=bin_width, device=logits.device)
+    probs = nn.functional.softmax(logits, dim=-1)
+    plddt = torch.sum(
+        probs * bounds.view(*((1,) * len(probs.shape[:-1])), *bounds.shape),
+        dim=-1,
+    )
+    return plddt
+
+
+def tm_function(d, Nres):
+    """Compute the rescaling function for pTM.
+
+    Parameters
+    ----------
+    d : torch.Tensor
+        The input
+    Nres : torch.Tensor
+        The number of residues
+
+    Returns
+    -------
+    Tensor
+        Output of the function
+
+    """
+    d0 = 1.24 * (torch.clip(Nres, min=19) - 15) ** (1 / 3) - 1.8
+    return 1 / (1 + (d / d0) ** 2)
+
+
+def compute_ptms(
+    logits: torch.Tensor,
+    x_preds: torch.Tensor,
+    feats: dict[str, torch.Tensor],
+    chains: ChainTable | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[int, dict[int, torch.Tensor]]]:
+    """Compute pTM and ipTM scores.
+
+    Each score is reduced over both token dims (a masked mean over one, then a max over the other),
+    so all four are per-sample scalars.
+
+    Args
+        logits : torch.Tensor
+            pae logits. Shape, [B, mult, N_tokens, N_tokens, num_dist_bins].
+        x_preds : torch.Tensor
+            The predicted coordinates. Shape, [B, mult, N_atoms, 3].
+        feats : Dict[str, torch.Tensor]
+            The input features.
+        chains : Optional[ChainTable]
+            Output of :func:`chain_table` for ``feats``; computed per call when omitted.
+
+    Returns:
+        pTM score: torch.Tensor
+            pTM score. Shape, [B, mult].
+        ipTM score: torch.Tensor
+            ipTM score. Shape, [B, mult].
+        ligand ipTM score: torch.Tensor
+            ligand ipTM score. Shape, [B, mult].
+        protein ipTM score: torch.Tensor
+            protein ipTM score. Shape, [B, mult].
+        pair chain ipTM score: dict[int, dict[int, torch.Tensor]]
+            Per chain pair, keyed asym_id -> asym_id. Each entry has shape [B, mult].
+
+    """
+    multiplicity = x_preds.shape[1]
+    _, tm_weights = pae_bin_weights(feats, multiplicity, logits.shape[-1], logits.device)
+    probabilities = nn.functional.softmax(logits, dim=-1)
+    expected_tm = (probabilities * tm_weights).sum(dim=-1)
+    return ptms_from_expected(expected_tm, x_preds, feats, chains)
+
+
+def pae_bin_weights(
+    feats: dict[str, torch.Tensor], multiplicity: int, n_bins: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return Boltz PAE centers and length-dependent TM bin weights."""
+    mask_pad = repeat_with_multiplicity(feats["token_pad_mask"], multiplicity)
+    n_res = mask_pad.sum(dim=-1, keepdim=True)
+    width = 32.0 / n_bins
+    centers = torch.arange(start=0.5 * width, end=32.0, step=width, device=device)
+    tm_weights = tm_function(centers[None, None, :], n_res).unsqueeze(-2).unsqueeze(-2)
+    return centers, tm_weights
+
+
+def compact_pae(
+    pair: torch.Tensor,
+    project: Callable[[torch.Tensor, int, int], torch.Tensor],
+    n_bins: int,
+    x_preds: torch.Tensor,
+    feats: dict[str, torch.Tensor],
+    chains: ChainTable | None = None,
+) -> dict[str, torch.Tensor | dict[int, dict[int, torch.Tensor]]]:
+    """Stream PAE projection and retain every Boltz confidence metric."""
+    weights = pae_bin_weights(feats, x_preds.shape[1], n_bins, pair.device)
+    pae, expected_tm = pair_expectations(pair, project, weights)
+    scores = ptms_from_expected(expected_tm, x_preds, feats, chains)
+    names = ("ptm", "iptm", "ligand_iptm", "protein_iptm", "pair_chains_iptm")
+    return {"pae": pae, **dict(zip(names, scores, strict=True))}
+
+
+def chain_pair_logits(
+    block: torch.Tensor,
+    start: int,
+    stop: int,
+    *,
+    head: nn.Module,
+    inter_head: nn.Module | None = None,
+    same: torch.Tensor | None = None,
+    different: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Project one Boltz row block with its original chain-specific heads."""
+    if inter_head is None:
+        return head(block)
+    if same is None or different is None:
+        raise ValueError("Separate confidence heads require chain masks")
+    intra_logits = head(block) * same[..., start:stop, :].float().unsqueeze(-1)
+    inter_logits = inter_head(block) * different[..., start:stop, :].float().unsqueeze(-1)
+    return inter_logits + intra_logits
+
+
+def ptms_from_expected(
+    tm_expected_value: torch.Tensor,
+    x_preds: torch.Tensor,
+    feats: dict[str, torch.Tensor],
+    chains: ChainTable | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[int, dict[int, torch.Tensor]]]:
+    """Apply Boltz frame, padding, molecule, and chain masks to expected TM terms."""
+    multiplicity = x_preds.shape[1]
+    if chains is None:
+        chains = chain_table(feats)
+    # Compute mask for collinear and overlapping tokens
+    # [B, mult, N_tokens]
+    _, mask_collinear_pred = compute_frame_pred(x_preds, feats["frames_idx"], feats, chains=chains)
+    maski = mask_collinear_pred.unsqueeze(-1)
+    mask_pad = repeat_with_multiplicity(feats["token_pad_mask"], multiplicity)
+
+    mask_pad_l = mask_pad.unsqueeze(-2)
+    mask_pad_r = mask_pad.unsqueeze(-1)
+
+    asym_id = repeat_with_multiplicity(feats["asym_id"], multiplicity)
+    asym_id_l = asym_id.unsqueeze(-2)
+    asym_id_r = asym_id.unsqueeze(-1)
+
+    # [B, mult, N_tokens, N_tokens]
+    pair_mask_ptm = maski * mask_pad_l * mask_pad_r
+    # [B, mult, N_tokens, N_tokens]
+    pair_mask_iptm = pair_mask_ptm * (asym_id_l != asym_id_r)
+
+    ptm = torch.max(
+        torch.sum(tm_expected_value * pair_mask_ptm, dim=-1) / (torch.sum(pair_mask_ptm, dim=-1) + 1e-5),
+        dim=-1,
+    ).values
+    iptm = torch.max(
+        torch.sum(tm_expected_value * pair_mask_iptm, dim=-1) / (torch.sum(pair_mask_iptm, dim=-1) + 1e-5),
+        dim=-1,
+    ).values
+
+    # compute ligand and protein ipTM
+    token_type = feats["mol_type"]
+    token_type = repeat_with_multiplicity(token_type, multiplicity)
+    is_ligand_token = (token_type == chain_type_ids["NONPOLYMER"]).float()
+    is_protein_token = (token_type == chain_type_ids["PROTEIN"]).float()
+
+    # [B, mult, N_tokens, N_tokens]
+    ligand_iptm_mask = pair_mask_iptm * (
+        (is_ligand_token.unsqueeze(-2) * is_protein_token.unsqueeze(-1))
+        + (is_protein_token.unsqueeze(-2) * is_ligand_token.unsqueeze(-1))
+    )
+
+    # [B, mult, N_tokens, N_tokens]
+    protein_ipmt_mask = pair_mask_iptm * (is_protein_token.unsqueeze(-2) * is_protein_token.unsqueeze(-1))
+
+    ligand_iptm = torch.max(
+        torch.sum(tm_expected_value * ligand_iptm_mask, dim=-1) / (torch.sum(ligand_iptm_mask, dim=-1) + 1e-5),
+        dim=-1,
+    ).values
+    protein_iptm = torch.max(
+        torch.sum(tm_expected_value * protein_ipmt_mask, dim=-1) / (torch.sum(protein_ipmt_mask, dim=-1) + 1e-5),
+        dim=-1,
+    ).values
+
+    # Compute pair chain ipTM
+    chain_pair_iptm = {}
+    for idx1 in chains.asym_ids:
+        chain_iptm = {}
+        for idx2 in chains.asym_ids:
+            mask_pair_chain = pair_mask_ptm * (asym_id_l == idx1) * (asym_id_r == idx2)
+
+            chain_iptm[idx2] = torch.max(
+                torch.sum(tm_expected_value * mask_pair_chain, dim=-1) / (torch.sum(mask_pair_chain, dim=-1) + 1e-5),
+                dim=-1,
+            ).values
+        chain_pair_iptm[idx1] = chain_iptm
+
+    return ptm, iptm, ligand_iptm, protein_iptm, chain_pair_iptm
+
+
+def compute_collinear_mask(v1: torch.Tensor, v2: torch.Tensor) -> torch.Tensor:
+    """Compute the mask for collinear or overlapping atoms.
+
+    Args:
+        v1: torch.Tensor
+            The first vector. Shape, [B, mult, N, 3]
+        v2: torch.Tensor
+            The second vector. Shape, [B, mult, N, 3]
+    Returns:
+        mask: torch.Tensor
+            The mask for collinear or overlapping atoms. Shape, [B, mult, N, N]
+    """
+    norm1 = torch.norm(v1, dim=1, keepdim=True)
+    norm2 = torch.norm(v2, dim=1, keepdim=True)
+    v1 = v1 / (norm1 + 1e-6)
+    v2 = v2 / (norm2 + 1e-6)
+    mask_angle = torch.abs(torch.sum(v1 * v2, dim=1)) < 0.9063
+    mask_overlap1 = norm1.reshape(-1) > 1e-2
+    mask_overlap2 = norm2.reshape(-1) > 1e-2
+    return mask_angle & mask_overlap1 & mask_overlap2
+
+
+def chain_table(feats: dict[str, torch.Tensor]) -> ChainTable:
+    """Read the chain layout :func:`compute_ptms` and :func:`compute_frame_pred` loop over.
+
+    Chains are walked in ascending ``asym_id`` order with running token and atom
+    offsets, as the tokenizer lays them out contiguously. The result depends on
+    the input features only, so it is computed once per forward with a single
+    device->host copy and shared by every diffusion sample.
+
+    Args:
+        feats: input features with ``asym_id``, ``mol_type``, ``token_pad_mask``
+            ``[B, N_tokens]``, ``atom_to_token`` ``[B, N_atoms, N_tokens]`` and
+            ``atom_pad_mask`` ``[B, N_atoms]``.
+    """
+    atoms_per_token = torch.einsum(
+        "ban,ba->bn", feats["atom_to_token"].to(torch.float32), feats["atom_pad_mask"].to(torch.float32)
+    )
+    table = torch.stack(
+        [
+            feats["asym_id"].to(torch.float32),
+            feats["token_pad_mask"].to(torch.float32),
+            atoms_per_token,
+            feats["mol_type"].to(torch.float32),
+        ],
+        dim=1,
+    ).cpu()
+    spans: list[tuple[tuple[int, int, int], ...]] = []
+    asym_ids: set[int] = set()
+    for asym_id, token_pad_mask, atom_counts, mol_type in table.unbind(0):
+        chain_spans: list[tuple[int, int, int]] = []
+        token_idx = 0
+        atom_idx = 0
+        chain_ids = torch.unique(asym_id).tolist()
+        asym_ids.update(int(chain_id) for chain_id in chain_ids)
+        for chain_id in chain_ids:
+            chain_tokens = asym_id == chain_id
+            num_tokens = int((chain_tokens.float() * token_pad_mask).sum().item())
+            num_atoms = int(atom_counts[chain_tokens].sum().item())
+            if int(mol_type[token_idx].item()) == chain_type_ids["NONPOLYMER"] and num_atoms >= 3:
+                chain_spans.append((token_idx, atom_idx, num_atoms))
+            token_idx += num_tokens
+            atom_idx += num_atoms
+        spans.append(tuple(chain_spans))
+    return ChainTable(asym_ids=tuple(sorted(asym_ids)), frame_spans=tuple(spans))
+
+
+def compute_frame_pred(
+    pred_atom_coords: torch.Tensor,
+    frames_idx_true: torch.Tensor,
+    feats: dict[str, torch.Tensor],
+    resolved_mask: torch.Tensor | None = None,
+    chains: ChainTable | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Args:
+        pred_atom_coords: torch.Tensor
+            The predicted atom coordinates. Shape, [B, mult, N_tokens, 3]
+        frames_idx_true: torch.Tensor
+            The true frames indices. Shape, [B, mult, N_tokens, 3]
+        feats: dict[str, torch.Tensor]
+            The input features. Shape, [B, mult, N_tokens, ...]
+        resolved_mask: Optional[torch.Tensor]
+            The resolved mask. Shape, [B, mult, N_tokens, N_atoms]
+        chains: Optional[ChainTable]
+            Output of :func:`chain_table` for ``feats``; computed here when omitted.
+    Returns:
+        frames_idx_pred: torch.Tensor
+            The predicted frames indices. Shape, [B, mult, N_tokens, 3]
+        mask_collinear_pred: torch.Tensor
+            The mask for collinear or overlapping atoms. Shape, [B, mult, N_tokens]
+    """
+    del resolved_mask
+    if chains is None:
+        chains = chain_table(feats)
+    B, multiplicity, N, _ = pred_atom_coords.shape
+    frames_idx_pred = repeat_with_multiplicity(frames_idx_true, multiplicity)
+
+    # Rebuild the frames of nonpolymer chains from the three nearest predicted
+    # atoms. Chains are contiguous atom ranges, so slicing replaces the
+    # boolean-mask gathers and keeps the loop free of host synchronization.
+    for i, pred_atom_coord in enumerate(pred_atom_coords):
+        # pred_atom_coord: (mult, N, 3)
+        for token_idx, atom_idx, num_atoms in chains.frame_spans[i]:
+            chain_coords = pred_atom_coord[:, atom_idx : atom_idx + num_atoms]
+            dist_mat = ((chain_coords[:, None, :, :] - chain_coords[:, :, None, :]) ** 2).sum(-1) ** 0.5
+
+            # Sort the atoms by distance
+            indices = torch.sort(dist_mat, dim=2).indices
+
+            # Compute the frames
+            frames = (
+                torch.cat(
+                    [
+                        indices[:, :, 1:2],
+                        indices[:, :, 0:1],
+                        indices[:, :, 2:3],
+                    ],
+                    dim=2,
+                )
+                + atom_idx
+            )
+            frames_idx_pred[i, :, token_idx : token_idx + num_atoms, :] = frames
+
+    # Expand the frames with the multiplicity (index tensors built on device:
+    # a host arange moved over is a blocking copy).
+    device = frames_idx_pred.device
+    frames_expanded = pred_atom_coords[
+        torch.arange(B, device=device)[:, None, None, None],
+        torch.arange(multiplicity, device=device)[None, :, None, None],
+        frames_idx_pred,
+    ].reshape(-1, 3, 3)
+
+    # Compute masks for collinear or overlapping atoms in the frame
+    mask_collinear_pred = compute_collinear_mask(
+        frames_expanded[:, 1] - frames_expanded[:, 0],
+        frames_expanded[:, 1] - frames_expanded[:, 2],
+    ).reshape(B, multiplicity, -1)
+
+    return frames_idx_pred, mask_collinear_pred * feats["token_pad_mask"][:, None, :]
+
+
+def concat_out_dicts(out_dicts: dict[str, Any]) -> dict[str, Any]:
+    """Concatenate the output dictionaries.
+
+    Args:
+        out_dicts: dict[str, Any]
+            The output dictionaries.
+    Returns:
+        out_dict: dict[str, Any]
+            The concatenated output dictionary.
+    """
+    out_dict = {}
+    for key in out_dicts[0]:
+        if key != "pair_chains_iptm":
+            out_dict[key] = torch.cat([out[key] for out in out_dicts], dim=1)
+        else:
+            pair_chains_iptm = {}
+            for chain_idx1 in out_dicts[0][key]:
+                chains_iptm = {}
+                for chain_idx2 in out_dicts[0][key][chain_idx1]:
+                    chains_iptm[chain_idx2] = torch.cat(
+                        [out[key][chain_idx1][chain_idx2] for out in out_dicts],
+                        dim=1,
+                    )
+                pair_chains_iptm[chain_idx1] = chains_iptm
+            out_dict[key] = pair_chains_iptm
+    return out_dict

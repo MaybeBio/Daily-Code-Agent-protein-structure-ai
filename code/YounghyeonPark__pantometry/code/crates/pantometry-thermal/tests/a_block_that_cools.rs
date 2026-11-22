@@ -1,0 +1,900 @@
+//! A block that can lose heat, checked against the closed forms that say where it settles.
+//!
+//! `Solid3D` was adiabatic on all six faces until now, so no three-dimensional thermal scene
+//! could reach a steady state: every one of them warmed for as long as it ran. That is honest
+//! for a pulse and useless for the question a designer asks — *what temperature does this run
+//! at* — which is the question a chip package, a magnet busbar, a motor and a factory cell are
+//! all asking.
+//!
+//! Every claim below is against something the domain did not compute: a lumped balance it has
+//! no code for, Newton's law of cooling, a conduction resistance in series with a film, and the
+//! ledger identity that says nothing was lost on the way out.
+
+use pantometry_core::units::{Area, Length, Temperature, Time};
+use pantometry_core::{Domain, Exchange, Substance};
+use pantometry_thermal::{Environment, Face, Solid3D};
+
+/// A copper cube, `n` cells on a side of `cell_mm`, starting at `start_c`.
+fn cube(n: usize, cell_mm: f64, start_c: f64) -> Solid3D {
+    Solid3D::new(
+        "block",
+        Substance::copper(),
+        (n, n, n),
+        Length::mm(cell_mm),
+        Temperature::celsius(start_c),
+    )
+}
+
+/// What the block holds, read the way the audit reads it: the ledger, minus what it has shed.
+fn stored(block: &Solid3D) -> f64 {
+    use pantometry_core::conserved::quantity;
+    block.ledger().get(quantity::ENERGY).unwrap_or(0.0) - block.lost_energy().to_si()
+}
+
+/// Run to `seconds`, subcycling at the domain's own limit, and give back the block.
+fn run(mut block: Solid3D, seconds: f64) -> Solid3D {
+    let limit = block.max_stable_dt(Time::ZERO).to_si();
+    let dt = Time::from_si(limit * 0.4);
+    let steps = (seconds / dt.to_si()).ceil() as usize;
+    let mut bus = Exchange::new();
+    let mut t = Time::ZERO;
+    for _ in 0..steps {
+        block.step(t, dt, &mut bus).expect("a stable step");
+        t += dt;
+    }
+    block
+}
+
+/// **A block with no exposed face is still adiabatic, exactly.** The guarantee that let this be
+/// added without changing a single existing scene: nothing loses heat unless a caller says a
+/// face is exposed.
+#[test]
+fn an_unexposed_block_loses_nothing() {
+    let before = cube(4, 5.0, 200.0);
+    let opening = stored(&before);
+    let after = run(before, 600.0);
+    assert_eq!(after.lost_energy().to_si(), 0.0, "nothing was exposed");
+    assert!(
+        (stored(&after) - opening).abs() < 1e-9,
+        "an insulated block holds what it had"
+    );
+}
+
+/// **A cooling block settles at ambient, and gets there at Newton's rate.**
+///
+/// Copper at 5 mm cells has a Biot number far below 0.1 — `hL/k` is about `12 · 0.01 / 401`,
+/// which is `3e-4` — so the block is isothermal to a part in three thousand and the closed form
+/// is the lumped one: `C dT/dt = −L(T)`. With `h` constant that is `exp(−t/τ)`; `h` is not quite
+/// constant, so the lumped equation is integrated as it stands rather than linearised.
+///
+/// `h` is the environment's convective coefficient **plus** the radiative term the domain also
+/// models, and that is the point of computing the expected `τ` from `Environment::loss_from`
+/// rather than from the convective number alone: a check written against convection only would
+/// be wrong by the 6 W·m⁻²·K⁻¹ a black surface radiates at room temperature, which is the same
+/// order again.
+#[test]
+fn a_cooling_block_follows_newtons_law() {
+    let n = 4;
+    let cell = 5.0e-3;
+    let side = n as f64 * cell;
+    let area = Area::from_si(6.0 * side * side);
+    let ambient = Temperature::celsius(20.0);
+    let start = Temperature::celsius(120.0);
+
+    let mut block = cube(n, 5.0, 120.0);
+    for face in Face::ALL {
+        block = block.losing_from(face, Environment::still_air(ambient, area / 6.0));
+    }
+
+    // The time constant, from the loss the domain's own environment model gives at the
+    // *midpoint* of the swing. Used below only to say *when* to look; the expectation itself no
+    // longer freezes `h` anywhere.
+    let copper = Substance::copper().thermal.unwrap();
+    let capacity = block.heat_capacity().to_si();
+    let mid = Temperature::celsius(70.0);
+    let env = Environment::still_air(ambient, area);
+    let loss = |kelvin: f64| {
+        env.loss_from(Temperature::from_si(kelvin), copper.emissivity)
+            .to_si()
+    };
+    let tau = capacity / (loss(mid.to_si()) / (mid.to_si() - ambient.to_si()));
+
+    // **The lumped block, integrated rather than linearised.** `C dT/dt = −L(T)` with `L` the
+    // environment's own loss, so the time to fall from the start to `T` is `C ∫ dT'/L(T')` — a
+    // quadrature, then a bisection for the temperature at a given time. `L` is the same
+    // `Environment::loss_from` the linearised form used; what changed is that `h` is no longer
+    // frozen at the midpoint, so the linearisation is out of the budget entirely.
+    //
+    // **This compared with `exp(−t/τ)` and `h` frozen at the midpoint**, to a bound of 0.41 K at
+    // one time constant set by that freezing, with the real error 0.10 K. Against the integral the
+    // error is 0.0023 K: forty times smaller, and what is left is the block itself.
+    let time_to = |kelvin: f64| {
+        let (a, b) = (kelvin, start.to_si());
+        let m = 2_000;
+        let h = (b - a) / m as f64;
+        let mut s = 1.0 / loss(a) + 1.0 / loss(b);
+        for i in 1..m {
+            s += if i % 2 == 1 { 4.0 } else { 2.0 } / loss(a + i as f64 * h);
+        }
+        capacity * s * h / 3.0
+    };
+    let lumped = |t: f64| {
+        let (mut lo, mut hi) = (ambient.to_si() + 1e-9, start.to_si());
+        for _ in 0..100 {
+            let mid = 0.5 * (lo + hi);
+            if time_to(mid) > t {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    };
+
+    // **What is left, bounded — and it has a sign.** The block is not quite lumped: its surface
+    // runs a little below its mean, so it sheds heat more slowly than a lumped block would, and it
+    // can only ever be *slower*. For a cube cooling uniformly the quasi-steady field is
+    // `T₀ − a·r²`, and the mean sits above its coldest point — a corner — by exactly
+    // `q·(side/2)/k`, so the rate is short by at most `Bi½ = h'·(side/2)/k`: an upper bound with a
+    // factor of three in it, since the *area-averaged* surface is short by a third of that and
+    // that is what the loss sees. `h'` is the loss's derivative in temperature, which is what a
+    // rate deficit scales with, taken where it is largest — the start. The one thing that makes
+    // the block cool *faster* is the explicit march: each step's `1 − k·dt` in place of `e^{−k·dt}`
+    // costs `(k·dt)²/2`, so `t·k²·dt/2` in `ln θ` — under a part in a hundred thousand here.
+    //
+    // **This was a symmetric window**, `|got − want|` under the upper bound, and the physics fixes
+    // the sign: `numerics-reviewer` set the solver's emissivity 0.4% high, the error went from
+    // +0.0023 K to −0.0039 K, and the test passed. Now the window is `[−march, +Biot]`, and a loss
+    // too high by more than the march's own error fails.
+    let dt = block.max_stable_dt(Time::ZERO).to_si() * 0.4;
+    let slope = {
+        let (hot, step) = (start.to_si(), 1e-3);
+        (loss(hot + step) - loss(hot - step)) / (2.0 * step)
+    };
+    let k_most = slope / capacity;
+    let biot_half = slope / area.to_si() * (side / 2.0) / copper.conductivity.to_si();
+    let window = |t: f64| {
+        let want = lumped(t);
+        let theta = want - ambient.to_si();
+        let slower = theta * ((t * k_most * biot_half).exp() - 1.0);
+        let faster = theta * ((t * k_most * k_most * dt / 2.0).exp() - 1.0);
+        (want, -faster, slower)
+    };
+    // `run` takes whole steps, so the time reached is a whole number of them past what was asked.
+    let reached = |t: f64| (t / dt).ceil() * dt;
+
+    // One time constant of a hundred-kelvin swing: measured +0.0023 K from the integral, inside
+    // −0.00018 to +0.0072. Measured with the solver's emissivity sabotaged: 0.4% high is −0.0039 K
+    // and fails; 2% high is 0.029 K out and 5% high 0.076 K, and the linearised version passed
+    // both. A loss 5% high is 1.8 K out.
+    let at_one = reached(tau);
+    let after = run(block, tau);
+    let (want, low, high) = window(at_one);
+    let got = after.mean_temperature().to_si();
+    assert!(
+        got - want > low && got - want < high,
+        "after one time constant the block should be between {low:+.5} and {high:+.5} K of \
+         {want:.4} K, and it is {:+.5} K from it",
+        got - want
+    );
+
+    // **And it keeps going the right way, along the same curve.** This ran twelve more time
+    // constants to check the block ended within a kelvin of the air: 1.43 million steps, 96 s of
+    // a debug build, for a looser claim than the curve itself. Two more constants against the
+    // integral instead: measured +0.00095 K from it, inside −0.00007 to +0.0029.
+    let at_three = at_one + reached(2.0 * tau);
+    let settled = run(after, 2.0 * tau);
+    let (want, low, high) = window(at_three);
+    let now = settled.mean_temperature().to_si();
+    assert!(
+        now - want > low && now - want < high,
+        "three time constants in, the block should be between {low:+.5} and {high:+.5} K of \
+         {want:.4} K, and it is {:+.5} K from it",
+        now - want
+    );
+}
+
+/// **Within a kelvin of the air, the block still moves toward it, from either side, at Newton's
+/// rate.**
+///
+/// `a_cooling_block_follows_newtons_law` stops three time constants in, five kelvin above the
+/// air. It used to run twelve more and see everything down to ambient, and that was ninety-six
+/// seconds of a debug build. What the shorter run gave up was measured by `numerics-reviewer`: a
+/// film that stops conducting within 3 K of the air — `if gap.abs() < 3.0 { continue; }` in the
+/// film flux — passed it. So this starts where that one stopped, half a kelvin either side of the
+/// air, for sixty seconds, and it also covers the case neither version had: a block *below* the
+/// air, which has to warm.
+///
+/// Sixty seconds is under a twenty-fifth of `τ`, so over it `h` is its value at the start to
+/// within the change in temperature, and the closed form is `Δθ = θ₀(1 − e^{−t/τ₀})` with
+/// `τ₀` from the loss at the start. What is left is the block not quite being lumped (Biot
+/// `hL/k` ≈ 6e-5) and Euler's step (`(t/τ)(dt/τ)/2`), both near 1e-4 of the change. Measured
+/// at 2.4e-5 and 2.1e-5, so 1e-3 is that effect with room to spare, not a number picked to pass.
+#[test]
+fn near_the_air_it_still_moves_both_ways() {
+    let n = 4;
+    let side = n as f64 * 5.0e-3;
+    let area = Area::from_si(6.0 * side * side);
+    let ambient = Temperature::celsius(20.0);
+    let emissivity = Substance::copper().thermal.unwrap().emissivity;
+    for start_c in [20.5, 19.5] {
+        let start = Temperature::celsius(start_c);
+        let mut block = cube(n, 5.0, start_c);
+        for face in Face::ALL {
+            block = block.losing_from(face, Environment::still_air(ambient, area / 6.0));
+        }
+        let theta0 = start.to_si() - ambient.to_si();
+        let h_a = Environment::still_air(ambient, area)
+            .loss_from(start, emissivity)
+            .to_si()
+            / theta0;
+        let tau = block.heat_capacity().to_si() / h_a;
+        let t = 60.0;
+        let after = run(block, t);
+        let moved = theta0 - (after.mean_temperature().to_si() - ambient.to_si());
+        let want = theta0 * (1.0 - (-t / tau).exp());
+        let off = (moved - want) / want;
+        assert!(
+            off.abs() < 1e-3,
+            "from {start_c} C the block should move {want:.6} K toward the air in {t} s, and it \
+             moved {moved:.6} K ({off:+.2e} of it)"
+        );
+    }
+}
+
+/// **A face named is the face that cools**, for each of the six.
+///
+/// Every other test here exposes all six faces equally to a block that is isothermal to a part in
+/// ten thousand, and there a face mapped to the wrong side, or one applied twice and another never,
+/// leaves the total loss and every temperature the same. `numerics-reviewer` named it while reviewing
+/// `a_cooling_block_follows_newtons_law`, and nothing in the file could see it.
+///
+/// So one face at a time, on glass rather than copper — Biot `hL/k` ≈ 0.13, where the block has a
+/// gradient worth reading — and three things that hold only if the face is where its name says:
+///
+/// - the layer of cells against it is colder than the layer against the opposite face;
+/// - along the other two axes the block is still symmetric, so their two end layers agree to
+///   rounding — a face put on the wrong axis breaks that;
+/// - and a cube is the same from every side, so the six runs lose the same heat.
+///
+/// Measured after 600 s: the exposed layer 7.65 K below the opposite one for every face, the other
+/// two axes symmetric to exactly zero, and the six losses equal to the last printed digit of
+/// 301.075319781 J. The 0.5 K is there so a difference at rounding cannot pass as a sign; a face on
+/// the wrong end reads −7.6 K and one on the wrong axis reads 0.
+///
+/// Sabotaged in `Face::holds` with `XMin` and `XMax` swapped, and with `YMin` read along `z`: this
+/// fails on both, and every other test in the file, run as it stood before this one, passed both.
+#[test]
+fn a_named_face_is_the_face_that_cools() {
+    let n = 4;
+    let side = n as f64 * 5.0e-3;
+    let ambient = Temperature::celsius(20.0);
+    let layer = |b: &Solid3D, axis: usize, at: usize| -> f64 {
+        let mut sum = 0.0;
+        for p in 0..n {
+            for q in 0..n {
+                let (i, j, k) = match axis {
+                    0 => (at, p, q),
+                    1 => (p, at, q),
+                    _ => (p, q, at),
+                };
+                sum += b.temperature_at(i, j, k).to_si();
+            }
+        }
+        sum / (n * n) as f64
+    };
+
+    let mut lost = Vec::new();
+    for (face, axis, low) in [
+        (Face::XMin, 0, true),
+        (Face::XMax, 0, false),
+        (Face::YMin, 1, true),
+        (Face::YMax, 1, false),
+        (Face::ZMin, 2, true),
+        (Face::ZMax, 2, false),
+    ] {
+        let block = Solid3D::new(
+            "glass",
+            Substance::borosilicate_crown(),
+            (n, n, n),
+            Length::mm(5.0),
+            Temperature::celsius(120.0),
+        )
+        .losing_from(
+            face,
+            Environment::still_air(ambient, Area::from_si(side * side)),
+        );
+        let after = run(block, 600.0);
+
+        let (near, far) = if low { (0, n - 1) } else { (n - 1, 0) };
+        let (exposed, opposite) = (layer(&after, axis, near), layer(&after, axis, far));
+        assert!(
+            opposite - exposed > 0.5,
+            "{face:?}: the layer against it is {exposed:.4} K and the opposite one {opposite:.4} K"
+        );
+        for other in (0..3).filter(|a| *a != axis) {
+            let (a, b) = (layer(&after, other, 0), layer(&after, other, n - 1));
+            assert!(
+                (a - b).abs() < 1e-9,
+                "{face:?}: along axis {other} the ends should match, {a:.12} against {b:.12}"
+            );
+        }
+        lost.push((face, after.lost_energy().to_si()));
+    }
+    let first = lost[0].1;
+    for (face, joules) in &lost {
+        assert!(
+            (joules / first - 1.0).abs() < 1e-9,
+            "{face:?} lost {joules:.6} J where XMin lost {first:.6} J"
+        );
+    }
+}
+
+/// **Nothing is lost on the way out: `stored + lost` is conserved to the bit.**
+///
+/// The identity that lets `books_balance` stay `true` for a block that sheds heat. Every joule
+/// that leaves a cell is counted in the same statement that removes it, so the ledger moves
+/// only by what crossed the bus — and here nothing did.
+#[test]
+fn every_joule_that_leaves_is_counted() {
+    let mut block = cube(3, 4.0, 300.0);
+    let side = 3.0 * 4.0e-3;
+    block = block.losing_from(
+        Face::ZMax,
+        Environment::still_air(Temperature::celsius(20.0), Area::from_si(side * side)),
+    );
+
+    let opening = stored(&block) + block.lost_energy().to_si();
+    let after = run(block, 2000.0);
+    let closing = stored(&after) + after.lost_energy().to_si();
+
+    assert!(
+        after.lost_energy().to_si() > 0.0,
+        "it should have shed heat"
+    );
+    // Relative to the joules that actually moved, not to the block's absolute enthalpy, so the
+    // check does not get easier as the block gets bigger.
+    let moved = after.lost_energy().to_si();
+    assert!(
+        (closing - opening).abs() / moved < 1e-12,
+        "stored + lost moved by {:e} J against {moved:e} J shed",
+        closing - opening
+    );
+}
+
+/// **The Biot number decides whether a cooled block has a gradient at all, and it does.**
+///
+/// The design question behind every cooled part: is this thing isothermal, or does the inside
+/// run hotter than the surface? The textbook answer is `Bi = hL/k` — under about 0.1 the block
+/// is lumped and a single temperature describes it; well above, it is not and the middle runs
+/// hot. Nothing in the domain computes a Biot number, so this is a check against an outside
+/// statement rather than against itself.
+///
+/// Two blocks of the same poor conductor, differing **only** in the film coefficient, three
+/// decades apart. The measured spread — hottest cell to coldest, against the block's own
+/// distance from the air — has to track it.
+#[test]
+fn the_biot_number_decides_whether_a_cooled_block_is_isothermal() {
+    // Borosilicate at 12 mm: a still-air film puts it at Bi = 0.05 and a fan at 50, which
+    // straddles the lumped criterion with two coefficients that are both real. A polymer is too
+    // poor a conductor for the low end — even still air leaves it at Bi ≈ 0.9 — and a metal is
+    // too good for the high one.
+    let glass = Substance::from_name("borosilicate").expect("the catalogue has it");
+    let k = glass.thermal.unwrap().conductivity.to_si();
+    let cells = 4;
+    let cell = 3.0e-3;
+    let ambient = Temperature::celsius(20.0);
+
+    // The spread a block develops after cooling for `seconds` with this film on one face.
+    let spread = |h: f64, seconds: f64| {
+        let block = Solid3D::new(
+            "part",
+            glass.clone(),
+            (cells, cells, cells),
+            Length::from_si(cell),
+            Temperature::celsius(120.0),
+        )
+        .losing_from(
+            Face::ZMax,
+            Environment {
+                ambient,
+                convection_w_per_m2_k: h,
+                area: Area::from_si((cells as f64 * cell).powi(2)),
+            },
+        );
+        let after = run(block, seconds);
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for kk in 0..cells {
+            let t = after.temperature_at(0, 0, kk).to_si();
+            lo = lo.min(t);
+            hi = hi.max(t);
+        }
+        (hi - lo, after.mean_temperature().to_si() - ambient.to_si())
+    };
+
+    // The characteristic length for a face-cooled block is the block itself.
+    let length = cells as f64 * cell;
+    let (gentle_spread, gentle_above) = spread(5.0, 300.0);
+    let (fierce_spread, fierce_above) = spread(5000.0, 300.0);
+    let bi_gentle = 5.0 * length / k;
+    let bi_fierce = 5000.0 * length / k;
+
+    assert!(
+        bi_gentle < 0.1 && bi_fierce > 10.0,
+        "the two films should straddle the lumped criterion: {bi_gentle:.3} and {bi_fierce:.0}"
+    );
+    // A gentle film leaves the block nearly isothermal: the internal spread is a small part of
+    // how far the whole block sits from the air.
+    assert!(
+        gentle_spread / gentle_above < 0.15,
+        "at Bi = {bi_gentle:.3} the block should be nearly lumped, spread {gentle_spread:.2} K \
+         against {gentle_above:.2} K above air"
+    );
+    // A fierce one does not: the face is dragged to the air and the far side is not.
+    assert!(
+        fierce_spread / fierce_above > 1.0,
+        "at Bi = {bi_fierce:.0} the block cannot be lumped, spread {fierce_spread:.2} K against \
+         {fierce_above:.2} K above air"
+    );
+}
+
+/// **A wall between two films is its resistances in series, cell by cell.**
+///
+/// A column of copper with a film on each end — 120 C water on one side, 20 C water on the other,
+/// the two at different coefficients —
+/// at steady state. Fourier and Newton together say what it does: one flux `Q` through
+/// `R = 1/(h₁A) + n·dx/(kA) + 1/(h₂A)`, the two surfaces where the films put them, and a straight
+/// line between them on which every cell centre sits. None of that is the domain's arithmetic.
+///
+/// **Why this and not the Biot test above.** That one is a pair of ratios with an order of
+/// magnitude between them, and a conductivity three times wrong, or the half cell between a centre
+/// and its surface left out of the film's path, both leave its verdicts where they were. Here the
+/// film is stiff enough — `h·dx/(2k)` is 0.37 — that the half cell is a third of the film, and the
+/// conductivity sets the slope of the line; both are numbers the test reads.
+///
+/// Copper, whose emissivity of 0.04 radiates about a millionth of what the film carries, so the
+/// closed form's films are Newton's and the domain's `T⁴` term cannot move the answer.
+#[test]
+fn a_wall_between_two_films_is_its_resistances_in_series() {
+    let n = 4;
+    let dx = 3.0e-3;
+    let area = dx * dx;
+    // Two different films, so a film's coefficient ending up on the other face shows: with the
+    // same `h` on both, that swap left every number where it was.
+    let (h_hot, h_cold) = (1.0e5, 3.0e4);
+    let copper = Substance::copper().thermal.unwrap();
+    let k = copper.conductivity.to_si();
+    let (hot, cold) = (Temperature::celsius(120.0), Temperature::celsius(20.0));
+    let film = |ambient, h| Environment {
+        ambient,
+        convection_w_per_m2_k: h,
+        area: Area::from_si(area),
+    };
+    let (hot_film, cold_film) = (film(hot, h_hot), film(cold, h_cold));
+    let wall = Solid3D::new(
+        "wall",
+        Substance::copper(),
+        (1, 1, n),
+        Length::from_si(dx),
+        Temperature::celsius(70.0),
+    )
+    .losing_from(Face::ZMin, film(hot, h_hot))
+    .losing_from(Face::ZMax, film(cold, h_cold));
+    let field = wall
+        .steady_state()
+        .expect("a wall between two films has a steady state");
+
+    // The closed form, with the films' own loss so their small radiative part is in it too. The
+    // surfaces are where each film's loss equals the flux, and the flux is what the copper between
+    // them carries: a bisection on `Q` for which the two surfaces sit `Q·n·dx/(kA)` apart.
+    let loss = |env: &Environment, kelvin: f64| {
+        env.loss_from(Temperature::from_si(kelvin), copper.emissivity)
+            .to_si()
+    };
+    let surface = |env: &Environment, q: f64| {
+        let (mut lo, mut hi) = (cold.to_si() - 1.0, hot.to_si() + 1.0);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if loss(env, mid) > q {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    };
+    let conduction = n as f64 * dx / (k * area);
+    let gap = |q: f64| surface(&hot_film, -q) - surface(&cold_film, q) - q * conduction;
+    let (mut lo, mut hi) = (0.0, (hot.to_si() - cold.to_si()) * h_hot * area);
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if gap(mid) > 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let q = 0.5 * (lo + hi);
+    let top = surface(&hot_film, -q);
+
+    // **The films are nearly all convection**, checked against the coefficients as written and
+    // not through `loss_from`, so a loss model that doubled its own convective term cannot agree
+    // with itself here.
+    for (env, h) in [(&hot_film, h_hot), (&cold_film, h_cold)] {
+        let share = loss(env, 70.0 + 273.15) / (70.0 + 273.15 - env.ambient.to_si()) / (h * area);
+        assert!(
+            (share - 1.0).abs() < 1e-4,
+            "a film of h = {h} should be convection to a part in ten thousand, is {share:.8}"
+        );
+    }
+
+    // **What the two can differ by, and it is the solver's alone.** The closed form takes each
+    // film at its surface, and so does the domain, which solves for the surface's own temperature
+    // behind the half cell; the copper between carries a straight line, which the cells sample
+    // exactly. What is left is the solver's own stopping rule — it stops when no sweep moves a
+    // cell by 1e-6 K — and twice it. Measured: 1.4e-7 K against a bound of 2e-6 K.
+    //
+    // **It allowed the films' half cell as well, 2.7e-5 K**, because the domain used to take a
+    // film's radiative part at the centre, half a cell in, and the two differed by 3.3e-6 to
+    // 6.1e-6 K — which this bound now refuses. Before that it bounded the whole radiative share
+    // times the whole drop, 3.7e-4 K, and `numerics-reviewer` switched radiation off in the film
+    // and it passed: the effect it was meant to hold was a hundredth of what it allowed.
+    let bound = 2.0 * 1e-6;
+    for (i, got) in field.iter().enumerate() {
+        let want = top - q * (i as f64 + 0.5) * dx / (k * area);
+        assert!(
+            (got - want).abs() < bound,
+            "cell {i} of the wall: {got:.7} K against the series {want:.7} K, off by {:.2e} K \
+             where the solver allows {bound:.2e}",
+            got - want
+        );
+    }
+}
+
+/// **A film stiffer than the conduction it replaces tightens the stability limit, and the
+/// domain refuses a step past it.**
+///
+/// The silent failure this guards: a boundary integrated explicitly past its own limit does not
+/// diverge dramatically, it **oscillates about ambient** — a cell overshooting the air it is
+/// losing to, every step, while the conservation audit stays perfectly happy because the heat
+/// really did leave.
+///
+/// The condition is worth stating because it is not "any exposed face". `worst_rate` is a
+/// maximum over cells, an interior cell has six conducting faces and a boundary cell has five
+/// plus a film, so the limit only moves when `h·dx > k` — the film outweighing the conduction
+/// it stands in for. For copper at 2 mm that needs `h > 200 kW/m²·K`, which is not air; for a
+/// polymer it needs a few hundred, which is a fan. Checked on the polymer, where it bites.
+#[test]
+fn a_stiff_film_tightens_the_limit_and_the_limit_is_enforced() {
+    let pla = Substance::from_name("pla").expect("the catalogue has it");
+    let side = 4.0 * 2.0e-3;
+    let bare = Solid3D::new(
+        "part",
+        pla.clone(),
+        (4, 4, 4),
+        Length::mm(2.0),
+        Temperature::celsius(300.0),
+    );
+    let bare_limit = bare.max_stable_dt(Time::ZERO).to_si();
+
+    let cooled = Solid3D::new(
+        "part",
+        pla,
+        (4, 4, 4),
+        Length::mm(2.0),
+        Temperature::celsius(300.0),
+    )
+    .losing_from(
+        Face::ZMax,
+        Environment {
+            ambient: Temperature::celsius(20.0),
+            convection_w_per_m2_k: 2000.0,
+            area: Area::from_si(side * side),
+        },
+    );
+    let cooled_limit = cooled.max_stable_dt(Time::ZERO).to_si();
+
+    assert!(
+        cooled_limit < bare_limit * 0.9,
+        "a film stiffer than the conduction it replaces must shorten the step: \
+         {cooled_limit:e} against {bare_limit:e}"
+    );
+
+    // And a step past it is refused rather than run into an oscillation.
+    let mut block = cooled;
+    let mut bus = Exchange::new();
+    block
+        .step(Time::ZERO, Time::from_si(cooled_limit * 1.5), &mut bus)
+        .expect_err("a step past the limit must be refused");
+}
+
+/// A box of PLA with no two sides the same length, so each face divides its area among a
+/// different number of cells, and every face has cells in its middle with five neighbours. The
+/// cell is `2⁻⁹` m, so that division is exact whatever the number.
+fn pla_box() -> Solid3D {
+    Solid3D::new(
+        "part",
+        Substance::from_name("pla").expect("the catalogue has it"),
+        (4, 3, 5),
+        Length::from_si(1.0 / 512.0),
+        Temperature::celsius(300.0),
+    )
+}
+
+/// A film on `face` of [`pla_box`], at `w_per_m2_k` over the face's whole area.
+fn film_on(face: Face, w_per_m2_k: f64) -> (Face, Environment) {
+    let (nx, ny, nz) = (4.0, 3.0, 5.0);
+    let cells = match face {
+        Face::XMin | Face::XMax => ny * nz,
+        Face::YMin | Face::YMax => nx * nz,
+        Face::ZMin | Face::ZMax => nx * ny,
+    };
+    let dx = 1.0 / 512.0;
+    (
+        face,
+        Environment {
+            ambient: Temperature::celsius(20.0),
+            convection_w_per_m2_k: w_per_m2_k,
+            area: Area::from_si(cells * dx * dx),
+        },
+    )
+}
+
+/// The face across the block from `face`.
+fn opposite(face: Face) -> Face {
+    match face {
+        Face::XMin => Face::XMax,
+        Face::XMax => Face::XMin,
+        Face::YMin => Face::YMax,
+        Face::YMax => Face::YMin,
+        Face::ZMin => Face::ZMax,
+        Face::ZMax => Face::ZMin,
+    }
+}
+
+/// [`pla_box`]'s limit with the given films.
+fn limit_with(films: &[(Face, f64)]) -> f64 {
+    films
+        .iter()
+        .fold(pla_box(), |block, &(face, h)| {
+            let (face, film) = film_on(face, h);
+            block.losing_from(face, film)
+        })
+        .max_stable_dt(Time::ZERO)
+        .to_si()
+}
+
+/// **Whichever face is cooled, the limit is the same.** A stiff film on a face sets the limit at
+/// the cells in that face's middle: five neighbours of the same material and the same film behind
+/// each, at the same temperature. So all six faces set one limit, to the bit, and each a shorter
+/// one than the bare box's: 0.872 of it, where the half cell of solid behind the film puts the
+/// floor for any film at 6/7, and a film this test misses entirely reads 1.
+///
+/// The limit visits only the cells on an exposed face, and this sees a far face visited on the
+/// near plane, or no plane visited at all: either reads the bare limit for that face. It does not
+/// see a face's two axes swapped, which still reaches a middle cell on five faces of this box and
+/// reads past the end of the sixth. `a_face_visits_the_cells_it_holds` in `solid.rs` is what sees
+/// that.
+#[test]
+fn a_stiff_film_on_any_face_sets_the_same_limit() {
+    let bare = limit_with(&[]);
+    let first = limit_with(&[(Face::XMin, 2000.0)]);
+    for face in Face::ALL {
+        let limit = limit_with(&[(face, 2000.0)]);
+        assert!(
+            limit < bare * 0.9,
+            "a stiff film on {face:?} must shorten the step: {limit:e} against {bare:e} bare"
+        );
+        assert_eq!(
+            limit.to_bits(),
+            first.to_bits(),
+            "{face:?} sets {limit:e}, XMin sets {first:e}"
+        );
+    }
+}
+
+/// **A second cooled face moves the limit only where the two faces meet.** A cell's rate is its
+/// conduction and the films of the faces it lies on, and the limit is the largest of them.
+///
+/// - **A weak second film leaves the limit to the bit.** The cells that set it, in the stiff
+///   face's middle, lie on no other face, and the weak film raises no cell past them. A limit
+///   that visited only one of two exposed faces' cells keeps the edge the two share and loses the
+///   stiff face's middle, and reads a longer limit.
+/// - **A stiff second film on a face beside the first shortens it**, because the edge the two
+///   share carries both films over four neighbours, which is more than either face's middle.
+///   **Across from the first it leaves the limit to the bit**, because the two share no cell.
+#[test]
+fn a_second_cooled_face_moves_the_limit_only_where_the_two_meet() {
+    for stiff in Face::ALL {
+        let alone = limit_with(&[(stiff, 2000.0)]);
+        for other in Face::ALL.into_iter().filter(|&f| f != stiff) {
+            let weak = limit_with(&[(stiff, 2000.0), (other, 5.0)]);
+            assert_eq!(
+                weak.to_bits(),
+                alone.to_bits(),
+                "a weak film on {other:?} moved the limit {stiff:?} set: {weak:e} against \
+                 {alone:e}"
+            );
+            let both = limit_with(&[(stiff, 2000.0), (other, 2000.0)]);
+            if other == opposite(stiff) {
+                assert_eq!(
+                    both.to_bits(),
+                    alone.to_bits(),
+                    "a stiff film across the block on {other:?} moved the limit {stiff:?} set: \
+                     {both:e} against {alone:e}"
+                );
+            } else {
+                assert!(
+                    both < alone,
+                    "a stiff film beside it on {other:?} did not shorten the limit {stiff:?} \
+                     set: {both:e} against {alone:e}"
+                );
+            }
+        }
+    }
+}
+
+/// **A gentle film does not move the limit, and that is not a bug.** The other side of the same
+/// fact, pinned so nobody "fixes" the limit into being pessimistic: still air on copper is
+/// nowhere near the conduction it stands in for, so the interior cell still sets the step.
+#[test]
+fn a_gentle_film_leaves_the_limit_alone() {
+    let side = 4.0 * 5.0e-3;
+    let bare = cube(4, 5.0, 200.0).max_stable_dt(Time::ZERO).to_si();
+    let cooled = cube(4, 5.0, 200.0)
+        .losing_from(
+            Face::ZMax,
+            Environment::still_air(Temperature::celsius(20.0), Area::from_si(side * side)),
+        )
+        .max_stable_dt(Time::ZERO)
+        .to_si();
+    assert_eq!(
+        cooled, bare,
+        "still air on copper is far weaker than the face it replaces"
+    );
+}
+
+/// **A hot block's limit is shorter than a cool one's, and that is not a refinement.**
+///
+/// The radiative conductance is `4εσT³`, so a part at 1000 °C carries about **26 times** what
+/// the same surface carries at room temperature — measured at `ε = 0.9`, 136 against
+/// 5.14 W/m²·K. A limit linearised about the *ambient* would hand the hot block a step an order
+/// too long, and an explicit boundary past its limit does not fail loudly: it oscillates about
+/// the air it is losing to, every step, while the conservation audit stays perfectly happy
+/// because the heat really did leave.
+///
+/// So the limit is evaluated at the block's own temperature, which is what
+/// [`Domain::max_stable_dt`] means by "from `now`". Checked as a ratio between two blocks
+/// differing only in how hot they are, and asserted one-sided against the `T³` the physics
+/// gives — a limit that ignored the state would return the identical number for both.
+#[test]
+fn a_hot_block_gets_a_shorter_limit_than_a_cool_one() {
+    // A poor conductor with a convective film just under the threshold on its own, so the
+    // radiative term is what carries it across. The film cannot exceed the half cell of solid
+    // behind it — , here 743 W/m^2/K — so radiation alone at 1000 C (420) does not reach
+    // it and 600 of convection beside it does.
+    let glass = Substance::from_name("borosilicate").expect("the catalogue has it");
+    let side = 4.0 * 3.0e-3;
+    let block = |celsius: f64| {
+        Solid3D::new(
+            "part",
+            glass.clone(),
+            (4, 4, 4),
+            Length::mm(3.0),
+            Temperature::celsius(celsius),
+        )
+        .losing_from(
+            Face::ZMax,
+            Environment {
+                ambient: Temperature::celsius(20.0),
+                convection_w_per_m2_k: 600.0,
+                area: Area::from_si(side * side),
+            },
+        )
+        .max_stable_dt(Time::ZERO)
+        .to_si()
+    };
+
+    let cool = block(30.0);
+    let hot = block(1000.0);
+    assert!(
+        hot < cool,
+        "a hot block radiates harder and must take shorter steps: {hot:e} against {cool:e}"
+    );
+
+    // And a block with no exposed face has a limit that does not move with temperature at all,
+    // which is the control that says the difference above came from the boundary.
+    let bare = |celsius: f64| {
+        Solid3D::new(
+            "part",
+            glass.clone(),
+            (4, 4, 4),
+            Length::mm(3.0),
+            Temperature::celsius(celsius),
+        )
+        .max_stable_dt(Time::ZERO)
+        .to_si()
+    };
+    assert_eq!(
+        bare(30.0),
+        bare(1000.0),
+        "conduction alone does not care how hot the block is"
+    );
+}
+
+/// **The stated area is the area that cools, whatever shape the part is.**
+///
+/// `losing_from` takes an `Area`, and the block divides it among the cells on that face so each
+/// carries its share. It divided by the cells the *grid* has there, and a designed part is mostly
+/// not there: a void cell took a share and lost nothing with it, so the area that actually cooled
+/// was the stated one times the solid fraction of the face.
+///
+/// Measured on `29-a-designed-bracket-becomes-cells`, the one shipped scene whose geometry comes
+/// from an STL: 410 of the 676 cells on `z-min` are solid, so 16.5 cm² of stated cooling acted as
+/// **10.0**, and its 120 s drop came out 1.908 K against the 2.950 K its own lumped balance
+/// predicts. The ratio, 0.647, tracked 410/676 and the radiative addition and nothing else.
+///
+/// The check here is a closed form the domain has no code for: a block small enough to be lumped
+/// (Bi ≪ 1) sheds `hA(T − T∞)` per second, so its initial rate is fixed by the **stated** `A`.
+/// Half the cells are emptied in a checkerboard that leaves exactly half of `z-min` solid, which
+/// is the case that used to halve the answer.
+#[test]
+fn a_part_with_voids_cools_at_the_rate_its_stated_area_says() {
+    let n = 6;
+    let cell_mm = 2.0;
+    let ambient = 20.0;
+    let start = 120.0;
+    // 12 cm², stated. Deliberately not the face's own 1.44 cm²: the area is what the scene says
+    // the part presents to the air, and the grid is how the part is discretised. Conflating them
+    // is the bug next door.
+    let area = Area::from_si(12.0e-4);
+    let h = 25.0;
+
+    let rate = |solid_fraction_of_face: bool| {
+        let mut block = cube(n, cell_mm, start);
+        if solid_fraction_of_face {
+            // Empty every other column, so exactly half of `z-min` is solid and the part is
+            // still connected along z.
+            block = block.empty(|i, _j, _k| i % 2 == 1);
+        }
+        block = block.losing_from(
+            Face::ZMin,
+            Environment {
+                ambient: Temperature::celsius(ambient),
+                convection_w_per_m2_k: h,
+                area,
+            },
+        );
+        let before = stored(&block);
+        let after = run(block, 1.0);
+        (before - stored(&after), after)
+    };
+
+    let (whole, _) = rate(false);
+    let (holed, after) = rate(true);
+
+    // `hA(T − T∞)` over one second, from the stated area and nothing the domain computed.
+    let want = h * area.to_si() * (start - ambient);
+    for (what, shed) in [("solid", whole), ("half emptied", holed)] {
+        let off = (shed - want).abs() / want;
+        assert!(
+            off < 0.02,
+            "{what}: shed {shed:.4} J in a second against hA(T-Tinf) = {want:.4} — {:.1} percent out",
+            off * 100.0
+        );
+    }
+    // And the two agree with each other far more tightly than either agrees with the lumped
+    // form, because they differ only in how many cells share one stated area. This is the
+    // assertion that used to fail, by a factor of two.
+    let between = (whole - holed).abs() / whole;
+    assert!(
+        between < 0.01,
+        "emptying half the face changed the heat leaving by {:.2} percent, and the area was stated",
+        between * 100.0
+    );
+    assert!(
+        after.lost_energy().to_si() > 0.0,
+        "the emptied block shed nothing at all"
+    );
+}

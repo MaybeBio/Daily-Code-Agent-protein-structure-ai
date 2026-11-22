@@ -1,0 +1,28 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { validationDashboardHtml } from './dashboard.mjs';
+
+const registry = JSON.parse(await readFile(new URL('./registry.v0.2.json', import.meta.url)));
+const before = structuredClone(registry);
+const html = validationDashboardHtml(registry);
+assert.match(html, /Numerical implementation checks/);
+assert.match(html, /one reference system, not five independent systems/);
+for (const value of ['2.84e-14', '3.76e-15', '1.24e-4', '2.76e-4']) assert(html.includes(value));
+assert.equal((html.match(/data-validation-comparison=/g) || []).length, 3);
+assert.doesNotMatch(html, /Pose benchmark|Best-of-5|crystal-scored|registered cases|feasible poses|data-validation-tier|registry.v0.2.json/);
+assert.match(html, /original-input precision limits/);
+assert(html.includes('STORMM/native comparison scope'));
+assert.deepEqual(registry, before, 'do not rewrite the archived registry');
+const subset = structuredClone(registry);
+delete subset.cases; delete subset.headline; delete subset.countingRules;
+subset.studies = subset.studies.filter(study => study.studyId === 'high-disruption-cross-runtime-2026-08-23');
+assert.equal(validationDashboardHtml(subset), html, 'docking records cannot affect numerical content');
+const hostile = structuredClone(registry);
+hostile.version = '<img src=x onerror=alert(1)>';
+assert.match(validationDashboardHtml(hostile), /&lt;img src=x/);
+hostile.artifacts.browserVacuum.href = 'javascript:alert(1)';
+assert.throws(() => validationDashboardHtml(hostile), /Invalid numerical evidence link/);
+const missing = structuredClone(registry);
+missing.studies = [];
+assert.throws(() => validationDashboardHtml(missing), /Numerical evidence unavailable/);
+console.log('Numerical-only validation dashboard: PASS');

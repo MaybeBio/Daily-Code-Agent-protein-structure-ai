@@ -1,0 +1,237 @@
+"""Reviewed form labels and bindings; the generated frontend is a projection."""
+
+from .contract import CapabilitySpec
+from .modalities import modality_metadata
+
+_ROWS = (
+    (
+        "predict",
+        "structure",
+        ("预测分子与复合物结构", "Predict structures and complexes"),
+        (
+            "蛋白、小分子、DNA、RNA、离子、共价连接；标准与 ABAG 模型。",
+            "Proteins, ligands, DNA, RNA, ions and covalent bonds; standard and ABAG checkpoints.",
+        ),
+        "OpenDDE",
+    ),
+    (
+        "properties",
+        "evaluate",
+        ("计算小分子性质", "Calculate molecular properties"),
+        (
+            "SMILES 或 SDF 批量计算 MW、LogP、TPSA、QED、SA、氢键与柔性指标。",
+            "Batch descriptors from SMILES or SDF: MW, LogP, TPSA, QED, SA, "
+            "hydrogen-bond counts and flexibility.",
+        ),
+        "RDKit",
+    ),
+    (
+        "campaign",
+        "design",
+        ("抗体设计与 CDR 优化", "Antibody design and CDR optimization"),
+        (
+            "VHH、scFv、VH/VL；多轮候选生成、折叠评分、筛选与反思。",
+            "VHH, scFv and VH/VL; iterative generation, folding, ranking and reflection.",
+        ),
+        "Harness + LLM",
+    ),
+    (
+        "esm",
+        "evaluate",
+        ("蛋白序列评分", "Score protein sequences"),
+        (
+            "使用 ESM2 对现有序列评分，辅助候选比较。",
+            "ESM2 scores for comparing existing sequences.",
+        ),
+        "Harness / ESM2",
+    ),
+    (
+        "esm2",
+        "design",
+        ("ESM2 引导序列提案", "ESM2-guided sequence proposals"),
+        (
+            "指定可变位置，生成有模型评分支持的序列提案。",
+            "Propose sequences at selected mutable positions with model scores.",
+        ),
+        "Harness / ESM2",
+    ),
+    (
+        "mpnn",
+        "design",
+        ("结构引导序列设计", "Structure-guided sequence design"),
+        (
+            "使用 SolubleMPNN，在给定结构和可变位置上设计序列。",
+            "SolubleMPNN sequence proposals for a structure and mutable positions.",
+        ),
+        "Harness / SolubleMPNN",
+    ),
+    (
+        "fold",
+        "structure",
+        ("结合体折叠与界面评分", "Binder folding and interface scoring"),
+        (
+            "预测结合体复合物，比较结构置信度与界面指标。",
+            "Predict binder complexes and compare structural confidence and interface metrics.",
+        ),
+        "Harness / OpenDDE",
+    ),
+    (
+        "epitope",
+        "analyze",
+        ("表位与热点接触", "Epitope and hotspot contacts"),
+        (
+            "分析抗体、抗原链及 CDR 对目标区域的接触。",
+            "Inspect contacts between antibody CDRs and antigen regions.",
+        ),
+        "Harness",
+    ),
+    (
+        "structure",
+        "analyze",
+        ("蛋白界面相互作用", "Protein interface interactions"),
+        (
+            "比较最多三个蛋白复合物，查看完整原生接触与修饰残基。",
+            "Compare up to three protein complexes with complete native contacts "
+            "and modified residues.",
+        ),
+        "PLIP",
+    ),
+    (
+        "rmsd",
+        "analyze",
+        ("蛋白界面与构象比较", "Compare protein interfaces and conformations"),
+        (
+            "明确靶蛋白与伙伴链，在同一坐标系比较构象、界面和观测覆盖率。",
+            "Map target and partner chains, then compare geometry, interfaces "
+            "and observed coverage in one frame.",
+        ),
+        "Biopython / DockQ",
+    ),
+    (
+        "evolution",
+        "analyze",
+        ("候选进化树", "Candidate evolution tree"),
+        (
+            "从候选历史中查看谱系和目标分数变化。",
+            "Review lineages and objective changes from candidate history.",
+        ),
+        "Harness",
+    ),
+    (
+        "compare",
+        "analyze",
+        ("比较两个候选集", "Compare candidate populations"),
+        (
+            "比较两次设计的目标值、最佳候选与候选重合情况。",
+            "Compare objectives, leading candidates and overlap across two design runs.",
+        ),
+        "Harness",
+    ),
+    (
+        "protrek-sequence",
+        "search",
+        ("按蛋白序列检索", "Search by protein sequence"),
+        (
+            "连接配置的 ProTrek 服务，检索相似蛋白。",
+            "Find similar proteins through the configured ProTrek service.",
+        ),
+        "Harness / ProTrek",
+    ),
+    (
+        "protrek-structure",
+        "search",
+        ("抗体结构同源检索", "Antibody structural analogues"),
+        (
+            "使用抗体可变域结构检索，仅返回抗体样域。",
+            "Search variable-domain structures, returning antibody-like domains.",
+        ),
+        "Harness / ProTrek",
+    ),
+    (
+        "target-msa",
+        "prepare",
+        ("准备抗体设计靶标 MSA", "Prepare target MSA for design"),
+        (
+            "搜索靶标的相似序列，查看多序列比对的规模。",
+            "Search target homologs and inspect multiple-sequence alignment depth.",
+        ),
+        "Harness",
+    ),
+    (
+        "features",
+        "prepare",
+        ("准备 MSA 与模板", "Prepare MSAs and templates"),
+        (
+            "为结构预测准备多序列比对和参考结构模板。",
+            "Prepare sequence alignments and structural templates for prediction.",
+        ),
+        "OpenDDE",
+    ),
+    (
+        "import",
+        "prepare",
+        ("导入结构与批量任务", "Import structures and batch tasks"),
+        (
+            "PDB/CIF 转输入；导入原生 JSON，审阅后单次或批量提交。",
+            "Convert PDB/CIF, import native JSON, review and submit single or batch tasks.",
+        ),
+        "OpenDDE",
+    ),
+    (
+        "resources",
+        "system",
+        ("模型、数据库与环境检查", "Models, databases and diagnostics"),
+        (
+            "查看依赖状态，安装原生资源，运行 doctor。",
+            "Inspect dependencies, install native resources and run doctor.",
+        ),
+        "OpenDDE",
+    ),
+)
+_CORE = {
+    "predict": ("predict",),
+    "properties": ("properties",),
+    "features": ("msa", "mt", "prep"),
+    "import": ("json",),
+    "resources": ("doctor", "resources"),
+}
+
+
+def forms() -> tuple[CapabilitySpec, ...]:
+    result = []
+    for identifier, group, label, note, source in _ROWS:
+        campaign = identifier == "campaign"
+        environment = (
+            "biopython"
+            if identifier == "rmsd"
+            else "plip"
+            if identifier == "structure"
+            else "chemistry"
+            if identifier == "properties"
+            else "opendde"
+            if identifier in _CORE
+            else "harness"
+        )
+        result.append(
+            CapabilitySpec(
+                id=identifier,
+                **modality_metadata(identifier),
+                group=group,
+                label=label,
+                note=note,
+                source=source,
+                environment=environment,
+                operations=("structure_compare",)
+                if identifier == "rmsd"
+                else ("protein_interface",)
+                if identifier == "structure"
+                else _CORE.get(identifier, () if campaign else ("harness",)),
+                frontend_form=identifier,
+                native_tool=identifier if environment == "harness" and not campaign else None,
+                submission="native_campaign" if campaign else "task",
+                contract_source="Native Harness config validated through /api/harness/plans"
+                if campaign
+                else "TaskRequest",
+            )
+        )
+    return tuple(result)

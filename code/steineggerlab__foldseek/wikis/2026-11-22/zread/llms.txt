@@ -1,0 +1,18 @@
+# steineggerlab/foldseek
+
+- [Overview](1-overview.md)
+- [Quick Start](2-quick-start.md)
+- [Installation Options](3-installation-options.md)
+- [Structure Search Basics](4-structure-search-basics.md)
+- [Working with Structure Databases](5-working-with-structure-databases.md)
+- [What's the Buzz](6-whats-the-buzz.md)
+- [What People Are Saying](7-what-people-are-saying.md)
+- [About the Team](8-about-the-team.md)
+- [Protein Structure Search Algorithms](9-protein-structure-search-algorithms.md)
+- [Architecture and Implementation](10-architecture-and-implementation.md)
+- [Structure Clustering](11-structure-clustering.md)
+- [Iterative Search Workflows](12-iterative-search-workflows.md)
+- [Structure Profiles](13-structure-profiles.md)
+- [Performance Optimization](14-performance-optimization.md)
+- [Docker and GPU Support](15-docker-and-gpu-support.md)
+- [Extending Foldseek](16-extending-foldseek.md)

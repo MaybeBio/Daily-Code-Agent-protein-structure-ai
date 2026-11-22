@@ -1,0 +1,128 @@
+"""Local input files participate in reference and freshness checks.
+
+A modular manuscript keeps its structure in the files its root file inputs, so
+every structure check has to read the assembled document. A root file holding
+nothing but inputs otherwise presents no front matter, no sections and no
+figures, and each check passes on an empty document instead of failing.
+"""
+import pytest
+
+from scripts.capability.reporting.validate_manuscript import (
+    arguments,
+    float_environments,
+    float_placement_faults,
+    headings,
+    read_document,
+    tex_inputs,
+    without_comments,
+    words,
+)
+
+
+def test_extensionless_nested_inputs_expose_labels_and_dependencies(tmp_path):
+    (tmp_path / 'notes.tex').write_text(r'\input{key.tex}')
+    key = tmp_path / 'key.tex'
+    key.write_text(r'\label{tab:checkpoint-key}')
+    text = r'\ref{tab:checkpoint-key}\input{notes}'
+    dependencies = tex_inputs(text, tmp_path)
+    assert [path.name for path, _ in dependencies] == ['notes.tex', 'key.tex']
+    expanded = text + ''.join(content for _, content in dependencies)
+    assert set(arguments(expanded, 'ref')) <= set(arguments(expanded, 'label'))
+    assert key in [path for path, _ in dependencies]
+
+
+def test_repeated_input_does_not_hide_duplicate_labels(tmp_path):
+    (tmp_path / 'key.tex').write_text(r'\label{tab:key}')
+    dependencies = tex_inputs(r'\input{key}\input{key.tex}', tmp_path)
+    labels = arguments(''.join(content for _, content in dependencies), 'label')
+    assert labels == ['tab:key', 'tab:key']
+    assert tex_inputs('% \\input{missing}\n', tmp_path) == []
+
+
+def test_float_placement_accepts_flexible_and_default_options():
+    for placement in ('[!htbp]', '[tbp]', '[hp]', ''):
+        for environment in ('figure', 'table', 'figure*', 'table*'):
+            assert float_placement_faults('\\begin{' + environment + '}' + placement) == []
+    assert float_placement_faults('% \\begin{figure}[!t]\n') == []
+
+
+def test_float_placement_refuses_text_only_and_float_only_options():
+    for text in (r'\begin{figure}[!t]', r'\begin{table}[p]', r'\begin{figure}[H]'):
+        assert len(float_placement_faults(text)) == 1
+
+
+def test_float_placement_checks_expanded_local_inputs(tmp_path):
+    (tmp_path / 'key.tex').write_text(r'\begin{table}[p]')
+    text = r'\input{key}'
+    expanded = text + ''.join(content for _, content in tex_inputs(text, tmp_path))
+    assert float_placement_faults(expanded)
+
+
+def test_invalid_input_refuses_instead_of_being_ignored(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        tex_inputs(r'\input{missing}', tmp_path)
+    (tmp_path / 'cycle.tex').write_text(r'\input{cycle}')
+    with pytest.raises(ValueError, match='Cyclic'):
+        tex_inputs(r'\input{cycle}', tmp_path)
+    with pytest.raises(ValueError, match='Nonlocal'):
+        tex_inputs(r'\input{../outside}', tmp_path)
+
+
+def test_a_modular_document_is_assembled_where_its_inputs_stand(tmp_path):
+    (tmp_path / 'frontmatter.tex').write_text('\\abstract{Two words}\n\\maketitle\n')
+    (tmp_path / 'results.tex').write_text(
+        '\\section{Results}\n\\subsection{One}\nFive counted body words here.\n')
+    (tmp_path / 'methods.tex').write_text('\\section{Methods}\n\\subsection{How}\n')
+    root = ('\\begin{document}\n\\input{frontmatter}\n\\input{results}\n'
+            '% \\input{dropped}\n\\input{methods}\n')
+    assembled, dependencies = read_document(root, tmp_path)
+
+    # The root file alone carries no structure at all; the assembled document
+    # carries it in reading order, and a commented-out input is not read.
+    assert arguments(root, 'abstract') == [] and arguments(root, 'section') == []
+    assert arguments(assembled, 'abstract') == ['Two words']
+    assert [section for section, _ in headings(assembled)] == ['Results', 'Methods']
+    assert dict(headings(assembled)) == {'Results': ['One'], 'Methods': ['How']}
+    assert [path.name for path, _ in dependencies] == ['frontmatter.tex', 'results.tex',
+                                                       'methods.tex']
+    assert [path.name for path, _ in tex_inputs(root, tmp_path)] == \
+        [path.name for path, _ in dependencies]
+    # The front-matter boundary and the end of the counted body are both there
+    # to be found, which is what the word count is measured between.
+    front, titled, remainder = assembled.partition('\\maketitle')
+    assert titled and arguments(front, 'abstract') == ['Two words']
+    assert words(remainder.partition('\\section{Methods}')[0]) == 5
+
+
+def test_a_local_float_wrapper_is_a_float(tmp_path):
+    (tmp_path / 'preamble.tex').write_text(
+        '\\newenvironment{widefigurepage}{%\n  \\begin{figure}[!htbp]\n  \\centering\n'
+        '}{%\n  \\end{figure}\n}\n'
+        '\\newenvironment{sidenote}{\\begin{quote}}{\\end{quote}}\n')
+    assembled, _ = read_document('\\input{preamble}', tmp_path)
+
+    # A wrapper that opens a figure is a figure; one that opens anything else is
+    # not, or every environment would be excluded from the counted body.
+    assert float_environments(assembled) == {'figure', 'figure*', 'table', 'table*',
+                                             'widefigurepage'}
+    assert 'sidenote' not in float_environments(assembled)
+    # Its fixed placement is still what the float checker reads, through the
+    # definition rather than through each use.
+    assert float_placement_faults(assembled) == []
+
+
+def test_a_comment_is_not_body_text():
+    """The journal word limit measures what is typeset, not source annotation.
+
+    An unstripped comment inflates the count, so a correct manuscript carrying
+    a long explanatory note would fail the length check. Placeholder blocks
+    recording deliberately unwritten sections are exactly that case.
+    """
+    assert words(without_comments('two words % and four commented ones')) == 2
+    assert without_comments(r'90\% yield') == r'90\% yield'
+    assert words(without_comments(r'90\% yield')) == 2
+    # A comment may not swallow the line that follows it.
+    assert words(without_comments('% hidden\nvisible text')) == 2
+    # Nor may it hide structure from the float checker.
+    assert float_placement_faults('% \\begin{figure}[t]\n') == []
+    assert float_placement_faults(r'\begin{figure}[t]') != []

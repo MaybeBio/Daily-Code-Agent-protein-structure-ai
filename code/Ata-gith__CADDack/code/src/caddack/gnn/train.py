@@ -1,0 +1,429 @@
+from __future__ import annotations
+
+import json
+import warnings
+from pathlib import Path
+
+from caddack.gnn.datasets import build_pyg_dataset
+from caddack.gnn.geometry import ComplexExample
+from caddack.gnn.models import MolecularGCN, MolecularGINE
+
+
+def _require_torch_geometric():
+    try:
+        import torch
+        import torch.nn.functional as F
+        from sklearn.metrics import accuracy_score, mean_absolute_error, r2_score, roc_auc_score
+        from torch_geometric.loader import DataLoader  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise ImportError(
+            "Training requires torch, torch-geometric, and scikit-learn."
+        ) from exc
+    return torch, F, DataLoader, accuracy_score, roc_auc_score, mean_absolute_error, r2_score
+
+
+def _split_indices(n: int, test_size: float = 0.2, seed: int = 42):
+    torch, *_ = _require_torch_geometric()
+    g = torch.Generator().manual_seed(seed)
+    order = torch.randperm(n, generator=g).tolist()
+    cut = max(1, int(round(n * (1 - test_size))))
+    return order[:cut], order[cut:]
+
+
+def _prepare_frame(df, smiles_col: str, target_col: str, task: str, positive_threshold: float | None):
+    if smiles_col not in df or target_col not in df:
+        raise ValueError(f"Missing required columns {smiles_col!r} and/or {target_col!r}")
+
+    data_df = df[[smiles_col, target_col]].dropna().copy()
+    if task == "classification":
+        if positive_threshold is not None:
+            data_df[target_col] = (
+                data_df[target_col].astype(float) >= float(positive_threshold)
+            ).astype(int)
+        else:
+            # No threshold: the column must already be binary {0, 1}, otherwise
+            # BCE/AUC downstream would silently train on / crash against floats.
+            uniq = set(data_df[target_col].dropna().unique().tolist())
+            if not uniq.issubset({0, 1}):
+                raise ValueError(
+                    f"task='classification' but target {target_col!r} is not binary "
+                    f"(found {sorted(uniq)[:5]}...). Pass positive_threshold to binarize "
+                    f"a continuous column, or use task='regression'."
+                )
+            data_df[target_col] = data_df[target_col].astype(int)
+    return data_df
+
+
+def train_from_csv(
+    csv_path: str | Path,
+    smiles_col: str,
+    target_col: str,
+    outdir: str | Path = "models/gnn",
+    model_name: str = "gine",
+    task: str = "classification",
+    epochs: int = 30,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    hidden_channels: int = 128,
+    num_layers: int = 3,
+    test_size: float = 0.2,
+    seed: int = 42,
+    positive_threshold: float | None = None,
+) -> dict[str, float]:
+    (torch, F, DataLoader, accuracy_score, roc_auc_score,
+     mean_absolute_error, r2_score) = _require_torch_geometric()
+    try:
+        import pandas as pd
+    except Exception as exc:
+        raise ImportError("pandas is required to read training CSV files.") from exc
+
+    df = pd.read_csv(csv_path)
+    data_df = _prepare_frame(df, smiles_col=smiles_col, target_col=target_col,
+                             task=task, positive_threshold=positive_threshold)
+    dataset = build_pyg_dataset(data_df[smiles_col].tolist(), data_df[target_col].tolist())
+    if len(dataset) < 4:
+        raise ValueError("Need at least 4 valid molecules to train/evaluate")
+
+    train_idx, test_idx = _split_indices(len(dataset), test_size=test_size, seed=seed)
+    train_set = [dataset[i] for i in train_idx]
+    test_set = [dataset[i] for i in test_idx]
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+
+    in_channels = dataset[0].x.shape[1]
+    edge_dim = dataset[0].edge_attr.shape[1] if dataset[0].edge_attr.numel() else 7
+    if model_name.lower() == "gcn":
+        model = MolecularGCN.build(
+            in_channels=in_channels,
+            hidden_channels=hidden_channels,
+            num_layers=num_layers,
+            task=task,
+        )
+    else:
+        model = MolecularGINE.build(
+            in_channels=in_channels,
+            edge_dim=edge_dim,
+            hidden_channels=hidden_channels,
+            num_layers=num_layers,
+            task=task,
+        )
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    def step(batch):
+        logits = model(batch)
+        y = batch.y.view(-1)
+        if task == "classification":
+            return F.binary_cross_entropy_with_logits(logits, y)
+        return F.mse_loss(logits, y)
+
+    model.train()
+    for _ in range(epochs):
+        for batch in train_loader:
+            optimizer.zero_grad()
+            loss = step(batch)
+            loss.backward()
+            optimizer.step()
+
+    model.eval()
+    preds, truths = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            logits = model(batch)
+            y = batch.y.view(-1)
+            if task == "classification":
+                probs = torch.sigmoid(logits)
+                preds.extend(probs.cpu().numpy().tolist())
+            else:
+                preds.extend(logits.cpu().numpy().tolist())
+            truths.extend(y.cpu().numpy().tolist())
+
+    if task == "classification":
+        labels = [1 if p >= 0.5 else 0 for p in preds]
+        metrics = {"accuracy": float(accuracy_score(truths, labels))}
+        # roc_auc is undefined when the test set contains a single class
+        if len(set(truths)) >= 2:
+            metrics["auc_roc"] = float(roc_auc_score(truths, preds))
+        else:
+            warnings.warn(
+                "Test set has a single class; auc_roc is undefined and omitted. "
+                "Use a larger or stratified split.",
+                stacklevel=2,
+            )
+            metrics["auc_roc"] = None
+    else:
+        metrics = {
+            "mae": float(mean_absolute_error(truths, preds)),
+            "r2": float(r2_score(truths, preds)),
+        }
+
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), outdir / "model.pt")
+    (outdir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    return metrics
+
+
+def _require_fusion_deps():
+    try:
+        import torch
+        import torch.nn.functional as F
+        from sklearn.metrics import mean_absolute_error, r2_score  # type: ignore
+        from torch_geometric.data import Data  # type: ignore
+        from torch_geometric.loader import DataLoader  # type: ignore
+    except Exception as exc:
+        raise ImportError(
+            "Fusion training requires torch, torch-geometric, and scikit-learn."
+        ) from exc
+    return torch, F, Data, DataLoader, mean_absolute_error, r2_score
+
+
+def _build_geo_pyg(ex: ComplexExample, with_neighbors: bool = True):
+    """Build a torch-geometric Data for the geometry tower.
+
+    ``with_neighbors`` attaches first-coordination-shell features, which also
+    tell the tower which atoms are ligand and which are pocket -- it otherwise
+    receives one undifferentiated point cloud. They are computed here rather
+    than stored on the record so that caches written before this existed stay
+    usable.
+    """
+    torch, _, Data, *_ = _require_fusion_deps()
+    geo = ex.geo
+    z = torch.tensor(geo.atomic_nums, dtype=torch.long)
+    pos = torch.tensor(geo.positions, dtype=torch.float)
+    data = Data(z=z, pos=pos)
+    if with_neighbors:
+        from caddack.gnn.geometry import neighbor_features
+
+        feats = neighbor_features(geo.atomic_nums, geo.positions, geo.n_ligand)
+        data.nfeat = torch.tensor(feats, dtype=torch.float)
+    # Ligand atoms come first in the record. The interaction readout needs to know
+    # which contacts cross the interface, so the mask is passed explicitly rather
+    # than inferred from the feature layout.
+    mask = torch.zeros(len(geo.atomic_nums), dtype=torch.float)
+    mask[: geo.n_ligand] = 1.0
+    data.is_ligand = mask
+    return data
+
+
+def train_fusion_from_complexes(
+    complexes: list[ComplexExample],
+    outdir: str | Path = "models/fusion",
+    hidden_channels: int = 128,
+    num_gine_layers: int = 3,
+    num_geo_interactions: int = 3,
+    num_rbf: int = 50,
+    cutoff: float = 6.0,
+    bayesian_hidden: list[int] | None = None,
+    prior_sigma: float = 1.0,
+    kl_weight: float = 1.0,
+    kl_warmup: int = 10,
+    epochs: int = 100,
+    batch_size: int = 16,
+    lr: float = 1e-3,
+    test_size: float = 0.2,
+    seed: int = 42,
+    split: str = "scaffold",
+    mc_samples_eval: int = 30,
+    no_aleatoric: bool = False,
+    standardize_target: bool = True,
+    strict_split: bool = False,
+) -> dict[str, float]:
+    """Train FusionAffinityNet on a list of ComplexExample objects.
+
+    Uses scaffold split (via ligand SMILES) when available, else random split.
+    Saves model.pt, metrics.json, and config.json to `outdir`.
+
+    ``strict_split`` makes a failed scaffold split raise instead of degrading to a
+    random split; benchmark scripts should set it, so a reported number can never
+    come from a different split than the one requested.
+
+    ``standardize_target`` z-scores the affinity with train-set statistics and
+    rescales predictions back afterwards. This removes a systematic offset that
+    otherwise appears because the Bayesian head is regularised toward a zero-mean
+    prior; ``y_mean``/``y_std`` are recorded in ``config.json`` for inference.
+    """
+    torch, F, Data, DataLoader, mean_absolute_error, r2_score = _require_fusion_deps()
+    from caddack.gnn.bayes import elbo_loss
+    from caddack.gnn.datasets import smiles_to_graph_arrays, to_pyg_data
+    from caddack.gnn.models import FusionAffinityNet
+
+    if len(complexes) < 4:
+        raise ValueError("Need at least 4 valid complexes to train.")
+
+    # --- Build datasets ---
+    valid = [ex for ex in complexes if ex.ligand_smiles is not None]
+    use_scaffold = split == "scaffold" and len(valid) >= 4
+
+    split_used = "random"
+    split_report: dict | None = None
+
+    if use_scaffold:
+        try:
+            import pandas as pd
+
+            from caddack.qsar.split import scaffold_split
+            df = pd.DataFrame({"SMILES_canonical": [ex.ligand_smiles for ex in valid]})
+            train_idx, test_idx, report = scaffold_split(
+                df, smiles_col="SMILES_canonical", test_size=test_size, seed=seed,
+                return_report=True,
+            )
+            complexes_to_use = valid
+            split_used, split_report = "scaffold", report.as_dict()
+        except Exception as exc:
+            # Never swallow this. Silently substituting a random split for a
+            # scaffold split turns an honest generalisation estimate into an
+            # inflated one, and the caller would attribute the reported metrics
+            # to the split they asked for.
+            if strict_split:
+                raise RuntimeError(
+                    f"scaffold split failed and strict_split=True: {exc}"
+                ) from exc
+            warnings.warn(
+                f"scaffold split unavailable ({type(exc).__name__}: {exc}); "
+                "falling back to a RANDOM split. Reported metrics will be "
+                "optimistic relative to a scaffold split.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            use_scaffold, split_used = False, "random_fallback"
+
+    if not use_scaffold:
+        complexes_to_use = complexes
+        train_idx, test_idx = _split_indices(len(complexes_to_use), test_size=test_size, seed=seed)
+        train_idx = list(train_idx)
+        test_idx = list(test_idx)
+
+    def _build_lig_pyg(ex: ComplexExample):
+        try:
+            g = smiles_to_graph_arrays(ex.ligand_smiles)
+        except Exception:
+            return None
+        return to_pyg_data(g, y=ex.affinity)
+
+    train_examples = [complexes_to_use[i] for i in train_idx]
+    test_examples = [complexes_to_use[i] for i in test_idx]
+
+    # Standardise the target using TRAIN statistics only (never test — that leaks).
+    # The Bayesian head is regularised toward a N(0, prior_sigma) prior, so asking it
+    # to emit raw affinities (mean ~6.4) leaves a systematic offset; predicting a
+    # zero-mean, unit-variance target and rescaling afterwards removes it.
+    if standardize_target:
+        _affs = [float(ex.affinity) for ex in train_examples]
+        y_mean = float(sum(_affs) / len(_affs))
+        _var = sum((a - y_mean) ** 2 for a in _affs) / max(len(_affs) - 1, 1)
+        y_std = float(_var ** 0.5) or 1.0
+    else:
+        y_mean, y_std = 0.0, 1.0
+
+    def make_pairs(examples):
+        pairs = []
+        for ex in examples:
+            lig = _build_lig_pyg(ex)
+            if lig is None:
+                continue
+            geo = _build_geo_pyg(ex)
+            geo.y = torch.tensor([(float(ex.affinity) - y_mean) / y_std], dtype=torch.float)
+            pairs.append((lig, geo))
+        return pairs
+
+    train_pairs = make_pairs(train_examples)
+    test_pairs = make_pairs(test_examples)
+    if len(train_pairs) < 2 or len(test_pairs) < 1:
+        raise ValueError("Not enough valid pairs after building graphs.")
+
+    n_train = len(train_pairs)
+
+    def collate_pairs(batch):
+        from torch_geometric.data import Batch  # type: ignore
+        ligs, geos = zip(*batch)
+        return Batch.from_data_list(list(ligs)), Batch.from_data_list(list(geos))
+
+    train_loader = DataLoader(train_pairs, batch_size=batch_size, shuffle=True, collate_fn=collate_pairs)
+    test_loader = DataLoader(test_pairs, batch_size=batch_size, shuffle=False, collate_fn=collate_pairs)
+
+    # Infer feature dims from first example
+    sample_lig = train_pairs[0][0]
+    ligand_in_channels = sample_lig.x.shape[1]
+    ligand_edge_dim = sample_lig.edge_attr.shape[1] if sample_lig.edge_attr.numel() else 7
+
+    model = FusionAffinityNet.build(
+        ligand_in_channels=ligand_in_channels,
+        ligand_edge_dim=ligand_edge_dim,
+        hidden_channels=hidden_channels,
+        num_gine_layers=num_gine_layers,
+        num_geo_interactions=num_geo_interactions,
+        num_rbf=num_rbf,
+        cutoff=cutoff,
+        bayesian_hidden=bayesian_hidden or [256, 128],
+        prior_sigma=prior_sigma,
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+
+    model.train()
+    for epoch in range(epochs):
+        beta = kl_weight * min(1.0, (epoch + 1) / max(kl_warmup, 1))
+        for lig_batch, geo_batch in train_loader:
+            optimizer.zero_grad()
+            mu, log_var = model(lig_batch, geo_batch)
+            y = geo_batch.y.view(-1)
+            kl = model.kl()
+            # KL is scaled by the dataset size N (n_train), not the batch count,
+            # so the per-example NLL and KL stay on the same scale.
+            loss = elbo_loss(mu, log_var, y, kl, n_train=n_train,
+                             kl_weight=beta, aleatoric=not no_aleatoric)
+            loss.backward()
+            optimizer.step()
+
+    # Evaluation (MC sampling); predictions are rescaled back to affinity units
+    model.eval()
+    all_preds, all_truths = [], []
+    with torch.no_grad():
+        for lig_batch, geo_batch in test_loader:
+            pred_mean, _, _ = model.predict_with_uncertainty(
+                lig_batch, geo_batch, n_samples=mc_samples_eval
+            )
+            all_preds.extend((pred_mean.cpu().numpy() * y_std + y_mean).tolist())
+            all_truths.extend(
+                (geo_batch.y.view(-1).cpu().numpy() * y_std + y_mean).tolist()
+            )
+
+    metrics = {
+        "mae": float(mean_absolute_error(all_truths, all_preds)),
+        "r2": float(r2_score(all_truths, all_preds)),
+        "n_train": n_train,
+        "n_test": len(test_pairs),
+        # split provenance: any reported number carries the split it came from
+        "split_requested": split,
+        "split_used": split_used,
+        "split_report": split_report,
+    }
+
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), outdir / "model.pt")
+    (outdir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+    config = {
+        "hidden_channels": hidden_channels,
+        "num_gine_layers": num_gine_layers,
+        "num_geo_interactions": num_geo_interactions,
+        "num_rbf": num_rbf,
+        "cutoff": cutoff,
+        "bayesian_hidden": bayesian_hidden or [256, 128],
+        "prior_sigma": prior_sigma,
+        "ligand_in_channels": ligand_in_channels,
+        "ligand_edge_dim": ligand_edge_dim,
+        # target standardisation: affinity = y_mean + y_std * model_output
+        "standardize_target": standardize_target,
+        "y_mean": y_mean,
+        "y_std": y_std,
+        "split_requested": split,
+        "split_used": split_used,
+        "split_report": split_report,
+    }
+    (outdir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    return metrics

@@ -1,0 +1,21 @@
+name: Windows (MSVC)
+
+on: [push]
+
+jobs:
+    ci:
+        runs-on: windows-2022
+        steps:
+        - uses: actions/checkout@v4
+        - name: prepare
+          run: |
+            git submodule update --init --recursive
+        - name: cmake
+          run: |
+            cmake .
+        - name: build
+          run: |
+            cmake --build . --config Release -- /nologo /verbosity:minimal /maxcpucount:4
+        - name: test
+          run: |
+            ctest -C Release -R '^viamd_test$' --output-on-failure --no-tests=error

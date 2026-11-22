@@ -1,0 +1,157 @@
+//! Verify that Euler achieves O(h) and Heun achieves O(h^2) convergence.
+//!
+//! Uses dx/dt = -x with exact solution x(T) = x(0) * exp(-T).
+//! Runs at multiple step counts and checks the error decay rate.
+
+use flowmatch::ode::{integrate_fixed, OdeMethod};
+use ndarray::Array1;
+
+/// Solve dx/dt = -x from t=0 to t=1, return absolute error vs exact.
+fn error_at_steps(method: OdeMethod, steps: usize) -> f64 {
+    let x0 = Array1::from_vec(vec![1.0f32]);
+    let exact = (-1.0f32).exp();
+    let dt = 1.0f32 / (steps as f32);
+
+    let result = integrate_fixed(method, &x0, 0.0, dt, steps, |x, _t| {
+        Ok(Array1::from_vec(vec![-x[0]]))
+    })
+    .unwrap();
+
+    (result[0] - exact).abs() as f64
+}
+
+/// Estimate convergence order from errors at doubling step counts.
+///
+/// Returns the average of log2(err[i] / err[i+1]) across consecutive pairs.
+fn estimate_order(method: OdeMethod, step_counts: &[usize]) -> f64 {
+    let errors: Vec<f64> = step_counts
+        .iter()
+        .map(|&s| error_at_steps(method, s))
+        .collect();
+
+    let mut ratios = Vec::new();
+    for i in 0..errors.len() - 1 {
+        if errors[i + 1] > 1e-12 {
+            // When steps double, h halves. Order p means err(h/2) / err(h) ~ 2^{-p}.
+            let ratio = (errors[i] / errors[i + 1]).ln() / 2.0f64.ln();
+            ratios.push(ratio);
+        }
+    }
+
+    ratios.iter().sum::<f64>() / ratios.len() as f64
+}
+
+#[test]
+fn euler_achieves_first_order_convergence() {
+    // Doubling step counts: 10, 20, 40, 80, 160.
+    let steps = vec![10, 20, 40, 80, 160];
+    let order = estimate_order(OdeMethod::Euler, &steps);
+
+    assert!(
+        (0.85..1.15).contains(&order),
+        "Euler should be ~O(h^1), estimated order = {order:.3}"
+    );
+}
+
+#[test]
+fn heun_achieves_second_order_convergence() {
+    // Doubling step counts: 10, 20, 40, 80, 160.
+    let steps = vec![10, 20, 40, 80, 160];
+    let order = estimate_order(OdeMethod::Heun, &steps);
+
+    assert!(
+        (1.85..2.15).contains(&order),
+        "Heun should be ~O(h^2), estimated order = {order:.3}"
+    );
+}
+
+/// On the rotation dx/dt = -y, dy/dt = x, one Euler step multiplies the radius
+/// by exactly sqrt(1 + h^2) and one Heun step by sqrt(1 + h^4/4), so after n
+/// steps the radius is that factor to the n-th power. This is the claim the
+/// `ode_comparison` example prints.
+#[test]
+fn rotation_radius_grows_by_the_amplification_factor() {
+    let velocity = |x: &ndarray::ArrayView1<f32>, _t: f32| -> flowmatch::Result<Array1<f32>> {
+        Ok(Array1::from_vec(vec![-x[1], x[0]]))
+    };
+    let x0 = Array1::from_vec(vec![1.0f32, 0.0]);
+    let total_t = 2.0 * std::f64::consts::PI;
+    for steps in [10usize, 20, 50, 200] {
+        let h = total_t / steps as f64;
+        let cases = [
+            (OdeMethod::Euler, (1.0 + h * h).sqrt()),
+            (OdeMethod::Heun, (1.0 + h.powi(4) / 4.0).sqrt()),
+        ];
+        for (method, factor) in cases {
+            let x = integrate_fixed(method, &x0, 0.0, h as f32, steps, velocity).unwrap();
+            let radius = ((x[0] * x[0] + x[1] * x[1]) as f64).sqrt();
+            let expected = factor.powi(steps as i32);
+            assert!(
+                ((radius - expected) / expected).abs() < 1e-4,
+                "{method:?} steps={steps}: radius {radius} vs {expected}"
+            );
+        }
+    }
+}
+
+/// Same test on a second ODE to confirm rates are not problem-specific.
+///
+/// dx/dt = cos(t), x(0) = 0. Exact: x(T) = sin(T).
+fn error_cosine_at_steps(method: OdeMethod, steps: usize) -> f64 {
+    let x0 = Array1::from_vec(vec![0.0f32]);
+    let t_final = 1.0f32;
+    let exact = t_final.sin();
+    let dt = t_final / (steps as f32);
+
+    let result = integrate_fixed(method, &x0, 0.0, dt, steps, |_x, t| {
+        Ok(Array1::from_vec(vec![t.cos()]))
+    })
+    .unwrap();
+
+    (result[0] - exact).abs() as f64
+}
+
+#[test]
+fn euler_first_order_on_cosine_ode() {
+    let steps = [20, 40, 80, 160, 320];
+    let errors: Vec<f64> = steps
+        .iter()
+        .map(|&s| error_cosine_at_steps(OdeMethod::Euler, s))
+        .collect();
+
+    let mut ratios = Vec::new();
+    for i in 0..errors.len() - 1 {
+        if errors[i + 1] > 1e-12 {
+            ratios.push((errors[i] / errors[i + 1]).ln() / 2.0f64.ln());
+        }
+    }
+    let order = ratios.iter().sum::<f64>() / ratios.len() as f64;
+
+    assert!(
+        (0.85..1.15).contains(&order),
+        "Euler should be ~O(h^1) on cosine ODE, estimated order = {order:.3}"
+    );
+}
+
+#[test]
+fn heun_second_order_on_cosine_ode() {
+    // Keep step counts low to stay in the truncation-dominated regime (f32).
+    let steps = [5, 10, 20, 40, 80];
+    let errors: Vec<f64> = steps
+        .iter()
+        .map(|&s| error_cosine_at_steps(OdeMethod::Heun, s))
+        .collect();
+
+    let mut ratios = Vec::new();
+    for i in 0..errors.len() - 1 {
+        if errors[i + 1] > 1e-12 {
+            ratios.push((errors[i] / errors[i + 1]).ln() / 2.0f64.ln());
+        }
+    }
+    let order = ratios.iter().sum::<f64>() / ratios.len() as f64;
+
+    assert!(
+        (1.85..2.15).contains(&order),
+        "Heun should be ~O(h^2) on cosine ODE, estimated order = {order:.3}"
+    );
+}

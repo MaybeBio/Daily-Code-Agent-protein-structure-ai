@@ -1,0 +1,16 @@
+name: mbuild
+channels:
+  - conda-forge
+dependencies:
+  - ele
+  - numpy>=2.0,<2.6
+  - packmol>=20.15
+  - gmso>=0.16.2
+  - garnett
+  - parmed>=3.4.3
+  - pycifrw
+  - python>=3.11,<=3.14
+  - rdkit>=2021
+  - scipy
+  - networkx
+  - treelib

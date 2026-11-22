@@ -1,0 +1,1224 @@
+// Energy expressions.
+
+#include "mdir/Driver/Expression.h"
+#include "mdir/Dialect/MD/MDOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/Location.h"
+#include "llvm/Support/ErrorHandling.h"
+
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringSwitch.h"
+
+#include <functional>
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+
+using namespace mdir::driver;
+using llvm::StringRef;
+
+struct Expression::Node {
+  enum Kind { Number, Name, Negate, Add, Subtract, Multiply, Divide, Power,
+              Call };
+  Kind kind;
+  double number = 0.0;
+  /// The name of a value, or of a function.
+  std::string name;
+  std::unique_ptr<Node> lhs;
+  std::unique_ptr<Node> rhs;
+  /// The arguments of a function.
+  std::vector<std::unique_ptr<Node>> arguments;
+};
+
+Expression::Expression() = default;
+Expression::Expression(Expression &&) = default;
+Expression &Expression::operator=(Expression &&) = default;
+Expression::~Expression() = default;
+
+std::string mdir::driver::formatReal(double value) {
+  char buffer[64];
+  std::snprintf(buffer, sizeof(buffer), "%.17e", value);
+  return buffer;
+}
+
+/// The op that computes the function `name` of one argument, or an empty
+/// string.
+static StringRef getFunctionOp(StringRef name) {
+  return llvm::StringSwitch<StringRef>(name)
+      .Case("sqrt", "math.sqrt")
+      .Case("exp", "math.exp")
+      .Case("log", "math.log")
+      .Case("sin", "math.sin")
+      .Case("cos", "math.cos")
+      .Case("tan", "math.tan")
+      .Case("asin", "math.asin")
+      .Case("acos", "math.acos")
+      .Case("atan", "math.atan")
+      .Case("sinh", "math.sinh")
+      .Case("cosh", "math.cosh")
+      .Case("tanh", "math.tanh")
+      .Case("abs", "math.absf")
+      .Case("floor", "math.floor")
+      .Case("ceil", "math.ceil")
+      .Case("erf", "math.erf")
+      .Case("erfc", "math.erfc")
+      .Default("");
+}
+
+/// The number of arguments of the function `name`, or 0 if there is no
+/// such function. Those of the custom forces of OpenMM [Eastman2017] (D22).
+static unsigned getArity(StringRef name) {
+  if (!getFunctionOp(name).empty())
+    return 1;
+  return llvm::StringSwitch<unsigned>(name)
+      .Cases({"step", "delta", "square", "cube", "recip", "sec", "csc", "cot"},
+             1)
+      .Cases({"min", "max", "atan2"}, 2)
+      .Case("select", 3)
+      .Default(0);
+}
+
+bool Expression::isFunction(StringRef name) { return getArity(name) != 0; }
+
+/// Solves m[i-1] + 4 m[i] + m[i+1] = right[i] for i in [0, n), with
+/// m[-1] = m[n] = 0, by elimination.
+static std::vector<double> solveTridiagonal(std::vector<double> right) {
+  size_t n = right.size();
+  std::vector<double> diagonal(n, 4.0), m(n, 0.0);
+  for (size_t i = 1; i < n; ++i) {
+    double factor = 1.0 / diagonal[i - 1];
+    diagonal[i] -= factor;
+    right[i] -= factor * right[i - 1];
+  }
+  for (size_t i = n; i-- > 0;)
+    m[i] = (right[i] - (i + 1 < n ? m[i + 1] : 0.0)) / diagonal[i];
+  return m;
+}
+
+/// The second derivatives m of the cubic spline through `values` at the
+/// spacing h, from
+///   m[i-1] + 4 m[i] + m[i+1] = 6 (y[i-1] - 2 y[i] + y[i+1]) / h²:
+/// natural, m = 0 at both ends, or periodic, the indices of the n - 1
+/// intervals taken modulo n - 1, a cyclic system solved by the formula of
+/// Sherman and Morrison from two tridiagonal ones.
+static std::vector<double> getCurvatures(llvm::ArrayRef<double> values,
+                                         double h, bool periodic) {
+  size_t n = values.size();
+  auto curvature = [&](size_t before, size_t i, size_t after) {
+    return 6.0 * (values[before] - 2.0 * values[i] + values[after]) / (h * h);
+  };
+  std::vector<double> m(n, 0.0);
+  if (!periodic) {
+    std::vector<double> right;
+    for (size_t i = 1; i + 1 < n; ++i)
+      right.push_back(curvature(i - 1, i, i + 1));
+    std::vector<double> inner = solveTridiagonal(right);
+    std::copy(inner.begin(), inner.end(), m.begin() + 1);
+    return m;
+  }
+  // A = T + u vᵀ with T tridiagonal, u = (γ, 0, ..., 0, 1), and
+  // v = (1, 0, ..., 0, 1/γ), γ = -4, so that the corners of A are 1 and
+  // the first and last diagonal of T are 4 - γ and 4 - 1/γ.
+  size_t count = n - 1;
+  std::vector<double> right(count);
+  for (size_t i = 0; i != count; ++i)
+    right[i] = curvature((i + count - 1) % count, i, i + 1);
+  double gamma = -4.0;
+  auto solve = [&](std::vector<double> b) {
+    // T x = b, with the first and last diagonal changed.
+    std::vector<double> diagonal(count, 4.0), x(count, 0.0);
+    diagonal.front() -= gamma;
+    diagonal.back() -= 1.0 / gamma;
+    for (size_t i = 1; i < count; ++i) {
+      double factor = 1.0 / diagonal[i - 1];
+      diagonal[i] -= factor;
+      b[i] -= factor * b[i - 1];
+    }
+    for (size_t i = count; i-- > 0;)
+      x[i] = (b[i] - (i + 1 < count ? x[i + 1] : 0.0)) / diagonal[i];
+    return x;
+  };
+  std::vector<double> u(count, 0.0);
+  u.front() = gamma;
+  u.back() = 1.0;
+  std::vector<double> x = solve(right), z = solve(u);
+  double factor = (x.front() + x.back() / gamma) /
+                  (1.0 + z.front() + z.back() / gamma);
+  for (size_t i = 0; i != count; ++i)
+    m[i] = x[i] - factor * z[i];
+  m[count] = m[0];
+  return m;
+}
+
+/// The derivative of the spline of getCurvatures at each of its points:
+/// that of the interval that begins there, and of the last interval at the
+/// last point.
+static std::vector<double> getSlopes(llvm::ArrayRef<double> values, double h,
+                                     bool periodic) {
+  std::vector<double> m = getCurvatures(values, h, periodic);
+  size_t n = values.size();
+  std::vector<double> slopes(n);
+  for (size_t i = 0; i + 1 < n; ++i)
+    slopes[i] = (values[i + 1] - values[i]) / h - h * (2.0 * m[i] + m[i + 1]) / 6.0;
+  slopes[n - 1] = (values[n - 1] - values[n - 2]) / h +
+                  h * (m[n - 2] + 2.0 * m[n - 1]) / 6.0;
+  return slopes;
+}
+
+std::vector<double> TabulatedFunction::getCoefficients() const {
+  if (discrete)
+    return values;
+  unsigned dimensions = getNumArguments();
+  std::vector<double> h(dimensions);
+  for (unsigned k = 0; k != dimensions; ++k)
+    h[k] = (maxs[k] - mins[k]) / static_cast<double>(sizes[k] - 1);
+  if (dimensions == 1) {
+    // On [x_i, x_i + h], with t = (x - x_i) / h,
+    //   y = (1 - t) y_i + t y_i+1 + h²/6 (((1 - t)³ - (1 - t)) m_i + (t³ - t) m_i+1).
+    std::vector<double> m = getCurvatures(values, h[0], periodic);
+    std::vector<double> coefficients;
+    for (size_t i = 0; i + 1 < values.size(); ++i) {
+      double a = h[0] * h[0] / 6.0;
+      coefficients.push_back(values[i]);
+      coefficients.push_back(values[i + 1] - values[i] -
+                             a * (2.0 * m[i] + m[i + 1]));
+      coefficients.push_back(3.0 * a * m[i]);
+      coefficients.push_back(a * (m[i + 1] - m[i]));
+    }
+    return coefficients;
+  }
+
+  // The derivatives at the points of the grid along each set of axes, a
+  // bit of `mask` for each, as the continuous functions of two and three
+  // arguments of OpenMM take them [Eastman2017]: along one axis from the
+  // spline through the values on each line of the grid, and along more
+  // than one from the spline through those along fewer, in the order
+  // below, which the result depends on at the level of the error of the
+  // splines.
+  std::vector<unsigned> stride(dimensions, 1);
+  for (unsigned k = 1; k != dimensions; ++k)
+    stride[k] = stride[k - 1] * sizes[k - 1];
+  size_t total = values.size();
+  std::vector<std::vector<double>> derivatives(1u << dimensions);
+  derivatives[0] = values;
+  auto differentiate = [&](unsigned mask, unsigned axis, unsigned from) {
+    std::vector<double> &result = derivatives[mask];
+    result.assign(total, 0.0);
+    const std::vector<double> &source = derivatives[from];
+    for (size_t start = 0; start != total; ++start) {
+      if ((start / stride[axis]) % sizes[axis] != 0)
+        continue;
+      std::vector<double> line(sizes[axis]);
+      for (unsigned i = 0; i != sizes[axis]; ++i)
+        line[i] = source[start + i * stride[axis]];
+      std::vector<double> slopes = getSlopes(line, h[axis], periodic);
+      for (unsigned i = 0; i != sizes[axis]; ++i)
+        result[start + i * stride[axis]] = slopes[i];
+    }
+  };
+  // (mask, axis, from): ∂x, ∂y, ∂z, ∂x∂y = x of ∂y, ∂x∂z = z of ∂x,
+  // ∂y∂z = y of ∂z, ∂x∂y∂z = x of ∂y∂z.
+  static const unsigned order[][3] = {{1, 0, 0}, {2, 1, 0}, {4, 2, 0},
+                                      {3, 0, 2}, {5, 2, 1}, {6, 1, 4},
+                                      {7, 0, 6}};
+  for (const auto &[mask, axis, from] : order)
+    if (mask < derivatives.size())
+      differentiate(mask, axis, from);
+
+  // The patch of each cell: the product of the cubics of Hermite along the
+  // axes, which match the values, the derivatives along each axis, and the
+  // mixed ones at the corners, the bicubic of Press et al. and the
+  // tricubic of Lekien and Marsden [Press2007, Lekien2005]. Along an axis,
+  // the cubic of p0, p1 and of the derivatives d0, d1 times the spacing
+  // has the coefficients (p0, d0, 3 (p1 - p0) - 2 d0 - d1,
+  // 2 (p0 - p1) + d0 + d1); `hermite[a][q]` is the factor of the q-th of
+  // (p0, p1, d0, d1) in the coefficient of the power a.
+  static const double hermite[4][4] = {
+      {1, 0, 0, 0}, {0, 0, 1, 0}, {-3, 3, -2, -1}, {2, -2, 1, 1}};
+  unsigned columns = getColumns();
+  std::vector<unsigned> cells(dimensions);
+  size_t numCells = 1;
+  for (unsigned k = 0; k != dimensions; ++k) {
+    cells[k] = sizes[k] - 1;
+    numCells *= cells[k];
+  }
+  std::vector<double> coefficients(numCells * columns, 0.0);
+  for (size_t cell = 0; cell != numCells; ++cell) {
+    std::vector<unsigned> corner(dimensions);
+    for (size_t rest = cell, k = 0; k != dimensions; ++k) {
+      corner[k] = rest % cells[k];
+      rest /= cells[k];
+    }
+    // q[k] in 0..3 picks along axis k p0, p1, d0, or d1.
+    for (unsigned column = 0; column != columns; ++column) {
+      double sum = 0.0;
+      for (unsigned qs = 0; qs != columns; ++qs) {
+        double factor = 1.0;
+        unsigned mask = 0;
+        size_t point = 0;
+        for (unsigned k = 0; k != dimensions; ++k) {
+          unsigned a = (column >> (2 * k)) & 3, q = (qs >> (2 * k)) & 3;
+          factor *= hermite[a][q];
+          if (q >= 2) {
+            mask |= 1u << k;
+            factor *= h[k];
+          }
+          point += (corner[k] + (q & 1)) * stride[k];
+        }
+        if (factor != 0.0)
+          sum += factor * derivatives[mask][point];
+      }
+      coefficients[cell * columns + column] = sum;
+    }
+  }
+  return coefficients;
+}
+
+double Expression::Spline::evaluate(llvm::ArrayRef<double> arguments) const {
+  unsigned dimensions = getNumArguments();
+  std::vector<double> t(dimensions);
+  size_t row = 0, stride = 1;
+  for (unsigned k = 0; k != dimensions; ++k) {
+    double x = arguments[k];
+    double place;
+    if (discrete) {
+      place = std::min(std::max(std::floor(x + 0.5), 0.0),
+                       static_cast<double>(counts[k] - 1));
+    } else {
+      if (periodic)
+        x -= (maxs[k] - mins[k]) * std::floor((x - mins[k]) / (maxs[k] - mins[k]));
+      else if (x < mins[k] || x > maxs[k])
+        return 0.0;
+      double u = (x - mins[k]) * scales[k];
+      place = std::min(std::max(std::floor(u), 0.0),
+                       static_cast<double>(counts[k] - 1));
+      t[k] = u - place;
+    }
+    row += static_cast<size_t>(place) * stride;
+    stride *= counts[k];
+  }
+  unsigned columns = getColumns();
+  const double *c = &coefficients[row * columns];
+  if (discrete)
+    return c[0];
+  // Horner's rule along the last argument first.
+  std::function<double(unsigned, unsigned)> sum = [&](unsigned k,
+                                                      unsigned offset) {
+    double p = 0.0;
+    for (int a = 3; a >= 0; --a)
+      p = p * t[k] + (k == 0 ? c[offset + a]
+                             : sum(k - 1, offset + (a << (2 * k))));
+    return p;
+  };
+  return sum(dimensions - 1, 0);
+}
+
+namespace {
+
+class Parser {
+public:
+  Parser(StringRef text, std::vector<std::string> &names,
+         llvm::ArrayRef<TabulatedFunction> functions,
+         std::vector<std::string> &called)
+      : text(text), rest(text), names(names), functions(functions),
+        called(called) {}
+
+  llvm::Expected<std::unique_ptr<Expression::Node>> parse() {
+    auto node = parseSum();
+    if (!node)
+      return node;
+    skipSpace();
+    if (!rest.empty())
+      return fail("unexpected '" + rest.take_front(1) + "'");
+    return node;
+  }
+
+private:
+  using Result = llvm::Expected<std::unique_ptr<Expression::Node>>;
+
+  llvm::Error fail(const llvm::Twine &message) {
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(), "in the expression '%s', at %u: %s",
+        text.str().c_str(),
+        static_cast<unsigned>(text.size() - rest.size() + 1),
+        message.str().c_str());
+  }
+
+  void skipSpace() { rest = rest.ltrim(); }
+
+  bool consume(char c) {
+    skipSpace();
+    if (rest.empty() || rest.front() != c)
+      return false;
+    rest = rest.drop_front();
+    return true;
+  }
+
+  static std::unique_ptr<Expression::Node>
+  create(Expression::Node::Kind kind, std::unique_ptr<Expression::Node> lhs,
+         std::unique_ptr<Expression::Node> rhs = nullptr) {
+    auto node = std::make_unique<Expression::Node>();
+    node->kind = kind;
+    node->lhs = std::move(lhs);
+    node->rhs = std::move(rhs);
+    return node;
+  }
+
+  Result parseSum() {
+    auto first = parseProduct();
+    if (!first)
+      return first;
+    std::unique_ptr<Expression::Node> lhs = std::move(*first);
+    while (true) {
+      Expression::Node::Kind kind;
+      if (consume('+'))
+        kind = Expression::Node::Add;
+      else if (consume('-'))
+        kind = Expression::Node::Subtract;
+      else
+        return std::move(lhs);
+      auto rhs = parseProduct();
+      if (!rhs)
+        return rhs;
+      lhs = create(kind, std::move(lhs), std::move(*rhs));
+    }
+  }
+
+  Result parseProduct() {
+    auto first = parseUnary();
+    if (!first)
+      return first;
+    std::unique_ptr<Expression::Node> lhs = std::move(*first);
+    while (true) {
+      Expression::Node::Kind kind;
+      if (consume('*'))
+        kind = Expression::Node::Multiply;
+      else if (consume('/'))
+        kind = Expression::Node::Divide;
+      else
+        return std::move(lhs);
+      auto rhs = parseUnary();
+      if (!rhs)
+        return rhs;
+      lhs = create(kind, std::move(lhs), std::move(*rhs));
+    }
+  }
+
+  Result parseUnary() {
+    if (consume('-')) {
+      auto operand = parseUnary();
+      if (!operand)
+        return operand;
+      return create(Expression::Node::Negate, std::move(*operand));
+    }
+    if (consume('+'))
+      return parseUnary();
+    return parsePower();
+  }
+
+  // A power binds more tightly than a sign before it and takes a sign after
+  // it: -a^-b is -(a^(-b)).
+  Result parsePower() {
+    auto base = parsePrimary();
+    if (!base)
+      return base;
+    if (!consume('^'))
+      return base;
+    auto exponent = parseUnary();
+    if (!exponent)
+      return exponent;
+    return create(Expression::Node::Power, std::move(*base),
+                  std::move(*exponent));
+  }
+
+  Result parsePrimary() {
+    skipSpace();
+    if (rest.empty())
+      return fail("expected a number, a name, or '('");
+
+    if (consume('(')) {
+      auto inner = parseSum();
+      if (!inner)
+        return inner;
+      if (!consume(')'))
+        return fail("expected ')'");
+      return inner;
+    }
+
+    char first = rest.front();
+    if (llvm::isDigit(first) || first == '.') {
+      std::string digits = rest.str();
+      char *end = nullptr;
+      double value = std::strtod(digits.c_str(), &end);
+      if (end == digits.c_str())
+        return fail("expected a number");
+      rest = rest.drop_front(end - digits.c_str());
+      auto node = std::make_unique<Expression::Node>();
+      node->kind = Expression::Node::Number;
+      node->number = value;
+      return std::move(node);
+    }
+
+    if (llvm::isAlpha(first) || first == '_') {
+      StringRef name = rest.take_while(
+          [](char c) { return llvm::isAlnum(c) || c == '_'; });
+      rest = rest.drop_front(name.size());
+      if (consume('(')) {
+        unsigned arity = getArity(name);
+        const TabulatedFunction *tabulated = nullptr;
+        for (const TabulatedFunction &function : functions)
+          if (function.name == name)
+            tabulated = &function;
+        if (arity == 0 && tabulated) {
+          arity = tabulated->getNumArguments();
+          if (!llvm::is_contained(called, name))
+            called.push_back(name.str());
+        }
+        if (arity == 0)
+          return fail("unknown function '" + name + "'");
+        auto node = std::make_unique<Expression::Node>();
+        node->kind = Expression::Node::Call;
+        node->name = name.str();
+        do {
+          auto argument = parseSum();
+          if (!argument)
+            return argument;
+          node->arguments.push_back(std::move(*argument));
+        } while (consume(','));
+        if (!consume(')'))
+          return fail("expected ')' after the arguments of '" + name + "'");
+        if (node->arguments.size() != arity)
+          return fail("'" + name + "' takes " + llvm::Twine(arity) +
+                      " argument" + (arity == 1 ? "" : "s") + ", not " +
+                      llvm::Twine(node->arguments.size()));
+        return std::move(node);
+      }
+      auto node = std::make_unique<Expression::Node>();
+      node->kind = Expression::Node::Name;
+      node->name = name.str();
+      if (!llvm::is_contained(names, node->name))
+        names.push_back(node->name);
+      return std::move(node);
+    }
+    return fail("unexpected '" + rest.take_front(1) + "'");
+  }
+
+  StringRef text;
+  StringRef rest;
+  std::vector<std::string> &names;
+  llvm::ArrayRef<TabulatedFunction> functions;
+  /// The tabulated functions that the text calls.
+  std::vector<std::string> &called;
+};
+
+class IREmitter {
+public:
+  IREmitter(mlir::OpBuilder &builder, mlir::Location loc,
+            const llvm::StringMap<mlir::Value> &values,
+            const llvm::StringMap<mlir::Value> &tables,
+            const llvm::StringMap<const Expression::Node *> &definitions,
+            llvm::ArrayRef<Expression::Spline> splines)
+      : builder(builder), loc(loc), values(values), tables(tables),
+        definitions(definitions), splines(splines) {}
+
+  mlir::Value emit(const Expression::Node &node) {
+    using Node = Expression::Node;
+    switch (node.kind) {
+    case Node::Number:
+      return constant(node.number);
+    case Node::Name: {
+      if (values.count(node.name))
+        return values.lookup(node.name);
+      auto known = defined.find(node.name);
+      if (known != defined.end())
+        return known->second;
+      mlir::Value value = emit(*definitions.lookup(node.name));
+      defined[node.name] = value;
+      return value;
+    }
+    case Node::Negate: {
+      mlir::Value value = emit(*node.lhs);
+      return op("arith.negf", {value});
+    }
+    case Node::Add:
+      return binary("arith.addf", node);
+    case Node::Subtract:
+      return binary("arith.subf", node);
+    case Node::Multiply:
+      return binary("arith.mulf", node);
+    case Node::Divide:
+      return binary("arith.divf", node);
+    case Node::Call:
+      return call(node);
+    case Node::Power: {
+      mlir::Value base = emit(*node.lhs);
+      double exponent;
+      if (isWholeNumber(*node.rhs, exponent)) {
+        mlir::Value count = integer(static_cast<int64_t>(exponent));
+        return mlir::math::FPowIOp::create(builder, loc, base, count);
+      }
+      mlir::Value exponentValue = emit(*node.rhs);
+      return op("math.powf", {base, exponentValue});
+    }
+    }
+    llvm_unreachable("unknown expression node");
+  }
+
+  mlir::Value emitMagnitude(const Expression::Node &node) {
+    using Node = Expression::Node;
+    auto magnitude = [&](const Node &child) { return emitMagnitude(child); };
+    switch (node.kind) {
+    case Node::Name:
+      if (!values.count(node.name) && definitions.count(node.name))
+        return magnitude(*definitions.lookup(node.name));
+      break;
+    case Node::Negate:
+      return magnitude(*node.lhs);
+    case Node::Add:
+    case Node::Subtract:
+      return op("arith.addf", {magnitude(*node.lhs), magnitude(*node.rhs)});
+    case Node::Multiply:
+      return op("arith.mulf", {magnitude(*node.lhs), magnitude(*node.rhs)});
+    case Node::Divide:
+      return op("arith.divf", {magnitude(*node.lhs), op("math.absf", {emit(*node.rhs)})});
+    case Node::Power: {
+      mlir::Value base = magnitude(*node.lhs), power;
+      double exponent;
+      if (isWholeNumber(*node.rhs, exponent))
+        power = mlir::math::FPowIOp::create(builder, loc, base,
+            integer(static_cast<int64_t>(exponent)));
+      else
+        power = op("math.powf", {base, emit(*node.rhs)});
+      return op("arith.maxnumf", {op("math.absf", {emit(node)}), power});
+    }
+    default:
+      break;
+    }
+    return op("math.absf", {emit(node)});
+  }
+
+private:
+  using Value = mlir::Value;
+  Value constant(double value) {
+    return mlir::arith::ConstantOp::create(builder, loc,
+                                           builder.getF64FloatAttr(value));
+  }
+  Value integer(int64_t value) {
+    return mlir::arith::ConstantOp::create(builder, loc,
+                                           builder.getI32IntegerAttr(value));
+  }
+  Value compare(mlir::arith::CmpFPredicate predicate, Value x, Value y) {
+    return mlir::arith::CmpFOp::create(builder, loc, predicate, x, y);
+  }
+  Value select(Value condition, Value yes, Value no) {
+    return mlir::arith::SelectOp::create(builder, loc, condition, yes, no);
+  }
+  Value compareWithZero(mlir::arith::CmpFPredicate predicate, Value x,
+                        Value yes, Value no) {
+    Value zero = constant(0.0);
+    Value condition = compare(predicate, x, zero);
+    return select(condition, yes, no);
+  }
+  Value spline(const Expression::Spline &spline, std::vector<Value> x) {
+    using mlir::arith::CmpFPredicate;
+    unsigned dimensions = spline.getNumArguments();
+    Value zero = constant(0.0);
+    std::vector<Value> t(dimensions);
+    Value row, outside;
+    double stride = 1.0;
+    for (unsigned k = 0; k != dimensions; ++k) {
+      Value place;
+      if (spline.discrete) {
+        Value half = constant(0.5);
+        Value shifted = op("arith.addf", {x[k], half});
+        Value floored = op("math.floor", {shifted});
+        Value low = op("arith.maximumf", {floored, zero});
+        Value top = constant(spline.counts[k] - 1);
+        place = op("arith.minimumf", {low, top});
+      } else {
+        Value low = constant(spline.mins[k]);
+        if (spline.periodic) {
+          Value period = constant(spline.maxs[k] - spline.mins[k]);
+          Value distance = op("arith.subf", {x[k], low});
+          Value fraction = op("arith.divf", {distance, period});
+          Value turns = op("math.floor", {fraction});
+          Value offset = op("arith.mulf", {turns, period});
+          x[k] = op("arith.subf", {x[k], offset});
+        } else {
+          Value below = compare(CmpFPredicate::OLT, x[k], low);
+          Value high = constant(spline.maxs[k]);
+          Value above = compare(CmpFPredicate::OGT, x[k], high);
+          Value either = mlir::arith::OrIOp::create(builder, loc, below, above);
+          outside = outside ? mlir::arith::OrIOp::create(builder, loc, outside,
+                                                         either)
+                                  .getResult()
+                            : either;
+        }
+        Value distance = op("arith.subf", {x[k], low});
+        Value scale = constant(spline.scales[k]);
+        Value u = op("arith.mulf", {distance, scale});
+        Value floor = op("math.floor", {u});
+        Value lower = op("arith.maximumf", {floor, zero});
+        Value top = constant(spline.counts[k] - 1);
+        place = op("arith.minimumf", {lower, top});
+        t[k] = op("arith.subf", {u, place});
+      }
+      Value term = place;
+      if (k != 0) {
+        Value strideValue = constant(stride);
+        term = op("arith.mulf", {place, strideValue});
+      }
+      row = k == 0 ? term : op("arith.addf", {row, term});
+      stride *= spline.counts[k];
+    }
+    Value index =
+        mlir::arith::FPToSIOp::create(builder, loc, builder.getI32Type(), row);
+    auto lookup = [&](unsigned k) -> Value {
+      Value column = integer(k);
+      Value table = tables.lookup(spline.table);
+      if (auto memory = mlir::dyn_cast<mlir::MemRefType>(table.getType())) {
+        Value i = mlir::arith::IndexCastOp::create(builder, loc, builder.getIndexType(), index);
+        Value j = mlir::arith::IndexCastOp::create(builder, loc, builder.getIndexType(), column);
+        Value value = mlir::memref::LoadOp::create(builder, loc, table, mlir::ValueRange{i, j});
+        if (memory.getElementType().isF32())
+          value = mlir::arith::ExtFOp::create(builder, loc, builder.getF64Type(), value);
+        return value;
+      }
+      return mdir::md::LookupOp::create(builder, loc, builder.getF64Type(),
+                                        table,
+                                        mlir::ValueRange{index, column});
+    };
+    if (spline.discrete)
+      return lookup(0);
+    std::function<Value(unsigned, unsigned)> sum = [&](unsigned k,
+                                                       unsigned offset) {
+      Value p;
+      for (int a = 3; a >= 0; --a) {
+        Value c =
+            k == 0 ? lookup(offset + a) : sum(k - 1, offset + (a << (2 * k)));
+        if (!p) {
+          p = c;
+        } else {
+          Value product = op("arith.mulf", {p, t[k]});
+          p = op("arith.addf", {product, c});
+        }
+      }
+      return p;
+    };
+    Value p = sum(dimensions - 1, 0);
+    return outside ? select(outside, zero, p) : p;
+  }
+  Value call(const Expression::Node &node) {
+    using mlir::arith::CmpFPredicate;
+    StringRef name = node.name;
+    std::vector<Value> a;
+    for (const auto &argument : node.arguments)
+      a.push_back(emit(*argument));
+    for (const Expression::Spline &table : splines)
+      if (table.name == name)
+        return spline(table, a);
+    StringRef operation = getFunctionOp(name);
+    if (!operation.empty())
+      return op(operation, {a[0]});
+    if (name == "min")
+      return op("arith.minimumf", {a[0], a[1]});
+    if (name == "max")
+      return op("arith.maximumf", {a[0], a[1]});
+    if (name == "atan2")
+      return op("math.atan2", {a[0], a[1]});
+    if (name == "select")
+      return compareWithZero(CmpFPredicate::UNE, a[0], a[1], a[2]);
+    if (name == "step" || name == "delta") {
+      // Preserve the established argument-evaluation order of the text emitter.
+      Value no = constant(0.0);
+      Value yes = constant(1.0);
+      return compareWithZero(name == "step" ? CmpFPredicate::OGE
+                                            : CmpFPredicate::OEQ,
+                             a[0], yes, no);
+    }
+    if (name == "square")
+      return op("arith.mulf", {a[0], a[0]});
+    if (name == "cube") {
+      Value square = op("arith.mulf", {a[0], a[0]});
+      return op("arith.mulf", {square, a[0]});
+    }
+    Value one = constant(1.0);
+    if (name == "recip")
+      return op("arith.divf", {one, a[0]});
+    Value denominator = op(name == "sec"   ? "math.cos"
+                           : name == "csc" ? "math.sin"
+                                           : "math.tan",
+                           {a[0]});
+    return op("arith.divf", {one, denominator});
+  }
+  static bool isWholeNumber(const Expression::Node &node, double &value) {
+    const Expression::Node *inner = &node;
+    double sign = 1.0;
+    while (inner->kind == Expression::Node::Negate) {
+      sign = -sign;
+      inner = inner->lhs.get();
+    }
+    if (inner->kind != Expression::Node::Number)
+      return false;
+    value = sign * inner->number;
+    return value == std::floor(value) && std::fabs(value) < 1.0e6;
+  }
+  Value binary(StringRef operation, const Expression::Node &node) {
+    Value lhs = emit(*node.lhs);
+    Value rhs = emit(*node.rhs);
+    return op(operation, {lhs, rhs});
+  }
+  Value op(StringRef operation, std::initializer_list<Value> operands) {
+    llvm::ArrayRef<Value> a(operands);
+#define MDIR_EXPR_UNARY(NAME, TYPE)                                            \
+  if (operation == NAME)                                                       \
+    return TYPE::create(builder, loc, a[0]);
+#define MDIR_EXPR_BINARY(NAME, TYPE)                                           \
+  if (operation == NAME)                                                       \
+    return TYPE::create(builder, loc, a[0], a[1]);
+    MDIR_EXPR_UNARY("arith.negf", mlir::arith::NegFOp)
+    MDIR_EXPR_UNARY("math.sqrt", mlir::math::SqrtOp)
+    MDIR_EXPR_UNARY("math.exp", mlir::math::ExpOp)
+    MDIR_EXPR_UNARY("math.log", mlir::math::LogOp)
+    MDIR_EXPR_UNARY("math.sin", mlir::math::SinOp)
+    MDIR_EXPR_UNARY("math.cos", mlir::math::CosOp)
+    MDIR_EXPR_UNARY("math.tan", mlir::math::TanOp)
+    MDIR_EXPR_UNARY("math.asin", mlir::math::AsinOp)
+    MDIR_EXPR_UNARY("math.acos", mlir::math::AcosOp)
+    MDIR_EXPR_UNARY("math.atan", mlir::math::AtanOp)
+    MDIR_EXPR_UNARY("math.sinh", mlir::math::SinhOp)
+    MDIR_EXPR_UNARY("math.cosh", mlir::math::CoshOp)
+    MDIR_EXPR_UNARY("math.tanh", mlir::math::TanhOp)
+    MDIR_EXPR_UNARY("math.absf", mlir::math::AbsFOp)
+    MDIR_EXPR_UNARY("math.floor", mlir::math::FloorOp)
+    MDIR_EXPR_UNARY("math.ceil", mlir::math::CeilOp)
+    MDIR_EXPR_UNARY("math.erf", mlir::math::ErfOp)
+    MDIR_EXPR_UNARY("math.erfc", mlir::math::ErfcOp)
+    MDIR_EXPR_BINARY("arith.addf", mlir::arith::AddFOp)
+    MDIR_EXPR_BINARY("arith.subf", mlir::arith::SubFOp)
+    MDIR_EXPR_BINARY("arith.mulf", mlir::arith::MulFOp)
+    MDIR_EXPR_BINARY("arith.divf", mlir::arith::DivFOp)
+    MDIR_EXPR_BINARY("arith.minimumf", mlir::arith::MinimumFOp)
+    MDIR_EXPR_BINARY("arith.maximumf", mlir::arith::MaximumFOp)
+    MDIR_EXPR_BINARY("math.powf", mlir::math::PowFOp)
+    MDIR_EXPR_BINARY("math.atan2", mlir::math::Atan2Op)
+#undef MDIR_EXPR_BINARY
+#undef MDIR_EXPR_UNARY
+    llvm_unreachable("unknown expression operation");
+  }
+  mlir::OpBuilder &builder;
+  mlir::Location loc;
+  const llvm::StringMap<Value> &values;
+  const llvm::StringMap<Value> &tables;
+  const llvm::StringMap<const Expression::Node *> &definitions;
+  llvm::ArrayRef<Expression::Spline> splines;
+  llvm::StringMap<Value> defined;
+};
+} // namespace
+
+/// Adds the names that `node` uses to `used`.
+static void collectNames(const Expression::Node &node,
+                         llvm::StringSet<> &used) {
+  if (node.kind == Expression::Node::Name)
+    used.insert(node.name);
+  for (const auto *child : {node.lhs.get(), node.rhs.get()})
+    if (child)
+      collectNames(*child, used);
+  for (const auto &argument : node.arguments)
+    collectNames(*argument, used);
+}
+
+llvm::Expected<Expression>
+Expression::parse(StringRef text, llvm::ArrayRef<TabulatedFunction> functions) {
+  // The expression, then definitions of names after semicolons, as the
+  // custom forces of OpenMM write them: "k*d^2; d = r - r0".
+  llvm::SmallVector<StringRef> parts;
+  text.split(parts, ';');
+  Expression expression;
+  std::vector<std::string> used, called;
+  Parser parser(parts.front(), used, functions, called);
+  auto root = parser.parse();
+  if (!root)
+    return root.takeError();
+  expression.root = std::move(*root);
+  llvm::StringMap<const Node *> byName;
+  for (StringRef part : llvm::drop_begin(parts)) {
+    part = part.trim();
+    if (part.empty())
+      continue;
+    auto [name, body] = part.split('=');
+    name = name.trim();
+    auto fail = [&](const llvm::Twine &message) {
+      return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                     "in the expression '%s': %s",
+                                     text.str().c_str(),
+                                     message.str().c_str());
+    };
+    if (name.empty() || body.data() == nullptr ||
+        !(llvm::isAlpha(name.front()) || name.front() == '_') ||
+        !llvm::all_of(name, [](char c) { return llvm::isAlnum(c) || c == '_'; }))
+      return fail("expected 'name = expression' after ';', not '" + part +
+                  "'");
+    if (getArity(name) != 0 || byName.count(name) ||
+        llvm::any_of(functions,
+                     [&](const auto &function) { return function.name == name; }))
+      return fail("'" + name + "' is defined twice or is a function");
+    Parser definition(body, used, functions, called);
+    auto node = definition.parse();
+    if (!node)
+      return node.takeError();
+    byName[name] = node->get();
+    expression.definitions.push_back({name.str(), std::move(*node)});
+  }
+  // A definition may use names defined after it, but not itself: a search
+  // in depth marks a name 1 while it is on the path and 2 when it is done.
+  llvm::StringMap<int> mark;
+  std::function<bool(StringRef)> cyclic = [&](StringRef name) {
+    if (mark.lookup(name) == 1)
+      return true;
+    if (mark.lookup(name) == 2)
+      return false;
+    mark[name] = 1;
+    llvm::StringSet<> inner;
+    collectNames(*byName.lookup(name), inner);
+    for (const auto &entry : inner)
+      if (byName.count(entry.getKey()) && cyclic(entry.getKey()))
+        return true;
+    mark[name] = 2;
+    return false;
+  };
+  for (const auto &[name, node] : expression.definitions)
+    if (cyclic(name))
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "in the expression '%s': the definition of '%s' refers to itself",
+          text.str().c_str(), name.c_str());
+  for (const std::string &name : used)
+    if (!byName.count(name))
+      expression.names.push_back(name);
+  for (const std::string &name : called) {
+    const TabulatedFunction &function = *llvm::find_if(
+        functions, [&](const auto &f) { return f.name == name; });
+    Spline spline;
+    spline.name = name;
+    spline.table = function.getTableName();
+    spline.mins = function.mins;
+    spline.maxs = function.maxs;
+    spline.periodic = function.periodic;
+    spline.discrete = function.discrete;
+    for (unsigned k = 0; k != function.getNumArguments(); ++k) {
+      unsigned intervals = function.sizes[k] - 1;
+      spline.counts.push_back(function.discrete ? function.sizes[k]
+                                                : intervals);
+      spline.scales.push_back(
+          function.discrete ? 1.0
+                            : static_cast<double>(intervals) /
+                                  (function.maxs[k] - function.mins[k]));
+    }
+    spline.coefficients = function.getCoefficients();
+    expression.splines.push_back(std::move(spline));
+  }
+  return std::move(expression);
+}
+
+static double
+evaluateNode(const Expression::Node &node,
+             const llvm::StringMap<double> &values,
+             const llvm::StringMap<const Expression::Node *> &definitions,
+             llvm::ArrayRef<Expression::Spline> splines) {
+  using Node = Expression::Node;
+  switch (node.kind) {
+  case Node::Number:
+    return node.number;
+  case Node::Name:
+    if (!values.count(node.name) && definitions.count(node.name))
+      return evaluateNode(*definitions.lookup(node.name), values, definitions, splines);
+    return values.lookup(node.name);
+  case Node::Negate:
+    return -evaluateNode(*node.lhs, values, definitions, splines);
+  case Node::Add:
+    return evaluateNode(*node.lhs, values, definitions, splines) + evaluateNode(*node.rhs, values, definitions, splines);
+  case Node::Subtract:
+    return evaluateNode(*node.lhs, values, definitions, splines) - evaluateNode(*node.rhs, values, definitions, splines);
+  case Node::Multiply:
+    return evaluateNode(*node.lhs, values, definitions, splines) * evaluateNode(*node.rhs, values, definitions, splines);
+  case Node::Divide:
+    return evaluateNode(*node.lhs, values, definitions, splines) / evaluateNode(*node.rhs, values, definitions, splines);
+  case Node::Power:
+    return std::pow(evaluateNode(*node.lhs, values, definitions, splines),
+                    evaluateNode(*node.rhs, values, definitions, splines));
+  case Node::Call: {
+    std::vector<double> a;
+    for (const auto &argument : node.arguments)
+      a.push_back(evaluateNode(*argument, values, definitions, splines));
+    double x = a[0];
+    for (const Expression::Spline &spline : splines)
+      if (spline.name == node.name)
+        return spline.evaluate(a);
+    double y = a.size() > 1 ? a[1] : 0.0, z = a.size() > 2 ? a[2] : 0.0;
+    return llvm::StringSwitch<double>(node.name)
+        .Case("sqrt", std::sqrt(x))
+        .Case("exp", std::exp(x))
+        .Case("log", std::log(x))
+        .Case("sin", std::sin(x))
+        .Case("cos", std::cos(x))
+        .Case("tan", std::tan(x))
+        .Case("asin", std::asin(x))
+        .Case("acos", std::acos(x))
+        .Case("atan", std::atan(x))
+        .Case("sinh", std::sinh(x))
+        .Case("cosh", std::cosh(x))
+        .Case("tanh", std::tanh(x))
+        .Case("abs", std::fabs(x))
+        .Case("floor", std::floor(x))
+        .Case("ceil", std::ceil(x))
+        .Case("erf", std::erf(x))
+        .Case("erfc", std::erfc(x))
+        .Case("step", x >= 0.0 ? 1.0 : 0.0)
+        .Case("delta", x == 0.0 ? 1.0 : 0.0)
+        .Case("square", x * x)
+        .Case("cube", x * x * x)
+        .Case("recip", 1.0 / x)
+        .Case("sec", 1.0 / std::cos(x))
+        .Case("csc", 1.0 / std::sin(x))
+        .Case("cot", 1.0 / std::tan(x))
+        .Case("min", std::fmin(x, y))
+        .Case("max", std::fmax(x, y))
+        .Case("atan2", std::atan2(x, y))
+        .Case("select", x != 0.0 ? y : z)
+        .Default(std::nan(""));
+  }
+  }
+  return std::nan("");
+}
+
+/// Replaces in `node` every call of `function` of the name `argument` by
+/// the name `replacement`.
+static void replaceCalls(Expression::Node &node, StringRef function,
+                         StringRef argument, StringRef replacement) {
+  using Node = Expression::Node;
+  if (node.kind == Node::Call && node.name == function &&
+      node.arguments.size() == 1 &&
+      node.arguments.front()->kind == Node::Name &&
+      node.arguments.front()->name == argument) {
+    node.kind = Node::Name;
+    node.name = replacement.str();
+    node.arguments.clear();
+    return;
+  }
+  for (auto *child : {node.lhs.get(), node.rhs.get()})
+    if (child)
+      replaceCalls(*child, function, argument, replacement);
+  for (auto &child : node.arguments)
+    replaceCalls(*child, function, argument, replacement);
+}
+
+/// Appends to `names` the names that `node` uses, in the order of their
+/// first use, once each.
+static void appendNames(const Expression::Node &node,
+                        std::vector<std::string> &names) {
+  if (node.kind == Expression::Node::Name &&
+      !llvm::is_contained(names, node.name))
+    names.push_back(node.name);
+  for (const auto *child : {node.lhs.get(), node.rhs.get()})
+    if (child)
+      appendNames(*child, names);
+  for (const auto &child : node.arguments)
+    appendNames(*child, names);
+}
+
+void Expression::replaceCall(StringRef function, StringRef argument,
+                             StringRef replacement) {
+  replaceCalls(*root, function, argument, replacement);
+  for (auto &[name, node] : definitions)
+    replaceCalls(*node, function, argument, replacement);
+  // The names that the expression uses and does not define, again.
+  std::vector<std::string> used;
+  appendNames(*root, used);
+  for (const auto &[name, node] : definitions)
+    appendNames(*node, used);
+  names.clear();
+  for (const std::string &name : used)
+    if (llvm::none_of(definitions,
+                      [&](const auto &entry) { return entry.first == name; }))
+      names.push_back(name);
+}
+
+llvm::StringMap<const Expression::Node *> Expression::getDefinitions() const {
+  llvm::StringMap<const Node *> byName;
+  for (const auto &[name, node] : definitions)
+    byName[name] = node.get();
+  return byName;
+}
+
+double Expression::evaluate(const llvm::StringMap<double> &values) const {
+  return evaluateNode(*root, values, getDefinitions(), splines);
+}
+
+/// The value of `node` and the size of the terms that it sums (see
+/// Expression::evaluateMagnitude).
+static std::pair<double, double>
+magnitudeNode(const Expression::Node &node,
+              const llvm::StringMap<double> &values,
+              const llvm::StringMap<const Expression::Node *> &definitions,
+              llvm::ArrayRef<Expression::Spline> splines) {
+  using Node = Expression::Node;
+  auto both = [&](const Node &child) {
+    return magnitudeNode(child, values, definitions, splines);
+  };
+  switch (node.kind) {
+  case Node::Name:
+    if (!values.count(node.name) && definitions.count(node.name))
+      return both(*definitions.lookup(node.name));
+    break;
+  case Node::Negate: {
+    auto [a, size] = both(*node.lhs);
+    return {-a, size};
+  }
+  case Node::Add:
+  case Node::Subtract: {
+    auto [a, sa] = both(*node.lhs);
+    auto [b, sb] = both(*node.rhs);
+    return {node.kind == Node::Add ? a + b : a - b, sa + sb};
+  }
+  case Node::Multiply: {
+    auto [a, sa] = both(*node.lhs);
+    auto [b, sb] = both(*node.rhs);
+    return {a * b, sa * sb};
+  }
+  case Node::Divide: {
+    auto [a, sa] = both(*node.lhs);
+    double b = evaluateNode(*node.rhs, values, definitions, splines);
+    return {a / b, sa / std::fabs(b)};
+  }
+  case Node::Power: {
+    auto [a, sa] = both(*node.lhs);
+    double b = evaluateNode(*node.rhs, values, definitions, splines);
+    double value = std::pow(a, b);
+    return {value, std::fmax(std::fabs(value), std::pow(sa, b))};
+  }
+  default:
+    break;
+  }
+  double value = evaluateNode(node, values, definitions, splines);
+  return {value, std::fabs(value)};
+}
+
+double
+Expression::evaluateMagnitude(const llvm::StringMap<double> &values) const {
+  return magnitudeNode(*root, values, getDefinitions(), splines).second;
+}
+
+struct mdir::driver::ExpressionIR::Impl {
+  std::unique_ptr<Expression::Node> root;
+  std::vector<std::pair<std::string, std::unique_ptr<Expression::Node>>>
+      definitions;
+  std::vector<Expression::Spline> splines;
+};
+
+static std::unique_ptr<Expression::Node>
+cloneExpressionNode(const Expression::Node &node) {
+  auto result = std::make_unique<Expression::Node>();
+  result->kind = node.kind;
+  result->number = node.number;
+  result->name = node.name;
+  if (node.lhs)
+    result->lhs = cloneExpressionNode(*node.lhs);
+  if (node.rhs)
+    result->rhs = cloneExpressionNode(*node.rhs);
+  for (const auto &argument : node.arguments)
+    result->arguments.push_back(cloneExpressionNode(*argument));
+  return result;
+}
+
+ExpressionIR::ExpressionIR(std::shared_ptr<const Impl> state)
+    : state(std::move(state)) {}
+
+ExpressionIR Expression::prepareIR() const {
+  auto result = std::make_shared<ExpressionIR::Impl>();
+  result->root = cloneExpressionNode(*root);
+  for (const auto &[name, definition] : definitions)
+    result->definitions.emplace_back(name, cloneExpressionNode(*definition));
+  // IR construction needs grid geometry, not a second copy of its coefficient
+  // data.
+  for (const auto &source : splines) {
+    Spline geometry;
+    geometry.name = source.name;
+    geometry.table = source.table;
+    geometry.mins = source.mins;
+    geometry.maxs = source.maxs;
+    geometry.scales = source.scales;
+    geometry.counts = source.counts;
+    geometry.periodic = source.periodic;
+    geometry.discrete = source.discrete;
+    result->splines.push_back(std::move(geometry));
+  }
+  return ExpressionIR(std::move(result));
+}
+
+ExpressionIR::Inputs
+ExpressionIR::getInputs(llvm::ArrayRef<StringRef> supplied) const {
+  Inputs result;
+  llvm::StringSet<> provided, names, tables, visitedDefinitions;
+  for (StringRef name : supplied)
+    provided.insert(name);
+  llvm::StringMap<const Expression::Node *> definitions;
+  for (const auto &[name, definition] : state->definitions)
+    definitions[name] = definition.get();
+  std::function<void(const Expression::Node &)> visit =
+      [&](const Expression::Node &node) {
+        if (node.kind == Expression::Node::Name) {
+          if (provided.count(node.name) || !definitions.count(node.name)) {
+            if (names.insert(node.name).second)
+              result.names.push_back(node.name);
+          } else if (visitedDefinitions.insert(node.name).second) {
+            visit(*definitions.lookup(node.name));
+          }
+          return;
+        }
+        if (node.lhs)
+          visit(*node.lhs);
+        if (node.rhs)
+          visit(*node.rhs);
+        for (const auto &argument : node.arguments)
+          visit(*argument);
+        if (node.kind == Expression::Node::Call)
+          for (const auto &spline : state->splines)
+            if (spline.name == node.name && tables.insert(spline.table).second)
+              result.tables.push_back(spline.table);
+      };
+  visit(*state->root);
+  return result;
+}
+
+mlir::Value ExpressionIR::build(mlir::OpBuilder &builder,
+                                const llvm::StringMap<mlir::Value> &values,
+                                const llvm::StringMap<mlir::Value> &tables,
+                                StringRef termName) const {
+  llvm::StringMap<const Expression::Node *> definitions;
+  for (const auto &[name, definition] : state->definitions)
+    definitions[name] = definition.get();
+  mlir::Location loc = builder.getUnknownLoc();
+  if (!termName.empty())
+    loc = mlir::NameLoc::get(
+        builder.getStringAttr("control-file term: " + termName.str()),
+        builder.getUnknownLoc());
+  return IREmitter(builder, loc, values, tables, definitions, state->splines)
+      .emit(*state->root);
+}
+
+mlir::Value ExpressionIR::buildMagnitude(mlir::OpBuilder &builder,
+    const llvm::StringMap<mlir::Value> &values,
+    const llvm::StringMap<mlir::Value> &tables) const {
+  llvm::StringMap<const Expression::Node *> definitions;
+  for (const auto &[name, definition] : state->definitions)
+    definitions[name] = definition.get();
+  return IREmitter(builder, builder.getUnknownLoc(), values, tables,
+      definitions, state->splines).emitMagnitude(*state->root);
+}

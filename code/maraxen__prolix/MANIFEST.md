@@ -1,7 +1,7 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/maraxen/prolix
-- 快照日期: 2026-11-18
+- 快照日期: 2026-11-22
 - 快照 commit: [`5ce098d8c5ab`](https://github.com/maraxen/prolix/commit/5ce098d8c5ab52d921b4351fa305b910fb8fd0f9)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 

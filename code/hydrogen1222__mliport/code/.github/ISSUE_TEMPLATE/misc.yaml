@@ -1,0 +1,15 @@
+name: Question / Feature request
+description: Ask a question or propose a feature
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for general questions, feature requests, or usage help.
+  - type: textarea
+    id: body
+    attributes:
+      label: Your question or feature request
+      description: Please be specific.
+    validations:
+      required: true

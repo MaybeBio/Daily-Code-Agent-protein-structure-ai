@@ -1,0 +1,373 @@
+"""Flat option dataclasses for driver-family knobs (PottsMPNN, ProtonPottsMPNN and LASErMPNN)."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Literal
+
+
+@dataclass(frozen=True)
+class PottsMPNNOptions:
+  """PottsMPNN inference knobs. ``None`` on the spec means family defaults."""
+
+  optimization_mode: Literal["none", "potts", "potts_converge", "nodes"] = "potts"
+  optimization_temperature: float = 0.0
+  binding_energy_optimization: Literal["none", "both", "only"] = "none"
+  binding_energy_json: str | None = None
+  mean_norm: bool = False
+  mutant_fasta: str | None = None
+  mutant_csv: str | None = None
+  exclude_chains: str | None = None
+  pssm_json: str | None = None
+  pssm_threshold: float = 0.0
+  pssm_multi: float = 0.0
+  pssm_log_odds_flag: bool = False
+  pssm_bias_flag: bool = False
+  bias_by_res_json: str | None = None
+  tied_epistasis: bool = False
+  skip_gaps: bool = False
+  optimize_pdb: bool = False
+  optimize_fasta: str | None = None
+  emit_etab: bool = False
+  emit_dense_hJ: bool = False  # noqa: N815 -- upstream knob name
+  chain_design_mask_json: str | None = None
+
+
+@dataclass(frozen=True)
+class ProtonPottsOptions:
+  """ProtonPottsMPNN inference knobs. ``None`` on the spec means family defaults.
+
+  Residues are addressed as ``"<chain>:<number>"`` (``"A:42"``), or ``"<chain>:<number><insertion>"``
+  where the file carries an insertion code. A token is a v6 protonation token (``"HIS-P"``), a
+  one-letter standard residue, or ``"X"``.
+
+  Attributes:
+    protonation_labels_json: Path to a JSON object ``{"A:42": "HIS-P", ...}`` of pre-assigned
+      protonation labels for the reference structure (aminx consumes labels; it does not assign
+      them, spec §11a). ``None`` means no labels, so every residue is a standard residue.
+    variants_json: Path to a JSON object ``{name: variant}``. A variant is either pins applied on
+      top of the reference sequence, ``{"A:42": "HIS"}``, or a full per-residue token list whose
+      length is the number of residues kept after featurisation. ``score:ddg`` requires it;
+      ``score:energy`` scores the reference plus each variant.
+
+  The ``design_*`` / pH-design fields configure ``ph_config.PHDesignConfig`` (``design_method``
+  accepts ``block_descent`` or ``greedy_energy_block`` only; everything else is refused there).
+  ``binder_chain=None`` means no design chain was given, which design runs reject. ``dep_map=()``
+  means the family default map. ``explicit_centers`` requires ``center_types=()``.
+
+  Nested sequences are stored as tuples (``dep_map`` as ``((type, (deprotonated, ...)), ...)``,
+  ``explicit_centers`` as ``((residue_id, type), ...)``) so the options stay hashable: the spec holds
+  them as a static field. ``options_from_json_value`` only converts the top-level list fields, so
+  ``__post_init__`` normalises the nested lists that JSON decoding leaves behind.
+  """
+
+  protonation_labels_json: str | None = None
+  variants_json: str | None = None
+  binder_chain: str | None = None
+  design_method: str = "block_descent"
+  block_size: int = 3
+  combined_lambda: float = 0.3
+  temperature: float = 0.05
+  samples_per_site: int = 2
+  center_types: tuple[str, ...] = ("HIS-P", "ASP-P", "GLU-P")
+  explicit_centers: tuple[tuple[int, str], ...] = ()
+  dep_map: tuple[tuple[str, tuple[str, ...]], ...] = ()
+  forbidden_tokens: tuple[str, ...] = ("HIS-A", "ASP-A", "GLU-A", "UNK")
+  neighbour_k: int = 16
+  max_mutations: int = 20
+  infill_scope: str = "neighbourhood"
+  repetitive_window_weight: float = 1.0
+  repetitive_window_radius: int = 2
+  repetitive_window_parents: tuple[str, ...] = ("ARG", "LYS", "HIS", "ASP", "GLU")
+  block_max_rounds: int = 10
+  cv_patience: int = 3
+  cv_max: int = 50
+  record_trajectory: bool = True
+  # Block-descent knobs (debt 2621). ``sweep_order`` knn/energy are ported; the other four are
+  # exposed but block_descent refuses any non-default value with NotImplementedError until ported.
+  sweep_order: str = "position"
+  global_weight: float = 0.0
+  zscale_mode: str = "block"
+  adjacent_repeat_weight: float = 0.0
+  self_weight: float = 1.0
+
+  def __post_init__(self) -> None:
+    dep = self.dep_map.items() if isinstance(self.dep_map, Mapping) else self.dep_map
+    object.__setattr__(self, "dep_map", tuple((str(k), tuple(str(t) for t in v)) for k, v in dep))
+    object.__setattr__(
+      self,
+      "explicit_centers",
+      tuple((int(r), str(t)) for r, t in self.explicit_centers),
+    )
+    # Mirrors PHDesignConfig.__post_init__ so a bad value fails at options construction too.
+    if self.sweep_order not in ("position", "knn", "energy"):
+      raise ValueError(
+        f"Unknown sweep_order {self.sweep_order!r}. Use 'position', 'knn' or 'energy'.",
+      )
+    if self.zscale_mode not in ("single_mutation", "block"):
+      raise ValueError(
+        f"Unknown zscale_mode {self.zscale_mode!r}. Use 'single_mutation' or 'block'.",
+      )
+    if self.self_weight < 0:
+      raise ValueError(f"self_weight must be >= 0 (got {self.self_weight}).")
+
+
+@dataclass(frozen=True)
+class LaserOptions:
+  """LASErMPNN inference knobs. ``None`` on the spec means family defaults."""
+
+  fs_sequence_temp: float | None = None
+  chi_temp: float | None = None
+  seq_min_p: float = 0.0
+  chi_min_p: float = 0.0
+  disabled_residues: tuple[str, ...] = ("X", "C")
+  disable_charged_fs: bool = False
+  repack_only: bool = False
+  fix_from_bfactor: bool = False
+  ignore_ligand: bool = False
+  use_water: bool = False
+  noncanonical_aa_ligand: bool = False
+  ala_budget: int = 4
+  gly_budget: int = 0
+  constrain_ala_gly_to_exposed_non_ss: bool = False
+  budget_residue_selection: str | None = None
+  ignore_chain_mask_zeros: bool = False
+  tied_second_input: str | None = None
+  tied_interpolation_lambda: float = 0.0
+  selection_string: str | None = None
+  n_decoding_orders: int = 10
+  n_dropouts: int = 10
+  proofread_dropout: bool = True
+  repack_all: bool = False
+  strict_load: bool = True
+  output_fasta: bool = False
+  output_fasta_only: bool = False
+
+
+@dataclass(frozen=True)
+class CalibyOptions:
+  """Options for Caliby Potts and sidechain diffusion family execution.
+
+  Attributes
+  ----------
+  checkpoint_id : str | None
+    Caliby checkpoint identifier (e.g. ``"caliby"``, ``"soluble_caliby"``,
+    ``"caliby_distill"``, ``"caliby_packer_010"``). ``None`` defers to
+    ``RunSpecification.checkpoint_id``, then to ``caliby``; when both are set they must agree.
+    A packer identifier (``caliby_packer_000`` / ``010`` / ``030``) selects the sidechain packer.
+  ensemble_conformers : int
+    Number of Gaussian noise conformers whose Potts parameters are averaged
+    (read by the driver; ``1`` disables the ensemble).
+  ensemble_noise_std : float
+    Standard deviation in angstroms of the coordinate perturbation used to generate
+    each ensemble conformer (read by the driver; ``0.0`` disables the ensemble).
+  packer_step_scale : float
+    Heun step scale of the sidechain packer sampler, matching upstream
+    ``edm_sidechain_sample`` (``1.5``).
+  """
+
+  checkpoint_id: str | None = None
+  ensemble_conformers: int = 1
+  ensemble_noise_std: float = 0.0
+  omit_gap_penalty: float = 1e6
+  packer_num_steps: int = 25
+  packer_sigma_min: float = 0.002
+  packer_sigma_max: float = 80.0
+  packer_rho: float = 7.0
+  packer_s_churn: float = 0.0
+  packer_step_scale: float = 1.5
+
+
+@dataclass(frozen=True)
+class FAMPNNOptions:
+  """Options for Full-Atom MPNN (FAMPNN) family execution.
+
+  Every field mirrors a key of the upstream run configs (``~/repos/fampnn/configs/seq_design.yaml``;
+  ``pack.yaml`` and ``score.yaml`` share the ``scn_diffusion`` block); the line cited is
+  ``seq_design.yaml``. ``temperature`` and the number of samples live on the sampling spec
+  (``SamplingSpecification.temperature``, ``num_samples``), not here.
+
+  Attributes
+  ----------
+  checkpoint_id : str | None
+      FAMPNN checkpoint identifier. ``None`` defers to ``RunSpecification.checkpoint_id``, then to
+      ``fampnn_0_3``; when both are set they must agree. aminx-only (upstream takes ``checkpoint_path``).
+  num_seq_steps : int
+      ``timestep_schedule.num_steps`` (:25): masked-autoregressive sequence steps.
+  seq_timestep_mode : str
+      ``timestep_schedule.mode`` (:26): ``linear`` | ``square`` | ``cubic`` | ``sqrt`` | ``cbrt`` | ``cosine``.
+  seq_t_start, seq_t_end : float
+      ``timestep_schedule.t_start`` / ``t_end`` (:27-28).
+  num_scn_steps : int
+      ``scn_diffusion.num_steps`` (:32): EDM sidechain steps per denoiser call.
+  scn_timestep_mode : str
+      ``scn_diffusion.timestep_schedule.mode`` (:35).
+  scn_t_start, scn_t_end : float
+      ``scn_diffusion.timestep_schedule.t_start`` / ``t_end`` (:36-37).
+  step_scale : float
+      ``scn_diffusion.step_scale`` (:38): multiplies the Euler drift.
+  s_churn, s_noise, s_t_min, s_t_max : float
+      ``scn_diffusion.churn_cfg`` (:40-43): Karras stochastic churn. ``s_t_min`` / ``s_t_max`` are in
+      units of the checkpoint's ``sigma_data``; churn is off when ``s_churn == 0``.
+  seq_only : bool
+      ``seq_only`` (:19): reveal the sequence but not sidechains during design.
+  repack_last : bool
+      ``repack_last`` (:21): one final sidechain pack for the finished sequence.
+  psce_threshold : float | None
+      ``psce_threshold`` (:22): re-mask sidechains whose mean predicted sidechain error is above this;
+      ``None`` keeps all.
+  fixed_pos_seq, fixed_pos_scn : str
+      The two columns of upstream's ``fixed_pos_csv`` (:14-15) in its ``"A1-100,B5"`` syntax: positions
+      whose sequence (resp. sidechains) are held fixed to the input structure. aminx takes them as strings
+      applying to every input; upstream picks a row per PDB name.
+  """
+
+  checkpoint_id: str | None = None
+  num_seq_steps: int = 100
+  seq_timestep_mode: str = "linear"
+  seq_t_start: float = 0.0
+  seq_t_end: float = 1.0
+  num_scn_steps: int = 50
+  scn_timestep_mode: str = "linear"
+  scn_t_start: float = 0.0
+  scn_t_end: float = 1.0
+  step_scale: float = 1.5
+  s_churn: float = 0.0
+  s_noise: float = 1.0
+  s_t_min: float = 0.01
+  s_t_max: float = 50.0
+  seq_only: bool = False
+  repack_last: bool = True
+  psce_threshold: float | None = 0.3
+  fixed_pos_seq: str = ""
+  fixed_pos_scn: str = ""
+
+
+_FLOAT16_REFUSAL: str = (
+  "ThermoMPNN dtype='float16' fails the parity band and is refused unless you pass "
+  "allow_float16=True (ThermoMPNNOptions.allow_float16, or the allow_float16 argument of "
+  "ThermoMPNNDriver.score; spec files: thermompnn.allow_float16 = true). Evidence: v1 run "
+  "f12f3209 missed the 1.5e-2 band with 0.048; v2 run 18c1d29c ho1 d_ddg max-abs 0.3995 vs "
+  "tolerance 0.1499."
+)
+
+
+@dataclass(frozen=True)
+class ThermoMPNNOptions:
+  """Options for ThermoMPNN and ThermoMPNN-D stability prediction.
+
+  Attributes
+  ----------
+  checkpoint_id : str | None
+      Checkpoint or ensemble identifier (e.g. ``"thermo_mpnn_v1_default"``,
+      ``"thermo_mpnn_v2_ensemble"``, ``"thermo_mpnn_d_ensemble"``). ``None`` defers to
+      ``spec.checkpoint_id``, then to ``"thermo_mpnn_v1_default"``.
+  mode : Literal["single", "double"]
+      Single-mutant SSM (``"single"``) or double-mutant epistatic (``"double"``) mode.
+  distance_threshold : float
+      C-alpha distance cutoff (Angstroms) for epistatic residue pairs in double mode.
+  batch_size : int
+      Pair batch chunk size for ThermoMPNN-D double-mutant scoring.
+  dtype : Literal["float32", "float16"]
+      Floating-point precision for trunk and head evaluation. ``"float32"`` is the default.
+      ``"float16"`` is not validated for ThermoMPNN (see the driver module docstring): the
+      float16 parity gate failed on a 496-residue structure, and the error was observed to grow
+      with system size (mechanism not established). Float16 is for screening or ranking only,
+      and selecting it requires ``allow_float16=True``.
+  allow_float16 : bool
+      Explicit bypass for ``dtype="float16"``. Float16 fails the ThermoMPNN parity band (v1 run
+      f12f3209 missed 1.5e-2 with 0.048; v2 run 18c1d29c ho1 d_ddg 0.3995 vs 0.1499), so
+      ``dtype="float16"`` raises ``ValueError`` unless this is ``True``. A bypassed call still
+      emits a ``UserWarning``. Has no effect with ``dtype="float32"``.
+  ensemble : bool
+      Whether to average across all 3 v2 ensemble members when using v2/D.
+  """
+
+  checkpoint_id: str | None = None
+  mode: Literal["single", "double"] = "single"
+  distance_threshold: float = 5.0
+  batch_size: int = 10000
+  dtype: Literal["float32", "float16"] = "float32"
+  ensemble: bool = True
+  allow_float16: bool = False
+
+  def __post_init__(self) -> None:
+    """Reject unknown ``mode`` or ``dtype`` values at construction time."""
+    if self.mode not in ("single", "double"):
+      msg = f"Unknown ThermoMPNN mode {self.mode!r}. Use 'single' or 'double'."
+      raise ValueError(msg)
+    if self.dtype not in ("float32", "float16"):
+      msg = f"Unknown ThermoMPNN dtype {self.dtype!r}. Use 'float32' or 'float16'."
+      raise ValueError(msg)
+    if self.dtype == "float16" and not self.allow_float16:
+      raise ValueError(_FLOAT16_REFUSAL)
+
+
+@dataclass(frozen=True)
+class AntiBMPNNOptions:
+  """Options for AntiBMPNN design post-processing (descriptor scoring of a designed segment).
+
+  AntiBMPNN's sampling CLI (``Running_AntiBMPNN_run.py``) is the ProteinMPNN flag set and needs no
+  family options: the model is a ProteinMPNN-architecture checkpoint selected through
+  ``RunSpecification.checkpoint_id`` (``antibmpnn_v_48_000`` ...). The only AntiBMPNN-specific
+  logic upstream is ``helper_scripts/parsing_design_result.py``, which slices each design at
+  ``--start``/``--end`` (1-based, inclusive: ``seq[start-1:end]``, lines 8, 27-28) and reports the
+  ``peptides`` PD1/PD2 means and the Lehninger net charge at pH 7.4 (lines 49, 53).
+
+  Earlier revisions carried ``cdr_scheme``, ``heavy_chain_id``, ``light_chain_id``,
+  ``cdr_bias_weight``, ``checkpoint_id`` and ``compute_descriptors``. None has an upstream
+  counterpart (no CDR scheme, chain role or bias weight exists in the AntiBMPNN repository) and none
+  was read by any code path, so they were removed rather than relabelled.
+
+  Both fields default to ``None`` (whole sequence); upstream declares NO default for ``--start`` /
+  ``--end`` (parsing_design_result.py:90-91) and crashes on ``start_r -= 1`` (:8) when ``--start`` is
+  omitted, so the defaults are aminx's, not upstream's.
+
+  Attributes
+  ----------
+  descriptor_start : int | None
+      First residue of the scored segment, 1-based inclusive (upstream ``--start``). ``None``
+      scores from the first residue.
+  descriptor_end : int | None
+      Last residue of the scored segment, 1-based inclusive (upstream ``--end``). ``None``
+      scores to the last residue.
+  """
+
+  descriptor_start: int | None = None
+  descriptor_end: int | None = None
+
+
+@dataclass(frozen=True)
+class FrustraMPNNOptions:
+  """Options for FrustraMPNN local energetic frustration index scoring.
+
+  Attributes
+  ----------
+  checkpoint_id : str | None
+      Checkpoint identifier (default: "megascale_default_la-true_esm-False_split1").
+  chains : str | tuple[str, ...] | None
+      Target chains to evaluate (e.g. "A" or ("A", "B")). None evaluates all chains.
+  positions : str | tuple[int, ...] | None
+      Target residue positions (e.g. "1,2,3" or (1, 2, 3)). None evaluates all positions.
+  subtract_mut : bool
+      Whether to subtract the wild-type residue prediction score (default: False).
+  dtype : Literal["float32", "float64"]
+      Floating-point compute precision: "float32" (default) or "float64".
+  """
+
+  checkpoint_id: str | None = "megascale_default_la-true_esm-False_split1"
+  chains: str | tuple[str, ...] | None = None
+  positions: str | tuple[int, ...] | None = None
+  subtract_mut: bool = False
+  dtype: Literal["float32", "float64"] = "float32"
+
+  def __post_init__(self) -> None:
+    """Validate and normalize configuration parameters."""
+    if self.dtype not in ("float32", "float64"):
+      msg = f"Unknown FrustraMPNN dtype {self.dtype!r}. Use 'float32' or 'float64'."
+      raise ValueError(msg)
+    if isinstance(self.chains, list):
+      object.__setattr__(self, "chains", tuple(self.chains))
+    if isinstance(self.positions, list):
+      object.__setattr__(self, "positions", tuple(self.positions))

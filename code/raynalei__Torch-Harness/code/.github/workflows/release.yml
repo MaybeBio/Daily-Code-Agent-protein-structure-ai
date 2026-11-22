@@ -1,0 +1,190 @@
+name: Release version tag
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Validate and build once
+    if: github.repository == 'aurekaresearch/OpenDDE-Harness'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Require a release commit from main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: "3.12"
+
+      - name: Validate release metadata and render notes
+        run: >-
+          uv run --no-project --python 3.12 python scripts/render_release_notes.py
+          --tag "$GITHUB_REF_NAME" --output release/RELEASE_NOTES.md
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui-tui/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          npm ci --prefix ui-tui
+          uv sync --locked --extra dev --dev
+
+      - name: Test release source
+        run: |
+          make lint-python
+          uv run pytest -q
+          npm run lint --prefix ui-tui
+          npm run lint:rpc --prefix ui-tui
+          npm run type-check --prefix ui-tui
+          npm test --prefix ui-tui
+
+      - name: Build TUI and release distributions
+        run: |
+          npm run build --prefix ui-tui
+          uv build --out-dir release/packages --no-create-gitignore
+          uvx twine check --strict release/packages/*
+
+      - name: Verify distribution contents
+        run: |
+          python3 - <<'PY'
+          import configparser, glob, tarfile, zipfile
+          whl = sorted(glob.glob("release/packages/*.whl"))[-1]
+          archive = zipfile.ZipFile(whl)
+          names = archive.namelist()
+          bundles = ["entry.js", "model-service.js"]  # BUNDLES in hatch_build.py
+          shipped = [f"opendde_harness/ui-tui/dist/{b}" for b in bundles]
+          assert not any("node_modules" in n for n in names), "node_modules leaked into wheel"
+          ui = sorted(n for n in names if "ui-tui/" in n)
+          assert ui == sorted(shipped), f"unexpected ui-tui entries: {ui}"
+          entries = next(n for n in names if n.endswith(".dist-info/entry_points.txt"))
+          config = configparser.ConfigParser()
+          config.read_string(archive.read(entries).decode())
+          assert config["console_scripts"]["ddeharness"] == "opendde_harness.cli.commands:run", "ddeharness entry missing"
+          assert "ddehess" not in config["console_scripts"], "incorrect CLI entry present"
+          for name in ("compute_environment.json", "source_versions.env", "model-checksums.sha256", "esm-model-license.txt"):
+              assert f"opendde_harness/cli/{name}" in names, f"runtime preparation resource missing: {name}"
+          assert not any(n.startswith(("external/opendde/", "external/ligandmpnn/", "external/plip/", "external/foldmason/")) for n in names), "upstream checkout leaked into wheel"
+          assert not any(n.endswith((".pt", ".ckpt", ".safetensors")) for n in names), "model weights leaked into wheel"
+          with tarfile.open(glob.glob("release/packages/*.tar.gz")[0]) as sdist:
+              sdist_names = sdist.getnames()
+          assert any(n.count("/") == 1 and n.endswith("/CHANGELOG.md") for n in sdist_names), "CHANGELOG.md missing from sdist"
+          # uv builds the wheel from the sdist: a bundle missing here is missing
+          # from the wheel a `pip install <sdist>` produces.
+          for bundle in bundles:
+              assert any(n.endswith(f"/ui-tui/dist/{bundle}") for n in sdist_names), f"{bundle} missing from sdist"
+          print(f"OK: {whl} ships {', '.join(bundles)} and no node_modules; the sdist carries them and CHANGELOG.md")
+          PY
+
+      - name: Export locked constraints and checksums
+        run: |
+          uv export --locked --no-dev --no-hashes --no-emit-project -o release/opendde-harness-constraints.txt
+          (cd release/packages && sha256sum *) > release/SHA256SUMS
+
+      - name: Test installed wheel and sdist outside the checkout
+        env:
+          UV_LINK_MODE: copy
+        shell: bash
+        run: |
+          shopt -s nullglob
+          wheels=("$GITHUB_WORKSPACE"/release/packages/*.whl)
+          sdists=("$GITHUB_WORKSPACE"/release/packages/*.tar.gz)
+          if (( ${#wheels[@]} != 1 || ${#sdists[@]} != 1 )); then
+            echo "Expected exactly one wheel and one source archive" >&2
+            exit 1
+          fi
+          for kind in wheel sdist; do
+            if [[ "$kind" == wheel ]]; then
+              artifact="${wheels[0]}"
+            else
+              artifact="${sdists[0]}"
+            fi
+            export UV_TOOL_DIR="$RUNNER_TEMP/ddeharness-$kind/tools"
+            export UV_TOOL_BIN_DIR="$RUNNER_TEMP/ddeharness-$kind/bin"
+            uv tool install --python 3.12 -c "$GITHUB_WORKSPACE/release/opendde-harness-constraints.txt" "$artifact"
+            (
+              cd "$RUNNER_TEMP"
+              "$UV_TOOL_BIN_DIR/ddeharness" --version
+              "$UV_TOOL_BIN_DIR/ddeharness" --help
+              "$UV_TOOL_BIN_DIR/ddeharness" tui --check
+            )
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ github.ref_name }}
+          path: release
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-pypi:
+    name: Publish immutable PyPI files
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/p/opendde-harness
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-${{ github.ref_name }}
+          path: release
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: release/packages
+
+  github-release:
+    name: Create draft GitHub Release from the same build
+    needs: [build, publish-pypi]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-${{ github.ref_name }}
+          path: release
+      - name: Create draft GitHub Release with assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          tag="$GITHUB_REF_NAME"
+          ver="${tag#v}"
+          pre=()
+          if [[ "$ver" =~ (a|b|rc)[0-9]+$ ]]; then
+            pre=(--prerelease)
+          fi
+          existing=$(gh api "repos/$GH_REPO/releases?per_page=100" --jq "map(select(.tag_name==\"$tag\"))[0].id // empty")
+          if [ -z "$existing" ]; then
+            gh release create "$tag" release/packages/* release/opendde-harness-constraints.txt release/SHA256SUMS \
+              --verify-tag --title "OpenDDE Harness $ver" \
+              --notes-file release/RELEASE_NOTES.md --draft "${pre[@]}"
+          else
+            echo "Release $tag already exists; leaving it unchanged."
+          fi

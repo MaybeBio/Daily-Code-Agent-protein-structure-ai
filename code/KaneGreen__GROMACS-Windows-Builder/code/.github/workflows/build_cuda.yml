@@ -1,0 +1,97 @@
+name: build_cuda
+
+on:
+  push:
+    paths:
+      - .github/workflows/build_cuda.yml
+  workflow_dispatch: {}
+
+env:
+  gmxversion: "2026.4"
+  gmxcompileto: C:/FOSS/gromacs_264
+  dependhome: C:/FOSS/Dependencies
+  dependpath: C:/FOSS/Dependencies/vcpkg_installed/x64-windows
+
+jobs:
+  build:
+    runs-on: windows-2025
+    if: github.event.repository.owner.id == github.event.sender.id
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install FFTW, hwloc, OpenBLAS
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ${{ env.dependhome }}
+          Set-Location ${{ env.dependhome }}
+          vcpkg new --application
+          vcpkg add port fftw3[avx2,threads]
+          vcpkg add port hwloc
+          vcpkg add port openblas[threads]
+          vcpkg install --overlay-ports=${{ github.workspace }}\vcpkg_overlay
+          Get-ChildItem "${{ env.dependpath }}\bin"
+
+      - name: Install CUDA Toolkit
+        id: cuda-toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.3.1"
+      
+      - name: Copy BuildCustomizations
+        shell: pwsh
+        run: |
+          Copy-Item -Path "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}\extras\visual_studio_integration\MSBuildExtensions\*" -Destination "C:\Program Files\Microsoft Visual Studio\18\Enterprise\MSBuild\Microsoft\VC\v180\BuildCustomizations\" -Force
+          Copy-Item -Path "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}\extras\visual_studio_integration\MSBuildExtensions\*" -Destination "C:\Program Files\Microsoft Visual Studio\18\Enterprise\MSBuild\Microsoft\VC\v170\BuildCustomizations\" -Force
+          Get-ChildItem "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}\bin\x64"
+
+      - name: Download Gromacs
+        shell: bash
+        env:
+          gmxdownloadlink: https://ftp.gromacs.org/gromacs/gromacs-2026.4.tar.gz
+          gmxmd5hash: "fbe7d5071dee17e3f448502b1fd30d55"
+        run: |
+          curl --retry 10 -Lfo gromacs_src.tar.gz ${{ env.gmxdownloadlink }}
+          echo "${{ env.gmxmd5hash }}  gromacs_src.tar.gz" | md5sum -c
+          tar xf gromacs_src.tar.gz
+          cd gromacs-${{ env.gmxversion }}
+          patch -p1 < ../0001-fix-MSVC-error-C3615.patch
+
+      - name: Compile GROMACS CUDA
+        shell: cmd
+        run: |
+          cd gromacs-${{ env.gmxversion }}
+          mkdir build
+          cd build
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat" x64 -vcvars_ver=14.44
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_INSTALL_PREFIX=${{ env.gmxcompileto }}" "-DCMAKE_PREFIX_PATH=${{ env.dependpath }}" "-DGMX_GPU=CUDA" "-DGMX_SIMD=AVX2_256" "-DGMX_HWLOC=ON" ..
+          cmake --build .
+          cmake --install .
+          cd ..
+          cd ..
+          rd /S /Q gromacs-${{ env.gmxversion }}
+
+      - name: Checksum
+        shell: bash
+        run: |
+          echo "BUILDDATE=$(date '+%b%d')" >> $GITHUB_ENV
+          cd `cygpath "${{ env.gmxcompileto }}"/bin`
+          sha256sum gmx.exe | tee gmx.exe.sha256
+
+      - name: Copy DLLs, extra force fields and Test
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse -Path "extra_force_fields\charmm36*.ff" "${{ env.gmxcompileto }}\share\gromacs\top\"
+          Copy-Item -Force -Path "${{ steps.cuda-toolkit.outputs.CUDA_PATH }}\bin\x64\cufft64_*.dll" -Destination "${{ env.gmxcompileto }}\bin\"
+          Copy-Item -Force -Path "${{ env.dependpath }}\bin\*.dll" -Destination "${{ env.gmxcompileto }}\bin\"
+          Set-Location ${{ env.gmxcompileto }}\bin
+          Remove-Item -Force -Path fftw3l.dll,fftw3.dll
+          .\gmx.exe -version
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        if: ${{ success() }}
+        with:
+          name: GROMACS-${{ env.gmxversion }}_${{ env.BUILDDATE }}_GPU_Windows-AMD64-AVX2_CUDA1331_msvc
+          path: ${{ env.gmxcompileto }}

@@ -1,0 +1,1392 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for CuTe DSL dual GEMM kernels.
+
+* ``x0_x1`` variant: ``sigmoid(X0 @ W0.T [+ bias0]) * (X1 @ W1.T [+ bias1])``
+  -- two independent X tensors, with an optional fused masked residual.
+* ``x_x`` variant: configurable sigmoid or silu gate over two projections of
+  one shared X tensor, with an optional left-aligned mask and transposed output.
+"""
+
+import importlib
+import json
+import os
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from bionemo_ir._torch.custom_ops.dual_gemm_x0_x1 import (
+    DualGemmX0X1CuTe,
+    _invoke_cuequiv_dual_gemm_x0_x1,
+    _invoke_vanilla_dual_gemm_x0_x1,
+    get_cute_dual_gemm_x0_x1_residual_op,
+    get_dual_gemm_x0_x1_op,
+)
+from bionemo_ir._torch.custom_ops.dual_gemm_x0_x1 import cutedsl as dual_gemm_x0_x1_cutedsl
+from bionemo_ir._torch.custom_ops.dual_gemm_x0_x1 import ops as dual_gemm_x0_x1_ops
+from bionemo_ir._torch.custom_ops.dual_gemm_x_x import (
+    DualGemmXxCuTe,
+    _invoke_cuequiv_dual_gemm_x_x,
+    _invoke_vanilla_dual_gemm_x_x,
+    get_cute_dual_gemm_x_x_min_rows,
+    get_dual_gemm_x_x_op,
+)
+from bionemo_ir._torch.custom_ops.dual_gemm_x_x import _config as dual_gemm_x_x_config
+from bionemo_ir._torch.custom_ops.dual_gemm_x_x import cutedsl as dual_gemm_x_x_cutedsl
+from bionemo_ir._torch.custom_ops.dual_gemm_x_x import ops as dual_gemm_x_x_ops
+from bionemo_ir._torch.custom_ops.dual_gemm_x_x._cubin import DualGemmXxCubinExecutable
+from bionemo_ir._torch.utils.kernel import CuTeDSLKernelVariantUnavailable, load_kernel_configs
+from bionemo_ir._torch.utils.kernel import _cutedsl_kernel_library as library_runtime
+from tests._torch import (
+    SM_VERSION,
+    cutedsl_test_modes,
+    make_left_aligned_mask,
+    require_cubin_library,
+    skip_if_no_cutedsl,
+    skip_if_not_sm90,
+    skip_if_not_sm100_family,
+)
+
+_DUAL_GEMM_XX_SOURCE_MODULE = "bionemo_ir._torch.custom_ops.dual_gemm_x_x._source"
+_DUAL_GEMM_XX_TEST_MODES = cutedsl_test_modes(_DUAL_GEMM_XX_SOURCE_MODULE)
+_DUAL_GEMM_XX_MODE_CACHES: dict[str, dict] = {
+    "source": {},
+    "cubin": {},
+}
+
+
+@pytest.mark.parametrize(
+    ("channels", "hidden", "gate"),
+    [(128, 256, "sigmoid"), (256, 512, "sigmoid"), (384, 512, "sigmoid"), (128, 512, "silu")],
+)
+@pytest.mark.parametrize("transpose_out", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_x_x_arbitrary_mask_matches_dense_projection(
+    channels: int, hidden: int, gate: str, transpose_out: bool, dtype: torch.dtype
+) -> None:
+    """Interior gaps and empty samples preserve the dense gated projection."""
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    torch.manual_seed(17)
+    x = torch.randn(2, 7, 31, channels, device="cuda", dtype=dtype)
+    weights = [torch.randn(hidden, channels, device="cuda", dtype=dtype) / channels**0.5 for _ in range(2)]
+    biases = [torch.randn(hidden, device="cuda", dtype=dtype) * 0.1 for _ in range(2)]
+    mask = torch.rand(x.shape[:-1], device="cuda") > 0.4
+    mask[1] = False
+    original = x.clone()
+    operation = get_dual_gemm_x_x_op(dtype, N=hidden, K=channels, pair_mask_left_aligned=False, gate=gate)
+    with torch.inference_mode():
+        actual = operation(x, *weights, *biases, mask, transpose_out=transpose_out, gate=gate)
+        activation = torch.sigmoid if gate == "sigmoid" else torch.nn.functional.silu
+        expected = activation(torch.nn.functional.linear(x.float(), weights[0].float(), biases[0].float()))
+        expected *= torch.nn.functional.linear(x.float(), weights[1].float(), biases[1].float())
+        expected *= mask.unsqueeze(-1)
+        if transpose_out:
+            expected = expected.movedim(-1, 0)
+    torch.testing.assert_close(actual.float(), expected, atol=0.02, rtol=0.02)
+    masked = actual.movedim(0, -1) if transpose_out else actual
+    assert torch.count_nonzero(masked[~mask]) == 0
+    torch.testing.assert_close(x, original, rtol=0, atol=0)
+
+
+def test_x_x_arbitrary_mask_graph_refreshes_values() -> None:
+    """A replay reads updated masks rather than a captured prefix length."""
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    torch.manual_seed(19)
+    dtype = torch.bfloat16
+    x = torch.randn(2, 13, 17, 128, device="cuda", dtype=dtype)
+    weights = [torch.randn(256, 128, device="cuda", dtype=dtype) * 0.05 for _ in range(2)]
+    mask = torch.ones(x.shape[:-1], device="cuda", dtype=torch.bool)
+    operation = get_dual_gemm_x_x_op(dtype, N=256, K=128, pair_mask_left_aligned=False)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        for _ in range(3):
+            operation(x, *weights, mask=mask, transpose_out=True)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.inference_mode(), torch.cuda.graph(graph):
+        output = operation(x, *weights, mask=mask, transpose_out=True)
+    mask[:, :, 1::3] = False
+    mask[1] = False
+    with torch.inference_mode():
+        expected = operation(x, *weights, mask=mask, transpose_out=True)
+        x.masked_fill_(~mask.unsqueeze(-1), float("nan"))
+        graph.replay()
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert torch.count_nonzero(output.movedim(0, -1)[~mask]) == 0
+
+
+@pytest.mark.parametrize(("selected_sm", "device_sm"), [(80, 90), (90, 90), (100, 100), (103, 103), (107, 107)])
+def test_x_x_nullable_mask_reuses_one_source_kernel(
+    monkeypatch: pytest.MonkeyPatch, selected_sm: int, device_sm: int
+) -> None:
+    """Mask presence changes a pointer value, not the selected machine code."""
+    if SM_VERSION != device_sm:
+        pytest.skip(f"requires SM{device_sm} (current SM{SM_VERSION})")
+    if os.getenv("CUTEDSL_FORCE_CUBIN"):
+        pytest.skip("source-kernel reuse is covered in source mode")
+    monkeypatch.setattr(DualGemmXxCuTe, "_compiled_cache", {})
+    with monkeypatch.context() as capability:
+        capability.setattr(torch.cuda, "get_device_capability", lambda *_args, **_kwargs: divmod(selected_sm, 10))
+        operation = DualGemmXxCuTe()
+
+    torch.manual_seed(23)
+    dtype = torch.bfloat16
+    tokens, channels, hidden = 64, 128, 256
+    x = torch.randn(1, tokens, tokens, channels, device="cuda", dtype=dtype)
+    weights = [torch.randn(hidden, channels, device="cuda", dtype=dtype) * 0.05 for _ in range(2)]
+    lengths = torch.full((tokens,), tokens - 8, device="cuda", dtype=torch.int32)
+
+    unmasked = operation(x, *weights, transpose_out=True)
+    first_executable = operation._last_exe
+    masked = operation(x, *weights, actual_seqlen=lengths, transpose_out=True)
+
+    assert operation._last_exe is first_executable
+    expected_mask = torch.arange(tokens, device="cuda")[None, :] < lengths[:, None]
+    torch.testing.assert_close(
+        masked,
+        unmasked * expected_mask.reshape(1, tokens, tokens, 1).movedim(-1, 0),
+        atol=0,
+        rtol=0,
+    )
+
+
+def _configure_dual_gemm_x_x_mode(mode: str, monkeypatch) -> None:
+    """Force one x_x implementation without allowing silent fallback."""
+    monkeypatch.delenv("CUTEDSL_FORCE_CUBIN", raising=False)
+    monkeypatch.setattr(DualGemmXxCuTe, "_compiled_cache", _DUAL_GEMM_XX_MODE_CACHES[mode])
+
+    if mode == "cubin":
+        require_cubin_library()
+
+        try:
+            source_module = importlib.import_module("bionemo_ir._torch.custom_ops.dual_gemm_x_x._source")
+        except ImportError:
+            source_module = None
+        if source_module is not None:
+
+            def source_unavailable(_implementation):
+                raise ModuleNotFoundError("CuTeDSL source disabled by CUBIN test mode")
+
+            monkeypatch.setattr(source_module, "resolve_implementation", source_unavailable)
+        monkeypatch.setattr(library_runtime, "_kernel_library", None)
+        return
+
+    def reject_cubin_fallback(*_args, **_kwargs):
+        raise AssertionError("source test mode unexpectedly fell back to the CUBIN library")
+
+    monkeypatch.setattr(dual_gemm_x_x_cutedsl, "populate_compiled_cache_from_library", reject_cubin_fallback)
+
+
+def _skip_unless_cubin_has_x_x(
+    K: int,
+    N: int,
+    *,
+    transpose_out: bool = False,
+    has_bias: bool = True,
+    has_mask: bool = True,
+    bucket: int = 128,
+    gate: str = "sigmoid",
+) -> None:
+    """Skip cubin-mode tuned-shape cases until the artifact-only refresh lands."""
+    launcher = require_cubin_library().dual_gemm_x_x
+    try:
+        launcher.make_kernel_config(
+            SM_VERSION,
+            K,
+            N,
+            bucket,
+            launcher.DType.BFLOAT16,
+            transpose_out,
+            has_bias,
+            has_mask,
+            gate == "silu",
+        )
+    except ValueError:
+        pytest.skip(f"dual_gemm_x_x CUBIN corpus has no SM{SM_VERSION} K={K} N={N} yet")
+
+
+def _ref_x0_x1_dual_gemm(
+    X0: torch.Tensor,
+    X1: torch.Tensor,
+    W0: torch.Tensor,
+    W1: torch.Tensor,
+    bias0: torch.Tensor | None = None,
+    bias1: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reference implementation in fp32 for tight tolerance checks."""
+    d0 = torch.nn.functional.linear(X0.float(), W0.float(), bias0.float() if bias0 is not None else None)
+    d1 = torch.nn.functional.linear(X1.float(), W1.float(), bias1.float() if bias1 is not None else None)
+    return (d0.sigmoid() * d1).to(X0.dtype)
+
+
+def _ref_x_x_dual_gemm(
+    X: torch.Tensor,
+    W0: torch.Tensor,
+    W1: torch.Tensor,
+    bias0: torch.Tensor | None = None,
+    bias1: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+    transpose_out: bool = False,
+    gate: str = "sigmoid",
+) -> torch.Tensor:
+    """Reference implementation in fp32 for tight tolerance checks.
+
+    Mirrors :func:`bionemo_ir._torch.custom_ops.dual_gemm_x_x._invoke_vanilla_dual_gemm_x_x`
+    bit-for-bit (mask multiply, optional transpose) but in fp32.
+    """
+    d0 = torch.nn.functional.linear(X.float(), W0.float(), bias0.float() if bias0 is not None else None)
+    d1 = torch.nn.functional.linear(X.float(), W1.float(), bias1.float() if bias1 is not None else None)
+    gate_fn = torch.sigmoid if gate == "sigmoid" else torch.nn.functional.silu
+    ret = (gate_fn(d0) * d1).to(X.dtype)
+    if mask is not None:
+        ret = ret * mask.unsqueeze(-1)
+    if transpose_out:
+        ret = ret.moveaxis(-1, 0)
+    return ret.contiguous()
+
+
+@dataclass
+class Scenario:
+    K: int = 128
+    N: int = 128
+    seq_lens: list[int] = field(default_factory=lambda: [100, 123, 512, 1023, 1024])
+    has_bias: bool = False
+    has_mask: bool = False
+    transpose_out: bool = False
+    dtype: torch.dtype = torch.bfloat16
+    atol: float = 1e-2
+    rtol: float = 1e-2
+
+
+@pytest.mark.parametrize(
+    ("N", "K0", "K1"),
+    [(384, 384, 256)],
+    ids=["k0-384-k1-256-n-384"],
+)
+def test_x0_x1_asymmetric_dual_gemm(N: int, K0: int, K1: int):
+    """Asymmetric output gates keep independent pair/hidden K widths."""
+    skip_if_no_cutedsl("dual_gemm_x0_x1")
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    W0 = torch.randn(N, K0, device="cuda", dtype=dtype) * 0.1
+    W1 = torch.randn(N, K1, device="cuda", dtype=dtype) * 0.1
+    bias0 = torch.randn(N, device="cuda", dtype=dtype) * 0.1
+    bias1 = torch.randn(N, device="cuda", dtype=dtype) * 0.1
+
+    cute_op = DualGemmX0X1CuTe()
+    # Includes M smaller than one CTA, odd/non-square M tails, and batch > 1.
+    for leading_shape in ((1, 1, 1), (1, 32, 32), (1, 33, 35), (2, 3, 37)):
+        X0 = torch.randn(*leading_shape, K0, device="cuda", dtype=dtype) * 0.1
+        X1 = torch.randn(*leading_shape, K1, device="cuda", dtype=dtype) * 0.1
+        ref = _ref_x0_x1_dual_gemm(X0, X1, W0, W1, bias0, bias1)
+        out = cute_op(X0, X1, W0, W1, bias0, bias1)
+        torch.testing.assert_close(
+            out,
+            ref,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=lambda message, shape=leading_shape: f"leading_shape={shape}: {message}",
+        )
+
+
+@pytest.mark.parametrize(
+    ("N", "K"),
+    [(392, 256), (392, 384)],
+    ids=["n392-k256", "n392-k384"],
+)
+@pytest.mark.parametrize("transpose_out", [False, True], ids=["normal", "transposed"])
+@pytest.mark.parametrize("J", [35, 1537], ids=["odd-short", "odd-long-anchor"])
+def test_x_x_tuned_odd_rectangular_masked(
+    N: int,
+    K: int,
+    transpose_out: bool,
+    J: int,
+) -> None:
+    """Exercise odd M/J tails and per-row masks for both tuned widths."""
+    skip_if_no_cutedsl("dual_gemm_x_x")
+
+    torch.manual_seed(43)
+    dtype = torch.bfloat16
+    B, I = 2, 3
+    X = torch.randn(B, I, J, K, device="cuda", dtype=dtype) * 0.1
+    W0 = torch.randn(N, K, device="cuda", dtype=dtype) * 0.1
+    W1 = torch.randn(N, K, device="cuda", dtype=dtype) * 0.1
+    bias0 = torch.randn(N, device="cuda", dtype=dtype) * 0.1
+    bias1 = torch.randn(N, device="cuda", dtype=dtype) * 0.1
+
+    lengths = torch.tensor(
+        [[J, J - 1, J // 2], [1, 0, J - 7]],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    positions = torch.arange(J, device="cuda")
+    mask = positions < lengths.unsqueeze(-1)
+
+    ref = _ref_x_x_dual_gemm(X, W0, W1, bias0, bias1, mask=mask, transpose_out=transpose_out)
+    out = DualGemmXxCuTe()(
+        X, W0, W1, bias0=bias0, bias1=bias1, mask=mask, transpose_out=transpose_out, actual_seqlen=lengths
+    )
+    torch.testing.assert_close(
+        out,
+        ref,
+        atol=1e-2,
+        rtol=1e-2,
+        msg=lambda message: f"B={B}, I={I}, J={J}, N={N}, K={K}, transpose_out={transpose_out}: {message}",
+    )
+
+
+@pytest.mark.parametrize(("K", "N"), [(768, 1536), (384, 1536)], ids=["unit-cluster", "two-pair-cluster"])
+@pytest.mark.parametrize("has_bias", [False, True], ids=["bias0", "bias1"])
+@pytest.mark.parametrize("epi_n", [32, 64])
+def test_x_x_sliced_epilogue_matches_whole_tile(
+    K: int,
+    N: int,
+    has_bias: bool,
+    epi_n: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Storing each tile in column slices moves only the staging: bias, masked rows, and tails match bit for bit."""
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    skip_if_not_sm100_family()
+    monkeypatch.delenv("CUTEDSL_FORCE_CUBIN", raising=False)
+    name = dual_gemm_x_x_config.get_config_file_name(SM_VERSION, K=K, N=N)
+    bundle = json.loads((Path(dual_gemm_x_x_config._CONFIGS_DIR) / name).read_text())
+    assert bundle.get("kernel_variant") is None, "the resident kernel has no sliced epilogue"
+
+    torch.manual_seed(7)
+    dtype, device = torch.bfloat16, "cuda"
+    B, I, J = 1, 5, 461
+    X = torch.randn(B, I, J, K, device=device, dtype=dtype)
+    W0 = torch.randn(N, K, device=device, dtype=dtype) * 0.05
+    W1 = torch.randn(N, K, device=device, dtype=dtype) * 0.05
+    bias0 = torch.randn(N, device=device, dtype=dtype) if has_bias else None
+    bias1 = torch.randn(N, device=device, dtype=dtype) if has_bias else None
+    lengths = torch.tensor([[J, J - 1, J // 2, 1, 0]], device=device, dtype=torch.int32)
+    mask = torch.arange(J, device=device) < lengths.unsqueeze(-1)
+
+    def run(entry_update: dict) -> torch.Tensor:
+        folder = tmp_path / f"epi{entry_update.get('epi_n', 0)}"
+        folder.mkdir()
+        tuned = dict(bundle, configs={key: {**entry, **entry_update} for key, entry in bundle["configs"].items()})
+        (folder / name).write_text(json.dumps(tuned))
+        monkeypatch.setenv("BIOIR_TUNED_CONFIG_FOLDER", str(folder))
+        monkeypatch.setattr(DualGemmXxCuTe, "_compiled_cache", {})
+        load_kernel_configs.cache_clear()
+        try:
+            return DualGemmXxCuTe()(X, W0, W1, bias0=bias0, bias1=bias1, mask=mask, actual_seqlen=lengths, gate="silu")
+        finally:
+            load_kernel_configs.cache_clear()
+
+    whole = run({"epi_n": 0})
+    sliced = run({"epi_n": epi_n})
+    torch.testing.assert_close(sliced, whole, atol=0, rtol=0)
+    assert not sliced[0, 4].any()
+
+
+# ---------------------------------------------------------------------------
+# x_x variant -- single shared X, optional left-aligned mask + transpose_out
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sc",
+    [
+        # Plain (no mask, no bias) -- the canonical fast path.
+        Scenario(N=128, K=128, seq_lens=[100], dtype=torch.bfloat16),
+        Scenario(N=128, K=128, dtype=torch.bfloat16, has_bias=True),
+        Scenario(N=128, K=128, dtype=torch.float16),
+        Scenario(N=128, K=128, dtype=torch.float16, has_bias=True),
+        # Masked variants (left-aligned in flat I*J view so the kernel's flat
+        # `actual_seqlen[b] = mask.reshape(B, I*J).sum(-1)` predicate matches
+        # the vanilla `ret * mask.unsqueeze(-1)` reference bit-for-bit).
+        Scenario(N=128, K=128, dtype=torch.bfloat16, has_mask=True),
+        Scenario(N=128, K=128, dtype=torch.bfloat16, has_bias=True, has_mask=True),
+        Scenario(N=128, K=128, dtype=torch.float16, has_mask=True),
+        # Larger N path (most production trimul uses N=256).
+        Scenario(N=256, K=128, seq_lens=[100, 512], dtype=torch.bfloat16),
+        Scenario(N=256, K=128, seq_lens=[100, 512], dtype=torch.bfloat16, has_bias=True, has_mask=True),
+        # Boltz-2/OpenFold3 trimul: the S=128 anchor stays ping-pong, larger anchors run the resident kernel.
+        Scenario(N=256, K=128, seq_lens=[100, 384, 512], dtype=torch.bfloat16, transpose_out=True),
+        Scenario(
+            N=256, K=128, seq_lens=[100, 512], dtype=torch.bfloat16, has_bias=True, has_mask=True, transpose_out=True
+        ),
+        # ProtenixV2 trimul (c_z=256, hidden=256).
+        Scenario(N=512, K=256, seq_lens=[100, 256], dtype=torch.bfloat16),
+        Scenario(N=512, K=256, seq_lens=[100, 256], dtype=torch.bfloat16, has_mask=True),
+        Scenario(N=512, K=256, seq_lens=[100, 256], dtype=torch.bfloat16, transpose_out=True),
+        Scenario(N=512, K=256, seq_lens=[100, 256], dtype=torch.bfloat16, has_mask=True, transpose_out=True),
+        # The N=392 trimul input projections.
+        Scenario(N=392, K=256, seq_lens=[32], dtype=torch.bfloat16, has_bias=True, has_mask=True),
+        Scenario(N=392, K=256, seq_lens=[32], dtype=torch.bfloat16, has_bias=True, has_mask=True, transpose_out=True),
+        Scenario(N=392, K=384, seq_lens=[32], dtype=torch.bfloat16, has_bias=True, has_mask=True),
+        Scenario(N=392, K=384, seq_lens=[32], dtype=torch.bfloat16, has_bias=True, has_mask=True, transpose_out=True),
+        # Pair-512 × K=384 is tuned on all shipped SMs.
+        Scenario(N=512, K=384, seq_lens=[32], dtype=torch.bfloat16, has_bias=True, has_mask=True),
+        Scenario(N=512, K=384, seq_lens=[32], dtype=torch.bfloat16, has_bias=True, has_mask=True, transpose_out=True),
+        # The N=512, K=512 trimul input projection, tuned on all shipped SMs.
+        Scenario(N=512, K=512, seq_lens=[32], dtype=torch.bfloat16, has_bias=True, has_mask=True),
+        Scenario(N=512, K=512, seq_lens=[32], dtype=torch.bfloat16, has_bias=True, has_mask=True, transpose_out=True),
+        # transpose_out=True -- exercises the col-major output allocator.
+        Scenario(N=128, K=128, seq_lens=[100, 512], dtype=torch.bfloat16, transpose_out=True),
+        # M = B*I*J must be padded to a multiple of 8 for the CuTe epilogue.
+        Scenario(N=128, K=128, seq_lens=[123], dtype=torch.bfloat16, transpose_out=True),
+    ],
+    ids=[
+        "sc_N128_K128_b0_m0_bf16",
+        "sc_N128_K128_b1_m0_bf16",
+        "sc_N128_K128_b0_m0_fp16",
+        "sc_N128_K128_b1_m0_fp16",
+        "sc_N128_K128_b0_m1_bf16",
+        "sc_N128_K128_b1_m1_bf16",
+        "sc_N128_K128_b0_m1_fp16",
+        "sc_N256_K128_b0_m0_bf16",
+        "sc_N256_K128_b1_m1_bf16",
+        "sc_N256_K128_b0_m0_bf16_t1",
+        "sc_N256_K128_b1_m1_bf16_t1",
+        "sc_N512_K256_b0_m0_bf16",
+        "sc_N512_K256_b0_m1_bf16",
+        "sc_N512_K256_b0_m0_bf16_t1",
+        "sc_N512_K256_b0_m1_bf16_t1",
+        "sc_N392_K256_xx_t0",
+        "sc_N392_K256_xx_t1",
+        "sc_N392_K384_xx_t0",
+        "sc_N392_K384_xx_t1",
+        "sc_N512_K384_xx_t0",
+        "sc_N512_K384_xx_t1",
+        "sc_N512_K512_xx_t0",
+        "sc_N512_K512_xx_t1",
+        "sc_N128_K128_b0_m0_bf16_t1",
+        "sc_N128_K128_b0_m0_bf16_t1_m_unaligned",
+    ],
+)
+@pytest.mark.parametrize("cutedsl_mode", _DUAL_GEMM_XX_TEST_MODES, ids=lambda mode: f"impl-{mode}")
+def test_x_x_dual_gemm(sc: Scenario, cutedsl_mode: str, monkeypatch):
+    """Test CuTe DSL dual GEMM x_x against fp32 reference.
+
+    Covers the four call-site axes of :class:`DualGemmXxCuTe`:
+      * dtype: bf16 and fp16
+      * has_bias: optional ``[N]`` biases on both gates
+      * has_mask: left-aligned ``[B, I, J]`` row mask
+      * transpose_out: optional output transpose
+    """
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    if cutedsl_mode == "cubin":
+        _skip_unless_cubin_has_x_x(
+            sc.K, sc.N, transpose_out=sc.transpose_out, has_bias=sc.has_bias, has_mask=sc.has_mask
+        )
+    torch.manual_seed(42)
+    _configure_dual_gemm_x_x_mode(cutedsl_mode, monkeypatch)
+
+    cute_op = DualGemmXxCuTe()
+
+    W0 = torch.randn(sc.N, sc.K, dtype=sc.dtype, device="cuda")
+    W1 = torch.randn(sc.N, sc.K, dtype=sc.dtype, device="cuda")
+    bias0 = torch.randn(sc.N, dtype=sc.dtype, device="cuda") if sc.has_bias else None
+    bias1 = torch.randn(sc.N, dtype=sc.dtype, device="cuda") if sc.has_bias else None
+
+    for seq_len in sc.seq_lens:
+        X = torch.randn(1, seq_len, seq_len, sc.K, device="cuda").contiguous().to(sc.dtype)
+        if sc.has_mask:
+            # Left-aligned in the flat (B, I*J) view -- matches the kernel's
+            # `actual_seqlen[b]` semantics so the masked rows zero out
+            # identically in both reference and kernel.
+            flat = make_left_aligned_mask(1, seq_len * seq_len, dtype=sc.dtype, device="cuda")
+            mask = flat.reshape(1, seq_len, seq_len)
+        else:
+            mask = None
+
+        ref = _ref_x_x_dual_gemm(X, W0, W1, bias0, bias1, mask=mask, transpose_out=sc.transpose_out)
+        out = cute_op(X, W0, W1, bias0=bias0, bias1=bias1, mask=mask, transpose_out=sc.transpose_out)
+
+        torch.testing.assert_close(
+            out,
+            ref,
+            atol=sc.atol,
+            rtol=sc.rtol,
+            msg=lambda m, seq_len=seq_len: (
+                f"seq_len={seq_len}, has_bias={sc.has_bias}, "
+                f"has_mask={sc.has_mask}, transpose_out={sc.transpose_out}: "
+                f"{m}"
+            ),
+        )
+
+
+@pytest.mark.parametrize("cutedsl_mode", _DUAL_GEMM_XX_TEST_MODES, ids=lambda mode: f"impl-{mode}")
+def test_x_x_dual_gemm_actual_seqlen_overrides_mask(cutedsl_mode: str, monkeypatch):
+    """Pre-computed ``actual_seqlen`` should take precedence over ``mask``.
+
+    Asserts that passing a deliberately-wrong ``mask`` together with the
+    correct ``actual_seqlen`` still produces the same output as the
+    correct mask alone, confirming the wrapper short-circuits the
+    ``mask.sum(-1)`` reduction when ``actual_seqlen`` is supplied.
+    """
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    torch.manual_seed(42)
+    _configure_dual_gemm_x_x_mode(cutedsl_mode, monkeypatch)
+    if cutedsl_mode == "cubin":
+        _skip_unless_cubin_has_x_x(128, 128, has_bias=False, has_mask=True)
+
+    cute_op = DualGemmXxCuTe()
+
+    B, I, J, K, N = 1, 64, 64, 128, 128
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    W0 = torch.randn(N, K, dtype=dtype, device=device)
+    W1 = torch.randn(N, K, dtype=dtype, device=device)
+    X = torch.randn(B, I, J, K, device=device).contiguous().to(dtype)
+
+    flat_correct = make_left_aligned_mask(B * I, J, dtype=dtype, device=device)
+    mask_correct = flat_correct.reshape(B, I, J)
+    # actual_seqlen is per-row (the kernel collapses (B, I) into the
+    # leading batch dim, so kernel_B = B * I).
+    actual_seqlen = mask_correct.reshape(B * I, J).sum(-1).to(torch.int32)
+
+    # All-ones "wrong" mask -- would otherwise zero nothing.
+    mask_wrong = torch.ones(B, I, J, dtype=dtype, device=device)
+
+    out_with_mask = cute_op(X, W0, W1, mask=mask_correct)
+    out_with_seqlen = cute_op(X, W0, W1, mask=mask_wrong, actual_seqlen=actual_seqlen)
+
+    torch.testing.assert_close(out_with_seqlen, out_with_mask, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize(("N", "K"), [(256, 128), (512, 256)])
+@pytest.mark.parametrize("has_bias", [False, True], ids=["bias0", "bias1"])
+@pytest.mark.parametrize("cutedsl_mode", _DUAL_GEMM_XX_TEST_MODES, ids=lambda mode: f"impl-{mode}")
+def test_x_x_silu_gate_matches_fused_swiglu(N: int, K: int, has_bias: bool, cutedsl_mode: str, monkeypatch):
+    """The silu gate must be a fused SwiGLU, not just close to one.
+
+    ``FusedSwiGLU`` is the kernel this gate exists to absorb, so it is the
+    reference that matters. It reads a packed ``[x | gate]`` buffer and gates on
+    the second half, which is why ``W0`` -- the kernel's gate weight -- supplies
+    the *second* half here. Both are checked against the same fp32 reference
+    rather than each other, because they round differently: the dual GEMM keeps
+    the whole epilogue in fp32 and rounds once at the store, while FusedSwiGLU
+    rounds ``silu(gate)`` to the working dtype before multiplying. The kernel is
+    therefore expected to be at least as accurate, which the last assertion
+    pins down so a regression cannot hide behind a loose tolerance.
+    """
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    from bionemo_ir.dsl_kernels.triton.fused_swiglu import FusedSwiGLU
+
+    torch.manual_seed(42)
+    _configure_dual_gemm_x_x_mode(cutedsl_mode, monkeypatch)
+    if cutedsl_mode == "cubin":
+        _skip_unless_cubin_has_x_x(K, N, has_bias=has_bias, has_mask=False, gate="silu")
+
+    dtype, device = torch.bfloat16, "cuda"
+    cute_op = DualGemmXxCuTe()
+    W0 = torch.randn(N, K, dtype=dtype, device=device)
+    W1 = torch.randn(N, K, dtype=dtype, device=device)
+    bias0 = torch.randn(N, dtype=dtype, device=device) if has_bias else None
+    bias1 = torch.randn(N, dtype=dtype, device=device) if has_bias else None
+    X = torch.randn(1, 96, 96, K, device=device).contiguous().to(dtype)
+
+    out = cute_op(X, W0, W1, bias0=bias0, bias1=bias1, gate="silu")
+    ref = _ref_x_x_dual_gemm(X, W0, W1, bias0, bias1, gate="silu")
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+    a0 = torch.nn.functional.linear(X, W0, bias0)
+    a1 = torch.nn.functional.linear(X, W1, bias1)
+    swiglu = FusedSwiGLU(d=N, three_way=False, dtype=dtype)
+    packed = torch.cat([a1, a0], dim=-1).contiguous()
+    torch.testing.assert_close(out, swiglu(packed), atol=2e-2, rtol=2e-2)
+
+    ref_f32 = ref.float()
+    assert (out.float() - ref_f32).abs().max() <= (swiglu(packed).float() - ref_f32).abs().max()
+
+
+@pytest.mark.parametrize("gate", ["sigmoid", "silu"])
+@pytest.mark.parametrize("cutedsl_mode", _DUAL_GEMM_XX_TEST_MODES, ids=lambda mode: f"impl-{mode}")
+def test_x_x_gate_selects_distinct_math(gate: str, cutedsl_mode: str, monkeypatch):
+    """Each gate must produce its own activation, and sigmoid must not move.
+
+    The gate joins ``has_bias`` and ``has_mask`` as a compile axis, so a stale
+    cache entry or a dropped keyword would silently serve the other epilogue.
+    Comparing against the matching fp32 reference catches that in both
+    directions.
+    """
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    torch.manual_seed(0)
+    _configure_dual_gemm_x_x_mode(cutedsl_mode, monkeypatch)
+    if cutedsl_mode == "cubin":
+        _skip_unless_cubin_has_x_x(128, 256, has_bias=False, has_mask=False, gate=gate)
+
+    dtype, device = torch.bfloat16, "cuda"
+    N, K = 256, 128
+    cute_op = DualGemmXxCuTe()
+    W0 = torch.randn(N, K, dtype=dtype, device=device)
+    W1 = torch.randn(N, K, dtype=dtype, device=device)
+    X = torch.randn(1, 64, 64, K, device=device).contiguous().to(dtype)
+
+    out = cute_op(X, W0, W1, gate=gate)
+    torch.testing.assert_close(out, _ref_x_x_dual_gemm(X, W0, W1, gate=gate), atol=1e-2, rtol=1e-2)
+
+    other = "silu" if gate == "sigmoid" else "sigmoid"
+    assert not torch.allclose(out, _ref_x_x_dual_gemm(X, W0, W1, gate=other), atol=1e-2, rtol=1e-2)
+
+
+def test_x_x_rejects_unknown_gate(monkeypatch):
+    """An unsupported gate is a caller error, not a fallback to sigmoid."""
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    _configure_dual_gemm_x_x_mode("source", monkeypatch)
+
+    dtype, device = torch.bfloat16, "cuda"
+    W0 = torch.randn(128, 128, dtype=dtype, device=device)
+    W1 = torch.randn(128, 128, dtype=dtype, device=device)
+    X = torch.randn(1, 32, 32, 128, device=device).contiguous().to(dtype)
+
+    with pytest.raises(ValueError, match="gate"):
+        DualGemmXxCuTe()(X, W0, W1, gate="gelu")
+
+
+def test_x_x_rejects_silu_without_declared_tuning(monkeypatch):
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    _configure_dual_gemm_x_x_mode("source", monkeypatch)
+
+    dtype, device = torch.bfloat16, "cuda"
+    W0 = torch.randn(128, 128, dtype=dtype, device=device)
+    W1 = torch.randn(128, 128, dtype=dtype, device=device)
+    X = torch.randn(1, 32, 32, 128, device=device, dtype=dtype)
+
+    with pytest.raises(ValueError, match="No dual_gemm x_x silu tuning"):
+        DualGemmXxCuTe()(X, W0, W1, gate="silu")
+
+
+def test_x_x_rank3_uses_sequence_length_for_tuning_bucket(monkeypatch):
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    op = DualGemmXxCuTe()
+    captured = None
+
+    def capture_variant(variant, _x):
+        nonlocal captured
+        captured = variant
+        return object()
+
+    monkeypatch.setattr(op, "_get_bucket_ranges", lambda *_args: [(128, "S=128|t=0"), (512, "S=512|t=0")])
+    monkeypatch.setattr(op, "_get_executable", capture_variant)
+    # A source executable launches through the source module, which builds the
+    # nullable-mask host pointers a source-free build cannot import.
+    monkeypatch.setattr(
+        dual_gemm_x_x_cutedsl,
+        "load_source_module",
+        lambda *_args: SimpleNamespace(launch_dual_gemm_x_x_source=lambda *_a, **_kw: None),
+    )
+
+    dtype = torch.bfloat16
+    x = torch.empty(1, 500, 128, device="cuda", dtype=dtype)
+    weight = torch.empty(128, 128, device="cuda", dtype=dtype)
+    op(x, weight, weight)
+
+    assert captured is not None
+    assert captured.bucket == 512
+
+
+def _fake_source(kernel_cls: type, **tile_params: object) -> SimpleNamespace:
+    """A resolved source with only the fields the disk cache key reads."""
+    return SimpleNamespace(
+        kernel=kernel_cls(),
+        config=SimpleNamespace(tile_params={"bias_n": 1536, "mma_tiler": [128, 128, 64], **tile_params}),
+    )
+
+
+class _StreamingKernel:
+    """Stands in for one source kernel class."""
+
+
+class _ResidentKernel:
+    """Stands in for another source kernel class."""
+
+
+def test_x_x_disk_cache_key_separates_kernels_and_tiles() -> None:
+    """The cache directory fingerprints kernel sources only, so the key must carry the selected tile."""
+    backend = DualGemmXxCuTe()
+    variant = dual_gemm_x_x_cutedsl._DualGemmXxVariant(torch.bfloat16, 768, 1536, 256, False, False, True, "silu")
+
+    key = backend._disk_cache_key(variant, _fake_source(_StreamingKernel, cluster_n=2))
+
+    assert key == backend._disk_cache_key(variant, _fake_source(_StreamingKernel, cluster_n=2))
+    assert key != backend._disk_cache_key(variant, _fake_source(_StreamingKernel, cluster_n=1))
+    assert key != backend._disk_cache_key(variant, _fake_source(_ResidentKernel, cluster_n=2))
+
+
+def test_x_x_retuned_tile_compiles_instead_of_loading_the_old_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A config-only retune with unchanged sources must not load the kernel cached for the old tile."""
+    backend = DualGemmXxCuTe()
+    disk: dict = {}
+    compiled: list[object] = []
+    monkeypatch.setattr(DualGemmXxCuTe, "_compiled_cache", {})
+    monkeypatch.setattr(backend, "load_from_cache", disk.get)
+    monkeypatch.setattr(backend, "save_to_cache", disk.__setitem__)
+
+    def compile_source(*_args: object, **_kwargs: object) -> object:
+        compiled.append(object())
+        return compiled[-1]
+
+    source_module = SimpleNamespace(compile_dual_gemm_x_x_source=compile_source)
+    variant = dual_gemm_x_x_cutedsl._DualGemmXxVariant(torch.bfloat16, 768, 1536, 256, False, False, True, "silu")
+
+    first = backend._load_or_compile_source(variant, source_module, _fake_source(_StreamingKernel, cluster_n=2))
+    DualGemmXxCuTe._compiled_cache.clear()
+    reloaded = backend._load_or_compile_source(variant, source_module, _fake_source(_StreamingKernel, cluster_n=2))
+    retuned = backend._load_or_compile_source(variant, source_module, _fake_source(_StreamingKernel, cluster_n=1))
+
+    assert reloaded is first
+    assert retuned is not first
+    assert len(compiled) == 2
+
+
+@pytest.mark.parametrize("public_call", [False, True], ids=["lookup", "call"])
+def test_x_x_memory_cache_tracks_the_selected_source(monkeypatch: pytest.MonkeyPatch, public_call: bool) -> None:
+    """A changed tile or kernel must replace both shared and per-instance executables."""
+    monkeypatch.delenv("CUTEDSL_FORCE_CUBIN", raising=False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    monkeypatch.setattr(DualGemmXxCuTe, "_compiled_cache", {})
+    monkeypatch.setattr(DualGemmXxCuTe, "load_from_cache", lambda *_args: None)
+    monkeypatch.setattr(DualGemmXxCuTe, "save_to_cache", lambda *_args: None)
+    monkeypatch.setattr(DualGemmXxCuTe, "_uses_resident_kernel", lambda *_args: False)
+    monkeypatch.setattr(DualGemmXxCuTe, "_kernel_is_sm90", lambda *_args: False)
+    compiled: list[object] = []
+    launched: list[object] = []
+
+    def compile_source(*_args: object, **_kwargs: object) -> object:
+        compiled.append(object())
+        return compiled[-1]
+
+    def launch_source(executable: object, **_kwargs: object) -> None:
+        launched.append(executable)
+
+    source_module = SimpleNamespace(
+        compile_dual_gemm_x_x_source=compile_source, launch_dual_gemm_x_x_source=launch_source
+    )
+    selected = _fake_source(_StreamingKernel, cluster_n=2)
+    monkeypatch.setattr(dual_gemm_x_x_cutedsl, "load_source_module", lambda *_args: source_module)
+    monkeypatch.setattr(DualGemmXxCuTe, "_resolve_source_kernel", lambda *_args: (source_module, selected))
+    backend = DualGemmXxCuTe()
+    x = torch.empty(1, 32, 128, dtype=torch.bfloat16)
+    weight = torch.empty(256, 128, dtype=torch.bfloat16)
+    variant = dual_gemm_x_x_cutedsl._DualGemmXxVariant(x.dtype, 128, 256, 32, False, False, False)
+
+    def run(operation: DualGemmXxCuTe) -> object:
+        if public_call:
+            operation(x, weight, weight)
+            return launched[-1]
+        return operation._get_executable(variant, x)
+
+    first = run(backend)
+    assert run(backend) is first
+    selected = _fake_source(_StreamingKernel, cluster_n=1)
+    retuned = run(backend)
+    assert retuned is not first
+    assert run(DualGemmXxCuTe()) is retuned
+    selected = _fake_source(_ResidentKernel, cluster_n=1)
+    resident = run(backend)
+    assert resident is not retuned
+    selected = _fake_source(_StreamingKernel, cluster_n=2)
+    assert run(backend) is first
+    assert len(compiled) == 3
+
+
+@pytest.mark.parametrize(("declared", "expected"), [(None, 0), (0, 0), (4096, 4096)])
+def test_x_x_min_rows_reads_the_bundle(tmp_path: Path, declared: int | None, expected: int) -> None:
+    bundle = {"kernel_abi": "sm100", "gates": ["silu"], "configs": {}}
+    if declared is not None:
+        bundle["min_rows"] = declared
+    path = tmp_path / f"K8_N8_sm100_{declared}.json"
+    path.write_text(json.dumps(bundle))
+    assert dual_gemm_x_x_config._declared_min_rows(str(path)) == expected
+
+
+@pytest.mark.parametrize("declared", [-1, True, "4096", 1.5])
+def test_x_x_min_rows_rejects_a_non_count(tmp_path: Path, declared: int | bool | str | float) -> None:
+    path = tmp_path / f"K8_N8_sm100_{declared!r}.json"
+    path.write_text(json.dumps({"kernel_abi": "sm100", "min_rows": declared, "configs": {}}))
+    with pytest.raises(ValueError, match="min_rows"):
+        dual_gemm_x_x_config._declared_min_rows(str(path))
+
+
+@pytest.mark.parametrize("sm", [80, 86, 89, 90, 100, 103, 107])
+def test_x_x_token_swiglu_min_rows_ships_only_on_blackwell(sm: int) -> None:
+    """Only the SM100 family measured the dual GEMM losing to the unfused path on small token MLPs; SM107 keeps SM103's
+    threshold."""
+    min_rows = dual_gemm_x_x_config.get_min_rows(sm, 768, 1536)
+    assert (min_rows > 0) == (sm in (100, 103, 107))
+
+
+def test_x_x_min_rows_is_zero_off_the_tuned_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dual_gemm_x_x_ops, "get_sm_version", lambda: 120)
+    assert get_cute_dual_gemm_x_x_min_rows(K=768, N=1536) == 0
+
+
+def test_x_x_cubin_adapter_rejects_an_unimplemented_gate_before_the_library():
+    """A gate no image can carry must fail before any library work.
+
+    The registry selects on the gate, so an unknown one would otherwise reach
+    the launcher as a plain lookup miss and be reported as a missing shape.
+    Refusing up front keeps a source-free build's error about the gate, which
+    is why this passes ``None`` for both the library and the launcher: reaching
+    either would raise ``AttributeError`` instead.
+    """
+    with pytest.raises(CuTeDSLKernelVariantUnavailable, match="gate"):
+        DualGemmXxCubinExecutable(
+            None,
+            None,
+            90,
+            K=128,
+            N=512,
+            bucket=512,
+            dtype=torch.bfloat16,
+            transpose_out=False,
+            has_bias=False,
+            runtime_mask=False,
+            gate="gelu",
+        )
+
+
+@pytest.mark.parametrize(("gate", "is_silu"), [("sigmoid", False), ("silu", True)])
+def test_x_x_cubin_adapter_forwards_gate_axis_to_launcher(gate: str, is_silu: bool):
+    class FakeDType:
+        FLOAT16 = 0
+        BFLOAT16 = 1
+
+    class FakeLauncher:
+        DType = FakeDType
+
+        def __init__(self):
+            self.args = None
+
+        def make_kernel_config(self, *args):
+            self.args = args
+            return object()
+
+    launcher = FakeLauncher()
+    DualGemmXxCubinExecutable(
+        None,
+        launcher,
+        90,
+        K=128,
+        N=512,
+        bucket=512,
+        dtype=torch.bfloat16,
+        transpose_out=False,
+        has_bias=False,
+        runtime_mask=False,
+        gate=gate,
+    )
+
+    assert launcher.args is not None
+    assert launcher.args[-1] is is_silu
+
+
+# ---------------------------------------------------------------------------
+# ProtenixV2 (N, K) dispatcher coverage
+#
+# x_x ``(512, 256)`` is tuned on every dual_gemm_x_x SM and x0_x1
+# ``(256, 256)`` on SM80/SM86/SM89/SM90. On those SMs the dispatcher must
+# select the CuTe path; elsewhere it must fall back (vanilla / cuequiv) rather
+# than try to load a missing JSON.
+# ---------------------------------------------------------------------------
+
+
+def test_x_x_protenix_shape_dispatches_cute_on_tuned_sms():
+    """Protenix ``(N=512, K=256)`` must hit CuTeDSL on every tuned SM."""
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    op = get_dual_gemm_x_x_op(torch.bfloat16, N=512, K=256)
+    assert op.__name__ == "_invoke_cute_dual_gemm_x_x"
+
+
+# Both released checkpoints share a trimul hidden width of 196: the upstream
+# trunk builds ``PairReprUpdate`` without forwarding ``tri_mult_c``, so the
+# module default wins and the configured value (256, or the 2026-07-22 release
+# YAML's ``25`` typo) never reaches the layer.  ``N = 2 * 196`` for the fused
+# input projection; ``K`` is the checkpoint's pair width.
+@pytest.mark.parametrize(("N", "K"), [(392, 256), (392, 384), (512, 384)])
+def test_x_x_tuned_shapes_dispatch_cute_on_supported_sms(N: int, K: int):
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    op = get_dual_gemm_x_x_op(torch.bfloat16, N=N, K=K, pair_mask_left_aligned=True)
+    assert op.__name__ == "_invoke_cute_dual_gemm_x_x"
+
+
+def test_x_x_pair_swiglu_shape_is_reachable_only_through_the_silu_gate():
+    """``(N=512, K=128)`` is a SwiGLU-only admission, not a general one.
+
+    The shape has tuned silu coverage on every dual_gemm_x_x SM. Admitting it
+    for sigmoid too would move trimul callers of that width onto a backend
+    nobody measured them on, so the dispatcher must keep the old answer there.
+    """
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    silu = get_dual_gemm_x_x_op(torch.bfloat16, N=512, K=128, gate="silu")
+    assert silu.__name__ == "_invoke_cute_dual_gemm_x_x"
+    sigmoid = get_dual_gemm_x_x_op(torch.bfloat16, N=512, K=128, gate="sigmoid")
+    assert sigmoid.__name__ != "_invoke_cute_dual_gemm_x_x"
+
+
+@pytest.mark.parametrize("cutedsl_mode", _DUAL_GEMM_XX_TEST_MODES, ids=lambda mode: f"impl-{mode}")
+def test_x_x_pair_swiglu_shape_matches_reference(cutedsl_mode: str, monkeypatch):
+    """The K128_N512 tiles must compute the admitted SwiGLU."""
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    _configure_dual_gemm_x_x_mode(cutedsl_mode, monkeypatch)
+    if cutedsl_mode == "cubin":
+        _skip_unless_cubin_has_x_x(128, 512, has_bias=False, has_mask=False, bucket=256, gate="silu")
+    torch.manual_seed(0)
+    N, K, S = 512, 128, 256
+    X = torch.randn(1, S, S, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    W0 = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.1
+    W1 = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.1
+
+    op = get_dual_gemm_x_x_op(torch.bfloat16, N=N, K=K, gate="silu")
+    out = op(X, W0, W1, gate="silu")
+    assert out.shape == (1, S, S, N)
+    torch.testing.assert_close(out, _ref_x_x_dual_gemm(X, W0, W1, gate="silu"), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("K", "N"),
+    [
+        (64, 128),
+        (64, 256),
+        (128, 256),
+        (128, 512),
+        (256, 512),
+        (256, 1024),
+        (384, 768),
+        (384, 1536),
+        (768, 1536),
+    ],
+)
+def test_x_x_model_swiglu_shapes_dispatch_cute_on_supported_sms(K: int, N: int):
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    op = get_dual_gemm_x_x_op(torch.bfloat16, N=N, K=K, gate="silu")
+    assert op.__name__ == "_invoke_cute_dual_gemm_x_x"
+
+
+def test_x0_x1_protenix_plain_shape_uses_only_shipped_abi():
+    """Plain Protenix output uses cuEquivariance, not residual-only CUBINs."""
+    skip_if_no_cutedsl("dual_gemm_x0_x1")
+    op = get_dual_gemm_x0_x1_op(torch.bfloat16, N=256, K=256)
+    assert op is _invoke_cuequiv_dual_gemm_x0_x1
+
+
+@pytest.mark.parametrize("sm", [80, 86, 89, 90, 100, 103, 107])
+def test_x_x_z12_shape_dispatches_cute_on_tuned_sms(monkeypatch: pytest.MonkeyPatch, sm: int) -> None:
+    monkeypatch.setattr(dual_gemm_x_x_ops, "get_sm_version", lambda: sm)
+    op = get_dual_gemm_x_x_op(torch.bfloat16, N=512, K=512, gate="sigmoid")
+    assert op.__name__ == "_invoke_cute_dual_gemm_x_x"
+
+
+@pytest.mark.parametrize("sm", [80, 86, 89, 90, 100, 103, 107])
+@pytest.mark.parametrize(
+    ("N", "K0", "K1", "expected"),
+    [
+        (64, 64, 64, _invoke_cuequiv_dual_gemm_x0_x1),
+        (128, 128, 128, _invoke_cuequiv_dual_gemm_x0_x1),
+        (256, 128, 128, _invoke_cuequiv_dual_gemm_x0_x1),
+        (384, 384, 256, _invoke_vanilla_dual_gemm_x0_x1),
+        (512, 512, 256, _invoke_vanilla_dual_gemm_x0_x1),
+    ],
+)
+def test_x0_x1_plain_calls_fallback_on_residual_only_sms(
+    monkeypatch: pytest.MonkeyPatch,
+    sm: int,
+    N: int,
+    K0: int,
+    K1: int,
+    expected: Callable,
+) -> None:
+    monkeypatch.setattr(dual_gemm_x0_x1_ops, "get_sm_version", lambda: sm)
+    assert get_dual_gemm_x0_x1_op(torch.bfloat16, N=N, K0=K0, K1=K1) is expected
+
+
+@pytest.mark.parametrize("sm", [80, 86, 89, 90, 100, 103, 107])
+@pytest.mark.parametrize(
+    ("N", "K0", "K1"),
+    [(256, 256, 196), (256, 256, 200), (384, 384, 196), (384, 384, 200)],
+)
+def test_x0_x1_removed_trimul_shapes_dispatch_vanilla(
+    monkeypatch: pytest.MonkeyPatch,
+    sm: int,
+    N: int,
+    K0: int,
+    K1: int,
+) -> None:
+    monkeypatch.setattr(dual_gemm_x0_x1_ops, "get_sm_version", lambda: sm)
+    assert get_dual_gemm_x0_x1_op(torch.bfloat16, N=N, K0=K0, K1=K1) is _invoke_vanilla_dual_gemm_x0_x1
+
+
+@pytest.mark.parametrize("sm", [80, 86, 89, 90, 100, 103, 107])
+def test_x0_x1_residual_dispatches_cute_on_tuned_sms(monkeypatch: pytest.MonkeyPatch, sm: int) -> None:
+    monkeypatch.setattr(dual_gemm_x0_x1_ops, "get_sm_version", lambda: sm)
+    op = get_cute_dual_gemm_x0_x1_residual_op(torch.bfloat16, N=384, K0=384, K1=256)
+    assert op is not None and op.__name__ == "_invoke_cute_dual_gemm_x0_x1"
+
+
+def test_x0_x1_residual_rejects_unshipped_sm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dual_gemm_x0_x1_ops, "get_sm_version", lambda: 120)
+    assert get_cute_dual_gemm_x0_x1_residual_op(torch.bfloat16, N=384, K0=384, K1=256) is None
+
+
+# A source-free build runs CuTe only from packaged images. A newly tuned SM such
+# as SM107 has none until the protected CUBIN refresh after merge, so until then
+# its calls must keep the previous path instead of raising on the first launch.
+@pytest.mark.parametrize("packaged", [False, True], ids=["no-image", "image"])
+def test_x_x_source_free_build_takes_cute_only_with_a_packaged_image(
+    monkeypatch: pytest.MonkeyPatch, packaged: bool
+) -> None:
+    monkeypatch.setattr(dual_gemm_x_x_ops, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(dual_gemm_x_x_cutedsl, "_source_available", lambda: False)
+    monkeypatch.setattr(dual_gemm_x_x_cutedsl, "_library_has_image", lambda *_args: packaged)
+    op = get_dual_gemm_x_x_op(torch.bfloat16, N=128, K=128)
+    assert op is (dual_gemm_x_x_ops._invoke_cute_dual_gemm_x_x if packaged else _invoke_cuequiv_dual_gemm_x_x)
+
+
+@pytest.mark.parametrize("packaged", [False, True], ids=["no-image", "image"])
+def test_x0_x1_residual_source_free_build_needs_a_packaged_image(
+    monkeypatch: pytest.MonkeyPatch, packaged: bool
+) -> None:
+    monkeypatch.setattr(dual_gemm_x0_x1_ops, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(dual_gemm_x0_x1_cutedsl, "_source_available", lambda: False)
+    monkeypatch.setattr(dual_gemm_x0_x1_cutedsl, "_library_has_residual_image", lambda *_args: packaged)
+    op = get_cute_dual_gemm_x0_x1_residual_op(torch.bfloat16, N=384, K0=384, K1=256)
+    assert (op is not None) is packaged
+
+
+def test_dual_gemm_source_build_never_probes_the_library(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_probe(*_args):
+        raise AssertionError("a source build must not probe the CUBIN library")
+
+    monkeypatch.delenv("CUTEDSL_FORCE_CUBIN", raising=False)
+    monkeypatch.setattr(dual_gemm_x_x_cutedsl, "_source_available", lambda: True)
+    monkeypatch.setattr(dual_gemm_x_x_cutedsl, "_library_has_image", no_probe)
+    monkeypatch.setattr(dual_gemm_x0_x1_cutedsl, "_source_available", lambda: True)
+    monkeypatch.setattr(dual_gemm_x0_x1_cutedsl, "_library_has_residual_image", no_probe)
+    assert dual_gemm_x_x_cutedsl.ships(107, torch.bfloat16, 128, 128)
+    assert dual_gemm_x0_x1_cutedsl.ships_fused_residual(107, torch.bfloat16, 384, 384, 256)
+
+
+def test_dual_gemm_force_cubin_probes_the_library(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CUTEDSL_FORCE_CUBIN", "1")
+    monkeypatch.setattr(dual_gemm_x_x_cutedsl, "_source_available", lambda: True)
+    monkeypatch.setattr(dual_gemm_x_x_cutedsl, "_library_has_image", lambda *_args: False)
+    monkeypatch.setattr(dual_gemm_x0_x1_cutedsl, "_source_available", lambda: True)
+    monkeypatch.setattr(dual_gemm_x0_x1_cutedsl, "_library_has_residual_image", lambda *_args: False)
+    assert not dual_gemm_x_x_cutedsl.ships(107, torch.bfloat16, 128, 128)
+    assert not dual_gemm_x0_x1_cutedsl.ships_fused_residual(107, torch.bfloat16, 384, 384, 256)
+
+
+@pytest.mark.parametrize("available", [False, True], ids=["missing", "present"])
+def test_dual_gemm_library_probe_reads_the_launcher(monkeypatch: pytest.MonkeyPatch, available: bool) -> None:
+    """The probe asks the launcher for the shape and treats a library error as no image."""
+    families: list[str] = []
+
+    def populate(_cache, _key, family, _factory):
+        families.append(family)
+        if not available:
+            raise CuTeDSLKernelVariantUnavailable("no image")
+        return object()
+
+    monkeypatch.setattr(dual_gemm_x_x_cutedsl, "populate_compiled_cache_from_library", populate)
+    monkeypatch.setattr(dual_gemm_x0_x1_cutedsl, "populate_compiled_cache_from_library", populate)
+    x_x = dual_gemm_x_x_cutedsl._library_has_image.__wrapped__(107, torch.bfloat16, 128, 128, False, "sigmoid")
+    x0_x1 = dual_gemm_x0_x1_cutedsl._library_has_residual_image.__wrapped__(107, torch.bfloat16, 384, 384, 256)
+    assert x_x is available and x0_x1 is available
+    # Without an image every bias and mask setting is tried before giving up.
+    assert families == (
+        ["dual_gemm_x_x"] * 4 + ["dual_gemm_x0_x1"] * 2 if not available else ["dual_gemm_x_x", "dual_gemm_x0_x1"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("sm", "N", "K0", "K1", "transpose_out"),
+    [
+        (90, 384, 384, 256, True),
+        (120, 256, 128, 64, False),
+    ],
+    ids=["transposed-cute-shape", "cuequiv-fallback-shape"],
+)
+def test_x0_x1_asymmetric_cuequiv_fallback_dispatches_vanilla(
+    monkeypatch: pytest.MonkeyPatch,
+    sm: int,
+    N: int,
+    K0: int,
+    K1: int,
+    transpose_out: bool,
+) -> None:
+    monkeypatch.setattr(dual_gemm_x0_x1_ops, "get_sm_version", lambda: sm)
+    op = get_dual_gemm_x0_x1_op(
+        torch.bfloat16,
+        transpose_out=transpose_out,
+        N=N,
+        K0=K0,
+        K1=K1,
+    )
+    assert op is _invoke_vanilla_dual_gemm_x0_x1
+
+
+def test_x_x_protenix_sm90_uses_hopper_kernel():
+    """Protenix x_x ``(512, 256)`` must resolve the SM90 ping-pong kernel."""
+    skip_if_not_sm90()
+    assert DualGemmXxCuTe()._kernel_is_sm90(256, 512) is True
+
+
+def test_x0_x1_protenix_sm90_uses_hopper_kernel():
+    """Protenix x0_x1 ``(256, 256)`` must resolve the SM90 ping-pong kernel."""
+    skip_if_not_sm90()
+    assert DualGemmX0X1CuTe()._kernel_is_sm90(256, 256) is True
+
+
+@pytest.mark.parametrize(("K", "N"), [(256, 392), (384, 392), (384, 512)])
+def test_x_x_tuned_sm90_uses_hopper_kernel(K: int, N: int):
+    """The tuned x_x widths must resolve the SM90 ping-pong kernel on Hopper."""
+    skip_if_not_sm90()
+    assert DualGemmXxCuTe()._kernel_is_sm90(K, N) is True
+
+
+@pytest.mark.parametrize(("K", "K1", "N"), [(384, 256, 384)])
+def test_x0_x1_asymmetric_sm90_uses_hopper_kernel(K: int, K1: int, N: int):
+    """The asymmetric x0_x1 widths must resolve the SM90 ping-pong kernel on Hopper."""
+    skip_if_not_sm90()
+    assert DualGemmX0X1CuTe()._kernel_is_sm90(K, N, K1) is True
+
+
+@pytest.mark.parametrize(
+    ("N", "K", "expected"),
+    [
+        (128, 128, _invoke_cuequiv_dual_gemm_x0_x1),
+        (256, 256, _invoke_vanilla_dual_gemm_x0_x1),
+    ],
+)
+def test_x0_x1_selector_rejects_unshipped_targets(monkeypatch, N: int, K: int, expected):
+    """Off the tuned SMs the CuTe path is never selected, whatever the shape."""
+    monkeypatch.setattr(dual_gemm_x0_x1_ops, "get_sm_version", lambda: 120)
+    assert get_dual_gemm_x0_x1_op(torch.bfloat16, N=N, K=K) is expected
+
+
+@pytest.mark.parametrize(
+    ("N", "K", "expected"),
+    [
+        (128, 128, _invoke_cuequiv_dual_gemm_x_x),
+        (512, 256, _invoke_vanilla_dual_gemm_x_x),
+    ],
+)
+def test_x_x_selector_rejects_unshipped_targets(monkeypatch, N: int, K: int, expected):
+    """Off the tuned SMs the CuTe path is never selected, whatever the shape."""
+    monkeypatch.setattr(dual_gemm_x_x_ops, "get_sm_version", lambda: 120)
+    assert get_dual_gemm_x_x_op(torch.bfloat16, N=N, K=K) is expected
+
+
+def test_tuned_dual_gemms_are_cudagraph_safe():
+    """TVM-FFI launches must be recorded on the capture stream."""
+    skip_if_no_cutedsl("dual_gemm_x0_x1")
+    skip_if_no_cutedsl("dual_gemm_x_x")
+
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    length = 32
+
+    def capture_and_compare(op, inputs, changed_indices):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            op(*inputs)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+
+        static_inputs = tuple(value.clone() if isinstance(value, torch.Tensor) else value for value in inputs)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = op(*static_inputs)
+
+        for index in changed_indices:
+            static_inputs[index].add_(0.125)
+        graph.replay()
+        replay = captured.clone()
+        eager = op(*static_inputs)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(replay, eager, atol=0, rtol=0)
+
+    x0 = torch.randn(1, length, length, 384, device="cuda", dtype=dtype)
+    x1 = torch.randn(1, length, length, 256, device="cuda", dtype=dtype)
+    w0 = torch.randn(384, 384, device="cuda", dtype=dtype) * 0.05
+    w1 = torch.randn(384, 256, device="cuda", dtype=dtype) * 0.05
+    bias0 = torch.randn(384, device="cuda", dtype=dtype) * 0.05
+    bias1 = torch.randn(384, device="cuda", dtype=dtype) * 0.05
+    capture_and_compare(
+        DualGemmX0X1CuTe(),
+        (x0, x1, w0, w1, bias0, bias1),
+        (0, 1),
+    )
+
+    x = torch.randn(1, length, length, 256, device="cuda", dtype=dtype)
+    w0 = torch.randn(392, 256, device="cuda", dtype=dtype) * 0.05
+    w1 = torch.randn(392, 256, device="cuda", dtype=dtype) * 0.05
+    bias0 = torch.randn(392, device="cuda", dtype=dtype) * 0.05
+    bias1 = torch.randn(392, device="cuda", dtype=dtype) * 0.05
+    mask = torch.ones(1, length, length, device="cuda", dtype=torch.bool)
+    capture_and_compare(
+        DualGemmXxCuTe(),
+        (x, w0, w1, bias0, bias1, mask),
+        (0,),
+    )
+
+
+# ---------------------------------------------------------------------------
+# SM90 (Hopper) kernel coverage
+#
+# On Hopper the wrappers resolve the persistent ping-pong kernel instead of the
+# SM80/86/89 universal kernel, so on this hardware every test above already
+# exercises it. The tests below add the coverage those don't:
+#   * explicit guards that the Hopper path is selected (not a silent SM80 /
+#     cuEquivariance fallback), and
+#   * correctness at the larger ``S=2048`` tuned bucket (``raster_factor=4``),
+#     which the ``seq_len <= 1024`` cases above never reach.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("N", [128, 256, 392])
+def test_x_x_dual_gemm_sm90_uses_hopper_kernel(N: int):
+    """The x_x wrapper must resolve the SM90 ping-pong kernel on Hopper.
+
+    Guards against a silent fall-back to an SM80 tile (wrong calling
+    convention) or to the cuEquivariance path, which would make the
+    ``is_sm90`` branch in ``__call__`` dead on this hardware.
+    """
+    skip_if_not_sm90()
+    k = {128: 128, 256: 128, 392: 256}[N]
+    assert DualGemmXxCuTe()._kernel_is_sm90(k, N) is True
+
+
+def test_x0_x1_dual_gemm_sm90_uses_hopper_kernel():
+    """The x0_x1 wrapper must resolve the SM90 ping-pong kernel on Hopper."""
+    skip_if_not_sm90()
+    assert DualGemmX0X1CuTe()._kernel_is_sm90(128, 128) is True
+
+
+@pytest.mark.parametrize(
+    ("K", "K1", "N"),
+    [(64, 64, 64), (128, 128, 128), (128, 128, 256), (256, 256, 256), (384, 256, 384), (512, 256, 512)],
+)
+def test_x0_x1_blackwell_uses_native_kernel(K: int, K1: int, N: int):
+    """Every tuned x0_x1 shape must resolve the native SM100 kernel on Blackwell."""
+    skip_if_not_sm100_family()
+    assert DualGemmX0X1CuTe()._kernel_abi(K, N, K1) == "sm100"
+
+
+@pytest.mark.parametrize(
+    "N,transpose_out",
+    [(128, False), (128, True), (256, False), (256, True)],
+    ids=["N128_t0", "N128_t1", "N256_t0", "N256_t1"],
+)
+@pytest.mark.parametrize("cutedsl_mode", _DUAL_GEMM_XX_TEST_MODES, ids=lambda mode: f"impl-{mode}")
+def test_x_x_dual_gemm_large_anchor(
+    N: int,
+    transpose_out: bool,
+    cutedsl_mode: str,
+    monkeypatch,
+):
+    """Exercise the ``S=2048`` tuned bucket for the x_x variant.
+
+    Uses a rectangular ``[1, 4, 2048, K]`` input so the per-sample side
+    length anchor ``S = J_outer = 2048`` selects the large bucket (a
+    distinct compiled kernel -- ``raster_factor=4`` on SM90) while
+    ``M = 4 * 2048`` stays small enough to run cheaply.
+    """
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    torch.manual_seed(0)
+    _configure_dual_gemm_x_x_mode(cutedsl_mode, monkeypatch)
+    K, dtype = 128, torch.bfloat16
+    if cutedsl_mode == "cubin":
+        _skip_unless_cubin_has_x_x(K, N, transpose_out=transpose_out, has_bias=False, has_mask=False, bucket=2048)
+
+    W0 = torch.randn(N, K, dtype=dtype, device="cuda")
+    W1 = torch.randn(N, K, dtype=dtype, device="cuda")
+    X = torch.randn(1, 4, 2048, K, device="cuda").contiguous().to(dtype)
+
+    ref = _ref_x_x_dual_gemm(X, W0, W1, transpose_out=transpose_out)
+    out = DualGemmXxCuTe()(X, W0, W1, transpose_out=transpose_out)
+
+    torch.testing.assert_close(
+        out,
+        ref,
+        atol=1e-2,
+        rtol=1e-2,
+        msg=lambda m: f"N={N}, transpose_out={transpose_out}: {m}",
+    )
+
+
+@pytest.mark.skipif(
+    set(_DUAL_GEMM_XX_TEST_MODES) != {"source", "cubin"},
+    reason="both implementations are required for a bitwise equivalence check",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("has_bias", [False, True], ids=["bias0", "bias1"])
+@pytest.mark.parametrize("has_mask", [False, True], ids=["mask0", "mask1"])
+@pytest.mark.parametrize("transpose_out", [False, True], ids=["t0", "t1"])
+def test_x_x_source_and_cubin_agree_bitwise(
+    dtype: torch.dtype,
+    has_bias: bool,
+    has_mask: bool,
+    transpose_out: bool,
+    monkeypatch,
+):
+    """The direct launcher must reproduce the source host launch exactly."""
+    skip_if_no_cutedsl("dual_gemm_x_x")
+    torch.manual_seed(123)
+    batch, rows, cols, K, N = 1, 4, 31, 128, 128
+    x = torch.randn(batch, rows, cols, K, dtype=dtype, device="cuda")
+    w0 = torch.randn(N, K, dtype=dtype, device="cuda")
+    w1 = torch.randn_like(w0)
+    bias0 = torch.randn(N, dtype=dtype, device="cuda") if has_bias else None
+    bias1 = torch.randn(N, dtype=dtype, device="cuda") if has_bias else None
+    mask = make_left_aligned_mask(batch, rows, cols, dtype=dtype, device="cuda") if has_mask else None
+
+    with monkeypatch.context() as source_patch:
+        _configure_dual_gemm_x_x_mode("source", source_patch)
+        source = DualGemmXxCuTe()(x, w0, w1, bias0=bias0, bias1=bias1, mask=mask, transpose_out=transpose_out)
+    with monkeypatch.context() as cubin_patch:
+        _configure_dual_gemm_x_x_mode("cubin", cubin_patch)
+        cubin = DualGemmXxCuTe()(x, w0, w1, bias0=bias0, bias1=bias1, mask=mask, transpose_out=transpose_out)
+
+    torch.testing.assert_close(cubin, source, atol=0.0, rtol=0.0)
+
+
+def test_x0_x1_dual_gemm_large_anchor():
+    """Exercise the ``S=2048`` SM90 bucket for the x0_x1 variant.
+
+    ``S = round(sqrt(M))`` for x0_x1 (no separate ``J`` axis), so a flat
+    ``[1, M, K]`` input with ``M`` just past the 512<->2048 midpoint
+    (``1280**2``) lands in the large bucket.
+    """
+    skip_if_not_sm90()
+    torch.manual_seed(0)
+    K, N, dtype = 128, 128, torch.bfloat16
+    M = 1300 * 1300  # sqrt == 1300 > 1280 midpoint -> S=2048 bucket
+
+    W0 = torch.randn(N, K, dtype=dtype, device="cuda")
+    W1 = torch.randn(N, K, dtype=dtype, device="cuda")
+    X0 = torch.randn(1, M, K, device="cuda").to(dtype)
+    X1 = torch.randn(1, M, K, device="cuda").to(dtype)
+
+    ref = _ref_x0_x1_dual_gemm(X0, X1, W0, W1)
+    out = DualGemmX0X1CuTe()(X0, X1, W0, W1)
+
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

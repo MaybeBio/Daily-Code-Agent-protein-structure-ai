@@ -1,20 +1,20 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/MDAnalysis/mdanalysis
-- 快照日期: 2026-11-18
-- 快照 commit: [`a72b0c2aff2b`](https://github.com/MDAnalysis/mdanalysis/commit/a72b0c2aff2b0a356c577557d2323b9c24512a61)
+- 快照日期: 2026-11-22
+- 快照 commit: [`5d5a6345de7b`](https://github.com/MDAnalysis/mdanalysis/commit/5d5a6345de7b48a5d7071f730c14b0b2c8b1ce17)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 
-## 保留 (712 个文件, 6.8 MB)
+## 保留 (713 个文件, 6.8 MB)
 
 | 类别 | 文件数 | 大小 |
 |---|---:|---:|
 | 源码 | 478 | 5.9 MB |
-| 文档 | 201 | 784.7 KB |
+| 文档 | 202 | 785.4 KB |
 | 构建/配置 | 24 | 89.7 KB |
 | README | 9 | 22.1 KB |
 
-按后缀: `.py` 437 (5.4 MB)、`无后缀` 11 (631.6 KB)、`.c` 8 (216.0 KB)、`.pyx` 13 (199.6 KB)、`.rst` 186 (126.1 KB)、`.h` 11 (104.0 KB)、`.yaml` 9 (38.7 KB)、`.bib` 2 (30.1 KB)、`setup.py` 2 (26.5 KB)、`.md` 11 (18.9 KB)、`.pxd` 7 (14.5 KB)、`.yml` 7 (9.7 KB)、`pyproject.toml` 2 (8.6 KB)、`Makefile` 1 (4.6 KB)、`.sh` 2 (3.6 KB)、`.ini` 1 (779 B)、`setup.cfg` 1 (560 B)、`.txt` 1 (286 B)
+按后缀: `.py` 437 (5.4 MB)、`无后缀` 11 (631.6 KB)、`.c` 8 (216.0 KB)、`.pyx` 13 (199.6 KB)、`.rst` 186 (126.2 KB)、`.h` 11 (104.0 KB)、`.yaml` 9 (38.7 KB)、`.bib` 2 (30.1 KB)、`setup.py` 2 (26.5 KB)、`.md` 12 (19.6 KB)、`.pxd` 7 (14.5 KB)、`.yml` 7 (9.7 KB)、`pyproject.toml` 2 (8.6 KB)、`Makefile` 1 (4.6 KB)、`.sh` 2 (3.6 KB)、`.ini` 1 (779 B)、`setup.cfg` 1 (560 B)、`.txt` 1 (286 B)
 
 > README / 文档中的相对图片与链接已改写为 GitHub 绝对地址。
 

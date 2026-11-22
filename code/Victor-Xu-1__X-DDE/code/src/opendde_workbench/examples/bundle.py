@@ -1,0 +1,158 @@
+"""Portable fixed results restore into the existing asset/task authorities without execution."""
+
+import json
+
+from ..assets import AssetStore
+from ..store import Store
+from .bundle_archive import safe_path, sha256, write_archive
+from .bundle_catalogue import bundle_catalogue
+from .bundle_notices import bundle_notices
+from .bundle_pin_scope import dependency_inventory
+from .bundle_projection import project_records, references
+from .bundle_restore import restore_bundle as restore_bundle
+from .bundle_sources import archive_sources
+from .evidence import capture_job
+from .files import verified_file
+from .pins import ExamplePins
+from .records import ExampleRecords
+
+
+def catalogue_digest(profile="archive"):
+    return bundle_catalogue(profile).digest
+
+
+def verify_examples(settings, capabilities=None, *, profile="archive", catalogue=None):
+    catalogue = catalogue or bundle_catalogue(profile)
+    if catalogue.profile != profile:
+        raise ValueError("The verification catalogue belongs to another study profile.")
+    modules = catalogue.modules
+    store = Store(settings.state_dir / "jobs.sqlite3")
+    assets = AssetStore(store, settings.state_dir / "assets")
+    pins = ExamplePins(store, settings.state_dir, modules=modules)
+    records = ExampleRecords(store, assets, settings, modules=modules)
+    computed = validated = 0
+    selected = tuple(modules) if capabilities is None else tuple(capabilities)
+    for capability in selected:
+        parent = modules[capability].parent_capability
+        if parent and parent not in selected:
+            raise ValueError("A follow-up case must retain its fixed parent-case pin.")
+        pin = pins.get(capability, verify=True)
+        if pin and profile != "archive" and pin.review is None:
+            raise ValueError(
+                "Current study results require an explicit scientific and visual review."
+            )
+        if pin and (parent or profile != "archive"):
+            from ..research.storage import ScientificStore
+            from .pin_validation import validate_case_job
+
+            prepared = catalogue.prepare(
+                capability,
+                ScientificStore(store, assets),
+                settings.state_dir / "public-example-cache",
+                records,
+            )
+            validate_case_job(capability, store.get(str(pin.job_id)), prepared, store)
+            if pin.supporting_evidence:
+                from .supporting import supporting_evidence
+
+                checked = supporting_evidence(
+                    store,
+                    settings.state_dir,
+                    store.get(str(pin.job_id)),
+                    prepared,
+                    [entry.job_id for entry in pin.supporting_evidence],
+                )
+                if checked != pin.supporting_evidence:
+                    raise ValueError("The fixed follow-up evidence changed.")
+        record = records.get(capability, verify=True)
+        if (
+            record
+            and profile != "archive"
+            and record.capability_id in {"regions", "workflows", "pose_exploration"}
+            and record.review is None
+        ):
+            raise ValueError(
+                "Computed study records require an explicit scientific and visual review."
+            )
+        if pin or record and record.computed_result_available:
+            computed += 1
+        elif record:
+            validated += 1
+        else:
+            raise ValueError("The bundle lacks a fixed example for " + capability)
+    return {"modules": len(selected), "computed": computed, "validated": validated}
+
+
+def export_bundle(settings, target, source_revision, *, capabilities=None, profile="archive"):
+    from ..research.storage import ScientificStore
+
+    catalogue = bundle_catalogue(profile)
+    modules = catalogue.modules
+    store = Store(settings.state_dir / "jobs.sqlite3")
+    assets = AssetStore(store, settings.state_dir / "assets")
+    scientific = ScientificStore(store, assets)
+    records = ExampleRecords(store, assets, settings, modules=modules)
+    selected = tuple(modules) if capabilities is None else tuple(capabilities)
+    if (
+        not selected
+        or len(set(selected)) != len(selected)
+        or any(key not in modules for key in selected)
+    ):
+        raise ValueError("Choose an explicit reviewed set of public example modules.")
+    summary = verify_examples(settings, selected, profile=profile)
+    roots = set()
+    for capability in selected:
+        prepared = catalogue.prepare(
+            capability, scientific, settings.state_dir / "public-example-cache", records
+        )
+        roots.update(references(prepared.model_dump(mode="json")))
+    rows = project_records(store, roots, capabilities=set(selected), modules=modules)
+    paths = {}
+    for row in rows["assets"]:
+        asset = assets.get(row["id"])
+        path = assets.path(asset)
+        if sha256(path) != asset.sha256:
+            raise ValueError("A case asset changed before export.")
+        paths[f"assets/{asset.id}/content{asset.suffix}"] = path
+    for row in rows["jobs"]:
+        if row["status"] != "succeeded":
+            continue  # Exact terminal retry history has no computed output claim.
+        evidence = capture_job(store, settings.state_dir, row["id"])
+        for name in evidence.artifact_sha256:
+            relative = f"jobs/{row['id']}/output/{name}"
+            paths[relative] = safe_path(settings.state_dir, relative)
+        output = settings.state_dir / "jobs" / row["id"] / "output"
+        for name, path in archive_sources(store.get(row["id"]), output).items():
+            paths[f"jobs/{row['id']}/output/{name}"] = path
+    for row in rows["jobs"]:
+        if row["status"] != "succeeded":
+            continue
+        analysis = settings.state_dir / "jobs" / row["id"] / "analysis" / "workbench-analysis.json"
+        if analysis.is_file() and json.loads(analysis.read_text()).get("schema_version") == 4:
+            paths[f"jobs/{row['id']}/analysis/workbench-analysis.json"] = analysis
+            for path in (analysis.parent / "workbench-aligned").glob("*.cif"):
+                paths[f"jobs/{row['id']}/analysis/workbench-aligned/{path.name}"] = path
+    for spec in catalogue.required_cache(selected):
+        verified_file(settings.state_dir / "public-example-cache", spec)
+        paths["public-example-cache/" + spec.sha256] = (
+            settings.state_dir / "public-example-cache" / spec.sha256
+        )
+    manifest = {
+        "schema_version": 1,
+        "profile": profile,
+        "catalogue_sha256": catalogue.digest,
+        "source_revision": source_revision,
+        "capabilities": list(selected),
+        "source_pin_dependencies": dependency_inventory(rows, selected),
+        "summary": summary,
+        "records": rows,
+        "notices": bundle_notices(
+            selected, rows, modules=modules, cases=catalogue.cases, files=catalogue.files
+        ),
+    }
+    return {
+        **summary,
+        **write_archive(target, manifest, paths),
+        "jobs": len(rows["jobs"]),
+        "assets": len(rows["assets"]),
+    }

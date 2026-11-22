@@ -1,0 +1,2490 @@
+"""
+This is a script for the frontend of the SequenceFeature class, a supportive class for the CPP feature engineering.
+"""
+from typing import Literal, Optional, Union, List, Dict, Tuple, Sequence
+import inspect
+import itertools
+import warnings
+import numpy as np
+import pandas as pd
+
+import aaanalysis.utils as ut
+from ._backend.check_feature import (check_split_kws,
+                                     check_parts_len,
+                                     check_match_features_seq_parts,
+                                     check_match_df_seq_jmd_len,
+                                     expand_pos_anchors_,
+                                     check_match_df_parts_features,
+                                     check_match_df_parts_df_scales,
+                                     check_df_scales,
+                                     check_match_df_scales_features,
+                                     check_match_df_scales_df_cat,
+                                     check_df_cat,
+                                     check_match_df_cat_features)
+from ._backend.cpp.utils_feature import (get_df_parts_,
+                                         remove_entries_with_gaps_,
+                                         replace_non_canonical_aa_,
+                                         get_positions_, get_amino_acids_,
+                                         get_df_pos_, get_df_pos_parts_)
+from ._backend.cpp.sequence_feature import (get_split_kws_, get_features_, get_feature_names_,
+                                            get_feature_descriptions_, get_df_feat_, get_scale_composition_,
+                                            get_acc_,
+                                            get_aa_composition_, get_dipeptide_composition_, get_kmer_composition_,
+                                            get_composition_scales_,
+                                            get_labels_ovr_, get_labels_ovo_, get_labels_quantile_,
+                                            get_labels_tiered_)
+from ._backend.cpp_run import _pick_feature_matrix_builder
+from ._backend.feature_filter import filter_correlation_, filter_variance_
+
+
+# I Helper Functions
+def _valid_df_parts_kws_keys():
+    """Return the ``SequenceFeature.get_df_parts`` parameter names valid in a ``df_parts_kws`` dict."""
+    params = inspect.signature(SequenceFeature.get_df_parts).parameters
+    return {p for p in params if p not in ("self", "df_seq")}
+
+
+def check_df_parts_kws(df_parts_kws=None, df_seq=None) -> None:
+    """Check ``df_parts_kws`` is a valid-key dict of ``get_df_parts`` kwargs, only used with ``df_seq``."""
+    if df_parts_kws is None:
+        return
+    ut.check_dict(name="df_parts_kws", val=df_parts_kws, accept_none=True)
+    if df_seq is None:
+        raise ValueError("'df_parts_kws' is only used together with 'df_seq'; with 'df_parts' the parts "
+                         "are taken directly from its columns.")
+    valid_keys = _valid_df_parts_kws_keys()
+    invalid_keys = set(df_parts_kws) - valid_keys
+    if invalid_keys:
+        raise ValueError(f"'df_parts_kws' should only contain 'get_df_parts' parameter names. Invalid keys: "
+                         f"{sorted(invalid_keys)}. Valid keys: {sorted(valid_keys)}.")
+def check_split_types(split_types=None):
+    """Check if split types valid (Segment, Pattern, or PeriodicPattern)"""
+    split_types = ut.check_list_like(name="split_types", val=split_types, accept_str=True, accept_none=True)
+    if split_types is None:
+        split_types = ut.LIST_SPLIT_TYPES
+    wrong_split_type = [x for x in split_types if x not in ut.LIST_SPLIT_TYPES]
+    if len(wrong_split_type) > 0:
+        raise ValueError(f"Wrong 'split_types' ({wrong_split_type}). Chose from {ut.LIST_SPLIT_TYPES}")
+    return split_types
+
+
+def check_match_strategy_split_args(strategy=None, split_types=None, n_split_min=1, n_split_max=15):
+    """Check that a split strategy is not combined with explicit split types or Segment split range"""
+    if strategy is None:
+        return None
+    dict_conflicts = {"split_types": (split_types, None, split_types is not None),
+                      "n_split_min": (n_split_min, 1, n_split_min != 1),
+                      "n_split_max": (n_split_max, 15, n_split_max != 15)}
+    for name, (val, default, is_conflict) in dict_conflicts.items():
+        if is_conflict:
+            raise ValueError(f"'{name}' ({val}) should be left at its default ({default}) when 'strategy' "
+                             f"('{strategy}') is given, since the strategy sets 'split_types', 'n_split_min', "
+                             f"and 'n_split_max'.")
+    return None
+
+
+def check_split_args(split_types, n_split_min=1, n_split_max=15, steps_pattern=None,
+                     n_min=2, n_max=4, len_max=15, steps_periodicpattern=None) -> None:
+    """Check split-type-specific ranges after strategy resolution."""
+    if ut.STR_SEGMENT in split_types and n_split_min > n_split_max:
+        raise ValueError(f"'n_split_min' ({n_split_min}) should be <= 'n_split_max' ({n_split_max}).")
+    if ut.STR_PATTERN in split_types:
+        if n_min > n_max:
+            raise ValueError(f"'n_min' ({n_min}) should be <= 'n_max' ({n_max}).")
+        steps_pattern = [3, 4] if steps_pattern is None else steps_pattern
+        for i, step in enumerate(steps_pattern):
+            if step < 1:
+                raise ValueError(f"'steps_pattern[{i}]' ({step}) should be a positive integer.")
+        if len_max <= steps_pattern[0]:
+            raise ValueError(f"'len_max' ({len_max}) should be greater than the smallest "
+                             f"'steps_pattern' value ({steps_pattern[0]}).")
+    if ut.STR_PERIODIC_PATTERN in split_types:
+        steps_periodicpattern = [3, 4] if steps_periodicpattern is None else steps_periodicpattern
+        for i, step in enumerate(steps_periodicpattern):
+            if step < 1:
+                raise ValueError(f"'steps_periodicpattern[{i}]' ({step}) should be a positive integer.")
+
+
+def check_steps(steps=None, steps_name="steps_pattern", len_min=2, fixed_len=False):
+    """Sort steps and warn if empty list"""
+    if steps is None:
+        return steps # Skip tests
+    steps = list(sorted(steps))
+    if len(steps) < len_min:
+        if fixed_len:
+            raise ValueError(f"'{steps_name}' ({steps}) should contain exactly {len_min} non-negative integers.")
+        else:
+            raise ValueError(f"'{steps_name}' ({steps}) should contain >= {len_min} non-negative integers.")
+    return steps
+
+
+def warn_creation_of_feature_matrix(features: ut.ArrayLike1D, df_parts: pd.DataFrame,
+                                    name="Feature matrix") -> None:
+    """Warn if feature matrix gets too large"""
+    n_feat = len(features)
+    n_samples = len(df_parts)
+    n_vals = n_feat * n_samples
+    ut.print_out(f"'{name}' for {n_feat} features and {n_samples} samples will be created.")
+    if n_vals > 1000 * 1000:
+        warning = f"Feature matrix with n={n_vals}>=10^6 values will be created, which will take some time.\n" \
+                  "It is recommended to create a feature matrix for a pre-selected number features " \
+                  "so that 10^6 values are not exceeded."
+        warnings.warn(warning)
+
+
+def check_match_labels_label_test_label_ref(labels: ut.ArrayLike1D, label_test=1, label_ref=0) -> None:
+    """Check if labels only contains label_test and label_ref"""
+    wrong_labels = [x for x in labels if x not in [label_ref, label_test]]
+    unique_wrong_labels = list(set(wrong_labels))
+    n_wrong_labels = len(unique_wrong_labels)
+    if n_wrong_labels > 0:
+        raise ValueError(f"'labels' contains {n_wrong_labels} wrong labels: {unique_wrong_labels}")
+
+
+def check_match_df_parts_label_test_label_ref(df_parts: pd.DataFrame, labels: ut.ArrayLike1D,
+                                              label_test=1, label_ref=0) -> None:
+    """Check if 'jmd_n', 'tmd', and 'jmd_c' in df_parts if amino acid for label_test or label_ref should be retrieved"""
+    list_parts = list(df_parts)
+    required_parts = ["jmd_n", "tmd", "jmd_c"]
+    mask_test = [x == label_test for x in labels]
+    mask_ref = [x == label_ref for x in labels]
+    if sum(mask_test) == 1:
+        missing_parts = [x for x in required_parts if x not in list_parts]
+        if len(missing_parts) > 0:
+            raise ValueError(f"'df_parts' misses '{missing_parts}' parts necessary to retrieve amino acid positions"
+                             f" for 'label_test' ({label_test}) if only one sample of it occurs in 'labels'."
+                             f"\n Add them to the current parts of 'df_parts': {list_parts}")
+    if sum(mask_ref) == 1:
+        missing_parts = [x for x in required_parts if x not in list_parts]
+        if len(missing_parts) > 0:
+            raise ValueError(f"'df_parts' misses '{missing_parts}' parts necessary to retrieve amino acid positions"
+                             f" for 'label_ref' ({label_ref}) if only one sample of it occurs in 'labels'."
+                             f"\n Add them to the current parts of 'df_parts': {list_parts}")
+
+
+def check_col_cat(col_cat=None) -> None:
+    """Check if col_cat valid column from df_feat"""
+    if col_cat not in ut.COLS_FEAT_SCALES:
+        raise ValueError(f"'col_cat' {col_cat} should be one of: {ut.COLS_FEAT_SCALES}")
+
+
+def check_col_val(col_val=None) -> None:
+    """Check if col_val valid column from df_feat"""
+    cols_feat = ut.COLS_FEAT_STAT + ut.COLS_FEAT_WEIGHT
+    if col_val not in cols_feat:
+        raise ValueError(f"'col_val' {col_val} should be one of: {cols_feat}")
+
+
+def check_match_labels_value_sources(labels: ut.ArrayLike1D, df_parts=None, dict_num_parts=None,
+                                     name="labels") -> None:
+    """Check at least one value source is given and each aligns row-wise with labels/targets."""
+    if df_parts is None and dict_num_parts is None:
+        raise ValueError("Provide at least one of 'df_parts' or 'dict_num_parts' to subset per group.")
+    n = len(labels)
+    if df_parts is not None:
+        ut.check_df_parts(df_parts=df_parts)
+        if len(df_parts) != n:
+            raise ValueError(f"'df_parts' (n={len(df_parts)}) should have the same number of rows "
+                             f"as '{name}' (n={n}).")
+    if dict_num_parts is not None:
+        ut.check_dict(name="dict_num_parts", val=dict_num_parts, accept_none=False)
+        for part, arr in dict_num_parts.items():
+            n_part = np.asarray(arr).shape[0]
+            if n_part != n:
+                raise ValueError(f"'dict_num_parts['{part}']' (axis-0 n={n_part}) should match "
+                                 f"'{name}' (n={n}).")
+
+
+def subset_value_sources(row_mask=None, df_parts=None, dict_num_parts=None):
+    """Return row-matched copies of the provided value sources (boolean mask applied positionally)."""
+    df_parts_sub = df_parts[row_mask].copy() if df_parts is not None else None
+    if dict_num_parts is not None:
+        dict_num_parts_sub = {part: np.asarray(arr)[row_mask].copy() for part, arr in dict_num_parts.items()}
+    else:
+        dict_num_parts_sub = None
+    return df_parts_sub, dict_num_parts_sub
+
+
+def check_match_df_feat_X(df_feat: pd.DataFrame, X=None):
+    """Check that a pre-computed feature matrix X aligns column-wise with df_feat."""
+    X = np.asarray(X)
+    if X.ndim != 2:
+        raise ValueError(f"'X' (ndim={X.ndim}) should be a 2D feature matrix of shape (n_samples, n_features).")
+    n_features = X.shape[1]
+    if n_features != len(df_feat):
+        raise ValueError(f"'X' (n_features={n_features}) should have one column per feature "
+                         f"in 'df_feat' (n_features={len(df_feat)}).")
+    if not np.isfinite(X).all():
+        raise ValueError("'X' should not contain NaN or infinite values.")
+    return X
+
+
+def recover_seq_parts_from_df_parts_row(row: pd.Series):
+    """Recover the basic ``(jmd_n_seq, tmd_seq, jmd_c_seq)`` from a single ``df_parts`` row.
+
+    The JMD lengths are read off the parts (never given): the basic part set
+    (``jmd_n``/``tmd``/``jmd_c``) is used directly, otherwise the default CPP extended set
+    (``tmd``/``jmd_n_tmd_n``/``tmd_c_jmd_c``) is split around the TMD. A JMD that cannot be
+    derived from the available parts is returned as an empty string (the features then carry
+    no JMD-N/JMD-C either).
+    """
+    cols = set(row.index)
+    _, col_jmd_n_tmd_n, col_tmd_c_jmd_c = ut.LIST_PARTS  # ['tmd', 'jmd_n_tmd_n', 'tmd_c_jmd_c']
+    tmd_seq = row[ut.COL_TMD] if ut.COL_TMD in cols else ""
+    # JMD-N: basic column if present, else the JMD-N portion of jmd_n_tmd_n (prefix before the TMD)
+    if ut.COL_JMD_N in cols:
+        jmd_n_seq = row[ut.COL_JMD_N]
+    elif col_jmd_n_tmd_n in cols and tmd_seq:
+        jmd_n_tmd_n = row[col_jmd_n_tmd_n]
+        n_overlap = max((i for i in range(len(tmd_seq) + 1) if jmd_n_tmd_n.endswith(tmd_seq[:i])), default=0)
+        jmd_n_seq = jmd_n_tmd_n[:len(jmd_n_tmd_n) - n_overlap]
+    else:
+        jmd_n_seq = ""
+    # JMD-C: basic column if present, else the JMD-C portion of tmd_c_jmd_c (suffix after the TMD)
+    if ut.COL_JMD_C in cols:
+        jmd_c_seq = row[ut.COL_JMD_C]
+    elif col_tmd_c_jmd_c in cols and tmd_seq:
+        tmd_c_jmd_c = row[col_tmd_c_jmd_c]
+        c_overlap = max((i for i in range(1, len(tmd_seq) + 1) if tmd_c_jmd_c.startswith(tmd_seq[-i:])), default=0)
+        jmd_c_seq = tmd_c_jmd_c[c_overlap:]
+    else:
+        jmd_c_seq = ""
+    return jmd_n_seq, tmd_seq, jmd_c_seq
+
+
+def check_match_df_seq_df_parts(df_seq: pd.DataFrame, entry=None, jmd_n_seq="", tmd_seq="", jmd_c_seq="") -> None:
+    """Check that the parts recovered from ``df_parts`` are consistent with ``df_seq`` for one protein."""
+    mask = df_seq[ut.COL_ENTRY] == entry
+    if not mask.any():
+        raise ValueError(f"'sample' entry ('{entry}') from 'df_parts' is not in the '{ut.COL_ENTRY}' "
+                         f"column of 'df_seq'. Available entries: "
+                         f"{ut.preview_options(df_seq[ut.COL_ENTRY])}.")
+    row = df_seq[mask].iloc[0]
+    span = jmd_n_seq + tmd_seq + jmd_c_seq
+    if ut.COL_SEQ in df_seq.columns:
+        if span and span not in row[ut.COL_SEQ]:
+            raise ValueError(f"'df_seq' and 'df_parts' do not match for entry ('{entry}'): the TMD-JMD span "
+                             f"derived from 'df_parts' is not contained in the 'df_seq' sequence.")
+    elif set(ut.COLS_SEQ_PARTS).issubset(df_seq.columns):
+        seq_parts = (row[ut.COL_JMD_N], row[ut.COL_TMD], row[ut.COL_JMD_C])
+        if seq_parts != (jmd_n_seq, tmd_seq, jmd_c_seq):
+            raise ValueError(f"'df_seq' and 'df_parts' do not match for entry ('{entry}'): the TMD-JMD parts differ.")
+
+
+def resolve_sample_entry(df_seq: pd.DataFrame, df_parts: pd.DataFrame, sample=None) -> str:
+    """Resolve a ``sample`` selector to a single, unique ``df_parts`` entry name.
+
+    ``sample`` may be a row position (int), an ``entry`` name (str) from the ``df_parts`` index, or —
+    when ``df_seq`` carries the optional ``gene`` / ``display_name`` / ``name`` columns (the ``gene``
+    column is bundled by :func:`load_dataset`) — a human-readable label (str) that is mapped to
+    its ``entry``, consulting those columns in that priority order. The selector must identify exactly
+    one protein: a value that matches nothing, or that is ambiguous (a duplicated ``entry`` in
+    ``df_parts`` or a label shared by several entries), raises a ``ValueError`` asking the caller to
+    disambiguate with the ``entry`` name or a row position (int).
+    """
+    entries = list(df_parts.index)
+    if isinstance(sample, (int, np.integer)) and not isinstance(sample, bool):
+        ut.check_number_range(name="sample", val=int(sample), min_val=0, max_val=len(df_parts) - 1, just_int=True)
+        return entries[int(sample)]
+    if not isinstance(sample, str):
+        raise ValueError(f"'sample' ({sample}) should be an entry name (str) or a row position (int).")
+    # 1) Match against the df_parts index (entry); must be unique.
+    n_entry = entries.count(sample)
+    if n_entry > 1:
+        raise ValueError(f"'sample' ('{sample}') matches {n_entry} rows in the 'df_parts' index; it is not "
+                         f"unique. Pass a row position (int) to select one.")
+    if n_entry == 1:
+        return sample
+    # 2) Fall back to the optional human-readable columns of df_seq (gene -> display_name -> name),
+    #    in priority order; the first present column that yields a unique match wins.
+    for col in (ut.COL_GENE, ut.COL_DISPLAY_NAME, ut.COL_NAME):
+        if col not in df_seq.columns:
+            continue
+        matched = list(dict.fromkeys(df_seq.loc[df_seq[col] == sample, ut.COL_ENTRY]))
+        if len(matched) > 1:
+            raise ValueError(f"'sample' ('{sample}') matches several '{col}' entries {matched}; it is "
+                             f"not unique. Pass the 'entry' name or a row position (int) to select one.")
+        if len(matched) == 1:
+            entry = matched[0]
+            if entries.count(entry) != 1:
+                raise ValueError(f"'sample' ('{sample}') maps to entry ('{entry}') via '{col}', which does not "
+                                 f"occur exactly once in the 'df_parts' index. Pass a row position (int).")
+            return entry
+    # 3) Nothing matched.
+    raise ValueError(f"'sample' ('{sample}') is neither an 'entry' in the 'df_parts' index nor a "
+                     f"'{ut.COL_GENE}' / '{ut.COL_DISPLAY_NAME}' / '{ut.COL_NAME}' in 'df_seq'. "
+                     f"First entries are: {entries[:5]}.")
+
+
+# II Main Functions
+class SequenceFeature:
+    """
+    Utility feature engineering class using sequences to create :class:`CPP` feature components (**Parts**, **Splits**,
+    and  **Scales**) and data structures [Breimann25]_.
+
+    The three feature components are the primary input for the :class:`aaanalysis.CPP` class and define
+    Comparative Physicochemical Profiling (CPP) features.
+
+    .. versionadded:: 0.1.0
+
+    Notes
+    -----
+    Feature Components:
+        - **Part**: A continuous subset of a sequence, such as a protein domain.
+        - **Split**: Continuous or discontinuous subset of a **Part**, either segment or pattern.
+        - **Scale**: A physicochemical scale, i.e., a set of numerical values (typically [0-1]) assigned to amino acids.
+
+    Main Parts:
+        We define three main parts from which each other part can be derived from:
+
+        - **TMD (target middle domain)**: Protein domain of interest with varying length.
+        - **JMD-N (juxta middle domain N-terminal)**: Protein domain or sequence region directly
+          N-terminally next to the TMD, typically set to a fixed length (10 by default).
+        - **JMD-C (juxta middle domain C-terminal)**: Protein domain or sequence region directly
+          C-terminally next to the TMD, typically set to a fixed length (10 by default).
+
+    Feature: Part + Split + Scale
+        Physicochemical property (expressed as numerical scale) present at distinct amino acid
+        positions within a protein sequence. The positions are obtained by splitting sequence parts
+        into segments or patterns.
+
+    Feature value: Realization of a Feature
+        For a given sequence, a feature value is the average of a physicochemical scale over
+        all amino acids obtained by splitting a sequence part.
+
+    Valid sequence parts:
+        - ``tmd``: Target Middle Domain (TMD).
+        - ``tmd_e``: TMD extended N- and C-terminally by a number of residues, defined by the ``ext_len`` configuration option.
+        - ``tmd_n``: N-terminal half of the TMD.
+        - ``tmd_c``: C-terminal half of the TMD.
+        - ``jmd_n``: N-terminal Juxt Middle Domain (JMD).
+        - ``jmd_c``: C-terminal JMD.
+        - ``ext_c``: Extended C-terminal region.
+        - ``ext_n``: Extended N-terminal region.
+        - ``tmd_jmd``: Combination of JMD-N, TMD, and JMD-C.
+        - ``jmd_n_tmd_n``: Combination of JMD-N and N-terminal half of TMD.
+        - ``tmd_c_jmd_c``: Combination of C-terminal half of TMD and JMD-C.
+        - ``ext_n_tmd_n``: Extended N-terminal region and N-terminal half of TMD.
+        - ``tmd_c_ext_c``: C-terminal half of TMD and extended C-terminal region.
+
+    Default parts:
+        The following three parts are provided by default: ``tmd``, ``jmd_n_tmd_n``, ``tmd_c_jmd_c``.
+
+    Parameters ending in ``_kws`` (e.g. ``split_kws``, ``df_parts_kws``) bundle related keyword
+    arguments into one dict; see the :ref:`keyword-dict parameters overview <kws-overview>`.
+
+    """
+
+    def __init__(self,
+                 verbose: bool = True
+                 ):
+        """
+        Parameters
+        ----------
+        verbose : bool, default=True
+            If ``True``, verbose outputs are enabled.
+        """
+        self.verbose = ut.check_verbose(verbose)
+
+    # Part and Split methods
+    def get_df_parts(self,
+                     df_seq: pd.DataFrame,
+                     list_parts: Optional[Union[str, List[str]]] = None,
+                     all_parts: bool = False,
+                     jmd_n_len: Union[int, None] = 10,
+                     jmd_c_len: Union[int, None] = 10,
+                     tmd_len: Optional[int] = None,
+                     remove_entries_with_gaps: bool = False,
+                     replace_non_canonical_aa: bool = False,
+                     ) -> pd.DataFrame:
+        """
+        Create DataFrame with selected sequence parts.
+
+        Slices each protein sequence in ``df_seq`` into the requested Parts
+        (target middle domain (TMD), JMD-N, JMD-C, and combinations thereof) using the
+        boundary information supplied with the sequences. The resulting ``df_parts``
+        DataFrame is the primary sequence input for :class:`CPP` and for
+        :meth:`SequenceFeature.feature_matrix`.
+
+        .. versionadded:: 0.1.0
+
+        .. versionchanged:: 1.1.0
+            Added the ``pos``-anchor input mode (``tmd_len``).
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein identifiers and sequence information
+            in a distinct format: **Position-based**, **Part-based**, **Sequence-based**, or **Sequence-TMD-based**.
+        list_parts: list of str, default={``tmd``, ``jmd_n_tmd_n``, ``tmd_c_jmd_c``}
+            Names of sequence parts that should be obtained for sequences from ``df_seq``.
+        jmd_n_len: int, default=10
+            Length of JMD-N in number of amino acids. If ``None``, ``jmd_n`` and ``jmd_c`` should be given.
+        jmd_c_len: int, default=10
+            Length of JMD-C in number of amino acids. If ``None``, ``jmd_n`` and ``jmd_c`` should be given.
+        tmd_len: int, optional
+            TMD length in amino acids for the **Anchor-based format** only (a ``sequence`` + ``pos`` ``df_seq``).
+            Each 1-based anchor in ``pos`` is placed at the P1 position of a length-``tmd_len`` TMD
+            (right-heavy for even ``tmd_len``); ignored for the other formats.
+        all_parts: bool, default=False
+            Whether to create DataFrame with all possible sequence parts (if ``True``) or parts given by ``list_parts``.
+        remove_entries_with_gaps: bool, default=False
+            Whether to exclude entries containing missing residues in their sequence parts (if ``True``),
+            usually resulting from sequences being too short.
+        replace_non_canonical_aa: bool, default=False
+            Whether to replace non-canonical amino acids (e.g., 'X') by gap ('-') symbol.
+
+        Returns
+        -------
+        df_parts : pd.DataFrame, shape (n_samples, n_parts)
+            Sequence parts DataFrame.
+
+        See Also
+        --------
+        * :class:`aaanalysis.SequenceFeature` for definition of parts, and lists of all existing and default parts.
+
+        Notes
+        -----
+        * If ``ext_len`` in aaanalysis.options is not set to > 0, following parts containing extended tmd are not
+          considered for ``all_parts=True``: ['tmd_e', 'ext_c', 'ext_n', 'ext_n_tmd_n', 'tmd_c_ext_c'].
+        * ``jmd_n_len`` and ``jmd_c_len`` must be both given, except for the part-based format.
+        * ``tmd_start`` and ``tmd_stop`` use **1-based indexing** to follow standard biological annotation conventions 
+          (e.g., UniProt), where residue positions start at 1. This allows direct use of annotated positions without conversion.
+
+        Formats for ``df_seq`` are differentiated by their respective columns:
+
+        **Position-based format**
+            - 'sequence': The complete amino acid sequence.
+            - 'tmd_start': Starting position of the TMD in the sequence (1-based, inclusive).
+            - 'tmd_stop': Ending position of the TMD in the sequence (1-based, inclusive).
+
+        **Part-based format**
+            - 'jmd_n': Amino acid sequence for JMD-N.
+            - 'tmd': Amino acid sequence for TMD.
+            - 'jmd_c': Amino acid sequence for JMD-C.
+
+        **Sequence-TMD-based format**
+            - 'sequence' and 'tmd' columns.
+
+        **Sequence-based format**
+            - Only the 'sequence' column.
+
+        **Anchor-based format**
+            - 'sequence' and 'pos' columns, together with the ``tmd_len`` argument.
+            - 'pos': per-row 1-based P1 anchor position(s) — a single ``int`` or a ``list[int]``. Each anchor
+              is exploded into one row whose TMD is centered (right-heavy for even ``tmd_len``) on the anchor;
+              multi-anchor rows yield multiple rows, ided in the index by ``<entry>_<win_start>-<win_stop>``.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_df_parts.rst
+        """
+        # Check input
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=jmd_c_len)
+        check_parts_len(jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len, accept_none_tmd_len=True)
+        # Anchor-based format ('sequence' + 'pos' + tmd_len): explode to position-based, then reuse the normal path
+        anchor_mode = (isinstance(df_seq, pd.DataFrame)
+                       and ut.COL_SEQ in df_seq.columns and ut.COL_POS in df_seq.columns
+                       and not set(ut.COLS_SEQ_POS).issubset(df_seq.columns)
+                       and not set(ut.COLS_SEQ_PARTS).issubset(df_seq.columns)
+                       and not set(ut.COLS_SEQ_TMD).issubset(df_seq.columns))
+        list_entry_win = None
+        if anchor_mode:
+            ut.check_number_range(name="tmd_len", val=tmd_len, min_val=1, just_int=True)
+            if jmd_n_len is None or jmd_c_len is None:
+                raise ValueError("'jmd_n_len' and 'jmd_c_len' should both be given (not None) "
+                                 "for the anchor-based ('sequence' + 'pos') format.")
+            df_seq, list_entry_win = expand_pos_anchors_(df_seq=df_seq, tmd_len=tmd_len,
+                                                         jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        ut.check_df_seq(df_seq=df_seq)
+        ut.check_bool(name="all_parts", val=all_parts)
+        ut.check_bool(name="replace_non_canonical_aa", val=replace_non_canonical_aa)
+        list_parts = ut.check_list_parts(list_parts=list_parts, all_parts=all_parts, accept_none=True)
+        df_seq = check_match_df_seq_jmd_len(df_seq=df_seq, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        # Create df parts
+        df_parts = get_df_parts_(df_seq=df_seq, list_parts=list_parts, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        if anchor_mode:
+            df_parts.index = list_entry_win
+        if remove_entries_with_gaps:
+            n_before = len(df_parts)
+            df_parts = remove_entries_with_gaps_(df_parts=df_parts)
+            n_removed = n_before - len(df_parts)
+            if n_removed > 0 and self.verbose:
+                warnings.warn(f"{n_removed} entries have been removed from 'df_seq' due to introduced gaps.")
+        if replace_non_canonical_aa:
+            df_parts = replace_non_canonical_aa_(df_parts=df_parts)
+        if len(df_parts) == 0:
+            raise ValueError(f"All entries have been removed from 'df_seq'. "
+                             f"Reduce 'jmd_n_len' ({jmd_n_len}) and 'jmd_c_len' ({jmd_c_len}) settings.")
+        return df_parts
+
+    def get_seq_kws(self,
+                    df_seq: pd.DataFrame,
+                    df_parts: pd.DataFrame,
+                    sample: Union[int, str],
+                    ) -> dict:
+        """
+        Get the per-part sequence keyword arguments (``jmd_n_seq``, ``tmd_seq``, ``jmd_c_seq``) for one protein.
+
+        Returns the TMD-JMD sequence parts of a single protein as a ready-to-use ``seq_kws`` dictionary, so
+        the per-protein sequence can be passed directly to the :class:`CPPPlot` methods (e.g. for sample-level
+        plots) via ``**seq_kws``, without manually slicing the DataFrame. The parts are taken from ``df_parts``
+        (the same sequence parts that produced ``df_feat`` via :meth:`CPP.run`), so the displayed residues are
+        always bound to the feature geometry; ``df_seq`` is cross-checked for consistency. The JMD lengths are
+        read off ``df_parts`` (no length argument); a JMD that the parts do not contain is returned empty.
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein identifiers and sequence information
+            in a distinct format: **Position-based**, **Part-based**, **Sequence-based**, or **Sequence-TMD-based**.
+        df_parts : pd.DataFrame, shape (n_samples, n_parts)
+            Sequence parts DataFrame (indexed by ``entry``) as produced by :meth:`SequenceFeature.get_df_parts`
+            and passed to :meth:`CPP.run`. Defines the TMD-JMD geometry; must be consistent with ``df_seq``.
+        sample : int or str
+            The protein to extract, given as a row position (int) in ``df_parts``, an ``entry`` name (str)
+            from its index, or — when ``df_seq`` provides the optional ``name`` column — a protein ``name``
+            (str), which is resolved to its ``entry``. Must identify exactly one protein: an unknown or
+            ambiguous selector (a duplicated ``entry`` or a ``name`` shared by several entries) raises a
+            ``ValueError``.
+
+        Returns
+        -------
+        seq_kws : dict
+            Dictionary with the keys ``jmd_n_seq``, ``tmd_seq``, and ``jmd_c_seq`` mapping to the
+            corresponding amino acid sequence parts of the selected protein (empty string where a JMD part
+            is not encoded in ``df_parts``).
+
+        See Also
+        --------
+        * :meth:`SequenceFeature.get_df_parts` for creating the underlying sequence parts DataFrame.
+        * :meth:`CPPPlot.profile` and :meth:`CPPPlot.feature_map`, which accept the returned parts via ``**seq_kws``.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_seq_kws.rst
+        """
+        # Check input
+        ut.check_df(name="df_seq", df=df_seq, cols_required=[ut.COL_ENTRY])
+        ut.check_df(name="df_parts", df=df_parts)
+        entry = resolve_sample_entry(df_seq=df_seq, df_parts=df_parts, sample=sample)
+        row = df_parts.loc[entry]
+        # Recover the basic parts from df_parts (JMD lengths encoded in the parts) and verify against df_seq
+        jmd_n_seq, tmd_seq, jmd_c_seq = recover_seq_parts_from_df_parts_row(row=row)
+        check_match_df_seq_df_parts(df_seq=df_seq, entry=entry,
+                                    jmd_n_seq=jmd_n_seq, tmd_seq=tmd_seq, jmd_c_seq=jmd_c_seq)
+        seq_kws = {f"{ut.COL_JMD_N}_seq": jmd_n_seq, f"{ut.COL_TMD}_seq": tmd_seq, f"{ut.COL_JMD_C}_seq": jmd_c_seq}
+        return seq_kws
+
+    @staticmethod
+    def get_split_kws(split_types: Optional[Union[Literal["Segment", "Pattern", "PeriodicPattern"],
+                                                   Sequence[Literal["Segment", "Pattern", "PeriodicPattern"]]]] = None,
+                      n_split_min: int = 1,
+                      n_split_max: int = 15,
+                      steps_pattern: Optional[Sequence[int]] = None,
+                      n_min: int = 2,
+                      n_max: int = 4,
+                      len_max: int = 15,
+                      steps_periodicpattern: Optional[Sequence[int]] = None,
+                      strategy: Optional[Literal["compositional", "positional"]] = None,
+                      ) -> dict:
+        """
+        Create dictionary with kwargs for three split types:
+
+            - **Segment**: continuous sub-sequence.
+            - **Pattern**: non-periodic discontinuous sub-sequence
+            - **PeriodicPattern**: periodic discontinuous sub-sequence.
+
+        A ``strategy`` preset names the Comparative Physicochemical Profiling (CPP) strategy directly
+        instead of spelling it out through ``split_types``, ``n_split_min``, and ``n_split_max``.
+
+        .. versionadded:: 0.1.0
+
+        .. versionchanged:: 1.2.0
+            Added the ``strategy`` presets for compositional and positional CPP features.
+
+        Parameters
+        ----------
+        split_types : {'Segment', 'Pattern', 'PeriodicPattern'} or list-like of str, default=None
+            Split types for which to create parameter dictionaries. A string selects one type; a non-empty list,
+            tuple, one-dimensional NumPy array, or pandas Series selects the supplied types. If ``None``, all
+            three split types are selected. Must remain ``None`` when ``strategy`` is not ``None``.
+        n_split_min : int, default=1
+            Minimum number of segments for the ``Segment`` entry. Must be >= 1 and no greater than
+            ``n_split_max`` when ``Segment`` is selected. Must remain 1 when ``strategy`` is not ``None``.
+        n_split_max : int, default=15
+            Maximum number of segments for the ``Segment`` entry. Must be >= 1 and no less than
+            ``n_split_min`` when ``Segment`` is selected. Must remain 15 when ``strategy`` is not ``None``.
+        steps_pattern : list-like of int, default=None
+            Step sizes for the ``Pattern`` entry. A supplied list, tuple, one-dimensional NumPy array, or
+            pandas Series must contain at least one non-negative integer and is sorted before use. If ``None``,
+            ``[3, 4]`` is used when ``Pattern`` is selected. For a selected ``Pattern``, all steps must be
+            positive and ``len_max`` must exceed the smallest step.
+        n_min : int, default=2
+            Minimum number of steps for the ``Pattern`` entry. Must be >= 1 and no greater than ``n_max`` when
+            ``Pattern`` is selected.
+        n_max : int, default=4
+            Maximum number of steps for the ``Pattern`` entry. Must be >= 1 and no less than ``n_min`` when
+            ``Pattern`` is selected.
+        len_max : int, default=15
+            Maximum residue position reached by a ``Pattern`` entry as its start position varies. Must be >= 1
+            and exceed the smallest ``steps_pattern`` value when ``Pattern`` is selected.
+        steps_periodicpattern : list-like of int, default=None
+            Alternating step sizes for the ``PeriodicPattern`` entry. A supplied list, tuple, one-dimensional
+            NumPy array, or pandas Series must contain exactly two non-negative integers and is sorted before
+            use. If ``None``, ``[3, 4]`` is used when ``PeriodicPattern`` is selected. For a selected
+            ``PeriodicPattern``, both steps must be positive.
+        strategy : {'compositional', 'positional'} or None, default=None
+            Preset for the CPP strategy, which sets ``split_types``, ``n_split_min``, and ``n_split_max``:
+
+            - ``'compositional'``: a single whole-part ``Segment`` (position-agnostic average), identical to
+              ``get_split_kws(split_types="Segment", n_split_min=1, n_split_max=1)``.
+            - ``'positional'``: sub-segments plus both discontinuous split types, identical to
+              ``get_split_kws(split_types=["Segment", "Pattern", "PeriodicPattern"], n_split_min=2,
+              n_split_max=15)``. ``steps_pattern``, ``n_min``, ``n_max``, ``len_max``, and
+              ``steps_periodicpattern`` still apply.
+
+            Together, both presets cover the default split set. If ``None``, the split set is defined by
+            ``split_types``, ``n_split_min``, and ``n_split_max``. Otherwise, those three parameters must
+            remain at their defaults.
+
+        Returns
+        -------
+        split_kws : dict
+            Nested dictionary for the selected split types. The ``Segment`` entry contains
+            ``n_split_min`` and ``n_split_max``; the ``Pattern`` entry contains ``steps``,
+            ``n_min``, ``n_max``, and ``len_max``; and the ``PeriodicPattern`` entry contains
+            ``steps``. Calling without arguments returns all three entries. ``strategy='compositional'`` returns
+            only ``{'Segment': {'n_split_min': 1, 'n_split_max': 1}}``.
+
+        Raises
+        ------
+        ValueError
+            If ``strategy`` is not ``'compositional'``, ``'positional'``, or ``None``; if ``strategy`` is
+            given while ``split_types``, ``n_split_min``, or ``n_split_max`` is not at its default; if
+            ``split_types`` is empty, neither a string nor an accepted one-dimensional list-like object, or
+            contains an unknown split type; if
+            ``n_split_min``, ``n_split_max``, ``n_min``, ``n_max``, or ``len_max`` is not an integer >= 1;
+            if a supplied step collection is not an accepted one-dimensional list-like object of non-negative
+            integers, has fewer than one ``steps_pattern`` value, or does not have exactly two
+            ``steps_periodicpattern`` values; if a selected ``Pattern`` or ``PeriodicPattern`` has a zero step;
+            or if the bounds of a selected split type are inconsistent
+            (``n_split_min`` > ``n_split_max``, ``n_min`` > ``n_max``, or
+            ``len_max`` <= min(``steps_pattern``)).
+
+        Notes
+        -----
+        The split bounds returned here are validated for internal consistency
+        (e.g., ``n_split_min <= n_split_max``, ``n_min <= n_max``,
+        ``len_max > min(steps_pattern)``); inconsistent values raise a ``ValueError``.
+
+        Beyond that, the *feasible* maxima are effectively capped by the CPP part
+        lengths used to build ``df_parts`` (``tmd_len``, ``jmd_n_len``, ``jmd_c_len``;
+        defaults 20/10/10): a ``Segment`` cannot be split into more pieces than its
+        part has residues, and a ``Pattern``/``PeriodicPattern`` cannot span beyond
+        the part length. Choosing ``n_split_max``, ``n_max``, or ``len_max`` larger
+        than a part can accommodate does not raise here — those splits simply yield
+        empty feature buckets downstream. The one config that is always degenerate
+        regardless of part length, an empty ``Pattern`` bucket where even the shortest
+        repeat exceeds ``len_max`` (``n_min * min(steps_pattern) > len_max``), emits a
+        ``UserWarning`` naming the offending parameters so it can be fixed by raising
+        ``len_max`` or lowering ``steps_pattern``/``n_min``.
+
+        The ``strategy`` presets are convenience only: the returned dictionary is equal to the
+        one from the equivalent explicit call and is consumed downstream in the same way.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_split_kws.rst
+        """
+        # Check input
+        ut.check_str_options(name="strategy", val=strategy, accept_none=True,
+                             list_str_options=ut.LIST_SPLIT_STRATEGIES)
+        split_types_raw = split_types
+        list_split_types = check_split_types(split_types=split_types)
+        args_int = dict(n_split_min=n_split_min, n_split_max=n_split_max, n_min=n_min, n_max=n_max, len_max=len_max)
+        for name in args_int:
+            ut.check_number_range(name=name, val=args_int[name], just_int=True, min_val=1)
+        steps_pattern = ut.check_list_like(name="steps_pattern", val=steps_pattern,
+                                           accept_none=True, check_all_non_neg_int=True)
+        steps_periodicpattern = ut.check_list_like(name="steps_periodicpattern", val=steps_periodicpattern,
+                                                   accept_none=True, check_all_non_neg_int=True)
+        steps_pattern = check_steps(steps=steps_pattern, steps_name="steps_pattern", len_min=1, fixed_len=False)
+        steps_periodicpattern = check_steps(steps=steps_periodicpattern, steps_name="steps_periodicpattern",
+                                            len_min=2, fixed_len=True)
+        check_match_strategy_split_args(strategy=strategy, split_types=split_types_raw,
+                                        n_split_min=n_split_min, n_split_max=n_split_max)
+        if strategy == ut.STR_COMPOSITIONAL:
+            list_split_types, n_split_min, n_split_max = [ut.STR_SEGMENT], 1, 1
+        elif strategy == ut.STR_POSITIONAL:
+            list_split_types, n_split_min, n_split_max = list(ut.LIST_SPLIT_TYPES), 2, 15
+        check_split_args(split_types=list_split_types, n_split_min=n_split_min, n_split_max=n_split_max,
+                         steps_pattern=steps_pattern, n_min=n_min, n_max=n_max, len_max=len_max,
+                         steps_periodicpattern=steps_periodicpattern)
+        # Create kws for splits
+        split_kws = get_split_kws_(n_split_min=n_split_min,
+                                   n_split_max=n_split_max,
+                                   steps_pattern=steps_pattern,
+                                   n_min=n_min,
+                                   n_max=n_max,
+                                   len_max=len_max,
+                                   steps_periodicpattern=steps_periodicpattern,
+                                   split_types=list_split_types)
+        # Post check
+        check_split_kws(split_kws=split_kws)
+        return split_kws
+
+    # Feature methods
+    def get_df_feat(self,
+                    features: Union[ut.ArrayLike1D, pd.DataFrame],
+                    df_parts: pd.DataFrame,
+                    labels: ut.ArrayLike1D,
+                    label_test: int = 1,
+                    label_ref: int = 0,
+                    df_scales: Optional[pd.DataFrame] = None,
+                    df_cat: Optional[pd.DataFrame] = None,
+                    start: int = 1,
+                    tmd_len: int = 20,
+                    jmd_c_len: int = 10,
+                    jmd_n_len: int = 10,
+                    accept_gaps: bool = False,
+                    parametric: bool = False,
+                    n_jobs: Union[int, None] = 1,
+                    ) -> pd.DataFrame:
+        """
+        Create feature DataFrame for given features.
+
+        Depending on the provided labels, the DataFrame is created for one of the three following cases:
+
+            1. Group vs group comparison
+            2. Sample vs group comparison
+            3. Sample vs sample comparison
+
+        * For the group vs group comparison, the general feature position will be provided.
+        * For sample vs group or sample vs sample comparison, the amino acid segments
+          and patterns for the respective sample from the test dataset (label = 1) will be given.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        features : array-like, shape (n_features,) or pd.DataFrame
+            Ids of features (``'PART-SPLIT-SCALE'``) for which ``df_feat`` should be created. Alternatively,
+            a ``df_feat`` DataFrame, in which case its ``'feature'`` column is used.
+        df_parts : pd.DataFrame, shape (n_samples, n_parts)
+            DataFrame with sequence parts. Must cover all parts in ``features``.
+        labels: array-like, shape (n_samples,)
+            Class labels for samples in ``df_parts``. Should contain only two different integer label values,
+            representing test and reference group (typically, 1 and 0).
+        label_test : int, default=1,
+            Class label of test group in ``labels``.
+        label_ref : int, default=0,
+            Class label of reference group in ``labels``.
+        df_scales : pd.DataFrame, shape (n_letters, n_scales), optional
+            DataFrame of scales with letters typically representing amino acids. Default from :meth:`load_scales`
+            unless specified in ``options['df_scales']``.
+        df_cat : pd.DataFrame, shape (n_scales, n_scales_info), optional
+            DataFrame of categories for physicochemical scales. Must contain all scales from ``df_scales``.
+            Default from :meth:`load_scales` with ``name='scales_cat'``, unless specified in ``options['df_cat']``.
+        start : int, default=1
+            Position label of first residue position (starting at N-terminus).
+        tmd_len : int, default=20
+            Length of target middle domain (TMD) (>0).
+        jmd_n_len : int, default=10
+            Length of JMD-N (>=0).
+        jmd_c_len : int, default=10
+            Length of JMD-C (>=0).
+        parametric : bool, default=False
+            Whether to use parametric (T-test) or non-parametric (Mann-Whitney U test) test for p-value computation.
+        accept_gaps : bool, default=False
+            Whether to accept missing values by enabling omitting for computations (if True).
+        n_jobs : int, None, or -1, default=1
+            Number of CPU cores (>=1) used for multiprocessing. If ``None``, the number is optimized automatically.
+            If ``-1``, the number is set to all available cores. Overridden by ``options['n_jobs']`` when set.
+
+        Returns
+        -------
+        df_feat : pd.DataFrame, shape (n_features, n_feature_info)
+            Feature DataFrame with a unique identifier, scale information, statistics, and positions for each feature.
+
+        Notes
+        -----
+        * Use parallel processing only for high number of features (>~1000 features per core)
+        * For sample vs group or sample vs sample comparison, ``df_parts`` must comprise ``jmd_n``, ``tmd``, and
+          ``jmd_c`` sequence parts as well as all parts in features.
+
+        See Also
+        --------
+        * The :meth:`CPP.run` method for creating and filtering Comparative Physicochemical
+          Profiling (CPP) features for discriminating between two groups of sequences.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_df_feat.rst
+        """
+        # Load defaults
+        if df_scales is None:
+            df_scales = ut.load_default_scales()
+        if df_cat is None:
+            df_cat = ut.load_default_scales(scale_cat=True)
+        # Check input
+        ut.check_df_parts(df_parts=df_parts)
+        check_df_scales(df_scales=df_scales)
+        features = ut.check_features(features=features, list_parts=list(df_parts), list_scales=list(df_scales))
+        ut.check_number_val(name="label_test", val=label_test, just_int=True)
+        ut.check_number_val(name="label_ref", val=label_ref, just_int=True)
+        labels = ut.check_labels(labels=labels, vals_required=[label_test, label_ref],
+                                 len_required=len(df_parts), allow_other_vals=False)
+        ut.check_number_val(name="start", val=start, just_int=True, accept_none=False)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=jmd_c_len)
+        args_len, _ = check_parts_len(tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        ut.check_bool(name="parametric", val=parametric)
+        ut.check_bool(name="accept_gaps", val=accept_gaps)
+        check_match_df_parts_features(df_parts=df_parts, features=features)
+        check_match_df_scales_features(df_scales=df_scales, features=features)
+        check_match_features_seq_parts(features=features, **args_len)
+        check_match_df_scales_df_cat(df_scales=df_scales, df_cat=df_cat, verbose=self.verbose)
+        df_parts = check_match_df_parts_df_scales(df_scales=df_scales, df_parts=df_parts, accept_gaps=accept_gaps)
+        check_match_labels_label_test_label_ref(labels=labels, label_test=label_test, label_ref=label_ref)
+        check_match_df_parts_label_test_label_ref(df_parts=df_parts, labels=labels,
+                                                  label_test=label_test, label_ref=label_ref)
+        n_jobs = ut.check_n_jobs(n_jobs=n_jobs)
+        # User warning
+        if self.verbose:
+            warn_creation_of_feature_matrix(features=features, df_parts=df_parts, name="df_feat")
+        # Get sample difference to reference group
+        df_feat = get_df_feat_(features=features, df_parts=df_parts, labels=labels,
+                               label_test=label_test, label_ref=label_ref,
+                               df_scales=df_scales, df_cat=df_cat,
+                               accept_gaps=accept_gaps, parametric=parametric,
+                               start=start, jmd_n_len=jmd_n_len, tmd_len=tmd_len, jmd_c_len=jmd_c_len,
+                               n_jobs=n_jobs)
+        return df_feat
+
+    def feature_matrix(self,
+                       features: Union[ut.ArrayLike1D, pd.DataFrame],
+                       df_parts: Optional[Union[pd.DataFrame, List[pd.DataFrame]]] = None,
+                       df_scales: Optional[pd.DataFrame] = None,
+                       accept_gaps: bool = False,
+                       n_jobs: Union[int, None] = 1,
+                       batch: bool = False,
+                       df_seq: Optional[pd.DataFrame] = None,
+                       df_parts_kws: Optional[dict] = None,
+                       ) -> Union[ut.ArrayLike2D, List[ut.ArrayLike2D]]:
+        """
+        Create feature matrix for given feature ids and sequence parts.
+
+        For each sample (row of ``df_parts``) and each feature id, looks up the
+        physicochemical scale values at the residue positions defined by the feature's
+        Part and Split components and averages them into a single feature value.
+        The result is the numerical input ``X`` consumed by :meth:`CPP.run` and
+        by :meth:`NumericalFeature.filter_correlation`.
+
+        .. versionadded:: 0.1.0
+
+        .. versionchanged:: 1.1.0
+            Added the ``batch`` parameter for building a list of ``df_parts`` in a single pass.
+
+        .. versionchanged:: 1.1.0
+            Added the ``df_seq`` and ``df_parts_kws`` parameters to build ``df_parts`` internally, so the
+            sequence-to-matrix step no longer requires a separate :meth:`get_df_parts` call.
+
+        Parameters
+        ----------
+        features : array-like, shape (n_features,) or pd.DataFrame
+            Ids of features (``'PART-SPLIT-SCALE'``) for which matrix of feature values should be created.
+            Alternatively, a ``df_feat`` DataFrame, in which case its ``'feature'`` column is used.
+        df_parts : pd.DataFrame, shape (n_samples, n_parts), optional
+            DataFrame with sequence parts. If ``batch=True``, instead a **list of such
+            DataFrames** (one per batch; all must share the same part columns). Provide exactly one of
+            ``df_parts`` or ``df_seq``.
+        df_scales : pd.DataFrame, shape (n_letters, n_scales), optional
+            DataFrame of scales with letters typically representing amino acids. Default from :meth:`load_scales`
+            unless specified in ``options['df_scales']``.
+        accept_gaps: bool, default=False
+            Whether to accept missing values by enabling omitting for computations (if ``True``).
+        n_jobs : int, None, or -1, default=1
+            Number of CPU cores (>=1) used for multiprocessing. If ``None``, the number is optimized automatically.
+            If ``-1``, the number is set to all available cores. Overridden by ``options['n_jobs']`` when set.
+        batch : bool, default=False
+            If ``True``, ``df_parts`` is a list of part DataFrames processed in one amortized call
+            (concatenated → Cython builder runs **once** → split back), returning one matrix per batch.
+            Use for per-protein sliding scoring where the same ``features`` are applied to many small
+            ``df_parts`` in a tight loop; the result is **byte-identical** to calling this per batch.
+            Not supported together with ``df_seq``.
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info), optional
+            DataFrame containing an ``entry`` column with unique protein identifiers and sequence information
+            in a distinct format: **Position-based**, **Part-based**, **Sequence-based**, or **Sequence-TMD-based**.
+            If given, ``df_parts`` is built internally via :meth:`get_df_parts`, as an alternative to passing
+            ``df_parts`` directly. Provide exactly one of ``df_parts`` or ``df_seq``.
+        df_parts_kws : dict, optional
+            Keyword arguments forwarded to :meth:`get_df_parts` when building ``df_parts`` from ``df_seq``
+            (e.g. ``{"list_parts": ["tmd"], "jmd_n_len": 10, "jmd_c_len": 10}``). Keys must be
+            :meth:`get_df_parts` parameter names (``df_seq`` excluded); unset options use their defaults.
+            The JMD flank lengths ``jmd_n_len`` / ``jmd_c_len`` default to 10, while ``tmd_len`` defaults
+            to ``None`` (the TMD length is variable, read from each sequence, except in the Position-based
+            input mode where it is fixed). Only valid together with ``df_seq``.
+
+        Returns
+        -------
+        X : array-like, shape (n_samples, n_features)
+            Feature matrix containing feature values for samples. If ``batch=True``, a **list** of such
+            matrices aligned to the input list of ``df_parts``.
+
+        Notes
+        -----
+        * Use parallel processing only for high number of features (>~1000 features per core)
+        * ``batch=True`` amortizes the per-call scale-lookup build and kernel warm-up that dominate when
+          this method is called thousands of times on small ``df_parts``.
+
+        Examples
+        --------
+        .. include:: examples/sf_feature_matrix.rst
+        """
+        # Resolve sequence input: exactly one of 'df_parts' / 'df_seq' (mutually exclusive)
+        ut.check_bool(name="batch", val=batch)
+        if (df_parts is None) == (df_seq is None):
+            raise ValueError("Exactly one of 'df_parts' or 'df_seq' should be given (not both, not neither).")
+        check_df_parts_kws(df_parts_kws=df_parts_kws, df_seq=df_seq)
+        if df_seq is not None:
+            if batch:
+                raise ValueError("'batch=True' is not supported together with 'df_seq'; "
+                                 "build the part DataFrames yourself and pass them as a list via 'df_parts'.")
+            # Build df_parts internally via the existing get_df_parts logic (same result as the two-step call)
+            df_parts = self.get_df_parts(df_seq=df_seq, **(df_parts_kws or {}))
+        # Load defaults
+        if df_scales is None:
+            df_scales = ut.load_default_scales()
+        # Check input
+        check_df_scales(df_scales=df_scales)
+        ut.check_bool(name="accept_gaps", val=accept_gaps)
+        n_jobs = ut.check_n_jobs(n_jobs=n_jobs)
+        # Normalize to a list of df_parts; remember whether to unwrap the single result.
+        if batch:
+            if isinstance(df_parts, pd.DataFrame):
+                raise ValueError("With 'batch=True', 'df_parts' should be a list of part "
+                                 "DataFrames, not a single DataFrame.")
+            list_df_parts = ut.check_list_like(name="df_parts", val=df_parts, accept_none=False)
+            if len(list_df_parts) == 0:
+                raise ValueError("'df_parts' should contain at least one DataFrame when 'batch=True'.")
+        else:
+            ut.check_df_parts(df_parts=df_parts)
+            list_df_parts = [df_parts]
+        for i, dfp in enumerate(list_df_parts):
+            ut.check_df_parts(df_parts=dfp)
+        cols0 = list(list_df_parts[0].columns)
+        features = ut.check_features(features=features, list_parts=cols0, list_scales=list(df_scales))
+        check_match_df_scales_features(df_scales=df_scales, features=features)
+        for i, dfp in enumerate(list_df_parts):
+            if list(dfp.columns) != cols0:
+                raise ValueError(f"'df_parts' entry {i} parts {list(dfp.columns)} should match "
+                                 f"the first entry's parts {cols0}.")
+            check_match_df_parts_features(df_parts=dfp, features=features)
+        # User warning (single-mode parity with the historical behavior)
+        if self.verbose and not batch:
+            warn_creation_of_feature_matrix(features=features, df_parts=list_df_parts[0])
+        # Concatenate -> build ONCE (same Cython/fast builder as CPP.run; byte-identical to
+        # the legacy ``get_feature_matrix_``, parity-tested) -> split back per batch.
+        lengths = [len(dfp) for dfp in list_df_parts]
+        df_all = pd.concat(list_df_parts, axis=0, ignore_index=True)
+        df_all = check_match_df_parts_df_scales(df_scales=df_scales, df_parts=df_all, accept_gaps=accept_gaps)
+        builder = _pick_feature_matrix_builder()
+        X_all = builder(features=features, df_parts=df_all, df_scales=df_scales,
+                        accept_gaps=accept_gaps, n_jobs=n_jobs)
+        list_X, start = [], 0
+        for n in lengths:
+            list_X.append(X_all[start:start + n])
+            start += n
+        return list_X if batch else list_X[0]
+
+    def scale_composition(self,
+                          df_seq: pd.DataFrame,
+                          df_scales: Optional[pd.DataFrame] = None,
+                          list_parts: Optional[Union[str, List[str]]] = None,
+                          return_df: bool = False,
+                          ) -> Union[ut.ArrayLike2D, pd.DataFrame]:
+        """
+        Create the scale-composition baseline matrix for given sequences and scales.
+
+        Builds the no-positional-split **scale-based baseline** featurization: for each
+        sequence the requested Parts are concatenated into one span, and every scale is
+        averaged over the residues of that span, yielding one value per scale. The result
+        is the ``(n_seq, n_scales)`` matrix ``X`` — the sequence's mean profile in
+        scale-space, the scale-based analogue of amino-acid composition. Unlike
+        :meth:`SequenceFeature.feature_matrix`, which averages each scale over the residues
+        of a specific Part-Split, this method averages each scale over the **whole span**
+        (a single mean per scale), with no positional information.
+
+        **Application.** Use this to build a **baseline feature set** for a prediction
+        model: fit the same classifier on this scale-composition ``X`` and on a
+        :class:`CPP` :meth:`feature_matrix` and compare the scores to show how much the
+        positional Part-Split-Scale features add over a plain scale-average encoding (the
+        "scale baseline vs CPP" comparison). It is *not* a positional feature set — reach
+        for :class:`CPP` when you need where-along-the-sequence information.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein identifiers and sequence information
+            in a distinct format: **Position-based**, **Part-based**, **Sequence-based**, or **Sequence-TMD-based**
+            (the same input accepted by :meth:`SequenceFeature.get_df_parts`).
+        df_scales : pd.DataFrame, shape (n_letters, n_scales), optional
+            DataFrame of scales with letters (amino acids) as index. Default from :meth:`load_scales`
+            unless specified in ``options['df_scales']``. The index defines which residues are scored;
+            residues absent from it are dropped before averaging.
+        list_parts : str or list of str, optional
+            Names of the sequence parts to average over (see :class:`SequenceFeature` for valid parts).
+            If ``None`` (default), the whole TMD-JMD span ``jmd_n`` + ``tmd`` + ``jmd_c`` (the ``tmd_jmd``
+            part) is used. Multiple parts are concatenated per sequence before averaging.
+        return_df : bool, default=False
+            If ``True``, return a labeled ``pd.DataFrame`` (rows indexed like ``df_parts``, one column per
+            scale) instead of a plain numpy array.
+
+        Returns
+        -------
+        X : array-like, shape (n_samples, n_scales)
+            Scale-average matrix containing, per sequence, the mean of each scale over the span residues.
+            Returned as a ``pd.DataFrame`` (scale names as columns) when ``return_df=True``.
+
+        Notes
+        -----
+        * **Missing / non-canonical residues**: a residue is averaged only if it is an index label of
+          ``df_scales``. Gap symbols (``'-'``) and any other non-canonical symbol (e.g. ``'X'``) are
+          dropped per the package convention, so the mean is taken over the scored residues only.
+        * A sequence whose span has **no** scored residue (empty span, or all residues non-canonical)
+          yields an all-``NaN`` row; a ``UserWarning`` naming the count is emitted when ``verbose=True``.
+        * This is a no-positional-split mean only; positional splits remain the job of :class:`CPP`.
+
+        See Also
+        --------
+        * :meth:`SequenceFeature.feature_matrix` for the positional Part-Split-Scale feature matrix.
+        * :meth:`SequenceFeature.get_df_parts` for the part-slicing used to build the span.
+
+        Examples
+        --------
+        .. include:: examples/sf_scale_composition.rst
+        """
+        # Load defaults
+        if df_scales is None:
+            df_scales = ut.load_default_scales()
+        # Check input
+        ut.check_df_seq(df_seq=df_seq)
+        check_df_scales(df_scales=df_scales)
+        ut.check_bool(name="return_df", val=return_df)
+        list_parts = ut.check_list_parts(list_parts=list_parts, return_default=False, accept_none=True)
+        # Resolve parts: None -> whole TMD-JMD span (jmd_n + tmd + jmd_c, the "tmd_jmd" part)
+        list_parts_used = ["tmd_jmd"] if list_parts is None else list_parts
+        # Build the sequence parts and the scale-average matrix
+        df_parts = self.get_df_parts(df_seq=df_seq, list_parts=list_parts_used)
+        X, n_kept = get_scale_composition_(df_parts=df_parts, df_scales=df_scales)
+        # Warn about rows that had no scored residue (all-NaN output)
+        n_empty = int((n_kept == 0).sum())
+        if n_empty > 0 and self.verbose:
+            warnings.warn(f"{n_empty} sequence(s) have no scored residue in the selected parts "
+                          f"(empty or all non-canonical); their scale-average row is all-NaN.")
+        if return_df:
+            return pd.DataFrame(X, index=df_parts.index, columns=list(df_scales.columns))
+        return X
+
+    def aa_composition(self,
+                       df_seq: pd.DataFrame,
+                       list_parts: Optional[Union[str, List[str]]] = None,
+                       return_df: bool = False,
+                       ) -> Union[ut.ArrayLike2D, pd.DataFrame]:
+        """
+        Create the amino-acid-composition (AAC) baseline matrix for given sequences.
+
+        Builds the no-positional-split **amino-acid-composition baseline** featurization: for
+        each sequence the requested Parts are concatenated into one span and the fraction of
+        each of the 20 canonical amino acids over that span is computed, yielding the
+        ``(n_seq, 20)`` matrix ``X``. The 20 columns follow the canonical order
+        ``ut.LIST_CANONICAL_AA`` (``A, C, D, ..., Y``) so column order is stable, and each row
+        sums to 1. Unlike :meth:`SequenceFeature.feature_matrix`, which averages scales over a
+        specific Part-Split, this method carries no positional information — it is a plain
+        residue frequency count.
+
+        **Application.** Use this to build a **baseline feature set** for a prediction model:
+        fit the same classifier on this composition ``X`` and on a :class:`CPP`
+        :meth:`feature_matrix` and compare the scores to show how much the positional
+        Part-Split-Scale features add over a plain amino-acid frequency encoding (the "AAC
+        baseline vs CPP" comparison). It is *not* a positional feature set — reach for
+        :class:`CPP` when you need where-along-the-sequence information.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein identifiers and sequence information
+            in a distinct format: **Position-based**, **Part-based**, **Sequence-based**, or **Sequence-TMD-based**
+            (the same input accepted by :meth:`SequenceFeature.get_df_parts`).
+        list_parts : str or list of str, optional
+            Names of the sequence parts to count over (see :class:`SequenceFeature` for valid parts).
+            If ``None`` (default), the whole TMD-JMD span ``jmd_n`` + ``tmd`` + ``jmd_c`` (the ``tmd_jmd``
+            part) is used. Multiple parts are concatenated per sequence before counting.
+        return_df : bool, default=False
+            If ``True``, return a labeled ``pd.DataFrame`` (rows indexed like ``df_parts``, one column per
+            canonical amino acid) instead of a plain numpy array.
+
+        Returns
+        -------
+        X : array-like, shape (n_samples, 20)
+            Amino-acid-composition matrix containing, per sequence, the fraction of each of the 20 canonical
+            amino acids over the span residues (columns in ``ut.LIST_CANONICAL_AA`` order). Returned as a
+            ``pd.DataFrame`` (amino-acid letters as columns) when ``return_df=True``.
+
+        Notes
+        -----
+        * **Missing / non-canonical residues**: only the 20 canonical amino acids are counted. Gap symbols
+          (``'-'``) and any other non-canonical symbol (e.g. ``'X'``) are dropped per the package convention,
+          so the fractions are taken over the canonical residues only and sum to 1.
+        * A sequence whose span has **no** canonical residue (empty span, or all residues non-canonical)
+          yields an all-``NaN`` row; a ``UserWarning`` naming the count is emitted when ``verbose=True``.
+        * This is a no-positional-split composition only; positional splits remain the job of :class:`CPP`.
+
+        See Also
+        --------
+        * :meth:`SequenceFeature.dipeptide_composition` for the ordered adjacent-pair (DPC) baseline.
+        * :meth:`SequenceFeature.scale_composition` for the scale-based composition baseline.
+        * :meth:`SequenceFeature.feature_matrix` for the positional Part-Split-Scale feature matrix.
+
+        Examples
+        --------
+        .. include:: examples/sf_aa_composition.rst
+        """
+        # Check input
+        ut.check_df_seq(df_seq=df_seq)
+        ut.check_bool(name="return_df", val=return_df)
+        list_parts = ut.check_list_parts(list_parts=list_parts, return_default=False, accept_none=True)
+        # Resolve parts: None -> whole TMD-JMD span (jmd_n + tmd + jmd_c, the "tmd_jmd" part)
+        list_parts_used = ["tmd_jmd"] if list_parts is None else list_parts
+        # Build the sequence parts and the amino-acid-composition matrix
+        df_parts = self.get_df_parts(df_seq=df_seq, list_parts=list_parts_used)
+        X, n_kept = get_aa_composition_(df_parts=df_parts)
+        # Warn about rows that had no canonical residue (all-NaN output)
+        n_empty = int((n_kept == 0).sum())
+        if n_empty > 0 and self.verbose:
+            warnings.warn(f"{n_empty} sequence(s) have no canonical residue in the selected parts "
+                          f"(empty or all non-canonical); their composition row is all-NaN.")
+        if return_df:
+            return pd.DataFrame(X, index=df_parts.index, columns=list(ut.LIST_CANONICAL_AA))
+        return X
+
+    def dipeptide_composition(self,
+                              df_seq: pd.DataFrame,
+                              list_parts: Optional[Union[str, List[str]]] = None,
+                              return_df: bool = False,
+                              ) -> Union[ut.ArrayLike2D, pd.DataFrame]:
+        """
+        Create the dipeptide-composition (DPC) baseline matrix for given sequences.
+
+        Builds the no-positional-split **dipeptide-composition baseline** featurization: for
+        each sequence the requested Parts are concatenated into one span and the fraction of
+        each of the 400 ordered adjacent canonical amino-acid pairs over that span is computed,
+        yielding the ``(n_seq, 400)`` matrix ``X``. The 400 columns are the ordered pairs
+        ``AA, AC, ..., YY`` in ``ut.LIST_CANONICAL_AA`` order (pair ``xy`` = first residue ``x``
+        followed by second residue ``y``) so column order is stable, and each row with at least
+        two canonical residues sums to 1. Unlike :meth:`SequenceFeature.feature_matrix`, which
+        averages scales over a specific Part-Split, this method carries no positional
+        information — it is a plain adjacent-pair frequency count.
+
+        **Application.** Use this to build a **baseline feature set** for a prediction model:
+        fit the same classifier on this composition ``X`` and on a :class:`CPP`
+        :meth:`feature_matrix` and compare the scores to show how much the positional
+        Part-Split-Scale features add over a plain dipeptide-frequency encoding (the "DPC
+        baseline vs CPP" comparison). DPC captures local sequential order (which residue
+        follows which) that plain amino-acid composition discards, while still being
+        position-agnostic — reach for :class:`CPP` when you need where-along-the-sequence
+        information.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein identifiers and sequence information
+            in a distinct format: **Position-based**, **Part-based**, **Sequence-based**, or **Sequence-TMD-based**
+            (the same input accepted by :meth:`SequenceFeature.get_df_parts`).
+        list_parts : str or list of str, optional
+            Names of the sequence parts to count pairs over (see :class:`SequenceFeature` for valid parts).
+            If ``None`` (default), the whole TMD-JMD span ``jmd_n`` + ``tmd`` + ``jmd_c`` (the ``tmd_jmd``
+            part) is used. Multiple parts are concatenated per sequence before pairing, so an adjacent pair
+            may cross a part boundary (see Notes).
+        return_df : bool, default=False
+            If ``True``, return a labeled ``pd.DataFrame`` (rows indexed like ``df_parts``, one column per
+            ordered amino-acid pair) instead of a plain numpy array.
+
+        Returns
+        -------
+        X : array-like, shape (n_samples, 400)
+            Dipeptide-composition matrix containing, per sequence, the fraction of each of the 400 ordered
+            adjacent canonical amino-acid pairs over the span (columns ``AA, AC, ..., YY`` in
+            ``ut.LIST_CANONICAL_AA`` order). Returned as a ``pd.DataFrame`` (pair strings as columns) when
+            ``return_df=True``.
+
+        Notes
+        -----
+        * **Missing / non-canonical residues**: only the 20 canonical amino acids are counted. Gap symbols
+          (``'-'``) and any other non-canonical symbol (e.g. ``'X'``) are dropped **before** pairing per the
+          package convention, so the remaining canonical residues form one contiguous chain — an adjacent
+          pair therefore spans over a dropped residue rather than being broken by it.
+        * **Part boundaries**: parts are concatenated into one span (matching
+          :meth:`SequenceFeature.scale_composition`), so when multiple ``list_parts`` are given an adjacent
+          pair **does** cross the boundary between two concatenated parts (the last residue of one part pairs
+          with the first residue of the next).
+        * A sequence whose span has **fewer than two** canonical residues (empty, a single residue, or all
+          non-canonical) has no adjacent pair and yields an all-``NaN`` row; a ``UserWarning`` naming the
+          count is emitted when ``verbose=True``.
+        * This is a no-positional-split composition only; positional splits remain the job of :class:`CPP`.
+
+        See Also
+        --------
+        * :meth:`SequenceFeature.aa_composition` for the single-residue (AAC) baseline.
+        * :meth:`SequenceFeature.scale_composition` for the scale-based composition baseline.
+        * :meth:`SequenceFeature.feature_matrix` for the positional Part-Split-Scale feature matrix.
+
+        Examples
+        --------
+        .. include:: examples/sf_dipeptide_composition.rst
+        """
+        # Check input
+        ut.check_df_seq(df_seq=df_seq)
+        ut.check_bool(name="return_df", val=return_df)
+        list_parts = ut.check_list_parts(list_parts=list_parts, return_default=False, accept_none=True)
+        # Resolve parts: None -> whole TMD-JMD span (jmd_n + tmd + jmd_c, the "tmd_jmd" part)
+        list_parts_used = ["tmd_jmd"] if list_parts is None else list_parts
+        # Build the sequence parts and the dipeptide-composition matrix
+        df_parts = self.get_df_parts(df_seq=df_seq, list_parts=list_parts_used)
+        X, n_pairs = get_dipeptide_composition_(df_parts=df_parts)
+        # Warn about rows that had fewer than two canonical residues (all-NaN output)
+        n_empty = int((n_pairs == 0).sum())
+        if n_empty > 0 and self.verbose:
+            warnings.warn(f"{n_empty} sequence(s) have fewer than two canonical residues in the selected "
+                          f"parts (no adjacent pair); their composition row is all-NaN.")
+        if return_df:
+            list_aa = list(ut.LIST_CANONICAL_AA)
+            columns = [a + b for a in list_aa for b in list_aa]
+            return pd.DataFrame(X, index=df_parts.index, columns=columns)
+        return X
+
+    def kmer_composition(self,
+                         df_seq: pd.DataFrame,
+                         k: int = 1,
+                         list_parts: Optional[Union[str, List[str]]] = None,
+                         return_df: bool = False,
+                         return_scales: bool = False,
+                         ) -> Union[ut.ArrayLike2D, pd.DataFrame, Tuple]:
+        """
+        Create the k-mer-composition (k-mer) baseline matrix for given sequences.
+
+        Builds the no-positional-split **k-mer-composition baseline** featurization: for each
+        sequence the requested Parts are concatenated into one span and the fraction of each of the
+        ``20 ** k`` ordered overlapping k-mers of adjacent canonical residues is computed, yielding
+        the ``(n_seq, 20 ** k)`` matrix ``X``. Columns are all length-``k`` amino-acid strings in
+        ``ut.LIST_CANONICAL_AA`` order (``itertools.product`` order: ``A, C, ..., Y`` for ``k=1``;
+        ``AA, AC, ..., YY`` for ``k=2``; ...) so column order is stable, and each row with at least
+        ``k`` canonical residues sums to 1. ``k=1`` is amino-acid composition (AAC, identical to
+        :meth:`aa_composition`) and ``k=2`` dipeptide composition (DPC, identical to
+        :meth:`dipeptide_composition`); higher ``k`` captures longer local sequential order. Unlike
+        :meth:`SequenceFeature.feature_matrix`, which averages scales over a specific Part-Split, this
+        method carries no positional information — it is a plain k-mer frequency count.
+
+        **Application.** Use this to build a **baseline feature set** for a prediction model and
+        compare it against a :class:`CPP` :meth:`feature_matrix` (the "composition baseline vs CPP"
+        comparison), quantifying how much the positional Part-Split-Scale features add over a plain
+        k-mer frequency encoding. Larger ``k`` encodes more local order at the cost of a
+        ``20 ** k``-wide, sparser matrix — reach for :class:`CPP` when you need
+        where-along-the-sequence information.
+
+        **Compositional descriptors (iFeature parity).** These non-positional, fixed-length
+        residue-frequency vectors are the classic *composition* descriptors of tools such as
+        **iFeature** [Chen18]_. The supported approaches:
+
+        * **AAC** (amino-acid composition, ``k=1``) — the fraction of each of the 20 amino acids
+          (20-D). The simplest composition; captures *which* residues, not order.
+        * **DPC** (dipeptide composition, ``k=2``) — the fraction of each ordered adjacent pair
+          (400-D). Adds local *sequential order* (which residue follows which).
+        * **k-mer** (``k >= 3``) — the general ``20 ** k``-D extension to longer motifs; grows
+          exponentially and sparsifies quickly, so it is most reliable at low ``k``.
+
+        Other iFeature-style descriptors (CTD — composition/transition/distribution of
+        physicochemical groups, PAAC — pseudo amino-acid composition, DDE, ...) are the natural
+        follow-ups to complete the family. To turn any of these into a :class:`CPP` ``df_feat`` (AAC
+        positional; DPC/k-mer non-positional), see :meth:`CPP.run_composit`.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein identifiers and sequence information
+            in a distinct format: **Position-based**, **Part-based**, **Sequence-based**, or **Sequence-TMD-based**
+            (the same input accepted by :meth:`SequenceFeature.get_df_parts`).
+        k : int, default=1
+            k-mer length (``>= 1``). ``1`` gives amino-acid composition (AAC, 20 columns), ``2`` the
+            dipeptide composition (DPC, 400 columns), ``3`` tripeptides (8000), ``4`` tetrapeptides
+            (160000). Capped at ``4`` because the ``20 ** k`` column count grows exponentially.
+        list_parts : str or list of str, optional
+            Sequence Parts concatenated into the span (default ``'tmd_jmd'``, the whole TMD-JMD span),
+            passed to :meth:`SequenceFeature.get_df_parts`.
+        return_df : bool, default=False
+            If ``True``, return a labeled ``pd.DataFrame`` (rows indexed like ``df_parts``, one column
+            per k-mer) instead of a plain array.
+        return_scales : bool, default=False
+            If ``True``, also return the CPP-ready ``(df_scales, df_cat)`` for the composition, i.e.
+            the return becomes the 3-tuple ``(X, df_scales, df_cat)``. For ``k=1`` (AAC) ``df_scales`` is
+            the ``(20, 20)`` one-hot identity scale set — pass it with ``df_cat`` to :meth:`CPP.run`
+            (whole-part ``Segment(1,1)`` split) to obtain amino-acid composition as a real ``df_feat`` /
+            feature map. For ``k>=2`` ``df_scales`` is ``None`` (a k-mer is not a per-residue scale, so
+            it cannot be a CPP scale) and ``df_cat`` categorizes the k-mers by residue class for the
+            composition map's grouping / labels.
+
+        Returns
+        -------
+        X : array-like, shape (n_samples, 20 ** k)
+            k-mer-composition matrix: per sequence, the fraction of each of the ``20 ** k`` ordered
+            k-mers over the span residues (columns in
+            ``itertools.product(ut.LIST_CANONICAL_AA, repeat=k)`` order). A span with fewer than ``k``
+            canonical residues has an all-``NaN`` row. Returned as a ``pd.DataFrame`` (k-mer strings as
+            columns) when ``return_df=True``. When ``return_scales=True`` the return is the 3-tuple
+            ``(X, df_scales, df_cat)`` (``df_scales`` is ``None`` for ``k>=2``).
+
+        See Also
+        --------
+        * :meth:`SequenceFeature.aa_composition`: the ``k=1`` amino-acid-composition special case.
+        * :meth:`SequenceFeature.dipeptide_composition`: the ``k=2`` dipeptide-composition special case.
+        * :meth:`SequenceFeature.scale_composition`: the scale-based composition baseline.
+        * :meth:`SequenceFeature.feature_matrix`: the positional Part-Split-Scale feature matrix.
+
+        Examples
+        --------
+        .. include:: examples/sf_kmer_composition.rst
+        """
+        # Check input
+        ut.check_df_seq(df_seq=df_seq)
+        ut.check_bool(name="return_df", val=return_df)
+        ut.check_bool(name="return_scales", val=return_scales)
+        if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or int(k) < 1:
+            raise ValueError(f"'k' should be an integer >= 1, got {k!r}.")
+        k = int(k)
+        if k > 4:
+            raise ValueError(f"'k'={k} would create 20**{k} = {20 ** k:,} columns; 'k' is capped at 4 "
+                             f"(k=1 AAC, k=2 DPC, k=3 tripeptides, k=4 tetrapeptides).")
+        list_parts = ut.check_list_parts(list_parts=list_parts, return_default=False, accept_none=True)
+        list_parts_used = ["tmd_jmd"] if list_parts is None else list_parts
+        # Build the sequence parts and the k-mer-composition matrix
+        df_parts = self.get_df_parts(df_seq=df_seq, list_parts=list_parts_used)
+        X, n_kmers = get_kmer_composition_(df_parts=df_parts, k=k)
+        # Warn about rows with fewer than k canonical residues (all-NaN output)
+        n_empty = int((n_kmers == 0).sum())
+        if n_empty > 0 and self.verbose:
+            warnings.warn(f"{n_empty} sequence(s) have fewer than k={k} canonical residues in the "
+                          f"selected parts (no k-mer); their composition row is all-NaN.")
+        if return_df:
+            columns = ["".join(p) for p in itertools.product(ut.LIST_CANONICAL_AA, repeat=k)]
+            X = pd.DataFrame(X, index=df_parts.index, columns=columns)
+        if return_scales:
+            df_scales, df_cat = get_composition_scales_(k=k)
+            return X, df_scales, df_cat
+        return X
+
+    def acc(self,
+            df_seq: pd.DataFrame,
+            df_scales: Optional[pd.DataFrame] = None,
+            list_parts: Optional[Union[str, List[str]]] = None,
+            n_lag: int = 1,
+            return_df: bool = False,
+            ) -> Union[ut.ArrayLike2D, pd.DataFrame]:
+        """
+        Create the scale auto-covariance (ACC) baseline matrix for given sequences and scales.
+
+        Builds the no-positional-split, **order-aware scale baseline** featurization: for each
+        sequence the requested Parts are concatenated into one span and, for every scale and lag
+        ``k`` (``1 .. n_lag``), the mean-centered auto-covariance of that scale's values along the
+        span is computed, yielding the ``(n_seq, n_scales * n_lag)`` matrix ``X``. Unlike
+        :meth:`SequenceFeature.scale_composition`, which reduces each scale to a single span mean
+        (an order-blind average), this method measures how each scale's value at one residue
+        co-varies with its value ``k`` residues later — the lag extension of ``scale_composition``
+        that keeps short-range sequential order in scale-space while staying position-agnostic.
+
+        **Application.** Use this as the **order-aware, non-positional baseline** in a "baseline vs
+        CPP" comparison: it is the natural middle point between :meth:`scale_composition` (an
+        order-blind scale mean) and :class:`CPP` (fully positional Part-Split-Scale features). Fit
+        the same classifier on this ACC ``X`` and on a :class:`CPP` :meth:`feature_matrix` to show
+        how much CPP's positional features add over a plain lag-covariance encoding. It is *not* a
+        positional feature set — reach for :class:`CPP` when you need where-along-the-sequence
+        information. This is the scale-covariance analogue of the auto-cross-covariance (ACC)
+        descriptors used by sequence-featurization tools such as iFeature / PROFEAT [Chen18]_.
+
+        **Definition.** For a span with per-position scale matrix ``S`` (shape ``L_span x
+        n_scales``) restricted to the residues present in ``df_scales.index``, let ``mean_j`` be the
+        mean of column ``j`` over the ``N`` scored residues. For lag ``k``,
+        ``AC(j, k) = sum_{i=1}^{N-k} (S[i, j] - mean_j) * (S[i + k, j] - mean_j) / (N - k)``. If
+        ``N - k < 1`` for a given lag (span too short), that lag's entries are ``NaN``.
+
+        **Scale basis.** Only the **auto-covariance** (each scale with itself at lag ``k``) over the
+        **full default** ``df_scales`` is computed — no cross-covariance between different scales
+        and no scale-set swap. This is the clean lag extension of :meth:`scale_composition` (same
+        default scales, span, and NaN handling), giving ``n_scales * n_lag`` columns; the full
+        cross-covariance would be ``n_scales * (n_scales - 1) * n_lag`` columns and is intentionally
+        out of scope.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_seq : pd.DataFrame, shape (n_samples, n_seq_info)
+            DataFrame containing an ``entry`` column with unique protein identifiers and sequence information
+            in a distinct format: **Position-based**, **Part-based**, **Sequence-based**, or **Sequence-TMD-based**
+            (the same input accepted by :meth:`SequenceFeature.get_df_parts`).
+        df_scales : pd.DataFrame, shape (n_letters, n_scales), optional
+            DataFrame of scales with letters (amino acids) as index. Default from :meth:`load_scales`
+            unless specified in ``options['df_scales']``. The index defines which residues are scored;
+            residues absent from it are dropped before the covariance is taken.
+        list_parts : str or list of str, optional
+            Names of the sequence parts to cover (see :class:`SequenceFeature` for valid parts).
+            If ``None`` (default), the whole TMD-JMD span ``jmd_n`` + ``tmd`` + ``jmd_c`` (the ``tmd_jmd``
+            part) is used. Multiple parts are concatenated per sequence before the covariance is taken.
+        n_lag : int, default=1
+            Number of lags (``>= 1``). Lags ``1 .. n_lag`` are computed; the output has
+            ``n_scales * n_lag`` columns in lag-major order (all scales for lag 1, then all scales for
+            lag 2, ...). Larger lags need longer spans (lag ``k`` needs at least ``k + 1`` scored residues).
+        return_df : bool, default=False
+            If ``True``, return a labeled ``pd.DataFrame`` (rows indexed like ``df_parts``, one column per
+            scale-and-lag named ``f"{scale}_lag{k}"``) instead of a plain numpy array.
+
+        Returns
+        -------
+        X : array-like, shape (n_samples, n_scales * n_lag)
+            Scale auto-covariance matrix containing, per sequence, the lag-``1 .. n_lag`` mean-centered
+            auto-covariance of each scale over the span residues (lag-major column order). Returned as a
+            ``pd.DataFrame`` (``f"{scale}_lag{k}"`` columns) when ``return_df=True``.
+
+        Notes
+        -----
+        * **Missing / non-canonical residues**: a residue is used only if it is an index label of
+          ``df_scales``. Gap symbols (``'-'``) and any other non-canonical symbol (e.g. ``'X'``) are
+          dropped **before** the covariance per the package convention, so the scored residues form one
+          contiguous chain and a lag-``k`` pair spans over a dropped residue rather than being broken by it.
+        * A lag ``k`` whose span has fewer than ``k + 1`` scored residues (``N - k < 1``) has its columns
+          filled with ``NaN``; a span with fewer than two scored residues (too short for lag 1) is an
+          all-``NaN`` row, and a ``UserWarning`` naming the count is emitted when ``verbose=True``.
+        * This is a no-positional-split covariance only; positional splits remain the job of :class:`CPP`.
+
+        See Also
+        --------
+        * :meth:`SequenceFeature.scale_composition` for the order-blind scale-average baseline (lag-0 mean).
+        * :meth:`SequenceFeature.dipeptide_composition` for the order-aware residue-frequency (DPC) baseline.
+        * :meth:`SequenceFeature.feature_matrix` for the positional Part-Split-Scale feature matrix.
+
+        Examples
+        --------
+        .. include:: examples/sf_acc.rst
+        """
+        # Load defaults
+        if df_scales is None:
+            df_scales = ut.load_default_scales()
+        # Check input
+        ut.check_df_seq(df_seq=df_seq)
+        check_df_scales(df_scales=df_scales)
+        ut.check_number_range(name="n_lag", val=n_lag, min_val=1, just_int=True)
+        ut.check_bool(name="return_df", val=return_df)
+        list_parts = ut.check_list_parts(list_parts=list_parts, return_default=False, accept_none=True)
+        n_lag = int(n_lag)
+        # Resolve parts: None -> whole TMD-JMD span (jmd_n + tmd + jmd_c, the "tmd_jmd" part)
+        list_parts_used = ["tmd_jmd"] if list_parts is None else list_parts
+        # Build the sequence parts and the auto-covariance matrix
+        df_parts = self.get_df_parts(df_seq=df_seq, list_parts=list_parts_used)
+        X, n_kept = get_acc_(df_parts=df_parts, df_scales=df_scales, n_lag=n_lag)
+        # Warn about rows too short for the smallest lag (all-NaN output)
+        n_short = int((n_kept < 2).sum())
+        if n_short > 0 and self.verbose:
+            warnings.warn(f"{n_short} sequence(s) have fewer than two scored residues in the selected "
+                          f"parts (too short for lag 1); their auto-covariance row is all-NaN.")
+        if return_df:
+            columns = [f"{scale}_lag{k}" for k in range(1, n_lag + 1) for scale in df_scales.columns]
+            return pd.DataFrame(X, index=df_parts.index, columns=columns)
+        return X
+
+    def prune_by_variance(self,
+                          df_feat: pd.DataFrame,
+                          df_parts: Optional[pd.DataFrame] = None,
+                          df_scales: Optional[pd.DataFrame] = None,
+                          threshold: float = 0.0,
+                          X: Optional[ut.ArrayLike2D] = None,
+                          accept_gaps: bool = False,
+                          n_jobs: Union[int, None] = 1,
+                          ) -> pd.DataFrame:
+        """
+        Prune near-constant features from a feature DataFrame by variance.
+
+        Model-free **feature pruning** step: drops every feature whose column variance in the
+        realized feature matrix (built from ``df_parts``, or supplied directly via ``X``) is at or
+        below ``threshold``, and returns the row-filtered ``df_feat``. Use it on a fitted
+        ``df_feat`` (e.g. from :meth:`CPP.run`) as the first reduction stage, before
+        :meth:`SequenceFeature.prune_by_correlation` and :meth:`TreeModel.select_features`.
+
+        This is distinct from CPP's in-run pre-filter (which screens candidate features by the
+        test-group standard deviation): pruning measures variance over **all** samples of the
+        already-selected features.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_feat : pd.DataFrame, shape (n_features, n_feature_info)
+            Feature DataFrame with a unique identifier, scale information, statistics, and positions for
+            each feature.
+        df_parts : pd.DataFrame, shape (n_samples, n_parts), optional
+            DataFrame with sequence parts. Used to build the feature matrix; not required if ``X`` is given.
+        df_scales : pd.DataFrame, shape (n_letters, n_scales), optional
+            DataFrame of scales with letters typically representing amino acids. Default from :meth:`load_scales`
+            unless specified in ``options['df_scales']``.
+        threshold : float, default=0.0
+            Minimum **population variance** (``numpy`` ``var``, ``ddof=0``) a feature's column must exceed
+            to be kept; the threshold is in **variance units**, not standard-deviation units. Feature
+            values are means of (typically ``[0, 1]``-normalized) scale values, so variances are small —
+            commonly below ``0.1`` — and a useful range is: ``0.0`` removes only strictly constant
+            features, while ``~0.01`` to ``~0.05`` also prunes low-variance features. The variance is
+            computed **over all provided samples** (every row of ``df_parts`` / ``X``, both classes
+            together) per feature column — not the test group only, and not per split.
+        X : array-like, shape (n_samples, n_features), optional
+            Pre-computed feature matrix. Column ``i`` must correspond to the feature in row ``i`` of
+            ``df_feat`` (same order). If given, it is used directly and ``df_parts`` / ``df_scales`` are
+            ignored (e.g. to reuse a matrix across pruning calls or to prune a :meth:`CPP.run_num`
+            ``df_feat``).
+        accept_gaps : bool, default=False
+            Whether to accept missing values by enabling omitting for computations (if ``True``).
+        n_jobs : int, None, or -1, default=1
+            Number of CPU cores (>=1) used for multiprocessing. If ``None``, the number is optimized automatically.
+            If ``-1``, the number is set to all available cores. Overridden by ``options['n_jobs']`` when set.
+
+        Returns
+        -------
+        df_feat : pd.DataFrame, shape (n_selected_features, n_feature_info)
+            Feature DataFrame filtered to the features with variance above ``threshold``, with a reset index.
+
+        Notes
+        -----
+        * **Variance metric**: population variance (``ddof=0``) of each feature column over all samples.
+          A feature that is constant across the samples (zero peak-to-peak range) is treated as exactly
+          zero variance, so ``threshold=0.0`` removes precisely the constant features even when floating
+          point would otherwise leave a tiny non-zero variance.
+        * **Scope**: variance reflects how much a feature varies across *your* samples; it is unrelated to
+          CPP's in-run pre-filter, which screens *candidate* features by the **test-group** standard
+          deviation (``max_std_test``) rather than the spread over all samples.
+        * Recommended pruning order: variance (this method) -> correlation
+          (:meth:`SequenceFeature.prune_by_correlation`) -> :meth:`TreeModel.select_features`.
+        * A pruning that retains no feature (e.g. ``threshold`` above every feature's variance) raises a
+          ``ValueError`` rather than returning an empty DataFrame.
+
+        See Also
+        --------
+        * :meth:`SequenceFeature.prune_by_correlation` for the complementary redundancy-pruning step.
+        * :meth:`SequenceFeature.feature_matrix` for the feature matrix that variance is computed over.
+        * :meth:`TreeModel.select_features` for the model-based selection that follows pruning.
+
+        Examples
+        --------
+        .. include:: examples/sf_prune_by_variance.rst
+        """
+        # Check input
+        df_feat = ut.check_df_feat(df_feat=df_feat)
+        ut.check_number_range(name="threshold", val=threshold, min_val=0, just_int=False, accept_none=False)
+        if X is None:
+            ut.check_df_parts(df_parts=df_parts)
+            X = self.feature_matrix(features=df_feat, df_parts=df_parts, df_scales=df_scales,
+                                    accept_gaps=accept_gaps, n_jobs=n_jobs)
+        else:
+            X = check_match_df_feat_X(df_feat=df_feat, X=X)
+        # Prune features whose variance is at or below the threshold
+        is_selected = filter_variance_(X, threshold=threshold)
+        if not is_selected.any():
+            raise ValueError(f"'threshold' ({threshold}) removed all features. Lower it to retain features.")
+        df_feat = df_feat[is_selected].reset_index(drop=True)
+        return df_feat
+
+    def prune_by_correlation(self,
+                             df_feat: pd.DataFrame,
+                             df_parts: Optional[pd.DataFrame] = None,
+                             df_scales: Optional[pd.DataFrame] = None,
+                             max_cor: float = 0.7,
+                             X: Optional[ut.ArrayLike2D] = None,
+                             accept_gaps: bool = False,
+                             n_jobs: Union[int, None] = 1,
+                             ) -> pd.DataFrame:
+        """
+        Prune mutually correlated features from a feature DataFrame.
+
+        Model-free **feature pruning** step: among features whose realized feature values
+        (built from ``df_parts``, or supplied directly via ``X``) are pairwise correlated beyond
+        ``max_cor``, keeps the one with the higher ``abs_auc`` and drops the others, returning the
+        row-filtered ``df_feat``. Use it after :meth:`SequenceFeature.prune_by_variance` and before
+        :meth:`TreeModel.select_features`.
+
+        The correlation is **empirical** — measured over the actual samples in ``df_parts``. This is
+        deliberately different from CPP's in-run redundancy reduction, which compares the underlying
+        scale vectors (``df_scales.corr()``) together with positional overlap. Pruning here catches
+        features that happen to be redundant on a specific dataset even when their scales are not.
+
+        Compared with the lower-level :meth:`NumericalFeature.filter_correlation`, which takes a raw
+        matrix ``X`` and returns a boolean mask keeping the **first** column of each correlated pair (in
+        the order given), this method is df_feat-in / df_feat-out: it builds ``X`` for you, **ranks
+        features by ``abs_auc`` first** so the dropped feature of a pair is always the weaker one, and
+        returns the row-filtered ``df_feat``.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_feat : pd.DataFrame, shape (n_features, n_feature_info)
+            Feature DataFrame with a unique identifier, scale information, statistics, and positions for
+            each feature. Must contain the ``abs_auc`` statistic used as the deterministic tie-break.
+        df_parts : pd.DataFrame, shape (n_samples, n_parts), optional
+            DataFrame with sequence parts. Used to build the feature matrix; not required if ``X`` is given.
+        df_scales : pd.DataFrame, shape (n_letters, n_scales), optional
+            DataFrame of scales with letters typically representing amino acids. Default from :meth:`load_scales`
+            unless specified in ``options['df_scales']``.
+        max_cor : float, default=0.7
+            Maximum **absolute Pearson correlation** [0-1] allowed between any two retained features.
+            For each pair whose ``|corr| > max_cor``, the feature with the **lower** ``abs_auc`` is
+            dropped (and the higher-``abs_auc`` one kept) — regardless of the input row order, because
+            the method ranks by ``abs_auc`` internally. Lower ``max_cor`` to prune more aggressively.
+        X : array-like, shape (n_samples, n_features), optional
+            Pre-computed feature matrix. Column ``i`` must correspond to the feature in row ``i`` of the
+            ``df_feat`` you pass (same order); the method then re-ranks ``df_feat`` and ``X`` together by
+            ``abs_auc`` internally, so you do **not** pre-sort. If given, it is used directly and
+            ``df_parts`` / ``df_scales`` are ignored (e.g. to reuse a matrix or to prune a
+            :meth:`CPP.run_num` ``df_feat``).
+        accept_gaps : bool, default=False
+            Whether to accept missing values by enabling omitting for computations (if ``True``).
+        n_jobs : int, None, or -1, default=1
+            Number of CPU cores (>=1) used for multiprocessing. If ``None``, the number is optimized automatically.
+            If ``-1``, the number is set to all available cores. Overridden by ``options['n_jobs']`` when set.
+
+        Returns
+        -------
+        df_feat : pd.DataFrame, shape (n_selected_features, n_feature_info)
+            Feature DataFrame filtered to a non-redundant subset (sorted by descending ``abs_auc``),
+            with a reset index.
+
+        Notes
+        -----
+        * **Tie-break / determinism**: features are sorted by descending ``abs_auc`` (ties broken by
+          ``abs_mean_dif``) before pruning, so for every correlated pair the lower-``abs_auc`` feature is
+          the one removed. This makes the output independent of the input row order and byte-identical
+          across runs; the returned ``df_feat`` is in descending-``abs_auc`` order.
+        * **X alignment**: if you pass a pre-computed ``X``, its columns must be aligned to the ``df_feat``
+          rows you pass (column ``i`` = feature in row ``i``); the method reorders both together, so a
+          mis-aligned ``X`` would correlate the wrong features.
+        * The retained set is guaranteed to contain no feature pair with ``|corr| > max_cor``.
+        * Constant (zero-variance) features have undefined correlation and are always retained here; run
+          :meth:`SequenceFeature.prune_by_variance` first to remove them.
+        * A ``df_feat`` with fewer than two features is returned unchanged (nothing to compare).
+
+        See Also
+        --------
+        * :meth:`SequenceFeature.prune_by_variance` for the variance-pruning step that should precede this.
+        * :meth:`NumericalFeature.filter_correlation` for the underlying correlation primitive on a matrix.
+        * :meth:`TreeModel.select_features` for the model-based selection that follows pruning.
+
+        Examples
+        --------
+        .. include:: examples/sf_prune_by_correlation.rst
+        """
+        # Check input
+        df_feat = ut.check_df_feat(df_feat=df_feat)
+        ut.check_number_range(name="max_cor", val=max_cor, min_val=0, max_val=1, just_int=False, accept_none=False)
+        if X is not None:
+            X = check_match_df_feat_X(df_feat=df_feat, X=X)
+        elif df_parts is not None:
+            ut.check_df_parts(df_parts=df_parts)
+        else:
+            raise ValueError("Either 'df_parts' or a pre-computed 'X' should be provided.")
+        # Nothing to compare with fewer than two features
+        if len(df_feat) < 2:
+            return df_feat.reset_index(drop=True)
+        # Order by descending abs_auc (tie-break abs_mean_dif) so the stronger feature of a pair is kept
+        order = df_feat.sort_values(by=[ut.COL_ABS_AUC, ut.COL_ABS_MEAN_DIF],
+                                    ascending=False).index.to_numpy()
+        df_feat = df_feat.loc[order].reset_index(drop=True)
+        if X is None:
+            X = self.feature_matrix(features=df_feat, df_parts=df_parts, df_scales=df_scales,
+                                    accept_gaps=accept_gaps, n_jobs=n_jobs)
+        else:
+            X = X[:, order]
+        # Prune redundant features (constant columns have undefined correlation -> always kept).
+        # Detect constant columns by zero peak-to-peak range (robust to float epsilon).
+        is_selected = np.ones(X.shape[1], dtype=bool)
+        non_constant = np.ptp(np.asarray(X, dtype=float), axis=0) > 0
+        idx_nc = np.where(non_constant)[0]
+        if idx_nc.size >= 2:
+            is_selected[idx_nc] = filter_correlation_(X[:, idx_nc], max_cor=max_cor)
+        df_feat = df_feat[is_selected].reset_index(drop=True)
+        return df_feat
+
+    def get_features(self,
+                     list_parts: Optional[List[str]] = None,
+                     all_parts: bool = False,
+                     split_kws: Optional[dict] = None,
+                     list_scales: Optional[List[str]] = None,
+                     ) -> List[str]:
+        """
+        Create list of all feature ids for given Parts, Splits, and Scales.
+
+        Enumerates every combination of the requested sequence parts, split types
+        (Segment, Pattern, PeriodicPattern from :meth:`SequenceFeature.get_split_kws`),
+        and scale names, returning structured ``PART-SPLIT-SCALE`` feature ids.
+        These ids can be passed directly to :meth:`SequenceFeature.feature_matrix`
+        or used to pre-select a feature space before calling :meth:`CPP.run`.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        list_parts: list of str, default=["tmd", "jmd_n_tmd_n", "tmd_c_jmd_c"]
+            Names of sequence parts which should be created (e.g., 'tmd'). Length should be >= 1.
+        all_parts: bool, default=False
+            Whether to create DataFrame with all possible sequence parts (if ``True``) or parts given by ``list_parts``.
+        split_kws : dict, optional
+            Dictionary with parameter dictionary for each chosen split_type. Default from :meth:`SequenceFeature.get_split_kws`.
+        list_scales : list of str, optional
+            Names of scales. Default scales from :meth:`load_scales` with ``name='scales'``.
+
+        Returns
+        -------
+        features : list of str
+            Ids of all possible features for combination of Parts, Splits, and Scales with form: PART-SPLIT-SCALE
+
+        Notes
+        -----
+        * If ``ext_len`` in aaanalysis.options is not set to > 0, following parts containing extended tmd are not
+          considered for ``all_parts=True``: ['tmd_e', 'ext_c', 'ext_n', 'ext_n_tmd_n', 'tmd_c_ext_c'].
+
+        Examples
+        --------
+        .. include:: examples/sf_get_features.rst
+        """
+        # Load defaults
+        if list_scales is None:
+            list_scales = list(ut.load_default_scales())
+        if split_kws is None:
+            split_kws = self.get_split_kws()
+        # Check input
+        ut.check_bool(name="all_parts", val=all_parts)
+        list_parts = ut.check_list_parts(list_parts=list_parts, all_parts=all_parts)
+        check_split_kws(split_kws=split_kws)
+        list_scales = ut.check_list_like(name="list_scales", val=list_scales, accept_none=False)
+        # Get features
+        features = get_features_(list_parts=list_parts, split_kws=split_kws, list_scales=list_scales)
+        return features
+
+    @staticmethod
+    def get_feature_names(features: Union[ut.ArrayLike1D, pd.DataFrame],
+                          df_cat: Optional[pd.DataFrame] = None,
+                          start: int = 1,
+                          tmd_len: int = 20,
+                          jmd_n_len: int = 10,
+                          jmd_c_len: int = 10,
+                          ) -> List[str]:
+        """
+        Convert feature ids (PART-SPLIT-SCALE) into feature names (scale name [positions]).
+
+        Replaces the compact ``PART-SPLIT-SCALE`` id format produced by
+        :meth:`SequenceFeature.get_features` with a human-readable string that
+        shows the full scale name from ``df_cat`` together with the residue
+        positions covered by the feature's Split, making feature results easier
+        to interpret in :class:`CPP` output DataFrames.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        features : array-like, shape (n_features,) or pd.DataFrame
+            List of feature ids (``'PART-SPLIT-SCALE'``). Alternatively, a ``df_feat`` DataFrame,
+            in which case its ``'feature'`` column is used.
+        df_cat : pd.DataFrame, shape (n_scales, n_scales_info), optional
+            DataFrame of categories for physicochemical scales. Must contain all scales from ``df_scales``.
+            Default from :meth:`load_scales` with ``name='scales_cat'``, unless specified in ``options['df_cat']``.
+        start : int, default=1
+            Position label of first residue position (starting at N-terminus).
+        tmd_len : int, default=20
+            Length of target middle domain (TMD) (>0).
+        jmd_n_len : int, default=10
+            Length of JMD-N (>=0).
+        jmd_c_len : int, default=10
+            Length of JMD-C (>=0).
+
+        Returns
+        -------
+        feat_names : list of str
+            Names of features.
+
+        Notes
+        -----
+        * Length parameters (``tmd_len``, ``jmd_n_len``, ``jmd_c_len``) must match with ids in ``features``.
+        * Positions are given depending on the three split types:
+
+            - Segment: [first...last]
+            - Pattern: [all positions]
+            - PeriodicPattern: [first..step1/step2..last]
+
+        Examples
+        --------
+        .. include:: examples/sf_get_feature_names.rst
+        """
+        # Load defaults
+        if df_cat is None:
+            df_cat = ut.load_default_scales(scale_cat=True)
+        # Check input
+        features = ut.check_features(features=features)
+        check_df_cat(df_cat=df_cat)
+        ut.check_number_val(name="start", val=start, just_int=True, accept_none=False)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=jmd_c_len)
+        args_len, _ = check_parts_len(tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        check_match_df_cat_features(df_cat=df_cat, features=features)
+        check_match_features_seq_parts(features=features, **args_len)
+        # Get feature names
+        feat_names = get_feature_names_(features=features,
+                                        df_cat=df_cat,
+                                        start=start,
+                                        tmd_len=tmd_len,
+                                        jmd_c_len=jmd_c_len,
+                                        jmd_n_len=jmd_n_len)
+        return feat_names
+
+    @staticmethod
+    def get_feature_descriptions(features: Union[ut.ArrayLike1D, pd.DataFrame],
+                                 df_cat: Optional[pd.DataFrame] = None,
+                                 start: int = 1,
+                                 tmd_len: int = 20,
+                                 jmd_n_len: int = 10,
+                                 jmd_c_len: int = 10,
+                                 ) -> List[str]:
+        """
+        Build a standardized, human-readable description for each feature id (PART-SPLIT-SCALE).
+
+        Complements the compact :meth:`SequenceFeature.get_feature_names` label
+        (``'scale name [positions]'``) with one self-contained sentence per
+        feature that spells out all three id fields: the sequence part as a
+        readable label, the Split as a phrase (e.g. ``'segment 2 of 4'``),
+        and the scale as its AAontology name together with the category and
+        subcategory from ``df_cat``. Terminology is drawn from fixed vocabularies
+        (the part labels and the AAontology category/subcategory wording), so the
+        output is deterministic and consistent across runs. The result can be
+        assigned to a ``df_feat`` column (``'feature_description'``) for readable
+        :class:`CPP` output without changing the ``'feature'`` id string.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        features : array-like, shape (n_features,) or pd.DataFrame
+            List of feature ids (``'PART-SPLIT-SCALE'``). Alternatively, a ``df_feat`` DataFrame,
+            in which case its ``'feature'`` column is used.
+        df_cat : pd.DataFrame, shape (n_scales, n_scales_info), optional
+            DataFrame of categories for physicochemical scales. Must contain all scales from ``df_scales``.
+            Default from :meth:`load_scales` with ``name='scales_cat'``, unless specified in ``options['df_cat']``.
+        start : int, default=1
+            Position label of first residue position (starting at N-terminus).
+        tmd_len : int, default=20
+            Length of target middle domain (TMD) (>0).
+        jmd_n_len : int, default=10
+            Length of JMD-N (>=0).
+        jmd_c_len : int, default=10
+            Length of JMD-C (>=0).
+
+        Returns
+        -------
+        feat_descriptions : list of str
+            Human-readable description for each feature, one per feature id.
+
+        Notes
+        -----
+        * Length parameters (``tmd_len``, ``jmd_n_len``, ``jmd_c_len``) must match with ids in ``features``.
+        * Part labels come from a fixed vocabulary; category and subcategory wording is taken
+          verbatim from ``df_cat`` (the AAontology scale categories table).
+
+        See Also
+        --------
+        * :meth:`SequenceFeature.get_feature_names` for the compact label form.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_feature_descriptions.rst
+        """
+        # Load defaults
+        if df_cat is None:
+            df_cat = ut.load_default_scales(scale_cat=True)
+        # Check input
+        features = ut.check_features(features=features)
+        check_df_cat(df_cat=df_cat)
+        ut.check_number_val(name="start", val=start, just_int=True, accept_none=False)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=jmd_c_len)
+        args_len, _ = check_parts_len(tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        check_match_df_cat_features(df_cat=df_cat, features=features)
+        check_match_features_seq_parts(features=features, **args_len)
+        # Get feature descriptions
+        feat_descriptions = get_feature_descriptions_(features=features,
+                                                      df_cat=df_cat,
+                                                      start=start,
+                                                      tmd_len=tmd_len,
+                                                      jmd_c_len=jmd_c_len,
+                                                      jmd_n_len=jmd_n_len)
+        return feat_descriptions
+
+    @staticmethod
+    def get_feature_positions(features: Union[ut.ArrayLike1D, pd.DataFrame],
+                              start: int = 1,
+                              tmd_len: int = 20,
+                              jmd_n_len: int = 10,
+                              jmd_c_len: int = 10,
+                              tmd_seq: Optional[str] = None,
+                              jmd_n_seq: Optional[str] = None,
+                              jmd_c_seq: Optional[str] = None,
+                              ) -> ut.ArrayLike1D:
+        """
+        Create for features a list of corresponding positions or amino acids.
+
+        Resolves each ``PART-SPLIT-SCALE`` feature id produced by
+        :meth:`SequenceFeature.get_features` to the concrete residue positions it
+        covers, using the supplied domain lengths. When sequence strings
+        (``tmd_seq``, ``jmd_n_seq``, ``jmd_c_seq``) are also provided the method
+        returns the actual amino acid segments or patterns instead of position
+        numbers, which is useful for inspecting :class:`CPP` feature results on a
+        specific protein.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        features : array-like, shape (n_features,) or pd.DataFrame
+            List of feature ids (``'PART-SPLIT-SCALE'``). Alternatively, a ``df_feat`` DataFrame,
+            in which case its ``'feature'`` column is used.
+        start : int, default=1
+            Position label of first residue position (starting at N-terminus).
+        tmd_len : int, default=20
+            Length of target middle domain (TMD) (>0).
+        jmd_n_len : int, default=10
+            Length of JMD-N (>=0).
+        jmd_c_len : int, default=10
+            Length of JMD-C (>=0).
+        tmd_seq : str, optional
+            Sequence of TMD. If given, respective amino acid segments/patterns will be returned instead of positions.
+        jmd_n_seq : str, optional
+            Sequence of JMD-N. If given, respective amino acid segments/patterns will be returned instead of positions.
+        jmd_c_seq : str, optional
+            Sequence of JMD-C. If given, respective amino acid segments/patterns will be returned instead of positions.
+
+        Returns
+        -------
+        list_pos : list
+            List of residue positions for each feature. Returned when no sequence arguments are provided.
+        list_aa : list
+            List of amino acid segments or patterns for each feature. Returned when ``tmd_seq``,
+            ``jmd_n_seq``, and ``jmd_c_seq`` are all provided.
+
+        Notes
+        -----
+        * Length parameters (``tmd_len``, ``jmd_n_len``, ``jmd_c_len``) must match with ids in ``features``.
+        * Length of sequence (``tmd_seq``, ``jmd_n_seq``, ``jmd_c_seq``) must match with ids in ``features``.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_feature_positions.rst
+        """
+        # Check input
+        features = ut.check_features(features=features)
+        ut.check_number_val(name="start", val=start, just_int=True, accept_none=False)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=jmd_c_len)
+        args_len, args_seq = check_parts_len(tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len,
+                                             tmd_seq=tmd_seq, jmd_n_seq=jmd_n_seq, jmd_c_seq=jmd_c_seq)
+        check_match_features_seq_parts(features=features, **args_seq, **args_len)
+        # Get feature position
+        if args_seq["tmd_seq"] is not None:
+            list_aa = get_amino_acids_(features=features, **args_seq)
+            return list_aa
+        else:
+            list_pos = get_positions_(features=features, start=start, **args_len)
+            return list_pos
+
+    @staticmethod
+    def get_df_pos(df_feat: pd.DataFrame,
+                   col_val: str = "mean_dif",
+                   col_cat: str = "category",
+                   start: int = 1,
+                   tmd_len: int = 20,
+                   jmd_n_len: int = 10,
+                   jmd_c_len: int = 10,
+                   list_parts: Optional[Union[str, List[str]]] = None,
+                   normalize : bool = False,
+                   ) -> pd.DataFrame:
+        """
+        Create DataFrame of aggregated (mean or sum) feature values per residue position and scale.
+
+        Projects the per-feature statistics from a ``df_feat`` DataFrame (typically
+        the output of :meth:`CPP.run`) onto individual residue positions by
+        spreading each feature's value across every position its Split covers and
+        then aggregating by scale category. The resulting position-by-category
+        matrix is the direct input for :class:`CPPPlot` position plots.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        df_feat : pd.DataFrame, shape (n_features, n_feature_info)
+            Feature DataFrame with a unique identifier, scale information, statistics, and positions for each feature.
+        col_val : {'abs_auc', 'abs_mean_dif', 'mean_dif', 'std_test', 'std_ref'}, default='mean_dif'
+            Column name in ``df_feat`` containing numerical values to ``average``. If feature importance and impact
+            are provided as {'feat_importance', 'feat_impact'} columns, their ``sum`` of values is computed.
+        col_cat : {'category', 'subcategory', 'scale_name'}, default='category'
+            Column name in ``df_feat`` for categorizing the numerical values during aggregation.
+        start : int, default=1
+            Position label of first residue position (starting at N-terminus).
+        tmd_len : int, default=20
+            Length of target middle domain (TMD) (>0).
+        jmd_n_len : int, default=10
+            Length of JMD-N (>=0).
+        jmd_c_len : int, default=10
+            Length of JMD-C (>=0).
+        list_parts: str or list of str, optional
+            Specific sequence parts to consider for numerical value aggregation.
+        normalize : bool, default=False
+            If ``True``, normalizes aggregated numerical values to a total of 100%.
+
+        Returns
+        -------
+        df_pos : pd.DataFrame, shape (n_categories, n_positions)
+            DataFrame with aggregated numerical values per position.
+
+        Notes
+        -----
+        * Length parameters (``tmd_len``, ``jmd_n_len``, ``jmd_c_len``) must match with feature ids in ``df_feat``.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_df_pos.rst
+        """
+        # Check input
+        list_parts = ut.check_list_parts(list_parts=list_parts, return_default=False, accept_none=True)
+        # Do not check for list_parts since df_pos can be obtained for any part
+        df_feat = ut.check_df_feat(df_feat=df_feat)
+        check_col_cat(col_cat=col_cat)
+        check_col_val(col_val=col_val)
+        ut.check_number_val(name="start", val=start, just_int=True, accept_none=False)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=jmd_c_len)
+        args_len, _ = check_parts_len(tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        ut.check_bool(name="normalize", val=normalize)
+        check_match_features_seq_parts(features=df_feat[ut.COL_FEATURE], **args_len)
+        # Get df pos
+        stop = start + jmd_n_len + tmd_len + jmd_c_len - 1
+        value_type = ut.DICT_VALUE_TYPE[col_val]
+        df_pos = get_df_pos_(df_feat=df_feat, col_cat=col_cat, col_val=col_val, value_type=value_type,
+                             start=start, stop=stop)
+        if normalize:
+            df_pos = df_pos / abs(df_pos).sum().sum() * 100
+        if list_parts is not None:
+            df_pos = get_df_pos_parts_(df_pos=df_pos, value_type=value_type,
+                                       start=start, **args_len, list_parts=list_parts)
+        return df_pos
+
+    @staticmethod
+    def get_labels_ovr(labels: ut.ArrayLike1D,
+                       label_test: int = 1,
+                       label_ref: int = 0,
+                       ) -> Dict[int, np.ndarray]:
+        """
+        Convert multi-class labels into one-vs-rest (OvR) binary label arrays.
+
+        One-vs-rest (OvR) maps each of the K classes to a full-length binary label
+        array in which that class is the test group and all remaining classes are
+        the reference group. Since no samples are dropped, the K arrays can be
+        looped through a single :class:`CPP` instance via :meth:`CPP.run` (the
+        ``df_parts`` is unchanged), yielding one binary feature set per class.
+        Discarding the other classes instead is :meth:`get_labels_ovo`.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        labels : array-like, shape (n_samples,)
+            Multi-class labels for samples. Must be integers (more than one distinct
+            value); for continuous targets discretize first with :meth:`get_labels_quantile`.
+        label_test : int, default=1
+            Value assigned to the target class of each one-vs-rest array.
+        label_ref : int, default=0
+            Value assigned to all remaining classes.
+
+        Returns
+        -------
+        dict_labels : dict
+            Dictionary mapping each class label to its one-vs-rest binary label array
+            (numpy array of shape (n_samples,)), keyed in sorted class order.
+
+        Notes
+        -----
+        * Each returned binary label array is directly usable as the ``labels``
+          argument of :meth:`CPP.run` / :meth:`CPP.run_num`.
+        * To aggregate the per-class results, run CPP per array and concatenate the
+          returned ``df_feat`` frames, tagging each with its class key.
+        * **Complexity:** O(n_samples x n_classes); scales linearly in both, so OvR
+          stays cheap for large K.
+
+        See Also
+        --------
+        * :class:`aaanalysis.CPP`: consumes each returned binary label array via :meth:`CPP.run`.
+        * :meth:`get_labels_ovo`: pairwise (one-vs-one) alternative that subsets samples.
+        * :meth:`get_labels_quantile`: discretize a continuous target into binary labels.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_labels_ovr.rst
+        """
+        # Check input
+        labels = ut.check_labels(labels=labels)
+        ut.check_number_val(name="label_test", val=label_test, just_int=True)
+        ut.check_number_val(name="label_ref", val=label_ref, just_int=True)
+        if label_test == label_ref:
+            raise ValueError(f"'label_test' ({label_test}) should differ from 'label_ref' ({label_ref}).")
+        # Convert labels
+        return get_labels_ovr_(labels=labels, label_test=label_test, label_ref=label_ref)
+
+    @staticmethod
+    def get_labels_ovo(labels: ut.ArrayLike1D,
+                       df_parts: Optional[pd.DataFrame] = None,
+                       dict_num_parts: Optional[Dict[str, np.ndarray]] = None,
+                       label_test: int = 1,
+                       label_ref: int = 0,
+                       ) -> Dict[Tuple[int, int], Tuple[Optional[pd.DataFrame], Optional[Dict[str, np.ndarray]], np.ndarray]]:
+        """
+        Convert multi-class labels into one-vs-one (OvO) binary labels with row-matched parts.
+
+        One-vs-one (OvO) maps each unordered pair of classes ``(a, b)`` to the subset of
+        samples belonging to either class together with a binary label array over that
+        subset (class ``a`` as test, class ``b`` as reference). Because the other classes
+        are discarded, each pair needs its own row subset of the value source. This method
+        applies the selection for you: pass ``df_parts`` (for :meth:`CPP.run`) and/or
+        ``dict_num_parts`` (for :meth:`CPP.run_num`) and it returns, per pair, the
+        row-matched **copies** alongside the binary labels — ready to drop straight into a
+        :class:`CPP` instance built on that pair.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        labels : array-like, shape (n_samples,)
+            Multi-class labels for samples. Must be integers (more than one distinct value).
+        df_parts : pd.DataFrame, optional
+            Parts table (``CPP.run`` value source) aligned row-wise with ``labels``. When
+            given, the returned per-pair copy is subset to that pair's samples.
+        dict_num_parts : dict, optional
+            Per-part numerical tensors (``CPP.run_num`` value source, ``{part: array}`` with
+            sample axis first) aligned row-wise with ``labels``. Subset per pair like
+            ``df_parts``. At least one of ``df_parts`` / ``dict_num_parts`` is required.
+        label_test : int, default=1
+            Value assigned to the first class of each pair.
+        label_ref : int, default=0
+            Value assigned to the second class of each pair.
+
+        Returns
+        -------
+        dict_labels : dict
+            Dictionary mapping each class pair ``(a, b)`` to a tuple
+            ``(df_parts_pair, dict_num_parts_pair, labels_pair)``: the row-matched
+            ``df_parts`` copy (or ``None`` if not supplied), the row-matched
+            ``dict_num_parts`` copy (or ``None`` if not supplied), and the binary label
+            array over that pair's samples. The original inputs are never modified.
+
+        Notes
+        -----
+        * The selection is applied positionally; ``df_parts_pair.index`` records which
+          original rows the pair retained.
+        * **Complexity:** O(n_samples x n_classes^2): K classes produce K(K-1)/2 pairs
+          (K=10 -> 45, K=20 -> 190), each needing its own CPP instance. Prefer OvO for
+          small K (~<10) and :meth:`get_labels_ovr` for larger problems.
+
+        See Also
+        --------
+        * :class:`aaanalysis.CPP`: consumes each pair's ``df_parts_pair`` / ``dict_num_parts_pair`` and ``labels_pair``.
+        * :meth:`get_labels_ovr`: one-vs-rest alternative that keeps all samples.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_labels_ovo.rst
+        """
+        # Check input
+        labels = ut.check_labels(labels=labels)
+        check_match_labels_value_sources(labels=labels, df_parts=df_parts,
+                                         dict_num_parts=dict_num_parts, name="labels")
+        ut.check_number_val(name="label_test", val=label_test, just_int=True)
+        ut.check_number_val(name="label_ref", val=label_ref, just_int=True)
+        if label_test == label_ref:
+            raise ValueError(f"'label_test' ({label_test}) should differ from 'label_ref' ({label_ref}).")
+        # Convert labels and subset value sources per pair
+        dict_mask_labels = get_labels_ovo_(labels=labels, label_test=label_test, label_ref=label_ref)
+        dict_labels = {}
+        for pair, (row_mask, labels_pair) in dict_mask_labels.items():
+            df_parts_pair, dict_num_parts_pair = subset_value_sources(
+                row_mask=row_mask, df_parts=df_parts, dict_num_parts=dict_num_parts)
+            dict_labels[pair] = (df_parts_pair, dict_num_parts_pair, labels_pair)
+        return dict_labels
+
+    @staticmethod
+    def get_labels_quantile(targets: ut.ArrayLike1D,
+                            q: float = 0.5,
+                            label_test: int = 1,
+                            label_ref: int = 0,
+                            ) -> np.ndarray:
+        """
+        Convert a continuous target into a binary label array by a single quantile threshold.
+
+        Splits samples at the ``q``-quantile of ``targets``: samples at or above the
+        cut become the test group and the remainder the reference group. No samples
+        are dropped, so the result is directly usable as the ``labels`` argument of
+        :meth:`CPP.run` / :meth:`CPP.run_num`, enabling regression-style tasks (e.g.
+        thermostability, binding affinity) within the binary CPP framework. For a
+        fixed positive set with stepwise-lowered negative cuts, use
+        :meth:`get_labels_tiered`.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        targets : array-like, shape (n_samples,)
+            Continuous target values for samples.
+        q : float, default=0.5
+            Quantile in the open interval (0, 1) defining the split threshold
+            (``0.5`` splits at the median).
+        label_test : int, default=1
+            Value assigned to samples at or above the threshold.
+        label_ref : int, default=0
+            Value assigned to samples below the threshold.
+
+        Returns
+        -------
+        labels : np.ndarray, shape (n_samples,)
+            Binary label array.
+
+        Notes
+        -----
+        * Targets are converted to ``float64``. Raises ``ValueError`` up front if the
+          split would yield only one class (constant targets, or a cut leaving one
+          side empty), instead of failing later inside :meth:`CPP.run`.
+        * **Complexity:** O(n_samples log n_samples) from the quantile, negligible
+          beside CPP runtime.
+
+        See Also
+        --------
+        * :class:`aaanalysis.CPP`: consumes the returned binary label array via :meth:`CPP.run`.
+        * :meth:`get_labels_tiered`: fixed positive set vs stepwise-lowered negative cuts.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_labels_quantile.rst
+        """
+        # Check input
+        targets = ut.check_list_like(name="targets", val=targets, accept_none=False)
+        targets = np.asarray(targets, dtype=float)
+        ut.check_number_range(name="q", val=q, min_val=0, max_val=1, exclusive_limits=True, just_int=False)
+        ut.check_number_val(name="label_test", val=label_test, just_int=True)
+        ut.check_number_val(name="label_ref", val=label_ref, just_int=True)
+        if label_test == label_ref:
+            raise ValueError(f"'label_test' ({label_test}) should differ from 'label_ref' ({label_ref}).")
+        # Convert targets
+        labels = get_labels_quantile_(targets=targets, q=q, label_test=label_test, label_ref=label_ref)
+        if len(np.unique(labels)) < 2:
+            raise ValueError(f"'targets' produce a single class at q={q} (all values equal, or the "
+                             f"cut leaves one side empty); adjust 'q' or 'targets'.")
+        return labels
+
+    @staticmethod
+    def get_labels_tiered(targets: ut.ArrayLike1D,
+                          q_pos: float = 0.8,
+                          list_q_neg: Sequence[float] = (0.8, 0.5, 0.3),
+                          df_parts: Optional[pd.DataFrame] = None,
+                          dict_num_parts: Optional[Dict[str, np.ndarray]] = None,
+                          label_test: int = 1,
+                          label_ref: int = 0,
+                          ) -> Dict[float, Tuple[Optional[pd.DataFrame], Optional[Dict[str, np.ndarray]], np.ndarray]]:
+        """
+        Build tiered binary labels sharing a fixed positive set, with row-matched parts.
+
+        Holds the positive set fixed at ``targets >= Q(q_pos)`` and sweeps a series of
+        negative cuts ``targets <= Q(q_neg)`` for each ``q_neg`` in ``list_q_neg``,
+        dropping the middle band each time. This compares CPP settings against the same
+        positives while the negatives move toward more extreme low values. Like
+        :meth:`get_labels_ovo`, each tier drops samples, so this method applies the
+        selection for you: pass ``df_parts`` (for :meth:`CPP.run`) and/or
+        ``dict_num_parts`` (for :meth:`CPP.run_num`) and it returns, per tier, the
+        row-matched **copies** alongside the binary labels.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        targets : array-like, shape (n_samples,)
+            Continuous target values for samples.
+        q_pos : float, default=0.8
+            Quantile in (0, 1) defining the fixed positive cut: positives are
+            ``targets >= Q(q_pos)``.
+        list_q_neg : sequence of float, default=(0.8, 0.5, 0.3)
+            Quantiles in (0, 1); for each, negatives are ``targets <= Q(q_neg)``
+            (positives take precedence on ties) and the middle band is dropped.
+        df_parts : pd.DataFrame, optional
+            Parts table (``CPP.run`` value source) aligned row-wise with ``targets``. When
+            given, the returned per-tier copy is subset to that tier's samples.
+        dict_num_parts : dict, optional
+            Per-part numerical tensors (``CPP.run_num`` value source, ``{part: array}`` with
+            sample axis first) aligned row-wise with ``targets``. Subset per tier like
+            ``df_parts``. At least one of ``df_parts`` / ``dict_num_parts`` is required.
+        label_test : int, default=1
+            Value assigned to positive samples.
+        label_ref : int, default=0
+            Value assigned to negative samples.
+
+        Returns
+        -------
+        dict_labels : dict
+            Dictionary mapping each ``q_neg`` to a tuple
+            ``(df_parts_tier, dict_num_parts_tier, labels_tier)``: the row-matched
+            ``df_parts`` copy (or ``None`` if not supplied), the row-matched
+            ``dict_num_parts`` copy (or ``None`` if not supplied), and the binary label
+            array over that tier's samples. The original inputs are never modified.
+
+        Notes
+        -----
+        * Raises ``ValueError`` if any tier yields only one class (e.g. ``q_neg`` above
+          ``q_pos`` leaving no negatives).
+        * The selection is applied positionally; ``df_parts_tier.index`` records which
+          original rows the tier retained.
+        * **Complexity:** O(n_samples log n_samples x n_tiers).
+
+        See Also
+        --------
+        * :class:`aaanalysis.CPP`: consumes each tier's ``df_parts_tier`` / ``dict_num_parts_tier`` and ``labels_tier``.
+        * :meth:`get_labels_quantile`: single-cut variant that keeps all samples.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_labels_tiered.rst
+        """
+        # Check input
+        targets = ut.check_list_like(name="targets", val=targets, accept_none=False)
+        targets = np.asarray(targets, dtype=float)
+        ut.check_number_range(name="q_pos", val=q_pos, min_val=0, max_val=1,
+                              exclusive_limits=True, just_int=False)
+        list_q_neg = ut.check_list_like(name="list_q_neg", val=list_q_neg, accept_none=False)
+        if len(list_q_neg) == 0:
+            raise ValueError("'list_q_neg' should contain at least one quantile.")
+        for q_neg in list_q_neg:
+            ut.check_number_range(name="list_q_neg", val=q_neg, min_val=0, max_val=1,
+                                  exclusive_limits=True, just_int=False)
+        check_match_labels_value_sources(labels=targets, df_parts=df_parts,
+                                         dict_num_parts=dict_num_parts, name="targets")
+        ut.check_number_val(name="label_test", val=label_test, just_int=True)
+        ut.check_number_val(name="label_ref", val=label_ref, just_int=True)
+        if label_test == label_ref:
+            raise ValueError(f"'label_test' ({label_test}) should differ from 'label_ref' ({label_ref}).")
+        # Convert targets and subset value sources per tier
+        dict_mask_labels = get_labels_tiered_(targets=targets, q_pos=q_pos, list_q_neg=list_q_neg,
+                                              label_test=label_test, label_ref=label_ref)
+        dict_labels = {}
+        for q_neg, (row_mask, labels_tier) in dict_mask_labels.items():
+            df_parts_tier, dict_num_parts_tier = subset_value_sources(
+                row_mask=row_mask, df_parts=df_parts, dict_num_parts=dict_num_parts)
+            dict_labels[q_neg] = (df_parts_tier, dict_num_parts_tier, labels_tier)
+        return dict_labels
+
+    @staticmethod
+    def get_df_parts_from_windows(dict_parts: Dict[str, Union[pd.DataFrame, Sequence[str]]],
+                                  ) -> pd.DataFrame:
+        """
+        Assemble a ``df_parts`` from per-part window sets (e.g. :class:`AAWindowSampler` outputs).
+
+        Builds a reference ``df_parts`` by stitching one window set per sequence part,
+        so each part can be generated with its **own** recipe. This unlocks
+        biologically-motivated reference backgrounds where the parts differ in
+        physicochemical prior, e.g. a coil-propensity JMD-N, an alpha-helix TMD, and a
+        coil-propensity JMD-C, each produced by a separate call to
+        :meth:`AAWindowSampler.sample_synthetic` with a different ``generator`` and
+        ``window_size``. The assembled frame is used as the reference class for
+        :class:`CPP` exactly like a real ``df_parts``. This method does not sample
+        sequences itself; it only consumes window sets produced by
+        :class:`AAWindowSampler`.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        dict_parts : dict
+            Dictionary mapping each part name (one of :attr:`aaanalysis.utils.LIST_ALL_PARTS`,
+            e.g. ``'jmd_n'``, ``'tmd'``, ``'jmd_c'``) to its window set. Each value is
+            either a DataFrame with a ``'window'`` column (the output of
+            :meth:`AAWindowSampler.sample_synthetic`) or a sequence of window strings.
+            All window lists must be in the **same order** across parts (the i-th window
+            of each part forms the i-th reference row); differing orders silently break
+            the biological meaning of the assembled rows.
+
+        Returns
+        -------
+        df_parts : pd.DataFrame, shape (n_windows, n_parts)
+            Reference parts with one column per key in ``dict_parts`` and an index of
+            ``'REF<i>'`` identifiers.
+
+        Notes
+        -----
+        * If the parts supply different numbers of windows, a ``RuntimeWarning`` is
+          issued and all parts are truncated to the smallest count.
+        * Concatenate the result with a real ``df_parts`` (matching columns) and label
+          the two groups before calling :meth:`CPP.run`.
+
+        See Also
+        --------
+        * :class:`aaanalysis.AAWindowSampler`: produces the per-part window sets (``sample_synthetic``).
+        * :class:`aaanalysis.CPP`: consumes the assembled ``df_parts`` via :meth:`CPP.run`.
+
+        Examples
+        --------
+        .. include:: examples/sf_get_df_parts_from_windows.rst
+        """
+        # Check input
+        ut.check_dict(name="dict_parts", val=dict_parts, accept_none=False)
+        if len(dict_parts) == 0:
+            raise ValueError("'dict_parts' should not be empty.")
+        data = {}
+        counts = {}
+        for part, source in dict_parts.items():
+            if part not in ut.LIST_ALL_PARTS:
+                raise ValueError(f"'dict_parts' key '{part}' should be one of: {ut.LIST_ALL_PARTS}")
+            if isinstance(source, pd.DataFrame):
+                if ut.COL_WINDOW not in source.columns:
+                    raise ValueError(f"'dict_parts['{part}']' DataFrame should contain a "
+                                     f"'{ut.COL_WINDOW}' column (the output of "
+                                     f"AAWindowSampler.sample_synthetic).")
+                windows = source[ut.COL_WINDOW].tolist()
+            else:
+                windows = list(ut.check_list_like(name=f"dict_parts['{part}']", val=source))
+            if len(windows) == 0:
+                raise ValueError(f"'dict_parts['{part}']' should contain at least one window.")
+            if not all(isinstance(w, str) for w in windows):
+                raise ValueError(f"'dict_parts['{part}']' windows should all be strings.")
+            data[part] = windows
+            counts[part] = len(windows)
+        # Align by position; on mismatch warn and truncate to the smallest count
+        n_windows = min(counts.values())
+        if len(set(counts.values())) > 1:
+            warnings.warn(f"window counts differ across parts {counts}; truncating to {n_windows}.",
+                          RuntimeWarning)
+            data = {part: windows[:n_windows] for part, windows in data.items()}
+        # Assemble parts
+        df_parts = pd.DataFrame(data, index=[f"REF{i}" for i in range(n_windows)])
+        ut.check_df_parts(df_parts=df_parts)
+        return df_parts

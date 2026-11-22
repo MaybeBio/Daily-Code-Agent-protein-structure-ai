@@ -1,0 +1,17 @@
+## Atomistic Simulation Engine Core
+The [`torch-sim`](https://github.com/torchsim/torch-sim/README.md#L3) project provides an atomistic simulation engine that leverages PyTorch for high-performance molecular dynamics (MD), structural optimization, and static calculations, particularly for machine learning interatomic potentials (MLIPs). The engine's core design allows for GPU acceleration and automatic batching of simulations.
+
+Central to the engine's operation is the management of simulation states. The [`SimState`](https://github.com/torchsim/torch-sim/torch_sim/state.py#L121) dataclass serves as the fundamental container for atomistic system properties such as atomic positions, masses, and cell parameters. This design enables efficient batched operations, including cloning, splitting, and slicing of states. [Core Simulation State Management](#atomistic-simulation-engine-core-core-simulation-state-management) provides further details on [`SimState`](https://github.com/torchsim/torch-sim/torch_sim/state.py#L121).
+
+High-level runner functions orchestrate simulation execution, handling molecular dynamics simulations, geometry optimizations, and single-point energy calculations. These runners integrate with various models and manage trajectory reporting. More information on these functions can be found in [High-Level Simulation Runners](#atomistic-simulation-engine-core-high-level-simulation-runners).
+
+For MD simulations, the engine supports diverse integrators, including NVE (constant energy, volume), NVT (constant temperature, volume), and NPT (constant pressure, temperature) ensembles. These integrators are implemented to handle batched simulations and periodic boundary conditions, utilizing PyTorch for acceleration and managing unit conversions. [Simulation Integrators](#simulation-integrators) covers these implementations in depth.
+
+Geometry optimization tasks are handled by a suite of algorithms such as Gradient Descent, BFGS, L-BFGS, and FIRE (Fast Inertial Relaxation Engine). These optimizers are designed for batched atomic structure relaxations and incorporate a filter-based approach to manage cell optimization constraints and parameterizations. [Geometry Optimization Algorithms](#geometry-optimization-algorithms) provides a detailed discussion of these optimizers.
+
+To enhance performance, the engine incorporates autobatching mechanisms that manage GPU memory and optimize batch processing, especially for systems of varying sizes. These mechanisms dynamically handle the convergence of optimization tasks. Refer to [Autobatching Mechanisms](#atomistic-simulation-engine-core-autobatching-mechanisms) for more information.
+
+Beyond core simulation functionalities, the engine offers auxiliary capabilities, including the application of constraints (e.g., fixing atoms or the center of mass), conversion to and from external atomistic file formats like ASE and Pymatgen, and specialized mathematical utilities for tensor operations. These are detailed in [Auxiliary Simulation Functionalities](#atomistic-simulation-engine-core-auxiliary-simulation-functionalities).
+
+The engine also supports advanced physical property calculations, such as the computation of elastic tensors, Monte Carlo swap simulations, and correlation analyses like Velocity AutoCorrelation and Heat Flux AutoCorrelation functions. These capabilities are elaborated in [Advanced Physical Property Calculations](#atomistic-simulation-engine-core-advanced-physical-property-calculations).
+

@@ -1,0 +1,67 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2011-2023 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#ifndef __PLUMED_core_GREX_h
+#define __PLUMED_core_GREX_h
+
+#include "WithCmd.h"
+#include "tools/ForwardDecl.h"
+#include <string>
+#include <vector>
+
+namespace PLMD {
+
+class PlumedMain;
+class Communicator;
+
+class GREX:
+  public WithCmd {
+  bool initialized;
+  ForwardDecl<Communicator> intracomm_fwd;
+/// Communicator of this replica (set with setMPIIntracomm).
+/// Normally the same processes as PlumedMain::comm.
+  Communicator& intracomm=*intracomm_fwd;
+  ForwardDecl<Communicator> intercomm_fwd;
+/// Communicator between replicas (set with setMPIIntercomm, which also sets
+/// PlumedMain::multi_sim_comm). The MD code passes it only on process 0 of
+/// intracomm; on the other processes it stays MPI_COMM_SELF.
+  Communicator& intercomm=*intercomm_fwd;
+  PlumedMain& plumedMain;
+  int partner;
+  double localDeltaBias;
+  double foreignDeltaBias;
+  double localUNow;
+  double localUSwap;
+  bool physicalEnergiesProvided=false;
+  std::vector<double> allDeltaBias;
+  std::string buffer;
+  int myreplica;
+public:
+  explicit GREX(PlumedMain&);
+  ~GREX();
+  void cmd(std::string_view key,const TypesafePtr & val) override;
+  void calculate();
+  void savePositions();
+};
+
+}
+
+#endif

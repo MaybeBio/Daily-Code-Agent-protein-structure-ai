@@ -1,0 +1,74 @@
+from molsysmt import pyunitwizard as puw
+from molsysmt._private.argdigest import arg_digest
+from molsysmt._private.variables import is_all
+
+
+@arg_digest(form="file:trjpk")
+def to_molsysmt_StructuresDict(
+    item, atom_indices="all", structure_indices="all", skip_digestion=False
+):
+    """
+    Converting from file:trjpk to molsysmt.StructuresDict.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Input TRJPK file, read using its existing six-record pickle layout.
+    atom_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Atom indices (0-based) to include.
+    structure_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Structure indices (0-based) to include or process.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+
+    Returns
+    -------
+    molsysmt.StructuresDict
+        Dictionary with selected coordinates, box, time and structure IDs.
+        Missing optional fields remain None. Stored nm/ps quantities are
+        standardized to the configured units.
+
+
+    .. versionadded:: 1.0.0
+    """
+
+    import pickle
+
+    tmp_item = {}
+
+    with open(item, "rb") as fff:
+        _ = pickle.load(fff)
+        _ = pickle.load(fff)
+        coordinates = pickle.load(fff)
+        box = pickle.load(fff)
+        time = pickle.load(fff)
+        mdstep = pickle.load(fff)
+
+    if coordinates is not None:
+        if not is_all(structure_indices):
+            coordinates = coordinates[structure_indices, :, :]
+        if not is_all(atom_indices):
+            coordinates = coordinates[:, atom_indices, :]
+        coordinates = puw.standardize(puw.quantity(coordinates, unit="nm"))
+
+    if box is not None:
+        if not is_all(structure_indices):
+            box = box[structure_indices, :, :]
+        box = puw.standardize(puw.quantity(box, unit="nm"))
+
+    if time is not None:
+        if not is_all(structure_indices):
+            time = time[structure_indices]
+        time = puw.standardize(puw.quantity(time, unit="ps"))
+
+    if mdstep is not None:
+        if not is_all(structure_indices):
+            mdstep = mdstep[structure_indices]
+
+    tmp_item["coordinates"] = coordinates
+    tmp_item["box"] = box
+    tmp_item["time"] = time
+    tmp_item["structure_id"] = mdstep
+
+    return tmp_item

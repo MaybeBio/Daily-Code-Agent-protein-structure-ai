@@ -1,0 +1,126 @@
+name: Research file preview checks
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      scope_only:
+        type: boolean
+        default: false
+    outputs:
+      file_navigation_only:
+        value: ${{ jobs.reference-scope.outputs.file_navigation_only }}
+  push:
+    paths: &workspace_paths
+      - "frontend/src/research/SelectedAssetPreview*"
+      - "frontend/src/research/ResearchWorkspace*"
+      - "frontend/src/research/useResearchFileNavigation.ts"
+      - "frontend/src/research/research-file-navigation.css"
+      - "scripts/research-file-navigation-scope.py"
+      - "frontend/src/research/ObjectInspector*"
+      - "frontend/src/research/useResearchGraph*"
+      - "frontend/src/research/useResearchRegistration*"
+      - "frontend/src/research/graph-merge*"
+      - "frontend/src/research/RelationshipGraph*"
+      - "frontend/src/research/asset-context*"
+      - "frontend/src/research/SequenceFilePreview*"
+      - "frontend/src/research/useSequenceFile*"
+      - "frontend/src/research/fasta-file*"
+      - "frontend/src/research/asset-file*"
+      - "frontend/src/research/sequence-file-preview.css"
+      - "frontend/src/presentation/SequenceTrack*"
+      - "frontend/src/presentation/SequencePositions*"
+      - "frontend/src/presentation/sequence-track.css"
+      - "frontend/src/presentation/MoleculeImage.tsx"
+      - "frontend/src/presentation/molecule-image.css"
+      - "frontend/src/publication/FigureViewport.tsx"
+      - "frontend/src/research/research.css"
+      - "server_tests/*workspace_preview*"
+      - "server_tests/test_workspace_versions_browser.py"
+      - ".github/workflows/workspace-preview-checks.yml"
+      # Inspector handoffs also use pose-handoff-checks.yml.
+      - "!frontend/src/research/ObjectInspector.tsx"
+      - "!.github/workflows/workspace-preview-checks.yml"
+  pull_request:
+    paths: *workspace_paths
+permissions:
+  contents: read
+jobs:
+  framing-scope:
+    uses: ./.github/workflows/figure-framing-scope.yml
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  reference-scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      reference_only: ${{ steps.scope.outputs.reference_only }}
+      file_navigation_only: ${{ steps.file-navigation.outputs.file_navigation_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/interaction-workspace-scope.py
+      - id: file-navigation
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/research-file-navigation-scope.py
+  workspace:
+    needs: [reference-scope, utility-scope, framing-scope]
+    if: >-
+      !inputs.scope_only &&
+      needs.framing-scope.outputs.compact_only != 'true' &&
+      needs.reference-scope.outputs.reference_only != 'true' &&
+      needs.utility-scope.outputs.sequence_desktop_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - name: Isolated state and locked frontend
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-workspace" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-workspace/state" >> "$GITHUB_ENV"
+          npm ci --prefix frontend
+          npm run build --prefix frontend
+          uv sync --locked --group dev --group browser
+      - name: Selected previews, file context, relationships and direct property handoff
+        working-directory: frontend
+        run: >-
+          npx vitest run src/research/SelectedAssetPreview.test.tsx
+          src/research/asset-context.test.ts src/research/RelationshipGraph.test.tsx
+          src/research/ResearchWorkspace.test.tsx
+          src/research/useResearchGraph.test.tsx src/research/useResearchRegistration.test.tsx
+          src/research/SequenceFilePreview.test.tsx src/research/fasta-file.test.ts
+          src/presentation/SequenceTrack.test.tsx
+          src/publication/FigureExport.test.tsx
+      - name: File identity, saved downloads and direct reader consumers
+        if: needs.reference-scope.outputs.file_navigation_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/presentation/VerifiedArtifactDownload.test.tsx
+          src/presentation/WorkspaceFullscreenControl.test.tsx
+          src/viewer/StructureViewer.test.tsx src/viewer/PoseSession.test.tsx
+          src/viewer/usePoseOptimization.test.tsx src/editors/scientificEditor.test.ts
+          src/simulations/fep-series.test.ts src/simulations/useFepSeries.test.tsx
+          src/integrations/ScientificResults.test.tsx
+      - name: Retained real inputs and native Ketcher; no calculations
+        run: |
+          .venv/bin/python server_tests/prepare_workspace_preview_cases.py
+          .venv/bin/python server_tests/prepare_visual_components.py --components ketcher
+          uv run --locked playwright install chromium --with-deps
+      - name: Bilingual native 2D, calculated input 3D, exports and responsive file switching
+        run: uv run --locked python -m pytest -x -q server_tests/test_workspace_preview_browser.py server_tests/test_workspace_versions_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: research-workspace-evidence
+          path: outputs/workspace-preview/**

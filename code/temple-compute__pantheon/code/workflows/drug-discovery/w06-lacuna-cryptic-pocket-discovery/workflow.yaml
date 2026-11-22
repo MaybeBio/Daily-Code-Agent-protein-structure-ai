@@ -1,0 +1,206 @@
+kind: horus_workflow
+name: Lacuna Cryptic Pocket Discovery
+
+# lacuna-pockets is a plain pip package (hatchling, pure Python + numpy/scipy for
+# the default NMA backend and both detectors) -- no conda or container toolchain
+# needed, unlike the fpocket-based BioBB workflows. uv_python_environment installs
+# it into a venv with `uv pip install` and runs the `lacuna` CLI entrypoint directly.
+_executor: &executor
+  kind: uv_python_environment
+  environment_dir: "../../.horus_uv_env_lacuna" # one env per run, shared by all tasks
+  python: "3.11"
+  requirements:
+    - "lacuna-pockets>=1.4.0"
+
+artifacts:
+  - id: receptor
+    name: Receptor structure (PDB upload)
+    description: >-
+      Unbound (apo) PDB/mmCIF structure to search for cryptic pockets; used
+      when no PDB ID is given. Default: KRAS G12C (4LDJ).
+    kind: file
+    path: examples/structures/receptor.pdb
+
+  - &pdb_id
+    id: pdb_id
+    name: PDB ID (fetch instead of upload)
+    description: >-
+      Four-character PDB code to fetch from RCSB (protein atoms of the first
+      model). Leave empty to use the uploaded receptor.
+    kind: string
+    path: params/pdb_id.txt
+    value: ""
+    pattern: '([0-9][A-Za-z0-9]{3})?'
+
+  - &conformers
+    id: conformers
+    name: Conformers
+    description: Size of the generated conformational ensemble.
+    kind: number
+    path: params/conformers.json
+    value: 20
+    min: 5
+    max: 200
+    step: 1
+
+  - &detector
+    id: detector
+    name: Pocket detector
+    description: >-
+      surface-fusion pools the geometric and the learned-surface detector and
+      reaches sites that are not yet concave; alpha is geometry only.
+    kind: choice
+    path: params/detector.txt
+    value: surface-fusion
+    options:
+      - {value: surface-fusion, label: Surface fusion (geometric + learned)}
+      - {value: surface, label: Learned surface}
+      - {value: alpha, label: Alpha spheres (geometric)}
+
+  - &rank_by
+    id: rank_by
+    name: Rank pockets by
+    description: Ranking strategy for the reported pockets.
+    kind: choice
+    path: params/rank_by.txt
+    value: learned
+    options:
+      - {value: learned, label: Learned ranker}
+      - {value: crypticity, label: Crypticity}
+      - {value: druggability, label: Druggability}
+      - {value: balanced, label: Balanced}
+      - {value: persistence, label: Persistence x druggability}
+
+  - &top
+    id: top
+    name: Pockets to report
+    description: Maximum number of ranked pockets in the report.
+    kind: number
+    path: params/top.json
+    value: 10
+    min: 1
+    max: 50
+    step: 1
+
+  - &min_druggability
+    id: min_druggability
+    name: Minimum druggability
+    description: Drop pockets whose druggability score (0-1) is below this.
+    kind: number
+    path: params/min_druggability.json
+    value: 0
+    min: 0
+    max: 1
+    step: 0.05
+
+tasks:
+  # Runs the full pipeline in one CLI call: ensemble generation, per-conformer
+  # detection with the pooled alpha + learned-surface detector, cross-ensemble
+  # clustering, and ranking. --detector surface-fusion is 1.1.0's headline
+  # addition: the alpha detector only proposes where there is already a
+  # concavity, which is exactly the wrong assumption for a cryptic site.
+  # Since 1.4.0 the report also carries a per-residue `residue_propensity` map
+  # and per-pocket `chain_shares` / `interface`; ranking is unchanged.
+  - kind: horus_task
+    id: discover
+    name: Discover cryptic pockets across a conformational ensemble
+    description: Generates a conformational ensemble, detects pockets in every conformer with the pooled alpha + learned surface detector, clusters them across the ensemble, and ranks the surviving sites with the fitted model.
+    skip_if_complete: false
+    inputs:
+      - id: receptor
+        name: Target receptor structure
+        kind: file
+        path: examples/structures/receptor.pdb
+      - *pdb_id
+      - *conformers
+      - *detector
+      - *rank_by
+      - *top
+      - *min_druggability
+    outputs:
+      - id: pockets
+        name: Ranked pocket report + pocket PDBs
+        kind: folder
+        path: results/pockets/
+    resources:
+      cpus: 4
+      memory_gb: 16
+      walltime: "01:00:00"
+    executor: *executor
+    runtime:
+      # With a PDB ID, fetch from RCSB and keep the protein atoms of model 1.
+      # The receptor actually used is copied into the output for the report.
+      kind: command
+      command: >-
+        R=${receptor} &&
+        if [ -n ${pdb_id} ]; then
+        curl -fL --retry 3 -o rcsb.pdb.part https://files.rcsb.org/download/${pdb_id}.pdb &&
+        awk '/^ENDMDL/{exit} /^(ATOM|TER)/' rcsb.pdb.part > rcsb.pdb && R=rcsb.pdb; fi &&
+        lacuna discover $$R
+        --conformers ${conformers}
+        --detector ${detector}
+        --rank-by ${rank_by}
+        --top ${top}
+        --min-druggability ${min_druggability}
+        --emit-pocket-pdbs
+        --output ${pockets} &&
+        cp $$R ${pockets}/receptor.pdb
+    target:
+      kind: local
+
+  # Turns the JSON report into files the Horus UI renders on its own: a .html
+  # file shows as a live page and a .csv as a sortable table, whereas the
+  # `pockets` folder only opens as a file explorer.
+  - kind: horus_task
+    id: report
+    name: Render the pocket report
+    description: Builds a self-contained HTML report (with a Mol* 3D view of the receptor and pockets), a pocket CSV and a per-residue propensity CSV from pocket_report.json.
+    inputs:
+      - id: pockets
+        name: Ranked pocket report + pocket PDBs
+        kind: folder
+        path: pockets/
+    outputs:
+      - id: report
+        name: Pocket report (HTML)
+        kind: file
+        path: results/report.html
+      - id: table
+        name: Pocket table (CSV)
+        kind: file
+        path: results/pockets.csv
+      - id: residues
+        name: Residue propensity (CSV)
+        kind: file
+        path: results/residue_propensity.csv
+    executor:
+      kind: shell
+    runtime:
+      kind: python_script
+      script: scripts/report.py
+      python: python3 # stdlib-only; use the target's python3
+      args: --pockets ${pockets} --receptor ${pockets}/receptor.pdb --report ${report} --table ${table} --residues ${residues}
+    target:
+      kind: local
+
+edges:
+  - source: artifact-receptor
+    source_output: receptor
+    target: discover
+    target_input: receptor
+
+  - source: discover
+    source_output: pockets
+    target: report
+    target_input: pockets
+
+  - {source: artifact-pdb_id, source_output: pdb_id, target: discover, target_input: pdb_id}
+  - {source: artifact-conformers, source_output: conformers, target: discover, target_input: conformers}
+  - {source: artifact-detector, source_output: detector, target: discover, target_input: detector}
+  - {source: artifact-rank_by, source_output: rank_by, target: discover, target_input: rank_by}
+  - {source: artifact-top, source_output: top, target: discover, target_input: top}
+  - {source: artifact-min_druggability, source_output: min_druggability, target: discover, target_input: min_druggability}
+
+orchestrator_target:
+  kind: local
+  working_directory: horus_workflow_results

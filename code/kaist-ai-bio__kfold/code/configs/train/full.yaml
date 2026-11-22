@@ -1,0 +1,165 @@
+# Configuration for K-Fold training
+name: full-train
+out_dir: ./experiments/
+
+# Reproducibility
+seed: 1 # NOTE: You may have to set different seeds for different stages
+
+# Multi-stage training
+load_opt_state: true
+# Continue the epoch, global step, and LR schedule when resetting optimizer state.
+# This option is only valid when load_opt_state is false.
+load_global_step: true
+# Parameter groups initialized from checkpoint EMA when optimizer state is reset.
+init_from_ema: []
+
+# Compilation settings
+compile:
+  enabled: false
+  mode: "default"
+  dynamic: false
+
+data:
+  _registry_: "datamodule"
+  _class_: TrainingDataModule
+
+  # Training hyperparameters
+  max_chains: ???
+  max_tokens: ???
+  max_atoms: ???
+  max_sequence_tokens: ???
+  max_apo: 4
+
+  # DataLoader
+  train_batch_size: 1
+  num_workers: 8
+  persistent_workers: true
+  pin_memory: false
+  safe_load: true
+
+  # CCD path
+  ccd_path: /data/ccd-train.pkl
+
+  # Datasets
+  data_root: /data/
+  train_datasets: []
+  val_datasets: []
+
+  # Prior sampler for diffusion bridge modeling
+  prior_sampler:
+    # If null, no prior sampling
+    chain_translation_scale: 24.0 # Angstroms
+    # Centered IID Gaussian ligand coordinates; no conformer or dynamics.
+    ligand_gaussian_scale: 8.0 # Angstroms
+    bioprior:
+      noise_scale: 0.5
+      max_steps: 10
+    train: true # Only for train/val
+
+# Lightning Trainer Configuration
+trainer:
+  accelerator: "auto"
+  strategy: "auto"
+  devices: "auto"
+  num_nodes: 1
+  precision: bf16-mixed
+  max_epochs: -1
+  limit_train_batches: 1000
+  limit_val_batches: null
+  log_every_n_steps: 10
+  enable_checkpointing: true
+  accumulate_grad_batches: 1
+  gradient_clip_val: 10.0
+
+# Exponential Moving Average (EMA)
+training:
+  # Training step hyperparameters
+  train_trunk: true
+  train_diffusion_head: true
+  train_confidence_head: true
+
+  # For structure module training
+  diffusion_batch_size: 48
+
+  # For confidence module training
+  num_mini_rollout_steps: 30 # Number of rollout steps for confidence training
+  num_mini_rollout_samples: 1 # Number of diffusion samples for confidence training
+
+  parcae:
+    min_recycles: 0
+    max_recycles: 5
+    poisson_mean: 2.0
+    grad_recurrence_steps: 2
+    recurrence_sampling_mode: shared # NOTE: `rank_independent` for sample-level recurrence count sampling
+
+  soar:
+    enabled: false
+    root_time_min: 0.2
+    root_time_max: 0.8
+    rollout_schedule_num_steps: 100
+    rollout_step_size: 1.0
+    auxiliary_samples_per_root: 4
+    forward_retention_min: 0.5
+    aux_loss_weight: 1.0
+
+validation:
+  # Validation step hyperparameters
+  num_recycles: 3
+  num_steps: 100
+  num_diffusion_samples: 5
+
+optimizer:
+  opt: "adam"
+  beta_1: 0.9
+  beta_2: 0.95
+  eps: 1e-8
+  lr_scheduler: af3
+  base_lr: 0.0
+  max_lr: 0.0018
+  lr_warmup_no_steps: 1000
+  lr_start_decay_after_n_steps: 50000
+  lr_decay_every_n_steps: 50000
+  lr_decay_factor: 0.95
+  ema_decay: 0.999
+  validate_with_ema_after_n_steps: 5000
+
+loss:
+  weights:
+    # Global loss weights
+    distogram: 3e-2
+    diffusion: 4.0
+    confidence: 1e-4
+    patch_geometry: 0.05
+    # Diffusion loss weights
+    bond: 0.0 # 1 for fine-tuning (See Section 5.2 for the AF3 paper)
+    smooth_lddt: 1.0
+
+  patch_geometry_loss: {}
+
+  # Diffusion loss
+  diffusion_loss:
+    # Weighted MSE Loss
+    mse_loss:
+      # NOTE: these are same to AlphaFold3:
+      # w = 1 + 5 * is_dna + 5 * is_rna + 10 * is_ligand
+      upweight_protein: 0.0
+      upweight_dna: 5.0
+      upweight_rna: 5.0
+      upweight_ligand: 10.0
+      align_true_to_pred: true
+
+    # Bond Loss
+    bond_loss: {}
+
+    # Smooth LDDT Loss
+    smooth_lddt_loss:
+      repr_atom_only: false # If True, use [Nrepr, N] instead of [N, N] for LDDT calculation.
+      chunk_size: 1 # Number of samples per chunk for LDDT calculation.
+      use_kernel: true # Use triton kernel for LDDT calculation.
+
+wandb:
+  use: false
+  project: "KFold" # Set your project name
+  entity: "K-Fold" # Set your entity name
+  group: null # Set your group name
+  tags: [] # Ddd your tags

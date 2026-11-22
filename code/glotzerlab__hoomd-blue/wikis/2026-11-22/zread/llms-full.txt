@@ -1,0 +1,3755 @@
+# Overview
+
+
+
+HOOMD-blue is a powerful Python package designed for performing high-performance particle simulations on both CPUs and GPUs. It's a versatile tool that supports multiple simulation methods including **Hard Particle Monte Carlo (HPMC)**, **Molecular Dynamics (MD)**, and **Multi-Particle Collision Dynamics (MPCD)**, making it particularly valuable for soft matter research while remaining general enough for various particle simulation types.
+
+## Core Architecture
+
+HOOMD-blue follows a sophisticated hybrid architecture that combines C++ performance with Python flexibility:
+
+```mermaid
+graph TB
+    A[Python Interface] --> B[C++ Backend]
+    B --> C[CPU Execution]
+    B --> D[GPU Execution]
+    D --> E[NVIDIA GPUs]
+    D --> F[AMD GPUs via HIP]
+    B --> G[MPI Parallel Processing]
+```
+
+The C++ backend handles the computationally intensive simulation engine, while the Python frontend provides an intuitive, user-friendly API. This design ensures **high performance** without sacrificing **ease of use**.
+
+### Key Components
+
+At the heart of HOOMD-blue is the `Simulation` class, which serves as the central orchestrator for all simulation activities:
+
+```python
+import hoomd
+
+# Create a simulation with device and seed
+cpu = hoomd.device.CPU()
+sim = hoomd.Simulation(device=cpu, seed=42)
+```
+
+The `Simulation` class manages three fundamental components:
+- **Device**: Specifies whether to use CPU, GPU, or multiple GPUs for execution
+- **State**: Contains the current state of the particle system
+- **Operations**: Defines what actions to perform during the simulation
+
+Sources: [simulation.py#L34-L57](hoomd/simulation.py#L34-L57), [ARCHITECTURE.md#L134-L151](ARCHITECTURE.md#L134-L151)
+
+## Simulation Methods
+
+HOOMD-blue supports three primary simulation methods, each optimized for different types of particle systems:
+
+### 1. Hard Particle Monte Carlo (HPMC)
+
+HPMC excels at simulating systems of hard particles with complex shapes. It's particularly useful for studying phase behavior, self-assembly, and entropy-driven phenomena.
+
+```python
+# Example: Convex polyhedron HPMC simulation
+mc = hoomd.hpmc.integrate.ConvexPolyhedron()
+mc.shape['octahedron'] = dict(vertices=[
+    (-0.5, 0, 0), (0.5, 0, 0),
+    (0, -0.5, 0), (0, 0.5, 0),
+    (0, 0, -0.5), (0, 0, 0.5),
+])
+sim.operations.integrator = mc
+```
+
+Sources: [README.md#L47-L68](README.md#L47-L68), [ARCHITECTURE.md#L152-L156](ARCHITECTURE.md#L152-L156)
+
+### 2. Molecular Dynamics (MD)
+
+The MD module implements traditional molecular dynamics with a wide range of potentials including pair, bond, angle, and dihedral interactions.
+
+```python
+# Example: Lennard-Jones MD simulation
+cell = hoomd.md.nlist.Cell(buffer=0.4)
+lj = hoomd.md.pair.LJ(nlist=cell)
+lj.params[('A', 'A')] = dict(epsilon=1, sigma=1)
+lj.r_cut[('A', 'A')] = 2.5
+
+integrator = hoomd.md.Integrator(dt=0.005)
+integrator.forces.append(lj)
+sim.operations.integrator = integrator
+```
+
+Sources: [README.md#L70-L93](README.md#L70-L93), [ARCHITECTURE.md#L158-L165](ARCHITECTURE.md#L158-L165)
+
+### 3. Multi-Particle Collision Dynamics (MPCD)
+
+MPCD is designed for simulating coarse-grained fluid dynamics and is particularly useful for studying hydrodynamic interactions in complex fluids.
+
+Sources: [__init__.py#L97-L98](hoomd/__init__.py#L97-L98)
+
+## Execution Model
+
+HOOMD-blue's execution model is designed for maximum flexibility and performance:
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant S as Simulation
+    participant O as Operations
+    participant D as Device (CPU/GPU)
+    
+    U->>S: Create Simulation(device, seed)
+    U->>S: Set up State
+    U->>O: Add Operations (Integrator, etc.)
+    U->>S: run(steps)
+    S->>O: Schedule operations
+    O->>D: Execute computations
+    D-->>S: Return results
+    S-->>U: Simulation complete
+```
+
+The system automatically handles:
+- **Device selection** (CPU, GPU, or multi-GPU)
+- **Memory management** between CPU and GPU
+- **Parallel execution** using MPI for distributed computing
+- **Autotuning** of kernel parameters for optimal performance
+
+Sources: [ARCHITECTURE.md#L67-L87](ARCHITECTURE.md#L67-L87), [simulation.py#L148-L185](hoomd/simulation.py#L148-L185)
+
+## Data Model
+
+HOOMD-blue employs a sophisticated data model optimized for both performance and flexibility:
+
+### Core Data Types
+- **ParticleData**: Stores particle positions, velocities, masses, and other properties
+- **BondedGroupData**: Manages bonds, angles, and dihedrals
+- **SystemDefinition**: Combines all system data into a unified structure
+- **SnapshotSystemData**: Enables file I/O and system initialization
+
+### Array Management
+The system uses specialized array types for efficient data handling:
+- **GPUArray<T>**: Maintains dual CPU/GPU copies with automatic synchronization
+- **Managed arrays**: Utilize CUDA unified memory for seamless data access
+
+Sources: [ARCHITECTURE.md#L89-L131](ARCHITECTURE.md#L89-L131)
+
+## Operation System
+
+HOOMD-blue uses a flexible operation-based architecture where simulations are built by combining different types of operations:
+
+| Operation Type | Purpose | Examples |
+|---------------|---------|----------|
+| **Integrator** | Advances system state in time | MDIntegrator, HPMCIntegrator |
+| **Compute** | Calculates system properties | NeighborList, ThermodynamicQuantities |
+| **Updater** | Modifies system state | BoxResizeUpdater, ParticleFilterUpdater |
+| **Writer** | Outputs data to files | GSDDumpWriter, TableWriter |
+| **Tuner** | Optimizes performance parameters | Autotuner, SFCPackTuner |
+
+Each operation can be scheduled to run at specific intervals using triggers, providing fine-grained control over simulation execution.
+
+Sources: [ARCHITECTURE.md#L134-L151](ARCHITECTURE.md#L134-L151), [__init__.py#L16-L20](hoomd/__init__.py#L16-L20)
+
+## Performance Features
+
+HOOMD-blue incorporates several advanced performance optimization features:
+
+### GPU Acceleration
+- **Native GPU support** for both NVIDIA (CUDA) and AMD (HIP) GPUs
+- **Zero-copy buffer access** through `__cuda_array_interface__` and `__array_interface__`
+- **Optimized kernel implementations** for maximum throughput
+
+### Autotuning
+The system automatically optimizes kernel parameters:
+```python
+# Autotuner automatically finds optimal block sizes and configurations
+# No user intervention required - it just works!
+```
+
+### Parallel Computing
+- **MPI support** for multi-node simulations
+- **Domain decomposition** for efficient parallel processing
+- **Load balancing** to optimize resource utilization
+
+Sources: [ARCHITECTURE.md#L201-L212](ARCHITECTURE.md#L201-L212), [ARCHITECTURE.md#L456-L462](ARCHITECTURE.md#L456-L462)
+
+> [!TIP]
+> HOOMD-blue's autotuning system automatically optimizes kernel parameters during simulation runs, ensuring optimal performance without manual tuning. This is particularly valuable when running on different GPU architectures or with varying system sizes.
+
+## Getting Started
+
+To begin using HOOMD-blue:
+
+1. **Install** the package using conda or build from source
+2. **Choose your simulation method** (HPMC, MD, or MPCD)
+3. **Create a simulation** with appropriate device settings
+4. **Set up your system** with initial particle configurations
+5. **Define operations** (integrators, forces, etc.)
+6. **Run the simulation** and analyze results
+
+```python
+# Complete minimal example
+import hoomd
+
+# Create simulation
+device = hoomd.device.CPU()
+sim = hoomd.Simulation(device=device, seed=1)
+
+# Set up state (example with GSD file)
+sim.create_state_from_gsd('initial_config.gsd')
+
+# Add operations and run
+sim.run(10000)  # Run for 10,000 steps
+```
+
+Sources: [README.md#L11-L15](README.md#L11-L15), [simulation.py#L56-L57](hoomd/simulation.py#L56-L57)
+
+## Conclusion
+
+HOOMD-blue represents a powerful, flexible, and high-performance simulation platform that bridges the gap between computational efficiency and user accessibility. Its hybrid Python/C++ architecture, combined with support for multiple simulation methods and automatic performance optimization, makes it an ideal choice for researchers studying complex particle systems across various scales and phenomena.
+
+Whether you're simulating hard particle colloids, complex molecular systems, or coarse-grained fluids, HOOMD-blue provides the tools and performance needed to advance your research efficiently and effectively.
+
+
+# Quick Start
+
+
+
+Welcome to HOOMD-blue! This guide will help you get up and running with your first particle simulation in just a few minutes. HOOMD-blue is a powerful Python package that performs particle simulations on both CPUs and GPUs, supporting both molecular dynamics and hard particle Monte Carlo methods.
+
+## What You'll Accomplish
+
+In this Quick Start, you'll:
+1. Install HOOMD-blue on your system
+2. Create a basic molecular dynamics simulation
+3. Run the simulation and see the results
+
+This guide focuses on getting you started quickly with a working example. For more detailed explanations of the concepts, refer to the other guides in our documentation.
+
+## Installation
+
+HOOMD-blue is available through conda-forge, making installation straightforward. The simplest way to install is:
+
+```bash
+micromamba install hoomd
+```
+
+HOOMD-blue will automatically detect if your system has a GPU and install the appropriate version. If you want to force a specific installation type:
+
+```bash
+# For GPU support
+export CONDA_OVERRIDE_CUDA="12.6"
+micromamba install "hoomd=*gpu*" "cuda-version=12.6"
+
+# For CPU-only
+micromamba install "hoomd=*cpu*"
+```
+
+> [!TIP]
+> If you encounter CUDA version errors, replace "12.6" with the CUDA version noted in the error message. HOOMD-blue also supports CUDA 11.8.
+
+Sources: [INSTALLING.rst#L19-46](INSTALLING.rst#L19-46)
+
+## Your First Simulation
+
+Let's create a simple molecular dynamics simulation of Lennard-Jones particles. This is a classic model in computational physics and serves as a great starting point.
+
+### Step 1: Import HOOMD-blue
+
+Start by importing the necessary modules:
+
+```python
+import hoomd
+```
+
+### Step 2: Set Up the Simulation Device
+
+HOOMD-blue can run on both CPUs and GPUs. Create a device object to specify where your simulation will run:
+
+```python
+# For CPU simulation
+device = hoomd.device.CPU()
+
+# Or for GPU simulation (if available)
+device = hoomd.device.GPU()
+```
+
+### Step 3: Create the Simulation Object
+
+The `Simulation` class is the central object that manages your simulation:
+
+```python
+sim = hoomd.Simulation(device=device, seed=42)
+```
+
+The `seed` parameter ensures reproducible results by initializing the random number generator.
+
+Sources: [simulation.py#L34-57](hoomd/simulation.py#L34-57)
+
+### Step 4: Define the Force Field
+
+For molecular dynamics, we need to define the forces between particles. Let's set up a Lennard-Jones potential:
+
+```python
+# Create a neighbor list with a buffer
+cell = hoomd.md.nlist.Cell(buffer=0.4)
+
+# Create the Lennard-Jones pair potential
+lj = hoomd.md.pair.LJ(nlist=cell)
+lj.params[('A', 'A')] = dict(epsilon=1.0, sigma=1.0)
+lj.r_cut[('A', 'A')] = 2.5
+```
+
+This code sets up a Lennard-Jones potential with standard parameters where particles of type 'A' interact with each other.
+
+### Step 5: Set Up the Integrator
+
+The integrator defines how particles move over time. We'll use the NVT ensemble (constant number of particles, volume, and temperature):
+
+```python
+# Create the integrator with a time step
+integrator = hoomd.md.Integrator(dt=0.005)
+integrator.forces.append(lj)
+
+# Add a thermostat to maintain temperature
+bussi = hoomd.md.methods.thermostats.Bussi(kT=1.5)
+nvt = hoomd.md.methods.ConstantVolume(filter=hoomd.filter.All(), thermostat=bussi)
+integrator.methods.append(nvt)
+
+# Attach the integrator to the simulation
+sim.operations.integrator = integrator
+```
+
+### Step 6: Initialize the System State
+
+Now we need to create an initial configuration of particles. For this example, we'll create a simple cubic lattice:
+
+```python
+# Create a snapshot with particles on a cubic lattice
+snapshot = hoomd.Snapshot()
+snapshot.particles.N = 1000
+snapshot.particles.position[:] = [[i, j, k] 
+                                  for i in range(10) 
+                                  for j in range(10) 
+                                  for k in range(10)]
+snapshot.particles.types = ['A']
+snapshot.particles.typeid[:] = [0] * 1000
+
+# Set the simulation box
+snapshot.configuration.box = [10, 10, 10, 0, 0, 0]
+
+# Initialize the simulation state
+sim.create_state_from_snapshot(snapshot)
+```
+
+Sources: [simulation.py#L248-292](hoomd/simulation.py#L248-292)
+
+### Step 7: Run the Simulation
+
+Finally, let's run the simulation for a few thousand steps:
+
+```python
+# Run the simulation
+sim.run(1_000)
+```
+
+This will advance the simulation by 1,000 time steps, updating particle positions and velocities according to the forces and integrator we defined.
+
+Sources: [simulation.py#L484-546](hoomd/simulation.py#L484-546)
+
+## Complete Example
+
+Here's the complete script for your first simulation:
+
+```python
+import hoomd
+
+# Create the simulation device and simulation object
+device = hoomd.device.CPU()
+sim = hoomd.Simulation(device=device, seed=42)
+
+# Set up the force field
+cell = hoomd.md.nlist.Cell(buffer=0.4)
+lj = hoomd.md.pair.LJ(nlist=cell)
+lj.params[('A', 'A')] = dict(epsilon=1.0, sigma=1.0)
+lj.r_cut[('A', 'A')] = 2.5
+
+# Set up the integrator
+integrator = hoomd.md.Integrator(dt=0.005)
+integrator.forces.append(lj)
+bussi = hoomd.md.methods.thermostats.Bussi(kT=1.5)
+nvt = hoomd.md.methods.ConstantVolume(filter=hoomd.filter.All(), thermostat=bussi)
+integrator.methods.append(nvt)
+sim.operations.integrator = integrator
+
+# Initialize the system
+snapshot = hoomd.Snapshot()
+snapshot.particles.N = 1000
+snapshot.particles.position[:] = [[i, j, k] 
+                                  for i in range(10) 
+                                  for j in range(10) 
+                                  for k in range(10)]
+snapshot.particles.types = ['A']
+snapshot.particles.typeid[:] = [0] * 1000
+snapshot.configuration.box = [10, 10, 10, 0, 0, 0]
+sim.create_state_from_snapshot(snapshot)
+
+# Run the simulation
+sim.run(1_000)
+
+print("Simulation completed successfully!")
+```
+
+## Next Steps
+
+Congratulations! You've just run your first HOOMD-blue simulation. From here, you can:
+
+1. **Save your results**: Add a GSD writer to save trajectory data
+2. **Analyze your data**: Use tools like freud to analyze particle configurations
+3. **Explore different methods**: Try hard particle Monte Carlo (HPMC) simulations
+4. **Scale up**: Run larger simulations on GPUs for better performance
+
+For more detailed information on any of these topics, check out our other documentation guides.
+
+
+# Installation Guide
+
+
+
+HOOMD-blue is a powerful Python package that performs particle simulations on CPUs and GPUs, supporting both hard particle Monte Carlo and molecular dynamics simulations. This guide will walk you through installing HOOMD-blue using the easiest methods first, then cover advanced options for developers who need custom builds.
+
+## Why Installation Matters
+
+Getting HOOMD-blue installed correctly is your first step toward running high-performance particle simulations. Whether you're studying soft matter materials, biological systems, or other particle-based phenomena, proper installation ensures you can leverage HOOMD-blue's GPU acceleration and parallel computing capabilities for maximum performance.
+
+## Installation Options
+
+HOOMD-blue offers two main installation paths, each suited for different use cases:
+
+| Installation Method | Best For | Time Required | Technical Skill |
+|-------------------|----------|---------------|----------------|
+| **Binary Installation** | Quick start, standard use cases | 5-10 minutes | Beginner |
+| **Build from Source** | Custom builds, MPI support, development | 30-60 minutes | Intermediate |
+
+## Prerequisites
+
+Before installing HOOMD-blue, ensure your system meets these requirements:
+
+**System Requirements:**
+- **Operating System:** Linux (x86_64), macOS (x86_64 or ARM64)
+- **Python:** 3.8 or later
+- **Memory:** 4 GB RAM minimum (8 GB recommended)
+- **Storage:** 1 GB free space
+
+**For GPU Acceleration:**
+- **NVIDIA GPU:** CUDA 11.8 or 12.6 compatible driver
+- **AMD GPU:** ROCm 5.7 or later
+
+> [!TIP]
+> HOOMD-blue automatically detects GPU capabilities during installation. You don't need to manually specify GPU support unless you want to force a specific configuration.
+
+## Binary Installation (Recommended)
+
+Binary installation is the fastest and easiest way to get started with HOOMD-blue. We'll use conda-forge, which provides pre-compiled packages for most systems.
+
+### Step 1: Install a Package Manager
+
+First, install micromamba, a fast package manager:
+
+```bash
+# Linux/macOS
+curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+sudo mv bin/micromamba /usr/local/bin/
+```
+
+### Step 2: Install HOOMD-blue
+
+Install HOOMD-blue with a single command. Micromamba will automatically detect your system capabilities:
+
+```bash
+micromamba install hoomd=5.3.1
+```
+
+This command installs the latest stable version and automatically chooses between CPU and GPU builds based on your system.
+
+### Step 3: Verify Installation
+
+Test your installation with a simple Python script:
+
+```python
+import hoomd
+
+# Create a simulation device
+device = hoomd.device.CPU()
+print(f"HOOMD-blue version: {hoomd.version.version}")
+print(f"Device: {device}")
+```
+
+If you see the version information without errors, your installation is successful!
+
+Sources: [INSTALLING.rst#L19-26](INSTALLING.rst#L19-26), [README.md#L11-15](README.md#L11-15)
+
+### GPU-Specific Installation
+
+If you have an NVIDIA GPU and want to ensure GPU acceleration is enabled:
+
+```bash
+# Force GPU installation with CUDA 12.6
+export CONDA_OVERRIDE_CUDA="12.6"
+micromamba install "hoomd=5.3.1=*gpu*" "cuda-version=12.6"
+```
+
+For systems with older CUDA 11.8 drivers:
+
+```bash
+export CONDA_OVERRIDE_CUDA="11.8"
+micromamba install "hoomd=5.3.1=*gpu*" "cuda-version=11.8"
+```
+
+> [!TIP]
+> If you encounter CUDA version conflicts, check your NVIDIA driver version with `nvidia-smi` and match the CUDA version accordingly.
+
+### CPU-Only Installation
+
+If you explicitly want a CPU-only build (useful for development or testing):
+
+```bash
+micromamba install "hoomd=5.3.1=*cpu*"
+```
+
+Sources: [INSTALLING.rst#L29-51](INSTALLING.rst#L29-51)
+
+## Building from Source
+
+Building from source is necessary when you need:
+- MPI parallel execution support
+- Custom build configurations
+- Development environment setup
+- Integration with specific libraries
+
+### Step 1: Install Build Dependencies
+
+Install the required packages for building HOOMD-blue:
+
+```bash
+# Core dependencies
+micromamba install cmake eigen git ninja numpy pybind11 python
+
+# Testing dependencies
+micromamba install pytest rowan
+
+# Optional: Documentation building
+micromamba install sphinx furo nbsphinx ipython
+```
+
+**Important:** Avoid installing compilers (clang, gcc) in your conda environment, as they can interfere with system compilers and cause build errors.
+
+Sources: [BUILDING.rst#L73-95](BUILDING.rst#L73-95)
+
+### Step 2: Obtain Source Code
+
+Clone the HOOMD-blue repository with all submodules:
+
+```bash
+git clone --recursive git@github.com:glotzerlab/hoomd-blue.git
+cd hoomd-blue
+```
+
+The `--recursive` flag is crucial as HOOMD-blue uses Git submodules for external dependencies.
+
+Sources: [BUILDING.rst#L153-173](BUILDING.rst#L153-173)
+
+### Step 3: Configure the Build
+
+Use CMake to configure your build. The basic configuration is:
+
+```bash
+cmake -B build -S . -GNinja
+```
+
+For advanced configurations, you can specify various options:
+
+```bash
+# Enable GPU support
+cmake -B build -S . -GNinja -DENABLE_GPU=on
+
+# Enable MPI support
+cmake -B build -S . -GNinja -DENABLE_MPI=on
+
+# Build with specific precision settings
+cmake -B build -S . -GNinja -DHOOMD_LONGREAL_SIZE=64 -DHOOMD_SHORTREAL_SIZE=32
+
+# Optimize for your processor
+cmake -B build -S . -GNinja -DCMAKE_CXX_FLAGS=-march=native -DCMAKE_C_FLAGS=-march=native
+```
+
+**Key Configuration Options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `ENABLE_GPU` | `off` | Enable GPU acceleration |
+| `ENABLE_MPI` | `off` | Enable MPI parallel execution |
+| `BUILD_HPMC` | `on` | Build HPMC module |
+| `BUILD_MD` | `on` | Build MD module |
+| `BUILD_TESTING` | `on` | Build unit tests |
+| `CMAKE_BUILD_TYPE` | `Release` | Build optimization level |
+
+Sources: [BUILDING.rst#L181-268](BUILDING.rst#L181-268)
+
+### Step 4: Build and Test
+
+Compile HOOMD-blue using Ninja:
+
+```bash
+cd build
+ninja
+```
+
+Run the test suite to verify your build:
+
+```bash
+python3 -m pytest hoomd
+```
+
+This may take 10-30 minutes depending on your system and configuration.
+
+Sources: [BUILDING.rst#L274-302](BUILDING.rst#L274-302)
+
+### Step 5: Install (Optional)
+
+Install HOOMD-blue to your Python environment:
+
+```bash
+ninja install
+```
+
+Alternatively, use the build directory without installation by setting the Python path:
+
+```bash
+export PYTHONPATH=/path/to/hoomd-blue/build:$PYTHONPATH
+```
+
+Sources: [BUILDING.rst#L308-325](BUILDING.rst#L308-325)
+
+## Platform-Specific Considerations
+
+### GPU Platform Selection
+
+HOOMD-blue supports both NVIDIA CUDA and AMD ROCm/HIP platforms:
+
+```mermaid
+flowchart TD
+    A[GPU Platform] --> B[NVIDIA CUDA]
+    A --> C[AMD ROCm/HIP]
+    B --> D[Default: CUDA]
+    C --> E[Set: HOOMD_GPU_PLATFORM=HIP]
+```
+
+For AMD GPU support:
+
+```bash
+cmake -B build -S . -GNinja -DENABLE_GPU=on -DHOOMD_GPU_PLATFORM=HIP
+```
+
+Sources: [BUILDING.rst#L125-142](BUILDING.rst#L125-142)
+
+### MPI Parallel Builds
+
+For multi-node or multi-GPU simulations, enable MPI support:
+
+```bash
+# Install MPI dependencies
+micromamba install openmpi cereal
+
+# Configure with MPI
+cmake -B build -S . -GNinja -DENABLE_MPI=on -DMPI_HOME=/path/to/mpi/install
+```
+
+MPI builds are essential for large-scale simulations on HPC clusters.
+
+Sources: [INSTALLING.rst#L7-14](INSTALLING.rst#L7-14), [BUILDING.rst#L120-124](BUILDING.rst#L120-124)
+
+## Verification and Testing
+
+After installation, verify that HOOMD-blue works correctly with your hardware:
+
+### Basic Functionality Test
+
+```python
+import hoomd
+
+# Test CPU device
+cpu_device = hoomd.device.CPU()
+print(f"CPU device created: {cpu_device}")
+
+# Test GPU device (if available)
+try:
+    gpu_device = hoomd.device.GPU()
+    print(f"GPU device created: {gpu_device}")
+    print(f"GPU compute capability: {gpu_device.compute_capability}")
+except Exception as e:
+    print(f"GPU not available: {e}")
+
+# Test version
+print(f"HOOMD-blue version: {hoomd.version.version}")
+```
+
+### Performance Test
+
+Run a quick simulation to test performance:
+
+```python
+import hoomd
+import hoomd.md
+
+# Create simulation
+device = hoomd.device.GPU()  # or hoomd.device.CPU()
+sim = hoomd.Simulation(device=device, seed=42)
+
+# Create a simple system
+sim.create_state_from_gsd('init.gsd')  # You'll need to create this file first
+
+# Set up MD simulation
+integrator = hoomd.md.Integrator(dt=0.005)
+sim.operations.integrator = integrator
+
+# Run a short simulation
+sim.run(1000)
+print(f"Simulation completed. TPS: {sim.tps}")
+```
+
+Sources: [hoomd/device.py#L17-23](hoomd/device.py#L17-23), [README.md#L47-68](README.md#L47-68)
+
+## Troubleshooting Common Issues
+
+### Installation Issues
+
+**Problem:** `micromamba install` fails with dependency conflicts
+```bash
+# Solution: Create a clean environment
+micromamba create -n hoomd_env python=3.10
+micromamba activate hoomd_env
+micromamba install hoomd=5.3.1
+```
+
+**Problem:** CUDA version mismatch
+```bash
+# Solution: Check your driver version
+nvidia-smi
+
+# Install matching CUDA version
+micromamba install "cuda-version=12.6" "hoomd=5.3.1=*gpu*"
+```
+
+### Build Issues
+
+**Problem:** CMake cannot find Python
+```bash
+# Solution: Specify Python executable explicitly
+cmake -B build -S . -GNinja -DPython_EXECUTABLE=/usr/bin/python3
+```
+
+**Problem:** GPU compilation fails
+```bash
+# Solution: Specify CUDA compiler
+cmake -B build -S . -GNinja -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+```
+
+**Problem:** MPI not found
+```bash
+# Solution: Specify MPI installation path
+cmake -B build -S . -GNinja -DENABLE_MPI=on -DMPI_HOME=/usr/lib/openmpi
+```
+
+### Runtime Issues
+
+**Problem:** Import error: `No module named 'hoomd'`
+```bash
+# Solution: Check Python path
+export PYTHONPATH=/path/to/hoomd-blue/build:$PYTHONPATH
+```
+
+**Problem:** GPU not detected
+```bash
+# Solution: Verify GPU drivers and CUDA installation
+nvidia-smi
+nvcc --version
+```
+
+> [!TIP]
+> If you encounter persistent issues, check the HOOMD-blue discussion board at https://github.com/glotzerlab/hoomd-blue/discussions/ for community support.
+
+## Next Steps
+
+Congratulations! You now have HOOMD-blue installed and ready for simulations. Here's what to explore next:
+
+1. **Basic Simulation Tutorial** - Learn to create and run your first simulation
+2. **Understanding Simulation Components** - Dive deeper into HOOMD-blue's architecture
+3. **Documentation** - Explore the full API reference at https://hoomd-blue.readthedocs.io/
+4. **Examples** - Check out the example scripts in the repository and documentation
+
+Remember that HOOMD-blue is designed to be flexible and powerful. Start with simple simulations and gradually explore more advanced features like GPU acceleration, MPI parallelization, and custom extensions as you become comfortable with the basics.
+
+
+# Basic Simulation Tutorial
+
+
+
+Welcome to the **Basic Simulation Tutorial** for HOOMD-blue! This tutorial will guide you through creating your first molecular dynamics simulation from scratch. By the end, you'll understand the core components of a HOOMD-blue simulation and be able to run your own simulations with confidence.
+
+## Understanding the Simulation Lifecycle
+
+A HOOMD-blue simulation follows a clear lifecycle that consists of four main stages:
+
+1. **Initialization**: Create a simulation object and device
+2. **State Creation**: Define the initial configuration of particles
+3. **Operations Setup**: Add forces, integrators, and other operations
+4. **Execution**: Run the simulation and collect data
+
+This structure ensures that your simulations are organized, modular, and easy to modify. Let's explore each stage in detail.
+
+## Step 1: Creating a Simulation Object
+
+Every HOOMD-blue simulation starts with creating a `Simulation` object, which serves as the central container for all simulation components. The simulation requires two key parameters: a device to execute on and a random seed.
+
+```python
+import hoomd
+
+# Create a simulation running on CPU with random seed 42
+simulation = hoomd.Simulation(device=hoomd.device.CPU(), seed=42)
+```
+
+The `device` parameter determines where the simulation will run:
+- `hoomd.device.CPU()`: Runs on CPU (available everywhere)
+- `hoomd.device.GPU()`: Runs on GPU (requires CUDA support)
+
+The `seed` parameter is crucial for reproducibility. HOOMD-blue uses deterministic random number generation, so the same seed will produce identical results across runs.
+
+> [!TIP]
+> Always set a seed for your simulations! This ensures your results are reproducible and debuggable. Without a seed, HOOMD-blue will use a default value of 0, but it's better to be explicit.
+
+Sources: [simulation.py#L59-L67](hoomd/simulation.py#L59-L67), [__init__.py#L100](hoomd/__init__.py#L100)
+
+## Step 2: Creating the Initial State
+
+Before running a simulation, you need to define the initial configuration of particles. HOOMD-blue provides two main ways to create a simulation state:
+
+### Method A: From a GSD File
+
+The easiest way to start is by loading an existing configuration from a GSD (General Simulation Data) file:
+
+```python
+# Create state from a GSD file
+simulation.create_state_from_gsd('initial_config.gsd')
+```
+
+This method is ideal when you have pre-equilibrated structures or want to restart from previous simulations.
+
+### Method B: From a Snapshot
+
+For creating initial configurations programmatically, use snapshots:
+
+```python
+# Create an empty snapshot
+snapshot = hoomd.Snapshot()
+
+# Set up a simple cubic box
+snapshot.box = [10, 10, 10, 0, 0, 0]  # Lx, Ly, Lz, xy, xz, yz
+
+# Add particles
+snapshot.particles.N = 100  # Number of particles
+snapshot.particles.position[:] = [[0, 0, 0]] * 100  # Set positions
+snapshot.particles.typeid[:] = [0] * 100  # All particles are type 0
+
+# Define particle types
+snapshot.particles.types = ['A']
+
+# Create state from snapshot
+simulation.create_state_from_snapshot(snapshot)
+```
+
+Snapshots give you complete control over the initial configuration, including particle positions, velocities, types, and bonded interactions.
+
+Sources: [simulation.py#L193-L246](hoomd/simulation.py#L193-L246), [snapshot.py#L52-L100](hoomd/snapshot.py#L52-L100)
+
+## Step 3: Setting Up Operations
+
+Operations define what happens during each simulation step. The main types of operations are:
+
+- **Integrator**: Advances particle positions and velocities
+- **Forces**: Compute interactions between particles
+- **Updaters**: Modify the simulation state periodically
+- **Writers**: Save data to files
+- **Tuners**: Optimize performance parameters
+
+### Creating a Molecular Dynamics Simulation
+
+Let's set up a simple Lennard-Jones fluid simulation:
+
+```python
+# Create an MD integrator
+integrator = hoomd.md.Integrator(dt=0.001)
+
+# Add Lennard-Jones forces
+lj = hoomd.md.pair.LJ(nlist=hoomd.md.nlist.Cell())
+lj.params[('A', 'A')] = dict(epsilon=1.0, sigma=1.0)
+lj.r_cut[('A', 'A')] = 2.5
+
+# Add the force to the integrator
+integrator.forces.append(lj)
+
+# Add the integrator to the simulation
+simulation.operations.integrator = integrator
+```
+
+### Adding Data Output
+
+To save simulation data, add a writer operation:
+
+```python
+# Write trajectory every 1000 steps
+gsd_writer = hoomd.write.GSD(
+    filename='trajectory.gsd',
+    trigger=hoomd.trigger.Periodic(1000),
+    mode='wb'
+)
+simulation.operations.writers.append(gsd_writer)
+```
+
+### Adding Thermodynamic Logging
+
+Monitor simulation progress with a logger:
+
+```python
+# Log thermodynamic quantities every 100 steps
+logger = hoomd.logging.Logger()
+logger.add(simulation, quantities=['timestep', 'tps'])
+logger.add(integrator, quantities=['kinetic_energy', 'potential_energy'])
+
+# Write log to file
+table_writer = hoomd.write.Table(
+    trigger=hoomd.trigger.Periodic(100),
+    logger=logger,
+    output=open('log.txt', 'w')
+)
+simulation.operations.writers.append(table_writer)
+```
+
+Sources: [operations.py#L66-L75](hoomd/operations.py#L66-L75), [operations.py#L278-L296](hoomd/operations.py#L278-L296)
+
+## Step 4: Running the Simulation
+
+With everything set up, you can now run the simulation:
+
+```python
+# Run for 10,000 steps
+simulation.run(10_000)
+```
+
+During the run, HOOMD-blue executes operations in a specific order each timestep:
+
+```mermaid
+sequenceDiagram
+    participant Simulation
+    participant Tuners
+    participant Updaters
+    participant Integrator
+    participant Writers
+    
+    loop Each timestep
+        Simulation->>Tuners: Apply tuning operations
+        Simulation->>Updaters: Update system state
+        Simulation->>Integrator: Advance particle positions/velocities
+        Simulation->>Writers: Save data to files
+    end
+```
+
+The `run` method advances the simulation by the specified number of steps, applying all operations in the correct sequence. You can monitor progress using the logged quantities or by checking the simulation object's properties:
+
+```python
+print(f"Completed {simulation.timestep} steps")
+print(f"Performance: {simulation.tps:.1f} steps per second")
+```
+
+Sources: [simulation.py#L484-L561](hoomd/simulation.py#L484-L561)
+
+## Complete Example: Simple Lennard-Jones Simulation
+
+Here's a complete example that puts everything together:
+
+```python
+import hoomd
+import hoomd.md
+
+# 1. Initialize simulation
+simulation = hoomd.Simulation(device=hoomd.device.CPU(), seed=42)
+simulation.timestep = 0
+
+# 2. Create initial state
+snapshot = hoomd.Snapshot()
+snapshot.box = [10, 10, 10, 0, 0, 0]
+snapshot.particles.N = 100
+snapshot.particles.position[:] = [[0, 0, 0]] * 100
+snapshot.particles.typeid[:] = [0] * 100
+snapshot.particles.types = ['A']
+simulation.create_state_from_snapshot(snapshot)
+
+# 3. Set up operations
+integrator = hoomd.md.Integrator(dt=0.001)
+
+# Add Lennard-Jones forces
+lj = hoomd.md.pair.LJ(nlist=hoomd.md.nlist.Cell())
+lj.params[('A', 'A')] = dict(epsilon=1.0, sigma=1.0)
+lj.r_cut[('A', 'A')] = 2.5
+integrator.forces.append(lj)
+
+# Add data output
+gsd_writer = hoomd.write.GSD(
+    filename='trajectory.gsd',
+    trigger=hoomd.trigger.Periodic(1000),
+    mode='wb'
+)
+simulation.operations.writers.append(gsd_writer)
+
+# Add logging
+logger = hoomd.logging.Logger()
+logger.add(simulation, quantities=['timestep', 'tps'])
+table_writer = hoomd.write.Table(
+    trigger=hoomd.trigger.Periodic(100),
+    logger=logger,
+    output=open('log.txt', 'w')
+)
+simulation.operations.writers.append(table_writer)
+
+# Set the integrator
+simulation.operations.integrator = integrator
+
+# 4. Run simulation
+simulation.run(10_000)
+
+print(f"Simulation completed at step {simulation.timestep}")
+```
+
+## Common Patterns and Best Practices
+
+### Performance Tuning
+
+HOOMD-blue includes automatic performance tuning that optimizes kernel parameters during the simulation:
+
+```python
+# Check if tuning is complete
+while not simulation.operations.is_tuning_complete:
+    simulation.run(1000)
+    print(f"Tuning... TPS: {simulation.tps:.1f}")
+```
+
+### Simulation Control
+
+You can run simulations in segments and modify parameters between runs:
+
+```python
+# Initial equilibration
+simulation.run(5_000)
+
+# Change temperature and continue
+integrator.kT = 2.0  # Higher temperature
+simulation.run(5_000)
+```
+
+### Error Handling
+
+Always check for common issues:
+
+```python
+# Verify state is created
+if simulation.state is None:
+    raise RuntimeError("Simulation state not initialized")
+
+# Check operations are scheduled
+if not simulation.operations._scheduled:
+    print("Operations not scheduled - run() will schedule them")
+```
+
+## Next Steps
+
+Congratulations! You've created and run your first HOOMD-blue simulation. From here, you can explore:
+
+- **More complex force fields**: Combine multiple force types for realistic molecular models
+- **Advanced integrators**: Use NPT, NVT, or other ensembles
+- **Analysis techniques**: Compute custom properties and correlations
+- **Parallel computing**: Scale up to larger systems with MPI
+
+The modular structure of HOOMD-blue makes it easy to build upon this foundation and create sophisticated simulations for your research needs.
+
+
+# Understanding Simulation Components
+
+
+
+HOOMD-blue is a powerful simulation engine that performs particle-based simulations using both Monte Carlo and molecular dynamics methods. To effectively use and extend HOOMD-blue, it's essential to understand its core simulation components and how they work together. This guide will walk you through the fundamental building blocks that make up a HOOMD-blue simulation.
+
+## The System: Orchestrating Your Simulation
+
+At the heart of every HOOMD-blue simulation is the **System** class, which acts as the conductor of your simulation orchestra. The System manages all the operations and coordinates their execution during a simulation run. Think of it as the central hub that brings together all the individual components to create a cohesive simulation.
+
+The System maintains lists of different operation types and executes them in a specific order during each time step. This organized approach ensures that all computations happen in the correct sequence and that the simulation progresses smoothly from one state to the next.
+
+Sources: [System.h#L34-L60](hoomd/System.h#L34-L60)
+
+## Core Operation Types
+
+HOOMD-blue organizes simulation functionality into five distinct operation types, each with a specific responsibility:
+
+### 1. Integrator: Advancing Time
+
+The **Integrator** is perhaps the most critical component in a dynamic simulation. Its job is to advance the simulation forward in time by updating particle positions and velocities. In HOOMD-blue, there can only be one Integrator per System, reflecting the fact that a simulation follows a single time evolution path.
+
+The Integrator manages forces and constraints that act on particles. It collects all ForceCompute objects, calculates the net force on each particle, and then uses this information to update particle states according to the equations of motion.
+
+```python
+# Example of setting up an MD integrator
+integrator = hoomd.md.Integrator(dt=0.005)
+sim.operations.integrator = integrator
+```
+
+Sources: [Integrator.h#L25-L59](hoomd/Integrator.h#L25-L59)
+
+### 2. Updater: Modifying System State
+
+**Updaters** are operations that modify the system state in some way. Unlike the Integrator, which has the specific job of time advancement, Updaters can perform various modifications to the particle data. Examples include:
+
+- Sorting particles to improve memory access patterns
+- Changing box dimensions
+- Applying external fields
+- Modifying particle properties
+
+Each Updater is associated with a Trigger that determines when it should execute. This allows you to control how frequently certain updates occur during the simulation.
+
+```python
+# Example of creating an updater with a periodic trigger
+box_resize = hoomd.update.BoxResize(trigger=hoomd.trigger.Periodic(1000))
+sim.operations.updaters.append(box_resize)
+```
+
+Sources: [Updater.h#L39-L55](hoomd/Updater.h#L39-L55)
+
+### 3. Compute: Calculating Properties
+
+**Computes** are read-only operations that calculate properties of the system without modifying it. They provide the foundation for many other operations by computing essential quantities like:
+
+- Neighbor lists for efficient force calculations
+- Forces and energies
+- Temperature and pressure
+- Order parameters
+
+Computes are designed to be efficient by avoiding redundant calculations. They track when they were last computed and skip recalculation if the system state hasn't changed.
+
+```python
+# Example of a compute (neighbor list)
+cell = hoomd.md.nlist.Cell(buffer=0.4)
+```
+
+Sources: [Compute.h#L38-L57](hoomd/Compute.h#L38-L57)
+
+### 4. Analyzer: Output and Analysis
+
+**Analyzers** (called "Writers" in the Python API) are responsible for analyzing the system state and outputting data. Like Computes, they don't modify the system, but their primary purpose is to provide information to the user through:
+
+- Writing trajectory files
+- Logging thermodynamic properties
+- Computing and saving custom analysis
+- Generating visualization data
+
+Analyzers also use Triggers to control when they run, allowing you to balance between data collection frequency and performance.
+
+```python
+# Example of an analyzer (writer)
+gsd_writer = hoomd.write.GSD(filename='trajectory.gsd', 
+                            trigger=hoomd.trigger.Periodic(1000))
+sim.operations.writers.append(gsd_writer)
+```
+
+Sources: [Analyzer.h#L38-L56](hoomd/Analyzer.h#L38-L56)
+
+### 5. Tuner: Optimizing Performance
+
+**Tuners** are special operations that modify parameters of other components to optimize performance without affecting the physical correctness of the simulation. Examples include:
+
+- Adjusting neighbor list skin distances
+- Optimizing GPU kernel parameters
+- Reordering particles in memory
+
+Tuners help HOOMD-blue maintain high performance across different system configurations and hardware.
+
+Sources: [ARCHITECTURE.md#L148-L150](ARCHITECTURE.md#L148-L150)
+
+## Triggers: Controlling Execution Timing
+
+**Triggers** determine when operations should execute during a simulation. They provide a flexible way to control the timing of different operations without modifying the operations themselves. HOOMD-blue includes several built-in trigger types:
+
+- **PeriodicTrigger**: Execute every N steps with an optional phase offset
+- **BeforeTrigger**: Execute on all steps before a specified timestep
+- **OnTrigger**: Execute only on a specific timestep
+- **AfterTrigger**: Execute on all steps after a specified timestep
+
+```python
+# Example trigger usage
+# Run every 1000 steps
+periodic_trigger = hoomd.trigger.Periodic(1000)
+
+# Run every 100 steps starting at step 50
+phase_trigger = hoomd.trigger.Periodic(100, phase=50)
+
+# Run only at step 10000
+single_trigger = hoomd.trigger.On(10000)
+```
+
+Sources: [Trigger.h#L16-L24](hoomd/Trigger.h#L16-L24)
+
+## Simulation Execution Flow
+
+Understanding how these components work together during simulation execution is crucial. Here's the typical flow of operations during each time step:
+
+```mermaid
+sequenceDiagram
+    participant System
+    participant Tuners
+    participant Updaters
+    participant Integrator
+    participant Analyzers
+    
+    loop Each timestep
+        System->>Tuners: Check triggers and execute if needed
+        System->>Updaters: Check triggers and execute if needed
+        System->>Integrator: Update particle positions/velocities
+        System->>Analyzers: Check triggers and execute if needed
+    end
+```
+
+The System orchestrates this flow, ensuring that operations execute in the correct order and only when their triggers indicate they should run.
+
+Sources: [System.h#L84-L93](hoomd/System.h#L84-L93)
+
+## Data Management
+
+All operations work with the same underlying system data, which is managed through several key classes:
+
+- **SystemDefinition**: Combines all system data into a single object
+- **ParticleData**: Stores particle positions, velocities, masses, and other properties
+- **ParticleGroup**: Represents subsets of particles for targeted operations
+- **BondedGroupData**: Manages bonds, angles, dihedrals, and other bonded interactions
+
+This shared data model ensures consistency across all operations and enables efficient communication between different components.
+
+Sources: [ARCHITECTURE.md#L125-L131](ARCHITECTURE.md#L125-L131)
+
+## Simulation Methods
+
+HOOMD-blue supports two primary simulation methods, each with its own set of specialized components:
+
+### Molecular Dynamics (MD)
+
+MD simulations use numerical integration to solve Newton's equations of motion. The MD module includes:
+
+- **IntegratorTwoStep**: The main MD integrator implementing velocity-Verlet integration
+- **ForceCompute**: Classes for various force calculations (LJ, Coulomb, bonds, etc.)
+- **IntegrationMethodTwoStep**: Different integration schemes (NVT, NPT, etc.)
+
+```python
+# Example MD setup
+lj = hoomd.md.pair.LJ(nlist=cell)
+lj.params[('A', 'A')] = dict(epsilon=1, sigma=1)
+lj.r_cut[('A', 'A')] = 2.5
+
+integrator = hoomd.md.Integrator(dt=0.005)
+integrator.forces.append(lj)
+```
+
+Sources: [README.md#L70-L93](README.md#L70-L93)
+
+### Hard Particle Monte Carlo (HPMC)
+
+HPMC simulations use stochastic moves to sample equilibrium configurations. The HPMC module includes:
+
+- **HPMCIntegrator**: The main HPMC integrator handling trial moves
+- **Shape classes**: Various particle shape implementations
+- **Updaters**: Specialized updaters for HPMC-specific operations
+
+```python
+# Example HPMC setup
+mc = hoomd.hpmc.integrate.ConvexPolyhedron()
+mc.shape['octahedron'] = dict(vertices=[
+    (-0.5, 0, 0), (0.5, 0, 0), (0, -0.5, 0),
+    (0, 0.5, 0), (0, 0, -0.5), (0, 0, 0.5)
+])
+```
+
+Sources: [README.md#L47-L68](README.md#L47-L68)
+
+> [!TIP]
+> When building complex simulations, remember that operations execute in the order they were added to the System. This can affect results, especially when multiple operations modify the same system properties.
+
+## Conclusion
+
+Understanding HOOMD-blue's simulation components is key to creating effective simulations. The modular design allows you to mix and match different operations to create custom simulation workflows while maintaining high performance through optimized C++ implementations and GPU acceleration.
+
+As you continue exploring HOOMD-blue, you'll discover how these components can be combined and extended to solve complex scientific problems. The flexibility of the operation-based architecture makes HOOMD-blue a powerful tool for a wide range of particle-based simulations.
+
+
+# System Architecture
+
+
+
+HOOMD-blue is a high-performance molecular dynamics simulation engine designed to run efficiently on both CPUs and GPUs. Its architecture is built around a modular design that emphasizes performance, maintainability, and extensibility. Let's explore the key components and design principles that make up the HOOMD-blue system architecture.
+
+## Core Architecture Overview
+
+At its heart, HOOMD-blue follows a **component-based architecture** where the simulation system is composed of multiple specialized components that work together. The architecture is designed to handle complex molecular simulations while providing flexibility for different simulation methods and hardware configurations.
+
+The main execution flow revolves around the **System** class, which acts as the central orchestrator for all simulation operations. It manages lists of operations that act on the system state and controls the simulation loop. This design allows for a clean separation of concerns, where each component has a specific responsibility.
+
+Sources: [ARCHITECTURE.md#L134-L151](ARCHITECTURE.md#L134-L151), [System.h#L34-L62](hoomd/System.h#L34-L62)
+
+## Execution Model and Hardware Support
+
+HOOMD-blue implements a **unified execution model** that can run on CPUs, GPUs, or multiple GPUs using MPI. The `ExecutionConfiguration` class is responsible for selecting and managing the execution environment:
+
+```cpp
+enum executionMode {
+    GPU,  //!< Execute on the GPU
+    CPU,  //!< Execute on the CPU
+    AUTO, //!< Auto select between GPU and CPU
+};
+```
+
+This design allows HOOMD-blue to automatically adapt to the available hardware while maintaining a consistent API. The system uses **HIP** (Heterogeneous-Compute Interface for Portability) to support both NVIDIA and AMD GPUs, ensuring broad hardware compatibility.
+
+For parallel computing, HOOMD-blue implements **domain decomposition** through MPI, where the simulation space is divided among multiple processes. Each process handles a portion of the particles, and the `Communicator` class manages the exchange of particles and data between neighboring domains.
+
+Sources: [ARCHITECTURE.md#L67-L88](ARCHITECTURE.md#L67-L88), [ExecutionConfiguration.h#L49-L66](hoomd/ExecutionConfiguration.h#L49-L66)
+
+## Data Model and System State
+
+The simulation state is managed through a hierarchical data model centered around the `SystemDefinition` class. This class acts as a container for all essential simulation data:
+
+- **ParticleData**: Stores particle positions, velocities, masses, and other per-particle properties
+- **BondedGroupData**: Manages bonds, angles, dihedrals, and other bonded interactions
+- **BoxDim**: Defines the simulation box geometry and boundary conditions
+
+HOOMD-blue uses specialized data types optimized for performance:
+- `Scalar`: Configurable floating-point type (float or double)
+- `ScalarN`: Vector types (Scalar2, Scalar3, Scalar4) for efficient GPU memory access
+- `GPUArray<T>`: Dual CPU/GPU arrays with automatic synchronization
+- `ManagedArray<T>`: Arrays using CUDA unified memory for seamless CPU/GPU access
+
+```cpp
+// Example of using GPUArray for particle positions
+GPUArray<Scalar4> m_positions;  // x, y, z coordinates + type
+GPUArray<Scalar4> m_velocities;  // vx, vy, vz + mass
+```
+
+This data model ensures efficient memory access patterns while maintaining flexibility for different simulation scenarios.
+
+Sources: [ARCHITECTURE.md#L89-L132](ARCHITECTURE.md#L89-L132), [SystemDefinition.h#L34-L72](hoomd/SystemDefinition.h#L34-L72)
+
+## Operation-Based Architecture
+
+HOOMD-blue uses an **operation-based architecture** where simulations are defined by composing different types of operations. The `System` class manages these operations and executes them based on `Trigger` conditions:
+
+```mermaid
+classDiagram
+    class Operation {
+        <<abstract>>
+    }
+    class Compute {
+        +compute()
+    }
+    class Updater {
+        +update()
+    }
+    class Integrator {
+        +update()
+    }
+    class Analyzer {
+        +analyze()
+    }
+    class Tuner {
+        +tune()
+    }
+    
+    Operation <|-- Compute
+    Operation <|-- Updater
+    Operation <|-- Integrator
+    Operation <|-- Analyzer
+    Operation <|-- Tuner
+```
+
+Each operation type serves a specific purpose:
+- **Compute**: Calculates system properties without modifying the state (e.g., neighbor lists)
+- **Updater**: Modifies the system state (e.g., temperature controllers)
+- **Integrator**: Advances the system in time (only one per simulation)
+- **Analyzer**: Analyzes and outputs data (e.g., trajectory writers)
+- **Tuner**: Optimizes performance parameters (e.g., kernel block sizes)
+
+This modular design allows users to build complex simulations by combining simple, well-defined operations.
+
+Sources: [ARCHITECTURE.md#L134-L151](ARCHITECTURE.md#L134-L151), [System.h#L147-L165](hoomd/System.h#L147-L165)
+
+## Simulation Methods and Templates
+
+HOOMD-blue supports multiple simulation methods through a **template-based design** that minimizes code duplication while maintaining high performance:
+
+- **Molecular Dynamics (MD)**: Implemented through `IntegratorTwoStep` and `FIREEnergyMinimizer`
+- **Hard Particle Monte Carlo (HPMC)**: Implemented through `HPMCIntegrator`
+- **Multi-Particle Collision Dynamics (MPCD)**: Optional module for fluid dynamics
+
+The template evaluator pattern allows HOOMD-blue to implement complex mathematical operations efficiently:
+
+```cpp
+// Example of template evaluator pattern
+template<class Evaluator>
+void computePairForces() {
+    // General implementation works with any evaluator
+    Evaluator eval;
+    for each particle pair {
+        Scalar force = eval.evaluate(r, params);
+        applyForce(force);
+    }
+}
+```
+
+This approach allows developers to add new functional forms (e.g., new pair potentials) by implementing only the evaluator class, while reusing the general computation framework.
+
+Sources: [ARCHITECTURE.md#L152-L187](ARCHITECTURE.md#L152-L187)
+
+## Python Integration and User Interface
+
+HOOMD-blue provides a comprehensive Python interface that wraps the C++ core functionality. The Python layer follows a hierarchical class structure:
+
+```mermaid
+classDiagram
+    class _DependencyRelation {
+        +handleDependencies()
+    }
+    class _HOOMDGetSetAttrBase {
+        +_param_dict
+        +_typeparam_dict
+    }
+    class _HOOMDBaseObject {
+        +attach()
+        +detach()
+    }
+    class Operation {
+        <<abstract>>
+    }
+    
+    _DependencyRelation <|-- _HOOMDBaseObject
+    _HOOMDGetSetAttrBase <|-- _HOOMDBaseObject
+    _HOOMDBaseObject <|-- Operation
+```
+
+Key features of the Python interface include:
+- **Parameter validation**: Automatic type checking and validation through `ParameterDict`
+- **Type parameters**: Per-type parameter management through `TypeParameter`
+- **Synced lists**: Lists that maintain synchronization between Python and C++
+- **Automatic attachment/detachment**: Objects can be attached to simulations or exist as pure Python objects
+
+This design ensures that users get a clean, Pythonic interface while maintaining the performance benefits of the C++ backend.
+
+Sources: [ARCHITECTURE.md#L214-L400](ARCHITECTURE.md#L214-L400)
+
+## Performance Optimization Features
+
+HOOMD-blue includes several performance optimization features that work automatically:
+
+### Autotuning
+
+The `Autotuner` class automatically optimizes kernel parameters such as block sizes and threads per particle. It cycles through possible parameters, measures performance using CUDA events, and selects the best configuration:
+
+```cpp
+class Autotuned {
+    virtual bool isAutotuningComplete();
+    virtual void startAutotuning();
+    std::vector<std::shared_ptr<Autotuner>> m_tuners;
+};
+```
+
+> [!TIP]
+> Autotuning happens automatically in the background, but you can monitor its progress and check when it's complete using the provided methods. This ensures optimal performance without manual intervention.
+
+### Zero-Copy Buffer Access
+
+HOOMD-blue supports direct access to GPU and CPU data buffers from Python using the `__cuda_array_interface__` and `__array_interface__` protocols. This allows for efficient data exchange with other Python libraries like NumPy and CuPy without unnecessary memory copies.
+
+Sources: [ARCHITECTURE.md#L201-L213](ARCHITECTURE.md#L201-L213), [ARCHITECTURE.md#L456-L463](ARCHITECTURE.md#L456-L463)
+
+## Build System and Development
+
+HOOMD-blue uses **CMake** as its build system, following modern CMake practices:
+
+- **Modular configuration**: Components can be enabled/disabled using `ENABLE_*` and `BUILD_*` variables
+- **Package management**: Uses `find_package(... CONFIG)` for dependency management
+- **Developer workflow**: Supports iterative development without requiring installation
+
+The project structure is organized as:
+- `CMake/`: Build configuration scripts
+- `hoomd/`: Source code for the Python package
+- `sphinx-doc/`: Documentation source files
+
+This organization makes it easy for developers to navigate the codebase and contribute to specific components.
+
+Sources: [ARCHITECTURE.md#L32-L50](ARCHITECTURE.md#L32-L50), [ARCHITECTURE.md#L464-L472](ARCHITECTURE.md#L464-L472)
+
+## Conclusion
+
+HOOMD-blue's architecture represents a carefully balanced design that prioritizes performance, maintainability, and extensibility. By combining a modular C++ core with a flexible Python interface, it provides both high performance for large-scale simulations and ease of use for researchers and developers. The operation-based architecture, combined with automatic performance optimization and hardware abstraction, makes HOOMD-blue a powerful tool for molecular dynamics simulations across diverse hardware configurations.
+
+The architecture's success lies in its ability to abstract away low-level details while providing the flexibility needed for advanced simulation techniques. Whether you're running simulations on a single CPU, multiple GPUs, or large-scale MPI clusters, HOOMD-blue's architecture ensures optimal performance with minimal code changes.
+
+# Molecular Dynamics (MD)
+
+
+
+Molecular Dynamics (MD) is a fundamental simulation method in HOOMD-blue that numerically integrates the degrees of freedom in a system as a function of time under the influence of forces. MD simulations enable researchers to study the dynamic behavior of molecules, atoms, and particles by solving Newton's equations of motion, providing insights into thermodynamic properties, structural changes, and time-dependent phenomena.
+
+## Understanding MD in HOOMD-blue
+
+At its core, HOOMD-blue's MD implementation follows a modular design where the `Integrator` class serves as the central orchestrator of the time integration process. The Integrator manages lists of integration methods, forces, and constraints that work together to evolve the system state over time. This design allows for flexible configuration of simulation parameters while maintaining high performance through optimized C++ backend implementations.
+
+The MD module in HOOMD-blue is built around several key components that work in concert:
+
+1. **Integration Methods**: Define the equations of motion for different subsets of particles
+2. **Forces**: Compute interactions between particles (pairwise, bonded, external, etc.)
+3. **Constraints**: Enforce specific conditions on the system (fixed distances, rigid bodies)
+4. **Neighbor Lists**: Optimize force calculations by tracking nearby particles
+
+Sources: [hoomd/md/__init__.py#L4-L18](hoomd/md/__init__.py#L4-L18), [hoomd/md/integrate.py#L159-L162](hoomd/md/integrate.py#L159-L162)
+
+## The MD Integration Process
+
+The MD integration process in HOOMD-blue follows a well-defined sequence that ensures accurate and efficient time evolution of the system. Let's examine this process through a typical simulation workflow:
+
+```mermaid
+sequenceDiagram
+    participant User as User Code
+    participant Integrator as MD Integrator
+    participant Methods as Integration Methods
+    participant Forces as Force Computations
+    particant System as Simulation State
+    
+    User->>Integrator: Create with dt, methods, forces
+    Integrator->>Methods: Attach integration methods
+    Integrator->>Forces: Attach force calculations
+    User->>Integrator: Attach to simulation
+    loop Each timestep
+        Integrator->>Forces: Compute net forces/torques
+        Forces-->>Integrator: Return F_i, τ_i, U, W
+        Integrator->>Methods: Apply equations of motion
+        Methods->>System: Update positions/velocities
+        System-->>Methods: Return updated state
+    end
+```
+
+The integration process begins with force computation, where all forces and constraints are evaluated to determine the net force and torque on each particle. The Integrator then applies the selected integration methods to update particle positions and velocities according to the equations of motion.
+
+Sources: [hoomd/md/integrate.py#L169-L199](hoomd/md/integrate.py#L169-L199)
+
+## Integration Methods
+
+HOOMD-blue provides several integration methods to suit different physical scenarios:
+
+```python
+# NVE integration (constant energy)
+nve = hoomd.md.methods.ConstantVolume(filter=hoomd.filter.All())
+
+# NVT integration (constant temperature)
+nvt = hoomd.md.methods.Langevin(filter=hoomd.filter.All(), 
+                                kT=1.0, 
+                                alpha=0.1)
+
+# NPT integration (constant pressure)
+npt = hoomd.md.methods.ConstantPressure(filter=hoomd.filter.All(), 
+                                       kT=1.0, 
+                                       tau=1.0,
+                                       S=1.0, 
+                                       tauS=1.0)
+```
+
+Each method can be applied to specific particle subsets through filters, allowing for multi-component systems with different integration schemes. The `Langevin` method implements stochastic dynamics with a thermostat, while `ConstantPressure` enables barostat control for pressure coupling.
+
+> [!TIP]
+> When using multiple integration methods, ensure that their particle filters are mutually exclusive to prevent double-counting forces and incorrect dynamics.
+
+Sources: [hoomd/md/methods/__init__.py#L19-L28](hoomd/md/methods/__init__.py#L19-L28)
+
+## Force Computations
+
+Forces in HOOMD-blue's MD module are organized into several categories, each optimized for specific types of interactions:
+
+| Force Type | Description | Examples |
+|------------|-------------|----------|
+| Pairwise | Short-range interactions between particle pairs | LJ, Yukawa, Morse |
+| Bonded | Connectivity-based forces | Bonds, angles, dihedrals |
+| External | Field-based forces | Electric, gravitational |
+| Constraints | Enforced geometric constraints | Distance, Rigid bodies |
+
+Pairwise forces are particularly important in MD simulations and are implemented using neighbor lists for computational efficiency:
+
+```python
+# Create a neighbor list
+nlist = hoomd.md.nlist.Cell()
+nlist.buffer = 0.4
+
+# Lennard-Jones potential
+lj = hoomd.md.pair.LJ(nlist=nlist, default_r_cut=2.5)
+lj.params[('A', 'A')] = dict(epsilon=1.0, sigma=1.0)
+lj.params[('A', 'B')] = dict(epsilon=1.5, sigma=0.8)
+lj.params[('B', 'B')] = dict(epsilon=0.5, sigma=1.2)
+```
+
+The Pair force implementation supports various shifting and smoothing modes to handle cutoffs gracefully, reducing energy drift in long simulations.
+
+Sources: [hoomd/md/pair/__init__.py#L4-L31](hoomd/md/pair/__init__.py#L4-L31), [hoomd/md/force.py#L21-L41](hoomd/md/force.py#L21-L41)
+
+## Energy and Virial Computation
+
+HOOMD-blue's MD module carefully tracks energy and virial contributions for thermodynamic property calculations. The total potential energy and virial are computed as sums of per-particle and additional terms:
+
+```mermaid
+flowchart TD
+    A[Force Computation] --> B[Per-particle Energy U_i]
+    A --> C[Per-particle Virial W_i]
+    A --> D[Additional Energy U_add]
+    A --> E[Additional Virial W_add]
+    
+    B --> F[Total Energy U = ΣU_i + U_add]
+    C --> G[Total Virial W = ΣW_i + W_add]
+    
+    F --> H[Thermodynamic Properties]
+    G --> H
+```
+
+This decomposition allows for efficient computation of system properties while maintaining consistency with the underlying physics. The Force base class provides methods to access these quantities:
+
+```python
+# Access energy and force data
+total_energy = lj.energy
+particle_energies = lj.energies
+forces = lj.forces
+virials = lj.virials
+```
+
+Sources: [hoomd/md/force.py#L36-L41](hoomd/md/force.py#L36-L41), [hoomd/md/force.py#L145-L151](hoomd/md/force.py#L145-L151)
+
+## Practical Example: Simple MD Simulation
+
+Let's put together a complete MD simulation example that demonstrates the key concepts:
+
+```python
+import hoomd
+import hoomd.md
+
+# Initialize simulation
+sim = hoomd.Simulation(device=hoomd.device.CPU(), seed=42)
+sim.create_state_from_gsd('initial.gsd')
+
+# Create neighbor list
+nlist = hoomd.md.nlist.Cell(buffer=0.4)
+
+# Define Lennard-Jones forces
+lj = hoomd.md.pair.LJ(nlist=nlist, default_r_cut=2.5)
+lj.params[('A', 'A')] = dict(epsilon=1.0, sigma=1.0)
+lj.params[('A', 'B')] = dict(epsilon=1.5, sigma=0.8)
+lj.params[('B', 'B')] = dict(epsilon=0.5, sigma=1.2)
+
+# Choose integration method (NVT)
+nvt = hoomd.md.methods.Langevin(filter=hoomd.filter.All(), 
+                                kT=1.0, 
+                                alpha=0.1)
+
+# Create integrator
+integrator = hoomd.md.Integrator(dt=0.005, 
+                                 methods=[nvt], 
+                                 forces=[lj])
+
+# Attach integrator to simulation
+sim.operations.integrator = integrator
+
+# Run simulation
+sim.run(10000)
+```
+
+This example demonstrates the typical workflow: setting up the simulation state, defining forces, selecting an integration method, creating the integrator, and running the simulation. The modular design makes it easy to modify individual components while maintaining the overall structure.
+
+Sources: [hoomd/md/integrate.py#L131-L158](hoomd/md/integrate.py#L131-L158)
+
+## Performance Considerations
+
+HOOMD-blue's MD implementation is designed for high performance, particularly on GPU hardware. Key performance features include:
+
+1. **Neighbor List Optimization**: Cell lists and tree structures minimize the number of pairwise evaluations
+2. **GPU Acceleration**: Computationally intensive routines are optimized for GPU execution
+3. **Mixed Precision**: Selective use of single and double precision balances accuracy and speed
+4. **Parallel Decomposition**: MPI support enables scaling to large systems
+
+The MD module automatically selects the optimal backend (CPU or GPU) based on the available hardware, ensuring maximum performance without requiring code changes.
+
+> [!TIP]
+> For best performance, ensure your system size is large enough to充分利用 GPU parallelism. Small systems may benefit more from CPU execution due to GPU overhead.
+
+Sources: [hoomd/md/__init__.py#L4-L18](hoomd/md/__init__.py#L4-L18)
+
+## Advanced Features
+
+HOOMD-blue's MD module includes several advanced features for sophisticated simulations:
+
+- **Rigid Body Dynamics**: Special handling for molecules with fixed internal geometry
+- **Anisotropic Particles**: Support for non-spherical particles with orientation-dependent interactions
+- **External Fields**: Application of time-dependent external forces and torques
+- **Thermostats and Barostats**: Multiple schemes for temperature and pressure control
+- **Energy Minimization**: FIRE algorithm for finding local energy minima
+
+These features extend the basic MD framework to handle complex physical systems while maintaining the same modular design principles.
+
+
+# Hard Particle Monte Carlo (HPMC)
+
+
+
+Hard Particle Monte Carlo (HPMC) is a powerful simulation method in HOOMD-blue that enables the study of systems composed of particles with hard interactions. Unlike molecular dynamics which simulates continuous motion, HPMC performs stochastic moves to sample equilibrium configurations of hard particle systems efficiently.
+
+## Overview of HPMC in HOOMD-blue
+
+HPMC in HOOMD-blue implements a sophisticated framework for simulating systems where particles interact through hard-core repulsions. This means particles cannot overlap, creating a purely entropic system that's ideal for studying colloids, granular materials, and other systems dominated by shape effects. The HPMC module provides a flexible architecture that supports various particle shapes, from simple spheres to complex polyhedra and user-defined shapes.
+
+The core of HPMC is built around the `IntegratorHPMC` base class, which defines the common interface for all HPMC integrators. This base class handles fundamental operations like move size management, statistics tracking, and interaction with the broader HOOMD-blue framework. For monodisperse systems (single particle type), the `IntegratorHPMCMono` template class provides specialized implementations optimized for performance.
+
+Sources: [IntegratorHPMC.h#L114-L125](hoomd/hpmc/IntegratorHPMC.h#L114-L125), [IntegratorHPMCMono.h#L107-L111](hoomd/hpmc/IntegratorHPMCMono.h#L107-L111)
+
+## Core HPMC Algorithm
+
+The HPMC algorithm follows a straightforward but powerful approach to sampling equilibrium configurations:
+
+1. **Particle Selection**: For each timestep, particles are selected in a random order to ensure unbiased sampling.
+
+2. **Trial Moves**: Selected particles undergo either translational or rotational moves, with the probability controlled by the translation move probability parameter.
+
+3. **Overlap Detection**: After a trial move, the system checks if the moved particle overlaps with any other particles. This is the most computationally intensive step and is highly optimized in HOOMD-blue.
+
+4. **Accept/Reject**: If the move results in no overlaps, it's accepted; otherwise, it's rejected. The algorithm maintains detailed balance to ensure proper equilibrium sampling.
+
+5. **Statistics**: The integrator tracks acceptance rates for both translational and rotational moves, providing important feedback on simulation performance.
+
+```mermaid
+flowchart TD
+    A[Start Timestep] --> B[Shuffle Particle Order]
+    B --> C[Select Particle]
+    C --> D{Move Type?}
+    D -->|Translation| E[Generate Random Translation]
+    D -->|Rotation| F[Generate Random Rotation]
+    E --> G[Check for Overlaps]
+    F --> G
+    G --> H{Overlap?}
+    H -->|No| I[Accept Move]
+    H -->|Yes| J[Reject Move]
+    I --> K[Update Statistics]
+    J --> K
+    K --> L{More Particles?}
+    L -->|Yes| C
+    L -->|No| M{More Selects?}
+    M -->|Yes| B
+    M -->|No| N[End Timestep]
+```
+
+Sources: [IntegratorHPMCMono.h#L421-L473](hoomd/hpmc/IntegratorHPMCMono.h#L421-L473)
+
+## Key Components of HPMC
+
+### Move Types and Parameters
+
+HPMC supports two fundamental types of moves:
+
+- **Translational moves**: Particles are displaced by a random vector with maximum length controlled by the `d` parameter for each particle type.
+- **Rotational moves**: Particles are rotated by a random quaternion with maximum rotation angle controlled by the `a` parameter for each particle type.
+
+The relative probability of translation versus rotation moves is controlled by the `translation_move_probability` parameter, which defaults to 0.5 (equal probability). For spherical particles, only translational moves are performed since rotations don't change the configuration.
+
+Sources: [IntegratorHPMC.h#L142-L227](hoomd/hpmc/IntegratorHPMC.h#L142-L227)
+
+### Particle Shapes
+
+HPMC in HOOMD-blue supports a wide variety of particle shapes through a templated design. Each shape is implemented as a class that provides methods for checking overlaps and computing bounding volumes. The supported shapes include:
+
+- Spheres
+- Convex polygons (2D)
+- Convex polyhedra (3D)
+- Ellipsoids
+- Spheropolygons and spheropolyhedra (rounded shapes)
+- Simple polygons
+- Faceted ellipsoids
+- Sphinx particles
+- Unions of shapes
+
+This extensible architecture allows users to easily add new shape types by implementing the required interface methods.
+
+Sources: [IntegratorHPMCMono.h#L113-L116](hoomd/hpmc/IntegratorHPMCMono.h#L113-L116)
+
+### Overlap Detection and Performance Optimization
+
+The most critical aspect of HPMC performance is efficient overlap detection. HOOMD-blue implements several optimizations:
+
+1. **Cell Lists**: The simulation box is divided into cells, and only particles in neighboring cells are checked for overlaps.
+
+2. **AABB Trees**: Axis-Aligned Bounding Box (AABB) trees provide hierarchical spatial data structures that accelerate broad-phase collision detection.
+
+3. **Image Lists**: For small systems, the algorithm maintains a list of periodic images to check, avoiding unnecessary computations.
+
+4. **Shape-Specific Optimizations**: Each shape implementation includes optimized overlap checks tailored to its geometry.
+
+```mermaid
+sequenceDiagram
+    participant P as Particle
+    participant A as AABB Tree
+    participant N as Neighbor Cells
+    participant O as Overlap Check
+    
+    P->>A: Query potential neighbors
+    A->>N: Return candidate particles
+    N->>O: Check each candidate
+    O-->>P: Report overlap status
+```
+
+Sources: [IntegratorHPMCMono.h#L346-L349](hoomd/hpmc/IntegratorHPMCMono.h#L346-L349), [IntegratorHPMCMono.h#L289-L293](hoomd/hpmc/IntegratorHPMCMono.h#L289-L293)
+
+### Interaction Matrix
+
+HPMC supports an interaction matrix that allows selective overlap checking between particle types. This is useful for systems where certain particle types should not interact (e.g., in mixtures with size disparity). The interaction matrix is a 2D array where each element indicates whether overlap checks should be performed between the corresponding particle types.
+
+Sources: [IntegratorHPMCMono.h#L332](hoomd/hpmc/IntegratorHPMCMono.h#L332), [IntegratorHPMCMono.h#L351](hoomd/hpmc/IntegratorHPMCMono.h#L351)
+
+## Advanced Features
+
+### Pair Potentials
+
+While HPMC primarily focuses on hard interactions, it also supports soft pair potentials that can be combined with hard core repulsions. This enables the simulation of systems with both entropic and energetic interactions. Pair potentials are implemented as separate modules that can be attached to the HPMC integrator.
+
+Sources: [IntegratorHPMC.h#L517-521](hoomd/hpmc/IntegratorHPMC.h#L517-521)
+
+### External Fields
+
+HPMC supports external fields that can bias particle positions or orientations. These include:
+
+- Wall potentials
+- Harmonic traps
+- Linear fields
+
+External fields are implemented as plugins that compute energy contributions during the move acceptance step.
+
+Sources: [IntegratorHPMC.h#L520-521](hoomd/hpmc/IntegratorHPMC.h#L520-521)
+
+### GPU Acceleration
+
+For high-performance computing, HPMC includes GPU-accelerated implementations through the `IntegratorHPMCMonoGPU` class. The GPU version follows the same algorithmic structure as the CPU version but leverages parallel processing to achieve significant speedups, especially for large systems.
+
+Sources: [IntegratorHPMCMonoGPU.h](hoomd/hpmc/IntegratorHPMCMonoGPU.h)
+
+## Usage Example
+
+Here's a simple example of setting up an HPMC simulation with spherical particles:
+
+```python
+import hoomd
+import hoomd.hpmc
+
+# Initialize the simulation
+sim = hoomd.Simulation(device=hoomd.device.CPU(), seed=42)
+
+# Create a system of hard spheres
+mc = hoomd.hpmc.integrate.Sphere()
+mc.shape.set_parameters(A=1.0)  # Sphere diameter
+mc.d['A'] = 0.1  # Maximum translation distance
+mc.a['A'] = 0.1  # Maximum rotation distance (not used for spheres)
+
+# Set the translation move probability
+mc.translation_move_probability = 0.5
+
+# Run the simulation
+sim.run(1000)
+```
+
+> [!TIP]
+> For optimal performance, adjust the move sizes (d and a parameters) to achieve acceptance rates between 20-50%. Too small moves result in slow exploration, while too large moves lead to high rejection rates.
+
+Sources: [integrate.py](hoomd/hpmc/integrate.py)
+
+## Performance Considerations
+
+HPMC performance depends on several factors:
+
+1. **Move Sizes**: Optimal move sizes balance exploration and acceptance rates. The `getMPS()` method provides moves-per-second statistics to help tune performance.
+
+2. **Cell Width**: The nominal cell width affects neighbor list efficiency. It's automatically updated based on particle sizes and move distances.
+
+3. **nselect Parameter**: Controls how many move attempts are made per particle per timestep. Higher values improve sampling but increase computational cost.
+
+4. **Shape Complexity**: More complex shapes require more expensive overlap checks, affecting overall simulation speed.
+
+Sources: [IntegratorHPMC.h#L275-279](hoomd/hpmc/IntegratorHPMC.h#L275-279), [IntegratorHPMC.h#L526-530](hoomd/hpmc/IntegratorHPMC.h#L526-530)
+
+## Conclusion
+
+Hard Particle Monte Carlo in HOOMD-blue provides a comprehensive framework for simulating systems dominated by shape and entropy. Its modular design supports a wide range of particle shapes and interaction types, while its optimized algorithms ensure efficient sampling of equilibrium configurations. Whether studying simple hard spheres or complex colloidal systems, HPMC offers the flexibility and performance needed for advanced molecular simulations.
+
+The combination of CPU and GPU implementations, along with support for external fields and pair potentials, makes HPMC a versatile tool for researchers in soft matter physics, materials science, and related fields.
+
+# Multi-Particle Collision Dynamics (MPCD)
+
+
+
+Multi-Particle Collision Dynamics (MPCD) is a powerful mesoscale simulation technique that bridges the gap between atomistic molecular dynamics and continuum fluid dynamics. In HOOMD-blue, the MPCD module provides a comprehensive implementation of this method, enabling efficient simulation of complex fluid systems with embedded particles.
+
+## Understanding MPCD: The Big Picture
+
+MPCD is a particle-based method for simulating hydrodynamic behavior in fluids. Unlike traditional molecular dynamics that tracks every atom, MPCD uses coarse-grained "solvent" particles that undergo periodic collisions and streaming steps. This approach captures essential fluid dynamics while being computationally efficient for larger systems and longer timescales.
+
+In HOOMD-blue, the MPCD implementation seamlessly integrates with the existing simulation framework, allowing you to combine MPCD fluids with other simulation methods like Molecular Dynamics (MD) and Hard Particle Monte Carlo (HPMC).
+
+### Core Components of HOOMD's MPCD Implementation
+
+The MPCD module in HOOMD-blue is built around several key classes that work together:
+
+1. **Integrator**: The main orchestrator that manages the MPCD simulation
+2. **CollisionMethod**: Implements the collision rules between particles
+3. **StreamingMethod**: Handles the ballistic motion of particles
+4. **ParticleData**: Specialized data structure for MPCD particles
+5. **CellList**: Efficient cell-based operations for collision detection
+
+## The MPCD Algorithm: Two Steps to Fluid Dynamics
+
+The MPCD algorithm alternates between two fundamental steps: collision and streaming. This two-step approach efficiently captures both local momentum exchange (collision) and collective fluid motion (streaming).
+
+### Step 1: Collision - Local Momentum Exchange
+
+In the collision step, particles are grouped into cells based on their positions, and their velocities are updated according to specific collision rules. The most common collision method implemented in HOOMD-blue is the Stochastic Rotation Dynamics (SRD).
+
+```python
+# Example of setting up SRD collision in HOOMD
+import hoomd
+import hoomd.mpcd
+
+# Initialize the SRD collision method
+srd = hoomd.mpcd.collide.SRD(seed=42, period=1, angle=130)
+srd.temperature = 1.0
+```
+
+The SRD collision method works by:
+1. Dividing the simulation box into cells
+2. Calculating the center-of-mass velocity for each cell
+3. Rotating particle velocities around the center-of-mass
+4. Applying thermostatting to maintain desired temperature
+
+This rotation preserves momentum but changes kinetic energy, effectively modeling viscous behavior. The rotation angle and collision frequency control fluid properties like viscosity.
+
+Sources: [SRDCollisionMethod.h#L25-L121](hoomd/mpcd/SRDCollisionMethod.h#L25-L121), [CollisionMethod.h#L33-L111](hoomd/mpcd/CollisionMethod.h#L33-L111)
+
+### Step 2: Streaming - Ballistic Motion
+
+In the streaming step, particles move ballistically according to their velocities for a fixed time interval. HOOMD-blue offers several streaming methods to handle different boundary conditions:
+
+```python
+# Example of setting up bulk streaming
+stream = hoomd.mpcd.stream.Bulk(period=1)
+
+# For confined geometries, you can use bounce-back streaming
+from hoomd.mpcd import geometry
+channel_geom = geometry.ParallelPlateSeparation(separation=10.0)
+stream = hoomd.mpcd.stream.BounceBack(geometry=channel_geom, period=1)
+```
+
+The streaming methods handle:
+- Ballistic motion of particles
+- Boundary condition enforcement (bounce-back, periodic, etc.)
+- Integration of external forces
+
+For confined systems, the bounce-back streaming method ensures particles remain within defined boundaries by reflecting their velocities when they collide with walls.
+
+Sources: [StreamingMethod.h#L31-L95](hoomd/mpcd/StreamingMethod.h#L31-L95), [BounceBackStreamingMethod.h#L42-L200](hoomd/mpcd/BounceBackStreamingMethod.h#L42-L200)
+
+> [!TIP]
+> The collision and streaming steps don't need to occur at every timestep. You can control their frequency using the `period` parameter, which helps balance accuracy and performance. Typical simulations use collision periods of 1-10 timesteps.
+
+## Understanding MPCD Particle Data
+
+MPCD particles in HOOMD-blue are managed through a specialized `ParticleData` class that's optimized for the unique requirements of MPCD simulations:
+
+```cpp
+// MPCD particles store position + type, velocity + cell index
+// All particles share the same mass for simplicity
+GPUArray<Scalar4> m_pos;     // Position + type
+GPUArray<Scalar4> m_vel;     // Velocity + cell index
+GPUArray<unsigned int> m_tag; // Particle identifier
+```
+
+Unlike regular HOOMD particles, MPCD particles:
+- All share the same mass (reducing memory usage)
+- Store cell indices with velocities for efficient cell-based operations
+- Lack a reverse tag mapping (optimizing for local operations)
+- Support virtual particles for maintaining density in confined systems
+
+Sources: [ParticleData.h#L43-L200](hoomd/mpcd/ParticleData.h#L43-L200)
+
+## Cell-Based Operations: The Heart of MPCD
+
+Efficient cell management is crucial for MPCD performance. The `CellList` class in HOOMD-blue organizes particles into a spatial grid, enabling:
+
+1. Fast collision partner identification
+2. Efficient computation of cell properties
+3. Support for grid shifting to prevent artifacts
+4. Parallel communication in MPI simulations
+
+```mermaid
+graph TD
+    A[Simulation Box] --> B[Cell List Generation]
+    B --> C[Cell-based Collision]
+    C --> D[Velocity Updates]
+    D --> E[Particle Streaming]
+    E --> F[Boundary Interactions]
+    F --> A
+```
+
+The cell list divides space into a regular grid where each cell contains particles that will collide together. The cell size is a critical parameter that affects both physical accuracy and computational efficiency.
+
+Sources: [CellList.h#L33-L200](hoomd/mpcd/CellList.h#L33-L200)
+
+## Practical Implementation: A Complete MPCD Simulation
+
+Let's put it all together with a complete example of setting up an MPCD simulation in HOOMD-blue:
+
+```python
+import hoomd
+import hoomd.mpcd
+
+# Initialize the simulation
+simulation = hoomd.Simulation(device=hoomd.device.CPU(), seed=42)
+
+# Create the system with MPCD particles
+mpcd = hoomd.mpcd.init.read_snapshot(
+    snapshot=mpcd_snapshot,
+    kT=1.0
+)
+
+# Set up the MPCD integrator
+integrator = hoomd.mpcd.Integrator(dt=0.1)
+
+# Configure the collision method
+collision = hoomd.mpcd.collide.SRD(seed=42, period=1, angle=130.0)
+collision.temperature = 1.0
+integrator.collision_method = collision
+
+# Configure the streaming method
+stream = hoomd.mpcd.stream.Bulk(period=1)
+integrator.streaming_method = stream
+
+# Set up the cell list
+cell_size = 1.0
+cl = hoomd.mpcd.cell_list.CellList(cell_size=cell_size)
+integrator.cell_list = cl
+
+# Run the simulation
+simulation.run(1000)
+```
+
+This example shows how to:
+1. Initialize MPCD particles from a snapshot
+2. Create an MPCD integrator
+3. Configure collision and streaming methods
+4. Set up the cell list
+5. Run the simulation
+
+## Advanced Features and Customization
+
+HOOMD-blue's MPCD module offers several advanced features for specialized applications:
+
+### Embedded Particles
+
+You can embed larger particles (such as colloids or polymers) in the MPCD fluid. These particles participate in collisions with the solvent, creating realistic hydrodynamic interactions:
+
+```python
+# Embed particles from an MD simulation
+embedded_group = hoomd.filter.Type('colloid')
+collision.setEmbeddedGroup(embedded_group)
+```
+
+### Multiple Collision Methods
+
+Beyond SRD, HOOMD-blue implements other collision methods like:
+- **AT (Alternating Thermostat)**: More accurate temperature control
+- Custom collision methods through extensibility
+
+### Complex Geometries
+
+The module supports various confined geometries:
+- Parallel plates
+- Cylinders
+- Spherical boundaries
+- Custom-defined geometries
+
+```python
+# Define a cylindrical confinement
+cylinder = geometry.ConcentricCylinders(
+    inner_radius=5.0,
+    outer_radius=15.0
+)
+stream = stream.BounceBack(geometry=cylinder)
+```
+
+### Virtual Particle Fillers
+
+For confined systems, virtual particle fillers maintain proper solvent density in regions that would otherwise be depleted:
+
+```python
+# Add virtual particles to maintain density
+filler = hoomd.mpcd.fill.VirtualParticleFiller(
+    density=5.0, seed=123
+)
+integrator.fillers.append(filler)
+```
+
+## Performance Considerations
+
+MPCD simulations can be computationally intensive, but HOOMD-blue provides several optimizations:
+
+1. **GPU Acceleration**: Many MPCD operations have GPU implementations for significant speedups
+2. **Cell Sorting**: Sorting particles by cell improves memory access patterns
+3. **Tunable Parameters**: Autotuning optimizes kernel launch parameters
+4. **MPI Parallelization**: Distributes computation across multiple nodes
+
+> [!TIP]
+> For optimal performance, match the cell size to the mean free path of your fluid and ensure your collision period is appropriate for the timescales you want to capture. Too frequent collisions waste computation, while too infrequent ones miss important physics.
+
+## Integration with Other HOOMD-blue Methods
+
+One of the strengths of HOOMD-blue's MPCD implementation is its seamless integration with other simulation techniques:
+
+- **Molecular Dynamics**: Simulate solutes with explicit interactions
+- **HPMC**: Study colloidal suspensions with hydrodynamic interactions
+- **Analysis Tools**: Use HOOMD-blue's full suite of analysis methods
+
+```mermaid
+graph LR
+    A[MPCD Fluid] --> B[Collision Step]
+    A --> C[Streaming Step]
+    D[Embedded Particles] --> B
+    B --> E[Hydrodynamic Interactions]
+    C --> F[Collective Motion]
+    E --> G[Complex Fluid Phenomena]
+    F --> G
+```
+
+This integration allows you to create hybrid simulations that capture multiple physical phenomena simultaneously.
+
+## Conclusion
+
+HOOMD-blue's MPCD implementation provides a powerful, flexible framework for mesoscale fluid simulations. By combining efficient algorithms with a modular design, it enables researchers to study complex fluid systems from simple bulk flows to intricate confined geometries with embedded particles.
+
+Whether you're studying membrane proteins in solution, colloidal suspensions, or microfluidics, the MPCD module in HOOMD-blue offers the tools you need to capture essential hydrodynamic behavior while maintaining computational efficiency.
+
+
+# Particle Data Management
+
+
+
+Particle data management is the backbone of any molecular simulation framework, and HOOMD-blue excels in this area with its comprehensive `ParticleData` class. This system handles everything from basic particle properties to complex data structures needed for parallel simulations, GPU acceleration, and anisotropic particles. **Understanding how particle data flows through this system** is crucial for developers who want to extend HOOMD-blue or optimize their simulations.
+
+## Core Concepts and Architecture
+
+At the heart of HOOMD-blue's particle management lies the `ParticleData` class, which serves as the central repository for all particle-related information. Think of it as a sophisticated database that tracks every aspect of your particles throughout the simulation. The class uses `GPUArray` containers that automatically handle data transfer between CPU and GPU memory, making the underlying acceleration transparent to users.
+
+Particles in HOOMD-blue have two key identifiers:
+- **Tag**: A unique global identifier that remains constant throughout the simulation
+- **Index**: The current position in the particle data arrays, which can change during sorting or migration
+
+This dual-identifier system is essential for performance optimization. While indices allow efficient memory access patterns, tags ensure particles can be reliably tracked even when the internal data structure is reorganized.
+
+```mermaid
+flowchart TD
+    A[Particle Tag] -->|maps to| B[Particle Index]
+    B -->|accesses| C[Position Array]
+    B -->|accesses| D[Velocity Array]
+    B -->|accesses| E[Property Arrays]
+    F[Reverse Lookup] -->|provides| B
+    C -->|stores| G[x, y, z, type]
+    D -->|stores| H[vx, vy, vz, mass]
+```
+
+The beauty of this design lies in its flexibility. When particles need to be sorted for better memory locality or migrated between processors in parallel simulations, only the mapping between tags and indices changes, while the actual particle identifiers remain stable.
+
+## Particle Properties Storage
+
+HOOMD-blue stores particle properties in carefully designed data structures that balance memory efficiency with computational performance. The key insight is **combining related properties into single data structures** to optimize memory access patterns.
+
+Here's how basic particle properties are organized:
+
+| Property | Data Structure | Components | Purpose |
+|----------|----------------|------------|---------|
+| Position | `Scalar4` | x, y, z coordinates + type ID | Spatial location and particle classification |
+| Velocity | `Scalar4` | vx, vy, vz components + mass | Motion dynamics and particle inertia |
+| Acceleration | `Scalar3` | ax, ay, az components | Force-derived motion changes |
+| Orientation | `Scalar4` | Quaternion (4 components) | Rotational state for anisotropic particles |
+
+This design leverages the fact that GPUs and modern CPUs can read 4-byte data structures more efficiently than separate 3-byte vectors. By packing type information into the w-component of position and mass into velocity components, HOOMD-blue reduces memory bandwidth requirements and improves cache utilization.
+Sources: [ParticleData.h#L223-234](hoomd/ParticleData.h#L223-234), [ParticleData.h#L1275-1279](hoomd/ParticleData.h#L1275-1279)
+
+### Alternative Arrays for Efficient Operations
+
+One of the most sophisticated features is the system of **alternate arrays** designed for high-performance particle reordering operations. Instead of writing to temporary buffers and copying back, HOOMD-blue provides shadow arrays that can be swapped in at effectively zero cost:
+
+```cpp
+// Example of efficient particle reordering
+ArrayHandle<Scalar4> h_pos_alt(m_pdata->getAltPositions(), 
+                              access_location::host, 
+                              access_mode::overwrite);
+ArrayHandle<Scalar4> h_pos(m_pdata->getPositions(), 
+                          access_location::host, 
+                          access_mode::read);
+
+// Apply permutation to alternate array
+for (int i = 0; i < getN(); ++i) 
+    h_pos_alt.data[i] = h_pos.data[permutation[i]];
+
+// Swap in reordered data instantly
+m_pdata->swapPositions();
+```
+
+This approach is particularly valuable for operations like spatial sorting and neighbor list updates where particle order needs to be changed frequently. The system maintains alternate arrays for all major particle properties, enabling consistent and efficient reordering operations.
+Sources: [ParticleData.h#L646-665](hoomd/ParticleData.h#L646-665), [ParticleData.h#L1305-1318](hoomd/ParticleData.h#L1305-1318)
+
+## Snapshot System
+
+The snapshot mechanism provides a powerful way to **capture and restore the complete state** of particle data. Snapshots serve two primary purposes:
+1. Initializing particle systems from external data
+2. Saving simulation states for analysis or restart
+
+```cpp
+// Taking a snapshot of current particle data
+SnapshotParticleData<float> snapshot;
+m_pdata->takeSnapshot(snapshot);
+
+// Accessing particle positions from snapshot
+for (unsigned int i = 0; i < snapshot.getSize(); i++) {
+    printf("Particle %d: pos=(%f, %f, %f)\n", 
+           i, snapshot.pos[i].x, 
+           snapshot.pos[i].y, snapshot.pos[i].z);
+}
+
+// Modifying and restoring snapshot
+snapshot.pos[0] = make_vec3<float>(0.0f, 0.0f, 0.0f);
+m_pdata->initializeFromSnapshot(snapshot);
+```
+
+Snapshots store data in **global tag order**, ensuring consistent particle identification across different stages of simulation. They also handle special features like origin shifting and acceleration flags, making them comprehensive state representations rather than simple data copies.
+Sources: [ParticleData.h#L118-129](hoomd/ParticleData.h#L118-129), [ParticleData.h#L1127-1132](hoomd/ParticleData.h#L1127-1132)
+
+> [!TIP]
+> Snapshots are the preferred method for modifying particle properties programmatically. Direct manipulation of particle data arrays should be avoided as it bypasses important consistency checks and can lead to undefined behavior in parallel simulations.
+
+## Dynamic Particle Management
+
+Modern simulations often require adding or removing particles during runtime. HOOMD-blue provides sophisticated support for **dynamic particle management** with automatic memory optimization and tag recycling.
+
+```mermaid
+sequenceDiagram
+    participant U as User Code
+    participant PD as ParticleData
+    participant M as Memory Manager
+    participant T as Tag System
+    
+    U->>PD: addParticle(type_id)
+    PD->>T: allocateNewTag()
+    T->>PD: return unique_tag
+    PD->>M: checkCapacity()
+    alt Need more space
+        M->>M: reallocAmortized()
+    end
+    PD->>PD: insert particle data
+    PD->>U: return particle_tag
+```
+
+The system employs several key strategies for efficient dynamic management:
+- **Amortized resizing**: Arrays grow by a constant factor when space is exhausted
+- **Tag recycling**: Removed particle tags are stored for reuse, preventing tag exhaustion
+- **Compact storage**: Active particles are kept contiguous in memory for optimal access patterns
+
+```cpp
+// Adding particles to simulation
+unsigned int tag1 = m_pdata->addParticle(0);  // Type 0
+unsigned int tag2 = m_pdata->addParticle(1);  // Type 1
+
+// Setting particle properties
+m_pdata->setPosition(tag1, make_scalar3(1.0, 0.0, 0.0));
+m_pdata->setVelocity(tag1, make_scalar3(0.1, 0.0, 0.0));
+
+// Removing particles
+m_pdata->removeParticle(tag2);
+```
+
+The system automatically handles all the complex bookkeeping involved in dynamic particle management, including updating reverse lookup tables and ensuring memory consistency across CPU and GPU arrays.
+Sources: [ParticleData.h#L1208-1212](hoomd/ParticleData.h#L1208-1212), [ParticleData.h#L1290-1294](hoomd/ParticleData.h#L1290-1294)
+
+## Parallel and GPU Considerations
+
+For parallel simulations using MPI and GPU acceleration, HOOMD-blue extends particle data management with **domain decomposition** and **ghost particle** systems. These features enable efficient scaling to thousands of processors while maintaining data consistency.
+
+```mermaid
+flowchart LR
+    subgraph Domain A
+        A1[Local Particles]
+        A2[Ghost Particles]
+    end
+    subgraph Domain B
+        B1[Local Particles]
+        B2[Ghost Particles]
+    end
+    A1 <-- communication --> B2
+    B1 <-- communication --> A2
+```
+
+Ghost particles are duplicates of particles from neighboring domains that are necessary for computing interactions near domain boundaries. The system automatically manages:
+- **Particle migration**: Moving particles between domains as they move through space
+- **Ghost particle communication**: Exchanging boundary particle data between neighboring processors
+- **Load balancing**: Redistributing particles to maintain equal computational load
+
+For GPU-accelerated simulations, the particle data system leverages **unified memory architecture** to provide seamless data access. The `GPUArray` containers automatically handle:
+- Host-device memory transfers
+- Asynchronous data movement
+- Memory coherency maintenance
+
+This design allows developers to write CPU-like code while benefiting from GPU acceleration without explicit memory management.
+Sources: [ParticleData.h#L328-352](hoomd/ParticleData.h#L328-352), [ParticleData.h#L1175-1181](hoomd/ParticleData.h#L1175-1181)
+
+## Python Integration and Data Access
+
+HOOMD-blue provides sophisticated Python bindings through the `LocalParticleData` class, enabling **efficient data access** for analysis and custom operations. This system is designed with performance in mind, avoiding unnecessary data copies and supporting both CPU and GPU buffer access.
+
+```python
+# Accessing particle data from Python
+import hoomd
+
+# Get current simulation state
+snapshot = simulation.state.take_snapshot()
+
+# Access particle positions in numpy array
+positions = snapshot.particles.position
+velocities = snapshot.particles.velocity
+
+# Modify particle properties
+positions[0] = [0.0, 0.0, 0.0]
+simulation.state.restore_snapshot(snapshot)
+
+# Direct access for analysis
+with simulation.state.cpu_local_snapshot as data:
+    positions = data.particles.position
+    # Perform analysis without data copy
+    center_of_mass = positions.mean(axis=0)
+```
+
+The Python integration supports several key features:
+- **Zero-copy access**: Direct memory access for large datasets
+- **Context management**: Automatic resource cleanup using Python context managers
+- **Flexible data access**: Support for different data types and array layouts
+- **Ghost particle inclusion**: Optional access to ghost particle data for analysis
+
+This integration makes HOOMD-blue not just a simulation engine but also a powerful platform for custom analysis and data processing workflows.
+Sources: [ParticleData.h#L1366-1392](hoomd/ParticleData.h#L1366-1392), [ParticleData.h#L1460-1467](hoomd/ParticleData.h#L1460-1467)
+
+## Extensibility and Customization
+
+The particle data system is designed with **extensibility in mind**, providing hooks and signals that allow developers to extend functionality without modifying core code. The signal-based architecture enables loose coupling between components.
+
+```cpp
+class CustomForceCompute : public ForceCompute {
+public:
+    CustomForceCompute(std::shared_ptr<ParticleData> pdata) 
+        : ForceCompute(pdata) {
+        // Connect to particle sort signal
+        m_pdata->getParticleSortSignal().connect(
+            std::bind(&CustomForceCompute::rebuildStructure, this));
+    }
+    
+private:
+    void rebuildStructure() {
+        // Update internal data structures when particles are sorted
+    }
+};
+```
+
+Key extensibility features include:
+- **Sort signals**: Notifications when particle order changes
+- **Box change signals**: Updates when simulation box dimensions change
+- **Particle number signals**: Notifications when particle count changes
+- **Memory management callbacks**: Custom actions during array reallocation
+
+This event-driven architecture makes it easy to develop custom force computes, analyzers, and other simulation components that integrate seamlessly with the core particle data system.
+
+> [!TIP]
+> When developing custom components that interact with particle data, always connect to the appropriate signals rather than assuming data layout remains constant. This ensures your code works correctly with the dynamic nature of HOOMD-blue's particle management.
+Sources: [ParticleData.h#L835-867](hoomd/ParticleData.h#L835-867), [ParticleData.h#L1253-1266](hoomd/ParticleData.h#L1253-1266)
+
+## Performance Optimization Strategies
+
+Understanding the particle data system architecture enables developers to write **high-performance simulation code** by leveraging HOOMD-blue's optimization features.
+
+### Memory Access Patterns
+
+The most critical factor for performance is maintaining **efficient memory access patterns**. Here are key strategies:
+
+```cpp
+// Good: Sequential access to particle arrays
+ArrayHandle<Scalar4> h_pos(m_pdata->getPositions(), 
+                          access_location::host, 
+                          access_mode::read);
+for (unsigned int i = 0; i < m_pdata->getN(); i++) {
+    Scalar4 pos = h_pos.data[i];
+    // Process particle i
+}
+
+// Avoid: Random access patterns that cause cache misses
+for (unsigned int tag = 0; tag < max_tag; tag++) {
+    if (m_pdata->isTagActive(tag)) {
+        unsigned int i = m_pdata->getRTag(tag);
+        Scalar4 pos = h_pos.data[i];  // Cache-unfriendly
+        // Process particle
+    }
+}
+```
+
+### Array Handle Management
+
+Proper management of `ArrayHandle` objects is crucial for performance:
+
+```cpp
+// Good: Minimize handle lifetime, use local scope
+{
+    ArrayHandle<Scalar4> h_pos(m_pdata->getPositions(), 
+                              access_location::host, 
+                              access_mode::read);
+    // Perform computation using host data
+}  // Handle automatically released
+
+// Avoid: Holding handles unnecessarily
+ArrayHandle<Scalar4> h_pos(m_pdata->getPositions(), 
+                          access_location::host, 
+                          access_mode::read);
+// Long computation that doesn't need position data
+// This blocks GPU operations unnecessarily
+```
+
+### GPU-CPU Data Transfer
+
+Be mindful of **implicit data transfers** when working with GPU arrays:
+
+```cpp
+// Good: Batch operations on GPU
+ArrayHandle<Scalar4> d_pos(m_pdata->getPositions(), 
+                          access_location::device, 
+                          access_mode::read);
+my_gpu_kernel<<<grid, blocks>>>(d_pos.data, ...);
+
+// Avoid: Frequent CPU-GPU synchronization
+for (int i = 0; i < iterations; i++) {
+    ArrayHandle<Scalar4> h_pos(m_pdata->getPositions(), 
+                              access_location::host, 
+                              access_mode::readwrite);  // Forces synchronization
+    // Small modification
+}  // Repeated synchronization kills performance
+```
+
+These optimization strategies can lead to **order-of-magnitude performance improvements** in custom code while maintaining compatibility with HOOMD-blue's core particle management system.
+
+# Forces and Constraints
+
+
+
+Forces and constraints are fundamental components in molecular dynamics simulations that govern particle behavior and interactions. In HOOMD-blue, these are implemented through a well-structured hierarchy that provides both flexibility and performance. Let's explore how forces and constraints work together to create realistic simulations.
+
+## Understanding the Force Architecture
+
+At the core of HOOMD-blue's force system is the `ForceCompute` base class, which serves as the foundation for all force calculations in the simulation. This class handles the storage and management of force-related data including forces, energies, virials, and torques for each particle in the system.
+
+The `ForceCompute` class provides several key arrays for storing particle data:
+- **Force array**: Stores the x, y, z components of force and potential energy for each particle
+- **Virial array**: Stores the per-particle virial as a 6-component upper triangular matrix
+- **Torque array**: Stores torque components for each particle (important for rotational degrees of freedom)
+
+```cpp
+// Key data structures in ForceCompute
+GPUArray<Scalar4> m_force;  // Forces and potential energies
+GPUArray<Scalar> m_virial;  // Virial components
+GPUArray<Scalar4> m_torque; // Torques
+```
+
+The class provides a pure virtual method `computeForces(uint64_t timestep)` that all specific force implementations must override. This method is called when forces need to be recalculated during the simulation.
+
+Sources: [ForceCompute.h#L207-L218](hoomd/ForceCompute.h#L207-L218), [ForceCompute.h#L237-L242](hoomd/ForceCompute.h#L237-L242)
+
+## Force Types in HOOMD-blue
+
+HOOMD-blue organizes forces into several categories based on their physical nature and implementation:
+
+### 1. Pair Forces (Non-bonded Interactions)
+Pair forces calculate interactions between all pairs of particles within a certain cutoff distance. These include Lennard-Jones potentials, Coulomb interactions, and other short-range forces. The system uses neighbor lists to efficiently compute these interactions without checking every possible particle pair.
+
+### 2. Bonded Forces
+Bonded forces act between particles that are explicitly connected through bonds, angles, or dihedrals:
+- **Bonds**: Connect two particles (e.g., covalent bonds)
+- **Angles**: Involve three particles in a bonded angle
+- **Dihedrals**: Involve four particles in a torsional angle
+
+### 3. External Forces
+External forces apply fields or potentials to particles based on their position in space, such as gravity, electric fields, or wall potentials.
+
+### 4. Constraint Forces
+Constraint forces maintain specific geometric relationships between particles, such as fixed distances or angles. These are handled differently from regular forces because they reduce the degrees of freedom in the system.
+
+Sources: [hoomd/md/__init__.py#L21-L42](hoomd/md/__init__.py#L21-L42)
+
+## The Constraint System
+
+Constraints in HOOMD-blue are implemented through the `ForceConstraint` base class, which extends `ForceCompute` with additional functionality specific to constraint handling. The key difference between regular forces and constraints is that constraints remove degrees of freedom from the system.
+
+```cpp
+class ForceConstraint : public ForceCompute
+{
+public:
+    // Return the number of DOF removed by this constraint
+    virtual Scalar getNDOFRemoved(std::shared_ptr<ParticleGroup> query)
+    {
+        return 0;
+    }
+    
+protected:
+    virtual void computeForces(uint64_t timestep);
+};
+```
+
+The `getNDOFRemoved()` method is crucial for thermodynamic calculations, as it tells the system how many degrees of freedom have been removed by the constraint. This affects temperature calculations and other statistical mechanical properties.
+
+Sources: [ForceConstraint.h#L27-L45](hoomd/ForceConstraint.h#L27-L45)
+
+## Force Computation Workflow
+
+The force computation process in HOOMD-blue follows a well-defined sequence that ensures all forces are calculated correctly and efficiently:
+
+```mermaid
+sequenceDiagram
+    participant Integrator
+    participant ForceCompute
+    participant SpecificForce
+    participant ParticleData
+    
+    Integrator->>ForceCompute: compute(timestep)
+    ForceCompute->>SpecificForce: computeForces(timestep)
+    SpecificForce->>ParticleData: Access particle positions
+    SpecificForce->>SpecificForce: Calculate forces
+    SpecificForce->>ForceCompute: Store forces in arrays
+    ForceCompute->>Integrator: Forces ready for integration
+```
+
+1. **Initialization**: The integrator calls the `compute()` method on all force objects
+2. **Force Calculation**: Each force object implements `computeForces()` to calculate its specific contribution
+3. **Data Access**: Forces access particle data (positions, velocities, etc.) through the `ParticleData` system
+4. **Storage**: Calculated forces are stored in the GPU arrays for efficient access
+5. **Integration**: The integrator uses the total forces to update particle positions and velocities
+
+Sources: [ForceCompute.h#L75-L76](hoomd/ForceCompute.h#L75-L76)
+
+## Memory Management and GPU Acceleration
+
+HOOMD-blue uses sophisticated memory management to handle force data efficiently:
+
+```cpp
+// Arrays are stored on GPU for fast access
+GPUArray<Scalar4> m_force;
+GPUArray<Scalar> m_virial;
+GPUArray<Scalar4> m_torque;
+```
+
+The `GPUArray` template class automatically handles data transfer between CPU and GPU memory, allowing the same code to work on both architectures. For performance-critical force calculations, HOOMD-blue provides GPU implementations that can calculate forces orders of magnitude faster than CPU versions.
+
+The system also includes the `LocalForceComputeData` class, which provides zero-copy access to force data from Python, allowing for efficient analysis and visualization without unnecessary data copying.
+
+Sources: [ForceCompute.h#L207-L218](hoomd/ForceCompute.h#L207-L218), [ForceCompute.h#L248-L259](hoomd/ForceCompute.h#L248-L259)
+
+## Implementing Custom Forces
+
+Creating custom forces in HOOMD-blue involves extending the `ForceCompute` class:
+
+```cpp
+class MyCustomForce : public ForceCompute
+{
+public:
+    MyCustomForce(std::shared_ptr<SystemDefinition> sysdef) 
+        : ForceCompute(sysdef) {}
+    
+protected:
+    virtual void computeForces(uint64_t timestep)
+    {
+        // Access particle data
+        ArrayHandle<Scalar4> h_pos(m_pdata->getPositions(), 
+                                   access_location::host, 
+                                   access_mode::read);
+        
+        // Calculate forces based on particle positions
+        // Store results in m_force, m_virial, etc.
+    }
+};
+```
+
+The key steps are:
+1. Inherit from `ForceCompute`
+2. Implement the `computeForces()` method
+3. Access particle data through the `ParticleData` system
+4. Store results in the appropriate arrays
+
+> [!TIP]
+> When implementing custom forces, always use the `ArrayHandle` class to access particle data. This ensures proper memory management and works seamlessly with both CPU and GPU execution modes.
+
+Sources: [ForceCompute.h#L237-L242](hoomd/ForceCompute.h#L237-L242)
+
+## Energy and Virial Calculations
+
+Forces in HOOMD-blue don't just compute forces—they also calculate energies and virials for thermodynamic analysis:
+
+```cpp
+// Access computed energies and forces
+Scalar total_energy = force_compute->calcEnergySum();
+vec3<double> total_force = force_compute->calcForceGroup(group);
+std::vector<Scalar> virial = force_compute->calcVirialGroup(group);
+```
+
+The system provides methods to:
+- Calculate total potential energy
+- Sum forces for specific particle groups
+- Compute virial contributions for pressure calculations
+- Access per-particle quantities for detailed analysis
+
+These quantities are essential for monitoring simulation progress, calculating thermodynamic properties, and validating simulation results.
+
+Sources: [ForceCompute.h#L78-L88](hoomd/ForceCompute.h#L78-L88)
+
+## Parallel Computing Considerations
+
+HOOMD-blue is designed to work efficiently in parallel computing environments:
+
+```cpp
+#ifdef ENABLE_MPI
+    virtual CommFlags getRequestedCommFlags(uint64_t timestep)
+    {
+        CommFlags flags(0);
+        flags[comm_flag::position] = 1;
+        flags[comm_flag::net_force] = 1;
+        return flags;
+    }
+#endif
+```
+
+In MPI simulations:
+- Forces can request specific particle data to be communicated between processors
+- The `preCompute()` method allows overlapping computation with communication
+- Forces are properly summed across processor boundaries
+
+This design ensures that force calculations scale efficiently to thousands of processors, enabling large-scale simulations of complex systems.
+
+Sources: [ForceCompute.h#L157-L167](hoomd/ForceCompute.h#L157-L167), [ForceCompute.h#L68-L72](hoomd/ForceCompute.h#L68-L72)
+
+## Conclusion
+
+The force and constraint system in HOOMD-blue represents a sophisticated architecture that balances flexibility, performance, and ease of use. By providing a clear hierarchy of base classes and efficient memory management, it enables researchers to implement complex molecular dynamics simulations while maintaining high performance on both CPU and GPU architectures.
+
+Whether you're using built-in force fields or implementing custom interactions, understanding this architecture will help you create more effective and efficient simulations. The modular design allows for easy extension and customization, making HOOMD-blue a powerful tool for molecular dynamics research.
+
+# Integrators and Updaters
+
+
+
+In the world of molecular dynamics simulations, integrators and updaters are the engines that drive your system forward in time. Think of them as the **conductors of your simulation orchestra** - integrators move particles according to physical laws, while updaters handle everything else that needs to change during a simulation. Let's dive into how these critical components work in HOOMD-blue.
+
+## The Foundation: Actions and Updaters
+
+At the heart of HOOMD-blue's simulation architecture lies a hierarchy of classes that perform actions on the system. The base class `Action` provides common functionality for all components that interact with the simulation state. `Action` holds references to the system definition, particle data, and execution configuration - essentially everything needed to interact with the simulation.
+
+Building on this foundation, the `Updater` class defines the basic contract for any component that modifies the simulation state. An updater is conceptually simple - it takes the current state and changes it in some way. This could mean moving particles, changing the simulation box, or any other modification needed during the simulation.
+
+Sources: [Action.h#L21-71](hoomd/Action.h#L21-71), [Updater.h#L39-113](hoomd/Updater.h#L39-113)
+
+## Integrators: The Physics Engines
+
+Integrators are specialized updaters that implement the physics of moving particles forward in time. They inherit from `Updater` but add specific functionality for force computation and particle dynamics. The base `Integrator` class provides the framework that all specific integration methods build upon.
+
+### Core Integrator Architecture
+
+The `Integrator` class manages two fundamental types of forces:
+
+1. **Regular Forces** (`m_forces`): These are computed independently and summed to get the net force on each particle
+2. **Constraint Forces** (`m_constraint_forces`): These are computed after the net force is available and can read the current unconstrained forces
+
+This two-stage computation is crucial for simulations with constraints (like rigid bodies or fixed bonds), where constraint forces depend on the current state of the system.
+
+```cpp
+class Integrator : public Updater {
+    std::vector<std::shared_ptr<ForceCompute>> m_forces;
+    std::vector<std::shared_ptr<ForceConstraint>> m_constraint_forces;
+    Scalar m_deltaT; // Time step size
+    // ... other members and methods
+};
+```
+
+Sources: [Integrator.h#L60-200](hoomd/Integrator.h#L60-200)
+
+### The Integration Process
+
+The magic happens in the `update()` method, which advances the system by one time step. Here's how it works:
+
+1. **Compute Net Forces**: The integrator first calculates all regular forces and sums them up
+2. **Apply Constraints**: Then it computes constraint forces that depend on the current net force
+3. **Update Particle States**: Finally, it updates particle positions and velocities based on the total forces
+
+The base `Integrator` class actually leaves the particle updating to derived classes - it only handles the force computation part. This makes sense because different integration methods (like Velocity Verlet, Brownian dynamics, etc.) have different ways of updating particle states.
+
+Sources: [Integrator.cc#L782-796](hoomd/Integrator.cc#L782-796)
+
+### Force Computation in Detail
+
+The force computation process is worth examining closely. The `computeNetForce()` method:
+
+1. **Zeroes out** the net force and virial arrays
+2. **Computes each force** independently by calling `force->compute(timestep)`
+3. **Sums all forces** into the net force array
+4. **Handles constraint forces** separately after regular forces are complete
+
+```cpp
+void Integrator::computeNetForce(uint64_t timestep) {
+    // Zero out net force arrays
+    net_force.zeroFill();
+    net_virial.zeroFill();
+    
+    // Compute and sum all regular forces
+    for (auto& force : m_forces) {
+        force->compute(timestep);
+        // Sum forces into net arrays...
+    }
+    
+    // Handle constraint forces
+    for (auto& constraint_force : m_constraint_forces) {
+        constraint_force->compute(timestep);
+        // Sum constraint forces...
+    }
+}
+```
+
+Sources: [Integrator.cc#L166-337](hoomd/Integrator.cc#L166-337)
+
+> [!TIP]
+> Integrators take "ownership" of particle accelerations in HOOMD-blue. Any other updater that modifies accelerations directly will produce undefined results. All acceleration changes must be done through forces added to the integrator.
+
+## Specialized Integrators: Two-Step Methods
+
+HOOMD-blue provides specialized integrators for different simulation needs. A particularly important one is `IntegratorTwoStep`, which implements the popular two-step integration methods used in molecular dynamics.
+
+Two-step methods (like Velocity Verlet) work by:
+1. **Half-step velocity update**
+2. **Full-step position update** 
+3. **Force computation**
+4. **Second half-step velocity update**
+
+This approach is more accurate and stable than simpler methods, making it the workhorse of many MD simulations.
+
+```cpp
+class IntegratorTwoStep : public Integrator {
+    std::vector<std::shared_ptr<IntegrationMethodTwoStep>> m_methods;
+    std::shared_ptr<ForceComposite> m_rigid_bodies;
+    // ...
+};
+```
+
+Sources: [IntegratorTwoStep.h#L38-123](hoomd/md/IntegratorTwoStep.h#L38-123)
+
+## Updaters: Beyond Particle Integration
+
+While integrators handle particle motion, updaters manage everything else that needs to change during a simulation. They're incredibly versatile - any transformation of the simulation state that doesn't follow standard integration rules can be implemented as an updater.
+
+### BoxResizeUpdater: A Concrete Example
+
+Let's look at `BoxResizeUpdater`, a practical updater that changes the simulation box size over time. This is useful for simulations under pressure, where you want the box to expand or contract in response to the system's state.
+
+```cpp
+class BoxResizeUpdater : public Updater {
+    std::shared_ptr<VectorVariantBox> m_box;  // Box as a function of time
+    std::shared_ptr<ParticleGroup> m_group;   // Particles to scale with the box
+    
+    void update(uint64_t timestep) {
+        // Get new box dimensions
+        BoxDim new_box = getCurrentBox(timestep);
+        
+        // Update the box
+        m_pdata->setGlobalBox(new_box);
+        
+        // Scale particle positions
+        scaleAndWrapParticles(cur_box, new_box);
+    }
+};
+```
+
+The `update()` method is simple but effective:
+1. **Gets the new box dimensions** from a time-dependent variant
+2. **Updates the global box** if dimensions changed
+3. **Scales particle positions** to maintain their relative locations in the new box
+4. **Wraps particles** back into the simulation box if they moved outside
+
+Sources: [BoxResizeUpdater.h#L34-79](hoomd/BoxResizeUpdater.h#L34-79), [BoxResizeUpdater.cc#L45-72](hoomd/BoxResizeUpdater.cc#L45-72)
+
+### The Trigger System
+
+One of the most powerful features of updaters is their integration with the **trigger system**. Every updater has a trigger that determines when it should run:
+
+```cpp
+class Updater : public Action {
+    std::shared_ptr<Trigger> m_trigger;
+    
+    virtual void update(uint64_t timestep) { }
+    // ...
+};
+```
+
+Triggers can be as simple as "run every step" or as complex as "run every 100 steps but only after step 10,000". This flexibility allows you to precisely control when different updates occur in your simulation.
+
+Sources: [Updater.h#L91-99](hoomd/Updater.h#L91-99)
+
+## Working Together: The Simulation Pipeline
+
+Integrators and updaters work together in a carefully orchestrated sequence during each simulation step. Here's how they fit into the larger simulation workflow:
+
+```mermaid
+sequenceDiagram
+    participant System
+    participant Updater1
+    participant Integrator
+    participant Updater2
+    participant Analyzer
+    
+    System->>Updater1: Should you run?
+    Updater1-->>System: Yes (trigger condition met)
+    System->>Updater1: update(timestep)
+    Updater1->>Updater1: Modify simulation state
+    
+    System->>Integrator: Should you run?
+    Integrator-->>System: Yes (always runs)
+    System->>Integrator: update(timestep)
+    Integrator->>Integrator: computeNetForce()
+    Integrator->>Integrator: update particle positions/velocities
+    
+    System->>Updater2: Should you run?
+    Updater2-->>System: Yes (trigger condition met)
+    System->>Updater2: update(timestep)
+    Updater2->>Updater2: Modify simulation state
+    
+    System->>Analyzer: Should you run?
+    Analyzer-->>System: Yes (trigger condition met)
+    System->>Analyzer: analyze(timestep)
+```
+
+The key insight is that **integrators typically run every step** (they have a periodic trigger with period 1), while other updaters run only when their specific conditions are met. This design allows for efficient simulations where expensive operations only occur when needed.
+
+## Best Practices and Common Patterns
+
+When working with integrators and updaters, keep these guidelines in mind:
+
+### 1. Choose the Right Tool for the Job
+
+- Use **integrators** for standard particle dynamics following physical laws
+- Use **updaters** for everything else (box changes, particle insertion/removal, etc.)
+- Consider **trigger conditions** carefully - running operations too often wastes computation
+
+### 2. Order Matters
+
+The sequence of operations matters in simulations. Generally:
+1. **Pre-integration updaters** run before the integrator (e.g., box resizing)
+2. **The integrator** runs, updating particle positions
+3. **Post-integration updaters** run after the integrator (e.g., data analysis)
+
+### 3. Performance Considerations
+
+- **Force computation** is often the bottleneck - minimize unnecessary force calculations
+- **GPU acceleration** is available for many operations - use it when possible
+- **Communication overhead** in MPI simulations can be significant - batch operations when possible
+
+Sources: [Integrator.h#L48-57](hoomd/Integrator.h#L48-57)
+
+## Conclusion
+
+Integrators and updaters form the backbone of HOOMD-blue's simulation engine. The integrator handles the physics of particle motion through force computation and position updates, while updaters provide a flexible framework for everything else that needs to change during a simulation.
+
+This modular design allows you to build complex simulations by combining simple, well-tested components. Whether you're running a simple molecular dynamics simulation or a complex Monte Carlo with box resizing, the integrator-updater architecture provides the flexibility you need.
+
+The key to mastering this system is understanding the separation of concerns: integrators for physics, updaters for everything else, and triggers for controlling when operations occur. With this foundation, you're ready to explore the specific integration methods and updaters available in HOOMD-blue's extensive toolkit.
+
+# GPU Acceleration
+
+
+
+GPU acceleration is at the heart of HOOMD-blue's performance, enabling molecular dynamics simulations to run orders of magnitude faster than on CPUs alone. This comprehensive guide explores how HOOMD-blue leverages modern GPUs through its sophisticated hybrid CPU/GPU architecture.
+
+## The GPU Architecture in HOOMD-blue
+
+HOOMD-blue employs a sophisticated hybrid architecture that seamlessly integrates CPU and GPU computation. At the core of this design is the **ExecutionConfiguration** class, which manages device selection, initialization, and execution mode determination. Unlike many simulation packages that support only NVIDIA GPUs, HOOMD-blue uses **HIP (Heterogeneous-Compute Interface for Portability)**, enabling support for both NVIDIA CUDA and AMD GPUs through a unified interface.
+
+The execution system operates in three modes:
+- **GPU mode**: Forces execution on the selected GPU
+- **CPU mode**: Runs all computations on the CPU
+- **AUTO mode**: Automatically selects GPU if available, otherwise falls back to CPU
+
+This flexibility ensures your simulations work regardless of hardware availability while maximizing performance when GPUs are present.
+Sources: [ExecutionConfiguration.h#L67-L76](hoomd/ExecutionConfiguration.h#L67-L76), [ExecutionConfiguration.cc#L78-L86](hoomd/ExecutionConfiguration.cc#L78-L86)
+
+## Device Selection and Configuration
+
+HOOMD-blue provides a clean Python interface for device selection through the `Device` classes. Users can easily choose between CPU and GPU execution with minimal code changes:
+
+```python
+# CPU execution
+device = hoomd.device.CPU()
+
+# GPU execution (automatically selects best available GPU)
+device = hoomd.device.GPU()
+
+# Specify a particular GPU
+device = hoomd.device.GPU(gpu_ids=[0])
+```
+
+When you create a GPU device, HOOMD-blue automatically scans available GPUs, checks their capabilities, and selects the most appropriate one. The system handles all the low-level details of GPU initialization, including context creation and memory management.
+
+> [!TIP]
+> Always reuse Device objects when possible. Creating a new Device instance has non-negligible overhead, especially on GPUs.
+
+The device selection process is intelligent - it considers GPU compute capabilities, available memory, and even MPI configuration when running in parallel to ensure optimal performance across your simulation setup.
+Sources: [device.py#L17-L23](hoomd/device.py#L17-L23), [ExecutionConfiguration.cc#L74-L76](hoomd/ExecutionConfiguration.cc#L74-L76)
+
+## Data Management: The GPUArray System
+
+Efficient data transfer between CPU and GPU is crucial for performance. HOOMD-blue's **GPUArray** class provides a sophisticated solution that minimizes data movement while maintaining flexibility. The system tracks where data resides (host or device) and automatically handles synchronization only when necessary.
+
+The GPUArray system uses three key concepts:
+- **access_location**: Where you want to access the data (host or device)
+- **data_location**: Where the data currently resides 
+- **access_mode**: How you intend to use the data (read, readwrite, or overwrite)
+
+```cpp
+// Example of GPUArray usage
+GPUArray<float> array(1000, exec_conf);
+
+// Acquire data on device for writing
+ArrayHandle<float> h_array(array, access_location::device, 
+                           access_mode::overwrite);
+
+// GPU kernel can now safely modify the data
+gpu_kernel(h_array.data, ...);
+```
+
+This intelligent data management system ensures that:
+1. Data is only transferred when absolutely necessary
+2. Multiple transfers of the same data are avoided
+3. Memory usage is optimized by keeping data where it's actively used
+Sources: [GPUArray.h#L36-L72](hoomd/GPUArray.h#L36-L72)
+
+## GPU Kernel Implementation Pattern
+
+HOOMD-blue follows a consistent pattern for implementing GPU-accelerated algorithms. Each computational module typically has three components:
+
+1. **Base class**: Defines the interface and common functionality (e.g., `CellList`)
+2. **GPU class**: Inherits from the base class and implements GPU-specific logic (e.g., `CellListGPU`)
+3. **CUDA/HIP kernels**: The actual GPU kernels in .cu and .cuh files
+
+```cpp
+// GPU class implementation
+class CellListGPU : public CellList {
+protected:
+    virtual void computeCellList() {
+        // Launch GPU kernels
+        gpu_compute_cell_list_kernel<<<blocks, threads>>>(...);
+    }
+    
+    std::shared_ptr<Autotuner<1>> m_tuner;  // Performance optimization
+};
+```
+
+This pattern allows HOOMD-blue to provide both CPU and GPU implementations of the same algorithm while sharing common code and maintaining a consistent user interface. Users don't need to change their simulation code when switching between CPU and GPU execution - the system automatically selects the appropriate implementation based on the device configuration.
+Sources: [CellListGPU.h#L27-L41](hoomd/CellListGPU.h#L27-L41)
+
+## Performance Optimization with Autotuning
+
+GPU performance is highly dependent on kernel configuration parameters like block size, grid size, and memory access patterns. HOOMD-blue includes a sophisticated **autotuning system** that automatically finds optimal parameters for each GPU kernel and hardware configuration.
+
+The Autotuner works by:
+1. Testing a range of parameter values
+2. Measuring performance for each configuration
+3. Selecting the best-performing parameters
+4. Locking to those values for future execution
+
+```cpp
+// Autotuner automatically finds optimal block size
+std::vector<unsigned int> range = Autotuner::makeBlockSizeRange(exec_conf);
+m_tuner.reset(new Autotuner<1>(range, 5, 1000, "cell_list", exec_conf));
+
+// In the compute method:
+m_tuner->begin();
+unsigned int block_size = m_tuner->getParam()[0];
+gpu_compute_cell_list_kernel<<<num_blocks, block_size>>>(...);
+m_tuner->end();
+```
+
+This autotuning happens transparently to users - you simply benefit from automatically optimized performance regardless of your specific GPU hardware. The system even adapts to different GPU architectures, ensuring optimal performance on everything from consumer-grade cards to high-end datacenter GPUs.
+Sources: [Autotuner.h#L84-L100](hoomd/Autotuner.h#L84-L100), [CellListGPU.h#L40](hoomd/CellListGPU.h#L40)
+
+## Memory Management and Optimization
+
+HOOMD-blue employs several advanced memory management techniques to maximize GPU performance:
+
+### 1. Cached Memory Allocation
+The system uses a **CachedAllocator** that maintains a pool of pre-allocated GPU memory blocks. This avoids the overhead of frequent GPU memory allocation and deallocation, which can be significant performance bottlenecks.
+
+### 2. Managed Memory Support
+For supported hardware, HOOMD-blue can use managed memory that automatically migrates between CPU and GPU based on access patterns. This reduces the need for explicit data transfers and can improve performance for algorithms with irregular access patterns.
+
+### 3. Asynchronous Execution
+Many GPU operations are executed asynchronously with respect to the CPU, allowing for overlapping computation and data transfer. The system carefully manages CUDA/HIP streams and events to ensure correct synchronization while maximizing parallelism.
+
+```cpp
+// Example of asynchronous kernel execution
+hipLaunchKernelGGL(gpu_kernel, blocks, threads, 0, stream, args...);
+// CPU can continue working while GPU executes
+```
+
+These memory management strategies work together to ensure that HOOMD-blue achieves near-peak performance on modern GPU hardware while maintaining the flexibility needed for complex molecular dynamics simulations.
+Sources: [ExecutionConfiguration.h#L46](hoomd/ExecutionConfiguration.h#L46), [CellListGPU.cu#L43-L63](hoomd/CellListGPU.cu#L43-L63)
+
+## Best Practices for GPU Acceleration
+
+To get the most out of HOOMD-blue's GPU acceleration, consider these best practices:
+
+### 1. Choose the Right Device
+```python
+# For small systems, CPU might be faster due to GPU overhead
+if system_size < 1000:
+    device = hoomd.device.CPU()
+else:
+    device = hoomd.device.GPU()
+```
+
+### 2. Minimize Data Transfer
+Structure your simulation to minimize data movement between CPU and GPU. Use HOOMD-blue's built-in analysis and output tools rather than transferring data to Python for custom processing.
+
+### 3. Leverage Autotuning
+Let the autotuner do its work - it will find optimal parameters for your specific hardware and simulation setup. The performance gains from autotuning can be substantial, often 2-5x compared to manually selected parameters.
+
+### 4. Monitor GPU Utilization
+Use GPU monitoring tools to ensure your simulation is actually using the GPU effectively. Low utilization might indicate that your simulation is CPU-bound or limited by data transfer.
+
+> [!TIP]
+> For maximum performance in multi-GPU systems, ensure your simulation size is large enough to keep all GPUs busy. A good rule of thumb is at least 10,000 particles per GPU.
+
+## Future Directions
+
+HOOMD-blue's GPU acceleration architecture continues to evolve with advances in GPU hardware and programming models. Future developments include:
+
+- Enhanced support for new GPU architectures and features
+- Improved multi-GPU scaling for larger simulations
+- Integration with specialized AI/ML accelerators
+- Advanced memory management techniques for next-generation memory systems
+
+The modular design of HOOMD-blue's GPU system ensures that it can adapt to these changes while maintaining backward compatibility and ease of use for researchers and developers.
+
+By understanding and leveraging HOOMD-blue's GPU acceleration capabilities, you can dramatically speed up your molecular dynamics simulations, enabling larger systems, longer timescales, and more complex analyses than ever before.
+
+# MPI and Parallel Computing
+
+
+
+HOOMD-blue leverages MPI (Message Passing Interface) to enable large-scale molecular dynamics simulations across multiple processors and nodes. This parallel computing approach allows you to distribute computational workload and memory requirements, making it possible to simulate systems with millions of particles that would be impossible to handle on a single machine.
+
+## Understanding MPI Communication in HOOMD-blue
+
+At its core, HOOMD-blue's MPI implementation follows a domain decomposition strategy where the global simulation box is divided into smaller sub-domains, each assigned to a different MPI process. This approach minimizes communication overhead while maximizing computational efficiency.
+
+The foundation of HOOMD-blue's MPI infrastructure is built upon several key components:
+
+### MPI Wrapper Functions
+
+HOOMD-blue provides convenient wrapper functions in `HOOMDMPI.h` that simplify common MPI operations using serialization. These wrappers handle the complexity of data serialization and deserialization automatically:
+
+```cpp
+// Broadcast a value from root to all processes
+template<typename T> void bcast(T& val, unsigned int root, const MPI_Comm mpi_comm)
+
+// Scatter vector elements to different processes
+template<typename T> void scatter_v(const std::vector<T>& in_values, T& out_value, unsigned int root, const MPI_Comm mpi_comm)
+
+// Gather values from all processes onto root
+template<typename T> void gather_v(const T& in_value, std::vector<T>& out_values, unsigned int root, const MPI_Comm mpi_comm)
+```
+
+These functions use the Cereal serialization library to handle complex data types automatically, making it easy to send particle data, forces, and other simulation state between processes.
+
+Sources: [HOOMDMPI.h#L127-L173](hoomd/HOOMDMPI.h#L127-L173), [HOOMDMPI.h#L253-L330](hoomd/HOOMDMPI.h#L253-L330)
+
+### Domain Decomposition
+
+The `DomainDecomposition` class is responsible for dividing the global simulation box into sub-domains assigned to each MPI process. It optimizes the decomposition to minimize surface area between domains, which reduces communication overhead.
+
+```cpp
+// Create a domain decomposition
+DomainDecomposition decomposition(exec_conf, global_box_L, nx, ny, nz);
+
+// Calculate the local box for this process
+BoxDim local_box = decomposition.calculateLocalBox(global_box);
+
+// Determine which process owns a particle
+unsigned int owner_rank = decomposition.placeParticle(global_box, particle_position, cart_ranks);
+```
+
+The decomposition can be uniform (equal-sized domains) or non-uniform (useful for systems with inhomogeneous particle distributions like vapor-liquid interfaces).
+
+Sources: [DomainDecomposition.h#L49-48](hoomd/DomainDecomposition.h#L49-48), [DomainDecomposition.h#L159-L163](hoomd/DomainDecomposition.h#L159-L163)
+
+## The Three-Stage Communication Pattern
+
+HOOMD-blue implements a sophisticated three-stage communication pattern that efficiently handles particle migration and ghost particle exchange:
+
+### Stage 1: Particle Migration
+
+In this stage, particles that have moved outside their local domain boundaries are transferred to the appropriate neighboring processes. This happens infrequently, typically only when the neighbor list needs rebuilding.
+
+```cpp
+// Force particle migration (e.g., after neighbor list rebuild)
+communicator.forceMigrate();
+
+// The actual migration is handled automatically in communicate()
+communicator.communicate(timestep);
+```
+
+When particles migrate, ownership is transferred completely - the sending process deletes the particle, and the receiving process adds it to its local particle data.
+
+Sources: [Communicator.h#L299-L307](hoomd/Communicator.h#L299-L307), [Communicator.h#L337-L347](hoomd/Communicator.h#L337-L347)
+
+### Stage 2: Ghost Exchange
+
+Ghost particles are copies of particles from neighboring domains that are within the cutoff distance + buffer distance from the local domain boundary. These are needed to correctly calculate forces on particles near domain boundaries.
+
+```cpp
+// Exchange ghost particles with neighbors
+communicator.exchangeGhosts();
+```
+
+The ghost layer width is determined by the maximum cutoff radius plus a buffer distance, ensuring that all necessary particle information is available for force calculations.
+
+Sources: [Communicator.h#L349-L357](hoomd/Communicator.h#L349-L357)
+
+### Stage 3: Ghost Position Updates
+
+Between particle migrations, only the positions of existing ghost particles need to be updated, which is more efficient than rebuilding the entire ghost particle list.
+
+```cpp
+// Begin updating ghost positions (non-blocking)
+communicator.beginUpdateGhosts(timestep);
+
+// ... perform other computations ...
+
+// Complete the ghost update
+communicator.finishUpdateGhosts(timestep);
+```
+
+This uses non-blocking MPI communication to allow overlap with other computations, improving overall performance.
+
+Sources: [Communicator.h#L307-L330](hoomd/Communicator.h#L307-L330)
+
+## Communication Flags and Data Management
+
+HOOMD-blue uses a sophisticated flag system to determine which particle properties need to be communicated:
+
+```cpp
+// Define communication flags
+CommFlags flags;
+flags[comm_flag::position] = 1;    // Communicate positions
+flags[comm_flag::velocity] = 1;    // Communicate velocities
+flags[comm_flag::net_force] = 1;   // Communicate forces
+
+// Set the flags for the communicator
+communicator.setFlags(flags);
+```
+
+Available communication flags include:
+- `tag`: Particle identifiers
+- `position`: Particle positions
+- `velocity`: Particle velocities
+- `charge`: Particle charges
+- `diameter`: Particle diameters
+- `orientation`: Particle orientations
+- `net_force`: Forces on particles
+- `net_torque`: Torques on particles
+
+This selective communication minimizes data transfer by only sending the information actually needed for the current computation.
+
+Sources: [Communicator.h#L57-80](hoomd/Communicator.h#L57-80), [Communicator.h#L278-284](hoomd/Communicator.h#L278-L284)
+
+## Running HOOMD-blue with MPI
+
+To run a HOOMD-blue simulation in parallel, you need to use MPI's launch mechanism:
+
+```bash
+# Run on 4 processes
+mpirun -np 4 python -m hoomd my_simulation.py
+
+# Run on 16 processes across 4 nodes (4 processes per node)
+mpirun -np 16 --map-by ppr:4:node python -m hoomd my_simulation.py
+```
+
+> [!TIP]
+> For optimal performance, ensure that the number of MPI processes matches your domain decomposition. Use powers of 2 (2, 4, 8, 16, 32) for best load balancing, especially for cubic simulation boxes.
+
+## Performance Considerations
+
+When using MPI with HOOMD-blue, several factors affect performance:
+
+### Domain Decomposition Strategy
+
+The shape of your domain decomposition significantly impacts performance. For cubic boxes, aim for roughly equal dimensions (e.g., 4×2×2 is better than 8×1×1).
+
+### Ghost Layer Width
+
+The ghost layer width affects both communication volume and frequency of particle migration:
+
+```cpp
+// Get the current ghost layer width
+Scalar max_width = communicator.getGhostLayerMaxWidth();
+```
+
+Larger ghost layers reduce migration frequency but increase communication volume.
+
+### Load Balancing
+
+For systems with non-uniform particle densities, consider using non-uniform domain decomposition:
+
+```cpp
+// Create non-uniform decomposition
+std::vector<Scalar> fxs = {0.0, 0.3, 0.7, 1.0};  // 30% and 40% splits
+std::vector<Scalar> fys = {0.0, 0.5, 1.0};        // 50% split
+std::vector<Scalar> fzs = {0.0, 1.0};             // Uniform in z
+
+DomainDecomposition decomposition(exec_conf, box_L, fxs, fys, fzs);
+```
+
+Sources: [DomainDecomposition.h#L68-73](hoomd/DomainDecomposition.h#L68-73)
+
+## Advanced Features
+
+### Two-Level Decomposition
+
+HOOMD-blue supports two-level decomposition for hybrid MPI+GPU systems, where processes on the same node share GPU resources:
+
+```cpp
+// Enable two-level decomposition
+DomainDecomposition decomposition(exec_conf, box_L, 0, 0, 0, true);
+```
+
+This optimizes communication patterns for multi-GPU nodes.
+
+### Callback System
+
+The Communicator class provides a callback system for custom communication needs:
+
+```cpp
+// Request a specific ghost layer width
+communicator.getGhostLayerWidthRequestSignal().connect([](unsigned int type) {
+    return 2.5;  // Custom ghost width for this type
+});
+
+// Request specific communication flags
+communicator.getCommFlagsRequestSignal().connect([](uint64_t timestep) {
+    CommFlags flags;
+    flags[comm_flag::position] = 1;
+    flags[comm_flag::velocity] = 1;
+    return flags;
+});
+```
+
+This allows modules to dynamically adjust communication parameters based on their requirements.
+
+Sources: [Communicator.h#L172-201](hoomd/Communicator.h#L172-201)
+
+## Best Practices
+
+1. **Profile your simulation**: Use HOOMD-blue's built-in profiling tools to identify communication bottlenecks.
+
+2. **Optimize domain decomposition**: Experiment with different domain shapes to find the optimal configuration for your system.
+
+3. **Minimize ghost layer width**: Use the smallest ghost layer that maintains simulation accuracy.
+
+4. **Balance workload**: Ensure each process has roughly the same number of particles to avoid idle time.
+
+5. **Use appropriate MPI process placement**: Consider network topology when placing processes on multi-node systems.
+
+HOOMD-blue's MPI implementation provides a robust foundation for large-scale molecular dynamics simulations, enabling researchers to tackle problems of unprecedented scale while maintaining high computational efficiency.
+
+# Custom Extensions and Plugins
+
+
+
+HOOMD-blue provides a powerful extension mechanism that allows you to create custom operations in Python, enabling you to prototype new simulation methods, analyze system state during simulation progression, or write output to custom file formats. This flexibility makes HOOMD-blue a versatile platform for developing and testing novel simulation algorithms without needing to modify the core C++ codebase.
+
+## Understanding the Extension Architecture
+
+The custom extension system in HOOMD-blue is built around two key components: the `Action` base class and the `CustomOperation` wrapper. These components work together to create a seamless integration between your Python code and HOOMD-blue's simulation engine.
+
+The `Action` class serves as the foundation for all custom extensions. When you create a custom operation, you inherit from this base class and implement the `act` method, which contains your custom logic. This method is called at specified timesteps during the simulation, allowing your code to interact with the simulation state.
+
+The `CustomOperation` class wraps your `Action` instance and integrates it into HOOMD-blue's operation system. It handles the communication between Python and C++, manages triggers that determine when your action should execute, and provides a clean interface for accessing your action's attributes and methods.
+
+```mermaid
+classDiagram
+    class Action {
+        +act(timestep)
+        +attach(simulation)
+        +detach()
+        +flags
+        +log_quantities
+    }
+    
+    class CustomOperation {
+        +action
+        +trigger
+        +act(timestep)
+    }
+    
+    class CustomUpdater {
+        +updater
+    }
+    
+    class CustomWriter {
+        +writer
+    }
+    
+    class CustomTuner {
+        +tuner
+    }
+    
+    Action <|-- CustomOperation
+    CustomOperation <|-- CustomUpdater
+    CustomOperation <|-- CustomWriter
+    CustomOperation <|-- CustomTuner
+```
+
+## Creating Your First Custom Action
+
+To create a custom extension, you start by defining a class that inherits from `hoomd.custom.Action`. Let's create a simple example that calculates the center of mass of the system:
+
+```python
+class CenterOfMassAction(hoomd.custom.Action):
+    def __init__(self):
+        super().__init__()
+        self.com = None
+    
+    def act(self, timestep):
+        """Calculate the center of mass of the system."""
+        snapshot = self._state.get_snapshot()
+        if snapshot.communicator.rank == 0:  # Only compute on rank 0
+            self.com = snapshot.particles.position.mean(axis=0)
+```
+
+In this example, we've created a simple action that calculates the center of mass by accessing the particle positions through the simulation state. The `act` method is where you implement your custom logic, and it receives the current timestep as an argument.
+
+> [!TIP]
+> Remember that when working with MPI simulations, you should be careful about which operations are performed on which MPI ranks. In the example above, we only compute the center of mass on rank 0 to avoid redundant calculations.
+
+## Integrating Your Action into the Simulation
+
+Once you've defined your action, you need to wrap it in an appropriate operation type and add it to the simulation. HOOMD-blue provides three types of custom operations:
+
+1. **CustomUpdater**: For operations that modify the system state
+2. **CustomWriter**: For operations that read the system state and generate output
+3. **CustomTuner**: For operations that tune parameters of other operations
+
+Here's how you would integrate our center of mass action as a writer:
+
+```python
+# Create the action
+com_action = CenterOfMassAction()
+
+# Wrap it in a CustomWriter
+com_writer = hoomd.write.CustomWriter(
+    action=com_action,
+    trigger=hoomd.trigger.Periodic(1000)  # Run every 1000 steps
+)
+
+# Add to the simulation
+simulation.operations.writers.append(com_writer)
+```
+
+The `trigger` parameter determines when your action will be executed. In this case, it will run every 1000 timesteps. You can use various trigger types like `Periodic`, `Before`, `After`, or create custom triggers to suit your needs.
+
+## Advanced Features of Custom Actions
+
+### Requesting Computed Quantities
+
+Sometimes your custom action may need access to quantities that HOOMD-blue doesn't compute by default, such as the pressure tensor or rotational kinetic energy. You can request these by setting the `flags` attribute in your action:
+
+```python
+class PressureAction(hoomd.custom.Action):
+    flags = [
+        hoomd.custom.Action.Flags.PRESSURE_TENSOR,
+        hoomd.custom.Action.Flags.ROTATIONAL_KINETIC_ENERGY,
+    ]
+    
+    def act(self, timestep):
+        """Access computed pressure and kinetic energy."""
+        # These quantities are now available in the simulation state
+        pass
+```
+
+### Logging Custom Properties
+
+You can expose properties of your action to HOOMD-blue's logging system by using the `@hoomd.logging.log` decorator:
+
+```python
+class LoggingAction(hoomd.custom.Action):
+    def __init__(self):
+        super().__init__()
+        self._temperature = 0.0
+    
+    @hoomd.logging.log
+    def temperature(self):
+        """Return the computed temperature."""
+        return self._temperature
+    
+    def act(self, timestep):
+        """Compute and store temperature."""
+        snapshot = self._state.get_snapshot()
+        # Calculate temperature from kinetic energy
+        self._temperature = 2.0 * snapshot.particles.kinetic_energy.mean() / (3.0 * snapshot.particles.N)
+```
+
+Now you can add this action to a logger and access the temperature property:
+
+```python
+logger = hoomd.logging.Logger()
+logger.add(logging_action, quantities=['temperature'])
+```
+
+## Understanding the Pass-Through System
+
+One of the most powerful features of HOOMD-blue's custom operation system is the pass-through mechanism. This allows you to access attributes and methods of your action directly through the operation wrapper:
+
+```python
+# Instead of writing:
+com_writer.action.com
+
+# You can write directly:
+com_writer.com
+```
+
+This makes your custom operations feel like native HOOMD-blue operations and provides a cleaner API for users of your extensions.
+
+## Best Practices for Custom Extensions
+
+When developing custom extensions, keep these best practices in mind:
+
+1. **Minimize computation in the act method**: The `act` method is called frequently during simulation, so keep it efficient.
+
+2. **Use appropriate operation types**: Choose `CustomUpdater` for state modifications, `CustomWriter` for output generation, and `CustomTuner` for parameter tuning.
+
+3. **Handle MPI correctly**: Be mindful of parallel execution and ensure your code works correctly in MPI environments.
+
+4. **Document your extensions**: Use docstrings to document your action's behavior, parameters, and any special requirements.
+
+5. **Test thoroughly**: Test your custom extensions with different system sizes and configurations to ensure robustness.
+
+## Example: A Complete Custom Extension
+
+Let's put everything together with a more complete example that calculates and logs the radius of gyration of a polymer chain:
+
+```python
+class RadiusOfGyration(hoomd.custom.Action):
+    """Calculate the radius of gyration of selected particles."""
+    
+    def __init__(self, particle_group):
+        super().__init__()
+        self.particle_group = particle_group
+        self._rg = 0.0
+    
+    @hoomd.logging.log
+    def radius_of_gyration(self):
+        """Return the computed radius of gyration."""
+        return self._rg
+    
+    def act(self, timestep):
+        """Calculate radius of gyration."""
+        snapshot = self._state.get_snapshot()
+        
+        # Get positions of particles in the group
+        positions = snapshot.particles.position[self.particle_group]
+        
+        # Calculate center of mass
+        com = positions.mean(axis=0)
+        
+        # Calculate radius of gyration
+        distances_squared = np.sum((positions - com)**2, axis=1)
+        self._rg = np.sqrt(np.mean(distances_squared))
+
+# Usage example
+polymer_group = hoomd.filter.Tags([1, 2, 3, 4, 5])  # Select polymer particles
+rg_calculator = RadiusOfGyration(polymer_group)
+
+rg_writer = hoomd.write.CustomWriter(
+    action=rg_calculator,
+    trigger=hoomd.trigger.Periodic(100)
+)
+
+simulation.operations.writers.append(rg_writer)
+
+# Set up logging
+logger = hoomd.logging.Logger()
+logger.add(rg_writer, quantities=['radius_of_gyration'])
+```
+
+This example demonstrates a complete custom extension that calculates a useful quantity (radius of gyration), makes it available through the logging system, and integrates cleanly into the simulation workflow.
+
+## Conclusion
+
+HOOMD-blue's custom extension system provides a flexible and powerful way to extend the simulation engine with your own Python code. By understanding the `Action` and `CustomOperation` classes, you can create custom updaters, writers, and tuners that integrate seamlessly with HOOMD-blue's simulation engine. Whether you're prototyping new algorithms, analyzing simulation data, or creating custom output formats, the extension system gives you the tools you need to customize HOOMD-blue for your specific research needs.
+
+
+# Data Output and Analysis
+
+
+
+In molecular simulations, collecting and analyzing data is as crucial as running the simulation itself. HOOMD-blue provides a comprehensive framework for outputting simulation data and performing analysis both during and after simulations. This guide will walk you through the various data output formats, logging capabilities, and analysis tools available in HOOMD-blue.
+
+## Understanding the Data Output Architecture
+
+HOOMD-blue's data output system is built around two main concepts: **Writers** and **Analyzers**. Writers are responsible for saving simulation data to files or displaying it, while Analyzers perform calculations on the simulation state without modifying it.
+
+The base `Analyzer` class provides the foundation for all analysis operations in HOOMD-blue. It defines a simple interface where derived classes implement the `analyze()` method to perform their calculations and make output whenever called by the simulation system. `Sources: [Analyzer.h#L38-L57](hoomd/Analyzer.h#L38-L57)`
+
+Writers in HOOMD-blue are implemented as operations that can be attached to a simulation. They handle various output formats and are triggered at specific intervals during the simulation. The `hoomd.write` module contains all the available writers, each designed for specific use cases.
+
+## Trajectory Output Formats
+
+HOOMD-blue supports several popular trajectory formats, each with its own strengths and use cases.
+
+### GSD Files: The Modern Standard
+
+GSD (General Simulation Data) is HOOMD-blue's native trajectory format, offering the most comprehensive support for simulation data. It can store particle positions, velocities, types, bonds, angles, dihedrals, impropers, constraints, and arbitrary logged quantities.
+
+```python
+# Write a GSD trajectory every 1,000 steps
+gsd_writer = hoomd.write.GSD(
+    trigger=hoomd.trigger.Periodic(1000),
+    filename='trajectory.gsd',
+    mode='wb'
+)
+simulation.operations.writers.append(gsd_writer)
+```
+
+GSD files are particularly powerful because they can handle simulations where the number of particles or particle types changes over time. They also support storing arbitrary quantities from the logging system, making them ideal for complex analyses. `Sources: [gsd.py#L60-L82](hoomd/write/gsd.py#L60-L82)`
+
+> [!TIP]
+> OVITO has native support for GSD files, including logged per-particle array quantities and particle shapes, making it an excellent choice for visualization.
+
+### DCD Files: Lightweight Trajectory Storage
+
+DCD (CHARMM/NAMD trajectory) is a compact format that stores only particle positions and box dimensions. It's ideal for long simulations where file size is a concern and you only need positional data.
+
+```python
+# Write a DCD trajectory every 10,000 steps
+dcd_writer = hoomd.write.DCD(
+    trigger=hoomd.trigger.Periodic(10000),
+    filename='trajectory.dcd'
+)
+simulation.operations.writers.append(dcd_writer)
+```
+
+DCD files are limited to simulations with a fixed number of particles but offer excellent compression for positional data. `Sources: [dcd.py#L19-L47](hoomd/write/dcd.py#L19-L47)`
+
+## Logging System: Capturing Simulation Properties
+
+The logging system in HOOMD-blue allows you to collect various simulation properties and computed quantities during the simulation. The `Logger` class serves as the central component for this functionality.
+
+### Logger Categories
+
+The logging system supports different categories of data, each suited for specific types of quantities:
+
+| Category | Description | Example |
+|----------|-------------|---------|
+| scalar | Single numerical values | Temperature, pressure |
+| sequence | Arrays of numbers | Per-particle energies |
+| string | Text values | Simulation state |
+| particle | Per-particle properties | Positions, velocities |
+| bond | Per-bond properties | Bond lengths, energies |
+
+```python
+# Create a logger that captures various quantities
+logger = hoomd.logging.Logger(categories=['scalar', 'particle', 'bond'])
+logger.add(simulation, quantities=['kinetic_temperature', 'potential_energy'])
+```
+
+The `LoggerCategories` enum provides a way to specify which types of data you want to collect, ensuring you only capture what you need. `Sources: [logging.py#L32-67](hoomd/logging.py#L32-67)`
+
+### Combining Loggers with Writers
+
+The real power of the logging system comes when you combine it with writers to save the logged data:
+
+```python
+# Create a logger and add quantities
+logger = hoomd.logging.Logger()
+logger.add(simulation, quantities=['kinetic_temperature', 'potential_energy'])
+
+# Write logged data to GSD file
+gsd_writer = hoomd.write.GSD(
+    trigger=hoomd.trigger.Periodic(1000),
+    filename='trajectory_with_log.gsd',
+    logger=logger
+)
+simulation.operations.writers.append(gsd_writer)
+```
+
+This approach allows you to save both trajectory data and computed quantities in the same file, simplifying post-processing. `Sources: [gsd.py#L10-L11](hoomd/write/__init__.py#L10-L11)`
+
+## Real-time Output and Monitoring
+
+### Table Writer: Console Output
+
+The `Table` writer provides real-time output to the console, making it ideal for monitoring simulation progress during runs:
+
+```python
+# Display simulation status every 1,000 steps
+table_writer = hoomd.write.Table(
+    trigger=hoomd.trigger.Periodic(1000),
+    logger=logger
+)
+simulation.operations.writers.append(table_writer)
+```
+
+The Table writer formats the output neatly in columns, making it easy to track key quantities as the simulation progresses. It includes a sophisticated formatter that handles numbers and strings with appropriate precision and alignment. `Sources: [table.py#L61-82](hoomd/write/table.py#L61-82)`
+
+### HDF5 Log: Efficient Binary Logging
+
+For high-performance logging of time-series data, HOOMD-blue provides the HDF5 writer:
+
+```python
+# Write logged data to HDF5 file
+hdf5_writer = hoomd.write.HDF5Log(
+    trigger=hoomd.trigger.Periodic(100),
+    filename='simulation_log.h5',
+    logger=logger
+)
+simulation.operations.writers.append(hdf5_writer)
+```
+
+HDF5 files are particularly useful for long simulations where you need to log many quantities frequently, as they provide efficient storage and fast access to the data. `Sources: [hdf5.py#L4-5](hoomd/write/hdf5.py#L4-5)`
+
+## Custom Analysis with PythonAnalyzer
+
+HOOMD-blue allows you to implement custom analysis operations in Python using the `PythonAnalyzer` class. This is particularly useful for analysis that doesn't fit into the standard logging framework.
+
+```python
+class CustomAnalyzer:
+    def __init__(self, simulation):
+        self.simulation = simulation
+    
+    def act(self, timestep):
+        # Perform custom analysis here
+        state = self.simulation.state
+        # Calculate and store custom quantities
+        return results
+
+# Create and attach the custom analyzer
+custom_analyzer = CustomAnalyzer(simulation)
+python_analyzer = hoomd.analyze.PythonAnalyzer(
+    trigger=hoomd.trigger.Periodic(1000),
+    analyzer=custom_analyzer
+)
+simulation.operations.analyzers.append(python_analyzer)
+```
+
+The `PythonAnalyzer` bridges the C++ core of HOOMD-blue with Python, allowing you to implement complex analysis logic while maintaining good performance. `Sources: [PythonAnalyzer.h#L12-33](hoomd/PythonAnalyzer.h#L12-33)`
+
+## Burst Mode: High-Frequency Data Collection
+
+For cases where you need high-frequency data collection but don't want to store every frame, HOOMD-blue provides the Burst writer:
+
+```python
+# Collect data every 10 steps but keep only the last 100 frames
+burst_writer = hoomd.write.Burst(
+    trigger=hoomd.trigger.Periodic(10),
+    filename='burst_trajectory.gsd',
+    max_frames=100
+)
+simulation.operations.writers.append(burst_writer)
+```
+
+The Burst writer maintains a sliding window of trajectory frames, which is particularly useful for analyzing short-time phenomena without overwhelming your storage. `Sources: [__init__.py#L8-9](hoomd/write/__init__.py#L8-9)`
+
+## Data Output Workflow
+
+```mermaid
+flowchart TD
+    A[Simulation State] --> B[Logger]
+    A --> C[Writers]
+    B --> D[Collect Quantities]
+    D --> E[Store in Memory]
+    C --> F[Write to File]
+    E --> F
+    F --> G[GSD/DCD/HDF5/Console]
+    
+    H[PythonAnalyzer] --> I[Custom Analysis]
+    I --> J[Results]
+    J --> K[Output/Storage]
+```
+
+This workflow shows how data flows through HOOMD-blue's output and analysis system. The simulation state feeds both the logging system and writers, while custom analyzers can perform additional processing.
+
+## Best Practices for Data Output
+
+1. **Choose the right format**: Use GSD for comprehensive data, DCD for lightweight trajectories, and HDF5 for time-series logging.
+
+2. **Balance frequency and storage**: Writing too frequently can slow down simulations and create huge files. Find the right balance for your specific needs.
+
+3. **Use triggers effectively**: Combine different triggers for different quantities - log thermodynamic properties frequently but save trajectories less often.
+
+4. **Plan your analysis**: Consider what analysis you'll need before setting up your logging to ensure you capture all necessary data.
+
+5. **Monitor file sizes**: Large simulations can generate terabytes of data. Use filters and selective logging to keep file sizes manageable.
+
+## Advanced Topics
+
+### Custom Writers
+
+For specialized output needs, you can create custom writers by extending the `CustomWriter` class:
+
+```python
+class MyCustomWriter(hoomd.write.CustomWriter):
+    def __init__(self, trigger):
+        super().__init__(trigger)
+        # Initialize your writer
+    
+    def write(self):
+        # Implement your custom output logic
+        pass
+```
+
+This gives you complete control over how data is formatted and saved. `Sources: [__init__.py#L15](hoomd/write/__init__.py#L15)`
+
+### Performance Considerations
+
+Data output can become a bottleneck in large simulations. To optimize performance:
+
+- Use the `filter` parameter in writers to output only relevant particles
+- Consider using the `dynamic` parameter in GSD writers to control which fields are written
+- Balance the frequency of output with your storage capacity
+- Use compression in formats that support it (like GSD)
+
+HOOMD-blue's data output and analysis system provides a flexible and powerful framework for capturing simulation data. By understanding the available options and how they work together, you can design an effective data collection strategy for your specific research needs.

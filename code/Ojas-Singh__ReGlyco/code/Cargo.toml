@@ -1,0 +1,113 @@
+[package]
+name = "reglyco"
+version.workspace = true
+edition = "2024"
+rust-version = "1.97"
+authors = ["ReGlyco contributors"]
+license.workspace = true
+description = "Native Rust construction of glycoprotein molecular systems"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+keywords = ["glycan", "glycoprotein", "glycosylation", "structural-biology"]
+categories = ["science", "command-line-utilities"]
+
+[lib]
+name = "reglyco"
+path = "src/lib.rs"
+
+[[bin]]
+name = "reglyco"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+reglyco-build = { version = "0.2.3", path = "crates/reglyco-build" }
+reglyco-core = { version = "0.2.3", path = "crates/reglyco-core" }
+reglyco-density = { version = "0.2.3", path = "crates/reglyco-density" }
+reglyco-ensemble = { version = "0.2.3", path = "crates/reglyco-ensemble" }
+reglyco-refine = { version = "0.2.3", path = "crates/reglyco-refine" }
+reglyco-relax = { version = "0.2.3", path = "crates/reglyco-relax" }
+reglyco-report = { version = "0.2.3", path = "crates/reglyco-report" }
+reglyco-saxs = { version = "0.2.3", path = "crates/reglyco-saxs" }
+reglyco-validate = { version = "0.2.3", path = "crates/reglyco-validate" }
+reglyco-cli = { version = "0.2.3", path = "crates/reglyco-cli" }
+
+[dev-dependencies]
+glysys.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# gemm (candle, via reglyco-glycoflow -> glycoflow-core) inlines fp16 NEON assembly into
+# `fp16`-enabled functions; at opt-level 0 nothing is inlined and the aarch64 assembler rejects
+# it ("instruction requires: fullfp16"). Optimise those crates in dev/test builds too.
+[profile.dev.package.gemm-common]
+opt-level = 3
+
+[profile.dev.package.gemm-f16]
+opt-level = 3
+
+[workspace]
+members = [
+    "crates/glycoflow-core",
+    "crates/reglyco-build",
+    "crates/reglyco-cli",
+    "crates/reglyco-core",
+    "crates/reglyco-density",
+    "crates/reglyco-ensemble",
+    "crates/reglyco-glycoflow",
+    "crates/reglyco-refine",
+    "crates/reglyco-relax",
+    "crates/reglyco-report",
+    "crates/reglyco-saxs",
+    "crates/reglyco-validate",
+    "crates/reglyco-workflow",
+    "crates/reglyco-wasm",
+    "crates/reglyco-pdf-wasm",
+]
+resolver = "3"
+
+[workspace.package]
+# Every crate published with `reglyco` carries this version (glycoflow-core
+# keeps its own); the wasm crates are not published.
+version = "0.2.3"
+license = "AGPL-3.0-only"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+nalgebra = { version = "0.35", default-features = false, features = ["std"] }
+# crabWURCS comes from its tagged repository, the same source GlySys uses, so
+# the workspace holds one copy and needs no sibling checkout. crates.io 0.3.3
+# is the same code; `cargo publish` substitutes it.
+crabwurcs-iupac = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.3", version = "0.3.3" }
+crabwurcs-core = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.3", version = "0.3.3" }
+crabwurcs-pdb = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.3", version = "0.3.3" }
+crabwurcs-snfg = { git = "https://github.com/Ojas-Singh/crabWURCS", tag = "v0.3.3", version = "0.3.3" }
+contour = "0.13.1"
+flate2 = "1"
+glysys = { version = "0.1.2", path = "../GlySys" }
+glysys-energy = { version = "0.1.2", path = "../GlySys/crates/glysys-energy" }
+glysys-opt = { version = "0.1.2", path = "../GlySys/crates/glysys-opt" }
+mrc = { version = "0.8", default-features = false, features = ["mmap", "gzip"] }
+open-bcif = "0.1.3"
+rand = "0.9"
+rand_chacha = "0.9"
+rayon = "1"
+plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series", "point_series", "full_palette"] }
+petgraph = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+typst-as-lib = { version = "0.16", features = ["typst-kit-fonts", "typst-kit-embed-fonts"] }
+typst-layout = "0.15"
+typst-pdf = "0.15"
+wasm-bindgen = "0.2"
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+getrandom = { version = "0.3", features = ["wasm_js"] }

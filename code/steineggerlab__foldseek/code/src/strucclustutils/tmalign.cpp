@@ -1,0 +1,569 @@
+#include "DBReader.h"
+#include "DBWriter.h"
+#include "IndexReader.h"
+#include "Debug.h"
+#include "Util.h"
+#include "QueryMatcher.h"
+#include "LocalParameters.h"
+#include "Matcher.h"
+#include "StructureUtil.h"
+#include "StructureSmithWaterman.h"
+#include "TMaligner.h"
+#include "LoLAlign.h"
+#include "Coordinate16.h"
+
+#ifdef OPENMP
+#include <omp.h>
+#endif
+
+bool compareHitsByScore(const Matcher::result_t &first, const Matcher::result_t &second) {
+    if (first.eval != second.eval) {
+        return first.eval > second.eval;
+    }
+    if (first.score != second.score) {
+        return first.score > second.score;
+    }
+    if (first.dbLen != second.dbLen) {
+        return first.dbLen < second.dbLen;
+    }
+    return first.dbKey < second.dbKey;
+}
+
+static void initQueryAligner(bool runLoLAlign, TMaligner *tmaligner, LoLAlign *lolaligner,
+                             float *qdata, char *querySeq, int queryLen,
+                             Sequence *qSeqAA, Sequence *qSeq3Di, SubstitutionMatrix *subMatAA,
+                             int maxTargetLen, int multiDomain) {
+    if (runLoLAlign) {
+        lolaligner->initQuery(qdata, &qdata[queryLen], &qdata[queryLen + queryLen], *qSeqAA, *qSeq3Di, queryLen, *subMatAA, maxTargetLen, multiDomain);
+        lolaligner->setStartAnchorLength(3);
+        if (queryLen <= 15) {
+            lolaligner->setStartAnchorLength(0);
+        }
+    } else {
+        tmaligner->initQuery(qdata, &qdata[queryLen], &qdata[queryLen + queryLen], querySeq, queryLen);
+    }
+}
+
+static Matcher::result_t alignTarget(LocalParameters &par, bool runLoLAlign, bool sameDB,
+                                     IndexReader *tdbr, IndexReader *tcadbr, IndexReader *tdbr3Di,
+                                     TMaligner *tmaligner, LoLAlign *lolaligner, FwBwAligner *fwbwAligner,
+                                     Sequence *tSeqAA, Sequence *tSeq3Di, Coordinate16 *tcoords,
+                                     SubstitutionMatrix *subMatAA, unsigned int queryId, int queryLen,
+                                     unsigned int dbKey, unsigned int thread_idx, std::string &backtrace) {
+    Matcher::result_t tmpResult;
+    unsigned int targetId = tdbr->sequenceReader->getId(dbKey);
+    bool isIdentity = ((queryId == targetId)
+                       && (par.includeIdentity || sameDB));
+    if (isIdentity) {
+        backtrace.clear();
+        backtrace.append(SSTR(queryLen));
+        backtrace.append(1, 'M');
+        if (runLoLAlign) {
+            tmpResult = Matcher::result_t(dbKey, 10000, 1.0, 1.0, 1.0,
+                                          1.0, std::max(queryLen, queryLen), 0, queryLen - 1,
+                                          queryLen, 0, queryLen - 1, queryLen, backtrace);
+        } else {
+            tmpResult = Matcher::result_t(dbKey, 100, 1.0, 1.0, 1.0,
+                                          1.0, std::max(queryLen, queryLen), 0, queryLen - 1,
+                                          queryLen, 0, queryLen - 1, queryLen, backtrace);
+        }
+        return tmpResult;
+    }
+
+    tmpResult.dbKey = dbKey;
+    char *targetSeq = tdbr->sequenceReader->getData(targetId, thread_idx);
+    int targetLen = static_cast<int>(tdbr->sequenceReader->getSeqLen(targetId));
+    if (!Util::canBeCovered(par.covThr, par.covMode, queryLen, targetLen) && runLoLAlign == false) {
+        tmpResult.eval = -1.0f; // this should avoid that the hit is added
+        tmpResult.score = -1.0f;
+        tmpResult.seqId = -1.0f;
+        tmpResult.qcov = 0.0f;
+        tmpResult.dbcov = 0.0f;
+        return tmpResult;
+    }
+
+    if (runLoLAlign) {
+        tSeqAA->mapSequence(targetId, dbKey, targetSeq, targetLen);
+
+        char *target3diSeq = tdbr3Di->sequenceReader->getData(targetId, thread_idx);
+        tSeq3Di->mapSequence(targetId, dbKey, target3diSeq, targetLen);
+    }
+    char *tcadata = tcadbr->sequenceReader->getData(targetId, thread_idx);
+    size_t tCaLength = tcadbr->sequenceReader->getEntryLen(targetId);
+
+    float *tdata = tcoords->read(tcadata, targetLen, tCaLength);
+
+    if (runLoLAlign) {
+        if (targetLen <= 15 && queryLen > 15) {
+            lolaligner->setStartAnchorLength(1);
+            if (targetLen < 4) {
+                lolaligner->setStartAnchorLength(0);
+            }
+            tmpResult = lolaligner->align(dbKey, tdata, &tdata[targetLen], &tdata[targetLen + targetLen], *tSeqAA, *tSeq3Di, targetLen, *subMatAA, fwbwAligner, par.multiDomain);
+            if (queryLen > 15) {
+                lolaligner->setStartAnchorLength(3);
+            }
+        } else {
+            tmpResult = lolaligner->align(dbKey, tdata, &tdata[targetLen], &tdata[targetLen + targetLen], *tSeqAA, *tSeq3Di, targetLen, *subMatAA, fwbwAligner, par.multiDomain);
+        }
+        return tmpResult;
+    }
+
+    float TMscore;
+    tmpResult = tmaligner->align(dbKey,
+                                 tdata, &tdata[targetLen],
+                                 &tdata[targetLen + targetLen],
+                                 targetSeq, targetLen, TMscore);
+    // TM-align could not align
+    if (TMscore == std::numeric_limits<float>::min()) {
+        tmpResult.eval = -1.0f; // this should avoid that the hit is added
+        tmpResult.score = -1.0f;
+        tmpResult.seqId = -1.0f;
+        tmpResult.qcov = 0.0f;
+        tmpResult.dbcov = 0.0f;
+    } else {
+        float qTM = (float) tmpResult.score / 100000.0f;
+        float tTM = tmpResult.eval;
+        switch (par.tmAlignHitOrder) {
+            case LocalParameters::TMALIGN_HIT_ORDER_AVG:
+                tmpResult.eval = (qTM + tTM) / 2.0f;
+                break;
+            case LocalParameters::TMALIGN_HIT_ORDER_QUERY:
+                tmpResult.eval = qTM;
+                break;
+            case LocalParameters::TMALIGN_HIT_ORDER_TARGET:
+                tmpResult.eval = tTM;
+                break;
+            case LocalParameters::TMALIGN_HIT_ORDER_MIN:
+                tmpResult.eval = std::min(qTM, tTM);
+                break;
+            case LocalParameters::TMALIGN_HIT_ORDER_MAX:
+                tmpResult.eval = std::max(qTM, tTM);
+                break;
+        }
+        tmpResult.score = static_cast<int>(qTM * 100.0f); // e.g. scaled
+    }
+    return tmpResult;
+}
+
+static bool isAcceptedHit(LocalParameters &par, bool runLoLAlign, const Matcher::result_t &r) {
+    bool hasCov = Util::hasCoverage(par.covThr, par.covMode, r.qcov, r.dbcov);
+    bool hasSeqId = (r.seqId >= (par.seqIdThr - std::numeric_limits<float>::epsilon()));
+    bool hasTMscore = (r.eval >= par.tmScoreThr);
+    if (runLoLAlign) {
+        hasTMscore = true;
+    }
+    return hasCov && hasSeqId && hasTMscore;
+}
+
+int runStructureAligner(int argc, const char **argv, const Command& command, bool runLoLAlign) {
+    LocalParameters &par = LocalParameters::getLocalInstance();
+    par.parseParameters(argc, argv, command, true, 0, MMseqsParameter::COMMAND_ALIGN);
+    SubstitutionMatrix *subMat3Di = nullptr;
+    SubstitutionMatrix *subMatAA  = nullptr;
+    if (runLoLAlign) {
+        subMat3Di = new SubstitutionMatrix(par.scoringMatrixFile.values.aminoacid().c_str(), 2.1, par.scoreBias);
+
+        std::string blosum;
+        for (size_t i = 0; i < par.substitutionMatrices.size(); i++) {
+            if (par.substitutionMatrices[i].name == "blosum62.out")  {
+                std::string matrixData((const char *)par.substitutionMatrices[i].subMatData, par.substitutionMatrices[i].subMatDataLen);
+                std::string matrixName = par.substitutionMatrices[i].name;
+                char *serializedMatrix = BaseMatrix::serialize(matrixName, matrixData);
+                blosum.assign(serializedMatrix);
+                free(serializedMatrix);
+                break;
+            }
+        }
+        float aaFactor = (par.alignmentType == LocalParameters::ALIGNMENT_TYPE_3DI_AA) ? 1.4 : 0.0;
+        subMatAA = new SubstitutionMatrix(blosum.c_str(), aaFactor, par.scoreBias);
+    }
+
+    Debug(Debug::INFO) << "Query database: " << par.db1 << "\n";
+    Debug(Debug::INFO) << "Target database: " << par.db2 << "\n";
+    const bool touch = (par.preloadMode != Parameters::PRELOAD_MODE_MMAP);
+    IndexReader qdbr(par.db1, par.threads, IndexReader::SEQUENCES,
+                     touch ? IndexReader::PRELOAD_INDEX : 0);
+    IndexReader qcadbr(
+            par.db1,
+            par.threads,
+            IndexReader::makeUserDatabaseType(LocalParameters::INDEX_DB_CA_KEY_DB1),
+            touch ? IndexReader::PRELOAD_INDEX : 0,
+            DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA,
+            "_ca"
+    );
+
+    IndexReader *qdbr3Di = NULL;
+
+    if (runLoLAlign) {
+        qdbr3Di = new IndexReader(StructureUtil::getIndexWithSuffix(par.db1, "_ss"), par.threads, IndexReader::SEQUENCES, touch ? IndexReader::PRELOAD_INDEX : 0);
+    }
+
+    IndexReader *tdbr = NULL;
+    IndexReader *tcadbr = NULL;
+    IndexReader *tdbr3Di = NULL;
+
+    bool sameDB = false;
+    uint16_t extended = DBReader<unsigned int>::getExtendedDbtype(FileUtil::parseDbType(par.db3.c_str()));
+    bool alignmentIsExtended = extended & Parameters::DBTYPE_EXTENDED_INDEX_NEED_SRC;
+    if (par.db1.compare(par.db2) == 0) {
+        sameDB = true;
+        tdbr = &qdbr;
+        tcadbr = &qcadbr;
+        if (runLoLAlign) {
+            tdbr3Di = qdbr3Di;
+        }
+    } else {
+        tdbr = new IndexReader(
+                par.db2, par.threads,
+                alignmentIsExtended ? IndexReader::SRC_SEQUENCES : IndexReader::SEQUENCES,
+                (touch) ? (IndexReader::PRELOAD_INDEX | IndexReader::PRELOAD_DATA) : 0);
+        tcadbr = new IndexReader(
+                par.db2,
+                par.threads,
+                alignmentIsExtended
+                ? IndexReader::makeUserDatabaseType(LocalParameters::INDEX_DB_CA_KEY_DB2)
+                : IndexReader::makeUserDatabaseType(LocalParameters::INDEX_DB_CA_KEY_DB1),
+                touch ? IndexReader::PRELOAD_INDEX : 0,
+                DBReader<unsigned int>::USE_INDEX | DBReader<unsigned int>::USE_DATA,
+                alignmentIsExtended ? "_seq_ca" : "_ca"
+        );
+        if (runLoLAlign) {
+            tdbr3Di = new IndexReader(StructureUtil::getIndexWithSuffix(par.db2, "_ss"), par.threads, IndexReader::SEQUENCES, touch ? IndexReader::PRELOAD_INDEX : 0);
+        }
+    }
+
+    DBReader<unsigned int> resultReader(par.db3.c_str(), par.db3Index.c_str(),
+                                        par.threads,
+                                        DBReader<unsigned int>::USE_DATA|DBReader<unsigned int>::USE_INDEX);
+    resultReader.open(DBReader<unsigned int>::LINEAR_ACCCESS);
+
+    int dbtype = Parameters::DBTYPE_ALIGNMENT_RES;
+    if (alignmentIsExtended) {
+        dbtype = DBReader<unsigned int>::setExtendedDbtype(dbtype,Parameters::DBTYPE_EXTENDED_INDEX_NEED_SRC);
+    }
+    if (runLoLAlign) {
+        dbtype = DBReader<unsigned int>::setExtendedDbtype(dbtype, LocalParameters::DBTYPE_EXTENDED_LOLALIGN);
+    }
+    // parallelize over queries if there are more queries than threads, otherwise over the targets of each query
+    const bool parallelQueries = resultReader.getSize() > static_cast<size_t>(par.threads);
+    DBWriter dbw(par.db4.c_str(), par.db4Index.c_str(), parallelQueries ? par.threads : 1, par.compressed, dbtype);
+    dbw.open();
+
+    Debug::Progress progress(resultReader.getSize());
+
+    std::vector<Coordinate16 *> tcoords;
+
+    std::vector<LoLAlign *> lolaligner;
+    std::vector<FwBwAligner *> fwbwAligner;
+    std::vector<Sequence *> tSeqAAs;
+    std::vector<Sequence *> tSeq3Dis;
+
+    std::vector<TMaligner *> tmaligner;
+    tcoords.resize(par.threads);
+
+    // The forward-backward SIMD kernel processes columns in blocks of blockLen and pads each
+    // block to a multiple of VECSIZE_FLOAT. A block length that is not a multiple of VECSIZE_FLOAT
+    // overruns the per-block buffers (which are sized blockLen+1), so round the requested block
+    // length up to the SIMD float width before using it.
+    int blockLen = static_cast<int>(((par.blocklen + VECSIZE_FLOAT - 1) / VECSIZE_FLOAT) * VECSIZE_FLOAT);
+
+    int max_targetLen = static_cast<int>(tdbr->sequenceReader->getMaxSeqLen() + 1);
+    max_targetLen = ((max_targetLen + blockLen - 1) / blockLen) * blockLen;
+        
+    if (runLoLAlign){
+        lolaligner.resize(par.threads);
+        fwbwAligner.resize(par.threads);
+        tSeqAAs.resize(par.threads);
+        tSeq3Dis.resize(par.threads);
+    } else {
+        tmaligner.resize(par.threads);
+    }
+    
+
+#pragma omp parallel
+    {
+        unsigned int thread_idx = 0;
+#ifdef OPENMP
+        thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+        if (runLoLAlign) {
+            // max_targetLen is padded up to a multiple of par.blocklen (see above); the LoLAlign
+            // buffers must be sized for this padded length because it is passed to initQuery as
+            // maxTLen and used to bound the anchor arrays. Sizing with the unpadded target length
+            // overflows anchorQuery/anchorTarget when blocklen > 16 pads past the real max length.
+            lolaligner[thread_idx] = new LoLAlign(std::max(static_cast<int>(qdbr.sequenceReader->getMaxSeqLen() + 1),
+                                                       max_targetLen), false, par.candidateSeeds, par.refineSeeds);
+            fwbwAligner[thread_idx] = new FwBwAligner(-par.fwbwGapopen, -par.fwbwGapextend, par.temperature, 0, qdbr.sequenceReader->getMaxSeqLen() + 1, tdbr->sequenceReader->getMaxSeqLen() + 1, blockLen, 0);
+            fwbwAligner[thread_idx]->setScaledMode(static_cast<FwBwAligner::ScaledMode>(par.fwbwScaledMode));
+            tSeqAAs[thread_idx] = new Sequence(par.maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, subMatAA, 0, false, par.compBiasCorrection);
+            tSeq3Dis[thread_idx] = new Sequence(par.maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, subMat3Di, 0, false, par.compBiasCorrection);
+           
+        } else {
+            tmaligner[thread_idx] = new TMaligner(std::max(qdbr.sequenceReader->getMaxSeqLen() + 1,
+                                                        tdbr->sequenceReader->getMaxSeqLen() + 1),
+                                                par.tmAlignFast, false, false);
+        }
+        tcoords[thread_idx] = new Coordinate16();
+    }
+
+
+    if (parallelQueries) {
+#pragma omp parallel
+        {
+            unsigned int thread_idx = 0;
+#ifdef OPENMP
+            thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+            std::vector<Matcher::result_t> finalHits;
+            std::string resultBuffer;
+            std::string backtrace;
+            Coordinate16 qcoords;
+            char buffer[32768];
+
+            Sequence *qSeqAA = NULL;
+            Sequence *qSeq3Di = NULL;
+            if (runLoLAlign) {
+                qSeqAA = new Sequence(par.maxSeqLen, qdbr.sequenceReader->getDbtype(), (const BaseMatrix *) subMatAA, 0, false, par.compBiasCorrection);
+                qSeq3Di = new Sequence(par.maxSeqLen, qdbr3Di->getDbtype(), (const BaseMatrix *) subMat3Di, 0, false, par.compBiasCorrection);
+            }
+
+#pragma omp for schedule(dynamic, 1)
+            for (size_t id = 0; id < resultReader.getSize(); id++) {
+                progress.updateProgress();
+                finalHits.clear();
+                resultBuffer.clear();
+                size_t queryKey = resultReader.getDbKey(id);
+                char *data = resultReader.getData(id, thread_idx);
+                if (*data == '\0') {
+                    dbw.writeData(resultBuffer.c_str(), resultBuffer.size(), queryKey, thread_idx);
+                    continue;
+                }
+
+                unsigned int queryId = qdbr.sequenceReader->getId(queryKey);
+                char *querySeq = qdbr.sequenceReader->getData(queryId, thread_idx);
+                int queryLen = static_cast<int>(qdbr.sequenceReader->getSeqLen(queryId));
+
+                if (runLoLAlign) {
+                    char *query3diSeq = qdbr3Di->sequenceReader->getData(queryId, thread_idx);
+                    qSeqAA->mapSequence(id, queryKey, querySeq, queryLen);
+                    qSeq3Di->mapSequence(id, queryKey, query3diSeq, queryLen);
+                }
+
+                char *qcadata = qcadbr.sequenceReader->getData(queryId, thread_idx);
+                size_t qCaLength = qcadbr.sequenceReader->getEntryLen(queryId);
+                float *qdata = qcoords.read(qcadata, queryLen, qCaLength);
+
+                initQueryAligner(runLoLAlign,
+                                 runLoLAlign ? NULL : tmaligner[thread_idx],
+                                 runLoLAlign ? lolaligner[thread_idx] : NULL,
+                                 qdata, querySeq, queryLen, qSeqAA, qSeq3Di, subMatAA,
+                                 max_targetLen, par.multiDomain);
+
+                int passedNum = 0;
+                int rejected = 0;
+                while (*data != '\0' && passedNum < par.maxAccept && rejected < par.maxRejected) {
+                    char dbKeyBuffer[256];
+                    Util::parseKey(data, dbKeyBuffer);
+                    const unsigned int dbKey = static_cast<unsigned int>(strtoul(dbKeyBuffer, NULL, 10));
+                    data = Util::skipLine(data);
+
+                    Matcher::result_t r = alignTarget(par, runLoLAlign, sameDB, tdbr, tcadbr, tdbr3Di,
+                                                      runLoLAlign ? NULL : tmaligner[thread_idx],
+                                                      runLoLAlign ? lolaligner[thread_idx] : NULL,
+                                                      runLoLAlign ? fwbwAligner[thread_idx] : NULL,
+                                                      runLoLAlign ? tSeqAAs[thread_idx] : NULL,
+                                                      runLoLAlign ? tSeq3Dis[thread_idx] : NULL,
+                                                      tcoords[thread_idx], subMatAA, queryId, queryLen,
+                                                      dbKey, thread_idx, backtrace);
+                    if (isAcceptedHit(par, runLoLAlign, r)) {
+                        finalHits.push_back(r);
+                        passedNum++;
+                        rejected = 0;
+                    } else {
+                        rejected++;
+                    }
+                }
+                SORT_SERIAL(finalHits.begin(), finalHits.end(), compareHitsByScore);
+
+                for (size_t i = 0; i < finalHits.size(); i++) {
+                    size_t len = Matcher::resultToBuffer(buffer, finalHits[i], par.addBacktrace, false);
+                    resultBuffer.append(buffer, len);
+                }
+
+                dbw.writeData(resultBuffer.c_str(), resultBuffer.size(), queryKey, thread_idx);
+            }
+
+            if (runLoLAlign) {
+                delete qSeqAA;
+                delete qSeq3Di;
+            }
+        }
+    } else {
+        std::vector<Matcher::result_t> swResults;
+        std::vector<Matcher::result_t> finalHits;
+        std::vector<unsigned int> dbKeys;
+        std::string resultBuffer;
+
+        Sequence *qSeqAA = NULL;
+        Sequence *qSeq3Di = NULL;
+        if (runLoLAlign) {
+            qSeqAA = new Sequence(par.maxSeqLen, qdbr.sequenceReader->getDbtype(), (const BaseMatrix *) subMatAA, 0, false, par.compBiasCorrection);
+            qSeq3Di = new Sequence(par.maxSeqLen, qdbr3Di->getDbtype(), (const BaseMatrix *) subMat3Di, 0, false, par.compBiasCorrection);
+        }
+
+        for (size_t id = 0; id < resultReader.getSize(); id++) {
+            progress.updateProgress();
+            swResults.clear();
+            finalHits.clear();
+            dbKeys.clear();
+            resultBuffer.clear();
+            size_t queryKey = resultReader.getDbKey(id);
+            char *data = resultReader.getData(id, 0);
+            if (*data == '\0') {
+                dbw.writeData(resultBuffer.c_str(), resultBuffer.size(), queryKey, 0);
+                continue;
+            }
+
+            unsigned int queryId = qdbr.sequenceReader->getId(queryKey);
+            char *querySeq = qdbr.sequenceReader->getData(queryId, 0);
+            int queryLen = static_cast<int>(qdbr.sequenceReader->getSeqLen(queryId));
+
+            if (runLoLAlign) {
+                char *query3diSeq = qdbr3Di->sequenceReader->getData(queryId, 0);
+                qSeqAA->mapSequence(id, queryKey, querySeq, queryLen);
+                qSeq3Di->mapSequence(id, queryKey, query3diSeq, queryLen);
+            }
+
+            char *qcadata = qcadbr.sequenceReader->getData(queryId, 0);
+            size_t qCaLength = qcadbr.sequenceReader->getEntryLen(queryId);
+
+            Coordinate16 qcoords;
+            float *qdata = qcoords.read(qcadata, queryLen, qCaLength);
+
+            while (*data != '\0') {
+                char dbKeyBuffer[256];
+                Util::parseKey(data, dbKeyBuffer);
+                const unsigned int dbKey = static_cast<unsigned int>(strtoul(dbKeyBuffer, NULL, 10));
+                dbKeys.push_back(dbKey);
+                data = Util::skipLine(data);
+            }
+
+            swResults.resize(dbKeys.size());
+#pragma omp parallel
+            {
+                unsigned int thread_idx = 0;
+#ifdef OPENMP
+                thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                initQueryAligner(runLoLAlign,
+                                 runLoLAlign ? NULL : tmaligner[thread_idx],
+                                 runLoLAlign ? lolaligner[thread_idx] : NULL,
+                                 qdata, querySeq, queryLen, qSeqAA, qSeq3Di, subMatAA,
+                                 max_targetLen, par.multiDomain);
+            }
+            int passedNum = 0;
+            int rejected = 0;
+            size_t chunkSize = (par.maxAccept == INT_MAX &&
+                                par.maxRejected == INT_MAX  ) ? dbKeys.size() : par.threads;
+            for (size_t chunkStart = 0; chunkStart < dbKeys.size(); chunkStart += chunkSize) {
+                if (passedNum >= par.maxAccept || rejected >= par.maxRejected) {
+                    break;
+                }
+                size_t chunkEnd = std::min(chunkStart + chunkSize, dbKeys.size());
+#pragma omp parallel
+                {
+                    unsigned int thread_idx = 0;
+#ifdef OPENMP
+                    thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                    std::string backtrace;
+
+#pragma omp for schedule(dynamic, 1)
+                    for (size_t i = chunkStart; i < chunkEnd; i++) {
+                        swResults[i] = alignTarget(par, runLoLAlign, sameDB, tdbr, tcadbr, tdbr3Di,
+                                                   runLoLAlign ? NULL : tmaligner[thread_idx],
+                                                   runLoLAlign ? lolaligner[thread_idx] : NULL,
+                                                   runLoLAlign ? fwbwAligner[thread_idx] : NULL,
+                                                   runLoLAlign ? tSeqAAs[thread_idx] : NULL,
+                                                   runLoLAlign ? tSeq3Dis[thread_idx] : NULL,
+                                                   tcoords[thread_idx], subMatAA, queryId, queryLen,
+                                                   dbKeys[i], thread_idx, backtrace);
+                    }
+                } // end parallel
+
+                for (size_t i = chunkStart; i < chunkEnd; i++) {
+                    if (passedNum >= par.maxAccept || rejected >= par.maxRejected) {
+                        break;
+                    }
+                    const Matcher::result_t &r = swResults[i];
+                    if (isAcceptedHit(par, runLoLAlign, r)) {
+                        finalHits.push_back(r);
+                        passedNum++;
+                        rejected = 0;
+                    } else {
+                        rejected++;
+                    }
+                }
+            } // end chunk
+            SORT_SERIAL(finalHits.begin(), finalHits.end(), compareHitsByScore);
+
+            resultBuffer.clear();
+
+            char buffer[32768];
+            for (size_t i = 0; i < finalHits.size(); i++) {
+                size_t len = Matcher::resultToBuffer(buffer, finalHits[i], par.addBacktrace, false);
+                resultBuffer.append(buffer, len);
+            }
+
+            dbw.writeData(resultBuffer.c_str(), resultBuffer.size(), queryKey, 0);
+        }
+
+        if (runLoLAlign) {
+            delete qSeqAA;
+            delete qSeq3Di;
+        }
+    }
+
+    dbw.close();
+    resultReader.close();
+
+    for (int i = 0; i < par.threads; i++) {
+        if (runLoLAlign) {
+            delete lolaligner[i];
+            delete fwbwAligner[i];
+            delete tSeqAAs[i];
+            delete tSeq3Dis[i];
+        } else {
+            delete tmaligner[i];
+        }
+        
+        delete tcoords[i];
+    }
+
+    if (sameDB == false) {
+        delete tdbr;
+        delete tcadbr;
+        if (runLoLAlign) {
+            delete tdbr3Di;
+        }
+    } 
+
+    if (runLoLAlign) {
+        delete subMat3Di;
+        delete subMatAA;
+
+        delete qdbr3Di;
+    }
+
+    return EXIT_SUCCESS;
+}
+
+
+int tmalign(int argc, const char **argv, const Command &command) {
+    return runStructureAligner(argc, argv, command, false);
+}
+
+int lolalign(int argc, const char **argv, const Command &command) {
+    return runStructureAligner(argc, argv, command, true);
+}

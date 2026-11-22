@@ -1,0 +1,4 @@
+interface:
+  display_name: "easy-MD"
+  short_description: "Protein-ligand docking and experimental protein PPI"
+  default_prompt: "Use $easy-md to select and run the appropriate protein-ligand or experimental protein-protein workflow for my inputs."

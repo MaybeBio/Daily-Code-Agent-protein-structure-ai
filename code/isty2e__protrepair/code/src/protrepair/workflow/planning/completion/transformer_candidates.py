@@ -1,0 +1,582 @@
+"""Direct completion-transformer planning over requested workflow state."""
+
+from dataclasses import dataclass
+
+from protrepair.chemistry import ComponentLibrary
+from protrepair.chemistry.microstate.context import PolymerMicrostateContext
+from protrepair.chemistry.microstate.preparation import AminoAcidPreparation
+from protrepair.scope import ResidueSetScope
+from protrepair.state import (
+    HydrogenCoverageState,
+    StructureChemistryReadinessFacts,
+    StructureCoverageFacts,
+    derive_structure_coverage_and_chemistry_readiness_facts,
+)
+from protrepair.structure.aggregate import ProteinStructure
+from protrepair.structure.labels import ResidueId
+from protrepair.transformer.completion.hydrogen.protonation import (
+    HistidineProtonationRequest,
+    histidine_microstate_requests,
+    normalize_histidine_protonation_request,
+)
+from protrepair.workflow.actions.heavy_completion import (
+    HeavyAtomCompletionTransformer,
+)
+from protrepair.workflow.actions.hydrogen_completion import (
+    HydrogenCompletionTransformer,
+)
+from protrepair.workflow.actions.retained_non_polymer_hydrogen_completion import (
+    RetainedNonPolymerHydrogenCompletionTransformer,
+)
+from protrepair.workflow.contracts.request import RequestedGoalSet
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionTransformerPlanningOutcome:
+    """Completion-family candidate assessment over requested goals."""
+
+    transformers: tuple[
+        HeavyAtomCompletionTransformer
+        | HydrogenCompletionTransformer
+        | RetainedNonPolymerHydrogenCompletionTransformer,
+        ...,
+    ] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "transformers", tuple(self.transformers))
+
+
+@dataclass(frozen=True, slots=True)
+class _ResidueCompletionPlanningFacts:
+    """Residue-local completion truth reused across one planning pass."""
+
+    residue_id: ResidueId
+    component_supported: bool
+    requires_backbone_completion: bool
+    requires_sidechain_completion: bool
+    needs_hydrogenation: bool
+
+
+def polymer_cap_hydrogen_target_residue_ids(
+    facts: StructureChemistryReadinessFacts,
+    *,
+    whole_structure: bool,
+    required_residue_ids: tuple[ResidueId, ...],
+) -> frozenset[ResidueId]:
+    """Limit graph and H writes to the same authorized polymer cap targets."""
+    return frozenset(
+        fact.residue_id
+        for fact in facts.residue_facts
+        if fact.linked_cap is not None
+        and (
+            whole_structure
+            or (fact.is_supported() and fact.residue_id in required_residue_ids)
+        )
+    )
+
+
+def plan_completion_transformers(
+    structure: ProteinStructure,
+    *,
+    requested_goals: RequestedGoalSet,
+    component_library: ComponentLibrary,
+    coverage_facts: StructureCoverageFacts | None = None,
+    chemistry_readiness_facts: StructureChemistryReadinessFacts | None = None,
+) -> CompletionTransformerPlanningOutcome:
+    """Return hydrogen-completion transformer candidates and blocker facts."""
+
+    return plan_hydrogen_completion_transformers(
+        structure,
+        requested_goals=requested_goals,
+        component_library=component_library,
+        coverage_facts=coverage_facts,
+        chemistry_readiness_facts=chemistry_readiness_facts,
+    )
+
+
+def plan_atom_completion_transformers(
+    structure: ProteinStructure,
+    *,
+    requested_goals: RequestedGoalSet,
+    component_library: ComponentLibrary,
+    required_residue_ids: tuple[ResidueId, ...] = (),
+    coverage_facts: StructureCoverageFacts | None = None,
+    chemistry_readiness_facts: StructureChemistryReadinessFacts | None = None,
+) -> CompletionTransformerPlanningOutcome:
+    """Return atom-completion transformer candidates and blocker facts."""
+
+    requests_backbone_heavy_atom_completion = (
+        requested_goals.requests_whole_structure_backbone_heavy_atom_completion()
+    )
+    requests_sidechain_heavy_atom_completion = (
+        requested_goals.requests_whole_structure_sidechain_heavy_atom_completion()
+    )
+    requests_heavy_atom_completion = (
+        requested_goals.requests_whole_structure_heavy_atom_completion()
+    )
+    requests_hydrogen_population = (
+        requested_goals.requests_whole_structure_hydrogen_population()
+    )
+    if (
+        not requests_heavy_atom_completion
+        and not requests_hydrogen_population
+        and not required_residue_ids
+    ):
+        return CompletionTransformerPlanningOutcome()
+
+    active_coverage_facts = coverage_facts
+    active_chemistry_readiness_facts = chemistry_readiness_facts
+    if active_coverage_facts is None or active_chemistry_readiness_facts is None:
+        (
+            active_coverage_facts,
+            active_chemistry_readiness_facts,
+        ) = derive_structure_coverage_and_chemistry_readiness_facts(
+            structure,
+            component_library=component_library,
+        )
+
+    residue_completion_facts = _residue_completion_planning_facts(
+        coverage_facts=active_coverage_facts,
+        chemistry_readiness_facts=active_chemistry_readiness_facts,
+    )
+    blocked_residue_id_set = set(
+        _blocked_atom_completion_residue_ids(
+            residue_completion_facts,
+            requests_heavy_atom_completion=requests_heavy_atom_completion,
+            requests_hydrogen_population=requests_hydrogen_population,
+            required_residue_id_set=set(required_residue_ids),
+        )
+    )
+    heavy_target_residue_ids = _heavy_completion_target_residue_ids(
+        residue_completion_facts,
+        blocked_residue_id_set=blocked_residue_id_set,
+        requests_backbone_heavy_atom_completion=(
+            requests_backbone_heavy_atom_completion
+        ),
+        requests_sidechain_heavy_atom_completion=(
+            requests_sidechain_heavy_atom_completion
+        ),
+        requests_hydrogen_population=requests_hydrogen_population,
+        required_residue_id_set=set(required_residue_ids),
+    )
+    return CompletionTransformerPlanningOutcome(
+        transformers=tuple(
+            transformer
+            for transformer in (
+                _heavy_completion_transformer(heavy_target_residue_ids),
+            )
+            if transformer is not None
+        ),
+    )
+
+
+def plan_hydrogen_completion_transformers(
+    structure: ProteinStructure,
+    *,
+    requested_goals: RequestedGoalSet,
+    component_library: ComponentLibrary,
+    required_residue_ids: tuple[ResidueId, ...] = (),
+    coverage_facts: StructureCoverageFacts | None = None,
+    chemistry_readiness_facts: StructureChemistryReadinessFacts | None = None,
+    histidine_protonation: HistidineProtonationRequest | None = None,
+    observed_preparation: AminoAcidPreparation | None = None,
+) -> CompletionTransformerPlanningOutcome:
+    """Propose H or coupled-chemistry completion from current state.
+
+    Parameters
+    ----------
+    structure : ProteinStructure
+        Snapshot to assess.
+    requested_goals : RequestedGoalSet
+        Whole-structure H goals; local prerequisites use required_residue_ids.
+    component_library : ComponentLibrary
+        Active component definitions.
+    required_residue_ids : tuple[ResidueId, ...]
+        Residues required by another planned action.
+    coverage_facts : StructureCoverageFacts or None
+        Current-snapshot coverage, or None to derive it.
+    chemistry_readiness_facts : StructureChemistryReadinessFacts or None
+        Current-snapshot chemistry facts, or None to derive them.
+    histidine_protonation : HistidineProtonationRequest or None
+        New HIS selection. None retains applicable prior choices.
+    observed_preparation : AminoAcidPreparation or None
+        Reusable seed, rebound to the exact snapshot, library and full requests.
+        None derives targets independently after the eligibility check.
+
+    Returns
+    -------
+    CompletionTransformerPlanningOutcome
+        Candidates for missing H or unrealized selected chemistry. Missing OXT
+        remains a terminal-completion prerequisite, not an H-placement action.
+    """
+
+    if not requested_goals.requests_hydrogen_preparation(
+        required_residue_ids=required_residue_ids
+    ):
+        return CompletionTransformerPlanningOutcome()
+
+    active_coverage_facts = coverage_facts
+    active_chemistry_readiness_facts = chemistry_readiness_facts
+    if active_coverage_facts is None or active_chemistry_readiness_facts is None:
+        (
+            active_coverage_facts,
+            active_chemistry_readiness_facts,
+        ) = derive_structure_coverage_and_chemistry_readiness_facts(
+            structure,
+            component_library=component_library,
+        )
+
+    residue_completion_facts = _residue_completion_planning_facts(
+        coverage_facts=active_coverage_facts,
+        chemistry_readiness_facts=active_chemistry_readiness_facts,
+    )
+    blocked_residue_id_set = set(
+        _blocked_hydrogen_completion_residue_ids(
+            residue_completion_facts,
+            required_residue_id_set=set(required_residue_ids),
+        )
+    )
+    hydrogen_target_residue_ids = _hydrogen_completion_target_residue_ids(
+        residue_completion_facts,
+        blocked_residue_id_set=blocked_residue_id_set,
+        requests_hydrogen_population=(
+            requested_goals.requests_whole_structure_hydrogen_population()
+        ),
+        required_residue_id_set=set(required_residue_ids),
+    )
+    request = normalize_histidine_protonation_request(histidine_protonation)
+    requests = histidine_microstate_requests(structure, request)
+    preparation = (
+        AminoAcidPreparation(
+            PolymerMicrostateContext(structure), component_library, requests=requests
+        )
+        if observed_preparation is None
+        else observed_preparation.for_inputs(
+            structure, component_library, requests=requests
+        )
+    )
+    whole_structure = requested_goals.requests_whole_structure_hydrogen_population()
+    cap_targets = polymer_cap_hydrogen_target_residue_ids(
+        active_chemistry_readiness_facts,
+        whole_structure=whole_structure,
+        required_residue_ids=required_residue_ids,
+    )
+    selected = set(hydrogen_target_residue_ids)
+    for fact in active_chemistry_readiness_facts.residue_facts:
+        if (cap := fact.linked_cap) is not None:
+            selected.discard(fact.residue_id)
+            if (
+                fact.residue_id in cap_targets
+                and cap.link_is_realized()
+                and not cap.hydrogens_are_complete()
+            ):
+                selected.add(fact.residue_id)
+            continue
+        residue = structure.constitution.residue_or_ligand(fact.residue_id)
+        template = (
+            None if residue is None else component_library.get(residue.component_id)
+        )
+        if (
+            template is not None
+            and template.has_unprepared_hydrogen_reference()
+            and fact.hydrogen_coverage_state is HydrogenCoverageState.COMPLETE
+        ):
+            # Read-only validation does not authorize replacing source chemistry
+            # with the preparation defaults of independently supported sites.
+            selected.discard(fact.residue_id)
+            continue
+        if (
+            not fact.is_supported()
+            or fact.heavy_atom_topology_availability_state.is_unavailable()
+        ):
+            selected.discard(fact.residue_id)
+            continue
+        if (
+            not requested_goals.requests_whole_structure_hydrogen_population()
+            and fact.residue_id not in required_residue_ids
+        ):
+            continue
+        targets = preparation.targets_for(fact.residue_id)
+        if any(target.requires_terminal_oxygen() for target in targets):
+            selected.discard(fact.residue_id)
+            continue
+        if any(
+            target.resolution.graph is not None and not target.is_realized()
+            for target in targets
+        ):
+            selected.add(fact.residue_id)
+        if fact.residue_id in selected:
+            fixed = preparation.fixed_hydrogen_context(fact.residue_id)
+            if (
+                fixed is not None
+                and fixed.unresolved_parent_names
+                and not preparation.has_pending_hydrogen_updates(fact.residue_id)
+            ):
+                selected.discard(fact.residue_id)
+    # Defer the partner only if the cap write is allowed by this request.
+    selected.difference_update(
+        cap.partner.residue_id
+        for fact in (
+            *active_chemistry_readiness_facts.residue_facts,
+            *active_chemistry_readiness_facts.retained_non_polymer_facts,
+        )
+        if (whole_structure or fact.residue_id in cap_targets)
+        and (cap := fact.linked_cap) is not None
+        and cap.heavy_bond_updates
+        and cap.partner is not None
+    )
+    return CompletionTransformerPlanningOutcome(
+        transformers=tuple(
+            transformer
+            for transformer in (
+                _hydrogen_completion_transformer(tuple(sorted(selected))),
+            )
+            if transformer is not None
+        ),
+    )
+
+
+def plan_retained_non_polymer_hydrogen_completion_transformers(
+    structure: ProteinStructure,
+    *,
+    requested_goals: RequestedGoalSet,
+    component_library: ComponentLibrary,
+    chemistry_readiness_facts: StructureChemistryReadinessFacts | None = None,
+) -> CompletionTransformerPlanningOutcome:
+    """Return retained non-polymer hydrogen completion candidates."""
+
+    if not requested_goals.requests_whole_structure_hydrogen_population():
+        return CompletionTransformerPlanningOutcome()
+
+    active_chemistry_readiness_facts = chemistry_readiness_facts
+    if active_chemistry_readiness_facts is None:
+        _, active_chemistry_readiness_facts = (
+            derive_structure_coverage_and_chemistry_readiness_facts(
+                structure,
+                component_library=component_library,
+            )
+        )
+
+    retained_non_polymer_target_residue_ids = tuple(
+        retained_fact.residue_id
+        for retained_fact in (
+            active_chemistry_readiness_facts.retained_non_polymer_facts
+        )
+        if retained_fact.requires_hydrogen_completion(for_hydrogen_goal=True)
+    )
+    return CompletionTransformerPlanningOutcome(
+        transformers=tuple(
+            transformer
+            for transformer in (
+                _retained_non_polymer_hydrogen_completion_transformer(
+                    retained_non_polymer_target_residue_ids
+                ),
+            )
+            if transformer is not None
+        ),
+    )
+
+
+def _residue_completion_planning_facts(
+    *,
+    coverage_facts: StructureCoverageFacts,
+    chemistry_readiness_facts: StructureChemistryReadinessFacts,
+) -> tuple[_ResidueCompletionPlanningFacts, ...]:
+    """Return one reusable residue-local completion fact bundle per residue."""
+
+    chemistry_readiness_by_residue_id = {
+        residue_fact.residue_id: residue_fact
+        for residue_fact in chemistry_readiness_facts.residue_facts
+    }
+    return tuple(
+        _ResidueCompletionPlanningFacts(
+            residue_id=coverage_residue_fact.residue_id,
+            component_supported=chemistry_readiness_by_residue_id[
+                coverage_residue_fact.residue_id
+            ].component_support_state.is_fully_supported(),
+            requires_backbone_completion=(
+                coverage_residue_fact.requires_backbone_completion()
+            ),
+            requires_sidechain_completion=(
+                coverage_residue_fact.requires_sidechain_completion()
+            ),
+            needs_hydrogenation=chemistry_readiness_by_residue_id[
+                coverage_residue_fact.residue_id
+            ].needs_hydrogenation(),
+        )
+        for coverage_residue_fact in coverage_facts.residue_facts
+    )
+
+
+def _blocked_atom_completion_residue_ids(
+    residue_completion_facts: tuple[_ResidueCompletionPlanningFacts, ...],
+    *,
+    requests_heavy_atom_completion: bool,
+    requests_hydrogen_population: bool,
+    required_residue_id_set: set[ResidueId],
+) -> tuple[ResidueId, ...]:
+    """Return residues that block completion because support is absent."""
+
+    if (
+        not requests_heavy_atom_completion
+        and not requests_hydrogen_population
+        and not required_residue_id_set
+    ):
+        return ()
+
+    return tuple(
+        residue_facts.residue_id
+        for residue_facts in residue_completion_facts
+        if (
+            not residue_facts.component_supported
+            and (
+                (
+                    requests_heavy_atom_completion
+                    and (
+                        residue_facts.requires_backbone_completion
+                        or residue_facts.requires_sidechain_completion
+                    )
+                )
+                or (
+                    requests_hydrogen_population
+                    and (
+                        residue_facts.requires_backbone_completion
+                        or residue_facts.requires_sidechain_completion
+                    )
+                )
+                or (
+                    residue_facts.residue_id in required_residue_id_set
+                    and (
+                        residue_facts.requires_backbone_completion
+                        or residue_facts.requires_sidechain_completion
+                    )
+                )
+            )
+        )
+    )
+
+
+def _blocked_hydrogen_completion_residue_ids(
+    residue_completion_facts: tuple[_ResidueCompletionPlanningFacts, ...],
+    *,
+    required_residue_id_set: set[ResidueId],
+) -> tuple[ResidueId, ...]:
+    """Return residues that block hydrogen completion because support is absent."""
+
+    return tuple(
+        residue_facts.residue_id
+        for residue_facts in residue_completion_facts
+        if (
+            not residue_facts.component_supported
+            and (
+                residue_facts.needs_hydrogenation
+                or residue_facts.residue_id in required_residue_id_set
+            )
+        )
+    )
+
+
+def _heavy_completion_target_residue_ids(
+    residue_completion_facts: tuple[_ResidueCompletionPlanningFacts, ...],
+    *,
+    blocked_residue_id_set: set[ResidueId],
+    requests_backbone_heavy_atom_completion: bool,
+    requests_sidechain_heavy_atom_completion: bool,
+    requests_hydrogen_population: bool,
+    required_residue_id_set: set[ResidueId],
+) -> tuple[ResidueId, ...]:
+    """Return residues that require heavy completion under the active goals."""
+
+    target_residue_ids: list[ResidueId] = []
+    for residue_facts in residue_completion_facts:
+        if residue_facts.residue_id in blocked_residue_id_set:
+            continue
+        if (
+            not residue_facts.requires_backbone_completion
+            and not residue_facts.requires_sidechain_completion
+        ):
+            continue
+        if (
+            requests_backbone_heavy_atom_completion
+            and residue_facts.requires_backbone_completion
+        ):
+            target_residue_ids.append(residue_facts.residue_id)
+            continue
+        if (
+            requests_sidechain_heavy_atom_completion
+            and residue_facts.requires_sidechain_completion
+        ):
+            target_residue_ids.append(residue_facts.residue_id)
+            continue
+        if requests_hydrogen_population and residue_facts.needs_hydrogenation:
+            target_residue_ids.append(residue_facts.residue_id)
+            continue
+        if residue_facts.residue_id in required_residue_id_set:
+            target_residue_ids.append(residue_facts.residue_id)
+
+    return tuple(target_residue_ids)
+
+
+def _hydrogen_completion_target_residue_ids(
+    residue_completion_facts: tuple[_ResidueCompletionPlanningFacts, ...],
+    *,
+    blocked_residue_id_set: set[ResidueId],
+    requests_hydrogen_population: bool,
+    required_residue_id_set: set[ResidueId],
+) -> tuple[ResidueId, ...]:
+    """Return residues that require hydrogen completion under the active goals."""
+
+    if not requests_hydrogen_population and not required_residue_id_set:
+        return ()
+
+    return tuple(
+        residue_facts.residue_id
+        for residue_facts in residue_completion_facts
+        if (
+            residue_facts.residue_id not in blocked_residue_id_set
+            and residue_facts.needs_hydrogenation
+            and (
+                requests_hydrogen_population
+                or residue_facts.residue_id in required_residue_id_set
+            )
+        )
+    )
+
+
+def _heavy_completion_transformer(
+    target_residue_ids: tuple[ResidueId, ...],
+) -> HeavyAtomCompletionTransformer | None:
+    """Return one heavy-completion transformer when any residues need it."""
+
+    if not target_residue_ids:
+        return None
+
+    return HeavyAtomCompletionTransformer.from_completion_scope(
+        ResidueSetScope(residue_ids=target_residue_ids)
+    )
+
+
+def _hydrogen_completion_transformer(
+    target_residue_ids: tuple[ResidueId, ...],
+) -> HydrogenCompletionTransformer | None:
+    """Return one hydrogen-completion transformer when any residues need it."""
+
+    if not target_residue_ids:
+        return None
+
+    return HydrogenCompletionTransformer.from_completion_scope(
+        ResidueSetScope(residue_ids=target_residue_ids)
+    )
+
+
+def _retained_non_polymer_hydrogen_completion_transformer(
+    target_residue_ids: tuple[ResidueId, ...],
+) -> RetainedNonPolymerHydrogenCompletionTransformer | None:
+    """Return one retained non-polymer hydrogen transformer when any targets need it."""
+
+    if not target_residue_ids:
+        return None
+
+    return RetainedNonPolymerHydrogenCompletionTransformer.from_completion_scope(
+        ResidueSetScope(residue_ids=target_residue_ids)
+    )

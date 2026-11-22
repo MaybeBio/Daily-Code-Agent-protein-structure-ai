@@ -1,0 +1,128 @@
+/**
+ *  \file IMP/isd/Nuisance.h
+ *  \brief A decorator for nuisance parameters particles
+ *
+ *  Copyright 2007-2026 IMP Inventors. All rights reserved.
+ */
+
+#ifndef IMPISD_NUISANCE_H
+#define IMPISD_NUISANCE_H
+
+#include <IMP/isd/isd_config.h>
+
+#include <IMP/Decorator.h>
+#include <IMP/decorator_macros.h>
+#include <cereal/access.hpp>
+#include <cereal/types/base_class.hpp>
+
+IMPISD_BEGIN_NAMESPACE
+
+//! Add nuisance parameter to particle
+/** The value of the nuisance parameter may express data
+    or theory uncertainty. It can be initialized with or without
+    specifying its value. Default is 1. On construction, the Nuisance is
+    unbounded. It can be bounded with set_upper and set_lower. Setting it
+    to values outside of bounds results in setting it to the bound value.
+ */
+class IMPISDEXPORT Nuisance : public Decorator {
+  static void do_setup_particle(Model *m, ParticleIndex pi,
+                                double nuisance = 1.0);
+
+ public:
+  IMP_DECORATOR_METHODS(Nuisance, Decorator);
+  IMP_DECORATOR_SETUP_0(Nuisance);
+  IMP_DECORATOR_SETUP_1(Nuisance, double, nuisance);
+
+  static bool get_is_setup(Model *m, ParticleIndex pi) {
+    return m->get_has_attribute(get_nuisance_key(), pi);
+  }
+
+  static FloatKey get_nuisance_key();
+  Float get_nuisance() const {
+    return get_model()->get_attribute(get_nuisance_key(), get_particle_index());
+  }
+  void set_nuisance(Float d);
+
+  /** set upper and lower bound of nuisance by specifying
+   * either a float or another nuisance. Both can be set at the same
+   * time in which case the upper bound is the minimum of the two values.
+   * This constraint is enforced with the help of a ScoreState that will be
+   * created on-the-fly.
+   */
+  bool get_has_lower() const;
+  bool get_has_lower_float() const;
+  bool get_has_lower_particle() const;
+  Float get_lower() const;
+  static FloatKey get_lower_key();
+  static ParticleIndexKey get_lower_particle_key();
+  void set_lower(Float d);
+  void set_lower(Particle *d);
+  void remove_lower();
+
+  bool get_has_upper() const;
+  bool get_has_upper_float() const;
+  bool get_has_upper_particle() const;
+  Float get_upper() const;
+  static FloatKey get_upper_key();
+  static ParticleIndexKey get_upper_particle_key();
+  void set_upper(Float d);
+  void set_upper(Particle *d);
+  void remove_upper();
+
+  Float get_nuisance_derivative() const {
+    return get_particle()->get_derivative(get_nuisance_key());
+  }
+
+  void add_to_nuisance_derivative(Float d, DerivativeAccumulator &accum) {
+    get_particle()->add_to_derivative(get_nuisance_key(), d, accum);
+  }
+
+  bool get_nuisance_is_optimized() const {
+    return get_particle()->get_is_optimized(get_nuisance_key());
+  }
+
+  void set_nuisance_is_optimized(bool val) {
+    get_particle()->set_is_optimized(get_nuisance_key(), val);
+  }
+
+  friend class NuisanceScoreState;
+
+ private:
+  // scorestate-related bookkeeping
+  static ObjectKey get_ss_key();
+  void enforce_bounds();
+  void remove_bounds();
+};
+
+IMP_DECORATORS(Nuisance, Nuisances, ParticlesTemp);
+
+//! Constrain a Nuisance to lie within its bounds
+class IMPISDEXPORT NuisanceScoreState : public ScoreState {
+  ParticleIndex pi_;
+
+  friend class cereal::access;
+  template<class Archive> void serialize(Archive &ar) {
+    ar(cereal::base_class<ScoreState>(this), pi_);
+  }
+  IMP_OBJECT_SERIALIZE_DECL(NuisanceScoreState);
+
+ public:
+  NuisanceScoreState(Particle *p)
+      : ScoreState(p->get_model(), "NuisanceScoreState%1%"),
+        pi_(p->get_index()) {}
+
+  NuisanceScoreState() {}
+
+  ParticleIndex get_index() const { return pi_; }
+
+  friend class Nuisance;
+  virtual void do_before_evaluate() override;
+  virtual void do_after_evaluate(DerivativeAccumulator *da) override;
+  virtual ModelObjectsTemp do_get_inputs() const override;
+  virtual ModelObjectsTemp do_get_outputs() const override;
+  IMP_OBJECT_METHODS(NuisanceScoreState);
+};
+
+IMPISD_END_NAMESPACE
+
+#endif /* IMPISD_NUISANCE_H */

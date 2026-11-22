@@ -1,7 +1,7 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/SanggeunParrk/geis
-- 快照日期: 2026-11-18
+- 快照日期: 2026-11-22
 - 快照 commit: [`bc318e4fbc2c`](https://github.com/SanggeunParrk/geis/commit/bc318e4fbc2c1e94ca49463d52c2fb9e184e8b99)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 

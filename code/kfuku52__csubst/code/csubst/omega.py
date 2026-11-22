@@ -1,0 +1,3530 @@
+#if __name__ == '__main__':
+#    mp.set_start_method('spawn')
+#    my_class = MyClass(1)
+#    my_class.mp_simple_method()
+#    my_class.wait()
+
+import numpy as np
+import pandas as pd
+from scipy.linalg import expm
+
+import itertools
+import re
+import sys
+import time
+import warnings
+from collections import defaultdict
+from functools import lru_cache
+
+from csubst.omega_statistics import (
+    _count_rates,
+    _calc_bh_fdr_qvalues as _calc_bh_fdr_qvalues,
+    _calc_omega_empirical_upper_tail_counts as _calc_omega_empirical_upper_tail_counts,
+    _calc_omega_empirical_upper_tail_counts_from_perm as _calc_omega_empirical_upper_tail_counts_from_perm,
+    _calc_omega_empirical_upper_tail_pvalues as _calc_omega_empirical_upper_tail_pvalues,
+    _calc_omega_empirical_upper_tail_pvalues_from_counts as _calc_omega_empirical_upper_tail_pvalues_from_counts,
+    _calc_omega_empirical_upper_tail_pvalues_from_perm as _calc_omega_empirical_upper_tail_pvalues_from_perm,
+    _calc_permutation_omega_matrix as _calc_permutation_omega_matrix,
+    _calc_raw_omega as _calc_raw_omega,
+    _calc_raw_rate as _calc_raw_rate,
+    _calibrate_dsc_matrix as _calibrate_dsc_matrix,
+    _calibrate_dsc_vector as _calibrate_dsc_vector,
+    _needs_omega_pvalue_upper_tail_edge_refinement as _needs_omega_pvalue_upper_tail_edge_refinement,
+)
+from csubst import asrv, urn_expectation
+from csubst import parallel
+from csubst import randomness
+from csubst import substitution
+from csubst import substitution_sparse
+from csubst import table
+from csubst import ete
+from csubst import expected_sparse
+from csubst import site_filter
+from csubst import output_stat
+from csubst import pseudocount
+from csubst import epistasis
+from csubst import expectation_3di
+from csubst import recoding_config
+from csubst._extensions import load_optional_extension, warn_extension_fallback
+
+omega_cy = load_optional_extension('omega_cy')
+
+_UINT8_POPCOUNT = np.unpackbits(
+    np.arange(256, dtype=np.uint8)[:, None],
+    axis=1,
+).sum(axis=1).astype(np.uint8)
+_DEFAULT_E_STAT_MIN_ITEMS_FOR_PARALLEL = 1000000000
+_DEFAULT_E_STAT_MIN_CATEGORIES_PER_JOB = 64
+_URN_OVERLAP_WORK_BYTES = 32 * 1024**2
+_PACKED_COUNT_WORK_BYTES = 32 * 1024**2
+_CYTHON_FALLBACK_WARNED = set()
+
+
+def _warn_cython_fallback(fastpath_name, exc):
+    warn_extension_fallback(
+        fastpath_name, exc, _CYTHON_FALLBACK_WARNED, fallback_name='NumPy'
+    )
+_OMEGA_PVALUE_REFINE_UPPER_EDGE_BINS = 2
+_OMEGA_PVALUE_AUTO_NITER_SCHEDULE = (100, 1000)
+_OMEGA_PVALUE_MAX_NITER = 10000
+
+
+def _get_cb_ids(cb):
+    bid_columns = cb.columns[cb.columns.str.startswith('branch_id_')]
+    if bid_columns.shape[0] == 0:
+        raise ValueError('cb should contain at least one branch_id_ column.')
+    cb_ids = cb.loc[:, bid_columns].to_numpy(copy=False, dtype=object)
+    if cb_ids.size == 0:
+        return np.zeros(shape=cb_ids.shape, dtype=np.int64)
+    normalized = []
+    for value in cb_ids.reshape(-1).tolist():
+        if value is None:
+            raise ValueError('branch_id columns should be integer-like.')
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError('branch_id columns should be integer-like.')
+        if isinstance(value, (int, np.integer)):
+            if int(value) < 0:
+                raise ValueError('branch_id columns should be non-negative integers.')
+            normalized.append(int(value))
+            continue
+        if isinstance(value, (float, np.floating)):
+            if (not np.isfinite(value)) or (not float(value).is_integer()):
+                raise ValueError('branch_id columns should be integer-like.')
+            if int(value) < 0:
+                raise ValueError('branch_id columns should be non-negative integers.')
+            normalized.append(int(value))
+            continue
+        value_txt = str(value).strip()
+        if (value_txt == '') or (not bool(re.fullmatch(r'[+-]?[0-9]+(?:\.0+)?', value_txt))):
+            raise ValueError('branch_id columns should be integer-like.')
+        if int(value_txt.split('.', 1)[0]) < 0:
+            raise ValueError('branch_id columns should be non-negative integers.')
+        normalized.append(int(value_txt.split('.', 1)[0]))
+    return np.array(normalized, dtype=np.int64).reshape(cb_ids.shape)
+
+
+def _resolve_requested_output_stats(g):
+    if 'output_stats' in g.keys():
+        return output_stat.parse_output_stats(g['output_stats'])
+    if 'output_stat' in g.keys():
+        return output_stat.parse_output_stats(g['output_stat'])
+    return list(output_stat.ALL_OUTPUT_STATS)
+
+
+def _resolve_epistasis_channels(g):
+    token = str(g.get('epistasis_apply_to', 'N')).strip().upper()
+    if token == 'N':
+        return ('N',)
+    if token == 'S':
+        return ('S',)
+    if token == 'NS':
+        return ('N', 'S')
+    raise ValueError('Unsupported epistasis_apply_to value: {}'.format(token))
+
+
+def _get_epistasis_branch_site_counts(sub_tensor, g):
+    if 'is_site_nonmissing' in g.keys():
+        num_branch = int(g['is_site_nonmissing'].shape[0])
+        num_site = int(g['is_site_nonmissing'].shape[1])
+    else:
+        num_branch = int(sub_tensor.shape[0])
+        num_site = int(sub_tensor.shape[1])
+    counts = np.zeros(shape=(num_branch, num_site), dtype=np.float64)
+    if '_asrv_branch_ids' in g.keys():
+        branch_ids = np.asarray(g['_asrv_branch_ids'], dtype=np.int64).reshape(-1)
+    else:
+        branch_ids = np.arange(num_branch, dtype=np.int64)
+    for branch_id in branch_ids.tolist():
+        counts[branch_id, :] = substitution.get_branch_site_sub_counts(
+            sub_tensor=sub_tensor,
+            branch_id=int(branch_id),
+        )
+    return counts
+
+
+def _apply_epistasis_to_sub_sites(sub_sites, obs_col, g):
+    if not g.get('epistasis_enabled', False):
+        return sub_sites
+    channel = 'N' if obs_col.startswith('OCN') else 'S' if obs_col.startswith('OCS') else None
+    state = g.get('_epistasis_state', {}).get(channel)
+    if state is None:
+        return sub_sites
+    # These are the exact outer-fold predictions scored during cross-fitting.
+    # Reweighting a different, full-data ASRV prior here would reintroduce the
+    # held-out response and invalidate the tuning/application contract.
+    probabilities = state['probabilities']
+    if np.shape(sub_sites) != probabilities.shape:
+        raise ValueError('Cross-fitted structure probabilities require branch-by-site ASRV sn weights.')
+    return probabilities
+
+
+def prepare_epistasis(g, ON_tensor, OS_tensor):
+    g['epistasis_enabled'] = False
+    epistasis.validate_options(g)
+    if g.get('asrv', 'each') != 'sn':
+        raise ValueError('Structure weighting requires --asrv sn.')
+    features = np.asarray(g['epistasis_site_feature_matrix_internal'], dtype=np.float64)
+    context, groups, partitions = epistasis.prepare_layout(g, ON_tensor.shape[0], features.shape[1])
+    g['_epistasis_provenance']['site_features'] = features.tolist()
+    g['_epistasis_provenance']['feature_mode'] = g.get('epistasis_feature_mode_resolved', 'single')
+    state = {}
+    for channel in _resolve_epistasis_channels(g):
+        tensor = ON_tensor if channel == 'N' else OS_tensor
+        mask = substitution.get_asrv_site_mask(g, channel)
+        counts = _get_epistasis_branch_site_counts(tensor, g)
+        fitted = epistasis.crossfit(counts, context, features, mask, groups, partitions, g)
+        eligible = (partitions >= 0) & mask.any(axis=1)
+        for name in ('beta', 'alpha', 'clip'):
+            fitted[name] = float(np.mean(fitted[name + '_by_branch'][eligible])) if eligible.any() else 0.
+        fitted['branch_context'] = context
+        state[channel] = fitted
+        print('Exploratory structure weighting [{}]: independent context, blocked cross-fitting; '
+              'mean beta={:.6g} (not an epistasis test).'.format(channel, fitted['beta']), flush=True)
+    g['_epistasis_state'] = state
+    g['epistasis_enabled'] = bool(state)
+    return g
+
+
+def _can_use_cython_expected_state(parent_state_block, transition_prob):
+    if omega_cy is None:
+        return False
+    if not hasattr(omega_cy, 'project_expected_state_block_double'):
+        return False
+    if not isinstance(parent_state_block, np.ndarray):
+        return False
+    if not isinstance(transition_prob, np.ndarray):
+        return False
+    if parent_state_block.dtype != np.float64:
+        return False
+    if transition_prob.dtype != np.float64:
+        return False
+    if parent_state_block.ndim != 2:
+        return False
+    if transition_prob.ndim != 2:
+        return False
+    if transition_prob.shape[0] != transition_prob.shape[1]:
+        return False
+    if parent_state_block.shape[1] != transition_prob.shape[0]:
+        return False
+    # For larger state spaces, NumPy/BLAS matmul is typically faster.
+    if parent_state_block.shape[1] > 8:
+        return False
+    return True
+
+
+def _can_use_cython_tmp_E_sum(cb_ids, sub_sites, sub_branches):
+    if omega_cy is None:
+        return False
+    if not hasattr(omega_cy, 'calc_tmp_E_sum_double'):
+        return False
+    if not isinstance(cb_ids, np.ndarray):
+        return False
+    if not isinstance(sub_sites, np.ndarray):
+        return False
+    if not isinstance(sub_branches, np.ndarray):
+        return False
+    if cb_ids.dtype != np.int64:
+        return False
+    if sub_sites.dtype != np.float64:
+        return False
+    if sub_branches.dtype != np.float64:
+        return False
+    if cb_ids.ndim != 2:
+        return False
+    if sub_sites.ndim != 2:
+        return False
+    if sub_branches.ndim != 1:
+        return False
+    if sub_sites.shape[0] != sub_branches.shape[0]:
+        return False
+    if cb_ids.shape[1] == 0:
+        return False
+    return True
+
+
+def _can_use_cython_packed_shared_counts(packed_masks, remapped_cb_ids):
+    if omega_cy is None:
+        return False
+    if not hasattr(omega_cy, 'calc_shared_counts_packed_uint8'):
+        return False
+    if not isinstance(packed_masks, np.ndarray):
+        return False
+    if not isinstance(remapped_cb_ids, np.ndarray):
+        return False
+    if packed_masks.dtype != np.uint8:
+        return False
+    if remapped_cb_ids.dtype != np.int64:
+        return False
+    if packed_masks.ndim != 3:
+        return False
+    if remapped_cb_ids.ndim != 2:
+        return False
+    if remapped_cb_ids.shape[1] == 0:
+        return False
+    return True
+
+
+def _can_use_cython_pack_sampled_indices(sampled_site_indices):
+    if omega_cy is None:
+        return False
+    if not hasattr(omega_cy, 'pack_sampled_site_indices_uint8'):
+        return False
+    if not isinstance(sampled_site_indices, np.ndarray):
+        return False
+    if sampled_site_indices.dtype != np.int64:
+        return False
+    if sampled_site_indices.ndim != 2:
+        return False
+    return True
+
+
+def _calc_shared_counts_from_packed_masks(packed_masks, remapped_cb_ids):
+    packed_masks = np.asarray(packed_masks, dtype=np.uint8)
+    remapped_cb_ids = np.asarray(remapped_cb_ids, dtype=np.int64)
+    if packed_masks.ndim != 3:
+        raise ValueError('packed_masks should be a 3D array.')
+    if remapped_cb_ids.ndim != 2:
+        raise ValueError('remapped_cb_ids should be a 2D array.')
+    if remapped_cb_ids.shape[1] <= 0:
+        raise ValueError('remapped_cb_ids should have at least one column.')
+    if remapped_cb_ids.shape[0] == 0:
+        return np.zeros((0, packed_masks.shape[1]), dtype=np.int32)
+    if (remapped_cb_ids < 0).any():
+        raise ValueError('remapped_cb_ids should be non-negative.')
+    if remapped_cb_ids.max() >= packed_masks.shape[0]:
+        raise ValueError('remapped_cb_ids contain out-of-range branch IDs.')
+    if _can_use_cython_packed_shared_counts(packed_masks=packed_masks, remapped_cb_ids=remapped_cb_ids):
+        try:
+            return omega_cy.calc_shared_counts_packed_uint8(
+                packed_masks=packed_masks,
+                remapped_cb_ids=remapped_cb_ids,
+            )
+        except Exception as exc:
+            _warn_cython_fallback('packed_shared_counts', exc)
+    _, iterations, packed_sites = packed_masks.shape
+    # Hold at most one working overlap and one gathered or popcount block.
+    bytes_per_row = max(1, 2 * iterations * packed_sites)
+    rows_per_block = max(1, _PACKED_COUNT_WORK_BYTES // bytes_per_row)
+    out = np.empty((len(remapped_cb_ids), iterations), dtype=np.int32)
+    for start in range(0, len(remapped_cb_ids), rows_per_block):
+        stop = min(start + rows_per_block, len(remapped_cb_ids))
+        ids = remapped_cb_ids[start:stop]
+        shared = packed_masks[ids[:, 0]]
+        for col in range(1, ids.shape[1]):
+            np.bitwise_and(shared, packed_masks[ids[:, col]], out=shared)
+        out[start:stop] = _UINT8_POPCOUNT[shared].sum(axis=2, dtype=np.int32)
+    return out
+
+
+def _pack_sampled_site_indices_to_uint8(sampled_site_indices, num_site):
+    sampled_site_indices = np.asarray(sampled_site_indices, dtype=np.int64)
+    if sampled_site_indices.ndim != 2:
+        raise ValueError('sampled_site_indices should be a 2D array.')
+    niter = int(sampled_site_indices.shape[0])
+    size = int(sampled_site_indices.shape[1])
+    num_site = int(num_site)
+    if num_site < 0:
+        raise ValueError('num_site should be >= 0.')
+    num_packed_site = (num_site + 7) // 8
+    packed = np.zeros((niter, num_packed_site), dtype=np.uint8)
+    if (niter == 0) or (size == 0) or (num_site == 0):
+        return packed
+    if _can_use_cython_pack_sampled_indices(sampled_site_indices=sampled_site_indices):
+        try:
+            return omega_cy.pack_sampled_site_indices_uint8(
+                sampled_site_indices=sampled_site_indices,
+                num_site=num_site,
+            )
+        except Exception as exc:
+            _warn_cython_fallback('pack_sampled_site_indices', exc)
+    row_indices = np.repeat(np.arange(niter, dtype=np.int64), size)
+    flattened_sites = sampled_site_indices.reshape(-1)
+    if (flattened_sites < 0).any() or (flattened_sites >= num_site).any():
+        raise ValueError('sampled_site_indices contain out-of-range site IDs.')
+    byte_indices = flattened_sites >> 3
+    bit_offsets = flattened_sites & 7
+    bit_values = (1 << (7 - bit_offsets)).astype(np.uint8, copy=False)
+    np.bitwise_or.at(packed, (row_indices, byte_indices), bit_values)
+    return packed
+
+
+def _weighted_sample_without_replacement_packed(
+    p, size, niter, rng=None, sampling_model='wallenius'
+):
+    if rng is None:
+        rng = np.random.default_rng()
+    p = np.asarray(p, dtype=np.float64)
+    if p.ndim != 1:
+        raise ValueError('p should be a 1D array.')
+    if size < 0:
+        raise ValueError('size should be >= 0.')
+    if niter < 0:
+        raise ValueError('niter should be >= 0.')
+    num_site = int(p.shape[0])
+    num_packed_site = (num_site + 7) // 8
+    packed = np.zeros(shape=(niter, num_packed_site), dtype=np.uint8)
+    positive_sites = np.flatnonzero(p > 0).astype(np.int64, copy=False)
+    num_positive_sites = positive_sites.shape[0]
+    if (size == 0) or (num_positive_sites == 0) or (niter == 0):
+        return packed
+    if size > num_positive_sites:
+        txt = 'Sample size ({}) exceeded number of positive-probability sites ({}) in hypergeometric sampling.'
+        raise ValueError(txt.format(size, num_positive_sites))
+    if size == num_positive_sites:
+        row_mask = np.zeros((num_packed_site,), dtype=np.uint8)
+        byte_indices = positive_sites >> 3
+        bit_offsets = positive_sites & 7
+        bit_values = (1 << (7 - bit_offsets)).astype(np.uint8, copy=False)
+        np.bitwise_or.at(row_mask, byte_indices, bit_values)
+        packed[:, :] = row_mask[None, :]
+        return packed
+    sampling_model = str(sampling_model).strip().lower()
+    if sampling_model == 'fisher':
+        weights = p[positive_sites]
+        uniform = np.all(weights == weights[0])
+        complement = size > num_positive_sites - size
+        log_weights = None
+        if uniform:
+            suffix_rows = itertools.repeat((None, None), num_positive_sites)
+        else:
+            log_weights = urn_expectation.normalized_log_weights(weights)
+            # An omitted subset has reciprocal odds. Keep the forward draw
+            # order and use its suffix weight to obtain each inclusion chance.
+            suffix_rows = (urn_expectation.fisher_suffix_rows(-log_weights, num_positive_sites - size)
+                           if complement else urn_expectation.fisher_suffix_rows(log_weights, size))
+        remaining = np.full(niter, size, dtype=np.int64)
+        for item_index, (log_current, log_next) in enumerate(suffix_rows):
+            active = np.flatnonzero(remaining > 0)
+            if active.shape[0] == 0:
+                break
+            items_left = num_positive_sites - item_index
+            forced = remaining[active] >= items_left
+            probability = np.ones(active.shape[0], dtype=np.float64)
+            optional = ~forced
+            if optional.any():
+                r = remaining[active[optional]]
+                if uniform:
+                    probability[optional] = r / items_left
+                else:
+                    assert log_weights is not None and log_current is not None and log_next is not None
+                    if complement:
+                        omitted = items_left - r
+                        log_numerator = log_next[omitted]
+                        log_denominator = log_current[omitted]
+                    else:
+                        log_numerator = log_weights[item_index] + log_next[r - 1]
+                        log_denominator = log_current[r]
+                    probability[optional] = np.exp(log_numerator - log_denominator)
+            choose = forced | (rng.random(active.shape[0]) < probability)
+            chosen_rows = active[choose]
+            byte, bit = divmod(int(positive_sites[item_index]), 8)
+            packed[chosen_rows, byte] |= 1 << (7 - bit)
+            remaining[chosen_rows] -= 1
+        if (remaining != 0).any():
+            raise RuntimeError('Fisher weighted sampling did not select the requested sample size.')
+        return packed
+    if sampling_model not in ['wallenius', 'factorized_approx']:
+        raise ValueError('Unsupported weighted sampling model: {}'.format(sampling_model))
+    for start, sites in urn_expectation.wallenius_sample_blocks(
+        positive_sites, p[positive_sites], size, niter, rng,
+    ):
+        packed[start:start + len(sites)] = _pack_sampled_site_indices_to_uint8(sites, num_site)
+    return packed
+
+
+def _project_expected_state_block(parent_state_block, transition_prob, float_tol):
+    if _can_use_cython_expected_state(parent_state_block, transition_prob):
+        return omega_cy.project_expected_state_block_double(
+            parent_state_block=parent_state_block,
+            transition_prob=transition_prob,
+            float_tol=float(float_tol),
+        )
+    expected_state_block = parent_state_block @ transition_prob
+    expected_sum = expected_state_block.sum(axis=1)
+    is_over = (expected_sum - 1) > float_tol
+    if is_over.any():
+        expected_state_block[is_over, :] /= expected_sum[is_over][:, None]
+    return expected_state_block
+
+
+def _infer_stationary_distribution(inst, validation_tol):
+    eigenvalues, eigenvectors = np.linalg.eig(np.asarray(inst, dtype=np.float64).T)
+    zero_index = int(np.argmin(np.abs(eigenvalues)))
+    stationary = eigenvectors[:, zero_index]
+    if np.max(np.abs(stationary.imag)) > validation_tol:
+        return None
+    stationary = stationary.real
+    if stationary.sum(dtype=np.float64) < 0:
+        stationary = -stationary
+    if (not np.isfinite(stationary).all()) or (stationary <= validation_tol).any():
+        return None
+    stationary /= stationary.sum(dtype=np.float64)
+    residual = np.max(np.abs(stationary @ np.asarray(inst, dtype=np.float64)))
+    if residual > validation_tol:
+        return None
+    return stationary
+
+
+def _build_reversible_expected_state_projector(inst, float_tol, stationary=None):
+    inst = np.asarray(inst, dtype=np.float64)
+    if (inst.ndim != 2) or (inst.shape[0] != inst.shape[1]) or (inst.shape[0] == 0):
+        return None
+    if not np.isfinite(inst).all():
+        return None
+    matrix_scale = max(1.0, float(np.max(np.abs(inst))))
+    validation_tol = max(
+        1e-10 * matrix_scale,
+        min(float(float_tol) * 0.1, 1e-5) * matrix_scale,
+        np.finfo(np.float64).eps * inst.shape[0] * matrix_scale * 100.0,
+    )
+    if np.max(np.abs(inst.sum(axis=1))) > validation_tol:
+        return None
+    if stationary is not None:
+        stationary = np.asarray(stationary, dtype=np.float64).reshape(-1)
+        if stationary.shape[0] != inst.shape[0]:
+            stationary = None
+        elif (not np.isfinite(stationary).all()) or (stationary <= validation_tol).any():
+            stationary = None
+        else:
+            stationary = stationary / stationary.sum(dtype=np.float64)
+            if np.max(np.abs(stationary @ inst)) > validation_tol:
+                stationary = None
+    if stationary is None:
+        stationary = _infer_stationary_distribution(inst=inst, validation_tol=validation_tol)
+    if stationary is None:
+        return None
+    sqrt_stationary = np.sqrt(stationary)
+    symmetric_inst = (sqrt_stationary[:, None] * inst) / sqrt_stationary[None, :]
+    if np.max(np.abs(symmetric_inst - symmetric_inst.T)) > validation_tol:
+        return None
+    symmetric_inst = (symmetric_inst + symmetric_inst.T) * 0.5
+    eigenvalues, eigenvectors = np.linalg.eigh(symmetric_inst)
+    if eigenvalues.max(initial=-np.inf) > validation_tol:
+        return None
+    eigenvalues = np.minimum(eigenvalues, 0.0)
+    reconstructed = (eigenvectors * eigenvalues[None, :]) @ eigenvectors.T
+    if np.max(np.abs(reconstructed - symmetric_inst)) > validation_tol * 10.0:
+        return None
+    return {
+        'kind': 'reversible',
+        'eigenvalues': np.ascontiguousarray(eigenvalues, dtype=np.float64),
+        'eigenvectors': np.ascontiguousarray(eigenvectors, dtype=np.float64),
+        'sqrt_stationary': np.ascontiguousarray(sqrt_stationary, dtype=np.float64),
+        'validation_tol': float(validation_tol),
+    }
+
+
+def _build_general_expected_state_projector(inst, float_tol):
+    inst = np.asarray(inst, dtype=np.float64)
+    if (inst.ndim != 2) or (inst.shape[0] != inst.shape[1]) or (inst.shape[0] == 0):
+        return None
+    if not np.isfinite(inst).all():
+        return None
+    matrix_scale = max(1.0, float(np.max(np.abs(inst))))
+    validation_tol = max(
+        1e-10 * matrix_scale,
+        min(float(float_tol) * 0.1, 1e-5) * matrix_scale,
+        np.finfo(np.float64).eps * inst.shape[0] * matrix_scale * 100.0,
+    )
+    if np.max(np.abs(inst.sum(axis=1))) > validation_tol:
+        return None
+    eigenvalues, eigenvectors = np.linalg.eig(inst)
+    condition_number = float(np.linalg.cond(eigenvectors))
+    if (not np.isfinite(condition_number)) or (condition_number > 1e8):
+        return None
+    inverse_eigenvectors = np.linalg.inv(eigenvectors)
+    reconstructed = (eigenvectors * eigenvalues[None, :]) @ inverse_eigenvectors
+    if np.max(np.abs(reconstructed - inst)) > validation_tol * 10.0:
+        return None
+    if eigenvalues.real.max(initial=-np.inf) > validation_tol:
+        return None
+    eigenvalues = eigenvalues.copy()
+    nearly_zero = np.abs(eigenvalues) <= validation_tol
+    eigenvalues[nearly_zero] = 0.0
+    return {
+        'kind': 'general',
+        'eigenvalues': np.ascontiguousarray(eigenvalues),
+        'eigenvectors': np.ascontiguousarray(eigenvectors),
+        'inverse_eigenvectors': np.ascontiguousarray(inverse_eigenvectors),
+        'validation_tol': float(validation_tol),
+        'condition_number': condition_number,
+    }
+
+
+def _build_expected_state_projector(inst, float_tol, stationary=None):
+    projector = _build_reversible_expected_state_projector(
+        inst=inst,
+        float_tol=float_tol,
+        stationary=stationary,
+    )
+    if projector is not None:
+        return projector
+    return _build_general_expected_state_projector(inst=inst, float_tol=float_tol)
+
+
+def _resolve_sub_sites(g, sub_sg, mode, sg, a, d, obs_col):
+    asrv_mode = g['asrv']
+    channel = 'N' if obs_col.startswith('OCN') else 'S'
+    if asrv_mode in ('each', 'file_each'):
+        sub_sites = substitution.get_each_sub_sites(sub_sg, mode, sg, a, d, g, channel=channel)
+    else:
+        weights = g['sub_sites']
+        key = channel if channel in weights else asrv_mode
+        sub_sites = weights[key]
+    return _apply_epistasis_to_sub_sites(sub_sites=sub_sites, obs_col=obs_col, g=g)
+
+
+def _get_static_sub_sites_if_available(g, sub_sg, mode, obs_col):
+    asrv_mode = str(g.get('asrv', 'no')).strip().lower()
+    if asrv_mode in ['each', 'file_each']:
+        return None
+    return _resolve_sub_sites(g=g, sub_sg=sub_sg, mode=mode, sg=0, a=0, d=0, obs_col=obs_col)
+
+
+def _calc_cb_site_overlap(cb_ids, sub_sites, float_type):
+    cb_ids = np.asarray(cb_ids, dtype=np.int64)
+    sub_sites = np.asarray(sub_sites, dtype=float_type)
+    if cb_ids.ndim != 2:
+        raise ValueError('cb_ids should be a 2D array.')
+    if sub_sites.ndim != 2:
+        raise ValueError('sub_sites should be a 2D array.')
+    if cb_ids.shape[0] == 0:
+        return np.zeros(shape=(0,), dtype=float_type)
+    if (cb_ids < 0).any():
+        raise ValueError('cb_ids should be non-negative.')
+    if sub_sites.shape[0] <= cb_ids.max():
+        raise ValueError('cb_ids contain out-of-range branch IDs.')
+    arity = cb_ids.shape[1]
+    if arity <= 0:
+        raise ValueError('cb_ids should have at least one column.')
+    # Each multiplication holds the working overlap and one gathered profile.
+    # Bound both arrays by chunking combination rows, keeping each site's
+    # multiplication order and each row's reduction order.
+    bytes_per_row = max(1, 2 * sub_sites.shape[1] * sub_sites.itemsize)
+    rows_per_block = max(1, _URN_OVERLAP_WORK_BYTES // bytes_per_row)
+    out = np.empty(cb_ids.shape[0], dtype=float_type)
+    for start in range(0, len(cb_ids), rows_per_block):
+        stop = min(start + rows_per_block, len(cb_ids))
+        ids = cb_ids[start:stop]
+        overlap = sub_sites[ids[:, 0]]
+        for col in range(1, arity):
+            overlap *= sub_sites[ids[:, col]]
+        out[start:stop] = overlap.sum(axis=1, dtype=float_type)
+    return out
+
+
+def _calc_cb_branch_factor(cb_ids, sub_branches, float_type):
+    cb_ids = np.asarray(cb_ids, dtype=np.int64)
+    sub_branches = np.asarray(sub_branches, dtype=float_type)
+    if cb_ids.ndim != 2:
+        raise ValueError('cb_ids should be a 2D array.')
+    if sub_branches.ndim != 1:
+        raise ValueError('sub_branches should be a 1D array.')
+    if cb_ids.shape[0] == 0:
+        return np.zeros(shape=(0,), dtype=float_type)
+    if (cb_ids < 0).any():
+        raise ValueError('cb_ids should be non-negative.')
+    if sub_branches.shape[0] <= cb_ids.max():
+        raise ValueError('cb_ids contain out-of-range branch IDs.')
+    if cb_ids.shape[1] <= 0:
+        raise ValueError('cb_ids should have at least one column.')
+    branch_factor = np.ones(shape=(cb_ids.shape[0],), dtype=float_type)
+    for col in range(cb_ids.shape[1]):
+        branch_factor *= sub_branches[cb_ids[:, col]]
+    return branch_factor
+
+
+def _calc_tmp_E_sum(cb_ids, sub_sites, sub_branches, float_type, cb_site_overlap=None):
+    if cb_site_overlap is not None:
+        cb_site_overlap = np.asarray(cb_site_overlap, dtype=float_type).reshape(-1)
+        if cb_site_overlap.shape[0] != cb_ids.shape[0]:
+            txt = 'cb_site_overlap length ({}) did not match number of cb rows ({}).'
+            raise ValueError(txt.format(cb_site_overlap.shape[0], cb_ids.shape[0]))
+        return cb_site_overlap * _calc_cb_branch_factor(
+            cb_ids=cb_ids,
+            sub_branches=sub_branches,
+            float_type=float_type,
+        )
+    if _can_use_cython_tmp_E_sum(cb_ids=cb_ids, sub_sites=sub_sites, sub_branches=sub_branches):
+        try:
+            return omega_cy.calc_tmp_E_sum_double(
+                cb_ids=cb_ids,
+                sub_sites=sub_sites,
+                sub_branches=sub_branches,
+            )
+        except Exception as exc:
+            _warn_cython_fallback('expected_overlap', exc)
+    if (cb_ids.shape[1] == 1):
+        bids = cb_ids[:, 0]
+        site_overlap = sub_sites[bids, :].sum(axis=1)
+        return site_overlap * sub_branches[bids]
+    if (cb_ids.shape[1] == 2):
+        bid1 = cb_ids[:, 0]
+        bid2 = cb_ids[:, 1]
+        site_overlap = (sub_sites[bid1, :] * sub_sites[bid2, :]).sum(axis=1)
+        return site_overlap * sub_branches[bid1] * sub_branches[bid2]
+    tmp_E = np.ones(shape=(cb_ids.shape[0], sub_sites.shape[1]), dtype=float_type)
+    branch_factor = np.ones(shape=(cb_ids.shape[0],), dtype=float_type)
+    for col in range(cb_ids.shape[1]):
+        bids = cb_ids[:, col]
+        tmp_E *= sub_sites[bids, :]
+        branch_factor *= sub_branches[bids]
+    return tmp_E.sum(axis=1) * branch_factor
+
+
+def _weighted_sample_without_replacement_masks(
+    p, size, niter, rng=None, sampling_model='wallenius'
+):
+    if rng is None:
+        rng = np.random.default_rng()
+    p = np.asarray(p, dtype=np.float64)
+    if p.ndim != 1:
+        raise ValueError('p should be a 1D array.')
+    if size < 0:
+        raise ValueError('size should be >= 0.')
+    positive_sites = np.flatnonzero(p > 0)
+    num_positive_sites = positive_sites.shape[0]
+    masks = np.zeros(shape=(niter, p.shape[0]), dtype=bool)
+    if (size == 0) or (num_positive_sites == 0):
+        return masks
+    if size > num_positive_sites:
+        txt = 'Sample size ({}) exceeded number of positive-probability sites ({}) in hypergeometric sampling.'
+        raise ValueError(txt.format(size, num_positive_sites))
+    if size == num_positive_sites:
+        masks[:, positive_sites] = True
+        return masks
+    if str(sampling_model).strip().lower() == 'fisher':
+        packed = _weighted_sample_without_replacement_packed(
+            p=p,
+            size=size,
+            niter=niter,
+            rng=rng,
+            sampling_model='fisher',
+        )
+        return np.unpackbits(packed, axis=1)[:, :p.shape[0]].astype(bool, copy=False)
+    for start, sites in urn_expectation.wallenius_sample_blocks(
+        positive_sites, p[positive_sites], size, niter, rng,
+    ):
+        rows = np.arange(start, start + len(sites))[:, None]
+        masks[rows, sites] = True
+    return masks
+
+
+def _resolve_omega_pvalue_rounding_mode(g):
+    mode = 'stochastic'
+    if g is not None:
+        mode = str(g.get('omega_pvalue_rounding', 'stochastic')).strip().lower()
+    allowed = {'round', 'stochastic', 'floor', 'ceil'}
+    if mode not in allowed:
+        raise ValueError('omega_pvalue_rounding should be one of round, stochastic, floor, ceil.')
+    return mode
+
+
+def _resolve_expectation_method(g):
+    token = 'codon_model'
+    if g is not None:
+        token = g.get('expectation_method', 'codon_model')
+    normalized = str(token).strip().lower()
+    if normalized in ['codon_model', '']:
+        return 'codon_model'
+    if normalized == 'urn':
+        return 'urn'
+    raise ValueError('Unsupported expectation_method: {}'.format(token))
+
+
+def _resolve_urn_model(g):
+    token = 'wallenius'
+    if g is not None:
+        token = g.get('urn_model', 'wallenius')
+    normalized = str(token).strip().lower()
+    if normalized in ['wallenius', 'fisher']:
+        return normalized
+    if normalized in ['factorized_approx', 'factorized', 'legacy_factorized', 'approx']:
+        return 'factorized_approx'
+    raise ValueError('urn_model should be one of wallenius, fisher, factorized_approx.')
+
+
+def _prepare_permutation_branch_sizes(sub_branches, niter, g, rng=None):
+    sub_branches = np.asarray(sub_branches)
+    if sub_branches.ndim != 1:
+        raise ValueError('sub_branches should be a 1D array.')
+    if np.issubdtype(sub_branches.dtype, np.integer):
+        out = sub_branches.astype(np.int64, copy=False)
+        if (out < 0).any():
+            raise ValueError('sub_branches should be non-negative.')
+        return out
+    sub_branches = sub_branches.astype(np.float64, copy=False)
+    if not np.isfinite(sub_branches).all():
+        raise ValueError('sub_branches should be finite.')
+    sub_branches = np.clip(sub_branches, a_min=0.0, a_max=None)
+    rounding_mode = _resolve_omega_pvalue_rounding_mode(g=g)
+    if rounding_mode == 'stochastic':
+        if rng is None:
+            rng = np.random.default_rng()
+        niter = int(niter)
+        if niter <= 0:
+            raise ValueError('niter should be a positive integer.')
+        base = np.floor(sub_branches).astype(np.int64, copy=False)
+        frac = sub_branches - base
+        if (frac > 0).any():
+            rand = rng.random((sub_branches.shape[0], niter))
+            inc = (rand < frac[:, None]).astype(np.int64, copy=False)
+            return base[:, None] + inc
+        return np.repeat(base[:, None], repeats=niter, axis=1)
+    if rounding_mode == 'round':
+        out = np.rint(sub_branches)
+    elif rounding_mode == 'floor':
+        out = np.floor(sub_branches)
+    elif rounding_mode == 'ceil':
+        out = np.ceil(sub_branches)
+    else:
+        raise ValueError('Unsupported omega_pvalue_rounding: {}'.format(rounding_mode))
+    out = out.astype(np.int64, copy=False)
+    if (out < 0).any():
+        raise ValueError('sub_branches should be non-negative after rounding.')
+    return out
+
+
+def _calc_wallenius_inclusion_probabilities(site_weights, draw_size, float_type=np.float64, policy="auto"):
+    probabilities, _ = _wallenius_inclusion_details(site_weights, draw_size, policy)
+    return probabilities.astype(float_type, copy=False)
+
+
+def _wallenius_inclusion_details(site_weights, draw_size, policy):
+    site_weights = np.asarray(site_weights, dtype=np.float64).reshape(-1)
+    if site_weights.ndim != 1:
+        raise ValueError('site_weights should be a 1D array.')
+    if not np.isfinite(site_weights).all() or (site_weights < 0).any():
+        raise ValueError('Site weights should be finite and non-negative.')
+    if policy not in ('auto', 'exact', 'quadrature'):
+        raise ValueError('Wallenius expectation policy must be auto, exact, or quadrature.')
+    draw_size = int(draw_size)
+    if draw_size < 0:
+        raise ValueError('draw_size should be >= 0.')
+    out = np.zeros(shape=site_weights.shape, dtype=np.float64)
+    positive_mask = (site_weights > 0)
+    positive_weights = site_weights[positive_mask]
+    num_positive = int(positive_weights.shape[0])
+    if (draw_size == 0) or (num_positive == 0):
+        return out, 'exact_boundary'
+    if draw_size >= num_positive:
+        out[positive_mask] = 1.0
+        return out, 'exact_boundary'
+    if draw_size == 1:
+        scaled = positive_weights / positive_weights.max()
+        out[positive_mask] = scaled / scaled.sum(dtype=np.float64)
+        method = 'exact_uniform' if np.all(positive_weights == positive_weights[0]) else 'exact_small_draw'
+        return out, method
+    method = urn_expectation.wallenius_method(positive_weights, draw_size)
+    if method == 'exact_uniform':
+        out[positive_mask] = draw_size / num_positive
+        return out, method
+    if draw_size == 2:
+        out[positive_mask] = urn_expectation.two_draw_inclusion(positive_weights)
+        return out, method
+    if method == 'approximate_mean' and policy == 'exact':
+        raise ValueError('Exact Wallenius expectation exceeds the enumeration budget; '
+                         'auto permits an approximate mean (see urn provenance).')
+    if method == 'exact_two_weight_groups':
+        out[positive_mask] = urn_expectation.two_group_wallenius_inclusion(positive_weights, draw_size)
+    elif method == 'exact_multiple_weight_groups':
+        out[positive_mask] = urn_expectation.grouped_wallenius_inclusion(positive_weights, draw_size)
+    elif method == 'exact_enumeration':
+        out[positive_mask] = urn_expectation.enumerated_wallenius_inclusion(positive_weights, draw_size)
+    elif policy == 'quadrature':
+        out[positive_mask] = urn_expectation.wallenius_quadrature_inclusion(positive_weights, draw_size)
+        method = 'quadrature'
+    else:
+        out[positive_mask] = urn_expectation.wallenius_mean_inclusion(positive_weights, draw_size)
+    return out, method
+
+
+def _calc_fisher_inclusion_probabilities(site_weights, draw_size, float_type=np.float64):
+    site_weights = np.asarray(site_weights, dtype=np.float64).reshape(-1)
+    if site_weights.ndim != 1:
+        raise ValueError('site_weights should be a 1D array.')
+    if (site_weights < 0).any():
+        raise ValueError('site_weights should be non-negative.')
+    draw_size = int(draw_size)
+    if draw_size < 0:
+        raise ValueError('draw_size should be >= 0.')
+    out = np.zeros(shape=site_weights.shape, dtype=np.float64)
+    positive_mask = (site_weights > 0)
+    positive_weights = site_weights[positive_mask]
+    num_positive = int(positive_weights.shape[0])
+    if (draw_size == 0) or (num_positive == 0):
+        return out.astype(float_type, copy=False)
+    if draw_size >= num_positive:
+        out[positive_mask] = 1.0
+        return out.astype(float_type, copy=False)
+    if np.all(positive_weights == positive_weights[0]):
+        out[positive_mask] = draw_size / num_positive
+        return out.astype(float_type, copy=False)
+    if draw_size == 1:
+        scaled = positive_weights / positive_weights.max()
+        out[positive_mask] = scaled / scaled.sum()
+        return out.astype(float_type, copy=False)
+    log_weights = urn_expectation.normalized_log_weights(positive_weights)
+    complement = draw_size > num_positive - draw_size
+    size = draw_size
+    if complement:
+        # The omitted subset has Fisher weights proportional to 1/w. Use its
+        # partition function with the site absent to avoid subtracting from 1.
+        size = num_positive - draw_size
+        log_weights = log_weights.min() - log_weights
+    prefix_tail = np.full(size + 1, -np.inf)
+    prefix_tail[0] = 0.
+    inclusion = np.full(num_positive, -np.inf, dtype=np.float64)
+    other_picks = size if complement else size - 1
+    for start, suffix in urn_expectation.fisher_suffix_blocks(log_weights, size):
+        stop = start + len(suffix) - 1
+        prefix = urn_expectation.fisher_suffix(log_weights[start:stop][::-1], size,
+                                               terminal=prefix_tail, following=start)[::-1]
+        prefix_tail = prefix[-1].copy()
+        selected = inclusion[start:stop]
+        if stop - start < num_positive:
+            # The workspace fits in one block. Reduce consecutive left-pick
+            # terms for each site before moving to the next block.
+            terms = prefix[:-1, :other_picks + 1] + suffix[1:, other_picks::-1]
+            np.logaddexp.reduce(terms, axis=1, out=selected)
+        else:
+            workspace = np.empty(num_positive, dtype=np.float64)
+            for left_pick in range(other_picks + 1):
+                right_pick = other_picks - left_pick
+                np.add(prefix[:-1, left_pick], suffix[1:, right_pick], out=workspace)
+                np.logaddexp(selected, workspace, out=selected)
+    log_denominator = prefix_tail[size]
+    if not np.isfinite(log_denominator):
+        raise ValueError('Unable to normalize Fisher weighted-urn probabilities.')
+    if not complement:
+        np.add(log_weights, inclusion, out=inclusion)
+    np.subtract(inclusion, log_denominator, out=inclusion)
+    np.exp(inclusion, out=inclusion)
+    out[positive_mask] = np.clip(inclusion, a_min=0.0, a_max=1.0)
+    return out.astype(float_type, copy=False)
+
+
+def _normalize_sub_sites_for_urn_overlap(sub_sites, num_branch):
+    sub_sites = np.asarray(sub_sites, dtype=np.float64)
+    if sub_sites.ndim == 1:
+        sub_sites = np.broadcast_to(sub_sites.reshape(1, -1), (int(num_branch), sub_sites.shape[0]))
+    elif sub_sites.ndim != 2:
+        raise ValueError('sub_sites should be a 1D or 2D array.')
+    if sub_sites.shape[0] != int(num_branch):
+        txt = 'sub_sites branch axis ({}) and sub_branches length ({}) should match.'
+        raise ValueError(txt.format(sub_sites.shape[0], int(num_branch)))
+    if (sub_sites < 0).any():
+        raise ValueError('sub_sites should be non-negative.')
+    return sub_sites
+
+
+def _urn_weight_profile_ids(sub_sites):
+    """Identify exact repeated branch weight rows without retaining row copies."""
+    if sub_sites.strides[0] == 0:
+        return np.zeros(len(sub_sites), dtype=np.int64)
+    representatives: dict[int, int] = {}
+    ids = np.arange(len(sub_sites), dtype=np.int64)
+    for branch_id, row in enumerate(sub_sites):
+        digest = hash(row.tobytes())
+        first = representatives.setdefault(digest, branch_id)
+        if first != branch_id and np.array_equal(row, sub_sites[first]):
+            ids[branch_id] = first
+    return ids
+
+
+def _calc_weighted_urn_expected_overlap(
+    cb_ids,
+    sub_sites,
+    sub_branches,
+    g,
+    float_type,
+    inclusion_probability_func,
+    profile_inclusion=None,
+):
+    cb_ids = np.asarray(cb_ids, dtype=np.int64)
+    if cb_ids.ndim != 2:
+        raise ValueError('cb_ids should be a 2D array.')
+    if cb_ids.shape[0] == 0:
+        return np.zeros(shape=(0,), dtype=float_type)
+    if (cb_ids < 0).any():
+        raise ValueError('cb_ids should be non-negative.')
+    if cb_ids.max() >= np.size(sub_branches):
+        raise ValueError('cb_ids contain out-of-range branch IDs.')
+    inclusion = _weighted_urn_inclusion_profiles(
+        sub_sites, sub_branches, g, inclusion_probability_func, profile_inclusion,
+    )
+    return _calc_cb_site_overlap(cb_ids, inclusion, float_type)
+
+
+def _weighted_urn_inclusion_profiles(sub_sites, sub_branches, g, inclusion_probability_func, profile_inclusion=None,
+                                     wallenius_zero=False):
+    sub_branches = np.asarray(sub_branches, dtype=np.float64).reshape(-1)
+    if sub_branches.ndim != 1:
+        raise ValueError('sub_branches should be a 1D array.')
+    if not np.isfinite(sub_branches).all():
+        raise ValueError('sub_branches should be finite.')
+    np.clip(sub_branches, a_min=0.0, a_max=None, out=sub_branches)
+    sub_sites = _normalize_sub_sites_for_urn_overlap(sub_sites=sub_sites, num_branch=sub_branches.shape[0])
+    profile_ids = _urn_weight_profile_ids(sub_sites)
+    reuse_profiles = np.any(profile_ids != np.arange(len(sub_sites)))
+    positive_counts = np.full(len(sub_sites), -1, dtype=np.int64)
+
+    if profile_inclusion is None:
+        def inclusion(branch_id, draw_size):
+            return inclusion_probability_func(
+                site_weights=sub_sites[branch_id], draw_size=draw_size, float_type=np.float64,
+            )
+
+        if reuse_profiles:
+            profile_bytes = max(1, sub_sites[0].nbytes)
+            inclusion = lru_cache(maxsize=max(1, min(64, (8 * 1024**2) // profile_bytes)))(inclusion)
+    else:
+        inclusion = profile_inclusion
+
+    rounding_mode = _resolve_omega_pvalue_rounding_mode(g=g)
+    if rounding_mode == 'stochastic':
+        base = np.floor(sub_branches).astype(np.int64, copy=False)
+        fraction = sub_branches - base
+    else:
+        rounded_sizes = _prepare_permutation_branch_sizes(sub_branches=sub_branches, niter=1, g=g)
+        base = np.asarray(rounded_sizes, dtype=np.int64).reshape(-1)
+        fraction = None
+    inclusion_prob = np.zeros(shape=sub_sites.shape, dtype=np.float64)
+    for branch_id in range(sub_sites.shape[0]):
+        profile_id = int(profile_ids[branch_id])
+        num_positive = int(positive_counts[profile_id])
+        if num_positive < 0:
+            num_positive = np.count_nonzero(sub_sites[profile_id] > 0)
+            positive_counts[profile_id] = num_positive
+        if num_positive == 0:
+            continue
+        size = int(base[branch_id])
+        size_lo = min(max(size, 0), num_positive)
+        if size_lo == 0 and wallenius_zero:
+            # The output buffer is already zero. Fractional counts below one
+            # only need the one-draw probabilities and their rounding weight.
+            g.setdefault('_urn_expectation_methods', {})['exact_boundary'] = True
+            if fraction is not None and fraction[branch_id] > 0.:
+                inclusion_prob[branch_id] = fraction[branch_id] * inclusion(profile_id, 1)
+            continue
+        prob = inclusion(profile_id, size_lo)
+        if fraction is not None and fraction[branch_id] > 0:
+            size_hi = min(max(size + 1, 0), num_positive)
+            if size_hi != size_lo:
+                frac = float(fraction[branch_id])
+                prob = (1.0 - frac) * prob + frac * inclusion(profile_id, size_hi)
+        inclusion_prob[branch_id] = prob
+    return inclusion_prob
+
+
+def _wallenius_inclusion_for_policy(site_weights, draw_size, g):
+    policy = g.get('urn_wallenius_expectation', 'auto')
+    result, method = _wallenius_inclusion_details(site_weights, draw_size, policy)
+    g.setdefault('_urn_expectation_methods', {})[method] = True
+    return result
+
+
+def _calc_wallenius_expected_overlap(cb_ids, sub_sites, sub_branches, g, float_type, profile_inclusion=None):
+    def inclusion(site_weights, draw_size, float_type):
+        return _wallenius_inclusion_for_policy(site_weights, draw_size, g)
+
+    return _calc_weighted_urn_expected_overlap(
+        cb_ids=cb_ids,
+        sub_sites=sub_sites,
+        sub_branches=sub_branches,
+        g=g,
+        float_type=float_type,
+        inclusion_probability_func=inclusion,
+        profile_inclusion=profile_inclusion,
+    )
+
+
+def wallenius_inclusion_profiles(sub_sites, draw_totals, g):
+    def inclusion(site_weights, draw_size, float_type):
+        return _wallenius_inclusion_for_policy(site_weights, draw_size, g)
+
+    draw_totals = np.asarray(draw_totals, dtype=np.float64).reshape(-1)
+    small = draw_totals <= 1.
+    if np.count_nonzero(small) < 8 or _resolve_omega_pvalue_rounding_mode(g) != 'stochastic':
+        return _weighted_urn_inclusion_profiles(sub_sites, draw_totals, g, inclusion, wallenius_zero=True)
+    if not np.isfinite(draw_totals).all():
+        raise ValueError('sub_branches should be finite.')
+    site_weights = _normalize_sub_sites_for_urn_overlap(sub_sites, num_branch=len(draw_totals))
+    weights = site_weights[small]
+    if (not np.isfinite(weights).all()
+            or g.get('urn_wallenius_expectation', 'auto') not in ('auto', 'exact', 'quadrature')):
+        return _weighted_urn_inclusion_profiles(site_weights, draw_totals, g, inclusion, wallenius_zero=True)
+    # Fractional draw sizes up to one are a mixture of the empty subset and
+    # a single weighted draw. Normalize those rows as a block.
+    probabilities = np.empty(site_weights.shape, dtype=np.float64)
+    probabilities[small] = _wallenius_single_draw_rows(weights, draw_totals[small], g)
+    if not small.all():
+        probabilities[~small] = _weighted_urn_inclusion_profiles(
+            site_weights[~small], draw_totals[~small], g, inclusion, wallenius_zero=True,
+        )
+    return probabilities
+
+
+def _wallenius_single_draw_rows(weights, totals, g):
+    """Normalize an owned array of rows with at most one expected draw."""
+    positive = weights > 0.
+    support = np.count_nonzero(positive, axis=1)
+    if not support.any():
+        weights.fill(0.)
+        return weights
+    largest = weights.max(axis=1)
+    smallest = weights.min(axis=1, where=positive, initial=np.inf)
+    methods = g.setdefault('_urn_expectation_methods', {})
+    if ((support > 0) & ((totals < 1.) | (support == 1))).any():
+        methods['exact_boundary'] = True
+    single = (totals > 0.) & (support > 1)
+    if (single & (smallest == largest)).any():
+        methods['exact_uniform'] = True
+    if (single & (smallest != largest)).any():
+        methods['exact_small_draw'] = True
+    np.divide(weights, largest[:, None], where=largest[:, None] > 0., out=weights)
+    mass = weights.sum(axis=1, keepdims=True)
+    np.divide(weights, mass, where=mass > 0., out=weights)
+    weights *= np.maximum(totals, 0.)[:, None]
+    return weights
+
+
+def _calc_fisher_expected_overlap(cb_ids, sub_sites, sub_branches, g, float_type):
+    return _calc_weighted_urn_expected_overlap(
+        cb_ids=cb_ids,
+        sub_sites=sub_sites,
+        sub_branches=sub_branches,
+        g=g,
+        float_type=float_type,
+        inclusion_probability_func=_calc_fisher_inclusion_probabilities,
+    )
+
+
+def _calc_urn_expected_overlap(cb_ids, sub_sites, sub_branches, g, float_type):
+    urn_model = _resolve_urn_model(g=g)
+    if urn_model == 'wallenius':
+        return _calc_wallenius_expected_overlap(
+            cb_ids=cb_ids,
+            sub_sites=sub_sites,
+            sub_branches=sub_branches,
+            g=g,
+            float_type=float_type,
+        )
+    if urn_model == 'fisher':
+        return _calc_fisher_expected_overlap(
+            cb_ids=cb_ids,
+            sub_sites=sub_sites,
+            sub_branches=sub_branches,
+            g=g,
+            float_type=float_type,
+        )
+    if urn_model == 'factorized_approx':
+        sub_branches = np.asarray(sub_branches, dtype=np.float64).reshape(-1)
+        if sub_branches.ndim != 1:
+            raise ValueError('sub_branches should be a 1D array.')
+        if not np.isfinite(sub_branches).all():
+            raise ValueError('sub_branches should be finite.')
+        np.clip(sub_branches, a_min=0.0, a_max=None, out=sub_branches)
+        sub_sites = _normalize_sub_sites_for_urn_overlap(sub_sites=sub_sites, num_branch=sub_branches.shape[0])
+        return _calc_tmp_E_sum(
+            cb_ids=cb_ids,
+            sub_sites=sub_sites,
+            sub_branches=sub_branches,
+            float_type=float_type,
+        )
+    raise ValueError('Unsupported urn_model: {}'.format(urn_model))
+
+
+def _fill_packed_masks_for_sizes(
+    packed_masks_branch, site_p, size_values, rng=None, sampling_model='wallenius'
+):
+    if rng is None:
+        rng = np.random.default_rng()
+    size_values = np.asarray(size_values, dtype=np.int64).reshape(-1)
+    if packed_masks_branch.shape[0] != size_values.shape[0]:
+        txt = 'packed_masks_branch iterations ({}) and size_values ({}) should match.'
+        raise ValueError(txt.format(packed_masks_branch.shape[0], size_values.shape[0]))
+    if (size_values < 0).any():
+        raise ValueError('size_values should be non-negative.')
+    site_p = np.asarray(site_p, dtype=np.float64).reshape(-1)
+    num_positive_sites = int((site_p > 0).sum())
+    if num_positive_sites == 0:
+        return None
+    positive_sizes = np.unique(size_values[size_values > 0])
+    for size in positive_sizes:
+        capped_size = int(size)
+        if capped_size > num_positive_sites:
+            capped_size = num_positive_sites
+        if capped_size <= 0:
+            continue
+        iter_indices = np.where(size_values == size)[0]
+        if iter_indices.shape[0] == 0:
+            continue
+        packed_masks_branch[iter_indices, :] = _weighted_sample_without_replacement_packed(
+            p=site_p,
+            size=capped_size,
+            niter=iter_indices.shape[0],
+            rng=rng,
+            sampling_model=sampling_model,
+        )
+    return None
+
+
+def _get_permutations_fast(
+    cb_ids, sub_branches, p, niter, rng=None, sampling_model='wallenius'
+):
+    if rng is None:
+        rng = np.random.default_rng()
+    niter = int(niter)
+    if niter < 0:
+        raise ValueError('niter should be >= 0.')
+    cb_ids = np.asarray(cb_ids, dtype=np.int64)
+    if cb_ids.ndim != 2:
+        raise ValueError('cb_ids should be a 2D array.')
+    if cb_ids.shape[0] == 0:
+        return np.zeros((0, niter), dtype=np.int32)
+    if (cb_ids < 0).any():
+        raise ValueError('cb_ids should be non-negative.')
+    sub_branches = np.asarray(sub_branches)
+    if sub_branches.ndim not in [1, 2]:
+        raise ValueError('sub_branches should be a 1D or 2D array.')
+    is_per_iteration_sizes = (sub_branches.ndim == 2)
+    if is_per_iteration_sizes:
+        if sub_branches.shape[1] != niter:
+            txt = 'When sub_branches is 2D, its number of columns ({}) should match niter ({}).'
+            raise ValueError(txt.format(sub_branches.shape[1], niter))
+        sub_branches = np.asarray(sub_branches, dtype=np.int64)
+    else:
+        sub_branches = np.asarray(sub_branches, dtype=np.int64)
+    if sub_branches.shape[0] <= cb_ids.max():
+        raise ValueError('cb_ids contain out-of-range branch IDs.')
+    if (sub_branches < 0).any():
+        raise ValueError('sub_branches should be non-negative.')
+    p = np.asarray(p, dtype=np.float64)
+    shared_positive_count = None
+    if p.ndim == 1:
+        shared_positive_count = int(np.count_nonzero(p > 0))
+        site_profiles = np.broadcast_to(p, (sub_branches.shape[0], p.size))
+    elif p.ndim == 2:
+        if p.shape[0] != sub_branches.shape[0]:
+            txt = 'When p is 2D, its number of rows ({}) should match sub_branches length ({}).'
+            raise ValueError(txt.format(p.shape[0], sub_branches.shape[0]))
+        site_profiles = p
+    else:
+        raise ValueError('p should be a 1D or 2D array.')
+    if shared_positive_count == 0:
+        return np.zeros((cb_ids.shape[0], niter), dtype=np.int32)
+    num_packed_site = (site_profiles.shape[1] + 7) // 8
+    if is_per_iteration_sizes:
+        active_branch_ids, inverse_branch_ids = np.unique(cb_ids, return_inverse=True)
+        remapped_cb_ids = inverse_branch_ids.reshape(cb_ids.shape)
+        packed_masks = np.zeros((len(active_branch_ids), niter, num_packed_site), dtype=np.uint8)
+        for index, branch_id in enumerate(active_branch_ids):
+            size_values = sub_branches[branch_id]
+            if size_values.any():
+                _fill_packed_masks_for_sizes(
+                    packed_masks_branch=packed_masks[index],
+                    site_p=site_profiles[branch_id],
+                    size_values=size_values,
+                    rng=rng,
+                    sampling_model=sampling_model,
+                )
+        return _calc_shared_counts_from_packed_masks(
+            packed_masks=packed_masks,
+            remapped_cb_ids=remapped_cb_ids,
+        )
+    cb_branch_sizes = sub_branches[cb_ids]
+    is_active_row = (cb_branch_sizes > 0).all(axis=1)
+    if not is_active_row.any():
+        return np.zeros((cb_ids.shape[0], niter), dtype=np.int32)
+    active_row_indices = np.where(is_active_row)[0]
+    active_cb_ids = cb_ids[active_row_indices, :]
+    active_branch_ids, inverse_branch_ids = np.unique(active_cb_ids, return_inverse=True)
+    remapped_active_cb_ids = inverse_branch_ids.reshape(active_cb_ids.shape)
+    packed_masks = np.zeros((len(active_branch_ids), niter, num_packed_site), dtype=np.uint8)
+    for index, branch_id in enumerate(active_branch_ids):
+        site_p = site_profiles[branch_id]
+        num_positive = (shared_positive_count if shared_positive_count is not None
+                        else int(np.count_nonzero(site_p > 0)))
+        # Keep one independent sample per branch within a replicate, even
+        # when weights and draw size match across branches. Shuffling a
+        # shared sample would sometimes pair a draw with itself.
+        size = min(int(sub_branches[branch_id]), num_positive)
+        if size:
+            packed_masks[index] = _weighted_sample_without_replacement_packed(
+                p=site_p, size=size, niter=niter, rng=rng, sampling_model=sampling_model,
+            )
+
+    active_out = _calc_shared_counts_from_packed_masks(
+        packed_masks=packed_masks,
+        remapped_cb_ids=remapped_active_cb_ids,
+    )
+    out = np.zeros((cb_ids.shape[0], niter), dtype=np.int32)
+    out[active_row_indices, :] = active_out
+    return out
+
+
+def _resolve_hypergeom_parallel_plan(cb_rows, num_categories, niter, requested_n_jobs, requested_chunk_factor):
+    n_jobs = int(requested_n_jobs)
+    chunk_factor = int(requested_chunk_factor)
+    if n_jobs <= 1:
+        return 1, max(chunk_factor, 1)
+    # For small branch-set workloads, thread startup and local-buffer reduction dominate.
+    # Fall back to single-thread execution to avoid regressions under --threads > 1.
+    workload = int(cb_rows) * int(num_categories) * int(niter)
+    if (cb_rows <= 4) or (workload < 20_000_000):
+        return 1, max(chunk_factor, 1)
+    return n_jobs, max(chunk_factor, 4)
+
+
+def _calc_hypergeom_count_matrix(
+    mode,
+    cb_ids,
+    sub_sg,
+    sub_bg,
+    niter,
+    obs_col,
+    num_gad_combinat,
+    list_igad,
+    g,
+    static_sub_sites,
+):
+    cb_ids = np.asarray(cb_ids, dtype=np.int64)
+    niter = int(niter)
+    if cb_ids.ndim != 2:
+        raise ValueError('cb_ids should be a 2D array.')
+    if niter <= 0:
+        raise ValueError('niter should be a positive integer.')
+    if cb_ids.shape[0] == 0:
+        return np.zeros(shape=(0, niter), dtype=np.int32)
+    operation_seed = g.get('_omega_operation_seed', None)
+    if operation_seed is None:
+        operation_seed = randomness.next_seed(g, 'omega_hypergeom_direct', str(obs_col), int(niter))
+    local_g = dict(g)
+    local_g['_omega_operation_seed'] = int(operation_seed)
+    requested_n_jobs = parallel.resolve_n_jobs(num_items=len(list_igad), threads=g['threads'])
+    chunk_factor = parallel.resolve_chunk_factor(task='general')
+    n_jobs, chunk_factor = _resolve_hypergeom_parallel_plan(
+        cb_rows=cb_ids.shape[0],
+        num_categories=len(list_igad),
+        niter=niter,
+        requested_n_jobs=requested_n_jobs,
+        requested_chunk_factor=chunk_factor,
+    )
+    igad_chunks,mmap_start_not_necessary_here = parallel.get_chunks(list_igad, n_jobs, chunk_factor=chunk_factor)
+    axis = (cb_ids.shape[0], niter)
+    dfq = np.zeros(shape=axis, dtype=np.int32)
+    if n_jobs == 1:
+        joblib_calc_hypergeom(
+            mode,
+            cb_ids,
+            sub_sg,
+            sub_bg,
+            dfq,
+            niter,
+            obs_col,
+            num_gad_combinat,
+            list_igad,
+            local_g,
+            static_sub_sites=static_sub_sites,
+        )
+        return dfq
+    tasks = [
+        (
+            mode,
+            cb_ids,
+            sub_sg,
+            sub_bg,
+            niter,
+            obs_col,
+            num_gad_combinat,
+            igad_chunk,
+            local_g,
+            static_sub_sites,
+        )
+        for igad_chunk in igad_chunks
+    ]
+    chunk_dfs = parallel.run_starmap(
+        func=_calc_hypergeom_chunk_local,
+        args_iterable=tasks,
+        n_jobs=n_jobs,
+        backend='threading',
+    )
+    for dfq_chunk in chunk_dfs:
+        dfq += dfq_chunk
+    return dfq
+
+
+def _collect_expected_state_branch_jobs(tree, mode, num_node, float_tol, state_has_mass=None, branch_lengths=None):
+    jobs = list()
+    if mode == 'cdn':
+        dist_prop = 'SNdist'
+    elif mode in ['pep', 'nsy']:
+        dist_prop = 'Ndist'
+    else:
+        raise ValueError('Unsupported expected-state mode: {}'.format(mode))
+    def get_length(node):
+        if branch_lengths is not None:
+            return float(branch_lengths[int(ete.get_prop(node, "numerical_label"))])
+        return max(float(ete.get_prop(node, dist_prop, 0)), 0.0)
+
+    for node in tree.traverse():
+        if ete.is_root(node):
+            continue
+        nl = int(ete.get_prop(node, "numerical_label"))
+        if (not ete.is_leaf(node)) and (not ete.node_has_state(node, state_has_mass=state_has_mass)):
+            continue
+        branch_length = get_length(node)
+        parent_node = node.up
+        while (parent_node is not None) and (not ete.node_has_state(parent_node, state_has_mass=state_has_mass)):
+            branch_length += get_length(parent_node)
+            parent_node = parent_node.up
+        if (parent_node is None) or (branch_length < float_tol):
+            continue
+        parent_nl = int(ete.get_prop(parent_node, "numerical_label"))
+        if (parent_nl < 0) or (parent_nl >= num_node):
+            continue
+        if (nl < 0) or (nl >= num_node):
+            continue
+        jobs.append((nl, parent_nl, branch_length))
+    return jobs
+
+
+def _resolve_expected_state_n_jobs(num_branch_jobs, num_site, num_state, g):
+    threads = int(g.get('threads', 1))
+    if (threads <= 1) or (num_branch_jobs <= 1):
+        return 1, 0
+    estimated_work = int(num_branch_jobs) * int(num_site) * int(num_state) * int(num_state)
+    n_jobs = parallel.resolve_task_n_jobs(
+        num_items=estimated_work,
+        threads=threads,
+        task='expected_state',
+    )
+    max_jobs_by_branch = parallel.resolve_n_jobs(num_items=num_branch_jobs, threads=threads)
+    return min(n_jobs, max_jobs_by_branch), estimated_work
+
+
+def _project_expected_state_chunk(
+    branch_jobs,
+    state,
+    stateE,
+    unique_site_rates,
+    rate_site_indices,
+    inst,
+    float_tol,
+):
+    if len(branch_jobs) == 0:
+        return None
+    # Each codon transition matrix is about 30 KiB.  Keeping every
+    # (branch_length, site_rate) pair until the whole chunk completes can grow
+    # to gigabytes on empirical-rate inputs.  Retain only the most recently
+    # used branch length: consecutive equal-length branches still reuse the
+    # matrices, while memory stays bounded by one branch's rate categories.
+    transition_prob_cache = dict()
+    cached_branch_length = None
+    for nl, parent_nl, branch_length in branch_jobs:
+        if (cached_branch_length is None) or (branch_length != cached_branch_length):
+            transition_prob_cache.clear()
+            cached_branch_length = branch_length
+        inst_bl = inst * branch_length
+        for site_rate, site_indices in zip(unique_site_rates, rate_site_indices):
+            if site_indices.shape[0] == 0:
+                continue
+            cache_key = (branch_length, float(site_rate))
+            transition_prob = transition_prob_cache.get(cache_key, None)
+            if transition_prob is None:
+                inst_bl_site = inst_bl * site_rate
+                # Confirmed this implementation (with expm) correctly replicated the example in this instruction (Huelsenbeck, 2012)
+                # https://molevolworkshop.github.io/faculty/huelsenbeck/pdf/WoodsHoleHandout.pdf
+                transition_prob = expm(inst_bl_site)
+                transition_prob_cache[cache_key] = transition_prob
+            parent_state_block = state[parent_nl, site_indices, :]
+            stateE[nl, site_indices, :] = _project_expected_state_block(
+                parent_state_block=parent_state_block,
+                transition_prob=transition_prob,
+                float_tol=float_tol,
+            )
+    return None
+
+
+def _run_expected_state_workers(worker_func, branch_jobs, worker_common_args, n_jobs, g):
+    if n_jobs == 1:
+        worker_func(branch_jobs, *worker_common_args)
+        return None
+    chunk_factor = parallel.resolve_chunk_factor(task='general')
+    branch_chunks, _ = parallel.get_chunks(input_data=branch_jobs, threads=n_jobs, chunk_factor=chunk_factor)
+    tasks = [(chunk,) + worker_common_args for chunk in branch_chunks]
+    parallel.run_starmap(
+        func=worker_func,
+        args_iterable=tasks,
+        n_jobs=n_jobs,
+        backend='threading',
+    )
+    return None
+
+
+def _project_expected_state_chunk_eigen(
+    branch_jobs,
+    state,
+    stateE,
+    site_rates,
+    projector,
+    float_tol,
+):
+    if len(branch_jobs) == 0:
+        return None
+    site_rates = np.asarray(site_rates, dtype=np.float64).reshape(-1)
+    cached_parent_nl = None
+    parent_eigen_state = None
+    for nl, parent_nl, branch_length in branch_jobs:
+        if cached_parent_nl != parent_nl:
+            parent_state = np.asarray(state[parent_nl, :, :], dtype=np.float64)
+            parent_eigen_state = _transform_parent_state_to_eigen(parent_state, projector)
+            cached_parent_nl = parent_nl
+        expected_state = _project_parent_eigen_state(
+            parent_eigen_state=parent_eigen_state,
+            branch_length=branch_length,
+            site_rates=site_rates,
+            projector=projector,
+            float_tol=float_tol,
+        )
+        stateE[nl, :, :] = expected_state
+    return None
+
+
+def _transform_parent_state_to_eigen(parent_state, projector):
+    if projector['kind'] == 'reversible':
+        return (parent_state / projector['sqrt_stationary'][None, :]) @ projector['eigenvectors']
+    return parent_state @ projector['eigenvectors']
+
+
+def _project_parent_eigen_state(parent_eigen_state, branch_length, site_rates, projector, float_tol):
+    decay = np.exp(
+        (np.asarray(site_rates, dtype=np.float64) * branch_length)[:, None]
+        * projector['eigenvalues'][None, :]
+    )
+    if projector['kind'] == 'reversible':
+        expected_state = (
+            (parent_eigen_state * decay) @ projector['eigenvectors'].T
+        ) * projector['sqrt_stationary'][None, :]
+    else:
+        expected_state = (parent_eigen_state * decay) @ projector['inverse_eigenvectors']
+        max_imag = float(np.max(np.abs(expected_state.imag)))
+        if max_imag > projector['validation_tol'] * 10.0:
+            raise FloatingPointError(
+                'General eigen expected-state projection produced an imaginary probability: {}'.format(max_imag)
+            )
+        expected_state = expected_state.real
+    min_expected = float(expected_state.min(initial=0.0))
+    if min_expected < -projector['validation_tol']:
+        raise FloatingPointError(
+            'Eigen expected-state projection produced a negative probability: {}'.format(min_expected)
+        )
+    np.maximum(expected_state, 0.0, out=expected_state)
+    expected_sum = expected_state.sum(axis=1)
+    is_over = (expected_sum - 1) > float_tol
+    if is_over.any():
+        expected_state[is_over, :] /= expected_sum[is_over][:, None]
+    return expected_state
+
+
+class _ProjectedBranchStateView:
+    def __init__(self, child_id, matrix, num_branch):
+        self.child_id = int(child_id)
+        self.matrix = np.asarray(matrix)
+        self.shape = (int(num_branch), self.matrix.shape[0], self.matrix.shape[1])
+        self.dtype = self.matrix.dtype
+
+    def __getitem__(self, index):
+        child_index, site_index, state_index = index
+        if int(child_index) != self.child_id:
+            raise IndexError('Projected branch state view only contains branch {}.'.format(self.child_id))
+        return self.matrix[site_index, state_index]
+
+
+def _project_expected_sparse_chunk(
+    branch_jobs,
+    state,
+    site_rates,
+    projector,
+    float_tol,
+    sub_mode,
+    amino_acid_orders,
+    syn_indices_list,
+):
+    sparse_entries = defaultdict(dict)
+    site_rates = np.asarray(site_rates, dtype=np.float64).reshape(-1)
+    cached_parent_nl = None
+    parent_eigen_state = None
+    for nl, parent_nl, branch_length in branch_jobs:
+        if cached_parent_nl != parent_nl:
+            parent_state = np.asarray(state[parent_nl, :, :], dtype=np.float64)
+            parent_eigen_state = _transform_parent_state_to_eigen(parent_state, projector)
+            cached_parent_nl = parent_nl
+        expected_state = _project_parent_eigen_state(
+            parent_eigen_state=parent_eigen_state,
+            branch_length=branch_length,
+            site_rates=site_rates,
+            projector=projector,
+            float_tol=float_tol,
+        )
+        projected_view = _ProjectedBranchStateView(
+            child_id=nl,
+            matrix=expected_state.astype(state.dtype, copy=False),
+            num_branch=state.shape[0],
+        )
+        branch_entries = substitution._accumulate_sparse_sub_tensor_chunk(
+            branch_pairs=[(nl, parent_nl)],
+            state_tensor=projected_view,
+            state_tensor_anc=state,
+            mode=sub_mode,
+            amino_acid_orders=amino_acid_orders,
+            syn_indices_list=syn_indices_list,
+        )
+        for key, row_map in branch_entries.items():
+            sparse_entries[key].update(row_map)
+    return sparse_entries
+
+
+def _get_codon_model_nsy_rate_matrix(g):
+    if g.get('nonsyn_recode') == '3di20':
+        expectation_3di.validate_options(g)
+        expectation_3di.validate_context(g)
+        return g['3di_q']
+    return g['instantaneous_nsy_rate_matrix']
+
+
+def _expected_site_rates(g, mode, state):
+    if mode == 'nsy' and g.get('nonsyn_recode') == '3di20':
+        expectation_3di.validate_context(g, state.shape[0], state.shape[1])
+        return g['3di_rates']
+    return g['iqtree_rate_values']
+
+
+def _expected_branch_lengths(g, mode):
+    return g['3di_branch_lengths'] if mode == 'nsy' and g.get('nonsyn_recode') == '3di20' else None
+
+
+def _get_fused_expected_sparse_substitution_tensor(g, mode):
+    from csubst import endpoint_io
+    if endpoint_io.enabled(g):
+        raise ValueError('Joint endpoints use the expected sparse reducer; a projected child marginal is insufficient.')
+    if str(g.get('expected_state_backend', 'auto')).strip().lower() == 'expm':
+        return None
+    if mode == 'cdn':
+        state = g['state_cdn'].astype(g['float_type'], copy=False)
+        inst = g['instantaneous_codon_rate_matrix']
+        stationary = g.get('equilibrium_frequency', g.get('empirical_eq_freq', None))
+        sub_mode = 'syn'
+    elif mode == 'nsy':
+        inst = _get_codon_model_nsy_rate_matrix(g)
+        state = g['state_nsy'].astype(g['float_type'], copy=False)
+        stationary = None
+        sub_mode = 'asis'
+    else:
+        return None
+    projector = _build_expected_state_projector(
+        inst=inst,
+        float_tol=float(g['float_tol']),
+        stationary=stationary,
+    )
+    if projector is None:
+        return None
+    rate_values = np.asarray(_expected_site_rates(g, mode, state), dtype=g['float_type']).reshape(-1)
+    state_has_mass = (state.sum(axis=(1, 2)) >= float(g['float_tol']))
+    branch_jobs = _collect_expected_state_branch_jobs(
+        tree=g['tree'],
+        mode=mode,
+        num_node=state.shape[0],
+        float_tol=float(g['float_tol']),
+        state_has_mass=state_has_mass,
+        branch_lengths=_expected_branch_lengths(g, mode),
+    )
+    selected_branch_set = substitution._get_selected_branch_set(g)
+    if selected_branch_set is not None:
+        branch_jobs = [job for job in branch_jobs if int(job[0]) in selected_branch_set]
+    branch_jobs = sorted(branch_jobs, key=lambda job: (job[1], job[0]))
+    n_jobs, estimated_work = _resolve_expected_state_n_jobs(
+        num_branch_jobs=len(branch_jobs),
+        num_site=state.shape[1],
+        num_state=state.shape[2],
+        g=g,
+    )
+    # The eigendecomposition path already batches every site through BLAS.
+    # Outer Python threading duplicates temporary matrices and causes BLAS
+    # contention, so keep the fused builder single-worker.
+    n_jobs = 1
+    print(
+        'Expected-state sparse fusion (mode={}): backend=eigen_{}, branches={}, estimated_work={}, workers={} (threads={})'.format(
+            mode,
+            projector['kind'],
+            len(branch_jobs),
+            estimated_work,
+            n_jobs,
+            int(g.get('threads', 1)),
+        ),
+        flush=True,
+    )
+    if sub_mode == 'asis':
+        num_syngroup = 1
+        num_state = state.shape[2]
+        amino_acid_orders = None
+        syn_indices_list = None
+    else:
+        num_syngroup = len(g['amino_acid_orders'])
+        num_state = int(g['max_synonymous_size'])
+        amino_acid_orders = list(g['amino_acid_orders'])
+        syn_indices_list = [
+            np.asarray(g['synonymous_indices'][aa], dtype=np.int64)
+            for aa in amino_acid_orders
+        ]
+    common_args = (
+        state,
+        rate_values,
+        projector,
+        float(g['float_tol']),
+        sub_mode,
+        amino_acid_orders,
+        syn_indices_list,
+    )
+    try:
+        if n_jobs == 1:
+            sparse_entries = _project_expected_sparse_chunk(branch_jobs, *common_args)
+        else:
+            chunk_factor = parallel.resolve_chunk_factor(task='general')
+            branch_chunks, _ = parallel.get_chunks(branch_jobs, threads=n_jobs, chunk_factor=chunk_factor)
+            chunk_maps = parallel.run_starmap(
+                func=_project_expected_sparse_chunk,
+                args_iterable=[(chunk,) + common_args for chunk in branch_chunks],
+                n_jobs=n_jobs,
+                backend='threading',
+            )
+            sparse_entries = substitution._merge_sparse_entry_maps(chunk_maps)
+    except FloatingPointError as exc:
+        warnings.warn(
+            'Expected-state sparse fusion was numerically unstable; using the materialized fallback: {}'.format(exc),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    return substitution._finalize_sparse_substitution_tensor(
+        sparse_entries=sparse_entries,
+        num_branch=state.shape[0],
+        num_site=state.shape[1],
+        num_syngroup=num_syngroup,
+        num_state=num_state,
+        dtype=state.dtype,
+    )
+
+
+# Backward-compatible private aliases used by focused parity tests.  Sparse
+# packing and storage mechanics live outside this high-level workflow module.
+_expected_projection_feature_count = expected_sparse.feature_count
+_get_expected_branch_projection_values = expected_sparse.projection_values
+_build_expected_projection_state_indices = expected_sparse.build_state_indices
+_get_expected_branch_projection_payloads = expected_sparse.branch_projection_payloads
+
+
+def _project_expected_branch_expm(
+    parent_state,
+    branch_length,
+    unique_site_rates,
+    rate_site_indices,
+    inst,
+    float_tol,
+):
+    expected_state = np.zeros_like(parent_state, dtype=np.float64)
+    inst_bl = np.asarray(inst, dtype=np.float64) * float(branch_length)
+    for site_rate, site_indices in zip(unique_site_rates, rate_site_indices):
+        if site_indices.shape[0] == 0:
+            continue
+        transition_prob = expm(inst_bl * float(site_rate))
+        expected_state[site_indices, :] = _project_expected_state_block(
+            parent_state_block=parent_state[site_indices, :],
+            transition_prob=transition_prob,
+            float_tol=float_tol,
+        )
+    return expected_state
+
+
+def _get_fused_expected_sparse_reducer(g, mode, selected_base_stats):
+    """Build only reducer projections, never an expected 5-D tensor."""
+    selected = substitution._resolve_cb_base_substitutions(selected_base_stats)
+    from csubst import endpoint_io
+    if endpoint_io.enabled(g):
+        return endpoint_io.expected_reducer(g, mode, selected)
+    if mode == 'cdn':
+        state = g['state_cdn'].astype(g['float_type'], copy=False)
+        inst = g['instantaneous_codon_rate_matrix']
+        stationary = g.get('equilibrium_frequency', g.get('empirical_eq_freq', None))
+        sub_mode = 'syn'
+        num_group = len(g['amino_acid_orders'])
+        num_state = int(g['max_synonymous_size'])
+        syn_indices_list = [
+            np.asarray(g['synonymous_indices'][aa], dtype=np.int64)
+            for aa in g['amino_acid_orders']
+        ]
+    elif mode == 'nsy':
+        inst = _get_codon_model_nsy_rate_matrix(g)
+        state = g['state_nsy'].astype(g['float_type'], copy=False)
+        stationary = None
+        sub_mode = 'asis'
+        num_group = 1
+        num_state = state.shape[2]
+        syn_indices_list = None
+    else:
+        raise ValueError('Unsupported expected sparse reducer mode: {}'.format(mode))
+    float_tol = float(g['float_tol'])
+    site_rates = np.asarray(_expected_site_rates(g, mode, state), dtype=np.float64).reshape(-1)
+    unique_site_rates, inverse_rate_indices = np.unique(site_rates, return_inverse=True)
+    rate_site_indices = [np.where(inverse_rate_indices == i)[0] for i in range(unique_site_rates.shape[0])]
+    state_has_mass = state.sum(axis=(1, 2)) >= float_tol
+    branch_jobs = _collect_expected_state_branch_jobs(
+        tree=g['tree'],
+        mode=mode,
+        num_node=state.shape[0],
+        float_tol=float_tol,
+        state_has_mass=state_has_mass,
+        branch_lengths=_expected_branch_lengths(g, mode),
+    )
+    selected_branch_set = substitution._get_selected_branch_set(g)
+    if selected_branch_set is not None:
+        branch_jobs = [job for job in branch_jobs if int(job[0]) in selected_branch_set]
+    requested_backend = str(g.get('expected_state_backend', 'auto')).strip().lower()
+    if requested_backend not in ['auto', 'expm', 'eigen']:
+        raise ValueError('Unsupported expected_state_backend: {}'.format(requested_backend))
+    projector = None
+    if requested_backend != 'expm':
+        projector = _build_expected_state_projector(
+            inst=inst,
+            float_tol=float_tol,
+            stationary=stationary,
+        )
+    if requested_backend == 'eigen' and projector is None:
+        warnings.warn(
+            'The expected-state rate matrix does not have a stable eigendecomposition; using scipy.linalg.expm.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    resolved_backend = 'eigen_{}'.format(projector['kind']) if projector is not None else 'expm'
+    # Monotonic branch order lets the reducers write directly into final CSR
+    # buffers instead of retaining one NumPy payload object per branch.
+    branch_jobs = sorted(branch_jobs, key=lambda job: job[0])
+    print(
+        'Tensor-free expected reducer (mode={}): backend={}, branches={}, projections={}'.format(
+            mode, resolved_backend, len(branch_jobs), ','.join(selected)
+        ),
+        flush=True,
+    )
+    row_builders = {
+        stat: expected_sparse.CSRRowBuilder(
+            num_row=state.shape[0],
+            num_column=_expected_projection_feature_count(stat, num_group, num_state) * state.shape[1],
+        )
+        for stat in selected
+    }
+    state_indices = _build_expected_projection_state_indices(
+        sub_mode=sub_mode,
+        num_group=num_group,
+        num_state=num_state,
+        syn_indices_list=syn_indices_list,
+    )
+    total = 0.0
+    cached_parent_nl = None
+    parent_eigen_state = None
+    try:
+        for nl, parent_nl, branch_length in branch_jobs:
+            parent_state = np.asarray(state[parent_nl, :, :], dtype=np.float64)
+            if projector is not None:
+                if cached_parent_nl != parent_nl:
+                    parent_eigen_state = _transform_parent_state_to_eigen(parent_state, projector)
+                    cached_parent_nl = parent_nl
+                expected_state = _project_parent_eigen_state(
+                    parent_eigen_state=parent_eigen_state,
+                    branch_length=branch_length,
+                    site_rates=site_rates,
+                    projector=projector,
+                    float_tol=float_tol,
+                )
+            else:
+                expected_state = _project_expected_branch_expm(
+                    parent_state=parent_state,
+                    branch_length=branch_length,
+                    unique_site_rates=unique_site_rates,
+                    rate_site_indices=rate_site_indices,
+                    inst=inst,
+                    float_tol=float_tol,
+                )
+            branch_payloads, branch_total = _get_expected_branch_projection_payloads(
+                parent_state=parent_state,
+                expected_state=expected_state,
+                sub_mode=sub_mode,
+                num_group=num_group,
+                num_state=num_state,
+                syn_indices_list=syn_indices_list,
+                state_indices=state_indices,
+                selected=selected,
+            )
+            total += branch_total
+            for stat in selected:
+                payload = branch_payloads.get(stat)
+                if payload is None:
+                    payload = (
+                        np.empty(0, dtype=np.int32),
+                        np.empty(0, dtype=np.float64),
+                    )
+                row_builders[stat].append(int(nl), payload[0], payload[1])
+    except FloatingPointError:
+        if projector is None:
+            raise
+        row_builders.clear()
+        fallback_g = dict(g)
+        fallback_g['expected_state_backend'] = 'expm'
+        warnings.warn(
+            'Tensor-free eigen reducer was numerically unstable; retrying with scipy.linalg.expm.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _get_fused_expected_sparse_reducer(fallback_g, mode, selected)
+    projections = {
+        stat: row_builders.pop(stat).finalize()
+        for stat in selected
+    }
+    storage = sum(substitution._sparse_matrix_nbytes(mat) for mat in projections.values())
+    print(
+        'Generated tensor-free expected projections: storage={:,} bytes, total={:,.6f}'.format(storage, total),
+        flush=True,
+    )
+    return {
+        'projections': projections,
+        'total': total,
+        'storage': storage,
+        'mode': mode,
+    }
+
+
+def calc_E_mean(mode, cb_ids, sub_sg, sub_bg, obs_col, list_igad, g, static_sub_sites=None,
+                cb_site_overlap=None, profile_inclusion=None):
+    E_b = np.zeros(shape=(cb_ids.shape[0],), dtype=g['float_type'])
+    for i,sg,a,d in list_igad:
+        if (a==d):
+            continue
+        if static_sub_sites is None:
+            sub_sites = _resolve_sub_sites(g=g, sub_sg=sub_sg, mode=mode, sg=sg, a=a, d=d, obs_col=obs_col)
+        else:
+            sub_sites = static_sub_sites
+        sub_branches = substitution.get_sub_branches(sub_bg, mode, sg, a, d)
+        if profile_inclusion is None:
+            E_b += _calc_urn_expected_overlap(cb_ids, sub_sites, sub_branches, g, g['float_type'])
+        else:
+            E_b += _calc_wallenius_expected_overlap(
+                cb_ids, sub_sites, sub_branches, g, g['float_type'], profile_inclusion=profile_inclusion,
+            )
+    return E_b
+
+
+def joblib_calc_E_mean(
+    mode,
+    cb_ids,
+    sub_sg,
+    sub_bg,
+    dfEb,
+    obs_col,
+    num_gad_combinat,
+    igad_chunk,
+    g,
+    static_sub_sites=None,
+    cb_site_overlap=None,
+):
+    iter_start = time.time()
+    if (igad_chunk==[]):
+        return None # This happens when the number of iteration is smaller than --threads
+    i_start = igad_chunk[0][0]
+    for i,sg,a,d in igad_chunk:
+        if (a==d):
+            continue
+        if static_sub_sites is None:
+            sub_sites = _resolve_sub_sites(g=g, sub_sg=sub_sg, mode=mode, sg=sg, a=a, d=d, obs_col=obs_col)
+        else:
+            sub_sites = static_sub_sites
+        sub_branches = substitution.get_sub_branches(sub_bg, mode, sg, a, d)
+        dfEb += _calc_urn_expected_overlap(
+            cb_ids=cb_ids,
+            sub_sites=sub_sites,
+            sub_branches=sub_branches,
+            g=g,
+            float_type=g['float_type'],
+        )
+    txt = 'E{}: {}-{}th of {} matrix_group/ancestral_state/derived_state combinations. Time elapsed: {:,} [sec]'
+    print(txt.format(obs_col, i_start, i, num_gad_combinat, int(time.time()-iter_start)), flush=True)
+
+
+def _calc_E_mean_chunk_local(
+    mode,
+    cb_ids,
+    sub_sg,
+    sub_bg,
+    obs_col,
+    num_gad_combinat,
+    igad_chunk,
+    g,
+    static_sub_sites,
+    cb_site_overlap,
+):
+    E_b = np.zeros(shape=(cb_ids.shape[0],), dtype=g['float_type'])
+    joblib_calc_E_mean(
+        mode,
+        cb_ids,
+        sub_sg,
+        sub_bg,
+        E_b,
+        obs_col,
+        num_gad_combinat,
+        igad_chunk,
+        g,
+        static_sub_sites=static_sub_sites,
+        cb_site_overlap=cb_site_overlap,
+    )
+    return E_b
+
+
+def joblib_calc_hypergeom(
+    mode,
+    cb_ids,
+    sub_sg,
+    sub_bg,
+    dfq,
+    niter,
+    obs_col,
+    num_gad_combinat,
+    igad_chunk,
+    g,
+    static_sub_sites=None,
+):
+    operation_seed = g.get('_omega_operation_seed', None)
+    if operation_seed is None:
+        operation_seed = randomness.next_seed(g, 'omega_hypergeom_direct', str(obs_col), int(niter))
+    for i,sg,a,d in igad_chunk:
+        if (a==d):
+            continue
+        if static_sub_sites is None:
+            sub_sites = _resolve_sub_sites(g=g, sub_sg=sub_sg, mode=mode, sg=sg, a=a, d=d, obs_col=obs_col)
+        else:
+            sub_sites = static_sub_sites
+        sub_branches = substitution.get_sub_branches(sub_bg, mode, sg, a, d)
+        if np.asarray(sub_sites).ndim == 1:
+            p = sub_sites
+            if p.sum()==0:
+                continue
+        else:
+            p = sub_sites
+            if (p.sum(axis=1) > 0).sum() == 0:
+                continue
+        pm_start = time.time()
+        category_rng = randomness.generator(
+            operation_seed,
+            'category',
+            str(obs_col),
+            int(i),
+            int(sg),
+            str(a),
+            str(d),
+        )
+        sub_branches = _prepare_permutation_branch_sizes(
+            sub_branches=sub_branches,
+            niter=niter,
+            g=g,
+            rng=category_rng,
+        )
+        dfq[:, :] += _get_permutations_fast(
+            cb_ids,
+            sub_branches,
+            p,
+            niter,
+            rng=category_rng,
+            sampling_model=_resolve_urn_model(g=g),
+        )
+        txt = '{}: {}/{} matrix_group/ancestral_state/derived_state combinations. Time elapsed for {:,} permutation: {:,} [sec]'
+        if '_longtail_count_components' not in g:
+            print(txt.format(obs_col, i + 1, num_gad_combinat, niter, int(time.time() - pm_start)), flush=True)
+
+
+def _calc_hypergeom_chunk_local(
+    mode,
+    cb_ids,
+    sub_sg,
+    sub_bg,
+    niter,
+    obs_col,
+    num_gad_combinat,
+    igad_chunk,
+    g,
+    static_sub_sites,
+):
+    dfq_local = np.zeros(shape=(cb_ids.shape[0], niter), dtype=np.int32)
+    joblib_calc_hypergeom(
+        mode,
+        cb_ids,
+        sub_sg,
+        sub_bg,
+        dfq_local,
+        niter,
+        obs_col,
+        num_gad_combinat,
+        igad_chunk,
+        g,
+        static_sub_sites=static_sub_sites,
+    )
+    return dfq_local
+
+
+def _prepare_substitution_permutation_components(sub_tensor, mode, SN, g):
+    supported_modes = {'spe2spe', 'spe2any', 'any2spe', 'any2any'}
+    if mode not in supported_modes:
+        raise ValueError('Unsupported E-stat mode: {}'.format(mode))
+    if isinstance(sub_tensor, substitution_sparse.SparseSubstitutionTensor):
+        sub_bg, sub_sg = substitution_sparse.summarize_sparse_sub_tensor(sparse_tensor=sub_tensor, mode=mode)
+    if mode=='spe2spe':
+        if not isinstance(sub_tensor, substitution_sparse.SparseSubstitutionTensor):
+            sub_bg = sub_tensor.sum(axis=1) # branch, matrix_group, ancestral_state, derived_state
+            sub_sg = sub_tensor.sum(axis=0) # site, matrix_group, ancestral_state, derived_state
+        list_gad = [ [g,a,d] for g,a,d in itertools.zip_longest(*g[SN+'_ind_nomissing_gad']) ]
+    elif mode=='spe2any':
+        if not isinstance(sub_tensor, substitution_sparse.SparseSubstitutionTensor):
+            sub_bg = sub_tensor.sum(axis=(1, 4)) # branch, matrix_group, ancestral_state
+            sub_sg = sub_tensor.sum(axis=(0, 4)) # site, matrix_group, ancestral_state
+        list_gad = [ [g,a,'2any'] for g,a in itertools.zip_longest(*g[SN+'_ind_nomissing_ga']) ]
+    elif mode=='any2spe':
+        if not isinstance(sub_tensor, substitution_sparse.SparseSubstitutionTensor):
+            sub_bg = sub_tensor.sum(axis=(1, 3)) # branch, matrix_group, derived_state
+            sub_sg = sub_tensor.sum(axis=(0, 3)) # site, matrix_group, derived_state
+        list_gad = [ [g,'any2',d] for g,d in itertools.zip_longest(*g[SN+'_ind_nomissing_gd']) ]
+    elif mode=='any2any':
+        if not isinstance(sub_tensor, substitution_sparse.SparseSubstitutionTensor):
+            sub_bg = sub_tensor.sum(axis=(1, 3, 4)) # branch, matrix_group
+            sub_sg = sub_tensor.sum(axis=(0, 3, 4)) # site, matrix_group
+        list_gad = list(itertools.product(np.arange(sub_tensor.shape[2]), ['any2',], ['2any',]))
+    if g.get('asrv_training_branches', 'all') != 'all':
+        from csubst import asrv
+        ids = g.get('_asrv_training_ids')
+        if ids is None:
+            ids = asrv.resolve_training_ids(g, sub_tensor.shape[0])
+        sub_sg = asrv.training_site_summary(sub_tensor, mode, ids)
+    num_gad_combinat = len(list_gad)
+    list_igad = [ [i,]+list(items) for i,items in zip(range(num_gad_combinat), list_gad) ]
+    obs_col = 'OC'+SN+mode
+    return sub_bg, sub_sg, list_igad, obs_col, num_gad_combinat
+
+
+def _resolve_E_stat_n_jobs(num_cb_rows, num_site, num_categories, g):
+    threads = int(g.get('threads', 1))
+    num_cb_rows = int(num_cb_rows)
+    num_site = int(num_site)
+    num_categories = int(num_categories)
+    estimated_work = num_cb_rows * num_site * num_categories
+    if (threads <= 1) or (num_cb_rows <= 0) or (num_site <= 0) or (num_categories <= 1):
+        return 1, estimated_work
+    if estimated_work < _DEFAULT_E_STAT_MIN_ITEMS_FOR_PARALLEL:
+        return 1, estimated_work
+    max_jobs_by_category = num_categories // _DEFAULT_E_STAT_MIN_CATEGORIES_PER_JOB
+    if max_jobs_by_category <= 1:
+        return 1, estimated_work
+    requested_n_jobs = parallel.resolve_n_jobs(num_items=num_categories, threads=threads)
+    return min(requested_n_jobs, max_jobs_by_category), estimated_work
+
+
+def calc_E_stat(cb, sub_tensor, mode, stat='mean', SN='', g=None):
+    if g is None:
+        raise ValueError('g is required.')
+    if stat != 'mean':
+        raise ValueError('Unsupported E-stat summary statistic: {}'.format(stat))
+    sub_bg, sub_sg, list_igad, obs_col, num_gad_combinat = _prepare_substitution_permutation_components(
+        sub_tensor=sub_tensor,
+        mode=mode,
+        SN=SN,
+        g=g,
+    )
+    txt = 'E{}{}: Total number of substitution categories after NaN removals: {}'
+    print(txt.format(SN, mode, num_gad_combinat))
+    cb_ids = _get_cb_ids(cb)
+    if g.get('asrv_posterior_draws'):
+        asrv.posterior_rate_seed(g)
+        rates = g['_asrv_rate_categories']
+        if np.all(rates == rates[0]):
+            rate_draws = (np.full(sub_sg.shape[0], rates[0]),)
+            count = 1
+        else:
+            rate_draws = asrv.posterior_site_rate_draws(g)
+            count = g['asrv_posterior_draws']
+        total = np.zeros(len(cb_ids))
+        # Rate draws change the site profile but keep the observed branch
+        # totals fixed. Integrate the overlap conditional on each profile.
+        for site_rates in rate_draws:
+            weights = substitution._normalize_site_weights_by_branch(site_rates, g, 0., channel=SN)
+            profile_bytes = max(1, weights.shape[1] * np.dtype(np.float64).itemsize)
+
+            @lru_cache(maxsize=min(512, (8 * 1024**2) // profile_bytes))
+            def inclusion(branch_id, draw_size):
+                return _wallenius_inclusion_for_policy(weights[branch_id], draw_size, g)
+
+            total += calc_E_mean(
+                mode, cb_ids, sub_sg, sub_bg, obs_col, list_igad, g,
+                static_sub_sites=weights, profile_inclusion=inclusion,
+            )
+        return (total / count).astype(g['float_type'], copy=False)
+    static_sub_sites = _get_static_sub_sites_if_available(g=g, sub_sg=sub_sg, mode=mode, obs_col=obs_col)
+    cb_site_overlap = None
+    n_jobs, estimated_work = _resolve_E_stat_n_jobs(
+        num_cb_rows=cb_ids.shape[0],
+        num_site=sub_sg.shape[0],
+        num_categories=len(list_igad),
+        g=g,
+    )
+    txt = 'E{}{} scheduler: cb_rows={}, sites={}, categories={}, estimated_work={}, workers={} (threads={})'
+    print(
+        txt.format(
+            SN,
+            mode,
+            cb_ids.shape[0],
+            sub_sg.shape[0],
+            len(list_igad),
+            estimated_work,
+            n_jobs,
+            int(g.get('threads', 1)),
+        ),
+        flush=True,
+    )
+    chunk_factor = parallel.resolve_chunk_factor(task='general')
+    igad_chunks = None
+    if stat == 'mean':
+        igad_chunks,mmap_start_not_necessary_here = parallel.get_chunks(
+            list_igad,
+            n_jobs,
+            chunk_factor=chunk_factor,
+        )
+    if n_jobs == 1:
+        E_b = calc_E_mean(
+            mode,
+            cb_ids,
+            sub_sg,
+            sub_bg,
+            obs_col,
+            list_igad,
+            g,
+            static_sub_sites=static_sub_sites,
+            cb_site_overlap=cb_site_overlap,
+        )
+    else:
+        tasks = [
+            (
+                mode,
+                cb_ids,
+                sub_sg,
+                sub_bg,
+                obs_col,
+                num_gad_combinat,
+                igad_chunk,
+                g,
+                static_sub_sites,
+                cb_site_overlap,
+            )
+            for igad_chunk in igad_chunks
+        ]
+        chunk_E = parallel.run_starmap(
+            func=_calc_E_mean_chunk_local,
+            args_iterable=tasks,
+            n_jobs=n_jobs,
+            backend='threading',
+        )
+        E_b = np.zeros(shape=(cb_ids.shape[0],), dtype=g['float_type'])
+        for item in chunk_E:
+            E_b += item
+    return E_b
+
+
+def subroot_E2nan(cb, tree):
+    id_cols = cb.columns[cb.columns.str.startswith('branch_id_')]
+    E_cols = cb.columns[cb.columns.str.startswith('E')]
+    if (E_cols.shape[0]==0):
+        return cb
+    for node in tree.traverse():
+        continue_flag = 1
+        if ete.is_root(node):
+            continue_flag = 0
+        elif ete.is_root(node.up):
+            continue_flag = 0
+        if continue_flag:
+            continue
+        for id_col in id_cols:
+            is_node = (cb.loc[:,id_col]==ete.get_prop(node, "numerical_label"))
+            cb.loc[is_node,E_cols] = np.nan
+    return cb
+
+
+def get_E(cb, g, ON_tensor, OS_tensor):
+    expectation_method = _resolve_expectation_method(g=g)
+    recoding_config.validate_nonsyn_expectation(g.get('nonsyn_recode', 'no'), expectation_method, g.get('sa_asr_mode', 'direct'), g.get('sa_iqtree_model', 'GTR'))
+    if expectation_3di.required(g):
+        expectation_3di.validate_context(g)
+    requested_output_stats = _resolve_requested_output_stats(g)
+    base_stats = output_stat.get_required_base_stats(requested_output_stats)
+    filter_report = site_filter.start_count_report(g, cb, ON_tensor, OS_tensor, base_stats)
+    if expectation_method == 'urn' and g.get('asrv') in asrv.EMPIRICAL_MODES:
+        from csubst import empirical_urn
+        combos = cb.loc[:, cb.columns.str.startswith('branch_id_')].to_numpy(dtype=np.int64)
+        for column, values in empirical_urn.expected_counts(g, combos, ON_tensor, OS_tensor, base_stats).items():
+            cb[column] = values
+    elif expectation_method == 'urn':
+        ON_gad, ON_ga, ON_gd = substitution.get_group_state_totals(ON_tensor)
+        OS_gad, OS_ga, OS_gd = substitution.get_group_state_totals(OS_tensor)
+        g['N_ind_nomissing_gad'] = np.where(ON_gad!=0)
+        g['N_ind_nomissing_ga'] = np.where(ON_ga!=0)
+        g['N_ind_nomissing_gd'] = np.where(ON_gd!=0)
+        g['S_ind_nomissing_gad'] = np.where(OS_gad!=0)
+        g['S_ind_nomissing_ga'] = np.where(OS_ga!=0)
+        g['S_ind_nomissing_gd'] = np.where(OS_gd!=0)
+        for st in base_stats:
+            cb['ECN'+st] = calc_E_stat(cb, ON_tensor, mode=st, stat='mean', SN='N', g=g)
+            cb['ECS'+st] = calc_E_stat(cb, OS_tensor, mode=st, stat='mean', SN='S', g=g)
+    elif expectation_method == 'codon_model':
+        id_cols = cb.columns[cb.columns.str.startswith('branch_id_')]
+        # Joint 3Di fingerprinting needs both codon and structural tip states.
+        # Acquire S while both are alive, before the N reducer releases states.
+        from csubst import endpoint_io
+        if (endpoint_io.enabled(g) and g.get('nonsyn_recode') == '3di20'
+                and 'ES_reducer' not in g):
+            g['ES_reducer'] = _get_fused_expected_sparse_reducer(
+                g=g, mode='cdn', selected_base_stats=base_stats,
+            )
+        if 'EN_reducer' not in g:
+            g['EN_reducer'] = _get_fused_expected_sparse_reducer(
+                g=g,
+                mode='nsy',
+                selected_base_stats=base_stats,
+            )
+            if bool(g.get('_release_state_after_expected_reducer', False)):
+                state_objects = {
+                    id(value): value
+                    for key in ('state_pep', 'state_nsy')
+                    for value in [g.get(key)]
+                    if isinstance(value, np.ndarray)
+                }
+                released_nbytes = sum(int(value.nbytes) for value in state_objects.values())
+                g['state_pep'] = None
+                g['state_nsy'] = None
+                print(
+                    'Released peptide/nonsynonymous state storage ({:,} bytes).'.format(
+                        released_nbytes
+                    ),
+                    flush=True,
+                )
+        else:
+            print('Reusing expected nonsynonymous sparse projections.', flush=True)
+        txt = 'Number of total empirically expected nonsynonymous substitutions in the tree: {:,.2f}'
+        print(txt.format(g['EN_reducer']['total']))
+        print('Preparing the ECN table with up to {:,} process(es).'.format(g['threads']), flush=True)
+        cbEN = substitution.get_cb_from_expected_reducer(
+            id_combinations=cb.loc[:, id_cols].values,
+            reducer=g['EN_reducer'],
+            attr='ECN',
+            g=g,
+            selected_base_stats=base_stats,
+        )
+        cb = table.merge_tables(cb, cbEN)
+        if filter_report is not None:
+            for stat in base_stats:
+                site_filter.collect_projection(filter_report, g['EN_reducer']['projections'][stat], 'ECN' + stat)
+        del cbEN
+        is_final_arity = int(g.get('current_arity', 0)) >= int(g.get('max_arity', 1))
+        if is_final_arity:
+            released_nbytes = int(g['EN_reducer']['storage'])
+            del g['EN_reducer']
+            from csubst import endpoint_io
+            endpoint_io.release_expected(g, 'N')
+            print(
+                'Released final-arity EN sparse projections ({:,} bytes).'.format(released_nbytes),
+                flush=True,
+            )
+        if 'ES_reducer' not in g:
+            g['ES_reducer'] = _get_fused_expected_sparse_reducer(
+                g=g,
+                mode='cdn',
+                selected_base_stats=base_stats,
+            )
+        else:
+            print('Reusing expected synonymous sparse projections.', flush=True)
+        state_cdn = g.get('state_cdn')
+        if bool(g.get('_release_state_after_expected_reducer', False)) and isinstance(state_cdn, np.ndarray):
+            released_nbytes = int(state_cdn.nbytes)
+            g['state_cdn'] = None
+            print(
+                'Released codon state storage ({:,} bytes).'.format(released_nbytes),
+                flush=True,
+            )
+        txt = 'Number of total empirically expected synonymous substitutions in the tree: {:,.2f}'
+        print(txt.format(g['ES_reducer']['total']))
+        print('Preparing the ECS table with up to {:,} process(es).'.format(g['threads']), flush=True)
+        cbES = substitution.get_cb_from_expected_reducer(
+            id_combinations=cb.loc[:, id_cols].values,
+            reducer=g['ES_reducer'],
+            attr='ECS',
+            g=g,
+            selected_base_stats=base_stats,
+        )
+        cb = table.merge_tables(cb, cbES)
+        if filter_report is not None:
+            for stat in base_stats:
+                site_filter.collect_projection(filter_report, g['ES_reducer']['projections'][stat], 'ECS' + stat)
+        del cbES
+        if is_final_arity:
+            released_nbytes = int(g['ES_reducer']['storage'])
+            del g['ES_reducer']
+            from csubst import endpoint_io
+            endpoint_io.release_expected(g, 'S')
+            print(
+                'Released final-arity ES sparse projections ({:,} bytes).'.format(released_nbytes),
+                flush=True,
+            )
+    else:
+        raise ValueError('Unsupported expectation_method: {}'.format(expectation_method))
+    cb = substitution.add_dif_stats(cb, g['float_tol'], prefix='EC', output_stats=requested_output_stats)
+    cb = subroot_E2nan(cb, tree=g['tree'])
+    site_filter.finish_count_report(filter_report, g)
+    return cb
+
+
+def get_exp_state(g, mode):
+    from csubst import endpoint_io
+    if endpoint_io.enabled(g):
+        raise ValueError('Joint endpoint predictions retain both state axes; use the expected sparse reducer.')
+    if mode=='cdn':
+        state = g['state_cdn'].astype(g['float_type'], copy=False)
+        inst = g['instantaneous_codon_rate_matrix']
+    elif mode=='pep':
+        state = g['state_pep'].astype(g['float_type'], copy=False)
+        inst = g['instantaneous_aa_rate_matrix']
+    elif mode=='nsy':
+        inst = _get_codon_model_nsy_rate_matrix(g)
+        state = g['state_nsy'].astype(g['float_type'], copy=False)
+    else:
+        raise ValueError('Unsupported expected-state mode: {}'.format(mode))
+    stateE = np.zeros_like(state, dtype=g['float_type'])
+    rate_values = np.asarray(_expected_site_rates(g, mode, state), dtype=g['float_type'])
+    if rate_values.ndim != 1:
+        rate_values = rate_values.reshape(-1)
+    unique_site_rates, inverse_rate_indices = np.unique(rate_values, return_inverse=True)
+    rate_site_indices = [np.where(inverse_rate_indices == i)[0] for i in range(unique_site_rates.shape[0])]
+    state_has_mass = (state.sum(axis=(1, 2)) >= float(g['float_tol']))
+    branch_jobs = _collect_expected_state_branch_jobs(
+        tree=g['tree'],
+        mode=mode,
+        num_node=stateE.shape[0],
+        float_tol=float(g['float_tol']),
+        state_has_mass=state_has_mass,
+        branch_lengths=_expected_branch_lengths(g, mode),
+    )
+    requested_backend = str(g.get('expected_state_backend', 'auto')).strip().lower()
+    if requested_backend not in ['auto', 'expm', 'eigen']:
+        raise ValueError('Unsupported expected_state_backend: {}'.format(requested_backend))
+    stationary = None
+    if mode == 'cdn':
+        stationary = g.get('equilibrium_frequency', g.get('empirical_eq_freq', None))
+    projector = None
+    if requested_backend != 'expm':
+        projector = _build_expected_state_projector(
+            inst=inst,
+            float_tol=float(g['float_tol']),
+            stationary=stationary,
+        )
+    resolved_backend = 'eigen_{}'.format(projector['kind']) if projector is not None else 'expm'
+    if (requested_backend == 'eigen') and (projector is None):
+        warnings.warn(
+            'The expected-state rate matrix does not have a stable eigendecomposition; using scipy.linalg.expm.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if projector is not None:
+        branch_jobs = sorted(branch_jobs, key=lambda job: (job[1], job[0]))
+    n_jobs, estimated_work = _resolve_expected_state_n_jobs(
+        num_branch_jobs=len(branch_jobs),
+        num_site=state.shape[1],
+        num_state=state.shape[2],
+        g=g,
+    )
+    if projector is not None:
+        # Site-vectorized BLAS projection is faster and lower-memory without
+        # an additional layer of Python threads.
+        n_jobs = 1
+    txt = 'Expected-state scheduler (mode={}): backend={}, branches={}, site_rates={}, estimated_work={}, workers={} (threads={})'
+    print(
+        txt.format(
+            mode,
+            resolved_backend,
+            len(branch_jobs),
+            unique_site_rates.shape[0],
+            estimated_work,
+            n_jobs,
+            int(g.get('threads', 1)),
+        ),
+        flush=True,
+    )
+    if projector is not None:
+        worker_func = _project_expected_state_chunk_eigen
+        worker_common_args = (state, stateE, rate_values, projector, float(g['float_tol']))
+    else:
+        worker_func = _project_expected_state_chunk
+        worker_common_args = (
+            state,
+            stateE,
+            unique_site_rates,
+            rate_site_indices,
+            inst,
+            float(g['float_tol']),
+        )
+    try:
+        _run_expected_state_workers(
+            worker_func=worker_func,
+            branch_jobs=branch_jobs,
+            worker_common_args=worker_common_args,
+            n_jobs=n_jobs,
+            g=g,
+        )
+    except FloatingPointError as exc:
+        if projector is None:
+            raise
+        warnings.warn(
+            'Eigen expected-state projection was numerically unstable; using scipy.linalg.expm: {}'.format(exc),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        stateE.fill(0)
+        fallback_n_jobs, _ = _resolve_expected_state_n_jobs(
+            num_branch_jobs=len(branch_jobs),
+            num_site=state.shape[1],
+            num_state=state.shape[2],
+            g=g,
+        )
+        _run_expected_state_workers(
+            worker_func=_project_expected_state_chunk,
+            branch_jobs=branch_jobs,
+            worker_common_args=(
+                state,
+                stateE,
+                unique_site_rates,
+                rate_site_indices,
+                inst,
+                float(g['float_tol']),
+            ),
+            n_jobs=fallback_n_jobs,
+            g=g,
+        )
+    max_stateE = stateE.sum(axis=(2)).max()
+    if (max_stateE - 1) >= g['float_tol']:
+        raise AssertionError('Total probability of expected states should not exceed 1. {}'.format(max_stateE))
+    return stateE
+
+
+def _calc_distribution_entropy(prob):
+    prob = np.asarray(prob, dtype=np.float64)
+    positive = prob[prob > 0]
+    if positive.shape[0] == 0:
+        return 0.0
+    return float(-(positive * np.log(positive)).sum(dtype=np.float64))
+
+
+def _calc_zero_fraction(cb, prefix, output_stats, float_tol):
+    cols = [prefix + sub for sub in output_stats if (prefix + sub) in cb.columns]
+    if len(cols) == 0:
+        return np.nan
+    values = cb.loc[:, cols].to_numpy(dtype=np.float64, copy=False)
+    is_finite = np.isfinite(values)
+    if not is_finite.any():
+        return np.nan
+    return float(((values < float_tol) & is_finite).sum() / is_finite.sum())
+
+
+def _get_pseudocount_context(cb, g, output_stats):
+    from csubst.omega_null import population_signature
+
+    columns = {str(c): cb[c].to_numpy(dtype=np.float64, copy=False) for c in cb
+               if str(c) in {p+s for p in ('OCN', 'ECN', 'OCS', 'ECS') for s in output_stat.ALL_OUTPUT_STATS}}
+    context = pseudocount.fit_stat_context(columns, g, output_stats, g['float_tol'])
+    config = context['config']
+    summary = {
+        'pseudocount_mode': config['pseudocount_mode'],
+        'pseudocount_alpha': float(config['pseudocount_alpha']),
+        'pseudocount_alpha_source': 'auto' if config.get('pseudocount_alpha_auto', False) else 'fixed',
+        'pseudocount_target': config['pseudocount_target'],
+        'pseudocount_enabled': int(config['pseudocount_enabled']),
+    }
+    for prefix in ('OCN', 'ECN', 'OCS', 'ECS'):
+        summary['pseudocount_zero_prop_'+prefix] = _calc_zero_fraction(cb, prefix, output_stats, g['float_tol'])
+    if context['fit_diagnostics']:
+        summary['pseudocount_alpha_fit_pairs'] = int(context['fit_diagnostics'].get('num_pairs', 0))
+        summary['pseudocount_alpha_fit_loglikelihood'] = float(context['fit_diagnostics'].get('fit_loglikelihood', np.nan))
+    for prefix, prior in context['atomic_priors'].items():
+        summary['pseudocount_pglobal_entropy_atomic_'+prefix] = _calc_distribution_entropy(prior)
+    context.update(summary=summary, population_signature=population_signature(cb))
+    return context
+
+
+def _print_pseudocount_summary(context):
+    summary = context.get('summary', dict())
+    txt = 'Pseudocount settings: mode={}, alpha={}, alpha_source={}, target={}, enabled={}'
+    print(
+        txt.format(
+            summary.get('pseudocount_mode', 'none'),
+            summary.get('pseudocount_alpha', 0.0),
+            summary.get('pseudocount_alpha_source', 'fixed'),
+            summary.get('pseudocount_target', 'both'),
+            summary.get('pseudocount_enabled', 0),
+        ),
+        flush=True,
+    )
+    if summary.get('pseudocount_alpha_source', 'fixed') == 'auto':
+        txt = 'Pseudocount alpha auto-fit: pairs={:,}, logL={:.3f}'
+        print(
+            txt.format(
+                int(summary.get('pseudocount_alpha_fit_pairs', 0)),
+                float(summary.get('pseudocount_alpha_fit_loglikelihood', np.nan)),
+            ),
+            flush=True,
+        )
+    txt = 'Pseudocount sparsity (pre-smoothing): OCN_zero={:.3f}, ECN_zero={:.3f}, OCS_zero={:.3f}, ECS_zero={:.3f}'
+    print(
+        txt.format(
+            float(summary.get('pseudocount_zero_prop_OCN', np.nan)),
+            float(summary.get('pseudocount_zero_prop_ECN', np.nan)),
+            float(summary.get('pseudocount_zero_prop_OCS', np.nan)),
+            float(summary.get('pseudocount_zero_prop_ECS', np.nan)),
+        ),
+        flush=True,
+    )
+    if summary.get('pseudocount_mode', 'none') == 'empirical':
+        txt = 'Pseudocount empirical atomic p_global entropy: OCN={:.3f}, ECN={:.3f}, OCS={:.3f}, ECS={:.3f}'
+        print(
+            txt.format(
+                float(summary.get('pseudocount_pglobal_entropy_atomic_OCN', np.nan)),
+                float(summary.get('pseudocount_pglobal_entropy_atomic_ECN', np.nan)),
+                float(summary.get('pseudocount_pglobal_entropy_atomic_OCS', np.nan)),
+                float(summary.get('pseudocount_pglobal_entropy_atomic_ECS', np.nan)),
+            ),
+            flush=True,
+        )
+
+
+def _write_pseudocount_summary_to_cb_stats(g, context):
+    if 'df_cb_stats' not in g:
+        return
+    summary = context.get('summary', dict())
+    for key, value in summary.items():
+        g['df_cb_stats'].at[0, key] = value
+
+
+def get_omega(cb, g, context=None):
+    requested_output_stats = _resolve_requested_output_stats(g)
+    if context is None:
+        context = _get_pseudocount_context(cb=cb, g=g, output_stats=requested_output_stats)
+    if tuple(requested_output_stats) != context['output_stats']:
+        raise ValueError('Explicit pseudocount context does not match the requested statistics.')
+    g['_pseudocount_context'] = context
+    config = context['config']
+    from csubst.omega_statistics import count_ratio_omega
+    for sub in requested_output_stats:
+        names = [prefix + sub for prefix in ('OCN', 'OCS', 'ECN', 'ECS')]
+        if all(name in cb for name in names):
+            n, s, en, es = (cb[name].to_numpy(dtype=float, copy=False) for name in names)
+            cb['count_ratio_omegaC' + sub] = count_ratio_omega(n, s, en, es)
+            cb['ocs_status_' + sub] = pd.Categorical.from_codes(
+                np.select([~np.isfinite(s), s == 0., s < g['float_tol'], s < 1.], [0, 1, 2, 3], default=4),
+                categories=['missing', 'zero', 'below_tolerance', 'below_one', 'at_least_one'])
+    if (not config['pseudocount_enabled']) and (not config['pseudocount_add_output_columns']):
+        for sub in requested_output_stats:
+            col_omega = 'omegaC'+sub
+            col_N = 'OCN'+sub
+            col_EN = 'ECN'+sub
+            col_dNc = 'dNC'+sub
+            col_S = 'OCS'+sub
+            col_ES = 'ECS'+sub
+            col_dSc = 'dSC'+sub
+            if all([ col in cb.columns for col in [col_N,col_EN,col_S,col_ES] ]):
+                obs_N = cb.loc[:, col_N].to_numpy(dtype=np.float64, copy=False)
+                exp_N = cb.loc[:, col_EN].to_numpy(dtype=np.float64, copy=False)
+                obs_S = cb.loc[:, col_S].to_numpy(dtype=np.float64, copy=False)
+                exp_S = cb.loc[:, col_ES].to_numpy(dtype=np.float64, copy=False)
+                dNc = _calc_raw_rate(obs=obs_N, exp=exp_N, float_tol=g['float_tol'])
+                dSc = _calc_raw_rate(obs=obs_S, exp=exp_S, float_tol=g['float_tol'])
+                omegaC = _calc_raw_omega(dNc=dNc, dSc=dSc, float_tol=g['float_tol'])
+                cb.loc[:, col_dNc] = dNc
+                cb.loc[:, col_dSc] = dSc
+                cb.loc[:, col_omega] = omegaC
+        return cb
+    result = {}
+    for i, sub in enumerate(requested_output_stats):
+        col_omega = 'omegaC'+sub
+        col_N = 'OCN'+sub
+        col_EN = 'ECN'+sub
+        col_dNc = 'dNC'+sub
+        col_S = 'OCS'+sub
+        col_ES = 'ECS'+sub
+        col_dSc = 'dSC'+sub
+        if all([ col in cb.columns for col in [col_N,col_EN,col_S,col_ES] ]):
+            obs_N = cb.loc[:, col_N].to_numpy(dtype=np.float64, copy=False)
+            exp_N = cb.loc[:, col_EN].to_numpy(dtype=np.float64, copy=False)
+            obs_S = cb.loc[:, col_S].to_numpy(dtype=np.float64, copy=False)
+            exp_S = cb.loc[:, col_ES].to_numpy(dtype=np.float64, copy=False)
+            raw_dNc = _calc_raw_rate(obs=obs_N, exp=exp_N, float_tol=g['float_tol'])
+            raw_dSc = _calc_raw_rate(obs=obs_S, exp=exp_S, float_tol=g['float_tol'])
+            raw_omega = _calc_raw_omega(dNc=raw_dNc, dSc=raw_dSc, float_tol=g['float_tol'])
+            if config['pseudocount_enabled']:
+                sm_dNc, sm_dSc = _count_rates(
+                    obs_N, exp_N, obs_S, exp_S, g['float_tol'],
+                    tuple(context[key][i] for key in ('alpha_obs_N', 'alpha_exp_N', 'alpha_obs_S', 'alpha_exp_S')),
+                )
+                sm_omega = _calc_raw_omega(sm_dNc, sm_dSc, g['float_tol'])
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    log_sm_omega = np.log(sm_omega)
+            else:
+                sm_dNc = raw_dNc.copy()
+                sm_dSc = raw_dSc.copy()
+                sm_omega = raw_omega.copy()
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    log_sm_omega = np.log(sm_omega)
+            result[col_dNc] = sm_dNc
+            result[col_dSc] = sm_dSc
+            result[col_omega] = sm_omega
+            if config['pseudocount_add_output_columns']:
+                result[col_dNc + '_raw'] = raw_dNc
+                result[col_dSc + '_raw'] = raw_dSc
+                result[col_omega + '_raw'] = raw_omega
+                result[col_dNc + '_smoothed'] = sm_dNc
+                result[col_dSc + '_smoothed'] = sm_dSc
+                result[col_omega + '_smoothed'] = sm_omega
+                result['log' + col_omega + '_smoothed'] = log_sm_omega
+    if not result:
+        return cb
+    return pd.concat([cb.drop(columns=list(result), errors='ignore'), pd.DataFrame(result, index=cb.index)], axis=1)
+
+
+def get_CoD(cb, g):
+    for NS in ['OCN','OCS']:
+        col_spe = NS + 'any2spe'
+        col_dif = NS + 'any2dif'
+        col_cod = NS + 'CoD'
+        if not all([col in cb.columns for col in [col_spe, col_dif]]):
+            continue
+        spe_values = cb.loc[:, col_spe].to_numpy(dtype=np.float64, copy=False)
+        dif_values = cb.loc[:, col_dif].to_numpy(dtype=np.float64, copy=False)
+        cb.loc[:, col_cod] = _calc_raw_rate(obs=spe_values, exp=dif_values, float_tol=g['float_tol'])
+    return cb
+
+
+def _calc_dif_count_matrix(any_count, spe_count, tol):
+    any_count = np.asarray(any_count, dtype=np.float64)
+    spe_count = np.asarray(spe_count, dtype=np.float64)
+    out = any_count - spe_count
+    is_negative = (out < (-float(tol)))
+    is_almost_zero = (~is_negative) & (out < float(tol))
+    # Values below -tol violate the required spe <= any nesting and cannot be
+    # explained by floating-point rounding.  Preserve them as undefined rather
+    # than adding artificial zero mass to a permutation null distribution.
+    out[is_negative] = np.nan
+    out[is_almost_zero] = 0
+    return out
+
+
+def _compose_permutation_count_matrix(stat, mode_to_count, tol):
+    if stat in ['any2any', 'spe2any', 'any2spe', 'spe2spe']:
+        return np.asarray(mode_to_count[stat], dtype=np.float64)
+    if stat == 'any2dif':
+        return _calc_dif_count_matrix(mode_to_count['any2any'], mode_to_count['any2spe'], tol=tol)
+    if stat == 'dif2any':
+        return _calc_dif_count_matrix(mode_to_count['any2any'], mode_to_count['spe2any'], tol=tol)
+    if stat == 'dif2spe':
+        return _calc_dif_count_matrix(mode_to_count['any2spe'], mode_to_count['spe2spe'], tol=tol)
+    if stat == 'spe2dif':
+        return _calc_dif_count_matrix(mode_to_count['spe2any'], mode_to_count['spe2spe'], tol=tol)
+    if stat == 'dif2dif':
+        any2dif = _calc_dif_count_matrix(mode_to_count['any2any'], mode_to_count['any2spe'], tol=tol)
+        spe2dif = _calc_dif_count_matrix(mode_to_count['spe2any'], mode_to_count['spe2spe'], tol=tol)
+        return _calc_dif_count_matrix(any2dif, spe2dif, tol=tol)
+    raise ValueError('Unsupported output stat for permutation omegaC p-value: {}'.format(stat))
+
+
+def _resolve_omega_pvalue_null_model(g):
+    model = 'hypergeom'
+    if g is not None:
+        model = str(g.get('omega_pvalue_null_model', 'hypergeom')).strip().lower()
+    if model not in ['hypergeom', 'poisson', 'poisson_full', 'nbinom']:
+        raise ValueError('omega_pvalue_null_model should be one of hypergeom, poisson, poisson_full, nbinom.')
+    return model
+
+
+def _resolve_omega_pvalue_niter_schedule(g):
+    schedule = None
+    if g is not None:
+        schedule = g.get('omega_pvalue_niter_schedule', None)
+    if schedule is not None:
+        if isinstance(schedule, str):
+            token = schedule.strip().lower()
+            if token in ['', '0', 'auto']:
+                schedule = None
+            else:
+                schedule = [v.strip() for v in schedule.split(',') if v.strip() != '']
+        if schedule is not None:
+            schedule = [int(v) for v in schedule]
+    if schedule is not None:
+        if len(schedule) == 0:
+            raise ValueError('omega_pvalue_niter_schedule should contain at least one stage.')
+        if min(schedule) <= 0:
+            raise ValueError('omega_pvalue_niter_schedule should contain positive integers.')
+        for prev, curr in zip(schedule, schedule[1:]):
+            if curr <= prev:
+                raise ValueError('omega_pvalue_niter_schedule should be strictly increasing.')
+        if schedule[-1] > int(_OMEGA_PVALUE_MAX_NITER):
+            txt = 'omega_pvalue_niter_schedule upper bound should be <= {}.'
+            raise ValueError(txt.format(int(_OMEGA_PVALUE_MAX_NITER)))
+        return schedule
+    auto_schedule = [int(v) for v in _OMEGA_PVALUE_AUTO_NITER_SCHEDULE]
+    return auto_schedule
+
+
+def _resolve_omega_pvalue_refine_upper_edge_bins(g):
+    edge_bins = int(_OMEGA_PVALUE_REFINE_UPPER_EDGE_BINS)
+    if g is not None:
+        edge_bins = int(g.get('omega_pvalue_refine_upper_edge_bins', edge_bins))
+    if edge_bins < 0:
+        raise ValueError('omega_pvalue_refine_upper_edge_bins should be >= 0.')
+    return edge_bins
+
+
+def _calc_poisson_count_matrix(
+    mode,
+    cb_ids,
+    sub_sg,
+    sub_bg,
+    niter,
+    obs_col,
+    num_gad_combinat,
+    list_igad,
+    g,
+    static_sub_sites,
+):
+    cb_ids = np.asarray(cb_ids, dtype=np.int64)
+    niter = int(niter)
+    if cb_ids.ndim != 2:
+        raise ValueError('cb_ids should be a 2D array.')
+    if niter <= 0:
+        raise ValueError('niter should be a positive integer.')
+    out = np.zeros(shape=(cb_ids.shape[0], niter), dtype=np.float64)
+    if cb_ids.shape[0] == 0:
+        return out
+    operation_seed = g.get('_omega_operation_seed', None)
+    if operation_seed is None:
+        operation_seed = randomness.next_seed(g, 'omega_poisson_direct', str(obs_col), int(niter))
+    for i, sg, a, d in list_igad:
+        if a == d:
+            continue
+        cache = g.get('_longtail_poisson_means')
+        key = (obs_col, int(i), int(sg), str(a), str(d))
+        if cache is None or key not in cache:
+            if static_sub_sites is None:
+                sub_sites = _resolve_sub_sites(g=g, sub_sg=sub_sg, mode=mode, sg=sg, a=a, d=d, obs_col=obs_col)
+            else:
+                sub_sites = static_sub_sites
+            sub_branches = substitution.get_sub_branches(sub_bg, mode, sg, a, d)
+            mean_count = _calc_urn_expected_overlap(
+                cb_ids=cb_ids if cache is None else g['_longtail_count_ids'],
+                sub_sites=sub_sites,
+                sub_branches=sub_branches,
+                g=g,
+                float_type=np.float64,
+            )
+            if cache is not None:
+                cache[key] = np.asarray(mean_count, dtype=np.float64).reshape(-1)
+        if cache is not None:
+            positions = [g['_longtail_count_index'][tuple(row)] for row in np.sort(cb_ids, axis=1)]
+            mean_count = cache[key][positions]
+        mean_count = np.asarray(mean_count, dtype=np.float64).reshape(-1)
+        if mean_count.shape[0] != cb_ids.shape[0]:
+            txt = 'mean_count rows ({}) and cb_ids rows ({}) should match.'
+            raise ValueError(txt.format(mean_count.shape[0], cb_ids.shape[0]))
+        np.clip(mean_count, a_min=0.0, a_max=None, out=mean_count)
+        if (mean_count > 0).sum() == 0:
+            continue
+        pm_start = time.time()
+        category_rng = randomness.generator(
+            operation_seed,
+            'category',
+            str(obs_col),
+            int(i),
+            int(sg),
+            str(a),
+            str(d),
+        )
+        out += category_rng.poisson(
+            lam=mean_count[:, None],
+            size=(mean_count.shape[0], niter),
+        ).astype(np.float64, copy=False)
+        txt = '{} (poisson): {}/{} matrix_group/ancestral_state/derived_state combinations. '
+        txt += 'Time elapsed for {:,} permutation: {:,} [sec]'
+        if '_longtail_count_components' not in g:
+            print(txt.format(obs_col, i + 1, num_gad_combinat, niter, int(time.time() - pm_start)), flush=True)
+    return out
+
+
+def _estimate_nbinom_alpha(obs_count, mean_count, float_tol, max_alpha=10.0):
+    obs_count = np.asarray(obs_count, dtype=np.float64).reshape(-1)
+    mean_count = np.asarray(mean_count, dtype=np.float64).reshape(-1)
+    if obs_count.shape[0] != mean_count.shape[0]:
+        txt = 'obs_count rows ({}) and mean_count rows ({}) should match.'
+        raise ValueError(txt.format(obs_count.shape[0], mean_count.shape[0]))
+    valid = np.isfinite(obs_count) & np.isfinite(mean_count) & (mean_count > float(float_tol))
+    if int(valid.sum()) < 20:
+        return 0.0, 'auto_insufficient_rows'
+    mu = np.clip(mean_count[valid], a_min=float(float_tol), a_max=None)
+    resid2 = (obs_count[valid] - mu) ** 2
+    alpha_i = (resid2 - mu) / (mu ** 2)
+    alpha_i = alpha_i[np.isfinite(alpha_i)]
+    if alpha_i.shape[0] == 0:
+        return 0.0, 'auto_no_finite_estimates'
+    alpha_i = np.clip(alpha_i, a_min=0.0, a_max=float(max_alpha))
+    alpha = float(np.median(alpha_i))
+    if not np.isfinite(alpha):
+        return 0.0, 'auto_non_finite'
+    return alpha, 'auto'
+
+
+def _resolve_nbinom_alpha(g, obs_count, mean_count):
+    token = 'auto'
+    if g is not None:
+        token = g.get('omega_pvalue_nbinom_alpha', 'auto')
+    if isinstance(token, str) and (token.strip().lower() == 'auto'):
+        alpha, source = _estimate_nbinom_alpha(
+            obs_count=obs_count,
+            mean_count=mean_count,
+            float_tol=float(g.get('float_tol', 1e-12)) if g is not None else 1e-12,
+        )
+        return float(alpha), source
+    alpha = float(token)
+    if (not np.isfinite(alpha)) or (alpha < 0):
+        raise ValueError('omega_pvalue_nbinom_alpha should be a finite value >= 0 or "auto".')
+    return float(alpha), 'fixed'
+
+
+def _sample_nbinom_count_matrix(mean_count, niter, alpha, rng=None):
+    if rng is None:
+        rng = np.random.default_rng()
+    mean_count = np.asarray(mean_count, dtype=np.float64).reshape(-1)
+    if mean_count.ndim != 1:
+        raise ValueError('mean_count should be a 1D array.')
+    if int(niter) <= 0:
+        raise ValueError('niter should be a positive integer.')
+    mean_count = np.clip(mean_count, a_min=0.0, a_max=None)
+    if mean_count.shape[0] == 0:
+        return np.zeros(shape=(0, int(niter)), dtype=np.float64)
+    if alpha <= 0:
+        return rng.poisson(
+            lam=mean_count[:, None],
+            size=(mean_count.shape[0], int(niter)),
+        ).astype(np.float64, copy=False)
+    gamma_shape = 1.0 / float(alpha)
+    gamma_scale = float(alpha) * mean_count[:, None]
+    lam = rng.gamma(
+        shape=gamma_shape,
+        scale=gamma_scale,
+        size=(mean_count.shape[0], int(niter)),
+    )
+    return rng.poisson(lam=lam).astype(np.float64, copy=False)
+
+
+def _calc_nbinom_count_matrix(
+    mode,
+    cb_ids,
+    sub_sg,
+    sub_bg,
+    niter,
+    obs_col,
+    num_gad_combinat,
+    list_igad,
+    g,
+    static_sub_sites,
+    obs_count,
+):
+    cb_ids = np.asarray(cb_ids, dtype=np.int64)
+    niter = int(niter)
+    if cb_ids.ndim != 2:
+        raise ValueError('cb_ids should be a 2D array.')
+    if niter <= 0:
+        raise ValueError('niter should be a positive integer.')
+    out = np.zeros(shape=(cb_ids.shape[0], niter), dtype=np.float64)
+    if cb_ids.shape[0] == 0:
+        return out
+    mean_total = np.zeros(shape=(cb_ids.shape[0],), dtype=np.float64)
+    for i, sg, a, d in list_igad:
+        if a == d:
+            continue
+        if static_sub_sites is None:
+            sub_sites = _resolve_sub_sites(g=g, sub_sg=sub_sg, mode=mode, sg=sg, a=a, d=d, obs_col=obs_col)
+        else:
+            sub_sites = static_sub_sites
+        sub_branches = substitution.get_sub_branches(sub_bg, mode, sg, a, d)
+        mean_count = _calc_urn_expected_overlap(
+            cb_ids=cb_ids,
+            sub_sites=sub_sites,
+            sub_branches=sub_branches,
+            g=g,
+            float_type=np.float64,
+        )
+        mean_count = np.asarray(mean_count, dtype=np.float64).reshape(-1)
+        if mean_count.shape[0] != cb_ids.shape[0]:
+            txt = 'mean_count rows ({}) and cb_ids rows ({}) should match.'
+            raise ValueError(txt.format(mean_count.shape[0], cb_ids.shape[0]))
+        np.clip(mean_count, a_min=0.0, a_max=None, out=mean_count)
+        mean_total += mean_count
+    if (mean_total > 0).sum() == 0:
+        return out
+    if obs_count is None:
+        obs_count = mean_total
+    alpha_cache = g.setdefault('_omega_nbinom_alpha_cache', {})
+    alpha_key = str(obs_col)
+    if alpha_key in alpha_cache:
+        alpha, alpha_source = alpha_cache[alpha_key]
+        alpha_source = str(alpha_source) + '_cached'
+    else:
+        alpha, alpha_source = _resolve_nbinom_alpha(
+            g=g,
+            obs_count=obs_count,
+            mean_count=mean_total,
+        )
+        alpha_cache[alpha_key] = (float(alpha), str(alpha_source))
+    pm_start = time.time()
+    operation_seed = g.get('_omega_operation_seed', None)
+    if operation_seed is None:
+        operation_seed = randomness.next_seed(g, 'omega_nbinom_direct', str(obs_col), int(niter))
+    out = _sample_nbinom_count_matrix(
+        mean_count=mean_total,
+        niter=niter,
+        alpha=alpha,
+        rng=randomness.generator(operation_seed, 'nbinom', str(obs_col)),
+    )
+    txt = '{} (nbinom): categories={}, alpha={:.6g} (source={}), niter={}, elapsed={} sec'
+    print(
+        txt.format(obs_col, int(num_gad_combinat), float(alpha), alpha_source, int(niter), int(time.time() - pm_start)),
+        flush=True,
+    )
+    return out
+
+
+def _get_mode_branch_site_mass(sub_tensor, mode, sg, a, d):
+    if isinstance(sub_tensor, substitution_sparse.SparseSubstitutionTensor):
+        if mode == 'spe2spe':
+            mat = sub_tensor.get_block(int(sg), int(a), int(d))
+            return np.asarray(mat.toarray(), dtype=np.float64)
+        if mode == 'spe2any':
+            return np.asarray(sub_tensor.project_spe2any(int(sg), int(a)).toarray(), dtype=np.float64)
+        if mode == 'any2spe':
+            return np.asarray(sub_tensor.project_any2spe(int(sg), int(d)).toarray(), dtype=np.float64)
+        if mode == 'any2any':
+            return np.asarray(sub_tensor.project_any2any(int(sg)).toarray(), dtype=np.float64)
+        raise ValueError('Unsupported mode: {}'.format(mode))
+    sub_tensor = np.asarray(sub_tensor)
+    if mode == 'spe2spe':
+        return np.asarray(sub_tensor[:, :, int(sg), int(a), int(d)], dtype=np.float64)
+    if mode == 'spe2any':
+        return np.asarray(sub_tensor[:, :, int(sg), int(a), :].sum(axis=2), dtype=np.float64)
+    if mode == 'any2spe':
+        return np.asarray(sub_tensor[:, :, int(sg), :, int(d)].sum(axis=2), dtype=np.float64)
+    if mode == 'any2any':
+        return np.asarray(sub_tensor[:, :, int(sg), :, :].sum(axis=(2, 3)), dtype=np.float64)
+    raise ValueError('Unsupported mode: {}'.format(mode))
+
+
+def _calc_poisson_full_count_matrix(
+    mode,
+    cb_ids,
+    sub_tensor,
+    niter,
+    obs_col,
+    num_gad_combinat,
+    list_igad,
+    g,
+):
+    cb_ids = np.asarray(cb_ids, dtype=np.int64)
+    niter = int(niter)
+    if cb_ids.ndim != 2:
+        raise ValueError('cb_ids should be a 2D array.')
+    if niter <= 0:
+        raise ValueError('niter should be a positive integer.')
+    out = np.zeros(shape=(cb_ids.shape[0], niter), dtype=np.float64)
+    if cb_ids.shape[0] == 0:
+        return out
+    operation_seed = g.get('_omega_operation_seed', None)
+    if operation_seed is None:
+        operation_seed = randomness.next_seed(g, 'omega_poisson_full_direct', str(obs_col), int(niter))
+    for i, sg, a, d in list_igad:
+        if a == d:
+            continue
+        sub_site_mass = _get_mode_branch_site_mass(
+            sub_tensor=sub_tensor,
+            mode=mode,
+            sg=sg,
+            a=a,
+            d=d,
+        )
+        np.clip(sub_site_mass, a_min=0.0, a_max=None, out=sub_site_mass)
+        sub_branches = sub_site_mass.sum(axis=1, dtype=np.float64)
+        sub_sites = np.zeros_like(sub_site_mass, dtype=np.float64)
+        nonzero_branch = (sub_branches > 0)
+        if nonzero_branch.any():
+            sub_sites[nonzero_branch, :] = (
+                sub_site_mass[nonzero_branch, :] /
+                sub_branches[nonzero_branch, None]
+            )
+        mean_count = _calc_urn_expected_overlap(
+            cb_ids=cb_ids,
+            sub_sites=sub_sites,
+            sub_branches=sub_branches,
+            g=g,
+            float_type=np.float64,
+        )
+        mean_count = np.asarray(mean_count, dtype=np.float64).reshape(-1)
+        if mean_count.shape[0] != cb_ids.shape[0]:
+            txt = 'mean_count rows ({}) and cb_ids rows ({}) should match.'
+            raise ValueError(txt.format(mean_count.shape[0], cb_ids.shape[0]))
+        np.clip(mean_count, a_min=0.0, a_max=None, out=mean_count)
+        if (mean_count > 0).sum() == 0:
+            continue
+        pm_start = time.time()
+        category_rng = randomness.generator(
+            operation_seed,
+            'category',
+            str(obs_col),
+            int(i),
+            int(sg),
+            str(a),
+            str(d),
+        )
+        out += category_rng.poisson(
+            lam=mean_count[:, None],
+            size=(mean_count.shape[0], niter),
+        ).astype(np.float64, copy=False)
+        txt = '{} (poisson_full): {}/{} matrix_group/ancestral_state/derived_state combinations. '
+        txt += 'Time elapsed for {:,} permutation: {:,} [sec]'
+        if '_longtail_count_components' not in g:
+            print(txt.format(obs_col, i + 1, num_gad_combinat, niter, int(time.time() - pm_start)), flush=True)
+    return out
+
+
+def _get_mode_permutation_count_matrix(cb_ids, sub_tensor, mode, SN, niter, g, obs_count=None):
+    # This cache is owned by one calibration pass and one output statistic.
+    # It is discarded before inputs, training branches, or ASRV can change.
+    cache = g.get('_longtail_count_components')
+    key = (id(sub_tensor), SN, mode)
+    if cache is not None and key in cache:
+        components = cache[key]
+    else:
+        components = _prepare_substitution_permutation_components(sub_tensor, mode, SN, g)
+        if cache is not None:
+            cache[key] = components
+    sub_bg, sub_sg, list_igad, obs_col, num_gad_combinat = components
+    static_sub_sites = _get_static_sub_sites_if_available(g=g, sub_sg=sub_sg, mode=mode, obs_col=obs_col)
+    null_model = _resolve_omega_pvalue_null_model(g=g)
+    operation_seed = randomness.next_seed(
+        g,
+        'omega_pvalue',
+        str(SN),
+        str(mode),
+        int(niter),
+        str(null_model),
+    )
+    local_g = dict(g)
+    local_g['_omega_operation_seed'] = int(operation_seed)
+    txt = 'pomegaC {}{}: {} count matrix (rows={:,}, niter={:,}, categories={:,})'
+    model_label = 'randomization'
+    if null_model == 'poisson':
+        model_label = 'poisson-rate'
+    if null_model == 'poisson_full':
+        model_label = 'poisson-full-rate'
+    if null_model == 'nbinom':
+        model_label = 'nbinom-rate'
+    if '_longtail_count_components' not in g:
+        print(txt.format(SN, mode, model_label, cb_ids.shape[0], int(niter), int(num_gad_combinat)), flush=True)
+    if null_model == 'hypergeom':
+        return _calc_hypergeom_count_matrix(
+            mode=mode,
+            cb_ids=cb_ids,
+            sub_sg=sub_sg,
+            sub_bg=sub_bg,
+            niter=int(niter),
+            obs_col=obs_col,
+            num_gad_combinat=num_gad_combinat,
+            list_igad=list_igad,
+            g=local_g,
+            static_sub_sites=static_sub_sites,
+        )
+    if null_model == 'poisson':
+        return _calc_poisson_count_matrix(
+            mode=mode,
+            cb_ids=cb_ids,
+            sub_sg=sub_sg,
+            sub_bg=sub_bg,
+            niter=int(niter),
+            obs_col=obs_col,
+            num_gad_combinat=num_gad_combinat,
+            list_igad=list_igad,
+            g=local_g,
+            static_sub_sites=static_sub_sites,
+        )
+    if null_model == 'poisson_full':
+        return _calc_poisson_full_count_matrix(
+            mode=mode,
+            cb_ids=cb_ids,
+            sub_tensor=sub_tensor,
+            niter=int(niter),
+            obs_col=obs_col,
+            num_gad_combinat=num_gad_combinat,
+            list_igad=list_igad,
+            g=local_g,
+        )
+    if null_model == 'nbinom':
+        return _calc_nbinom_count_matrix(
+            mode=mode,
+            cb_ids=cb_ids,
+            sub_sg=sub_sg,
+            sub_bg=sub_bg,
+            niter=int(niter),
+            obs_col=obs_col,
+            num_gad_combinat=num_gad_combinat,
+            list_igad=list_igad,
+            g=local_g,
+            static_sub_sites=static_sub_sites,
+            obs_count=obs_count,
+        )
+    raise ValueError('Unsupported omega_pvalue_null_model: {}'.format(null_model))
+
+
+def _resolve_omega_pvalue_dsc_calibration_transformation(cb, sub, g):
+    col_dSc = 'dSC' + sub
+    col_noncalibrated_dSc = col_dSc + '_nocalib'
+    col_omega = 'omegaC' + sub
+    col_noncalibrated_omega = col_omega + '_nocalib'
+    has_calibrated_columns = all(
+        [col in cb.columns for col in [col_dSc, col_noncalibrated_dSc, col_omega, col_noncalibrated_omega]]
+    )
+    if not has_calibrated_columns:
+        return None
+    transformation = str(g.get('calibrate_longtail_transformation', 'quantile')).strip().lower()
+    if transformation == '':
+        transformation = 'quantile'
+    if transformation not in ['quantile', 'gamma']:
+        raise ValueError('Unsupported calibrate_longtail_transformation: {}'.format(transformation))
+    return transformation
+
+
+def add_omega_empirical_pvalues(cb, ON_tensor, OS_tensor, g):
+    if not bool(g.get('calc_omega_pvalue', False)):
+        return cb
+    if _resolve_expectation_method(g=g) != 'urn':
+        txt = 'Skipping --calc_omegaC_pvalue because --expectation_method is not "urn".\n'
+        sys.stderr.write(txt)
+        return cb
+    from csubst import omega_null
+    omega_null.validate_config(g)
+    omega_null.validate_population(cb, g)
+    if omega_null.needs_joint(g):
+        return omega_null.add_joint_pvalues(cb, ON_tensor, OS_tensor, g)
+    if (g.get('longtail_method', 'independent_null') == 'independent_null'
+            and any(str(col).startswith('calibration_reference_') for col in cb.columns)):
+        from csubst import omega_calibration
+        return omega_calibration.add_independent_null_pvalues(cb, ON_tensor, OS_tensor, g)
+    calibrated = any(str(c).startswith('dSC') and str(c).endswith('_nocalib') for c in cb)
+    if pseudocount.validate_args(g)['pseudocount_enabled'] or calibrated:
+        return omega_null.add_fixed_pvalues(cb, ON_tensor, OS_tensor, g)
+    null_model = _resolve_omega_pvalue_null_model(g=g)
+    txt = 'omega_C empirical p-value null model: {}'
+    print(txt.format(null_model), flush=True)
+    pvalue_schedule = _resolve_omega_pvalue_niter_schedule(g=g)
+    pvalue_refine_upper_edge_bins = _resolve_omega_pvalue_refine_upper_edge_bins(g=g)
+    if null_model == 'nbinom':
+        g['_omega_nbinom_alpha_cache'] = {}
+    txt = 'omega_C empirical p-value staged schedule ({}): {}'
+    print(txt.format(null_model, ','.join([str(int(v)) for v in pvalue_schedule])), flush=True)
+    cb_ids = _get_cb_ids(cb)
+    output_stats = _resolve_requested_output_stats(g)
+    smoothing_context = _get_pseudocount_context(cb, g, output_stats)
+    for sub in output_stats:
+        alphas = omega_null.stat_alphas(smoothing_context, sub)
+        col_omega = 'omegaC' + sub
+        col_exp_N = 'ECN' + sub
+        col_exp_S = 'ECS' + sub
+        if not all([col in cb.columns for col in [col_omega, col_exp_N, col_exp_S]]):
+            continue
+        required_modes = output_stat.get_required_base_stats([sub])
+        calibrate_dsc_transformation = _resolve_omega_pvalue_dsc_calibration_transformation(cb=cb, sub=sub, g=g)
+        if calibrate_dsc_transformation is not None:
+            txt = 'pomegaC {}: applying dSc {} calibration to permutation omega null'
+            print(txt.format(sub, calibrate_dsc_transformation), flush=True)
+        obs_omega_values = cb.loc[:, col_omega].to_numpy(dtype=np.float64, copy=False)
+        exp_N_values = cb.loc[:, col_exp_N].to_numpy(dtype=np.float64, copy=False)
+        exp_S_values = cb.loc[:, col_exp_S].to_numpy(dtype=np.float64, copy=False)
+        ge_ranks = np.zeros(shape=(cb.shape[0],), dtype=np.int64)
+        valid_niter = np.zeros(shape=(cb.shape[0],), dtype=np.int64)
+        attempted = np.zeros(cb.shape[0], dtype=np.int64)
+        active_rows = np.arange(cb.shape[0], dtype=np.int64)
+        prev_total_niter = 0
+        for stage_index, stage_niter in enumerate(pvalue_schedule):
+            stage_niter = int(stage_niter)
+            incremental_niter = stage_niter - prev_total_niter
+            if incremental_niter <= 0:
+                txt = 'omega_pvalue_niter_schedule should be strictly increasing; got {} after {}.'
+                raise ValueError(txt.format(stage_niter, prev_total_niter))
+            txt = 'pomegaC {} stage {}/{}: cumulative_niter={:,}, incremental_niter={:,}, rows={:,}'
+            print(
+                txt.format(
+                    sub,
+                    stage_index + 1,
+                    len(pvalue_schedule),
+                    stage_niter,
+                    incremental_niter,
+                    active_rows.shape[0],
+                ),
+                flush=True,
+            )
+            if active_rows.shape[0] == 0:
+                break
+            mode_to_count_N = dict()
+            mode_to_count_S = dict()
+            active_cb_ids = cb_ids[active_rows, :]
+            for mode in required_modes:
+                obs_count_N = None
+                obs_count_S = None
+                if null_model == 'nbinom':
+                    obs_col_N = 'OCN' + mode
+                    obs_col_S = 'OCS' + mode
+                    if obs_col_N in cb.columns:
+                        obs_count_N = cb.loc[:, obs_col_N].to_numpy(dtype=np.float64, copy=False)[active_rows]
+                    if obs_col_S in cb.columns:
+                        obs_count_S = cb.loc[:, obs_col_S].to_numpy(dtype=np.float64, copy=False)[active_rows]
+                mode_to_count_N[mode] = _get_mode_permutation_count_matrix(
+                    cb_ids=active_cb_ids,
+                    sub_tensor=ON_tensor,
+                    mode=mode,
+                    SN='N',
+                    niter=incremental_niter,
+                    g=g,
+                    obs_count=obs_count_N,
+                )
+                mode_to_count_S[mode] = _get_mode_permutation_count_matrix(
+                    cb_ids=active_cb_ids,
+                    sub_tensor=OS_tensor,
+                    mode=mode,
+                    SN='S',
+                    niter=incremental_niter,
+                    g=g,
+                    obs_count=obs_count_S,
+                )
+            perm_count_N = _compose_permutation_count_matrix(
+                stat=sub,
+                mode_to_count=mode_to_count_N,
+                tol=g['float_tol'],
+            )
+            perm_count_S = _compose_permutation_count_matrix(
+                stat=sub,
+                mode_to_count=mode_to_count_S,
+                tol=g['float_tol'],
+            )
+            ge_increment, valid_increment = _calc_omega_empirical_upper_tail_counts(
+                obs_omega=obs_omega_values[active_rows],
+                exp_N=exp_N_values[active_rows],
+                exp_S=exp_S_values[active_rows],
+                perm_count_N=perm_count_N,
+                perm_count_S=perm_count_S,
+                float_tol=g['float_tol'],
+                calibrate_dsc_transformation=calibrate_dsc_transformation,
+                alphas=alphas,
+            )
+            attempted[active_rows] += incremental_niter
+            ge_ranks[active_rows] += ge_increment
+            valid_niter[active_rows] += valid_increment
+            is_last_stage = (stage_index == (len(pvalue_schedule) - 1))
+            if is_last_stage:
+                break
+            refine_mask = _needs_omega_pvalue_upper_tail_edge_refinement(
+                obs_omega=obs_omega_values[active_rows],
+                exp_S=exp_S_values[active_rows],
+                ge_ranks=ge_ranks[active_rows],
+                valid_niter=valid_niter[active_rows],
+                edge_bins=pvalue_refine_upper_edge_bins,
+            )
+            if calibrate_dsc_transformation is not None:
+                # Rank-based dS calibration must use a stable row population at
+                # every stage; otherwise the null distribution changes as rows
+                # are refined.
+                refine_mask[:] = True
+            next_rows = active_rows[refine_mask]
+            txt = 'pomegaC {} refinement after stage {}: rows {} -> {} (upper_edge_bins={})'
+            print(
+                txt.format(
+                    sub,
+                    stage_index + 1,
+                    active_rows.shape[0],
+                    next_rows.shape[0],
+                    int(pvalue_refine_upper_edge_bins),
+                ),
+                flush=True,
+            )
+            active_rows = next_rows
+            prev_total_niter = stage_niter
+        pvalue = _calc_omega_empirical_upper_tail_pvalues_from_counts(
+            obs_omega=obs_omega_values,
+            exp_S=exp_S_values,
+            ge_ranks=ge_ranks,
+            valid_niter=valid_niter,
+        )
+        omega_null.add_diagnostics(cb, sub, smoothing_context, valid_niter, attempted, calibrate_dsc_transformation)
+        col_p = 'pomegaC' + sub
+        cb.loc[:, col_p] = pvalue
+        col_q = 'qomegaC' + sub
+        qvalue = _calc_bh_fdr_qvalues(pvalue)
+        cb.loc[:, col_q] = qvalue
+        if 'calibration_reference_' + sub in cb:
+            cb['calibration_pvalue_status_' + sub] = 'empirical_full_population'
+            cb['calibration_test_n_' + sub] = valid_niter
+            cb['calibration_test_undefined_' + sub] = int(pvalue_schedule[-1]) - valid_niter
+        finite = np.isfinite(pvalue)
+        if finite.any():
+            txt = 'Arity = {:,}, cb: median {} = {:.4f} ({:,}/{:,} finite)'
+            print(
+                txt.format(
+                    cb_ids.shape[1],
+                    col_p,
+                    float(np.nanmedian(pvalue)),
+                    int(finite.sum()),
+                    int(pvalue.shape[0]),
+                ),
+                flush=True,
+            )
+        finite_q = np.isfinite(qvalue)
+        if finite_q.any():
+            txt = 'Arity = {:,}, cb: median {} = {:.4f} ({:,}/{:,} finite)'
+            print(
+                txt.format(
+                    cb_ids.shape[1],
+                    col_q,
+                    float(np.nanmedian(qvalue)),
+                    int(finite_q.sum()),
+                    int(qvalue.shape[0]),
+                ),
+                flush=True,
+            )
+    return cb
+
+
+def print_cb_stats(cb, prefix, output_stats):
+    arity = cb.columns.str.startswith('branch_id_').sum()
+    hd = 'Arity = {:,}, {}:'.format(arity, prefix)
+    for sub in output_stats:
+        col_omega = 'omegaC'+sub
+        if col_omega not in cb.columns:
+            continue
+        median_value = cb.loc[:,col_omega].median()
+        txt = '{} median {} (non-corrected for dNc vs dSc distribution ranges): {:.3f}'
+        print(txt.format(hd, col_omega, median_value), flush=True)
+
+
+def calc_omega(cb, OS_tensor, ON_tensor, g, reuse_pseudocount_context=False):
+    cb = get_E(cb, g, ON_tensor, OS_tensor)
+    output_stats = _resolve_requested_output_stats(g)
+    from csubst import omega_null
+    reuse = reuse_pseudocount_context and omega_null.data_dependent(g)
+    if reuse:
+        context = g.get('_pseudocount_context')
+        if context is None:
+            raise ValueError('Supplemental rows require the original pseudocount fitting context.')
+    else:
+        context = _get_pseudocount_context(cb=cb, g=g, output_stats=output_stats)
+    g['_pseudocount_context'] = context
+    if context['config']['pseudocount_add_output_columns'] and not reuse:
+        _print_pseudocount_summary(context=context)
+        _write_pseudocount_summary_to_cb_stats(g=g, context=context)
+    cb = get_omega(cb, g, context=context)
+    cb = get_CoD(cb, g)
+    if reuse and g.get('calc_omega_pvalue', False):
+        for sub in output_stats:
+            cb['pomegaC'+sub] = np.nan
+            cb['qomegaC'+sub] = np.nan
+            omega_null.add_diagnostics(cb, sub, context, np.zeros(len(cb), dtype=int), 0)
+            cb['pvalue_status_'+sub] = 'unavailable_full_population_null'
+            cb['pvalue_alpha_'+sub] = 'not_tested'
+            cb['pvalue_prior_'+sub] = 'not_tested'
+            cb['pvalue_joint_'+sub] = 'not_tested'
+    else:
+        cb = add_omega_empirical_pvalues(cb=cb, ON_tensor=ON_tensor, OS_tensor=OS_tensor, g=g)
+    print_cb_stats(cb=cb, prefix='cb', output_stats=output_stats)
+    return(cb, g)
+
+
+def calibrate_dsc(cb, transformation='quantile', output_stats=None, float_tol=1e-12,
+                  g=None, ON_tensor=None, OS_tensor=None, reuse_reference=False):
+    if g is not None:
+        if transformation != 'quantile':
+            raise ValueError('Frozen long-tail references currently support quantile transformation only.')
+        from csubst import omega_calibration
+        return omega_calibration.apply_calibration(
+            cb, g, ON_tensor=ON_tensor, OS_tensor=OS_tensor,
+            reuse_reference=reuse_reference,
+        )
+    prefix='cb'
+    arity = cb.columns.str.startswith('branch_id_').sum()
+    hd = 'Arity = {:,}, {}:'.format(arity, prefix)
+    if output_stats is None:
+        output_stats = list(output_stat.ALL_OUTPUT_STATS)
+    for sub in output_stats:
+        col_dNc = 'dNC'+sub
+        col_dSc = 'dSC'+sub
+        col_omega = 'omegaC'+sub
+        col_pvalue = 'pomegaC'+sub
+        col_qvalue = 'qomegaC'+sub
+        col_noncalibrated_dSc = 'dSC'+sub+'_nocalib'
+        col_noncalibrated_omega = 'omegaC'+sub+'_nocalib'
+        if not all([col in cb.columns for col in [col_dNc, col_dSc, col_omega]]):
+            continue
+        dNc_values = cb.loc[:, col_dNc].to_numpy(dtype=np.float64, copy=False)
+        uncorrected_dSc_values = cb.loc[:, col_dSc].to_numpy(dtype=np.float64, copy=False)
+        fit_mask = (np.isfinite(dNc_values) & np.isfinite(uncorrected_dSc_values))
+        if (~fit_mask).all():
+            txt = 'dSc calibration could not be applied: {} (no finite dNc/dSc pairs)\n'
+            sys.stderr.write(txt.format(sub))
+            continue
+        excluded_count = int((~fit_mask).sum())
+        if (excluded_count > 0):
+            txt = 'dSc calibration could not be applied to {:,}/{:,} branch combinations for {}\n'
+            sys.stderr.write(txt.format(excluded_count, cb.shape[0], sub))
+        rename_map = {col_dSc: col_noncalibrated_dSc, col_omega: col_noncalibrated_omega}
+        if col_pvalue in cb.columns:
+            rename_map[col_pvalue] = col_pvalue + '_nocalib'
+        if col_qvalue in cb.columns:
+            rename_map[col_qvalue] = col_qvalue + '_nocalib'
+        cb = cb.rename(columns=rename_map)
+        calibrated_dSc_values, _, is_nocalib_higher = _calibrate_dsc_vector(
+            dNc_values=dNc_values,
+            dSc_values=uncorrected_dSc_values,
+            transformation=transformation,
+        )
+        cb.loc[:, col_dSc] = calibrated_dSc_values
+        calibrated_dNc = cb.loc[:,col_dNc].to_numpy(dtype=np.float64, copy=False)
+        calibrated_dSc = cb.loc[:, col_dSc].to_numpy(dtype=np.float64, copy=False)
+        calibrated_omega = _calc_raw_omega(
+            dNc=calibrated_dNc,
+            dSc=calibrated_dSc,
+            float_tol=float(float_tol),
+        )
+        noncalibrated_omega_values = cb.loc[:, col_noncalibrated_omega].to_numpy(dtype=np.float64, copy=False)
+        calibrated_omega[~fit_mask] = noncalibrated_omega_values[~fit_mask]
+        cb.loc[:, col_omega] = calibrated_omega
+        median_value = cb.loc[:,col_omega].median()
+        corrected_count = int(np.sum(fit_mask & (calibrated_dSc_values > uncorrected_dSc_values)))
+        txt = '{} median {} ({:,}/{:,} branch combinations were corrected for dNc vs dSc distribution ranges): {:.3f}'
+        print(txt.format(hd, col_omega, corrected_count, cb.shape[0], median_value), flush=True)
+    return cb

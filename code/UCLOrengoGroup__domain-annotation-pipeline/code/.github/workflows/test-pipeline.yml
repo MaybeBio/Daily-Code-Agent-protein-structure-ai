@@ -1,0 +1,61 @@
+# Runs an autotest of the pipeline 
+name: Pipeline test (30 TED test IDs)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java (for Nextflow)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Nextflow
+        run: |
+          curl -s https://get.nextflow.io | bash
+          sudo mv nextflow /usr/local/bin/nextflow
+          nextflow version
+      
+      - name: Install nf-test
+        run: |
+          curl -fsSL https://get.nf-test.com | bash
+          sudo mv nf-test /usr/local/bin/nf-test
+          nf-test -version
+
+      - name: Build docker images for tests (temporary until GHCR default)
+        run: |
+          docker compose version
+          docker compose build
+
+      - name: Run test
+        env:
+          NXF_ANSI_LOG: "false"
+          NFT_DIFF_ARGS: "-u -U 5"
+        run: |
+          set -euxo pipefail
+          nf-test test --profile +docker --ci
+
+      - name: Upload nf-test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nf-test-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .nf-test/tests/*/output
+            .nf-test/tests/*/reports
+            .nf-test/tests/*/meta
+            .nextflow.log
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+
+

@@ -1,0 +1,73 @@
+import numpy as np
+import pandas as pd
+import gzip
+import io
+import pytest
+
+from csubst import tsv
+
+
+def test_write_dataframe_matches_pandas_for_analysis_types(tmp_path):
+    frame = pd.DataFrame(
+        {
+            "branch_id": np.array([1, 2, 3], dtype=np.int64),
+            "score": np.array([1.23456, np.nan, np.inf], dtype=np.float64),
+            "flag": [True, False, True],
+            "label": ["plain", "tab\tvalue", None],
+        }
+    )
+    expected_path = tmp_path / "pandas.tsv"
+    observed_path = tmp_path / "csubst.tsv"
+    frame.to_csv(expected_path, sep="\t", index=False, float_format="%.4f", lineterminator="\n")
+
+    tsv.write_dataframe(frame, observed_path, float_format="%.4f", chunksize=2)
+
+    assert observed_path.read_bytes() == expected_path.read_bytes()
+
+
+def test_write_dataframe_supports_append_without_duplicate_header(tmp_path):
+    frame = pd.DataFrame({"x": [1.0, 2.0], "name": ["a", "b"]})
+    output_path = tmp_path / "chunks.tsv"
+    tsv.write_dataframe(frame.iloc[:1], output_path, float_format="%.2f")
+    tsv.write_dataframe(
+        frame.iloc[1:],
+        output_path,
+        float_format="%.2f",
+        header=False,
+        mode="a",
+    )
+    assert output_path.read_text(encoding="utf-8") == "x\tname\n1.00\ta\n2.00\tb\n"
+
+
+def test_write_dataframe_preserves_zero_column_legacy_output(tmp_path):
+    frame = pd.DataFrame(index=np.arange(3))
+    output_path = tmp_path / "zero_columns.tsv"
+
+    tsv.write_dataframe(frame, output_path)
+
+    assert output_path.read_bytes() == b"\n"
+
+
+def test_write_dataframe_zero_columns_without_header_is_empty(tmp_path):
+    frame = pd.DataFrame(index=np.arange(3))
+    output_path = tmp_path / "zero_columns_no_header.tsv"
+
+    tsv.write_dataframe(frame, output_path, header=False)
+
+    assert output_path.read_bytes() == b""
+
+
+@pytest.mark.parametrize("header", [False, True])
+def test_write_dataframe_zero_columns_supports_gzip(tmp_path, header):
+    path = tmp_path / "empty.tsv.gz"
+    tsv.write_dataframe(pd.DataFrame(index=range(3)), path, header=header)
+    with gzip.open(path, "rt") as handle:
+        assert handle.read() == ("\n" if header else "")
+
+
+@pytest.mark.parametrize("stream_type", [io.StringIO, io.BytesIO])
+def test_write_dataframe_zero_columns_supports_caller_stream(stream_type):
+    stream = stream_type()
+    tsv.write_dataframe(pd.DataFrame(index=range(3)), stream)
+    assert not stream.closed
+    assert stream.getvalue() in ("\n", b"\n")

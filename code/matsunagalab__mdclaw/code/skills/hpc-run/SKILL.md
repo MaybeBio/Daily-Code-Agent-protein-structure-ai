@@ -1,0 +1,134 @@
+---
+name: hpc-run
+description: "SLURM-based HPC submission for MDClaw workflow nodes. Handles cluster inspection, single-node and job-array submission, status sync to the DAG, and production restart extensions."
+---
+
+# HPC Run Skill
+
+Follow `skills/common/preamble.md`, `skills/common/run-loop.md` (the canonical
+node loop), and `skills/common/tool-output.md` for error handling.
+
+Use this skill when the user wants to run minimization, equilibration, or
+production nodes on SLURM, submit multiple replicates or systems, monitor/recover
+jobs, configure cluster policy, or extend production runs.
+
+Structure preparation remains a login-node or interactive step: run
+`prepare_complex`, `solvate_structure` / `embed_in_membrane` and
+`build_amber_system` in the foreground and wait for their JSON (minutes to
+tens of minutes; the CLI reports `still running` on stderr). Do not submit
+them as Slurm jobs and do not background them. HPC submission starts after a
+`topo` node exists and the next `min`/`eq`/`prod` node can resolve its inputs
+from the DAG.
+
+## Step 0: Confirm
+
+- `job_dir` and the `node_id` to submit (from `create_node`).
+- Current DAG state via `mdclaw inspect_job --job-dir <job_dir>`: a completed
+  `topo` (and, for `prod`, a completed `eq`) parent, and no conflicting running
+  work.
+- Cluster resources/policy if unknown: inspect with `mdclaw inspect_cluster`
+  and `mdclaw show_policy`. A partition whose `gpu_type` is `null` mixes GPU
+  models: read the top-level `gpu_inventory` (per model: `node_list`,
+  `gpus_total`, `gpus_free`) and `node_gres` (per node; a node may carry
+  several models) and pin a model that has `gpus_free > 0` with
+  `--gres gpu:<model>:1` instead of trusting `gpus_per_node`. On a large
+  machine `node_list` / `free_node_list` are folded host ranges
+  (`rk[0007,2500-2502]`, usable as `--nodelist`) and `node_gres` is grouped per
+  GRES (`node_gres_grouped: true`). `gpus_free` is
+  `null` when the site does not report GresUsed. When every model shows 0 free,
+  a submission will queue: say so, with `sbatch --test-only`'s start estimate,
+  before submitting a long chain.
+  When policy is missing or the user gives limits,
+  set it explicitly with `mdclaw set_policy` (partitions, GPU/time/memory
+  caps, default partition). For containerized compute nodes, run
+  `mdclaw configure_container --image /abs/path/mdclaw.sif --extra-flags=--nv`;
+  submission tools then auto-bind each task's `job_dir`.
+
+## Route To The Right Guidance
+
+- Shared SIF with no host MDClaw installation: [direct SIF invocation](https://github.com/matsunagalab/mdclaw/blob/HEAD/skills/hpc-run/sif-slurm.md).
+- One DAG node as one SLURM job:
+  `skills/hpc-run/submit-single.md`
+- A rounds scheme (replicas of `skills/md-production/rounds.md`, weighted
+  ensemble of `skills/md-we/SKILL.md`): one GPU job runs `run_rounds
+  --max-wall-hours <limit - 1>` via `submit_job --script`; resubmit the same
+  command to continue (the state is in the DAG). Small systems:
+  `run_rounds --executor mps` on the login node submits each round as
+  `submit_mps_job` jobs instead.
+- Several nodes at the same stage whose systems are too small to fill the
+  GPU (replicates, seeds, several small systems), sharing one GPU under
+  NVIDIA MPS -- the default for replicate sets of small systems on any
+  NVIDIA GPU cluster: `skills/hpc-run/submit-mps.md`
+- Homogeneous batches of large systems, one GPU each:
+  `skills/hpc-run/submit-array.md`
+- Monitoring, status sync, logs, and recovery:
+  `skills/hpc-run/monitor-recover.md`
+- Extending a completed production node:
+  `skills/hpc-run/prod-extension.md`
+- Multi-system study campaigns: resolve each registered `study.json`
+  `jobs[].job_dir`, then submit and monitor per job with the pages above.
+  The study is an index; keep SLURM state in each job's node metadata.
+
+## Critical Rules
+
+- **Immediately after topology exists, submit the whole `min -> eq -> prod`
+  chain, then stop.** Invoke `submit_job` through the selected MDClaw runtime
+  for minimization, equilibration with
+  `--dependency afterok:<min_slurm_id>`, and production with
+  `--dependency afterok:<eq_slurm_id>`; each `submit_job` result's
+  `next.chain_command` is that next submission, filled in. Production must be the final `sbatch`.
+  Report all three job IDs and the DAG handoff, then exit without polling unless
+  the caller explicitly asked you to see the run finish. Submit parents before
+  children: a child whose parent has no Slurm job is refused
+  (`parent_not_submitted`), and an `afterok` you left out on a queued parent's
+  job is added for you (`dependency_added`).
+- `submit_job` parses every literal `mdclaw` line of `--script` with the CLI's
+  own parser and checks the node's declared conditions before sbatch. On
+  `script_arguments_invalid`, `script_placeholder_unfilled` or a
+  `condition_mismatch`, resubmit with the `corrected_command` in `next_action`;
+  never paste `...` or `<job_dir>` from an example. Keep job and output
+  directories on shared storage (`submission_path_not_shared` names the path).
+- A shared-SIF deployment calls host SLURM clients through standard binds;
+  follow [sif-slurm.md](https://github.com/matsunagalab/mdclaw/blob/HEAD/skills/hpc-run/sif-slurm.md), including bind-environment cleanup.
+  A checkout deployment may instead use its existing `bin/mdclaw`. Do not
+  create a host launcher or clone a checkout for the shared-SIF route.
+- On a SIF-only host (no host launcher), submit through `singularity exec` as
+  `skills/hpc-run/sif-slurm.md` describes. The CLI writes the container
+  runtime's absolute path into the sbatch script (host PATH read from the
+  launcher process); if it reports `container_runtime_not_found`, follow its
+  `next_action` rather than submitting by hand. A `notes` entry saying the
+  runtime is not visible inside the image is normal: the job is fine, do not
+  cancel it.
+- Always pass both `--job-dir` and `--node-id` when submitting or running a DAG
+  workflow node.
+- MD stage tools run only inside a Slurm job. On the login node they refuse
+  (`md_outside_allocation`, node still pending) and `next_action` is the
+  node's `submit_job` command; run that, do not switch to `--platform CPU`.
+  Inside a GPU job whose container lacks `--nv` they refuse
+  `gpu_allocated_platform_unavailable`: fix the container
+  (`configure_container --extra-flags=--nv`) and submit again.
+- Do not pass `--system-xml-file`, `--topology-pdb-file`, `--state-xml-file`, or `--restart-from` in normal
+  DAG SLURM commands; resolver logic handles these.
+- `COMPLETED` SLURM state alone does not mark a node complete. The MDClaw tool
+  running inside the job owns the final `complete_node` call.
+- **Simulations too small for the GPU share it under MPS.** When two or more
+  nodes are ready at the same stage (replicates, seeds, several small
+  systems) and one simulation cannot fill the GPU (about 100k atoms or fewer
+  on a data-centre GPU, less on a smaller GPU), submit them with one
+  `submit_mps_job` per stage instead of one GPU job each: the aggregate
+  throughput is 2x or more for small systems (NVIDIA on H100/L40S; 2.65x
+  measured on a GB200 with 8 tasks) for the GPU-hours of one GPU. The
+  decision table, the GPU-class extrapolation and the calibration recipe are
+  in `submit-mps.md`. A single system, or one above about 400k atoms, takes
+  `submit_job`.
+- Use arrays only for homogeneous, low-failure task sets of large systems.
+  Use individual jobs with dependencies when failure isolation matters.
+- GPU resources stay in sync with the OpenMM platform automatically. When a
+  node's run command uses `--platform CUDA` (or `--platform OpenCL`) and you
+  pass neither `--gpus` nor `--gres`, `submit_job` / `submit_array_job` auto-set
+  `--gpus 1` and emit a warning, so a CUDA run never lands on a CPU-only node.
+  On a GPU cluster, default `min`/`eq`/`prod` to `--platform CUDA` so they
+  request a GPU. Pass `--gpus N` for multi-GPU, or `--gres gpu:<type>:N` on
+  clusters that require GRES form (`--gres` also suppresses the autodetection).
+  `--platform auto` does NOT trigger a GPU request on HPC: without an allocated
+  GPU it falls back to CPU, so make GPU intent explicit with `--platform CUDA`.

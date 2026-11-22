@@ -1,0 +1,1183 @@
+"""SQLite persistence -- shared by the pipeline (writer) and the Flask app (reader).
+
+One row per processed polymer entity. The full metric dict, per-residue arrays, domain
+list and heatmap data are stored as JSON; the handful of columns used for sorting,
+filtering and the leaderboard are promoted to real columns. Runs group entities into the
+weekly batch that produced them (`label` = the release Wednesday the run covers).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Iterator, Optional
+
+from . import config
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    label        TEXT NOT NULL,          -- release date this run covers (YYYY-MM-DD)
+    since        TEXT,
+    until        TEXT,
+    started_at   TEXT,
+    finished_at  TEXT,
+    n_discovered INTEGER DEFAULT 0,
+    n_compared   INTEGER DEFAULT 0,
+    n_skipped    INTEGER DEFAULT 0,
+    status       TEXT DEFAULT 'running',
+    kind         TEXT DEFAULT 'weekly'   -- 'weekly' (the ongoing watch) or 'backfill' (historical chunk)
+);
+
+CREATE TABLE IF NOT EXISTS entities (
+    entity_id          TEXT PRIMARY KEY,   -- e.g. 7XYZ_1
+    entry_id           TEXT,
+    chain              TEXT,
+    uniprot            TEXT,
+    uniprot_name       TEXT,
+    description        TEXT,
+    deposit_date       TEXT,
+    release_date       TEXT,
+    resolution         REAL,
+    method             TEXT,
+    -- novelty
+    novelty_identity   REAL,               -- % identity to closest pre-cutoff chain
+    is_novel           INTEGER,
+    closest_pre_cutoff TEXT,
+    -- alphafold
+    af_entry_id        TEXT,
+    af_model_version   INTEGER,
+    mean_plddt         REAL,
+    -- promoted headline metrics (for sort/leaderboard)
+    tm_by_experiment   REAL,
+    lddt               REAL,
+    gdt_ts             REAL,
+    ca_rmsd            REAL,
+    fraud_score        REAL,
+    confidently_wrong  INTEGER,
+    -- full payloads (the big per-residue & heatmap blobs live in the entity_blobs sidecar
+    -- so the hot `entities` table stays small and list/sort queries stay fast)
+    metrics_json       TEXT,
+    domains_json       TEXT,
+    -- provenance
+    status             TEXT,               -- compared | skipped | error
+    skip_reason        TEXT,
+    run_id             INTEGER,
+    processed_at       TEXT,
+    FOREIGN KEY(run_id) REFERENCES runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_run     ON entities(run_id);
+CREATE INDEX IF NOT EXISTS idx_entities_fraud   ON entities(fraud_score);
+CREATE INDEX IF NOT EXISTS idx_entities_deposit ON entities(deposit_date);
+
+-- Covering index for overall_stats(), the aggregate behind every KPI on the home
+-- page and /api/stats. Nothing indexed `status`, so the query planner had only
+-- SCAN entities: ~97k rows over 63 MB of pages, and because the table is 28
+-- columns wide a scan drags in 23 columns the aggregate never reads. That cost
+-- 62 ms on every single page load and made the site the slowest thing on the
+-- droplet by an order of magnitude (68 ms against 1-2 ms for its neighbours).
+--
+-- Listing the aggregated columns after `status` makes it *covering*: SQLite
+-- answers the whole query from a ~3 MB index and never touches the table. The
+-- column order matters -- status first, because that is what the WHERE filters.
+CREATE INDEX IF NOT EXISTS idx_entities_stats   ON entities(
+    status, confidently_wrong, is_novel, tm_by_experiment, lddt);
+
+-- Sidecar for the large per-entity payloads (per-residue arrays ~6 KB, heatmaps ~470 KB each).
+-- Kept out of `entities` so scans/sorts over the hot table don't drag ~470 KB/row of JSON
+-- through memory. Read only on the per-structure entry page (a single indexed lookup).
+CREATE TABLE IF NOT EXISTS entity_blobs (
+    entity_id        TEXT PRIMARY KEY,
+    per_residue_json TEXT,
+    heatmaps_json    TEXT
+);
+
+-- Enrichment metadata for the Analysis tab (fetched lazily over the compared subset).
+CREATE TABLE IF NOT EXISTS entity_annotations (
+    entity_id        TEXT PRIMARY KEY,
+    sequence         TEXT,
+    seq_length       INTEGER,
+    cath_code        TEXT,
+    cath_class       TEXT,
+    cath_arch        TEXT,
+    cath_topo        TEXT,
+    cath_name        TEXT,
+    scop2_sf         TEXT,
+    ecod_family      TEXT,
+    pfam_json        TEXT,
+    go_json          TEXT,
+    citation_doi     TEXT,
+    citation_title   TEXT,
+    citation_journal TEXT,
+    citation_year    INTEGER,
+    citation_pubmed  INTEGER,
+    n_chains         INTEGER,
+    assembly_count   INTEGER,
+    is_amyloid       INTEGER,
+    is_idr           INTEGER,
+    is_assembly      INTEGER,
+    is_coiledcoil    INTEGER,
+    is_engineered    INTEGER,
+    enriched_at      TEXT,
+    FOREIGN KEY(entity_id) REFERENCES entities(entity_id)
+);
+
+-- Cached, precomputed analysis payload (one 'cumulative' row rebuilt after each run).
+CREATE TABLE IF NOT EXISTS analysis_snapshots (
+    kind        TEXT PRIMARY KEY,
+    data_json   TEXT,
+    updated_at  TEXT
+);
+
+-- One row per PDB release week (see examples_auto.py). Weeks with a confidently-wrong catch
+-- (has_catch=1) carry a full templated example; 'quiet' weeks (has_catch=0, AlphaFold never
+-- overconfident) carry just the week's closest miss. Rebuilt after every run.
+CREATE TABLE IF NOT EXISTS weekly_examples (
+    week          TEXT PRIMARY KEY,     -- release date this week covers (the weekly cycle)
+    entity_id     TEXT,
+    uniprot       TEXT,
+    failure_mode  TEXT,
+    fraud_score   REAL,
+    tm            REAL,
+    plddt         REAL,
+    is_novel      INTEGER,
+    has_catch     INTEGER DEFAULT 1,    -- 1 = confidently-wrong catch; 0 = quiet week (closest miss)
+    n_analysed    INTEGER,              -- structures analysed that release week
+    data_json     TEXT,                 -- full templated example (catch) or a short note (quiet)
+    created_at    TEXT
+);
+
+-- Calculate tab: strict autocomplete index of qualifying human entities + AlphaFold-availability
+-- cache (populated by calc_index.py, rebuilt weekly by the run).
+CREATE TABLE IF NOT EXISTS calculate_index (
+    entity_id TEXT PRIMARY KEY, entry_id TEXT, uniprot TEXT, gene TEXT, title TEXT,
+    deposit_date TEXT, post_cutoff INTEGER, indexed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_calcidx_entry ON calculate_index(entry_id);
+CREATE TABLE IF NOT EXISTS af_uniprot_cache (
+    uniprot TEXT PRIMARY KEY, has_model INTEGER, checked_at TEXT
+);
+
+-- Lightweight visitor counter for the header stats panel (IPs are hashed, never stored raw).
+CREATE TABLE IF NOT EXISTS visits (
+    ip_hash     TEXT PRIMARY KEY,
+    first_seen  TEXT,
+    last_seen   TEXT,
+    hits        INTEGER DEFAULT 0
+);
+"""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@contextmanager
+def connect() -> Iterator[sqlite3.Connection]:
+    conn = sqlite3.connect(config.DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    # WAL is a PERSISTENT property of the database file -- set once in init_schema(), never
+    # here. Running `PRAGMA journal_mode=WAL` on every connection needs a brief write lock,
+    # and when a deploy restarts the web service (which also opens the DB) that collided
+    # with the backfill's writes and surfaced as "attempt to write a readonly database".
+    # busy_timeout is per-connection and harmless -- wait for a writer rather than erroring.
+    conn.execute("PRAGMA busy_timeout=30000")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_schema() -> None:
+    with connect() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")   # persisted in the DB header; set once
+        conn.executescript(SCHEMA)
+
+
+def _retry_write(action, attempts: int = 6, base_delay: float = 0.4):
+    """Retry a DB write through a transient OperationalError (a locked/readonly window, e.g.
+    a concurrent web-service restart) instead of letting a multi-day backfill crash."""
+    import time
+    for i in range(attempts):
+        try:
+            return action()
+        except sqlite3.OperationalError:
+            if i == attempts - 1:
+                raise
+            time.sleep(base_delay * (i + 1))
+
+
+# --------------------------------------------------------------------------------------
+# Runs
+# --------------------------------------------------------------------------------------
+def start_run(label: str, since: str, until: str, kind: str = "weekly") -> int:
+    def _do():
+        with connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO runs(label, since, until, started_at, status, kind) VALUES (?,?,?,?, 'running', ?)",
+                (label, since, until, _now(), kind),
+            )
+            return int(cur.lastrowid)
+    return _retry_write(_do)
+
+
+def finish_run(run_id: int, n_discovered: int, n_compared: int, n_skipped: int) -> None:
+    def _do():
+        with connect() as conn:
+            conn.execute(
+                "UPDATE runs SET finished_at=?, n_discovered=?, n_compared=?, n_skipped=?, status='done' WHERE id=?",
+                (_now(), n_discovered, n_compared, n_skipped, run_id),
+            )
+    _retry_write(_do)
+
+
+def entity_exists(entity_id: str) -> bool:
+    with connect() as conn:
+        return conn.execute("SELECT 1 FROM entities WHERE entity_id=?", (entity_id,)).fetchone() is not None
+
+
+# Error rows whose skip_reason is one of these are not real failures: the pipeline
+# *correctly* refused to compare (too few residues aligned to the AF model, or a peptide
+# too short to superpose). They belong under 'skipped' (not-comparable), like constructs.
+_NONCOMPARABLE_ERROR_PATTERNS = ("refusing to compare", "too short")
+
+
+def _noncomparable_where(col: str = "skip_reason") -> str:
+    return " OR ".join(f"{col} LIKE '%{p}%'" for p in _NONCOMPARABLE_ERROR_PATTERNS)
+
+
+def reclassify_noncomparable_errors() -> int:
+    """Move guard-rejection error rows to 'skipped' (they are not real failures). Returns the
+    number of rows reclassified. Idempotent."""
+    def _do():
+        with connect() as conn:
+            cur = conn.execute(
+                f"UPDATE entities SET status='skipped' "
+                f"WHERE status='error' AND ({_noncomparable_where()})"
+            )
+            return cur.rowcount
+    return _retry_write(_do)
+
+
+def error_entity_ids(exclude_noncomparable: bool = True) -> list[str]:
+    """Entity ids currently in 'error' status. By default excludes the guard rejections
+    (which a retry cannot fix); the remainder are the retryable I/O/format/model failures."""
+    sql = "SELECT entity_id FROM entities WHERE status='error'"
+    if exclude_noncomparable:
+        sql += f" AND NOT ({_noncomparable_where()})"
+    sql += " ORDER BY entity_id"
+    with connect() as conn:
+        return [r["entity_id"] for r in conn.execute(sql).fetchall()]
+
+
+# --------------------------------------------------------------------------------------
+# Entities
+# --------------------------------------------------------------------------------------
+def upsert_entity(rec: dict) -> None:
+    """Insert or replace one entity row. `rec` carries scalar columns plus the four JSON
+    blobs already serialized to dicts/lists (this function serializes them)."""
+    m = rec.get("metrics") or {}
+    row = {
+        "entity_id": rec["entity_id"],
+        "entry_id": rec.get("entry_id"),
+        "chain": rec.get("chain"),
+        "uniprot": rec.get("uniprot"),
+        "uniprot_name": rec.get("uniprot_name"),
+        "description": rec.get("description"),
+        "deposit_date": rec.get("deposit_date"),
+        "release_date": rec.get("release_date"),
+        "resolution": rec.get("resolution"),
+        "method": rec.get("method"),
+        "novelty_identity": rec.get("novelty_identity"),
+        "is_novel": _as_int(rec.get("is_novel")),
+        "closest_pre_cutoff": rec.get("closest_pre_cutoff"),
+        "af_entry_id": rec.get("af_entry_id"),
+        "af_model_version": rec.get("af_model_version"),
+        "mean_plddt": m.get("mean_plddt"),
+        "tm_by_experiment": m.get("tm_by_experiment"),
+        "lddt": m.get("lddt"),
+        "gdt_ts": m.get("gdt_ts"),
+        "ca_rmsd": m.get("ca_rmsd"),
+        "fraud_score": m.get("fraud_score"),
+        "confidently_wrong": _as_int(m.get("confidently_wrong")),
+        "metrics_json": json.dumps(m),
+        "domains_json": json.dumps(rec.get("domains") or []),
+        "status": rec.get("status", "compared"),
+        "skip_reason": rec.get("skip_reason"),
+        "run_id": rec.get("run_id"),
+        "processed_at": _now(),
+    }
+    cols = ", ".join(row)
+    placeholders = ", ".join(f":{c}" for c in row)
+    # The big per-residue & heatmap payloads go to the sidecar (see entity_blobs schema).
+    blobs = (rec["entity_id"], json.dumps(rec.get("per_residue") or {}),
+             json.dumps(rec.get("heatmaps") or {}))
+
+    def _do():
+        with connect() as conn:
+            conn.execute(f"INSERT OR REPLACE INTO entities ({cols}) VALUES ({placeholders})", row)
+            conn.execute("INSERT OR REPLACE INTO entity_blobs "
+                         "(entity_id, per_residue_json, heatmaps_json) VALUES (?,?,?)", blobs)
+    _retry_write(_do)
+
+
+def _as_int(v) -> Optional[int]:
+    if v is None:
+        return None
+    return int(bool(v))
+
+
+# --------------------------------------------------------------------------------------
+# Queries (used by the web app)
+# --------------------------------------------------------------------------------------
+def latest_run_label() -> Optional[str]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT label FROM runs WHERE status='done' ORDER BY finished_at DESC LIMIT 1"
+        ).fetchone()
+        return row["label"] if row else None
+
+
+def list_weeks() -> list[dict]:
+    # Only the genuine weekly releases (the ongoing watch) — the historical archive was loaded
+    # as monthly 'backfill' runs, which are browsable in the cumulative view, not as "weeks".
+    # Aggregate by label so a run that was interrupted and resumed shows once, with summed counts.
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT label,
+                      SUM(n_discovered) n_discovered,
+                      SUM(n_compared)   n_compared,
+                      SUM(n_skipped)    n_skipped,
+                      MAX(finished_at)  finished_at
+               FROM runs WHERE status='done' AND kind='weekly'
+               GROUP BY label ORDER BY label DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_all_weeks() -> list[dict]:
+    """Every distinct PDB release week across the whole corpus (derived from each structure's
+    release_date, so the historical 2018→ backfill shows at weekly granularity too), newest first,
+    with structures analysed and confidently-wrong counts."""
+    with connect() as conn:
+        rows = conn.execute(
+            f"""SELECT substr(release_date,1,10) week,
+                       COUNT(*)                        n_analysed,
+                       COALESCE(SUM(confidently_wrong),0) n_cw
+                FROM entities
+                WHERE {ANALYSED} AND release_date IS NOT NULL AND length(release_date) >= 10
+                GROUP BY week ORDER BY week DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def dropdown_weeks(limit: int = 8) -> list[dict]:
+    """The latest N weekly releases for the 'Jump to' menu. Counts the ACTUAL analysed entities
+    (screened+compared) per release, not the runs table's n_compared which over-counts. Ordered
+    newest-first and capped at `limit`, so the menu auto-populates the most recent weeks as the
+    weekly watch runs."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT r.label, COUNT(e.entity_id) n_compared
+               FROM runs r JOIN entities e ON e.run_id = r.id
+                    AND e.status IN ('screened','compared')
+               WHERE r.status='done' AND r.kind='weekly'
+               GROUP BY r.label ORDER BY r.label DESC LIMIT ?""",
+            (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_backfill_months() -> list[dict]:
+    """The historical monthly backfill runs (kind='backfill'), newest first — offered in the
+    'Jump to' menu as a separate group so the whole 2018→ archive is browsable by month. Counts
+    the actual analysed entities per month (matching what the month's page shows)."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT r.label, COUNT(e.entity_id) n_compared
+               FROM runs r JOIN entities e ON e.run_id = r.id
+                    AND e.status IN ('screened','compared')
+               WHERE r.status='done' AND r.kind='backfill'
+               GROUP BY r.label ORDER BY r.label DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def entity_citation(entity_id: str) -> dict:
+    """The primary-literature citation for an entity, from its enrichment annotation."""
+    with connect() as conn:
+        r = conn.execute(
+            "SELECT citation_doi, citation_title, citation_journal, citation_year "
+            "FROM entity_annotations WHERE entity_id=?", (entity_id,)).fetchone()
+        if not r:
+            return {}
+        return {"doi": r["citation_doi"], "title": r["citation_title"],
+                "journal": r["citation_journal"], "year": r["citation_year"]}
+
+
+def family_summary(uniprot: str) -> dict:
+    """Live per-protein stats for the Examples panels: deposition count, confidently-wrong count,
+    worst TM, mean pLDDT."""
+    with connect() as conn:
+        r = conn.execute(
+            f"""SELECT COUNT(*) n, SUM(confidently_wrong) n_wrong,
+                       MIN(tm_by_experiment) min_tm, AVG(mean_plddt) mean_plddt
+                FROM entities WHERE uniprot=? AND {ANALYSED}""", (uniprot,)).fetchone()
+        return dict(r) if r else {}
+
+
+# --------------------------------------------------------------------------------------
+# Weekly auto-examples ('example of the week' + archive) — see examples_auto.py
+# --------------------------------------------------------------------------------------
+
+_WEEKLY_EXAMPLES_DDL = """
+CREATE TABLE IF NOT EXISTS weekly_examples (
+    week TEXT PRIMARY KEY, entity_id TEXT, uniprot TEXT, failure_mode TEXT,
+    fraud_score REAL, tm REAL, plddt REAL, is_novel INTEGER,
+    has_catch INTEGER DEFAULT 1, n_analysed INTEGER, data_json TEXT, created_at TEXT
+);
+"""
+
+# Joined fields examples_auto.build() needs. Kept in sync with that module.
+_AUTO_SRC_COLS = (
+    "e.entity_id, e.entry_id, e.chain, e.uniprot, e.uniprot_name, e.description, "
+    "e.release_date, e.tm_by_experiment, e.mean_plddt, e.fraud_score, e.lddt, e.ca_rmsd, "
+    "e.confidently_wrong, e.is_novel, e.novelty_identity, e.metrics_json, "
+    "a.seq_length, a.n_chains, a.cath_name, a.cath_class, a.scop2_sf, "
+    "a.citation_doi, a.citation_title, a.citation_year, "
+    "a.is_amyloid, a.is_assembly, a.is_idr, a.is_coiledcoil"
+)
+
+
+def rebuild_weekly_examples() -> dict:
+    """Regenerate one row per PDB release week. Weeks with a confidently-wrong catch get the best
+    non-curated catch (novel first, then FRAUD) built into a full templated panel; every other
+    analysed week is recorded as a 'quiet' week with that week's closest miss. Replaces the table.
+    Returns {'weeks': N, 'catches': M}."""
+    from . import examples_auto as ea
+    with connect() as conn:
+        conn.execute("DROP TABLE IF EXISTS weekly_examples")
+        conn.execute(_WEEKLY_EXAMPLES_DDL)
+        # (A) best non-curated confidently-wrong catch per release week.
+        cw_rows = conn.execute(
+            f"SELECT {_AUTO_SRC_COLS} FROM entities e "
+            "LEFT JOIN entity_annotations a ON a.entity_id = e.entity_id "
+            "WHERE e.confidently_wrong=1 AND e.uniprot IS NOT NULL AND e.release_date IS NOT NULL "
+            "AND length(e.release_date) >= 10 "
+            "ORDER BY e.release_date DESC, e.is_novel DESC, e.fraud_score DESC"
+        ).fetchall()
+        catch: dict[str, sqlite3.Row] = {}
+        for r in cw_rows:
+            if r["uniprot"] in ea.CURATED_UNIPROTS:
+                continue
+            catch.setdefault(r["release_date"][:10], r)
+        # (B) every release week: analysed count + that week's worst (highest-FRAUD) structure.
+        week_rows = conn.execute(
+            f"""SELECT wk, n_analysed, entity_id, uniprot, description, tm, plddt, fraud FROM (
+                  SELECT substr(release_date,1,10) wk, entity_id, uniprot, description,
+                         tm_by_experiment tm, mean_plddt plddt, fraud_score fraud,
+                         COUNT(*) OVER (PARTITION BY substr(release_date,1,10)) n_analysed,
+                         ROW_NUMBER() OVER (PARTITION BY substr(release_date,1,10)
+                                            ORDER BY fraud_score DESC) rn
+                  FROM entities
+                  WHERE {ANALYSED} AND release_date IS NOT NULL AND length(release_date) >= 10
+                ) WHERE rn = 1"""
+        ).fetchall()
+        now, n_catch = _now(), 0
+        ins = ("INSERT INTO weekly_examples (week, entity_id, uniprot, failure_mode, fraud_score, "
+               "tm, plddt, is_novel, has_catch, n_analysed, data_json, created_at) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+        for w in week_rows:
+            wk = w["wk"]
+            if wk in catch:
+                r = catch[wk]
+                data = ea.build(r)
+                conn.execute(ins, (wk, r["entity_id"], r["uniprot"], data["failure_mode"],
+                                   r["fraud_score"], r["tm_by_experiment"], r["mean_plddt"],
+                                   r["is_novel"], 1, w["n_analysed"], json.dumps(data), now))
+                n_catch += 1
+            else:
+                nm = w["description"] or w["uniprot"] or "a structure"
+                note = (f"{w['n_analysed']} structure{'s' if w['n_analysed'] != 1 else ''} analysed this "
+                        f"release. AlphaFold's largest disagreement was {nm}"
+                        + (f" (TM {w['tm']:.2f})" if w["tm"] is not None else "")
+                        + " — but nothing was confidently wrong, so there is no overconfident failure "
+                        "to report this week.")
+                data = {"name": nm, "entry": w["entity_id"], "note": note}
+                conn.execute(ins, (wk, w["entity_id"], w["uniprot"], None, w["fraud"], w["tm"],
+                                   w["plddt"], None, 0, w["n_analysed"], json.dumps(data), now))
+        return {"weeks": len(week_rows), "catches": n_catch}
+
+
+def _weekly_example_row(r: sqlite3.Row) -> dict:
+    d = dict(r)
+    d["data"] = json.loads(d.pop("data_json") or "{}")
+    return d
+
+
+def latest_weekly_example() -> Optional[dict]:
+    """The most recent week WITH a confidently-wrong catch (the featured 'Fresh catch'), or None."""
+    with connect() as conn:
+        conn.execute(_WEEKLY_EXAMPLES_DDL)
+        r = conn.execute(
+            "SELECT * FROM weekly_examples WHERE has_catch=1 ORDER BY week DESC LIMIT 1").fetchone()
+        return _weekly_example_row(r) if r else None
+
+
+def archive_weekly_examples(exclude_week: Optional[str] = None) -> list[dict]:
+    """Every release week except the featured one, newest first — catches and quiet weeks alike."""
+    with connect() as conn:
+        conn.execute(_WEEKLY_EXAMPLES_DDL)
+        if exclude_week:
+            rows = conn.execute("SELECT * FROM weekly_examples WHERE week != ? ORDER BY week DESC",
+                                (exclude_week,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM weekly_examples ORDER BY week DESC").fetchall()
+        return [_weekly_example_row(r) for r in rows]
+
+
+def weekly_examples_counts() -> dict:
+    """{'weeks': total release weeks, 'catches': weeks with a confidently-wrong catch}."""
+    with connect() as conn:
+        conn.execute(_WEEKLY_EXAMPLES_DDL)
+        r = conn.execute(
+            "SELECT COUNT(*) weeks, COALESCE(SUM(has_catch),0) catches FROM weekly_examples").fetchone()
+        return {"weeks": r["weeks"], "catches": r["catches"]}
+
+
+# --------------------------------------------------------------------------------------
+# Calculate tab: strict autocomplete index + on-demand compute helpers
+# --------------------------------------------------------------------------------------
+_CALC_DDL = """
+CREATE TABLE IF NOT EXISTS calculate_index (
+    entity_id TEXT PRIMARY KEY, entry_id TEXT, uniprot TEXT, gene TEXT, title TEXT,
+    deposit_date TEXT, post_cutoff INTEGER, indexed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_calcidx_entry ON calculate_index(entry_id);
+CREATE TABLE IF NOT EXISTS af_uniprot_cache (
+    uniprot TEXT PRIMARY KEY, has_model INTEGER, checked_at TEXT
+);
+"""
+
+
+def _ensure_calc(conn) -> None:
+    conn.executescript(_CALC_DDL)
+
+
+def auto_source_row(entity_id: str):
+    """The joined entity+annotation+metrics row that examples_auto.build() consumes (same columns
+    the weekly-example rebuild uses), for any entity_id — reused by the Calculate panel."""
+    with connect() as conn:
+        return conn.execute(
+            f"SELECT {_AUTO_SRC_COLS} FROM entities e "
+            "LEFT JOIN entity_annotations a ON a.entity_id = e.entity_id WHERE e.entity_id=?",
+            (entity_id,)).fetchone()
+
+
+def index_upsert(rows: list[dict]) -> int:
+    """Upsert qualifying entities into the autocomplete index. Each row: entity_id, entry_id,
+    uniprot, gene, title, deposit_date, post_cutoff."""
+    if not rows:
+        return 0
+    now = _now()
+    with connect() as conn:
+        _ensure_calc(conn)
+        conn.executemany(
+            "INSERT INTO calculate_index (entity_id, entry_id, uniprot, gene, title, deposit_date, "
+            "post_cutoff, indexed_at) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(entity_id) DO UPDATE SET entry_id=excluded.entry_id, uniprot=excluded.uniprot, "
+            "gene=excluded.gene, title=excluded.title, deposit_date=excluded.deposit_date, "
+            "post_cutoff=excluded.post_cutoff, indexed_at=excluded.indexed_at",
+            [(r["entity_id"], r["entry_id"], r.get("uniprot"), r.get("gene"), r.get("title"),
+              r.get("deposit_date"), r.get("post_cutoff"), now) for r in rows])
+    return len(rows)
+
+
+def seed_index_from_entities() -> int:
+    """Seed the index from corpus entities that already have a UniProt + AlphaFold model (proven
+    qualifying by the pipeline). post_cutoff is derived from the deposit date."""
+    cutoff = config.AF_TRAINING_CUTOFF.isoformat()
+    with connect() as conn:
+        _ensure_calc(conn)
+        rows = conn.execute(
+            "SELECT entity_id, entry_id, uniprot, uniprot_name gene, description title, deposit_date, "
+            "CASE WHEN substr(deposit_date,1,10) >= ? THEN 1 ELSE 0 END post_cutoff "
+            "FROM entities WHERE uniprot IS NOT NULL AND af_entry_id IS NOT NULL "
+            "AND status IN ('screened','compared')", (cutoff,)).fetchall()
+    return index_upsert([dict(r) for r in rows])
+
+
+def index_count() -> int:
+    with connect() as conn:
+        _ensure_calc(conn)
+        return conn.execute("SELECT COUNT(*) FROM calculate_index").fetchone()[0]
+
+
+def index_suggest(prefix: str, limit: int = 8) -> list[dict]:
+    """Autocomplete: qualifying entries whose PDB id starts with `prefix` (preferred) or whose
+    gene/title contains it. Deduplicated to one row per PDB entry (the lowest entity number)."""
+    p = (prefix or "").strip().lower()
+    if not p:
+        return []
+    with connect() as conn:
+        _ensure_calc(conn)
+        rows = conn.execute(
+            "SELECT entity_id, entry_id, uniprot, gene, title, post_cutoff, "
+            "       (lower(entry_id) LIKE ?) AS id_hit "
+            "FROM calculate_index "
+            "WHERE lower(entry_id) LIKE ? OR lower(gene) LIKE ? OR lower(title) LIKE ? "
+            "ORDER BY id_hit DESC, entry_id, entity_id LIMIT 200",
+            (p + "%", p + "%", "%" + p + "%", "%" + p + "%")).fetchall()
+    seen, out = set(), []
+    for r in rows:                                   # one suggestion per PDB entry
+        if r["entry_id"] in seen:
+            continue
+        seen.add(r["entry_id"])
+        out.append(dict(r))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def index_entities_for_entry(entry_id: str) -> list[dict]:
+    """All qualifying entities of a PDB entry (to resolve a bare 4-char id / offer a chooser)."""
+    with connect() as conn:
+        _ensure_calc(conn)
+        rows = conn.execute(
+            "SELECT * FROM calculate_index WHERE lower(entry_id)=? ORDER BY entity_id",
+            (entry_id.lower(),)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def af_cache_get(uniprot: str) -> Optional[bool]:
+    with connect() as conn:
+        _ensure_calc(conn)
+        r = conn.execute("SELECT has_model FROM af_uniprot_cache WHERE uniprot=?", (uniprot,)).fetchone()
+        return None if r is None else bool(r["has_model"])
+
+
+def af_cache_set(uniprot: str, has_model: bool) -> None:
+    with connect() as conn:
+        _ensure_calc(conn)
+        conn.execute(
+            "INSERT INTO af_uniprot_cache (uniprot, has_model, checked_at) VALUES (?,?,?) "
+            "ON CONFLICT(uniprot) DO UPDATE SET has_model=excluded.has_model, checked_at=excluded.checked_at",
+            (uniprot, 1 if has_model else 0, _now()))
+
+
+def calculate_run_id() -> int:
+    """The singleton run that owns on-demand 'Calculate' entities (kind='calculate', so they are
+    excluded from every 'weekly'/'backfill' aggregate)."""
+    with connect() as conn:
+        r = conn.execute("SELECT id FROM runs WHERE kind='calculate' ORDER BY id LIMIT 1").fetchone()
+        if r:
+            return r["id"]
+    return start_run("calculate", "", "", kind="calculate")
+
+
+def calc_status(entity_id: str) -> Optional[dict]:
+    """Light status lookup for the poll endpoint: {status, skip_reason} or None."""
+    with connect() as conn:
+        r = conn.execute("SELECT status, skip_reason FROM entities WHERE entity_id=?",
+                         (entity_id,)).fetchone()
+        return dict(r) if r else None
+
+
+def computing_count() -> int:
+    with connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM entities WHERE status='computing'").fetchone()[0]
+
+
+def mark_computing(entity_id: str, entry_id: str, uniprot: Optional[str], run_id: int) -> None:
+    """Placeholder row so the poll can see 'computing' immediately; never clobbers a real result."""
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO entities (entity_id, entry_id, uniprot, status, run_id, processed_at) "
+            "VALUES (?,?,?,'computing',?,?) "
+            "ON CONFLICT(entity_id) DO UPDATE SET status='computing', run_id=excluded.run_id, "
+            "processed_at=excluded.processed_at "
+            "WHERE entities.status NOT IN ('compared','screened','calculated')",
+            (entity_id, entry_id, uniprot, run_id, _now()))
+
+
+def run_kind(label: str) -> Optional[str]:
+    """'weekly' | 'backfill' | None — lets the release page title itself 'Release month' vs
+    'Release week' for a given label."""
+    with connect() as conn:
+        r = conn.execute(
+            "SELECT kind FROM runs WHERE label=? AND status='done' LIMIT 1", (label,)
+        ).fetchone()
+        return r["kind"] if r else None
+
+
+def week_exists(label: str) -> bool:
+    """True for any completed run with this label (weekly OR backfill month) OR any release week
+    that has analysed structures — so historical weeks load by direct URL and from the archive."""
+    with connect() as conn:
+        if conn.execute("SELECT 1 FROM runs WHERE label=? AND status='done' LIMIT 1",
+                        (label,)).fetchone():
+            return True
+        return conn.execute(
+            f"SELECT 1 FROM entities WHERE substr(release_date,1,10)=? AND {ANALYSED} LIMIT 1",
+            (label,)).fetchone() is not None
+
+
+# Both tiers count as "analysed": 'screened' (TM-only) and 'compared' (full metrics).
+ANALYSED = "status IN ('screened','compared')"
+
+
+def entities_for_week(label: str) -> list[dict]:
+    with connect() as conn:
+        # Prefer a real run with this label (weekly watch or a backfill month); otherwise treat the
+        # label as a release week (YYYY-MM-DD) so any historical week is browsable at weekly grain.
+        has_run = conn.execute("SELECT 1 FROM runs WHERE label=? LIMIT 1", (label,)).fetchone()
+        if has_run:
+            q = ("SELECT * FROM entities WHERE run_id IN (SELECT id FROM runs WHERE label=?) "
+                 f"AND {ANALYSED} ORDER BY fraud_score DESC")
+        else:
+            q = (f"SELECT * FROM entities WHERE substr(release_date,1,10)=? AND {ANALYSED} "
+                 "ORDER BY fraud_score DESC")
+        return [dict(r) for r in conn.execute(q, (label,)).fetchall()]
+
+
+# Scalar columns only (no JSON blobs) -- cheap to pull for every analysed entity, which
+# the cumulative "All" view needs for its scatter, histograms, KPIs and top-N table.
+_SCALAR_COLS = (
+    "entity_id, entry_id, chain, uniprot, description, deposit_date, resolution, method, "
+    "novelty_identity, is_novel, mean_plddt, tm_by_experiment, lddt, gdt_ts, ca_rmsd, "
+    "fraud_score, confidently_wrong, status"
+)
+
+
+def all_entities_scalar() -> list[dict]:
+    """Every analysed entity (both tiers), scalar columns only, worst-FRAUD first."""
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_SCALAR_COLS} FROM entities WHERE {ANALYSED} ORDER BY fraud_score DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def uniprots_before_label(label: str) -> set:
+    """UniProt accessions seen in weeks released before `label` (for the 'first seen' flag).
+    Week labels are ISO dates, so a string comparison orders them correctly."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT e.uniprot FROM entities e JOIN runs r ON e.run_id = r.id "
+            "WHERE r.label < ? AND e.uniprot IS NOT NULL",
+            (label,),
+        ).fetchall()
+        return {r["uniprot"] for r in rows}
+
+
+def get_entity(entity_id: str) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM entities WHERE entity_id=?", (entity_id,)).fetchone()
+        if not row:
+            return None
+        e = dict(row)
+        # Big payloads live in the sidecar; merge them back so callers see one dict. Fall back
+        # to any legacy inline column so this works before/during/after the sidecar migration.
+        b = conn.execute(
+            "SELECT per_residue_json, heatmaps_json FROM entity_blobs WHERE entity_id=?",
+            (entity_id,)).fetchone()
+        e["per_residue_json"] = (b["per_residue_json"] if b else None) or e.get("per_residue_json")
+        e["heatmaps_json"] = (b["heatmaps_json"] if b else None) or e.get("heatmaps_json")
+        return e
+
+
+def leaderboard(limit: int = 100, novel_only: bool = False) -> list[dict]:
+    q = f"SELECT * FROM entities WHERE {ANALYSED}"
+    if novel_only:
+        q += " AND is_novel=1"
+    # Worst first: confidently wrong, then high fraud score, then low TM.
+    q += " ORDER BY confidently_wrong DESC, fraud_score DESC, tm_by_experiment ASC LIMIT ?"
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(q, (limit,)).fetchall()]
+
+
+def leaderboard_grouped(max_proteins: int = 80, max_members: int = 40) -> list[dict]:
+    """Worst offenders GROUPED by protein for a collapsible leaderboard. Returns the worst
+    `max_proteins` UniProts (ranked by their single worst FRAUD score), each with its worst
+    deposition as the group header and up to `max_members` depositions as expandable rows."""
+    with connect() as conn:
+        tops = conn.execute(
+            f"""SELECT uniprot, MAX(fraud_score) wf, COUNT(*) n
+                FROM entities WHERE {ANALYSED} AND uniprot IS NOT NULL
+                GROUP BY uniprot ORDER BY wf DESC, n DESC LIMIT ?""", (max_proteins,)).fetchall()
+        unis = [r["uniprot"] for r in tops]
+        counts = {r["uniprot"]: r["n"] for r in tops}
+        if not unis:
+            return []
+        ph = ",".join("?" * len(unis))
+        rows = conn.execute(
+            f"""SELECT {_SCALAR_COLS} FROM entities
+                WHERE {ANALYSED} AND uniprot IN ({ph})
+                ORDER BY confidently_wrong DESC, fraud_score DESC, tm_by_experiment ASC""",
+            unis).fetchall()
+    from collections import defaultdict
+    by = defaultdict(list)
+    for r in rows:
+        by[r["uniprot"]].append(dict(r))
+    groups = []
+    for uni in unis:                       # preserve the worst-first protein order
+        members = by.get(uni)
+        if not members:
+            continue
+        groups.append({
+            "uniprot": uni, "worst": members[0], "n": counts[uni],
+            "n_wrong": sum(1 for m in members if m.get("confidently_wrong")),
+            "members": members[:max_members], "truncated": len(members) > max_members,
+        })
+    return groups
+
+
+def uniprot_deposition_counts() -> dict:
+    """{uniprot: number of analysed depositions} — how many structures of each protein we hold.
+    Lets views show a '×N' badge (AlphaFold DB has one model per sequence, so N depositions all
+    share the same prediction)."""
+    with connect() as conn:
+        return {r["uniprot"]: r["n"] for r in conn.execute(
+            f"SELECT uniprot, COUNT(*) n FROM entities WHERE {ANALYSED} AND uniprot IS NOT NULL "
+            "GROUP BY uniprot").fetchall()}
+
+
+def deposit_month_trend() -> list[dict]:
+    """Per-deposit-month aggregates for the trend figure (chronological, evenly spaced).
+
+    Binning by each structure's deposit month — not by processing-run label — is what makes the
+    trend a real timeline. The archive was backfilled in irregular buckets (monthly chunks, a few
+    weekly runs, and one big catch-up run of ~8.6k), so grouping by run produced gaps (empty
+    chunks) and huge spikes (the catch-up run). Deposit-month bins spread those structures onto
+    their true dates. Months with <5 analysed structures are dropped so each point is a
+    meaningful mean (the most recent month is often near-empty)."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT substr(deposit_date,1,7)  AS label,
+                      AVG(tm_by_experiment)      AS mean_tm,
+                      SUM(confidently_wrong)     AS confidently_wrong,
+                      COUNT(*)                   AS n_compared
+               FROM entities
+               WHERE status IN ('screened','compared')
+                 AND deposit_date IS NOT NULL AND length(deposit_date) >= 7
+               GROUP BY label HAVING COUNT(*) >= 5 ORDER BY label ASC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def cw_rate_trend() -> Optional[dict]:
+    """Trend of the confidently-wrong RATE over deposit time, by logistic regression of the
+    binary confidently_wrong outcome on the deposit year across every analysed structure. This
+    is binning-free — the rigorous test the monthly Mann-Kendall under-powers (it lands at
+    p≈0.05). Returns the slope, p, odds-ratio per decade, baseline rate and the fitted rate at
+    the first/last deposit year (for the display line), or None if too little data / no libs."""
+    try:
+        import numpy as np
+        from scipy.stats import norm
+    except Exception:
+        return None
+    from datetime import date as _date
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT deposit_date d, confidently_wrong cw FROM entities "
+            f"WHERE {ANALYSED} AND deposit_date IS NOT NULL AND length(deposit_date) >= 10"
+        ).fetchall()
+    xs, ys = [], []
+    for r in rows:
+        try:
+            y, m, dd = int(r["d"][:4]), int(r["d"][5:7]), int(r["d"][8:10])
+            xs.append(y + (_date(y, m, dd) - _date(y, 1, 1)).days / 365.25)
+            ys.append(1.0 if r["cw"] else 0.0)
+        except Exception:
+            pass
+    if len(ys) < 200 or sum(ys) < 10:
+        return None
+    x = np.asarray(xs)
+    y = np.asarray(ys)
+    xm = x.mean()
+    X = np.column_stack([np.ones_like(x), x - xm])
+    b = np.zeros(2)
+    for _ in range(50):                       # Newton-Raphson logistic (2 params, converges fast)
+        mu = 1.0 / (1.0 + np.exp(-(X @ b)))
+        W = mu * (1 - mu)
+        H = X.T @ (X * W[:, None])
+        try:
+            step = np.linalg.solve(H, X.T @ (y - mu))
+        except np.linalg.LinAlgError:
+            return None
+        b = b + step
+        if np.max(np.abs(step)) < 1e-9:
+            break
+    se = float(np.sqrt(np.linalg.inv(H)[1, 1]))
+    z = b[1] / se if se else 0.0
+    p = float(2 * (1 - norm.cdf(abs(z))))
+
+    def _rate(xx):
+        return float(1.0 / (1.0 + np.exp(-(b[0] + b[1] * (xx - xm)))))
+
+    return {"slope": float(b[1]), "p": p, "or_decade": float(np.exp(b[1] * 10)),
+            "baseline": float(y.mean()), "significant": p < 0.05,
+            "yr0": float(x.min()), "yr1": float(x.max()),
+            "rate0": _rate(x.min()), "rate1": _rate(x.max())}
+
+
+# --------------------------------------------------------------------------------------
+# Analysis-tab support: enrichment annotations + cached snapshot
+# --------------------------------------------------------------------------------------
+def compared_needing_annotation(limit: Optional[int] = None) -> list[dict]:
+    """Fully-analysed entities that have no enrichment annotation row yet."""
+    q = ("SELECT e.entity_id, e.entry_id, e.chain, e.uniprot, e.description, e.uniprot_name, "
+         "e.is_novel, e.closest_pre_cutoff, e.metrics_json "
+         "FROM entities e LEFT JOIN entity_annotations a ON a.entity_id = e.entity_id "
+         "WHERE e.status='compared' AND a.entity_id IS NULL ORDER BY e.fraud_score DESC")
+    if limit:
+        q += f" LIMIT {int(limit)}"
+    with connect() as conn:
+        return [dict(r) for r in conn.execute(q).fetchall()]
+
+
+def upsert_annotation(row: dict) -> None:
+    row = {**row, "enriched_at": _now()}
+    cols = ", ".join(row)
+    placeholders = ", ".join(f":{c}" for c in row)
+
+    def _do():
+        with connect() as conn:
+            conn.execute(
+                f"INSERT OR REPLACE INTO entity_annotations ({cols}) VALUES ({placeholders})", row
+            )
+    _retry_write(_do)
+
+
+def compared_with_annotations() -> list[dict]:
+    """All fully-analysed entities joined to their enrichment annotations (for aggregation).
+    Includes metrics_json for feature extraction; excludes the big heatmap/per-residue blobs."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT e.entity_id, e.entry_id, e.chain, e.uniprot, e.uniprot_name, e.description,
+                      e.deposit_date, e.release_date, e.resolution, e.method, e.novelty_identity,
+                      e.is_novel, e.closest_pre_cutoff, e.mean_plddt, e.tm_by_experiment, e.lddt,
+                      e.gdt_ts, e.ca_rmsd, e.fraud_score, e.confidently_wrong, e.metrics_json, e.run_id,
+                      r.label AS week,
+                      a.sequence, a.seq_length, a.cath_code, a.cath_class, a.cath_arch, a.cath_topo,
+                      a.cath_name, a.scop2_sf, a.ecod_family, a.pfam_json,
+                      a.citation_doi, a.citation_title, a.citation_journal, a.citation_year,
+                      a.citation_pubmed, a.n_chains, a.assembly_count,
+                      a.is_amyloid, a.is_idr, a.is_assembly, a.is_coiledcoil, a.is_engineered
+               FROM entities e
+               JOIN entity_annotations a ON a.entity_id = e.entity_id
+               LEFT JOIN runs r ON e.run_id = r.id
+               WHERE e.status='compared'"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def annotation_count() -> int:
+    with connect() as conn:
+        return conn.execute("SELECT COUNT(*) n FROM entity_annotations").fetchone()["n"]
+
+
+def save_snapshot(kind: str, data: dict) -> None:
+    import json as _json
+
+    def _do():
+        with connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO analysis_snapshots(kind, data_json, updated_at) VALUES (?,?,?)",
+                (kind, _json.dumps(data), _now()),
+            )
+    _retry_write(_do)
+
+
+def load_snapshot(kind: str = "cumulative") -> Optional[dict]:
+    import json as _json
+
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT data_json, updated_at FROM analysis_snapshots WHERE kind=?", (kind,)
+        ).fetchone()
+        if not row:
+            return None
+        data = _json.loads(row["data_json"])
+        data["_updated_at"] = row["updated_at"]
+        return data
+
+
+def record_visit(ip_hash: str) -> None:
+    def _do():
+        with connect() as conn:
+            conn.execute(
+                "INSERT INTO visits(ip_hash, first_seen, last_seen, hits) VALUES (?,?,?,1) "
+                "ON CONFLICT(ip_hash) DO UPDATE SET last_seen=excluded.last_seen, hits=hits+1",
+                (ip_hash, _now(), _now()),
+            )
+    _retry_write(_do)
+
+
+def visitor_stats(min_hits: int = 1) -> dict:
+    """Visitor counts for the header panel, counting only visitors who stayed.
+
+    `min_hits` is a dwell-time test: the page polls /api/stats once a minute, so
+    requiring a few calls means the visitor had the page open for a few minutes
+    rather than merely causing it to render once. See _MIN_HITS in webapp.py for
+    the measurements behind the threshold.
+
+    It is weaker here than the equivalent test in mdeller.com's mdeller-stats.py,
+    and deliberately so rather than by oversight: `hits` is cumulative per address
+    for all time, so a crawler returning across many days eventually clears any
+    threshold, where the log-based counter can ask the question one day at a time.
+    Per-day dwell would need a row per address-day instead of the single row this
+    schema keeps. The _CLOUD_NETS prefix filter is what actually does the work; this
+    is the cheap second line, and it also quietly drops the one-shot renderer that
+    arrives from a network nobody has catalogued yet.
+    """
+    try:
+        with connect() as conn:
+            r = conn.execute("SELECT COUNT(*) uniq, COALESCE(SUM(hits),0) hits "
+                             "FROM visits WHERE hits >= ?", (min_hits,)).fetchone()
+            today = _now()[:10]
+            t = conn.execute("SELECT COUNT(*) n FROM visits "
+                             "WHERE substr(last_seen,1,10)=? AND hits >= ?",
+                             (today, min_hits)).fetchone()
+            return {"unique": r["uniq"], "hits": r["hits"], "today": t["n"]}
+    except sqlite3.OperationalError:      # visits table not created yet (fresh deploy)
+        return {"unique": 0, "hits": 0, "today": 0}
+
+
+def db_size_bytes() -> int:
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        p = str(config.DB_PATH) + suffix
+        if os.path.exists(p):
+            total += os.path.getsize(p)
+    return total
+
+
+def total_entity_count() -> int:
+    """Every entity the backfill has touched -- analysed (screened+compared) plus skipped and
+    errored. Used for the header panel's 'PDBs Processed' throughput figure."""
+    with connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+
+
+# The aggregate underlying it only moves when a weekly run or a backfill lands,
+# so serving it from a snapshot for a few minutes costs nothing in accuracy.
+OVERALL_STATS_TTL = 600
+
+
+def _snapshot_age(updated_at: Optional[str]) -> Optional[float]:
+    """Seconds since a snapshot was written, or None if that cannot be told."""
+    if not updated_at:
+        return None
+    try:
+        from datetime import datetime, timezone
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(updated_at)).total_seconds()
+        return age if age >= 0 else None
+    except Exception:
+        return None
+
+
+def overall_stats(max_age: int = OVERALL_STATS_TTL) -> dict:
+    """The KPI aggregate for the home page and /api/stats.
+
+    Cached in analysis_snapshots, the same mechanism the analysis payload uses,
+    because this is called on every page load and by the polled stats endpoint.
+    The covering index above already takes the query from 62 ms to single
+    figures; the cache takes the common case to a single indexed row read.
+
+    Pass max_age=0 to force a recompute (what the weekly run does when it
+    finishes, so the first visitor afterwards sees fresh numbers rather than
+    waiting out the TTL).
+    """
+    if max_age > 0:
+        cached = load_snapshot("overall_stats")
+        age = _snapshot_age((cached or {}).get("_updated_at"))
+        if cached and age is not None and age < max_age:
+            cached.pop("_updated_at", None)
+            return cached
+
+    with connect() as conn:
+        row = conn.execute(
+            f"""SELECT COUNT(*) n, SUM(confidently_wrong) cw, SUM(is_novel) novel,
+                       SUM(CASE WHEN is_novel=1 AND confidently_wrong=1 THEN 1 ELSE 0 END) novel_wrong,
+                       AVG(tm_by_experiment) avg_tm, AVG(lddt) avg_lddt,
+                       SUM(status='compared') fully
+                FROM entities WHERE {ANALYSED}"""
+        ).fetchone()
+    stats = dict(row) if row else {}
+
+    # Never let a failed cache write cost a page render: the numbers are already
+    # computed by this point, and the database may legitimately be locked by a
+    # run in progress.
+    try:
+        save_snapshot("overall_stats", stats)
+    except Exception:
+        pass
+    return stats
+
+
+def stats_bundle() -> dict:
+    """Everything the Statistics page reports that comes from the database, in one connection."""
+    with connect() as conn:
+        e = dict(conn.execute(
+            f"""SELECT COUNT(*) analysed, SUM(status='compared') compared, SUM(status='screened') screened,
+                       SUM(confidently_wrong) cw, SUM(is_novel) novel,
+                       SUM(CASE WHEN is_novel=1 AND confidently_wrong=1 THEN 1 ELSE 0 END) novel_cw,
+                       AVG(tm_by_experiment) avg_tm, AVG(lddt) avg_lddt, AVG(mean_plddt) avg_plddt,
+                       COUNT(DISTINCT uniprot) proteins,
+                       MIN(deposit_date) dep_min, MAX(deposit_date) dep_max,
+                       MIN(release_date) rel_min, MAX(release_date) rel_max
+                FROM entities WHERE {ANALYSED}""").fetchone())
+        by_status = dict(conn.execute("SELECT status, COUNT(*) FROM entities GROUP BY status").fetchall())
+        runs = dict(conn.execute("SELECT kind, COUNT(*) FROM runs GROUP BY kind").fetchall())
+        latest_weekly = conn.execute(
+            "SELECT label, finished_at FROM runs WHERE kind='weekly' AND status='done' "
+            "ORDER BY label DESC LIMIT 1").fetchone()
+        last_run = conn.execute(
+            "SELECT label, kind, finished_at FROM runs WHERE status='done' "
+            "ORDER BY finished_at DESC LIMIT 1").fetchone()
+        skips = conn.execute(
+            "SELECT skip_reason, COUNT(*) n FROM entities WHERE status='skipped' AND skip_reason IS NOT NULL "
+            "GROUP BY skip_reason ORDER BY n DESC LIMIT 6").fetchall()
+        counts = {}
+        for t in ("entities", "entity_blobs", "entity_annotations", "analysis_snapshots",
+                  "calculate_index", "af_uniprot_cache", "weekly_examples", "runs", "visits"):
+            try:
+                counts[t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            except Exception:
+                counts[t] = None
+        n_weeks = conn.execute(
+            f"SELECT COUNT(DISTINCT substr(release_date,1,10)) FROM entities "
+            f"WHERE {ANALYSED} AND release_date IS NOT NULL AND length(release_date) >= 10").fetchone()[0]
+    return {
+        "e": e, "by_status": by_status, "runs": runs,
+        "latest_weekly": dict(latest_weekly) if latest_weekly else None,
+        "last_run": dict(last_run) if last_run else None,
+        "skips": [dict(s) for s in skips], "table_counts": counts,
+        "calculated": by_status.get("calculated", 0), "errors": by_status.get("error", 0),
+        "computing": by_status.get("computing", 0), "skipped": by_status.get("skipped", 0),
+        "release_weeks": n_weeks,
+    }
+
+
+def median_tm() -> Optional[float]:
+    """Median TM over the analysed set, to match the home-page KPI. Kept separate from
+    overall_stats so the frequently-polled /api/stats doesn't pay for the sort. SQLite has no
+    MEDIAN -> average the middle value(s): LIMIT 1 for an odd count, LIMIT 2 for an even one."""
+    with connect() as conn:
+        n = conn.execute(
+            f"SELECT COUNT(*) FROM entities WHERE {ANALYSED} AND tm_by_experiment IS NOT NULL"
+        ).fetchone()[0]
+        if not n:
+            return None
+        return conn.execute(
+            f"""SELECT AVG(tm_by_experiment) FROM (
+                    SELECT tm_by_experiment FROM entities
+                    WHERE {ANALYSED} AND tm_by_experiment IS NOT NULL
+                    ORDER BY tm_by_experiment LIMIT ? OFFSET ?)""",
+            (2 - n % 2, (n - 1) // 2),
+        ).fetchone()[0]

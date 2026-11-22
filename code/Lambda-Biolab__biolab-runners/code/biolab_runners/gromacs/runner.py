@@ -1,0 +1,1873 @@
+"""GROMACS subprocess runners.
+
+This module hosts two runners:
+
+- :class:`GromacsRunner` — the **legacy one-shot mdrun** runner
+  (preserved from S3). Drives a single ``gmx mdrun`` invocation
+  against a pre-built ``.tpr``; idempotent on ``energy.edr``
+  existence.
+
+- :class:`GromacsProtocolRunner` — the **S4 production-grade
+  protocol** runner. Drives the full pipeline (topology → box →
+  solvate → ions → minimization → NVT → NPT → production) with
+  per-stage checkpoint resume. Each MD stage runs ``gmx grompp``
+  before ``gmx mdrun`` (grompp compiles the ``.tpr`` from the
+  ``.mdp`` + previous ``.gro`` + optional ``.cpt``); mdrun uses
+  ``-cpi`` + ``-append`` **only** when a ``.cpt`` exists.
+
+Both runners are thin subprocess wrappers. The protocol
+**content** (``.mdp`` strings, command-line construction, stage
+plan) lives in :mod:`biolab_runners.gromacs.protocol`. The
+**filenames** live in :mod:`biolab_runners.gromacs.paths`. The
+**manifest I/O** lives in :mod:`biolab_runners.gromacs.utils`.
+This module is the orchestrator that ties them together.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import dataclasses
+import logging
+import os
+import signal
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from biolab_runners.contracts import (
+    ArtifactReference,
+    ExecutionMode,
+    ExecutionStatus,
+    MalformedOutputError,
+    RunnerTimeoutError,
+)
+from biolab_runners.gromacs.observations import (
+    GromacsStageObservation,
+    extract_protocol_observations,
+)
+from biolab_runners.gromacs.protocol import (
+    GENION_INPUT,
+    ProtocolStage,
+    StageKind,
+    build_commands,
+    build_stage_plan,
+    generate_equil_npt_mdp,
+    generate_equil_nvt_mdp,
+    generate_minimization_mdp,
+    generate_production_mdp,
+    ions_mdp_content,
+    stage_minimum_outputs,
+    stage_outputs_for,
+    stage_prebuilt_topology,
+)
+from biolab_runners.gromacs.selection_sidecars import (
+    bind_checkpoint_identity,
+    refresh_selection_sidecars,
+    stage_selection_sidecars,
+    strict_sidecars_requested,
+    validate_checkpoint_identity,
+    validate_staged_selection_sidecars,
+)
+from biolab_runners.gromacs.utils import (
+    GromacsRecord,
+    GromacsRecordStatus,
+    StageStatus,
+    build_invocation_command,
+    invoke,
+    load_stage_manifest,
+    now_utc_iso,
+    parse_nthcol_energy_checked,
+    record_stage_status,
+    resolve_binary_prefix,
+    save_stage_manifest,
+)
+from biolab_runners.provenance import (
+    EMPTY_PROVENANCE,
+    ProvenanceMetadata,
+    build_execution_provenance,
+    compute_config_digest,
+    compute_executed_config_digest,
+    compute_file_digest,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from types import FrameType
+
+    from biolab_runners.gromacs.config import GromacsConfig, GromacsProtocolConfig
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "GromacsProtocolResult",
+    "GromacsProtocolRunner",
+    "GromacsResult",
+    "GromacsRunner",
+]
+
+
+# Sentinel return code for "child was killed by SIGTERM". Distinct
+# from any plausible gmx exit code; the runner checks for it before
+# marking a stage FAILED (an interrupted stage is still RESUMABLE).
+_INTERRUPTED_RC = -signal.SIGTERM
+
+
+class _SelectionSidecarRefusalError(ValueError):
+    pass
+
+
+def _empty_metrics_dict() -> dict[str, float]:
+    return {}
+
+
+@dataclass(frozen=True)
+class GromacsResult:
+    """Outcome of one GROMACS run."""
+
+    name: str
+    output_dir: str
+    records: tuple[GromacsRecord, ...] = ()
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+    exit_code: int = 0
+    duration_seconds: float = 0.0
+    metrics: dict[str, float] = field(default_factory=_empty_metrics_dict)
+    provenance: ProvenanceMetadata = EMPTY_PROVENANCE
+    status: ExecutionStatus = ExecutionStatus.INCOMPLETE
+    artifacts: tuple[ArtifactReference, ...] = ()
+    execution_mode: ExecutionMode = ExecutionMode.SUBPROCESS
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the result into a JSON-safe dictionary."""
+        return {
+            "name": self.name,
+            "output_dir": self.output_dir,
+            "records": [r.to_dict() for r in self.records],
+            "succeeded": self.succeeded,
+            "failed": self.failed,
+            "skipped": self.skipped,
+            "exit_code": self.exit_code,
+            "duration_seconds": self.duration_seconds,
+            "metrics": dict(self.metrics),
+            "provenance": self.provenance.to_dict(),
+            "status": self.status,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "execution_mode": self.execution_mode,
+        }
+
+
+@dataclass(frozen=True)
+class GromacsProtocolResult:
+    """Outcome of one production-grade GROMACS protocol run.
+
+    Captures per-stage status (so a partial run — e.g. one where
+    the production stage was interrupted by Spot reclaim — still
+    reports which earlier stages completed). The
+    ``duration_seconds`` field is the wall-clock time of the
+    entire run; per-stage timings are visible in the manifest.
+
+    Counters are exact:
+    - ``skipped``: stages that were COMPLETED before this invocation
+      (no subprocess was launched).
+    - ``succeeded``: stages that ran fresh during this invocation
+      (or re-ran due to ``force=True``) and exited zero.
+    - ``failed``: stages that ran but exited non-zero (and were not
+      interrupted by SIGTERM).
+    - ``interrupted``: stages that were interrupted by SIGTERM
+      (treated as resumable — the manifest preserves RUNNING
+      status so the next invocation resumes from the ``.cpt``).
+    - ``validated``: stages that were **dry-run** (.mdp files
+      emitted for inspection, no subprocess, NO manifest record
+      written — a subsequent real run will run them from
+      scratch). Mutually exclusive with ``succeeded`` /
+      ``skipped`` (each stage contributes to exactly one of
+      these four counters per invocation).
+    - ``dry_run``: True iff the runner was constructed with
+      ``dry_run=True``. When True, every stage counts as
+      ``validated`` (or ``failed`` for stages that could not
+      emit a .mdp).
+    - ``observations``: per-stage records read from the real
+      ``equil_nvt`` / ``equil_npt`` / ``production`` ``.edr``
+      files, each bound to its stage EDR digest. The records carry
+      timestamped temperature and pressure samples with the units
+      declared by the energy file. They are evidence, not a verdict:
+      no threshold, aggregation, or stability claim is derived from
+      them, and an unreadable or absent stage stays an explicit
+      unavailable/partial/error state.
+    """
+
+    name: str
+    output_dir: str
+    replica_index: int
+    replicas_total: int
+    stage_statuses: dict[str, str] = field(default_factory=dict)
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+    interrupted: int = 0
+    validated: int = 0
+    dry_run: bool = False
+    exit_code: int = 0
+    duration_seconds: float = 0.0
+    error: str = ""
+    execution_mode: ExecutionMode = ExecutionMode.SUBPROCESS
+    requested_config_digest: str = ""
+    executed_config_digest: str | None = None
+    source_backbone_digest: str | None = None
+    executed: bool = False
+    cache_hit: bool = False
+    command: tuple[str, ...] = ()
+    observations: tuple[GromacsStageObservation, ...] = ()
+
+    @property
+    def status(self) -> ExecutionStatus:
+        """Return the normalized status for the whole protocol invocation."""
+        if self.dry_run:
+            return ExecutionStatus.DRY_RUN
+        if self.interrupted:
+            return ExecutionStatus.INTERRUPTED
+        if self.exit_code == 124:
+            return ExecutionStatus.TIMEOUT
+        if self.failed or self.error:
+            return ExecutionStatus.FAILED
+        if self.succeeded == 0 and self.skipped > 0:
+            return ExecutionStatus.CACHED
+        if self.succeeded == 0 and self.skipped == 0:
+            return ExecutionStatus.INCOMPLETE
+        return ExecutionStatus.SUCCEEDED
+
+    @property
+    def artifacts(self) -> tuple[ArtifactReference, ...]:
+        """Return references for files present in the protocol output."""
+        output = Path(self.output_dir)
+        if not output.is_dir():
+            return ()
+        boundary = output.resolve()
+        return tuple(
+            ArtifactReference.from_path(path, required=False, kind="simulation", root=boundary)
+            for path in sorted(output.iterdir())
+            if path.is_file() and not path.is_symlink()
+        )
+
+    @property
+    def provenance(self) -> ProvenanceMetadata:
+        """Return shared execution provenance for this protocol result."""
+        provenance = build_execution_provenance(
+            runner_name="gromacs_protocol",
+            execution_mode=self.execution_mode,
+            status=self.status,
+            exit_code=self.exit_code,
+            artifacts=self.artifacts,
+            requested_config_digest=self.requested_config_digest,
+            executed_config_digest=self.executed_config_digest,
+            source_backbone_digest=self.source_backbone_digest,
+            executed=self.executed,
+            cache_hit=self.cache_hit,
+            command=self.command,
+        )
+        if not self.executed and self.cache_hit and self.executed_config_digest:
+            provenance = dataclasses.replace(
+                provenance,
+                executed_config_digest=self.executed_config_digest,
+            )
+        return provenance
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the result into a JSON-safe dictionary."""
+        return {
+            "name": self.name,
+            "output_dir": self.output_dir,
+            "replica_index": self.replica_index,
+            "replicas_total": self.replicas_total,
+            "stage_statuses": dict(self.stage_statuses),
+            "succeeded": self.succeeded,
+            "failed": self.failed,
+            "skipped": self.skipped,
+            "interrupted": self.interrupted,
+            "validated": self.validated,
+            "dry_run": self.dry_run,
+            "exit_code": self.exit_code,
+            "duration_seconds": self.duration_seconds,
+            "error": self.error,
+            "status": self.status,
+            "execution_mode": self.execution_mode,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "observations": [observation.to_dict() for observation in self.observations],
+            "provenance": self.provenance.to_dict(),
+        }
+
+
+# Special stage status returned by dry-run. NOT a value of
+# :class:`StageStatus` (so the manifest-authority skip logic in
+# ``_stage_already_complete`` ignores it) and NOT a string that
+# the runner interprets as COMPLETED/FAILED. The runner counts
+# stages in this status under ``validated`` rather than
+# ``succeeded`` / ``skipped`` so callers can distinguish a
+# dry-run validation from a real run.
+_DRY_RUN_STATUS = "validated"
+
+
+def _mdp_content_for(stage: ProtocolStage, config: GromacsProtocolConfig) -> str | None:
+    """Return the canonical generated ``.mdp`` content for a stage."""
+    if not stage.mdp_filename:
+        return None
+    if stage.kind == StageKind.IONS:
+        return ions_mdp_content()
+    if stage.kind == StageKind.MINIMIZE:
+        return generate_minimization_mdp(
+            config.minimization_max_iterations,
+            replica_index=config.replica_index,
+            execution_seed=config.execution_seed,
+        )
+    if stage.kind == StageKind.EQUIL_NVT:
+        return generate_equil_nvt_mdp(
+            config.nvt_ps,
+            config.temperature_k,
+            replica_index=config.replica_index,
+            execution_seed=config.execution_seed,
+        )
+    if stage.kind == StageKind.EQUIL_NPT:
+        return generate_equil_npt_mdp(
+            config.npt_ps,
+            config.temperature_k,
+            config.pressure_bar,
+            replica_index=config.replica_index,
+            execution_seed=config.execution_seed,
+        )
+    if stage.kind == StageKind.PRODUCTION:
+        return generate_production_mdp(
+            config.effective_production_ns(),
+            config.temperature_k,
+            config.pressure_bar,
+            replica_index=config.replica_index,
+            execution_seed=config.execution_seed,
+        )
+    return None
+
+
+def _emit_mdp(work_dir: Path, stage: ProtocolStage, config: GromacsProtocolConfig) -> str | None:
+    """Emit the .mdp content for a stage and write it to disk.
+
+    Returns the mdp filename written (matches ``stage.mdp_filename``)
+    or ``None`` for stages that don't need a .mdp file (e.g.
+    ``BOX`` is a pure ``editconf`` invocation with no mdp input).
+    The content is the canonical deterministic string from the
+    protocol module — same config → byte-identical content.
+    """
+    content = _mdp_content_for(stage, config)
+    if content is None:
+        return None
+    mdp_path = work_dir / stage.mdp_filename
+    mdp_path.write_text(content)
+    return stage.mdp_filename
+
+
+def _is_md_stage(kind: StageKind) -> bool:
+    """True iff the stage runs ``gmx mdrun`` (and is therefore checkpoint-resumable)."""
+    return kind in (
+        StageKind.MINIMIZE,
+        StageKind.EQUIL_NVT,
+        StageKind.EQUIL_NPT,
+        StageKind.PRODUCTION,
+    )
+
+
+def _checkpoint_for(work_dir: Path, stage: ProtocolStage) -> str | None:
+    """Return the absolute path to the ``.cpt`` for an MD stage, or None.
+
+    ``None`` signals "fresh start" — the caller (build_commands) uses
+    this to decide whether to emit ``-cpi <path>``. The "no duplicate
+    start path" rule from S4: GROMACS errors when ``-cpi`` points to
+    a non-existent file, so the runner pre-checks and emits the flag
+    only when resume is actually possible.
+    """
+    if not _is_md_stage(stage.kind):
+        return None
+    from biolab_runners.gromacs.paths import GromacsFiles
+
+    cpt = work_dir / GromacsFiles.checkpoint(stage.prefix)
+    return str(cpt) if cpt.exists() else None
+
+
+def _require_staged_selection_sidecars(
+    work_dir: Path,
+    config: GromacsProtocolConfig,
+) -> None:
+    if not strict_sidecars_requested(config):
+        return
+    try:
+        validate_staged_selection_sidecars(work_dir)
+    except (OSError, ValueError) as exc:
+        raise _SelectionSidecarRefusalError(str(exc)) from exc
+
+
+def _require_checkpoint_identity(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+    checkpoint_path: str | None,
+) -> None:
+    if not strict_sidecars_requested(config) or checkpoint_path is None:
+        return
+    try:
+        validate_checkpoint_identity(
+            work_dir,
+            stage=stage.kind.value,
+            checkpoint=Path(checkpoint_path),
+        )
+    except (OSError, ValueError) as exc:
+        raise _SelectionSidecarRefusalError(str(exc)) from exc
+
+
+def _refresh_selection_sidecars_after_stage(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+) -> None:
+    if not strict_sidecars_requested(config):
+        return
+    coordinates: Path | None = None
+    if stage.kind == StageKind.SOLVATE:
+        coordinates = work_dir / "solvated.gro"
+    elif stage.kind == StageKind.IONS:
+        coordinates = work_dir / "ions.gro"
+    elif _is_md_stage(stage.kind):
+        coordinates = work_dir / f"{stage.prefix}.gro"
+    if coordinates is None:
+        return
+    checkpoint_path = _checkpoint_for(work_dir, stage)
+    try:
+        refresh_selection_sidecars(
+            work_dir,
+            stage=stage.kind.value,
+            topology_path=work_dir / "topol.top",
+            coordinates_path=coordinates,
+            checkpoint=Path(checkpoint_path) if checkpoint_path is not None else None,
+        )
+    except (OSError, ValueError) as exc:
+        raise _SelectionSidecarRefusalError(str(exc)) from exc
+
+
+def _bind_stage_checkpoint(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+) -> None:
+    checkpoint_path = _checkpoint_for(work_dir, stage)
+    if not strict_sidecars_requested(config) or checkpoint_path is None:
+        return
+    try:
+        bind_checkpoint_identity(
+            work_dir,
+            stage=stage.kind.value,
+            checkpoint=Path(checkpoint_path),
+        )
+    except (OSError, ValueError) as exc:
+        raise _SelectionSidecarRefusalError(str(exc)) from exc
+
+
+def _outputs_exist(work_dir: Path, outputs: tuple[str, ...]) -> bool:
+    """True iff every output filename exists and is non-empty on disk."""
+    return all(
+        (work_dir / name).is_file() and (work_dir / name).stat().st_size > 0 for name in outputs
+    )
+
+
+def _stage_already_complete(work_dir: Path, stage: ProtocolStage) -> bool:
+    """True iff the manifest marks this stage COMPLETED **before** this run.
+
+    This is the "manifest authority" check used by the runner's
+    skip accounting: a manifest entry saying COMPLETED means the
+    stage was completed in a previous invocation, regardless of
+    whether the disk outputs still exist (the manifest is the
+    source of truth — outputs may be on a shared filesystem that
+    is unavailable right now, etc.).
+
+    The disk-output check is a separate fallback (used when the
+    manifest is silent) — see ``_outputs_complete_on_disk``.
+
+    Prebuilt-source binding: the TOPOLOGY stage also stores a
+    ``prebuilt_source`` block with the source digests. A
+    different prebuilt source (different ``.top`` /
+    ``.gro`` pair supplied by the caller) MUST invalidate the
+    cached stage even when the manifest status is COMPLETED.
+    This helper currently only consults the status field; the
+    caller (``_run_single_stage``) does the prebuilt-source
+    diff check separately — see the comment block in
+    :meth:`GromacsProtocolRunner.run_protocol`.
+    """
+    manifest = load_stage_manifest(work_dir)
+    record = manifest.get("stages", {}).get(stage.kind.value)
+    return isinstance(record, dict) and record.get("status") == StageStatus.COMPLETED
+
+
+def _prebuilt_source_changed(work_dir: Path, config: GromacsProtocolConfig) -> bool:
+    """Return True iff the supplied prebuilt source differs from the cached one.
+
+    A cached TOPOLOGY stage is invalidated when EITHER of the
+    prebuilt source paths OR their digests has changed. This
+    prevents a stale topology from being silently reused when
+    the caller supplied a new ``.top`` / ``.gro`` pair.
+
+    Returns ``False`` when the manifest is silent (the
+    no-cache case) or when the prebuilt pair is empty (legacy
+    ``input_pdb`` path) — only the prebuilt path ever has a
+    "previous" identity to compare against.
+    """
+    if not (config.prebuilt_topology and config.prebuilt_coordinates):
+        return False
+    manifest = load_stage_manifest(work_dir)
+    record = manifest.get("stages", {}).get(StageKind.TOPOLOGY.value)
+    if not record:
+        return False
+    cached = record.get("prebuilt_source") or {}
+    new = _prebuilt_meta(config)
+    return (
+        cached.get("prebuilt_topology") != new["prebuilt_topology"]
+        or cached.get("prebuilt_coordinates") != new["prebuilt_coordinates"]
+        or cached.get("sha256_topology") != new["sha256_topology"]
+        or cached.get("sha256_coordinates") != new["sha256_coordinates"]
+    )
+
+
+def _outputs_complete_on_disk(work_dir: Path, stage: ProtocolStage) -> bool:
+    """True iff every MINIMUM output for the stage is on disk and non-empty.
+
+    Used only by the legacy manifest-silent recovery fallback in
+    :meth:`GromacsProtocolRunner._run_single_stage`; the runner's
+    guard requires a silent manifest and no on-disk ``.cpt``.
+
+    **Uses ``stage_minimum_outputs``, NOT ``stage_outputs_for``.**
+    The minimum set is the strict subset of files that ``gmx``
+    writes UNCONDITIONALLY: ``.tpr``, ``.gro``, ``.edr``, ``.log``.
+    Forbidding the intermittent artifacts (``.cpt``,
+    ``.xtc``, ``.trr``) would force the runner to re-run every
+    short simulation, which defeats the purpose of the fallback.
+
+    The runner separately checks ``.cpt`` via
+    :func:`_checkpoint_for` when deciding fresh-vs-resume, so
+    missing .cpt correctly forces a fresh start even when the
+    minimum outputs are present.
+    """
+    return _outputs_exist(work_dir, stage_minimum_outputs(stage.kind, stage.prefix))
+
+
+def _work_dir(config: GromacsProtocolConfig) -> Path:
+    """Compute the per-replica work directory for this config.
+
+    Single-replica runs (``replicas_total == 1``) write directly
+    under ``output_root / name``. Multi-replica runs write under
+    ``output_root / name / f"rep{replica_index:03d}"`` so all
+    replicas can coexist in one ``output_root`` without colliding
+    on .cpt / .tpr / .edr filenames.
+    """
+    root = Path(config.output_root) / config.name
+    if config.replicas_total > 1:
+        return root / f"rep{config.replica_index:03d}"
+    return root
+
+
+class GromacsRunner:
+    """Subprocess wrapper around the upstream GROMACS CLI (legacy one-shot)."""
+
+    def __init__(
+        self,
+        *,
+        config: GromacsConfig | None = None,
+        binary_prefix: list[str] | None = None,
+        output_root: Path | None = None,
+        timeout_seconds: int = 86400,
+    ) -> None:
+        self._config_override = config
+        self._binary_prefix = binary_prefix
+        self._output_root = output_root or Path.cwd() / "gromacs_output"
+        self._timeout_seconds = timeout_seconds
+
+    @property
+    def output_root(self) -> Path:
+        """Return the root directory into which GROMACS writes outputs."""
+        return self._output_root
+
+    def is_complete(self, config: GromacsConfig) -> bool:
+        """Return True if a prior ``energy.edr`` already exists."""
+        energy = self._design_dir(config) / f"{config.tpr_basename}.edr"
+        return energy.exists()
+
+    def run(
+        self,
+        config: GromacsConfig | None = None,
+        *,
+        force: bool = False,
+        dry_run: bool = False,
+    ) -> GromacsResult:
+        """Run GROMACS and return the parsed result."""
+        cfg = config or self._config_override
+        if cfg is None:
+            raise ValueError("GromacsConfig is required: pass it to run() or the runner")
+        execution_mode = _gromacs_execution_mode(self._binary_prefix)
+
+        output_dir = self._design_dir(cfg)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if not force and self.is_complete(cfg):
+            records = self._collect_records(output_dir, cfg)
+            status = _status_from_gromacs_records(0, records, cached=True)
+            artifacts = _artifacts_for_records(records, output_dir)
+            succeeded, failed = _record_counts(records)
+            return GromacsResult(
+                name=cfg.name,
+                output_dir=str(output_dir),
+                records=tuple(records),
+                succeeded=succeeded,
+                failed=failed,
+                skipped=len(records),
+                exit_code=0,
+                duration_seconds=0.0,
+                provenance=_gromacs_provenance(
+                    status,
+                    0,
+                    artifacts,
+                    execution_mode,
+                    requested_config_digest=compute_config_digest(cfg),
+                    source_backbone_digest=compute_file_digest(Path(cfg.structure_file)),
+                    cache_hit=True,
+                ),
+                status=status,
+                artifacts=artifacts,
+                execution_mode=execution_mode,
+            )
+
+        config_dict = _config_to_cli(cfg)
+        command = build_invocation_command(
+            config_dict=config_dict,
+            mdrun_extra=cfg.extra_mdrun_flags,
+            binary_prefix=self._binary_prefix,
+        )
+        requested_digest = compute_config_digest(cfg)
+        source_digest = compute_file_digest(Path(cfg.structure_file))
+        if dry_run:
+            status = ExecutionStatus.DRY_RUN
+            return GromacsResult(
+                name=cfg.name,
+                output_dir=str(output_dir),
+                records=(),
+                succeeded=0,
+                failed=0,
+                skipped=0,
+                exit_code=0,
+                duration_seconds=0.0,
+                provenance=_gromacs_provenance(
+                    status,
+                    0,
+                    (),
+                    execution_mode,
+                    command=command,
+                    requested_config_digest=requested_digest,
+                    source_backbone_digest=source_digest,
+                ),
+                status=status,
+                execution_mode=execution_mode,
+            )
+
+        started = time.monotonic()
+        try:
+            exit_code = invoke(
+                config_dict=config_dict,
+                output_dir=output_dir,
+                mdrun_extra=cfg.extra_mdrun_flags,
+                binary_prefix=self._binary_prefix,
+                timeout_seconds=self._timeout_seconds,
+            )
+        except RunnerTimeoutError:
+            exit_code = 124
+        records = self._collect_records(output_dir, cfg)
+        succeeded = sum(1 for r in records if r.status == GromacsRecordStatus.SUCCEEDED)
+        failed = len(records) - succeeded
+        status = _status_from_gromacs_records(exit_code, records)
+        artifacts = _artifacts_for_records(records, output_dir)
+        return GromacsResult(
+            name=cfg.name,
+            output_dir=str(output_dir),
+            records=tuple(records),
+            succeeded=succeeded,
+            failed=failed,
+            skipped=0,
+            exit_code=exit_code,
+            duration_seconds=time.monotonic() - started,
+            provenance=_gromacs_provenance(
+                status,
+                exit_code,
+                artifacts,
+                execution_mode,
+                command=command,
+                requested_config_digest=requested_digest,
+                executed_config_digest=compute_executed_config_digest({"command": list(command)}),
+                source_backbone_digest=source_digest,
+                executed=True,
+            ),
+            status=status,
+            artifacts=artifacts,
+            execution_mode=execution_mode,
+        )
+
+    def _design_dir(self, config: GromacsConfig) -> Path:
+        return self._output_root / config.name
+
+    def _collect_records(self, output_dir: Path, config: GromacsConfig) -> list[GromacsRecord]:
+        """Walk ``output_dir`` and parse each ``energy.edr``-derived file."""
+        energy = output_dir / f"{config.tpr_basename}.edr"
+        if not energy.exists():
+            return []
+        if energy.is_symlink():
+            return [
+                GromacsRecord(
+                    index=0,
+                    path=str(energy),
+                    potential_energy=0.0,
+                    status=GromacsRecordStatus.FAILED,
+                    error="energy artifact symlink is outside the output boundary",
+                )
+            ]
+        records: list[GromacsRecord] = []
+        try:
+            potential = parse_nthcol_energy_checked(energy, column=1)
+        except (MalformedOutputError, OSError, UnicodeDecodeError) as exc:
+            logger.warning("failed to parse %s: %s", energy, exc)
+            records.append(
+                GromacsRecord(
+                    index=len(records),
+                    path=str(energy),
+                    potential_energy=0.0,
+                    status=GromacsRecordStatus.FAILED,
+                    error=str(exc),
+                )
+            )
+            return records
+        records.append(
+            GromacsRecord(
+                index=0,
+                path=str(energy),
+                potential_energy=potential,
+            )
+        )
+        return records
+
+
+def _artifacts_for_records(
+    records: list[GromacsRecord], output_dir: Path | None = None
+) -> tuple[ArtifactReference, ...]:
+    """Describe energy artifacts that were actually produced."""
+    return tuple(
+        ArtifactReference.from_path(record.path, kind="energy", root=output_dir)
+        for record in records
+        if record.path and not Path(record.path).is_symlink()
+    )
+
+
+def _status_from_gromacs_records(
+    exit_code: int,
+    records: list[GromacsRecord],
+    *,
+    cached: bool = False,
+) -> ExecutionStatus:
+    """Map the legacy one-shot result to the shared status vocabulary."""
+    if exit_code == 124:
+        return ExecutionStatus.TIMEOUT
+    if exit_code < 0:
+        return ExecutionStatus.INTERRUPTED
+    if exit_code != 0:
+        return ExecutionStatus.FAILED
+    if not records:
+        return ExecutionStatus.INCOMPLETE
+    if any(record.status != GromacsRecordStatus.SUCCEEDED for record in records):
+        return ExecutionStatus.MALFORMED
+    return ExecutionStatus.CACHED if cached else ExecutionStatus.SUCCEEDED
+
+
+def _record_counts(records: list[GromacsRecord]) -> tuple[int, int]:
+    """Count one-shot records by their parsed status."""
+    succeeded = sum(1 for record in records if record.status == GromacsRecordStatus.SUCCEEDED)
+    failed = sum(1 for record in records if record.status != GromacsRecordStatus.SUCCEEDED)
+    return succeeded, failed
+
+
+def _gromacs_provenance(
+    status: ExecutionStatus,
+    exit_code: int,
+    artifacts: tuple[ArtifactReference, ...],
+    mode: ExecutionMode = ExecutionMode.SUBPROCESS,
+    *,
+    command: tuple[str, ...] = (),
+    requested_config_digest: str = "",
+    executed_config_digest: str | None = None,
+    source_backbone_digest: str | None = None,
+    executed: bool = False,
+    cache_hit: bool = False,
+) -> ProvenanceMetadata:
+    """Build the generic one-shot GROMACS execution record."""
+    return build_execution_provenance(
+        runner_name="gromacs",
+        execution_mode=mode,
+        status=status,
+        exit_code=exit_code,
+        artifacts=artifacts,
+        command=command,
+        requested_config_digest=requested_config_digest,
+        executed_config_digest=executed_config_digest,
+        source_backbone_digest=source_backbone_digest,
+        executed=executed,
+        cache_hit=cache_hit,
+    )
+
+
+def _gromacs_execution_mode(
+    binary_prefix: list[str] | None,
+    *,
+    resolved_prefix: tuple[str, ...] | None = None,
+) -> ExecutionMode:
+    """Identify the mode of the resolved command prefix."""
+    prefix = resolved_prefix or resolve_binary_prefix(binary_prefix)
+    runtime = Path(prefix[0]).name
+    if runtime in {"docker", "podman", "nerdctl", "singularity", "apptainer"} and any(
+        token in {"run", "exec"} for token in prefix[1:4]
+    ):
+        return ExecutionMode.CONTAINER_URI
+    return ExecutionMode.SUBPROCESS
+
+
+def _protocol_input_digests(config: GromacsProtocolConfig) -> dict[str, str | None]:
+    """Return content digests for the scientific files a protocol consumes."""
+    if config.prebuilt_topology and config.prebuilt_coordinates:
+        digests = {
+            "prebuilt_topology": compute_file_digest(Path(config.prebuilt_topology)),
+            "prebuilt_coordinates": compute_file_digest(Path(config.prebuilt_coordinates)),
+        }
+        if strict_sidecars_requested(config):
+            digests.update(
+                {
+                    "prebuilt_prepared_pdb": compute_file_digest(
+                        Path(config.prebuilt_prepared_pdb)
+                    ),
+                    "prebuilt_selection_map": compute_file_digest(
+                        Path(config.prebuilt_selection_map)
+                    ),
+                    "prebuilt_index": compute_file_digest(Path(config.prebuilt_index)),
+                    "prebuilt_bundle_manifest": compute_file_digest(
+                        Path(config.prebuilt_bundle_manifest)
+                    ),
+                }
+            )
+        return digests
+    return {"input_pdb": compute_file_digest(Path(config.input_pdb))}
+
+
+def _protocol_source_identity(config: GromacsProtocolConfig) -> dict[str, str | None]:
+    """Return the canonical source path/content identity for a protocol."""
+    if config.prebuilt_topology and config.prebuilt_coordinates:
+        identity = {
+            "mode": "strict_prebuilt" if strict_sidecars_requested(config) else "prebuilt",
+            "topology_path": config.prebuilt_topology,
+            "coordinates_path": config.prebuilt_coordinates,
+            "topology_digest": compute_file_digest(Path(config.prebuilt_topology)),
+            "coordinates_digest": compute_file_digest(Path(config.prebuilt_coordinates)),
+        }
+        if strict_sidecars_requested(config):
+            identity.update(
+                {
+                    "prepared_pdb_path": config.prebuilt_prepared_pdb,
+                    "prepared_pdb_digest": compute_file_digest(Path(config.prebuilt_prepared_pdb)),
+                    "selection_map_path": config.prebuilt_selection_map,
+                    "selection_map_digest": compute_file_digest(
+                        Path(config.prebuilt_selection_map)
+                    ),
+                    "index_path": config.prebuilt_index,
+                    "index_digest": compute_file_digest(Path(config.prebuilt_index)),
+                    "bundle_manifest_path": config.prebuilt_bundle_manifest,
+                    "bundle_manifest_digest": compute_file_digest(
+                        Path(config.prebuilt_bundle_manifest)
+                    ),
+                }
+            )
+        return identity
+    return {
+        "mode": "input_pdb",
+        "input_pdb_path": config.input_pdb,
+        "input_pdb_digest": compute_file_digest(Path(config.input_pdb)),
+    }
+
+
+def _protocol_stage_identity_payload(
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+) -> dict[str, object]:
+    """Build the stage-scoped science identity used by manifest reuse."""
+    from biolab_runners.gromacs.protocol import GROMACS_PROTOCOL_VERSION
+
+    payload: dict[str, object] = {
+        "protocol_version": GROMACS_PROTOCOL_VERSION,
+        "stage": {
+            "kind": stage.kind.value,
+            "prefix": stage.prefix,
+            "mdp_filename": stage.mdp_filename,
+        },
+        "source": _protocol_source_identity(config),
+    }
+    if stage.kind == StageKind.TOPOLOGY:
+        payload["topology_parameters"] = {
+            "force_field": config.force_field,
+            "water_model": config.water_model,
+        }
+    elif stage.kind == StageKind.BOX:
+        payload["box_parameters"] = {"box_buffer_nm": config.box_buffer_nm}
+    elif stage.kind == StageKind.IONS:
+        payload["ion_parameters"] = {
+            "ion_concentration_m": config.ion_concentration_m,
+            "mdp": _mdp_content_for(stage, config),
+        }
+    elif _is_md_stage(stage.kind):
+        payload["md_parameters"] = {
+            "mdp": _mdp_content_for(stage, config),
+            "nt_threads": config.nt_threads,
+            "extra_mdrun_flags": list(config.extra_mdrun_flags),
+        }
+    return payload
+
+
+def _protocol_stage_identity(stage: ProtocolStage, config: GromacsProtocolConfig) -> str:
+    """Return the canonical digest binding a stage to its science inputs."""
+    return compute_executed_config_digest(_protocol_stage_identity_payload(stage, config))
+
+
+def _protocol_executed_config(config: GromacsProtocolConfig) -> dict[str, object]:
+    """Bind protocol settings and consumed input contents to execution."""
+    from biolab_runners.gromacs.protocol import GROMACS_PROTOCOL_VERSION
+
+    payload = dataclasses.asdict(config)
+    if config.execution_seed is None:
+        payload.pop("execution_seed")
+    payload["protocol_version"] = GROMACS_PROTOCOL_VERSION
+    payload["input_digests"] = _protocol_input_digests(config)
+    payload["mdp_contents"] = {
+        stage.kind.value: _mdp_content_for(stage, config)
+        for stage in build_stage_plan()
+        if stage.mdp_filename
+    }
+    return payload
+
+
+def _resolve_protocol_command(command: list[str], prefix: tuple[str, ...]) -> list[str]:
+    if not prefix:
+        raise ValueError("resolved GROMACS executable prefix must not be empty")
+    if not command or command[0] != "gmx":
+        actual = command[0] if command else "<empty>"
+        raise ValueError(
+            f"protocol command must begin with the logical executable token 'gmx'; got {actual!r}"
+        )
+    return [*prefix, *command[1:]]
+
+
+def _protocol_source_digest(config: GromacsProtocolConfig) -> str | None:
+    """Return the legacy source field only for the input actually consumed."""
+    if config.prebuilt_topology and config.prebuilt_coordinates:
+        return None
+    return compute_file_digest(Path(config.input_pdb))
+
+
+def _observations_for_result(
+    dry_run: bool,
+    work_dir: Path,
+    executable: tuple[str, ...] | None,
+) -> tuple[GromacsStageObservation, ...]:
+    """Read stage EDR observations for a finished protocol invocation."""
+    if dry_run or not executable:
+        return ()
+    return extract_protocol_observations(work_dir, executable)
+
+
+def _stage_prebuilt_files(
+    config: GromacsProtocolConfig,
+    work_dir: Path,
+) -> dict[str, str]:
+    if not strict_sidecars_requested(config):
+        return stage_prebuilt_topology(config, work_dir)
+    stage_selection_sidecars(config, work_dir)
+    return {
+        "topology": config.prebuilt_topology,
+        "coordinates": config.prebuilt_coordinates,
+        "sha256_topology": compute_file_digest(Path(config.prebuilt_topology)) or "",
+        "sha256_coordinates": compute_file_digest(Path(config.prebuilt_coordinates)) or "",
+    }
+
+
+def _prebuilt_failure_result(
+    config: GromacsProtocolConfig,
+    work_dir: Path,
+    started: float,
+    execution_mode: ExecutionMode,
+    *,
+    dry_run: bool,
+    error: str,
+) -> GromacsProtocolResult:
+    return GromacsProtocolResult(
+        name=config.name,
+        output_dir=str(work_dir),
+        replica_index=config.replica_index,
+        replicas_total=config.replicas_total,
+        stage_statuses={},
+        succeeded=0,
+        failed=1,
+        skipped=0,
+        interrupted=0,
+        validated=0,
+        dry_run=dry_run,
+        exit_code=2,
+        duration_seconds=time.monotonic() - started,
+        error=error,
+        execution_mode=execution_mode,
+    )
+
+
+def _config_to_cli(config: GromacsConfig) -> dict[str, str]:
+    """Translate :class:`GromacsConfig` into a flat CLI kwargs dict."""
+    payload: dict[str, str] = {
+        "-deffnm": config.tpr_basename,
+        "-s": config.structure_file,
+        "-nsteps": str(config.nsteps),
+    }
+    for key, value in config.extra.items():
+        payload[str(key)] = str(value)
+    return payload
+
+
+def invoke(  # noqa: F811 - re-export for the test monkeypatch seam
+    *,
+    config_dict: dict[str, str],
+    output_dir: Path,
+    mdrun_extra: tuple[str, ...],
+    binary_prefix: list[str] | None = None,
+    timeout_seconds: int = 86400,
+) -> int:
+    """Run ``gmx mdrun`` once; returns the process exit code."""
+    from biolab_runners.gromacs.utils import invoke as _invoke
+
+    return _invoke(
+        config_dict=config_dict,
+        output_dir=output_dir,
+        mdrun_extra=mdrun_extra,
+        binary_prefix=binary_prefix,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# S4 production-grade protocol runner
+# ---------------------------------------------------------------------------
+
+
+class GromacsProtocolRunner:
+    """Run the production-grade GROMACS protocol end-to-end.
+
+    Drives every stage in the canonical order (topology → box →
+    solvate → ions → minimize → NVT → NPT → production), honouring
+    per-stage idempotency:
+
+    - **Manifest authority**: the manifest is the source of truth.
+      A stage whose manifest record is ``completed`` is **skipped**
+      (no subprocess launched) — this is the skip counter.
+    - **Output fallback**: when the manifest is silent, no
+      ``.cpt`` is on disk, and every canonical output is
+      non-empty, the runner treats the stage as complete
+      (legacy recovery). An on-disk ``.cpt`` always routes
+      to the execution path so ``-cpi`` resume is preserved.
+    - **MD stage resume**: an MD stage with a ``.cpt`` on disk
+      resumes via ``gmx grompp -t <cpt>`` + ``gmx mdrun -cpi
+      <cpt> -append``. Without ``.cpt``, the stage starts fresh
+      (no ``-cpi``, no ``-append``) — the "no duplicate start
+      path" rule.
+    - **SIGTERM preservation**: when the parent receives SIGTERM
+      (cloud preemption), the child is forwarded the signal and
+      given up to 30 s to write its periodic ``.cpt`` and exit.
+      The stage is recorded as ``running`` (not ``failed``) so
+      the next invocation sees the on-disk ``.cpt`` and resumes.
+      The runner returns ``interrupted`` (not ``failed``) and
+      halts at the interrupted stage, so a missing-input FAILED
+      cannot overwrite the truthful interruption result.
+    - **``nt_threads=0``**: the runner OMITS ``-nt`` so GROMACS
+      auto-detects the host thread count (the recommended default
+      on cloud VMs where you don't know the vCPU count a priori).
+    - **Genion stdin**: the IONS stage's ``gmx genion`` invocation
+      receives its ``SOL`` group selection via subprocess stdin
+      (``input=GENION_INPUT``) — NEVER ``sh -c "echo SOL | gmx
+      genion ..."`` (shell injection + platform-dependent quoting).
+    - **force=True**: ignores the manifest, ignores the disk
+      outputs, and re-runs every stage from scratch. The IONS
+      stage re-runs ``gmx grompp`` and ``gmx genion`` (the latter
+      will overwrite ``ions.gro``).
+
+    Args:
+        binary_prefix: Optional override for the ``gmx`` command
+            prefix (e.g. ``["docker", "run", "--rm", "gmx-image",
+            "gmx"]`` for a containerised install).
+        sigterm_grace_seconds: How long the parent waits for the
+            child to exit cleanly after forwarding SIGTERM, before
+            escalating to SIGKILL. Default 30 s — enough for
+            ``gmx mdrun`` to write its periodic ``.cpt``.
+        dry_run: Validate the protocol plan and emit .mdp files
+            without invoking any ``gmx`` subprocess.
+    """
+
+    def __init__(
+        self,
+        *,
+        binary_prefix: list[str] | None = None,
+        sigterm_grace_seconds: float = 30.0,
+        dry_run: bool = False,
+    ) -> None:
+        self._binary_prefix = binary_prefix
+        self._sigterm_grace_seconds = sigterm_grace_seconds
+        self._dry_run = dry_run
+        self._resolved_binary_prefix: tuple[str, ...] | None = None
+        self._last_command: tuple[str, ...] = ()
+
+    def run_protocol(
+        self,
+        config: GromacsProtocolConfig,
+    ) -> GromacsProtocolResult:
+        """Execute the full protocol and return a per-stage result.
+
+        See the class docstring for the skip-vs-resume-vs-fresh
+        decision tree. The method is the only public entry point
+        — everything else is an internal helper.
+
+        Prebuilt mode: when ``config.prebuilt_topology`` and
+        ``config.prebuilt_coordinates`` are both set, the
+        runner stages the caller-supplied ``.top`` / ``.gro``
+        into canonical filenames at the START of the protocol
+        (BEFORE the stage loop). The TOPOLOGY stage's command
+        list is empty (returned by ``build_commands``), so the
+        per-stage logic skips ``pdb2gmx``. The prebuilt source
+        digests are recorded into the stage manifest under
+        ``stages[TOPOLOGY].prebuilt_source`` so a future
+        invocation that supplies a different
+        ``prebuilt_topology`` / ``prebuilt_coordinates`` pair
+        correctly invalidates the cached stage (see the
+        ``_stage_already_complete`` short-circuit).
+
+        Strict prebuilt mode additionally stages and validates the
+        prepared PDB, selection map, index, and bundle manifest. The
+        sidecar identity follows each atom-index-changing stage and
+        binds any resumable checkpoint before ``-cpi`` is allowed.
+        """
+        work_dir = _work_dir(config)
+        self._resolved_binary_prefix = resolve_binary_prefix(self._binary_prefix)
+        self._last_command = ()
+        work_dir.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        execution_mode = _gromacs_execution_mode(
+            self._binary_prefix, resolved_prefix=self._resolved_binary_prefix
+        )
+        stage_statuses: dict[str, str] = {}
+        succeeded = 0
+        skipped = 0
+        failed = 0
+        interrupted = 0
+        validated = 0
+        exit_code = 0
+        error = ""
+
+        # Prebuilt stage (no subprocess — file copy only).
+        prebuilt_failure = self._stage_prebuilt(work_dir, config, started, execution_mode)
+        if prebuilt_failure is not None:
+            return prebuilt_failure
+
+        for stage in build_stage_plan():
+            try:
+                status, rc, was_skipped = self._run_single_stage(work_dir, stage, config)
+            except _SelectionSidecarRefusalError as exc:
+                _record_protocol_stage_status(
+                    work_dir,
+                    stage,
+                    config,
+                    StageStatus.FAILED,
+                    outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+                    error=str(exc),
+                )
+                stage_statuses[stage.kind.value] = StageStatus.FAILED
+                failed += 1
+                exit_code = 2
+                error = f"stage {stage.kind.value} selection sidecar refusal: {exc}"
+                break
+            stage_statuses[stage.kind.value] = status
+            if status == StageStatus.COMPLETED:
+                if was_skipped:
+                    skipped += 1
+                else:
+                    succeeded += 1
+            elif status == _DRY_RUN_STATUS:
+                # Dry-run stage: no subprocess, no manifest record,
+                # no skip. Counted under ``validated`` (NOT under
+                # ``succeeded``) so callers can tell a real run from
+                # a dry-run validation.
+                validated += 1
+            elif status == "interrupted":
+                # Halt: a missing-input FAILED on the next stage
+                # would overwrite the truthful interruption result.
+                # The next invocation re-enters the RUNNING stage
+                # via the on-disk ``.cpt`` (or restarts fresh).
+                interrupted += 1
+                exit_code = rc
+                error = f"stage {stage.kind.value} interrupted by SIGTERM (rc={rc})"
+                break
+            elif status == StageStatus.FAILED:
+                failed += 1
+                exit_code = rc
+                error = f"stage {stage.kind.value} failed (rc={rc})"
+                break
+
+        did_work = bool(succeeded or failed or interrupted)
+        observations = _observations_for_result(
+            self._dry_run, work_dir, self._resolved_binary_prefix
+        )
+        return GromacsProtocolResult(
+            name=config.name,
+            output_dir=str(work_dir),
+            replica_index=config.replica_index,
+            replicas_total=config.replicas_total,
+            stage_statuses=stage_statuses,
+            succeeded=succeeded,
+            failed=failed,
+            skipped=skipped,
+            interrupted=interrupted,
+            validated=validated,
+            dry_run=self._dry_run,
+            exit_code=exit_code,
+            duration_seconds=time.monotonic() - started,
+            error=error,
+            execution_mode=execution_mode,
+            requested_config_digest=compute_config_digest(config),
+            executed_config_digest=(
+                compute_executed_config_digest(_protocol_executed_config(config))
+                if not self._dry_run and (did_work or skipped)
+                else None
+            ),
+            source_backbone_digest=_protocol_source_digest(config),
+            executed=not self._dry_run and did_work,
+            cache_hit=not self._dry_run and not did_work and skipped > 0,
+            command=self._last_command,
+            observations=observations,
+        )
+
+    def _run_single_stage(
+        self,
+        work_dir: Path,
+        stage: ProtocolStage,
+        config: GromacsProtocolConfig,
+    ) -> tuple[str, int, bool]:
+        """Run one stage; return ``(status, exit_code, was_skipped)``.
+
+        Decision tree (the manifest is the source of truth):
+
+        - ``force=True``: bypass manifest + outputs, re-run from
+          scratch.
+        - Manifest says COMPLETED → record COMPLETED, return
+          (``was_skipped=True``).
+        - Manifest silent AND no ``.cpt`` AND minimum outputs on
+          disk → mark COMPLETED, return ``was_skipped=True``
+          (LEGACY recovery path; see the guard below).
+        - Otherwise: emit ``.mdp``, build commands, execute.
+
+        MD-stage resume:
+        - ``.cpt`` exists → resume via ``-cpi`` + ``-append``.
+        - No ``.cpt`` → start fresh.
+
+        INTERRUPTED-STAGE RECOVERY: a RUNNING manifest or an
+        on-disk ``.cpt`` is always re-entered via the execution
+        path. The legacy disk-output fallback fires only when the
+        manifest is silent AND no ``.cpt`` exists, so a
+        post-SIGTERM state is never silently promoted to
+        ``COMPLETED``.
+        """
+        # --- Skip accounting (manifest authority) ---
+        # The skip accounting is delegated to a single helper so
+        # this orchestrator stays at one branch level. The helper
+        # returns ``True`` when the stage should be skipped.
+        if _stage_should_skip(work_dir, stage, config):
+            return StageStatus.COMPLETED, 0, True
+
+        # --- Emit .mdp and build commands ---
+        _emit_mdp(work_dir, stage, config)
+        started_at = now_utc_iso()
+        checkpoint_path = _checkpoint_for(work_dir, stage)
+        _require_checkpoint_identity(work_dir, stage, config, checkpoint_path)
+        commands = build_commands(
+            stage,
+            checkpoint_path=checkpoint_path,
+            config=config,
+        )
+        prefix = self._resolved_binary_prefix or resolve_binary_prefix(self._binary_prefix)
+        resolved_commands = [_resolve_protocol_command(command, prefix) for command in commands]
+        if resolved_commands:
+            self._last_command = tuple(resolved_commands[-1])
+
+        if self._dry_run:
+            return _DRY_RUN_STATUS, 0, False
+
+        _record_protocol_stage_status(
+            work_dir,
+            stage,
+            config,
+            StageStatus.RUNNING,
+            command=" ".join(resolved_commands[0]) if resolved_commands else "",
+            started_at=started_at,
+        )
+
+        # --- Execute commands ---
+        rc = 0
+        for cmd in resolved_commands:
+            self._last_command = tuple(cmd)
+            rc = self._run_subprocess(cmd, work_dir, config.timeout_seconds)
+            if rc != 0:
+                break
+        completed_at = now_utc_iso()
+
+        # --- Classify the outcome ---
+        if rc == _INTERRUPTED_RC:
+            _bind_stage_checkpoint(work_dir, stage, config)
+            # SIGTERM: the child was forwarded the signal and exited.
+            # Preserve the manifest in RUNNING (NOT failed) so the
+            # next invocation sees the on-disk .cpt and resumes.
+            _record_protocol_stage_status(
+                work_dir,
+                stage,
+                config,
+                StageStatus.RUNNING,
+                outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+                command=" ".join(resolved_commands[0]) if resolved_commands else "",
+                started_at=started_at,
+                completed_at=completed_at,
+                error="interrupted by SIGTERM; resumable on next invocation",
+            )
+            return "interrupted", _INTERRUPTED_RC, False
+
+        if rc == 0:
+            _refresh_selection_sidecars_after_stage(work_dir, stage, config)
+        else:
+            _bind_stage_checkpoint(work_dir, stage, config)
+        status = StageStatus.COMPLETED if rc == 0 else StageStatus.FAILED
+        _record_protocol_stage_status(
+            work_dir,
+            stage,
+            config,
+            status,
+            outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+            command=" ".join(resolved_commands[0]) if resolved_commands else "",
+            started_at=started_at,
+            completed_at=completed_at,
+            error="" if rc == 0 else f"rc={rc}",
+        )
+        return status, rc, False
+
+    def _stage_prebuilt(
+        self,
+        work_dir: Path,
+        config: GromacsProtocolConfig,
+        started: float,
+        execution_mode: ExecutionMode,
+    ) -> GromacsProtocolResult | None:
+        """Stage the caller-supplied prebuilt .top/.gro (B4 + cascade invalidation).
+
+        Compares the supplied prebuilt source digests to the
+        cached ones BEFORE staging the new files. If the source
+        has changed, every downstream stage that depends on
+        ``topol.top`` / ``processed.gro`` is invalidated —
+        their on-disk outputs are quarantined to
+        ``.stale/<UTC>/`` and their manifest entries are reset
+        to PENDING so the per-stage loop re-runs them from
+        scratch. Without this guard the staging block would
+        re-record the manifest BEFORE the loop, making the
+        invalidation check unreachable (probe 5 surfaced this).
+
+        Returns ``None`` on success, or a failure
+        :class:`GromacsProtocolResult` on staging error.
+        """
+        if not (config.prebuilt_topology and config.prebuilt_coordinates):
+            return None
+
+        topology_stage = build_stage_plan()[0]
+        source_changed = _prebuilt_source_changed(work_dir, config)
+        if config.force and strict_sidecars_requested(config):
+            _invalidate_stages_from(work_dir, StageKind.TOPOLOGY, reason="force")
+        elif source_changed:
+            logger.info(
+                "prebuilt source digests differ from cached values; "
+                "invalidating downstream dependent stages"
+            )
+            _invalidate_downstream_for_prebuilt_change(work_dir)
+        elif not config.force and _stage_identity_changed(work_dir, topology_stage, config):
+            pass
+        elif not config.force and _stage_already_complete(work_dir, topology_stage):
+            try:
+                _require_staged_selection_sidecars(work_dir, config)
+            except _SelectionSidecarRefusalError as exc:
+                return _prebuilt_failure_result(
+                    config,
+                    work_dir,
+                    started,
+                    execution_mode,
+                    dry_run=self._dry_run,
+                    error=f"prebuilt bundle reuse refused: {exc}",
+                )
+            return None
+
+        try:
+            staged = _stage_prebuilt_files(config, work_dir)
+            prebuilt_meta = {
+                "prebuilt_topology": staged["topology"],
+                "prebuilt_coordinates": staged["coordinates"],
+                "sha256_topology": staged["sha256_topology"],
+                "sha256_coordinates": staged["sha256_coordinates"],
+            }
+            _record_protocol_stage_status(
+                work_dir,
+                topology_stage,
+                config,
+                StageStatus.COMPLETED,
+                outputs=stage_minimum_outputs(topology_stage.kind, topology_stage.prefix),
+                prebuilt_source=prebuilt_meta,
+            )
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            error_prefix = (
+                "selection sidecar staging failed"
+                if strict_sidecars_requested(config)
+                else "prebuilt topology staging failed"
+            )
+            return _prebuilt_failure_result(
+                config,
+                work_dir,
+                started,
+                execution_mode,
+                dry_run=self._dry_run,
+                error=f"{error_prefix}: {exc}",
+            )
+        return None
+
+    def _run_subprocess(
+        self,
+        cmd: list[str],
+        work_dir: Path,
+        timeout_seconds: int,
+    ) -> int:
+        r"""Run one resolved GROMACS argv with SIGTERM grace + kill escalation.
+
+        **Honest SIGTERM semantics** (no 24 h blocking):
+
+        1. Spawn the child. The parent installs a SIGTERM handler
+           that sets ``interrupted`` and forwards to the child
+           (``Popen.terminate``).
+        2. If SIGTERM arrives, the child has
+           ``sigterm_grace_seconds`` (default 30 s) to write its
+           periodic ``.cpt`` and exit.
+        3. After the grace expires the parent escalates with
+           ``Popen.kill()`` (SIGKILL). The child has no further
+           chance to flush a .cpt — by this point the next
+           invocation will start fresh from the last periodic
+           checkpoint. The grace is the **only** opportunity to
+           leave a resumable .cpt; the kill is the contract.
+        4. The parent returns ``_INTERRUPTED_RC`` when the child
+           exited via the SIGTERM path (regardless of whether
+           it exited within the grace or after the kill). The
+           runner classifies the stage as ``interrupted`` (NOT
+           failed); the manifest stays in ``RUNNING`` so the
+           next invocation resumes from the on-disk ``.cpt``
+           (if the child flushed one in time) or starts fresh
+           (if the kill was the actual exit path).
+
+        **Honest timeout semantics**: ``proc.communicate(timeout=
+        timeout_seconds)`` raises ``TimeoutExpired`` if the child
+        exceeds the overall per-stage timeout. The parent then
+        kills the child and returns rc=124 (the conventional
+        "command timed out" code). The grace escalation runs on
+        a separate timer (the SIGTERM signal handler) — it does
+        NOT block on the communicate timeout.
+
+        **Genion stdin**: when ``cmd`` is the IONS stage's resolved genion
+        invocation, the parent's stdin pipe
+        is closed and ``GENION_INPUT`` ("SOL\n") is fed via
+        ``Popen.communicate(input=GENION_INPUT)``. No shell, no
+        quoting, no injection.
+        """
+        prefix = self._resolved_binary_prefix or resolve_binary_prefix(self._binary_prefix)
+        if tuple(cmd[: len(prefix)]) != prefix or len(cmd) <= len(prefix):
+            raise ValueError(
+                "subprocess command does not match the resolved GROMACS executable prefix"
+            )
+        self._last_command = tuple(cmd)
+
+        # Detect genion — needs stdin (group selection).
+        is_genion = cmd[len(prefix)] == "genion"
+
+        # Track whether the parent received SIGTERM (Spot preemption).
+        interrupted = threading.Event()
+        sigterm_received_at: list[float | None] = [None]
+        kill_dispatched = threading.Event()
+
+        stdin_arg = subprocess.PIPE if is_genion else None
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(work_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            stdin=stdin_arg,
+        )
+
+        original = self._install_sigterm_handler(
+            proc, interrupted, sigterm_received_at, kill_dispatched
+        )
+        try:
+            # Communicate is in text mode (text=True on Popen); the
+            # stdin payload must be a str, not bytes. The
+            # communicate timeout is the OVERALL cap (timeout_seconds);
+            # the SIGTERM grace runs on the separate watchdog timer.
+            stdin_payload: str | None = GENION_INPUT if is_genion else None
+            _, stderr = proc.communicate(input=stdin_payload, timeout=timeout_seconds)
+            rc = proc.returncode if proc.returncode is not None else 0
+        except subprocess.TimeoutExpired:
+            logger.error("GROMACS stage timed out after %ds in %s", timeout_seconds, work_dir)
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            try:
+                _, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                _, stderr = "", ""
+            rc = 124
+        finally:
+            signal.signal(signal.SIGTERM, original)
+
+        # If the parent received SIGTERM (interrupted.is_set()), the
+        # child was forwarded the signal. Return the sentinel so the
+        # stage is recorded as interrupted (not failed), preserving
+        # resumable status.
+        if interrupted.is_set():
+            return _INTERRUPTED_RC
+
+        if rc != 0:
+            logger.warning(
+                "gmx stage failed rc=%d in %s; stderr=%s",
+                rc,
+                work_dir,
+                (stderr or "")[-500:],
+            )
+        return rc
+
+    def _install_sigterm_handler(
+        self,
+        proc: subprocess.Popen[str],
+        interrupted: threading.Event,
+        sigterm_received_at: list[float | None],
+        kill_dispatched: threading.Event,
+    ) -> Callable[[int, FrameType | None], object] | int | signal.Handlers | None:
+        """Install the SIGTERM forwarder and its grace-period watchdog."""
+
+        def _forward_sigterm(*_unused: object) -> None:
+            if interrupted.is_set():
+                return  # already handling
+            interrupted.set()
+            sigterm_received_at[0] = time.monotonic()
+            with contextlib.suppress(ProcessLookupError):
+                proc.terminate()
+
+            def _escalate_to_kill() -> None:
+                if kill_dispatched.is_set():
+                    return
+                kill_dispatched.set()
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                logger.warning(
+                    "gmx child did not exit within %.1fs of SIGTERM; escalated to SIGKILL",
+                    self._sigterm_grace_seconds,
+                )
+
+            watchdog = threading.Timer(self._sigterm_grace_seconds, _escalate_to_kill)
+            watchdog.daemon = True
+            watchdog.start()
+
+        return signal.signal(signal.SIGTERM, _forward_sigterm)
+
+
+def _cached_stage_invalidated_for_topology(work_dir: Path, config: GromacsProtocolConfig) -> bool:
+    """Return True iff the cached TOPOLOGY stage is invalidated by a prebuilt-source mismatch.
+
+    Helper extracted from :meth:`GromacsProtocolRunner._run_single_stage`
+    so the stage's branch structure stays under the complexity
+    gate. A different prebuilt source (different ``.top`` /
+    ``.gro`` pair supplied by the caller) MUST invalidate the
+    cached stage even when the manifest status is COMPLETED.
+    """
+    return _prebuilt_source_changed(work_dir, config)
+
+
+def _stage_record_outputs(
+    record: dict[str, Any] | None,
+    stage: ProtocolStage,
+) -> list[str]:
+    """Return recorded and canonical outputs for forensic quarantine."""
+    recorded = record.get("outputs") if isinstance(record, dict) else None
+    names = recorded if isinstance(recorded, list) else []
+    return sorted(set(names).union(stage_outputs_for(stage.kind, stage.prefix)))
+
+
+def _invalidate_stages_from(
+    work_dir: Path,
+    start_kind: StageKind,
+    *,
+    reason: str,
+) -> None:
+    """Quarantine and reset a stage plus every dependent downstream stage."""
+    manifest = load_stage_manifest(work_dir)
+    stages_section = manifest.setdefault("stages", {})
+    plan = build_stage_plan()
+    start_index = next(index for index, item in enumerate(plan) if item.kind == start_kind)
+    stale_dir = _prebuilt_stale_dir(work_dir)
+
+    for stage in plan[start_index:]:
+        kind = stage.kind.value
+        record = stages_section.get(kind)
+        _move_outputs_to_stale(work_dir, _stage_record_outputs(record, stage), stale_dir)
+        updated = dict(record) if isinstance(record, dict) else {}
+        updated["status"] = StageStatus.PENDING
+        updated[f"invalidated_by_{reason}"] = True
+        stages_section[kind] = updated
+
+    save_stage_manifest(work_dir, manifest)
+    logger.info("invalidated protocol stages from %s; stale dir=%s", start_kind.value, stale_dir)
+
+
+def _invalidate_downstream_for_prebuilt_change(work_dir: Path) -> None:
+    """Invalidate every dependent stage when the prebuilt source has changed.
+
+    B4 — when the supplied prebuilt ``.top`` / ``.gro`` differs from
+    the cached digests, every stage that depends on those files
+    must be invalidated. The TOPOLOGY stage itself is RE-staged
+    below by the caller; the downstream stages (BOX, SOLVATE,
+    IONS, MINIMIZE, EQUIL_NVT, EQUIL_NPT, PRODUCTION) need their
+    cached outputs quarantined to ``.stale/<UTC>/`` and their
+    manifest entries reset to PENDING so the per-stage loop
+    re-runs them from scratch.
+
+    Implementation:
+
+    1. Read the current manifest.
+    2. For every dependent stage kind, if its manifest entry is
+       ``completed`` (or ``running`` — a partial run that was
+       interrupted) or ``failed`` (a downstream failure that
+       can't possibly be the prebuilt-source's fault), reset the
+       entry to PENDING.
+    3. Quarantine every on-disk output file that corresponds to
+       those stages to ``.stale/<UTC>/`` for forensic review.
+    4. Save the manifest.
+    """
+    manifest = load_stage_manifest(work_dir)
+    stages_section = manifest.setdefault("stages", {})
+    dependent_kinds = (
+        StageKind.TOPOLOGY,
+        StageKind.BOX,
+        StageKind.SOLVATE,
+        StageKind.IONS,
+        StageKind.MINIMIZE,
+        StageKind.EQUIL_NVT,
+        StageKind.EQUIL_NPT,
+        StageKind.PRODUCTION,
+    )
+    stale_dir = _prebuilt_stale_dir(work_dir)
+
+    for kind in dependent_kinds:
+        record = stages_section.get(kind.value)
+        stage = next(item for item in build_stage_plan() if item.kind == kind)
+        _move_outputs_to_stale(work_dir, _stage_record_outputs(record, stage), stale_dir)
+        # Reset to PENDING; the per-stage loop will re-run it.
+        stages_section[kind.value] = {
+            "status": StageStatus.PENDING,
+            "invalidated_by_prebuilt_source_change": True,
+        }
+
+    save_stage_manifest(work_dir, manifest)
+    logger.info(
+        "invalidated downstream stages for prebuilt source change; stale dir=%s",
+        stale_dir,
+    )
+
+
+def _record_protocol_stage_status(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+    status: str,
+    *,
+    outputs: tuple[str, ...] = (),
+    command: str = "",
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    error: str = "",
+    prebuilt_source: dict[str, Any] | None = None,
+) -> None:
+    """Record a stage result and bind it to the current protocol identity."""
+    record_stage_status(
+        work_dir,
+        stage.kind.value,
+        status,
+        outputs=outputs,
+        command=command,
+        started_at=started_at,
+        completed_at=completed_at,
+        error=error,
+        prebuilt_source=prebuilt_source,
+    )
+    manifest = load_stage_manifest(work_dir)
+    record = manifest["stages"].setdefault(stage.kind.value, {})
+    record["protocol_identity"] = _protocol_stage_identity(stage, config)
+    save_stage_manifest(work_dir, manifest)
+
+
+def _prebuilt_stale_dir(work_dir: Path) -> Path:
+    """Return the per-invocation ``.stale/<UTC>/`` directory."""
+    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%S_%f") + f"_{os.getpid()}"
+    stale_dir = work_dir / ".stale" / ts
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    return stale_dir
+
+
+def _move_outputs_to_stale(work_dir: Path, outputs: list[str], stale_dir: Path) -> None:
+    """Best-effort move every named output to ``stale_dir`` (errors logged)."""
+    import shutil
+
+    for name in outputs:
+        src = work_dir / name
+        if not src.exists():
+            continue
+        try:
+            shutil.move(str(src), str(stale_dir / name))
+            logger.info("quarantined stale %s -> %s", src, stale_dir / name)
+        except OSError as exc:
+            logger.warning("quarantine failed for %s: %s", src, exc)
+
+
+def _stage_identity_changed(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+) -> bool:
+    """Invalidate resumable manifest records that are not protocol-compatible."""
+    record = load_stage_manifest(work_dir).get("stages", {}).get(stage.kind.value)
+    if record is None or (isinstance(record, dict) and record.get("status") == StageStatus.PENDING):
+        return False
+    identity = _protocol_stage_identity(stage, config)
+    if isinstance(record, dict) and record.get("protocol_identity") == identity:
+        return False
+    logger.info(
+        "%s stage identity is missing or changed; invalidating downstream stages",
+        stage.kind.value,
+    )
+    _invalidate_stages_from(work_dir, stage.kind, reason="protocol_identity")
+    return True
+
+
+def _stage_should_skip(
+    work_dir: Path,
+    stage: ProtocolStage,
+    config: GromacsProtocolConfig,
+) -> bool:
+    """Return True iff the stage is already complete and should be skipped.
+
+    Encapsulates the manifest-authority decision (canonical
+    path) plus the prebuilt-source invalidation (prebuilt path)
+    plus the legacy disk-output fallback (recovery path). When
+    the helper returns ``True``, the stage is recorded as
+    COMPLETED and the runner returns ``was_skipped=True``. When
+    it returns ``False``, the runner falls through to the
+    execution path.
+
+    The helper is module-level (not a method) so the helper
+    itself doesn't add complexity to ``_run_single_stage``.
+    """
+    if config.force:
+        return False
+
+    _require_staged_selection_sidecars(work_dir, config)
+
+    if _stage_identity_changed(work_dir, stage, config):
+        return False
+
+    # Manifest authority — cache hit.
+    if _stage_already_complete(work_dir, stage):
+        # Prebuilt mode invalidates a cached TOPOLOGY stage
+        # when the supplied source digests differ from the
+        # recorded ones.
+        if stage.kind == StageKind.TOPOLOGY and _cached_stage_invalidated_for_topology(
+            work_dir, config
+        ):
+            logger.info(
+                "TOPOLOGY stage cached as COMPLETED but prebuilt source "
+                "digests differ; invalidating cached stage"
+            )
+            return False
+        _record_protocol_stage_status(
+            work_dir,
+            stage,
+            config,
+            StageStatus.COMPLETED,
+            outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+        )
+        return True
+
+    # Legacy disk-output fallback — manifest silent AND no
+    # on-disk .cpt AND minimum outputs on disk. Without this
+    # guard, a Spot-reclaim RUNNING manifest with on-disk
+    # outputs would be promoted to COMPLETED here, silently
+    # dropping the -cpi resume.
+    manifest_record = load_stage_manifest(work_dir).get("stages", {}).get(stage.kind.value)
+    manifest_status = manifest_record.get("status") if manifest_record else None
+    if (
+        manifest_status is None
+        and _checkpoint_for(work_dir, stage) is None
+        and _outputs_complete_on_disk(work_dir, stage)
+    ):
+        _refresh_selection_sidecars_after_stage(work_dir, stage, config)
+        _record_protocol_stage_status(
+            work_dir,
+            stage,
+            config,
+            StageStatus.COMPLETED,
+            outputs=stage_minimum_outputs(stage.kind, stage.prefix),
+        )
+        return True
+
+    return False
+
+
+def _prebuilt_meta(config: GromacsProtocolConfig) -> dict[str, str]:
+    """Compute the prebuilt-source digest metadata for the manifest binding.
+
+    Used by :class:`GromacsProtocolRunner.run_protocol` to record the
+    prebuilt source paths + digests in the TOPOLOGY stage's
+    manifest record. A future invocation with a different
+    prebuilt source sees a different digest and the cached stage
+    is invalidated (see :func:`_prebuilt_source_changed`).
+
+    Lives at module level rather than inside the class so it
+    can be unit-tested without instantiating a runner.
+    """
+    from biolab_runners.provenance import compute_file_digest
+
+    return {
+        "prebuilt_topology": config.prebuilt_topology,
+        "prebuilt_coordinates": config.prebuilt_coordinates,
+        "sha256_topology": compute_file_digest(Path(config.prebuilt_topology)) or "",
+        "sha256_coordinates": compute_file_digest(Path(config.prebuilt_coordinates)) or "",
+    }

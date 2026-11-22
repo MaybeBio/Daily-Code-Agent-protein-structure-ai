@@ -1,0 +1,320 @@
+//! This module integrates this application with the graphics engine.
+
+use std::f32::consts::TAU;
+
+use graphics::{
+    Camera, DeviceEvent, DeviceType, EngineUpdates, Handedness, InputSettings, Lighting, Mesh,
+    PointLight, Scene, ScrollBehavior, UiLayoutSides, UiLayoutTopBottom, UiSettings, WindowEvent,
+};
+use lin_alg::f32::Vec3;
+
+use crate::{
+    cam::{
+        FOG_HALF_DEPTH_DEFAULT, RENDER_DIST_FAR, RENDER_DIST_NEAR, VIEW_DEPTH_DEFAULT,
+        calc_fog_dists, front_orientation,
+    },
+    drawing::{atoms_bonds::BOND_RADIUS_BASE, floor},
+    inputs,
+    inputs::{RUN_FACTOR, SCROLL_MOVE_AMT, SCROLL_ROTATE_AMT},
+    state::{MsaaSetting, State},
+    ui::ui_handler,
+};
+
+pub type Color = (f32, f32, f32);
+
+const WINDOW_TITLE: &str = "Molchanica";
+const WINDOW_SIZE_X: f32 = 1_800.;
+const WINDOW_SIZE_Y: f32 = 1_200.;
+pub const BACKGROUND_COLOR: Color = (0., 0., 0.);
+
+// todo: These consts should probably be in the drawing module.
+
+// Keep this in sync with mesh init.
+pub const MESH_SPHERE_HIGHRES: usize = 0;
+pub const MESH_CUBE: usize = 1;
+pub const MESH_BOND: usize = 2;
+pub const MESH_SPHERE_LOWRES: usize = 3;
+pub const MESH_SPHERE_MEDRES: usize = 4;
+pub const MESH_DOCKING_BOX: usize = 5;
+pub const MESH_PEP_SOLVENT_SURFACE: usize = 6; // Van Der Waals surface.
+// pub const MESH_DOCKING_SURFACE: usize = 7;
+pub const MESH_DENSITY_SURFACE: usize = 8;
+pub const MESH_SECONDARY_STRUCTURE: usize = 9; // Active peptide ribbon.
+pub const MESH_OTHER_RIBBONS: usize = 10; // Combined ribbons for other open peptides.
+// Draw the floor, then the grid, then the axes.
+pub const MESH_FLOOR: usize = 11;
+pub const MESH_FLOOR_GRID_X: usize = 12;
+pub const MESH_FLOOR_GRID_Z: usize = 13;
+pub const MESH_FLOOR_AXIS_X: usize = 14;
+pub const MESH_FLOOR_AXIS_Z: usize = 15;
+
+// We support an arbitrary number of pockets.
+pub const MESH_POCKET_START: usize = 16;
+
+// pub const SHELL_OPACITY: f32 = 0.01;
+
+// Fog curve shape. Higher fog_power = steeper / more abrupt cutoff.
+// Lower fog_density = dim-but-visible at the far end rather than fully opaque.
+const FOG_POWER: f32 = 6.;
+const FOG_DENSITY: f32 = 4.;
+
+// From the farthest molecule.
+pub const CAM_INIT_OFFSET: f32 = 10.;
+
+// A higher value will result in a less-dramatic brightness change with distance.
+const FLASHLIGHT_OFFSET: f32 = 10.;
+// const FLASHLIGHT_FOV: f32 = TAU / 16.;
+pub const OUTSIDE_LIGHTING_OFFSET: f32 = 900.;
+// pub const DOCKING_LIGHT_INTENSITY: f32 = 0.3;
+
+/// Set the flashlight to be a little bit behind the camera; prevents too dramatic of an intensity
+/// scaling on the object looked at, WRT distance.
+///
+/// The flashlight is a light source which illuminates the area directly in front of the camera.
+pub fn set_flashlight(scene: &mut Scene) {
+    let light = &mut scene.lighting.point_lights[0];
+    light.position = scene.camera.position
+        + scene
+            .camera
+            .orientation
+            .rotate_vec(Vec3::new(0., 0., -FLASHLIGHT_OFFSET));
+
+    // todo: Put back. Problem with di
+    // light.type_ = LightType::Directional {
+    //     direction: scene.camera.orientation.rotate_vec(FWD_VEC),
+    //     fov: FLASHLIGHT_FOV,
+    // };
+}
+
+/// Set lighting based on the center and size of the molecule. Sets it *above* the center. (+Y axis)
+pub fn set_static_light(scene: &mut Scene, center: Vec3, size: f32) {
+    scene.lighting.point_lights[1].position =
+        center + Vec3::new(40., size + OUTSIDE_LIGHTING_OFFSET, 0.);
+}
+
+/// Match the MSAA default to the GPU, unless the user has chosen a setting. Integrated GPUs have
+/// no VRAM: 4× MSAA's colour and depth targets live in system RAM, costing ~260 MB at 4K. So
+/// we default to none on them, and 4× on others.
+///
+/// Runs once, on the first frame: the engine selects the adapter after we've handed it the
+/// initial settings.
+fn apply_msaa_gpu_default(state: &mut State, scene: &Scene, updates: &mut EngineUpdates) {
+    if state.volatile.msaa_gpu_default_applied {
+        return;
+    }
+
+    let Some(adapter) = &scene.adapter_info else {
+        return;
+    };
+
+    state.volatile.msaa_gpu_default_applied = true;
+
+    if state.to_save.graphics.msaa_user_set {
+        return;
+    }
+
+    let msaa = if adapter.device_type == DeviceType::IntegratedGpu {
+        MsaaSetting::None
+    } else {
+        MsaaSetting::default()
+    };
+
+    if msaa == state.to_save.graphics.msaa {
+        return;
+    }
+
+    println!(
+        "Setting MSAA to {} for GPU {} ({:?})",
+        msaa.to_str(),
+        adapter.name,
+        adapter.device_type
+    );
+
+    state.to_save.graphics.msaa = msaa;
+    state.graphics_settings = state.to_save.graphics.to_engine();
+    updates.graphics_settings = Some(state.graphics_settings.clone());
+}
+
+/// Used by `Grpahics` as part of its cycle to get updates from the application.
+/// This runs each frame.
+fn render_handler(state: &mut State, scene: &mut Scene, _dt: f32) -> EngineUpdates {
+    let mut updates = EngineUpdates::default();
+
+    apply_msaa_gpu_default(state, scene, &mut updates);
+
+    updates
+}
+
+// Input handlers can rebuild all entities, e.g. in the mol editor; restore the floor after them.
+fn event_dev_handler(
+    state: &mut State,
+    event: DeviceEvent,
+    scene: &mut Scene,
+    engine_inputs: bool,
+    dt: f32,
+) -> EngineUpdates {
+    let mut updates = inputs::event_dev_handler(state, event, scene, engine_inputs, dt);
+    floor::update(state, scene, &mut updates);
+
+    updates
+}
+
+fn event_win_handler(
+    state: &mut State,
+    event: WindowEvent,
+    scene: &mut Scene,
+    dt: f32,
+) -> EngineUpdates {
+    let mut updates = inputs::event_win_handler(state, event, scene, dt);
+    floor::update(state, scene, &mut updates);
+
+    updates
+}
+
+/// Run by `Graphics` once, when the event loop exits. Persist prefs on close, so changes made
+/// since the last action-triggered or timed save (e.g. selection, visibility, molecule positions)
+/// still stick.
+fn exit_handler(state: &mut State) {
+    state.update_save_prefs();
+}
+
+/// Entry point to our render and event loop.
+pub fn render(state: State) {
+    let white = [1., 1., 1., 0.5];
+    let pink = [1., 0., 1., 1.];
+
+    let (fog_start, fog_end) = calc_fog_dists(VIEW_DEPTH_DEFAULT, FOG_HALF_DEPTH_DEFAULT);
+
+    let mut camera = Camera {
+        fov_y: TAU / 8.,
+        position: Vec3::new(0., 0., 60.),
+        far: RENDER_DIST_FAR,
+        near: RENDER_DIST_NEAR,
+        // Molecular coordinates are right-handed; displaying them as left-handed mirrors
+        // them, e.g. making alpha helices left-handed.
+        handedness: Handedness::Right,
+        orientation: front_orientation(),
+        // These control how aggressive the fog is in fading objects to the background.
+        // fog_power: higher = steeper curve, more abrupt cutoff.
+        // fog_density: lower = objects remain dim-but-visible rather than fully hidden.
+        fog_density: FOG_DENSITY,
+        fog_power: FOG_POWER,
+        fog_start,
+        fog_end,
+        fog_color: [BACKGROUND_COLOR.0, BACKGROUND_COLOR.1, BACKGROUND_COLOR.2],
+        ..Default::default()
+    };
+
+    camera.update_proj_mat();
+
+    let mut scene = Scene {
+        meshes: vec![
+            Mesh::new_sphere(1., 3),
+            Mesh::new_box(1., 1., 1.),
+            Mesh::new_cylinder(1., BOND_RADIUS_BASE, 14),
+            Mesh::new_sphere(1., 1), // low-res sphere
+            Mesh::new_sphere(1., 2), // med-res sphere
+            Mesh::new_box(1., 1., 1.),
+            Mesh::new_box(1., 1., 1.), // Placeholder for VDW/SA surface; populated later.
+            Mesh::new_box(1., 1., 1.), // Placeholder for docking site surface; populated later.
+            Mesh::new_box(1., 1., 1.), // Placeholder for density surface; populated later.
+            Mesh::new_box(1., 1., 1.), // Placeholder for secondary structure surface; populated later.
+            Mesh::default(),           // Ribbons for other open peptides.
+            floor::mesh_disc(),
+            floor::mesh_grid_line(true),
+            floor::mesh_grid_line(false),
+            floor::mesh_axis(true),
+            floor::mesh_axis(false),
+            // No placeholder for pockets; we add them as required.
+            // Mesh::new_box(1., 1., 1.), // Placeholder for pocket; populated later.
+        ],
+        entities: Vec::new(),
+        gaussians: Vec::new(),
+        camera,
+        // Lighting is set when drawing molecules; placeholder here.
+        lighting: Lighting {
+            ambient_color: white,
+            ambient_intensity: 0.005,
+            point_lights: vec![
+                // The camera-oriented *flashlight*. Moves with the camera.
+                PointLight {
+                    // todo: temp rm TS
+                    // type_: LightType::Directional{ direction: Vec3::new_zero(), fov: FLASHLIGHT_FOV },
+                    diffuse_intensity: 24.,
+                    specular_intensity: 24.,
+                    ..Default::default()
+                },
+                // A fixed light, from *above*
+                PointLight {
+                    // A safe default we override when opening molecules.
+                    position: Vec3::new(40., 5. + OUTSIDE_LIGHTING_OFFSET, 0.),
+                    diffuse_color: white,
+                    specular_color: white,
+                    diffuse_intensity: 30_000.,
+                    specular_intensity: 30_000.,
+                    ..Default::default()
+                },
+                // A fixed light, from *below*. Dimmer to impart some degree of directionality
+                // to these primary lights, but without leaving any part of the molecules in darkness.
+                PointLight {
+                    // Note: Not quite opposite the "opposite" light, to prevent a band on
+                    // spheres.
+                    position: Vec3::new(60., -(5. + OUTSIDE_LIGHTING_OFFSET), 0.),
+                    diffuse_color: white,
+                    specular_color: white,
+                    diffuse_intensity: 15_000.,
+                    specular_intensity: 15_000.,
+                    ..Default::default()
+                },
+                // A light on the docking site, if applicable.
+                PointLight {
+                    diffuse_color: pink,
+                    specular_color: pink,
+                    diffuse_intensity: 0.,
+                    specular_intensity: 0.,
+                    ..Default::default()
+                },
+            ],
+        },
+        input_settings: InputSettings {
+            control_scheme: state.to_save.control_scheme.to_scheme_default(),
+            move_sens: state.to_save.control_settings.movement_speed as f32,
+            rotate_sens: (state.to_save.control_settings.rotation_sens as f32) / 100.,
+            run_factor: RUN_FACTOR,
+            scroll_behavior: ScrollBehavior::MoveRoll {
+                move_amt: SCROLL_MOVE_AMT,
+                rotate_amt: SCROLL_ROTATE_AMT,
+            },
+            ..Default::default()
+        },
+        background_color: BACKGROUND_COLOR,
+        window_size: (WINDOW_SIZE_X, WINDOW_SIZE_Y),
+        window_title: WINDOW_TITLE.to_owned(),
+        ..Default::default()
+    };
+
+    let ui_settings = UiSettings {
+        layout_sides: UiLayoutSides::Left,
+        layout_top_bottom: UiLayoutTopBottom::Top,
+        icon_path: Some("resources/icon.png".to_owned()),
+        pipeline_cache_dir: Some(state.volatile.prefs_dir.join("gpu_cache")),
+    };
+
+    // Session files are parsed after the first frame by the receiver-driven startup worker. The
+    // initial scene only needs its camera-relative light to be valid before entering the event loop.
+    set_flashlight(&mut scene);
+
+    let graphics_settings = state.graphics_settings.clone();
+
+    graphics::run_with_exit_handler(
+        state,
+        scene,
+        ui_settings,
+        graphics_settings,
+        render_handler,
+        event_dev_handler,
+        event_win_handler,
+        ui_handler,
+        exit_handler,
+    );
+}

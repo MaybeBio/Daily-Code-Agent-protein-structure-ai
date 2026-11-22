@@ -1,0 +1,1841 @@
+"""
+This is a script for the frontend of the CPP class, a sequence-based feature engineering object.
+"""
+
+import warnings
+from typing import Dict, Literal, Optional, List, Tuple, Union
+
+import numpy as np
+import pandas as pd
+
+import aaanalysis.utils as ut
+from aaanalysis.template_classes import Tool
+
+# Import supportive class (exception for importing from same sub-package)
+from ._backend.cpp.sequence_feature import get_split_kws_, get_composition_scales_
+from ._backend.cpp.composition import get_kmer_composit_df_feat_
+from ._backend.check_feature import (
+    check_split_kws,
+    check_parts_len,
+    clamp_split_kws_to_parts_,
+    check_df_scales,
+    check_df_cat,
+    check_match_df_parts_df_scales,
+    check_match_df_scales_df_cat,
+    check_match_df_parts_features,
+)
+from ._backend.cpp_run import (
+    cpp_run_single,
+    cpp_run_batch,
+    cpp_run_batch_num,
+    cpp_run_sample_batched,
+    _resample_row_indices,
+    _pick_feature_matrix_builder,
+)
+from ._backend.cpp._filters._get_feature_matrix_fast import AALookupCache
+from ._backend.cpp.cpp_eval import evaluate_features
+from ._backend.cpp._simplify import simplify_cpp_
+
+
+# I Helper Functions
+def _warn_gaps_encountered(df_parts=None, accept_gaps=False):
+    """Warn when ``accept_gaps=True`` and a gap symbol is actually present.
+
+    With ``accept_gaps=True`` the gap-symbol guard is bypassed and all-gap
+    splits produce ``NaN`` feature values, which downstream scorers may skip
+    or fail on. Surface a ``UserWarning`` only when a gap is truly encountered
+    (not merely allowed)."""
+    if not accept_gaps:
+        return
+    has_gap = any(
+        df_parts[p].astype(str).str.contains(ut.STR_AA_GAP, regex=False).any()
+        for p in list(df_parts)
+    )
+    if has_gap:
+        warnings.warn(
+            f"'accept_gaps' (True) encountered the gap symbol "
+            f"('{ut.STR_AA_GAP}') in 'df_parts'; affected feature values may be "
+            f"NaN. Ensure downstream scorers handle NaN.",
+            UserWarning,
+        )
+
+
+def _finalize_run_output(df_feat=None, return_stats=False):
+    """Shared tail for ``run`` / ``run_num``: stringify object columns, capture
+    ``last_filter_stats_``, and optionally return the stats dict alongside."""
+    for col in df_feat.select_dtypes(include=["object", "string"]).columns:
+        df_feat[col] = df_feat[col].apply(
+            lambda x: str(x) if isinstance(x, (np.str_, np.generic)) else x
+        )
+    stats = df_feat.attrs.get("last_filter_stats")
+    if return_stats:
+        return df_feat, stats
+    return df_feat
+
+
+def _check_bootstrap_batching(n_batches=None, n_sample_batches=None):
+    """Bootstrap stability selection runs each round single-pass; the memory-batching
+    modes (``n_batches`` / ``n_sample_batches``) are not combinable with it."""
+    if n_batches is not None:
+        raise ValueError(
+            f"'n_batches' ({n_batches}) should be None when CPP(bootstrap=True); each "
+            f"bootstrap round runs single-pass. Set n_batches=None or construct CPP with "
+            f"bootstrap=False."
+        )
+    if n_sample_batches is not None:
+        raise ValueError(
+            f"'n_sample_batches' ({n_sample_batches}) should be None when "
+            f"CPP(bootstrap=True); each bootstrap round runs single-pass. Set "
+            f"n_sample_batches=None or construct CPP with bootstrap=False."
+        )
+
+
+def _resolve_bootstrap_kws(bootstrap_kws=None):
+    """Validate ``bootstrap_kws`` and merge with the tuned defaults.
+
+    Returns ``(rounds, resample, frac, ci)``. ``None`` yields all defaults; a dict may set any
+    subset of ``{'rounds', 'resample', 'frac', 'ci'}`` (unset keys keep their default). Unknown keys
+    or out-of-range values raise ``ValueError``.
+    """
+    if bootstrap_kws is None:
+        bootstrap_kws = {}
+    if not isinstance(bootstrap_kws, dict):
+        raise ValueError(
+            f"'bootstrap_kws' ({type(bootstrap_kws).__name__}) should be a dict with keys "
+            f"{sorted(ut.DICT_BOOTSTRAP_DEFAULTS)} (any subset) or None."
+        )
+    unknown = set(bootstrap_kws) - set(ut.DICT_BOOTSTRAP_DEFAULTS)
+    if unknown:
+        raise ValueError(
+            f"'bootstrap_kws' has unknown key(s) {sorted(unknown)}; allowed keys are "
+            f"{sorted(ut.DICT_BOOTSTRAP_DEFAULTS)}."
+        )
+    cfg = {**ut.DICT_BOOTSTRAP_DEFAULTS, **bootstrap_kws}
+    ut.check_number_range(name="bootstrap_kws['rounds']", val=cfg["rounds"], min_val=1, just_int=True)
+    ut.check_str_options(name="bootstrap_kws['resample']", val=cfg["resample"],
+                         list_str_options=ut.LIST_RESAMPLE)
+    ut.check_number_range(name="bootstrap_kws['frac']", val=cfg["frac"], min_val=0.0, max_val=1.0,
+                          just_int=False)
+    if cfg["frac"] == 0:
+        raise ValueError(f"'bootstrap_kws['frac']' ({cfg['frac']}) should be > 0 and <= 1.")
+    ut.check_number_range(name="bootstrap_kws['ci']", val=cfg["ci"], min_val=0, max_val=1,
+                          exclusive_limits=True, accept_none=True, just_int=False)
+    return cfg["rounds"], cfg["resample"], cfg["frac"], cfg["ci"]
+
+
+def _collect_round_stats(df_round: pd.DataFrame,
+                         per_feat_stats: Dict[str, Dict[str, List[float]]]) -> None:
+    """Retain the per-round CPP statistics of one bootstrap round, keyed by feature.
+
+    ``per_feat_stats`` maps a feature id to ``{statistic column: [value per round in which the
+    feature was selected]}``. Only the statistics that have an interval column
+    (``ut.DICT_COLS_FEAT_CI``) are kept, and only those the round's ``df_feat`` carries.
+    """
+    cols = [c for c in ut.DICT_COLS_FEAT_CI if c in df_round.columns]
+    feats = df_round[ut.COL_FEATURE].tolist()
+    for col in cols:
+        for feat, val in zip(feats, df_round[col].tolist()):
+            per_feat_stats.setdefault(feat, {}).setdefault(col, []).append(float(val))
+
+
+def _add_bootstrap_ci_cols(df_feat: pd.DataFrame,
+                           per_feat_stats: Dict[str, Dict[str, List[float]]],
+                           ci: float) -> pd.DataFrame:
+    """Summarize the retained per-round statistics into per-feature percentile intervals.
+
+    For each statistic with an interval column, the central ``ci`` percentile interval of the
+    values collected over the resampling rounds is appended as ``<statistic>_ci_low`` /
+    ``<statistic>_ci_high``, rounded like the other statistic columns. The interval covers the
+    rounds in which the feature was selected, so a feature observed in fewer than two rounds has
+    no spread to summarize and gets ``NaN`` bounds. ``df_feat`` is modified in place and returned.
+    """
+    alpha = (1.0 - ci) / 2.0
+    q_low, q_high = 100.0 * alpha, 100.0 * (1.0 - alpha)
+    feats = df_feat[ut.COL_FEATURE].tolist()
+    for col, (col_low, col_high) in ut.DICT_COLS_FEAT_CI.items():
+        if col not in df_feat.columns:
+            continue
+        lows, highs = [], []
+        for feat in feats:
+            vals = per_feat_stats.get(feat, {}).get(col, [])
+            if len(vals) < 2:
+                lows.append(np.nan)
+                highs.append(np.nan)
+                continue
+            low, high = np.percentile(np.asarray(vals, dtype=float), [q_low, q_high])
+            lows.append(round(float(low), 3))
+            highs.append(round(float(high), 3))
+        df_feat[col_low] = lows
+        df_feat[col_high] = highs
+    return df_feat
+
+
+def check_match_list_df_feat_list_df_parts(list_df_feat=None, list_df_parts=None) -> None:
+    """Check if all elements in list are valid feature DataFrames"""
+    for df_feat, df_parts in zip(list_df_feat, list_df_parts):
+        ut.check_df_feat(df_feat=df_feat, list_parts=list(df_parts))
+
+
+def check_ml_cv_labels(ml_cv=None, labels=None) -> None:
+    """Validate ``ml_cv`` (>=2, <= smallest class count) for the simplify CV gate."""
+    ut.check_number_range(name="ml_cv", val=ml_cv, min_val=2, just_int=True)
+    min_class_count = min(pd.Series(labels).value_counts())
+    if ml_cv > min_class_count:
+        raise ValueError(
+            f"'ml_cv' ({ml_cv}) should not be greater than the smallest class "
+            f"count ({min_class_count})."
+        )
+
+
+def check_ml_model(ml_model=None) -> None:
+    """Validate the simplify CV-gate model: a string preset or a classifier instance."""
+    if isinstance(ml_model, str):
+        ut.check_str_options(
+            name="ml_model", val=ml_model, list_str_options=ut.LIST_CV_MODELS
+        )
+    elif not (hasattr(ml_model, "fit") and hasattr(ml_model, "predict")):
+        raise ValueError(
+            f"'ml_model' ({ml_model}) should be one of {ut.LIST_CV_MODELS} "
+            f"or a scikit-learn classifier with 'fit'/'predict' methods."
+        )
+
+
+def check_match_list_df_feat_names_feature_sets(
+    list_df_feat=None, names_feature_sets=None
+) -> None:
+    """Check if length of list_df_feat and names match"""
+    if names_feature_sets is None:
+        return None  # Skip check
+    if len(list_df_feat) != len(names_feature_sets):
+        raise ValueError(
+            f"Length of 'list_df_feat' ({len(list_df_feat)}) and 'names_feature_sets'"
+            f" ({len(names_feature_sets)} does not match) "
+        )
+
+
+def _check_dict_num_parts(dict_num_parts=None, df_parts=None):
+    """Layer-2 validation for CPP.run_num: ``dict_num_parts`` must align with ``self.df_parts``.
+
+    Catches the cases where a user constructed ``dict_num_parts`` by hand (without
+    going through ``NumericalFeature.get_parts``) or mixed parts from a different
+    preprocessing run.
+    """
+    if not isinstance(dict_num_parts, dict):
+        raise ValueError(
+            f"'dict_num_parts' ({type(dict_num_parts).__name__}) should be a "
+            f"Dict[part_name, np.ndarray] produced by NumericalFeature.get_parts(...)."
+        )
+    expected_parts = set(df_parts.columns)
+    got_parts = set(dict_num_parts.keys())
+    if got_parts != expected_parts:
+        missing = sorted(expected_parts - got_parts)
+        extra = sorted(got_parts - expected_parts)
+        raise ValueError(
+            f"'dict_num_parts' part names {sorted(got_parts)} should match CPP's "
+            f"df_parts.columns {sorted(expected_parts)} "
+            f"(missing: {missing}, extra: {extra}). Re-run NumericalFeature.get_parts(...) "
+            f"with the same df_seq + jmd_n_len + jmd_c_len that produced the CPP's df_parts."
+        )
+    n_samples = len(df_parts)
+    D_seen = set()
+    for part in sorted(expected_parts):
+        arr = dict_num_parts[part]
+        if not isinstance(arr, np.ndarray):
+            raise ValueError(
+                f"'dict_num_parts[{part!r}]' ({type(arr).__name__}) should be np.ndarray "
+                f"of shape (n_samples, L_part_max, D)."
+            )
+        if arr.ndim != 3:
+            raise ValueError(
+                f"'dict_num_parts[{part!r}]' (ndim={arr.ndim}) should be 3D "
+                f"(n_samples, L_part_max, D)."
+            )
+        if arr.shape[0] != n_samples:
+            raise ValueError(
+                f"'dict_num_parts[{part!r}]' shape {arr.shape} should have "
+                f"n_samples={n_samples} matching CPP's df_parts row count."
+            )
+        D_seen.add(arr.shape[2])
+    if len(D_seen) > 1:
+        raise ValueError(
+            f"'dict_num_parts' has inconsistent D across parts: {sorted(D_seen)} — "
+            f"all parts must share the same dimensionality."
+        )
+    if D_seen and 0 in D_seen:
+        raise ValueError("'dict_num_parts' has D=0; should be >= 1.")
+
+
+def _derive_dict_part_lens(df_parts=None):
+    """Compute per-(entry, part) real residue count from ``df_parts`` strings.
+
+    Tensor backends need per-sample real lengths to know where the NaN padding
+    starts in each row. We re-derive them from the string ``df_parts`` (non-gap
+    character count) rather than threading them through the user-facing API —
+    keeps ``dict_num_parts`` a single-shape dict.
+    """
+    dict_part_lens = {}
+    for part in df_parts.columns:
+        col = df_parts[part].to_list()
+        lens = np.fromiter(
+            (sum(c != ut.STR_AA_GAP for c in s) for s in col),
+            dtype=np.int64,
+            count=len(col),
+        )
+        dict_part_lens[part] = lens
+    return dict_part_lens
+
+
+# II Main Functions
+class CPP(Tool):
+    """
+    Comparative Physicochemical Profiling (**CPP**) class to create and filter features that are most discriminant
+    between two sets of sequences [Breimann25]_.
+
+    CPP aims at identifying a set of non-redundant features that are most discriminant between the
+    test and reference group of sequences.
+
+    .. versionadded:: 0.1.0
+
+    Attributes
+    ----------
+    last_filter_stats_ : dict
+        Filter-funnel counts from the most recent :meth:`run` / :meth:`run_num` / :meth:`run_composit`
+        (``n_candidates``, ``n_after_prefilter``, ``n_after_redundancy``, ``n_final``); ``None`` before
+        the first call.
+
+    Notes
+    -----
+    Parameters ending in ``_kws`` (e.g. ``split_kws``, ``bootstrap_kws``) bundle related keyword
+    arguments into one dict; see the :ref:`keyword-dict parameters overview <kws-overview>`.
+    """
+
+    def __init__(
+        self,
+        df_parts: pd.DataFrame,
+        split_kws: Optional[dict] = None,
+        df_scales: Optional[pd.DataFrame] = None,
+        df_cat: Optional[pd.DataFrame] = None,
+        accept_gaps: bool = False,
+        verbose: bool = True,
+        random_state: Optional[int] = None,
+        bootstrap: bool = False,
+        bootstrap_kws: Optional[dict] = None,
+    ):
+        """
+        Parameters
+        ----------
+        df_parts : pd.DataFrame, shape (n_samples, n_parts)
+            DataFrame with sequence parts.
+        split_kws : dict, optional
+            Dictionary with parameter dictionary for each chosen split_type. Default from
+            :meth:`SequenceFeature.get_split_kws`. If a sequence part in ``df_parts`` is too short
+            for the requested splits (e.g. a free peptide with no flanking context), the split
+            lengths are **auto-capped** to the shortest part (``Segment`` ``n_split_max`` capped;
+            ``Pattern`` / ``PeriodicPattern`` that cannot fit are dropped) and one ``UserWarning``
+            is emitted; the capped ``split_kws`` is stored as ``self.split_kws``. For parts long
+            enough for the requested splits this is a no-op.
+        df_scales : pd.DataFrame, shape (n_letters, n_scales), optional
+            DataFrame of scales with letters typically representing amino acids. Default from :meth:`load_scales`
+            unless specified in ``options['df_scales']``.
+        df_cat : pd.DataFrame, shape (n_scales, n_scales_info), optional
+            DataFrame of categories for physicochemical scales. Must contain all scales from ``df_scales``.
+            Default from :meth:`load_scales` with ``name='scales_cat'``, unless specified in ``options['df_cat']``.
+        accept_gaps : bool, default=False
+            Whether to accept missing values by enabling omitting for computations (if ``True``).
+            Combined with :meth:`SequencePreprocessor.pad_parts`, this enables analyzing short,
+            variable-length sequences at a uniform, finer ``n_split_max`` than the shortest real
+            sequence allows (a padded part is longer, so more splits fit).
+        verbose : bool, default=True
+            If ``True``, verbose outputs are enabled.
+        random_state : int, optional
+            The seed used by the random number generator. If a positive integer, results of stochastic processes are
+            consistent, enabling reproducibility. If ``None``, stochastic processes will be truly random. Also seeds the
+            bootstrap resampling (``bootstrap=True``).
+        bootstrap : bool, default=False
+            Whether to add **bootstrap stability annotation** to the selection. ``False`` (default) runs the
+            single-pass selection, so :meth:`run` / :meth:`run_num` / :meth:`run_composit` behave exactly as before
+            (output byte-identical) and ``bootstrap_kws`` is ignored. ``True`` wraps the ordinary run: the data is
+            resampled ``bootstrap_kws['rounds']`` times and re-selected each round to score how often each feature is
+            selected, then the **ordinary full-data selection is returned with a ``selection_frequency`` column**
+            (0 to 1) added. The selected features are exactly those of a normal run (``n_filter`` is the selection
+            criterion) — bootstrapping annotates their stability, it does not change which features are selected.
+            Set ``bootstrap_kws['ci']`` to additionally report a per-feature confidence interval for the
+            ``abs_auc`` and ``mean_dif`` statistics.
+        bootstrap_kws : dict, optional
+            Bootstrap configuration (only used when ``bootstrap=True``). A dict with any subset of these keys; unset
+            keys keep their tuned default, and ``None`` uses all defaults:
+
+            * ``'rounds'`` (int, default ``20``): number of resampling rounds (>=1). More rounds give a more precise
+              ``selection_frequency`` estimate at a roughly linear cost; ~20 to ~50 is typically enough.
+            * ``'resample'`` ({'both', 'reference', 'test'}, default ``'reference'``): which class group is resampled
+              each round. ``'reference'`` fixes the test group and resamples only the reference group (isolating the
+              dominant source of selection instability); ``'both'`` resamples both; ``'test'`` resamples only the test
+              group.
+            * ``'frac'`` (float, default ``0.8``): per-group resample size as a fraction of the group's samples
+              (``0<frac<=1``), drawn with replacement each round. ``0.8`` is the conventional sub-sample size; with
+              ``n_filter`` as the final cut the exact fraction only modestly affects the result.
+            * ``'ci'`` (float or None, default ``None``): confidence level (``0<ci<1``, e.g. ``0.95``) of the
+              **per-feature confidence intervals**. ``None`` leaves them off and the output unchanged. A level
+              summarizes the statistics computed in the resampling rounds into a central percentile interval per
+              feature, appending ``abs_auc_ci_low`` / ``abs_auc_ci_high`` and ``mean_dif_ci_low`` /
+              ``mean_dif_ci_high`` after ``selection_frequency``. A higher level widens the interval; more
+              ``rounds`` make it more precise.
+
+        Notes
+        -----
+        * All scales from ``df_scales`` must be contained in ``df_cat``
+        * **Stability annotation (``bootstrap=True``) is a cross-cutting wrapper**, configured once on the object
+          and applied uniformly by :meth:`run`, :meth:`run_num`, and :meth:`run_composit`. It is a thin wrapper: it
+          re-runs the ordinary selection on ``bootstrap_kws['rounds']`` resamples of the data to score how often each
+          feature is selected, then returns the **ordinary full-data selection** with a per-feature
+          ``selection_frequency`` (0 to 1) added. The selected feature list is exactly a normal run (``n_filter`` is
+          the criterion); the annotation flags which of those features are reproducible under resampling vs
+          sample-specific — a **trust / interpretability** aid, not a change to the list or to predictive accuracy.
+          To keep any downstream cross-validation leakage-safe, run CPP (bootstrapped or not) **inside** each training
+          fold, never on the full dataset before splitting.
+        * **Per-feature confidence intervals (``bootstrap_kws['ci']``) reuse the same rounds.** Each round already
+          computes the CPP statistics on its resample; with a confidence level set, those values are retained and
+          summarized into a central percentile interval per feature, so the intervals cost no extra runs. They are
+          **conditional on selection**: a feature contributes a value only in the rounds in which it was selected,
+          so an interval is read together with ``selection_frequency`` (a narrow interval from 2 of 20 rounds says
+          little), and a feature selected in fewer than two rounds gets ``NaN`` bounds. The intervals describe the
+          resampling spread of the statistic, not a posterior or a calibrated significance test.
+        * **Choosing the settings.** ``bootstrap=True`` uses the tuned defaults in ``bootstrap_kws``
+          (``rounds=20``, ``frac=0.8``, ``resample='reference'``); pass a dict to override any of them.
+          ``rounds`` controls how precisely ``selection_frequency`` is estimated (~20 is a practical sweet spot, ~50
+          converges the estimate) at a roughly linear cost; ``frac=0.8`` is the conventional sub-sample size and a
+          robust default; ``resample='reference'`` resamples only the (usually larger, noisier) reference group.
+        * **Splits auto-cap to the shortest part.** A sequence part of length ``L`` can carry a
+          ``Segment`` with at most ``n_split_max = L`` pieces, a ``Pattern`` only if ``len_max <= L``,
+          and a ``PeriodicPattern`` only if its first step ``<= L``. When ``df_parts`` contains a
+          part too short for the requested ``split_kws`` (typically free peptides / short domains
+          with no flanking context), CPP caps the ``Segment`` ``n_split_max`` and drops the
+          ``Pattern`` / ``PeriodicPattern`` split types that cannot fit (``Segment`` is always kept),
+          emits one ``UserWarning``, and stores the capped ``split_kws`` as ``self.split_kws`` so
+          both :meth:`run` and :meth:`run_num` use it. This never raises; for parts long enough for
+          the requested splits it is a no-op and the output is unchanged.
+        * **CPP is intrinsically binary** (one test group vs one reference group). For
+          **multi-class** or **regression** tasks, do not change CPP: transform the target
+          into binary contrasts with the ``SequenceFeature.get_labels_*`` helpers and loop
+          :meth:`run` (or :meth:`run_num`) over them. Use
+          :meth:`SequenceFeature.get_labels_ovr` / :meth:`SequenceFeature.get_labels_ovo`
+          for multi-class and :meth:`SequenceFeature.get_labels_quantile` /
+          :meth:`SequenceFeature.get_labels_tiered` for regression. The row-dropping
+          helpers (``ovo`` / ``tiered``) return the row-matched ``df_parts`` /
+          ``dict_num_parts`` per contrast, ready to drop straight into a new ``CPP``. See
+          the **P8: Prediction** protocol for the end-to-end workflow.
+
+        See Also
+        --------
+        * :class:`CPPPlot`: the respective plotting class.
+        * :class:`SequenceFeature` for definition of sequence **Parts**.
+        * :meth:`SequenceFeature.split_kws` for definition of **Splits** key word arguments.
+        * :func:`load_scales` for definition of amino acid **Scales** and their categories.
+        * ``SequenceFeature.get_labels_*`` (e.g. :meth:`SequenceFeature.get_labels_ovr`):
+          build multi-class / regression label contrasts to drive CPP.
+
+        Examples
+        --------
+        .. include:: examples/cpp.rst
+        """
+        # Load defaults
+        if split_kws is None:
+            split_kws = get_split_kws_()
+        if df_scales is None:
+            df_scales = ut.load_default_scales()
+        if df_cat is None:
+            df_cat = ut.load_default_scales(scale_cat=True)
+        # Check input
+        verbose = ut.check_verbose(verbose)
+        random_state = ut.check_random_state(random_state=random_state)
+        ut.check_df_parts(df_parts=df_parts)
+        check_split_kws(split_kws=split_kws)
+        check_df_scales(df_scales=df_scales)
+        check_df_cat(df_cat=df_cat)
+        ut.check_bool(name="accept_gaps", val=accept_gaps)
+        ut.check_bool(name="bootstrap", val=bootstrap)
+        n_bootstrap, resample, bootstrap_frac, bootstrap_ci = _resolve_bootstrap_kws(bootstrap_kws)
+        df_parts = check_match_df_parts_df_scales(
+            df_parts=df_parts, df_scales=df_scales, accept_gaps=accept_gaps
+        )
+        # Auto-cap the split lengths to the shortest sequence part (free-peptide safety net): a part
+        # shorter than a split's required length cannot carry that split, so cap the Segment
+        # 'n_split_max' and drop Pattern / PeriodicPattern that cannot fit, warning once. For parts
+        # long enough for the requested splits this is a no-op (the original 'split_kws' object is
+        # returned), so self.split_kws — hence run / run_num output — is byte-identical.
+        split_kws, split_changes = clamp_split_kws_to_parts_(df_parts=df_parts, split_kws=split_kws)
+        if split_changes:
+            warnings.warn(
+                f"'df_parts' has a sequence part too short for the requested 'split_kws'; "
+                f"auto-capped so CPP still runs: {'; '.join(split_changes)}. Pass a smaller "
+                f"'n_split_max' / 'len_max' (via SequenceFeature.get_split_kws) or add flanking "
+                f"context (jmd_n/jmd_c) to control this. To keep finer splits, pad short parts "
+                f"to a uniform length first with SequencePreprocessor.pad_parts (then "
+                f"CPP(accept_gaps=True)).", UserWarning)
+        df_scales, df_cat = check_match_df_scales_df_cat(
+            df_cat=df_cat, df_scales=df_scales, verbose=verbose
+        )
+        # Internal attributes
+        self._accept_gaps = accept_gaps
+        self._verbose = verbose
+        self._random_state = random_state
+        # Bootstrap / stability-selection mode (cross-cutting: applies to run / run_num).
+        self._bootstrap = bootstrap
+        self._n_bootstrap = n_bootstrap
+        self._resample = resample
+        self._bootstrap_frac = bootstrap_frac
+        self._bootstrap_ci = bootstrap_ci
+        # Feature components: Scales + Part + Split
+        self.df_cat = df_cat.copy()
+        self.df_scales = df_scales.copy()
+        self.df_parts = df_parts.copy()
+        self.split_kws = split_kws
+        # Phase A.4: lazy cache for the AA-index + float64 scale_matrix used by
+        # ``get_feature_matrix_fast_`` in ``CPP.run_num`` pass 2. Built on the
+        # first call and reused across repeat calls on this instance.
+        self._aa_lookup_cache = None
+        # Filter-funnel counts from the most recent ``run`` / ``run_num``
+        # (sklearn trailing-underscore convention: set during the call).
+        self.last_filter_stats_ = None
+
+    # Bootstrap stability selection (thin wrapper around run / run_num / run_composit)
+    def _fresh_bootstrap_cpp(self, idx=None):
+        """A CPP identical to this one but with bootstrap OFF, optionally on a row subset.
+
+        Used per bootstrap round so the wrapper re-uses the ordinary ``run`` / ``run_num`` /
+        ``run_composit`` methods (``bootstrap=False`` avoids re-entering this wrapper). ``idx=None``
+        keeps the full data; otherwise ``df_parts`` is sliced to those rows.
+        """
+        df_parts = self.df_parts if idx is None else self.df_parts.iloc[idx].reset_index(drop=True)
+        return CPP(df_parts=df_parts, split_kws=self.split_kws, df_scales=self.df_scales,
+                   df_cat=self.df_cat, accept_gaps=self._accept_gaps, verbose=False,
+                   random_state=self._random_state)
+
+    def _bootstrap_run(self, run_on=None, labels=None, label_test=1, label_ref=0):
+        """Tally ``selection_frequency`` over the bootstrap resampling rounds, then return a normal
+        full-data selection with that column added.
+
+        ``run_on(idx)`` runs the chosen selection method (``run`` / ``run_num`` / ``run_composit``)
+        on the bootstrap resample given by row indices ``idx`` and returns its ``df_feat``;
+        ``run_on(None)`` runs it on the full data. The final selection is exactly the ordinary
+        full-data run (``n_filter`` is the selection criterion); ``selection_frequency`` (fraction of
+        rounds each feature was selected) is reported alongside it. When ``bootstrap_kws['ci']`` sets
+        a confidence level, the statistics computed in each round are retained as well and summarized
+        into per-feature confidence intervals.
+        """
+        labels_arr = np.asarray(labels)
+        idx_test = np.where(labels_arr == label_test)[0]
+        idx_ref = np.where(labels_arr == label_ref)[0]
+        rng = np.random.default_rng(self._random_state)
+        ci = self._bootstrap_ci
+        counts: Dict[str, int] = {}
+        per_feat_stats: Dict[str, Dict[str, List[float]]] = {}
+        for _ in range(self._n_bootstrap):
+            idx = _resample_row_indices(idx_test=idx_test, idx_ref=idx_ref,
+                                        resample=self._resample,
+                                        bootstrap_frac=self._bootstrap_frac, rng=rng)
+            df_round = run_on(idx)
+            for feat in df_round[ut.COL_FEATURE]:
+                counts[feat] = counts.get(feat, 0) + 1
+            if ci is not None:
+                _collect_round_stats(df_round=df_round, per_feat_stats=per_feat_stats)
+        df_feat = run_on(None)  # ordinary full-data selection; n_filter is the criterion
+        freq = {f: c / self._n_bootstrap for f, c in counts.items()}
+        df_feat[ut.COL_SELECTION_FREQUENCY] = [
+            round(freq.get(f, 0.0), 3) for f in df_feat[ut.COL_FEATURE]
+        ]
+        if ci is not None:
+            _add_bootstrap_ci_cols(df_feat=df_feat, per_feat_stats=per_feat_stats, ci=ci)
+        return df_feat
+
+    # Main method
+    def run(
+        self,
+        labels: ut.ArrayLike1D,
+        label_test: int = 1,
+        label_ref: int = 0,
+        n_filter: int = 100,
+        n_pre_filter: Optional[int] = None,
+        pct_pre_filter: int = 5,
+        max_std_test: float = 0.2,
+        max_overlap: float = 0.5,
+        max_cor: float = 0.5,
+        check_cat: bool = True,
+        parametric: bool = False,
+        start: int = 1,
+        tmd_len: int = 20,
+        jmd_n_len: int = 10,
+        jmd_c_len: int = 10,
+        n_jobs: Optional[int] = None,
+        vectorized: bool = True,
+        n_batches: Optional[int] = None,
+        n_sample_batches: Optional[int] = None,
+        return_stats: bool = False,
+        redundancy: Literal["legacy", "exact"] = "legacy",
+    ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, dict]]:
+        """
+        Perform Comparative Physicochemical Profiling (CPP) algorithm: creation and two-step filtering of
+        interpretable sequence-based features.
+
+        The aim of the CPP algorithm is to identify a set of unique, non-redundant features that are most
+        discriminant between the test and reference group of sequences. See [Breimann25]_ for details on the algorithm.
+
+        .. versionadded:: 0.1.0
+
+        .. versionchanged:: 1.1.0
+            Added the ``return_stats`` parameter, returning the filter-funnel statistics alongside ``df_feat``.
+
+        .. versionchanged:: 1.2.0
+            ``n_sample_batches`` now creates exactly the requested number of balanced, non-empty
+            sample batches. ``n_batches`` and ``n_sample_batches`` document their distinct
+            output and memory trade-offs.
+
+        .. versionchanged:: 1.1.0
+            When the constructor enables bootstrap stability annotation (``CPP(bootstrap=True)``), ``df_feat`` gains a
+            ``selection_frequency`` column (the selected features are unchanged; see the ``bootstrap`` /
+            ``bootstrap_kws`` constructor parameters and the Notes below).
+
+        .. versionchanged:: 1.2.0
+            ``CPP(bootstrap=True, bootstrap_kws={'ci': <level>})`` additionally appends the per-feature
+            confidence-interval columns ``abs_auc_ci_low`` / ``abs_auc_ci_high`` and ``mean_dif_ci_low`` /
+            ``mean_dif_ci_high``. Without a level the output is unchanged.
+
+        Parameters
+        ----------
+        labels : array-like, shape (n_samples,)
+            Class labels for samples in sequence DataFrame (typically, test=1, reference=0).
+        label_test : int, default=1
+            Class label in ``labels`` that defines the test group used for feature statistics.
+        label_ref : int, default=0
+            Class label in ``labels`` that defines the reference group used for feature statistics.
+        n_filter : int, default=100
+            Number of features to be filtered/selected by CPP algorithm. With bootstrap stability selection
+            (``CPP(bootstrap=True)``) this still caps the final redundancy-filtered output computed on the full dataset.
+        n_pre_filter : int or None, default=None
+            Number of candidate features retained before redundancy filtering. If ``None``,
+            ``pct_pre_filter`` determines this number from all candidate features.
+        pct_pre_filter : int, default=5
+            Percentage of all features that should remain after the pre-filtering step.
+        max_std_test : float, default=0.2
+            Maximum standard deviation [>0-<1] within the test group used as threshold for pre-filtering.
+        max_overlap : float, default=0.5
+            Maximum positional overlap [0-1] of features used as threshold for filtering.
+        max_cor : float, default=0.5
+            Maximum Pearson correlation [0-1] of feature scales used as threshold for filtering.
+        check_cat : bool, default=True
+            Whether to check for redundancy within scale categories during filtering.
+        redundancy : {'legacy', 'exact'}, default='legacy'
+            Position-overlap criterion of the redundancy-reduction step. ``'legacy'`` (default)
+            keeps results reproducible across versions; ``'exact'`` compares the actual residue
+            positions (see Notes).
+        parametric : bool, default=False
+            Whether to use parametric (T-test) or non-parametric (Mann-Whitney U test) test for p-value computation.
+            This also sets the p-value column name in ``df_feat`` ('p_val_ttest_indep' vs 'p_val_mann_whitney').
+        start : int, default=1
+            Position label of first residue position (starting at N-terminus).
+        tmd_len : int, default=20
+            Length of target middle domain (TMD) (>0).
+        jmd_n_len : int, default=10
+            Length of JMD-N (>=0).
+        jmd_c_len : int, default=10
+            Length of JMD-C (>=0).
+        n_jobs : int, None, or -1, default=None
+            Number of CPU cores (>=1) used for multiprocessing. If ``None``, the number is optimized automatically.
+            If ``-1``, the number is set to all available cores. Overridden by ``options['n_jobs']`` when set.
+
+            .. warning::
+               On Python 3.14 + macOS, calling this with ``n_jobs > 1`` (or ``-1`` /
+               ``None``) from a script that lacks an ``if __name__ == "__main__":``
+               guard (or from a bare REPL / heredoc) can trigger a recursive process
+               spawn (``FileNotFoundError`` / ``EOFError`` / ``cannot pickle '_thread.RLock'``).
+               Guard your entry point, or run serially with ``n_jobs=1``. See also
+               :class:`CPPGrid` (default ``backend="threads"``), which sidesteps this.
+        vectorized : bool, default=True
+            Whether to apply sequence splitting and the Mann-Whitney U test in 'vectorized' mode (``True``),
+            improving speed but increasing memory consumption. The vectorized Mann-Whitney U test uses a
+            fast normal approximation of the p-value (roughly an order of magnitude faster on the test
+            step); ``vectorized=False`` instead computes the exact :func:`scipy.stats.mannwhitneyu`
+            p-value, which is slower but reproducible bit-for-bit. This choice changes only the reported
+            'p_val_mann_whitney' and 'p_val_fdr_bh' columns: feature ranking and selection are driven by
+            'abs_auc' and 'abs_mean_dif', so the selected features are identical in either mode.
+        n_batches : int or None, default=None
+            Number of scale-axis batches (2 to ``len(df_scales.columns)``). If ``None``,
+            single-pass processing is used. A value reduces the per-batch scale-value tensor
+            and usually lowers peak memory at the cost of additional work. Output is
+            byte-identical to the single-pass result, ``p_val_fdr_bh`` included: the
+            Benjamini-Hochberg correction is computed once over the pooled p-values of all
+            batches, not per batch.
+
+            .. versionchanged:: 1.2.0
+                The Benjamini-Hochberg correction is now pooled across batches, so batched
+                output matches single-pass output exactly. Before, it was applied per
+                feature batch and ``p_val_fdr_bh`` could differ from the single-pass value.
+        n_sample_batches : int or None, default=None
+            Number of non-empty, contiguous sample-axis batches (2 to ``n_samples``). If
+            ``None``, sample batching is disabled. A value divides samples into exactly this
+            many batches, whose sizes differ by at most one. It bounds the dominant per-batch
+            ``O(batch_size x part_length x n_scales)`` scale-value tensor by ``batch_size``.
+            It does **not** make peak memory independent of ``n``: the survivor matrix of
+            shape ``(n_samples, n_survivors)`` and its test statistics stay resident, so peak
+            memory still grows with ``n``. Floating-point accumulation across batches can
+            change statistics at rounding precision and resolve pathological ties differently.
+            Mutually exclusive with ``n_batches`` (which batches over scales).
+
+            .. versionchanged:: 1.2.0
+                Creates exactly the requested number of balanced, non-empty batches.
+        return_stats : bool, default=False
+            If ``True``, also return the filter-funnel statistics (``last_filter_stats_``)
+            as a second element ``(df_feat, stats)``; if ``False``, return only ``df_feat``.
+
+            .. versionadded:: 1.1.0
+
+        Returns
+        -------
+        df_feat : pd.DataFrame, shape (n_features, n_feature_info)
+            Feature DataFrame with a unique identifier, scale information, statistics, and positions for each feature.
+            Returned on its own when ``return_stats=False`` (default).
+        stats : dict[str, int]
+            Filter-funnel counts (same content as :attr:`CPP.last_filter_stats_`):
+            ``n_candidates``, ``n_after_prefilter``, ``n_after_redundancy``, and
+            ``n_final``. Returned only when ``return_stats=True``, in which case
+            the return value is ``(df_feat, stats)``.
+
+        Raises
+        ------
+        ValueError
+            If an argument fails validation, both batching modes are requested, or batching is
+            requested while the constructor has ``bootstrap=True``.
+
+        Notes
+        -----
+        * Pre-filtering can be adjusted by the following parameters: {'n_pre_filter', 'pct_pre_filter', 'max_std_test'}.
+        * Filtering can be adjusted by the following parameters: {'n_filter', 'max_overlap', 'max_cor', 'check_cat', 'redundancy'}.
+        * ``redundancy='exact'`` is an optional **enhancement** of the redundancy step, not a correctness
+          fix: it compares the true residue positions and tends to yield a more *concentrated* signature
+          (fewer redundant subcategories) rather than higher predictive performance, which stays
+          essentially unchanged. Default ``'legacy'`` keeps prior results reproducible. For a stronger,
+          more efficient redundancy reduction, see :meth:`CPP.simplify`.
+        * **Bootstrap stability annotation** (``CPP(bootstrap=True)``) wraps this run: the data is
+          resampled ``bootstrap_kws['rounds']`` times (per ``bootstrap_kws``) and re-selected each
+          round to score how often each feature is selected, then **this ordinary full-data run is
+          returned with a ``selection_frequency`` column** (0 to 1) appended after ``positions``. The
+          selected features are exactly those of the non-bootstrap run (``n_filter`` is the selection
+          criterion); ``selection_frequency`` flags which are reproducible under resampling. The run is
+          otherwise unchanged (``bootstrap=False``, the default, is byte-identical). Not combinable
+          with ``n_batches`` / ``n_sample_batches``. Setting ``bootstrap_kws['ci']`` (e.g. ``0.95``)
+          additionally summarizes the statistics of those same rounds into a per-feature percentile
+          interval of ``abs_auc`` and ``mean_dif`` (``NaN`` bounds for a feature selected in fewer
+          than two rounds); the interval columns are appended after ``selection_frequency``.
+        * **Binary by design.** ``run`` compares one test group against one reference group. For
+          multi-class or regression tasks, build binary label contrasts with the
+          ``SequenceFeature.get_labels_*`` helpers and loop ``run`` over them (see the
+          :class:`CPP` class notes and the **P8: Prediction** protocol).
+        * **Cost** scales as ``O(n_scales x n_parts x n_splits)`` (the candidate feature count), so larger
+          scale sets / wider ``split_kws`` are proportionally slower — budget a sweep accordingly, or use
+          :class:`CPPGrid` (which runs CPP once per ``n_filter`` group and slices the rest).
+        * **Classifier head tracks the metric** when training a downstream model on ``df_feat``: in practice
+          SVM tends to be best for AP (ranking), logistic regression for balanced accuracy, and random forest
+          for MCC at a fixed threshold (detection). Pick the head to match the objective you report.
+        * For large datasets (due to long sequences or a high number of samples) or memory-limited systems,
+          memory consumption can be reduced by:
+
+          - Disabling vectorized mode (``vectorized=False``)
+          - Reducing ``n_jobs`` (down to ``n_jobs=1``)
+          - Using batch processing (``n_batches>=2``, with higher values reducing memory usage)
+
+          While this helps to prevent crashes, it may slow down processing.
+
+        * ``df_feat`` follows a **standardized, deterministic column order** (the
+          canonical schema), with the unique feature id (1), scale information (2-5),
+          statistical results for filtering and ranking (6-12), and feature positions (13):
+
+            1. 'feature': Feature ID (PART-SPLIT-SCALE)
+            2. 'category': Scale category
+            3. 'subcategory': Sub category of scales
+            4. 'scale_name': Name of scales
+            5. 'scale_description': Description of the scale
+            6. 'abs_auc': Absolute adjusted AUC (area under the curve) [-0.5 to 0.5]
+            7. 'abs_mean_dif': Absolute mean differences between test and reference group [0 to 1]
+            8. 'mean_dif': Mean differences between test and reference group [-1 to 1]
+            9. 'std_test': Standard deviation in test group
+            10. 'std_ref': Standard deviation in reference group
+            11. 'p_val_mann_whitney' or 'p_val_ttest_indep': p-value of the non-parametric
+                Mann-Whitney test (default) or, when ``parametric=True``, the independent
+                t-test. The column **name** reflects which test was run.
+            12. 'p_val_fdr_bh': Benjamini-Hochberg False Discovery Rate (FDR) corrected p-values
+            13. 'positions': Feature positions for default settings
+
+          The feature id (column 1) is an opaque ``PART-SPLIT-SCALE`` string; split it with
+          :func:`aaanalysis.utils.split_feat_id` rather than parsing it by hand. Columns added
+          downstream — the explainable-AI columns ('feat_importance', 'feat_impact') and the
+          per-substrate SHAP columns ('feat_impact_<name>', 'mean_dif_<name>', ...) added by
+          :class:`TreeModel` / :class:`ShapModel` — are appended after 'positions' in a stable
+          order, so the canonical order is a lower bound, never a restriction.
+
+        * **Compositional vs positional features** are not a separate setting — the distinction
+          emerges from ``split_kws``. A single whole-part average (``n_split_max=1`` with no
+          ``Pattern`` / ``PeriodicPattern``) yields **compositional** features (an
+          amino-acid-composition-like mean over the entire part, position-agnostic); using
+          ``n_split_max>1`` and/or patterns yields **positional** features resolved to specific
+          sub-regions.
+
+        See Also
+        --------
+        * :func:`comp_auc_adjusted` for details on ``abs_auc``.
+
+        Examples
+        --------
+        .. include:: examples/cpp_run.rst
+        """
+        # Check input
+        ut.check_number_val(name="label_test", val=label_test, just_int=True)
+        ut.check_number_val(name="label_ref", val=label_ref, just_int=True)
+        labels = ut.check_labels(
+            labels=labels,
+            vals_required=[label_test, label_ref],
+            len_required=len(self.df_parts),
+            allow_other_vals=False,
+        )
+        ut.check_number_range(name="n_filter", val=n_filter, min_val=1, just_int=True)
+        ut.check_str_options(name="redundancy", val=redundancy, list_str_options=["legacy", "exact"])
+        ut.check_number_range(
+            name="n_pre_filter",
+            val=n_pre_filter,
+            min_val=1,
+            accept_none=True,
+            just_int=True,
+        )
+        ut.check_number_range(
+            name="pct_pre_filter",
+            val=pct_pre_filter,
+            min_val=5,
+            max_val=100,
+            just_int=True,
+        )
+        ut.check_number_range(
+            name="max_std_test",
+            val=max_std_test,
+            min_val=0.0,
+            max_val=1.0,
+            just_int=False,
+            exclusive_limits=True,
+        )
+        ut.check_number_range(
+            name="max_overlap",
+            val=max_overlap,
+            min_val=0.0,
+            max_val=1.0,
+            just_int=False,
+        )
+        ut.check_number_range(
+            name="max_cor", val=max_cor, min_val=0.0, max_val=1.0, just_int=False
+        )
+        ut.check_bool(name="check_cat", val=check_cat)
+        ut.check_bool(name="parametric", val=parametric)
+        ut.check_number_val(name="start", val=start, just_int=True, accept_none=False)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=jmd_c_len)
+        args_len, _ = check_parts_len(
+            tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len
+        )
+        n_jobs = ut.check_n_jobs(n_jobs=n_jobs)
+        ut.check_bool(name="vectorized", val=vectorized)
+        ut.check_bool(name="return_stats", val=return_stats)
+        n_scales = len(list(self.df_scales))
+        ut.check_number_range(
+            name="n_batches",
+            val=n_batches,
+            just_int=True,
+            accept_none=True,
+            min_val=2,
+            max_val=n_scales,
+        )
+        ut.check_number_range(
+            name="n_sample_batches",
+            val=n_sample_batches,
+            just_int=True,
+            accept_none=True,
+            min_val=2,
+            max_val=len(self.df_parts),
+        )
+        if n_batches is not None and n_sample_batches is not None:
+            raise ValueError(
+                f"'n_sample_batches' ({n_sample_batches}) should be None when 'n_batches' "
+                f"({n_batches}) is set; choose scale-batching or sample-batching, not both."
+            )
+        _warn_gaps_encountered(df_parts=self.df_parts, accept_gaps=self._accept_gaps)
+        # Route through the unified CPP pipeline + Cython kernel
+        # (with Python fallback) — bit-exact, guaranteed by
+        # ``test_run_num_parity``.
+        args = dict(
+            df_parts=self.df_parts,
+            split_kws=self.split_kws,
+            df_scales=self.df_scales,
+            df_cat=self.df_cat,
+            verbose=self._verbose,
+            accept_gaps=self._accept_gaps,
+            labels=labels,
+            label_test=label_test,
+            label_ref=label_ref,
+            n_filter=n_filter,
+            n_pre_filter=n_pre_filter,
+            pct_pre_filter=pct_pre_filter,
+            max_std_test=max_std_test,
+            max_overlap=max_overlap,
+            max_cor=max_cor,
+            check_cat=check_cat,
+            redundancy=redundancy,
+            parametric=parametric,
+            start=start,
+            tmd_len=tmd_len,
+            jmd_n_len=jmd_n_len,
+            jmd_c_len=jmd_c_len,
+            n_jobs=n_jobs,
+            vectorized=vectorized,
+        )
+        builder = _pick_feature_matrix_builder()
+        if self._aa_lookup_cache is None:
+            self._aa_lookup_cache = AALookupCache.from_df(
+                df_parts=self.df_parts,
+                df_scales=self.df_scales,
+            )
+        if self._bootstrap:
+            _check_bootstrap_batching(n_batches=n_batches, n_sample_batches=n_sample_batches)
+            labels_arr = np.asarray(labels)
+
+            def _run_on(idx):
+                cpp = self._fresh_bootstrap_cpp(idx)
+                lab = labels_arr if idx is None else labels_arr[idx]
+                return cpp.run(
+                    labels=lab, label_test=label_test, label_ref=label_ref, n_filter=n_filter,
+                    n_pre_filter=n_pre_filter, pct_pre_filter=pct_pre_filter, max_std_test=max_std_test,
+                    max_overlap=max_overlap, max_cor=max_cor, check_cat=check_cat, redundancy=redundancy,
+                    parametric=parametric, start=start, tmd_len=tmd_len, jmd_n_len=jmd_n_len,
+                    jmd_c_len=jmd_c_len, n_jobs=n_jobs, vectorized=vectorized,
+                )
+
+            df_feat = self._bootstrap_run(run_on=_run_on, labels=labels,
+                                          label_test=label_test, label_ref=label_ref)
+        elif n_sample_batches is not None:
+            df_feat = cpp_run_sample_batched(
+                **args,
+                n_sample_batches=n_sample_batches,
+            )
+        elif n_batches is None:
+            df_feat = cpp_run_single(
+                df_seq=None,
+                dict_num=None,
+                aa_lookup_cache=self._aa_lookup_cache,
+                feature_matrix_builder=builder,
+                **args,
+            )
+        else:
+            df_feat = cpp_run_batch(
+                **args,
+                n_batches=n_batches,
+                feature_matrix_builder=builder,
+            )
+        self.last_filter_stats_ = df_feat.attrs.get("last_filter_stats")
+        return _finalize_run_output(df_feat=df_feat, return_stats=return_stats)
+
+    def run_num(
+        self,
+        dict_num_parts: Dict[str, np.ndarray],
+        labels: ut.ArrayLike1D,
+        label_test: int = 1,
+        label_ref: int = 0,
+        n_filter: int = 100,
+        n_pre_filter: Optional[int] = None,
+        pct_pre_filter: int = 5,
+        max_std_test: float = 0.2,
+        max_overlap: float = 0.5,
+        max_cor: float = 0.5,
+        check_cat: bool = True,
+        parametric: bool = False,
+        start: int = 1,
+        tmd_len: int = 20,
+        jmd_n_len: int = 10,
+        jmd_c_len: int = 10,
+        n_jobs: Optional[int] = None,
+        vectorized: bool = True,
+        n_batches: Optional[int] = None,
+        n_sample_batches: Optional[int] = None,
+        return_stats: bool = False,
+        redundancy: Literal["legacy", "exact"] = "legacy",
+    ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, dict]]:
+        """
+        Numerical-mode Comparative Physicochemical Profiling (CPP): same algorithm as
+        :meth:`run`, but per-residue values come from a pre-sliced numerical tensor
+        (`dict_num_parts`) instead of an AA→scale lookup. Use for PLM embeddings, DSSP
+        one-hots, PTM dummies, or any per-residue numerical representation.
+
+        Same pipeline (pre-filter stats, pre-filter, recompute, add_stat, redundancy
+        filter) and same output schema as :meth:`run`. The constructor-bound
+        ``df_scales`` / ``df_cat`` provide DIMENSION NAMES + categories for the D axis
+        of ``dict_num_parts`` (the per-AA values they would normally provide are
+        unused — ``dict_num_parts`` is the value source).
+
+        .. versionadded:: 1.1.0
+
+        .. versionchanged:: 1.1.0
+            Honors bootstrap stability annotation (``CPP(bootstrap=True)``) exactly like :meth:`run`, resampling
+            along the sample axis of ``dict_num_parts`` and adding a ``selection_frequency`` column to ``df_feat``
+            (the selected features are unchanged).
+
+        .. versionchanged:: 1.2.0
+            Honors ``bootstrap_kws['ci']`` exactly like :meth:`run`, appending the per-feature
+            confidence-interval columns of ``abs_auc`` and ``mean_dif`` to ``df_feat``.
+
+        Parameters
+        ----------
+        dict_num_parts : dict[str, np.ndarray], required
+            Per-part NaN-padded numerical tensors, produced by
+            :meth:`NumericalFeature.get_parts`. Each value has shape
+            ``(n_samples, L_part_max, D)`` aligned row-for-row with
+            ``self.df_parts``. Keys must match ``self.df_parts.columns``. ``D`` must
+            equal ``len(self.df_scales.columns)`` (each D dimension names a "scale").
+        labels : array-like, shape (n_samples,)
+            Class labels for samples in sequence DataFrame (typically, test=1, reference=0).
+        label_test : int, default=1
+            Class label of test group in ``labels``.
+        label_ref : int, default=0
+            Class label of reference group in ``labels``.
+        n_filter : int, default=100
+            Number of features to be filtered/selected by CPP algorithm.
+        n_pre_filter : int or None, default=None
+            Number of candidate features retained before redundancy filtering. If ``None``,
+            ``pct_pre_filter`` determines this number from all candidate features.
+        pct_pre_filter : int, default=5
+            Percentage of all features that should remain after the pre-filtering step.
+        max_std_test : float, default=0.2
+            Maximum standard deviation [>0-<1] within the test group used as threshold for pre-filtering.
+        max_overlap : float, default=0.5
+            Maximum positional overlap [0-1] of features used as threshold for filtering.
+        max_cor : float, default=0.5
+            Maximum Pearson correlation [0-1] of feature scales used as threshold for filtering.
+        check_cat : bool, default=True
+            Whether to check for redundancy within scale categories during filtering.
+        redundancy : {'legacy', 'exact'}, default='legacy'
+            Position-overlap criterion of the redundancy-reduction step. ``'legacy'`` (default)
+            keeps results reproducible across versions; ``'exact'`` compares the actual residue
+            positions (see Notes).
+        parametric : bool, default=False
+            Whether to use parametric (T-test) or non-parametric (Mann-Whitney U test) for p-value computation.
+        start : int, default=1
+            Position label of first residue position (starting at N-terminus).
+        tmd_len : int, default=20
+            Length of target middle domain (TMD) (>0).
+        jmd_n_len : int, default=10
+            Length of JMD-N (>=0).
+        jmd_c_len : int, default=10
+            Length of JMD-C (>=0).
+        n_jobs : int, None, or -1, default=None
+            Number of CPU cores (>=1) used for multiprocessing. If ``None``, the number is optimized
+            automatically; if ``-1``, all available cores are used. Overridden by ``options['n_jobs']``
+            when set. The Python 3.14 + macOS spawn caveat documented in :meth:`run` applies here too.
+        vectorized : bool, default=True
+            Whether to apply sequence splitting and the Mann-Whitney U test in 'vectorized' mode (``True``),
+            improving speed but increasing memory consumption. The vectorized Mann-Whitney U test uses a
+            fast normal approximation of the p-value (roughly an order of magnitude faster on the test
+            step); ``vectorized=False`` instead computes the exact :func:`scipy.stats.mannwhitneyu`
+            p-value, which is slower but reproducible bit-for-bit. This choice changes only the reported
+            'p_val_mann_whitney' and 'p_val_fdr_bh' columns: feature ranking and selection are driven by
+            'abs_auc' and 'abs_mean_dif', so the selected features are identical in either mode.
+        n_batches : int or None, default=None
+            Number of batches (2 to ``len(df_scales.columns)``) over the D axis of
+            ``dict_num_parts``. If ``None``, single-pass; a value bounds the **pass-1
+            stat** working set to one D-chunk (pass-2 recompute still runs globally, so
+            this trims pass-1 memory but does not bound overall peak RSS — use
+            ``n_sample_batches`` for that). Output is bit-exact with the single-pass
+            result. Mutually exclusive with ``n_sample_batches``.
+
+            .. versionchanged:: 1.2.0
+                Clarified that only the pass-1 working set is batched.
+        n_sample_batches : int or None, default=None
+            Number of non-empty, contiguous batches (2 to ``n_samples``) over the **sample**
+            axis. If ``None``, single-pass. A value creates exactly this many batches whose
+            sizes differ by at most one, bounding the per-batch working set (stat
+            intermediates + pass-2 recompute) to ``O(batch_size)``. The resident input tensor
+            is unchanged. Pass-1 ``std_test`` uses accumulator-style variance, so the result
+            may differ from the single-pass run by ULP-level rounding (after the ``round(3)``
+            on the stat columns), which can reorder tie-broken features; hence opt-in, not the
+            default. Mutually exclusive with ``n_batches``.
+
+            .. versionchanged:: 1.2.0
+                Creates exactly the requested number of balanced, non-empty batches.
+        return_stats : bool, default=False
+            If ``True``, also return the filter-funnel statistics (``last_filter_stats_``) as a second
+            element ``(df_feat, stats)``; if ``False``, return only ``df_feat``.
+
+        Returns
+        -------
+        df_feat : pd.DataFrame, shape (n_features, n_feature_info)
+            Same schema as :meth:`run`.
+            Returned on its own when ``return_stats=False`` (default).
+        stats : dict[str, int]
+            Filter-funnel counts (same content as :attr:`CPP.last_filter_stats_`):
+            ``n_candidates``, ``n_after_prefilter``, ``n_after_redundancy``, and
+            ``n_final``. Returned only when ``return_stats=True``, in which case
+            the return value is ``(df_feat, stats)``.
+
+        Raises
+        ------
+        ValueError
+            If ``dict_num_parts`` is ``None`` (use :meth:`run` for seq-mode), or if
+            its shape / part names / D don't align with the constructor's
+            ``self.df_parts`` and ``self.df_scales``; if any other argument fails
+            validation; if both batching modes are requested; or if batching is
+            requested while the constructor has ``bootstrap=True``.
+
+        Notes
+        -----
+        * ``redundancy`` behaves exactly as in :meth:`run` (default ``'legacy'`` keeps results
+          reproducible; ``'exact'`` compares the true residue positions — an optional enhancement,
+          not a correctness fix).
+        * **Call order — ``get_parts`` then ``run_num``.** ``dict_num_parts`` must come
+          from :meth:`NumericalFeature.get_parts` (step 1), which slices a raw
+          ``df_seq`` + ``dict_num`` into the per-part tensors consumed here (step 2).
+          There is no raw-``df_seq`` / ``dict_num`` entry point on ``run_num``; passing
+          ``dict_num_parts=None`` raises (use :meth:`run` for sequence-mode).
+        * **Peak memory is higher than :meth:`run` and scales with the input tensor.**
+          ``run_num`` carries the dense ``(n_samples, L_part_max, D)`` per-part tensor that
+          ``dict_num_parts`` materializes, so its peak memory is roughly an order of
+          magnitude above the same-data :meth:`run` (which streams an AA→scale lookup and
+          never builds that tensor) and grows with ``D``; runtime is otherwise comparable to
+          :meth:`run`. For large ``n``, pass ``n_sample_batches`` to bound the per-batch
+          working set, at the cost of ULP-level differences in tie-broken features.
+          ``n_batches`` only trims the pass-1 stat working set, not overall peak.
+        * **Raw PLM embeddings are not directly usable — normalize them first.**
+          Per-residue values are expected in ``[0, 1]`` (the ``StructurePreprocessor`` /
+          ``AnnotationPreprocessor`` normalization convention), since the default
+          ``max_std_test=0.2`` pre-filter is calibrated for that range. Raw embeddings
+          (unbounded floats) must be passed through
+          :meth:`EmbeddingPreprocessor.encode` to obtain a ``[0, 1]``-normalized
+          ``{entry: (L, D)}`` ``dict_num`` before :meth:`NumericalFeature.get_parts`.
+          Skipping normalization raises no error — the ``max_std_test`` pre-filter is
+          simply miscalibrated for the out-of-range spread, so the feature funnel
+          silently keeps/drops the wrong features.
+          (``EmbeddingPreprocessor.build_scales`` / ``build_cat`` serve the *other*,
+          AA-scale path via :meth:`run`; they are not a per-residue value source here.)
+        * **Three arms, one entry point.** *structure-only* (``dict_num`` from
+          :class:`StructurePreprocessor`), *embedding* (``EmbeddingPreprocessor.encode``),
+          and *fused* (concatenate sources with :func:`aaanalysis.combine_dict_nums` first)
+          all flow through ``get_parts`` → ``run_num`` — only the ``dict_num`` differs.
+        * **Compositional vs positional** features emerge from ``split_kws`` exactly as in
+          :meth:`run` (``n_split_max=1`` with no patterns ⇒ compositional whole-part mean;
+          otherwise positional).
+
+        See Also
+        --------
+        * :meth:`run`: sequence-mode equivalent (no ``dict_num_parts``).
+        * :meth:`NumericalFeature.get_parts`: produces ``(df_parts, dict_num_parts)``
+          from raw ``df_seq + dict_num``.
+        * :class:`EmbeddingPreprocessor`, :class:`StructurePreprocessor`,
+          :class:`AnnotationPreprocessor`: the per-residue ``dict_num`` sources
+          (PLM embeddings / structure / annotations), combinable via
+          :func:`aaanalysis.combine_dict_nums`.
+
+        Examples
+        --------
+        .. include:: examples/cpp_run.rst
+        """
+        # Validate
+        if dict_num_parts is None:
+            raise ValueError(
+                "'dict_num_parts' (None) is required. Use CPP.run() for seq-mode, or call "
+                "NumericalFeature.get_parts(df_seq, dict_num, ...) to produce "
+                "dict_num_parts from a per-residue tensor input."
+            )
+        _check_dict_num_parts(dict_num_parts=dict_num_parts, df_parts=self.df_parts)
+        # D must match the constructor's df_scales (it names the D dimensions).
+        D = next(iter(dict_num_parts.values())).shape[2]
+        n_df_scales_cols = len(self.df_scales.columns)
+        if D != n_df_scales_cols:
+            raise ValueError(
+                f"'dict_num_parts' D={D} should equal len(self.df_scales.columns)="
+                f"{n_df_scales_cols}. df_scales names the D dimensions in numerical mode."
+            )
+        ut.check_number_val(name="label_test", val=label_test, just_int=True)
+        ut.check_number_val(name="label_ref", val=label_ref, just_int=True)
+        labels = ut.check_labels(
+            labels=labels,
+            vals_required=[label_test, label_ref],
+            len_required=len(self.df_parts),
+            allow_other_vals=False,
+        )
+        ut.check_number_range(name="n_filter", val=n_filter, min_val=1, just_int=True)
+        ut.check_str_options(name="redundancy", val=redundancy, list_str_options=["legacy", "exact"])
+        ut.check_number_range(
+            name="n_pre_filter",
+            val=n_pre_filter,
+            min_val=1,
+            accept_none=True,
+            just_int=True,
+        )
+        ut.check_number_range(
+            name="pct_pre_filter",
+            val=pct_pre_filter,
+            min_val=5,
+            max_val=100,
+            just_int=True,
+        )
+        ut.check_number_range(
+            name="max_std_test",
+            val=max_std_test,
+            min_val=0.0,
+            max_val=1.0,
+            just_int=False,
+            exclusive_limits=True,
+        )
+        ut.check_number_range(
+            name="max_overlap",
+            val=max_overlap,
+            min_val=0.0,
+            max_val=1.0,
+            just_int=False,
+        )
+        ut.check_number_range(
+            name="max_cor", val=max_cor, min_val=0.0, max_val=1.0, just_int=False
+        )
+        ut.check_bool(name="check_cat", val=check_cat)
+        ut.check_bool(name="parametric", val=parametric)
+        ut.check_number_val(name="start", val=start, just_int=True, accept_none=False)
+        jmd_n_len = ut.check_jmd_n_len(jmd_n_len=jmd_n_len)
+        jmd_c_len = ut.check_jmd_c_len(jmd_c_len=jmd_c_len)
+        check_parts_len(tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len)
+        n_jobs = ut.check_n_jobs(n_jobs=n_jobs)
+        ut.check_bool(name="vectorized", val=vectorized)
+        ut.check_bool(name="return_stats", val=return_stats)
+        ut.check_number_range(
+            name="n_batches",
+            val=n_batches,
+            just_int=True,
+            accept_none=True,
+            min_val=2,
+            max_val=n_df_scales_cols,
+        )
+        ut.check_number_range(
+            name="n_sample_batches",
+            val=n_sample_batches,
+            just_int=True,
+            accept_none=True,
+            min_val=2,
+            max_val=len(self.df_parts),
+        )
+        if n_batches is not None and n_sample_batches is not None:
+            raise ValueError(
+                f"'n_sample_batches' ({n_sample_batches}) should be None when 'n_batches' "
+                f"({n_batches}) is set; choose scale-batching or sample-batching, not both."
+            )
+
+        # Re-derive per-(entry, part) real lengths from df_parts non-gap chars.
+        # The user-facing dict_num_parts carries only the NaN-padded tensor; lens
+        # are deterministic from the string df_parts (keeps the API one-shape).
+        dict_part_lens = _derive_dict_part_lens(df_parts=self.df_parts)
+
+        args = dict(
+            df_parts=self.df_parts,
+            split_kws=self.split_kws,
+            df_scales=self.df_scales,
+            df_cat=self.df_cat,
+            verbose=self._verbose,
+            accept_gaps=self._accept_gaps,
+            labels=labels,
+            label_test=label_test,
+            label_ref=label_ref,
+            n_filter=n_filter,
+            n_pre_filter=n_pre_filter,
+            pct_pre_filter=pct_pre_filter,
+            max_std_test=max_std_test,
+            max_overlap=max_overlap,
+            max_cor=max_cor,
+            check_cat=check_cat,
+            redundancy=redundancy,
+            parametric=parametric,
+            start=start,
+            tmd_len=tmd_len,
+            jmd_n_len=jmd_n_len,
+            jmd_c_len=jmd_c_len,
+            n_jobs=n_jobs,
+            vectorized=vectorized,
+        )
+
+        # Cython by default; falls back to pure-Python kernel if the compiled `.so`
+        # isn't present (e.g. user installed without the wheel). Same auto-dispatch
+        # as cpp.run — see _pick_feature_matrix_builder docstring.
+        builder = _pick_feature_matrix_builder()
+        if self._bootstrap:
+            _check_bootstrap_batching(n_batches=n_batches, n_sample_batches=n_sample_batches)
+            labels_arr = np.asarray(labels)
+
+            def _run_on(idx):
+                cpp = self._fresh_bootstrap_cpp(idx)
+                lab = labels_arr if idx is None else labels_arr[idx]
+                dnp = (dict_num_parts if idx is None
+                       else {p: v[idx] for p, v in dict_num_parts.items()})
+                return cpp.run_num(
+                    dict_num_parts=dnp, labels=lab, label_test=label_test, label_ref=label_ref,
+                    n_filter=n_filter, n_pre_filter=n_pre_filter, pct_pre_filter=pct_pre_filter,
+                    max_std_test=max_std_test, max_overlap=max_overlap, max_cor=max_cor,
+                    check_cat=check_cat, redundancy=redundancy, parametric=parametric, start=start,
+                    tmd_len=tmd_len, jmd_n_len=jmd_n_len, jmd_c_len=jmd_c_len, n_jobs=n_jobs,
+                    vectorized=vectorized,
+                )
+
+            df_feat = self._bootstrap_run(run_on=_run_on, labels=labels,
+                                          label_test=label_test, label_ref=label_ref)
+        elif n_sample_batches is not None:
+            # Batch the sample axis: each batch slices the resident tensor and
+            # bounds the per-batch working set (stat intermediates + pass-2
+            # recompute) to O(batch_size). This is the lever that actually lowers
+            # peak RSS for large n. Pass-1 std_test uses accumulator variance, so
+            # the result may differ from single-pass by ULP-level rounding (after
+            # the round(3) on stat columns); hence opt-in, not the default.
+            df_feat = cpp_run_sample_batched(
+                dict_part_vals=dict_num_parts,
+                dict_part_lens=dict_part_lens,
+                n_sample_batches=n_sample_batches,
+                **args,
+            )
+        elif n_batches is None:
+            df_feat = cpp_run_single(
+                df_seq=None,
+                dict_num=None,
+                dict_part_vals=dict_num_parts,
+                dict_part_lens=dict_part_lens,
+                aa_lookup_cache=None,  # numerical path doesn't use AA lookup
+                feature_matrix_builder=builder,  # consumed by seq-mode only; harmless here
+                **args,
+            )
+        else:
+            # Batch the D axis (the dict_num_parts dimensions). Bit-exact with the
+            # single-pass path — see cpp_run_batch_num.
+            df_feat = cpp_run_batch_num(
+                dict_part_vals=dict_num_parts,
+                dict_part_lens=dict_part_lens,
+                n_batches=n_batches,
+                **args,
+            )
+        self.last_filter_stats_ = df_feat.attrs.get("last_filter_stats")
+        return _finalize_run_output(df_feat=df_feat, return_stats=return_stats)
+
+    def run_composit(self,
+                     labels: ut.ArrayLike1D,
+                     composition: Literal["aac", "dpc", "kmer"] = "aac",
+                     k: int = 3,
+                     n_filter: int = 100,
+                     max_cor: Optional[float] = None,
+                     min_count: int = 1,
+                     label_test: int = 1,
+                     label_ref: int = 0,
+                     parametric: bool = False,
+                     start: int = 1,
+                     tmd_len: int = 20,
+                     jmd_n_len: int = 10,
+                     jmd_c_len: int = 10,
+                     n_jobs: Optional[int] = None,
+                     ) -> pd.DataFrame:
+        """
+        Composition-mode CPP: build a ``df_feat`` of composition features (a special, non-positional
+        feature type) instead of positional Part-Split-Scale features.
+
+        Composition descriptors (iFeature-style [Chen18]_) summarize a sequence as fixed-length
+        residue-frequency vectors with no positional split — the baseline CPP's positional features
+        are meant to beat. This turns them into a CPP ``df_feat`` with the same discriminative
+        statistics CPP ranks on:
+
+        * ``composition="aac"`` (**amino-acid composition**, k=1) *is* positional CPP: it runs over a
+          one-hot identity scale set with the whole-part ``Segment(1,1)`` split, giving genuine
+          ``<PART>-Segment(1,1)-<AA>`` features **with positions** that :meth:`CPPPlot.feature_map` draws.
+        * ``composition="dpc"`` (**dipeptide composition**, k=2) / ``composition="kmer"`` (general
+          ``k``) are **non-positional**: a k-mer is a property of an adjacent residue tuple, not a
+          per-residue scale, so the returned ``df_feat`` has no ``positions`` (not feature-map-able).
+          The ``20 ** k`` k-mers are scored with CPP's statistics and filtered by adjusted AUC (top
+          ``n_filter``), a min-occurrence guard (``min_count``), and optional correlation dedup (``max_cor``).
+
+        .. versionadded:: 1.1.0
+
+        .. versionchanged:: 1.1.0
+            Honors bootstrap stability annotation (``CPP(bootstrap=True)``): the composition features are
+            re-selected on ``bootstrap_kws['rounds']`` resamples and this run gains a ``selection_frequency``
+            column (the selected features are unchanged).
+
+        Parameters
+        ----------
+        labels : array-like, shape (n_samples,)
+            Class labels for samples in the sequence DataFrame (typically, test=1, reference=0).
+        composition : str, default="aac"
+            Composition descriptor: ``"aac"`` (amino-acid, positional), ``"dpc"`` (dipeptide), or
+            ``"kmer"`` (general k-mer of length ``k``).
+        k : int, default=3
+            k-mer length for ``composition="kmer"`` (1 to 4; ``20 ** k`` grows exponentially). Ignored
+            for ``"aac"`` (k=1) and ``"dpc"`` (k=2).
+        n_filter : int, default=100
+            Number of top composition features (by adjusted AUC) to keep.
+        max_cor : float, optional
+            If given, drop k-mers correlating above this with an already-kept, higher-AUC k-mer (the
+            composition-space analog of the CPP ``max_cor`` redundancy filter). ``k >= 2`` only.
+        min_count : int, default=1
+            A k-mer must be present (non-zero) in at least this many sequences to be eligible for
+            ranking (drops sparse presence/absence noise; matters at higher ``k``). ``k >= 2`` only.
+        label_test : int, default=1
+            Class label of the test group.
+        label_ref : int, default=0
+            Class label of the reference group.
+        parametric : bool, default=False
+            Whether the p-value is parametric (T-test) or non-parametric (Mann-Whitney U).
+        start : int, default=1
+            Position label of the first residue (AAC feature ids only).
+        tmd_len : int, default=20
+            TMD length for the AAC position labelling (AAC only).
+        jmd_n_len : int, default=10
+            JMD-N length for the AAC position labelling (AAC only).
+        jmd_c_len : int, default=10
+            JMD-C length for the AAC position labelling (AAC only).
+        n_jobs : int, None, or -1, default=None
+            Number of CPU cores used for the statistics.
+
+        Returns
+        -------
+        df_feat : pd.DataFrame
+            Composition features with CPP statistics, ranked by ``abs_auc``. For ``"aac"`` the features
+            are positional (``<PART>-Segment(1,1)-<AA>``, drawn by the feature map); for ``"dpc"`` /
+            ``"kmer"`` the ``feature`` column holds the k-mer string and there is no ``positions`` column.
+            With bootstrap stability annotation (``CPP(bootstrap=True)``) a ``selection_frequency``
+            column is added, plus the per-feature confidence-interval columns of ``abs_auc`` and
+            ``mean_dif`` when ``bootstrap_kws['ci']`` sets a confidence level.
+
+        See Also
+        --------
+        * :meth:`SequenceFeature.kmer_composition`: the underlying composition matrices (and their
+          iFeature context / compositional-approach explanation).
+        * :meth:`CPP.run`: positional Part-Split-Scale feature engineering.
+
+        Examples
+        --------
+        .. include:: examples/cpp_run_composit.rst
+        """
+        # Check input
+        ut.check_str_options(name="composition", val=composition, list_str_options=["aac", "dpc", "kmer"])
+        ut.check_number_range(name="n_filter", val=n_filter, min_val=1, just_int=True)
+        ut.check_number_range(name="min_count", val=min_count, min_val=1, just_int=True)
+        if composition == "kmer":
+            ut.check_number_range(name="k", val=k, min_val=1, max_val=4, just_int=True)
+        if self._bootstrap:
+            labels_arr = np.asarray(labels)
+
+            def _run_on(idx):
+                cpp = self._fresh_bootstrap_cpp(idx)
+                lab = labels_arr if idx is None else labels_arr[idx]
+                return cpp.run_composit(
+                    labels=lab, composition=composition, k=k, n_filter=n_filter, max_cor=max_cor,
+                    min_count=min_count, label_test=label_test, label_ref=label_ref,
+                    parametric=parametric, start=start, tmd_len=tmd_len, jmd_n_len=jmd_n_len,
+                    jmd_c_len=jmd_c_len, n_jobs=n_jobs,
+                )
+
+            return self._bootstrap_run(run_on=_run_on, labels=labels,
+                                       label_test=label_test, label_ref=label_ref)
+        if composition == "aac":
+            # Positional: one-hot identity AA scales + whole-part Segment(1,1) through the full pipeline.
+            df_scales, df_cat = get_composition_scales_(k=1)
+            split_kws = get_split_kws_(split_types=[ut.STR_SEGMENT], n_split_min=1, n_split_max=1)
+            cpp = CPP(df_parts=self.df_parts, split_kws=split_kws, df_scales=df_scales, df_cat=df_cat,
+                      verbose=self._verbose, random_state=self._random_state)
+            return cpp.run(labels=labels, label_test=label_test, label_ref=label_ref, n_filter=n_filter,
+                           parametric=parametric, start=start, tmd_len=tmd_len, jmd_n_len=jmd_n_len,
+                           jmd_c_len=jmd_c_len, n_jobs=n_jobs)
+        # Non-positional: k-mer composition + CPP discriminative stats + filtering.
+        k_use = 2 if composition == "dpc" else int(k)
+        n_jobs = ut.check_n_jobs(n_jobs=n_jobs)
+        return get_kmer_composit_df_feat_(df_parts=self.df_parts, labels=labels, k=k_use,
+                                          label_test=label_test, label_ref=label_ref, n_filter=n_filter,
+                                          max_cor=max_cor, min_count=min_count, parametric=parametric,
+                                          n_jobs=n_jobs)
+
+    def eval(
+        self,
+        list_df_feat: List[pd.DataFrame],
+        labels: ut.ArrayLike1D,
+        label_test: int = 1,
+        label_ref: int = 0,
+        min_th: float = 0.0,
+        names_feature_sets: Optional[List[str]] = None,
+        list_cat: Optional[List[str]] = None,
+        list_df_parts: Optional[List[pd.DataFrame]] = None,
+        n_jobs: Optional[int] = 1,
+    ) -> pd.DataFrame:
+        """
+        Evaluate the quality of different sets of identified Comparative Physicochemical
+        Profiling (CPP) features.
+
+        Feature sets are evaluated regarding two quality groups:
+
+        - **Discriminative Power**: The capability of features to distinguish between test and reference datasets.
+        - **Redundancy**: Assessed by the optimized number of clusters, based on Pearson correlation among features.
+
+        .. versionadded:: 0.1.0
+
+        Parameters
+        ----------
+        list_df_feat : list of pd.DataFrames
+            List of feature DataFrames each of shape (n_features, n_feature_info)
+        labels : array-like, shape (n_samples,)
+            Class labels for samples in sequence DataFrame (typically, test=1, reference=0).
+        label_test : int, default=1,
+            Class label of test group in ``labels``.
+        label_ref : int, default=0,
+            Class label of reference group in ``labels``.
+        min_th : float, default=0.0
+            Pearson correlation threshold for clustering optimization (between -1 and 1).
+        names_feature_sets : list of str, optional
+            List of names for feature sets corresponding to ``list_df_feat``.
+        list_cat : list of str, optional
+            List of scale categories to retrieve number of features from. Default:
+            ['ASA/Volume', 'Composition', 'Conformation', 'Energy', 'Others', 'Polarity', 'Shape', 'Structure-Activity']
+        list_df_parts : list of pd.DataFrames, optional
+            List of part DataFrames each of shape (n_samples, n_parts). Must match with ``list_df_feat``.
+        n_jobs : int, None, or -1, default=1
+            Number of CPU cores (>=1) used for multiprocessing. If ``None``, the number is optimized automatically.
+            If ``-1``, the number is set to all available cores. Overridden by ``options['n_jobs']`` when set.
+
+        Returns
+        -------
+        df_eval : pd.DataFrame
+            Evaluation results for each set of identified features. For each set, statistical
+            measures were averaged across all features.
+
+        Notes
+        -----
+        * ``df_eval`` includes the following columns (upper-case indicates direct reference to ``df_feat`` columns):
+
+            - 'name': Name of the feature set, typically based on CPP run settings, if ``names`` is provided.
+            - 'n_features': Tuple with total number of features and list of number of features per scale category from ``list_cat``.
+            - 'avg_ABS_AUC': Absolute Area Under the Curve (AUC) averaged across all features.
+            - 'range_ABS_AUC': Quintile range of absolute AUC among all features (min, 25%, median, 75%, max).
+            - 'avg_MEAN_DIF': Tuple of mean differences averaged across all features separately
+              for features with positive and negative 'mean_dif'.
+            - 'n_clusters': Optimal number of clusters [2,100].
+            - 'avg_n_feat_per_clust': Average number of features per cluster.
+            - 'std_n_feat_per_clust': Standard deviation of feature number per cluster.
+
+        * 'n_clusters' is optimized for a KMeans clustering model based on the minimum Pearson correlation between
+          the cluster center and all cluster members across all clusters (``min_cor_center`` in :class:`AAclust`),
+          which has to exceed the minimum correlation threshold ``min_th``.
+
+        See Also
+        --------
+        * :func:`CPPPlot.eval`: the respective plotting method.
+        * :ref:`usage_principles_aaontology` for details on scale categories.
+        * :meth:`CPP.run` for details on CPP statistical measures.
+        * :func:`comp_auc_adjusted` for details on 'abs_auc'.
+        * :class:`sklearn.cluster.KMeans` for employed clustering model.
+        * :class:`AAclust` ([Breimann24a]_) for details on cluster optimization using Pearson correlation.
+
+        Examples
+        --------
+        .. include:: examples/cpp_eval.rst
+        """
+        # Check input
+        list_df_feat = ut.check_list_like(
+            name="list_df_feat", val=list_df_feat, min_len=2
+        )
+        ut.check_number_val(name="label_test", val=label_test, just_int=True)
+        ut.check_number_val(name="label_ref", val=label_ref, just_int=True)
+        labels = ut.check_labels(
+            labels=labels,
+            vals_required=[label_test, label_ref],
+            len_required=len(self.df_parts),
+            allow_other_vals=False,
+        )
+        ut.check_number_range(
+            name="min_th", val=min_th, min_val=-1, max_val=1, just_int=False
+        )
+        names_feature_sets = ut.check_list_like(
+            name="names_feature_sets",
+            val=names_feature_sets,
+            accept_none=True,
+            accept_str=True,
+            check_all_str_or_convertible=True,
+        )
+        list_cat = ut.check_list_like(
+            name="list_cat",
+            val=list_cat,
+            accept_none=True,
+            accept_str=True,
+            check_all_str_or_convertible=True,
+        )
+        n_jobs = ut.check_n_jobs(n_jobs=n_jobs)
+        check_match_list_df_feat_names_feature_sets(
+            list_df_feat=list_df_feat, names_feature_sets=names_feature_sets
+        )
+        list_df_parts = ut.check_list_like(
+            name="list_df_parts", val=list_df_parts, accept_none=True
+        )
+        mask_test = [x == label_test for x in labels]
+        if list_df_parts is None:
+            list_df_parts = [self.df_parts[mask_test]] * len(list_df_feat)
+        if list_cat is None:
+            list_cat = ut.LIST_CAT
+        check_match_list_df_feat_list_df_parts(
+            list_df_feat=list_df_feat, list_df_parts=list_df_parts
+        )
+        df_eval = evaluate_features(
+            list_df_feat=list_df_feat,
+            names_feature_sets=names_feature_sets,
+            list_cat=list_cat,
+            list_df_parts=list_df_parts,
+            df_scales=self.df_scales,
+            accept_gaps=self._accept_gaps,
+            min_th=min_th,
+            n_jobs=n_jobs,
+            random_state=self._random_state,
+        )
+        return df_eval
+
+    def simplify(
+        self,
+        df_feat: pd.DataFrame,
+        labels: ut.ArrayLike1D,
+        strategy: Literal["greedy", "consolidate", "swap_all"] = "greedy",
+        candidate_search: Literal["exact", "fast"] = "exact",
+        max_interpret_grade: Optional[int] = None,
+        min_cor: float = 0.7,
+        ml_model: Union[Literal["svm", "rf", "log_reg"], object] = "svm",
+        ml_metric: str = "balanced_accuracy",
+        ml_th: float = 0.0,
+        ml_cv: int = 5,
+        allow_drop: bool = True,
+        on_unimprovable: Literal["keep", "drop", "drop_if_perf_allows"] = "keep",
+        redundancy_tie_break: Literal["interpretability", "performance"] = "interpretability",
+        label_test: int = 1,
+        label_ref: int = 0,
+        max_std_test: float = 0.2,
+        max_cor: float = 0.5,
+        max_overlap: float = 0.5,
+        check_cat: bool = True,
+        return_details: bool = False,
+    ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
+        """
+        Simplify a feature set by swapping scales for more interpretable correlated ones.
+
+        For each feature (``PART-SPLIT-SCALE``), an alternative scale from a **more
+        interpretable AAontology subcategory** (interpretability grade 1-10, 1 = best;
+        per-subcategory grades are in ``load_scales(name='subcat')``) that **correlates** with the
+        original scale is substituted, keeping ``PART-SPLIT``. The swapped feature's statistics
+        are recomputed; a swap is accepted only if it passes CPP's per-feature filtering
+        (``max_std_test``) and a cross-validation gate (performance not worse than the current
+        set, within ``ml_th``). The swapped set is then redundancy-reduced, yielding a
+        more interpretable and ideally smaller ``df_feat``. The candidate pool (the full rated
+        AAontology scale set) is loaded internally.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_feat : pd.DataFrame, shape (n_features, n_feature_info)
+            Feature DataFrame from :meth:`run` (the standardized CPP output schema).
+        labels : array-like, shape (n_samples,)
+            Class labels for samples in sequence DataFrame (typically, test=1, reference=0).
+        strategy : {'greedy', 'consolidate', 'swap_all'}, default='greedy'
+            How candidate swaps are chosen and validated (see Notes for full behavior):
+
+            - ``'greedy'``: per-feature — each targeted feature is swapped to its best
+              candidate that keeps the cross-validation (CV) score within ``ml_th``.
+            - ``'consolidate'``: set-level — funnels features into the fewest interpretable
+              subcategories, keeping each batch swap only if the set CV score holds.
+            - ``'swap_all'``: apply every eligible best-candidate swap with no CV gate
+              (fastest; ``ml_model`` / ``ml_metric`` / ``ml_th`` / ``ml_cv`` ignored).
+        candidate_search : {'exact', 'fast'}, default='exact'
+            How many candidate scales are evaluated per feature. ``'exact'`` (default) tests
+            every eligible candidate and reproduces the original result exactly. ``'fast'`` is
+            an **approximate** speed-up that caps the search to the most promising candidates
+            per feature (highest interpretability, then strongest correlation); it can change
+            which features are kept and so is most useful on large scale pools. If none of the
+            searched candidates is accepted, the feature keeps its original scale (it is never
+            dropped for this reason), so ``'fast'`` may leave a feature un-simplified that
+            ``'exact'`` would have swapped. The speed-up is concentrated in ``strategy='greedy'``
+            (one cross-validation per candidate tried); ``'consolidate'`` gains less and
+            ``'swap_all'`` is unaffected (it already stops at the first viable candidate). With
+            ``return_details=True`` the ``df_candidates`` report is correspondingly shorter
+            under ``'fast'``.
+        max_interpret_grade : int, optional
+            The maximum (worst) interpretability **grade** kept (1-10, where **grade 1 is the
+            best / most interpretable, so lower is better**). Every feature whose scale
+            subcategory is graded worse (higher) than this is targeted for replacement. If
+            ``None`` (default), every improvable feature is attempted.
+        min_cor : float, default=0.7
+            Minimum absolute Pearson correlation between a candidate scale and the original scale
+            (between 0 and 1); anti-correlation is allowed via the absolute value.
+        ml_model : str or sklearn estimator, default='svm'
+            Model for the cross-validation gate (``'greedy'`` / ``'consolidate'``). A string
+            preset ``'svm'`` (default; fast), ``'rf'`` (recommended for non-linear feature
+            relationships, but slower), or ``'log_reg'`` (fastest); or any configured scikit-learn
+            classifier instance (e.g. ``SVC(kernel='poly', C=0.1)``), used as-is.
+        ml_metric : str, default='balanced_accuracy'
+            Scoring metric for the CV gate (any scikit-learn classification scorer name).
+        ml_th : float, default=0.0
+            CV-gate tolerance: a swap is accepted if its CV score is at least ``baseline - ml_th``
+            (>=0).
+        ml_cv : int, default=5
+            Number of cross-validation folds (>=2, <= smallest class count).
+        allow_drop : bool, default=True
+            Whether ``simplify`` may **drop** features. If ``False``, it only swaps scales and never
+            removes a feature, so the output keeps every input feature 1:1 (the redundancy reduction
+            is skipped and ``on_unimprovable`` is forced to ``'keep'``).
+        on_unimprovable : str, default='keep'
+            What to do with a targeted feature that cannot be improved: ``'keep'`` (retain the
+            original), ``'drop'`` (remove it), or ``'drop_if_perf_allows'`` (remove only if the
+            CV score does not drop). The last feature is never dropped.
+        redundancy_tie_break : str, default='interpretability'
+            When two swapped features are redundant, keep the ``'interpretability'``-best (then
+            ``abs_auc``) or the ``'performance'``-best (``abs_auc``).
+        label_test : int, default=1
+            Class label of the test group in ``labels``.
+        label_ref : int, default=0
+            Class label of the reference group in ``labels``.
+        max_std_test : float, default=0.2
+            Per-feature pre-filter threshold a swapped feature must satisfy (between 0 and 1).
+        max_cor : float, default=0.5
+            Redundancy correlation threshold for the post-swap reduction (between 0 and 1).
+        max_overlap : float, default=0.5
+            Redundancy position-overlap threshold for the post-swap reduction (between 0 and 1).
+        check_cat : bool, default=True
+            Whether the redundancy reduction only compares features within the same scale category.
+        return_details : bool, default=False
+            If ``True``, also return a long-form ``df_candidates`` reporting every candidate
+            considered (scale, interpretability, correlation, recomputed std, accepted-flag).
+
+        Returns
+        -------
+        df_feat : pd.DataFrame
+            The simplified feature DataFrame (CPP output schema), with swapped scales, recomputed
+            statistics, and redundant features removed.
+        df_candidates : pd.DataFrame
+            Returned only if ``return_details=True``: one row per candidate considered.
+
+        Notes
+        -----
+        * The CV-gate model is seeded from the CPP instance's ``random_state``; set it once via
+          ``aa.CPP(..., random_state=...)`` for a reproducible result.
+        * Redundancy reduction **protects original features** — it never drops a feature the user
+          already had, it only removes a *swapped* feature when the swap made it redundant with a
+          kept feature (using signed correlation, matching :meth:`run`).
+        * The ``strategy`` controls how swaps are chosen and validated:
+
+          - **'greedy'**: per-feature. Each targeted feature is swapped to its best correlated
+            candidate that keeps the cross-validation score within ``ml_th`` of the current set;
+            otherwise the next candidate is tried. Each swap is individually justified.
+          - **'consolidate'**: set-level. Interpretable subcategories are taken best-first, and
+            every targeted feature that can move into the current subcategory is swapped as one
+            batch, which is kept only if the set CV score stays within ``ml_th``. Funnels features
+            into the fewest subcategories.
+          - **'swap_all'**: apply every eligible best-candidate swap with no cross-validation
+            (fastest); ``ml_model`` / ``ml_metric`` / ``ml_th`` / ``ml_cv`` are ignored. A pure
+            interpretability transform to evaluate yourself afterwards.
+
+        * Features whose scale is **not a rated AAontology scale** (e.g. ``run_num`` pseudo-scales
+          or unclassified scales) carry no interpretability grade and are skipped. If no feature
+          is rated, ``df_feat`` is returned unchanged with a ``RuntimeWarning``.
+        * An anti-correlated swap flips the sign of ``mean_dif`` (the feature still discriminates);
+          the correlation sign is reported in ``df_candidates``.
+
+        See Also
+        --------
+        * :meth:`run` for the feature DataFrame produced and its schema.
+        * :func:`load_scales` for the interpretability-tiered explainable scale sets (``top_explain_n``).
+
+        Examples
+        --------
+        .. include:: examples/cpp_simplify.rst
+        """
+        # Check input
+        df_feat = ut.check_df_feat(df_feat=df_feat, list_parts=list(self.df_parts))
+        ut.check_number_val(name="label_test", val=label_test, just_int=True)
+        ut.check_number_val(name="label_ref", val=label_ref, just_int=True)
+        labels = ut.check_labels(
+            labels=labels,
+            vals_required=[label_test, label_ref],
+            len_required=len(self.df_parts),
+            allow_other_vals=False,
+        )
+        check_match_df_parts_features(
+            df_parts=self.df_parts, features=list(df_feat[ut.COL_FEATURE])
+        )
+        ut.check_str_options(
+            name="strategy", val=strategy, list_str_options=ut.LIST_SIMPLIFY_STRATEGIES
+        )
+        ut.check_str_options(
+            name="candidate_search",
+            val=candidate_search,
+            list_str_options=ut.LIST_CANDIDATE_SEARCH,
+        )
+        ut.check_str_options(
+            name="on_unimprovable",
+            val=on_unimprovable,
+            list_str_options=ut.LIST_ON_UNIMPROVABLE,
+        )
+        ut.check_str_options(
+            name="redundancy_tie_break",
+            val=redundancy_tie_break,
+            list_str_options=ut.LIST_REDUNDANCY_TIE_BREAK,
+        )
+        ut.check_str(name="ml_metric", val=ml_metric)
+        check_ml_model(ml_model=ml_model)
+        ut.check_number_range(
+            name="min_cor", val=min_cor, min_val=0, max_val=1, just_int=False
+        )
+        ut.check_number_range(
+            name="max_std_test", val=max_std_test, min_val=0, max_val=1, just_int=False
+        )
+        ut.check_number_range(
+            name="max_cor", val=max_cor, min_val=0, max_val=1, just_int=False
+        )
+        ut.check_number_range(
+            name="max_overlap", val=max_overlap, min_val=0, max_val=1, just_int=False
+        )
+        ut.check_number_val(name="ml_th", val=ml_th, just_int=False)
+        ut.check_number_range(
+            name="max_interpret_grade",
+            val=max_interpret_grade,
+            min_val=1,
+            max_val=10,
+            just_int=True,
+            accept_none=True,
+        )
+        ut.check_bool(name="check_cat", val=check_cat)
+        ut.check_bool(name="return_details", val=return_details)
+        ut.check_bool(name="allow_drop", val=allow_drop)
+        check_ml_cv_labels(ml_cv=ml_cv, labels=labels)
+        random_state = ut.check_random_state(random_state=self._random_state)
+        # The recomputed p-value column must match the input df_feat's test choice.
+        parametric = ut.COL_PVAL_TTEST in list(df_feat)
+        _warn_gaps_encountered(df_parts=self.df_parts, accept_gaps=self._accept_gaps)
+        return simplify_cpp_(
+            df_feat=df_feat,
+            df_parts=self.df_parts,
+            df_scales_self=self.df_scales,
+            labels=labels,
+            strategy=strategy,
+            candidate_search=candidate_search,
+            max_interpret_grade=max_interpret_grade,
+            min_cor=min_cor,
+            ml_metric=ml_metric,
+            ml_th=ml_th,
+            ml_cv=ml_cv,
+            allow_drop=allow_drop,
+            on_unimprovable=on_unimprovable,
+            redundancy_tie_break=redundancy_tie_break,
+            label_test=label_test,
+            label_ref=label_ref,
+            max_std_test=max_std_test,
+            max_cor=max_cor,
+            max_overlap=max_overlap,
+            check_cat=check_cat,
+            parametric=parametric,
+            accept_gaps=self._accept_gaps,
+            return_details=return_details,
+            ml_model=ml_model,
+            random_state=random_state,
+            verbose=self._verbose,
+        )

@@ -1,0 +1,216 @@
+import IMP
+import math
+import IMP.isd
+import IMP.test
+import IMP.core
+import pickle
+try:
+    import jax
+except ImportError:
+    jax = None
+
+
+class LogRestraint(IMP.Restraint):
+    """Restraint that logs how it was called (or skipped)"""
+
+    def __init__(self, m, ps, value):
+        super().__init__(m, 'LogRestraint%1%')
+        self.ps = ps
+        self.value = value
+        self.moved_evaluate = None
+
+    def unprotected_evaluate(self, accum):
+        self.moved_evaluate = False
+        return self.value
+
+    def unprotected_evaluate_moved(self, accum, moved_pis, reset_pis):
+        self.moved_evaluate = True
+        return self.value
+
+    def do_get_inputs(self):
+        return self.ps
+
+
+class Tests(IMP.test.TestCase):
+
+    def test_evaluate_moved(self):
+        """Test scoring with moved particles"""
+        def assert_restraint_skipped(r):
+            # In debug mode restraints aren't actually skipped; they are
+            # evaluated and the score is checked against the 'skipped' score
+            if IMP.get_check_level() >= IMP.USAGE_AND_INTERNAL:
+                assert_restraint_evaluate_moved(r)
+            else:
+                self.assertIsNone(r.moved_evaluate)
+
+        def assert_restraint_evaluate(r):
+            self.assertFalse(r.moved_evaluate)
+
+        def assert_restraint_evaluate_moved(r):
+            self.assertTrue(r.moved_evaluate)
+        m = IMP.Model()
+        p1 = IMP.Particle(m)
+        p2 = IMP.Particle(m)
+        p3 = IMP.Particle(m)
+        p4 = IMP.Particle(m)
+        r1 = LogRestraint(m, [p1], 100.0)
+        r4 = LogRestraint(m, [p4], 10.0)
+        lw = IMP.isd.LogWrapper([r1, r4], 1.0)
+
+        def clear_restraints():
+            r1.moved_evaluate = r4.moved_evaluate = None
+        # Plain evaluate should *not* call the evaluate_moved method on r1,r4
+        clear_restraints()
+        self.assertAlmostEqual(lw.evaluate(False), -6.908, delta=1e-3)
+        assert_restraint_evaluate(r1)
+        assert_restraint_evaluate(r4)
+
+        # If we move p1, r1 should be evaluate_moved, r4 skipped
+        # (and score should be unchanged, of course)
+        clear_restraints()
+        self.assertAlmostEqual(lw.evaluate_moved(False, [p1], []),
+                               -6.908, delta=1e-3)
+        assert_restraint_evaluate_moved(r1)
+        assert_restraint_skipped(r4)
+
+        # No restraints depend on p2
+        clear_restraints()
+        self.assertAlmostEqual(lw.evaluate_moved(False, [p2], []),
+                               -6.908, delta=1e-3)
+        assert_restraint_skipped(r1)
+        assert_restraint_skipped(r4)
+
+        # p4 causes r4 to be updated
+        clear_restraints()
+        self.assertAlmostEqual(lw.evaluate_moved(False, [p4], []),
+                               -6.908, delta=1e-3)
+        assert_restraint_skipped(r1)
+        assert_restraint_evaluate_moved(r4)
+
+        # Moves of multiple particles are not specially handled but will
+        # pass through to evaluate_moved
+        clear_restraints()
+        self.assertAlmostEqual(lw.evaluate_moved(False, [p1, p2], []),
+                               -6.908, delta=1e-3)
+        assert_restraint_evaluate_moved(r1)
+        assert_restraint_evaluate_moved(r4)
+
+        # Moves with derivatives are not specially handled but will
+        # pass through to evaluate_moved
+        clear_restraints()
+        self.assertAlmostEqual(lw.evaluate_moved(True, [p1], []),
+                               -6.908, delta=1e-3)
+        assert_restraint_evaluate_moved(r1)
+        assert_restraint_evaluate_moved(r4)
+
+        # Newly-added restraints should use regular evaluate to get first score
+        clear_restraints()
+        r3 = LogRestraint(m, [p3], 30.0)
+        r3.moved_evaluate = None
+        lw.add_restraint(r3)
+        self.assertAlmostEqual(lw.evaluate_moved(False, [p4], []),
+                               -10.308, delta=1e-3)
+        assert_restraint_skipped(r1)
+        assert_restraint_evaluate(r3)
+        assert_restraint_evaluate_moved(r4)
+
+    def test_aggregate(self):
+        """Test get_is_aggregate()"""
+        m = IMP.Model()
+        p1 = IMP.Particle(m)
+        p2 = IMP.Particle(m)
+        r1 = LogRestraint(m, [p1], 100.0)
+        r2 = LogRestraint(m, [p2], 10.0)
+        lw = IMP.isd.LogWrapper([r1, r2], 1.0)
+        self.assertFalse(r1.get_is_aggregate())
+        self.assertTrue(lw.get_is_aggregate())
+
+    def test_pickle(self):
+        """Test that LogWrapper can be (un-)pickled"""
+        m = IMP.Model()
+        r0 = IMP._ConstRestraint(m, [], 100)
+        lw = IMP.isd.LogWrapper([r0], 1.0)
+        lw.set_name("foo")
+        self.assertAlmostEqual(lw.evaluate(False), -4.605, delta=1e-3)
+        dump = pickle.dumps(lw)
+        newlw = pickle.loads(dump)
+        self.assertEqual(newlw.get_name(), "foo")
+        self.assertEqual([lw.get_name() for r in newlw.restraints], ["foo"])
+        self.assertAlmostEqual(newlw.evaluate(False), -4.605, delta=1e-3)
+
+    def test_pickle_polymorphic(self):
+        """Test that LogWrapper can be (un-)pickled via polymorphic pointer"""
+        m = IMP.Model()
+        r0 = IMP._ConstRestraint(m, [], 100)
+        lw = IMP.isd.LogWrapper([r0], 1.0)
+        rs = IMP.RestraintSet(m, 12.0)
+        rs.restraints.append(lw)
+        self.assertAlmostEqual(rs.evaluate(False), -55.262, delta=1e-3)
+        dump = pickle.dumps(rs)
+        newrs = pickle.loads(dump)
+        self.assertAlmostEqual(newrs.evaluate(False), -55.262, delta=1e-3)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax(self):
+        """Test JAX implementation of LogWrapper"""
+        m = IMP.Model()
+        for (prob, exp_score) in [(10.0, -6.9077554),
+                                  (0.1, -2.3025851),
+                                  (0.0, math.inf)]:
+            r0 = IMP._ConstRestraint(m, [], 100)
+            r1 = IMP._ConstRestraint(m, [], prob)
+            lw = IMP.isd.LogWrapper([r0, r1], 1.0)
+            imp_score = lw.evaluate(False)
+            jax_score = lw._evaluate_jax()
+            self.assertAlmostEqual(imp_score, exp_score, delta=1e-4)
+            self.assertAlmostEqual(imp_score, jax_score, delta=1e-4)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_periodic(self):
+        """Test JAX implementation of LogWrapper with PBC"""
+        import IMP.jax
+        space = IMP.jax.PeriodicSpace([10., 10., 10.])
+        m = IMP.Model()
+        p1 = IMP.Particle(m)
+        d1 = IMP.core.XYZ.setup_particle(p1, IMP.algebra.Vector3D(0, 0, 0))
+        p2 = IMP.Particle(m)
+        d2 = IMP.core.XYZ.setup_particle(p2, IMP.algebra.Vector3D(7, 0, 0))
+        uf = IMP.core.Linear(0.0, 1.0)
+        dr = IMP.core.DistanceRestraint(m, uf, p1, p2)
+        lw = IMP.isd.LogWrapper([dr], 1.0)
+        jax_score = lw._evaluate_jax(space=space)
+
+        # In periodic space, distance is 3.0, not 7.0
+        self.assertAlmostEqual(jax_score, -math.log(3.0), delta=1e-3)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_multi_attr(self):
+        """Test JAX LogWrapper with multiple attribute sets"""
+        import IMP.jax
+
+        # First set
+        m = IMP.Model()
+        p1 = IMP.Particle(m)
+        d1 = IMP.core.XYZ.setup_particle(p1, IMP.algebra.Vector3D(0, 0, 0))
+        p2 = IMP.Particle(m)
+        d2 = IMP.core.XYZ.setup_particle(p2, IMP.algebra.Vector3D(7, 0, 0))
+        uf = IMP.core.Linear(0.0, 1.0)
+        dr = IMP.core.DistanceRestraint(m, uf, p1, p2)
+        lw = IMP.isd.LogWrapper([dr], 1.0)
+        imp_score1 = lw.evaluate(False)
+
+        # Second set
+        m.set_number_of_sphere_attribute_sets(2)
+        m.set_active_sphere_attribute_set(1)
+        d1 = IMP.core.XYZ.setup_particle(p1, IMP.algebra.Vector3D(0, 0, 0))
+        d2 = IMP.core.XYZ.setup_particle(p2, IMP.algebra.Vector3D(17, 0, 0))
+        imp_score2 = lw.evaluate(False)
+
+        jax_score = lw._evaluate_jax()
+        self.assertEqual(jax_score.shape, (2,))
+        self.assertAlmostEqual(jax_score[0], imp_score1, delta=1e-4)
+        self.assertAlmostEqual(jax_score[1], imp_score2, delta=1e-4)
+
+
+if __name__ == '__main__':
+    IMP.test.main()

@@ -1,0 +1,1116 @@
+# This code is part of OpenFE and is licensed under the MIT license.
+# For details, see https://github.com/OpenFreeEnergy/openfe
+import gzip
+import os
+import pathlib
+import urllib.error
+import urllib.request
+from importlib import resources
+
+import gufe
+import mdtraj
+import numpy as np
+import openmm
+import pandas as pd
+import pytest
+from gufe import (
+    AlchemicalNetwork,
+    AtomMapper,
+    ChemicalSystem,
+    LigandAtomMapping,
+    NonTransformation,
+    ProteinComponent,
+    SmallMoleculeComponent,
+    SolventComponent,
+    Transformation,
+)
+from gufe.tests.test_protocol import DummyProtocol
+from openff.toolkit import ForceField
+from openff.units import unit
+from openff.units import unit as offunit
+from openmm import unit as ommunit
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+import openfe
+from openfe.data._registry import POOCH_CACHE
+from openfe.protocols.openmm_rfe import RelativeHybridTopologyProtocol
+from openfe.protocols.openmm_rfe._rfe_utils.relative import HybridTopologyFactory
+from openfe.protocols.openmm_utils.serialization import deserialize
+from openfe.tests.protocols.openmm_rfe.helpers import make_htf
+
+
+class SlowTests:
+    """Plugin for handling fixtures that skips slow tests
+
+    Fixtures
+    --------
+
+    Currently two fixture types are handled:
+      * `integration`:
+        Extremely slow tests that are meant to be run to truly put the code
+        through a real run.
+
+      * `slow`:
+        Unit tests that just take too long to be running regularly.
+
+
+    How to use the fixtures
+    -----------------------
+
+    To add these fixtures simply add `@pytest.mark.integration` or
+    `@pytest.mark.slow` decorator to the relevant function or class.
+
+
+    How to run tests marked by these fixtures
+    -----------------------------------------
+
+    To run the `integration` tests, either use the `--integration` flag
+    when invoking pytest, or set the environment variable
+    `OFE_INTEGRATION_TESTS` to `true`. Note: triggering `integration` will
+    automatically also trigger tests marked as `slow`.
+
+    To run the `slow` tests, either use the `--runslow` flag when invoking
+    pytest, or set the environment variable `OFE_SLOW_TESTS` to `true`
+    """
+
+    def __init__(self, config):
+        self.config = config
+
+    @staticmethod
+    def _modify_slow(items, config):
+        msg = (
+            "need --runslow pytest cli option or the environment variable "
+            "`OFE_SLOW_TESTS` set to `True` to run"
+        )
+        skip_slow = pytest.mark.skip(reason=msg)
+        for item in items:
+            if "slow" in item.keywords:
+                item.add_marker(skip_slow)
+
+    @staticmethod
+    def _modify_integration(items, config):
+        msg = (
+            "need --integration pytest cli option or the environment "
+            "variable `OFE_INTEGRATION_TESTS` set to `True` to run"
+        )
+        skip_int = pytest.mark.skip(reason=msg)
+        for item in items:
+            if "integration" in item.keywords:
+                item.add_marker(skip_int)
+
+    def pytest_collection_modifyitems(self, items, config):
+        if (
+            config.getoption("--integration")
+            or os.getenv("OFE_INTEGRATION_TESTS", default="false").lower() == "true"
+        ):
+            return
+        elif (
+            config.getoption("--runslow")
+            or os.getenv("OFE_SLOW_TESTS", default="false").lower() == "true"
+        ):
+            self._modify_integration(items, config)
+        else:
+            self._modify_integration(items, config)
+            self._modify_slow(items, config)
+
+
+# allow for optional slow tests
+# See: https://docs.pytest.org/en/latest/example/simple.html
+def pytest_addoption(parser):
+    parser.addoption("--runslow", action="store_true", default=False, help="run slow tests")
+    parser.addoption("--integration", action="store_true", default=False, help="run long integration tests")  # fmt: skip
+
+
+def pytest_configure(config):
+    config.pluginmanager.register(SlowTests(config), "slow")
+    config.addinivalue_line("markers", "slow: mark test as slow")
+    config.addinivalue_line("markers", "integration: mark test as long integration test")
+
+
+def mol_from_smiles(smiles: str) -> Chem.Mol:
+    m = Chem.MolFromSmiles(smiles)
+    AllChem.Compute2DCoords(m)  # type: ignore[attr-defined]
+
+    return m
+
+
+@pytest.fixture(scope="session")
+def simple_mapping():
+    """Disappearing oxygen on end
+
+    C C O
+
+    C C
+    """
+    molA = SmallMoleculeComponent(mol_from_smiles("CCO"))
+    molB = SmallMoleculeComponent(mol_from_smiles("CC"))
+
+    m = LigandAtomMapping(molA, molB, componentA_to_componentB={0: 0, 1: 1})
+
+    return m
+
+
+@pytest.fixture(scope="session")
+def other_mapping():
+    """Disappearing middle carbon
+
+    C C O
+
+    C   C
+    """
+    molA = SmallMoleculeComponent(mol_from_smiles("CCO"))
+    molB = SmallMoleculeComponent(mol_from_smiles("CC"))
+
+    m = LigandAtomMapping(molA, molB, componentA_to_componentB={0: 0, 2: 1})
+
+    return m
+
+
+@pytest.fixture()
+def lomap_basic_test_files_dir(tmp_path_factory):
+    # for lomap, which wants the files in a directory
+    lomap_files = tmp_path_factory.mktemp("lomap_files")
+    lomap_basic = "openfe.tests.data.lomap_basic"
+
+    for f in resources.contents(lomap_basic):
+        if not f.endswith("mol2"):
+            continue
+        stuff = resources.read_binary(lomap_basic, f)
+
+        with open(lomap_files / f, "wb") as fout:
+            fout.write(stuff)
+
+    yield str(lomap_files)
+
+
+@pytest.fixture(scope="session")
+def atom_mapping_basic_test_files():
+    # a dict of {filenames.strip(mol2): SmallMoleculeComponent} for a simple
+    # set of ligands
+    files = {}
+    for f in [
+        "1,3,7-trimethylnaphthalene",
+        "1-butyl-4-methylbenzene",
+        "2,6-dimethylnaphthalene",
+        "2-methyl-6-propylnaphthalene",
+        "2-methylnaphthalene",
+        "2-naftanol",
+        "methylcyclohexane",
+        "toluene",
+    ]:
+        with resources.as_file(resources.files("openfe.tests.data.lomap_basic")) as d:
+            fn = str(d / (f + ".mol2"))
+            mol = Chem.MolFromMol2File(fn, removeHs=False)
+            files[f] = SmallMoleculeComponent(mol, name=f)
+
+    return files
+
+
+@pytest.fixture()
+def lomap_old_mapper() -> AtomMapper:
+    """
+    LomapAtomMapper with the old default settings.
+
+    This is necessary as atom_mapping_basic_test_files are not all fully aligned
+    and need both shift and a large max3d value.
+    """
+    return openfe.setup.atom_mapping.LomapAtomMapper(
+        time=20,
+        threed=True,
+        max3d=1000.0,
+        element_change=True,
+        seed="",
+        shift=True,
+    )
+
+
+@pytest.fixture
+def benzene_toluene_topology():
+    """Load the mdtraj hybrid topology reference for benzene to toluene."""
+    with resources.as_file(resources.files("openfe.tests.data.openmm_rfe")) as d:
+        atoms = pd.read_csv(d / "benzene_toluene_hybrid_top" / "hybrid_topology_atoms.csv")
+        bonds = np.loadtxt(d / "benzene_toluene_hybrid_top" / "hybrid_topology_bonds.txt")
+        return mdtraj.Topology.from_dataframe(atoms=atoms, bonds=bonds)
+
+
+@pytest.fixture(scope="session")
+def benzene_modifications_uncharged():
+    files = {}
+    with resources.as_file(resources.files("openfe.tests.data")) as d:
+        fn = str(d / "benzene_modifications.sdf")
+        supp = Chem.SDMolSupplier(str(fn), removeHs=False)
+        for rdmol in supp:
+            files[rdmol.GetProp("_Name")] = SmallMoleculeComponent(rdmol)
+    return files
+
+
+@pytest.fixture(scope="session")
+def benzene_modifications():
+    files = {}
+    with resources.as_file(resources.files("openfe.tests.data")) as d:
+        fn = str(d / "benzene_modifications_am1bcc.sdf")
+        supp = Chem.SDMolSupplier(str(fn), removeHs=False)
+        for rdmol in supp:
+            files[rdmol.GetProp("_Name")] = SmallMoleculeComponent(rdmol)
+    return files
+
+
+@pytest.fixture(scope="session")
+def charged_benzene_modifications():
+    files = {}
+    with resources.as_file(resources.files("openfe.tests.data.openmm_rfe")) as d:
+        fn = str(d / "charged_benzenes.sdf")
+        supp = Chem.SDMolSupplier(str(fn), removeHs=False)
+        for rdmol in supp:
+            files[rdmol.GetProp("_Name")] = SmallMoleculeComponent(rdmol)
+    return files
+
+
+@pytest.fixture(scope="session")
+def T4L_septop_reference_xml():
+    with resources.as_file(resources.files("openfe.tests.data.openmm_septop")) as d:
+        f = str(d / "system.xml.bz2")
+    return deserialize(pathlib.Path(f))
+
+
+@pytest.fixture
+def serialization_template():
+    def inner(filename):
+        loc = "openfe.tests.data.serialization"
+        tmpl = resources.read_text(loc, filename)
+        return tmpl.replace("{OFE_VERSION}", openfe.__version__)
+
+    return inner
+
+
+@pytest.fixture(scope="session")
+def benzene_transforms():
+    # a dict of Molecules for benzene transformations
+    mols = {}
+    with resources.as_file(resources.files("openfe.tests.data")) as d:
+        fn = str(d / "benzene_modifications_am1bcc.sdf")
+        supplier = Chem.SDMolSupplier(fn, removeHs=False)
+        for mol in supplier:
+            mols[mol.GetProp("_Name")] = SmallMoleculeComponent(mol)
+    return mols
+
+
+@pytest.fixture(scope="session")
+def T4_protein_component_pdb() -> str:
+    with resources.as_file(resources.files("openfe.tests.data")) as d:
+        return str(d / "181l_only.pdb")
+
+
+@pytest.fixture(scope="session")
+def T4_protein_component(T4_protein_component_pdb) -> gufe.ProteinComponent:
+    return gufe.ProteinComponent.from_pdb_file(T4_protein_component_pdb, name="T4_protein")
+
+
+@pytest.fixture(scope="session")
+def a2a_protein_membrane_pdb():
+    with resources.as_file(resources.files("openfe.tests.data.a2a")) as d:
+        yield str(d / "protein.pdb.gz")
+
+
+@pytest.fixture(scope="session")
+def a2a_protein_membrane_component(a2a_protein_membrane_pdb) -> openfe.ProteinMembraneComponent:
+    yield openfe.ProteinMembraneComponent.from_pdb_file(a2a_protein_membrane_pdb, name="a2a")
+
+
+@pytest.fixture(scope="session")
+def eg5_protein_pdb():
+    with resources.as_file(resources.files("openfe.tests.data.eg5")) as d:
+        yield str(d / "eg5_protein.pdb")
+
+
+@pytest.fixture()
+def eg5_ligands_uncharged_sdf():
+    with resources.as_file(resources.files("openfe.tests.data.eg5")) as d:
+        yield str(d / "eg5_ligands.sdf")
+
+
+@pytest.fixture()
+def eg5_ligands_sdf():
+    with resources.as_file(resources.files("openfe.tests.data.eg5")) as d:
+        yield str(d / "eg5_ligands_am1bcc.sdf")
+
+
+@pytest.fixture()
+def eg5_cofactor_sdf():
+    with resources.as_file(resources.files("openfe.tests.data.eg5")) as d:
+        yield str(d / "eg5_cofactor_am1bcc.sdf")
+
+
+@pytest.fixture()
+def eg5_protein(eg5_protein_pdb) -> openfe.ProteinComponent:
+    return openfe.ProteinComponent.from_pdb_file(eg5_protein_pdb)
+
+
+@pytest.fixture()
+def eg5_ligands_uncharged(eg5_ligands_uncharged_sdf) -> list[SmallMoleculeComponent]:
+    return [
+        SmallMoleculeComponent(m)
+        for m in Chem.SDMolSupplier(eg5_ligands_uncharged_sdf, removeHs=False)
+    ]
+
+
+@pytest.fixture()
+def eg5_ligands(eg5_ligands_sdf) -> list[SmallMoleculeComponent]:
+    return [SmallMoleculeComponent(m) for m in Chem.SDMolSupplier(eg5_ligands_sdf, removeHs=False)]
+
+
+@pytest.fixture()
+def eg5_cofactor(eg5_cofactor_sdf) -> SmallMoleculeComponent:
+    return SmallMoleculeComponent.from_sdf_file(eg5_cofactor_sdf)
+
+
+@pytest.fixture(scope="session")
+def cdk8_ligands_sdf():
+    with resources.as_file(resources.files("openfe.tests.data.cdk8")) as d:
+        yield str(d / "cdk8_ligands.sdf")
+
+
+@pytest.fixture(scope="session")
+def cdk8_ligands(cdk8_ligands_sdf) -> list[SmallMoleculeComponent]:
+    return [SmallMoleculeComponent(m) for m in Chem.SDMolSupplier(cdk8_ligands_sdf, removeHs=False)]
+
+
+@pytest.fixture(scope="session")
+def cdk8_protein_pdb():
+    with resources.as_file(resources.files("openfe.tests.data.cdk8")) as d:
+        yield str(d / "cdk8_protein.pdb")
+
+
+@pytest.fixture(scope="session")
+def cdk8_protein(cdk8_protein_pdb) -> openfe.ProteinComponent:
+    return openfe.ProteinComponent.from_pdb_file(cdk8_protein_pdb)
+
+
+@pytest.fixture(scope="session")
+def a2a_ligands_sdf():
+    with resources.as_file(resources.files("openfe.tests.data.a2a")) as d:
+        yield str(d / "ligands.sdf.gz")
+
+
+@pytest.fixture(scope="session")
+def a2a_ligands(a2a_ligands_sdf):
+    with gzip.open(a2a_ligands_sdf, "rb") as gzf:
+        suppl = Chem.ForwardSDMolSupplier(gzf, removeHs=False)
+        yield [SmallMoleculeComponent(m) for m in suppl]
+
+
+@pytest.fixture()
+def orion_network():
+    with resources.as_file(resources.files("openfe.tests.data.external_formats")) as d:
+        yield str(d / "somebenzenes_nes.dat")
+
+
+@pytest.fixture()
+def fepplus_network():
+    with resources.as_file(resources.files("openfe.tests.data.external_formats")) as d:
+        yield str(d / "somebenzenes_edges.edge")
+
+
+@pytest.fixture()
+def CN_molecule() -> list[SmallMoleculeComponent]:
+    """
+    A basic CH3NH2 molecule for quick testing.
+    """
+    with resources.as_file(resources.files("openfe.tests.data")) as d:
+        fn = str(d / "CN.sdf")
+        supp = Chem.SDMolSupplier(str(fn), removeHs=False)
+
+        smc = [SmallMoleculeComponent(i) for i in supp][0]
+
+    return smc
+
+
+@pytest.fixture(scope="function")
+def am1bcc_ref_charges():
+    ref_chgs = {
+        "ambertools":[
+            0.146957, -0.918943, 0.025557, 0.025557,
+            0.025557, 0.347657, 0.347657
+        ] * offunit.elementary_charge,
+        "openeye": [
+            0.14713, -0.92016, 0.02595, 0.02595,
+            0.02595, 0.34759, 0.34759
+        ] * offunit.elementary_charge,
+        "nagl": [
+            0.170413, -0.930417, 0.021593, 0.021593,
+            0.021593, 0.347612, 0.347612
+        ] * offunit.elementary_charge,
+        "espaloma": [
+            0.017702, -0.966793, 0.063076, 0.063076,
+            0.063076, 0.379931, 0.379931
+        ] * offunit.elementary_charge,
+    }  # fmt: skip
+    return ref_chgs
+
+
+try:
+    urllib.request.urlopen("https://www.google.com")
+except urllib.error.URLError:  # -no-cov-
+    HAS_INTERNET = False
+else:
+    HAS_INTERNET = True
+
+try:
+    import espaloma
+
+    HAS_ESPALOMA = True
+except ModuleNotFoundError:
+    HAS_ESPALOMA = False
+
+
+@pytest.fixture(scope="module")
+def chlorobenzene():
+    """Load chlorobenzene with partial charges from sdf file."""
+    with resources.as_file(resources.files("openfe.tests.data.htf")) as f:
+        yield SmallMoleculeComponent.from_sdf_file(f / "t4_lysozyme_data" / "chlorobenzene.sdf")
+
+
+@pytest.fixture(scope="module")
+def fluorobenzene():
+    """Load fluorobenzene with partial charges from sdf file."""
+    with resources.as_file(resources.files("openfe.tests.data.htf")) as f:
+        yield SmallMoleculeComponent.from_sdf_file(f / "t4_lysozyme_data" / "fluorobenzene.sdf")
+
+
+@pytest.fixture(scope="module")
+def ethane():
+    """Load ethane with partial charges from sdf file."""
+    with resources.as_file(resources.files("openfe.tests.data.htf")) as f:
+        yield SmallMoleculeComponent.from_sdf_file(f / "ethane.sdf")
+
+
+@pytest.fixture(scope="module")
+def chloroethane():
+    """Load chloroethane with partial charges from sdf file."""
+    with resources.as_file(resources.files("openfe.tests.data.htf")) as f:
+        yield SmallMoleculeComponent.from_sdf_file(f / "chloroethane.sdf")
+
+
+@pytest.fixture(scope="module")
+def fluoroethane():
+    """Load fluoroethane with partial charges from sdf file."""
+    with resources.as_file(resources.files("openfe.tests.data.htf")) as f:
+        yield SmallMoleculeComponent.from_sdf_file(f / "fluoroethane.sdf")
+
+
+@pytest.fixture(scope="module")
+def benzene():
+    """Load fluoroethane with partial charges from sdf file."""
+    with resources.as_file(resources.files("openfe.tests.data.htf")) as f:
+        yield SmallMoleculeComponent.from_sdf_file(f / "t4_lysozyme_data" / "benzene.sdf")
+
+
+@pytest.fixture(scope="module")
+def chlorobenzene_to_fluorobenzene_mapping(chlorobenzene, fluorobenzene):
+    """Return a mapping from chlorobenzene to fluorobenzene."""
+    return LigandAtomMapping(
+        componentA=chlorobenzene,
+        componentB=fluorobenzene,
+        componentA_to_componentB={
+            # perfect one-to-one mapping
+            0: 0,
+            1: 1,
+            2: 2,
+            3: 3,
+            4: 4,
+            5: 5,
+            6: 6,
+            7: 7,
+            8: 8,
+            9: 9,
+            10: 10,
+            11: 11,
+        },
+    )
+
+
+@pytest.fixture(scope="module")
+def chloroethane_to_ethane_mapping(chloroethane, ethane):
+    """Return a mapping from chloroethane to ethane."""
+    return LigandAtomMapping(
+        componentA=chloroethane,
+        componentB=ethane,
+        componentA_to_componentB={
+            # Cl-H not mapped, all others one-to-one
+            1: 1,
+            2: 2,
+            3: 3,
+            4: 4,
+            5: 5,
+            6: 6,
+            7: 7,
+        },
+    )
+
+
+@pytest.fixture(scope="module")
+def chloroethane_to_fluoroethane_mapping(chloroethane, fluoroethane):
+    """Return a mapping from chloroethane to fluoroethane."""
+    return LigandAtomMapping(
+        componentA=chloroethane,
+        componentB=fluoroethane,
+        componentA_to_componentB={
+            # perfect one-to-one mapping
+            0: 0,
+            1: 1,
+            2: 2,
+            3: 3,
+            4: 4,
+            5: 5,
+            6: 6,
+            7: 7,
+        },
+    )
+
+
+@pytest.fixture(scope="module")
+def chlorobenzene_to_benzene_mapping(chlorobenzene, benzene):
+    """Return a mapping from chlorobenzene to benzene."""
+    return LigandAtomMapping(
+        componentA=chlorobenzene,
+        componentB=benzene,
+        componentA_to_componentB={
+            # Cl-H not mapped, all others one-to-one
+            1: 1,
+            2: 2,
+            3: 3,
+            4: 4,
+            5: 5,
+            6: 6,
+            7: 7,
+            8: 8,
+            9: 9,
+            10: 10,
+            11: 11,
+        },
+    )
+
+
+@pytest.fixture(scope="module")
+def t4_lysozyme_solvated():
+    """Load the T4 lysozyme L99A structure and solvent from the pdb file."""
+    with resources.as_file(resources.files("openfe.tests.data.htf")) as f:
+        with gzip.open(f / "t4_lysozyme_data" / "t4_lysozyme_solvated.pdb.gz", "rb") as gzf:
+            yield ProteinComponent.from_pdb_file(gzf)
+
+
+def apply_box_vectors_and_fix_nb_force(
+    hybrid_topology_factory: HybridTopologyFactory, force_field: ForceField
+):
+    """
+    Edit the systems in the hybrid topology factory to have the correct box vectors and nonbonded force settings for the T4 lysozyme system.
+    """
+    hybrid_system = hybrid_topology_factory.hybrid_system
+    # as we use a pre-solvated system, we need to correct the nonbonded methods and cutoffs and set the box vectors
+    box_vectors = [
+        openmm.vec3.Vec3(x=6.90789161545809, y=0.0, z=0.0) * ommunit.nanometer,
+        openmm.vec3.Vec3(x=0.0, y=6.90789161545809, z=0.0) * ommunit.nanometer,
+        openmm.vec3.Vec3(x=3.453945807729045, y=3.453945807729045, z=4.88461700499211)
+        * ommunit.nanometer,
+    ]
+    hybrid_system.setDefaultPeriodicBoxVectors(*box_vectors)
+    for force in hybrid_system.getForces():
+        if isinstance(force, openmm.NonbondedForce):
+            force.setNonbondedMethod(openmm.NonbondedForce.PME)
+            force.setCutoffDistance(
+                force_field.get_parameter_handler("Electrostatics").cutoff.m_as(offunit.nanometer)
+                * ommunit.nanometer
+            )
+            force.setUseDispersionCorrection(False)
+            force.setUseSwitchingFunction(False)
+        elif isinstance(force, openmm.CustomNonbondedForce):
+            force.setCutoffDistance(
+                force_field.get_parameter_handler("Electrostatics").cutoff.m_as(offunit.nanometer)
+                * ommunit.nanometer
+            )
+            force.setNonbondedMethod(force.CutoffPeriodic)
+            force.setUseLongRangeCorrection(False)
+            force.setUseSwitchingFunction(False)
+
+    # make sure both end state systems have the same cutoff method and distance
+    for end_state in [hybrid_topology_factory._old_system, hybrid_topology_factory._new_system]:
+        end_state.setDefaultPeriodicBoxVectors(*box_vectors)
+        for force in end_state.getForces():
+            if isinstance(force, openmm.NonbondedForce):
+                force.setNonbondedMethod(openmm.NonbondedForce.PME)
+                force.setCutoffDistance(
+                    force_field.get_parameter_handler("Electrostatics").cutoff.m_as(
+                        offunit.nanometer
+                    )
+                    * ommunit.nanometer
+                )
+                force.setUseDispersionCorrection(False)
+                force.setUseSwitchingFunction(False)
+
+
+@pytest.fixture(scope="module")
+def htf_cmap_chlorobenzene_to_fluorobenzene(
+    chlorobenzene_to_fluorobenzene_mapping, t4_lysozyme_solvated
+):
+    """Generate the htf for chlorobenzene to fluorobenzene with a CMAP term."""
+    settings = RelativeHybridTopologyProtocol.default_settings()
+    small_ff = settings.forcefield_settings.small_molecule_forcefield
+    if ".offxml" not in small_ff:
+        small_ff += ".offxml"
+    ff = ForceField(small_ff)
+    # update the default force fields to include a force field with CMAP terms
+    settings.forcefield_settings.forcefields = [
+        "amber/protein.ff19SB.xml",  # cmap amber ff
+        "amber/tip3p_standard.xml",  # TIP3P and recommended monovalent ion parameters
+        "amber/tip3p_HFE_multivalent.xml",  # for divalent ions
+        "amber/phosaa19SB.xml",  # Handles THE TPO
+    ]
+    htf = make_htf(
+        mapping=chlorobenzene_to_fluorobenzene_mapping,
+        protein=t4_lysozyme_solvated,
+        settings=settings,
+    )
+    # apply box vectors and fix nonbonded force settings so we can use PME
+    apply_box_vectors_and_fix_nb_force(hybrid_topology_factory=htf, force_field=ff)
+    hybrid_system = htf.hybrid_system
+    forces = {force.getName(): force for force in hybrid_system.getForces()}
+
+    return {
+        "htf": htf,
+        "hybrid_system": hybrid_system,
+        "forces": forces,
+        "mapping": chlorobenzene_to_fluorobenzene_mapping,
+        "chlorobenzene": chlorobenzene_to_fluorobenzene_mapping.componentA,
+        "fluorobenzene": chlorobenzene_to_fluorobenzene_mapping.componentB,
+        "electrostatic_scale": ff.get_parameter_handler("Electrostatics").scale14,
+        "vdW_scale": ff.get_parameter_handler("vdW").scale14,
+        "force_field": ff,
+    }
+
+
+@pytest.fixture(scope="module")
+def htf_chloro_fluoroethane(chloroethane, fluoroethane, chloroethane_to_fluoroethane_mapping):
+    """Generate the htf for chloroethane to fluoroethane in vacuum."""
+    settings = RelativeHybridTopologyProtocol.default_settings()
+    small_ff = settings.forcefield_settings.small_molecule_forcefield
+    if ".offxml" not in small_ff:
+        small_ff += ".offxml"
+    ff = ForceField(small_ff)
+    chloro_openff = chloroethane.to_openff()
+    chloro_charges = chloro_openff.partial_charges.m_as(offunit.elementary_charge)
+    chloro_labels = ff.label_molecules(chloro_openff.to_topology())[0]
+    fluoro_openff = fluoroethane.to_openff()
+    fluoro_charges = fluoro_openff.partial_charges.m_as(offunit.elementary_charge)
+    fluoro_labels = ff.label_molecules(fluoro_openff.to_topology())[0]
+    htf = make_htf(mapping=chloroethane_to_fluoroethane_mapping, settings=settings)
+    hybrid_system = htf.hybrid_system
+    forces = {force.getName(): force for force in hybrid_system.getForces()}
+
+    return {
+        "htf": htf,
+        "hybrid_system": hybrid_system,
+        "forces": forces,
+        "chloro_labels": chloro_labels,
+        "fluoro_labels": fluoro_labels,
+        "mapping": chloroethane_to_fluoroethane_mapping,
+        "chloroethane": chloroethane,
+        "fluoroethane": fluoroethane,
+        "chloro_charges": chloro_charges,
+        "fluoro_charges": fluoro_charges,
+        "electrostatic_scale": ff.get_parameter_handler("Electrostatics").scale14,
+        "vdW_scale": ff.get_parameter_handler("vdW").scale14,
+        "force_field": ff,
+    }
+
+
+@pytest.fixture(scope="module")
+def htf_chloro_ethane(chloroethane, ethane, chloroethane_to_ethane_mapping):
+    """Generate the htf for chloroethane to ethane in vacuum."""
+    settings = RelativeHybridTopologyProtocol.default_settings()
+    small_ff = settings.forcefield_settings.small_molecule_forcefield
+    if ".offxml" not in small_ff:
+        small_ff += ".offxml"
+    ff = ForceField(small_ff)
+
+    chloro_openff = chloroethane.to_openff()
+    chloro_charges = chloro_openff.partial_charges.m_as(offunit.elementary_charge)
+    chloro_labels = ff.label_molecules(chloro_openff.to_topology())[0]
+    ethane_openff = ethane.to_openff()
+    ethane_charges = ethane_openff.partial_charges.m_as(offunit.elementary_charge)
+    ethane_labels = ff.label_molecules(ethane_openff.to_topology())[0]
+    htf = make_htf(mapping=chloroethane_to_ethane_mapping, settings=settings)
+    hybrid_system = htf.hybrid_system
+    forces = {force.getName(): force for force in hybrid_system.getForces()}
+
+    return {
+        "htf": htf,
+        "hybrid_system": hybrid_system,
+        "forces": forces,
+        "chloro_labels": chloro_labels,
+        "ethane_labels": ethane_labels,
+        "mapping": chloroethane_to_ethane_mapping,
+        "chloroethane": chloroethane,
+        "ethane": ethane,
+        "chloro_charges": chloro_charges,
+        "ethane_charges": ethane_charges,
+        "electrostatic_scale": ff.get_parameter_handler("Electrostatics").scale14,
+        "vdW_scale": ff.get_parameter_handler("vdW").scale14,
+        "force_field": ff,
+    }
+
+
+@pytest.fixture(scope="module")
+def htf_chlorobenzene_fluorobenzene(
+    chlorobenzene, fluorobenzene, chlorobenzene_to_fluorobenzene_mapping, t4_lysozyme_solvated
+):
+    """Generate the htf for chlorobenzene to fluorobenzene in complex with t4-lysozyme solvated."""
+    settings = RelativeHybridTopologyProtocol.default_settings()
+    small_ff = settings.forcefield_settings.small_molecule_forcefield
+    if ".offxml" not in small_ff:
+        small_ff += ".offxml"
+    ff = ForceField(small_ff)
+    chloro_openff = chlorobenzene.to_openff()
+    chloro_charges = chloro_openff.partial_charges.m_as(offunit.elementary_charge)
+    chloro_labels = ff.label_molecules(chloro_openff.to_topology())[0]
+    fluoro_openff = fluorobenzene.to_openff()
+    fluoro_charges = fluoro_openff.partial_charges.m_as(offunit.elementary_charge)
+    fluoro_labels = ff.label_molecules(fluoro_openff.to_topology())[0]
+    htf = make_htf(
+        mapping=chlorobenzene_to_fluorobenzene_mapping,
+        settings=settings,
+        protein=t4_lysozyme_solvated,
+    )
+    hybrid_system = htf.hybrid_system
+
+    apply_box_vectors_and_fix_nb_force(hybrid_topology_factory=htf, force_field=ff)
+
+    forces = {force.getName(): force for force in hybrid_system.getForces()}
+
+    return {
+        "htf": htf,
+        "hybrid_system": hybrid_system,
+        "forces": forces,
+        "chloro_labels": chloro_labels,
+        "fluoro_labels": fluoro_labels,
+        "mapping": chlorobenzene_to_fluorobenzene_mapping,
+        "chlorobenzene": chlorobenzene,
+        "fluorobenzene": fluorobenzene,
+        "chloro_charges": chloro_charges,
+        "fluoro_charges": fluoro_charges,
+        "electrostatic_scale": ff.get_parameter_handler("Electrostatics").scale14,
+        "vdW_scale": ff.get_parameter_handler("vdW").scale14,
+        "force_field": ff,
+    }
+
+
+@pytest.fixture(scope="module")
+def htf_chlorobenzene_benzene(
+    chlorobenzene, benzene, chlorobenzene_to_benzene_mapping, t4_lysozyme_solvated
+):
+    """Generate the htf for chlorobenzene to benzene with interpolate 1-4s on in complex with t4-lysozyme solvated."""
+    settings = RelativeHybridTopologyProtocol.default_settings()
+    small_ff = settings.forcefield_settings.small_molecule_forcefield
+    if ".offxml" not in small_ff:
+        small_ff += ".offxml"
+    ff = ForceField(small_ff)
+
+    chloro_openff = chlorobenzene.to_openff()
+    chloro_charges = chloro_openff.partial_charges.m_as(offunit.elementary_charge)
+    chloro_labels = ff.label_molecules(chloro_openff.to_topology())[0]
+    benzene_openff = benzene.to_openff()
+    benzene_charges = benzene_openff.partial_charges.m_as(offunit.elementary_charge)
+    benzene_labels = ff.label_molecules(benzene_openff.to_topology())[0]
+    htf = make_htf(
+        mapping=chlorobenzene_to_benzene_mapping, settings=settings, protein=t4_lysozyme_solvated
+    )
+    hybrid_system = htf.hybrid_system
+
+    apply_box_vectors_and_fix_nb_force(hybrid_topology_factory=htf, force_field=ff)
+
+    forces = {force.getName(): force for force in hybrid_system.getForces()}
+
+    return {
+        "htf": htf,
+        "hybrid_system": hybrid_system,
+        "forces": forces,
+        "chloro_labels": chloro_labels,
+        "benzene_labels": benzene_labels,
+        "mapping": chlorobenzene_to_benzene_mapping,
+        "chlorobenzene": chlorobenzene,
+        "benzene": benzene,
+        "chloro_charges": chloro_charges,
+        "benzene_charges": benzene_charges,
+        "electrostatic_scale": ff.get_parameter_handler("Electrostatics").scale14,
+        "vdW_scale": ff.get_parameter_handler("vdW").scale14,
+        "force_field": ff,
+    }
+
+
+@pytest.fixture()
+def broken_bond_mapping() -> LigandAtomMapping:
+    """Build a broken bond mapping for two pfkfb3 ligands"""
+    with resources.as_file(resources.files("openfe.tests.data")) as f:
+        supplier = Chem.SDMolSupplier(str(f / "pfkfb3_ligands.sdf"), removeHs=False)
+        mol_by_name = dict()
+        for mol in supplier:
+            smc = SmallMoleculeComponent(mol)
+            mol_by_name[smc.name] = smc
+
+    return LigandAtomMapping(
+        componentA=mol_by_name["47"],
+        componentB=mol_by_name["46"],
+        componentA_to_componentB={
+            29: 32,
+            30: 31,
+            31: 33,
+            32: 34,
+            33: 38,
+            34: 37,
+            36: 35,
+            37: 36,
+            38: 39,
+            39: 40,
+            40: 41,
+            41: 42,
+            42: 43,
+            43: 44,
+            0: 2,
+            1: 3,
+            2: 0,
+            3: 1,
+            4: 4,
+            5: 5,
+            6: 6,
+            7: 7,
+            8: 8,
+            9: 9,
+            10: 14,
+            11: 10,
+            12: 13,
+            13: 25,
+            14: 11,
+            15: 12,
+            16: 26,
+            17: 15,
+            18: 16,
+            19: 17,
+            20: 18,
+            21: 19,
+            22: 20,
+            23: 21,
+            24: 23,
+            25: 22,
+            26: 24,
+            27: 28,
+            28: 27,
+        },
+    )
+
+
+@pytest.fixture()
+def appearing_bond_mapping(chlorobenzene) -> LigandAtomMapping:
+    with resources.as_file(resources.files("openfe.tests.data")) as f:
+        ethyl_benzene = SmallMoleculeComponent.from_sdf_file(str(f / "ethylbenzene.sdf"))
+
+    # create a fake mapping which adds a new bond during the transformation by mapping the ethyl group to the chlorine atom in chlorobenzene
+    return LigandAtomMapping(
+        componentA=ethyl_benzene,
+        componentB=chlorobenzene,
+        componentA_to_componentB={5: 0, 7: 1, 8: 2, 9: 3, 10: 4, 11: 5, 12: 6},
+    )
+
+
+@pytest.fixture()
+def single_to_triple_bond_mapping() -> LigandAtomMapping:
+    # Create a mapping from the janssen bace dataset which has a single to triple bond transformation
+    with resources.as_file(resources.files("openfe.tests.data")) as f:
+        supplier = Chem.SDMolSupplier(str(f / "single_to_triple_mapping.sdf"), removeHs=False)
+        smcs = [SmallMoleculeComponent(m) for m in supplier if m is not None]
+
+        return LigandAtomMapping(
+            componentA=smcs[0],
+            componentB=smcs[1],
+            componentA_to_componentB={
+                31: 33,
+                32: 31,
+                33: 32,
+                36: 34,
+                37: 35,
+                38: 36,
+                39: 37,
+                40: 38,
+                41: 39,
+                42: 40,
+                43: 41,
+                44: 44,
+                45: 43,
+                46: 42,
+                47: 45,
+                48: 46,
+                49: 49,
+                50: 47,
+                51: 48,
+                52: 50,
+                53: 51,
+                54: 52,
+                0: 0,
+                1: 1,
+                2: 2,
+                3: 3,
+                4: 4,
+                5: 5,
+                6: 6,
+                7: 7,
+                8: 8,
+                9: 9,
+                10: 10,
+                11: 11,
+                12: 12,
+                13: 13,
+                14: 14,
+                15: 15,
+                16: 16,
+                17: 17,
+                18: 18,
+                19: 19,
+                20: 20,
+                21: 21,
+                22: 22,
+                23: 23,
+                24: 24,
+                25: 25,
+                26: 26,
+                27: 27,
+                28: 28,
+                29: 29,
+                30: 30,
+            },
+        )
+
+
+@pytest.fixture()
+def triple_to_single_bond_mapping(single_to_triple_bond_mapping) -> LigandAtomMapping:
+    # return the reverse mapping of the single to triple bond mapping
+    return LigandAtomMapping(
+        componentA=single_to_triple_bond_mapping.componentB,
+        componentB=single_to_triple_bond_mapping.componentA,
+        componentA_to_componentB=single_to_triple_bond_mapping.componentB_to_componentA,
+    )
+
+
+@pytest.fixture
+def solvent_kcl() -> SolventComponent:
+    yield SolventComponent(positive_ion="K", negative_ion="Cl", ion_concentration=0.0 * unit.molar)
+
+
+@pytest.fixture
+def toluene_complex_system(benzene_modifications, T4_protein_component) -> ChemicalSystem:
+    return openfe.ChemicalSystem(
+        {
+            "ligand": benzene_modifications["toluene"],
+            "solvent": openfe.SolventComponent(
+                positive_ion="Na", negative_ion="Cl", ion_concentration=0.15 * unit.molar
+            ),
+            "protein": T4_protein_component,
+        }
+    )
+
+
+@pytest.fixture
+def toluene_solvated(benzene_transforms, solvent_kcl) -> ChemicalSystem:
+    return ChemicalSystem(
+        {
+            "ligand": benzene_transforms["toluene"],
+            "solvent": solvent_kcl,
+        }
+    )
+
+
+@pytest.fixture
+def dummy_abfe_transformation(toluene_solvated, toluene_complex_system) -> Transformation:
+    return Transformation(
+        toluene_solvated,
+        toluene_complex_system,
+        protocol=DummyProtocol(settings=DummyProtocol.default_settings()),
+        mapping=None,
+    )
+
+
+@pytest.fixture
+def dummy_nontransformation(toluene_complex_system) -> NonTransformation:
+    return NonTransformation(
+        toluene_complex_system,
+        protocol=DummyProtocol(settings=DummyProtocol.default_settings()),
+    )
+
+
+@pytest.fixture
+def radial_alchemical_network(
+    benzene_transforms, solvent_kcl, T4_protein_component
+) -> AlchemicalNetwork:
+    variants = ["toluene", "phenol", "benzonitrile", "anisole", "benzaldehyde", "styrene"]
+
+    # define the solvent chemical systems and transformations between
+    # benzene and the others
+    toluene_solvateds = {}
+    toluene_solvated_transformations = {}
+
+    toluene_solvateds["benzene"] = ChemicalSystem(
+        {
+            "solvent": solvent_kcl,
+            "ligand": benzene_transforms["benzene"],
+        },
+        name="benzene-solvent",
+    )
+
+    for ligand in variants:
+        toluene_solvateds[ligand] = ChemicalSystem(
+            {
+                "solvent": solvent_kcl,
+                "ligand": benzene_transforms[ligand],
+            },
+            name=f"{ligand}-solvent",
+        )
+
+        toluene_solvated_transformations[("benzene", ligand)] = gufe.Transformation(
+            toluene_solvateds["benzene"],
+            toluene_solvateds[ligand],
+            protocol=DummyProtocol(settings=DummyProtocol.default_settings()),
+            mapping=None,
+        )
+
+    # define the complex chemical systems and transformations between
+    # benzene and the others
+    solvated_complexes = {}
+    solvated_complex_transformations = {}
+
+    solvated_complexes["benzene"] = gufe.ChemicalSystem(
+        {
+            "protein": T4_protein_component,
+            "solvent": solvent_kcl,
+            "ligand": benzene_transforms["benzene"],
+        },
+        name="benzene-complex",
+    )
+
+    for ligand in variants:
+        solvated_complexes[ligand] = gufe.ChemicalSystem(
+            {
+                "protein": T4_protein_component,
+                "solvent": solvent_kcl,
+                "ligand": benzene_transforms[ligand],
+            },
+            name=f"{ligand}-complex",
+        )
+        solvated_complex_transformations[("benzene", ligand)] = gufe.Transformation(
+            solvated_complexes["benzene"],
+            solvated_complexes[ligand],
+            protocol=DummyProtocol(settings=DummyProtocol.default_settings()),
+            mapping=None,
+        )
+
+    return AlchemicalNetwork(
+        list(toluene_solvated_transformations.values())
+        + list(solvated_complex_transformations.values())
+    )

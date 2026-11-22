@@ -1,6 +1,6 @@
 [project]
 name = "foldmatch"
-version = "0.12.0"
+version = "0.13.0"
 authors = [
     { name="Joan Segura", email="joan.segura@rcsb.org" },
 ]
@@ -28,6 +28,13 @@ dependencies=[
     "igraph==1.0.0",
     "pyarrow==24.0.0",
     "threadpoolctl==3.6.0",
+]
+
+[project.optional-dependencies]
+# NetworKit ParallelLeiden, fm-search cluster --leiden-backend networkit (11.2 has no GraphFromCsr). Wheels for Linux
+# x86_64, macOS 26 arm64 and Windows; none for Linux aarch64 or macOS before 26, and no sdist.
+networkit = [
+    "networkit==11.3",
 ]
 
 [project.urls]

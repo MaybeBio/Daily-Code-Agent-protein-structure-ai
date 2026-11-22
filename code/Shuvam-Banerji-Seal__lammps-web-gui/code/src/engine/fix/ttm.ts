@@ -1,0 +1,582 @@
+import { Fix } from './fix';
+import { potentialFile, StyleError } from '../force/types';
+import type { System } from '../system';
+import { RanMars } from '../rng';
+import { nativeOrder } from '../atoms';
+import { inumeric, missingArgs, numeric } from '../force/util';
+
+/*
+ * fix ttm and fix ttm/grid — the two-temperature model. Written from the
+ * documented behaviour (docs.lammps.org/fix_ttm.html, plans/lammps-docs/
+ * fix_ttm.rst) and from black-box measurements with native LAMMPS (the
+ * binary run on synthetic inputs). No LAMMPS source was consulted.
+ *
+ * Syntax: "fix ID group-ID ttm seed C_e rho_e kappa_e gamma_p gamma_s v_0 Nx
+ * Ny Nz keyword value ..." ; ttm/grid takes the same arguments. Keywords:
+ * set Tinit, infile file, outfile Nout file (ttm only).
+ *
+ * Model. The electron grid is an Nx x Ny x Nz cell array over the box. Each
+ * end of step the grid is advanced by the heat diffusion equation of the doc's
+ * Description (C_e rho_e dT_e/dt = div(kappa_e grad T_e) - g_p (T_e - T_a) +
+ * g_s T_a', with the friction and stopping terms below), and the coupling to the atoms is an inhomogeneous Langevin force per atom
+ * with the electron temperature of the atom's cell:
+ *   F_i = -gamma_p v_i [mvv2e] + g2 (u - 1/2) + F_stop
+ *   F_stop = -gamma_s v_i [mvv2e] when |v_i| > v_0 (electronic stopping), else 0
+ *   g2 = sqrt(24 gamma_p kB T_e / (mvv2e dt)) / ftm2v, u uniform on [0,1)
+ * with v_i the half-step velocity at the force evaluation.
+ *
+ * Measured with native LAMMPS (black box, one-atom and eight-atom runs with
+ * thermo and per-step dumps, seed 4242):
+ *  - the first RanMars draw is discarded at fix creation, then three draws per
+ *    group atom in native storage order (x, y, z), exactly as fix langevin does;
+ *  - the random and friction forces above reproduce the native forces to 1e-10
+ *    relative (uniform -0.5 scaling, no mass dependence of the random amplitude);
+ *  - there is no fix force at setup (step 0 forces are zero);
+ *  - the stopping force switches on at |v| > v_0 and is -gamma_s v (measured
+ *    for speeds 1.6 .. 5.2 with v_0 = 2.2);
+ *  - the energy handed from electrons to atoms on a step is
+ *    f_2[2] = sum_i F_i . v_i(end of step) dt, and the electron energy
+ *    E = C_e rho_e V_cell T_e (summed over cells) falls by that amount;
+ *    f_2[1] = total electron energy, f_2[2] = that step's transfer;
+ *  - the diffusion step is explicit FTCS on the cell grid with periodic wrap;
+ *    the outfile written at step n is the grid after the end-of-step update;
+ *  - with a step too large for explicit FTCS native splits the step into k
+ *    equal sub-steps; with C = dt kappa/(C_e rho_e) sum_d 1/(L_d/N_d)^2 the
+ *    measured count is k = 1 for C <= 1/2 and k = floor(2C) + 1 above (checked
+ *    at C = 0.25 .. 3.0 on two box shapes);
+ *  - gamma_p = 0 is an error in native LAMMPS (so gamma_p must be > 0);
+ *  - an infile with a UNITS: tag that differs from the run's units is an
+ *    error; a file without the tag is read; a duplicate or missing grid index
+ *    is an error; a negative temperature is an error; the set keyword with a
+ *    value of 0 is an error; with both set and infile the infile values are kept;
+ *  - outfile writes the file <name>.<step> every Nout steps (step 0 is not
+ *    written): a header line # DATE: ... UNITS: <units> COMMENT: Electron
+ *    temperature on NxxNyxNz grid at step <step> - created by fix ttm, then one
+ *    line ix iy iz T per grid point.
+ *
+ * Quoted doc sentences (docs.lammps.org/fix_ttm.html):
+ *  "The input file is a text file which may have comments starting with the '#' character."
+ *  "The lines can appear in any order."
+ *  "If all the grid point values are not specified, LAMMPS will generate an error."
+ *  "The fix ttm/grid command does not support the *outfile* keyword."
+ *  "These fixes require use of an orthogonal 3d simulation box with periodic boundary conditions in all dimensions."
+ *  "They also require that the size and shape of the simulation box do not vary"
+ *  "The vector values calculated are \"extensive\"."
+ *  "The first quantity is the total energy of the electronic subsystem."
+ *  "The second quantity is the energy transferred from the electronic to the atomic subsystem on that timestep."
+ */
+
+/** %.16g, as the outfile values are written (no exponent for the temperature range used here). */
+const fmt16g = (x: number): string => {
+  if (x === 0) return '0';
+  const s = x.toPrecision(16);
+  if (s.includes('e')) return Number(s).toPrecision(16).replace(/\.?0+e/, 'e');
+  return s.includes('.') ? s.replace(/\.?0+$/, '') : s;
+};
+
+/** Stability: sub-steps needed for explicit FTCS, from the measured rule (see header). */
+export const substepCount = (C: number): number => (C <= 0.5 + 1e-12 ? 1 : Math.floor(2 * C + 1e-9) + 1);
+
+export interface TtmParams {
+  seed: number;
+  Ce: number;
+  rhoE: number;
+  kappa: number;
+  gammaP: number;
+  gammaS: number;
+  v0: number;
+  nx: number;
+  ny: number;
+  nz: number;
+}
+
+/** Parses the common argument list of fix ttm and fix ttm/grid. */
+export const parseTtmArgs = (id: string, style: string, args: string[]): TtmParams => {
+  // As native LAMMPS does (src/EXTRA-FIX/fix_ttm.cpp at b332f28)
+  if (args.length < 10) throw missingArgs(`fix ${style}`);
+  // As native LAMMPS does (src/EXTRA-FIX/fix_ttm.cpp FixTTM::FixTTM at b332f28): the seed and grid sizes are read with
+  // utils::inumeric and the other values with utils::numeric
+  return {
+    seed: inumeric(args[0]),
+    Ce: numeric(args[1]),
+    rhoE: numeric(args[2]),
+    kappa: numeric(args[3]),
+    gammaP: numeric(args[4]),
+    gammaS: numeric(args[5]),
+    v0: numeric(args[6]),
+    nx: inumeric(args[7]),
+    ny: inumeric(args[8]),
+    nz: inumeric(args[9]),
+  };
+};
+
+/**
+ * The value checks of fix ttm, ttm/grid and ttm/cascade, made after the keywords have been read, as native LAMMPS does
+ * (src/EXTRA-FIX/fix_ttm.cpp FixTTM::FixTTM at b332f28, "error check").
+ */
+export const checkTtmArgs = (style: string, p: TtmParams): void => {
+  if (p.seed <= 0) throw new StyleError(`Invalid random number seed in fix ${style} command`);
+  if (p.Ce <= 0) throw new StyleError(`Fix ${style} electronic_specific_heat must be > 0.0`);
+  if (p.rhoE <= 0) throw new StyleError(`Fix ${style} electronic_density must be > 0.0`);
+  if (p.kappa < 0) throw new StyleError(`Fix ${style} electronic_thermal_conductivity must be >= 0.0`);
+  if (p.gammaP <= 0) throw new StyleError(`Fix ${style} gamma_p must be > 0.0`);
+  if (p.gammaS < 0) throw new StyleError(`Fix ${style} gamma_s must be >= 0.0`);
+  if (p.v0 < 0) throw new StyleError(`Fix ${style} v_0 must be >= 0.0`);
+  if (p.nx <= 0 || p.ny <= 0 || p.nz <= 0) throw new StyleError(`Fix ${style} grid sizes must be all > 0`);
+};
+
+/** A style-specific keyword: returns the number of arguments it consumed, or 0 when the key is not its own. */
+export type TtmKeywordHandler = (key: string, args: string[], i: number) => number;
+
+/**
+ * Keywords after the required arguments. Returns the initial grid spec.
+ * Shared with fix ttm/mod, ttm/thermal and ttm/cascade; `extra` takes the keywords of the
+ * subclass styles. `outfileAllowed` is false for ttm/grid and ttm/cascade (the doc of fix ttm
+ * says: "The fix ttm/grid and fix ttm/cascade commands do not support the *outfile* keyword.").
+ */
+export interface TtmKeywords {
+  setT: number | null;
+  infile: string | null;
+  outNevery: number;
+  outfile: string | null;
+}
+
+export const parseTtmKeywords = (id: string, style: string, args: string[], outfileAllowed: boolean, extra?: TtmKeywordHandler): TtmKeywords => {
+  const k: TtmKeywords = { setT: null, infile: null, outNevery: 0, outfile: null };
+  for (let i = 0; i < args.length;) {
+    const key = args[i];
+    const used = extra ? extra(key, args, i) : 0;
+    if (used > 0) {
+      i += used;
+    } else if (key === 'set') {
+      // As native LAMMPS does (src/EXTRA-FIX/fix_ttm.cpp FixTTM::FixTTM at b332f28): if (iarg + 2 > narg) missing_cmd_args("fix {} set")
+      if (i + 2 > args.length) throw new StyleError(`Illegal fix ${style} set command: missing argument(s)`);
+      // As native LAMMPS does (src/EXTRA-FIX/fix_ttm.cpp at b332f28): utils::numeric, then Tinit > 0
+      const t = numeric(args[i + 1]);
+      if (t <= 0) throw new StyleError(`Fix ${style} initial temperature must be > 0.0`);
+      k.setT = t;
+      i += 2;
+    } else if (key === 'infile') {
+      // As native LAMMPS does (src/EXTRA-FIX/fix_ttm.cpp FixTTM::FixTTM at b332f28): if (iarg + 2 > narg) missing_cmd_args("fix {} infile")
+      if (i + 2 > args.length) throw new StyleError(`Illegal fix ${style} infile command: missing argument(s)`);
+      k.infile = args[i + 1];
+      i += 2;
+    } else if (key === 'outfile') {
+      if (!outfileAllowed) throw new StyleError(`fix ${id} ${style} does not support the outfile keyword (use dump grid or restart instead)`);
+      // As native LAMMPS does (src/EXTRA-FIX/fix_ttm.cpp FixTTM::FixTTM at b332f28): if (iarg + 3 > narg) missing_cmd_args("fix {} outfile")
+      if (i + 3 > args.length) throw new StyleError(`Illegal fix ${style} outfile command: missing argument(s)`);
+      const n = Number(args[i + 1]);
+      if (!Number.isInteger(n) || n < 1 || args[i + 2] === undefined) throw new StyleError(`fix ${id} ${style}: outfile needs Nout (positive integer) and a file name`);
+      k.outNevery = n;
+      k.outfile = args[i + 2];
+      i += 3;
+    } else {
+      // As native LAMMPS does (src/EXTRA-FIX/fix_ttm.cpp at b332f28): "Unknown fix {style} keyword {key}"
+      throw new StyleError(`Unknown fix ${style} keyword ${key}`);
+    }
+  }
+  return k;
+};
+
+/**
+ * Reads the infile grid: "Each line contains four numeric columns: ix,iy,iz,Temperature."
+ * Returns one temperature per grid point (x fastest).
+ */
+export const parseTtmInfile = (text: string, id: string, style: string, nx: number, ny: number, nz: number, units: string, fname: string): Float64Array => {
+  const lines = text.split('\n');
+  const first = lines[0] ?? '';
+  const tag = /UNITS:\s*(\S+)/.exec(first);
+  if (tag && tag[1] !== units) {
+    throw new StyleError(`fix ${id} ${style}: infile ${fname} was written for units ${tag[1]} but ${units} units are in use`);
+  }
+  const n = nx * ny * nz;
+  const out = new Float64Array(n);
+  const seen = new Uint8Array(n);
+  for (const raw of lines) {
+    const line = raw.replace(/#.*/, '').trim();
+    if (!line) continue;
+    const w = line.split(/\s+/);
+    if (w.length < 4) throw new StyleError(`fix ${id} ${style}: infile ${fname} line needs ix iy iz T: '${raw.trim()}'`);
+    const ix = Number(w[0]), iy = Number(w[1]), iz = Number(w[2]), t = Number(w[3]);
+    if (![ix, iy, iz, t].every(Number.isFinite)) throw new StyleError(`fix ${id} ${style}: infile ${fname} has a non-numeric entry: '${raw.trim()}'`);
+    if (!Number.isInteger(ix) || !Number.isInteger(iy) || !Number.isInteger(iz) || ix < 1 || ix > nx || iy < 1 || iy > ny || iz < 1 || iz > nz) {
+      throw new StyleError(`fix ${id} ${style}: infile ${fname} grid index out of range: '${raw.trim()}'`);
+    }
+    if (t < 0) throw new StyleError(`fix ${id} ${style}: infile ${fname} electron temperatures must not be negative`);
+    const c = (ix - 1) + nx * ((iy - 1) + ny * (iz - 1));
+    if (seen[c]) throw new StyleError(`fix ${id} ${style}: infile ${fname} sets grid point ${ix} ${iy} ${iz} twice`);
+    seen[c] = 1;
+    out[c] = t;
+  }
+  for (let c = 0; c < n; c++) {
+    if (!seen[c]) throw new StyleError(`fix ${id} ${style}: infile ${fname} did not set all ${nx}x${ny}x${nz} grid temperatures`);
+  }
+  return out;
+};
+
+/** Grid and seed of a ttm-family fix (every style has them). */
+export interface TtmGrid {
+  seed: number;
+  nx: number;
+  ny: number;
+  nz: number;
+}
+
+/**
+ * The positional part of a ttm-family command: the grid and seed, the scalar parameters of fix ttm
+ * (null for ttm/thermal, whose per-cell properties come from its properties file), how many arguments
+ * it took, and `data`, the style's own keyword results (filled by the keyword handler before the fix
+ * object is built).
+ */
+export interface TtmPositional extends TtmGrid {
+  consumed: number;
+  scalar: TtmParams | null;
+  /** The style's value checks, made after its keywords (native's "error check" follows the keyword loop). */
+  check: () => void;
+}
+
+/** The ttm positional arguments (ttm, ttm/grid, ttm/cascade): seed C_e rho_e kappa_e gamma_p gamma_s v_0 Nx Ny Nz. */
+export const ttmPositional = (id: string, style: string, args: string[]): TtmPositional => {
+  const scalar = parseTtmArgs(id, style, args);
+  return { seed: scalar.seed, nx: scalar.nx, ny: scalar.ny, nz: scalar.nz, consumed: 10, scalar, check: () => checkTtmArgs(style, scalar) };
+};
+
+export type TtmStyle = 'ttm' | 'ttm/grid' | 'ttm/mod' | 'ttm/thermal' | 'ttm/cascade';
+
+/**
+ * fix ttm and fix ttm/grid (identical in a serial run: the grid is simply stored once, see the header),
+ * and the base of fix ttm/thermal and fix ttm/cascade (ttm/thermal.ts, ttm/cascade.ts). The style supplies
+ * the per-cell electron properties through the hooks below; the defaults are the uniform ttm model.
+ *
+ * Hooks, all per grid cell c with electron temperature T (the cell's current value):
+ *  - cvolAt: volumetric heat capacity (energy / (temperature volume));
+ *  - energyAt: energy of the cell's electrons (the total the vector output sums);
+ *  - kappaAt: electron thermal conductivity; pairKappa: the conductance used for the flow between
+ *    cell c (conductivity kc) and a neighbour (conductivity kj);
+ *  - gammaPFor / gammaSFor: the friction coefficients of an atom in cell c with speed `speed`;
+ *  - vacuum: a cell whose electrons are absent (it exchanges no energy and holds no coupling);
+ *  - sourceAt: volumetric heating of the electrons (energy / (time volume)), per cell.
+ */
+export class FixTTM extends Fix {
+  readonly style: TtmStyle;
+  vectorFlag = true;
+  sizeVector = 2;
+  extvector = 1;
+
+  protected readonly p: TtmGrid;
+  /** The scalar ttm parameters (null for ttm/thermal). */
+  protected readonly scalar: TtmParams | null;
+  protected readonly kw: TtmKeywords;
+  protected Te: Float64Array;
+  protected readonly cellVolume: number;
+  protected readonly rng: RanMars;
+  /** The fix force of the current step per atom (3N), kept for the energy tally. */
+  protected fl: Float64Array;
+  /** Native storage order (physical atom index per slot) when fl was computed. */
+  protected flOrder = new Int32Array(0);
+  protected lastTransfer = 0;
+  /** Outfile line order: the base styles write x fastest; fix ttm/mod writes z fastest (measured with native LAMMPS). */
+  protected outfileZFastest = false;
+
+  /**
+   * `pos` lets a subclass parse its own positional arguments (before this constructor runs, from the
+   * same args); `keywords` handles the subclass keywords. Subclasses read what their handlers collected
+   * only after super() returns.
+   */
+  constructor(sys: System, id: string, group: string, args: string[], style: TtmStyle = 'ttm', pos?: TtmPositional, keywords?: TtmKeywordHandler) {
+    super(sys, id, group, args);
+    this.style = style;
+    const s = sys.state;
+    if (s.dimension !== 3) throw new StyleError(`fix ${id} ${style} requires a 3d simulation`);
+    if (s.box.triclinic) throw new StyleError(`fix ${id} ${style} requires an orthogonal box (triclinic boxes are not supported)`);
+    if (!s.box.periodic.every(Boolean)) throw new StyleError(`fix ${id} ${style} requires periodic boundaries in all dimensions`);
+    const P = pos ?? ttmPositional(id, style, args);
+    this.p = { seed: P.seed, nx: P.nx, ny: P.ny, nz: P.nz };
+    this.scalar = P.scalar;
+    this.kw = parseTtmKeywords(id, style, args.slice(P.consumed), style === 'ttm' || style === 'ttm/thermal' || style === 'ttm/mod', keywords);
+    P.check();
+    const nGrid = this.p.nx * this.p.ny * this.p.nz;
+    const lx = s.box.hi[0] - s.box.lo[0], ly = s.box.hi[1] - s.box.lo[1], lz = s.box.hi[2] - s.box.lo[2];
+    this.cellVolume = (lx / this.p.nx) * (ly / this.p.ny) * (lz / this.p.nz);
+    this.Te = new Float64Array(nGrid);
+    if (this.kw.infile !== null) {
+      this.Te = parseTtmInfile(sys.readFile(this.kw.infile, style === 'ttm/grid' || style === 'ttm/cascade'
+        // fix_ttm_grid.cpp read_electron_temperatures (also for ttm/cascade); fix_ttm.cpp for ttm and ttm/thermal
+        ? (n, r) => `Cannot open grid file: ${n}: ${r}` : potentialFile('electron temperature grid')), id, style, this.p.nx, this.p.ny, this.p.nz, s.units.style, this.kw.infile);
+    } else if (this.kw.setT !== null) {
+      this.Te.fill(this.kw.setT);
+    }
+    // fix_ttm.html: "The fix ttm/grid and fix ttm/cascade commands also output a per-grid vector which stores the
+    // electron temperature for each grid cell" ... "the name of the single grid produced by fix ttm/grid is "grid".
+    // The name of its per-grid data is "data"." (grid.ts); it is valid on every step
+    if (style === 'ttm/grid' || style === 'ttm/cascade') this.pergridFlag = true;
+    // Measured with native LAMMPS (black box): the first draw of the generator is discarded at creation.
+    this.rng = new RanMars(this.p.seed);
+    this.rng.uniform();
+    this.fl = new Float64Array(0);
+  }
+
+  // ---- per-cell hooks (uniform ttm model) -------------------------------------------------------
+
+  /** Volumetric heat capacity C_e rho_e of the uniform ttm model. */
+  protected cvolAt(_c: number, _T: number): number {
+    return this.uniform().Ce * this.uniform().rhoE;
+  }
+
+  /** Energy of one cell: volume times the integral of the volumetric heat capacity from 0 to T. */
+  protected energyAt(c: number, T: number): number {
+    return this.cellVolume * this.cvolAt(c, T) * T;
+  }
+
+  protected kappaAt(_c: number, _T: number): number {
+    return this.uniform().kappa;
+  }
+
+  /** The uniform model has one conductivity, so both ends of a pair give the same value. */
+  protected pairKappa(kc: number, _kj: number): number {
+    return kc;
+  }
+
+  protected gammaPFor(_c: number, _speed: number): number {
+    return this.uniform().gammaP;
+  }
+
+  /** Electronic stopping friction coefficient for an atom of the given speed (0 when it does not apply). */
+  protected gammaSFor(speed: number): number {
+    const u = this.uniform();
+    return speed > u.v0 ? u.gammaS : 0;
+  }
+
+  /** Cells without electrons: none in the uniform model. */
+  protected vacuum(_c: number): boolean {
+    return false;
+  }
+
+  protected sourceAt(_c: number): number {
+    return 0;
+  }
+
+  /** Cells whose atoms take no electron-ion coupling (no force, no random draw). Defaults to the empty cells. */
+  protected uncoupled(c: number): boolean {
+    return this.vacuum(c);
+  }
+
+  protected uniform(): TtmParams {
+    if (this.scalar === null) throw new StyleError(`fix ${this.id} ${this.style}: internal error (no scalar parameters)`);
+    return this.scalar;
+  }
+
+  /** Grid index of an atom (periodic wrap, x fastest). */
+  protected cellOf(i: number): number {
+    const s = this.sys.state;
+    const { nx, ny, nz } = this.p;
+    const cell = (x: number, lo: number, len: number, n: number): number => {
+      let f = (x - lo) / len;
+      f -= Math.floor(f);
+      return Math.min(n - 1, Math.max(0, Math.floor(f * n)));
+    };
+    const ix = cell(s.x[3 * i], s.box.lo[0], s.box.hi[0] - s.box.lo[0], nx);
+    const iy = cell(s.x[3 * i + 1], s.box.lo[1], s.box.hi[1] - s.box.lo[1], ny);
+    const iz = cell(s.x[3 * i + 2], s.box.lo[2], s.box.hi[2] - s.box.lo[2], nz);
+    return ix + nx * (iy + ny * iz);
+  }
+
+  /**
+   * Native LAMMPS adds no new fix force on the setup step (measured: step 0 forces are zero). A later run
+   * keeps the fix force of the previous step, but by storage slot: the first half-kick of the second run
+   * applies the force of slot k to whatever atom now occupies slot k, because the setup sort reorders
+   * the atoms (measured with native LAMMPS, 8 atoms, dt 0.2: the implied kick of atom i equals the step-3
+   * force of the atom that was in its slot before the sort; the same test on one atom gives the force
+   * of that atom). So setup adds the stored per-slot force, not a fresh draw and not the force of the
+   * atom itself.
+   */
+  gridByName(name: string): number { return this.pergridFlag && name === 'grid' ? 0 : -1; }
+  gridSize(_igrid: number): [number, number, number] { return [this.p.nx, this.p.ny, this.p.nz]; }
+  griddataByName(igrid: number, name: string): { index: number; ncol: number } | null {
+    return this.pergridFlag && igrid === 0 && name === 'data' ? { index: 0, ncol: 0 } : null;
+  }
+  griddata(_index: number): Float64Array { return this.Te; }
+
+  setup(): void {
+    if (this.fl.length === 0) return;
+    const s = this.sys.state;
+    if (this.flOrder.length !== s.n) {
+      throw new StyleError(`fix ${this.id} ${this.style}: atoms were added or deleted between runs (carry-over of the last force is not supported)`);
+    }
+    const ord = nativeOrder(s);
+    for (let k = 0; k < s.n; k++) {
+      const i = ord[k], j = this.flOrder[k];
+      if (!(s.mask[i] & this.groupBit)) continue;
+      s.f[3 * i] += this.fl[3 * j]; s.f[3 * i + 1] += this.fl[3 * j + 1]; s.f[3 * i + 2] += this.fl[3 * j + 2];
+    }
+  }
+
+  postForce(): void {
+    const s = this.sys.state;
+    const u = s.units;
+    const { f, v, mask } = s;
+    if (this.fl.length !== 3 * s.n) this.fl = new Float64Array(3 * s.n);
+    this.flOrder = Int32Array.from(nativeOrder(s));
+    for (const i of nativeOrder(s)) {
+      if (!(mask[i] & this.groupBit)) continue;
+      const cell = this.cellOf(i);
+      // Measured with native LAMMPS (black box): an atom in a cell without electrons gets no force and draws no random number
+      // (the next atom takes the draws the empty-cell atom would have used).
+      if (this.uncoupled(cell)) {
+        this.fl[3 * i] = 0; this.fl[3 * i + 1] = 0; this.fl[3 * i + 2] = 0;
+        continue;
+      }
+      const T = this.Te[cell];
+      const vx = v[3 * i], vy = v[3 * i + 1], vz = v[3 * i + 2];
+      const speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
+      const gammaP = this.gammaPFor(cell, speed);
+      // g1 multiplies v (friction), g2 scales the uniform deviate (see header)
+      const g1 = -gammaP / u.ftm2v;
+      const g2 = Math.sqrt((24 * gammaP * u.boltz * T) / (u.mvv2e * s.dt)) / u.ftm2v;
+      const gammaS = this.gammaSFor(speed);
+      const stop = gammaS !== 0 ? -gammaS / u.ftm2v : 0;
+      const rx = g2 * (this.rng.uniform() - 0.5);
+      const ry = g2 * (this.rng.uniform() - 0.5);
+      const rz = g2 * (this.rng.uniform() - 0.5);
+      const fx = g1 * vx + stop * vx + rx;
+      const fy = g1 * vy + stop * vy + ry;
+      const fz = g1 * vz + stop * vz + rz;
+      f[3 * i] += fx; f[3 * i + 1] += fy; f[3 * i + 2] += fz;
+      this.fl[3 * i] = fx; this.fl[3 * i + 1] = fy; this.fl[3 * i + 2] = fz;
+    }
+  }
+
+  endOfStep(): void {
+    const s = this.sys.state;
+    const cells = this.p.nx * this.p.ny * this.p.nz;
+    // energy handed to the atoms this step: sum F . v dt over the group, per cell
+    const transfer = new Float64Array(cells);
+    for (let i = 0; i < s.n; i++) {
+      if (!(s.mask[i] & this.groupBit)) continue;
+      const dE = (this.fl[3 * i] * s.v[3 * i] + this.fl[3 * i + 1] * s.v[3 * i + 1] + this.fl[3 * i + 2] * s.v[3 * i + 2]) * s.dt;
+      transfer[this.cellOf(i)] += dE;
+    }
+    let total = 0;
+    for (let c = 0; c < cells; c++) total += transfer[c];
+    this.lastTransfer = total;
+    this.advance(transfer);
+    if (this.kw.outfile !== null && s.step % this.kw.outNevery === 0) this.writeGrid(s.step);
+  }
+
+  /** Wrapped grid index of cell (ix, iy, iz) (periodic in each direction). */
+  protected wrapIndex(ix: number, iy: number, iz: number): number {
+    const { nx, ny, nz } = this.p;
+    return ((ix + nx) % nx) + nx * (((iy + ny) % ny) + ny * ((iz + nz) % nz));
+  }
+
+  /**
+   * The diffusion term of one cell, the sum over its six face neighbours of the conductance times the
+   * temperature difference over dx^2 (the pairwise form used by fix ttm and ttm/thermal). `kc` is the
+   * conductivity of the cell, `t` its electron temperature. Empty cells (see vacuum) exchange nothing.
+   */
+  protected flowInto(ix: number, iy: number, iz: number, t: number, kc: number): number {
+    const { nx, ny, nz } = this.p;
+    const s = this.sys.state;
+    const lx = (s.box.hi[0] - s.box.lo[0]) / nx, ly = (s.box.hi[1] - s.box.lo[1]) / ny, lz = (s.box.hi[2] - s.box.lo[2]) / nz;
+    const nb: [number, number][] = [
+      [this.wrapIndex(ix + 1, iy, iz), 1 / (lx * lx)], [this.wrapIndex(ix - 1, iy, iz), 1 / (lx * lx)],
+      [this.wrapIndex(ix, iy + 1, iz), 1 / (ly * ly)], [this.wrapIndex(ix, iy - 1, iz), 1 / (ly * ly)],
+      [this.wrapIndex(ix, iy, iz + 1), 1 / (lz * lz)], [this.wrapIndex(ix, iy, iz - 1), 1 / (lz * lz)],
+    ];
+    let flux = 0;
+    for (const [j, w] of nb) {
+      if (this.vacuum(j)) continue;
+      const tj = this.Te[j];
+      flux += this.pairKappa(kc, this.kappaAt(j, tj)) * (tj - t) * w;
+    }
+    return flux;
+  }
+
+  /**
+   * One end-of-step update of the electron grid: the heat diffusion equation solved explicitly (FTCS,
+   * periodic), split into k sub-steps when needed (see header). Each sub-step also removes its share
+   * transfer/k of the energy handed to the atoms. Measured with native LAMMPS (black box, a k = 2 step
+   * with coupling on, outfile compared cell by cell): the share goes in every sub-step; putting the whole
+   * transfer before or after the diffusion does not reproduce the native grid.
+   *
+   * The sub-step count uses the largest kappa/C_v over all cells (vacuum cells included), with the
+   * values at the start of the step: measured with native LAMMPS (black box, ttm/thermal with per-cell
+   * properties and ttm/cascade with tables), the count is the one of this rule with that maximum.
+   * The source of ttm/thermal enters each sub-step with the sub-step length (measured: the source term is
+   * added in every sub-step, not once with the full step).
+   */
+  protected advance(transfer: Float64Array): void {
+    const { nx, ny, nz } = this.p;
+    const s = this.sys.state;
+    const lx = (s.box.hi[0] - s.box.lo[0]) / nx, ly = (s.box.hi[1] - s.box.lo[1]) / ny, lz = (s.box.hi[2] - s.box.lo[2]) / nz;
+    const cells = nx * ny * nz;
+    let Dmax = 0;
+    for (let c = 0; c < cells; c++) {
+      const T = this.Te[c];
+      const D = this.kappaAt(c, T) / this.cvolAt(c, T);
+      if (D > Dmax) Dmax = D;
+    }
+    const C = s.dt * Dmax * (1 / (lx * lx) + 1 / (ly * ly) + 1 / (lz * lz));
+    const k = substepCount(C);
+    // a diffusion number this large cannot be stepped in reasonable time (it arises for vanishing heat capacity)
+    if (!(k <= 1e6)) throw new StyleError(`fix ${this.id} ${this.style}: the electron diffusion needs ${k} sub-steps per step (a heat capacity or conductivity is too extreme for the timestep)`);
+    const h = s.dt / k;
+    const next = new Float64Array(cells);
+    for (let sub = 0; sub < k; sub++) {
+      for (let iz = 0; iz < nz; iz++) {
+        for (let iy = 0; iy < ny; iy++) {
+          for (let ix = 0; ix < nx; ix++) {
+            const c = this.wrapIndex(ix, iy, iz);
+            const t = this.Te[c];
+            if (this.vacuum(c)) { next[c] = t; continue; }
+            const kc = this.kappaAt(c, t);
+            const cv = this.cvolAt(c, t);
+            const flux = this.flowInto(ix, iy, iz, t, kc);
+            next[c] = t + h * flux / cv + h * this.sourceAt(c) / cv - transfer[c] / (this.cellVolume * cv * k);
+            // the coupling needs sqrt(T_e): a cell that cools below zero has no defined amplitude (native not measured)
+            if (!(next[c] >= 0)) throw new StyleError(`fix ${this.id} ${this.style}: electron temperature of grid cell ${c + 1} became negative`);
+          }
+        }
+      }
+      this.Te.set(next);
+    }
+  }
+
+  /** The text after COMMENT: in the outfile header line. */
+  protected outfileComment(step: number): string {
+    const { nx, ny, nz } = this.p;
+    return `Electron temperature on ${nx}x${ny}x${nz} grid at step ${step} - created by fix ${this.style}`;
+  }
+
+  /** Writes the grid in the infile layout (outfile "T.out.<step>"). */
+  protected writeGrid(step: number): void {
+    const { nx, ny, nz } = this.p;
+    const s = this.sys.state;
+    const date = new Date().toISOString().slice(0, 10);
+    const head = `# DATE: ${date} UNITS: ${s.units.style} COMMENT: ${this.outfileComment(step)}\n`;
+    const lines: string[] = [];
+    const put = (ix: number, iy: number, iz: number): void => {
+      lines.push(`${ix + 1} ${iy + 1} ${iz + 1} ${fmt16g(this.Te[ix + nx * (iy + ny * iz)])}`);
+    };
+    if (this.outfileZFastest) {
+      for (let ix = 0; ix < nx; ix++) for (let iy = 0; iy < ny; iy++) for (let iz = 0; iz < nz; iz++) put(ix, iy, iz);
+    } else {
+      for (let iz = 0; iz < nz; iz++) for (let iy = 0; iy < ny; iy++) for (let ix = 0; ix < nx; ix++) put(ix, iy, iz);
+    }
+    this.sys.writeFile(`${this.kw.outfile}.${step}`, head + lines.join('\n') + '\n', false);
+  }
+
+  computeVector(i: number): number {
+    if (i === 0) {
+      let e = 0;
+      for (let c = 0; c < this.Te.length; c++) e += this.energyAt(c, this.Te[c]);
+      return e;
+    }
+    if (i === 1) return this.lastTransfer;
+    throw new StyleError(`fix ${this.id} ${this.style}: vector index ${i + 1} out of range`);
+  }
+
+  boxChanged(): void {
+    throw new StyleError(`fix ${this.id} ${this.style}: the box size and shape must not change (fix npt, fix deform and the like are not supported)`);
+  }
+}

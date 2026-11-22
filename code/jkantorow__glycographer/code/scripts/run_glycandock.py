@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+
+'''
+Generate GlycanDock decoys for a receptor-glycoligand complex.
+
+This is a thin CLI over glycographer.sample; all of the protocol logic lives in
+the module. Two sampling modes, selected by --preset (or inferred from --grid):
+
+- probe       Glycographer grid-probe sampling. A sampling grid is supplied and
+              each decoy places the glycoligand fragment at one of the grid's
+              coordinates before docking, building up an ensemble across a
+              putative binding site.
+- refinement  Standard GlycanDock refinement of a known or designed complex.
+              Rosetta's GlycanDock has an effective docking range of ~7 A, so
+              the input pose is assumed to be near the true binding pose. The
+              glycoligand is not randomized, and the input must already be
+              prepacked (prepack_complex.py), as in the published workflow.
+
+Parallelism
+-----------
+A run of N decoys is split into blocks with --n-blocks; each process runs one
+block chosen by --block-index. Under SLURM both default from the array
+environment, so a 1000-decoy run across 42 tasks is just:
+
+    sbatch --array=0-41 scripts/slurm/run_glycandock.sh complex.pdb -n 1000 \
+        --grid grid.pdb --n-blocks 42
+
+Blocks partition the index range exactly, so tasks never collide on an output
+filename and no decoy is dropped. This replaces the manual --start-count-from
+submissions.
+
+Output
+------
+Each block is written as one <run_id>_block<NNN>.tar.xz holding its decoys
+plus its manifest and timings under meta/, instead of one file per decoy, to
+keep inode usage down (--loose-pdbs restores loose files). The analysis
+scripts read the archives directly. To fold a finished run into a single
+<run_id>.tar.xz, chain merge_glycandock_blocks.py after the array:
+
+    jid=$(sbatch --parsable --array=0-41 scripts/slurm/run_glycandock.sh ...)
+    sbatch --dependency=afterok:$jid scripts/slurm/merge_glycandock_blocks.sh <outdir>
+
+Use --dry-run to print the plan (block slices, seeds, output names, resolved
+config) without initializing Rosetta -- it works on machines without PyRosetta.
+'''
+
+import argparse
+import json
+import os
+import sys
+
+from glycographer.archive import block_archive_name, read_block_manifest
+from glycographer.sample import (
+    GlycanDockConfig, STAGE_1_2_OPTIONS, STAGE_2_OPTIONS,
+    block_seed, block_slice, check_options, check_setters, decoy_name,
+    default_outprefix, run_block,
+)
+
+
+def _env_int(name, default):
+    '''Read an integer from the environment, falling back if unset/garbage.'''
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f'Warning: ignoring non-integer {name}={raw!r}', file=sys.stderr)
+        return default
+
+
+def _block_outputs(outdir, outprefix, run_id, block_index, indices, archive):
+    '''Every file run_block would write for this block.'''
+    if archive:
+        return [os.path.join(outdir, block_archive_name(run_id, block_index))]
+    paths = [os.path.join(outdir, decoy_name(outprefix, i)) for i in indices]
+    paths.append(os.path.join(outdir, f'{run_id}_block{block_index:03d}_manifest.json'))
+    paths.append(os.path.join(outdir, f'{run_id}_block{block_index:03d}_timings.jsonl'))
+    return paths
+
+
+def _read_block_manifest(block_files, archive):
+    '''The finished block's manifest, or None if the block is not complete.'''
+    if archive:
+        path = block_files[0]
+        return read_block_manifest(path) if os.path.exists(path) else None
+    try:
+        with open(block_files[-2]) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+_NO_PYROSETTA = '''\
+PyRosetta is not available in this environment.
+
+Docking requires it, but the rest of this CLI does not -- use --dry-run to
+check a run plan (block slices, seeds, output names, resolved config) on a
+machine without PyRosetta, such as a Windows workstation.
+
+PyRosetta is not on PyPI; it is a licensed Graylab build. On the cluster,
+activate the glycographer conda env where it is installed.'''
+
+
+def _require_pyrosetta():
+    '''Turn the lazy import failure into an explanation rather than a traceback.'''
+    try:
+        import pyrosetta  # noqa: F401
+    except ModuleNotFoundError:
+        raise SystemExit(_NO_PYROSETTA)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description='Output predicted docking poses between a receptor and '
+                    'glycoligand, sampled and scored by the Rosetta '
+                    'GlycanDockProtocol mover under REF15.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''examples:
+  # single process, 100 probe decoys over a sampling grid
+  run_glycandock.py complex.pdb -n 100 --grid grid.pdb
+
+  # same run split across 42 SLURM array tasks
+  sbatch --array=0-41 scripts/slurm/run_glycandock.sh complex.pdb \\
+      -n 1000 --grid grid.pdb --n-blocks 42
+
+  # standard GlycanDock run on a known complex (no --grid -> refinement preset)
+  prepack_complex.py complex.pdb -o complex_prepacked.pdb
+  run_glycandock.py complex_prepacked.pdb -n 50 --native complex.pdb
+
+  # sweep a protocol parameter without a dedicated flag
+  run_glycandock.py complex.pdb -n 20 --set mc_kt=0.8 --set rb_rounds=12
+
+  # check the plan without running anything (no PyRosetta needed)
+  run_glycandock.py complex.pdb -n 1000 --n-blocks 42 --block-index 7 --dry-run
+''')
+
+    parser.add_argument('complex', type=str, nargs='?',
+                        help='Receptor-glycoligand complex in PDB format. Receptor and glycoligand '
+                             'chain ids should be A and X respectively (see --set partners=...).')
+    parser.add_argument('-n', '--nstruct', type=int, default=1,
+                        help='Total number of sampled and scored poses to output across the '
+                             'whole run, i.e. across all blocks (default: 1).')
+    parser.add_argument('-grid', '--grid', type=str, default=None,
+                        help='Sampling grid PDB for energy landscape mapping. Not required when '
+                             'refining a predetermined input pose.')
+    parser.add_argument('-o', '--outprefix', type=str, default=None,
+                        help='Prefix for output pose files (default: derived from the complex filename).')
+    parser.add_argument('--outdir', type=str, default='.',
+                        help='Directory for output poses, timings and manifest (default: cwd).')
+    parser.add_argument('--native', type=str, default=None,
+                        help='Native crystal complex to score decoys against. Without it, Fnat, '
+                             'heavy_Lrmsd, ring_Lrmsd and the other native-relative scores are NA.')
+
+    proto = parser.add_argument_group('protocol')
+    proto.add_argument('--preset', choices=('probe', 'refinement', 'publication'),
+                       default=None,
+                       help="Protocol parameter preset. Default: 'probe' when --grid is given, "
+                            "otherwise 'refinement'. 'publication' uses the Nance et al. defaults.")
+    proto.add_argument('--config', type=str, default=None,
+                       help='Load protocol parameters from a JSON config (as written into a run '
+                            'manifest). Overrides --preset; individual flags still apply on top.')
+    proto.add_argument('--set', dest='overrides', action='append', default=[],
+                       metavar='FIELD=VALUE',
+                       help='Override any GlycanDockConfig field, e.g. --set mc_kt=0.8. '
+                            'Repeatable, and applied last so it wins over other flags.')
+    proto.add_argument('--n-cycles', type=int, default=None,
+                       help='Stage 2 outer ramping cycles (preset default: 1 for probe, 10 for refinement).')
+    proto.add_argument('--refine-only', action='store_true',
+                       help='Skip Stage 1 and run only Stage 2 on the input structure.')
+    start = proto.add_mutually_exclusive_group()
+    start.add_argument('--random-start', dest='random_start', action='store_true',
+                       default=None,
+                       help='Randomize glycoligand orientation (RigidBodyRandomizeMover) before '
+                            'docking. Default: on for probe, off for refinement/publication.')
+    start.add_argument('--no-random-start', dest='random_start', action='store_false',
+                       help='Start every decoy from the input glycoligand orientation.')
+    proto.add_argument('--prepack-mode', choices=('per_decoy', 'once', 'none'),
+                       default=None,
+                       help="Stage 0 handling. 'once' (default for refinement/publication) expects "
+                            "the input PDB to be already prepacked by prepack_complex.py. "
+                            "'per_decoy' (default for probe) prepacks inside the loop, matching "
+                            "every existing glycographer probe ensemble. 'none' skips Stage 0 "
+                            "and records that no prepacking was intended.")
+    proto.add_argument('--cst-file', type=str, default=None,
+                       help='Rosetta constraint file (-cst_fa_file) for restrained refinement. '
+                            'Not used for probe sampling.')
+    proto.add_argument('--options', type=str, default=None,
+                       help='Rosetta flags file. Default: config/glycandock_stage_2.init when '
+                            '--refine-only, else config/glycandock_stage_1_stage_2.init.')
+
+    par = parser.add_argument_group('parallelism')
+    par.add_argument('--n-blocks', type=int, default=None,
+                     help='Split the run into this many blocks (default: $SLURM_ARRAY_TASK_COUNT, else 1).')
+    par.add_argument('--block-index', type=int, default=None,
+                     help='Which block this process runs, 0-based (default: $SLURM_ARRAY_TASK_ID, else 0).')
+    par.add_argument('--start', '--start-count-from', dest='start', type=int, default=1,
+                     help='Index of the first decoy of the whole run (default: 1).')
+    par.add_argument('--run-id', type=str, default=None,
+                     help='Identifier for the whole run; also seeds the RNG. Must be the same '
+                          'across all blocks of one run (default: the output prefix).')
+    par.add_argument('--seed', type=int, default=None,
+                     help='Explicit RNG seed for this block, overriding the derived one. '
+                          'Pass -1 to disable seeding and use Rosetta default behavior.')
+    par.add_argument('--no-reuse-template', action='store_true',
+                     help='Re-read the input PDB for every decoy instead of copying a template '
+                          'pose. Slower; restores the exact legacy read-per-decoy behavior.')
+    par.add_argument('--loose-pdbs', action='store_true',
+                     help='Write one PDB per decoy plus a separate manifest and timings file, '
+                          'instead of one tar.xz archive per block.')
+    par.add_argument('--overwrite', action='store_true',
+                     help="Replace this block's existing archive (or decoys, manifest and "
+                          'timings). Without it the run refuses to start if any already exist.')
+    par.add_argument('--resume', action='store_true',
+                     help='Skip blocks that already finished (manifest present) and rerun '
+                          'unfinished ones, replacing their partial outputs. Resubmit the '
+                          'original command with this added to fill in failed blocks.')
+
+    misc = parser.add_argument_group('diagnostics')
+    misc.add_argument('--dry-run', action='store_true',
+                      help='Print the resolved plan and exit without initializing Rosetta.')
+    misc.add_argument('--check-setters', action='store_true',
+                      help='Verify GlycanDockProtocol setter names in this PyRosetta build, then exit.')
+    misc.add_argument('-q', '--quiet', action='store_true',
+                      help='Suppress per-decoy progress output.')
+
+    return parser
+
+
+def resolve_config(args):
+    '''Build the GlycanDockConfig from --config/--preset plus flag overrides.'''
+    if args.config:
+        config = GlycanDockConfig.from_json(args.config)
+    else:
+        preset = args.preset or ('probe' if args.grid else 'refinement')
+        config = getattr(GlycanDockConfig, preset)()
+
+    changes = {}
+    if args.n_cycles is not None:
+        changes['n_cycles'] = args.n_cycles
+    if args.refine_only:
+        changes['refine_only'] = True
+    if args.random_start is not None:
+        changes['random_start'] = args.random_start
+    if args.prepack_mode is not None:
+        changes['prepack_mode'] = args.prepack_mode
+    if changes:
+        config = config.replace(**changes)
+
+    # --set is applied last so it always wins.
+    if args.overrides:
+        config = config.with_overrides(args.overrides)
+
+    return config
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.check_setters:
+        _require_pyrosetta()
+        results = check_setters(verbose=True)
+        return 0 if all(results.values()) else 1
+
+    if not args.complex:
+        parser.error('the complex PDB argument is required '
+                     '(omit it only with --check-setters)')
+    if args.nstruct < 1:
+        parser.error('number of output structures must be at least 1')
+    if args.start < 1:
+        parser.error('output pose count must begin at least from 1')
+
+    n_blocks = args.n_blocks if args.n_blocks is not None else \
+        _env_int('SLURM_ARRAY_TASK_COUNT', 1)
+    block_index = args.block_index if args.block_index is not None else \
+        _env_int('SLURM_ARRAY_TASK_ID', 0)
+
+    # An explicit --n-blocks that disagrees with the array means some blocks
+    # are never run (array too small) or tasks error out (ids too large). A
+    # sparse array like --array=7,23 is a deliberate rerun of chosen blocks, so
+    # only a full 0..N-1 array is checked for being too small.
+    array_count = _env_int('SLURM_ARRAY_TASK_COUNT', None)
+    array_max = _env_int('SLURM_ARRAY_TASK_MAX', None)
+    if args.n_blocks is not None and array_count is not None:
+        if array_max is None:
+            array_max = array_count - 1
+        if array_max >= args.n_blocks:
+            print(f'Warning: SLURM array ids run up to {array_max} but --n-blocks is '
+                  f'{args.n_blocks}; tasks {args.n_blocks}..{array_max} will fail as '
+                  f'out of range.', file=sys.stderr)
+        elif array_count == array_max + 1 and array_count < args.n_blocks:
+            print(f'Warning: --n-blocks {args.n_blocks} does not match the SLURM array '
+                  f'size ({array_count} tasks); blocks {array_count}..'
+                  f'{args.n_blocks - 1} will never run.', file=sys.stderr)
+
+    try:
+        config = resolve_config(args)
+    except (ValueError, OSError) as e:
+        parser.error(str(e))
+
+    outprefix = args.outprefix or default_outprefix(args.complex)
+    run_id = args.run_id or outprefix
+    options = args.options or (
+        STAGE_2_OPTIONS if config.refine_only else STAGE_1_2_OPTIONS)
+
+    try:
+        indices = block_slice(args.nstruct, n_blocks, block_index, start=args.start)
+    except ValueError as e:
+        parser.error(str(e))
+
+    seed = args.seed if args.seed is not None else block_seed(run_id, block_index)
+    if seed is not None and seed < 0:
+        seed = None
+
+    if not indices:
+        print(f'Block {block_index} of {n_blocks} has no decoys assigned '
+              f'({args.nstruct} total). Nothing to do.')
+        return 0
+
+    # The manifest is written last, so a readable one covering exactly this
+    # block's indices means the block finished. With --resume such blocks are
+    # skipped and anything else (e.g. a walltime kill) is rerun from scratch.
+    archive = not args.loose_pdbs
+    block_files = _block_outputs(args.outdir, outprefix, run_id, block_index,
+                                 indices, archive)
+    done = _read_block_manifest(block_files, archive)
+    if done is not None and done.get('indices') != indices:
+        print(f'Error: finished block {block_index} covers decoys '
+              f'{done.get("indices")[:3]}... but block {block_index} of {n_blocks} '
+              f'is now {indices[:3]}... -- -n or --n-blocks differs from the '
+              f'original run.', file=sys.stderr)
+        return 1
+    complete = done is not None
+    if args.resume and complete:
+        print(f'Block {block_index} of {n_blocks} already complete '
+              f'({os.path.basename(block_files[0] if archive else block_files[-2])}). '
+              f'Skipping.')
+        return 0
+
+    # Seeds depend only on (run_id, block_index), so a resubmission into the
+    # same outdir would silently regenerate and clobber identical decoys.
+    existing = [p for p in block_files if os.path.exists(p)]
+    if existing and not (args.overwrite or args.resume) and not args.dry_run:
+        print(f'Error: block {block_index} of {n_blocks} would overwrite '
+              f'{len(existing)} existing file(s) in {os.path.abspath(args.outdir)}:',
+              file=sys.stderr)
+        for p in existing[:5]:
+            print(f'  {os.path.basename(p)}', file=sys.stderr)
+        if len(existing) > 5:
+            print(f'  ... and {len(existing) - 5} more', file=sys.stderr)
+        print('Use --resume to rerun only unfinished blocks, a different '
+              '--outdir/--run-id, or --overwrite.', file=sys.stderr)
+        return 1
+
+    if args.dry_run:
+        print(f'run_id       : {run_id}')
+        print(f'complex      : {args.complex}')
+        print(f'grid         : {args.grid}')
+        print(f'native       : {args.native}')
+        print(f'options      : {options}')
+        print(f'outdir       : {os.path.abspath(args.outdir)}')
+        print(f'block        : {block_index} of {n_blocks}')
+        print(f'decoys       : {len(indices)} of {args.nstruct} total '
+              f'({indices[0]}..{indices[-1]})')
+        print(f'seed         : {seed}')
+        if archive:
+            print(f'archive      : {os.path.basename(block_files[0])}')
+        print(f'first decoy  : {decoy_name(outprefix, indices[0])}')
+        print(f'last decoy   : {decoy_name(outprefix, indices[-1])}')
+        if existing:
+            print(f'existing     : {len(existing)} output file(s) already present -- '
+                  + ('will be overwritten' if args.overwrite or args.resume
+                     else 'a real run will refuse without --resume/--overwrite'))
+        print('\nresolved config vs publication defaults:')
+        diff = GlycanDockConfig.publication().diff(config)
+        if diff:
+            for field, (pub, mine) in sorted(diff.items()):
+                print(f'  {field:18s} {pub!r:>8} -> {mine!r}')
+        else:
+            print('  (identical to publication defaults)')
+
+        problems = check_options(options, config)
+        if problems:
+            print('\noptions preflight:')
+            for p in problems:
+                print(f'  ! {p}\n')
+            return 1
+        print('\noptions preflight: OK')
+        return 0
+
+    _require_pyrosetta()
+    manifest = run_block(
+        config, args.complex,
+        indices=indices,
+        grid_pdb=args.grid,
+        native=args.native,
+        cst_file=args.cst_file,
+        options_file=options,
+        outprefix=outprefix,
+        outdir=args.outdir,
+        run_id=run_id,
+        block_index=block_index,
+        n_blocks=n_blocks,
+        seed=seed,
+        reuse_template=not args.no_reuse_template,
+        archive=archive,
+        verbose=not args.quiet,
+    )
+
+    print(f'\nWrote {len(manifest["outputs"])} decoys to '
+          f'{manifest.get("archive") or os.path.abspath(args.outdir)}')
+    return 0
+
+
+if __name__ == '__main__':
+    exit(main())

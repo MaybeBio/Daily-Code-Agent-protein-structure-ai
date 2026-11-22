@@ -1,0 +1,811 @@
+"""Generated reference surfaces for upstream PottsMPNN, LASErMPNN and ProtonPottsMPNN knobs.
+
+Produced by scripts/redsox/extract_upstream_knobs.py. Do not edit the
+generated dataclasses by hand. The manual block is the exception.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+POTTSMPNN_COMMIT = "0cb0a58874e373d664114f1735deab77614e4ab5"
+LASERMPNN_COMMIT = "e70f2c6d765416f7e29d51bfd6d4e08496438878"
+PROTONPOTTSMPNN_COMMIT = "09682abfa7d20e0abcdeea0490b7a4b1c190aee3"
+FRUSTRAMPNN_COMMIT = "3a03cdc300bfe24c4bb70e60207118532bc73b3b"
+EXTRACTOR_SHA256 = "dcfd2039e7de0e65dac53d189ba8e085669b38353f115836c0a062a442c2359d"
+
+@dataclass(frozen=True)
+class LaserCheckpointParamsKnobs:
+  """model_params build_hydrogens / graph_structure literals and subscript reads."""
+
+  laser_checkpoint__build_hydrogens: bool = True  # type=checkpoint literal; help=checkpoint-derived model_params key; train_lasermpnn.py:779
+  laser_checkpoint__graph_structure__lig_lig_knn_graph_k: int = 5  # type=checkpoint literal; help=checkpoint-derived model_params key; pretrain_ligand_encoder.py:227
+  laser_checkpoint__graph_structure__lig_pr_distance_cutoff: float = 20.0  # type=checkpoint literal; help=checkpoint-derived model_params key; train_lasermpnn.py:794
+  laser_checkpoint__graph_structure__lig_pr_knn_graph_k: int = 48  # type=checkpoint literal; help=checkpoint-derived model_params key; train_lasermpnn.py:795
+  laser_checkpoint__graph_structure__pr_pr_knn_graph_k: int = 48  # type=checkpoint literal; help=checkpoint-derived model_params key; train_lasermpnn.py:793
+
+@dataclass(frozen=True)
+class LaserModelLASErMPNNSampleKnobs:
+  """utils/model.py:727:sample."""
+
+  laser_model_LASErMPNN_sample__ala_budget: int = 4  # type=int; help=parameter of sample; utils/model.py:729
+  laser_model_LASErMPNN_sample__batch: object | None = None  # type=BatchData; help=parameter of sample; utils/model.py:728; UNRESOLVED required parameter; no upstream default
+  laser_model_LASErMPNN_sample__budget_residue_mask: object | None = None  # type=Optional[torch.Tensor]; help=parameter of sample; utils/model.py:729
+  laser_model_LASErMPNN_sample__chi_angle_sample_temperature: object | None = None  # type=Optional[float]; help=parameter of sample; utils/model.py:731
+  laser_model_LASErMPNN_sample__chi_min_p: float = 0.0  # type=float; help=parameter of sample; utils/model.py:732
+  laser_model_LASErMPNN_sample__disable_charged_residue_mask: object | None = None  # type=Optional[torch.Tensor]; help=parameter of sample; utils/model.py:733
+  laser_model_LASErMPNN_sample__disable_pbar: bool = False  # type=bool; help=parameter of sample; utils/model.py:732
+  laser_model_LASErMPNN_sample__disabled_residues: tuple[object, ...] = ('X',)  # type=Optional[list]; help=parameter of sample; utils/model.py:731
+  laser_model_LASErMPNN_sample__gly_budget: int = 0  # type=int; help=parameter of sample; utils/model.py:729
+  laser_model_LASErMPNN_sample__ignore_chain_mask_zeros: bool = False  # type=bool; help=parameter of sample; utils/model.py:733
+  laser_model_LASErMPNN_sample__repack_all: bool = False  # type=bool; help=parameter of sample; utils/model.py:733
+  laser_model_LASErMPNN_sample__return_encoder_embeddings: bool = False  # type=bool; help=parameter of sample; utils/model.py:732
+  laser_model_LASErMPNN_sample__seq_min_p: float = 0.0  # type=float; help=parameter of sample; utils/model.py:732
+  laser_model_LASErMPNN_sample__sequence_sample_temperature: object | None = None  # type=Optional[Union[float, torch.Tensor]]; help=parameter of sample; utils/model.py:730
+
+@dataclass(frozen=True)
+class LaserModelLASErMPNNTiedSampleKnobs:
+  """utils/model.py:460:tied_sample."""
+
+  laser_model_LASErMPNN_tied_sample__ala_budget: int = 4  # type=int; help=parameter of tied_sample; utils/model.py:462
+  laser_model_LASErMPNN_tied_sample__batch1: object | None = None  # type=BatchData; help=parameter of tied_sample; utils/model.py:461; UNRESOLVED required parameter; no upstream default
+  laser_model_LASErMPNN_tied_sample__batch2: object | None = None  # type=BatchData; help=parameter of tied_sample; utils/model.py:461; UNRESOLVED required parameter; no upstream default
+  laser_model_LASErMPNN_tied_sample__budget_residue_mask: object | None = None  # type=Optional[torch.Tensor]; help=parameter of tied_sample; utils/model.py:462
+  laser_model_LASErMPNN_tied_sample__chi_angle_sample_temperature: object | None = None  # type=Optional[float]; help=parameter of tied_sample; utils/model.py:463
+  laser_model_LASErMPNN_tied_sample__disable_pbar: bool = False  # type=bool; help=parameter of tied_sample; utils/model.py:464
+  laser_model_LASErMPNN_tied_sample__disabled_residues: tuple[object, ...] = ('X',)  # type=Optional[list]; help=parameter of tied_sample; utils/model.py:463
+  laser_model_LASErMPNN_tied_sample__gly_budget: int = 0  # type=int; help=parameter of tied_sample; utils/model.py:462
+  laser_model_LASErMPNN_tied_sample__lambda_: float = 0.5  # type=float; help=parameter of tied_sample; utils/model.py:461
+  laser_model_LASErMPNN_tied_sample__repack_all: bool = False  # type=bool; help=parameter of tied_sample; utils/model.py:464
+  laser_model_LASErMPNN_tied_sample__sequence_sample_temperature: object | None = None  # type=Optional[Union[float, torch.Tensor]]; help=parameter of tied_sample; utils/model.py:461
+
+@dataclass(frozen=True)
+class LaserModelLigandmpnnLigandMPNNSampleKnobs:
+  """utils/model_ligandmpnn.py:241:sample."""
+
+  laser_model_ligandmpnn_LigandMPNN_sample__batch: object | None = None  # type=BatchData; help=parameter of sample; utils/model_ligandmpnn.py:242; UNRESOLVED required parameter; no upstream default
+  laser_model_ligandmpnn_LigandMPNN_sample__disable_charged_residue_mask: object | None = None  # type=Optional[torch.Tensor]; help=parameter of sample; utils/model_ligandmpnn.py:245
+  laser_model_ligandmpnn_LigandMPNN_sample__disable_pbar: bool = False  # type=bool; help=parameter of sample; utils/model_ligandmpnn.py:244
+  laser_model_ligandmpnn_LigandMPNN_sample__disabled_residues: tuple[object, ...] = ('X',)  # type=Optional[list]; help=parameter of sample; utils/model_ligandmpnn.py:243
+  laser_model_ligandmpnn_LigandMPNN_sample__ignore_chain_mask_zeros: bool = False  # type=bool; help=parameter of sample; utils/model_ligandmpnn.py:245
+  laser_model_ligandmpnn_LigandMPNN_sample__repack_all: bool = False  # type=bool; help=parameter of sample; utils/model_ligandmpnn.py:245
+  laser_model_ligandmpnn_LigandMPNN_sample__return_encoder_embeddings: bool = False  # type=bool; help=parameter of sample; utils/model_ligandmpnn.py:244
+  laser_model_ligandmpnn_LigandMPNN_sample__seq_min_p: float = 0.0  # type=float; help=parameter of sample; utils/model_ligandmpnn.py:244
+  laser_model_ligandmpnn_LigandMPNN_sample__sequence_sample_temperature: object | None = None  # type=Optional[Union[float, torch.Tensor]]; help=parameter of sample; utils/model_ligandmpnn.py:242
+
+@dataclass(frozen=True)
+class LaserRunBatchInferenceKnobs:
+  """run_batch_inference.py."""
+
+  laser_run_batch_inference__ala_budget: int = 4  # type=int; help=Maximum number of ALA residues that can be sampled in exposed non-secondary structured residues. Only used if --constrain_ala_gly_sampling_to_exposed_non_secondary_structure is set or --budget_residue_sele_string is set.; run_batch_inference.py:386
+  laser_run_batch_inference__budget_residue_sele_string: object | None = None  # type=unknown; help=A ProDy-style selection string to constrain the residues to sample ALA and GLY residues in. Can be used to override the automatic selection performed by the --constrain_ala_gly_sampling_to_exposed_non_secondary_structure flag.; run_batch_inference.py:385
+  laser_run_batch_inference__chi_min_p: float = 0.0  # type=float; help=Minimum probability for chi sampling. Not recommended.; run_batch_inference.py:373
+  laser_run_batch_inference__chi_temp: float | None = None  # type=float; help=Temperature for chi sampling.; run_batch_inference.py:372
+  laser_run_batch_inference__constrain_ala_gly_sampling_to_exposed_non_secondary_structure: bool = False  # type=bool; help=If set, constrains number of ALA and GLY residues that can be sampled in exposed non-secondary structured residues. The max number of ALA and GLY residues is set by the --ala_budget and --gly_budget arguments.; run_batch_inference.py:384
+  laser_run_batch_inference__designs_per_batch: int = 30  # type=int; help=Number of designs to generate per batch. If designs_per_input > designs_per_batch, chunks up the inference calls in batches of this size. Default is 30, can increase/decrease depending on available GPU memory.; run_batch_inference.py:366
+  laser_run_batch_inference__designs_per_input: int | None = None  # type=int; help=Number of designs to generate per input.; run_batch_inference.py:365; UNRESOLVED no default literal
+  laser_run_batch_inference__disable_charged_fs: bool = False  # type=bool; help=Disable sampling D,K,R,E residues in the first shell around the ligand.; run_batch_inference.py:397
+  laser_run_batch_inference__disabled_residues: str = 'X,C'  # type=str; help=Residues to disable in sampling.; run_batch_inference.py:380
+  laser_run_batch_inference__first_shell_sequence_temp: float | None = None  # type=float; help=Temperature for first shell sequence sampling. Can be used to disentangle binding site temperature from global sequence temperature for harder folds.; run_batch_inference.py:371
+  laser_run_batch_inference__fix_beta: bool = False  # type=bool; help=If B-factors are set to 1, fixes the residue and rotamer, if not, designs that position.; run_batch_inference.py:381
+  laser_run_batch_inference__fs_calc_burial_hull_alpha_value: float = 9.0  # type=float; help=Alpha parameter for defining convex hull. May want to try setting to larger values if using folds with larger cavities (ex: ~100.0).; run_batch_inference.py:395
+  laser_run_batch_inference__fs_calc_ca_distance: float = 10.0  # type=float; help=Distance between a ligand heavy atom and CA carbon to consider that carbon first shell.; run_batch_inference.py:394
+  laser_run_batch_inference__fs_no_calc_burial: bool = False  # type=bool; help=Disable using a burial calculation when selecting first shell residues, if true uses only distance from --fs_calc_ca_distance; run_batch_inference.py:396
+  laser_run_batch_inference__gly_budget: int = 0  # type=int; help=Maximum number of GLY residues that can be sampled in exposed non-secondary structured residues. Only used if --constrain_ala_gly_sampling_to_exposed_non_secondary_structure is set or --budget_residue_sele_string is set.; run_batch_inference.py:387
+  laser_run_batch_inference__ignore_key_mismatch: bool = True  # type=bool; help=Allows mismatched keys in checkpoint statedict; run_batch_inference.py:379
+  laser_run_batch_inference__ignore_ligand: bool = False  # type=bool; help=Ignore ligand in sampling.; run_batch_inference.py:383
+  laser_run_batch_inference__inference_device: str = 'cpu'  # type=str; help=PyTorch style device string (e.g. "cuda:0").; run_batch_inference.py:376
+  laser_run_batch_inference__input_pdb_directory: str | None = None  # type=str; help=Path to directory of input .pdb or .pdb.gz files, a single input .pdb or .pdb.gz file, or a .txt file of paths to input .pdb or .pdb.gz files.; run_batch_inference.py:363; UNRESOLVED no default literal
+  laser_run_batch_inference__inputs_processed_simultaneously: int = 5  # type=int; help=When passed a list of multiple files, this is the number of input files to process per pass through the GPU. Useful when generating a few sequences for many input files.; run_batch_inference.py:367
+  laser_run_batch_inference__model_weights_path: str | None = None  # type=str; help=f'Path to model weights. Default: {default_weights_path}. Other weights can be found in the ./model_weights/ directory.'; run_batch_inference.py:368; UNRESOLVED default is not a literal (f'{default_weights_path}')
+  laser_run_batch_inference__noncanonical_aa_ligand: bool = False  # type=bool; help=Featurize a noncanonical amino acid as a ligand.; run_batch_inference.py:388
+  laser_run_batch_inference__output_fasta: bool = False  # type=bool; help=Output a fasta file of the designed sequences in addition to the PDB files.; run_batch_inference.py:391
+  laser_run_batch_inference__output_fasta_only: bool = False  # type=bool; help=Output only a fasta file of the designed sequences, does not write PDB files.; run_batch_inference.py:392
+  laser_run_batch_inference__output_pdb_directory: str | None = None  # type=str; help=Path to directory to output LASErMPNN designs.; run_batch_inference.py:364; UNRESOLVED no default literal
+  laser_run_batch_inference__repack_all: bool = False  # type=bool; help=Repack all residues, even those with chain_mask=1.; run_batch_inference.py:389
+  laser_run_batch_inference__repack_only_input_sequence: bool = False  # type=bool; help=Repacks the input sequence without changing the sequence.; run_batch_inference.py:382
+  laser_run_batch_inference__seq_min_p: float = 0.0  # type=float; help=Minimum probability for sequence sampling. Not recommended.; run_batch_inference.py:374
+  laser_run_batch_inference__sequence_temp: float | None = None  # type=float; help=Temperature for sequence sampling.; run_batch_inference.py:370
+  laser_run_batch_inference__use_water: bool = False  # type=bool; help=Parses water (resname HOH) as part of a ligand.; run_batch_inference.py:377
+  laser_run_batch_inference__verbose: bool = True  # type=bool; help=Silences all output except pbar.; run_batch_inference.py:378
+
+@dataclass(frozen=True)
+class LaserRunBatchInferenceLigandmpnnKnobs:
+  """run_batch_inference_ligandmpnn.py."""
+
+  laser_run_batch_inference_ligandmpnn__ala_budget: int = 4  # type=int; help=; run_batch_inference_ligandmpnn.py:330
+  laser_run_batch_inference_ligandmpnn__budget_residue_sele_string: object | None = None  # type=unknown; help=; run_batch_inference_ligandmpnn.py:329
+  laser_run_batch_inference_ligandmpnn__chi_min_p: float = 0.0  # type=float; help=Minimum probability for chi sampling. Not recommended.; run_batch_inference_ligandmpnn.py:318
+  laser_run_batch_inference_ligandmpnn__chi_temp: float | None = None  # type=float; help=Temperature for chi sampling.; run_batch_inference_ligandmpnn.py:317
+  laser_run_batch_inference_ligandmpnn__designs_per_batch: int = 30  # type=int; help=Number of designs to generate per batch. If designs_per_input > designs_per_batch, chunks up the inference calls in batches of this size. Default is 30, can increase/decrease depending on available GPU memory.; run_batch_inference_ligandmpnn.py:311
+  laser_run_batch_inference_ligandmpnn__designs_per_input: int | None = None  # type=int; help=Number of designs to generate per input.; run_batch_inference_ligandmpnn.py:310; UNRESOLVED no default literal
+  laser_run_batch_inference_ligandmpnn__disable_charged_fs: bool = False  # type=bool; help=Disable sampling D,K,R,E residues in the first shell around the ligand.; run_batch_inference_ligandmpnn.py:341
+  laser_run_batch_inference_ligandmpnn__disabled_residues: str = 'X'  # type=str; help=Residues to disable in sampling.; run_batch_inference_ligandmpnn.py:325
+  laser_run_batch_inference_ligandmpnn__first_shell_sequence_temp: float | None = None  # type=float; help=Temperature for first shell sequence sampling. Can be used to disentangle binding site temperature from global sequence temperature for harder folds.; run_batch_inference_ligandmpnn.py:316
+  laser_run_batch_inference_ligandmpnn__fix_beta: bool = False  # type=bool; help=If B-factors are set to 1, fixes the residue and rotamer, if not, designs that position.; run_batch_inference_ligandmpnn.py:326
+  laser_run_batch_inference_ligandmpnn__fs_calc_burial_hull_alpha_value: float = 9.0  # type=float; help=Alpha parameter for defining convex hull. May want to try setting to larger values if using folds with larger cavities (ex: ~100.0).; run_batch_inference_ligandmpnn.py:339
+  laser_run_batch_inference_ligandmpnn__fs_calc_ca_distance: float = 10.0  # type=float; help=Distance between a ligand heavy atom and CA carbon to consider that carbon first shell.; run_batch_inference_ligandmpnn.py:338
+  laser_run_batch_inference_ligandmpnn__fs_no_calc_burial: bool = False  # type=bool; help=Disable using a burial calculation when selecting first shell residues, if true uses only distance from --fs_calc_ca_distance; run_batch_inference_ligandmpnn.py:340
+  laser_run_batch_inference_ligandmpnn__gly_budget: int = 0  # type=int; help=; run_batch_inference_ligandmpnn.py:331
+  laser_run_batch_inference_ligandmpnn__ignore_key_mismatch: bool = True  # type=bool; help=Allows mismatched keys in checkpoint statedict; run_batch_inference_ligandmpnn.py:324
+  laser_run_batch_inference_ligandmpnn__ignore_ligand: bool = False  # type=bool; help=Ignore ligand in sampling.; run_batch_inference_ligandmpnn.py:328
+  laser_run_batch_inference_ligandmpnn__inference_device: str = 'cpu'  # type=str; help=PyTorch style device string (e.g. "cuda:0").; run_batch_inference_ligandmpnn.py:321
+  laser_run_batch_inference_ligandmpnn__input_pdb_directory: str | None = None  # type=str; help=Path to directory of input .pdb or .pdb.gz files, a single input .pdb or .pdb.gz file, or a .txt file of paths to input .pdb or .pdb.gz files.; run_batch_inference_ligandmpnn.py:308; UNRESOLVED no default literal
+  laser_run_batch_inference_ligandmpnn__inputs_processed_simultaneously: int = 5  # type=int; help=When passed a list of multiple files, this is the number of input files to process per pass through the GPU. Useful when generating a few sequences for many input files.; run_batch_inference_ligandmpnn.py:312
+  laser_run_batch_inference_ligandmpnn__model_weights_path: str | None = None  # type=str; help=f'Path to model weights. Default: {default_weights_path}. Other weights can be found in the ./model_weights/ directory.'; run_batch_inference_ligandmpnn.py:313; UNRESOLVED default is not a literal (f'{default_weights_path}')
+  laser_run_batch_inference_ligandmpnn__noncanonical_aa_ligand: bool = False  # type=bool; help=Featurize a noncanonical amino acid as a ligand.; run_batch_inference_ligandmpnn.py:332
+  laser_run_batch_inference_ligandmpnn__output_fasta: bool = False  # type=bool; help=Output a fasta file of the designed sequences in addition to the PDB files.; run_batch_inference_ligandmpnn.py:335
+  laser_run_batch_inference_ligandmpnn__output_fasta_only: bool = False  # type=bool; help=Output only a fasta file of the designed sequences, does not write PDB files.; run_batch_inference_ligandmpnn.py:336
+  laser_run_batch_inference_ligandmpnn__output_pdb_directory: str | None = None  # type=str; help=Path to directory to output LASErMPNN designs.; run_batch_inference_ligandmpnn.py:309; UNRESOLVED no default literal
+  laser_run_batch_inference_ligandmpnn__repack_all: bool = False  # type=bool; help=Repack all residues, even those with chain_mask=1.; run_batch_inference_ligandmpnn.py:333
+  laser_run_batch_inference_ligandmpnn__repack_only_input_sequence: bool = False  # type=bool; help=Repacks the input sequence without changing the sequence.; run_batch_inference_ligandmpnn.py:327
+  laser_run_batch_inference_ligandmpnn__seq_min_p: float = 0.0  # type=float; help=Minimum probability for sequence sampling. Not recommended.; run_batch_inference_ligandmpnn.py:319
+  laser_run_batch_inference_ligandmpnn__sequence_temp: float | None = None  # type=float; help=Temperature for sequence sampling.; run_batch_inference_ligandmpnn.py:315
+  laser_run_batch_inference_ligandmpnn__use_water: bool = False  # type=bool; help=Parses water (resname HOH) as part of a ligand.; run_batch_inference_ligandmpnn.py:322
+  laser_run_batch_inference_ligandmpnn__verbose: bool = True  # type=bool; help=Silences all output except pbar.; run_batch_inference_ligandmpnn.py:323
+
+@dataclass(frozen=True)
+class LaserRunInferenceKnobs:
+  """run_inference.py."""
+
+  laser_run_inference__backbone_noise: str = ''  # type=str; help=Inference backbone noise.; run_inference.py:779
+  laser_run_inference__device: str = 'cpu'  # type=str; help=Pytorch style device string. Ex: "cuda:0" or "cpu".; run_inference.py:780
+  laser_run_inference__disable_charged_fs: bool = False  # type=bool; help=Disable sampling D,K,R,E residues in the first shell around the ligand.; run_inference.py:792
+  laser_run_inference__entropy_decoder: bool = False  # type=bool; help=Uses entropy based decoding order. Decodes all residues and selects the lowest entropy residue as next to decode, then recomputes all remaining residues. Takes longer than normal decoding.; run_inference.py:784
+  laser_run_inference__fix_beta: bool = False  # type=bool; help=Residues with B-Factor of 1.0 have sequence and rotamer fixed, residues with B-Factor of 0.0 are designed.; run_inference.py:782
+  laser_run_inference__fs_calc_burial_hull_alpha_value: float = 9.0  # type=float; help=Alpha parameter for defining convex hull. May want to try setting to larger values if using folds with larger cavities (ex: ~100.0).; run_inference.py:790
+  laser_run_inference__fs_calc_ca_distance: float = 10.0  # type=float; help=Distance between a ligand heavy atom and CA carbon to consider that carbon first shell.; run_inference.py:789
+  laser_run_inference__fs_no_calc_burial: bool = False  # type=bool; help=Disable using a burial calculation when selecting first shell residues, if true uses only distance from --fs_calc_ca_distance; run_inference.py:791
+  laser_run_inference__fs_sequence_temp: float | None = None  # type=float; help=Residues around the ligand will be sampled at this temperature, otherwise they default to sequence_temp.; run_inference.py:778
+  laser_run_inference__ignore_ligand: bool = False  # type=bool; help=Ignore ligands in the input PDB file.; run_inference.py:786
+  laser_run_inference__input_pdb_code: str | None = None  # type=str; help=Path to the input PDB file.; run_inference.py:773; UNRESOLVED no default literal
+  laser_run_inference__model_weights: str | None = None  # type=str; help=f'Path to dictionary of torch.save()ed model state_dict and training parameters. Default: {default_weights_path}'; run_inference.py:774; UNRESOLVED default is not a literal (default_weights_path)
+  laser_run_inference__noncanonical_aa_ligand: bool = False  # type=bool; help=Featurize a noncanonical amino acid as a ligand.; run_inference.py:787
+  laser_run_inference__output_path: str = 'laser_output.pdb'  # type=str; help=Path to the output PDB file.; run_inference.py:776
+  laser_run_inference__repack_only: bool = False  # type=bool; help=Only repack residues, do not design new ones.; run_inference.py:785
+  laser_run_inference__sequence_temp: str = ''  # type=str; help=Sequence sample temperature.; run_inference.py:777
+  laser_run_inference__strict_load: bool = True  # type=bool; help=Small state_dict mismatches are ignored. Don't use this unless any missing parameters aren't learned during training.; run_inference.py:783
+
+@dataclass(frozen=True)
+class LaserRunInferenceLigandmpnnKnobs:
+  """run_inference_ligandmpnn.py."""
+
+  laser_run_inference_ligandmpnn__backbone_noise: str = ''  # type=str; help=Inference backbone noise.; run_inference_ligandmpnn.py:777
+  laser_run_inference_ligandmpnn__device: str = 'cpu'  # type=str; help=Pytorch style device string. Ex: "cuda:0" or "cpu".; run_inference_ligandmpnn.py:778
+  laser_run_inference_ligandmpnn__disable_charged_fs: bool = False  # type=bool; help=Disable sampling D,K,R,E residues in the first shell around the ligand.; run_inference_ligandmpnn.py:790
+  laser_run_inference_ligandmpnn__entropy_decoder: bool = False  # type=bool; help=Uses entropy based decoding order. Decodes all residues and selects the lowest entropy residue as next to decode, then recomputes all remaining residues. Takes longer than normal decoding.; run_inference_ligandmpnn.py:782
+  laser_run_inference_ligandmpnn__fix_beta: bool = False  # type=bool; help=Residues with B-Factor of 1.0 have sequence and rotamer fixed, residues with B-Factor of 0.0 are designed.; run_inference_ligandmpnn.py:780
+  laser_run_inference_ligandmpnn__fs_calc_burial_hull_alpha_value: float = 9.0  # type=float; help=Alpha parameter for defining convex hull. May want to try setting to larger values if using folds with larger cavities (ex: ~100.0).; run_inference_ligandmpnn.py:788
+  laser_run_inference_ligandmpnn__fs_calc_ca_distance: float = 10.0  # type=float; help=Distance between a ligand heavy atom and CA carbon to consider that carbon first shell.; run_inference_ligandmpnn.py:787
+  laser_run_inference_ligandmpnn__fs_no_calc_burial: bool = False  # type=bool; help=Disable using a burial calculation when selecting first shell residues, if true uses only distance from --fs_calc_ca_distance; run_inference_ligandmpnn.py:789
+  laser_run_inference_ligandmpnn__fs_sequence_temp: float | None = None  # type=float; help=Residues around the ligand will be sampled at this temperature, otherwise they default to sequence_temp.; run_inference_ligandmpnn.py:776
+  laser_run_inference_ligandmpnn__ignore_ligand: bool = False  # type=bool; help=Ignore ligands in the input PDB file.; run_inference_ligandmpnn.py:784
+  laser_run_inference_ligandmpnn__input_pdb_code: str | None = None  # type=str; help=Path to the input PDB file.; run_inference_ligandmpnn.py:771; UNRESOLVED no default literal
+  laser_run_inference_ligandmpnn__model_weights: str | None = None  # type=str; help=f'Path to dictionary of torch.save()ed model state_dict and training parameters. Default: {default_weights_path}'; run_inference_ligandmpnn.py:772; UNRESOLVED default is not a literal (default_weights_path)
+  laser_run_inference_ligandmpnn__noncanonical_aa_ligand: bool = False  # type=bool; help=Featurize a noncanonical amino acid as a ligand.; run_inference_ligandmpnn.py:785
+  laser_run_inference_ligandmpnn__output_path: str = 'laser_output.pdb'  # type=str; help=Path to the output PDB file.; run_inference_ligandmpnn.py:774
+  laser_run_inference_ligandmpnn__repack_only: bool = False  # type=bool; help=Only repack residues, do not design new ones.; run_inference_ligandmpnn.py:783
+  laser_run_inference_ligandmpnn__sequence_temp: str = ''  # type=str; help=Sequence sample temperature.; run_inference_ligandmpnn.py:775
+  laser_run_inference_ligandmpnn__strict_load: bool = True  # type=bool; help=Small state_dict mismatches are ignored. Don't use this unless any missing parameters aren't learned during training.; run_inference_ligandmpnn.py:781
+
+@dataclass(frozen=True)
+class LaserRunInferenceLigandmpnnSampleModelKnobs:
+  """run_inference_ligandmpnn.py:512:sample_model."""
+
+  laser_run_inference_ligandmpnn_sample_model__ala_budget: int = 4  # type=Optional[int]; help=parameter of sample_model; run_inference_ligandmpnn.py:516
+  laser_run_inference_ligandmpnn_sample_model__batch_data: object | None = None  # type=BatchData; help=parameter of sample_model; run_inference_ligandmpnn.py:513; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_ligandmpnn_sample_model__bb_noise: float | None = None  # type=float; help=parameter of sample_model; run_inference_ligandmpnn.py:513; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_ligandmpnn_sample_model__budget_residue_mask: object | None = None  # type=Optional[torch.Tensor]; help=parameter of sample_model; run_inference_ligandmpnn.py:516
+  laser_run_inference_ligandmpnn_sample_model__chi_min_p: float = 0.0  # type=float; help=parameter of sample_model; run_inference_ligandmpnn.py:514
+  laser_run_inference_ligandmpnn_sample_model__chi_temp: object | None = None  # type=Optional[float]; help=parameter of sample_model; run_inference_ligandmpnn.py:513
+  laser_run_inference_ligandmpnn_sample_model__disable_charged_fs: bool = False  # type=bool; help=parameter of sample_model; run_inference_ligandmpnn.py:517
+  laser_run_inference_ligandmpnn_sample_model__disable_pbar: bool = False  # type=bool; help=parameter of sample_model; run_inference_ligandmpnn.py:514
+  laser_run_inference_ligandmpnn_sample_model__disabled_residues: tuple[object, ...] = ('X',)  # type=Optional[List[str]]; help=parameter of sample_model; run_inference_ligandmpnn.py:515
+  laser_run_inference_ligandmpnn_sample_model__fs_sequence_temp: object | None = None  # type=Optional[float]; help=parameter of sample_model; run_inference_ligandmpnn.py:514
+  laser_run_inference_ligandmpnn_sample_model__gly_budget: int = 0  # type=Optional[int]; help=parameter of sample_model; run_inference_ligandmpnn.py:516
+  laser_run_inference_ligandmpnn_sample_model__ignore_chain_mask_zeros: bool = False  # type=bool; help=parameter of sample_model; run_inference_ligandmpnn.py:515
+  laser_run_inference_ligandmpnn_sample_model__model: object | None = None  # type=LigandMPNN; help=parameter of sample_model; run_inference_ligandmpnn.py:513; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_ligandmpnn_sample_model__params: object | None = None  # type=dict; help=parameter of sample_model; run_inference_ligandmpnn.py:513; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_ligandmpnn_sample_model__repack_all: bool = False  # type=bool; help=parameter of sample_model; run_inference_ligandmpnn.py:515
+  laser_run_inference_ligandmpnn_sample_model__seq_min_p: float = 0.0  # type=float; help=parameter of sample_model; run_inference_ligandmpnn.py:514
+  laser_run_inference_ligandmpnn_sample_model__sequence_temp: object | None = None  # type=Optional[float]; help=parameter of sample_model; run_inference_ligandmpnn.py:513; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_ligandmpnn_sample_model__use_edo: bool = False  # type=bool; help=parameter of sample_model; run_inference_ligandmpnn.py:513
+  laser_run_inference_ligandmpnn_sample_model__verbose: bool = False  # type=bool; help=parameter of sample_model; run_inference_ligandmpnn.py:514
+
+@dataclass(frozen=True)
+class LaserRunInferenceSampleModelKnobs:
+  """run_inference.py:511:sample_model."""
+
+  laser_run_inference_sample_model__ala_budget: int = 4  # type=Optional[int]; help=parameter of sample_model; run_inference.py:515
+  laser_run_inference_sample_model__batch_data: object | None = None  # type=BatchData; help=parameter of sample_model; run_inference.py:512; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_sample_model__bb_noise: float | None = None  # type=float; help=parameter of sample_model; run_inference.py:512; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_sample_model__budget_residue_mask: object | None = None  # type=Optional[torch.Tensor]; help=parameter of sample_model; run_inference.py:515
+  laser_run_inference_sample_model__chi_min_p: float = 0.0  # type=float; help=parameter of sample_model; run_inference.py:513
+  laser_run_inference_sample_model__chi_temp: object | None = None  # type=Optional[float]; help=parameter of sample_model; run_inference.py:512
+  laser_run_inference_sample_model__disable_charged_fs: bool = False  # type=bool; help=parameter of sample_model; run_inference.py:516
+  laser_run_inference_sample_model__disable_pbar: bool = False  # type=bool; help=parameter of sample_model; run_inference.py:513
+  laser_run_inference_sample_model__disabled_residues: tuple[object, ...] = ('X',)  # type=Optional[List[str]]; help=parameter of sample_model; run_inference.py:514
+  laser_run_inference_sample_model__fs_sequence_temp: object | None = None  # type=Optional[float]; help=parameter of sample_model; run_inference.py:513
+  laser_run_inference_sample_model__gly_budget: int = 0  # type=Optional[int]; help=parameter of sample_model; run_inference.py:515
+  laser_run_inference_sample_model__ignore_chain_mask_zeros: bool = False  # type=bool; help=parameter of sample_model; run_inference.py:514
+  laser_run_inference_sample_model__model: object | None = None  # type=LASErMPNN; help=parameter of sample_model; run_inference.py:512; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_sample_model__params: object | None = None  # type=dict; help=parameter of sample_model; run_inference.py:512; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_sample_model__repack_all: bool = False  # type=bool; help=parameter of sample_model; run_inference.py:514
+  laser_run_inference_sample_model__seq_min_p: float = 0.0  # type=float; help=parameter of sample_model; run_inference.py:513
+  laser_run_inference_sample_model__sequence_temp: object | None = None  # type=Optional[float]; help=parameter of sample_model; run_inference.py:512; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_sample_model__use_edo: bool = False  # type=bool; help=parameter of sample_model; run_inference.py:512
+  laser_run_inference_sample_model__verbose: bool = False  # type=bool; help=parameter of sample_model; run_inference.py:513
+
+@dataclass(frozen=True)
+class LaserRunInferenceTiedKnobs:
+  """run_inference_tied.py."""
+
+  laser_run_inference_tied__ala_budget: int = 4  # type=int; help=Max number of alanine residues that can be sampled in exposed non-secondary structured residues when --constrain_ala_gly_sampling_to_exposed_non_secondary_structure is set.; run_inference_tied.py:894
+  laser_run_inference_tied__backbone_noise: str = ''  # type=str; help=Inference backbone noise.; run_inference_tied.py:882
+  laser_run_inference_tied__budget_residue_sele_string: str = ''  # type=str; help=A ProDy selection string to specify residues to constrain sampling for. If set, only residues that satisfy the selection criteria will be constrained. Ex: "same residue as (chain A and resnum 50)". See ProDy documentation for selection s...; run_inference_tied.py:892
+  laser_run_inference_tied__constrain_ala_gly_sampling_to_exposed_non_secondary_structure: bool = False  # type=bool; help=If set, constrains number of ALA and GLY residues that can be sampled in exposed non-secondary structured residues. The max number of ALA and GLY residues is set by the --ala_budget and --gly_budget arguments.; run_inference_tied.py:893
+  laser_run_inference_tied__designs_per_input: int = 1  # type=int; help=Number of sequences to design per input structure. Default is 1.; run_inference_tied.py:876
+  laser_run_inference_tied__device: str = 'cpu'  # type=str; help=Pytorch style device string. Ex: "cuda:0" or "cpu".; run_inference_tied.py:883
+  laser_run_inference_tied__disable_charged_fs: bool = False  # type=bool; help=Disable sampling D,K,R,E residues in the first shell around the ligand.; run_inference_tied.py:899
+  laser_run_inference_tied__disabled_residues: str = 'X,C'  # type=str; help=Comma separated list of one letter amino acid codes to disable sampling of. Default is "X,C" which corresponds to any residues with unknown amino acids and Cysteines.; run_inference_tied.py:884
+  laser_run_inference_tied__entropy_decoder: bool = False  # type=bool; help=Uses entropy based decoding order. Decodes all residues and selects the lowest entropy residue as next to decode, then recomputes all remaining residues. Takes longer than normal decoding.; run_inference_tied.py:888
+  laser_run_inference_tied__fix_beta: bool = False  # type=bool; help=Residues with B-Factor of 1.0 have sequence and rotamer fixed, residues with B-Factor of 0.0 are designed.; run_inference_tied.py:886
+  laser_run_inference_tied__fs_calc_burial_hull_alpha_value: float = 9.0  # type=float; help=Alpha parameter for defining convex hull. May want to try setting to larger values if using folds with larger cavities (ex: ~100.0).; run_inference_tied.py:897
+  laser_run_inference_tied__fs_calc_ca_distance: float = 10.0  # type=float; help=Distance between a ligand heavy atom and CA carbon to consider that carbon first shell.; run_inference_tied.py:896
+  laser_run_inference_tied__fs_no_calc_burial: bool = False  # type=bool; help=Disable using a burial calculation when selecting first shell residues, if true uses only distance from --fs_calc_ca_distance; run_inference_tied.py:898
+  laser_run_inference_tied__fs_sequence_temp: float | None = None  # type=float; help=Residues around the ligand will be sampled at this temperature, otherwise they default to sequence_temp.; run_inference_tied.py:881
+  laser_run_inference_tied__gly_budget: int = 0  # type=int; help=Max number of glycine residues that can be sampled in exposed non-secondary structured residues when --constrain_ala_gly_sampling_to_exposed_non_secondary_structure is set.; run_inference_tied.py:895
+  laser_run_inference_tied__ignore_ligand: bool = False  # type=bool; help=Ignore ligands in the input PDB file.; run_inference_tied.py:890
+  laser_run_inference_tied__input_pdb_code_1: str | None = None  # type=str; help=Path to the input PDB file.; run_inference_tied.py:873; UNRESOLVED no default literal
+  laser_run_inference_tied__input_pdb_code_2: str | None = None  # type=str; help=Path to the input PDB file.; run_inference_tied.py:874; UNRESOLVED no default literal
+  laser_run_inference_tied__model_weights: str | None = None  # type=str; help=f'Path to dictionary of torch.save()ed model state_dict and training parameters. Default: {default_weights_path}'; run_inference_tied.py:877; UNRESOLVED default is not a literal (default_weights_path)
+  laser_run_inference_tied__noncanonical_aa_ligand: bool = False  # type=bool; help=Featurize a noncanonical amino acid as a ligand.; run_inference_tied.py:891
+  laser_run_inference_tied__output_path: str = 'laser_output.pdb'  # type=str; help=Path to the output PDB file.; run_inference_tied.py:879
+  laser_run_inference_tied__repack_only: bool = False  # type=bool; help=Only repack residues, do not design new ones.; run_inference_tied.py:889
+  laser_run_inference_tied__sequence_temp: str = ''  # type=str; help=Sequence sample temperature.; run_inference_tied.py:880
+  laser_run_inference_tied__strict_load: bool = True  # type=bool; help=Small state_dict mismatches are ignored. Don't use this unless any missing parameters aren't learned during training.; run_inference_tied.py:887
+  laser_run_inference_tied__tied_probability_interpolation_lambda: float = 0.0  # type=float; help=Lambda value for interpolating between the two model output distributions during tied decoding. Final probabilities are computed as: lambda * prob1 + (1-lambda) * prob2. Default is 0.0 which corresponds to using only the first input stru...; run_inference_tied.py:875
+
+@dataclass(frozen=True)
+class LaserRunInferenceTiedSampleModelKnobs:
+  """run_inference_tied.py:565:sample_model."""
+
+  laser_run_inference_tied_sample_model__ala_budget: int = 4  # type=Optional[int]; help=parameter of sample_model; run_inference_tied.py:569
+  laser_run_inference_tied_sample_model__batch_data1: object | None = None  # type=BatchData; help=parameter of sample_model; run_inference_tied.py:566; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_tied_sample_model__batch_data2: object | None = None  # type=BatchData; help=parameter of sample_model; run_inference_tied.py:566; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_tied_sample_model__bb_noise: float | None = None  # type=float; help=parameter of sample_model; run_inference_tied.py:566; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_tied_sample_model__budget_residue_mask: object | None = None  # type=Optional[torch.Tensor]; help=parameter of sample_model; run_inference_tied.py:569
+  laser_run_inference_tied_sample_model__chi_temp: object | None = None  # type=Optional[float]; help=parameter of sample_model; run_inference_tied.py:566
+  laser_run_inference_tied_sample_model__disable_charged_fs: bool = False  # type=bool; help=parameter of sample_model; run_inference_tied.py:570
+  laser_run_inference_tied_sample_model__disable_pbar: bool = False  # type=bool; help=parameter of sample_model; run_inference_tied.py:567
+  laser_run_inference_tied_sample_model__disabled_residues: tuple[object, ...] = ('X', 'C')  # type=Optional[List[str]]; help=parameter of sample_model; run_inference_tied.py:568
+  laser_run_inference_tied_sample_model__fs_sequence_temp: object | None = None  # type=Optional[float]; help=parameter of sample_model; run_inference_tied.py:567
+  laser_run_inference_tied_sample_model__gly_budget: int = 0  # type=Optional[int]; help=parameter of sample_model; run_inference_tied.py:569
+  laser_run_inference_tied_sample_model__ignore_chain_mask_zeros: bool = False  # type=bool; help=parameter of sample_model; run_inference_tied.py:568
+  laser_run_inference_tied_sample_model__interpolation_lambda: float | None = None  # type=float; help=parameter of sample_model; run_inference_tied.py:566; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_tied_sample_model__model: object | None = None  # type=LASErMPNN; help=parameter of sample_model; run_inference_tied.py:566; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_tied_sample_model__params: object | None = None  # type=dict; help=parameter of sample_model; run_inference_tied.py:566; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_tied_sample_model__repack_all: bool = False  # type=bool; help=parameter of sample_model; run_inference_tied.py:568
+  laser_run_inference_tied_sample_model__sequence_temp: object | None = None  # type=Optional[float]; help=parameter of sample_model; run_inference_tied.py:566; UNRESOLVED required parameter; no upstream default
+  laser_run_inference_tied_sample_model__use_edo: bool = False  # type=bool; help=parameter of sample_model; run_inference_tied.py:566
+  laser_run_inference_tied_sample_model__verbose: bool = False  # type=bool; help=parameter of sample_model; run_inference_tied.py:567
+
+@dataclass(frozen=True)
+class LaserRunPredictPartialChargesKnobs:
+  """run_predict_partial_charges.py."""
+
+  laser_run_predict_partial_charges__input_pdb: str | None = None  # type=str; help=Path to input PDB file containing ligand coordinates.; run_predict_partial_charges.py:74; UNRESOLVED no default literal
+  laser_run_predict_partial_charges__model_weights: str | None = None  # type=str; help=Path to ligand encoder weights.; run_predict_partial_charges.py:76; UNRESOLVED default is not a literal (default_weights_path)
+  laser_run_predict_partial_charges__output_pdb: str | None = None  # type=str; help=Output PDB path with predicted partial charges as b-factors.; run_predict_partial_charges.py:75; UNRESOLVED no default literal
+
+@dataclass(frozen=True)
+class LaserRunProofreadingKnobs:
+  """run_proofreading.py."""
+
+  laser_run_proofreading__device: str = 'cuda:0'  # type=str; help=Device to run the model on.; run_proofreading.py:228
+  laser_run_proofreading__disable_inference_dropout: bool = False  # type=bool; help=Disable inference dropout.; run_proofreading.py:230
+  laser_run_proofreading__n_decoding_orders: int = 10  # type=int; help=Number of decoding orders to use.; run_proofreading.py:232
+  laser_run_proofreading__n_dropouts: int = 10  # type=int; help=Number of dropouts to use.; run_proofreading.py:233
+  laser_run_proofreading__output_dir: str | None = None  # type=str; help=Path to an output directory.; run_proofreading.py:227; UNRESOLVED no default literal
+  laser_run_proofreading__pdb_file: str | None = None  # type=str; help=Path to the pdb file of the protein complex.; run_proofreading.py:226; UNRESOLVED no default literal
+  laser_run_proofreading__repack_all: bool = False  # type=bool; help=Repack all residues.; run_proofreading.py:234
+  laser_run_proofreading__selection_string: str = ''  # type=str; help=A Prody selection string to override the default behavior of proofreading the binding site only.; run_proofreading.py:235
+  laser_run_proofreading__silent: bool = False  # type=bool; help=Disable printing.; run_proofreading.py:231
+  laser_run_proofreading__weights: str | None = None  # type=str; help=f'Path to the weights file. Defaults to {default_weights_path}.'; run_proofreading.py:229; UNRESOLVED default is not a literal (default_weights_path)
+
+@dataclass(frozen=True)
+class LaserThreadAndScoreSequencesKnobs:
+  """scripts/thread_and_score_sequences.py."""
+
+  laser_thread_and_score_sequences__backbone: str | None = None  # type=str; help=Path to the pdb file of the backbone structure to thread the sequences onto.; scripts/thread_and_score_sequences.py:42; UNRESOLVED no default literal
+  laser_thread_and_score_sequences__fasta: str | None = None  # type=str; help=Path to the fasta file of sequences to be threaded onto the input backbone.; scripts/thread_and_score_sequences.py:41; UNRESOLVED no default literal
+  laser_thread_and_score_sequences__output_dir: str | None = None  # type=str; help=Path to the output directory where the threaded pdb files will be saved.; scripts/thread_and_score_sequences.py:43; UNRESOLVED no default literal
+  laser_thread_and_score_sequences__weights: str | None = None  # type=str; help=Path to the weights file for LASErMPNN. If not provided, default weights will be used.; scripts/thread_and_score_sequences.py:44; UNRESOLVED default is not a literal (default_weights)
+
+@dataclass(frozen=True)
+class PottsAssignFixedChainsKnobs:
+  """helper_scripts/assign_fixed_chains.py."""
+
+  potts_assign_fixed_chains__chain_list: str = ''  # type=str; help=List of the chains that need to be designed; helper_scripts/assign_fixed_chains.py:32
+  potts_assign_fixed_chains__input_path: str | None = None  # type=str; help=Path to the parsed PDBs; helper_scripts/assign_fixed_chains.py:30
+  potts_assign_fixed_chains__output_path: str | None = None  # type=str; help=Path to the output dictionary; helper_scripts/assign_fixed_chains.py:31
+
+@dataclass(frozen=True)
+class PottsEnergyPredictionKnobs:
+  """energy_prediction.py."""
+
+  potts_energy_prediction__config: str | None = None  # type=str; help=; energy_prediction.py:125; UNRESOLVED required; no upstream default
+
+@dataclass(frozen=True)
+class PottsMakeBiasAAKnobs:
+  """helper_scripts/make_bias_AA.py."""
+
+  potts_make_bias_AA__AA_list: str = ''  # type=str; help=List of AAs to be biased; helper_scripts/make_bias_AA.py:20
+  potts_make_bias_AA__bias_list: str = ''  # type=str; help=AA bias strengths; helper_scripts/make_bias_AA.py:21
+  potts_make_bias_AA__output_path: str | None = None  # type=str; help=Path to the output dictionary; helper_scripts/make_bias_AA.py:19
+
+@dataclass(frozen=True)
+class PottsMakeBiasPerResDictKnobs:
+  """helper_scripts/make_bias_per_res_dict.py."""
+
+  potts_make_bias_per_res_dict__input_path: str | None = None  # type=str; help=Path to the parsed PDBs; helper_scripts/make_bias_per_res_dict.py:49
+  potts_make_bias_per_res_dict__output_path: str | None = None  # type=str; help=Path to the output dictionary; helper_scripts/make_bias_per_res_dict.py:50
+
+@dataclass(frozen=True)
+class PottsMakeFixedPositionsDictKnobs:
+  """helper_scripts/make_fixed_positions_dict.py."""
+
+  potts_make_fixed_positions_dict__chain_list: str = ''  # type=str; help=List of the chains that need to be fixed; helper_scripts/make_fixed_positions_dict.py:53
+  potts_make_fixed_positions_dict__input_path: str | None = None  # type=str; help=Path to the parsed PDBs; helper_scripts/make_fixed_positions_dict.py:51
+  potts_make_fixed_positions_dict__output_path: str | None = None  # type=str; help=Path to the output dictionary; helper_scripts/make_fixed_positions_dict.py:52
+  potts_make_fixed_positions_dict__position_list: str = ''  # type=str; help=Position lists, e.g. 11 12 14 18, 1 2 3 4 for first chain and the second chain; helper_scripts/make_fixed_positions_dict.py:54
+  potts_make_fixed_positions_dict__specify_non_fixed: bool = False  # type=bool; help=Allows specifying just residues that need to be designed (default: false); helper_scripts/make_fixed_positions_dict.py:55
+
+@dataclass(frozen=True)
+class PottsMakePosNegTiedPositionsDictKnobs:
+  """helper_scripts/make_pos_neg_tied_positions_dict.py."""
+
+  potts_make_pos_neg_tied_positions_dict__chain_list: str = ''  # type=str; help=List of the chains that need to be fixed; helper_scripts/make_pos_neg_tied_positions_dict.py:61
+  potts_make_pos_neg_tied_positions_dict__homooligomer: int = 0  # type=int; help=If 0 do not use, if 1 then design homooligomer; helper_scripts/make_pos_neg_tied_positions_dict.py:63
+  potts_make_pos_neg_tied_positions_dict__input_path: str | None = None  # type=str; help=Path to the parsed PDBs; helper_scripts/make_pos_neg_tied_positions_dict.py:59
+  potts_make_pos_neg_tied_positions_dict__output_path: str | None = None  # type=str; help=Path to the output dictionary; helper_scripts/make_pos_neg_tied_positions_dict.py:60
+  potts_make_pos_neg_tied_positions_dict__pos_neg_chain_betas: str = ''  # type=str; help=Chain beta list for the chain lists provided; 1.0 for the positive design, -0.1 or -0.5 for negative, 0.0 means do not use that chain info; helper_scripts/make_pos_neg_tied_positions_dict.py:65
+  potts_make_pos_neg_tied_positions_dict__pos_neg_chain_list: str = ''  # type=str; help=Chain lists to be tied together; helper_scripts/make_pos_neg_tied_positions_dict.py:64
+  potts_make_pos_neg_tied_positions_dict__position_list: str = ''  # type=str; help=Position lists, e.g. 11 12 14 18, 1 2 3 4 for first chain and the second chain; helper_scripts/make_pos_neg_tied_positions_dict.py:62
+
+@dataclass(frozen=True)
+class PottsMakePssmInputDictKnobs:
+  """helper_scripts/make_pssm_input_dict.py."""
+
+  potts_make_pssm_input_dict__PSSM_input_path: str | None = None  # type=str; help=Path to PSSMs saved as npz files.; helper_scripts/make_pssm_input_dict.py:31
+  potts_make_pssm_input_dict__jsonl_input_path: str | None = None  # type=str; help=Path where to load .jsonl dictionary of parsed pdbs.; helper_scripts/make_pssm_input_dict.py:32
+  potts_make_pssm_input_dict__output_path: str | None = None  # type=str; help=Path where to save .jsonl dictionary with PSSM bias.; helper_scripts/make_pssm_input_dict.py:33
+
+@dataclass(frozen=True)
+class PottsMakeTiedPositionsDictKnobs:
+  """helper_scripts/make_tied_positions_dict.py."""
+
+  potts_make_tied_positions_dict__chain_list: str = ''  # type=str; help=List of the chains that need to be fixed; helper_scripts/make_tied_positions_dict.py:51
+  potts_make_tied_positions_dict__homooligomer: int = 0  # type=int; help=If 0 do not use, if 1 then design homooligomer; helper_scripts/make_tied_positions_dict.py:53
+  potts_make_tied_positions_dict__input_path: str | None = None  # type=str; help=Path to the parsed PDBs; helper_scripts/make_tied_positions_dict.py:49
+  potts_make_tied_positions_dict__output_path: str | None = None  # type=str; help=Path to the output dictionary; helper_scripts/make_tied_positions_dict.py:50
+  potts_make_tied_positions_dict__position_list: str = ''  # type=str; help=Position lists, e.g. 11 12 14 18, 1 2 3 4 for first chain and the second chain; helper_scripts/make_tied_positions_dict.py:52
+
+@dataclass(frozen=True)
+class PottsMutationSearchKnobs:
+  """mutation_search.py."""
+
+  potts_mutation_search__allowed_from_aas: str | None = None  # type=str; help=String of allowed source AAs; mutation_search.py:776
+  potts_mutation_search__allowed_to_aas: str | None = None  # type=str; help=String of allowed target AAs; mutation_search.py:777
+  potts_mutation_search__binding_energy_cutoff: float | None = None  # type=float; help=Contact cutoff in Angstroms; mutation_search.py:781
+  potts_mutation_search__binding_energy_json: str | None = None  # type=str; help=Path to binding energy JSON; mutation_search.py:780
+  potts_mutation_search__cfg_path: str | None = None  # type=str; help=Path to model config YAML; mutation_search.py:764; UNRESOLVED required; no upstream default
+  potts_mutation_search__disallowed_chains: tuple[object, ...] = ()  # type=unknown; help=Chains to exclude from mutation; mutation_search.py:775
+  potts_mutation_search__energy_mode: str = 'both'  # type=str; choices=('stability', 'binding', 'both'); help=Scoring mode; mutation_search.py:782
+  potts_mutation_search__max_keep_per_depth: int = 2000  # type=int; help=Hard cap on kept candidates; mutation_search.py:771
+  potts_mutation_search__max_mutations: int = 4  # type=int; help=Max mutation depth; mutation_search.py:768
+  potts_mutation_search__no_pareto_front: bool = False  # type=bool; help=Disable Pareto front calculation; mutation_search.py:784
+  potts_mutation_search__pdb_paths: object | None = None  # type=unknown; help=List of PDB file paths; mutation_search.py:763; UNRESOLVED required; no upstream default
+  potts_mutation_search__per_position_quota: int | None = None  # type=int; help=Max candidates per position; mutation_search.py:772
+  potts_mutation_search__plot_dir: str | None = None  # type=str; help=Output directory for plots and CSVs; mutation_search.py:765; UNRESOLVED required; no upstream default
+  potts_mutation_search__rrf_k: int = 60  # type=int; help=RRF constant for 'both' mode; mutation_search.py:783
+  potts_mutation_search__top_percent: float = 10.0  # type=float; help=Top percentage to keep; mutation_search.py:769
+  potts_mutation_search__top_percent_decay_base: float = 1.0  # type=float; help=Decay base for top_percent; mutation_search.py:770
+
+@dataclass(frozen=True)
+class PottsParseMultipleChainsKnobs:
+  """helper_scripts/parse_multiple_chains.py."""
+
+  potts_parse_multiple_chains__ca_only: bool = False  # type=bool; help=parse a backbone-only structure (default: false); helper_scripts/parse_multiple_chains.py:160
+  potts_parse_multiple_chains__input_path: str | None = None  # type=str; help=Path to a folder with pdb files, e.g. /home/my_pdbs/; helper_scripts/parse_multiple_chains.py:158
+  potts_parse_multiple_chains__output_path: str | None = None  # type=str; help=Path where to save .jsonl dictionary of parsed pdbs; helper_scripts/parse_multiple_chains.py:159
+
+@dataclass(frozen=True)
+class PottsPottsMpnnUtilsPottsMPNNSampleKnobs:
+  """potts_mpnn_utils.py:1321:sample."""
+
+  potts_potts_mpnn_utils_PottsMPNN_sample__S_true: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_sample__X: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_sample__bias_AAs_np: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__bias_by_res: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__chain_M_pos: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__chain_encoding_all: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_sample__chain_mask: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_sample__mask: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__omit_AA_mask: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__omit_AAs_np: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__pssm_bias: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__pssm_bias_flag: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__pssm_coef: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__pssm_log_odds_flag: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__pssm_log_odds_mask: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__pssm_multi: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+  potts_potts_mpnn_utils_PottsMPNN_sample__randn: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_sample__residue_idx: object | None = None  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_sample__temperature: float = 1.0  # type=unknown; help=parameter of sample; potts_mpnn_utils.py:1321
+
+@dataclass(frozen=True)
+class PottsPottsMpnnUtilsPottsMPNNTiedSampleKnobs:
+  """potts_mpnn_utils.py:1490:tied_sample."""
+
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__S_true: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__X: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__bias_AAs_np: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__bias_by_res: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__chain_M_pos: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__chain_encoding_all: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__chain_mask: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__mask: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__omit_AA_mask: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__omit_AAs_np: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__pssm_bias: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__pssm_bias_flag: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__pssm_coef: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__pssm_log_odds_flag: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__pssm_log_odds_mask: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__pssm_multi: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__randn: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__residue_idx: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490; UNRESOLVED required parameter; no upstream default
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__temperature: float = 1.0  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__tied_beta: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+  potts_potts_mpnn_utils_PottsMPNN_tied_sample__tied_pos: object | None = None  # type=unknown; help=parameter of tied_sample; potts_mpnn_utils.py:1490
+
+@dataclass(frozen=True)
+class PottsSampleSeqsKnobs:
+  """sample_seqs.py."""
+
+  potts_sample_seqs__config: str | None = None  # type=str; help=; sample_seqs.py:414; UNRESOLVED required; no upstream default
+
+@dataclass(frozen=True)
+class PottsTrainingKnobs:
+  """training/training.py."""
+
+  potts_training__backbone_noise: float = 0.2  # type=float; help=amount of noise added to backbone during training; training/training.py:244
+  potts_training__batch_size: int = 10000  # type=int; help=number of tokens for one batch; training/training.py:237
+  potts_training__debug: bool = False  # type=bool; help=minimal data loading for debugging; training/training.py:246
+  potts_training__dropout: float = 0.1  # type=float; help=dropout level; 0.0 means no dropout; training/training.py:243
+  potts_training__gradient_norm: float = -1.0  # type=float; help=clip gradient norm, set to negative to omit clipping; training/training.py:247
+  potts_training__hidden_dim: int = 128  # type=int; help=hidden model dimension; training/training.py:239
+  potts_training__max_protein_length: int = 10000  # type=int; help=maximum length of the protein complext; training/training.py:238
+  potts_training__mixed_precision: bool = True  # type=bool; help=train with mixed precision; training/training.py:248
+  potts_training__num_decoder_layers: int = 3  # type=int; help=number of decoder layers; training/training.py:241
+  potts_training__num_encoder_layers: int = 3  # type=int; help=number of encoder layers; training/training.py:240
+  potts_training__num_epochs: int = 200  # type=int; help=number of epochs to train for; training/training.py:233
+  potts_training__num_examples_per_epoch: int = 1000000  # type=int; help=number of training example to load for one epoch; training/training.py:236
+  potts_training__num_neighbors: int = 48  # type=int; help=number of neighbors for the sparse graph; training/training.py:242
+  potts_training__path_for_outputs: str = './exp_020'  # type=str; help=path for logs and model weights; training/training.py:231
+  potts_training__path_for_training_data: str = 'my_path/pdb_2021aug02'  # type=str; help=path for loading training data; training/training.py:230
+  potts_training__previous_checkpoint: str = ''  # type=str; help=path for previous model weights, e.g. file.pt; training/training.py:232
+  potts_training__reload_data_every_n_epochs: int = 2  # type=int; help=reload training data every n epochs; training/training.py:235
+  potts_training__rescut: float = 3.5  # type=float; help=PDB resolution cutoff; training/training.py:245
+  potts_training__save_model_every_n_epochs: int = 10  # type=int; help=save model weights every n epochs; training/training.py:234
+
+@dataclass(frozen=True)
+class PottsmpnnCfgKnobs:
+  """cfg.model/cfg.inference ∪ example YAML."""
+
+  pottsmpnn_cfg__chain_dict_json: object | None = None  # type=yaml; help=example YAML key; inputs/example_config_sample_seqs.yaml:6
+  pottsmpnn_cfg__dev: str = 'cuda'  # type=yaml; help=example YAML key; inputs/example_config_energy_prediction.yaml:1
+  pottsmpnn_cfg__inference__bias_AA_json: str = ''  # type=yaml; help=yaml+ast; first read run_utils.py:581; inputs/example_config_sample_seqs.yaml:33
+  pottsmpnn_cfg__inference__bias_by_res_json: str = ''  # type=yaml; help=yaml+ast; first read run_utils.py:598; inputs/example_config_sample_seqs.yaml:35
+  pottsmpnn_cfg__inference__binding_energy_cutoff: int = 8  # type=yaml; help=yaml+ast; first read sample_seqs.py:308; inputs/example_config_energy_prediction.yaml:22
+  pottsmpnn_cfg__inference__binding_energy_json: object | None = None  # type=yaml; help=yaml+ast; first read run_utils.py:649; inputs/example_config_energy_prediction.yaml:21
+  pottsmpnn_cfg__inference__binding_energy_optimization: str = 'none'  # type=yaml; help=yaml+ast; first read sample_seqs.py:162; inputs/example_config_sample_seqs.yaml:24
+  pottsmpnn_cfg__inference__chain_dict: object | None = None  # type=yaml; help=example YAML key; inputs/example_config_energy_prediction.yaml:25
+  pottsmpnn_cfg__inference__chain_ranges: str = 'inputs/example_chain_ranges.json'  # type=yaml; help=yaml+ast; first read energy_prediction.py:101; inputs/example_config_energy_prediction.yaml:26
+  pottsmpnn_cfg__inference__ddG: bool = True  # type=yaml; help=yaml+ast; first read energy_prediction.py:59; inputs/example_config_energy_prediction.yaml:17
+  pottsmpnn_cfg__inference__decoding_order_offset: int = 0  # type=yaml; help=yaml+ast; first read sample_seqs.py:202; inputs/example_config_sample_seqs.yaml:21
+  pottsmpnn_cfg__inference__exclude_chains: object | None = None  # type=cfg-attr; help=cfg attribute read; run_utils.py:755; UNRESOLVED cfg attribute is read but has no example-YAML default
+  pottsmpnn_cfg__inference__filter: bool = False  # type=yaml; help=yaml+ast; first read mutation_search.py:397; inputs/example_config_energy_prediction.yaml:20
+  pottsmpnn_cfg__inference__fix_decoding_order: bool = True  # type=yaml; help=yaml+ast; first read sample_seqs.py:201; inputs/example_config_sample_seqs.yaml:20
+  pottsmpnn_cfg__inference__fixed_positions_json: str = ''  # type=yaml; help=yaml+ast; first read run_utils.py:554; inputs/example_config_sample_seqs.yaml:30
+  pottsmpnn_cfg__inference__max_tokens: int = 20000  # type=yaml; help=yaml+ast; first read run_utils.py:878; inputs/example_config_energy_prediction.yaml:19
+  pottsmpnn_cfg__inference__mean_norm: bool = False  # type=yaml; help=yaml+ast; first read mutation_search.py:396; inputs/example_config_energy_prediction.yaml:18
+  pottsmpnn_cfg__inference__noise: float = 0.0  # type=yaml; help=yaml+ast; first read energy_prediction.py:34; inputs/example_config_energy_prediction.yaml:24
+  pottsmpnn_cfg__inference__num_samples: int = 1  # type=yaml; help=yaml+ast; first read sample_seqs.py:40; inputs/example_config_sample_seqs.yaml:16
+  pottsmpnn_cfg__inference__omit_AA_json: str = ''  # type=yaml; help=yaml+ast; first read run_utils.py:572; inputs/example_config_sample_seqs.yaml:32
+  pottsmpnn_cfg__inference__omit_AAs: tuple[object, ...] = ()  # type=yaml; help=yaml+ast; first read run_utils.py:607; inputs/example_config_sample_seqs.yaml:36
+  pottsmpnn_cfg__inference__optimization_mode: str = 'potts'  # type=yaml; help=yaml+ast; first read sample_seqs.py:130; inputs/example_config_sample_seqs.yaml:22
+  pottsmpnn_cfg__inference__optimization_temperature: float = 0.0  # type=yaml; help=yaml+ast; first read sample_seqs.py:39; inputs/example_config_sample_seqs.yaml:23
+  pottsmpnn_cfg__inference__optimize_fasta: str = ''  # type=yaml; help=yaml+ast; first read sample_seqs.py:40; inputs/example_config_sample_seqs.yaml:28
+  pottsmpnn_cfg__inference__optimize_pdb: bool = False  # type=yaml; help=yaml+ast; first read sample_seqs.py:40; inputs/example_config_sample_seqs.yaml:27
+  pottsmpnn_cfg__inference__pssm_bias_flag: bool = False  # type=yaml; help=yaml+ast; first read sample_seqs.py:348; inputs/example_config_sample_seqs.yaml:40
+  pottsmpnn_cfg__inference__pssm_json: str = ''  # type=yaml; help=yaml+ast; first read run_utils.py:562; inputs/example_config_sample_seqs.yaml:31
+  pottsmpnn_cfg__inference__pssm_log_odds_flag: bool = False  # type=yaml; help=yaml+ast; first read sample_seqs.py:349; inputs/example_config_sample_seqs.yaml:39
+  pottsmpnn_cfg__inference__pssm_multi: float = 0.0  # type=yaml; help=yaml+ast; first read sample_seqs.py:348; inputs/example_config_sample_seqs.yaml:38
+  pottsmpnn_cfg__inference__pssm_threshold: float = 0.0  # type=yaml; help=yaml+ast; first read sample_seqs.py:198; inputs/example_config_sample_seqs.yaml:37
+  pottsmpnn_cfg__inference__skip_gaps: bool = False  # type=yaml; help=yaml+ast; first read energy_prediction.py:62; inputs/example_config_energy_prediction.yaml:23
+  pottsmpnn_cfg__inference__temperature: float = 0.1  # type=yaml; help=yaml+ast; first read sample_seqs.py:38; inputs/example_config_sample_seqs.yaml:17
+  pottsmpnn_cfg__inference__tied_epistasis: object | None = None  # type=cfg-attr; help=cfg attribute read; sample_seqs.py:361; UNRESOLVED cfg attribute is read but has no example-YAML default
+  pottsmpnn_cfg__inference__tied_positions_json: str = ''  # type=yaml; help=yaml+ast; first read run_utils.py:590; inputs/example_config_sample_seqs.yaml:34
+  pottsmpnn_cfg__inference__write_pdb: bool = True  # type=yaml; help=yaml+ast; first read sample_seqs.py:124; inputs/example_config_sample_seqs.yaml:29
+  pottsmpnn_cfg__input_dir: str = 'inputs/example_pdbs'  # type=yaml; help=example YAML key; inputs/example_config_energy_prediction.yaml:5
+  pottsmpnn_cfg__input_list: object | None = None  # type=yaml; help=example YAML key; inputs/example_config_energy_prediction.yaml:4; UNRESOLVED YAML defaults disagree: inputs/example_config_energy_prediction.yaml:4='inputs/example_list_energy_prediction.txt'; inputs/example_config_sample_seqs.yaml:4='inputs/example_list_sample_seqs.txt'
+  pottsmpnn_cfg__model__check_path: str = 'vanilla_model_weights/pottsmpnn_20.pt'  # type=yaml; help=yaml+ast; first read energy_prediction.py:32; inputs/example_config_energy_prediction.yaml:9
+  pottsmpnn_cfg__model__edge_features: int = 128  # type=yaml; help=example YAML key; inputs/example_config_energy_prediction.yaml:11
+  pottsmpnn_cfg__model__hidden_dim: int = 128  # type=yaml; help=yaml+ast; first read energy_prediction.py:33; inputs/example_config_energy_prediction.yaml:10
+  pottsmpnn_cfg__model__num_edges: int = 48  # type=yaml; help=yaml+ast; first read energy_prediction.py:34; inputs/example_config_energy_prediction.yaml:14
+  pottsmpnn_cfg__model__num_layers: int = 3  # type=yaml; help=yaml+ast; first read energy_prediction.py:34; inputs/example_config_energy_prediction.yaml:13
+  pottsmpnn_cfg__model__potts_dim: int = 400  # type=yaml; help=yaml+ast; first read energy_prediction.py:34; inputs/example_config_energy_prediction.yaml:12
+  pottsmpnn_cfg__model__vocab: int = 21  # type=yaml; help=yaml+ast; first read energy_prediction.py:29; inputs/example_config_energy_prediction.yaml:15
+  pottsmpnn_cfg__mutant_csv: object | None = None  # type=yaml; help=example YAML key; inputs/example_config_energy_prediction.yaml:7
+  pottsmpnn_cfg__mutant_fasta: object | None = None  # type=yaml; help=example YAML key; inputs/example_config_energy_prediction.yaml:6
+  pottsmpnn_cfg__out_dir: object | None = None  # type=yaml; help=example YAML key; inputs/example_config_energy_prediction.yaml:2; UNRESOLVED YAML defaults disagree: inputs/example_config_energy_prediction.yaml:2='outputs/example_energy_prediction'; inputs/example_config_sample_seqs.yaml:2='outputs/example_sequence_outputs'
+  pottsmpnn_cfg__out_name: object | None = None  # type=yaml; help=example YAML key; inputs/example_config_energy_prediction.yaml:3; UNRESOLVED YAML defaults disagree: inputs/example_config_energy_prediction.yaml:3='example_energy_prediction'; inputs/example_config_sample_seqs.yaml:3='sample_run'
+
+@dataclass(frozen=True)
+class ProtonPottsPottsMpnnPhPHDesignCriteriaKnobs:
+  """foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:94:PHDesignCriteria."""
+
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__adjacent_repeat_weight: float = 0.0  # type=float; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:156
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__backend: str = 'potts'  # type=str; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:97
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__block_max_rounds: int = 10  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:174
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__block_size: int = 2  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:144
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__candidate_pool: int = 12  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:220
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__center_count: int = 1  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:195
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__center_protonation_types: tuple[object, ...] = ('HIS-P', 'ASP-P', 'GLU-P')  # type=List[str]; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:109
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__center_types: tuple[object, ...] = ()  # type=List[str]; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:203
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__combined_lambda: float = 1.0  # type=float; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:124
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__cv_max: int = 50  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:130
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__cv_patience: int = 3  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:129
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__dep_map: object | None = None  # type=Dict[str, List[str]]; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:110; UNRESOLVED default is not a literal (dict(DEFAULT_DEP_MAP))
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__explicit_centers: tuple[object, ...] = ()  # type=List[Dict]; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:198
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__forbidden_tokens: object | None = None  # type=List[str]; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:184; UNRESOLVED default is not a literal (list(DEFAULT_FORBIDDEN_TOKENS))
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__global_weight: float = 0.0  # type=float; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:145
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__infill_scope: str = 'neighbourhood'  # type=str; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:223
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__max_mutations: int = 0  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:236
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__max_plans_per_seed: int = 8  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:222
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__method: str = 'converged_mcmc'  # type=str; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:122
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__n_plan_samples: int = 64  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:221
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__neighbour_k: int = 0  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:230
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__num_designs: int = 8  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:185
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__placement_by: str = 'scan_potts'  # type=str; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:212
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__placement_label: str = ''  # type=str; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:215
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__placement_region: tuple[object, ...] = ('all',)  # type=List[str]; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:207
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__placement_seq_masked: bool = False  # type=bool; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:120
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__rank_normalize: bool = False  # type=bool; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:146
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__record_trajectory: bool = False  # type=bool; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:191
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__repetitive_window_gate_types: tuple[object, ...] = ()  # type=List[str]; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:165
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__repetitive_window_parents: tuple[object, ...] = ()  # type=List[str]; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:164
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__repetitive_window_radius: int = 2  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:163
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__repetitive_window_weight: float = 0.0  # type=float; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:162
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__samples_per_site: int = 4  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:128
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__seed_source: str = 'inverse'  # type=str; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:182
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__selective: bool = True  # type=bool; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:123
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__selective_source: str = 'potts'  # type=str; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:107
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__self_weight: float = 1.0  # type=float; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:173
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__sweep_order: str = 'position'  # type=str; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:227
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__temperature: float = 0.1  # type=float; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:126
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__topk_sites: int = 2  # type=int; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:111
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__two_phase_frac: float = 0.5  # type=float; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:125
+  protonpotts_potts_mpnn_ph_PHDesignCriteria__zscale_mode: str = 'block'  # type=str; help=field of PHDesignCriteria; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:152
+
+@dataclass(frozen=True)
+class ProtonPottsPottsMpnnPhPottsMPNNPHEngineRunPhRedesignKnobs:
+  """foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:1030:run_ph_redesign."""
+
+  protonpotts_potts_mpnn_ph_PottsMPNNPHEngine_run_ph_redesign__atom_array: object | None = None  # type=AtomArray; help=parameter of run_ph_redesign; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:1033; UNRESOLVED required parameter; no upstream default
+  protonpotts_potts_mpnn_ph_PottsMPNNPHEngine_run_ph_redesign__binder_chain: str | None = None  # type=str; help=parameter of run_ph_redesign; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:1034; UNRESOLVED required parameter; no upstream default
+  protonpotts_potts_mpnn_ph_PottsMPNNPHEngine_run_ph_redesign__criteria_list: object | None = None  # type=Sequence[PHDesignCriteria]; help=parameter of run_ph_redesign; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:1035; UNRESOLVED required parameter; no upstream default
+  protonpotts_potts_mpnn_ph_PottsMPNNPHEngine_run_ph_redesign__initial_sequences: object | None = None  # type=Optional[Sequence[str]]; help=parameter of run_ph_redesign; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:1037
+  protonpotts_potts_mpnn_ph_PottsMPNNPHEngine_run_ph_redesign__n_jobs: int = 1  # type=int; help=parameter of run_ph_redesign; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:1038
+  protonpotts_potts_mpnn_ph_PottsMPNNPHEngine_run_ph_redesign__seed: int = 0  # type=int; help=parameter of run_ph_redesign; foundry/models/mpnn/src/mpnn/inference_engines/potts_mpnn_ph.py:1036
+
+# MANUAL (not AST-derivable)
+# Input-list rows parsed by PottsMPNN sample_seqs.py:81-94.
+# Line format: pdb|designed:chains|fixed:chains
+@dataclass(frozen=True)
+class pottsmpnn_input_list:
+  """Manual input-list fields. The extractor --check diff skips this block."""
+
+  pottsmpnn_input_list__pdb: str | None = None  # type=str; help=PDB stem (text before the first |); sample_seqs.py:81-94
+  pottsmpnn_input_list__designed_chains: str | None = None  # type=str; help=designed chains (colon-separated); sample_seqs.py:81-94
+  pottsmpnn_input_list__fixed_chains: str | None = None  # type=str; help=fixed chains (colon-separated); sample_seqs.py:81-94
+
+
+@dataclass(frozen=True)
+class ThermoModelKnobs:
+  """Upstream ThermoMPNN-D v2_ssm.py command-line flags (argparse block, v2_ssm.py:538-576).
+
+  Upstream exposes no checkpoint, ensemble or dtype flag: the checkpoint is chosen by --mode
+  through get_config/get_model (v2_ssm.py:477-478), ensembling and precision are not options.
+  """
+
+  thermo_model__mode: str = "single"  # type=str; --mode single|additive|epistatic; v2_ssm.py:540-545
+  thermo_model__pdb: str = "./2OCJ.pdb"  # type=str; --pdb; v2_ssm.py:546
+  thermo_model__batch_size: int = 256  # type=int; --batch_size (epistatic only, v2_ssm.py:495); v2_ssm.py:547-553
+  thermo_model__out: str = "ssm"  # type=str; --out csv prefix; v2_ssm.py:554-555
+  thermo_model__chains: list[str] | None = None  # nargs=+; --chains; v2_ssm.py:556-560
+  thermo_model__threshold: float = -0.5  # type=float; --threshold; v2_ssm.py:561-566
+  thermo_model__distance: float = 5.0  # type=float; --distance (CA-CA cutoff); v2_ssm.py:567-572
+  thermo_model__ss_penalty: bool = False  # store_true; --ss_penalty; v2_ssm.py:573-577
+
+@dataclass(frozen=True)
+class CalibyKnobs:
+  """Upstream Caliby (ProteinDesignLab/caliby @ 41d31560c3c73d7980d94f40f3c852b90bfab5c0) run knobs.
+
+  Re-derived 261104 from the upstream files, not from aminx. Sources: the packaged sampling config
+  caliby/configs/seq_des/inference.yaml (line numbers below), the Hydra run configs
+  caliby/configs/eval/sampling/seq_des.yaml, and the Python API caliby/api.py. The invented knobs of
+  the earlier attempt (mcmc_*, cooling_schedule, conformer_generator, af3_diffusion_steps) do not exist
+  in any of these files (rg over the whole repo, 261104). The packer's sigma schedule (s_min 0.01,
+  s_max 80, rho 7) is read from the checkpoint's own config (checkpoint cfg model.denoiser.interpolant)
+  and is not a run knob.
+  """
+
+  caliby_inference__batch_size: int = 4  # inference.yaml:4; subbatch size of compute_potts_params (atom_mpnn_denoiser.py:356)
+  caliby_inference__num_seqs_per_pdb: int = 1  # inference.yaml:5; sequences drawn per structure (atom_mpnn_denoiser.py:227)
+  caliby_inference__verbose: bool = True  # inference.yaml:6
+  caliby_inference__num_workers: int = 2  # inference.yaml:7; dataloader workers
+  caliby_inference__omit_aas: list[str] | None = None  # inference.yaml:10; globally banned residues, X always banned (atom_mpnn_denoiser.py:194-199)
+  caliby_inference__ensemble_ignore_res_idx_mismatch: bool = False  # inference.yaml:11; conformer-file ensembles (seq_des_utils.py:1025)
+  caliby_inference__gaussian_conformers_n_conformers: int = 0  # inference.yaml:15; atom_mpnn_denoiser.py:156-161
+  caliby_inference__gaussian_conformers_noise_std: float = 0.0  # inference.yaml:16; 0 disables (atom_mpnn_denoiser.py:157)
+  caliby_inference__potts_regularization: str = "LCP"  # inference.yaml:20; atom_mpnn_denoiser.py:216-222
+  caliby_inference__potts_sweeps: int = 500  # inference.yaml:21
+  caliby_inference__potts_proposal: str = "dlmc"  # inference.yaml:22
+  caliby_inference__potts_temperature: float = 0.01  # inference.yaml:23 (api.py:48 temperature)
+  caliby_inference__potts_rejection_step: bool = False  # inference.yaml:24
+  caliby_inference__potts_only_cond: bool = False  # inference.yaml:25; atom_mpnn_denoiser.py:168-176
+  caliby_inference__scn_packing_num_steps: int = 50  # inference.yaml:30; scn_diffusion_mlp.py:115
+  caliby_inference__scn_packing_step_scale: float = 1.5  # inference.yaml:31; scn_diffusion_mlp.py:116, edm_interpolant.py:150
+  caliby_run__seed: int = 0  # eval/sampling/seq_des.yaml:2; L.seed_everything (seq_des.py:22)
+  caliby_run__ckpt_name_or_path: str = "caliby"  # eval/sampling/seq_des.yaml:6; weights.py:11-18 registry or literal .ckpt path
+  caliby_run__pos_constraint_csv: str | None = None  # eval/sampling/seq_des.yaml:18; seq_des.py:45
+  caliby_run__run_self_consistency_eval: bool = False  # eval/sampling/seq_des.yaml:21; seq_des.py:66
+  caliby_api__use_primary_res_type: bool = True  # api.py:151 ensemble_sample
+  caliby_api__out_dir: str | None = None  # api.py:94 / eval/sampling/seq_des.yaml:7
+  caliby_ckpt__augment_eps: float = 0.3  # checkpoint cfg model.denoiser.augment_eps; atom_mpnn_denoiser.py:134-139, applied only in training mode
+# END MANUAL
+# MANUAL (not AST-derivable)
+# AntiBMPNN (zeysun/AntiBMPNN @ 7e6329ba3c317e7344c6b09add72dea2390af39a), re-derived 261104 from the argparse
+# blocks. Running_AntiBMPNN_run.py:405-452 is the ProteinMPNN flag set. There is NO cdr_scheme, heavy/light chain,
+# bias_weight, ANARCI or clustering flag anywhere in the repository (rg over *.py *.sh 261104: the only CDR text is a
+# function name, CDRH3_Comb, in helper_scripts/parsing_design_result.py).
+@dataclass(frozen=True)
+class AntiBMPNNRunKnobs:
+  """Running_AntiBMPNN_run.py argparse block (lines 407-452)."""
+
+  antibmpnn_run__suppress_print: int = 0  # type=int; --suppress_print; 0 for False, 1 for True; read at :49 (print_all); Running_AntiBMPNN_run.py:407
+  antibmpnn_run__ca_only: bool = False  # type=bool; --ca_only; store_true; selects CA-only parsing and model (:148, :167); no CA-only AntiBMPNN checkpoint exists; Running_AntiBMPNN_run.py:410
+  antibmpnn_run__path_to_model_weights: str = ""  # type=str; --path_to_model_weights; NEVER READ: checkpoint dir is hard-coded '../antibmpnn_model_weights' at :35; Running_AntiBMPNN_run.py:411
+  antibmpnn_run__model_name: str = "v_48_020"  # type=str; --model_name; checkpoint stem under ../antibmpnn_model_weights (:39); the shipped files are antibmpnn_000..100.pt so the default names no file; Running_AntiBMPNN_run.py:412
+  antibmpnn_run__use_soluble_model: bool = False  # type=bool; --use_soluble_model; store_true; NEVER READ in main(); Running_AntiBMPNN_run.py:413
+  antibmpnn_run__seed: int = 0  # type=int; --seed; NEVER READ: the seed is drawn at random at :26-30; Running_AntiBMPNN_run.py:416
+  antibmpnn_run__save_score: int = 0  # type=int; --save_score; 0/1; writes scores/<name>.npz (:390-391); Running_AntiBMPNN_run.py:418
+  antibmpnn_run__save_probs: int = 0  # type=int; --save_probs; 0/1; writes probs/<name>.npz (:392-396); Running_AntiBMPNN_run.py:419
+  antibmpnn_run__score_only: int = 0  # type=int; --score_only; 0/1; scores the input backbone-sequence pair under a random decoding order (:225-270); Running_AntiBMPNN_run.py:421
+  antibmpnn_run__path_to_fasta: str = ""  # type=str; --path_to_fasta; score FASTA sequences with --score_only (:227-240); Running_AntiBMPNN_run.py:422
+  antibmpnn_run__conditional_probs_only: int = 0  # type=int; --conditional_probs_only; 0/1; log p(s_i | rest of sequence and backbone) (:271-282); Running_AntiBMPNN_run.py:425
+  antibmpnn_run__conditional_probs_only_backbone: int = 0  # type=int; --conditional_probs_only_backbone; 0/1; log p(s_i | backbone) only (:278); Running_AntiBMPNN_run.py:426
+  antibmpnn_run__unconditional_probs_only: int = 0  # type=int; --unconditional_probs_only; 0/1; one forward pass, p(s_i | backbone) (:283-293); Running_AntiBMPNN_run.py:427
+  antibmpnn_run__backbone_noise: float = 0.0  # type=float; --backbone_noise; std of Gaussian noise added to backbone atoms: augment_eps (:167); Running_AntiBMPNN_run.py:429
+  antibmpnn_run__num_seq_per_target: int = 1  # type=int; --num_seq_per_target; sequences per target; NUM_BATCHES = num_seq_per_target // batch_size (:43); Running_AntiBMPNN_run.py:430
+  antibmpnn_run__batch_size: int = 1  # type=int; --batch_size; clones per batch (:44, :221); Running_AntiBMPNN_run.py:431
+  antibmpnn_run__max_length: int = 200000  # type=int; --max_length; proteins longer than this are dropped by StructureDatasetPDB (:149); Running_AntiBMPNN_run.py:432
+  antibmpnn_run__sampling_temp: str = "0.1"  # type=str; --sampling_temp; space-separated temperatures (:45); Running_AntiBMPNN_run.py:433
+  antibmpnn_run__out_folder: str | None = None  # type=str; --out_folder; output folder (:41); Running_AntiBMPNN_run.py:435
+  antibmpnn_run__pdb_path: str = ""  # type=str; --pdb_path; single PDB to design (:147); Running_AntiBMPNN_run.py:436
+  antibmpnn_run__pdb_path_chains: str = ""  # type=str; --pdb_path_chains; chains to design; the rest are fixed (:151-157); Running_AntiBMPNN_run.py:437
+  antibmpnn_run__jsonl_path: str | None = None  # type=str; --jsonl_path; pre-parsed structures (:159); Running_AntiBMPNN_run.py:438
+  antibmpnn_run__chain_id_jsonl: str = ""  # type=str; --chain_id_jsonl; designed / fixed chain dictionary (:52); Running_AntiBMPNN_run.py:439
+  antibmpnn_run__fixed_positions_jsonl: str = ""  # type=str; --fixed_positions_jsonl; fixed-position dictionary (:63); Running_AntiBMPNN_run.py:440
+  antibmpnn_run__omit_AAs: str = "X"  # type=str; --omit_AAs; type=list: a CLI value is split into letters and REPLACES the default 'X' omit (:46, :50); Running_AntiBMPNN_run.py:441
+  antibmpnn_run__bias_AA_jsonl: str = ""  # type=str; --bias_AA_jsonl; per-letter logit bias dictionary (:100, :141-145); Running_AntiBMPNN_run.py:442
+  antibmpnn_run__bias_by_res_jsonl: str = ""  # type=str; --bias_by_res_jsonl; per-position logit bias dictionary (:124); Running_AntiBMPNN_run.py:444
+  antibmpnn_run__omit_AA_jsonl: str = ""  # type=str; --omit_AA_jsonl; per-position omitted letters (:88); Running_AntiBMPNN_run.py:445
+  antibmpnn_run__pssm_jsonl: str = ""  # type=str; --pssm_jsonl; PSSM dictionary (:75); Running_AntiBMPNN_run.py:446
+  antibmpnn_run__pssm_multi: float = 0.0  # type=float; --pssm_multi; 0.0 ignores the PSSM, 1.0 ignores the model; Running_AntiBMPNN_run.py:447
+  antibmpnn_run__pssm_threshold: float = 0.0  # type=float; --pssm_threshold; restricts letters per position via pssm_log_odds (:223); Running_AntiBMPNN_run.py:448
+  antibmpnn_run__pssm_log_odds_flag: int = 0  # type=int; --pssm_log_odds_flag; 0/1; Running_AntiBMPNN_run.py:449
+  antibmpnn_run__pssm_bias_flag: int = 0  # type=int; --pssm_bias_flag; 0/1; Running_AntiBMPNN_run.py:450
+  antibmpnn_run__tied_positions_jsonl: str = ""  # type=str; --tied_positions_jsonl; tied-position dictionary (:112); selects tied_sample (:313); Running_AntiBMPNN_run.py:452
+
+
+@dataclass(frozen=True)
+class AntiBMPNNParseResultKnobs:
+  """helper_scripts/parsing_design_result.py argparse block (lines 89-91)."""
+
+  antibmpnn_parse__dir: str | None = None  # type=str; --dir directory of .fa files; parsing_design_result.py:89
+  antibmpnn_parse__start: int | None = None  # type=int; --start first residue, 1-based (seq[start-1:end], :8,:27-28); parsing_design_result.py:90
+  antibmpnn_parse__end: int | None = None  # type=int; --end last residue, inclusive; parsing_design_result.py:91
+
+
+FAMPNN_COMMIT = "aaf788b1502ad95d5c5a84455cfc53f2544f3b45"
+
+
+@dataclass(frozen=True)
+class FampnnKnobs:
+  """Upstream FAMPNN run knobs: the union of ``configs/{seq_design,pack,score}.yaml`` plus the one in-code argument.
+
+  Derived by reading ``~/repos/fampnn`` at ``FAMPNN_COMMIT`` (261104, replaces an earlier set that named
+  ``num_scn_steps``, ``num_seq_steps``, ``sigma_min``, ``sigma_max``, ``rho`` and ``pack_each_step``; none is a
+  config key, and the sigma range and rho are checkpoint ``model_cfg`` values, not run knobs). A key shared by
+  several configs is one field; its comment lists every config line. Lines are ``seq_design.yaml`` unless
+  prefixed. Defaults are the ``seq_design.yaml`` value; ``checkpoint_path`` differs per config
+  (pack.yaml:6 ``fampnn_0_0.pt``, score.yaml:6 ``fampnn_0_3_cath.pt``). Read by code (verified with ``rg 'cfg\\.'``
+  over ``fampnn/inference/``): every key below by at least one of seq_design.py, pack.py, score_multi.py and
+  score_all_muts.py; ``fixed_pos_verbose`` only as the ``verbose=`` print flag of ``get_override_masks``
+  (pack.py:109); ``scn_diffusion.timestep_schedule.num_steps`` and ``churn_cfg.num_steps`` are YAML
+  interpolations of ``scn_diffusion.num_steps`` and are not separate knobs here.
+  """
+
+  fampnn__seed: int = 0  # type=int; seq_design.yaml:2, pack.yaml:2, score.yaml:2; seed_everything sampling_utils.py:13-16
+  fampnn__batch_size: int = 16  # type=int; :3, pack.yaml:3, score.yaml:3
+  fampnn__checkpoint_path: str = "weights/fampnn_0_3.pt"  # type=str; :6, pack.yaml:6, score.yaml:6
+  fampnn__out_dir: str = "outputs/seq_design"  # type=str; :7, pack.yaml:7, score.yaml:7
+  fampnn__pdb_dir: str | None = None  # type=str; :10, pack.yaml:10
+  fampnn__pdb_key_list: object | None = None  # type=path; :11, pack.yaml:11
+  fampnn__pdb_path: str | None = None  # type=str; score.yaml:9
+  fampnn__mutations_path: str | None = None  # type=str; score.yaml:10 (read by score_multi.py -> scoring_utils.score_seq)
+  fampnn__num_seqs_per_pdb: int = 1  # type=int; :9
+  fampnn__num_samples_per_pdb: int = 1  # type=int; pack.yaml:9
+  fampnn__presort_by_length: bool = False  # type=bool; :12 (seq_design.py:79, ordering only)
+  fampnn__fixed_pos_csv: str | None = None  # type=path; :15, pack.yaml:12 (columns fixed_pos_seq, fixed_pos_scn; sampling_utils.py:92-190)
+  fampnn__fixed_pos_verbose: bool = True  # type=bool; :16, pack.yaml:13
+  fampnn__seq_only: bool = False  # type=bool; :19 (sd_model.py:247 scn_mlm_mask)
+  fampnn__temperature: float = 0.1  # type=float; :20 (fampnn_denoiser.py:112-129; 0 = argmax)
+  fampnn__repack_last: bool = True  # type=bool; :21 (sd_model.py:273)
+  fampnn__psce_threshold: float | None = 0.3  # type=float|null; :22 (sd_model.py:255)
+  fampnn__timestep_schedule__num_steps: int = 100  # type=int; :25
+  fampnn__timestep_schedule__mode: str = "linear"  # type=str; :26 (sampling_utils.py:75-100)
+  fampnn__timestep_schedule__t_start: float = 0.0  # type=float; :27
+  fampnn__timestep_schedule__t_end: float = 1.0  # type=float; :28
+  fampnn__scn_diffusion__num_steps: int = 50  # type=int; :32, pack.yaml:17, score.yaml:14
+  fampnn__scn_diffusion__timestep_schedule__mode: str = "linear"  # type=str; :35, pack.yaml:20, score.yaml:17
+  fampnn__scn_diffusion__timestep_schedule__t_start: float = 0.0  # type=float; :36, pack.yaml:21, score.yaml:18
+  fampnn__scn_diffusion__timestep_schedule__t_end: float = 1.0  # type=float; :37, pack.yaml:22, score.yaml:19
+  fampnn__scn_diffusion__step_scale: float = 1.5  # type=float; :38, pack.yaml:23, score.yaml:20 (edm_interpolant.py:179-180)
+  fampnn__scn_diffusion__churn_cfg__s_churn: float = 0.0  # type=float; :40, pack.yaml:25, score.yaml:22 (edm_interpolant.py:139-153)
+  fampnn__scn_diffusion__churn_cfg__s_noise: float = 1.0  # type=float; :41, pack.yaml:26, score.yaml:23
+  fampnn__scn_diffusion__churn_cfg__s_t_min: float = 0.01  # type=float; :42, pack.yaml:27, score.yaml:24
+  fampnn__scn_diffusion__churn_cfg__s_t_max: float = 50.0  # type=float; :43, pack.yaml:28, score.yaml:25
+  fampnn__restrict_pos_aatype: object | None = None  # in-code argument of SeqDenoiser.sample (sd_model.py:162); no config key
+
+
+@dataclass(frozen=True)
+class FrustraModelKnobs:
+  """Upstream FrustraMPNN CLI flags and model configuration knobs.
+
+  Derived from Click CLI definitions in src/frustrampnn/cli/main.py:42-90
+  and transfer learning model configuration in src/frustrampnn/model/transfer_model.py:98-111
+  and model_utils.py:120-125.
+  """
+
+  frustra_cli__pdb: str = ""  # type=str; --pdb; src/frustrampnn/cli/main.py:42-48
+  frustra_cli__checkpoint: str = ""  # type=str; --checkpoint; src/frustrampnn/cli/main.py:49-55
+  frustra_cli__output: str = "frustration_predictions.csv"  # type=str; --output; src/frustrampnn/cli/main.py:56-62
+  frustra_cli__chains: str | None = None  # type=str; --chains; src/frustrampnn/cli/main.py:63-67
+  frustra_cli__positions: str | None = None  # type=str; --positions; src/frustrampnn/cli/main.py:68-72
+  frustra_cli__device: str | None = None  # type=str; --device; src/frustrampnn/cli/main.py:73-78
+  frustra_cli__config: str | None = None  # type=str; --config; src/frustrampnn/cli/main.py:79-84
+  frustra_cli__quiet: bool = False  # type=bool; --quiet; src/frustrampnn/cli/main.py:85-90
+  frustra_model__subtract_mut: bool = False  # type=bool; cfg.model.subtract_mut; src/frustrampnn/model/transfer_model.py:99
+  frustra_model__num_final_layers: int = 3  # type=int; cfg.model.num_final_layers; src/frustrampnn/model/transfer_model.py:100
+  frustra_model__lightattn: bool = True  # type=bool; cfg.model.lightattn; src/frustrampnn/model/transfer_model.py:101
+  frustra_model__decoding_order: str = "left-to-right"  # type=str; cfg.decoding_order; src/frustrampnn/model/transfer_model.py:104
+  frustra_model__add_esm_embeddings: bool = False  # type=bool; cfg.training.add_esm_embeddings; src/frustrampnn/model/transfer_model.py:111
+  frustra_model__hidden_dims: tuple[int, ...] = (64, 32)  # type=tuple; cfg.model.hidden_dims; src/frustrampnn/model/transfer_model.py:98
+  frustra_model__freeze_weights: bool = True  # type=bool; cfg.model.freeze_weights; src/frustrampnn/model/model_utils.py:123
+  frustra_model__load_pretrained: bool = True  # type=bool; cfg.model.load_pretrained; src/frustrampnn/model/model_utils.py:120
+# END MANUAL

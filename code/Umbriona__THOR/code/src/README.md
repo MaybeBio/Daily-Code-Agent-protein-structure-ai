@@ -1,0 +1,348 @@
+# Scripts reference
+
+What each script does and what it takes. See the [root README](https://github.com/Umbriona/THOR/blob/HEAD/README.md)
+for an overview and setup; see `scripts/archive/README.md` and
+`scripts/data_processing/archive/README.md` for retired scripts.
+
+Each `.sh` is a SLURM wrapper that runs the matching `.py` inside a Singularity
+container. **The wrappers carry absolute cluster paths and SLURM account names
+that you will need to edit.** The Python scripts take ordinary arguments and
+can be run directly.
+
+---
+
+## Generation
+
+### `scripts/generate_thor.py` — generate variants from a FASTA
+The main entry point for using a trained model. Self-contained: it computes
+ESM-1v per-position likelihoods inline, so no TFRecord preprocessing is needed.
+Writes a FASTA of variants plus per-variant metrics (generator NLL, ESM NLL,
+predicted temperature), and optionally a JSONL of softmax distributions.
+
+| Argument | |
+|---|---|
+| `--run_dir` | **required.** Trained run directory, containing `config.yaml` and `weights/epoch_<n>/` |
+| `--fasta` *or* `--sequence` | input sequences, or a single raw sequence |
+| `--weights` | weights directory *relative to `--run_dir`* — `weights_85` for a downloaded model, or `weights/epoch_39` for one of your own runs. The generator is loaded from `<run_dir>/<weights>/generator_G.h5` |
+| `--replicates` | variants per input sequence (default 1) |
+| `--temperature` | sampling temperature (default 1.0) |
+| `--esm_filter_threshold` | drop variants whose ESM NLL exceeds this |
+| `--filter_opt_cycles` | rounds of ESM-guided argmax optimisation |
+| `--store_softmax` | also write the generator's per-position probabilities as JSONL |
+| `--store_scoring_probs` | also write the scoring models' per-position probabilities as JSONL: the ESM distribution behind each emitted sequence's metrics, plus the ProteinMPNN backbone distribution when `--structure` is given. Columns are in AA20 order |
+| `--skip_ogt` | skip temperature prediction |
+| `--output_dir`, `--name`, `--gpu`, `--device`, `--batch_tokens` | |
+
+Every run also writes `<name>_run_metadata.json`: the full command line, every
+argument, the generator and model versions, and the structure's name, chain and
+sha256. ESM and ProteinMPNN appear twice in it, under `feature_models` and
+`scoring_models`, because each is used in both capacities — once to build the
+generator's input and once to score what came out. `*_scoring_probs.jsonl` is
+only ever the scoring side, and names its key `Scoring_Model` to say so.
+
+Wrapper: `generate_thor.sh`. Notebook: `generate_thor_colab.ipynb`.
+
+#### Structure input (optional, ProteinMPNN)
+
+Given a backbone, ProteinMPNN can contribute structure-derived features and a
+per-variant score. Clone it first — it is not a pip package, and its weights
+ship with the checkout:
+
+```
+git clone https://github.com/dauparas/ProteinMPNN
+```
+
+| Argument | |
+|---|---|
+| `--structure` | PDB or mmCIF file (`.pdb`, `.cif`; AlphaFold and Boltz output included). Use with `--sequence`, or alone to take the sequence from the chain |
+| `--mpnn_chain` | chain to use (default: the first chain with CA atoms) |
+| `--mpnn_dir` | path to the ProteinMPNN checkout (default `ProteinMPNN`) |
+| `--mpnn_weight` | blend weight for generator features: `0` = ESM only, `1` = ProteinMPNN only |
+| `--skip_mpnn_score` | compute features but skip per-variant scoring |
+| `--mpnn_model`, `--mpnn_soluble`, `--mpnn_backbone_noise`, `--mpnn_seed` | |
+
+The features are *unconditional* ProteinMPNN probabilities — they depend on the
+backbone, not on the sequence threaded through it — so they are computed once
+and reused for the wildtype and every variant. `--mpnn_weight` mixes them with
+the ESM features as `(1-w)*ESM + w*MPNN`.
+
+> **`--mpnn_weight > 0` is experimental.** The generator was trained on ESM-1v
+> masked marginals; blending in ProteinMPNN feeds it a distribution it never saw
+> in training. Compare against `--mpnn_weight 0` before trusting the output.
+
+Only the ESM features are blended. ESM metrics and the `--esm_filter_threshold`
+filter keep their original meaning, and the ProteinMPNN score is reported
+separately as `MPNN_nll` in the FASTA header (lower = fits the fold better).
+
+Positions must line up with the structure, so a `--sequence` that disagrees with
+the chain is rejected rather than silently misaligned. Structures with unresolved
+residues are reported: positions then refer to the resolved residues only.
+
+### `scripts/inspect_variant_scores.ipynb` — residue-level scores (prototype)
+The same viewer is built into `generate_thor_colab.ipynb` (section 3b), reading
+the files the run just wrote; an optional cell there saves a small selection of
+the figures into the downloaded zip under `figures/`. This notebook is for
+looking at a bundle later, away from Colab. Point it at a `*_thor_outputs.zip` or any output directory and,
+for each variant, it draws
+one figure per score (ESM, Generator, ProteinMPNN): a heatmap of the full
+distribution over the 20 residues at every position, with the residue actually
+present boxed and the wildtype residue marked, plus a track above it showing how
+much probability that residue got — a short bar under a high wildtype mark is a
+substitution the model dislikes.
+
+Rows are grouped by side-chain chemistry rather than alphabetically, and the view
+is windowed with a slider plus a jump-to-substitution control, since whole
+sequences do not fit on a screen. A **substitutions only** toggle drops every
+position that did not change, which is usually the view you want.
+
+Needs `--store_scoring_probs` for the ESM and ProteinMPNN panels and
+`--store_softmax` for the generator panel; a missing file is reported and that
+figure skipped. An optional cell recomputes the ProteinMPNN probabilities from a
+structure and writes them back into `*_scoring_probs.jsonl`, for bundles made
+before those were stored — they depend only on the backbone, so the values match
+what the run would have written. It defaults to the structure bundled with the
+run, so for a recent bundle there is nothing to fill in.
+
+Bundles written before the `Scoring_Model` rename, whose key is `model`, are read
+unchanged.
+
+### `scripts/generate_thor_structures.py` — a FASTA plus a directory of structures
+`generate_thor.py` takes one backbone at a time, because ProteinMPNN features
+describe a single chain — so `--structure` and `--fasta` cannot be combined.
+This driver closes that gap: it runs `generate_thor.py` once per FASTA record,
+pairing each with the structure of the same name, then writes the per-run
+tables and figures plus one combined CSV.
+
+```
+python generate_thor_structures.py \
+    --run_dir RUN --fasta seqs.fasta --structure_dir structures/ \
+    --output_dir out/ --mpnn_dir ProteinMPNN --mpnn_weight 0.3 \
+    -- --replicates 10 --esm_filter_threshold 3.0
+```
+
+| Argument | |
+|---|---|
+| `--fasta` | **required.** A record id must match its structure's filename stem |
+| `--structure_dir` | structures named `<record_id>.cif`/`.pdb`/`.mmcif`/`.ent`. Omit to run ESM-only |
+| `--output_dir` | **required.** Each record gets a subdirectory; `all_variants.csv` collects them |
+| `--seq_source` | `fasta` (default) fails if sequence and chain disagree; `structure` generates from the resolved chain |
+| `--require_structure` | fail a record with no structure instead of running it ESM-only |
+| `--only`, `--dry_run`, `--no_summary` | |
+| *after `--`* | passed straight to `generate_thor.py`, so every flag it takes is available |
+
+A record with no structure runs ESM-only with a warning, and a record whose run
+fails is reported and skipped so the rest still finish — the exit status is
+non-zero if any failed. ESM is loaded once per record, about a minute each:
+fine for tens of proteins, worth rethinking for hundreds.
+
+Wrapper: `generate_thor_structures.sh` (SLURM + Singularity). It bind-mounts the
+ProteinMPNN checkout into the container, which does not contain it.
+
+### `scripts/summarise_variants.py` — tables and figures from a variant FASTA
+The Colab notebook's post-processing as a script, so a cluster run and a
+notebook run produce the same CSV columns and the same plot. Writes
+`<id>_variants.csv` and `<id>_variants.png` beside each input FASTA, and with
+`--combined` one CSV with every run stacked and keyed by `input_id`. Importable
+as `parse_variant_fasta` / `plot_variants`. Called automatically by
+`generate_thor_structures.py`.
+
+### `scripts/generate_thor_batch.py` — generate across a whole dataset
+Dataset-scale generation from **pre-built TFRecords**, used for the large-scale
+experiments. Loads the full CycleGAN (with PID controllers) rather than the
+generator alone, and writes 50 replicates per sequence.
+
+| Argument | |
+|---|---|
+| `-i/--input` | **required.** Run directory holding `config.yaml` and `weights/` |
+| `--epoch` | epoch to load |
+| `--store_softmax` | also dump softmax probabilities |
+| `-g/--gpu`, `-v/--verbose` | |
+
+> Its input TFRecord glob and the ET weight paths are hardcoded in the body of
+> the script (around line 110) and must be edited to point at your data.
+
+Wrapper: `generate_thor_batch.sh`, which sweeps epochs 3–39.
+
+---
+
+## Training
+
+### `scripts/train_thor.py` — train the THOR generator
+CycleGAN training with mixed `bfloat16`, TF32 and multi-GPU support.
+Everything is driven by the config file; the run writes weights, `config.yaml`
+and `history.csv` into a timestamped results directory.
+
+| Argument | |
+|---|---|
+| `-c/--config` | YAML config (see `config/Cycle_gan/`) |
+| `-g/--gpu` | comma-separated GPU ids |
+| `-v/--verbose` | |
+
+Start from **`config/Cycle_gan/Reference_config.yaml`**, the current reference —
+it is the only config in that directory that matches the present schema; the
+rest are archived under `config/Cycle_gan/archive/`.
+
+Config sections: `CycleGan` (architecture, `Losses`, `Optimizers`,
+`LR_Schedule`, PID settings, `Fractional_training`), `Classifier` (the ET
+critic), `Data_meso` / `Data_thermo` (TFRecord locations, `records_type: ESM`),
+`Log`, `Results`.
+
+Wrapper: `train_thor.sh` — 4×A100, 3-day limit, picks a config by
+`$SLURM_ARRAY_TASK_ID`.
+
+#### Fine-tuning on a specific family
+
+To continue from an existing model rather than training from scratch — the
+family-specific fine-tuning step — point `saved` at a previous run's results
+directory in the config:
+
+```yaml
+CycleGan:
+    saved: "/data/pretrained"      # the downloaded Hugging Face repo
+    saved_weights: "weights_85"    # published models: 70, 75, 80, 85, 90, 95
+    lambda_self: 0.85              # must match: weights_NN <-> 0.NN
+```
+
+The six published models share one architecture and differ only in
+`lambda_self`, the PID setpoint that holds generated variants near the target
+sequence identity. Loading one while leaving `lambda_self` at another value
+pulls the model away from what it was trained for.
+
+`saved_weights` names a directory inside `saved` holding the four `.h5` files
+for G, F and both discriminators, plus optional `PID_G.pkl` / `PID_F.pkl`.
+
+For continuing one of your own runs, `saved_epoch: 39` is shorthand for
+`saved_weights: "weights/epoch_39"`, matching the layout training writes. With
+`saved` set but neither key, the end-of-run checkpoint
+`<saved>/weights/cycle_gan_model_final` is used instead. Set `saved` to
+`"none"` or leave it out to train from scratch.
+
+Fine-tuning restores weights and PID controller state; optimizers start fresh,
+so give the run a learning-rate warmup.
+
+Point `Data_meso` / `Data_thermo` at the family's records, and everything else
+proceeds as a normal training run.
+
+### `scripts/train_et_regressor.py` — train the temperature regressor
+Trains the environmental-temperature (ET) model used as THOR's critic and to
+score variants. Despite the `Classifier` naming kept in the config schema, this
+is a **regression** model: MSE loss, R² metric. Three independently trained
+copies form the ensemble.
+
+| Argument | |
+|---|---|
+| `-c/--config` | YAML config (see `config/Classifier/`) |
+| `-g/--gpu`, `-o/--output`, `-v/--verbose` | |
+
+Wrapper: `train_et_regressor.sh`.
+
+### `scripts/finetune_ESM.py` — fine-tune ESM-1v (exploratory)
+Masked-LM fine-tuning of ESM-1v on your own sequences, so the likelihoods
+guiding generation reflect the target family. Multi-GPU via `torchrun` (DDP).
+
+> **Not used for the published results.** This was tried and made no
+> appreciable difference, so THOR uses stock `facebook/esm1v_t33_650M_UR90S_1`
+> throughout. The script is kept because the experiment is part of the record,
+> and because fine-tuning may help on families further from ESM's training
+> distribution. Nothing else in the pipeline depends on it.
+
+| Argument | |
+|---|---|
+| `--data_path` | **required.** FASTA, or a text file with one sequence per line |
+| `--output_dir` | **required.** |
+| `--model_name` | default `facebook/esm1v_t33_650M_UR90S_1` |
+| `--val_path`, `--epochs`, `--per_device_batch`, `--accum`, `--lr`, `--warmup_steps`, `--max_length` | |
+| `--bf16`, `--resume auto` | |
+
+Wrapper: `finetune_ESM.sh` — 4×A100 via `torchrun`.
+
+---
+
+## Prediction
+
+### `scripts/predict_et.py` — predict temperature for a FASTA
+Runs the trained ET ensemble over a FASTA and writes a new FASTA with the
+predicted temperature appended to each header.
+
+```sh
+python predict_et.py <in.fasta> <out.fasta>
+```
+
+`--config`, `--weights`, `--batch-size` and `--max-len` default to the
+container layout and can be overridden. Wrapper: `predict_et.sh`.
+
+### `scripts/convert_ogt_savedmodel_to_h5.py` — checkpoint conversion
+Converts legacy ET SavedModel checkpoints (`variables/variables`) into `.h5`.
+Takes `--config`, `--ogt_dir`, `--output_dir`, `--models`.
+
+---
+
+## Data processing — `scripts/data_processing/`
+
+### `compute_MLM_features.py` — the one feature step
+Runs ESM-1v over a FASTA, quantizes the per-position probability
+distributions, and shards the result straight to disk. **This both computes
+features and writes the model-ready records** — there is no separate
+record-building stage.
+
+| Argument | |
+|---|---|
+| `-i/--input` | **required.** FASTA (temperature may be the last header token) |
+| `-o/--output` | **required.** output directory |
+| `--format` | `tfrecord` (default, gzip) or `pickle` |
+| `--model` | ESM model: a HF id (default `facebook/esm1v_t33_650M_UR90S_1`, as used for the published results) or a local directory |
+| `--mode` | `single` or random-partition masking |
+| `--quantize` | `none` / `uint8` |
+| `--max_entries` | records per shard |
+| `--batch_tokens`, `--max_length`, `--bf16`, `--name` | |
+| `--min_quality`, `--quality_metric` | drop low-confidence sequences |
+
+Wrappers: `compute_MLM_features_tfrecord.sh` (SLURM array, the production run)
+and `compute_MLM_features_pickle.sh` (same script, `--format pickle`).
+
+### `compute_mpnn_features.py` — structure features and scores
+A library, not a CLI: helpers that `generate_thor.py` uses when `--structure` is
+given. Extracts a single chain from a PDB, runs ProteinMPNN for per-position
+backbone probabilities in the same `(L, 20)` AA20 layout the generator expects,
+scores sequences against the backbone, and blends structure with ESM features.
+
+ProteinMPNN's alphabet is `ACDEFGHIKLMNPQRSTVWYX`, so its first 20 columns are
+already in AA20 order. As with the ESM features, the non-amino-acid column is
+dropped without renormalising, so rows sum to slightly under 1.
+
+Needs a ProteinMPNN checkout: `git clone https://github.com/dauparas/ProteinMPNN`.
+
+### Record handling
+| Script | Purpose |
+|---|---|
+| `filter_records.py` | Drops records whose id hash appears in `--id_hashes_npy`; used to remove test-set overlap. Takes `--input_dir`, `--out_dir`, `--shard_size_mb`. |
+| `filter_records_entropy.py` | Filters by per-position entropy (`--entropy_min` / `--entropy_max`), removing low-information sequences. Takes `--input_dir`, `--feature_name`, `--out_dir`. |
+| `check_record_lengths.py` | Scans shards and reports the sequence-length distribution. Takes `-d/--directory`. |
+| `combine_tfrecords.py` | Merges shards into one file. **Takes no arguments** — edit the `pattern` and `out_path` in the call at the bottom. Wrapper: `combine_tfrecords.sh`. |
+
+### Other
+| Script | Purpose |
+|---|---|
+| `make_embeddings.py` | Average ESM embeddings per sequence, written as a pickle. Takes `-i/--input`, `-o/--output`, `--batch_size`, `--max_entries`. Wrapper: `make_embeddings.sh`. |
+| `cluster.sh` | mmseqs `easy-cluster` at 70/60/50/40% identity, extracting the top 100 clusters at each threshold. This is how redundancy between train and test was controlled. Edit `FASTA_FILE` at the top. |
+
+### `data_processing/dataset_construction/`
+How the training data was built from raw IMG downloads — kept as a provenance
+trail rather than a pipeline you need to re-run. See the README there for the
+step order.
+
+---
+
+## `utils/`
+
+Model and data definitions imported by the scripts above.
+
+| Module | Contents |
+|---|---|
+| `models_cyclegan_self_loss.py` | The CycleGAN used by `train_thor.py` and `generate_thor_batch.py`: training steps, PID-controlled loss weighting, checkpointing |
+| `models_gan_atte.py` | The generator architecture. `generate_thor.py` builds this directly to load G alone |
+| `models_generator.py`, `models_discriminator.py` | Generator and discriminator components |
+| `models_classifyer.py` | The ET regressor (`get_classifier`) — note the spelling and the classifier-era naming |
+| `layers_new.py`, `layers_residual.py` | Self-attention, Gumbel-softmax, spectral normalisation, residual blocks |
+| `preprocessing.py` | TFRecord parsing and dataset assembly |
+| `loaders.py`, `losses.py`, `metrics.py`, `callbacks.py` | Losses, optimizers and metrics resolved from config |

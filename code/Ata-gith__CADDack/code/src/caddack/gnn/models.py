@@ -1,0 +1,457 @@
+from __future__ import annotations
+
+import math
+
+
+def _require_torch():
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from torch_geometric.nn import (  # type: ignore
+            GCNConv,
+            GINEConv,
+            global_add_pool,
+            global_mean_pool,
+        )
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "PyTorch + torch-geometric are required for GNN models."
+        ) from exc
+    return torch, nn, F, GCNConv, GINEConv, global_add_pool, global_mean_pool
+
+
+def _radius_graph_pure(pos, r, batch, loop=False):
+    """Pure-PyTorch radius graph; fallback when pyg-lib is unavailable."""
+    import torch
+    rows, cols = [], []
+    offset = 0
+    for b in batch.unique():
+        mask = batch == b
+        sub = pos[mask]
+        n = sub.shape[0]
+        diff = sub.unsqueeze(0) - sub.unsqueeze(1)   # [n, n, 3]
+        dist = diff.norm(dim=-1)                      # [n, n]
+        adj = (dist <= r) if loop else ((dist <= r) & (dist > 0))
+        src, dst = adj.nonzero(as_tuple=True)
+        rows.append(src + offset)
+        cols.append(dst + offset)
+        offset += n
+    if not rows:
+        return torch.empty((2, 0), dtype=torch.long, device=pos.device)
+    return torch.stack([torch.cat(rows), torch.cat(cols)])
+
+
+def _require_torch_geo():
+    """Subset of requirements for the geometry tower."""
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from torch_geometric.nn import global_add_pool  # type: ignore
+        try:
+            from torch_geometric.nn import radius_graph  # type: ignore
+            # Probe whether radius_graph actually works (pyg>=2.4 requires pyg-lib)
+            _test_pos = torch.zeros(2, 3)
+            _test_bat = torch.zeros(2, dtype=torch.long)
+            radius_graph(_test_pos, r=1.0, batch=_test_bat, loop=False)
+        except (ImportError, Exception):
+            radius_graph = _radius_graph_pure  # type: ignore
+        try:
+            from torch_scatter import scatter  # type: ignore
+        except ImportError:
+            from torch_geometric.utils import scatter  # type: ignore  # pyg>=2.3 built-in
+    except Exception as exc:
+        raise ImportError(
+            "PyTorch + torch-geometric are required for the geometry tower."
+        ) from exc
+    return torch, nn, F, global_add_pool, radius_graph, scatter
+
+
+class MolecularGCN:
+    """Factory wrapper exposing a torch.nn.Module when torch is available."""
+
+    @staticmethod
+    def build(
+        in_channels: int,
+        hidden_channels: int = 128,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+        task: str = "classification",
+    ):
+        torch, nn, F, GCNConv, _, _, global_mean_pool = _require_torch()
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.task = task
+                self.dropout = dropout
+                self.convs = nn.ModuleList()
+                self.convs.append(GCNConv(in_channels, hidden_channels))
+                for _ in range(num_layers - 1):
+                    self.convs.append(GCNConv(hidden_channels, hidden_channels))
+                self.head = nn.Linear(hidden_channels, 1)
+
+            def forward(self, data):
+                x, edge_index, batch = data.x, data.edge_index, data.batch
+                for conv in self.convs:
+                    x = conv(x, edge_index)
+                    x = F.relu(x)
+                    x = F.dropout(x, p=self.dropout, training=self.training)
+                x = global_mean_pool(x, batch)
+                logits = self.head(x).view(-1)
+                return logits
+
+        return _Model()
+
+
+class GaussianRBF:
+    """Factory: Gaussian radial basis function expansion of interatomic distances."""
+
+    @staticmethod
+    def build(num_rbf: int = 50, cutoff: float = 6.0):
+        torch, nn, F, *_ = _require_torch()
+
+        class _GaussianRBF(nn.Module):
+            def __init__(self):
+                super().__init__()
+                centers = torch.linspace(0.0, cutoff, num_rbf)
+                self.register_buffer("centers", centers)
+                self.width = (cutoff / num_rbf) ** 2
+
+            def forward(self, dist):
+                return torch.exp(-((dist.unsqueeze(-1) - self.centers) ** 2) / self.width)
+
+        return _GaussianRBF()
+
+
+class GeometryTower:
+    """SchNet-style continuous-filter conv tower over interatomic distances.
+
+    SE(3)-invariant: operates on pairwise distances only, never raw coords.
+    """
+
+    @staticmethod
+    def build(
+        num_elements: int = 100,
+        hidden_channels: int = 128,
+        num_rbf: int = 50,
+        num_interactions: int = 3,
+        cutoff: float = 6.0,
+        node_feat_dim: int = 0,
+        readout: str = "interaction",
+    ):
+        torch, nn, F, global_add_pool, radius_graph, scatter = _require_torch_geo()
+        if readout not in ("interaction", "sum"):
+            raise ValueError(f"readout must be 'interaction' or 'sum', got {readout!r}")
+
+        rbf_module = GaussianRBF.build(num_rbf=num_rbf, cutoff=cutoff)
+
+        def _filter_net(in_dim, out_dim):
+            return nn.Sequential(
+                nn.Linear(in_dim, out_dim),
+                nn.SiLU(),
+                nn.Linear(out_dim, out_dim),
+            )
+
+        def _atom_mlp(dim):
+            return nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+
+        class _InteractionBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.filter_net = _filter_net(num_rbf, hidden_channels)
+                self.update_mlp = _atom_mlp(hidden_channels)
+                self.res_proj = nn.Identity()
+
+            def forward(self, h, edge_index, rbf, dist, cutoff_val):
+                src, dst = edge_index
+                # cosine envelope cutoff
+                envelope = 0.5 * (torch.cos(math.pi * dist / cutoff_val) + 1.0)
+                filt = self.filter_net(rbf) * envelope.unsqueeze(-1)  # [E, C]
+                msg = h[src] * filt                                     # [E, C]
+                agg = scatter(msg, dst, dim=0, dim_size=h.size(0), reduce="sum")
+                return h + self.update_mlp(agg)
+
+        class _GeometryTower(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = nn.Embedding(num_elements + 1, hidden_channels)
+                self.node_feat_dim = node_feat_dim
+                # Atomic number alone makes a backbone carbonyl O, a serine
+                # hydroxyl and a water indistinguishable. First-neighbour
+                # features (see caddack.gnn.geometry.neighbor_features) are
+                # projected and added to the element embedding, so the tower
+                # starts from local chemistry rather than element identity.
+                if node_feat_dim:
+                    self.feat_proj = nn.Sequential(
+                        nn.Linear(node_feat_dim, hidden_channels),
+                        nn.SiLU(),
+                        nn.Linear(hidden_channels, hidden_channels),
+                    )
+                self.rbf = rbf_module
+                self.blocks = nn.ModuleList([_InteractionBlock() for _ in range(num_interactions)])
+                self.cutoff = cutoff
+                self.readout = readout
+                if readout == "interaction":
+                    # One embedding per protein-ligand contact, from the two atom
+                    # states and their separation.
+                    self.pair_net = nn.Sequential(
+                        nn.Linear(hidden_channels + num_rbf, hidden_channels),
+                        nn.SiLU(),
+                        nn.Linear(hidden_channels, hidden_channels),
+                    )
+                    # Four pooled views -> back to hidden_channels, so the fusion
+                    # head's input size is unchanged.
+                    self.out_proj = nn.Linear(4 * hidden_channels, hidden_channels)
+
+            def forward(self, z, pos, batch, nfeat=None, is_ligand=None):
+                h = self.embed(z.clamp(0, num_elements))
+                if self.node_feat_dim:
+                    if nfeat is None:
+                        raise ValueError(
+                            "this tower was built with node_feat_dim="
+                            f"{self.node_feat_dim} but received no node features"
+                        )
+                    h = h + self.feat_proj(nfeat)
+                edge_index = radius_graph(pos, r=self.cutoff, batch=batch, loop=False)
+                src, dst = edge_index
+                diff = pos[src] - pos[dst]
+                dist = diff.norm(dim=-1)
+                rbf = self.rbf(dist)
+                for block in self.blocks:
+                    h = block(h, edge_index, rbf, dist, self.cutoff)
+
+                if self.readout != "interaction" or is_ligand is None:
+                    # Summing an undifferentiated bag of ligand and pocket atoms
+                    # is a learned atom count, which a model can minimise loss
+                    # with while ignoring the geometry entirely. Kept only for
+                    # comparison against the interaction readout.
+                    return global_add_pool(h, batch)
+
+                n_graphs = int(batch.max().item()) + 1 if batch.numel() else 1
+                lig = is_ligand > 0.5
+
+                # Contacts that cross the interface: the quantity actually being
+                # predicted. Pooling over these rather than over atoms means an
+                # atom inventory is no longer a solution.
+                #
+                # Only cross edges are embedded. They are a minority of the graph
+                # -- 28% at a 6 A cutoff, 16% at 14 A, the rest being pocket-pocket
+                # -- so building pair features for every edge and discarding most
+                # of them tripled the cost of an epoch for nothing.
+                cross = lig[src] != lig[dst]
+                src_c, dst_c = src[cross], dst[cross]
+                if src_c.numel() == 0:  # no contacts within the cutoff
+                    inter_sum = h.new_zeros(n_graphs, hidden_channels)
+                    inter_mean = inter_sum
+                else:
+                    envelope = 0.5 * (torch.cos(math.pi * dist[cross] / self.cutoff) + 1.0)
+                    pair = self.pair_net(
+                        torch.cat([h[src_c] * h[dst_c], rbf[cross]], dim=-1))
+                    pair = pair * envelope.unsqueeze(-1)
+                    ebatch = batch[src_c]
+                    inter_sum = scatter(pair, ebatch, dim=0,
+                                        dim_size=n_graphs, reduce="sum")
+                    inter_mean = scatter(pair, ebatch, dim=0,
+                                         dim_size=n_graphs, reduce="mean")
+
+                # Mean, not sum: size should not carry the prediction on its own.
+                def _mean(mask):
+                    if not bool(mask.any()):
+                        return h.new_zeros(n_graphs, hidden_channels)
+                    return scatter(h[mask], batch[mask], dim=0,
+                                   dim_size=n_graphs, reduce="mean")
+
+                return self.out_proj(torch.cat(
+                    [inter_sum, inter_mean, _mean(lig), _mean(~lig)], dim=-1))
+
+        return _GeometryTower()
+
+
+class FusionAffinityNet:
+    """Two-tower Bayesian fusion net for protein–ligand binding affinity."""
+
+    @staticmethod
+    def build(
+        ligand_in_channels: int = 7,
+        ligand_edge_dim: int = 7,
+        hidden_channels: int = 128,
+        num_gine_layers: int = 3,
+        num_geo_interactions: int = 3,
+        num_rbf: int = 50,
+        cutoff: float = 6.0,
+        num_elements: int = 100,
+        geo_node_feat_dim: int = 0,
+        geo_readout: str = "interaction",
+        global_feat_dim: int = 0,
+        bayesian_hidden: list[int] | None = None,
+        prior_sigma: float = 1.0,
+        dropout: float = 0.1,
+    ):
+        torch, nn, F, _, GINEConv, global_add_pool, _ = _require_torch()
+        from caddack.gnn.bayes import BayesianMLP, elbo_loss  # noqa: F401
+
+        if bayesian_hidden is None:
+            bayesian_hidden = [256, 128]
+
+        geo_tower = GeometryTower.build(
+            node_feat_dim=geo_node_feat_dim,
+            readout=geo_readout,
+            num_elements=num_elements,
+            hidden_channels=hidden_channels,
+            num_rbf=num_rbf,
+            num_interactions=num_geo_interactions,
+            cutoff=cutoff,
+        )
+
+        def mlp(in_dim, out_dim):
+            return nn.Sequential(nn.Linear(in_dim, out_dim), nn.ReLU(), nn.Linear(out_dim, out_dim))
+
+        bayes_head = BayesianMLP.build(
+            # The two towers, plus any per-complex features supplied alongside
+            # them (see global_feat_dim).
+            in_features=hidden_channels * 2 + global_feat_dim,
+            hidden_dims=bayesian_hidden,
+            prior_sigma=prior_sigma,
+            dropout=dropout,
+        )
+
+        class _FusionNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Tower 1: ligand 2D GINE
+                self.lig_convs = nn.ModuleList()
+                self.lig_convs.append(GINEConv(
+                    mlp(ligand_in_channels, hidden_channels), edge_dim=ligand_edge_dim))
+                for _ in range(num_gine_layers - 1):
+                    self.lig_convs.append(GINEConv(
+                        mlp(hidden_channels, hidden_channels), edge_dim=ligand_edge_dim))
+                self.dropout_p = dropout
+
+                # Tower 2: geometry
+                self.geo_tower = geo_tower
+
+                # Bayesian head
+                self.bayes_head = bayes_head
+                self.global_feat_dim = global_feat_dim
+
+            def _encode_ligand(self, lig_data):
+                x, edge_index, edge_attr, batch = (
+                    lig_data.x, lig_data.edge_index, lig_data.edge_attr, lig_data.batch
+                )
+                for conv in self.lig_convs:
+                    x = conv(x, edge_index, edge_attr=edge_attr)
+                    x = F.relu(x)
+                    x = F.dropout(x, p=self.dropout_p, training=self.training)
+                return global_add_pool(x, batch)
+
+            def forward(self, lig_data, geo_data):
+                h_lig = self._encode_ligand(lig_data)
+                h_geo = self.geo_tower(geo_data.z, geo_data.pos, geo_data.batch,
+                                       getattr(geo_data, "nfeat", None),
+                                       getattr(geo_data, "is_ligand", None))
+                h = torch.cat([h_lig, h_geo], dim=-1)
+                if self.global_feat_dim:
+                    # Per-complex scalars handed to the head directly rather than
+                    # learned: Vina's interaction terms, which a random forest
+                    # showed carry signal the towers were not extracting.
+                    gfeat = getattr(geo_data, "gfeat", None)
+                    if gfeat is None:
+                        raise ValueError(
+                            f"built with global_feat_dim={self.global_feat_dim} "
+                            "but geo_data has no 'gfeat'")
+                    h = torch.cat([h, gfeat.view(h.shape[0], -1)], dim=-1)
+                mu, log_var = self.bayes_head(h)
+                return mu, log_var
+
+            def kl(self):
+                return self.bayes_head.kl()
+
+            def predict_with_uncertainty(self, lig_data, geo_data, n_samples: int = 30,
+                                         mc_dropout: bool = True):
+                """Return (mean, epistemic_std, aleatoric_std) via MC sampling.
+
+                ``mc_dropout`` keeps the encoders' dropout active while sampling.
+                It defaults to True because switching it off makes the epistemic
+                term structurally unable to do its job: with the encoders in eval
+                mode, the GINE and geometry towers produce an identical embedding
+                on every pass, so only the Bayesian head's weights vary. The
+                resulting variance describes uncertainty about the final linear
+                map given a fixed representation, and cannot express that a
+                complex is unlike anything in training -- which is the question
+                the estimate is usually being asked.
+
+                Measured on a PDBbind scaffold split, sampling the head alone
+                gave a Spearman correlation of 0.07 between reported uncertainty
+                and actual error. Set ``mc_dropout=False`` to reproduce that
+                head-only behaviour.
+
+                Safe here because the network contains no BatchNorm; train mode
+                toggles dropout and nothing else.
+                """
+                if n_samples < 1:
+                    raise ValueError("n_samples must be >= 1")
+                was_training = self.training
+                self.train(mc_dropout)
+                try:
+                    mus, vars_ = [], []
+                    with torch.no_grad():
+                        for _ in range(n_samples):
+                            mu, log_var = self.forward(lig_data, geo_data)
+                            mus.append(mu)
+                            vars_.append(torch.exp(log_var))
+                finally:
+                    self.train(was_training)  # restore caller's mode
+                mus_t = torch.stack(mus, dim=0)          # [T, B]
+                vars_t = torch.stack(vars_, dim=0)        # [T, B]
+                pred_mean = mus_t.mean(0)
+                # biased (unbiased=False) so a single sample yields 0, not NaN
+                epistemic = mus_t.var(0, unbiased=False).sqrt()
+                aleatoric = vars_t.mean(0).sqrt()
+                return pred_mean, epistemic, aleatoric
+
+        return _FusionNet()
+
+
+class MolecularGINE:
+    @staticmethod
+    def build(
+        in_channels: int,
+        edge_dim: int,
+        hidden_channels: int = 128,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+        task: str = "classification",
+    ):
+        torch, nn, F, _, GINEConv, global_add_pool, _ = _require_torch()
+
+        def mlp(in_dim: int, out_dim: int):
+            return nn.Sequential(
+                nn.Linear(in_dim, out_dim),
+                nn.ReLU(),
+                nn.Linear(out_dim, out_dim),
+            )
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.task = task
+                self.dropout = dropout
+                self.convs = nn.ModuleList()
+                self.convs.append(GINEConv(mlp(in_channels, hidden_channels), edge_dim=edge_dim))
+                for _ in range(num_layers - 1):
+                    self.convs.append(GINEConv(mlp(hidden_channels, hidden_channels), edge_dim=edge_dim))
+                self.head = nn.Linear(hidden_channels, 1)
+
+            def forward(self, data):
+                x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
+                for conv in self.convs:
+                    x = conv(x, edge_index, edge_attr=edge_attr)
+                    x = F.relu(x)
+                    x = F.dropout(x, p=self.dropout, training=self.training)
+                x = global_add_pool(x, batch)
+                logits = self.head(x).view(-1)
+                return logits
+
+        return _Model()

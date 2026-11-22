@@ -1,0 +1,16 @@
+[package]
+name = "editor-core"
+description = "The GUI-free half of the scene editor: check, place, run, verify."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+pantometry-world = { workspace = true }
+pantometry = { workspace = true }
+serde_json = { workspace = true }
+# Promoted from a dev-dependency: the outliner describes a *run*, and `viewer_core::Run` is what
+# a run is. No GPU and no window here — viewer-core is two serde crates — and both shells already
+# link it, so this moves a type across a boundary rather than a dependency tree.
+viewer-core = { workspace = true }

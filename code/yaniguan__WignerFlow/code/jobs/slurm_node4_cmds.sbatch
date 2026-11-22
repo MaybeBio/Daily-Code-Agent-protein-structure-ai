@@ -1,0 +1,28 @@
+#!/bin/bash
+# Full 4-GPU node on a SLURM cluster: runs up to 4 shell commands at once, one per GPU.
+# Usage: sbatch -J <name> -t 12:00:00 jobs/slurm_node4_cmds.sbatch "cmd 1" "cmd 2" "cmd 3" "cmd 4"
+# Pass your allocation on the command line: sbatch -A <account> ...
+#SBATCH -p gpu
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=4
+#SBATCH -c 10
+#SBATCH --gpus=4
+#SBATCH --mem=360G
+#SBATCH -o logs/%x-%j.out
+
+set -uo pipefail
+export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$HOME/micromamba}"
+MAMBA_EXE="${MAMBA_EXE:-micromamba}"
+eval "$("$MAMBA_EXE" shell hook -s bash)"
+micromamba activate "${WIGNERFLOW_ENV:-$HOME/envs/wignerflow}"
+cd "${REPO_DIR:-$PWD}"
+mkdir -p logs
+export PYTHONPATH="$PWD:${PYTHONPATH:-}"   # so scripts/*.py can import equitraj
+nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+gpu=0
+for cmd in "$@"; do
+  echo "GPU $gpu: $cmd"
+  CUDA_VISIBLE_DEVICES=$gpu bash -c "$cmd" > "logs/${SLURM_JOB_NAME}_gpu${gpu}_${SLURM_JOB_ID}.out" 2>&1 &
+  gpu=$((gpu + 1))
+done
+wait

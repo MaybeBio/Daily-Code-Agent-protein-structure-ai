@@ -1,0 +1,148 @@
+"""Rebuild RESULTS.md from results/*/ground_truth/metrics.json and results/*/*/eval*/metrics.json.
+
+    python scripts/make_results.py
+"""
+
+import glob
+import json
+import os
+from pathlib import Path
+
+import yaml
+
+
+def _read_json(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _read_yaml(path):
+    with open(path, encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+def fmt(x, spec=".3g"):
+    if x is None:
+        return "–"
+    if isinstance(x, bool):
+        return "pass" if x else "**fail**"
+    return format(x, spec)
+
+
+def ground_truth_rows():
+    rows = []
+    for path in sorted(glob.glob("results/*/ground_truth/metrics.json")):
+        system = Path(path).parts[1]
+        m = _read_json(path)
+        pt = m["per_traj"]
+        first_pair = next(iter(m["rdf"]))
+        rdf = m["rdf"][first_pair]
+        d = m.get("diffusion", {}).get("D_cm2_per_s")
+        rows.append(f"| {system} | {m['n_traj']} | {m['T_mean_K']:.1f} | {fmt(m['energy_drift_kJmol_per_ns_per_dof']['mean'])} "
+                    f"(max {fmt(m['energy_drift_kJmol_per_ns_per_dof']['max_abs'])}) | {first_pair}: {rdf['first_peak_A']:.2f} Å, "
+                    f"{rdf['first_peak_height']:.2f} | {fmt(d)} | {pt[0]['ns_per_day_with_io']:.0f} ({pt[0]['platform']}) |")
+    return rows
+
+
+def eval_rows():
+    rows = []
+    for path in sorted(glob.glob("results/*/*/eval*/metrics.json")):
+        parts = Path(path).parts
+        m = _read_json(path)
+        if m.get("split", "test") != "test":
+            continue  # validation-set evaluations are only for choosing checkpoints
+        v = m.get("v0_verdict", {})
+        name = f"{parts[1]}/{parts[2]}" + ("" if parts[3] == "eval" else f" ({parts[3]})") + f", step {m.get('train_step', '?')}"
+        st = m["stability"]
+        cfg_path = os.path.join(*parts[:3], "config.yaml")
+        cfg = _read_yaml(cfg_path) if os.path.exists(cfg_path) else {}
+        target = cfg.get("model", {}).get("target", "?")
+        seed = cfg.get("seed", "?")
+        t_m = m.get("temperature", {}).get("T_model_second_half_K")
+        t_err = None if t_m is None else (t_m - m["T_ground_truth_K"]) / m["T_ground_truth_K"]
+        rows.append(
+            f"| {name} | {m['head']} | {target} | {seed} | {m['stride_fs']:.0f} | {m['n_rollouts']} × {m['steps']} | "
+            f"{m['n_rollouts'] - st['crashed']}/{m['n_rollouts']} | "
+            f"{fmt(t_m, '.1f')} / {m['T_ground_truth_K']:.1f} ({fmt(t_err, '+.1%')}) | "
+            f"{fmt(m.get('rdf', {}).get('peak_pos_err_A'))} | {fmt(m.get('rdf', {}).get('peak_height_rel_err'))} | "
+            f"{fmt(m.get('vacf', {}).get('first_zero_rel_err'))} | {fmt(m.get('diffusion', {}).get('rel_err'))} | "
+            f"{fmt(v.get('all_pass')) if v else '–'} |")
+    return rows
+
+
+def stability_figure(path="results/argon/stability_vs_step.png"):
+    """Validation rollouts (1000 steps, every 2000 training steps) of the flow-head residual runs, one line per seed.
+
+    Top: final temperature of the rollout relative to the ground truth. Bottom: RDF L1 error.
+    Dots mark the checkpoint that was tested with 10^4-step rollouts (value = test temperature / truth).
+    """
+    import matplotlib.pyplot as plt
+
+    from equitraj import plots
+
+    runs = sorted(glob.glob("results/argon/B_S3a_seed*/log.jsonl"))
+    if not runs or not os.path.exists("results/argon/ground_truth/metrics.json"):
+        return None
+    t_gt = _read_json("results/argon/ground_truth/metrics.json")["T_mean_K"]
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 6.5), sharex=True)
+    for k, log in enumerate(runs):
+        name = Path(log).parts[2]
+        with open(log, encoding="utf-8") as fh:
+            parsed = [json.loads(line) for line in fh if '"val_T_end"' in line]
+        rows = [r for r in parsed if r.get("val_T_end") is not None and r.get("val_rdf_l1") is not None]
+        step = [r["step"] for r in rows]
+        c = plots.SERIES[k % len(plots.SERIES)]
+        label = name.replace("B_S3a_", "")
+        ax1.plot(step, [r["val_T_end"] / t_gt for r in rows], color=c, linewidth=2, label=label)
+        ax2.plot(step, [r["val_rdf_l1"] for r in rows], color=c, linewidth=2)
+        ev = os.path.join(os.path.dirname(log), "eval", "metrics.json")
+        if os.path.exists(ev):
+            m = _read_json(ev)
+            t_test = m.get("temperature", {}).get("T_model_second_half_K")
+            if t_test is not None:
+                ax1.scatter([m["train_step"]], [t_test / t_gt], color=c, s=60, zorder=3, edgecolor="black")
+            else:  # every test rollout crashed
+                ax1.scatter([m["train_step"]], [0.0], color=c, s=60, zorder=3, marker="x")
+    ax1.axhline(1.0, color=plots.GRAY, linewidth=1, linestyle="--")
+    ax1.axhspan(0.95, 1.05, color=plots.GRAY, alpha=0.15, linewidth=0)
+    ax1.set_ylim(0, 2.8)
+    plots._style(ax1, "", "T / T_ground-truth", "Validation rollout temperature by training step")
+    ax1.legend(frameon=False, ncol=3, fontsize=9)
+    ax2.set_yscale("log")
+    plots._style(ax2, "training step", "RDF L1 error", "RDF error of validation rollouts")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
+
+def main():
+    lines = ["# Results", "",
+             "Generated by `python scripts/make_results.py` from the `metrics.json` files under `results/`.",
+             "Rollouts replace the integrator completely (no OpenMM). \"Model only\" means no thermostat and no energy rescaling.",
+             "", "## Ground truth (OpenMM, NVE)", "",
+             "| System | Trajectories | T (K) | Energy drift (kJ/mol/ns/dof) | First RDF peak | D (cm²/s) | OpenMM speed (ns/day) |",
+             "|---|---|---|---|---|---|---|"]
+    lines += ground_truth_rows()
+    lines += ["", "## Model rollouts", "",
+              "Errors are relative unless marked Å; the temperature column shows the signed error. v0 criteria (argon): no crash; |ΔT|/T < 5%; RDF peak position < 0.05 Å; "
+              "peak height < 10%; VACF first zero < 10%; D < 20%.", "",
+              "| Run | Head | Target | Seed | Stride (fs) | Rollouts × steps | Not crashed | T model / truth (K) | RDF peak pos (Å) | RDF peak height | VACF zero | D | v0 |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    rows = eval_rows()
+    lines += rows if rows else ["| (no evaluated models yet) |" + " |" * 12]
+    fig = stability_figure()
+    if fig:
+        lines += ["", "## Stability by training step", "",
+                  "![Validation rollouts by training step](results/argon/stability_vs_step.png)", "",
+                  "Each line is one training seed (flow head, residual targets, default `best.pt` selection). Rollouts are 1000 steps on validation "
+                  "trajectories, evaluated every 2000 training steps; the grey band is ±5% of the ground-truth temperature. "
+                  "Dots are the checkpoints that were tested with 10⁴-step rollouts (dot height = test temperature / truth); an x marks a checkpoint whose 10⁴-step test rollouts all crashed."]
+    with open("RESULTS.md", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"RESULTS.md: {len(rows)} evaluated runs")
+
+
+if __name__ == "__main__":
+    main()

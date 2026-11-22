@@ -1,0 +1,41 @@
+name: openff-toolkit-examples
+channels:
+  - conda-forge
+dependencies:
+    # Base depends
+  - python
+  - packaging
+  - numpy
+  - networkx
+  - cachetools
+  - xmltodict
+  - python-constraint2
+  - openmm >=7.6
+  - openff-forcefields >=2025
+  - openff-amber-ff-ports >=0.0.3
+  - openff-units
+  - openff-utilities >=0.1.5
+  - openff-interchange-base >=0.5
+  - openff-nagl-base >=0.5.3
+  - openff-nagl-models >=2025
+  - nglview
+    # Toolkit-specific
+  - rdkit
+    # Test-only/optional/dev/typing/examples
+  - pytest =8
+  - pytest-xdist
+  - pytest-rerunfailures
+  - pytest-timeout
+  - pyyaml
+  - toml
+  - bson
+  - msgpack-python
+  - pydantic =2
+  - qcelemental
+  - qcportal >=0.70
+  - qcengine
+  - nbval
+  - mdtraj
+  - pdbfixer
+  - gromacs >=2023.3
+  - pyedr

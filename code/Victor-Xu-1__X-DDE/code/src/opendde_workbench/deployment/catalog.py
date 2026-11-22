@@ -1,0 +1,538 @@
+"""Reviewed upstream releases. Updates never execute browser-supplied commands."""
+
+import platform
+import shutil
+from dataclasses import asdict, dataclass
+from typing import Literal
+
+from ..datasets.public_resources import RESOURCES as SUPPLIER_FILES
+from ..datasets.public_resources import VERSION as SUPPLIER_FILES_VERSION
+from ..diffsbdd.manifest import MODEL_URL, MODELS, SOURCE_COMMIT, SOURCE_SHA256, SOURCE_URL
+from ..docking.manifest import BINARY_SHA256, BINARY_URL
+from ..docking.manifest import VERSION as GNINA_VERSION
+from ..examples.bundle_release import SHA256 as CASE_SHA
+from ..examples.bundle_release import URL as CASE_URL
+from ..examples.bundle_release import VERSION as CASE_VERSION
+from ..examples.channel_bundle_release import SHA256 as CHANNEL_CASE_SHA
+from ..examples.channel_bundle_release import URL as CHANNEL_CASE_URL
+from ..examples.channel_bundle_release import VERSION as CHANNEL_CASE_VERSION
+from ..examples.dataset_bundle_release import SHA256 as DATA_CASE_SHA
+from ..examples.dataset_bundle_release import URL as DATA_CASE_URL
+from ..examples.dataset_bundle_release import VERSION as DATA_CASE_VERSION
+from ..examples.del_bundle_release import BYTES as DEL_CASE_BYTES
+from ..examples.del_bundle_release import SHA256 as DEL_CASE_SHA
+from ..examples.del_bundle_release import URL as DEL_CASE_URL
+from ..examples.del_bundle_release import VERSION as DEL_CASE_VERSION
+from ..examples.manifest import MANIFEST as EXAMPLE_MANIFEST
+from ..examples.pose_bundle_release import SHA256 as POSE_CASE_SHA
+from ..examples.pose_bundle_release import URL as POSE_CASE_URL
+from ..examples.pose_bundle_release import VERSION as POSE_CASE_VERSION
+from ..examples.proximity_bundle_release import SHA256 as PROXIMITY_CASE_SHA
+from ..examples.proximity_bundle_release import URL as PROXIMITY_CASE_URL
+from ..examples.proximity_bundle_release import VERSION as PROXIMITY_CASE_VERSION
+from ..examples.stat6_bundle_release import BYTES as STAT6_CASE_BYTES
+from ..examples.stat6_bundle_release import CAPABILITIES as STAT6_CASE_CAPABILITIES
+from ..examples.stat6_bundle_release import SHA256 as STAT6_CASE_SHA
+from ..examples.stat6_bundle_release import URL as STAT6_CASE_URL
+from ..examples.stat6_bundle_release import VERSION as STAT6_CASE_VERSION
+from ..examples.surface_bundle_release import SHA256 as SURFACE_CASE_SHA
+from ..examples.surface_bundle_release import URL as SURFACE_CASE_URL
+from ..examples.surface_bundle_release import VERSION as SURFACE_CASE_VERSION
+from ..integrations.labels import public_name
+from ..integrations.specs import PROGRAMS as SCIENTIFIC_PROGRAMS
+from ..pockets.manifest import SHA256 as P2_SHA
+from ..pockets.manifest import URL as P2_URL
+from ..pockets.manifest import VERSION as P2_VERSION
+from ..receptors.image import VERSION as BIOPYTHON_VERSION
+from ..space.manifest import LICENSE as CAVER_LICENSE
+from ..space.manifest import SHA256 as CAVER_SHA
+from ..space.manifest import URL as CAVER_URL
+from ..space.manifest import VERSION as CAVER_VERSION
+from .native_tools import SHA256 as ZSTD_SHA
+from .native_tools import URL as ZSTD_URL
+from .native_tools import VERSION as ZSTD_VERSION
+
+
+@dataclass(frozen=True)
+class Package:
+    id: str
+    version: str
+    name: str
+    description: str
+    size: str
+    dependencies: tuple[str, ...] = ()
+    automatic: bool = False
+    url: str = ""
+    checksum: str = ""
+    license: str = ""
+    engine: str | None = None
+    kind: Literal["runtime", "model", "editor", "data"] = "runtime"
+
+
+PACKAGES = {
+    p.id: p
+    for p in [
+        Package(
+            "caver",
+            CAVER_VERSION,
+            "口袋通道与瓶颈 · CAVER",
+            "静态结构内的通道、瓶颈和路径轮廓 / Static channels, bottlenecks and profiles",
+            "约 200 MB 下载；至少 3 GiB 安装空间 / ~200 MB; 3 GiB staging",
+            url=CAVER_URL,
+            checksum=CAVER_SHA,
+            license=CAVER_LICENSE,
+            engine="caver",
+        ),
+        Package(
+            "biopython",
+            BIOPYTHON_VERSION,
+            "Biopython / DockQ 结构分析",
+            "结构准备、构象与界面对照 / Preparation, conformation and interface comparison",
+            "约 200 MB 下载；至少 2 GiB 安装空间 / ~200 MB download; 2 GiB staging",
+            license=(
+                "Biopython License Agreement / BSD-3-Clause; DockQ MIT; "
+                "NumPy BSD-3-Clause; NetworkX BSD-3-Clause; dependency terms"
+            ),
+            engine="biopython",
+            kind="runtime",
+        ),
+        Package(
+            "chemistry",
+            "rdkit-2026.3.6-dimorphite-2.1.0",
+            "Chemistry preparation environment",
+            "独立 CPU 化学状态与构象准备 / Independent CPU molecular preparation",
+            "约 150 MB 下载；至少 2 GiB 安装空间 / ~150 MB download; 2 GiB staging",
+            license="RDKit BSD-3-Clause; Dimorphite-DL Apache-2.0; dependency licenses",
+            engine="chemistry",
+            kind="runtime",
+        ),
+        Package(
+            "gnina",
+            GNINA_VERSION,
+            "GNINA docking environment",
+            "独立对接/评分环境与化学解析器 / Independent docking and chemistry runtime",
+            "约 4.5 GB 下载；至少 12 GiB 安装空间 / ~4.5 GB download; 12 GiB staging",
+            url=BINARY_URL,
+            checksum=BINARY_SHA256,
+            license=(
+                "GNINA GPL-2.0/Apache-2.0; NVIDIA proprietary runtime and other dependency terms"
+            ),
+            engine="gnina",
+            kind="runtime",
+        ),
+        Package(
+            "harness",
+            "0.0.4",
+            "OpenDDE Harness",
+            "原生工具客户端与安装器 / Native tool client",
+            "约150 MB",
+            automatic=True,
+            url="https://github.com/aurekaresearch/OpenDDE-Harness/releases/download/v0.0.4/opendde_harness-0.0.4-py3-none-any.whl",
+            checksum="94d615786dcc8d65227696319f65dab43c8af9f89891ed7fc74c685e9efca59f",
+            license="Apache-2.0",
+            engine="harness",
+            kind="runtime",
+        ),
+        Package(
+            "runtime",
+            "0.0.4",
+            "OpenDDE runtime",
+            "OpenDDE、PLIP、MPNN 原生源码 / Native scientific code",
+            "约300 MB",
+            ("harness",),
+            True,
+            license="Upstream licenses",
+            engine="opendde",
+            kind="runtime",
+        ),
+        Package(
+            "compute",
+            "v1",
+            "OpenDDE compute environment",
+            "Docker 中的 PyTorch、RDKit、Biotite / Scientific dependencies",
+            "数 GB / Several GB",
+            ("harness", "runtime"),
+            True,
+            license="Upstream licenses",
+            engine="opendde",
+            kind="runtime",
+        ),
+        Package(
+            "standard",
+            "opendde-v1",
+            "OpenDDE standard",
+            "标准模型与 CCD 数据 / General model and CCD",
+            "数 GB / Several GB",
+            ("harness", "runtime", "compute"),
+            license="Upstream model terms",
+            engine="opendde",
+            kind="model",
+        ),
+        Package(
+            "abag",
+            "opendde-v1",
+            "OpenDDE ABAG",
+            "抗体模型、ESM2 与 SolubleMPNN 权重 / Antibody and tool weights",
+            "数 GB / Several GB",
+            ("harness", "runtime", "compute"),
+            license="Upstream model terms",
+            engine="opendde",
+            kind="model",
+        ),
+        Package(
+            "ketcher",
+            "3.18.0",
+            "Ketcher",
+            "二维分子与大分子绘图 / Molecular sketch editor",
+            "35 MB 下载 / download",
+            automatic=True,
+            url="https://github.com/epam/ketcher/releases/download/v3.18.0/ketcher-standalone-3.18.0.zip",
+            checksum="484e7f10a0e74808ae5f43f0e6448db6f4d884bdd2189aa271108474167a3e7e",
+            license="Apache-2.0",
+            engine=None,
+            kind="editor",
+        ),
+        Package(
+            "molstar",
+            "5.13.0",
+            "Mol*",
+            "蛋白、复合物、序列与三维结构检查 / Protein structure workspace",
+            "约20 MB 下载 / download",
+            automatic=True,
+            url="https://registry.npmjs.org/molstar/-/molstar-5.13.0.tgz",
+            checksum="sha512:pMXXhPGkbjYeZwPbHSTvQmUJ+wXpLVphDF0n90piy1OtYrUCCr6Z3MFqWjV6Kjcd44hU0U2myQMnPulb4MC1FQ==",
+            license="MIT",
+            engine=None,
+            kind="editor",
+        ),
+    ]
+}
+
+
+PACKAGES["opendde-tools"] = Package(
+    "opendde-tools",
+    ZSTD_VERSION,
+    "OpenDDE 搜索数据库解压工具 / Search archive tools",
+    "固定源码的 Zstandard，独立安装 / Checksum-pinned Zstandard",
+    "约 2.5 MB 下载，100 MB 编译空间 / download and build space",
+    ("compute",),
+    url=ZSTD_URL,
+    checksum=ZSTD_SHA,
+    license="BSD-3-Clause",
+    engine="opendde",
+)
+PACKAGES["opendde-search"] = Package(
+    "opendde-search",
+    "alphafold-v3.0",
+    "模板与 RNA 搜索数据库 / Template and RNA databases",
+    "PDB SEQRES、Rfam、RNAcentral 和 NT-RNA / Four native search databases",
+    "至少 110 GiB 空间；下载时间较长 / At least 110 GiB; large download",
+    ("runtime", "compute", "opendde-tools"),
+    license="Upstream database terms",
+    engine="opendde",
+    kind="model",
+)
+
+PACKAGES["sapiens"] = Package(
+    "sapiens",
+    "1.1.0-cpu",
+    "Sapiens / ANARCII / Promb",
+    "抗体人源参考评估与框架建议 / Antibody reference evaluation and framework proposals",
+    "独立 CPU 模型与依赖；至少 6 GiB 安装空间 / Independent CPU models; 6 GiB staging",
+    license="Sapiens MIT; ANARCII BSD-3-Clause; Promb MIT; OAS data terms separately",
+    engine="sapiens",
+)
+
+PACKAGES["admet"] = Package(
+    "admet",
+    "2.0.1-chemprop-2.3.1-cpu",
+    "ADMET-AI",
+    "小分子性质与早期安全性预测 / Molecular ADMET and early safety predictions",
+    "独立 CPU 模型与依赖；至少 6 GiB 安装空间 / Independent CPU models; 6 GiB staging",
+    license="ADMET-AI MIT; Chemprop MIT; dependency licenses; DrugBank reference disabled",
+    engine="admet",
+)
+
+PACKAGES["posebusters"] = Package(
+    "posebusters",
+    "0.6.5-cpu",
+    "PoseBusters",
+    "分子构象与结合姿势质控 / Molecular pose plausibility",
+    "约500 MB / Independent CPU runtime",
+    license="MIT / dependency licenses",
+    engine="posebusters",
+)
+
+PACKAGES["anarcii"] = Package(
+    "anarcii",
+    "2.0.8-cpu",
+    "ANARCII",
+    "抗体编号与域识别 / Antibody numbering and domain annotation",
+    "约 1 GB / CPU runtime and bundled models",
+    license="BSD-3-Clause / dependency licenses",
+    engine="anarcii",
+)
+
+PACKAGES["diffsbdd"] = Package(
+    "diffsbdd",
+    SOURCE_COMMIT[:12],
+    "DiffSBDD",
+    "小分子设计科学环境 / Small-molecule design runtime",
+    "数 GB / Several GB",
+    url=SOURCE_URL,
+    checksum=SOURCE_SHA256,
+    license="MIT / upstream licenses",
+    engine="diffsbdd",
+)
+for identifier, model in MODELS.items():
+    key = "diffsbdd-model-" + identifier
+    PACKAGES[key] = Package(
+        key,
+        model["sha256"][:12],
+        "DiffSBDD · " + identifier,
+        "官方固定模型 / Official pinned checkpoint",
+        f"{model['bytes'] / 1024**2:.1f} MiB",
+        ("diffsbdd",),
+        url=MODEL_URL + model["file"] + "?download=1",
+        checksum=model["sha256"],
+        license="Official DiffSBDD model terms",
+        engine="diffsbdd",
+        kind="model",
+    )
+
+
+PACKAGES["p2rank-compute"] = Package(
+    "p2rank-compute",
+    "temurin-21-amd64",
+    "P2Rank CPU Java",
+    "受限、离线 Java 容器 / Bounded offline Java container",
+    "约 200 MB",
+    license="GPL-2.0 with Classpath Exception / image licenses",
+    engine="p2rank",
+)
+PACKAGES["p2rank"] = Package(
+    "p2rank",
+    P2_VERSION,
+    "P2Rank",
+    "蛋白结合位点候选 / Protein-site hypotheses",
+    "263 MiB",
+    ("p2rank-compute",),
+    url=P2_URL,
+    checksum=P2_SHA,
+    license="MIT / bundled library terms",
+    engine="p2rank",
+)
+
+
+CASE_BUNDLE_IDS = (
+    "public-stat6-examples",
+    "public-examples",
+    "public-dataset-examples",
+    "public-del-examples",
+    "public-surface-examples",
+    "public-pose-examples",
+    "public-channel-examples",
+    "public-proximity-examples",
+)
+
+PACKAGES["public-stat6-examples"] = Package(
+    "public-stat6-examples",
+    STAT6_CASE_VERSION,
+    "STAT6 research examples",
+    f"{len(STAT6_CASE_CAPABILITIES)} 个模块的已审查原生结果 / "
+    f"Reviewed native results for {len(STAT6_CASE_CAPABILITIES)} modules",
+    f"{STAT6_CASE_BYTES / 1_000_000:.1f} MB",
+    automatic=True,
+    url=STAT6_CASE_URL,
+    checksum=STAT6_CASE_SHA,
+    license=(
+        "Source and computed-output terms in the reviewed bundle manifest; "
+        "not experimental validation"
+    ),
+    engine="x-dde",
+    kind="data",
+)
+
+PACKAGES["public-examples"] = Package(
+    "public-examples",
+    CASE_VERSION,
+    "Public research cases",
+    "45 个模块的真实输入与结果 / Real inputs and results for 45 modules",
+    "5.5 MB",
+    automatic=True,
+    url=CASE_URL,
+    checksum=CASE_SHA,
+    license="RCSB CC0-1.0; ChEMBL CC-BY-SA-3.0; UniProt CC-BY-4.0; computed output notices",
+    engine="x-dde",
+    kind="data",
+)
+
+PACKAGES["public-experimental-examples"] = Package(
+    "public-experimental-examples",
+    "1",
+    "Experimental evidence public case",
+    "EGFR 单一实测实验的 177 个化合物 / 177 compounds from one reported EGFR assay",
+    "0.6 MB",
+    dependencies=("public-examples",),
+    automatic=True,
+    url=EXAMPLE_MANIFEST["files"]["egfr_library"]["url"],
+    checksum=EXAMPLE_MANIFEST["files"]["egfr_library"]["sha256"],
+    license="ChEMBL CC-BY-SA-3.0; source-backed experimental reference, not model inference",
+    engine="x-dde",
+    kind="data",
+)
+
+PACKAGES["public-surface-examples"] = Package(
+    "public-surface-examples",
+    SURFACE_CASE_VERSION,
+    "Structural exposure public case",
+    "BRD4–JQ1 真实暴露分析模板与结果 / Native BRD4–JQ1 exposure template and result",
+    "0.4 MB",
+    dependencies=("public-examples",),
+    automatic=True,
+    url=SURFACE_CASE_URL,
+    checksum=SURFACE_CASE_SHA,
+    license="RCSB PDB CC0-1.0; native geometric measurements with source and method notices",
+    engine="x-dde",
+    kind="data",
+)
+
+PACKAGES["public-channel-examples"] = Package(
+    "public-channel-examples",
+    CHANNEL_CASE_VERSION,
+    "Pocket channel public case",
+    "人源 AChE–多奈哌齐真实通道与瓶颈 / Native human AChE–donepezil channels",
+    "1.1 MB",
+    automatic=True,
+    url=CHANNEL_CASE_URL,
+    checksum=CHANNEL_CASE_SHA,
+    license="RCSB PDB CC0-1.0; native geometric measurements, not whole-drug passage",
+    engine="x-dde",
+    kind="data",
+)
+
+PACKAGES["public-proximity-examples"] = Package(
+    "public-proximity-examples",
+    PROXIMITY_CASE_VERSION,
+    "Induced proximity public case",
+    "MZ1–BRD4–VHL 原生三元核心装配 / Native ternary core assembly hypotheses",
+    "0.5 MB",
+    automatic=True,
+    url=PROXIMITY_CASE_URL,
+    checksum=PROXIMITY_CASE_SHA,
+    license="RCSB PDB CC0-1.0; processed input attribution; computed hypotheses, not drug activity",
+    engine="x-dde",
+    kind="data",
+)
+
+PACKAGES["public-pose-examples"] = Package(
+    "public-pose-examples",
+    POSE_CASE_VERSION,
+    "Binding-mode public case",
+    "BRD4–JQ1 真实姿势分群与结构对比 / Native BRD4–JQ1 pose clustering and comparison",
+    "0.7 MB",
+    dependencies=("public-examples",),
+    automatic=True,
+    url=POSE_CASE_URL,
+    checksum=POSE_CASE_SHA,
+    license="RCSB PDB CC0-1.0; native geometry and contact measurements, not binding proof",
+    engine="x-dde",
+    kind="data",
+)
+
+PACKAGES["public-dataset-examples"] = Package(
+    "public-dataset-examples",
+    DATA_CASE_VERSION,
+    "Screening and DEL public cases",
+    "14 个模块的真实输入与原生结果 / Real inputs and native results for 14 data modules",
+    "3.9 MB",
+    automatic=True,
+    url=DATA_CASE_URL,
+    checksum=DATA_CASE_SHA,
+    license="MIT; CC-BY-4.0; ChEMBL CC-BY-SA-3.0; retrieval model outputs CC-BY-NC-4.0",
+    engine="x-dde",
+    kind="data",
+)
+
+PACKAGES["public-del-examples"] = Package(
+    "public-del-examples",
+    DEL_CASE_VERSION,
+    "DEL research examples",
+    "5 个模块的完整实验计数与原生结果 / Full-cohort counts and native results for 5 modules",
+    f"{DEL_CASE_BYTES / 1_000_000:.1f} MB 下载；建议 1.5 GiB 导入空间 / "
+    f"{DEL_CASE_BYTES / 1_000_000:.1f} MB download; 1.5 GiB import space",
+    automatic=True,
+    url=DEL_CASE_URL,
+    checksum=DEL_CASE_SHA,
+    license="MIT source data; computational enrichment and sample support, not binding proof",
+    engine="x-dde",
+    kind="data",
+)
+
+PACKAGES["supplier-libraries"] = Package(
+    "supplier-libraries",
+    SUPPLIER_FILES_VERSION,
+    "Public supplier structure files",
+    f"{len({row['supplier'] for row in SUPPLIER_FILES.values()})} 家供应商的 "
+    f"{len(SUPPLIER_FILES)} 份公开结构文件 / "
+    f"{len(SUPPLIER_FILES)} public structure files",
+    f"{sum(row['archive_bytes'] for row in SUPPLIER_FILES.values()) / 1024**3:.1f} GiB "
+    f"下载 / download; "
+    f"{sum(row['size'] for row in SUPPLIER_FILES.values()) / 1024**3:.1f} GiB "
+    "原始结构 / structures",
+    license="Supplier published-file terms; no redistribution assumed",
+    engine="x-dde",
+    kind="data",
+)
+
+
+def prerequisites() -> dict:
+    return {
+        "platform": platform.system(),
+        "architecture": platform.machine(),
+        "supported": platform.system() == "Linux" and platform.machine() in {"x86_64", "AMD64"},
+        "docker": bool(shutil.which("docker")),
+        "uv": bool(shutil.which("uv")),
+        "gpu_tool": bool(shutil.which("nvidia-smi")),
+    }
+
+
+for identifier, specification in SCIENTIFIC_PROGRAMS.items():
+    PACKAGES[identifier] = Package(
+        identifier,
+        specification["version"],
+        public_name(identifier, specification["name"]),
+        "独立科学环境 / Independent scientific environment",
+        "至少 16 GiB 安装空间 / At least 16 GiB staging space",
+        license=specification["license"],
+        engine=identifier,
+    )
+    if specification["models"]:
+        PACKAGES[identifier + "-models"] = Package(
+            identifier + "-models",
+            specification["version"],
+            public_name(identifier, specification["name"]) + " models",
+            "固定版本模型与必要资源 / Fixed model versions and required resources",
+            str(round(sum(item["size"] for item in specification["models"]) / 1024**3, 1)) + " GiB",
+            (identifier,),
+            license=specification["license"],
+            engine=identifier,
+            kind="model",
+        )
+
+
+def catalogue() -> list[dict]:
+    return [asdict(p) for p in PACKAGES.values()]
+
+
+def dependencies(identifier: str) -> list[str]:
+    result = []
+
+    def visit(key):
+        for dep in PACKAGES[key].dependencies:
+            visit(dep)
+        if key not in result:
+            result.append(key)
+
+    visit(identifier)
+    return result

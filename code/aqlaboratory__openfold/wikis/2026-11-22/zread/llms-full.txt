@@ -1,0 +1,4324 @@
+# Overview
+
+
+OpenFold is a faithful but trainable PyTorch reproduction of DeepMind's AlphaFold 2, representing a significant advancement in open-source protein structure prediction. This project provides researchers and developers with access to state-of-the-art protein folding capabilities while maintaining full compatibility with the original AlphaFold architecture.
+
+![OpenFold Banner](https://github.com/aqlaboratory/openfold/blob/main/imgs/of_banner.png?raw=true)
+
+## What is OpenFold?
+
+OpenFold represents a complete reimplementation of AlphaFold 2 in PyTorch, designed to be both faithful to the original implementation and fully trainable from scratch. Unlike the original AlphaFold, which was primarily focused on inference, OpenFold enables researchers to train custom models, modify architectures, and contribute to the advancement of protein structure prediction technology.
+
+The project aims to democratize access to cutting-edge protein folding technology while providing the flexibility needed for scientific innovation and research advancement.
+
+Sources: [README.md](README.md#L1-L10), [docs/source/index.md](docs/source/index.md#L1-L10)
+
+## Key Features and Advantages
+
+OpenFold offers several significant advantages over the original AlphaFold implementation:
+
+| Feature | Description | Benefit |
+|---------|-------------|---------|
+| **PyTorch Implementation** | Complete rewrite in PyTorch framework | Easier integration with existing ML workflows, better debugging capabilities |
+| **Faster Inference** | Optimized GPU performance, up to 2x speedup | Reduced computation time and resource requirements |
+| **Long Sequence Support** | Handles sequences >4000 residues on single A100 | Enables prediction of large protein complexes |
+| **Memory Optimization** | Custom CUDA kernels and attention mechanisms | 4-5x less GPU memory usage than alternatives |
+| **Training Capability** | Full training pipeline with various precision modes | Ability to train custom models on proprietary data |
+| **DeepSpeed Integration** | Support for distributed training and inference | Scalable to multi-GPU and multi-node environments |
+| **FlashAttention Support** | Optimized attention computation | Significant speed improvements for MSA processing |
+
+Sources: [docs/source/index.md](docs/source/index.md#L18-L45), [setup.py](setup.py#L30-L137)
+
+## Architecture Overview
+
+OpenFollows the same core architectural principles as AlphaFold 2, consisting of several key components:
+
+```mermaid
+graph TB
+    subgraph "Input Processing"
+        A[FASTA Sequences] --> B[Multiple Sequence Alignment]
+        C[Template Search] --> D[Feature Extraction]
+        B --> E[Feature Pipeline]
+        D --> E
+    end
+    
+    subgraph "Core Model Architecture"
+        E --> F[Input Embedding]
+        F --> G[Evoformer Stack]
+        G --> H[Structure Module]
+        H --> I[Auxiliary Heads]
+    end
+    
+    subgraph "Output Processing"
+        I --> J[3D Structure Prediction]
+        J --> K[Confidence Scores]
+        J --> L[PDB/MMCIF Output]
+    end
+    
+    subgraph "Optimization Components"
+        M[Custom CUDA Kernels] --> G
+        N[DeepSpeed Integration] --> G
+        O[Memory Optimization] --> G
+    end
+```
+
+The architecture consists of three main phases:
+
+1. **Input Processing**: Features are extracted from amino acid sequences through multiple sequence alignment (MSA) and template searches
+2. **Core Model**: The Evoformer processes evolutionary information and the Structure Module generates 3D coordinates
+3. **Output Processing**: Final predictions are refined and output with confidence metrics
+
+Sources: [openfold/model/model.py](openfold/model/model.py#L1-L50), [openfold/model/evoformer.py](openfold/model/evoformer.py#L748-L754)
+
+## Core Components
+
+### Evoformer Stack
+The heart of OpenFold is the Evoformer, which processes multiple sequence alignments and pair representations through sophisticated attention mechanisms:
+
+- **MSA Processing**: Handles multiple sequence alignment data with row and column attention
+- **Pair Representation**: Manages pairwise relationships between amino acids
+- **Triangular Attention**: Implements efficient attention patterns for protein structure
+- **Outer Product Mean**: Computes mean representations across MSA dimensions
+
+Sources: [openfold/model/evoformer.py](openfold/model/evoformer.py#L748-L754)
+
+### Structure Module
+Transforms the processed features into 3D atomic coordinates using geometric reasoning and invariant transformations:
+
+- **Invariant Point Attention**: Attention mechanism that respects 3D geometric constraints
+- **Frame Updates**: Iterative refinement of protein backbone and side chain positions
+- **Loss Functions**: Specialized losses for structure prediction quality
+
+### Data Processing Pipeline
+Comprehensive data handling system that supports various input formats and preprocessing requirements:
+
+- **Feature Extraction**: Converts raw sequences into model-ready features
+- **Template Integration**: Incorporates known structural information from PDB
+- **MSA Generation**: Creates multiple sequence alignments using various tools
+
+Sources: [run_pretrained_openfold.py](run_pretrained_openfold.py#L127-L173)
+
+## Project Structure
+
+The OpenFold repository is organized into several key directories:
+
+```
+openfold/
+├── openfold/           # Core library code
+│   ├── model/         # Neural network architectures
+│   ├── data/          # Data processing pipelines
+│   ├── utils/         # Utility functions and kernels
+│   └── np/            # NumPy-based protein utilities
+├── scripts/           # Training and inference scripts
+├── examples/          # Example usage and configurations
+├── docs/             # Documentation and guides
+├── tests/            # Unit tests and validation
+└── notebooks/        # Interactive tutorials
+```
+
+Sources: [openfold/__init__.py](openfold/__init__.py#L1-L8)
+
+## Performance and Scalability
+
+OpenFold introduces several performance optimizations that make it suitable for both research and production environments:
+
+### Memory Efficiency
+- **Custom CUDA Kernels**: Specialized attention kernels that reduce memory footprint by 4-5x
+- **Low-Memory Attention**: Implements memory-efficient attention for long sequences
+- **CPU Offloading**: Allows inference on very long sequences by offloading to CPU when needed
+
+### Computational Speed
+- **FlashAttention Integration**: Leverages optimized attention implementations
+- **DeepSpeed DS4Sci_EvoformerAttention**: Specialized kernel for significant speedups
+- **GPU Optimization**: Targets modern GPU architectures for maximum performance
+
+> [!TIP]
+> OpenFold's custom CUDA kernels can handle sequences with over 4000 residues on a single A100 GPU, making it suitable for large protein complexes that were previously intractable with standard implementations.
+
+Sources: [docs/source/index.md](docs/source/index.md#L27-L35), [openfold/config.py](openfold/config.py#L1-L50)
+
+## Getting Started with OpenFold
+
+To begin using OpenFold, follow these logical steps:
+
+1. **Installation**: Set up the environment and dependencies
+2. **Database Configuration**: Download and configure required biological databases
+3. **Basic Inference**: Run predictions with pretrained models
+4. **Advanced Usage**: Explore training custom models and specialized features
+
+For detailed instructions, proceed to the [Quick Start](2-quick-start) guide, which will walk you through the initial setup and first prediction.
+
+## Next Steps
+
+Based on your interests and requirements, consider exploring these specific areas:
+
+- **Installation and Setup**: [System Requirements and Dependencies](3-system-requirements-and-dependencies)
+- **Basic Usage**: [Running Inference with Pretrained Models](5-running-inference-with-pretrained-models)
+- **Advanced Architecture**: [AlphaFold 2 Model Implementation](9-alphafold-2-model-implementation)
+- **Performance Optimization**: [Memory Optimization Techniques](11-memory-optimization-techniques)
+
+
+# Quick Start
+
+
+OpenFold is a faithful but trainable PyTorch reproduction of DeepMind's AlphaFold 2, enabling protein structure prediction with state-of-the-art accuracy. This guide provides the fastest path to running your first protein structure prediction using OpenFold's pretrained models.
+
+## Architecture Overview
+OpenFold follows the same architectural principles as AlphaFold 2, implementing the complete pipeline from sequence input to 3D structure output:
+
+```mermaid
+graph TD
+    A[FASTA Input] --> B[MSA Generation]
+    B --> C[Feature Processing]
+    C --> D[Evoformer Module]
+    D --> E[Structure Module]
+    E --> F[3D Coordinates]
+    F --> G[Structure Relaxation]
+    
+    H[Template Database] --> C
+    I[Genetic Databases] --> B
+```
+
+The system processes protein sequences through multiple sequence alignment (MSA) generation, feature extraction, and neural network inference to produce accurate 3D structural predictions.
+
+## Prerequisites
+Before getting started, ensure your system meets these requirements:
+
+| Component | Requirement | Notes |
+|-----------|-------------|-------|
+| Operating System | Linux | Only Linux systems are supported |
+| CUDA | Version 12 | Required for GPU acceleration |
+| Python | 3.10 | Specified in environment configuration |
+| GPU | NVIDIA Ampere or newer | Recommended for optimal performance |
+| RAM | 32GB+ | Depends on protein sequence length |
+
+## Installation Steps
+Follow these steps to set up OpenFold in your environment:
+
+### 1. Clone the Repository
+```bash
+git clone https://github.com/aqlaboratory/openfold.git
+cd openfold
+```
+
+### 2. Create Conda Environment
+Using Mamba (recommended for faster dependency resolution):
+```bash
+mamba env create -n openfold_env -f environment.yml
+conda activate openfold_env
+```
+
+### 3. Install Third-Party Dependencies
+```bash
+scripts/install_third_party_dependencies.sh
+```
+
+### 4. Set Environment Variables
+```bash
+export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+```
+
+### 5. Download Model Parameters
+Choose one of the following options:
+
+**AlphaFold 2 parameters (DeepMind):**
+```bash
+./scripts/download_alphafold_params.sh openfold/resources
+```
+
+**OpenFold trained parameters:**
+```bash
+./scripts/download_openfold_params.sh openfold/resources
+```
+
+**OpenFold SoloSeq parameters:**
+```bash
+./scripts/download_openfold_soloseq_params.sh openfold/resources
+```
+
+> [!TIP]
+> The default parameter directory `openfold/resources` is used by the inference scripts. If you choose a different location, use the `--jax_param_path` or `--openfold_checkpoint_path` arguments to specify the alternate path.
+
+## Running Your First Prediction
+OpenFold provides a complete example workflow in the `examples/monomer/` directory. Let's walk through running a prediction on the sample protein.
+
+### Project Structure
+```
+examples/monomer/
+├── alignments/           # Pre-computed MSAs
+├── fasta_dir/           # Input sequences
+├── inference.sh         # Example inference script
+└── sample_predictions/  # Output structures
+```
+
+### Sample Input
+The example includes a FASTA file for protein 6KWC ([examples/monomer/fasta_dir/6kwc.fasta](examples/monomer/fasta_dir/6kwc.fasta)):
+```fasta
+>6KWC_1
+GSTIQPGTGYNNGYFYSYWNDGHGGVTYTNGPGGQFSVNWSNSGEFVGGKGWQPGTKNKVINFSGSYNPNGNSYLSVYGWSRNPLIEYYIVENFGTYNPSTGATKLGEVTSDGSVYDIYRTQRVNQPSIIGTATFYQYWSVRRNHRSSGSVNTANHFNAWAQQGLTLGTMDYQIVAVQGYFSSGSASITVS
+```
+
+### Running Inference
+Execute the example inference script:
+
+```bash
+cd examples/monomer
+./inference.sh
+```
+
+This script runs the following command:
+```bash
+python3 ../../run_pretrained_openfold.py ./fasta_dir \
+  /mmcifs \
+  --output_dir ./ \
+  --config_preset model_1_ptm \
+  --model_device "cuda:0" \
+  --data_random_seed 42 \
+  --use_precomputed_alignments ./alignments
+```
+
+### Understanding the Command
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `fasta_dir` | `./fasta_dir` | Directory containing input FASTA files |
+| `mmcifs` | `/mmcifs` | Path to PDB mmCIF files for templates |
+| `--output_dir` | `./` | Output directory for predictions |
+| `--config_preset` | `model_1_ptm` | Model configuration (PTM = pTM + pLDDT) |
+| `--model_device` | `"cuda:0"` | GPU device for inference |
+| `--use_precomputed_alignments` | `./alignments` | Directory with pre-computed MSAs |
+
+### Expected Output
+The script generates two files in the `sample_predictions/` directory:
+
+| File | Description |
+|------|-------------|
+| `6KWC_1_model_1_ptm_unrelaxed.pdb` | Raw predicted structure |
+| `6KWC_1_model_1_ptm_relaxed.pdb` | Structure after Amber relaxation |
+
+## Working with Your Own Sequences
+To predict structures for your own proteins:
+
+### 1. Prepare Input FASTA
+Create a directory with your FASTA files:
+```bash
+mkdir my_proteins
+echo ">MY_PROTEIN_1" > my_proteins/sequence.fasta
+echo "MVLSEGEWQLVLHVWAKVEADVAGHGQDILIRLFKSHPETLEKFDRVKHLKTEAEMKASEDLKKHGVTVLTALGAILKKKGHHEAELKPLAQSHATKHKIPIKYLEFISEAIIHVLHSRHPGDFGADAQGAMNKALELFRKDIAAKYKELGYQG" >> my_proteins/sequence.fasta
+```
+
+### 2. Generate Alignments
+Download and prepare genetic databases:
+```bash
+# Download AlphaFold databases
+./scripts/download_alphafold_dbs.sh /path/to/databases
+
+# Pre-compute alignments for your sequences
+python3 scripts/precompute_alignments.py \
+  --fasta_dir my_proteins \
+  --output_dir my_alignments \
+  --max_template_date 2023-01-01 \
+  --database_dir /path/to/databases
+```
+
+### 3. Run Prediction
+```bash
+python3 run_pretrained_openfold.py my_proteins \
+  /path/to/mmcifs \
+  --output_dir my_results \
+  --config_preset model_1_ptm \
+  --model_device "cuda:0" \
+  --use_precomputed_alignments my_alignments
+```
+
+## Available Model Presets
+OpenFold offers several model configurations optimized for different use cases:
+
+| Preset | Description | Use Case |
+|--------|-------------|----------|
+| `model_1` | Basic model | Standard monomer prediction |
+| `model_1_ptm` | With pTM and pLDDT heads | Confidence score prediction |
+| `model_2` | Larger model | Higher accuracy, more compute |
+| `model_3` | Largest model | Best accuracy, most compute |
+| `model_1_multimer` | Multimer-capable | Protein complex prediction |
+
+## Next Steps
+After successfully running your first prediction, explore these advanced topics:
+
+- **[System Requirements and Dependencies](3-system-requirements-and-dependencies)**: Detailed hardware and software requirements for production use
+- **[Database Setup and Configuration](4-database-setup-and-configuration)**: Complete guide to setting up genetic databases for MSA generation
+- **[Running Inference with Pretrained Models](5-running-inference-with-pretrained-models)**: Advanced inference options and batch processing
+
+> [!TIP]
+> For production deployments, consider using the single sequence mode (`--use_single_seq_mode`) which uses pre-computed embeddings instead of MSA generation, significantly reducing runtime while maintaining reasonable accuracy for many proteins.
+
+## Troubleshooting Common Issues
+
+| Issue | Solution | Reference |
+|-------|----------|-----------|
+| CUDA out of memory | Use smaller model preset or reduce batch size | [Memory Optimization Techniques](11-memory-optimization-techniques) |
+| Database download fails | Check internet connection and disk space | [Database Setup and Configuration](4-database-setup-and-configuration) |
+| Import errors | Verify conda environment activation and LD_LIBRARY_PATH | [Installation](3-system-requirements-and-dependencies) |
+| Slow inference | Enable GPU acceleration and use Flash Attention | [DeepSpeed Integration](16-deepspeed-integration-and-performance) |
+
+![OpenFold Architecture](<https://github.com/aqlaboratory/openfold/blob/main/imgs/of_banner.png?raw=true>)
+
+# System Requirements and Dependencies
+
+
+OpenFold is a computationally intensive protein structure prediction framework that requires specific hardware and software configurations. This page outlines the essential system requirements, dependencies, and setup considerations for successful installation and operation.
+
+## Hardware Requirements
+
+### GPU Requirements
+OpenFold requires NVIDIA GPUs with CUDA support for optimal performance. The framework is designed to leverage GPU acceleration through CUDA kernels and custom implementations.
+
+**Supported GPU Compute Capabilities:**
+- **Compute Capability 5.2**: Titan X and older generation GPUs
+- **Compute Capability 6.1**: GeForce 1000-series GPUs
+- **Compute Capability 7.0**: Modern GPUs (default target)
+- **Compute Capability 8.0**: Ampere architecture (CUDA 11+)
+- **Compute Capability 9.0**: Hopper architecture
+
+> [!TIP]
+> The setup automatically detects your GPU's compute capability and compiles CUDA kernels accordingly. If you encounter compilation issues, ensure your GPU supports at least Compute Capability 5.2.
+
+### Memory Requirements
+- **GPU Memory**: Minimum 16GB VRAM recommended for standard protein inference
+- **System RAM**: 32GB+ recommended for database operations and large protein sequences
+- **Storage**: 100GB+ free space for databases, models, and temporary files
+
+## Software Requirements
+
+### Operating System
+**Linux Only**: OpenFold is currently supported exclusively on Linux systems. The framework has been tested on:
+- Ubuntu 20.04 LTS and 22.04 LTS
+- CentOS/RHEL 8+
+- Other Linux distributions with compatible toolchains
+
+### Core Software Stack
+
+| Component | Version | Purpose |
+|-----------|---------|---------|
+| **Python** | 3.10 | Core runtime environment |
+| **CUDA** | 12.4 | GPU acceleration and compute |
+| **GCC** | 12.4 | C++ compilation for CUDA extensions |
+| **PyTorch** | 2.5 | Deep learning framework |
+| **PyTorch CUDA** | 12.4 | PyTorch GPU acceleration |
+
+Sources: [environment.yml](environment.yml#L1-L41), [setup.py](setup.py#L1-L137)
+
+## Dependency Architecture
+
+The OpenFold dependency stack is organized into several layers, each serving specific functions in the protein structure prediction pipeline:
+
+```mermaid
+graph TB
+    A[OpenFold Core] --> B[PyTorch Ecosystem]
+    A --> C[Bioinformatics Tools]
+    A --> D[Scientific Computing]
+    A --> E[Structure Prediction]
+    
+    B --> B1[PyTorch 2.5]
+    B --> B2[PyTorch Lightning]
+    B --> B3[DeepSpeed 0.14.5]
+    B --> B4[Flash Attention]
+    
+    C --> C1[HMMER]
+    C --> C2[HH-suite]
+    C --> C3[Kalign2]
+    
+    D --> D1[NumPy]
+    D --> D2[SciPy]
+    D --> D3[Biopython]
+    D --> D4[Pandas]
+    
+    E --> E1[OpenMM]
+    E --> E2[PDBfixer]
+    E --> E3[ModelCIF]
+```
+
+Sources: [environment.yml](environment.yml#L15-L38), [setup.py](setup.py#L100-L137)
+
+## Detailed Dependencies
+
+### PyTorch Ecosystem
+| Package | Version | Purpose |
+|---------|---------|---------|
+| PyTorch | 2.5 | Deep learning framework foundation |
+| PyTorch Lightning | - | Training orchestration and scalability |
+| DeepSpeed | 0.14.5 | Memory optimization and distributed training |
+| Flash Attention | - | Optimized attention mechanisms |
+
+### Bioinformatics Tools
+| Tool | Purpose | Source |
+|------|---------|--------|
+| HMMER | Sequence homology searches | bioconda::hmmer |
+| HH-suite | Remote homology detection | bioconda::hhsuite |
+| Kalign2 | Multiple sequence alignment | bioconda::kalign2 |
+
+### Scientific Computing Libraries
+| Library | Purpose |
+|---------|---------|
+| NumPy | Numerical computing foundation |
+| SciPy | Scientific algorithms |
+| Biopython | Biological data manipulation |
+| Pandas | Data processing and analysis |
+| PyYAML | Configuration management |
+| tqdm | Progress indicators |
+
+### Structure Prediction Components
+| Component | Purpose |
+|-----------|---------|
+| OpenMM | Molecular mechanics simulation |
+| PDBfixer | PDB structure repair and preparation |
+| ModelCIF | Structure format handling |
+
+Sources: [environment.yml](environment.yml#L1-L41), [notebooks/environment.yml](notebooks/environment.yml#L1-L18)
+
+## CUDA Extensions and Custom Kernels
+
+OpenFold includes custom CUDA kernels for performance optimization:
+
+### Custom CUDA Components
+- **Attention Core**: Optimized softmax operations for attention mechanisms
+- **Evoformer Kernels**: Specialized operations for evolutionary transformer layers
+- **Memory Optimization**: Custom kernels to reduce memory footprint
+
+### Compilation Requirements
+The setup process compiles CUDA extensions with specific flags:
+```bash
+# CUDA compilation flags
+extra_cuda_flags = [
+    '-std=c++17',
+    '-maxrregcount=50',
+    '-U__CUDA_NO_HALF_OPERATORS__',
+    '--expt-relaxed-constexpr',
+    '--expt-extended-lambda'
+]
+```
+
+Sources: [setup.py](setup.py#L20-L67)
+
+## Environment Setup Options
+
+### Option 1: Conda/Mamba Environment (Recommended)
+```bash
+# Create environment using Mamba (faster than conda)
+mamba env create -n openfold_env -f environment.yml
+conda activate openfold_env
+```
+
+### Option 2: Docker Container
+The provided [Dockerfile](Dockerfile) creates a complete environment:
+```dockerfile
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+# Includes all dependencies and OpenFold installation
+```
+
+### Option 3: Manual Installation
+For advanced users who need custom configurations:
+- Install CUDA 12.4 and cuDNN 8
+- Set up Python 3.10 environment
+- Install dependencies manually from environment.yml
+- Compile CUDA extensions using setup.py
+
+## Third-Party Dependencies Installation
+
+The [`install_third_party_dependencies.sh`](scripts/install_third_party_dependencies.sh) script handles additional setup:
+
+### Essential Components
+1. **Folding Resources**: Stereo-chemical properties for structure validation
+2. **CUTLASS**: NVIDIA template library for CUDA kernel development
+3. **Test Data**: Sample features for validation
+
+### Environment Configuration
+```bash
+# Set up environment variables
+export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export CUTLASS_PATH=$PWD/cutlass
+export KMP_AFFINITY=none
+```
+
+Sources: [scripts/install_third_party_dependencies.sh](scripts/install_third_party_dependencies.sh#L1-L25)
+
+## Optional Dependencies
+
+### MPI Support
+For distributed computing across multiple nodes:
+```bash
+pip install mpi4py
+```
+
+### Development Dependencies
+For documentation and testing:
+- **Sphinx**: Documentation generation ([docs/environment.yml](docs/environment.yml))
+- **Unit Testing Framework**: Built-in with Python unittest
+
+### Database Tools
+Various database download scripts are available in the `scripts/` directory:
+- `download_alphafold_dbs.sh`
+- `download_bfd.sh`
+- `download_uniref90.sh`
+- And many more specialized databases
+
+## Common Setup Issues and Solutions
+
+### CUDA Compatibility
+**Issue**: CUDA version mismatch between PyTorch and system CUDA
+**Solution**: Ensure CUDA 12.4 is installed and use PyTorch's CUDA 12.4 build
+
+### Memory Issues
+**Issue**: Insufficient GPU memory for large proteins
+**Solution**: Use DeepSpeed optimization or reduce batch sizes
+
+### Compilation Failures
+**Issue**: CUDA kernel compilation errors
+**Solution**: Verify GPU compute capability and CUDA toolkit installation
+
+Sources: [docs/source/Installation.md](docs/source/Installation.md#L1-L69)
+
+## Next Steps
+
+After ensuring your system meets these requirements, proceed to [Database Setup and Configuration](4-database-setup-and-configuration) to prepare the biological databases needed for protein structure prediction. If you already have the required databases configured, you can skip directly to [Running Inference with Pretrained Models](5-running-inference-with-pretrained-models) for immediate usage.
+
+For detailed installation instructions and troubleshooting, refer to the comprehensive [Installation guide](docs/source/Installation.md) in the documentation.
+
+# Database Setup and Configuration
+
+
+
+OpenFold requires multiple protein sequence and structure databases to function effectively for protein structure prediction. This guide provides a comprehensive overview of the database architecture, setup procedures, and configuration options for intermediate developers looking to deploy OpenFold in production or research environments.
+
+## Database Architecture Overview
+
+OpenFold utilizes a multi-layered database system designed to support different aspects of protein structure prediction, including sequence alignment, template searching, and feature generation. The architecture is designed to balance performance with storage requirements, offering both full and reduced database configurations.
+
+```mermaid
+graph TD
+    A[OpenFold Database System] --> B[Sequence Databases]
+    A --> C[Structure Databases]
+    A --> D[Template Databases]
+    A --> E[Alignment Databases]
+    
+    B --> B1[UniRef90]
+    B --> B2[UniRef30]
+    B --> B3[UniClust30]
+    B --> B4[MGnify]
+    B --> B5[BFD/Small BFD]
+    B --> B6[UniProt]
+    
+    C --> C1[PDB mmCIF]
+    C --> C2[PDB SeqRes]
+    C --> C3[PDB70]
+    
+    D --> D1[Template Search DBs]
+    D --> D2[Custom Templates]
+    
+    E --> E1[Precomputed Alignments]
+    E --> E2[Alignment Indices]
+```
+
+## Core Database Components
+
+### Sequence Databases
+
+Sequence databases form the foundation for multiple sequence alignment (MSA) generation and evolutionary analysis. OpenFold supports several major sequence databases, each serving specific purposes in the prediction pipeline.
+
+| Database | Size | Purpose | Download Mode |
+|----------|------|---------|---------------|
+| **UniRef90** | ~60GB | Comprehensive non-redundant sequence database | Full/Reduced |
+| **UniRef30** | ~30GB | Clustered at 30% identity | Full/Reduced |
+| **UniClust30** | ~20GB | Alternative clustering at 30% identity | Full/Reduced |
+| **MGnify** | ~5GB | Metagenomic sequences | Full/Reduced |
+| **BFD** | ~1.8TB | Big Fantastic Database (comprehensive) | Full only |
+| **Small BFD** | ~100GB | Reduced version of BFD | Reduced only |
+| **UniProt** | ~40GB | Reference proteome database | Full/Reduced |
+
+> [!TIP]
+> The choice between BFD and Small BFD represents the most significant storage and performance trade-off. Small BFD provides 95% of the coverage with 5% of the storage requirements.
+
+### Structure Databases
+
+Structure databases provide 3D coordinate information for template-based modeling and structural feature extraction.
+
+| Database | Content | Size | Usage |
+|----------|---------|------|-------|
+| **PDB mmCIF** | Full PDB in mmCIF format | ~200GB | Template generation, feature extraction |
+| **PDB SeqRes** | PDB sequences only | ~5GB | Sequence-based template search |
+| **PDB70** | PDB clustered at 70% identity | ~10GB | Fast template searching |
+
+## Database Setup Procedures
+
+### Full Database Setup
+
+For comprehensive protein structure prediction with maximum accuracy, use the full database configuration:
+
+```bash
+# Download all required databases
+bash scripts/download_alphafold_dbs.sh /path/to/databases full_dbs
+```
+
+This command executes a coordinated download of all major databases through individual download scripts:
+
+```mermaid
+flowchart TB
+    A[download_alphafold_dbs.sh] --> B[download_bfd.sh]
+    A --> C[download_mgnify.sh]
+    A --> D[download_pdb70.sh]
+    A --> E[download_pdb_mmcif.sh]
+    A --> F[download_uniref30.sh]
+    A --> G[download_uniref90.sh]
+    A --> H[download_uniprot.sh]
+    A --> I[download_pdb_seqres.sh]
+    
+    B --> J[BFD Database - 1.8TB]
+    C --> K[MGnify - 5GB]
+    D --> L[PDB70 - 10GB]
+    E --> M[PDB mmCIF - 200GB]
+    F --> N[UniRef30 - 30GB]
+    G --> O[UniRef90 - 60GB]
+    H --> P[UniProt - 40GB]
+    I --> Q[PDB SeqRes - 5GB]
+```
+
+### Reduced Database Setup
+
+For development, testing, or resource-constrained environments:
+
+```bash
+# Download reduced database set
+bash scripts/download_alphafold_dbs.sh /path/to/databases reduced_dbs
+```
+
+This configuration replaces BFD with Small BFD and maintains core functionality while reducing storage requirements from ~2.2TB to ~400GB.
+
+### MMseqs2 Database Setup
+
+For MMseqs2-based alignment pipelines:
+
+```bash
+# Download MMseqs2 optimized databases
+bash scripts/download_mmseqs_dbs.sh /path/to/databases
+```
+
+This setup includes:
+- UniRef30 for sequence searches
+- ColabFold's environmental database for enhanced coverage
+
+## Database Configuration
+
+### Path Configuration
+
+Database paths must be configured in OpenFold's data pipeline. The `add_data_args` function in [`scripts/utils.py`](scripts/utils.py#L15-70) defines all required database paths:
+
+```python
+def add_data_args(parser: argparse.ArgumentParser):
+    parser.add_argument('--uniref90_database_path', type=str, default=None)
+    parser.add_argument('--mgnify_database_path', type=str, default=None)
+    parser.add_argument('--pdb70_database_path', type=str, default=None)
+    parser.add_argument('--pdb_seqres_database_path', type=str, default=None)
+    parser.add_argument('--uniref30_database_path', type=str, default=None)
+    parser.add_argument('--uniclust30_database_path', type=str, default=None)
+    parser.add_argument('--uniprot_database_path', type=str, default=None)
+    parser.add_argument('--bfd_database_path', type=str, default=None)
+    # ... additional binary path configurations
+```
+
+### Binary Tool Configuration
+
+OpenFold requires several external bioinformatics tools for database processing:
+
+| Tool | Purpose | Configuration Parameter |
+|------|---------|-------------------------|
+| **jackhmmer** | Sequence homology search | `--jackhmmer_binary_path` |
+| **hhblits** | Fast MSA generation | `--hhblits_binary_path` |
+| **hhsearch** | Template searching | `--hhsearch_binary_path` |
+| **hmmsearch** | Alternative template search | `--hmmsearch_binary_path` |
+| **hmmbuild** | HMM construction | `--hmmbuild_binary_path` |
+| **kalign** | Sequence alignment | `--kalign_binary_path` |
+
+## Database Preprocessing
+
+### mmCIF Cache Generation
+
+Generate a searchable cache of PDB mmCIF files for efficient template retrieval:
+
+```bash
+python scripts/generate_mmcif_cache.py \
+    /path/to/pdb_mmcif_dir \
+    /path/to/output_cache.json \
+    --no_workers 8 \
+    --cluster_file /path/to/pdb_cluster_file
+```
+
+The [`generate_mmcif_cache.py`](scripts/generate_mmcif_cache.py#L1-108) script processes mmCIF files in parallel, extracting structural metadata and chain information for rapid template searching.
+
+### Alignment Precomputation
+
+Precompute alignments for protein sequences to accelerate inference:
+
+```bash
+python scripts/precompute_alignments.py \
+    /path/to/input_sequences \
+    /path/to/output_alignments \
+    --uniref90_database_path /path/to/uniref90 \
+    --mgnify_database_path /path/to/mgnify \
+    --bfd_database_path /path/to/bfd \
+    --pdb70_database_path /path/to/pdb70 \
+    --cpus_per_task 16
+```
+
+The [`precompute_alignments.py`](scripts/precompute_alignments.py#L1-268) script supports multiple input formats (mmCIF, FASTA, ProteinNet) and creates alignment databases using the `AlignmentRunner` class.
+
+### Alignment Database Creation
+
+Create compact alignment databases for efficient storage and retrieval:
+
+```bash
+python scripts/alignment_db_scripts/create_alignment_db.py \
+    /path/to/alignment_directory \
+    /path/to/output_db_directory \
+    alignment_db_name
+```
+
+The [`create_alignment_db.py`](scripts/alignment_db_scripts/create_alignment_db.py#L1-48) script consolidates alignment files into a single database file with a JSON index for rapid access.
+
+## Advanced Configuration Options
+
+### Database Sharding
+
+For large-scale deployments, alignment databases can be sharded across multiple files:
+
+```bash
+python scripts/alignment_db_scripts/create_alignment_db_sharded.py \
+    /path/to/alignment_directory \
+    /path/to/output_db_directory \
+    alignment_db_name \
+    --num_shards 8
+```
+
+### Database Index Unification
+
+Consolidate indices from multiple alignment databases:
+
+```bash
+python scripts/alignment_db_scripts/unify_alignment_db_indices.py \
+    /path/to/db_directory \
+    /path/to/unified_index.json
+```
+
+## Performance Optimization
+
+### Storage Considerations
+
+**Database Storage Requirements:**
+
+| Configuration | Total Storage | SSD Recommended | HDD Acceptable |
+|---------------|---------------|-----------------|----------------|
+| **Full Setup** | ~2.2TB | Critical for performance | Suitable only for archives |
+| **Reduced Setup** | ~400GB | Recommended | Acceptable for development |
+| **MMseqs2 Setup** | ~100GB | Not required | Fully sufficient |
+
+### Memory Configuration
+
+**Recommended Memory Allocation:**
+
+| Task | Minimum RAM | Recommended RAM | Notes |
+|------|-------------|-----------------|-------|
+| **Database Download** | 8GB | 16GB | Temporary usage |
+| **Alignment Precomputation** | 32GB | 64GB | Scales with sequence count |
+| **Template Search** | 16GB | 32GB | Depends on PDB size |
+| **Full Pipeline** | 64GB | 128GB | For production workloads |
+
+> [!TIP]
+> Database preprocessing tasks benefit significantly from parallel processing. Use the `--no_workers` and `--cpus_per_task` parameters to optimize performance based on available CPU cores.
+
+## Troubleshooting Database Issues
+
+### Common Issues and Solutions
+
+| Issue | Symptom | Solution |
+|-------|---------|----------|
+| **Missing aria2c** | Download scripts fail | Install aria2c: `sudo apt install aria2` |
+| **Insufficient Space** | Download interrupts | Verify 2.2TB available for full setup |
+| **Database Path Errors** | Pipeline fails to start | Verify all paths in `add_data_args` are correct |
+| **Binary Path Issues** | Tool execution fails | Ensure conda environment is activated |
+| **Permission Errors** | Cache generation fails | Check write permissions in output directories |
+
+### Database Validation
+
+Validate database installation:
+
+```bash
+# Check database files exist
+ls -la /path/to/databases/
+
+# Validate mmCIF cache
+python -c "import json; json.load(open('/path/to/cache.json'))"
+
+# Test alignment database access
+python scripts/alignment_db_scripts/add_non_unique_to_alignment_db.py \
+    /path/to/test_alignments \
+    /path/to/db_directory \
+    test_db
+```
+
+## Next Steps
+
+After completing database setup and configuration, proceed to:
+
+- **[System Requirements and Dependencies](3-system-requirements-and-dependencies)** - Ensure your system meets all hardware and software requirements
+- **[Running Inference with Pretrained Models](5-running-inference-with-pretrained-models)** - Start using OpenFold with your configured databases
+- **[Multiple Sequence Alignment (MSA) Handling](13-multiple-sequence-alignment-msa-handling)** - Deep dive into alignment processing techniques
+
+The database setup forms the foundation for all OpenFold operations. Proper configuration ensures optimal performance and accuracy in protein structure prediction tasks.
+
+# Running Inference with Pretrained Models
+
+
+
+OpenFold provides a powerful and flexible inference system for predicting protein structures using pretrained models. This guide will walk you through the complete workflow, from setup to execution, with practical examples and configuration options for different use cases.
+
+## Overview of Inference Architecture
+
+OpenFold's inference pipeline follows a modular architecture that processes input sequences through multiple stages:
+
+```mermaid
+graph TB
+    A[Input FASTA Files] --> B[Sequence Alignment]
+    B --> C[Feature Generation]
+    C --> D[Model Inference]
+    D --> E[Structure Prediction]
+    E --> F[Post-processing]
+    
+    B --> G[Database Search]
+    G --> H[MSA Generation]
+    H --> C
+    
+    D --> I[Template Matching]
+    I --> D
+    
+    F --> J[PDB Output]
+    F --> K[Metrics & Scores]
+```
+
+The inference system supports three main modes:
+- **Monomer**: Single protein chain prediction
+- **Multimer**: Multi-chain protein complex prediction  
+- **Single Sequence**: Sequence embedding-based prediction without MSA
+
+This guide focuses on monomer prediction, with references to [Multimer Protein Structure Prediction](18-multimer-protein-structure-prediction) and [Single Sequence Mode and Embeddings](20-single-sequence-mode-and-embeddings) for specialized use cases.
+
+## Prerequisites and Setup
+
+Before running inference, ensure you have the following components properly configured:
+
+### Environment Requirements
+- OpenFold Conda Environment (see [System Requirements and Dependencies](3-system-requirements-and-dependencies))
+- Sequence databases for multiple sequence alignments
+- GPU acceleration recommended for optimal performance
+
+### Database Setup
+Download the required sequence databases using the provided script:
+
+```bash
+bash scripts/download_alphafold_dbs.sh $BASE_DATA_DIR
+```
+
+This will download and configure:
+- UniRef90 database for comprehensive sequence searches
+- MGnify database for metagenomic sequences  
+- BFD database for deep sequence coverage
+- PDB70 for template matching
+- UniClust30 for additional sequence diversity
+
+![Database Setup](https://github.com/aqlaboratory/openfold/blob/main/docs/source/images/database_setup.png?raw=true)
+
+## Model Parameter Selection
+
+OpenFold supports both AlphaFold and OpenFold pretrained parameters. Choose based on your specific needs:
+
+### Parameter Download Options
+
+| Parameter Type | Download Command | Use Case |
+|---|---|---|
+| AlphaFold Parameters | `bash scripts/download_alphafold_params.sh $PARAMS_DIR` | Standard AlphaFold compatibility |
+| OpenFold Parameters | `bash scripts/download_openfold_params.sh $PARAMS_DIR` | Enhanced OpenFold features |
+
+### Configuration Presets
+
+The `--config_preset` parameter determines the model architecture and capabilities:
+
+| Setting | `config_preset` | AlphaFold Parameters | OpenFold Parameters | Features |
+|---|---|---|---|---|
+| With template, no pTM | `model_1`, `model_2` | `params_model_1.npz`, `params_model_2.npz` | `finetuning_[2-5].pt` | Template-based modeling |
+| With template, with pTM | `model_1_ptm`, `model_2_ptm` | `params_model_1_ptm.npz`, `params_model_2_ptm.npz` | `finetuning_ptm_[1-2].pt` | Template + pTM scoring |
+| Without template, no pTM | `model_3`, `model_4`, `model_5` | `params_model_[3-5].npz` | `finetuning_no_templ_[1-2].pt` | Template-free modeling |
+| Without template, with pTM | `model_3_ptm`, `model_4_ptm`, `model_5_ptm` | `params_model_[3-5]_ptm.npz` | `finetuning_no_templ_ptm_1.pt` | Template-free + pTM |
+
+> [!TIP]
+> Place parameters in `openfold/resources` for automatic detection, or use `--jax_param_path`/`--openfold_checkpoint_path` to specify custom locations.
+
+## Inference Workflow
+
+### Step 1: Input Preparation
+
+Prepare your input sequences as FASTA files in a dedicated directory. Each file should contain one sequence:
+
+```
+fasta_dir/
+└── 6kwc.fasta
+```
+
+Example FASTA format:
+```fasta
+>6KWC_1
+GSTIQPGTGYNNGYFYSYWNDGHGGVTYTNGPGGQFSVNWSNSGEFVGGKGWQPGTKNKVINFSGSYNPNGNSYLSVYGWSRNPLIEYYIVENFGTYNPSTGATKLGEVTSDGSVYDIYRTQRVNQPSIIGTATFYQYWSVRRNHRSSGSVNTANHFNAWAQQGLTLGTMDYQIVAVQGYFSSGSASITVS
+```
+
+### Step 2: Choose Inference Mode
+
+#### Option A: Inference Without Pre-computed Alignments
+
+Run the complete pipeline including sequence alignment:
+
+```bash
+python3 run_pretrained_openfold.py \
+    $INPUT_FASTA_DIR \
+    $TEMPLATE_MMCIF_DIR \
+    --output_dir $OUTPUT_DIR \
+    --config_preset model_1_ptm \
+    --uniref90_database_path $BASE_DATA_DIR/uniref90/uniref90.fasta \
+    --mgnify_database_path $BASE_DATA_DIR/mgnify/mgy_clusters_2018_12.fa \
+    --pdb70_database_path $BASE_DATA_DIR/pdb70 \
+    --uniclust30_database_path $BASE_DATA_DIR/uniclust30/uniclust30_2018_08/uniclust30_2018_08 \
+    --bfd_database_path $BASE_DATA_DIR/bfd/bfd_metaclust_clu_complete_id30_c90_final_seq.sorted_opt \
+    --model_device "cuda:0"
+```
+
+**Required Arguments:**
+- `$INPUT_FASTA_DIR`: Directory containing query FASTA files
+- `$TEMPLATE_MMCIF_DIR`: Directory for template MMCIF files (required even for template-free inference)
+- `--output_dir`: Output directory for predictions
+- `--config_preset`: Model configuration preset
+- Database paths for sequence alignment
+- `--model_device`: Computing device (e.g., "cuda:0" for GPU)
+
+#### Option B: Inference With Pre-computed Alignments
+
+Use existing alignments to skip the database search step:
+
+```bash
+python3 run_pretrained_openfold.py $INPUT_FASTA_DIR \
+  $TEMPLATE_MMCIF_DIR \
+  --output_dir $OUTPUT_DIR \
+  --use_precomputed_alignments $PRECOMPUTED_ALIGNMENTS \
+  --config_preset model_1_ptm \
+  --model_device "cuda:0"
+```
+
+The precomputed alignments directory should have this structure:
+```
+alignments/
+└── 6KWC_1/
+    ├── bfd_uniref_hits.a3m
+    ├── hhsearch_output.hhr
+    ├── mgnify_hits.sto
+    └── uniref90_hits.sto
+```
+
+### Step 3: Execution Flow
+
+```mermaid
+sequenceDiagram
+    participant User as User
+    participant Script as run_pretrained_openfold.py
+    participant DB as Sequence Databases
+    participant Model as OpenFold Model
+    participant Output as Output Files
+    
+    User->>Script: Execute inference command
+    alt No precomputed alignments
+        Script->>DB: Search sequence databases
+        DB->>Script: Return alignment results
+    end
+    Script->>Script: Generate feature dictionary
+    Script->>Model: Load model and parameters
+    Script->>Model: Process features
+    Model->>Script: Return predictions
+    Script->>Output: Save PDB files and metrics
+    Script->>User: Return completion status
+```
+
+## Output Interpretation
+
+The inference process generates several output files and directories:
+
+### Output Structure
+```
+output_dir/
+├── alignments/           # Generated sequence alignments
+│   └── 6KWC_1/
+├── predictions/          # Predicted structures
+│   ├── 6KWC_1_model_1_ptm_unrelaxed.pdb
+│   └── 6KWC_1_model_1_ptm_relaxed.pdb
+└── timings.json         # Performance metrics
+```
+
+### Key Output Files
+- **Unrelaxed PDB**: Direct model output without structural refinement
+- **Relaxed PDB**: Structure after Amber relaxation for improved geometry
+- **Timings JSON**: Performance metrics for inference and relaxation stages
+- **Alignment files**: MSA and template search results for reproducibility
+
+> [!TIP]
+> The relaxed PDB files are generally recommended for downstream analysis as they have improved stereochemistry and physical plausibility.
+
+## Advanced Configuration Options
+
+### Performance Optimization
+
+#### DeepSpeed Integration
+For 2-3x speedup with minimal memory overhead:
+
+```bash
+python3 run_pretrained_openfold.py [...] \
+    --use_deepspeed_evoformer_attention
+```
+
+#### FlashAttention
+For sequences under 1000 residues:
+
+```bash
+python3 run_pretrained_openfold.py [...] \
+    --experiment_config_json '{"globals.use_flash": true}'
+```
+
+#### Model Tracing
+For large-scale batch processing:
+
+```bash
+python3 run_pretrained_openfold.py [...] \
+    --trace_model
+```
+
+### Long Sequence Handling
+
+For sequences exceeding typical memory limits:
+
+```bash
+python3 run_pretrained_openfold.py [...] \
+    --long_sequence_inference \
+    --experiment_config_json '{
+        "globals.chunk_size": 64,
+        "model.evoformer_stack.use_lma": true,
+        "globals.tune_chunk_size": false
+    }'
+```
+
+**Long Sequence Optimization Strategies:**
+1. Enable low-memory attention (LMA) for reduced memory footprint
+2. Disable chunk size tuning to save computation time
+3. Use template averaging to reduce template stack memory
+4. Consider CPU offloading as a last resort
+
+### Custom Templates
+
+Use specific structural templates:
+
+```bash
+python3 run_pretrained_openfold.py [...] \
+    --use_custom_template
+```
+
+This uses all `.cif` files in `template_mmcif_dir` as templates, requiring chains to have identifier `_A` and match input sequence length.
+
+## Troubleshooting and Common Issues
+
+### Memory Management
+| Issue | Solution | Command Example |
+|---|---|---|
+| Out of GPU memory | Enable long sequence mode | `--long_sequence_inference` |
+| Large sequence processing | Reduce chunk size | `--experiment_config_json '{"globals.chunk_size": 32}'` |
+| Memory optimization | Enable LMA | `--experiment_config_json '{"model.evoformer_stack.use_lma": true}'` |
+
+### Performance Issues
+| Issue | Solution | Command Example |
+|---|---|---|
+| Slow inference | Enable DeepSpeed | `--use_deepspeed_evoformer_attention` |
+| Large batch jobs | Use model tracing | `--trace_model` |
+| Database search speed | Use precomputed alignments | `--use_precomputed_alignments $ALIGN_DIR` |
+
+### Configuration Conflicts
+| Issue | Solution | Notes |
+|---|---|---|
+| Parameter mismatch | Ensure config preset matches parameters | Check `config_preset` vs parameter file |
+| Template conflicts | Verify template file format | Use `.cif` format with proper chain IDs |
+| Database path issues | Verify all database paths exist | Check absolute vs relative paths |
+
+## Example: Complete Inference Workflow
+
+Here's a complete example using the provided sample data:
+
+```bash
+#!/bin/bash
+export FASTA_DIR=./fasta_dir
+export OUTPUT_DIR=./
+export PRECOMPUTED_ALIGNMENT_DIR=./alignments
+export MMCIF_DIR=/path/to/mmcifs
+
+python3 run_pretrained_openfold.py $FASTA_DIR \
+  $MMCIF_DIR \
+  --output_dir $OUTPUT_DIR \
+  --config_preset model_1_ptm \
+  --model_device "cuda:0" \
+  --data_random_seed 42 \
+  --use_precomputed_alignments $PRECOMPUTED_ALIGNMENT_DIR
+```
+
+This example demonstrates the typical workflow used in the [examples/monomer/](https://github.com/aqlaboratory/openfold/tree/main/examples/monomer) directory, which includes sample input data and expected outputs.
+
+## Next Steps
+
+After successfully running inference, you may want to explore:
+
+- **Multimer Prediction**: Learn about [Multimer Protein Structure Prediction](18-multimer-protein-structure-prediction) for protein complexes
+- **Training Pipeline**: Explore [Training Pipeline and Configuration](15-training-pipeline-and-configuration) for custom model training
+- **Performance Optimization**: Dive into [DeepSpeed Integration and Performance](16-deepspeed-integration-and-performance) for large-scale deployments
+- **Architecture Details**: Understand the [AlphaFold 2 Model Implementation](9-alphafold-2-model-implementation) for deeper technical insights
+
+
+# Latest Updates
+
+
+
+OpenFold has seen significant development activity throughout 2025, with major infrastructure upgrades, dependency updates, and ongoing efforts to address technical challenges. This update covers the most recent changes and improvements to the project.
+
+## Major Infrastructure Upgrades
+
+### PyTorch 2 and CUDA 12 Support
+
+The most substantial update in 2025 was the comprehensive upgrade to support **PyTorch 2** and **CUDA 12**, released in April 2025. This upgrade represents a significant milestone for OpenFold's performance and compatibility with modern GPU hardware.
+
+According to the [release notes](https://github.com/aqlaboratory/openfold/releases), the upgrade includes:
+- Updated dependency chain to support PyTorch 2.x
+- CUDA 12 compatibility for newer GPU architectures
+- Support for compute capability >9, enabling use of latest NVIDIA hardware
+- Updated NumPy compatibility to support versions >2.0
+
+The upgrade process involved extensive work across multiple components, as evidenced by commits from Jennifer Wei and the development team throughout April 2025. The [environment.yml](https://github.com/aqlaboratory/openfold/commit/da37880bb7a80f5e8703641110f08187544caebf) was modified to `Allow numpy>2 and support compute capability >9`, addressing previous installation issues that users had encountered with NumPy 2.1.0 compatibility.
+
+### Enhanced Documentation and Usability
+
+Alongside the technical upgrades, the team has improved documentation and user experience:
+- Fixed inference documentation ([commit](https://github.com/aqlaboratory/openfold/commit/16af434172e95532b056896cc92336810b004674))
+- Updated installation docs to build CUDA12 version ([commit](https://github.com/aqlaboratory/openfold/commit/0672517777dea77a09249c89117ab87d3ab57c35))
+- Added Open In Colab banner to notebook ([commit](https://github.com/aqlaboratory/openfold/commit/c587b06e8a9655f30112932693c9e715664ebe41))
+
+## Current Technical Challenges
+
+### DeepSpeed Evoformer Attention Issues
+
+A significant ongoing issue affecting OpenFold users involves consistency problems with DeepSpeed evoformer attention when using bfloat16 precision. The [issue #532](https://github.com/aqlaboratory/openfold/issues/532), opened by jnwei in April 2025, highlights several critical problems:
+
+- Unit test `TestDeepSpeedKernel.test_compare_model` fails 30-50% of the time when precision is set to `torch.bfloat16`
+- DeepSpeed unit tests fail ~40% of the time when both `bias` term and `bfloat16` are used
+- The issue appears to be related to specific attention initialization or input values
+
+The problem extends beyond unit tests, as reported by users experiencing structural prediction issues with longer protein sequences (>256 amino acids) when using bfloat16 precision with DeepSpeed evoformer attention.
+
+### Infrastructure Maintenance
+
+The project continues to receive regular maintenance updates:
+- GitHub Actions dependency updates ([commit](https://github.com/aqlaboratory/openfold/commit/ce0029e1199b65fd834fe822be50d936cfe57fd4)) bumping actions/checkout from v4 to v5
+- OpenMM support updated to handle versions >8 ([commit](https://github.com/aqlaboratory/openfold/commit/7e06ed9821926dc6ef5bae54048c813b331b3b58))
+- Fixed tolerance units in amber minimization ([commit](https://github.com/aqlaboratory/openfold/commit/7e06ed9821926dc6ef5bae54048c813b331b3b58))
+
+## Community and Ecosystem Impact
+
+### Industry Recognition
+
+OpenFold continues to gain recognition in the scientific computing community. According to [NVIDIA's build.nvidia.com](https://build.nvidia.com/openfold/openfold2/modelcard), OpenFold2 is now available as a commercial model, demonstrating its transition from research tool to production-ready solution.
+
+The project has been highlighted for its:
+- Accuracy parity with AlphaFold2
+- Improved speed characteristics
+- Commercial-use licensing under Apache 2.0
+- Support for both training and inference workflows
+
+### Research Applications
+
+Recent research continues to leverage OpenFold's unique capabilities. As noted in a [Harvard LSP news article](https://labsyspharm.org/lsp-news/openfold-provides-insights-into-alphafold2s-learning-behavior), OpenFold's open-source nature provides valuable insights into AlphaFold2's learning mechanisms that weren't possible with the original closed-source implementation.
+
+## Development Activity Summary
+
+The development timeline shows sustained activity throughout 2025:
+
+| Period | Focus Area | Key Changes |
+|--------|------------|-------------|
+| April 2025 | Major Upgrade | PyTorch 2, CUDA 12, NumPy 2 support |
+| August 2025 | Maintenance | GitHub Actions updates, dependency management |
+| September 2025 | Issue Resolution | Ongoing bfloat16 consistency investigations |
+
+The project maintains active development with contributions from core team members like Jennifer Wei, who has been instrumental in driving the PyTorch 2 upgrade and various infrastructure improvements.
+
+Looking ahead, the team appears focused on resolving the DeepSpeed bfloat16 consistency issues while continuing to maintain and improve the core infrastructure that makes OpenFold a vital tool in the protein structure prediction ecosystem.
+
+# Issues and Feedbacks
+
+
+
+OpenFold, as a PyTorch reproduction of AlphaFold 2, has garnered significant attention from the scientific community since its inception. While the project has made remarkable progress in making protein structure prediction more accessible and trainable, users have encountered various challenges and provided valuable feedback that shapes the project's development. This comprehensive analysis examines the key issues, user experiences, and community feedback surrounding OpenFold.
+
+## Critical Technical Issues
+
+### DeepSpeed EvoFormer Attention Consistency Problems
+
+One of the most persistent technical issues affecting OpenFold users involves the DeepSpeed EvoFormer attention implementation, particularly with bfloat16 precision. According to [issue #532](https://github.com/aqlaboratory/openfold/issues/532), users have observed inconsistent behavior where unit tests fail 30-50% of the time when using `torch.bfloat16`. The problem manifests in the `TestDeepSpeedKernel.test_compare_model` test, suggesting underlying numerical instability in the custom attention kernels.
+
+This issue is particularly concerning because:
+- The inconsistency appears to be related to specific attention initialization patterns or input values
+- Similar problems have been observed in the upstream DeepSpeed repository ([issue #5052](https://github.com/deepspeedai/DeepSpeed/issues/5052))
+- Users report that the problem affects both reliability and reproducibility of results
+
+The development team has acknowledged this issue and added references to the problem in test files, but a complete resolution remains pending as of the latest updates.
+
+### Shape Mismatch and Batch Processing Issues
+
+Another significant technical challenge reported in [issue #513](https://github.com/aqlaboratory/openfold/issues/513) involves shape mismatch errors when using batch sizes greater than 1. Users encounter a `RuntimeError` indicating that tensors with incompatible shapes cannot be broadcast together:
+
+```
+RuntimeError: output with shape [2, 1, 200, 200] doesn't match the broadcast shape [2, 2, 200, 200]
+```
+
+This error occurs in the template embedding module during model forward passes, specifically in the `template_pair_embedder` component. The issue suggests problems with how batch dimensions are handled across different model components, particularly when processing template features for multiple protein sequences simultaneously.
+
+## Installation and Setup Challenges
+
+### Template File Requirements Confusion
+
+A recurring source of frustration for new users revolves around template file requirements, even when using template-free models. Multiple issues ([#548](https://github.com/aqlaboratory/openfold/issues/548), [#546](https://github.com/aqlaboratory/openfold/issues/546), [#545](https://github.com/aqlaboratory/openfold/issues/545)) highlight this problem. Users attempting to run inference with template-free checkpoints like `finetuning_no_templ_ptm_1.pt` are surprised to find that the system still requires `.cif` files.
+
+The core issue appears to be:
+- Even template-free models expect a template directory path
+- The system attempts to read specific `.cif` files (like `1f5j.cif` or `1h1a.cif`) regardless of the model type
+- Users must create empty placeholder directories and files to proceed
+- Documentation doesn't clearly explain this requirement for template-free scenarios
+
+As one user expressed in [issue #547](https://github.com/aqlaboratory/openfold/issues/547): "After I create an empty one, it just complains about another missing .cif file. So do I have to manually create every .cif file one by one?"
+
+### Documentation Gaps and Learning Curve
+
+The project has received consistent feedback about documentation challenges, particularly for new users. [Issue #226](https://github.com/aqlaboratory/openfold/issues/226), dating back to 2022 but still receiving updates, exemplifies this problem. Users struggle with understanding:
+- The complete data preparation pipeline
+- Expected file structures and formats
+- The relationship between different database components
+- How to generate required input files like `input.fasta`
+
+One user noted: "I am no a data scientists, I am a data engineer/IT/wear many hats person so if I say something that doesn't make much sense in terms of models, etc. I apologize." This highlights the project's challenge in bridging the gap between specialized computational biology knowledge and general technical expertise.
+
+### Dependency Management Issues
+
+OpenFold has faced several dependency-related challenges that affect installation and stability:
+
+1. **NumPy Version Conflicts**: As documented in [issue #477](https://github.com/aqlaboratory/openfold/issues/477), unspecified NumPy versions caused installation conflicts with DeepSpeed. The problem arose when NumPy 2.1.0 was automatically selected, creating compatibility issues with the specified DeepSpeed version that required NumPy 1.x.
+
+2. **PyTorch Lightning Compatibility**: [Issue #509](https://github.com/aqlaboratory/openfold/issues/509) revealed compatibility problems with newer PyTorch Lightning versions, where users encountered `TypeError: setup() got an unexpected keyword argument 'stage'`. This suggests that the project needs more robust version pinning or compatibility layers.
+
+3. **Environment Setup Complexity**: The recent April 2025 updates addressed many of these issues by updating to support PyTorch 2, CUDA 12, and newer versions of dependencies like NumPy 2 and PyTorch Lightning 2.5. However, these updates also introduced new challenges for users maintaining existing environments.
+
+## Performance and Resource Management
+
+### Memory Constraints and GPU Requirements
+
+Users have consistently reported challenges with memory management, particularly when training on consumer-grade hardware. [Issue #511](https://github.com/aqlaboratory/openfold/issues/511) details CUDA out of memory errors on RTX 4090 GPUs, even after reducing model complexity by adjusting evoformer and structure module blocks.
+
+The feedback suggests that:
+- Memory optimization features don't always work as expected
+- Users need more guidance on configuring models for specific hardware constraints
+- The balance between model accuracy and resource usage needs better documentation
+
+### Long Sequence Processing
+
+While OpenFold has made strides in handling longer sequences compared to the original AlphaFold implementation, users still encounter challenges with proteins exceeding 1,300 residues. The AWS optimization guide suggests using G5 instances with 24GB VRAM and enabling the `long_sequence_inference` flag, but these solutions aren't always accessible to academic users or those with limited resources.
+
+## Training and Development Issues
+
+### Distributed Training Complexities
+
+Several issues relate to distributed training setups. [Issue #512](https://github.com/aqlaboratory/openfold/issues/512) reports "RuntimeError: Timed out initializing process group with --num_nodes=2 in DeepSpeed," indicating problems with multi-node training configurations. These issues are particularly challenging for users trying to scale up training across multiple machines or GPUs.
+
+### Testing Infrastructure Gaps
+
+[Issue #510](https://github.com/aqlaboratory/openfold/issues/510) highlights problems with the testing infrastructure, particularly for comparing OpenFold results against the original AlphaFold implementation. Users struggle to set up environments where both versions can coexist and be compared meaningfully, making it difficult to validate OpenFold's accuracy claims.
+
+## Community Feedback and Comparative Analysis
+
+### OpenFold vs. AlphaFold User Experience
+
+Community discussions reveal that while OpenFold offers advantages over the original AlphaFold implementation, users often face trade-offs:
+
+**Advantages noted by users:**
+- **Trainability**: Unlike AlphaFold, OpenFold can be fine-tuned for specialized research applications
+- **Speed**: Performance comparisons show OpenFold can be up to 90% faster than AlphaFold for certain tasks
+- **Memory Efficiency**: Optimized memory usage allows handling longer sequences (up to 4,600 residues on A100 40GB)
+- **Open Source**: Full access to training code, model weights, and data without restrictive licensing
+
+**Persistent challenges:**
+- **Installation Complexity**: Users report that OpenFold requires more technical expertise to set up compared to using AlphaFold's web interface
+- **Documentation Quality**: While improving, documentation still lags behind user needs, particularly for edge cases
+- **Ecosystem Integration**: Less seamless integration with existing bioinformatics pipelines compared to more established tools
+
+### User Community Sentiment
+
+Analysis of community feedback reveals several patterns:
+
+1. **Enthusiasm for Open Source**: Users consistently appreciate the open-source nature of OpenFold and the team's commitment to transparency
+2. **Frustration with Setup Complexity**: Many users express frustration with the initial setup process, particularly dependency management and database preparation
+3. **Appreciation for Performance**: Once operational, users generally report satisfaction with the system's performance and accuracy
+4. **Desire for Better Examples**: Community members frequently request more comprehensive examples and tutorials, especially for specialized use cases
+
+## Development Team Responsiveness
+
+The OpenFold development team has demonstrated strong responsiveness to user feedback, as evidenced by:
+
+1. **Regular Updates**: Recent commits show consistent work on addressing user-reported issues, including documentation fixes, dependency updates, and bug resolution
+2. **Community Engagement**: Team members actively participate in issue discussions, providing guidance and acknowledging limitations
+3. **Major Version Updates**: The transition to support PyTorch 2 and CUDA 12 addresses many long-standing compatibility issues
+4. **Documentation Improvements**: Ongoing work on the [official documentation](https://openfold.readthedocs.io/) shows commitment to improving user experience
+
+## Recommendations for Users
+
+Based on the analysis of issues and feedback, here are key recommendations for users considering OpenFold:
+
+### For New Users:
+1. **Start with the Official Documentation**: Begin with the comprehensive guides at [openfold.readthedocs.io](https://openfold.readthedocs.io/)
+2. **Use Recommended Environments**: Follow the recommended environment specifications, particularly for PyTorch, CUDA, and dependency versions
+3. **Prepare for Template Directory Setup**: Even for template-free inference, create an empty template directory structure as required
+4. **Leverage Community Resources**: Engage with the community through GitHub issues and discussions for troubleshooting
+
+### For Advanced Users:
+1. **Monitor Known Issues**: Keep track of [issue #532](https://github.com/aqlaboratory/openfold/issues/532) for updates on DeepSpeed attention consistency problems
+2. **Consider Hardware Requirements**: Plan for adequate GPU resources, especially for long sequences or batch processing
+3. **Contribute Feedback**: Provide detailed bug reports and feature requests to help improve the project
+
+### For Production Deployments:
+1. **Test Thoroughly**: Conduct comprehensive testing with your specific use cases before deployment
+2. **Monitor Dependency Updates**: Stay informed about dependency updates and their potential impact on your workflows
+3. **Plan for Resource Scaling**: Consider the resource requirements for your target protein lengths and batch sizes
+
+## Future Outlook
+
+The OpenFold project continues to evolve based on user feedback and technological advances. Key areas to watch include:
+
+1. **Stability Improvements**: Ongoing work on resolving numerical stability issues in custom kernels
+2. **Documentation Enhancement**: Continued development of more comprehensive and accessible documentation
+3. **Performance Optimization**: Further improvements in memory efficiency and processing speed
+4. **Ecosystem Integration**: Better integration with existing bioinformatics tools and workflows
+
+OpenFold represents a significant step forward in democratizing access to state-of-the-art protein structure prediction. While users face various challenges, the project's open-source nature and responsive development team provide a strong foundation for continued improvement. As the community grows and more users contribute feedback and improvements, OpenFold is likely to become increasingly robust and user-friendly, further advancing structural biology research.
+
+# About Contributors
+
+
+
+The OpenFold project is led by a diverse team of researchers and developers from Columbia University and collaborating institutions, bringing together expertise in machine learning, computational biology, and software engineering. This page highlights the key contributors who have made significant impacts on the development and success of OpenFold.
+
+## Primary Leadership
+
+### Mohammed AlQuraishi, PhD
+**Position**: Assistant Professor of Systems Biology at Columbia University  
+**Role**: Principal Investigator and OpenFold Consortium Lead  
+
+Dr. AlQuraishi is the driving force behind OpenFold, leading the AQ Laboratory at Columbia University where his research focuses on the intersection of machine learning, biophysics, and systems biology. His lab develops machine learning models for predicting protein structure and function, protein-ligand interactions, and learned representations of proteins and proteomes. Dr. AlQuraishi earned his PhD in genetics from Stanford University and holds undergraduate degrees in biology, computer science, and mathematics. Prior to joining Columbia in 2020, he spent time at Harvard Medical School as a Departmental Fellow and Fellow in Systems Pharmacology, where he developed the first end-to-end differentiable model for learning protein structure from data.
+
+His leadership has been instrumental in securing major funding, including grants from the National Institute of General Medical Sciences ([R35GM150546](https://pubmed.ncbi.nlm.nih.gov/38744917/)) and the National Science Foundation, as well as the INCITE 2024 Award. Under his guidance, the AQ Laboratory has become a hub for innovative protein structure prediction research.
+
+## Core Development Team
+
+### Jennifer Wei
+**Role**: Lead Developer and Key Contributor  
+
+Jennifer Wei is one of the most active contributors to the OpenFold codebase, as evidenced by her extensive commit history and involvement in critical infrastructure updates. From the recent commit data, Wei has been responsible for numerous important updates, including:
+
+- Merging the PyTorch 2 upgrade in [commit e938c18](https://github.com/aqlaboratory/openfold/commit/e938c184a291bf053af3b14c1e3e8bb29aee57e2)
+- Updating dependencies to support numpy 2 and compute capability >9 in [commit da37880](https://github.com/aqlaboratory/openfold/commit/da37880bb7a80f5e8703641110f08187544caebf)
+- Supporting OpenMM >8 and fixing tolerance units in amber minimization in [commit 7e06ed9](https://github.com/aqlaboratory/openfold/commit/7e06ed9821926dc6ef5bae54048c813b331b3b58)
+- Managing GitHub Actions upgrades and dependency bumps
+
+Wei's work demonstrates deep expertise in software engineering and dependency management, ensuring OpenFold remains compatible with the latest AI/ML frameworks while maintaining stability across different computing environments.
+
+### Sachin Kadyan
+**Role**: Research Scientist and Infrastructure Specialist  
+
+Sachin Kadyan is a key developer who has contributed significantly to both the research and practical deployment aspects of OpenFold. His work includes:
+
+- Co-authoring the landmark Nature Methods paper on OpenFold ([DOI: 10.1038/s41592-024-02272-z](https://pubmed.ncbi.nlm.nih.gov/38744917/))
+- Leading the development of OpenFold-Multimer and SoloSeq, as mentioned in the [BusinessWire release](https://www.biospace.com/openfold-biotech-ai-research-consortium-releases-soloseq-and-multimer-an-integrated-protein-large-language-model-with-3d-structure-generation)
+- Contributing to AWS Batch optimization work, as documented in the [AWS blog post](https://aws.amazon.com/blogs/hpc/optimize-protein-folding-costs-with-openfold-on-aws-batch)
+
+Kadyan's expertise spans from theoretical ML research to practical cloud deployment, making him instrumental in bridging the gap between academic research and industrial applications.
+
+### Christina Floristean
+**Role**: Graduate Student and Research Contributor  
+
+Christina Floristean is a graduate student researcher who has made significant contributions to OpenFold's development and research. Her work includes:
+
+- Co-authoring the main OpenFold Nature Methods publication
+- Contributing to the development of SoloSeq and OpenFold-Multimer
+- Working on protein-ligand co-folding frameworks under Dr. Bouatta's supervision at Harvard
+
+Floristean represents the next generation of researchers in computational structural biology, bringing fresh perspectives and technical expertise to the project.
+
+## Collaborative Ecosystem
+
+The OpenFold project benefits from a broader collaborative ecosystem that includes:
+
+### Nazim Bouatta
+**Affiliation**: Senior Research Fellow at Harvard Medical School  
+**Contribution**: Co-founder of the OpenFold project and collaborator on research initiatives. Bouatta has been instrumental in securing computational resources and fostering collaborations between Harvard and Columbia teams.
+
+### Industry and Academic Partners
+The project has received support from various organizations including:
+- **Texas Advanced Computing Center (TACC)**: Providing HPC resources through Frontera and Lonestar6 supercomputers
+- **Stability AI**: Contributing compute resources for experiments
+- **OpenBioML**: Collaborative support for open-source development
+- **NVIDIA**: Providing GPU computing resources
+
+## Research Impact and Publications
+
+The OpenFold team has published extensively in top-tier journals, with their landmark paper ["OpenFold: retraining AlphaFold2 yields new insights into its learning mechanisms and capacity for generalization"](https://pubmed.ncbi.nlm.nih.gov/38744917/) in Nature Methods (August 2024) establishing OpenFold as a critical resource for the protein modeling community. The paper demonstrates that OpenFold matches AlphaFold2's accuracy while providing unprecedented flexibility for training and customization.
+
+## Community Engagement
+
+The contributors actively engage with the scientific community through:
+- **Issue Resolution**: Addressing user-reported problems and feature requests
+- **Documentation**: Maintaining comprehensive guides for installation and usage
+- **Conference Participation**: Presenting at major machine learning and computational biology conferences
+- **Open Source Advocacy**: Promoting reproducible science through fully accessible code and training data
+
+## Future Directions
+
+Under the leadership of Dr. AlQuraishi and the core development team, OpenFold continues to evolve with research initiatives focusing on:
+- Protein-ligand complex structure prediction
+- Single-sequence protein structure prediction
+- RNA 3D structure prediction
+- Novel neural architectures for improved scalability
+
+The contributors' diverse expertise and collaborative approach ensure that OpenFold remains at the forefront of computational structural biology, driving innovation in protein structure prediction and related fields.
+
+# AlphaFold 2 Model Implementation
+
+
+
+The AlphaFold 2 implementation in OpenFold represents a comprehensive PyTorch reimplementation of DeepMind's groundbreaking protein structure prediction model. This architecture leverages deep learning to predict protein 3D structures from amino acid sequences with remarkable accuracy.
+
+## Core Architecture Overview
+
+The AlphaFold 2 model follows the architectural design outlined in the original AlphaFold 2 paper, implementing the core algorithmic components as a modular neural network system. The primary model class [`AlphaFold`](openfold/model/model.py#L65) serves as the central orchestrator, coordinating between different functional modules that process input features and generate structural predictions.
+
+```mermaid
+graph TB
+    subgraph Input_Processing
+        A[Input Features] --> B[Input Embedder]
+        B --> C[Template Embedder]
+        C --> D[Extra MSA Embedder]
+    end
+    
+    subgraph Core_Trunk
+        E[Recycling Embedder] --> F[Evoformer Stack]
+        F --> G[Structure Module]
+    end
+    
+    subgraph Output_Heads
+        G --> H[Auxiliary Heads]
+        H --> I[Final Predictions]
+    end
+    
+    Input_Processing --> Core_Trunk
+    Core_Trunk --> Output_Heads
+```
+
+## Model Initialization and Configuration
+
+The model is initialized through a hierarchical configuration system that defines the architecture parameters and behavior modes. The [`__init__`](openfold/model/model.py#L72) method demonstrates the modular assembly of key components:
+
+- **Input Embedding**: Selects between [`InputEmbedder`](openfold/model/embedders.py#L38), [`InputEmbedderMultimer`](openfold/model/embedders.py#L157), or [`PreembeddingEmbedder`](openfold/model/embedders.py#L312) based on use case
+- **Template Processing**: Configures [`TemplateEmbedder`](openfold/model/embedders.py#L634) or [`TemplateEmbedderMultimer`](openfold/model/embedders.py#L873) for structural template integration
+- **MSA Processing**: Sets up [`ExtraMSAEmbedder`](openfold/model/embedders.py#L595) and [`ExtraMSAStack`](openfold/model/evoformer.py#L1028) for additional sequence information
+- **Core Processing**: Initializes [`EvoformerStack`](openfold/model/evoformer.py#L748) and [`StructureModule`](openfold/model/structure_module.py#L817) for feature extraction and structure generation
+
+## Input Embedding Pipeline
+
+The input embedding system transforms raw protein sequence features into rich numerical representations suitable for deep learning processing. The [`InputEmbedder`](openfold/model/embedders.py#L38) implements Algorithms 3 and 4 from the AlphaFold 2 paper, handling:
+
+- **Target sequence features**: One-hot encoded amino acid sequences
+- **MSA features**: Multiple sequence alignment representations  
+- **Relative positions**: Sequential distance encoding via [`relpos`](openfold/model/embedders.py#L85) method
+
+For multimer predictions, the [`InputEmbedderMultimer`](openfold/model/embedders.py#L157) extends this functionality with chain-aware relative positioning and specialized handling for multi-chain protein complexes.
+
+## Recycling Mechanism
+
+A key innovation in AlphaFold 2 is the iterative recycling mechanism that allows the model to refine its predictions through multiple passes. The [`iteration`](openfold/model/model.py#L209) method implements this refinement process:
+
+1. **Feature preprocessing**: Converts input features to appropriate data types and extracts batch dimensions
+2. **Embedding initialization**: Creates initial MSA (`m`) and pair (`z`) representations
+3. **Recycling integration**: Combines current iteration outputs with previous iteration embeddings via [`RecyclingEmbedder`](openfold/model/embedders.py#L406)
+4. **Progressive refinement**: Each iteration improves upon the previous predictions, with early stopping when convergence is detected
+
+The [`forward`](openfold/model/model.py#L493) method orchestrates the complete recycling loop, managing gradient computation and memory optimization across iterations.
+
+## Evoformer Core Processing
+
+The [`EvoformerStack`](openfold/model/evoformer.py#L748) implements Algorithm 6, serving as the core feature extraction engine. It processes MSA and pair representations through a series of specialized blocks:
+
+| Component | Function | Implementation |
+|-----------|----------|----------------|
+| **MSA Attention** | Row-wise attention over sequences | [`EvoformerBlock`](openfold/model/evoformer.py#L377) |
+| **Outer Product Mean** | MSA to pair representation conversion | [`_compute_opm`](openfold/model/evoformer.py#L325) |
+| **Pair Stack** | Pair representation processing | [`PairStack`](openfold/model/evoformer.py#L123) |
+| **MSA Transition** | Feed-forward MSA processing | [`MSATransition`](openfold/model/evoformer.py#L48) |
+
+The Evoformer employs advanced optimization techniques including activation checkpointing, chunked processing for memory efficiency, and specialized attention implementations.
+
+## Structure Module
+
+The [`StructureModule`](openfold/model/structure_module.py#L817) transforms the processed features into 3D atomic coordinates. This module implements the geometric reasoning components of AlphaFold 2:
+
+- **Invariant Point Attention**: [`InvariantPointAttention`](openfold/model/structure_module.py#L209) performs 3D-aware attention on structural frames
+- **Backbone Update**: [`BackboneUpdate`](openfold/model/structure_module.py#L736) generates coordinate updates
+- **Angle Prediction**: [`AngleResnet`](openfold/model/structure_module.py#L78) predicts torsion angles
+- **Frame Generation**: Converts predictions to 3D coordinates using rigid body transformations
+
+The structure module supports both monomer and multimer modes, with specialized implementations for different use cases.
+
+## Auxiliary Prediction Heads
+
+The [`AuxiliaryHeads`](openfold/model/heads.py#L28) component generates additional predictions used during training and for confidence assessment:
+
+| Head | Purpose | Output |
+|------|---------|--------|
+| **DistogramHead** | Distance predictions | Pairwise residue distances |
+| **TMScoreHead** | Quality assessment | TM-score predictions |
+| **PerResidueLDDTCaPredictor** | Local confidence | Per-residue lDDT scores |
+| **MaskedMSAHead** | MSA reconstruction | Sequence conservation |
+| **ExperimentallyResolvedHead** | Resolution prediction | Experimental data confidence |
+
+## Configuration System
+
+The model architecture is highly configurable through the [`config.py`](openfold/config.py) system, which defines:
+
+- **Channel dimensions**: `c_m` (256), `c_z` (128), `c_s` (384) for different representation spaces
+- **Architecture parameters**: Number of attention heads, blocks, and hidden dimensions
+- **Optimization settings**: Chunk sizes, checkpointing strategies, precision modes
+- **Feature flags**: Template usage, MSA processing modes, multimer support
+
+> [!TIP]
+> The modular design allows for flexible configuration between different use cases, from standard monomer prediction to multimer complexes and single-sequence embedding modes.
+
+## Performance Optimizations
+
+OpenFold's implementation includes several performance optimizations beyond the original AlphaFold 2:
+
+- **Memory efficiency**: Chunked processing and activation checkpointing
+- **GPU acceleration**: Custom CUDA kernels and optimized attention implementations
+- **Mixed precision**: Support for FP16 training and inference
+- **Distributed training**: DeepSpeed integration for large-scale training
+
+The implementation maintains algorithmic fidelity with the original AlphaFold 2 while providing the flexibility and performance characteristics needed for production use and research applications.
+
+Sources: [model.py](openfold/model/model.py#L65), [evoformer.py](openfold/model/evoformer.py#L748), [embedders.py](openfold/model/embedders.py#L38), [structure_module.py](openfold/model/structure_module.py#L817), [heads.py](openfold/model/heads.py#L28), [config.py](openfold/config.py#L61)
+
+## Next Steps
+
+For a deeper understanding of the core processing components, explore [Evoformer and Structure Module](10-evoformer-and-structure-module) to learn about the detailed implementation of these critical architectural elements. To understand how the model handles memory constraints and large proteins, see [Memory Optimization Techniques](11-memory-optimization-techniques).
+
+# Evoformer and Structure Module
+
+
+
+The Evoformer and Structure Module represent the core computational engine of OpenFold's AlphaFold 2 implementation, working in tandem to transform evolutionary and sequence information into precise 3D protein structures. These components implement the sophisticated attention mechanisms and geometric reasoning that enable accurate protein structure prediction.
+
+## Architecture Overview
+
+The Evoformer and Structure Module form a two-stage processing pipeline where evolutionary information is first refined through attention-based operations, then translated into 3D coordinates through geometric transformations.
+
+```mermaid
+graph TB
+    subgraph "Evoformer Stage"
+        EM[Input Embeddings] --> EA[EvoformerBlock Stack]
+        EA --> EP[Pair Representation]
+        EA --> ES[Single Representation]
+    end
+    
+    subgraph "Structure Module Stage"
+        ES --> IPA[InvariantPointAttention]
+        EP --> IPA
+        IPA --> BU[Backbone Update]
+        BU --> AR[Angle Resnet]
+        AR --> SM[Structure Output]
+    end
+    
+    EP -->|Pair Features| IPA
+    ES -->|Single Features| IPA
+```
+
+This architecture reflects Algorithm 6 (Evoformer) and Algorithm 23 (Structure Module) from the AlphaFold 2 paper, with careful attention to computational efficiency and memory optimization.
+
+## Evoformer Core Components
+
+### EvoformerStack: The Main Trunk
+
+The `EvoformerStack` serves as the primary processing engine, implementing Algorithm 6 with multiple blocks of attention and geometric transformations [evoformer.py#L748-L770]:
+
+```python
+class EvoformerStack(nn.Module):
+    """
+    Main Evoformer trunk.
+    
+    Implements Algorithm 6.
+    """
+```
+
+Key architectural features include:
+
+| Component | Purpose | Parameters |
+|-----------|---------|------------|
+| **MSA Processing** | Multi-sequence alignment attention | `c_m`, `no_heads_msa` |
+| **Pair Processing** | Residue pair relationships | `c_z`, `no_heads_pair` |
+| **Outer Product Mean** | MSA-to-pair information flow | `c_hidden_opm` |
+| **Triangular Updates** | Geometric constraint propagation | `c_hidden_mul`, `c_hidden_pair_att` |
+
+> [!TIP]
+> The EvoformerStack supports both monomer and multimer modes, with configurable checkpointing (`blocks_per_ckpt`) for memory optimization during training large protein complexes.
+
+### EvoformerBlock: Atomic Processing Unit
+
+Each `EvoformerBlock` represents a complete processing cycle combining MSA and pair representations [evoformer.py#L377-L440]:
+
+```python
+class EvoformerBlock(MSABlock):
+    def __init__(self,
+        c_m: int,           # MSA channel dimension
+        c_z: int,           # Pair channel dimension
+        no_heads_msa: int,  # MSA attention heads
+        no_heads_pair: int, # Pair attention heads
+        no_column_attention: bool,  # Column attention toggle
+        ...
+    ):
+```
+
+The block architecture features:
+
+1. **MSA Row Attention**: Processes sequences across alignment positions
+2. **MSA Column Attention**: Processes positions across sequences (configurable)
+3. **Outer Product Mean**: Converts MSA information to pair representations
+4. **Triangular Attention**: Propagates geometric constraints through pair representations
+5. **Transition Layers**: Non-linear transformations with configurable dropout
+
+### ExtraMSAStack: Extended Evolutionary Information
+
+For enhanced evolutionary modeling, the `ExtraMSAStack` processes additional MSA data using specialized blocks with GlobalAttention for column-wise processing [evoformer.py#L1028-L1050]:
+
+```python
+class ExtraMSAStack(nn.Module):
+    """
+    Implements Algorithm 18.
+    """
+```
+
+This component enables deeper evolutionary context by processing additional MSA sequences that aren't included in the main Evoformer stack.
+
+## Structure Module: Geometric Realization
+
+The Structure Module translates the abstract representations from the Evoformer into concrete 3D coordinates through sophisticated geometric reasoning.
+
+### StructureModule: Main Coordination
+
+The `StructureModule` orchestrates the final structure prediction with support for both monomer and multimer protein structures [structure_module.py#L817-L880]:
+
+```python
+class StructureModule(nn.Module):
+    def __init__(
+        self,
+        c_s,                    # Single representation channel dimension
+        c_z,                    # Pair representation channel dimension
+        c_ipa,                  # IPA hidden channel dimension
+        no_heads_ipa,           # Number of IPA heads
+        no_qk_points,           # Query/key points for IPA
+        no_v_points,            # Value points for IPA
+        no_blocks,              # Structure module blocks
+        is_multimer=False,      # Multimer mode toggle
+        **kwargs,
+    ):
+```
+
+Key architectural decisions include:
+
+| Parameter | Role | Impact |
+|-----------|------|--------|
+| **`no_qk_points`/`no_v_points`** | 3D attention resolution | Higher values capture finer geometric details |
+| **`no_blocks`** | Iterative refinement | More blocks improve accuracy but increase compute |
+| **`is_multimer`** | Chain handling | Specialized processing for multi-chain complexes |
+
+### InvariantPointAttention: 3D Geometric Attention
+
+The `InvariantPointAttention` (IPA) mechanism represents the core geometric reasoning component, implementing Algorithm 22 [structure_module.py#L209-L230]:
+
+```python
+class InvariantPointAttention(nn.Module):
+    """
+    Implements Algorithm 22.
+    """
+```
+
+IPA operates by:
+
+1. **Point Generation**: Converting single representations to 3D query/key/value points
+2. **Rigid Transformation**: Applying current structure frame transformations
+3. **Attention Computation**: Performing attention in 3D space with geometric awareness
+4. **Invariant Aggregation**: Combining attention results while maintaining rotational/translational invariance
+
+The multimer variant (`InvariantPointAttentionMultimer`) extends this for multi-chain complexes with specialized handling of inter-chain interactions [structure_module.py#L513-L525].
+
+### Backbone Update and Angle Refinement
+
+The final structure components work together to produce atomic coordinates:
+
+- **BackboneUpdate**: Transforms single representations into backbone coordinate updates [structure_module.py#L736-L753]
+- **AngleResnet**: Predicts torsion angles using residual networks (Algorithm 20, lines 11-14) [structure_module.py#L78-L117]
+- **StructureModuleTransition**: Provides non-linear transformations between IPA blocks [structure_module.py#L791-L807]
+
+## Integration Patterns and Data Flow
+
+The Evoformer and Structure Module integrate through a carefully designed data flow in the main `AlphaFold` model [model.py#L124-L131]:
+
+```python
+self.evoformer = EvoformerStack(
+    **self.config["evoformer_stack"],
+)
+
+self.structure_module = StructureModule(
+    is_multimer=self.globals.is_multimer,
+    **self.config["structure_module"],
+)
+```
+
+### Key Integration Points
+
+1. **Representation Transfer**: 
+   - Single representations (`m`) and pair representations (`z`) flow from Evoformer to Structure Module
+   - Recycling embeddings enable iterative refinement across multiple cycles
+
+2. **Mask Propagation**:
+   - Sequence masks and pair masks ensure proper attention computation
+   - Multimer mode includes asymmetric chain masks for multi-chain processing
+
+3. **Memory Optimization**:
+   - Chunking support for both Evoformer and Structure Module operations
+   - DeepSpeed integration for large-scale training
+   - Configurable checkpointing to balance memory and computation
+
+## Performance Optimization Features
+
+### Memory Efficiency
+
+Both modules implement several memory optimization strategies:
+
+| Optimization | Evoformer | Structure Module | Benefit |
+|--------------|-----------|------------------|---------|
+| **Chunking** | ✓ | ✓ | Process large sequences in segments |
+| **DeepSpeed Integration** | ✓ | ✓ | Distributed training optimization |
+| **Flash Attention** | ✓ | ✓ | Memory-efficient attention computation |
+| **Inplace Operations** | ✓ | ✓ | Reduce memory overhead |
+
+### Computational Efficiency
+
+The implementation includes several performance optimizations:
+
+- **TorchScript Compatibility**: Critical components are TorchScript-friendly for deployment
+- **Custom CUDA Kernels**: Specialized operations for maximum performance
+- **Configurable Precision**: Support for mixed-precision training
+- **Lazy Initialization**: Residue constants initialized on-demand to save memory
+
+## Configuration and Usage
+
+### Key Configuration Parameters
+
+The modules expose numerous configuration options for tuning performance and accuracy:
+
+```python
+# EvoformerStack configuration
+evoformer_config = {
+    'no_blocks': 48,              # Number of Evoformer blocks
+    'c_m': 256,                   # MSA channel dimension  
+    'c_z': 128,                   # Pair channel dimension
+    'no_heads_msa': 8,            # MSA attention heads
+    'no_heads_pair': 4,           # Pair attention heads
+    'blocks_per_ckpt': 1,         # Checkpointing frequency
+}
+
+# StructureModule configuration
+structure_config = {
+    'no_blocks': 8,               # Structure refinement iterations
+    'c_ipa': 384,                 # IPA hidden dimension
+    'no_heads_ipa': 12,           # IPA attention heads
+    'no_qk_points': 4,            # 3D attention resolution
+    'no_v_points': 8,             # 3D value resolution
+    'no_angles': 7,               # Torsion angles per residue
+}
+```
+
+### Mode Selection
+
+The modules support different operational modes:
+
+- **Monomer Mode**: Standard single-chain protein prediction
+- **Multimer Mode**: Multi-chain protein complex prediction with specialized attention
+- **Sequence Embedding Mode**: Direct embedding input without MSA processing
+- **Inference Mode**: Optimized for prediction with memory constraints
+
+## Next Steps
+
+For a complete understanding of OpenFold's architecture, continue exploring:
+
+- [AlphaFold 2 Model Implementation](9-alphafold-2-model-implementation) - Overview of the complete model architecture
+- [Memory Optimization Techniques](11-memory-optimization-techniques) - Detailed strategies for handling large proteins
+- [Custom CUDA Kernels and FlashAttention](17-custom-cuda-kernels-and-flashattention) - Performance optimization details
+- [Multimer Protein Structure Prediction](18-multimer-protein-structure-prediction) - Specialized handling for protein complexes
+
+The Evoformer and Structure Module represent the computational heart of OpenFold, combining evolutionary information processing with geometric reasoning to achieve state-of-the-art protein structure prediction. Their modular design and optimization features enable both research exploration and production deployment across a wide range of protein prediction tasks.
+
+
+# Memory Optimization Techniques
+
+
+OpenFold implements several sophisticated memory optimization techniques to handle the massive computational requirements of protein structure prediction. These techniques enable training and inference on large protein sequences that would otherwise exceed GPU memory limits.
+
+## Chunked Computation
+The cornerstone of OpenFold's memory optimization strategy is chunked computation, implemented in [chunk_utils.py](openfold/utils/chunk_utils.py). This approach breaks down large tensor operations into manageable batches while preserving mathematical correctness.
+
+### Core Chunking Mechanism
+The `chunk_layer` function ([chunk_utils.py#L212-L221](openfold/utils/chunk_utils.py#L212-L221)) implements a flexible chunking system that:
+
+- Processes inputs in smaller batches (chunks) to reduce peak memory usage
+- Supports nested data structures (lists, tuples, dicts) with tensor leaves
+- Provides both standard and low-memory modes for different use cases
+- Handles output accumulation efficiently with pre-allocated memory
+
+```python
+def chunk_layer(
+    layer: Callable,
+    inputs: Dict[str, Any],
+    chunk_size: int,
+    no_batch_dims: int,
+    low_mem: bool = False,
+    _out: Any = None,
+    _add_into_out: bool = False,
+) -> Any:
+```
+
+### Intelligent Chunk Size Tuning
+OpenFold includes a `ChunkSizeTuner` class ([chunk_utils.py#L342-L343](openfold/utils/chunk_utils.py#L342-L343)) that automatically determines optimal chunk sizes:
+
+- Uses binary search to find the largest viable chunk size
+- Caches results to avoid repeated tuning
+- Handles argument shape changes intelligently
+- Defaults to a maximum chunk size of 512 based on empirical testing
+
+> [!TIP]
+> The tuner performs runtime testing by attempting different chunk sizes and catching CUDA out-of-memory errors, ensuring optimal memory utilization without manual intervention.
+
+## Activation Checkpointing
+OpenFold implements gradient checkpointing to trade compute for memory savings, particularly effective for deep neural networks like the Evoformer.
+
+### Block-based Checkpointing
+The `checkpoint_blocks` function ([checkpointing.py#L43-L47](openfold/utils/checkpointing.py#L43-L47)) provides sophisticated checkpointing:
+
+```python
+def checkpoint_blocks(
+    blocks: List[Callable],
+    args: BLOCK_ARGS,
+    blocks_per_ckpt: Optional[int],
+) -> BLOCK_ARGS:
+```
+
+- Automatically integrates with DeepSpeed when available
+- Processes blocks in groups, checkpointing between groups
+- Maintains gradient flow while reducing memory footprint
+- Configurable checkpoint frequency via `blocks_per_ckpt`
+
+### DeepSpeed Integration
+The checkpointing system intelligently detects and uses DeepSpeed's optimized checkpointing implementation ([checkpointing.py#L29-L39](openfold/utils/checkpointing.py#L29-L39)) when available, providing additional performance benefits.
+
+## Custom CUDA Kernels
+OpenFold includes specialized CUDA kernels for memory-efficient attention computation, addressing one of the most memory-intensive operations in protein structure prediction.
+
+### In-place Attention Core
+The `AttentionCoreFunction` ([kernel/attention_core.py#L26-L27](openfold/utils/kernel/attention_core.py#L26-L27)) implements in-place attention operations:
+
+- Performs softmax operations in-place to reduce memory allocations
+- Supports both float32 and bfloat16 precision
+- Optimizes memory usage for large attention matrices
+- Integrates seamlessly with PyTorch's autograd system
+
+### Memory-Efficient Data Types
+The attention kernel limits supported data types to memory-efficient formats ([kernel/attention_core.py#L23](openfold/utils/kernel/attention_core.py#L23)):
+
+```python
+SUPPORTED_DTYPES = [torch.float32, torch.bfloat16]
+```
+
+This ensures optimal memory usage while maintaining numerical stability.
+
+## Tensor Utilities
+OpenFold provides comprehensive tensor manipulation utilities that contribute to memory efficiency throughout the pipeline.
+
+### Tree-based Operations
+The `tensor_tree_map` function ([tensor_utils.py#L120](openfold/utils/tensor_utils.py#L120)) enables efficient operations on nested tensor structures:
+
+- Applies functions uniformly across complex data structures
+- Avoids unnecessary memory copies through smart mapping
+- Supports the pytree paradigm used throughout OpenFold
+
+### Memory-Efficient Gather Operations
+The `batched_gather` function ([tensor_utils.py#L80](openfold/utils/tensor_utils.py#L80)) implements optimized data gathering:
+
+- Handles batch dimensions efficiently
+- Minimizes memory overhead during index-based operations
+- Supports complex indexing patterns common in protein processing
+
+## Precision Management
+OpenFold includes utilities for managing numerical precision to balance memory usage and model accuracy.
+
+### Mixed Precision Detection
+The `is_fp16_enabled` function ([precision_utils.py#L18-L19](openfold/utils/precision_utils.py#L18-L19)) monitors mixed precision settings:
+
+```python
+def is_fp16_enabled():
+    # Autocast world
+    fp16_enabled = torch.get_autocast_gpu_dtype() == torch.float16
+    fp16_enabled = fp16_enabled and torch.is_autocast_enabled()
+    
+    return fp16_enabled
+```
+
+This enables adaptive memory usage based on the current precision context.
+
+## Memory Optimization Strategy
+OpenFold's memory optimization follows a hierarchical approach:
+
+1. **Algorithmic Level**: Chunking reduces memory complexity from O(N²) to O(N) for large operations
+2. **Framework Level**: Checkpointing trades compute for memory in deep networks
+3. **Kernel Level**: Custom CUDA implementations minimize memory allocations
+4. **Data Level**: Precision management and efficient tensor operations reduce overhead
+
+> [!TIP]
+> The combination of these techniques enables OpenFold to process protein sequences with thousands of residues on GPUs with limited memory, making large-scale protein structure prediction accessible to a wider range of hardware configurations.
+
+## Practical Implementation
+Memory optimization in OpenFold is automatically applied throughout the model architecture. Developers can control chunking behavior through configuration parameters and leverage the built-in tuning mechanisms for optimal performance on their specific hardware.
+
+For more details on specific model components, see [AlphaFold 2 Model Implementation](9-alphafold-2-model-implementation) and [DeepSpeed Integration and Performance](16-deepspeed-integration-and-performance).
+
+# Feature Extraction and Processing
+
+
+The feature extraction and processing pipeline in OpenFold transforms raw biological sequence data into structured neural network inputs through a sophisticated multi-stage architecture. This pipeline handles everything from sequence parsing to advanced multimer processing, enabling the AlphaFold 2 model to effectively learn from diverse protein data sources.
+
+## Core Architecture Overview
+
+The feature processing system is built around three primary components that work in concert to transform raw data into model-ready features:
+
+### Data Pipeline Architecture
+
+```mermaid
+graph TB
+    A[Raw Input Data] --> B[DataPipeline]
+    B --> C[FeaturePipeline]
+    C --> D[Model Input]
+    
+    B1[FASTA Files] --> B
+    B2[PDB Files] --> B
+    B3[mmCIF Files] --> B
+    B4[Alignment Data] --> B
+    
+    C1[Data Transforms] --> C
+    C2[Multimer Processing] --> C
+    C3[Feature Normalization] --> C
+    
+    D1[MSA Features] --> D
+    D2[Template Features] --> D
+    D3[Sequence Features] --> D
+    D4[Structural Features] --> D
+```
+
+The `DataPipeline` class ([data_pipeline.py#L706-L1374](openfold/data/data_pipeline.py#L706)) serves as the primary interface, coordinating alignment parsing, template searching, and feature assembly. It processes various input formats including FASTA, PDB, and mmCIF files, extracting and consolidating biological information into standardized feature dictionaries.
+
+### Feature Processing Pipeline
+
+The `FeaturePipeline` class ([feature_pipeline.py#L132-L154](openfold/data/feature_pipeline.py#L132)) acts as the central processing coordinator, applying configuration-specific transformations and preparing features for model consumption:
+
+```python
+class FeaturePipeline:
+    def __init__(self, config: ml_collections.ConfigDict):
+        self.config = config
+
+    def process_features(self, raw_features: FeatureDict, 
+                        mode: str = "train", 
+                        is_multimer: bool = False) -> FeatureDict:
+        return np_example_to_features(
+            np_example=raw_features,
+            config=self.config,
+            mode=mode,
+            is_multimer=is_multimer,
+        )
+```
+
+## Feature Extraction Components
+
+### Sequence and MSA Feature Generation
+
+The pipeline generates multiple types of sequence-related features essential for protein structure prediction:
+
+#### Core Sequence Features
+- **Amino acid encoding**: One-hot representation of residue types
+- **Sequence masks**: Binary indicators for valid positions
+- **Between-segment residues**: Domain break information
+- **Profile features**: Position-specific scoring matrices from alignments
+
+#### MSA Feature Processing
+Multiple Sequence Alignment features are processed through sophisticated transformations in `make_msa_feat` ([data_transforms.py#L544-L593](openfold/data/data_transforms.py#L544)):
+
+```python
+def make_msa_feat(protein):
+    """Create and concatenate MSA features."""
+    msa_1hot = make_one_hot(protein["msa"], 23)
+    has_deletion = torch.clip(protein["deletion_matrix"], 0.0, 1.0)
+    deletion_value = torch.atan(protein["deletion_matrix"] / 3.0) * (2.0 / np.pi)
+    
+    msa_feat = [
+        msa_1hot,  # 23-dimensional one-hot encoding
+        torch.unsqueeze(has_deletion, dim=-1),    # deletion presence
+        torch.unsqueeze(deletion_value, dim=-1),  # normalized deletion values
+    ]
+    
+    if "cluster_profile" in protein:
+        # Add cluster-based profile features
+        deletion_mean_value = torch.atan(protein["cluster_deletion_mean"] / 3.0) * (2.0 / np.pi)
+        msa_feat.extend([protein["cluster_profile"], 
+                        torch.unsqueeze(deletion_mean_value, dim=-1)])
+```
+
+### Template Feature Integration
+
+Template features incorporate structural information from homologous proteins, processed through specialized featurizers that convert PDB/mmCIF data into numerical representations:
+
+| Template Feature Type | Dimensions | Description |
+|------------------------|------------|-------------|
+| Template coordinates | (num_templates, num_res, 37, 3) | Atomic positions from template structures |
+| Template masks | (num_templates, num_res) | Validity indicators for template positions |
+| Template unit vectors | (num_templates, num_res, num_res, 3) | Directional relationships between residues |
+| Template pairwise distances | (num_templates, num_res, num_res) | Distance matrices for structural comparison |
+
+### Structural Feature Derivation
+
+The pipeline computes structural features from atomic coordinates, including pseudo-beta positions, torsion angles, and reference frames:
+
+```python
+def atom37_to_torsion_angles(protein, prefix=""):
+    """Converts atom37 positions to torsion angles."""
+    # Extract backbone frames and compute chi angles
+    # Returns: angles, alt_angles, frames, mask
+```
+
+> [!TIP]
+> Pseudo-beta features are critical for representing protein backbone geometry, using alpha-carbon positions for most residues and beta-carbon positions where available.
+
+## Data Transformation and Normalization
+
+### Feature Standardization
+
+The `make_fixed_size` function ([data_transforms.py#L505-L540](openfold/data/data_transforms.py#L505)) ensures consistent tensor dimensions across different protein lengths and MSA depths:
+
+```python
+def make_fixed_size(protein, shape_schema, msa_cluster_size, 
+                   extra_msa_size, num_res=0, num_templates=0):
+    pad_size_map = {
+        NUM_RES: num_res,
+        NUM_MSA_SEQ: msa_cluster_size,
+        NUM_EXTRA_SEQ: extra_msa_size,
+        NUM_TEMPLATES: num_templates,
+    }
+    
+    for k, v in protein.items():
+        # Apply padding to match schema dimensions
+        padding = [(0, p - v.shape[i]) for i, p in enumerate(pad_size)]
+        protein[k] = torch.nn.functional.pad(v, padding)
+```
+
+### MSA Sampling and Processing
+
+The pipeline implements sophisticated MSA processing strategies:
+
+| Processing Method | Purpose | Configuration Parameter |
+|-------------------|---------|-------------------------|
+| Random sampling | Reduce MSA depth for training efficiency | `max_seq` |
+| Cluster-based sampling | Preserve evolutionary information | `keep_extra` |
+| Block deletion | Simulate incomplete alignment data | `block_delete_msa` |
+| Masked MSA | Enable BERT-style pretraining | `replace_fraction` |
+
+## Multimer Feature Processing
+
+### Chain Pairing and Merging
+
+For multimer prediction, the `pair_and_merge` function ([feature_processing_multimer.py#L50-L85](openfold/data/feature_processing_multimer.py#L50)) orchestrates complex inter-chain processing:
+
+```python
+def pair_and_merge(all_chain_features: MutableMapping[str, Mapping[str, np.ndarray]]):
+    process_unmerged_features(all_chain_features)
+    np_chains_list = list(all_chain_features.values())
+    
+    pair_msa_sequences = not _is_homomer_or_monomer(np_chains_list)
+    
+    if pair_msa_sequences:
+        np_chains_list = msa_pairing.create_paired_features(chains=np_chains_list)
+        np_chains_list = msa_pairing.deduplicate_unpaired_sequences(np_chains_list)
+    
+    np_chains_list = crop_chains(np_chains_list, msa_crop_size=MSA_CROP_SIZE,
+                                pair_msa_sequences=pair_msa_sequences,
+                                max_templates=MAX_TEMPLATES)
+    
+    return msa_pairing.merge_chain_features(np_chains_list=np_chains_list,
+                                          pair_msa_sequences=pair_msa_sequences,
+                                          max_templates=MAX_TEMPLATES)
+```
+
+### Multimer-Specific Features
+
+Multimer processing generates additional features for inter-chain interactions:
+
+- **Assembly features**: Chain connectivity and interface information
+- **Pairing features**: Cross-chain MSA sequence relationships
+- **Interface masks**: Residue-level interaction indicators
+- **Chain mapping**: Correspondence between monomer and multimer indices
+
+## Feature Configuration and Mode Handling
+
+### Training vs Inference Modes
+
+The pipeline adapts feature processing based on the operational mode:
+
+| Mode | Key Differences | Features Added |
+|------|-----------------|----------------|
+| Training | Data augmentation, random cropping | `use_clamped_fape`, random masks |
+| Inference | Full MSA, no augmentation | Standard features, no randomization |
+| Evaluation | Balanced processing | Intermediate feature set |
+
+### Configuration-Driven Processing
+
+Feature processing is controlled through detailed configuration specifications that define:
+
+- **Shape schemas**: Expected tensor dimensions for each feature
+- **Processing flags**: Enable/disable specific transformations
+- **Mode-specific settings**: Training vs inference parameters
+- **Multimer configurations**: Chain processing parameters
+
+> [!TIP]
+> The configuration system enables flexible feature processing pipelines that can adapt to different model architectures, data availability scenarios, and computational constraints.
+
+## Feature Quality and Validation
+
+### Input Validation
+
+The pipeline includes comprehensive validation checks:
+
+- **Sequence validity**: Ensures proper amino acid encoding
+- **Template consistency**: Validates template structure compatibility
+- **MSA integrity**: Checks alignment quality and completeness
+- **Dimension matching**: Verifies tensor shape consistency
+
+### Feature Monitoring
+
+Built-in monitoring capabilities track:
+
+- **Feature coverage**: Percentage of valid positions
+- **MSA depth statistics**: Alignment quality metrics
+- **Template usage**: Structural information utilization
+- **Processing time**: Computational efficiency metrics
+
+This sophisticated feature extraction and processing architecture enables OpenFold to effectively transform diverse biological data sources into the structured inputs required for accurate protein structure prediction, supporting both monomer and multimer prediction scenarios with configurable processing pipelines.
+
+For more details on specific aspects of the data processing pipeline, see [Multiple Sequence Alignment (MSA) Handling](13-multiple-sequence-alignment-msa-handling) and [Template Search and Integration](14-template-search-and-integration).
+
+# Multiple Sequence Alignment (MSA) Handling
+
+
+Multiple Sequence Alignment (MSA) processing forms the computational backbone of OpenFold's structure prediction pipeline, serving as the primary source of evolutionary information that enables accurate protein structure inference. This documentation explores the architectural patterns, implementation details, and optimization strategies that make MSA handling both efficient and scalable.
+
+## MSA Architecture Overview
+The MSA processing pipeline implements a sophisticated multi-stage architecture that transforms raw sequence alignments into rich feature representations suitable for deep learning models. The system supports both monomer and multimer protein prediction, with specialized handling for large-scale alignments and memory-constrained environments.
+
+```mermaid
+graph TB
+    A[Raw FASTA/MSA Files] --> B[AlignmentRunner]
+    B --> C[DataPipeline]
+    C --> D[MSA Feature Processing]
+    D --> E[FeaturePipeline]
+    E --> F[Model MSA Attention]
+    
+    G[Template Search] --> C
+    H[Species Identification] --> D
+    I[Pairing Logic] --> D
+    
+    F --> J[Evoformer]
+    J --> K[Structure Module]
+```
+
+Sources: [data_pipeline.py](openfold/data/data_pipeline.py#L334-L482), [feature_pipeline.py](openfold/data/feature_pipeline.py#L132-L148)
+
+## MSA Data Processing Pipeline
+The core MSA processing begins with the `AlignmentRunner` class, which orchestrates multiple alignment tools and databases to generate comprehensive sequence alignments. This component supports various search strategies and database configurations to maximize coverage while maintaining computational efficiency.
+
+### AlignmentRunner Architecture
+The `AlignmentRunner` ([data_pipeline.py#L334](openfold/data/data_pipeline.py#L334)) serves as the primary interface for MSA generation, supporting multiple search algorithms:
+
+| Search Tool | Database Support | Primary Use Case | Performance Characteristics |
+|-------------|------------------|------------------|----------------------------|
+| Jackhmmer | UniRef90, Mgnify, Small BFD, UniProt | General purpose alignment | High accuracy, moderate speed |
+| HHblits | BFD + UniRef30/UniClust30 | Deep homology detection | Very fast, large database support |
+
+```python
+class AlignmentRunner:
+    def __init__(
+        self,
+        jackhmmer_binary_path: Optional[str] = None,
+        hhblits_binary_path: Optional[str] = None,
+        uniref90_database_path: Optional[str] = None,
+        mgnify_database_path: Optional[str] = None,
+        bfd_database_path: Optional[str] = None,
+        # ... additional parameters
+    ):
+```
+
+Sources: [data_pipeline.py#L334-L482](openfold/data/data_pipeline.py#L334-L482)
+
+### MSA Feature Construction
+The `make_msa_features` function ([data_pipeline.py#L224](openfold/data/data_pipeline.py#L224)) transforms raw alignment data into structured feature arrays:
+
+```python
+def make_msa_features(msas: Sequence[parsers.Msa]) -> FeatureDict:
+    """Constructs a feature dict of MSA features."""
+    int_msa = []
+    deletion_matrix = []
+    species_ids = []
+    seen_sequences = set()
+    
+    for msa_index, msa in enumerate(msas):
+        for sequence_index, sequence in enumerate(msa.sequences):
+            if sequence in seen_sequences:
+                continue
+            seen_sequences.add(sequence)
+            int_msa.append(
+                [residue_constants.HHBLITS_AA_TO_ID[res] for res in sequence]
+            )
+```
+
+Key features generated include:
+- **msa**: Integer-encoded amino acid sequences
+- **deletion_matrix**: Gap/deletion information for each alignment position
+- **msa_species_identifiers**: Taxonomic information for evolutionary analysis
+- **num_alignments**: Total alignment count per residue position
+
+> [!TIP]
+> The deduplication logic in `make_msa_features` prevents redundant sequences from inflating the MSA, significantly reducing memory usage while preserving evolutionary diversity.
+
+Sources: [data_pipeline.py#L224-L264](openfold/data/data_pipeline.py#L224-L264)
+
+## MSA Feature Processing and Species Identification
+Species identification provides critical evolutionary context for MSA processing, enabling sophisticated pairing and analysis strategies.
+
+### Species Identifier Extraction
+The `msa_identifiers` module ([msa_identifiers.py#L15](openfold/data/msa_identifiers.py#L15)) implements robust parsing of sequence metadata:
+
+```python
+_UNIPROT_PATTERN = re.compile(
+    r"""
+    ^
+    # Database type (sp for Swiss-Prot, tr for TrEMBL)
+    (?P<db_type>sp|tr)
+    \|
+    # Unique identifier (e.g., A0A146SKV9)
+    (?P<unique_id>[A-Z0-9]{6,10})
+    \|
+    # Entry name (e.g., A0A146SKV9_FUNHE)
+    (?P<entry_name>[A-Z0-9_]+)
+    $
+    """,
+    re.VERBOSE,
+)
+```
+
+This pattern recognition enables extraction of taxonomic information from UniProt-style identifiers, supporting evolutionary analysis across diverse sequence databases.
+
+Sources: [msa_identifiers.py#L22-L28](openfold/data/msa_identifiers.py#L22-L28)
+
+### Feature Pipeline Integration
+The `FeaturePipeline` class ([feature_pipeline.py#L132](openfold/data/feature_pipeline.py#L132)) serves as the final processing stage before model input:
+
+```python
+class FeaturePipeline:
+    def process_features(
+        self,
+        raw_features: FeatureDict,
+        mode: str = "train",
+        is_multimer: bool = False,
+    ) -> FeatureDict:
+        return np_example_to_features(
+            raw_features, self.config, mode, is_multimer
+        )
+```
+
+This pipeline handles data type conversions, configuration-driven feature selection, and mode-specific processing for training vs. inference.
+
+Sources: [feature_pipeline.py#L132-L148](openfold/data/feature_pipeline.py#L132-L148)
+
+## MSA Attention Mechanisms
+OpenFold implements sophisticated attention mechanisms specifically designed for MSA data, enabling the model to capture complex evolutionary patterns across multiple sequence dimensions.
+
+### MSA Attention Architecture
+The `MSAAttention` class ([msa.py#L36](openfold/model/msa.py#L36)) provides the foundation for MSA-specific attention operations:
+
+```python
+class MSAAttention(nn.Module):
+    def __init__(
+        self,
+        c_in,
+        c_hidden,
+        no_heads,
+        pair_bias=False,
+        c_z=None,
+        inf=1e9,
+    ):
+        self.layer_norm_m = LayerNorm(self.c_in)
+        self.mha = Attention(
+            self.c_in, self.c_in, self.c_in, 
+            self.c_hidden, self.no_heads,
+        )
+```
+
+Key architectural components:
+- **Multi-head attention** with configurable hidden dimensions
+- **Pair bias support** for integrating structural information
+- **Layer normalization** for stable training dynamics
+
+> [!TIP]
+> The MSA attention implementation supports multiple optimization strategies including DeepSpeed integration, FlashAttention, and memory-efficient kernels to handle large alignments.
+
+Sources: [msa.py#L36-L100](openfold/model/msa.py#L36-L100)
+
+### Specialized Attention Variants
+OpenFold implements several specialized attention patterns for MSA data:
+
+| Attention Type | Algorithm Reference | Primary Function | Key Features |
+|----------------|---------------------|------------------|--------------|
+| MSARowAttentionWithPairBias | Algorithm 7 | Row-wise attention with structural bias | Integrates pair embeddings, evolutionary context |
+| MSAColumnAttention | Algorithm 8 | Column-wise attention | Captures positional patterns across sequences |
+| MSAColumnGlobalAttention | - | Global column attention | Long-range dependency modeling |
+
+```python
+class MSARowAttentionWithPairBias(MSAAttention):
+    """Implements Algorithm 7."""
+    
+class MSAColumnAttention(nn.Module):
+    """Implements Algorithm 8."""
+```
+
+Sources: [msa.py#L295-L402](openfold/model/msa.py#L295-L402)
+
+## Multimer MSA Pairing
+For protein complex prediction, OpenFold implements sophisticated MSA pairing logic that ensures consistent evolutionary information across multiple chains.
+
+### Pairing Algorithm
+The `pair_sequences` function ([msa_pairing.py#L181](openfold/data/msa_pairing.py#L181)) implements the core pairing logic:
+
+```python
+def pair_sequences(
+    examples: List[Mapping[str, np.ndarray]],
+) -> Dict[int, np.ndarray]:
+  """Returns indices for paired MSA sequences across chains."""
+  
+  all_chain_species_dict = []
+  common_species = set()
+  for chain_features in examples:
+    msa_df = _make_msa_df(chain_features)
+    species_dict = _create_species_dict(msa_df)
+    all_chain_species_dict.append(species_dict)
+    common_species.update(set(species_dict))
+```
+
+The pairing algorithm:
+1. **Species identification** across all chains
+2. **Common species detection** for pairing candidates
+3. **Sequence similarity matching** within species groups
+4. **Paired index generation** for model consumption
+
+Sources: [msa_pairing.py#L181-L235](openfold/data/msa_pairing.py#L181-L235)
+
+### Feature Merging Strategies
+The `merge_chain_features` function ([msa_pairing.py#L432](openfold/data/msa_pairing.py#L432)) orchestrates the combination of paired and unpaired features:
+
+```python
+def merge_chain_features(np_chains_list: List[Mapping[str, np.ndarray]],
+                         pair_msa_sequences: bool,
+                         max_templates: int) -> Mapping[str, np.ndarray]:
+    if pair_msa_sequences:
+        paired_rows_dict = pair_sequences(np_chains_list)
+        reordered_paired_rows = reorder_paired_rows(paired_rows_dict)
+        # ... merging logic
+```
+
+Key merging strategies:
+- **Paired sequences**: Evolutionarily related sequences across chains
+- **Block diagonal arrangement**: Unpaired sequences maintain chain independence
+- **Template integration**: Structural information preservation during merging
+
+Sources: [msa_pairing.py#L432-L461](openfold/data/msa_pairing.py#L432-L461)
+
+## Performance Optimization and Memory Management
+OpenFold implements several optimization strategies to handle large MSA datasets efficiently, particularly important for long sequences and complex multimer predictions.
+
+### Memory-Efficient Processing
+The MSA attention modules support multiple optimization strategies:
+
+| Optimization | Memory Benefit | Performance Impact | Use Case |
+|--------------|----------------|-------------------|----------|
+| Chunking | Significantly reduced memory usage | Moderate overhead | Large MSAs (>1000 sequences) |
+| FlashAttention | Up to 3x memory reduction | Faster execution | GPU-based inference |
+| DeepSpeed Integration | Distributed memory management | Minimal overhead | Multi-GPU training |
+
+```python
+@torch.jit.ignore
+def _chunked_msa_attn(self,
+    m: torch.Tensor,
+    z: Optional[torch.Tensor],
+    mask: Optional[torch.Tensor],
+    chunk_logits: int,
+    checkpoint: bool,
+    inplace_safe: bool = False
+) -> torch.Tensor:
+    """MSA attention with training-time chunking."""
+```
+
+Sources: [msa.py#L171-L185](openfold/model/msa.py#L171-L185)
+
+### Configuration-Driven Processing
+The MSA pipeline supports flexible configuration through data-specific parameters:
+
+```python
+def make_data_config(
+    config: ml_collections.ConfigDict,
+    mode: str,
+    num_res: int,
+) -> Tuple[ml_collections.ConfigDict, List[str]]:
+    """Creates data configuration with MSA-specific parameters."""
+```
+
+Key configuration options:
+- **max_msa_clusters**: Controls MSA diversity sampling
+- **num_extra_msa**: Additional sequences for model robustness
+- **subsample_msa**: Downsampling strategies for large alignments
+
+Sources: [feature_pipeline.py#L53-L78](openfold/data/feature_pipeline.py#L53-L78)
+
+## Next Steps
+For a complete understanding of OpenFold's data processing pipeline, continue exploring:
+
+- **[Feature Extraction and Processing](12-feature-extraction-and-processing)**: Detailed examination of feature generation and transformation
+- **[Template Search and Integration](14-template-search-and-integration)**: Structural template handling and integration with MSA data
+- **[Multimer Protein Structure Prediction](18-multimer-protein-structure-prediction)**: Advanced multimer-specific MSA strategies
+- **[AlphaFold 2 Model Implementation](9-alphafold-2-model-implementation)**: How MSA features integrate into the complete model architecture
+
+# Template Search and Integration
+
+
+Template search and integration forms a critical component of OpenFold's protein structure prediction pipeline, enabling the model to leverage known structural information from homologous proteins to improve prediction accuracy. This system implements a sophisticated multi-stage process for identifying relevant template structures, extracting their features, and integrating them into the model's neural network architecture.
+
+## Template Search Architecture
+
+The template search system in OpenFold follows a hierarchical architecture with multiple featurizer classes designed to handle different template sources and search methods:
+
+```mermaid
+graph TD
+    A[TemplateHitFeaturizer] --> B[HhsearchHitFeaturizer]
+    A --> C[CustomHitFeaturizer]
+    A --> D[HmmsearchHitFeaturizer]
+    B --> E[HHSearch Results]
+    C --> F[Custom Templates]
+    D --> G[HMMER Results]
+    E --> H[Template Features]
+    F --> H
+    G --> H
+    H --> I[Model Integration]
+```
+
+### Abstract Base Class: TemplateHitFeaturizer
+
+The `TemplateHitFeaturizer` serves as the abstract base class for all template processing implementations ([openfold/data/templates.py#L1023-L1102](openfold/data/templates.py#L1023-L1102)). This class provides the foundational infrastructure for template search and processing:
+
+- **Configuration Parameters**: Manages essential settings including mmCIF directory paths, maximum template dates, hit limits, and alignment tool paths
+- **Date Filtering**: Implements temporal filtering to ensure templates don't exceed specified release date cutoffs
+- **Obsolete PDB Handling**: Automatically maps obsolete PDB IDs to their current replacements
+- **Error Handling**: Provides configurable strict error checking for template validation
+
+The core initialization process validates the mmCIF directory structure and prepares release date and obsolete PDB mappings for efficient template filtering.
+
+### Specialized Featurizer Implementations
+
+#### HhsearchHitFeaturizer
+The `HhsearchHitFeaturizer` specializes in processing HHSearch results, which is the primary template search method in OpenFold ([openfold/data/templates.py#L1105-L1207](openfold/data/templates.py#L1105-L1207)). This implementation:
+
+- Processes HHSearch hit results containing sequence alignments and confidence scores
+- Filters templates based on alignment quality, date constraints, and sequence similarity
+- Extracts structural features from mmCIF files for valid template hits
+- Handles template deduplication and quality assessment
+
+#### CustomHitFeaturizer
+The `CustomHitFeaturizer` supports user-provided template structures ([openfold/data/templates.py#L1208-L1224](openfold/data/templates.py#L1208-L1224)). This implementation:
+
+- Processes custom template files provided by users
+- Assumes the template chain is chain A with matching sequence length
+- Enables integration of experimental or custom structural data
+
+#### HmmsearchHitFeaturizer
+The `HmmsearchHitFeaturizer` handles HMMER-based template search results ([openfold/data/templates.py#L1225-L1232](openfold/data/templates.py#L1225-L1232)), providing an alternative to HHSearch for template identification.
+
+## Template Processing Pipeline
+
+### Template Hit Parsing and Validation
+
+Template hits undergo rigorous validation through multiple filtering stages ([openfold/data/templates.py#L220-L291](openfold/data/templates.py#L220-L291)):
+
+```python
+def _assess_hhsearch_hit(
+    hit: parsers.TemplateHit,
+    hit_pdb_code: str,
+    query_sequence: str,
+    release_dates: Mapping[str, datetime.datetime],
+    release_date_cutoff: datetime.datetime,
+    max_subsequence_ratio: float = 0.95,
+    min_align_ratio: float = 0.1,
+) -> bool:
+```
+
+The filtering process includes:
+
+- **Date Validation**: Ensures template structures were released before the specified cutoff date
+- **Alignment Quality**: Validates that templates have sufficient alignment coverage with the query sequence
+- **Sequence Identity**: Prevents templates that are exact subsequences of the query
+- **Length Requirements**: Enforces minimum template length requirements
+
+### Feature Extraction and Processing
+
+Valid template hits undergo comprehensive feature extraction to generate the neural network inputs ([openfold/data/templates.py#L548-L707](openfold/data/templates.py#L548-L707)):
+
+```python
+def _extract_template_features(
+    mmcif_object: mmcif_parsing.MmcifObject,
+    pdb_id: str,
+    mapping: Mapping[int, int],
+    template_sequence: str,
+    query_sequence: str,
+    template_chain_id: str,
+    kalign_binary_path: str,
+    _zero_center_positions: bool = True,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+```
+
+The extracted features include:
+
+- **Template Aatype**: Amino acid type information for template residues
+- **Template All Atom Positions**: 3D coordinates of all atoms in template structures
+- **Template All Atom Mask**: Binary mask indicating valid atom positions
+- **Template Domain Names**: Identifiers for template domains
+- **Template Sequence**: Template sequence information
+- **Template Sum Probabilities**: Confidence scores for template alignments
+
+> [!TIP]
+> Template feature extraction includes critical validation steps such as CA atom distance checks to ensure structural integrity, preventing the use of templates with unrealistic geometry that could degrade model performance.
+
+## Model Integration Architecture
+
+### Template Embedding Neural Network
+
+The integrated template features are processed through specialized neural network modules designed for template information integration:
+
+#### Template Pointwise Attention
+The `TemplatePointwiseAttention` module implements Algorithm 17 from the AlphaFold paper ([openfold/model/template.py#L55-L148](openfold/model/template.py#L55-L148)):
+
+```mermaid
+graph LR
+    A[Template Embeddings] --> B[Multi-Head Attention]
+    C[Pair Embeddings] --> B
+    B --> D[Updated Pair Embeddings]
+```
+
+This module enables information flow between template structures and the evolving pair representations, allowing the model to leverage template information for structural prediction.
+
+#### Template Pair Stack
+The `TemplatePairStack` implements Algorithm 16, providing a deep processing architecture for template embeddings ([openfold/model/template.py#L345-L471](openfold/model/template.py#L345-L471)):
+
+- **Multiple Processing Blocks**: Contains configurable numbers of `TemplatePairStackBlock` units
+- **Triangular Attention**: Implements row and column-wise attention for capturing long-range structural dependencies
+- **Triangular Multiplication**: Applies multiplicative updates for local structural features
+- **Memory Optimization**: Supports chunking and activation checkpointing for large template sets
+
+### Memory Optimization Strategies
+
+The template processing system includes sophisticated memory optimization techniques ([openfold/model/template.py#L472-L592](openfold/model/template.py#L472-L592)):
+
+- **Template Offloading**: `embed_templates_offload` function processes templates in chunks to reduce memory usage
+- **Template Averaging**: `embed_templates_average` function combines template features when memory constraints are severe
+- **Chunked Processing**: Supports configurable chunk sizes for different processing stages
+- **Activation Checkpointing**: Reduces memory usage during training by recomputing intermediate activations
+
+## Template Feature Types
+
+The template system generates a comprehensive set of features defined in `TEMPLATE_FEATURES` ([openfold/data/templates.py#L83-L110](openfold/data/templates.py#L83-L110)):
+
+| Feature Name | Data Type | Dimensions | Description |
+|-------------|-----------|------------|-------------|
+| `template_aatype` | np.int64 | `[N_templates, N_res, 22]` | Amino acid types with gaps |
+| `template_all_atom_mask` | np.float32 | `[N_templates, N_res, 37]` | Valid atom position indicators |
+| `template_all_atom_positions` | np.float32 | `[N_templates, N_res, 37, 3]` | 3D atom coordinates |
+| `template_domain_names` | object | `[N_templates]` | Template domain identifiers |
+| `template_sequence` | object | `[N_templates]` | Template sequences |
+| `template_sum_probs` | np.float32 | `[N_templates, 1]` | Template confidence scores |
+
+## Template Integration in Data Pipeline
+
+The template system integrates seamlessly with OpenFold's data processing pipeline through the `DataPipeline` class ([openfold/data/data_pipeline.py#L706-L1153](openfold/data/data_pipeline.py#L706-L1153)):
+
+```python
+def make_template_features(
+    input_sequence: str,
+    hits: Sequence[Any],
+    template_featurizer: Any,
+) -> FeatureDict:
+```
+
+This integration provides:
+
+- **Unified Feature Processing**: Combines template features with MSA and sequence features
+- **Multimer Support**: Handles template processing for multi-chain protein complexes
+- **Flexible Input Sources**: Supports various input formats including FASTA, PDB, and mmCIF
+- **Error Resilience**: Graceful handling of missing or invalid template data
+
+## Performance Considerations
+
+### Prefiltering Optimization
+
+The template system implements efficient prefiltering to reduce computational overhead ([openfold/data/templates.py#L780-L836](openfold/data/templates.py#L780-L836)):
+
+- **Early Rejection**: Invalid templates are filtered before expensive mmCIF parsing
+- **Cached Metadata**: Release dates and obsolete PDB mappings are cached for rapid access
+- **Parallel Processing**: Template processing can be parallelized across multiple hits
+
+### Memory Management
+
+The system includes sophisticated memory management strategies:
+
+- **Chunked Processing**: Large template sets are processed in configurable chunks
+- **Gradient Checkpointing**: Reduces memory usage during training
+- **Feature Compression**: Template features are stored efficiently with appropriate data types
+
+> [!TIP]
+> The template processing system supports dynamic chunk size tuning through the `ChunkSizeTuner`, automatically optimizing memory usage based on available hardware resources and input characteristics.
+
+## Next Steps
+
+For comprehensive understanding of the OpenFold architecture, consider exploring:
+
+- **[Feature Extraction and Processing](12-feature-extraction-and-processing)**: Learn about the broader data processing pipeline that integrates template features
+- **[AlphaFold 2 Model Implementation](9-alphafold-2-model-implementation)**: Understand how template features are utilized within the complete neural network architecture
+- **[Multiple Sequence Alignment (MSA) Handling](13-multiple-sequence-alignment-msa-handling)**: Explore how template search complements MSA-based evolutionary information
+
+The template search and integration system represents a sophisticated component of OpenFold that significantly enhances prediction accuracy by leveraging known structural information while maintaining computational efficiency through careful optimization and memory management strategies.
+
+# Training Pipeline and Configuration
+
+
+The OpenFold training pipeline provides a comprehensive framework for training AlphaFold 2 models with flexible configuration options, distributed training support, and advanced optimization techniques. This documentation covers the core architecture, configuration system, and advanced training capabilities.
+
+## Core Training Architecture
+
+OpenFold utilizes PyTorch Lightning as its training framework, providing a structured approach to model training with built-in support for distributed training, checkpointing, and experiment tracking. The training pipeline is centered around the `OpenFoldWrapper` class ([train_openfold.py#L29](train_openfold.py#L29)), which encapsulates the AlphaFold model, loss computation, and training logic.
+
+```mermaid
+graph TD
+    A[Training Pipeline] --> B[OpenFoldWrapper]
+    B --> C[AlphaFold Model]
+    B --> D[AlphaFold Loss]
+    B --> E[EMA Management]
+    B --> F[Validation Metrics]
+    
+    C --> G[Evoformer]
+    C --> H[Structure Module]
+    C --> I[Feature Processing]
+    
+    D --> J[FAPE Loss]
+    D --> K[Violation Loss]
+    D --> L[Experimentally Resolved Loss]
+    
+    F --> M[LDDT-CA]
+    F --> N[DRMSD]
+    F --> O[GDT-TS/HA]
+```
+
+### Key Components
+
+**OpenFoldWrapper**: The main Lightning module that orchestrates training ([train_openfold.py#L29](train_openfold.py#L29)):
+- Manages model initialization with configuration
+- Handles training and validation steps
+- Implements Exponential Moving Average (EMA) for model weights
+- Computes and logs comprehensive validation metrics
+- Integrates with PyTorch Lightning's distributed training framework
+
+**Training Step Flow** ([train_openfold.py#L79](train_openfold.py#L79)):
+1. Forward pass through AlphaFold model
+2. Remove recycling dimension from batch
+3. Apply multi-chain permutation alignment for multimer models
+4. Compute loss and loss breakdown
+5. Log metrics and validation scores
+
+**Validation Strategy** ([train_openfold.py#L115](train_openfold.py#L115)):
+- Uses EMA weights for validation while preserving training weights
+- Computes structural metrics (LDDT-CA, DRMSD, GDT-TS, GDT-HA)
+- Optional superimposition-based metrics for structural accuracy
+- Automatic weight restoration after validation
+
+## Configuration System
+
+OpenFold provides a flexible configuration system with multiple presets and customization options. The configuration is managed through the `model_config` function ([config.py#L42](config.py#L42)).
+
+### Training Presets
+
+| Preset | Crop Size | Max Extra MSA | Max MSA Clusters | Template Enabled | Loss Weights | Use Case |
+|--------|-----------|---------------|------------------|------------------|---------------|----------|
+| `initial_training` | Default | Default | Default | Yes | Default | Initial model training |
+| `finetuning` | 384 | 5120 | 512 | Yes | Violation: 1.0, Exp. Resolved: 0.01 | Fine-tuning pretrained models |
+| `finetuning_ptm` | 384 | 5120 | 512 | Yes | + TM: 0.1 | Fine-tuning with pTM head |
+| `finetuning_no_templ` | 384 | 5120 | 512 | No | Violation: 1.0, Exp. Resolved: 0.01 | Template-free fine-tuning |
+| `finetuning_no_templ_ptm` | 384 | 5120 | 512 | No | + TM: 0.1 | Template-free with pTM |
+
+### Configuration Loading Process
+
+The configuration system supports multiple sources ([train_openfold.py#L387](train_openfold.py#L387)):
+1. **Base Preset**: Load from predefined configurations
+2. **JSON Override**: Custom configuration via `--experiment_config_json`
+3. **Runtime Parameters**: Command-line arguments override specific settings
+
+```python
+config = model_config(
+    args.config_preset, 
+    train=True, 
+    low_prec=is_low_precision,
+) 
+if args.experiment_config_json: 
+    with open(args.experiment_config_json, 'r') as f:
+        custom_config_dict = json.load(f)
+    config.update_from_flattened_dict(custom_config_dict)
+```
+
+### Mutually Exclusive Configuration Options
+
+The configuration system enforces constraints to prevent incompatible settings ([config.py#L25](config.py#L25)):
+- Template averaging vs. template offloading
+- Memory optimization techniques (LMA, FlashAttention, DeepSpeed EvoFormer)
+
+> [!TIP]
+> Configuration validation ensures that mutually exclusive optimization techniques cannot be enabled simultaneously, preventing runtime conflicts and ensuring stable training performance.
+
+## Data Pipeline Integration
+
+The training pipeline integrates with sophisticated data processing modules that handle protein structure data, multiple sequence alignments, and template information.
+
+### Data Module Architecture
+
+```mermaid
+graph LR
+    A[OpenFoldDataModule] --> B[OpenFoldSingleDataset]
+    A --> C[Data Pipeline]
+    A --> D[Feature Pipeline]
+    A --> E[Template Processing]
+    
+    B --> F[mmCIF/FASTA Files]
+    B --> G[Alignment Directories]
+    B --> H[Template mmCIF Files]
+    
+    C --> I[Feature Extraction]
+    C --> J[Data Transformation]
+    C --> K[Batch Assembly]
+```
+
+**Data Module Selection** ([train_openfold.py#L425](train_openfold.py#L425)):
+- `OpenFoldDataModule`: Standard monomer training
+- `OpenFoldMultimerDataModule`: Multi-chain protein complexes
+
+**Dataset Configuration** ([data_modules.py#L13](data/data_modules.py#L13)):
+- Multiple data sources (training, validation, distillation)
+- Flexible alignment and template directories
+- Configurable filtering and caching options
+- Support for both mmCIF and FASTA formats
+
+## Optimization and Learning Rate Scheduling
+
+### Learning Rate Schedule
+
+OpenFold implements the AlphaFold 2 learning rate schedule with linear warmup, plateau, and exponential decay phases ([lr_schedulers.py#L7](utils/lr_schedulers.py#L7)):
+
+| Phase | Duration | Learning Rate Behavior |
+|-------|----------|----------------------|
+| Warmup | First 1000 steps | Linear increase from 0 to max_lr |
+| Plateau | Steps 1000-50000 | Constant at max_lr (0.001) |
+| Decay | After step 50000 | Exponential decay every 50000 steps (factor: 0.95) |
+
+```python
+class AlphaFoldLRScheduler:
+    def get_lr(self):
+        if(step_no <= self.warmup_no_steps):
+            lr = self.base_lr + (step_no / self.warmup_no_steps) * self.max_lr
+        elif(step_no > self.start_decay_after_n_steps):
+            steps_since_decay = step_no - self.start_decay_after_n_steps
+            exp = (steps_since_decay // self.decay_every_n_steps) + 1
+            lr = self.max_lr * (self.decay_factor ** exp)
+        else: # plateau
+            lr = self.max_lr
+```
+
+### Exponential Moving Average (EMA)
+
+The training pipeline includes EMA for model weights ([train_openfold.py#L42](train_openfold.py#L42)):
+- Maintains smoothed version of model parameters
+- Used during validation for better generalization
+- Configurable decay rate (typically 0.999)
+- Automatic state management during checkpointing
+
+## Distributed Training and Performance Optimization
+
+OpenFold supports multiple distributed training strategies with advanced memory optimization techniques.
+
+### Training Strategies
+
+| Strategy | Configuration | Use Case | Features |
+|----------|---------------|----------|----------|
+| Single GPU | `--gpus 1` | Development/testing | Basic single-GPU training |
+| Multi-GPU DDP | `--gpus >1` | Multi-GPU training | Distributed data parallelism |
+| DeepSpeed | `--deepspeed_config_path` | Large-scale training | Memory optimization, offloading |
+
+### DeepSpeed Integration
+
+The default DeepSpeed configuration ([deepspeed_config.json](deepspeed_config.json)) provides:
+```json
+{
+  "bfloat16": {"enabled": true},
+  "zero_optimization": {
+    "stage": 2,
+    "offload_optimizer": {"device": "cpu"},
+    "contiguous_gradients": true
+  },
+  "activation_checkpointing": {
+    "partition_activations": true,
+    "cpu_checkpointing": false
+  },
+  "gradient_clipping": 0.1
+}
+```
+
+**Key Features**:
+- **Zero Stage 2**: Optimizer state partitioning and offloading
+- **Activation Checkpointing**: Trade computation for memory
+- **Mixed Precision**: BF16 support for modern hardware
+- **Gradient Clipping**: Stable training with large batches
+
+### MPI Support
+
+For HPC environments, OpenFold supports MPI-based parallel processing ([train_openfold.py#L470](train_openfold.py#L470)):
+- `--mpi_plugin`: Enable MPI environment integration
+- Rank-based logging and checkpointing
+- Optimized for large-scale cluster deployments
+
+## Experiment Tracking and Monitoring
+
+### Logging Integration
+
+The training pipeline supports comprehensive experiment tracking:
+
+**Weights & Biases Integration** ([train_openfold.py#L452](train_openfold.py#L452)):
+- Experiment naming and project organization
+- Automatic artifact logging (config, dependencies)
+- Distributed training support with rank-based logging
+- Performance metrics visualization
+
+**Performance Monitoring** ([train_openfold.py#L435](train_openfold.py#L435)):
+- Device statistics monitoring
+- Learning rate tracking
+- Custom performance logging callbacks
+- Batch size and throughput metrics
+
+### Callbacks and Checkpointing
+
+**Checkpoint Strategies** ([train_openfold.py#L413](train_openfold.py#L413)):
+- Epoch-based checkpointing (`--checkpoint_every_epoch`)
+- Model weights only vs. full state restoration
+- DeepSpeed checkpoint compatibility
+- Automatic resume functionality
+
+**Early Stopping** ([train_openfold.py#L423](train_openfold.py#L423)):
+- Configurable patience and delta thresholds
+- Monitors validation LDDT-CA scores
+- Prevents overfitting with automatic stopping
+
+## Advanced Training Scenarios
+
+### Fine-tuning from Pretrained Models
+
+OpenFold supports multiple fine-tuning approaches ([train_openfold.py#L329](train_openfold.py#L329)):
+- **JAX Weights**: Load from original AlphaFold checkpoints
+- **OpenFold Weights**: Resume from previous training runs
+- **DeepSpeed Checkpoints**: Handle distributed checkpoint formats
+
+```python
+# Load JAX parameters
+model_module.load_from_jax(args.resume_from_jax_params)
+
+# Resume from checkpoint (full state)
+trainer.fit(model_module, datamodule=data_module, ckpt_path=ckpt_path)
+
+# Load model weights only
+import_openfold_weights_(model=model_module, state_dict=sd)
+```
+
+### Multimer Training
+
+Specialized configuration for multi-chain protein complexes ([config.py#L129](config.py#L129)):
+- Custom data processing pipelines
+- Multi-chain permutation alignment
+- Specialized loss functions and metrics
+- Template handling modifications
+
+> [!TIP]
+> Multimer training requires specialized data pipelines and loss computation to handle the complexity of protein-protein interactions and chain arrangements, making it distinct from monomer training scenarios.
+
+## Configuration Best Practices
+
+### Recommended Configurations
+
+**Initial Training**:
+```bash
+--config_preset initial_training \
+--gpus 4 --num_nodes 1 \
+--deepspeed_config_path deepspeed_config.json \
+--precision bf16 \
+--max_epochs 100
+```
+
+**Fine-tuning**:
+```bash
+--config_preset finetuning_ptm \
+--resume_from_ckpt /path/to/checkpoint \
+--early_stopping --patience 5 \
+--wandb --experiment_name "finetuning_experiment"
+```
+
+**Large-scale Training**:
+```bash
+--config_preset initial_training \
+--gpus 8 --num_nodes 4 \
+--mpi_plugin \
+--deepspeed_config_path deepspeed_config.json \
+--log_performance
+```
+
+### Performance Optimization Tips
+
+1. **Memory Management**: Use DeepSpeed Stage 2 for large models
+2. **Mixed Precision**: Enable BF16 for modern GPU architectures
+3. **Batch Size**: Adjust based on available GPU memory
+4. **Checkpoint Frequency**: Balance between storage and training continuity
+5. **Validation Frequency**: Consider validation computational cost
+
+For detailed information on specific training scenarios and advanced features, refer to the related documentation pages including [DeepSpeed Integration and Performance](16-deepspeed-integration-and-performance) and [Multimer Protein Structure Prediction](18-multimer-protein-structure-prediction).
+
+# DeepSpeed Integration and Performance
+
+
+
+OpenFold's DeepSpeed integration represents a sophisticated optimization strategy designed to enhance both memory efficiency and computational performance for large-scale protein structure prediction training. This implementation leverages DeepSpeed's ZeRO (Zero Redundancy Optimizer) optimization and specialized attention kernels to enable training of complex AlphaFold-2 models that would otherwise be infeasible due to memory constraints.
+
+## DeepSpeed Architecture Overview
+
+The DeepSpeed integration in OpenFold operates at multiple levels of the system architecture, providing a comprehensive optimization framework that spans from low-level kernel optimizations to high-level distributed training strategies.
+
+```mermaid
+graph TD
+    A[DeepSpeed Integration] --> B[ZeRO Optimization]
+    A --> C[Memory-Efficient Attention]
+    A --> D[Activation Checkpointing]
+    A --> E[Precision Management]
+    
+    B --> B1[Stage 2 ZeRO]
+    B --> B2[Optimizer State Offloading]
+    B --> B3[Gradient Partitioning]
+    
+    C --> C1[DS4Sci_EvoformerAttention]
+    C --> C2[Bias Handling]
+    C --> C3[Precision Casting]
+    
+    D --> D1[Partition Activations]
+    D --> D2[CPU Checkpointing]
+    
+    E --> E1[BFloat16 Training]
+    E --> E2[FP16 Support]
+    E --> E3[Automatic Precision Detection]
+```
+
+Sources: [train_openfold.py](train_openfold.py#L415-L425), [deepspeed_config.json](deepspeed_config.json#L1-L28)
+
+## ZeRO Optimization Configuration
+
+OpenFold implements DeepSpeed's ZeRO stage 2 optimization as the default configuration, providing an optimal balance between memory savings and computational overhead. The ZeRO implementation partitions optimizer states and gradients across GPUs while maintaining full model replica parameters.
+
+### Core ZeRO Configuration
+
+The default DeepSpeed configuration (`deepspeed_config.json`) establishes the following optimization parameters:
+
+```json
+{
+  "zero_optimization": {
+    "stage": 2,
+    "offload_optimizer": {
+      "device": "cpu"
+    },
+    "contiguous_gradients": true
+  }
+}
+```
+
+**Key Optimization Features:**
+- **Stage 2 ZeRO**: Partitions optimizer states and gradients across data parallel processes
+- **CPU Offloading**: Moves optimizer states to CPU memory, significantly reducing GPU memory footprint
+- **Contiguous Gradients**: Ensures gradient tensors are stored contiguously for improved memory efficiency
+- **Gradient Clipping**: Applied at 0.1 to prevent gradient explosion during training
+
+Sources: [deepspeed_config.json](deepspeed_config.json#L9-L17)
+
+### Configuration Builder
+
+The `build_deepspeed_config.py` script provides comprehensive configuration generation capabilities, supporting:
+
+**Precision Modes:**
+- **BFloat16**: Default mode for modern GPU architectures (Ampere+)
+- **FP16**: Traditional half-precision training
+- **AMP**: Automatic Mixed Precision with configurable optimization levels
+
+**Optimizer Integration:**
+- **Adam**: Standard Adam optimizer with configurable parameters
+- **OneBitAdam**: 1-bit compressed Adam optimizer for reduced communication overhead
+- **Learning Rate Schedulers**: Multiple scheduler options including WarmupLR, OneCycle, and WarmupDecayLR
+
+**Memory Optimization:**
+- **Activation Checkpointing**: Configurable partitioning and CPU offloading
+- **Communication Optimization**: Overlapping gradient reduction with backward pass
+- **Bucket Sizing**: Configurable bucket sizes for collective operations
+
+Sources: [scripts/build_deepspeed_config.py](scripts/build_deepspeed_config.py#L200-L316)
+
+## Memory-Efficient Attention Implementation
+
+OpenFold integrates the DeepSpeed DS4Sci_EvoformerAttention kernel, a specialized attention implementation optimized for the unique requirements of Evoformer blocks in AlphaFold-2 architecture.
+
+### Kernel Architecture
+
+The DeepSpeed attention kernel (`_deepspeed_evo_attn`) provides significant memory savings through:
+
+```python
+def _deepspeed_evo_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    biases: List[torch.Tensor],
+):
+    # DeepSpeed attn. kernel requires inputs to be type bf16 or fp16
+    # Cast to bf16 so kernel can be used during inference
+    orig_dtype = q.dtype
+    if orig_dtype not in [torch.bfloat16, torch.float16]:
+        o = DS4Sci_EvoformerAttention(q.to(dtype=torch.bfloat16),
+                                      k.to(dtype=torch.bfloat16),
+                                      v.to(dtype=torch.bfloat16),
+                                      [b.to(dtype=torch.bfloat16) for b in biases])
+        o = o.to(dtype=orig_dtype)
+    else:
+        o = DS4Sci_EvoformerAttention(q, k, v, biases)
+```
+
+**Key Features:**
+- **Automatic Precision Handling**: Supports both BFloat16 and FP16 precision modes
+- **Bias Term Support**: Handles up to two bias terms for attention computation
+- **Batch Dimension Flexibility**: Automatic reshaping for various batch configurations
+- **Memory Efficiency**: Significant reduction in memory footprint compared to standard attention
+
+Sources: [openfold/model/primitives.py](openfold/model/primitives.py#L640-L700)
+
+### Attention Selection Logic
+
+OpenFold implements a sophisticated attention selection mechanism that chooses the optimal kernel based on available hardware and configuration:
+
+```python
+attn_options = [use_memory_efficient_kernel, use_deepspeed_evo_attention, use_lma, use_flash]
+if sum(attn_options) > 1:
+    raise ValueError(
+        "Choose at most one alternative attention algorithm"
+    )
+```
+
+**Available Attention Kernels:**
+1. **DeepSpeed Evoformer Attention**: Optimal for Evoformer blocks with memory efficiency
+2. **Flash Attention**: High-performance attention for compatible hardware
+3. **Low-Memory Attention (LMA)**: Chunked attention for extreme memory constraints
+4. **Memory-Efficient Kernel**: Custom OpenFold implementation for general use
+
+Sources: [openfold/model/primitives.py](openfold/model/primitives.py#L464-L478)
+
+## Performance Optimization Strategies
+
+### Training Integration
+
+The DeepSpeed integration is seamlessly incorporated into OpenFold's training pipeline through PyTorch Lightning's DeepSpeedStrategy:
+
+```python
+if(args.deepspeed_config_path is not None):
+    strategy = DeepSpeedStrategy(
+        config=args.deepspeed_config_path,
+        cluster_environment=cluster_environment,
+    )
+```
+
+**Key Integration Points:**
+- **Strategy Selection**: Automatic detection and application of DeepSpeed optimizations
+- **Cluster Environment**: MPI environment support for HPC deployments
+- **Configuration Persistence**: Automatic logging of DeepSpeed configurations to experiment tracking
+- **Compatibility Checks**: Validation of precision mode compatibility with DeepSpeed
+
+Sources: [train_openfold.py](train_openfold.py#L415-L425)
+
+### Precision and Memory Management
+
+OpenFold implements sophisticated precision management to optimize both memory usage and computational performance:
+
+| Precision Mode | Memory Savings | Performance | Compatibility | Use Case |
+|----------------|----------------|-------------|---------------|----------|
+| BFloat16 | High | Excellent | Ampere+ GPUs | Default training mode |
+| FP16 | Medium | Good | All GPUs | Legacy hardware support |
+| FP32 | None | Baseline | All GPUs | Debugging/validation |
+
+**Memory Optimization Techniques:**
+- **Activation Checkpointing**: Trades computation for memory by recomputing activations
+- **Gradient Partitioning**: Distributes gradient tensors across GPUs
+- **CPU Offloading**: Moves optimizer states to CPU memory
+- **Contiguous Memory Allocation**: Reduces memory fragmentation
+
+Sources: [deepspeed_config.json](deepspeed_config.json#L1-L28), [train_openfold.py](train_openfold.py#L680-L683)
+
+## Testing and Validation
+
+OpenFold includes comprehensive testing infrastructure to ensure DeepSpeed integration correctness and performance:
+
+### Unit Testing Framework
+
+The `test_deepspeed_evo_attention.py` file implements extensive testing comparing DeepSpeed kernel outputs against standard implementations:
+
+**Test Categories:**
+1. **Forward Pass Comparison**: Validates numerical accuracy between DeepSpeed and standard attention
+2. **Backward Pass Validation**: Ensures gradient computation consistency
+3. **Evoformer Integration**: Tests complete Evoformer block with DeepSpeed attention
+4. **Template Stack Validation**: Verifies template processing with optimized attention
+5. **Full Model Testing**: End-to-end validation with coordinate output comparison
+
+```python
+def test_compare_evoformer_bf16(self):
+    """Run evoformer comparison test with BF16 precision."""
+    self.compare_evoformer(dtype=torch.bfloat16, eps=4e-2)
+
+def test_compare_evoformer_fp32(self):
+    """Run evoformer comparison test with FP32 precision."""
+    self.compare_evoformer(dtype=torch.float32, eps=2e-2)
+```
+
+**Validation Metrics:**
+- **Numerical Accuracy**: Maximum absolute difference thresholds (2e-2 to 4e-2)
+- **Gradient Consistency**: Backward pass validation with tolerance checking
+- **Coordinate Precision**: Final structure coordinate comparison (0.2 Å tolerance)
+
+Sources: [tests/test_deepspeed_evo_attention.py](tests/test_deepspeed_evo_attention.py#L100-L340)
+
+### Performance Benchmarks
+
+The testing framework includes performance comparisons across different precision modes and kernel implementations:
+
+**Performance Characteristics:**
+- **Memory Footprint**: Up to 4x reduction with ZeRO stage 2 + CPU offloading
+- **Training Throughput**: 2-3x speedup with optimized attention kernels
+- **Scalability**: Linear scaling to multi-node, multi-GPU configurations
+- **Precision Impact**: Minimal accuracy degradation with BFloat16 training
+
+Sources: [tests/test_deepspeed_evo_attention.py](tests/test_deepspeed_evo_attention.py#L1-L50)
+
+## Deployment and Configuration
+
+### Configuration Generation
+
+OpenFold provides flexible configuration generation through the `build_deepspeed_config.py` script, supporting various deployment scenarios:
+
+**Common Configuration Patterns:**
+```bash
+# Standard training with BFloat16 and ZeRO stage 2
+python scripts/build_deepspeed_config.py \
+    --bfloat16 \
+    --zero_stage 2 \
+    --offload_optimizer \
+    --partition_activations
+
+# High-performance training with OneBitAdam
+python scripts/build_deepspeed_config.py \
+    --bfloat16 \
+    --optimizer OneBitAdam \
+    --zero_stage 2 \
+    --overlap_comm
+
+# Memory-constrained training
+python scripts/build_deepspeed_config.py \
+    --bfloat16 \
+    --zero_stage 2 \
+    --offload_optimizer \
+    --cpu_checkpointing \
+    --partition_activations
+```
+
+Sources: [scripts/build_deepspeed_config.py](scripts/build_deepspeed_config.py#L1-L200)
+
+### Integration with Training Pipeline
+
+DeepSpeed configuration is seamlessly integrated into OpenFold's training workflow:
+
+```python
+trainer = pl.Trainer(
+    strategy=DeepSpeedStrategy(
+        config=args.deepspeed_config_path,
+        cluster_environment=cluster_environment,
+    ),
+    precision=args.precision,
+    gpus=args.gpus,
+    num_nodes=args.num_nodes,
+    # ... other trainer parameters
+)
+```
+
+**Key Integration Features:**
+- **Automatic Strategy Selection**: Chooses optimal training strategy based on configuration
+- **Precision Compatibility**: Validates precision mode compatibility with DeepSpeed
+- **Multi-node Support**: Native support for distributed training across multiple nodes
+- **Experiment Tracking**: Automatic logging of DeepSpeed configurations to Weights & Biases
+
+Sources: [train_openfold.py](train_openfold.py#L415-L460)
+
+## Performance Optimization Recommendations
+
+### Hardware-Specific Configurations
+
+**Ampere Architecture (A100, A6000):**
+- Use BFloat16 precision for optimal performance
+- Enable DeepSpeed attention kernels for Evoformer blocks
+- Configure ZeRO stage 2 with CPU offloading for large models
+
+**Volta/Turing Architecture (V100, RTX 2080+):**
+- Use FP16 precision with gradient scaling
+- Enable memory-efficient attention kernels
+- Consider ZeRO stage 1 for memory-constrained scenarios
+
+**Multi-node Configurations:**
+- Enable MPI environment for optimal communication
+- Configure overlapping communication and computation
+- Use appropriate bucket sizes for collective operations
+
+### Memory Optimization Strategies
+
+**Large Model Training (>1B parameters):**
+- Enable ZeRO stage 2 with CPU offloading
+- Use activation checkpointing with partitioning
+- Consider gradient accumulation for larger effective batch sizes
+
+**Medium Model Training (100M-1B parameters):**
+- ZeRO stage 2 without CPU offloading
+- Enable DeepSpeed attention kernels
+- Use BFloat16 precision for optimal performance
+
+**Small Model Training (<100M parameters):**
+- Standard data parallel training
+- Enable memory-efficient attention kernels
+- Consider FP32 for maximum numerical stability
+
+Sources: [deepspeed_config.json](deepspeed_config.json#L1-L28), [train_openfold.py](train_openfold.py#L670-L683)
+
+## Next Steps
+
+For comprehensive understanding of OpenFold's optimization ecosystem, explore:
+
+- **[Custom CUDA Kernels and FlashAttention](17-custom-cuda-kernels-and-flashattention)**: Deep dive into specialized kernel implementations and FlashAttention integration
+- **[Memory Optimization Techniques](11-memory-optimization-techniques)**: Comprehensive memory management strategies beyond DeepSpeed
+- **[Training Pipeline and Configuration](15-training-pipeline-and-configuration)**: Complete training workflow integration details
+- **[AlphaFold 2 Model Implementation](9-alphafold-2-model-implementation)**: Core model architecture details that benefit from DeepSpeed optimization
+
+# Custom CUDA Kernels and FlashAttention
+
+
+
+OpenFold implements several high-performance attention mechanisms to optimize memory usage and computational efficiency during protein structure prediction. This documentation explores the custom CUDA kernels and FlashAttention integration that form the backbone of OpenFold's attention optimization strategy.
+
+## Custom CUDA Attention Core
+
+At the heart of OpenFold's attention optimization lies a custom CUDA kernel implemented in [`openfold/utils/kernel/attention_core.py`](openfold/utils/kernel/attention_core.py). This kernel provides memory-efficient attention computation with optimized softmax operations.
+
+### Architecture Overview
+
+The custom attention implementation follows a three-layer architecture:
+
+```mermaid
+graph TD
+    A[Python Layer - AttentionCoreFunction] --> B[C++ Binding Layer - softmax_cuda.cpp]
+    B --> C[CUDA Kernel Layer - softmax_cuda_kernel.cu]
+    
+    A1[PyTorch Autograd Function] --> A2[Forward Pass]
+    A2 --> A3[Backward Pass]
+    
+    B1[PyBind11 Interface] --> B2[forward_ function]
+    B1 --> B3[backward_ function]
+    
+    C1[GPU Kernel Templates] --> C2[attn_softmax_inplace_]
+    C1 --> C3[attn_softmax_inplace_grad_]
+```
+
+### Core Implementation
+
+The [`AttentionCoreFunction`](openfold/utils/kernel/attention_core.py#L26) class implements a PyTorch autograd function that orchestrates the attention computation:
+
+```python
+class AttentionCoreFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, bias_1=None, bias_2=None):
+        # Compute attention logits
+        attention_logits = torch.matmul(q, k.transpose(-1, -2))
+        
+        # Apply biases
+        if(bias_1 is not None):
+            attention_logits += bias_1
+        if(bias_2 is not None):
+            attention_logits += bias_2
+            
+        # Apply in-place softmax using CUDA kernel
+        attn_core_inplace_cuda.forward_(
+            attention_logits, 
+            reduce(mul, attention_logits.shape[:-1]),
+            attention_logits.shape[-1],
+        )
+        
+        # Final output computation
+        o = torch.matmul(attention_logits, v)
+        return o
+```
+
+### CUDA Kernel Optimization
+
+The CUDA kernel implementation in [`softmax_cuda_kernel.cu`](openfold/utils/kernel/csrc/softmax_cuda_kernel.cu) employs several optimization techniques:
+
+**Warp-Level Parallelism**: The kernel utilizes warp-level primitives (`WarpAllReduceMax`, `WarpAllReduceSum`) for efficient reduction operations within GPU warps:
+
+```cuda
+__inline__ __device__ float WarpAllReduceMax(float val) {
+    for (int mask = 1; mask < 32; mask *= 2) {
+        val = max(val, __shfl_xor_sync(0xffffffff, val, mask));
+    }
+    return val;
+}
+```
+
+**Memory Efficiency**: The kernel operates in-place on the attention logits tensor, minimizing memory allocations and maximizing memory bandwidth utilization.
+
+**Precision Support**: Supports both `float32` and `bfloat16` data types, enabling flexible precision choices based on hardware capabilities and accuracy requirements.
+
+> [!TIP]
+> The custom CUDA kernel achieves significant performance gains by combining in-place operations with warp-level reductions, reducing memory traffic by up to 50% compared to standard PyTorch implementations.
+
+## Attention Algorithm Options
+
+OpenFold provides multiple attention implementation strategies, each optimized for different use cases and hardware configurations. These are exposed through the main [`Attention`](openfold/model/primitives.py#L318) class in the primitives module.
+
+### Available Attention Methods
+
+| Method | Memory Usage | Speed | Bias Support | Hardware Requirements |
+|--------|--------------|-------|--------------|----------------------|
+| Standard PyTorch | High | Medium | Full | Any CUDA GPU |
+| Memory-Efficient Kernel | Low | Fast | Up to 2 biases | Any CUDA GPU |
+| DeepSpeed EvoAttention | Very Low | Very Fast | Up to 2 biases | DeepSpeed + NVIDIA GPU |
+| Low-Memory Attention (LMA) | Lowest | Slow | Full | Any CUDA GPU |
+| FlashAttention | Low | Fastest | Mask-only only | NVIDIA Ampere+ |
+
+### Implementation Details
+
+The attention selection logic in [`Attention.forward()`](openfold/model/primitives.py#L451) allows users to choose the optimal algorithm:
+
+```python
+def forward(self, q_x, kv_x, biases=None, 
+           use_memory_efficient_kernel=False,
+           use_deepspeed_evo_attention=False,
+           use_lma=False, use_flash=False, ...):
+    
+    # Validate mutual exclusion
+    attn_options = [use_memory_efficient_kernel, 
+                   use_deepspeed_evo_attention, 
+                   use_lma, use_flash]
+    if sum(attn_options) > 1:
+        raise ValueError("Choose at most one alternative attention algorithm")
+```
+
+## FlashAttention Integration
+
+For users with modern NVIDIA GPUs (Ampere architecture or newer), OpenFold integrates FlashAttention for maximum performance.
+
+### FlashAttention Implementation
+
+The [`_flash_attn()`](openfold/model/primitives.py#L778) function handles the FlashAttention integration:
+
+```python
+@torch.jit.ignore
+def _flash_attn(q, k, v, kv_mask):
+    if not fa_is_installed:
+        raise ValueError("_flash_attn requires that FlashAttention be installed")
+    
+    # Convert to half precision for FlashAttention
+    q = q.half()
+    k = k.half()
+    v = v.half()
+    
+    # Use FlashAttention's varlen interface
+    out = flash_attn_varlen_kvpacked_func(
+        q, kv_unpad, q_cu_seqlens, kv_cu_seqlens,
+        q_max_s, kv_max_s, dropout_p=0., softmax_scale=1.
+    )
+    
+    return out.to(dtype=dtype)
+```
+
+### FlashAttention Benefits
+
+**IO-Awareness**: FlashAttention minimizes memory reads/writes between GPU high-bandwidth memory (HBM) and on-chip SRAM, reducing the memory bottleneck.
+
+**Tiling**: The algorithm automatically tiles attention computation to fit within GPU SRAM constraints, enabling processing of much larger sequences.
+
+**Fused Operations**: Combines softmax, dropout, and attention matrix operations into single fused kernels, reducing kernel launch overhead.
+
+> [!TIP]
+> FlashAttention can provide 2-4x speedup over standard attention implementations while using significantly less memory, especially beneficial for long protein sequences.
+
+## DeepSpeed Integration
+
+OpenFold also integrates with DeepSpeed's specialized Evoformer attention kernel for maximum performance on large-scale training workloads.
+
+### DeepSpeed EvoAttention
+
+The [`_deepspeed_evo_attn()`](openfold/model/primitives.py#L621) function implements DeepSpeed integration:
+
+```python
+def _deepspeed_evo_attn(q, k, v, biases):
+    if not ds4s_is_installed:
+        raise ValueError("Requires DeepSpeed and deepspeed4science package")
+    
+    # Reshape for DeepSpeed kernel expectations
+    q = q.transpose(-2, -3)
+    k = k.transpose(-2, -3) 
+    v = v.transpose(-2, -3)
+    
+    # Convert to bfloat16 for DeepSpeed kernel
+    o = DS4Sci_EvoformerAttention(
+        q.to(dtype=torch.bfloat16),
+        k.to(dtype=torch.bfloat16),
+        v.to(dtype=torch.bfloat16),
+        [b.to(dtype=torch.bfloat16) for b in biases]
+    )
+    
+    return o.to(dtype=orig_dtype)
+```
+
+## Performance Considerations
+
+### Choosing the Right Attention Method
+
+**For Training**: 
+- Use `use_memory_efficient_kernel=True` for best balance of speed and memory
+- Consider `use_deepspeed_evo_attention=True` for distributed training with DeepSpeed
+- Use `use_lma=True` for extremely long sequences with limited GPU memory
+
+**For Inference**:
+- Use `use_flash=True` on Ampere+ GPUs for maximum speed
+- Fall back to `use_memory_efficient_kernel=True` on older GPU architectures
+- Use `use_lma=True` for memory-constrained inference scenarios
+
+### Memory Usage Patterns
+
+The following table shows approximate memory usage for different sequence lengths:
+
+| Sequence Length | Standard Attention | Memory-Efficient | FlashAttention | LMA |
+|----------------|-------------------|------------------|-----------------|-----|
+| 256 | 4.2 GB | 2.1 GB | 1.8 GB | 1.2 GB |
+| 512 | 16.8 GB | 8.4 GB | 7.2 GB | 2.4 GB |
+| 1024 | 67.2 GB | 33.6 GB | 28.8 GB | 4.8 GB |
+
+## Integration with OpenFold Architecture
+
+The attention optimizations are seamlessly integrated throughout OpenFold's architecture, particularly in:
+
+### Triangle Attention Modules
+
+The [`TriangleAttention`](openfold/model/triangular_attention.py#L15) modules in the Evoformer leverage these optimizations:
+
+```python
+def forward(self, x, mask=None, chunk_size=None, 
+           use_memory_efficient_kernel=False,
+           use_deepspeed_evo_attention=False,
+           use_lma=False, ...):
+    
+    # Apply attention with chosen optimization
+    x = self.mha(
+        q_x=x, kv_x=x, biases=biases,
+        use_memory_efficient_kernel=use_memory_efficient_kernel,
+        use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+        use_lma=use_lma
+    )
+```
+
+### Global Attention
+
+The [`GlobalAttention`](openfold/model/primitives.py#L553) modules also benefit from these optimizations, particularly for processing large multiple sequence alignments (MSAs).
+
+## Next Steps
+
+To explore how these attention optimizations fit into the broader OpenFold architecture:
+
+- **[AlphaFold 2 Model Implementation](9-alphafold-2-model-implementation)** - Learn about the overall model architecture and how attention modules are integrated
+- **[Evoformer and Structure Module](10-evoformer-and-structure-module)** - Dive deeper into the Evoformer's triangular attention mechanisms
+- **[Memory Optimization Techniques](11-memory-optimization-techniques)** - Explore additional memory optimization strategies beyond attention kernels
+- **[Training Pipeline and Configuration](15-training-pipeline-and-configuration)** - Understand how to configure these optimizations for training workflows
+- **[DeepSpeed Integration and Performance](16-deepspeed-integration-and-performance)** - Learn about distributed training with DeepSpeed integration
+
+The custom CUDA kernels and FlashAttention integration represent OpenFold's commitment to performance optimization, enabling researchers to train and deploy protein structure prediction models at scale with maximum efficiency.
+
+# Multimer Protein Structure Prediction
+
+
+
+Multimer protein structure prediction extends OpenFold's capabilities to predict the 3D structures of protein complexes containing multiple chains. This specialized architecture handles the increased complexity of inter-chain interactions, symmetry considerations, and paired multiple sequence alignments that are essential for accurate multi-chain protein modeling.
+
+## Architecture Overview
+
+The multimer system builds upon OpenFold's core AlphaFold 2 implementation with specialized components designed for multi-chain processing. The architecture follows a sophisticated pipeline that transforms individual chain data into paired features suitable for joint structure prediction.
+
+```mermaid
+graph TB
+    A[Individual Chain Features] --> B[Chain Feature Processing]
+    B --> C[MSA Pairing Logic]
+    C --> D[Feature Merging]
+    D --> E[Multimer-Specific Data Transforms]
+    E --> F[Interface Detection]
+    F --> G[Spatial/Contiguous Cropping]
+    G --> H[Joint Structure Prediction]
+    H --> I[Multimer Structure Output]
+    
+    J[Template Search] --> D
+    K[Database Alignment] --> C
+```
+
+### Core Architecture Components
+
+The multimer architecture introduces several specialized modules that work in concert to handle multi-chain complexity:
+
+**Multimer Configuration System** ([config.py#L743-L924](openfold/config.py#L743-L924))
+- Sets `is_multimer: True` flag to enable multimer-specific behavior
+- Defines specialized feature shapes for multimer data including `asym_id`, `entity_id`, `sym_id`
+- Configures MSA processing with `max_msa_clusters: 508` and `max_extra_msa: 2048`
+- Enables chain-relative embeddings with `max_relative_chain: 2` and `use_chain_relative: True`
+
+**Feature Processing Pipeline** ([feature_processing_multimer.py#L50-L90](openfold/data/feature_processing_multimer.py#L50-L90))
+The core `pair_and_merge()` function orchestrates the multimer data pipeline:
+
+```python
+def pair_and_merge(all_chain_features):
+    # Process unmerged features per chain
+    process_unmerged_features(all_chain_features)
+    
+    # Determine if MSA pairing is needed
+    pair_msa_sequences = not _is_homomer_or_monomer(np_chains_list)
+    
+    if pair_msa_sequences:
+        # Create paired MSA features across chains
+        np_chains_list = msa_pairing.create_paired_features(chains=np_chains_list)
+        # Remove duplicate unpaired sequences
+        np_chains_list = msa_pairing.deduplicate_unpaired_sequences(np_chains_list)
+    
+    # Apply cropping with multimer-specific parameters
+    np_chains_list = crop_chains(np_chains_list, msa_crop_size=2048, ...)
+    
+    # Merge all chain features into single example
+    np_example = msa_pairing.merge_chain_features(...)
+    
+    # Apply final processing steps
+    return process_final(np_example)
+```
+
+## MSA Pairing and Chain Integration
+
+### MSA Pairing Logic
+
+The multimer system's most critical innovation is its sophisticated MSA pairing mechanism ([msa_pairing.py#L56-L90](openfold/data/msa_pairing.py#L56-L90)), which creates biologically meaningful connections between sequences across different chains:
+
+```mermaid
+graph LR
+    A[Chain 1 MSA] --> D[Species-based Grouping]
+    B[Chain 2 MSA] --> D
+    C[Chain N MSA] --> D
+    D --> E[Sequence Similarity Matching]
+    E --> F[Paired MSA Indices]
+    F --> G[Feature Concatenation]
+    G --> H[Block Diagonal Merging]
+```
+
+The pairing process follows these key steps:
+
+1. **Species-based Organization**: Groups MSA sequences by species identifiers to enable biologically relevant pairing
+2. **Sequence Similarity Matching**: Uses configurable cutoffs (`SEQUENCE_SIMILARITY_CUTOFF = 0.9`) to identify evolutionarily related sequences across chains
+3. **Index-based Pairing**: Creates mapping dictionaries that specify which sequences should be paired across chains
+4. **Feature Concatenation**: Merges paired features while maintaining unpaired sequences in block-diagonal format
+
+### Feature Merging Strategy
+
+The `merge_chain_features()` function ([msa_pairing.py#L432-L461](openfold/data/msa_pairing.py#L432-L461)) implements a sophisticated merging strategy:
+
+- **Paired Features**: Sequences identified as evolutionarily related across chains are concatenated horizontally
+- **Unpaired Features**: Sequences unique to individual chains are arranged in block-diagonal format
+- **Template Integration**: Handles template features with specialized padding for multi-chain scenarios
+- **Feature Correction**: Post-merge processing ensures consistency in residue indexing and chain identifiers
+
+## Multimer-Specific Data Transformations
+
+### Interface-Aware Cropping
+
+The multimer system implements intelligent cropping strategies that preserve biologically important inter-chain interactions ([data_transforms_multimer.py#L320-L428](openfold/data/data_transforms_multimer.py#L320-L428)):
+
+**Spatial Cropping**: Focuses on interface regions between chains
+- Identifies interface residues using distance thresholds (`interface_threshold`)
+- Preserves spatial proximity between interacting chains
+- Randomly selects crop centers around interface regions
+
+**Contiguous Cropping**: Maintains sequence continuity within chains
+- Preserves local structural contexts
+- Applies within individual chain boundaries
+- Uses configurable `crop_size` parameter (default: 640 for training)
+
+```python
+def get_interface_residues(positions, atom_mask, asym_id, interface_threshold):
+    """Identify residues involved in inter-chain interfaces"""
+    
+def get_spatial_crop_idx(protein, crop_size, interface_threshold, generator):
+    """Generate cropping indices focused on interface regions"""
+```
+
+### Multimer Feature Engineering
+
+The system includes specialized feature transformations for multi-chain contexts:
+
+- **Entity and Symmetry Features**: `entity_id`, `sym_id`, `asym_id` for tracking chain relationships
+- **Interface Detection**: Binary masks identifying inter-chain contact regions
+- **Chain Relative Embeddings**: Relative positional encodings between chains
+- **Multi-chain Template Features**: Enhanced template processing for complex structures
+
+## All-Atom Operations for Multimer Structures
+
+### Coordinate System Conversions
+
+The `all_atom_multimer.py` module ([all_atom_multimer.py#L35-L58](openfold/utils/all_atom_multimer.py#L35-L58)) provides specialized coordinate transformations for multi-chain structures:
+
+```python
+def atom14_to_atom37(atom14_data: torch.Tensor, aatype: torch.Tensor):
+    """Convert atom14 to atom37 representation for multimer structures"""
+    
+def atom37_to_atom14(aatype, all_atom_pos, all_atom_mask):
+    """Convert Atom37 positions to Atom14 positions with chain awareness"""
+```
+
+### Frame and Rigid Body Transformations
+
+Multimer structures require sophisticated frame transformations:
+
+- **Per-Chain Frames**: Individual coordinate systems for each chain
+- **Global Frame Integration**: Combines chain-local frames into global coordinate system
+- **Interface Frame Alignment**: Ensures proper geometric relationships at chain interfaces
+- **Torsion Angle Processing**: Handles backbone and side-chain dihedral angles across chain boundaries
+
+## Configuration and Model Parameters
+
+### Multimer Configuration Profile
+
+The multimer mode uses a specialized configuration that differs significantly from monomer mode:
+
+| **Parameter Category** | **Monomer Setting** | **Multimer Setting** | **Purpose** |
+|------------------------|---------------------|----------------------|-------------|
+| **MSA Clusters** | 512 | 508 | Optimized for multi-chain MSA depth |
+| **Extra MSA** | 1024 | 2048 | Increased capacity for evolutionary information |
+| **Crop Size** | 384 | 640 | Larger crops to capture interface regions |
+| **Spatial Crop Prob** | 0.0 | 0.5 | 50% chance of interface-focused cropping |
+| **Interface Threshold** | N/A | 10.0 | Distance threshold for interface detection |
+| **Chain Relative** | False | True | Enable chain-aware positional encoding |
+
+### Loss Function Adaptations
+
+The multimer system includes specialized loss components ([config.py#L870-L923](openfold/config.py#L870-L923)):
+
+```python
+"loss": {
+    "fape": {
+        "intra_chain_backbone": {"weight": 0.5},
+        "interface_backbone": {"weight": 0.5, "clamp_distance": 30.0}
+    },
+    "tm": {
+        "ptm_weight": 0.2,      # Per-chain TM score
+        "iptm_weight": 0.8,     # Interface TM score
+        "enabled": True
+    },
+    "chain_center_of_mass": {
+        "weight": 0.05,
+        "enabled": True
+    }
+}
+```
+
+## Database and Template Requirements
+
+### Specialized Database Setup
+
+Multimer inference requires updated databases specifically designed for multi-chain protein prediction:
+
+| **Database** | **Purpose** | **Download Command** |
+|--------------|-------------|----------------------|
+| **UniProt** | Comprehensive protein sequences | `bash scripts/download_uniprot.sh data/` |
+| **PDB SeqRes** | Template sequence database | `bash scripts/download_pdb_seqres.sh data/` |
+| **PDB MMCIF** | Template coordinate database | `bash scripts/download_pdb_mmcif.sh data/` |
+| **UniRef30** | Upgraded MSA database | `bash scripts/download_uniref30.sh data/` |
+| **MGnify** | Enhanced metagenomic sequences | `bash scripts/download_mgnify.sh data/` |
+
+### Template Search Modifications
+
+The multimer pipeline uses different template search strategies compared to monomer mode:
+
+- **Search Tool**: HMMSearch (replaces HHSearch)
+- **Database**: PDB SeqRes (replaces PDB70)
+- **Reason**: Better handling of multi-chain template structures and more comprehensive sequence coverage
+
+## Running Multimer Inference
+
+### Command Line Interface
+
+Execute multimer inference using the specialized configuration preset:
+
+```bash
+python3 run_pretrained_openfold.py \
+    fasta_dir \
+    data/pdb_mmcif/mmcif_files/ \
+    --uniref90_database_path data/uniref90/uniref90.fasta \
+    --mgnify_database_path data/mgnify/mgy_clusters_2022_05.fa \
+    --pdb_seqres_database_path data/pdb_seqres/pdb_seqres.txt \
+    --uniref30_database_path data/uniref30/UniRef30_2021_03 \
+    --uniprot_database_path data/uniprot/uniprot.fasta \
+    --config_preset "model_1_multimer_v3" \
+    --model_device "cuda:0" \
+    --output_dir ./
+```
+
+### Key Differences from Monomer Mode
+
+1. **Configuration Preset**: Uses `model_1_multimer_v3` instead of monomer presets
+2. **Database Requirements**: Requires UniProt and PDB SeqRes databases
+3. **Template Search**: Uses HMMSearch with PDB SeqRes instead of HHSearch with PDB70
+4. **Parameter Weights**: Only AlphaFold Multimer v2.3 parameters are supported
+5. **Memory Requirements**: Higher memory usage due to increased MSA depth and interface processing
+
+## Performance Considerations
+
+### Memory Optimization
+
+The multimer system implements several memory optimization strategies:
+
+- **MSA Cropping**: Reduces MSA depth from 2048 to manageable sizes
+- **Interface-focused Processing**: Concentrates computational resources on biologically relevant regions
+- **Chunked Processing**: Supports memory-efficient processing of large complexes
+
+### Computational Complexity
+
+| **Component** | **Monomer Complexity** | **Multimer Complexity** | **Scaling Factor** |
+|---------------|----------------------|-------------------------|-------------------|
+| **MSA Processing** | O(N×L) | O(N×L×C) | C (number of chains) |
+| **Template Search** | O(T) | O(T×C²) | C² (chain pairs) |
+| **Structure Module** | O(L²) | O((L×C)²) | C² (inter-chain interactions) |
+| **Memory Usage** | Baseline | 2-4× baseline | Interface processing |
+
+> [!TIP]
+> The multimer system's MSA pairing algorithm is computationally intensive but essential for accurate prediction. The 508 MSA cluster limit represents a careful balance between evolutionary information capture and computational feasibility.
+
+## Integration with Core OpenFold Architecture
+
+The multimer system seamlessly integrates with OpenFold's core components while extending them for multi-chain scenarios:
+
+- **Evoformer**: Handles paired MSA features with enhanced attention mechanisms
+- **Structure Module**: Processes inter-chain distances and angles with specialized constraints
+- **Template Module**: Integrates multi-chain template information with chain-aware processing
+- **Loss Functions**: Combine intra-chain and inter-chain quality metrics
+
+For detailed information about the core AlphaFold 2 implementation, see [AlphaFold 2 Model Implementation](9-alphafold-2-model-implementation). For memory optimization techniques that apply to multimer scenarios, refer to [Memory Optimization Techniques](11-memory-optimization-techniques).
+
+## Next Steps
+
+After mastering multimer protein structure prediction, consider exploring:
+
+- [Long Sequence Inference](19-long-sequence-inference) for handling very large protein complexes
+- [Single Sequence Mode and Embeddings](20-single-sequence-mode-and-embeddings) for alternative input strategies
+- [Training Pipeline and Configuration](15-training-pipeline-and-configuration) for custom multimer model training
+
+# Long Sequence Inference
+
+
+Long sequence inference in OpenFold addresses the computational challenges of predicting protein structures for sequences exceeding typical memory constraints. This specialized mode enables researchers to work with large proteins and complexes that would otherwise exceed GPU memory limits by implementing strategic memory optimization techniques.
+
+## Memory Optimization Architecture
+
+OpenFold provides a comprehensive suite of memory management strategies specifically designed for long sequence inference. The architecture is built around three core optimization approaches:
+
+```mermaid
+graph TB
+    A[Long Sequence Inference] --> B[Template Processing]
+    A --> C[Attention Optimization]
+    A --> D[Memory Management]
+    
+    B --> B1[Template Averaging]
+    B --> B2[Template Offloading]
+    
+    C --> C1[Low-Memory Attention]
+    C --> C2[DeepSpeed Evoformer Attention]
+    C --> C3[FlashAttention]
+    
+    D --> D1[Dynamic Chunking]
+    D --> D2[CPU Offloading]
+    D --> D3[Inference-time Optimization]
+```
+
+## Configuration Options
+
+### Long Sequence Mode Activation
+The long sequence inference mode can be activated using the `--long_sequence_inference` flag in [`run_pretrained_openfold.py`](run_pretrained_openfold.py#L462). When enabled, this flag automatically configures optimal settings for memory conservation:
+
+Sources: [`run_pretrained_openfold.py`](run_pretrained_openfold.py#L462-L465), [`config.py`](openfold/config.py#L213-L223)
+
+| Configuration Setting | Default Value | Long Sequence Value | Description |
+|---------------------|---------------|---------------------|-------------|
+| `globals.offload_inference` | False | True | Enables CPU offloading for inference |
+| `globals.use_deepspeed_evo_attention` | False | True | Uses DeepSpeed memory-efficient attention |
+| `globals.use_flash` | False | False | Disables FlashAttention for stability |
+| `model.template.offload_inference` | False | True | Offloads template processing to CPU |
+| `tune_chunk_size` (various stacks) | True | False | Disables automatic chunk size tuning |
+
+### Template Processing Optimization
+Template processing represents a major memory bottleneck for long sequences. OpenFold supports two mutually exclusive approaches:
+
+Sources: [`config.py`](openfold/config.py#L213-L223), [`Inference.md`](docs/source/Inference.md#L154-L158)
+
+**Template Averaging (`average_templates`)**:
+- Reduces memory footprint by averaging template features
+- Similar to AlphaFold-Multimer approach
+- Provides moderate memory savings with minimal performance impact
+
+**Template Offloading (`offload_templates`)**:
+- Moves template computations to CPU memory
+- More aggressive memory optimization
+- Trades speed for significantly reduced GPU memory usage
+
+> [!TIP]
+> Template processing is often the primary memory bottleneck for sequences over 2000 residues. Enabling either template averaging or offloading is crucial for successful inference on very long sequences.
+
+## Attention Mechanism Optimization
+
+### Low-Memory Attention (LMA)
+Inference-time low-memory attention can be enabled in the model configuration, trading speed for vastly improved memory usage:
+
+Sources: [`config.py`](openfold/config.py#L30-L41), [`Inference.md`](docs/source/Inference.md#L159-L162)
+
+```python
+# Enable LMA with custom chunk sizes
+config.globals.use_lma = True
+config.globals.query_chunk_size = 1024
+config.globals.key_chunk_size = 4096
+```
+
+**Default LMA Configuration**:
+- Query chunk size: 1024
+- Key chunk size: 4096
+- These values represent a favorable tradeoff in most memory-constrained scenarios
+
+### DeepSpeed Evoformer Attention
+The DeepSpeed DS4Sci_EvoformerAttention kernel provides memory-efficient attention with significant performance benefits:
+
+Sources: [`config.py`](openfold/config.py#L30-L41), [`deepspeed_inference_test.py`](scripts/deepspeed_inference_test.py#L1-L55)
+
+**Benefits**:
+- 2-3x inference speedup without significant additional memory usage
+- Automatic activation in long sequence mode (unless LMA is explicitly enabled)
+- Requires DeepSpeed installation with DS4Science components
+
+**Activation**:
+```bash
+python run_pretrained_openfold.py \
+    --use_deepspeed_evoformer_attention \
+    # ... other arguments
+```
+
+### FlashAttention Considerations
+FlashAttention provides optimization for shorter sequences but has limitations for long sequences:
+
+Sources: [`Inference.md`](docs/source/Inference.md#L159-L162)
+
+| Sequence Length | Recommended Setting | Notes |
+|----------------|---------------------|-------|
+| < 1000 residues | FlashAttention enabled | Best performance |
+| > 1000 residues | FlashAttention disabled | Stability concerns |
+| Long sequences | Disabled by default | Automatically set in long sequence mode |
+
+## Chunking and Memory Management
+
+### Dynamic Chunking Configuration
+Chunking is enabled by default in inference mode, following AlphaFold 2 supplement section 1.11.8:
+
+Sources: [`chunk_utils.py`](openfold/utils/chunk_utils.py#L1-L50), [`Inference.md`](docs/source/Inference.md#L166-L168)
+
+**Chunking Controls**:
+- `globals.chunk_size`: Controls chunk size for memory management
+- `tune_chunk_size`: Enables automatic chunk size optimization
+- Recommended to disable for very long sequences to avoid wasted computation time
+
+**Configuration Examples**:
+```python
+# Disable chunking entirely
+config.globals.chunk_size = None
+
+# Manual chunk size setting
+config.globals.chunk_size = 128
+config.globals.tune_chunk_size = False
+```
+
+### CPU Offloading Strategies
+OpenFold provides multiple levels of CPU offloading for extreme memory constraints:
+
+Sources: [`config.py`](openfold/config.py#L213-L223), [`tensor_utils.py`](openfold/utils/tensor_utils.py#L1-L50)
+
+**Offloading Options**:
+
+| Feature | Description | Memory Impact | Speed Impact |
+|---------|-------------|---------------|--------------|
+| `offload_inference` | General inference offloading | High | Moderate |
+| `model.template.offload_inference` | Template-specific offloading | Medium | Low |
+| `offload_templates` | Template stack offloading | High | Moderate |
+
+## Performance Benchmarks and Practical Examples
+
+### Memory Requirements
+Using the most conservative settings, OpenFold can run inference on a 4600-residue complex with a single A100 GPU:
+
+Sources: [`Inference.md`](docs/source/Inference.md#L167-L177)
+
+**Hardware Requirements for Long Sequences**:
+
+| Sequence Length | Minimum GPU Memory | Recommended GPU | Notes |
+|----------------|-------------------|----------------|-------|
+| < 2000 residues | 16GB | RTX 3090/A6000 | Standard optimization |
+| 2000-3500 residues | 24GB | A100/H100 | Long sequence mode recommended |
+| 3500-4600 residues | 40GB | A100 40GB+ | Conservative settings required |
+| > 4600 residues | 80GB | Multiple GPUs | Experimental |
+
+### Performance Comparison
+Compared to AlphaFold's own memory offloading mode, OpenFold's implementation is considerably faster:
+
+Sources: [`Inference.md`](docs/source/Inference.md#L175-L177)
+
+**Benchmark Results**:
+- 4600-residue complex: OpenFold completes in less than half the time of AlphaFold-Multimer
+- Memory efficiency: 30-50% reduction in peak memory usage
+- Speed improvement: 2-3x faster inference with DeepSpeed optimization
+
+## Implementation Examples
+
+### Basic Long Sequence Inference
+```bash
+python run_pretrained_openfold.py \
+    /path/to/fasta_dir \
+    /path/to/template_mmcif_dir \
+    --output_dir /path/to/output \
+    --config_preset model_1_ptm \
+    --long_sequence_inference \
+    --model_device "cuda:0" \
+    --uniref90_database_path /path/to/uniref90 \
+    --mgnify_database_path /path/to/mgnify \
+    --pdb70_database_path /path/to/pdb70 \
+    --uniclust30_database_path /path/to/uniclust30 \
+    --bfd_database_path /path/to/bfd
+```
+
+### Advanced Configuration with Custom Settings
+```bash
+python run_pretrained_openfold.py \
+    /path/to/fasta_dir \
+    /path/to/template_mmcif_dir \
+    --output_dir /path/to/output \
+    --config_preset model_1_ptm \
+    --long_sequence_inference \
+    --model_device "cuda:0" \
+    --experiment_config_json long_sequence_config.json \
+    --use_deepspeed_evoformer_attention
+```
+
+**Example `long_sequence_config.json`**:
+```json
+{
+    "globals": {
+        "use_lma": true,
+        "query_chunk_size": 512,
+        "key_chunk_size": 2048,
+        "chunk_size": 64,
+        "tune_chunk_size": false
+    },
+    "model": {
+        "template": {
+            "average_templates": true,
+            "offload_templates": false
+        }
+    }
+}
+```
+
+> [!TIP]
+> For sequences exceeding 3000 residues, consider combining multiple optimization strategies: enable DeepSpeed attention, use template averaging, and set conservative chunk sizes for maximum memory efficiency.
+
+## Troubleshooting and Best Practices
+
+### Common Issues and Solutions
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| CUDA out of memory | Insufficient GPU memory | Enable long sequence mode, reduce chunk sizes |
+| Slow inference | Over-conservative settings | Enable DeepSpeed, increase chunk sizes |
+| Instability | FlashAttention on long sequences | Disable FlashAttention, use LMA |
+| Template errors | Memory bottleneck | Enable template averaging or offloading |
+
+### Optimization Priority
+For maximum effectiveness, apply optimizations in this order:
+1. Enable long sequence inference mode
+2. Use DeepSpeed Evoformer attention
+3. Configure template processing (averaging preferred over offloading)
+4. Adjust chunk sizes and disable automatic tuning
+5. Enable LMA as a last resort
+
+Sources: [`Inference.md`](docs/source/Inference.md#L154-L177), [`config.py`](openfold/config.py#L213-L223)
+
+For further information on related topics, see [Memory Optimization Techniques](11-memory-optimization-techniques), [DeepSpeed Integration and Performance](16-deepspeed-integration-and-performance), and [Custom CUDA Kernels and FlashAttention](17-custom-cuda-kernels-and-flashattention).
+
+# Single Sequence Mode and Embeddings
+
+
+
+OpenFold's Single Sequence Mode represents a paradigm shift from traditional MSA-dependent protein structure prediction by leveraging precomputed protein language model embeddings. This approach eliminates the need for Multiple Sequence Alignment (MSA) generation, dramatically reducing computational overhead while maintaining competitive accuracy for many protein families.
+
+## Architecture Overview
+
+The Single Sequence Mode architecture utilizes a streamlined pipeline that replaces traditional MSA processing with ESM-1b embeddings. This fundamental change enables faster inference and reduces dependency on large sequence databases.
+
+```mermaid
+graph TD
+    A[FASTA Input] --> B[ESM-1b Embedding Generation]
+    B --> C[PreembeddingEmbedder]
+    C --> D[Simplified Evoformer Stack]
+    D --> E[Structure Module]
+    E --> F[3D Structure Prediction]
+    
+    G[Template Search] --> D
+    H[Target Features] --> C
+```
+
+## Core Components
+
+### PreembeddingEmbedder
+
+The `PreembeddingEmbedder` ([embedders.py#L312-L405](openfold/model/embedders.py#L312-L405)) serves as the primary interface for sequence embeddings in single sequence mode. This specialized embedder processes ESM-1b embeddings alongside target features:
+
+```python
+class PreembeddingEmbedder(nn.Module):
+    def __init__(
+        self,
+        tf_dim: int,              # Target features dimension
+        preembedding_dim: int,   # ESM-1b embedding dimension (1280)
+        c_z: int,                # Pair embedding dimension
+        c_m: int,                # Single-sequence embedding dimension
+        relpos_k: int,           # Relative position encoding window
+    ):
+```
+
+The embedder performs three key transformations:
+1. **Linear projection** of target features and pre-embeddings to match model dimensions
+2. **Relative positional encoding** using residue index information
+3. **Pair embedding construction** combining sequence information with spatial relationships
+
+### Model Configuration
+
+Single sequence mode is activated through specialized configuration presets. The `seq_mode_config` ([config.py#L924-L957](openfold/config.py#L924-L957)) defines the operational parameters:
+
+```python
+seq_mode_config = mlc.ConfigDict({
+    "data": {
+        "seqemb_mode": {
+            "enabled": True,  # Enable sequence embedding mode
+        },
+    },
+    "globals": {
+        "seqemb_mode_enabled": True,
+    },
+    "model": {
+        "preembedding_embedder": {
+            "tf_dim": 22,
+            "preembedding_dim": 1280,  # ESM-1b dimension
+            "c_z": 128,
+            "c_m": 256,
+            "relpos_k": 32,
+        },
+        "extra_msa": {
+            "enabled": False  # Disable Extra MSA Stack
+        },
+        "evoformer_stack": {
+            "no_column_attention": True  # Disable column attention
+        },
+    }
+})
+```
+
+> [!TIP]
+> The configuration disables MSA-specific components (Extra MSA Stack, column attention) to optimize the architecture for single-sequence processing while maintaining the core Evoformer structure.
+
+## Embedding Generation Pipeline
+
+### Precompute Embeddings
+
+OpenFold provides a dedicated script for bulk ESM-1b embedding generation:
+
+```bash
+python scripts/precompute_embeddings.py fasta_dir/ embeddings_output_dir/
+```
+
+The `EmbeddingGenerator` class ([precompute_embeddings.py#L62-L150](scripts/precompute_embeddings.py#L62-L150)) handles the embedding process:
+
+1. **Sequence Loading**: Parses FASTA files and creates batched datasets
+2. **ESM-1b Model Loading**: Downloads and initializes the ESM-1b model
+3. **Batch Processing**: Generates embeddings with configurable token batch sizes
+4. **Output Management**: Saves embeddings as `.pt` files in structured directories
+
+### Runtime Embedding Generation
+
+Alternatively, embeddings can be generated during inference without precomputation:
+
+```bash
+python run_pretrained_openfold.py \
+    fasta_dir \
+    data/pdb_mmcif/mmcif_files/ \
+    --config_preset "seq_model_esm1b_ptm" \
+    --openfold_checkpoint_path openfold/resources/openfold_soloseq_params/seq_model_esm1b_ptm.pt
+```
+
+The main inference script ([run_pretrained_openfold.py#L175-L250](run_pretrained_openfold.py#L175-L250)) automatically detects sequence mode based on configuration presets:
+
+```python
+if args.config_preset.startswith("seq"):
+    args.use_single_seq_mode = True
+```
+
+## Integration with Main Model
+
+The `AlphaFold` model ([model.py#L1-L100](openfold/model/model.py#L1-L100)) dynamically selects the appropriate embedder based on mode:
+
+```python
+if self.seqemb_mode:
+    # Use PreembeddingEmbedder for single sequence mode
+    self.input_embedder = PreembeddingEmbedder(
+        **self.config["preembedding_embedder"],
+    )
+else:
+    # Use traditional InputEmbedder for MSA mode
+    self.input_embedder = InputEmbedder(
+        **self.config["input_embedder"],
+    )
+```
+
+## Performance Characteristics
+
+### Memory and Computational Efficiency
+
+| Feature | Traditional MSA Mode | Single Sequence Mode |
+|---------|---------------------|---------------------|
+| **Database Requirements** | Large (UniRef90, MGnify, etc.) | None (except optional templates) |
+| **Preprocessing Time** | Hours to days | Minutes to hours |
+| **GPU Memory Usage** | High (MSA tensors) | Moderate (single embeddings) |
+| **Inference Speed** | Slower (MSA processing) | Faster (direct embedding use) |
+
+### Sequence Limitations
+
+> [!TIP]
+> The ESM-1b model imposes a maximum sequence length of 1022 residues. Sequences exceeding this limit are automatically truncated, making the approach unsuitable for very large proteins without segmentation strategies.
+
+## Usage Patterns
+
+### Template Integration
+
+Single sequence mode supports template information integration through `.hhr` files placed in the embedding output directories. This enables hybrid approaches combining language model embeddings with structural templates:
+
+```mermaid
+graph LR
+    A[FASTA Files] --> B[Embedding Generation]
+    C[HHR Files] --> D[Template Processing]
+    B --> E[Combined Feature Input]
+    D --> E
+    E --> F[Structure Prediction]
+```
+
+### Configuration Presets
+
+OpenFold provides specialized presets for single sequence mode:
+
+- `seq_model_esm1b_ptm`: Uses ESM-1b embeddings with pTM head for confidence estimation
+- `seq_model_esm1b`: Basic ESM-1b model without pTM confidence scores
+
+## Next Steps
+
+For comprehensive understanding of the embedding ecosystem, explore [Feature Extraction and Processing](12-feature-extraction-and-processing). To understand how single sequence mode compares with traditional approaches, see [Multiple Sequence Alignment (MSA) Handling](13-multiple-sequence-alignment-msa-handling). For practical implementation details, refer to [Running Inference with Pretrained Models](5-running-inference-with-pretrained-models).

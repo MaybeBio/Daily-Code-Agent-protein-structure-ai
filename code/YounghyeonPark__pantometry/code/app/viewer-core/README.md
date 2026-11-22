@@ -1,0 +1,167 @@
+# A native viewer for a pantometry run
+
+```sh
+cd app
+cargo run --release -- ../../out.json                       # a window
+cargo run --release -- ../../out.json --snapshot out.ppm             # one frame, no window
+cargo run --release -- ../../out.json --snapshot out.ppm --frame 30  # a frame worth looking at
+cargo run --release -- ../../out.json --snapshot out.ppm --frame-panel bar   # one panel framed
+```
+
+Drag to rotate, scroll to zoom, space to play, left and right to scrub, **F** to frame each panel
+in turn and then the whole run again. `--frame-panel NAME` opens framed on one panel, in the
+window or in a snapshot, and refuses a name the run does not have with the names it does.
+
+## Framing one panel, because zoom cannot
+
+The window frames every panel at once, which is the right default and was the only choice. Scene
+14 holds a 20 mm bar, a 4.4 m room and orbits spanning 2.7e11 m, and framed whole the bar is
+`7.5e-14` of the framing: its 61 samples reached the GPU at **one** `f32` position, so it was a
+single `+`. Zoom cannot help — `Camera::zoom` clamps the distance to 1.2..9, and no focal length
+spreads one point into two.
+
+Framing a panel makes its box the framing: every panel is still projected through that one
+framing, so nothing moves relative to anything else, the scale bar is read off the camera fitted
+to the framed box — `Camera::across_per_metre`, two points at its centre square to the view — and
+the colour bar goes to the framed panel. What is far away leaves the screen. This shell projects on the
+CPU and hands the pass screen positions, so nothing clipped it — one of scene 14's planets is behind
+the eye when the bar is framed, and `Camera::project` clamps such a point to the near plane, which
+put it at `(-2.8e14, -8.8e14)`. A primitive with a corner outside the near or far plane is dropped,
+by `Camera::sees`, rather than cut at it the way a GPU would; framed on the bar, the room's cells
+that reach past the far plane go whole.
+
+Measured with `--snapshot` on scene 14: **13 318** lit pixels framed whole, **400 616** framed on
+the bar — most of them the room the bar lies along the edge of, which is not far from it but
+touching it. A whole-run snapshot is byte-identical to what it was before this existed, on the
+three committed fixtures and on scene 14, so the figures `docs/README.md` refreshes are still true.
+
+The input is what any run writes: `pantometry-world <scene> out.json`, or anything that calls
+`pantometry_view::to_json`. Two of the shipped scenes and the `optical_bench` example are committed
+under `viewer-core/tests/runs/` as fixtures, trimmed to a couple of frames each.
+
+## Why it is above the library
+
+The measured argument for that boundary — and for there being one of it rather than four — is in
+[app/README.md](https://github.com/YounghyeonPark/pantometry/blob/HEAD/app/README.md). This crate is the small end of it: two serde crates, no GPU, no
+window.
+
+## Why it does not depend on `pantometry`
+
+Deliberately, and it is the load-bearing decision here. If a viewer can be written against the
+**file** and nothing else, the wire format is complete. If it had needed to link the library for
+something the file did not carry, the format would have been the thing to fix — and finding that
+out is worth more than the convenience.
+
+**A test holds this now.** It used to be a workspace boundary: this was its own cargo workspace and
+reaching into `crates/` meant adding a path dependency somebody would notice. In one workspace
+`pantometry = { workspace = true }` is one line away in any manifest, and `editor-core` — which
+links the library deliberately — sits beside this one sharing the same dependency table. A property
+that was structural is a discipline, and `the_wire_format_is_enough` is what checks it.
+
+It reads all four panel shapes a run can contain, and an unknown `kind` is an **error** rather
+than a panel quietly skipped. A viewer written against an older library than the run should say
+so, not open a window with something missing.
+
+## The format grew a key, and this crate refused every file
+
+`deny_unknown_fields` is deliberate here — a reader that silently drops what it does not recognise
+is how a renamed field once went unnoticed in this workspace — and the price came due the day
+`pantometry-view` started writing `extent_m` on a field. Every run the library produced stopped
+parsing, with the message naming the key, and the library's own gate could not see it:
+this is a separate workspace with a separate job, and nothing in `crates/` reads the format back.
+
+`extent_m` is `Option` with a `serde` default, so a reader built today opens a file written before
+today. The fixtures in `tests/runs/` are deliberately **not** regenerated: they are what an older
+library wrote, and they are the only thing that can prove the old direction still works.
+
+It is worth what it costs. Before this, a field carried a grid and not the extent it was sampled
+over, so `Panel::bounds` returned **the grid in cell units** — a 9×9×9 block framed as a nine-metre
+cube, at the origin however far from it the part really was, and a slab asked for at more slices
+drawn taller for it. That was recorded in a doc comment rather than fixed, because the number
+genuinely was not in the file.
+
+## Where the arithmetic lives
+
+`viewer-core` has no GPU dependency and holds everything that could be got wrong the same way
+twice:
+
+- **one colour scale across the whole run** — a frame normalised to itself makes a decay look like
+  a steady state;
+- **one framing across the whole run** — otherwise a moving body looks still and the camera moves;
+- **the projection**, including the clamp that stops a point behind the eye becoming a streak
+  across the window;
+- **the fit** — the focal length that puts the run's bounding box in the frame.
+
+## Two things this file already claimed and the renderer did not do
+
+Both found by pointing it at a run shaped unlike the fixtures — `portafilter_flow`, which is tall,
+thin, and spans two orders of magnitude in value from the shower screen to the spout.
+
+**The colour scale was per frame.** `Run::scale_of` computes the range over the whole run, was
+tested, and **nothing called it**: `segments` measured the values it had in hand. So water leaving
+a screen clean and arriving at a spout at 83 kg/m³ rendered mid-ramp the whole way down, because
+at every instant it sat halfway between that instant's lightest and darkest — the exact failure
+the bullet above says this crate exists to prevent. `segments` takes the span now, and
+`the_shading_uses_the_runs_scale_and_not_the_frames` checks the *consumption* rather than the
+accessor.
+
+**The camera was set up for a cube.** `Framing` normalises by the longest side, so a tall thin run
+fills one axis and a fraction of the others; at a fixed distance the portafilter came out at 15% of
+the frame height and **0.29% of its pixels**. Backing in does not fix it — at this field of view a
+unit subject fills the frame at a distance of 0.35, which is inside its own bounding box. Distance
+is the wrong knob; it sets how strong the perspective is, and that was never the problem.
+
+`Camera::fit` sets the **focal length**, and the projection is linear in it, so one pass is exact
+and there is no convergence test to get wrong. The same portafilter now covers 2.5%, and a cube, a
+plate and a portafilter all land their furthest corner at 0.850 of the half-frame.
+
+Seven tests, against the real fixtures. `viewer` is then a surface, a line pipeline and an event
+loop, and draws only what it is handed.
+
+## `--snapshot`, and what it is for
+
+A window nobody can photograph proves the program did not panic, which is a much weaker claim than
+it looks: a wrong projection, an empty vertex buffer and a silently-failed pipeline all fail to
+panic too.
+
+`--snapshot` renders one frame to a texture with no window, reads it back and writes a PPM, using
+the **same** camera, the same `viewer-core` segments and the same pipeline the window uses. On the
+optical bench it reports
+
+```text
+75643 of 792000 pixels carry a line (9.55%), in 101 shades
+```
+
+**This said `1046 ... in 3 shades`, and "three shades is the check worth having — one per field
+angle".** That was a true reading of a renderer that drew every line in the flat colour of its
+value, and it has not been that renderer for some time: a line is shaded by depth now, so a field
+angle is a family of shades rather than one. The committed fixture in `tests/runs/` has not changed
+since it was trimmed and reports 77506 in 100 shades when run today, so the drift is the renderer
+rather than the run. Nothing asserted either number, so nothing said it had moved.
+
+What survives is the weaker claim the count can still make: a snapshot in **one** shade is a
+value-to-colour mapping that has collapsed, and a snapshot in none is an empty vertex buffer. The
+number above is one machine's adapter; the shape of the check is what to keep.
+
+The lit count is measured against **the corner pixel**, not a constant. The target is sRGB, so the
+clear colour is stored far brighter than the linear number the pass was given — 56,66,77 rather
+than 10,14,19 — and a fixed threshold called every pixel in the image a line and reported 100%.
+
+## What is not here
+
+**This said "only paths are drawn", and it was true twice over and then not at all.** The first
+version drew `Paths` and refused everything else — and `PanelData::paths` is built by no `Domain`,
+so the refusal was the only thing the shell ever said about a shipped scene. Then every panel
+became line segments, a body and a field sample each a small cross, which drew all thirty and read
+as a cloud of `+` glyphs: measured on a four-material power module, 5 045 lit pixels in **eight
+shades**, with nothing in it to say where the die was.
+
+A field is a solid now, meshed by `pantometry_view::mesh` — the same geometry the glTF and USD
+exporters write and the editor's viewport shades — and depth-tested. The same module renders 152 160
+pixels in 17 shades, and the layers are visible. Point sets are still crosses, which is what a set
+of bodies is.
+
+No RTX, no materials, no shadows, no editing, no USD. Those are a different product, and the
+recommendation on record is to **export into** the tools that already do them rather than rebuild
+them — `pantometry-scene`'s frames are a few hundred lines away from glTF, which reaches Blender,
+three.js and every USD viewer.

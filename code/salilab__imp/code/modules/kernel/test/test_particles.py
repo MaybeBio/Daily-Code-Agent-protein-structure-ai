@@ -1,0 +1,335 @@
+import IMP
+import IMP.test
+import pickle
+
+
+xkey = IMP.FloatKey("x")
+ykey = IMP.FloatKey("y")
+zkey = IMP.FloatKey("z")
+idkey = IMP.IntKey("id")
+radkey = IMP.FloatKey("radius")
+
+
+class Tests(IMP.test.TestCase):
+
+    """Test particles"""
+
+    def setup(self):
+        """Build a set of test particles"""
+        IMP.test.TestCase.setUp(self)
+
+        model = IMP.Model("particles model")
+        particles = []
+
+        # create particles 0 - 11
+        for i in range(0, 12):
+            particles.append(self.create_point_particle(model,
+                                                        i * 2, i * 3, i * 4))
+            p1 = particles[i]
+            p1.add_attribute(radkey, 1.5 * i, False)
+            p1.add_attribute(idkey, i)
+            p1.add_attribute(IMP.IntKey("six"), 6)
+            p1.add_attribute(IMP.SparseIntKey("seven"), 7)
+            p1.add_attribute(IMP.SparseFloatKey("seven"), 7.1)
+            p1.add_attribute(IMP.StringKey("id_str"), "name_" + str(i))
+            p1.add_attribute(IMP.StringKey("six"), "b:0110")
+            p1.add_attribute(IMP.SparseStringKey("seven"), "b:0111")
+
+        # add additional attributes to particle 11
+        for i in range(0, 6):
+            p1.add_attribute(IMP.FloatKey("attr_" + str(i)), 3.5 * i, False)
+        # clear derivatives
+        print(model.get_ref_count())
+        r = IMP._ConstRestraint(model, particles, 1)
+        r.evaluate(True)
+        print(model.get_ref_count())
+        return (model, particles)
+
+    def test_no_model(self):
+        """Check that operations fail on particles once the model is gone"""
+        refcnt = IMP.test.RefCountChecker(self)
+        (model, particles) = self.setup()
+        p1 = particles[0]
+        self.assertEqual(p1.get_is_active(), True)
+        IMP.set_log_level(IMP.MEMORY)
+        del model
+        # Particles left over after a model is deleted should act as if
+        # they are inactive
+        refcnt.assert_number(12)
+        self.assertEqual(p1.get_is_active(), False)
+        # this should be a usageexception as it is expensive
+        #self.assertRaises(ValueError, p1.add_attribute, IMP.IntKey("Test"), 0)
+        #self.assertRaises(ValueError, p1.get_value, xkey)
+        #self.assertRaises(ValueError, p1.set_value, xkey, 0.0)
+
+    def test_equality(self):
+        """Check particle identity"""
+        (model, particles) = self.setup()
+        p0 = particles[0]
+        p1 = particles[1]
+        self.assertTrue(p0 != p1)
+        self.assertTrue(p0 == p0)
+        self.assertTrue(not p0 != p0)
+        # Different SWIG proxies for the same underlying Particle should
+        # report equality:
+        [m_p0, m_p1] = IMP.get_particles(model,model.get_particle_indexes()[:2])
+        self.assertTrue(m_p0 == p0)
+        self.assertTrue(not m_p0 != p0)
+        # Even particles with equal attributes should not count as equal:
+        p0 = self.create_point_particle(model, 0, 0, 0)
+        p1 = self.create_point_particle(model, 0, 0, 0)
+        self.assertTrue(p0 != p1)
+
+    def test_hashing(self):
+        """Check that particles and decorators hash in python"""
+        (model, particles) = self.setup()
+        p0 = particles[0]
+        p1 = particles[1]
+        d = {}
+        d[p0] = 1
+        d[p1] = 2
+        print(p0.__hash__())
+        td = IMP._TrivialDecorator.setup_particle(p0)
+        print(td.__hash__())
+        print(td.get_particle().__hash__())
+        d[td] = 3
+        self.assertEqual(d[p0], 3)
+
+    def test_get_set_methods(self):
+        """Test particle get_ and set_ methods"""
+        (model, particles) = self.setup()
+        for (i, p) in enumerate(particles):
+            #self.assertEqual(p.get_index(), IMP.ParticleIndex(i))
+            model = p.get_model()
+        p = particles[0]
+        self.assertEqual(p.get_is_active(), True)
+        model.remove_particle(p.get_index())
+        self.assertEqual(p.get_is_active(), False)
+
+    def _test_add_remove(self, p, ak, v):
+        p.add_attribute(ak, v)
+        self.assertTrue(p.has_attribute(ak))
+        p.remove_attribute(ak)
+        self.assertFalse(p.has_attribute(ak))
+
+    def test_remove_attributes(self):
+        """Test that attributes can be removed"""
+        (model, particles) = self.setup()
+        p = particles[0]
+        fk = IMP.FloatKey("to_remove")
+        p.add_attribute(fk, 0, False)
+        self.assertTrue(p.has_attribute(fk))
+        self.assertFalse(p.get_is_optimized(fk))
+        p.set_is_optimized(fk, True)
+        self.assertTrue(p.get_is_optimized(fk))
+        p.set_is_optimized(fk, False)
+        self.assertFalse(p.get_is_optimized(fk))
+        self._test_add_remove(p, IMP.FloatKey("something"), 1.0)
+        self._test_add_remove(p, IMP.SparseFloatKey("something"), 1.0)
+        self._test_add_remove(p, IMP.StringKey("something"), "Hello")
+        self._test_add_remove(p, IMP.SparseStringKey("something"), "Hello")
+        self._test_add_remove(p, IMP.IntKey("something"), 1)
+        self._test_add_remove(p, IMP.SparseIntKey("something"), 1)
+        self._test_add_remove(p, IMP.ParticleIndexKey("something"), p)
+        self._test_add_remove(p, IMP.SparseParticleIndexKey("something"), p)
+        self._test_add_remove(p, IMP.IntsKey("something"), [1,2,3])
+        self._test_add_remove(p, IMP.FloatsKey("something"), [1.0,2.0,3.0])
+
+    def test_remove_particles_age(self):
+        """Check that removing particles updates the age counter"""
+        m = IMP.Model()
+        # No particles removed yet, so age==0
+        self.assertEqual(m.get_age(), 1)
+        self.assertEqual(m.get_removed_particles_attributes_age(), 0)
+        # Adding particles should not update age
+        p1 = IMP.Particle(m)
+        m.update()
+        self.assertEqual(m.get_age(), 2)
+        self.assertEqual(m.get_removed_particles_attributes_age(), 0)
+        # Remove particles should update age
+        m.remove_particle(p1)
+        m.update()
+        self.assertEqual(m.get_age(), 3)
+        self.assertEqual(m.get_removed_particles_attributes_age(), 2)
+
+    def test_remove_attributes_age(self):
+        """Check that removing attributes updates the age counter"""
+        m = IMP.Model()
+        # No attributes removed yet, so age==0
+        self.assertEqual(m.get_age(), 1)
+        self.assertEqual(m.get_removed_particles_attributes_age(), 0)
+        # Adding particles or attributes should not update age
+        p1 = IMP.Particle(m)
+        p1.add_attribute(IMP.FloatKey("something"), 1.0)
+        m.update()
+        self.assertEqual(m.get_age(), 2)
+        self.assertEqual(m.get_removed_particles_attributes_age(), 0)
+        # Removing float attributes should update age
+        p2 = IMP.Particle(m)
+        self._test_add_remove(p2, IMP.FloatKey("something"), 1.0)
+        m.update()
+        self.assertEqual(m.get_age(), 3)
+        self.assertEqual(m.get_removed_particles_attributes_age(), 2)
+        # Removing int attributes should update age
+        p3 = IMP.Particle(m)
+        self._test_add_remove(p3, IMP.IntKey("something"), 1)
+        m.update()
+        self.assertEqual(m.get_age(), 4)
+        self.assertEqual(m.get_removed_particles_attributes_age(), 3)
+
+    def test_float_derivatives(self):
+        """Test get/set of Float derivatives"""
+        (model, particles) = self.setup()
+        p = particles[0]
+        self.assertTrue(p.get_is_optimized(xkey))
+        p.set_is_optimized(xkey, False)
+        self.assertFalse(p.get_is_optimized(xkey))
+        self.assertEqual(p.get_derivative(xkey), 0.0)
+        da = IMP.DerivativeAccumulator()
+        p.add_to_derivative(xkey, 10.0, da)
+        self.assertEqual(p.get_derivative(xkey), 10.0)
+        da = IMP.DerivativeAccumulator(2.0)
+        p.add_to_derivative(xkey, 10.0, da)
+        self.assertEqual(p.get_derivative(xkey), 30.0)
+        model.add_to_derivative(xkey, p.get_index(), 10.0, da)
+        self.assertEqual(p.get_derivative(xkey), 50.0)
+
+    def test_vector3d_derivatives(self):
+        """Test get/set of Vector3D derivatives"""
+        k = IMP.Vector3DDerivKey("test_3d_derivs")
+        m = IMP.Model()
+        p = IMP.Particle(m)
+        m.add_attribute(k, p, IMP.Vector3D(1,2,3))
+        self.assertFalse(p.get_is_optimized(k))
+        p.set_is_optimized(k, True)
+        self.assertTrue(p.get_is_optimized(k))
+        deriv = p.get_derivative(k)
+        self.assertAlmostEqual(deriv[0], 0.0, delta=1e-5)
+        self.assertAlmostEqual(deriv[1], 0.0, delta=1e-5)
+        self.assertAlmostEqual(deriv[2], 0.0, delta=1e-5)
+        da = IMP.DerivativeAccumulator()
+        p.add_to_derivative(k, IMP.Vector3D(10.0, 15.0, 20.0), da)
+        deriv = p.get_derivative(k)
+        self.assertAlmostEqual(deriv[0], 10.0, delta=1e-5)
+        self.assertAlmostEqual(deriv[1], 15.0, delta=1e-5)
+        self.assertAlmostEqual(deriv[2], 20.0, delta=1e-5)
+
+    def test_vector4d_derivatives(self):
+        """Test get/set of Vector4D derivatives"""
+        k = IMP.Vector4DDerivKey("test_4d_derivs")
+        m = IMP.Model()
+        p = IMP.Particle(m)
+        m.add_attribute(k, p, IMP.Vector4D(1,2,3,4))
+        self.assertFalse(p.get_is_optimized(k))
+        p.set_is_optimized(k, True)
+        self.assertTrue(p.get_is_optimized(k))
+        deriv = p.get_derivative(k)
+        self.assertAlmostEqual(deriv[0], 0.0, delta=1e-5)
+        self.assertAlmostEqual(deriv[1], 0.0, delta=1e-5)
+        self.assertAlmostEqual(deriv[2], 0.0, delta=1e-5)
+        self.assertAlmostEqual(deriv[3], 0.0, delta=1e-5)
+        da = IMP.DerivativeAccumulator()
+        p.add_to_derivative(k, IMP.Vector4D(10.0, 15.0, 20.0, 40.0), da)
+        deriv = p.get_derivative(k)
+        self.assertAlmostEqual(deriv[0], 10.0, delta=1e-5)
+        self.assertAlmostEqual(deriv[1], 15.0, delta=1e-5)
+        self.assertAlmostEqual(deriv[2], 20.0, delta=1e-5)
+        self.assertAlmostEqual(deriv[3], 40.0, delta=1e-5)
+
+    def test_browsing(self):
+        """Test browsing of particle attributes"""
+        (model, particles) = self.setup()
+        p = particles[0]
+        ict = 0
+        fct = 0
+        sct = 0
+        for s in p.get_string_keys():
+            sct += 1
+        for s in p.get_float_keys():
+            fct += 1
+        for s in p.get_int_keys():
+            ict += 1
+        self.assertEqual(ict, 2)
+        self.assertEqual(fct, 4)
+        self.assertEqual(sct, 2)
+
+    def test_particles(self):
+        """Test that particle attributes are available and correct"""
+        (model, particles) = self.setup()
+        for (i, p) in enumerate(particles):
+            self.assertTrue(p.has_attribute(xkey))
+            # A Float "x" exists; make sure that has_attribute doesn't get
+            # confused between different types of attribute:
+            self.assertFalse(p.has_attribute(IMP.IntKey("x")))
+            self.assertFalse(p.has_attribute(IMP.IntKey("notexist")))
+            self.assertEqual(p.get_value(xkey), i * 2)
+            self.assertEqual(p.get_value(ykey), i * 3)
+            self.assertEqual(p.get_value(zkey), i * 4)
+            self.assertEqual(p.get_value(idkey), i)
+            self.assertEqual(p.get_value(IMP.StringKey("id_str")),
+                             "name_" + str(i))
+            self.assertEqual(p.get_value(IMP.IntKey("six")), 6)
+            self.assertEqual(p.get_value(IMP.SparseIntKey("seven")), 7)
+            self.assertAlmostEqual(p.get_value(IMP.SparseFloatKey("seven")),
+                                   7.1, delta=0.1)
+            self.assertEqual(p.get_value(IMP.StringKey("six")), "b:0110")
+            self.assertEqual(p.get_value(IMP.SparseStringKey("seven")),
+                             "b:0111")
+
+        # test additional attributes in particle 11
+        p = particles[11]
+        for i in range(0, 6):
+            val = p.get_value(IMP.FloatKey("attr_" + str(i)))
+            self.assertEqual(val, 3.5 * i)
+
+    def test_comparisons(self):
+        """Test comparisons of particles and decorators"""
+        (model, particles) = self.setup()
+        p0a = particles[0]
+        p0b = model.get_particle(model.get_particle_indexes()[0])
+        self.assertEqual(p0a, p0b)
+        td0a = IMP._TrivialDecorator.setup_particle(p0a)
+        td0b = IMP._TrivialDecorator(p0b)
+        self.assertEqual(td0a, td0b)
+        self.assertEqual(td0a, p0a)
+
+    def test_many_particle(self):
+        """Test that we can allocate many particles"""
+        m = IMP.Model("many particles")
+        num = 20000
+        for i in range(0, num):
+            p = IMP.Particle(m)
+            if i % 10000 == 0:
+                print(i)
+        print("removing")
+        for i in range(0, num):
+            if i % 1000 == 0:
+                m.remove_particle(m.get_particle_indexes()[i])
+            if i % 10000 == 0:
+                print(i)
+
+    def test_pickle(self):
+        """Test that Particle can be (un-)pickled"""
+        m = IMP.Model()
+        p = IMP.Particle(m)
+        p.set_name("foo")
+        dump = pickle.dumps(p)
+        newp = pickle.loads(dump)
+        self.assertEqual(newp.get_name(), "foo")
+        self.assertEqual(newp.get_index(), p.get_index())
+
+    def test_decorator_pickle(self):
+        """Test that Decorators can be (un-)pickled"""
+        m = IMP.Model()
+        p = IMP.Particle(m)
+        p.set_name("foo")
+        td = IMP._TrivialDecorator.setup_particle(p)
+        dump = pickle.dumps(td)
+        newtd = pickle.loads(dump)
+        newp = newtd.get_particle()
+        self.assertEqual(newp.get_name(), "foo")
+        self.assertEqual(newp.get_index(), p.get_index())
+
+
+if __name__ == '__main__':
+    IMP.test.main()

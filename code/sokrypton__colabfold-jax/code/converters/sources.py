@@ -1,0 +1,128 @@
+"""Where each model's ORIGINAL (unconverted) checkpoint comes from.
+
+This table is converter-side only. Nothing under `src/alphafold3` reads it: the
+runtime never downloads a PyTorch checkpoint and never imports torch. Conversion
+is an offline step whose product -- a single `<model>.bin.zst` of haiku params --
+is what the runtime loads (see `alphafold3.model.model_registry`).
+
+`files` rather than `url`/`file` means the model is published as several archives
+(chai-1's five TorchScript modules plus a distogram head), so the converter is
+handed the directory and finds its own pieces. `repo` means a Hugging Face repo
+to snapshot whole -- the ESMFold2 family needs its config.json as well as its
+weights, because the registry row is asserted against it at conversion.
+"""
+
+from __future__ import annotations
+
+SOURCES = {
+    # ESMFold2 and its releases (Arc Institute / CZ Biohub). Hugging Face repos
+    # rather than a single archive: each ships model.safetensors + config.json,
+    # and the converter is handed the DIRECTORY so it can read both -- the
+    # config is what check_release_config asserts the registry row against.
+    #
+    # All six share the ESM-C 6B tower below. They do NOT share the LM shim:
+    # each trains its own `language_model.*`, which convert_esmfold2_weights
+    # writes beside the blob as <model>.lm.npz.
+    'esmfold2': dict(repo='biohub/ESMFold2'),
+    'esmfold2_fast': dict(repo='biohub/ESMFold2-Fast'),
+    # The 600M/300M-ESM-C tier; pairs with the esmc_600m / esmc_300m towers
+    # below. SYNTHYRA's repos, not biohub's, since 2026-09-25: they carry the
+    # same folding weights plus a trained confidence head. Verified rather than
+    # assumed -- all 820 tensors of biohub's step1500k checkpoint are
+    # BIT-IDENTICAL in Synthyra/ESMFold2-600, which adds exactly 93
+    # confidence_head tensors and changes nothing else. So the structure gates
+    # taken against the old repo still hold, and only the head is new.
+    'esmfold2_lm600m': dict(repo='Synthyra/ESMFold2-600'),
+    'esmfold2_lm300m': dict(repo='Synthyra/ESMFold2-300'),
+    # The protein language model ESMFold2 conditions on. NOT an AF3 model -- a
+    # separate graph with its own loader (alphafold3/model/esm.py). float32 is
+    # 25.4 GB and cannot even be WRITTEN as a blob (a record header packs its
+    # length as a signed 32-bit int), so it is converted at int8.
+    'esmc': dict(repo='biohub/ESMC-6B'),
+    # the smaller towers, for the base300M/base600M folding variants
+    'esmc_300m': dict(repo='biohub/ESMC-300M-1500000'),
+    'esmc_600m': dict(repo='biohub/ESMC-600M-1500000'),
+    # chai-1's ESM2 3B. No URL: chai ships it as a traced TorchScript archive
+    # fetched by chai-lab's own downloader, so pass it with --checkpoint
+    # (~/chai1_weights/esm/traced_sdpa_esm2_t36_3B_UR50D_fp16.pt). The archive
+    # is not opaque -- state_dict() gives the ordinary ESM2 names.
+    'esm2': dict(local='chai1_weights/esm/traced_sdpa_esm2_t36_3B_UR50D_fp16.pt'),
+    # OpenFold3 (AlQuraishi Lab). Public, no sign-request needed.
+    'openfold3': dict(
+        url='https://openfold.s3.amazonaws.com/staging/of3-p2-155k.pt',
+        file='of3-p2-155k.pt'),
+    # OpenBind, OpenFold3 v0.5.0. A different bucket from preview-2 -- the one
+    # their own setup_openfold.py uses (S3_BUCKET = "openfold3-data").
+    # Upstream deprecates preview-2 as of this release.
+    'openbind0': dict(
+        url='https://openfold3-data.s3.amazonaws.com/openfold3-parameters/'
+            'of3-ob-2025-06-30-174k.pt',
+        file='of3-ob-2025-06-30-174k.pt'),
+    # Protenix-v1, the 368 M release that preceded v2.
+    'protenix1': dict(
+        url='https://protenix.tos-cn-beijing.volces.com/checkpoint/'
+            'protenix_base_default_v1.0.0.pt',
+        file='protenix_base_default_v1.0.0.pt'),
+    # IntelliFold-v2 (IntelligenAI). Stock-AF3 module tree at widened channels.
+    'intellifold2': dict(
+        url='https://huggingface.co/intelligenAI/intellifold/resolve/main/intellifold_v2.pt',
+        file='intellifold_v2.pt'),
+    # OpenDDE (Aureka Research). Upstream publishes no version number, hence the
+    # bare name. Pinned to the commit we converted.
+    'opendde': dict(
+        url='https://huggingface.co/aurekaresearch/OpenDDE/resolve/'
+            'eddd563ce96571f784012edd8f045181c8f8627d/opendde.pt',
+        file='opendde.pt'),
+    # BioEmu2 (Microsoft Research, MIT): the bioemu2-preview release. Its
+    # config.yaml lives beside it; the converter needs only the EMA weights.
+    'bioemu2': dict(
+        url='https://huggingface.co/microsoft/bioemu2/resolve/main/checkpoints/'
+            'bioemu2-preview/checkpoint.ckpt',
+        file='checkpoint.ckpt'),
+    # HelixFold3 (Baidu PaddleHelix): the 2025-07-14 parameters, a zip holding
+    # one .pdparams (non-commercial terms -- see its LICENSE beside it).
+    'helixfold3': dict(
+        url='https://paddlehelix.bd.bcebos.com/HelixFold3/params/HelixFold3-params-20250714.zip',
+        file='HelixFold3-params-20250714.zip'),
+    # Boltz-2 (jwohlwend/boltz, MIT).
+    'boltz2': dict(
+        url='https://huggingface.co/boltz-community/boltz-2/resolve/main/boltz2_conf.ckpt',
+        file='boltz2_conf.ckpt'),
+    # Protenix-v2 (ByteDance, Apache-2.0). The official CDN 403s; this is the
+    # community HF mirror (SHA256 verified against the CDN copy when it was
+    # still reachable).
+    'protenix2': dict(
+        url='https://huggingface.co/TMF001/protenix-v2-weights/resolve/main/protenix-v2.pt',
+        file='protenix-v2.pt'),
+    # Mol-1 (Molence Bio, Apache-2.0): its release bucket, the URL `mol pred` itself downloads
+    # (mol/data/sources.py checkpoint_url).
+    'mol1': dict(
+        url='https://mol-1-release.oss-cn-shanghai.aliyuncs.com/checkpoint/mol-1-base.pt',
+        file='mol-1-base.pt'),
+    # RoseTTAFold3 (RosettaCommons foundry). We use the EMA shadow weights.
+    'rosettafold3': dict(
+        url='https://files.ipd.uw.edu/pub/rf3/rf3_foundry_01_24_latest_remapped.ckpt',
+        file='rf3_foundry_01_24_latest_remapped.ckpt'),
+    # chai-1 (chaidiscovery, Apache-2.0). Five frozen TorchScript archives.
+    # distogram_head.pt is NOT part of stock chai -- upstream has no distogram
+    # head at all (its trunk returns only (single, pair)) -- it comes from
+    # sokrypton/chai-lab@dgram, trained on the trunk pair representation.
+    # The "depencencies" in the asset URLs is chai's own typo; the correctly
+    # spelled path 404s.
+    'chai1': dict(files=[
+        ('https://chaiassets.com/chai1-inference-depencencies/models_v2/feature_embedding.pt',
+         'models_v2/feature_embedding.pt'),
+        ('https://chaiassets.com/chai1-inference-depencencies/models_v2/token_embedder.pt',
+         'models_v2/token_embedder.pt'),
+        ('https://chaiassets.com/chai1-inference-depencencies/models_v2/trunk.pt',
+         'models_v2/trunk.pt'),
+        ('https://chaiassets.com/chai1-inference-depencencies/models_v2/diffusion_module.pt',
+         'models_v2/diffusion_module.pt'),
+        ('https://chaiassets.com/chai1-inference-depencencies/models_v2/confidence_head.pt',
+         'models_v2/confidence_head.pt'),
+        ('https://raw.githubusercontent.com/sokrypton/chai-lab/dgram/chai_lab/model/distogram_head.pt',
+         'models_v2/distogram_head.pt'),
+    ]),
+    # AlphaFold3 itself is not converted: DeepMind's release is already a haiku
+    # blob, and its terms require you to request it rather than fetch a URL.
+}

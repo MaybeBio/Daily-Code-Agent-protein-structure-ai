@@ -1,0 +1,55 @@
+//! GlycoFlow-guided fitting of a glycan of known sequence to a protein site in a density map.
+//!
+//! Rust port of the validated Python reference `glycoflow/fitting/` (GlycoFlow repository),
+//! running the frozen GlycoFlow flow model through the `glycoflow-core` engine:
+//!
+//! * [`site`]: anchor atoms, deposited glycan tree (naming and evaluation only), GLYCAM sequence
+//!   (crabWURCS `write_glycam`), environment with crystal symmetry mates ([`symmetry`]);
+//! * [`observation`]: the [`observation::Observation`] trait (prepare / evaluate with `dE/dx`)
+//!   and its density implementation on `reglyco_density::site_likelihood`;
+//! * [`problem`]: GlycoFlow templates, attachment kinematics and the single objective
+//!   `-loglik + w_env E_env + w_self E_self + E_attach + w_prior E_prior` with analytic
+//!   gradients; [`prior`]: the GlycoFlow marginal prior;
+//! * [`search`]: observation-guided generation through the sampler's guidance hook, attachment
+//!   grid search, Adam refinement, distinct basins; [`support`]: subtree support and prior
+//!   completion (pinned-torsion inpainting); [`pipeline`]: `fit_site`;
+//! * [`output`], [`evaluation`], [`workflow`]: structures, reports, validation;
+//! * [`observer`]: watching a fit as it runs; [`deposition`]: chemistry checks of a deposit;
+//! * [`ensemble`]: the extend mode, an ensemble of conformers past the density;
+//! * [`known`]: known atom positions (a deposit, an earlier fit) as starts of a fit.
+
+pub mod anchor;
+pub mod cartesian;
+pub mod counter;
+pub mod deposition;
+pub mod ensemble;
+pub mod error;
+pub mod evaluation;
+pub mod ideal;
+pub mod infer;
+pub mod known;
+pub mod maxent;
+pub mod model;
+pub mod observation;
+pub mod observer;
+pub mod output;
+pub mod pipeline;
+pub mod prior;
+pub mod problem;
+pub mod ring;
+pub mod search;
+pub mod sidechain;
+pub mod site;
+pub mod support;
+pub mod symmetry;
+pub mod workflow;
+
+pub use error::{FitError, Result};
+pub use glycoflow_core;
+pub use model::{ComputeDevice, GlycoflowModel};
+pub use observation::{DensityObservation, Observation, ObservationValue};
+pub use observer::{CartesianStep, FitObserver, GuidedStep, Observer};
+pub use pipeline::{FitConfig, FitOutcome, PriorCache, PriorConfig, fit_site};
+pub use problem::{Pose, ProblemOptions, RingSource, SiteProblem, Terms};
+pub use site::{Site, SiteOptions, SymmetryMode, load_site};
+pub use workflow::{SiteRequest, WorkflowInput, WorkflowOptions, WorkflowResult};

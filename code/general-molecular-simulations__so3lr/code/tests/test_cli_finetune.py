@@ -1,0 +1,339 @@
+import re
+import subprocess
+import pathlib
+
+import yaml
+import pytest
+
+from subprocess_env import so3lr_subprocess_env, _parse_final_table_loss
+
+
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
+DATAFILE = PROJECT_ROOT / 'tests' / 'test_data' / 'ac.xyz'
+DATAFILE_WATER = PROJECT_ROOT / 'tests' / 'test_data' / 'water_pbc_dummy.xyz'
+DEFAULT_CONFIG = PROJECT_ROOT / 'so3lr' / 'config' / 'finetune.yaml'
+
+
+@pytest.fixture
+def workdir(tmp_path):
+    """Provide a temporary working directory for fine-tuning."""
+    wd = tmp_path / 'finetune_test'
+    yield wd
+    # Cleanup happens automatically via tmp_path
+
+
+@pytest.fixture
+def test_config(tmp_path):
+    """Create a test config with few epochs and wandb disabled."""
+    with open(DEFAULT_CONFIG) as f:
+        cfg = yaml.safe_load(f)
+
+    cfg['training']['num_epochs'] = 2
+    cfg['training']['use_wandb'] = False
+    cfg['training']['eval_every_num_steps'] = 5
+    cfg['training']['batch_max_num_graphs'] = 4
+
+    config_path = tmp_path / 'test_finetune.yaml'
+    with open(config_path, 'w') as f:
+        yaml.dump(cfg, f)
+
+    return config_path
+
+
+@pytest.fixture
+def test_config_water(tmp_path):
+    """Create a test config for water with long-range cutoff."""
+    with open(DEFAULT_CONFIG) as f:
+        cfg = yaml.safe_load(f)
+
+    cfg['training']['num_epochs'] = 2
+    cfg['training']['use_wandb'] = False
+    cfg['training']['eval_every_num_steps'] = 5
+    cfg['training']['batch_max_num_graphs'] = 4
+    cfg['data']['neighbors_lr_cutoff'] = 12.0
+    # On periodic data the model must switch the long-range terms off where the
+    # pair list ends, as MD and eval at lr_cutoff=12 do.
+    cfg['model'] = {'cutoff_lr': 12.0}
+
+    config_path = tmp_path / 'test_finetune_water.yaml'
+    with open(config_path, 'w') as f:
+        yaml.dump(cfg, f)
+
+    return config_path
+
+
+def _parse_param_counts(result):
+    """Pull (total, trainable) out of the parameter summary the trainer prints.
+
+    Exit code and final loss alone cannot tell a real fine-tune from a run in
+    which every parameter was frozen: a no-op run completes normally and reports
+    the pretrained loss. These counts can.
+    """
+    text = result.stdout + result.stderr
+    total = re.search(r'Total number of parameters:\s*([\d,]+)', text)
+    trainable = re.search(r'Trainable parameters:\s*([\d,]+)', text)
+    if total is None or trainable is None:
+        return None, None
+    return int(total.group(1).replace(',', '')), int(trainable.group(1).replace(',', ''))
+
+
+def _assert_finetuning_succeeded(result, workdir, max_loss=0.1):
+    """Assert that fine-tuning completed and produced expected outputs."""
+    assert result.returncode == 0, (
+        f"so3lr finetune failed with return code {result.returncode}\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+    # Check that the workdir was created with expected outputs
+    assert workdir.exists(), "Workdir was not created"
+    assert (workdir / 'hyperparameters.json').exists(), "hyperparameters.json not created"
+    assert (workdir / 'fine_tuning.json').exists(), "fine_tuning.json not created"
+    assert (workdir / 'checkpoints').exists(), "checkpoints directory not created"
+    # so3lr show follows the run through the journal next to the default log
+    assert list(workdir.glob('finetuning.*.events.jsonl')), "no run journal"
+    # The shipped config's data.filter values only get a note in the log, and the
+    # parameter tree stays out of CLI output.
+    output = result.stdout + result.stderr
+    assert not [line for line in output.splitlines() if 'WARNING' in line and 'data.filter' in line]
+    assert 'kernel: (' not in output
+
+    # Parse the final eval loss from the printed metrics table. The trainer logs
+    # validation checkpoints as rows of a table (print_metrics_header/row):
+    #   "        epoch |          step |    forces_mae | ... |          loss | ..."
+    final_loss = _parse_final_table_loss(result)
+    assert final_loss is not None, (
+        f"No metrics table row found in output.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert 0 < final_loss < max_loss, (
+        f"Final loss={final_loss} is outside reasonable range (0, {max_loss}).\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
+# What every strategy selects, and how many parameters that trains, is checked against
+# every bundled model in test_finetuning_strategies.py, without a training run. This
+# run covers what only `so3lr finetune` shows: `last_layer` must name its block from
+# the *pretrained* model's num_layers, not the finetune config's (#15). `full`
+# (everything trainable) runs in test_cli_finetune_water_pbc (--full).
+@pytest.mark.parametrize('strategy', ['last_layer'])
+def test_cli_finetune(workdir, test_config, strategy):
+    """Run `so3lr finetune` on ac.xyz with 20 train / 5 valid and verify it completes."""
+    result = subprocess.run(
+        [
+            'so3lr', 'finetune',
+            '--datafile', str(DATAFILE),
+            '--workdir', str(workdir),
+            '--num-train', '20',
+            '--num-valid', '5',
+            '--config', str(test_config),
+            '--strategy', strategy,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=so3lr_subprocess_env(),
+    )
+
+    _assert_finetuning_succeeded(result, workdir, max_loss=0.1)
+
+    # Pin what the strategy actually selected. Asserting only on exit code and
+    # loss would pass even if `last_layer` resolved to a `layers_N` that does
+    # not exist: every parameter would be frozen, two epochs of zero updates
+    # would complete, and the pretrained loss would sit well under the bound.
+    total, trainable = _parse_param_counts(result)
+    assert total is not None, (
+        f"No parameter summary in output.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert 0 < trainable < total, (
+        f"strategy={strategy} trained {trainable}/{total} parameters"
+    )
+
+
+def test_cli_finetune_refuses_a_strategy_that_freezes_everything(workdir, test_config):
+    """The headline fail-loudly behavior: a whitelist strategy matching nothing
+    must raise before any data is loaded, not run a full training job of zero
+    updates and exit 0. The legacy `so3lr` checkpoint has no `observables_3`,
+    so `--strategy obs_3` selects nothing there."""
+    result = subprocess.run(
+        [
+            'so3lr', 'finetune',
+            '--datafile', str(DATAFILE),
+            '--workdir', str(workdir),
+            '--num-train', '20',
+            '--num-valid', '5',
+            '--config', str(test_config),
+            '--model', 'so3lr',
+            '--strategy', 'obs_3',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=so3lr_subprocess_env(),
+    )
+    assert result.returncode != 0, (
+        f"obs_3 on the legacy checkpoint must fail, not run a no-op training.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert 'would freeze every parameter' in (result.stdout + result.stderr)
+
+
+@pytest.mark.slow
+def test_cli_finetune_water_pbc(workdir, test_config_water):
+    """Run `so3lr finetune` on periodic water box with 13 train / 2 valid and verify it completes."""
+    result = subprocess.run(
+        [
+            'so3lr', 'finetune',
+            '--datafile', str(DATAFILE_WATER),
+            '--workdir', str(workdir),
+            '--num-train', '13',
+            '--num-valid', '2',
+            '--config', str(test_config_water),
+            '--strategy', 'full',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=240,
+        env=so3lr_subprocess_env(),
+    )
+
+    _assert_finetuning_succeeded(result, workdir, max_loss=0.2)
+
+    # `full` must train everything through the CLI wiring, not only in
+    # resolve_finetuning_strategy (test_finetuning_strategies.py).
+    total, trainable = _parse_param_counts(result)
+    assert total is not None and trainable == total, (
+        f"strategy=full trained {trainable}/{total} parameters"
+    )
+
+
+def test_cli_finetune_refuses_periodic_data_cut_short_of_cutoff_lr(workdir, test_config_water, tmp_path):
+    """Without model.cutoff_lr the pretrained 1000 A stays, and on a crystal the 12 A pair
+    list would cut the long-range terms off instead of switching them off smoothly."""
+    with open(test_config_water) as f:
+        cfg = yaml.safe_load(f)
+    del cfg['model']
+    config = tmp_path / 'no_cutoff_lr.yaml'
+    with open(config, 'w') as f:
+        yaml.dump(cfg, f)
+    result = subprocess.run(
+        ['so3lr', 'finetune', '--datafile', str(DATAFILE_WATER), '--workdir', str(workdir),
+         '--num-train', '13', '--num-valid', '2', '--config', str(config), '--strategy', 'full'],
+        capture_output=True, text=True, timeout=240, env=so3lr_subprocess_env(),
+    )
+    assert result.returncode != 0
+    assert 'exceeds data.neighbors_lr_cutoff' in (result.stdout + result.stderr)
+
+
+@pytest.mark.slow
+def test_cli_finetune_water_pbc_with_pme(workdir, test_config_water, tmp_path):
+    """PME during fine-tuning, recorded in fine_tuning.json and kept out of the
+    fine-tuned model's hyperparameters, which keep the pretrained long-range settings."""
+    import json
+    from so3lr.model_config import load_model_config
+    from so3lr.model_registry import resolve_model
+
+    config = _write_config(test_config_water, tmp_path, 'pme.yaml', model={
+        'cutoff_lr': 12.0, 'kspace_electrostatics': 'pme'})
+    result = subprocess.run(
+        ['so3lr', 'finetune', '--datafile', str(DATAFILE_WATER), '--workdir', str(workdir),
+         '--num-train', '13', '--num-valid', '2', '--config', str(config), '--strategy', 'full'],
+        capture_output=True, text=True, timeout=300, env=so3lr_subprocess_env(),
+    )
+    _assert_finetuning_succeeded(result, workdir, max_loss=0.2)
+    assert 'K-space grid shape' in (result.stdout + result.stderr)
+    record = json.loads((workdir / 'fine_tuning.json').read_text())
+    # unset settings take the eval/MD defaults, and are recorded
+    assert record['long_range'] == {
+        'cutoff_lr': 12.0, 'kspace_electrostatics': 'pme', 'kspace_smearing': 4.0,
+        'kspace_spacing': 2.0, 'kspace_dispersion': False}
+    assert 'K-space dispersion grid' not in (result.stdout + result.stderr)
+    saved = json.loads((workdir / 'hyperparameters.json').read_text())['model']
+    pretrained = load_model_config(resolve_model(None).dir)['model']
+    assert saved['cutoff_lr'] == pretrained['cutoff_lr']
+    assert 'kspace_electrostatics' not in saved
+
+
+def _write_config(test_config, tmp_path, name, **sections):
+    """`test_config` with extra (nested) sections merged in."""
+    with open(test_config) as f:
+        cfg = yaml.safe_load(f)
+    for section, values in sections.items():
+        cfg.setdefault(section, {})
+        cfg[section].update(values)
+    path = tmp_path / name
+    with open(path, 'w') as f:
+        yaml.dump(cfg, f)
+    return path
+
+
+def test_cli_finetune_readout_only_keeps_the_long_range_heads(workdir, test_config, tmp_path):
+    """A residual readout on a frozen backbone: the charge, a0 and C6 heads and the
+    backbone come out of training bit-identical, the residual readout does not."""
+    import numpy as np
+    import jax
+    from so3lr.model_registry import resolve_model
+    from so3lr.mlff.utils import checkpoint_utils
+
+    config = _write_config(
+        test_config, tmp_path, 'readout_only.yaml',
+        model={'energy_residual_mlp_widths': [32], 'energy_residual_inputs': 'all_layers'},
+    )
+    result = subprocess.run(
+        [
+            'so3lr', 'finetune',
+            '--datafile', str(DATAFILE),
+            '--workdir', str(workdir),
+            '--num-train', '20',
+            '--num-valid', '5',
+            '--config', str(config),
+            '--strategy', 'readout_only',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=so3lr_subprocess_env(),
+    )
+    _assert_finetuning_succeeded(result, workdir, max_loss=0.1)
+    assert 'Residual energy readout: initialised' in (result.stdout + result.stderr)
+
+    before = checkpoint_utils.load_params_from_workdir(resolve_model(None).dir)['params']
+    after = checkpoint_utils.load_params_from_workdir(workdir)['params']
+    for path in (('observables_0', 'electrostatic_energy'), ('observables_2',),
+                 ('observables_3',), ('layers_0',)):
+        a, b = before, after
+        for key in path:
+            a, b = a[key], b[key]
+        for x, y in zip(jax.tree_util.tree_leaves(a), jax.tree_util.tree_leaves(b)):
+            np.testing.assert_array_equal(np.asarray(x), np.asarray(y), err_msg=str(path))
+    residual = after['observables_0']['energy_residual_dense_final']['kernel']
+    assert np.abs(np.asarray(residual)).max() > 0, 'the residual readout did not train'
+
+
+@pytest.mark.slow
+def test_cli_finetune_with_long_range_anchors(workdir, test_config, tmp_path):
+    """Full fine-tuning with the charges / a0 / C6 anchored to the pretrained model:
+    the anchor terms are scored (and logged) next to the forces."""
+    config = _write_config(
+        test_config, tmp_path, 'anchored.yaml',
+        training={'long_range_anchor_weights': {'partial_charges': 1.0, 'a0_ratios': 1.0,
+                                                'c6_ratios': 1.0}},
+    )
+    result = subprocess.run(
+        [
+            'so3lr', 'finetune',
+            '--datafile', str(DATAFILE),
+            '--workdir', str(workdir),
+            '--num-train', '20',
+            '--num-valid', '5',
+            '--config', str(config),
+            '--strategy', 'full',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=240,
+        env=so3lr_subprocess_env(),
+    )
+    _assert_finetuning_succeeded(result, workdir, max_loss=0.2)
+    assert 'anchor_partial_charges' in (result.stdout + result.stderr)

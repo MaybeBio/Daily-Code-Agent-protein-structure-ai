@@ -1,0 +1,127 @@
+from __future__ import print_function
+import os
+import string
+import numpy as np
+from ase.units import kcal
+from ase.units import  mol as unit_mol
+from ase.units import Hartree, Bohr
+from ase.calculators.calculator import Calculator
+import copy
+try:
+  import pyscf
+  from pyscf import gto,scf,grad,dft
+  from pyscf import solvent,dftd3
+except:
+  pass
+
+class Pyscf(Calculator):
+    def __init__(self, label='ase',basis='631g',charge=0,spin=0,method="hf", **kwargs):
+        mol = pyscf.gto.Mole()
+        mol.charge = charge
+        mol.spin = spin
+        mol.output = None#label+'.out'
+        mol.chkfile = label+'.chk'
+        mol.verbose = 1
+        self.mol = mol
+        self.method = method
+        self.command = None
+        self.label = None
+        # set user values
+        self.set(**kwargs)
+
+    def set(self, **kwargs):
+        """
+        Sets the parameters on the according keywords
+        Raises RuntimeError when wrong keyword is provided
+        """
+        for key in kwargs:
+            if key == "charge":
+                self.mol.charge = kwargs[key]
+            if key == "spin":
+                self.mol.spin = kwargs[key]
+            if key == "method":
+                self.method = kwargs[key]
+            if key == "basis":
+                self.mol.basis = kwargs[key]
+
+    def get_version(self):
+        return self.version
+
+    def initialize(self, atoms):
+        pass
+
+    def run_qr(self,atoms, coordinates, charge=None, pointcharges=None, define_str=None):
+            mol = self.mol
+            self.atoms = None
+            self.atoms = atoms
+            mol.atom = [[atom.symbol, atom.position] for atom in self.atoms]
+            mol.build()
+            if self.method == 'hf':
+                mscf = pyscf.scf.RHF(mol)
+                mscf.max_cycle=200
+                mscf.max_memory=1000
+                self.command = mscf.run(conv_tol=1e-8,conv_tol_grad=1e-12).apply(pyscf.grad.RHF)
+            if self.method == 'dft':
+                mdft =  pyscf.dft.RKS(mol)
+                mdft.max_cycle=200
+                mdft.max_memory=1000
+                self.command = mdft.run(conv_tol=1e-8,conv_tol_grad=1e-12,xc='bp86').apply(pyscf.grad.RKS)
+
+
+            self.energy = mscf.scf()*((Hartree)/(kcal / unit_mol))
+
+            self.energy_zero = self.energy
+            self.energy_free = self.energy
+            result = self.command.run()
+            grad = np.array(result.grad())
+            self.forces = grad*(-(Hartree/Bohr)/(kcal / unit_mol))
+
+            if 0:
+                print(" energy", self.energy)
+                print("gradients", self.forces)
+
+    def read_energy(self, fname):
+        return self.energy
+
+    def read_forces(self, fname):
+        return self.forces
+
+    def get_command(self):
+        return self.command
+
+    def set_label(self, label):
+        self.label = label
+
+    def atoms_are_equal(self, atoms_new):
+        ''' (adopted from jacapo.py)
+        comparison of atoms to self.atoms using tolerances to account
+        for float/double differences and float math.
+        '''
+
+        TOL = 1.0e-6  # angstroms
+
+        # check for change in cell parameters
+        test = len(atoms_new) == len(self.atoms)
+        if test is not True:
+            return False
+
+        # check for change in cell parameters
+        test = (abs(self.atoms.get_cell() - atoms_new.get_cell()) <= TOL).all()
+        if test is not True:
+            return False
+
+        old = self.atoms.arrays
+        new = atoms_new.arrays
+
+        # check for change in atom position
+        test = (abs(new['positions'] - old['positions']) <= TOL).all()
+        if test is not True:
+            return False
+
+        # passed all tests
+        return True
+
+    def update(self, atoms_new):
+        if not self.atoms_are_equal(atoms_new):
+            self.atoms = atoms_new.copy()
+            self.run()

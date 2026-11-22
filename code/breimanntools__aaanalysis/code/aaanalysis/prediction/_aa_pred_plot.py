@@ -1,0 +1,2180 @@
+"""
+This is a script for the frontend of the AAPredPlot class for visualizing AAPred results.
+"""
+from typing import Optional, List, Dict, Union, Tuple, Literal, Hashable
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from matplotlib import pyplot as plt
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+
+import aaanalysis.utils as ut
+from ._backend.aa_pred.aa_pred_plot_comparison import plot_comparison_
+from ._backend.aa_pred.aa_pred_plot_ranking import (plot_ranking_, ranking_figheight,
+                                                    _resolve_group_colors)
+from ._backend.aa_pred.aa_pred_plot_rank_scatter import plot_rank_scatter_
+from ._backend.aa_pred.aa_pred_plot_clustermap import plot_clustermap_
+from ._backend.aa_pred.aa_pred_plot_dendrogram import plot_dendrogram_
+from ._backend.aa_pred.aa_pred_plot_legend import place_legend_below_
+from ._backend.aa_pred.aa_pred_group import assign_band_index
+
+
+# I Helper Functions
+# Single-protein positional plot kinds dispatched by :meth:`AAPredPlot.predict_sample`.
+LIST_SAMPLE_KINDS = ["window", "domain", "sequence"]
+# Across-samples plot kinds (of per-sample scores) dispatched by :meth:`AAPredPlot.predict_group`.
+LIST_GROUP_KINDS = ["hist", "ranking", "rank_scatter", "scatter", "cutoff"]
+# Evaluation plot kinds dispatched by :meth:`AAPredPlot.eval`.
+LIST_EVAL_KINDS = ["eval", "comparison", "heatmap"]
+# Per-kind figure-size defaults used when ``figsize=None`` (split by method).
+_DICT_SAMPLE_FIGSIZE = {"window": (10, 4), "domain": (6, 4.5), "sequence": (12, 6)}
+# Cap on the number of subcategory rows drawn in the ``kind='sequence'`` heatmap when
+# ``subcats=None`` (so a full 74-subcategory classification does not produce a wall of rows).
+_SUBCAT_ROW_CAP = 25
+_DICT_GROUP_FIGSIZE = {"hist": (6, 4.5), "ranking": None, "rank_scatter": None,
+                        "scatter": (5.5, 5.5), "cutoff": (6, 4.5)}
+_DICT_CLUSTER_FIGSIZE = {"clustermap": (11, 11)}
+_DICT_DENDROGRAM_FIGSIZE = {"rectangular": (7, 9), "circular": (9, 10)}
+
+
+def _new_ax(ax=None, figsize=(6, 5)):
+    """Return (fig, ax), creating a new figure if ax is None."""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
+    return fig, ax
+
+
+def check_match_kind_layout(kind=None, layout=None):
+    """Reject a non-default ``layout`` for a ``group_cluster`` kind that has no tree layout."""
+    if kind != "dendrogram" and layout != ut.LIST_CLUSTER_LAYOUTS[0]:
+        str_error = (f"'layout' ({layout!r}) should be 'rectangular' when 'kind' "
+                     f"is 'clustermap'.")
+        raise ValueError(str_error)
+
+
+def _check_cluster_inputs(data=None, names=None, labels=None, labels_row=None, dict_color=None,
+                          dict_color_row=None, legend_title=None, legend_title_row=None,
+                          figsize=None, title=None):
+    """Shared input checks of every ``group_cluster`` kind."""
+    data = ut.check_X(X=data, min_n_samples=2, min_n_features=1)
+    if names is not None:
+        names = ut.check_list_like(name="names", val=names,
+                                   check_all_str_or_convertible=True)
+        if len(names) != data.shape[0]:
+            raise ValueError(f"'names' (n={len(names)}) should match n_samples ({data.shape[0]}).")
+    # Per-sample class labels color a sidebar / leaf strip (purely cosmetic), so any hashable
+    # values are allowed.
+
+    def _check_labels(name, val):
+        if val is None:
+            return None
+        val = ut.check_list_like(name=name, val=val, accept_none=False)
+        if len(val) != data.shape[0]:
+            raise ValueError(f"'{name}' (n={len(val)}) should match n_samples ({data.shape[0]}).")
+        for label in val:
+            try:
+                hash(label)
+            except TypeError:
+                str_error = f"'{name}' ({label!r}) should contain only hashable values."
+                raise ValueError(str_error) from None
+        return val
+
+    def _check_label_colors(name, val, colors):
+        if val is None or colors is None:
+            return
+        missing = list(dict.fromkeys(label for label in val if label not in colors))
+        if missing:
+            str_error = (f"'{name}' ({colors}) should contain colors for "
+                         f"labels {missing}.")
+            raise ValueError(str_error)
+
+    labels = _check_labels("labels", labels)
+    labels_row = _check_labels("labels_row", labels_row)
+    ut.check_dict_color(name="dict_color", val=dict_color, accept_none=True)
+    ut.check_dict_color(name="dict_color_row", val=dict_color_row, accept_none=True)
+    _check_label_colors(name="dict_color", val=labels, colors=dict_color)
+    _check_label_colors(name="dict_color_row", val=labels_row, colors=dict_color_row)
+    ut.check_str(name="legend_title", val=legend_title, accept_none=True)
+    ut.check_str(name="legend_title_row", val=legend_title_row, accept_none=True)
+    ut.check_figsize(figsize=figsize, accept_none=True)
+    ut.check_str(name="title", val=title, accept_none=True)
+    return data, names, labels, labels_row
+
+
+def check_match_scores_labels(scores=None, labels=None):
+    """Check that per-sample labels match the length of the scores array."""
+    if labels is not None and len(labels) != len(scores):
+        raise ValueError(f"'labels' (n={len(labels)}) should match length of 'scores' (n={len(scores)}).")
+
+
+def _default(val, fallback):
+    """Return ``val`` unless it is ``None``, then ``fallback`` (per-kind default resolution)."""
+    return fallback if val is None else val
+
+
+def _resolve_band_colors(band_colors, cmap, n_bands):
+    """Resolve one color per confidence band (low score -> high score).
+
+    ``band_colors`` (a list of length ``n_bands``) is used verbatim if given; otherwise
+    ``n_bands`` colors are sampled across the inner range of ``cmap`` so the low-score
+    band is the low end of the colormap and the high-score band the high end.
+    """
+    if band_colors is not None:
+        if not isinstance(band_colors, (list, tuple)) or len(band_colors) != n_bands:
+            raise ValueError(f"'band_colors' ({band_colors}) should be a list of {n_bands} colors "
+                             f"(one per band delimited by 'thresholds') when 'band=True'.")
+        return list(band_colors)
+    cmap_obj = plt.get_cmap(cmap)
+    return [cmap_obj(x) for x in np.linspace(0.15, 0.85, n_bands)]
+
+
+def _band_index(left_edge, sorted_thresholds):
+    """Band index (0-based, low -> high) of a bar whose left edge is ``left_edge``.
+
+    Delegates to the shared ``assign_band_index`` kernel so the histogram banding and
+    :meth:`AAPred.score_to_group` use one boundary convention (thresholds as inclusive lower bounds).
+    """
+    return int(assign_band_index(left_edge, sorted_thresholds))
+
+
+def _check_highlight_cells(highlight, data):
+    """Resolve/validate the eval-heatmap ``highlight`` to a list of ``(row, col)`` cells to box.
+
+    - ``None`` -> ``[]`` (box nothing).
+    - a positive ``int`` N -> the ``N`` highest-value cells, best first (NaNs ignored).
+    - ``"max"`` / ``"min"`` -> the single best / worst cell (aliases for ``1`` / worst).
+    - a ``(row, col)`` tuple, or a list of them -> those explicit cells (bounds-checked).
+    """
+    if highlight is None:
+        return []
+    n_rows, n_cols = data.shape
+
+    def _rank_cells(n, worst=False):
+        flat = data.ravel()
+        valid = np.where(~np.isnan(flat))[0]
+        if valid.size == 0:
+            raise ValueError("'highlight' (top-N / 'max' / 'min') needs at least one non-NaN cell "
+                             "in 'df_eval'.")
+        order = valid[np.argsort(flat[valid], kind="stable")]  # ascending (worst first)
+        if not worst:
+            order = order[::-1]                                # best first
+        return [tuple(int(v) for v in np.unravel_index(k, data.shape)) for k in order[:min(n, order.size)]]
+
+    if isinstance(highlight, str):
+        if highlight == "max":
+            return _rank_cells(1, worst=False)
+        if highlight == "min":
+            return _rank_cells(1, worst=True)
+        raise ValueError(f"'highlight' ('{highlight}') should be a positive int (top-N), 'max', "
+                         f"'min', a (row, col) tuple/list, or None.")
+    if _is_int(highlight):
+        if highlight < 1:
+            raise ValueError(f"'highlight' ({highlight}) as an int should be >= 1 (number of top "
+                             f"cells to box).")
+        return _rank_cells(int(highlight), worst=False)
+    # explicit (row, col) or a list of them
+    cells = highlight if (isinstance(highlight, list) and highlight
+                          and isinstance(highlight[0], (tuple, list))) else [highlight]
+    out = []
+    for cell in cells:
+        if not (isinstance(cell, (tuple, list)) and len(cell) == 2 and _is_int(cell[0]) and _is_int(cell[1])):
+            raise ValueError(f"'highlight' cell ({cell}) should be a (row, col) integer tuple.")
+        i, j = int(cell[0]), int(cell[1])
+        if not (0 <= i < n_rows and 0 <= j < n_cols):
+            raise ValueError(f"'highlight' cell ({i}, {j}) is outside the grid (shape {(n_rows, n_cols)}).")
+        out.append((i, j))
+    return out
+
+
+# Multi-track sequence-viewer helpers (shared by the ``window``/``domain`` renderers).
+# The base prediction axes are stacked with optional extra tracks that all share the
+# residue-position x-axis: a CPP-importance profile, per-subcategory scale profiles,
+# user annotation tracks, and a bottom sequence row.
+_SEQ_ROW_MAX = 80  # longest visible region for which per-residue letters are still drawn
+_HIGHLIGHT_ALPHA = 0.25  # opacity of a highlight span (kept low so it sits behind the data)
+_ZOOM_PAD = 5  # residues of padding added on each side of a zoomed highlight region
+
+
+def _is_int(val):
+    """True if ``val`` is a plain / numpy integer (``bool`` is rejected)."""
+    return isinstance(val, (int, np.integer)) and not isinstance(val, bool)
+
+
+def _normalize_highlight(highlight):
+    """Normalize ``highlight`` to a list of validated ``(start, stop)`` int tuples.
+
+    Accepts ``None`` (-> ``[]``), a single ``(start, stop)`` tuple, or a list of such
+    tuples (1-based, inclusive residue-position / x-axis bounds). Each ``start`` / ``stop``
+    must be an integer with ``start <= stop``; anything else raises ``ValueError``.
+    """
+    if highlight is None:
+        return []
+    # A length-2 collection of scalars is one region; a list of (start, stop) pairs is many.
+    is_single = (isinstance(highlight, (tuple, list)) and len(highlight) == 2
+                 and not any(isinstance(v, (tuple, list)) for v in highlight))
+    regions = [highlight] if is_single else highlight
+    if not isinstance(regions, (list, tuple)):
+        raise ValueError(f"'highlight' ({highlight!r}) should be a (start, stop) tuple or a "
+                         f"list of (start, stop) tuples.")
+    out = []
+    for region in regions:
+        if not (isinstance(region, (tuple, list)) and len(region) == 2):
+            raise ValueError(f"'highlight' region ({region!r}) should be a (start, stop) tuple.")
+        start, stop = region
+        if not (_is_int(start) and _is_int(stop)):
+            raise ValueError(f"'highlight' region ({region!r}) should have integer 'start' and "
+                             f"'stop' positions.")
+        start, stop = int(start), int(stop)
+        if start > stop:
+            raise ValueError(f"'highlight' region ({start}, {stop}) should have 'start' <= 'stop'.")
+        out.append((start, stop))
+    return out
+
+
+def _count_visible(x, visible_range):
+    """Number of plotted x positions inside ``visible_range`` (all of them if ``None``)."""
+    if visible_range is None:
+        return len(x)
+    lo, hi = visible_range
+    x = np.asarray(x, dtype=float)
+    return int(np.sum((x >= lo) & (x <= hi)))
+
+
+def _visible_range(regions, x, zoom):
+    """``(lo, hi)`` x-window to show when zooming into ``regions``, clamped to the data; else ``None``.
+
+    Spans the minimum ``start`` to the maximum ``stop`` over ``regions`` with a small pad,
+    clamped to the plotted x-range. Returns ``None`` when zoom is off or no region is given.
+    """
+    if not zoom or not regions:
+        return None
+    lo = min(start for start, _ in regions) - _ZOOM_PAD
+    hi = max(stop for _, stop in regions) + _ZOOM_PAD
+    x = np.asarray(x, dtype=float)
+    if len(x):
+        lo = max(lo, float(x.min()))
+        hi = min(hi, float(x.max()))
+    return float(lo), float(hi)
+
+
+def _draw_highlight_spans(axes, regions):
+    """Shade each ``(start, stop)`` region as a vertical span on every axes (behind the data)."""
+    for tax in axes:
+        for start, stop in regions:
+            tax.axvspan(start, stop, color=ut.COLOR_LINK_HIGHLIGHT, alpha=_HIGHLIGHT_ALPHA,
+                        linewidth=0, zorder=0)
+
+
+def _entry_sequence(df_seq, entry):
+    """Return ``(sequence, tmd_start)`` for ``entry`` in ``df_seq``; either may be ``None``.
+
+    ``sequence`` is the full protein string (needed for subcategory / sequence rows) and
+    ``tmd_start`` its 1-based TMD start (needed to map ``domain`` offsets onto residues).
+    """
+    if df_seq is None or entry is None:
+        return None, None
+    ut.check_df(name="df_seq", df=df_seq, cols_required=[ut.COL_ENTRY])
+    sub = df_seq[df_seq[ut.COL_ENTRY] == entry]
+    if len(sub) == 0:
+        return None, None
+    seq = str(sub[ut.COL_SEQ].iloc[0]) if ut.COL_SEQ in sub.columns else None
+    tmd_start = None
+    if ut.COL_TMD_START in sub.columns and pd.notna(sub[ut.COL_TMD_START].iloc[0]):
+        tmd_start = int(sub[ut.COL_TMD_START].iloc[0])
+    return seq, tmd_start
+
+
+def _residue_indices(kind, x, tmd_start):
+    """1-based protein residue index for each plotted x position, or ``None`` if unmapped.
+
+    * ``window`` — ``x`` already holds 1-based residue (anchor) positions.
+    * ``domain`` — ``x`` holds boundary offsets; residue ``= tmd_start + offset`` (needs
+      ``tmd_start``, else the residue-anchored tracks are omitted).
+    """
+    if kind == "window":
+        return np.asarray(x, dtype=int)
+    if tmd_start is None:
+        return None
+    return np.asarray(tmd_start + np.asarray(x, dtype=int), dtype=int)
+
+
+def _subcat_profile(seq, scale_ids, df_scales):
+    """Per-residue (0-based over ``seq``) mean scale value across ``scale_ids``.
+
+    ``profile[r] = mean_s df_scales.loc[seq[r], s]`` for each requested scale ``s``; ``None``
+    when none of the ``scale_ids`` are present in ``df_scales``.
+    """
+    cols = [s for s in scale_ids if s in df_scales.columns]
+    if len(cols) == 0:
+        return None
+    per_aa = df_scales[cols].mean(axis=1)  # index = amino acid letter -> mean scale value
+    return np.array([per_aa.get(aa, np.nan) for aa in seq], dtype=float)
+
+
+def _importance_profile(df_feat):
+    """Window-frame position -> summed feature importance, spread over each feature's residues.
+
+    Each feature contributes ``importance / n_positions`` to every 1-based position in its
+    ``positions`` column (matching the CPP per-position normalization). Uses
+    ``feat_importance`` when present, else ``abs_auc``. Returns ``(positions, values)`` arrays
+    or ``(None, None)`` when no usable column is available.
+    """
+    col = (ut.COL_FEAT_IMPORT if ut.COL_FEAT_IMPORT in df_feat.columns
+           else ut.COL_ABS_AUC if ut.COL_ABS_AUC in df_feat.columns else None)
+    if col is None or ut.COL_POSITION not in df_feat.columns:
+        return None, None
+    acc = {}
+    for pos_str, weight in zip(df_feat[ut.COL_POSITION].astype(str), df_feat[col].astype(float)):
+        parts = [int(p) for p in pos_str.split(",") if p.strip() != ""]
+        if len(parts) == 0:
+            continue
+        share = float(weight) / len(parts)
+        for p in parts:
+            acc[p] = acc.get(p, 0.0) + share
+    if len(acc) == 0:
+        return None, None
+    positions = np.array(sorted(acc))
+    values = np.array([acc[p] for p in positions], dtype=float)
+    return positions, values
+
+
+def _spread_on_x(x, values):
+    """Map a per-index ``values`` vector onto the plotted x-range by linear interpolation.
+
+    Used to align a window-frame profile (whose length need not equal ``len(x)``) onto the
+    residue x-axis; returned unchanged when the lengths already match.
+    """
+    x = np.asarray(x, dtype=float)
+    values = np.asarray(values, dtype=float)
+    if len(values) == len(x):
+        return values
+    if len(x) < 2 or len(values) == 0:
+        return np.full(len(x), np.nan)
+    grid = np.linspace(float(x.min()), float(x.max()), len(values))
+    return np.interp(x, grid, values)
+
+
+def _is_numeric_values(values):
+    """True if ``values`` can be cast to a float array (numeric -> line track)."""
+    try:
+        np.asarray(values, dtype=float)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _build_extra_tracks(kind, x, seq, tmd_start, df_scales, df_cat, subcats, df_feat,
+                        list_annotations, visible_range=None):
+    """Assemble the ordered extra-track list: importance, subcats, user tracks, sequence.
+
+    A track whose inputs are missing is simply skipped. Numeric user tracks become line
+    profiles; non-numeric ones fall back to an ``imshow`` strip. The sequence row draws
+    per-residue letters only when the number of *visible* positions (after any zoom, given
+    by ``visible_range``) is short enough, so zooming reveals the letters automatically.
+    """
+    tracks = []
+    residues = _residue_indices(kind=kind, x=x, tmd_start=tmd_start)
+    # 1) CPP importance profile (one track)
+    if df_feat is not None:
+        positions, values = _importance_profile(df_feat)
+        if positions is not None:
+            vals = _spread_on_x(x, values)
+            peak = np.nanmax(np.abs(vals)) if np.isfinite(vals).any() else 0.0
+            if peak > 0:
+                vals = vals / peak
+            tracks.append(dict(type="line", values=vals, label="CPP importance",
+                               color=ut.COLOR_FEAT_POS))
+    # 2) Per-subcategory scale profiles (one track per subcat)
+    if subcats and seq is not None and df_scales is not None and df_cat is not None \
+            and residues is not None:
+        clist = ut.plot_get_clist_(n_colors=max(len(subcats), 3))
+        for i, name in enumerate(subcats):
+            scale_ids = df_cat[df_cat[ut.COL_SUBCAT] == name][ut.COL_SCALE_ID].tolist()
+            per_res = _subcat_profile(seq, scale_ids, df_scales)
+            if per_res is None:
+                continue
+            vals = np.array([per_res[r - 1] if 1 <= r <= len(per_res) else np.nan
+                             for r in residues], dtype=float)
+            tracks.append(dict(type="line", values=vals, label=name,
+                               color=clist[i % len(clist)]))
+    # 3) User annotation tracks (numeric -> line, else categorical imshow strip)
+    if list_annotations:
+        for track in list_annotations:
+            values = track["values"]
+            label = track.get("label", "")
+            if _is_numeric_values(values):
+                tracks.append(dict(type="line", values=_spread_on_x(x, values),
+                                   label=label, color=track.get("color")))
+            else:
+                cats = list(dict.fromkeys(values))
+                code = np.array([cats.index(v) for v in values], dtype=float)
+                tracks.append(dict(type="imshow", values=code, label=label,
+                                   cmap=track.get("cmap", "viridis")))
+    # 4) Sequence row at the bottom (letters only when the *visible* region is short enough)
+    if seq is not None and residues is not None:
+        letters = [seq[r - 1] if 1 <= r <= len(seq) else "" for r in residues]
+        tracks.append(dict(type="seq", letters=letters, label="Sequence",
+                           show=_count_visible(x, visible_range) <= _SEQ_ROW_MAX))
+    return tracks
+
+
+def _positional_layout(ax, figsize, tracks):
+    """Return ``(fig, base_ax, [track_axes])`` for the stacked viewer.
+
+    When an explicit ``ax`` is passed only the base profile is drawn on it (no sub-tracks).
+    Otherwise a shared-x stack is created, the figure growing in height per extra track.
+    """
+    if ax is not None:
+        return ax.figure, ax, []
+    if not tracks:
+        fig, base_ax = plt.subplots(figsize=figsize)
+        return fig, base_ax, []
+    heights = [6.0] + [0.5 if t["type"] == "seq" else 0.9 for t in tracks]
+    figsize = (figsize[0], figsize[1] + 0.55 * len(tracks))
+    fig, axes = plt.subplots(len(tracks) + 1, 1, figsize=figsize, sharex=True,
+                             gridspec_kw={"height_ratios": heights})
+    return fig, axes[0], list(axes[1:])
+
+
+def _set_track_label(tax, label):
+    """Left-side, horizontally written track label aligned with the row."""
+    tax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=8)
+    tax.yaxis.set_label_coords(-0.012, 0.5)
+
+
+def _draw_track(tax, track, x, is_bottom, visible_range=None):
+    """Render one extra track onto its sub-axes (line / imshow / sequence row)."""
+    ttype = track["type"]
+    if ttype == "line":
+        tax.plot(x, track["values"], color=track["color"] or ut.COLOR_FEAT_NEG, linewidth=1.1)
+        tax.set_yticks([])
+    elif ttype == "imshow":
+        tax.imshow(track["values"].reshape(1, -1), aspect="auto",
+                   cmap=track.get("cmap", "viridis"),
+                   extent=[float(np.min(x)), float(np.max(x)), 0, 1])
+        tax.set_yticks([])
+    elif ttype == "seq":
+        if track.get("show", True):
+            lo, hi = visible_range if visible_range is not None else (-np.inf, np.inf)
+            for xi, letter in zip(x, track["letters"]):
+                if lo <= xi <= hi:
+                    tax.text(xi, 0.5, letter, ha="center", va="center",
+                             family=ut.FONT_AA, fontsize=7)
+        tax.set_ylim(0, 1)
+        tax.set_yticks([])
+    _set_track_label(tax, track["label"])
+    if ttype != "imshow":
+        sns.despine(ax=tax, left=True, bottom=not is_bottom)
+    if not is_bottom:
+        tax.tick_params(axis="x", bottom=False)
+
+
+def _resolve_ranking_panels(df_pred, col_group, panel_col, panels, group_order):
+    """Resolve ranking panels into ``[(title, sub_frame, per_panel_group_order), ...]`` or ``None``.
+
+    ``panels`` is a ``{panel_title: [col_group values]}`` dict: each panel holds the rows whose
+    ``col_group`` is in the list (in that order, which also drives ``sort='group'``). ``panel_col``
+    is a column whose distinct values each get a panel. They are mutually exclusive; both ``None``
+    returns ``None`` (a single panel).
+    """
+    if panels is not None:
+        if col_group is None:
+            raise ValueError("'panels' groups 'col_group' values, so 'col_group' is required.")
+        if not isinstance(panels, dict) or not panels:
+            raise ValueError(f"'panels' ({panels}) should be a non-empty dict of "
+                             "{panel_title: [group values]}.")
+        known = set(df_pred[col_group])
+        specs = []
+        for ptitle, pgroups in panels.items():
+            ut.check_str(name="panels key", val=ptitle)
+            pgroups = ut.check_list_like(name=f"panels['{ptitle}']", val=pgroups, accept_none=False)
+            missing = [g for g in pgroups if g not in known]
+            if missing:
+                raise ValueError(f"'panels[{ptitle!r}]' lists groups absent from "
+                                 f"'{col_group}': {missing}")
+            sub = df_pred[df_pred[col_group].isin(pgroups)]
+            if len(sub) == 0:
+                raise ValueError(f"'panels[{ptitle!r}]' selects no rows.")
+            specs.append((str(ptitle), sub, list(pgroups)))
+        return specs
+    if panel_col is not None:
+        vals = list(dict.fromkeys(df_pred[panel_col].tolist()))
+        return [(str(p), df_pred[df_pred[panel_col] == p], group_order) for p in vals]
+    return None
+
+
+# II Main Functions
+class AAPredPlot:
+    """
+    Plotting class for :class:`AAPred` evaluation and prediction results [Breimann25]_.
+
+    The single home for prediction figures, dispatched by ``kind`` from three methods:
+
+    - :meth:`predict_sample` visualizes **single-protein positional predictions**: the
+      per-residue profile (``kind='window'``) and the domain boundary-sensitivity curve
+      (``kind='domain'``).
+    - :meth:`predict_group` visualizes **across-samples predictions**: score histograms
+      (``kind='hist'``), ranked candidates (``kind='ranking'``), per-protein rank scatters
+      (``kind='rank_scatter'``), two-predictor scatters (``kind='scatter'``), and survival
+      curves (``kind='cutoff'``).
+    - :meth:`group_cluster` clusters the sample group by explanation similarity: the
+      hierarchically clustered sample x sample correlation heatmap (``kind='clustermap'``).
+    - :meth:`eval` visualizes **model/feature-set evaluation**: metric bars per model
+      (``kind='eval'``) and grouped benchmark comparisons (``kind='comparison'``).
+
+    .. warning::
+
+        **Experimental.** This class is part of the new v1.1.0 prediction layer and is under active
+        development; its API (signatures, defaults, return objects) may change between minor releases
+        without the usual deprecation cycle. Pin a version if you depend on the current behaviour.
+
+    .. versionadded:: 1.1.0
+
+    See Also
+    --------
+    * :class:`AAPred`: the logic class whose results this visualizes.
+    """
+
+    def __init__(self):
+        """
+        Notes
+        -----
+        The figures are built on Matplotlib and seaborn. A small set of shared modification
+        functions recurs across the ``predict_group`` plots (only the main ones are listed):
+
+        * :func:`seaborn.despine` — remove the top and right axes spines.
+        * :meth:`matplotlib.axes.Axes.axvline` — the dashed confidence cut-off / threshold lines.
+        * :meth:`matplotlib.axes.Axes.legend` — the per-class color legend.
+
+        See Also
+        --------
+        * :class:`AAPred`: the logic class whose results this visualizes.
+        * :func:`seaborn.despine` for the shared axes-spine styling.
+
+        Examples
+        --------
+        .. include:: examples/aap_plot.rst
+        """
+
+    @staticmethod
+    def predict_sample(data: Optional[pd.DataFrame] = None,
+                       *, kind: str = "window",
+                       ax: Optional[Axes] = None,
+                       figsize: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+                       entry: Optional[str] = None,
+                       list_annotations: Optional[List[Dict]] = None,
+                       threshold: Optional[Union[int, float]] = None,
+                       color: Optional[str] = None,
+                       xlabel: Optional[str] = None,
+                       ylabel: Optional[str] = None,
+                       df_seq: Optional[pd.DataFrame] = None,
+                       df_scales: Optional[pd.DataFrame] = None,
+                       df_cat: Optional[pd.DataFrame] = None,
+                       subcats: Optional[List[str]] = None,
+                       df_feat: Optional[pd.DataFrame] = None,
+                       highlight: Optional[Union[Tuple[int, int], List[Tuple[int, int]]]] = None,
+                       zoom: bool = False,
+                       ) -> Tuple[Figure, Axes]:
+        """
+        Visualize single-protein positional predictions as a multi-track sequence viewer.
+
+        One entry point for the three positional figures; ``kind`` selects the base renderer.
+        For ``'window'`` / ``'domain'`` ``data`` is the prediction frame from :meth:`AAPred.predict`;
+        the base profile is stacked, top to bottom, with optional extra tracks that all share the
+        residue-position x-axis: a **CPP-importance** profile (``df_feat``), one **subcategory** scale
+        profile per entry in ``subcats``, the **user annotation** tracks (``list_annotations``), and a
+        **sequence** row at the bottom. Any track whose inputs are not provided is simply omitted.
+
+        * ``'window'`` — per-residue profile from :meth:`AAPred.predict` (``level='window'``);
+          ``data`` is the ``df_window`` frame (columns ``entry``, ``position``, ``score``). The
+          x-axis is the residue position, so every extra track aligns residue-by-residue.
+        * ``'domain'`` — boundary-sensitivity curve from :meth:`AAPred.predict` (``level='domain'``);
+          ``data`` is the ``df_domain`` frame (columns ``entry``, ``offset``, ``score``, ``is_best``).
+          The x-axis is the boundary offset; the residue-anchored tracks (subcategory, sequence)
+          map each offset to residue ``tmd_start + offset`` and therefore need ``df_seq`` with a
+          ``tmd_start`` column.
+        * ``'sequence'`` — a CPP-feature-map-style **heatmap over the complete protein sequence**;
+          rows are **subcategories** (``subcats``, or every subcategory in ``df_cat`` capped at 25
+          when ``subcats=None``), columns are the **residue positions** ``1..len(sequence)``, and each
+          cell is that subcategory's mean scale value at that residue (the same per-residue
+          subcategory profile the line tracks use, stacked into a matrix). It needs only ``df_seq``
+          (plus ``df_scales`` / ``df_cat``, default-loaded when omitted); ``data`` is **optional** and,
+          when given as a ``df_window`` frame, is drawn as a thin prediction track above the heatmap.
+          The **sequence** row is drawn below the heatmap and ``highlight`` / ``zoom`` behave exactly
+          as for the other kinds (cyan spans over the residue columns; zoom reveals the letters).
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        data : pd.DataFrame, optional
+            Prediction frame for the selected ``kind``: the ``df_window`` (``'window'``) or
+            ``df_domain`` (``'domain'``) output of :meth:`AAPred.predict`. Required for those two
+            kinds; **optional** for ``kind='sequence'`` (which only needs ``df_seq``), where a
+            ``df_window`` frame is drawn as a thin prediction track above the heatmap.
+        kind : str, default="window"
+            Which positional figure to draw; one of ``window``, ``domain``, ``sequence``.
+        ax : matplotlib.axes.Axes, optional
+            Axes to draw on. If ``None``, a new figure and axes are created. When given, only the
+            base profile is drawn (the stacked extra tracks need their own figure).
+        figsize : tuple, optional
+            Figure size when ``ax`` is ``None``. If ``None``, a per-kind default is used; the
+            figure grows in height for each extra track.
+        entry : str, optional
+            Protein to plot; required only when ``data`` holds more than one ``entry``.
+        list_annotations : list of dict, optional
+            Per-position annotation tracks; each dict has ``values`` (aligned to the plotted
+            positions), ``label`` (str), an optional ``color`` (numeric line tracks) and optional
+            ``cmap`` (non-numeric/categorical tracks drawn as an ``imshow`` strip).
+        threshold : int or float, optional
+            (``kind='window'``) Score drawn as a horizontal dashed decision line.
+        color : str, optional
+            Base line color; defaults to a house color.
+        xlabel : str, optional
+            x-axis label; defaults to a per-kind label.
+        ylabel : str, optional
+            y-axis label; defaults to a per-kind label.
+        df_seq : pd.DataFrame, optional
+            DataFrame containing an ``entry`` column of unique protein identifiers and a
+            ``sequence`` column (and, for ``kind='domain'``, ``tmd_start``), used to draw the
+            subcategory profiles and the sequence row. Required for those tracks and **required**
+            for ``kind='sequence'`` (it supplies the residue sequence spanned by the heatmap).
+        df_scales : pd.DataFrame, optional
+            Amino-acid scale matrix (letters x scales) for the subcategory profiles / heatmap cells.
+            Defaults to the bundled ``load_scales()`` when this is ``None`` and it is needed (i.e.
+            ``subcats`` is given, or always for ``kind='sequence'``).
+        df_cat : pd.DataFrame, optional
+            Scale classification (``scale_id`` / ``subcategory``) mapping each subcategory to its
+            scales. Defaults to the bundled ``load_scales(name='scales_cat')`` when this is ``None``
+            and it is needed (``subcats`` given, or always for ``kind='sequence'``).
+        subcats : list of str, optional
+            Subcategory names; one scale-profile line track is added per name (needs ``df_seq``). For
+            ``kind='sequence'`` these become the heatmap **rows**; ``None`` uses every subcategory in
+            ``df_cat`` (capped at 25, with a verbose note when capped).
+        df_feat : pd.DataFrame, optional
+            CPP feature frame (with a ``positions`` column and a ``feat_importance`` or ``abs_auc``
+            column) mapped onto positions to draw the CPP-importance track.
+        highlight : tuple or list of tuple, optional
+            One or more ``(start, stop)`` regions (1-based, inclusive) shaded as a bright-cyan
+            vertical span across **every** track (base, importance, subcategory, annotation and
+            sequence rows), so single or multiple parts are marked consistently down the whole
+            stack. The bounds are given in the plot's x-axis units: residue positions for
+            ``kind='window'`` and boundary offsets for ``kind='domain'``. Each ``start`` / ``stop``
+            must be an integer with ``start <= stop``.
+        zoom : bool, default=False
+            If ``True`` and ``highlight`` is given, restrict the shared x-axis to the highlighted
+            region(s) (from the minimum ``start`` to the maximum ``stop``, padded by a few residues
+            and clamped to the data range). Because the visible window then shortens, the sequence
+            row renders per-residue letters for the zoomed span. Applies to both kinds; a no-op when
+            ``highlight`` is ``None``.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The figure.
+        ax : matplotlib.axes.Axes
+            The base-profile axes (the top track).
+
+        See Also
+        --------
+        * :meth:`AAPred.predict` for the predictions this visualizes.
+        * :meth:`AAPredPlot.predict_group` for across-samples figures.
+        * :meth:`AAPredPlot.eval` for evaluation figures.
+        * :meth:`CPPStructurePlot.plot_linked` / :meth:`CPPStructurePlot.map_structure`: pass the
+          same ``highlight`` ``(start, stop)`` regions to mirror the cyan selection shaded here on
+          the 3D protein structure (shared ``COLOR_LINK_HIGHLIGHT``).
+
+        Examples
+        --------
+        .. include:: examples/aap_plot_sample.rst
+        """
+        if kind not in LIST_SAMPLE_KINDS:
+            raise ValueError(f"'kind' ('{kind}') must be one of {LIST_SAMPLE_KINDS}.")
+        ut.check_bool(name="zoom", val=zoom)
+        highlight = _normalize_highlight(highlight)
+        figsize = figsize if figsize is not None else _DICT_SAMPLE_FIGSIZE[kind]
+        # 'window' and 'domain' need their prediction frame; 'sequence' can stand on df_seq alone.
+        if data is None and kind != "sequence":
+            raise ValueError(f"'data' (the prediction frame) is required for kind='{kind}'.")
+        if kind == "window":
+            return AAPredPlot._plot_window(
+                df_window=data, entry=entry, list_annotations=list_annotations, threshold=threshold,
+                ax=ax, figsize=figsize, color=color,
+                xlabel=_default(xlabel, "Residue position"),
+                ylabel=_default(ylabel, "Prediction score"),
+                df_seq=df_seq, df_scales=df_scales, df_cat=df_cat, subcats=subcats, df_feat=df_feat,
+                highlight=highlight, zoom=zoom)
+        if kind == "domain":
+            return AAPredPlot._plot_domain(
+                df_domain=data, entry=entry, ax=ax, figsize=figsize, color=color,
+                xlabel=_default(xlabel, "Boundary offset [residues]"),
+                ylabel=_default(ylabel, "Prediction score"),
+                df_seq=df_seq, df_scales=df_scales, df_cat=df_cat, subcats=subcats, df_feat=df_feat,
+                list_annotations=list_annotations, highlight=highlight, zoom=zoom)
+        # kind == "sequence"
+        return AAPredPlot._plot_sequence(
+            data=data, entry=entry, ax=ax, figsize=figsize, color=color,
+            xlabel=_default(xlabel, "Residue position"),
+            ylabel=_default(ylabel, "Subcategory"),
+            df_seq=df_seq, df_scales=df_scales, df_cat=df_cat, subcats=subcats, df_feat=df_feat,
+            list_annotations=list_annotations, threshold=threshold, highlight=highlight, zoom=zoom)
+
+    @staticmethod
+    def predict_group(data: Union[pd.DataFrame, ut.ArrayLike1D, ut.ArrayLike2D],
+                       *, kind: str = "hist",
+                       ax: Optional[Axes] = None,
+                       figsize: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+                       labels: Optional[ut.ArrayLike1D] = None,
+                       bins: int = 20,
+                       thresholds: Optional[Union[int, float, List[Union[int, float]]]] = None,
+                       band: bool = False,
+                       dict_color: Optional[Dict[Union[int, str], str]] = None,
+                       col_name: str = "name",
+                       col_score: str = "score",
+                       col_group: Optional[str] = None,
+                       col_std: Optional[str] = None,
+                       group_order: Optional[List[str]] = None,
+                       band_colors: Optional[List[str]] = None,
+                       top_n: Optional[int] = None,
+                       ascending: bool = False,
+                       panel_col: Optional[str] = None,
+                       panels: Optional[Dict[str, List[str]]] = None,
+                       sort: str = "score",
+                       title: Optional[str] = None,
+                       scores_y: Optional[ut.ArrayLike1D] = None,
+                       marker_size: Union[int, float] = 30,
+                       diagonal: bool = True,
+                       n_steps: int = 101,
+                       cmap: str = "GnBu",
+                       xlabel: Optional[str] = None,
+                       ylabel: Optional[str] = None,
+                       legend_title: Optional[str] = None,
+                       line_thresholds: Optional[Union[int, float, List[Union[int, float]]]] = None,
+                       score_range: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+                       annotate_at: Optional[Union[int, float]] = None,
+                       show_n: bool = False,
+                       threshold_labels: Optional[List[str]] = None,
+                       legend_loc: Optional[str] = None,
+                       ) -> Tuple[Figure, Axes]:
+        """
+        Visualize across-samples prediction scores, dispatched by ``kind``.
+
+        One entry point for every group score figure; ``kind`` selects the renderer and ``data``
+        is its primary input. For sample-relation views (clustering samples by their feature or
+        SHAP vectors) see :meth:`AAPredPlot.group_cluster`.
+
+        * ``'hist'`` — histogram of per-sample scores; ``data`` is the ``scores`` array. By default
+          class-separated by ``labels``; with ``band=True`` the bars are instead colored by the
+          confidence band they fall into (delimited by ``thresholds``), for scoring unlabeled
+          samples. Uses ``labels``, ``bins``, ``thresholds``, ``band``, ``dict_color``,
+          ``band_colors``, ``cmap``, ``xlabel``, ``ylabel``.
+        * ``'ranking'`` — ranked-candidate horizontal bars; ``data`` is a per-sample ``df_pred``.
+          Uses ``col_name``, ``col_score``, ``col_group``, ``col_std``, ``dict_color``,
+          ``thresholds`` (cut-off lines, default ``(50, 80)``), ``top_n``, ``ascending``,
+          ``group_order``, ``xlabel``, ``title``. Split into side-by-side
+          panels with either ``panel_col`` (one panel per distinct column value) or ``panels`` (a
+          ``{title: [group values]}`` dict grouping ``col_group`` values into named panels);
+          ``sort='group'`` clusters the bars in each panel by ``col_group`` instead of by score.
+        * ``'rank_scatter'`` — per-protein rank scatter: proteins ranked by their maximum score
+          (x-axis = rank, y-axis = score) and colored by group, the standard sanity check for a
+          deployed per-protein predictor; ``data`` is a per-protein ``df_rank``. Uses
+          ``col_score``, ``col_group`` (required here), ``group_order``, ``dict_color``,
+          ``thresholds`` (drawn as horizontal score lines), ``marker_size``, ``xlabel``, ``ylabel``.
+        * ``'scatter'`` — two-predictor agreement scatter; ``data`` is ``scores_x`` and the required
+          ``scores_y`` the y-axis. Uses ``labels``, ``dict_color``, ``marker_size``, ``diagonal``,
+          ``xlabel``, ``ylabel``.
+        * ``'cutoff'`` — survival curve of the scores; ``data`` is the ``scores`` array. Uses
+          ``n_steps``, ``thresholds``, ``xlabel``, ``ylabel``. With ``labels`` given, one curve is
+          drawn per group (colored by ``dict_color``) over a common cutoff grid.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        data : pd.DataFrame or array-like
+            Primary input for the selected ``kind`` (see above): a per-sample score array
+            (``'hist'``/``'scatter'``/``'cutoff'``), a per-sample ranking frame (``'ranking'``), or a
+            per-protein ranking frame (``'rank_scatter'``).
+        kind : str, default="hist"
+            Which group figure to draw; one of ``hist``, ``ranking``, ``rank_scatter``, ``scatter``,
+            ``cutoff``.
+        ax : matplotlib.axes.Axes, optional
+            Axes to draw on. If ``None``, a new figure and axes are created.
+        figsize : tuple, optional
+            Figure size when ``ax`` is ``None``. If ``None``, a per-kind default is used.
+        labels : array-like, optional
+            (``kind='hist'``/``'scatter'``/``'cutoff'``) Per-sample class labels used to
+            color/separate the data (adds a class legend, or one curve per group).
+        bins : int, default=20
+            (``kind='hist'``) Number of histogram bins.
+        thresholds : int, float, or list, optional
+            Score values drawn as dashed reference lines (the single reference-line param for every
+            kind). (``kind='hist'``/``'cutoff'``) Vertical lines; with ``kind='hist'`` and
+            ``band=True`` they also delimit the confidence bands. (``kind='rank_scatter'``) Horizontal
+            lines on the score axis. (``kind='ranking'``) x-positions of the dashed cut-off lines;
+            defaults to ``(50, 80)`` for ranking (pass an empty list for none).
+        band : bool, default=False
+            (``kind='hist'``) If ``True``, color each histogram bar by the confidence band it falls
+            into (bands delimited by ``thresholds``) instead of splitting by ``labels``. Requires
+            ``thresholds`` and is mutually exclusive with ``labels``.
+
+            .. versionadded:: 1.1.0
+        dict_color : dict, optional
+            The single ``label``/``group`` ``-> color`` mapping for every kind.
+            (``kind='hist'``/``'scatter'``/``'cutoff'``) Colors the per-class data; defaults to the
+            locked positive/negative sample palette. (``kind='ranking'``/``'rank_scatter'``) Colors
+            the bars/points by ``col_group``; canonical group names (``substrate``,
+            ``non-substrate``, ``hold-out``) default to the locked sample palette, with a fallback
+            palette for other groups.
+        col_name : str, default="name"
+            (``kind='ranking'``) Column with the per-item labels shown as y-tick labels.
+        col_score : str, default="score"
+            (``kind='ranking'``) Column with the numeric prediction score used to rank the bars.
+            (``kind='rank_scatter'``) Column with the per-protein max score ranked on the y-axis.
+        col_group : str, optional
+            (``kind='ranking'``) Column whose distinct values color the bars (adds a class legend).
+            (``kind='rank_scatter'``) Column with the per-protein group label used for coloring
+            (required for this kind).
+        col_std : str, optional
+            (``kind='ranking'``) Column with per-item standard deviations, drawn as error bars.
+        group_order : list of str, optional
+            (``kind='rank_scatter'``) Order in which groups are colored, drawn, and legended;
+            defaults to first-appearance order in ``data``. (``kind='ranking'`` with ``sort='group'``)
+            The order of the ``col_group`` blocks within each panel; a ``panels`` dict overrides it
+            per panel with its own group list.
+        band_colors : list of str, optional
+            (``kind='hist'`` with ``band=True``) One color per confidence band (low to high score);
+            defaults to a sampling of ``cmap``.
+        top_n : int, optional
+            (``kind='ranking'``) If given, keep only the top ``top_n`` ranked items.
+        ascending : bool, default=False
+            (``kind='ranking'``) Sort order; ``False`` ranks the highest score first (on top).
+        panel_col : str, optional
+            (``kind='ranking'``) Column whose distinct values each get their own ranked-bar panel,
+            drawn side by side (requires ``ax=None``); ``None`` draws a single panel. Panels share
+            the x-axis and return an array of axes. Mutually exclusive with ``panels``.
+
+            .. versionadded:: 1.1.0
+        panels : dict, optional
+            (``kind='ranking'``) A ``{panel_title: [col_group values]}`` dict that groups the
+            ``col_group`` values into named, side-by-side panels (each panel holds the rows whose
+            ``col_group`` is in its list). A convenience alternative to pre-computing a ``panel_col``;
+            mutually exclusive with it and requires ``col_group`` and ``ax=None``. The per-panel
+            group list also sets the ``sort='group'`` order within that panel.
+
+            .. versionadded:: 1.1.0
+        sort : {'score', 'group'}, default='score'
+            (``kind='ranking'``) Bar order within each panel: ``'score'`` ranks all bars by
+            ``col_score`` (as before); ``'group'`` clusters the bars by ``col_group`` (in
+            ``group_order`` / the panel's group list) and ranks by score inside each group. Requires
+            ``col_group``.
+
+            .. versionadded:: 1.1.0
+        title : str, optional
+            (``kind='ranking'``) Axes title.
+        scores_y : array-like, optional
+            (``kind='scatter'``, required there) Per-sample scores of the second predictor (y-axis).
+        marker_size : int or float, default=30
+            (``kind='scatter'``/``'rank_scatter'``) Scatter marker size.
+        diagonal : bool, default=True
+            (``kind='scatter'``) If ``True``, draw the ``y = x`` agreement line.
+        n_steps : int, default=101
+            (``kind='cutoff'``) Number of evenly spaced cutoffs between the min and max score.
+        cmap : str, default="GnBu"
+            (``kind='hist'`` with ``band=True`` and no ``band_colors``) Colormap sampled for the
+            per-band colors.
+        xlabel : str, optional
+            x-axis label; defaults to a per-kind label.
+        ylabel : str, optional
+            y-axis label; defaults to a per-kind label.
+        legend_title : str, optional
+            Title of the color-key legend, which is placed **below the plot** (house style, shared
+            across the group / eval figures: frameless, left-aligned, non-bold — set
+            ``options['legend_title_bold']=True`` for bold). Defaults to a per-kind label
+            (``'Class'`` / ``'Group'``); pass ``''`` for an untitled legend, which is also used
+            automatically when the legend has a single entry.
+        line_thresholds : int, float, or list, optional
+            (``kind='hist'``) Which ``thresholds`` are drawn as dashed guide lines. ``None``
+            (default) draws one line per threshold; pass a subset to keep the band coloring at all
+            ``thresholds`` while drawing lines only at some (e.g. band at ``[20, 50, 80]`` but lines
+            only at the ``[20, 80]`` confidence cut-offs).
+        score_range : tuple, optional
+            (``kind='hist'``) ``(low, high)`` bin span and x-limit. When given, the bars are binned
+            across this full range (e.g. ``(0, 100)`` for a percentage score, so they span 0-100
+            regardless of the observed min/max); ``None`` (default) bins over the observed data range.
+        annotate_at : int or float, optional
+            (``kind='cutoff'``) Write each curve's recovery percentage at this cut-off next to it.
+        show_n : bool, default=False
+            (``kind='cutoff'``) Append the group size ``(n=…)`` to each legend label.
+        threshold_labels : list of str, optional
+            (``kind='cutoff'``) Labels drawn above the ``thresholds`` guide lines (e.g.
+            ``["LC cut-off", "HC cut-off"]``).
+        legend_loc : str, optional
+            (``kind='cutoff'``) Place the legend **inside** the axes at this matplotlib location
+            (e.g. ``"lower left"``) instead of below the plot.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The figure.
+        ax : matplotlib.axes.Axes
+            The axes with the requested plot.
+
+        See Also
+        --------
+        * :meth:`AAPred.predict` for the predictions this visualizes.
+        * :meth:`AAPredPlot.predict_sample` for single-protein positional figures.
+        * :meth:`AAPredPlot.eval` for evaluation figures.
+
+        Examples
+        --------
+        .. include:: examples/aap_plot_group.rst
+        """
+        if kind not in LIST_GROUP_KINDS:
+            raise ValueError(f"'kind' ('{kind}') must be one of {LIST_GROUP_KINDS}.")
+        figsize = figsize if figsize is not None else _DICT_GROUP_FIGSIZE[kind]
+        if kind == "hist":
+            return AAPredPlot._plot_hist(
+                scores=data, labels=labels, ax=ax, figsize=figsize, bins=bins,
+                thresholds=thresholds, band=band, dict_color=dict_color, band_colors=band_colors,
+                cmap=cmap, xlabel=_default(xlabel, "Prediction score"),
+                ylabel=_default(ylabel, "Number of samples"),
+                legend_title=_default(legend_title, "Class"), line_thresholds=line_thresholds,
+                score_range=score_range)
+        if kind == "ranking":
+            # Ranking keeps its LC/HC cut-off lines at (50, 80) by default (pass an empty list for none);
+            # the shared ``thresholds`` param is ``None`` by default (= no lines) for the other kinds.
+            return AAPredPlot._plot_ranking(
+                df_pred=data, col_name=col_name, col_score=col_score, col_group=col_group,
+                col_std=col_std, dict_color=dict_color,
+                thresholds=(50, 80) if thresholds is None else thresholds, top_n=top_n,
+                ascending=ascending, ax=ax, figsize=figsize,
+                xlabel=_default(xlabel, "Prediction score [%]"), title=title,
+                panel_col=panel_col, panels=panels, sort=sort, group_order=group_order,
+                legend_title=_default(legend_title, "Group"))
+        if kind == "rank_scatter":
+            return AAPredPlot._plot_rank_scatter(
+                df_rank=data, col_score=col_score, col_group=col_group, group_order=group_order,
+                dict_color=dict_color, thresholds=thresholds, marker_size=marker_size, ax=ax,
+                figsize=figsize, xlabel=_default(xlabel, "Protein rank"),
+                ylabel=_default(ylabel, "Max score per protein"),
+                legend_title=_default(legend_title, "Group"))
+        if kind == "scatter":
+            if scores_y is None:
+                raise ValueError("'kind'='scatter' requires 'scores_y' (the second predictor's scores).")
+            return AAPredPlot._plot_scatter(
+                scores_x=data, scores_y=scores_y, labels=labels, ax=ax, figsize=figsize,
+                dict_color=dict_color, marker_size=marker_size, diagonal=diagonal,
+                xlabel=_default(xlabel, "Predictor 1 score"),
+                ylabel=_default(ylabel, "Predictor 2 score"),
+                legend_title=_default(legend_title, "Class"))
+        # kind == "cutoff"
+        return AAPredPlot._plot_cutoff(
+            scores=data, labels=labels, ax=ax, figsize=figsize, n_steps=n_steps, color=None,
+            dict_color=dict_color, thresholds=thresholds, xlabel=_default(xlabel, "Score cutoff"),
+            ylabel=_default(ylabel, "Samples above cutoff [%]"),
+            legend_title=_default(legend_title, "Group"), annotate_at=annotate_at, show_n=show_n,
+            threshold_labels=threshold_labels, legend_loc=legend_loc)
+
+    @staticmethod
+    def group_cluster(X: Union[pd.DataFrame, ut.ArrayLike2D],
+                      *, kind: Literal["clustermap", "dendrogram"] = "clustermap",
+                      layout: Literal["rectangular", "circular"] = "rectangular",
+                      labels: Optional[ut.ArrayLike1D] = None,
+                      dict_color: Optional[Dict[Hashable, str]] = None,
+                      legend_title: Optional[str] = "Class",
+                      labels_row: Optional[ut.ArrayLike1D] = None,
+                      dict_color_row: Optional[Dict[Hashable, str]] = None,
+                      legend_title_row: Optional[str] = None,
+                      names: Optional[ut.ArrayLike1D] = None,
+                      cmap: str = "GnBu",
+                      figsize: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+                      cbar_label: Optional[str] = "Pearson correlation (r)",
+                      title: Optional[str] = None,
+                      ) -> Tuple[Figure, Axes]:
+        """
+        Cluster the sample group by how its members relate, dispatched by ``kind``.
+
+        The sample-relation counterpart of :meth:`AAPredPlot.predict_group` (which plots the
+        prediction *scores*): ``group_cluster`` takes the sample x feature matrix ``X`` (feature
+        values from :meth:`SequenceFeature.feature_matrix`, or SHAP values from a fitted
+        :class:`ShapModel`) and lays the samples out by their similarity, annotating each sample
+        with up to two per-sample class strips (a top and a left sidebar), each with a titled legend.
+
+        * ``'clustermap'`` — hierarchically clustered sample x sample correlation heatmap of the
+          feature/SHAP vectors. ``labels`` colors the top (column) sidebar and ``labels_row`` the
+          left (row) sidebar; a lone ``labels`` is mirrored onto both.
+        * ``'dendrogram'`` — the sample relation tree alone, drawn with the ``layout`` of choice
+          (``'rectangular'`` or a radial ``'circular'`` tree). It is built from exactly the same
+          linkage as the clustermap, so its topology and leaf order equal the clustermap's row
+          dendrogram. ``labels`` and ``labels_row`` color the leaves as one strip (rectangular)
+          or ring (circular) each, ``labels`` innermost, each with its titled legend.
+
+        .. versionadded:: 1.1.0
+
+        .. versionchanged:: 1.2.0
+           Added ``kind='dendrogram'`` and the ``layout`` parameter.
+
+        Parameters
+        ----------
+        X : pd.DataFrame or array-like
+            Finite numeric per-sample feature or importance matrix, shape ``(n_samples, n_features)``
+            with at least two samples and one feature. Its rows determine the sample relations;
+            use CPP feature values from :meth:`SequenceFeature.feature_matrix` or SHAP values from
+            :class:`ShapModel`.
+        kind : {'clustermap', 'dendrogram'}, default='clustermap'
+            Which relation figure to draw.
+
+            - ``'clustermap'``: draw the clustered sample x sample Pearson-correlation heatmap.
+            - ``'dendrogram'``: draw only the corresponding sample-relation tree.
+
+            .. versionchanged:: 1.2.0
+               Added the ``'dendrogram'`` option.
+        layout : {'rectangular', 'circular'}, default='rectangular'
+            Tree layout when ``kind='dendrogram'``. It has no visual effect for the default
+            clustermap layout; a non-default value with ``kind='clustermap'`` raises a
+            ``ValueError``.
+
+            - ``'rectangular'``: draw the root on the left and leaves in rows on the right.
+            - ``'circular'``: draw a radial tree with the root at the center and leaves around it.
+
+            .. versionadded:: 1.2.0
+        labels : array-like, optional, default=None
+            Per-sample class labels (length ``n_samples``) coloring the top (column) sidebar. When
+            ``labels_row`` is ``None``, the same annotation is mirrored onto the left sidebar. For
+            ``kind='dendrogram'``, they color the innermost leaf strip or ring. If ``None``, no
+            top or innermost annotation is drawn. Labels must be hashable and cannot be ``None``.
+        dict_color : dict, optional, default=None
+            A ``label -> color`` mapping for ``labels``; the mapping order also sets the legend
+            order. It must contain a valid matplotlib color for every label. If ``None``, colors
+            are assigned from the house palette in first-occurrence order.
+        legend_title : str or None, default='Class'
+            Title for the ``labels`` annotation legend. If ``None``, the legend title is
+            ``'Class'``; an empty string also uses ``'Class'``.
+        labels_row : array-like, optional, default=None
+            Per-sample class labels for a *distinct* left (row) sidebar (length ``n_samples``), e.g.
+            a prediction-confidence band alongside a class annotation on top. For
+            ``kind='dendrogram'`` they color a second, outer leaf strip or ring. If ``None``, the
+            clustermap mirrors ``labels`` on its left sidebar and the dendrogram draws no outer
+            annotation. Labels must be hashable and cannot be ``None``.
+        dict_color_row : dict, optional, default=None
+            A ``label -> color`` mapping for ``labels_row``. It must contain a valid matplotlib
+            color for every row label. If ``None``, colors are assigned from the house palette in
+            first-occurrence order.
+        legend_title_row : str or None, default=None
+            Title for the ``labels_row`` annotation legend. If ``None``, the legend title is
+            ``'Class'``; an empty string also uses ``'Class'``.
+        names : array-like, optional, default=None
+            Per-sample tick labels (leaf names for ``kind='dendrogram'``). If ``None``, positional
+            indices are used; otherwise items must be strings or string-convertible. Dense sample
+            sets show only every k-th name.
+        cmap : str, default='GnBu'
+            (``kind='clustermap'``) Colormap for the correlation heatmap; validated
+            but ignored by the dendrogram.
+        figsize : tuple of float, optional, default=None
+            Figure width and height in inches, each at least one. If ``None``, uses ``(11, 11)``
+            for ``kind='clustermap'``, ``(7, 9)`` for a rectangular dendrogram, or ``(9, 10)`` for
+            a circular dendrogram. Both kinds own their figure, so no ``ax`` is accepted.
+        cbar_label : str or None, default='Pearson correlation (r)'
+            (``kind='clustermap'``) Label of the colorbar. Defaults to
+            ``'Pearson correlation (r)'``; ``None`` leaves the colorbar unlabeled. It is
+            validated but ignored by the dendrogram.
+        title : str, optional, default=None
+            Figure title. If ``None``, no figure title is added.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The figure.
+        ax : matplotlib.axes.Axes
+            The clustermap heatmap axes, or the tree axes (a polar axes for ``layout='circular'``).
+
+        Raises
+        ------
+        ValueError
+            If ``kind`` is not one of ``'clustermap'`` or ``'dendrogram'``, if ``layout`` is not one
+            of ``'rectangular'`` or ``'circular'``, or if a non-default ``layout`` is combined with
+            ``kind='clustermap'``.
+        ValueError
+            If ``X`` is not a finite numeric 2D matrix with at least two samples and one feature.
+        ValueError
+            If ``labels``, ``labels_row``, or ``names`` are not list-like of length ``n_samples``,
+            if a label is ``None`` or not hashable, if ``names`` contains an item that is not
+            string-convertible, if ``dict_color`` / ``dict_color_row`` are not dictionaries of
+            valid colors or miss a color for a label, if
+            ``legend_title``, ``legend_title_row``, ``cbar_label``, or ``title`` are not
+            strings, if ``cmap`` is not a valid matplotlib colormap name, or if
+            ``figsize`` is not a tuple of two numbers each at least one.
+
+        See Also
+        --------
+        * :meth:`AAPredPlot.predict_group` for across-samples views of the prediction scores.
+        * :class:`ShapModel` and :meth:`SequenceFeature.feature_matrix` for the input
+          matrix.
+
+        Notes
+        -----
+        * Samples are related by the **Pearson correlation** between their feature/importance
+          vectors. A sample whose vector has zero variance (e.g. an all-zero SHAP row)
+          is treated as uncorrelated (0) with other samples and has self-correlation 1,
+          so the clustering stays well-defined without numerical warnings.
+        * Both kinds share one **hierarchical linkage**, computed with ``scipy`` (average linkage
+          on the Euclidean distances between the rows of that correlation matrix) and handed to
+          ``seaborn.clustermap`` via ``row_linkage`` / ``col_linkage``. The dendrogram therefore
+          shows the same topology and leaf order as the clustermap's row dendrogram.
+        * ``seaborn`` uses the ``fastcluster`` package for its own linkage when it is installed.
+          Since the linkage is now always computed with ``scipy``, a clustermap drawn on a machine
+          with ``fastcluster`` installed may break exact ties between equidistant merges
+          differently than before (the cluster contents are the same; only the arrangement of tied
+          branches can differ).
+
+        Examples
+        --------
+        .. include:: examples/aap_plot_group_cluster.rst
+        """
+        # Validate
+        ut.check_str_options(name="kind", val=kind,
+                             list_str_options=ut.LIST_CLUSTER_KINDS)
+        ut.check_str_options(name="layout", val=layout, list_str_options=ut.LIST_CLUSTER_LAYOUTS)
+        ut.check_cmap(name="cmap", val=cmap)
+        ut.check_str(name="cbar_label", val=cbar_label, accept_none=True)
+        check_match_kind_layout(kind=kind, layout=layout)
+        if kind == "dendrogram":
+            figsize = figsize if figsize is not None else _DICT_DENDROGRAM_FIGSIZE[layout]
+            return AAPredPlot._plot_dendrogram(
+                data=X, layout=layout, labels=labels, dict_color=dict_color,
+                legend_title=legend_title, labels_row=labels_row, dict_color_row=dict_color_row,
+                legend_title_row=legend_title_row, names=names, figsize=figsize, title=title)
+        figsize = figsize if figsize is not None else _DICT_CLUSTER_FIGSIZE[kind]
+        # kind == "clustermap"
+        return AAPredPlot._plot_clustermap(
+            data=X, labels=labels, dict_color=dict_color, legend_title=legend_title,
+            labels_row=labels_row, dict_color_row=dict_color_row, legend_title_row=legend_title_row,
+            names=names, cmap=cmap, figsize=figsize, cbar_label=cbar_label, title=title)
+
+    @staticmethod
+    def eval(df_eval: pd.DataFrame,
+             *, kind: str = "eval",
+             ax: Optional[Axes] = None,
+             figsize: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+             dict_color: Optional[Union[Dict[str, str], List[str]]] = None,
+             baseline: Optional[Union[int, float]] = None,
+             group: str = "group",
+             condition: str = "condition",
+             value: str = "value",
+             baseline_label: Optional[str] = None,
+             annotate: bool = True,
+             annotation_fmt: Optional[str] = None,
+             group_order: Optional[List[str]] = None,
+             condition_order: Optional[List[str]] = None,
+             bar_width: Union[int, float] = 0.8,
+             xlabel: Optional[str] = None,
+             ylabel: str = "Score",
+             title: Optional[str] = None,
+             ylim: Optional[Tuple[Union[int, float], Union[int, float]]] = None,
+             fontsize_annotations: Union[int, float] = 10,
+             xtick_rotation: Union[int, float] = 0,
+             highlight: Optional[Union[int, str, Tuple[int, int], List[Tuple[int, int]]]] = 1,
+             vmin: Optional[Union[int, float]] = None,
+             vmax: Optional[Union[int, float]] = None,
+             cmap: str = "viridis",
+             cbar_label: Optional[str] = None,
+             legend_title: Optional[str] = None,
+             ) -> Tuple[Figure, Axes]:
+        """
+        Visualize model / feature-set evaluation, dispatched by ``kind``.
+
+        Three evaluation figures share one entry point:
+
+        * ``'eval'`` — grouped bar plot comparing **models** across metrics (hue = model), from the
+          long-format ``df_eval`` of :meth:`AAPred.eval` (columns ``model``, ``metric``,
+          ``principle``, ``score``, ``score_std``). Cross-validation bars carry ``score_std`` error
+          bars and held-out bars are hatched. Uses ``dict_color``, ``baseline``, ``ylabel``.
+        * ``'comparison'`` — grouped ``condition`` x ``group`` benchmark barplot with per-bar value
+          labels and an optional baseline, from a tidy ``df_eval`` with ``group`` / ``condition`` /
+          ``value`` columns. Uses ``group``, ``condition``, ``value``, ``baseline``,
+          ``baseline_label``, ``annotate``, ``annotation_fmt``, ``group_order``, ``condition_order``,
+          ``dict_color``, ``bar_width``, ``xlabel``, ``ylabel``, ``title``, ``ylim``,
+          ``fontsize_annotations``, ``xtick_rotation``.
+        * ``'heatmap'`` — square annotated heatmap of a 2D score grid (``df_eval`` is a wide
+          DataFrame whose rows x columns are the two sweep axes and whose cells are the scores),
+          with the best cell(s) boxed (``highlight`` selects how many). Consolidates the recurring
+          "grid of scores -> seaborn heatmap -> box the best configuration" block. Uses ``annotate``,
+          ``annotation_fmt``, ``highlight``, ``vmin``, ``vmax``, ``cmap``, ``cbar_label``, ``title``.
+
+        To compare **CPP parameter combinations** instead, use the feature-optimization protocol
+        :func:`aaanalysis.pipe.find_features` and its evaluation-grid :func:`aaanalysis.pipe.plot_eval`.
+
+        .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        df_eval : pd.DataFrame
+            Evaluation table. For ``kind='eval'`` the :meth:`AAPred.eval` output (columns ``model``,
+            ``metric``, ``principle``, ``score``, ``score_std``); for ``kind='comparison'`` a tidy
+            frame with the ``group`` / ``condition`` / ``value`` columns; for ``kind='heatmap'`` a
+            wide numeric grid whose row index and columns are the two sweep axes and whose cells are
+            the scores.
+        kind : str, default="eval"
+            Which evaluation figure to draw; one of ``eval``, ``comparison``, ``heatmap``.
+        ax : matplotlib.axes.Axes, optional
+            Axes to draw on. If ``None``, a new figure and axes are created.
+        figsize : tuple, optional
+            Figure size when ``ax`` is ``None``. If ``None``, a per-kind default is used.
+        dict_color : dict or list, optional
+            The single ``model``/``group`` ``-> color`` mapping. (``kind='eval'``) A
+            ``model -> color`` dict (the bar hue). (``kind='comparison'``) A ``group -> color`` dict,
+            or a list of colors aligned to ``group_order``.
+        baseline : int or float, optional
+            y-value of a dashed chance / baseline line (e.g. ``0.5`` for ``kind='eval'``, ``50`` for
+            ``kind='comparison'``). If ``None``, no line is drawn.
+        group : str, default="group"
+            (``kind='comparison'``) Column whose distinct values become the colored bars (legend).
+        condition : str, default="condition"
+            (``kind='comparison'``) Column whose distinct values become the x-axis clusters.
+        value : str, default="value"
+            (``kind='comparison'``) Column with the numeric bar heights.
+        baseline_label : str, optional
+            (``kind='comparison'``) Legend label for the baseline; ``None`` generates
+            ``"chance (<baseline>)"``; ``""`` draws the line without a legend entry.
+        annotate : bool, default=True
+            (``kind='comparison'``) If ``True``, write each bar's value above it.
+            (``kind='heatmap'``) If ``True``, write each cell's value inside it.
+        annotation_fmt : str, optional
+            (``kind='comparison'``) Format string for the value labels; auto-chosen when ``None``.
+            (``kind='heatmap'``) Cell-value format; when ``None``, ``".2f"`` for ``[0, 1]``-scaled
+            scores and ``".0f"`` otherwise.
+        group_order : list of str, optional
+            (``kind='comparison'``) Order of the groups (bars within a cluster).
+        condition_order : list of str, optional
+            (``kind='comparison'``) Order of the conditions (x-axis clusters).
+        bar_width : int or float, default=0.8
+            (``kind='comparison'``) Total width of each cluster (split across the groups); in (0, 1].
+        xlabel : str, optional
+            (``kind='comparison'``) x-axis label.
+        ylabel : str, default="Score"
+            y-axis label.
+        title : str, optional
+            (``kind='comparison'``/``'heatmap'``) Axes title.
+        ylim : tuple, optional
+            (``kind='comparison'``) y-axis limits ``(bottom, top)``.
+        fontsize_annotations : int or float, default=10
+            (``kind='comparison'``) Font size of the per-bar value labels.
+        xtick_rotation : int or float, default=0
+            (``kind='comparison'``) Rotation (degrees) of the cluster tick labels.
+        highlight : int, str, tuple, or list, default=1
+            (``kind='heatmap'``) Which cell(s) to box with a bold frame: a positive int ``N`` boxes
+            the ``N`` best (highest-value) cells (``1`` = the single best), ``"max"`` / ``"min"`` box
+            the single best / worst cell, an explicit ``(row, col)`` (or list of them) boxes those
+            cells, and ``None`` boxes nothing.
+
+            .. versionadded:: 1.1.0
+        vmin : int or float, optional
+            (``kind='heatmap'``) Lower bound of the color scale; auto-scaled when ``None``.
+
+            .. versionadded:: 1.1.0
+        vmax : int or float, optional
+            (``kind='heatmap'``) Upper bound of the color scale; auto-scaled when ``None``.
+
+            .. versionadded:: 1.1.0
+        cmap : str, default="viridis"
+            (``kind='heatmap'``) Colormap for the heatmap cells.
+
+            .. versionadded:: 1.1.0
+        cbar_label : str, optional
+            (``kind='heatmap'``) Label of the colorbar; defaults to ``"Score"``.
+
+            .. versionadded:: 1.1.0
+        legend_title : str, optional
+            (``kind='eval'``/``'comparison'``) Title of the color-key legend, placed **below the
+            plot** (house style: frameless, left-aligned, non-bold — set
+            ``options['legend_title_bold']=True`` for bold). Defaults to a per-kind label (the model
+            / group name); pass ``''`` for an untitled legend.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            The figure.
+        ax : matplotlib.axes.Axes
+            The axes with the requested evaluation plot.
+
+        See Also
+        --------
+        * :meth:`AAPred.eval` for the evaluation table this visualizes.
+        * :func:`aaanalysis.pipe.find_features` and :func:`aaanalysis.pipe.plot_eval` for
+          comparing CPP parameter combinations (a heatmap over the parameter grid).
+
+        Examples
+        --------
+        .. include:: examples/aap_plot_eval.rst
+        """
+        if kind not in LIST_EVAL_KINDS:
+            raise ValueError(f"'kind' ('{kind}') must be one of {LIST_EVAL_KINDS}.")
+        if kind == "eval":
+            return AAPredPlot._eval_bars(
+                df_eval=df_eval, ax=ax, figsize=_default(figsize, (7, 5)),
+                dict_color=dict_color, baseline=baseline, ylabel=ylabel,
+                legend_title=_default(legend_title, "Model"))
+        if kind == "heatmap":
+            return AAPredPlot._plot_heatmap(
+                df_eval=df_eval, ax=ax, figsize=_default(figsize, (6, 5)),
+                annotate=annotate, annotation_fmt=annotation_fmt,
+                highlight=highlight, vmin=vmin, vmax=vmax, cmap=cmap,
+                cbar_label=_default(cbar_label, "Score"), title=title,
+                xlabel=xlabel, ylabel=ylabel)
+        # kind == "comparison"
+        return AAPredPlot._plot_comparison(
+            df_eval=df_eval, group=group, condition=condition, value=value, baseline=baseline,
+            baseline_label=baseline_label, annotate=annotate, annotation_fmt=annotation_fmt,
+            group_order=group_order, condition_order=condition_order, dict_color=dict_color,
+            bar_width=bar_width, ax=ax, figsize=_default(figsize, (7, 4.2)), xlabel=xlabel,
+            ylabel=ylabel, title=title, ylim=ylim, fontsize_annotations=fontsize_annotations,
+            xtick_rotation=xtick_rotation, legend_title=_default(legend_title, group.capitalize()))
+
+    # III Private renderers (one per kind; kept as the original drawing logic)
+    @staticmethod
+    def _eval_bars(df_eval, ax=None, figsize=(7, 5), dict_color=None, baseline=None,
+                   ylabel="Score", legend_title=None):
+        """Grouped bar plot comparing methods across metrics (hue = model)."""
+        # Check input
+        cols = ut.COLS_EVAL_PRED
+        ut.check_df(name="df_eval", df=df_eval, cols_required=cols)
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_dict_color(name="dict_color", val=dict_color, accept_none=True)
+        if baseline is not None:
+            ut.check_number_val(name="baseline", val=baseline, just_int=False)
+        ut.check_str(name="ylabel", val=ylabel, accept_none=True)
+        # Grouped bar plot: metrics on the x-axis, one bar per (feature set x) model x principle.
+        # A ``features`` column (from AAPred.eval(baseline=...)) splits each group into the compared
+        # feature sets ('cpp' vs the baselines) so their rows are NEVER averaged together; it then
+        # becomes the hue. Without it the plot is unchanged (one hued bar per model).
+        has_features = ut.COL_FEATURES in df_eval.columns
+        metrics = list(dict.fromkeys(df_eval[ut.COL_METRIC].tolist()))
+        models = list(dict.fromkeys(df_eval[ut.COL_MODEL].tolist()))
+        principles = list(dict.fromkeys(df_eval[ut.COL_PRINCIPLE].tolist()))
+        feature_sets = list(dict.fromkeys(df_eval[ut.COL_FEATURES].tolist())) if has_features else [None]
+        fig, ax = _new_ax(ax=ax, figsize=figsize)
+        dict_color = dict(dict_color) if dict_color is not None else {}
+        hue_keys = feature_sets if has_features else models
+        clist = ut.plot_get_clist_(n_colors=max(len(hue_keys), 2))
+        dict_hue_color = {k: dict_color.get(k, clist[i % len(clist)]) for i, k in enumerate(hue_keys)}
+        n_groups = len(models) * len(principles) * len(feature_sets)
+        width = 0.8 / max(n_groups, 1)
+        x = np.arange(len(metrics))
+        idx = 0
+        for feat in feature_sets:
+            for model in models:
+                for principle in principles:
+                    mask = (df_eval[ut.COL_MODEL] == model) & (df_eval[ut.COL_PRINCIPLE] == principle)
+                    if has_features:
+                        mask = mask & (df_eval[ut.COL_FEATURES] == feat)
+                    sub = df_eval[mask]
+                    heights = [float(sub[sub[ut.COL_METRIC] == m][ut.COL_SCORE].mean()) for m in metrics]
+                    errs = [float(sub[sub[ut.COL_METRIC] == m][ut.COL_SCORE_STD].mean()) for m in metrics]
+                    errs = [0 if np.isnan(e) else e for e in errs]
+                    hatch = "//" if principle == ut.STR_PRINCIPLE_HOLDOUT else None
+                    color = dict_hue_color[feat] if has_features else dict_hue_color[model]
+                    if has_features:
+                        parts = [str(feat)]
+                        if len(models) > 1:
+                            parts.append(model)
+                        if len(principles) > 1:
+                            parts.append(principle)
+                        label = " · ".join(parts)
+                    else:
+                        label = model if len(principles) == 1 else f"{model} ({principle})"
+                    ax.bar(x + (idx - (n_groups - 1) / 2) * width, heights, width=width,
+                           color=color, edgecolor="black", linewidth=0.6,
+                           hatch=hatch, yerr=errs, capsize=2.5, label=label)
+                    idx += 1
+        if baseline is not None:
+            ax.axhline(baseline, color="grey", linestyle="--", linewidth=1)
+        ax.set_xticks(x)
+        # Anchored rotation keeps neighbouring metric names (e.g. 'balanced_accuracy') apart
+        ax.set_xticklabels(metrics, rotation=35, ha="right", rotation_mode="anchor")
+        ax.set_ylabel(ylabel)
+        place_legend_below_(ax=ax, title=legend_title, fontsize=8)
+        sns.despine(ax=ax)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def _plot_heatmap(df_eval, ax=None, figsize=(6, 5), annotate=True, annotation_fmt=None,
+                      highlight="max", vmin=None, vmax=None, cmap="viridis", cbar_label="Score",
+                      title=None, xlabel=None, ylabel=None):
+        """Square annotated heatmap of a 2D score grid, boxing the optimal cell."""
+        # Check input
+        ut.check_df(name="df_eval", df=df_eval, accept_none=False, accept_nan=True)
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_bool(name="annotate", val=annotate)
+        ut.check_str(name="annotation_fmt", val=annotation_fmt, accept_none=True)
+        ut.check_number_val(name="vmin", val=vmin, accept_none=True)
+        ut.check_number_val(name="vmax", val=vmax, accept_none=True)
+        ut.check_str(name="cmap", val=cmap, accept_none=False)
+        ut.check_str(name="cbar_label", val=cbar_label, accept_none=True)
+        ut.check_str(name="title", val=title, accept_none=True)
+        ut.check_str(name="xlabel", val=xlabel, accept_none=True)
+        ut.check_str(name="ylabel", val=ylabel, accept_none=True)
+        try:
+            data = np.asarray(df_eval.to_numpy(), dtype=float)
+        except (ValueError, TypeError):
+            raise ValueError("'df_eval' (for kind='heatmap') should contain only numeric scores.")
+        if data.size == 0:
+            raise ValueError("'df_eval' (empty) should have at least one cell for kind='heatmap'.")
+        highlight_cells = _check_highlight_cells(highlight=highlight, data=data)
+        if annotation_fmt is None:
+            # [0, 1]-scaled scores need decimals; percent-scaled ones read best as integers.
+            finite = data[np.isfinite(data)]
+            annotation_fmt = ".2f" if finite.size and np.max(np.abs(finite)) <= 1.5 else ".0f"
+        # Draw the square annotated heatmap; let matplotlib place a layout-robust colorbar (a
+        # free-floating cax positioned from draw-time coords would detach under tight_layout).
+        fig, ax = _new_ax(ax=ax, figsize=figsize)
+        sns.heatmap(df_eval, vmin=vmin, vmax=vmax, cmap=cmap, annot=annotate, fmt=annotation_fmt,
+                    square=True, linewidth=0.1, cbar=False, ax=ax)
+        ax.tick_params(left=False, bottom=False)
+        plt.setp(ax.get_yticklabels(), rotation=0)
+        plt.setp(ax.get_xticklabels(), rotation=0)
+        if xlabel is not None:
+            ax.set_xlabel(xlabel)
+        if ylabel is not None:
+            ax.set_ylabel(ylabel)
+        # Box the selected cell(s) with a frame inset slightly inside the cell (matches the
+        # hand-rolled house heatmap: a crisp box that does not sit on the grid lines).
+        for i, j in highlight_cells:
+            ax.add_patch(plt.Rectangle((j + 0.04, i + 0.04), 0.92, 0.92, fill=False,
+                                       edgecolor="black", lw=3, clip_on=False))
+        # Slim colorbar sized to the heatmap grid itself: a cax anchored in the grid's data
+        # coordinates (just right of the grid, spanning its full height) tracks the square-aspect
+        # grid exactly, so it never over-runs the grid on a non-square df_eval the way a fixed
+        # axes-fraction colorbar (``fraction=...``) does when ``square=True`` letterboxes the grid.
+        # As a child of ``ax`` it also survives a later ``tight_layout()``.
+        n_rows, n_cols = data.shape
+        cax = ax.inset_axes([n_cols + 0.25, 0, 0.15, n_rows], transform=ax.transData)
+        cb = fig.colorbar(ax.collections[-1], cax=cax, label=cbar_label)
+        cb.outline.set_visible(False)
+        cb.ax.add_line(plt.Line2D([1, 1], [0, 1], transform=cb.ax.transAxes, color="black",
+                                  linewidth=plt.rcParams["axes.linewidth"], clip_on=False))
+        if title is not None:
+            ax.set_title(title)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def _plot_comparison(df_eval, group="group", condition="condition", value="value",
+                         baseline=None, baseline_label=None, annotate=True, annotation_fmt=None,
+                         group_order=None, condition_order=None, dict_color=None, bar_width=0.8,
+                         ax=None, figsize=(7, 4.2), xlabel=None, ylabel="Score", title=None,
+                         ylim=None, fontsize_annotations=10, xtick_rotation=0, legend_title=None):
+        """Grouped method x condition comparison barplot with value labels and a baseline."""
+        # Check input
+        ut.check_str(name="group", val=group)
+        ut.check_str(name="condition", val=condition)
+        ut.check_str(name="value", val=value)
+        if len({group, condition, value}) < 3:
+            raise ValueError(f"'group', 'condition', and 'value' should be three distinct columns, "
+                             f"got group={group!r}, condition={condition!r}, value={value!r}.")
+        ut.check_df(name="df_eval", df=df_eval, cols_required=[group, condition, value])
+        if len(df_eval) == 0:
+            raise ValueError("'df_eval' (0 rows) should contain at least one row.")
+        if not pd.api.types.is_numeric_dtype(df_eval[value]):
+            raise ValueError(f"'{value}' column of 'df_eval' should be numeric, "
+                             f"got dtype '{df_eval[value].dtype}'.")
+        ut.check_number_val(name="baseline", val=baseline, accept_none=True, just_int=False)
+        ut.check_str(name="baseline_label", val=baseline_label, accept_none=True)
+        ut.check_bool(name="annotate", val=annotate)
+        ut.check_str(name="annotation_fmt", val=annotation_fmt, accept_none=True)
+        ut.check_list_like(name="group_order", val=group_order, accept_none=True)
+        ut.check_list_like(name="condition_order", val=condition_order, accept_none=True)
+        ut.check_number_range(name="bar_width", val=bar_width, min_val=0, max_val=1, just_int=False)
+        if bar_width == 0:
+            raise ValueError("'bar_width' should be greater than 0.")
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_str(name="xlabel", val=xlabel, accept_none=True)
+        ut.check_str(name="ylabel", val=ylabel, accept_none=True)
+        ut.check_str(name="title", val=title, accept_none=True)
+        ut.check_number_range(name="fontsize_annotations", val=fontsize_annotations, min_val=0,
+                              just_int=False)
+        ut.check_number_val(name="xtick_rotation", val=xtick_rotation, just_int=False)
+        if ylim is not None:
+            ut.check_lim(name="ylim", val=ylim)
+        # Plot
+        fig, ax = plot_comparison_(df_eval=df_eval, group=group, condition=condition, value=value,
+                                   baseline=baseline, baseline_label=baseline_label, annotate=annotate,
+                                   annotation_fmt=annotation_fmt, group_order=group_order,
+                                   condition_order=condition_order, dict_color=dict_color, bar_width=bar_width,
+                                   ax=ax, figsize=figsize, xlabel=xlabel, ylabel=ylabel, title=title,
+                                   ylim=ylim, fontsize_annotations=fontsize_annotations,
+                                   xtick_rotation=xtick_rotation, legend_title=legend_title)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def _plot_ranking(df_pred, col_name="name", col_score="score", col_group=None, col_std=None,
+                      dict_color=None, thresholds=(50, 80), top_n=None, ascending=False, ax=None,
+                      figsize=None, xlabel="Prediction score", title=None, panel_col=None,
+                      panels=None, sort="score", group_order=None, legend_title=None):
+        """Ranked candidates as horizontal bars colored by class, with cut-off lines.
+
+        ``panel_col`` (a column) or ``panels`` (a ``{title: [group values]}`` dict) split the bars
+        into side-by-side panels; ``sort='group'`` clusters the bars within each panel by
+        ``col_group`` (in ``group_order``) and ranks by score inside each group.
+        """
+        # Check input
+        ut.check_str(name="col_name", val=col_name)
+        ut.check_str(name="col_score", val=col_score)
+        ut.check_str(name="col_group", val=col_group, accept_none=True)
+        ut.check_str(name="col_std", val=col_std, accept_none=True)
+        ut.check_str(name="panel_col", val=panel_col, accept_none=True)
+        ut.check_str_options(name="sort", val=sort, list_str_options=["score", "group"])
+        ut.check_list_like(name="group_order", val=group_order, accept_none=True)
+        cols_required = [c for c in [col_name, col_score, col_group, col_std, panel_col] if c is not None]
+        ut.check_df(name="df_pred", df=df_pred, cols_required=cols_required)
+        if len(df_pred) == 0:
+            raise ValueError("'df_pred' (0 rows) should contain at least one row.")
+        if not pd.api.types.is_numeric_dtype(df_pred[col_score]):
+            raise ValueError(f"'{col_score}' column of 'df_pred' should be numeric.")
+        ut.check_bool(name="ascending", val=ascending)
+        if top_n is not None:
+            ut.check_number_range(name="top_n", val=top_n, min_val=1, just_int=True)
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_str(name="xlabel", val=xlabel, accept_none=True)
+        ut.check_str(name="title", val=title, accept_none=True)
+        if sort == "group" and col_group is None:
+            raise ValueError("'sort'='group' requires 'col_group' (the column that colors the bars).")
+        if panels is not None and panel_col is not None:
+            raise ValueError("Pass either 'panels' or 'panel_col', not both (both make panels).")
+        # Resolve panels -> [(title, sub-frame, per-panel group order)], or None for a single panel
+        panel_specs = _resolve_ranking_panels(df_pred, col_group, panel_col, panels, group_order)
+        if panel_specs is None:
+            fig, ax = plot_ranking_(df_pred=df_pred, col_name=col_name, col_score=col_score,
+                                    col_group=col_group, col_std=col_std, dict_color=dict_color,
+                                    thresholds=thresholds, top_n=top_n, ascending=ascending, ax=ax,
+                                    figsize=figsize, xlabel=xlabel, title=title, sort=sort,
+                                    group_order=group_order, legend_title=legend_title)
+            return ut.FigAxResult(fig, ax)
+        if ax is not None:
+            raise ValueError("'panels'/'panel_col' draw multiple panels and require 'ax' (None).")
+        n_rows_max = max((len(sub) for _, sub, _ in panel_specs), default=0)
+        if figsize is None:
+            figsize = (5.0 * len(panel_specs), ranking_figheight(n_rows_max))
+        fig, axes = plt.subplots(1, len(panel_specs), figsize=figsize, sharex=True, squeeze=False)
+        axes = axes[0]
+        for (ptitle, sub, pgo), ax_i in zip(panel_specs, axes):
+            # Suppress each panel's own legend; one combined legend goes below the whole figure.
+            plot_ranking_(df_pred=sub, col_name=col_name, col_score=col_score, col_group=col_group,
+                          col_std=col_std, dict_color=dict_color, thresholds=thresholds, top_n=top_n,
+                          ascending=ascending, ax=ax_i, figsize=figsize, xlabel=xlabel, sort=sort,
+                          group_order=pgo, title=ptitle if title is None else f"{title}: {ptitle}",
+                          draw_legend=False)
+        if col_group is not None:
+            all_groups = (list(group_order) if group_order is not None
+                          else list(dict.fromkeys(df_pred[col_group].tolist())))
+            colors = _resolve_group_colors(all_groups, dict_color)
+            handles = [plt.Rectangle((0, 0), 1, 1, color=colors[g]) for g in all_groups]
+            place_legend_below_(fig=fig, handles=handles, labels=all_groups,
+                                title=legend_title, fontsize=9, y=0.02)
+        return ut.FigAxResult(fig, axes)
+
+    @staticmethod
+    def _plot_rank_scatter(df_rank, col_score="score", col_group=None, group_order=None,
+                           dict_color=None, thresholds=None, marker_size=25, ax=None,
+                           figsize=None, xlabel="Protein rank", ylabel="Max score per protein",
+                           legend_title=None):
+        """Per-protein rank scatter: max-score-per-protein sorted by score, colored by group."""
+        # Check input
+        if col_group is None:
+            raise ValueError("'kind'='rank_scatter' requires 'col_group' (the per-protein group "
+                             "column used for coloring).")
+        ut.check_str(name="col_score", val=col_score)
+        ut.check_str(name="col_group", val=col_group)
+        ut.check_df(name="df_rank", df=df_rank, cols_required=[col_score, col_group])
+        if len(df_rank) == 0:
+            raise ValueError("'df_rank' (0 rows) should contain at least one protein.")
+        if not pd.api.types.is_numeric_dtype(df_rank[col_score]):
+            raise ValueError(f"'{col_score}' column of 'df_rank' should be numeric.")
+        ut.check_list_like(name="group_order", val=group_order, accept_none=True)
+        ut.check_dict_color(name="dict_color", val=dict_color, accept_none=True)
+        ut.check_number_range(name="marker_size", val=marker_size, min_val=0, just_int=False)
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_str(name="xlabel", val=xlabel, accept_none=True)
+        ut.check_str(name="ylabel", val=ylabel, accept_none=True)
+        list_thresholds = []
+        if thresholds is not None:
+            list_thresholds = list(thresholds) if isinstance(thresholds, (list, tuple)) else [thresholds]
+            for i, t in enumerate(list_thresholds):
+                ut.check_number_val(name=f"thresholds[{i}]", val=t, just_int=False)
+        if group_order is not None:
+            missing = set(df_rank[col_group]) - set(group_order)
+            if missing:
+                raise ValueError(f"'group_order' is missing groups present in 'df_rank': {missing}")
+        # Plot
+        fig, ax = plot_rank_scatter_(df_rank=df_rank, col_score=col_score, col_group=col_group,
+                                     group_order=group_order, dict_color=dict_color,
+                                     thresholds=list_thresholds, ax=ax, figsize=figsize,
+                                     marker_size=marker_size, xlabel=xlabel, ylabel=ylabel,
+                                     legend_title=legend_title)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def _plot_clustermap(data, labels=None, dict_color=None,
+                         legend_title: Optional[str] = "Class",
+                         labels_row=None, dict_color_row=None,
+                         legend_title_row: Optional[str] = None,
+                         names=None, cmap="GnBu", figsize=(11, 11),
+                         cbar_label: Optional[str] = "Pearson correlation (r)", title=None):
+        """Cluster samples by explanation similarity (correlation of importance vectors)."""
+        # Check input
+        data, names, labels, labels_row = _check_cluster_inputs(
+            data=data, names=names, labels=labels, labels_row=labels_row, dict_color=dict_color,
+            dict_color_row=dict_color_row, legend_title=legend_title,
+            legend_title_row=legend_title_row, figsize=figsize, title=title)
+        # Plot
+        fig, ax = plot_clustermap_(data=data, names=names, labels=labels, dict_color=dict_color,
+                                   legend_title=legend_title, labels_row=labels_row,
+                                   dict_color_row=dict_color_row, legend_title_row=legend_title_row,
+                                   cmap=cmap, figsize=figsize, cbar_label=cbar_label, title=title)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def _plot_dendrogram(data, layout="rectangular", labels=None, dict_color=None,
+                         legend_title: Optional[str] = "Class", labels_row=None,
+                         dict_color_row=None, legend_title_row: Optional[str] = None,
+                         names=None, figsize=(7, 9), title=None):
+        """Sample relation tree (rectangular or circular) sharing the clustermap linkage."""
+        # Check input
+        data, names, labels, labels_row = _check_cluster_inputs(
+            data=data, names=names, labels=labels, labels_row=labels_row, dict_color=dict_color,
+            dict_color_row=dict_color_row, legend_title=legend_title,
+            legend_title_row=legend_title_row, figsize=figsize, title=title)
+        # Plot
+        fig, ax = plot_dendrogram_(data=data, names=names, labels=labels, dict_color=dict_color,
+                                   legend_title=legend_title, labels_row=labels_row,
+                                   dict_color_row=dict_color_row, legend_title_row=legend_title_row,
+                                   layout=layout, figsize=figsize, title=title)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def _plot_hist(scores, labels=None, ax=None, figsize=(6, 4.5), bins=20, thresholds=None,
+                   band=False, dict_color=None, band_colors=None, cmap="viridis",
+                   xlabel="Prediction score", ylabel="Number of samples", legend_title=None,
+                   line_thresholds=None, score_range=None):
+        """Histogram of per-sample prediction scores, class-separated or confidence-banded."""
+        # Check input
+        scores = ut.check_array_like(name="scores", val=scores, expected_dim=1)
+        labels = ut.check_labels(labels=labels) if labels is not None else None
+        check_match_scores_labels(scores=scores, labels=labels)
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_number_range(name="bins", val=bins, min_val=1, just_int=True)
+        ut.check_bool(name="band", val=band)
+        ut.check_dict_color(name="dict_color", val=dict_color, accept_none=True)
+        ut.check_str(name="cmap", val=cmap, accept_none=False)
+        ut.check_str(name="xlabel", val=xlabel, accept_none=True)
+        ut.check_str(name="ylabel", val=ylabel, accept_none=True)
+        list_thresholds = []
+        if thresholds is not None:
+            list_thresholds = list(thresholds) if isinstance(thresholds, (list, tuple)) else [thresholds]
+            for i, t in enumerate(list_thresholds):
+                ut.check_number_val(name=f"thresholds[{i}]", val=t, just_int=False)
+        if line_thresholds is not None:
+            _lt = list(line_thresholds) if isinstance(line_thresholds, (list, tuple)) else [line_thresholds]
+            for i, t in enumerate(_lt):
+                ut.check_number_val(name=f"line_thresholds[{i}]", val=t, just_int=False)
+        if band:
+            if not list_thresholds:
+                raise ValueError("'band' (True) should be used with 'thresholds' delimiting the "
+                                 "confidence bands.")
+            if labels is not None:
+                raise ValueError("'band' (True) colors bars by score band and should be used with "
+                                 "'labels' (None); pass one or the other, not both.")
+        # Resolve colors
+        dict_color = dict(dict_color) if dict_color is not None else {}
+        default_cycle = [ut.COLOR_POS, ut.COLOR_NEG, ut.COLOR_REL_NEG, ut.COLOR_UNL]
+        # Bin over the full ``score_range`` when given (so the bars span it, e.g. 0-100 for a
+        # percentage score), otherwise over the observed data range.
+        if score_range is not None:
+            ut.check_lim(name="score_range", val=score_range)
+            lo, hi = float(score_range[0]), float(score_range[1])
+        else:
+            lo, hi = float(np.min(scores)), float(np.max(scores))
+        # Draw
+        fig, ax = _new_ax(ax=ax, figsize=figsize)
+        bin_edges = np.linspace(lo, hi, bins + 1)
+        if band:
+            sorted_ths = sorted(list_thresholds)
+            band_colors = _resolve_band_colors(band_colors=band_colors, cmap=cmap, n_bands=len(sorted_ths) + 1)
+            _, edges, patches = ax.hist(scores, bins=bin_edges, edgecolor="black", linewidth=0.6)
+            for patch, left in zip(patches, edges[:-1]):
+                patch.set_facecolor(band_colors[_band_index(left, sorted_ths)])
+        elif labels is None:
+            ax.hist(scores, bins=bin_edges, color=ut.COLOR_POS, edgecolor="black", linewidth=0.6)
+        else:
+            for i, lab in enumerate(sorted(set(labels))):
+                color = dict_color.get(lab, default_cycle[i % len(default_cycle)])
+                ax.hist(np.asarray(scores)[np.asarray(labels) == lab], bins=bin_edges, alpha=0.7,
+                        color=color, edgecolor="black", linewidth=0.6, label=str(lab))
+            place_legend_below_(ax=ax, title=legend_title)
+        # Draw dashed guide lines. By default one per threshold; ``line_thresholds`` restricts them
+        # (e.g. band-color at [20, 50, 80] but a line only at the [20, 80] confidence cut-offs, so
+        # the 50 split inside the low-confidence zone carries no line).
+        if line_thresholds is None:
+            draw_ths = list_thresholds
+        else:
+            draw_ths = list(line_thresholds) if isinstance(line_thresholds, (list, tuple)) else [line_thresholds]
+        for t in draw_ths:
+            ax.axvline(t, color="0.3", linestyle="--", linewidth=1.3)
+        if score_range is not None:
+            ax.set_xlim(lo, hi)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        sns.despine(ax=ax)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def _plot_scatter(scores_x, scores_y, labels=None, ax=None, figsize=(5.5, 5.5), dict_color=None,
+                      marker_size=30, diagonal=True, xlabel="Predictor 1 score",
+                      ylabel="Predictor 2 score", legend_title=None):
+        """2D scatter comparing per-sample scores of two predictors."""
+        # Check input
+        scores_x = ut.check_array_like(name="scores_x", val=scores_x, expected_dim=1)
+        scores_y = ut.check_array_like(name="scores_y", val=scores_y, expected_dim=1)
+        if len(scores_x) != len(scores_y):
+            raise ValueError(f"'scores_x' (n={len(scores_x)}) and 'scores_y' (n={len(scores_y)}) should match in length.")
+        labels = ut.check_labels(labels=labels) if labels is not None else None
+        check_match_scores_labels(scores=scores_x, labels=labels)
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_dict_color(name="dict_color", val=dict_color, accept_none=True)
+        ut.check_number_range(name="marker_size", val=marker_size, min_val=0, just_int=False)
+        ut.check_bool(name="diagonal", val=diagonal)
+        ut.check_str(name="xlabel", val=xlabel, accept_none=True)
+        ut.check_str(name="ylabel", val=ylabel, accept_none=True)
+        # Resolve colors
+        dict_color = dict(dict_color) if dict_color is not None else {}
+        default_cycle = [ut.COLOR_POS, ut.COLOR_NEG, ut.COLOR_REL_NEG, ut.COLOR_UNL]
+        # Draw
+        fig, ax = _new_ax(ax=ax, figsize=figsize)
+        if diagonal:
+            lo = float(min(np.min(scores_x), np.min(scores_y)))
+            hi = float(max(np.max(scores_x), np.max(scores_y)))
+            ax.plot([lo, hi], [lo, hi], color="0.6", linestyle="--", linewidth=1, zorder=0)
+        if labels is None:
+            ax.scatter(scores_x, scores_y, s=marker_size, color=ut.COLOR_POS,
+                       edgecolors="white", linewidths=0.3)
+        else:
+            sx, sy, la = np.asarray(scores_x), np.asarray(scores_y), np.asarray(labels)
+            for i, lab in enumerate(sorted(set(labels))):
+                color = dict_color.get(lab, default_cycle[i % len(default_cycle)])
+                mask = la == lab
+                ax.scatter(sx[mask], sy[mask], s=marker_size, color=color,
+                           edgecolors="white", linewidths=0.3, label=str(lab))
+            place_legend_below_(ax=ax, title=legend_title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        sns.despine(ax=ax)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def _plot_cutoff(scores, labels=None, ax=None, figsize=(6, 4.5), n_steps=101, color=None,
+                     dict_color=None, thresholds=None, xlabel="Score cutoff",
+                     ylabel="Samples above cutoff [%]", legend_title=None,
+                     annotate_at=None, show_n=False, threshold_labels=None, legend_loc=None):
+        """Line plot of the percentage of samples scoring at or above each cutoff.
+
+        With ``labels`` given, one survival curve is drawn per group over a common cutoff grid.
+        ``annotate_at`` writes each curve's recovery % at that cut-off; ``show_n`` appends the group
+        size to the legend labels; ``threshold_labels`` labels the ``thresholds`` guide lines;
+        ``legend_loc`` places the legend inside at that matplotlib location (else below the axes).
+        """
+        # Check input
+        scores = ut.check_array_like(name="scores", val=scores, expected_dim=1)
+        if len(scores) == 0:
+            raise ValueError("'scores' (0 values) should contain at least one score.")
+        labels = ut.check_list_like(name="labels", val=labels) if labels is not None else None
+        if labels is not None and len(labels) != len(scores):
+            raise ValueError(f"'labels' (n={len(labels)}) should match 'scores' (n={len(scores)}).")
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_number_range(name="n_steps", val=n_steps, min_val=2, just_int=True)
+        ut.check_color(name="color", val=color, accept_none=True)
+        ut.check_dict_color(name="dict_color", val=dict_color, accept_none=True)
+        ut.check_str(name="xlabel", val=xlabel, accept_none=True)
+        ut.check_str(name="ylabel", val=ylabel, accept_none=True)
+        list_thresholds = []
+        if thresholds is not None:
+            list_thresholds = list(thresholds) if isinstance(thresholds, (list, tuple)) else [thresholds]
+            for i, t in enumerate(list_thresholds):
+                ut.check_number_val(name=f"thresholds[{i}]", val=t, just_int=False)
+        ut.check_number_val(name="annotate_at", val=annotate_at, accept_none=True)
+        ut.check_bool(name="show_n", val=show_n)
+        ut.check_list_like(name="threshold_labels", val=threshold_labels, accept_none=True)
+        ut.check_str(name="legend_loc", val=legend_loc, accept_none=True)
+
+        def _annotate(g_scores, col):
+            if annotate_at is not None:
+                rec = 100.0 * np.mean(g_scores >= annotate_at)
+                ax.text(annotate_at + 2, rec, f"{rec:.0f}%", color=col, va="center", fontsize="small")
+
+        # Compute over a common cutoff grid so grouped curves are comparable
+        scores = np.asarray(scores, dtype=float)
+        cutoffs = np.linspace(float(np.min(scores)), float(np.max(scores)), n_steps)
+        # Draw
+        fig, ax = _new_ax(ax=ax, figsize=figsize)
+        if labels is None:
+            pct = np.array([100.0 * np.mean(scores >= c) for c in cutoffs])
+            col = color or ut.COLOR_FEAT_POS
+            ax.plot(cutoffs, pct, color=col, linewidth=2)
+            _annotate(scores, col)
+        else:
+            labels = np.asarray(labels)
+            dict_color = dict(dict_color) if dict_color is not None else {}
+            default_cycle = [ut.COLOR_POS, ut.COLOR_NEG, ut.COLOR_REL_NEG, ut.COLOR_UNL]
+            for i, lab in enumerate(sorted(set(labels.tolist()))):
+                g_scores = scores[labels == lab]
+                pct = np.array([100.0 * np.mean(g_scores >= c) for c in cutoffs])
+                col = dict_color.get(lab, default_cycle[i % len(default_cycle)])
+                lab_txt = f"{lab} (n={len(g_scores)})" if show_n else str(lab)
+                ax.plot(cutoffs, pct, color=col, linewidth=2, label=lab_txt)
+                _annotate(g_scores, col)
+            if legend_loc is not None:
+                weight = "bold" if ut.check_legend_title_bold() else "normal"
+                leg = ax.legend(loc=legend_loc, frameon=False, fontsize="small",
+                                title=legend_title or None,
+                                title_fontproperties={"weight": weight, "size": "small"} if legend_title else None)
+                if leg is not None:
+                    leg._legend_box.align = "left"
+            else:
+                place_legend_below_(ax=ax, title=legend_title)
+        for k, t in enumerate(list_thresholds):
+            ax.axvline(t, color="0.3", linestyle="--", linewidth=1.3)
+            if threshold_labels is not None and k < len(threshold_labels) and threshold_labels[k]:
+                ax.text(t, 1.005, threshold_labels[k], transform=ax.get_xaxis_transform(),
+                        ha="center", va="bottom", fontsize="small", clip_on=False)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_ylim(0, 100)
+        sns.despine(ax=ax)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def _check_track_inputs(df_seq=None, df_scales=None, df_cat=None, subcats=None, df_feat=None):
+        """Validate and default-resolve the multi-track viewer inputs.
+
+        Returns the (possibly default-loaded) ``(df_scales, df_cat, subcats)`` triple; the
+        bundled scales / classification are loaded only when ``subcats`` is requested and the
+        matching frame is ``None``.
+        """
+        if df_seq is not None:
+            ut.check_df(name="df_seq", df=df_seq, cols_required=[ut.COL_ENTRY])
+        if df_scales is not None:
+            ut.check_df(name="df_scales", df=df_scales)
+        if df_cat is not None:
+            ut.check_df(name="df_cat", df=df_cat, cols_required=[ut.COL_SCALE_ID, ut.COL_SUBCAT])
+        if df_feat is not None:
+            ut.check_df(name="df_feat", df=df_feat, cols_required=[ut.COL_FEATURE])
+        if subcats is not None:
+            subcats = ut.check_list_like(name="subcats", val=subcats, accept_str=True, accept_none=True)
+            if isinstance(subcats, str):
+                subcats = [subcats]
+        if subcats and (df_scales is None or df_cat is None):
+            from aaanalysis.data_handling import load_scales
+            if df_scales is None:
+                df_scales = load_scales(name="scales")
+            if df_cat is None:
+                df_cat = load_scales(name="scales_cat")
+        return df_scales, df_cat, subcats
+
+    @staticmethod
+    def _draw_extra_tracks(track_axes, tracks, x, visible_range=None):
+        """Render every extra track and return the bottom-most axes (for the x-label)."""
+        for i, (tax, track) in enumerate(zip(track_axes, tracks)):
+            _draw_track(tax, track, x, is_bottom=(i == len(tracks) - 1),
+                        visible_range=visible_range)
+        return track_axes[-1] if track_axes else None
+
+    @staticmethod
+    def _plot_window(df_window, entry=None, list_annotations=None, threshold=None, ax=None,
+                     figsize=(10, 4), color=None, xlabel="Residue position",
+                     ylabel="Prediction score", df_seq=None, df_scales=None, df_cat=None,
+                     subcats=None, df_feat=None, highlight=None, zoom=False):
+        """Per-residue prediction profile from AAPred.predict(level='window'), with extra tracks."""
+        # Check input
+        ut.check_df(name="df_window", df=df_window,
+                    cols_required=[ut.COL_ENTRY, ut.COL_RESIDUE_POS, ut.COL_SCORE])
+        ut.check_str(name="entry", val=entry, accept_none=True)
+        ut.check_list_like(name="list_annotations", val=list_annotations, accept_none=True)
+        if threshold is not None:
+            ut.check_number_val(name="threshold", val=threshold, just_int=False)
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_color(name="color", val=color, accept_none=True)
+        ut.check_str(name="xlabel", val=xlabel, accept_none=True)
+        ut.check_str(name="ylabel", val=ylabel, accept_none=True)
+        df_scales, df_cat, subcats = AAPredPlot._check_track_inputs(
+            df_seq=df_seq, df_scales=df_scales, df_cat=df_cat, subcats=subcats, df_feat=df_feat)
+        # Resolve the entry
+        entries = list(dict.fromkeys(df_window[ut.COL_ENTRY].tolist()))
+        if entry is None:
+            if len(entries) > 1:
+                raise ValueError(f"'df_window' contains multiple entries {entries}; pass 'entry='.")
+            entry = entries[0]
+        elif entry not in entries:
+            raise ValueError(f"'entry' ({entry}) not in 'df_window' entries {entries}.")
+        sub = df_window[df_window[ut.COL_ENTRY] == entry].sort_values(ut.COL_RESIDUE_POS)
+        pos = sub[ut.COL_RESIDUE_POS].to_numpy()
+        score = sub[ut.COL_SCORE].to_numpy()
+        # Resolve the zoom window (min start to max stop, padded), so the sequence row keys
+        # per-residue letters off the *visible* span rather than the full data length.
+        visible_range = _visible_range(highlight, pos, zoom)
+        # Build the extra tracks (importance, subcats, user annotations, sequence) + layout
+        seq, tmd_start = _entry_sequence(df_seq, entry)
+        tracks = _build_extra_tracks(kind="window", x=pos, seq=seq, tmd_start=tmd_start,
+                                     df_scales=df_scales, df_cat=df_cat, subcats=subcats,
+                                     df_feat=df_feat, list_annotations=list_annotations,
+                                     visible_range=visible_range)
+        fig, ax, track_axes = _positional_layout(ax=ax, figsize=figsize, tracks=tracks)
+        # Draw the base profile
+        ax.plot(pos, score, color=color or ut.COLOR_FEAT_NEG, linewidth=1.2)
+        if threshold is not None:
+            ax.axhline(threshold, color="0.4", linestyle="--", linewidth=1.2)
+        ax.set_ylim(0, 1)
+        ax.set_ylabel(ylabel)
+        # Shade the highlighted region(s) behind the data on every track axes; zoom last.
+        _draw_highlight_spans([ax] + track_axes, highlight)
+        if visible_range is not None:
+            ax.set_xlim(*visible_range)
+        elif len(pos):
+            ax.set_xlim(pos.min(), pos.max())
+        sns.despine(ax=ax, bottom=bool(track_axes))
+        if track_axes:
+            ax.tick_params(axis="x", bottom=False)
+        # Draw the extra tracks; the x-label goes on the bottom-most axes
+        bottom = AAPredPlot._draw_extra_tracks(track_axes, tracks, pos, visible_range=visible_range)
+        (bottom if bottom is not None else ax).set_xlabel(xlabel)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def _plot_domain(df_domain, entry=None, ax=None, figsize=(6, 4.5), color=None,
+                     xlabel="Boundary offset [residues]", ylabel="Prediction score",
+                     df_seq=None, df_scales=None, df_cat=None, subcats=None, df_feat=None,
+                     list_annotations=None, highlight=None, zoom=False):
+        """Domain boundary-sensitivity plot from AAPred.predict(level='domain'), with extra tracks."""
+        # Check input
+        ut.check_df(name="df_domain", df=df_domain,
+                    cols_required=[ut.COL_ENTRY, ut.COL_OFFSET, ut.COL_SCORE])
+        ut.check_str(name="entry", val=entry, accept_none=True)
+        ut.check_list_like(name="list_annotations", val=list_annotations, accept_none=True)
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_color(name="color", val=color, accept_none=True)
+        ut.check_str(name="xlabel", val=xlabel, accept_none=True)
+        ut.check_str(name="ylabel", val=ylabel, accept_none=True)
+        df_scales, df_cat, subcats = AAPredPlot._check_track_inputs(
+            df_seq=df_seq, df_scales=df_scales, df_cat=df_cat, subcats=subcats, df_feat=df_feat)
+        # Resolve the entry
+        entries = list(dict.fromkeys(df_domain[ut.COL_ENTRY].tolist()))
+        if entry is None:
+            if len(entries) > 1:
+                raise ValueError(f"'df_domain' contains multiple entries {entries}; pass 'entry='.")
+            entry = entries[0]
+        elif entry not in entries:
+            raise ValueError(f"'entry' ({entry}) not in 'df_domain' entries {entries}.")
+        sub = df_domain[df_domain[ut.COL_ENTRY] == entry].sort_values(ut.COL_OFFSET)
+        offsets = sub[ut.COL_OFFSET].to_numpy()
+        score = sub[ut.COL_SCORE].to_numpy()
+        # Resolve the zoom window (highlight bounds are boundary offsets here, the x-axis).
+        visible_range = _visible_range(highlight, offsets, zoom)
+        # Build the extra tracks (importance, subcats, user annotations, sequence) + layout
+        seq, tmd_start = _entry_sequence(df_seq, entry)
+        tracks = _build_extra_tracks(kind="domain", x=offsets, seq=seq, tmd_start=tmd_start,
+                                     df_scales=df_scales, df_cat=df_cat, subcats=subcats,
+                                     df_feat=df_feat, list_annotations=list_annotations,
+                                     visible_range=visible_range)
+        fig, ax, track_axes = _positional_layout(ax=ax, figsize=figsize, tracks=tracks)
+        # Draw the base curve
+        ax.plot(offsets, score, color=color or ut.COLOR_FEAT_POS, marker="o", linewidth=1.6)
+        i_best = int(np.argmax(score))
+        ax.scatter([offsets[i_best]], [score[i_best]], s=110, marker="*",
+                   color=ut.COLOR_FEAT_POS, edgecolors="black", zorder=5, label="best")
+        ax.axvline(0, color="0.6", linestyle="--", linewidth=1)  # annotated boundary
+        ax.set_ylabel(ylabel)
+        ax.set_ylim(0, 1)
+        ax.legend(frameon=False)
+        # Shade the highlighted region(s) behind the data on every track axes; zoom last.
+        _draw_highlight_spans([ax] + track_axes, highlight)
+        if visible_range is not None:
+            ax.set_xlim(*visible_range)
+        sns.despine(ax=ax, bottom=bool(track_axes))
+        if track_axes:
+            ax.tick_params(axis="x", bottom=False)
+        # Draw the extra tracks; the x-label goes on the bottom-most axes
+        bottom = AAPredPlot._draw_extra_tracks(track_axes, tracks, offsets,
+                                               visible_range=visible_range)
+        (bottom if bottom is not None else ax).set_xlabel(xlabel)
+        return ut.FigAxResult(fig, ax)
+
+    @staticmethod
+    def _sequence_matrix(seq, subcats, df_scales, df_cat):
+        """Stack the per-residue subcategory scale profiles into a ``(n_rows, len(seq))`` matrix.
+
+        Reuses the per-residue subcategory profile (``_subcat_profile``) that feeds the line
+        tracks: one row vector per subcategory (``profile[r] = mean scale value at residue r``),
+        vertically stacked. Subcategories with no scale in ``df_scales`` are dropped. Returns
+        ``(matrix, row_labels)`` where ``row_labels`` are the kept subcategory names.
+        """
+        rows, row_labels = [], []
+        for name in subcats:
+            scale_ids = df_cat[df_cat[ut.COL_SUBCAT] == name][ut.COL_SCALE_ID].tolist()
+            per_res = _subcat_profile(seq, scale_ids, df_scales)
+            if per_res is None:
+                continue
+            rows.append(per_res)
+            row_labels.append(name)
+        if not rows:
+            return None, []
+        return np.vstack(rows), row_labels
+
+    @staticmethod
+    def _plot_sequence(data=None, entry=None, ax=None, figsize=(12, 6), color=None,
+                       xlabel="Residue position", ylabel="Subcategory", df_seq=None,
+                       df_scales=None, df_cat=None, subcats=None, df_feat=None,
+                       list_annotations=None, threshold=None, highlight=None, zoom=False):
+        """Full-sequence subcategory x residue scale-value heatmap (CPP feature-map style).
+
+        The heatmap is the base track; a ``df_window`` ``data`` frame (if given) is drawn as a
+        thin prediction profile above it, and the sequence row below. ``highlight`` / ``zoom``
+        act on the residue-position columns exactly as for the window/domain viewers.
+        """
+        # Check input
+        if data is not None:
+            ut.check_df(name="data", df=data, cols_required=[ut.COL_ENTRY])
+        ut.check_str(name="entry", val=entry, accept_none=True)
+        ut.check_list_like(name="list_annotations", val=list_annotations, accept_none=True)
+        if threshold is not None:
+            ut.check_number_val(name="threshold", val=threshold, just_int=False)
+        ut.check_ax(ax=ax, accept_none=True)
+        ut.check_figsize(figsize=figsize, accept_none=True)
+        ut.check_color(name="color", val=color, accept_none=True)
+        ut.check_str(name="xlabel", val=xlabel, accept_none=True)
+        ut.check_str(name="ylabel", val=ylabel, accept_none=True)
+        # df_seq supplies the residue sequence the heatmap spans, so it is required here.
+        if df_seq is None:
+            raise ValueError("'df_seq' is required for kind='sequence' (it supplies the sequence "
+                             "spanned by the heatmap columns).")
+        df_scales, df_cat, subcats = AAPredPlot._check_track_inputs(
+            df_seq=df_seq, df_scales=df_scales, df_cat=df_cat, subcats=subcats, df_feat=df_feat)
+        # The heatmap always needs both scale frames (even when subcats=None), so default-load.
+        if df_scales is None or df_cat is None:
+            from aaanalysis.data_handling import load_scales
+            if df_scales is None:
+                df_scales = load_scales(name="scales")
+            if df_cat is None:
+                df_cat = load_scales(name="scales_cat")
+        # Resolve the entry (from the prediction frame when given, else from df_seq)
+        seq_entries = list(dict.fromkeys(df_seq[ut.COL_ENTRY].tolist()))
+        if entry is None:
+            src_entries = (list(dict.fromkeys(data[ut.COL_ENTRY].tolist()))
+                           if data is not None else seq_entries)
+            if len(src_entries) > 1:
+                raise ValueError(f"Multiple entries {src_entries}; pass 'entry='.")
+            if len(src_entries) == 0:
+                raise ValueError("'df_seq' contains no entries.")
+            entry = src_entries[0]
+        seq, _ = _entry_sequence(df_seq, entry)
+        if seq is None:
+            raise ValueError(f"'entry' ({entry}) not found in 'df_seq' (needs an 'entry' and a "
+                             f"'sequence' column).")
+        # Resolve the subcategory rows (all subcategories capped when subcats is None)
+        if subcats:
+            subcat_names = list(subcats)
+        else:
+            subcat_names = list(dict.fromkeys(df_cat[ut.COL_SUBCAT].tolist()))
+            if len(subcat_names) > _SUBCAT_ROW_CAP:
+                if ut.check_verbose(False):
+                    ut.print_out(f"Note: {len(subcat_names)} subcategories found in 'df_cat'; "
+                                 f"showing the first {_SUBCAT_ROW_CAP}. Pass 'subcats=' to choose.")
+                subcat_names = subcat_names[:_SUBCAT_ROW_CAP]
+        # Build the subcategory x residue matrix (rows stacked from the per-residue profiles)
+        matrix, row_labels = AAPredPlot._sequence_matrix(seq, subcat_names, df_scales, df_cat)
+        if matrix is None:
+            raise ValueError("No subcategory produced a scale profile; check 'subcats', 'df_cat' "
+                             "and 'df_scales'.")
+        n_rows, seq_len = matrix.shape
+        residues = np.arange(1, seq_len + 1)
+        # Optional prediction profile (df_window-style: per-residue position + score) above the map
+        pred_pos = pred_score = None
+        if data is not None and ut.COL_RESIDUE_POS in data.columns and ut.COL_SCORE in data.columns:
+            sub = data[data[ut.COL_ENTRY] == entry].sort_values(ut.COL_RESIDUE_POS)
+            if len(sub):
+                pred_pos = sub[ut.COL_RESIDUE_POS].to_numpy()
+                pred_score = sub[ut.COL_SCORE].to_numpy()
+        # Zoom window (highlight bounds are residue positions here, the heatmap x-axis)
+        visible_range = _visible_range(highlight, residues, zoom)
+        # Layout: [optional prediction track] / heatmap / sequence row, sharing the residue x-axis,
+        # plus a dedicated colorbar column. A user-supplied ax only carries the heatmap.
+        include_pred = pred_pos is not None
+        if ax is not None:
+            fig = ax.figure
+            heatmap_ax, pred_ax, seq_ax = ax, None, None
+            all_axes = [heatmap_ax]
+        else:
+            heights = ([0.9] if include_pred else []) + [max(0.4 * n_rows, 3.0), 0.5]
+            fig_h = figsize[1] + 0.22 * max(n_rows - 8, 0)
+            n_grid = len(heights)
+            gs = plt.figure(figsize=(figsize[0], fig_h)).add_gridspec(
+                n_grid, 2, width_ratios=[40, 1], height_ratios=heights, hspace=0.12, wspace=0.03)
+            fig = gs.figure
+            main_axes, prev = [], None
+            for r in range(n_grid):
+                a = fig.add_subplot(gs[r, 0], sharex=prev) if prev is not None else fig.add_subplot(gs[r, 0])
+                main_axes.append(a)
+                prev = a
+            cax = fig.add_subplot(gs[:, 1])
+            i = 0
+            pred_ax = main_axes[i] if include_pred else None
+            i += int(include_pred)
+            heatmap_ax = main_axes[i]
+            seq_ax = main_axes[i + 1]
+            all_axes = [a for a in [pred_ax, heatmap_ax, seq_ax] if a is not None]
+        # Heatmap: residues on the x-axis (extent in residue units so tracks/highlight align),
+        # subcategories top-to-bottom on the y-axis.
+        im = heatmap_ax.imshow(matrix, aspect="auto", cmap="viridis", interpolation="nearest",
+                               extent=[0.5, seq_len + 0.5, n_rows, 0])
+        heatmap_ax.set_yticks(np.arange(n_rows) + 0.5)
+        heatmap_ax.set_yticklabels(row_labels, fontsize=8)
+        heatmap_ax.set_ylabel(ylabel)
+        if ax is not None:
+            fig.colorbar(im, ax=heatmap_ax, fraction=0.025, pad=0.02).set_label("scale value",
+                                                                                fontsize=8)
+        else:
+            fig.colorbar(im, cax=cax).set_label("scale value", fontsize=8)
+        # Prediction track above the heatmap (optional)
+        if pred_ax is not None:
+            pred_ax.plot(pred_pos, pred_score, color=color or ut.COLOR_FEAT_NEG, linewidth=1.2)
+            if threshold is not None:
+                pred_ax.axhline(threshold, color="0.4", linestyle="--", linewidth=1.2)
+            pred_ax.set_ylim(0, 1)
+            pred_ax.set_yticks([])
+            _set_track_label(pred_ax, "Prediction")
+            sns.despine(ax=pred_ax, left=True, bottom=True)
+        # Sequence row below the heatmap (letters only when the visible span is short enough)
+        if seq_ax is not None:
+            seq_track = dict(type="seq", letters=list(seq), label="Sequence",
+                             show=_count_visible(residues, visible_range) <= _SEQ_ROW_MAX)
+            _draw_track(seq_ax, seq_track, residues, is_bottom=True, visible_range=visible_range)
+        # Highlight spans behind the data on every axes; then zoom the shared x-axis.
+        _draw_highlight_spans(all_axes, highlight)
+        if visible_range is not None:
+            heatmap_ax.set_xlim(*visible_range)
+        else:
+            heatmap_ax.set_xlim(0.5, seq_len + 0.5)
+        # Only the bottom-most axes shows the x tick labels + x-label
+        for a in all_axes[:-1]:
+            a.tick_params(axis="x", labelbottom=False)
+        all_axes[-1].set_xlabel(xlabel)
+        return ut.FigAxResult(fig, heatmap_ax)

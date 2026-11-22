@@ -1,0 +1,269 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2011-2023 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#include "GREX.h"
+#include "PlumedMain.h"
+#include "ActionSet.h"
+#include "ActionToPutData.h"
+#include "DomainDecomposition.h"
+#include "tools/Tools.h"
+#include "tools/Communicator.h"
+#include <sstream>
+
+namespace PLMD {
+
+GREX::GREX(PlumedMain&p):
+  initialized(false),
+  plumedMain(p),
+  partner(-1), // = unset
+  localDeltaBias(0),
+  foreignDeltaBias(0),
+  localUNow(0),
+  localUSwap(0),
+  myreplica(-1) { // = unset
+  p.setSuffix(".NA");
+}
+
+GREX::~GREX() {
+// empty destructor to delete unique_ptr
+}
+
+#define CHECK_INIT(ini,word) plumed_assert(ini) << "cmd(\"" << word <<"\") should be only used after GREX initialization"
+#define CHECK_NOTINIT(ini,word) plumed_assert(!(ini)) << "cmd(\"" << word <<"\") should be only used before GREX initialization"
+#define CHECK_NOTNULL(val,word) plumed_assert(val) << "NULL pointer received in cmd(\"GREX " << word << "\")"
+
+void GREX::cmd(std::string_view key,const TypesafePtr & val) {
+// Enumerate all possible commands:
+  enum {
+#include "GREXEnum.inc"
+  };
+
+// Static object (initialized once) containing the map of commands:
+  static const Tools::FastStringUnorderedMap<int> word_map = {
+#include "GREXMap.inc"
+  };
+
+  gch::small_vector<std::string_view> words;
+  Tools::getWordsSimple(words,key);
+  unsigned nw=words.size();
+  if(nw==0) {
+    // do nothing
+  } else {
+    int iword=-1;
+    const auto it=word_map.find(words[0]);
+    if(it!=word_map.end()) {
+      iword=it->second;
+    }
+    switch(iword) {
+    case cmd_initialized:
+      CHECK_NOTNULL(val,key);
+      val.set(int(initialized));
+      break;
+    case cmd_setMPIIntracomm:
+      CHECK_NOTINIT(initialized,key);
+      intracomm.Set_comm(val);
+      break;
+    case cmd_setMPIIntercomm:
+      CHECK_NOTINIT(initialized,key);
+      intercomm.Set_comm(val);
+      plumedMain.multi_sim_comm.Set_comm(val);
+      break;
+    case cmd_setMPIFIntracomm:
+      CHECK_NOTINIT(initialized,key);
+      intracomm.Set_fcomm(val);
+      break;
+    case cmd_setMPIFIntercomm:
+      CHECK_NOTINIT(initialized,key);
+      intercomm.Set_fcomm(val);
+      plumedMain.multi_sim_comm.Set_fcomm(val);
+      break;
+    case cmd_init:
+      CHECK_NOTINIT(initialized,key);
+      initialized=true;
+// note that for PEs!=root this is automatically 0 (comm defaults to MPI_COMM_SELF)
+      myreplica=intercomm.Get_rank();
+      intracomm.Sum(myreplica);
+      plumedMain.updateReplicaIdentity(intracomm);
+      {
+        std::string s;
+        Tools::convert(myreplica,s);
+        plumedMain.setSuffix("."+s);
+      }
+      break;
+    case cmd_prepare:
+      CHECK_INIT(initialized,key);
+      if(intracomm.Get_rank()==0) {
+        return;
+      }
+      intracomm.Bcast(partner,0);
+      calculate();
+      break;
+    case cmd_setPartner:
+      CHECK_INIT(initialized,key);
+      partner=val.get<int>();
+      break;
+    case cmd_savePositions:
+      CHECK_INIT(initialized,key);
+      savePositions();
+      break;
+    case cmd_calculate:
+      CHECK_INIT(initialized,key);
+      if(intracomm.Get_rank()!=0) {
+        return;
+      }
+      intracomm.Bcast(partner,0);
+      calculate();
+      break;
+    case cmd_getLocalDeltaBias:
+      CHECK_INIT(initialized,key);
+      CHECK_NOTNULL(val,key);
+      plumedMain.plumedQuantityToMD("energy",localDeltaBias,val);
+      break;
+    case cmd_cacheLocalUNow:
+      CHECK_INIT(initialized,key);
+      CHECK_NOTNULL(val,key);
+      {
+        localUNow=plumedMain.MDQuantityToPLUMED("energy",val);
+        intracomm.Sum(localUNow);
+      }
+      break;
+    case cmd_cacheLocalUSwap:
+      CHECK_INIT(initialized,key);
+      // Maintenance kernels reject ENERGY here; calculate() supports it below.
+      physicalEnergiesProvided=true;
+      CHECK_NOTNULL(val,key);
+      {
+        localUSwap=plumedMain.MDQuantityToPLUMED("energy",val);
+        intracomm.Sum(localUSwap);
+      }
+      break;
+    case cmd_getForeignDeltaBias:
+      CHECK_INIT(initialized,key);
+      CHECK_NOTNULL(val,key);
+      plumedMain.plumedQuantityToMD("energy",foreignDeltaBias,val);
+      break;
+    case cmd_shareAllDeltaBias:
+      CHECK_INIT(initialized,key);
+      if(intracomm.Get_rank()!=0) {
+        return;
+      }
+      allDeltaBias.assign(intercomm.Get_size(),0.0);
+      allDeltaBias[intercomm.Get_rank()]=localDeltaBias;
+      intercomm.Sum(allDeltaBias);
+      break;
+    case cmd_getDeltaBias:
+      CHECK_INIT(initialized,key);
+      CHECK_NOTNULL(val,key);
+      plumed_assert(nw==2);
+      plumed_massert(allDeltaBias.size()==static_cast<unsigned>(intercomm.Get_size()),
+                     "to retrieve bias with cmd(\"GREX getDeltaBias\"), first share it with cmd(\"GREX shareAllDeltaBias\")");
+      {
+        unsigned rep;
+        Tools::convert(std::string(words[1]),rep);
+        plumed_massert(rep<allDeltaBias.size(),"replica index passed to cmd(\"GREX getDeltaBias\") is out of range");
+        plumedMain.plumedQuantityToMD("energy",allDeltaBias[rep],val);
+      }
+      break;
+    default:
+      plumed_error() << "cannot interpret cmd(\" GREX" << key << "\"). check plumed developers manual to see the available commands.";
+      break;
+    }
+  }
+}
+
+void GREX::savePositions() {
+  plumedMain.prepareDependencies();
+  plumedMain.resetActive(true);
+  plumedMain.shareAll();
+  plumedMain.waitData();
+  // shareAll() also starts the exchange of the domain decomposition when no action needs atoms on this
+  // step, but waitData() only completes the exchanges of the active inputs. Complete it here, or the
+  // next exchange waits for messages that were never received (with asynchronous sharing).
+  for(const auto & dd : plumedMain.getActionSet().select<DomainDecomposition*>()) {
+    if(!dd->isActive() && dd->hasBeenSet()) {
+      dd->wait();
+    }
+  }
+  std::ostringstream o;
+  plumedMain.writeBinary(o);
+  buffer=o.str();
+}
+
+void GREX::calculate() {
+  unsigned nn=buffer.size();
+  // the buffers of the two replicas must have the same size, otherwise the partner
+  // state would be read from a truncated or partially filled buffer
+  unsigned partner_nn=nn;
+  if(intracomm.Get_rank()==0) {
+    Communicator::Request req=intercomm.Isend(nn,partner,1065);
+    intercomm.Recv(partner_nn,partner,1065);
+    req.wait();
+  }
+  intracomm.Bcast(partner_nn,0);
+  if(partner_nn!=nn) {
+    plumed_error()<<"GREX: the state of replica "<<partner<<" has a different size ("<<partner_nn<<" bytes instead of "<<nn
+                  <<"): replicas must use PLUMED inputs that define the same values";
+  }
+  std::vector<char> rbuf(nn);
+  // performCalc() may have updated a time-dependent potential after caching
+  // its bias. Evaluate both configurations with that same current potential.
+  std::istringstream own(buffer);
+  plumedMain.readBinary(own);
+  plumedMain.setExchangeStep(true);
+  plumedMain.prepareDependencies();
+  plumedMain.justCalculate();
+  localDeltaBias=-plumedMain.getBias();
+  if(intracomm.Get_rank()==0) {
+    Communicator::Request req=intercomm.Isend(buffer,partner,1066);
+    intercomm.Recv(rbuf,partner,1066);
+    req.wait();
+  }
+  intracomm.Bcast(rbuf,0);
+  std::istringstream i(std::string(rbuf.data(),rbuf.size()));
+  plumedMain.readBinary(i);
+  if(physicalEnergiesProvided) {
+    // The partner's serialized ENERGY is U_partner(x_partner). General HREX
+    // needs U_local(x_partner), already summed over local domains by caching.
+    // Replace the value after deserialization; do not sum it a second time.
+    for(auto* input : plumedMain.getActionSet().select<ActionToPutData*>()) {
+      if(input->getName()=="ENERGY") {
+        input->copyOutput(0)->set(localUSwap);
+      }
+    }
+  }
+  plumedMain.setExchangeStep(true);
+  plumedMain.prepareDependencies();
+  plumedMain.justCalculate();
+  plumedMain.setExchangeStep(false);
+  localDeltaBias+=plumedMain.getBias();
+  if(physicalEnergiesProvided) {
+    localDeltaBias+=localUSwap-localUNow;
+  }
+  if(intracomm.Get_rank()==0) {
+    Communicator::Request req=intercomm.Isend(localDeltaBias,partner,1067);
+    intercomm.Recv(foreignDeltaBias,partner,1067);
+    req.wait();
+  }
+  intracomm.Bcast(foreignDeltaBias,0);
+  physicalEnergiesProvided=false;
+}
+
+}

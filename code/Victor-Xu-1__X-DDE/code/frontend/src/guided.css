@@ -1,0 +1,230 @@
+.help-trigger {
+  display: inline-flex;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+.help-trigger > button,
+.studio-heading .help-trigger > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 2px;
+  font-size: var(--text-small, 13px);
+  line-height: 1;
+}
+.help-tooltip {
+  position: fixed;
+  z-index: 1000;
+  width: min(280px, calc(100vw - 16px));
+  padding: 11px 13px;
+  background: var(--ink);
+  color: var(--accent-contrast);
+  box-shadow: 0 5px 18px var(--overlay);
+  border-radius: 7px;
+  font-size: var(--text-small, 13px);
+  line-height: 1.65;
+  pointer-events: none;
+}
+.example-button {
+  font-size: var(--text-small, 13px);
+  margin-bottom: 14px;
+  text-align: left;
+}
+.studio-app .input-panel h3 {
+  font-size: var(--text-small, 13px);
+}
+.run-choices {
+  margin-top: 16px;
+}
+.preset-choices {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+.preset-choices label {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  cursor: pointer;
+  padding: 8px;
+  border: 0;
+  border-radius: 0;
+  background: var(--surface-muted);
+  box-shadow: none;
+}
+.preset-choices input {
+  margin-top: 3px;
+}
+.preset-choices strong {
+  font-size: var(--text-small, 13px);
+  display: block;
+  font-weight: 600;
+}
+.preset-choices small {
+  display: block;
+  font-size: var(--text-small, 13px);
+  line-height: 1.5;
+  margin-top: 2px;
+  color: var(--muted);
+}
+.studio-app .input-panel .task-name {
+  margin-top: 13px;
+}
+.guided-toolbar {
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.guided-toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--text-small, 13px);
+  color: var(--muted);
+}
+.guided-toolbar select {
+  max-width: 280px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 7px;
+  color: var(--ink);
+  background: var(--surface);
+  font-size: var(--text-small, 13px);
+}
+.quickstart {
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  background: var(--canvas);
+  font-size: var(--text-small, 13px);
+}
+.candidate-actions select {
+  max-width: 130px;
+  font-size: var(--text-small, 13px);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  padding: 4px;
+  border-radius: 4px;
+  color: var(--muted);
+}
+.conformer-select {
+  border: 0;
+  background: transparent;
+  padding: 3px 0;
+  color: var(--accent);
+  font-size: var(--text-small, 13px);
+  font-weight: 600;
+  text-align: left;
+}
+.comparison-note button {
+  background: transparent;
+  border: 0;
+  text-decoration: underline;
+  color: var(--muted);
+  font-size: var(--text-small, 13px);
+}
+.property-grid {
+  margin: 9px 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px;
+}
+.property-grid > div {
+  padding: 6px;
+  background: transparent;
+  border-radius: 0;
+  border-bottom: 1px solid var(--line);
+}
+.property-grid dt {
+  font-size: var(--text-small, 13px);
+  color: var(--muted);
+}
+.property-grid dd {
+  margin: 3px 0 0;
+  font-size: 13px;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.analysis-empty {
+  display: grid;
+  place-items: center;
+  min-height: 100px;
+  font-size: 11px !important;
+  color: var(--muted) !important;
+  text-align: center;
+  line-height: 1.6;
+}
+.result-explanation {
+  font-size: var(--text-small, 13px);
+  line-height: 1.7;
+  margin: 10px 0;
+  color: var(--muted);
+}
+.result-explanation > p {
+  margin: 6px 0;
+}
+.analysis-card {
+  min-height: 240px;
+  height: auto;
+}
+.analysis-card > p {
+  line-height: 1.5;
+}
+.contact-card li button {
+  background: transparent;
+  border: 0;
+  color: var(--accent);
+  font-size: var(--text-small, 13px);
+  padding: 4px 2px;
+  text-decoration: underline;
+}
+.selection-explanation {
+  margin: 5px 0 0;
+  font-size: var(--text-small, 13px);
+  color: var(--muted);
+  min-height: 26px;
+  line-height: 1.5;
+}
+.viewer-comparison {
+  font-size: var(--text-small, 13px);
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+.viewer-footer {
+  flex-wrap: wrap;
+}
+@media (max-width: 1000px) {
+  .guided-toolbar select {
+    max-width: 210px;
+  }
+  .analysis-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 580px) {
+  .guided-toolbar {
+    margin-bottom: 12px;
+  }
+  .guided-toolbar label {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .guided-toolbar select {
+    max-width: 70%;
+  }
+  .help-tooltip {
+    font-size: 13px;
+  }
+  .property-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .preset-choices strong {
+    font-size: 13px;
+  }
+  .preset-choices small {
+    font-size: var(--text-small, 13px);
+  }
+}

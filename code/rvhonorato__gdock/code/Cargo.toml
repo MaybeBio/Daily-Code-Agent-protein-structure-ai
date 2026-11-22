@@ -1,0 +1,62 @@
+[workspace]
+members = [".", "py", "wasm"]
+default-members = ["."]
+resolver = "2"
+
+# One version for the core, the Python bindings and the wasm bindings.
+[workspace.package]
+version = "2.3.0"
+edition = "2021"
+rust-version = "1.85"
+license = "0BSD"
+authors = ["Rodrigo V. Honorato <email@rvhonorato.me>"]
+repository = "https://codeberg.org/rvhonorato/gdock"
+homepage = "https://gdock.org"
+
+[workspace.dependencies]
+gdock = { path = ".", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[package]
+name = "gdock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Information-driven protein-protein docking using a genetic algorithm"
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+# The repository also holds the bindings and the website. Keep them out of the crate.
+# The test data stays out too. Run the tests from the repository.
+include = ["src/**", "/README.md", "/LICENSE", "/CITATION.cff"]
+keywords = [
+  "bioinformatics",
+  "protein",
+  "docking",
+  "structural-biology",
+  "genetic-algorithm",
+]
+categories = ["science", "command-line-utilities", "algorithms", "simulation"]
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
+[dependencies]
+rand = "0.10"
+rand_distr = "0.6"
+rayon = { version = "1.12", optional = true }
+clap = "4.6"
+colored = "3.1"
+indicatif = "0.18"
+flate2 = "1.1"
+
+[profile.dev]
+debug = true
+
+# Profiles only work at the workspace root. Keep the wasm size setting here.
+[profile.release.package.gdock-wasm]
+opt-level = "s"

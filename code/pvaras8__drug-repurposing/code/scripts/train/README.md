@@ -1,0 +1,1 @@
+Please see our [training instructions](https://github.com/pvaras8/drug-repurposing/blob/HEAD/docs/training.md).

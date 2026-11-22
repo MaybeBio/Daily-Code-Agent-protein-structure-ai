@@ -1,0 +1,7 @@
+[project]
+name = "w02-programmatic-dynamic-dag"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+  "horus-runtime>=0.8.0",
+]

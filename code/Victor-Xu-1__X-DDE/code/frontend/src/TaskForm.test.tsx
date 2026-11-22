@@ -1,0 +1,333 @@
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, expect, it, vi } from "vitest";
+import { TaskForm } from "./TaskForm";
+import { request } from "./api";
+import type { Job, Prediction } from "./types";
+import { defaults } from "./form-model";
+vi.mock("./api", async (original) => {
+  const actual = await original<typeof import("./api")>();
+  return {
+    ...actual,
+    request: vi.fn((path: string, options?: RequestInit) => {
+      if (path === "/examples/predict")
+        return Promise.resolve({
+          module: {
+            capability_id: "predict",
+            case_id: "brd4-jq1",
+            revision: 1,
+          },
+          case: {
+            id: "brd4-jq1",
+            revision: 1,
+            label: ["BRD4–JQ1", "BRD4–JQ1"],
+            description: ["公开复合物", "Public complex"],
+            sources: [],
+          },
+          files: [],
+          pin: null,
+          computed_result_available: false,
+        });
+      return actual.request(path, options);
+    }),
+  };
+});
+afterEach(cleanup);
+// jsdom lacks the native dialog lifecycle used by the real-browser test.
+if (!HTMLDialogElement.prototype.showModal) {
+  HTMLDialogElement.prototype.showModal = function () {
+    this.setAttribute("open", "");
+  };
+  HTMLDialogElement.prototype.close = function () {
+    this.removeAttribute("open");
+  };
+}
+async function openReview(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("button", { name: "Preview job" }));
+  return within(await screen.findByRole("dialog", { name: "Preview job" }));
+}
+
+it("blocks remote MSA search at the settings step until explicit sequence consent", async () => {
+  const user = userEvent.setup(),
+    submit = vi.fn();
+  render(
+    <TaskForm
+      language="en"
+      ready
+      onSubmit={submit}
+      initialRequest={{
+        name: "STAT6 settings admission",
+        components: [
+          { kind: "protein", count: 1, value: "MSLWGLVSKM" },
+          {
+            kind: "ligand",
+            count: 1,
+            value:
+              "O=C(CCN1C=CN=N1)N(C2)CCC=C2C3=C(F)C4=C(C=C(N4)C(N(C)C)=O)C=C3",
+          },
+        ],
+        parameters: {
+          ...defaults,
+          feature_mode: "search",
+          allow_network: false,
+        },
+      }}
+    />,
+  );
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
+  expect(screen.getByText("Search needs network permission")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "MSA settings" }));
+  await user.click(
+    screen.getByRole("checkbox", { name: /Allow this task to send sequences/ }),
+  );
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  expect(screen.getByRole("button", { name: "Next" })).toBeEnabled();
+  expect(submit).not.toHaveBeenCalled();
+});
+it("localizes material guidance without replacing the user's sequence or stereochemistry", async () => {
+  const submit = vi.fn(),
+    user = userEvent.setup();
+  const { rerender } = render(
+    <TaskForm language="en" ready={false} onSubmit={submit} />,
+  );
+  await user.click(screen.getByRole("button", { name: /^Next$/ }));
+  const sequence = screen.getByLabelText("One-letter amino-acid sequence"),
+    ligand = screen.getByLabelText("SMILES or CCD_ identifier");
+  expect(sequence).toHaveAttribute(
+    "placeholder",
+    "Paste the target protein sequence or one FASTA record",
+  );
+  expect(ligand).toHaveAttribute(
+    "placeholder",
+    "Paste SMILES or a CCD_ component identifier",
+  );
+  await user.type(sequence, "MSSATQQK");
+  await user.click(ligand);
+  await user.paste("N[C@@H](C)C(=O)O");
+  rerender(<TaskForm language="zh" ready={false} onSubmit={submit} />);
+  expect(screen.getByLabelText("单字母氨基酸序列")).toHaveValue("MSSATQQK");
+  expect(screen.getByLabelText("SMILES 或 CCD_ 编号")).toHaveValue(
+    "N[C@@H](C)C(=O)O",
+  );
+  expect(screen.getByLabelText("SMILES 或 CCD_ 编号")).toHaveAttribute(
+    "placeholder",
+    "粘贴 SMILES 或 CCD_组分编号",
+  );
+  await user.click(
+    screen.getByRole("button", { name: "小分子 / 配体输入说明" }),
+  );
+  expect(screen.getByRole("tooltip")).not.toHaveTextContent(
+    /CCO|乙醇|ethanol/i,
+  );
+  expect(submit).not.toHaveBeenCalled();
+});
+it("offers recommended choices, retains prepared input and blocks unavailable prediction at review", async () => {
+  const user = userEvent.setup();
+  const { rerender } = render(
+    <TaskForm language="zh" ready={false} onSubmit={vi.fn()} />,
+  );
+  await user.click(screen.getByRole("button", { name: "下一步" }));
+  expect(screen.getByRole("button", { name: "下一步" })).toBeDisabled();
+  await user.type(screen.getByLabelText("单字母氨基酸序列"), "ACDE");
+  await user.type(screen.getByLabelText("SMILES 或 CCD_ 编号"), "CCO");
+  await user.click(screen.getByRole("button", { name: "下一步" }));
+  expect(
+    screen.getByLabelText("标准预测 · 推荐", { exact: false }),
+  ).toBeChecked();
+  expect(screen.queryByLabelText("随机种子")).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "下一步" }));
+  await user.click(screen.getByRole("button", { name: "预览任务" }));
+  expect(screen.getByRole("button", { name: "提交任务" })).toBeDisabled();
+  rerender(<TaskForm language="en" ready={true} onSubmit={vi.fn()} />);
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Submit job" })).toBeEnabled(),
+  );
+});
+it("prevents an empty input from reaching the API", async () => {
+  const user = userEvent.setup(),
+    submit = vi.fn();
+  const { container } = render(
+    <TaskForm language="en" ready onSubmit={submit} />,
+  );
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  fireEvent.submit(container.querySelector("form")!);
+  expect(await screen.findByRole("alert")).toHaveTextContent("Check step 2");
+  expect(submit).not.toHaveBeenCalled();
+});
+it("keeps native prediction components and comparison preset while submitting only after review", async () => {
+  const user = userEvent.setup(),
+    submit = vi.fn().mockResolvedValue({ id: "predicted" } as Job);
+  const projectId = "a9e3ee41-54e5-43d0-a863-c4f584cb94e8";
+  render(
+    <TaskForm language="en" ready onSubmit={submit} projectId={projectId} />,
+  );
+  await user.click(screen.getByLabelText("Protein–ligand complex"));
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  await user.type(
+    screen.getByLabelText("One-letter amino-acid sequence"),
+    "ACDE",
+  );
+  await user.type(screen.getByLabelText("SMILES or CCD_ identifier"), "CCO");
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  await user.click(screen.getByLabelText(/Compare conformers/));
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  expect(submit).not.toHaveBeenCalled();
+  const review = await openReview(user);
+  await user.click(await review.findByRole("button", { name: "Request JSON" }));
+  const reviewed = JSON.parse(
+    review.getByLabelText("X-DDE submission request").textContent!,
+  );
+  expect(reviewed.project_id).toBe(projectId);
+  expect(submit).not.toHaveBeenCalled();
+  await user.click(review.getByRole("button", { name: "Submit job" }));
+  expect(submit).toHaveBeenCalledOnce();
+  expect(submit.mock.calls[0][0]).toEqual(reviewed);
+  expect(submit.mock.calls[0][0]).toMatchObject({
+    components: [
+      { kind: "protein", value: "ACDE" },
+      { kind: "ligand", value: "CCO" },
+    ],
+    parameters: {
+      samples: 3,
+      steps: 200,
+      cycles: 10,
+      dtype: "bf16",
+      model: "standard",
+    },
+  });
+  expect(submit.mock.calls[0][0].name).toMatch(/^Protein–ligand complex/);
+  expect(
+    await screen.findByRole("link", { name: "Open task progress and results" }),
+  ).toHaveAttribute("href", "/#task=predicted");
+});
+it("submits native entered values once and retains the pending state until the actual response", async () => {
+  const user = userEvent.setup();
+  let resolve!: (job: Job) => void;
+  const submit = vi.fn(
+    (_v: Prediction, _key: string) =>
+      new Promise<Job>((done) => {
+        resolve = done;
+      }),
+  );
+  render(<TaskForm language="en" ready onSubmit={submit} />);
+  await user.click(screen.getByLabelText("Small-molecule structure"));
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  await user.type(screen.getByLabelText("SMILES or CCD_ identifier"), "CCO");
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  await user.type(screen.getByLabelText(/Task name/), "my experiment");
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  const review = await openReview(user);
+  await user.click(review.getByRole("button", { name: "Submit job" }));
+  expect(review.getByRole("button", { name: /Submitting/ })).toBeDisabled();
+  expect(submit).toHaveBeenCalledOnce();
+  expect(submit.mock.calls[0][0]).toMatchObject({
+    name: "my experiment",
+    components: [{ kind: "ligand", value: "CCO", count: 1 }],
+  });
+  await act(async () => resolve({ id: "pending-response" } as Job));
+  expect(
+    await screen.findByRole("heading", { name: "5. View results" }),
+  ).toBeVisible();
+});
+
+it("blocks a mismatched FASTA source and verifies the same selected asset again on retry", async () => {
+  const id = "b9e3ee41-54e5-43d0-a863-c4f584cb94e8";
+  const sha256 = "a".repeat(64);
+  const metadata = {
+    id,
+    sha256,
+    kind: "sequences",
+    suffix: ".fasta",
+    size: 12,
+    name: "source.fasta",
+  };
+  const mockedRequest = vi.mocked(request);
+  const original = mockedRequest.getMockImplementation()!;
+  mockedRequest.mockImplementation(async (path, init) =>
+    path === `/assets/${id}/metadata`
+      ? (metadata as never)
+      : original(path, init),
+  );
+  const fetcher = vi
+    .spyOn(globalThis, "fetch")
+    .mockResolvedValueOnce(new Response(">other\nFGHI"))
+    .mockResolvedValueOnce(new Response(">selected\rACDE\r"));
+  try {
+    const user = userEvent.setup();
+    const submit = vi.fn();
+    render(
+      <TaskForm
+        language="en"
+        ready
+        onSubmit={submit}
+        initialRequest={{
+          name: "Provenance",
+          components: [
+            { kind: "protein", count: 1, value: "ACDE", source_sequence: id },
+          ],
+          parameters: {
+            seed: 101,
+            samples: 1,
+            steps: 200,
+            cycles: 10,
+            dtype: "bf16",
+          },
+          scientific_inputs: [
+            { asset_id: id, sha256, record: 0, conformer: 0 },
+          ],
+        }}
+      />,
+    );
+    const next = screen.getByRole("button", { name: "Next" });
+    for (let step = 0; step < 3; step++)
+      await user.click(
+        step === 0 ? next : screen.getByRole("button", { name: "Next" }),
+      );
+    const review = await openReview(user);
+    expect(await review.findByRole("alert")).toHaveTextContent(
+      "could not be verified",
+    );
+    expect(review.getByRole("button", { name: "Submit job" })).toBeDisabled();
+    await user.click(review.getByRole("button", { name: "Check files again" }));
+    expect(
+      await review.findByRole("link", { name: "source.fasta" }),
+    ).toHaveAttribute("href", `/api/assets/${id}`);
+    expect(review.getByRole("button", { name: "Submit job" })).toBeEnabled();
+    expect(submit).not.toHaveBeenCalled();
+  } finally {
+    fetcher.mockRestore();
+    mockedRequest.mockImplementation(original);
+  }
+});
+it("preserves automatic name and idempotency key after uncertain failure and language changes", async () => {
+  const user = userEvent.setup(),
+    submit = vi.fn().mockRejectedValue(new Error("connection interrupted"));
+  const { rerender } = render(
+    <TaskForm language="en" ready onSubmit={submit} />,
+  );
+  await user.click(screen.getByLabelText("Small-molecule structure"));
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  await user.type(screen.getByLabelText("SMILES or CCD_ identifier"), "CCO");
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  await user.click(screen.getByRole("button", { name: "Next" }));
+  const review = await openReview(user);
+  await user.click(review.getByRole("button", { name: "Submit job" }));
+  expect(await review.findByRole("alert")).toHaveTextContent(
+    "connection interrupted",
+  );
+  rerender(<TaskForm language="zh" ready onSubmit={submit} />);
+  await user.click(screen.getByRole("button", { name: "提交任务" }));
+  await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+  expect(submit.mock.calls[0][1]).toBe(submit.mock.calls[1][1]);
+  expect(submit.mock.calls[0][0].name).toBe(submit.mock.calls[1][0].name);
+});

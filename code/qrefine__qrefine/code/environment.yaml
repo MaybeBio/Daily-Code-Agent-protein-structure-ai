@@ -1,0 +1,19 @@
+name: qrefine
+channels:
+  - conda-forge
+dependencies:
+  # cctbx essentials
+  - cctbx-nightly::cctbx
+  - cctbx-nightly::cctbx-base
+  - chem_data::chem_data
+  - phenix-project::probe
+  - phenix-project::reduce
+  # essentials
+  - python=3.12
+  - networkx
+  - pymongo
+  - ase=3.22.1
+  # Calculators
+  - mopac
+  - xtb
+#  - libblas=*=*mkl

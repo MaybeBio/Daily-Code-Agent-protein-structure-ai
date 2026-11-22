@@ -1,0 +1,2530 @@
+// What the lowerings of md_exec have in common.
+
+#include "mdir/Conversion/MDExecKernels.h"
+#include "mdir/Conversion/RaggedRows.h"
+
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+
+#include "mdir/Dialect/MD/MDOps.h"
+#include "mdir/Dialect/MDRT/MDRTOps.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/AttrTypeSubElements.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/TypeUtilities.h"
+#include "llvm/ADT/StringExtras.h"
+
+using namespace mlir;
+using namespace mdir;
+using namespace mdir::kernels;
+
+Value kernels::createIndex(OpBuilder &builder, Location loc, int64_t value) {
+  return arith::ConstantIndexOp::create(builder, loc, value);
+}
+
+Value kernels::createZero(OpBuilder &builder, Location loc, Type type) {
+  return arith::ConstantOp::create(
+      builder, loc, type, cast<TypedAttr>(builder.getZeroAttr(type)));
+}
+
+Value kernels::createReal(OpBuilder &builder, Location loc, Type real,
+                          double value) {
+  return arith::ConstantOp::create(builder, loc, real,
+                                   builder.getFloatAttr(real, value));
+}
+
+/// The square of `cutoff` in `type`. In f32 it is pulled in so that every
+/// distance whose square passes `r2 < cutoff2` has a square root in f32 at
+/// least four units in the last place below the cutoff in f32: an
+/// expression with a pole at the cutoff, as the Stillinger-Weber form has
+/// at a sigma, whose product in f32 may round to a unit below the cutoff,
+/// is then never evaluated at its pole (D159). The cutoff moves inward by
+/// some 5e-7 of itself.
+Value kernels::createCutoff2(OpBuilder &builder, Location loc, Type type,
+                              double cutoff) {
+  double square = cutoff * cutoff;
+  if (!type.isF32())
+    return createReal(builder, loc, type, square);
+  float limit = static_cast<float>(cutoff);
+  for (int k = 0; k != 4; ++k)
+    limit = std::nextafter(limit, 0.0f);
+  float narrow = static_cast<float>(square);
+  // The test is strict: every r2 that passes is at most the float below.
+  while (static_cast<double>(narrow) > square ||
+         std::sqrt(std::nextafter(narrow, 0.0f)) > limit)
+    narrow = std::nextafter(narrow, 0.0f);
+  return createReal(builder, loc, type, static_cast<double>(narrow));
+}
+
+Value kernels::createInverse(OpBuilder &builder, Location loc, Value box) {
+  Value edges = getEdges(builder, loc, box);
+  auto type = cast<VectorType>(edges.getType());
+  FloatAttr one = builder.getFloatAttr(type.getElementType(), 1.0);
+  Value ones = arith::ConstantOp::create(
+      builder, loc, type, DenseElementsAttr::get(type, one.getValue()));
+  return arith::DivFOp::create(builder, loc, ones, edges);
+}
+
+bool kernels::isTriclinic(Value box) {
+  return cast<VectorType>(box.getType()).getNumElements() == 6;
+}
+
+Value kernels::getEdges(OpBuilder &builder, Location loc, Value box) {
+  if (!isTriclinic(box))
+    return box;
+  // Three extractions rather than a strided slice, which the pipeline of a
+  // device does not lower.
+  SmallVector<Value, 3> diagonal;
+  for (int64_t k = 0; k != 3; ++k)
+    diagonal.push_back(vector::ExtractOp::create(builder, loc, box, k));
+  return vector::FromElementsOp::create(
+      builder, loc,
+      VectorType::get({3}, cast<VectorType>(box.getType()).getElementType()),
+      diagonal);
+}
+
+Value kernels::emitMinimumImage(OpBuilder &builder, Location loc, Value raw,
+                                Value box, Value inverse) {
+  if (!isTriclinic(box)) {
+    Value images = arith::MulFOp::create(builder, loc, raw, inverse);
+    Value nearest = math::RoundEvenOp::create(builder, loc, images);
+    Value shift = arith::MulFOp::create(builder, loc, nearest, box);
+    return arith::SubFOp::create(builder, loc, raw, shift);
+  }
+  auto element = [&](Value vector, int64_t k) -> Value {
+    return vector::ExtractOp::create(builder, loc, vector, k);
+  };
+  Value d[3] = {element(raw, 0), element(raw, 1), element(raw, 2)};
+  Value ax = element(box, 0), by = element(box, 1), cz = element(box, 2),
+        bx = element(box, 3), cx = element(box, 4), cy = element(box, 5);
+  // n = round(d_a / h_aa), d −= n times the row of H, from c up to a.
+  auto take = [&](Value along, Value inverseDiagonal,
+                  ArrayRef<std::pair<int, Value>> row) {
+    Value n = math::RoundEvenOp::create(
+        builder, loc, arith::MulFOp::create(builder, loc, along,
+                                            inverseDiagonal));
+    for (auto [axis, component] : row)
+      d[axis] = arith::SubFOp::create(
+          builder, loc, d[axis],
+          arith::MulFOp::create(builder, loc, n, component));
+  };
+  take(d[2], element(inverse, 2), {{0, cx}, {1, cy}, {2, cz}});
+  take(d[1], element(inverse, 1), {{0, bx}, {1, by}});
+  take(d[0], element(inverse, 0), {{0, ax}});
+  return vector::FromElementsOp::create(builder, loc, raw.getType(),
+                                        ValueRange{d[0], d[1], d[2]});
+}
+
+Value kernels::emitLatticeShift(OpBuilder &builder, Location loc, Value cells,
+                               Value box) {
+  if (!isTriclinic(box))
+    return arith::MulFOp::create(builder, loc, cells, box);
+  auto element = [&](Value vector, int64_t k) -> Value {
+    return vector::ExtractOp::create(builder, loc, vector, k);
+  };
+  auto mul = [&](Value a, Value b) -> Value {
+    return arith::MulFOp::create(builder, loc, a, b);
+  };
+  auto add = [&](Value a, Value b) -> Value {
+    return arith::AddFOp::create(builder, loc, a, b);
+  };
+  Value na = element(cells, 0), nb = element(cells, 1), nc = element(cells, 2);
+  Value ax = element(box, 0), by = element(box, 1), cz = element(box, 2),
+        bx = element(box, 3), cx = element(box, 4), cy = element(box, 5);
+  return vector::FromElementsOp::create(
+      builder, loc, cells.getType(),
+      ValueRange{add(add(mul(na, ax), mul(nb, bx)), mul(nc, cx)),
+                 add(mul(nb, by), mul(nc, cy)), mul(nc, cz)});
+}
+
+Value kernels::emitFaceWidths(OpBuilder &builder, Location loc, Value box) {
+  auto element = [&](int64_t k) -> Value {
+    return vector::ExtractOp::create(builder, loc, box, k);
+  };
+  auto mul = [&](Value a, Value b) -> Value {
+    return arith::MulFOp::create(builder, loc, a, b);
+  };
+  auto add = [&](Value a, Value b) -> Value {
+    return arith::AddFOp::create(builder, loc, a, b);
+  };
+  Value ax = element(0), by = element(1), cz = element(2), bx = element(3),
+        cx = element(4), cy = element(5);
+  // b × c = (b_y c_z, −b_x c_z, b_x c_y − b_y c_x).
+  Value n0 = mul(by, cz), n1 = mul(bx, cz),
+        n2 = arith::SubFOp::create(builder, loc, mul(bx, cy), mul(by, cx));
+  Value norm = math::SqrtOp::create(
+      builder, loc, add(add(mul(n0, n0), mul(n1, n1)), mul(n2, n2)));
+  Value volume = mul(mul(ax, by), cz);
+  Value wa = arith::DivFOp::create(builder, loc, volume, norm);
+  Value wb = arith::DivFOp::create(
+      builder, loc, mul(by, cz),
+      math::SqrtOp::create(builder, loc, add(mul(cy, cy), mul(cz, cz))));
+  return vector::FromElementsOp::create(
+      builder, loc,
+      VectorType::get({3}, cast<VectorType>(box.getType()).getElementType()),
+      ValueRange{wa, wb, cz});
+}
+
+Value kernels::convertReal(OpBuilder &builder, Location loc, Value value,
+                           Type real) {
+  Type source = value.getType();
+  Type target = real;
+  if (auto vector = dyn_cast<VectorType>(source))
+    target = VectorType::get(vector.getShape(), real);
+  if (source == target)
+    return value;
+  if (getElementTypeOrSelf(source).getIntOrFloatBitWidth() <
+      real.getIntOrFloatBitWidth())
+    return arith::ExtFOp::create(builder, loc, target, value);
+  return arith::TruncFOp::create(builder, loc, target, value);
+}
+
+Value kernels::loadElement(OpBuilder &builder, Location loc, Value buffer,
+                           Value particle) {
+  auto type = cast<MemRefType>(buffer.getType());
+  if (type.getRank() == 1)
+    return memref::LoadOp::create(builder, loc, buffer, ValueRange{particle});
+
+  int64_t components = type.getDimSize(1);
+  SmallVector<Value, 3> elements;
+  for (int64_t c = 0; c < components; ++c)
+    elements.push_back(memref::LoadOp::create(
+        builder, loc, buffer,
+        ValueRange{particle, createIndex(builder, loc, c)}));
+  return vector::FromElementsOp::create(
+      builder, loc, VectorType::get({components}, type.getElementType()),
+      elements);
+}
+
+void kernels::storeElement(OpBuilder &builder, Location loc, Value value,
+                           Value buffer, Value particle) {
+  auto type = cast<MemRefType>(buffer.getType());
+  if (type.getRank() == 1) {
+    memref::StoreOp::create(builder, loc, value, buffer,
+                            ValueRange{particle});
+    return;
+  }
+  for (int64_t c = 0, e = type.getDimSize(1); c < e; ++c) {
+    Value element = vector::ExtractOp::create(builder, loc, value, c);
+    memref::StoreOp::create(builder, loc, element, buffer,
+                            ValueRange{particle, createIndex(builder, loc, c)});
+  }
+}
+
+/// Adds `value`, a scalar or a vector, atomically to the element `row` of
+/// the buffer `buffer` on the host.
+static void emitHostAtomicAdd(OpBuilder &b, Location loc, Value value,
+                              Value buffer, Value row) {
+  auto type = cast<MemRefType>(buffer.getType());
+  if (type.getRank() == 1) {
+    memref::AtomicRMWOp::create(b, loc, arith::AtomicRMWKind::addf, value,
+                                buffer, ValueRange{row});
+    return;
+  }
+  for (int64_t c = 0, e = type.getDimSize(1); c < e; ++c)
+    memref::AtomicRMWOp::create(
+        b, loc, arith::AtomicRMWKind::addf,
+        vector::ExtractOp::create(b, loc, value, c), buffer,
+        ValueRange{row, createIndex(b, loc, c)});
+}
+
+//===----------------------------------------------------------------------===//
+// Loops over particles
+//===----------------------------------------------------------------------===//
+
+SmallVector<Value> kernels::emitParticleKernel(OpBuilder &builder,
+                                               md_exec::ParticleForOp op,
+                                               Value particle,
+                                               IRMapping &local) {
+  Location loc = op.getLoc();
+  Block &kernel = op.getKernel().front();
+
+  for (auto [index, buffer] : llvm::enumerate(op.getIns()))
+    local.map(kernel.getArgument(index),
+              loadElement(builder, loc, buffer, particle));
+  for (Operation &nested : kernel.without_terminator())
+    builder.clone(nested, local);
+
+  Operation *yield = kernel.getTerminator();
+  unsigned numOuts = op.getOuts().size();
+  for (unsigned i = 0; i != numOuts; ++i)
+    storeElement(builder, loc, local.lookupOrDefault(yield->getOperand(i)),
+                 op.getOuts()[i], particle);
+
+  SmallVector<Value> contributions;
+  for (unsigned i = numOuts, e = yield->getNumOperands(); i != e; ++i)
+    contributions.push_back(local.lookupOrDefault(yield->getOperand(i)));
+  return contributions;
+}
+
+//===----------------------------------------------------------------------===//
+// Loops over pairs
+//===----------------------------------------------------------------------===//
+
+SmallVector<Value> kernels::emitPairKernel(OpBuilder &builder,
+                                           md_exec::PairForOp op,
+                                           Value counts, Value index,
+                                           Value box, Value inverse,
+                                           Value central,
+                                           IRMapping &local,
+                                           const RowLanes *lanes,
+                                           SmallVectorImpl<Value> *outTotals,
+                                           const PairLayout *layout,
+                                           AddToMember add) {
+  Location loc = op.getLoc();
+  Value positions = layout ? layout->positions : op.getPositions();
+  SmallVector<Value> insBuffers(op.getIns().begin(), op.getIns().end());
+  if (layout)
+    insBuffers.assign(layout->ins.begin(), layout->ins.end());
+  Block &kernel = op.getKernel().front();
+  Operation *yield = kernel.getTerminator();
+  unsigned numIns = op.getIns().size();
+  unsigned numOuts = op.getOuts().size();
+  unsigned numYields = yield->getNumOperands();
+  // The rows of a domain (D290).
+  bool explicitImages = op.getImages() == md_exec::Images::Explicit;
+  bool twoEnded = op.getTraversal() == md_exec::Traversal::Directed &&
+                  op.getConflict() == md_exec::Conflict::Atomic;
+
+  // The difference of the positions is taken in their type and then
+  // converted to the type that the kernel computes in: the subtraction is
+  // the step that loses precision. The minimum image and the squared
+  // length follow in the type of the kernel; a device computes in double
+  // precision at a small fraction of the rate of single.
+  Type computed = kernel.getArgument(0).getType();
+  double cutoff = op.getCutoff().convertToDouble();
+  Value cutoff2 = createCutoff2(builder, loc, computed, cutoff);
+  Value boxComputed = convertReal(builder, loc, box, computed);
+  Value inverseComputed = convertReal(builder, loc, inverse, computed);
+  Value zero = createIndex(builder, loc, 0);
+  Value one = createIndex(builder, loc, 1);
+
+  Value centralPosition = loadElement(builder, loc, positions, central);
+  SmallVector<Value> centralValues;
+  for (Value buffer : insBuffers)
+    centralValues.push_back(loadElement(builder, loc, buffer, central));
+
+  Value count =
+      memref::LoadOp::create(builder, loc, counts, ValueRange{central});
+  Value end =
+      arith::IndexCastOp::create(builder, loc, builder.getIndexType(), count);
+  Value first = zero, step = one;
+  if (lanes) {
+    end = arith::SelectOp::create(builder, loc, lanes->valid, end, zero);
+    first = lanes->lane;
+    step = createIndex(builder, loc, lanes->lanes);
+  }
+
+  // The contributions of the neighbors of one particle are summed in the
+  // order of its list, or, with lanes, in that order within each lane and
+  // then over the lanes.
+  // A contribution to a global sum that the kernel widens, as the mixed
+  // mode widens the energy and the virial to f64, is summed over the row
+  // in the type the kernel computed it in and widened once for the row:
+  // a device adds in f64 at a small fraction of the rate of f32.
+  auto getNarrow = [&](unsigned i) -> Value {
+    if (i < numOuts)
+      return Value();
+    auto widen = yield->getOperand(i).getDefiningOp<arith::ExtFOp>();
+    if (!widen || widen->getBlock() != &kernel)
+      return Value();
+    return widen.getIn();
+  };
+  SmallVector<Value> sums;
+  for (unsigned i = 0; i != numYields; ++i) {
+    Value narrow = getNarrow(i);
+    Type type = narrow ? narrow.getType() : yield->getOperand(i).getType();
+    sums.push_back(createZero(builder, loc, type));
+  }
+
+  auto inner = scf::ForOp::create(
+      builder, loc, first, end, step, sums,
+      [&](OpBuilder &pair, Location, Value entry, ValueRange partial) {
+        Value narrow = memref::LoadOp::create(pair, loc, index,
+                                              ValueRange{central, entry});
+        Value other = arith::IndexCastOp::create(pair, loc,
+                                                 pair.getIndexType(), narrow);
+
+        auto emitCandidate = [&](OpBuilder &pair) -> SmallVector<Value> {
+          SmallVector<Value> updated;
+          // The minimum-image displacement [AllenTildesley2017] and its
+          // squared length; with explicit images, the plain difference, since
+          // the rows carry their images (D290).
+          Value otherPosition = loadElement(pair, loc, positions, other);
+          Value raw = convertReal(
+              pair, loc,
+              arith::SubFOp::create(pair, loc, centralPosition, otherPosition),
+              computed);
+          Value d = explicitImages ? raw
+                                   : emitMinimumImage(pair, loc, raw,
+                                                      boxComputed,
+                                                      inverseComputed);
+          Value squares = arith::MulFOp::create(pair, loc, d, d);
+          Value r2 = vector::ReductionOp::create(
+              pair, loc, vector::CombiningKind::ADD, squares);
+
+          IRMapping inside = local;
+          inside.map(kernel.getArgument(0), r2);
+          inside.map(kernel.getArgument(1), d);
+          for (unsigned i = 0; i != numIns; ++i) {
+            inside.map(kernel.getArgument(2 + 2 * i), centralValues[i]);
+            inside.map(kernel.getArgument(3 + 2 * i),
+                       loadElement(pair, loc, insBuffers[i], other));
+          }
+          for (Operation &nested : kernel.without_terminator())
+            pair.clone(nested, inside);
+
+          // A pair beyond the cutoff contributes nothing, and neither does
+          // an entry that stands for the particle itself, which is how a
+          // device marks an excluded pair (the build of the neighbor matrix,
+          // MatrixBuild.cpp).
+          Value within = arith::CmpFOp::create(
+              pair, loc, arith::CmpFPredicate::OLT, r2, cutoff2);
+          Value distinct = arith::CmpIOp::create(
+              pair, loc, arith::CmpIPredicate::ne, other, central);
+          within = arith::AndIOp::create(pair, loc, within, distinct);
+          // With the policy (directed, atomic), the value of each destination
+          // at the neighbor, sigma times that at the center, added atomically
+          // (D290).
+          if (twoEnded && numOuts != 0)
+            scf::IfOp::create(pair, loc, within, [&](OpBuilder &then,
+                                                     Location) {
+              Value neighbor = other;
+              if (layout)
+                neighbor = arith::IndexCastOp::create(
+                    then, loc, then.getIndexType(),
+                    memref::LoadOp::create(then, loc, layout->order,
+                                           ValueRange{other}));
+              for (unsigned i = 0; i != numOuts; ++i) {
+                Value value = inside.lookupOrDefault(yield->getOperand(i));
+                if (op.getExchange(i) == md::Exchange::Antisymmetric)
+                  value = arith::NegFOp::create(then, loc, value);
+                Value destination = op.getOuts()[i];
+                auto type = cast<MemRefType>(destination.getType());
+                if (add)
+                  add(then, i, neighbor, value);
+                else if (type.getMemorySpace())
+                  emitAtomicAdd(then, loc, value, destination, neighbor);
+                else
+                  emitHostAtomicAdd(then, loc, value, destination, neighbor);
+              }
+              scf::YieldOp::create(then, loc);
+            });
+          for (unsigned i = 0; i != numYields; ++i) {
+            Value narrow = getNarrow(i);
+            Value contribution =
+                inside.lookupOrDefault(narrow ? narrow : yield->getOperand(i));
+            Value nothing = createZero(pair, loc, contribution.getType());
+            Value masked = arith::SelectOp::create(pair, loc, within,
+                                                   contribution, nothing);
+            updated.push_back(
+                arith::AddFOp::create(pair, loc, partial[i], masked));
+          }
+          return updated;
+        };
+        SmallVector<Value> updated;
+        if (op.getGhostFree()) {
+          Value candidate = other;
+          if (layout)
+            candidate = arith::IndexCastOp::create(
+                pair, loc, pair.getIndexType(),
+                memref::LoadOp::create(pair, loc, layout->order,
+                                       ValueRange{other}));
+          Value owned = arith::CmpIOp::create(
+              pair, loc, arith::CmpIPredicate::ult, candidate,
+              op.getCenters());
+          auto permitted = scf::IfOp::create(
+              pair, loc, TypeRange(partial), owned, /*withElseRegion=*/true);
+          {
+            OpBuilder then = OpBuilder::atBlockEnd(permitted.thenBlock());
+            scf::YieldOp::create(then, loc, emitCandidate(then));
+          }
+          {
+            OpBuilder otherwise = OpBuilder::atBlockEnd(permitted.elseBlock());
+            scf::YieldOp::create(otherwise, loc, partial);
+          }
+          updated.assign(permitted.getResults().begin(),
+                         permitted.getResults().end());
+        } else {
+          updated = emitCandidate(pair);
+        }
+        scf::YieldOp::create(pair, loc, updated);
+      });
+
+  SmallVector<Value> totals(inner.getResults());
+  for (unsigned i = 0; i != numYields; ++i)
+    if (getNarrow(i))
+      totals[i] = arith::ExtFOp::create(
+          builder, loc, yield->getOperand(i).getType(), totals[i]);
+  if (lanes)
+    for (Value &total : totals)
+      total = lanes->combine(builder, loc, total);
+
+  auto emitStores = [&](OpBuilder &writer) {
+    // The destinations are in the order of the particles.
+    Value particle = central;
+    if (layout)
+      particle = arith::IndexCastOp::create(
+          writer, loc, writer.getIndexType(),
+          memref::LoadOp::create(writer, loc, layout->order,
+                                 ValueRange{central}));
+    for (unsigned i = 0; i != numOuts; ++i) {
+      Value destination = op.getOuts()[i];
+      Value total = totals[i];
+      // Other rows add to this one at their neighbors at the same time:
+      // the center adds atomically as well (D290).
+      if (twoEnded) {
+        if (add)
+          add(writer, i, particle, total);
+        else if (cast<MemRefType>(destination.getType()).getMemorySpace())
+          emitAtomicAdd(writer, loc, total, destination, particle);
+        else
+          emitHostAtomicAdd(writer, loc, total, destination, particle);
+        continue;
+      }
+      if (!op.overwrites(i))
+        total = arith::AddFOp::create(
+            writer, loc, loadElement(writer, loc, destination, particle),
+            total);
+      storeElement(writer, loc, total, destination, particle);
+    }
+  };
+  if (outTotals) {
+    outTotals->assign(totals.begin(), totals.begin() + numOuts);
+  } else if (lanes && numOuts != 0) {
+    Value leader = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
+                                         lanes->lane, zero);
+    Value writes = arith::AndIOp::create(builder, loc, leader, lanes->valid);
+    scf::IfOp::create(builder, loc, writes, [&](OpBuilder &then, Location) {
+      emitStores(then);
+      scf::YieldOp::create(then, loc);
+    });
+  } else {
+    emitStores(builder);
+  }
+
+  SmallVector<Value> contributions;
+  for (unsigned i = numOuts; i != numYields; ++i) {
+    Value total = totals[i];
+    if (auto weights = op.getWeights()) {
+      double weight = (*weights)[i - numOuts];
+      if (weight != 1.0) {
+        Type type = total.getType();
+        FloatAttr scalar =
+            builder.getFloatAttr(getElementTypeOrSelf(type), weight);
+        Value factor;
+        if (auto vector = dyn_cast<VectorType>(type))
+          factor = arith::ConstantOp::create(
+              builder, loc, type,
+              DenseElementsAttr::get(vector, scalar.getValue()));
+        else
+          factor = arith::ConstantOp::create(builder, loc, type, scalar);
+        total = arith::MulFOp::create(builder, loc, factor, total);
+      }
+    }
+    contributions.push_back(total);
+  }
+  return contributions;
+}
+
+/// The components of `value` (a number or a vector) as numbers.
+static SmallVector<Value> getComponents(OpBuilder &b, Location loc,
+                                        Value value) {
+  auto vector = dyn_cast<VectorType>(value.getType());
+  if (!vector)
+    return {value};
+  SmallVector<Value> parts;
+  for (int64_t c = 0, e = vector.getNumElements(); c != e; ++c)
+    parts.push_back(vector::ExtractOp::create(b, loc, value, c));
+  return parts;
+}
+
+/// A value of `type` (a number or a vector) from its components.
+static Value fromComponents(OpBuilder &b, Location loc, Type type,
+                            ArrayRef<Value> parts) {
+  if (auto vector = dyn_cast<VectorType>(type))
+    return vector::FromElementsOp::create(b, loc, vector, parts);
+  return parts.front();
+}
+
+
+//===----------------------------------------------------------------------===//
+// Loops over tuples
+//===----------------------------------------------------------------------===//
+
+/// The value of `buffer`, a buffer of i32, at `row` and `column`, as an
+/// index.
+static Value loadIndex(OpBuilder &builder, Location loc, Value buffer,
+                       Value row, Value column) {
+  Value narrow =
+      memref::LoadOp::create(builder, loc, buffer, ValueRange{row, column});
+  return arith::IndexCastOp::create(builder, loc, builder.getIndexType(),
+                                    narrow);
+}
+
+namespace {
+/// A tuple of the row of a particle in an incidence structure, evaluated:
+/// its number, the place of the particle, its members, and the mapping
+/// from the values of the kernel to those that it computes.
+struct EvaluatedTuple {
+  Value tuple, place;
+  SmallVector<Value, 4> members;
+  IRMapping inside;
+};
+} // namespace
+
+/// How a kernel loads the value of a member from a buffer, in `type` if
+/// it is not null (the kernel narrows the value to it at once), and
+/// whether the value is the position whose differences the kernel takes:
+/// `loadElement`, or a value held in registers (emitIntegrationThread),
+/// where a position may be one relative to the tuple, in the type of the
+/// kernel.
+using LoadMember = function_ref<Value(OpBuilder &, Value, Value, Type, bool)>;
+
+/// The type that every use of `argument` narrows it to, if each is an
+/// arith.truncf to one type; otherwise null.
+static Type getNarrowedType(BlockArgument argument) {
+  Type narrowed;
+  for (Operation *user : argument.getUsers()) {
+    auto truncate = dyn_cast<arith::TruncFOp>(user);
+    if (!truncate || truncate.getRoundingmodeAttr() ||
+        (narrowed && truncate.getType() != narrowed))
+      return Type();
+    narrowed = truncate.getType();
+  }
+  return narrowed;
+}
+
+static void evaluateMembers(OpBuilder &b, md_exec::TupleForOp op,
+                            EvaluatedTuple &result, Value box, Value inverse,
+                            const IRMapping &local,
+                            LoadMember loadMember = nullptr);
+
+/// The row of `particle` in `incidence`, a buffer of ragged rows
+/// (RaggedRows.h): where its entries begin and how many tuples it has.
+static RaggedRow loadRow(OpBuilder &b, md_exec::TupleForOp op,
+                         Value incidence, Value particle) {
+  return emitRaggedRow(b, op.getLoc(), incidence, particle,
+                       md_exec::getIncidenceEntrySize(op.getArity()),
+                       /*checked=*/false);
+}
+
+/// Loads the entry `number` of the row `row` of `incidence`: the tuple,
+/// the place of the particle in it, and its members.
+static EvaluatedTuple loadTuple(OpBuilder &b, md_exec::TupleForOp op,
+                                Value incidence, const RaggedRow &row,
+                                Value number) {
+  Location loc = op.getLoc();
+  int64_t arity = op.getArity();
+  int64_t entry = md_exec::getIncidenceEntrySize(arity);
+  auto column = [&](int64_t c) -> Value {
+    return arith::IndexCastOp::create(
+        b, loc, b.getIndexType(),
+        emitRaggedEntry(b, loc, incidence, row.first, number, c, entry));
+  };
+  EvaluatedTuple result;
+  result.tuple = column(0);
+  result.place = column(1);
+  for (int64_t q = 0; q != arity; ++q)
+    result.members.push_back(column(2 + q));
+  return result;
+}
+
+/// Loads the entry `number` of the row `row` of `incidence` and emits the
+/// kernel of `op` for it: the displacements in the minimum image, taken in
+/// the type of the positions and imaged in `computed`, the values of `ins`
+/// for each member and of `parameters` for the tuple.
+static EvaluatedTuple evaluateTuple(OpBuilder &b, md_exec::TupleForOp op,
+                                    Value incidence, const RaggedRow &row,
+                                    Value number, Value box, Value inverse,
+                                    const IRMapping &local) {
+  EvaluatedTuple result = loadTuple(b, op, incidence, row, number);
+  evaluateMembers(b, op, result, box, inverse, local);
+  return result;
+}
+
+/// Emits the kernel of `op` for the tuple `result.tuple` of the members
+/// `result.members`, as `evaluateTuple` does.
+static void evaluateMembers(OpBuilder &b, md_exec::TupleForOp op,
+                            EvaluatedTuple &result, Value box, Value inverse,
+                            const IRMapping &local, LoadMember loadMember) {
+  Location loc = op.getLoc();
+  Block &kernel = op.getKernel().front();
+  int64_t arity = op.getArity();
+  IRMapping &inside = result.inside;
+  inside = local;
+  Value positions = op.getPositions();
+  auto load = [&](Value buffer, Value member, Type type,
+                  bool position = false) -> Value {
+    if (loadMember)
+      return loadMember(b, buffer, member, type, position);
+    Value value = loadElement(b, loc, buffer, member);
+    if (type)
+      value = arith::TruncFOp::create(b, loc, type, value);
+    return value;
+  };
+  SmallVector<Value, 4> memberPositions(arity);
+  auto positionOf = [&](int64_t q) {
+    if (!memberPositions[q])
+      memberPositions[q] =
+          load(positions, result.members[q], Type(), /*position=*/true);
+    return memberPositions[q];
+  };
+  Type computed = getElementTypeOrSelf(box.getType());
+  for (auto [index, coordinate] : llvm::enumerate(op.getCoordinates())) {
+    Value raw = convertReal(
+        b, loc,
+        arith::SubFOp::create(b, loc, positionOf(coordinate.members[0]),
+                              positionOf(coordinate.members[1])),
+        computed);
+    Value d = emitMinimumImage(b, loc, raw, box, inverse);
+    inside.map(kernel.getArgument(index), d);
+  }
+  // A value that the kernel narrows at once is loaded narrowed, and the
+  // ops that narrow it are not cloned.
+  unsigned argument = op.getCoordinateKinds().size();
+  for (Value buffer : op.getIns())
+    for (int64_t q = 0; q != arity; ++q) {
+      BlockArgument in = kernel.getArgument(argument++);
+      if (in.use_empty())
+        continue;
+      Type narrowed = getNarrowedType(in);
+      if (!narrowed) {
+        inside.map(in, load(buffer, result.members[q], Type()));
+        continue;
+      }
+      Value value = load(buffer, result.members[q], narrowed);
+      for (Operation *user : in.getUsers())
+        inside.map(user->getResult(0), value);
+    }
+  for (Value buffer : op.getParameters())
+    inside.map(kernel.getArgument(argument++),
+               loadElement(b, loc, buffer, result.tuple));
+  for (Operation &nested : kernel.without_terminator()) {
+    if (nested.getNumResults() == 1 && isa<arith::TruncFOp>(nested) &&
+        inside.contains(nested.getResult(0)))
+      continue;
+    b.clone(nested, inside);
+  }
+}
+
+/// `partial` with `value` added, or, for a value of the type i1 that tells
+/// whether the kernel yields true for some tuple, or-ed
+/// (D278).
+static Value accumulate(OpBuilder &builder, Location loc, Value partial,
+                        Value value) {
+  if (value.getType().isInteger(1))
+    return arith::OrIOp::create(builder, loc, partial, value);
+  return arith::AddFOp::create(builder, loc, partial, value);
+}
+
+/// The loop of `emitTupleKernel` for a set whose tuples share no particle:
+/// the member at place 0 evaluates the tuple once and writes the values of
+/// all members; a particle in no tuple writes 0 where the loop overwrites.
+static SmallVector<Value> emitOwnedTupleKernel(OpBuilder &builder,
+                                               md_exec::TupleForOp op,
+                                               Value incidence, Value box,
+                                               Value inverse, Value particle,
+                                               IRMapping &local) {
+  Location loc = op.getLoc();
+  Block &kernel = op.getKernel().front();
+  Operation *yield = kernel.getTerminator();
+  int64_t arity = op.getArity();
+  unsigned numOuts = op.getOuts().size();
+  unsigned numYields = yield->getNumOperands();
+  Value zero = createIndex(builder, loc, 0);
+
+  SmallVector<Type> sumTypes;
+  for (unsigned i = numOuts * arity; i != numYields; ++i)
+    sumTypes.push_back(yield->getOperand(i).getType());
+  auto zeros = [&](OpBuilder &b) {
+    SmallVector<Value> values;
+    for (Type type : sumTypes)
+      values.push_back(createZero(b, loc, type));
+    return values;
+  };
+
+  RaggedRow row = loadRow(builder, op, incidence, particle);
+  Value member = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::ne,
+                                       row.count, zero);
+  auto branch = scf::IfOp::create(
+      builder, loc, member,
+      [&](OpBuilder &b, Location) {
+        EvaluatedTuple evaluated =
+            evaluateTuple(b, op, incidence, row, zero, box, inverse, local);
+        Value owner = arith::CmpIOp::create(
+            b, loc, arith::CmpIPredicate::eq, evaluated.place, zero);
+        auto owned = scf::IfOp::create(
+            b, loc, owner,
+            [&](OpBuilder &c, Location) {
+              for (unsigned i = 0; i != numOuts; ++i) {
+                Value destination = op.getOuts()[i];
+                for (int64_t q = 0; q != arity; ++q) {
+                  Value target = evaluated.members[q];
+                  Value value = evaluated.inside.lookupOrDefault(
+                      yield->getOperand(i * arity + q));
+                  if (!op.overwrites(i))
+                    value = arith::AddFOp::create(
+                        c, loc, loadElement(c, loc, destination, target),
+                        value);
+                  storeElement(c, loc, value, destination, target);
+                }
+              }
+              SmallVector<Value> contributions;
+              for (unsigned i = numOuts * arity; i != numYields; ++i)
+                contributions.push_back(
+                    evaluated.inside.lookupOrDefault(yield->getOperand(i)));
+              scf::YieldOp::create(c, loc, contributions);
+            },
+            [&](OpBuilder &c, Location) {
+              scf::YieldOp::create(c, loc, zeros(c));
+            });
+        scf::YieldOp::create(b, loc, owned.getResults());
+      },
+      [&](OpBuilder &b, Location) {
+        for (unsigned i = 0; i != numOuts; ++i)
+          if (op.overwrites(i))
+            storeElement(
+                b, loc,
+                createZero(b, loc, yield->getOperand(i * arity).getType()),
+                op.getOuts()[i], particle);
+        scf::YieldOp::create(b, loc, zeros(b));
+      });
+  return SmallVector<Value>(branch.getResults());
+}
+
+SmallVector<Value> kernels::emitTupleKernel(OpBuilder &builder,
+                                            md_exec::TupleForOp op,
+                                            Value incidence, Value box,
+                                            Value inverse, Value particle,
+                                            IRMapping &local,
+                                            const RowLanes *lanes,
+                                            SmallVectorImpl<Value> *outTotals) {
+  Location loc = op.getLoc();
+  Block &kernel = op.getKernel().front();
+  Operation *yield = kernel.getTerminator();
+  int64_t arity = op.getArity();
+  unsigned numOuts = op.getOuts().size();
+  unsigned numYields = yield->getNumOperands();
+
+  // As for pairs, the differences of the positions are taken in their type
+  // and the minimum image in the type that the kernel computes in.
+  Type computed =
+      cast<VectorType>(kernel.getArgument(0).getType()).getElementType();
+  Value boxComputed = convertReal(builder, loc, box, computed);
+  Value inverseComputed = convertReal(builder, loc, inverse, computed);
+  if (op.getDisjoint() && !lanes)
+    return emitOwnedTupleKernel(builder, op, incidence, boxComputed,
+                                inverseComputed, particle, local);
+  Value zero = createIndex(builder, loc, 0);
+  Value one = createIndex(builder, loc, 1);
+
+  // What the particle accumulates: one value for each destination, then
+  // one for each global sum.
+  SmallVector<Value> sums;
+  for (unsigned i = 0; i != numOuts; ++i)
+    sums.push_back(createZero(builder, loc, yield->getOperand(i * arity).getType()));
+  // A contribution to a global sum that the kernel widens is summed over
+  // the row in the type it was computed in and widened once (as in
+  // emitPairKernel).
+  auto getNarrow = [&](unsigned i) -> Value {
+    auto widen = yield->getOperand(i).getDefiningOp<arith::ExtFOp>();
+    if (!widen || widen->getBlock() != &kernel)
+      return Value();
+    return widen.getIn();
+  };
+  for (unsigned i = numOuts * arity; i != numYields; ++i) {
+    Value narrow = getNarrow(i);
+    sums.push_back(createZero(
+        builder, loc,
+        narrow ? narrow.getType() : yield->getOperand(i).getType()));
+  }
+
+  RaggedRow row = loadRow(builder, op, incidence, particle);
+  Value count = row.count;
+  Value first = zero, step = one;
+  if (lanes) {
+    count = arith::SelectOp::create(builder, loc, lanes->valid, count, zero);
+    first = lanes->lane;
+    step = createIndex(builder, loc, lanes->lanes);
+  }
+  auto loop = scf::ForOp::create(
+      builder, loc, first, count, step, sums,
+      [&](OpBuilder &b, Location, Value number, ValueRange partial) {
+        EvaluatedTuple evaluated =
+            evaluateTuple(b, op, incidence, row, number, boxComputed,
+                          inverseComputed, local);
+        IRMapping &inside = evaluated.inside;
+        Value place = evaluated.place;
+
+        // The value for the place of the particle, of each destination.
+        SmallVector<Value> updated;
+        for (unsigned i = 0; i != numOuts; ++i) {
+          Value value = inside.lookupOrDefault(yield->getOperand(i * arity));
+          for (int64_t q = 1; q != arity; ++q) {
+            Value here = arith::CmpIOp::create(
+                b, loc, arith::CmpIPredicate::eq, place,
+                createIndex(b, loc, q));
+            value = arith::SelectOp::create(
+                b, loc, here,
+                inside.lookupOrDefault(yield->getOperand(i * arity + q)),
+                value);
+          }
+          updated.push_back(arith::AddFOp::create(b, loc, partial[i], value));
+        }
+
+        // A tuple adds to a sum once, through its member at place 0.
+        Value atFirst = arith::CmpIOp::create(
+            b, loc, arith::CmpIPredicate::eq, place, zero);
+        for (unsigned i = numOuts * arity, j = numOuts; i != numYields;
+             ++i, ++j) {
+          Value narrow = getNarrow(i);
+          Value contribution =
+              inside.lookupOrDefault(narrow ? narrow : yield->getOperand(i));
+          Value nothing = createZero(b, loc, contribution.getType());
+          Value masked =
+              arith::SelectOp::create(b, loc, atFirst, contribution, nothing);
+          updated.push_back(accumulate(b, loc, partial[j], masked));
+        }
+        scf::YieldOp::create(b, loc, updated);
+      });
+
+  SmallVector<Value> totals(loop.getResults());
+  for (unsigned i = numOuts * arity, j = numOuts; i != numYields; ++i, ++j)
+    if (getNarrow(i))
+      totals[j] = arith::ExtFOp::create(
+          builder, loc, yield->getOperand(i).getType(), totals[j]);
+  if (lanes)
+    for (Value &total : totals)
+      total = lanes->combine(builder, loc, total);
+
+  auto emitStores = [&](OpBuilder &writer) {
+    for (unsigned i = 0; i != numOuts; ++i) {
+      Value destination = op.getOuts()[i];
+      Value total = totals[i];
+      if (!op.overwrites(i))
+        total = arith::AddFOp::create(
+            writer, loc, loadElement(writer, loc, destination, particle),
+            total);
+      storeElement(writer, loc, total, destination, particle);
+    }
+  };
+  if (outTotals) {
+    outTotals->assign(totals.begin(), totals.begin() + numOuts);
+  } else if (lanes && numOuts != 0) {
+    Value leader = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
+                                         lanes->lane, zero);
+    Value writes = arith::AndIOp::create(builder, loc, leader, lanes->valid);
+    scf::IfOp::create(builder, loc, writes, [&](OpBuilder &then, Location) {
+      emitStores(then);
+      scf::YieldOp::create(then, loc);
+    });
+  } else {
+    emitStores(builder);
+  }
+
+  return SmallVector<Value>(totals.begin() + numOuts, totals.end());
+}
+
+/// Adds `value`, a scalar or a vector, atomically to the element `row` of
+/// the buffer `buffer` on a device, with no result: a relaxed atomic at the
+/// scope of the device. f32 takes PTX's own reduction, as the NVPTX backend
+/// of LLVM expands atomicrmw fadd of f32 into a loop of compare-and-swap.
+void kernels::emitAtomicAdd(OpBuilder &b, Location loc, Value value,
+                            Value buffer, Value row) {
+  auto type = cast<MemRefType>(buffer.getType());
+  Type element = type.getElementType();
+  int64_t components = type.getRank() == 1 ? 1 : type.getDimSize(1);
+  int64_t bytes = element.getIntOrFloatBitWidth() / 8;
+  Type wide = b.getI64Type();
+  Value base = arith::IndexCastOp::create(
+      b, loc, wide,
+      memref::ExtractAlignedPointerAsIndexOp::create(b, loc, buffer));
+  Value first = arith::MulIOp::create(
+      b, loc, arith::IndexCastOp::create(b, loc, wide, row),
+      arith::ConstantOp::create(b, loc, wide,
+                                b.getI64IntegerAttr(components * bytes)));
+  for (int64_t c = 0; c != components; ++c) {
+    Value part = components == 1
+                     ? value
+                     : vector::ExtractOp::create(b, loc, value, c).getResult();
+    Value offset = arith::AddIOp::create(
+        b, loc, first,
+        arith::ConstantOp::create(b, loc, wide, b.getI64IntegerAttr(c * bytes)));
+    Value address = arith::AddIOp::create(b, loc, base, offset);
+    Value pointer = LLVM::IntToPtrOp::create(
+        b, loc, LLVM::LLVMPointerType::get(b.getContext(), 1), address);
+    if (element.isF32()) {
+      LLVM::InlineAsmOp::create(
+          b, loc, TypeRange(), ValueRange{pointer, part},
+          "red.relaxed.gpu.global.add.f32 [$0], $1;", "l,f",
+          /*has_side_effects=*/true, /*is_align_stack=*/false,
+          LLVM::TailCallKind::None, /*asm_dialect=*/LLVM::AsmDialectAttr(),
+          /*operand_attrs=*/ArrayAttr());
+    } else {
+      LLVM::AtomicRMWOp::create(b, loc, LLVM::AtomicBinOp::fadd, pointer,
+                                part, LLVM::AtomicOrdering::monotonic,
+                                StringRef("device"));
+    }
+  }
+}
+
+void kernels::emitTupleOnce(OpBuilder &builder, md_exec::TupleForOp op,
+                            Value members, Value tuple, Value box,
+                            Value inverse, IRMapping &local,
+                            AddToMember add) {
+  Location loc = op.getLoc();
+  Block &kernel = op.getKernel().front();
+  Operation *yield = kernel.getTerminator();
+  int64_t arity = op.getArity();
+  Type computed =
+      cast<VectorType>(kernel.getArgument(0).getType()).getElementType();
+  Value boxComputed = convertReal(builder, loc, box, computed);
+  Value inverseComputed = convertReal(builder, loc, inverse, computed);
+
+  EvaluatedTuple evaluated;
+  evaluated.tuple = tuple;
+  for (int64_t q = 0; q != arity; ++q)
+    evaluated.members.push_back(
+        loadIndex(builder, loc, members, tuple, createIndex(builder, loc, q)));
+  evaluateMembers(builder, op, evaluated, boxComputed, inverseComputed,
+                  local);
+  for (unsigned i = 0, e = op.getOuts().size(); i != e; ++i) {
+    Value destination = op.getOuts()[i];
+    Type stored = getElementTypeOrSelf(destination.getType());
+    for (int64_t q = 0; q != arity; ++q) {
+      Value value = evaluated.inside.lookupOrDefault(
+          yield->getOperand(i * arity + q));
+      Value converted = convertReal(builder, loc, value, stored);
+      if (add)
+        add(builder, i, evaluated.members[q], converted);
+      else
+        emitAtomicAdd(builder, loc, converted, destination,
+                      evaluated.members[q]);
+    }
+  }
+}
+
+SmallVector<Value>
+kernels::emitTuplesOnceWithSums(OpBuilder &builder, md_exec::TupleForOp op,
+                                Value members, Value first, Value stride,
+                                Value count, Value box, Value inverse) {
+  Location loc = op.getLoc();
+  Block &kernel = op.getKernel().front();
+  Operation *yield = kernel.getTerminator();
+  int64_t arity = op.getArity();
+  unsigned numOuts = op.getOuts().size();
+  unsigned numYields = yield->getNumOperands();
+  Type computed =
+      cast<VectorType>(kernel.getArgument(0).getType()).getElementType();
+  Value boxComputed = convertReal(builder, loc, box, computed);
+  Value inverseComputed = convertReal(builder, loc, inverse, computed);
+  // A contribution that the kernel widens is summed in the type it was
+  // computed in (as in emitTupleKernel).
+  auto getNarrow = [&](unsigned i) -> Value {
+    auto widen = yield->getOperand(i).getDefiningOp<arith::ExtFOp>();
+    if (!widen || widen->getBlock() != &kernel)
+      return Value();
+    return widen.getIn();
+  };
+  SmallVector<Value> sums;
+  for (unsigned i = numOuts * arity; i != numYields; ++i) {
+    Value narrow = getNarrow(i);
+    sums.push_back(createZero(
+        builder, loc,
+        narrow ? narrow.getType() : yield->getOperand(i).getType()));
+  }
+  auto loop = scf::ForOp::create(
+      builder, loc, first, count, stride, sums,
+      [&](OpBuilder &b, Location, Value tuple, ValueRange partial) {
+        EvaluatedTuple evaluated;
+        evaluated.tuple = tuple;
+        for (int64_t q = 0; q != arity; ++q)
+          evaluated.members.push_back(
+              loadIndex(b, loc, members, tuple, createIndex(b, loc, q)));
+        evaluateMembers(b, op, evaluated, boxComputed, inverseComputed,
+                        IRMapping());
+        IRMapping &inside = evaluated.inside;
+        for (unsigned i = 0; i != numOuts; ++i) {
+          Value destination = op.getOuts()[i];
+          Type stored = getElementTypeOrSelf(destination.getType());
+          for (int64_t q = 0; q != arity; ++q) {
+            Value value =
+                inside.lookupOrDefault(yield->getOperand(i * arity + q));
+            emitAtomicAdd(b, loc, convertReal(b, loc, value, stored),
+                          destination, evaluated.members[q]);
+          }
+        }
+        SmallVector<Value> updated;
+        for (unsigned i = numOuts * arity, j = 0; i != numYields; ++i, ++j) {
+          Value narrow = getNarrow(i);
+          Value contribution =
+              inside.lookupOrDefault(narrow ? narrow : yield->getOperand(i));
+          updated.push_back(accumulate(b, loc, partial[j], contribution));
+        }
+        scf::YieldOp::create(b, loc, updated);
+      });
+  SmallVector<Value> totals(loop.getResults());
+  for (unsigned i = numOuts * arity, j = 0; i != numYields; ++i, ++j)
+    if (getNarrow(i))
+      totals[j] = arith::ExtFOp::create(
+          builder, loc, yield->getOperand(i).getType(), totals[j]);
+  return totals;
+}
+
+int64_t kernels::getIntegrationStride(const IntegrationRun &run) {
+  int64_t widest = 1;
+  for (md_exec::TupleForOp loop : run.loops)
+    widest = std::max<int64_t>(widest, loop.getArity());
+  return 32 - (widest - 1);
+}
+
+void kernels::emitIntegrationThread(
+    OpBuilder &builder, const IntegrationRun &run, ArrayRef<Value> boxes,
+    ArrayRef<Value> inverses, Value thread, Value span, Value acrossList,
+    Value acrossCount, bool across,
+    function_ref<void(OpBuilder &, Value, ArrayRef<Value>)> storeAfter) {
+  md_exec::ParticleForOp before = run.before, after = run.after;
+  SmallVector<md_exec::TupleForOp, 4> loops(run.loops.begin(),
+                                            run.loops.end());
+  Location loc = after.getLoc();
+  Type i32 = builder.getI32Type();
+  Value zero = createIndex(builder, loc, 0);
+  Value width = arith::ConstantOp::create(builder, loc, i32,
+                                          builder.getI32IntegerAttr(32));
+  unsigned beforeOuts = before.getOuts().size();
+  unsigned afterOuts = after.getOuts().size();
+  auto toI32 = [&](OpBuilder &b, Value index) -> Value {
+    return arith::IndexCastOp::create(b, loc, i32, index);
+  };
+  auto True = [&](OpBuilder &b) -> Value {
+    return arith::ConstantOp::create(b, loc, b.getI1Type(),
+                                     b.getBoolAttr(true));
+  };
+
+  // `value` from the lane `source` of the warp; numbers of 64 bits travel
+  // as two of 32.
+  auto shuffleFrom = [&](OpBuilder &b, Value value, Value source) -> Value {
+    SmallVector<Value> parts = getComponents(b, loc, value);
+    for (Value &part : parts) {
+      Type type = part.getType();
+      if (type.getIntOrFloatBitWidth() == 64) {
+        Type i64 = b.getI64Type();
+        Value bits = arith::BitcastOp::create(b, loc, i64, part);
+        Value low = arith::TruncIOp::create(b, loc, i32, bits);
+        Value high = arith::TruncIOp::create(
+            b, loc, i32,
+            arith::ShRUIOp::create(
+                b, loc, bits,
+                arith::ConstantOp::create(b, loc, i64,
+                                          b.getI64IntegerAttr(32))));
+        low = gpu::ShuffleOp::create(b, loc, low, source, width,
+                                     gpu::ShuffleMode::IDX)
+                  .getShuffleResult();
+        high = gpu::ShuffleOp::create(b, loc, high, source, width,
+                                      gpu::ShuffleMode::IDX)
+                   .getShuffleResult();
+        Value joined = arith::OrIOp::create(
+            b, loc, arith::ExtUIOp::create(b, loc, i64, low),
+            arith::ShLIOp::create(
+                b, loc, arith::ExtUIOp::create(b, loc, i64, high),
+                arith::ConstantOp::create(b, loc, i64,
+                                          b.getI64IntegerAttr(32))));
+        part = arith::BitcastOp::create(b, loc, type, joined);
+      } else {
+        part = gpu::ShuffleOp::create(b, loc, part, source, width,
+                                      gpu::ShuffleMode::IDX)
+                   .getShuffleResult();
+      }
+    }
+    return fromComponents(b, loc, value.getType(), parts);
+  };
+
+  // The values of the loop before for a member, from its inputs as they
+  // are stored, before the thread writes anything.
+  auto evalBefore = [&](OpBuilder &b, Value member) {
+    IRMapping local;
+    Block &kernel = before.getKernel().front();
+    for (auto [index, buffer] : llvm::enumerate(before.getIns()))
+      local.map(kernel.getArgument(index), loadElement(b, loc, buffer, member));
+    for (Operation &nested : kernel.without_terminator())
+      b.clone(nested, local);
+    Operation *yield = kernel.getTerminator();
+    SmallVector<Value> values;
+    for (unsigned i = 0; i != beforeOuts; ++i)
+      values.push_back(local.lookupOrDefault(yield->getOperand(i)));
+    return values;
+  };
+  // The values of the loop before for a member, as the first kernel wrote
+  // them.
+  auto loadBefore = [&](OpBuilder &b, Value member) {
+    SmallVector<Value> values;
+    for (Value buffer : before.getOuts())
+      values.push_back(loadElement(b, loc, buffer, member));
+    return values;
+  };
+  auto fromBefore = [&](Value buffer) -> int {
+    for (unsigned j = 0; j != beforeOuts; ++j)
+      if (before.getOuts()[j] == buffer)
+        return j;
+    return -1;
+  };
+  auto fromLoop = [&](Value buffer) -> std::pair<int, int> {
+    for (auto [i, loop] : llvm::enumerate(loops))
+      for (auto [o, out] : llvm::enumerate(loop.getOuts()))
+        if (out == buffer)
+          return {int(i), int(o)};
+    return {-1, -1};
+  };
+  // The types of the values of a loop over tuples for one member: one for
+  // each destination.
+  auto correctionTypes = [&](md_exec::TupleForOp loop) {
+    Operation *yield = loop.getKernel().front().getTerminator();
+    int64_t arity = loop.getArity();
+    SmallVector<Type> types;
+    for (unsigned o = 0, e = loop.getOuts().size(); o != e; ++o)
+      types.push_back(yield->getOperand(o * arity).getType());
+    return types;
+  };
+  // The cell of a loop in the type its kernel computes in.
+  auto cellOf = [&](OpBuilder &, unsigned i) -> std::pair<Value, Value> {
+    return {boxes[i], inverses[i]};
+  };
+  // The flag of loop `i`, set by the member at place 0 of a tuple whose
+  // kernel yields true after its destinations (D278).
+  auto setFlag = [&](OpBuilder &b, unsigned i, const IRMapping &inside) {
+    if (i >= run.flags.size() || !run.flags[i])
+      return;
+    md_exec::TupleForOp loop = loops[i];
+    Operation *yield = loop.getKernel().front().getTerminator();
+    Value failed = inside.lookupOrDefault(
+        yield->getOperand(loop.getOuts().size() * loop.getArity()));
+    Value flag = run.flags[i];
+    scf::IfOp::create(b, loc, failed, [&](OpBuilder &set, Location) {
+      memref::StoreOp::create(
+          set, loc,
+          arith::ConstantOp::create(set, loc, i32, set.getI32IntegerAttr(1)),
+          flag, ValueRange{createIndex(set, loc, 0)});
+      scf::YieldOp::create(set, loc);
+    });
+  };
+
+  // The loop after for a member, its values of the loop before from
+  // registers and those of the loops over tuples from `corrections` (one
+  // for each destination of each loop), and its contributions handed
+  // over; the destinations of the loops over tuples for the member, and
+  // those of the loop before that the loop after does not write, too.
+  auto evalAfter = [&](OpBuilder &b, Value member, ArrayRef<Value> values,
+                       ArrayRef<SmallVector<Value>> corrections) {
+    for (auto [i, loop] : llvm::enumerate(loops))
+      for (auto [o, out] : llvm::enumerate(loop.getOuts())) {
+        if (!run.keepOuts[i][o])
+          continue;
+        Value value = corrections[i][o];
+        if (!loop.overwrites(o))
+          value = arith::AddFOp::create(
+              b, loc, loadElement(b, loc, out, member), value);
+        storeElement(b, loc, value, out, member);
+      }
+    IRMapping local;
+    Block &kernel = after.getKernel().front();
+    for (auto [index, buffer] : llvm::enumerate(after.getIns())) {
+      Type type = kernel.getArgument(index).getType();
+      Type real = getElementTypeOrSelf(type);
+      Value value;
+      if (int j = fromBefore(buffer); j >= 0)
+        value = convertReal(b, loc, values[j], real);
+      else if (auto [i, o] = fromLoop(buffer); i >= 0)
+        value = convertReal(b, loc, corrections[i][o], real);
+      else
+        value = loadElement(b, loc, buffer, member);
+      local.map(kernel.getArgument(index), value);
+    }
+    for (Operation &nested : kernel.without_terminator())
+      b.clone(nested, local);
+    Operation *yield = kernel.getTerminator();
+    for (unsigned i = 0; i != afterOuts; ++i)
+      storeElement(b, loc, local.lookupOrDefault(yield->getOperand(i)),
+                   after.getOuts()[i], member);
+    for (unsigned j = 0; j != beforeOuts; ++j)
+      if (!llvm::is_contained(after.getOuts(), before.getOuts()[j]))
+        storeElement(b, loc, values[j], before.getOuts()[j], member);
+    SmallVector<Value> contributions;
+    for (unsigned i = afterOuts, e = yield->getNumOperands(); i != e; ++i)
+      contributions.push_back(local.lookupOrDefault(yield->getOperand(i)));
+    storeAfter(b, member, contributions);
+  };
+
+  // The tuple of a particle in each loop, if any (at most one over the
+  // loops), and whether its members all lie in the warp of the particle.
+  struct Row {
+    EvaluatedTuple tuple;
+    Value inTuple, inWarp, useWarp, leaderLane, leadsAcross;
+  };
+  auto loadRows = [&](OpBuilder &b, Value particle, Value lane32,
+                      Value warpBase, Value warpEnd, Value valid) {
+    SmallVector<Row> rows;
+    for (auto [i, loop] : llvm::enumerate(loops)) {
+      Row row;
+      // The first entry of a row of no tuples is read as well, and not
+      // kept: it is that of the next row, or the entry of zeros at the end
+      // (RaggedRows.h, #347).
+      RaggedRow ragged = loadRow(b, loop, loop.getIncidence(), particle);
+      row.inTuple = arith::AndIOp::create(
+          b, loc, valid,
+          arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ne,
+                                ragged.count, zero));
+      row.tuple = loadTuple(b, loop, loop.getIncidence(), ragged, zero);
+      Value inWarp;
+      for (Value member : row.tuple.members) {
+        Value in = arith::AndIOp::create(
+            b, loc,
+            arith::CmpIOp::create(b, loc, arith::CmpIPredicate::uge, member,
+                                  warpBase),
+            arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ult, member,
+                                  warpEnd));
+        inWarp = inWarp ? arith::AndIOp::create(b, loc, inWarp, in) : in;
+      }
+      row.inWarp = inWarp;
+      row.useWarp = arith::AndIOp::create(b, loc, row.inTuple, inWarp);
+      row.leaderLane = arith::SelectOp::create(
+          b, loc, row.useWarp,
+          toI32(b, arith::SubIOp::create(b, loc, row.tuple.members[0],
+                                         warpBase)),
+          lane32);
+      Value leads = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq,
+                                          row.tuple.place, zero);
+      row.leadsAcross = arith::AndIOp::create(
+          b, loc,
+          arith::AndIOp::create(
+              b, loc, row.inTuple,
+              arith::XOrIOp::create(b, loc, inWarp, True(b))),
+          leads);
+      rows.push_back(row);
+    }
+    return rows;
+  };
+
+  // The second kernel: the tuples that lie across warps, from the list
+  // the first kernel made, `span` threads in one block. Their member at
+  // place 0 takes every member: the values of the loop before that the
+  // first kernel wrote, the tuple, and the loop after for each. The block
+  // then clears the count for the next run.
+  if (across) {
+    Value count = arith::IndexCastOp::create(
+        builder, loc, builder.getIndexType(),
+        memref::LoadOp::create(builder, loc, acrossCount, ValueRange{zero}));
+    scf::ForOp::create(
+        builder, loc, thread, count, span, ValueRange(),
+        [&](OpBuilder &b, Location, Value entry, ValueRange) {
+      Value particle = arith::IndexCastOp::create(
+          b, loc, b.getIndexType(),
+          memref::LoadOp::create(b, loc, acrossList, ValueRange{entry}));
+      SmallVector<Row> rows =
+          loadRows(b, particle, toI32(b, zero), particle, particle, True(b));
+      for (auto [i, loop] : llvm::enumerate(loops)) {
+        Row &row = rows[i];
+        Value leads = arith::AndIOp::create(
+            b, loc, row.inTuple,
+            arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq,
+                                  row.tuple.place, zero));
+        scf::IfOp::create(b, loc, leads, [&](OpBuilder &c, Location) {
+          int64_t arity = loop.getArity();
+          EvaluatedTuple evaluated = row.tuple;
+          SmallVector<SmallVector<Value>, 4> values;
+          for (int64_t q = 0; q != arity; ++q)
+            values.push_back(loadBefore(c, evaluated.members[q]));
+          auto loadMember = [&](OpBuilder &d, Value buffer, Value member,
+                                Type type, bool) -> Value {
+            Value value;
+            if (int j = fromBefore(buffer); j < 0) {
+              value = loadElement(d, loc, buffer, member);
+            } else {
+              for (int64_t q = 0; q != arity && !value; ++q)
+                if (evaluated.members[q] == member)
+                  value = values[q][j];
+              assert(value && "a member of the tuple");
+            }
+            if (type)
+              value = arith::TruncFOp::create(d, loc, type, value);
+            return value;
+          };
+          auto [box, inverse] = cellOf(c, i);
+          evaluateMembers(c, loop, evaluated, box, inverse, IRMapping(),
+                          loadMember);
+          setFlag(c, i, evaluated.inside);
+          Operation *yield = loop.getKernel().front().getTerminator();
+          for (int64_t q = 0; q != arity; ++q) {
+            SmallVector<SmallVector<Value>> corrections;
+            for (auto [k, other] : llvm::enumerate(loops)) {
+              SmallVector<Value> ofLoop;
+              SmallVector<Type> types = correctionTypes(other);
+              for (unsigned o = 0, e = types.size(); o != e; ++o)
+                ofLoop.push_back(
+                    k == i ? evaluated.inside.lookupOrDefault(
+                                 yield->getOperand(o * arity + q))
+                           : createZero(c, loc, types[o]));
+              corrections.push_back(ofLoop);
+            }
+            evalAfter(c, evaluated.members[q], values[q], corrections);
+          }
+          scf::YieldOp::create(c, loc);
+        });
+      }
+      scf::YieldOp::create(b, loc);
+    });
+    gpu::BarrierOp::create(builder, loc);
+    Value first = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
+                                        thread, zero);
+    scf::IfOp::create(builder, loc, first, [&](OpBuilder &b, Location) {
+      memref::StoreOp::create(
+          b, loc, arith::ConstantOp::create(b, loc, i32, b.getI32IntegerAttr(0)),
+          acrossCount, ValueRange{zero});
+      scf::YieldOp::create(b, loc);
+    });
+    return;
+  }
+
+  // The first kernel, over `span` particles. Warp w takes the particles
+  // from b(S w) to b(S (w + 1)), where S is 32 less the widest arity less
+  // one and b(n) is n moved up past the tuple that n is in if its members
+  // follow one another and n is not the first: a tuple whose members
+  // follow one another then lies in one warp, and a warp takes 32
+  // particles at most. The driver keeps the members of a group together
+  // (an order by anchors); the second kernel takes the other tuples that
+  // lie across warps.
+  Value c32 = createIndex(builder, loc, 32);
+  Value warp = arith::DivUIOp::create(builder, loc, thread, c32);
+  Value lane = arith::RemUIOp::create(builder, loc, thread, c32);
+  Value stride = createIndex(builder, loc, getIntegrationStride(run));
+  Value last = arith::SubIOp::create(builder, loc, span,
+                                     createIndex(builder, loc, 1));
+  auto boundary = [&](OpBuilder &b, Value n) -> Value {
+    Value inside =
+        arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ult, n, span);
+    Value at = arith::SelectOp::create(b, loc, inside, n, last);
+    Value moved = at;
+    for (md_exec::TupleForOp loop : loops) {
+      RaggedRow ragged = loadRow(b, loop, loop.getIncidence(), at);
+      Value count = ragged.count;
+      EvaluatedTuple tuple =
+          loadTuple(b, loop, loop.getIncidence(), ragged, zero);
+      Value low = tuple.members[0], high = tuple.members[0];
+      for (Value member : ArrayRef(tuple.members).drop_front()) {
+        low = arith::MinUIOp::create(b, loc, low, member);
+        high = arith::MaxUIOp::create(b, loc, high, member);
+      }
+      Value end = arith::AddIOp::create(b, loc, high,
+                                        createIndex(b, loc, 1));
+      Value together = arith::CmpIOp::create(
+          b, loc, arith::CmpIPredicate::eq,
+          arith::SubIOp::create(b, loc, end, low),
+          createIndex(b, loc, loop.getArity()));
+      Value straddles = arith::AndIOp::create(
+          b, loc,
+          arith::AndIOp::create(
+              b, loc,
+              arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ne, count,
+                                    zero),
+              together),
+          arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ult, low, at));
+      moved = arith::SelectOp::create(b, loc, straddles, end, moved);
+    }
+    return arith::SelectOp::create(b, loc, inside, moved, span);
+  };
+  Value warpBase =
+      boundary(builder, arith::MulIOp::create(builder, loc, warp, stride));
+  Value warpEnd = boundary(
+      builder,
+      arith::MulIOp::create(
+          builder, loc,
+          arith::AddIOp::create(builder, loc, warp,
+                                createIndex(builder, loc, 1)),
+          stride));
+  auto nonempty = scf::IfOp::create(
+      builder, loc,
+      arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::ult, warpBase,
+                            warpEnd),
+      /*withElseRegion=*/false);
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPoint(nonempty.thenBlock()->getTerminator());
+
+  // Every lane: the loop before for its particle. A lane past the end of
+  // the particles of its warp takes the first one, takes part in the
+  // shuffles, and writes nothing.
+  Value candidate = arith::AddIOp::create(builder, loc, warpBase, lane);
+  Value valid = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::ult,
+                                      candidate, warpEnd);
+  Value particle =
+      arith::SelectOp::create(builder, loc, valid, candidate, warpBase);
+  SmallVector<Value> own = evalBefore(builder, particle);
+  Value lane32 = toI32(builder, lane);
+  SmallVector<Row> rows =
+      loadRows(builder, particle, lane32, warpBase, warpEnd, valid);
+
+  // The tuples whose members are in one warp: the member at place 0
+  // gathers the values of every member from its lane, computes the
+  // tuple, and every member takes its values from the lane of the member
+  // at place 0. A particle is in one tuple at most over the loops, the
+  // sets being disjoint, so one set of shuffles serves every loop; a lane
+  // loads its own values, narrowed where the kernels narrow them at once.
+  // The shuffles take every lane of the warp, so they are outside any
+  // branch; a lane in no tuple shuffles from itself.
+  int64_t widest = 0;
+  Value useWarp, leaderLane = lane32;
+  for (auto [i, loop] : llvm::enumerate(loops)) {
+    Row &row = rows[i];
+    widest = std::max<int64_t>(widest, loop.getArity());
+    useWarp = useWarp ? arith::OrIOp::create(builder, loc, useWarp, row.useWarp)
+                      : row.useWarp;
+    leaderLane = arith::SelectOp::create(builder, loc, row.useWarp,
+                                         row.leaderLane, leaderLane);
+  }
+  SmallVector<Value, 4> sources;
+  for (int64_t q = 0; q != widest; ++q) {
+    Value source = lane32;
+    for (auto [i, loop] : llvm::enumerate(loops)) {
+      if (q >= loop.getArity())
+        continue;
+      Row &row = rows[i];
+      source = arith::SelectOp::create(
+          builder, loc, row.useWarp,
+          toI32(builder, arith::SubIOp::create(builder, loc,
+                                               row.tuple.members[q],
+                                               warpBase)),
+          source);
+    }
+    sources.push_back(source);
+  }
+  // The values that the kernels take of each member: the positions, and
+  // each of their inputs in the type they narrow it to, if any. Where a
+  // kernel computes in a type narrower than that of the positions, a lane
+  // takes its position relative to that of the member at place 0, in f64,
+  // and narrows that: the differences of the kernel are then those of
+  // small numbers, and the member at place 0 narrows nothing.
+  struct Request {
+    Value buffer;
+    Type type;
+    bool position;
+    bool operator==(const Request &other) const {
+      return buffer == other.buffer && type == other.type &&
+             position == other.position;
+    }
+  };
+  SmallVector<Request> requests;
+  auto request = [&](Request wanted) {
+    if (!llvm::is_contained(requests, wanted))
+      requests.push_back(wanted);
+  };
+  // With `storedPositions` the members take the positions as stored: the
+  // displacement between two members other than the member at place 0 is
+  // then the difference of the stored positions, narrowed, as in the
+  // kernel of the loop alone, not that of two narrowed relative positions,
+  // which rounds otherwise (#102).
+  auto positionRequest = [&](unsigned i) {
+    Value positions = loops[i].getPositions();
+    Type real = cast<MemRefType>(positions.getType()).getElementType();
+    Type computed = getElementTypeOrSelf(boxes[i].getType());
+    if (!run.storedPositions &&
+        computed.getIntOrFloatBitWidth() < real.getIntOrFloatBitWidth())
+      return Request{positions, VectorType::get({3}, computed), true};
+    return Request{positions, Type(), true};
+  };
+  for (auto [i, loop] : llvm::enumerate(loops)) {
+    Block &kernel = loop.getKernel().front();
+    request(positionRequest(i));
+    unsigned argument = loop.getCoordinateKinds().size();
+    for (Value buffer : loop.getIns())
+      for (int64_t q = 0, arity = loop.getArity(); q != arity; ++q) {
+        BlockArgument in = kernel.getArgument(argument++);
+        if (!in.use_empty())
+          request({buffer, getNarrowedType(in), false});
+      }
+  }
+  SmallVector<SmallVector<Value, 4>> gathered;
+  for (auto [buffer, type, position] : requests) {
+    Value value;
+    if (int j = fromBefore(buffer); j >= 0)
+      value = own[j];
+    else
+      value = loadElement(builder, loc, buffer, particle);
+    if (position && type) {
+      Value origin = shuffleFrom(builder, value, leaderLane);
+      value = arith::TruncFOp::create(
+          builder, loc, type,
+          arith::SubFOp::create(builder, loc, value, origin));
+    } else if (type) {
+      value = arith::TruncFOp::create(builder, loc, type, value);
+    }
+    SmallVector<Value, 4> ofMembers;
+    for (Value source : sources)
+      ofMembers.push_back(shuffleFrom(builder, value, source));
+    gathered.push_back(ofMembers);
+  }
+
+  // The values of each loop for each member and destination, computed by
+  // the member at place 0 of its tuple.
+  SmallVector<SmallVector<Value>> computedOf;
+  for (auto [i, loop] : llvm::enumerate(loops)) {
+    Row &row = rows[i];
+    int64_t arity = loop.getArity();
+    SmallVector<Type> types = correctionTypes(loop);
+    Value leads = arith::AndIOp::create(
+        builder, loc, row.useWarp,
+        arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
+                              row.tuple.place, zero));
+    auto computed = scf::IfOp::create(
+        builder, loc, leads,
+        [&](OpBuilder &b, Location) {
+          EvaluatedTuple evaluated = row.tuple;
+          Request place = positionRequest(i);
+          auto loadMember = [&](OpBuilder &, Value buffer, Value member,
+                                Type type, bool position) -> Value {
+            auto it = llvm::find(requests, position
+                                               ? place
+                                               : Request{buffer, type, false});
+            assert(it != requests.end() && "a value that was gathered");
+            for (int64_t q = 0; q != arity; ++q)
+              if (evaluated.members[q] == member)
+                return gathered[it - requests.begin()][q];
+            llvm_unreachable("a member of the tuple");
+          };
+          auto [box, inverse] = cellOf(b, i);
+          evaluateMembers(b, loop, evaluated, box, inverse, IRMapping(),
+                          loadMember);
+          setFlag(b, i, evaluated.inside);
+          Operation *yield = loop.getKernel().front().getTerminator();
+          SmallVector<Value> values;
+          for (int64_t q = 0; q != arity; ++q)
+            for (unsigned o = 0, e = types.size(); o != e; ++o)
+              values.push_back(evaluated.inside.lookupOrDefault(
+                  yield->getOperand(o * arity + q)));
+          scf::YieldOp::create(b, loc, values);
+        },
+        [&](OpBuilder &b, Location) {
+          SmallVector<Value> values;
+          for (int64_t q = 0; q != arity; ++q)
+            for (Type type : types)
+              values.push_back(createZero(b, loc, type));
+          scf::YieldOp::create(b, loc, values);
+        });
+    computedOf.push_back(SmallVector<Value>(computed.getResults()));
+  }
+
+  // Every member takes its values from the lane of the member at place 0:
+  // the loops whose destinations have the same types share the shuffles,
+  // the lane at place 0 holding the values of the one loop it leads.
+  SmallVector<SmallVector<Value>> mine(loops.size());
+  SmallVector<bool> done(loops.size(), false);
+  for (unsigned first = 0, e = loops.size(); first != e; ++first) {
+    if (done[first])
+      continue;
+    SmallVector<Type> types = correctionTypes(loops[first]);
+    SmallVector<unsigned> group;
+    for (unsigned i = first; i != e; ++i)
+      if (!done[i] && correctionTypes(loops[i]) == types) {
+        group.push_back(i);
+        done[i] = true;
+      }
+    int64_t arity = 0;
+    for (unsigned i : group)
+      arity = std::max<int64_t>(arity, loops[i].getArity());
+    SmallVector<Value> received(arity * types.size());
+    for (int64_t q = 0; q != arity; ++q)
+      for (unsigned o = 0, n = types.size(); o != n; ++o) {
+        Value held = createZero(builder, loc, types[o]);
+        for (unsigned i : group)
+          if (q < loops[i].getArity())
+            held = arith::SelectOp::create(builder, loc, rows[i].useWarp,
+                                           computedOf[i][q * n + o], held);
+        received[q * n + o] = shuffleFrom(builder, held, leaderLane);
+      }
+    for (unsigned i : group) {
+      Row &row = rows[i];
+      for (unsigned o = 0, n = types.size(); o != n; ++o) {
+        Value chosen = createZero(builder, loc, types[o]);
+        for (int64_t q = 0, a = loops[i].getArity(); q != a; ++q) {
+          Value here = arith::CmpIOp::create(
+              builder, loc, arith::CmpIPredicate::eq, row.tuple.place,
+              createIndex(builder, loc, q));
+          chosen = arith::SelectOp::create(builder, loc, here,
+                                           received[q * n + o], chosen);
+        }
+        mine[i].push_back(
+            arith::SelectOp::create(builder, loc, row.useWarp, chosen,
+                                    createZero(builder, loc, types[o])));
+      }
+    }
+  }
+
+  // A particle in a tuple that lies across warps is left to the second
+  // kernel, and its member at place 0 goes on the list; every other
+  // particle takes the loop after here.
+  Value elsewhere, leadsAcross;
+  for (Row &row : rows) {
+    Value across = arith::AndIOp::create(
+        builder, loc, row.inTuple,
+        arith::XOrIOp::create(builder, loc, row.inWarp, True(builder)));
+    elsewhere = elsewhere ? arith::OrIOp::create(builder, loc, elsewhere,
+                                                 across)
+                          : across;
+    leadsAcross = leadsAcross ? arith::OrIOp::create(builder, loc,
+                                                     leadsAcross,
+                                                     row.leadsAcross)
+                              : row.leadsAcross;
+  }
+  scf::IfOp::create(builder, loc, leadsAcross, [&](OpBuilder &b, Location) {
+    Value address = arith::IndexCastOp::create(
+        b, loc, b.getI64Type(),
+        memref::ExtractAlignedPointerAsIndexOp::create(b, loc, acrossCount));
+    Value pointer = LLVM::IntToPtrOp::create(
+        b, loc, LLVM::LLVMPointerType::get(b.getContext(), 1), address);
+    Value slot = LLVM::AtomicRMWOp::create(
+        b, loc, LLVM::AtomicBinOp::add, pointer,
+        arith::ConstantOp::create(b, loc, i32, b.getI32IntegerAttr(1)),
+        LLVM::AtomicOrdering::monotonic, StringRef("device"));
+    memref::StoreOp::create(
+        b, loc, toI32(b, particle), acrossList,
+        ValueRange{arith::IndexCastOp::create(b, loc, b.getIndexType(), slot)});
+    scf::YieldOp::create(b, loc);
+  });
+  // A particle left to the second kernel writes its values of the loop
+  // before, which that kernel takes.
+  scf::IfOp::create(
+      builder, loc, elsewhere,
+      [&](OpBuilder &b, Location) {
+        for (unsigned j = 0; j != beforeOuts; ++j)
+          storeElement(b, loc, own[j], before.getOuts()[j], particle);
+        scf::YieldOp::create(b, loc);
+      },
+      [&](OpBuilder &b, Location) {
+        scf::IfOp::create(b, loc, valid, [&](OpBuilder &c, Location) {
+          evalAfter(c, particle, own, mine);
+          scf::YieldOp::create(c, loc);
+        });
+        scf::YieldOp::create(b, loc);
+      });
+}
+
+void kernels::emitExclusionFilter(OpBuilder &builder, Location loc,
+                                  Value counts, Value index, Value excluded,
+                                  Value particle) {
+  Type narrow = builder.getI32Type();
+  Value zero = createIndex(builder, loc, 0);
+  Value one = createIndex(builder, loc, 1);
+  Value width = memref::DimOp::create(builder, loc, index, one);
+  int64_t entry = md_exec::getIncidenceEntrySize(2);
+
+  Value found = arith::IndexCastOp::create(
+      builder, loc, builder.getIndexType(),
+      memref::LoadOp::create(builder, loc, counts, ValueRange{particle}));
+  Value fits =
+      arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::ule, found,
+                            width);
+  RaggedRow pairs =
+      emitRaggedRow(builder, loc, excluded, particle, entry, /*checked=*/false);
+  Value numExcluded = pairs.count;
+  Value any = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::ne,
+                                    numExcluded, zero);
+  Value filter = arith::AndIOp::create(builder, loc, fits, any);
+
+  scf::IfOp::create(builder, loc, filter, [&](OpBuilder &b, Location) {
+    // The other member of each excluded pair of the particle: the member at
+    // place 1 − s, for the place s of the particle.
+    auto partnerOf = [&](OpBuilder &c, Value k) -> Value {
+      Value place =
+          emitRaggedEntry(c, loc, excluded, pairs.first, k, 1, entry);
+      Value isFirst = arith::CmpIOp::create(
+          c, loc, arith::CmpIPredicate::eq, place,
+          arith::ConstantOp::create(c, loc, narrow, c.getI32IntegerAttr(0)));
+      Value column = arith::SelectOp::create(
+          c, loc, isFirst, createIndex(c, loc, 3), createIndex(c, loc, 2));
+      return emitRaggedEntry(c, loc, excluded, pairs.first, k, column,
+                             createIndex(c, loc, entry));
+    };
+
+    auto kept = scf::ForOp::create(
+        b, loc, zero, found, one, ValueRange{zero},
+        [&](OpBuilder &c, Location, Value r, ValueRange written) {
+          Value neighbor =
+              memref::LoadOp::create(c, loc, index, ValueRange{particle, r});
+          auto search = scf::ForOp::create(
+              c, loc, zero, numExcluded, one,
+              ValueRange{arith::ConstantOp::create(c, loc, c.getI1Type(),
+                                                   c.getBoolAttr(false))},
+              [&](OpBuilder &d, Location, Value k, ValueRange isExcluded) {
+                Value same =
+                    arith::CmpIOp::create(d, loc, arith::CmpIPredicate::eq,
+                                          partnerOf(d, k), neighbor);
+                scf::YieldOp::create(
+                    d, loc,
+                    ValueRange{arith::OrIOp::create(d, loc, isExcluded[0],
+                                                    same)});
+              });
+          Value keep = arith::XOrIOp::create(
+              c, loc, search.getResult(0),
+              arith::ConstantOp::create(c, loc, c.getI1Type(),
+                                        c.getBoolAttr(true)));
+          scf::IfOp::create(c, loc, keep, [&](OpBuilder &d, Location) {
+            memref::StoreOp::create(d, loc, neighbor, index,
+                                    ValueRange{particle, written[0]});
+            scf::YieldOp::create(d, loc);
+          });
+          Value more = arith::AddIOp::create(c, loc, written[0], one);
+          scf::YieldOp::create(
+              c, loc,
+              ValueRange{arith::SelectOp::create(c, loc, keep, more,
+                                                 written[0])});
+        });
+    memref::StoreOp::create(
+        b, loc, arith::IndexCastOp::create(b, loc, narrow, kept.getResult(0)),
+        counts, ValueRange{particle});
+    scf::YieldOp::create(b, loc);
+  });
+}
+
+void kernels::lowerLookups(Operation *root) {
+  SmallVector<md::LookupOp> lookups;
+  root->walk([&](md::LookupOp op) { lookups.push_back(op); });
+  for (md::LookupOp op : lookups) {
+    OpBuilder builder(op);
+    Location loc = op.getLoc();
+    SmallVector<Value, 2> indices;
+    for (Value index : op.getIndices())
+      indices.push_back(index.getType().isIndex()
+                            ? index
+                            : arith::IndexCastOp::create(
+                                  builder, loc, builder.getIndexType(), index)
+                                  .getResult());
+    Value value =
+        memref::LoadOp::create(builder, loc, op.getTable(), indices);
+    op.getResult().replaceAllUsesWith(convertReal(
+        builder, loc, value, getElementTypeOrSelf(op.getResult().getType())));
+    op.erase();
+  }
+}
+
+Value kernels::emitRenumber(OpBuilder &builder, Location loc, Value members,
+                            Value ids) {
+  Type narrow = builder.getI32Type();
+  Value zero = createIndex(builder, loc, 0);
+  Value one = createIndex(builder, loc, 1);
+  auto toIndex = [&](OpBuilder &b, Value value) -> Value {
+    return arith::IndexCastOp::create(b, loc, b.getIndexType(), value);
+  };
+  Value count = memref::DimOp::create(builder, loc, ids, zero);
+  Value place = memref::AllocOp::create(
+      builder, loc, MemRefType::get({ShapedType::kDynamic}, narrow),
+      ValueRange{count});
+  scf::ForOp::create(
+      builder, loc, zero, count, one, ValueRange(),
+      [&](OpBuilder &b, Location, Value p, ValueRange) {
+        Value id = memref::LoadOp::create(b, loc, ids, ValueRange{p});
+        memref::StoreOp::create(
+            b, loc, arith::IndexCastOp::create(b, loc, narrow, p), place,
+            ValueRange{toIndex(b, id)});
+        scf::YieldOp::create(b, loc);
+      });
+
+  auto type = cast<MemRefType>(members.getType());
+  int64_t arity = type.getDimSize(1);
+  Value numTuples = memref::DimOp::create(builder, loc, members, zero);
+  Value result = memref::AllocOp::create(
+      builder, loc, MemRefType::get(type.getShape(), narrow),
+      ValueRange{numTuples});
+  scf::ForOp::create(
+      builder, loc, zero, numTuples, one, ValueRange(),
+      [&](OpBuilder &b, Location, Value t, ValueRange) {
+        for (int64_t q = 0; q != arity; ++q) {
+          Value column = createIndex(b, loc, q);
+          Value member =
+              memref::LoadOp::create(b, loc, members, ValueRange{t, column});
+          Value now =
+              memref::LoadOp::create(b, loc, place, ValueRange{toIndex(b, member)});
+          memref::StoreOp::create(b, loc, now, result, ValueRange{t, column});
+        }
+        scf::YieldOp::create(b, loc);
+      });
+  memref::DeallocOp::create(builder, loc, place);
+  return result;
+}
+
+bool kernels::isGivenToFunction(Value members) {
+  while (Operation *op = members.getDefiningOp()) {
+    if (!isa<memref::CastOp, memref::MemorySpaceCastOp>(op))
+      return false;
+    members = op->getOperand(0);
+  }
+  Block *block = cast<BlockArgument>(members).getOwner();
+  Operation *parent = block->getParentOp();
+  return block->isEntryBlock() && parent &&
+         parent->getName().getStringRef() == "func.func";
+}
+
+Value kernels::emitBuildTriplets(OpBuilder &builder, Location loc,
+                                 Value counts, Value entries, Value positions,
+                                 Value box, Value inverse, Type computed,
+                                 double cutoff) {
+  Type narrow = builder.getI32Type();
+  Type index = builder.getIndexType();
+  Value zero = createIndex(builder, loc, 0);
+  Value one = createIndex(builder, loc, 1);
+  Value two = createIndex(builder, loc, 2);
+  Value size = memref::DimOp::create(builder, loc, positions, zero);
+  Value width = memref::DimOp::create(builder, loc, entries, one);
+  Value cutoff2 = createCutoff2(builder, loc, computed, cutoff);
+  Value boxComputed = convertReal(builder, loc, box, computed);
+  Value inverseComputed = convertReal(builder, loc, inverse, computed);
+  auto toIndex = [&](OpBuilder &b, Value value) -> Value {
+    return arith::IndexCastOp::create(b, loc, index, value);
+  };
+
+  // The short row of each particle: the entries of its row within the
+  // cutoff, in the order of the row. Each pair of them is a triplet, as in
+  // the triple sum of [StillingerWeber1985].
+  Value near = memref::AllocOp::create(
+      builder, loc,
+      MemRefType::get({ShapedType::kDynamic, ShapedType::kDynamic}, narrow),
+      ValueRange{size, width});
+  Value nearCounts = memref::AllocOp::create(
+      builder, loc, MemRefType::get({ShapedType::kDynamic}, index),
+      ValueRange{size});
+  scf::ParallelOp::create(
+      builder, loc, ValueRange{zero}, ValueRange{size}, ValueRange{one},
+      [&](OpBuilder &b, Location, ValueRange ivs) {
+        Value center = ivs[0];
+        Value centerPosition = loadElement(b, loc, positions, center);
+        Value count = toIndex(
+            b, memref::LoadOp::create(b, loc, counts, ValueRange{center}));
+        auto row = scf::ForOp::create(
+            b, loc, zero, count, one, ValueRange{zero},
+            [&](OpBuilder &c, Location, Value entry, ValueRange found) {
+              Value other = memref::LoadOp::create(
+                  c, loc, entries, ValueRange{center, entry});
+              // As a loop over the triplets takes the leg: the end minus
+              // the center.
+              Value raw = convertReal(
+                  c, loc,
+                  arith::SubFOp::create(
+                      c, loc, loadElement(c, loc, positions, toIndex(c, other)),
+                      centerPosition),
+                  computed);
+              Value d = emitMinimumImage(c, loc, raw, boxComputed,
+                                         inverseComputed);
+              Value squares = arith::MulFOp::create(c, loc, d, d);
+              Value r2 = vector::ReductionOp::create(
+                  c, loc, vector::CombiningKind::ADD, squares);
+              Value within = arith::CmpFOp::create(
+                  c, loc, arith::CmpFPredicate::OLT, r2, cutoff2);
+              auto keep = scf::IfOp::create(
+                  c, loc, within,
+                  [&](OpBuilder &t, Location) {
+                    memref::StoreOp::create(t, loc, other, near,
+                                            ValueRange{center, found[0]});
+                    scf::YieldOp::create(
+                        t, loc,
+                        ValueRange{arith::AddIOp::create(t, loc, found[0],
+                                                         one)});
+                  },
+                  [&](OpBuilder &e, Location) {
+                    scf::YieldOp::create(e, loc, found[0]);
+                  });
+              scf::YieldOp::create(c, loc, keep.getResults());
+            });
+        memref::StoreOp::create(b, loc, row.getResult(0), nearCounts,
+                                ValueRange{center});
+        scf::ReduceOp::create(b, loc);
+      });
+
+  // The first triplet of each center: n (n - 1) / 2 for each before it.
+  Value firsts = memref::AllocOp::create(
+      builder, loc, MemRefType::get({ShapedType::kDynamic}, index),
+      ValueRange{size});
+  auto total = scf::ForOp::create(
+      builder, loc, zero, size, one, ValueRange{zero},
+      [&](OpBuilder &b, Location, Value center, ValueRange sum) {
+        memref::StoreOp::create(b, loc, sum[0], firsts, ValueRange{center});
+        Value n = memref::LoadOp::create(b, loc, nearCounts,
+                                         ValueRange{center});
+        Value pairs = arith::DivUIOp::create(
+            b, loc,
+            arith::MulIOp::create(b, loc, n,
+                                  arith::SubIOp::create(b, loc, n, one)),
+            two);
+        // A particle with no neighbor within the cutoff has n = 0, whose
+        // n - 1 wraps; its product is 0 all the same.
+        Value isolated = arith::CmpIOp::create(
+            b, loc, arith::CmpIPredicate::eq, n, zero);
+        pairs = arith::SelectOp::create(b, loc, isolated, zero, pairs);
+        scf::YieldOp::create(
+            b, loc, ValueRange{arith::AddIOp::create(b, loc, sum[0], pairs)});
+      });
+
+  Value members = memref::AllocOp::create(
+      builder, loc,
+      MemRefType::get({ShapedType::kDynamic, 3}, narrow),
+      ValueRange{total.getResult(0)});
+  scf::ParallelOp::create(
+      builder, loc, ValueRange{zero}, ValueRange{size}, ValueRange{one},
+      [&](OpBuilder &b, Location, ValueRange ivs) {
+        Value center = ivs[0];
+        Value centerNarrow = arith::IndexCastOp::create(b, loc, narrow,
+                                                        center);
+        Value n = memref::LoadOp::create(b, loc, nearCounts,
+                                         ValueRange{center});
+        Value first = memref::LoadOp::create(b, loc, firsts,
+                                             ValueRange{center});
+        scf::ForOp::create(
+            b, loc, zero, n, one, ValueRange{first},
+            [&](OpBuilder &c, Location, Value a, ValueRange slot) {
+              Value end = memref::LoadOp::create(c, loc, near,
+                                                 ValueRange{center, a});
+              Value next = arith::AddIOp::create(c, loc, a, one);
+              auto inner = scf::ForOp::create(
+                  c, loc, next, n, one, ValueRange{slot[0]},
+                  [&](OpBuilder &d, Location, Value bIndex,
+                      ValueRange row) {
+                    Value other = memref::LoadOp::create(
+                        d, loc, near, ValueRange{center, bIndex});
+                    Value place[3] = {end, centerNarrow, other};
+                    for (int64_t q = 0; q != 3; ++q)
+                      memref::StoreOp::create(
+                          d, loc, place[q], members,
+                          ValueRange{row[0], createIndex(d, loc, q)});
+                    scf::YieldOp::create(
+                        d, loc,
+                        ValueRange{arith::AddIOp::create(d, loc, row[0], one)});
+                  });
+              scf::YieldOp::create(c, loc, inner.getResults());
+            });
+        scf::ReduceOp::create(b, loc);
+      });
+
+  memref::DeallocOp::create(builder, loc, near);
+  memref::DeallocOp::create(builder, loc, nearCounts);
+  memref::DeallocOp::create(builder, loc, firsts);
+  return members;
+}
+
+void kernels::freeAtEndOfBlock(Operation *op, Value buffer) {
+  OpBuilder builder(op->getBlock()->getTerminator());
+  memref::DeallocOp::create(builder, op->getLoc(), buffer);
+}
+
+Value kernels::emitBuildIncidence(OpBuilder &builder, Location loc,
+                                  Value members, Value size) {
+  Type narrow = builder.getI32Type();
+  auto membersType = cast<MemRefType>(members.getType());
+  int64_t arity = membersType.getDimSize(1);
+  int64_t entry = md_exec::getIncidenceEntrySize(arity);
+  Value zero = createIndex(builder, loc, 0);
+  Value one = createIndex(builder, loc, 1);
+  Value numTuples = memref::DimOp::create(builder, loc, members, zero);
+  auto toIndex = [&](OpBuilder &b, Value value) -> Value {
+    return arith::IndexCastOp::create(b, loc, b.getIndexType(), value);
+  };
+  auto toNarrow = [&](OpBuilder &b, Value value) -> Value {
+    return arith::IndexCastOp::create(b, loc, narrow, value);
+  };
+
+  // The number of tuples of each particle.
+  Value counts = memref::AllocOp::create(
+      builder, loc, MemRefType::get({ShapedType::kDynamic}, narrow),
+      ValueRange{size});
+  Value none = arith::ConstantOp::create(builder, loc, narrow,
+                                         builder.getI32IntegerAttr(0));
+  Value increment = arith::ConstantOp::create(builder, loc, narrow,
+                                              builder.getI32IntegerAttr(1));
+  scf::ForOp::create(builder, loc, zero, size, one, ValueRange(),
+                     [&](OpBuilder &b, Location, Value i, ValueRange) {
+                       memref::StoreOp::create(b, loc, none, counts,
+                                               ValueRange{i});
+                       scf::YieldOp::create(b, loc);
+                     });
+  scf::ForOp::create(
+      builder, loc, zero, numTuples, one, ValueRange(),
+      [&](OpBuilder &b, Location, Value t, ValueRange) {
+        for (int64_t q = 0; q != arity; ++q) {
+          Value member = toIndex(
+              b, memref::LoadOp::create(b, loc, members,
+                                        ValueRange{t, createIndex(b, loc, q)}));
+          Value count =
+              memref::LoadOp::create(b, loc, counts, ValueRange{member});
+          Value more = arith::AddIOp::create(b, loc, count, increment);
+          memref::StoreOp::create(b, loc, more, counts, ValueRange{member});
+        }
+        scf::YieldOp::create(b, loc);
+      });
+
+  // The ragged rows (RaggedRows.h): the number of particles, the offsets
+  // of their rows, the entries, and an entry of zeros.
+  Value entries = arith::MulIOp::create(builder, loc, numTuples,
+                                        createIndex(builder, loc, arity));
+  Value elements = emitRaggedSize(builder, loc, size, entries, entry);
+  Value incidence = memref::AllocOp::create(
+      builder, loc, MemRefType::get({ShapedType::kDynamic}, narrow),
+      ValueRange{elements});
+  Value header = arith::AddIOp::create(builder, loc, size,
+                                       createIndex(builder, loc, 2));
+  memref::StoreOp::create(builder, loc, toNarrow(builder, size), incidence,
+                          ValueRange{zero});
+  // The offsets, and in `counts` where the next entry of each row goes.
+  auto total = scf::ForOp::create(
+      builder, loc, zero, size, one, ValueRange{none},
+      [&](OpBuilder &b, Location, Value i, ValueRange before) {
+        Value at = arith::AddIOp::create(b, loc, i, one);
+        memref::StoreOp::create(b, loc, before[0], incidence, ValueRange{at});
+        Value count = memref::LoadOp::create(b, loc, counts, ValueRange{i});
+        memref::StoreOp::create(b, loc, before[0], counts, ValueRange{i});
+        scf::YieldOp::create(
+            b, loc, ValueRange{arith::AddIOp::create(b, loc, before[0], count)});
+      });
+  memref::StoreOp::create(
+      builder, loc, total.getResult(0), incidence,
+      ValueRange{arith::AddIOp::create(builder, loc, size, one)});
+  Value last = arith::AddIOp::create(
+      builder, loc, header,
+      arith::MulIOp::create(builder, loc, entries,
+                            createIndex(builder, loc, entry)));
+  scf::ForOp::create(builder, loc, last, elements, one, ValueRange(),
+                     [&](OpBuilder &b, Location, Value i, ValueRange) {
+                       memref::StoreOp::create(b, loc, none, incidence,
+                                               ValueRange{i});
+                       scf::YieldOp::create(b, loc);
+                     });
+
+  // The entries, in the order of the tuples and, within a tuple, of the
+  // places.
+  scf::ForOp::create(
+      builder, loc, zero, numTuples, one, ValueRange(),
+      [&](OpBuilder &b, Location, Value t, ValueRange) {
+        SmallVector<Value, 4> tupleMembers;
+        for (int64_t q = 0; q != arity; ++q)
+          tupleMembers.push_back(memref::LoadOp::create(
+              b, loc, members, ValueRange{t, createIndex(b, loc, q)}));
+        for (int64_t s = 0; s != arity; ++s) {
+          Value particle = toIndex(b, tupleMembers[s]);
+          Value filled =
+              memref::LoadOp::create(b, loc, counts, ValueRange{particle});
+          Value base = arith::AddIOp::create(
+              b, loc, header,
+              arith::MulIOp::create(b, loc, toIndex(b, filled),
+                                    createIndex(b, loc, entry)));
+          auto store = [&](Value value, int64_t c) {
+            Value at =
+                arith::AddIOp::create(b, loc, base, createIndex(b, loc, c));
+            memref::StoreOp::create(b, loc, value, incidence, ValueRange{at});
+          };
+          store(toNarrow(b, t), 0);
+          store(arith::ConstantOp::create(b, loc, narrow,
+                                          b.getI32IntegerAttr(s)),
+                1);
+          for (int64_t q = 0; q != arity; ++q)
+            store(tupleMembers[q], 2 + q);
+          Value more = arith::AddIOp::create(b, loc, filled, increment);
+          memref::StoreOp::create(b, loc, more, counts, ValueRange{particle});
+        }
+        scf::YieldOp::create(b, loc);
+      });
+
+  memref::DeallocOp::create(builder, loc, counts);
+  return incidence;
+}
+
+//===----------------------------------------------------------------------===//
+// Templates
+//===----------------------------------------------------------------------===//
+
+std::string kernels::getInstanceName(StringRef name, Type real) {
+  return real.isF64() ? name.str() : (name + "_f32").str();
+}
+
+static std::string getPMESuffix(Type position, Type charge, Type force,
+                                int64_t order) {
+  auto bits = [](Type type) {
+    return std::to_string(type.getIntOrFloatBitWidth());
+  };
+  return "_p" + bits(position) + "c" + bits(charge) + "f" + bits(force) +
+         "o" + std::to_string(order);
+}
+
+std::string kernels::getPMEInstanceName(StringRef name, Type position,
+                                        Type charge, Type force,
+                                        int64_t order) {
+  return (name + getPMESuffix(position, charge, force, order)).str();
+}
+
+std::string kernels::getPMETemplateHeader(Type position, Type charge,
+                                          Type force, int64_t order,
+                                          bool tiles) {
+  // The aliases of the types of the instance, which the text of a template
+  // of particle mesh Ewald uses and does not define
+  // (D374, #739): the types that the positions, the
+  // charges, and the forces are stored in; the type of the forces, in which
+  // the splines, the grid, and its transform are; and, on a device, a tile
+  // of the spreading of bins of E points (D282), of (E + P - 1)^3 points in
+  // the memory of the block.
+  auto spell = [](Type type) {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    type.print(os);
+    return text;
+  };
+  std::string header = "!pme_pos = " + spell(position) + "\n" +
+                       "!pme_chg = " + spell(charge) + "\n" +
+                       "!pme_frc = " + spell(force) + "\n" +
+                       "!pme_real = " + spell(force) + "\n";
+  if (tiles)
+    for (int64_t edge : {4, 8, 16}) {
+      int64_t length = edge + order - 1;
+      header += "!pme_tile_" + std::to_string(edge) + " = memref<" +
+                std::to_string(length * length * length) +
+                "x!pme_real, #gpu.address_space<workgroup>>\n";
+    }
+  return header;
+}
+
+bool kernels::keepTemplateFunction(Operation *op, bool potential,
+                                   bool listed, int64_t tiles) {
+  // What a function of a template is for, as its attributes state
+  // (D377, #739): the potential at the particles (D231),
+  // a list of the particles (D262), or the spreading through tiles of an
+  // edge, its binning included (D282). The attributes are removed from a
+  // function that is kept, so that the module holds no trace of them.
+  auto potentialMark = StringAttr::get(op->getContext(),
+                                       "mdir.template.potential");
+  auto listedMark = StringAttr::get(op->getContext(), "mdir.template.listed");
+  auto edgeMark = StringAttr::get(op->getContext(), "mdir.template.tile_edge");
+  bool keep = true;
+  if (op->hasAttr(potentialMark) && !potential)
+    keep = false;
+  if (op->hasAttr(listedMark) && !listed)
+    keep = false;
+  if (auto edge = op->getAttrOfType<IntegerAttr>(edgeMark))
+    keep = keep && tiles && edge.getInt() == tiles;
+  op->removeAttr(potentialMark);
+  op->removeAttr(listedMark);
+  op->removeAttr(edgeMark);
+  return keep;
+}
+
+LogicalResult kernels::instantiatePMESymbols(ModuleOp templates,
+                                             Type position, Type charge,
+                                             Type force, int64_t order) {
+  // The functions that the template defines take the suffix of the
+  // instance; declarations, those of the runtime (`@mdrtFFTPrepare`) and
+  // the parameters of the instance among them, keep their names. A transform of the host, `@mdir.template.fft.NAME`,
+  // becomes that of the runtime for a grid in the type of the forces,
+  // `@mdrtFFT64NAME` or `@mdrtFFT32NAME` (runtime/mdrt_fft.c)
+  // (D374, #739).
+  MLIRContext *context = templates.getContext();
+  std::string suffix = getPMESuffix(position, charge, force, order);
+  constexpr StringLiteral fft = "mdir.template.fft.";
+  SmallVector<std::pair<Operation *, std::string>> renamed;
+  for (Operation &op : templates.getOps()) {
+    if (!isa<SymbolOpInterface>(&op))
+      continue;
+    StringRef name = SymbolTable::getSymbolName(&op).getValue();
+    bool defined = op.getNumRegions() != 0 && !op.getRegion(0).empty();
+    if (defined)
+      renamed.push_back({&op, (name + suffix).str()});
+    else if (name.starts_with(fft))
+      renamed.push_back(
+          {&op, ((force.isF64() ? "mdrtFFT64" : "mdrtFFT32") +
+                 name.drop_front(fft.size()))
+                    .str()});
+  }
+  for (auto &[op, instance] : renamed) {
+    auto name = StringAttr::get(context, instance);
+    if (failed(SymbolTable::replaceAllSymbolUses(op, name, templates)))
+      return op->emitError() << "cannot rename the uses of "
+                             << SymbolTable::getSymbolName(op);
+    SymbolTable::setSymbolName(op, name);
+  }
+  return success();
+}
+
+LogicalResult kernels::resolveTemplateConversions(Operation *root) {
+  // Each `mdrt.template_convert` of a template becomes the conversion that
+  // the types of its instance need (D370, #739): a
+  // cast of the bits between two of the same type, which changes nothing,
+  // and otherwise an extension or a truncation. Every op is checked before
+  // any is replaced, so that a module with an error is left as it was.
+  SmallVector<mdrt::TemplateConvertOp> conversions;
+  root->walk([&](mdrt::TemplateConvertOp op) { conversions.push_back(op); });
+  for (mdrt::TemplateConvertOp op : conversions) {
+    Type from = getElementTypeOrSelf(op.getIn().getType());
+    Type to = getElementTypeOrSelf(op.getOut().getType());
+    if (from != to &&
+        from.getIntOrFloatBitWidth() == to.getIntOrFloatBitWidth())
+      return op.emitOpError() << "converts between " << from << " and " << to
+                              << ", which are of the same width";
+  }
+  for (mdrt::TemplateConvertOp op : conversions) {
+    OpBuilder builder(op);
+    Value in = op.getIn();
+    Type type = op.getOut().getType();
+    unsigned from = getElementTypeOrSelf(in.getType()).getIntOrFloatBitWidth();
+    unsigned to = getElementTypeOrSelf(type).getIntOrFloatBitWidth();
+    Value out;
+    if (in.getType() == type)
+      out = arith::BitcastOp::create(builder, op.getLoc(), type, in);
+    else if (to > from)
+      out = arith::ExtFOp::create(builder, op.getLoc(), type, in);
+    else
+      out = arith::TruncFOp::create(builder, op.getLoc(), type, in);
+    op.getOut().replaceAllUsesWith(out);
+    op.erase();
+  }
+  return success();
+}
+
+LogicalResult kernels::resolveTemplateParameters(Operation *root, Type real,
+                                                 int64_t order, int64_t lanes) {
+  // The calls `@mdir.template.NAME.TYPE()` and `@mdir.template.NAME(...)`
+  // of the templates of particle mesh Ewald on a device, each replaced
+  // where it stands by what the instance takes for it
+  // (D369, #739). Every call is checked before any is
+  // replaced, so that a module with an error is left as it was.
+  constexpr StringLiteral prefix = "mdir.template.";
+  MLIRContext *context = root->getContext();
+  bool wide = real.isF64();
+  int64_t bytes = wide ? 8 : 4;
+  SmallVector<func::CallOp> calls;
+  root->walk([&](func::CallOp call) {
+    if (call.getCallee().starts_with(prefix))
+      calls.push_back(call);
+  });
+  // The edge E of a name `NAME_E`, or 0.
+  auto edgeOf = [](StringRef name, StringRef stem) -> int64_t {
+    int64_t edge = 0;
+    if (!name.consume_front(stem) || name.getAsInteger(10, edge))
+      return 0;
+    return edge;
+  };
+  for (func::CallOp call : calls) {
+    StringRef name =
+        call.getCallee().drop_front(prefix.size()).split('.').first;
+    bool constant = name == "order" || name == "lanes" ||
+                    name == "real_bytes" || edgeOf(name, "tile_side_") ||
+                    edgeOf(name, "tile_points_");
+    if (constant) {
+      if (call.getNumOperands() != 0 || call.getNumResults() != 1 ||
+          !call.getResult(0).getType().isIntOrIndex())
+        return call.emitOpError()
+               << "takes the parameter '" << name
+               << "' of the template, which is an integer of no operands";
+      continue;
+    }
+    if (name == "global_add") {
+      if (call.getNumOperands() != 2 || call.getNumResults() != 0 ||
+          !isa<LLVM::LLVMPointerType>(call.getOperand(0).getType()) ||
+          call.getOperand(1).getType() != real)
+        return call.emitOpError()
+               << "adds to global memory with operands other than a "
+                  "pointer and a value of "
+               << real;
+      continue;
+    }
+    if (edgeOf(name, "shared_add_")) {
+      auto tile = dyn_cast<MemRefType>(call.getOperand(0).getType());
+      if (call.getNumOperands() != 3 || call.getNumResults() != 0 || !tile ||
+          tile.getElementType() != real ||
+          !call.getOperand(1).getType().isIndex() ||
+          call.getOperand(2).getType() != real)
+        return call.emitOpError()
+               << "adds to a tile with operands other than the tile of "
+               << real << ", an index, and a value";
+      continue;
+    }
+    return call.emitOpError()
+           << "calls an unknown parameter of the template '" << name << "'";
+  }
+  for (func::CallOp call : calls) {
+    OpBuilder builder(call);
+    Location loc = call.getLoc();
+    StringRef name =
+        call.getCallee().drop_front(prefix.size()).split('.').first;
+    if (call.getNumResults() == 1) {
+      // The order of the splines, the threads of a particle in the gather
+      // (`lanes`, from the launch policy: the least power of 2 not below
+      // the order up to 8, so that they are aligned within a warp), the
+      // bytes of a value of the type of the forces, and
+      // the points of a side, E + P - 1, and of a tile, (E + P - 1)^3, of
+      // the spreading of bins of E points (D282).
+      int64_t value = 0;
+      if (name == "order")
+        value = order;
+      else if (name == "lanes")
+        value = lanes;
+      else if (name == "real_bytes")
+        value = bytes;
+      else if (int64_t edge = edgeOf(name, "tile_side_"))
+        value = edge + order - 1;
+      else if (int64_t edge = edgeOf(name, "tile_points_"))
+        value = (edge + order - 1) * (edge + order - 1) * (edge + order - 1);
+      Type type = call.getResult(0).getType();
+      Value result = arith::ConstantOp::create(
+          builder, loc, builder.getIntegerAttr(type, value));
+      call.getResult(0).replaceAllUsesWith(result);
+    } else if (name == "global_add") {
+      // An atomic addition to global memory at the scope of the device,
+      // with no result. The NVPTX backend of LLVM expands `atomicrmw fadd`
+      // of f32 into a loop of compare-and-swap, at four times the time of
+      // PTX's own reduction on an RTX 3090, so f32 takes that (NVIDIA only,
+      // as the template is); f64 is native.
+      Value pointer = call.getOperand(0), value = call.getOperand(1);
+      if (wide)
+        LLVM::AtomicRMWOp::create(builder, loc, LLVM::AtomicBinOp::fadd,
+                                  pointer, value,
+                                  LLVM::AtomicOrdering::monotonic, "device");
+      else
+        LLVM::InlineAsmOp::create(
+            builder, loc, TypeRange(), ValueRange{pointer, value},
+            "red.relaxed.gpu.global.add.f32 [$0], $1;", "l,f",
+            /*has_side_effects=*/true, /*is_align_stack=*/false,
+            LLVM::tailcallkind::TailCallKind::None,
+            /*asm_dialect=*/LLVM::AsmDialectAttr(),
+            /*operand_attrs=*/ArrayAttr());
+    } else {
+      // A relaxed atomic addition to a tile in the memory of the block, at
+      // the scope of the block, native for f32 and f64
+      // (`atom.relaxed.cta.shared.add`): `memref.atomic_rmw` is acq_rel at
+      // the scope of the system.
+      Value tile = call.getOperand(0), at = call.getOperand(1),
+            value = call.getOperand(2);
+      Value base =
+          memref::ExtractAlignedPointerAsIndexOp::create(builder, loc, tile);
+      Value size = arith::ConstantOp::create(builder, loc,
+                                             builder.getIndexAttr(bytes));
+      Value offset = arith::MulIOp::create(builder, loc, at, size);
+      Value address = arith::AddIOp::create(builder, loc, base, offset);
+      Value integer = arith::IndexCastOp::create(
+          builder, loc, builder.getI64Type(), address);
+      Value pointer = LLVM::IntToPtrOp::create(
+          builder, loc, LLVM::LLVMPointerType::get(context, 3), integer);
+      LLVM::AtomicRMWOp::create(builder, loc, LLVM::AtomicBinOp::fadd,
+                                pointer, value,
+                                LLVM::AtomicOrdering::monotonic, "block");
+    }
+    call.erase();
+  }
+  // The alignment of a load or a store of a value of the type of the forces:
+  // its bytes.
+  auto alignment = StringAttr::get(context, "mdir.template.real_alignment");
+  root->walk([&](Operation *op) {
+    if (!op->hasAttr(alignment))
+      return;
+    op->removeAttr(alignment);
+    if (auto load = dyn_cast<LLVM::LoadOp>(op))
+      load.setAlignment(bytes);
+    else if (auto store = dyn_cast<LLVM::StoreOp>(op))
+      store.setAlignment(bytes);
+  });
+  // The declarations, now that nothing calls them.
+  SmallVector<func::FuncOp> declarations;
+  root->walk([&](func::FuncOp function) {
+    if (function.getSymName().starts_with(prefix))
+      declarations.push_back(function);
+  });
+  for (func::FuncOp function : declarations) {
+    if (!function.isDeclaration())
+      return function.emitOpError()
+             << "defines a parameter of the template, which the instance "
+                "gives";
+    function.erase();
+  }
+  return success();
+}
+
+LogicalResult kernels::instantiateTemplates(ModuleOp templates, Type real) {
+  if (real.isF64())
+    return success();
+  if (!real.isF32())
+    return templates.emitError()
+           << "the templates are instantiated for f64 or f32, not " << real;
+  MLIRContext *context = templates.getContext();
+  Type wide = Float64Type::get(context);
+  const llvm::fltSemantics &narrow = cast<FloatType>(real).getFloatSemantics();
+
+  // Every f64 of the template becomes f32, in the types of values,
+  // arguments, results, and attributes (the shapes of memrefs and vectors
+  // included), and every constant of f64 the constant of f32 that it rounds
+  // to. The parser reads a literal of f32 as a double and rounds it to f32
+  // in the same way, so the instance is what the text of the template with
+  // f32 in place of f64 parses to (D368, #739).
+  AttrTypeReplacer replacer;
+  replacer.addReplacement([&](FloatType type) -> std::optional<Type> {
+    if (type == wide)
+      return real;
+    return std::nullopt;
+  });
+  replacer.addReplacement(
+      [&](FloatAttr attribute)
+          -> std::optional<std::pair<Attribute, WalkResult>> {
+        if (attribute.getType() != wide)
+          return std::nullopt;
+        APFloat value = attribute.getValue();
+        bool losesInfo = false;
+        (void)value.convert(narrow, APFloat::rmNearestTiesToEven, &losesInfo);
+        return std::make_pair(FloatAttr::get(real, value), WalkResult::skip());
+      });
+  replacer.addReplacement(
+      [&](DenseFPElementsAttr attribute)
+          -> std::optional<std::pair<Attribute, WalkResult>> {
+        if (attribute.getElementType() != wide)
+          return std::nullopt;
+        Attribute values = attribute.mapValues(real, [&](const APFloat &v) {
+          APFloat value = v;
+          bool losesInfo = false;
+          (void)value.convert(narrow, APFloat::rmNearestTiesToEven,
+                              &losesInfo);
+          return value.bitcastToAPInt();
+        });
+        return std::make_pair(values, WalkResult::skip());
+      });
+  replacer.recursivelyReplaceElementsIn(templates, /*replaceAttrs=*/true,
+                                        /*replaceLocs=*/false,
+                                        /*replaceTypes=*/true);
+
+  // A conversion from f64 to f32 is now one from f32 to f32, which is a
+  // cast of the bits.
+  SmallVector<arith::TruncFOp> truncations;
+  templates.walk([&](arith::TruncFOp op) {
+    if (op.getIn().getType() == op.getType())
+      truncations.push_back(op);
+  });
+  for (arith::TruncFOp op : truncations) {
+    OpBuilder builder(op);
+    Value cast = arith::BitcastOp::create(builder, op.getLoc(), op.getType(),
+                                          op.getIn());
+    op.replaceAllUsesWith(cast);
+    op.erase();
+  }
+
+  // The functions that the templates define take the names of the
+  // instance; declarations keep theirs.
+  SmallVector<Operation *> defined;
+  for (Operation &op : templates.getOps()) {
+    auto symbol = dyn_cast<SymbolOpInterface>(&op);
+    if (symbol && op.getNumRegions() != 0 && !op.getRegion(0).empty())
+      defined.push_back(&op);
+  }
+  for (Operation *op : defined) {
+    StringAttr name = SymbolTable::getSymbolName(op);
+    auto instance =
+        StringAttr::get(context, getInstanceName(name.getValue(), real));
+    if (failed(SymbolTable::replaceAllSymbolUses(op, instance, templates)))
+      return op->emitError() << "cannot rename the uses of " << name;
+    SymbolTable::setSymbolName(op, instance);
+  }
+  return success();
+}

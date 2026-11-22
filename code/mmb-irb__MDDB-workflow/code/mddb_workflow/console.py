@@ -1,0 +1,1182 @@
+from os.path import exists
+from shutil import copyfile, get_terminal_size
+from subprocess import call
+from argparse import ArgumentParser, RawTextHelpFormatter, Action, _SubParsersAction
+from textwrap import wrap, dedent
+import re
+import glob
+import pandas as pd
+from mddb_workflow.mwf import workflow, Project, requestables, TaskResolver
+from mddb_workflow.utils.structures import Structure
+from mddb_workflow.utils.file import File
+from mddb_workflow.utils.filters import filter_atoms
+from mddb_workflow.utils.subsets import get_trajectory_subset
+from mddb_workflow.utils.constants import *
+from mddb_workflow.utils.auxiliar import InputError, MISSING_BONDS
+from mddb_workflow.utils.database import get_available_nodes
+from mddb_workflow.utils.nassa_file import generate_nassa_config
+from mddb_workflow.tools.conversions import convert
+from mddb_workflow.tools.check_inputs import TRAJECTORY_SUPPORTED_FORMATS, TOPOLOGY_SUPPORTED_FORMATS, STRUCTURE_SUPPORTED_FORMATS
+from mddb_workflow.tools.get_bonds import mine_topology_bonds
+from mddb_workflow.tools.update_references import update_references, get_all_reference_types, AVAILABLE_REFERENCE_TYPES, ALL_FLAG
+from mddb_workflow.tools.update_projects import update_projects, UPDATABLE_TASKS
+from mddb_workflow.tools.viewer import view_project
+from mddb_workflow.analyses.nassa import workflow_nassa
+from mddb_workflow.analyses.energies import ENERGIES_ENGINES, DEFAULT_ENERGIES_ENGINE
+from mddb_workflow.core.dataset import Dataset
+
+expected_project_args = set(Project.__init__.__code__.co_varnames)
+
+test_docs_url = 'https://mddb-workflow.readthedocs.io/en/latest/usage.html#tests-and-other-checking-processes'
+task_docs_url = 'https://mddb-workflow.readthedocs.io/en/latest/tasks.html'
+
+
+class CustomHelpFormatter(RawTextHelpFormatter):
+    """Custom formatter for argparse help text with better organization and spacing."""
+
+    def __init__(self, prog, indent_increment=2, max_help_position=6, width=None):
+        """Initialize the custom help formatter."""
+        super().__init__(prog, indent_increment, max_help_position, width)
+
+    def _get_help_string(self, action):
+        import argparse
+        help = action.help
+        if '%(default)' not in action.help:
+            if action.default is not argparse.SUPPRESS and \
+                action.default and action.default != '.':
+                defaulting_nargs = [argparse.OPTIONAL, argparse.ZERO_OR_MORE]
+                if action.option_strings or action.nargs in defaulting_nargs:
+                    help += '\nDefault: %(default)s'
+        return help
+
+    def _split_lines(self, text, width):
+        lines = []
+        for line in text.splitlines():
+            if line.strip() != '':
+                if line.startswith('https'):
+                    lines.append(line)
+                else:
+                    lines.extend(wrap(line, width, break_long_words=False, replace_whitespace=False))
+        return lines
+
+    def _format_usage(self, usage, actions, groups, prefix):
+        essential_usage = super()._format_usage(usage, actions, groups, prefix)
+        # Only for mwf run
+        if 'run' in self._prog:
+            # Combine the aguments for -i, -e, -ow
+            lines = essential_usage.split('\n')
+            filtered_lines = []
+            for line in lines:
+                if line.strip().startswith("[-i "):
+                    line = line.replace("[-i", "[-i/-e/-ow")
+                    filtered_lines.append(line)
+                elif line.strip().startswith("[-e") or line.strip().startswith("[-ow"):
+                    continue
+                else:
+                    filtered_lines.append(line)
+            essential_usage = '\n'.join(filtered_lines)
+        return essential_usage
+
+    def _format_action_invocation(self, action):
+        """Format the display of options with choices more cleanly."""
+        if not action.option_strings:
+            # This is a positional argument
+            return super()._format_action_invocation(action)
+
+        # For options with choices, format them nicely
+        opts = ', '.join(action.option_strings)
+
+        if action.nargs == 0:
+            # Boolean flag
+            return opts
+        # Special case for include, exclude, and overwrite
+        if action.dest in ['include', 'exclude', 'overwrite']:
+            opts = ', '.join(action.option_strings)
+            metavar = 'TASKS'
+            return f"{opts} {metavar}"
+        else:
+            # Format with metavar or choices
+            metavar = self._format_args(action, action.dest.upper())
+            if action.choices:
+                choice_str = '{' + ','.join(str(c) for c in action.choices) + '}'
+                # if action.nargs is not None and action.nargs != 1:
+                #     choice_str += ' ...'
+                return f"{opts} [{choice_str}]"
+            else:
+                return f"{opts} {metavar}"
+
+
+class CustomArgumentParser(ArgumentParser):
+    """Extends the ArgumentParser to handle subcommands and errors more gracefully."""
+
+    def error(self, message):
+        """Override the default error method to show subcommand-specific help if a subcommand is detected."""
+        # Check for subcommand in sys.argv
+        import sys
+        # Extract subcommand from command line if it exists
+        if hasattr(self, '_subparsers') and self._subparsers is not None:
+            subcommands = [choice for action in self._subparsers._actions
+                          if isinstance(action, _SubParsersAction)
+                          for choice in action.choices]
+            if len(sys.argv) > 1 and sys.argv[1] in subcommands:
+                self.subcommand = sys.argv[1]
+
+        # Now continue with your existing logic
+        if hasattr(self, 'subcommand') and self.subcommand:
+            self._print_message(f"{self.prog} {self.subcommand}: error: {message}\n", sys.stderr)
+            # Show help for the specific subparser
+            for action in self._subparsers._actions:
+                if isinstance(action, _SubParsersAction):
+                    for choice, subparser in action.choices.items():
+                        if choice == self.subcommand:
+                            subparser.print_usage()
+                            break
+        else:
+            # Default error behavior for main parser
+            self.print_usage(sys.stderr)
+            self._print_message(f"{self.prog}: error: {message}\n", sys.stderr)
+        sys.exit(2)
+
+
+def parse_docstring_for_help(docstring):
+    """Parse a docstring to extract help for arguments."""
+    if not docstring:
+        return {}
+
+    docstring = dedent(docstring)
+    arg_section_match = re.search(r'Args:\n(.*?)(?=\n\n|\Z)', docstring, re.S)
+    if not arg_section_match:
+        return {}
+
+    arg_section = arg_section_match.group(1)
+    help_dict = {}
+    # Regex to find argument name and its full description, including newlines
+    arg_blocks = re.findall(r'^\s*([a-zA-Z0-9_]+)\s*\(.*?\):\s*(.*?)(?=\n\s*[a-zA-Z0-9_]+\s*\(|\Z)', arg_section, re.S | re.M)
+
+    for arg_name, help_text in arg_blocks:
+        # Clean up the help text: remove leading/trailing whitespace from each line and join
+        lines = []
+        for line in help_text.strip().split('\n'):
+            # For lines that are part of a list, just rstrip to keep indentation
+            if line.lstrip().startswith('-'):
+                lines.append('  ' + line.strip())
+            else:
+                lines.append(line.strip())
+        help_dict[arg_name] = '\n'.join(lines)
+
+    return help_dict
+
+
+def pretty_list(availables: list[str]) -> str:
+    """Pretty print a list of available checkings / failures."""
+    final_line = '\n'
+    for available in availables:
+        nice_name = NICE_NAMES.get(available, None)
+        if not nice_name:
+            raise Exception('Flag "' + available + '" has not a defined nice name')
+        final_line += '\n  - ' + available + ': ' + nice_name
+    final_line += f'\nTo know more about each test please visit:\n{test_docs_url}'
+    return final_line
+
+
+class custom (Action):
+    """Custom argparse action to handle the following 2 arguments.
+
+    This is done becuase it is not possible to combine nargs='*' with const
+    https://stackoverflow.com/questions/72803090/argparse-how-to-create-the-equivalent-of-const-with-nargs
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        """Handle optional argument values with smart defaults.
+
+        If argument is not passed -> default
+        If argument is passed empty -> const
+        If argument is passed with values -> values
+        """
+        if values:
+            setattr(namespace, self.dest, values)
+        else:
+            setattr(namespace, self.dest, self.const)
+
+
+class flag_or_auto_action (Action):
+    """Custom argparse action to accept a flag alone or with 'auto' (e.g. image and fit)."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if values is None:
+            setattr(namespace, self.dest, True)
+            return
+        if values != AUTOMATIC_FLAG:
+            parser.error(f'argument {option_string}: expected nothing or "{AUTOMATIC_FLAG}", got "{values}"')
+        setattr(namespace, self.dest, AUTOMATIC_FLAG)
+
+
+class translation_action (Action):
+    """Custom argparse action to accept either 'auto' or 3 numbers."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if values == [AUTOMATIC_FLAG]:
+            setattr(namespace, self.dest, AUTOMATIC_FLAG)
+            return
+        if len(values) != 3:
+            parser.error(f'argument {option_string}: expected "{AUTOMATIC_FLAG}" or 3 numbers (x y z)')
+        try:
+            translation = [float(value) for value in values]
+        except ValueError:
+            parser.error(f'argument {option_string}: expected "{AUTOMATIC_FLAG}" or 3 numbers (x y z), got {values}')
+        setattr(namespace, self.dest, translation)
+
+
+def main():
+    """Parse the arguments and calls the workflow accordingly."""
+    # Parse input arguments from the console
+    # The vars function converts the args object to a dictionary
+    args = parser.parse_args()
+    if hasattr(args, 'subcommand') and args.subcommand:
+        parser.subcommand = args.subcommand
+    # Apply common arguments as necessary
+    if hasattr(args, 'no_symlinks') and args.no_symlinks:
+        GLOBALS['no_symlinks'] = True
+    if hasattr(args, 'no_colors') and args.no_colors:
+        GLOBALS['no_colors'] = True
+    if hasattr(args, 'ssleep') and args.ssleep:
+        GLOBALS['no_ssl'] = True
+    if hasattr(args, 'working_directory') and args.working_directory:
+        GLOBALS['working_directory'] = args.working_directory
+    # Find which subcommand was called
+    subcommand = args.subcommand
+    # If there is not subcommand then print help
+    if not subcommand:
+        parser.print_help()
+    # If user wants to run the workflow
+    elif subcommand == "run":
+        # Get arguments in a dict copy, so we do not mutate the original 
+        dict_args = { k:v for k,v in vars(args).items() }
+        # Remove arguments not related to this subcommand
+        del dict_args['subcommand']
+        # Remove common arguments from the dict as well
+        common_args = [action.dest for action in common_parser._actions]
+        for arg in common_args:
+            del dict_args[arg]
+        # Find out which arguments are for the Project class and which ones are for the workflow
+        project_args = {}
+        workflow_args = {}
+        for k, v in dict_args.items():
+            if k in expected_project_args:
+                project_args[k] = v
+            else:
+                workflow_args[k] = v
+        # Legacy fix
+        if hasattr(args, 'working_directory') and args.working_directory != '.' and project_args['directory'] == '.':
+            project_args['directory'] = args.working_directory
+        # Call the actual main function
+        workflow(project_parameters=project_args, **workflow_args)
+    # If user wants to setup the inputs
+    elif subcommand == "inputs":
+        # Make a copy of the template in the local directory if there is not an inputs file yet
+        if exists(DEFAULT_INPUTS_FILENAME):
+            print(f"File {DEFAULT_INPUTS_FILENAME} already exists")
+        else:
+            copyfile(INPUTS_TEMPLATE_FILEPATH, DEFAULT_INPUTS_FILENAME)
+            print(f"File {DEFAULT_INPUTS_FILENAME} has been generated")
+        # Set the editor to be used to modify the inputs file
+        editor_command = args.editor
+        if editor_command:
+            if editor_command == 'none': return
+            return call([editor_command, DEFAULT_INPUTS_FILENAME])
+        # If no editor argument is passed then ask the user for one
+        print("Choose your preferred editor:")
+        available_editors = list(AVAILABLE_TEXT_EDITORS.keys())
+        for i, editor_name in enumerate(available_editors, 1):
+            print(f"{i}. {editor_name}")
+        print("*. exit")
+        try:
+            choice = int(input("Number: ").strip())
+            if not (1 <= choice <= len(available_editors)): raise ValueError
+            editor_name = available_editors[choice - 1]
+            editor_command = AVAILABLE_TEXT_EDITORS[editor_name]
+            # Open a text editor for the user
+            print(f"{editor_name} was selected")
+            call([editor_command, DEFAULT_INPUTS_FILENAME])
+        except ValueError:
+            print("No editor was selected")
+
+    # In case the convert tool was called
+    elif subcommand == 'convert':
+        # If no input arguments are passed print help
+        if args.input_structure is None and args.input_trajectories is None:
+            convert_parser.print_help()
+            return
+        if args.input_trajectories is None:
+            args.input_trajectories = []
+        # Run the convert command
+        convert(
+            input_structure_filepath=args.input_structure,
+            output_structure_filepath=args.output_structure,
+            input_trajectory_filepaths=args.input_trajectories,
+            output_trajectory_filepath=args.output_trajectory,
+        )
+
+    # In case the filter tool was called
+    elif subcommand == 'filter':
+        input_structure_file = File(args.input_structure) if args.input_structure else None
+        output_structure_file = File(args.output_structure) if args.output_structure else None
+        input_trajectory_file = File(args.input_trajectory) if args.input_trajectory else None
+        output_trajectory_file = File(args.output_trajectory) if args.output_trajectory else None
+        # Run the convert command
+        filter_atoms(
+            input_structure_file=input_structure_file,
+            output_structure_file=output_structure_file,
+            input_trajectory_file=input_trajectory_file,
+            output_trajectory_file=output_trajectory_file,
+            selection_string=args.selection_string,
+            selection_syntax=args.selection_syntax
+        )
+        print('There you have it :)')
+
+    # In case the subset tool was called
+    elif subcommand == 'subset':
+        output_trajectory = args.output_trajectory if args.output_trajectory else args.input_trajectory
+        get_trajectory_subset(
+            input_structure_file=File(args.input_structure),
+            input_trajectory_file=File(args.input_trajectory),
+            output_trajectory_file=File(output_trajectory),
+            start=args.start,
+            end=args.end,
+            step=args.step,
+            skip=args.skip,
+            frames=args.frames
+        )
+        print('All done :)')
+
+    # In case the view tool was called
+    elif subcommand == 'view':
+        view_project(
+            input_filepaths=args.input_files,
+            start=args.start,
+            end=args.end,
+            step=args.step,
+            frames=args.frames,
+            selection=args.selection,
+            all_frames=args.all
+        )
+
+    # In case the chainer tool was called
+    elif subcommand == 'chainer':
+        # Parse the structure
+        structure = Structure.from_file(args.input_structure)
+        # If there is a bonds source then mine bonds from it
+        if args.bonds_source:
+            bonds_source = File(args.bonds_source)
+            if not bonds_source.exists:
+                raise InputError(f'Missing bonds source "{bonds_source.path}"')
+            # Extract bonds from the topology
+            mined_bonds = mine_topology_bonds(bonds_source)
+            # Set mined bonds in the structure
+            structure.bonds = mined_bonds
+        # Check if there are missing bonds at this point, which may happen if we have a coarse grain
+        # Note that we might know if the structure is in coarse grain thanks to the elements (Cg)
+        missing_any_bonds = any(bond == MISSING_BONDS for bond in structure.bonds)
+        # If we are missing any bond then we can not run the per-fragment logic
+        if missing_any_bonds and not args.letter:
+            raise InputError('Cannot run the per-fragment logic with missing bonds.\n' +
+                '  Please either specify a chain letter (-let) or provide a bonds source topology (-bs).')
+        # Select atom accoridng to inputs
+        selection = structure.select(args.selection_string, args.selection_syntax) if args.selection_string else structure.select_all()
+        if not selection: raise InputError(f'Empty selection {selection}')
+        # Run the chainer logic
+        structure.chainer(selection, args.letter, args.whole_fragments)
+        # Generate the output file from the modified structure
+        structure.generate_file(args.output_structure)
+        print(f'Changes written to {args.output_structure}')
+    elif subcommand in ['dataset', 'ds']:
+        if not hasattr(args, 'dataset_subcommand') or not args.dataset_subcommand:
+            ds_parser.print_help()
+            return
+        # If dataset_path is not provided, search for *.db or *.sql file
+        if (not hasattr(args, 'dataset_path') or not args.dataset_path):
+            db_files = glob.glob("*.db") + glob.glob("*.sql")
+            if db_files:
+                args.dataset_path = db_files[0]
+                print(f"Using dataset file: {args.dataset_path}")
+            else:
+                print("No dataset_path provided and no *.db or *.sql file found in the current directory.")
+                ds_parser.print_help()
+                return
+
+        # Only the commands which add projects may create a new dataset file
+        create = args.dataset_subcommand in ('add', 'scan')
+        dataset = Dataset(args.dataset_path, create=create)
+        if args.dataset_subcommand == 'add':
+            dataset.add_entries(
+                paths_or_globs=args.paths_or_globs,
+                ignore_dirs=args.ignore_dirs,
+                md_dirs=args.md_dirs,
+                verbose=True,
+            )
+        elif args.dataset_subcommand == 'remove':
+            dataset.remove_entry(args.query_path)
+
+        elif args.dataset_subcommand == 'status':
+            status = dataset.get_status(args.project_path)
+            # Format and display the status nicely
+            print(f"UUID:          {status['uuid']}")
+            print(f"Path:          {status['rel_path']}")
+            print(f"State:         {status['state']}")
+            print(f"Scope:         {status['scope']}")
+            print(f"MDs:           {status['num_mds']}")
+            print(f"Last Modified: {status['last_modified']}")
+            print(f"Message:       {status['message']}")
+        elif args.dataset_subcommand == 'logs':
+            dataset.show_logs(
+                error=args.error,
+                n_projects=args.n_rows,
+                tail=args.tail,
+                query_path=args.query_path,
+                query_state=args.query_state,
+                query_message=args.query_message,
+                query_inputs=args.query_inputs,
+                query_name=args.query_name,
+                query_warnings=args.query_warnings
+            )
+        elif args.dataset_subcommand == 'ls':
+            dataset.list_projects(
+                sort_by=args.sort_by,
+                asc=not args.reverse,
+                n_projects=args.n_rows,
+                include_logs=args.include_logs,
+                query_path=args.query_path,
+                query_state=args.query_state,
+                query_message=args.query_message,
+                query_inputs=args.query_inputs,
+                query_name=args.query_name,
+                query_warnings=args.query_warnings
+            )
+        elif args.dataset_subcommand == 'view':
+            status = dataset.get_status(args.project_path)
+            if status is None:
+                raise InputError(f'{args.project_path} is not in the dataset')
+            if status['scope'] != 'Project':
+                raise InputError(f'{args.project_path} is a MD directory. Please pass the path to its project.')
+            view_project(
+                directory=args.project_path,
+                start=args.start,
+                end=args.end,
+                step=args.step,
+                frames=args.frames,
+                selection=args.selection,
+                all_frames=args.all
+            )
+        elif args.dataset_subcommand == 'show':
+            if args.summary:
+                summary = dataset.summary()
+                width = get_terminal_size((80, 20)).columns
+                print('=' * width)
+                print("Summary of project states:")
+                print('=' * width)
+                print(summary)
+                errors = dataset.error_summary().head(10 if args.n_rows == 50 else args.n_rows)
+                if len(errors) == 0: return
+                pd.set_option('display.max_rows', len(errors) + 1)
+                pd.set_option('display.max_colwidth', width - 10)
+                print('=' * width)
+                print("Summary of error messages for projects:")
+                print('=' * width)
+                print(errors)
+                return
+            df = dataset.get_dataframe(
+                show_id=args.show_id,
+                sort_by=args.sort_by,
+                asc=False if args.reverse else True,
+                include_logs=args.include_logs,
+                query_path=args.query_path,
+                query_state=args.query_state,
+                query_scope=args.query_scope,
+                query_message=args.query_message,
+                query_inputs=args.query_inputs,
+                query_name=args.query_name,
+                query_warnings=args.query_warnings
+            )
+            total = len(df)
+            if args.n_rows == 0 or args.n_rows >= total:
+                title_str = f"MDDB Dataset ({len(df)} rows)"
+            else:
+                df = df.tail(args.n_rows)
+                title_str = f"MDDB Dataset (last {args.n_rows} of {total} rows)"
+            try:
+                from mddb_workflow.utils.rich import rich_display_dataframe
+                df.reset_index(inplace=True)
+                rich_display_dataframe(df, title=title_str)
+            except ImportError:
+                print(df)
+        elif args.dataset_subcommand == 'watch':
+            from mddb_workflow.utils.rich import watch_dataframe
+            watch_dataframe(lambda: dataset.get_dataframe(
+                    sort_by='last_modified',
+                    asc=False if args.reverse else True,
+                    query_path=args.query_path,
+                    query_state=args.query_state,
+                    query_scope=args.query_scope,
+                    query_message=args.query_message,
+                    query_inputs=args.query_inputs,
+                    query_name=args.query_name,
+                    query_warnings=args.query_warnings
+                ),
+                title="Live MDDB Dataset"
+            )
+        elif args.dataset_subcommand == 'inputs' and args.get:
+            if args.set or args.inputs_template or args.inputs_generator or args.overwrite:
+                ds_inputs.error("--get can not be combined with --set, --inputs_template, --inputs_generator or --overwrite")
+            dataset.get_inputs_field(
+                field=args.get,
+                query_path=args.query_path,
+                query_state=args.query_state,
+                query_message=args.query_message,
+                query_inputs=args.query_inputs,
+                query_name=args.query_name,
+                query_warnings=args.query_warnings
+            )
+        elif args.dataset_subcommand == 'inputs' and args.set:
+            if args.inputs_template or args.inputs_generator or args.overwrite:
+                ds_inputs.error("--set can not be combined with --inputs_template, --inputs_generator or --overwrite")
+            field, value = args.set
+            dataset.set_inputs_field(
+                field=field,
+                value=value,
+                query_path=args.query_path,
+                query_state=args.query_state,
+                query_message=args.query_message,
+                query_inputs=args.query_inputs,
+                query_name=args.query_name,
+                query_warnings=args.query_warnings
+            )
+        elif args.dataset_subcommand == 'inputs' and not args.inputs_template:
+            # Without a template there is nothing to generate so we show the existing inputs files
+            if args.inputs_generator or args.overwrite:
+                ds_inputs.error("--inputs_generator and --overwrite require --inputs_template")
+            dataset.show_inputs_files(
+                query_path=args.query_path,
+                query_state=args.query_state,
+                query_message=args.query_message,
+                query_inputs=args.query_inputs,
+                query_name=args.query_name,
+                query_warnings=args.query_warnings
+            )
+        elif args.dataset_subcommand == 'inputs':
+            dataset.generate_inputs_yaml(
+                inputs_template_path=args.inputs_template,
+                inputs_generator=args.inputs_generator,
+                overwrite=args.overwrite,
+                query_path=args.query_path,
+                query_state=args.query_state,
+                query_message=args.query_message,
+                query_inputs=args.query_inputs,
+                query_name=args.query_name,
+                query_warnings=args.query_warnings
+            )
+        elif args.dataset_subcommand == 'run':
+            dataset.launch(
+                query_path=args.query_path,
+                query_state=args.query_state,
+                query_message=args.query_message,
+                query_inputs=args.query_inputs,
+                query_name=args.query_name,
+                query_warnings=args.query_warnings,
+                n_jobs=args.n_jobs,
+                pool_size=args.pool_size,
+                cmd=args.cmd,
+                slurm=args.slurm,
+                job_template=args.job_template,
+                debug=args.debug
+            )
+        elif args.dataset_subcommand == 'scan':
+            dataset.scan(root_dir='.', verbose=True)
+        elif args.dataset_subcommand == 'load':
+            dataset.load(
+                loader_path=args.loader,
+                node=args.node,
+                overwrite=args.overwrite,
+                include=args.include_files,
+                exclude=args.exclude_files,
+                skip_trajectories=args.skip_trajectories,
+                skip_files=args.skip_files,
+                skip_analyses=args.skip_analyses,
+                md_directories=args.md_dirs,
+                query_path=args.query_path,
+                query_state=args.query_state,
+                query_message=args.query_message,
+                query_inputs=args.query_inputs,
+                query_name=args.query_name,
+                query_warnings=args.query_warnings
+            )
+
+    # If user wants to run the NASSA analysis
+    elif subcommand == "nassa":
+        # If no input arguments are passed print help
+        if args.config is None and args.make_config is False:
+            nassa_parser.print_help()
+            print('Please provide a configuration file or make one with the -m flag')
+            return
+        # If the user wants to make a configuration file
+        if args.make_config:
+            # print('args.make_config: ', args.make_config)
+            if args.make_config is True or args.make_config == []:
+                # Make a copy of the template in the local directory if there is not an inputs file yet
+                if not exists(DEFAULT_NASSA_CONFIG_FILENAME):
+                    copyfile(NASSA_TEMPLATE_FILEPATH, DEFAULT_NASSA_CONFIG_FILENAME)
+                # Open a text editor for the user
+                call(["vim", DEFAULT_NASSA_CONFIG_FILENAME])
+                print('Configuration file created as nassa.json\nNow you can run the analysis with the -c flag.')
+                return
+            # If the user provides a path to the files
+            else:
+                generate_nassa_config(
+                    args.make_config,
+                    args.seq_path,
+                    args.output,
+                    args.unit_len,
+                    args.n_sequences
+                    )
+            print('Configuration file created as nassa.json\nNow you can run the analysis with the -c flag.')
+            return
+        # If the user wants to run the analysis. With the config file an analysis name must be provided, or the all flag must be set
+        if args.config and args.analysis_names is None and args.all is False:
+            nassa_parser.print_help()
+            print('Please provide an analysis name to run:', ', '.join(NASSA_ANALYSES_LIST))
+            return
+        # If the user wants to run the helical parameters analysis we must check if the necessary files are provided (structure, topology and trajectory)
+        if args.helical_parameters:
+            # Also, it is necesary to provide the project directories. Each of the project directories must contain an independent MD
+            if args.proj_directories is None:
+                nassa_parser.print_help()
+                print('Please provide a project directory to run the helical parameters analysis with the -pdirs flag')
+                return
+            # If the all flag is set, the user must provide the path to the sequences because it is necessary to create the nassa.yml and run the NASSA analysis
+            if args.all:
+                if not args.seq_path:
+                    raise InputError('Please, if all option is selected provide the path to the sequences (--seq_path)')
+            # If all the flags are correctly set, we can run the analysis
+            workflow_nassa(
+                config_file_path=None,  # The configuration file is not needed in this case because we are going to run the helical parameters analysis so it will be created then
+                analysis_names=args.analysis_names,
+                overwrite=args.overwrite,
+                overwrite_nassa=args.overwrite_nassa,
+                helical_par=args.helical_parameters,
+                accession=args.accession,
+                sample_trajectory=args.sample_trajectory,
+                proj_dirs=args.proj_directories,
+                input_structure_file=args.input_structure_filepath,
+                input_trajectory_file=args.input_trajectory_filepath,
+                input_top_file=args.input_topology_filepath,
+                all=args.all,
+                unit_len=args.unit_len,
+                n_sequences=args.n_sequences,
+                seq_path=args.seq_path,
+                input_md_directories=args.input_md_directories,
+                trust=args.trust,
+                mercy=args.mercy
+            )
+        # If the user wants to run the NASSA analysis with the config file already created and the analysis name provided
+        else:
+            # Get arguments in a dict copy, so we do not mutate the original 
+            dict_args = { k:v for k,v in vars(args).items() }
+            del dict_args['subcommand']
+            # Call the actual main function
+            workflow_nassa(
+                    config_file_path=args.config,
+                    analysis_names=args.analysis_names,
+                    make_config=args.make_config,
+                    output=args.output,
+                    working_directory=args.working_directory,
+                    overwrite=args.overwrite,
+                    overwrite_nassa=args.overwrite_nassa,
+                    n_sequences=args.n_sequences,
+                    unit_len=args.unit_len,
+                    all=args.all,
+                    input_md_directories=args.input_md_directories,
+                    trust=args.trust,
+                    mercy=args.mercy
+            )
+    # Update references
+    elif subcommand == 'upref':
+        # Set the final list of nodes
+        nodes = list(args.nodes)
+        # If all nodes are requested then we must check available nodes
+        if ALL_FLAG in nodes:
+            if len(nodes) > 1:
+                raise InputError('If you ask for "all" nodes then it is redundant asking for any more nodes')
+            available_nodes = get_available_nodes()
+            nodes = list(available_nodes.keys())
+        # Set the final list reference types
+        types = list(args.types)
+        # If all nodes are requested then we must check available nodes
+        if ALL_FLAG in types:
+            if len(types) > 1:
+                raise InputError('If you ask for "all" reference types then it is redundant asking for any more types')
+            types = get_all_reference_types()
+        # Iterate nodes
+        for node_alias in nodes:
+            # Iterate reference types
+            for reference_type in types:
+                update_references(node_alias, reference_type, args.loader, args.force, args.workers)
+    # Update projects
+    elif subcommand == 'uproj':
+        # Set the final list of nodes
+        nodes = list(args.nodes)
+        # If all nodes are requested then we must check available nodes
+        if ALL_FLAG in nodes:
+            if len(nodes) > 1:
+                raise InputError('If you ask for "all" nodes then it is redundant asking for any more nodes')
+            available_nodes = get_available_nodes()
+            nodes = list(available_nodes.keys())
+        # Iterate nodes
+        for node_alias in nodes:
+            update_projects(node_alias, args.loader, args.accessions, args.query,
+                trust=args.trust, mercy=args.mercy, faith=args.faith,
+                include=args.include, exclude=args.exclude)
+
+# Define a common parser running in top of all others
+# This arguments declared here are available among all subparsers
+common_parser = ArgumentParser(add_help=False)
+
+# If this argument is passed then no symlinks will be used anywhere
+# Files will be copied instead thus taking more time and disk
+# However symlinks are not always allowed in all file systems so this is sometimes necessary
+common_parser.add_argument("-ns", "--no_symlinks", default=False, action='store_true',
+    help="Do not use symlinks internally")
+common_parser.add_argument("-nc", "--no_colors", default=False, action='store_true',
+    help="Do not use colors for logging")
+common_parser.add_argument("-sl", "--ssleep", default=False, action='store_true',
+    help=("Use this flag to skip SSL certificate authentication.\n"
+        "WARNING: Do not use this flag if you don't trust the data source."))
+common_parser.add_argument("-wd", "--working_directory", default='.',
+    help="Set the working directory. Make sure you have read and write permissions in this directory.")
+
+# Define console arguments to call the workflow
+parser = CustomArgumentParser(description="MDDB Workflow")
+subparsers = parser.add_subparsers(help='Name of the subcommand to be used', dest="subcommand")
+
+project_init_help = parse_docstring_for_help(Project.__init__.__doc__)
+workflow_help = parse_docstring_for_help(workflow.__doc__)
+
+# Set the run subcommand
+run_parser = subparsers.add_parser("run",
+    help="Run the workflow",
+    formatter_class=CustomHelpFormatter,
+    parents=[common_parser]
+)
+
+# Set optional arguments
+run_parser_input_group = run_parser.add_argument_group('INPUT OPTIONS')
+run_parser_input_args = [
+    # There is no default since many formats may be possible
+    (['-top', '--input_topology_filepath'], {'default': None, 'help': project_init_help['input_topology_filepath']+f'\nSupported formats: {", ".join(TOPOLOGY_SUPPORTED_FORMATS)}.'}),
+    (['-stru', '--input_structure_filepath'], {'default': None, 'help': project_init_help['input_structure_filepath']+f'\nSupported formats: {", ".join(STRUCTURE_SUPPORTED_FORMATS)}.'}),
+    (['-traj', '--input_trajectory_filepaths'], {'default': None, 'nargs': '*', 'help': project_init_help['input_trajectory_filepaths']+f'\nSupported formats: {", ".join(TRAJECTORY_SUPPORTED_FORMATS)}.'}),
+    (['-dir', '--directory'], {'default': '.', 'help': project_init_help['directory']}),
+    (['-mdir', '--input_md_directories'], {'default': None, 'nargs': '*', 'help': project_init_help['input_md_directories']}),
+    (['-md', '--input_md_config'], {'action': 'append', 'default': None, 'nargs': '*', 'help': project_init_help['input_md_config']}),
+    (['-mdref', '--reference_md_index'], {'type': int, 'default': None, 'help': project_init_help['reference_md_index']}),
+    (['-proj', '--accession'], {'default': None, 'help': project_init_help['accession']}),
+    (['-url', '--database_url'], {'default': DEFAULT_API_URL, 'help': project_init_help['database_url']}),
+    (['-inp', '--inputs_filepath'], {'default': None, 'help': project_init_help['inputs_filepath']}),
+    (['-fin', '--forced_inputs'], {'action': 'append', 'nargs': '*', 'default': None, 'help': project_init_help['forced_inputs']}),
+    (['-pop', '--populations_filepath'], {'default': DEFAULT_POPULATIONS_FILENAME, 'help': project_init_help['populations_filepath']}),
+    (['-tpro', '--transitions_filepath'], {'default': DEFAULT_TRANSITIONS_FILENAME, 'help': project_init_help['transitions_filepath']}),
+    (['-ad', '--aiida_data_filepath'], {'default': None, 'help': project_init_help['aiida_data_filepath']}),
+]
+for flags, kwargs in run_parser_input_args:
+    run_parser_input_group.add_argument(*flags, **kwargs)
+
+# Set a group for the workflow control options
+run_parser_workflow_group = run_parser.add_argument_group('WORKFLOW CONTROL OPTIONS')
+run_parser_workflow_args = [
+    (['-img', '--image'], {'nargs': '?', 'action': flag_or_auto_action, 'metavar': 'auto', 'default': False, 'help': project_init_help['image']}),
+    (['-fit', '--fit'], {'nargs': '?', 'action': flag_or_auto_action, 'metavar': 'auto', 'default': False, 'help': project_init_help['fit']}),
+    (['-trans', '--translation'], {'nargs': '+', 'action': translation_action, 'metavar': 'auto|X Y Z', 'default': None, 'help': project_init_help['translation']}),
+    (['-d', '--download'], {'action': 'store_true', 'help': workflow_help['download']}),
+    (['-s', '--setup'], {'action': 'store_true', 'help': workflow_help['setup']}),
+    (['-ds', '--dataset_path'], {'default': None, 'help': workflow_help['dataset_path']}),
+    (['-k', '--keep_going'], {'action': 'store_true', 'help': workflow_help['keep_going']}),
+    (['-smp', '--sample_trajectory'], {'type': int, 'nargs': '?', 'default': None, 'const': 10, 'metavar': 'N_FRAMES', 'help': project_init_help['sample_trajectory']}),
+    (['-rcut', '--rmsd_cutoff'], {'type': float, 'default': DEFAULT_RMSD_CUTOFF, 'help': project_init_help['rmsd_cutoff']}),
+    (['-icut', '--interaction_cutoff'], {'type': float, 'default': DEFAULT_INTERACTION_CUTOFF, 'help': project_init_help['interaction_cutoff']}),
+    (['-iauto', '--interactions_auto'], {'type': str, 'nargs': '?', 'const': True, 'help': project_init_help['interactions_auto']}),
+    (['-eng', '--energies_engine'], {'default': DEFAULT_ENERGIES_ENGINE, 'choices': ENERGIES_ENGINES, 'help': project_init_help['energies_engine']}),
+    (['-gb', '--guess_bonds'], {'action': 'store_true', 'help': project_init_help['guess_bonds']}),
+    (['-ib', '--ignore_bonds'], {'action': 'store_true', 'help': project_init_help['ignore_bonds']}),
+    (['-ibox', '--ignore_box'], {'action': 'store_true', 'help': project_init_help['ignore_box']}),
+    (['-skip', '--skip_frames'], {'type': int, 'nargs': 2, 'action': 'append', 'default': None, 'metavar': ('MD_INDEX', 'N_FRAMES'), 'help': project_init_help['skip_frames']}),
+    (['-sfr', '--screenshot_frame'], {'type': int, 'default': None, 'help': project_init_help['screenshot_frame']}),
+    (['-lb', '--local_blast'], {'action': 'store_true', 'help': project_init_help['local_blast']}),
+    (['-lip', '--local_interproscan'], {'action': 'store_true', 'help': project_init_help['local_interproscan']}),
+]
+for flags, kwargs in run_parser_workflow_args:
+    run_parser_workflow_group.add_argument(*flags, **kwargs)
+
+# Set a group for the selection options
+run_parser_selection_group = run_parser.add_argument_group('SELECTION OPTIONS')
+run_parser_selection_args = [
+    (['-filt', '--filter_selection'], {'nargs': '?', 'default': False, 'const': True, 'help': project_init_help['filter_selection']}),
+    (['-pbc', '--pbc_selection'], {'default': None, 'help': project_init_help['pbc_selection']}),
+    (['-cg', '--cg_selection'], {'default': None, 'help': project_init_help['cg_selection']}),
+    (['-ua', '--ua_selection'], {'default': None, 'help': project_init_help['ua_selection']}),
+    (['-qm', '--qm_selection'], {'default': None, 'help': project_init_help['qm_selection']}),
+    (['-pcafit', '--pca_fit_selection'], {'default': PROTEIN_AND_NUCLEIC_BACKBONE, 'help': project_init_help['pca_fit_selection']}),
+    (['-pcana', '--pca_analysis_selection'], {'default': PROTEIN_AND_NUCLEIC_BACKBONE, 'help': project_init_help['pca_analysis_selection']}),
+]
+for flags, kwargs in run_parser_selection_args:
+    run_parser_selection_group.add_argument(*flags, **kwargs)
+
+# Set a group with all input checking options
+run_parser_checks_group = run_parser.add_argument_group('INPUT CHECKS OPTIONS', description=f"For more information about each check please visit:\n{test_docs_url}")
+run_parser_checks_args = [
+    (['-t', '--trust'], {'default': [], 'nargs': '*', 'action': custom, 'const': AVAILABLE_CHECKINGS, 'choices': AVAILABLE_CHECKINGS,
+      'help': ("If passed, do not run the specified checking. Note that all checkings are skipped if passed alone. "
+               "Available checkings:" + pretty_list(AVAILABLE_CHECKINGS))}),
+    (['-m', '--mercy'], {'default': [], 'nargs': '*', 'action': custom, 'const': AVAILABLE_FAILURES, 'choices': AVAILABLE_FAILURES,
+     'help': ("If passed, do not kill the process when any of the specfied checkings fail and proceed with the workflow. "
+              "Note that all checkings are allowed to fail if the argument is passed alone. "
+              "Available checkings:" + pretty_list(AVAILABLE_FAILURES))}),
+    (['-f', '--faith'], {'default': False, 'action': 'store_true',
+     'help': ("Use this flag to force-skip all data processing thus asuming inputs are already processed.\n"
+              "Inputs must be outputs of an up to date workflow and thus the input structure must be a mmCIF (.cif) file.\n"
+              "WARNING: Do not use this flag if you don't know what you are doing.\n"
+              "This may lead to several silent errors.")}),
+]
+for flags, kwargs in run_parser_checks_args:
+    run_parser_checks_group.add_argument(*flags, **kwargs)
+
+# Set a list with the alias of all requestable dependencies
+choices = sorted(list(requestables.keys()) + list(TaskResolver.DEPENDENCY_FLAGS.keys()))
+task_groups_help = {
+    "download": "Download missing input files (already ran with analyses)",
+    "setup": "Process and test input files (already ran with analyses)",
+    "meta": "Run project and MD metadata analyses",
+    "network": "Run dependencies which require internet connection",
+    "minimal": "Run dependencies required by the web client to work",
+    "interdeps": "Run interactions and all its dependent analyses",
+    "membs": "Run all membrane-related analyses",
+}
+task_groups = [f'{flag}: {description}' for flag, description in task_groups_help.items()]
+assert len(TaskResolver.DEPENDENCY_FLAGS.keys()) == len(task_groups), "The number of dependency flags and task groups must be the same"
+
+run_parser_analysis_group = run_parser.add_argument_group('TASKS OPTIONS',
+    description=f"Available tasks: {choices}\nFor more information about each task, please visit:\n{task_docs_url}")
+run_parser_analysis_args = [
+    (['-i', '--include'], {'nargs': '*', 'choices': choices,
+      'help': (workflow_help['include']
+               + "\nThere are also some additional flags to define a preconfigured group of dependencies:\n  - "
+               + '\n  - '.join(task_groups))}),
+    (['-e', '--exclude'], {'nargs': '*', 'choices': choices, 'help': workflow_help['exclude']}),
+    (['-ow', '--overwrite'], {'type': str, 'nargs': '*', 'default': [], 'action': custom, 'const': True, 'choices': choices, 'help': workflow_help['overwrite']}),
+]
+for flags, kwargs in run_parser_analysis_args:
+    run_parser_analysis_group.add_argument(*flags, **kwargs)
+
+
+# Add a new to command to aid in the inputs file setup
+inputs_parser = subparsers.add_parser("inputs",
+    help="Set the inputs file",
+    formatter_class=CustomHelpFormatter,
+    parents=[common_parser]
+)
+# Chose the editor in advance
+inputs_parser.add_argument(
+    "-ed", "--editor",
+    choices=[*AVAILABLE_TEXT_EDITORS.values(), 'none'],
+    help="Set the text editor to modify the inputs file")
+
+
+# The convert command
+convert_parser = subparsers.add_parser("convert",
+    help="Convert a structure and/or several trajectories to other formats\n" +
+        "If several input trajectories are passed they will be merged previously",
+    formatter_class=CustomHelpFormatter,
+    parents=[common_parser])
+convert_parser_args = [
+    (['-is', '--input_structure'], {'help': "Path to input structure file"}),
+    (['-os', '--output_structure'], {'help': "Path to output structure file"}),
+    (['-it', '--input_trajectories'], {'nargs': '*', 'help': "Path to input trajectory file or same format files."}),
+    (['-ot', '--output_trajectory'], {'help': "Path to output trajectory file"}),
+]
+for flags, kwargs in convert_parser_args:
+    convert_parser.add_argument(*flags, **kwargs)
+
+
+# The filter command
+filter_parser = subparsers.add_parser("filter",
+    help="Filter atoms in a structure and/or a trajectory\n",
+    formatter_class=CustomHelpFormatter,
+    parents=[common_parser])
+filter_parser_args = [
+    (["-is", "--input_structure"], {'required': True, 'help': "Path to input structure file"}),
+    (["-os", "--output_structure"], {'help': "Path to output structure file"}),
+    (["-it", "--input_trajectory"], {'help': "Path to input trajectory file"}),
+    (["-ot", "--output_trajectory"], {'help': "Path to output trajectory file"}),
+    (["-sel", "--selection_string"], {'help': "Atom selection"}),
+    (["-syn", "--selection_syntax"], {'default': 'vmd', 'help': "Atom selection syntax (vmd by default)"}),
+]
+for flags, kwargs in filter_parser_args:
+    filter_parser.add_argument(*flags, **kwargs)
+
+
+# The subset command
+subset_parser = subparsers.add_parser("subset",
+    help="Get a subset of frames from the current trajectory",
+    formatter_class=CustomHelpFormatter,
+    parents=[common_parser])
+subset_parser_args = [
+    (["-is", "--input_structure"], {'required': True, 'help': "Path to input structure file"}),
+    (["-it", "--input_trajectory"], {'required': True, 'help': "Path to input trajectory file"}),
+    (["-ot", "--output_trajectory"], {'help': "Path to output trajectory file"}),
+    (["-start", "--start"], {'type': int, 'default': 0, 'help': "Start frame (0-based)"}),
+    (["-end", "--end"], {'type': int, 'default': None, 'help': "End frame (0-based)"}),
+    (["-step", "--step"], {'type': int, 'default': 1, 'help': "Frame step"}),
+    (["-skip", "--skip"], {'nargs': '*', 'type': int, 'default': [], 'help': "Frames to be skipped (0-based)"}),
+    (["-fr", "--frames"], {'nargs': '*', 'type': int, 'default': [], 'help': "Frames to be returned (0-based). Input frame order is ignored as original frame order is conserved."}),
+]
+for flags, kwargs in subset_parser_args:
+    subset_parser.add_argument(*flags, **kwargs)
+
+
+# The view command
+view_parser = subparsers.add_parser("view",
+    help="Open VMD with the most processed structure and trajectory of the current project\n" +
+        "If no frames are specified then all frames are loaded for trajectories under 500 MB and only the first 10 frames otherwise",
+    formatter_class=CustomHelpFormatter,
+    parents=[common_parser])
+view_parser_args = [
+    (["input_files"], {'nargs': '*', 'metavar': 'FILE', 'help': "Paths to the structure and the trajectory files, in any order. " +
+        "The most processed structure and trajectory in the project by default. If the structure is passed alone then no trajectory is loaded"}),
+]
+# Frame and selection options are shared with the dataset view command
+view_shared_args = [
+    (["-start", "--start"], {'type': int, 'default': None, 'help': "Start frame (0-based)"}),
+    (["-end", "--end"], {'type': int, 'default': None, 'help': "End frame (0-based, not included). The last frame by default if start or step are passed"}),
+    (["-step", "--step"], {'type': int, 'default': None, 'help': "Frame step"}),
+    (["-fr", "--frames"], {'nargs': '*', 'type': int, 'default': [], 'help': "Frames to be loaded (0-based). Other arguments are ignored."}),
+    (["-a", "--all"], {'action': 'store_true', 'help': "Load all frames. Other frame arguments are ignored."}),
+    (["-sel", "--selection"], {'default': None, 'help': "Atom selection (VMD syntax) to focus the view on. It is also shown in CPK over the default representation."}),
+]
+for flags, kwargs in view_parser_args + view_shared_args:
+    view_parser.add_argument(*flags, **kwargs)
+
+
+# The chainer command
+chainer_parser = subparsers.add_parser("chainer",
+    help="Edit structure (pdb) chains",
+    formatter_class=CustomHelpFormatter,
+    parents=[common_parser])
+chainer_parser_args = [
+    (["-is", "--input_structure"], {'required': True, 'help': "Path to input structure file"}),
+    (["-os", "--output_structure"], {'default': 'chained.pdb', 'help': "Path to output structure file"}),
+    (["-sel", "--selection_string"], {'help': "Atom selection (the whole structure by default)"}),
+    (["-syn", "--selection_syntax"], {'default': 'vmd', 'choices': Structure.SUPPORTED_SELECTION_SYNTAXES, 'help': "Atom selection syntax (VMD syntax by default)"}),
+    (["-let", "--letter"], {'help': "New chain letter (one letter per fragment by default)"}),
+    (["-whfr", "--whole_fragments"], {'type': bool, 'default': False, 'help': "Consider fragments beyond the atom selection. Otherwise a fragment could end up having multiple chains."}),
+    (["-bs", "--bonds_source"], {'help': "Source topology file to mine bonds from."}),
+]
+for flags, kwargs in chainer_parser_args:
+    chainer_parser.add_argument(*flags, **kwargs)
+
+
+# The NASSA commands
+nassa_parser = subparsers.add_parser("nassa", formatter_class=CustomHelpFormatter,
+    help="Run and set the configuration of the NASSA analysis",
+    parents=[common_parser])
+nassa_parser_args = [
+    (['-c', '--config'], {'help': "Configuration file for the NASSA analysis"}),
+    (['-n', '--analysis_names'], {'nargs': '*', 'default': None, 'help': "Name of the analysis to be run. It can be: " + ', '.join(NASSA_ANALYSES_LIST)}),
+    (['-w', '--make_config'], {'nargs': '*', 'default': None, 'help': "Make a configuration file for the NASSA analysis: makecfg.\nThe base path could be given as an argument. If not, an example of configuration file is created."}),
+    (['-seq', '--seq_path'], {'type': str, 'const': False, 'action': custom, 'help': "Set the base path of the sequences. If not given, the sequences are searched in the current directory."}),
+    (['-o', '--output'], {'help': "Output path for the NASSA analysis"}),
+    (['-ow', '--overwrite'], {'type': str, 'nargs': '*', 'default': [], 'action': custom, 'const': True, 'choices': choices, 'help': workflow_help['overwrite']}),
+    (['-own', '--overwrite_nassa'], {'type': str, 'nargs': '*', 'default': [], 'action': custom, 'const': True, 'help': "Set the output files to be overwritten thus re-runing its corresponding analysis or tool for the NASSA analysis"}),
+    (['-nseq', '--n_sequences'], {'type': int, 'help': "Number of sequences to be analyzed"}),
+    (['-i', '--unit_len'], {'type': int, 'default': 6, 'help': "Number of base pairs to be analyzed"}),
+    (['-hp', '--helical_parameters'], {'action': 'store_true', 'default': False, 'help': "Run the helical parameters analysis"}),
+    (['-pdirs', '--proj_directories'], {'nargs': '*', 'default': None, 'help': "Path to the different project directories. Each directory is to contain an independent project.\nSeveral output files will be generated in the same folder directory"}),
+    (['-all', '--all'], {'action': 'store_true', 'default': False, 'help': "Run all the helical parameters and NASSA analyses"}),
+    (['-stru', '--input_structure_filepath'], {'default': None, 'help': project_init_help['input_structure_filepath']}),
+    (['-traj', '--input_trajectory_filepath'], {'nargs': '*', 'default': None, 'help': project_init_help['input_trajectory_filepaths']}),
+    (['-top', '--input_topology_filepath'], {'default': None, 'help': project_init_help['input_topology_filepath']}),
+    (['-mdir', '--input_md_directories'], {'nargs': '*', 'default': None, 'help': project_init_help['input_md_directories']}),
+    (['-proj', '--accession'], {'default': None, 'help': project_init_help['accession']}),
+    (['-smp', '--sample_trajectory'], {'type': int, 'nargs': '?', 'default': None, 'const': 10, 'metavar': 'N_FRAMES', 'help': project_init_help['sample_trajectory']}),
+    (['-t', '--trust'], {'default': [], 'nargs': '*', 'action': custom, 'const': AVAILABLE_CHECKINGS, 'choices': AVAILABLE_CHECKINGS,
+      'help': ("If passed, do not run the specified checking. Note that all checkings are skipped if passed alone. "
+               "Available checkings:" + pretty_list(AVAILABLE_CHECKINGS))}),
+    (['-m', '--mercy'], {'default': [], 'nargs': '*', 'action': custom, 'const': AVAILABLE_FAILURES, 'choices': AVAILABLE_FAILURES,
+     'help': ("If passed, do not kill the process when any of the specfied checkings fail and proceed with the workflow. "
+              "Note that all checkings are allowed to fail if the argument is passed alone. "
+              "Available checkings:" + pretty_list(AVAILABLE_FAILURES))}),
+    (['-dup', '--duplicates'], {'default': False, 'action': 'store_true', 'help': "If passed, merge duplicate subunits if there is more than one, in the sequences. if not only the last will be selected"}),
+]
+for flags, kwargs in nassa_parser_args:
+    nassa_parser.add_argument(*flags, **kwargs)
+
+# Dataset subcommand
+ds_help = {func.__name__: parse_docstring_for_help(func.__doc__) for func in Dataset.__dict__.values() if callable(func)}
+ds_parser = subparsers.add_parser("dataset", aliases=["ds"], formatter_class=CustomHelpFormatter, help="Manage and process a dataset of MDDB projects.")
+dataset_subparsers = ds_parser.add_subparsers(dest='dataset_subcommand', help='Dataset subcommands')
+common_ds_parser = ArgumentParser(add_help=False)
+common_ds_parser.add_argument("dataset_path", nargs='?', default=None, help=ds_help['__init__']['dataset_path'] + " If not provided, the first *.db file found in the current directory will be used.",)
+# Dataset add subcommand
+dataset_add = dataset_subparsers.add_parser("add", formatter_class=CustomHelpFormatter, help="Add a directory and add all MDDB projects to a dataset storage file.", parents=[common_ds_parser])
+dataset_add.add_argument("-p", "--paths_or_globs", nargs='*', help=ds_help['add_entries']['paths_or_globs'])
+dataset_add.add_argument("-i", "--ignore_dirs", nargs='*', help=ds_help['add_entries']['ignore_dirs'], default=[])
+dataset_add.add_argument("-md", "--md_dirs", nargs='*', help=ds_help['add_entries']['md_dirs'], default=[])
+# Dataset remove subcommand
+dataset_remove = dataset_subparsers.add_parser("remove", formatter_class=CustomHelpFormatter, help="Remove a project from the dataset storage file.", parents=[common_ds_parser])
+dataset_remove.add_argument("-p", "--query_path", help='Path to the project to be removed from the dataset.')
+# Dataset status subcommand
+dataset_add = dataset_subparsers.add_parser("status", formatter_class=CustomHelpFormatter, help="Show the status of a project inside the dataset.", parents=[common_ds_parser])
+dataset_add.add_argument("-p", "--project_path", help='Path to the project.', required=True)
+
+# Dataset view subcommand
+ds_view = dataset_subparsers.add_parser("view", formatter_class=CustomHelpFormatter, help="Open VMD with the most processed structure and trajectory of a project inside the dataset.", parents=[common_ds_parser])
+ds_view.add_argument("-p", "--project_path", help='Path to the project.', required=True)
+for flags, kwargs in view_shared_args:
+    ds_view.add_argument(*flags, **kwargs)
+# Common query parser for dataset subcommands
+# Some subcommands use only some states by default
+def make_query_parser(default_state: list[str] = []) -> ArgumentParser:
+    parser = ArgumentParser(add_help=False)
+    parser.add_argument("-p", "--query_path", nargs='*', default=['*'], help=ds_help['get_dataframe']['query_path'])
+    parser.add_argument("-st", "--query_state", nargs='*', default=default_state, help=ds_help['get_dataframe']['query_state'])
+    parser.add_argument("-ms", "--query_message", nargs='*', default=[], help=ds_help['get_dataframe']['query_message'])
+    parser.add_argument("-qi", "--query_inputs", nargs=2, action='append', metavar=('FIELD', 'VALUE'), default=None,
+        help="Filter projects by a field in their inputs file (e.g. '-qi pdb_ids 1ABC'). " + ds_help['get_inputs_field']['field'] +
+        " The value is parsed as YAML. If the field is a list, it is enough for the value to be one of its items." +
+        " Repeat the option to add more conditions, projects must match all of them (e.g. '-qi pdb_ids 1ABC -qi temp 310').")
+    parser.add_argument("-nm", "--query_name", nargs='*', default=[],
+        help="Filter projects by the name in their inputs file using glob patterns, ignoring case (e.g. '-nm \"*kinase*\"')." +
+        " Projects without a name are left out.")
+    parser.add_argument("-wn", "--query_warnings", nargs='*', default=[], action=custom, const=['*'],
+        help="Filter projects by the tags of their current warnings using glob patterns (e.g. '-wn pbcontacts')." +
+        " Warnings in the MDs of the project count as well. Pass the flag alone to get projects with any warning.")
+    return parser
+query_parser = make_query_parser()
+# Scope filter only for subcommands which display both projects and MDs
+scope_parser = ArgumentParser(add_help=False)
+scope_parser.add_argument("-sc", "--query_scope", type=str, default=None, help=ds_help['get_dataframe']['query_scope'])
+# Dataset inputs subcommand
+ds_inputs = dataset_subparsers.add_parser("inputs", formatter_class=CustomHelpFormatter, help="Generate inputs file for MDDB projects.", parents=[common_ds_parser, query_parser])
+ds_inputs.add_argument("-it", "--inputs_template", type=str, help=ds_help['generate_inputs_yaml']['inputs_template_path'])
+ds_inputs.add_argument("-ig", "--inputs_generator", type=str, help=ds_help['generate_inputs_yaml']['inputs_generator'])
+ds_inputs.add_argument("-o", "--overwrite", action="store_true", help=ds_help['generate_inputs_yaml']['overwrite'])
+ds_inputs.add_argument("-s", "--set", nargs=2, metavar=('FIELD', 'VALUE'),
+    help="Edit existing inputs files instead of generating them. " + ds_help['set_inputs_field']['field'] + " " + ds_help['set_inputs_field']['value'])
+ds_inputs.add_argument("-g", "--get", type=str, metavar='FIELD',
+    help="Show the value of a field in the existing inputs files instead of generating them. " + ds_help['get_inputs_field']['field'])
+# Dataset show subcommand
+ds_show = dataset_subparsers.add_parser("show", formatter_class=CustomHelpFormatter, help="Display information about a dataset of MDDB projects.", parents=[common_ds_parser, query_parser, scope_parser])
+ds_show.add_argument('-s', '--sort_by', help="Column name to sort the dataset by.", default='last_modified', type=str)
+ds_show.add_argument('-r', '--reverse', help="Reverse the sort order.", action='store_true')
+ds_show.add_argument('-n', '--n_rows', help="Number of rows to display. 0 for all rows.", default=50, type=int)
+ds_show.add_argument('-l', '--include_logs', help=ds_help['get_dataframe']['include_logs'], action='store_true')
+ds_show.add_argument('-m', '--summary', help="Get a summary of the state of the projects.", action='store_true')
+ds_show.add_argument('-id', '--show_id', help="Show UUIDs.", action='store_true')
+# Dataset ls subcommand
+ds_ls = dataset_subparsers.add_parser("ls", formatter_class=CustomHelpFormatter, help="List the dataset projects one block per project, with full paths and messages and the project name.", parents=[common_ds_parser, query_parser])
+ds_ls.add_argument('-s', '--sort_by', help=ds_help['list_projects']['sort_by'], default='last_modified', type=str)
+ds_ls.add_argument('-r', '--reverse', help="Reverse the sort order.", action='store_true')
+ds_ls.add_argument('-n', '--n_rows', help=ds_help['list_projects']['n_projects'], default=50, type=int)
+ds_ls.add_argument('-l', '--include_logs', help=ds_help['list_projects']['include_logs'], action='store_true')
+
+ds_logs = dataset_subparsers.add_parser("logs", formatter_class=CustomHelpFormatter, help="Show the most recent output logs of the dataset projects.", parents=[common_ds_parser, query_parser])
+ds_logs.add_argument("-e", "--error", help=ds_help['show_logs']['error'], action='store_true')
+ds_logs.add_argument('-n', '--n_rows', help=ds_help['show_logs']['n_projects'], default=50, type=int)
+ds_logs.add_argument('-t', '--tail', help=ds_help['show_logs']['tail'], default=0, type=int)
+
+# Dataset watch subcommand
+ds_watch = dataset_subparsers.add_parser("watch", formatter_class=CustomHelpFormatter, help="Display information live about a dataset of MDDB projects.", parents=[common_ds_parser, query_parser, scope_parser])
+ds_watch.add_argument('-r', '--reverse', help="Reverse the sort order.", action='store_true')
+# Dataset scan subcommand
+ds_scan = dataset_subparsers.add_parser("scan", formatter_class=CustomHelpFormatter, help="Scan a directory and add all MDDB projects to a dataset storage file.", parents=[common_ds_parser])
+# # Dataset run subcommand
+ds_run = dataset_subparsers.add_parser("run", formatter_class=CustomHelpFormatter, help="Run the workflow for a dataset of MDDB projects.", parents=[common_ds_parser, query_parser])
+ds_run.add_argument("-n", "--n_jobs", type=int, default=0, help=ds_help['launch']['n_jobs'])
+ds_run.add_argument("-ps", "--pool_size", type=int, default=1, help=ds_help['launch']['pool_size'])
+ds_run.add_argument("-c", "--cmd", type=str, help=ds_help['launch']['cmd'])
+ds_run.add_argument("-sl", "--slurm", action="store_true", help=ds_help['launch']['slurm'])
+ds_run.add_argument("-jt", "--job-template", help=ds_help['launch']['job_template'])
+ds_run.add_argument("--debug", action="store_true", help=ds_help['launch']['debug'])
+# Dataset load subcommand
+ds_load = dataset_subparsers.add_parser("load", formatter_class=CustomHelpFormatter, help="Upload the dataset projects to the database using the MDDB loader.", parents=[common_ds_parser, make_query_parser(['done'])])
+ds_load.add_argument("-ld", "--loader", type=str, help=ds_help['load']['loader_path'])
+ds_load.add_argument("-nd", "--node", type=str, help=ds_help['load']['node'])
+ds_load.add_argument("-o", "--overwrite", action="store_true", help=ds_help['load']['overwrite'])
+# Note that the loader options are named differently when they clash with the query options (e.g. -st)
+ds_load.add_argument("-i", "--include_files", nargs='+', help=ds_help['load']['include'])
+ds_load.add_argument("-e", "--exclude_files", nargs='+', help=ds_help['load']['exclude'])
+ds_load.add_argument("-stj", "--skip_trajectories", action="store_true", help=ds_help['load']['skip_trajectories'])
+ds_load.add_argument("-sf", "--skip_files", action="store_true", help=ds_help['load']['skip_files'])
+ds_load.add_argument("-sa", "--skip_analyses", action="store_true", help=ds_help['load']['skip_analyses'])
+ds_load.add_argument("-md", "--md_dirs", nargs='+', help=ds_help['load']['md_directories'])
+
+# Update references command
+upref_parser = subparsers.add_parser("upref",
+    help="Update references",
+    formatter_class=CustomHelpFormatter,
+    parents=[common_parser]
+)
+
+# Set optional arguments
+upref_parser.add_argument("-nd", "--nodes", required=True, nargs='*',
+    help=("Select the node(s) where the references are to be updated. Either use URLs or an aliases. "
+          "If you don't know the available aliases then just run the command with a wrong alias. "
+          "It will fail and then it will show you available aliases in MDposit. "
+          "You may also pass the flag 'all' in order to update references from all nodes."))
+upref_parser.add_argument("-rt", "--types", required=True, nargs='*',
+    help=f"Select the type(s) of references to update among these: {', '.join(AVAILABLE_REFERENCE_TYPES)}")
+upref_parser.add_argument("-ld", "--loader", type=str,
+    help=f"Set the path to the directory where the loader is installed, so the workflow can use it. "
+        "If the loader is available then the new references will be automatically uploaded in batches. "
+        "Note that using the loader makes the process more memory efficient and faster. "
+        "Without it, chain references are only made, in the 'chain_references' directory, so several processes "
+        "may share this directory (e.g. SLURM array tasks) and every sequence is run once. "
+        "Then run the update with the loader to upload them.")
+upref_parser.add_argument("-f", "--force", default=False, action='store_true',
+    help="Remake all references, also those already generated with the latest version. "
+        "References already remade in the local output file of a previous run are not remade, move this file to remake them.")
+upref_parser.add_argument("-w", "--workers", type=int, default=1,
+    help="Chain references are remade with the local InterProScan (set it up with "
+        "'python -m mddb_workflow.utils.interproscan --setup'). Set how many InterProScan runs are done at once. "
+        "The CPUs of this process are split among them, and about 4 CPUs per run work well.")
+
+
+# The update projects command
+uproj_parser = subparsers.add_parser("uproj",
+    help="Update outdated projects",
+    formatter_class=CustomHelpFormatter,
+    parents=[common_parser]
+)
+
+# Set optional arguments
+uproj_parser.add_argument("-nd", "--nodes", required=True, nargs='*',
+    help=("Select the node(s) where the projects are to be updated. Either use URLs or an aliases. "
+          "If you don't know the available aliases then just run the command with a wrong alias. "
+          "It will fail and then it will show you available aliases in MDposit. "
+          "You may also pass the flag 'all' in order to update projects from all nodes."))
+uproj_parser.add_argument("-proj", "--accessions", nargs='*', default=None,
+    help="Select the project(s) to be updated. All projects in the node are checked by default.")
+uproj_parser.add_argument("-q", "--query", type=str, default=None,
+    help=("Set a search query so only the matching projects are checked (e.g. -q spike). "
+          "This is the 'search' parameter of the /projects endpoint in the database API. "
+          "It can not be combined with specific projects (-proj)."))
+uproj_parser.add_argument("-ld", "--loader", type=str,
+    help=f"Set the path to the directory where the loader is installed, so the workflow can use it. "
+        "If the loader is available then the outdated data will be automatically uploaded after every project update. "
+        "Note that, once uploaded, the local project directory is removed.")
+uproj_parser.add_argument("-i", "--include", nargs='*', choices=UPDATABLE_TASKS,
+    help=("Set the only tasks to be checked and updated. Projects with these tasks up to date are not updated at all. "
+          "Note that included analyses are also run in those MDs where they are missing in the database."))
+uproj_parser.add_argument("-e", "--exclude", nargs='*', choices=UPDATABLE_TASKS,
+    help="Set tasks to be ignored, so they are not updated even if they are outdated.")
+
+# Set the same input checking options of the run command, to be passed to the workflow
+uproj_parser_checks_group = uproj_parser.add_argument_group('INPUT CHECKS OPTIONS', description=f"For more information about each check please visit:\n{test_docs_url}")
+for flags, kwargs in run_parser_checks_args:
+    uproj_parser_checks_group.add_argument(*flags, **kwargs)

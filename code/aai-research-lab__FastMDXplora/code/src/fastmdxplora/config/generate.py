@@ -1,0 +1,493 @@
+"""Config template generation and resolved-config dumping.
+
+Both functions read from the schema registry so they never drift from
+the actual option surface.
+
+  - :func:`generate_template` powers ``fastmdx config``: a fully
+    commented YAML file with every option, its default, and a one-line
+    description. Users edit this rather than authoring from scratch.
+
+  - :func:`write_resolved_config` powers the reproducibility dump: after
+    a run, the fully merged configuration (defaults + file + overrides)
+    is written to ``resolved_config.yml`` so the exact study can be
+    re-run.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from fastmdxplora.config.schema import (
+    PHASE_SCHEMAS,
+    TOP_LEVEL,
+    Field,
+    PhaseSchema,
+)
+
+
+# ---------------------------------------------------------------------------
+# Template generation (`fastmdx config`)
+# ---------------------------------------------------------------------------
+def _format_value_for_yaml(value: Any) -> str:
+    """Render a Python value as a YAML scalar/inline-collection string."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        # Quote strings that could be misread as YAML (e.g. 'Na+', 'name CA')
+        if any(c in value for c in ":#{}[],&*!|>'\"%@` ") or value == "":
+            return f'"{value}"'
+        return value
+    if isinstance(value, (list, tuple)):
+        inner = ", ".join(_format_value_for_yaml(v) for v in value)
+        return f"[{inner}]"
+    if isinstance(value, dict):
+        # Inline flow mapping for the example dicts in the template
+        inner = ", ".join(
+            f"{k}: {_format_value_for_yaml(v)}" for k, v in value.items()
+        )
+        return f"{{{inner}}}"
+    return str(value)
+
+
+#: Settings that say the same thing as another, or that cannot be given
+#: beside it, keyed by the one shown second. Each is written with a note
+#: naming the first, so a template uncommented line by line never offers two
+#: live choices for one setting: `include` and `exclude` uncommented
+#: together are refused, and `pressure_atm` beside `pressure_bar` loses to
+#: it without a word.
+_ONE_OR_THE_OTHER: dict[tuple[str, str], str] = {
+    ("(top-level)", "exclude_phase"): "include_phase",
+    ("setup", "force_field"): "forcefield",
+    ("setup", "keep_heterogens"): "heterogens",
+    ("simulation", "pressure_atm"): "pressure_bar",
+    ("simulation", "nvt_steps"): "nvt_duration_ns",
+    ("simulation", "npt_steps"): "npt_duration_ns",
+    ("simulation", "production_steps"): "duration_ns",
+    ("analysis", "exclude"): "include",
+    ("analysis", "selection"): "select_atoms",
+}
+
+
+def _field_template_lines(
+    fld: Field, *, commented: bool, indent: int = 2, phase: str = "(top-level)",
+) -> list[str]:
+    """Render one field as YAML lines: a help comment + the key.
+
+    Parameters
+    ----------
+    fld : Field
+    commented : bool
+        When True, the key line is commented out (prefixed with ``# ``)
+        so the template shows the option without activating it.
+    indent : int
+        Number of leading spaces. Top-level fields use 0; fields inside a
+        phase block use 2.
+    phase : str
+        The block the field is in, for the settings it is one of a pair in.
+
+    The help is written after ``## ``, so taking one ``# `` off a block to
+    use it leaves the help a comment: written after ``# ``, a help line such
+    as "Integrator: langevin_middle, ..." became a key of its own.
+    """
+    pad = " " * indent
+    lines = [f"{pad}## {fld.help}"]
+
+    # The value shown: prefer the real default; fall back to the example
+    # when the default is None (so the line is illustrative, and says so).
+    shown = fld.default if fld.default is not None else fld.example
+    value_str = _format_value_for_yaml(shown)
+
+    notes: list[str] = []
+    if commented and fld.default is None and fld.example is not None:
+        notes.append("an example; unset by default")
+    other = _ONE_OR_THE_OTHER.get((phase, fld.name))
+    if other is not None:
+        notes.append(f"instead of {other}, not beside it")
+
+    prefix = f"{pad}# " if commented else pad
+    line = f"{prefix}{fld.name}: {value_str}"
+    if notes:
+        line += "   # " + "; ".join(notes)
+    lines.append(line)
+    return lines
+
+
+def _phase_template_block(
+    schema: PhaseSchema,
+    *,
+    commented: bool,
+) -> list[str]:
+    """Render a full phase block: header comment + all its fields.
+
+    When ``commented`` is True the phase header itself is commented out
+    (``# setup:``) so a fully-commented block doesn't leave a dangling
+    ``setup:`` key with a null value (which would be invalid against the
+    schema). The user uncomments the header and the options they want.
+    """
+    header_prefix = "# " if commented else ""
+    lines = [
+        "",
+        f"# {'=' * 70}",
+        f"# {schema.name}: {schema.description}",
+        f"# {'=' * 70}",
+        f"{header_prefix}{schema.name}:",
+    ]
+    for fld in schema.fields:
+        lines.extend(_field_template_lines(fld, commented=commented, indent=2,
+                                           phase=schema.name))
+    return lines
+
+
+def generate_template(*, minimal: bool = False) -> str:
+    """Return a fully-commented YAML config template as a string.
+
+    Parameters
+    ----------
+    minimal : bool, default False
+        If True, generate a short template with only the most common
+        options active. If False (default), generate the comprehensive
+        template with every option shown (per-phase blocks commented out
+        so defaults apply until the user opts in).
+    """
+    if minimal:
+        return _minimal_template()
+
+    lines: list[str] = [
+        "# FastMDXplora configuration file",
+        "#",
+        "# Generated by `fastmdx config`. Every option is shown with its",
+        "# default value and a one-line description. Options under each phase",
+        "# block are commented out — uncomment the phase header and the options",
+        "# you want to change; anything left commented uses the built-in default.",
+        "# A line after `## ` is help, and stays a comment when one `# ` is taken off.",
+        "#",
+        "# Run with:  fastmdx explore --config this_file.yml",
+        "#",
+        "# Override any value from the command line — flags beat the file:",
+        "#   fastmdx explore --config this_file.yml --simulate-duration-ns 50",
+        "",
+        "# ----------------------------------------------------------------------",
+        "# Systems (REQUIRED): the list of systems to study.",
+        "# Always a list — even one system goes here as a single entry. Add more",
+        "# entries to study several systems in one run; each can carry its own",
+        "# per-phase option overrides (e.g. a different pH).",
+        "# ----------------------------------------------------------------------",
+        "systems:",
+        "  - id: protein1",
+        "    system: protein.pdb        # PDB/CIF path, or a 4-char PDB ID",
+        "  # - id: protein2",
+        "  #   system: 1L2Y             # a PDB ID, fetched from RCSB",
+        "  #   setup: { ph: 6.5 }       # optional per-system option overrides",
+        "",
+        "# ----------------------------------------------------------------------",
+        "# Project-level settings",
+        "# ----------------------------------------------------------------------",
+    ]
+    # Top-level settings at column 0. Only `output` and the ones with a
+    # default are live; every other is commented out, so a template given a
+    # system and run states nothing nobody asked for. The provenance, the
+    # budget and the decisions were live with their examples: a study run
+    # from the template was recorded as drafted by an AI model, ran in
+    # stages under a 40 hour ceiling, and its report gave a reason for a pH
+    # it never set.
+    for fld in TOP_LEVEL.fields:
+        commented = fld.default is None and fld.name != "output"
+        lines.extend(_field_template_lines(fld, commented=commented, indent=0))
+
+    # Per-phase blocks: fully commented so the file is valid as-is
+    # (everything defaults) and the user opts in to changes.
+    for schema in PHASE_SCHEMAS.values():
+        lines.extend(_phase_template_block(schema, commented=True))
+
+    # Sweep + execution: optional parameter sweeps and parallelism.
+    lines.extend([
+        "",
+        f"# {'=' * 70}",
+        "# SWEEP (optional): vary parameters across runs.",
+        "#",
+        "# Each axis is a dotted phase.option key mapped to a list of values.",
+        "# FastMDXplora runs the full cross-product (systems × sweep axes),",
+        "# each as a complete study in runs/<id>/, indexed by batch_manifest.json.",
+        "# With one system and no sweep you get the familiar flat output layout.",
+        f"# {'=' * 70}",
+        "#",
+        "# sweep:",
+        "#   simulation.temperature_K: [300, 310, 320]",
+        "#   simulation.pressure_bar: [1.0, 1.2]   # multiple axes => cross-product",
+        "",
+        f"# {'=' * 70}",
+        "# EXECUTION (optional): how runs are scheduled.",
+        f"# {'=' * 70}",
+        "#",
+        "# execution:",
+        "#   mode: parallel        # sequential (default) | parallel",
+        "#   workers: 2            # parallel runs at once",
+        "#   devices: [0, 1]       # GPU indices; one run pinned per device",
+        "#   continue_on_error: true",
+    ])
+
+    return "\n".join(lines) + "\n"
+
+
+def _minimal_template() -> str:
+    """A short starter template with just the essentials active."""
+    return (
+        "# FastMDXplora configuration (minimal starter)\n"
+        "# Run with:  fastmdx explore --config this_file.yml\n"
+        "\n"
+        "systems:\n"
+        "  - id: protein1\n"
+        "    system: protein.pdb      # PDB/CIF path, or a 4-char PDB ID\n"
+        "\n"
+        "output: ./my_study\n"
+        "\n"
+        "simulation:\n"
+        "  duration_ns: 100.0         # production length in ns\n"
+        "  platform: auto             # auto | CUDA | OpenCL | CPU\n"
+        "\n"
+        "analysis:\n"
+        "  include: [rmsd, rmsf, rg, cluster]\n"
+        "\n"
+        "report:\n"
+        "  title: My MD Study\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Resolved-config dump (reproducibility)
+# ---------------------------------------------------------------------------
+#: Where each phase records the settings it worked out for itself, and the
+#: key it puts them under. A phase writes its record into the run's output
+#: directory as it finishes, and the resolved config is written after all
+#: of them, so by then they are on disk to be read.
+_PHASE_RECORDS = {
+    "setup": ("setup/setup_parameters.json", "resolved"),
+    "simulation": ("simulation/simulation_parameters.json", "resolved"),
+    "analysis": ("analysis/analysis_manifest.json", "resolved"),
+}
+
+
+def _recorded_resolutions(run_dir: Path) -> dict[str, dict[str, Any]]:
+    """Per phase, the settings that phase recorded having worked out.
+
+    Absent for a phase that did not run, for a run from before the records
+    existed, and for one whose phase failed before writing. All three are
+    the same answer -- nothing to add -- and the schema defaults stand.
+
+    Only values are read, never structure: a record is a file on disk that
+    a person may have edited, and a key that is not a setting of that phase
+    would make the resolved config fail its own validation on replay. So
+    anything the phase's schema does not declare is dropped.
+    """
+    import json
+
+    from fastmdxplora.config.schema import PHASE_SCHEMAS
+
+    found: dict[str, dict[str, Any]] = {}
+    for phase, (relative, key) in _PHASE_RECORDS.items():
+        path = run_dir / relative
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        resolved = record.get(key)
+        if not isinstance(resolved, dict):
+            continue
+        schema = PHASE_SCHEMAS.get(phase)
+        if schema is None:
+            continue
+        kept = {name: value for name, value in resolved.items()
+                if value is not None and schema.get(name) is not None}
+        if kept:
+            found[phase] = kept
+    return found
+
+
+def _drop_counts_of_another_length(block: dict[str, Any], found: dict[str, Any]) -> None:
+    """Leave out of ``found`` a recorded step count that is not the length
+    its stage is given as in ``block``.
+
+    The record is the folder's own simulation, which is not always the run
+    the block describes: an extended study's analyses run again over its
+    joined pieces with the study's whole production as `duration_ns`, and
+    its record holds the first piece's steps. Written beside each other,
+    the two disagree, and the loader refuses the file (a carried-on study
+    was refused by `fastmdx resume` for it).
+    """
+    from fastmdxplora.simulation.lengths import DEFAULT_TIMESTEP_FS, steps_in
+
+    timestep = block.get("timestep_fs") or DEFAULT_TIMESTEP_FS
+    for steps_key, ns_key in (("production_steps", "duration_ns"),
+                              ("nvt_steps", "nvt_duration_ns"),
+                              ("npt_steps", "npt_duration_ns")):
+        ns = block.get(ns_key)
+        if ns is None or found.get(steps_key) is None:
+            continue
+        try:
+            same = int(found[steps_key]) == steps_in(ns, timestep)
+        except (TypeError, ValueError, ZeroDivisionError):
+            same = False
+        if not same:
+            found.pop(steps_key)
+
+
+def write_resolved_config(
+    merged: dict[str, Any],
+    output_dir: str | Path,
+    *,
+    filename: str = "resolved_config.yml",
+    full: bool = True,
+) -> Path:
+    """Write the fully-merged configuration to ``output_dir/resolved_config.yml``.
+
+    Parameters
+    ----------
+    merged : dict
+        The resolved run configuration. Recognized keys: ``system`` (the
+        input for this run), ``system_id`` (optional id), ``output``,
+        ``verbose``, ``include``, ``exclude``, and ``options`` (per-phase
+        option blocks).
+    output_dir : path
+        Directory to write into.
+    filename : str
+        Output file name.
+    full : bool
+        Name every setting each phase used, defaults included. This is the
+        point of the file and the default. ``False`` writes only what was
+        explicitly set, which is shorter and answers a different question.
+
+    Returns
+    -------
+    Path
+        The path written.
+
+    Notes
+    -----
+    The dump is a valid FastMDXplora config file — feed it straight back
+    to ``--config`` to reproduce the run. The single system is written as
+    the canonical one-element ``systems:`` list.
+
+    The defaults come from ``PhaseSchema.defaults()``, which reads
+    ``Field.phase_value`` and not ``Field.default``. The two differ where a
+    field declares a ``phase_sentinel``, and writing the wrong one is not a
+    cosmetic error: ``simulation.pressure_bar`` declares ``1.0`` and starts
+    a phase at ``None`` precisely so that ``pressure_atm`` stays
+    detectable. Write ``1.0`` into the file and a run configured at 1.2 atm
+    replays at 1.0 bar — a silent change of pressure, in the file whose
+    whole purpose is to reproduce the run.
+
+    For the same reason a field whose effective value is worked out at run
+    time is written as ``null`` rather than as the value its help text
+    describes. ``null`` is what the loader reads as "use the default", so
+    it round-trips to the same run; a substituted number would not. A step
+    count written beside the duration it was derived from would override
+    that duration on replay.
+    """
+    import yaml
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    # Reassemble into config-file shape (canonical `systems:` list).
+    doc: dict[str, Any] = {}
+    if merged.get("system") is not None:
+        sid = merged.get("system_id") or "s1"
+        doc["systems"] = [{"id": sid, "system": str(merged["system"])}]
+    elif merged.get("systems"):
+        doc["systems"] = [dict(entry) for entry in merged["systems"]]
+    if merged.get("output") is not None:
+        doc["output"] = str(merged["output"])
+    if merged.get("verbose"):
+        doc["verbose"] = bool(merged["verbose"])
+    # Only where it is off: on is the default, and a study that said
+    # nothing explained. Left out before, so a study run with --no-explain
+    # was recorded as one that explained.
+    if merged.get("explain") is False:
+        doc["explain"] = False
+    if merged.get("include_phase"):
+        doc["include_phase"] = list(merged["include_phase"])
+    if merged.get("exclude_phase"):
+        doc["exclude_phase"] = list(merged["exclude_phase"])
+    # The study's shape, where it has one: axes to sweep and how its runs are
+    # scheduled. A run of a sweep is handed neither, so its own file is that
+    # run; a study written with them reproduces every run it made.
+    for key in ("sweep", "execution"):
+        if merged.get(key):
+            doc[key] = merged[key]
+
+    # Study-level provenance, written before the phase blocks so it reads
+    # as a statement about the study rather than a setting of the last
+    # phase. Only when set: absent means a person wrote it, which is the
+    # default and every study run before the field existed.
+    from fastmdxplora.config.loader import STUDY_LEVEL_KEYS
+
+    for key in STUDY_LEVEL_KEYS:
+        if merged.get(key) is not None:
+            # A number stays a number: written through str(), the budget of a
+            # study read back as the text '0.5'.
+            value = merged[key]
+            numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+            # And a mapping a mapping: the decisions behind the settings.
+            doc[key] = value if numeric or isinstance(value, (dict, list)) else str(value)
+
+    options = merged.get("options") or {}
+    if full:
+        # Every setting the run used, defaults included -- which is what the
+        # file is for. It carried only what was explicitly set, so a phase
+        # that ran entirely on its defaults left no block at all, and the
+        # file reproduced a study on the version that wrote it and no other.
+        # A default that moves in a later release silently changed what the
+        # file meant, which is the failure it exists to prevent.
+        recorded = _recorded_resolutions(out)
+        for phase, schema in PHASE_SCHEMAS.items():
+            block = schema.defaults()
+            block.update(options.get(phase) or {})
+            # What the phase worked out goes on top of what it was asked
+            # for, because it is the more specific truth and the two agree:
+            # a step count derived from a duration is that duration, and on
+            # replay the count wins over the duration it came from, giving
+            # the same run. Written as a default beside a duration the user
+            # set, it would not have been -- which is why only a recorded
+            # resolution is allowed to do this.
+            found = dict(recorded.get(phase) or {})
+            if phase == "analysis" and block.get("exclude"):
+                # Analyses left out by name: the record holds that choice,
+                # not also the plan it resolved to (`include`), which the
+                # loader refuses beside it, so every later run of the study
+                # from its record stopped. The plan is in the manifest.
+                found.pop("include", None)
+            if phase == "simulation":
+                _drop_counts_of_another_length(block, found)
+            block.update(found)
+            doc[phase] = block
+    else:
+        for phase, block in options.items():
+            if block:
+                doc[phase] = dict(block)
+
+    header = (
+        "# FastMDXplora resolved configuration\n"
+        "#\n"
+        "# This is the fully-merged configuration actually used for this run\n"
+        "# (built-in defaults + config file + command-line overrides). Feed it\n"
+        "# back to reproduce the exact study:\n"
+        "#\n"
+        "#   fastmdx explore --config resolved_config.yml\n"
+        "#\n"
+    )
+    # A setting the run worked out from another, said beside the value.
+    for name, said in (merged.get("derived") or {}).items():
+        header += f"# {name}: {said['value']}, taken from {said['from']}\n"
+    if merged.get("derived"):
+        header += "#\n"
+    from fastmdxplora.orchestrator import _put_in_place
+
+    path = out / filename
+    # Whole or not at all: a stop raised as it was written (a run's record
+    # written again as it ends) left it cut short, and the study unread.
+    _put_in_place(path, header + yaml.safe_dump(doc, sort_keys=False,
+                                                default_flow_style=False))
+    return path

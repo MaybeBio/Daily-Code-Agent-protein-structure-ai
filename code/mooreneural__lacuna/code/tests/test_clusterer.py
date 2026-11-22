@@ -1,0 +1,355 @@
+"""Tests for the cross-ensemble pocket clusterer."""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from lacuna.models import Atom, Residue, Structure, Pocket
+from lacuna.pockets.clusterer import (
+    cluster_pockets, compute_crypticity, learned_score, ranker_features,
+    CRYPTICITY_THRESHOLD, RANK_STRATEGIES, _RANKER_FEATURES, _RANKER_WEIGHTS,
+    _RANKER_INTERCEPT,
+)
+
+
+def _make_pocket(centroid, volume=200.0, conformer_idx=0, lining=None):
+    return Pocket(
+        centroid=centroid,
+        volume_a3=volume,
+        enclosure=0.5,
+        hydrophobic_fraction=0.5,
+        aromatic_count=2,
+        lining_residues=lining or ["ALA1:A", "GLY2:A"],
+        conformer_idx=conformer_idx,
+    )
+
+
+class TestClusterPockets:
+    def test_identical_pockets_merge(self):
+        """Two pockets at the same location should form one cluster."""
+        p1 = _make_pocket((0.0, 0.0, 0.0), conformer_idx=0)
+        p2 = _make_pocket((0.5, 0.5, 0.5), conformer_idx=1)
+        clusters = cluster_pockets([[p1], [p2]], n_conformers=2)
+        assert len(clusters) == 1
+        assert clusters[0].persistence == pytest.approx(1.0)
+
+    def test_distant_pockets_stay_separate(self):
+        """Pockets far apart should not merge."""
+        p1 = _make_pocket((0.0, 0.0, 0.0), conformer_idx=0)
+        p2 = _make_pocket((50.0, 50.0, 50.0), conformer_idx=0)
+        clusters = cluster_pockets([[p1, p2]], n_conformers=1)
+        assert len(clusters) == 2
+
+    def test_persistence_calculated_correctly(self):
+        """Pocket in 2/4 conformers should have 50% persistence."""
+        pockets = [
+            [_make_pocket((0.0, 0.0, 0.0), conformer_idx=0)],
+            [_make_pocket((0.0, 0.0, 0.0), conformer_idx=1)],
+            [],
+            [],
+        ]
+        clusters = cluster_pockets(pockets, n_conformers=4)
+        assert len(clusters) >= 1
+        assert clusters[0].persistence == pytest.approx(0.5)
+
+    def test_cryptic_flag_tracks_crypticity(self):
+        """The cryptic flag is exactly crypticity >= threshold, not a persistence
+        rule. A pocket absent from the apo conformer opens (apo_volume 0), so a
+        reliably reopened site is still cryptic even at high persistence, which is
+        the behaviour the old persistence rule got wrong on real targets."""
+        pockets = [[_make_pocket((0.0, 0.0, 0.0), conformer_idx=i)] for i in range(1, 9)]
+        pockets = [[]] + pockets  # absent in conformer 0
+        clusters = cluster_pockets(pockets, n_conformers=9)
+        c = clusters[0]
+        assert c.persistence > 0.8  # opened in almost every conformer
+        assert c.cryptic == (c.crypticity >= CRYPTICITY_THRESHOLD)
+
+    def test_constitutive_pocket_not_cryptic(self):
+        """A pocket already fully formed in the apo conformer has opening 0, so
+        crypticity 0, so it is not cryptic - regardless of persistence."""
+        pockets = [[_make_pocket((0.0, 0.0, 0.0), conformer_idx=i)] for i in range(10)]
+        clusters = cluster_pockets(pockets, n_conformers=10)
+        assert clusters[0].crypticity == pytest.approx(0.0)
+        assert clusters[0].cryptic is False
+
+    def test_cryptic_flag_matches_report_count(self):
+        """The per-pocket flag and the report's n_cryptic_pockets never diverge:
+        both are the same boolean. This is the regression guard for the bug where
+        one used persistence < 0.9 and the other crypticity >= 0.3."""
+        pockets = [[]] + [[_make_pocket((0.0, 0.0, 0.0), conformer_idx=i)] for i in range(1, 6)]
+        pockets += [[_make_pocket((30.0, 30.0, 30.0), conformer_idx=i)] for i in range(6)]
+        clusters = cluster_pockets(pockets, n_conformers=6)
+        for c in clusters:
+            assert c.cryptic == (c.crypticity >= CRYPTICITY_THRESHOLD)
+
+    def test_ranked_by_druggability(self):
+        """Higher-druggability pocket should rank first."""
+        p_high = _make_pocket((0.0, 0.0, 0.0), conformer_idx=0)   # enclosure=0.5
+        p_low  = _make_pocket((50.0, 0.0, 0.0), conformer_idx=0)  # same enclosure, different location
+        clusters = cluster_pockets([[p_high, p_low]], n_conformers=1)
+        assert len(clusters) == 2
+        assert clusters[0].druggability >= clusters[1].druggability
+
+    def test_empty_input_returns_empty(self):
+        clusters = cluster_pockets([[], [], []], n_conformers=3)
+        assert clusters == []
+
+    def test_rank_assigned_sequentially(self):
+        pockets = [[_make_pocket((float(i * 30), 0.0, 0.0), conformer_idx=0)] for i in range(5)]
+        clusters = cluster_pockets(pockets, n_conformers=1)
+        for i, c in enumerate(clusters):
+            assert c.rank == i + 1
+
+    def test_lining_residues_aggregated(self):
+        """Merged cluster should contain lining residues from all conformers."""
+        p1 = _make_pocket((0.0, 0.0, 0.0), conformer_idx=0, lining=["ALA1:A"])
+        p2 = _make_pocket((1.0, 0.0, 0.0), conformer_idx=1, lining=["GLY2:A"])
+        clusters = cluster_pockets([[p1], [p2]], n_conformers=2)
+        assert len(clusters) == 1
+        assert "ALA1:A" in clusters[0].lining_residues or "GLY2:A" in clusters[0].lining_residues
+
+
+class TestComputeCrypticity:
+    def test_absent_in_apo_is_maximally_cryptic(self):
+        """A pocket absent in the apo state scores crypticity == druggability-when-open."""
+        assert compute_crypticity(apo_volume=0.0, max_volume=300.0,
+                                  max_druggability=0.8) == pytest.approx(0.8)
+
+    def test_constitutive_pocket_is_not_cryptic(self):
+        """A pocket the same size in apo and open states is not cryptic."""
+        assert compute_crypticity(apo_volume=300.0, max_volume=300.0,
+                                  max_druggability=0.9) == 0.0
+
+    def test_partial_opening(self):
+        """Half-opening yields half-weighted crypticity."""
+        # opening = (300-150)/300 = 0.5 -> crypticity = 0.5 * 0.6 = 0.3
+        assert compute_crypticity(apo_volume=150.0, max_volume=300.0,
+                                  max_druggability=0.6) == pytest.approx(0.3)
+
+    def test_zero_volume_is_safe(self):
+        assert compute_crypticity(apo_volume=0.0, max_volume=0.0,
+                                  max_druggability=0.5) == 0.0
+
+
+class TestCrypticityIntegration:
+    def _scenario(self):
+        """Constitutive pocket C (always open) + cryptic pocket X (absent in apo)."""
+        constitutive = [
+            [_make_pocket((0.0, 0.0, 0.0), volume=300.0, conformer_idx=i)]
+            for i in range(4)
+        ]
+        # X absent from conformer 0, appears in 1,2,3
+        cryptic = [[],
+                   [_make_pocket((40.0, 0.0, 0.0), volume=300.0, conformer_idx=1)],
+                   [_make_pocket((40.0, 0.0, 0.0), volume=300.0, conformer_idx=2)],
+                   [_make_pocket((40.0, 0.0, 0.0), volume=300.0, conformer_idx=3)]]
+        pocket_lists = [constitutive[i] + cryptic[i] for i in range(4)]
+        return pocket_lists
+
+    def _by_centroid(self, clusters, x):
+        return next(c for c in clusters if abs(c.centroid[0] - x) < 1.0)
+
+    def test_cryptic_pocket_has_higher_crypticity(self):
+        clusters = cluster_pockets(self._scenario(), n_conformers=4)
+        C = self._by_centroid(clusters, 0.0)
+        X = self._by_centroid(clusters, 40.0)
+        assert X.crypticity > C.crypticity
+        assert C.crypticity == 0.0  # constitutive
+        assert X.apo_volume_a3 == 0.0  # absent in apo
+
+    def test_crypticity_ranking_surfaces_cryptic_first(self):
+        clusters = cluster_pockets(self._scenario(), n_conformers=4, rank_by="crypticity")
+        assert abs(clusters[0].centroid[0] - 40.0) < 1.0  # X ranks first
+
+    def test_balanced_ranking_favors_persistent(self):
+        clusters = cluster_pockets(self._scenario(), n_conformers=4, rank_by="balanced")
+        assert abs(clusters[0].centroid[0] - 0.0) < 1.0  # constitutive C ranks first
+
+    def test_volume_dynamics_recorded(self):
+        clusters = cluster_pockets(self._scenario(), n_conformers=4)
+        for c in clusters:
+            assert c.volume_min_a3 <= c.volume_a3 <= c.volume_max_a3
+            assert c.max_druggability >= c.druggability - 1e-9
+
+    def test_invalid_rank_by_raises(self):
+        with pytest.raises(ValueError):
+            cluster_pockets(self._scenario(), n_conformers=4, rank_by="nonsense")
+
+
+class TestLearnedRanker:
+    """The fitted linear ranker used by ``rank_by="learned"``."""
+
+    def test_feature_vector_covers_the_scored_subset_and_is_finite(self):
+        """ranker_features returns a superset: every scored feature must be present
+        (a missing one would silently corrupt the score), and all values finite."""
+        p = _make_pocket((0.0, 0.0, 0.0))
+        c = cluster_pockets([[p]], n_conformers=1)[0]
+        feats = ranker_features(c)
+        assert set(_RANKER_FEATURES) <= set(feats)
+        assert all(np.isfinite(v) for v in feats.values()), feats
+
+    def test_candidate_geometry_features_are_exposed(self):
+        """The detector's geometric descriptors must reach the ranker layer, or
+        train_ranker.py cannot evaluate them."""
+        p = _make_pocket((0.0, 0.0, 0.0))
+        c = cluster_pockets([[p]], n_conformers=1)[0]
+        feats = ranker_features(c)
+        for name in ("bur_raw", "depth", "mouth", "elong", "dcen", "centroid_std"):
+            assert name in feats
+
+    def test_centroid_std_tracks_spatial_scatter(self):
+        """A site detected at the same place every conformer is stable; one that
+        moves is not. This is the ensemble-native signal."""
+        steady = [_make_pocket((0.0, 0.0, 0.0), conformer_idx=i) for i in range(4)]
+        drifty = [_make_pocket((float(i) * 1.2, 0.0, 0.0), conformer_idx=i) for i in range(4)]
+        c_steady = cluster_pockets([[p] for p in steady], n_conformers=4)[0]
+        c_drifty = cluster_pockets([[p] for p in drifty], n_conformers=4)[0]
+        assert ranker_features(c_steady)["centroid_std"] == pytest.approx(0.0)
+        assert ranker_features(c_drifty)["centroid_std"] > 0.5
+
+    def test_weights_align_with_features(self):
+        assert len(_RANKER_WEIGHTS) == len(_RANKER_FEATURES)
+
+    def test_score_matches_manual_dot_product(self):
+        """The score must be exactly intercept + w . x on raw features."""
+        p = _make_pocket((0.0, 0.0, 0.0))
+        c = cluster_pockets([[p]], n_conformers=1)[0]
+        feats = ranker_features(c)
+        expected = _RANKER_INTERCEPT + sum(
+            w * feats[name] for name, w in zip(_RANKER_FEATURES, _RANKER_WEIGHTS)
+        )
+        assert learned_score(c) == pytest.approx(expected)
+
+    def test_learned_ranking_is_deterministic(self):
+        """Same input must give the same order every time (committee requirement)."""
+        pockets = [
+            [_make_pocket((0.0, 0.0, 0.0), volume=300.0, conformer_idx=i) for i in range(1)]
+            + [_make_pocket((40.0, 0.0, 0.0), volume=150.0, conformer_idx=0)]
+        ]
+        first = [c.centroid for c in cluster_pockets(pockets, 1, rank_by="learned")]
+        for _ in range(3):
+            again = [c.centroid for c in cluster_pockets(pockets, 1, rank_by="learned")]
+            assert again == first
+
+    def test_learned_is_the_default_strategy(self):
+        """The default must stay 'learned': it roughly doubles recovery over the
+        analytic rules on the held-out CryptoBench test fold."""
+        from lacuna.pockets.clusterer import _DEFAULT_RANK_BY
+        assert _DEFAULT_RANK_BY == "learned"
+        p = _make_pocket((0.0, 0.0, 0.0))
+        default_order = [c.centroid for c in cluster_pockets([[p]], n_conformers=1)]
+        explicit = [c.centroid for c in
+                    cluster_pockets([[p]], n_conformers=1, rank_by="learned")]
+        assert default_order == explicit
+
+    def test_learned_is_a_valid_strategy(self):
+        assert "learned" in RANK_STRATEGIES
+        p = _make_pocket((0.0, 0.0, 0.0))
+        clusters = cluster_pockets([[p]], n_conformers=1, rank_by="learned")
+        assert clusters and clusters[0].rank == 1
+
+    def test_learned_ranking_reorders_versus_crypticity(self):
+        """The learned score must be able to disagree with crypticity, otherwise
+        it could not have doubled recovery on the benchmark."""
+        big_constitutive = [
+            _make_pocket((0.0, 0.0, 0.0), volume=800.0, conformer_idx=i,
+                         lining=[f"ALA{i}:A" for i in range(40)])
+            for i in range(4)
+        ]
+        small_cryptic = [_make_pocket((40.0, 0.0, 0.0), volume=180.0, conformer_idx=3,
+                                      lining=["TRP9:A", "PHE10:A"])]
+        lists = [[big_constitutive[0], ], [big_constitutive[1]], [big_constitutive[2]],
+                 [big_constitutive[3], small_cryptic[0]]]
+        by_cryp = cluster_pockets(lists, 4, rank_by="crypticity")
+        by_learned = cluster_pockets(lists, 4, rank_by="learned")
+        # Both orders are valid rankings of the same clusters.
+        assert {c.centroid for c in by_cryp} == {c.centroid for c in by_learned}
+        assert all(c.rank == i + 1 for i, c in enumerate(by_learned))
+
+
+class TestConsensusLining:
+    """A cluster's lining is a majority vote over the conformers it appears in.
+
+    The rule this replaced counted MEMBER POCKETS against a threshold of
+    `len(conformer_set) * 0.5`, two different units, and because the count is an
+    integer the real bar was `ceil(C/2)` member pockets. That is not a 50%
+    consensus at small C: at C = 1 nothing is filtered, and at C = 2 the bar is
+    one member, so the result is the UNION of both, strictly larger than either.
+    Clusters at C <= 2 are 36% of all clusters.
+    """
+
+    @staticmethod
+    def _cluster(linings):
+        """One cluster from co-located pockets, one per conformer."""
+        from lacuna.pockets.clusterer import cluster_pockets as cp
+        pockets = [
+            _make_pocket((0.0, 0.1 * i, 0.0), conformer_idx=i, lining=lin)
+            for i, lin in enumerate(linings)
+        ]
+        clusters = cp([[p] for p in pockets], n_conformers=len(pockets))
+        assert len(clusters) == 1, "fixture must produce a single cluster"
+        return clusters[0]
+
+    def test_two_conformers_intersect_rather_than_union(self):
+        """The bug, directly. Shared residues only, not everything either saw."""
+        c = self._cluster([["ALA1:A", "GLY2:A", "SER3:A"],
+                           ["GLY2:A", "SER3:A", "THR4:A"]])
+        assert c.lining_residues == ["GLY2:A", "SER3:A"]
+
+    def test_single_conformer_keeps_its_own_residues(self):
+        """With one member there is nothing to take a majority over."""
+        c = self._cluster([["ALA1:A", "GLY2:A", "SER3:A"]])
+        assert c.lining_residues == ["ALA1:A", "GLY2:A", "SER3:A"]
+
+    def test_three_conformers_need_two(self):
+        c = self._cluster([["ALA1:A", "GLY2:A"],
+                           ["ALA1:A", "SER3:A"],
+                           ["ALA1:A", "GLY2:A"]])
+        # ALA1 in 3, GLY2 in 2, SER3 in 1.
+        assert c.lining_residues == ["ALA1:A", "GLY2:A"]
+
+    def test_four_conformers_need_three(self):
+        """A strict majority, so an even split does not carry."""
+        c = self._cluster([["ALA1:A", "GLY2:A"], ["ALA1:A", "GLY2:A"],
+                           ["ALA1:A", "SER3:A"], ["ALA1:A", "SER3:A"]])
+        # ALA1 in 4, GLY2 in 2 of 4, SER3 in 2 of 4: neither half carries.
+        assert c.lining_residues == ["ALA1:A"]
+
+    def test_a_conformer_does_not_vote_twice(self):
+        """One conformer can contribute several member pockets to a cluster.
+
+        Counting member pockets lets a single conformer carry a residue over the
+        bar on its own, which is what the old numerator did.
+        """
+        from lacuna.pockets.clusterer import cluster_pockets as cp
+        # Conformer 0 contributes two nearby pockets, conformer 1 one.
+        a = _make_pocket((0.0, 0.0, 0.0), conformer_idx=0,
+                         lining=["ALA1:A", "GLY2:A"])
+        b = _make_pocket((1.0, 0.0, 0.0), conformer_idx=0,
+                         lining=["ALA1:A", "GLY2:A"])
+        d = _make_pocket((0.5, 0.0, 0.0), conformer_idx=1, lining=["ALA1:A"])
+        clusters = cp([[a, b], [d]], n_conformers=2)
+        assert len(clusters) == 1
+        # GLY2 was seen by one conformer of two, so it must not reach a majority
+        # even though two member pockets carried it.
+        assert clusters[0].lining_residues == ["ALA1:A"]
+
+    def test_never_returns_an_empty_lining(self):
+        """A site with no residues cannot be scored, docked or read."""
+        c = self._cluster([["ALA1:A"], ["GLY2:A"], ["SER3:A"], ["THR4:A"]])
+        # Every residue is in 1 of 4 conformers, so no majority exists; the
+        # fallback keeps the residues the members agree on most.
+        assert c.lining_residues
+        assert len(c.lining_residues) == 4
+
+    def test_the_old_rule_is_still_reachable(self):
+        """Kept so the change can be measured, and reverted if it has to be."""
+        from lacuna.pockets import clusterer as cl
+        try:
+            cl.CONSENSUS_STRICT_MAJORITY = False
+            c = self._cluster([["ALA1:A", "GLY2:A", "SER3:A"],
+                               ["GLY2:A", "SER3:A", "THR4:A"]])
+            # The old bar at C = 2 was one member pocket, i.e. the union.
+            assert c.lining_residues == ["ALA1:A", "GLY2:A", "SER3:A", "THR4:A"]
+        finally:
+            cl.CONSENSUS_STRICT_MAJORITY = True

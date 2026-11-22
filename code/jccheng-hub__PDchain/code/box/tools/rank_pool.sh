@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+pixiroot="$PIXI_PROJECT_ROOT"
+pixitoml="$pixiroot/pixi.toml"
+pixirun="pixi run -m $pixitoml -e"
+[[ -n $pixiroot ]] || {
+    echo 'Need $PIXI_PROJECT_ROOT to be defined.' >&2
+    exit 1
+}
+
+usage () { cat << EOF
+Usage: rank_pool METRIC... --indir [str]
+Rank designs in pool using specified metrics.
+
+Ranking algorithm:
+1.  Make an ordered list of each metric
+2.  Track the worst designs on each list, then remove them from each list
+3.  Repeat tracking / elimination until no designs are left
+4.  Reverse the order of eliminated designs for a ranked list
+
+Parameters:
+    METRIC                  Metric string
+                            Needs to have the format of min:metric, max:metric,
+                            val:metric=ideal_val, abv:metric=cutoff,
+                            blw:metric=cutoff.
+                            abv and blw are used for direct filtering.
+                            min, max, and val are used for ranking.
+                            E.g. min:fin_total_energy_per_res
+                            E.g. max:protein_mpnn_confidence
+                            E.g. val:dsasa=0.75
+
+Options:
+  --indir [str]             Input directory of designs
+  --perc [float]            Target top percent
+  --num [int]               Target top number (overrides --perc)
+  --num_eval [int]          Target top number for metric evalulation
+                            Default to --perc or --num if not specified
+  --outdir [str]            Path to output directory to store passed designs
+  --outfile [str]           Path to output text file listing passed designs
+                            If invoked, will not copy passed designs into output
+                            directory (i.e. --outdir is ignored)
+  --inplace                 Will archive away failed designs in input directory
+  --help                    Display this help and exit
+EOF
+}
+
+# >>> Defaults >>> {{{
+args=($(echo $0 $@ | sed "s/--.*//"))
+opts=($(echo $0 $@ | sed "s/--/\n--/" | sed "1d"))
+optchk () {
+    [[ " ${opts[*]} " =~ " $1 " ]] && echo 1 || echo 0
+}
+optarg () {
+    sed "s/--/\n--/g" <<< "${opts[*]}" |
+    sed -n "1,/^$1 /s/^$1 //p" | sed 's/ \+$//'
+}
+
+val_opts=(
+    indir               num                 num_eval            outdir
+    outfile             perc
+)
+
+bool_opts=(
+    help                inplace                                 
+)
+
+indir="REQUIRED"
+outdir="ranked"
+perc="1"
+
+default_vals () {
+    [[ ${#val_opts[@]} -ge 1 ]] && {
+        echo -e "\nDefaults:"
+        for opt in ${val_opts[@]} ; do
+            [[ -n ${!opt} ]] && echo "  --${opt} ${!opt}" || echo "  --${opt} NONE"
+        done | sort | xargs printf "  %-19s %-19s %-19s %-s\n"
+    }
+    [[ ${#bool_opts[@]} -ge 1 ]] && {
+        echo -e "\nFlags:"
+        sed 's/ /\n/g' <<< "${bool_opts[@]}" |
+        sed 's/^/--/g' | xargs printf "  %-39s %-s\n"
+    }
+}
+
+all_opts=()
+for opt in ${bool_opts[@]} ; do
+    [[ $(optchk --$opt) == 1 ]] && all_opts+=(--$opt)
+    declare "$opt=$(optchk --$opt)"
+done
+for opt in ${val_opts[@]} ; do
+    val=$(optarg --${opt})
+    [[ -n $val ]] && declare "$opt=$val"
+    [[ ${!opt} == REQUIRED ]] && help="1"
+    [[ -n ${!opt} ]] && all_opts+=(--$opt ${!opt})
+done
+[[ $((${#args[@]}-1)) -lt 1 ]] && help="1"
+[[ $help == 1 ]] && { usage ; default_vals ; exit ;}
+# <<< Defaults <<< }}}
+
+# Input arguments
+mets=(${args[@]:1})
+if [[ ! -d $indir ]] ; then
+    echo "$indir is not a directory!" && exit
+elif [[ $(echo $indir/*.pdb | sed '/*/d' | wc -w) == 0 ]] ; then
+    echo "$indir doesn't contain any PDBs!" && exit
+fi
+
+# Output list of available metrics
+[[ -z ${mets[*]} ]] && {
+    gawk '
+        $1~/^[a-z]/ {
+            met[$1]++
+            max = met[$1]>max ? max=met[$1] : max
+            sum[$1]+=$2
+            val[$1][met[$1]] = $2
+        }
+
+        END {
+            print "List of metrics + averages + sd:"
+            for (i in met) if (met[i]==max) {
+                printf "%-28s%-12s%s\n", i, sum[i] / max, get_sd(val[i])
+            }
+        }
+
+        function get_sd(v,    key, mean, n, std) {
+            for (key in v) { mean += v[key] ; n++ }
+            mean = mean / n
+            for (key in v) {
+                std += (v[key] - mean) * (v[key] - mean)
+            }
+            return sqrt(std / n)
+        }
+    ' $indir/*.pdb ; exit
+}
+
+# Check for metrics formatting
+fmt_check=$(sed 's/ /\n/g' <<< "${mets[*]}" | gawk -F ':' '
+    $1~/^(min|max|val|abv|blw)$/{i++} END {if (i==NR) {print 1} else {print 0}}'
+)
+
+# Report inputs
+if [[ $fmt_check == 1 ]] ; then
+    echo "Using the following metrics for $indir/*.pdb"
+    sed 's/ /\n/g' <<< "${mets[*]}" | gawk -F ':' '{printf "%-32s%s\n", $2, $1}'
+else
+    echo "All metrics provided must follow the format of max:metric, min:metric, or val:metric=ideal_val"
+    exit
+fi
+
+# Initialize
+tmpdir=$(mktemp -d ${TMPDIR:-/tmp}/tmp_${USER}_XXXXXX) ; trap 'rm -r $tmpdir' EXIT
+
+# Filter input PDBs with cuts
+for met in ${mets[@]} ; do
+    met=($(echo $met | sed 's/[:|=]/ /g'))
+    if [[ ${met[0]} =~ ^abv$ && -n ${met[2]} ]] ; then
+        echo "Eliminating designs with ${met[1]} score below ${met[2]}"
+        filt+=($(
+            grep -H "^${met[1]}" $indir/*.pdb 2>/dev/null |
+            awk -v i=${met[2]} '$2<=i{print$1}' | cut -d: -f1
+        ))
+    elif [[ ${met[0]} =~ ^blw$ ]] ; then
+        echo "Eliminating designs with ${met[1]} score above ${met[2]}"
+        filt+=($(
+            grep -H "^${met[1]}" $indir/*.pdb 2>/dev/null |
+            awk -v i=${met[2]} '$2>=i{print$1}' | cut -d: -f1
+        ))
+    fi
+    unset met
+done
+
+# If input PDBs were filtered out, then remove the filtered PDBs from rankings
+pass=($indir/*.pdb)
+[[ -n $filt ]] && {
+    filt=($(echo ${filt[@]} | sed 's| |\n|g' | sort -u))
+    echo "The following designs were filtered out: ${filt[@]}"
+    newpass=($(
+        echo ${pass[@]} ${filt[@]} | sed 's| |\n|g' | sort | uniq -u
+    ))
+    if [[ ${#newpass} == 0 ]] ; then
+        echo "There are no designs left after filtering..."
+        echo "Defaulting to original input list."
+    else
+        unset pass
+        pass=(${newpass[@]})
+    fi
+}
+
+# Get metrics
+for met in ${mets[@]} ; do
+    met=($(echo $met | sed 's/[:|=]/ /g'))
+    if [[ ${met[0]} =~ ^min$ ]] ; then
+        echo "Generating ascending sorted list for ${met[1]}..."
+        grep -H "^${met[1]} " ${pass[@]} 2>/dev/null | sort -k2,2n -k1R |
+        sed 's/:/ /' > $tmpdir/${met[1]}.txt
+    elif [[ ${met[0]} =~ ^max$ ]] ; then
+        echo "Generating descending sorted list for ${met[1]}..."
+        grep -H "^${met[1]} " ${pass[@]} 2>/dev/null | sort -k2,2rn -k1R |
+        sed 's/:/ /' > $tmpdir/${met[1]}.txt
+    elif [[ ${met[0]} =~ ^val$ ]] ; then
+        [[ -z ${met[2]} ]] && {
+            echo "Ideal value for ${met[1]} not provided. Omitting this metric!" ; continue
+        }
+        echo "Generating ascending sorted list for abs(${met[1]} - ${met[2]}) ..."
+        grep -H "^${met[1]} " ${pass[@]} 2>/dev/null | awk -v idval=${met[2]} '
+            function abs(x) { return x < 0 ? -x : x }
+            { print $1 "_dev_from_" idval, abs(idval-$2) }
+        ' | sort -k2,2n -k1R | sed 's/:/ /' > ${tmpdir}/${met[1]}.txt
+    elif [[ ${met[0]} =~ ^abv|blw$ ]] ; then
+        continue
+    fi
+
+    # Trim out files
+    [[ -s $tmpdir/${met[1]}.txt ]] || {
+        echo "Metric ${met[1]} not found in input PDBs... Omitting this metric!"
+        rm $tmpdir/${met[1]}.txt
+    }
+
+    # Ignore metric if best and worst values are identical
+    awk 'NR==1 {best=$NF} {worst=$NF} END { if (NR>10 && best==worst) exit 1 }' $tmpdir/${met[1]}.txt || {
+        echo "The best and worst values for ${met[1]} are identical... Omitting this metric!"
+        rm $tmpdir/${met[1]}.txt
+    }
+
+    unset met
+done
+
+# Get threshold
+totnum=${#pass[@]}
+topnum=$(awk 'BEGIN{printf "%.0f", ('"$perc * $totnum * 0.01"')}')
+[[ -n $num ]] && topnum=$num
+[[ -z $num_eval ]] && num_eval=$topnum
+echo "Threshold: $topnum / $totnum"
+
+gawk -v topnum=$topnum -v ranked="$tmpdir/ranked.txt" '
+{ dt[FILENAME][FNR]["pdb"] = $1 ; dt[FILENAME][FNR]["val"] = $3 } END {
+    lim = FNR ; metcount = length(dt)
+    while (lim > 0) {
+        for (txt in dt) {
+            pdb = dt[txt][lim]["pdb"]
+            if ( !(pdb in elimkey) ) {
+                elimkey[pdb] = 1 ; elim[++f] = pdb
+            }
+        }
+
+        # Record max line
+        if (!maxlim && topnum > FNR - f) maxlim = lim
+
+        # Break loop if all designs were eliminated
+        if (f == FNR) { break } else { lim-- }
+    }
+    print "Max percentile: " 100 * maxlim / FNR
+
+    # Reverse elimination list to give ranked list
+    for (i=f; i>=1; i--) print elim[i] >> ranked
+}
+' $tmpdir/*.txt
+
+# Append the filtered to ranked list
+[[ -n $filt && ${#newpass} != 0 ]] && {
+    echo ${filt[@]} | sed 's| |\n|g' >> $tmpdir/ranked.txt
+}
+
+# Output
+calc_pool_metrics () {
+    # Calculate metrics (avg, sd) for input rankfile's top designs
+    # $1: path to rankfile that lists the paths to all designs
+    local rankfile=$1 topnum=$num_eval totnum=$totnum
+    local bnmet=$(
+        echo ${mets[@]} | sed 's/ /\n/g' |
+        sed -e 's/^.*://' -e 's/=.*$//' | paste -sd ' '
+    )
+    local topdes=$(head -n$totnum $rankfile | paste -sd ' ')
+    awk -v topnum="$topnum" '
+    $1 ~ /^('"${bnmet// /|}"')$/ && check[FILENAME][$1] == "" {
+        check[FILENAME][$1] = 1
+        s[$1]+=$2 ; n[$1]++
+
+        if (n_top[$1] >= topnum + 0) next
+        s_top[$1]+=$2 ; n_top[$1]++
+    }
+
+    END {
+        print "metric avg_top avg_all"
+        for (met in s) {
+            if (n[met]=="" || n_top[met]=="") continue
+            print met, s_top[met] / n_top[met], s[met] / n[met]
+        }
+    }
+    ' $topdes
+}
+
+if [[ -n $outfile ]] ; then
+    outfiledir=$(dirname $outfile)
+    mkdir -p $outfiledir
+    sed 's|^.*/||' $tmpdir/ranked.txt > $outfile
+    echo "${mets[@]}" | sed 's/ /\n/g' > $outfiledir/ranked_metrics.txt
+    tmpdat=$(calc_pool_metrics $tmpdir/ranked.txt)
+    echo "$tmpdat" > $outfiledir/ranked_avg.txt
+    echo "Ranked list (best to worst) saved to $outfile"
+elif [[ $inplace == 1 ]] ; then
+    sed 's|^.*/||' $tmpdir/ranked.txt > $indir/ranked.txt
+    echo "${mets[@]}" | sed 's/ /\n/g' > $indir/ranked_metrics.txt
+    tmpdat=$(calc_pool_metrics $tmpdir/ranked.txt)
+    echo "$tmpdat" > $indir/ranked_avg.txt
+
+    tormv=($(gawk -v topnum=$topnum 'FNR > topnum' $tmpdir/ranked.txt))
+    if [[ -n $tormv ]] ; then
+        mkdir -p $indir/archive
+        if [[ $(echo $indir/*.pdb | wc -w) -gt $topnum ]] ; then
+            mv ${tormv[@]} $indir/archive
+            echo "Archived away ${#tormv[@]} failed designs"
+        else
+            echo "Number of designs in $indir is below threshold of $topnum"
+            echo "No designs were archived"
+        fi
+    else
+        echo "No designs were archived"
+    fi
+    echo "Ranked list (best to worst) saved to $indir/ranked.txt"
+else
+    mkdir -p $outdir
+    sed 's|^.*/||' $tmpdir/ranked.txt > $outdir/ranked.txt
+    echo "${mets[@]}" | sed 's/ /\n/g' > $outdir/ranked_metrics.txt
+    tmpdat=$(calc_pool_metrics $tmpdir/ranked.txt)
+    echo "$tmpdat" > $outdir/ranked_avg.txt
+    cp $(head -n $topnum $tmpdir/ranked.txt) $outdir
+    echo "Transferred top $topnum designs to $outdir"
+    echo "Ranked list (best to worst) saved to $outdir/ranked.txt"
+fi

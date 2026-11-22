@@ -1,0 +1,55 @@
+name: Windows physical capacity and launch controls
+on:
+  workflow_dispatch:
+  push:
+    paths: &windows_capacity_paths
+      - "install.ps1"
+      - "scripts/opendde.ps1"
+      - "tests/test_windows_installer.ps1"
+      - "tests/test_windows_launch_capacity.ps1"
+      - ".github/workflows/windows-capacity-checks.yml"
+  pull_request:
+    paths: *windows_capacity_paths
+permissions:
+  contents: read
+jobs:
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  installer-network-boundary:
+    needs: utility-scope
+    if: >-
+      needs.utility-scope.outputs.sequence_desktop_only != 'true' &&
+      needs.utility-scope.outputs.simulation_desktop_only != 'true' &&
+      needs.utility-scope.outputs.del_desktop_only != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Explicit installer networking cannot change scientific execution or offline builds
+        run: uv run --locked pytest -q tests/test_install_network.py
+  windows-entry:
+    needs: utility-scope
+    if: >-
+      needs.utility-scope.outputs.sequence_desktop_only != 'true' &&
+      needs.utility-scope.outputs.simulation_desktop_only != 'true' &&
+      needs.utility-scope.outputs.del_desktop_only != 'true'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installation drive and registered backing drive before any WSL boot or download
+        shell: pwsh
+        run: ./tests/test_windows_installer.ps1
+      - name: Case-insensitive start commands and offline close/status without booting WSL
+        shell: pwsh
+        run: ./tests/test_windows_launch_capacity.ps1

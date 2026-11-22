@@ -1,0 +1,3370 @@
+import csv
+import hashlib
+import io
+import json
+import math
+import os
+import re
+import sys
+import tempfile
+from collections import OrderedDict
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from scipy.stats import rankdata
+
+from csubst import ete
+from csubst import foreground
+from csubst import parallel
+from csubst import parser_misc
+from csubst import randomness
+from csubst import runtime
+from csubst import scan_endpoint
+from csubst import scan_permutation
+from csubst import sequence
+from csubst import scan_statistics
+from csubst import substitution
+from csubst import trait_ctmc
+from csubst import site_storage
+
+
+class _CandidateCache:
+    """A bounded cache owned by one immutable scan fit or one worker chunk."""
+
+    def __init__(self, max_bytes=32 * 1024**2, max_items=4096):
+        self.max_bytes, self.max_items = max_bytes, max_items
+        self.entries = OrderedDict()
+        self.nbytes = 0
+
+    def obtain(self, key, build, size_of):
+        if key in self.entries:
+            self.entries.move_to_end(key)
+            return self.entries[key][0]
+        value = build()
+        size = size_of(value)
+        if size <= self.max_bytes:
+            while self.entries and (self.nbytes + size > self.max_bytes or len(self.entries) >= self.max_items):
+                self.nbytes -= self.entries.popitem(last=False)[1][1]
+            self.entries[key] = (value, size)
+            self.nbytes += size
+        return value
+
+
+def _scan_candidate_cache(scan_static, name):
+    if scan_static is None or not scan_static.get('_cache_candidates', True):
+        return None
+    if name not in scan_static:
+        scan_static[name] = _CandidateCache()
+    return scan_static[name]
+
+
+class _PosteriorBranchValues:
+    """Read-only, branch-indexed mass for private fixed-candidate scoring."""
+
+    __slots__ = ('values',)
+
+    def __init__(self, frame, num_branch):
+        self.values = np.zeros(num_branch, dtype=np.float64)
+        self.values[frame['branch_id'].to_numpy(dtype=np.int64)] = frame['event_pp'].fillna(0).to_numpy(dtype=np.float64)
+        self.values.flags.writeable = False
+
+    @property
+    def nbytes(self):
+        return sys.getsizeof(self.values) + sys.getsizeof(self)
+
+    def select(self, branch_ids):
+        valid = (branch_ids >= 0) & (branch_ids < len(self.values))
+        values = np.zeros(len(branch_ids), dtype=np.float64)
+        values[valid] = self.values[branch_ids[valid]]
+        return values
+
+
+_POSTERIOR_VECTOR_OVERHEAD = (sys.getsizeof(np.empty(0, dtype=np.float64))
+                              + sys.getsizeof(object.__new__(_PosteriorBranchValues)))
+
+
+def _cached_posterior_events(scan_static, sub_tensor, site, from_ids, to_ids, float_tol, *, branch_values=False):
+    projection = scan_static.get('rate_event_projection') if scan_static is not None else None
+    def build():
+        return extract_candidate_posterior_events(sub_tensor, site, from_ids, to_ids, float_tol, projection)
+    cache = _scan_candidate_cache(scan_static, '_event_cache')
+    if cache is None:
+        return build()
+    key = (id(sub_tensor), int(site), tuple(from_ids), tuple(to_ids), float_tol, id(projection))
+    # A dense vector is useful only if it fits the existing cache budget.
+    # Public/discovery callers continue to receive the historical DataFrame.
+    if branch_values and int(sub_tensor.shape[0]) * 8 + _POSTERIOR_VECTOR_OVERHEAD <= cache.max_bytes:
+        return cache.obtain(('branch_values',) + key,
+                            lambda: _PosteriorBranchValues(build(), int(sub_tensor.shape[0])),
+                            lambda value: value.nbytes)
+    return cache.obtain(key, build, lambda frame: int(frame.memory_usage(index=True, deep=True).sum()))
+
+
+SCAN_MATCHES = (
+    "any2any",
+    "any2spe",
+    "any2dif",
+    "spe2any",
+    "spe2spe",
+    "spe2dif",
+    "dif2any",
+    "dif2spe",
+    "dif2dif",
+)
+
+SCAN_RATE_EVENT_MODES = ("called", "posterior_sum")
+SCAN_RATE_EXPOSURES = ("q_weighted", "state_aware", "raw_branch_length", "endpoint")
+SCAN_OTHER_SCOPES = ("all", "sister")
+SCAN_PVALUE_CALIBRATIONS = ("none", "candidate_fixed", "full_scan", "parametric_bootstrap", "parametric")
+SCAN_UNIT_MODES = ("lineage", "stem", "clade")
+
+
+SCAN_OUTPUT_COLUMNS = (
+    "scan_id",
+    "trait",
+    "target_class",
+    "scan_match",
+    "site",
+    "nonsyn_recode",
+    "from_state",
+    "to_state",
+    "from_state_ids",
+    "to_state_ids",
+    "observed_from_state_ids",
+    "observed_to_state_ids",
+    "from_state_distribution",
+    "to_state_distribution",
+    "state_change",
+    "candidate_event_pp_sum",
+    "candidate_event_mass_sum",
+    "scan_event_threshold",
+    "scan_event_units",
+    "support_mass_sum",
+    "support_mass_mean",
+    "scan_unit_mode",
+    "scan_min_support_count",
+    "scan_min_event_pp",
+    "scan_rate_length_used",
+    "scan_rate_exposure",
+    "scan_exposure_units",
+    "scan_endpoint_model",
+    "scan_observation_method",
+    "scan_inference_method",
+    "rate_status",
+    "scan_rate_event_mode",
+    "scan_other_scope",
+    "scan_pvalue_calibration",
+    "scan_n_permutations",
+    "scan_permutation_seed",
+    "scan_permutation_backend",
+    "scan_permutation_n_jobs",
+    "scan_permutation_success_count",
+    "scan_permutation_failure_count",
+    "scan_permutation_failure_reasons",
+    "scan_calibration_status",
+    "scan_calibration_null",
+    "scan_calibration_scope",
+    "scan_permutation_sampling",
+    "scan_permutation_unique_count",
+    "scan_permutation_space_size",
+    "scan_pvalue_resolution",
+    "codon_site_alignment",
+    "site_rate",
+    "site_rate_categorized",
+    "site_rate_quantile",
+    "state_all_conservation",
+    "state_all_entropy",
+    "state_all_major_state",
+    "state_all_valid_tip_count",
+    "state_bg_conservation",
+    "state_bg_entropy",
+    "state_bg_major_state",
+    "state_bg_valid_tip_count",
+    "aa_all_conservation",
+    "aa_all_entropy",
+    "aa_all_major_state",
+    "aa_all_valid_tip_count",
+    "aa_bg_conservation",
+    "aa_bg_entropy",
+    "aa_bg_major_state",
+    "aa_bg_valid_tip_count",
+    "unit_total",
+    "support_unit_count",
+    "support_fraction",
+    "support_pp_sum",
+    "support_pp_mean",
+    "support_unit_ids",
+    "support_branch_ids",
+    "lineage_total",
+    "support_lineage_count",
+    "support_lineage_fraction",
+    "support_lineage_ids",
+    "target_event_count",
+    "target_event_branch_count",
+    "target_raw_branch_length",
+    "target_sn_rescaled_length",
+    "target_n_rescaled_length",
+    "target_exposure_branch_length",
+    "target_exposure",
+    "target_zero_exposure_branch_count",
+    "target_positive_event_zero_exposure_branch_count",
+    "target_missing_exposure_branch_count",
+    "target_exposure_diagnostics",
+    "other_event_count",
+    "other_event_branch_count",
+    "other_raw_branch_length",
+    "other_sn_rescaled_length",
+    "other_n_rescaled_length",
+    "other_exposure_branch_length",
+    "other_exposure",
+    "other_zero_exposure_branch_count",
+    "other_positive_event_zero_exposure_branch_count",
+    "other_missing_exposure_branch_count",
+    "other_exposure_diagnostics",
+    "target_event_rate",
+    "other_event_rate",
+    "rate_ratio",
+    "score_rate_enrichment",
+    "scan_rate_testable",
+    "scan_rate_undefined_reason",
+    "scan_score_method",
+    "scan_event_measure",
+    "scan_inference_status",
+    "scan_bh_scope",
+    "scan_bh_family_id",
+    "scan_bh_family_size",
+    "scan_bh_valid_asymptotic_count",
+    "scan_bh_valid_empirical_count",
+    "scan_maxT_scope",
+    "scan_bootstrap_success_count",
+    "scan_bootstrap_failure_count",
+    "scan_bootstrap_directory",
+    "p_rate_enrichment_bootstrap_maxT",
+    "p_rate_enrichment_asymptotic",
+    "p_rate_enrichment_empirical",
+    "q_rate_enrichment_empirical_by_trait_match",
+    "p_rate_enrichment_empirical_maxT",
+    "q_rate_enrichment_asymptotic_by_trait_match",
+)
+
+SCAN_UNIT_COLUMNS = (
+    "trait",
+    "unit_id",
+    "unit_mode",
+    "lineage_value",
+    "stem_branch_ids",
+    "fg_leaf_names",
+    "fg_branch_ids",
+    "sister_branch_ids",
+    "fg_clade_branch_ids",
+)
+
+
+def normalize_scan_matches(value):
+    value_txt = "" if value is None else str(value).strip().lower()
+    if value_txt in ["", "all"]:
+        return list(SCAN_MATCHES)
+    out = list()
+    seen = set()
+    for token in value_txt.split(","):
+        token = token.strip().lower()
+        if token == "":
+            continue
+        if token == "all":
+            tokens = SCAN_MATCHES
+        else:
+            if token not in SCAN_MATCHES:
+                txt = "--scan_match should contain values from {}."
+                raise ValueError(txt.format(", ".join(SCAN_MATCHES)))
+            tokens = (token,)
+        for normalized in tokens:
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            out.append(normalized)
+    if len(out) == 0:
+        raise ValueError("--scan_match should contain at least one value.")
+    return out
+
+
+def normalize_scan_unit_mode(value):
+    value_txt = "clade" if value is None else str(value).strip().lower()
+    if value_txt not in SCAN_UNIT_MODES:
+        txt = "--scan_unit_mode should be one of {}."
+        raise ValueError(txt.format(", ".join(SCAN_UNIT_MODES)))
+    return value_txt
+
+
+def normalize_scan_rate_event_mode(value):
+    value_txt = "posterior_sum" if value is None else str(value).strip().lower()
+    if value_txt not in SCAN_RATE_EVENT_MODES:
+        txt = "--scan_rate_event_mode should be one of {}."
+        raise ValueError(txt.format(", ".join(SCAN_RATE_EVENT_MODES)))
+    return value_txt
+
+
+def normalize_scan_rate_exposure(value):
+    value_txt = "state_aware" if value is None else str(value).strip().lower()
+    if value_txt not in SCAN_RATE_EXPOSURES:
+        txt = "--scan_rate_exposure should be one of {}."
+        raise ValueError(txt.format(", ".join(SCAN_RATE_EXPOSURES)))
+    return value_txt
+
+
+def resolve_scan_rate_exposure(g):
+    requested = normalize_scan_rate_exposure(g.get("scan_rate_exposure", "q_weighted"))
+    if (requested == "q_weighted") and (str(g.get("nonsyn_recode", "no")).strip().lower() == "3di20"):
+        if not bool(g.get("_scan_3di_exposure_warning_emitted", False)):
+            print(
+                "Scan warning: q_weighted exposure is unavailable for 3Di states because the fitted codon Q "
+                "does not define 3Di-state transition rates; using state_aware exposure.",
+                flush=True,
+            )
+            g["_scan_3di_exposure_warning_emitted"] = True
+        return "state_aware"
+    return requested
+
+
+def normalize_scan_other_scope(value):
+    value_txt = "all" if value is None else str(value).strip().lower()
+    if value_txt not in SCAN_OTHER_SCOPES:
+        txt = "--scan_other_scope should be one of {}."
+        raise ValueError(txt.format(", ".join(SCAN_OTHER_SCOPES)))
+    return value_txt
+
+
+def normalize_scan_pvalue_calibration(value):
+    value_txt = "full_scan" if value is None else str(value).strip().lower()
+    if value_txt not in SCAN_PVALUE_CALIBRATIONS:
+        txt = "--scan_pvalue_calibration should be one of {}."
+        raise ValueError(txt.format(", ".join(SCAN_PVALUE_CALIBRATIONS)))
+    return value_txt
+
+
+def normalize_scan_n_permutations(value):
+    n_permutations = int(value)
+    if n_permutations < 0:
+        raise ValueError("--scan_n_permutations should be >= 0.")
+    return n_permutations
+
+
+def scan_event_threshold(g):
+    bridge = g.get("scan_observation") == "bridge"
+    value = float(g.get("scan_min_event_count", .5) if bridge else g.get("scan_min_event_pp", .5))
+    if not np.isfinite(value) or value < 0 or (not bridge and value > 1):
+        raise ValueError("--scan_min_event_count / --scan_min_event_pp must be finite and nonnegative; probabilities cannot exceed one.")
+    return value
+
+
+def validate_scan_configuration(g):
+    scan_event_threshold(g)
+    # The CLI resolves the common posterior switch and scan-specific override.
+    # Mark programmatic scan contexts too so shared event builders cannot take
+    # the search route while preparing/filtering scan input.
+    g['subcommand'] = 'scan'
+    if g.get("scan_observation", "marginal") != "marginal" and bool(g.get("ml_anc", False)):
+        raise ValueError("Joint/bridge scan requires --ml_anc no.")
+    observation = str(g.get("scan_observation", "marginal"))
+    if observation not in ("marginal", "joint", "bridge"):
+        raise ValueError("Unknown scan observation method.")
+    if observation != "marginal":
+        if resolve_scan_rate_exposure(g) != "endpoint":
+            raise ValueError("Joint/bridge observations require --scan_rate_exposure endpoint.")
+        if float(g.get("min_sub_pp", 0)) != 0:
+            raise ValueError("Joint/bridge observations require --min_sub_pp 0; use scan_min_event_pp for candidate selection.")
+    if g.get("scan_pvalue_calibration") == "parametric" and observation == "marginal":
+        raise ValueError("Parametric calibration requires joint or bridge observations.")
+    if resolve_scan_rate_exposure(g) == "endpoint":
+        scan_endpoint.validate_options(g)
+    # Validate discovery settings before loading ASR or taking an empty-site
+    # shortcut. An empty result must not hide invalid user input.
+    normalize_scan_matches(g.get("scan_match", "any2spe"))
+    normalize_scan_unit_mode(g.get("scan_unit_mode", "clade"))
+    normalize_scan_rate_event_mode(g.get("scan_rate_event_mode", "posterior_sum"))
+    normalize_scan_rate_exposure(g.get("scan_rate_exposure", "q_weighted"))
+    normalize_scan_other_scope(g.get("scan_other_scope", "all"))
+    _length_column(str(g.get("scan_rate_length", "n_rescaled")).strip().lower())
+    parse_scan_support_threshold(g.get("scan_min_support", "2"), total_units=0)
+    min_event_pp = float(g.get("scan_min_event_pp", 0.5))
+    if not np.isfinite(min_event_pp) or not 0 <= min_event_pp <= 1:
+        raise ValueError("--scan_min_event_pp should satisfy 0 <= value <= 1.")
+    calibration = normalize_scan_pvalue_calibration(
+        g.get("scan_pvalue_calibration", "full_scan")
+    )
+    n_permutations = normalize_scan_n_permutations(
+        g.get("scan_n_permutations", 1000)
+    )
+    if calibration == "parametric" and int(g.get("scan_permutation_seed", 1)) < 0:
+        raise ValueError("--scan_permutation_seed must be nonnegative for parametric calibration.")
+    if calibration != "none" and n_permutations == 0:
+        raise ValueError(
+            "--scan_n_permutations should be > 0 when --scan_pvalue_calibration is {}.".format(
+                calibration
+            )
+        )
+    if g.get("fg_trait_tree"):
+        if calibration != "full_scan":
+            raise ValueError("--fg_trait_tree requires --scan_pvalue_calibration full_scan.")
+        if normalize_scan_unit_mode(g.get("scan_unit_mode", "clade")) == "lineage":
+            raise ValueError("--fg_trait_tree requires --scan_unit_mode stem or clade.")
+    if calibration in ("candidate_fixed", "full_scan"):
+        if not bool(g.get("scan_permutation_sample_original", True)):
+            raise ValueError(
+                "--scan_permutation_sample_original no is not supported for calibration: "
+                "the assignment space must include the observed foreground. Use yes."
+            )
+        if bool(g.get("scan_permutation_retry_sample_original", False)):
+            raise ValueError(
+                "--scan_permutation_retry_sample_original yes is not supported: "
+                "scan calibration cannot change the assignment space after a failure. Use no."
+            )
+        if "fg_df" in g and len(g["fg_df"].columns[1:]) != 1:
+            raise ValueError(
+                "Scan calibration currently requires one trait. Multiple traits need a joint "
+                "assignment null preserving their dependence; use --scan_pvalue_calibration none "
+                "for an uncalibrated multi-trait scan."
+            )
+    filter_mode = str(g.get("scan_site_plot_filter", "all")).strip().lower()
+    allowed_filters = {"all", "analytical", "empirical", "full_scan", "parametric_bootstrap"}
+    if filter_mode not in allowed_filters:
+        raise ValueError(
+            "--scan_site_plot_filter should be one of {}.".format(
+                ", ".join(sorted(allowed_filters))
+            )
+        )
+    alpha = float(g.get("scan_site_plot_alpha", 0.05))
+    if (not np.isfinite(alpha)) or alpha < 0 or alpha > 1:
+        raise ValueError(
+            "--scan_site_plot_alpha should be a finite value between 0 and 1."
+        )
+    if filter_mode == "empirical" and calibration not in ("candidate_fixed", "full_scan"):
+        raise ValueError(
+            "--scan_site_plot_filter empirical requires --scan_pvalue_calibration "
+            "candidate_fixed or full_scan; use the full_scan plot filter for fixed-model parametric calibration."
+        )
+    if filter_mode == "full_scan" and calibration not in ("full_scan", "parametric"):
+        raise ValueError(
+            "--scan_site_plot_filter full_scan requires --scan_pvalue_calibration full_scan or parametric."
+        )
+    if filter_mode == "parametric_bootstrap" and calibration != "parametric_bootstrap":
+        raise ValueError(
+            "--scan_site_plot_filter parametric_bootstrap requires --scan_pvalue_calibration parametric_bootstrap."
+        )
+    return None
+
+
+def _resolve_scan_permutation_backend():
+    return parallel.resolve_parallel_backend()
+
+
+def _resolve_scan_permutation_n_jobs(g, n_permutations):
+    n_permutations = int(n_permutations)
+    if n_permutations <= 0:
+        return 1
+    return parallel.resolve_n_jobs(
+        num_items=n_permutations,
+        threads=int(g.get("threads", 1)),
+    )
+
+
+def parse_scan_support_threshold(value, total_units, param_name="--scan_min_support"):
+    total_units = int(total_units)
+    value_txt = str(value).strip().lower()
+    if value_txt == "":
+        raise ValueError("{} should be non-empty.".format(param_name))
+    try:
+        numeric_decimal = Decimal(value_txt)
+    except InvalidOperation as exc:
+        raise ValueError("{} should be numeric.".format(param_name)) from exc
+    numeric = float(numeric_decimal)
+    if (not numeric_decimal.is_finite()) or (not np.isfinite(numeric)):
+        raise ValueError("{} should be finite.".format(param_name))
+    if numeric < 0:
+        raise ValueError("{} should be >= 0.".format(param_name))
+    if bool(re.fullmatch(r"[+]?[0-9]+", value_txt)):
+        return int(numeric_decimal)
+    if numeric_decimal <= Decimal("1"):
+        count = (numeric_decimal * Decimal(total_units)).to_integral_value(rounding=ROUND_CEILING)
+        return int(count)
+    if numeric_decimal != numeric_decimal.to_integral_value():
+        raise ValueError("{} should be a fraction <= 1 or an integer count.".format(param_name))
+    return int(numeric_decimal)
+
+
+def _state_set_label(indices, state_orders, any_label="any", dif_label="dif"):
+    indices = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if indices.shape[0] == 0:
+        return ""
+    if indices.shape[0] == state_orders.shape[0]:
+        return any_label
+    if indices.shape[0] == 1:
+        return str(state_orders[int(indices[0])])
+    return dif_label
+
+
+def _state_distribution_label(events, col, state_orders):
+    if events.shape[0] == 0:
+        return ""
+    grouped = events.groupby(col, as_index=True)["event_pp"].sum()
+    grouped = grouped.sort_values(ascending=False)
+    parts = []
+    for idx, value in grouped.items():
+        parts.append("{}:{:.6g}".format(str(state_orders[int(idx)]), float(value)))
+    return ",".join(parts)
+
+
+def _is_sparse_sub_tensor(sub_tensor):
+    return substitution._is_sparse_sub_tensor(sub_tensor)
+
+
+def _pack_scan_tensor_for_worker(sub_tensor):
+    if isinstance(sub_tensor, np.memmap):
+        filename = getattr(sub_tensor, "filename", None)
+        if filename is not None:
+            sub_tensor.flush()
+            return {
+                "__scan_memmap__": True,
+                "filename": os.path.abspath(os.fspath(filename)),
+                "dtype": np.dtype(sub_tensor.dtype).str,
+                "shape": tuple(int(v) for v in sub_tensor.shape),
+                "offset": int(getattr(sub_tensor, "offset", 0)),
+            }
+    return sub_tensor
+
+
+def _unpack_scan_tensor_for_worker(value):
+    if not (isinstance(value, dict) and bool(value.get("__scan_memmap__", False))):
+        return value
+    return np.memmap(
+        value["filename"],
+        dtype=np.dtype(value["dtype"]),
+        mode="r",
+        shape=tuple(value["shape"]),
+        offset=int(value.get("offset", 0)),
+    )
+
+
+def _pack_scan_array_for_worker(value, name, owned_paths, min_copy_bytes=1024 * 1024):
+    packed = _pack_scan_tensor_for_worker(value)
+    if packed is not value:
+        return packed
+    if (not isinstance(value, np.ndarray)) or (int(value.nbytes) < int(min_copy_bytes)):
+        return value
+    run_tmpdir = runtime.get_run_tempdir(create=False)
+    fd, path = tempfile.mkstemp(
+        prefix="tmp.csubst.scan_worker_{}._".format(str(name)),
+        suffix=".mmap",
+        dir=run_tmpdir,
+    )
+    os.close(fd)
+    worker_memmap = np.memmap(path, dtype=value.dtype, mode="w+", shape=value.shape)
+    np.copyto(worker_memmap, value)
+    worker_memmap.flush()
+    descriptor = _pack_scan_tensor_for_worker(worker_memmap)
+    del worker_memmap
+    owned_paths.append(path)
+    return descriptor
+
+
+def _pack_scan_worker_context(g, scan_static):
+    owned_paths = []
+    worker_g = dict(g)
+    worker_g["state_nsy"] = _pack_scan_array_for_worker(
+        g.get("state_nsy", None),
+        name="state_nsy",
+        owned_paths=owned_paths,
+    )
+    q_context = dict(scan_static["q_context"])
+    state_cdn = q_context.get("state_cdn", None)
+    if state_cdn is None:
+        worker_g["state_cdn"] = None
+    else:
+        packed_state_cdn = _pack_scan_array_for_worker(
+            state_cdn,
+            name="state_cdn",
+            owned_paths=owned_paths,
+        )
+        worker_g["state_cdn"] = packed_state_cdn
+        q_context["state_cdn"] = packed_state_cdn
+    for unused_key in ["state_nuc", "state_pep", "_3di_alignment_by_branch_id", "_3di_tip_alignment_by_leaf",
+                       "scan_category_states", "scan_tip_emissions",
+                       "scan_observed_state_nsy", "scan_observed_state_pep"]:
+        worker_g.pop(unused_key, None)
+    worker_static = dict(scan_static)
+    for key in ('_event_cache', '_exposure_cache', '_fixed_candidates', '_fixed_rate_cache', '_fixed_rate_metadata'):
+        worker_static.pop(key, None)
+    endpoint_context = q_context.get("endpoint_context")
+    if endpoint_context is not None:
+        q_context["endpoint_context"] = {
+            key: _pack_scan_array_for_worker(value, name="endpoint_" + key, owned_paths=owned_paths)
+            for key, value in endpoint_context.items()
+        }
+    worker_static["q_context"] = q_context
+    worker_static["observed_site_annotations"] = {}
+    return worker_g, worker_static, owned_paths
+
+
+def _unpack_scan_worker_context(g, scan_static):
+    worker_g = dict(g)
+    worker_g["state_nsy"] = _unpack_scan_tensor_for_worker(worker_g.get("state_nsy", None))
+    worker_static = dict(scan_static)
+    for key in ('_event_cache', '_exposure_cache', '_fixed_candidates', '_fixed_rate_cache', '_fixed_rate_metadata'):
+        worker_static.pop(key, None)
+    q_context = dict(worker_static["q_context"])
+    packed_state_cdn = q_context.get("state_cdn", None)
+    if packed_state_cdn is None:
+        worker_g["state_cdn"] = None
+    else:
+        state_cdn = _unpack_scan_tensor_for_worker(packed_state_cdn)
+        worker_g["state_cdn"] = state_cdn
+        q_context["state_cdn"] = state_cdn
+    if q_context.get("endpoint_context") is not None:
+        q_context["endpoint_context"] = {
+            key: _unpack_scan_tensor_for_worker(value)
+            for key, value in q_context["endpoint_context"].items()
+        }
+    worker_static["q_context"] = q_context
+    return worker_g, worker_static
+
+
+def extract_atomic_events(sub_tensor, min_event_pp=0.5, float_tol=1e-12):
+    threshold = max(float(min_event_pp), float(float_tol))
+    rows = []
+    if isinstance(sub_tensor, site_storage.SiteEventTensor):
+        for start, values in sub_tensor.iter_site_blocks():
+            # Scan the contiguous mask first and decode coordinates only at hits.
+            hits = np.flatnonzero(values >= threshold)
+            if hits.size == 0:
+                continue
+            site, branch, _sg, anc, der = np.unravel_index(hits, values.shape)
+            keep = anc != der
+            if keep.any():
+                site, branch, anc, der = site[keep], branch[keep], anc[keep], der[keep]
+                rows.append(pd.DataFrame({
+                    'branch_id': branch.astype(np.int64, copy=False),
+                    'site': (start + site).astype(np.int64, copy=False),
+                    'from_state_id': anc.astype(np.int64, copy=False),
+                    'to_state_id': der.astype(np.int64, copy=False),
+                    'event_pp': values[site, branch, 0, anc, der].astype(np.float64, copy=False),
+                }))
+    elif _is_sparse_sub_tensor(sub_tensor):
+        branch, site, _sg, anc, der, event_pp = sub_tensor._coordinates()
+        keep = (anc != der) & np.asarray(event_pp >= threshold, dtype=bool)
+        if keep.any():
+            rows.append(
+                pd.DataFrame(
+                    {
+                        "branch_id": branch[keep].astype(np.int64, copy=False),
+                        "site": site[keep].astype(np.int64, copy=False),
+                        "from_state_id": anc[keep].astype(np.int64, copy=False),
+                        "to_state_id": der[keep].astype(np.int64, copy=False),
+                        "event_pp": event_pp[keep].astype(np.float64, copy=False),
+                    }
+                )
+            )
+    else:
+        arr = np.asarray(sub_tensor)
+        if arr.ndim != 5:
+            raise ValueError("sub_tensor should be 5D.")
+        branch_id, site, _group, anc, der = np.where(arr >= threshold)
+        if branch_id.shape[0] > 0:
+            keep = anc != der
+            branch_id = branch_id[keep]
+            site = site[keep]
+            anc = anc[keep]
+            der = der[keep]
+            event_pp = arr[branch_id, site, 0, anc, der]
+            rows.append(
+                pd.DataFrame(
+                    {
+                        "branch_id": branch_id.astype(np.int64, copy=False),
+                        "site": site.astype(np.int64, copy=False),
+                        "from_state_id": anc.astype(np.int64, copy=False),
+                        "to_state_id": der.astype(np.int64, copy=False),
+                        "event_pp": event_pp.astype(np.float64, copy=False),
+                    }
+                )
+            )
+    if len(rows) == 0:
+        return pd.DataFrame(
+            columns=["branch_id", "site", "from_state_id", "to_state_id", "event_pp"]
+        )
+    out = pd.concat(rows, ignore_index=True)
+    if isinstance(sub_tensor, site_storage.SiteEventTensor):
+        out = out.sort_values(['branch_id', 'site', 'from_state_id', 'to_state_id'],
+                              kind='stable').reset_index(drop=True)
+    return out
+
+
+def _canonicalize_scan_projection(matrix):
+    matrix = matrix.tocsc(copy=False)
+    matrix.sum_duplicates()
+    matrix.eliminate_zeros()
+    matrix.sort_indices()
+    return matrix
+
+
+def _build_scan_rate_projection(sub_tensor, scan_matches):
+    """Build reusable sparse projections for common scan candidate shapes."""
+    if not _is_sparse_sub_tensor(sub_tensor):
+        return None
+    if isinstance(scan_matches, (list, tuple, set)):
+        scan_matches = ",".join(str(value) for value in scan_matches)
+    matches = set(normalize_scan_matches(scan_matches))
+    num_site = int(sub_tensor.shape[1])
+    num_from = int(sub_tensor.shape[3])
+    num_to = int(sub_tensor.shape[4])
+    out = {
+        "num_from": num_from,
+        "num_to": num_to,
+    }
+    diagonal_blocks = tuple(
+        sub_tensor.get_block(0, state_id, state_id)
+        for state_id in range(min(num_from, num_to))
+    )
+    has_diagonal_mass = any(matrix.nnz > 0 for matrix in diagonal_blocks)
+    # Production substitution tensors have an empty diagonal.  For arbitrary
+    # caller-provided tensors with diagonal mass, use the historical block
+    # extraction path so that sum-then-subtract cancellation cannot change a
+    # float_tol boundary decision.
+    if "any2spe" in matches and not has_diagonal_mass:
+        projected = sub_tensor.project("any2spe")
+        matrices = []
+        for der in range(num_to):
+            start = der * num_site
+            matrix = projected[:, start:start + num_site]
+            matrices.append(_canonicalize_scan_projection(matrix))
+        out["any2spe"] = tuple(matrices)
+    if "spe2any" in matches and not has_diagonal_mass:
+        projected = sub_tensor.project("spe2any")
+        matrices = []
+        for anc in range(num_from):
+            start = anc * num_site
+            matrix = projected[:, start:start + num_site]
+            matrices.append(_canonicalize_scan_projection(matrix))
+        out["spe2any"] = tuple(matrices)
+    if "any2any" in matches and not has_diagonal_mass:
+        matrix = sub_tensor.project("any2any")[:, :num_site]
+        out["any2any"] = _canonicalize_scan_projection(matrix)
+    return out
+
+
+def _get_projected_candidate_branch_values(projection, site, from_ids, to_ids):
+    if projection is None:
+        return None
+    num_from = int(projection["num_from"])
+    num_to = int(projection["num_to"])
+    valid_from = np.array(
+        sorted(set(int(v) for v in from_ids if 0 <= int(v) < num_from)),
+        dtype=np.int64,
+    )
+    valid_to = np.array(
+        sorted(set(int(v) for v in to_ids if 0 <= int(v) < num_to)),
+        dtype=np.int64,
+    )
+    matrix = None
+    if (
+        valid_from.shape[0] == num_from
+        and valid_to.shape[0] == 1
+        and "any2spe" in projection
+    ):
+        matrix = projection["any2spe"][int(valid_to[0])]
+    elif (
+        valid_from.shape[0] == 1
+        and valid_to.shape[0] == num_to
+        and "spe2any" in projection
+    ):
+        matrix = projection["spe2any"][int(valid_from[0])]
+    elif (
+        valid_from.shape[0] == num_from
+        and valid_to.shape[0] == num_to
+        and "any2any" in projection
+    ):
+        matrix = projection["any2any"]
+    if matrix is None:
+        return None
+    start = int(matrix.indptr[int(site)])
+    end = int(matrix.indptr[int(site) + 1])
+    branch_values = np.zeros(shape=(matrix.shape[0],), dtype=np.float64)
+    if end > start:
+        rows = matrix.indices[start:end].astype(np.int64, copy=False)
+        values = matrix.data[start:end].astype(np.float64, copy=False)
+        np.add.at(branch_values, rows, values)
+    return branch_values
+
+
+def extract_candidate_posterior_events(
+    sub_tensor,
+    site,
+    from_ids,
+    to_ids,
+    float_tol=1e-12,
+    projection=None,
+):
+    site = int(site)
+    array_site = site
+    from_ids = np.array(sorted(set(np.asarray(from_ids, dtype=np.int64).reshape(-1).tolist())), dtype=np.int64)
+    to_ids = np.array(sorted(set(np.asarray(to_ids, dtype=np.int64).reshape(-1).tolist())), dtype=np.int64)
+    if isinstance(sub_tensor, site_storage.SiteEventTensor):
+        num_branch, num_site, num_group, num_from, num_to = sub_tensor.shape
+        array_site = 0
+    elif _is_sparse_sub_tensor(sub_tensor):
+        num_branch = int(sub_tensor.shape[0])
+        num_site = int(sub_tensor.shape[1])
+        num_group = int(sub_tensor.shape[2])
+        num_from = int(sub_tensor.shape[3])
+        num_to = int(sub_tensor.shape[4])
+    else:
+        arr = np.asarray(sub_tensor)
+        if arr.ndim != 5:
+            raise ValueError("sub_tensor should be 5D.")
+        num_branch, num_site, num_group, num_from, num_to = arr.shape
+    if num_group < 1:
+        raise ValueError("sub_tensor should contain at least one substitution group.")
+    if (site < 0) or (site >= num_site):
+        raise ValueError("site is outside the substitution tensor site axis.")
+    branch_values = _get_projected_candidate_branch_values(
+        projection=projection,
+        site=site,
+        from_ids=from_ids,
+        to_ids=to_ids,
+    )
+    if branch_values is None:
+        if isinstance(sub_tensor, site_storage.SiteEventTensor):
+            arr = sub_tensor.read_site(site)[:, np.newaxis]
+        branch_values = np.zeros(shape=(num_branch,), dtype=np.float64)
+        for anc in from_ids.tolist():
+            if (int(anc) < 0) or (int(anc) >= num_from):
+                continue
+            for der in to_ids.tolist():
+                if (int(der) < 0) or (int(der) >= num_to) or (int(anc) == int(der)):
+                    continue
+                if _is_sparse_sub_tensor(sub_tensor):
+                    mat = sub_tensor.get_block(0, int(anc), int(der))
+                    col = mat.getcol(site).tocoo()
+                    if col.data.shape[0] == 0:
+                        continue
+                    np.add.at(branch_values, col.row.astype(np.int64, copy=False), col.data.astype(np.float64, copy=False))
+                else:
+                    branch_values += arr[:, array_site, 0, int(anc), int(der)].astype(np.float64, copy=False)
+    keep = np.where(branch_values > float(float_tol))[0]
+    if keep.shape[0] == 0:
+        return pd.DataFrame(
+            columns=["branch_id", "site", "from_state_id", "to_state_id", "event_pp"]
+        )
+    return pd.DataFrame(
+        {
+            "branch_id": keep.astype(np.int64, copy=False),
+            "site": np.full(shape=keep.shape[0], fill_value=site, dtype=np.int64),
+            "from_state_id": np.full(shape=keep.shape[0], fill_value=-1, dtype=np.int64),
+            "to_state_id": np.full(shape=keep.shape[0], fill_value=-1, dtype=np.int64),
+            "event_pp": branch_values[keep].astype(np.float64, copy=False),
+        }
+    )
+
+
+def _get_branch_prop_length_to_effective_parent(node, prop_name, state_has_mass):
+    length = max(float(ete.get_prop(node, prop_name, 0.0) or 0.0), 0.0)
+    parent = getattr(node, "up", None)
+    while parent is not None:
+        if ete.node_has_state(parent, state_has_mass=state_has_mass):
+            return length
+        length += max(float(ete.get_prop(parent, prop_name, 0.0) or 0.0), 0.0)
+        parent = getattr(parent, "up", None)
+    return length
+
+
+def build_branch_metadata(g):
+    state = np.asarray(g["state_nsy"])
+    state_has_mass = state.sum(axis=(1, 2)) > float(g.get("float_tol", 0))
+    rows = []
+    for node in g["tree"].traverse():
+        if ete.is_root(node):
+            continue
+        branch_id = int(ete.get_prop(node, "numerical_label"))
+        if (not ete.is_leaf(node)) and (not ete.node_has_state(node, state_has_mass=state_has_mass)):
+            continue
+        parent_node, raw_length = ete.get_effective_state_parent(
+            node,
+            state_has_mass=state_has_mass,
+            accumulate_distance=True,
+        )
+        if parent_node is None:
+            continue
+        parent_id = int(ete.get_prop(parent_node, "numerical_label"))
+        if (branch_id < 0) or (branch_id >= state.shape[0]) or (parent_id < 0) or (parent_id >= state.shape[0]):
+            continue
+        rows.append(
+            {
+                "branch_id": branch_id,
+                "parent_id": parent_id,
+                "raw_length": max(float(raw_length), 0.0),
+                "sn_rescaled_length": _get_branch_prop_length_to_effective_parent(
+                    node=node,
+                    prop_name="SNdist",
+                    state_has_mass=state_has_mass,
+                ),
+                "n_rescaled_length": _get_branch_prop_length_to_effective_parent(
+                    node=node,
+                    prop_name="Ndist",
+                    state_has_mass=state_has_mass,
+                ),
+            }
+        )
+    if len(rows) == 0:
+        raise ValueError("No analyzable non-root branches were available for scan.")
+    return pd.DataFrame(rows).sort_values("branch_id").reset_index(drop=True)
+
+
+def _lineage_values(g, trait_name):
+    values = foreground._get_non_background_lineages(g["fg_df"].loc[:, trait_name])
+    return values.tolist()
+
+
+def _node_by_branch_id(g):
+    return {int(ete.get_prop(node, "numerical_label")): node for node in g["tree"].traverse()}
+
+
+def _lineage_sister_branch_ids(g, trait_name, lineage_index, fg_branch_ids, node_by_id):
+    fg_set = set(int(v) for v in np.asarray(fg_branch_ids, dtype=np.int64).reshape(-1).tolist())
+    all_fg_set = set(int(v) for v in np.asarray(g["fg_ids"][trait_name], dtype=np.int64).reshape(-1).tolist())
+    sister_ids = set()
+    lineage_key = "is_lineage_fg_" + str(trait_name) + "_" + str(int(lineage_index) + 1)
+    for bid in fg_set:
+        node = node_by_id.get(int(bid), None)
+        if node is None:
+            continue
+        for sister in ete.get_sisters(node):
+            sister_id = int(ete.get_prop(sister, "numerical_label"))
+            is_sister_lineage = bool(ete.get_prop(sister, lineage_key, False))
+            if bool(g.get("scan_sister_stem_only", False)):
+                if (not is_sister_lineage) and (sister_id not in all_fg_set):
+                    sister_ids.add(sister_id)
+            else:
+                for desc in sister.traverse():
+                    desc_id = int(ete.get_prop(desc, "numerical_label"))
+                    if desc_id in all_fg_set:
+                        continue
+                    if not bool(ete.get_prop(desc, lineage_key, False)):
+                        sister_ids.add(desc_id)
+    sister_ids = sister_ids.difference(fg_set)
+    return np.array(sorted(sister_ids), dtype=np.int64)
+
+
+def _lineage_component_groups(g, trait_name, valid_branches):
+    valid_branches = set(int(v) for v in valid_branches)
+    groups = []
+    lineages = _lineage_values(g=g, trait_name=trait_name)
+    for lineage_index, lineage_value in enumerate(lineages):
+        lineage_key = "is_lineage_fg_{}_{}".format(trait_name, int(lineage_index) + 1)
+        components = []
+        for node in g["tree"].traverse():
+            if ete.is_root(node) or (not bool(ete.get_prop(node, lineage_key, False))):
+                continue
+            is_parent_lineage = bool(ete.get_prop(node.up, lineage_key, False))
+            if is_parent_lineage:
+                continue
+            stem_branch_id = int(ete.get_prop(node, "numerical_label"))
+            clade_branch_ids = np.array(
+                sorted(
+                    int(ete.get_prop(desc, "numerical_label"))
+                    for desc in node.traverse()
+                    if int(ete.get_prop(desc, "numerical_label")) in valid_branches
+                ),
+                dtype=np.int64,
+            )
+            components.append(
+                {
+                    "stem_branch_id": stem_branch_id,
+                    "stem_is_valid": stem_branch_id in valid_branches,
+                    "clade_branch_ids": clade_branch_ids,
+                    "leaf_names": sorted(str(v) for v in ete.get_leaf_names(node)),
+                }
+            )
+        components = sorted(components, key=lambda item: int(item["stem_branch_id"]))
+        leaf_names = []
+        trait_leaf_names = g.get("fg_leaf_names", {}).get(trait_name, [])
+        if lineage_index < len(trait_leaf_names):
+            leaf_names = sorted(str(v) for v in trait_leaf_names[lineage_index])
+        groups.append(
+            {
+                "lineage_index": int(lineage_index),
+                "lineage_value": lineage_value,
+                "leaf_names": leaf_names,
+                "components": components,
+            }
+        )
+    return groups
+
+
+def _format_branch_id_list(values):
+    values = np.asarray(values, dtype=np.int64).reshape(-1)
+    return ",".join(str(int(v)) for v in values.tolist())
+
+
+def _component_ids(components, key):
+    arrays = [np.asarray(component[key], dtype=np.int64).reshape(-1) for component in components]
+    arrays = [values for values in arrays if values.shape[0] > 0]
+    if len(arrays) == 0:
+        return np.array([], dtype=np.int64)
+    return np.unique(np.concatenate(arrays).astype(np.int64, copy=False))
+
+
+def build_scan_units(g, branch_meta):
+    rows = []
+    valid_branches = set(branch_meta["branch_id"].astype(int).tolist())
+    node_by_id = _node_by_branch_id(g)
+    unit_mode = normalize_scan_unit_mode(g.get("scan_unit_mode", "clade"))
+    for trait_name in g["fg_df"].columns[1:].tolist():
+        groups = _lineage_component_groups(
+            g=g,
+            trait_name=trait_name,
+            valid_branches=valid_branches,
+        )
+        trait_rows = []
+        if unit_mode == "lineage":
+            for group in groups:
+                lineage_index = int(group["lineage_index"])
+                fg_ids = foreground._get_lineage_target_ids(
+                    lineage_index=lineage_index,
+                    trait_name=trait_name,
+                    g=g,
+                )
+                fg_ids = np.array(
+                    [int(v) for v in fg_ids.tolist() if int(v) in valid_branches],
+                    dtype=np.int64,
+                )
+                stem_ids = np.array(
+                    [
+                        int(component["stem_branch_id"])
+                        for component in group["components"]
+                        if bool(component["stem_is_valid"])
+                    ],
+                    dtype=np.int64,
+                )
+                fg_clade_ids = _component_ids(group["components"], "clade_branch_ids")
+                sister_ids = _lineage_sister_branch_ids(
+                    g=g,
+                    trait_name=trait_name,
+                    lineage_index=lineage_index,
+                    fg_branch_ids=fg_ids,
+                    node_by_id=node_by_id,
+                )
+                sister_ids = np.array(
+                    [int(v) for v in sister_ids.tolist() if int(v) in valid_branches],
+                    dtype=np.int64,
+                )
+                trait_rows.append(
+                    {
+                        "trait": trait_name,
+                        "unit_mode": unit_mode,
+                        "lineage_value": group["lineage_value"],
+                        "stem_branch_ids": _format_branch_id_list(stem_ids),
+                        "fg_leaf_names": ",".join(group["leaf_names"]),
+                        "fg_branch_ids": _format_branch_id_list(fg_ids),
+                        "sister_branch_ids": _format_branch_id_list(sister_ids),
+                        "fg_clade_branch_ids": _format_branch_id_list(fg_clade_ids),
+                    }
+                )
+        else:
+            for group in groups:
+                for component in group["components"]:
+                    stem_ids = np.array(
+                        [int(component["stem_branch_id"])] if bool(component["stem_is_valid"]) else [],
+                        dtype=np.int64,
+                    )
+                    clade_ids = np.asarray(component["clade_branch_ids"], dtype=np.int64)
+                    fg_ids = stem_ids if unit_mode == "stem" else clade_ids
+                    if fg_ids.shape[0] == 0:
+                        continue
+                    trait_rows.append(
+                        {
+                            "trait": trait_name,
+                            "unit_mode": unit_mode,
+                            "lineage_value": group["lineage_value"],
+                            "stem_branch_ids": _format_branch_id_list(stem_ids),
+                            "fg_leaf_names": ",".join(component["leaf_names"]),
+                            "fg_branch_ids": _format_branch_id_list(fg_ids),
+                            "sister_branch_ids": "",
+                            "fg_clade_branch_ids": _format_branch_id_list(clade_ids),
+                        }
+                    )
+            all_fg_ids = _component_ids(
+                [{"ids": _parse_id_list(row["fg_branch_ids"])} for row in trait_rows],
+                "ids",
+            )
+            for row in trait_rows:
+                sister_ids = _unit_sister_branch_ids(
+                    g=g,
+                    fg_branch_ids=_parse_id_list(row["fg_branch_ids"]),
+                    all_fg_branch_ids=all_fg_ids,
+                    node_by_id=node_by_id,
+                )
+                sister_ids = np.array(
+                    [int(v) for v in sister_ids.tolist() if int(v) in valid_branches],
+                    dtype=np.int64,
+                )
+                row["sister_branch_ids"] = _format_branch_id_list(sister_ids)
+        for unit_id, row in enumerate(trait_rows, start=1):
+            row["unit_id"] = int(unit_id)
+            rows.append(row)
+    if len(rows) == 0:
+        return pd.DataFrame(columns=list(SCAN_UNIT_COLUMNS))
+    return pd.DataFrame(rows).loc[:, list(SCAN_UNIT_COLUMNS)]
+
+
+def _parse_id_list(value):
+    text = "" if value is None else str(value).strip()
+    if text == "":
+        return np.array([], dtype=np.int64)
+    return np.array([int(v) for v in text.split(",") if str(v).strip() != ""], dtype=np.int64)
+
+
+def _unit_sister_branch_ids(g, fg_branch_ids, all_fg_branch_ids, node_by_id):
+    fg_set = set(int(v) for v in np.asarray(fg_branch_ids, dtype=np.int64).reshape(-1).tolist())
+    all_fg_set = set(int(v) for v in np.asarray(all_fg_branch_ids, dtype=np.int64).reshape(-1).tolist())
+    sister_ids = set()
+    for bid in fg_set:
+        node = node_by_id.get(int(bid), None)
+        if node is None:
+            continue
+        for sister in ete.get_sisters(node):
+            sister_id = int(ete.get_prop(sister, "numerical_label"))
+            if bool(g.get("scan_sister_stem_only", False)):
+                if sister_id not in all_fg_set:
+                    sister_ids.add(sister_id)
+            else:
+                for desc in sister.traverse():
+                    desc_id = int(ete.get_prop(desc, "numerical_label"))
+                    if desc_id not in all_fg_set:
+                        sister_ids.add(desc_id)
+    return np.array(sorted(sister_ids.difference(fg_set)), dtype=np.int64)
+
+
+def _selected_stem_fg_branch_ids(g, trait_cache, stem_index):
+    stem_index = int(stem_index)
+    unit_mode = normalize_scan_unit_mode(g.get("scan_unit_mode", "clade"))
+    if (unit_mode == "stem") or (
+        (unit_mode == "lineage") and bool(g.get("fg_stem_only", False))
+    ):
+        return np.array([int(trait_cache["branch_ids"][stem_index])], dtype=np.int64)
+    return np.array(trait_cache["descendant_branch_ids_by_index"][stem_index], dtype=np.int64)
+
+
+def _get_scan_trait_plan(g, trait_name, valid_branch_ids):
+    cache_key = (str(trait_name), tuple(int(i) for i in valid_branch_ids))
+    plans = g.setdefault("_scan_trait_plans", {})
+    if cache_key in plans:
+        return plans[cache_key]
+    trait_cache = foreground._get_trait_clade_permutation_cache(g=g, trait_name=trait_name)
+    valid_set = set(int(i) for i in valid_branch_ids)
+    unit_mode = normalize_scan_unit_mode(g.get("scan_unit_mode", "clade"))
+    groups = _lineage_component_groups(g=g, trait_name=trait_name, valid_branches=valid_set)
+    observed = [
+        tuple(trait_cache["branch_id_to_index"][component["stem_branch_id"]] for component in group["components"])
+        for group in groups
+    ]
+    if unit_mode != "lineage":
+        observed = [tuple(i for group in observed for i in group)]
+    elif any(len(group) == 0 for group in observed):
+        raise ValueError("Every foreground lineage needs a non-root component for scan calibration.")
+    descendants = trait_cache['descendant_indices_by_index']
+    if (isinstance(descendants, scan_permutation.CladeDescendants) and unit_mode != 'stem'
+            and not (unit_mode == 'lineage' and bool(g.get('fg_stem_only', False)))):
+        index = descendants.index
+        valid = np.array([int(bid) in valid_set for bid in index.branch_ids], dtype=bool)
+        positions = index.preorder_indices
+        present = np.zeros(len(positions), dtype=np.int64)
+        present[positions >= 0] = valid[positions[positions >= 0]]
+        cumulative = np.concatenate(([0], np.cumsum(present)))
+        eligible = cumulative[index.stops] > cumulative[index.starts]
+    else:
+        eligible = np.array([
+            any(int(bid) in valid_set for bid in _selected_stem_fg_branch_ids(g, trait_cache, i))
+            for i in range(len(trait_cache["branch_ids"]))
+        ], dtype=bool)
+    if not eligible.any():
+        raise ValueError("No clades have analyzable target branches for scan calibration.")
+    if g.get("fg_trait_tree"):
+        model = g["_fg_trait_model"]
+        stem_ids = trait_cache["branch_ids"]
+        observed_ids = tuple(sorted(int(stem_ids[index]) for index in observed[0]))
+        if observed_ids != model.observed_stems:
+            raise ValueError("Observed scan units do not match the binary trait origins.")
+        observed_indices = tuple(sorted(observed[0]))
+        if not eligible[list(observed_indices)].all():
+            raise ValueError("An observed trait origin has no analyzable scan target branches.")
+        plan = {
+            "sampler": None,
+            "observed": (observed_indices,),
+            "trait_cache": trait_cache,
+            "groups": groups,
+            "eligible": eligible,
+            "eligible_model_branches": np.isin(model.branch_ids, stem_ids[eligible]),
+        }
+        plans[cache_key] = plan
+        return plan
+    min_count = int(g.get("min_clade_bin_count", g.get("scan_permutation_min_clade_bin_count", 10)))
+    if min_count < 1:
+        raise ValueError("The minimum clade bin count must be positive.")
+    # Bin boundaries depend only on the eligible tree, never on which clades
+    # happened to be foreground. Keep the existing size-bin boundary convention.
+    bins, _ = foreground._build_clade_permutation_bins_from_arrays(
+        size_array=trait_cache["size"][eligible],
+        is_fg_stem=np.zeros(int(eligible.sum()), dtype=bool),
+        min_clade_bin_count=min_count,
+        sample_original_foreground=True,
+    )
+    bin_array = np.digitize(trait_cache["size"], bins[::-1], right=False)
+    sampler = scan_permutation.build_plan(
+        bin_array=bin_array,
+        eligible=eligible,
+        observed=observed,
+        descendants=trait_cache["descendant_indices_by_index"],
+    )
+    plan = {
+        "sampler": sampler,
+        "observed": sampler.observed,
+        "trait_cache": trait_cache,
+        "groups": groups,
+        "eligible": eligible,
+        "bins": bins,
+        "bin_array": bin_array,
+    }
+    plans[cache_key] = plan
+    return plan
+
+
+def _scan_configuration_id(configurations):
+    payload = json.dumps(configurations, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _build_permuted_trait_context(
+    g,
+    trait_name,
+    valid_branch_ids,
+    sample_original_foreground=True,
+    rng=None,
+    configuration=None,
+    include_units=True,
+):
+    if not sample_original_foreground:
+        raise ValueError("Scan calibration must include the original foreground clades.")
+    if rng is None:
+        rng = randomness.next_generator(g, 'scan_permutation_direct', str(trait_name))
+    plan = _get_scan_trait_plan(g, trait_name, valid_branch_ids)
+    if configuration is None and plan["sampler"] is None:
+        model = g["_fg_trait_model"]
+        stems, attempts = trait_ctmc.sample_stems(
+            model, plan["eligible_model_branches"], g.get("fg_trait_match_tip_count", False), rng,
+        )
+        by_id = plan["trait_cache"]["branch_id_to_index"]
+        configuration = (tuple(sorted(by_id[bid] for bid in stems)),)
+    elif configuration is None:
+        configuration, attempts = scan_permutation.sample_configuration(plan["sampler"], rng)
+    else:
+        attempts = 0
+    trait_cache = plan["trait_cache"]
+    valid_set = set(int(v) for v in valid_branch_ids)
+    unit_mode = normalize_scan_unit_mode(g.get("scan_unit_mode", "clade"))
+    unit_specs: list[dict[str, Any]] = []
+    sampled_components = []
+    for group_index, indices in enumerate(configuration):
+        components = []
+        for stem_index in indices:
+            fg_ids = np.array([
+                int(bid) for bid in _selected_stem_fg_branch_ids(g, trait_cache, stem_index)
+                if int(bid) in valid_set
+            ], dtype=np.int64)
+            if fg_ids.size == 0:
+                raise ValueError("A sampled foreground component has no analyzable target branches.")
+            components.append({
+                "stem_branch_id": int(trait_cache["branch_ids"][stem_index]),
+                "fg_branch_ids": fg_ids,
+                "clade_branch_ids": np.array([
+                    int(bid) for bid in trait_cache["descendant_branch_ids_by_index"][stem_index]
+                    if int(bid) in valid_set
+                ], dtype=np.int64),
+                "leaf_names": list(trait_cache["leaf_names_by_index"][stem_index]) if include_units else [],
+            })
+        if not include_units:
+            sampled_components.extend(components)
+            continue
+        # Lineage groups (including the number of components in each bin) are
+        # part of the sampled configuration. No rank-based reassignment occurs.
+        component_groups = [components] if unit_mode == "lineage" else [[c] for c in components]
+        for component_group in component_groups:
+            unit_specs.append({
+                "lineage_value": (
+                    plan["groups"][group_index]["lineage_value"] if unit_mode == "lineage"
+                    else len(unit_specs) + 1
+                ),
+                "stem_branch_ids": np.array(sorted(c["stem_branch_id"] for c in component_group), dtype=np.int64),
+                "fg_branch_ids": _component_ids(component_group, "fg_branch_ids"),
+                "clade_branch_ids": _component_ids(component_group, "clade_branch_ids"),
+                "leaf_names": sorted({str(name) for c in component_group for name in c["leaf_names"]}),
+            })
+    if not include_units:
+        # Fixed candidates need branch unions, not per-unit display metadata.
+        # All unit sister sets exclude the same complete foreground union;
+        # their union therefore equals the sister set of that union.
+        all_fg_ids = _component_ids(sampled_components, "fg_branch_ids")
+        all_rate_fg_ids = _component_ids(sampled_components, "clade_branch_ids")
+        sister_ids = np.array([], dtype=np.int64)
+        if normalize_scan_other_scope(g.get("scan_other_scope", "all")) == "sister":
+            sister_ids = _unit_sister_branch_ids(
+                g=g, fg_branch_ids=all_fg_ids, all_fg_branch_ids=all_fg_ids,
+                node_by_id=_node_by_branch_id(g),
+            )
+            sister_ids = np.array([int(v) for v in sister_ids if int(v) in valid_set], dtype=np.int64)
+        return {
+            "units": None,
+            "fg_ids": all_fg_ids,
+            "rate_fg_ids": all_rate_fg_ids,
+            "sister_ids": sister_ids,
+            "fg_leaf_names": [],
+            "sampling_attempts": attempts,
+            "configuration": [[int(trait_cache["branch_ids"][i]) for i in group] for group in configuration],
+        }
+    all_fg_ids = _component_ids(unit_specs, "fg_branch_ids")
+    all_rate_fg_ids = _component_ids(unit_specs, "clade_branch_ids")
+    node_by_id = _node_by_branch_id(g)
+    rows = []
+    fg_leaf_names = []
+    for i, spec in enumerate(unit_specs):
+        sister_ids = _unit_sister_branch_ids(
+            g=g, fg_branch_ids=spec["fg_branch_ids"], all_fg_branch_ids=all_fg_ids, node_by_id=node_by_id,
+        )
+        sister_ids = np.array([int(v) for v in sister_ids if int(v) in valid_set], dtype=np.int64)
+        fg_leaf_names.append(spec["leaf_names"])
+        rows.append({
+            "trait": trait_name,
+            "unit_id": i + 1,
+            "unit_mode": unit_mode,
+            "lineage_value": spec["lineage_value"],
+            "stem_branch_ids": _format_branch_id_list(spec["stem_branch_ids"]),
+            "fg_leaf_names": ",".join(spec["leaf_names"]),
+            "fg_branch_ids": _format_branch_id_list(spec["fg_branch_ids"]),
+            "sister_branch_ids": _format_branch_id_list(sister_ids),
+            "fg_clade_branch_ids": _format_branch_id_list(spec["clade_branch_ids"]),
+        })
+    return {
+        "units": pd.DataFrame(rows, columns=list(SCAN_UNIT_COLUMNS)),
+        "fg_ids": all_fg_ids,
+        "rate_fg_ids": all_rate_fg_ids,
+        "fg_leaf_names": fg_leaf_names,
+        "sampling_attempts": attempts,
+        "configuration": [[int(trait_cache["branch_ids"][i]) for i in group] for group in configuration],
+    }
+
+
+def _build_permuted_scan_context(
+    g,
+    trait_names,
+    valid_branch_ids,
+    sample_original_foreground=True,
+    rng=None,
+    configurations=None,
+    include_units=True,
+):
+    if rng is None:
+        rng = randomness.next_generator(g, 'scan_permutation_context')
+    units = []
+    fg_ids = {}
+    rate_fg_ids = {}
+    fg_leaf_names = {}
+    sampled_configurations = {}
+    sister_ids = {}
+    attempts = 0
+    for trait_name in trait_names:
+        trait_context = _build_permuted_trait_context(
+            g=g,
+            trait_name=trait_name,
+            valid_branch_ids=valid_branch_ids,
+            sample_original_foreground=sample_original_foreground,
+            rng=rng,
+            configuration=None if configurations is None else configurations[trait_name],
+            include_units=include_units,
+        )
+        if include_units:
+            units.append(trait_context["units"])
+        else:
+            sister_ids[trait_name] = trait_context["sister_ids"]
+        fg_ids[trait_name] = trait_context["fg_ids"]
+        rate_fg_ids[trait_name] = trait_context["rate_fg_ids"]
+        fg_leaf_names[trait_name] = trait_context["fg_leaf_names"]
+        sampled_configurations[trait_name] = trait_context["configuration"]
+        attempts += trait_context["sampling_attempts"]
+    units_df = None
+    if include_units:
+        units_df = pd.concat(units, ignore_index=True) if units else pd.DataFrame(columns=list(SCAN_UNIT_COLUMNS))
+    context = {
+        "units": units_df,
+        "fg_ids": fg_ids,
+        "rate_fg_ids": rate_fg_ids,
+        "fg_leaf_names": fg_leaf_names,
+        "trait_names": list(trait_names),
+        "sampling_attempts": attempts,
+        "configuration": sampled_configurations,
+        "configuration_id": _scan_configuration_id(sampled_configurations),
+    }
+    if not include_units:
+        context["sister_ids"] = sister_ids
+    return context
+
+
+def _observed_candidate_states(values):
+    ids = values.to_numpy(copy=False)
+    if ids.dtype != np.int64:
+        ids = values.astype(int).to_numpy(copy=False)
+    return np.unique(ids)
+
+
+def _candidate_group_columns(match):
+    if match == "spe2spe":
+        return ["site", "from_state_id", "to_state_id"]
+    if match in ["any2spe", "dif2spe"]:
+        return ["site", "to_state_id"]
+    if match in ["spe2any", "spe2dif"]:
+        return ["site", "from_state_id"]
+    return ["site"]
+
+
+def _format_state_change(from_label, to_label, site_label, match):
+    site_label = int(site_label)
+    from_label = str(from_label)
+    to_label = str(to_label)
+    match = str(match)
+    if match == "spe2spe":
+        return "{}{}{}".format(from_label, site_label, to_label)
+    if to_label not in ["any", "dif"]:
+        return "{}{}".format(site_label, to_label)
+    if from_label not in ["any", "dif"]:
+        return "{}{}".format(from_label, site_label)
+    return "{}:{}".format(site_label, match)
+
+
+def _candidate_distribution_label(values, state_orders):
+    """Format a distribution with the historical pandas descending tie order."""
+    if len(values) == 1:
+        index, value = values[0]
+        return '{}:{:.6g}'.format(str(state_orders[int(index)]), float(value))
+    masses = np.asarray([mass for _, mass in values])
+    missing = np.isnan(masses)
+    positions = np.flatnonzero(~missing)
+    # pandas reverses before and after ascending quicksort. Sorting -masses
+    # instead changes the order of tied states, which is part of the output.
+    order = positions[::-1][masses[positions][::-1].argsort(kind='quicksort')][::-1]
+    if missing.any():
+        order = np.concatenate((order, np.flatnonzero(missing)))
+    return ','.join('{}:{:.6g}'.format(str(state_orders[int(values[i][0])]), float(values[i][1]))
+                    for i in order)
+
+
+def build_candidates(events, scan_matches, state_orders):
+    rows = []
+    num_state = int(state_orders.shape[0])
+    all_states = np.arange(num_state, dtype=np.int64)
+    summaries = {}
+    for match in scan_matches:
+        if events.shape[0] == 0:
+            continue
+        group_cols = tuple(_candidate_group_columns(match))
+        if group_cols not in summaries:
+            # Reduce each state distribution in one pass, preserving pandas'
+            # summation and tie ordering, rather than grouping each tiny frame.
+            distributions = {}
+            for column in ('from_state_id', 'to_state_id'):
+                keys = list(dict.fromkeys((*group_cols, column)))
+                reduced = events.groupby(keys, sort=True)['event_pp'].sum()
+                by_group = {}
+                for key, mass in reduced.items():
+                    key = key if isinstance(key, tuple) else (key,)
+                    group_key = tuple(key[keys.index(col)] for col in group_cols)
+                    by_group.setdefault(group_key, []).append((key[keys.index(column)], mass))
+                distributions[column] = {
+                    key: _candidate_distribution_label(values, state_orders)
+                    for key, values in by_group.items()}
+            records = []
+            for key, group in events.groupby(list(group_cols), sort=True):
+                key = key if isinstance(key, tuple) else (key,)
+                observed_from = _observed_candidate_states(group['from_state_id'])
+                observed_to = _observed_candidate_states(group['to_state_id'])
+                records.append((int(group['site'].iloc[0]), observed_from, observed_to,
+                                distributions['from_state_id'][key], distributions['to_state_id'][key],
+                                float(group['event_pp'].sum())))
+            summaries[group_cols] = records
+        ancestral, derived = match.split('2')
+        for site, observed_from, observed_to, from_distribution, to_distribution, total in summaries[group_cols]:
+            if ((ancestral == 'spe' and len(observed_from) != 1)
+                    or (ancestral == 'dif' and len(observed_from) < 2)
+                    or (derived == 'spe' and len(observed_to) != 1)
+                    or (derived == 'dif' and len(observed_to) < 2)):
+                continue
+            from_set = all_states if ancestral == 'any' else observed_from
+            to_set = all_states if derived == 'any' else observed_to
+            from_label = _state_set_label(from_set, state_orders)
+            to_label = _state_set_label(to_set, state_orders)
+            state_change = _format_state_change(
+                from_label=from_label,
+                to_label=to_label,
+                site_label=site + 1,
+                match=match,
+            )
+            rows.append(
+                {
+                    "scan_match": match,
+                    "site": site,
+                    "from_state_ids": ",".join(str(v) for v in from_set.tolist()),
+                    "to_state_ids": ",".join(str(v) for v in to_set.tolist()),
+                    "observed_from_state_ids": ",".join(str(v) for v in observed_from.tolist()),
+                    "observed_to_state_ids": ",".join(str(v) for v in observed_to.tolist()),
+                    "from_state": from_label,
+                    "to_state": to_label,
+                    "from_state_distribution": from_distribution,
+                    "to_state_distribution": to_distribution,
+                    "state_change": state_change,
+                    "candidate_event_pp_sum": total,
+                }
+            )
+    if len(rows) == 0:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def _index_event_sites(events):
+    if events.empty:
+        return {}
+    return events.groupby(events["site"].to_numpy(dtype=int), sort=False).indices
+
+
+def _matches_candidate_states(states, ids):
+    if ids.size == 1:
+        return states == ids[0]
+    return np.isin(states, ids)
+
+
+def _candidate_event_positions(events, event_sites, site, from_ids, to_ids):
+    positions = event_sites.get(int(site))
+    if positions is None:
+        return np.empty(0, dtype=np.intp)
+    from_ids = np.asarray(from_ids, dtype=np.int64).reshape(-1)
+    to_ids = np.asarray(to_ids, dtype=np.int64).reshape(-1)
+    ancestral = events["from_state_id"].to_numpy(dtype=int)[positions]
+    derived = events["to_state_id"].to_numpy(dtype=int)[positions]
+    keep = (_matches_candidate_states(ancestral, from_ids)
+            & _matches_candidate_states(derived, to_ids)
+            & (ancestral != derived))
+    return positions[keep]
+
+
+def _support_for_unit(branch_event, branch_ids, min_event_pp):
+    maximum = 0.0
+    supporting = []
+    if isinstance(branch_ids, np.ndarray):
+        branch_ids = branch_ids.tolist()
+    for bid in branch_ids:
+        value = float(branch_event.get(bid, 0.0))
+        if value > 0.0 and value >= min_event_pp:
+            maximum = max(maximum, value)
+            supporting.append(bid)
+    return maximum, supporting
+
+
+def _format_lineage_id_list(values):
+    output = io.StringIO()
+    csv.writer(output, lineterminator="\r\n").writerow(str(value) for value in values)
+    return output.getvalue().removesuffix("\r\n")
+
+
+def _scan_unit_support_plan(units_df):
+    """Parse fixed branch membership once per trait/foreground assignment."""
+    branch_lists = units_df.get("fg_branch_ids", [""] * len(units_df))
+    return [
+        (unit_id, lineage_value, _parse_id_list(branch_ids).tolist())
+        for unit_id, lineage_value, branch_ids in zip(
+            units_df["unit_id"], units_df["lineage_value"], branch_lists,
+        )
+    ]
+
+
+def _summarize_unit_support(candidate_events, units_df, target_class, min_event_pp, unit_plan=None):
+    if str(target_class) != "fg":
+        raise ValueError("Only foreground target class is supported in scan.")
+    if units_df.shape[0] == 0:
+        return {
+            "unit_total": 0,
+            "support_unit_count": 0,
+            "support_fraction": np.nan,
+            "support_pp_sum": 0.0,
+            "support_pp_mean": np.nan,
+            "support_unit_ids": "",
+            "support_branch_ids": "",
+            "lineage_total": 0,
+            "support_lineage_count": 0,
+            "support_lineage_fraction": np.nan,
+            "support_lineage_ids": "",
+        }
+    branch_ids = candidate_events["branch_id"]
+    event_pp = candidate_events["event_pp"]
+    branch_event = {}
+    if branch_ids.dtype == np.int64 and event_pp.dtype == np.float64:
+        branch_event = dict(zip(branch_ids.to_numpy(copy=False), event_pp.to_numpy(copy=False)))
+    if len(branch_event) != len(candidate_events):
+        # Keep the grouped sum when a branch contributes multiple events.
+        branch_event = candidate_events.groupby("branch_id")["event_pp"].sum().to_dict()
+    support_pp = []
+    support_units = []
+    support_branches = []
+    analyzable_lineages = dict()
+    support_lineages = set()
+    if unit_plan is None:
+        unit_plan = _scan_unit_support_plan(units_df)
+    threshold = float(min_event_pp)
+    for unit_id, lineage_value, fg_ids in unit_plan:
+        if len(fg_ids):
+            analyzable_lineages[lineage_value] = None
+        pp, branches = _support_for_unit(branch_event, fg_ids, threshold)
+        if branches:
+            support_units.append(int(unit_id))
+            support_pp.append(pp)
+            support_branches.extend(branches)
+            support_lineages.add(lineage_value)
+    unit_total = int(units_df.shape[0])
+    support_count = int(len(support_units))
+    lineage_total = len(analyzable_lineages)
+    support_lineage_count = len(support_lineages)
+    return {
+        "unit_total": unit_total,
+        "support_unit_count": support_count,
+        "support_fraction": (support_count / unit_total) if unit_total > 0 else np.nan,
+        "support_pp_sum": float(np.sum(support_pp)) if len(support_pp) else 0.0,
+        "support_pp_mean": float(np.mean(support_pp)) if len(support_pp) else np.nan,
+        "support_unit_ids": ",".join(str(v) for v in support_units),
+        "support_branch_ids": ",".join(str(v) for v in sorted(set(support_branches))),
+        "lineage_total": lineage_total,
+        "support_lineage_count": support_lineage_count,
+        "support_lineage_fraction": (support_lineage_count / lineage_total) if lineage_total > 0 else np.nan,
+        "support_lineage_ids": _format_lineage_id_list(v for v in analyzable_lineages if v in support_lineages),
+    }
+
+
+def _target_branch_ids_from_maps(fg_ids_map, trait_name, target_class, valid_branch_ids):
+    if str(target_class) != "fg":
+        raise ValueError("Only foreground target class is supported in scan.")
+    valid = set(int(v) for v in valid_branch_ids)
+    fg_ids = set(int(v) for v in np.asarray(fg_ids_map.get(trait_name, []), dtype=np.int64).reshape(-1).tolist())
+    return np.array(sorted(fg_ids.intersection(valid)), dtype=np.int64)
+
+
+
+
+def _union_unit_branch_ids(units_df, column):
+    out = set()
+    if column not in units_df.columns:
+        return out
+    for value in units_df[column].tolist():
+        out.update(int(v) for v in _parse_id_list(value).tolist())
+    return out
+
+
+def _fg_ids_map_from_units(units, trait_names, column, fallback_map=None):
+    out = {}
+    if fallback_map is None:
+        fallback_map = {}
+    for trait_name in trait_names:
+        units_trait = units.loc[units["trait"] == trait_name, :]
+        branch_ids = _union_unit_branch_ids(units_df=units_trait, column=column)
+        if len(branch_ids) == 0:
+            branch_ids = set(
+                int(v)
+                for v in np.asarray(fallback_map.get(trait_name, []), dtype=np.int64).reshape(-1).tolist()
+            )
+        out[trait_name] = np.array(sorted(branch_ids), dtype=np.int64)
+    return out
+
+
+def _rate_fg_ids_map_from_units(units, fg_ids_map, trait_names):
+    return _fg_ids_map_from_units(
+        units=units,
+        trait_names=trait_names,
+        column="fg_clade_branch_ids",
+        fallback_map=fg_ids_map,
+    )
+
+
+def _other_branch_ids_from_maps(
+    fg_ids_map,
+    trait_name,
+    target_class,
+    valid_branch_ids,
+    scan_other_scope,
+    units_df,
+):
+    if str(target_class) != "fg":
+        raise ValueError("Only foreground target class is supported in scan.")
+    valid = set(int(v) for v in np.asarray(valid_branch_ids, dtype=np.int64).reshape(-1).tolist())
+    target = set(
+        int(v)
+        for v in _target_branch_ids_from_maps(
+            fg_ids_map=fg_ids_map,
+            trait_name=trait_name,
+            target_class=target_class,
+            valid_branch_ids=valid_branch_ids,
+        ).tolist()
+    )
+    sister = _union_unit_branch_ids(units_df=units_df, column="sister_branch_ids").intersection(valid)
+    if scan_other_scope == "all":
+        out = valid.difference(target)
+    elif scan_other_scope == "sister":
+        out = sister
+    else:
+        txt = "--scan_other_scope should be one of {}."
+        raise ValueError(txt.format(", ".join(SCAN_OTHER_SCOPES)))
+    return np.array(sorted(out.intersection(valid).difference(target)), dtype=np.int64)
+
+
+
+
+def _opportunity_states(from_ids, to_ids):
+    to_set = set(int(v) for v in np.asarray(to_ids, dtype=np.int64).reshape(-1).tolist())
+    out = []
+    for anc in np.asarray(from_ids, dtype=np.int64).reshape(-1).tolist():
+        anc = int(anc)
+        if any(der != anc for der in to_set):
+            out.append(anc)
+    return np.array(sorted(set(out)), dtype=np.int64)
+
+
+def _build_codon_state_ids(g):
+    codon_q = g.get("instantaneous_codon_rate_matrix", None)
+    group_indices = g.get("nonsynonymous_indices", None)
+    if codon_q is None or not isinstance(group_indices, dict):
+        return None
+    num_codon = int(np.asarray(codon_q).shape[0])
+    codon_state_ids = np.full(shape=(num_codon,), fill_value=-1, dtype=np.int64)
+    state_orders = sequence.get_nonsyn_state_orders(g)
+    for state_id, state_label in enumerate(state_orders.tolist()):
+        indices = group_indices.get(str(state_label), [])
+        for codon_id in np.asarray(indices, dtype=np.int64).reshape(-1).tolist():
+            if (int(codon_id) < 0) or (int(codon_id) >= num_codon):
+                raise ValueError("nonsynonymous_indices contained an out-of-range codon index.")
+            if codon_state_ids[int(codon_id)] >= 0:
+                raise ValueError("A codon was assigned to multiple nonsynonymous states.")
+            codon_state_ids[int(codon_id)] = int(state_id)
+    if (codon_state_ids < 0).any():
+        raise ValueError("Some codons were not assigned to a nonsynonymous state.")
+    return codon_state_ids
+
+
+def _build_scan_q_context(g, rate_exposure, branch_meta=None):
+    if rate_exposure not in ("q_weighted", "endpoint"):
+        return {
+            "q_matrix": None,
+            "state_cdn": None,
+            "codon_q_matrix": None,
+            "codon_state_ids": None,
+        }
+    codon_q = g.get("instantaneous_codon_rate_matrix", None)
+    state_cdn = g.get("state_cdn", None)
+    codon_state_ids = _build_codon_state_ids(g)
+    q_matrix = g.get("instantaneous_nsy_rate_matrix", None)
+    if rate_exposure == "endpoint":
+        if g.get("nonsyn_recode") == "3di20":
+            codon_q = g.get("3di_q")
+            state_cdn = g["state_nsy"]
+            codon_state_ids = np.arange(state_cdn.shape[2])
+        if codon_q is None or state_cdn is None or codon_state_ids is None:
+            raise ValueError("Scan endpoint exposure requires codon posterior states, codon Q and state groups.")
+        if branch_meta is None:
+            branch_meta = build_branch_metadata(g)
+        endpoint_context = scan_endpoint.build_context(g, branch_meta, codon_state_ids)
+        return {"q_matrix": None, "state_cdn": state_cdn,
+                "codon_q_matrix": codon_q, "codon_state_ids": codon_state_ids,
+                "endpoint_context": endpoint_context}
+    if (codon_q is None) or (state_cdn is None) or (codon_state_ids is None):
+        if q_matrix is None:
+            raise ValueError(
+                "--scan_rate_exposure q_weighted requires codon posterior states and an instantaneous codon Q matrix."
+            )
+        return {
+            "q_matrix": q_matrix,
+            "state_cdn": None,
+            "codon_q_matrix": None,
+            "codon_state_ids": None,
+        }
+    return {
+        "q_matrix": q_matrix,
+        "state_cdn": state_cdn,
+        "codon_q_matrix": codon_q,
+        "codon_state_ids": codon_state_ids,
+    }
+
+
+def _length_column(rate_length):
+    if rate_length == "raw":
+        return "raw_length"
+    if rate_length == "sn_rescaled":
+        return "sn_rescaled_length"
+    if rate_length == "n_rescaled":
+        return "n_rescaled_length"
+    raise ValueError("--scan_rate_length should be one of raw, sn_rescaled, n_rescaled.")
+
+
+def _poisson_lrt_pvalue(x_target, l_target, x_other, l_other):
+    """Legacy numerical diagnostic only; posterior mass has no exact Poisson P."""
+    return scan_statistics.rate_score(x_target, l_target, x_other, l_other)[1]
+
+
+def _bh_qvalues(pvalues):
+    pvalues = np.asarray(pvalues, dtype=np.float64)
+    qvalues = np.full(shape=pvalues.shape, fill_value=np.nan, dtype=np.float64)
+    valid = np.isfinite(pvalues)
+    if not valid.any():
+        return qvalues
+    valid_indices = np.where(valid)[0]
+    p = pvalues[valid]
+    order = np.argsort(p)
+    ranked = p[order]
+    n = ranked.shape[0]
+    q = np.empty(shape=n, dtype=np.float64)
+    prev = 1.0
+    for i in range(n - 1, -1, -1):
+        value = ranked[i] * n / (i + 1)
+        prev = min(prev, value)
+        q[i] = prev
+    out = np.empty(shape=n, dtype=np.float64)
+    out[order] = np.minimum(q, 1.0)
+    qvalues[valid_indices] = out
+    return qvalues
+
+
+def _assign_grouped_qvalues(scan_df, out_col, group_cols, p_col="p_rate_enrichment_asymptotic"):
+    scan_df[out_col] = np.nan
+    if scan_df.shape[0] == 0:
+        return scan_df
+    grouper = group_cols[0] if len(group_cols) == 1 else group_cols
+    for _, index_values in scan_df.groupby(grouper, sort=False, dropna=False).groups.items():
+        pvalues = scan_df.loc[index_values, p_col].to_numpy(dtype=np.float64)
+        scan_df.loc[index_values, out_col] = _bh_qvalues(pvalues)
+    return scan_df
+
+
+def _annotate_inference(scan_df, g):
+    calibration = normalize_scan_pvalue_calibration(g.get('scan_pvalue_calibration', 'full_scan'))
+    scan_df['scan_score_method'] = scan_statistics.SCORE_METHOD
+    scan_df['scan_event_measure'] = 'posterior_mean_jump_count' if g.get('scan_observation') == 'bridge' else 'posterior_mass'
+    scan_df['scan_bh_scope'] = scan_statistics.BH_SCOPE
+    if calibration in ('none', 'parametric_bootstrap'):
+        scan_df['scan_permutation_backend'] = 'not_used'
+        scan_df['scan_permutation_n_jobs'] = 0
+    scan_df['scan_maxT_scope'] = (
+        scan_statistics.MAXIMUM_SCOPE if calibration in ('full_scan', 'parametric_bootstrap', 'parametric') else 'none'
+    )
+    status = {'none': 'exploratory_asymptotic',
+              'candidate_fixed': 'diagnostic_fixed_candidates',
+              'full_scan': 'diagnostic_clade_resampling',
+              'parametric': 'fixed_model_parametric_bootstrap',
+              'parametric_bootstrap': 'pending_parametric_bootstrap'}[calibration]
+    if 'scan_inference_status' not in scan_df:
+        scan_df['scan_inference_status'] = status
+    else:
+        scan_df['scan_inference_status'] = scan_df['scan_inference_status'].fillna(status)
+    for (trait, match), indices in scan_df.groupby(['trait', 'scan_match'], dropna=False).groups.items():
+        scan_df.loc[indices, 'scan_bh_family_id'] = json.dumps([str(trait), str(match)], ensure_ascii=False)
+        scan_df.loc[indices, 'scan_bh_family_size'] = len(indices)
+        for label in ('asymptotic', 'empirical'):
+            values = scan_df.loc[indices, 'p_rate_enrichment_' + label].to_numpy(dtype=float)
+            scan_df.loc[indices, 'scan_bh_valid_' + label + '_count'] = int(np.isfinite(values).sum())
+    for col in ('scan_bh_family_size', 'scan_bh_valid_asymptotic_count', 'scan_bh_valid_empirical_count'):
+        scan_df[col] = scan_df[col].astype('int64')
+    return scan_df
+
+
+def _q_weighted_opportunity(
+    branch_meta,
+    state_nsy,
+    site,
+    from_ids,
+    to_ids,
+    q_matrix,
+    rate_length,
+    state_cdn=None,
+    codon_q_matrix=None,
+    codon_state_ids=None,
+):
+    if (state_cdn is not None) and (codon_q_matrix is not None) and (codon_state_ids is not None):
+        state_cdn = np.asarray(state_cdn, dtype=np.float64)
+        codon_q = np.asarray(codon_q_matrix, dtype=np.float64)
+        codon_state_ids = np.asarray(codon_state_ids, dtype=np.int64).reshape(-1)
+        if codon_q.ndim != 2 or codon_q.shape[0] != codon_q.shape[1]:
+            raise ValueError("instantaneous_codon_rate_matrix should be a square matrix.")
+        if state_cdn.shape[2] != codon_q.shape[0] or codon_state_ids.shape[0] != codon_q.shape[0]:
+            raise ValueError("Codon Q/state dimensions did not match for q_weighted scan exposure.")
+        q_positive = np.where(np.isfinite(codon_q) & (codon_q > 0), codon_q, 0.0)
+        from_set = set(int(v) for v in np.asarray(from_ids, dtype=np.int64).reshape(-1).tolist())
+        to_set = set(int(v) for v in np.asarray(to_ids, dtype=np.int64).reshape(-1).tolist())
+        codon_weights = np.zeros(shape=(codon_q.shape[0],), dtype=np.float64)
+        for anc_codon, anc_state in enumerate(codon_state_ids.tolist()):
+            anc_state = int(anc_state)
+            if anc_state not in from_set:
+                continue
+            candidate_mask = np.array(
+                [(int(state_id) in to_set) and (int(state_id) != anc_state) for state_id in codon_state_ids],
+                dtype=bool,
+            )
+            candidate_rate = float(q_positive[anc_codon, candidate_mask].sum())
+            if str(rate_length) == "n_rescaled":
+                nonsyn_mask = (codon_state_ids >= 0) & (codon_state_ids != anc_state)
+                total_rate = float(q_positive[anc_codon, nonsyn_mask].sum())
+                if total_rate > 0.0:
+                    codon_weights[anc_codon] = candidate_rate / total_rate
+            else:
+                codon_weights[anc_codon] = candidate_rate
+        parent_ids = branch_meta["parent_id"].astype(int).to_numpy(copy=False)
+        return state_cdn[parent_ids, int(site), :].dot(codon_weights)
+    if q_matrix is None:
+        raise ValueError(
+            "--scan_rate_exposure q_weighted requires codon-state posterior/Q context or "
+            "instantaneous_nsy_rate_matrix."
+        )
+    state_nsy = np.asarray(state_nsy, dtype=np.float64)
+    q = np.asarray(q_matrix, dtype=np.float64)
+    if q.ndim != 2 or q.shape[0] != q.shape[1]:
+        raise ValueError("instantaneous_nsy_rate_matrix should be a square matrix.")
+    num_state = int(state_nsy.shape[2])
+    if q.shape[0] != num_state:
+        txt = "instantaneous_nsy_rate_matrix shape ({}) did not match nonsyn state axis ({})."
+        raise ValueError(txt.format(q.shape[0], num_state))
+    q_positive = np.where(np.isfinite(q) & (q > 0), q, 0.0)
+    weights = np.zeros(shape=(num_state,), dtype=np.float64)
+    to_ids = np.asarray(to_ids, dtype=np.int64).reshape(-1)
+    for anc in np.asarray(from_ids, dtype=np.int64).reshape(-1).tolist():
+        anc = int(anc)
+        if (anc < 0) or (anc >= num_state):
+            continue
+        allowed_to = [int(der) for der in to_ids.tolist() if (int(der) != anc) and (0 <= int(der) < num_state)]
+        if len(allowed_to) == 0:
+            continue
+        row_rates = q_positive[anc, :].copy()
+        row_rates[anc] = 0.0
+        candidate_rate = float(row_rates[allowed_to].sum())
+        if str(rate_length) == "n_rescaled":
+            total_rate = float(row_rates.sum())
+            if total_rate > 0.0:
+                weights[anc] = candidate_rate / total_rate
+        else:
+            weights[anc] = candidate_rate
+    parent_ids = branch_meta["parent_id"].astype(int).to_numpy(copy=False)
+    return state_nsy[parent_ids, int(site), :].dot(weights)
+
+
+class _ScanRateMetadata:
+    """Borrow the fixed branch columns used to score foreground assignments."""
+
+    def __init__(self, branch_meta):
+        self.branch_meta = branch_meta
+        self.branch_ids = None
+        self._lengths = {}
+        self._parent_ids = None
+        self._event_selection = None
+
+    def prepare(self, target_branch_ids, other_branch_ids):
+        # Keep conversion lazy and ordered like the unprepared rate call.
+        target_set = set(int(v) for v in np.asarray(target_branch_ids, dtype=np.int64).reshape(-1).tolist())
+        if self.branch_ids is None:
+            self.branch_ids = self.branch_meta["branch_id"].astype(int).to_numpy(copy=False)
+        is_target = np.isin(self.branch_ids, np.array(sorted(target_set), dtype=np.int64))
+        if other_branch_ids is None:
+            other_set = set(int(v) for v in self.branch_ids.tolist()).difference(target_set)
+        else:
+            other_set = set(int(v) for v in np.asarray(other_branch_ids, dtype=np.int64).reshape(-1).tolist())
+            other_set = other_set.difference(target_set)
+        is_other = np.isin(self.branch_ids, np.array(sorted(other_set), dtype=np.int64))
+        return self, is_target, is_other
+
+    def select_events(self, events):
+        # One fixed branch axis per assignment; retain only the last size's
+        # bounds check, never an event vector or a per-candidate index cache.
+        size = len(events.values)
+        selection = self._event_selection
+        if selection is None or selection[0] != size:
+            ids = self.branch_ids
+            selection = (size, bool(((ids >= 0) & (ids < size)).all()))
+            self._event_selection = selection
+        if selection[1]:
+            return events.values[self.branch_ids]
+        return events.select(self.branch_ids)
+
+    def get_lengths(self, rate_length):
+        length_col = _length_column(rate_length)
+        if length_col not in self._lengths:
+            self._lengths[length_col] = tuple(
+                self.branch_meta[column].to_numpy(dtype=np.float64, copy=False)
+                for column in (length_col, "raw_length", "sn_rescaled_length", "n_rescaled_length")
+            )
+        return self._lengths[length_col]
+
+    def get_parents(self):
+        if self._parent_ids is None:
+            self._parent_ids = self.branch_meta["parent_id"].astype(int).to_numpy(copy=False)
+        return self._parent_ids
+
+
+def _rate_branch_values(
+    candidate_events, branch_data, state_nsy, site, from_ids, to_ids, rate_length, rate_exposure,
+    *, q_matrix, state_cdn, codon_q_matrix, codon_state_ids, endpoint_context, exposure_cache,
+):
+    branch_meta = branch_data.branch_meta
+    branch_ids = branch_data.branch_ids
+    if isinstance(candidate_events, _PosteriorBranchValues):
+        event_values = branch_data.select_events(candidate_events)
+    else:
+        event_ids = candidate_events["branch_id"]
+        if event_ids.is_unique:
+            # Posterior extraction already yields one row per branch.
+            event_by_branch = dict(zip(event_ids, candidate_events["event_pp"].fillna(0)))
+        else:
+            # Called events retain pandas' compensated summation.
+            event_by_branch = candidate_events.groupby("branch_id")["event_pp"].sum().to_dict()
+        event_values = np.array([float(event_by_branch.get(int(bid), 0.0)) for bid in branch_ids], dtype=np.float64)
+    chosen_length = branch_data.get_lengths(rate_length)[0]
+    missing_exposure = exposure_reasons = None
+    if rate_exposure == "endpoint":
+        if rate_length != "raw" or endpoint_context is None:
+            raise ValueError("Scan endpoint requires raw model lengths and a fitted endpoint context.")
+        if not np.array_equal(branch_ids, endpoint_context["branch_ids"]):
+            raise ValueError("Scan endpoint context branch order does not match branch metadata.")
+        def expected():
+            return scan_endpoint.expected_events(endpoint_context, state_cdn, state_nsy, site, from_ids, to_ids)
+        if exposure_cache is None:
+            opportunity, missing_exposure, exposure_reasons = expected()
+        else:
+            key = (id(endpoint_context), id(state_cdn), id(state_nsy), int(site), tuple(from_ids), tuple(to_ids))
+            opportunity, missing_exposure, exposure_reasons = exposure_cache.obtain(
+                key, expected, lambda values: sum(value.nbytes for value in values))
+    elif rate_exposure == "state_aware":
+        opp_states = _opportunity_states(from_ids=from_ids, to_ids=to_ids)
+        if opp_states.shape[0] == 0:
+            opportunity = np.zeros(shape=branch_ids.shape[0], dtype=np.float64)
+        else:
+            parent_ids = branch_data.get_parents()
+            opportunity = state_nsy[parent_ids, int(site), :][:, opp_states].sum(axis=1)
+    elif rate_exposure == "raw_branch_length":
+        opportunity = np.ones(shape=branch_ids.shape[0], dtype=np.float64)
+    elif rate_exposure == "q_weighted":
+        opportunity = _q_weighted_opportunity(
+            branch_meta=branch_meta,
+            state_nsy=state_nsy,
+            site=site,
+            from_ids=from_ids,
+            to_ids=to_ids,
+            q_matrix=q_matrix,
+            rate_length=rate_length,
+            state_cdn=state_cdn,
+            codon_q_matrix=codon_q_matrix,
+            codon_state_ids=codon_state_ids,
+        )
+    else:
+        txt = "--scan_rate_exposure should be one of {}."
+        raise ValueError(txt.format(", ".join(SCAN_RATE_EXPOSURES)))
+    exposure = opportunity if rate_exposure == "endpoint" else chosen_length * opportunity
+    return event_values, exposure, missing_exposure, exposure_reasons
+
+
+def _score_rate_branches(event_values, exposure, is_target, is_other, rate_exposure, impossible_indices=None,
+                         *, branch_indices=None):
+    target, other = (is_target, is_other) if branch_indices is None else branch_indices
+    target_event = float(event_values[target].sum())
+    other_event = float(event_values[other].sum())
+    target_exposure = float(exposure[target].sum())
+    other_exposure = float(exposure[other].sum())
+    score, pvalue = scan_statistics.rate_score(
+        x_target=target_event,
+        l_target=target_exposure,
+        x_other=other_event,
+        l_other=other_exposure,
+    )
+    if impossible_indices is None:
+        impossible = (event_values > 0) & (exposure == 0)
+        invalid_endpoint = rate_exposure == "endpoint" and impossible[is_target | is_other].any()
+    else:
+        impossible = None
+        invalid_endpoint = (rate_exposure == "endpoint" and impossible_indices.size
+                            and (is_target[impossible_indices] | is_other[impossible_indices]).any())
+    if invalid_endpoint:
+        score = pvalue = np.nan
+    return {
+        "score_rate_enrichment": score,
+        "target_event_count": target_event,
+        "other_event_count": other_event,
+        "target_exposure": target_exposure,
+        "other_exposure": other_exposure,
+    }, pvalue, impossible
+
+
+def _rate_summary(
+    candidate_events,
+    branch_meta,
+    state_nsy,
+    site,
+    from_ids,
+    to_ids,
+    target_branch_ids,
+    rate_length,
+    rate_exposure,
+    other_branch_ids=None,
+    q_matrix=None,
+    state_cdn=None,
+    codon_q_matrix=None,
+    codon_state_ids=None,
+    endpoint_context=None,
+    exposure_cache=None,
+    *,
+    score_only=False,
+    prepared_branch=None,
+):
+    if prepared_branch is None:
+        prepared_branch = _ScanRateMetadata(branch_meta).prepare(target_branch_ids, other_branch_ids)
+    branch_data, is_target, is_other = prepared_branch
+    event_values, exposure, missing_exposure, exposure_reasons = _rate_branch_values(
+        candidate_events, branch_data, state_nsy, site, from_ids, to_ids, rate_length, rate_exposure,
+        q_matrix=q_matrix, state_cdn=state_cdn, codon_q_matrix=codon_q_matrix, codon_state_ids=codon_state_ids,
+        endpoint_context=endpoint_context, exposure_cache=exposure_cache,
+    )
+    branch_ids = branch_data.branch_ids
+    rate, pvalue, impossible = _score_rate_branches(event_values, exposure, is_target, is_other, rate_exposure)
+    if score_only:
+        return rate
+    score = rate["score_rate_enrichment"]
+    target_event, other_event = rate["target_event_count"], rate["other_event_count"]
+    target_exposure, other_exposure = rate["target_exposure"], rate["other_exposure"]
+    _, raw_length, sn_length, n_length = branch_data.get_lengths(rate_length)
+    if rate_exposure != "endpoint":
+        missing_exposure = np.zeros(branch_ids.shape[0], dtype=bool)
+        exposure_reasons = np.full(branch_ids.shape[0], "ok", dtype="U24")
+        exposure_reasons[exposure == 0] = "legacy_zero_exposure"
+    target_rate = target_event / target_exposure if target_exposure > 0 else np.nan
+    other_rate = other_event / other_exposure if other_exposure > 0 else np.nan
+    if np.isfinite(target_rate) and np.isfinite(other_rate):
+        if other_rate == 0:
+            rate_ratio = np.inf if target_rate > 0 else np.nan
+        else:
+            rate_ratio = target_rate / other_rate
+    else:
+        rate_ratio = np.nan
+    if impossible[is_target | is_other].any():
+        rate_status = "positive_event_zero_exposure"
+        if rate_exposure == "endpoint":
+            target_rate = other_rate = rate_ratio = score = pvalue = np.nan
+    elif target_exposure == 0:
+        rate_status = "zero_target_exposure"
+    elif other_exposure == 0:
+        rate_status = "zero_other_exposure"
+    else:
+        rate_status = "ok"
+
+    def exposure_diagnostics(selected):
+        labels, counts = np.unique(exposure_reasons[selected], return_counts=True)
+        return ";".join("{}:{}".format(label, count) for label, count in zip(labels, counts) if label != "ok")
+
+    reason = ''
+    if not np.isfinite(score):
+        inputs = np.array([target_event, other_event, target_exposure, other_exposure])
+        if np.isfinite(inputs).all() and (inputs >= 0).all() and (inputs[2:] == 0).any():
+            reason = 'zero_exposure_no_rate_contrast'
+        else:
+            reason = 'invalid_rate_inputs'
+    return {
+        "scan_exposure_units": "expected_endpoint_events" if rate_exposure == "endpoint" else "legacy_weighted_branch_length",
+        "scan_endpoint_model": endpoint_context["model"] if endpoint_context is not None else "",
+        "scan_observation_method": "marginal_posterior_product",
+        "scan_inference_method": "exploratory_poisson_lrt",
+        "rate_status": rate_status,
+        "target_event_count": target_event,
+        "target_event_branch_count": int((event_values[is_target] > 0).sum()),
+        "target_raw_branch_length": float(raw_length[is_target].sum()),
+        "target_sn_rescaled_length": float(sn_length[is_target].sum()),
+        "target_n_rescaled_length": float(n_length[is_target].sum()),
+        "target_exposure_branch_length": np.nan if rate_exposure == "endpoint" else target_exposure,
+        "target_exposure": target_exposure,
+        "target_zero_exposure_branch_count": int(((exposure == 0) & ~missing_exposure & is_target).sum()),
+        "target_positive_event_zero_exposure_branch_count": int((impossible & is_target).sum()),
+        "target_missing_exposure_branch_count": int((missing_exposure & is_target).sum()),
+        "target_exposure_diagnostics": exposure_diagnostics(is_target),
+        "other_event_count": other_event,
+        "other_event_branch_count": int((event_values[is_other] > 0).sum()),
+        "other_raw_branch_length": float(raw_length[is_other].sum()),
+        "other_sn_rescaled_length": float(sn_length[is_other].sum()),
+        "other_n_rescaled_length": float(n_length[is_other].sum()),
+        "other_exposure_branch_length": np.nan if rate_exposure == "endpoint" else other_exposure,
+        "other_exposure": other_exposure,
+        "other_zero_exposure_branch_count": int(((exposure == 0) & ~missing_exposure & is_other).sum()),
+        "other_positive_event_zero_exposure_branch_count": int((impossible & is_other).sum()),
+        "other_missing_exposure_branch_count": int((missing_exposure & is_other).sum()),
+        "other_exposure_diagnostics": exposure_diagnostics(is_other),
+        "target_event_rate": target_rate,
+        "other_event_rate": other_rate,
+        "rate_ratio": rate_ratio,
+        "score_rate_enrichment": score,
+        "scan_rate_testable": bool(np.isfinite(score)),
+        "scan_rate_undefined_reason": reason,
+        "p_rate_enrichment_asymptotic": pvalue,
+    }
+
+
+def _rank_quantiles(values):
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    out = np.full(shape=values.shape, fill_value=np.nan, dtype=np.float64)
+    finite = np.isfinite(values)
+    if not finite.any():
+        return out
+    finite_values = values[finite]
+    ranks = rankdata(finite_values, method="average").astype(np.float64, copy=False)
+    out[finite] = ranks / finite_values.shape[0]
+    return out
+
+
+def _calc_conservation(state, orders, tip_ids, float_tol):
+    state = np.asarray(state)
+    orders = np.asarray(orders, dtype=object).reshape(-1)
+    tip_ids = np.asarray(tip_ids, dtype=np.int64).reshape(-1)
+    num_site = int(state.shape[1])
+    prefix = {
+        "conservation": np.full(num_site, np.nan, dtype=np.float64),
+        "entropy": np.full(num_site, np.nan, dtype=np.float64),
+        "major_state": np.array([""] * num_site, dtype=object),
+        "valid_tip_count": np.zeros(num_site, dtype=np.int64),
+    }
+    if tip_ids.shape[0] == 0:
+        return prefix
+    # Bound the advanced-indexing copy while retaining tip summation order.
+    # One selected site is the minimum block, even if it exceeds the target.
+    max_block_bytes = 16 * 1024 * 1024
+    bytes_per_site = tip_ids.shape[0] * state.shape[2] * state.dtype.itemsize
+    sites_per_block = max(1, max_block_bytes // max(bytes_per_site, 1))
+    if num_site > sites_per_block:
+        for start in range(0, num_site, sites_per_block):
+            stop = min(start + sites_per_block, num_site)
+            values = _calc_conservation(state[:, start:stop, :], orders, tip_ids, float_tol)
+            for key in prefix:
+                prefix[key][start:stop] = values[key]
+        return prefix
+    block = state[tip_ids, :, :]
+    valid = block.sum(axis=2) > float(float_tol)
+    prefix["valid_tip_count"] = valid.sum(axis=0).astype(np.int64, copy=False)
+    totals = block.sum(axis=0)
+    total_mass = totals.sum(axis=1)
+    valid_sites = total_mass > float(float_tol)
+    if valid_sites.any():
+        probs = np.zeros_like(totals, dtype=np.float64)
+        probs[valid_sites, :] = totals[valid_sites, :] / total_mass[valid_sites, None]
+        major_idx = probs.argmax(axis=1)
+        prefix["conservation"][valid_sites] = probs[valid_sites, major_idx[valid_sites]]
+        prefix["major_state"][valid_sites] = orders[major_idx[valid_sites]].astype(str)
+        entropy = np.zeros(num_site, dtype=np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_probs = np.where(probs > 0, np.log(probs), 0.0)
+        entropy[valid_sites] = -np.sum(probs[valid_sites, :] * log_probs[valid_sites, :], axis=1)
+        denom = math.log(max(orders.shape[0], 2))
+        prefix["entropy"][valid_sites] = entropy[valid_sites] / denom
+    return prefix
+
+
+def build_site_annotations(g, trait_name, fg_leaf_names_map=None):
+    num_site = int(g["state_nsy"].shape[1])
+    site_index_alignment = parser_misc.get_site_index_alignment(g=g, expected_num_site=num_site)
+    out = pd.DataFrame(
+        {
+            "site": np.arange(num_site, dtype=np.int64),
+            "codon_site_alignment": site_index_alignment.astype(np.int64, copy=False) + 1,
+        }
+    )
+    rate_values = g.get("iqtree_rate_values", None)
+    if rate_values is None:
+        out["site_rate"] = np.nan
+        out["site_rate_quantile"] = np.nan
+    else:
+        rate_values = np.asarray(rate_values, dtype=np.float64).reshape(-1)
+        if rate_values.shape[0] != num_site:
+            txt = "iqtree_rate_values length ({}) did not match scan site axis ({})."
+            raise ValueError(txt.format(rate_values.shape[0], num_site))
+        out["site_rate"] = rate_values
+        out["site_rate_quantile"] = _rank_quantiles(rate_values)
+    categorized_rate_values = g.get("iqtree_categorized_rate_values", None)
+    if categorized_rate_values is None:
+        out["site_rate_categorized"] = np.nan
+    else:
+        categorized_rate_values = np.asarray(categorized_rate_values, dtype=np.float64).reshape(-1)
+        if categorized_rate_values.shape[0] != num_site:
+            txt = "iqtree_categorized_rate_values length ({}) did not match scan site axis ({})."
+            raise ValueError(txt.format(categorized_rate_values.shape[0], num_site))
+        out["site_rate_categorized"] = categorized_rate_values
+    tip_ids = []
+    fg_tip_names = set()
+    if fg_leaf_names_map is None:
+        fg_leaf_names_map = g.get("fg_leaf_names", {})
+    for values in fg_leaf_names_map.get(trait_name, []):
+        fg_tip_names.update([str(v) for v in values])
+    bg_tip_ids = []
+    for leaf in ete.iter_leaves(g["tree"]):
+        branch_id = int(ete.get_prop(leaf, "numerical_label"))
+        tip_ids.append(branch_id)
+        if str(leaf.name) not in fg_tip_names:
+            bg_tip_ids.append(branch_id)
+    float_tol = float(g.get("float_tol", 1e-12))
+    state_orders = sequence.get_nonsyn_state_orders(g)
+    aa_orders = np.asarray(g.get("amino_acid_orders", []), dtype=object)
+    state_all = _calc_conservation(g.get("scan_observed_state_nsy", g["state_nsy"]), state_orders, tip_ids, float_tol)
+    state_bg = _calc_conservation(g.get("scan_observed_state_nsy", g["state_nsy"]), state_orders, bg_tip_ids, float_tol)
+    aa_all = _calc_conservation(g.get("scan_observed_state_pep", g["state_pep"]), aa_orders, tip_ids, float_tol)
+    aa_bg = _calc_conservation(g.get("scan_observed_state_pep", g["state_pep"]), aa_orders, bg_tip_ids, float_tol)
+    for label, values in [
+        ("state_all", state_all),
+        ("state_bg", state_bg),
+        ("aa_all", aa_all),
+        ("aa_bg", aa_bg),
+    ]:
+        out[label + "_conservation"] = values["conservation"]
+        out[label + "_entropy"] = values["entropy"]
+        out[label + "_major_state"] = values["major_state"]
+        out[label + "_valid_tip_count"] = values["valid_tip_count"]
+    return out
+
+
+def _select_scan_plot_rows(scan_df):
+    if scan_df.shape[0] == 0:
+        return scan_df.copy()
+    plot_rows = scan_df.loc[scan_df["target_class"].astype(str) == "fg", :].copy()
+    if plot_rows.shape[0] == 0:
+        return plot_rows
+    for col, default in [
+        ("support_unit_count", 0),
+        ("support_pp_sum", 0.0),
+        ("candidate_event_pp_sum", 0.0),
+        ("p_rate_enrichment_bootstrap_maxT", np.inf),
+        ("p_rate_enrichment_empirical_maxT", np.inf),
+        ("p_rate_enrichment_asymptotic", np.inf),
+    ]:
+        if col not in plot_rows.columns:
+            plot_rows[col] = default
+    for generic, legacy in [("support_mass_sum", "support_pp_sum"),
+                            ("candidate_event_mass_sum", "candidate_event_pp_sum")]:
+        if generic not in plot_rows:
+            plot_rows[generic] = plot_rows[legacy]
+        else:
+            plot_rows[generic] = plot_rows[generic].fillna(plot_rows[legacy])
+    plot_rows["__plot_bootstrap_p__"] = pd.to_numeric(
+        plot_rows["p_rate_enrichment_bootstrap_maxT"], errors="coerce"
+    ).fillna(np.inf)
+    plot_rows["__plot_empirical_p__"] = pd.to_numeric(
+        plot_rows["p_rate_enrichment_empirical_maxT"], errors="coerce"
+    ).fillna(np.inf)
+    plot_rows["__plot_analytical_p__"] = pd.to_numeric(
+        plot_rows["p_rate_enrichment_asymptotic"], errors="coerce"
+    ).fillna(np.inf)
+    plot_rows = plot_rows.sort_values(
+        by=[
+            "codon_site_alignment",
+            "support_unit_count",
+            "support_mass_sum",
+            "candidate_event_mass_sum",
+            "__plot_bootstrap_p__",
+            "__plot_empirical_p__",
+            "__plot_analytical_p__",
+        ],
+        ascending=[True, False, False, False, True, True, True],
+        kind="mergesort",
+    )
+    plot_rows = plot_rows.drop_duplicates(subset=["codon_site_alignment"], keep="first")
+    return plot_rows.drop(columns=["__plot_bootstrap_p__", "__plot_empirical_p__", "__plot_analytical_p__"]).reset_index(drop=True)
+
+
+def filter_scan_site_plot_candidates(scan_df, g):
+    mode = str(g.get("scan_site_plot_filter", "all")).strip().lower()
+    allowed = {"all", "analytical", "empirical", "full_scan", "parametric_bootstrap"}
+    if mode not in allowed:
+        raise ValueError("--scan_site_plot_filter should be one of {}.".format(", ".join(sorted(allowed))))
+    alpha = float(g.get("scan_site_plot_alpha", 0.05))
+    if (not np.isfinite(alpha)) or (alpha < 0) or (alpha > 1):
+        raise ValueError("--scan_site_plot_alpha should be a finite value between 0 and 1.")
+    if mode == "all":
+        return scan_df.copy()
+
+    calibration = normalize_scan_pvalue_calibration(g.get("scan_pvalue_calibration", "full_scan"))
+    if (mode == "empirical") and (calibration not in ("candidate_fixed", "full_scan")):
+        raise ValueError(
+            "--scan_site_plot_filter empirical requires --scan_pvalue_calibration "
+            "candidate_fixed or full_scan; use the full_scan plot filter for fixed-model parametric calibration."
+        )
+    if (mode == "full_scan") and (calibration not in ("full_scan", "parametric")):
+        raise ValueError(
+            "--scan_site_plot_filter full_scan requires --scan_pvalue_calibration full_scan or parametric."
+        )
+    if mode == "parametric_bootstrap" and calibration != "parametric_bootstrap":
+        raise ValueError("--scan_site_plot_filter parametric_bootstrap requires --scan_pvalue_calibration parametric_bootstrap.")
+    pvalue_columns = {
+        "analytical": ("p_endpoint_enrichment_analytic" if g.get("scan_analytic_pvalue") == "endpoint_mixture"
+                       else "p_rate_enrichment_asymptotic"),
+        "empirical": "p_rate_enrichment_empirical",
+        "full_scan": "p_rate_enrichment_empirical_maxT",
+        "parametric_bootstrap": "p_rate_enrichment_bootstrap_maxT",
+    }
+    pvalue_column = pvalue_columns[mode]
+    if pvalue_column not in scan_df.columns:
+        raise ValueError(
+            "--scan_site_plot_filter {} requires column {}.".format(mode, pvalue_column)
+        )
+    pvalues = pd.to_numeric(scan_df[pvalue_column], errors="coerce")
+    keep = np.isfinite(pvalues.to_numpy(dtype=np.float64)) & (pvalues.to_numpy(dtype=np.float64) <= alpha)
+    return scan_df.loc[keep, :].copy()
+
+
+def build_scan_site_plot_table(scan_df, g, ON_tensor):
+    if scan_df.shape[0] == 0:
+        return pd.DataFrame(), np.array([], dtype=np.int64)
+    plot_rows = _select_scan_plot_rows(scan_df)
+    if plot_rows.shape[0] == 0:
+        return pd.DataFrame(), np.array([], dtype=np.int64)
+    branch_ids = set()
+    for value in plot_rows.get("support_branch_ids", pd.Series(dtype=object)).tolist():
+        branch_ids.update(int(v) for v in _parse_id_list(value).tolist())
+    if len(branch_ids) == 0:
+        return pd.DataFrame(), np.array([], dtype=np.int64)
+    branch_ids = np.array(sorted(branch_ids), dtype=np.int64)
+    site_numbers = np.array(
+        sorted(set(plot_rows["codon_site_alignment"].astype(int).tolist())),
+        dtype=np.int64,
+    )
+    out = pd.DataFrame({"codon_site_alignment": site_numbers})
+    out.loc[:, "OCNany2spe"] = 0.0
+    out.loc[:, "OCNany2dif"] = 0.0
+    for branch_id in branch_ids.tolist():
+        out.loc[:, "N_sub_{}".format(int(branch_id))] = 0.0
+    site_to_row = {int(site): int(i) for i, site in enumerate(site_numbers.tolist())}
+    for _, row in plot_rows.iterrows():
+        alignment_site = int(row["codon_site_alignment"])
+        row_index = site_to_row.get(alignment_site, None)
+        if row_index is None:
+            continue
+        support_ids = set(int(v) for v in _parse_id_list(row.get("support_branch_ids", "")).tolist())
+        if len(support_ids) == 0:
+            continue
+        from_ids = _parse_id_list(row.get("from_state_ids", ""))
+        to_ids = _parse_id_list(row.get("to_state_ids", ""))
+        candidate_events = extract_candidate_posterior_events(
+            sub_tensor=ON_tensor,
+            site=int(row["site"]),
+            from_ids=from_ids,
+            to_ids=to_ids,
+            float_tol=float(g.get("float_tol", 1e-12)),
+        )
+        if candidate_events.shape[0] == 0:
+            continue
+        candidate_events = candidate_events.loc[
+            candidate_events["branch_id"].astype(int).isin(support_ids),
+            :,
+        ]
+        if candidate_events.shape[0] == 0:
+            continue
+        max_event = 0.0
+        for _, event in candidate_events.iterrows():
+            branch_id = int(event["branch_id"])
+            col = "N_sub_{}".format(branch_id)
+            if col not in out.columns:
+                continue
+            value = float(event["event_pp"])
+            if not np.isfinite(value):
+                continue
+            out.at[row_index, col] = max(float(out.at[row_index, col]), value)
+            max_event = max(max_event, value)
+        out.at[row_index, "OCNany2spe"] = max(float(out.at[row_index, "OCNany2spe"]), max_event)
+    if 'event_eligible' in g:
+        alignment_to_internal = dict(zip(plot_rows['codon_site_alignment'].astype(int), plot_rows['site'].astype(int)))
+        selected_sites = [alignment_to_internal[int(site)] for site in site_numbers]
+        for branch_id in branch_ids:
+            eligible = g['event_eligible'][branch_id, selected_sites]
+            out['N_eligible_{}'.format(branch_id)] = eligible
+            out.loc[~eligible, 'N_sub_{}'.format(branch_id)] = np.nan
+    return out, branch_ids
+
+
+def _build_scan_static_context(g, ON_tensor, rate_ON_tensor=None):
+    min_event_pp = scan_event_threshold(g)
+    events = extract_atomic_events(
+        sub_tensor=ON_tensor,
+        min_event_pp=min_event_pp,
+        float_tol=float(g.get("float_tol", 1e-12)),
+    )
+    branch_meta = build_branch_metadata(g)
+    trait_names = g["fg_df"].columns[1:].tolist()
+    observed_site_annotations = {
+        trait_name: build_site_annotations(g=g, trait_name=trait_name)
+        for trait_name in trait_names
+    }
+    permutation_site_annotations = None
+    if len(trait_names) > 0:
+        permutation_site_annotations = build_site_annotations(
+            g=g,
+            trait_name=trait_names[0],
+            fg_leaf_names_map={},
+        )
+    rate_exposure = resolve_scan_rate_exposure(g)
+    if rate_ON_tensor is None:
+        rate_ON_tensor = ON_tensor
+    rate_event_projection = None
+    if str(g.get("scan_rate_event_mode", "posterior_sum")).strip().lower() == "posterior_sum":
+        rate_event_projection = _build_scan_rate_projection(
+            sub_tensor=rate_ON_tensor,
+            scan_matches=g.get("scan_match", "any2spe"),
+        )
+    return {
+        "events": events,
+        "event_sites": _index_event_sites(events),
+        "branch_meta": branch_meta,
+        "valid_branch_ids": branch_meta["branch_id"].astype(int).to_numpy(copy=False),
+        "rate_exposure": rate_exposure,
+        "q_context": _build_scan_q_context(g=g, rate_exposure=rate_exposure, branch_meta=branch_meta),
+        "observed_site_annotations": observed_site_annotations,
+        "permutation_site_annotations": permutation_site_annotations,
+        "rate_event_projection": rate_event_projection,
+        # Single-pass discovery has no repeated candidate vectors to reuse.
+        '_cache_candidates': normalize_scan_pvalue_calibration(
+            g.get('scan_pvalue_calibration', 'full_scan')) in ('full_scan', 'candidate_fixed'),
+    }
+
+
+def _scan_substitutions_core(g, ON_tensor, rate_ON_tensor=None, scan_context=None, scan_static=None):
+    scan_matches = normalize_scan_matches(g.get("scan_match", "any2spe"))
+    scan_targets = ["fg"]
+    rate_length = str(g.get("scan_rate_length", "n_rescaled")).strip().lower()
+    _length_column(rate_length)
+    if scan_static is None:
+        scan_static = _build_scan_static_context(g=g, ON_tensor=ON_tensor)
+    rate_exposure = scan_static["rate_exposure"]
+    rate_event_mode = normalize_scan_rate_event_mode(g.get("scan_rate_event_mode", "posterior_sum"))
+    scan_other_scope = normalize_scan_other_scope(g.get("scan_other_scope", "all"))
+    pvalue_calibration = normalize_scan_pvalue_calibration(g.get("scan_pvalue_calibration", "full_scan"))
+    n_permutations = normalize_scan_n_permutations(g.get("scan_n_permutations", 1000))
+    permutation_seed = int(g.get("scan_permutation_seed", 1))
+    permutation_backend = _resolve_scan_permutation_backend()
+    permutation_n_jobs = _resolve_scan_permutation_n_jobs(g=g, n_permutations=n_permutations)
+    min_event_pp = scan_event_threshold(g)
+    state_orders = sequence.get_nonsyn_state_orders(g)
+    if rate_ON_tensor is None:
+        rate_ON_tensor = ON_tensor
+    q_context = scan_static["q_context"]
+    events = scan_static["events"]
+    event_sites = scan_static["event_sites"]
+    branch_meta = scan_static["branch_meta"]
+    valid_branch_ids = scan_static["valid_branch_ids"]
+    if scan_context is None:
+        units = build_scan_units(g=g, branch_meta=branch_meta)
+        trait_names = g["fg_df"].columns[1:].tolist()
+        fg_ids_map = _fg_ids_map_from_units(
+            units=units,
+            trait_names=trait_names,
+            column="fg_branch_ids",
+            fallback_map=g.get("fg_ids", {}),
+        )
+        rate_fg_ids_map = _rate_fg_ids_map_from_units(
+            units=units,
+            fg_ids_map=fg_ids_map,
+            trait_names=trait_names,
+        )
+    else:
+        units = scan_context["units"].copy()
+        fg_ids_map = scan_context["fg_ids"]
+        rate_fg_ids_map = scan_context.get("rate_fg_ids", scan_context["fg_ids"])
+        trait_names = list(scan_context["trait_names"])
+    if units.shape[0] == 0:
+        raise ValueError("No foreground units were available for scan. Use --foreground.")
+    rows = []
+    scan_id = 0
+    for trait_name in trait_names:
+        units_trait = units.loc[units["trait"] == trait_name, :].reset_index(drop=True)
+        candidate_branch_ids = _target_branch_ids_from_maps(
+            fg_ids_map=fg_ids_map,
+            trait_name=trait_name,
+            target_class="fg",
+            valid_branch_ids=valid_branch_ids,
+        )
+        candidate_events = events.loc[events["branch_id"].astype(int).isin(candidate_branch_ids.tolist()), :].copy()
+        candidates = build_candidates(
+            events=candidate_events,
+            scan_matches=scan_matches,
+            state_orders=state_orders,
+        )
+        if candidates.shape[0] == 0:
+            continue
+        min_support_count = parse_scan_support_threshold(
+            g.get("scan_min_support", "2"),
+            total_units=units_trait.shape[0],
+        )
+        if min_support_count > units_trait.shape[0]:
+            if scan_context is None:
+                txt = (
+                    "Scan warning: --scan_min_support resolved to {} for trait {}, "
+                    "but only {} foreground units are available; no candidates can pass."
+                )
+                print(txt.format(int(min_support_count), trait_name, int(units_trait.shape[0])), flush=True)
+            continue
+        if scan_context is None:
+            site_annotations = scan_static["observed_site_annotations"][trait_name]
+        else:
+            site_annotations = scan_static["permutation_site_annotations"]
+        site_annotation_by_site = site_annotations.set_index("site", drop=False)
+        unit_plan = _scan_unit_support_plan(units_trait)
+        rate_branch_sets = {
+            target_class: (
+                _target_branch_ids_from_maps(
+                    fg_ids_map=rate_fg_ids_map,
+                    trait_name=trait_name,
+                    target_class=target_class,
+                    valid_branch_ids=valid_branch_ids,
+                ),
+                _other_branch_ids_from_maps(
+                    fg_ids_map=rate_fg_ids_map,
+                    trait_name=trait_name,
+                    target_class=target_class,
+                    valid_branch_ids=valid_branch_ids,
+                    scan_other_scope=scan_other_scope,
+                    units_df=units_trait,
+                ),
+            )
+            for target_class in scan_targets
+        }
+        for cand in candidates.to_dict("records"):
+            site = int(cand["site"])
+            from_ids = np.array([int(v) for v in str(cand["from_state_ids"]).split(",") if v != ""], dtype=np.int64)
+            to_ids = np.array([int(v) for v in str(cand["to_state_ids"]).split(",") if v != ""], dtype=np.int64)
+            positions = _candidate_event_positions(events, event_sites, site, from_ids, to_ids)
+            matched_events = events.take(positions)
+            candidate_support = _summarize_unit_support(
+                candidate_events=matched_events,
+                units_df=units_trait,
+                target_class="fg",
+                min_event_pp=min_event_pp,
+                unit_plan=unit_plan,
+            )
+            if int(candidate_support["support_unit_count"]) < int(min_support_count):
+                continue
+            if rate_event_mode == "called":
+                rate_events = matched_events
+            elif rate_event_mode == "posterior_sum":
+                rate_events = _cached_posterior_events(
+                    scan_static=scan_static,
+                    sub_tensor=rate_ON_tensor,
+                    site=site,
+                    from_ids=from_ids,
+                    to_ids=to_ids,
+                    float_tol=float(g.get("float_tol", 1e-12)),
+                )
+            else:
+                txt = "--scan_rate_event_mode should be one of {}."
+                raise ValueError(txt.format(", ".join(SCAN_RATE_EVENT_MODES)))
+            scan_id += 1
+            site_row = site_annotation_by_site.loc[site, :].to_dict()
+            site_label = int(site_row.get("codon_site_alignment", site + 1))
+            state_change = _format_state_change(
+                from_label=cand["from_state"],
+                to_label=cand["to_state"],
+                site_label=site_label,
+                match=cand["scan_match"],
+            )
+            for target_class in scan_targets:
+                target_branch_ids, other_branch_ids = rate_branch_sets[target_class]
+                rate = _rate_summary(
+                    candidate_events=rate_events,
+                    branch_meta=branch_meta,
+                    state_nsy=np.asarray(g["state_nsy"]),
+                    site=site,
+                    from_ids=from_ids,
+                    to_ids=to_ids,
+                    target_branch_ids=target_branch_ids,
+                    rate_length=rate_length,
+                    rate_exposure=rate_exposure,
+                    other_branch_ids=other_branch_ids,
+                    q_matrix=q_context["q_matrix"],
+                    state_cdn=q_context["state_cdn"],
+                    codon_q_matrix=q_context["codon_q_matrix"],
+                    codon_state_ids=q_context["codon_state_ids"],
+                    endpoint_context=q_context.get("endpoint_context"),
+                    exposure_cache=_scan_candidate_cache(scan_static, '_exposure_cache'),
+                )
+                row = {
+                    "scan_id": int(scan_id),
+                    "trait": trait_name,
+                    "target_class": target_class,
+                    "scan_match": cand["scan_match"],
+                    "site": int(site),
+                    "nonsyn_recode": str(g.get("nonsyn_recode", "no")),
+                    "from_state": cand["from_state"],
+                    "to_state": cand["to_state"],
+                    "from_state_ids": cand["from_state_ids"],
+                    "to_state_ids": cand["to_state_ids"],
+                    "observed_from_state_ids": cand["observed_from_state_ids"],
+                    "observed_to_state_ids": cand["observed_to_state_ids"],
+                    "from_state_distribution": cand["from_state_distribution"],
+                    "to_state_distribution": cand["to_state_distribution"],
+                    "state_change": state_change,
+                    "candidate_event_pp_sum": float(cand["candidate_event_pp_sum"]),
+                    "scan_unit_mode": normalize_scan_unit_mode(g.get("scan_unit_mode", "clade")),
+                    "scan_min_support_count": int(min_support_count),
+                    "scan_min_event_pp": float(min_event_pp),
+                    "scan_rate_length_used": rate_length,
+                    "scan_rate_exposure": rate_exposure,
+                    "scan_rate_event_mode": rate_event_mode,
+                    "scan_other_scope": scan_other_scope,
+                    "scan_pvalue_calibration": pvalue_calibration,
+                    "scan_n_permutations": int(n_permutations),
+                    "scan_permutation_seed": int(permutation_seed),
+                    "scan_permutation_backend": permutation_backend,
+                    "scan_permutation_n_jobs": int(permutation_n_jobs),
+                    "scan_permutation_success_count": 0,
+                    "scan_permutation_failure_count": 0,
+                    "scan_permutation_failure_reasons": "",
+                    "p_rate_enrichment_bootstrap_maxT": np.nan,
+                    "scan_bootstrap_success_count": 0,
+                    "scan_bootstrap_failure_count": 0,
+                    "scan_bootstrap_directory": "",
+                    "p_rate_enrichment_empirical": np.nan,
+                    "p_rate_enrichment_empirical_maxT": np.nan,
+                }
+                row.update(site_row)
+                row.update(candidate_support)
+                row.update(rate)
+                rows.append(row)
+    if len(rows) == 0:
+        scan_df = pd.DataFrame(columns=list(SCAN_OUTPUT_COLUMNS))
+    else:
+        scan_df = pd.DataFrame(rows)
+        sort_cols = [
+            "trait",
+            "scan_match",
+            "site_rate_quantile",
+            "target_class",
+            "p_rate_enrichment_asymptotic",
+            "support_fraction",
+            "support_unit_count",
+        ]
+        for col in sort_cols:
+            if col not in scan_df.columns:
+                scan_df[col] = np.nan
+        scan_df = _assign_grouped_qvalues(
+            scan_df=scan_df,
+            out_col="q_rate_enrichment_asymptotic_by_trait_match",
+            group_cols=["trait", "scan_match"],
+        )
+        scan_df = scan_df.sort_values(
+            by=["trait", "scan_match", "score_rate_enrichment", "site_rate_quantile", "target_class"],
+            ascending=[True, True, False, True, True],
+            na_position="last",
+        ).reset_index(drop=True)
+        scan_df = scan_df.loc[:, [col for col in SCAN_OUTPUT_COLUMNS if col in scan_df.columns]]
+    return scan_df, units
+
+
+def _scan_permutation_seed(base_seed, permutation_index):
+    modulus = np.iinfo(np.uint32).max
+    return int((int(base_seed) + int(permutation_index)) % modulus)
+
+
+_SCAN_KEY_COLUMNS = ["trait", "target_class", "scan_match", "site", "from_state_ids", "to_state_ids"]
+
+
+def _scan_row_key(row):
+    return (
+        str(row["trait"]),
+        str(row["target_class"]),
+        str(row["scan_match"]),
+        int(row["site"]),
+        str(row["from_state_ids"]),
+        str(row["to_state_ids"]),
+    )
+
+
+def _empirical_p_from_scores(score_obs, values, denominator_count, exact=False):
+    if len(values) != denominator_count:
+        raise ValueError("Each scan configuration must contribute exactly one null statistic.")
+    return scan_statistics.empirical_pvalue(score_obs, values, denominator_count, exact=exact)
+
+
+def _build_permuted_context_with_seed(g, trait_names, valid_branch_ids, permutation_index, include_units=True):
+    rng = np.random.default_rng(_scan_permutation_seed(
+        base_seed=int(g.get("scan_permutation_seed", 1)), permutation_index=permutation_index,
+    ))
+    configurations = None
+    if g.get("_scan_permutation_exact", False):
+        configurations = {
+            trait: _get_scan_trait_plan(g, trait, valid_branch_ids)["sampler"].configurations[permutation_index - 1]
+            for trait in trait_names
+        }
+    return _build_permuted_scan_context(
+        g=g, trait_names=trait_names, valid_branch_ids=valid_branch_ids,
+        sample_original_foreground=True, rng=rng, configurations=configurations,
+        include_units=include_units,
+    )
+
+
+def _fixed_scan_candidates(records):
+    for row in records:
+        key = _scan_row_key(row)
+        from_ids = tuple(_parse_id_list(row['from_state_ids']))
+        to_ids = tuple(_parse_id_list(row['to_state_ids']))
+        yield key, key[:2], (key[3], from_ids, to_ids)
+
+
+def _candidate_fixed_permutation_scores(
+    g,
+    observed_df,
+    scan_context,
+    branch_meta,
+    valid_branch_ids,
+    ON_tensor,
+    rate_ON_tensor,
+    scan_static=None,
+):
+    rate_length = str(g.get("scan_rate_length", "n_rescaled")).strip().lower()
+    rate_exposure = scan_static["rate_exposure"] if scan_static is not None else resolve_scan_rate_exposure(g)
+    rate_event_mode = normalize_scan_rate_event_mode(g.get("scan_rate_event_mode", "posterior_sum"))
+    scan_other_scope = normalize_scan_other_scope(g.get("scan_other_scope", "all"))
+    min_event_pp = scan_event_threshold(g)
+    called_events = None
+    called_sites = None
+    if rate_event_mode == "called":
+        if scan_static is not None:
+            called_events = scan_static["events"]
+            called_sites = scan_static["event_sites"]
+        else:
+            called_events = extract_atomic_events(
+                sub_tensor=ON_tensor,
+                min_event_pp=min_event_pp,
+                float_tol=float(g.get("float_tol", 1e-12)),
+            )
+            called_sites = _index_event_sites(called_events)
+    q_context = scan_static["q_context"] if scan_static is not None else _build_scan_q_context(
+        g=g,
+        rate_exposure=rate_exposure,
+        branch_meta=branch_meta,
+    )
+    out = {}
+    candidates = scan_static.get('_fixed_candidates') if scan_static is not None else None
+    if candidates is None:
+        candidates = _fixed_scan_candidates(observed_df.to_dict('records'))
+    branch_masks = {}
+    branch_data = scan_static.get('_fixed_rate_metadata') if scan_static is not None else None
+    if branch_data is None:
+        branch_data = _ScanRateMetadata(branch_meta)
+    cache = scan_static.get('_fixed_rate_cache') if scan_static is not None else None
+    projection = scan_static.get('rate_event_projection') if scan_static is not None else None
+    state_nsy = np.asarray(g["state_nsy"])
+    float_tol = float(g.get("float_tol", 1e-12))
+
+    def values_for(site, from_ids, to_ids):
+        if rate_event_mode == "called":
+            positions = _candidate_event_positions(called_events, called_sites, site, from_ids, to_ids)
+            rate_events = called_events.take(positions)
+        else:
+            events = extract_candidate_posterior_events(
+                rate_ON_tensor, site, from_ids, to_ids, float_tol, projection,
+            )
+            rate_events = _PosteriorBranchValues(events, rate_ON_tensor.shape[0])
+        event_values, exposure, _, _ = _rate_branch_values(
+            rate_events, branch_data, state_nsy, site, from_ids, to_ids, rate_length, rate_exposure,
+            q_matrix=q_context["q_matrix"], state_cdn=q_context["state_cdn"], codon_q_matrix=q_context["codon_q_matrix"],
+            codon_state_ids=q_context["codon_state_ids"], endpoint_context=q_context.get("endpoint_context"),
+            exposure_cache=None,
+        )
+        return event_values, exposure, np.flatnonzero((event_values > 0) & (exposure == 0))
+
+    for row_key, branch_key, values_key in candidates:
+        if branch_key not in branch_masks:
+            trait_name, target_class = branch_key
+            fg_ids = scan_context.get('rate_fg_ids', scan_context['fg_ids'])
+            target_ids = _target_branch_ids_from_maps(fg_ids, trait_name, target_class, valid_branch_ids)
+            if scan_context['units'] is None:
+                if scan_other_scope == 'all':
+                    other_ids = valid_branch_ids
+                elif scan_other_scope == 'sister':
+                    other_ids = scan_context['sister_ids'][trait_name]
+                else:
+                    raise ValueError("Unsupported fixed-candidate control scope: " + str(scan_other_scope))
+                other_ids = np.setdiff1d(other_ids, target_ids)
+            else:
+                units_trait = scan_context['units'].loc[scan_context['units']['trait'] == trait_name, :].reset_index(drop=True)
+                other_ids = _other_branch_ids_from_maps(
+                    fg_ids, trait_name, target_class, valid_branch_ids, scan_other_scope, units_df=units_trait)
+            _, is_target, is_other = branch_data.prepare(target_ids, other_ids)
+            # Retain branch order so indexed sums round like the masked sums.
+            branch_indices = np.flatnonzero(is_target), np.flatnonzero(is_other)
+            branch_masks[branch_key] = is_target, is_other, branch_indices
+        if cache is None:
+            event_values, exposure, impossible_indices = values_for(*values_key)
+        else:
+            event_values, exposure, impossible_indices = cache.obtain(
+                values_key, lambda: values_for(*values_key), lambda arrays: sum(array.nbytes for array in arrays),
+            )
+        is_target, is_other, branch_indices = branch_masks[branch_key]
+        rate, _, _ = _score_rate_branches(
+            event_values, exposure, is_target, is_other, rate_exposure, impossible_indices=impossible_indices,
+            branch_indices=branch_indices,
+        )
+        out[row_key] = scan_statistics.calibration_score(rate)
+    return out
+
+
+def _run_scan_permutation(
+    permutation_index,
+    g,
+    observed_df,
+    observed_keys,
+    calibration,
+    trait_names,
+    branch_meta,
+    valid_branch_ids,
+    ON_tensor,
+    rate_ON_tensor,
+    scan_static,
+):
+    diagnostic = {
+        "permutation_index": int(permutation_index),
+        "seed": None if g.get("_scan_permutation_exact", False) else _scan_permutation_seed(
+            int(g.get("scan_permutation_seed", 1)), permutation_index,
+        ),
+        "configuration_id": None,
+        "configuration": None,
+        "sampling_attempts": 0,
+        "candidate_count": 0,
+        "testable_candidate_count": 0,
+        "max_score": None,
+        "status": "failed",
+        "failure_reason": "",
+    }
+    try:
+        scan_context = _build_permuted_context_with_seed(
+            g=g,
+            trait_names=trait_names,
+            valid_branch_ids=valid_branch_ids,
+            permutation_index=permutation_index,
+            include_units=calibration != "candidate_fixed",
+        )
+        for key in ("configuration_id", "configuration", "sampling_attempts"):
+            diagnostic[key] = scan_context[key]
+        if calibration == "candidate_fixed":
+            perm_by_key = _candidate_fixed_permutation_scores(
+                g=g, observed_df=observed_df, scan_context=scan_context,
+                branch_meta=branch_meta, valid_branch_ids=valid_branch_ids,
+                ON_tensor=ON_tensor, rate_ON_tensor=rate_ON_tensor, scan_static=scan_static,
+            )
+            if set(perm_by_key) != observed_keys:
+                raise ValueError("A fixed-candidate scan permutation did not evaluate every observed candidate.")
+        else:
+            perm_df, _ = _scan_substitutions_core(
+                g=g, ON_tensor=ON_tensor, rate_ON_tensor=rate_ON_tensor,
+                scan_context=scan_context, scan_static=scan_static,
+            )
+            perm_by_key = {_scan_row_key(row): scan_statistics.calibration_score(row) for _, row in perm_df.iterrows()}
+            if len(perm_by_key) != len(perm_df):
+                raise ValueError("Duplicate candidate keys in a scan permutation.")
+        scores = np.asarray(list(perm_by_key.values()), dtype=np.float64)
+        diagnostic["candidate_count"] = int(len(scores))
+        diagnostic["testable_candidate_count"] = int(np.isfinite(scores).sum())
+        if np.isnan(scores).any() or np.isposinf(scores).any():
+            raise ValueError("A scan candidate has an undefined or invalid rate statistic (check exposures and states).")
+        # Empty/testability-excluded families are successful no-test outcomes.
+        # Every configuration contributes once, even when a key is absent.
+        max_score = float(scores.max()) if len(scores) else -np.inf
+        diagnostic.update(status="success", max_score=None if max_score == -np.inf else max_score)
+        return {
+            "success": True, "max_score": max_score, "candidate_scores": perm_by_key,
+            "failure_reason": "", "diagnostic": diagnostic,
+        }
+    except Exception as exc:
+        reason = "{}: {}".format(type(exc).__name__, str(exc))
+        diagnostic["failure_reason"] = reason
+        if isinstance(exc, (scan_permutation.SamplingError, trait_ctmc.SamplingError)):
+            diagnostic["sampling_attempts"] = exc.attempts
+        return {
+            "success": False, "max_score": np.nan, "candidate_scores": {},
+            "failure_reason": reason, "diagnostic": diagnostic,
+        }
+
+
+def _run_scan_permutation_chunk(
+    permutation_indices,
+    g,
+    observed_df,
+    observed_keys,
+    calibration,
+    trait_names,
+    branch_meta,
+    valid_branch_ids,
+    ON_tensor,
+    rate_ON_tensor,
+    scan_static,
+):
+    g, scan_static = _unpack_scan_worker_context(g=g, scan_static=scan_static)
+    ON_tensor = _unpack_scan_tensor_for_worker(ON_tensor)
+    rate_ON_tensor = _unpack_scan_tensor_for_worker(rate_ON_tensor)
+    records = observed_df.loc[:, _SCAN_KEY_COLUMNS].to_dict('records')
+    if calibration == 'candidate_fixed':
+        # Candidate events and exposures depend only on this worker's fixed fit.
+        scan_static['_fixed_rate_metadata'] = _ScanRateMetadata(branch_meta)
+        scan_static['_fixed_rate_cache'] = _scan_candidate_cache(scan_static, '_fixed_rate_cache')
+        scan_static['_fixed_candidates'] = list(_fixed_scan_candidates(records))
+    scores = observed_df['score_rate_enrichment'].to_numpy(dtype=np.float64)
+    enriched = np.isfinite(scores) & (scores > 0)
+    test_keys = tuple(_scan_row_key(records[i]) for i in np.flatnonzero(enriched))
+    tested_scores = scores[enriched]
+    exceedances = np.zeros(len(test_keys), dtype=np.int64)
+    summary: dict[str, Any] = {
+        "success_count": 0,
+        "failure_count": 0,
+        "failure_reasons": [],
+        "diagnostics": [],
+        "max_score": [],
+        "exceedances": exceedances,
+    }
+    for permutation_index in np.asarray(
+        permutation_indices, dtype=np.int64
+    ).reshape(-1).tolist():
+        result = _run_scan_permutation(
+            permutation_index=int(permutation_index),
+            g=g,
+            observed_df=observed_df,
+            observed_keys=observed_keys,
+            calibration=calibration,
+            trait_names=trait_names,
+            branch_meta=branch_meta,
+            valid_branch_ids=valid_branch_ids,
+            ON_tensor=ON_tensor,
+            rate_ON_tensor=rate_ON_tensor,
+            scan_static=scan_static,
+        )
+        summary["diagnostics"].append(result["diagnostic"])
+        if not result.get("success", False):
+            summary["failure_count"] += 1
+            reason = str(result.get("failure_reason", "")).strip()
+            if reason and reason not in summary["failure_reasons"]:
+                summary["failure_reasons"].append(reason)
+            continue
+        summary["success_count"] += 1
+        summary["max_score"].append(float(result["max_score"]))
+        reference = result["candidate_scores"]
+        trial_scores = np.fromiter((reference.get(key, -np.inf) for key in test_keys),
+                                   dtype=np.float64, count=len(test_keys))
+        # Absent candidates contribute -inf. Only positive observed scores need
+        # a tail count, and each assignment still contributes to the denominator.
+        exceedances += scan_statistics._empirical_upper_tail(tested_scores, trial_scores)
+    return summary
+
+
+def _scan_plan_diagnostics(g, trait_name, plan, branch_meta):
+    trait_cache = plan["trait_cache"]
+    sampler = plan["sampler"]
+    state = np.asarray(g["state_nsy"])
+    # Summarize in bounded blocks: diagnostics must not copy a potentially large
+    # branch x site x state memmap or retain a second posterior tensor.
+    valid_counts = np.zeros(state.shape[0], dtype=np.int64)
+    entropy_sums = np.zeros(state.shape[0], dtype=np.float64)
+    for bid in branch_meta["branch_id"]:
+        for start in range(0, state.shape[1], 4096):
+            block = np.asarray(state[int(bid), start:start + 4096], dtype=np.float64)
+            mass = block.sum(axis=1)
+            valid = np.isfinite(block).all(axis=1) & (mass > float(g.get("float_tol", 0)))
+            probabilities = np.divide(block, mass[:, None], out=np.zeros_like(block), where=valid[:, None])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                entropy = -np.where(probabilities > 0, probabilities * np.log(probabilities), 0).sum(axis=1)
+            valid_counts[int(bid)] += int(valid.sum())
+            entropy_sums[int(bid)] += float(entropy[valid].sum())
+    metadata = branch_meta.set_index("branch_id")
+    nodes = _node_by_branch_id(g)
+    depths: dict[int, float] = {}
+    for node in g["tree"].traverse("preorder"):
+        bid = int(ete.get_prop(node, "numerical_label"))
+        depths[bid] = 0.0 if ete.is_root(node) else depths[int(ete.get_prop(node.up, "numerical_label"))] + float(node.dist)
+
+    def finite_or_none(value):
+        return float(value) if np.isfinite(value) else None
+
+    clades = []
+    for i, bid in enumerate(trait_cache["branch_ids"]):
+        target_ids = [int(b) for b in _selected_stem_fg_branch_ids(g, trait_cache, i) if int(b) in metadata.index]
+        valid_count = int(valid_counts[target_ids].sum())
+        cell_count = len(target_ids) * state.shape[1]
+        clades.append({
+            "stem_branch_id": int(bid),
+            "parent_branch_id": int(ete.get_prop(nodes[int(bid)].up, "numerical_label")),
+            "leaf_names": list(trait_cache["leaf_names_by_index"][i]),
+            "leaf_count": int(trait_cache["size"][i]),
+            "bin": int(plan["bin_array"][i]) if sampler is not None else None,
+            "eligible": bool(plan["eligible"][i]),
+            "target_branch_ids": target_ids,
+            "root_distance": finite_or_none(depths[int(bid)]),
+            "stem_raw_length": finite_or_none(float(nodes[int(bid)].dist)),
+            "target_raw_length": finite_or_none(metadata.loc[target_ids, "raw_length"].sum()),
+            "target_n_rescaled_length": finite_or_none(metadata.loc[target_ids, "n_rescaled_length"].sum()),
+            "target_sn_rescaled_length": finite_or_none(metadata.loc[target_ids, "sn_rescaled_length"].sum()),
+            "analyzable_state_fraction": valid_count / cell_count if cell_count else 0.0,
+            "mean_state_entropy": finite_or_none(entropy_sums[target_ids].sum() / valid_count) if valid_count else None,
+        })
+    if sampler is None:
+        model = g["_fg_trait_model"]
+        return {
+            "trait": str(trait_name),
+            "sampling_law": "fitted_binary_trait_ctmc",
+            "rate_model": g.get("fg_trait_rate_model", "er"),
+            "time_tree": str(g["fg_trait_tree"]),
+            **model.details(g.get("fg_trait_match_tip_count", False)),
+            "clades": clades,
+        }
+    return {
+        "trait": str(trait_name),
+        "bin_boundaries": [int(v) for v in plan["bins"]],
+        "bin_pools": [[int(trait_cache["branch_ids"][i]) for i in pool] for pool in sampler.pools],
+        "component_counts_by_bin_and_group": [list(counts) for counts in sampler.counts],
+        "group_labels": [str(group["lineage_value"]) for group in plan["groups"]] if normalize_scan_unit_mode(g.get("scan_unit_mode")) == "lineage" else ["pooled_clades"],
+        "proposal_space_size": str(sampler.proposal_count),
+        "valid_space_size": len(sampler.configurations) if sampler.configurations is not None else None,
+        "sampling_probability": 1.0 / len(sampler.configurations) if sampler.configurations is not None else None,
+        "sampling_law": "uniform_over_valid_configurations",
+        "max_rejection_draws": scan_permutation.MAX_REJECTION_DRAWS,
+        "clades": clades,
+    }
+
+
+def _finish_scan_calibration(g, observed_df, diagnostic):
+    trials = diagnostic["trials"]
+    diagnostic["success_count"] = sum(trial["status"] == "success" for trial in trials)
+    diagnostic["failure_count"] = len(trials) - diagnostic["success_count"]
+    diagnostic["sampling_attempts"] = sum(trial["sampling_attempts"] for trial in trials)
+    diagnostic["unique_configuration_count"] = len({trial["configuration_id"] for trial in trials if trial["configuration_id"] is not None})
+    observed_id = diagnostic.get("observed", {}).get("configuration_id")
+    diagnostic["original_configuration_count"] = sum(trial["configuration_id"] == observed_id for trial in trials) if observed_id is not None else 0
+    reasons = list(dict.fromkeys(trial["failure_reason"] for trial in trials if trial["failure_reason"]))
+    if diagnostic.get("failure_reason"):
+        reasons.insert(0, diagnostic["failure_reason"])
+    out = observed_df.copy()
+    columns = {
+        "scan_permutation_success_count": diagnostic["success_count"],
+        "scan_permutation_failure_count": diagnostic["failure_count"],
+        "scan_permutation_failure_reasons": "; ".join(reasons[:5]),
+        "scan_calibration_status": diagnostic["status"],
+        "scan_calibration_null": diagnostic["null"],
+        "scan_calibration_scope": diagnostic["scope"],
+        "scan_permutation_sampling": diagnostic["sampling"],
+        "scan_permutation_unique_count": diagnostic["unique_configuration_count"],
+        "scan_permutation_space_size": diagnostic.get("space_size"),
+        "scan_pvalue_resolution": diagnostic.get("pvalue_resolution"),
+    }
+    for col, value in columns.items():
+        out[col] = value
+    if str(diagnostic["status"]).startswith("unavailable"):
+        out["scan_inference_status"] = "failed_null_replicates"
+    g["scan_calibration_diagnostics"] = diagnostic
+    return out
+
+
+def _calibrate_scan_pvalues(g, observed_df, ON_tensor, rate_ON_tensor, scan_static):
+    calibration = normalize_scan_pvalue_calibration(g.get("scan_pvalue_calibration", "full_scan"))
+    requested_count = normalize_scan_n_permutations(g.get("scan_n_permutations", 1000))
+    diagnostic = {
+        "schema_version": 1,
+        "calibration": calibration,
+        "null": "uniform_nonoverlapping_size_binned_clades",
+        "assumption": "The observed assignment is uniform over the fixed eligible configurations, conditional on the tree, states, masks and bin/group counts.",
+        "scope": "within_trait_full_scan" if calibration == "full_scan" else "observed_candidates_exploratory",
+        "status": "disabled" if calibration == "none" else "pending",
+        "sampling": "not_run",
+        "requested_count": requested_count,
+        "seed": int(g.get("scan_permutation_seed", 1)),
+        "original_foreground_included": True,
+        "trials": [],
+        "settings": {
+            "substitution_posterior": str(g.get("substitution_posterior", "marginal")),
+            "scan_observation": str(g.get("scan_observation", "marginal")),
+            "scan_match": normalize_scan_matches(g.get("scan_match", "any2spe")),
+            "scan_min_support": str(g.get("scan_min_support", "2")),
+            "scan_min_event_pp": float(g.get("scan_min_event_pp", 0.5)),
+            "scan_rate_length": str(g.get("scan_rate_length", "n_rescaled")),
+            "scan_rate_event_mode": normalize_scan_rate_event_mode(g.get("scan_rate_event_mode", "posterior_sum")),
+            "scan_other_scope": normalize_scan_other_scope(g.get("scan_other_scope", "all")),
+            "scan_unit_mode": normalize_scan_unit_mode(g.get("scan_unit_mode", "clade")),
+            "fg_stem_only": bool(g.get("fg_stem_only", False)),
+            "scan_sister_stem_only": bool(g.get("scan_sister_stem_only", False)),
+            "min_clade_bin_count": int(g.get("min_clade_bin_count", g.get("scan_permutation_min_clade_bin_count", 10))),
+        },
+        "resolved_rate_exposure": scan_static["rate_exposure"],
+        "state_tensor_shape": list(np.asarray(g["state_nsy"]).shape),
+        "endpoint_model": g.get("scan_endpoint_metadata"),
+    }
+    if calibration == "parametric":
+        from csubst import scan_ctmc
+        return scan_ctmc.calibrate(g, observed_df)
+    if calibration in ("none", "parametric_bootstrap"):
+        diagnostic.update(status="disabled", null="none", scope="uncalibrated", assumption=None, original_foreground_included=None)
+        return _finish_scan_calibration(g, observed_df, diagnostic)
+    branch_meta = scan_static["branch_meta"]
+    valid_branch_ids = scan_static["valid_branch_ids"]
+    trait_names = g["fg_df"].columns[1:].tolist()
+    plan = _get_scan_trait_plan(g, trait_names[0], valid_branch_ids)
+    sampler = plan["sampler"]
+    diagnostic["plan"] = _scan_plan_diagnostics(g, trait_names[0], plan, branch_meta)
+    enumerated = None if sampler is None else sampler.configurations
+    diagnostic["space_size"] = None if enumerated is None else len(enumerated)
+    if sampler is None:
+        diagnostic.update(
+            null="fitted_binary_trait_ctmc",
+            assumption="The binary trait follows the fitted CTMC on the time tree independently of "
+                       "the fixed molecular data, conditional on the analyzable origin count and "
+                       "any specified positive tip count.",
+        )
+    observed_context = _build_permuted_scan_context(
+        g, trait_names, valid_branch_ids,
+        configurations={trait_names[0]: plan["observed"]},
+    )
+    diagnostic["observed"] = {
+        "configuration": observed_context["configuration"],
+        "configuration_id": observed_context["configuration_id"],
+        "candidate_count": int(len(observed_df)),
+    }
+    if observed_df.empty:
+        diagnostic.update(status="no_observed_candidates")
+        if calibration == "full_scan":
+            diagnostic["global_pvalue"] = 1.0
+        return _finish_scan_calibration(g, observed_df, diagnostic)
+    try:
+        observed_maximum = scan_statistics.maximum_score(observed_df)
+    except ValueError as exc:
+        diagnostic.update(status="unavailable_observed_statistic", failure_reason=str(exc))
+        return _finish_scan_calibration(g, observed_df, diagnostic)
+    observed_scores = observed_df["score_rate_enrichment"].to_numpy(dtype=np.float64)
+    diagnostic["observed"]["max_score"] = None if observed_maximum == -np.inf else observed_maximum
+    observed_candidates = observed_df.loc[:, _SCAN_KEY_COLUMNS + ["score_rate_enrichment"]]
+    observed_keys = {_scan_row_key(row) for row in observed_candidates.to_dict('records')}
+    if len(observed_keys) != len(observed_df):
+        raise ValueError("Duplicate observed candidate keys in scan calibration.")
+    exact = enumerated is not None and len(enumerated) <= requested_count
+    g["_scan_permutation_exact"] = exact
+    n_permutations = len(enumerated) if exact else requested_count
+    diagnostic.update(
+        sampling="exact" if exact else "monte_carlo",
+        pvalue_resolution=1.0 / (n_permutations if exact else n_permutations + 1),
+    )
+    n_jobs = _resolve_scan_permutation_n_jobs(g=g, n_permutations=n_permutations)
+    backend = _resolve_scan_permutation_backend()
+    diagnostic.update(backend=backend, n_jobs=n_jobs)
+    permutation_chunks, _ = parallel.get_chunks(
+        input_data=np.arange(1, n_permutations + 1, dtype=np.int64),
+        threads=n_jobs, chunk_factor=parallel.resolve_chunk_factor(task="general"),
+    )
+    owned_worker_paths = []
+    if (backend == "multiprocessing") and (n_jobs > 1):
+        worker_g, worker_scan_static, owned_worker_paths = _pack_scan_worker_context(g=g, scan_static=scan_static)
+        worker_ON_tensor = _pack_scan_array_for_worker(ON_tensor, name="ON_tensor", owned_paths=owned_worker_paths, min_copy_bytes=0)
+        worker_rate_ON_tensor = worker_ON_tensor if rate_ON_tensor is ON_tensor else _pack_scan_array_for_worker(
+            rate_ON_tensor, name="rate_ON_tensor", owned_paths=owned_worker_paths, min_copy_bytes=0,
+        )
+    else:
+        worker_g, worker_scan_static = g, scan_static
+        worker_ON_tensor, worker_rate_ON_tensor = ON_tensor, rate_ON_tensor
+    permutation_args = [
+        (chunk, worker_g, observed_candidates, observed_keys, calibration, trait_names, branch_meta,
+         valid_branch_ids, worker_ON_tensor, worker_rate_ON_tensor, worker_scan_static)
+        for chunk in permutation_chunks
+    ]
+    try:
+        chunk_results = parallel.run_starmap(_run_scan_permutation_chunk, permutation_args, n_jobs=n_jobs, backend=backend)
+    finally:
+        for path in owned_worker_paths:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+    max_perm_score = []
+    for result in chunk_results:
+        diagnostic["trials"].extend(result["diagnostics"])
+        max_perm_score.extend(result["max_score"])
+    diagnostic["trials"].sort(key=lambda trial: trial["permutation_index"])
+    out = observed_df.copy()
+    out["scan_permutation_backend"] = backend
+    out["scan_permutation_n_jobs"] = int(n_jobs)
+    failure_count = sum(trial["status"] != "success" for trial in diagnostic["trials"])
+    if failure_count:
+        diagnostic["status"] = "unavailable_failed_trials"
+        reasons = list(dict.fromkeys(trial["failure_reason"] for trial in diagnostic["trials"] if trial["failure_reason"]))
+        print("Scan warning: {} of {} permutations failed; calibration is unavailable: {}".format(
+            failure_count, n_permutations, "; ".join(reasons[:5]),
+        ), flush=True)
+        # Never silently change the null to the subset of successful trials.
+        return _finish_scan_calibration(g, out, diagnostic)
+    if sum(result["success_count"] for result in chunk_results) != n_permutations:
+        raise ValueError("Each scan configuration must contribute exactly one null statistic.")
+    enriched = np.isfinite(observed_scores) & (observed_scores > 0)
+    pvalues = np.full(len(out), np.nan)
+    pvalues[observed_scores <= 0] = 1.
+    exceedances = sum((result["exceedances"] for result in chunk_results),
+                      np.zeros(np.count_nonzero(enriched), dtype=np.int64))
+    offset = 0 if exact else 1
+    pvalues[enriched] = (offset + exceedances) / (offset + n_permutations)
+    out["p_rate_enrichment_empirical"] = pvalues
+    if calibration == "full_scan":
+        out["p_rate_enrichment_empirical_maxT"] = scan_statistics.empirical_pvalues(
+            observed_scores, max_perm_score, n_permutations, exact=exact,
+        )
+        diagnostic["global_pvalue"] = _empirical_p_from_scores(observed_maximum, max_perm_score, n_permutations, exact=exact)
+    diagnostic["status"] = "conditional_trait_model" if sampler is None else "conditional_assignment"
+    return _finish_scan_calibration(g, out, diagnostic)
+
+
+def scan_substitutions(g, ON_tensor, rate_ON_tensor=None):
+    validate_scan_configuration(g)
+    g.pop("scan_calibration_diagnostics", None)
+    g["_scan_trait_plans"] = {}
+    g["_scan_permutation_exact"] = False
+    scan_static = _build_scan_static_context(
+        g=g,
+        ON_tensor=ON_tensor,
+        rate_ON_tensor=rate_ON_tensor if rate_ON_tensor is not None else ON_tensor,
+    )
+    scan_df, units = _scan_substitutions_core(
+        g=g,
+        ON_tensor=ON_tensor,
+        rate_ON_tensor=rate_ON_tensor,
+        scan_static=scan_static,
+    )
+    scan_df = _calibrate_scan_pvalues(
+        g=g,
+        observed_df=scan_df,
+        ON_tensor=ON_tensor,
+        rate_ON_tensor=rate_ON_tensor if rate_ON_tensor is not None else ON_tensor,
+        scan_static=scan_static,
+    )
+    if scan_df.shape[0] > 0:
+        observation = g.get("scan_observation", "marginal")
+        scan_df["scan_event_threshold"] = scan_event_threshold(g)
+        scan_df["scan_event_units"] = "posterior_mean_jump_count" if observation == "bridge" else "endpoint_probability"
+        scan_df["candidate_event_mass_sum"] = scan_df["candidate_event_pp_sum"]
+        scan_df["support_mass_sum"] = scan_df["support_pp_sum"]
+        scan_df["support_mass_mean"] = scan_df["support_pp_mean"]
+        if observation == "bridge":
+            scan_df[["candidate_event_pp_sum", "support_pp_sum", "support_pp_mean", "scan_min_event_pp"]] = np.nan
+        if observation != "marginal":
+            scan_df["scan_observation_method"] = "joint_endpoint_posterior" if observation == "joint" else "posterior_mean_jump_count"
+            if observation == "bridge":
+                scan_df["scan_exposure_units"] = "expected_jump_count"
+        if g.get("scan_pvalue_calibration") == "parametric":
+            scan_df["scan_inference_method"] = "fixed_model_parametric_bootstrap_global_max_score"
+        scan_df = _assign_grouped_qvalues(
+            scan_df=scan_df,
+            out_col="q_rate_enrichment_empirical_by_trait_match",
+            group_cols=["trait", "scan_match"],
+            p_col="p_rate_enrichment_empirical",
+        )
+        scan_df = _annotate_inference(scan_df, g)
+        scan_df = scan_df.loc[:, [col for col in SCAN_OUTPUT_COLUMNS if col in scan_df.columns]]
+    return scan_df, units

@@ -1,0 +1,516 @@
+"""@namespace IMP.pmi.samplers
+   Sampling of the system.
+"""
+
+import IMP
+import IMP.core
+from IMP.pmi.tools import get_restraint_set
+
+
+class _SerialReplicaExchange:
+    """Dummy replica exchange class used in non-MPI builds.
+       It should act similarly to IMP.mpi.ReplicaExchange
+       on a single processor.
+    """
+    def __init__(self):
+        self.__params = {}
+
+    def get_number_of_replicas(self):
+        return 1
+
+    def create_temperatures(self, tmin, tmax, nrep):
+        return [tmin]
+
+    def get_my_index(self):
+        return 0
+
+    def set_my_parameter(self, key, val):
+        self.__params[key] = val
+
+    def get_my_parameter(self, key):
+        return self.__params[key]
+
+    def get_friend_index(self, step):
+        return 0
+
+    def get_friend_parameter(self, key, findex):
+        return self.get_my_parameter(key)
+
+    def do_exchange(self, myscore, fscore, findex):
+        return False
+
+    def set_was_used(self, was_used):
+        self.was_used = was_used
+
+
+class _SamplerBase:
+    def __init__(self, model, start_frame):
+        self.model = model
+        # that is -1 because mc/md has not yet run
+        self.nframe = start_frame - 1
+        self.simulated_annealing = False
+
+    def set_simulated_annealing(self, min_temp, max_temp, min_temp_time,
+                                max_temp_time):
+        self.simulated_annealing = True
+        self.tempmin = min_temp
+        self.tempmax = max_temp
+        self.timemin = min_temp_time
+        self.timemax = max_temp_time
+
+    def temp_simulated_annealing(self):
+        if self.nframe % (self.timemin + self.timemax) < self.timemin:
+            value = 0.0
+        else:
+            value = 1.0
+        temp = self.tempmin + (self.tempmax - self.tempmin) * value
+        return temp
+
+
+class MonteCarlo(_SamplerBase):
+    """Sample using Monte Carlo"""
+
+    # check that isd is installed
+    try:
+        import IMP.isd
+        isd_available = True
+    except ImportError:
+        isd_available = False
+
+    def __init__(self, model, objects=None, temp=1.0, filterbyname=None,
+                 score_moved=False, start_frame=0):
+        """Setup Monte Carlo sampling
+        @param model         The IMP Model
+        @param objects       What to sample (a list of Movers)
+        @param temp The MC temperature
+        @param filterbyname Not used
+        @param score_moved   If True, attempt to speed up sampling by
+               caching scoring function terms on particles that didn't move
+        @param start_frame The starting frame number
+        """
+        super().__init__(model, start_frame=start_frame)
+        self.losp = [
+            "Rigid_Bodies",
+            "Floppy_Bodies",
+            "Nuisances",
+            "X_coord",
+            "Weights"
+            "Surfaces"]
+        self.selfadaptive = False
+        self.temp = temp
+        self.mvs = []
+        self.mvslabels = []
+        self.label = "None"
+        self.movers_data = {}
+        self.use_jax = False
+        self._jax_optimizer = None
+        self._jax_state = None
+
+        self.mvs = objects
+
+        # SerialMover
+        self.smv = IMP.core.SerialMover(self.mvs)
+
+        self.mc = IMP.core.MonteCarlo(self.model)
+        self.mc.set_scoring_function(get_restraint_set(self.model))
+        self.mc.set_return_best(False)
+        self.mc.set_score_moved(score_moved)
+        self.mc.set_kt(self.temp)
+        self.mc.add_mover(self.smv)
+
+    def set_use_jax(self, nstep):
+        """Request that sampling of the scoring function is done using
+           JAX instead of IMP's internal C++ implementation (requires
+           that all PMI restraints used have a JAX implementation)."""
+        self.use_jax = True
+        self._jax_optimizer = self.mc._get_jax_optimizer(
+            nstep * self.get_number_of_movers())
+        self._jax_state = self._jax_optimizer.get_initial_state()
+
+    def get_jax_model(self):
+        """Get the current JAX Model used by the sampler."""
+        return self._jax_state.jm
+
+    def set_kt(self, temp):
+        self.temp = temp
+        self.mc.set_kt(temp)
+        if self._jax_state is not None:
+            self._jax_state.temperature = temp
+
+    def get_mc(self):
+        return self.mc
+
+    def set_scoring_function(self, objectlist):
+        rs = IMP.RestraintSet(self.model, 1.0, 'sfo')
+        for ob in objectlist:
+            rs.add_restraint(ob.get_restraint())
+        sf = IMP.core.RestraintsScoringFunction([rs])
+        self.mc.set_scoring_function(sf)
+
+    def set_self_adaptive(self, isselfadaptive=True):
+        self.selfadaptive = isselfadaptive
+
+    def get_number_of_movers(self):
+        return len(self.smv.get_movers())
+
+    def get_particle_types(self):
+        return self.losp
+
+    def optimize(self, nstep):
+        self.nframe += 1
+        if self.use_jax:
+            score, self._jax_state = self._jax_optimizer.optimize(
+                self._jax_state)
+        else:
+            score = self.mc.optimize(nstep * self.get_number_of_movers())
+
+        # apply simulated annealing protocol
+        if self.simulated_annealing:
+            self.set_kt(self.temp_simulated_annealing())
+
+        # apply self adaptive protocol
+        if self.selfadaptive:
+            self.apply_self_adaptive()
+        return score
+
+    def apply_self_adaptive(self):
+        """Modify parameters of individual movers to try to keep acceptance
+           rate around 50%"""
+        if self.use_jax:
+            raise NotImplementedError(
+                "Adaptive protocol is not yet implemented for JAX")
+        for i, mv in enumerate(self.mvs):
+
+            mvacc = mv.get_number_of_accepted()
+            mvprp = mv.get_number_of_proposed()
+            if mv not in self.movers_data:
+                accept = float(mvacc) / float(mvprp)
+                self.movers_data[mv] = (mvacc, mvprp)
+            else:
+                oldmvacc, oldmvprp = self.movers_data[mv]
+                accept = float(mvacc-oldmvacc) / float(mvprp-oldmvprp)
+                self.movers_data[mv] = (mvacc, mvprp)
+            if accept < 0.05:
+                accept = 0.05
+            if accept > 1.0:
+                accept = 1.0
+
+            if isinstance(mv, IMP.core.NormalMover):
+                stepsize = mv.get_sigma()
+                if 0.4 > accept or accept > 0.6:
+                    mv.set_sigma(stepsize * 2 * accept)
+
+            if isinstance(mv, IMP.isd.WeightMover):
+                stepsize = mv.get_radius()
+                if 0.4 > accept or accept > 0.6:
+                    mv.set_radius(stepsize * 2 * accept)
+
+            if isinstance(mv, IMP.core.RigidBodyMover):
+                mr = mv.get_maximum_rotation()
+                mt = mv.get_maximum_translation()
+                if 0.4 > accept or accept > 0.6:
+                    mv.set_maximum_rotation(mr * 2 * accept)
+                    mv.set_maximum_translation(mt * 2 * accept)
+
+            if isinstance(mv, IMP.pmi.TransformMover):
+                mr = mv.get_maximum_rotation()
+                mt = mv.get_maximum_translation()
+                if 0.4 > accept or accept > 0.6:
+                    mv.set_maximum_rotation(mr * 2 * accept)
+                    mv.set_maximum_translation(mt * 2 * accept)
+
+            if isinstance(mv, IMP.core.BallMover):
+                mr = mv.get_radius()
+                if 0.4 > accept or accept > 0.6:
+                    mv.set_radius(mr * 2 * accept)
+
+    def set_label(self, label):
+        self.label = label
+
+    def get_frame_number(self):
+        return self.nframe
+
+    def get_output(self):
+        output = {}
+        for i, mv in enumerate(self.smv.get_movers()):
+            mvname = mv.get_name()
+            mvacc = mv.get_number_of_accepted()
+            mvprp = mv.get_number_of_proposed()
+            try:
+                mvacr = float(mvacc) / float(mvprp)
+            except:  # noqa: E722
+                mvacr = 0.0
+            output["MonteCarlo_Acceptance_" +
+                   mvname + "_" + str(i)] = str(mvacr)
+            if "Nuisances" in mvname:
+                output["MonteCarlo_StepSize_" + mvname + "_" + str(i)] = \
+                    str(IMP.core.NormalMover.get_from(mv).get_sigma())
+            if "Weights" in mvname:
+                output["MonteCarlo_StepSize_" + mvname + "_" + str(i)] = \
+                    str(IMP.isd.WeightMover.get_from(mv).get_radius())
+        output["MonteCarlo_Temperature"] = str(self.mc.get_kt())
+        output["MonteCarlo_Nframe"] = str(self.nframe)
+        return output
+
+
+class MolecularDynamics(_SamplerBase):
+    """Sample using molecular dynamics"""
+
+    def __init__(self, model, objects, kt, gamma=0.01, maximum_time_step=1.0,
+                 sf=None, use_jax=False, start_frame=0):
+        """Setup MD
+        @param model The IMP Model
+        @param objects What to sample. Use flat list of particles
+        @param kt Temperature
+        @param gamma Viscosity parameter
+        @param maximum_time_step MD max time step
+        @param start_frame The starting frame number
+        """
+        super().__init__(model, start_frame=start_frame)
+
+        # check if using PMI1 objects dictionary, or just list of particles
+        try:
+            for obj in objects:
+                psamp = obj.get_particles_to_sample()
+                to_sample = psamp['Floppy_Bodies_SimplifiedModel'][0]
+        except:  # noqa: E722
+            to_sample = objects
+
+        self.ltstate = IMP.atom.LangevinThermostatOptimizerState(
+            self.model, to_sample, kt/0.0019872041, gamma)
+        self.md = IMP.atom.MolecularDynamics(self.model)
+        self.md.set_maximum_time_step(maximum_time_step)
+        if sf:
+            self.md.set_scoring_function(sf)
+        else:
+            self.md.set_scoring_function(get_restraint_set(self.model))
+        self.md.add_optimizer_state(self.ltstate)
+
+    def set_use_jax(self, nstep):
+        """Request that sampling of the scoring function is done using
+           JAX instead of IMP's internal C++ implementation (requires
+           that all PMI restraints used have a JAX implementation)."""
+        raise NotImplementedError("JAX currently only supported for MC")
+
+    def set_kt(self, kt):
+        temp = kt/0.0019872041
+        self.ltstate.set_temperature(temp)
+        self.md.assign_velocities(temp)
+
+    def set_gamma(self, gamma):
+        self.ltstate.set_gamma(gamma)
+
+    def optimize(self, nsteps):
+        # apply simulated annealing protocol
+        self.nframe += 1
+        if self.simulated_annealing:
+            self.set_kt(self.temp_simulated_annealing())
+        return self.md.optimize(nsteps)
+
+    def get_output(self):
+        output = {}
+        output["MolecularDynamics_KineticEnergy"] = \
+            str(self.md.get_kinetic_energy())
+        return output
+
+
+class ConjugateGradients:
+    """Sample using conjugate gradients"""
+
+    def __init__(self, model, objects):
+        self.model = model
+        self.nframe = -1
+        self.cg = IMP.core.ConjugateGradients(self.model)
+        self.cg.set_scoring_function(get_restraint_set(self.model))
+
+    def set_label(self, label):
+        self.label = label
+
+    def get_frame_number(self):
+        return self.nframe
+
+    def optimize(self, nstep):
+        self.nframe += 1
+        self.cg.optimize(nstep)
+
+    def set_scoring_function(self, objectlist):
+        rs = IMP.RestraintSet(self.model, 1.0, 'sfo')
+        for ob in objectlist:
+            rs.add_restraint(ob.get_restraint())
+        sf = IMP.core.RestraintsScoringFunction([rs])
+        self.cg.set_scoring_function(sf)
+
+    def get_output(self):
+        output = {}
+        output["ConjugatedGradients_Nframe"] = str(self.nframe)
+        return output
+
+
+class _ReplicaExchangeStats:
+    """Statistics for replica exchange.
+       This is in a separate class so that we can pickle it easily for
+       restarts"""
+    def __init__(self):
+        self.nattempts = 0
+        self.nmintemp = 0
+        self.nmaxtemp = 0
+        self.nsuccess = 0
+
+    def get_output(self):
+        output = {}
+        if self.nattempts != 0:
+            output["ReplicaExchange_SwapSuccessRatio"] = str(
+                float(self.nsuccess) / self.nattempts)
+            output["ReplicaExchange_MinTempFrequency"] = str(
+                float(self.nmintemp) / self.nattempts)
+            output["ReplicaExchange_MaxTempFrequency"] = str(
+                float(self.nmaxtemp) / self.nattempts)
+        else:
+            output["ReplicaExchange_SwapSuccessRatio"] = str(0)
+            output["ReplicaExchange_MinTempFrequency"] = str(0)
+            output["ReplicaExchange_MaxTempFrequency"] = str(0)
+        return output
+
+
+class ReplicaExchange:
+    """Sample using replica exchange"""
+
+    def __init__(self, model, tempmin, tempmax, samplerobjects, test=True,
+                 replica_exchange_object=None):
+        '''
+        samplerobjects can be a list of MonteCarlo or MolecularDynamics
+        '''
+
+        self.model = model
+        self.samplerobjects = samplerobjects
+        # min and max temperature
+        self.TEMPMIN_ = tempmin
+        self.TEMPMAX_ = tempmax
+
+        if replica_exchange_object is None:
+            # initialize Replica Exchange class
+            try:
+                import IMP.mpi
+                print('ReplicaExchange: MPI was found. '
+                      'Using Parallel Replica Exchange.')
+                print('(MPI can be explicitly disabled by setting '
+                      'the IMP_NO_MPI\nenvironment variable.)')
+                self.rem = IMP.mpi.ReplicaExchange()
+            except ImportError:
+                print('ReplicaExchange: Could not find MPI. '
+                      'Using Serial Replica Exchange.')
+                self.rem = _SerialReplicaExchange()
+
+        else:
+            # get the replica exchange class instance from elsewhere
+            print('got existing rex object')
+            self.rem = replica_exchange_object
+
+        # get number of replicas
+        nproc = self.rem.get_number_of_replicas()
+
+        if nproc % 2 != 0 and not test:
+            raise Exception(
+                "number of replicas has to be even. "
+                "set test=True to run with odd number of replicas.")
+        # create array of temperatures, in geometric progression
+        temp = self.rem.create_temperatures(
+            self.TEMPMIN_,
+            self.TEMPMAX_,
+            nproc)
+        # get replica index
+        self.temperatures = temp
+
+        myindex = self.rem.get_my_index()
+        # set initial value of the parameter (temperature) to exchange
+        self.rem.set_my_parameter("temp", [self.temperatures[myindex]])
+        for so in self.samplerobjects:
+            so.set_kt(self.temperatures[myindex])
+        # Acceptance, etc. statistics
+        self.stats = _ReplicaExchangeStats()
+
+    def get_temperatures(self):
+        return self.temperatures
+
+    def get_my_temp(self):
+        return self.rem.get_my_parameter("temp")[0]
+
+    def get_my_index(self):
+        return self.rem.get_my_index()
+
+    def swap_temp(self, nframe, score=None):
+        if score is None:
+            score = self.model.evaluate(False)
+        # get my replica index and temperature
+        _ = self.rem.get_my_index()
+        mytemp = self.rem.get_my_parameter("temp")[0]
+
+        if mytemp == self.TEMPMIN_:
+            self.stats.nmintemp += 1
+
+        if mytemp == self.TEMPMAX_:
+            self.stats.nmaxtemp += 1
+
+        # score divided by kbt
+        myscore = score / mytemp
+
+        # get my friend index and temperature
+        findex = self.rem.get_friend_index(nframe)
+        ftemp = self.rem.get_friend_parameter("temp", findex)[0]
+        # score divided by kbt
+        fscore = score / ftemp
+
+        # try exchange
+        flag = self.rem.do_exchange(myscore, fscore, findex)
+
+        self.stats.nattempts += 1
+        # if accepted, change temperature
+        if (flag):
+            for so in self.samplerobjects:
+                so.set_kt(ftemp)
+            self.stats.nsuccess += 1
+
+    def get_output(self):
+        output = self.stats.get_output()
+        output["ReplicaExchange_CurrentTemp"] = str(self.get_my_temp())
+        return output
+
+
+class MPI_values:
+    def __init__(self, replica_exchange_object=None):
+        """Query values (ie score, and others)
+        from a set of parallel jobs"""
+
+        if replica_exchange_object is None:
+            # initialize Replica Exchange class
+            try:
+                import IMP.mpi
+                print('MPI_values: MPI was found. '
+                      'Using Parallel Replica Exchange')
+                self.rem = IMP.mpi.ReplicaExchange()
+            except ImportError:
+                print('MPI_values: Could not find MPI. '
+                      'Using Serial Replica Exchange')
+                self.rem = _SerialReplicaExchange()
+
+        else:
+            # get the replica exchange class instance from elsewhere
+            print('got existing rex object')
+            self.rem = replica_exchange_object
+
+    def set_value(self, name, value):
+        self.rem.set_my_parameter(name, [value])
+
+    def get_values(self, name):
+        values = []
+        for i in range(self.rem.get_number_of_replicas()):
+            v = self.rem.get_friend_parameter(name, i)[0]
+            values.append(v)
+        return values
+
+    def get_percentile(self, name):
+        value = self.rem.get_my_parameter(name)[0]
+        values = sorted(self.get_values(name))
+        ind = values.index(value)
+        percentile = float(ind)/len(values)
+        return percentile

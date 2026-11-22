@@ -1,0 +1,372 @@
+.dataset-results .dataset-series-context {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+.dataset-results .dataset-series-context p {
+  margin: 0;
+}
+
+.dataset-series-source strong {
+  margin-inline-end: 8px;
+  color: var(--ink);
+}
+
+.dataset-series-context details[open] {
+  flex-basis: 100%;
+}
+
+.dataset-series-context summary {
+  cursor: pointer;
+  color: var(--accent);
+}
+
+.dataset-results .dataset-series-context details > p {
+  margin-block-start: 6px;
+}
+
+@media (min-width: 1180px) {
+  [data-del-results] > .dataset-result-metrics {
+    column-gap: 11px;
+  }
+
+  [data-del-results] .dataset-download-menu > summary {
+    padding: 6px 10px;
+  }
+
+  [data-del-results]
+    .dataset-table-region:is(
+      [data-table-view="counts"],
+      [data-table-view="decoded"],
+      [data-table-view="series"],
+      [data-table-view="followup"]
+    ) .dataset-table-toolbar {
+    justify-content: flex-start;
+    gap: 6px 12px;
+    padding-block: 4px 8px;
+  }
+
+  [data-del-results] .dataset-table-region[data-table-view="series"]
+    .dataset-table-toolbar > label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  [data-del-results]
+    .dataset-table-region:is(
+      [data-table-view="counts"],
+      [data-table-view="decoded"],
+      [data-table-view="series"],
+      [data-table-view="followup"]
+    ) .dataset-table-toolbar :is(input[type="search"], select) {
+    min-height: 34px;
+    padding-block: 5px;
+  }
+
+  [data-del-results] :is(
+    .dataset-counts-table,
+    .dataset-decoded-table,
+    .dataset-series-table,
+    .dataset-followup-table
+  ) {
+    max-height: min(56vh, 540px);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  [data-del-results] :is(
+    .dataset-counts-table,
+    .dataset-decoded-table,
+    .dataset-series-table,
+    .dataset-followup-table
+  ) :is(td, th) {
+    padding: 7px 10px;
+  }
+
+  [data-del-results] :is(
+    .dataset-counts-table, .dataset-decoded-table, .dataset-followup-table
+  ) .dataset-column-member {
+    position: sticky;
+    inset-inline-start: 0;
+    z-index: 1;
+    background: var(--surface);
+  }
+
+  [data-del-results] :is(
+    .dataset-counts-table, .dataset-decoded-table, .dataset-followup-table
+  ) th.dataset-column-member {
+    z-index: 2;
+    background: var(--surface-muted);
+  }
+
+  [data-del-results]
+    .dataset-table-region[data-table-view="counts"] > .field-help {
+    margin-block: 0 6px;
+  }
+
+  [data-del-results] .del-definition-view {
+    gap: 12px;
+  }
+
+  [data-del-results] .del-barcode-map {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(128px, 100%), 1fr));
+  }
+
+  [data-del-results] .del-barcode-map > div {
+    gap: 4px;
+    padding: 8px 11px;
+    border-top-width: 3px;
+    border-radius: 6px;
+  }
+
+  [data-del-results] .dataset-block-grid {
+    gap: 12px;
+  }
+
+  [data-del-results] .dataset-block-grid article {
+    min-height: 152px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+
+  [data-del-results] .dataset-block-grid .molecule-image {
+    width: 100%;
+    min-height: 0;
+    height: 112px;
+    padding: 4px 0;
+  }
+
+  [data-del-results] .dataset-block-grid .molecule-image img {
+    height: 104px;
+  }
+
+  [data-del-results]
+    .dataset-table-region[data-table-view="enrichment"]
+    .dataset-table-toolbar {
+    justify-content: flex-start;
+    gap: 8px 14px;
+    padding-block: 6px 10px;
+  }
+
+  [data-del-results]
+    .dataset-table-region[data-table-view="enrichment"]
+    .dataset-table-toolbar
+    input[type="search"] {
+    flex: 1 1 180px;
+    width: auto;
+    min-width: 140px;
+    max-width: 340px;
+    min-height: 34px;
+    padding-block: 5px;
+  }
+
+  [data-del-results]
+    .dataset-table-region[data-table-view="enrichment"]
+    .dataset-comparison-control
+    select {
+    min-height: 34px;
+    padding-block: 5px;
+  }
+
+  [data-del-results] .dataset-table-scroll.dataset-enrichment-table th,
+  [data-del-results] .dataset-table-scroll.dataset-enrichment-table td {
+    padding: 7px 10px;
+  }
+
+  [data-del-results]
+    .dataset-table-scroll.dataset-enrichment-table
+    .dataset-column-member {
+    position: sticky;
+    inset-inline-start: 0;
+    z-index: 1;
+    background: var(--surface);
+  }
+
+  [data-del-results]
+    .dataset-table-scroll.dataset-enrichment-table
+    th.dataset-column-member {
+    z-index: 2;
+    background: var(--surface-muted);
+  }
+
+  [data-del-results]
+    .dataset-table-scroll.dataset-enrichment-table
+    .molecule-image.is-thumbnail {
+    width: 138px;
+    max-width: 138px;
+    height: 70px;
+    min-height: 0;
+  }
+
+  [data-del-results]
+    .dataset-table-scroll.dataset-enrichment-table
+    .molecule-image
+    img {
+    max-height: 62px;
+  }
+}
+
+@media (width > 1000px) {
+  .module-template.is-preview [data-del-results] {
+    --dataset-stage-height: clamp(260px, calc(100dvh - 350px), 610px);
+  }
+
+  [data-del-results]
+    .structure-workbench:not([data-workspace-expanded="true"]):has(
+      [data-del-review], .dataset-member-inspector
+    ) {
+    grid-template-columns: minmax(0, 1fr) minmax(282px, 36%);
+    column-gap: 16px;
+    --dataset-drawing-height: clamp(190px, calc(100dvh - 408px), 540px);
+  }
+
+  [data-del-results]
+    .structure-workbench:has([data-del-review], .dataset-member-inspector)
+    > .structure-workbench-details {
+    gap: 8px;
+  }
+
+  [data-del-results] .structure-workbench-details .dataset-result-metrics {
+    column-gap: 10px;
+    row-gap: 4px;
+    padding-block-end: 6px;
+    margin-block-end: 4px;
+  }
+
+  [data-del-results] .structure-workbench-details .dataset-result-metrics strong {
+    font-size: 14px;
+  }
+
+  [data-del-results] .structure-workbench-details .dataset-download-menu > summary {
+    padding: 6px 10px;
+  }
+
+  [data-del-results] .structure-workbench-details .dataset-panel-title {
+    min-height: 0;
+    padding: 4px 0 6px;
+  }
+
+  [data-del-results] .structure-workbench-details [data-compact-toolbar] {
+    --compact-table-tools: enabled;
+  }
+
+  [data-del-results] .dataset-candidate-table .research-table td {
+    padding-block: 6px;
+  }
+
+  [data-del-results="del_enumerate"] .dataset-library-table {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+
+  [data-del-results="del_enumerate"] .dataset-library-table .dataset-column-id {
+    position: sticky;
+    inset-inline-start: 0;
+    z-index: 1;
+    min-width: 118px;
+    background: var(--surface);
+  }
+
+  [data-del-results="del_enumerate"] .dataset-library-table th.dataset-column-id {
+    z-index: 2;
+    background: var(--surface-muted);
+  }
+
+  [data-del-results="del_enumerate"]
+    .dataset-library-table tr.selected > td.dataset-column-id {
+    background: var(--accent-soft);
+  }
+
+  [data-del-results="del_enumerate"] .dataset-table-region[data-table-view="library"]
+    .dataset-table-toolbar {
+    gap: 6px;
+    padding-block: 4px 8px;
+  }
+
+  .studio-app [data-del-results="del_enumerate"] {
+    > .research-tabs > .research-tab-list {
+      margin: 0 0 8px;
+
+      > [role="tab"] {
+        min-height: 36px;
+        padding-block: 6px;
+      }
+    }
+
+    .structure-workbench:not([data-workspace-expanded="true"]) {
+      --dataset-drawing-height: clamp(250px, calc(100dvh - 342px), 540px);
+
+      .research-tab-toolbar {
+        margin-block-end: 4px;
+      }
+    }
+
+    .candidate-inspection-preview
+      .research-tab-toolbar
+      > .research-tab-list:has(> [role="tab"]:only-of-type) {
+      display: none;
+    }
+
+    .dataset-table-region[data-table-view="library"] > .dataset-table-toolbar {
+      flex-wrap: nowrap;
+
+      input[type="search"] {
+        flex: 1 1 120px;
+        min-width: 0;
+        width: auto;
+        padding-block: 5px;
+        font-size: 12px;
+      }
+
+      button {
+        flex-shrink: 0;
+        padding: 5px 9px;
+        font-size: 12px;
+      }
+    }
+  }
+}
+
+@media (width > 1000px) and (height <= 760px) {
+  .studio-app
+    .studio-content:has(
+      .detail-panel.has-header-navigation
+        :is(
+          [data-del-results="del_enumerate"],
+          [data-del-results="del_candidates"]
+        )
+    ) {
+    padding-block-start: 8px;
+  }
+  .task-history-workspace
+    .detail-panel.has-header-navigation:has(
+      :is(
+        [data-del-results="del_enumerate"],
+        [data-del-results="del_candidates"]
+      )
+    )
+    > .task-detail-header {
+    margin-block-end: 6px;
+
+    h2 {
+      font-size: 16px;
+      line-height: 1.3;
+    }
+  }
+  .detail-panel.has-header-navigation [data-del-results="del_candidates"] {
+    --dataset-stage-height: clamp(280px, calc(100dvh - 297px), 610px);
+    --dataset-edge-stage-reserve: 322px;
+  }
+}
+
+@media (width > 1000px) and (max-height: 620px) {
+  [data-del-results="del_enumerate"] .dataset-candidate-table .research-table :is(th, td) {
+    padding-block: 4px;
+  }
+}

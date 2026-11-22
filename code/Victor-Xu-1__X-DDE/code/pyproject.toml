@@ -1,0 +1,71 @@
+[project]
+name = "x-dde"
+version = "0.9.78"
+description = "Independent discovery platform integrating scientific software backends"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{name = "Victor Xu"}]
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn==0.54.0",
+    "typing-extensions==4.16.0",
+]
+
+[project.scripts]
+X-DDE = "opendde_workbench.cli:main"
+x-dde = "opendde_workbench.cli:main"
+xdde = "opendde_workbench.cli:main"
+x-dde-server = "opendde_workbench.__main__:main"
+opendde-workbench = "opendde_workbench.__main__:main"
+opendde = "opendde_workbench.cli:main"
+OpenDDE = "opendde_workbench.cli:main"
+OPENDDE = "opendde_workbench.cli:main"
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opendde_workbench"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"frontend/src/editors/ketcher-conversions.ts" = "opendde_workbench/data/recognition_locale/ketcher-conversions.ts"
+"frontend/src/utilities/recognition-host-bridge.ts" = "opendde_workbench/data/recognition_locale/recognition-host-bridge.ts"
+"frontend/src/utilities/recognition-foreground.ts" = "opendde_workbench/data/recognition_locale/recognition-foreground.ts"
+"frontend/src/utilities/recognition-locale.ts" = "opendde_workbench/data/recognition_locale/recognition-locale.ts"
+"frontend/src/editors/portable-smiles.ts" = "opendde_workbench/data/recognition_locale/portable-smiles.ts"
+"frontend/src/editors/portable-smiles-ring-stereo.ts" = "opendde_workbench/data/recognition_locale/portable-smiles-ring-stereo.ts"
+"frontend/src/utilities/recognition-host-ui-locale.ts" = "opendde_workbench/data/recognition_locale/recognition-host-ui-locale.ts"
+"frontend/src/editors/recognition-host-editor.ts" = "opendde_workbench/data/recognition_locale/recognition-host-editor.ts"
+"frontend/src/editors/ketcher-contract.ts" = "opendde_workbench/data/recognition_locale/ketcher-contract.ts"
+"frontend/src/editors/ketcher-appearance.ts" = "opendde_workbench/data/recognition_locale/ketcher-appearance.ts"
+"frontend/src/editors/ketcher-hydrogens.ts" = "opendde_workbench/data/recognition_locale/ketcher-hydrogens.ts"
+"frontend/src/editors/editor-lifetime.ts" = "opendde_workbench/data/recognition_locale/editor-lifetime.ts"
+"frontend/src/editors/native-molecular-viewport.ts" = "opendde_workbench/data/recognition_locale/native-molecular-viewport.ts"
+"frontend/src/editors/molecule-readiness.ts" = "opendde_workbench/data/recognition_locale/molecule-readiness.ts"
+"frontend/src/editors/recognition-host-editor.css" = "opendde_workbench/data/recognition_locale/recognition-host-editor.css"
+
+[tool.hatch.build.hooks.custom]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.per-file-target-version]
+"src/opendde_workbench/scientific_objects.py" = "py310"
+"src/opendde_workbench/docking/options.py" = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+browser = ["playwright==1.58.0"]
+dev = [
+    "httpx2==2.13.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+]

@@ -1,0 +1,260 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Read-only token: this workflow never writes to the repository or publishes.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # actions/setup-python has no Python 3.9 build for ubuntu-latest
+          # (26.04); 3.9 builds exist for ubuntu-22.04 and ubuntu-24.04.
+          - python-version: "3.9"
+            os: ubuntu-24.04
+          - python-version: "3.11"
+            os: ubuntu-latest
+          - python-version: "3.13"
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      - name: Run tests
+        run: python -m unittest discover -v
+
+      - name: Exercise installed MCP server
+        if: matrix.python-version == '3.11'
+        run: |
+          python -m pip install '.[mcp]'
+          python - <<'PY'
+          import asyncio
+          from amber_to_lammps_mcp import create_server
+          server = create_server()
+          tools = asyncio.run(server.list_tools())
+          names = {tool.name for tool in tools}
+          assert {"convert", "check_lammps_run0"} <= names, names
+          PY
+
+  package:
+    name: build and check distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check distributions
+        run: python -m twine check --strict dist/*
+
+  whitespace:
+    name: whitespace (git diff --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Check only the changes being proposed or pushed, so whitespace that
+      # already exists on main does not fail unrelated work.
+      - name: Check changed lines for whitespace errors
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git diff --check "origin/${BASE_REF}...HEAD"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            git diff --check "$BEFORE_SHA" HEAD
+          else
+            git diff --check HEAD~1 HEAD
+          fi
+
+  sander:
+    name: sander/LAMMPS AMBER-family validation
+    runs-on: ubuntu-24.04
+    env:
+      LAMMPS_COMMIT: 26e5f79b4e5aa77b65fc4fbf314b206bf0530b45
+      LAMMPS_CACHE_FLAVOR: molecule-extra_molecule-kspace-rigid-lepton-v3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Cache the pinned executable. The key includes the runner platform,
+      # source commit, compiler family, enabled packages, and a format version.
+      - name: Restore pinned LAMMPS build
+        id: cache-lammps
+        uses: actions/cache@v4
+        with:
+          path: lammps-build/lmp
+          key: lammps-${{ runner.os }}-${{ runner.arch }}-ubuntu24-gcc-${{ env.LAMMPS_COMMIT }}-${{ env.LAMMPS_CACHE_FLAVOR }}
+
+      # Ubuntu's LAMMPS package omits EXTRA-MOLECULE, which provides the
+      # Fourier dihedral style emitted by AMBER2LAMMPS. On a cache miss, build
+      # the same stable release used for local validation.
+      - uses: actions/checkout@v4
+        if: steps.cache-lammps.outputs.cache-hit != 'true'
+        with:
+          repository: lammps/lammps
+          ref: ${{ env.LAMMPS_COMMIT }}
+          path: lammps-source
+          persist-credentials: false
+
+      - uses: mamba-org/setup-micromamba@f457c30a868e4760d3a6fcea5f25dc655b8edf39
+        with:
+          environment-name: amber-validation
+          create-args: >-
+            python=3.12
+            ambertools=25
+            numpy
+            scipy
+            parmed
+          cache-environment: true
+
+      - name: Build LAMMPS with required packages
+        if: steps.cache-lammps.outputs.cache-hit != 'true'
+        run: |
+          cmake -S lammps-source/cmake -B lammps-build \
+            -D CMAKE_BUILD_TYPE=Release \
+            -D BUILD_MPI=off \
+            -D PKG_MOLECULE=on \
+            -D PKG_EXTRA-MOLECULE=on \
+            -D PKG_KSPACE=on \
+            -D PKG_LEPTON=on \
+            -D PKG_RIGID=on
+          cmake --build lammps-build --parallel 2
+
+      - name: Validate GAFF2 and GLYCAM mixture
+        shell: micromamba-shell {0}
+        run: |
+          set -euo pipefail
+          python validation/amber_family_mix/validate_sander.py \
+            --sander "$CONDA_PREFIX/bin/sander" \
+            --lammps lammps-build/lmp
+
+      - name: Validate standalone GLYCAM
+        shell: micromamba-shell {0}
+        run: |
+          set -euo pipefail
+          python validation/glycam_glucose/validate_sander.py \
+            --sander "$CONDA_PREFIX/bin/sander" \
+            --lammps lammps-build/lmp
+
+      - name: Validate protein and GAFF2 ligand
+        shell: micromamba-shell {0}
+        run: |
+          set -euo pipefail
+          python validation/protein_ligand/validate_sander.py \
+            --sander "$CONDA_PREFIX/bin/sander" \
+            --lammps lammps-build/lmp
+
+      - name: Validate protein, water, and ions
+        shell: micromamba-shell {0}
+        run: |
+          set -euo pipefail
+          python validation/amber_protein_water_ions/validate_sander.py \
+            --sander "$CONDA_PREFIX/bin/sander" \
+            --lammps lammps-build/lmp
+
+      - name: Validate HMR masses, forces, and TIP3P SHAKE
+        shell: micromamba-shell {0}
+        run: |
+          set -euo pipefail
+          python validation/hmr_shake/validate.py \
+            --sander "$CONDA_PREFIX/bin/sander" \
+            --lammps lammps-build/lmp
+
+      - name: Exercise compact MCP LAMMPS validation
+        shell: micromamba-shell {0}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import tempfile
+          from amber_to_lammps_mcp import convert_amber_system, _check_lammps_run0
+
+          root = tempfile.mkdtemp(prefix="a2l-mcp-run0-")
+          conversion = convert_amber_system(
+              pdb_file=os.path.abspath("ethanol.pdb"),
+              topologies=[os.path.abspath("ethanol.prmtop")],
+              counts=[1], charges=[0], data_file="ethanol.data",
+              parameter_file="ethanol.parm", output_root=root,
+          )
+          result = _check_lammps_run0(
+              conversion["files"]["provenance"], output_root=root,
+              lammps_executable=os.path.abspath("lammps-build/lmp"),
+          )
+          assert result["status"] == "passed", result
+          assert "potential" in result["energies_kcal_mol"], result
+          PY
+
+      - name: Validate 12-6-4 C4 output with LEPTON
+        shell: micromamba-shell {0}
+        run: |
+          set -euo pipefail
+          python validation/c4_lepton/validate.py \
+            --lammps lammps-build/lmp
+
+      - name: Validate 12-6-4 C4 energies and forces against sander
+        shell: micromamba-shell {0}
+        run: |
+          set -euo pipefail
+          python validation/c4_sander/validate_sander.py \
+            --sander "$CONDA_PREFIX/bin/sander" \
+            --lammps lammps-build/lmp
+
+  # Single stable check name for branch protection, independent of the matrix.
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [test, package, whitespace, sander]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all CI jobs to succeed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          for result in $RESULTS; do
+            if [ "$result" != "success" ]; then
+              echo "A required CI job did not succeed."
+              exit 1
+            fi
+          done

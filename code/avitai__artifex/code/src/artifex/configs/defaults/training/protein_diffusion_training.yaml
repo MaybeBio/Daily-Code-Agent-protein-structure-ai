@@ -1,0 +1,33 @@
+name: protein_diffusion_training
+description: Default training configuration for protein diffusion models
+
+# Batch size settings
+batch_size: 128
+
+# Training duration
+num_epochs: 100
+
+# Optimizer configuration
+optimizer:
+  name: default_optimizer
+  optimizer_type: adamw
+  learning_rate: 1.0e-4
+  weight_decay: 2.0e-5
+  beta1: 0.9
+  beta2: 0.99
+  eps: 1.0e-8
+
+# Scheduler configuration
+scheduler:
+  name: default_scheduler
+  scheduler_type: cosine
+  warmup_steps: 500
+  min_lr_ratio: 0.001
+
+# Checkpointing and logging
+log_frequency: 20
+save_frequency: 100
+max_checkpoints: 5
+
+# Regularization
+gradient_clip_norm: 1.0

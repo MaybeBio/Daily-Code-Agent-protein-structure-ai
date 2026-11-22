@@ -1,0 +1,193 @@
+---
+summary: Contact cutoff equality changes across equivalent length units
+issue: uibcdf/molsysmt#666
+status: resolved
+opened: 2026-11-09
+closed: 2026-11-10
+severity: high
+verification: reproduced
+area: [structure, units]
+guard: tests/structure/test_distance_family_contract.py::test_equivalent_contact_cutoffs_keep_the_strict_predecessor
+normative:
+blocked_by: []
+supersedes: []
+---
+
+# Equivalent contact cutoffs change a boundary decision
+
+**Status:** Resolved by requiring the published PyUnitWizard 0.29.2 cutoff
+correction. The original diagnosis and source-only attempts are retained below.
+
+## What
+
+For points at 0 and 0.5 nm, the documented inclusive contact cutoff returns
+True for 0.5 nm but False for 5 angstrom or 500 pm under the nm policy. No
+rounding or approximate cutoff rule was requested. Changing active length units
+also changes this exact-boundary result. Most ordinary nonboundary inputs are
+outside the demonstrated failure; no general detector-invalidity claim is made.
+
+## How
+
+The native threshold digester standardizes the caller quantity. Conversions of
+5 angstrom and 500 pm to nm yield 0.49999999999999994 and 0.4999999999999999 in
+the received Pint stack. The final inclusive comparison then excludes 0.5 nm.
+A direct minimal native probe covers three active policies, four thresholds
+(including the immediate float64 predecessor of 0.5 nm), both dense and cell-list
+routes, and ordinary/trusted calls. All twenty-four paired observations agree
+between ordinary and trusted calls; both native routes reproduce the discrepancy.
+No library workaround or fuzzy comparator is selected by this diagnosis.
+
+## Why
+
+Changing the representation or presentation policy for an equivalent physical
+cutoff can change a scientific decision at the boundary. The contact panel
+cannot repair this by altering the native result or silently widening criteria.
+This is a native correctness review and is distinct from the missing facade
+routes reported in #665.
+
+## What is measured and what is assumed
+
+[Exact attempts and observations](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/native_contact_unit_boundary_666_20261109.json)
+retain the 151-pass/three-failure prototype pilot and the corrected oracle's
+152 passes/two genuine native failures in 154 cases. The mass-oracle typo was
+corrected to public physchem.get_mass; no threshold assertion changed. The native
+probe reproduces without the addon. The isolated local prototype is retained in
+`wip/contacts-panel-421-20261109` at `c96d258b9`; it is not published or received
+as a graphical capability. No browser run or milestone credit is claimed.
+
+**Assumed, not established:** a general unit-conversion/comparison capability
+may be needed. uibcdf/pyunitwizard#143 asks its owner to identify an existing
+supported route or the smallest missing capability, while MolSysMT reviews its
+own digestion/calculation-unit choices. Ordinary backend IEEE rounding is not
+classified as an upstream contract defect merely from these observations.
+
+## What was refuted
+
+The failure is not introduced by the contact panel, a mass-weight calculation,
+only the cell-list algorithm, or trusted-validation bypass. A blanket isclose
+rule would change the requested scientific threshold and does not establish a
+correct fix. A later passing nonboundary case cannot discharge this failure.
+
+## Acceptance criteria
+
+Agree the physical/numerical cutoff contract, preserve caller values/units and
+strict adjacent-value controls, and receive a correction through public native
+calls with both CPU routes, PBC, supported endpoint/representation modes and
+nondefault policies. Report any justified provider capability/floor separately.
+Then rerun the complete prototype selection and actual graphical receiving.
+Keep original failures and unit/backend/runtime identities. No implicit backend
+fallback, policy overwrite, source mutation or per-detector conversion clone.
+
+## Provenance
+
+Linux/Python 3.14; native source efffbaa8f and unchanged Rust. Runtime published
+PyUnitWizard 0.28.1, Pint 0.25.3, NumPy 2.4.6. The inspected provider clone is clean
+f82b618 and is not the runtime substitution. Owned processes use one CPU, 2 GiB,
+no swap and host-reserve monitoring; exact process/resource counters and source
+hashes remain in the receiving record. Deliberate tiny-budget test warnings are
+separate from host memory pressure.
+
+## Exact-scale reference exploration — 2026-11-10
+
+A [27-case independent reference](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/unit_scale_boundary_reference_666_20261110.json)
+uses standard-library Fraction.from_float, declared exact SI length ratios,
+one final binary64 rounding and the unchanged inclusive comparator. Working
+policies nm, angstrom and pm each receive all three source units and the
+immediate predecessor, exact equality and successor. All nine strict-below
+controls remain negative, and all eighteen equal/above controls remain positive.
+
+This is a deliberately narrow reference experiment, not a selected public API,
+production correction or proof for arbitrary units, geometry, affine conversions,
+backends, arrays or overflow. It suggests a useful provider discussion under
+uibcdf/pyunitwizard#143 without redefining thresholds through isclose or
+per-detector conversion clones. The accepted native failure and contact intent
+remain open, with no graphical or formal-progress credit.
+
+The bounded reference and its exclusions were handed to the provider in
+[uibcdf/pyunitwizard#143](https://github.com/uibcdf/pyunitwizard/issues/143#issuecomment-6778379247).
+The question is whether a supported explicit conversion route already exists
+or a provider-owned capability is warranted; no API, floor or release decision
+is inferred from delivering the proposal.
+
+## PyUnitWizard source correction received — 2026-11-10
+
+The provider corrected the usual `convert` and `get_value` path in local
+commit `238ed119f703acf89e2426d31970797a9340f14d`. Its exact-scale arithmetic
+applies to verified standard Pint definitions of nm, angstrom and pm and
+the supported input types. The provider keeps Pint behavior for foreign or
+redefined scales, active contexts and unsupported types. Adjacent source values
+can coincide after rounding in other destination representations.
+
+An isolated export of that exact provider commit passed **135** MolSysMT-side
+cases. The 27 scalar and array checks match the published destination bits.
+The 108 public `get_contacts` cases cover all three working policies and
+source units, each predecessor/equality/successor, both CPU routes and
+vacuum or an orthogonal box crossed by the pair. All strict predecessor
+controls remain negative. The native backend SHA-256 is
+`4ffb82e4250a1862fff17dbe7725fb8f0770d613ffef2648370389a66983d345`.
+MolSysMT inputs are from the working tree at `078e322fc` with unrelated
+H5MSM source changes. The run asserts the imported PyUnitWizard path is the
+export and uses the existing inclusive contact predicate. The shared installed
+environment was not changed.
+
+This receives the bounded provider source fix. A compatible published provider
+and applicable broader endpoint/representation checks remain pending. The final
+contact intent needs independent graphical receiving. No dependency floor,
+milestone credit, package or release decision follows from this source run.
+
+## Contact panel source and browser receiving — 2026-11-10
+
+Local branch `wip/contacts-panel-666-source-20261110` at
+`fbb9e2bd4fd9c7cc5b5f998d7a5db6a1b15b0145` carries the prototype forward from
+current owner source `9df62445e`. It delegates to native `get_contacts`, retains
+the Boolean map, and sends at most 50 result rows per page. Paired and Cartesian
+scopes, center endpoints, original indices, evaluated zeros and explicit
+participant actions are covered in **264 passing** Python and preflight cases.
+The calculation preserves the cutoff and its unit at the native boundary.
+
+With PyUnitWizard `238ed119`, Viewer `5164f13b` and native `4ffb82e4`,
+two actual JupyterLab and Chromium runs pass under nm and pm working policies.
+Each includes 0.5 nm, 5 Å and 500 pm and excludes the immediate binary64
+predecessor in each input unit. The second, more distant pair stays negative.
+All twelve decisions are observed in the panel table. The mounted scene,
+coordinates, chemical states, unit configuration and managed revision stay
+unchanged across the calculations. Page errors match the plain-Jupyter control.
+The two concurrent runs peak at about 2.54 GiB with at least 12.07 GiB host
+memory available in the sampled interval.
+
+An initial browser run passes all cutoff decisions and fails its final scene
+comparison against a snapshot taken before the widget mounted. A subsequent
+attempt captures the mounted baseline but fails to recognize its Jupyter output
+marker. The final driver takes the baseline after mounting and checks the
+rendered output cell. Every attempt uses the same native cutoff criteria.
+
+The published PyUnitWizard 0.29.1 tag resolves to `ab92f1e6` and predates
+the correction. The panel remains in the local branch while the
+compatible publication and its installed receiving are pending. #666 remains
+open and this source browser evidence adds no formal milestone credit.
+
+## Published correction and integrated panel — 2026-11-10
+
+PyUnitWizard [0.29.2](https://github.com/uibcdf/pyunitwizard/releases/tag/0.29.2)
+contains the correction and is the new MolSysMT dependency floor. The
+[receiving record](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/contact_panel_public_provider_receiving_666_20261110.json)
+identifies the public Conda file, its SHA-256, actual imports and the reviewed
+MolSysViewer and native-extension identities. The verified package ran from an
+isolated import overlay in the existing Linux/Python 3.14 environment.
+
+**860 focused cases pass**, including the 135 provider and native boundary
+controls. The permanent native guard passes all 36 cases with 0.29.2 and catches
+28 failures with 0.28.1. Each case exercises the predecessor, equality and
+successor for a declared cutoff and tests the native Boolean result. The guard
+protects exact boundary decisions under nm, angstrom and pm working policies,
+both CPU routes, and vacuum or periodic coordinates.
+
+Two actual JupyterLab and Chromium workflows pass all twelve displayed
+decisions under nm and pm. Each includes the equivalent cutoff and excludes its
+predecessor. The mounted scene, coordinates, chemical states, managed revision
+and caller units are preserved. All fifteen fast release gates pass. The
+source integration is `a9e6c6efb8393dab2101dca850dc3edbf2385947`. It passes
+145 focused cases including caller policy, explicit H5MSM migration, the
+native guard and the contact panel. This accepts the contact-query source
+intent under #421. Exact candidate, platform and final installed-pair
+qualification remain under #334 and #524.

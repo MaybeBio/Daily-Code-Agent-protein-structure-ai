@@ -1,0 +1,965 @@
+import { EQUAL_STYLES } from '../argInfo';
+import { Fix } from './fix';
+import { StyleError } from '../force/types';
+import { missingArgs } from '../force/util';
+import type { System } from '../system';
+import { int, latticeScale, num, yesno } from '../commands/args';
+import { libm } from '../libm';
+import { restartDue } from '../commands/restart';
+
+/*
+ * fix ID group-ID deform N parameter style args ... keyword value ...
+ * — docs.lammps.org/fix_deform.html. Quoted lines below are verbatim from
+ * that page (fix_deform.rst in plans/lammps-docs, checked with grep -F).
+ *
+ *   |   fix ID group-ID deform N parameter style args ... keyword value ...
+ *
+ *   |Every Nth timestep during the run, the simulation box is
+ *   |expanded, contracted, or tilted to ramped values between the initial
+ *   |and final values.
+ *
+ * Length styles, with t the elapsed time since the start of the run:
+ *
+ *   |   L(t) = L0 (1 + erate\*dt)
+ *
+ *   |   L(t) = L0 exp(trate\*dt)
+ *
+ *   |   L(t) = L0 + A sin(2\*pi t/Tp)
+ *
+ *   |*volume* value = none = adjust this dim to preserve volume of system
+ *
+ *   |For the *scale*, *vel*, *erate*, *trate*, *volume*, *wiggle*, and
+ *   |*variable* styles, the box length is expanded or compressed around its
+ *   |mid point.
+ *
+ * "final" ramps both boundaries: "For style *final*, the final lo and hi box
+ * boundaries of a dimension are specified."; "delta" is the same ramp with
+ * targets lo0+dlo / hi0+dhi. "vel" is "a velocity at which the box length
+ * changes is specified in units of distance/time", i.e. L(t) = L0 + V t.
+ *
+ * Tilt styles:
+ *
+ *   |   T(t) = T0 + L0\*erate\*dt
+ *
+ *   |   T(t) = T0 exp(trate\*dt)
+ *
+ *   |   T(t) = T0 + A sin(2\*pi t/Tp)
+ *
+ *   |where T0 is the initial tilt factor, L0 is the original length of the
+ *   |box perpendicular to the shear direction (e.g. y box length for xy
+ *
+ *   |every picosecond.  Note that the initial tilt factor must be non-zero
+ *   |to use the *trate* option.
+ *
+ * remap (applied at each deformation and, for v, whenever pbc wraps atoms):
+ *
+ *   |Each time the box size or shape is changed, the *remap* keyword
+ *   |determines whether atom positions are remapped to the new box.  If
+ *   |*remap* is set to *x* (the default), atoms in the fix group are
+ *   |remapped; otherwise they are not.  Note that their velocities are not
+ *   |changed, just their positions are altered.  If *remap* is set to *v*,
+ *   |then any atom in the fix group that crosses a periodic boundary will
+ *   |have a delta added to its velocity equal to the difference in
+ *   |velocities between the lo and hi boundaries.  Note that this velocity
+ *   |difference can include tilt components, e.g. a delta in the x velocity
+ *   |when an atom crosses the y periodic boundary.  If *remap* is set to
+ *   |*none*, then neither of these remappings take place.
+ *
+ *   |The *flip* keyword allows the tilt factors for a triclinic box to
+ *   |exceed half the distance of the parallel box length, as discussed
+ *   |above.  If the *flip* value is set to *yes*, the bound is enforced by
+ *   |flipping the box when it is exceeded.  If the *flip* value is set to
+ *   |*no*, the tilt will continue to change without flipping.
+ *
+ *   |The *units* keyword determines the meaning of the distance units used
+ *   |to define various arguments.  A *box* value selects standard distance
+ *   |units as defined by the :doc:`units <units>` command, e.g. Angstroms for
+ *   |units = real or metal.  A *lattice* value means the distance units are
+ *   |in lattice spacings.  The :doc:`lattice <lattice>` command must have
+ *   |been previously used to define the lattice spacing.  Note that the
+ *   |units choice also affects the *vel* style parameters since it is
+ *   |defined in terms of distance/time.  Also note that the units keyword
+ *   |does not affect the *variable* style.
+ *
+ *   |The option defaults are remap = x, flip = yes, and units = lattice.
+ *
+ * The deformation is applied in end_of_step every N steps ("Every Nth
+ * timestep"); each length/tilt is a function of the elapsed time since the
+ * start of the run (step - run.firstStep) * dt, and the final/delta/scale
+ * ramp spans the run (lastStep - firstStep) * dt ("This fix can perform
+ * deformation over multiple runs, using the *start* and *stop* keywords of
+ * the :doc:`run <run>` command." — the engine measures from the run start).
+ *
+ * The streaming velocity of the deforming box (used by compute temp/deform
+ * and by the remap v boundary deltas) follows from r = r_lo + H lamda with
+ * the triclinic edge matrix H = [[Lx,xy,xz],[0,Ly,yz],[0,0,Lz]]
+ * (Howto_triclinic.html): v = d(r_lo)/dt + (dH/dt) lamda, i.e. per component
+ *   vx = loDot_x + Lxdot*lam_x + xydot*lam_y + xzdot*lam_z
+ *   vy = loDot_y + Lydot*lam_y + yzdot*lam_z
+ *   vz = loDot_z + Lzdot*lam_z
+ * where loDot is the velocity of the lo boundary (-Ldot/2 for the styles that
+ * deform "around its mid point", the lo ramp rate for final/delta).
+ */
+
+type DimStyle = 'final' | 'delta' | 'scale' | 'vel' | 'erate' | 'trate' | 'volume' | 'wiggle' | 'variable';
+
+const LEN_STYLES: DimStyle[] = ['final', 'delta', 'scale', 'vel', 'erate', 'trate', 'volume', 'wiggle', 'variable'];
+const TILT_STYLES: DimStyle[] = ['final', 'delta', 'vel', 'erate', 'trate', 'wiggle', 'variable'];
+/** fix deform/pressure-only styles (docs.lammps.org/fix_deform_pressure.html). */
+const PRESSURE_STYLES = ['pressure', 'pressure/mean'];
+/** fix deform/pressure-only keywords. */
+const PRESSURE_KEYWORDS = ['couple', 'vol/balance/p', 'max/rate', 'normalize/pressure'];
+
+/**
+ * The arguments of a child style of fix deform (fix deform/pressure): the styles of an x ... yz parameter that the
+ * parent leaves to it with their word counts, its own parameters (box), and its trailing keywords with their word
+ * counts. As native LAMMPS does (src/fix_deform.cpp constructor and options() at b332f28), the parent records where
+ * they are (leftover) and the child parses them.
+ */
+export interface DeformChildArgs {
+  /** The child's fix style, for the messages. */
+  name: string;
+  styles: Record<string, number>;
+  params: string[];
+  options: Record<string, number>;
+}
+
+/**
+ * The box of one update while it is being built: lo and hi bounds, lengths, tilts (xy, xz, yz), and the rates other
+ * fixes and computes read (length rate, lo-boundary rate, tilt rate). apply is false for the rates set at init (no box
+ * change).
+ */
+export interface DeformTargets {
+  lo: number[];
+  hi: number[];
+  len: number[];
+  lenD: number[];
+  loD: number[];
+  tilt: number[];
+  tiltD: number[];
+  apply: boolean;
+}
+
+/** How a volume dimension follows the others (native ONE_FROM_ONE, ONE_FROM_TWO, TWO_FROM_ONE). */
+export interface VolumeLink {
+  dim: number;
+  kind: 'one-from-one' | 'one-from-two' | 'two-from-one';
+  fixed: number;
+  dynamic1: number;
+  dynamic2: number;
+}
+
+/** A fix that deforms the box (native get_fix_by_style("^deform"): fix deform and fix deform/pressure). */
+export const isDeformFix = (f: { style: string }): boolean => f.style === 'deform' || f.style === 'deform/pressure';
+
+interface DimSpec {
+  /** 'x' | 'y' | 'z' | 'xy' | 'xz' | 'yz'. */
+  name: string;
+  /** Length dimension 0/1/2 for x/y/z; for tilts the tilt index 0/1/2 (xy, xz, yz). */
+  dim: number;
+  tilt: boolean;
+  style: DimStyle;
+  /** erate/rescale (tilt only). */
+  rescale?: boolean;
+  lo?: number; hi?: number;   // final targets (box units)
+  dlo?: number; dhi?: number; // delta amounts (box units)
+  factor?: number;            // scale
+  v?: number;                 // vel (box units / time)
+  rate?: number;              // erate / trate (1/time)
+  amp?: number; period?: number; // wiggle (amp in box units)
+  var1?: string; var2?: string;  // variable style names
+}
+
+export class FixDeform extends Fix {
+  readonly style: string = 'deform';
+  protected readonly specs: DimSpec[] = [];
+  protected remapMode: 'x' | 'v' | 'none' = 'x';
+  protected flip = true;
+  private readonly unitsLattice: boolean;
+  /** Positions in args of the child style's words (native leftover_iarg), in the order they appear. */
+  protected readonly leftover: number[] = [];
+  /** The volume dimensions and the dimensions they follow (native set[i].substyle, fixed, dynamic1, dynamic2). */
+  protected volumeLinks: VolumeLink[] = [];
+
+  // box at the start of the run (paraphrased, not quoted: the box set by
+  // create_box, read_data or read_restart, or the values from the end of the
+  // previous run; paraphrase of the fix_deform.rst description of run start)
+  protected lo0: number[] = [0, 0, 0];
+  protected hi0: number[] = [0, 0, 0];
+  protected len0: number[] = [0, 0, 0];
+  protected mid0: number[] = [0, 0, 0];
+  protected tilt0: number[] = [0, 0, 0];
+  /** Length perpendicular to the shear: y for xy, z for xz and yz. */
+  protected perp0: number[] = [0, 0, 0];
+  /** The box volume at the start of the run, xprd yprd zprd as native vol_start (also in 2d). */
+  protected vol0 = 0;
+  protected captured = false;
+
+  /** Current box deformation rates: d(length)/dt, d(tilt)/dt, lo-boundary velocity. */
+  private lenDot: number[] = [0, 0, 0];
+  private tiltDot: number[] = [0, 0, 0];
+  private loDot: number[] = [0, 0, 0];
+  /** remap v state: the last remap step, and the repair bookkeeping for the engine's earlier no-kick pbc wraps. */
+  private remapLastStep = -1;
+  private imgPre: Int32Array | null = null;
+  private accShift = new Float64Array(0);
+  private accImg = new Int32Array(0);
+  private lam: number[] = [0, 0, 0];
+  /**
+   * A box flip decided by the last box update (native flip, tilt_flip and flipxy/flipxz/flipyz): the step whose
+   * pre_exchange performs it, the flipped tilts (xy, xz, yz) and the box vectors added (m for xy, n for xz, p for yz).
+   */
+  private flipPending: { step: number; tilt: number[]; m: number; n: number; p: number } | null = null;
+
+  constructor(sys: System, id: string, group: string, args: string[], child?: DeformChildArgs) {
+    super(sys, id, group, args);
+    const n = int(args[0], 'fix deform N');
+    // fix_deform.rst: "For N > 0, the box is updated at the end of the time step every N steps. For N = 0, the box is updated immediately after position updates on every time step."
+    // As native LAMMPS does (src/fix_deform.cpp FixDeform::FixDeform and options() at b332f28): the messages name the
+    // style as invoked (deform or deform/pressure)
+    const style = child ? child.name : 'deform';
+    if (n < 0) throw new StyleError(`Fix ${style} Nevery must be >= 0`);
+    this.nevery = n;
+    let units: string | null = null;
+    // first pass: keywords (they may follow any parameter sequence)
+    // the child's words are recorded with their positions, as native leftover_iarg (its keywords, and its parameters)
+    const skipChild = (k: number, nskip: number, what: string): number => {
+      if (k + nskip > args.length) throw new StyleError(`Illegal fix ${child!.name} ${what} command: missing argument(s)`);
+      for (let j = 0; j < nskip; j++) this.leftover.push(k + j);
+      return nskip;
+    };
+    for (let k = 1; k < args.length;) {
+      const w = args[k];
+      if (child && Object.hasOwn(child.options, w)) {
+        k += skipChild(k, child.options[w], w);
+        continue;
+      }
+      if (child && child.params.includes(w)) {
+        const st = args[k + 1];
+        if (st === undefined || !Object.hasOwn(child.styles, st)) throw new StyleError(`Illegal fix ${child.name} command argument: ${st ?? ''}`);
+        k += skipChild(k, child.styles[st], `${w} ${st}`);
+        continue;
+      }
+      if (w === 'remap' || w === 'flip' || w === 'units' || PRESSURE_KEYWORDS.includes(w)) {
+        const val = args[k + 1];
+        // As native LAMMPS does (src/fix_deform.cpp FixDeform::options at b332f28): "Illegal fix {style} {keyword} command: missing argument(s)"
+        if (val === undefined) throw missingArgs(`fix ${child ? child.name : 'deform'} ${w}`);
+        if (w === 'remap') {
+          if (val !== 'x' && val !== 'v' && val !== 'none') throw new StyleError(`Illegal fix ${style} remap command: ${val}`);
+          this.remapMode = val;
+        } else if (w === 'flip') {
+          this.flip = yesno(val, 'fix deform flip');
+        } else if (w === 'units') {
+          if (val !== 'lattice' && val !== 'box') throw new StyleError(`Illegal fix ${style} units command: ${val}`);
+          units = val;
+        } else {
+          // a fix deform/pressure keyword given to fix deform
+          throw new StyleError(`Unknown fix ${style} keyword: ${w}`);
+        }
+        k += 2;
+        continue;
+      }
+      k += this.parseParam(args, k, child);
+    }
+    if (!this.specs.length && !child) throw new StyleError('fix deform: at least one parameter (x, y, z, xy, xz, yz) is required');
+    // fix_deform.rst (live docs): for N = 0 the box update is not compatible with the variable style. Native error (black box), no quote marks:
+    // Fix deform cannot use the variable style with nevery = 0
+    if (n === 0 && this.specs.some((sp) => sp.style === 'variable')) {
+      throw new StyleError('fix deform cannot use the variable style with nevery = 0');
+    }
+    // erate/rescale: Measured with native LAMMPS (black box): with no length change the tilt
+    // equals the erate result (xy erate/rescale 0.05 and xy erate 0.05 print identical xy at steps 0-2 with
+    // Lx = 6.71838476553003). With x trate 0.02 the two differ (step 1: xy 0.504570858167162 for rescale
+    // against 0.504550695891306 for erate), because dT/dt = L_beta erate + (dL_alpha/dt)/L_alpha T.
+    // Only the lone-tilt case is implemented; the mixed-flow half-step scheme is refused.
+    if (this.specs.some((sp) => sp.rescale)) {
+      if (this.specs.length !== 1) {
+        throw new StyleError('fix deform: erate/rescale together with other parameters is not supported by the browser engine (only a lone xy, xz or yz erate/rescale)');
+      }
+    }
+    if (sys.dimension === 2) {
+      for (const sp of this.specs) {
+        if (sp.name === 'z' || sp.name === 'xz' || sp.name === 'yz') {
+          throw new StyleError(`fix deform: parameter ${sp.name} is not available for a 2d simulation`);
+        }
+      }
+    }
+    // the volume dimensions and the ones they follow (a child style links its own, as native "only check for parent,
+    // otherwise child will check")
+    if (!child) {
+      this.volumeLinks = this.linkVolumes((d) => {
+        const sp = this.specs.find((x) => !x.tilt && x.dim === d);
+        return !sp ? 'none' : sp.style === 'volume' ? 'volume' : 'other';
+      }, 'deform');
+    }
+    // units conversion happens after the full parse: the keyword may follow
+    // the parameter sequences it scales. region.html (style prism): "The lattice spacing
+    // in dimension x is applied to xy and xz, and the spacing in dimension y
+    // to yz."
+    this.unitsLattice = (units ?? 'lattice') === 'lattice';
+    if (this.unitsLattice) {
+      const sp = latticeScale(sys, 'lattice', 'fix deform');
+      const scaleOf = (name: string): number => (name === 'x' || name === 'xy' || name === 'xz' ? sp[0] : name === 'y' || name === 'yz' ? sp[1] : sp[2]);
+      for (const s2 of this.specs) {
+        const f = scaleOf(s2.name);
+        if (s2.lo !== undefined) s2.lo *= f;
+        if (s2.hi !== undefined) s2.hi *= f;
+        if (s2.dlo !== undefined) s2.dlo *= f;
+        if (s2.dhi !== undefined) s2.dhi *= f;
+        if (s2.v !== undefined) s2.v *= f;
+        if (s2.amp !== undefined) s2.amp *= f;
+      }
+    }
+  }
+
+  /** Parses one parameter/args sequence at args[k]; returns the words consumed. */
+  private parseParam(a: string[], k: number, child?: DeformChildArgs): number {
+    const name = a[k];
+    const tilt = name.length === 2;
+    const style = a[k + 1];
+    if (!['x', 'y', 'z', 'xy', 'xz', 'yz'].includes(name)) {
+      // As native LAMMPS does (src/fix_deform.cpp FixDeform::FixDeform and FixDeform::options at b332f28): the first word that is
+      // neither a box parameter nor a keyword ends the parameter loop, and options() then rejects it as an unknown keyword.
+      throw new StyleError(`Unknown fix ${child ? child.name : 'deform'} keyword: ${name}`);
+    }
+    // a style the parent does not know is the child's (native child_styles): its words are left to the child
+    const parentStyle = tilt ? style === 'erate/rescale' || TILT_STYLES.includes(style as DimStyle) : LEN_STYLES.includes(style as DimStyle);
+    if (child && !parentStyle && style !== undefined && Object.hasOwn(child.styles, style)) {
+      const nskip = child.styles[style];
+      if (k + nskip > a.length) throw new StyleError(`Illegal fix ${child.name} ${style} command: missing argument(s)`);
+      for (let j = 0; j < nskip; j++) this.leftover.push(k + j);
+      return nskip;
+    }
+    if (this.specs.some((s) => s.name === name)) throw new StyleError(`fix deform: parameter ${name} given twice`);
+    if (PRESSURE_STYLES.includes(style)) {
+      // fix_deform.cpp constructor: "Illegal fix {} command argument: {}" (the style is one of fix deform/pressure)
+      throw new StyleError(`Illegal fix deform command argument: ${style} (a fix deform/pressure style)`);
+    }
+    // fix_deform.rst: "The *erate/rescale* style operates similarly to the *erate* style with a specified strain rate"
+    // The rescale variant is implemented only for a lone tilt parameter (see the check after the parse loop).
+    const rescale = style === 'erate/rescale';
+    if (rescale && !tilt) throw new StyleError(`fix deform: style 'erate/rescale' is only valid for tilt parameters (got ${name})`);
+    const st = rescale ? 'erate' : style;
+    const allowed = tilt ? TILT_STYLES : LEN_STYLES;
+    if (!allowed.includes(st as DimStyle)) {
+      throw new StyleError(`fix deform: style '${style}' is not valid for parameter ${name} (allowed: ${allowed.join(' ')}${tilt ? ' erate/rescale' : ''})`);
+    }
+    const spec: DimSpec = { name, dim: tilt ? ['xy', 'xz', 'yz'].indexOf(name) : ['x', 'y', 'z'].indexOf(name), tilt, style: st as DimStyle, rescale };
+    const numAt = (j: number, what: string): number => num(a[j], `fix deform ${name} ${style} ${what}`);
+    let used = 2;
+    switch (st) {
+      case 'final':
+        if (tilt) {
+          spec.lo = numAt(k + 2, 'tilt');
+          used = 3;
+        } else {
+          spec.lo = numAt(k + 2, 'lo');
+          spec.hi = numAt(k + 3, 'hi');
+          used = 4;
+        }
+        break;
+      case 'delta':
+        if (tilt) {
+          spec.dlo = numAt(k + 2, 'dtilt');
+          used = 3;
+        } else {
+          spec.dlo = numAt(k + 2, 'dlo');
+          spec.dhi = numAt(k + 3, 'dhi');
+          used = 4;
+        }
+        break;
+      case 'scale':
+        if (tilt) throw new StyleError(`fix deform: style 'scale' is not valid for tilt parameter ${name}`);
+        spec.factor = numAt(k + 2, 'factor');
+        used = 3;
+        break;
+      case 'vel':
+        spec.v = numAt(k + 2, 'V');
+        used = 3;
+        break;
+      case 'erate':
+      case 'trate':
+        spec.rate = numAt(k + 2, 'R');
+        used = 3;
+        break;
+      case 'volume':
+        if (tilt) throw new StyleError(`fix deform: style 'volume' is not valid for tilt parameter ${name}`);
+        used = 2; // "*volume* value = none": no value follows
+        break;
+      case 'wiggle':
+        spec.amp = numAt(k + 2, 'A');
+        spec.period = numAt(k + 3, 'Tp');
+        if (spec.period <= 0) throw new StyleError(`fix deform: wiggle period must be > 0 (got '${a[k + 3]}')`);
+        used = 4;
+        break;
+      case 'variable': {
+        const v1 = a[k + 2], v2 = a[k + 3];
+        if (v1 === undefined || v2 === undefined) throw new StyleError(`fix deform ${name} variable needs two variables v_name1 v_name2`);
+        if (!v1.startsWith('v_') || !v2.startsWith('v_')) throw new StyleError(`fix deform ${name} variable needs two variables v_name1 v_name2 (got '${v1} ${v2}')`);
+        spec.var1 = v1.slice(2);
+        spec.var2 = v2.slice(2);
+        used = 4;
+        break;
+      }
+    }
+    this.specs.push(spec);
+    return used;
+  }
+
+  /**
+   * As native LAMMPS does (src/fix_deform.cpp constructor at b332f28): each volume dimension follows the others. With
+   * one undeformed other dimension it takes the volume from the deformed one and the undeformed one's start length
+   * (one-from-one); with two deformed others, from both (one-from-two); when the other is also a volume dimension, the
+   * two share the volume left by the deformed one and keep their start length ratio (two-from-one). A volume
+   * dimension needs at least one deformed other dimension: "Fix {} volume setting is invalid".
+   */
+  protected linkVolumes(kindOf: (d: number) => 'none' | 'volume' | 'other', name: string): VolumeLink[] {
+    const links: VolumeLink[] = [];
+    for (let i = 0; i < 3; i++) {
+      if (kindOf(i) !== 'volume') continue;
+      const o1 = (i + 1) % 3, o2 = (i + 2) % 3;
+      const k1 = kindOf(o1), k2 = kindOf(o2);
+      if (k1 !== 'other' && k2 !== 'other') throw new StyleError(`Fix ${name} volume setting is invalid`);
+      if (k1 === 'none') links.push({ dim: i, kind: 'one-from-one', fixed: o1, dynamic1: o2, dynamic2: -1 });
+      else if (k2 === 'none') links.push({ dim: i, kind: 'one-from-one', fixed: o2, dynamic1: o1, dynamic2: -1 });
+      else if (k1 === 'volume') links.push({ dim: i, kind: 'two-from-one', fixed: o1, dynamic1: o2, dynamic2: -1 });
+      else if (k2 === 'volume') links.push({ dim: i, kind: 'two-from-one', fixed: o2, dynamic1: o1, dynamic2: -1 });
+      else links.push({ dim: i, kind: 'one-from-two', fixed: -1, dynamic1: o1, dynamic2: o2 });
+    }
+    return links;
+  }
+
+  /** Does this fix set box length d (native dimflag[0..2])? */
+  controlsLength(d: number): boolean {
+    return this.specs.some((sp) => !sp.tilt && sp.dim === d);
+  }
+
+  /** Does this fix set tilt t, 0 xy, 1 xz, 2 yz (native dimflag[5], [4], [3])? */
+  controlsTilt(t: number): boolean {
+    return this.specs.some((sp) => sp.tilt && sp.dim === t);
+  }
+
+  init(): void {
+    const s = this.sys.state;
+    const g = this.sys.geom;
+    // fix_deform.cpp init(): "More than one fix deform" (get_fix_by_style("deform") counts fix deform/pressure too)
+    if (this.sys.fixes.filter((f) => isDeformFix(f)).length > 1) throw new StyleError('More than one fix deform');
+    // then the variables of the variable style, in native's set[] order (x, y, z, yz, xz, xy): each exists and is
+    // equal-style
+    const ORDER = ['x', 'y', 'z', 'yz', 'xz', 'xy'];
+    const varSpecs = this.specs.filter((sp) => sp.style === 'variable').sort((a, b) => ORDER.indexOf(a.name) - ORDER.indexOf(b.name));
+    for (const sp of varSpecs) {
+      for (const name of [sp.var1!, sp.var2!]) {
+        const v = this.sys.vars.get(name);
+        if (!v) throw new StyleError(`Variable name ${name} for fix ${this.style} does not exist`);
+        if (!EQUAL_STYLES.has(v.style)) throw new StyleError(`Variable ${name} for fix ${this.style} is invalid style`);
+      }
+    }
+    for (let d = 0; d < 3; d++) {
+      this.lo0[d] = s.box.lo[d];
+      this.hi0[d] = s.box.hi[d];
+      this.len0[d] = d === 0 ? g.lx : d === 1 ? g.ly : g.lz;
+      this.mid0[d] = 0.5 * (s.box.lo[d] + s.box.hi[d]);
+    }
+    this.tilt0 = [g.xy, g.xz, g.yz];
+    // "L0 is the original length of the box perpendicular to the shear
+    // direction (e.g. y box length for xy deformation)"
+    this.perp0 = [g.ly, g.lz, g.lz];
+    this.vol0 = g.lx * g.ly * g.lz;
+    for (const sp of this.specs) {
+      if (sp.style === 'trate' && sp.tilt && this.tilt0[sp.dim] === 0) {
+        throw new StyleError(`fix deform: the initial tilt factor must be non-zero to use the trate option (${sp.name} is 0)`);
+      }
+    }
+    this.checkYzFlips();
+    this.captured = true;
+    this.deform(false); // rates at elapsed = 0, for compute temp/deform before the first end_of_step
+  }
+
+  /**
+   * As native LAMMPS does (src/fix_deform.cpp init at b332f28): "if yz [3] changes and will cause box flip, then xy [5]
+   * cannot be changing unless xz [4] style is ERATERS ... b/c the flips would induce continuous changes in xz". With
+   * flip yes, a changing yz whose final value (its range for wiggle) passes half the y length at the start or at the
+   * end of the run stops the run when xy changes too.
+   */
+  private checkYzFlips(): void {
+    const yz = this.specs.find((sp) => sp.tilt && sp.dim === 2);
+    const xz = this.specs.find((sp) => sp.tilt && sp.dim === 1);
+    if (!yz || !this.controlsTilt(0) || xz?.rescale || !this.flip) return;
+    if (yz.style === 'variable') throw new StyleError('Fix deform cannot use yz variable with box flips and a defined xy unless xz is erate/rescale');
+    if (yz.rescale) throw new StyleError('Fix deform cannot use yz erate/rescale with box flips and a defined xy unless xz is erate/rescale');
+    const sys = this.sys;
+    const span = (sys.run.endStep - sys.run.beginStep) * sys.state.dt;
+    const T0 = this.tilt0[2];
+    let lo: number, hi: number;
+    if (yz.style === 'wiggle') { lo = T0 - yz.amp!; hi = T0 + yz.amp!; }
+    else {
+      const stop = yz.style === 'final' ? yz.lo! : yz.style === 'delta' ? T0 + yz.dlo! : yz.style === 'vel' ? T0 + yz.v! * span
+        : yz.style === 'erate' ? T0 + this.perp0[2] * yz.rate! * span : yz.style === 'trate' ? T0 * libm.exp(yz.rate! * span) : T0;
+      lo = hi = stop;
+    }
+    const L0 = this.len0[1];
+    let flag = lo / L0 < -0.5 || hi / L0 > 0.5;
+    const y = this.specs.find((sp) => !sp.tilt && sp.dim === 1);
+    if (y) {
+      const L1 = y.style === 'final' ? y.hi! - y.lo! : y.style === 'delta' ? this.hi0[1] + y.dhi! - (this.lo0[1] + y.dlo!)
+        : y.style === 'scale' ? y.factor! * L0 : y.style === 'vel' ? L0 + y.v! * span : y.style === 'erate' ? L0 * (1 + y.rate! * span)
+          : y.style === 'trate' ? L0 * libm.exp(y.rate! * span) : L0;
+      if (lo / L1 < -0.5 || hi / L1 > 0.5) flag = true;
+    }
+    if (flag) throw new StyleError('Fix deform is changing yz too much with xy. This can be accounted for by setting xz style to erate/rescale.');
+  }
+
+  setup(): void {
+    // As native LAMMPS does (src/fix_deform.cpp at b332f28): the fix has no setup(), so the box first changes at the
+    // first post_integrate (or end_of_step) and the run setup keeps the atoms where they are; the rates are set at init.
+    // remap v: the first remap window starts at the run setup
+    const s = this.sys.state;
+    this.remapLastStep = s.step;
+    this.ensureRemapArrays(s.n);
+  }
+
+  endOfStep(): void {
+    const s = this.sys.state;
+    if (this.nevery === 0 || s.step % this.nevery !== 0) return;
+    this.deform(true);
+  }
+
+  /**
+   * Computes the box parameters and rates for the current step's elapsed time
+   * and, when `apply`, installs them through sys.setBox (remap x keeps the
+   * fractional coordinates of the fix group's atoms, v/none keep their
+   * Cartesian ones).
+   */
+  private deform(apply: boolean): void {
+    if (!this.captured) return;
+    const sys = this.sys;
+    const s = sys.state;
+    const dt = s.dt;
+    // native fix_deform.cpp measures the run with update->beginstep and endstep (the start and stop of run.html)
+    const elapsed = (s.step - sys.run.beginStep) * dt;
+    const span = (sys.run.endStep - sys.run.beginStep) * dt;
+    const frac = span > 0 ? elapsed / span : 0;
+    const dim = s.dimension;
+    const ndims = dim === 2 ? 2 : 3;
+
+    const lo = [s.box.lo[0], s.box.lo[1], s.box.lo[2]];
+    const hi = [s.box.hi[0], s.box.hi[1], s.box.hi[2]];
+    const tilt = [s.box.tilt[0], s.box.tilt[1], s.box.tilt[2]];
+    const len = [this.len0[0], this.len0[1], this.len0[2]];
+    const lenD = [0, 0, 0];
+    const loD = [0, 0, 0];
+
+    // non-volume length styles first (volume dims need their new lengths)
+    for (const sp of this.specs) {
+      if (sp.tilt || sp.style === 'volume') continue;
+      const d = sp.dim, L0 = this.len0[d];
+      let L = L0, LD = 0, loRate = 0;
+      switch (sp.style) {
+        case 'final':
+        case 'delta': {
+          // final: "the final lo and hi box boundaries"; delta: lo0+dlo, hi0+dhi
+          const loT = sp.style === 'final' ? sp.lo! : this.lo0[d] + sp.dlo!;
+          const hiT = sp.style === 'final' ? sp.hi! : this.hi0[d] + sp.dhi!;
+          lo[d] = this.lo0[d] + (loT - this.lo0[d]) * frac;
+          hi[d] = this.hi0[d] + (hiT - this.hi0[d]) * frac;
+          loRate = span > 0 ? (loT - this.lo0[d]) / span : 0;
+          LD = span > 0 ? (hiT - this.hi0[d] - (loT - this.lo0[d])) / span : 0;
+          break;
+        }
+        case 'scale': {
+          L = L0 + (sp.factor! * L0 - L0) * frac;
+          LD = span > 0 ? (sp.factor! * L0 - L0) / span : 0;
+          break;
+        }
+        // As native LAMMPS does (src/fix_deform.cpp init at b332f28): the rate of the final, delta, scale, vel and erate
+        // styles is (stop - start) / delt over the run, and 0 when the run has no steps ("if (delt != 0.0) ... else
+        // dlo_dt = dhi_dt = 0.0"), so a run 0 sees no box rate (pair lubricate's strain rate, compute temp/deform)
+        case 'vel':
+          L = L0 + sp.v! * elapsed;
+          LD = span > 0 ? sp.v! : 0;
+          break;
+        case 'erate':
+          L = L0 * (1 + sp.rate! * elapsed);
+          LD = span > 0 ? L0 * sp.rate! : 0;
+          break;
+        case 'trate':
+          L = L0 * libm.exp(sp.rate! * elapsed);
+          LD = L * sp.rate!;
+          break;
+        case 'wiggle': {
+          const w = (2 * Math.PI * elapsed) / sp.period!;
+          L = L0 + sp.amp! * libm.sin(w);
+          LD = sp.amp! * ((2 * Math.PI) / sp.period!) * libm.cos(w);
+          break;
+        }
+        case 'variable':
+          L = L0 + sys.equalVariable(sp.var1!);
+          LD = sys.equalVariable(sp.var2!);
+          break;
+      }
+      len[d] = L;
+      lenD[d] = LD;
+      if (sp.style !== 'final' && sp.style !== 'delta') {
+        // "the box length is expanded or compressed around its mid point"
+        lo[d] = this.mid0[d] - 0.5 * L;
+        hi[d] = this.mid0[d] + 0.5 * L;
+        loRate = -LD / 2;
+      }
+      loD[d] = loRate;
+    }
+
+    // the child's controls (fix deform/pressure), then the volume dimensions, which follow the others' new lengths
+    const tiltD = [0, 0, 0];
+    const tg: DeformTargets = { lo, hi, len, lenD, loD, tilt, tiltD, apply };
+    this.controlTargets(tg);
+    this.applyVolume(tg);
+
+    // tilt styles
+    for (const sp of this.specs) {
+      if (!sp.tilt) continue;
+      const t = sp.dim, T0 = this.tilt0[t];
+      let T = T0, TD = 0;
+      switch (sp.style) {
+        case 'final':
+          T = T0 + (sp.lo! - T0) * frac;
+          TD = span > 0 ? (sp.lo! - T0) / span : 0;
+          break;
+        case 'delta':
+          T = T0 + sp.dlo! * frac;
+          TD = span > 0 ? sp.dlo! / span : 0;
+          break;
+        // tilts as native init: final, delta and vel have no rate in a run with no steps; erate keeps its rate ("ERATE
+        // and ERATERS not set to 0 even if delt is 0 since needed for velocity kick in fix nvt/sllod")
+        case 'vel':
+          T = T0 + sp.v! * elapsed;
+          TD = span > 0 ? sp.v! : 0;
+          break;
+        case 'erate':
+          T = T0 + this.perp0[t] * sp.rate! * elapsed;
+          TD = this.perp0[t] * sp.rate!;
+          break;
+        case 'trate':
+          T = T0 * libm.exp(sp.rate! * elapsed);
+          TD = T0 * sp.rate! * libm.exp(sp.rate! * elapsed);
+          break;
+        case 'wiggle': {
+          const w = (2 * Math.PI * elapsed) / sp.period!;
+          T = T0 + sp.amp! * libm.sin(w);
+          TD = sp.amp! * ((2 * Math.PI) / sp.period!) * libm.cos(w);
+          break;
+        }
+        case 'variable':
+          T = T0 + sys.equalVariable(sp.var1!);
+          TD = sys.equalVariable(sp.var2!);
+          break;
+      }
+      tilt[t] = T;
+      tiltD[t] = TD;
+    }
+    this.boxTargets(tg);
+    for (let d = 0; d < ndims; d++) {
+      if (!(len[d] > 0)) throw new StyleError(`fix deform: box length in ${'xyz'[d]} became ${len[d]}`);
+    }
+
+    if (apply && s.box.triclinic) this.tiltTargets(lo, hi, tilt);
+
+    if (!apply) {
+      this.lenDot = lenD;
+      this.tiltDot = tiltD;
+      this.loDot = loD;
+      return;
+    }
+    this.lenDot = lenD;
+    this.tiltDot = tiltD;
+    this.loDot = loD;
+    // As native LAMMPS does (src/fix_deform.cpp end_of_step at b332f28): with remap x every rigid body's centre of mass
+    // is mapped with the atoms, to lamda coordinates of the old box before the change and back to the new box after it.
+    const remapBodies = this.remapMode === 'x';
+    if (remapBodies) for (const f of sys.fixes) f.deformBodies?.(0);
+    sys.setBox(lo, hi, tilt, this.remapMode === 'x' ? this.groupBit : 0, this);
+    if (remapBodies) for (const f of sys.fixes) f.deformBodies?.(1);
+    // thermo output and dumps after end_of_step keep reporting this step's
+    // force evaluation (energies, virial and per-atom forces), as LAMMPS does
+    // when fix deform changes the box after final_integrate
+    if (this.nevery > 0) sys.forcesCurrent();
+  }
+
+  /** The child's controls of an update, after the strain styles and before the volume ones (fix deform/pressure). */
+  protected controlTargets(_tg: DeformTargets): void {}
+
+  /** The child's controls of an update after the volume styles (fix deform/pressure box). */
+  protected boxTargets(_tg: DeformTargets): void {}
+
+  /**
+   * As native LAMMPS does (src/fix_deform.cpp apply_volume at b332f28): the half length of a volume dimension, from
+   * the start volume (xprd yprd zprd) and the lengths it follows (see linkVolumes), set about the start mid point;
+   * its length rate is the change from the current length over one time step, (2 shift - L) / dt.
+   */
+  protected applyVolume(tg: DeformTargets): void {
+    const s = this.sys.state;
+    for (const vl of this.volumeLinks) {
+      const i = vl.dim;
+      const v0 = this.vol0;
+      const target = (d: number): number => tg.hi[d] - tg.lo[d];
+      const start = (d: number): number => this.hi0[d] - this.lo0[d];
+      let shift: number;
+      if (vl.kind === 'one-from-one') shift = 0.5 * (v0 / target(vl.dynamic1) / start(vl.fixed));
+      else if (vl.kind === 'one-from-two') shift = 0.5 * (v0 / target(vl.dynamic1) / target(vl.dynamic2));
+      else shift = 0.5 * Math.sqrt(v0 * start(i) / target(vl.dynamic1) / start(vl.fixed));
+      tg.lenD[i] = (2.0 * shift - (s.box.hi[i] - s.box.lo[i])) / s.dt;
+      tg.loD[i] = -0.5 * tg.lenD[i];
+      tg.lo[i] = 0.5 * (this.lo0[i] + this.hi0[i]) - shift;
+      tg.hi[i] = 0.5 * (this.lo0[i] + this.hi0[i]) + shift;
+      tg.len[i] = tg.hi[i] - tg.lo[i];
+    }
+  }
+
+  /**
+   * The box length rate (rate, native domain->h_rate[0..2]) and lo-boundary rate (ratelo, native h_ratelo[0..2])
+   * of an orthogonal box, for fix srd's streaming velocity correction (fix_deform.cpp init(): "h_rate[i] = dhi_dt -
+   * dlo_dt; h_ratelo[i] = dlo_dt", and 0 for the dimensions that are not deformed). Only styles whose rate is
+   * constant over the run are supported: the rates of trate, wiggle, variable and volume change with time, and a
+   * tilt parameter makes the box triclinic. Other styles throw a StyleError.
+   */
+  streamingRates(): { rate: number[]; ratelo: number[] } {
+    for (const sp of this.specs) {
+      if (sp.style === 'trate' || sp.style === 'wiggle' || sp.style === 'variable' || sp.style === 'volume') {
+        throw new StyleError(`fix deform style ${sp.style} is not supported with fix srd (its box rate changes during the run)`);
+      }
+    }
+    this.deform(false);
+    // domain.cpp h_rate order: the length rates, then yz, xz and xy (the tilt rates; zero for an orthogonal box)
+    return {
+      rate: [this.lenDot[0], this.lenDot[1], this.lenDot[2], this.tiltDot[2], this.tiltDot[1], this.tiltDot[0]],
+      ratelo: [this.loDot[0], this.loDot[1], this.loDot[2]],
+    };
+  }
+
+  /**
+   * As native LAMMPS does (src/fix_deform.cpp update_domain and update_box at b332f28), for a triclinic box: each tilt
+   * target (xy, then yz, then xz) is moved by whole box lengths (x for xy and xz, y for yz; the target lengths of this
+   * update) to the value closest to the current tilt, which after a box flip differs from the style's value by those
+   * lengths (moving yz by one y length moves xz by xy, the B vector's x component). The tilts the fix does not set
+   * keep their current values in the box. With flip yes, a target beyond half its box length decides a flip (yz first,
+   * as it changes xz): it is made on the next step (on this step for N = 0) in pre_exchange, before the neighbor
+   * lists are rebuilt, and not along a non-periodic x or y. fix_deform.html: "If the *flip* value is set to *yes*, the
+   * bound is enforced by flipping the box when it is exceeded."
+   */
+  private tiltTargets(lo: number[], hi: number[], tilt: number[]): void {
+    const s = this.sys.state;
+    const g = this.sys.geom;
+    const h = [g.lx, g.ly, g.lz, g.yz, g.xz, g.xy];
+    const target = [tilt[0], tilt[1], tilt[2]];
+    // Voigt index 5 (xy), 3 (yz), 4 (xz) to the engine's tilt index (xy 0, xz 1, yz 2)
+    for (const i of [5, 3, 4]) {
+      const ti = i === 5 ? 0 : i === 4 ? 1 : 2;
+      const idenom = i === 3 ? 1 : 0;
+      const denom = hi[idenom] - lo[idenom];
+      const denomInv = 1.0 / denom;
+      const current = h[i] / h[idenom];
+      while (target[ti] * denomInv - current > 0.0) {
+        target[ti] -= denom;
+        if (i === 3) target[1] -= target[0];
+      }
+      while (target[ti] * denomInv - current < 0.0) {
+        target[ti] += denom;
+        if (i === 3) target[1] += target[0];
+      }
+      if (Math.abs(target[ti] * denomInv - 1.0 - current) < Math.abs(target[ti] * denomInv - current)) {
+        target[ti] -= denom;
+        if (i === 3) target[1] -= target[0];
+      }
+    }
+    if (this.flip) {
+      const xprd = hi[0] - lo[0], yprd = hi[1] - lo[1];
+      const xprdinv = 1.0 / xprd, yprdinv = 1.0 / yprd;
+      if (target[2] * yprdinv < -0.5 || target[2] * yprdinv > 0.5 || target[1] * xprdinv < -0.5 ||
+        target[1] * xprdinv > 0.5 || target[0] * xprdinv < -0.5 || target[0] * xprdinv > 0.5) {
+        const fl = [target[0], target[1], target[2]];
+        let m = 0, n = 0, p = 0;
+        if (s.box.periodic[1]) {
+          if (fl[2] * yprdinv < -0.5) { fl[2] += yprd; fl[1] += fl[0]; p = 1; }
+          else if (fl[2] * yprdinv > 0.5) { fl[2] -= yprd; fl[1] -= fl[0]; p = -1; }
+        }
+        if (s.box.periodic[0]) {
+          if (fl[1] * xprdinv < -0.5) { fl[1] += xprd; n = 1; }
+          if (fl[1] * xprdinv > 0.5) { fl[1] -= xprd; n = -1; }
+          if (fl[0] * xprdinv < -0.5) { fl[0] += xprd; m = 1; }
+          if (fl[0] * xprdinv > 0.5) { fl[0] -= xprd; m = -1; }
+        }
+        if (m || n || p) this.flipPending = { step: s.step + (this.nevery > 0 ? 1 : 0), tilt: fl, m, n, p };
+      }
+    }
+    for (let t = 0; t < 3; t++) if (this.controlsTilt(t)) tilt[t] = target[t];
+  }
+
+  /** The neighbor lists are rebuilt on the step of a pending box flip (native next_reneighbor). */
+  reneighborDue(step: number): boolean {
+    return this.flipPending !== null && this.flipPending.step === step;
+  }
+
+  /**
+   * The box rates the current step sees, in native domain->h_rate order (length rates, yz, xz, xy) and
+   * domain->h_ratelo (the lo-boundary rates). As fix_deform.cpp sets them (init, then end_of_step): the rates of
+   * the box after the last deform update, which the next step's integrator and compute temp/deform use.
+   */
+  nativeRates(): { hRate: number[]; hRateLo: number[] } {
+    return {
+      hRate: [this.lenDot[0], this.lenDot[1], this.lenDot[2], this.tiltDot[2], this.tiltDot[1], this.tiltDot[0]],
+      hRateLo: [this.loDot[0], this.loDot[1], this.loDot[2]],
+    };
+  }
+
+  /** Does the fix change a box tilt (BOX_CHANGE_SHAPE in native LAMMPS)? */
+  hasTilt(): boolean {
+    return [0, 1, 2].some((t) => this.controlsTilt(t));
+  }
+
+  /** Does the fix change a box length (BOX_CHANGE_SIZE in native LAMMPS)? */
+  hasLengthChange(): boolean {
+    return [0, 1, 2].some((d) => this.controlsLength(d));
+  }
+
+  /** The remap keyword (x, v or none). */
+  remapFlag(): 'x' | 'v' | 'none' {
+    return this.remapMode;
+  }
+
+  /** Streaming velocity the deforming box imposes at atom i's position. */
+  vstream(i: number, out: number[]): void {
+    const s = this.sys.state;
+    this.sys.geom.toLamda(s.x[3 * i], s.x[3 * i + 1], s.x[3 * i + 2], this.lam);
+    const l0 = this.lam[0], l1 = this.lam[1], l2 = this.lam[2];
+    out[0] = this.loDot[0] + this.lenDot[0] * l0 + this.tiltDot[0] * l1 + this.tiltDot[1] * l2;
+    out[1] = this.loDot[1] + this.lenDot[1] * l1 + this.tiltDot[2] * l2;
+    out[2] = this.loDot[2] + this.lenDot[2] * l2;
+  }
+
+  /**
+   * remap v: "any atom in the fix group that crosses a periodic boundary will
+   * have a delta added to its velocity equal to the difference in velocities
+   * between the lo and hi boundaries". Native LAMMPS applies this from its
+   * pre_exchange hook, i.e. only on steps where the neighbor lists are
+   * rebuilt: an atom outside the box is wrapped by domain->pbc() right after
+   * and its velocity picks up the boundary delta. Measured on native LAMMPS
+   * (1-atom boxes, slow drifts and shears): the rebuild fires when the largest
+   * atom displacement since the last build exceeds skin/2 - boxDelta, where
+   * boxDelta is the largest box-parameter change since that build (a purely
+   * deforming box with stationary atoms never rebuilds). An image change of k
+   * in dimension d shifts v by -k * (v_hi - v_lo), with (v_hi - v_lo) =
+   * (Lxdot) for x, (xydot, Lydot) for y and (xzdot, yzdot, Lzdot) for z.
+   *
+   * The engine rebuilds its neighbor lists by the same rule but penalises the
+   * box change with 2*boxDelta (neighbor.ts), so its rebuilds — and with them
+   * sys.pbc()'s coordinate wraps — can happen a step or two earlier than
+   * native's. A wrap without the simultaneous kick changes the atom's
+   * unwrapped position by the tilt grown since the wrap, so this fix times
+   * the wraps+kicks itself: postIntegrate replicates native's rebuild
+   * criterion and, on a remap step, wraps the group's atoms that are outside
+   * the box and adds the velocity deltas. The engine's earlier no-kick wraps
+   * of group atoms are undone first (preExchange/preNeighbor record them with
+   * the box they used), which restores exactly native's state.
+   */
+  preExchange(): void {
+    const s = this.sys.state;
+    const fp = this.flipPending;
+    if (fp && fp.step === s.step) {
+      // As native LAMMPS does (src/fix_deform.cpp pre_exchange at b332f28): the tilts this fix sets take their
+      // flipped values ("if (dimflag[3]) domain->yz = ... tilt_flip"), then the image flags and the atoms follow
+      this.flipPending = null;
+      const tilt = [s.box.tilt[0], s.box.tilt[1], s.box.tilt[2]];
+      for (let t = 0; t < 3; t++) if (this.controlsTilt(t)) tilt[t] = fp.tilt[t];
+      this.sys.flipBox(tilt, fp.m, fp.n, fp.p, this);
+      // the flip maps every atom into the new box without a velocity change (Domain::remap), as native does, so
+      // these wraps are not the engine's own and are not undone later
+      this.imgPre = null;
+      return;
+    }
+    if (this.remapMode !== 'v') return;
+    this.imgPre = Int32Array.from(s.image.subarray(0, 3 * s.n));
+  }
+
+  /** Records the pbc wraps of group atoms (engine rebuild steps only). */
+  preNeighbor(): void {
+    if (this.remapMode !== 'v' || !this.imgPre) return;
+    const s = this.sys.state;
+    const g = this.sys.geom;
+    this.ensureRemapArrays(s.n);
+    for (let i = 0; i < s.n; i++) {
+      const kx = s.image[3 * i] - this.imgPre[3 * i];
+      const ky = s.image[3 * i + 1] - this.imgPre[3 * i + 1];
+      const kz = s.image[3 * i + 2] - this.imgPre[3 * i + 2];
+      if (kx === 0 && ky === 0 && kz === 0) continue;
+      this.accShift[3 * i] += kx * g.lx + ky * g.xy + kz * g.xz;
+      this.accShift[3 * i + 1] += ky * g.ly + kz * g.yz;
+      this.accShift[3 * i + 2] += kz * g.lz;
+      this.accImg[3 * i] += kx;
+      this.accImg[3 * i + 1] += ky;
+      this.accImg[3 * i + 2] += kz;
+    }
+  }
+
+  postIntegrate(): void {
+    // N = 0: the box is updated right after the position update, before the
+    // neighbour decision and the force evaluation of this step.
+    // Measured with native LAMMPS (black box; tests/oracle/w39nemd_n0_xy.in, w39nemd_n0_nocheck.in): the
+    // tilt printed after each step is the same for N = 0 and N = 1 (xy 0.504550695891306 at step 1, both),
+    // while the temperature differs from step 1 on (0.305927635580199 for N = 0, 0.305922908247966 for N = 1),
+    // so the box is changed before this step's neighbour wraps and kicks, not after the final half kick.
+    if (this.nevery === 0 && this.captured) this.deform(true);
+    if (this.remapMode !== 'v' || !this.sys.hasBox) return;
+    const s = this.sys.state;
+    const g = this.sys.geom;
+    const nb = this.sys.nb;
+    const step = s.step;
+    const ago = step - this.remapLastStep;
+    // native kicks in Domain::pbc on the steps the neighbor list is rebuilt. As native LAMMPS does (src/neighbor.cpp
+    // Neighbor::decide at b332f28): a rebuild that a restart write or a fix (fix srd's next_reneighbor) forces at this
+    // step comes before the delay, every and distance tests; otherwise ask the neighbor's own distance check (its
+    // positions and box of the last build), so the remap step is the rebuild step
+    const forced = restartDue(this.sys, step) || this.sys.fixes.some((f) => f.reneighborDue?.(step) === true);
+    if (!forced) {
+      if (ago < nb.delay) return;
+      if (nb.every > 1 && step % nb.every !== 0) return;
+      if (nb.check && !nb.movedTooFar(s, g)) return;
+    }
+    // remap step: undo the engine's earlier no-kick wraps of the group, then
+    // wrap whoever is outside the box now and add the boundary velocity deltas. On the step of a box flip native's
+    // pre_exchange maps every atom into the flipped box before domain->pbc(), so pbc kicks no one: only the undo runs.
+    this.ensureRemapArrays(s.n);
+    const flipNow = this.flipPending !== null && this.flipPending.step === step;
+    const v = s.v;
+    const dlx = this.lenDot[0], dly = this.lenDot[1], dlz = this.lenDot[2];
+    const dxy = this.tiltDot[0], dxz = this.tiltDot[1], dyz = this.tiltDot[2];
+    for (let i = 0; i < s.n; i++) {
+      if (!(s.mask[i] & this.groupBit)) continue;
+      if (this.accImg[3 * i] !== 0 || this.accImg[3 * i + 1] !== 0 || this.accImg[3 * i + 2] !== 0) {
+        s.x[3 * i] += this.accShift[3 * i];
+        s.x[3 * i + 1] += this.accShift[3 * i + 1];
+        s.x[3 * i + 2] += this.accShift[3 * i + 2];
+        s.image[3 * i] -= this.accImg[3 * i];
+        s.image[3 * i + 1] -= this.accImg[3 * i + 1];
+        s.image[3 * i + 2] -= this.accImg[3 * i + 2];
+        this.accShift[3 * i] = 0; this.accShift[3 * i + 1] = 0; this.accShift[3 * i + 2] = 0;
+        this.accImg[3 * i] = 0; this.accImg[3 * i + 1] = 0; this.accImg[3 * i + 2] = 0;
+      }
+      if (flipNow) continue;
+      const ix = s.image[3 * i], iy = s.image[3 * i + 1], iz = s.image[3 * i + 2];
+      g.remap(s.x, s.image, i);
+      const kx = s.image[3 * i] - ix, ky = s.image[3 * i + 1] - iy, kz = s.image[3 * i + 2] - iz;
+      if (kx === 0 && ky === 0 && kz === 0) continue;
+      v[3 * i] -= kx * dlx + ky * dxy + kz * dxz;
+      v[3 * i + 1] -= ky * dly + kz * dyz;
+      v[3 * i + 2] -= kz * dlz;
+    }
+    this.remapLastStep = step;
+  }
+
+  /** (Re)allocates the per-atom remap bookkeeping. */
+  private ensureRemapArrays(n: number): void {
+    if (this.accImg && this.accImg.length === 3 * n && this.accShift.length === 3 * n) return;
+    this.accImg = new Int32Array(3 * n);
+    this.accShift = new Float64Array(3 * n);
+  }
+}

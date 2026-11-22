@@ -1,0 +1,102 @@
+# Mol-1 inputs and conditioning
+
+Read with `ariax skills forge --reference mol1-inputs --read --json`. The native
+input schema is defined at
+[`6ad1a133f919dc79b4f829bdc24fad28b9c4d3f0`](https://github.com/molence/Mol-1/blob/6ad1a133f919dc79b4f829bdc24fad28b9c4d3f0/docs/infer_json_format.md),
+but not every native mode is supported by this Forge recipe. Use the
+[entry guide](https://github.com/cytokineking/ariax-cli/blob/HEAD/agent-skills/skills/ariax-forge/tools/mol1.md) for mode limits and the direct-runner commands.
+
+Supply a nonempty JSON list even for one job. Each job has a unique `name` and
+`sequences` list. Use simple filename-safe names without slashes, traversal or
+control characters, because names become output paths. Every sequence entry
+contains one entity object. Specify the intended stoichiometry through `count`
+and an explicit `id` list with one unique chain ID per copy. Do not infer
+oligomerization, protonation, ligand identity or missing partners from a name.
+
+| Entity key | Required identity | Important details |
+| --- | --- | --- |
+| `proteinChain` | `sequence`, `count` | Canonical amino acids and `X`; unknown residues lose chemical specificity. Optional `modifications` use `ptmType: "CCD_CODE"` and one-based `ptmPosition`. |
+| `dnaSequence` | `sequence`, `count` | A single strand. Provide the intended complementary strand explicitly for duplex DNA. Native alphabet includes A/C/G/T, I/U and N/X unknowns. |
+| `rnaSequence` | `sequence`, `count` | A single strand; A/C/G/U, I and N/X unknowns. RNA MSA search stays disabled. |
+| `ligand` | `ligand`, `count` | `CCD_ATP`-style code, chemically specified SMILES, or `FILE_/inputs/.../ligand.sdf` (also PDB/MOL/MOL2 with a 3D conformation). Preserve stereochemistry, charges and intended component identity. |
+| `ion` | `ion`, `count` | A CCD ion code such as `MG`, without the `CCD_` prefix. |
+
+All five entities accept `id`. DNA/RNA modifications use `modificationType` and
+one-based `basePosition`. The model constructs molecular features and reference
+conformers from these identities; an input ligand conformer is not a guarantee
+of fixed output coordinates. Record any explicitly selected domain/crop and its
+mapping to the original sequence; output sequence positions do not recover
+omitted residues or experimental author numbering.
+
+## Supplied alignments, no public search
+
+The Forge recipe calls `python -m mol.runner.inference` on prepared JSON. It
+loads local features directly; it does not call `mol pred`'s protein MSA search
+preprocessor. `--use_msa false` produces empty/dummy MSA features and ignores
+supplied alignments. Set it explicitly for a no-MSA prediction.
+No-MSA prediction can be substantially less accurate; it is a scientific change,
+not a transparent performance optimization.
+
+Supplied protein MSAs are outside the documented Forge scope. If a separately
+supported recipe is available, set `--use_msa true` and specify
+`unpairedMsaPath` and/or `pairedMsaPath` inside **each** appropriate
+`proteinChain`. Use absolute paths such as `/inputs/mol1/msas/A.unpaired.a3m`.
+Upload every referenced file at that exact path and wait for every input to be
+ready. Relative paths resolve against the remote working directory, not the JSON
+file. Preserve the query sequence, database release, search parameters,
+coverage, paired-chain correspondence and any preprocessing decisions. A pairing
+file's presence alone does not prove biologically appropriate chain pairing.
+`--msa_pair_as_unpair` defaults to `true`: paired rows also enter unpaired
+features. Keep this setting with the run record.
+
+Without explicit user authorization for public ColabFold, do not substitute
+`mol pred`, `mol msa` or `mol prep` to repair missing alignments. When authorized,
+native `mol pred --use_msa true` performs protein MSA preprocessing; the direct
+runner flag only loads prepared alignments. Preprocess a copy of the JSON under
+`/workspace`, retaining `input-update-msa.json` and its referenced MSAs. A failed
+archive transfer can leave completed searches/alignments: inspect and reuse
+validated native files before repeating requests; the pinned native cache can
+return `None` when `out.tar.gz` already exists. Avoid the deprecated dictionary-valued `msa` form;
+conversion in the high-level preprocessing path can write a new JSON beside its
+source, which is incompatible with read-only `/inputs`.
+
+Keep `--use_template false --use_rna_msa false` in this recipe.
+Upstream supports protein `templatesPath` in `.a3m`, `.hhr` or inline-structure
+`.json` format, and RNA `unpairedMsaPath`; those modes need separate assets,
+input checks and a supported recipe. Native template features may fetch a missing
+mmCIF and write into a model-root cache even when hits are supplied. Template
+search is not implied by the no-search direct runner. Do not enable it until a
+supported recipe provides local structures and separates writable scratch from
+read-only assets. No RNA database search is authorized by these examples.
+
+## Covalent and modified chemistry
+
+Native `covalent_bonds` entries identify `entity1`/`entity2` by one-based order in
+`sequences`, optional paired `copy1`/`copy2` by one-based copy index,
+`position1`/`position2` by one-based residue/component position, and `atom1`/
+`atom2` by CCD atom name. SMILES/file atom indices start at zero; do not confuse
+these with one-based polymer positions. Omitting both copy fields bonds
+corresponding copies and requires matching copy counts. A single ligand has
+component position 1. Multi-CCD ligands such as `CCD_NAG_NAG` need explicit
+intercomponent bonds.
+
+These records condition a prediction; validate the resulting bond geometry and
+chemistry. Upstream cautions that general polymer–polymer covalent bonds are
+unreliable, apart from its described cyclic-peptide/disulfide cases. None are
+validated in this recipe. An unavailable CCD component is an input/asset
+limitation, not permission to silently change chemistry or fetch a new dictionary.
+
+## Seeds, batches and input sources
+
+The direct runner reads one JSON file containing one or more jobs. `--seeds 101`
+selects the default seed; a comma-separated value selects several. With
+`--use_seeds_in_json true`, the first job's `modelSeeds` list applies to **all**
+jobs in the file. Leave it `false` when choosing seeds through the command line
+to avoid hidden seed precedence. Give every job a unique output name and
+preserve all requested seed/sample identities. Larger batches and additional
+seeds remain outside the documented Forge scope.
+
+Save the exact input JSON, every MSA/template/ligand companion, source revision,
+selected named asset identities, command argv and resolved runtime settings.
+Preserve explicit user chemistry and chain mappings when exporting to another
+tool; similar JSON field names do not guarantee compatible semantics.

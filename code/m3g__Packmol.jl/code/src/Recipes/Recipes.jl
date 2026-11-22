@@ -1,0 +1,109 @@
+#
+# Recipes: systems set up from densities and concentrations (solvation boxes, membranes),
+# written as input files (`write_packmol_input`) or packed directly (`packmol(recipe)`).
+#
+using Unitful
+using PDBToolsBase: read_pdb, write_pdb, Atom, mass, charge, maxmin, eachresidue
+
+export density_pure_solvent, density_pure_cossolvent
+export write_packmol_input
+export SolutionBoxUSC, convert_concentration, convert_density_table!, get_density_table
+export SolutionBoxUS
+export SolutionBoxUWI
+export Membrane
+
+const RecipesDirectory = @__DIR__
+
+# Recipes are higher-level, parameter-driven system setups (target densities/
+# concentrations instead of explicit molecule counts) built on top of the
+# packing engine: solvation boxes today (SolutionBoxUS/USC/UWI), each with a
+# `pbc` keyword (`:cubic`/`:orthorhombic`/`:dodecahedral`/`:octahedral`)
+# selecting the periodic cell shape; membranes, vesicles, and nanotubes are
+# planned as future recipes. Each recipe implements `write_packmol_input`
+# (and, generically below, `packmol`).
+abstract type Recipe end
+
+#
+# Recipes are constructed with keyword arguments only. The two most common
+# misuses — a positional call (e.g. `SolutionBoxUWI("protein.pdb")`) and a
+# missing mandatory keyword — would otherwise surface as a bare MethodError or
+# UndefKeywordError; these turn them into an error listing the recipe's
+# keywords. Each recipe declares its mandatory keywords via
+# `_mandatory_keywords`, and uses `_missing_keyword` as their default value
+# (evaluated only when the keyword is not given).
+#
+function _keywords(::Type{R}) where {R<:Recipe}
+    mandatory = _mandatory_keywords(R)
+    kw_constructor = only(m for m in methods(R) if m.nargs == 1)
+    optional = filter(∉(mandatory), Base.kwarg_decl(kw_constructor))
+    return join(mandatory, ", "), join(optional, ", ")
+end
+
+function _missing_keyword(::Type{R}, kw::Symbol) where {R<:Recipe}
+    mandatory, optional = _keywords(R)
+    throw(ArgumentError("""\n
+        Keyword argument `$kw` is mandatory for $(nameof(R)).
+
+        Mandatory keyword arguments: $mandatory
+        Optional keyword arguments: $optional
+        See `?$(nameof(R))` for details.
+
+    """))
+end
+
+function (::Type{R})(args...; kwargs...) where {R<:Recipe}
+    mandatory, optional = _keywords(R)
+    value = first(args) isa AbstractString ? repr(first(args)) : "..."
+    throw(ArgumentError("""\n
+        $(nameof(R)) takes keyword arguments only, but was called with $(length(args)) positional argument(s).
+        For example: $(nameof(R))(; $(first(_mandatory_keywords(R)))=$value, ...)
+
+        Mandatory keyword arguments: $mandatory
+        Optional keyword arguments: $optional
+        See `?$(nameof(R))` for details.
+
+    """))
+end
+
+#
+# Shared machinery for the `packmol(system::Recipe; ...)` methods (one per
+# concrete recipe type, defined alongside each type's `write_packmol_input`
+# method): both build a `PackmolSystem` directly in memory — reusing the same
+# box-sizing/molecule-count computation as `write_packmol_input` — and hand it
+# to `packmol(::PackmolSystem)`, without ever going through a `.inp` file.
+#
+
+# The fixed solute, centered at the origin: equivalent to the input file's
+# `number 1` / `center` / `fixed 0. 0. 0. 0. 0. 0.` lines (see
+# `_apply_fixed_center!` in StructureType.jl for why `center=:geometric`,
+# not the `structure_type` default of `:none`, is required to match that
+# text-file behavior: `:none` leaves the raw PDB coordinates un-recentered).
+_fixed_solute_structure_type(pdbfile::String; tolerance::Real=2.0) = structure_type(
+    pdbfile; number=1, tolerance, fixed=(zeros(3), zeros(3)), center=:geometric,
+)
+
+# A recipe's periodic unit cell (built by `set_unitcell`, in Å), centered at
+# the origin (where the solute is fixed) — equivalent to the input file's
+# `unitcell a b c α β γ` line.
+_recipe_unitcell(unitcell::AbstractMatrix{Float64}) = (
+    unitcell = Matrix{Float64}(unitcell),
+    unitcell_center = zero(SVector{3,Float64}),
+)
+
+# One-line human-readable description of a recipe's unit cell, for the
+# printed/written summary (`a=... Å, b=... Å, c=... Å, α=...°, β=...°, γ=...°`).
+# The sides and angles of the cell, in two lines (the second indented), with 3 decimals
+function _unitcell_description(unitcell::AbstractMatrix{Float64})
+    a, b, c, α, β, γ = round.(_unitcell_abc_angles(unitcell); digits=3)
+    return "a = $a Å, b = $b Å, c = $c Å\n    α = $(α)°, β = $(β)°, γ = $(γ)°"
+end
+
+include("./DensityTable.jl")
+include("./concentration_units.jl")
+
+# System types
+include("./SolutionBoxUS.jl")
+include("./SolutionBoxUSC.jl")
+include("./SolutionBoxUWI.jl")
+include("./Membrane.jl")
+include("./MembraneProtein.jl")

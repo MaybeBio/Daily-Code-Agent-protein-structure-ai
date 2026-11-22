@@ -1,0 +1,169 @@
+"""Immutable pointers to successful native jobs in the existing platform database."""
+
+import hashlib
+import json
+
+from ..store import ConflictError, now
+from .candidate_review import validate_initial_candidate
+from .catalogue import MODULES
+from .contracts import ExamplePin, JobEvidence
+from .evidence import capture_job, verify_job
+from .pin_validation import validate_case_job
+
+
+class ExamplePins:
+    def __init__(self, store, state, *, modules=MODULES):
+        self.store, self.state = store, state
+        self.modules = modules
+        with store.connect() as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS example_pins ("
+                "capability_id TEXT NOT NULL, revision INTEGER NOT NULL, "
+                "job_id TEXT NOT NULL, body TEXT NOT NULL, "
+                "PRIMARY KEY(capability_id,revision))"
+            )
+
+    def get(self, capability_id, *, verify=False):
+        module = self.modules[capability_id]
+        revision = module.revision
+        with self.store.connect() as db:
+            row = db.execute(
+                "SELECT body FROM example_pins WHERE capability_id=? AND revision=?",
+                (capability_id, revision),
+            ).fetchone()
+        record = ExamplePin.model_validate_json(row["body"]) if row else None
+        if record and (record.case_id, record.capability_id) != (module.case_id, capability_id):
+            raise ValueError("The pinned result belongs to a different study or capability.")
+        if record and verify:
+            verify_job(
+                self.store,
+                self.state,
+                JobEvidence(
+                    job_id=record.job_id,
+                    request_sha256=record.request_sha256,
+                    environment_sha256=record.environment_sha256,
+                    artifact_sha256=record.artifact_sha256,
+                ),
+            )
+            for evidence in record.supporting_evidence:
+                verify_job(self.store, self.state, evidence)
+            validate_initial_candidate(
+                record.initial_candidate_id,
+                record.review,
+                self.store.get(str(record.job_id)),
+                self.state,
+            )
+        return record
+
+    def for_job(self, capability_id, job_id):
+        """Read the most recent seal for this exact completed task, including old revisions."""
+        with self.store.connect() as db:
+            row = db.execute(
+                "SELECT p.body, j.request FROM example_pins AS p "
+                "JOIN jobs AS j ON j.id=p.job_id WHERE p.capability_id=? AND p.job_id=? "
+                "ORDER BY p.revision DESC LIMIT 1",
+                (capability_id, str(job_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        record = ExamplePin.model_validate_json(row["body"])
+        if (record.capability_id, record.job_id) != (capability_id, job_id):
+            raise ValueError("The recorded seal belongs to another prediction.")
+        if hashlib.sha256(row["request"].encode()).hexdigest() != record.request_sha256:
+            raise ValueError("The retained prediction request differs from its seal.")
+        return record
+
+    def request(self, capability_id, *, reviewed=False):
+        """Replay sealed authored JSON without introducing later model defaults."""
+        pin = self.get(capability_id, verify=True)
+        if pin is None:
+            return None
+        if reviewed and pin.review is None:
+            raise ValueError("The fixed task requires an explicit scientific example review.")
+        with self.store.connect() as db:
+            row = db.execute("SELECT request FROM jobs WHERE id=?", (str(pin.job_id),)).fetchone()
+        if row is None or hashlib.sha256(row["request"].encode()).hexdigest() != pin.request_sha256:
+            raise ValueError("The original fixed-example request changed or is unavailable.")
+        return json.loads(row["request"])
+
+    def predecessor(self, capability_id, *, verify=False):
+        """Find the immediately preceding saved revision within the same study."""
+        module = self.modules[capability_id]
+        with self.store.connect() as db:
+            rows = db.execute(
+                "SELECT revision,body FROM example_pins WHERE capability_id=? AND revision<? "
+                "ORDER BY revision DESC",
+                (capability_id, module.revision),
+            ).fetchall()
+        row = next(
+            (row for row in rows if json.loads(row["body"])["case_id"] == module.case_id),
+            None,
+        )
+        if row is None:
+            return None
+        modules = dict(self.modules)
+        modules[capability_id] = module.model_copy(update={"revision": row["revision"]})
+        return ExamplePins(self.store, self.state, modules=modules).get(
+            capability_id, verify=verify
+        )
+
+    def pin(
+        self,
+        capability_id,
+        job_id,
+        prepared,
+        *,
+        review=None,
+        supporting_job_ids=(),
+        initial_candidate_id=None,
+    ):
+        module = self.modules[capability_id]
+        if prepared.module != module:
+            raise ValueError("The prepared inputs belong to a different reviewed study revision.")
+        job = self.store.get(str(job_id))
+        if job is None or job.status != "succeeded":
+            raise ValueError("Only successful native tasks can become fixed computed examples.")
+        validate_case_job(capability_id, job, prepared, self.store)
+        validate_initial_candidate(initial_candidate_id, review, job, self.state)
+        evidence = capture_job(self.store, self.state, job_id)
+        from .supporting import supporting_evidence
+
+        followups = supporting_evidence(self.store, self.state, job, prepared, supporting_job_ids)
+        digests = evidence.artifact_sha256
+        record = ExamplePin(
+            capability_id=capability_id,
+            case_id=module.case_id,
+            revision=module.revision,
+            job_id=job_id,
+            request_sha256=evidence.request_sha256,
+            environment_sha256=evidence.environment_sha256,
+            artifact_sha256=digests,
+            created_at=now(),
+            review=review,
+            initial_candidate_id=initial_candidate_id,
+            supporting_evidence=followups,
+        )
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            old = db.execute(
+                "SELECT body FROM example_pins WHERE capability_id=? AND revision=?",
+                (capability_id, module.revision),
+            ).fetchone()
+            if old:
+                existing = ExamplePin.model_validate_json(old["body"])
+                if (
+                    existing.job_id != record.job_id
+                    or existing.artifact_sha256 != digests
+                    or existing.request_sha256 != record.request_sha256
+                    or existing.environment_sha256 != record.environment_sha256
+                    or existing.review != record.review
+                    or existing.initial_candidate_id != record.initial_candidate_id
+                    or existing.supporting_evidence != record.supporting_evidence
+                ):
+                    raise ConflictError("The fixed example is immutable; publish a new revision.")
+                return existing
+            db.execute(
+                "INSERT INTO example_pins VALUES(?,?,?,?)",
+                (capability_id, module.revision, str(job_id), record.model_dump_json()),
+            )
+        return record

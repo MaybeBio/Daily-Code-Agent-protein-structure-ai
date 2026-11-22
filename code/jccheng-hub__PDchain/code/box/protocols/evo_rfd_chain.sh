@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+pixiroot="$PIXI_PROJECT_ROOT"
+pixitoml="$pixiroot/pixi.toml"
+pixirun="pixi run -m $pixitoml -e"
+[[ -n $pixiroot ]] || {
+    echo 'Need $PIXI_PROJECT_ROOT to be defined.'
+    exit
+}
+
+usage () { cat << EOF
+Usage: evo_rfd_chain METRIC... --indir [str]
+Evolve rfd_chain designs found in INDIR
+
+Parameters:
+    METRIC                  Metric string
+                            Needs to have the format of min:metric, max:metric,
+                            or val:metric=ideal_val
+                            E.g. min:fin_reu_per_res
+                            E.g. max:protein_mpnn_confidence
+                            E.g. val:dsasa=0.7
+
+Options:
+  --inpdb [str]             Input rfd_chain designs (can specify multiple)
+                            REQUIRED if not invoking --indir
+  --indir [str]             Input directory of (rfd_chain) designs
+                            Overrides --inpdb
+                            REQUIRED if not invoking --inpdb
+  --outdir [str]            Output directory for design pool
+  --poolsize [int/str]      Determines the design pool size. The design pool is
+                            where designs will be aggregated and continuously
+                            evolved. The design pool also determines how designs
+                            are ranked, as performance on each metric is
+                            relative. Use keyword "ALL" to set the poolsize to
+                            the number of designs found in the input directory.
+  --poolperc [float]        Percent of poolsize to use as the subset pool. The
+                            subset pool is randomly chosen from the design pool
+                            in each design run, and the top ranking design from
+                            the subset pool is chosen for redesign.
+                            For example, --poolsize 200 --poolperc 5 would
+                            result in a subset poolsize of 10, meaning that 10
+                            designs are randomly chosen from the pool of 200,
+                            and the top design of that 10-member pool is chosen
+                            for redesign.
+                            Increase this value to increase the odds of higher
+                            ranked designs being chosen (at the cost of
+                            diversity).
+                            Accepted range: 0-100
+                            Note: a subset poolsize of less than 1 will be
+                            treated as 1, and a subset poolsize of 1 would mean
+                            that the design chosen for redesign is truly random.
+  --famiperc [float]        Percent of poolsize a single family's maximum
+                            allowed occupancy. For example, a famiperc of 20 for
+                            a poolsize of 200 would mean that a maximum of 40
+                            family members are allowed in the pool. If the
+                            number of family members exceed 40, then the worst
+                            performing one is automatically archived.
+  --gen0perc [float]        If the percent of gen0 designs in pool is below this
+                            threshold, then quit. If unset, then the continuous
+                            evolution will persist until the time limit.
+  --tlim [str]              Time limit. Use format of [float][d/h/m/s].
+                            E.g. --tlim 8.5h
+  --auto_update             Automatically updates output directory with input
+                            directory every round. Useful when the input
+                            directory is dynamically being updated with designs.
+  --skip_diffusion          Skip RFdiffusion step during redesign.
+  --stop_at_capacity        Stop running when the number of designs >= poolsize.
+  --help                    Display this help and exit
+EOF
+}
+
+# --- Defaults --- # {{{
+args=($(echo $0 $@ | sed "s/--.*//"))
+opts=($(echo $0 $@ | sed "s/--/\n--/" | sed "1d"))
+optchk () {
+    [[ " ${opts[*]} " =~ " $1 " ]] && echo 1 || echo 0
+}
+optarg () {
+    sed "s/--/\n--/g" <<< "${opts[*]}" |
+    sed -n "1,/^$1 /s/^$1 //p" | sed 's/ \+$//'
+}
+
+val_opts=(
+    addmets             backrub             biasjson            ca_stdev            
+    clash_cut           cterm_add           cterm_trim          design_cycles       
+    famiperc            gen0perc            helix_cap           indir               
+    inpaint_seq         inpaint_seq_ch      inpaint_str         inpaint_str_ch      
+    inpdb               loop_cut            mpnn_model          natbias             
+    nbr_resfile_cmd     nterm_add           nterm_trim          omitjson            
+    outdir              poolperc            poolsize            redes_dist          
+    relax_repeats       rfd_ckpt            rog_cut             seg_rmv_chance      
+    select_met          ss_trim             temperature         threads             
+    timesteps           tlim                vary_linkers                            
+)
+
+bool_opts=(
+    auto_update         dec_only            disallow_cys        fix_bb              
+    fix_chi             help                idealize            ignore_metals       
+    inc_only            monomer_ROG         partial             persistent          
+    ppi_mode            relax               rosetta_lig_nbr     sc_context          
+    skip_diffusion      stop_at_capacity                                            
+)
+
+cterm_add="0"
+cterm_trim="1"
+famiperc="100"
+mpnn_model="protein_mpnn"
+nterm_add="0"
+nterm_trim="1"
+outdir="./evolved"
+poolperc="10"
+poolsize="200"
+relax_repeats="1"
+ss_trim="2"
+temperature="0.1"
+threads="1"
+timesteps="15"
+tlim="2h"
+vary_linkers="0"
+
+default_vals () {
+    [[ ${#val_opts[@]} -ge 1 ]] && {
+        echo -e "\nDefaults:"
+        for opt in ${val_opts[@]} ; do
+            [[ -n ${!opt} ]] && echo "  --${opt} ${!opt}" || echo "  --${opt} NONE"
+        done | sort | xargs printf "  %-19s %-19s %-19s %-s\n"
+    }
+    [[ ${#bool_opts[@]} -ge 1 ]] && {
+        echo -e "\nFlags:"
+        sed 's/ /\n/g' <<< "${bool_opts[@]}" |
+        sed 's/^/--/g' | xargs printf "  %-39s %-s\n"
+    }
+}
+
+all_opts=()
+for opt in ${bool_opts[@]} ; do
+    [[ $(optchk --$opt) == 1 ]] && all_opts+=(--$opt)
+    declare "$opt=$(optchk --$opt)"
+done
+for opt in ${val_opts[@]} ; do
+    val=$(optarg --${opt})
+    [[ -n $val ]] && declare "$opt=$val"
+    [[ ${!opt} == REQUIRED ]] && help="1"
+    [[ -n ${!opt} ]] && all_opts+=(--$opt ${!opt})
+done
+[[ $((${#args[@]}-1)) -lt 1 ]] && help="1"
+[[ $help == 1 ]] && { usage ; default_vals ; exit ;}
+# }}}
+
+# Initialize
+echo "Executing command:" "$0" "$@"
+mets="${args[@]:1}"
+tmpdir=$(mktemp -d ${TMPDIR:-/tmp}/tmp_${USER}_XXXXXX) ; trap 'rm -r $tmpdir' EXIT
+
+if [[ -n $indir ]] ; then
+    echo "Taking designs from --indir $indir as inputs..."
+    [[ $(echo $indir/*.pdb | sed '/*/d' | wc -w) == 0 ]] && {
+        echo "$indir doesn't contain any PDBs!" && exit
+    }
+elif [[ -n $inpdb ]] ; then
+    echo "Taking designs from --inpdb $inpdb as inputs..."
+    ls $inpdb >/dev/null || exit
+    indir="$tmpdir/indir" ; mkdir -p $indir
+    echo "Copying input PDBs into temporary input directory..."
+    cp -v $inpdb $indir
+else
+    echo "Need to specify either --inpdb or --indir." && exit
+fi
+
+all_opts=($(echo "${all_opts[@]}" | sed 's|--|\n--|g' | sed '/^--inpdb /d'))
+all_opts=($(echo "${all_opts[@]}" | sed 's|--|\n--|g' | sed '/^--indir /d'))
+
+shopt -s nullglob
+outdir="${outdir%/}" ; mkdir -p $outdir/archive
+
+# Check time limit
+tlim_s=$(gawk -v tlim="$tlim" 'BEGIN {
+    mult["s"] = 1 ; mult["m"] = 60 ; mult["h"] = 3600 ; mult["d"] = 86400
+    if ( match(tlim, /^([0-9.]+)([a-z])$/, a) && a[2] in mult ) {
+        print int(a[1] * mult[a[2]])
+    } else {
+        print "ERROR"
+    }
+}')
+
+# Handle time limit error
+if [[ $tlim_s != "ERROR" ]] ; then
+    echo "Time limit set to $tlim ($tlim_s seconds)"
+else
+    echo "Error with parsing time. Make sure --tlim follows the format of [float][s/m/h/d]."
+    exit
+fi
+
+# Get final time
+time_f=$(echo "$SECONDS + $tlim_s" | bc)
+
+# Set contigs to SKIP with --skip_diffusion
+[[ $skip_diffusion == 1 ]] && contigs="SKIP"
+
+# Determine pool size and famisize
+[[ $poolsize == "ALL" ]] && poolsize=$(echo $indir/*pdb | wc -w)
+famisize=$(echo "$poolsize * $famiperc * 0.01" | bc | sed 's/^0$/1/')
+echo "Pool size: $poolsize"
+echo "Family size: $famisize"
+
+# Define function for removing worst family members
+trim_family () {
+    local rankfile="$1" famisize="$2" pooldir="$3"
+    local tormv=$(awk -v famisize=$famisize '
+        {
+            f++ ; file[f] = fami[f] = $1
+            sub(/_gen[0-9]+_[a-zA-Z]{6}[.]pdb$/, "", fami[f])
+            c[fami[f]]++
+        }
+
+        c[fami[f]] > famisize { print file[f] }
+    ' $rankfile | sed "s|^|${pooldir%/}/|" | paste -sd ' ')
+    [[ -n $tormv ]] && {
+        mv $tormv $outdir/archive &&
+        echo "Archived the following designs for exceeding the maximum family size of $famisize: $tormv"
+    }
+}
+
+# Check for metrics formatting
+fmt_check=$(sed 's/ /\n/g' <<< "${mets[*]}" | gawk -F ':' '
+    $1~/^(min|max|val|abv|blw)$/{i++} END {if (i==NR) {print 1} else {print 0}}'
+)
+[[ $fmt_check != 1 ]] && {
+    echo "All metrics provided must follow the format of max:metric, min:metric, or val:metric=ideal_val"
+    exit
+}
+
+# Make initial design pool
+echo "Generating initial design pool..."
+for inpdb in $indir/*.pdb ; do
+    bnpdb=$(basename ${inpdb%.*})
+    [[ $(echo $outdir/$bnpdb*.pdb $outdir/archive/$bnpdb*.pdb | wc -w) == 0 ]] && {
+        cp -v $inpdb $outdir/${bnpdb}_gen0_orides.pdb
+    }
+done
+rank_pool $mets --indir $outdir --num $poolsize --inplace
+
+# Start evolving
+while [[ $SECONDS -lt $time_f ]] ; do
+
+    # Get ranked file
+    rankfile="$tmpdir/ranked.txt"
+    rank_pool $mets --indir $outdir --num $poolsize --outfile $rankfile
+
+    # Pull random subset of designs from pool, then choose best one from subset
+    cursize=$(echo $outdir/*.pdb | wc -w)
+    subsize=$(echo "$cursize * $poolperc / 100" | bc | sed 's/^0$/1/')
+    echo "Subpool size with current poolsize of $cursize: $subsize"
+
+    # Take top 2 from random subset, then take the one with smaller family size
+    inpdb=($(
+        awk '
+            {
+                file[++f]=$1
+                fami[f]=$1
+                sub(/_gen[0-9]+_[a-zA-Z]{6}[.]pdb$/, "", fami[f])
+                c[fami[f]]++
+            }
+
+            END {
+                for (i=1; i<=f; i++) {
+                    print file[i], i, c[fami[i]]
+                }
+            }
+        ' $rankfile | shuf -n$subsize | sort -k2n | head -n2 | awk '
+            { lin[NR]=$0 ; rank[NR]=$2 ; fami[NR]=$3 }
+            END {    
+                if (!fami[2] || fami[1] <= fami[2]) {
+                    print lin[1]
+                } else {
+                    print lin[2]
+                }
+            }
+        ' | sed "s|^|${outdir%/}/|"
+    ))
+
+    # Check if inpdb exists
+    if ls $inpdb &>/dev/null ; then
+        echo "Picked $inpdb (rank ${inpdb[1]}) for evolution"
+    else
+        echo "$inpdb does not exist." && continue
+    fi
+
+    # Run rfd_chain
+    outbn=($(basename ${inpdb%.*} | sed -E 's|_([^_]+)_([^_]+)$| \1 \2|'))
+    oldgen=$(tr -cd '0-9' <<< "${outbn[1]}")
+    newgen=$(echo "$oldgen + 1" | bc)
+    rfd_chain $contigs \
+        --inpdb $inpdb \
+        --outprefix $outdir/${outbn}_gen${newgen} \
+        --randsuffix \
+        ${all_opts[@]} ${extra_opts[@]}
+
+    # Auto update
+    [[ $auto_update == 1 ]] && {
+        echo "Updating pool because of --auto_update..."
+        for inpdb in $indir/*.pdb ; do
+            bnpdb=$(basename ${inpdb%.*})
+            [[ $(echo $outdir/$bnpdb*.pdb $outdir/archive/$bnpdb*.pdb | wc -w) == 0 ]] && {
+                cp -v $inpdb $outdir/${bnpdb}_gen0_orides.pdb
+            }
+        done
+    }
+
+    # Filter and track metrics for top 1% of designs
+    cursize=$(echo $outdir/*.pdb | wc -w)
+    num_eval=$(awk -v i="$cursize" 'BEGIN{printf "%.0f\n", (i * 0.01)}' | sed 's|^0$|1|')
+    rank_pool $mets --indir $outdir --num_eval $num_eval --num $poolsize --inplace
+    trim_family "$outdir/ranked.txt" "$famisize" "$outdir"
+
+    # If gen0perc is set and the gen0 pool is below threshold, then exit
+    [[ -n $gen0perc ]] && {
+        all_gen0=($(
+            echo $outdir/*pdb | sed 's/ /\n/g' | grep -E 'gen0_[^_]{6}[.]pdb$'
+        ))
+        cur_gen0perc=$(echo "100 * ${#all_gen0[@]} / $poolsize" | bc -l)
+        if [[ $(echo "$cur_gen0perc > $gen0perc" | bc) == 1 ]] ; then
+            echo "Current gen0perc is $cur_gen0perc%, above the cutoff of $gen0perc."
+        else
+            echo "Current gen0perc is $cur_gen0perc%, meeting the cutoff of $gen0perc."
+            echo "Exiting..."
+            break
+        fi
+    }
+
+    # Stop at capacity
+    [[ $stop_at_capacity == 1 ]] && {
+        cursize=$(echo $outdir/*.pdb | wc -w)
+        [[ $cursize -ge $poolsize ]] && {
+            echo "The option --stop_at_capacity was enabled, and maximum capacity is reached."
+            break
+        }
+    }
+done
+
+[[ $stop_at_capacity == 1 && $SECONDS -ge $time_f ]] && {
+    echo "The option --stop_at_capacity (with --poolsize $poolsize) was enabled, but the time limit (--tlim $tlim) was reached before capacity was reached. Rerun your command if you want to continue until max capacity."
+}

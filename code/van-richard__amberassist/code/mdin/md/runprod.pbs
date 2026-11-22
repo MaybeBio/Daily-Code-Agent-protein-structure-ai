@@ -1,0 +1,49 @@
+#!/bin/bash
+#PBS -q preemptable
+#PBS -A EnzymeSim
+#PBS -l walltime=7:00:00
+#PBS -l select=1:ncpus=1:ngpus=1
+#PBS -l filesystems=home:eagle
+#PBS -j oe
+#PBS -r y
+
+date
+
+module load amber/24
+cd ${PBS_O_WORKDIR}
+
+
+REP="2"
+cpu="mpirun -n ${NCPUS} pmemd.MPI"
+pmemd="pmemd.cuda"
+parm="step3_pbcsetup"
+
+if [[ -z "${REP}" ]]; then
+    echo "missing: REP value"
+    exit 1
+fi
+
+# find the right parm file
+if [ -f "${parm}_1264.parm7" ]; then
+    init="${parm}_1264"
+else
+    init="${parm}"
+fi
+
+
+pstep=$(printf "prod%02d" "$((${REP} - 1))")
+istep=$(printf "prod%02d" "${REP}")
+
+echo "running: ${istep} from ${pstep}"
+
+$pmemd -O -i prod2.mdin \
+    -p ${init}.parm7 \
+    -c ${pstep}.ncrst \
+    -o ${istep}.mdout \
+    -r ${istep}.ncrst \
+    -inf ${istep}.mdinfo \
+    -ref ${init}.ncrst \
+    -x ${istep}.nc
+
+date
+

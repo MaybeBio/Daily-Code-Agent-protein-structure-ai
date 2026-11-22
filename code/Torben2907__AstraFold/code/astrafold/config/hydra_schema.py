@@ -1,0 +1,243 @@
+"""Typed schema of the Hydra config in configs/."""
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from omegaconf import MISSING
+
+
+@dataclass
+class FilteringConfig:
+    max_len: int = MISSING
+    min_len: int = MISSING
+
+
+@dataclass
+class DataConfig:
+    csv_path: str = MISSING
+    # Held-out CSV for validation; null disables validation.
+    val_csv_path: str | None = None
+    filtering: FilteringConfig = MISSING
+    min_t: float = MISSING
+    batch_size: int = MISSING
+    max_batch_size: int = MISSING
+    max_squared_res: int = MISSING
+    max_num_res_squared: int = MISSING
+    eval_batch_size: int = MISSING
+    num_workers: int = MISSING
+    prefetch_factor: int = MISSING
+    contact_distance_threshold: float = MISSING
+    contact_minimum_sequence_separation: int = MISSING
+
+
+@dataclass
+class RotationConfig:
+    train_schedule: str = MISSING
+    sample_schedule: str = MISSING
+    exp_rate: int = MISSING
+
+
+@dataclass
+class TranslationConfig:
+    train_schedule: str = MISSING
+    sample_schedule: str = MISSING
+
+
+@dataclass
+class SamplingConfig:
+    num_timesteps: int = MISSING
+
+
+@dataclass
+class InterpolantConfig:
+    min_t: float = MISSING
+    rots: RotationConfig = MISSING
+    trans: TranslationConfig = MISSING
+    sampling: SamplingConfig = MISSING
+
+    self_condition: bool = MISSING
+
+
+@dataclass
+class NodeEmbedderConfig:
+    c_s: int = MISSING
+    c_pos_emb: int = MISSING
+    c_timestep_emb: int = MISSING
+    c_token_emb: int = MISSING
+    embed_diffuse_mask: bool = MISSING
+    max_num_res: int = MISSING
+    timestep_int: int = MISSING
+
+
+@dataclass
+class EdgeEmbedderConfig:
+    single_bias_transition_n: int = MISSING
+    c_s: int = MISSING
+    c_p: int = MISSING
+    relpos_k: int = MISSING
+    use_rbf: bool = MISSING
+    num_rbf: int = MISSING
+    feat_dim: int = MISSING
+    num_bins: int = MISSING
+    self_condition: bool = MISSING
+
+
+@dataclass
+class IPAConfig:
+    c_s: int = MISSING
+    c_z: int = MISSING
+    c_hidden: int = MISSING
+    no_heads: int = MISSING
+    no_qk_points: int = MISSING
+    no_v_points: int = MISSING
+    seq_tfmr_num_heads: int = MISSING
+    seq_tfmr_num_layers: int = MISSING
+    num_blocks: int = MISSING
+    dropout: float = MISSING
+
+
+@dataclass
+class ModelConfig:
+    node_embed_size: int = MISSING
+    edge_embed_size: int = MISSING
+    symmetric: bool = MISSING
+    node_features: NodeEmbedderConfig = MISSING
+    edge_features: EdgeEmbedderConfig = MISSING
+    ipa: IPAConfig = MISSING
+
+
+@dataclass
+class BatchOptimalTransportConfig:
+    enabled: bool = MISSING
+    cost: str = MISSING
+    noise_per_sample: int = MISSING
+    permute: bool = MISSING
+
+
+@dataclass
+class TrainingConfig:
+    min_plddt_mask: int | None = MISSING
+    loss: str = MISSING
+    bb_atom_scale: float = MISSING
+    trans_scale: float = MISSING
+    translation_loss_weight: float = MISSING
+    t_normalize_clip: float = MISSING
+    rotation_loss_weights: float = MISSING
+    aux_loss_weight: float = MISSING
+    aux_loss_t_pass: float = MISSING
+    tors_loss_scale: float = MISSING
+    token_loss_weight: float = MISSING
+    token_mask_probability: float | None = None
+    smoke_test_seed: int | None = None
+
+
+@dataclass
+class ValidationConfig:
+    # Every validation example is evaluated at each of these flow times.
+    t_values: list[float] = MISSING
+    # Seeds the noise, token masks and t-independent randomness of each validation
+    # batch, so validation metrics are comparable across epochs.
+    seed: int = MISSING
+
+
+@dataclass
+class WandbConfig:
+    name: str = MISSING
+    project: str = MISSING
+    save_code: bool = MISSING
+    tags: list = MISSING
+    mode: str = MISSING
+
+
+@dataclass
+class OptimizerConfig:
+    lr: float = MISSING
+
+
+@dataclass
+class TrainerConfig:
+    overfit_batches: int = MISSING
+    max_steps: int = MISSING
+    min_epochs: int = MISSING
+    max_epochs: int = MISSING
+    accelerator: str = MISSING
+    devices: Any = MISSING  # int (number of GPUs) or list[int] (GPU ids); OmegaConf can't type that union
+    log_every_n_steps: int = MISSING
+    deterministic: bool = MISSING
+    detect_anomaly: bool = MISSING
+    strategy: str = MISSING
+    check_val_every_n_epoch: int = MISSING
+    accumulate_grad_batches: int = MISSING
+
+
+@dataclass
+class CheckpointerConfig:
+    dirpath: str = MISSING
+    save_last: bool = MISSING
+    save_top_k: int = MISSING
+    monitor: str = MISSING
+    mode: str = MISSING
+    every_n_epochs: int = MISSING
+    filename: str = MISSING
+    auto_insert_metric_name: bool = MISSING
+
+
+@dataclass
+class ExperimentConfig:
+    seed: int = MISSING
+    finetune: bool = MISSING
+    warm_start: str | None = MISSING
+    warm_start_cfg_override: bool = MISSING
+    use_swa: bool = MISSING
+
+    batch_ot: BatchOptimalTransportConfig = MISSING
+    training: TrainingConfig = MISSING
+    validation: ValidationConfig = MISSING
+    wandb: WandbConfig = MISSING
+    optimizer: OptimizerConfig = MISSING
+    trainer: TrainerConfig = MISSING
+    checkpointer: CheckpointerConfig = MISSING
+
+
+@dataclass
+class HydraConfig:
+    data_cfg: DataConfig = MISSING
+    interpolant: InterpolantConfig = MISSING
+    model: ModelConfig = MISSING
+    experiment: ExperimentConfig = MISSING
+
+
+@dataclass
+class HybridSamplerConfig:
+    """Options of the hybrid sampler (astrafold/data/hybrid_sampler.py)."""
+
+    # eps: a contact token is revealed once its probability is >= 1 - eps.
+    confidence_tolerance: float = 0.2
+    # Most tokens revealed per trajectory; 1 reveals one token per restart.
+    tokens_per_round: int = 8
+    # Share of the tokens remasked for the self-consistency score.
+    remask_fraction: float = 0.25
+
+
+@dataclass
+class InferenceConfig:
+    """Schema of configs/inference.yaml (used by inference.py, not by training)."""
+
+    ckpt_path: str = MISSING
+    # FASTA file with one or more RNA sequences.
+    fasta_path: str = MISSING
+    # Structures are written to <output_dir>/<FASTA record id>/Sample_<i>.<ext>.
+    output_dir: str = MISSING
+    num_samples: int = MISSING
+    # Number of samples generated in one forward pass.
+    batch_size: int = MISSING
+    # Steps of the sampler; null uses interpolant.sampling.num_timesteps of the checkpoint.
+    num_timesteps: int | None = None
+    # flow: one trajectory that reveals tokens along the way; hybrid: restart the
+    # flow after every revealed token and score the samples by self-consistency.
+    sampler: str = "flow"
+    hybrid: HybridSamplerConfig = field(default_factory=HybridSamplerConfig)
+    # Sample i is generated from seed + i, whatever the batch size.
+    seed: int = MISSING
+    output_format: str = MISSING  # pdb | mmcif | both
+    device: str = MISSING  # auto | cpu | cuda | cuda:<id>

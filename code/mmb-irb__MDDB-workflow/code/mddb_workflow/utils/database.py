@@ -1,0 +1,425 @@
+import urllib.request
+import http.client
+import urllib.parse
+import urllib.error
+import ssl
+import json
+from math import ceil
+from tqdm import tqdm
+from mddb_workflow.utils.auxiliar import load_json, save_json, InputError, RemoteServiceError, DatabaseUnavailableError
+from mddb_workflow.utils.auxiliar import reprint, warn, retry_request
+from mddb_workflow.utils.constants import GLOBALS, INCOMPLETE_PREFIX, DEFAULT_INPUTS_FILENAME
+from mddb_workflow.utils.type_hints import *
+
+# When downloading files, set the chunk size in bytes
+CHUNK_SIZE = 1024 * 1024  # 1 MB
+
+# Create a system to skip SSL certificates authentication
+NO_SSL_CONTEXT = ssl.create_default_context()
+NO_SSL_CONTEXT.check_hostname = False
+NO_SSL_CONTEXT.verify_mode = ssl.CERT_NONE
+
+# Header for workflow request source
+WORKFLOW_REQUEST_SOURCE_HEADER = 'x-mddb-request-source'
+WORKFLOW_REQUEST_SOURCE_VALUE = 'workflow'
+
+# Set the URL of the global server, including the available nodes
+GLOBAL_SERVER_ALIAS = 'global'
+GLOBAL_SERVER_NAME = 'MDposit'
+GLOBAL_SERVER_URL = 'https://mdposit.mddbr.eu/api/'
+
+
+def workflow_urlopen(url, *args, **kwargs):
+    """Set a workflow header for metrics urllib.request.urlopen."""
+    # Set the context depending on if we will skip SSL authentication
+    no_ssl_authentication = GLOBALS.get('no_ssl', False) == True
+    kwargs['context'] = NO_SSL_CONTEXT if no_ssl_authentication else None
+    # Run the request
+    req = urllib.request.Request(url)
+    req.add_header(WORKFLOW_REQUEST_SOURCE_HEADER, WORKFLOW_REQUEST_SOURCE_VALUE)
+    return urllib.request.urlopen(req, *args, **kwargs)
+
+
+def read_url(request_url: str, output_file: Optional['File'] = None, show_progress: bool = False) -> Optional[bytes]:
+    """Get the content of a request, or write it in a file by chunks if a file is passed.
+    The whole request is in here so it is fully repeated when retried, even if it failed in the middle of a download.
+    """
+    response = workflow_urlopen(request_url)
+    if output_file is None: return response.read()
+    pbar = tqdm(unit='B', unit_scale=True, unit_divisor=1024, miniters=1, desc=' Progress', leave=False) if show_progress else None
+    with open(output_file.path, 'wb') as file:
+        while True:
+            chunk = response.read(CHUNK_SIZE)
+            if not chunk: break
+            if pbar is not None: pbar.update(len(chunk))
+            file.write(chunk)
+    # Reading by chunks does not complain if the connection is closed before the end, so we check it here
+    # The length is the number of bytes still expected and it is None when the server does not say the size
+    if response.length: raise http.client.IncompleteRead(b'', response.length)
+
+# Read URLs retrying when there are network or server problems
+read_url_retried = retry_request(read_url)
+# Read URLs of things which must exist, so they are also retried if not found
+read_existing_url_retried = retry_request(read_url, retry_not_found=True)
+
+def get_available_nodes() -> dict[str, str]:
+    nodes_url = f'{GLOBAL_SERVER_URL}rest/current/nodes'
+    try:
+        nodes_data = json.loads(read_url_retried(nodes_url))
+        return {node['alias']: {'name': node['name'], 'url': node['api_url']} for node in nodes_data}
+    except Exception as error:
+        raise Exception(f'Something went wrong when requesting nodes data ({nodes_url}) with error "{error}"')
+
+
+class Remote:
+    """Class to handle remote projects in the database."""
+    def __init__(self, database: 'Database', accession: str):
+        """Initialize the remote project handler.
+
+        Args:
+            database: Database handler to access the database.
+            accession: Accession of the remote project to be handled.
+
+        """
+        # Set the URL
+        self.database = database
+        self.accession = accession
+        self.project_url = f'{self.database.url}rest/current/projects/{accession}'
+        # Set internal variables
+        self._project_data = None
+        self._available_files = None
+        # Download project data to make sure we have database access and the project exists
+        self.get_project_data()
+
+    def __str__(self) -> str:
+        return f'< Remote {self.project_url} >'
+
+    def get_project_data(self) -> dict:
+        """Get project data.
+        This is only used to make sure the project exists by now.
+        """
+        # Return the internal value if we already have it
+        if self._project_data != None:
+            return self._project_data
+        # Make sure the database is alive (and thus the provided database URL is valid)
+        if not self.database.is_alive():
+            raise RemoteServiceError('Database not available')
+        # Otherwise request the project data to the API
+        try:
+            self._project_data = json.loads(read_existing_url_retried(self.project_url))
+            return self._project_data
+        except urllib.error.HTTPError as error:
+            # Try to provide comprehensive error logs depending on the error
+            # If project was not found
+            if error.code == 404:
+                raise InputError(f'Remote project "{self.accession}" not found in {self.project_url}')
+            # If we don't know the error then simply say something went wrong
+            raise Exception(f'Error when downloading project data: {self.project_url} with error: {error}')
+        except urllib.error.URLError as error:
+            # If we don't know the error then simply say something went wrong
+            raise Exception(f'Error when downloading project data: {self.project_url} with error: {error}')
+        except Exception as error:
+            raise Exception(f'Something went wrong when requesting project data: {self.project_url} with error: {error}')
+    project_data = property(get_project_data, None, None, "Project data (read only)")
+
+    def get_snaphsots(self):
+        """Get the number of snapshots in the remote trajectory."""
+        return self._project_data['metadata']['mdFrames']
+    snapshots = property(get_snaphsots, None, None, "Number of snapshots in the remote trajectory (read only)")
+
+    def _get_file(self, request_url: str, description: str, output_file: 'File' = None):
+        """Get the content of a request and optionally save it to a file."""
+        file_str = '' if output_file is None else f' ({output_file.path})'
+        print(f'Downloading {description}{file_str}\n')
+        try:
+            content = read_url_retried(request_url, output_file)
+            if output_file is None: return json.loads(content)
+        except Exception as error:
+            raise Exception(f'Something went wrong when downloading {description}: {request_url} with error: {error}')
+
+    def get_available_files(self):
+        """Get the available files in the remote project."""
+        # Return the internal value if we already have it
+        if self._available_files != None:
+            return self._available_files
+        # Otherwise request the available files to the API
+        request_url = self.project_url + '/files'
+        self._available_files = self._get_file(request_url, 'available files')
+        return self._available_files
+    available_files = property(get_available_files, None, None, "Remote available files (read only)")
+
+    def download_file(self, target_filename: str, output_file: 'File'):
+        """Download a specific file from the project/files endpoint."""
+        request_url = f'{self.project_url}/files/{target_filename}'
+        print(f'Downloading file "{target_filename}" in {output_file.path}\n')
+        try:
+            read_url_retried(request_url, output_file)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                raise Exception(f'Missing remote file "{target_filename}"')
+            # If we don't know the error then simply say something went wrong
+            raise Exception(f'Something went wrong when downloading file "{target_filename}" in {request_url} with error: {error}')
+
+    def get_standard_topology(self):
+        """Get the standard topology of the project."""
+        # Download the project standard topology
+        request_url = self.project_url + '/topology'
+        return self._get_file(request_url, 'standard topology')
+
+    def download_standard_topology(self, output_file: 'File'):
+        """Download the standard topology of the project."""
+        request_url = self.project_url + '/topology'
+        self._get_file(request_url, 'standard topology', output_file)
+
+    def download_standard_structure(self, output_file: 'File'):
+        """Download the standard structure of the project."""
+        request_url = self.project_url + '/structure'
+        self._get_file(request_url, 'standard structure', output_file)
+
+    def download_trajectory(self,
+        output_file: 'File',
+        frame_selection: Optional[str] = None,
+        atom_selection: Optional[str] = None,
+        format: Optional[str] = None
+    ):
+        """Download the main trajectory."""
+        if [frame_selection, atom_selection, format] == [None, None, 'xtc']:
+            # If we dont have a specific request, we can download the main trajectory
+            # directly from the trajectory.xtc file so it is faster
+            request_url = f'{self.project_url}/files/trajectory.xtc'
+        else:
+            # Set the base URL
+            request_url = self.project_url + '/trajectory'
+            # Additional arguments to be included in the URL
+            arguments = []
+            if frame_selection:
+                arguments.append(f'frames={frame_selection}')
+            if atom_selection:
+                arguments.append(f'atoms={atom_selection}')
+            if format:
+                arguments.append(f'format={format}')
+            if len(arguments) > 0:
+                request_url += '?' + '&'.join(arguments)
+        # Send the request
+        print(f'Downloading main trajectory ({output_file.path})')
+        # Create a temporal file to download the trajectory
+        # Thus if the download is interrupted we will know the trajectory is incomplete
+        incomplete_trajectory = output_file.get_prefixed_file(INCOMPLETE_PREFIX)
+        # If we have a previous incomplete trajectory then remove it
+        if incomplete_trajectory.exists: incomplete_trajectory.remove()
+        try:
+            read_url_retried(request_url, incomplete_trajectory, show_progress=True)
+        except Exception as error:
+            raise Exception(f'Something went wrong when downloading the main trajectory: {request_url} with error: {error}')
+        # Once the trajectory is fully downloaded we change its filename
+        incomplete_trajectory.rename_to(output_file)
+
+    def get_inputs_file_source_filename(self) -> str:
+        """Get the inputs file name with the source format."""
+        return f'source_{self.database.alias}_{self.accession}_{DEFAULT_INPUTS_FILENAME}'
+
+    def download_inputs_file(self, output_file: 'File'):
+        """Download the inputs file."""
+        request_url = self.project_url + '/inputs'
+        # In case this is a json file we must specify the format in the query
+        is_json = output_file.format == 'json'
+        if is_json:
+            request_url += '?format=json'
+        self._get_file(request_url, 'inputs file', output_file)
+        if is_json:
+            file_content = load_json(output_file.path)
+            save_json(file_content, output_file.path, indent=4)
+
+    def download_analysis_data(self, analysis_type: str, output_file: 'File'):
+        """Download analysis data."""
+        request_url = f'{self.project_url}/analyses/{analysis_type}'
+        self._get_file(request_url, f'{analysis_type} analysis data', output_file)
+        # Format JSON if needed
+        try:
+            file_content = load_json(output_file.path)
+            save_json(file_content, output_file.path, indent=4)
+        except Exception:
+            pass  # If not JSON, skip formatting
+
+
+class Database:
+    """Class to handle database operations."""
+    def __init__(self, url_or_alias: str):
+        """Initialize the database handler.
+
+        Args:
+            url_or_alias: URL of the database (e.g. https://irb-dev.mddbr.eu/api/) or alias (e.g. mmb)
+
+        """
+        self.url = None
+        self.alias = None
+        # Set the database API URL
+        if '://' in url_or_alias:
+            self.url = url_or_alias
+        # If this is not an URL then it may be an alias from a remote node
+        else:
+            self.alias = url_or_alias
+            # Check if the user is requesting for the global database
+            # Get available nodes from the remote
+            available_nodes = get_available_nodes()
+            # Add the global node as an option
+            nodes = {GLOBAL_SERVER_ALIAS: {'name': GLOBAL_SERVER_NAME, 'url': GLOBAL_SERVER_URL}, **available_nodes}
+            # Check if the requested URL is actually a node alias
+            target_node = nodes.get(url_or_alias, None)
+            # If not then we complain
+            if target_node is None:
+                message = f'Invalid database alias "{url_or_alias}". Available aliases:\n'
+                for node_alias, node_config in nodes.items():
+                    message += f' - {node_alias} ({node_config["name"]}) -> {node_config["url"]}\n'
+                raise InputError(message)
+            # If there is a matching alias then use its URL
+            self.url = target_node['url']
+        # If the URL already includes /rest/... then clean this part away
+        if '/rest' in self.url:
+            self.url = self.url.split('/rest')[0] + '/'
+        # Set an alias for this database
+        # Note that the URL may include a port or a path (e.g. http://localhost:8000/)
+        self.alias = self.url.split('://')[1].split('/')[0].split(':')[0].split('.')[0].split('-')[0]
+
+    def __str__(self) -> str:
+        return f'< Database {self.url} >'
+
+    def is_alive(self) -> bool:
+        """Check if the database is alive.
+
+        WARNING: Note that this function requires internet connection.
+        WARNING: Do not run in by default.
+        """
+        try:
+            read_url_retried(self.url)
+            return True
+        except urllib.error.HTTPError as error:
+            # Server error
+            if error.code == 503:
+                warn('MDDB Service unavailable. Please try again later.')
+                return False
+            # Unknown HTTP error
+            return False
+        except urllib.error.URLError as error:
+            # SSL error
+            if 'SSL: CERTIFICATE_VERIFY_FAILED' in str(error):
+                raise RemoteServiceError(f'Failed to verify SSL certificate from {self.url}\n' +
+                    ' Use the "--ssleep" flag to avoid SSL authentication if you trust the source.')
+            # Timeout error
+            # The error variable as is do not work properly
+            # Its 'errno' value is None (at least for tiemout errors)
+            actual_error = error.args[0]
+            if actual_error.errno == 110:
+                warn('Timeout error when requesting MDposit. Is the node fallen?')
+                return False
+            # Unknown URL error
+            return False
+        except:
+            # Unknown error
+            return False
+
+    def get_reference_data(self, reference_type: str, reference_id: str) -> Optional[dict]:
+        """Get reference data for a specific reference ID from the MDDB database.
+        Return None if the reference is not in the database.
+        Raise a DatabaseUnavailableError if the database is not responding.
+        """
+        # Make sure the database is alive (and thus the provided database URL is valid)
+        # If not we raise an error instead of returning None, so this is not saved in cache as a missing reference
+        if not self.is_alive():
+            raise DatabaseUnavailableError(f'MDDB database {self.url} is not available')
+        # Request the specific data
+        request_url = f'{self.url}rest/v1/references/{reference_type}/{reference_id}'
+        try:
+            return json.loads(read_url_retried(request_url).decode("utf-8", errors='ignore'))
+        # Handle possible errors
+        except urllib.error.HTTPError as error:
+            # If the reference is not found in MDposit
+            if error.code == 404: return None
+            warn(f'Error when requesting MDposit: {request_url}')
+            raise RuntimeError(f'Something went wrong with the MDposit request {request_url}')
+        except Exception as error:
+            raise RuntimeError(f'Something went wrong with the MDposit request {request_url} with error: {error}')
+
+    def get_all_refences_data (self , reference_type: str, page_limit: int = 100, verbose : bool = True) -> list[dict]:
+        """Get all references data for a specific reference type from the MDDB database."""
+        # Make the first request to know the number of available references
+        first_request_url = f'{self.url}rest/v1/references/{reference_type}?limit={page_limit}'
+        if verbose: print() # Print an empty line for the further reprint
+        try:
+            if verbose: reprint(f'Requesting first page -> {first_request_url}')
+            first_response = json.loads(read_url_retried(first_request_url).decode("utf-8", errors='ignore'))
+        # Handle possible errors
+        except urllib.error.HTTPError as error:
+            raise RuntimeError(f'Something went wrong with the MDposit request {first_request_url} with error: {error}')
+        except Exception as error:
+            raise RuntimeError(f'Something went wrong with the MDposit request {first_request_url} with error: {error}')
+        # Calculate how many pages we will need to have the whole content
+        expected_references_count = first_response['referencesCount']
+        n_pages = ceil(expected_references_count/page_limit)
+        # Get all references in a single list
+        references = first_response['references']
+        # Paginate to get the rest of references
+        for page in range(2, n_pages + 1):
+            following_request_url = first_request_url + f'&page={page}'
+            try:
+                if verbose: reprint(f'Requesting page {page}/{n_pages} -> {following_request_url}')
+                following_response = json.loads(read_url_retried(following_request_url).decode("utf-8", errors='ignore'))
+                references += following_response['references']
+            # Handle possible errors
+            except urllib.error.HTTPError as error:
+                raise RuntimeError(f'Something went wrong with the MDposit request {following_request_url} with error: {error}')
+            except Exception as error:
+                raise RuntimeError(f'Something went wrong with the MDposit request {following_request_url} with error: {error}')
+        # Make sure the numbers match
+        final_references_count = len(references)
+        if final_references_count != expected_references_count:
+            warn(f'We expected {expected_references_count} references but we got {final_references_count}')
+        # Return all references
+        return references
+
+    def get_all_project_accessions(self, search: str | None = None, page_limit: int = 100, verbose: bool = True) -> tuple[int, Generator[str, None, None]]:
+        """Get the accessions of all projects in the MDDB database.
+        If a search query is passed then only the matching projects are returned.
+        Return the number of projects and a generator which yields the accessions one by one.
+        Only the first page is requested here, further pages are requested on demand while iterating."""
+        # Ask only for the accession to make the requests light
+        first_request_url = f'{self.url}rest/v1/projects?limit={page_limit}&projection={{"accession":1}}'
+        if search: first_request_url += f'&search={urllib.parse.quote(search)}'
+        if verbose: print() # Print an empty line for the further reprint
+        try:
+            if verbose: reprint(f'Requesting first page -> {first_request_url}')
+            first_response = json.loads(read_url_retried(first_request_url).decode("utf-8", errors='ignore'))
+        except Exception as error:
+            raise RuntimeError(f'Something went wrong with the MDposit request {first_request_url} with error: {error}')
+        # Calculate how many pages we will need to have the whole content
+        expected_projects_count = first_response['filteredCount']
+        n_pages = ceil(expected_projects_count/page_limit)
+        def generate_accessions() -> Generator[str, None, None]:
+            yielded_projects_count = 0
+            for project in first_response['projects']:
+                yielded_projects_count += 1
+                yield project['accession']
+            # Paginate to get the rest of projects
+            # Note that we do not reprint here since other logs may be printed between pages
+            for page in range(2, n_pages + 1):
+                following_request_url = first_request_url + f'&page={page}'
+                try:
+                    if verbose: print(f'Requesting page {page}/{n_pages} -> {following_request_url}')
+                    following_response = json.loads(read_url_retried(following_request_url).decode("utf-8", errors='ignore'))
+                except Exception as error:
+                    raise RuntimeError(f'Something went wrong with the MDposit request {following_request_url} with error: {error}')
+                for project in following_response['projects']:
+                    yielded_projects_count += 1
+                    yield project['accession']
+            # Make sure the numbers match
+            if yielded_projects_count != expected_projects_count:
+                warn(f'We expected {expected_projects_count} projects but we got {yielded_projects_count}')
+        return expected_projects_count, generate_accessions()
+
+    def get_project_versions(self, accession: str) -> dict:
+        """Get the versions of the project metadata, topology and analyses in the MDDB database."""
+        request_url = f'{self.url}rest/v1/projects/{accession}/versions'
+        try:
+            return json.loads(read_url_retried(request_url).decode("utf-8", errors='ignore'))
+        except Exception as error:
+            raise RuntimeError(f'Something went wrong with the MDposit request {request_url} with error: {error}')

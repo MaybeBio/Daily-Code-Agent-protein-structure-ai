@@ -1,0 +1,43 @@
+[package]
+name = "pantometry-py"
+description = "Python bindings for pantometry: coupled physics whose conservation audit is an exception"
+version = "0.24.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Younghyeon Park and pantometry contributors"]
+repository = "https://github.com/YounghyeonPark/pantometry"
+publish = false
+
+# **Its own workspace, deliberately.**
+#
+# pyo3 brings about fifteen crates and a build script that links libpython. The library
+# workspace has kept to twelve external dependencies, three of which reach a published
+# artifact, and `deny.toml` gates every one of them by licence — a claim the README makes and
+# CI enforces. Folding a Python extension into that workspace would put pyo3's tree into the
+# same lockfile and the same allow-list, and would make `cargo build --workspace` require a
+# Python development environment to compile a physics library.
+#
+# So: separate workspace, separate `Cargo.lock`, separate CI job. That is the rule the repository
+# follows whenever a heavy dependency arrives, and pyo3 was the first to trigger it; `app/` is the
+# second, for a GPU stack and a window toolkit, and `ARCHITECTURE.md` carries the measured
+# dependency counts that make the argument.
+#
+# This used to cite a note in `crates/pantometry-world/Cargo.toml`. That crate is `app/` now and
+# the note did not survive the move, so the citation pointed at a file with nothing in it to
+# point at — the rule is stated here instead of borrowed from somewhere that no longer says it.
+[workspace]
+
+[lib]
+# `pantometry` is the importable name; the crate is `pantometry-py` so it does not collide with the
+# facade in the parent workspace.
+name = "pantometry"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Both a path and a version. The path is what local builds and CI use; the version is what a
+# **source distribution** needs, because an sdist is a tarball rooted at this directory and
+# `../../crates/pantometry` points outside it. Without the version the sdist builds here and is
+# unbuildable for anyone who downloads it — which is the worst shape for a failure, since the
+# wheels would install fine and only the fallback path would be broken.
+pantometry = { path = "../../crates/pantometry", version = "0.24.0" }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }

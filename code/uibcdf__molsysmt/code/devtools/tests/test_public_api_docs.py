@@ -1,0 +1,360 @@
+"""Structural guards for the published API reference."""
+
+import json
+from io import StringIO
+from pathlib import Path
+
+import pytest
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+API_ROOT = REPOSITORY_ROOT / "docs" / "api"
+
+
+def test_published_api_reference_excludes_private_modules():
+    assert not any(path.is_file() for path in (API_ROOT / "_private").rglob("*"))
+
+    offenders = []
+    for source in API_ROOT.rglob("*"):
+        if source.suffix not in {".md", ".rst"}:
+            continue
+        if "molsysmt._private" in source.read_text(encoding="utf-8"):
+            offenders.append(source.relative_to(REPOSITORY_ROOT).as_posix())
+
+    assert offenders == []
+
+
+@pytest.mark.parametrize(
+    "function_name,tutorial_path",
+    [
+        (
+            "molsysmt.form.get_attributes",
+            "docs/content/user/tools/form/get_attributes.ipynb",
+        ),
+        (
+            "molsysmt.form.has_attribute",
+            "docs/content/user/tools/form/has_attribute.ipynb",
+        ),
+        (
+            "molsysmt.build.solve_atoms_with_alternate_location",
+            "docs/content/user/tools/build/solve_atoms_with_alternate_locations.ipynb",
+        ),
+    ],
+)
+def test_api_tutorial_links_resolve_to_actual_notebook_targets(
+    tmp_path, function_name, tutorial_path
+):
+    """Build both link directions using targets read from the stored notebooks."""
+    pytest.importorskip("myst_parser")
+    from sphinx.testing.util import SphinxTestApp
+
+    def introduction(path):
+        notebook = json.loads((REPOSITORY_ROOT / path).read_text(encoding="utf-8"))
+        cell = next(
+            cell for cell in notebook["cells"] if cell["cell_type"] == "markdown"
+        )
+        return "".join(cell["source"])
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "conf.py").write_text(
+        "extensions = ['sphinx.ext.autodoc', 'sphinx.ext.napoleon', 'myst_parser']\n"
+        "myst_enable_extensions = ['colon_fence']\nmaster_doc = 'index'\n",
+        encoding="utf-8",
+    )
+    (source / "index.rst").write_text(
+        "API reference\n=============\n\n"
+        f".. autofunction:: {function_name}\n\n"
+        ".. toctree::\n\n   tutorial\n   forms\n",
+        encoding="utf-8",
+    )
+    (source / "tutorial.md").write_text(introduction(tutorial_path), encoding="utf-8")
+    (source / "forms.md").write_text(
+        introduction("docs/content/user/foundations/molecular_system/forms.ipynb"),
+        encoding="utf-8",
+    )
+    warnings = StringIO()
+    app = SphinxTestApp(
+        srcdir=source,
+        builddir=tmp_path,
+        status=StringIO(),
+        warning=warnings,
+        warningiserror=True,
+    )
+    try:
+        app.build(force_all=True)
+        assert app.statuscode == 0, warnings.getvalue()
+        assert warnings.getvalue() == ""
+        api_html = (tmp_path / "html/index.html").read_text(encoding="utf-8")
+        tutorial_html = (tmp_path / "html/tutorial.html").read_text(encoding="utf-8")
+        assert 'href="tutorial.html#' in api_html
+        assert f'href="index.html#{function_name}"' in tutorial_html
+    finally:
+        app.cleanup()
+
+
+def _render_api_docstring(tmp_path, function_name, tutorial_label):
+    """Render actual public API text through its NumPy-to-RST boundary."""
+    pytest.importorskip("sphinx")
+    from sphinx.testing.util import SphinxTestApp
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "conf.py").write_text(
+        "extensions = ['sphinx.ext.autodoc', 'sphinx.ext.napoleon']\n"
+        "master_doc = 'index'\n",
+        encoding="utf-8",
+    )
+    (source / "index.rst").write_text(
+        f".. _{tutorial_label}:\n\n"
+        "Public API\n==========\n\n"
+        f".. autofunction:: {function_name}\n",
+        encoding="utf-8",
+    )
+    warnings = StringIO()
+    app = SphinxTestApp(
+        srcdir=source,
+        builddir=tmp_path,
+        status=StringIO(),
+        warning=warnings,
+        warningiserror=True,
+    )
+    try:
+        app.build(force_all=True)
+        assert app.statuscode == 0, warnings.getvalue()
+        assert warnings.getvalue() == ""
+        rendered = (tmp_path / "html" / "index.html").read_text(encoding="utf-8")
+        assert function_name.rsplit(".", 1)[-1] in rendered
+    finally:
+        app.cleanup()
+
+
+def test_box_geometry_docstring_renders_without_rst_errors(tmp_path):
+    _render_api_docstring(
+        tmp_path,
+        "molsysmt.pbc.get_lengths_and_angles_from_box",
+        "Tutorial_Get_lengths_and_angles_from_box",
+    )
+
+
+def test_least_rmsd_fit_docstring_renders_without_rst_errors(tmp_path):
+    _render_api_docstring(
+        tmp_path,
+        "molsysmt.structure.least_rmsd_fit",
+        "Tutorial_Least_rmsd_fit",
+    )
+
+
+def test_molsys_manual_type_setter_docstring_renders_and_example_runs(tmp_path):
+    _render_api_docstring(
+        tmp_path,
+        "molsysmt.form.molsysmt_MolSys.set.set_atom_ff_type_to_atom",
+        "Tutorial_Set",
+    )
+
+    import doctest
+
+    from molsysmt.form.molsysmt_MolSys.set import set_atom_ff_type_to_atom
+
+    example = doctest.DocTestParser().get_doctest(
+        set_atom_ff_type_to_atom.__doc__,
+        {"set_atom_ff_type_to_atom": set_atom_ff_type_to_atom},
+        "set_atom_ff_type_to_atom",
+        "public-docstring",
+        0,
+    )
+    result = doctest.DocTestRunner().run(example)
+    assert result.failed == 0 and result.attempted == 4
+
+
+@pytest.mark.parametrize(
+    "name,tutorial_label,statement_count",
+    [
+        ("get", "Tutorial_Get", 11),
+        ("info", "Tutorial_Info", 3),
+        ("to_form", "Tutorial_Convert", 5),
+    ],
+)
+def test_molsys_shortcut_docstrings_render_and_examples_run(
+    tmp_path, name, tutorial_label, statement_count
+):
+    _render_api_docstring(tmp_path, f"molsysmt.native.MolSys.{name}", tutorial_label)
+
+    import doctest
+
+    from molsysmt.native import MolSys
+
+    example = doctest.DocTestParser().get_doctest(
+        getattr(MolSys, name).__doc__, {}, name, "public-docstring", 0
+    )
+    result = doctest.DocTestRunner().run(example)
+    assert result.failed == 0 and result.attempted == statement_count
+
+
+@pytest.mark.parametrize(
+    "function_name,tutorial_label",
+    [
+        ("molsysmt.build.build_peptide", "Tutorial_Build_peptide"),
+        ("molsysmt.third_party.tleap.TLeap.run", "Tutorial_TLeap"),
+    ],
+)
+def test_resource_lifecycle_docstrings_render_without_rst_errors(
+    tmp_path, function_name, tutorial_label
+):
+    _render_api_docstring(tmp_path, function_name, tutorial_label)
+
+
+def test_directed_vector_docstring_renders_without_rst_errors(tmp_path):
+    _render_api_docstring(
+        tmp_path, "molsysmt.structure.get_vectors", "Tutorial_Get_vectors"
+    )
+
+
+@pytest.mark.parametrize(
+    "function_name,tutorial_label",
+    [
+        ("molsysmt.physchem.get_chemical_template", "Tutorial_Get_Chemical_Template"),
+        (
+            "molsysmt.topology.get_atom_name_correspondence",
+            "Tutorial_Get_Atom_Name_Correspondence",
+        ),
+    ],
+)
+def test_chemical_reference_boundary_docstrings_render_without_rst_errors(
+    tmp_path, function_name, tutorial_label
+):
+    _render_api_docstring(tmp_path, function_name, tutorial_label)
+
+
+def test_hbond_site_direction_docstring_renders_without_rst_errors(tmp_path):
+    _render_api_docstring(
+        tmp_path,
+        "molsysmt.interactions.hbonds.get_hbond_site_directions",
+        "Tutorial_Get_hbond_site_directions",
+    )
+
+
+@pytest.mark.parametrize(
+    "function_name,tutorial_label",
+    [
+        (
+            "molsysmt.form.openmm_Simulation.to_file_pdb.to_file_pdb",
+            "Tutorial_Form_openmm_Simulation",
+        ),
+        (
+            "molsysmt.form.openmm_Simulation.to_pdbfixer_PDBFixer.to_pdbfixer_PDBFixer",
+            "Tutorial_Form_openmm_Simulation",
+        ),
+        ("molsysmt.build.get_missing_bonds", "Tutorial_Get_missing_bonds"),
+    ],
+)
+def test_eager_bridge_docstrings_render_without_rst_errors(
+    tmp_path, function_name, tutorial_label
+):
+    _render_api_docstring(tmp_path, function_name, tutorial_label)
+
+    if function_name == "molsysmt.build.get_missing_bonds":
+        import doctest
+
+        from molsysmt.build import get_missing_bonds
+
+        example = doctest.DocTestParser().get_doctest(
+            get_missing_bonds.__doc__, {}, "get_missing_bonds", "public-docstring", 0
+        )
+        result = doctest.DocTestRunner().run(example)
+        assert result.failed == 0 and result.attempted == 3
+
+
+def test_nglview_color_docstring_renders_without_rst_errors(tmp_path, monkeypatch):
+    _render_api_docstring(
+        tmp_path,
+        "molsysmt.third_party.nglview.set_color_by_value",
+        "Tutorial_NGLView_Set_color_by_value",
+    )
+
+    import doctest
+    from importlib import import_module
+
+    pytest.importorskip("nglview")
+    from molsysmt.third_party.nglview import set_color_by_value
+
+    def reject_remote_example(*args, **kwargs):
+        raise AssertionError("The public example must use bundled local data.")
+
+    downloader = import_module("molsysmt.form.file_pdb.download")
+    monkeypatch.setattr(downloader, "download", reject_remote_example)
+    example = doctest.DocTestParser().get_doctest(
+        set_color_by_value.__doc__, {}, "set_color_by_value", "public-docstring", 0
+    )
+    runner = doctest.DocTestRunner()
+    result = runner.run(example, clear_globs=False)
+    assert result.failed == 0
+    representation = example.globs["view"]._ngl_msg_archive[-1]
+    assert representation["reconstruc_color_scheme"] is True
+    assert len(representation["kwargs"]["color"]) == len(example.globs["values"])
+
+
+def test_legacy_toolbox_cards_render_without_directive_errors(tmp_path):
+    """Render the retained draft's actual cards, without its separate navigation."""
+    pytest.importorskip("sphinx_design")
+    pytest.importorskip("myst_parser")
+    from sphinx.testing.util import SphinxTestApp
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "conf.py").write_text(
+        "extensions = ['myst_parser', 'sphinx_design']\n"
+        "myst_enable_extensions = ['colon_fence']\nmaster_doc = 'index'\n",
+        encoding="utf-8",
+    )
+    draft = REPOSITORY_ROOT / "docs/content/user/tools/index_v2.md"
+    cards = draft.read_text(encoding="utf-8").split("```{eval-rst}", 1)[0]
+    (source / "index.md").write_text(cards, encoding="utf-8")
+    warnings = StringIO()
+    app = SphinxTestApp(
+        srcdir=source,
+        builddir=tmp_path,
+        status=StringIO(),
+        warning=warnings,
+        warningiserror=True,
+    )
+    try:
+        app.build(force_all=True)
+        assert app.statuscode == 0, warnings.getvalue()
+        assert warnings.getvalue() == ""
+        rendered = (tmp_path / "html/index.html").read_text(encoding="utf-8")
+        assert "sd-row-cols-1" in rendered
+        assert "sd-row-cols-md-2" in rendered
+        assert "sd-row-cols-lg-3" in rendered
+        assert "Explore Basic" in rendered
+        assert "Explore Third Party" in rendered
+    finally:
+        app.cleanup()
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    [
+        "molsysmt.form.file_prmtop.get_structural_attributes.get_box_from_system",
+        "molsysmt.form.file_trjpk.to_file_trjpk.to_file_trjpk",
+        "molsysmt.form.file_trjpk.get_topological_attributes.get_n_atoms_from_system",
+        "molsysmt.form.file_trjpk.get_topological_attributes.get_atom_index_from_atom",
+        "molsysmt.form.file_trjpk.get_structural_attributes.get_n_structures_from_system",
+        "molsysmt.form.file_trjpk.get_structural_attributes.get_coordinates_from_atom",
+        "molsysmt.form.file_trjpk.get_structural_attributes.get_coordinates_from_system",
+        "molsysmt.form.file_trjpk.get_structural_attributes.get_box_from_system",
+        "molsysmt.form.file_trjpk.get_structural_attributes.get_time_from_system",
+        "molsysmt.form.file_trjpk.get_structural_attributes.get_structure_id_from_system",
+    ],
+)
+def test_restored_file_query_docstrings_render_without_rst_errors(
+    tmp_path, function_name
+):
+    _render_api_docstring(tmp_path, function_name, "Restored_file_query")
+
+
+def test_mdtraj_topology_geometry_docstring_renders_without_rst_errors(tmp_path):
+    _render_api_docstring(
+        tmp_path,
+        "molsysmt.form.mdtraj_Topology.to_mdtraj_Trajectory.to_mdtraj_Trajectory",
+        "Tutorial_Convert",
+    )

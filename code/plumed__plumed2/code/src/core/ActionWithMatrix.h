@@ -1,0 +1,118 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2011-2023 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#ifndef __PLUMED_core_ActionWithMatrix_h
+#define __PLUMED_core_ActionWithMatrix_h
+
+#include "ActionWithVector.h"
+#include <cstddef>
+
+namespace PLMD {
+
+//this class serves as a workaround for moving data with openacc without specifying --memory=managed
+class RequiredMatrixElements {
+  std::vector<std::size_t> bookeeping{};
+  std::size_t* bookeeping_data=nullptr;
+public:
+  std::size_t ncols=0;
+  void update() {
+    bookeeping_data = bookeeping.data();
+  }
+  void toACCDevice() const {
+    //this assumes that update() has already been called
+#pragma acc enter data copyin(this[0:1], bookeeping_data[0:bookeeping.size()])
+  }
+  void removeFromACCDevice() const {
+#pragma acc exit data delete(bookeeping_data[0:bookeeping.size()],this[0:1])
+  }
+  std::size_t& operator[]( std::size_t i ) {
+    return bookeeping_data[i];
+  }
+  std::size_t operator[]( std::size_t i ) const {
+    return bookeeping_data[i];
+  }
+  std::size_t size() const {
+    return bookeeping.size();
+  }
+  void resize(std::size_t newSize) {
+    bookeeping.resize(newSize);
+    update();
+  }
+};
+
+class MatrixElementOutput {
+public:
+  View<double> values;
+  View2D<double> derivs;
+  MatrixElementOutput( std::size_t nv, std::size_t nd, double* v, double* d ) :
+    values( v, nv ),
+    derivs( d, nv, nd ) {
+  }
+};
+
+class ActionWithMatrix : public ActionWithVector {
+private:
+/// List of columns in matrix that have non-zero elements
+  std::vector<unsigned> column_list;
+protected:
+/// The number of elements in the longest column of the sparse matrix that is output by this action
+  unsigned maxcolsize;
+/// Some actions have a flag that sets this to true.  The elements on the diagonal of the resulting matrix are then set to zero
+  bool diagzero;
+/// This flag turns on a low memory implemntation of the multi-threaded calculation
+  bool no_thread_gather;
+/// This flag is activated when we run through the columns of the matrix when gathering forces in a thread safe way
+  bool gatherForceOnColumns;
+/// Copy the matrix bookeeping for task list stuff from the first component
+  void copyMatrixBookeepingFromFirstComponent( RequiredMatrixElements& outmat );
+/// Implementation of transferStashToValues for both precisions
+  template <typename T>
+  void matrixStashToValuesImpl( const std::vector<unsigned>& partialTaskList, const std::vector<T>& stash );
+/// Implementation of transferForcesToStash for both precisions
+  template <typename T>
+  void matrixForcesToStashImpl( const std::vector<unsigned>& partialTaskList, std::vector<T>& stash ) const ;
+/// Update all the arrays for doing bookeeping
+  void updateBookeepingArrays( RequiredMatrixElements& mat );
+/// Get an array that tells us which indices are in each column
+  void getColumnBookeepingArrays( RequiredMatrixElements& outmat );
+/// With AVOID_THREAD_GATHER the forces are gathered in two passes that are not combined across MPI processes:
+/// stop with an error if the action is parallelised with MPI (serial is the SERIAL flag of the task manager,
+/// so this is called by the derived actions after it has been read)
+  void checkThreadGatherWithMPI( const bool serial );
+public:
+  static void registerKeywords( Keywords& keys );
+  explicit ActionWithMatrix(const ActionOptions&);
+/// Get the list of active tasks for this action
+  std::vector<unsigned>& getListOfActiveTasks() override ;
+/// Get the size to use for the value in the stash
+  unsigned getSizeOfValueInStash( const Value* myval ) override ;
+/// Get the elements of the matrices into the output values
+  void transferStashToValues( const std::vector<unsigned>& partialTaskList, const std::vector<double>& stash ) override ;
+/// Get the elements of the matrices into the output values
+  void transferStashToValues( const std::vector<unsigned>& partialTaskList, const std::vector<float>& stash ) override ;
+/// Get the forces from the output values and transfer them to the stash
+  void transferForcesToStash( const std::vector<unsigned>& partialTaskList, std::vector<double>& stash ) const override ;
+/// Get the forces from the output values and transfer them to the stash
+  void transferForcesToStash( const std::vector<unsigned>& partialTaskList, std::vector<float>& stash ) const override ;
+};
+
+}
+#endif

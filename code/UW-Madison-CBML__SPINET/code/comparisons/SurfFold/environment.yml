@@ -1,0 +1,10 @@
+name: Surffold
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - mkl
+  - openbabel
+  - pip:
+      - torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121

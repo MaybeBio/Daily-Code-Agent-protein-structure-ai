@@ -1,0 +1,209 @@
+name: Structure comparison contracts and rigid-frame controls
+on:
+  workflow_dispatch:
+  push:
+    paths: &comparison_paths
+      - "src/opendde_workbench/structure_comparison/**"
+      - "src/opendde_workbench/receptors/native_fit.py"
+      - "src/opendde_workbench/receptors/image.py"
+      - "src/opendde_workbench/receptors/native*requirements*"
+      - "src/opendde_workbench/receptors/build/**"
+      - "src/opendde_workbench/receptors/native.Dockerfile"
+      - "src/opendde_workbench/receptors/backend.py"
+      - "src/opendde_workbench/receptors/profiles.py"
+      - "src/opendde_workbench/receptors/runner.py"
+      - "scripts/generate-biopython-lock.py"
+      - "server_tests/*comparison*native*"
+      - "server_tests/comparison_api_harness.py"
+      - "server_tests/comparison_browser_harness.py"
+      - "frontend/src/structure-comparison/**"
+      - "frontend/src/viewer/residue-region*"
+      - "frontend/src/viewer/context-focus*"
+      - "frontend/src/viewer/scene.ts"
+      - "frontend/src/operations/ToolCenter.tsx"
+      - "frontend/src/operations/OperationResults.tsx"
+      - "frontend/src/operations/types.ts"
+      - "frontend/src/operations/harness-fields.ts"
+      - "frontend/src/examples/stat6-harness*"
+      - "src/opendde_workbench/examples/stat6/requests.py"
+      - "src/opendde_workbench/examples/stat6/reference_inputs.py"
+      - "src/opendde_workbench/examples/stat6/catalogue.py"
+      - "src/opendde_workbench/examples/stat6/manifest.json"
+      - "src/opendde_workbench/examples/stat6/catalogue-profiles.json"
+      - "src/opendde_workbench/examples/stat6/inputs/4Y5W.cif"
+      - "server_tests/test_native_structure_comparison.py"
+      - "server_tests/test_archived_comparison_browser.py"
+      - "tests/test_structure_comparison*.py"
+      - "scripts/comparison-layout-scope.py"
+      - ".github/workflows/structure-comparison-checks.yml"
+  pull_request:
+    paths: *comparison_paths
+permissions:
+  contents: read
+jobs:
+  layout-scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      layout_only: ${{ steps.scope.outputs.layout_only }}
+      receptor_workspace_only: ${{ steps.preparation.outputs.receptor_workspace_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/comparison-layout-scope.py
+      - id: preparation
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/receptor-workspace-scope.py
+  archived-result-layout:
+    needs: [layout-scope, utility-scope]
+    if: >-
+      needs.layout-scope.outputs.layout_only == 'true' ||
+      needs.utility-scope.outputs.paired_figure_only == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      WB_AUTO_DEPLOY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev --group browser
+      - name: Comparison selection identity and direct form and viewer consumers
+        if: needs.utility-scope.outputs.paired_figure_only != 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/structure-comparison/ComparisonForm.test.tsx
+          src/structure-comparison/ComparisonScene.test.ts
+          src/viewer/structure-camera.test.tsx src/viewer/StructureViewer.test.tsx
+          src/viewer/source-layout.test.ts src/viewer/modified-polymer.test.ts
+          src/presentation/WorkspaceFullscreenControl.test.tsx
+          src/operations/StructureComparisonResults.test.tsx
+          src/presentation/ResearchTabs.test.tsx
+      - name: Exact paired renderer and native export consumers
+        if: needs.utility-scope.outputs.paired_figure_only == 'true'
+        working-directory: frontend
+        run: >-
+          npx vitest run src/viewer/capture.test.ts src/viewer/useViewerSnapshot.test.ts
+          src/viewer/useStructureFigure.test.ts src/viewer/StructureViewer.test.tsx
+          src/simulations/comparison-figure.test.ts src/simulations/BoundPoseComparison.test.tsx
+          src/publication/FigureExport.test.tsx src/operations/StructureComparisonResults.test.tsx
+          src/integrations/ScientificResults.test.tsx
+      - name: Validate and restore the published STAT6 result without running an engine
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-comparison-layout" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-comparison-layout/state" >> "$GITHUB_ENV"
+          export WB_HOME="$RUNNER_TEMP/x-dde-comparison-layout"
+          export WB_STATE_DIR="$WB_HOME/state"
+          google-chrome --version
+          uv run --locked ruff check scripts/comparison-layout-scope.py
+          uv run --locked ruff check server_tests/test_archived_comparison_browser.py server_tests/comparison_browser_harness.py
+          uv run --locked pytest -q tests/test_structure_comparison_layout_scope.py tests/test_molecular_utility_scope.py
+          uv run --locked python server_tests/prepare_quality_context_cases.py
+      - name: Inspect native alignment, linked camera and independent figures in Chrome
+        run: uv run --locked python -m pytest -x -q server_tests/test_archived_comparison_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: archived-comparison-layout
+          path: outputs/comparison-layout/
+  utility-scope:
+    uses: ./.github/workflows/molecular-utility-checks.yml
+    with:
+      scope_only: true
+  antibody-scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      antibody_only: ${{ steps.scope.outputs.antibody_only }}
+      native_receptor_only: ${{ steps.scope.outputs.native_receptor_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/antibody_template_scope.py
+  contracts-and-frame:
+    needs: [antibody-scope, utility-scope, layout-scope]
+    if: needs.layout-scope.outputs.receptor_workspace_only != 'true' && needs.layout-scope.outputs.layout_only != 'true' && needs.utility-scope.outputs.utility_only != 'true' && (needs.antibody-scope.outputs.antibody_only != 'true' && needs.antibody-scope.outputs.native_receptor_only != 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev
+      - name: Exact comparison form and historical reader controls
+        working-directory: frontend
+        run: >-
+          npm test -- src/structure-comparison/ComparisonForm.test.tsx
+          src/structure-comparison/ComparisonScene.test.ts
+          src/viewer/residue-region.test.ts src/viewer/context-focus.test.ts
+          src/viewer/native-interface-context.test.ts
+          src/viewer/style.test.ts
+          src/operations/StructureComparisonResults.test.tsx
+          src/examples/stat6-harness.test.ts src/examples/harness.test.ts
+      - name: Exact chain roles, mutations, insertions, source versions and fitted partner frame
+        run: >-
+          uv run --locked --with biopython==1.88 --with numpy==1.26.4 pytest -q
+          tests/test_structure_comparison.py tests/test_structure_comparison_geometry.py
+          tests/test_structure_comparison_polymer.py
+          tests/test_structure_comparison_example.py
+          tests/test_capabilities.py tests/test_method_choices.py
+          tests/test_stat6_templates.py::test_actual_bundled_inputs_keep_confirmed_smiles_and_computed_geometry
+          tests/test_stat6_templates.py::test_every_affected_template_has_stat6_identity_and_a_distinct_revision
+          server_tests/test_receptor_science.py::test_actual_rigid_structure_copy_recovers_frame_and_original_residue_correspondence
+      - name: Changed Python contracts and adapters
+        run: >-
+          uv run --locked ruff check src/opendde_workbench/structure_comparison
+          src/opendde_workbench/receptors
+          tests/test_structure_comparison*.py server_tests/comparison_native_harness.py
+          server_tests/comparison_api_harness.py
+          server_tests/comparison_browser_harness.py
+          server_tests/test_native_structure_comparison.py
+  native-structural-runtime:
+    needs: contracts-and-frame
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - run: uv sync --locked --group dev --group browser
+      - run: uv run --locked --group browser playwright install --with-deps chromium
+      - name: Verify exact runtime and isolated compiler dependency hashes
+        run: uv run --locked python scripts/generate-biopython-lock.py --check
+      - name: Prepare only the existing native receptor consumer fixture
+        run: >-
+          uv run --locked --with biopython==1.88 --with numpy==1.26.4 pytest -q
+          server_tests/test_receptor_science.py::test_actual_rigid_structure_copy_recovers_frame_and_original_residue_correspondence
+      - name: Actual compiled interface runtime, modified polymers and existing receptor handoff
+        env:
+          WB_TEST_NATIVE_COMPARISON: "1"
+          WB_TEST_NATIVE_RECEPTORS: "1"
+          WB_TEST_COMPARISON_BROWSER: "1"
+        run: >-
+          uv run --locked --group browser --with biopython==1.88 --with numpy==1.26.4 pytest -x -q
+          server_tests/test_native_structure_comparison.py
+          server_tests/test_native_receptors.py::test_actual_receptor_environment_and_reusable_persistent_alignment_collection
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-structure-comparison-runtime-controls
+          path: server_tests/evidence/structure-comparison/**
+          if-no-files-found: warn

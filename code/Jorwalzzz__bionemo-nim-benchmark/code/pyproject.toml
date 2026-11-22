@@ -1,0 +1,111 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jorwal"
+version = "2.2.0"
+description = "Benchmark suite and interactive cockpit for NVIDIA BioNeMo & NIM microservices (ESM-2, DiffDock, MolMIM, ESMFold)."
+readme = "README.md"
+authors = [
+  { name = "Jorwal", email = "contact@jorwal.dev" },
+  { name = "Jorwalzzz", email = "jorwalzzz@users.noreply.github.com" }
+]
+license = { text = "AGPL-3.0-only" }
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Healthcare Industry",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: OS Independent",
+]
+keywords = [
+  "jorwal",
+  "jorwalzzz",
+  "nvidia",
+  "bionemo",
+  "nim",
+  "diffdock",
+  "esmfold",
+  "molmim",
+  "drug-discovery",
+  "biophysics",
+  "cheminformatics"
+]
+dependencies = [
+  "requests>=2.31.0",
+  "rdkit>=2023.09.1",
+  "numpy>=1.26",
+  "pandas>=2.0.0",
+  "matplotlib>=3.8.0",
+  "seaborn>=0.13.0",
+  "python-dotenv>=1.0.0",
+  "reportlab>=4.2.0",
+  "fastapi>=0.110.0",
+  "uvicorn>=0.28.0",
+  "pydantic>=2.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4.0",
+  "pytest-cov>=4.1.0",
+  "httpx>=0.27.0",
+  "mcp>=1.2.0,<2",
+  "biopython>=1.81",
+  "tqdm>=4.66.0",
+  "ruff>=0.4.0",
+  "bandit>=1.7.5",
+  "pip-audit>=2.6.0"
+]
+cpu = [
+  "torch>=2.0.0",
+  "transformers>=4.35.0"
+]
+all = [
+  "jorwal[dev,cpu]"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["bionemo_benchmark*"]
+
+[project.urls]
+Homepage = "https://github.com/Jorwalzzz/bionemo-nim-benchmark"
+Documentation = "https://github.com/Jorwalzzz/bionemo-nim-benchmark#readme"
+Repository = "https://github.com/Jorwalzzz/bionemo-nim-benchmark.git"
+Issues = "https://github.com/Jorwalzzz/bionemo-nim-benchmark/issues"
+"Trademark Policy" = "https://github.com/Jorwalzzz/bionemo-nim-benchmark/blob/main/TRADEMARK.md"
+
+[project.scripts]
+jorwal = "serve_cockpit:main"
+jorwal-nim = "serve_cockpit:main"
+bionemo-benchmark = "run_benchmark:main"
+bionemo-mcp = "bionemo_benchmark.mcp.server:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+  "E501",  # line length handled by formatter/soft limit
+  "B008",  # do not perform function calls in argument defaults (FastAPI Depends)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_mcp_server.py" = ["E402"]
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", "Lenia", "scratch", "node_modules", "jidu6411_flash"]
+skips = []

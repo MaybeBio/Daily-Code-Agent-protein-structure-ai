@@ -1,0 +1,516 @@
+"""Figures for the mutational scan.
+
+The headline figure is a diverging ddG heatmap centred on zero. The original
+notebook used a sequential ``Blues_r`` map, which hides the sign of the effect;
+ddG is signed and the sign is the whole point, so a diverging map with a
+symmetric, percentile-clipped range is used instead. Clipping matters because a
+single buried clash can reach +60 REU and would otherwise flatten the entire
+colour scale.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib
+import numpy as np
+import pandas as pd
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.colors import TwoSlopeNorm  # noqa: E402
+
+from .logging_utils import get_logger
+
+DPI = 300
+
+#: Readable labels for TMol's score-term code identifiers, condensed from
+#: Table S1 of the TMol paper (arXiv:2611.21857). Used on the decomposition
+#: figure, where `fa_ljatr` tells a non-Rosetta reader nothing.
+TERM_LABELS = {
+    "fa_ljatr": "LJ attraction",
+    "fa_ljrep": "LJ repulsion",
+    "fa_lk": "LK solvation",
+    "fa_elec": "electrostatics",
+    "hbond": "H bonding",
+    "lk_ball": "directional hydration",
+    "lk_ball_iso": "isotropic hydration",
+    "lk_bridge": "water bridge",
+    "lk_bridge_uncpl": "water bridge (uncoupled)",
+    "rama": "Ramachandran",
+    "omega": "omega torsion",
+    "dunbrack_rot": "Dunbrack rotamer prob.",
+    "dunbrack_rotdev": "Dunbrack deviation",
+    "dunbrack_semirot": "Dunbrack semi-rotameric",
+    "ref": "reference energy",
+    "disulfide": "disulfide geometry",
+    "cart_lengths": "bond lengths",
+    "cart_angles": "bond angles",
+    "cart_torsions": "bond torsions",
+    "cart_impropers": "improper torsions",
+    "cart_hxltorsions": "hydroxyl torsions",
+    "gen_torsions": "generic bonded",
+    "na_torsion": "nucleic-acid torsions",
+    "na_torsion_well": "nucleic-acid wells",
+    "metal_coordination": "metal coordination",
+    "constraint": "constraints",
+}
+
+
+def term_label(identifier: str) -> str:
+    """Readable name for a score term, falling back to its code identifier."""
+    return TERM_LABELS.get(identifier, identifier)
+
+
+def _save(fig, outdir: Path, stem: str, also_pdf: bool = True) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+    fig.savefig(outdir / f"{stem}.png", dpi=DPI, bbox_inches="tight")
+    if also_pdf:
+        fig.savefig(outdir / f"{stem}.pdf", bbox_inches="tight")
+    plt.close(fig)
+    get_logger().info("wrote %s", outdir / f"{stem}.png")
+
+
+def _figsize(table: pd.DataFrame) -> tuple[float, float]:
+    width = max(6.0, 0.45 * table.shape[1] + 3.0)
+    height = max(4.0, 0.32 * table.shape[0] + 2.0)
+    return width, min(height, 40.0)
+
+
+def _heatmap(
+    table: pd.DataFrame,
+    title: str,
+    cbar_label: str,
+    *,
+    cmap: str,
+    norm=None,
+    annotate: bool = False,
+    fmt: str = "{:.1f}",
+):
+    fig, ax = plt.subplots(figsize=_figsize(table))
+    data = table.to_numpy(dtype=float)
+    masked = np.ma.masked_invalid(data)
+    cmap_obj = matplotlib.colormaps[cmap].with_extremes(bad="0.88")
+    image = ax.imshow(masked, aspect="auto", cmap=cmap_obj, norm=norm, interpolation="nearest")
+
+    ax.set_xticks(range(table.shape[1]), table.columns, fontsize=9)
+    ax.set_yticks(range(table.shape[0]), table.index, fontsize=8)
+    ax.set_xlabel("substitution")
+    ax.set_ylabel("position (wild-type residue)")
+    ax.set_title(title)
+    ax.set_xticks(np.arange(-0.5, table.shape[1], 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, table.shape[0], 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=0.6)
+    ax.tick_params(which="minor", length=0)
+
+    if annotate and table.size <= 900:
+        mid = np.nanmean(np.abs(data)) if np.isfinite(data).any() else 0.0
+        for i in range(table.shape[0]):
+            for j in range(table.shape[1]):
+                value = data[i, j]
+                if not np.isfinite(value):
+                    continue
+                ax.text(
+                    j,
+                    i,
+                    fmt.format(value),
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    color="white" if abs(value) > 1.8 * mid else "black",
+                )
+
+    bar = fig.colorbar(image, ax=ax, fraction=0.025, pad=0.02)
+    bar.set_label(cbar_label)
+    return fig
+
+
+def _symmetric_norm(data: np.ndarray, clip_percentile: float = 98.0) -> TwoSlopeNorm:
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return TwoSlopeNorm(vmin=-1.0, vcenter=0.0, vmax=1.0)
+    limit = float(np.percentile(np.abs(finite), clip_percentile))
+    limit = max(limit, 1e-3)
+    return TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
+
+
+def plot_ddg_heatmap(
+    mats: dict[str, pd.DataFrame],
+    outdir: Path,
+    *,
+    annotate: bool = False,
+    stats: pd.DataFrame | None = None,
+) -> None:
+    """Mean ddG, with a symmetric diverging scale clipped at the 98th percentile.
+
+    Since v0.3.0 strain-flagged cells are blanked rather than drawn. On the
+    SKEMPI benchmark those predictions were anti-predictive -- Pearson r of
+    -0.09 with the sign wrong 84% of the time -- so showing them is worse than
+    showing nothing. They remain in the CSV outputs.
+    """
+    table = mats["ddg_mean"]
+    n_blanked = 0
+    if stats is not None and "trust" in stats.columns:
+        table = table.copy()
+        excluded = stats[(stats.trust == "none") & ~stats.is_wt_self]
+        for row in excluded.itertuples():
+            label = f"{row.position} ({row.wt_aa})"
+            if label in table.index and row.mut_aa in table.columns:
+                table.loc[label, row.mut_aa] = np.nan
+                n_blanked += 1
+    norm = _symmetric_norm(table.to_numpy(dtype=float))
+    subtitle = "blue = stabilizing (ddG < 0), red = destabilizing"
+    if n_blanked:
+        subtitle += f"\ngrey = {n_blanked} strain-flagged cell(s) withheld as unreliable"
+    fig = _heatmap(
+        table,
+        "Mean interface ddG across the conformational ensemble\n" + subtitle,
+        "ddG (REU)",
+        cmap="RdBu_r",
+        norm=norm,
+        annotate=annotate,
+    )
+    _save(fig, outdir, "ddg_mean_heatmap")
+
+
+def plot_sd_heatmap(mats: dict[str, pd.DataFrame], outdir: Path) -> None:
+    """Conformational spread of each substitution."""
+    table = mats["ddg_sd"]
+    fig = _heatmap(
+        table,
+        "Standard deviation of ddG across the ensemble\n"
+        "high values mark substitutions whose effect depends on the conformer",
+        "SD of ddG (REU)",
+        cmap="viridis",
+    )
+    _save(fig, outdir, "ddg_sd_heatmap")
+
+
+def plot_significant_heatmap(
+    mats: dict[str, pd.DataFrame], outdir: Path, *, alpha: float = 0.05
+) -> None:
+    """Mean ddG with substitutions that fail the FDR threshold greyed out."""
+    mean = mats["ddg_mean"].copy()
+    q = mats["qvalue"]
+    mean = mean.where(q < alpha)
+    if not np.isfinite(mean.to_numpy(dtype=float)).any():
+        get_logger().warning(
+            "no substitution reached FDR < %.3g; skipping the significance heatmap", alpha
+        )
+        return
+    norm = _symmetric_norm(mean.to_numpy(dtype=float))
+    fig = _heatmap(
+        mean,
+        f"Mean ddG, showing only substitutions with FDR q < {alpha:g}\n"
+        "grey = not distinguishable from zero across the ensemble",
+        "ddG (REU)",
+        cmap="RdBu_r",
+        norm=norm,
+        annotate=True,
+    )
+    _save(fig, outdir, "ddg_significant_heatmap")
+
+
+def plot_top_mutations(stats: pd.DataFrame, outdir: Path, *, top_n: int = 25) -> None:
+    """The lowest-ddG substitutions with 95% confidence intervals.
+
+    Ranked by mean ddG, so on a scan where nothing improves binding this is
+    simply the least damaging set -- the title says so rather than implying
+    every bar is an improvement.
+    """
+    real = stats[~stats.is_wt_self].sort_values("ddg_mean").head(top_n)
+    if real.empty:
+        return
+    labels = [
+        f"{row.wt_aa}{row.resnum}{row.mut_aa} ({row.chain})" for row in real.itertuples()
+    ]
+    y = np.arange(len(real))[::-1]
+    lower = (real.ddg_mean - real.ci95_low).fillna(0.0)
+    upper = (real.ci95_high - real.ddg_mean).fillna(0.0)
+
+    fig, ax = plt.subplots(figsize=(8.0, max(3.0, 0.34 * len(real) + 1.5)))
+    colors = ["#2c7fb8" if sig else "#bdbdbd" for sig in real.significant]
+    ax.barh(y, real.ddg_mean, color=colors, height=0.72)
+    ax.errorbar(
+        real.ddg_mean,
+        y,
+        xerr=[lower.clip(lower=0), upper.clip(lower=0)],
+        fmt="none",
+        ecolor="0.25",
+        elinewidth=1.0,
+        capsize=2.5,
+    )
+    ax.axvline(0.0, color="black", linewidth=0.9)
+    ax.set_yticks(y, labels, fontsize=8)
+    ax.set_xlabel("mean ddG (REU), error bars = 95% CI across conformers")
+    ax.set_title(
+        f"{len(real)} most favourable substitutions, ranked by mean ddG\n"
+        "ddG < 0 predicts tighter binding; "
+        "solid = significant after Benjamini-Hochberg FDR correction"
+    )
+    ax.grid(axis="x", alpha=0.3)
+    ax.set_axisbelow(True)
+    _save(fig, outdir, "top_mutations")
+
+
+def plot_position_profile(raw: pd.DataFrame, outdir: Path) -> None:
+    """Per-position distribution of ddG over all substitutions and conformers."""
+    from .stats import usable_rows
+
+    usable = usable_rows(raw)
+    usable = usable[usable.mut_name3 != usable.wt_name3]
+    if usable.empty:
+        return
+    order = (
+        usable[["position", "chain", "resnum", "icode", "wt_aa"]]
+        .drop_duplicates()
+        .sort_values(["chain", "resnum", "icode"])
+    )
+    groups = [usable[usable.position == p].ddg.to_numpy() for p in order.position]
+    labels = [f"{p}\n({w})" for p, w in zip(order.position, order.wt_aa)]
+
+    fig, ax = plt.subplots(figsize=(max(7.0, 0.46 * len(groups) + 2.0), 5.0))
+    parts = ax.violinplot(groups, showextrema=False, widths=0.85)
+    for body in parts["bodies"]:
+        body.set_facecolor("#9ecae1")
+        body.set_alpha(0.65)
+    ax.boxplot(groups, widths=0.22, showfliers=False, medianprops={"color": "crimson"})
+    ax.axhline(0.0, color="black", linewidth=0.9, linestyle="--")
+    ax.set_xticks(range(1, len(groups) + 1), labels, fontsize=7)
+    ax.set_ylabel("ddG (REU)")
+    ax.set_xlabel("scanned position (wild-type residue)")
+    ax.set_title(
+        "Tolerance to substitution per position\n"
+        "every substitution in every conformer; low median = position tolerates change"
+    )
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_axisbelow(True)
+    _save(fig, outdir, "position_profile")
+
+
+def plot_convergence(conv: pd.DataFrame, outdir: Path) -> None:
+    """Drift of the mean ddG matrix as conformers accumulate."""
+    if conv.empty or len(conv) < 3:
+        return
+    fig, (left, right) = plt.subplots(1, 2, figsize=(10.0, 4.0))
+    left.plot(conv.n_conformers, conv.mean_abs_drift, "o-", color="#2c7fb8", label="mean")
+    left.plot(conv.n_conformers, conv.max_abs_drift, "s--", color="#d95f0e", label="max")
+    left.set_xlabel("conformers included")
+    left.set_ylabel("|running mean - final mean| (REU)")
+    left.set_title("Convergence of the ddG matrix")
+    left.legend(frameon=False)
+    left.grid(alpha=0.3)
+
+    right.plot(conv.n_conformers, conv.mean_sem, "o-", color="#31a354")
+    right.set_xlabel("conformers included")
+    right.set_ylabel("mean SEM of ddG (REU)")
+    right.set_title("Precision vs ensemble size")
+    right.grid(alpha=0.3)
+    fig.suptitle(
+        "Flat curves mean the ensemble is large enough; "
+        "still-falling curves mean more conformers are needed",
+        fontsize=9,
+    )
+    _save(fig, outdir, "convergence")
+
+
+def plot_position_hotspots(summary: pd.DataFrame, outdir: Path) -> None:
+    """Wild-type interface contribution against substitution tolerance."""
+    if "wt_interface_contribution" not in summary.columns:
+        return
+    data = summary[np.isfinite(summary.wt_interface_contribution)]
+    if data.empty:
+        return
+    fig, ax = plt.subplots(figsize=(7.0, 5.5))
+    sizes = 30 + 14 * data.n_significant_stabilizing
+    points = ax.scatter(
+        data.wt_interface_contribution,
+        data.mean_ddg_all_substitutions,
+        c=data.best_ddg_mean,
+        s=sizes,
+        cmap="RdBu_r",
+        norm=_symmetric_norm(data.best_ddg_mean.to_numpy(dtype=float)),
+        edgecolor="0.3",
+        linewidth=0.5,
+    )
+    for row in data.itertuples():
+        ax.annotate(
+            f"{row.wt_aa}{row.resnum}",
+            (row.wt_interface_contribution, row.mean_ddg_all_substitutions),
+            fontsize=7,
+            xytext=(3, 3),
+            textcoords="offset points",
+        )
+    ax.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+    ax.set_xlabel("wild-type contribution to the interface energy (REU)")
+    ax.set_ylabel("mean ddG over all substitutions (REU)")
+    ax.set_title(
+        "Hotspots and tolerance\n"
+        "left = residue already binds strongly; high = position resists substitution\n"
+        "marker size = number of significant stabilizing substitutions"
+    )
+    bar = fig.colorbar(points, ax=ax, fraction=0.04)
+    bar.set_label("best ddG at the position (REU)")
+    ax.grid(alpha=0.3)
+    ax.set_axisbelow(True)
+    _save(fig, outdir, "position_hotspots")
+
+
+def plot_term_decomposition(terms: pd.DataFrame, stats: pd.DataFrame, outdir: Path, *, top_n: int = 20) -> None:
+    """Per-score-term breakdown of the most stabilizing substitutions."""
+    if terms is None or terms.empty:
+        return
+    columns = [c for c in terms.columns if c.startswith("ddg_")]
+    if not columns:
+        return
+    best = stats[~stats.is_wt_self].sort_values("ddg_mean").head(top_n)
+    keys = set(zip(best.position, best.mut_name3))
+    chosen = terms[[(p, m) in keys for p, m in zip(terms.position, terms.mut_name3)]]
+    if chosen.empty:
+        return
+    grouped = chosen.groupby(["position", "mut_name3"])[columns].mean()
+    grouped = grouped.loc[:, grouped.abs().max() > 0.05]
+    if grouped.empty:
+        return
+    lookup = {(row.position, row.mut_name3): row.ddg_mean for row in best.itertuples()}
+    grouped = grouped.reindex(sorted(grouped.index, key=lambda k: lookup.get(k, 0.0)))
+    labels = [f"{p} {m}" for p, m in grouped.index]
+    grouped.index = labels
+    grouped.columns = [term_label(c.removeprefix("ddg_")) for c in grouped.columns]
+
+    norm = _symmetric_norm(grouped.to_numpy(dtype=float))
+    fig = _heatmap(
+        grouped,
+        "Score-term decomposition of the most stabilizing substitutions\n"
+        "which energy term each ddG comes from",
+        "ddG contribution (REU)",
+        cmap="RdBu_r",
+        norm=norm,
+        annotate=True,
+        fmt="{:.2f}",
+    )
+    fig.axes[0].set_ylabel("position and substitution")
+    fig.axes[0].set_xlabel("score term (TMol paper Table S1 naming)")
+    fig.axes[0].tick_params(axis="x", labelrotation=35)
+    for tick in fig.axes[0].get_xticklabels():
+        tick.set_horizontalalignment("right")
+    _save(fig, outdir, "term_decomposition")
+
+
+def plot_interface_vs_total(stats: pd.DataFrame, outdir: Path, *, strain_cutoff: float = 1.0) -> None:
+    """Interface ddG against whole-pose ddG, exposing hidden strain.
+
+    The reported ddG sums cross-partner pairs only, so intramolecular costs are
+    invisible to it. Points far below the diagonal improve the interface while
+    making the molecule worse overall: they are paying rotamer strain or an
+    intra-chain clash to buy interface contact, and should be distrusted.
+    """
+    if "ddg_total_mean" not in stats.columns:
+        return
+    real = stats[~stats.is_wt_self]
+    real = real[np.isfinite(real.ddg_mean) & np.isfinite(real.ddg_total_mean)]
+    if real.empty:
+        return
+
+    flagged = real[real.get("strain_flag", False) == True]  # noqa: E712
+    clean = real.drop(flagged.index)
+
+    fig, ax = plt.subplots(figsize=(6.8, 6.4))
+    limit = float(
+        np.nanpercentile(
+            np.abs(np.concatenate([real.ddg_mean, real.ddg_total_mean])), 99
+        )
+    )
+    limit = max(limit, 1.0)
+    ax.plot([-limit, limit], [-limit, limit], color="0.6", linewidth=0.9, zorder=1,
+            label="interface change = total change")
+    ax.axhline(0.0, color="black", linewidth=0.7)
+    ax.axvline(0.0, color="black", linewidth=0.7)
+    ax.scatter(clean.ddg_mean, clean.ddg_total_mean, s=26, c="#2c7fb8",
+               edgecolor="0.3", linewidth=0.4, zorder=3, label="consistent")
+    if not flagged.empty:
+        ax.scatter(flagged.ddg_mean, flagged.ddg_total_mean, s=52, c="#d7301f",
+                   marker="D", edgecolor="0.2", linewidth=0.5, zorder=4,
+                   label=f"hidden strain > {strain_cutoff:g} REU")
+        for row in flagged.sort_values("ddg_mean").head(12).itertuples():
+            ax.annotate(f"{row.wt_aa}{row.resnum}{row.mut_aa}",
+                        (row.ddg_mean, row.ddg_total_mean), fontsize=7,
+                        xytext=(4, -2), textcoords="offset points")
+
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.set_xlabel("interface ddG (REU) - what the scan reports")
+    ax.set_ylabel("whole-pose ddG (REU) - total score change")
+    ax.set_title(
+        "Does the interface gain survive the whole molecule?\n"
+        "bottom-right quadrant is the trap: interface improves, total worsens"
+    )
+    ax.legend(frameon=False, fontsize=8, loc="upper left")
+    ax.grid(alpha=0.3)
+    ax.set_axisbelow(True)
+    _save(fig, outdir, "interface_vs_total")
+
+
+def plot_trust_heatmap(stats: pd.DataFrame, mats: dict[str, pd.DataFrame], outdir: Path) -> None:
+    """Mean ddG shown only where the benchmark says the prediction is reliable.
+
+    High trust means a core position with an effect of at least the trust
+    cutoff and no strain flag: on the SKEMPI benchmark that regime reached
+    Pearson r = 0.59 with the sign right 95% of the time, against r = 0.22
+    and 70% elsewhere.
+    """
+    if stats is None or "trust" not in stats.columns:
+        return
+    table = mats["ddg_mean"].copy()
+    keep = {
+        (f"{r.position} ({r.wt_aa})", r.mut_aa)
+        for r in stats[(stats.trust == "high") & ~stats.is_wt_self].itertuples()
+    }
+    if not keep:
+        get_logger().info(
+            "no high-trust predictions, so the trust heatmap is skipped "
+            "(needs a core position with |ddG| above the trust cutoff)"
+        )
+        return
+    for label in table.index:
+        for column in table.columns:
+            if (label, column) not in keep:
+                table.loc[label, column] = np.nan
+    fig = _heatmap(
+        table,
+        f"High-trust predictions only ({len(keep)} of "
+        f"{int((~stats.is_wt_self).sum())})\n"
+        "core position, effect above the trust cutoff, no strain flag\n"
+        "benchmark: r = 0.59, sign correct 95% of the time in this regime",
+        "ddG (REU)",
+        cmap="RdBu_r",
+        norm=_symmetric_norm(mats["ddg_mean"].to_numpy(dtype=float)),
+        annotate=True,
+    )
+    _save(fig, outdir, "ddg_high_trust_heatmap")
+
+
+def make_all(
+    stats: pd.DataFrame,
+    summary: pd.DataFrame,
+    conv: pd.DataFrame,
+    mats: dict[str, pd.DataFrame],
+    raw: pd.DataFrame,
+    terms: pd.DataFrame | None,
+    outdir: Path,
+    *,
+    alpha: float = 0.05,
+    annotate: bool = False,
+    top_n: int = 25,
+) -> None:
+    """Produce every figure into ``outdir``."""
+    plot_ddg_heatmap(mats, outdir, annotate=annotate, stats=stats)
+    plot_trust_heatmap(stats, mats, outdir)
+    plot_sd_heatmap(mats, outdir)
+    plot_significant_heatmap(mats, outdir, alpha=alpha)
+    plot_top_mutations(stats, outdir, top_n=top_n)
+    plot_position_profile(raw, outdir)
+    plot_convergence(conv, outdir)
+    plot_position_hotspots(summary, outdir)
+    plot_interface_vs_total(stats, outdir)
+    plot_term_decomposition(terms, stats, outdir)

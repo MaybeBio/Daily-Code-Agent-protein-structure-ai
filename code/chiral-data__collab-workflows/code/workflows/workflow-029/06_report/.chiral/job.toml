@@ -1,0 +1,11 @@
+name        = "Campaign Report"
+description = "Generate a self-contained interactive HTML dashboard summarising the full binder design campaign: funnel chart, ranking table, iPTM vs ΔG scatter, top-N 3D viewer, and methodology notes."
+inputs      = ["folded", "results"]
+outputs     = ["report/index.html"]
+
+[container]
+image = "plotly-report:2026_06_30"
+
+[scripts]
+run = "run.sh"
+

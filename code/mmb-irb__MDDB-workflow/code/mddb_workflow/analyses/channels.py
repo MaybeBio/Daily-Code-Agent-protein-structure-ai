@@ -1,0 +1,130 @@
+from pathlib import Path
+import MDAnalysis as mda
+import subprocess
+from mddb_workflow.tools.get_reduced_trajectory import get_reduced_trajectory
+from mddb_workflow.utils.auxiliar import save_json, load_json
+from mddb_workflow.utils.file import File
+from mddb_workflow.utils.constants import OUTPUT_CHANNELS_FILENAME, CHANNELS_ANALYSIS_VERSION
+from mddb_workflow.tools.membrane_mapping import get_bilayers
+from mddb_workflow.utils.type_hints import *
+import json
+
+RESOURCES_DIR = str(Path(__file__).parent.parent / 'resources')
+# CHAP can not read mmCIF so we give it a PDB
+# Atoms are selected through an index file so chains do not matter
+CHAP_STRUCTURE_FILENAME = '.chap_structure.pdb'
+
+
+def _parse_chap_residue_fractions(pdb_file: Path) -> dict[str, list[float]]:
+    """Parse residue-level pore-lining and pore-facing fractions from CHAP output."""
+    # https://www.channotation.org/docs/contents_pdb_file/
+    residue_fractions = {}
+    if not Path(pdb_file).exists():
+        return residue_fractions
+    pore_lining = []
+    pore_facing = []
+    residue_keys = []
+    with open(pdb_file, 'r') as pdb_handle:
+        for line in pdb_handle:
+            if not line.startswith(('ATOM', 'HETATM')):
+                continue
+
+            chain_id = line[21].strip() or '_'
+            residue_index = line[22:26].strip()
+            insertion_code = line[26].strip()
+            residue_key = f'{chain_id}:{residue_index}{insertion_code}' if insertion_code else f'{chain_id}:{residue_index}'
+
+            # Atoms of the same residue are consecutive
+            # Note that chain names may be repeated in the PDB so the same key may appear in different residues
+            if len(residue_keys) > 0 and residue_key == residue_keys[-1]:
+                continue
+
+            residue_keys.append(residue_key)
+            pore_lining.append(float(line[54:60]))
+            pore_facing.append(float(line[60:66]))
+
+    return {'pore_lining': pore_lining, 'pore_facing': pore_facing}
+
+
+def channels(
+    membrane_map: dict,
+    universe: 'Universe',
+    structure: 'Structure',
+    output_directory: str,
+    thickness_analysis: dict,
+    cg_residues: list[int],
+    snapshots: int,
+    frames_limit: int
+):
+    """Characterize channels in a membrane protein using CHAP."""
+    if len(get_bilayers(membrane_map)) == 0:
+        print('  -> No flat bilayers found, skipping channels analysis')
+        return
+    if universe.select_atoms('protein').n_atoms == 0:
+        print('  -> No protein found, skipping channels analysis')
+        return
+    print('  -> Running channels analysis')
+    frame = 0
+    top = thickness_analysis['data']['mean_positive'][frame] + thickness_analysis['data']['midplane_z'][frame]
+    bot = thickness_analysis['data']['mean_negative'][frame] + thickness_analysis['data']['midplane_z'][frame]
+    # Select protein between membrane planes
+    TM_at = universe.select_atoms(f'protein and prop z > {bot} and prop z < {top}').residues.atoms
+    with mda.selections.gromacs.SelectionWriter(f'{output_directory}/membrane_atoms.ndx', mode='w') as ndx:
+        # chain X (ligand) is removed so CHAP can calculate the pore facing residues
+        # This is explained in the Pathway-Mapping Parameters section of the docs
+        ndx.write(universe.select_atoms('protein and not chainID X').atoms, name='Protein')
+        ndx.write(TM_at, name='membrane_atoms')
+    pdb = Path(f'{output_directory}/{CHAP_STRUCTURE_FILENAME}').absolute()
+    structure.generate_pdb_file(str(pdb), show_warnings=False, accept_limitations=True)
+    reduced_trajectory_file, frame_step, n_frames = get_reduced_trajectory(
+        input_trajectory_file=File(universe.trajectory.filename),
+        snapshots=snapshots,
+        reduced_trajectory_frames_limit=frames_limit
+    )
+    cmd = ["chap",
+           "-f", str(Path(reduced_trajectory_file).absolute()),
+           "-s", str(pdb),
+           "-n", "membrane_atoms.ndx",
+           "-sel-pathway", "0",
+           "-pf-sel-ipp", "1",
+           "-hydrophob-fallback", "0",  # hardcoded value for weird named residues
+           "-pf-vdwr-database", "user",
+           "-pf-vdwr-json", RESOURCES_DIR + "/chap_vdw.json",
+           "-hydrophob-database", "user",
+           "-hydrophob-json", RESOURCES_DIR + "/chap_hydrophobicity.json",
+           "-out-num-points", "200",
+           "-out-detailed"
+    ]
+    if len(cg_residues) > 0:
+        cmd.append("-pf-vdwr-fallback 0.4")  # hardcoded value for CG
+    cmd = ' '.join(cmd)
+    print('  -> Running command:', cmd)
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=output_directory)
+    if result.returncode != 0:
+        failt_str = 'Pore radius at initial probe position is infinite'
+        if failt_str in result.stderr:
+            print('  -> No channels found.')
+            pdb.unlink()
+            return
+        # Temporal raise to detect and fix possible issues with CHAP execution,
+        # but we should handle this more gracefully in the future
+        raise RuntimeError(f'CHAP command failed with return code {result.returncode}. Stderr: {result.stderr}')
+    pdb.unlink()
+    output = load_json(f'{output_directory}/output.json')
+    stream = f'{output_directory}/stream_output.json'
+    stream_data = []
+    # Each line in the stream output is a JSON object
+    with open(stream, 'r') as f:
+        for line in f:
+            stream_data.append(json.loads(line))
+
+    data_to_save = {
+        'data': {
+            'output': output,
+            'stream': stream_data,
+            'pore_residues': _parse_chap_residue_fractions(
+                f"{output_directory}/output.pdb"),
+        },
+        'version': CHANNELS_ANALYSIS_VERSION,
+    }
+    save_json(data_to_save, output_directory + '/' + OUTPUT_CHANNELS_FILENAME)

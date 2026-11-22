@@ -1,0 +1,38 @@
+/*
+ * What this page adds to Studio's page. The Design card (its start screen, job editor, run settings and designs) and the
+ * simple view of Studio around it come with Studio (`window.atomworksStudio.mountDesignCard` installs their stylesheets);
+ * only this is the page's: the guide popup.
+ */
+
+/* The side panel's scrollbar always shown (macOS hides overlay scrollbars until a scroll), so a long card reads as
+   scrollable. Styling ::-webkit-scrollbar makes Chrome draw a classic, always-visible bar. */
+#atomworks-studio-popover::-webkit-scrollbar { width: 10px; }
+#atomworks-studio-popover::-webkit-scrollbar-track { background: var(--surface-recessed, #1b1c1e); }
+#atomworks-studio-popover::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-muted, #b1b3b9) 55%, transparent); border: 2px solid var(--surface-recessed, #1b1c1e); border-radius: 5px;
+}
+#atomworks-studio-popover::-webkit-scrollbar-thumb:hover { background: var(--text-muted, #b1b3b9); }
+.rfd4p-generate-row .rfd4p-generate-btn { width: auto; }
+.rfd4p-generate-row .rfd4p-designs-count { width: 56px; height: 34px; box-sizing: border-box; }
+#rfd4p-studio-card .rfd4p-link-btn, .rfd4p-piece-pop .rfd4p-link-btn {
+  min-height: 0; padding: 0; border: 0; background: none; color: var(--accent, #82aaff); font: inherit; text-decoration: underline; cursor: pointer;
+}
+/* A source's caption (click: replace) and its ×, shown while the caption is pointed at (always on touch screens). */
+#rfd4p-studio-card .rfd4p-source-row { display: flex; align-items: center; gap: 4px; min-width: 0; }
+#rfd4p-studio-card .rfd4p-source-row .rfd4p-source { min-width: 0; }
+#rfd4p-studio-card .rfd4p-source-x { flex: none; opacity: 0; }
+#rfd4p-studio-card .rfd4p-source-row:hover .rfd4p-source-x,
+#rfd4p-studio-card .rfd4p-source-row:focus-within .rfd4p-source-x { opacity: 1; }
+@media (hover: none) { #rfd4p-studio-card .rfd4p-source-x { opacity: 1; } }
+#rfd4p-fetch-status:empty { display: none; }
+#rfd4p-studio-card:not(.rfd4p-starting) #rfd4p-examples { display: none; }
+.rfd4p-piece-pop .rfd4p-pop-static { align-self: center; font-size: 12px; }
+/* A piece's residues: from – to boxes, as new residues' length. */
+.rfd4p-piece-pop .rfd4p-ranges-wrap, .rfd4p-piece-pop .rfd4p-ranges { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
+.rfd4p-piece-pop .rfd4p-range { display: inline-flex; align-items: center; gap: 4px; }
+.rfd4p-piece-pop .rfd4p-range input { width: 64px; }
+/* The "+" popup: label, what to add, Add, the Add buttons in one column. */
+.rfd4p-piece-pop .rfd4p-slot-row { display: grid; grid-template-columns: 76px minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+
+/* The "+" popup's boxes, new residues' and the entry's, one size so they line up. */
+.rfd4p-piece-pop .rfd4p-slot-row input[type=number] { width: 64px; }

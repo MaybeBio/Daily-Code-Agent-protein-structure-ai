@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=77", "versioneer[toml]", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MDANCE"
+dynamic = ["version"]
+authors = [
+  { name="Jherome Brylle Woody Santos", email="ja.santos@ufl.edu"},
+  { name="Lexin Chen", email="le.chen@ufl.edu" },
+  { name="Micah Smith" },
+  { name="Ramón Alain Miranda Quintana" },
+]
+description = "a flexible n-ary clustering package for all applications."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+  "numpy >= 1.20.0",
+  "scikit-learn >= 0.24.0",
+  "MDAnalysis >= 2.0.0",
+  "scipy >= 1.6.0",
+  "matplotlib >= 3.3.0",
+  "cycler >= 0.10.0",
+]
+
+[project.urls]
+Homepage = "https://mqcomplab.github.io/MDANCE/"
+Documentation = "https://mdance.readthedocs.io/en/latest/"
+Repository = "https://github.com/mqcomplab/MDANCE"
+Issues = "https://github.com/mqcomplab/MDANCE/issues"
+
+[project.scripts]
+prime_sim = "mdance.cli.prime_sim:main"
+prime_rep = "mdance.cli.prime_rep:main"
+
+[tool.setuptools.package-data]
+"mdance.data" = ["*.csv", "*.npy", "*.pdb", "*.dcd", "ala_pathways/*.csv"]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "mdance.__version__"}
+
+[project.optional-dependencies]
+dev = [
+  "pytest >= 7.0",
+]

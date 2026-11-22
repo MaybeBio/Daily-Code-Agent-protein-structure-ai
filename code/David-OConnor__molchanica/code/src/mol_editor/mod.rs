@@ -1,0 +1,1544 @@
+pub mod add_atoms;
+pub mod templates;
+
+use std::{
+    collections::HashMap,
+    io,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
+    time::Instant,
+};
+
+use bio_apis::{
+    ReqError,
+    pubchem::{self, StructureSearchNamespace},
+};
+use bio_files::{BondType, Mol2, Pdbqt, Sdf, SdfFormat, Xyz, md_params::ForceFieldParams};
+use dynamics::{
+    ComputationDevice, FfMolType, HydrogenConstraint, Integrator, MdConfig, MdOverrides, MdState,
+    MolDynamics, ParamError, Solvent, TAU_TEMP_DEFAULT, params::FfParamSet, snapshot::Snapshot,
+};
+use egui::FontFamily;
+use graphics::{ControlScheme, EngineUpdates, Entity, EntityUpdate, FWD_VEC, Scene, TextOverlay};
+use lin_alg::{
+    f32::{Quaternion as QuaternionF32, Vec3 as Vec3F32},
+    f64::Vec3,
+};
+use mol_defs::{
+    bond_inference::create_hydrogen_bonds_two_mols,
+    mol_components::MolComponents,
+    molecules::{
+        Atom, Bond, HydrogenBondTwoMols, MolGenericRef, MolIdent, MolType, common::MoleculeCommon,
+        small::MoleculeSmall,
+    },
+};
+use na_seq::{
+    AtomTypeInRes,
+    Element::{Carbon, Hydrogen},
+};
+
+use crate::{
+    cam,
+    cam::MOVE_TO_CAM_DIST,
+    drawing::{
+        EntityClass, LABEL_COLOR_ATOM, MESH_BALL_STICK_SPHERE, MESH_SPACEFILL_SPHERE, MoleculeView,
+        atoms_bonds::{
+            ATOM_SHININESS, BALL_STICK_RADIUS, BALL_STICK_RADIUS_H, atom_color, bond_entities,
+        },
+        draw_mol_with_pharmacophore_visibility, draw_pocket,
+    },
+    file_io::managed_mols,
+    mol_manip::ManipMode,
+    prefs::OpenType,
+    render::{set_flashlight, set_static_light},
+    selection::{Selection, ViewSelLevel},
+    split_join::start_structure_lookup,
+    state::{OperatingMode, PrimaryModeCam, State, StateUi},
+    ui::util::handle_redraw,
+    util::{RedrawFlags, aromatic_ring_centroid, create_smiles, find_neighbor_posit, handle_err},
+};
+
+pub const INIT_CAM_DIST: f32 = 20.;
+
+// Set a higher value to place the light farther away. (More uniform, dimmer lighting)
+pub const STATIC_LIGHT_MOL_SIZE: f32 = 500.;
+
+const MOL_IDENT: &str = "editor_mol";
+const MAX_RELAX_ITERS: usize = 300;
+
+/// Molecules added from the editor are named e.g. "Editor 0", or "Editor | 1123 | Taurine" if
+/// PubChem knows the structure.
+const EDITOR_NAME_PREFIX: &str = "Editor";
+
+pub struct MdEditor {
+    pub md: Option<MdState>,
+    pub mol_specific_params: ForceFieldParams,
+    /// Picoseconds per integration step.
+    pub dt: f32,
+    /// Milliseconds between simulation updates.
+    pub time_between_runs: f32,
+    pub running: bool,
+    pub solvent: Solvent,
+    pub snap: Option<Snapshot>,
+    pub last_dt_run: Instant,
+    pub rebuild_required: bool,
+    pub steps_per_update: usize,
+    pub pull_strength: f32,
+    pub pull_target: Option<(usize, Vec3F32)>,
+    pending_pull: Option<(usize, Vec3F32)>,
+    pub pinned_atoms: Vec<usize>,
+    pub error: Option<String>,
+}
+
+impl Default for MdEditor {
+    fn default() -> Self {
+        Self {
+            md: Default::default(),
+            solvent: Solvent::None,
+            mol_specific_params: Default::default(),
+            dt: 0.0001,
+            time_between_runs: 33.333,
+            running: Default::default(),
+            last_dt_run: Instant::now(),
+            snap: Default::default(),
+            rebuild_required: Default::default(),
+            steps_per_update: 20,
+            pull_strength: 20.,
+            pull_target: None,
+            pending_pull: None,
+            pinned_atoms: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+/// Bounded spring force, in kcal/mol/Å.
+fn pull_force(displacement: Vec3F32, strength: f32) -> Vec3F32 {
+    let force = displacement * strength;
+    let magnitude = force.magnitude();
+    if !magnitude.is_finite() {
+        return Vec3F32::new_zero();
+    }
+
+    force * (100. / magnitude.max(100.))
+}
+
+impl MdEditor {
+    pub(crate) fn set_pull_target(&mut self, index: usize, target: Vec3F32) {
+        self.pull_target = Some((index, target));
+        self.pending_pull = self.pull_target;
+    }
+
+    pub(crate) fn clear_pull(&mut self) {
+        self.pull_target = None;
+        self.pending_pull = None;
+    }
+
+    fn invalidate(&mut self) {
+        self.md = None;
+        self.snap = None;
+        self.clear_pull();
+        self.pinned_atoms.clear();
+        self.error = None;
+        self.rebuild_required = true;
+    }
+
+    pub fn set_pinned(&mut self, indices: &[usize], pinned: bool) {
+        let Some(md) = &mut self.md else {
+            return;
+        };
+
+        for &i in indices {
+            let Some(atom) = md.atoms.get_mut(i) else {
+                continue;
+            };
+
+            atom.static_ = pinned;
+            atom.vel = Vec3F32::new_zero();
+            atom.accel = Vec3F32::new_zero();
+            if pinned && !self.pinned_atoms.contains(&i) {
+                self.pinned_atoms.push(i);
+            } else if !pinned {
+                self.pinned_atoms.retain(|&index| index != i);
+            }
+        }
+    }
+}
+
+/// For editing small organic molecules.
+pub struct MolEditorState {
+    pub mol: MoleculeSmall,
+    /// Hydrogen bonds between the mol and pocket.
+    pub h_bonds: Vec<HydrogenBondTwoMols>,
+    /// I.e. state.ligands[i]. For instance, we replace this in the primary state
+    /// if "updating".
+    pub mol_i_in_state: Option<usize>,
+    /// I.e. state.pockets[i]
+    pub pocket_i_in_state: Option<usize>,
+    pub md: MdEditor,
+    /// Bond index.
+    // todo: DRY with mol char?
+    pub rotatable_bonds: Vec<usize>,
+    pub selected_comp: Option<usize>,
+    pub show_pharmacophore_renders: bool,
+    // todo: Separate `visibility` substruct like we have in `StateUi` ?
+    pub show_atom_sns: bool,
+    /// Our SMILES for the molecule's current structure. Kept up to date by `refresh_smiles`.
+    pub smiles: String,
+    /// Where the "Check DBs" PubChem lookup stands for the molecule's current structure. `None`
+    /// if not checked since the last structural edit.
+    pub db_check: Option<DbCheck>,
+    /// For naming molecules added from the editor, e.g. "Editor 0", "Editor 1".
+    pub next_name_i: usize,
+}
+
+impl Default for MolEditorState {
+    fn default() -> Self {
+        Self {
+            mol: Default::default(),
+            h_bonds: Default::default(),
+            mol_i_in_state: Default::default(),
+            pocket_i_in_state: Default::default(),
+            md: Default::default(),
+            rotatable_bonds: Default::default(),
+            selected_comp: Default::default(),
+            show_pharmacophore_renders: Default::default(),
+            show_atom_sns: true,
+            smiles: Default::default(),
+            db_check: Default::default(),
+            next_name_i: Default::default(),
+        }
+    }
+}
+
+/// The editor's atom serial number label. This is independent of `LabelVis::atom_sn`, and colored
+/// differently from the pharmacophore feature numbering, so the two aren't confused.
+pub fn atom_sn_label(atom: &Atom, size: f32) -> TextOverlay {
+    TextOverlay {
+        text: atom.serial_number.to_string(),
+        size,
+        color: LABEL_COLOR_ATOM,
+        font_family: FontFamily::Proportional,
+    }
+}
+
+/// The outcome of looking up the editor's molecule in PubChem by its SMILES.
+#[derive(Clone, Copy, PartialEq)]
+pub enum DbCheck {
+    Pending,
+    /// PubChem has this structure; its CID and other identifiers are in the molecule's `idents`.
+    Found,
+    NotFound,
+    /// E.g. from a network problem.
+    Failed,
+}
+
+impl MolEditorState {
+    /// For now, sets up a pair of single-bonded carbon atoms.
+    pub fn clear_mol(&mut self, sel: &mut Selection) {
+        // todo: Change this dist; rough start.
+        const DIST: f64 = 1.3;
+
+        self.md.invalidate();
+
+        // Start from a fresh molecule, so nothing (identifiers, name, metadata, source file etc.)
+        // carries over from the one this replaces. Keep the pocket, if any: it's what the
+        // molecule is being designed for, not part of it.
+        let pocket = self.mol.pharmacophore.pocket.take();
+        self.mol = MoleculeSmall::default();
+        self.mol.common.ident = MOL_IDENT.to_owned();
+        self.mol.pharmacophore.pocket = pocket;
+        self.h_bonds.clear();
+
+        let mol = &mut self.mol.common;
+
+        mol.atoms = vec![
+            Atom {
+                serial_number: 1,
+                posit: Vec3::new_zero(),
+                element: Carbon,
+                type_in_res: Some(AtomTypeInRes::C), // todo: no; fix this
+                force_field_type: Some("ca".to_owned()), // todo: A/R
+                partial_charge: Some(0.),            // todo: A/R,
+                ..Default::default()
+            },
+            Atom {
+                serial_number: 2,
+                posit: Vec3::new(DIST, 0., 0.),
+                element: Carbon,
+                type_in_res: Some(AtomTypeInRes::C), // todo: no; fix this
+                force_field_type: Some("ca".to_owned()), // todo: A/R
+                partial_charge: Some(0.),            // todo: A/R,
+                ..Default::default()
+            },
+        ];
+
+        mol.bonds = vec![Bond {
+            bond_type: BondType::Single,
+            atom_0_sn: 1,
+            atom_1_sn: 2,
+            atom_0: 0,
+            atom_1: 1,
+            is_backbone: false,
+        }];
+
+        *sel = Selection::None;
+        mol.reset_posits();
+        mol.build_adjacency_list();
+        mol.reassign_sns();
+
+        // Forces the refresh, as the identifiers were cleared above.
+        self.smiles.clear();
+        self.refresh_smiles();
+    }
+
+    /// Regenerate our SMILES from the molecule's structure. If the structure changed, identifiers
+    /// from before (e.g. a CID found by "Check DBs", or those of the molecule loaded) no longer
+    /// describe it, so this replaces them with the new SMILES.
+    pub fn refresh_smiles(&mut self) {
+        // Not all edits keep the adjacency list current; SMILES generation (and MD) use it.
+        self.mol.common.build_adjacency_list();
+        let smiles = create_smiles(&self.mol.common);
+
+        if smiles == self.smiles {
+            return;
+        }
+
+        self.mol.idents.clear();
+        self.mol.clear_safety_data();
+        if !smiles.is_empty() {
+            self.mol.idents.push(MolIdent::Smiles(smiles.clone()));
+        }
+
+        self.smiles = smiles;
+        self.db_check = None;
+    }
+
+    /// Apply a PubChem lookup of the molecule, from `check_dbs`. `smiles` is what we looked up;
+    /// if the molecule changed since, the result is for a different structure, and is ignored.
+    fn apply_db_check(&mut self, smiles: &str, props: Option<&pubchem::Properties>) {
+        if smiles != self.smiles {
+            return;
+        }
+
+        // PubChem answers a structure it doesn't have with CID 0.
+        self.db_check = match props {
+            Some(p) if p.cid != 0 => {
+                self.mol.update_idents_and_char_from_pubchem(p);
+                Some(DbCheck::Found)
+            }
+            Some(_) => Some(DbCheck::NotFound),
+            None => Some(DbCheck::Failed),
+        };
+    }
+
+    /// The editor's molecule as a new compound, e.g. for adding to state. Only its structure and
+    /// pharmacophore come along: identifiers, metadata, source file etc. are those of any
+    /// molecule it was loaded from, which it may no longer be. See `name_edited_mol`.
+    fn to_new_mol(&mut self) -> MoleculeSmall {
+        self.mol.common.reassign_sns();
+        self.mol.common.build_adjacency_list();
+
+        let common = &self.mol.common;
+
+        let mut result = MoleculeSmall {
+            common: MoleculeCommon {
+                atoms: common.atoms.clone(),
+                bonds: common.bonds.clone(),
+                adjacency_list: common.adjacency_list.clone(),
+                next_atom_sn: common.next_atom_sn,
+                ..Default::default()
+            },
+            pharmacophore: self.mol.pharmacophore.clone(),
+            components: self.mol.components.clone(),
+            ..Default::default()
+        };
+
+        // In the editor, atom positions are the source of truth.
+        result.common.reset_posits();
+        result.update_characterization();
+        result
+    }
+
+    /// A simplified variant of our primary `open_molecule` function.
+    pub fn open_molecule(
+        &mut self,
+        path: &Path,
+        scene: &mut Scene,
+        engine_updates: &mut EngineUpdates,
+        state_ui: &mut StateUi,
+        manip_mode: ManipMode,
+    ) -> io::Result<()> {
+        let binding = path.extension().unwrap_or_default().to_ascii_lowercase();
+        let extension = binding;
+
+        let molecule = match extension.to_str().unwrap() {
+            "sdf" => {
+                let mut m: MoleculeSmall = Sdf::load(path)?.try_into()?;
+                m.common.path = Some(path.to_owned());
+                m
+            }
+            "mol2" => {
+                let mut m: MoleculeSmall = Mol2::load(path)?.try_into()?;
+                m.common.path = Some(path.to_owned());
+                m
+            }
+            "xyz" => MoleculeSmall::from_xyz(Xyz::load(path)?, path)?,
+            "pdbqt" => {
+                let mut m: MoleculeSmall = Pdbqt::load(path)?.try_into()?;
+                m.common.path = Some(path.to_owned());
+                m
+            }
+            // "cif" => {
+            //     // todo
+            // }
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "Invalid file extension",
+                ));
+            }
+        };
+
+        self.load_mol(
+            &molecule,
+            // param_set,
+            // mol_specific_params,
+            scene,
+            engine_updates,
+            state_ui,
+            manip_mode,
+        );
+        Ok(())
+    }
+    //
+    // fn _remove_repopulate_h(
+    //     &mut self,
+    //     scene: &mut Scene,
+    //     engine_updates: &mut EngineUpdates,
+    //     state_ui: &mut StateUi,
+    // ) {
+    //     // We assign H dynamically; ignore present ones.
+    //     self.mol.common.atoms = self
+    //         .mol
+    //         .common
+    //         .atoms
+    //         .iter()
+    //         .filter(|a| a.element != Hydrogen)
+    //         .map(|a| a.clone())
+    //         .collect();
+    //
+    //     // Remove bonds to atoms that no longer exist, and change indices otherwise:
+    //     // serial_number -> new index after filtering
+    //     let sn2idx: HashMap<u32, usize> = self
+    //         .mol
+    //         .common
+    //         .atoms
+    //         .iter()
+    //         .enumerate()
+    //         .map(|(i, a)| (a.serial_number, i))
+    //         .collect();
+    //
+    //     // Keep only bonds whose endpoints still exist; reindex to new atom indices
+    //     self.mol.common.bonds = self
+    //         .mol
+    //         .common
+    //         .bonds
+    //         .iter()
+    //         .filter_map(|b| {
+    //             let i0 = sn2idx.get(&b.atom_0_sn)?;
+    //             let i1 = sn2idx.get(&b.atom_1_sn)?;
+    //             Some(Bond {
+    //                 bond_type: b.bond_type,
+    //                 atom_0_sn: b.atom_0_sn,
+    //                 atom_1_sn: b.atom_1_sn,
+    //                 atom_0: *i0,
+    //                 atom_1: *i1,
+    //                 is_backbone: b.is_backbone,
+    //             })
+    //         })
+    //         .collect();
+    //
+    //     // Rebuild these based on the new filters.
+    //     self.mol.common.reset_posits();
+    //     self.mol.common.build_adjacency_list();
+    //
+    //     // Re-populate hydrogens algorithmically.
+    //     for (i, atom) in self.mol.common.atoms.clone().iter().enumerate() {
+    //         println!("Populating H for atom {atom}");
+    //         populate_hydrogens_on_atom(&mut self.mol.common, i, atom.element, &atom.force_field_type, &mut scene.entities, state_ui, engine_updates);
+    //     }
+    // }
+
+    pub fn load_mol(
+        &mut self,
+        mol: &MoleculeSmall,
+        scene: &mut Scene,
+        updates: &mut EngineUpdates,
+        state_ui: &mut StateUi,
+        manip_mode: ManipMode,
+    ) {
+        self.md.invalidate();
+        state_ui.selection = Selection::None;
+        self.mol = mol.clone();
+        self.mol.common.ident = MOL_IDENT.to_owned();
+
+        self.mol.common.reset_posits();
+        self.mol.common.update_next_sn();
+
+        // The identifiers loaded with the molecule stay until its structure changes; see
+        // `refresh_smiles`.
+        self.mol.common.build_adjacency_list();
+        self.smiles = create_smiles(&self.mol.common);
+        self.db_check = None;
+
+        self.move_to_origin();
+        scene.input_settings.control_scheme = ControlScheme::Arc {
+            center: Vec3F32::new_zero(),
+        };
+
+        redraw(&mut scene.entities, self, state_ui, manip_mode, updates);
+
+        set_flashlight(scene);
+        updates.lighting = true;
+    }
+
+    fn move_to_origin(&mut self) {
+        {
+            let centroid = self.mol.common.centroid();
+            for posit in &mut self.mol.common.atom_posits {
+                *posit -= centroid;
+            }
+            self.mol.common.reset_posits();
+        }
+    }
+
+    /// Load the latest md_posits into atom positions, and update entities.
+    pub fn load_atom_posits_from_md(
+        &mut self,
+        entities: &mut Vec<Entity>,
+        state_ui: &StateUi,
+        updates: &mut EngineUpdates,
+        manip_mode: ManipMode,
+    ) {
+        let Some(md) = &self.md.md else { return };
+        let mol = &mut self.mol.common;
+
+        // `MdState::atoms` stores the caller-supplied solute first, followed by any explicit
+        // solvent atoms or counterions added during MD initialization. Only the leading solute
+        // atoms correspond to the molecule in the editor.
+        if md.atoms.len() < mol.atoms.len() || mol.atoms.len() != mol.atom_posits.len() {
+            eprintln!(
+                "Unable to fully sync mol-editor MD positions: MD has {} atoms, while the editor requires {} atoms and has {} positions.",
+                md.atoms.len(),
+                mol.atoms.len(),
+                mol.atom_posits.len()
+            );
+        }
+
+        // Zip the collections so a stale or failed MD rebuild cannot turn a size mismatch into an
+        // index-out-of-bounds panic. Normal edit paths rebuild MD before reaching this point.
+        for ((atom, posit), md_atom) in mol
+            .atoms
+            .iter_mut()
+            .zip(&mut mol.atom_posits)
+            .zip(&md.atoms)
+        {
+            atom.posit = md_atom.posit.into();
+            *posit = md_atom.posit.into();
+        }
+
+        self.update_h_bonds();
+        redraw(entities, self, state_ui, manip_mode, updates);
+    }
+
+    /// Run MD for a single step if ready, and update atom positions immediately after.
+    pub fn md_step(
+        &mut self,
+        dev: &ComputationDevice,
+        entities: &mut Vec<Entity>,
+        state_ui: &StateUi,
+        engine_updates: &mut EngineUpdates,
+        manip_mode: ManipMode,
+    ) {
+        if !self.md.running
+            || self.md.last_dt_run.elapsed().as_secs_f32() * 1_000. < self.md.time_between_runs
+        {
+            return;
+        }
+
+        let Some(md) = &mut self.md.md else { return };
+
+        self.md.last_dt_run = Instant::now();
+
+        // A quick drag can end before the next MD update.
+        let pull_target = self.md.pull_target.or(self.md.pending_pull.take());
+        let start = Instant::now();
+        for _ in 0..self.md.steps_per_update {
+            let forces = pull_target.and_then(|(i, target)| {
+                let atom = md.atoms.get(i)?;
+                if atom.static_ {
+                    return None;
+                }
+
+                let force = pull_force(target - atom.posit, self.md.pull_strength);
+                let mut forces = vec![Vec3F32::new_zero(); md.atoms.len()];
+                forces[i] = force;
+
+                Some(forces)
+            });
+            md.step(dev, self.md.dt, forces);
+
+            if let Some(error) = &md.force_error {
+                self.md.error = Some(format!("IMD stopped: {error:?}"));
+                self.md.running = false;
+
+                break;
+            }
+
+            // Keep input responsive on slower machines.
+            if start.elapsed().as_millis() >= 12 {
+                break;
+            }
+        }
+
+        // Keep the latest snapshot for the energy display, and remove the rest from memory to
+        // prevent them from accumulating.
+        if let Some(snap) = md.snapshots.pop() {
+            self.md.snap = Some(snap);
+        }
+        md.snapshots.clear();
+
+        if md.atoms.iter().any(|atom| {
+            !atom.posit.x.is_finite() || !atom.posit.y.is_finite() || !atom.posit.z.is_finite()
+        }) || md.force_error.is_some()
+        {
+            self.md.error.get_or_insert_with(|| {
+                "IMD stopped: unstable geometry. Relax before restarting.".to_owned()
+            });
+            self.md.running = false;
+            self.md.clear_pull();
+            self.md.md = None;
+            self.md.snap = None;
+            self.md.pinned_atoms.clear();
+            self.md.rebuild_required = true;
+
+            return;
+        }
+
+        // Load positions from the MD state directly, and redraw. (Not from snapshots: these are
+        // only taken every few steps.)
+        self.load_atom_posits_from_md(entities, state_ui, engine_updates, manip_mode);
+    }
+
+    /// Re-assigns FF type, partial charge, and mol-specific (e.g. dihedral) params. An interface to
+    /// `dynamics`' general NFF param updator, with setup that makes it work
+    /// in this context.
+    pub fn rebuild_ff_related(&mut self, param_set: &FfParamSet) {
+        // Typical serial number layouts are currently required to prevent crashes when assigning
+        // partial charges using SNs.
+        self.mol.common.reassign_sns();
+
+        // Setting these to `None` on any atom triggers FF param and partial charge rebuilds.
+        if !self.mol.common.atoms.is_empty() {
+            self.mol.common.atoms[0].force_field_type = None;
+            self.mol.common.atoms[0].partial_charge = None;
+        }
+
+        self.mol.frcmod_loaded = false;
+        self.md.mol_specific_params = ForceFieldParams::default();
+
+        // if let Some(p) = param_set.amber().and_then(|set| set.small_mol.as_ref()) {
+        //     editor.mol.update_ff_related(&mut msp, p);
+        // } else {
+        //     eprintln!("Error: Unable to update a molecule's params due to missing GAFF2.");
+        // }
+
+        let mut msp = HashMap::new();
+
+        // Update this immediately, as we may take advantage of FF types when adjusting geometry,
+        // and it may be useful to view them.
+        if let Some(p) = param_set.amber().and_then(|set| set.small_mol.as_ref()) {
+            self.mol.update_ff_related(&mut msp, p, false);
+        } else {
+            eprintln!("Error: Unable to update a molecule's params due to missing GAFF2.");
+        }
+
+        if let Some(v) = msp.get(MOL_IDENT) {
+            self.md.mol_specific_params = v.clone();
+        }
+    }
+
+    pub fn update_h_bonds(&mut self) {
+        if let Some(pocket) = &self.mol.pharmacophore.pocket {
+            self.h_bonds = create_hydrogen_bonds_two_mols(
+                &self.mol.common.atoms,
+                &self.mol.common.atom_posits,
+                &self.mol.common.bonds,
+                &pocket.common.atoms,
+                &pocket.common.atom_posits,
+                &pocket.common.bonds,
+            );
+        }
+    }
+}
+
+// todo: Into a GUI util?
+pub fn enter_edit_mode(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    state.volatile.operating_mode = OperatingMode::MolEditor;
+
+    // Rebuilt shortly.
+    state.mol_editor.md.md = None;
+    state.ui.view_sel_level = ViewSelLevel::AtomBond;
+
+    state.ui.ui_vis.sidebar_mol_properties = false;
+    state.ui.ui_vis.pharmacophore_list = true;
+
+    // Save the camera, to restore on exit. If a molecule manipulation is in progress, the mouse
+    // controls are temporarily disabled; save the scheme the manipulation would restore.
+    let control_scheme = if matches!(state.volatile.mol_manip.mode, ManipMode::None) {
+        scene.input_settings.control_scheme
+    } else {
+        state.volatile.control_scheme_prev
+    };
+    state.volatile.primary_mode_cam = Some(PrimaryModeCam::new(&scene.camera, control_scheme));
+
+    state.volatile.orbit_center_prev = state.volatile.orbit_center;
+    state.volatile.depth_mode_prev = state.to_save.depth_mode;
+
+    // For now at least, disable auto fog when in editing mode.
+    if state.to_save.depth_mode == crate::prefs::DepthMode::Auto {
+        state.to_save.depth_mode = crate::prefs::DepthMode::Disabled;
+    }
+
+    cam::set_fog(state, &mut scene.camera);
+
+    // This stays false under several conditions.
+    let mut mol_loaded = false;
+
+    if let Some((mol_type, i)) = state.volatile.active_mol
+        && mol_type == MolType::Ligand
+    {
+        if i >= state.ligands.len() {
+            eprintln!("Expected a ligand at this index, but out of bounds when entering edit mode");
+        } else {
+            let mut source = state.ligands[i].clone();
+            source.common = state.force_fields.amber_copy(&source.common);
+            state.mol_editor.load_mol(
+                &source,
+                scene,
+                updates,
+                &mut state.ui,
+                state.volatile.mol_manip.mode,
+            );
+            mol_loaded = true;
+
+            state.mol_editor.mol_i_in_state = Some(i);
+        }
+    }
+
+    if !mol_loaded {
+        // A pocket left from a previous editing session isn't one we're using now.
+        state.mol_editor.mol.pharmacophore.pocket = None;
+        state.mol_editor.clear_mol(&mut state.ui.selection);
+    }
+
+    // Reset positions to be around the origin.
+    state.mol_editor.move_to_origin();
+    scene.input_settings.control_scheme = ControlScheme::Arc {
+        center: state.mol_editor.mol.common.centroid().into(),
+    };
+
+    // Select the first atom.
+    state.ui.selection = if state.mol_editor.mol.common.atoms.is_empty() {
+        Selection::None
+    } else {
+        Selection::AtomLig((0, 0))
+    };
+
+    // Look down -Z, so 2D layouts in the XY plane display with +X right, and +Y up.
+    scene.camera.position = Vec3F32::new(0., 0., INIT_CAM_DIST);
+    scene.camera.orientation = cam::front_orientation();
+
+    scene.entities.clear();
+
+    state.volatile.mol_manip.mode = ManipMode::None;
+
+    // Set to a view supported by the editor.
+    // todo: In this case, store the previous view, and re-set it upon exiting the editor.
+    if !matches!(
+        state.ui.mol_view,
+        MoleculeView::Sticks | MoleculeView::BallAndStick | MoleculeView::SpaceFill
+    ) {
+        state.ui.mol_view = MoleculeView::BallAndStick
+    }
+
+    // Clear all entities for non-editor molecules.
+    redraw(
+        &mut scene.entities,
+        &state.mol_editor,
+        &state.ui,
+        state.volatile.mol_manip.mode,
+        updates,
+    );
+
+    set_static_light(scene, Vec3F32::new_zero(), STATIC_LIGHT_MOL_SIZE);
+    set_flashlight(scene);
+    updates.lighting = true;
+}
+
+// todo: Into a GUI util?
+pub fn exit_edit_mode(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    state.volatile.operating_mode = OperatingMode::Primary;
+
+    // Restore the camera to how it was prior to entering the editor.
+    if let Some(cam) = state.volatile.primary_mode_cam.take() {
+        scene.camera.position = cam.position;
+        scene.camera.orientation = cam.orientation;
+        scene.input_settings.control_scheme = cam.control_scheme;
+    }
+    state.volatile.orbit_center = state.volatile.orbit_center_prev;
+    updates.camera = true;
+
+    state.to_save.depth_mode = state.volatile.depth_mode_prev;
+    cam::set_fog(state, &mut scene.camera);
+
+    state.mol_editor.md.md = None;
+    state.mol_editor.md.running = false;
+    state.mol_editor.mol_i_in_state = None;
+    state.mol_editor.pocket_i_in_state = None;
+
+    state.volatile.mol_manip.mode = ManipMode::None;
+
+    let mut flags = RedrawFlags::default();
+    flags.set_all();
+    handle_redraw(state, scene, &mut flags, updates);
+
+    set_flashlight(scene);
+
+    updates.lighting = true;
+}
+
+// todo: Move to drawing_wrappers?
+// todo: Method on MolEditor?
+pub fn redraw(
+    entities: &mut Vec<Entity>,
+    editor: &MolEditorState,
+    ui: &StateUi,
+    manip_mode: ManipMode,
+    updates: &mut EngineUpdates,
+) {
+    *entities = Vec::new();
+
+    entities.extend(draw_mol_with_pharmacophore_visibility(
+        MolGenericRef::Small(&editor.mol),
+        0,
+        ui,
+        &None,
+        manip_mode,
+        OperatingMode::MolEditor,
+        1,
+        false,
+        editor.show_pharmacophore_renders,
+        editor.show_atom_sns,
+    ));
+
+    if let Some(p) = &editor.mol.pharmacophore.pocket {
+        entities.extend(draw_pocket(
+            p,
+            &editor.h_bonds,
+            &editor.mol.common.atom_posits,
+            &ui.visibility,
+            &Selection::None,
+            &manip_mode,
+        ));
+    }
+    updates.entities = EntityUpdate::All;
+}
+
+/// Tailored function to prevent having to redraw the whole mol.
+fn draw_atom(
+    entities: &mut Vec<Entity>,
+    atom: &Atom,
+    components: &Option<MolComponents>,
+    ui: &StateUi,
+) {
+    if matches!(ui.mol_view, MoleculeView::BallAndStick) {
+        if ui.visibility.hide_hydrogen && atom.element == Hydrogen {
+            return;
+        }
+
+        let color = atom_color(
+            atom,
+            0,
+            99999,
+            &[],
+            None,
+            0,
+            0,
+            &[],
+            &[],
+            &ui.selection,
+            ViewSelLevel::AtomBond, // Use element or partial-charge colors.
+            ui.res_coloring,
+            ui.atom_color_by_charge
+                .then_some(ui.inspection.charge_palette),
+            MolType::Ligand,
+            components,
+        );
+
+        let (radius, mesh) = match ui.mol_view {
+            MoleculeView::SpaceFill => (atom.element.vdw_radius(), MESH_SPACEFILL_SPHERE),
+            _ => match atom.element {
+                Hydrogen => (BALL_STICK_RADIUS_H, MESH_BALL_STICK_SPHERE),
+                _ => (BALL_STICK_RADIUS, MESH_BALL_STICK_SPHERE),
+            },
+        };
+
+        let mut entity = Entity::new(
+            mesh,
+            // We assume atom.posit is synced with atom_posits here. (Not true generally)
+            atom.posit.into(),
+            QuaternionF32::new_identity(),
+            radius,
+            color,
+            ATOM_SHININESS,
+        );
+
+        entity.class = EntityClass::Ligand as u32;
+        entities.push(entity);
+    }
+}
+
+/// Tailored function to prevent having to draw the whole mol.
+fn draw_bond(
+    entities: &mut Vec<Entity>,
+    bond: &Bond,
+    atoms: &[Atom],
+    bonds: &[Bond],
+    adj_list: &[Vec<usize>],
+    ui: &StateUi,
+    components: &Option<MolComponents>,
+) {
+    // todo: C+P from draw_molecule. With some removed, but much repeated.
+    let atom_0 = &atoms[bond.atom_0];
+    let atom_1 = &atoms[bond.atom_1];
+
+    if ui.visibility.hide_hydrogen && (atom_0.element == Hydrogen || atom_1.element == Hydrogen) {
+        return;
+    }
+
+    // We assume atom.posit is synced with atom_posits here. (Not true generally)
+    let posit_0: Vec3F32 = atoms[bond.atom_0].posit.into();
+    let posit_1: Vec3F32 = atoms[bond.atom_1].posit.into();
+
+    // For determining how to orient multiple-bonds. Only run for relevant bonds to save
+    // computation.
+    let neighbor_posit = match bond.bond_type {
+        BondType::Aromatic => {
+            let mut hydrogen_is = Vec::with_capacity(atoms.len());
+            for atom in atoms {
+                hydrogen_is.push(atom.element == Hydrogen);
+            }
+            let aromatic_adj = {
+                let n = atoms.len();
+                let mut adj = vec![Vec::new(); n];
+                for b in bonds {
+                    if b.bond_type == BondType::Aromatic {
+                        adj[b.atom_0].push(b.atom_1);
+                        adj[b.atom_1].push(b.atom_0);
+                    }
+                }
+                adj
+            };
+            let atom_posits_f64: Vec<Vec3> = atoms.iter().map(|a| a.posit).collect();
+            let centroid: Vec3F32 = aromatic_ring_centroid(
+                &aromatic_adj,
+                &atom_posits_f64,
+                bond.atom_0,
+                bond.atom_1,
+                &hydrogen_is,
+            )
+            .map(|c| c.into())
+            .unwrap_or_else(|| atoms[0].posit.into());
+            (centroid, false)
+        }
+        BondType::Double | BondType::Triple => {
+            let mut hydrogen_is = Vec::with_capacity(atoms.len());
+            for atom in atoms {
+                hydrogen_is.push(atom.element == Hydrogen);
+            }
+            let neighbor_i = find_neighbor_posit(adj_list, bond.atom_0, bond.atom_1, &hydrogen_is);
+            match neighbor_i {
+                Some((i, p1)) => (atoms[i].posit.into(), p1),
+                None => (atoms[0].posit.into(), false),
+            }
+        }
+        _ => (lin_alg::f32::Vec3::new_zero(), false),
+    };
+
+    let color_0 = atom_color(
+        atom_0,
+        0,
+        bond.atom_0,
+        &[],
+        None,
+        0,
+        0,
+        &[],
+        &[],
+        &ui.selection,
+        ViewSelLevel::AtomBond, // Always color ligands by atom.
+        ui.res_coloring,
+        ui.atom_color_by_charge
+            .then_some(ui.inspection.charge_palette),
+        MolType::Ligand,
+        components,
+    );
+
+    let color_1 = atom_color(
+        atom_1,
+        0,
+        bond.atom_1,
+        &[],
+        None,
+        0,
+        0,
+        &[],
+        &[],
+        &ui.selection,
+        ViewSelLevel::AtomBond, // Always color ligands by atom.
+        ui.res_coloring,
+        ui.atom_color_by_charge
+            .then_some(ui.inspection.charge_palette),
+        MolType::Ligand,
+        components,
+    );
+
+    let to_hydrogen = atom_0.element == Hydrogen || atom_1.element == Hydrogen;
+
+    entities.extend(bond_entities(
+        posit_0,
+        posit_1,
+        color_0,
+        color_1,
+        bond.bond_type,
+        MolType::Ligand,
+        "",
+        false,
+        true,
+        neighbor_posit,
+        false,
+        to_hydrogen,
+    ));
+}
+
+/// Save the editor's molecule to disk.
+pub fn save(state: &mut State, path: &Path) -> io::Result<()> {
+    let mol = MolGenericRef::Small(&state.mol_editor.mol);
+
+    let binding = path.extension().unwrap_or_default().to_ascii_lowercase();
+    let extension = binding;
+
+    match extension.to_str().unwrap_or_default() {
+        "sdf" => mol.to_sdf()?.save(path, SdfFormat::V2000)?, // todo: format A/R
+        "mol2" => mol.to_mol2()?.save(path)?,
+        "xyz" => mol.to_xyz()?.save(path)?,
+        "prmtop" => (), // todo
+        "pdbqt" => mol.to_pdbqt()?.save(path)?,
+        _ => {
+            return Err(io::Error::other("Unsupported file type"));
+        }
+    }
+
+    Ok(())
+}
+
+/// Set up MD for the editor's molecule.
+pub(super) fn build_dynamics(
+    dev: &ComputationDevice,
+    editor: &mut MolEditorState,
+    param_set: &FfParamSet,
+    cfg: &MdConfig,
+) -> Result<MdState, ParamError> {
+    println!("Setting up dynamics for the mol editor...");
+
+    editor.rebuild_ff_related(param_set);
+
+    let atoms_gen: Vec<_> = editor
+        .mol
+        .common
+        .atoms
+        .iter()
+        .map(|a| a.to_generic())
+        .collect();
+
+    let bonds_gen: Vec<_> = editor
+        .mol
+        .common
+        .bonds
+        .iter()
+        .map(|b| b.to_generic())
+        .collect();
+
+    let mols = vec![MolDynamics {
+        ff_mol_type: FfMolType::SmallOrganic,
+        atoms: atoms_gen,
+        atom_posits: Some(editor.mol.common.atom_posits.clone()),
+        atom_init_velocities: None,
+        bonds: bonds_gen,
+        adjacency_list: Some(editor.mol.common.adjacency_list.clone()),
+        static_: false,
+        bonded_only: false,
+        mol_specific_params: Some(editor.md.mol_specific_params.clone()),
+        explicit_params: None,
+        residues: None,
+    }];
+
+    let cfg = MdConfig {
+        // The editor has its own solvent toggle. Inheriting the application-wide MD solvent here
+        // made Relax unexpectedly initialize water even when "MD Water" was disabled.
+        solvent: editor.md.solvent.clone(),
+        max_init_relaxation_iters: Some(50), // todo A/R
+        overrides: MdOverrides {
+            // todo: Reduced number of water relax steps to make it faster?
+            // Water relaxation is slow.
+            // skip_water_relaxation: true,
+            long_range_recip_disabled: true,
+            ..Default::default()
+        },
+        // todo: Which one?
+        integrator: Integrator::VerletVelocity {
+            thermostat: Some(TAU_TEMP_DEFAULT),
+        },
+        // We run slower time steps than in typical MD steps here, so this is OK, and may
+        // provide a more realistic visualization.
+        hydrogen_constraint: HydrogenConstraint::Flexible,
+        snapshot_handlers: Default::default(),
+        zero_com_drift: false,
+        barostat_cfg: None,
+        ..cfg.clone()
+    };
+
+    println!("Initializing MD state...");
+
+    // Workaround to now have to regen water. I call this a workaround as there can be other
+    // elegant approaches in the Dynamics lib, and or that handle vacancies better from changing
+    // atom counts. Or that applies automatically. Pre-arranged water is a good way to start, e.g.
+    // instead of in a lattice.
+    // let mut water_prev = None;
+    //
+    // if let Some(md_prev) = &editor.md_state {
+    //     if !md_prev.water.is_empty() {
+    //         water_prev = Some(md_prev.water.clone());
+    //         cfg.overrides.skip_water = true;
+    //     }
+    // }
+
+    let (mut md_state, _) = MdState::new(dev, &cfg, &mols, param_set)?;
+
+    // Atoms otherwise start at rest, and with the small time steps we use here, the thermostat
+    // takes minutes to bring them up to temperature; the molecule appears frozen until then.
+    md_state.initialize_velocities(cfg.temp_target, true);
+
+    // if let Some(w) = water_prev {
+    //     println!("Using previous water molecules");
+    //     // todo: Dangerous: Could cause an overlap and therefor blowup.
+    //     // md_state.water = w;
+    // }
+
+    println!("MD init done.");
+
+    Ok(md_state)
+}
+
+/// Start a fresh molecule while keeping the editor open and its pocket, if any.
+pub fn clear_editor(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    state.mol_editor.clear_mol(&mut state.ui.selection);
+    state.mol_editor.mol_i_in_state = None;
+    state.mol_editor.selected_comp = None;
+    state.mol_editor.rotatable_bonds.clear();
+    state.mol_editor.md.running = false;
+    sync_md(state);
+
+    state.volatile.mol_manip.mode = ManipMode::None;
+    state.volatile.mol_manip.pivot = None;
+    scene.input_settings.control_scheme = ControlScheme::Arc {
+        center: state.mol_editor.mol.common.centroid().into(),
+    };
+    scene.camera.position = Vec3F32::new(0., 0., INIT_CAM_DIST);
+    scene.camera.orientation = cam::front_orientation();
+    updates.camera = true;
+
+    redraw(
+        &mut scene.entities,
+        &state.mol_editor,
+        &state.ui,
+        state.volatile.mol_manip.mode,
+        updates,
+    );
+}
+
+/// Add the editor's molecule to state, then start a fresh molecule in the editor.
+pub fn clear_and_add(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    add_edited_mol(state);
+    clear_editor(state, scene, updates);
+}
+
+/// Update the molecule loaded into the editor, then start a fresh molecule in the editor.
+pub fn clear_and_update(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    lig_i: usize,
+) {
+    if update_edited_mol(state, lig_i) {
+        clear_editor(state, scene, updates);
+    }
+}
+
+/// Exit the editor, adding its molecule to state as a new one.
+pub fn exit_and_add(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    add_edited_mol(state);
+    exit_edit_mode(state, scene, updates);
+}
+
+/// Add the editor's molecule to state without changing editor mode.
+fn add_edited_mol(state: &mut State) {
+    let mol = state.mol_editor.to_new_mol();
+    state.ligands.push(mol);
+
+    let lig_i = state.ligands.len() - 1;
+    name_edited_mol(state, lig_i);
+    store_edited_mol(state, lig_i, None);
+
+    // The editor centers the molecule at the origin, which may be out of view of the camera we
+    // restore on exit. Place it in front of that camera, as when opening a molecule.
+    if let Some(cam) = &state.volatile.primary_mode_cam {
+        let posit = cam.position + cam.orientation.rotate_vec(FWD_VEC) * MOVE_TO_CAM_DIST;
+        state.ligands[lig_i].common.move_to(posit.into());
+    }
+}
+
+/// Exit the editor, replacing the molecule it was loaded from with the edited one.
+pub fn exit_and_update(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    lig_i: usize,
+) {
+    if update_edited_mol(state, lig_i) {
+        exit_edit_mode(state, scene, updates);
+    }
+}
+
+/// Replace the molecule loaded into the editor without changing editor mode.
+fn update_edited_mol(state: &mut State, lig_i: usize) -> bool {
+    let editor = &mut state.mol_editor;
+    editor.mol.common.reassign_sns();
+
+    let Some(lig) = state.ligands.get_mut(lig_i) else {
+        return false;
+    };
+
+    // The editor centers the molecule at the origin; we move it back to here.
+    let centroid_prev = lig.common.centroid();
+
+    // Load the edited molecule back into the state.
+    lig.common.atoms = editor.mol.common.atoms.clone();
+    lig.common.bonds = editor.mol.common.bonds.clone();
+    lig.pharmacophore = editor.mol.pharmacophore.clone();
+    lig.components = editor.mol.components.clone();
+
+    lig.common.build_adjacency_list();
+    lig.common.reset_posits();
+    lig.common.update_next_sn();
+
+    lig.update_characterization();
+
+    let path_prev = name_edited_mol(state, lig_i);
+    store_edited_mol(state, lig_i, path_prev.as_deref());
+
+    // Keep it where it was prior to editing, e.g. relative to other molecules, and to the camera
+    // we restore on exit.
+    if let Some(lig) = state.ligands.get_mut(lig_i) {
+        lig.common.move_to(centroid_prev);
+    }
+
+    true
+}
+
+/// A molecule from the editor, added to or updated in state at `lig_i`, may be a different
+/// compound from any it was loaded from. Identifiers, metadata and other data keyed to that one
+/// would name the wrong thing, so replace them: Our SMILES, and a provisional name, e.g. "Editor 0".
+/// Then look up the structure on PubChem: If it has the compound, its CID and other identifiers
+/// come in, and the name becomes e.g. "Editor | 1123 | Taurine".
+///
+/// Returns the file the molecule was loaded from, if any.
+fn name_edited_mol(state: &mut State, lig_i: usize) -> Option<PathBuf> {
+    let ident = next_editor_ident(state);
+
+    let lig = state.ligands.get_mut(lig_i)?;
+
+    lig.common.build_adjacency_list();
+    let smiles = create_smiles(&lig.common);
+
+    lig.idents.clear();
+    lig.clear_safety_data();
+    if !smiles.is_empty() {
+        lig.idents.push(MolIdent::Smiles(smiles));
+    }
+
+    lig.common.metadata.clear();
+    lig.associated_structures.clear();
+    lig.therapeutic_props = None;
+
+    // Its file, if any, holds the molecule before the edit. As with splitting and joining, treat
+    // that as closed: It won't reopen next session in place of this one, and caching identifiers
+    // found for this one (see `managed_mols::update_managed_mol`) can't write over it.
+    let path_prev = lig.common.path.take();
+    if let Some(path) = &path_prev {
+        for history in &mut state.to_save.open_history {
+            if history.type_ == OpenType::Ligand && history.path == *path {
+                history.last_session = false;
+            }
+        }
+    }
+    lig.common.filename.clear();
+
+    lig.common.ident = ident.clone();
+    lig.common.name = Some(ident);
+
+    // Molecule-specific params are keyed by name; build them under the new one.
+    lig.frcmod_loaded = false;
+    if let Some(params) = &state.ff_param_set.amber().unwrap().small_mol {
+        lig.update_ff_related(&mut state.mol_specific_params, params, false);
+    } else {
+        eprintln!("Error: Unable to update a molecule's params due to missing GAFF2.");
+    }
+
+    start_structure_lookup(state, lig_i, Some(EDITOR_NAME_PREFIX));
+
+    path_prev
+}
+
+/// Keep a molecule from the editor in an application-managed file, and add it to the open
+/// history. It then reopens next session, and is in the recent-files list, even if the user never
+/// saves it. `path_prev` is the file it was loaded from, if any; see `managed_mols::store_edited`.
+fn store_edited_mol(state: &mut State, lig_i: usize, path_prev: Option<&Path>) {
+    let Some(lig) = state.ligands.get_mut(lig_i) else {
+        return;
+    };
+
+    match managed_mols::store_edited(&state.volatile.prefs_dir, lig, path_prev) {
+        Ok(path) => {
+            lig.common.update_path(&path);
+            let ident = lig.common.ident.clone();
+
+            state.update_history(&path, OpenType::Ligand, Some(ident));
+            state.update_save_prefs();
+        }
+        Err(e) => handle_err(
+            &mut state.ui,
+            format!("Unable to keep the edited molecule for the next session: {e}"),
+        ),
+    }
+}
+
+/// A name for a molecule from the editor, e.g. "Editor 0", not used by another.
+fn next_editor_ident(state: &mut State) -> String {
+    loop {
+        let ident = format!("{EDITOR_NAME_PREFIX} {}", state.mol_editor.next_name_i);
+        state.mol_editor.next_name_i += 1;
+
+        let taken = state.ligands.iter().any(|lig| {
+            lig.common.ident.eq_ignore_ascii_case(&ident)
+                || lig
+                    .common
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(&ident))
+        }) || state
+            .mol_specific_params
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case(&ident));
+
+        if !taken {
+            return ident;
+        }
+    }
+}
+
+/// Look up the editor's molecule, as it currently is, on PubChem by its SMILES ("Check DBs").
+/// Resolves at once if our local cache has the structure; otherwise, the lookup runs in the
+/// background, and `on_db_check` applies it.
+pub fn check_dbs(state: &mut State) {
+    state.mol_editor.refresh_smiles();
+
+    let smiles = state.mol_editor.smiles.clone();
+    if smiles.is_empty() {
+        return;
+    }
+
+    if let Some(props) = state
+        .to_save
+        .pubchem_properties_map
+        .get(&MolIdent::Smiles(smiles.clone()))
+    {
+        state.mol_editor.apply_db_check(&smiles, Some(props));
+        return;
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let query = smiles.clone();
+
+    thread::spawn(move || {
+        let _ = tx.send(pubchem::properties(
+            StructureSearchNamespace::Smiles,
+            &query,
+        ));
+    });
+
+    // Replaces any lookup in progress; that one is for an older version of the molecule, or the
+    // same one.
+    state.volatile.thread_receivers.editor_db_check = Some((smiles, rx));
+    state.mol_editor.db_check = Some(DbCheck::Pending);
+}
+
+/// Apply a finished "Check DBs" lookup. `smiles` is what we looked up.
+pub fn on_db_check(
+    state: &mut State,
+    smiles: String,
+    result: Result<pubchem::Properties, ReqError>,
+) {
+    let props = match result {
+        Ok(props) => {
+            // Cached as a load's PubChem lookup would, so this structure resolves at once from
+            // now on, e.g. when adding the molecule to state.
+            if props.cid != 0 {
+                state
+                    .to_save
+                    .pubchem_properties_map
+                    .insert(MolIdent::Smiles(smiles.clone()), props.clone());
+                state.to_save.save_flag = true;
+            }
+            Some(props)
+        }
+        Err(e) => {
+            eprintln!("Unable to look up {smiles} on PubChem: {e:?}");
+            None
+        }
+    };
+
+    state.mol_editor.apply_db_check(&smiles, props.as_ref());
+}
+
+/// Used to share this between GUI and inputs.
+pub fn ensure_dynamics(state: &mut State) -> bool {
+    if !state.mol_editor.md.rebuild_required && state.mol_editor.md.md.is_some() {
+        return true;
+    }
+
+    state.mol_editor.md.clear_pull();
+    state.mol_editor.md.pinned_atoms.clear();
+    state.mol_editor.md.snap = None;
+    let result = build_dynamics(
+        &state.computation_device(),
+        &mut state.mol_editor,
+        &state.ff_param_set,
+        &state.to_save.md.config,
+    );
+
+    match result {
+        Ok(md) => {
+            state.mol_editor.md.md = Some(md);
+            state.mol_editor.md.rebuild_required = false;
+            state.mol_editor.md.error = None;
+            state.mol_editor.md.last_dt_run = Instant::now();
+
+            true
+        }
+        Err(error) => {
+            let message = format!("Unable to set up editor dynamics: {error:?}");
+            handle_err(&mut state.ui, message.clone());
+            state.mol_editor.md.error = Some(message);
+            state.mol_editor.md.md = None;
+            state.mol_editor.md.running = false;
+            state.mol_editor.md.rebuild_required = true;
+
+            false
+        }
+    }
+}
+
+pub fn relax(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    state.mol_editor.md.clear_pull();
+    if !ensure_dynamics(state) {
+        return;
+    }
+
+    let dev = state.computation_device();
+    let md = state.mol_editor.md.md.as_mut().unwrap();
+    md.minimize_energy(&dev, MAX_RELAX_ITERS, None);
+    let error = md
+        .force_error
+        .as_ref()
+        .map(|error| format!("Unable to relax geometry: {error:?}"))
+        .or_else(|| {
+            md.atoms
+                .iter()
+                .any(|a| !a.posit.magnitude_squared().is_finite())
+                .then(|| "Unable to relax geometry: non-finite atom positions.".to_owned())
+        });
+    if let Some(message) = error {
+        handle_err(&mut state.ui, message.clone());
+        state.mol_editor.md.error = Some(message);
+        state.mol_editor.md.md = None;
+        state.mol_editor.md.snap = None;
+        state.mol_editor.md.pinned_atoms.clear();
+        state.mol_editor.md.running = false;
+        state.mol_editor.md.rebuild_required = true;
+
+        return;
+    }
+
+    md.snapshots.clear();
+    state.mol_editor.md.snap = None;
+    state.mol_editor.load_atom_posits_from_md(
+        &mut scene.entities,
+        &state.ui,
+        updates,
+        state.volatile.mol_manip.mode,
+    );
+}
+
+pub fn relax_after_edit(state: &mut State, scene: &mut Scene, updates: &mut EngineUpdates) {
+    crate::mol_manip::discard_editor_transform(state, scene);
+    state.mol_editor.mol.common.build_adjacency_list();
+    state.mol_editor.mol.update_characterization();
+    state.mol_editor.refresh_smiles();
+    state.mol_editor.md.rebuild_required = true;
+    relax(state, scene, updates);
+}
+
+pub fn sync_md(state: &mut State) {
+    // This runs after edits, some of which change the structure.
+    state.mol_editor.refresh_smiles();
+
+    state.mol_editor.md.clear_pull();
+    state.mol_editor.md.pinned_atoms.clear();
+    state.mol_editor.md.rebuild_required = true;
+
+    if state.mol_editor.md.running {
+        ensure_dynamics(state);
+    } else {
+        // The MD build will be triggered the next time MD is started or Relax is clicked. Drop the
+        // old state now: its atom count and topology no longer describe the edited molecule.
+        state.mol_editor.md.md = None;
+        state.mol_editor.md.snap = None;
+        state.mol_editor.md.rebuild_required = true;
+        state.mol_editor.rebuild_ff_related(&state.ff_param_set);
+    }
+}

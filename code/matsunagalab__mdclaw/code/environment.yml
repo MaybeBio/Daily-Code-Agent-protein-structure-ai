@@ -1,0 +1,77 @@
+name: mdclaw
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  # --- conda-only or conda-preferred ---
+  - ambertools>=24.0
+  - pdbfixer>=1.9
+  - rdkit>=2023.9.1
+  - openblas
+  - matplotlib
+  - pymol-open-source
+  - pymbar>=4.2.0,<5
+  # Keep both analysis ecosystems available. MDClaw itself uses MDTraj, while
+  # MDAnalysis is useful for external/adaptive-sampling analysis code and has
+  # compiled conda-forge packages for Linux arm64.
+  - mdanalysis>=2.8,<3
+  # Fortran executables for pore analysis; the mdahole2 Python interface is
+  # installed through pyproject.toml in the pip stage below.
+  - hole2=2.3.1
+  # --- openmmforcefields-unification (PR3+) ---
+  # OpenMM 8.5.1 is the floor for openmmforcefields>=0.15.1; 8.6 brings
+  # SourceWithCMAP fixes used by the ff19SB and phosaa19SB conversions.
+  - openmm>=8.5.1
+  # Cap the CUDA build of OpenMM below the 13.x series. conda-forge bakes the
+  # CUDA toolkit its NVRTC was built against into each OpenMM build, and the
+  # PTX that NVRTC emits at runtime must be JIT-compilable by the *cluster's*
+  # GPU driver. A 13.x build needs driver >=R580; on common HPC drivers it
+  # fails silently with CUDA_ERROR_UNSUPPORTED_PTX_VERSION. Capping at <13
+  # deterministically selects the 12.9 build (driver >=R575) regardless of the
+  # solve-time driver, with no GPU-coverage loss (Volta..Blackwell). NOTE:
+  # conda-forge has no <12.9 CUDA build for OpenMM>=8.5, so drivers older than
+  # R575 (e.g. CUDA 12.8 / driver 570) cannot run ANY conda CUDA build of
+  # OpenMM -- use the container/SIF (source-built against CUDA 11.8, driver
+  # >=R520) or run with `--platform OpenCL`.
+  - cuda-version>=12.0,<13
+  - openmmforcefields>=0.16.0
+  - openff-toolkit-base>=0.17.1
+  - openff-nagl>=0.5
+  # openff-pablo runtime deps (per its README: rustworkx for graph algos,
+  # pyxdg for XDG_CACHE_HOME resolution of the CCD download cache).
+  - rustworkx>=0.14
+  - pyxdg>=0.28
+  # HPacker uses torch at import time. Keep this on conda-forge to avoid
+  # mixing pkgs/main PyTorch with conda-forge protobuf on macOS.
+  - pytorch>=2.7,<2.8
+  # openmm-torch is deliberately absent: every conda-forge build pins
+  # openmm <8.5, unsolvable next to the openmm floor above, and ships only the
+  # deprecated TorchForce. The container source-builds the pinned commit with
+  # PythonTorchForce; locally the custom-force path is skipped until that
+  # build exists (docs/developer/conda-env-parity-plan.md).
+  # openmm-plumed 2.1 conda binaries constrain OpenMM below 8.5. Keep our
+  # modern OpenMM and source-build PLUMED 2.9.4 + its plugin into this prefix:
+  # bash container/scripts/build-plumed.sh "$CONDA_PREFIX" /tmp/new-plumed-build
+  - cmake>=3.18,<4
+  - swig
+  - patch
+  - make
+  - cxx-compiler
+  - git
+  # --- pip dependencies (delegated to pyproject.toml) ---
+  - pip
+  - pip:
+    - -e .
+    - e3nn==0.5.0
+    - hpacker @ git+https://github.com/gvisani/hpacker.git
+    # openff-pablo is pre-1.0 and not yet on conda-forge / PyPI; install
+    # the 0.2.2 git tag and pin to <0.3 to absorb expected API churn
+    # before the openff-pablo team cuts a stable release.
+    - openff-pablo @ git+https://github.com/openforcefield/openff-pablo.git@v0.2.2
+    # SST2 (simulated solute tempering) from the matsunagalab fork, pinned to a
+    # commit of the mdclaw branch (GPL-2.0; run_sst2 calls it as a subprocess).
+    # Pulls pdb_numpy from PyPI. A bump changes five sites: this one, and the
+    # pip install line plus MDCLAW_SST2_REVISION in each of the two Dockerfiles
+    # (docs/developer/container.md). ba48461 is the floor for charge-unscaled
+    # solutes; run_sst2 refuses them on an older driver.
+    - "SST2 @ git+https://github.com/matsunagalab/SST2.git@3dc7013"

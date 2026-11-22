@@ -1,0 +1,63 @@
+from pathlib import Path
+
+from pandora.metadata import collect_metadata
+from pandora.parsing import mmcif_to_structure
+
+MMCIF_PATH = (
+    Path(__file__).parent.parent
+    / "datasets"
+    / "dev"
+    / "mmcif"
+    / "04"
+    / "104m.cif"
+)
+
+
+def test_collect_metadata_from_fixture():
+    structure, _, _ = mmcif_to_structure(str(MMCIF_PATH))
+
+    metadata = collect_metadata(structure)
+
+    assert metadata.entry_id == "104M"
+    assert metadata.quality.resolution == 1.71
+    assert metadata.quality.r_work == 0.154
+    assert metadata.quality.r_free == 0.225
+    assert [t.ncbi_taxon_id for t in metadata.taxonomies] == [9755]
+    assert [(e.entity_id, e.chain_ids) for e in metadata.entities] == [
+        ("1", ["A"]),
+        ("2", ["B"]),
+        ("3", ["C"]),
+        ("4", ["D"]),
+        ("5", ["E"]),
+    ]
+    assert [lig.comp_id for lig in metadata.ligands] == ["SO4", "HEM", "NBN"]
+    assert {m.accession for m in metadata.uniprot_mappings} == {"P02185"}
+    assert metadata.raw_categories == sorted(structure.raw)
+
+
+MMCIF_DIR = Path(__file__).parent.parent / "datasets" / "dev" / "mmcif"
+
+
+def _quality(entry_id: str):
+    structure, _, _ = mmcif_to_structure(
+        str(MMCIF_DIR / entry_id[1:3] / f"{entry_id}.cif")
+    )
+    return collect_metadata(structure).quality
+
+
+def test_cryo_em_resolution_falls_back_to_em_3d_reconstruction():
+    quality = _quality("22jy")
+    assert quality.resolution == 2.2
+    assert "_em_3d_reconstruction" in quality.provenance.source_category
+
+
+def test_xray_resolution_comes_from_refine():
+    quality = _quality("1a08")
+    assert quality.resolution == 2.2
+    assert "_em_3d_reconstruction" not in quality.provenance.source_category
+
+
+def test_rmerge_extracted_when_rsym_missing():
+    quality = _quality("1a08")
+    assert quality.r_sym is None
+    assert quality.r_merge == 0.086

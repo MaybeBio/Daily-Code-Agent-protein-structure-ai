@@ -1,0 +1,59 @@
+from molsysmt._private.argdigest import arg_digest
+
+
+@arg_digest(form="file:cif.gz")
+def to_molsysmt_MolSys(
+    item,
+    atom_indices="all",
+    structure_indices="all",
+    skip_digestion=False,
+    *,
+    get_missing_bonds=True,
+):
+    """
+    Converting from file:cif.gz to molsysmt.MolSys.
+
+
+    Parameters
+    ----------
+    item : molecular system
+        Argument item.
+    atom_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Atom indices (0-based) to include.
+    structure_indices : int, list, tuple, or numpy.ndarray, default='all'
+        Structure indices (0-based) to include or process.
+    skip_digestion : bool, default=False
+        Whether to skip MolSysMT's internal argument digestion mechanism.
+    get_missing_bonds : bool, default=True
+        Whether to infer missing connectivity. False retains only supported
+        deposited chem_comp_bond/struct_conn declarations, without template,
+        terminal-H, peptide-link or distance inference. It does not certify
+        complete chemistry or change the previous enabled default.
+
+    Returns
+    -------
+    molsysmt.MolSys
+        Resulting object in molsysmt.MolSys form.
+
+
+    .. versionadded:: 1.0.0
+    """
+
+    from molsysmt.form.mmcif_PdbxContainers_DataContainer.to_molsysmt_MolSys import (
+        to_molsysmt_MolSys as mmcif_PdbxContainers_DataContainer_to_molsysmt_MolSys,
+    )
+
+    from .to_mmcif_PdbxContainers_DataContainer import (
+        to_mmcif_PdbxContainers_DataContainer,
+    )
+
+    tmp_item = to_mmcif_PdbxContainers_DataContainer(item, skip_digestion=True)
+    tmp_item = mmcif_PdbxContainers_DataContainer_to_molsysmt_MolSys(
+        tmp_item,
+        atom_indices=atom_indices,
+        structure_indices=structure_indices,
+        get_missing_bonds=get_missing_bonds,
+        skip_digestion=True,
+    )
+
+    return tmp_item

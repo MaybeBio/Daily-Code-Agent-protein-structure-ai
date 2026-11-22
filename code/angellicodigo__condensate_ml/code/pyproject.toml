@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "condensate_ml"
+version = "0.1.0"
+description = "JAX MD Rubisco-EPYC1 differentiable Brownian dynamics simulation"
+requires-python = ">=3.10"
+dependencies = [
+    "jax",
+    "jax-md",
+    "numpy",
+]
+
+[project.optional-dependencies]
+cuda12 = [
+    "jax[cuda12]",
+]
+
+[tool.setuptools]
+packages = [
+    "condensate_ml",
+    "condensate_ml.helper",
+]
+
+[tool.setuptools.package-dir]
+condensate_ml = "src"
+"condensate_ml.helper" = "helper"

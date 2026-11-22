@@ -1,0 +1,293 @@
+/*
+ * Lazily loaded style registries (generated from the registry modules; tests/engineLazyStyles.test.ts checks that
+ * every name here is exactly what its module registers). These modules are not imported by styles.ts: the session
+ * loads a group before a command that names one of its styles (Session.dispatch -> ensureStyles), so the engine
+ * worker's first chunk stays small (npm run check:size, engine budget). Add a registry module here only if no
+ * statically imported engine code needs it.
+ */
+
+/** HOOKS: not styles but helpers that core commands call (nativeRandom.ts), named by the command words that need them. */
+/** COMMANDS: general commands a lazy group adds to the session's command table (styles.ts LAZY_COMMANDS). */
+/** MINIMIZERS: min_style names (run/minimizers.ts). */
+export type StyleKind = 'PAIRS' | 'BONDS' | 'ANGLES' | 'DIHEDRALS' | 'IMPROPERS' | 'KSPACES' | 'FIXES' | 'COMPUTES' | 'HOOKS' | 'COMMANDS' | 'MINIMIZERS';
+export type StyleModule = Partial<Record<StyleKind, Record<string, unknown>>>;
+
+export interface LazyGroup {
+  /** registry module name (src/engine/registry/<id>.ts) */
+  id: string;
+  names: Partial<Record<StyleKind, readonly string[]>>;
+  load: () => Promise<StyleModule>;
+}
+
+/**
+ * The GPL-ported pair styles the pair threads run (cpu/threadedPairs.ts THREADED_NAMES): the pair worker loads their
+ * factories with loadGplThreadedPair (the core reaches src/engine-gpl only through this module, rule 7).
+ */
+export const GPL_THREADED_PAIRS: readonly string[] = [
+  'sw',
+  // pairwise styles of the CORESHELL and KSPACE ports whose loops read nothing but the PairCompute arrays
+  // eff/cut: the electron spin and radius in, the radial electron force out (Pair.threadExtras)
+  'eff/cut',
+  'born/coul/long/cs', 'buck/coul/long/cs', 'born/coul/dsf/cs', 'born/coul/wolf/cs', 'coul/wolf/cs', 'coul/long/cs', 'lj/cut/coul/long/cs', 'lj/class2/coul/long/cs', 'buck/long/coul/long',
+  // pace: full list in native order, rows add to their own atoms; a worker's copy rebuilds the basis (Pair.threadAdopt)
+  'pace',
+];
+
+/**
+ * The GPL-ported pair styles computed on the engine thread whose own loops the pair threads share (Pair.threadKernel,
+ * PairCompute.kernels; not in THREADED_NAMES): the workers load their factories as those of GPL_THREADED_PAIRS.
+ */
+export const GPL_KERNEL_PAIRS: readonly string[] = [
+  // reaxff: the uncorrected bond orders of every far pair within the bond cutoff (its loop 'bop')
+  'reaxff',
+];
+
+/**
+ * The registry module of the GPL-ported pair styles for the pair threads (engine-gpl/registry/threaded_pairs.ts), loaded
+ * on the engine thread: its factory for `name` and the module's own URL, which the pair worker imports (the worker's
+ * bundle then holds no GPL code and none of this table), or null for a style it does not list.
+ */
+export const loadGplThreadedPair = async (name: string): Promise<{ make: () => import('./force/types').Pair; url: string } | null> => {
+  if (!GPL_THREADED_PAIRS.includes(name) && !GPL_KERNEL_PAIRS.includes(name)) return null;
+  const m = await import('../engine-gpl/registry/threaded_pairs');
+  const make = (m.THREADED as Partial<Record<string, () => import('./force/types').Pair>>)[name];
+  return make ? { make, url: m.MODULE_URL } : null;
+};
+
+export const LAZY_GROUPS: readonly LazyGroup[] = [
+  { id: 'gpl_libm', names: { HOOKS: ['libm'] }, load: () => import('../engine-gpl/registry/libm') as Promise<StyleModule> },
+  { id: 'gpl_neigh_one', names: { HOOKS: ['neigh_one'] }, load: () => import('../engine-gpl/registry/neigh_one') as Promise<StyleModule> },
+  { id: 'gpl_mathextra', names: { HOOKS: ['mathextra'] }, load: () => import('../engine-gpl/registry/mathextra') as Promise<StyleModule> },
+  { id: 'gpl_wall_region_colloid', names: { HOOKS: ['colloid'] }, load: () => import('../engine-gpl/registry/wall_region_colloid') as Promise<StyleModule> },
+  { id: 'gpl_wall_gran_region', names: { HOOKS: ['wall/gran/region', 'wall/region'] }, load: () => import('../engine-gpl/registry/wall_gran_region') as Promise<StyleModule> },
+  { id: 'gpl_restart', names: { HOOKS: ['native-restart'] }, load: () => import('../engine-gpl/registry/restart') as Promise<StyleModule> },
+  { id: 'gpl_write_data_body', names: { HOOKS: ['body'] }, load: () => import('../engine-gpl/registry/write_data_body') as Promise<StyleModule> },
+  { id: 'gpl_dump_vtk', names: { HOOKS: ['vtk'] }, load: () => import('../engine-gpl/registry/dump_vtk') as Promise<StyleModule> },
+  { id: 'gpl_dump_grid', names: { HOOKS: ['grid', 'grid/vtk'] }, load: () => import('../engine-gpl/registry/dump_grid') as Promise<StyleModule> },
+  { id: 'gpl_dump_cfg', names: { HOOKS: ['cfg', 'cfg/uef'] }, load: () => import('../engine-gpl/registry/dump_cfg') as Promise<StyleModule> },
+  { id: 'gpl_dump_traj', names: { HOOKS: ['dcd', 'xtc'] }, load: () => import('../engine-gpl/registry/dump_traj') as Promise<StyleModule> },
+  { id: 'gpl_dump_h5md', names: { HOOKS: ['h5md'] }, load: () => import('../engine-gpl/registry/dump_h5md') as Promise<StyleModule> },
+  { id: 'gpl_group_group', names: { HOOKS: ['group/group'] }, load: () => import('../engine-gpl/registry/group_group') as Promise<StyleModule> },
+  { id: 'gpl_tally2', names: { COMPUTES: ['heat/flux/tally', 'heat/flux/virial/tally'] }, load: () => import('../engine-gpl/registry/tally2') as Promise<StyleModule> },
+  { id: 'gpl_uef', names: { COMPUTES: ['pressure/uef', 'temp/uef'], FIXES: ['npt/uef', 'nvt/uef'] }, load: () => import('../engine-gpl/registry/uef') as Promise<StyleModule> },
+  { id: 'gpl_random', names: { HOOKS: ['dipole/random', 'geom', 'quat/random', 'random', 'spin/atom/random', 'spin/random', 'theta/random', 'type/fraction', 'type/ratio', 'type/subset'] }, load: () => import('../engine-gpl/registry/random') as Promise<StyleModule> },
+  { id: 'gpl_hma', names: { COMPUTES: ['hma'] }, load: () => import('../engine-gpl/registry/hma') as Promise<StyleModule> },
+  { id: 'gpl_born_matrix', names: { COMPUTES: ['born/matrix'] }, load: () => import('../engine-gpl/registry/born_matrix') as Promise<StyleModule> },
+  { id: 'gpl_lj_long_disp', names: { HOOKS: ['lj/long/coul/long'], PAIRS: ['lj/long/tip4p/long'] }, load: () => import('../engine-gpl/registry/lj_long_disp') as Promise<StyleModule> },
+  { id: 'gpl_arg_checks', names: { HOOKS: ['fix', 'compute', 'pair_style', 'native_styles', 'atom_style', 'pair_unset', 'pair_q'] }, load: () => import('../engine-gpl/registry/arg_checks') as Promise<StyleModule> },
+  { id: 'gpl_pair_local', names: { HOOKS: ['pair/local', 'property/local', 'eam', 'eam/alloy', 'eam/fs', 'granular'] }, load: () => import('../engine-gpl/registry/pair_local') as Promise<StyleModule> },
+  { id: 'gpl_rigid_nh', names: { FIXES: ['rigid/nph', 'rigid/nph/small', 'rigid/npt', 'rigid/npt/small', 'rigid/nvt', 'rigid/nvt/small'] }, load: () => import('../engine-gpl/registry/fix_rigid_nh') as Promise<StyleModule> },
+  { id: 'gpl_hyper_local', names: { FIXES: ['hyper/local'] }, load: () => import('../engine-gpl/registry/hyper_local') as Promise<StyleModule> },
+  { id: 'gpl_rigid_meso', names: { FIXES: ['rigid/meso'] }, load: () => import('../engine-gpl/registry/fix_rigid_meso') as Promise<StyleModule> },
+  { id: 'gpl_electrode', names: { FIXES: ['electrode/conp', 'electrode/conq', 'electrode/thermo'], KSPACES: ['ewald/electrode', 'pppm/electrode'] }, load: () => import('../engine-gpl/registry/electrode') as Promise<StyleModule> },
+  { id: 'gpl_localdensity', names: { PAIRS: ['local/density'] }, load: () => import('../engine-gpl/registry/localdensity') as Promise<StyleModule> },
+  { id: 'gpl_ldd', names: { PAIRS: ['ldd'] }, load: () => import('../engine-gpl/registry/ldd') as Promise<StyleModule> },
+  { id: 'gpl_sdpd', names: { PAIRS: ['sdpd/taitwater/isothermal'] }, load: () => import('../engine-gpl/registry/sdpd') as Promise<StyleModule> },
+  { id: 'gpl_machdyn', names: { COMPUTES: ['smd/contact/radius', 'smd/damage', 'smd/internal/energy', 'smd/plastic/strain', 'smd/plastic/strain/rate', 'smd/rho', 'smd/tlsph/dt', 'smd/tlsph/num/neighs', 'smd/tlsph/shape', 'smd/tlsph/strain', 'smd/tlsph/strain/rate', 'smd/tlsph/stress', 'smd/ulsph/effm', 'smd/ulsph/num/neighs', 'smd/ulsph/strain', 'smd/ulsph/strain/rate', 'smd/ulsph/stress', 'smd/vol'], FIXES: ['smd/adjust_dt', 'smd/integrate_tlsph', 'smd/integrate_ulsph', 'smd/setvel', 'smd/wall_surface'], PAIRS: ['smd/hertz', 'smd/tlsph', 'smd/tri_surface', 'smd/ulsph'] }, load: () => import('../engine-gpl/registry/machdyn') as Promise<StyleModule> },
+  { id: 'gpl_amoeba', names: { PAIRS: ['amoeba', 'hippo'], ANGLES: ['amoeba'], IMPROPERS: ['amoeba'], FIXES: ['amoeba/pitorsion', 'amoeba/bitorsion'] }, load: () => import('../engine-gpl/registry/amoeba') as Promise<StyleModule> },
+  { id: 'gpl_entropy_basal', names: { COMPUTES: ['basal/atom', 'entropy/atom'] }, load: () => import('../engine-gpl/registry/entropy_basal') as Promise<StyleModule> },
+  { id: 'gpl_diffraction', names: { COMPUTES: ['saed', 'xrd'], FIXES: ['saed/vtk'] }, load: () => import('../engine-gpl/registry/diffraction') as Promise<StyleModule> },
+  { id: 'gpl_uf3', names: { PAIRS: ['uf3'] }, load: () => import('../engine-gpl/registry/uf3') as Promise<StyleModule> },
+  { id: 'gpl_dpd', names: { PAIRS: ['dpd', 'dpd/ext', 'dpd/ext/tstat', 'dpd/tstat'] }, load: () => import('../engine-gpl/registry/dpd') as Promise<StyleModule> },
+  { id: 'gpl_neb_spin', names: { COMMANDS: ['neb/spin'], FIXES: ['neb/spin'] }, load: () => import('../engine-gpl/registry/neb_spin') as Promise<StyleModule> },
+  { id: 'gpl_replica', names: { COMMANDS: ['prd', 'tad', 'temper', 'temper/npt', 'temper/grem'], COMPUTES: ['pressure/alchemy'], FIXES: ['alchemy'] }, load: () => import('../engine-gpl/registry/replica') as Promise<StyleModule> },
+  { id: 'gpl_pimd', names: { FIXES: ['pimd', 'pimd/nvt', 'pimd/nvt/bosonic', 'pimd/langevin', 'pimd/langevin/bosonic'] }, load: () => import('../engine-gpl/registry/pimd') as Promise<StyleModule> },
+  { id: 'gpl_thermostat', names: { FIXES: ['temp/csld', 'temp/csvr'] }, load: () => import('../engine-gpl/registry/thermostat') as Promise<StyleModule> },
+  { id: 'gpl_dpdmeso', names: { COMPUTES: ['edpd/temp/atom', 'tdpd/cc/atom'], FIXES: ['edpd/source', 'mvv/dpd', 'mvv/edpd', 'mvv/tdpd', 'tdpd/source'], PAIRS: ['edpd', 'mdpd', 'mdpd/rhosum', 'tdpd'] }, load: () => import('../engine-gpl/registry/dpdmeso') as Promise<StyleModule> },
+  { id: 'gpl_ptm', names: { COMPUTES: ['ptm/atom'] }, load: () => import('../engine-gpl/registry/ptm') as Promise<StyleModule> },
+  { id: 'gpl_rheo', names: { FIXES: ['rheo', 'rheo/pressure', 'rheo/viscosity', 'rheo/thermal', 'rheo/oxidation', 'add/heat'], BONDS: ['rheo/shell'], PAIRS: ['rheo', 'rheo/solid'], COMPUTES: ['rheo/property/atom'] }, load: () => import('../engine-gpl/registry/rheo') as Promise<StyleModule> },
+  { id: 'gpl_dpdreact', names: { PAIRS: ['dpd/fdt', 'dpd/fdt/energy'], FIXES: ['dpd/energy', 'eos/cv', 'shardlow'], COMPUTES: ['dpd', 'dpd/atom'] }, load: () => import('../engine-gpl/registry/dpdreact') as Promise<StyleModule> },
+  { id: 'gpl_dpdrx', names: { PAIRS: ['exp6/rx', 'table/rx', 'multi/lucy/rx'], FIXES: ['rx', 'eos/table/rx'] }, load: () => import('../engine-gpl/registry/dpdrx') as Promise<StyleModule> },
+  { id: 'gpl_srd', names: { FIXES: ['srd'] }, load: () => import('../engine-gpl/registry/srd') as Promise<StyleModule> },
+  { id: 'gpl_phonon', names: { COMMANDS: ['dynamical_matrix', 'third_order'], FIXES: ['phonon'] }, load: () => import('../engine-gpl/registry/phonon') as Promise<StyleModule> },
+  { id: 'gpl_qtb', names: { FIXES: ['qbmsst', 'qtb'] }, load: () => import('../engine-gpl/registry/qtb') as Promise<StyleModule> },
+  { id: 'gpl_meam_ms', names: { PAIRS: ['meam/ms', 'meam'] }, load: () => import('../engine-gpl/registry/meam_ms') as Promise<StyleModule> },
+  { id: 'gpl_pafi', names: { FIXES: ['pafi'] }, load: () => import('../engine-gpl/registry/pafi') as Promise<StyleModule> },
+  { id: 'gpl_pod', names: { PAIRS: ['pod'], COMPUTES: ['pod/atom', 'podd/atom', 'pod/global', 'pod/local'] }, load: () => import('../engine-gpl/registry/pod') as Promise<StyleModule> },
+  { id: 'gpl_slcsa', names: { COMPUTES: ['slcsa/atom'] }, load: () => import('../engine-gpl/registry/slcsa') as Promise<StyleModule> },
+  { id: 'adapt_pairs', names: { HOOKS: ['adapt'] }, load: () => import('./registry/adapt_pairs') as Promise<StyleModule> },
+  // loaded by the word image (dump/write_dump ... image); its createDump joins gpl_graphics' shading helpers in that slot
+  { id: 'dump_image', names: { HOOKS: ['image'] }, load: () => import('./registry/dump_image') as Promise<StyleModule> },
+  // loaded by the words restart, write_restart and read_restart: the restart file writer and reader of the core
+  { id: 'restart_text', names: { HOOKS: ['restart', 'write_restart', 'read_restart'] }, load: () => import('./registry/restart_text') as Promise<StyleModule> },
+  { id: 'pair_meam_spline', names: { PAIRS: ['meam/spline', 'meam/sw/spline'] }, load: () => import('./registry/pair_meam_spline') as Promise<StyleModule> },
+  { id: 'pair_snap', names: { PAIRS: ['snap'] }, load: () => import('./registry/pair_snap') as Promise<StyleModule> },
+  { id: 'compute_sna', names: { COMPUTES: ['sna/atom', 'snad/atom', 'snav/atom'] }, load: () => import('./registry/compute_sna') as Promise<StyleModule> },
+  { id: 'compute_snap15', names: { COMPUTES: ['gaussian/grid/local', 'sna/grid', 'sna/grid/local', 'snap'] }, load: () => import('./registry/compute_snap15') as Promise<StyleModule> },
+  { id: 'mliap', names: { COMPUTES: ['mliap'], PAIRS: ['mliap'] }, load: () => import('./registry/mliap') as Promise<StyleModule> },
+  { id: 'pair_granular', names: { PAIRS: ['granular'] }, load: () => import('./registry/pair_granular') as Promise<StyleModule> },
+  { id: 'superellipsoid', names: { PAIRS: ['granular/superellipsoid'] }, load: () => import('../engine-gpl/registry/superellipsoid') as Promise<StyleModule> },
+  { id: 'gpl_pair_gran', names: { PAIRS: ['gran/hertz/history', 'gran/hooke', 'gran/hooke/history'] }, load: () => import('../engine-gpl/registry/pair_gran') as Promise<StyleModule> },
+  { id: 'gpl_gran_single', names: { HOOKS: ['gran/hertz/history', 'gran/hooke', 'gran/hooke/history'] }, load: () => import('../engine-gpl/registry/gran_single') as Promise<StyleModule> },
+  // the WebGPU kernel of the gran pairs (gpu/atomKernel.ts), read by run/accel.ts through gplHook(<style name>)
+  { id: 'gpl_gran_gpu', names: { HOOKS: ['gran/hertz/history', 'gran/hooke', 'gran/hooke/history'] }, load: () => import('../engine-gpl/registry/gran_gpu') as Promise<StyleModule> },
+  { id: 'fix_wallgran', names: { FIXES: ['freeze', 'heat/flow', 'wall/gran', 'wall/gran/region'] }, load: () => import('./registry/fix_wallgran') as Promise<StyleModule> },
+  { id: 'fix_gcmc', names: { FIXES: ['gcmc'] }, load: () => import('./registry/fix_gcmc') as Promise<StyleModule> },
+  { id: 'fix_external', names: { FIXES: ['external'] }, load: () => import('./registry/fix_external') as Promise<StyleModule> },
+  { id: 'fix_widom', names: { FIXES: ['widom'] }, load: () => import('./registry/fix_widom') as Promise<StyleModule> },
+  { id: 'gpl_fix_hmc', names: { FIXES: ['hmc'] }, load: () => import('../engine-gpl/registry/fix_hmc') as Promise<StyleModule> },
+  { id: 'fix_molswap', names: { FIXES: ['mol/swap'] }, load: () => import('./registry/fix_molswap') as Promise<StyleModule> },
+  { id: 'compute_voro', names: { COMPUTES: ['voronoi/atom'] }, load: () => import('./registry/compute_voro') as Promise<StyleModule> },
+  { id: 'gpl_neighbor_swap', names: { FIXES: ['neighbor/swap'], HOOKS: ['voronoi/atom'] }, load: () => import('../engine-gpl/registry/neighbor_swap') as Promise<StyleModule> },
+  { id: 'gpl_sgcmc', names: { FIXES: ['sgcmc'] }, load: () => import('../engine-gpl/registry/sgcmc') as Promise<StyleModule> },
+  { id: 'peri22', names: { COMPUTES: ['damage/atom', 'dilatation/atom'], PAIRS: ['peri/lps', 'peri/pmb'] }, load: () => import('./registry/peri22') as Promise<StyleModule> },
+  { id: 'peri_ves_eps', names: { COMPUTES: ['plasticity/atom'], PAIRS: ['peri/eps', 'peri/ves'] }, load: () => import('../engine-gpl/registry/peri') as Promise<StyleModule> },
+  { id: 'pair_tip4p', names: { PAIRS: ['lj/cut/tip4p/cut', 'lj/cut/tip4p/long', 'tip4p/cut', 'tip4p/long'] }, load: () => import('./registry/pair_tip4p') as Promise<StyleModule> },
+  { id: 'kspace_tip4p', names: { KSPACES: ['pppm/tip4p', 'zero'] }, load: () => import('./registry/kspace_tip4p') as Promise<StyleModule> },
+  { id: 'kspace_dipole44', names: { KSPACES: ['ewald/dipole'] }, load: () => import('./registry/kspace_dipole44') as Promise<StyleModule> },
+  { id: 'gpl_dipole', names: { PAIRS: ['lj/cut/dipole/long'], KSPACES: ['pppm/dipole'] }, load: () => import('../engine-gpl/registry/dipole') as Promise<StyleModule> },
+  { id: 'gpl_pppm_disp', names: { KSPACES: ['pppm/disp', 'pppm/disp/tip4p'] }, load: () => import('../engine-gpl/registry/pppm_disp') as Promise<StyleModule> },
+  { id: 'gpl_esp', names: { KSPACES: ['esp'], PAIRS: ['coul/esp', 'lj/cut/coul/esp'] }, load: () => import('../engine-gpl/registry/esp') as Promise<StyleModule> },
+  { id: 'pair_dipole18', names: { PAIRS: ['lj/cut/dipole/cut', 'lj/sf/dipole/sf'] }, load: () => import('./registry/pair_dipole18') as Promise<StyleModule> },
+  { id: 'fix_ttm', names: { FIXES: ['ttm', 'ttm/grid', 'ttm/mod', 'ttm/thermal', 'ttm/cascade'] }, load: () => import('./registry/fix_ttm') as Promise<StyleModule> },
+  { id: 'compute_tally47', names: { COMPUTES: ['force/tally', 'group/group', 'pe/tally', 'stress/tally'] }, load: () => import('./registry/compute_tally47') as Promise<StyleModule> },
+  { id: 'gpl_spin', names: { PAIRS: ['spin/dipole/cut', 'spin/neel', 'spin/dipole/long'], FIXES: ['langevin/spin'], KSPACES: ['ewald/dipole/spin', 'pppm/dipole/spin'], MINIMIZERS: ['spin', 'spin/cg', 'spin/lbfgs'] }, load: () => import('../engine-gpl/registry/spin') as Promise<StyleModule> },
+  { id: 'spin', names: { PAIRS: ['spin/exchange', 'spin/exchange/biquadratic', 'spin/dmi', 'spin/magelec'], COMPUTES: ['spin'], FIXES: ['nve/spin', 'precession/spin', 'setforce/spin'] }, load: () => import('./registry/spin') as Promise<StyleModule> },
+  { id: 'fix_numdiff', names: { FIXES: ['numdiff', 'numdiff/virial'] }, load: () => import('./registry/fix_numdiff') as Promise<StyleModule> },
+  { id: 'fix_qeq', names: { FIXES: ['qeq/dynamic', 'qeq/fire', 'qeq/point', 'qeq/shielded', 'qeq/slater'] }, load: () => import('../engine-gpl/registry/fix_qeq') as Promise<StyleModule> },
+  { id: 'fix_cmap', names: { FIXES: ['cmap'] }, load: () => import('./registry/fix_cmap') as Promise<StyleModule> },
+  { id: 'lepton', names: { ANGLES: ['lepton'], BONDS: ['lepton'], DIHEDRALS: ['lepton'], FIXES: ['efield/lepton', 'wall/lepton'], PAIRS: ['lepton', 'lepton/coul', 'lepton/sphere'] }, load: () => import('./registry/lepton') as Promise<StyleModule> },
+  { id: 'pair_tersoff2', names: { PAIRS: ['tersoff/mod', 'tersoff/mod/c', 'tersoff/zbl'] }, load: () => import('./registry/pair_tersoff2') as Promise<StyleModule> },
+  { id: 'pair_vashishta', names: { PAIRS: ['vashishta'] }, load: () => import('./registry/pair_vashishta') as Promise<StyleModule> },
+  { id: 'pair_soft17', names: { PAIRS: ['coul/cut/soft', 'coul/long/soft', 'lj/charmm/coul/long/soft', 'lj/class2/coul/cut/soft', 'lj/class2/coul/long/soft', 'lj/class2/soft', 'lj/cut/coul/cut/soft', 'lj/cut/coul/long/soft', 'lj/cut/soft'] }, load: () => import('./registry/pair_soft17') as Promise<StyleModule> },
+  { id: 'pair_colloid', names: { PAIRS: ['colloid'] }, load: () => import('./registry/pair_colloid') as Promise<StyleModule> },
+  { id: 'pair_ycolloid', names: { PAIRS: ['yukawa/colloid'] }, load: () => import('./registry/pair_ycolloid') as Promise<StyleModule> },
+  { id: 'pair_relres', names: { PAIRS: ['lj/relres'] }, load: () => import('./registry/pair_relres') as Promise<StyleModule> },
+  { id: 'pair_hbond', names: { PAIRS: ['hbond/dreiding/lj', 'hbond/dreiding/lj/angleoffset', 'hbond/dreiding/morse', 'hbond/dreiding/morse/angleoffset'] }, load: () => import('./registry/pair_hbond') as Promise<StyleModule> },
+  { id: 'body48', names: { FIXES: ['nve/body'], PAIRS: ['body/nparticle'] }, load: () => import('./registry/body48') as Promise<StyleModule> },
+  { id: 'gpl_body', names: { PAIRS: ['body/rounded/polygon', 'body/rounded/polyhedron'], FIXES: ['nvt/body', 'npt/body', 'nph/body', 'wall/body/polygon', 'wall/body/polyhedron'], COMPUTES: ['temp/body', 'body/local'] }, load: () => import('../engine-gpl/registry/body') as Promise<StyleModule> },
+  { id: 'asphere19', names: { COMPUTES: ['erotate/asphere', 'temp/asphere'], FIXES: ['nph/asphere', 'npt/asphere', 'nve/asphere', 'nve/asphere/noforce', 'nvt/asphere'] }, load: () => import('./registry/asphere19') as Promise<StyleModule> },
+  { id: 'pair_asphere19', names: { PAIRS: ['resquared'] }, load: () => import('./registry/pair_asphere19') as Promise<StyleModule> },
+  { id: 'gpl_asphere_gayberne', names: { PAIRS: ['gayberne'] }, load: () => import('../engine-gpl/registry/pair_gayberne') as Promise<StyleModule> },
+  { id: 'compute_struct', names: { COMPUTES: ['aggregate/atom', 'centro/atom', 'cluster/atom', 'cna/atom', 'fragment/atom', 'hexorder/atom'] }, load: () => import('./registry/compute_struct') as Promise<StyleModule> },
+  { id: 'compute_orient', names: { COMPUTES: ['orientorder/atom'] }, load: () => import('./registry/compute_orient') as Promise<StyleModule> },
+  { id: 'dihedral_class2xe', names: { DIHEDRALS: ['class2xe'] }, load: () => import('../engine-gpl/registry/dihedral_class2xe') as Promise<StyleModule> },
+  { id: 'gpl_dihedral_class2', names: { DIHEDRALS: ['class2'] }, load: () => import('../engine-gpl/registry/dihedral_class2') as Promise<StyleModule> },
+  { id: 'gpl_angle_class2', names: { ANGLES: ['class2'] }, load: () => import('../engine-gpl/registry/angle_class2') as Promise<StyleModule> },
+  { id: 'class2_35', names: { IMPROPERS: ['class2'] }, load: () => import('./registry/class2_35') as Promise<StyleModule> },
+  { id: 'fix_ehex', names: { FIXES: ['ehex', 'heat'] }, load: () => import('./registry/fix_ehex') as Promise<StyleModule> },
+  { id: 'fix_pkgsmall47', names: { FIXES: ['dt/reset', 'electron/stopping', 'ave/moments'] }, load: () => import('./registry/fix_pkgsmall47') as Promise<StyleModule> },
+  { id: 'fix_gk', names: { FIXES: ['ave/correlate', 'thermal/conductivity', 'viscosity'] }, load: () => import('./registry/fix_gk') as Promise<StyleModule> },
+  { id: 'compute_gk', names: { COMPUTES: ['heat/flux'] }, load: () => import('./registry/compute_gk') as Promise<StyleModule> },
+  { id: 'fix_boxrelax', names: { FIXES: ['box/relax'] }, load: () => import('./registry/fix_boxrelax') as Promise<StyleModule> },
+  { id: 'fix_restrain', names: { FIXES: ['evaporate', 'restrain', 'spring/rg'] }, load: () => import('./registry/fix_restrain') as Promise<StyleModule> },
+  { id: 'compute_restrain', names: { COMPUTES: ['msd/nongauss'] }, load: () => import('./registry/compute_restrain') as Promise<StyleModule> },
+  { id: 'fix_pour', names: { FIXES: ['deposit', 'pour'] }, load: () => import('./registry/fix_pour') as Promise<StyleModule> },
+  { id: 'pair_3body', names: { PAIRS: ['tersoff'] }, load: () => import('./registry/pair_3body') as Promise<StyleModule> },
+  { id: 'pair_airebo', names: { PAIRS: ['airebo', 'airebo/morse', 'airebo/bc', 'rebo'] }, load: () => import('../engine-gpl/registry/pair_airebo') as Promise<StyleModule> },
+  { id: 'pair_batch49', names: { PAIRS: ['buck6d/coul/gauss/dsf', 'buck6d/coul/gauss/long', 'gauss/cut', 'coul/diel', 'momb'] }, load: () => import('./registry/pair_batch49') as Promise<StyleModule> },
+  { id: 'pair_potbatch48', names: { PAIRS: ['pedone', 'smatb', 'smatb/single'] }, load: () => import('./registry/pair_potbatch48') as Promise<StyleModule> },
+  { id: 'pair_batch49', names: { PAIRS: ['buck6d/coul/gauss/dsf', 'buck6d/coul/gauss/long', 'gauss/cut', 'coul/diel', 'momb'] }, load: () => import('./registry/pair_batch49') as Promise<StyleModule> },
+  { id: 'bonded50', names: { ANGLES: ['class2/p6', 'cosine/buck6d'], IMPROPERS: ['inversion/harmonic'] }, load: () => import('./registry/bonded50') as Promise<StyleModule> },
+  { id: 'pair_sw', names: { PAIRS: ['sw/mod'] }, load: () => import('./registry/pair_sw') as Promise<StyleModule> },
+  { id: 'pair_mbtable49', names: { PAIRS: ['threebody/table', 'sw/angle/table'] }, load: () => import('./registry/pair_mbtable49') as Promise<StyleModule> },
+  { id: 'gpl_granular_mdr', names: { HOOKS: ['mdr'] }, load: () => import('../engine-gpl/registry/granular_mdr') as Promise<StyleModule> },
+  { id: 'gpl_granular_jkr', names: { HOOKS: ['jkr'] }, load: () => import('../engine-gpl/registry/granular_jkr') as Promise<StyleModule> },
+  { id: 'gpl_granular_gpu', names: { HOOKS: ['granular'] }, load: () => import('../engine-gpl/registry/granular_gpu') as Promise<StyleModule> },
+  { id: 'gpl_tri', names: { HOOKS: ['tri'] }, load: () => import('../engine-gpl/registry/tri_hook') as Promise<StyleModule> },
+  { id: 'gpl_reset_atoms', names: { HOOKS: ['reset_atoms'] }, load: () => import('../engine-gpl/registry/reset_atoms_hook') as Promise<StyleModule> },
+  { id: 'gpl_linemin', names: { HOOKS: ['minimize', 'hyper', 'prd', 'tad', 'neb'] }, load: () => import('../engine-gpl/registry/linemin') as Promise<StyleModule> },
+  { id: 'gpl_pppm', names: { HOOKS: ['pppm', 'pppm/cg', 'pppm/dielectric', 'pppm/electrode', 'pppm/rk', 'pppm/tip4p'] }, load: () => import('../engine-gpl/registry/pppm') as Promise<StyleModule> },
+  { id: 'line_tri', names: { FIXES: ['nve/line', 'nve/tri'], PAIRS: ['line/lj', 'tri/lj'] }, load: () => import('../engine-gpl/registry/line_tri') as Promise<StyleModule> },
+  { id: 'eff', names: { COMPUTES: ['ke/atom/eff', 'ke/eff', 'temp/eff', 'temp/region/eff'], FIXES: ['nph/eff', 'npt/eff', 'nve/eff', 'nvt/eff', 'temp/rescale/eff'], PAIRS: ['eff/cut'] }, load: () => import('../engine-gpl/registry/eff') as Promise<StyleModule> },
+  // the WebGPU kernel of pair eff/cut (gpu/atomKernel.ts), read by run/accel.ts through gplHook('eff/cut')
+  { id: 'gpl_eff_gpu', names: { HOOKS: ['eff/cut'] }, load: () => import('../engine-gpl/registry/eff_gpu') as Promise<StyleModule> },
+  { id: 'gransurf', names: { PAIRS: ['surf/granular'], FIXES: ['surface/local', 'surface/global'] }, load: () => import('../engine-gpl/registry/gransurf') as Promise<StyleModule> },
+  { id: 'pair_comb', names: { PAIRS: ['comb', 'comb3'], FIXES: ['qeq/comb'] }, load: () => import('../engine-gpl/registry/pair_comb') as Promise<StyleModule> },
+  { id: 'pair_smtbq', names: { PAIRS: ['smtbq'] }, load: () => import('../engine-gpl/registry/pair_smtbq') as Promise<StyleModule> },
+  { id: 'pair_rebomos', names: { PAIRS: ['rebomos'] }, load: () => import('../engine-gpl/registry/pair_rebomos') as Promise<StyleModule> },
+  { id: 'pair_ylz', names: { PAIRS: ['ylz'] }, load: () => import('../engine-gpl/registry/pair_ylz') as Promise<StyleModule> },
+  { id: 'pair_mm3', names: { PAIRS: ['mm3/switch3/coulgauss/long'] }, load: () => import('../engine-gpl/registry/pair_mm3') as Promise<StyleModule> },
+  { id: 'pair_misc4', names: { PAIRS: ['lj/sf'] }, load: () => import('./registry/pair_misc4') as Promise<StyleModule> },
+  { id: 'pair_misc5', names: { PAIRS: ['atm', 'nb3b/harmonic', 'nb3b/screened'] }, load: () => import('./registry/pair_misc5') as Promise<StyleModule> },
+  { id: 'pair_misc13', names: { PAIRS: ['vashishta/table'] }, load: () => import('./registry/pair_misc13') as Promise<StyleModule> },
+  { id: 'fix_misc13', names: { FIXES: ['ave/grid', 'controller'] }, load: () => import('./registry/fix_misc13') as Promise<StyleModule> },
+  { id: 'fix_misc14', names: { FIXES: ['accelerate/cos'] }, load: () => import('./registry/fix_misc14') as Promise<StyleModule> },
+  { id: 'compute_misc13', names: { COMPUTES: ['event/displace'] }, load: () => import('./registry/compute_misc13') as Promise<StyleModule> },
+  { id: 'compute_misc14', names: { COMPUTES: ['temp/chunk', 'temp/cs', 'temp/ramp'] }, load: () => import('./registry/compute_misc14') as Promise<StyleModule> },
+  { id: 'compute_misc14b', names: { COMPUTES: ['viscosity/cos'] }, load: () => import('./registry/compute_misc14b') as Promise<StyleModule> },
+  { id: 'compute_misc15', names: { COMPUTES: ['pair'] }, load: () => import('./registry/compute_misc15') as Promise<StyleModule> },
+  { id: 'compute_batch48', names: { COMPUTES: ['cnp/atom', 'temp/profile'] }, load: () => import('./registry/compute_batch48') as Promise<StyleModule> },
+  { id: 'fix_batch48', names: { FIXES: ['addtorque/group', 'ti/spring', 'tmd', 'rhok'] }, load: () => import('./registry/fix_batch48') as Promise<StyleModule> },
+  { id: 'fix_hyper49', names: { FIXES: ['halt', 'hyper/global', 'tune/kspace'] }, load: () => import('./registry/fix_hyper49') as Promise<StyleModule> },
+  { id: 'fix_ilves50', names: { FIXES: ['ilves'] }, load: () => import('./registry/fix_ilves50') as Promise<StyleModule> },
+  { id: 'pair_class2spica51', names: { ANGLES: ['spica', 'sdk'], PAIRS: ['lj/class2/coul/cut', 'lj/class2/coul/long', 'lj/spica', 'lj/spica/coul/long', 'lj/sdk', 'lj/sdk/coul/long'] }, load: () => import('./registry/pair_class2spica51') as Promise<StyleModule> },
+  { id: 'bpm51', names: { FIXES: ['nve/bpm/sphere'], PAIRS: ['bpm/spring'] }, load: () => import('./registry/bpm51') as Promise<StyleModule> },
+  { id: 'bpm59', names: { BONDS: ['bpm/rotational', 'bpm/spring', 'bpm/spring/plastic', 'bpm/zero', 'bpm/peri'], PAIRS: ['bpm/peri'] }, load: () => import('../engine-gpl/registry/bpm') as Promise<StyleModule> },
+  { id: 'oxdna', names: { FIXES: ['nve/dot', 'nve/dotc/langevin'], BONDS: ['oxdna/fene', 'oxdna2/fene', 'oxrna2/fene', 'oxdna3/fene'], PAIRS: ['oxdna/excv', 'oxdna/stk', 'oxdna/hbond', 'oxdna/xstk', 'oxdna/coaxstk', 'oxdna2/excv', 'oxrna2/excv', 'oxdna2/stk', 'oxdna2/hbond', 'oxdna2/xstk', 'oxrna2/coaxstk', 'oxdna2/dh', 'oxrna2/dh', 'oxdna2/coaxstk', 'oxrna2/hbond', 'oxrna2/xstk', 'oxrna2/stk', 'oxdna3/excv', 'oxdna3/stk', 'oxdna3/hbond', 'oxdna3/xstk', 'oxdna3/coaxstk', 'oxdna3/dh'] }, load: () => import('../engine-gpl/registry/oxdna') as Promise<StyleModule> },
+  { id: 'compute_stressprof', names: { COMPUTES: ['stress/cartesian', 'stress/mop', 'stress/mop/profile'] }, load: () => import('./registry/compute_stressprof') as Promise<StyleModule> },
+  { id: 'gpl_stress_curvilinear', names: { COMPUTES: ['stress/cylinder', 'stress/spherical'] }, load: () => import('../engine-gpl/registry/stress_curvilinear') as Promise<StyleModule> },
+  { id: 'brownian', names: { FIXES: ['align/self', 'brownian', 'brownian/asphere', 'brownian/sphere', 'propel/self'] }, load: () => import('../engine-gpl/registry/brownian') as Promise<StyleModule> },
+  { id: 'gpl_dielectric', names: { FIXES: ['polarize/bem/gmres', 'polarize/bem/icc', 'polarize/functional'], PAIRS: ['lj/cut/coul/cut/dielectric', 'lj/cut/coul/long/dielectric', 'lj/cut/coul/msm/dielectric'], KSPACES: ['pppm/dielectric', 'msm/dielectric', 'pppm/disp/dielectric'], COMPUTES: ['efield/atom'] }, load: () => import('../engine-gpl/registry/dielectric') as Promise<StyleModule> },
+  { id: 'gpl_fep', names: { FIXES: ['adapt/fep'], PAIRS: ['morse/soft', 'lj/cut/soft/gapsys', 'coul/cut/soft/gapsys', 'lj/cut/tip4p/long/soft', 'tip4p/long/soft'], COMPUTES: ['fep', 'fep/ta'] }, load: () => import('../engine-gpl/registry/fep') as Promise<StyleModule> },
+  { id: 'gpl_drude', names: { FIXES: ['drude', 'drude/transform/direct', 'drude/transform/inverse', 'langevin/drude', 'tgnvt/drude', 'tgnpt/drude'], COMPUTES: ['temp/drude'], PAIRS: ['thole', 'coul/tt', 'lj/cut/thole/long'] }, load: () => import('../engine-gpl/registry/drude') as Promise<StyleModule> },
+  { id: 'gpl_bondval', names: { PAIRS: ['bondval', 'bondval/vec'] }, load: () => import('../engine-gpl/registry/bondval') as Promise<StyleModule> },
+  { id: 'gpl_settorque_atom', names: { FIXES: ['settorque/atom'] }, load: () => import('../engine-gpl/registry/settorque_atom') as Promise<StyleModule> },
+  { id: 'gpl_frenkel', names: { COMPUTES: ['frenkel'] }, load: () => import('../engine-gpl/registry/frenkel') as Promise<StyleModule> },
+  { id: 'gpl_sph', names: { PAIRS: ['sph/rhosum', 'sph/idealgas', 'sph/taitwater', 'sph/taitwater/morris', 'sph/heatconduction'], FIXES: ['sph', 'sph/stationary'], COMPUTES: ['sph/rho/atom', 'sph/e/atom'] }, load: () => import('../engine-gpl/registry/sph') as Promise<StyleModule> },
+  { id: 'gpl_dpdsmooth', names: { FIXES: ['meso/move'] }, load: () => import('../engine-gpl/registry/dpdsmooth') as Promise<StyleModule> },
+  { id: 'interlayer', names: { PAIRS: ['coul/shield', 'ilp/graphene/hbn', 'ilp/tmd', 'kolmogorov/crespi/full', 'kolmogorov/crespi/z', 'lebedeva/z', 'saip/metal', 'saip/metal/tmd', 'aip/water/2dm', 'drip'] }, load: () => import('../engine-gpl/registry/interlayer') as Promise<StyleModule> },
+  { id: 'gpl_react', names: { FIXES: ['bond/react'] }, load: () => import('../engine-gpl/registry/react') as Promise<StyleModule> },
+  { id: 'gpl_bondcb', names: { FIXES: ['bond/create', 'bond/break'] }, load: () => import('../engine-gpl/registry/bondcb') as Promise<StyleModule> },
+  { id: 'gpl_ave_histo_weight', names: { FIXES: ['ave/histo/weight'] }, load: () => import('../engine-gpl/registry/ave_histo_weight') as Promise<StyleModule> },
+  { id: 'pair_reaxff', names: { PAIRS: ['reaxff'], FIXES: ['qeq/reaxff', 'qeq/reax', 'acks2/reaxff', 'acks2/reax', 'qtpie/reaxff', 'qeq/rel/reaxff', 'reaxff/bonds', 'reaxff/species'], COMPUTES: ['reaxff/atom'] }, load: () => import('../engine-gpl/registry/reaxff') as Promise<StyleModule> },
+  { id: 'gpl_extrafix', names: { FIXES: ['gle', 'grem', 'electron/stopping/fit', 'npt/cauchy'] }, load: () => import('../engine-gpl/registry/extrafix') as Promise<StyleModule> },
+  { id: 'gpl_mc', names: { FIXES: ['charge/regulation', 'gemc'] }, load: () => import('../engine-gpl/registry/mc') as Promise<StyleModule> },
+  { id: 'gpl_dipole_dlm', names: { HOOKS: ['dipole/dlm'] }, load: () => import('../engine-gpl/registry/dipole_dlm') as Promise<StyleModule> },
+  { id: 'gpl_nh_deviatoric', names: { HOOKS: ['x', 'y', 'z', 'xy', 'yz', 'xz'] }, load: () => import('../engine-gpl/registry/nh_deviatoric') as Promise<StyleModule> },
+  { id: 'gpl_langevin_angmom', names: { HOOKS: ['angmom'] }, load: () => import('../engine-gpl/registry/langevin_angmom') as Promise<StyleModule> },
+  { id: 'gpl_ctip', names: { PAIRS: ['coul/ctip'], FIXES: ['qeq/ctip'] }, load: () => import('../engine-gpl/registry/ctip') as Promise<StyleModule> },
+  { id: 'gpl_group_omega', names: { HOOKS: ['velocity', 'momentum', 'omega'] }, load: () => import('../engine-gpl/registry/group_omega') as Promise<StyleModule> },
+  { id: 'gpl_deposit', names: { HOOKS: ['deposit'] }, load: () => import('../engine-gpl/registry/deposit') as Promise<StyleModule> },
+  { id: 'gpl_tracker', names: { PAIRS: ['tracker'] }, load: () => import('../engine-gpl/registry/tracker') as Promise<StyleModule> },
+  { id: 'gpl_multi_lucy', names: { PAIRS: ['multi/lucy'] }, load: () => import('../engine-gpl/registry/multi_lucy') as Promise<StyleModule> },
+  { id: 'gpl_graphics', names: { FIXES: ['graphics/arrows', 'graphics/chunk', 'graphics/labels', 'graphics/lines', 'graphics/objects', 'graphics/periodic', 'graphics/replica'], HOOKS: ['image', 'atoms', 'region'] }, load: () => import('../engine-gpl/registry/graphics') as Promise<StyleModule> },
+  { id: 'gpl_graphics_isosurface', names: { FIXES: ['graphics/isosurface'] }, load: () => import('../engine-gpl/registry/graphics_isosurface') as Promise<StyleModule> },
+  { id: 'gpl_shock', names: { FIXES: ['msst', 'nphug', 'wall/piston', 'append/atoms'] }, load: () => import('../engine-gpl/registry/shock') as Promise<StyleModule> },
+  { id: 'gpl_table_bonded', names: { BONDS: ['table'], ANGLES: ['table'], DIHEDRALS: ['table', 'table/cut'] }, load: () => import('../engine-gpl/registry/table_bonded') as Promise<StyleModule> },
+  { id: 'gpl_xmolecule', names: { BONDS: ['fene/nm', 'harmonic/restrain', 'quartic/exp'], ANGLES: ['cosine/shift/exp', 'mwlc'], DIHEDRALS: ['spherical'], IMPROPERS: ['ring'] }, load: () => import('../engine-gpl/registry/xmolecule') as Promise<StyleModule> },
+  { id: 'gpl_chunk_more', names: { COMPUTES: ['vcm/chunk', 'torque/chunk', 'vacf/chunk', 'inertia', 'slice', 'global/atom'], FIXES: ['momentum/chunk', 'spring/chunk', 'store/force'] }, load: () => import('../engine-gpl/registry/chunk_more') as Promise<StyleModule> },
+  { id: 'gpl_xpair1', names: { PAIRS: ['beck', 'born/gauss', 'buck/mdf', 'lennard/mdf', 'lj/mdf', 'cosine/squared', 'coul/cut/global', 'coul/exclude', 'coul/slater/cut', 'ufm', 'wf/cut'] }, load: () => import('../engine-gpl/registry/xpair1') as Promise<StyleModule> },
+  { id: 'gpl_xpair2', names: { PAIRS: ['lj/cut/sphere', 'lj/expand/sphere', 'lj/expand/coul/long', 'lj/gromacs/coul/gromacs', 'lj/pirani', 'morse/smooth/linear', 'nm/cut', 'nm/cut/split', 'nm/cut/coul/cut', 'nm/cut/coul/long'] }, load: () => import('../engine-gpl/registry/xpair2') as Promise<StyleModule> },
+  { id: 'gpl_manyeam', names: { PAIRS: ['adp', 'eam/cd', 'eam/cd/old', 'eam/he'] }, load: () => import('../engine-gpl/registry/manyeam') as Promise<StyleModule> },
+  { id: 'gpl_sw', names: { PAIRS: ['sw'] }, load: () => import('../engine-gpl/registry/sw') as Promise<StyleModule> },
+  { id: 'gpl_manybody2', names: { PAIRS: ['gw', 'gw/zbl', 'tersoff/table', 'polymorphic'] }, load: () => import('../engine-gpl/registry/manybody2') as Promise<StyleModule> },
+  { id: 'gpl_manybody3', names: { PAIRS: ['eim', 'edip', 'edip/multi'] }, load: () => import('../engine-gpl/registry/manybody3') as Promise<StyleModule> },
+  { id: 'gpl_mcswap', names: { FIXES: ['atom/swap', 'tfmc', 'bond/create/angle', 'bond/swap'] }, load: () => import('../engine-gpl/registry/mcswap') as Promise<StyleModule> },
+  { id: 'gpl_cmds', names: { COMMANDS: ['write_coeff', 'write_molecule', 'angle_write', 'dihedral_write', 'pair_write', 'bond_write', 'group2ndx', 'ndx2group', 'region2vmd'] }, load: () => import('../engine-gpl/registry/cmds') as Promise<StyleModule> },
+  { id: 'gpl_fitpod', names: { COMMANDS: ['fitpod'] }, load: () => import('../engine-gpl/registry/fitpod') as Promise<StyleModule> },
+  { id: 'gpl_min_hftn', names: { MINIMIZERS: ['hftn'] }, load: () => import('../engine-gpl/registry/min_hftn') as Promise<StyleModule> },
+  { id: 'gpl_csdiel', names: { PAIRS: ['coul/wolf/cs', 'coul/long/cs', 'lj/cut/coul/long/cs', 'lj/class2/coul/long/cs', 'coul/cut/dielectric', 'coul/long/dielectric', 'lj/cut/coul/debye/dielectric', 'lj/long/coul/long/dielectric', 'buck/long/coul/long', 'born/coul/dsf/cs', 'born/coul/wolf/cs', 'born/coul/long/cs', 'buck/coul/long/cs'] }, load: () => import('../engine-gpl/registry/csdiel') as Promise<StyleModule> },
+  { id: 'gpl_xcompute', names: { COMPUTES: ['ackland/atom', 'ave/sphere/atom', 'composition/atom', 'efield/wolf/atom', 'pressure/cylinder', 'rattlers/atom', 'temp/rotate', 'ti'] }, load: () => import('../engine-gpl/registry/xcompute') as Promise<StyleModule> },
+  { id: 'gpl_gransph', names: { PAIRS: ['sph/lj'], FIXES: ['addtorque/atom', 'damping/cundall', 'viscous/nonlinear'], COMPUTES: ['contact/atom', 'fabric', 'pe/mol/tally', 'sph/t/atom'] }, load: () => import('../engine-gpl/registry/gransph') as Promise<StyleModule> },
+  { id: 'gpl_xfix', names: { FIXES: ['nvk', 'ffl', 'gld', 'smd', 'ave/correlate/long', 'set', 'nonaffine/displacement', 'pair', 'efield/tip4p', 'press/langevin', 'deform/pressure'] }, load: () => import('../engine-gpl/registry/xfix') as Promise<StyleModule> },
+  { id: 'gpl_sllod', names: { FIXES: ['nvt/sllod'] }, load: () => import('../engine-gpl/registry/fix_sllod') as Promise<StyleModule> },
+  { id: 'gpl_rigeff', names: { COMPUTES: ['erotate/rigid', 'ke/rigid', 'rigid/local', 'temp/deform/eff', 'smd/triangle/vertices', 'smd/tlsph/defgrad', 'smd/hourglass/error'], FIXES: ['langevin/eff', 'nvt/sllod/eff', 'eos/table', 'smd/move_tri_surf'] }, load: () => import('../engine-gpl/registry/rigeff') as Promise<StyleModule> },
+  { id: 'gpl_slater', names: { PAIRS: ['coul/slater/long', 'dpd/coul/slater/long'] }, load: () => import('../engine-gpl/registry/slater') as Promise<StyleModule> },
+  { id: 'gpl_e3b', names: { PAIRS: ['e3b'] }, load: () => import('../engine-gpl/registry/e3b') as Promise<StyleModule> },
+  { id: 'gpl_colvars', names: { FIXES: ['colvars'] }, load: () => import('../engine-gpl/registry/colvars') as Promise<StyleModule> },
+  // dispersion/d3: its parameter tables are split over several data chunks, which loadD3 imports before the style is made
+  { id: 'gpl_d3', names: { PAIRS: ['dispersion/d3'] }, load: () => import('../engine-gpl/registry/d3').then((m) => m.loadD3()) as Promise<StyleModule> },
+  { id: 'gpl_srp', names: { PAIRS: ['srp', 'srp/react'], FIXES: ['SRP', 'SRPREACT'] }, load: () => import('../engine-gpl/registry/srp') as Promise<StyleModule> },
+  { id: 'gpl_ewald_disp', names: { KSPACES: ['ewald/disp', 'ewald/disp/dipole'], PAIRS: ['lj/long/dipole/long'] }, load: () => import('../engine-gpl/registry/ewald_disp') as Promise<StyleModule> },
+  { id: 'gpl_mgpt', names: { PAIRS: ['mgpt'] }, load: () => import('../engine-gpl/registry/mgpt') as Promise<StyleModule> },
+  { id: 'gpl_msm', names: { KSPACES: ['msm', 'msm/cg'], PAIRS: ['coul/msm', 'lj/cut/coul/msm', 'born/coul/msm', 'buck/coul/msm', 'lj/charmm/coul/msm', 'lj/spica/coul/msm', 'lj/sdk/coul/msm'] }, load: () => import('../engine-gpl/registry/msm') as Promise<StyleModule> },
+  { id: 'gpl_filtercorotate', names: { FIXES: ['filter/corotate'] }, load: () => import('../engine-gpl/registry/filtercorotate') as Promise<StyleModule> },
+  { id: 'gpl_extrafix_misc', names: { FIXES: ['viscous/sphere', 'flow/gauss', 'wall/ees', 'wall/region/ees', 'baoab', 'orient/eco'] }, load: () => import('../engine-gpl/registry/extrafix_misc') as Promise<StyleModule> },
+  { id: 'gpl_latboltz', names: { FIXES: ['lb/fluid', 'lb/viscous', 'lb/momentum'] }, load: () => import('../engine-gpl/registry/latboltz') as Promise<StyleModule> },
+  { id: 'gpl_extep', names: { PAIRS: ['extep'] }, load: () => import('../engine-gpl/registry/extep') as Promise<StyleModule> },
+  { id: 'gpl_class2xe', names: { ANGLES: ['class2xe'] }, load: () => import('../engine-gpl/registry/class2xe') as Promise<StyleModule> },
+  { id: 'gpl_mesont', names: { BONDS: ['mesocnt'], ANGLES: ['mesocnt'], PAIRS: ['mesocnt', 'mesocnt/viscous'] }, load: () => import('../engine-gpl/registry/mesont') as Promise<StyleModule> },
+  { id: 'gpl_yaff', names: { ANGLES: ['cross'], BONDS: ['mm3'], PAIRS: ['lj/switch3/coulgauss/long'] }, load: () => import('../engine-gpl/registry/yaff') as Promise<StyleModule> },
+  { id: 'gpl_bocs', names: { FIXES: ['bocs'], COMPUTES: ['PRESSURE/BOCS'] }, load: () => import('../engine-gpl/registry/bocs') as Promise<StyleModule> },
+  { id: 'gpl_orient', names: { FIXES: ['orient/fcc', 'orient/bcc'] }, load: () => import('../engine-gpl/registry/orient') as Promise<StyleModule> },
+  { id: 'gpl_colloid2', names: { PAIRS: ['lubricate', 'lubricate/poly', 'lubricateU', 'lubricateU/poly', 'brownian', 'brownian/poly'], FIXES: ['wall/colloid', 'wall/srd'] }, load: () => import('../engine-gpl/registry/colloid2') as Promise<StyleModule> },
+  { id: 'gpl_pppmx', names: { KSPACES: ['pppm/stagger', 'pppm/rk'] }, load: () => import('../engine-gpl/registry/pppmx') as Promise<StyleModule> },
+  { id: 'gpl_miscx', names: { BONDS: ['quartic', 'special'], ANGLES: ['dipole'], PAIRS: ['list', 'dsmc'] }, load: () => import('../engine-gpl/registry/miscx') as Promise<StyleModule> },
+  { id: 'gpl_pace', names: { PAIRS: ['pace', 'pace/extrapolation'], COMPUTES: ['pace'] }, load: () => import('../engine-gpl/registry/pace') as Promise<StyleModule> },
+  { id: 'gpl_mliap_ace', names: { HOOKS: ['ace'] }, load: () => import('../engine-gpl/registry/mliap_ace') as Promise<StyleModule> },
+  { id: 'gpl_apip', names: { PAIRS: ['eam/apip', 'eam/fs/apip', 'pace/apip', 'pace/precise/apip', 'pace/fast/apip', 'lambda/input/apip', 'lambda/input/csp/apip', 'lambda/zone/apip'], FIXES: ['atom_weight/apip', 'lambda/apip', 'lambda_thermostat/apip', 'lambda/la/csp/apip'] }, load: () => import('../engine-gpl/registry/apip') as Promise<StyleModule> },
+  { id: 'gpl_bop', names: { PAIRS: ['bop'] }, load: () => import('../engine-gpl/registry/bop') as Promise<StyleModule> },
+  { id: 'gpl_lcbop', names: { PAIRS: ['lcbop'] }, load: () => import('../engine-gpl/registry/lcbop') as Promise<StyleModule> },
+  { id: 'gpl_manifold', names: { FIXES: ['nve/manifold/rattle', 'nvt/manifold/rattle', 'manifoldforce'] }, load: () => import('../engine-gpl/registry/manifold') as Promise<StyleModule> },
+];

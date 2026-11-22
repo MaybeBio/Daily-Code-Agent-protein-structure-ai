@@ -1,0 +1,350 @@
+// Copyright (c) 2024-2026 The Regents of the University of Michigan.
+// Part of hoomd-rs, released under the BSD 3-Clause License.
+
+//! Implement `PositiveReal`
+
+use serde::{Deserialize, Serialize};
+use std::{
+    cmp::Ordering,
+    fmt,
+    ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign},
+};
+
+use super::Error;
+
+/// A f64 value that is not +/- inf, nan, or a value <= 0.
+///
+/// # Example
+///
+/// Construct from a value known at runtime with [`PositiveReal::try_from`]:
+///
+/// ```
+/// use hoomd_utility::valid::PositiveReal;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let positive = PositiveReal::try_from(1.0)?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Construct from a value known at compile time with [`crate::positive_real!`]:
+///
+/// ```
+/// use hoomd_utility::valid::PositiveReal;
+///
+/// const HALF: PositiveReal = hoomd_utility::positive_real!(0.5);
+/// const SUM: PositiveReal = hoomd_utility::positive_real!(1.0 + 1.0);
+///
+/// assert_eq!(HALF.get(), 0.5);
+/// assert_eq!(SUM.get(), 2.0);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PositiveReal(f64);
+
+impl PositiveReal {
+    /// Construct from a value, checking that it is finite and greater than 0.
+    ///
+    /// This is a const-callable equivalent of [`PositiveReal::try_from`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFinite`] when `v` is not finite.
+    /// [`Error::NotPositive`] when `v` is not a positive value
+    #[inline]
+    pub const fn from_f64(v: f64) -> Result<Self, Error> {
+        if !v.is_finite() {
+            Err(Error::NotFinite(v))
+        } else if v <= 0.0 {
+            Err(Error::NotPositive(v))
+        } else {
+            Ok(Self(v))
+        }
+    }
+
+    /// Access the value.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hoomd_utility::valid::PositiveReal;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let positive = PositiveReal::try_from(1.0)?;
+    ///
+    /// assert_eq!(positive.get(), 1.0);
+    /// # Ok(())
+    /// # }
+    #[must_use]
+    #[inline]
+    pub const fn get(&self) -> f64 {
+        self.0
+    }
+
+    /// Compute the square root.
+    ///
+    /// The square root of a positive finite value is always a positive finite value,
+    /// so the result is guaranteed to be valid.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hoomd_utility::valid::PositiveReal;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let positive = PositiveReal::try_from(4.0)?;
+    ///
+    /// assert_eq!(positive.sqrt().get(), 2.0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    #[inline]
+    pub fn sqrt(&self) -> Self {
+        Self(self.0.sqrt())
+    }
+
+    /// Compute the cube root.
+    ///
+    /// The cube root of a positive finite value is always a positive finite value,
+    /// so the result is guaranteed to be valid.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hoomd_utility::valid::PositiveReal;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let positive = PositiveReal::try_from(27.0)?;
+    ///
+    /// assert_eq!(positive.cbrt().get(), 3.0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    #[inline]
+    pub fn cbrt(&self) -> Self {
+        Self(self.0.cbrt())
+    }
+}
+
+impl Eq for PositiveReal {}
+
+impl PartialOrd for PositiveReal {
+    #[inline]
+    fn partial_cmp(&self, other: &PositiveReal) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PositiveReal {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.get().total_cmp(&other.get())
+    }
+}
+
+impl TryFrom<f64> for PositiveReal {
+    type Error = Error;
+
+    /// Convert [`f64`] to [`PositiveReal`].
+    ///
+    /// # Example
+    ///
+    /// Valid conversion:
+    /// ```
+    /// use hoomd_utility::valid::PositiveReal;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let positive = PositiveReal::try_from(1.0)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Invalid conversion
+    /// ```
+    /// use hoomd_utility::valid::PositiveReal;
+    ///
+    /// let result = PositiveReal::try_from(-1.0);
+    /// assert!(matches!(
+    ///     result,
+    ///     Err(hoomd_utility::valid::Error::NotPositive(_))
+    /// ));
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFinite`] when `v` is not finite.
+    /// [`Error::NotPositive`] when `v` is not a positive value
+    #[inline]
+    fn try_from(v: f64) -> Result<PositiveReal, Error> {
+        PositiveReal::from_f64(v)
+    }
+}
+
+/// Construct a [`PositiveReal`] from a const-evaluatable value.
+///
+/// The value is validated during compilation: it must be finite and greater than zero
+/// or the invocation fails to compile. Values that are not known at compile time must
+/// be constructed with [`PositiveReal::try_from`] instead.
+///
+/// # Example
+///
+/// ```
+/// use hoomd_utility::valid::PositiveReal;
+///
+/// const HALF: PositiveReal = hoomd_utility::positive_real!(0.5);
+/// const SUM: PositiveReal = hoomd_utility::positive_real!(1.0 + 1.0);
+///
+/// assert_eq!(HALF.get(), 0.5);
+/// assert_eq!(SUM.get(), 2.0);
+/// ```
+///
+/// This does not compile:
+///
+/// ```compile_fail
+/// use hoomd_utility::valid::PositiveReal;
+///
+/// const INVALID: PositiveReal = hoomd_utility::positive_real!(-1.0);
+/// ```
+#[macro_export]
+macro_rules! positive_real {
+    ($value:expr) => {
+        const {
+            match $crate::valid::PositiveReal::from_f64($value) {
+                ::core::result::Result::Ok(value) => value,
+                ::core::result::Result::Err(_) => {
+                    ::core::panic!("value must be finite and greater than 0")
+                }
+            }
+        }
+    };
+}
+
+impl Default for PositiveReal {
+    /// The default value is 1.0.
+    #[inline]
+    fn default() -> Self {
+        PositiveReal(1.0)
+    }
+}
+
+impl fmt::Display for PositiveReal {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Add for PositiveReal {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        Self(self.0 + rhs.0)
+    }
+}
+
+impl AddAssign<PositiveReal> for PositiveReal {
+    #[inline]
+    fn add_assign(&mut self, rhs: PositiveReal) {
+        self.0 += rhs.0;
+    }
+}
+
+impl Mul for PositiveReal {
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        Self(self.0 * rhs.0)
+    }
+}
+
+impl MulAssign<PositiveReal> for PositiveReal {
+    #[inline]
+    fn mul_assign(&mut self, rhs: PositiveReal) {
+        self.0 *= rhs.0;
+    }
+}
+
+impl Div for PositiveReal {
+    type Output = Self;
+
+    #[inline]
+    fn div(self, rhs: Self) -> Self {
+        Self(self.0 / rhs.0)
+    }
+}
+
+impl DivAssign<PositiveReal> for PositiveReal {
+    #[inline]
+    fn div_assign(&mut self, rhs: PositiveReal) {
+        self.0 /= rhs.0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assert2::check;
+
+    #[test]
+    fn positive_real_validation() {
+        let result = PositiveReal::try_from(f64::INFINITY);
+        check!(result == Err(Error::NotFinite(f64::INFINITY)));
+
+        let result = PositiveReal::try_from(-f64::INFINITY);
+        check!(result == Err(Error::NotFinite(-f64::INFINITY)));
+
+        let result = PositiveReal::try_from(f64::NAN);
+        check!(matches!(result, Err(Error::NotFinite(_))));
+
+        let result = PositiveReal::try_from(0.0);
+        check!(result == Err(Error::NotPositive(0.0)));
+
+        let result = PositiveReal::try_from(-1.0);
+        check!(result == Err(Error::NotPositive(-1.0)));
+    }
+
+    #[test]
+    fn positive_real_addition() {
+        let sum = positive_real!(0.25) + positive_real!(0.75);
+        check!(sum.get() == 1.0);
+
+        let mut sum = positive_real!(1.0);
+        sum += positive_real!(0.5);
+        check!(sum.get() == 1.5);
+    }
+
+    #[test]
+    fn positive_real_roots() {
+        check!(positive_real!(4.0).sqrt().get() == 2.0);
+        check!(positive_real!(27.0).cbrt().get() == 3.0);
+
+        // The result is valid even at the extremes of the representable range.
+        let largest = PositiveReal::try_from(f64::MAX).expect("f64::MAX is positive");
+        check!(largest.sqrt().get().is_finite());
+        check!(largest.cbrt().get().is_finite());
+
+        let smallest =
+            PositiveReal::try_from(f64::from_bits(1)).expect("smallest subnormal is positive");
+        check!(smallest.sqrt().get() > 0.0);
+        check!(smallest.cbrt().get() > 0.0);
+    }
+
+    #[test]
+    fn positive_real_macro_construction() {
+        const ONE: PositiveReal = positive_real!(1.0);
+        const SUFFIXED_INT: PositiveReal = positive_real!(2f64);
+        const UNDERSCORES: PositiveReal = positive_real!(1_000.5);
+        const EXPRESSION: PositiveReal = positive_real!(0.5 + 0.5);
+
+        check!(ONE.get() == 1.0);
+        check!(SUFFIXED_INT.get() == 2.0);
+        check!(UNDERSCORES.get() == 1000.5);
+        check!(EXPRESSION.get() == 1.0);
+
+        let runtime = positive_real!(2.5);
+        check!(runtime.get() == 2.5);
+    }
+}

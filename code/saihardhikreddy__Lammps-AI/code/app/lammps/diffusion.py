@@ -1,0 +1,133 @@
+"""First-Class Molecular Self-Diffusion Module for Liquid-State MD.
+
+Computes self-diffusion coefficients from Mean Squared Displacement (MSD)
+using the Einstein relation:
+    D = lim_{t -> inf} <|r(t) - r(0)|^2> / (6t)
+
+This module operates independently with zero external dependencies.
+"""
+import math
+from typing import List, Dict, Tuple
+
+
+def calculate_diffusion_coefficient(
+    time_ps: List[float],
+    msd_angstrom2: List[float],
+    fit_start_fraction: float = 0.4
+) -> Dict[str, float]:
+    """Calculate the self-diffusion coefficient (D) from MSD time-series data.
+    
+    Parameters:
+        time_ps: Simulation time points in picoseconds (ps).
+        msd_angstrom2: Mean squared displacement in square angstroms (Å²).
+        fit_start_fraction: Fraction of initial data to discard (skips ballistic regime, defaults to 0.4).
+        
+    Returns:
+        Dictionary containing:
+        - slope_angstrom2_ps: Linear regression slope d(MSD)/dt (Å²/ps)
+        - diffusion_coefficient_m2_s: Self-diffusion coefficient D in m²/s
+        - diffusion_coefficient_cm2_s: Self-diffusion coefficient D in cm²/s
+        - r_squared: Coefficient of determination (R²) assessing linearity
+    """
+    # A negative fraction used to slice from the END of the series (-0.5 fitted only the last
+    # half, silently), and NaN crashed int(); anything outside [0, 1) is a caller error.
+    if not (isinstance(fit_start_fraction, (int, float)) and 0 <= fit_start_fraction < 1):
+        raise ValueError(f"fit_start_fraction must be in [0, 1), got {fit_start_fraction!r}")
+    if len(time_ps) < 2 or len(msd_angstrom2) < 2 or len(time_ps) != len(msd_angstrom2):
+        return {
+            "slope_angstrom2_ps": 0.0,
+            "diffusion_coefficient_m2_s": 0.0,
+            "diffusion_coefficient_cm2_s": 0.0,
+            "r_squared": 0.0
+        }
+
+    start_idx = int(len(time_ps) * fit_start_fraction)
+    # Ensure at least 2 points remain for linear regression
+    if start_idx >= len(time_ps) - 1:
+        start_idx = max(0, len(time_ps) - 2)
+
+    x = time_ps[start_idx:]
+    y = msd_angstrom2[start_idx:]
+    n = len(x)
+
+    sum_x = sum(x)
+    sum_y = sum(y)
+    sum_xx = sum(xi * xi for xi in x)
+    sum_xy = sum(xi * yi for xi, yi in zip(x, y))
+
+    denom = (n * sum_xx - sum_x * sum_x)
+    if denom == 0:
+        return {
+            "slope_angstrom2_ps": 0.0,
+            "diffusion_coefficient_m2_s": 0.0,
+            "diffusion_coefficient_cm2_s": 0.0,
+            "r_squared": 0.0
+        }
+
+    slope = (n * sum_xy - sum_x * sum_y) / denom
+    intercept = (sum_y - slope * sum_x) / n
+
+    # Compute R^2 goodness of fit
+    y_mean = sum_y / n
+    ss_tot = sum((yi - y_mean) ** 2 for yi in y)
+    ss_res = sum((yi - (slope * xi + intercept)) ** 2 for xi, yi in zip(x, y))
+    r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 1.0
+
+    # Einstein relation in 3D: D = slope / 6
+    # Units conversion: 1 Å²/ps = 1e-20 m² / 1e-12 s = 1e-8 m²/s
+    D_m2_s = (slope / 6.0) * 1e-8
+    D_cm2_s = D_m2_s * 1e4
+
+    return {
+        "slope_angstrom2_ps": slope,
+        "diffusion_coefficient_m2_s": D_m2_s,
+        "diffusion_coefficient_cm2_s": D_cm2_s,
+        "r_squared": max(0.0, min(1.0, r_squared))
+    }
+
+
+def generate_msd_commands(
+    group: str = "all",
+    compute_id: str = "cMSD",
+    fix_id: str = "fMSD",
+    sample_every: int = 10,
+    output_file: str = "msd.out"
+) -> str:
+    """Generate official LAMMPS command blocks for tracking 3D MSD.
+
+    The first column fix ave/time writes is the timestep number, not a time. (The title used
+    to call it "Time", and fitting MSD against step numbers as if they were picoseconds gives
+    a D that is off by the timestep: 1000x for a 1 fs step.) Read the file with
+    read_msd_file(path, timestep_ps), which converts steps to picoseconds.
+    """
+    return f"""# Compute Mean Squared Displacement (MSD)
+compute         {compute_id} {group} msd
+fix             {fix_id} {group} ave/time {sample_every} 1 {sample_every} c_{compute_id}[4] file {output_file} title1 "# TimeStep MSD_total"
+"""
+
+
+def read_msd_file(path: str, timestep_ps: float) -> Tuple[List[float], List[float]]:
+    """(time_ps, msd) from a fix ave/time MSD file, ready for calculate_diffusion_coefficient.
+
+    Each data row is "<timestep> <msd>"; the timestep is multiplied by timestep_ps (0.001 for
+    a 1 fs step in metal or real units). Comment lines, blank lines and rows holding nan or
+    inf are skipped.
+    """
+    if not timestep_ps or timestep_ps <= 0:
+        raise ValueError(f"timestep_ps must be positive, got {timestep_ps!r}")
+    time_ps: List[float] = []
+    msd: List[float] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if not parts or parts[0].startswith("#") or len(parts) < 2:
+                continue
+            try:
+                step, value = float(parts[0]), float(parts[1])
+            except ValueError:
+                continue
+            if not (math.isfinite(step) and math.isfinite(value)):
+                continue  # "nan"/"inf" rows from a run that blew up would make the fit NaN
+            time_ps.append(step * timestep_ps)
+            msd.append(value)
+    return time_ps, msd

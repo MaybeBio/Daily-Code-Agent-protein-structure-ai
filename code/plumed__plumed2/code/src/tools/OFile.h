@@ -1,0 +1,344 @@
+/* +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+   Copyright (c) 2012-2023 The plumed team
+   (see the PEOPLE file at the root of the distribution for a list of names)
+
+   See http://www.plumed.org for more information.
+
+   This file is part of plumed, version 2.
+
+   plumed is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   plumed is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with plumed.  If not, see <http://www.gnu.org/licenses/>.
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++ */
+#ifndef __PLUMED_tools_OFile_h
+#define __PLUMED_tools_OFile_h
+
+#include "FileBase.h"
+#include "H5Table.h"
+#include <vector>
+#include <sstream>
+#include <memory>
+#include <cstddef>
+
+namespace PLMD {
+
+class Value;
+
+/**
+\ingroup TOOLBOX
+Class for output files
+
+This class provides features similar to those in the standard C "FILE*" type,
+but only for sequential output. See IFile for sequential input.
+
+See the example here for a possible use:
+\verbatim
+#include "File.h"
+
+int main(){
+  PLMD::OFile pof;
+  pof.open("ciao");
+  pof.printf("%s\n","test1");
+  pof.setLinePrefix("plumed: ");
+  pof.printf("%s\n","test2");
+  pof.setLinePrefix("");
+  pof.addConstantField("x2").printField("x2",67.0);
+  pof.printField("x1",10.0).printField("x3",20.12345678901234567890).printField();
+  pof.printField("x1",10.0).printField("x3",-1e70*20.12345678901234567890).printField();
+  pof.printField("x3",10.0).printField("x2",777.0).printField("x1",-1e70*20.12345678901234567890).printField();
+  pof.printField("x3",67.0).printField("x1",18.0).printField();
+  return 0;
+}
+\endverbatim
+
+This program is expected to produce a file "ciao" which reads
+\verbatim
+test1
+plumed: test2
+#! FIELDS x1 x3
+#! SET x2                      67
+                     10      20.12345678901234
+                     10 -2.012345678901235e+71
+#! FIELDS x1 x3
+#! SET x2                     777
+ -2.012345678901235e+71                     10
+                     18                     67
+\endverbatim
+
+Notes
+- "x2" is declared as "constant", which means that it is written using the "SET"
+keyword. Thus, everytime it is modified, all the headers are repeated in the output file.
+- printField() without arguments is used as a "newline".
+- most methods return a reference to the OFile itself, to allow chaining many calls on the same line
+(this is similar to << operator in std::ostream)
+
+\section using-correctly-ofile Using correctly OFile in PLUMED
+
+When a OFile object is used in PLUMED it can be convenient to link() it
+to the Action object where it is defined, or to the PlumedMain object.
+This will save in the OFile a pointer to the linked object and will
+allow to have some extra information. E.g., if PLUMED is restarting,
+files will be appended. Notice that one can enforce this behavior using
+the enforceRestart() method before opening a file.
+
+To have all files managed consistently, it is important to use OFile in the proper way.
+This should allow multi-replica plumed, restart and backups to work in
+the expected way. For this reason all the operations in OFile and IFile
+are synchronizing all the processors of the group, so call to OFile functions
+should always be performed by all processes; for this reason is also not useful
+to use Log for debugging because only master threads will actually write.
+For debugging is better to use the standard stderr.
+
+\verbatim
+int main(){
+// this is a growing file, containing a full history
+// (frames are appended, as in traditional HILLS and COLVAR)
+  OFile grw;
+// this is a single-snapshopt file used e.g. for checkpointing
+// (rewritten every time)
+  OFile snp;
+
+// open both files at the beginning
+// (will go in \ref Action constructor)
+  grw.open("growing");
+  snp.open("snapshot");
+
+// trajectory loop
+  for(int i=0;i<nsteps;i++){
+
+// files should be written in the update() method of an \ref Action
+
+// write on growing file
+    grw<<"data at step "<<i<<\n";
+
+// flushing
+// it takes time, so do it only if data is critical
+// better to leave this choice to the user with the FLUSH keyword
+//    grw.flush();
+
+// write on snapshot file
+    snp.rewind();
+    snp<<"snapshot at step "<<i<<"\n";
+    snp.flush();
+// the only difference is that snp is rewound
+// notice that it should be rewound just before writing
+// because rewind is going to move the file out of the way
+// to have a safe copy of the file ("bck.last.filename")
+// Also notice that snapshots should be flushed
+// for this reason, it is better to write them only
+// rarely to avoid excessive slow down
+
+  }
+}
+
+\notice
+Notice that it is not necessary to explicitly close files, since they are closed implicitly
+when the object goes out of scope. In case you need to explicitly close the file before it is
+destroyed, please check it the procedure is exception safe and, if necessary, add some `try/catch`
+statement.
+
+\endverbatim
+*/
+
+class OFile:
+  public virtual FileBase {
+/// Pointer to a linked OFile.
+/// see link(OFile&)
+  OFile* linked;
+/// Internal buffer for printf
+  std::vector<char> buffer_string;
+/// Internal buffer (generic use)
+  std::vector<char> buffer;
+/// Internal buffer length
+  int buflen;
+/// This variables stores the actual buffer length
+  int actual_buffer_length;
+/// Class identifying a single field for fielded output
+  class Field:
+    public FieldBase {
+  public:
+/// the value with its type, for HDF5 tables (value holds it as text)
+    h5table::Value typed;
+  };
+/// Set a field (text: as written in a text file, typed: for HDF5 tables)
+  void setField(const std::string& name,const std::string& text,const h5table::Value& typed);
+/// True for an HDF5 table (extension .h5): the rows are written with h5writer
+  bool h5mode=false;
+/// Writer of the HDF5 table (on the writing process only), created at the first row (see h5open)
+  std::unique_ptr<h5table::Writer> h5writer;
+/// The HDF5 table is appended to (restart, or after its first row) rather than created
+  bool h5append=false;
+/// Create the writer of the HDF5 table, if not done yet (writing process only): after the
+/// trim at the restart step, so that files rewritten at every write are never trimmed
+  void h5open();
+/// Close the HDF5 table
+  void closeBackend() override;
+/// Low-level write
+  std::size_t llwrite(const char*,std::size_t);
+/// True if fields has changed.
+/// This could be due to a change in the list of fields or a reset
+/// of a nominally constant field
+  bool fieldChanged;
+/// Format for fields writing
+  std::string fieldFmt;
+/// All the previously defined variable fields
+  std::vector<Field> previous_fields;
+/// All the defined variable fields
+  std::vector<Field> fields;
+/// All the defined constant fields
+  std::vector<Field> const_fields;
+/// Values of the constant fields in the header of the last line written before a checkpoint
+/// (see setLastFields): they are given to the constant fields when they are added
+  std::vector<Field> restored_const_fields;
+/// Prefix for line (e.g. "PLUMED: ")
+  std::string linePrefix;
+/// Temporary ostringstream for << output
+  std::ostringstream oss;
+/// The string used for backing up files
+  std::string backstring;
+/// Find field index given name
+  unsigned findField(const std::string&name)const;
+/// check if we are restarting
+  bool checkRestart()const;
+/// True if restart behavior should be forced
+  bool enforceRestart_;
+/// True if backup behavior (i.e. non restart) should be forced
+  bool enforceBackup_;
+/// True if the file, opened for appending at a restart, is still to be trimmed at the
+/// restart step (see Checkpointing::trimAtRestart): it is done just before the first
+/// write, so that files rewritten at every write (rewind) are never trimmed
+  bool trimPending_=false;
+/// True if the file is never trimmed at the restart step (see enforceNoTrim)
+  bool enforceNoTrim_=false;
+/// Check that no other OFile linked to the same PlumedMain object
+/// is currently writing on the file this->path.
+/// Throws an exception if this is the case.
+  void checkNotOpenElsewhere()const;
+/// True if this process writes the file: the first process of the communicator,
+/// or every process if there is no communicator
+  bool isWriter()const;
+/// Open fp (and gzfp for gz files) with the given modes.
+/// Only the writer opens the file: the other processes open the null device (/dev/null, NUL on Windows),
+/// so that fp is valid on all processes but the file is opened (and truncated) only once.
+  void openOnWriter(const char* fmode,const char* gzmode,bool reopenFp=true);
+/// After the writer opened the file: let all processes know whether it succeeded.
+/// This is also a synchronization point: the other processes continue
+/// only after the writer has opened (and created) the file.
+  void syncOpen();
+public:
+/// Trim the file at the restart step, if still to be done (see trimPending_)
+  void applyPendingTrim();
+/// Never trim this file at the restart step (to be called before open)
+  OFile& enforceNoTrim() {
+    enforceNoTrim_=true;
+    return *this;
+  }
+/// Constructor
+  OFile();
+/// Destructor
+  ~OFile() override;
+/// For an HDF5 table: the number of rows of every block written so far (on the writing process)
+  std::vector<unsigned long long> getH5Rows();
+/// Allows overloading of link
+  using FileBase::link;
+/// Allows overloading of open
+  using FileBase::open;
+/// Allows linking this OFile to another one.
+/// In this way, everything written to this OFile will be immediately
+/// written on the linked OFile. Notice that a OFile should
+/// be either opened explicitly, linked to a FILE or linked to a OFile
+  OFile& link(OFile&);
+/// Set the string name to be used for automatic backup
+  void setBackupString( const std::string& );
+/// Backup a file by giving it a different name
+  void backupFile( const std::string& bstring, const std::string& fname );
+/// This backs up all the files that would have been created with the
+/// name str.  It is used in analysis when you are not restarting.  Analysis
+/// output files at different times, which are names analysis.0.<filename>,
+/// analysis.1.<filename> and <filename>, are backed up to bck.0.analysis.0.<filename>,
+/// bck.0.analysis.1.<filename> and bck.0.<filename>
+  void backupAllFiles( const std::string& str );
+/// Opens the file using automatic append/backup
+  OFile& open(const std::string&name) override;
+/// Set the prefix for output.
+/// Typically "PLUMED: ". Notice that lines with a prefix cannot
+/// be parsed using fields in a IFile.
+  OFile& setLinePrefix(const std::string&);
+/// Set the format for writing double precision fields
+  OFile& fmtField(const std::string&);
+/// Reset the format for writing double precision fields to its default
+  OFile& fmtField();
+/// Set the value of a double precision field
+  OFile& printField(const std::string&,double);
+/// Set the value of a int type field
+  OFile& printField(const std::string&,int);
+  OFile& printField(const std::string&,long int);
+  OFile& printField(const std::string&,long long int);
+  OFile& printField(const std::string&,unsigned);
+  OFile& printField(const std::string&,long unsigned);
+  OFile& printField(const std::string&,long long unsigned);
+/// Set the value of a string field
+  OFile& printField(const std::string&,const std::string&);
+///
+  OFile& addConstantField(const std::string&);
+/// Used to setup printing of values
+  OFile& setupPrintValue( Value *val );
+/// Print a value
+  OFile& printField( Value* val, const double& v );
+  /** Close a line.
+  Typically used as
+  \verbatim
+    of.printField("a",a).printField("b",b).printField();
+  \endverbatim
+  */
+  OFile& printField();
+  /**
+  Resets the list of fields.
+  As it is only possible to add new constant fields (addConstantField()),
+  this method can be used to clean the field list.
+  */
+  OFile& clearFields();
+/// Header of the last line written with printField() (field names and the
+/// current values of the constant fields), as a string. Stored in the checkpoint
+/// so that a restart does not print the header again.
+  std::string getLastFields() const;
+/// Set the header of the last line written, see getLastFields().
+  void setLastFields(const std::string& str);
+/// Formatted output with explicit format - a la printf
+  int printf(const char*fmt,...);
+/// Formatted output with << operator
+  template <class T>
+  friend OFile& operator<<(OFile&,const T &);
+/// Rewind a file
+  OFile&rewind();
+/// Flush a file
+  FileBase&flush() override;
+/// Enforce restart, also if the attached plumed object is not restarting.
+/// Useful for tests
+  OFile&enforceRestart();
+/// Enforce backup, even if the attached plumed object is restarting.
+  OFile&enforceBackup();
+};
+
+/// Write using << syntax
+template <class T>
+OFile& operator<<(OFile&of,const T &t) {
+  of.oss<<t;
+  of.printf("%s",of.oss.str().c_str());
+  of.oss.str("");
+  return of;
+}
+
+
+}
+
+#endif

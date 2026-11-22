@@ -1,0 +1,323 @@
+name: Artifex CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer push to a pull request cancels its superseded run; a push to main always completes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The unit tests run in this many shards per leg (pytest-split), and unit_coverage checks that
+  # every one of them reported coverage.
+  UNIT_TEST_SHARDS: 4
+
+jobs:
+  already_tested:
+    name: Tree already tested
+    runs-on: ubuntu-latest
+    # The action reads the merged pull request and its checks; a private repository's token
+    # reads them only with these, and naming them keeps a public one working if it turns private.
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    outputs:
+      skip: ${{ steps.compare.outputs.skip }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A merge repeats the pull request; a manual run is asked for. When this step does not run
+      # the output is empty, which every consumer reads as "test it". The compare lives in
+      # substrax, the stack's base layer: skip only when this tree is the pull request's and
+      # every check of it succeeded. Pinned by commit (substrax ec43d80, PR #42).
+      - name: Compare this tree with the pull request that produced it
+        id: compare
+        if: github.event_name == 'push'
+        uses: avitai/substrax/.github/actions/already-tested@a61235ad7f851081efca508285b660a9d7f921ea
+
+  # Not gated on already_tested: every job waits on it, including the main-only
+  # performance job, and a skipped dependency would take that job down with it.
+  quality:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Artifex
+        uses: ./.github/actions/setup-artifex
+        with:
+          python-version: "3.12"
+          cache-suffix: quality
+          linux-editable-target: ".[dev]"
+
+      - name: Lock file is current
+        run: uv lock --check
+
+      - name: Run Ruff
+        run: uv run ruff check --output-format=github
+
+      - name: Check formatting
+        run: uv run ruff format --check
+
+      - name: Run pre-commit hooks
+        env:
+          PRE_COMMIT_HOME: /tmp/pre-commit-cache
+        run: uv run pre-commit run --all-files --show-diff-on-failure --color=always
+
+      - name: Documented model surface matches the tree
+        run: uv run python scripts/derive_status.py --check
+
+  unit_tests:
+    name: Unit Tests (${{ matrix.os }}, Python ${{ matrix.python-version }}, shard ${{ matrix.group }})
+    needs: [quality, already_tested]
+    runs-on: ${{ matrix.os }}
+    # pytest-split divides one collection into UNIT_TEST_SHARDS groups, one per matrix leg; the
+    # group list below is 1..UNIT_TEST_SHARDS. With no durations file it balances by test count
+    # (least_duration gives every test the same weight). Unsharded, a leg took 43 to 58 minutes.
+    strategy:
+      matrix:
+        # The macOS-14 runners queue for hours and run the same steps; they run on
+        # pushes to main only, so a branch or pull request is gated by the ubuntu
+        # jobs alone and the merge to main measures both platforms. A merge of a tree
+        # its pull request already tested runs only macOS, which no pull request ran.
+        os: ${{ fromJSON(needs.already_tested.outputs.skip == 'true' && '["macos-15"]' || (github.ref == 'refs/heads/main' && '["ubuntu-latest", "macos-15"]' || '["ubuntu-latest"]')) }}
+        python-version: ["3.12", "3.13"]
+        group: [1, 2, 3, 4]
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Artifex
+        uses: ./.github/actions/setup-artifex
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache-suffix: unit-${{ matrix.python-version }}-${{ matrix.os }}
+          linux-editable-target: ".[dev,test]"
+          macos-editable-target: ".[all-cpu]"
+
+      - name: Run unit tests with coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          # pytest-randomly orders the collection before pytest-split assigns it, so every shard
+          # of a run takes the run's id as its seed: one order, each test in exactly one shard.
+          # A shard covers part of the suite, so the coverage cap is not enforced per shard;
+          # unit_coverage holds each leg's shards, combined, to it.
+          uv run pytest tests/ -v -m "not slow and not blackjax" \
+            --cov=src/artifex --cov-report=xml --cov-report=term-missing --cov-fail-under=0 \
+            --splits "$UNIT_TEST_SHARDS" --group ${{ matrix.group }} \
+            --splitting-algorithm least_duration --randomly-seed=${{ github.run_id }}
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results-${{ matrix.python-version }}-${{ matrix.os }}-shard${{ matrix.group }}
+          path: |
+            .coverage
+            coverage.xml
+            test-results/
+          include-hidden-files: true
+        if: always()
+
+  unit_coverage:
+    name: Unit Coverage (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    # One per unit test leg, on every change the unit tests run on: the leg's shards together
+    # are the leg's whole unit run, held to [tool.coverage.report] fail_under as one run was.
+    # The report runs on the leg's Python: coverage re-parses the source for branch arcs, and
+    # that analysis follows the interpreter's version.
+    needs: [unit_tests, already_tested]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: ${{ fromJSON(needs.already_tested.outputs.skip == 'true' && '["macos-15"]' || (github.ref == 'refs/heads/main' && '["ubuntu-latest", "macos-15"]' || '["ubuntu-latest"]')) }}
+        python-version: ["3.12", "3.13"]
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Artifex
+        uses: ./.github/actions/setup-artifex
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache-suffix: unit-coverage-${{ matrix.python-version }}
+          linux-editable-target: ".[dev,test]"
+
+      - name: Download the leg's shard coverage
+        uses: actions/download-artifact@v4
+        with:
+          pattern: unit-test-results-${{ matrix.python-version }}-${{ matrix.os }}-shard*
+          path: shards
+
+      - name: Hold the leg's combined shards to the coverage cap
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          data=(shards/*/.coverage)
+          if [[ "${#data[@]}" -ne "$UNIT_TEST_SHARDS" ]]; then
+            echo "::error::expected coverage from $UNIT_TEST_SHARDS shards, found ${#data[@]}"
+            exit 1
+          fi
+          uv run coverage combine --data-file=.coverage.unit "${data[@]}"
+          uv run coverage report --data-file=.coverage.unit
+
+  integration_tests:
+    name: Integration Tests
+    needs: [unit_tests, already_tested]
+    if: needs.already_tested.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Artifex
+        uses: ./.github/actions/setup-artifex
+        with:
+          python-version: "3.12"
+          cache-suffix: integration
+          linux-editable-target: ".[dev,test]"
+
+      - name: Run integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run pytest tests/artifex/generative_models/integration/ -v \
+            --cov=src/artifex --cov-report=xml --cov-report=term-missing --cov-fail-under=0
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: |
+            .coverage
+            coverage.xml
+            test-results/
+          include-hidden-files: true
+        if: always()
+
+  e2e_tests:
+    name: End-to-End Tests
+    needs: [integration_tests, already_tested]
+    if: needs.already_tested.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Artifex
+        uses: ./.github/actions/setup-artifex
+        with:
+          python-version: "3.12"
+          cache-suffix: e2e
+          linux-editable-target: ".[dev,test]"
+
+      - name: Run end-to-end tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run pytest tests/ -v -m e2e \
+            --cov=src/artifex --cov-report=xml --cov-report=term-missing --cov-fail-under=0
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results
+          path: |
+            .coverage
+            coverage.xml
+            test-results/
+          include-hidden-files: true
+        if: always()
+
+  performance_tests:
+    name: Performance Tests
+    needs: unit_tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Artifex
+        uses: ./.github/actions/setup-artifex
+        with:
+          python-version: "3.12"
+          cache-suffix: perf
+          linux-editable-target: ".[dev,test]"
+
+      - name: Run performance tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run pytest tests/ -v -m "benchmark or performance" --benchmark-autosave --benchmark-columns=mean,stddev,min,max --no-cov
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmark-results/
+            benchmark.json
+            histogram.svg
+        if: always()
+
+  coverage:
+    name: Test Coverage
+    needs: [unit_tests, integration_tests, e2e_tests, already_tested]
+    if: needs.already_tested.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Artifex
+        uses: ./.github/actions/setup-artifex
+        with:
+          python-version: "3.12"
+          cache-suffix: coverage
+          linux-editable-target: ".[dev,test]"
+
+      - name: Download all coverage reports
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Debug artifact contents
+        run: |
+          echo "Listing artifact directory structure:"
+          find artifacts -type f | sort
+          echo "Checking for .coverage files:"
+          find artifacts -name ".coverage" | sort
+
+      - name: Combine coverage reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ls artifacts/*/.coverage 1> /dev/null 2>&1; then
+            uv run coverage combine artifacts/*/.coverage
+          else
+            echo "ERROR: No .coverage files found to combine"
+            exit 1
+          fi
+          uv run coverage report
+          uv run coverage xml
+
+      - name: Upload combined coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-coverage-report
+          path: coverage.xml
+        if: always()

@@ -1,0 +1,259 @@
+# Declared inputs that the static import closure cannot see, per ledger row.
+#
+# Read tests/knob_gate/_closure.py first. A row's closure is the static import
+# closure of scripts/parity/<slug>.py plus the entries below. Anything that is not
+# in the closure cannot invalidate the row; anything the closure cannot prove
+# (dynamic imports, package data) makes the row fall back to the old global rule
+# unless it is declared here. Every declaration is a REVIEWED CLAIM, so each one
+# carries its reason.
+#
+#   soft        modules loaded by string/table dispatch, not by an import statement
+#   dynamic_ok  closure files whose dynamic-load sites are covered by soft/data/the
+#               global prefixes, with the reason below
+#   data        path prefixes of non-.py inputs the vehicle reads
+#
+# THE DYNAMIC SITES (three found 261008 by scanning the closures, all rows; io/__init__.py added 261028):
+#
+#   src/aminx/host/runner.py          importlib.import_module(_DRIVER_BACKED_FAMILIES[family])
+#       Imports the family package named by the request's model_family. A LASEr
+#       vehicle requests only "lasermpnn" and a Potts vehicle only "pottsmpnn", so
+#       the row's own family package is declared as `soft` below and the OTHER
+#       family is intentionally absent. The closure scan proves the other family is
+#       not reachable by any import statement; this table is the only claim that it
+#       is not reached by the string table either.
+#   src/aminx/io/__init__.py          importlib.import_module(_LAZY_SUBMODULES[name])
+#       Lazy re-export of aminx.io.campaign_sink and aminx.io.designs on attribute
+#       access. Every `from aminx.io.<x> import ...` adds this file to a closure. No
+#       parity vehicle touches either lazy name (the closure scan finds no import of
+#       them), so they are intentionally not declared as `soft`. This reviewed claim
+#       is only as strong as that scan: a vehicle that starts using a lazy name must
+#       import it statically or declare it `soft`.
+#   src/aminx/io/weights.py           importlib.resources.files("aminx.model_params")
+#       Packaged weight files. They are non-.py files under src/aminx/, so they stay
+#       GLOBAL (any change invalidates every row) because this table declares no
+#       `data` prefix for them, and the gate separately pins the weights bytes
+#       through checkpoint_registry.json.
+#   src/aminx/families/potts_mpnn/driver.py   spec_from_file_location(<converter>)
+#       Loads scripts/recapture/pottsmpnn_model_to_eqx.py, and scripts/recapture/ is
+#       a GLOBAL prefix, so a change there invalidates every row regardless. Only
+#       the Potts rows reach this site (the LASEr closures contain no potts file).
+#
+# WHAT VERIFIES THESE CLAIMS. test_closure_selftest.py pins the closure structure
+# (no cross-family file in either family's rows) and the fail-safe behaviour. The
+# graded vehicles are the only thing that can show the closure covers a real run:
+# see scripts/redsox/closure_hook/sitecustomize.py, which records every repo file a
+# run actually loaded, and the "loaded files inside closure" check in verify_wave.py.
+
+[slug.laser_proofread_parity]
+soft = ["aminx.families.laser_mpnn"]
+dynamic_ok = ["src/aminx/host/runner.py", "src/aminx/io/__init__.py", "src/aminx/io/weights.py"]
+oracle_dirs = ["aminx-oracles/dumps/b3_laser_owned/"]
+
+[slug.laser_proofread_unconditional_parity]
+soft = ["aminx.families.laser_mpnn"]
+dynamic_ok = ["src/aminx/host/runner.py", "src/aminx/io/__init__.py", "src/aminx/io/weights.py"]
+oracle_dirs = ["aminx-oracles/dumps/b3_laser_owned/"]
+
+[slug.laser_decode_e2e]
+soft = ["aminx.families.laser_mpnn"]
+dynamic_ok = ["src/aminx/host/runner.py", "src/aminx/io/__init__.py", "src/aminx/io/weights.py"]
+oracle_dirs = ["aminx-oracles/dumps/b3_laser_owned/"]
+
+[slug.laser_score_parity]
+soft = ["aminx.families.laser_mpnn"]
+dynamic_ok = ["src/aminx/host/runner.py", "src/aminx/io/__init__.py", "src/aminx/io/weights.py"]
+oracle_dirs = ["aminx-oracles/dumps/b3_laser_owned/"]
+
+[slug.potts_ar_decode]
+soft = ["aminx.families.potts_mpnn"]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+  "src/aminx/families/potts_mpnn/driver.py",
+]
+
+[slug.potts_energy_parity]
+soft = ["aminx.families.potts_mpnn"]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+  "src/aminx/families/potts_mpnn/driver.py",
+]
+
+[slug.potts_ar_refine_exact]
+soft = ["aminx.families.potts_mpnn"]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+  "src/aminx/families/potts_mpnn/driver.py",
+]
+
+[slug.potts_ddg_megascale]
+soft = ["aminx.families.potts_mpnn"]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+  "src/aminx/families/potts_mpnn/driver.py",
+]
+
+# protonpotts_parity (spec 261007 section 50). The vehicle runs the thirteen wave scripts as SUBPROCESSES, which no import
+# statement shows, so every one of them is declared `soft`, together with the checkpoint converter they load by path.
+# The ProtonPotts family package is reached only through the string table in host/runner.py, hence `soft` too.
+# KNOWN GAP: scripts/convert_weights.py is loaded by the converter via spec_from_file_location. It sits outside every
+# scoped prefix (row_is_stale only looks at src/aminx/ and scripts/parity/), so no `data` declaration can make an edit
+# to it stale this row; declaring one would be vacuous and was removed. The converted weights are still pinned by the
+# checkpoint sha and graded against upstream on every run of the row. Tracked in spec section 51.
+[slug.protonpotts_parity]
+soft = [
+  "aminx.families.protonpotts_mpnn",
+  "convert_protonpotts_checkpoint",
+  "protonpotts_features_parity",
+  "protonpotts_encoder_parity",
+  "protonpotts_energy_parity",
+  "protonpotts_driver_parity",
+  "protonpotts_ph_block_parity",
+  "protonpotts_ph_greedy_parity",
+  "protonpotts_ph_driver_parity",
+  "protonpotts_decoder_parity",
+  "protonpotts_ddg_parity",
+  "protonpotts_sample_parity",
+  "protonpotts_ph_methods_parity",
+  "protonpotts_ph_knobs_parity",
+  "protonpotts_ph_objective_knobs_parity",
+]
+# The scripts/parity sites (the decoder and ddg waves too) load the converter or the driver wave (both declared soft) (declared soft) or scripts/convert_weights.py (the known gap above).
+# runner.py / weights.py / the Potts driver are the same three sites the Potts rows declare: the family string table
+# (protonpotts_mpnn is declared soft above), packaged weights (non-.py under src/aminx/, global), and the Potts
+# recapture converter (scripts/recapture/ is a global prefix).
+dynamic_ok = [
+  "scripts/parity/convert_protonpotts_checkpoint.py",
+  "scripts/parity/protonpotts_driver_parity.py",
+  "scripts/parity/protonpotts_encoder_parity.py",
+  "scripts/parity/protonpotts_energy_parity.py",
+  "scripts/parity/protonpotts_decoder_parity.py",
+  "scripts/parity/protonpotts_ddg_parity.py",
+  "scripts/parity/protonpotts_sample_parity.py",
+  "scripts/parity/protonpotts_ph_methods_parity.py",
+  "scripts/parity/protonpotts_ph_knobs_parity.py",
+  "scripts/parity/protonpotts_ph_objective_knobs_parity.py",
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+  "src/aminx/families/potts_mpnn/driver.py",
+]
+oracle_dirs = ["aminx-oracles-protonpotts/"]
+
+[slug.tier1_variants_parity]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+]
+data = ["tests/data/1ubq.pdb"]
+
+[slug.ca_only_parity]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+]
+data = ["tests/data/1ubq.pdb"]
+
+# v2 vehicle (ca_only_parity_v2.py wraps ca_only_parity.py with --canonical-edges); branch rows point here, the v1 slug
+# stays as the closure of its recorded (FAIL) run. Same closure: the wrapper adds no import beyond ca_only_parity.
+[slug.ca_only_parity_v2]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+]
+data = ["tests/data/1ubq.pdb"]
+
+[slug.thermo_mpnn_parity]
+soft = ["aminx.families.thermo_mpnn"]
+# thermo_mpnn/model.py imports potts_mpnn.features (potts_edge_features), so the closure legitimately reaches the Potts
+# package and its driver's converter-by-path site (same declaration the Potts rows carry).
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+  "src/aminx/families/potts_mpnn/driver.py",
+]
+data = ["tests/data/1ubq.pdb"]
+
+# v2: float16 reported, not graded. Same closure as v1 (the wrapper only adds a flag); v1 stays as the closure of its runs.
+[slug.thermo_mpnn_parity_v2]
+soft = ["aminx.families.thermo_mpnn"]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+  "src/aminx/families/potts_mpnn/driver.py",
+]
+data = ["tests/data/1ubq.pdb"]
+
+[slug.caliby_parity_v2]
+soft = ["aminx.families.caliby"]
+dynamic_ok = [
+  "src/aminx/families/potts_mpnn/driver.py",
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+]
+data = ["tests/data/1ubq.pdb", "tests/port/reference/caliby/"]
+
+# AntiBMPNN v3 (261104_p4-final-review-fixes; v2 + finiteness rule). The vehicle reads sealed upstream dumps (outside the repo, sha256-pinned in the
+# sidecar [data]) and the HuJ3 fixture/checkpoints under the upstream clone. It drives aminx.host.runner.score (entry
+# stage, published weights via aminx.io.weights) but NOT any potts_mpnn module.
+[slug.antibmpnn_parity_v3]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+]
+
+
+[slug.fampnn_parity]
+soft = ["aminx.families.fampnn"]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+]
+data = ["tests/data/1ubq.pdb", "tests/knob_gate/checkpoint_registry.json"]
+
+# v2 vehicle (fampnn_parity_v2.py wraps fampnn_parity.py with --band-rule floor); supersedes the v1 slug above, whose
+# registered run recorded FAIL on one float64 loop check. Same closure: the wrapper adds no import beyond fampnn_parity.
+[slug.fampnn_parity_v2]
+soft = ["aminx.families.fampnn"]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+]
+data = ["tests/data/1ubq.pdb", "tests/knob_gate/checkpoint_registry.json"]
+
+# v3 vehicle (fampnn_parity_v3.py wraps fampnn_parity.py with --band-rule floor and the non-finite/shape/crash
+# accounting). Branch rows point here; the v1 and v2 slugs stay as the closures of their recorded runs.
+[slug.fampnn_parity_v3]
+soft = ["aminx.families.fampnn"]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+]
+data = ["tests/data/1ubq.pdb", "tests/knob_gate/checkpoint_registry.json"]
+
+[slug.frustrampnn_parity]
+soft = ["aminx.families.frustra_mpnn"]
+dynamic_ok = [
+  "src/aminx/host/runner.py",
+  "src/aminx/io/__init__.py",
+  "src/aminx/io/weights.py",
+]
+data = ["tests/data/1ubq.pdb"]
+

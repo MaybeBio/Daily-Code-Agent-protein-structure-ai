@@ -1,0 +1,23 @@
+/* ============================================
+   BioGenesis — Premium Dark Theme
+   Inspired by PTNK Future: #00E5FF × GitHub Dark
+   ============================================ */
+
+/* Split into parts in T4.4. The cascade depends on this order — these imports
+   mirror the original file top to bottom, so do not reorder them. */
+
+@import './styles/tokens.css';
+@import './styles/base.css';
+@import './styles/layout.css';
+@import './styles/tools.css';
+@import './styles/content.css';
+@import './styles/panels.css';
+@import './styles/components.css';
+@import './styles/viewer.css';
+@import './styles/utilities.css';
+
+@import './styles/workspace.css';
+
+@import './styles/identity.css';
+
+@import './styles/responsive.css';

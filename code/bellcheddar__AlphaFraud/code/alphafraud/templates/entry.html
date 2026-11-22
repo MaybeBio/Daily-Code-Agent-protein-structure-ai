@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% set active = '' %}
+{% block title %}{{ e.entry_id }}_{{ e.chain }} &middot; AlphaFraud{% endblock %}
+
+{% macro figure(fig_json, dom_id) %}
+  {% if fig_json %}
+  <div class="card">
+    <div class="plot" id="{{ dom_id }}"></div>
+    <div class="dlbar"><button class="dl" onclick="downloadPlotCsv('{{ dom_id }}','{{ e.entry_id }}_{{ dom_id }}.csv')">⬇ Download CSV</button></div>
+  </div>
+  <script type="application/json" data-target="{{ dom_id }}">{{ fig_json | safe }}</script>
+  {% endif %}
+{% endmacro %}
+
+{% macro fmt(v) %}{% if v is none %}—{% else %}{{ v }}{% endif %}{% endmacro %}
+{% macro r2(v) %}{% if v is none %}—{% elif v is number %}{{ '%.2f'|format(v) }}{% else %}{{ v }}{% endif %}{% endmacro %}
+
+{% block content %}
+  <h1>
+    {{ e.entry_id }}_{{ e.chain }}
+    {% if e.confidently_wrong %}<span class="badge wrong">confidently wrong</span>{% endif %}
+    {% if e.is_novel %}<span class="badge novel">novel</span>{% endif %}
+  </h1>
+  <p class="sub">
+    {{ e.description or '' }} &middot;
+    {% if e.uniprot %}<a href="https://www.uniprot.org/uniprotkb/{{ e.uniprot }}" target="_blank" rel="noopener">{{ e.uniprot }}</a>{% endif %}
+    {% if e.uniprot_name %}({{ e.uniprot_name }}){% endif %} &middot;
+    <a href="https://www.rcsb.org/structure/{{ e.entry_id }}" target="_blank" rel="noopener">RCSB {{ e.entry_id }}</a> &middot;
+    {% if e.af_entry_id %}<a href="https://alphafold.ebi.ac.uk/entry/{{ e.uniprot }}" target="_blank" rel="noopener">{{ e.af_entry_id }} (v{{ e.af_model_version }})</a>{% endif %}
+  </p>
+
+  {% if e.status == 'screened' %}
+  <div class="card" style="border-left:4px solid var(--amber)">
+    <b>Screen-only record.</b> This structure passed the fast TM-score screen (TM {{ r2(metrics.tm_by_experiment) }})
+    and AlphaFold agrees well with experiment, so the full metric suite, novelty score and heatmaps were not
+    computed. Full analysis is reserved for the disagreements (TM below the screening threshold).
+  </div>
+  {% endif %}
+
+  {% set ru = ribbon_url(e.entity_id) %}
+  {% if ru %}
+  {% set cu = coords_url(e.entity_id) %}
+  <div class="card ribbonhero">
+    <div class="ribbonhero-visual">
+      <img id="ribbonImg" src="{{ ru }}" alt="Experimental Cα ribbon coloured by deviation from the AlphaFold model">
+      <div id="viewer3d" class="viewer3d"></div>
+      {% if cu %}
+      {% set gu = ghost_url(e.entity_id) %}
+      <div class="viewer3d-controls">
+        <button class="btn3d" id="btn3d" onclick="toggleRibbon3D('{{ e.entity_id }}', '{{ cu }}', '{{ gu or '' }}')">🔄 Interactive 3D</button>
+        <button class="btn3d" id="btnGhost" style="display:none" onclick="toggleGhost()">👻 AlphaFold ghost</button>
+        <span class="viewer3d-hint" id="viewer3dHint"></span>
+      </div>
+      {% endif %}
+    </div>
+    <div class="devlegend">
+      <div class="devlegend-title">Experimental structure, coloured by Cα deviation from the AlphaFold model</div>
+      <p>Blue where the experiment agrees with AlphaFold; amber-to-red where it diverges. The scale is anchored to
+         absolute Ångströms, so hotspots are comparable across structures.</p>
+      <div class="devlegend-bar"></div>
+      <div class="devlegend-ticks"><span>0&#8491;</span><span>1</span><span>2</span><span>5</span><span>10&#8491;+</span></div>
+      <div class="devlegend-note">○ N-terminus &middot; ● C-terminus &middot; ribbon widens at helices &amp; strands &middot;
+        <span style="color:#2563eb">faint blue dashes</span> = the superposed AlphaFold backbone</div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="kpis">
+    <div class="kpi good"><div class="n">{{ r2(metrics.tm_by_experiment) }}</div><div class="l">TM-score</div></div>
+    <div class="kpi"><div class="n">{{ r2(metrics.lddt) }}</div><div class="l">lDDT</div></div>
+    <div class="kpi"><div class="n">{{ r2(metrics.ca_rmsd) }}</div><div class="l">Cα-RMSD Å</div></div>
+    <div class="kpi"><div class="n">{{ r2(metrics.mean_plddt) }}</div><div class="l">mean pLDDT</div></div>
+    <div class="kpi {% if e.confidently_wrong %}alert{% endif %}"><div class="n">{{ r2(metrics.fraud_score) }}</div><div class="l">FRAUD score</div></div>
+    <div class="kpi"><div class="n">{{ r2(nov(e.novelty_identity)) }}%</div><div class="l">novelty{% if e.novelty_identity is not none %} <span class="hint">({{ r2(e.novelty_identity) }}% id)</span>{% endif %}</div></div>
+  </div>
+
+  {% if figures.tracks %}
+  {{ figure(figures.tracks, 'tracks') }}
+  <div class="explain">
+    <h4>Per-residue accuracy vs. confidence</h4>
+    <p>Reading along the protein chain: <dfn>red</dfn> is how far each residue sits from the experiment
+    (C&alpha; deviation in &Aring;, higher = worse); <dfn>green</dfn> is local accuracy (lDDT&times;100);
+    <dfn>blue dotted</dfn> is AlphaFold's own confidence (pLDDT). Stretches where confidence stays high but the
+    red line is large are exactly where AlphaFold is <dfn>confidently wrong</dfn>.</p>
+    <p class="takehome">Take-home: mean confidence pLDDT {{ r2(metrics.mean_plddt) }} vs. overall accuracy
+    lDDT {{ r2(metrics.lddt) }} and TM-score {{ r2(metrics.tm_by_experiment) }}.</p>
+    <h5>The metrics</h5>
+    <p class="metric"><dfn>Cα deviation:</dfn> how far residue i sits from where the experiment places it, after
+    superposing the whole chain. <span class="eq">Δᵢ = |Pᵢ &minus; (R·Qᵢ + t)|</span> &Aring;, with Pᵢ/Qᵢ the
+    experimental/model Cα coordinates and R,t the best-fit rotation and translation.</p>
+    <p class="metric"><dfn>per-residue lDDT:</dfn> local accuracy at residue i without superposition &mdash; the
+    fraction of i's neighbour distances (within 15 &Aring;) the model preserves.
+    <span class="eq">lDDTᵢ = ¼ Σ_t 1[ |d_exp &minus; d_model| &lt; t ]</span>, t ∈ {0.5, 1, 2, 4} &Aring;.</p>
+    <p class="metric"><dfn>pLDDT:</dfn> AlphaFold's confidence for residue i (0&ndash;100) &mdash; its own predicted
+    lDDT, output by the network before seeing the experiment.</p>
+  </div>
+  {% endif %}
+
+  {% if figures.calibration %}
+  {{ figure(figures.calibration, 'calibration') }}
+  <div class="explain">
+    <h4>Is the confidence honest?</h4>
+    <p>Each point is one residue: AlphaFold's predicted confidence (pLDDT, horizontal) against its actual
+    accuracy (lDDT&times;100, vertical). Points on the dashed diagonal are perfectly calibrated; points well
+    below it are <dfn>overconfident</dfn> &mdash; AlphaFold was surer than it should have been.</p>
+    <p class="takehome">Take-home: pLDDT&ndash;lDDT correlation
+    {{ metrics.plddt_lddt_pearson if metrics.plddt_lddt_pearson is not none else '—' }}
+    (near 1 = well calibrated; near or below 0 = confidence unrelated to, or opposite, real accuracy).</p>
+    <h5>The metrics</h5>
+    <p class="metric"><dfn>pLDDT (x):</dfn> AlphaFold's predicted per-residue confidence, 0&ndash;100.
+    <dfn>lDDT&times;100 (y):</dfn> the accuracy actually achieved at that residue. Perfect calibration puts every
+    point on the diagonal <span class="eq">pLDDTᵢ = 100·lDDTᵢ</span>.</p>
+    <p class="metric"><dfn>Calibration correlation:</dfn> the headline is the Pearson correlation of the two across
+    all residues. <span class="eq">r = cov(pLDDT, lDDT) / (σ_pLDDT · σ_lDDT)</span> &mdash; near 1 means confidence
+    tracks accuracy honestly; ≤ 0 means it does not.</p>
+  </div>
+  {% endif %}
+
+  {% if figures.distance %}
+  {{ figure(figures.distance, 'distance') }}
+  <div class="explain">
+    <h4>Where the shape differs</h4>
+    <p>The difference between the experimental and predicted residue&ndash;residue distance maps (&Aring;).
+    Bright regions mark pairs of residues whose separation AlphaFold got wrong &mdash; often a whole domain
+    placed in the wrong position relative to the rest of the structure.</p>
+    <p class="takehome">Take-home: mean distance-map difference {{ r2(metrics.distance_matrix_mean_diff) }}&nbsp;&Aring;.</p>
+    <h5>The metric</h5>
+    <p class="metric"><dfn>Distance-matrix difference:</dfn> each cell is how much the separation of residues i and j
+    differs between prediction and experiment. <span class="eq">|Dᵢⱼ^exp &minus; Dᵢⱼ^model|</span>, where
+    Dᵢⱼ = |rᵢ &minus; rⱼ| is the distance between the two residues. Superposition-free, so a domain in the wrong
+    place shows up as a bright off-diagonal block rather than being averaged away.</p>
+  </div>
+  {% endif %}
+
+  {% if figures.pae %}
+  {{ figure(figures.pae, 'pae') }}
+  <div class="explain">
+    <h4>Did AlphaFold know it was wrong?</h4>
+    <p><dfn>Left</dfn>: AlphaFold's own predicted error (PAE, &Aring;) for each residue pair.
+    <dfn>Right</dfn>: the error we actually measured. Where the right panel is much brighter than the left,
+    AlphaFold underestimated its own error.</p>
+    <p class="takehome">Take-home: mean predicted error {{ r2(metrics.mean_pae) }}&nbsp;&Aring; vs. mean observed
+    error {{ r2(metrics.mean_observed_error) }}&nbsp;&Aring;;
+    {{ (100 * metrics.pae_overconfident_frac) | round(1) if metrics.pae_overconfident_frac is not none else '—' }}%
+    of residue pairs were more wrong than AlphaFold predicted.</p>
+    <h5>The metrics</h5>
+    <p class="metric"><dfn>PAE (predicted):</dfn> AlphaFold's Predicted Aligned Error &mdash; <span class="eq">PAEᵢⱼ</span>
+    is the position error (&Aring;) it expects for residue j when the structure is aligned on residue i, output by
+    the network.</p>
+    <p class="metric"><dfn>Observed error:</dfn> the frame-invariant reality we measure for the same pair.
+    <span class="eq">Eᵢⱼ = | |rᵢ&minus;rⱼ|_exp &minus; |rᵢ&minus;rⱼ|_model |</span>. If the observed panel is far
+    brighter than the predicted one, AlphaFold underestimated its own error &mdash; it was overconfident.</p>
+  </div>
+  {% endif %}
+
+  {% if domains %}
+  <h2>Per-domain breakdown</h2>
+  <div class="tablewrap">
+    <table id="domainsTable" class="sortable">
+      <thead><tr><th>Source</th><th>Domain</th><th>Range</th><th>Residues</th><th>TM</th><th>RMSD Å</th><th>mean Cα Δ</th><th>Name</th></tr></thead>
+      <tbody>
+        {% for d in domains %}
+        <tr>
+          <td>{{ d.source }}</td><td>{{ d.label }}</td><td>{{ d.range }}</td>
+          <td class="num">{{ d.n_residues }}</td><td class="num">{{ r2(d.tm) }}</td>
+          <td class="num">{{ r2(d.rmsd) }}</td><td class="num">{{ r2(d.mean_ca_dev) }}</td>
+          <td>{{ d.name or '' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="dlbar"><button class="dl" onclick="downloadTableCsv('domainsTable','{{ e.entry_id }}_domains.csv')">⬇ Download CSV</button></div>
+  {% endif %}
+
+  <h2>All metrics</h2>
+  <div class="metrics-grid">
+    {% for group_name, keys in metric_groups %}
+    <div class="card metric-group">
+      <h3>{{ group_name }}</h3>
+      <table>
+        <tbody>
+          {% for key, label in keys %}
+          {% if key in metrics %}
+          <tr><td>{{ label }}</td><td>{{ r2(metrics[key]) }}</td></tr>
+          {% endif %}
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endfor %}
+  </div>
+
+  <p class="sub" style="margin-top:20px">
+    Deposited {{ (e.deposit_date or '')[:10] }} · released {{ (e.release_date or '')[:10] }} ·
+    {{ e.method or '' }}{% if e.resolution %} · {{ e.resolution }} Å{% endif %} ·
+    closest pre-cutoff chain: {{ e.closest_pre_cutoff or 'none' }}
+  </p>
+{% endblock %}

@@ -1,0 +1,166 @@
+import torch
+
+from metatrain.scaler.checkpoints import update_per_property_scales
+from metatrain.utils.data.atomic_basis_helpers import densify_atomic_basis_dataset_info
+
+
+###########################
+# MODEL ###################
+###########################
+
+
+def model_update_v1_v2(checkpoint: dict) -> None:
+    """
+    Update trainer checkpoint from version 1 to version 2.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    # In v1 there was a huge bug where `edge_irreps` was passed
+    # to MACE even if it was None. Here we keep this functionality
+    # to update from v1 to v2, although people should really just
+    # retrain, because the v1 situation was very bad.
+    if checkpoint["model_data"]["hypers"]["edge_irreps"] is None:
+        checkpoint["model_data"]["hypers"]["edge_irreps"] = ""
+
+
+def model_update_v2_v3(checkpoint: dict) -> None:
+    """
+    Update a v2 checkpoint to v3.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    update_per_property_scales(checkpoint)
+
+
+def model_update_v3_v4(checkpoint: dict) -> None:
+    """
+    Update a v3 checkpoint to v4.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    if "mace_head_name" not in checkpoint["model_data"]["hypers"]:
+        checkpoint["model_data"]["hypers"]["mace_head_name"] = None
+
+
+def model_update_v4_v5(checkpoint: dict) -> None:
+    """
+    Update a v4 checkpoint to v5.
+
+    It removes the additive models and scaler from the model checkpoint,
+    as this is now handled by the MetatrainModel wrapper.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    removed_prefixes = (
+        "additive_models.",
+        "scaler.",
+    )
+    for key in ["model_state_dict", "best_model_state_dict"]:
+        if (state_dict := checkpoint.get(key)) is not None:
+            for k in list(state_dict):
+                for prefix in removed_prefixes:
+                    if k.startswith(prefix):
+                        state_dict.pop(k)
+
+    # Before this update, the model stored the dataset_info in a sparse format
+    # for atomic basis targets but worked in the dense format. After this update,
+    # the model works in whatever format the dataset_info is stored in,
+    # so to keep the checkpoint compatible we need to densify the stored dataset_info.
+    checkpoint["model_data"]["dataset_info"] = densify_atomic_basis_dataset_info(
+        checkpoint["model_data"]["dataset_info"]
+    )
+
+
+def model_update_v5_v6(checkpoint: dict) -> None:
+    """
+    Update model checkpoint from version 5 to version 6.
+
+    The embedded composition model and scaler now use
+    ``metatensor.torch.learn.nn.Module`` with ``register_buffer`` instead of
+    manually tracked buffers.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    for key in ["model_state_dict", "best_model_state_dict"]:
+        if (state_dict := checkpoint.get(key)) is None:
+            continue
+
+        # If both model_state_dict and best_model_state_dict point to the same
+        # dict, the upgrade was already applied in the first iteration.
+        if "_mts_helper" in state_dict:
+            continue
+
+        reference = next(v for v in state_dict.values() if isinstance(v, torch.Tensor))
+        empty_tensor = torch.zeros(0, dtype=reference.dtype, device=reference.device)
+
+        state_dict["_mts_helper"] = empty_tensor
+        state_dict["_extra_state"] = {}
+
+
+def model_update_v6_v7(checkpoint: dict) -> None:
+    """
+    Update model checkpoint from version 6 to version 7.
+
+    The `layouts` buffer was made persistent by mistake in the previous version.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    for key in ["model_state_dict", "best_model_state_dict"]:
+        if (state_dict := checkpoint.get(key)) is None:
+            continue
+        state_dict["_extra_state"].pop("layouts", None)
+
+
+###########################
+# TRAINER #################
+###########################
+
+
+def trainer_update_v1_v2(checkpoint: dict) -> None:
+    """
+    Update trainer checkpoint from version 1 to version 2.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    checkpoint["train_hypers"]["batch_atom_bounds"] = [None, None]
+
+
+def trainer_update_v2_v3(checkpoint: dict) -> None:
+    """
+    Update trainer checkpoint from version 2 to version 3.
+
+    The ``batch_atom_bounds`` field has been removed from the trainer schema
+    (max-atom packing is now done by the sampler, via ``max_atoms_per_batch``
+    and ``min_atoms_per_batch``). ``batch_atom_bounds`` bounds are translated
+    into the equivalent sampler settings; if it was unset, the new sampler
+    settings default to no packing.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    train_hypers = checkpoint["train_hypers"]
+    min_bound, max_bound = train_hypers.pop("batch_atom_bounds", [None, None])
+    train_hypers["max_atoms_per_batch"] = max_bound
+    train_hypers["min_atoms_per_batch"] = min_bound if min_bound is not None else 0
+
+
+def trainer_update_v3_v4(checkpoint: dict) -> None:
+    """
+    Deprecate the ``distributed`` hyperparameter.
+
+    So that it doesn't show up in the restarting options.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    train_hypers = checkpoint["train_hypers"]
+    if "distributed" in train_hypers and train_hypers["distributed"] is None:
+        train_hypers.pop("distributed")
+
+
+def trainer_update_v4_v5(checkpoint: dict) -> None:
+    """
+    Adds the extenders hyperparameter to the trainer hypers.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    train_hypers = checkpoint["train_hypers"]
+    train_hypers["extenders"] = {}

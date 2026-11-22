@@ -1,0 +1,192 @@
+"""Typed contracts for configuration and mutable analysis state.
+
+The runtime still exposes one mapping for compatibility, but grouping keys by
+lifetime makes stage boundaries reviewable and supports incremental typing.
+"""
+
+from typing import Any, TypedDict
+
+import numpy as np
+import pandas as pd
+
+
+class InputConfig(TypedDict, total=False):
+    alignment_file: str
+    full_cds_alignment_file: str
+    rooted_tree_file: str
+    foreground: str
+    fg_stem_only: bool
+    fg_trait_tree: str | None
+    fg_trait_rate_model: str
+    fg_trait_match_tip_count: bool
+    path_iqtree_state: str
+    path_iqtree_rate: str
+    infile_type: str
+    input_data_type: str
+    genetic_code: int
+    epistasis_context_file: str
+    epistasis_context_source: str
+    database_search: str
+    alphafold_version: str
+    blastp_db: str | None
+    mmseqs_db: str | None
+    resource: str
+    resource_cache_dir: str
+    resource_lock_poll: float
+    resource_lock_timeout: float
+    no_download: bool
+    verify: bool | None
+
+
+class OutputConfig(TypedDict, total=False):
+    outdir: str
+    output_prefix: str
+    log_file: str
+    iqtree_outdir: str
+    float_format: str
+    float_digit: int
+    export_expected_omega: bool
+
+
+class NumericConfig(TypedDict, total=False):
+    float_type: Any
+    float_tol: float
+    threads: int
+    blas_threads: int
+    random_seed: int
+    current_arity: int
+    high_order_pruning: str
+    max_arity: int
+    min_arity: int
+    min_sub_pp: float
+    min_ocn_site_pp: float
+    cutoff_ocn_stats: list[str]
+
+
+class ModelConfig(TypedDict, total=False):
+    substitution_posterior: str
+    pair_posterior: str
+    endpoint_block_size: int
+    calibrate_longtail: bool
+    longtail_method: str
+    longtail_null_niter: int
+    longtail_test_block_size: int
+    expectation_method: str
+    expected_state_backend: str
+    nonsyn_recode: str
+    nonsyn_recode_training_alignment: str
+    urn_n_regions: str
+    asrv_training_branches: str
+    asrv_concentration: float | None
+    asrv_report: bool
+    asrv: str
+    asrv_posterior_draws: int
+    urn_wallenius_expectation: str
+    epistasis_cv_clades: int
+    epistasis_beta_partition: str
+    epistasis_branch_depth_bins: int
+    epistasis_beta_auto: bool
+    epistasis_beta_value: float
+    epistasis_clip_auto: bool
+    epistasis_clip_value: float
+    epistasis_joint_auto: bool
+    ml_anc: bool
+    codon_orders: np.ndarray
+    amino_acid_orders: list[str]
+    synonymous_indices: dict[str, list[int]]
+    max_synonymous_size: int
+    equilibrium_frequency: np.ndarray
+    empirical_eq_freq: np.ndarray
+    instantaneous_codon_rate_matrix: np.ndarray
+    instantaneous_nsy_rate_matrix: np.ndarray
+    iqtree_rate_values: np.ndarray
+
+
+class AnalysisState(TypedDict, total=False):
+    tree: Any
+    num_node: int
+    num_input_site: int
+    num_input_state: int
+    state_cdn: np.ndarray | None
+    state_pep: np.ndarray | None
+    state_nsy: np.ndarray | None
+    state_loaded_branch_ids: np.ndarray | None
+    iqtree_rate_column: str | None
+    _asrv_nonsynonymous_site_mask: np.ndarray
+    _asrv_rate_categories: np.ndarray
+    _asrv_rate_posterior: np.ndarray
+    _asrv_posterior_seed: int
+    _empirical_urn_fit: tuple[Any, Any]
+    _empirical_urn_uniform_weight: float | None
+    _empirical_urn_folds: list[dict[str, Any]]
+    EN_reducer: dict[str, Any]
+    ES_reducer: dict[str, Any]
+    sub_branches: list[int]
+    branch_table: pd.DataFrame
+    df_cb_stats: pd.DataFrame
+    df_cb_stats_main: pd.DataFrame
+    fg_ids: dict[str, np.ndarray]
+    epistasis_enabled: bool
+    _epistasis_state: dict[str, Any]
+    _epistasis_provenance: dict[str, Any]
+    scan_calibration_diagnostics: dict[str, Any]
+
+
+class OutputSwitches(TypedDict, total=False):
+    b: bool
+    bs: bool
+    cb: bool
+    cbs: bool
+    cs: bool
+    s: bool
+    branch_dist: bool
+    drop_invariant_tip_sites: bool
+    site_filter_report: bool
+    output_stats: Any
+
+
+class InternalControls(TypedDict, total=False):
+    _release_state_after_expected_reducer: bool
+    _cbs_stream_target_bytes: int
+    _scan_trait_plans: dict[Any, Any]
+    _scan_permutation_exact: bool
+    _fg_trait_model: Any
+
+
+class ScanConfig(TypedDict, total=False):
+    scan_analytic_pvalue: str
+    scan_analytic_profile: str | None
+    scan_observation: str
+    scan_min_event_count: float
+    scan_ctmc_model_precision: dict[str, Any]
+    scan_pvalue_calibration: str
+    scan_bootstrap_workers: int
+    scan_n_permutations: int
+    scan_permutation_seed: int
+    scan_site_plot_filter: str
+    scan_cli_options: dict[str, Any]
+    scan_bootstrap_summary: dict[str, Any]
+    scan_no_test_reason: str
+
+
+class SimulationConfig(TypedDict, total=False):
+    simulate_scenario: str
+    simulate_epistasis_distance_scale: float
+    simulate_epistasis_preference_multiplier: float
+    simulate_focal_tips: int
+    simulate_focal_branch_length: float | None
+
+
+class AnalysisConfig(
+    InputConfig,
+    OutputConfig,
+    NumericConfig,
+    ModelConfig,
+    AnalysisState,
+    OutputSwitches,
+    InternalControls,
+    ScanConfig,
+    SimulationConfig,
+    total=False,
+):
+    """Compatibility view of the combined pipeline mapping."""

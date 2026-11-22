@@ -1,0 +1,20 @@
+name        = "RFdiffusion Backbone Design"
+description = "Run RFdiffusion (Watson et al. 2023) to generate binder backbone structures. RFdiffusion emits the receptor as chain A and the binder as chain B, following the contig order; this node relabels them so the output is chain A = binder (poly-Gly), chain B = receptor, which is what the downstream nodes expect."
+inputs      = ["validated_target.pdb"]
+outputs     = ["backbones/design_*.pdb"]
+
+[container]
+image   = "rfdiffusion:2026_06_25"
+
+[scripts]
+run = "run.sh"
+
+[params.noise_scale]
+type    = "float"
+default = 1.0
+hint    = "RFdiffusion noise scale for Ca denoising; lower = more conservative"
+
+[params.num_diffusion_steps]
+type    = "integer"
+default = 50
+hint    = "Number of diffusion denoising steps"

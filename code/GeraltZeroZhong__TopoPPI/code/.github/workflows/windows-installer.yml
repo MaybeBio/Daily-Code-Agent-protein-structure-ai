@@ -1,0 +1,332 @@
+name: Windows Installer
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - name: Read package version
+        id: version
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "src"
+          $version = python -c "from topoppi._version import __version__; print(__version__)"
+          "value=$version" >> $env:GITHUB_OUTPUT
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match package version v$version."
+          }
+
+      - name: Build matching plugin wheels
+        shell: pwsh
+        run: |
+          python -m pip install build
+          if ($LASTEXITCODE -ne 0) { throw "Could not install the wheel build tool." }
+          $wheelDir = Join-Path $env:RUNNER_TEMP "binding-wheels"
+          foreach ($plugin in @("affinity", "hotspot")) {
+            python -m build --wheel "plugins/$plugin" --outdir $wheelDir
+            if ($LASTEXITCODE -ne 0) { throw "Could not build the $plugin plugin wheel." }
+            $wheel = Join-Path $wheelDir "topoppi_${plugin}-${{ steps.version.outputs.value }}-py3-none-any.whl"
+            if (!(Test-Path $wheel)) { throw "Plugin wheel version does not match Core: $wheel" }
+          }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Windows OptCuts artifact
+        shell: pwsh
+        run: |
+          .\tools\OptCuts\build_windows_optcuts.ps1 -OutputDir "installer\windows"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item installer\windows\OptCuts_bin-windows-x86_64.exe release-assets\
+          Copy-Item installer\windows\OptCuts_bin-windows-x86_64.exe.sha256 release-assets\
+
+      - name: Build setup executable
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $packageSpec = "https://github.com/GeraltZeroZhong/TopoPPI/archive/refs/tags/$env:GITHUB_REF_NAME.zip"
+          }
+          else {
+            $packageSpec = "https://github.com/GeraltZeroZhong/TopoPPI/archive/$env:GITHUB_SHA.zip"
+          }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) {
+            $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          }
+          Push-Location installer\windows
+          try {
+            & $iscc "/DMyAppVersion=${{ steps.version.outputs.value }}" "/DMyPackageSpec=$packageSpec" "TopoPPI.iss"
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+      - name: Locate setup executable
+        id: artifact
+        shell: pwsh
+        run: |
+          $installer = "installer\windows\Output\TopoPPI-${{ steps.version.outputs.value }}-windows-x86_64-setup.exe"
+          if (!(Test-Path $installer)) {
+            throw "Installer not found: $installer"
+          }
+          Copy-Item $installer release-assets\
+          $expected = @(
+            "OptCuts_bin-windows-x86_64.exe",
+            "OptCuts_bin-windows-x86_64.exe.sha256",
+            "TopoPPI-${{ steps.version.outputs.value }}-windows-x86_64-setup.exe"
+          ) | Sort-Object
+          $actual = @(Get-ChildItem release-assets -File | ForEach-Object Name | Sort-Object)
+          if (Compare-Object -ReferenceObject $expected -DifferenceObject $actual) {
+            throw "Unexpected Windows release artifact layout: $($actual -join ', ')"
+          }
+          "installer=$installer" >> $env:GITHUB_OUTPUT
+
+      - name: Run installed application lifecycle smoke
+        timeout-minutes: 40
+        shell: pwsh
+        run: |
+          $installer = (Resolve-Path "${{ steps.artifact.outputs.installer }}").Path
+          $installDir = Join-Path $env:RUNNER_TEMP ("TopoPPI " + [char]0x7528 + [char]0x6237)
+          $installLog = Join-Path $env:RUNNER_TEMP "TopoPPI Installer.log"
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          Set-Content -Path (Join-Path $installDir "TopoPPI GUI.cmd") -Value "legacy launcher"
+          $mappedDrivesBefore = @(& subst.exe)
+          $installProcess = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$installDir`"", "/LOG=`"$installLog`""
+          ) -PassThru
+          $installProcess | Wait-Process -Timeout 1800 -ErrorAction Stop
+          $mappedDrivesAfter = @(& subst.exe)
+          if (($mappedDrivesBefore -join "`n") -ne ($mappedDrivesAfter -join "`n")) {
+            throw "Windows setup left a package-cache drive mapped."
+          }
+          if ($installProcess.ExitCode -ne 0) {
+            Get-Content $installLog -Tail 200 -ErrorAction SilentlyContinue
+            Get-Content (Join-Path $installDir "installation.log") -Tail 200 -ErrorAction SilentlyContinue
+            throw "TopoPPI setup failed with exit code $($installProcess.ExitCode)."
+          }
+
+          $python = Join-Path $installDir "env\python.exe"
+          $cli = Join-Path $installDir "TopoPPI CLI.cmd"
+          $commandPrompt = Join-Path $installDir "TopoPPI Command Prompt.cmd"
+          $guiLauncher = Join-Path $installDir "launch_gui.pyw"
+          $commandPromptShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\TopoPPI\TopoPPI Command Prompt.lnk"
+          foreach ($path in @($python, $cli, $commandPrompt, $guiLauncher, $commandPromptShortcut)) {
+            if (!(Test-Path $path)) {
+              Get-Content $installLog -Tail 200 -ErrorAction SilentlyContinue
+              Get-Content (Join-Path $installDir "installation.log") -Tail 200 -ErrorAction SilentlyContinue
+              throw "Installed application file is missing: $path"
+            }
+          }
+          if (Test-Path (Join-Path $installDir "TopoPPI GUI.cmd")) {
+            throw "The v1.2 GUI launcher remained after upgrade."
+          }
+
+          & $python -c "import MDAnalysis, igl, prolif, rdkit, topoppi; assert topoppi.__version__ == '${{ steps.version.outputs.value }}'"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The installed Python environment could not import the application stack."
+          }
+          & $python -I tests\core_install_smoke.py --allow-scikit-learn
+          if ($LASTEXITCODE -ne 0) {
+            throw "The default Chemistry plugin failed its installed capability smoke."
+          }
+
+          $numericSmoke = @'
+          import json
+          import sys
+          from pathlib import Path
+          import numpy as np
+
+          for package in ("libblas", "libcblas", "liblapack"):
+              records = list((Path(sys.prefix) / "conda-meta").glob(f"{package}-*.json"))
+              assert len(records) == 1, (package, records)
+              assert "openblas" in json.loads(records[0].read_text())["build"], package
+          np.testing.assert_array_equal(np.dot(np.ones((30000, 3)), np.ones(3)), np.full(30000, 3.0))
+          '@
+          & $python -c $numericSmoke
+          if ($LASTEXITCODE -ne 0) {
+            throw "The installed OpenBLAS numerical stack failed."
+          }
+
+          & $cli --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "The automation CLI wrapper could not start TopoPPI."
+          }
+
+          $commandPromptText = Get-Content $commandPrompt -Raw
+          foreach ($expected in @("TOPOPPI_OPTCUTS_BIN", "env\Scripts", "cmd.exe /K")) {
+            if (!$commandPromptText.Contains($expected)) {
+              throw "The command prompt launcher does not configure $expected."
+            }
+          }
+          $promptOutput = @("topoppi --version", "exit") | & $commandPrompt
+          if ($LASTEXITCODE -ne 0 -or !(($promptOutput -join "`n").Contains("topoppi ${{ steps.version.outputs.value }}"))) {
+            throw "The installed command prompt could not run TopoPPI from its Unicode directory."
+          }
+
+          $guiSmoke = @'
+          import tkinter as tk
+          from topoppi.gui_app import InterfaceApp
+
+          root = tk.Tk()
+          root.withdraw()
+          try:
+              InterfaceApp(root)
+              root.update_idletasks()
+          finally:
+              root.destroy()
+          '@
+          & $python -c $guiSmoke
+          if ($LASTEXITCODE -ne 0) {
+            throw "The installed desktop application could not construct its main window."
+          }
+
+          $env:MPLBACKEND = "Agg"
+          $env:PYTHONUTF8 = "1"
+          $userResults = Join-Path $installDir "results"
+          New-Item -ItemType Directory -Force -Path $userResults | Out-Null
+          $smokeOutput = Join-Path $userResults "interface.png"
+          $smokeAtlas = Join-Path $userResults "interface.npz"
+          & $cli tests\fixtures\tiny_complex.pdb -A A -B B `
+            --prolif tests\fixtures\prolif_interactions.json `
+            --min-points 1 `
+            --map-style footprints --export-atlas $smokeAtlas `
+            -o $smokeOutput
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path $smokeOutput)) {
+            throw "The installed TopoPPI pipeline smoke failed."
+          }
+          & $cli render $smokeAtlas -o (Join-Path $userResults "interface.pdf")
+          if ($LASTEXITCODE -ne 0) {
+            throw "The installed CLI could not render its saved footprint atlas."
+          }
+          & $python installer\smoke_footprints.py $smokeAtlas (Join-Path $env:RUNNER_TEMP "topoppi-windows-desktop")
+          if ($LASTEXITCODE -ne 0) {
+            throw "The installed GUI footprint editing smoke failed."
+          }
+
+          $wheelDir = Join-Path $env:RUNNER_TEMP "binding-wheels"
+          $wheels = @("affinity", "hotspot") | ForEach-Object {
+            Join-Path $wheelDir "topoppi_${_}-${{ steps.version.outputs.value }}-py3-none-any.whl"
+          }
+          & $python -m pip install @wheels
+          if ($LASTEXITCODE -ne 0) { throw "Plugin installation into the desktop environment failed." }
+          & $python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "Desktop plugin dependencies are inconsistent." }
+          $env:TOPOPPI_OPTCUTS_BIN = Join-Path $installDir "bin\OptCuts_bin.exe"
+          Copy-Item installer\smoke_affinity.py, installer\smoke_binding.py $env:RUNNER_TEMP
+          Push-Location $env:RUNNER_TEMP
+          try {
+            & $python smoke_binding.py --require-gui
+            if ($LASTEXITCODE -ne 0) { throw "Installed desktop binding workflows failed." }
+          }
+          finally { Pop-Location }
+
+          $atlasBeforeRepair = [System.IO.File]::ReadAllBytes($smokeAtlas)
+          $repairLog = Join-Path $env:RUNNER_TEMP "TopoPPI Repair Installer.log"
+          $repairProcess = Start-Process -FilePath $installer -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$installDir`"", "/LOG=`"$repairLog`""
+          ) -PassThru
+          $repairProcess | Wait-Process -Timeout 1800 -ErrorAction Stop
+          if ($repairProcess.ExitCode -ne 0) {
+            Get-Content $repairLog -Tail 200 -ErrorAction SilentlyContinue
+            Get-Content (Join-Path $installDir "installation.log") -Tail 200 -ErrorAction SilentlyContinue
+            throw "TopoPPI repair failed with exit code $($repairProcess.ExitCode)."
+          }
+          if ((@(& subst.exe) -join "`n") -ne ($mappedDrivesBefore -join "`n")) {
+            throw "Windows repair left a package-cache drive mapped."
+          }
+          $atlasAfterRepair = [System.IO.File]::ReadAllBytes($smokeAtlas)
+          if (![System.Linq.Enumerable]::SequenceEqual[byte]($atlasBeforeRepair, $atlasAfterRepair)) {
+            throw "Repair changed the user's saved atlas."
+          }
+          & $python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "Repair left inconsistent plugin dependencies." }
+          & $python -c $numericSmoke
+          if ($LASTEXITCODE -ne 0) { throw "Repair changed the working numerical stack." }
+          & $cli render $smokeAtlas -o (Join-Path $userResults "after-repair.pdf")
+          if ($LASTEXITCODE -ne 0) { throw "The saved atlas could not reopen after repair." }
+          Push-Location $env:RUNNER_TEMP
+          try {
+            & $python smoke_binding.py --require-gui
+            if ($LASTEXITCODE -ne 0) { throw "Binding workflows failed after desktop repair." }
+          }
+          finally { Pop-Location }
+
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          if (!(Test-Path $uninstaller)) {
+            throw "TopoPPI uninstaller was not created."
+          }
+          Set-Content -Path (Join-Path $installDir "gui-startup.log") -Value "lifecycle smoke"
+          $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"
+          ) -Wait -PassThru
+          if ($uninstallProcess.ExitCode -ne 0) {
+            throw "TopoPPI uninstall failed with exit code $($uninstallProcess.ExitCode)."
+          }
+          if (!(Test-Path $smokeAtlas) -or !(Test-Path (Join-Path $userResults "after-repair.pdf"))) {
+            throw "Uninstall removed saved analysis output."
+          }
+          $atlasAfterUninstall = [System.IO.File]::ReadAllBytes($smokeAtlas)
+          if (![System.Linq.Enumerable]::SequenceEqual[byte]($atlasBeforeRepair, $atlasAfterUninstall)) {
+            throw "Uninstall changed the user's saved atlas."
+          }
+          $remaining = @(Get-ChildItem -Force $installDir | Where-Object Name -ne "results" | ForEach-Object Name)
+          if ($remaining.Count -ne 0) {
+            throw "Application files remained after uninstall: $($remaining -join ', ')"
+          }
+          if (Test-Path $commandPromptShortcut) {
+            throw "The TopoPPI command prompt shortcut remained after uninstall."
+          }
+
+      - name: Upload installation failure logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-installation-logs
+          path: |
+            ${{ runner.temp }}/TopoPPI* Installer.log
+            ${{ runner.temp }}/TopoPPI */installation.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Reject private paths in release executables
+        shell: pwsh
+        run: |
+          $paths = @(
+            (Resolve-Path "${{ steps.artifact.outputs.installer }}").Path,
+            (Resolve-Path "release-assets\OptCuts_bin-windows-x86_64.exe").Path
+          )
+          foreach ($path in $paths) {
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            $text = [System.Text.Encoding]::ASCII.GetString($bytes) +
+              [System.Text.Encoding]::Unicode.GetString($bytes)
+            foreach ($marker in @($env:GITHUB_WORKSPACE, "D:\a\", "\Users\runner\")) {
+              if ($text.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                throw "Release executable contains a private build path: $path"
+              }
+            }
+          }
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-windows
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14

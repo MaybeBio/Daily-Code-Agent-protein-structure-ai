@@ -1,0 +1,243 @@
+
+import copy
+
+import pandas as pd
+import numpy as np
+import pytest
+
+from csubst import ete
+from csubst import foreground
+from csubst import substitution_scan
+from scan_fixtures import make_scan_context as _toy_scan_context, make_endpoint_scan_context
+
+
+@pytest.mark.parametrize('unit_mode,other_scope,stem_only,sister_stem', [
+    ('lineage', 'all', False, False),
+    ('lineage', 'sister', True, False),
+    ('stem', 'sister', False, True),
+    ('clade', 'all', False, True),
+])
+def test_fixed_candidates_match_full_unit_context(
+        monkeypatch, unit_mode, other_scope, stem_only, sister_stem):
+    g, tensor = _toy_scan_context()
+    groups = [['A', 'B'], ['C']]
+    labels = {node.name: int(ete.get_prop(node, 'numerical_label')) for node in g['tree'].traverse()}
+    g['fg_df'] = pd.DataFrame({'name': ['A', 'B', 'C'], 'trait': [1, 1, 2]})
+    g['fg_leaf_names'] = {'trait': groups}
+    g['fg_ids'] = {'trait': np.array([labels[name] for name in ['A', 'B', 'C']])}
+    for node in g['tree'].traverse():
+        tips = set(ete.get_leaf_names(node))
+        flags = [tips.issubset(group) for group in groups]
+        ete.set_prop(node, 'is_fg_trait', any(flags))
+        for index, flag in enumerate(flags, 1):
+            ete.set_prop(node, 'is_lineage_fg_trait_' + str(index), flag)
+    g.update(scan_unit_mode=unit_mode, scan_other_scope=other_scope, fg_stem_only=stem_only,
+             scan_sister_stem_only=sister_stem, scan_pvalue_calibration='candidate_fixed',
+             scan_n_permutations=99, scan_min_support='1')
+    reference_g = copy.deepcopy(g)
+    actual, actual_units = substitution_scan.scan_substitutions(g, tensor)
+    original = substitution_scan._build_permuted_context_with_seed
+
+    def full_context(*args, **kwargs):
+        kwargs['include_units'] = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(substitution_scan, '_build_permuted_context_with_seed', full_context)
+    expected, expected_units = substitution_scan.scan_substitutions(reference_g, tensor)
+
+    assert not actual.empty
+    assert (actual['scan_permutation_success_count'] > 0).all()
+    pd.testing.assert_frame_equal(actual, expected, check_exact=True)
+    pd.testing.assert_frame_equal(actual_units, expected_units, check_exact=True)
+    assert g['scan_calibration_diagnostics'] == reference_g['scan_calibration_diagnostics']
+
+
+@pytest.mark.parametrize("calibration", ["candidate_fixed", "full_scan"])
+def test_endpoint_scan_dense_sparse_and_stored_permutations_agree(calibration):
+    from csubst import substitution, site_storage
+
+    g, on_tensor = make_endpoint_scan_context()
+    g['scan_pvalue_calibration'] = calibration
+    dense, _ = substitution_scan.scan_substitutions(g=dict(g), ON_tensor=on_tensor)
+    sparse, _ = substitution_scan.scan_substitutions(
+        g=dict(g), ON_tensor=substitution.dense_to_sparse_sub_tensor(on_tensor))
+    pd.testing.assert_frame_equal(dense, sparse)
+    stored = site_storage.SiteEventTensor(on_tensor.shape)
+    stored.write_block(0, np.moveaxis(on_tensor, 1, 0))
+    stored.seal()
+    disk, _ = substitution_scan.scan_substitutions(g=dict(g), ON_tensor=stored)
+    pd.testing.assert_frame_equal(dense, disk)
+    assert dense.iloc[0]["scan_permutation_success_count"] == 4
+    assert dense.iloc[0]["scan_exposure_units"] == "expected_endpoint_events"
+
+
+@pytest.mark.parametrize("calibration", ["candidate_fixed", "full_scan"])
+def test_endpoint_undefined_permutation_is_not_treated_as_no_candidates(monkeypatch, calibration):
+    monkeypatch.setattr(substitution_scan, "_build_permuted_context_with_seed", lambda **kw: dict(configuration_id="a", configuration=[], sampling_attempts=1))
+    monkeypatch.setattr(substitution_scan, "_candidate_fixed_permutation_scores", lambda **kw: {"x": np.nan})
+    monkeypatch.setattr(substitution_scan, "_scan_substitutions_core", lambda **kw: (pd.DataFrame({"score_rate_enrichment": [np.nan]}), None))
+    monkeypatch.setattr(substitution_scan, "_scan_row_key", lambda row: "x")
+    result = substitution_scan._run_scan_permutation(
+        permutation_index=0, g={}, observed_df=None, observed_keys={"x"}, calibration=calibration,
+        trait_names=[], branch_meta=None, valid_branch_ids=[], ON_tensor=None,
+        rate_ON_tensor=None, scan_static={"rate_exposure": "endpoint"})
+    assert not result["success"]
+    assert "undefined" in result["failure_reason"].lower()
+
+
+def test_scan_candidate_fixed_permutation_adds_empirical_pvalues():
+    g, on_tensor = _toy_scan_context()
+    g["scan_pvalue_calibration"] = "candidate_fixed"
+    g["scan_n_permutations"] = 4
+    g["scan_permutation_seed"] = 3
+
+    scan_df, _ = substitution_scan.scan_substitutions(g=g, ON_tensor=on_tensor)
+
+    row = scan_df.iloc[0]
+    assert row["scan_pvalue_calibration"] == "candidate_fixed"
+    assert row["scan_permutation_success_count"] == 4
+    assert np.isfinite(float(row["p_rate_enrichment_empirical"]))
+    assert np.isnan(float(row["p_rate_enrichment_empirical_maxT"]))
+
+
+def test_scan_permutation_failures_report_reasons(monkeypatch, capsys):
+    g, on_tensor = _toy_scan_context()
+    g["scan_pvalue_calibration"] = "candidate_fixed"
+    g["scan_n_permutations"] = 2
+    g["scan_permutation_seed"] = 3
+
+    def fail_permutation_context(*args, **kwargs):
+        raise RuntimeError("permutation context boom")
+
+    monkeypatch.setattr(
+        substitution_scan,
+        "_build_permuted_context_with_seed",
+        fail_permutation_context,
+    )
+
+    scan_df, _ = substitution_scan.scan_substitutions(g=g, ON_tensor=on_tensor)
+
+    captured = capsys.readouterr()
+    row = scan_df.iloc[0]
+    assert row["scan_permutation_success_count"] == 0
+    assert row["scan_permutation_failure_count"] == 2
+    assert "RuntimeError: permutation context boom" in row["scan_permutation_failure_reasons"]
+    assert "2 of 2 permutations failed" in captured.out
+    assert np.isnan(float(row["p_rate_enrichment_empirical"]))
+
+
+def test_scan_permutation_does_not_retry_a_failed_context(monkeypatch):
+    g, _ = _toy_scan_context()
+    calls = []
+
+    def fail_context(*args, **kwargs):
+        calls.append(kwargs["sample_original_foreground"])
+        raise ValueError("lost unit")
+
+    monkeypatch.setattr(substitution_scan, "_build_permuted_scan_context", fail_context)
+    with pytest.raises(ValueError, match="lost unit"):
+        substitution_scan._build_permuted_context_with_seed(
+            g=g, trait_names=["trait"],
+            valid_branch_ids=np.arange(g["state_nsy"].shape[0]), permutation_index=1,
+        )
+    assert calls == [True]
+
+
+def test_scan_eligibility_is_fixed_before_sampling():
+    g, _ = _toy_scan_context()
+    g["scan_unit_mode"] = "stem"
+    trait_cache = foreground._get_trait_clade_permutation_cache(g=g, trait_name="trait")
+    labels = {node.name: int(ete.get_prop(node, "numerical_label")) for node in g["tree"].traverse()}
+    valid_branch_ids = np.array([bid for bid in trait_cache["branch_ids"] if bid != labels["B"]])
+    plan = substitution_scan._get_scan_trait_plan(g, "trait", valid_branch_ids)
+    excluded = trait_cache["branch_id_to_index"][labels["B"]]
+    assert not plan["eligible"][excluded]
+    assert all(excluded not in group for config in plan["sampler"].configurations for group in config)
+    assert plan["sampler"].observed in plan["sampler"].configurations
+
+    invalid_observed_ids = np.array([bid for bid in valid_branch_ids if bid != labels["A"]])
+    with pytest.raises(ValueError, match="observed foreground component"):
+        substitution_scan._get_scan_trait_plan(g, "trait", invalid_observed_ids)
+
+
+def test_scan_rejects_negative_permutation_count_even_without_calibration():
+    g, on_tensor = _toy_scan_context()
+    g["scan_pvalue_calibration"] = "none"
+    g["scan_n_permutations"] = -1
+
+    with pytest.raises(ValueError, match="scan_n_permutations"):
+        substitution_scan.scan_substitutions(g=g, ON_tensor=on_tensor)
+
+
+def test_empirical_pvalue_rejects_an_inconsistent_denominator():
+    with pytest.raises(ValueError, match="exactly one null statistic"):
+        substitution_scan._empirical_p_from_scores(
+            score_obs=2., values=[0.01, 0.02, 0.03, 0.04, 0.05, 0.06], denominator_count=4,
+        )
+
+
+def test_permutation_chunk_counts_ties_and_absent_candidates(monkeypatch):
+    observed = pd.DataFrame({
+        'trait': 'trait', 'target_class': 'foreground', 'scan_match': 'any2spe',
+        'site': [0, 1, 2, 3], 'from_state_ids': '0', 'to_state_ids': '1',
+        'score_rate_enrichment': [2., 2., 0., np.nan],
+    })
+    keys = [substitution_scan._scan_row_key(row) for row in observed.to_dict('records')]
+    scores = [{keys[0]: 2. - 1e-13, keys[1]: 2. - 4e-12}, {}, {keys[0]: 3.}]
+
+    def permutation(permutation_index, **kwargs):
+        candidates = scores[permutation_index - 1]
+        return dict(success=True, diagnostic={}, candidate_scores=candidates,
+                    max_score=max(candidates.values(), default=-np.inf))
+
+    monkeypatch.setattr(substitution_scan, '_run_scan_permutation', permutation)
+    result = substitution_scan._run_scan_permutation_chunk(
+        np.arange(1, 4), {}, observed, set(keys), 'full_scan', [], None, None, None, None, {'q_context': {}},
+    )
+    assert result['success_count'] == 3
+    np.testing.assert_array_equal(result['exceedances'], [2, 0])
+    assert result['max_score'] == [2. - 1e-13, -np.inf, 3.]
+
+
+def test_scan_rate_event_mode_posterior_sum_keeps_low_pp_background_mass_for_rates():
+    g, on_tensor = _toy_scan_context()
+    labels = {node.name: int(ete.get_prop(node, "numerical_label")) for node in g["tree"].traverse()}
+    on_tensor[labels["B"], 0, 0, 0, 1] = 0.2
+
+    g["scan_rate_event_mode"] = "posterior_sum"
+    posterior_df, _ = substitution_scan.scan_substitutions(g=g, ON_tensor=on_tensor)
+    g["scan_rate_event_mode"] = "called"
+    called_df, _ = substitution_scan.scan_substitutions(g=g, ON_tensor=on_tensor)
+
+    posterior_row = posterior_df.iloc[0]
+    called_row = called_df.iloc[0]
+    assert posterior_row["target_event_count"] == pytest.approx(1.7)
+    assert posterior_row["other_event_count"] == pytest.approx(0.2)
+    assert called_row["target_event_count"] == pytest.approx(1.7)
+    assert called_row["other_event_count"] == pytest.approx(0.0)
+
+
+def test_scan_other_scope_limits_foreground_control_branches_to_sisters():
+    g, on_tensor = _toy_scan_context()
+
+    g["scan_other_scope"] = "all"
+    all_df, units = substitution_scan.scan_substitutions(g=g, ON_tensor=on_tensor)
+    g["scan_other_scope"] = "sister"
+    sister_df, _ = substitution_scan.scan_substitutions(g=g, ON_tensor=on_tensor)
+
+    assert "sister_branch_ids" in units.columns
+    assert all_df.iloc[0]["other_raw_branch_length"] == pytest.approx(4.0)
+    assert sister_df.iloc[0]["other_raw_branch_length"] == pytest.approx(2.0)
+
+
+def test_scan_substitutions_empty_result_preserves_output_schema(capsys):
+    g, on_tensor = _toy_scan_context()
+    g["scan_min_support"] = "3"
+
+    scan_df, units = substitution_scan.scan_substitutions(g=g, ON_tensor=on_tensor)
+
+    captured = capsys.readouterr()
+    assert "--scan_min_support resolved to 3" in captured.out
+    assert units.shape[0] == 2
+    assert scan_df.empty
+    assert list(scan_df.columns) == list(substitution_scan.SCAN_OUTPUT_COLUMNS)

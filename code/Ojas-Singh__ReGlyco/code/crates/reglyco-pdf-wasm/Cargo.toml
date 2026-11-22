@@ -1,0 +1,19 @@
+[package]
+name = "reglyco-pdf-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license.workspace = true
+description = "Separately loaded browser PDF renderer for ReGlyco reports"
+repository = "https://github.com/Ojas-Singh/ReGlyco"
+# Built into the browser bundles of a release, not published to crates.io.
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+js-sys.workspace = true
+serde_json.workspace = true
+serde-wasm-bindgen.workspace = true
+wasm-bindgen.workspace = true

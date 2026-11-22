@@ -1,0 +1,1296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' https://3dmol.org https://3Dmol.org https://cdn.jsdelivr.net blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self' https://files.rcsb.org https://data.rcsb.org https://raw.githubusercontent.com https://health.api.nvidia.com https://integrate.api.nvidia.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self';"/>
+<meta http-equiv="X-Content-Type-Options" content="nosniff"/>
+<meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"/>
+<meta name="referrer" content="strict-origin-when-cross-origin"/>
+<script>if(window.top!==window.self){try{window.top.location=window.self.location}catch(e){document.documentElement.innerHTML=''}}</script>
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>NVIDIA BioNeMo Benchmark Cockpit — Interactive 3D Discovery Studio</title>
+<meta name="description" content="Interactive 3D molecular cockpit for target-to-lead modeling and benchmarking with NVIDIA BioNeMo NIMs. Built by Aarav Jorwal (@Jorwalzzz)."/>
+<meta property="og:title" content="NVIDIA BioNeMo Benchmark Cockpit"/>
+<meta property="og:description" content="Interactive 3D molecular modeling cockpit for target-to-lead modeling and benchmarking with NVIDIA BioNeMo NIMs."/>
+<meta property="og:type" content="website"/>
+<meta property="og:url" content="https://jorwalzzz.github.io/bionemo-nim-benchmark/cockpit.html"/>
+<meta name="twitter:card" content="summary_large_image"/>
+<meta name="twitter:title" content="NVIDIA BioNeMo Benchmark Cockpit"/>
+<meta name="twitter:description" content="Interactive 3D molecular modeling cockpit for target-to-lead modeling and benchmarking with NVIDIA BioNeMo NIMs."/>
+<link rel="canonical" href="https://jorwalzzz.github.io/bionemo-nim-benchmark/cockpit.html"/>
+<link rel="icon" type="image/svg+xml" href="./assets/favicon.svg"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin=""/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="./css/tokens.css"/>
+<link rel="stylesheet" href="./assets/css/theme.css"/>
+<link rel="stylesheet" href="./app.min.css?v=20261121"/>
+<link rel="stylesheet" href="./cockpit.css?v=20261121"/>
+<script src="./vendor/3Dmol-min.js" integrity="sha384-NM1C3ZcjJAUuea4z5P0F1LXCE0n/gamcTJqFiwNDn4QYgPMSRAcbKj2mWZZYt43t" crossorigin="anonymous" onerror="this.onerror=null;this.src='https://3Dmol.org/build/3Dmol-min.js'" defer></script>
+<script src="./vendor/chart.umd.min.js" integrity="sha384-e6nUZLBkQ86NJ6TVVKAeSaK8jWa3NhkYWZFomE39AvDbQWeie9PlQqM3pmYW5d1g" crossorigin="anonymous" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js'" defer></script>
+</head>
+<body class="dark bg-grid">
+<a href="#main-content" class="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-50 focus:px-4 focus:py-2 focus:bg-emerald-600 focus:text-white focus:rounded-md focus:shadow-lg focus:outline-none">Skip to main cockpit workspace</a>
+<!-- ═══════════════════════════════════════════════ HEADER ══════════════ -->
+<header class="glass sticky top-0 z-50 border-b border-surface-border">
+  <div class="flex items-center justify-between px-6 h-14">
+    <!-- Logo & Brand -->
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-lg overflow-hidden border border-emerald-500/40 shadow-md shadow-emerald-500/20 flex items-center justify-center bg-[#04070c]">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="32" height="32" class="w-8 h-8 block" style="width: 32px; height: 32px; min-width: 32px; min-height: 32px;" fill="none">
+  <defs>
+    <!-- Background Gradient -->
+    <radialGradient id="plateGlow" cx="50%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#0f1923"/>
+      <stop offset="100%" stop-color="#05080c"/>
+    </radialGradient>
+
+    <!-- Emerald / NVIDIA Green to Quantum Cyan Gradient -->
+    <linearGradient id="helixGradA" x1="15%" y1="10%" x2="85%" y2="90%">
+      <stop offset="0%" stop-color="#76B900"/>
+      <stop offset="50%" stop-color="#10B981"/>
+      <stop offset="100%" stop-color="#06B6D4"/>
+    </linearGradient>
+
+    <linearGradient id="helixGradB" x1="85%" y1="15%" x2="20%" y2="95%">
+      <stop offset="0%" stop-color="#00F0FF"/>
+      <stop offset="60%" stop-color="#10B981"/>
+      <stop offset="100%" stop-color="#76B900"/>
+    </linearGradient>
+
+    <!-- Neon Rim Stroke Gradient -->
+    <linearGradient id="rimGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#76B900" stop-opacity="0.8"/>
+      <stop offset="40%" stop-color="#10B981" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#00F0FF" stop-opacity="0.6"/>
+    </linearGradient>
+
+    <!-- Glow Filter for active site -->
+    <filter id="coreGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Base Squircle Plate -->
+  <rect x="6" y="6" width="108" height="108" rx="26" fill="url(#plateGlow)" stroke="url(#rimGrad)" stroke-width="1.75"/>
+
+  <!-- Subtle Hexagonal Ambient Grid Lines in Background -->
+  <path d="M60 20 L86 35 L86 65 L60 80 L34 65 L34 35 Z" stroke="#76B900" stroke-opacity="0.08" stroke-width="1.5" fill="none"/>
+  <path d="M60 28 L78 38.5 L78 59.5 L60 70 L42 59.5 L42 38.5 Z" stroke="#00F0FF" stroke-opacity="0.06" stroke-width="1" fill="none"/>
+
+  <!-- Chiral Macromolecular Fold (Continuous Tensor Ribbon Loop) -->
+  <!-- Loop Strand 1: Upper Right to Lower Left sweeping fold -->
+  <path d="M60 24 C78 24, 94 38, 94 56 C94 72, 82 86, 68 88 C54 90, 42 82, 38 72 C34 62, 40 50, 52 46 C64 42, 74 48, 76 58 C78 68, 70 76, 60 76 C50 76, 44 68, 44 60"
+        stroke="url(#helixGradA)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.95"/>
+
+  <!-- Loop Strand 2: Overlapping Inverse Chiral Ribbon for 3D Depth -->
+  <path d="M60 24 C44 24, 26 38, 26 56 C26 70, 36 84, 52 88 C66 91, 78 84, 82 72 C86 60, 78 48, 66 44 C56 41, 46 48, 44 56"
+        stroke="url(#helixGradB)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.85"/>
+
+  <!-- Precision Geometric Nodes (Macromolecular Catalytic Coordinate Vertices) -->
+  <!-- Top Node -->
+  <circle cx="60" cy="24" r="4.5" fill="#76B900" filter="url(#coreGlow)"/>
+  <circle cx="60" cy="24" r="2" fill="#FFFFFF"/>
+
+  <!-- Right Node -->
+  <circle cx="94" cy="56" r="4" fill="#10B981" filter="url(#coreGlow)"/>
+  <circle cx="94" cy="56" r="1.8" fill="#FFFFFF"/>
+
+  <!-- Left Node -->
+  <circle cx="26" cy="56" r="4" fill="#00F0FF" filter="url(#coreGlow)"/>
+  <circle cx="26" cy="56" r="1.8" fill="#FFFFFF"/>
+
+  <!-- Bottom Fold Intersect -->
+  <circle cx="60" cy="88" r="3.5" fill="#76B900" filter="url(#coreGlow)"/>
+  <circle cx="60" cy="88" r="1.5" fill="#FFFFFF"/>
+
+  <!-- Active Catalytic Site Core: Glowing Ligand Diamond in the pocket center -->
+  <g transform="translate(60, 58) rotate(45)">
+    <rect x="-5" y="-5" width="10" height="10" rx="2" fill="#00F0FF" filter="url(#coreGlow)" opacity="0.9"/>
+    <rect x="-2" y="-2" width="4" height="4" rx="0.5" fill="#FFFFFF"/>
+  </g>
+
+  <!-- Micro Coordinate Crosshairs -->
+  <line x1="60" y1="46" x2="60" y2="50" stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="1"/>
+  <line x1="60" y1="66" x2="60" y2="70" stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="1"/>
+  <line x1="48" y1="58" x2="52" y2="58" stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="1"/>
+  <line x1="68" y1="58" x2="72" y2="58" stroke="#FFFFFF" stroke-opacity="0.6" stroke-width="1"/>
+</svg>
+      </div>
+      <span class="font-extrabold text-sm tracking-wide text-white">JORWAL <span class="font-mono" style="background: linear-gradient(135deg, #76b900, #00f1fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;">NIM</span></span>
+      <span class="hidden md:flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded border border-emerald-500/25 bg-emerald-500/10 text-emerald-300 shadow-sm shadow-emerald-500/10">⚡ BioNeMo Benchmark Cockpit</span>
+      <span class="hidden lg:inline-flex items-center gap-1.5 text-[11px] text-gray-400 font-mono ml-2 pl-2 border-l border-gray-700"><span>Architected by <strong class="text-gray-200">Aarav Jorwal (@Jorwalzzz)</strong></span></span>
+    </div>
+
+    <!-- Center: Platform Status -->
+    <div id="trialBadge" class="hidden md:flex items-center gap-2 px-3.5 py-1.5 rounded-full text-xs" style="background: rgba(118,185,0,0.06); border: 1px solid rgba(118,185,0,0.2);">
+      <div class="relative flex items-center justify-center">
+        <span id="trialDot" class="w-2 h-2 rounded-full bg-emerald-400"></span>
+        <span class="absolute w-4 h-4 rounded-full bg-emerald-400/25 animate-ping"></span>
+      </div>
+      <span id="trialText" class="text-gray-300 font-medium">Interactive Discovery Studio • Full Pipeline Active</span>
+    </div>
+
+    <!-- Right: CTA + Status -->
+    <div class="flex items-center gap-3">
+      <div id="runtimeModeStatus" class="hidden md:flex items-center gap-1.5 text-xs text-gray-400">
+        <div class="relative flex items-center justify-center">
+          <span class="w-1.5 h-1.5 rounded-full bg-green-400"></span>
+          <span class="absolute w-3 h-3 rounded-full bg-green-400/25 animate-ping"></span>
+        </div>
+        <span id="runtimeModeLabel">Simulation Mode (No API Key)</span>
+      </div>
+      <a href="./index.html" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-gray-300 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10 transition-all">
+        <span>← Benchmark Overview</span>
+      </a>
+      <button aria-label="Start guided tour" onclick="startInteractiveTour()" class="px-3 py-1.5 rounded-lg text-xs font-bold text-white flex items-center gap-1.5 transition-all hover:scale-105" style="background: linear-gradient(135deg, #ec4899, #8b5cf6); border: 1px solid rgba(236, 72, 153, 0.5);">
+        <span>🧭 Guide</span>
+      </button>
+      <button aria-label="Open hardware benchmark" onclick="openBenchmarkModal()" class="px-3 py-1.5 rounded-lg text-xs font-bold text-white flex items-center gap-1.5 transition-all hover:scale-105 glow-green" style="background: linear-gradient(135deg, rgba(118,185,0,0.25), rgba(0,241,253,0.15)); border: 1px solid rgba(118,185,0,0.6);">
+        <span class="w-1.5 h-1.5 rounded-full bg-nvidia-green animate-pulse"></span>
+        <span>⚡ Benchmark</span>
+      </button>
+      <button aria-label="Submit Feedback" id="feedbackNavBtn" onclick="openFeedbackModal()" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-cyan-300 bg-cyan-500/10 border border-cyan-500/30 hover:bg-cyan-500/20 flex items-center gap-1.5 transition-all">
+        <span>💬 Feedback</span>
+      </button>
+      <div id="ownerAccessContainer" class="hidden items-center gap-2" style="display: none;"></div>
+      <div id="staticDemoContainer" class="hidden items-center gap-2" style="display: none;">
+        <button aria-label="Static Demo Mode Information" id="staticDemoPill" onclick="openStaticDemoModal()" class="px-2.5 py-1 rounded-lg text-xs font-mono font-bold text-amber-400 bg-amber-500/10 border border-amber-500/30 hover:bg-amber-500/20 flex items-center gap-1.5 transition-all cursor-pointer">
+          <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+          <span>STATIC DEMO MODE</span>
+        </button>
+      </div>
+      <div id="authHudContainer" class="flex items-center gap-2">
+        <button aria-label="Sign In or Register" id="authBtn" onclick="openAuthModal()" class="px-3 py-1.5 rounded-lg text-xs font-bold text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 border border-emerald-400/40 shadow-sm flex items-center gap-1.5 transition-all">
+          <span>🔑 Sign In</span>
+          <span class="text-[10px] font-mono px-1.5 py-0.2 rounded bg-black/30 border border-white/20">5 Runs/Day</span>
+        </button>
+      </div>
+      <button aria-label="Desktop App Status & Developer Letter" id="fullAppNavBtn" onclick="openInstallModal()" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-amber-300 bg-amber-500/10 border border-amber-500/30 hover:bg-amber-500/20 flex items-center gap-1.5 transition-all">
+          <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>
+          <span>🌱 Desktop App Status</span>
+        </button>
+    </div></div>
+  </div>
+</header>
+
+<!-- Interactive 10-Step Guided Tour Card -->
+<div id="tourCardModal" style="display: none;" class="hidden fixed bottom-6 right-6 z-[2500] max-w-xl w-[94%] md:w-[560px] p-5 rounded-2xl border border-purple-500/40 bg-[#0d1117]/95  shadow-2xl animate-fade-up">
+  <!-- Tour Header -->
+  <div class="flex items-center justify-between pb-3 border-b border-surface-border mb-3">
+    <div class="flex items-center gap-2.5">
+      <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-pink-500 to-purple-600 flex items-center justify-center text-white text-xs font-bold shadow-md shadow-purple-500/30">
+        🧭
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <span id="tourStepBadge" class="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-purple-500/20 text-purple-300 border border-purple-500/30">Step 1 of 10</span>
+          <span id="tourTechBadge" class="text-[10px] font-mono px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">Architecture</span>
+        </div>
+      </div>
+    </div>
+    <button aria-label="Close dialog" onclick="closeInteractiveTour()" class="text-gray-500 hover:text-white text-lg leading-none p-1 transition-colors">✕</button>
+  </div>
+
+  <!-- Progress Bar (10 steps) -->
+  <div class="w-full bg-gray-800 rounded-full h-1.5 mb-3 overflow-hidden">
+    <div id="tourProgressBar" class="h-full bg-gradient-to-r from-pink-500 to-purple-500 transition-all duration-300" style="width: 10%;"></div>
+  </div>
+
+  <!-- Step Title -->
+  <h3 id="tourStepTitle" class="text-sm font-bold text-white mb-2.5 font-sans flex items-center gap-1.5">
+    1/10: Platform Overview — Autonomous AI Drug Discovery
+  </h3>
+
+  <!-- Explanations -->
+  <div class="space-y-2.5 text-xs text-gray-300 mb-4">
+    <!-- What it is -->
+    <div class="p-2.5 rounded-xl bg-purple-950/20 border border-purple-500/20">
+      <div class="text-[10px] font-bold uppercase tracking-wider text-purple-300 mb-1 flex items-center gap-1">
+        <span>📖</span> Key Concept
+      </div>
+      <p id="tourWhatIs" class="text-[11px] text-gray-300 leading-relaxed whitespace-pre-line"></p>
+    </div>
+
+    <!-- What to do -->
+    <div class="p-2.5 rounded-xl bg-cyan-950/20 border border-cyan-500/20">
+      <div class="text-[10px] font-bold uppercase tracking-wider text-cyan-300 mb-1 flex items-center gap-1">
+        <span>🎯</span> Quick Action
+      </div>
+      <p id="tourWhatToDo" class="text-[11px] text-gray-300 leading-relaxed"></p>
+    </div>
+  </div>
+
+  <!-- Actions & Navigation -->
+  <div class="flex items-center justify-between pt-2 border-t border-surface-border">
+    <div class="flex items-center gap-2">
+      <button aria-label="Previous step" id="btnTourPrev" onclick="prevTourStep()" class="px-3 py-1.5 text-xs font-medium text-gray-400 hover:text-white rounded-lg bg-white/5 border border-white/10 transition-colors">
+        ◀ Previous
+      </button>
+      <button aria-label="Execute step action" id="btnTourAction" onclick="executeTourAction()" class="px-3 py-1.5 text-xs font-bold text-cyan-300 hover:text-white rounded-lg bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/30 transition-all flex items-center gap-1">
+        ⚡ Try This Step
+      </button>
+    </div>
+    <button aria-label="Next step" id="btnTourNext" onclick="nextTourStep()" class="px-4 py-1.5 text-xs font-bold text-white rounded-lg bg-gradient-to-r from-pink-500 to-purple-600 hover:opacity-90 shadow-md shadow-purple-500/20 transition-all flex items-center gap-1">
+      <span>Next Step ➔</span>
+    </button>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ MAIN GRID ════════════ -->
+<div id="main-content" class="flex flex-col lg:flex-row min-h-[calc(100vh-56px)] lg:h-[calc(100vh-56px)] overflow-y-auto lg:overflow-hidden">
+
+  <!-- LEFT SIDEBAR: Control Panel -->
+  <aside class="flex flex-col w-full lg:w-72 xl:w-80 flex-shrink-0 border-b lg:border-b-0 lg:border-r border-surface-border overflow-y-auto" style="background: var(--surface-card);">
+    <div class="p-5">
+      <!-- Target Selector -->
+              <!-- Target Selection Tabs -->
+        <div class="mb-3">
+          <div class="flex items-center justify-between mb-2">
+            <label class="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
+              <svg class="w-3.5 h-3.5 text-nvidia-green" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="10"></circle>
+                <circle cx="12" cy="12" r="6"></circle>
+                <circle cx="12" cy="12" r="2"></circle>
+              </svg>
+              <span>Therapeutic Target</span>
+            </label>
+            <span id="targetModeBadge" class="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">PRESET</span>
+          </div>
+          <div class="grid grid-cols-3 gap-1 bg-[#101620] p-1 rounded-lg border border-surface-border mb-2.5">
+            <button aria-label="Switch to target presets" type="button" onclick="switchTargetTab('presets')" id="tabBtnPresets" class="py-1 text-[11px] font-bold rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 transition-all">Presets</button>
+            <button aria-label="Switch to RCSB PDB target input" type="button" onclick="switchTargetTab('rcsb')" id="tabBtnRcsb" class="py-1 text-[11px] font-semibold rounded text-gray-400 hover:text-white transition-all">RCSB PDB</button>
+            <button aria-label="Switch to ESMFold de novo folding" type="button" onclick="switchTargetTab('esmfold')" id="tabBtnEsmfold" class="py-1 text-[11px] font-semibold rounded text-gray-400 hover:text-white transition-all">ESMFold</button>
+          </div>
+
+          <!-- Tab 1: Presets -->
+          <div id="targetTabPresets">
+            <select id="targetSelect" aria-label="Target Selection" class="w-full text-xs rounded-lg px-3 py-2.5 font-medium focus:outline-none focus:ring-2 transition-all" style="background: #161b22; border: 1px solid #30363d; color: #e6edf3;" onchange="updateTargetInfo()">
+              <optgroup label="Repo Benchmark Core">
+                <option value="7RPZ" selected>KRAS G12D (7RPZ · MRTX1133)</option>
+                <option value="4MNE">BRAF V600E (4MNE · Vemurafenib)</option>
+                <option value="2HYY">BCR-ABL1 (2HYY · Imatinib)</option>
+                <option value="3IKA">EGFR T790M (3IKA · WZ4002)</option>
+                <option value="1DHF">Human DHFR (1DHF · Folate)</option>
+              </optgroup>
+              <optgroup label="Oncology Kinases">
+                <option value="3PP0">HER2/ERBB2 (3PP0 · SYR127063)</option>
+                <option value="4CLI">ALK (4CLI · Lorlatinib)</option>
+                <option value="4JPS">PI3Kα (4JPS · Alpelisib)</option>
+                <option value="5P9J">BTK (5P9J · Ibrutinib)</option>
+              </optgroup>
+              <optgroup label="Cell Cycle & PPI">
+                <option value="5L2I">CDK6 (5L2I · Palbociclib)</option>
+                <option value="6O0K">BCL-2 (6O0K · Venetoclax · bRo5)</option>
+                <option value="5DS3">PARP1 (5DS3 · Olaparib)</option>
+                <option value="5J89">PD-L1 Dimer (5J89 · BMS-202)</option>
+              </optgroup>
+              <optgroup label="Infectious Disease">
+                <option value="7VH8">SARS-CoV-2 Mpro (7VH8 · Nirmatrelvir)</option>
+                <option value="7BV2">SARS-CoV-2 RdRp (7BV2 · Remdesivir)</option>
+                <option value="4TZK">M. tuberculosis InhA (4TZK · Pyrrolidine Carboxamide)</option>
+              </optgroup>
+            </select>
+          </div>
+
+          <!-- Tab 2: RCSB PDB -->
+          <div id="targetTabRcsb" class="hidden">
+            <div class="flex gap-1.5">
+              <input type="text" id="customTargetInput" aria-label="Custom RCSB PDB ID" placeholder="RCSB PDB (e.g. 6LU7, 2ITZ)" oninput="onCustomTargetInput(this.value)" class="flex-1 text-xs px-2.5 py-2 rounded-lg bg-[#161b22] border border-[#30363d] text-gray-200 placeholder-gray-500 font-mono focus:border-nvidia-green focus:outline-none" />
+              <button aria-label="Fetch target structure from RCSB PDB" type="button" onclick="fetchCustomTarget()" class="px-3 py-2 text-xs font-bold rounded-lg bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 border border-emerald-500/30 transition-colors">Fetch</button>
+            </div>
+            <div id="rcsbMetadataPreview" class="hidden mt-2 p-2.5 rounded-lg bg-black/40 border border-surface-border text-xs">
+              <div class="flex items-center justify-between mb-1">
+                <span class="font-bold text-emerald-400 font-mono text-[11px]" id="rcsbPreviewPdb"></span>
+                <span class="font-mono text-[10px] text-amber-400 font-semibold" id="rcsbPreviewRes"></span>
+              </div>
+              <p class="text-[11px] text-gray-300 leading-snug line-clamp-2" id="rcsbPreviewTitle"></p>
+            </div>
+            <p class="text-[10px] text-gray-500 mt-1">Fetches experimental crystallographic receptor from RCSB PDB.</p>
+          </div>
+
+          <!-- Tab 3: ESMFold De Novo Sequence -->
+          <div id="targetTabEsmfold" class="hidden space-y-2">
+            <div>
+              <div class="flex justify-between items-center mb-1">
+                <span class="text-[11px] text-gray-400">Amino Acid Sequence</span>
+                <span class="text-[10px] text-cyan-400 font-mono" id="seqLenBadge">0 aa</span>
+              </div>
+              <textarea id="esmfoldSeqInput" aria-label="ESMFold Amino Acid Sequence" rows="3" placeholder="Paste FASTA or amino acid sequence (e.g. MTEYKLVVV...)" oninput="updateSeqCount()" class="w-full text-[11px] p-2 rounded-lg bg-[#161b22] border border-[#30363d] text-gray-200 font-mono focus:border-cyan-400 focus:outline-none resize-none"></textarea>
+            </div>
+            <div>
+              <div class="text-[10px] text-gray-400 mb-1">Example FASTA Sequences:</div>
+              <div class="flex flex-wrap gap-1.5">
+                <button aria-label="Load Ubiquitin 76aa FASTA sequence" type="button" onclick="loadEsmPreset('ubiquitin')" id="chipEsmUbiquitin" class="text-[10px] px-2 py-0.5 bg-slate-800/80 hover:bg-cyan-500/20 hover:text-cyan-300 text-gray-300 rounded-md border border-gray-700/80 hover:border-cyan-500/40 font-mono transition-colors">Ubiquitin 76aa</button>
+                <button aria-label="Load KRAS G12D 169aa FASTA sequence" type="button" onclick="loadEsmPreset('kras')" id="chipEsmKras" class="text-[10px] px-2 py-0.5 bg-slate-800/80 hover:bg-cyan-500/20 hover:text-cyan-300 text-gray-300 rounded-md border border-gray-700/80 hover:border-cyan-500/40 font-mono transition-colors">KRAS G12D 169aa</button>
+                <button aria-label="Load Mpro 306aa FASTA sequence" type="button" onclick="loadEsmPreset('mpro')" id="chipEsmMpro" class="text-[10px] px-2 py-0.5 bg-slate-800/80 hover:bg-cyan-500/20 hover:text-cyan-300 text-gray-300 rounded-md border border-gray-700/80 hover:border-cyan-500/40 font-mono transition-colors">Mpro 306aa</button>
+              </div>
+            </div>
+            <button aria-label="Fold de novo sequence with ESMFold" type="button" onclick="foldDeNovoSequence()" class="w-full py-1.5 text-xs font-bold rounded-lg bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 border border-cyan-500/30 flex items-center justify-center gap-1.5 transition-colors">
+              <span>Fold De Novo Structure (ESMFold)</span>
+            </button>
+          </div>
+        </div>
+
+      <!-- Target Info Card -->
+      <div id="targetInfoCard" class="glass-bright rounded-xl p-4 mb-5">
+        <div class="flex items-center justify-between mb-2.5">
+          <div class="flex items-center gap-2">
+            <div class="w-2 h-2 rounded-full" style="background: var(--nvidia-green);"></div>
+            <span id="targetName" class="text-sm font-bold text-glow-green" style="color: var(--nvidia-green);">KRAS G12D (Switch-II Pocket)</span>
+          </div>
+          <span id="targetTelemetryBadge" class="badge-illustrative text-[10px]">Illustrative In Silico</span>
+        </div>
+        <div class="space-y-1.5 text-xs">
+          <div class="flex justify-between"><span class="text-gray-500">PDB ID</span><span id="targetPdb" class="font-mono text-cyan-400">7RPZ</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Indication</span><span id="targetInd" class="text-gray-300">Repo Benchmark Core</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Key Pocket</span><span id="targetPocket" class="text-gray-300 font-mono text-[11px] truncate max-w-[170px]" title="Switch-II Pocket (G12D Induced Subpocket)">Switch-II Pocket</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Ligand / CCD</span><span id="targetLigand" class="text-gray-300 font-mono text-[11px]">MRTX1133 (7RP)</span></div>
+          <div class="flex justify-between"><span class="text-gray-500">Mutant / Status</span><span id="targetMut" class="font-mono" style="color: #f87171;">G12D</span></div>
+          <div id="targetMetricsRow" class="pt-2 border-t border-surface-border grid grid-cols-3 gap-1 text-[10px] font-mono text-center">
+            <div class="p-1 rounded bg-black/40"><div class="text-gray-500">Est. Kd</div><div id="targetKd" class="text-cyan-400 font-bold">0.2 nM</div></div>
+            <div class="p-1 rounded bg-black/40"><div class="text-gray-500">Pred. ΔG</div><div id="targetDeltaG" class="text-emerald-400 font-bold">-12.4 kcal</div></div>
+            <div class="p-1 rounded bg-black/40"><div class="text-gray-500">Res.</div><div id="targetRes" class="text-amber-400 font-bold">1.30 Å</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Candidate Slider -->
+      <div class="mb-5">
+        <label class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2 block">
+          📦 Candidates: <span id="candidateNum" class="text-nvidia-green">10</span>
+        </label>
+        <input type="range" id="candidateSlider" aria-label="Candidate Count Slider" min="4" max="20" value="10" class="w-full accent-green-500 cursor-pointer" oninput="document.getElementById('candidateNum').textContent=this.value"/>
+      </div>
+<div class="mb-5">
+  <div class="flex justify-between items-center mb-1.5">
+    <label class="text-xs font-semibold text-gray-400 uppercase tracking-wider">🔄 Discovery Rounds</label>
+    <span id="roundsDisplay" class="text-xs font-bold text-cyan-400 font-mono">2 Rounds</span>
+  </div>
+  <div class="grid grid-cols-3 gap-1.5">
+    <button aria-label="Set optimization rounds" type="button" onclick="setRounds(1)" id="btn-round-1" class="py-1.5 text-xs rounded-lg border border-surface-border text-gray-400 hover:text-white transition-colors">1 (Fast)</button>
+    <button aria-label="Set optimization rounds" type="button" onclick="setRounds(2)" id="btn-round-2" class="py-1.5 text-xs rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-300 font-bold transition-colors">2 (Evolve)</button>
+    <button aria-label="Set optimization rounds" type="button" onclick="setRounds(3)" id="btn-round-3" class="py-1.5 text-xs rounded-lg border border-surface-border text-gray-400 hover:text-white transition-colors">3 (Deep)</button>
+  </div>
+</div>
+
+      <!-- Auth Required Lock Banner (Shown when not signed in) -->
+      <div id="authRequiredBanner" class="p-3 rounded-xl bg-amber-950/40 border border-amber-500/40 text-xs text-amber-200 mb-3 space-y-2 transition-all">
+        <div class="flex items-center justify-between font-bold text-amber-300">
+          <span class="flex items-center gap-1.5">
+            <span>🔒</span>
+            <span>Sign-In Required to Run</span>
+          </span>
+          <span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-black/50 border border-amber-500/30 text-amber-300">5 Runs/Day</span>
+        </div>
+        <p class="text-[11px] text-gray-300 leading-snug">
+          Autonomous discovery requires a verified researcher session. Daily quotas refresh at 3:00 PM IST (09:30 UTC).
+        </p>
+        <button type="button" onclick="openAuthModal('🔒 Please sign in or register to launch discovery runs.')" class="w-full py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-md transition-all flex items-center justify-center gap-1.5">
+          <span>🔑 Sign In / Register to Unlock</span>
+        </button>
+      </div>
+
+      <!-- Run Button -->
+      <button aria-label="Run autonomous molecular discovery" id="runBtn" onclick="runDiscovery()" class="btn-cta w-full text-white font-bold py-3 rounded-xl text-sm flex items-center justify-center gap-2 mb-4">
+        <svg id="runIcon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+        <span id="runLabel">🚀 Run Autonomous Discovery</span>
+      </button>
+
+      <!-- Agent Pipeline Status -->
+      <div class="mb-5">
+        <div class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">⚙️ Agent Swarm Status</div>
+        <div class="space-y-2.5" id="agentStatusPanel">
+          <div class="flex items-center gap-3 py-2 px-3 rounded-lg border-l-2 border-l-emerald-500/40 hover:bg-white/[0.02] transition-colors" style="background: rgba(22,27,34,0.6);">
+            <div class="agent-ring idle" id="ring-scout"></div>
+            <div class="flex-1 flex items-center justify-between">
+              <div class="text-xs font-semibold text-gray-300">Target Scout</div>
+              <div class="text-[10px] text-gray-400 font-mono" id="status-scout">Standby</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-3 py-2 px-3 rounded-lg border-l-2 border-l-cyan-500/40 hover:bg-white/[0.02] transition-colors" style="background: rgba(22,27,34,0.6);">
+            <div class="agent-ring idle" id="ring-chemist"></div>
+            <div class="flex-1 flex items-center justify-between">
+              <div class="text-xs font-semibold text-gray-300">Generative Chemist</div>
+              <div class="text-[10px] text-gray-400 font-mono" id="status-chemist">Standby</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-3 py-2 px-3 rounded-lg border-l-2 border-l-purple-500/40 hover:bg-white/[0.02] transition-colors" style="background: rgba(22,27,34,0.6);">
+            <div class="agent-ring idle" id="ring-admet"></div>
+            <div class="flex-1 flex items-center justify-between">
+              <div class="text-xs font-semibold text-gray-300">ADMET Critic</div>
+              <div class="text-[10px] text-gray-400 font-mono" id="status-admet">Standby</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-3 py-2 px-3 rounded-lg border-l-2 border-l-blue-500/40 hover:bg-white/[0.02] transition-colors" style="background: rgba(22,27,34,0.6);">
+            <div class="agent-ring idle" id="ring-docking"></div>
+            <div class="flex-1 flex items-center justify-between">
+              <div class="text-xs font-semibold text-gray-300">DiffDock Docking</div>
+              <div class="text-[10px] text-gray-400 font-mono" id="status-docking">Standby</div>
+            </div>
+          </div>
+          <div class="flex items-center gap-3 py-2 px-3 rounded-lg border-l-2 border-l-amber-500/40 hover:bg-white/[0.02] transition-colors" style="background: rgba(22,27,34,0.6);">
+            <div class="agent-ring idle" id="ring-pi"></div>
+            <div class="flex-1 flex items-center justify-between">
+              <div class="text-xs font-semibold text-gray-300">PI Pareto Arbiter</div>
+              <div class="text-[10px] text-gray-400 font-mono" id="status-pi">Standby</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  
+<!-- Attribution & Acknowledgements -->
+<div class="mt-4 pt-3 border-t border-surface-border text-[11px] text-gray-400 leading-relaxed">
+  <div class="text-gray-300 font-semibold mb-1 flex items-center gap-1.5">
+    <span>🧬</span>
+    <span>Architected & engineered by <strong class="text-nvidia-green">Aarav Jorwal (@Jorwalzzz)</strong></span>
+  </div>
+  <p class="text-gray-500 text-[10px] leading-normal">
+    Special thanks to the <a href="https://developer.nvidia.com" target="_blank" rel="noopener noreferrer" class="text-gray-400 hover:text-nvidia-green underline">NVIDIA Developer Program</a> & <a href="https://build.nvidia.com/explore/discover" target="_blank" rel="noopener noreferrer" class="text-gray-400 hover:text-nvidia-green underline">BioNeMo team</a> for providing the GPU microservices (MolMIM, DiffDock, ESM-2), and the open-source scientific community (RDKit, RCSB PDB, 3Dmol.js).
+  </p>
+  <div class="mt-2 flex items-center gap-2 text-[10px] text-gray-500 font-mono flex-wrap">
+    <span class="px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20">AGPLv3 Copyleft</span>
+    <span>•</span>
+    <span class="badge-measured px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-bold">186/186 HERMETIC TESTS PASSING</span>
+    <span>•</span>
+    <span>Permanent Academic DOI via Zenodo</span>
+  </div>
+</div>
+</aside>
+
+  <!-- CENTER: Main Cockpit Canvas -->
+  <main class="flex-1 flex flex-col min-w-0 overflow-y-auto lg:overflow-hidden">
+
+    <!-- Progress Bar -->
+    <div class="h-[3px] w-full" style="background: var(--surface-border);">
+      <div id="progressBar" class="h-full progress-fill" style="width: 0%;"></div>
+    </div>
+
+    <!-- KPI Row -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 p-4 border-b border-surface-border">
+      <div class="glass rounded-xl p-3 kpi-accent-green">
+        <div class="text-[10px] text-gray-400 uppercase tracking-wider mb-1 font-semibold">Top Lead ΔG</div>
+        <div class="tele-num text-glow-green" id="kpiAffinity" style="color: var(--nvidia-green);">—</div>
+        <div class="text-[10px] text-gray-500 font-mono">kcal/mol</div>
+      </div>
+      <div class="glass rounded-xl p-3 kpi-accent-cyan">
+        <div class="text-[10px] text-gray-400 uppercase tracking-wider mb-1 font-semibold">QED Score</div>
+        <div class="tele-num" id="kpiQed" style="color: var(--cyber-cyan);">—</div>
+        <div class="text-[10px] text-gray-500 font-mono">drug-likeness</div>
+      </div>
+      <div class="glass rounded-xl p-3 kpi-accent-purple">
+        <div class="text-[10px] text-gray-400 uppercase tracking-wider mb-1 font-semibold">Screened</div>
+        <div class="tele-num text-purple-400" id="kpiScreened">—</div>
+        <div class="text-[10px] text-gray-500 font-mono">candidates</div>
+      </div>
+      <div class="glass rounded-xl p-3 kpi-accent-amber">
+        <div class="text-[10px] text-gray-400 uppercase tracking-wider mb-1 font-semibold">Pareto Leads</div>
+        <div class="tele-num text-amber-400" id="kpiPareto">—</div>
+        <div class="text-[10px] text-gray-500 font-mono">non-dominated</div>
+      </div>
+    </div>
+
+    <!-- Main Content Split -->
+    <div class="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-0 overflow-hidden">
+
+      <!-- LEFT: Agent Log Stream -->
+      <div class="flex flex-col border-r border-surface-border overflow-hidden">
+        <!-- Provenance Status Banner -->
+        <div id="provenanceBanner" class="px-4 py-2 bg-amber-500/10 border-b border-amber-500/30 flex items-center justify-between text-[11px] font-mono">
+          <div class="flex items-center gap-2 min-w-0">
+            <span id="provenanceDot" class="w-2 h-2 rounded-full bg-amber-400 shrink-0"></span>
+            <span id="provenanceBadge" class="font-bold text-amber-400 shrink-0">OFFLINE DEMO · CLIENT SIMULATION (NOT LIVE NIM)</span>
+            <span id="provenanceDetail" class="text-gray-400 truncate hidden sm:inline">(Local simulation; metrics illustrative. Run `python serve_cockpit.py` for live NIM)</span>
+          </div>
+          <button id="viewReceiptBtn" aria-label="View raw execution provenance receipt" type="button" onclick="openRawReceiptModal()" class="ml-2 px-2 py-0.5 rounded text-[10px] font-semibold bg-white/5 hover:bg-white/10 text-gray-300 border border-gray-700/60 shrink-0 transition-colors">
+            View Raw JSON
+          </button>
+        </div>
+        <div class="flex items-center justify-between px-4 py-3 border-b border-surface-border">
+          <div class="flex items-center gap-2">
+            <div class="w-2 h-2 rounded-full animate-pulse" id="streamDot" style="background: #374151;"></div>
+            <span class="text-xs font-semibold text-gray-300">🤖 Multi-Agent Thought Stream</span>
+          </div>
+          <span class="text-[10px] font-mono text-gray-600" id="streamTimestamp">--:--:--</span>
+        </div>
+        <div id="agentLog" class="flex-1 overflow-y-auto p-4 space-y-3 text-xs font-mono">
+          <div class="flex flex-col items-center justify-center h-full min-h-[220px] gap-3 select-none text-center py-8">
+            <div class="relative w-12 h-12 flex items-center justify-center">
+              <div class="absolute inset-0 rounded-full border-2 border-emerald-500/20 animate-ping"></div>
+              <div class="absolute inset-1 rounded-full border border-emerald-500/40 animate-spin" style="animation-duration: 4s;"></div>
+              <div class="text-2xl">🧬</div>
+            </div>
+            <div class="text-xs text-gray-400 font-sans leading-relaxed">
+              Select a target and click<br/>
+              <strong class="font-bold text-emerald-400">🚀 Run Autonomous Discovery</strong>
+            </div>
+            <div class="w-24 h-px bg-gradient-to-r from-transparent via-emerald-500/40 to-transparent animate-pulse"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: Pareto Chart + Lead Table -->
+      <div class="flex flex-col overflow-hidden">
+        <!-- Pareto Chart -->
+        <div class="p-4 border-b border-surface-border">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-xs font-semibold text-gray-300">📊 Pareto Frontier (Affinity vs. Drug-Likeness)</span>
+            <span class="badge-green">Multi-Objective</span>
+          </div>
+          <div style="height: 200px;">
+            <canvas id="paretoChart"></canvas>
+          </div>
+        </div>
+
+        <!-- Lead Cards -->
+        <div class="flex-1 overflow-y-auto p-4">
+          <div class="flex items-center justify-between mb-3">
+            <div class="flex items-center gap-2">
+              <span class="text-xs font-semibold text-gray-300">🏆 Top Nominated Leads</span>
+              <span id="leadCount" class="text-[10px] text-gray-600">0 candidates</span>
+            </div>
+            <button id="btnExportRunJson" aria-label="Export active run result as JSON" onclick="exportActiveRunJson()" class="px-2 py-0.5 rounded text-[10px] font-semibold bg-white/5 hover:bg-white/10 text-emerald-400 border border-emerald-500/30 transition-colors flex items-center gap-1">
+              <span>📥</span> Export JSON
+            </button>
+          </div>
+          <div id="leadsContainer" class="space-y-2">
+            <div id="emptyLeadsState" class="flex flex-col items-center justify-center p-8 text-center text-gray-500">
+              <span class="text-3xl mb-2">🧪</span>
+              <div class="text-xs font-semibold text-gray-400">No leads nominated yet</div>
+              <div class="text-[10px] text-gray-600 mt-1">Select a target and run autonomous discovery to nominate Pareto-optimal drug candidates.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- RIGHT SIDEBAR: Selected Lead Dossier -->
+  <aside class="hidden lg:flex flex-col w-72 xl:w-80 flex-shrink-0 border-l border-surface-border overflow-y-auto" style="background: var(--surface-card);">
+    <div class="p-5">
+      <div class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">📋 Lead Dossier</div>
+      <div id="dossierPanel">
+        <div class="flex flex-col items-center justify-center py-12 gap-4 select-none">
+          <div class="relative flex items-center justify-center">
+            <div class="w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-500/10 to-cyan-500/5 border border-emerald-500/20 flex items-center justify-center text-3xl shadow-lg shadow-emerald-500/5">
+              🔬
+            </div>
+            <div class="absolute -inset-2 rounded-2xl border border-emerald-500/10 animate-ping" style="animation-duration: 3s;"></div>
+          </div>
+          <div class="text-center space-y-1">
+            <div class="text-xs font-semibold text-gray-300">Select a Lead Candidate</div>
+            <div class="text-[11px] text-gray-500 leading-relaxed">Click any lead card to load<br/>its 3D pose & molecular profile</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<!-- ═══════════════════════════════════════════════ DESKTOP APP STATUS & APOLOGY MODAL ════════ -->
+<div id="installModal" class="modal-backdrop hidden" style="display: none;" onclick="closeModalOnBackdrop(event)">
+  <div class="modal-card max-w-xl p-0 animate-fade-up overflow-hidden" onclick="event.stopPropagation()" style="background: #0d1117; border: 1px solid rgba(245, 158, 11, 0.4); box-shadow: 0 25px 60px rgba(0,0,0,0.85);">
+    <!-- Modal Header -->
+    <div class="p-5 border-b border-surface-border flex items-center justify-between bg-[#161b22] modal-header-band">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-300 text-lg">
+          🌱
+        </div>
+        <div>
+          <h2 id="modalTitle" class="text-base font-bold text-white flex items-center gap-2">
+            <span>Our Sincere Apology & Status Note</span>
+            <span class="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">In Progress</span>
+          </h2>
+          <p id="modalSubtitle" class="text-xs text-gray-400">Why we removed downloading scripts & our commitment to you</p>
+        </div>
+      </div>
+      <button aria-label="Close dialog" onclick="closeInstallModal()" class="text-gray-400 hover:text-white text-xl p-1 leading-none transition-colors">&times;</button>
+    </div>
+
+    <!-- Modal Body -->
+    <div class="p-6 space-y-4 text-xs">
+      <div class="p-4 rounded-xl bg-amber-950/20 border border-amber-500/30 space-y-2">
+        <div class="flex items-center gap-2 font-bold text-amber-300 text-sm">
+          <span>💌 An Honest Word From Aarav Jorwal</span>
+        </div>
+        <p class="text-gray-300 leading-relaxed text-xs">
+          If you were looking for an offline download button today, <strong class="text-amber-200">we apologize from the bottom of our hearts.</strong> We made the conscious decision to completely take down all download commands and temporary scripts.
+        </p>
+      </div>
+
+      <div class="space-y-2 text-gray-300 leading-relaxed">
+        <p>
+          Cancer and antiviral therapeutics are far too important to compromise on stability. In early internal tests, asking scientists to configure complex Python and CUDA terminal environments led to frustration. We refuse to deliver anything less than an effortless, single-click native desktop experience that works reliably on day one.
+        </p>
+        <p>
+          Our team is actively engineering a <strong>dedicated native workstation application</strong> with built-in GPU acceleration and automated setup. It is under deep, passionate development.
+        </p>
+      </div>
+
+      <div class="p-3.5 rounded-xl bg-[#121822] border border-surface-border space-y-2">
+        <div class="text-[11px] font-bold text-emerald-400 uppercase tracking-wider flex items-center gap-1.5">
+          <span>✓</span>
+          <span>100% Free & Active in Your Browser Today</span>
+        </div>
+        <div class="text-gray-400 leading-relaxed text-[11px]">
+          Everything in this Web Studio — 3D molecular visualization, multi-objective Pareto ranking, retrosynthesis steps, and Opentrons robot protocols — is fully active and completely free with no download required.
+        </div>
+      </div>
+
+      <!-- Footer CTA -->
+      <div class="pt-2 flex justify-between items-center">
+        <a href="https://github.com/Jorwalzzz/bionemo-nim-benchmark" target="_blank" rel="noopener noreferrer" class="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-gray-300 text-xs font-semibold flex items-center gap-1.5 border border-white/10 transition-colors">
+          <span>⭐ Follow on GitHub for Desktop Release</span>
+        </a>
+        <button aria-label="Close dialog" onclick="closeInstallModal()" class="px-5 py-2 rounded-lg bg-surface-elevated text-white text-xs font-semibold hover:bg-white/10 transition-colors">
+          Back to Cockpit
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast" class="toast hide">✅ Copied to clipboard!</div>
+
+
+
+<!-- ═══════════════════════════════════════════════ 3D INSPECTOR MODAL ════════ -->
+<div id="viewer3DModal" class="modal-backdrop hidden" style="display: none;" onclick="close3DModal(event)">
+  <div class="modal-card max-w-4xl p-0 animate-fade-up overflow-hidden" onclick="event.stopPropagation()" style="background: #0d1117; border: 1px solid #30363d; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.8);">
+    <div class="p-4 border-b border-surface-border flex items-center justify-between bg-[#161b22]">
+      <div class="flex items-center gap-3">
+        <div class="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse"></div>
+        <div>
+          <h3 id="modal3DTitle" class="text-sm font-bold text-white font-mono">3D Pocket & Docking Inspector</h3>
+          <p id="modal3DSub" class="text-[11px] text-gray-400">Interactive High-Resolution WebGL Visualization</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <button aria-label="Toggle 3D molecule auto-rotation" onclick="toggle3DSpin()" class="px-2.5 py-1 text-xs text-gray-300 hover:text-white rounded bg-white/5 border border-white/10">🔄 Spin</button>
+        <button aria-label="Toggle binding pocket surface rendering" onclick="toggle3DSurface()" class="px-2.5 py-1 text-xs text-gray-300 hover:text-white rounded bg-white/5 border border-white/10">🎨 Pocket Surface</button>
+        <button aria-label="Reset 3D camera view" onclick="reset3DView()" class="px-2.5 py-1 text-xs text-gray-300 hover:text-white rounded bg-white/5 border border-white/10">🔍 Recenter</button>
+        <button aria-label="Close dialog" onclick="close3DModalDirect()" class="text-gray-400 hover:text-white p-1 text-lg font-bold ml-2">&times;</button>
+      </div>
+    </div>
+    <div id="modalMolViewer3D" style="width: 100%; height: 500px; position: relative; background: #0b0f14;"></div>
+    <div class="p-3 bg-[#101620] border-t border-surface-border flex items-center justify-between text-xs text-gray-400">
+      <div class="flex items-center gap-4">
+        <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded bg-cyan-400"></span> Pocket Sidechains (Sticks)</span>
+        <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded bg-emerald-400"></span> Docked Conformer Pose</span>
+        <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded bg-gradient-to-r from-blue-400 to-indigo-500"></span> Protein Cartoon</span>
+      </div>
+      <span class="font-mono text-cyan-300 font-semibold" id="modal3DMetrics"></span>
+    </div>
+  </div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════ HARDWARE BENCHMARK MODAL ════════ -->
+<div id="benchmarkModal" class="modal-backdrop hidden" style="display: none;" onclick="closeBenchmarkModal(event)">
+  <div class="modal-card max-w-2xl p-0 animate-fade-up overflow-hidden" onclick="event.stopPropagation()" style="background: #0d1117; border: 1px solid #30363d; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.85);">
+    <!-- Modal Header -->
+    <div class="p-5 border-b border-surface-border flex items-center justify-between bg-[#161b22] modal-header-band">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg flex items-center justify-center glow-green" style="background: linear-gradient(135deg, #76b900, #386b00);">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="white"><path d="M7 2v11h3v9l7-12h-4l4-8z"/></svg>
+        </div>
+        <div>
+          <h3 class="text-sm font-bold text-white flex items-center gap-2">
+            <span>NVIDIA H100 Tensor Core vs. Laptop CPU</span>
+            <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Speedup Benchmark</span>
+          </h3>
+          <p class="text-xs text-gray-400">Real-time throughput & latency telemetry measuring AI acceleration</p>
+        </div>
+      </div>
+      <button aria-label="Close dialog" onclick="closeBenchmarkModalDirect()" class="text-gray-400 hover:text-white p-1 text-xl font-bold">&times;</button>
+    </div>
+
+    <!-- Modal Content -->
+    <div class="p-5 space-y-4 max-h-[75vh] overflow-y-auto">
+      <!-- High-Level KPI Comparison Cards -->
+      <div class="grid grid-cols-3 gap-3">
+        <div class="p-3.5 rounded-xl bg-[#121822] border border-surface-border">
+          <div class="text-[11px] text-gray-400 mb-1">Overall Speedup</div>
+          <div id="bmOverallSpeedup" class="text-2xl font-mono font-extrabold text-glow-green" style="color: var(--nvidia-green);">54.8×</div>
+          <div class="text-[10px] text-gray-500 mt-0.5">Tensor Core Acceleration</div>
+        </div>
+        <div class="p-3.5 rounded-xl bg-[#121822] border border-surface-border">
+          <div class="text-[11px] text-gray-400 mb-1">Local Host CPU</div>
+          <div id="bmCpuLatency" class="text-2xl font-mono font-extrabold text-red-400">23.4s</div>
+          <div class="text-[10px] text-gray-500 mt-0.5">Per-candidate cycle</div>
+        </div>
+        <div class="p-3.5 rounded-xl bg-[#121822] border border-surface-border">
+          <div class="text-[11px] text-gray-400 mb-1">NVIDIA NIM H100</div>
+          <div id="bmGpuLatency" class="text-2xl font-mono font-extrabold text-cyan-400">0.44s</div>
+          <div class="text-[10px] text-gray-500 mt-0.5">Sub-second inference</div>
+        </div>
+      </div>
+
+      <!-- Live Micro-Benchmark Trigger -->
+      <div class="p-3 rounded-xl bg-[#161b22] border border-[#30363d] flex items-center justify-between">
+        <div>
+          <div class="text-xs font-bold text-gray-200">Live Host CPU Calibration</div>
+          <div id="bmHostCpuName" class="text-[11px] text-gray-400 font-mono">Standard x86_64 Laptop CPU</div>
+        </div>
+        <button aria-label="Run live host CPU inference benchmark" id="btnRunLiveBm" onclick="runLiveBenchmark()" class="px-3 py-1.5 text-xs font-bold rounded-lg bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 border border-emerald-500/30 flex items-center gap-1.5 transition-colors">
+          <span>⚡ Calibrate My Laptop CPU</span>
+        </button>
+      </div>
+
+      <!-- Detailed Task Latency Breakdown -->
+      <div class="space-y-3">
+        <div class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Module-by-Module Latency Comparison</div>
+
+        <!-- Task 1: ESM-2 -->
+        <div class="p-3 rounded-xl bg-[#121822] border border-surface-border space-y-2">
+          <div class="flex justify-between items-center text-xs">
+            <span class="font-bold text-white">🧬 ESM-2 (650M) Protein Language Model</span>
+            <span id="bmEsm2Speedup" class="font-mono font-bold text-emerald-400">40.0× Faster</span>
+          </div>
+          <div class="space-y-1 text-[11px]">
+            <div class="flex items-center gap-2">
+              <span class="w-16 text-gray-400 font-mono">Laptop CPU</span>
+              <div class="flex-1 bg-gray-800 rounded-full h-2 overflow-hidden">
+                <div class="bg-red-500/70 h-full rounded-full" style="width: 100%;"></div>
+              </div>
+              <span id="bmEsm2Cpu" class="w-16 text-right font-mono text-gray-300">3,200 ms</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="w-16 text-gray-400 font-mono">NIM H100</span>
+              <div class="flex-1 bg-gray-800 rounded-full h-2 overflow-hidden">
+                <div class="bg-emerald-400 h-full rounded-full" style="width: 1.5%;"></div>
+              </div>
+              <span id="bmEsm2Gpu" class="w-16 text-right font-mono text-emerald-400 font-bold">80.0 ms</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Task 2: MolMIM -->
+        <div class="p-3 rounded-xl bg-[#121822] border border-surface-border space-y-2">
+          <div class="flex justify-between items-center text-xs">
+            <span class="font-bold text-white">⚗️ MolMIM Generative Chemistry</span>
+            <span id="bmMolmimSpeedup" class="font-mono font-bold text-emerald-400">43.3× Faster</span>
+          </div>
+          <div class="space-y-1 text-[11px]">
+            <div class="flex items-center gap-2">
+              <span class="w-16 text-gray-400 font-mono">Laptop CPU</span>
+              <div class="flex-1 bg-gray-800 rounded-full h-2 overflow-hidden">
+                <div class="bg-red-500/70 h-full rounded-full" style="width: 100%;"></div>
+              </div>
+              <span id="bmMolmimCpu" class="w-16 text-right font-mono text-gray-300">4,850 ms</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="w-16 text-gray-400 font-mono">NIM H100</span>
+              <div class="flex-1 bg-gray-800 rounded-full h-2 overflow-hidden">
+                <div class="bg-emerald-400 h-full rounded-full" style="width: 2.3%;"></div>
+              </div>
+              <span id="bmMolmimGpu" class="w-16 text-right font-mono text-emerald-400 font-bold">112.0 ms</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Task 3: DiffDock -->
+        <div class="p-3 rounded-xl bg-[#121822] border border-surface-border space-y-2">
+          <div class="flex justify-between items-center text-xs">
+            <span class="font-bold text-white">🔬 DiffDock 3D Conformer Pose Diffusion</span>
+            <span id="bmDiffdockSpeedup" class="font-mono font-bold text-emerald-400">62.8× Faster</span>
+          </div>
+          <div class="space-y-1 text-[11px]">
+            <div class="flex items-center gap-2">
+              <span class="w-16 text-gray-400 font-mono">Laptop CPU</span>
+              <div class="flex-1 bg-gray-800 rounded-full h-2 overflow-hidden">
+                <div class="bg-red-500/70 h-full rounded-full" style="width: 100%;"></div>
+              </div>
+              <span id="bmDiffdockCpu" class="w-16 text-right font-mono text-gray-300">15,400 ms</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="w-16 text-gray-400 font-mono">NIM H100</span>
+              <div class="flex-1 bg-gray-800 rounded-full h-2 overflow-hidden">
+                <div class="bg-emerald-400 h-full rounded-full" style="width: 1.6%;"></div>
+              </div>
+              <span id="bmDiffdockGpu" class="w-16 text-right font-mono text-emerald-400 font-bold">245.0 ms</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- High-Throughput Campaign Impact Banner -->
+      <div class="p-3.5 rounded-xl border border-emerald-500/30 bg-emerald-500/5 space-y-1.5">
+        <div class="text-xs font-bold text-emerald-400 flex items-center gap-1.5">
+          <span>🚀 High-Throughput Screening Impact (10,000 Molecules)</span>
+        </div>
+        <div class="text-xs text-gray-300 leading-relaxed">
+          Running a virtual library screen of 10,000 drug leads takes <strong class="text-red-400 font-mono">~90.0 hours (~3.75 days)</strong> on standard laptop CPU. With <strong class="text-emerald-400">NVIDIA NIM H100 Tensor Cores</strong>, the same campaign completes in <strong class="text-cyan-400 font-mono">~73.3 minutes</strong>, saving <strong class="text-white font-mono" id="bmTimeSaved">~88.5 hours</strong> vs. AMD EPYC 7763 CPU baseline.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ RESISTANCE ESCAPE MODAL ════ -->
+<div id="resistanceModal" class="modal-backdrop hidden" style="display: none;" onclick="if(event.target===this)closeResistanceModal()">
+  <div class="modal-card max-w-3xl p-0 animate-fade-up overflow-hidden" onclick="event.stopPropagation()" style="background: #0d1117; border: 1px solid rgba(239, 68, 68, 0.4); box-shadow: 0 25px 60px rgba(0, 0, 0, 0.8), 0 0 40px rgba(239, 68, 68, 0.15);">
+    <div class="p-5 border-b border-surface-border flex items-center justify-between bg-[#161b22] modal-header-band">
+      <div class="flex items-center gap-3">
+        <div class="w-3 h-3 rounded-full bg-red-400 animate-pulse"></div>
+        <div>
+          <h3 class="text-base font-bold text-white flex items-center gap-2">
+            <span>🛡️ Adaptive Resistance Escape Lab</span>
+            <span id="resStatusBadge" class="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">READY</span>
+          </h3>
+          <p class="text-xs text-gray-400">Target Hotspot Entropy (ESM-2) + Counter-Design Evolution (MolMIM)</p>
+        </div>
+      </div>
+      <button aria-label="Close dialog" onclick="closeResistanceModal()" class="text-gray-400 hover:text-white text-xl p-1 leading-none">✕</button>
+    </div>
+
+    <div class="p-6 space-y-5 overflow-y-auto max-h-[80vh]">
+      <!-- Mutation Challenge Header -->
+      <div class="p-3.5 rounded-xl bg-red-950/20 border border-red-500/30 flex items-center justify-between">
+        <div>
+          <div class="text-[10px] text-red-400 uppercase tracking-wider font-semibold">Simulated Clinical Escape Mutation</div>
+          <div id="resMutationTitle" class="text-sm font-bold text-gray-100 font-mono mt-0.5">G12D → G12V (Steric Resistance — Illustrative Scripted Scenario)</div>
+          <div class="text-[11px] text-gray-400 mt-1">High-Entropy Hotspot Residues: <span id="resHotspots" class="font-mono text-cyan-300">Asp12, Tyr96, Gln61, Lys16</span></div>
+        </div>
+        <div class="text-right">
+          <span class="text-[10px] font-mono px-2 py-1 rounded bg-red-500/20 text-red-300 border border-red-500/30 font-bold">ESM-2 Entropy Flag</span>
+        </div>
+      </div>
+
+      <!-- 3-Way Stress Test Metric Cards -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <!-- Card 1: Original Lead -->
+        <div class="p-3.5 rounded-xl bg-[#121822] border border-surface-border">
+          <div class="text-[10px] text-gray-400 uppercase tracking-wider mb-1">Original Lead</div>
+          <div id="resOrigAff" class="text-xl font-mono font-bold text-cyan-400">-9.20 kcal/mol</div>
+          <div class="text-[10px] text-gray-500 mt-1">Nominated baseline affinity</div>
+          <div class="mt-2 text-[10px] text-emerald-400 font-semibold flex items-center gap-1">
+            <span>●</span> Active Binding Pose
+          </div>
+        </div>
+
+        <!-- Card 2: Mutated Target Stress -->
+        <div class="p-3.5 rounded-xl bg-red-950/30 border border-red-500/30">
+          <div class="text-[10px] text-red-400 uppercase tracking-wider mb-1">Mutated Resistance Target</div>
+          <div id="resMutAff" class="text-xl font-mono font-bold text-red-400">-5.80 kcal/mol</div>
+          <div class="text-[10px] text-red-300 mt-1">⚠️ Severe affinity collapse</div>
+          <div class="mt-2 text-[10px] text-red-400 font-semibold flex items-center gap-1">
+            <span>▼</span> Resistance Clash Triggered
+          </div>
+        </div>
+
+        <!-- Card 3: MolMIM Evolved Scaffold -->
+        <div class="p-3.5 rounded-xl bg-emerald-950/30 border border-emerald-500/40">
+          <div class="text-[10px] text-emerald-400 uppercase tracking-wider mb-1">MolMIM Counter-Design</div>
+          <div id="resEvolvedAff" class="text-xl font-mono font-bold text-emerald-400">-9.90 kcal/mol</div>
+          <div class="text-[10px] text-emerald-300 mt-1">Recovery: <strong id="resDeltaRecovery" class="text-white font-mono">+4.10 kcal/mol</strong></div>
+          <div class="mt-2 text-[10px] text-emerald-300 font-semibold flex items-center gap-1">
+            <span>▲</span> Escape Bypass Validated
+          </div>
+        </div>
+      </div>
+
+      <!-- Mechanistic Explanation -->
+      <div class="p-4 rounded-xl bg-[#161b22] border border-[#30363d] space-y-1.5">
+        <div class="text-xs font-bold text-gray-200 flex items-center gap-2">
+          <span>🔬</span>
+          <span>Biophysical Mechanism & Bioisosteric Rationale</span>
+        </div>
+        <p id="resMechanismText" class="text-xs text-gray-300 leading-relaxed">
+          [Illustrative scripted scenario — not real resistance data] Simulated G12D→G12V substitution reduces switch-II electrostatic complementarity. MolMIM counter-design remodels terminal heterocycle to restore pocket fit.
+        </p>
+      </div>
+
+      <!-- Evolved Chemical SMILES -->
+      <div class="p-3.5 rounded-xl bg-[#0b0f14] border border-[#30363d] space-y-2">
+        <div class="flex justify-between items-center text-xs">
+          <span class="text-gray-400 font-semibold">MolMIM Evolved Escape SMILES:</span>
+          <button aria-label="Copy evolved SMILES string" onclick="copyEvolvedSmiles()" class="px-2 py-1 text-[10px] rounded bg-white/5 hover:bg-white/10 text-cyan-300 border border-white/10 transition-colors">📋 Copy SMILES</button>
+        </div>
+        <div id="resEvolvedSmiles" class="text-[11px] font-mono text-emerald-400 p-2 rounded bg-black/40 border border-emerald-500/20 break-all select-all">
+          O=C(N1CCN(C2=NC=C(Cl)C3=C2C(C4=C(F)C=CC=C4F)=CC=C3)CC1)C5=C(N)N=C6C(F)=CC=CC6=C5
+        </div>
+      </div>
+
+      <!-- Actions -->
+      <div class="flex gap-2 pt-2">
+        <button aria-label="Adopt evolved scaffold" onclick="adoptEvolvedScaffold()" class="flex-1 py-2.5 rounded-lg btn-cta text-white font-bold text-xs flex items-center justify-center gap-2">
+          <span>🧪 Adopt Evolved Candidate into Workbench</span>
+        </button>
+        <button aria-label="Close dialog" onclick="closeResistanceModal()" class="px-4 py-2.5 rounded-lg bg-white/5 hover:bg-white/10 text-gray-300 text-xs font-semibold">
+          Close
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ ROBOT PROTOCOL MODAL ══════ -->
+<div id="robotProtocolModal" class="modal-backdrop hidden" style="display: none;" onclick="if(event.target===this)closeRobotModal()">
+  <div class="modal-card max-w-4xl p-0 animate-fade-up overflow-hidden" onclick="event.stopPropagation()" style="background: #0d1117; border: 1px solid rgba(245, 158, 11, 0.4); box-shadow: 0 25px 60px rgba(0,0,0,0.8);">
+    <div class="p-5 border-b border-surface-border flex items-center justify-between bg-[#161b22] modal-header-band">
+      <div class="flex items-center gap-3">
+        <div class="w-3 h-3 rounded-full bg-amber-400 animate-pulse"></div>
+        <div>
+          <h3 class="text-base font-bold text-white flex items-center gap-2">
+            <span>🤖 Opentrons OT-2 Automated Robotic Protocol</span>
+            <span id="robotModalSteps" class="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">2 Steps</span>
+          </h3>
+          <p class="text-xs text-gray-400">Target Candidate: <span id="robotModalLeadId" class="text-amber-300 font-mono">LEAD-001</span> | Opentrons API Level 2.15</p>
+        </div>
+      </div>
+      <button aria-label="Close dialog" onclick="closeRobotModal()" class="text-gray-400 hover:text-white text-xl p-1 leading-none">✕</button>
+    </div>
+
+    <div class="p-6 space-y-4 overflow-y-auto max-h-[80vh]">
+      <!-- Deck Configuration Layout -->
+      <div class="p-3 rounded-xl bg-[#121822] border border-surface-border">
+        <div class="text-[10px] text-gray-400 uppercase tracking-wider font-semibold mb-2">Automated Deck Allocation</div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] font-mono">
+          <div class="p-2 rounded bg-black/40 border border-surface-border"><strong class="text-amber-400">Slot 1:</strong> 300 µL Tiprack</div>
+          <div class="p-2 rounded bg-black/40 border border-surface-border"><strong class="text-amber-400">Slot 2:</strong> 12-Well Reagents</div>
+          <div class="p-2 rounded bg-black/40 border border-surface-border"><strong class="text-cyan-400">Slot 3:</strong> Temp Module (25°C)</div>
+          <div class="p-2 rounded bg-black/40 border border-surface-border"><strong class="text-amber-400">Slot 5:</strong> 1000 µL Tiprack</div>
+        </div>
+      </div>
+
+      <!-- Code Box -->
+      <div class="space-y-1.5">
+        <div class="flex justify-between items-center text-xs">
+          <span class="text-gray-400 font-semibold font-mono">Executable Python Script (ot2_synthesis.py):</span>
+          <div class="flex gap-2">
+            <button aria-label="Copy Opentrons OT-2 Python protocol" onclick="copyOT2Code()" class="px-2.5 py-1 text-xs rounded bg-white/5 hover:bg-white/10 text-gray-300 border border-white/10 transition-colors">📋 Copy Code</button>
+            <button aria-label="Download Opentrons Python script" onclick="downloadCurrentOT2Py()" class="px-2.5 py-1 text-xs font-bold rounded bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 border border-amber-500/30 transition-colors">⬇ Download .py</button>
+          </div>
+        </div>
+        <pre id="ot2CodeContent" class="p-4 rounded-xl bg-[#010409] border border-[#21262d] text-amber-300/90 text-xs font-mono overflow-x-auto max-h-72 select-all leading-relaxed"></pre>
+      </div>
+
+      <!-- Modal Footer -->
+      <div class="flex justify-between items-center pt-2">
+        <button aria-label="Download wet-lab SOP protocol card" onclick="generateLabCard()" class="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-gray-300 text-xs font-semibold flex items-center gap-1.5">
+          <span>📋 Download Wet-Lab SOP Card (.md)</span>
+        </button>
+        <button aria-label="Close dialog" onclick="closeRobotModal()" class="px-4 py-2 rounded-lg bg-surface-elevated text-gray-200 text-xs font-semibold hover:bg-white/10">
+          Close
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ OWNER ACCESS MODAL ═══════ -->
+<div id="ownerModal" class="modal-backdrop hidden" style="display: none;" onclick="if(event.target===this)closeOwnerModal()">
+  <div class="modal-card max-w-sm p-0 animate-fade-up overflow-hidden" onclick="event.stopPropagation()" style="background: #0d1117; border: 1px solid rgba(118, 185, 0, 0.4); box-shadow: 0 25px 60px rgba(0,0,0,0.85);">
+    <div class="p-4 border-b border-surface-border flex items-center justify-between bg-[#161b22] modal-header-band">
+      <div class="flex items-center gap-2">
+        <span class="text-nvidia-green font-mono text-sm">🔒</span>
+        <h3 class="text-sm font-bold text-white">Owner Access Mode</h3>
+      </div>
+      <button aria-label="Close owner dialog" onclick="closeOwnerModal()" class="text-gray-400 hover:text-white text-lg p-1 leading-none">✕</button>
+    </div>
+    <div class="p-5 space-y-4">
+      <p class="text-xs text-gray-400">Hardware-bound localhost authentication. Unlocks unlimited discovery campaigns and benchmarking.</p>
+      <div id="ownerStatusMessage" class="hidden text-xs px-3 py-2 rounded font-mono"></div>
+      <div>
+        <label for="ownerIdInput" class="block text-[11px] font-mono text-gray-400 uppercase mb-1">Owner Identifier</label>
+        <input type="text" id="ownerIdInput" autocomplete="username" placeholder="Owner ID" class="w-full px-3 py-2 rounded-lg bg-[#0d1117] border border-gray-700 text-white text-xs font-mono focus:border-nvidia-green focus:outline-none">
+      </div>
+      <div>
+        <label for="ownerPasswordInput" class="block text-[11px] font-mono text-gray-400 uppercase mb-1">Password</label>
+        <input type="password" id="ownerPasswordInput" autocomplete="current-password" placeholder="••••••••" class="w-full px-3 py-2 rounded-lg bg-[#0d1117] border border-gray-700 text-white text-xs font-mono focus:border-nvidia-green focus:outline-none" onkeydown="if(event.key==='Enter')submitOwnerLogin()">
+      </div>
+      <div class="flex items-center justify-end gap-2 pt-2">
+        <button type="button" onclick="closeOwnerModal()" class="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-gray-300 text-xs font-semibold">Cancel</button>
+        <button type="button" id="ownerLoginBtn" onclick="submitOwnerLogin()" class="px-4 py-1.5 rounded-lg bg-nvidia-green hover:brightness-110 text-black text-xs font-bold transition-all shadow-md">Authenticate</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ AUTHENTICATION MODAL ══════ -->
+<div id="authModal" class="modal-backdrop hidden" style="display: none;" onclick="if(event.target===this)closeAuthModal()">
+  <div class="modal-card max-w-md p-0 animate-fade-up overflow-hidden" onclick="event.stopPropagation()" style="background: #0d1117; border: 1px solid rgba(16, 185, 129, 0.4); box-shadow: 0 25px 60px rgba(0,0,0,0.85);">
+    <div class="p-5 border-b border-surface-border flex items-center justify-between bg-[#161b22] modal-header-band">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 font-bold text-sm">
+          🔑
+        </div>
+        <div>
+          <h3 id="authModalTitle" class="text-base font-bold text-white flex items-center gap-2">
+            <span>Researcher Authentication</span>
+          </h3>
+          <p class="text-xs text-gray-400">Access Free Trial Discovery Runs (5 runs/day)</p>
+        </div>
+      </div>
+      <button aria-label="Close dialog" onclick="closeAuthModal()" class="text-gray-400 hover:text-white text-xl p-1 leading-none">✕</button>
+    </div>
+
+    <!-- Sync Notice Banner -->
+    <div class="px-5 py-2.5 bg-emerald-950/30 border-b border-emerald-500/20 text-xs text-emerald-300 flex items-center gap-2">
+      <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+      <span>Daily quota: <strong>5 runs / 24 hours</strong>. Synchronized reset at <strong>3:00 PM IST (09:30 UTC)</strong>.</span>
+    </div>
+
+    <div class="p-6 space-y-4">
+      <!-- Tabs -->
+      <div class="flex rounded-lg bg-black/40 p-1 border border-surface-border">
+        <button id="authTabLogin" onclick="switchAuthTab('login')" class="flex-1 py-1.5 text-xs font-bold rounded-md bg-emerald-600 text-white transition-all">Sign In</button>
+        <button id="authTabRegister" onclick="switchAuthTab('register')" class="flex-1 py-1.5 text-xs font-semibold rounded-md text-gray-400 hover:text-white transition-all">Register New</button>
+      </div>
+
+      <!-- Quick Evaluator 1-Click Button -->
+      <div class="p-3 rounded-xl bg-purple-950/20 border border-purple-500/30">
+        <div class="text-[11px] text-purple-300 font-semibold mb-1 flex items-center gap-1.5">
+          <span>⚡ Instant Reviewer Access:</span>
+        </div>
+        <button onclick="handleDemoLogin()" class="w-full py-2 rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white text-xs font-bold transition-all shadow-md flex items-center justify-center gap-2">
+          <span>1-Click Evaluator Sign In</span>
+          <span class="text-[10px] font-mono text-purple-200 bg-black/30 px-1.5 py-0.5 rounded">evaluator@bionemo.org</span>
+        </button>
+      </div>
+
+      <!-- Login Form -->
+      <form id="authLoginForm" onsubmit="handleAuthLogin(event)" class="space-y-3">
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 mb-1">Email Address</label>
+          <input type="email" id="authLoginEmail" required placeholder="dr.smith@institution.edu" oninput="handleEmailInputValidation(this, 'authLoginEmailFeedback')" class="w-full px-3 py-2 rounded-lg bg-black/50 border border-surface-border text-white text-xs focus:outline-none focus:border-emerald-500" />
+          <div id="authLoginEmailFeedback" class="mt-1 text-[11px] font-mono hidden"></div>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 mb-1">Password</label>
+          <input type="password" id="authLoginPassword" required placeholder="••••••••" class="w-full px-3 py-2 rounded-lg bg-black/50 border border-surface-border text-white text-xs focus:outline-none focus:border-emerald-500" />
+        </div>
+        <div id="authLoginError" class="text-xs text-red-400 hidden"></div>
+        <button type="submit" id="authLoginSubmitBtn" class="w-full py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-all shadow-md">
+          Sign In to Workspace
+        </button>
+      </form>
+
+      <!-- Register Form -->
+      <form id="authRegisterForm" onsubmit="handleAuthRegister(event)" class="space-y-3 hidden" style="display: none;">
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 mb-1">Full Name</label>
+          <input type="text" id="authRegName" required placeholder="Dr. Jane Doe" class="w-full px-3 py-2 rounded-lg bg-black/50 border border-surface-border text-white text-xs focus:outline-none focus:border-emerald-500" />
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 mb-1">Institution / Organization</label>
+          <input type="text" id="authRegOrg" required placeholder="Stanford Bioengineering / Independent" class="w-full px-3 py-2 rounded-lg bg-black/50 border border-surface-border text-white text-xs focus:outline-none focus:border-emerald-500" />
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 mb-1">Email Address</label>
+          <input type="email" id="authRegEmail" required placeholder="dr.doe@stanford.edu" oninput="handleEmailInputValidation(this, 'authRegEmailFeedback')" class="w-full px-3 py-2 rounded-lg bg-black/50 border border-surface-border text-white text-xs focus:outline-none focus:border-emerald-500" />
+          <div id="authRegEmailFeedback" class="mt-1 text-[11px] font-mono hidden"></div>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 mb-1">Password (Min 6 characters)</label>
+          <input type="password" id="authRegPassword" required minlength="6" placeholder="••••••••" class="w-full px-3 py-2 rounded-lg bg-black/50 border border-surface-border text-white text-xs focus:outline-none focus:border-emerald-500" />
+        </div>
+        <div id="authRegError" class="text-xs text-red-400 hidden"></div>
+        <button type="submit" id="authRegSubmitBtn" class="w-full py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition-all shadow-md">
+          Create Researcher Account
+        </button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ QUOTA EXHAUSTED MODAL ══════ -->
+<div id="quotaExhaustedModal" class="modal-backdrop hidden" style="display: none;" onclick="if(event.target===this)closeQuotaModal()">
+  <div class="modal-card max-w-md p-0 animate-fade-up overflow-hidden" onclick="event.stopPropagation()" style="background: #0d1117; border: 1px solid rgba(239, 68, 68, 0.4); box-shadow: 0 25px 60px rgba(0,0,0,0.85);">
+    <div class="p-5 border-b border-surface-border flex items-center justify-between bg-[#161b22] modal-header-band">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg bg-red-500/20 border border-red-500/40 flex items-center justify-center text-red-400 font-bold text-sm">
+          ⏳
+        </div>
+        <div>
+          <h3 class="text-base font-bold text-white flex items-center gap-2">
+            <span>Daily Discovery Quota Reached</span>
+          </h3>
+          <p class="text-xs text-gray-400">5 of 5 Free Runs Used for Current Cycle</p>
+        </div>
+      </div>
+      <button aria-label="Close dialog" onclick="closeQuotaModal()" class="text-gray-400 hover:text-white text-xl p-1 leading-none">✕</button>
+    </div>
+
+    <div class="p-6 space-y-4 text-center">
+      <div class="p-4 rounded-xl bg-red-950/20 border border-red-500/30 text-left space-y-2">
+        <div class="text-xs font-bold text-red-300">Synchronized Daily Refresh Period:</div>
+        <p class="text-xs text-gray-300 leading-relaxed">
+          The global discovery pipeline refreshes for all researchers simultaneously at <strong>3:00 PM IST (09:30 UTC)</strong> every day.
+        </p>
+      </div>
+
+      <!-- Live Countdown Card -->
+      <div class="p-4 rounded-xl bg-black/60 border border-surface-border">
+        <div class="text-[11px] text-gray-400 uppercase tracking-wider font-semibold mb-1">Time Remaining Until Next 5-Run Refill</div>
+        <div id="quotaModalCountdown" class="text-3xl font-mono font-extrabold text-amber-400 tracking-wider">
+          --:--:--
+        </div>
+        <div class="text-[10px] text-gray-500 mt-1">Refreshes next at 3:00 PM IST (09:30 UTC)</div>
+      </div>
+
+      <!-- Offline Alternative -->
+      <div class="p-3.5 rounded-xl bg-[#161b22] border border-surface-border text-left space-y-2">
+        <div class="text-xs font-bold text-gray-200">Need Unlimited Runs Right Now?</div>
+        <p class="text-xs text-gray-400 leading-relaxed">
+          Deploy the open-source CLI or Desktop App locally on your GPU/CPU workstation for 100% unlimited, unmetered discovery campaigns with your own NVIDIA API key.
+        </p>
+        <button onclick="closeQuotaModal(); openInstallModal();" class="w-full py-2 rounded-lg bg-white/10 hover:bg-white/15 text-white text-xs font-semibold border border-white/20 transition-all flex items-center justify-center gap-1.5">
+          <span>🌱 View Desktop App & Local Setup</span>
+        </button>
+      </div>
+
+      <button onclick="closeQuotaModal()" class="w-full py-2 text-xs text-gray-400 hover:text-white transition-colors">
+        Dismiss & Browse Loaded Results
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ AUTHENTICATED FEEDBACK MODAL ══════ -->
+<div id="feedbackModal" class="modal-backdrop hidden" style="display: none;" onclick="if(event.target===this)closeFeedbackModal()">
+  <div class="modal-card max-w-lg p-0 animate-fade-up overflow-hidden" onclick="event.stopPropagation()" style="background: #0d1117; border: 1px solid rgba(6, 182, 212, 0.4); box-shadow: 0 25px 60px rgba(0,0,0,0.85);">
+    <div class="p-5 border-b border-surface-border flex items-center justify-between bg-[#161b22] modal-header-band">
+      <div class="flex items-center gap-3">
+        <div class="w-8 h-8 rounded-lg bg-cyan-500/20 border border-cyan-500/40 flex items-center justify-center text-cyan-400 font-bold text-sm">
+          💬
+        </div>
+        <div>
+          <h3 class="text-base font-bold text-white flex items-center gap-2">
+            <span>Scientific Feedback & Evaluation</span>
+          </h3>
+          <p class="text-xs text-gray-400">Peer review and community evaluation log</p>
+        </div>
+      </div>
+      <button aria-label="Close dialog" onclick="closeFeedbackModal()" class="text-gray-400 hover:text-white text-xl p-1 leading-none">✕</button>
+    </div>
+
+    <!-- Submitter Identity Pill -->
+    <div class="px-5 py-2.5 bg-[#121822] border-b border-surface-border flex items-center justify-between text-xs">
+      <div class="flex items-center gap-2">
+        <span class="text-gray-400">Researcher:</span>
+        <span id="feedbackUserIdentity" class="font-mono text-cyan-300 font-semibold">dr.alex@stanford.edu</span>
+      </div>
+      <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/30">Verified Session</span>
+    </div>
+
+    <form id="feedbackForm" onsubmit="handleFeedbackSubmit(event)" class="p-6 space-y-4">
+      <div>
+        <label class="block text-xs font-semibold text-gray-300 mb-1">Target Evaluation Complex</label>
+        <input type="text" id="feedbackTargetComplex" readonly class="w-full px-3 py-2 rounded-lg bg-black/40 border border-surface-border text-gray-300 font-mono text-xs focus:outline-none" value="KRAS G12D (PDB: 8AFB)" />
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 mb-1">Category</label>
+          <select id="feedbackCategory" class="w-full px-3 py-2 rounded-lg bg-black/50 border border-surface-border text-white text-xs focus:outline-none focus:border-cyan-500">
+            <option value="Lead Candidates">Lead Candidates & Docking</option>
+            <option value="ESMFold Structure">ESMFold 3D Structure</option>
+            <option value="ADMET & Druggability">ADMET & Druggability</option>
+            <option value="Retrosynthesis">Retrosynthesis & OT-2</option>
+            <option value="UI & Performance">UI & Performance</option>
+            <option value="General Evaluation">General Peer Review</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-gray-300 mb-1">Scientific Quality Rating</label>
+          <select id="feedbackRating" class="w-full px-3 py-2 rounded-lg bg-black/50 border border-surface-border text-amber-300 text-xs font-bold focus:outline-none focus:border-cyan-500">
+            <option value="5">★★★★★ (5/5) Publication Grade</option>
+            <option value="4">★★★★☆ (4/5) High Confidence</option>
+            <option value="3">★★★☆☆ (3/5) Acceptable Baseline</option>
+            <option value="2">★★☆☆☆ (2/5) Needs Tuning</option>
+            <option value="1">★☆☆☆☆ (1/5) Discrepancy Found</option>
+          </select>
+        </div>
+      </div>
+
+      <div>
+        <label class="block text-xs font-semibold text-gray-300 mb-1">Scientific Observations / Peer Review Notes</label>
+        <textarea id="feedbackComments" required rows="4" placeholder="Detail your experimental observations, pose validation against crystallographic data, or suggestions for the bio-computational pipeline..." class="w-full px-3 py-2 rounded-lg bg-black/50 border border-surface-border text-white text-xs focus:outline-none focus:border-cyan-500 resize-none"></textarea>
+      </div>
+
+      <div id="feedbackFormError" class="text-xs text-red-400 hidden"></div>
+
+      <div class="flex items-center justify-between pt-2">
+        <button type="button" onclick="closeFeedbackModal()" class="px-4 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-gray-300 text-xs font-semibold">
+          Cancel
+        </button>
+        <button type="submit" id="feedbackSubmitBtn" class="px-5 py-2 rounded-lg bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white text-xs font-bold shadow-md transition-all">
+          Submit Scientific Feedback
+        </button>
+      </div>
+
+      <!-- Previous Submissions Box -->
+      <div id="feedbackHistoryContainer" class="mt-4 pt-4 border-t border-surface-border hidden">
+        <div class="text-[11px] font-semibold text-gray-400 mb-2">Your Previous Submissions:</div>
+        <div id="feedbackHistoryList" class="space-y-2 max-h-36 overflow-y-auto text-xs font-mono"></div>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ RAW RECEIPT MODAL ═════════ -->
+<div id="rawReceiptModal" class="modal-backdrop hidden" style="display: none;" onclick="if(event.target===this)closeRawReceiptModal()">
+  <div class="modal-card max-w-2xl p-0 animate-fade-up overflow-hidden" onclick="event.stopPropagation()" style="background: #0d1117; border: 1px solid rgba(16, 185, 129, 0.4); box-shadow: 0 25px 60px rgba(0,0,0,0.85);">
+    <div class="p-4 border-b border-surface-border flex items-center justify-between bg-[#161b22] modal-header-band">
+      <div class="flex items-center gap-2">
+        <span class="text-emerald-400 font-mono text-sm">🧾</span>
+        <h3 class="text-sm font-bold text-white">Execution Provenance & Raw Receipt</h3>
+      </div>
+      <button aria-label="Close raw receipt dialog" onclick="closeRawReceiptModal()" class="text-gray-400 hover:text-white text-lg p-1 leading-none">✕</button>
+    </div>
+    <div class="p-4 space-y-3">
+      <div class="flex items-center justify-between text-xs text-gray-400">
+        <span>Verifiable cryptographic execution metadata & API telemetry:</span>
+        <button type="button" id="copyRawReceiptBtn" aria-label="Copy raw receipt JSON" onclick="copyRawReceiptJson()" class="px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-emerald-400 text-xs font-mono border border-emerald-500/30 transition-colors flex items-center gap-1">
+          <span>📋</span> <span id="copyReceiptBtnText">Copy JSON</span>
+        </button>
+      </div>
+      <pre id="rawReceiptContent" class="p-3 rounded-lg bg-black/70 border border-gray-800 text-[11px] font-mono text-gray-200 overflow-x-auto max-h-[400px] select-all leading-relaxed whitespace-pre"></pre>
+      <div class="flex items-center justify-end pt-2 border-t border-surface-border">
+        <button type="button" aria-label="Close raw receipt modal footer button" onclick="closeRawReceiptModal()" class="px-4 py-1.5 rounded-lg bg-surface-elevated text-gray-200 text-xs font-semibold hover:bg-white/10">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ STATIC DEMO MODAL ════════ -->
+<div id="staticDemoModal" class="modal-backdrop hidden" style="display: none;" onclick="if(event.target===this)closeStaticDemoModal()">
+  <div class="modal-card max-w-md p-0 animate-fade-up overflow-hidden" onclick="event.stopPropagation()" style="background: #0d1117; border: 1px solid rgba(245, 158, 11, 0.4); box-shadow: 0 25px 60px rgba(0,0,0,0.85);">
+    <div class="p-4 border-b border-surface-border flex items-center justify-between bg-[#161b22] modal-header-band">
+      <div class="flex items-center gap-2">
+        <span class="text-amber-400 font-mono text-sm">⚡</span>
+        <h3 class="text-sm font-bold text-white">Static Web Preview Mode</h3>
+      </div>
+      <button aria-label="Close static demo dialog" onclick="closeStaticDemoModal()" class="text-gray-400 hover:text-white text-lg p-1 leading-none">✕</button>
+    </div>
+    <div class="p-5 space-y-4">
+      <p class="text-xs text-gray-300 leading-relaxed">
+        You are viewing the hosted GitHub Pages release. Discovery campaigns in this static environment execute through verified client-side in silico biophysical simulations.
+      </p>
+      <div class="p-3 rounded-lg bg-black/60 border border-gray-800">
+        <div class="text-[10px] text-gray-400 uppercase font-mono mb-1.5">To connect to a live NVIDIA NIM GPU backend:</div>
+        <pre class="text-[11px] font-mono text-emerald-400 bg-black/40 p-2 rounded border border-surface-border select-all overflow-x-auto whitespace-pre">uvicorn bionemo_benchmark.server.app:app --host 127.0.0.1 --port 8000</pre>
+        <div class="text-[10px] text-gray-500 mt-1 font-mono">or run: <code class="text-gray-300">python serve_cockpit.py</code></div>
+      </div>
+      <div class="flex items-center justify-end gap-2 pt-2 border-t border-surface-border">
+        <button type="button" aria-label="Close static demo modal footer" onclick="closeStaticDemoModal()" class="px-4 py-1.5 rounded-lg bg-surface-elevated text-gray-200 text-xs font-semibold hover:bg-white/10">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="./js/theme.js?v=20261121"></script>
+<script type="module" src="./js/data/target-presets.js?v=20261121"></script>
+<script type="module" src="./js/cockpit/main.js?v=20261121"></script>
+</body>
+</html>

@@ -1,0 +1,470 @@
+# AlphaFold3 논문 재현과 변이 감별력 검정 — BlindSpot
+
+알츠하이머 인과 단백질의 AlphaFold3 구조 예측(Yao et al. 2024)을 재현하고,
+예측 모델이 미스센스 변이를 실제로 감별하는지 음성 대조군과 순열검정으로 검정한 프로젝트.
+
+> 논문은 알츠하이머 인과 단백질의 미스센스 변이가 **3D 구조를 바꾼다**고 보고했다.
+> 동일 조건으로 재현해 음성 대조군과 비교한 결과, **논문이 대표 사례로 실은 CD33의 구조 변화는
+> 모델 자체의 변동과 구분되지 않았다**(3개 중 1개). PILRA는 뚜렷이 구분됐고, TREM2는 지표에 따라 판정이 갈렸다.
+> 결합 예측 모델(Boltz-2)로 확장하면 **두 복합체 모두에서 변이를 감별하지 못했다.**
+> → 구조 예측으로 변이 효과를 논하기 전에 **모델의 변이 감별력을 먼저 검정해야 한다.**
+
+**원논문** Yao, M. *et al.* (2024) *Deciphering proteins in Alzheimer's disease: A new Mendelian
+randomization method integrated with AlphaFold3 for 3D structure prediction.*
+**Cell Genomics 4, 100700.** [`10.1016/j.xgen.2024.100700`](https://doi.org/10.1016/j.xgen.2024.100700)
+
+**▶ 데모** https://qkrvlfg123.github.io/AD-AlphaFold3-Reproduction/app/ — 본 검정을 웹에서 실행
+(이 저장소의 `main`에서 배포. 2×2 교차검증 매트릭스와 순열검정이 반영된 버전)
+
+
+### 이 저장소에서 확인할 수 있는 것
+
+| | 내용 | 위치 |
+|---|---|---|
+| **A. 논문 조사** | 선행 연구 한계·차별성 정리, 인용 문헌 10편 | [선행 연구의 한계](#a--선행-연구의-한계와-본-연구의-차별성-literature-review) · [재현 범위](#a--재현-범위--실행한-것과-인용한-것) |
+| **B. 연구** | 가설 설정 · 음성 대조군 · 통계 검정 | [가설과 검정](#b--가설과-검정-research--analysis) · [결과](#결과) |
+| **C. 구현** | Python 스크립트 12개 · 재현 절차 · 예측 구조 60개 | [재현 방법](#c--재현-방법-implementation) · [`src/`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/src) · [`data/`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/data) |
+| **C. 구현** | **웹 애플리케이션** — UniProt 실시간 검증 · 브라우저 통계 재계산 | [데모](https://qkrvlfg123.github.io/AD-AlphaFold3-Reproduction/app/) · [`app/`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/app) |
+
+### 팀 구성 · 역할 (2인 팀)
+
+| 구성원 | 맡은 파트 | 주요 위치 |
+|---|---|---|
+| **qkrvlfg123 (본인)** | **Boltz-2를 두 번째 복합체(PILRA-NPDC1)로 확장** · **구조 축 × 결합 축 2×2 교차검증 매트릭스 구축** · **유의성 검정을 음성 대조군 기반 순열검정으로 재설계** (Python·JS 동일 알고리즘으로 통일) | [`src/make_boltz_npdc1_inputs.py`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/src/make_boltz_npdc1_inputs.py) · [`src/detectability.py`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/src/detectability.py) · [`src/analyze_boltz.py`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/src/analyze_boltz.py) (PILRA 축·순열검정 부분) · [`inputs/boltz/README_NPDC1.md`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/inputs/boltz/README_NPDC1.md) · [`app/app.js`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/app/app.js) (2×2 매트릭스·순열검정 부분) · [`docs/PROGRESS.md`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/docs/PROGRESS.md) · [`tests/`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/tests) · [교차검증 결과](#4-교차검증--22-종합-판정) · [고찰](#고찰--22-매트릭스의-해석) |
+| [mimm-112](https://github.com/mimm-112) | AF3 재현 · Mann–Whitney 검정 · TREM2+Aβ42 Boltz-2 · BlindSpot 웹앱 · 슬라이드 | [`src/`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/src) (AF3 파이프라인) · [`src/make_boltz_inputs.py`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/src/make_boltz_inputs.py) · [`notebooks/02_boltz_trem2_ab42.ipynb`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/notebooks/02_boltz_trem2_ab42.ipynb) · [`app/`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/app) · [`app/slides/`](https://github.com/qkrvlfg123/AD-AlphaFold3-Reproduction/blob/HEAD/app/slides) |
+
+---
+
+## B · 가설과 검정 *(Research & Analysis)*
+
+| | 내용 |
+|---|---|
+| **귀무가설 H₀** | 야생형과 변이형의 예측 구조 차이는 **동일 서열에서 나온 모델들 사이의 변동과 같다** |
+| **대립가설 H₁** | 변이형의 구조 차이가 그 변동을 **초과한다** |
+| **음성 대조군** | **동일 서열에서 나온 모델 5개의 쌍** (변이 없음 → 차이는 모델 변동뿐) |
+| **처리군** | 야생형 × 변이형 구조 쌍 |
+| **검정** | 라벨 순열검정 (단측), α = 0.05 — 두 축 공통 |
+| **통제 변수** | 동일 도구·동일 서열 구간·시드 고정·동일 샘플 수 |
+
+> **구조 축 음성 대조군의 범위** — AlphaFold Server 작업은 서열당 **1회, 시드 1개**로 실행했다
+> (`data/alphafold3/*/fold_*_job_request.json`의 `modelSeeds: ["1"]`).
+> 따라서 구조 축의 음성 대조군 쌍은 **한 작업 안에서 나온 확산 표본 5개 사이의 변동**이고,
+> 처리군 쌍은 항상 **서로 다른 두 작업**(야생형 작업 × 변이형 작업) 사이의 차이다.
+> 작업 간·시드 간 변동은 음성 대조군에 포함되지 않아 변이 효과와 분리되지 않는다.
+> 차이가 작은 TREM2(0.09 Å)는 이 한계의 영향을 가장 크게 받는다.
+> 결합 축(Boltz-2)은 시드 2~3개로 실행해 시드 간 쌍이 음성 대조군에 들어 있다.
+
+---
+
+## 결과
+
+### 1. 논문 재현 — CD33 pTM 일치
+
+| 단백질 | 변이 | 재현 pTM | 논문 보고 pTM |
+|---|---|---|---|
+| **CD33** | R69G | **0.59–0.60** | **0.6** ✅ |
+| PILRA | R78G | 0.44–0.46 | 미보고 |
+| TREM2 | R62H | 0.52–0.54 | 미보고 |
+
+논문은 AlphaFold 방법을 STAR Methods에 기술하지 않았다. 입력 구간이 명시되지 않아
+두 근거로 **전장 서열**임을 복원했다 — (i) 논문 Fig 4B·S5 원본에 무질서 꼬리가 존재,
+(ii) 전장일 때만 pTM 0.6이 재현됨.
+
+논문과 직접 비교할 수 있는 값은 CD33의 pTM 하나(반올림된 0.6)뿐이고, 입력 구간도 이 값이 맞도록 고른 것이다.
+따라서 이 절은 "같은 조건을 복원했다"는 근거이지 논문 결과 전체의 재현을 뜻하지 않는다.
+
+### 2. 구조 축 — 3개 중 1개는 노이즈와 구분 불가
+
+변이 잔기 8 Å 이내 Cα 국소 RMSD, Ig 도메인 정렬 후 재정렬 없이 측정.
+
+| 단백질 | 음성 대조군 (동일 서열, 20쌍) | 처리군 (WT×변이형, 25쌍) | 비 | p | 판정 |
+|---|---|---|---|---|---|
+| **CD33** | 0.124 Å | **0.120 Å** | 0.97× | **0.65** | **H₀ 기각 실패** |
+| TREM2 | 0.168 Å | 0.257 Å | 1.53× | 0.0079 | H₀ 기각 (차이 0.09 Å, **지표 의존** — 아래 표) |
+| PILRA | 0.100 Å | 0.995 Å | 9.97× | 0.0079 | H₀ 기각 |
+
+**CD33은 논문이 본문 Figure 4B에 대표로 실은 사례다.**
+
+**지표를 바꿨을 때** — 같은 구조 쌍을 Ig 도메인 전체 RMSD(`results/rmsd_pairs.csv`의 `rmsd_domain`)로 다시 검정했다.
+
+| 단백질 | 음성 대조군 | 처리군 | 비 | p | 국소 지표와 비교 |
+|---|---|---|---|---|---|
+| CD33 | 0.117 Å | 0.107 Å | 0.92× | 0.56 | 같음 (기각 실패) |
+| **TREM2** | 0.290 Å | 0.262 Å | 0.90× | **0.64** | **달라짐** (국소 지표에서는 기각) |
+| PILRA | 0.114 Å | 0.327 Å | 2.88× | 0.0079 | 같음 (기각) |
+
+PILRA는 두 지표 모두에서 구분되고 CD33은 두 지표 모두에서 구분되지 않는다.
+**TREM2는 변이 주변 8 Å 국소 지표에서만 기각된다.** R62H 모델 하나(4번)가 나머지와 1 Å 이상 떨어져 있어
+음성 대조군과 처리군 양쪽에 큰 값이 섞여 있고, 도메인 전체로 보면 차이가 사라진다.
+TREM2의 "기각"은 국소 지표를 미리 정했다는 전제에서만 성립하는 결과로 읽어야 한다.
+
+**다중 비교** — 구조 축 3개와 결합 축 2개, 모두 5개의 검정을 했다. Bonferroni 보정 기준은 0.05 / 5 = 0.01이고,
+기각된 두 사례의 p(0.0079)는 이 기준도 통과한다.
+
+> **p 값에 관하여** — 쌍은 서로 독립이 아니다. 같은 구조가 여러 쌍에 재사용되므로
+> Mann–Whitney 의 p 는 과소평가된다(PILRA 는 6×10⁻⁹ 로 나왔다). 위 표는 라벨을 뒤섞어
+> 얻은 경험 분포로 교정한 **순열검정** 값이다. **판정은 세 사례 모두 바뀌지 않았다.**
+>
+> 조건당 모델이 5개면 전수 분할이 126개이므로 **도달 가능한 최소 p 는 1/126 = 0.0079** 다.
+> TREM2·PILRA 는 그 바닥값에 붙어 있다 — 더 작은 p 를 주장하려면 모델 수를 늘려야 한다.
+
+### 3. 결합 축 — Boltz-2도 감별 실패
+
+두 복합체를 **구조 축과 완전히 같은 설계**로 검정했고 **둘 다 감별하지 못했다.**
+
+**결합 파트너 선정 기준.** 결합 축 검증은 아무 복합체에나 적용할 수 없다.
+모델이 감별에 성공했는지 실패했는지 판단하려면 **대조할 실험 근거**가 있어야 하므로,
+"이 변이가 이 결합을 바꾼다"고 실험 문헌이 이미 보고한 사례에만 적용할 수 있다.
+그 조건을 만족하는 두 쌍을 골랐다.
+
+| 복합체 | 실험 근거 | 파트너 유형 |
+|---|---|---|
+| **TREM2 + Aβ42** | R62H 가 Aβ 결합을 감소시킴 (Zhao 2018 · Zhong 2018) | 펩타이드 (APP 672–713) |
+| **PILRA + NPDC1** | G78R 이 NPDC1 을 포함한 리간드 결합을 50% 이상 감소시킴 (Rathore 2018) | 단백질 (세포외 도메인) |
+
+두 파트너 모두 단백질·펩타이드라 Boltz-2 의 단백질–단백질 예측으로 다룰 수 있다.
+
+**CD33 을 결합 축에서 제외한 이유.** CD33 의 결합 파트너는 **시알산(당)** 이다.
+본 저장소의 결합 축은 **단백질–단백질 예측 설계**이므로 이 조합은 다룰 수 없어
+결합 축에서 제외했다. (Boltz-2 자체는 SMILES·CCD 코드로 당·저분자를 입력할 수 있으나
+본 저장소의 설계 범위 밖이다.) 공교롭게도 이는 PILRA 결과의 한계와 같은 뿌리다 —
+당이 매개하는 결합은 이 설계의 사각지대다([3-2](#3-2-pilra--npdc1) 참조).
+
+ipTM 은 구조당 스칼라이므로 쌍 차이 `|ipTM_i − ipTM_j|` 로 바꿔 쌍 설계에 맞춘다.
+같은 대립형질 안의 쌍 = 모델 진동(음성 대조군), 대립형질 간 쌍 = 변이 신호.
+
+#### 3-1. TREM2 + Aβ42
+
+TREM2 Ig 도메인(19–130) + Aβ42(APP 672–713) 복합체, 시드 3 × 모델 5 = 30 구조.
+
+| 항목 | 음성 대조군 (같은 대립형질 쌍, 210쌍) | 처리군 (대립형질 간 쌍, 225쌍) | 비 | p | 판정 |
+|---|---|---|---|---|---|
+| **ipTM 쌍 차이** | 0.046 | 0.043 | **0.95×** | **0.80** | 구분 안 됨 |
+
+원시 ipTM 중앙값은 WT 0.851 / R62H 0.824 (인터페이스 pLDDT 0.791 / 0.787, pTM 0.935 / 0.923).
+복합체 예측 자체는 성공했다(ipTM 0.85는 높은 값). **변이 감별력만 없다.**
+
+#### 3-2. PILRA + NPDC1
+
+PILRA Ig 도메인(32–150) + NPDC1 세포외 도메인(35–181) 복합체, 시드 2 × 모델 5 = 20 구조.
+
+| 항목 | 음성 대조군 (같은 대립형질 쌍, 90쌍) | 처리군 (대립형질 간 쌍, 100쌍) | 비 | p | 판정 |
+|---|---|---|---|---|---|
+| **ipTM 쌍 차이** | 0.058 | 0.046 | **0.80×** | **0.97** | 구분 안 됨 |
+
+원시 ipTM 중앙값은 G78 0.909 / R78 0.894.
+**비가 1.0 미만**이다 — 변이 쌍 차이가 같은 서열 쌍 차이보다도 작다.
+
+- **변이 방향** — UniProt 정본(Q9UKJ1)이 **이미 R78**이라 정상형이 G78이다.
+  문헌 표기 `G78R`과 방향이 반대이므로 WT/MUT 대신 잔기 이름으로 표기했다.
+- **p 값 표기** — 표의 0.97은 **라벨 순열검정**(고정 시드 표본 20,000회) 값이다.
+  같은 자료에 옛 방식을 적용하면 그룹 직접 비교 0.85(정규근사) / 0.8534(정확검정),
+  쌍 차이 + Mann–Whitney 0.77 이 나온다. **네 방식 모두 판정은 변동성 내로 동일**하고,
+  순열검정이 쌍의 비독립성까지 교정한 가장 보수적인 값이다.
+
+- **중앙값 차의 부호가 표본을 늘리자 뒤집혔다** — n = 5에서는 R78이 G78보다 높았고(+0.017),
+  n = 10에서는 G78이 R78보다 높다(−0.015). 방향조차 표본에 따라 바뀐다는 것은
+  **이 차이가 신호가 아니라 노이즈라는 증거**다.
+- 본 저장소에는 PILRA 복합체의 **ipTM 수치만 수록**했고 구조 파일(.cif)은 포함하지 않았다.
+
+**⚠️ 이 결과는 글리칸 부재 때문일 수 있다 (추정).**
+PILRA의 리간드 인식은 **시알산 매개**이고 78번 잔기가 그 시알산 결합 부위에 있다.
+그런데 Boltz-2 단백질–단백질 예측에는 **글리칸이 없다.**
+따라서 이 미감별이 **모델의 감별 한계** 때문인지 **글리칸이 빠졌기 때문**인지
+이 결과만으로는 구분할 수 없다. 실험 문헌은 50% 이상의 결합 감소를 보고한다
+(Rathore N, et al. 2018, *PLoS Genet* 14(11):e1007427).
+
+### 4. 교차검증 — 2×2 종합 판정
+
+두 축의 판정을 **합성하지 않고 교차 배치**한다. 두 축은 이제 같은 음성 대조군 설계와
+같은 귀무가설(단측: 신호 쌍 > 노이즈 쌍)을 쓰지만, 측정 대상이 구조 편차와 결합 신뢰도로
+서로 다르므로 하나의 점수로 합치지 않는다.
+
+| | 결합 축 — 변동성 초과 | 결합 축 — 변동성 내 |
+|---|---|---|
+| **구조 축 — 변동성 초과** | 해당 사례 없음 | **TREM2 R62H** (구조 0.0079, 국소 지표 기준 · 결합 0.80) · **PILRA R78G** (구조 0.0079 · 결합 0.97) |
+| **구조 축 — 변동성 내** | 해당 사례 없음 | 해당 사례 없음 |
+
+**결합 축 미측정** — CD33 R69G (결합 파트너가 시알산이라 단백질–단백질 예측 설계 범위 밖, [3절](#3-결합-축--boltz-2도-감별-실패) 참조).
+미측정은 미감별과 다른 상태이므로 매트릭스에 배치하지 않았다.
+
+현재 채워진 칸은 **"구조는 초과, 결합은 미감별"** 하나다.
+두 사례 모두 구조 편차는 음성 대조군을 넘었으나 결합 신뢰도 차이는 넘지 못했다.
+TREM2는 도메인 전체 지표로는 구조 축도 변동성 내이므로, 이 칸에 확실히 놓이는 사례는 PILRA 하나다.
+웹 애플리케이션의 리포트 화면(`?s=s5`)에서 같은 매트릭스를 확인할 수 있다.
+
+---
+
+## 고찰 — 2×2 매트릭스의 해석
+
+이 표는 "변이가 중요한가"를 답하지 않는다. 대신 **어느 축을 예측 결과로 쓰고
+어느 축을 실험으로 확인할지** 순서를 정하는 데 쓸 수 있다.
+
+### 각 칸이 서로 다른 다음 단계를 시사한다
+
+| 칸 | 읽는 법 | 제안할 수 있는 다음 단계 |
+|---|---|---|
+| **구조 초과 + 결합 초과** | 두 축이 모두 변이를 감지했다 | 두 예측 모두 근거로 쓸 수 있는 강한 후보. 실험은 검증 목적 |
+| **구조 초과 + 결합 내** | 구조는 감지, 결합은 판단 보류 | 구조는 예측을 활용하고 **결합은 실험으로 확인** |
+| **구조 내 + 결합 초과** | 결합은 감지, 구조는 판단 보류 | 결합은 예측을 활용하고 **구조는 실험으로 확인** |
+| **둘 다 변동성 내** | 어느 축도 근거가 되지 못한다 | 계산이 아닌 **실험적 접근**이 필요한 사례로 분류 |
+
+같은 "판정 불가"라도 어느 축에서 막혔는지에 따라 다음에 할 일이 달라진다는 점이
+이 배치의 쓸모라고 할 수 있다. 두 축을 하나의 점수로 합쳤다면 이 구분은 사라진다.
+
+### 축을 늘리는 것보다 각 축의 감별력을 먼저 재는 편이 순서일 수 있다
+
+이번에 결합 축(Boltz-2)을 새로 붙였지만 두 복합체 모두 변이를 감별하지 못했다
+(신호/노이즈 비 TREM2 0.95× · PILRA 0.80× — 둘 다 1.0 미만).
+**축을 하나 더한다고 답이 하나 늘지는 않았다.**
+
+이는 새 모델을 파이프라인에 추가하기 전에 **그 모델이 해당 변이를 감지할 수 있는지
+먼저 재야 한다**는 것을 시사한다. 감별력이 없는 축은 칸을 하나 더 만들 뿐
+판단 근거를 더하지 못한다. 본 저장소가 두 축에 같은 음성 대조군 설계와 같은 검정을
+적용한 이유이기도 하다.
+
+### ⚠️ 이번 결과를 뒤집어 읽지 않도록
+
+현재 두 사례가 모두 **"구조 초과 + 결합 내"** 한 칸에 들어가 있다.
+이 배치만 보면 "구조는 변했고 결합은 변하지 않았다"로 읽기 쉬우나, **그렇게 읽으면 안 된다.**
+
+**첫째, 결합 축의 "변동성 내"는 결합이 변하지 않았다는 뜻이 아니다.**
+그것은 **Boltz-2 가 그 변화를 보지 못했다**는 뜻이다. 미감별은 대상에 대한 진술이 아니라
+모델에 대한 진술이다.
+
+**둘째, 실험 문헌은 오히려 반대 방향을 보고한다.**
+
+| 사례 | 실험 문헌의 보고 | 본 모델의 판정 |
+|---|---|---|
+| TREM2 R62H | AD 변이가 **Aβ 결합을 감소**시킴 (Zhao 2018 · Zhong 2018) | 감별 실패 (p = 0.80) |
+| PILRA R78G | G78R 이 **리간드 결합을 50% 이상 감소**시킴 (Rathore 2018) | 감별 실패 (p = 0.97) |
+
+즉 두 사례 모두 **결합이 실제로 변한다고 보고된 사례**인데 모델이 그것을 잡아내지 못했다.
+PILRA 는 미감별의 구체적 사유까지 짐작할 수 있다 — 리간드 인식이 시알산 매개인데
+Boltz-2 단백질–단백질 예측에는 글리칸이 없다(추정, [3-2](#3-2-pilra--npdc1) 참조).
+
+**셋째, 따라서 이 칸이 제안하는 것은 "결합 실험 위주로 하라"가 아니다.**
+**"결합은 예측을 근거로 쓰지 말고 실험으로 확인하라"** 에 가깝다.
+문헌이 이미 효과를 보고한 사례에서 모델이 감별에 실패했다면, 그 축의 실험 우선순위는
+낮아지는 것이 아니라 **오히려 올라간다**고 읽는 편이 타당할 수 있다.
+
+> 다만 현재 채워진 칸이 하나뿐이고 사례도 둘이므로, 위 해석은 이 표본에서
+> 도출한 제안이며 일반화하기에는 이르다.
+
+---
+
+## A · 선행 연구의 한계와 본 연구의 차별성 *(Literature Review)*
+
+| | 선행 연구 | 본 연구 |
+|---|---|---|
+| 원논문 (Yao 2024) | WT 1개 vs 변이형 1개를 겹쳐 "구조가 변했다"고 기술 | **음성 대조군을 두고 통계 검정** |
+| AlphaFold 한계 (Buel 2022) | AF2가 미스센스 변이에 둔감함을 지적 | **정량화**하여 단백질별 판정 |
+| 통계 처리 | 쌍 비교를 독립 표본처럼 검정 | **라벨 순열검정으로 쌍 비독립성 교정** |
+| Boltz-2 한계 (Bret 2026) | affinity가 결합부위 변이에 둔감함을 보고 | **AD 표적에서 독립 확인** |
+| 실험 문헌 (Zhao 2018 등) | R62H가 Aβ 결합을 감소시킴 | 두 예측 모델 모두 이를 **못 잡음**을 확인 |
+| 실험 문헌 (Rathore 2018) | PILRA G78R이 리간드 결합을 50% 이상 감소시킴 | 예측 모델이 **못 잡음** — 글리칸 부재로 추정 |
+
+**본 연구의 기여**: 구조·결합 두 축에서 동일한 검정 프로토콜을 적용해,
+예측 모델의 **변이 감별력 자체를 측정하는 절차**를 제시했다.
+
+---
+
+## A · 재현 범위 — 실행한 것과 인용한 것
+
+원논문 파이프라인은 **① MR-SPI 통계 → ② AlphaFold3 구조 예측** 두 단계다.
+본 저장소는 **②만 직접 실행**했고 ①은 논문 결과를 인용했다.
+
+| 단계 | 본 저장소 | 사유 |
+|---|---|---|
+| ① MR-SPI (인과 단백질 식별) | **미실행 · 논문 결과 인용** | 입력 자료가 통제접근 |
+| ② AlphaFold3 (구조 예측) | **직접 실행 + 검정 추가** | 웹서버 무료 공개 |
+| ③ Boltz-2 (결합 예측) | **직접 실행** — 본 저장소의 확장 | MIT 라이선스 |
+
+### ① 을 실행하지 않은 이유
+
+MR-SPI 자체는 **오픈소스로 공개되어 있어 코드 접근에는 제약이 없다.**
+실행을 막는 것은 코드가 아니라 **입력 데이터의 접근 조건**이다.
+
+| 필요 자원 | 공개 상태 | 제약 |
+|---|---|---|
+| **MR-SPI R 패키지** | 공개 — [GitHub `MinhaoYaooo/MR-SPI`](https://github.com/MinhaoYaooo/MR-SPI) · [Zenodo `10.5281/zenodo.14036275`](https://doi.org/10.5281/zenodo.14036275) | 없음 |
+| AD GWAS 요약통계 (Jansen 2019) | [공개 다운로드](https://ctg.cncr.nl/software/summary_statistics) | 대용량 |
+| **UKB-PPP pGWAS 요약통계** | [Synapse `syn51365301`](https://www.synapse.org/Synapse:syn51365301) | **통제접근(controlled access) — 별도 신청·승인 필요** |
+
+→ UKB-PPP는 신청·승인 절차가 필요한 통제접근 자원이고 규모도 크다.
+  발표 일정 내 확보가 불가능하여 **①은 논문 보고값을 입력으로 사용**했다.
+  즉 7개 인과 단백질 목록과 인과효과 방향은 **본 저장소의 결과가 아니라 주어진 전제**다.
+
+> **표기 원칙** — 본 저장소는 MR-SPI를 구현하거나 실행한 바 없다.
+> 위 링크는 원저자 공개 자원에 대한 **인용**이며, 재현을 원하는 사람을 위한 경로 안내다.
+
+---
+
+## C · 웹 애플리케이션 — BlindSpot
+
+**AlphaFold3 · Boltz-2 기반 미스센스 변이 구조 예측 감별력 검정 플랫폼**
+
+본 검정 절차를 브라우저에서 실행하는 정적 애플리케이션.
+**https://qkrvlfg123.github.io/AD-AlphaFold3-Reproduction/app/**
+
+| 기능 | 상태 |
+|---|---|
+| UniProt 조회 및 잔기 대조 검증 | **실동작 · 임의 accession** |
+| 변이 서열 생성 · 도메인 자동 절단 | 실동작 |
+| 입력 파일 배포 (FASTA · AF Server JSON · Boltz YAML) | 실동작 |
+| 감별력 검정 재계산 (라벨 순열검정) | 실동작 — 원자료 CSV에서 브라우저가 계산 |
+| 3D 구조 뷰어 (Mol\*) | 실동작 — WebGL 미지원 시 사전 렌더 폴백 |
+| 구조 예측 실행 | 미구현 (GPU 필요) |
+
+검증 로직은 `src/sequences.py` 의 `assert` 규칙을 이식한 것으로,
+`Q9UKJ1` + `G78R` 입력 시 역방향 오류를 감지하고 `R78G` 를 제시한다.
+
+서버가 필요 없으나 `file://` 로 열면 CORS 로 UniProt 조회가 차단된다.
+로컬 실행은 `cd app && python3 -m http.server 8899`.
+
+---
+
+## C · 재현 방법 *(Implementation)*
+
+### 환경
+
+```bash
+python3 -m pip install -r requirements.txt
+conda create -n pymol -c conda-forge python=3.11 pymol-open-source -y   # RMSD·렌더링용
+```
+
+### 실행 순서
+
+```bash
+# 1. 입력 서열 생성 (UniProt 조회 + 잔기 번호 assert 검증)
+python3 src/sequences.py
+
+# 2. AlphaFold Server 업로드용 JSON 생성
+python3 src/make_af_jobs.py
+#    → alphafoldserver.com 에서 inputs/af_jobs/af_jobs_A_full_seed1.json 업로드
+#    → 결과를 folds_*/ 로 내려받는다. 없으면 3~5단계는 저장소의 data/alphafold3/ 정리본을 읽는다
+
+# 3. 신뢰도 집계
+python3 src/collect_confidence.py
+
+# 4. RMSD 쌍 계산 (PyMOL 환경)
+conda run -n pymol python src/rmsd_analysis.py
+
+# 5. 논문 스타일 그림 + 슬라이드 표/차트
+conda run -n pymol python src/pymol_render.py
+python3 src/compose_figure.py
+python3 src/make_slide_tables.py
+python3 src/make_slide_charts.py
+
+# 6. Boltz-2 확장 (Colab T4) — notebooks/02_boltz_trem2_ab42.ipynb
+python3 src/make_boltz_inputs.py         # TREM2 ± Aβ42
+python3 src/make_boltz_npdc1_inputs.py   # PILRA ± NPDC1
+python3 src/analyze_boltz.py
+
+# 7. 웹 애플리케이션 로컬 실행
+cd app && python3 -m http.server 8899   # → http://localhost:8899
+```
+
+### 검정 엔진 테스트
+
+```bash
+python3 tests/test_detectability.py     # 표준 라이브러리만 사용, 9개 테스트
+```
+
+`results/`의 원자료에서 위 결과 표의 값(노이즈·신호 중앙값, 비, 순열 p, 판정)이 그대로 재현되는지 확인하고,
+양성·음성 대조, 라벨 교환 불변성, 전수 열거와 표본 순열의 일치를 함께 검사한다.
+
+### 재현성 장치
+
+- **잔기 번호 `assert` 강제 검증** — UniProt 서열 버전이 바뀌면 즉시 중단 (`src/sequences.py`)
+- **시드 고정** — AF Server / Boltz-2 모두 시드를 명시하고 기록
+- **매니페스트 CSV** — 모든 입력 서열의 구간·길이·변이 위치를 기록
+- **이어달리기** — 이미 끝난 작업은 건너뛰므로 세션이 끊겨도 재개 가능
+
+---
+
+## C · 저장소 구조
+
+```
+src/
+  detectability.py        감별력 검정 엔진 (음성 대조군 쌍 설계 + 라벨 순열검정)
+  sequences.py            UniProt 조회 · 변이 적용 · 잔기 번호 검증
+  make_af_jobs.py         AlphaFold Server 업로드용 JSON 생성
+  collect_confidence.py   pTM · pLDDT 집계 (mmCIF 파서 자체 구현)
+  rmsd_analysis.py        모델 쌍별 RMSD 135개 계산 (PyMOL)
+  pymol_render.py         논문 Fig 4B · S5 스타일 렌더링
+  compose_figure.py       논문 레이아웃으로 합성
+  make_slide_tables.py    슬라이드용 표 생성 + 통계 검정
+  make_slide_charts.py    노이즈/신호 분포 차트
+  make_boltz_inputs.py    Boltz-2 입력 YAML 생성 (TREM2 ± Aβ42)
+  make_boltz_npdc1_inputs.py  Boltz-2 입력 YAML 생성 (PILRA ± NPDC1)
+  analyze_boltz.py        ipTM 집계 + 검정 (타 사례 행은 보존)
+
+tests/
+  test_detectability.py   검정 엔진 회귀 테스트 (README 결과 표 재현 확인)
+
+notebooks/
+  02_boltz_trem2_ab42.ipynb   Colab T4용 Boltz-2 실행 노트북
+
+app/        BlindSpot 웹 애플리케이션 (정적 배포)
+  index.html              5화면 UI
+  app.js                  UniProt 검증 · 라벨 순열검정 · Mol* 뷰어
+  data/                   원자료 CSV · 구조 파일 · 폴백 이미지
+
+inputs/     FASTA · AF Server JSON · Boltz YAML
+data/       예측 구조 60개 + 신뢰도 JSON (MSA·PAE는 재생성 가능하므로 제외)
+results/    집계 CSV · 통계 요약 · 슬라이드 표
+figures/    논문 재현 그림 · 분석 차트
+docs/       작업 기록 (교차검증 매트릭스 설계 과정)
+```
+
+---
+
+## 사용 도구
+
+| 도구 | 용도 | 라이선스 |
+|---|---|---|
+| [AlphaFold Server (AF3)](https://alphafoldserver.com) | 구조 예측 (논문과 동일) | 비영리 한정 |
+| [Boltz-2](https://github.com/jwohlwend/boltz) 2.2.1 | 복합체·결합 예측 | MIT |
+| PyMOL 3.1.0 (open-source) | 정렬 · RMSD · 렌더링 | 오픈소스 |
+| SciPy · pandas · matplotlib | 통계 · 시각화 | BSD |
+
+> **라이선스 주의** — AlphaFold Server 약관은 개인·비영리 조직만 허용한다.
+> 본 저장소는 학술 재현 목적이다. 상업적 확장은 MIT 라이선스인 Boltz-2 기반이어야 한다.
+
+---
+
+## 참고 문헌
+
+1. Yao, M. *et al.* (2024) *Cell Genomics* **4**, 100700. — 재현 대상
+2. Abramson, J. *et al.* (2024) *Nature* **630**, 493. — AlphaFold3
+3. Passaro, S. *et al.* (2025) — Boltz-2
+4. **Buel, G. & Walters, K.** (2022) *Nat Struct Mol Biol* — *Can AlphaFold2 predict the impact of missense mutations on structure?*
+5. **Bret, G.** *et al.* (2026) *J Chem Inf Model* — Boltz-2의 결합부위 변이 둔감성
+6. Zhao, Y. *et al.* (2018) *Neuron* **97**, 1023. — TREM2가 Aβ 올리고머에 결합, AD 변이가 결합 감소
+7. Zhong, L. *et al.* (2018) *Mol Neurodegener* — oAβ1-42 결합, 필수 잔기 31–91
+8. Yeh, F. *et al.* (2016) *Neuron* **91**, 328. — TREM2–APOE/CLU/LDL 결합
+9. Pillai, J. *et al.* (2025) *Comput Struct Biotechnol J* — TREM2 R62H의 구조 영향이 R47H보다 작음
+10. Jansen, I. *et al.* (2019) *Nat Genet* **51**, 404. — AD GWAS
+
+데이터베이스: UniProt `P20138` `Q9UKJ1` `Q9NZC2` `P05067` · RCSB PDB `4NFB` `3WUZ` `5UD7` `5UD8`
+
+---
+
+## 한계
+
+- 예측 대 예측 비교이며 **실험적 검증은 없다**
+- "차이가 없다"는 **결합이 변하지 않는다는 뜻이 아니라 모델이 감별하지 못했다**는 뜻이다
+- ipTM은 결합력(affinity)이 아니라 인터페이스 신뢰도다 — Boltz-2 affinity head는 저분자 전용
+- MR-SPI 통계 파트는 재현하지 않고 논문 값을 인용했다 (UKB-PPP는 통제접근 자원)
+
+## 향후 개선 과제
+- **VCF 일괄 입력.** 지금은 연구자가 변이를 하나씩 직접 입력한다. VCF 파일을 업로드하면
+  주요 미스센스 변이를 추출해 입력란을 자동으로 채우는 기능을 추가한다.
+- **결합 축 검증 사례 확대.** 이번에 결합 축 검증에 쓸 수 있었던 것은 변이가 결합에 미치는
+  영향을 실험으로 보고한 문헌이 있는 단백질(TREM2 · PILRA) 뿐이었다. 감별력을 재려면
+  "모델이 무엇을 놓쳤는지" 대조할 실험값이 있어야 하는데, 그런 **결합 실험 데이터 자체가
+  아직 드물다.** 데이터가 축적되면 더 많은 사례에서 감별력을 확인할 수 있고, 나아가
+  **어떤 종류의 결합 변이를 예측 모델이 잘 잡고 어떤 것을 놓치는지** 패턴을 파악하는
+  방향으로 발전시킬 수 있다. 예컨대 이번 PILRA 사례는 글리칸이 매개하는 결합에서
+  모델이 취약할 수 있음을 시사하는데, 같은 유형의 사례가 모이면 이를 검증할 수 있다.

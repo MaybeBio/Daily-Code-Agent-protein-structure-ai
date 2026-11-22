@@ -1,0 +1,486 @@
+import { newAccum, type Pair } from '../force/types';
+import type { NeighList } from '../neighbor';
+import type { TwoPassPair } from './threadedPairs';
+
+/** The style factories a worker builds its copy with (cpu/threadedPairFactories.ts: the tests run workers in-process with them). */
+export type PairFactories = Readonly<Record<string, () => Pair>>;
+/** Loads a style's factory on demand (cpu/threadedPairLoaders.ts: the pair worker loads only the styles it is sent). */
+export type PairLoader = (name: string, url?: string) => Promise<(() => Pair) | null>;
+import { halfBinsPairs, halfBinsPairsSpecial, type HalfBins } from './neighborKernel';
+import { PPPM_PARAMS, pppmField, pppmSpread, pppmWeights, readPppmParams, weightScratch } from '../force/kspace/pppmKernel';
+import { fftPassLines } from '../force/fft';
+
+/*
+ * The worker side of the shared-memory pair threads (pairThreads.ts) and the helpers both sides
+ * share. Kept apart from pairThreads.ts so the worker bundle (src/workers/pair.worker.ts) does not
+ * contain the code that spawns it.
+ */
+
+/** The part of a Worker the pool uses (tests pass in-process stand-ins). */
+export interface PairWorkerLike {
+  postMessage(msg: unknown): void;
+  onmessage: ((ev: MessageEvent) => void) | null;
+  terminate(): void;
+}
+
+export type PairThreadMessage =
+  | { type: 'init'; ctl: SharedArrayBuffer; index: number }
+  | { type: 'buffers'; x: SharedArrayBuffer; t: SharedArrayBuffer; q: SharedArrayBuffer; numneigh: SharedArrayBuffer; firstneigh: SharedArrayBuffer; neighbors: SharedArrayBuffer; f: SharedArrayBuffer; fs: SharedArrayBuffer[]; acc: SharedArrayBuffer; chunks: SharedArrayBuffer; tags: SharedArrayBuffer }
+  | { type: 'pair'; name: string; fields: Record<string, unknown>; url?: string; slot?: number }
+  /** a ThreadExtras style's shared arrays: the inputs, and this worker's per-atom outputs and global sums */
+  | { type: 'xbuffers'; inputs: SharedArrayBuffer[]; perAtom: SharedArrayBuffer[]; globals: SharedArrayBuffer }
+  /** this worker's per-atom energy (nall) and virial (6 nall) arrays, for calls that tally them */
+  | { type: 'ebuffers'; eatom: SharedArrayBuffer; vatom: SharedArrayBuffer }
+  | {
+    type: 'compute'; nlocal: number; nall: number;
+    /** the style reads the full list (a three-body style of THREADED_PAIRS), else the half list */
+    full: boolean; qqrd2e: number; specialLJ: number[]; specialCoul: number[]; nchunks: number;
+    /** the engine's force array when it is shared (the threads then add their forces into it, see REDUCE) */
+    F: SharedArrayBuffer | null; phase: number; nslices: number;
+    /**
+     * 0: pair.compute; 1 and 2: the two loops of a TwoPassPair (threadedPairs.ts), the first summing into this worker's
+     * force array (one value per atom), the second reading the per-atom values in aux
+     */
+    pass: 0 | 1 | 2; aux: SharedArrayBuffer | null;
+    /** the shared neighbors are in the style's order (Pair.threadNeighbors); the style reads atom IDs (tags) */
+    ordered: boolean; tags: boolean;
+    /** the pair slot (MAX_PAIR_SLOTS) whose copy computes */
+    slot: number;
+    /** a ThreadExtras style: the call's scalars (the outputs are zeroed and filled), else null */
+    extras: number[] | null;
+    /** the call tallies per-atom energy, per-atom virial (into this worker's 'ebuffers' arrays, zeroed first) */
+    eatom: boolean; vatom: boolean;
+  }
+  | {
+    type: 'nbuffers'; bL: SharedArrayBuffer; bG: SharedArrayBuffer; rLo: SharedArrayBuffer; rHi: SharedArrayBuffer;
+    lk: SharedArrayBuffer; lt: SharedArrayBuffer; lxs: SharedArrayBuffer; gk: SharedArrayBuffer; gt: SharedArrayBuffer;
+    gxs: SharedArrayBuffer; cutsq: SharedArrayBuffer; ltag: SharedArrayBuffer; gtag: SharedArrayBuffer; chunkBins: SharedArrayBuffer; chunkOut: SharedArrayBuffer;
+    spOffset: SharedArrayBuffer; spPartner: SharedArrayBuffer; spOrder: SharedArrayBuffer; id: SharedArrayBuffer; owner: SharedArrayBuffer;
+    pa: SharedArrayBuffer; pj: SharedArrayBuffer;
+  }
+  | {
+    type: 'neigh'; nrows: number; nt: number; nchunks: number; binMax: number;
+    /** neighborKernel.ts HalfBins rule and delta (the IDs in bin order are the shared ltag and gtag) */
+    rule: number; delta: number;
+    /** a list with special bonds: the weights and the rest of neighborKernel.ts SpecialBins (the arrays are shared) */
+    special: { lj: number[]; coul: number[]; keep: boolean; hx: number; hy: number; hz: number; sbbits: number } | null;
+  }
+  /** PPPM's shared arrays (force/kspace/pppmKernel.ts): positions, mesh charges, weights, field meshes, field forces */
+  | { type: 'pbuffers'; x: SharedArrayBuffer; q: SharedArrayBuffer; first: SharedArrayBuffer; wts: SharedArrayBuffer; ex: SharedArrayBuffer; ey: SharedArrayBuffer; ez: SharedArrayBuffer; rho: SharedArrayBuffer; out: SharedArrayBuffer; params: SharedArrayBuffer }
+  /**
+   * one of PPPM's per-atom loops over chunks of atoms: 1 the weights (pppmWeights), 2 the field forces (pppmField); the
+   * grid, the counts and the constants are in the shared params array (pppmKernel.ts writePppmParams)
+   */
+  /**
+   * One of PPPM's threaded loops: 1 the weights, 2 the field interpolation (chunks of atoms), 3 the charge spread (chunks
+   * of mesh z planes), 4 one pass of the FFTs of the meshes in mask (bit k: ex, ey, ez, rho; chunks of lines of pass dim)
+   */
+  | { type: 'pppm'; phase: 1 | 2 | 3 | 4; fft?: { mask: number; dim: number; sign: -1 | 1 } }
+  /** the shared arrays of the style in a pair slot whose own loops the threads share (Pair.threadKernel) */
+  | { type: 'kbuffers'; slot: number; f64: SharedArrayBuffer[]; i32: SharedArrayBuffer[] }
+  /** one such loop: items [0, n) in nchunks chunks claimed from NEXT, each run by the slot's copy of the style */
+  | { type: 'kernel'; slot: number; name: string; n: number; nchunks: number; args: number[] };
+
+/** Atoms [lo, hi) of chunk c when n atoms are cut into nchunks chunks (PPPM's loops). */
+export const atomChunk = (n: number, nchunks: number, c: number): [number, number] => {
+  const len = Math.ceil(n / nchunks);
+  return [Math.min(n, c * len), Math.min(n, (c + 1) * len)];
+};
+
+/**
+ * A chunk of a threaded neighbor search (pairThreads.ts halfList) is recorded in chunkOut as three words: the thread
+ * that searched it (a worker's index, or NOT_DONE when no thread had room for its entries), the first entry in that
+ * thread's arrays and the number of entries.
+ */
+export const NOT_DONE = -1;
+
+/** Words of the control buffer: finished workers, failed workers. */
+/**
+ * Slots of the shared control array: DONE counts finished ranges, FAILED counts failed ones, READY counts workers that
+ * have started and handled their init message. A worker created from inside the engine worker may only start once the
+ * engine thread returns to its event loop, so the engine must not block in Atomics.wait on a worker before it is READY.
+ */
+export const DONE = 0, FAILED = 1, READY = 2;
+/**
+ * NEXT is the next unclaimed chunk of the neighbor list. Every thread (the engine thread too) claims chunks with
+ * Atomics.add until none are left, so a thread that runs slower (a busy core, an efficiency core, a late wake-up)
+ * simply takes fewer chunks. Measured in Chromium before this (8 threads, 16k-atom LJ, fixed equal ranges): the
+ * engine thread finished its range in 2.1 ms and then waited 2.4 ms for the slowest worker.
+ */
+export const NEXT = 3;
+/**
+ * The parallel sum of the threads' forces into the engine's force array (when it is in shared memory): after the pair
+ * chunks (DONE) the engine advances PHASE, every thread claims slices of the array from NEXT2 and adds, element by
+ * element, each worker's force in worker order (the order of the one-thread sum), and DONE2 counts the finished threads.
+ */
+export const PHASE = 4, NEXT2 = 5, DONE2 = 6;
+/**
+ * PAIR_READY counts the workers that have built the style of the last 'pair' message: the engine sets it to 0 before
+ * sending a style and runs the pair term on its own thread until every worker has built it (a worker that loads the
+ * style's module on demand needs a moment, and the engine never blocks on it).
+ */
+export const PAIR_READY = 7;
+/**
+ * Pair slots: slot 0 is the pair style; slot 1 + k is sub-style k of a pair_style hybrid, whose sub-styles run on the
+ * threads one after another (force/pair/hybrid.ts subRunner). Each slot keeps its own copy in the workers, so the
+ * sub-styles are not sent again every step, and its own PAIR_READY count: slot 0 at PAIR_READY, slot s > 0 at
+ * CTL_BASE + s - 1.
+ */
+export const MAX_PAIR_SLOTS = 16;
+const CTL_BASE = 8;
+export const readyIndex = (slot: number): number => (slot === 0 ? PAIR_READY : CTL_BASE + slot - 1);
+/** Words of the control array. */
+export const CTL_WORDS = CTL_BASE + MAX_PAIR_SLOTS - 1;
+/** Adds every worker's forces into F over elements [k0, k1), each element in worker order. */
+export const sumForces = (F: Float64Array, fs: readonly Float64Array[], k0: number, k1: number): void => {
+  for (let k = k0; k < k1; k++) {
+    let v = F[k];
+    for (let w = 0; w < fs.length; w++) v += fs[w][k];
+    F[k] = v;
+  }
+};
+/** Chunks per thread: enough to even out the load, few enough that the per-call overhead stays small. */
+export const CHUNKS_PER_THREAD = 8;
+/** Doubles of a worker's result: evdwl, ecoul, virial[6]. */
+export const ACC_LEN = 8;
+
+/** Splits [0, inum) into k ranges with about the same number of list entries (plus one per atom). */
+export const splitRanges = (numneigh: Int32Array, inum: number, k: number): Int32Array => {
+  const b = new Int32Array(k + 1);
+  let total = 0;
+  for (let i = 0; i < inum; i++) total += numneigh[i] + 1;
+  let acc = 0, r = 1;
+  for (let i = 0; i < inum && r < k; i++) {
+    acc += numneigh[i] + 1;
+    while (r < k && acc >= (total * r) / k) b[r++] = i + 1;
+  }
+  for (; r <= k; r++) b[r] = inum;
+  return b;
+};
+
+/** numneigh with the atoms outside [i0, i1) given no neighbors, written into `out`. */
+export const restrictCounts = (numneigh: Int32Array, inum: number, i0: number, i1: number, out: Int32Array): Int32Array => {
+  out.fill(0, 0, inum);
+  out.set(numneigh.subarray(i0, i1), i0);
+  return out;
+};
+
+/** The pair style's fields that survive structured cloning (caches holding functions are left out). */
+export const cloneableFields = (pair: Pair): Record<string, unknown> => {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(pair)) {
+    if (typeof v === 'function') continue;
+    try {
+      out[k] = structuredClone(v);
+    } catch {
+      // e.g. an erfc table cache (closures): the worker's fresh instance builds its own
+    }
+  }
+  return out;
+};
+
+const plainProto = (o: object): boolean => {
+  const p = Object.getPrototypeOf(o);
+  return p === Object.prototype || p === null;
+};
+
+/** Copies cloned fields into a fresh instance, keeping the instance's own class-typed members (their methods). */
+export const adoptFields = (target: Record<string, unknown>, src: Record<string, unknown>): void => {
+  for (const k of Object.keys(src)) {
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+    const v = src[k], cur = target[k];
+    if (v && typeof v === 'object' && cur && typeof cur === 'object' && !ArrayBuffer.isView(cur) && !Array.isArray(cur)
+      && !(cur instanceof Map) && !(cur instanceof Set) && !plainProto(cur) && plainProto(v)) {
+      adoptFields(cur as Record<string, unknown>, v as Record<string, unknown>);
+    } else {
+      target[k] = v;
+    }
+  }
+};
+
+/** A pair style rebuilt from the engine's fields with one of the factories (null when there is none for the name). */
+export const pairFromFields = (name: string, fields: Record<string, unknown>, factories: PairFactories): Pair | null =>
+  Object.hasOwn(factories, name) ? pairFromFactory(factories[name], fields) : null;
+
+/** The style built by `make`, with the engine style's cloned fields. */
+export const pairFromFactory = (make: () => Pair, fields: Record<string, unknown>): Pair => {
+  const p = make();
+  // allocate() creates the class-typed members (coefficient tables) the cloned fields go into
+  if (typeof fields.ntypes === 'number' && fields.ntypes > 0) p.allocate(fields.ntypes);
+  adoptFields(p as unknown as Record<string, unknown>, fields);
+  p.threadAdopt?.();
+  return p;
+};
+
+/**
+ * Every class-typed member of the engine's style has the same class in the rebuilt copy (a member
+ * that came back as a plain object would have lost its methods).
+ */
+export const sameShape = (orig: object, copy: object, depth = 0): boolean => {
+  if (depth > 4) return true;
+  const o = orig as Record<string, unknown>, c = copy as Record<string, unknown>;
+  for (const [k, v] of Object.entries(o)) {
+    if (!v || typeof v !== 'object' || ArrayBuffer.isView(v) || Array.isArray(v) || v instanceof Map || v instanceof Set) continue;
+    if (plainProto(v)) continue;
+    const w = c[k];
+    if (!w || typeof w !== 'object' || Object.getPrototypeOf(w) !== Object.getPrototypeOf(v)) return false;
+    if (!sameShape(v, w, depth + 1)) return false;
+  }
+  return true;
+};
+
+/** One worker's side of the protocol, also run in-process by tests. */
+export class PairThreadWorker {
+  constructor(private readonly factories: PairFactories | PairLoader) {}
+  /** per pair slot: the last 'pair' message (a slower load of an older style must not replace a newer one) */
+  private readonly pairGens = new Map<number, number>();
+
+  private ctl: Int32Array | null = null;
+  /** the pair copies by slot (MAX_PAIR_SLOTS) */
+  private readonly pairs = new Map<number, Pair | null>();
+  /** per pair slot: the shared arrays of the style's loops ('kbuffers') */
+  private readonly kbufs = new Map<number, { f64: Float64Array[]; i32: Int32Array[] }>();
+  private x: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private t: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  private q: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private numneigh: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  private firstneigh: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  private neighbors: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  private tags: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  /** a ThreadExtras style's shared inputs and this worker's outputs ('xbuffers') */
+  private xIn: Float64Array[] = [];
+  private xPerAtom: Float64Array[] = [];
+  private xGlobals: Float64Array = new Float64Array(0);
+  /** this worker's per-atom energy and virial ('ebuffers') */
+  private eatom: Float64Array = new Float64Array(0);
+  private vatom: Float64Array = new Float64Array(0);
+  private f: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private fs: Float64Array[] = [];
+  private acc: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private chunks: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  private index = 0;
+  /** the binned atoms of the current neighbor search, the chunk table and this worker's entry arrays */
+  private bins: HalfBins | null = null;
+  private spArrays: { offset: Int32Array; partner: Int32Array; order: Int8Array; id: Int32Array; owner: Int32Array } | null = null;
+  private chunkBins: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  private chunkOut: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  private pa: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  private pj: Int32Array<ArrayBufferLike> = new Int32Array(0);
+
+  handle(m: PairThreadMessage): void {
+    if (m.type === 'init') {
+      this.ctl = new Int32Array(m.ctl);
+      this.index = m.index;
+      Atomics.add(this.ctl, READY, 1);
+      return;
+    }
+    if (m.type === 'nbuffers') {
+      this.bins = {
+        bL: new Int32Array(m.bL), bG: new Int32Array(m.bG), rLo: new Int32Array(m.rLo), rHi: new Int32Array(m.rHi), nrows: 0,
+        lk: new Int32Array(m.lk), lt: new Int32Array(m.lt), lxs: new Float64Array(m.lxs),
+        gk: new Int32Array(m.gk), gt: new Int32Array(m.gt), gxs: new Float64Array(m.gxs), cutsq: new Float64Array(m.cutsq), nt: 0,
+        ltag: new Int32Array(m.ltag), gtag: new Int32Array(m.gtag),
+      };
+      this.chunkBins = new Int32Array(m.chunkBins); this.chunkOut = new Int32Array(m.chunkOut);
+      this.spArrays = {
+        offset: new Int32Array(m.spOffset), partner: new Int32Array(m.spPartner), order: new Int8Array(m.spOrder),
+        id: new Int32Array(m.id), owner: new Int32Array(m.owner),
+      };
+      this.pa = new Int32Array(m.pa); this.pj = new Int32Array(m.pj);
+      return;
+    }
+    if (m.type === 'neigh') { this.neighbors_(m); return; }
+    if (m.type === 'pbuffers') {
+      this.pX = new Float64Array(m.x); this.pQ = new Float64Array(m.q); this.pFirst = new Int32Array(m.first); this.pWts = new Float64Array(m.wts);
+      this.pEx = new Float64Array(m.ex); this.pEy = new Float64Array(m.ey); this.pEz = new Float64Array(m.ez); this.pRho = new Float64Array(m.rho); this.pOut = new Float64Array(m.out);
+      this.pParams = new Float64Array(m.params);
+      return;
+    }
+    if (m.type === 'pppm') { this.pppm_(m); return; }
+    if (m.type === 'kbuffers') {
+      this.kbufs.set(m.slot, { f64: m.f64.map((b) => new Float64Array(b)), i32: m.i32.map((b) => new Int32Array(b)) });
+      return;
+    }
+    if (m.type === 'kernel') { this.kernel_(m); return; }
+    if (m.type === 'buffers') {
+      this.x = new Float64Array(m.x); this.t = new Int32Array(m.t); this.q = new Float64Array(m.q);
+      this.numneigh = new Int32Array(m.numneigh); this.firstneigh = new Int32Array(m.firstneigh); this.neighbors = new Int32Array(m.neighbors);
+      this.f = new Float64Array(m.f); this.acc = new Float64Array(m.acc); this.chunks = new Int32Array(m.chunks);
+      this.fs = m.fs.map((b) => new Float64Array(b));
+      this.tags = new Int32Array(m.tags);
+      return;
+    }
+    if (m.type === 'xbuffers') {
+      this.xIn = m.inputs.map((b) => new Float64Array(b));
+      this.xPerAtom = m.perAtom.map((b) => new Float64Array(b));
+      this.xGlobals = new Float64Array(m.globals);
+      return;
+    }
+    if (m.type === 'ebuffers') {
+      this.eatom = new Float64Array(m.eatom);
+      this.vatom = new Float64Array(m.vatom);
+      return;
+    }
+    if (m.type === 'pair') {
+      const slot = m.slot ?? 0;
+      if (!Number.isInteger(slot) || slot < 0 || slot >= MAX_PAIR_SLOTS) return;
+      const gen = (this.pairGens.get(slot) ?? 0) + 1;
+      this.pairGens.set(slot, gen);
+      const ready = (pair: Pair | null) => {
+        if (gen !== this.pairGens.get(slot)) return;
+        this.pairs.set(slot, pair);
+        if (pair && this.ctl) {
+          Atomics.add(this.ctl, readyIndex(slot), 1);
+          // the engine thread may be waiting for every worker to build it (SharedPairThreads.awaitPair)
+          Atomics.notify(this.ctl, readyIndex(slot));
+        }
+      };
+      this.pairs.set(slot, null);
+      const f = this.factories;
+      if (typeof f !== 'function') { ready(pairFromFields(m.name, m.fields, f)); return; }
+      f(m.name, m.url).then((make) => ready(make ? pairFromFactory(make, m.fields) : null), () => ready(null));
+      return;
+    }
+    const ctl = this.ctl!;
+    try {
+      const pair = this.pairs.get(m.slot) ?? null;
+      if (!pair) throw new Error('no pair style');
+      this.f.fill(0, 0, m.pass === 1 ? m.nall : 3 * m.nall);
+      const a = newAccum();
+      const specialLJ = Float64Array.from(m.specialLJ), specialCoul = Float64Array.from(m.specialCoul);
+      const two = pair as Pair & TwoPassPair;
+      // a ThreadExtras style: this worker's outputs start at zero for the call
+      const extra = m.extras ? { inputs: this.xIn, perAtom: this.xPerAtom, globals: this.xGlobals, scalars: m.extras } : undefined;
+      if (extra) {
+        for (const a of extra.perAtom) a.fill(0, 0, m.nall);
+        extra.globals.fill(0);
+      }
+      const eatom = m.eatom ? this.eatom.fill(0, 0, m.nall) : null;
+      const vatom = m.vatom ? this.vatom.fill(0, 0, 6 * m.nall) : null;
+      const values = m.pass === 2 ? new Float64Array(m.aux!) : null;
+      for (;;) {
+        const c = Atomics.add(ctl, NEXT, 1);
+        if (c >= m.nchunks) break;
+        const rows: NeighList = { ilo: this.chunks[c], inum: this.chunks[c + 1], numneigh: this.numneigh, firstneigh: this.firstneigh, neighbors: this.neighbors, nativeOrdered: m.ordered };
+        const pc = {
+          x: this.x, f: this.f, type: this.t, q: this.q, nlocal: m.nlocal, nall: m.nall,
+          half: m.full ? null : rows, full: m.full ? rows : null,
+          specialLJ, specialCoul, qqrd2e: m.qqrd2e,
+          acc: a, eatom, vatom, tags: m.tags ? this.tags : undefined, extra,
+          // THREADED_PAIRS styles do not read these
+          s: undefined as never, nb: undefined as never, geom: undefined as never,
+        };
+        if (m.pass === 1) two.densities(pc, this.f as Float64Array);
+        else if (m.pass === 2) two.forces(pc, values!);
+        else pair.compute(pc);
+      }
+      this.acc[0] = a.evdwl; this.acc[1] = a.ecoul;
+      for (let c = 0; c < 6; c++) this.acc[2 + c] = a.virial[c];
+    } catch {
+      Atomics.add(ctl, FAILED, 1);
+    }
+    Atomics.add(ctl, DONE, 1);
+    Atomics.notify(ctl, DONE);
+    if (!m.F) return;
+    // the parallel sum: wait for the engine to start it (every thread has finished its chunks), then claim slices
+    Atomics.wait(ctl, PHASE, m.phase);
+    const F = new Float64Array(m.F);
+    const len = Math.ceil((3 * m.nall) / m.nslices);
+    for (;;) {
+      const sl = Atomics.add(ctl, NEXT2, 1);
+      if (sl >= m.nslices) break;
+      sumForces(F, this.fs, sl * len, Math.min(3 * m.nall, (sl + 1) * len));
+    }
+    Atomics.add(ctl, DONE2, 1);
+    Atomics.notify(ctl, DONE2);
+  }
+
+  private pX: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private pQ: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private pFirst: Int32Array<ArrayBufferLike> = new Int32Array(0);
+  private pWts: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private pEx: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private pEy: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private pEz: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private pRho: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private pOut: Float64Array<ArrayBufferLike> = new Float64Array(0);
+  private pParams: Float64Array<ArrayBufferLike> = new Float64Array(PPPM_PARAMS);
+
+  /** One of PPPM's per-atom loops: chunks of atoms claimed from NEXT, as the engine thread claims them too. */
+  private pppm_(m: Extract<PairThreadMessage, { type: 'pppm' }>): void {
+    const ctl = this.ctl!;
+    try {
+      // the grid, the counts and the constants the engine thread wrote into the shared params array
+      const { g, n, nchunks, C, V, zForce, items } = readPppmParams(this.pParams as Float64Array);
+      const sc = weightScratch(g.order);
+      const xs = new Int32Array(3 * g.order);
+      const meshes = [this.pEx, this.pEy, this.pEz, this.pRho] as Float64Array[];
+      const fftMeshes = m.fft ? meshes.filter((_, k) => (m.fft!.mask & (1 << k)) !== 0) : [];
+      for (;;) {
+        const c = Atomics.add(ctl, NEXT, 1);
+        if (c >= nchunks) break;
+        const [i0, i1] = atomChunk(items, nchunks, c);
+        if (m.phase === 1) pppmWeights(g, this.pX, i0, i1, this.pFirst as Int32Array, this.pWts as Float64Array, sc);
+        else if (m.phase === 2) pppmField(g, i0, i1, this.pQ, this.pFirst as Int32Array, this.pWts as Float64Array, this.pEx as Float64Array, this.pEy as Float64Array, this.pEz as Float64Array, C, V, zForce, this.pOut as Float64Array, xs);
+        else if (m.phase === 3) pppmSpread(g, n, this.pQ, this.pFirst as Int32Array, this.pWts as Float64Array, this.pRho as Float64Array, i0, i1, xs);
+        else for (const a of fftMeshes) fftPassLines(a, g.nx, g.ny, g.nz, m.fft!.dim, i0, i1, m.fft!.sign);
+      }
+    } catch {
+      Atomics.add(ctl, FAILED, 1);
+    }
+    Atomics.add(ctl, DONE, 1);
+    Atomics.notify(ctl, DONE);
+  }
+
+  /** A loop of the style in a pair slot (Pair.threadKernel): chunks of items claimed from NEXT. */
+  private kernel_(m: Extract<PairThreadMessage, { type: 'kernel' }>): void {
+    const ctl = this.ctl!;
+    try {
+      const pair = this.pairs.get(m.slot);
+      const k = this.kbufs.get(m.slot);
+      if (!pair || !pair.threadKernel || !k) throw new Error(`no style or arrays in pair slot ${m.slot}`);
+      for (;;) {
+        const c = Atomics.add(ctl, NEXT, 1);
+        if (c >= m.nchunks) break;
+        const [i0, i1] = atomChunk(m.n, m.nchunks, c);
+        pair.threadKernel(m.name, i0, i1, k.f64, k.i32, m.args);
+      }
+    } catch {
+      Atomics.add(ctl, FAILED, 1);
+    }
+    Atomics.add(ctl, DONE, 1);
+    Atomics.notify(ctl, DONE);
+  }
+
+  /** A threaded neighbor search: chunks of bins claimed from NEXT, their entries appended to this worker's arrays. */
+  private neighbors_(m: Extract<PairThreadMessage, { type: 'neigh' }>): void {
+    const ctl = this.ctl!;
+    try {
+      const B = { ...this.bins!, nrows: m.nrows, nt: m.nt, rule: m.rule, delta: m.delta };
+      const sp = m.special ? { ...this.spArrays!, ...m.special, lj: Float64Array.from(m.special.lj), coul: Float64Array.from(m.special.coul) } : null;
+      const out = new Int32Array(2);
+      let np = 0;
+      for (;;) {
+        const c = Atomics.add(ctl, NEXT, 1);
+        if (c >= m.nchunks) break;
+        const b1 = this.chunkBins[c + 1];
+        if (sp) halfBinsPairsSpecial(B, sp, this.chunkBins[c], b1, this.pa, this.pj, np, this.pa.length, m.binMax, out);
+        else halfBinsPairs(B, this.chunkBins[c], b1, this.pa, this.pj, np, this.pa.length, m.binMax, out);
+        if (out[0] < b1) {
+          // no room for this chunk: the engine thread searches it (its partial entries are dropped)
+          this.chunkOut[3 * c] = NOT_DONE;
+          continue;
+        }
+        this.chunkOut[3 * c] = this.index;
+        this.chunkOut[3 * c + 1] = np;
+        this.chunkOut[3 * c + 2] = out[1] - np;
+        np = out[1];
+      }
+    } catch {
+      Atomics.add(ctl, FAILED, 1);
+    }
+    Atomics.add(ctl, DONE, 1);
+    Atomics.notify(ctl, DONE);
+  }
+}
+

@@ -1,0 +1,2431 @@
+"""Core user interface for the Aminx package."""
+
+# COMP-NEW (2026-05-25): non-streaming path now drains via streaming_tensor_sink_session (§14 resolved).
+
+from __future__ import annotations
+
+import logging
+import sys
+import warnings
+from collections.abc import Callable, Hashable
+from types import SimpleNamespace
+from typing import Any, cast
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from aminx.host._sampling_grid_lineage import (
+  _base_sampling_key,
+  _grid_iteration_arrays,
+  _grid_manifest_row_hash,
+  _grid_sample_indices,
+  _resolve_grid_lineage,
+)
+from aminx.host._sampling_helper import (
+  _canonical_structure_ids_for_spec,
+  _prepare_ligand_context,
+  _structure_ids_for_batch,
+)
+from aminx.host.bucketing import batch_span, repad_residue_axis, score_rung, trim_residue_axis
+from aminx.host.family_driver import (
+  DRIVER_BACKED_FAMILY_MODULES,
+  FAMILY_DRIVERS,
+  FAMILY_EXTRA_REQUIREMENTS,
+  FamilyDriver,
+  validate_model_family,
+)
+from aminx.host.family_runner import run_family_driver
+from aminx.host.kernel_dispatch import _sample_batch, _spec_sample_rung
+from aminx.host.logit_aggregation import (
+  aggregate_logits,
+  aggregate_pseudo_perplexities,
+  compute_logit_fingerprint,
+  pad_to_max,
+)
+from aminx.host.output_sinks import (
+  streaming_tensor_sink_session,
+  take_staging_sequences_logits,
+)
+from aminx.host.plan import (
+  InferencePlan,
+  make_inference_plan,
+  resolve_chunk_size,
+  resolve_target_samples,
+)
+from aminx.host.schema_versions import (
+  GRID_SCHEMA_VERSION,
+  INSPECTION_SCHEMA_VERSION,
+  JACOBIAN_SCHEMA_VERSION,
+  SAMPLING_SCHEMA_VERSION,
+  SCORING_SCHEMA_VERSION,
+)
+from aminx.host.streaming import _sample_streaming
+from aminx.host.streaming_host import StreamingBatchHost
+from aminx.io.sink_provenance import prng_seed_attrs, resolve_aminx_version
+from aminx.run.batch_mapping import MappedBy
+from aminx.run.specs import (
+  InspectionSpecification,
+  JacobianSpecification,
+  SamplingSpecification,
+  ScoringSpecification,
+)
+
+# Families whose dispatch REQUIRES a registered FamilyDriver. The stock MPNN path
+# cannot serve these, so a missing driver is an error, never a silent fallback.
+# The table lives in family_driver (one source of truth shared with spec validation);
+# this alias keeps the name the dispatch code and its tests use.
+_DRIVER_BACKED_FAMILIES: dict[str, str] = DRIVER_BACKED_FAMILY_MODULES
+
+
+def _require_family_extra(family: str) -> None:
+  """Fail with the install hint when a family's optional dependency is missing.
+
+  Without this, a laser request dies on a bare ``ModuleNotFoundError: prody`` raised
+  from inside featurization (#2483). Checked at resolution, before any featurizing.
+  """
+  requirement = FAMILY_EXTRA_REQUIREMENTS.get(family)
+  if requirement is None:
+    return
+  import importlib  # noqa: PLC0415
+
+  module, extra = requirement
+  try:
+    importlib.import_module(module)
+  except ImportError as exc:
+    msg = (
+      f"model_family={family!r} needs the optional {module!r} dependency, which is not "
+      f"installed. Install the {extra!r} extra: `uv sync --extra {extra}` or "
+      f"`pip install 'aminx[{extra}]'`."
+    )
+    raise ImportError(msg) from exc
+
+
+def _family_driver_for(spec: Any) -> FamilyDriver | None:  # noqa: ANN401
+  """Return the driver for ``spec``, importing its family package on first use.
+
+  A driver already registered under the family key is left in place so tests can
+  install a stand-in before dispatch.
+
+  A driver-backed family RAISES when no driver resolves, rather than returning
+  None. That distinction is the point: every call site reads
+
+      if (d := _family_driver_for(spec)) is not None:
+          ... guards that raise for unsupported purposes ...
+          return run_family_driver(d, spec, purpose)
+
+  so a None skips the entire block -- including those guards -- and falls through
+  to the stock ProteinMPNN path, answering the request with a different model.
+
+  ON DEBT #2403, CORRECTED. That debt was filed against a tree where only
+  ``pottsmpnn`` was imported here, and claimed a lasermpnn request silently
+  returned ProteinMPNN results. That overstated it: the lasermpnn import was
+  added by 2f95e187, the SAME commit that introduced LaserDriver, so no tree ever
+  had the driver without its import. What was real is narrower -- a branch
+  carrying the LASEr featurizer but not the driver resolved None and fell
+  through silently instead of saying so. The table and the raise fix that, and
+  keep a third family from re-introducing it.
+  """
+  family = getattr(spec, "model_family", None)
+  if family is not None:
+    validate_model_family(family)
+  module = _DRIVER_BACKED_FAMILIES.get(family) if isinstance(family, str) else None
+  if module is not None:
+    _require_family_extra(family)
+  if module is not None and FAMILY_DRIVERS.get(family) is None:
+    import importlib  # noqa: PLC0415
+
+    importlib.import_module(module)
+
+  driver = FAMILY_DRIVERS.get(family)
+  if driver is None and module is not None:
+    msg = (
+      f"model_family={family!r} requires a registered FamilyDriver, but none resolved "
+      f"after importing {module!r}. Refusing to fall back to the stock MPNN path, "
+      f"which would silently return ProteinMPNN results for a {family} request."
+    )
+    raise RuntimeError(msg)
+  return driver
+
+
+from .prep import prep_protein_stream_and_model
+
+# Padding more than this many times the longest real chain triggers the once-per-run warning (aminx debt #2358).
+_PADDING_WARN_RATIO = 2.0
+_PADDING_BUCKET = 32  # the suggested max_length is rounded up to a multiple of this (an example, not a bucket ladder)
+
+_PADDING_COST_TEXT = {
+  "sample": (
+    "Autoregressive decode cost grows roughly with the square of the padded length, so this does about "
+    "{ratio_sq:.0f}x the work needed. Sampling draws random numbers at the padded shape, so changing "
+    "max_length may change the sampled sequences for the same seed. "
+    "Default runs set length_bucketing and trim each batch to the xtrax ladder rung; "
+    "pass --no-length-bucketing (length_bucketing=False) to restore fixed padding."
+  ),
+  "score": (
+    "Scoring is a single forward pass over the padded length, so it also pays for the padding (the scaling "
+    "was not measured). Scores themselves do not depend on max_length. "
+    "Default runs set length_bucketing and trim each batch to the xtrax ladder rung; "
+    "pass --no-length-bucketing (length_bucketing=False) to restore fixed padding."
+  ),
+}
+
+
+def _is_aminx_module(name: str) -> bool:
+  return name == "aminx" or name.startswith("aminx.")
+
+
+class _PaddingCheck:
+  """Warn once per run when a batch is padded to far more than the span of its longest chain.
+
+  Structures are padded to ``max_length`` (default 512) by the loader, and autoregressive decode cost grows
+  with the padded length, so a short chain at the default pays a large factor with no signal. An exploratory
+  timing in aminx debt #2358 saw ~86 s/sample on CPU for a 93-resolved-residue chain at the default (no
+  registered run). The warning changes no numbers and never raises from its own computation.
+
+  The length compared is the SPAN of the chain (index of the last valid residue + 1), not the count of valid
+  residues: structures with unresolved residues have gaps in the mask, and ``max_length`` below the span makes
+  the loader crop at random (default ``random_crop``, not reproducible) or raise (``truncation_strategy="none"``).
+  The suggestion is therefore never below the span, and the message says to size it to the longest chain across
+  ALL inputs, since only the first offending batch is examined.
+
+  ``rung_fn=None`` (the constructor default) compares the span to the padded length, which is what
+  ``_PaddingCheck("sample")`` has always done. The runner passes ``rung_fn``: the same per-batch decision
+  the dispatch trims with (``_spec_sample_rung`` / ``score_rung``). When it returns a rung, the comparison
+  uses that rung, so a batch whose padding is actually removed stays silent; when it returns ``None``
+  (bucketing off, a skip guard, a span past the ladder) the batch runs padded and still warns.
+  """
+
+  def __init__(
+    self,
+    entry: str,
+    *,
+    rung_fn: Callable[[Any], int | None] | None = None,
+  ) -> None:
+    self._entry = entry
+    self._warned = False
+    self._rung_fn = rung_fn
+
+  def __call__(self, batched_ensemble: Any) -> None:  # noqa: ANN401
+    if self._warned:
+      return
+    try:
+      mask = getattr(batched_ensemble, "mask", None)
+      if mask is None:
+        return
+      mask_np = np.asarray(mask)
+      if mask_np.ndim < 2 or mask_np.shape[-1] == 0:  # expects (batch, length)
+        return
+      padded = int(mask_np.shape[-1])
+      real = batch_span(mask_np)
+    except (TypeError, ValueError):  # advisory only: a malformed batch is never worth failing a run
+      return
+    compared = padded
+    if self._rung_fn is not None:
+      try:
+        rung = self._rung_fn(batched_ensemble)
+      except (TypeError, ValueError, AttributeError):  # advisory only, as above
+        rung = None
+      if rung is not None:
+        compared = rung
+    suggested = -(-real // _PADDING_BUCKET) * _PADDING_BUCKET
+    if real <= 0 or compared <= _PADDING_WARN_RATIO * real or suggested >= compared:
+      return
+    self._warned = True
+    # Attribute the warning to the caller's code (first frame outside aminx), so filters keyed on the caller's
+    # module work and Python's default once-per-location dedup is per call site, not one aminx line.
+    frame = sys._getframe(0)  # noqa: SLF001
+    level = 1
+    while frame is not None and _is_aminx_module(frame.f_globals.get("__name__", "")):
+      frame = frame.f_back
+      level += 1
+    if frame is None:
+      level -= 1
+    cost = _PADDING_COST_TEXT[self._entry].format(ratio_sq=(compared / real) ** 2)
+    warnings.warn(
+      f"structures are padded to max_length={padded} but the longest chain in this batch spans {real} residues. "
+      f"{cost} Pass max_length close to your longest chain, for example max_length={suggested} if this is the "
+      f"longest. Set it to at least the longest chain across ALL your inputs: chains longer than max_length are "
+      f"cropped at random or rejected, depending on truncation_strategy.",
+      UserWarning,
+      stacklevel=level,
+    )
+
+
+def _fixed_mask_has_fixed_positions(fixed_mask: object) -> bool:
+  """True if ``fixed_mask`` declares any fixed position -- MappedBy is conservatively True.
+
+  A ``MappedBy`` can't be cheaply checked for "all zero" without the per-batch structure
+  identity resolution machinery this guard runs before (score/jacobian don't support
+  fixed_mask at all, so there is nothing to resolve against) -- treat any MappedBy as
+  "has fixed positions set" rather than trying to peek inside its mapping.
+  """
+  if isinstance(fixed_mask, MappedBy):
+    return True
+  return bool(jnp.any(jnp.asarray(fixed_mask)))
+
+
+logger = logging.getLogger(__name__)
+_batch_logger = logging.getLogger(__name__ + ".batch_plan")
+
+
+def sample(
+  spec: SamplingSpecification | None = None,
+  **kwargs: Any,  # noqa: ANN401
+) -> dict[str, Any]:
+  """Sample new sequences for given input structures.
+
+  Routes to streaming or in-memory sampling based on output configuration and averaging mode.
+  Loads structures, prepares model, processes in batches, and aggregates
+  results with optional logits and pseudo-perplexity calculations.
+
+  Parameters
+  ----------
+  spec : SamplingSpecification, optional
+      SamplingSpecification object configuring inputs, model, and sampling strategy.
+      If None, a default specification is constructed from **kwargs.
+  **kwargs : Any
+      Keyword arguments for SamplingSpecification if spec is None. Options include:
+        inputs : str or list[str]
+            Input structures (file paths, PDB IDs, etc.).
+        chain_id : str, optional
+            Specific chain(s) to parse.
+        model : int, optional
+            Model number to load. If None, all models used.
+        altloc : str, optional
+            Alternate location identifier.
+        model_version : str, optional
+            Model version (e.g., 'proteinmpnn_v1').
+        model_weights : str, optional
+            Path to model weights.
+        foldcomp_database : str, optional
+            FoldComp database for compressed structures.
+        random_seed : int, optional
+            Random seed for sampling.
+        backbone_noise : float, optional
+            Noise added to backbone coordinates.
+        num_samples : int, optional
+            Number of sequences per structure/noise level.
+        sampling_strategy : str, optional
+            Sampling strategy (e.g., 'autoregressive', 'straight_through').
+        temperature : float, optional
+            Sampling temperature.
+        bias : jax.Array, optional
+            Per-position or per-position-per-token logit bias. Shape: (L,) or (L, 21).
+        fixed_positions : list[int], optional
+            Residue indices to keep fixed.
+        iterations : int, optional
+            Optimization iterations for 'straight_through' strategy.
+        learning_rate : float, optional
+            Learning rate for 'straight_through' strategy.
+        batch_size : int, optional
+            Number of structures per batch.
+        return_logits : bool, optional
+            Whether to return logits for each position.
+        output_h5_path : str or Path, optional
+            Path to Zarr store output file.
+
+  Returns
+  -------
+  dict[str, Any]
+      Dictionary with keys:
+        sequences : jax.Array
+            Sampled sequences, shape (S, N, D, T, L): S structures, N samples per
+            structure, D backbone-noise levels, T temperatures, L (padded) sequence length.
+            Masked with 'mask' key.
+        mask : jax.Array
+            Sequence validity mask (1 for valid, 0 for padding). Same shape as ``sequences``.
+        schema_version : str
+            Schema version for results ('grid_v1' or 'sampling_v1').
+        metadata : dict
+            Metadata including specification, skipped_inputs, structure_ids,
+            and optional lineage info (grid mode).
+        logits : jax.Array, optional
+            Per-position logits if return_logits=True. Shape: (S, N, D, T, L, 21).
+        pseudo_perplexity : jax.Array, optional
+            Per-sequence pseudo-perplexity scores if computed.
+
+  Notes
+  -----
+  Streaming vs. in-memory: If output_h5_path is set, uses streaming I/O.
+  Otherwise, concatenates per-batch results in memory.
+
+  References
+  ----------
+  .. [ProteinMPNN] Dauparas, J., et al. "Robust deep learning-based protein
+     sequence design using ProteinMPNN." *Science* 378(6615):49-56 (2022).
+     https://doi.org/10.1126/science.add2187
+
+  .. [LigandMPNN] Dauparas, J., et al. "Atomic context-conditioned protein
+     sequence design using LigandMPNN." *Nature Methods* 22(4):717-723 (2025).
+     https://doi.org/10.1038/s41592-025-02626-1
+
+  """
+  if spec is None:
+    spec = SamplingSpecification(**kwargs)
+
+  # FamilyDriver dispatch. An empty registry leaves this path untouched.
+  purpose = "sample"
+  if (d := _family_driver_for(spec)) is not None:
+    if getattr(spec, "decoding_order_fn", None) is not None:
+      msg = f"{d.name} does not support decoding_order_fn"
+      raise ValueError(msg)
+    if d.handles(spec, purpose):
+      return run_family_driver(d, spec, purpose)
+    if purpose not in d.mpnn_fallback_purposes:
+      msg = f"{d.name} does not support {purpose} in v1"
+      raise ValueError(msg)
+
+  # F002/F003 guard [260826_aminx-invariant-audit]: runner.sample cannot honour
+  # multistate spec fields.  score() routes through _score_fused_multistate which
+  # performs real cross-state fusion; sample() has no such path (the internal
+  # _sample_batch kernel silently discards multi_state_strategy via `del` and never
+  # reads state_position_map).  Silently returning per-structure single-state output
+  # when the caller supplied multistate fields is a lie; raise loudly instead and
+  # direct callers to the campaign verbs that do implement multistate sampling.
+  _multistate_default = "arithmetic_mean"
+  if spec.state_position_map is not None or spec.multi_state_strategy != _multistate_default:
+    _bad_fields = []
+    if spec.state_position_map is not None:
+      _bad_fields.append(
+        f"state_position_map (shape {getattr(spec.state_position_map, 'shape', type(spec.state_position_map))})",
+      )
+    if spec.multi_state_strategy != _multistate_default:
+      _bad_fields.append(f"multi_state_strategy={spec.multi_state_strategy!r}")
+    msg = (
+      f"runner.sample() does not implement multistate sampling; the following "
+      f"spec fields cannot be honoured: {', '.join(_bad_fields)}. "
+      f"Use `aminx campaign run` or the campaign worker verb to reach the "
+      f"multistate sampling path (aminx.sampling.multistate_poe."
+      f"sample_multistate_poe_campaign_row). "
+      f"runner.score() does honour these fields via _score_fused_multistate."
+    )
+    raise NotImplementedError(msg)
+
+  protein_iterator, model = prep_protein_stream_and_model(spec)
+
+  # Construct inference plan once before routing to streaming or non-streaming path.
+  # purpose="sample": this is the one caller that wants new sequences, not a score of a given
+  # one -- aminx#110 was this exact resolution defaulting to ConditionalMode (score-shaped)
+  # here with no way to ask for real autoregressive sampling.
+  plan: InferencePlan = make_inference_plan(model, spec, purpose="sample")
+
+  if spec.run_spec.io.output_h5_path:
+    return _sample_streaming(spec, protein_iterator, plan, _sample_batch)
+
+  # Non-streaming path uses io_callback staging via streaming_tensor_sink_session;
+  # drains per-batch via take_staging_sequences_logits.
+  all_sequences, all_pseudo_perplexities = [], []
+  needs_logits = (
+    spec.run_spec.sampling.return_logits or spec.run_spec.sampling.return_logit_fingerprint
+  )
+  all_logits = [] if needs_logits else None
+  canonical_structure_ids = _canonical_structure_ids_for_spec(spec)
+  resolved_structure_ids: list[str] = []
+  structure_offset = 0
+  structure_batch_count = StreamingBatchHost.structure_batch_count(protein_iterator)
+  grid_lineage = _resolve_grid_lineage(spec)
+
+  padding_check = _PaddingCheck(
+    "sample",
+    rung_fn=lambda batch: _spec_sample_rung(spec, batch, plan, quiet=True),
+  )
+  with streaming_tensor_sink_session():
+    for batch_idx, batched_ensemble in enumerate(protein_iterator):
+      padding_check(batched_ensemble)
+      batch_size = batched_ensemble.coordinates.shape[0]
+      batch_structure_ids = _structure_ids_for_batch(
+        canonical_structure_ids,
+        structure_offset=structure_offset,
+        batch_size=batch_size,
+      )
+      target_for_batch = resolve_target_samples(spec, None, grid_lineage)
+      _, _, pseudo_perplexity = _sample_batch(
+        spec,
+        batched_ensemble,
+        plan,
+        canonical_structure_ids=canonical_structure_ids,
+        batch_structure_ids=batch_structure_ids,
+        batch_idx=batch_idx,
+        structure_batch_count=structure_batch_count,
+      )
+      StreamingBatchHost.sink_barrier()
+      sampled_sequences_np, sampled_logits_np = take_staging_sequences_logits(
+        batch_idx,
+        0,
+        target_for_batch,
+      )
+      all_sequences.append(jnp.asarray(sampled_sequences_np))
+      if needs_logits and all_logits is not None:
+        all_logits.append(jnp.asarray(sampled_logits_np))
+      if pseudo_perplexity is not None:
+        all_pseudo_perplexities.append(pseudo_perplexity)
+      resolved_structure_ids.extend(batch_structure_ids)
+      structure_offset += batch_size
+  max_len = max(arr.shape[-1] for arr in all_sequences)
+
+  all_sequences_padded = [pad_to_max(seq, max_len, axis=-1, pad_value=0) for seq in all_sequences]
+
+  all_masks = [
+    pad_to_max(
+      jnp.ones(seq.shape, dtype=jnp.int32),
+      max_len,
+      axis=-1,
+      pad_value=0,
+    )
+    for seq in all_sequences
+  ]
+
+  results: dict[str, Any] = {
+    "sequences": jnp.concatenate(all_sequences_padded, axis=0),
+    "mask": jnp.concatenate(all_masks, axis=0),
+    "schema_version": GRID_SCHEMA_VERSION if spec.grid_mode else SAMPLING_SCHEMA_VERSION,
+    "metadata": {
+      "specification": spec,
+      "skipped_inputs": getattr(protein_iterator, "skipped_frames", []),
+      "structure_ids": resolved_structure_ids,
+    },
+  }
+  aggregated_logits = (
+    aggregate_logits(all_logits, max_len) if needs_logits and all_logits is not None else None
+  )
+  if spec.run_spec.sampling.return_logits and aggregated_logits is not None:
+    results["logits"] = aggregated_logits
+  if spec.run_spec.sampling.return_logit_fingerprint and aggregated_logits is not None:
+    fingerprint_key = jax.random.PRNGKey(spec.run_spec.sampling.random_seed)
+    results["logit_fingerprint"] = compute_logit_fingerprint(aggregated_logits, fingerprint_key)
+  if all_pseudo_perplexities:
+    results["pseudo_perplexity"] = aggregate_pseudo_perplexities(all_pseudo_perplexities)
+
+  if grid_lineage is not None:
+    manifest_row_hash = _grid_manifest_row_hash(spec, grid_lineage)
+    total_num_samples_for_grid = resolve_target_samples(spec, grid_lineage=grid_lineage)
+    chunk_size_for_grid = resolve_chunk_size(spec, total_num_samples_for_grid, grid_lineage)
+    iteration_ids, iteration_starts, iteration_counts = _grid_iteration_arrays(
+      grid_lineage,
+      chunk_size=chunk_size_for_grid,
+    )
+    sample_indices = _grid_sample_indices(grid_lineage)
+    results["sample_indices"] = jnp.asarray(sample_indices, dtype=jnp.int32)
+    results["metadata"]["lineage"] = {
+      **grid_lineage,
+      "manifest_row_hash": manifest_row_hash,
+      "sample_indices": sample_indices.tolist(),
+      "grid_iteration_ids": iteration_ids.tolist(),
+      "grid_iteration_sample_start": iteration_starts.tolist(),
+      "grid_iteration_sample_count": iteration_counts.tolist(),
+    }
+
+  return results
+
+
+# All schema versions are now imported from schema_versions.py (single source of truth).
+
+
+def _make_averaged_score_fn(
+  plan: Any,  # noqa: ANN401
+  spec: Any,  # noqa: ANN401
+) -> Any:  # noqa: ANN401
+  """Create a scoring function that averages over backbone noise levels.
+
+  Builds D InferenceBundle objects from spec.backbone_noise, encodes each,
+  fuses node/edge features via plan.stage_set.encoding_fusion, then decodes
+  once to produce logits. Uses _nll_from_logits for the NLL calculation.
+
+  Args:
+    plan: InferencePlan with encode, decode, stage_set, and encoding_fusion.
+    spec: ScoringSpecification with backbone_noise field.
+
+  Returns:
+    A scoring function with signature matching make_score_fn output.
+
+  Raises:
+    AssertionError: If bundles' conditioning fields are not noise-invariant.
+  """
+  from functools import partial  # noqa: PLC0415
+
+  import equinox as eqx  # noqa: PLC0415
+
+  from aminx.inference.bundle_builder import build_inference_bundle  # noqa: PLC0415
+  from aminx.inference.score_conditional import score_averaged  # noqa: PLC0415
+  from aminx.scoring.score import _nll_from_logits  # noqa: PLC0415
+
+  def _check_r3_invariance(bundles_per_noise: list) -> None:
+    """Check R3: all D bundles must share conditioning fields; only backbone_noise may vary.
+
+    Must be called on concrete (non-JIT-traced) bundles so eqx.tree_equal returns a
+    Python bool rather than an abstract tracer. The R3 check is moved here from the
+    JIT closure to guarantee it fires correctly on real values.
+    """
+    ref = bundles_per_noise[0]
+    for _d, _bnd in enumerate(bundles_per_noise[1:], start=1):
+      for _attr in ("conditioning", "geometry", "ligand", "wave"):
+        result = eqx.tree_equal(getattr(ref, _attr), getattr(_bnd, _attr))
+        # eqx.tree_equal returns True/False/None (or a concrete array) on real values.
+        # Cast to bool — if it's a JAX scalar, bool() concretizes it safely here (outside JIT).
+        if not bool(result):
+          msg = (
+            f"_make_averaged_score_fn: bundle[{_d}].{_attr} differs from bundle[0].{_attr}. "
+            f"D bundles must share all conditioning fields; only backbone_noise may vary. "
+            f"(R3 invariant)"
+          )
+          raise AssertionError(msg)
+
+  # Not length-bucketed in S8 v1: this path keeps the padded length.
+  @partial(jax.jit, static_argnames=("multi_state_strategy", "use_rolling_state"))
+  def _score_averaged_jit(
+    prng_key: jax.Array,
+    bundles_per_noise: list,
+    config_out: Any,  # noqa: ANN401
+    sequence: jax.Array,
+    mask: jax.Array,
+    multi_state_strategy: str = "arithmetic_mean",
+    use_rolling_state: bool = False,
+  ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    """JIT-compiled core: encode, fuse, decode. Receives pre-built concrete bundles."""
+    del use_rolling_state, multi_state_strategy
+
+    # Encode at each noise level, fuse, decode
+    logits = score_averaged(
+      plan.model,
+      prng_key,
+      bundles_per_noise,
+      config_out,
+      plan.stage_set,
+      plan.stage_set.encoding_fusion,
+    )
+
+    # Compute NLL using the extracted helper
+    nll = _nll_from_logits(logits, sequence, mask)
+
+    # Scoring is full-context (non-autoregressive), so decoding order is not applicable.
+    # Return None instead of a meaningless random permutation.
+    return nll, logits, None
+
+  def score_sequence_averaged(
+    prng_key: jax.Array,
+    sequence: jax.Array,
+    structure_coordinates: jax.Array,
+    mask: jax.Array,
+    residue_index: jax.Array,
+    chain_index: jax.Array,
+    backbone_noise: float | None = None,
+    ar_mask_override: jax.Array | None = None,
+    structure_mapping: jax.Array | None = None,
+    tie_group_map: jax.Array | None = None,
+    multi_state_strategy: str = "arithmetic_mean",
+    multi_state_temperature: float = 1.0,
+    state_weights: jax.Array | None = None,
+    state_position_map: jax.Array | None = None,
+    bias: jax.Array | None = None,
+    use_rolling_state: bool = False,
+    ligand_coords: jax.Array | None = None,
+    ligand_atom_types: jax.Array | None = None,
+    ligand_mask: jax.Array | None = None,
+    **kwargs: Any,  # noqa: ANN401
+  ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    """Python-level wrapper: build bundles, check R3 on concrete arrays, call JIT core."""
+    del (
+      multi_state_temperature,
+      backbone_noise,
+    )  # backbone_noise is overridden by spec.backbone_noise
+    del kwargs
+
+    L = int(sequence.shape[0])
+
+    # Build decoding AR mask: use provided override or default full-context mask. This is a
+    # direct caller-supplied override, not sourced from any RunSpecification field -- aminx#113
+    # confirmed the spec-level `ar_mask` field (now deleted) never fed anything; this parameter
+    # is unrelated and always was.
+    if ar_mask_override is not None:
+      ar_mask_single = ar_mask_override[0] if ar_mask_override.ndim == 3 else ar_mask_override
+    else:
+      ar_mask_single = None  # bundle_builder will create the default
+
+    # Build D bundles on concrete (Python-level) arrays — one per backbone_noise level.
+    # This runs OUTSIDE the JIT boundary so all arrays are concrete.
+    backbone_noises = spec.run_spec.sampling.backbone_noise or (0.0,)
+    bundles_per_noise = []
+    config_out = None
+    for noise_val in backbone_noises:
+      bundle, config_out = build_inference_bundle(
+        coords=structure_coordinates,
+        mask=mask,
+        residue_index=residue_index,
+        chain_index=chain_index,
+        sequence=sequence,
+        backbone_noise=float(noise_val),
+        ar_mask=ar_mask_single,
+        structure_mapping=structure_mapping,
+        tie_group_map=tie_group_map,
+        state_weights=state_weights,
+        state_position_map=state_position_map,
+        bias=bias,
+        ligand_coords=ligand_coords,
+        ligand_atom_types=ligand_atom_types,
+        ligand_mask=ligand_mask,
+        mode="score_conditional",
+        inference=True,
+      )
+      bundles_per_noise.append(bundle)
+
+    # R3 assertion: needs concrete arrays so eqx.tree_equal returns a Python bool. Under the
+    # runner's jax.vmap the inputs are tracers and bool() raises TracerBoolConversionError for
+    # D >= 2 (debt #2517), so the check is hoisted: ``runner.score`` calls
+    # ``score_sequence_averaged.check_r3`` once, eagerly, on the first concrete structure, and
+    # this in-call check only runs when the inputs are concrete (a direct, un-vmapped call).
+    if len(bundles_per_noise) > 1 and not any(
+      isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(bundles_per_noise)
+    ):
+      _check_r3_invariance(bundles_per_noise)
+
+    # Delegate to JIT-compiled core
+    del L  # unused after bundle build
+    return _score_averaged_jit(
+      prng_key,
+      bundles_per_noise,
+      cast("Any", config_out),
+      sequence,
+      mask,
+      multi_state_strategy=multi_state_strategy,
+      use_rolling_state=use_rolling_state,
+    )
+
+  def check_r3(
+    sequence: jax.Array,
+    structure_coordinates: jax.Array,
+    mask: jax.Array,
+    residue_index: jax.Array,
+    chain_index: jax.Array,
+  ) -> None:
+    """Run the R3 invariance check eagerly on concrete arrays (hoisted out of the vmap, #2517).
+
+    The invariant -- conditioning / geometry / ligand / wave are identical across the D noise
+    levels -- is a property of the bundle builder, not of the data, so one concrete structure
+    suffices. Raises ``AssertionError`` on a violation; a no-op for fewer than two levels.
+    """
+    levels = spec.run_spec.sampling.backbone_noise or (0.0,)
+    if len(levels) < 2:
+      return
+    bundles = [
+      build_inference_bundle(
+        coords=structure_coordinates,
+        mask=mask,
+        residue_index=residue_index,
+        chain_index=chain_index,
+        sequence=sequence,
+        backbone_noise=float(level),
+        mode="score_conditional",
+        inference=True,
+      )[0]
+      for level in levels
+    ]
+    _check_r3_invariance(bundles)
+
+  score_sequence_averaged.check_r3 = check_r3  # type: ignore[attr-defined]
+  return score_sequence_averaged
+
+
+def _candidate_activation_bytes(
+  split_fns: Any,  # noqa: ANN401
+  multi_state_strategy: str,
+  batched_ensemble: Any,  # noqa: ANN401
+  batch_ligand: tuple[jax.Array | None, jax.Array | None, jax.Array | None],
+  sample_key: jax.Array,
+  sample_sequence: jax.Array,
+  *,
+  batch_size: int,
+  model_signature: Hashable,
+) -> int:
+  """Live bytes one candidate holds once the encode is hoisted, for the candidate-axis planner.
+
+  Derived, not typed: XLA's buffer assignment for ONE candidate's decode + NLL on ONE structure
+  (``xtrax.tiling.estimators.lowered_memory_estimate``: argument + output + temp bytes), times
+  ``batch_size`` because the structure axis is vmapped outside the candidate axis, so every
+  structure in the batch holds its own candidate's working set at once.
+
+  Counted: the decoder's temporaries, the (L, 21) logits and the structural arrays it is handed.
+  Also counted, deliberately: one copy of the encoder output, because it is an *argument* of the
+  lowered function. It is shared across candidates rather than held per candidate, so this
+  over-states the per-candidate figure by at most one encoding -- the safe direction for a
+  Vmap -> SafeMap demotion decision.
+  Not counted: the ``batch_size`` encodings themselves (live however the candidate axis is tiled).
+
+  Falls back to an analytic lower bound (encoder tensors + output logits) only if the backend
+  cannot produce a memory analysis, and logs that it did.
+  """
+  from xtrax.tiling import lowered_memory_estimate  # noqa: PLC0415
+
+  coords, mask, residue_index, chain_index, ligand = jax.tree.map(
+    lambda a: a[0],
+    (
+      batched_ensemble.coordinates,
+      batched_ensemble.mask,
+      batched_ensemble.residue_index,
+      batched_ensemble.chain_index,
+      batch_ligand,
+    ),
+  )
+  ligand_kwargs = (
+    {}
+    if ligand[0] is None
+    else {"ligand_coords": ligand[0], "ligand_atom_types": ligand[1], "ligand_mask": ligand[2]}
+  )
+  encoding = jax.eval_shape(
+    lambda *a: split_fns.encode_structure(*a, **ligand_kwargs),
+    coords,
+    mask,
+    residue_index,
+    chain_index,
+  )
+
+  def _one_candidate(
+    key: jax.Array,
+    seq: jax.Array,
+    enc: Any,  # noqa: ANN401
+    c: jax.Array,
+    m: jax.Array,
+    r: jax.Array,
+    ch: jax.Array,
+  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    return split_fns.score_candidate(
+      key, jax.nn.one_hot(seq, 21), enc, c, m, r, ch, multi_state_strategy=multi_state_strategy,
+    )
+
+  args = (sample_key, sample_sequence, encoding, coords, mask, residue_index, chain_index)
+  # Lowering is a full XLA compile, so memoise per (architecture, shape signature) for the whole
+  # PROCESS: a long structure stream with identical (padded) shapes must not recompile once per
+  # batch, and repeated score() calls must not recompile once per call (#3484 -- this lowering was
+  # ~1 s of every warm call while the cache lived only for one call). ``model_signature`` names
+  # the architecture, because the estimate depends on hidden sizes, not only on input shapes.
+  cache_key = (
+    model_signature,
+    multi_state_strategy,
+    tuple((tuple(leaf.shape), str(leaf.dtype)) for leaf in jax.tree.leaves(args)),
+  )
+  per_structure = _ACTIVATION_ESTIMATE_CACHE.get(cache_key)
+  if per_structure is None:
+    try:
+      per_structure = lowered_memory_estimate(_one_candidate, *args)
+    except RuntimeError:
+      logger.warning(
+        "score runner: backend gave no memory analysis; using an analytic lower bound "
+        "(encoder tensors + logits) for the candidate-axis memory estimate.",
+      )
+      per_structure = sum(
+        int(leaf.size) * leaf.dtype.itemsize for leaf in jax.tree.leaves(encoding)
+      ) + int(coords.shape[0]) * 21 * 4
+    if len(_ACTIVATION_ESTIMATE_CACHE) >= _ACTIVATION_ESTIMATE_CACHE_MAX:
+      _ACTIVATION_ESTIMATE_CACHE.pop(next(iter(_ACTIVATION_ESTIMATE_CACHE)))
+    _ACTIVATION_ESTIMATE_CACHE[cache_key] = per_structure
+  return int(per_structure) * batch_size
+
+
+# Process-wide memo for _candidate_activation_bytes (#3484). Small and FIFO-bounded: one entry per
+# (architecture, strategy, padded shape) actually scored.
+_ACTIVATION_ESTIMATE_CACHE: dict[Hashable, int] = {}
+_ACTIVATION_ESTIMATE_CACHE_MAX = 64
+
+
+def _model_signature(model: Any) -> Hashable:  # noqa: ANN401
+  """Architecture identity of a model: its pytree structure plus every array leaf's shape/dtype.
+
+  Two loads of one checkpoint share it (so the activation estimate is reused across score()
+  calls); checkpoints with different hidden sizes or layer counts do not.
+  """
+  import equinox as eqx  # noqa: PLC0415 -- lazy, as elsewhere in this module (import isolation)
+
+  arrays, static = eqx.partition(model, eqx.is_array)
+  leaves = tuple((tuple(leaf.shape), str(leaf.dtype)) for leaf in jax.tree.leaves(arrays))
+  return (str(jax.tree.structure(arrays)), str(jax.tree.structure(static)), leaves)
+
+
+# Largest (mask, sequence) tile scored at once by ScoreSplitFns.score_pairs (#3485). The planner's
+# per-pair estimate lowers ONE candidate, and the batched program outgrows it at large tiles. On a
+# 24 GiB TITAN RTX, 448 pairs at the 512 rung (pre-registered sweep, bathos run 6162354f): tiles
+# 6/12/24/32 peaked at 0.58/1.06/1.79/2.57 GiB with warm walls 1.19/1.18/1.15/1.27 s, while the
+# uncapped device-sized plan ran out of memory (13.2 GiB in use). Throughput is flat, so cap it.
+_MAX_PAIR_TILE = 32
+
+
+def _pair_tile(strategy: Any, n_pairs: int) -> int | None:  # noqa: ANN401
+  """Tile size for the pair map: the planner's, capped at ``_MAX_PAIR_TILE``; ``None`` = one vmap."""
+  from xtrax.tiling import Vmap  # noqa: PLC0415
+
+  planned = n_pairs if isinstance(strategy, Vmap) else int(strategy.batch_size)
+  tile = max(1, min(planned, _MAX_PAIR_TILE))
+  return None if tile >= n_pairs else tile
+
+
+def _score_noise_levels(spec: Any) -> tuple[float, ...]:  # noqa: ANN401
+  """The spec's backbone-noise levels as floats; ``(0.0,)`` when none are set."""
+  return tuple(float(level) for level in (spec.backbone_noise or (0.0,)))
+
+
+def _score_noise_key(spec: Any, structure_idx: Any) -> jax.Array:  # noqa: ANN401
+  """The per-structure backbone-noise key, identical to ``runner.sample``'s (N-D2).
+
+  Design derives ``fold_in(_base_sampling_key(spec), structure_idx)``
+  (``host/kernel_dispatch.py``, ``encode_key``) and hands it to the encoder; score uses the
+  same derivation so scoring at a design's spec/seed sees the identical noised backbone.
+  ``structure_idx`` is the index WITHIN the structure batch, as in design (design folds
+  ``jnp.arange(batch_size)``, not a global index). Scoring has no grid lineage, so
+  ``grid_lineage=None`` (the non-grid design key).
+  """
+  return jax.random.fold_in(_base_sampling_key(spec, grid_lineage=None), structure_idx)
+
+
+def _over_noise_levels(
+  run: Callable[..., Any],
+  noise_levels: tuple[float, ...],
+  noise_key: jax.Array,
+) -> Any:  # noqa: ANN401
+  """Run ``run(noise, key)`` at each noise level; D >= 2 gains a noise axis after candidates.
+
+  ``run`` returns a pytree whose leaves have a leading candidate axis. One level calls it
+  directly (output unchanged, ``(C, ...)``); two or more map it over the levels with
+  ``jax.vmap`` and move the level axis to position 1, giving ``(C, D, ...)``. A single level
+  of exactly ``0.0`` passes ``(None, None)`` so the call is the historical noise-free one,
+  bit for bit.
+  """
+  any_noise = any(level != 0.0 for level in noise_levels)
+  if len(noise_levels) == 1:
+    return run(*((noise_levels[0], noise_key) if any_noise else (None, None)))
+  key = noise_key if any_noise else None
+  levels = jnp.asarray(noise_levels, dtype=jnp.float32)
+  out = jax.vmap(lambda level: run(level, key))(levels)
+  return jax.tree.map(lambda leaf: jnp.moveaxis(leaf, 0, 1), out)
+
+
+def _pad_scoring_ar_masks(
+  ar_masks: Any,  # noqa: ANN401 -- the validated (K, L, L) int8 stack from ScoringSpecification
+  sequence_indices: list[jax.Array],
+  struct_len: int,
+) -> jax.Array:
+  """Pad a ``(K, L, L)`` mask stack to the structure length in one call (checks as below, once)."""
+  first = _pad_scoring_ar_mask(ar_masks[0], sequence_indices, struct_len)  # length checks
+  pad = int(first.shape[0]) - int(ar_masks.shape[-1])
+  return jnp.pad(jnp.asarray(ar_masks), ((0, 0), (0, pad), (0, pad)))
+
+
+def _pad_scoring_ar_mask(
+  ar_mask: Any,  # noqa: ANN401 -- the validated (L, L) int8 ndarray from ScoringSpecification
+  sequence_indices: list[jax.Array],
+  struct_len: int,
+) -> jax.Array:
+  """Pad a caller's ``(L, L)`` scoring ``ar_mask`` to the loader's padded structure length.
+
+  The structure may be padded to ``max_length`` and each candidate is X-padded to match, so the
+  mask must cover ``struct_len`` positions. Padded rows and columns are zero (invisible); those
+  positions are masked out of the NLL and the encoder by the structure mask regardless.
+
+  Every candidate must have exactly the mask's ``L`` residues: one mask names positions, and a
+  shorter candidate would leave some of those positions scoring against X padding.
+  """
+  mask_len = int(ar_mask.shape[0])
+  bad = sorted({int(s.shape[0]) for s in sequence_indices if int(s.shape[0]) != mask_len})
+  if bad:
+    msg = (
+      f"score runner: spec.ar_mask is ({mask_len}, {mask_len}) but candidate sequence lengths "
+      f"{bad} differ; every sequence scored under an ar_mask must have exactly {mask_len} residues."
+    )
+    raise ValueError(msg)
+  if mask_len > struct_len:
+    msg = (
+      f"score runner: spec.ar_mask covers {mask_len} positions but the structure batch has "
+      f"{struct_len}."
+    )
+    raise ValueError(msg)
+  return jnp.pad(jnp.asarray(ar_mask), ((0, struct_len - mask_len),) * 2)
+
+
+def score(  # noqa: PLR0915
+  spec: ScoringSpecification | None = None,
+  **kwargs: Any,  # noqa: ANN401
+) -> dict[str, Any]:
+  """Score sequences against input structures.
+
+  Loads structures, prepares model, and computes negative
+  log-likelihood (NLL) scores for provided sequences. Optionally returns logits
+  and decoding orders.
+
+  Parameters
+  ----------
+  spec : ScoringSpecification, optional
+      ScoringSpecification object configuring inputs, sequences, and scoring options.
+      If None, a default specification is constructed from **kwargs.
+  **kwargs : Any
+      Keyword arguments for ScoringSpecification if spec is None.
+
+  Returns
+  -------
+  dict[str, Any]
+      Dictionary with keys:
+        scores : jax.Array
+            Negative log-likelihood scores. Shape: (num_structures, num_sequences) when
+            ``spec.backbone_noise`` has exactly one level, else
+            (num_structures, num_sequences, D) with one trailing entry per noise level
+            (candidates before noise, mirroring ``sample``'s samples-before-noise order).
+            The shape depends only on the spec. The fused multi-state path
+            (``state_position_map``) has one fused "structure": (1, C) / (1, C, D). With
+            ``average_node_features=True`` the levels are fused (D -> 1), so there is never a
+            noise axis.
+            With ``spec.ar_masks`` (a (K, L, L) stack) every sequence is scored under every mask
+            in one call: (num_structures, K, num_sequences), plus the trailing noise axis.
+        mask : jax.Array
+            Structure validity mask (1 for valid, 0 for padding). Shape: (num_structures,).
+        schema_version : str
+            Schema version for results ('scoring_v2').
+        noise_levels : tuple[float, ...]
+            The backbone-noise levels scored, in axis order (also in ``metadata``). Noise is
+            drawn from ``runner.sample``'s per-structure key, so a score at the same
+            spec/seed sees the same noised backbone as the design did.
+        metadata : dict
+            Metadata including specification, structure_ids, noise_levels, and skipped_inputs.
+        logits : jax.Array, optional
+            Per-position logits if return_logits=True. Shape: (num_structures, num_sequences, L, 21),
+            with the same trailing-D axis position as scores: (S, C, D, L, 21) for D >= 2.
+            With ``spec.ar_masks``: (S, K, C, L, 21) (mask axis before the sequence axis).
+        loss_xy : jax.Array, optional
+            Auxiliary ligand-proximal negative log-likelihood if return_loss_xy=True. Shape:
+            (num_structures, num_sequences), or (num_structures, num_sequences, D) with the
+            same trailing noise axis as ``scores``. Not supported with state_position_map.
+        ligand_confidence : jax.Array, optional
+            Auxiliary ligand-proximal confidence (exp(-loss_xy)) if return_loss_xy=True, with
+            the same shape as ``loss_xy``.
+        mask_xy : jax.Array, optional
+            Per-residue mask (1.0 within ``ligand_cutoff_for_score`` of a valid ligand atom),
+            shape (num_structures, L). It depends only on the structure.
+        decoding_orders : None, optional
+            Present (and always ``None``) if return_decoding_orders=True. Every score()
+            path is full-context teacher forcing (``1 - I`` mask, no waves), so there is no
+            decoding order to report. This key used to carry a random permutation that the
+            computation never used (debt #1717); it is kept, as ``None``, so callers that
+            index it get an explicit "not applicable" rather than a KeyError or noise.
+
+  Notes
+  -----
+  Batch composition (#3487). A sequence's scores and logits never depend on the CONTENT of the
+  other sequences in the call (bitwise, at a fixed number of sequences), but can differ by float
+  reassociation between calls with different numbers of sequences, because the candidate axis
+  is vmapped. The bound is ``aminx.scoring.score.SCORE_BATCH_COMPOSITION_ATOL``; compare scores
+  across batch compositions with that tolerance, not bitwise.
+
+  Raises
+  ------
+  NotImplementedError
+      If output_h5_path is set (HDF5 streaming not yet implemented for scoring).
+  ValueError
+      If sequence length doesn't match structure length.
+
+  """
+  if spec is None:
+    spec = ScoringSpecification(**kwargs)
+
+  purpose = f"score:{spec.output_kind}"
+  if (d := _family_driver_for(spec)) is not None:
+    if getattr(spec, "decoding_order_fn", None) is not None:
+      msg = f"{d.name} does not support decoding_order_fn"
+      raise ValueError(msg)
+    if d.handles(spec, purpose) and spec.ar_masks is not None:
+      # A family driver scores under its own visibility rule and has no K axis: it would return
+      # (S, C) scores for a caller who asked for K mask-conditioned ones (review 261118).
+      msg = f"score runner: {d.name} does not support ar_masks; it would score under its own visibility rule."
+      raise NotImplementedError(msg)
+    if d.handles(spec, purpose):
+      # Family drivers return before the per-structure loop, and none of them computes
+      # loss_xy / mask_xy / ligand_confidence. Refuse rather than return scores without them.
+      if spec.return_loss_xy:
+        msg = (
+          f"score runner: return_loss_xy=True is not implemented for the {d.name} driver "
+          f"(purpose {purpose!r}); the ligand-proximal loss would be silently dropped. "
+          "Set return_loss_xy=False, or score with the stock MPNN path."
+        )
+        raise NotImplementedError(msg)
+      return run_family_driver(d, spec, purpose)
+    if purpose not in d.mpnn_fallback_purposes:
+      msg = f"{d.name} does not support {purpose} in v1"
+      raise ValueError(msg)
+
+  if spec.output_h5_path:
+    msg = "score runner: HDF5 streaming output not yet implemented; omit --output-h5-path for in-memory results"
+    raise NotImplementedError(msg)
+
+  # spec.fixed_mask -- audit 260826_chain-selection-vendor-superset-audit finding FA2.
+  # aminx.scoring.score.score_sequence has no fixed_mask/chain_mask parameter and never
+  # reads it; confirmed via a differential probe (fixed_mask=all-ones vs all-zeros on an
+  # identical sequences_to_score input produced bit-identical scores). Silently accepting
+  # and ignoring it would let a caller believe the returned NLL excludes or otherwise
+  # accounts for the positions they marked fixed, when it does not -- score() already
+  # deliberately scores every position under full context (see score_sequence's ar_mask
+  # comment), so there is no established semantics here to guess at silently.
+  if spec.fixed_mask is not None and _fixed_mask_has_fixed_positions(spec.fixed_mask):
+    msg = (
+      "score runner: spec.fixed_mask has one or more fixed positions set, but "
+      "aminx.scoring.score.score_sequence has no parameter for it and never reads it. "
+      "runner.sample honours fixed_mask (via host/_sampling_helper.py's "
+      "_prepare_fixed_controls); this surface does not yet. Omit fixed_mask when calling "
+      "score(), or use runner.sample if you need fixed-position-aware behavior."
+    )
+    raise NotImplementedError(msg)
+
+  # spec.ar_mask: a caller-chosen visibility pattern, honoured on the plain per-structure path
+  # only (the encode-once split scorer). The averaged-feature and fused multi-state scorers build
+  # their own bundles and would drop it, so refuse them rather than score under the default mask
+  # while the caller believes they scored under theirs.
+  if spec.ar_masks is not None and spec.return_loss_xy:
+    msg = (
+      "score runner: return_loss_xy=True is not implemented with ar_masks (a (K, L, L) stack); "
+      "the ligand-proximal loss is defined per sequence, not per (mask, sequence) pair."
+    )
+    raise NotImplementedError(msg)
+  if (spec.ar_mask is not None or spec.ar_masks is not None) and (
+    spec.average_node_features or spec.state_position_map is not None
+  ):
+    msg = (
+      "score runner: spec.ar_mask is only supported on the plain per-structure scoring path; "
+      "average_node_features=True and state_position_map would silently score under the default "
+      "full-context mask instead. Score per structure, or leave ar_mask None."
+    )
+    raise NotImplementedError(msg)
+
+  # Ligand channel (#167). ``score_sequence`` accepts ligand tensors, but this surface used to
+  # have no field to receive them, so a LigandMPNN checkpoint was scored WITHOUT its ligand and
+  # nothing said so -- the returned NLL is a different, worse-conditioned number. Refuse every
+  # combination this surface cannot honour rather than dropping it.
+  ligand_requested = bool(spec.ligand_conditioning) or spec.ligand_context_path is not None
+  if spec.sidechain_conditioning:
+    msg = (
+      "score runner: spec.sidechain_conditioning=True, but aminx.scoring.score.score_sequence "
+      "has no atom_37 / side-chain parameters and never reads them, so the side-chain context "
+      "would be silently dropped. Use runner.sample, or leave sidechain_conditioning False."
+    )
+    raise NotImplementedError(msg)
+  if ligand_requested and (spec.average_node_features or spec.state_position_map is not None):
+    msg = (
+      "score runner: ligand conditioning is not implemented for the averaged-feature "
+      "(average_node_features=True) or fused multi-state (state_position_map) scoring paths; "
+      "it would be silently dropped there. Score per structure, or omit the ligand fields."
+    )
+    raise NotImplementedError(msg)
+
+  # return_loss_xy is computed in the per-structure loop only. The fused multi-state path returns
+  # before that loop, so it would drop loss_xy, mask_xy and ligand_confidence without a word.
+  if spec.return_loss_xy and spec.state_position_map is not None:
+    msg = (
+      "score runner: return_loss_xy=True is not implemented for the fused multi-state path "
+      "(state_position_map); the ligand-proximal loss would be silently dropped there. Score per "
+      "structure, or set return_loss_xy=False."
+    )
+    raise NotImplementedError(msg)
+  if spec.return_loss_xy:
+    # Lazy: keeps the runner's module-level import closure narrow (guarded by
+    # tests/test_import_isolation.py); evaluate_ligand_cutoff_candidates below closes over it.
+    from aminx.scoring.ligand_cutoff import (  # noqa: PLC0415
+      evaluate_ligand_cutoff_candidates,
+      validate_ligand_cutoff,
+    )
+
+    validate_ligand_cutoff(spec.ligand_cutoff_for_score)
+    if not ligand_requested:
+      # Without a ligand there is no proximal set: the old path fed (None, None, None) to the
+      # kernel and returned loss_xy=0 and ligand_confidence=1 -- a perfect-looking score for a
+      # quantity that was never computed. Refuse instead of fabricating it.
+      msg = (
+        "score runner: return_loss_xy=True needs a ligand context (set ligand_conditioning=True "
+        "and/or ligand_context_path); without one the ligand-proximal loss is undefined and "
+        "would be reported as loss_xy=0, ligand_confidence=1."
+      )
+      raise ValueError(msg)
+
+  if ligand_requested and spec.model_family != "ligandmpnn":
+    msg = (
+      f"score runner: ligand conditioning was requested (ligand_conditioning="
+      f"{spec.ligand_conditioning}, ligand_context_path={spec.ligand_context_path}) but the "
+      f"checkpoint is model_family={spec.model_family!r}, which has no ligand channel; the "
+      "ligand would be silently ignored. Use a LigandMPNN checkpoint or drop the ligand fields."
+    )
+    raise ValueError(msg)
+
+  # Backbone noise axis (N-D1..N-D3, spec 261011_noise-level-axis). Replaces the #214 refusal.
+  # The plain per-structure and fused multi-state paths apply every level in
+  # spec.backbone_noise, drawing the noise from design's per-structure key
+  # (``_score_noise_key``); the averaged-feature path fuses the levels (D -> 1) and has no
+  # noise axis. One level -> ``(S, C)``; two or more -> ``(S, C, D)``.
+  noise_levels = _score_noise_levels(spec)
+
+  from aminx.scoring.score import make_score_fn, make_score_split_fns  # noqa: PLC0415
+  from aminx.utils.aa_convert import string_to_protein_sequence  # noqa: PLC0415
+
+  protein_iterator, model = prep_protein_stream_and_model(spec)
+
+  if spec.model_family == "ligandmpnn" and not ligand_requested:
+    logger.warning(
+      "score runner: scoring a LigandMPNN checkpoint WITHOUT ligand context "
+      "(ligand_conditioning=False, no ligand_context_path). If this design was conditioned on "
+      "a ligand, the returned NLL is not the number you want -- set ligand_conditioning=True "
+      "and provide the ligand via ligand_context_path or the input batch.",
+    )
+
+  # Build score function: standard or averaged-feature
+  if spec.average_node_features:
+    from aminx.host.plan import make_inference_plan  # noqa: PLC0415
+
+    # purpose="score" (the default): this call evaluates a given sequence, it never samples one.
+    plan = make_inference_plan(model, spec, purpose="score")
+    score_fn = _make_averaged_score_fn(plan, spec)  # type: ignore[arg-type]
+  else:
+    score_fn = make_score_fn(model)  # type: ignore[arg-type]
+
+  # Encode-once path (#147). Only the plain per-structure branch below uses it: the encoding is
+  # candidate-independent because the noise is drawn from the per-STRUCTURE key (N-D2), so it
+  # is encoded once per (structure, noise level) (N-D3). The averaged-feature path encodes at
+  # spec.backbone_noise levels with keys derived from each candidate's key, and the fused
+  # multi-state path (state_position_map) stacks states into one encode; both keep their
+  # per-candidate core and are NOT hoisted.
+  split_fns = (
+    make_score_split_fns(model)  # type: ignore[arg-type]
+    if not spec.average_node_features and spec.state_position_map is None
+    else None
+  )
+
+  # Convert string sequences to integer indices
+  sequence_indices_list = []
+  for seq_str in spec.sequences_to_score:
+    seq_idx = string_to_protein_sequence(seq_str)
+    sequence_indices_list.append(seq_idx)
+
+  # spec.state_position_map's ONLY sensible purpose is cross-state residue alignment
+  # for genuine multi-state PoE fusion -- its presence is an unambiguous signal the
+  # caller wants ONE fused score across every spec.inputs structure, not N independent
+  # per-structure scores (the loop below, unchanged, for the state_position_map=None
+  # default -- preserves exact prior behavior for every existing caller that scores a
+  # sequence against several unrelated candidate structures). Previously
+  # state_position_map (and multi_state_strategy, forwarded per-structure into a
+  # call site where S was always 1) were silently inert here -- confirmed via a live
+  # differential (arithmetic_mean vs product produced byte-identical logits) before
+  # this fix, not assumed from a source read alone.
+  # Length bucketing (S8 v1) does not trim _score_fused_multistate or _score_averaged_jit.
+  if spec.state_position_map is not None:
+    return _score_fused_multistate(
+      spec,
+      protein_iterator,
+      score_fn,
+      sequence_indices_list,
+      noise_levels=noise_levels,
+    )
+
+  from aminx.tiling.axes import N_CANDIDATES  # noqa: PLC0415
+  from aminx.tiling.dispatch import make_axis_dispatch  # noqa: PLC0415
+  from aminx.tiling.planner import plan_axis_strategy  # noqa: PLC0415
+
+  all_scores, all_logits = [], None
+  if spec.return_logits:
+    all_logits = []
+  all_loss_xy, all_conf_xy, all_mask_xy = [], [], []
+
+  canonical_structure_ids = _canonical_structure_ids_for_spec(spec)
+  resolved_structure_ids: list[str] = []
+  structure_offset = 0
+  model_signature = _model_signature(model) if split_fns is not None else None
+
+  # Prepare random key
+  prng_key = jax.random.PRNGKey(spec.run_spec.sampling.random_seed)
+
+  # Structures within one Grain batch are already stacked to a common length by the
+  # loader (batched_ensemble.coordinates is a genuine (batch_size, L, 4, 3) array) --
+  # both the structure axis and the candidate (sequences-to-score) axis are therefore
+  # homogeneous per batch and dispatched via jax.vmap / aminx's own N_CANDIDATES
+  # BatchPlanner composition, never a hand-rolled Python loop over the jitted
+  # score_fn. Only the OUTER loop over Grain batches remains a plain Python loop --
+  # that is host-side streaming-iterator drainage, not JAX computation, the same
+  # exemption generate_multistate_conditional_logits.py's own docstring gives its
+  # result-writing loop.
+  longest_sequence = max((int(seq.shape[0]) for seq in sequence_indices_list), default=0)
+
+  def _score_rung_of(batch: Any) -> int | None:  # noqa: ANN401
+    return score_rung(
+      batch.mask,
+      batch.coordinates.shape[1],
+      max_length=spec.max_length,
+      enabled=spec.length_bucketing,
+      pass_mode=spec.pass_mode,
+      longest_sequence=longest_sequence,
+      average_node_features=spec.average_node_features,
+      multistate=spec.state_position_map is not None,
+    )
+
+  padding_check = _PaddingCheck("score", rung_fn=_score_rung_of)
+  r3_checked = False
+  for _batch_idx, batched_ensemble in enumerate(protein_iterator):
+    padding_check(batched_ensemble)
+    batch_size = batched_ensemble.coordinates.shape[0]
+    batch_structure_ids = _structure_ids_for_batch(
+      canonical_structure_ids,
+      structure_offset=structure_offset,
+      batch_size=batch_size,
+    )
+    struct_len = batched_ensemble.coordinates.shape[1]
+
+    padded_seqs = []
+    for seq_idx in sequence_indices_list:
+      # The structure may be padded to max_length by the loader; the user
+      # sequence must fit within the (padded) structure length.
+      if seq_idx.shape[0] > struct_len:
+        msg = (
+          f"Sequence too long for batch starting at structure "
+          f"{batch_structure_ids[0]}: structure has {struct_len} residues, but "
+          f"sequence has {seq_idx.shape[0]} residues"
+        )
+        raise ValueError(msg)
+      # Pad the sequence to the structure length with X (index 20). Padded positions
+      # contribute 0 to the NLL because the structure MASK is 0 there, which drops them
+      # from both the numerator and the denominator of the masked mean.
+      #
+      # This comment used to credit the ``[..., :20]`` vocabulary slice in
+      # ``_nll_from_logits`` instead. That was wrong, and the wrong attribution kept a real
+      # defect alive: the mask alone already handled padding (verified -- the denominator
+      # is 214 for a 214-residue chain at max_length=512), so the slice's only live effect
+      # was to charge 0 nats for a *genuine* X residue while still counting it in the
+      # denominator. The slice is gone; do not reintroduce it to "handle padding".
+      if seq_idx.shape[0] < struct_len:
+        pad = jnp.full((struct_len - seq_idx.shape[0],), 20, dtype=seq_idx.dtype)
+        seq_idx = jnp.concatenate([seq_idx, pad])  # noqa: PLW2901
+      padded_seqs.append(seq_idx)
+    stacked_sequences = jnp.stack(padded_seqs, axis=0)  # (C, struct_len)
+    n_candidates = stacked_sequences.shape[0]
+    # None unless the caller chose a visibility pattern; None keeps the full-context default.
+    batch_ar_mask = (
+      None
+      if spec.ar_mask is None
+      else _pad_scoring_ar_mask(spec.ar_mask, sequence_indices_list, struct_len)
+    )
+    # ar_masks (#3485): K masks, each padded like ar_mask. The candidate axis below becomes the
+    # K x C (mask, sequence) pairs, so every pair is scored against the one encoding in one map.
+    if spec.ar_masks is not None:
+      # Audit 261118 (#3486): with ar_masks the masks' L must be the structure's own residue
+      # count after chain selection. A longer structure would score its extra residues against X
+      # padding (inside the NLL denominator); a shorter one would silently drop trailing letters.
+      mask_len = int(np.asarray(spec.ar_masks).shape[-1])
+      valid = [int(v) for v in np.asarray(batched_ensemble.mask).reshape(batch_size, -1).sum(axis=1)]
+      if any(v != mask_len for v in valid):
+        msg = (
+          f"score runner: ar_masks cover {mask_len} positions but the structure batch starting at "
+          f"{batch_structure_ids[0]} has {valid} valid residues; with ar_masks every structure "
+          "must have exactly L residues after chain selection (check chain_id)."
+        )
+        raise ValueError(msg)
+    batch_ar_masks = (
+      None
+      if spec.ar_masks is None
+      else _pad_scoring_ar_masks(spec.ar_masks, sequence_indices_list, struct_len)
+    )
+
+    # Pre-derive one key per (structure, candidate) pair via the SAME sequential
+    # jax.random.split chain the pre-refactor loop used (struct outer, candidate
+    # inner) -- a single `split(prng_key, n)` in one shot is a different derivation
+    # tree than n chained `prng_key, subkey = split(prng_key)` calls, so reusing one
+    # batch_key across every structure in a batch (the first version of this fix)
+    # silently changed the sampled decoding order -- and hence the NLL -- for any
+    # batch with more than one structure. Splitting here is cheap (host-side PRNG
+    # ops, no model call) so this loop isn't the composability violation the
+    # candidate/structure axes below are dispatched via vmap/xtrax to avoid.
+    n_keys_needed = batch_size * n_candidates
+    flat_keys = []
+    for _ in range(n_keys_needed):
+      prng_key, subkey = jax.random.split(prng_key)
+      flat_keys.append(subkey)
+    batch_keys = jnp.stack(flat_keys, axis=0).reshape(batch_size, n_candidates, -1)
+    # One backbone-noise key per structure in the batch (N-D2): design's key, shared by every
+    # candidate and every noise level. Never consumed when no level is nonzero.
+    batch_noise_keys = jax.vmap(lambda idx: _score_noise_key(spec, idx))(jnp.arange(batch_size))
+
+    # Per-structure ligand tensors (B, L, M, ...) or None. Only prepared when the spec asks for
+    # a ligand, so the ligand-free path is byte-for-byte what it was.
+    if ligand_requested:
+      ligand_context = _prepare_ligand_context(
+        spec,  # type: ignore[arg-type]  # duck-typed: reads model_family + the ligand fields
+        batched_ensemble,
+        batch_size,
+        struct_len,
+        canonical_structure_ids=canonical_structure_ids,
+        batch_structure_ids=batch_structure_ids,
+        # ScoringSpecification.ligand_conditioning is a plain bool where False means "not
+        # required" (a ligand_context_path alone requests the ligand); it is not the sampling
+        # tri-state's ablate switch.
+        ablate_ligand=False,
+      )
+      batch_ligand = (ligand_context["Y"], ligand_context["Y_t"], ligand_context["Y_m"])
+    else:
+      batch_ligand = (None, None, None)
+
+    # One rung decision per batch (score_rung), shared with the padding warning.
+    # None keeps every array below at its padded length. The averaged-feature
+    # path is never trimmed in S8 v1.
+    rung = _score_rung_of(batched_ensemble)
+    score_coords = batched_ensemble.coordinates
+    score_mask = batched_ensemble.mask
+    score_residue_index = batched_ensemble.residue_index
+    score_chain_index = batched_ensemble.chain_index
+    score_sequences = stacked_sequences
+    score_ligand = batch_ligand
+    if rung is not None:
+      score_coords = trim_residue_axis(score_coords, rung, 1)
+      score_mask = trim_residue_axis(score_mask, rung, 1)
+      score_residue_index = trim_residue_axis(score_residue_index, rung, 1)
+      score_chain_index = trim_residue_axis(score_chain_index, rung, 1)
+      score_sequences = trim_residue_axis(score_sequences, rung, 1)
+      score_ligand = tuple(trim_residue_axis(part, rung, 1) for part in score_ligand)
+      if batch_ar_mask is not None:
+        batch_ar_mask = batch_ar_mask[:rung, :rung]
+      if batch_ar_masks is not None:
+        batch_ar_masks = batch_ar_masks[:, :rung, :rung]
+
+    if split_fns is not None:
+      # The noise-level axis is vmapped, so its activations coexist: scale by D.
+      activation_bytes = len(noise_levels) * _candidate_activation_bytes(
+        split_fns,
+        spec.multi_state_strategy,
+        SimpleNamespace(
+          coordinates=score_coords,
+          mask=score_mask,
+          residue_index=score_residue_index,
+          chain_index=score_chain_index,
+        ),
+        score_ligand,
+        batch_keys[0, 0],
+        score_sequences[0],
+        batch_size=batch_size,
+        model_signature=model_signature,
+      )
+    else:
+      # Output logits only. Known to undercount: the averaged path re-encodes inside the mapped
+      # function. Kept because that path's per-candidate function is host-side Python (it builds
+      # bundles and runs an R3 check on concrete values), so it cannot be lowered for a real
+      # estimate. See #147.
+      activation_bytes = struct_len * 21 * 4  # (L, 21) float32 logits per candidate
+    n_masks = 1 if batch_ar_masks is None else int(batch_ar_masks.shape[0])
+    strategy = plan_axis_strategy(
+      N_CANDIDATES,
+      n_masks * n_candidates,
+      None,
+      activation_bytes_per_element=activation_bytes,
+      # Budget-sized tiles only on the new ar_masks path: every pre-existing caller keeps its
+      # 0.5.3 dispatch (and float reduction order) exactly; see plan_axis_strategy.
+      size_unsized_tiles=batch_ar_masks is not None,
+    )
+    candidate_iterator = make_axis_dispatch(strategy, axis=N_CANDIDATES.name)
+
+    def _score_structure(
+      struct_coords: jax.Array,
+      struct_mask: jax.Array,
+      struct_residue_index: jax.Array,
+      struct_chain_index: jax.Array,
+      struct_keys: jax.Array,
+      struct_ligand: tuple[jax.Array | None, jax.Array | None, jax.Array | None],
+      struct_noise_key: jax.Array,
+      _candidate_iterator: Any = candidate_iterator,  # noqa: ANN401
+      _stacked_sequences: jax.Array = score_sequences,
+      _ar_mask: jax.Array | None = batch_ar_mask,
+      _ar_masks: jax.Array | None = batch_ar_masks,
+      _pair_chunk: int | None = _pair_tile(strategy, n_masks * n_candidates),
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+      ligand_kwargs = (
+        {}
+        if struct_ligand[0] is None
+        else {
+          "ligand_coords": struct_ligand[0],
+          "ligand_atom_types": struct_ligand[1],
+          "ligand_mask": struct_ligand[2],
+        }
+      )
+
+      if split_fns is not None:
+
+        def _run_level(
+          noise: float | jax.Array | None,
+          noise_key: jax.Array | None,
+        ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+          noise_kwargs = {} if noise is None else {"backbone_noise": noise, "noise_key": noise_key}
+          # Encode this structure ONCE per noise level (the ligand tensors belong to the encode
+          # side); the candidate map below closes over the encoding and runs only decode + NLL.
+          encoding = split_fns.encode_structure(
+            struct_coords,
+            struct_mask,
+            struct_residue_index,
+            struct_chain_index,
+            **ligand_kwargs,
+            **noise_kwargs,
+          )
+
+          def _score_one_candidate(
+            item: dict[str, jax.Array],
+          ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+            return split_fns.score_candidate(
+              item["key"],
+              jax.nn.one_hot(item["seq"], 21),
+              encoding,
+              struct_coords,
+              struct_mask,
+              struct_residue_index,
+              struct_chain_index,
+              multi_state_strategy=spec.multi_state_strategy,
+              ar_mask=_ar_mask,
+            )
+
+          if _ar_masks is None:
+            return _candidate_iterator(
+              _score_one_candidate,
+              {"key": struct_keys, "seq": _stacked_sequences},
+            )
+
+          # All K x C (mask, sequence) pairs in one jitted program (#3485): see
+          # scoring.score._score_pairs_kernel. The planner's tile size is passed through, so a
+          # large K x C becomes a chunked lax.map inside the same cached executable.
+          return split_fns.score_pairs(
+            struct_keys,
+            _stacked_sequences,
+            _ar_masks,
+            encoding,
+            struct_coords,
+            struct_mask,
+            struct_residue_index,
+            struct_chain_index,
+            multi_state_strategy=spec.multi_state_strategy,
+            chunk_size=_pair_chunk,
+          )
+
+        out = _over_noise_levels(_run_level, noise_levels, struct_noise_key)
+        if _ar_masks is None:
+          return out
+        # (K * C, ...) -> (K, C, ...); a noise axis, when present, stays after them.
+        k_masks, c_seq = _ar_masks.shape[0], _stacked_sequences.shape[0]
+        return jax.tree.map(lambda leaf: leaf.reshape(k_masks, c_seq, *leaf.shape[1:]), out)
+
+      # Averaged-feature path: it fuses the noise levels itself (D -> 1) from spec.backbone_noise,
+      # so it takes no noise key and has no noise axis.
+      def _score_one_candidate(
+        item: dict[str, jax.Array],
+      ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+        seq_one_hot = jax.nn.one_hot(item["seq"], 21)
+        return score_fn(  # type: ignore[misc]
+          item["key"],
+          seq_one_hot,
+          struct_coords,
+          struct_mask,
+          struct_residue_index,
+          struct_chain_index,
+          multi_state_strategy=spec.multi_state_strategy,
+          **ligand_kwargs,
+        )
+
+      return _candidate_iterator(
+        _score_one_candidate,
+        {"key": struct_keys, "seq": _stacked_sequences},
+      )
+
+    if spec.average_node_features and len(noise_levels) > 1 and not r3_checked:
+      # Hoisted R3 check (#2517): concrete arrays, once, outside the vmap below.
+      score_fn.check_r3(  # type: ignore[union-attr]
+        score_sequences[0],
+        score_coords[0],
+        score_mask[0],
+        score_residue_index[0],
+        score_chain_index[0],
+      )
+      r3_checked = True
+
+    # The third output (a decoding order) is discarded: scoring is full-context, see the
+    # `decoding_orders` note in this function's docstring (debt #1717).
+    batch_scores, batch_logits, _ = jax.vmap(_score_structure)(
+      score_coords,
+      score_mask,
+      score_residue_index,
+      score_chain_index,
+      batch_keys,
+      score_ligand,
+      batch_noise_keys,
+    )
+    if rung is not None:
+      batch_logits = repad_residue_axis(batch_logits, struct_len, -2)
+
+    if spec.return_loss_xy:
+      y_c, _, y_m = batch_ligand
+      cutoff = spec.ligand_cutoff_for_score
+
+      def _calc_struct_loss_xy(
+        coords: jax.Array,
+        res_mask: jax.Array,
+        logits_struct: jax.Array,
+        yc: jax.Array | None,
+        ym: jax.Array | None,
+        *,
+        _seqs: jax.Array = stacked_sequences,
+        _cutoff: float = cutoff,
+      ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        # Production path: the same per-candidate evaluation the unit tests exercise. The
+        # mask depends only on the structure, so every candidate row is identical.
+        # chain_mask (reference run.py:434-439 multiplies it into the combined mask) is left
+        # at None: score() refuses every fixed position above, so the designable-chain mask
+        # is all-ones here and the library default is exactly equivalent.
+        scores = evaluate_ligand_cutoff_candidates(
+          coords, _seqs, logits_struct, res_mask, yc, ym, cutoff=_cutoff,
+        )
+        return scores.loss_xy, scores.ligand_confidence, scores.mask_xy[0]
+
+      b_loss_xy, b_conf, b_mask_xy = jax.vmap(_calc_struct_loss_xy)(
+        batched_ensemble.coordinates, batched_ensemble.mask, batch_logits, y_c, y_m,
+      )
+      all_loss_xy.append(b_loss_xy)
+      all_conf_xy.append(b_conf)
+      all_mask_xy.append(b_mask_xy)
+
+    all_scores.append(batch_scores)
+    if spec.run_spec.sampling.return_logits and all_logits is not None:
+      all_logits.append(batch_logits)
+
+    resolved_structure_ids.extend(batch_structure_ids)
+    structure_offset += batch_size
+
+  # Concatenate results: (num_structures, num_sequences), plus a trailing noise-level axis
+  # (num_structures, num_sequences, D) when the spec has two or more levels (N-D1).
+  scores_array = jnp.concatenate(all_scores, axis=0)
+
+  results = {
+    "scores": scores_array,
+    "mask": jnp.ones(scores_array.shape[0], dtype=jnp.int32),
+    "schema_version": SCORING_SCHEMA_VERSION,
+    "noise_levels": noise_levels,
+    "metadata": {
+      "specification": spec,
+      "skipped_inputs": getattr(protein_iterator, "skipped_frames", []),
+      "structure_ids": resolved_structure_ids,
+      "noise_levels": noise_levels,
+    },
+  }
+
+  if spec.return_loss_xy and all_loss_xy:
+    # Carry the noise axis exactly as ``scores`` does: loss_xy and ligand_confidence are
+    # (S, C) for one noise level and (S, C, D) for D >= 2. mask_xy depends only on the
+    # structure, so it is (S, L).
+    results["loss_xy"] = jnp.concatenate(all_loss_xy, axis=0)
+    results["ligand_confidence"] = jnp.concatenate(all_conf_xy, axis=0)
+    results["mask_xy"] = jnp.concatenate(all_mask_xy, axis=0)
+
+  if spec.run_spec.sampling.return_logits and all_logits is not None:
+    # Shape: (num_structures, num_sequences, L, 21), or (S, C, D, L, 21) with D >= 2 levels.
+    results["logits"] = jnp.concatenate(all_logits, axis=0)
+
+  if spec.run_spec.sampling.return_decoding_orders:
+    results["decoding_orders"] = None
+
+  return results
+
+
+def _score_fused_multistate(  # noqa: PLR0915  # not length-bucketed in S8 v1
+  spec: ScoringSpecification,
+  protein_iterator: Any,  # noqa: ANN401
+  score_fn: Any,  # noqa: ANN401
+  sequence_indices_list: list[jax.Array],
+  *,
+  noise_levels: tuple[float, ...] = (0.0,),
+) -> dict[str, Any]:
+  """Score sequences against ONE genuinely fused multi-state ensemble.
+
+  Every structure loaded from `spec.inputs` is treated as a single state of one PoE
+  bead (matching the sampling path's `sample_multistate_poe_bead` convention) and
+  stacked into a real leading-S bundle, fused via `spec.multi_state_strategy` and
+  aligned via `spec.state_position_map` -- this is what `score()`'s default
+  independent-per-structure loop cannot do (S is always 1 at that call site, so
+  `multi_state_strategy` has nothing to fuse and `state_position_map` is never even
+  read). Drains the ENTIRE iterator first (not just one batch) so this is correct
+  even if a caller sets a small `--batch-size` that would otherwise split the
+  ensemble's states across multiple iterator batches.
+
+  Returns a `scores`/`logits` shaped with a leading dimension of 1 (one fused
+  "structure"), not `len(spec.inputs)` independent ones -- the semantics are
+  genuinely different from the default branch's per-structure output, by design.
+  `scores` is `(1, C)`, or `(1, C, D)` for two or more `noise_levels`; the noise draw uses the
+  design key for structure 0 (`_score_noise_key`). The averaged-feature scorer fuses levels
+  itself (D -> 1), so with `average_node_features` the levels are recorded but not mapped.
+  """
+  # Draining the Grain protein_iterator into host-side lists is not the "hand-rolled
+  # loop over JAX computation" this project's composability convention forbids -- no
+  # JAX op runs until the single jnp.stack below; this is host-side data collection
+  # before entering JAX, the same exemption generate_multistate_conditional_logits.py's
+  # own docstring gives its result-writing loop.
+  all_coords, all_mask, all_residue_index, all_chain_index = [], [], [], []
+  structure_ids: list[str] = []
+  canonical_structure_ids = _canonical_structure_ids_for_spec(spec)
+  structure_offset = 0
+
+  for batched_ensemble in protein_iterator:
+    batch_size = batched_ensemble.coordinates.shape[0]
+    batch_structure_ids = _structure_ids_for_batch(
+      canonical_structure_ids,
+      structure_offset=structure_offset,
+      batch_size=batch_size,
+    )
+    for struct_idx in range(batch_size):
+      all_coords.append(batched_ensemble.coordinates[struct_idx])
+      all_mask.append(batched_ensemble.mask[struct_idx])
+      all_residue_index.append(batched_ensemble.residue_index[struct_idx])
+      all_chain_index.append(batched_ensemble.chain_index[struct_idx])
+    structure_ids.extend(batch_structure_ids)
+    structure_offset += batch_size
+
+  n_states = len(all_coords)
+  state_position_map = jnp.asarray(spec.state_position_map)
+  if state_position_map.shape[0] != n_states:
+    msg = (
+      f"spec.state_position_map has {state_position_map.shape[0]} states but "
+      f"{n_states} structures were loaded from spec.inputs -- these must match for "
+      "genuine multi-state fusion. If you did not intend fusion, leave "
+      "state_position_map unset (the default per-structure independent-scoring path "
+      "is unaffected by this branch)."
+    )
+    raise ValueError(msg)
+
+  stacked_coords = jnp.stack(all_coords, axis=0)  # (S, L, 4, 3)
+  stacked_mask = jnp.stack(all_mask, axis=0)  # (S, L)
+  stacked_residue_index = jnp.stack(all_residue_index, axis=0)
+  stacked_chain_index = jnp.stack(all_chain_index, axis=0)
+  struct_len = stacked_coords.shape[1]
+
+  # Pad every sequence to struct_len (host-side, static shapes, no JAX computation
+  # yet) so the candidate axis below is genuinely homogeneous -- a precondition for
+  # N_CANDIDATES.heterogeneous=False and for stacking into one array to dispatch over.
+  padded_seqs = []
+  for seq_idx in sequence_indices_list:
+    if seq_idx.shape[0] > struct_len:
+      msg = (
+        f"Sequence too long for the fused ensemble: structures have {struct_len} "
+        f"residues, but sequence has {seq_idx.shape[0]} residues"
+      )
+      raise ValueError(msg)
+    if seq_idx.shape[0] < struct_len:
+      pad = jnp.full((struct_len - seq_idx.shape[0],), 20, dtype=seq_idx.dtype)
+      seq_idx = jnp.concatenate([seq_idx, pad])  # noqa: PLW2901
+    padded_seqs.append(seq_idx)
+  stacked_sequences = jnp.stack(padded_seqs, axis=0)  # (C, struct_len)
+  n_candidates = stacked_sequences.shape[0]
+  candidate_keys = jax.random.split(
+    # No fallback to seed 42: main's #2528 fix makes random_seed=0 mean seed 0.
+    jax.random.PRNGKey(spec.run_spec.sampling.random_seed),
+    n_candidates,
+  )
+
+  # Candidate (sequences-to-score) axis dispatched via aminx's own BatchPlanner ->
+  # Vmap/SafeMap composition (never a hand-rolled Python loop over a jitted call) --
+  # the same N_CANDIDATES primitive make_batched_conditional_logits_split_fn's
+  # batched_decode_fn already uses for an analogous "many candidates, one structure
+  # ensemble" dispatch.
+  from aminx.tiling.axes import N_CANDIDATES  # noqa: PLC0415
+  from aminx.tiling.dispatch import make_axis_dispatch  # noqa: PLC0415
+  from aminx.tiling.planner import plan_axis_strategy  # noqa: PLC0415
+
+  activation_bytes = struct_len * 21 * 4  # (L, 21) float32 logits per candidate
+  strategy = plan_axis_strategy(
+    N_CANDIDATES,
+    n_candidates,
+    None,
+    activation_bytes_per_element=activation_bytes,
+  )
+  candidate_iterator = make_axis_dispatch(strategy, axis=N_CANDIDATES.name)
+
+  if spec.average_node_features and len(noise_levels) > 1:
+    # Hoisted R3 check (#2517): eager, on concrete arrays, outside the candidate vmap.
+    score_fn.check_r3(
+      stacked_sequences[0],
+      stacked_coords,
+      stacked_mask,
+      stacked_residue_index,
+      stacked_chain_index,
+    )
+
+  def _run_level(
+    noise: float | jax.Array | None,
+    noise_key: jax.Array | None,
+  ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+    noise_kwargs = {} if noise is None else {"backbone_noise": noise, "noise_key": noise_key}
+
+    def _score_one_candidate(
+      item: dict[str, jax.Array],
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
+      seq_one_hot = jax.nn.one_hot(item["seq"], 21)
+      return score_fn(
+        item["key"],
+        seq_one_hot,
+        stacked_coords,
+        stacked_mask,
+        stacked_residue_index,
+        stacked_chain_index,
+        state_position_map=state_position_map,
+        multi_state_strategy=spec.multi_state_strategy,
+        multi_state_temperature=spec.multi_state_temperature,
+        **noise_kwargs,
+      )
+
+    return candidate_iterator(
+      _score_one_candidate,
+      {"key": candidate_keys, "seq": stacked_sequences},
+    )
+
+  all_scores, all_logits, _ = _over_noise_levels(
+    _run_level,
+    (0.0,) if spec.average_node_features else noise_levels,
+    _score_noise_key(spec, 0),
+  )
+
+  # Leading dim of 1: ONE fused "structure", not len(spec.inputs) independent ones.
+  results: dict[str, Any] = {
+    "scores": all_scores[None],
+    "mask": jnp.ones(1, dtype=jnp.int32),
+    "schema_version": SCORING_SCHEMA_VERSION,
+    "noise_levels": noise_levels,
+    "metadata": {
+      "specification": spec,
+      "skipped_inputs": getattr(protein_iterator, "skipped_frames", []),
+      "noise_levels": noise_levels,
+      "structure_ids": ["fused_multistate"],
+      "fused_structure_ids": structure_ids,
+    },
+  }
+  if spec.return_logits:
+    results["logits"] = all_logits[None]
+  if spec.return_decoding_orders:
+    # Full-context scoring has no decoding order; see score()'s docstring (debt #1717).
+    results["decoding_orders"] = None
+
+  return results
+
+
+def inspect(  # noqa: PLR0915
+  spec: InspectionSpecification | None = None,
+  **kwargs: Any,  # noqa: ANN401
+) -> dict[str, Any]:
+  """Inspect model encodings and features for input structures.
+
+  Computes requested features (unconditional logits, encoded node features, etc.)
+  for each input structure. Features are collected per-structure in the result dict.
+
+  Parameters
+  ----------
+  spec : InspectionSpecification, optional
+      InspectionSpecification object configuring inputs and inspection options.
+      If None, a default specification is constructed from **kwargs.
+  **kwargs : Any
+      Keyword arguments for InspectionSpecification if spec is None.
+
+  Returns
+  -------
+  dict[str, Any]
+      Dictionary with keys:
+        {feature_name}: list or jax.Array
+            Per-feature results. Each feature is a list of arrays, one per structure.
+        mask : jax.Array
+            Structure validity mask. Shape: (num_structures,).
+        schema_version : str
+            Schema version for results ('inspection_v1').
+        metadata : dict
+            Metadata including specification, structure_ids, and skipped_inputs.
+
+  Raises
+  ------
+  NotImplementedError
+      If output_h5_path is set (HDF5 streaming not yet implemented for inspect).
+  ValueError
+      If conditional_logits or decoded_node_features are requested without sequence data.
+
+  """
+  if spec is None:
+    spec = InspectionSpecification(**kwargs)
+
+  purpose = "inspect"
+  if (d := _family_driver_for(spec)) is not None:
+    if getattr(spec, "decoding_order_fn", None) is not None:
+      msg = f"{d.name} does not support decoding_order_fn"
+      raise ValueError(msg)
+    if d.handles(spec, purpose):
+      return run_family_driver(d, spec, purpose)
+    if purpose not in d.mpnn_fallback_purposes:
+      msg = f"{d.name} does not support {purpose} in v1"
+      raise ValueError(msg)
+
+  # F005 guard [260826_aminx-invariant-audit]: runner.inspect cannot honour
+  # spec.state_position_map -- no code path in this body reads it (AST hit
+  # count 0; see findings.jsonl F005 evidence), so a caller-supplied map would
+  # be silently discarded and the output would be single-state while stamped
+  # as multistate. Raise loudly instead, mirroring the F002 guard at
+  # runner.sample (7460516a); score() honours the field via
+  # _score_fused_multistate and campaign verbs implement real state fusion.
+  if getattr(spec, "state_position_map", None) is not None:
+    msg = (
+      "inspect runner: spec.state_position_map is set but runner.inspect has no "
+      "cross-state fusion path -- the field would be silently discarded. Use "
+      "runner.score (which honours state_position_map via _score_fused_multistate) "
+      "or the campaign verbs for genuine multistate output."
+    )
+    raise NotImplementedError(msg)
+
+  if spec.output_h5_path:
+    msg = "inspect runner: HDF5 streaming output not yet implemented; omit --output-h5-path for in-memory results"
+    raise NotImplementedError(msg)
+
+  from aminx.inference.bundle_builder import build_inference_bundle  # noqa: PLC0415
+  from aminx.inference.score_unconditional import kernel as score_unconditional  # noqa: PLC0415
+  from aminx.sampling.conditional_logits import (  # noqa: PLC0415
+    make_batched_conditional_logits_split_fn,
+    make_conditional_logits_fn,
+    make_encoding_conditional_logits_split_fn,
+  )
+  from aminx.utils.autoregression import full_context_ar_mask  # noqa: PLC0415
+  from aminx.utils.structure_metrics import (  # noqa: PLC0415
+    _extract_ca_coordinates,
+    calculate_ca_distance_matrix,
+    calculate_cb_distance_matrix,
+    calculate_closest_atom_distance_matrix,
+    calculate_cosine_similarity,
+    calculate_rmsd,
+    calculate_tm_score,
+  )
+
+  protein_iterator, model = prep_protein_stream_and_model(spec)
+
+  # Stage set flows from the inference plan (single construction) rather than a
+  # direct make_stage_set import — keeps runner.py free of make_stage_set (COMP-534).
+  # purpose="score": only .stage_set is used below, decode_fn is never invoked from this
+  # plan, but "score" is still the semantically correct purpose for an inspection call.
+  unconditional_stage_set = make_inference_plan(model, spec, purpose="score").stage_set
+
+  results_per_feature = {feat: [] for feat in spec.inspection_features}
+  distance_matrices: list[jax.Array] = []
+  ca_coords_for_similarity: list[jax.Array] = []
+
+  canonical_structure_ids = _canonical_structure_ids_for_spec(spec)
+  resolved_structure_ids: list[str] = []
+  structure_offset = 0
+
+  # Prepare random key
+  prng_key = jax.random.PRNGKey(spec.run_spec.sampling.random_seed)
+
+  # decoded_node_features, encoded_node_features and edge_features share one encode per
+  # structure (same inputs, same subkey). The split fn is built on first use, once per call (B5).
+  encode_fn = None
+
+  for _batch_idx, batched_ensemble in enumerate(protein_iterator):
+    batch_size = batched_ensemble.coordinates.shape[0]
+    batch_structure_ids = _structure_ids_for_batch(
+      canonical_structure_ids,
+      structure_offset=structure_offset,
+      batch_size=batch_size,
+    )
+
+    for struct_idx in range(batch_size):
+      struct_coords = batched_ensemble.coordinates[struct_idx]
+      struct_mask = batched_ensemble.mask[struct_idx]
+      struct_residue_index = batched_ensemble.residue_index[struct_idx]
+      struct_chain_index = batched_ensemble.chain_index[struct_idx]
+
+      prng_key, subkey = jax.random.split(prng_key)
+      shared_encoding = None  # filled by the first encoder-sharing feature
+
+      for feature_name in spec.inspection_features:
+        if feature_name == "unconditional_logits":
+          # Build inference bundle and compute unconditional logits
+          # Prepare atom_37 data if sidechain conditioning is enabled
+          if spec.sidechain_conditioning and hasattr(batched_ensemble, "coordinates"):
+            atom_37 = batched_ensemble.coordinates[struct_idx]
+            atom_37_mask = (
+              batched_ensemble.atom_mask[struct_idx]
+              if hasattr(batched_ensemble, "atom_mask") and batched_ensemble.atom_mask is not None
+              else (
+                batched_ensemble.full_atom_mask[struct_idx]
+                if hasattr(batched_ensemble, "full_atom_mask")
+                and batched_ensemble.full_atom_mask is not None
+                else None
+              )
+            )
+          else:
+            atom_37 = None
+            atom_37_mask = None
+
+          bundle, config = build_inference_bundle(
+            coords=struct_coords,
+            mask=struct_mask,
+            residue_index=struct_residue_index,
+            chain_index=struct_chain_index,
+            sequence=None,  # Not needed for unconditional
+            backbone_noise=0.0,
+            ar_mask=None,
+            structure_mapping=None,
+            fixed_mask=spec.fixed_mask,
+            atom_37=atom_37,
+            atom_37_mask=atom_37_mask,
+            mode="score_unconditional",
+            inference=True,
+          )
+          logits = score_unconditional(model, subkey, bundle, config, unconditional_stage_set)  # type: ignore[arg-type]
+          results_per_feature[feature_name].append(logits)
+
+        elif feature_name == "conditional_logits":
+          # Use native sequence from parsed structure, converted to the model's alphabet.
+          # aatype is AF; the model's token space is MPNN. Note :802 below already converts
+          # candidate *strings* via string_to_protein_sequence -- the two alphabets were
+          # ~30 lines apart in this same loop, compared against each other.
+          from aminx.utils.aa_convert import af_to_mpnn  # noqa: PLC0415
+
+          if hasattr(batched_ensemble, "aatype") and batched_ensemble.aatype is not None:
+            native_seq = af_to_mpnn(batched_ensemble.aatype[struct_idx])
+          else:
+            msg = (
+              "Structure does not contain sequence information; cannot compute conditional_logits"
+            )
+            raise ValueError(msg)
+
+          cond_logits_fn = make_conditional_logits_fn(model)
+          logits = cond_logits_fn(
+            subkey,
+            struct_coords,
+            struct_mask,
+            struct_residue_index,
+            struct_chain_index,
+            native_seq,
+          )
+          results_per_feature[feature_name].append(logits)
+
+        elif feature_name == "batched_conditional_logits":
+          # Composable_jax batched path (Part 2, Option B): R replicate keys (bb-noise
+          # draws) x C externally provided candidate sequences, teacher-forced. See
+          # sampling/conditional_logits.py:make_batched_conditional_logits_split_fn and
+          # the using-xtrax skill — axis dispatch (Vmap/SafeMap) is BatchPlanner-resolved,
+          # not hand-rolled. candidate_sequences/n_replicates validated in specs.py
+          # __post_init__ (non-empty candidates; backbone_noise > 0 when n_replicates > 1).
+          from aminx.utils.aa_convert import string_to_protein_sequence  # noqa: PLC0415
+
+          candidate_array = jnp.stack(
+            [string_to_protein_sequence(seq) for seq in spec.candidate_sequences],
+          )
+          bb_noise = spec.backbone_noise
+          if bb_noise is None:
+            bb_noise_scalar = 0.0
+          elif isinstance(bb_noise, (int, float)):
+            bb_noise_scalar = float(bb_noise)
+          else:
+            bb_noise_scalar = float(next(iter(bb_noise)))
+
+          replicate_keys = jax.random.split(subkey, spec.n_replicates)
+
+          batched_encode_fn, batched_decode_fn = make_batched_conditional_logits_split_fn(
+            model,
+            replicate_batch_size=spec.replicate_batch_size,
+            candidate_batch_size=spec.candidate_batch_size,
+          )
+          encodings = batched_encode_fn(
+            struct_coords,
+            struct_mask,
+            struct_residue_index,
+            struct_chain_index,
+            replicate_keys,
+            backbone_noise=bb_noise_scalar,
+            structure_mapping=None,
+          )
+          batched_logits = batched_decode_fn(encodings, candidate_array)  # (R, C, L, 21)
+          results_per_feature[feature_name].append(batched_logits)
+
+        elif feature_name == "decoded_node_features":
+          from aminx.utils.aa_convert import af_to_mpnn  # noqa: PLC0415
+
+          if hasattr(batched_ensemble, "aatype") and batched_ensemble.aatype is not None:
+            native_seq = af_to_mpnn(batched_ensemble.aatype[struct_idx])  # AF -> model space
+          else:
+            msg = "Structure does not contain sequence information; cannot compute decoded_node_features"
+            raise ValueError(msg)
+
+          if shared_encoding is None:
+            if encode_fn is None:
+              encode_fn, _ = make_encoding_conditional_logits_split_fn(model)
+            shared_encoding = encode_fn(
+              struct_coords,
+              struct_mask,
+              struct_residue_index,
+              struct_chain_index,
+              backbone_noise=0.0,
+              prng_key=subkey,
+              structure_mapping=None,
+            )
+          encoding = shared_encoding
+          one_hot = jax.nn.one_hot(native_seq, 21)
+          length = one_hot.shape[0]
+          # Full context minus self, NOT zeros (#4204). ar_mask[i, j] == 1 means i SEES j,
+          # so the previous zeros mask meant these "decoded node features" were decoded
+          # from structure alone -- the native one_hot gathered just above reached
+          # call_conditional but could not influence it.
+          ar_mask = full_context_ar_mask(length)
+          decoded = model.decoder.call_conditional(  # type: ignore[attr-defined]
+            encoding.node_features,
+            encoding.edge_features,
+            encoding.neighbor_indices,
+            encoding.mask,
+            ar_mask,
+            one_hot,
+            model.w_s_embed.weight,
+          )
+          results_per_feature[feature_name].append(decoded)
+
+        elif feature_name in ("encoded_node_features", "edge_features"):
+          # Use the split function to compute encoder output
+          if shared_encoding is None:
+            if encode_fn is None:
+              encode_fn, _ = make_encoding_conditional_logits_split_fn(model)
+            shared_encoding = encode_fn(
+              struct_coords,
+              struct_mask,
+              struct_residue_index,
+              struct_chain_index,
+              backbone_noise=0.0,
+              prng_key=subkey,
+              structure_mapping=None,
+            )
+          enc_output = shared_encoding
+
+          if feature_name == "encoded_node_features":
+            results_per_feature[feature_name].append(enc_output.node_features)
+          else:  # edge_features
+            results_per_feature[feature_name].append(enc_output.edge_features)
+
+      if spec.distance_matrix:
+        if spec.distance_matrix_method == "ca":
+          distance_matrices.append(calculate_ca_distance_matrix(struct_coords))
+        elif spec.distance_matrix_method == "cb":
+          distance_matrices.append(calculate_cb_distance_matrix(struct_coords))
+        elif spec.distance_matrix_method == "closest_atom":
+          atom_mask = (
+            batched_ensemble.atom_mask[struct_idx]
+            if hasattr(batched_ensemble, "atom_mask") and batched_ensemble.atom_mask is not None
+            else jnp.ones(struct_coords.shape[:2])
+          )
+          distance_matrices.append(
+            calculate_closest_atom_distance_matrix(struct_coords, atom_mask),
+          )
+        else:
+          msg = f"Unsupported distance_matrix_method: {spec.distance_matrix_method!r}"
+          raise NotImplementedError(msg)
+
+      if spec.cross_input_similarity:
+        ca_coords_for_similarity.append(_extract_ca_coordinates(struct_coords))
+
+    resolved_structure_ids.extend(batch_structure_ids)
+    structure_offset += batch_size
+
+  results = {
+    "mask": jnp.ones(len(resolved_structure_ids), dtype=jnp.int32),
+    "schema_version": INSPECTION_SCHEMA_VERSION,
+    "metadata": {
+      "specification": spec,
+      "skipped_inputs": getattr(protein_iterator, "skipped_frames", []),
+      "structure_ids": resolved_structure_ids,
+    },
+  }
+
+  # Add feature results
+  results.update(results_per_feature)
+
+  if spec.distance_matrix:
+    results["distance_matrix"] = distance_matrices
+
+  if spec.cross_input_similarity and len(ca_coords_for_similarity) >= 2:
+    n_structures = len(ca_coords_for_similarity)
+    similarity = jnp.zeros((n_structures, n_structures))
+    for i in range(n_structures):
+      for j in range(n_structures):
+        ca_i = ca_coords_for_similarity[i]
+        ca_j = ca_coords_for_similarity[j]
+        min_len = min(ca_i.shape[0], ca_j.shape[0])
+        ca_i = ca_i[:min_len]
+        ca_j = ca_j[:min_len]
+        if spec.similarity_metric == "rmsd":
+          value = calculate_rmsd(ca_i, ca_j, align=True)
+        elif spec.similarity_metric == "tm-score":
+          value = calculate_tm_score(ca_i, ca_j, sequence_length=min_len)
+        elif spec.similarity_metric == "cosine":
+          value = calculate_cosine_similarity(ca_i.reshape(-1), ca_j.reshape(-1))
+        else:
+          msg = f"Unsupported similarity_metric: {spec.similarity_metric!r}"
+          raise NotImplementedError(msg)
+        similarity = similarity.at[i, j].set(value)
+    results["cross_input_similarity"] = similarity
+
+  return results
+
+
+def jacobian(
+  spec: JacobianSpecification | None = None,
+  **kwargs: Any,  # noqa: ANN401
+) -> dict[str, Any]:
+  """Compute Jacobians for input structures.
+
+  ``jacobian_mode='categorical'`` (default): full forward-mode categorical Jacobian
+  (L, 21, L, 21) via ``jax.jacfwd``.
+
+  ``jacobian_mode='reverse'``: reverse-mode score gradient (L, 21) — one backward
+  pass; mutation effect approximated as ``grad[i, m] - grad[i, w]`` (see
+  ``aminx.utils.reverse_jac``).
+  """
+  if spec is None:
+    spec = JacobianSpecification(**kwargs)
+
+  purpose = "jacobian"
+  if (d := _family_driver_for(spec)) is not None:
+    if getattr(spec, "decoding_order_fn", None) is not None:
+      msg = f"{d.name} does not support decoding_order_fn"
+      raise ValueError(msg)
+    if d.handles(spec, purpose):
+      return run_family_driver(d, spec, purpose)
+    if purpose not in d.mpnn_fallback_purposes:
+      msg = f"{d.name} does not support {purpose} in v1"
+      raise ValueError(msg)
+
+  # F005 guard [260826_aminx-invariant-audit]: runner.jacobian cannot honour
+  # spec.state_position_map -- no code path in this body reads it (AST hit
+  # count 0; see findings.jsonl F005 evidence), so a caller-supplied map would
+  # be silently discarded and the output would be single-state while stamped
+  # as multistate. Raise loudly instead, mirroring the F002 guard at
+  # runner.sample (7460516a); score() honours the field via
+  # _score_fused_multistate and campaign verbs implement real state fusion.
+  if getattr(spec, "state_position_map", None) is not None:
+    msg = (
+      "jacobian runner: spec.state_position_map is set but runner.jacobian has "
+      "no cross-state fusion path -- the field would be silently discarded. Use "
+      "runner.score (which honours state_position_map via _score_fused_multistate) "
+      "or the campaign verbs for genuine multistate output."
+    )
+    raise NotImplementedError(msg)
+
+  if spec.combine:
+    msg = "jacobian runner: combine=True not yet implemented; use in-memory results"
+    raise NotImplementedError(msg)
+
+  if spec.jacobian_mode == "reverse" and spec.compute_apc:
+    msg = "jacobian runner: compute_apc applies to categorical Jacobians only; use --no-compute-apc with reverse mode"
+    raise ValueError(msg)
+
+  # spec.fixed_mask -- audit 260826_chain-selection-vendor-superset-audit finding FA3.
+  # Neither make_categorical_jacobian_fn nor make_reverse_jacobian_score_fn takes a
+  # fixed_mask/chain_mask parameter; confirmed via a differential probe (fixed_mask=
+  # all-ones vs all-zeros on an identical structure produced bit-identical
+  # categorical_jacobians). Unlike score() this is not obviously N/A-by-definition --
+  # excluding fixed positions from the sensitivity computation is a plausible real
+  # need -- so this is flagged loud rather than silently guessed at.
+  if spec.fixed_mask is not None and _fixed_mask_has_fixed_positions(spec.fixed_mask):
+    msg = (
+      "jacobian runner: spec.fixed_mask has one or more fixed positions set, but "
+      "neither the categorical nor reverse Jacobian kernel has a parameter for it and "
+      "neither reads it. runner.sample honours fixed_mask (via "
+      "host/_sampling_helper.py's _prepare_fixed_controls); this surface does not yet. "
+      "Omit fixed_mask when calling jacobian()."
+    )
+    raise NotImplementedError(msg)
+
+  from xtrax.run import ZarrStagingSink, derive_sink_spec  # noqa: PLC0415
+
+  from aminx.utils.apc import apc_corrected_frobenius_norm  # noqa: PLC0415
+  from aminx.utils.autoregression import full_context_ar_mask  # noqa: PLC0415
+  from aminx.utils.forward_jac import make_categorical_jacobian_fn  # noqa: PLC0415
+  from aminx.utils.reverse_jac import make_reverse_jacobian_score_fn  # noqa: PLC0415
+
+  protein_iterator, model = prep_protein_stream_and_model(spec)
+  # jacobian_batch_size now reaches the tangent-axis SafeMap tile in forward_jac. Until
+  # 2026-08-12 it was declared on the CLI and the spec and referenced NOWHERE, so a user
+  # hitting an OOM could set it and observe no change whatsoever.
+  cat_jac_fn = make_categorical_jacobian_fn(
+    model,  # type: ignore[arg-type]
+    tangent_batch_size=spec.jacobian_batch_size or None,
+  )
+  # `model`'s runtime union (Aminx | PrxteinLigandMPNN) doesn't structurally satisfy
+  # ModelProtocol -- __call__'s first positional param is named `coords` there vs `key`
+  # in the protocol. Same pre-existing mismatch as the `make_encoding_conditional_logits_
+  # split_fn` calls above. The codebase-wide suppression convention seen nearby (a
+  # mypy-style comment naming the ty rule) predates ty and ty does not act on it -- ty's
+  # own directive uses a different tool prefix, spelled out below -- so this is the first
+  # suppression on this call written in the syntax ty actually reads.
+  encode_fn, reverse_grad_fn = make_reverse_jacobian_score_fn(
+    model,  # ty: ignore[invalid-argument-type]
+  )
+
+  all_jacobians: list[jax.Array] = []
+  apc_matrices: list[jax.Array] | None = [] if spec.compute_apc else None
+
+  canonical_structure_ids = _canonical_structure_ids_for_spec(spec)
+  resolved_structure_ids: list[str] = []
+  structure_offset = 0
+  prng_key = jax.random.PRNGKey(spec.run_spec.sampling.random_seed)
+  use_io_sink = spec.output_h5_path is not None
+  n_staged = 0
+
+  # Output goes straight through xtrax's ZarrStagingSink, one structure at a time.
+  #
+  # This replaced aminx's own JacobianAccumulationSink + io_callback round-trip
+  # (host/output_sinks.py), which was a plain Python list: every Jacobian was held in
+  # memory until the loop finished and only then written. At L=242 one categorical
+  # Jacobian is ~103 MB, so an N-structure run peaked at N x 103 MB for no reason -- the
+  # tensor is already materialized on the host inside this Python loop, so the io_callback
+  # bought nothing here. Staging incrementally means peak memory is one structure.
+  #
+  # The APC matrix is staged alongside it. It was previously computed and then discarded
+  # by every CLI invocation: `results["apc_frobenius_norm"]` only ever existed in the
+  # returned dict, which `cli.py` throws away, so the (L, L) map -- the thing an actual
+  # coupling analysis wants -- could not be obtained from the CLI at all.
+  result_key = "score_gradients" if spec.jacobian_mode == "reverse" else "categorical_jacobians"
+
+  zarr_sink: ZarrStagingSink | None = None
+  resolved_aminx_version: str | None = None
+  if use_io_sink:
+    assert spec.output_h5_path is not None
+    zarr_sink = ZarrStagingSink(
+      derive_sink_spec(
+        spec.run_spec,
+        output_dir=spec.output_h5_path,
+        format="zarr",
+        flush_every=max(1, spec.combine_batch_size or 1),
+      ),
+    )
+    # Resolved HERE, at sink construction -- before `_run_structure_loop` runs any of the
+    # actual (expensive) Jacobian/gradient compute below -- so a PackageNotFoundError
+    # fails this run before it starts, never after a structure's Jacobian has already
+    # been computed and is only now being staged.
+    resolved_aminx_version = resolve_aminx_version()
+
+  def _run_structure_loop(*, stage_to_sink: bool) -> None:
+    nonlocal prng_key, structure_offset, n_staged
+
+    global_idx = 0
+    for _batch_idx, batched_ensemble in enumerate(protein_iterator):
+      batch_size = batched_ensemble.coordinates.shape[0]
+      batch_structure_ids = _structure_ids_for_batch(
+        canonical_structure_ids,
+        structure_offset=structure_offset,
+        batch_size=batch_size,
+      )
+
+      for struct_idx in range(batch_size):
+        struct_coords = batched_ensemble.coordinates[struct_idx]
+        struct_mask = batched_ensemble.mask[struct_idx]
+        struct_residue_index = batched_ensemble.residue_index[struct_idx]
+        struct_chain_index = batched_ensemble.chain_index[struct_idx]
+
+        from aminx.utils.aa_convert import af_to_mpnn  # noqa: PLC0415
+
+        if hasattr(batched_ensemble, "aatype") and batched_ensemble.aatype is not None:
+          native_seq = af_to_mpnn(batched_ensemble.aatype[struct_idx])  # AF -> model space
+        else:
+          msg = "Structure does not contain sequence information; cannot compute Jacobian"
+          raise ValueError(msg)
+
+        prng_key, subkey = jax.random.split(prng_key)
+        if spec.jacobian_mode == "reverse":
+          encoding = encode_fn(
+            struct_coords,
+            struct_mask,
+            struct_residue_index,
+            struct_chain_index,
+            backbone_noise=0.0,
+            prng_key=subkey,
+            structure_mapping=None,
+          )
+          one_hot = jax.nn.one_hot(native_seq, 21)
+          length = one_hot.shape[0]
+          # Full context minus self, NOT zeros. An all-zero ar_mask admits no sequence
+          # information into the decoder at all (model/decoder.py:144-147 uses it to gate
+          # the sequence edge features). That annihilated the forward categorical Jacobian
+          # outright; measured here it shifts the reverse score gradient by ~0.16% of its
+          # magnitude rather than zeroing it, because the score reads one_hot directly --
+          # affected, not destroyed, but wrong either way for a mutation-effect estimate.
+          ar_mask = full_context_ar_mask(length)
+          jac = reverse_grad_fn(encoding, one_hot, ar_mask)
+        else:
+          jac = cat_jac_fn(
+            subkey,
+            struct_coords,
+            struct_mask,
+            struct_residue_index,
+            struct_chain_index,
+            native_seq,
+          )
+
+        apc = None
+        if apc_matrices is not None:
+          apc = apc_corrected_frobenius_norm(
+            jac,
+            residue_batch_size=spec.apc_residue_batch_size,
+          )
+
+        if stage_to_sink:
+          assert zarr_sink is not None
+          payload: dict[str, Any] = {result_key: np.asarray(jac)}
+          if apc is not None:
+            payload["apc_frobenius_norm"] = np.asarray(apc)
+          # No root stage on this path (see task_id `260910_aminx-sink-provenance-schema`
+          # AC3) -- the wheel version and PRNG seed are stamped per-record instead. Uses
+          # the SAME `spec.run_spec.sampling.random_seed` value that built `prng_key`
+          # above. None becomes 42 once at specification construction; 0 stays 0.
+          # This record never stages a "logits" array
+          # (result_key is "score_gradients" or "categorical_jacobians"), so
+          # `logits_bias_semantics` does not apply here.
+          zarr_sink.stage(
+            (str(global_idx),),
+            attrs={
+              "aminx_version": resolved_aminx_version,
+              **prng_seed_attrs(spec.run_spec.sampling.random_seed),
+            },
+            **payload,
+          )
+          n_staged += 1
+          # Deliberately NOT retained: holding `jac` here would reinstate the
+          # accumulate-everything behavior this streaming path exists to remove.
+        else:
+          all_jacobians.append(jac)
+          if apc_matrices is not None and apc is not None:
+            apc_matrices.append(apc)
+        global_idx += 1
+
+      resolved_structure_ids.extend(batch_structure_ids)
+      structure_offset += batch_size
+
+  _run_structure_loop(stage_to_sink=use_io_sink)
+
+  n_results = n_staged if use_io_sink else len(all_jacobians)
+  results: dict[str, Any] = {
+    # Empty when streaming: the tensors are on disk, not in this dict. Read them back from
+    # ``results["output_path"]`` rather than expecting them here -- materializing an
+    # N x (L, 21, L, 21) list is precisely what the streaming path avoids.
+    result_key: [] if use_io_sink else all_jacobians,
+    "jacobian_mode": spec.jacobian_mode,
+    "mask": jnp.ones(n_results, dtype=jnp.int32),
+    "n_structures": n_results,
+    "schema_version": JACOBIAN_SCHEMA_VERSION,
+    "metadata": {
+      "specification": spec,
+      "skipped_inputs": getattr(protein_iterator, "skipped_frames", []),
+      "structure_ids": resolved_structure_ids,
+    },
+  }
+
+  if apc_matrices is not None and not use_io_sink:
+    results["apc_frobenius_norm"] = apc_matrices
+
+  if use_io_sink and zarr_sink is not None:
+    from xtrax.run import fsync_tree, zarr_content_digest  # noqa: PLC0415
+
+    out_path = spec.output_h5_path
+    assert out_path is not None
+    zarr_sink.drain()
+    # fsync BEFORE digesting: the digest is only a claim about durable bytes if the tree
+    # has actually reached disk. Both primitives are xtrax's -- they were hoisted out of
+    # aminx into xtrax.run.zarr_integrity, so this uses the promoted version rather than
+    # a local copy.
+    fsync_tree(out_path)
+    results["output_path"] = str(out_path)
+    results["output_digest"] = zarr_content_digest(out_path)
+
+  return results

@@ -1,0 +1,1428 @@
+//! Information and settings for the opened, or to-be opened molecules.
+
+use std::io::Cursor;
+
+use bio_apis::{bmrb, chebi, drugbank, emdb, lmsd, pdbe, pubchem, rcsb, uniprot};
+use bio_files::{
+    DensityMap, ResidueType, density_from_2fo_fc_rcsb_gemmi,
+    md_params::{BondStretchingParams, ForceFieldParams},
+};
+use dynamics::merge_params;
+use egui::{Button, Color32, RichText, Ui};
+use graphics::{EngineUpdates, Scene};
+use lin_alg::f64::Vec3;
+use mol_defs::molecules::{
+    Atom, Bond, MolGenericRef, MolGenericRefMut, MolIdent, MolType, PeptideIdent, Residue,
+    aa_color,
+    nucleic_acid::NucleicAcidType,
+    pocket::{POCKET_DIST_THRESH_DEFAULT, Pocket},
+};
+
+use crate::{
+    button,
+    cam::move_cam_to_active_mol,
+    drawing,
+    drawing::{
+        CHARGE_MAP_MAX, CHARGE_MAP_MIN, COLOR_AA_NON_RESIDUE_EGUI, wrappers::draw_all_pockets,
+    },
+    file_io::gemmi_dir,
+    label,
+    md::mdposit,
+    peptide_ligands::{LigAttachUi, detach_het_res, remove_het_res},
+    render::MESH_POCKET_START,
+    selection::{SelAtom, Selection},
+    split_join::{JoinLigand, join_ligands, split_lig_at_bonds},
+    state::{MetadataTarget, State},
+    ui::{
+        COL_SPACING, COLOR_ACTION, COLOR_HIGHLIGHT, MAX_TITLE_LEN, load_all_idents_button, popup,
+        popup::MetadataSource, util::Idents,
+    },
+    util,
+    util::{
+        RedrawFlags, handle_err, handle_success, make_egui_color, make_lig_3d, make_lig_from_res,
+        move_mol_to_res,
+    },
+};
+
+/// `posit_override` is for example, relative atom positions, such as a positioned ligand.
+fn disp_atom_data(
+    atom: &Atom,
+    residues: &[Residue],
+    posit_override: Option<Vec3>,
+    ui: &mut Ui,
+    show_role: bool,
+    show_posit: bool,
+) {
+    let text_0 = format!("#{}", atom.serial_number);
+    label!(ui, text_0, Color32::WHITE);
+
+    if show_posit {
+        // Similar to `Vec3`'s format impl, but with fewer digits.
+        let posit = match posit_override {
+            Some(p) => p,
+            None => atom.posit,
+        };
+
+        let posit_txt = format!("|{:.3}, {:.3}, {:.3}|", posit.x, posit.y, posit.z);
+        label!(ui, posit_txt, Color32::GOLD);
+    }
+
+    let text_b = atom.element.to_letter();
+
+    let atom_color = make_egui_color(atom.element.color());
+    label!(ui, text_b, atom_color);
+
+    // Hijacking `show_posit` here to hide res/dihedral info as well.
+    if let Some(res_i) = atom.residue
+        && show_posit
+    {
+        // Placeholder for water etc.
+        let mut res_color = COLOR_AA_NON_RESIDUE_EGUI;
+
+        let res_txt = if res_i >= residues.len() {
+            "Invalid res".to_owned()
+        } else {
+            let res = &residues[res_i];
+
+            if let ResidueType::AminoAcid(aa) = res.res_type {
+                res_color = make_egui_color(aa_color(aa));
+            }
+
+            format!("  {res}")
+        };
+
+        label!(ui, res_txt, res_color);
+    }
+
+    if show_role {
+        let role = match atom.role {
+            Some(r) => format!("Role: {r}"),
+            None => String::new(),
+        };
+        label!(ui, role, Color32::LIGHT_GRAY);
+    }
+
+    if let Some(tir) = &atom.type_in_res {
+        label!(ui, tir.to_string(), Color32::LIGHT_YELLOW);
+    }
+
+    if let Some(tir) = &atom.type_in_res_general {
+        label!(ui, tir, Color32::LIGHT_YELLOW);
+    }
+
+    if let Some(ff) = &atom.force_field_type {
+        label!(ui, format!("FF: {ff}"), Color32::LIGHT_YELLOW);
+    }
+
+    if let Some(q) = &atom.partial_charge {
+        let plus = if *q > 0. { "+" } else { "" };
+        let color = make_egui_color(drawing::color_viridis_float(
+            *q,
+            CHARGE_MAP_MIN,
+            CHARGE_MAP_MAX,
+        ));
+
+        // todo: In some cases, this is getting rendered over the initial text? EGUI error?
+        label!(ui, format!("{plus}q: {q:.2}"), color);
+    }
+}
+
+fn ligand_params(state: &State, ident: &str) -> Option<ForceFieldParams> {
+    let general = state
+        .selected_force_field()
+        .parameters(dynamics::FfMolType::SmallOrganic)?;
+    let specific = state.mol_specific_params.get(ident).or_else(|| {
+        state
+            .mol_specific_params
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(ident))
+            .map(|(_, params)| params)
+    });
+
+    Some(match specific {
+        Some(specific) => merge_params(general, specific),
+        None => general.clone(),
+    })
+}
+
+/// `posit_override` is for example, relative atom positions, such as a positioned ligand.
+fn disp_bond_data(
+    bond: &Bond,
+    atoms: &[Atom],
+    params: Option<&ForceFieldParams>,
+    resolved: Option<(&BondStretchingParams, f32, f32)>,
+    ui: &mut Ui,
+) {
+    let atom_0 = &atoms[bond.atom_0];
+    let atom_1 = &atoms[bond.atom_1];
+
+    ui.label("Bond");
+    label!(
+        ui,
+        format!("#{} - #{}", bond.atom_0_sn, bond.atom_1_sn),
+        Color32::WHITE
+    );
+
+    label!(
+        ui,
+        format!(
+            "{} {} {}",
+            atom_0.element.to_letter(),
+            bond.bond_type.to_visual_str(),
+            atom_1.element.to_letter()
+        ),
+        Color32::LIGHT_BLUE
+    );
+
+    // todo: Cache??
+    let posit_0 = atom_0.posit;
+    let posit_1 = atom_1.posit;
+    let dist = (posit_1 - posit_0).magnitude();
+
+    label!(ui, format!("{dist:.3} Å"), Color32::LIGHT_YELLOW);
+
+    let by_type = params.and_then(|p| {
+        let ff_0 = atom_0.force_field_type.as_deref()?;
+        let ff_1 = atom_1.force_field_type.as_deref()?;
+        let bond = p.get_bond(&(ff_0.to_owned(), ff_1.to_owned()), true)?;
+        let mass_0 = p
+            .mass
+            .get(ff_0)
+            .map(|m| m.mass)
+            .unwrap_or_else(|| atom_0.element.atomic_weight());
+        let mass_1 = p
+            .mass
+            .get(ff_1)
+            .map(|m| m.mass)
+            .unwrap_or_else(|| atom_1.element.atomic_weight());
+        Some((bond, mass_0, mass_1))
+    });
+    if let Some((b, mass_0, mass_1)) = resolved.or(by_type) {
+        ui.label(RichText::new("Param len:"));
+        label!(ui, format!("{:.3} Å", b.r_0), Color32::LIGHT_BLUE);
+        let freq = util::bond_freq(b.k_b, mass_0, mass_1);
+        ui.label(format!("Freq: {freq:.2} ps^-1"));
+    }
+}
+
+/// Display data for a selection owned by the molecule editor.
+///
+/// Editor selections use the ligand variants of `Selection`, but their atom and bond indices refer
+/// to `state.mol_editor.mol`, not to the corresponding molecule in `state.ligands`. Looking them up
+/// through the normal `selected_data` path can therefore display an unrelated original atom, or no
+/// data at all when the edited molecule has grown beyond the original molecule's length.
+pub(in crate::ui) fn selected_data_mol_editor(state: &State, selection: &Selection, ui: &mut Ui) {
+    let mol = &state.mol_editor.mol;
+    let params = state
+        .ff_param_set
+        .amber()
+        .unwrap()
+        .small_mol
+        .as_ref()
+        .map(|general| merge_params(general, &state.mol_editor.md.mol_specific_params));
+
+    ui.horizontal(|ui| match selection {
+        Selection::AtomLig((_, atom_i)) => {
+            let Some(atom) = mol.common.get_atom(*atom_i) else {
+                return;
+            };
+            let posit = mol
+                .common
+                .atom_posits
+                .get(*atom_i)
+                .copied()
+                .unwrap_or(atom.posit);
+
+            disp_atom_data(atom, &[], Some(posit), ui, false, true);
+        }
+        Selection::AtomsLig((_, atom_is)) => {
+            ui.label(format!("{} atoms |", atom_is.len()));
+
+            for atom_i in atom_is {
+                let Some(atom) = mol.common.get_atom(*atom_i) else {
+                    continue;
+                };
+                let posit = mol
+                    .common
+                    .atom_posits
+                    .get(*atom_i)
+                    .copied()
+                    .unwrap_or(atom.posit);
+
+                disp_atom_data(atom, &[], Some(posit), ui, false, false);
+                ui.label("|");
+            }
+        }
+        Selection::BondLig((_, bond_i)) => {
+            let Some(bond) = mol.common.get_bond(*bond_i) else {
+                return;
+            };
+            disp_bond_data(bond, &mol.common.atoms, params.as_ref(), None, ui);
+        }
+        Selection::BondsLig((_, bond_is)) => {
+            for bond_i in bond_is {
+                let Some(bond) = mol.common.get_bond(*bond_i) else {
+                    continue;
+                };
+                disp_bond_data(bond, &mol.common.atoms, params.as_ref(), None, ui);
+            }
+        }
+        _ => {}
+    });
+}
+
+/// Display text of the selected atom or residue.
+pub(in crate::ui) fn selected_data(state: &State, selection: &Selection, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        match selection {
+            Selection::Atoms(objects) => {
+                let count: usize = objects.iter().map(|o| o.atoms.len()).sum();
+                ui.label(format!(
+                    "{count} selected atoms in {} objects",
+                    objects.len()
+                ));
+            }
+            Selection::AtomPeptide(sel_i) => {
+                let Some(mol) = state
+                    .peptide_for_tools_i()
+                    .and_then(|i| state.peptides.get(i))
+                else {
+                    return;
+                };
+                if *sel_i >= mol.common.atoms.len() {
+                    return;
+                }
+
+                let atom = &mol.common.atoms[*sel_i];
+                disp_atom_data(atom, &mol.residues, None, ui, true, true);
+            }
+            Selection::AtomsPeptide(atom_is) => {
+                let Some(mol) = state
+                    .peptide_for_tools_i()
+                    .and_then(|i| state.peptides.get(i))
+                else {
+                    return;
+                };
+
+                ui.label(format!("{} atoms |", atom_is.len()));
+
+                for atom_i in atom_is {
+                    let Some(atom) = mol.common.get_atom(*atom_i) else {
+                        return;
+                    };
+                    let posit = mol.common.atom_posits[*atom_i];
+
+                    disp_atom_data(atom, &mol.residues, Some(posit), ui, false, false);
+
+                    ui.label("|");
+                }
+            }
+            Selection::AtomLig((mol_i, atom_i)) => {
+                let Some(mol) = state.get_small(*mol_i) else {
+                    return;
+                };
+
+                let Some(atom) = mol.common.get_atom(*atom_i) else {
+                    return;
+                };
+                let posit = mol.common.atom_posits[*atom_i];
+
+                disp_atom_data(atom, &[], Some(posit), ui, false, true);
+            }
+            // todo: Update A/R
+            Selection::AtomsLig((mol_i, atom_is)) => {
+                let Some(mol) = state.get_small(*mol_i) else {
+                    return;
+                };
+
+                ui.label(format!("{} atoms |", atom_is.len()));
+
+                for atom_i in atom_is {
+                    let Some(atom) = mol.common.get_atom(*atom_i) else {
+                        return;
+                    };
+                    let posit = mol.common.atom_posits[*atom_i];
+
+                    disp_atom_data(atom, &[], Some(posit), ui, false, false);
+                    ui.label("|");
+                }
+            }
+            // todo DRY
+            Selection::AtomNucleicAcid((mol_i, atom_i)) => {
+                let Some(mol) = state.get_nucleic_acid(*mol_i) else {
+                    return;
+                };
+
+                let Some(atom) = mol.common.get_atom(*atom_i) else {
+                    return;
+                };
+                let posit = mol.common.atom_posits[*atom_i];
+
+                disp_atom_data(atom, &mol.residues, Some(posit), ui, true, true);
+            }
+            Selection::ResiduesNucleicAcid((mol_i, indices)) => {
+                if let [i] = indices.as_slice() {
+                    if let Some(residue) = state
+                        .get_nucleic_acid(*mol_i)
+                        .and_then(|m| m.residues.get(*i))
+                    {
+                        ui.label(format!("#{} {}", residue.serial_number, residue.res_type));
+                    }
+                } else {
+                    ui.label(format!("{} residues", indices.len()));
+                }
+            }
+            // todo DRY
+            Selection::AtomLipid((mol_i, atom_i)) => {
+                let Some(mol) = state.get_lipid(*mol_i) else {
+                    return;
+                };
+
+                let Some(atom) = mol.common.get_atom(*atom_i) else {
+                    return;
+                };
+                let posit = mol.common.atom_posits[*atom_i];
+
+                disp_atom_data(atom, &mol.residues, Some(posit), ui, true, true);
+            }
+            // todo DRY
+            Selection::AtomPocket((mol_i, atom_i)) => {
+                let Some(mol) = state.get_pocket(*mol_i) else {
+                    return;
+                };
+
+                let Some(atom) = mol.common.get_atom(*atom_i) else {
+                    return;
+                };
+                let posit = mol.common.atom_posits[*atom_i];
+
+                disp_atom_data(atom, &[], Some(posit), ui, true, true);
+            }
+            Selection::Residue(sel_i) => {
+                if let Some(mol) = state
+                    .peptide_for_tools_i()
+                    .and_then(|i| state.peptides.get(i))
+                {
+                    if *sel_i >= mol.residues.len() {
+                        return;
+                    }
+
+                    let res = &mol.residues[*sel_i];
+                    // todo: Color-coding by part like atom, to make easier to view.
+
+                    let mut res_color = COLOR_AA_NON_RESIDUE_EGUI;
+
+                    if let ResidueType::AminoAcid(aa) = res.res_type {
+                        res_color = make_egui_color(aa_color(aa));
+                    }
+                    label!(ui, res.to_string(), res_color);
+
+                    if !res.atoms.is_empty()
+                        && let Some(i_chain) = mol.common.atoms[res.atoms[0]].chain
+                    {
+                        if i_chain >= mol.chains.len() {
+                            eprintln!("Res chain out of bounds when drawing label");
+                        } else {
+                            let ch_name = &mol.chains[i_chain].id;
+                            label!(ui, format!("Ch: {}", ch_name), Color32::WHITE);
+                        }
+                    }
+                }
+            }
+            Selection::Residues(sel_is) => {
+                // todo: More detail A/R
+                label!(ui, format!("{} residues", sel_is.len()), Color32::WHITE);
+            }
+            Selection::BondPeptide(bond_i) => {
+                let Some(mol) = state
+                    .peptide_for_tools_i()
+                    .and_then(|i| state.peptides.get(i))
+                else {
+                    return;
+                };
+                let Some(bond) = mol.common.get_bond(*bond_i) else {
+                    return;
+                };
+
+                disp_bond_data(
+                    bond,
+                    &mol.common.atoms,
+                    state
+                        .selected_force_field()
+                        .parameters(dynamics::FfMolType::Peptide),
+                    state.force_fields.bond_params(
+                        MolType::Peptide,
+                        state.peptide_for_tools_i().unwrap(),
+                        bond.atom_0_sn,
+                        bond.atom_1_sn,
+                    ),
+                    ui,
+                );
+            }
+            Selection::BondLig((mol_i, bond_i)) => {
+                let Some(mol) = state.get_small(*mol_i) else {
+                    return;
+                };
+                let Some(bond) = mol.common.get_bond(*bond_i) else {
+                    return;
+                };
+
+                let params = ligand_params(state, &mol.common.ident);
+                disp_bond_data(
+                    bond,
+                    &mol.common.atoms,
+                    params.as_ref(),
+                    state.force_fields.bond_params(
+                        MolType::Ligand,
+                        *mol_i,
+                        bond.atom_0_sn,
+                        bond.atom_1_sn,
+                    ),
+                    ui,
+                );
+            }
+            Selection::BondsLig((mol_i, bond_is)) => {
+                let Some(mol) = state.get_small(*mol_i) else {
+                    return;
+                };
+                let params = ligand_params(state, &mol.common.ident);
+
+                for bond_i in bond_is {
+                    if *bond_i >= mol.common.bonds.len() {
+                        return;
+                    }
+
+                    let bond = &mol.common.bonds[*bond_i];
+                    disp_bond_data(
+                        bond,
+                        &mol.common.atoms,
+                        params.as_ref(),
+                        state.force_fields.bond_params(
+                            MolType::Ligand,
+                            *mol_i,
+                            bond.atom_0_sn,
+                            bond.atom_1_sn,
+                        ),
+                        ui,
+                    );
+                }
+            }
+            Selection::BondNucleicAcid((mol_i, bond_i)) => {
+                let Some(mol) = state.get_nucleic_acid(*mol_i) else {
+                    return;
+                };
+                let Some(bond) = mol.common.get_bond(*bond_i) else {
+                    return;
+                };
+
+                let params = match mol.na_type {
+                    NucleicAcidType::Dna => state
+                        .selected_force_field()
+                        .parameters(dynamics::FfMolType::Dna),
+                    NucleicAcidType::Rna => state
+                        .selected_force_field()
+                        .parameters(dynamics::FfMolType::Rna),
+                };
+
+                disp_bond_data(
+                    bond,
+                    &mol.common.atoms,
+                    params,
+                    state.force_fields.bond_params(
+                        MolType::NucleicAcid,
+                        *mol_i,
+                        bond.atom_0_sn,
+                        bond.atom_1_sn,
+                    ),
+                    ui,
+                );
+            }
+            Selection::BondLipid((mol_i, bond_i)) => {
+                let Some(mol) = state.get_lipid(*mol_i) else {
+                    return;
+                };
+                let Some(bond) = mol.common.get_bond(*bond_i) else {
+                    return;
+                };
+
+                disp_bond_data(
+                    bond,
+                    &mol.common.atoms,
+                    state
+                        .selected_force_field()
+                        .parameters(dynamics::FfMolType::Lipid),
+                    state.force_fields.bond_params(
+                        MolType::Lipid,
+                        *mol_i,
+                        bond.atom_0_sn,
+                        bond.atom_1_sn,
+                    ),
+                    ui,
+                );
+            }
+            Selection::BondPocket((mol_i, bond_i)) => {
+                let Some(mol) = state.get_pocket(*mol_i) else {
+                    return;
+                };
+                let Some(bond) = mol.common.get_bond(*bond_i) else {
+                    return;
+                };
+
+                disp_bond_data(bond, &mol.common.atoms, None, None, ui);
+            }
+            Selection::ComponentEditor(_) => {}
+            Selection::None => {}
+        }
+    });
+}
+
+/// Actions that are specific to the active protein. The common molecule description is rendered
+/// by [`display_mol_data`], alongside the corresponding actions for every other molecule type.
+fn display_peptide_actions(
+    state: &mut State,
+    peptide_i: usize,
+    scene: &mut Scene,
+    ui: &mut Ui,
+    redraw_lig: &mut bool,
+    updates: &mut EngineUpdates,
+) {
+    // These variables prevent double borrows.
+    let mut res_to_make = None;
+    let mut res_to_detach = None;
+    let mut res_to_remove = None;
+    let mut move_lig_to_res = None;
+    let mut move_lig_to_sel = None;
+    let mut move_cam = false;
+    if let Some(pep) = state.peptides.get(peptide_i) {
+        // if ui.button(RichText::new("Close").color(Color32::LIGHT_RED)).clicked() {
+        //     *close = true;
+        // }
+
+        for ident in &pep.idents {
+            // EMDB and AlphaFold DB accessions carry their own prefixes, so need no label.
+            let (text, db) = match ident {
+                PeptideIdent::Rcsb(id) => (format!("RCSB: {id}"), "RCSB PDB"),
+                PeptideIdent::Pdbe(id) => (format!("PDBe: {id}"), "PDBe"),
+                PeptideIdent::Uniprot(id) => (format!("UniProt: {id}"), "UniProt"),
+                PeptideIdent::AlphaFoldDb(id) => (id.clone(), "AlphaFold DB"),
+                PeptideIdent::Emdb(id) => (id.clone(), "EMDB"),
+                PeptideIdent::Bmrb(id) => (format!("BMRB: {id}"), "BMRB"),
+            };
+
+            if ui
+                .button(text)
+                .on_hover_text(format!(
+                    "Open a web browser to the {db} page for this entry."
+                ))
+                .clicked()
+            {
+                match ident {
+                    PeptideIdent::Rcsb(id) => rcsb::open_overview(id),
+                    PeptideIdent::Pdbe(id) => pdbe::open_entry(id),
+                    PeptideIdent::Uniprot(id) => uniprot::open_overview(id),
+                    PeptideIdent::AlphaFoldDb(id) => uniprot::open_alphafold_view(id),
+                    PeptideIdent::Emdb(id) => emdb::open_overview(id),
+                    PeptideIdent::Bmrb(id) => bmrb::open_overview(id),
+                }
+            }
+        }
+
+        if let Some(pdb_id) = mdposit::pdb_id(&pep.idents) {
+            let button = ui
+                .button("MdPosit Traj")
+                .on_hover_text(format!("Find MDposit trajectories for {pdb_id}."));
+            if button.clicked() {
+                state
+                    .volatile
+                    .mdposit
+                    .open(pdb_id.clone(), button.rect.left_bottom(), ui.ctx());
+            }
+
+            let running = state.volatile.mdposit.quick_running();
+            let quick = ui
+                .add_enabled(!running, Button::new("Quick Traj"))
+                .on_hover_text(format!(
+                    "Download a trajectory of {pdb_id} from the best-matching MDposit \
+                    simulation, and play it. Set its download size, and whether it favors \
+                    smooth motion or time covered, in Settings."
+                ))
+                .on_disabled_hover_text("Downloading an MDposit trajectory…");
+            if running {
+                ui.spinner();
+            }
+
+            if quick.clicked() {
+                let residues = pep
+                    .residues
+                    .iter()
+                    .filter(|res| matches!(res.res_type, ResidueType::AminoAcid(_)))
+                    .count();
+
+                state.volatile.mdposit.quick(
+                    pdb_id.clone(),
+                    residues,
+                    &state.to_save.md,
+                    state.volatile.prefs_dir.clone(),
+                    ui.ctx(),
+                );
+                handle_success(
+                    &mut state.ui,
+                    format!("Finding an MDposit trajectory for {pdb_id}…"),
+                );
+            }
+        }
+
+        if ui
+            .button("Dihe")
+            .on_hover_text("Draw a Ramachandran plot of the dihedral angles of the peptide.")
+            .clicked()
+        {
+            state.ui.popup.rama_plot = !state.ui.popup.rama_plot;
+        }
+
+        let res_sel_i = match state.ui.selection {
+            Selection::AtomPeptide(sel_i) => pep.common.atoms.get(sel_i).and_then(|a| a.residue),
+            Selection::Residue(sel_i) => {
+                if sel_i >= pep.residues.len() {
+                    handle_err(
+                        &mut state.ui,
+                        "Residue selection is out of bounds.".to_owned(),
+                    );
+                    None
+                } else {
+                    Some(sel_i)
+                }
+            }
+            _ => None,
+        };
+        let res_selected = res_sel_i.and_then(|i| pep.residues.get(i));
+
+        if let Some(mol) = state.active_mol() {
+            for res in &pep.het_residues {
+                // Note: This approach will fail if there are multiple hetero residues of similar len to
+                // this ligand.
+
+                if (res.atoms.len() as i32 - mol.common().atoms.len() as i32) < 3 {
+                    let name = match &res.res_type {
+                        ResidueType::Other(name) => name,
+                        _ => "hetero residue",
+                    };
+                    ui.add_space(COL_SPACING / 2.);
+
+                    // todo: Rework this "Lig to [het res name]" and add back as required. (2026-09-19)
+                    //
+                    // if button!(ui, format!("Lig to {name}"), COLOR_HIGHLIGHT,
+                    //     "Move the ligand to be colocated with this residue. this is intended to \
+                    // be used to synchronize the ligand with a pre-positioned hetero residue in the protein file, e.g. \
+                    // prior to docking. In addition to moving \
+                    // its center, this attempts to align each atom with its equivalent on the residue."
+                    //
+                    //     )
+                    //         .clicked()
+                    //     {
+                    //         // todo: I don't like this clone, but it avoids a dbl-borrow.
+                    //         move_lig_to_res = Some(res.clone());
+                    //     }
+                    break;
+                }
+            }
+        }
+
+        if let Some((mol_type, _)) = state.volatile.active_mol
+            && mol_type == MolType::Ligand
+            && !matches!(state.ui.selection, Selection::None | Selection::AtomLig(_))
+            && button!(
+                ui,
+                "Move lig to sel",
+                COLOR_HIGHLIGHT,
+                "Re-position the ligand to be colocated with the selected atom or residue."
+            )
+            .clicked()
+        {
+            let peptide = &state.peptides[peptide_i];
+            let atom_sel = peptide.get_sel_atom(&state.ui.selection);
+
+            if let Some(a) = atom_sel {
+                // See note on why we clone above.
+                move_lig_to_sel = Some(a.clone());
+            }
+        }
+    }
+
+    let mut density_to_load = None;
+    if let Some(mol) = state.peptides.get(peptide_i)
+        && let Some(files_avail) = &mol.rcsb_files_avail
+    {
+        if files_avail.validation_2fo_fc
+            && ui
+            .button(RichText::new("Fetch elec ρ").color(COLOR_HIGHLIGHT))
+            .on_hover_text(
+                "Load 2fo-fc electron density data from RCSB PDB. Convert to CCP4 map format and display.",
+            )
+            .clicked()
+        {
+            match gemmi_dir()
+                .and_then(|dir| density_from_2fo_fc_rcsb_gemmi(&mol.common.ident, Some(&dir)))
+            {
+                Ok(density) => {
+                    density_to_load = Some(density);
+                    handle_success(&mut state.ui, "Loaded density data from RCSB".to_owned());
+                }
+                Err(e) => handle_err(
+                    &mut state.ui,
+                    format!(
+                        "Error loading or processing RCSB 2fo-fc map for {:?}: {e:?}",
+                        &mol.common.ident
+                    ),
+                ),
+            }
+        }
+
+        if files_avail.map
+            && ui
+                .button(RichText::new("Map").color(COLOR_HIGHLIGHT))
+                .on_hover_text("Load the electron-density map available from RCSB PDB.")
+                .clicked()
+        {
+            match rcsb::load_map(&mol.common.ident) {
+                Ok(data) => {
+                    let mut cursor = Cursor::new(data);
+                    match DensityMap::open(&mut cursor) {
+                        Ok(density) => density_to_load = Some(density),
+                        Err(_) => handle_err(
+                            &mut state.ui,
+                            format!("Error loading RCSB Map for {:?}", &mol.common.ident),
+                        ),
+                    }
+                }
+                Err(_) => handle_err(
+                    &mut state.ui,
+                    format!("Error loading RCSB Map for {:?}", &mol.common.ident),
+                ),
+            }
+        }
+    }
+
+    if let Some(density) = density_to_load {
+        state.load_density(density);
+    }
+
+    if let Some(res_i) = res_to_detach {
+        detach_het_res(state, peptide_i, res_i, true, scene, updates);
+    }
+
+    if let Some(res_i) = res_to_remove {
+        remove_het_res(state, peptide_i, res_i, scene, updates);
+    }
+
+    if let Some(res) = res_to_make {
+        make_lig_from_res(state, &res, scene, updates);
+        // if let Some(pep) = peptide_i.and_then(|i| state.peptide.get(i)) {
+        //     move_cam_to_active_mol(state, scene, pep.center, engine_updates);
+        // }
+    }
+
+    if let Some(res) = move_lig_to_res {
+        if let Some((_, i)) = state.volatile.active_mol
+            && i < state.ligands.len()
+        {
+            let pep = &state.peptides[peptide_i];
+            let center = pep.common.centroid();
+            let mol = &mut state.ligands[i];
+            move_mol_to_res(&mut MolGenericRefMut::Small(mol), pep, &res);
+            move_cam_to_active_mol(state, scene, center, updates);
+        }
+
+        *redraw_lig = true;
+    }
+
+    if let Some(sel_atom) = move_lig_to_sel {
+        let mut mol = state.active_mol_mut().unwrap();
+        mol.common_mut().move_to(sel_atom.posit);
+
+        let center = state
+            .peptides
+            .get(peptide_i)
+            .map(|mol| mol.common.centroid())
+            .unwrap_or_else(Vec3::new_zero);
+        move_cam_to_active_mol(state, scene, center, updates);
+
+        move_cam = true;
+
+        *redraw_lig = true;
+    }
+
+    if move_cam {
+        let center = state
+            .peptides
+            .get(peptide_i)
+            .map(|mol| mol.common.centroid())
+            .unwrap_or_else(Vec3::new_zero);
+
+        move_cam_to_active_mol(state, scene, center, updates);
+    }
+
+    let mut pocket_to_add = None;
+
+    if let Some(mol) = state.peptides.get(peptide_i) {
+        // todo: Temp location
+        if let Selection::AtomPeptide(sel_i) = state.ui.selection && button!(
+                ui,
+                "Pocket from sel",
+                COLOR_ACTION,
+                "Create a pocket around the selected atom. For screening, docking, pharmacophores etc."
+            )
+            .clicked() {
+
+            // todo: Rel or abs?
+            let posit = mol.common.atoms[sel_i].posit;
+            let ident = format!("{} atom {sel_i}", mol.common.ident);
+            pocket_to_add = Some(Pocket::new(mol, posit, POCKET_DIST_THRESH_DEFAULT, &ident));
+        }
+    }
+
+    if let Some(mut pocket) = pocket_to_add {
+        pocket.mesh_i_rel = state.pockets.len(); // relative: 0 for first pocket, 1 for second, …
+        let target_mesh_i = MESH_POCKET_START + pocket.mesh_i_rel;
+        while scene.meshes.len() <= target_mesh_i {
+            scene.meshes.push(Default::default());
+        }
+        scene.meshes[target_mesh_i] = pocket.surface_mesh.clone();
+        updates.meshes = true;
+
+        draw_all_pockets(state, scene, updates);
+        state.pockets.push(pocket);
+    }
+}
+
+pub(in crate::ui) fn display_mol_data(
+    state: &mut State,
+    scene: &mut Scene,
+    ui: &mut Ui,
+    redraw_lig: &mut bool,
+    updates: &mut EngineUpdates,
+) {
+    ui.horizontal(|ui| {
+        let Some((active_mol_type, active_mol_i)) = state.volatile.active_mol else {
+            return;
+        };
+
+        if let Some(mol) = state.active_mol() {
+            mol_descrip(&mol, ui);
+        }
+
+        if active_mol_type == MolType::Peptide {
+            display_peptide_actions(state, active_mol_i, scene, ui, redraw_lig, updates);
+            return;
+        }
+
+        if active_mol_type == MolType::Ligand {
+            if !state.peptides.is_empty()
+                && button!(
+                    ui,
+                    "Add to protein",
+                    COLOR_ACTION,
+                    "Add this ligand to a protein, in its current position, as a hetero residue:                     e.g. to save them together as one mmCIF file. If it was detached from a                     protein, this restores its mmCIF records."
+                )
+                .clicked()
+            {
+                state.ui.popup.lig_attach = Some(LigAttachUi::new(state, active_mol_i));
+            }
+
+            if ui
+                .button(RichText::new("Similar mols"))
+                .on_hover_text(
+                    "Using PubChem, find, download, and open similar molecules to this one.",
+                )
+                .clicked()
+            {
+                let mol = &state.ligands[active_mol_i];
+
+                // todo: This needs to be in its own thread; long-running blockign call.
+
+                // todo: Support more than CID. Requires a mode to rcsb api.
+                for ident in &mol.idents {
+                    println!("IDEN: {:?}", ident); // todo temp
+                    if let MolIdent::PubChem(cid) = ident {
+                        // todo: This doesn't show because it doesn't get a chance to render prior to the block.
+                        handle_success(
+                            &mut state.ui,
+                            "Searching for similar molecules...".to_string(),
+                        );
+                        match pubchem::find_similar_mols(*cid) {
+                            Ok(cids) => {
+                                // todo: This is temp
+                                println!("Similar mols to {cid}: {:?}", cids);
+                                let max_results = 20;
+                                let cids_str = cids
+                                    .iter()
+                                    .take(max_results)
+                                    .map(|x| x.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+
+                                handle_success(
+                                    &mut state.ui,
+                                    format!("Similar PubChem CIDs: {cids_str}..."),
+                                );
+                            }
+
+                            Err(_) => {
+                                handle_err(
+                                    &mut state.ui,
+                                    "Problem finding similar molecules on PubChem".to_owned(),
+                                );
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut update_cid = None; // to avoid a borrow error.
+
+        let mut split_at: Option<Vec<usize>> = None;
+        let mut join_clicked = false;
+        let mut cancel_join = false;
+        let mut make_3d = false;
+        let mut load_all_idents = false;
+
+        let loading_idents = state.volatile.thread_receivers.all_idents_avail.is_some();
+
+        if let Some(mol) = state.active_mol() {
+            match mol {
+                MolGenericRef::Peptide(_) => {}
+                MolGenericRef::Small(m) => {
+                    // Copied now so `m` (and its borrow of `state`) ends before `state.ui` is mutated.
+                    let is_2d = m.common.is_2d;
+
+                    ui.add_space(COL_SPACING);
+                    if !m.ff_params_loaded {
+                        ui.label(RichText::new("FF/q").color(Color32::LIGHT_RED))
+                            .on_hover_text(
+                                "Green if force field names, and partial charges are assigned \
+                for all ligand atoms. Required for ligand moleculer dynamics and docking.",
+                            );
+                    }
+
+                    if !m.frcmod_loaded {
+                        ui.label(RichText::new("Frcmod").color(Color32::LIGHT_RED))
+                            .on_hover_text(
+                                "Green if molecule-specific Amber force field parameters are \
+                loaded for this ligand. Required for ligand molecular dynamics and docking.",
+                            );
+                    }
+
+                    let mut pubchem_cid = None;
+                    for ident in &m.idents {
+                        match ident {
+                            MolIdent::DrugBank(id) => {
+                                if ui.button(format!("DB: {id}")).clicked() {
+                                    drugbank::open_overview(id);
+                                }
+                            }
+                            MolIdent::PubChem(cid) => {
+                                if ui.button(format!("PubChem: {cid}")).clicked() {
+                                    pubchem::open_overview(*cid);
+                                }
+                                pubchem_cid = Some(*cid);
+                            }
+                            MolIdent::Chebi(id) => {
+                                if ui.button(format!("CHEBI:{id}")).clicked() {
+                                    chebi::open_overview(*id);
+                                }
+                            }
+                            MolIdent::PdbeAmber(id) => {
+                                if ui.button(format!("PDBe: {id}")).clicked() {
+                                    pdbe::open_overview(id);
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+
+                    // If we have a PDBE ID, but no PubChem ID, try to find one using
+                    // an intermediate SMILES representation, upon clicking the button.
+                    if pubchem_cid.is_none() && ui.button("PubChem").clicked() {
+                        // If we already have SMILES, this saves an API call.
+                        for ident in &m.idents {
+                            if let MolIdent::Smiles(smiles) = ident {
+                                // todo: Don't block ?
+                                let cids = pubchem::find_cids_from_search(smiles, true)
+                                    .unwrap_or_default();
+
+                                if !cids.is_empty() {
+                                    let cid = cids[0];
+                                    update_cid = Some(cid);
+                                    pubchem::open_overview(cid);
+                                }
+
+                                break;
+                            }
+                        }
+
+                        // This runs if we have neither CID, nor SMILES.
+                        if let Ok((cid, _smiles)) =
+                            pubchem::get_cid_from_pdbe_id(&mol.common().ident)
+                        {
+                            update_cid = Some(cid);
+                            pubchem::open_overview(cid);
+                        }
+                    }
+
+                    if load_all_idents_button(ui, loading_idents) {
+                        // Deferred; starting the lookup needs `state` mutably.
+                        load_all_idents = true;
+                    }
+
+                    if let Some(pending) = &state.ui.join_ligand {
+                        ui.label(format!(
+                            "Join: ligand {}, atom {}. Select an atom in another ligand.",
+                            pending.endpoint.0 + 1,
+                            pending.endpoint.1 + 1,
+                        ));
+                        let ready = matches!(
+                            state.ui.selection,
+                            Selection::AtomLig((i, _)) if i != pending.endpoint.0
+                        );
+                        join_clicked = ui
+                            .add_enabled(
+                                ready,
+                                egui::Button::new(RichText::new("Join ligands").color(COLOR_ACTION)),
+                            )
+                            .on_hover_text(
+                                "Optimize the single bond length and twist, keeping each ligand rigid. \
+                                No atoms or hydrogens are removed. Falls back to element-based geometry \
+                                if force-field relaxation is unavailable.",
+                            )
+                            .clicked();
+                        cancel_join = ui.button("Cancel join").clicked();
+                    } else if matches!(
+                        state.ui.selection,
+                        Selection::AtomLig((i, _)) if i == active_mol_i
+                    ) {
+                        join_clicked = button!(
+                            ui,
+                            "Join ligands",
+                            COLOR_ACTION,
+                            "Remember this atom, then click an atom in another ligand \
+                            (without Shift) to join with a single bond."
+                        )
+                        .clicked();
+                    }
+
+                    // Only the active molecule's own bonds can split it.
+                    let split_at_bonds = match &state.ui.selection {
+                        Selection::BondLig((mol_i, bond_i)) if *mol_i == active_mol_i => {
+                            Some(vec![*bond_i])
+                        }
+                        Selection::BondsLig((mol_i, bonds_i)) if *mol_i == active_mol_i => {
+                            Some(bonds_i.clone())
+                        }
+                        _ => None
+                    };
+
+                    if let Some(bond_indexes) = split_at_bonds
+                        && button!(
+                            ui,
+                            "Split at bond[s]",
+                            COLOR_ACTION,
+                            "Splits an atom into two or more molecules. Using the selected bond[s] as a splitting point, remove one side of this molecule's\
+                            atoms and bonds, and create a new small molecule[s] of them."
+                        ).clicked()
+                    {
+                        // Deferred; splitting takes all of `state`.
+                        split_at = Some(bond_indexes);
+                    }
+
+                    if is_2d
+                        && button!(
+                            ui,
+                            "Make 3D",
+                            COLOR_ACTION,
+                            "This molecule's coordinates are flat, e.g. from a 2D-only SDF. Build 3D \
+                            geometry by minimizing its energy with the Amber force field. \
+                            Stereocenters may not match the source's."
+                        )
+                        .clicked()
+                    {
+                        // Deferred; this needs `state` mutably.
+                        make_3d = true;
+                    }
+                }
+                MolGenericRef::Lipid(l) => {
+                    if ui.button("View on LMSD").clicked() {
+                        lmsd::open_overview(&l.lmsd_id);
+                    }
+                }
+                _ => (),
+            }
+        }
+
+        ui.add_space(COL_SPACING);
+
+        if let Some(mol) = state.active_mol_mut()
+            && let Some(cid) = update_cid
+            && let MolGenericRefMut::Small(m) = mol
+        {
+            m.idents.push(MolIdent::PubChem(cid));
+        }
+
+        if load_all_idents
+            && active_mol_type == MolType::Ligand
+            && let Some(mol) = state.ligands.get(active_mol_i)
+        {
+            crate::threads::start_all_idents_lookup(
+                &mut state.volatile.thread_receivers,
+                active_mol_i,
+                mol.common.ident.clone(),
+                mol.idents.clone(),
+            );
+            handle_success(
+                &mut state.ui,
+                "Loading molecule identifiers from PubChem and ChEBI...".to_owned(),
+            );
+        }
+
+        if cancel_join {
+            state.ui.join_ligand = None;
+        } else if join_clicked
+            && let Selection::AtomLig(endpoint) = state.ui.selection
+        {
+            if let Some(pending) = state.ui.join_ligand.take() {
+                if pending.is_current(state) {
+                    join_ligands(state, pending.endpoint, endpoint, scene, updates);
+                } else {
+                    handle_err(
+                        &mut state.ui,
+                        "The first ligand changed. Select its atom and start the join again.".to_owned(),
+                    );
+                }
+            } else if let Some(lig) = state.ligands.get(endpoint.0) {
+                state.ui.join_ligand = Some(JoinLigand::new(lig, endpoint));
+            }
+        }
+
+        if cancel_join || join_clicked {
+            drawing::wrappers::draw_all_ligs(state, scene, updates);
+        }
+
+        if let Some(bond_indexes) = split_at {
+            split_lig_at_bonds(state, active_mol_i, &bond_indexes, scene, updates);
+        }
+
+        if make_3d {
+            make_lig_3d(state, active_mol_i, scene, updates);
+        }
+    });
+}
+
+/// Display metadata stored for a given molecule.
+pub(in crate::ui) fn metadata(
+    mol_type: MolType,
+    i: usize,
+    state: &mut State,
+    redraw: &mut RedrawFlags,
+    ui: &mut Ui,
+) {
+    let Some(mol) = state.get_mol(mol_type, i) else {
+        return;
+    };
+
+    // Clone what we need while `mol` (and its borrow of `state`) is still live,
+    // then drop it so we can mutably borrow `state.ui.popup` below.
+    let common = mol.common().clone();
+    let idents: Option<Vec<MolIdent>> = if let MolGenericRef::Small(m) = mol {
+        Some(m.idents.clone())
+    } else {
+        None
+    };
+    let peptide_idents: Option<Vec<PeptideIdent>> = if let MolGenericRef::Peptide(m) = mol {
+        Some(m.idents.clone())
+    } else {
+        None
+    };
+
+    let loading_idents = state.volatile.thread_receivers.all_idents_avail.is_some();
+    // Cloned to avoid holding a borrow of `state` alongside the mutable one below.
+    let prefs_dir = state.volatile.prefs_dir.clone();
+    // Edit rows belong to the molecule they were loaded from; another one starts fresh.
+    reset_metadata_edit_on_change(state, MetadataTarget::Mol(mol_type, i));
+
+    let display_name = common.name(idents.as_ref()).to_string();
+
+    let result = popup::metadata_popup(
+        &mut state.ui.editing_metadata,
+        &mut state.ui.metadata_edit.rows,
+        MetadataSource::from_mol(&common, &display_name),
+        idents
+            .as_ref()
+            .map(Idents::Small)
+            .or(peptide_idents.as_ref().map(Idents::Peptide)),
+        loading_idents,
+        &prefs_dir,
+        ui,
+    );
+
+    // The popup edits a clone; apply the result to the molecule itself.
+    if let Some(metadata) = result.metadata
+        && let Some(mut mol) = state.get_mol_mut(mol_type, i)
+    {
+        mol.common_mut().metadata = metadata;
+    }
+
+    if let Some(name) = result.name
+        && let Some(mut mol) = state.get_mol_mut(mol_type, i)
+    {
+        mol.common_mut().name = name;
+        redraw.set(mol_type);
+    }
+
+    if result.load_all_idents
+        && mol_type == MolType::Ligand
+        && let Some(idents) = idents
+    {
+        crate::threads::start_all_idents_lookup(
+            &mut state.volatile.thread_receivers,
+            i,
+            common.ident,
+            idents,
+        );
+        handle_success(
+            &mut state.ui,
+            "Loading molecule identifiers from PubChem and ChEBI...".to_owned(),
+        );
+    }
+}
+
+/// Edit rows belong to the molecule or sequence they were loaded from; switching to another one
+/// discards them.
+fn reset_metadata_edit_on_change(state: &mut State, target: MetadataTarget) {
+    if state.ui.metadata_edit.target != Some(target) {
+        state.ui.metadata_edit.target = Some(target);
+        state.ui.metadata_edit.rows.clear();
+        state.ui.metadata_edit.sequence_text.clear();
+        state.ui.metadata_edit.sequence_error = None;
+        state.ui.editing_metadata = false;
+    }
+}
+
+/// The metadata popup's contents for a sequence. Shares the molecule popup's display and editor.
+pub(in crate::ui) fn seq_metadata(i: usize, state: &mut State, ui: &mut Ui) {
+    let Some(seq) = state.sequences.get(i) else {
+        return;
+    };
+
+    // Cloned, as with molecules, so we can borrow `state` mutably for the edit state below.
+    let name = (!seq.name.is_empty()).then(|| seq.name.clone());
+    let display_name = seq.display_name().to_owned();
+    let metadata = seq.metadata.clone();
+    let path = seq.path.clone();
+    let letters = seq.data.to_letters();
+    let has_features = !seq.features.is_empty();
+    let summary = format!(
+        "{} · {} {}",
+        seq.seq_type(),
+        seq.data.len(),
+        seq.seq_type().residue_unit()
+    );
+
+    reset_metadata_edit_on_change(state, MetadataTarget::Seq(i));
+
+    if !state.ui.editing_metadata {
+        state.ui.metadata_edit.sequence_text.clone_from(&letters);
+        state.ui.metadata_edit.sequence_error = None;
+    }
+
+    label!(ui, summary, Color32::GRAY);
+    if let Some(p) = &path {
+        label!(ui, p.display().to_string(), Color32::GRAY);
+    }
+
+    ui.label("Sequence:");
+    if state.ui.editing_metadata {
+        if has_features {
+            ui.small("Changing the sequence length clears its positional features.");
+        }
+        ui.add(
+            egui::TextEdit::multiline(&mut state.ui.metadata_edit.sequence_text)
+                .desired_width(450.)
+                .desired_rows(5),
+        );
+        if ui
+            .button("Apply changes")
+            .on_hover_text("Update the open sequence. Use Save in the sidebar to write a file.")
+            .clicked()
+        {
+            let text = state.ui.metadata_edit.sequence_text.clone();
+            match state.edit_sequence(i, &text) {
+                Ok(()) => state.ui.metadata_edit.sequence_error = None,
+                Err(error) => state.ui.metadata_edit.sequence_error = Some(error),
+            }
+        }
+        if let Some(error) = &state.ui.metadata_edit.sequence_error {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
+    } else {
+        ui.label(letters);
+    }
+
+    let prefs_dir = state.volatile.prefs_dir.clone();
+
+    let result = popup::metadata_popup(
+        &mut state.ui.editing_metadata,
+        &mut state.ui.metadata_edit.rows,
+        MetadataSource {
+            display_name: &display_name,
+            name: &name,
+            metadata: &metadata,
+            path: &path,
+        },
+        None,
+        false,
+        &prefs_dir,
+        ui,
+    );
+
+    let Some(seq) = state.sequences.get_mut(i) else {
+        return;
+    };
+
+    if let Some(metadata) = result.metadata {
+        seq.metadata = metadata;
+    }
+
+    // A sequence's name isn't an override of a generated one; clearing it leaves it empty.
+    if let Some(name) = result.name {
+        seq.name = name.unwrap_or_default();
+    }
+}
+
+pub(in crate::ui) fn mol_descrip(mol: &MolGenericRef, ui: &mut Ui) {
+    let name = mol.common().name.as_deref().unwrap_or(&mol.common().ident);
+    ui.heading(RichText::new(name).color(Color32::GOLD));
+
+    ui.label(format!("{} atoms", mol.common().atoms.len()));
+
+    if let MolGenericRef::Peptide(m) = mol
+        && let Some(method) = m.experimental_method
+    {
+        ui.label(method.to_str_short());
+    }
+
+    if let Some(title) = mol.common().metadata.get("_struct.title") {
+        // Limit size to prevent UI problems.
+        let mut title_abbrev: String = title.chars().take(MAX_TITLE_LEN).collect();
+
+        if title_abbrev.len() != title.len() {
+            title_abbrev += "...";
+
+            // Allow hovering to see the full title.
+            ui.label(RichText::new(title_abbrev).color(Color32::WHITE).size(12.))
+                .on_hover_text(title);
+        } else {
+            ui.label(RichText::new(title_abbrev).color(Color32::WHITE).size(12.));
+        }
+    }
+}

@@ -1,0 +1,636 @@
+use std::process::Command;
+
+#[test]
+#[ignore = "GlycoFlow scientific regression; needs $GLYCOFLOW_MODEL and 5KZC.pdb + eds-5kzc.ccp4 under $REGLYCO_DATA"]
+fn glycoflow_5kzc_n79_density_regression() {
+    let data = std::path::PathBuf::from(
+        std::env::var_os("REGLYCO_DATA").expect("set REGLYCO_DATA (structures/, maps/)"),
+    );
+    assert!(
+        std::env::var_os("GLYCOFLOW_MODEL").is_some(),
+        "set GLYCOFLOW_MODEL"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args(["refine", "--protein"])
+        .arg(data.join("structures/5KZC.pdb"))
+        .arg("--density-map")
+        .arg(data.join("maps/eds-5kzc.ccp4"))
+        .args([
+            "--objective",
+            "density",
+            "--replace-glycan",
+            "A:79",
+            "--seed",
+            "0",
+            "--quiet",
+            "--output",
+        ])
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let fit: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.path().join("glycoflow-fit.json")).unwrap(),
+    )
+    .unwrap();
+    let recovery = &fit["sites"][0]["evaluation"]["recovery"];
+    assert!(recovery["full_rmsd"].as_f64().unwrap() < 1.3, "{recovery}");
+    assert!(recovery["core_rmsd"].as_f64().unwrap() < 0.8, "{recovery}");
+    assert_eq!(fit["validation"]["valid"], true);
+    for name in ["fitted.pdb", "candidates.pdb", "validation.json"] {
+        assert!(directory.path().join(name).is_file(), "missing {name}");
+    }
+}
+
+#[test]
+fn cli_builds_a_pdb_only_bundle() {
+    let directory = tempfile::tempdir().unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args([
+            "build",
+            "--protein",
+            "tests/fixtures/protein.pdb",
+            "--site",
+            "A:1",
+            "--glycan",
+            "tests/fixtures/glycan.pdb",
+            "--output",
+        ])
+        .arg(directory.path())
+        .arg("--no-system")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(directory.path().join("glycoprotein.pdb").is_file());
+    assert!(directory.path().join("report.json").is_file());
+    assert!(!directory.path().join("system.top").exists());
+}
+
+#[test]
+fn cli_saxs_model_writes_fit_plot_and_report() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("experiment.dat");
+    std::fs::write(
+        &data,
+        "# q I sigma\n0.01 10.0 0.1\n0.02 5.0 0.1\n0.03 2.5 0.1\n0.04 1.2 0.1\n0.05 0.6 0.1\n",
+    )
+    .unwrap();
+    let output = directory.path().join("model");
+    let result = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args(["saxs", "model", "--data"])
+        .arg(&data)
+        .args([
+            "--models",
+            "tests/fixtures/protein.pdb",
+            "--report",
+            "--quiet",
+            "--output",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for file in [
+        "best-model.pdb",
+        "saxs-model.json",
+        "saxs-diagnostic.svg",
+        "report.json",
+        "report.pdf",
+        "report.typ",
+    ] {
+        assert!(output.join(file).is_file(), "missing {file}");
+    }
+    assert!(output.join("report-assets/saxs-diagnostic.svg").is_file());
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["analysis"]["saxs"]["mode"], "single_model");
+}
+
+#[test]
+fn cli_saxs_ensemble_reweight_and_occupancy_write_machine_outputs() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("experiment.dat");
+    std::fs::write(
+        &data,
+        "# q I sigma\n0.01 10.0 0.1\n0.02 5.0 0.1\n0.03 2.5 0.1\n0.04 1.2 0.1\n0.05 0.6 0.1\n",
+    )
+    .unwrap();
+    let ensemble_output = directory.path().join("ensemble");
+    let ensemble = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args(["saxs", "ensemble", "--data"])
+        .arg(&data)
+        .args([
+            "--models",
+            "tests/fixtures/protein.pdb",
+            "--quiet",
+            "--output",
+        ])
+        .arg(&ensemble_output)
+        .status()
+        .unwrap();
+    assert!(ensemble.success());
+    assert!(ensemble_output.join("unbiased-fit.dat").is_file());
+    assert!(ensemble_output.join("saxs-ensemble.json").is_file());
+
+    let reweight_output = directory.path().join("reweight");
+    let reweight = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args(["saxs", "reweight", "--data"])
+        .arg(&data)
+        .args([
+            "--models",
+            "tests/fixtures/protein.pdb",
+            "--quiet",
+            "--output",
+        ])
+        .arg(&reweight_output)
+        .status()
+        .unwrap();
+    assert!(reweight.success());
+    assert!(reweight_output.join("reweighted-fit.dat").is_file());
+    assert!(reweight_output.join("weights.csv").is_file());
+
+    let occupancy_output = directory.path().join("occupancy");
+    let occupancy = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args(["saxs", "occupancy", "--data"])
+        .arg(&data)
+        .args([
+            "--protein",
+            "tests/fixtures/protein.pdb",
+            "--candidate",
+            "A:1=none",
+            "--report",
+            "--quiet",
+            "--output",
+        ])
+        .arg(&occupancy_output)
+        .status()
+        .unwrap();
+    assert!(occupancy.success());
+    assert!(occupancy_output.join("saxs-occupancy.json").is_file());
+    assert!(
+        occupancy_output
+            .join("report-assets/saxs-occupancy.svg")
+            .is_file()
+    );
+    let analysis: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(occupancy_output.join("saxs-occupancy.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(analysis["site_occupancy"]["A:1"], 0.0);
+}
+
+#[test]
+fn cli_saxs_occupancy_accepts_json_candidate_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("experiment.dat");
+    std::fs::write(
+        &data,
+        "# q I sigma\n0.01 10.0 0.1\n0.02 5.0 0.1\n0.03 2.5 0.1\n0.04 1.2 0.1\n0.05 0.6 0.1\n",
+    )
+    .unwrap();
+    let manifest = directory.path().join("candidates.json");
+    std::fs::write(
+        &manifest,
+        r#"{"sites":[{"site":"A:1","candidates":[{"id":"none","prior":2.0}]}]}"#,
+    )
+    .unwrap();
+    let output = directory.path().join("manifest");
+    let result = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args(["saxs", "occupancy", "--data"])
+        .arg(&data)
+        .args([
+            "--protein",
+            "tests/fixtures/protein.pdb",
+            "--candidate-manifest",
+        ])
+        .arg(&manifest)
+        .args(["--quiet", "--output"])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let analysis: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("saxs-occupancy.json")).unwrap())
+            .unwrap();
+    assert_eq!(analysis["combinations"][0]["prior"], 2.0);
+    assert_eq!(
+        analysis["combinations"][0]["assignments"][0]["candidate"],
+        "none"
+    );
+}
+
+#[test]
+fn cli_saxs_occupancy_rejects_combinations_above_cap() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("experiment.dat");
+    std::fs::write(&data, "# q I sigma\n0.01 10.0 0.1\n0.02 5.0 0.1\n").unwrap();
+    let output = directory.path().join("guard");
+    let result = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args(["saxs", "occupancy", "--data"])
+        .arg(&data)
+        .args([
+            "--protein",
+            "tests/fixtures/protein.pdb",
+            "--candidate",
+            "A:1=none,absent",
+            "--candidate",
+            "A:2=none,absent",
+            "--max-combinations",
+            "3",
+            "--quiet",
+            "--output",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("at least 4 combinations"), "{stderr}");
+    assert!(!output.exists());
+}
+
+#[test]
+fn cli_report_writes_self_contained_pdf_bundle() {
+    let directory = tempfile::tempdir().unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args([
+            "build",
+            "--protein",
+            "tests/fixtures/protein.pdb",
+            "--attach",
+            "A:1=tests/fixtures/glycan.pdb",
+            "--no-system",
+            "--report",
+            "--output",
+        ])
+        .arg(directory.path())
+        .args(["--population", "8", "--generations", "2", "--seed", "7"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for file in ["report.json", "report.pdf", "report.typ"] {
+        assert!(directory.path().join(file).is_file(), "missing {file}");
+    }
+    assert!(
+        std::fs::read(directory.path().join("report.pdf"))
+            .unwrap()
+            .starts_with(b"%PDF")
+    );
+    assert!(directory.path().join("report-assets").is_dir());
+}
+
+#[test]
+fn validate_report_uses_a_stem_derived_bundle() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("validation.json");
+    let status = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args([
+            "validate",
+            "--input",
+            "tests/fixtures/protein.pdb",
+            "--output",
+        ])
+        .arg(&output)
+        .arg("--report")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for file in [
+        "validation.json",
+        "validation-report.json",
+        "validation-report.pdf",
+    ] {
+        assert!(directory.path().join(file).is_file(), "missing {file}");
+    }
+}
+
+#[test]
+fn cli_rejects_mismatched_site_and_glycan_counts() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args([
+            "build",
+            "--protein",
+            "tests/fixtures/protein.pdb",
+            "--site",
+            "A:1",
+            "--site",
+            "B:2",
+            "--glycan",
+            "tests/fixtures/glycan.pdb",
+            "--output",
+        ])
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--site values"));
+}
+
+#[test]
+fn cli_search_writes_structure_and_machine_readable_reports() {
+    let directory = tempfile::tempdir().unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args([
+            "search",
+            "--protein",
+            "tests/fixtures/protein.pdb",
+            "--attach",
+            "A:1=tests/fixtures/glycan.pdb",
+            "--output",
+        ])
+        .arg(directory.path())
+        .args(["--population", "8", "--generations", "2", "--seed", "7"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(directory.path().join("structure.pdb").is_file());
+    assert!(directory.path().join("search.json").is_file());
+    assert!(directory.path().join("report.json").is_file());
+    let search: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.path().join("search.json")).unwrap())
+            .unwrap();
+    assert_eq!(search["sites"].as_array().unwrap().len(), 1);
+    assert_eq!(search["seed"], 7);
+}
+
+#[test]
+fn energy_build_reuses_one_topology_and_reports_local_minimization() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args([
+            "build",
+            "--protein",
+            "tests/fixtures/protein.pdb",
+            "--attach",
+            "A:1=tests/fixtures/glycan.pdb",
+            "--interact",
+            "--min",
+            "--min-iterations",
+            "1",
+            "--population",
+            "4",
+            "--generations",
+            "1",
+            "--no-system",
+            "--report",
+            "--quiet",
+            "--output",
+        ])
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let search: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.path().join("search.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        search["energy_diagnostics"]["topology_parameterizations"],
+        1
+    );
+    assert!(
+        search["energy_diagnostics"]["minimizations"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(search["energy_diagnostics"]["cache_hits"].as_u64().unwrap() > 0);
+    assert!(
+        search["energy_diagnostics"]["active_atoms"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        search["energy_diagnostics"]["neighbor_pairs"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        !search["minimized_coordinates"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(search["energy_cutoff_angstrom"], 10.0);
+    assert_eq!(search["minimization_radius_angstrom"], 5.0);
+    assert!(
+        std::fs::read(directory.path().join("report.pdf"))
+            .unwrap()
+            .starts_with(b"%PDF")
+    );
+}
+
+#[test]
+fn cli_refine_runs_search_and_physical_relaxation() {
+    let directory = tempfile::tempdir().unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args([
+            "refine",
+            "--protein",
+            "tests/fixtures/protein.pdb",
+            "--attach",
+            "A:1=tests/fixtures/glycan.pdb",
+            "--output",
+        ])
+        .arg(directory.path())
+        .args([
+            "--population",
+            "4",
+            "--generations",
+            "1",
+            "--max-iterations",
+            "1",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for file in [
+        "structure.pdb",
+        "search.json",
+        "relaxation.json",
+        "report.json",
+    ] {
+        assert!(directory.path().join(file).is_file(), "missing {file}");
+    }
+}
+
+#[test]
+fn cli_scan_attaches_glcnac_to_every_sequon() {
+    let directory = tempfile::tempdir().unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args([
+            "scan",
+            "--protein",
+            "tests/fixtures/sequon-protein.pdb",
+            "--glycan",
+            "tests/fixtures/glycan.pdb",
+            "--output",
+        ])
+        .arg(directory.path())
+        .args(["--population", "32", "--generations", "1"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let scan: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.path().join("scan.json")).unwrap())
+            .unwrap();
+    assert_eq!(scan["attachment_count"], 1);
+    assert_eq!(scan["sequons"][0]["motif"], "NAT");
+    assert!(directory.path().join("structure.pdb").is_file());
+    assert!(directory.path().join("search.json").is_file());
+    assert!(directory.path().join("report.json").is_file());
+}
+
+/// Energy scoring parameterizes the glycoprotein once, from a reference state.
+/// That state used to be conformer 0 at phi = psi = 0, which on this protein
+/// puts the GlcNAc's C6 1.6 A from a glycine: GlySys read the contact as a
+/// bond and refused the PDB-named residue ("C6 is bonded to another residue").
+/// Both bundle formats must build in both energy modes.
+#[test]
+fn energy_build_prepares_its_topology_without_glycan_contacts() {
+    for glycan in ["tests/fixtures/pdb-bundle", "tests/fixtures/glycan.pdb"] {
+        for mode in ["--interact", "--energy"] {
+            let directory = tempfile::tempdir().unwrap();
+            let output = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+                .args([
+                    "build",
+                    "--protein",
+                    "tests/fixtures/blocked-asn-protein.pdb",
+                    "--attach",
+                    &format!("A:1={glycan}"),
+                    mode,
+                    "--population",
+                    "4",
+                    "--generations",
+                    "1",
+                    "--no-system",
+                    "--quiet",
+                    "--output",
+                ])
+                .arg(directory.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{glycan} {mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let search: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(directory.path().join("search.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                search["energy_diagnostics"]["topology_parameterizations"], 1,
+                "{glycan} {mode}"
+            );
+            assert!(directory.path().join("glycoprotein.pdb").is_file());
+        }
+    }
+}
+
+/// A deposited receptor usually lacks heavy atoms (here ASP 295 is cut at CB
+/// and THR 299 has no OXT). GlySys rebuilds them when it prepares the energy
+/// topology, so the frames must carry them too: energy modes build from the
+/// receptor completed with GlySys's atoms and write them out.
+#[test]
+fn energy_build_completes_a_receptor_with_missing_heavy_atoms() {
+    for mode in ["--interact", "--energy"] {
+        let directory = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+            .args([
+                "build",
+                "--protein",
+                "tests/fixtures/truncated-sequon-protein.pdb",
+                "--attach",
+                "B:297=tests/fixtures/pdb-bundle",
+                mode,
+                "--population",
+                "4",
+                "--generations",
+                "1",
+                "--no-system",
+                "--quiet",
+                "--output",
+            ])
+            .arg(directory.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pdb = std::fs::read_to_string(directory.path().join("glycoprotein.pdb")).unwrap();
+        let atom = |name: &str, residue: &str| {
+            pdb.lines().any(|line| {
+                line.starts_with("ATOM")
+                    && line[12..16].trim() == name
+                    && line[17..26]
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        == residue
+            })
+        };
+        for (name, residue) in [
+            ("CG", "ASP B 295"),
+            ("OD1", "ASP B 295"),
+            ("OD2", "ASP B 295"),
+            ("OXT", "THR B 299"),
+        ] {
+            assert!(atom(name, residue), "{mode}: {residue} {name} missing");
+        }
+    }
+}
+
+/// Steric mode (the default) leaves the receptor as given.
+#[test]
+fn steric_build_keeps_a_receptor_with_missing_heavy_atoms_as_given() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_reglyco"))
+        .args([
+            "build",
+            "--protein",
+            "tests/fixtures/truncated-sequon-protein.pdb",
+            "--attach",
+            "B:297=tests/fixtures/pdb-bundle",
+            "--population",
+            "4",
+            "--generations",
+            "1",
+            "--no-system",
+            "--quiet",
+            "--output",
+        ])
+        .arg(directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pdb = std::fs::read_to_string(directory.path().join("glycoprotein.pdb")).unwrap();
+    assert!(!pdb.contains("OXT"));
+    assert!(!pdb.lines().any(|line| line.contains("CG   ASP B 295")));
+}

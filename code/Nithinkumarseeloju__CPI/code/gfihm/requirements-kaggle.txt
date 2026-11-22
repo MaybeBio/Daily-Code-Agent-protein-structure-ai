@@ -1,0 +1,7 @@
+# Keep Kaggle's preinstalled CUDA PyTorch and scientific stack.
+# These are training dependencies, not the local app/Windows environment.
+rdkit>=2024.3
+tape-proteins==0.5
+typed-argument-parser>=1.9,<2
+tensorboardX>=2.6,<3
+lifelines==0.30.0

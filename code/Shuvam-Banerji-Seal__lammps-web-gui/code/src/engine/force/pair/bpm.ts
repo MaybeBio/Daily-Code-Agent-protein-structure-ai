@@ -1,0 +1,170 @@
+import { Pair, PairParams, StyleError, type PairCompute, type PairSep, type StyleContext, pairCoeffArgs } from '../types';
+import { NEIGHMASK, SBBITS } from '../../neighbor';
+import { logical, missingArgs, parseNum, fmtCoeff } from '../util';
+import { tallyAtom } from './lj_cut';
+
+/*
+ * pair_style bpm/spring — docs.lammps.org/pair_bpm_spring.html (texts: plans/lammps-docs-live/pair_bpm_spring.rst).
+ * The doc says: "computes pairwise forces with the formula" F = k (r - r_c) + k_a (r - r_c)^3
+ * and "An additional damping force is also applied to interacting particles", F_D = -gamma w (r_hat . v) with
+ * w = 1 - (r/r_c)^8. Its energy proxy is "k (r - r_c)^2 / 2 + k_a (r - r_c)^4 / 4".
+ *
+ * Measured with native LAMMPS (black box), two unbonded atoms in lj units with thermo norm no: at r = 0.8, 0.4
+ * (r_c = 1, k = 1, gamma = 0.5, k_a = 2) the energies are 0.0208 and 0.2448 and the force magnitudes 0.216 and
+ * 1.032, i.e. E = k (r_c - r)^2/2 + k_a (r_c - r)^4/4 and F = k (r_c - r) + k_a (r_c - r)^3 with no smoothing on
+ * the spring term; beyond r_c the pair has no interaction. Bonded pairs with special_bonds lj 0 are excluded
+ * (the special factor multiplies both energy and force): a bonded pair at r = 0.8 gives zero pair energy.
+ * Mixing: the doc says "A is always mixed via a geometric rule" and the cutoff follows pair_modify mix. The
+ * gamma and k_a mixing rules are not in the doc, so an unset I,J pair is refused.
+ * Requires comm_modify vel yes (ghost velocities for the damping term), as native does.
+ */
+
+export class PairBpmSpring extends Pair {
+  readonly name = 'bpm/spring';
+  virialFdotr = true;
+  anharmonic = false;
+  p!: PairParams;
+  private kk = new Float64Array(0);
+  private rc = new Float64Array(0);
+  private gg = new Float64Array(0);
+  private ka = new Float64Array(0);
+
+  settings(args: string[], _ctx: StyleContext): void {
+    // As native LAMMPS does (src/BPM/pair_bpm_spring.cpp PairBPMSpring::settings at b332f28): anharmonic yes|no
+    // (utils::logical); the missing-value message names pair_coeff, as native's does
+    for (let k = 0; k < args.length; k += 2) {
+      if (args[k] !== 'anharmonic') throw new StyleError(`Illegal pair_style command ${args[k]}`);
+      if (k + 1 >= args.length) throw missingArgs('pair_coeff bpm/spring anharmonic');
+      this.anharmonic = logical(args[k + 1]);
+    }
+  }
+
+  allocate(ntypes: number): void {
+    super.allocate(ntypes);
+    this.p = new PairParams(ntypes, ['k', 'rc', 'gamma', 'ka']);
+  }
+
+  coeff(args: string[], _ctx: StyleContext): void {
+    const need = this.anharmonic ? 6 : 5;
+    if (args.length !== need) throw pairCoeffArgs(`usage: pair_coeff I J k r_c gamma${this.anharmonic ? ' k_a' : ''}`);
+    const vals = args.slice(2).map((w, q) => parseNum(w, ['k', 'r_c', 'gamma', 'k_a'][q]));
+    if (!(vals[1] > 0)) throw new StyleError('pair bpm/spring: r_c must be > 0');
+    const kv = this.anharmonic ? vals : [vals[0], vals[1], vals[2], 0];
+    this.p.setRange(args[0], args[1], kv);
+  }
+
+  initStyle(ctx: StyleContext): void {
+    if (ctx.ghostVelocity !== true) throw new StyleError('Pair bpm/spring requires ghost atoms store velocity\n(use comm_modify vel yes)');
+    const nt = this.ntypes + 1;
+    this.kk = new Float64Array(nt * nt); this.rc = new Float64Array(nt * nt);
+    this.gg = new Float64Array(nt * nt); this.ka = new Float64Array(nt * nt);
+  }
+
+  initOne(i: number, j: number): number {
+    const p = this.p;
+    if (!p.isSet(i, j)) {
+      if (!p.isSet(i, i) || !p.isSet(j, j)) throw new StyleError(`All pair coeffs are not set (pair ${i} ${j})`);
+      throw new StyleError(`pair bpm/spring: pair ${i} ${j} is not set and its gamma and k_a cannot be mixed (not in the doc); set it with pair_coeff`);
+    }
+    const nt = this.ntypes + 1;
+    const k1 = i * nt + j, k2 = j * nt + i;
+    this.kk[k1] = this.kk[k2] = p.get('k', i, j);
+    this.rc[k1] = this.rc[k2] = p.get('rc', i, j);
+    this.gg[k1] = this.gg[k2] = p.get('gamma', i, j);
+    this.ka[k1] = this.ka[k2] = p.get('ka', i, j);
+    return p.get('rc', i, j);
+  }
+
+  /** The velocities of the last force evaluation (single() reads them by owned index). */
+  private velLast: Float64Array | null = null;
+
+  /**
+   * Pair energy and force of one pair for compute pair/local. As native LAMMPS does (src/BPM/pair_bpm_spring.cpp single
+   * at b332f28), which differs from its force loop: zero beyond the cutoff ("if (rsq > cutsq[itype][jtype]) return
+   * 0.0"), the spring term -k dr (and -k_a dr^3) is not divided by r while the damping term is, and the smoothing is
+   * "smooth = rsq / cutsq[itype][jtype]; smooth *= smooth; smooth = 1.0 - smooth"; both times factor_lj.
+   */
+  single(i: number, j: number, itype: number, jtype: number, rsq: number, _fc: number, factorLJ: number, _qi = 0, _qj = 0, del?: PairSep): { eng: number; fforce: number } {
+    const t = itype * (this.ntypes + 1) + jtype;
+    if (rsq > this.cutsq[t]) return { eng: 0, fforce: 0 };
+    const v = this.velLast;
+    if (!v || !del) throw new StyleError('pair bpm/spring single() needs a force evaluation and the pair separation');
+    const r = Math.sqrt(rsq), rinv = 1 / r;
+    const dr = r - this.rc[t];
+    let fpair = -this.kk[t] * dr;
+    let energy = -0.5 * fpair * dr;
+    if (this.anharmonic) {
+      const fa = -this.ka[t] * dr * dr * dr;
+      fpair += fa;
+      energy += -0.25 * fa * dr;
+    }
+    let smooth = rsq / this.cutsq[t];
+    smooth *= smooth;
+    smooth = 1 - smooth;
+    const dot = del.dx * (v[3 * i] - v[3 * j]) + del.dy * (v[3 * i + 1] - v[3 * j + 1]) + del.dz * (v[3 * i + 2] - v[3 * j + 2]);
+    fpair -= this.gg[t] * dot * rinv * smooth;
+    return { eng: energy * factorLJ, fforce: fpair * factorLJ };
+  }
+
+  override singleNeedsSeparation(): boolean { return true; }
+
+  compute(pc: PairCompute): void {
+    const list = pc.half!;
+    const { x, f, type } = pc;
+    const s = pc.s;
+    const vel = s.v;
+    this.velLast = vel;
+    const owner = pc.nb.owner;
+    const nt = this.ntypes + 1;
+    const { cutsq, kk, rc, gg, ka } = this;
+    const sLJ = pc.specialLJ;
+    const anh = this.anharmonic;
+    let evdwl = 0;
+    const nb = list.neighbors;
+    for (let i = list.ilo ?? 0; i < list.inum; i++) {
+      const oi = owner[i];
+      const xi = x[3 * i], yi = x[3 * i + 1], zi = x[3 * i + 2];
+      const ti = type[i] * nt;
+      let fxi = 0, fyi = 0, fzi = 0;
+      for (let k = list.firstneigh[i], k1 = k + list.numneigh[i]; k < k1; k++) {
+        const jj = nb[k];
+        const j = jj & NEIGHMASK;
+        const dx = xi - x[3 * j], dy = yi - x[3 * j + 1], dz = zi - x[3 * j + 2];
+        const rsq = dx * dx + dy * dy + dz * dz;
+        const t = ti + type[j];
+        if (rsq >= cutsq[t]) continue;
+        const factor = sLJ[jj >>> SBBITS];
+        const r = Math.sqrt(rsq);
+        const dr = r - rc[t];
+        // conservative part: -dE/dr = -(k dr + k_a dr^3), along r_hat = d / r
+        const kdr = kk[t] * dr;
+        const cube = anh ? ka[t] * dr * dr * dr : 0;
+        const fcons = (-(kdr + cube) * factor) / r;
+        // damping on i: -gamma w (r_hat . v_ij) r_hat with w = 1 - (r/r_c)^8
+        const oj = owner[j];
+        const dvx = vel[3 * oi] - vel[3 * oj], dvy = vel[3 * oi + 1] - vel[3 * oj + 1], dvz = vel[3 * oi + 2] - vel[3 * oj + 2];
+        const w = 1 - Math.pow(r / rc[t], 8);
+        const fdamp = (-gg[t] * w * (dx * dvx + dy * dvy + dz * dvz) * factor) / rsq;
+        const fpair = fcons + fdamp;
+        const fx = dx * fpair, fy = dy * fpair, fz = dz * fpair;
+        fxi += fx; fyi += fy; fzi += fz;
+        f[3 * j] -= fx; f[3 * j + 1] -= fy; f[3 * j + 2] -= fz;
+        const e = factor * (0.5 * kk[t] * dr * dr + 0.25 * (anh ? ka[t] * dr ** 4 : 0));
+        evdwl += e;
+        // per-atom energy and virial, as native LAMMPS does (src/BPM/pair_bpm_spring.cpp compute at b332f28: ev_tally)
+        if (pc.eatom || pc.vatom) tallyAtom(pc, i, j, e, fpair, dx, dy, dz);
+      }
+      f[3 * i] += fxi; f[3 * i + 1] += fyi; f[3 * i + 2] += fzi;
+    }
+    pc.acc.evdwl += evdwl;
+  }
+
+  dataCoeffs(): string[] {
+    const out: string[] = [];
+    for (let i = 1; i <= this.ntypes; i++) {
+      out.push(`${i} ${fmtCoeff(this.p.get('k', i, i))} ${fmtCoeff(this.p.get('rc', i, i))} ${fmtCoeff(this.p.get('gamma', i, i))}`);
+    }
+    return out;
+  }
+}
+

@@ -1,0 +1,310 @@
+"""Repository contracts for the narrowed core-layer surface."""
+
+from __future__ import annotations
+
+import textwrap
+from pathlib import Path
+from typing import cast
+
+from tests.utils.fresh_interpreter import run_repo_json
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+FLASH_DOC = REPO_ROOT / "docs/core/flash_attention.md"
+RESIDUAL_DOC = REPO_ROOT / "docs/core/residual.md"
+GRAPH_DOC = REPO_ROOT / "docs/models/graph.md"
+CORE_LAYERS_INIT = REPO_ROOT / "src/artifex/generative_models/core/layers/__init__.py"
+RESIDUAL_RUNTIME = REPO_ROOT / "src/artifex/generative_models/core/layers/residual.py"
+PIXELCNN_RUNTIME = REPO_ROOT / "src/artifex/generative_models/models/autoregressive/pixel_cnn.py"
+
+
+def _normalized_text(path: Path) -> str:
+    return " ".join(path.read_text(encoding="utf-8").split())
+
+
+FLASH_RUNTIME = REPO_ROOT / "src/artifex/generative_models/core/layers/flash_attention.py"
+BACKEND_RUNTIME = REPO_ROOT / "src/artifex/generative_models/core/layers/attention_backend.py"
+
+
+def test_flash_attention_surface_drops_the_orphaned_triton_kernel() -> None:
+    """The Triton kernel was defined but never called, so it must be gone."""
+    payload = run_repo_json(
+        textwrap.dedent(
+            """
+            from substrax.testing import report
+
+            import artifex.generative_models.core.layers.flash_attention as flash_attention_module
+
+            report({
+                name: hasattr(flash_attention_module, name)
+                for name in (
+                    'flash_dot_product_attention',
+                    'flash_attention_triton',
+                    'flash_attention_forward_kernel',
+                    'TRITON_AVAILABLE',
+                    'FlashAttentionConfig',
+                    'AttentionMask',
+                    'PADDING_SEGMENT_ID',
+                )
+            })
+            """
+        )
+    )
+
+    assert payload["flash_dot_product_attention"] is True
+    for removed in (
+        "flash_attention_triton",
+        "flash_attention_forward_kernel",
+        "TRITON_AVAILABLE",
+        "FlashAttentionConfig",
+        "AttentionMask",
+        "PADDING_SEGMENT_ID",
+    ):
+        assert payload[removed] is False, f"{removed} should have been removed"
+
+    runtime = FLASH_RUNTIME.read_text(encoding="utf-8")
+    assert "triton" not in runtime.lower()
+
+    # The layers package must not export a symbol named after one of its own
+    # submodules: doing so rebinds the package attribute and makes
+    # `import ...layers.flash_attention as m` return the symbol, not the module.
+    exported = run_repo_json(
+        textwrap.dedent(
+            """
+            from substrax.testing import report
+            import pkgutil
+
+            import artifex.generative_models.core.layers as layers
+
+            submodules = {info.name for info in pkgutil.iter_modules(layers.__path__)}
+            report(sorted(submodules & set(layers.__all__)))
+            """
+        )
+    )
+    assert exported == []
+
+    flash_doc = _normalized_text(FLASH_DOC).lower()
+    for banned in (
+        "jax_native",
+        "kvax optimizations",
+        "significant performance improvements",
+        "additional features",
+        "triton-first path",
+        "flash_attention_triton",
+    ):
+        assert banned not in flash_doc
+
+
+def test_every_advertised_attention_backend_is_actually_dispatched() -> None:
+    """Each backend the enum names must be reachable in the runtime, not just declared.
+
+    The previous surface advertised backends that no code path could select. A
+    backend now counts as real only when the dispatcher passes its value to
+    ``jax.nn.dot_product_attention`` or delegates to the nnx kernel.
+    """
+    payload = run_repo_json(
+        textwrap.dedent(
+            """
+            from substrax.testing import report
+
+            from artifex.generative_models.core.layers.attention_backend import AttentionBackend
+
+            report({'members': [backend.value for backend in AttentionBackend]})
+            """
+        )
+    )
+
+    assert set(cast(list[str], payload["members"])) == {"cudnn", "xla"}
+
+    runtime = FLASH_RUNTIME.read_text(encoding="utf-8")
+    # The fused backend must be requested explicitly, since implementation=None
+    # silently falls back to XLA inside JAX.
+    assert 'implementation="cudnn"' in runtime
+    # The portable backend must delegate to the reference kernel rather than
+    # reimplementing dropout, masking and sowing.
+    assert "_nnx_attention(" in runtime
+
+    backend_runtime = BACKEND_RUNTIME.read_text(encoding="utf-8")
+    for constraint in ("CUDNN_SUPPORTED_DTYPES", "HEAD_DIM_MULTIPLE", "HEAD_DIM_MAX_HOPPER"):
+        assert constraint in backend_runtime
+
+
+def test_live_dropout_is_never_fused() -> None:
+    """The fused kernel bakes its dropout seed into the compiled executable.
+
+    ``jax/_src/cudnn/fused_attention_stablehlo.py`` marks ``seed`` a static
+    argument and serialises it into the custom-call backend config, so a jitted
+    training step would reuse one dropout mask forever. Selecting the fused
+    kernel with live dropout would be silently wrong, not merely fast.
+    """
+    payload = run_repo_json(
+        textwrap.dedent(
+            """
+            from substrax.testing import report
+
+            import jax.numpy as jnp
+
+            from artifex.generative_models.core.layers.attention_backend import (
+                AttentionBackend,
+                select_attention_backend,
+            )
+
+            eligible = dict(
+                dtype=jnp.bfloat16,
+                head_dim=64,
+                device_kind='gpu',
+                compute_capability=(9, 0),
+            )
+            report({
+                'inference': select_attention_backend(
+                    **eligible, deterministic=True, dropout_rate=0.0, sow_weights=False
+                ).value,
+                'live_dropout': select_attention_backend(
+                    **eligible, deterministic=False, dropout_rate=0.1, sow_weights=False
+                ).value,
+                'sow_weights': select_attention_backend(
+                    **eligible, deterministic=True, dropout_rate=0.0, sow_weights=True
+                ).value,
+            })
+            """
+        )
+    )
+
+    assert payload["inference"] == "cudnn"
+    assert payload["live_dropout"] == "xla"
+    assert payload["sow_weights"] == "xla"
+
+
+def test_masked_pixelcnn_residual_surface_is_local_to_pixelcnn() -> None:
+    """Placeholder masked residual blocks should not remain on the shared core-layer surface."""
+    payload = run_repo_json(
+        textwrap.dedent(
+            """
+            import importlib
+            from substrax.testing import report
+
+            results = {}
+            checks = (
+                ('artifex.generative_models.core.layers.residual', 'MaskedConv2DResidualBlock'),
+                ('artifex.generative_models.core.layers', 'MaskedConv2DResidualBlock'),
+                ('artifex.generative_models.core.layers', 'PixelCNNResidualBlock'),
+            )
+            for module_name, attr_name in checks:
+                module = importlib.import_module(module_name)
+                results[f'{module_name}:{attr_name}'] = hasattr(module, attr_name)
+
+            report(results)
+            """
+        )
+    )
+
+    for key, value in payload.items():
+        assert value is False, key
+
+    residual_doc = _normalized_text(RESIDUAL_DOC)
+    residual_runtime = RESIDUAL_RUNTIME.read_text(encoding="utf-8")
+    core_layers_init = CORE_LAYERS_INIT.read_text(encoding="utf-8")
+    pixelcnn_runtime = PIXELCNN_RUNTIME.read_text(encoding="utf-8")
+
+    for banned in ("MaskedConv2DResidualBlock", "PixelCNNResidualBlock", "masked_conv2d"):
+        assert banned not in residual_doc
+        assert banned not in residual_runtime
+        assert banned not in core_layers_init
+
+    assert "class PixelCNNResidualBlock" in pixelcnn_runtime
+    assert (
+        "from artifex.generative_models.core.layers import PixelCNNResidualBlock"
+        not in pixelcnn_runtime
+    )
+
+
+def test_egnn_layer_contract_is_hidden_dim_only() -> None:
+    """EGNNLayer should no longer advertise a separate node_dim constructor contract."""
+    payload = run_repo_json(
+        textwrap.dedent(
+            """
+            import inspect
+            from substrax.testing import report
+
+            from artifex.generative_models.core.layers.egnn import EGNNLayer
+
+            report({
+                'init_params': list(inspect.signature(EGNNLayer.__init__).parameters),
+            })
+            """
+        )
+    )
+
+    assert "node_dim" not in payload["init_params"]
+    assert "hidden_dim" in payload["init_params"]
+
+    graph_doc = _normalized_text(GRAPH_DOC)
+    assert "EGNNLayer" in graph_doc
+    assert "node_dim" not in graph_doc
+
+
+KAN_DOC = REPO_ROOT / "docs/core/kan.md"
+CLIFFORD_DOC = REPO_ROOT / "docs/core/clifford.md"
+CORE_INDEX_DOC = REPO_ROOT / "docs/core/index.md"
+MKDOCS = REPO_ROOT / "mkdocs.yml"
+
+
+def _exported_names(package: str) -> list[str]:
+    payload = run_repo_json(
+        textwrap.dedent(
+            f"""
+            import importlib
+            from substrax.testing import report
+
+            report(importlib.import_module({package!r}).__all__)
+            """
+        )
+    )
+    return cast(list[str], payload)
+
+
+def test_backbone_layer_families_are_documented() -> None:
+    """The KAN and Clifford families each have a page naming every export.
+
+    Neither family is consumed by an artifex model today; they stay in the
+    layers package as backbones (opifex builds PIKANs and Clifford FNOs on
+    them), so the page is the only place a reader learns they exist.
+    """
+    for package, doc in (
+        ("artifex.generative_models.core.layers.kan", KAN_DOC),
+        ("artifex.generative_models.core.layers.clifford", CLIFFORD_DOC),
+    ):
+        assert doc.exists(), doc
+        text = doc.read_text(encoding="utf-8")
+        assert f"**Module:** `{package.removeprefix('artifex.')}`" in text
+        missing = [name for name in _exported_names(package) if f"`{name}`" not in text]
+        assert missing == [], f"{doc.name} does not mention {missing}"
+
+    nav = MKDOCS.read_text(encoding="utf-8")
+    assert "- core/kan.md" in nav
+    assert "- core/clifford.md" in nav
+
+    core_index = _normalized_text(CORE_INDEX_DOC)
+    assert "kan.md" in core_index
+    assert "clifford.md" in core_index
+
+
+def test_layers_package_purpose_covers_backbones_no_model_uses_yet() -> None:
+    """The package docstring states the backbone rule rather than current consumers."""
+    payload = run_repo_json(
+        textwrap.dedent(
+            """
+            from substrax.testing import report
+
+            import artifex.generative_models.core.layers as layers
+
+            report({"doc": layers.__doc__})
+            """
+        )
+    )
+    doc = " ".join(cast(str, payload["doc"]).split()).lower()
+
+    assert "used to build the generative models" not in doc
+    assert "backbone" in doc
+    assert "kolmogorov-arnold" in doc
+    assert "clifford" in doc

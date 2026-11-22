@@ -1,0 +1,753 @@
+#include "mdir/Compiler/Compile.h"
+#include "mdir/Conversion/GPUToBinary.h"
+#include "mdir/Conversion/Passes.h"
+#include "mdir/Dialect/Dyn/DynDialect.h"
+#include "mdir/Dialect/MD/MDDialect.h"
+#include "mdir/Dialect/MD/Transforms/DerivativeInterface.h"
+#include "mdir/Dialect/MD/Transforms/Passes.h"
+#include "mdir/Dialect/MDExec/DevicePolicy.h"
+#include "mdir/Dialect/MDExec/MDExecDialect.h"
+#include "mdir/Dialect/MDExec/Transforms/Passes.h"
+#include "mdir/Dialect/MDRT/MDRTDialect.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/Parser/Parser.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
+#include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
+#include "llvm/IR/Module.h"
+#include "llvm/TargetParser/Host.h"
+#include "llvm/TargetParser/Triple.h"
+#include "llvm/TargetParser/X86TargetParser.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/ThreadPool.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+#include <cstdlib>
+#include <dlfcn.h>
+#include <mutex>
+#include <unistd.h>
+using namespace mdir;
+using namespace mdir::driver;
+using llvm::StringRef;
+char compiler::CompileError::ID = 0;
+std::string mdir::compiler::getModuleDirectory() {
+  Dl_info info;
+  if (!dladdr(reinterpret_cast<void *>(&getModuleDirectory), &info) ||
+      !info.dli_fname)
+    return "";
+  llvm::SmallString<256> path(info.dli_fname);
+  if (llvm::sys::fs::make_absolute(path))
+    return "";
+  return std::string(llvm::sys::path::parent_path(path));
+}
+void mdir::compiler::useCudaToolkit() {
+  for (const char *name : {"CUDA_ROOT", "CUDA_HOME", "CUDA_PATH"})
+    if (const char *root = std::getenv(name); root && *root) {
+      setenv("CUDA_ROOT", root, /*overwrite=*/0);
+      return;
+    }
+  // libdevice carried with the package or the installed tree, so that a
+  // GPU run needs only the driver.
+  std::string module = getModuleDirectory();
+  if (!module.empty()) {
+    llvm::SmallString<256> wheel(module), tree(module);
+    llvm::sys::path::append(wheel, "cuda");
+    llvm::sys::path::append(tree, "..", "share", "mdir", "cuda");
+    for (llvm::SmallString<256> *root : {&wheel, &tree}) {
+      llvm::SmallString<256> libdevice(*root);
+      llvm::sys::path::append(libdevice, "nvvm", "libdevice",
+                              "libdevice.10.bc");
+      if (llvm::sys::fs::exists(libdevice)) {
+        llvm::sys::path::remove_dots(*root, /*remove_dot_dot=*/true);
+        setenv("CUDA_ROOT", root->c_str(), /*overwrite=*/0);
+        return;
+      }
+    }
+  }
+  if (*MDIR_CUDA_ROOT)
+    setenv("CUDA_ROOT", MDIR_CUDA_ROOT, /*overwrite=*/0);
+}
+llvm::Expected<std::string>
+mdir::compiler::getGpuOptions(const Control &control, int64_t device,
+                              bool cache) {
+  // The host's variables (D402): every program's host code
+  // reads MDIR_HOST_CPU, a program for the CPU MDIR_HOST_PAIRS as well.
+  if (auto error = checkHostEnvironment(control.target == Target::CPU))
+    return std::move(error);
+  if (control.target != Target::GPU)
+    return std::string();
+  auto options = mdir::getGpuPipelineOptions(device);
+  if (!options)
+    return llvm::make_error<CompileError>(llvm::toString(options.takeError()));
+  if (!cache)
+    *options += " cache=false";
+  return options;
+}
+/// md-exec-lower-stage-bodies with the strategy of the products of the
+/// shape of a GEMM in the bodies (D302) from
+/// `MDIR_STAGE_CONTRACTIONS`, for comparing the strategies: `gemm` calls of
+/// cuBLAS, `loops` MDIR's loops; another value, or none, is the default.
+static std::string getStageBodiesPass(StringRef arch) {
+  StringRef chosen = std::getenv("MDIR_STAGE_CONTRACTIONS")
+                         ? std::getenv("MDIR_STAGE_CONTRACTIONS")
+                         : "";
+  StringRef shortSums = std::getenv("MDIR_STAGE_SHORT_REDUCTIONS")
+                            ? std::getenv("MDIR_STAGE_SHORT_REDUCTIONS")
+                            : "";
+  std::string options;
+  if (chosen == "gemm" || chosen == "loops")
+    options = ("contractions=" + chosen).str();
+  if (shortSums == "registers") {
+    if (!options.empty())
+      options += " ";
+    options += "short-reductions=true";
+  }
+  // The block of a body's kernel from the launch policy of the
+  // architecture (D420).
+  if (!arch.empty()) {
+    if (!options.empty())
+      options += " ";
+    options += ("arch=" + arch).str();
+  }
+  if (!options.empty())
+    return "md-exec-lower-stage-bodies{" + options + "},";
+  return "md-exec-lower-stage-bodies,";
+}
+
+/// The options of md-exec-choose-scatter (D285) from the
+/// switches of the environment, for comparing the strategies and for
+/// tests: `MDIR_PME_SPREAD` the tiles of PME (D282; `global` none,
+/// `tiles` or `tilesN` every sum that can be tiled, with bins of N points),
+/// `MDIR_TUPLE_SUMS` the tables of the tuples (D283; `atomics` none,
+/// `blocks` at any count, which the tests of small systems need), and
+/// `MDIR_PAIR_SUMS` those of the loops over groups (D291).
+static std::string getScatterOptions(const Control &control) {
+  std::string options;
+  if (const char *spread = std::getenv("MDIR_PME_SPREAD")) {
+    StringRef layout(spread);
+    if (layout == "global")
+      options += "tile=off ";
+    else if (layout.consume_front("tiles"))
+      options += layout.empty() ? "tile=on "
+                                : ("tile=on tile-edge=" + layout + " ").str();
+    else
+      options += ("tile=" + layout + " ").str();
+  }
+  StringRef sums = std::getenv("MDIR_TUPLE_SUMS") ? std::getenv("MDIR_TUPLE_SUMS")
+                                                  : "";
+  if (sums == "atomics")
+    options += "hash=off ";
+  else if (sums == "blocks")
+    options += "hash=on ";
+  // `MDIR_PAIR_SUMS` the tables of the loops over groups (D291;
+  // `atomics` none, `blocks` every loop that can take one).
+  StringRef pairs = std::getenv("MDIR_PAIR_SUMS") ? std::getenv("MDIR_PAIR_SUMS")
+                                                  : "";
+  if (pairs == "atomics")
+    options += "pair-hash=off ";
+  else if (pairs == "blocks")
+    options += "pair-hash=on ";
+  return options;
+}
+
+llvm::StringRef mdir::compiler::getFusedPruningSetting() {
+  const char *fuse = std::getenv("MDIR_FUSED_PRUNE");
+  llvm::StringRef value = fuse ? fuse : "";
+  if (value == "off" || value == "always")
+    return value;
+  return "default";
+}
+
+namespace {
+/// The host that the host code is compiled for (D402): the
+/// CPU that LLVM detects, or the one that `MDIR_HOST_CPU` names, the width
+/// of its vector registers, and the options of md-exec-choose-host-pairs
+/// that `MDIR_HOST_PAIRS` gives.
+struct HostTarget {
+  std::string cpu;
+  int64_t vectorBits = 128;
+  std::string pairs;
+};
+} // namespace
+
+/// Reads and checks `MDIR_HOST_CPU`, and with `readPairs` `MDIR_HOST_PAIRS`,
+/// which only a program for the CPU reads. The CPU and its
+/// features are read as `JITTargetMachineBuilder::detectHost` reads them,
+/// without a machine: the pipeline of a Python program is built before its
+/// simulation initializes the target. A CPU that `MDIR_HOST_CPU` names has
+/// the features of its name and every feature they imply (`x86-64-v3` has
+/// AVX2, and so AVX; `sandybridge` has AVX itself).
+static llvm::Expected<HostTarget> getHostTarget(bool readPairs) {
+  HostTarget host;
+  StringRef chosen = readPairs && std::getenv("MDIR_HOST_PAIRS")
+                         ? std::getenv("MDIR_HOST_PAIRS")
+                         : "";
+  if (chosen == "scalar" || chosen == "lanes") {
+    host.pairs = ("mode=" + chosen + " ").str();
+  } else if (!chosen.empty()) {
+    StringRef width = chosen;
+    int64_t lanes = 0;
+    if (!width.consume_front("lanes:") || width.getAsInteger(10, lanes) ||
+        lanes < 1 || lanes > 64 || !llvm::isPowerOf2_64(lanes))
+      return llvm::make_error<compiler::CompileError>(
+          "MDIR_HOST_PAIRS='" + chosen.str() +
+          "' is not scalar, lanes, or lanes:W with W a power of two from 1 "
+          "to 64");
+    host.pairs = "mode=lanes width=" + std::to_string(lanes) + " ";
+  }
+  llvm::Triple triple(llvm::sys::getProcessTriple());
+  host.cpu = llvm::sys::getHostCPUName().str();
+  bool avx = false, avx512 = false;
+  if (const char *named = std::getenv("MDIR_HOST_CPU"); named && *named) {
+    host.cpu = named;
+    if (triple.isX86()) {
+      if (llvm::X86::parseArchX86(host.cpu, /*Only64Bit=*/true) ==
+          llvm::X86::CK_None)
+        return llvm::make_error<compiler::CompileError>(
+            "MDIR_HOST_CPU='" + host.cpu +
+            "' is not a 64-bit CPU that LLVM's X86 back end knows, such as "
+            "x86-64, x86-64-v3, or znver3");
+      llvm::SmallVector<llvm::StringRef> own;
+      llvm::X86::getFeaturesForCPU(host.cpu, own);
+      llvm::StringMap<bool> features;
+      for (llvm::StringRef feature : own) {
+        features[feature] = true;
+        llvm::X86::updateImpliedFeatures(feature, true, features);
+      }
+      avx = features.lookup("avx");
+      avx512 = features.lookup("avx512f");
+    }
+  } else if (triple.isX86()) {
+    llvm::StringMap<bool> features = llvm::sys::getHostCPUFeatures();
+    avx = features.lookup("avx");
+    avx512 = features.lookup("avx512f");
+  }
+  host.vectorBits = avx512 ? 512 : avx ? 256 : 128;
+  return host;
+}
+
+llvm::Error compiler::checkHostEnvironment(bool cpuProgram) {
+  auto host = getHostTarget(/*readPairs=*/cpuProgram);
+  return host ? llvm::Error::success() : host.takeError();
+}
+
+/// The machine of the host code before its code-generation level: the
+/// host that LLVM detects, or, with `MDIR_HOST_CPU`, the CPU it names with
+/// that CPU's own features (`x86-64` for a host of SSE2 alone), to compile
+/// for a narrower host than this one (D402). The compile
+/// cache keys a host object by this machine's CPU and features.
+static llvm::Expected<llvm::orc::JITTargetMachineBuilder> getHostBuilder() {
+  auto host = getHostTarget(/*readPairs=*/false);
+  if (!host)
+    return host.takeError();
+  auto builder = llvm::orc::JITTargetMachineBuilder::detectHost();
+  if (!builder)
+    return builder.takeError();
+  if (const char *cpu = std::getenv("MDIR_HOST_CPU"); cpu && *cpu) {
+    builder->setCPU(host->cpu);
+    builder->setFeatures("");
+  }
+  return builder;
+}
+
+/// The options of md-exec-choose-host-pairs (D402): the CPU
+/// of the host and the width of its vector registers, and `MDIR_HOST_PAIRS`,
+/// which overrides the host's policy for comparisons and tests: `scalar`
+/// (no loop takes the lanes), `lanes` (every loop that can, at the width of
+/// the mode and the host), or `lanes:W` (at `W` lanes). The driver checks
+/// the variables first (`checkHostEnvironment`); here a value that it
+/// refused leaves the options empty.
+static std::string getHostPairsOptions() {
+  auto host = getHostTarget(/*readPairs=*/true);
+  if (!host) {
+    llvm::consumeError(host.takeError());
+    return "";
+  }
+  return host->pairs + "cpu=" + host->cpu +
+         " vector-bits=" + std::to_string(host->vectorBits);
+}
+
+/// The architecture that the options of `mdir-gpu-lower-to-nvvm` compile
+/// for (`cubin-chip=`, getGpuPipelineOptions), whose entries of the tuning
+/// policies the device lowering takes (D420), or an empty
+/// name where they name none (PTX for the default architecture).
+static std::string getTargetArchitecture(StringRef gpuOptions) {
+  llvm::SmallVector<StringRef> words;
+  gpuOptions.split(words, ' ', -1, /*KeepEmpty=*/false);
+  for (StringRef word : words)
+    if (word.consume_front("cubin-chip="))
+      return word.str();
+  return "";
+}
+
+/// The options of the pruning in the loop over pairs (D284): on
+/// from the groups of the pruning policy for the architecture of
+/// `gpuOptions` (D420), unless MDIR_FUSED_PRUNE is `off`;
+/// `always` takes it at any number of groups.
+/// The lowering of md_alg.traverse_pairs that MDIR_TRAVERSE_ORACLE names
+/// (`simt`, `serial`, `serial-reversed`, `serial-magnitudes`, `omitted`),
+/// for the contract test of D415; by default its SIMT
+/// schedule, with no option. The serial
+/// definition does not prune in the loop, so the oracle turns the pruning
+/// in the loop off (getFusedPruningOptions).
+static std::string getTraverseOracleOption() {
+  const char *value = std::getenv("MDIR_TRAVERSE_ORACLE");
+  if (!value || !*value)
+    return "";
+  // The other sums take a fixed order, a row a particle, so that what
+  // differs between two runs of the test is the traversal's alone.
+  return std::string("traverse-oracle=") + value + " tuples-once=false ";
+}
+
+static std::string getFusedPruningOptions(llvm::StringRef gpuOptions) {
+  // The groups from which the loop prunes: the entry of the pruning policy
+  // for the architecture that the kernels are compiled for
+  // (D284, D420; 4096, and 20,480 for every architecture
+  // of the major version 12).
+  int64_t groups =
+      md_exec::policy::getDevicePolicy(getTargetArchitecture(gpuOptions))
+          .pruning.fusedGroups;
+  llvm::StringRef value = mdir::compiler::getFusedPruningSetting();
+  // The serial oracle takes the pruning in the refresh.
+  const char *oracle = std::getenv("MDIR_TRAVERSE_ORACLE");
+  if (value == "off" ||
+      (oracle && *oracle && llvm::StringRef(oracle) != "simt"))
+    return "";
+  return "fuse-pruning=true fuse-pruning-groups=" +
+         std::to_string(value == "always" ? 0 : groups) + " ";
+}
+
+std::string mdir::compiler::getPipeline(const Control &control,
+                               const Program &program, StringRef gpuOptions) {
+  std::string pipeline;
+  llvm::raw_string_ostream os(pipeline);
+  os << "md-check-exchange,md-differentiate,md-expand-truncation,md-inline,"
+     << "dyn-expand-couplings,md-bypass-updates,";
+  os << "convert-md-to-md-exec{skin=" << program.skin
+     << " width=" << program.neighborWidth << "},";
+  os << "md-exec-reuse-neighbors";
+  if (program.pruneSkin > 0.0)
+    os << "{prune-skin=" << program.pruneSkin << "}";
+  os << ",";
+  // Opt-in only (D88): the structures may miss pairs; the run warns.
+  if (control.rebuildPeriod > 0)
+    os << "md-exec-rebuild-at-interval{interval=" << control.rebuildPeriod
+       << "},";
+  // On a device each run of loops over disjoint tuples is one kernel with
+  // the loop over particles before it and the one after it (D110), so
+  // the loop that closes one run is not fused with the one that opens the
+  // next.
+  os << "md-exec-expose-validity,"
+     << "md-exec-fuse-loops"
+     << (control.target == Target::GPU ? "{integration-runs=true}" : "")
+     << ",md-exec-accumulate-destinations,"
+     << "md-exec-narrow-sums,";
+  if (control.fastMath)
+    os << "md-exec-simplify-distance{radial=true},";
+  os << "canonicalize,cse,md-exec-fold-tables,canonicalize,cse,";
+  // Before the precision: a loop over groups keeps the positions as they
+  // are stored (D95).
+  if (control.target == Target::GPU &&
+      control.neighborStructure == NeighborStructure::Groups)
+    os << "md-exec-choose-neighbors{kind=groups},";
+
+  StringRef mode = control.precision == Precision::Single
+                       ? "single"
+                       : control.precision == Precision::Mixed ? "mixed"
+                                                               : "double";
+  // In the deterministic mode the fields of the steps are stored as their
+  // roles say, whatever buffers of host calls the loops reach (#102).
+  os << "md-exec-assign-precision{mode=" << mode
+     << (!control.stagedModels.empty() &&
+                 control.stagedModels.front().stageFieldPrecision == "DOUBLE"
+             ? " stage-fields-f64=true"
+             : "")
+     << (control.deterministic ? " deterministic=true" : "") << "},";
+  if (control.fastMath)
+    os << "md-exec-approximate,md-exec-expand-radial,canonicalize,cse,";
+  // The divisions of the f64 pair kernels by one value share one
+  // reciprocal, and on a device a division by sqrt(x) is a product by
+  // rsqrt(x), which the host would compute as 1 / sqrt(x)
+  // (D366): the types are fixed and cse has run.
+  if (control.fastMath)
+    os << "md-exec-share-divisions"
+       << (control.target == Target::GPU ? "{rsqrt=true}" : "") << ",";
+  // The algebra of every sum, from the mode (D301): in the
+  // deterministic mode a floating-point sum is `fixed_order`, otherwise
+  // `any_order`. The strategies and the lowerings read it, not the mode.
+  os << "md-exec-assign-algebra"
+     << (control.deterministic ? "{deterministic=true}" : "") << ",";
+
+  if (control.target == Target::GPU) {
+    // The architecture that the kernels are compiled for, whose entries of
+    // the tuning policies the choosers and the lowering take
+    // (D420); none for PTX of the default architecture,
+    // which takes the default entries.
+    std::string arch = getTargetArchitecture(gpuOptions);
+    std::string archOption = arch.empty() ? "" : "arch=" + arch + " ";
+    // The strategy of each scatter-accumulate: the tiles of the spreading
+    // of PME by the size of its grid (D282), the tables of the tuples
+    // evaluated once from 100,000 tuples (D283); MDIR_PME_SPREAD and
+    // MDIR_TUPLE_SUMS override the choice, to compare the strategies
+    // (D285).
+    os << "md-exec-choose-scatter{" << archOption << getScatterOptions(control)
+       << "},";
+    // Kernels in f32 look their tables up in f32.
+    os << "md-exec-assign-storage{memory=device"
+       << (control.precision == Precision::Double ? "" : " tables=f32")
+       << "},md-exec-assign-streams,"
+       // The batched bodies of models in stages (D293).
+       << (control.stagedModels.empty() ? "" : getStageBodiesPass(arch))
+       // The loops over pairs over groups become md_alg.traverse_pairs
+       // (D415).
+       << "convert-md-exec-to-md-alg,"
+       << "convert-md-exec-to-gpu{" << archOption
+       // In the deterministic mode the arithmetic of a step does not
+       // depend on what else the step computes. LLVM contracts a product
+       // into a fused multiply-add only where it has one use, and the
+       // energies and the virial of a step that writes them give products
+       // more uses, which changed the rounding of its forces (#97). LLVM
+       // does not contract there; every sum with a product as an operand
+       // becomes a fused multiply-add instead, by the formula alone, and
+       // the kernels that join the constraints with the loops over
+       // particles around them (D110) take the displacements of the tuples
+       // as the kernels of the constraints alone do (#102).
+       << (control.deterministic ? "deterministic=true explicit-fma=true "
+                                 : "")
+       // The renumbered tuples and their incidence structures are the
+       // runtime's, in a store of the program that runs the code: the
+       // entry of an embedding front end runs in activations, which begin
+       // again and again in the same order of the particles (D253), and a
+       // segment of `mdir run` builds in the memory of the one before
+       // (#316).
+       << "kept-tuples=true "
+       // ... and builds them on the device where it does not take them
+       // (D257).
+       << "device-tuples=true "
+       // A check of the pruning of the dual lists, for tests
+       // (D268).
+       << (std::getenv("MDIR_CHECK_PRUNING") ? "check-pruning=true " : "")
+       // The pruning of a dual list in the loop over pairs that follows
+       // its refresh (D284).
+       << getFusedPruningOptions(gpuOptions)
+       // The serial definition of md_alg.traverse_pairs on the host in
+       // place of its schedule, for the contract test
+       // (D415).
+       << getTraverseOracleOption()
+       << (control.fastMath && !control.deterministic ? "" : "contract=false")
+       << "},"
+       // The collection ops of md_alg that the lowering left (the matrix
+       // template's and the groups build's) are lowered after the place of
+       // the collection-level transformations, which is empty
+       // (D408).
+       << "md-alg-transform-collections,convert-md-alg-to-gpu,"
+       // The buffers of the storage that the loop over steps and the code
+       // after it never use are released after their last use in the
+       // setup, by the liveness of D412 with `kills=proven`
+       // (D414).
+       << "md-exec-release-dead-storage,"
+       // The code of the host writes no buffer of the model that the entry
+       // takes (D258): proven here, or no compile.
+       << "check-read-only-arguments,"
+       << "mdir-gpu-lower-to-nvvm{";
+    // The kernels become cubins for the device's architecture, which the
+    // driver loads without compiling them; for a device that cannot be
+    // asked, PTX for the default architecture, which it compiles at load
+    // (D214).
+    os << (gpuOptions.empty() ? StringRef("cubin-format=isa") : gpuOptions)
+       << "},"
+       << "reconcile-unrealized-casts";
+    return pipeline;
+  }
+
+  // Reductions summed over fixed chunks in a fixed order: the same bits
+  // from run to run and for any number of threads (D171).
+  // The structures of the tuples are the runtime's to keep, across the
+  // activations of the entry of an embedding front end (D253) and across
+  // the segments of `mdir run` (#316).
+  bool threaded = control.threads > 1;
+  // The lanes of the rows of the loops over pairs (D402),
+  // by the measured policy of the host, which a host not measured does not
+  // have (the scalar row).
+  os << "md-exec-choose-host-pairs{" << getHostPairsOptions() << "},";
+  // On one thread the spreading of PME adds to its grid without atomics
+  // (D271).
+  os << "md-exec-assign-storage,convert-md-exec-to-loops{kept-tuples=true"
+     << (threaded ? "" : " atomic-grid=false") << "}"
+     // The code writes no buffer of the model that the entry takes
+     // (D258): proven here, or no compile.
+     << ",check-read-only-arguments"
+     << ",fixed-order-reductions,";
+  if (threaded)
+    os << "convert-scf-to-openmp,hoist-static-allocas,canonicalize,";
+  // In the deterministic mode a sine does not depend on what else its
+  // kernel computes: LLVM's code generator turns a sine and a cosine of one
+  // argument into one call of `sincos`, which does not round as `sin` and
+  // `cos` do, and the torsions have the cosine only where a step writes
+  // energies (#243).
+  if (control.deterministic)
+    os << "separate-sin-cos,";
+  os << "convert-scf-to-cf,convert-math-to-llvm,convert-math-to-libm,"
+     << "convert-vector-to-llvm,expand-strided-metadata,"
+     << "finalize-memref-to-llvm,convert-arith-to-llvm,"
+     << "convert-func-to-llvm,convert-cf-to-llvm,convert-ub-to-llvm,";
+  // The rows that the builder allocates where it writes them (the observed
+  // columns, the coordinates and the terms of pulling, dH/dλ and the
+  // energies of the states) are in the loops over steps: allocated there,
+  // each is taken again at every row and given back when the entry returns,
+  // which that of a simulation never does (D117, #305). Every
+  // allocation of a constant size is taken once, where the function begins.
+  // The lowering for a device releases the stack of an iteration where it
+  // ends instead (`releaseStack`), since the arguments of its launches are
+  // on the stack as well.
+  //
+  // The pass refuses what it cannot move, an allocation whose size is not a
+  // constant outside the first block, in every program: the entry of a
+  // program of frames is a loop over frames that never returns (#309), that
+  // of a program of segments (a Python simulation) never returns either, and
+  // the loops over steps of `mdir run` keep what they take until the run
+  // ends (#305). So a program that compiles takes nothing of its stack again
+  // at a step or a frame (#312). No program has such an allocation: the
+  // builder, the templates, and the passes allocate static shapes alone.
+  os << "hoist-static-allocas{refuse-rest=true},";
+  if (threaded)
+    os << "convert-openmp-to-llvm,";
+  os << "reconcile-unrealized-casts";
+  return pipeline;
+}
+
+
+llvm::Expected<compiler::CompiledProgram>
+compiler::compile(const model::PreparedModel &prepared, bool cache) {
+  auto program = prepared.build();
+  if (!program)
+    return program.takeError();
+  return lower(prepared.control, std::move(*program), prepared.execution,
+               cache);
+}
+// getRegistry: Registry.cpp, the dialects and passes of the lowerings (#655).
+llvm::ThreadPoolInterface &compiler::getThreadPool() {
+  // The pool is never destroyed: a lowering may still use it while the
+  // process exits, and a forked child, in which the threads of its parent's
+  // pool do not exist, leaves that pool and makes its own.
+  static std::mutex mutex;
+  static llvm::DefaultThreadPool *pool = nullptr;
+  static pid_t owner = 0;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!pool || owner != getpid()) {
+    // MDIR_COMPILE_THREADS bounds the threads of a lowering, for processes
+    // that compile side by side, such as the tests of a suite.
+    llvm::ThreadPoolStrategy strategy = llvm::hardware_concurrency();
+    if (const char *given = std::getenv("MDIR_COMPILE_THREADS")) {
+      unsigned threads = 0;
+      if (llvm::StringRef(given).getAsInteger(10, threads) || threads == 0)
+        llvm::errs() << "mdir: ignoring MDIR_COMPILE_THREADS='" << given
+                     << "', which is not a positive integer\n";
+      else
+        strategy = llvm::hardware_concurrency(threads);
+    }
+    pool = new llvm::DefaultThreadPool(strategy);
+    owner = getpid();
+  }
+  return *pool;
+}
+void compiler::shareThreadPool(mlir::MLIRContext &context) {
+  context.setThreadPool(getThreadPool());
+}
+llvm::Expected<mlir::OwningOpRef<mlir::ModuleOp>>
+compiler::lowerModule(mlir::MLIRContext &context, const driver::Control &control,
+                      const driver::Program &program, CompileStats *stats,
+                      StringRef gpuOptions) {
+  std::string diagnostics;
+  llvm::raw_string_ostream diagnosticStream(diagnostics);
+  mlir::ScopedDiagnosticHandler handler(&context, [&](mlir::Diagnostic &d) {
+    d.getLocation().print(diagnosticStream);
+    diagnosticStream << ": ";
+    d.print(diagnosticStream);
+    diagnosticStream << "\n";
+    return mlir::success();
+  });
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(program.module, &context);
+  if (!module)
+    return llvm::make_error<CompileError>("cannot parse generated IR: " + diagnostics);
+  std::string pipeline = getPipeline(control, program, gpuOptions);
+  mlir::PassManager manager(&context, mlir::ModuleOp::getOperationName(),
+                             mlir::PassManager::Nesting::Implicit);
+  if (mlir::failed(mlir::parsePassPipeline(pipeline, manager, diagnosticStream)))
+    return llvm::make_error<CompileError>("cannot set up lowering: " + diagnostics);
+  // Counts from an earlier context at the same address are not this one's.
+  (void)takeGpuModuleStats(context);
+  if (mlir::failed(manager.run(*module)))
+    return llvm::make_error<CompileError>("cannot lower program: " + diagnostics);
+  CompileStats gpu = takeGpuModuleStats(context);
+  if (stats)
+    *stats += gpu;
+  return std::move(module);
+}
+/// `program` with its pipeline, not lowered.
+static llvm::Expected<compiler::CompiledProgram>
+planProgram(const driver::Control &control, driver::Program program,
+            const model::Execution &execution, bool cache) {
+#if !MDIR_HAS_CUDA
+  if (execution.target == Target::GPU)
+    return llvm::make_error<model::ModelError>(model::ModelError::Unsupported,
+                                              "GPU compilation requires a CUDA-enabled build");
+#endif
+  // The toolkit of the simulation's lowering, so that both find the same
+  // libdevice and ptxas.
+  if (control.target == Target::GPU)
+    compiler::useCudaToolkit();
+  auto gpu = compiler::getGpuOptions(control, execution.device, cache);
+  if (!gpu)
+    return gpu.takeError();
+  std::string pipeline = compiler::getPipeline(control, program, *gpu);
+  return compiler::CompiledProgram{std::move(program), execution,
+                                   std::move(pipeline), {}, std::move(*gpu)};
+}
+driver::Control compiler::getSegmentsControl(driver::Control control) {
+  control.segments = true;
+  control.energyPeriod = 0;
+  control.framePeriod = 0;
+  control.checkpointPeriod = 0;
+  control.numSteps = std::max<int64_t>(1, control.getCouplingPeriod());
+  return control;
+}
+llvm::Error compiler::checkDerivatives(const driver::Control &control,
+                                       const driver::Program &program) {
+  mlir::MLIRContext context(getRegistry(),
+                            mlir::MLIRContext::Threading::DISABLED);
+  std::string diagnostics;
+  llvm::raw_string_ostream diagnosticStream(diagnostics);
+  mlir::ScopedDiagnosticHandler handler(&context, [&](mlir::Diagnostic &d) {
+    d.getLocation().print(diagnosticStream);
+    diagnosticStream << ": ";
+    d.print(diagnosticStream);
+    diagnosticStream << "\n";
+    return mlir::success();
+  });
+  // An error of the text or of the set-up is the lowering's to report.
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(program.module, &context);
+  if (!module)
+    return llvm::Error::success();
+  mlir::PassManager manager(&context, mlir::ModuleOp::getOperationName(),
+                            mlir::PassManager::Nesting::Implicit);
+  if (mlir::failed(mlir::parsePassPipeline("md-check-exchange,md-differentiate",
+                                           manager, diagnosticStream)))
+    return llvm::Error::success();
+  if (mlir::succeeded(manager.run(*module)))
+    return llvm::Error::success();
+  // The arguments of `@tunable` by the names of their tunables.
+  std::string named;
+  for (auto [argument, tunable] : program.gradientArguments) {
+    std::string words =
+        "argument " + std::to_string(argument) + " of 'tunable'";
+    if (diagnostics.find(words) == std::string::npos ||
+        tunable >= control.tunableDeclarations.size())
+      continue;
+    named += (named.empty() ? "" : ", ") + words + " is the tunable '" +
+             control.tunableDeclarations[tunable].name + "'";
+  }
+  while (!diagnostics.empty() && diagnostics.back() == '\n')
+    diagnostics.pop_back();
+  return llvm::make_error<model::ModelError>(
+      model::ModelError::Input,
+      "the program asks for a derivative that has no rule" +
+          std::string(program.tunableGradient ? " (System.tunable_gradient)"
+                                              : "") +
+          ": " + diagnostics + (named.empty() ? "" : "; " + named));
+}
+llvm::Expected<compiler::CompiledProgram>
+compiler::plan(const model::PreparedModel &prepared, bool cache) {
+  auto program = prepared.build();
+  if (!program)
+    return program.takeError();
+  // No program is made whose derivatives have no rule (D230): those of the
+  // program, which `lowered_ir` lowers, and those of the program of the
+  // segments, which a simulation lowers (#256). An error of the build of
+  // the second is the simulation's to report.
+  if (llvm::Error error = checkDerivatives(prepared.control, *program))
+    return std::move(error);
+  driver::Control segments = getSegmentsControl(prepared.control);
+  segments.neighborWidth = program->neighborWidth;
+  if (auto second = driver::buildProgram(segments, prepared.system)) {
+    if (llvm::Error error = checkDerivatives(segments, *second))
+      return std::move(error);
+  } else {
+    llvm::consumeError(second.takeError());
+  }
+  return planProgram(prepared.control, std::move(*program),
+                     prepared.execution, cache);
+}
+llvm::Expected<std::string>
+compiler::lowerToText(const driver::Control &control,
+                      const CompiledProgram &compiled) {
+  mlir::MLIRContext context(getRegistry(),
+                            mlir::MLIRContext::Threading::DISABLED);
+  shareThreadPool(context);
+  if (control.target == Target::GPU)
+    useCudaToolkit();
+  auto module = lowerModule(context, control, compiled.program, nullptr,
+                            compiled.gpuOptions);
+  if (!module)
+    return module.takeError();
+  std::string lowered;
+  llvm::raw_string_ostream os(lowered);
+  (*module)->print(os);
+  return lowered;
+}
+llvm::Expected<compiler::CompiledProgram>
+compiler::lower(const driver::Control &control, driver::Program program,
+                const model::Execution &execution, bool cache) {
+  auto planned = planProgram(control, std::move(program), execution, cache);
+  if (!planned)
+    return planned.takeError();
+  auto lowered = lowerToText(control, *planned);
+  if (!lowered)
+    return lowered.takeError();
+  planned->loweredIR = std::move(*lowered);
+  return planned;
+}
+
+// MLIR's ExecutionEngine compiles with the machine it is given, or with one
+// of the default level that it makes itself; its option
+// `jitCodeGenOptLevel` sets the level of a builder that it does not use.
+// The level is therefore that of this machine. `Aggressive` measured no
+// gain over `Default` on the Amber suite (GPU, within 0.3%) nor on JAC on
+// the CPU (2%, within the noise), so the host code takes `Default` (#90).
+llvm::Expected<std::unique_ptr<llvm::TargetMachine>>
+compiler::createHostMachine() {
+  auto builder = getHostBuilder();
+  if (!builder)
+    return builder.takeError();
+  builder->setCodeGenOptLevel(llvm::CodeGenOptLevel::Default);
+  return builder->createTargetMachine();
+}
+
+// Without it the code generator alone compiled the host code: no inlining
+// of the helpers of the templates (the minimum image of a search, the
+// B-splines of PME), no promotion of their arrays to registers, no
+// hoisting out of loops (#359, D267). The pipeline keeps the
+// floating-point semantics of the module: it neither contracts nor
+// reassociates what the module does not allow. O3 took 11 to 16% less time
+// a step on the CPU than O2 for 4 to 5% more compile time (D269).
+static constexpr llvm::OptimizationLevel hostLevel = llvm::OptimizationLevel::O3;
+
+llvm::StringRef compiler::hostOptimization() {
+  return hostLevel == llvm::OptimizationLevel::O3 ? "O3" : "O2";
+}
+
+void compiler::optimizeHostModule(llvm::Module &module,
+                                  llvm::TargetMachine &machine) {
+  llvm::LoopAnalysisManager loops;
+  llvm::FunctionAnalysisManager functions;
+  llvm::CGSCCAnalysisManager sccs;
+  llvm::ModuleAnalysisManager modules;
+  llvm::PassBuilder builder(&machine);
+  builder.registerModuleAnalyses(modules);
+  builder.registerCGSCCAnalyses(sccs);
+  builder.registerFunctionAnalyses(functions);
+  builder.registerLoopAnalyses(loops);
+  builder.crossRegisterProxies(loops, functions, sccs, modules);
+  builder.buildPerModuleDefaultPipeline(hostLevel).run(module, modules);
+}

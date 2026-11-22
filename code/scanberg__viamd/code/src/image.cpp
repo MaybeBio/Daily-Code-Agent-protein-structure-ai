@@ -1,0 +1,65 @@
+#include <image.h>
+
+#include <core/md_log.h>
+#include <core/md_file.h>
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+
+static void write_func(void* context, void* data, int size) {
+    MD_ASSERT(context);
+    md_file_t* file = (md_file_t*)context;
+    md_file_write(*file, data, size);
+}
+
+static inline md_file_t open_file(md_str_t filename) {
+    md_file_t file = {0};
+    if (!md_file_open(&file, filename, MD_FILE_WRITE | MD_FILE_CREATE | MD_FILE_TRUNCATE)) {
+        MD_LOG_ERROR("Failed to open file");
+    }
+    return file;
+}
+
+ImageFormat image_format_from_ext(md_str_t ext) {
+    if (md_str_eq_cstr_ignore_case(ext, "jpg") || md_str_eq_cstr_ignore_case(ext, "jpeg")) return ImageFormat_JPG;
+    if (md_str_eq_cstr_ignore_case(ext, "png")) return ImageFormat_PNG;
+    if (md_str_eq_cstr_ignore_case(ext, "bmp")) return ImageFormat_BMP;
+    return ImageFormat_Unknown;
+}
+
+bool image_write_jpg(md_str_t filename, const void* rgba, int width, int height, int quality) {
+    md_file_t file = open_file(filename);
+    bool result = false;
+    if (md_file_valid(file)) {
+        result = stbi_write_jpg_to_func(write_func, &file, width, height, 4, rgba, quality) != 0;
+        md_file_close(&file);
+    }
+    return result;
+}
+
+bool image_write_png(md_str_t filename, const void* rgba, int width, int height) {
+    md_file_t file = open_file(filename);
+    bool result = false;
+    if (md_file_valid(file)) {
+        result = stbi_write_png_to_func(write_func, &file, width, height, 4, rgba, width * sizeof(uint32_t)) != 0;
+        md_file_close(&file);
+    }
+    return result;
+}
+
+bool image_write_bmp(md_str_t filename, const void* rgba, int width, int height) {
+    md_file_t file = open_file(filename);
+    bool result = false;
+    if (md_file_valid(file)) {
+        result = stbi_write_bmp_to_func(write_func, &file, width, height, 4, rgba) != 0;
+        md_file_close(&file);
+    }
+    return result;
+}

@@ -1,0 +1,1436 @@
+import numpy as np
+import pandas as pd
+
+import itertools
+import hashlib
+import json
+import os
+import pkgutil
+import re
+import shutil
+import sys
+import tempfile
+from collections import OrderedDict
+
+from csubst import __version__
+from csubst import output_safety
+from csubst import genetic_code
+from csubst import foreground
+from csubst import sequence
+from csubst import parser_iqtree
+from csubst import recoding_config
+from csubst import resource_cache
+from csubst import runtime
+from csubst import structural_alphabet
+from csubst import tree
+from csubst import ete
+from csubst import expectation_3di
+from csubst import tsv
+
+_THREEDI_STATE_CACHE_FORMAT_VERSION = 6
+
+
+def _initialize_and_report_nonsyn_recode(g):
+    recode = recoding_config.normalize_nonsyn_recode(g.get("nonsyn_recode", "no"))
+    g["nonsyn_recode"] = recode
+    if recode == '3di20':
+        # Discard any codon-derived N context retained by an in-process caller.
+        # Scan/inspect may still need the codon and amino-acid model contexts.
+        g.pop('instantaneous_nsy_rate_matrix', None)
+        g.pop('rate_nsy_tensor', None)
+        for key in expectation_3di.CONTEXT_KEYS:
+            g.pop(key, None)
+    write_pca = bool(g.get("plot_nonsyn_recode_pca", False))
+    if (recode in ["no", "3di20"]) and (not write_pca):
+        required_keys = ["amino_acid_orders", "synonymous_indices", "matrix_groups"]
+        missing_keys = [key for key in required_keys if key not in g]
+        if len(missing_keys) > 0:
+            txt = "Missing required key(s) for nonsynonymous recoding initialization: {}"
+            raise ValueError(txt.format(", ".join(missing_keys)))
+        state_orders = [str(aa) for aa in g["amino_acid_orders"]]
+        index_map = OrderedDict()
+        codon_map = OrderedDict()
+        members = OrderedDict()
+        aa_to_state = OrderedDict()
+        for aa in state_orders:
+            index_map[aa] = np.asarray(g["synonymous_indices"][aa], dtype=np.int64).reshape(-1).tolist()
+            codon_map[aa] = [str(c) for c in g["matrix_groups"][aa]]
+            members[aa] = (aa,)
+            aa_to_state[aa] = aa
+        if len(state_orders) == 0:
+            raise ValueError("No nonsynonymous recoding states were generated.")
+        g["nonsyn_state_orders"] = np.array(state_orders, dtype=object)
+        g["nonsynonymous_indices"] = index_map
+        g["nonsyn_matrix_groups"] = codon_map
+        g["nonsyn_state_members"] = members
+        g["nonsyn_aa_to_state"] = aa_to_state
+        g["max_nonsynonymous_size"] = max(len(index_map[state]) for state in state_orders)
+        if recode == "3di20":
+            print("Applying nonsynonymous recoding scheme: 3di20")
+            txt = "3Di mode: --sa_asr_mode={}, predictor={}, direct IQ-TREE model={} (--seqtype MORPH)"
+            print(
+                txt.format(
+                    g.get("sa_asr_mode", "direct"),
+                    structural_alphabet.get_3di_model_cache_key(g),
+                    g.get("sa_iqtree_model", "GTR"),
+                )
+            )
+        return g
+    from csubst import recoding
+    g = recoding.initialize_nonsyn_groups(g)
+    if g["nonsyn_recode"] != "no":
+        txt = "Applying nonsynonymous recoding scheme: {}"
+        print(txt.format(g["nonsyn_recode"]))
+        if g["nonsyn_recode"] == "3di20":
+            txt = "3Di mode: --sa_asr_mode={}, predictor={}, direct IQ-TREE model={} (--seqtype MORPH)"
+            print(
+                txt.format(
+                    g.get("sa_asr_mode", "direct"),
+                    structural_alphabet.get_3di_model_cache_key(g),
+                    g.get("sa_iqtree_model", "GTR"),
+                )
+            )
+        recoding.write_nonsyn_recoding_table(
+            g,
+            output_path=runtime.output_path(g, "nonsyn_recoding.tsv"),
+        )
+    if write_pca:
+        recoding.write_nonsyn_recoding_pca_plot(
+            g,
+            output_path=runtime.output_path(g, "nonsyn_recoding_pca.png"),
+        )
+    return g
+
+
+def prepare_input_context(
+    g,
+    include_foreground=False,
+    include_marginal=False,
+    resolve_state_subset=False,
+    prepare_state=False,
+    force_notree_run=False,
+    ignore_tree_inconsistency=False,
+    state_metadata_only=False,
+):
+    g["codon_table"] = genetic_code.get_codon_table(ncbi_id=g["genetic_code"])
+    g = tree.read_treefile(g)
+    g = generate_intermediate_files(g, force_notree_run=force_notree_run)
+    g = annotate_tree(g, ignore_tree_inconsistency=ignore_tree_inconsistency)
+    g = read_input(g, state_metadata_only=state_metadata_only)
+    if include_foreground:
+        g = foreground.get_foreground_branch(g)
+        if include_marginal:
+            g = foreground.get_marginal_branch(g)
+    if resolve_state_subset:
+        g = resolve_state_loading(g)
+    if prepare_state:
+        g = prep_state(g)
+    return g
+
+
+def _normalize_sa_state_cache_mode(value):
+    normalized = str(value).strip().lower()
+    if normalized in ['auto', 'yes', 'no']:
+        return normalized
+    raise ValueError('--sa_state_cache should be one of auto, yes, no.')
+
+
+def _resolve_expectation_method(g):
+    token = g.get('expectation_method', 'codon_model')
+    normalized = str(token).strip().lower()
+    if normalized in ['codon_model', '']:
+        return 'codon_model'
+    if normalized == 'urn':
+        return 'urn'
+    raise ValueError('Unsupported expectation method: {}'.format(token))
+
+
+def _normalize_branch_ids_for_3di_cache(branch_ids):
+    if branch_ids is None:
+        return []
+    arr = np.asarray(branch_ids, dtype=np.int64).reshape(-1)
+    if arr.shape[0] == 0:
+        return []
+    return sorted(list(set([int(v) for v in arr.tolist()])))
+
+
+def _get_file_signature(path):
+    path_txt = str(path).strip()
+    if path_txt == '':
+        return {
+            'path': '',
+            'size': -1,
+            'mtime_ns': -1,
+            'sha256': '',
+        }
+    abs_path = os.path.abspath(path_txt)
+    if not os.path.isfile(abs_path):
+        return {
+            'path': abs_path,
+            'size': -1,
+            'mtime_ns': -1,
+            'sha256': '',
+        }
+    stat = os.stat(abs_path)
+    return {
+        'path': abs_path,
+        'size': int(stat.st_size),
+        'mtime_ns': int(getattr(stat, 'st_mtime_ns', int(stat.st_mtime * 1e9))),
+        'sha256': resource_cache.sha256_file(abs_path),
+    }
+
+
+def _get_3di_state_cache_context(g, selected_branch_ids, state_cdn_shape):
+    full_cds_path = str(g.get('full_cds_alignment_file', '')).strip()
+    if full_cds_path == '':
+        full_cds_path = str(g.get('alignment_file', '')).strip()
+    ml_anc_value = str(g.get('ml_anc', False)).strip().lower()
+    drop_mode = str(g.get('drop_invariant_tip_sites_mode', g.get('drop_invariant_tip_sites', 'no'))).strip().lower()
+    if drop_mode in ['1', 'true', 'yes', 'on']:
+        drop_mode = 'tip_invariant'
+    elif drop_mode in ['0', 'false', 'off']:
+        drop_mode = 'no'
+    iqtree_exe = str(g.get('iqtree_exe', '')).strip()
+    iqtree_path = shutil.which(iqtree_exe) or iqtree_exe
+    context = {
+        'format_version': int(_THREEDI_STATE_CACHE_FORMAT_VERSION),
+        'nonsyn_recode': '3di20',
+        'genetic_code': int(g.get('genetic_code', 1)),
+        'model_expectations': expectation_3di.required(g),
+        'sa_asr_mode': str(g.get('sa_asr_mode', 'direct')).strip().lower(),
+        'infile_type': str(g.get('infile_type', '')).strip().lower(),
+        'input_data_type': str(g.get('input_data_type', '')).strip().lower(),
+        'ml_anc': ml_anc_value in ['1', 'true', 'yes', 'y', 'on'],
+        'drop_invariant_tip_sites': drop_mode != 'no',
+        'drop_invariant_tip_sites_mode': drop_mode,
+        'prostt5_model': str(g.get('prostt5_model', 'Rostlab/ProstT5')).strip(),
+        'prostt5_revision': structural_alphabet._resolve_prostt5_revision(g),
+        'prostt5_local_dir': str(g.get('prostt5_local_dir', '')).strip(),
+        # Retain the cache field name for existing ProstT5 caches. Its value now
+        # identifies the selected predictor, encoder and classifier weights.
+        'prostt5_model_cache_key': structural_alphabet.get_3di_model_cache_key(g),
+        'sa_iqtree_model': str(g.get('sa_iqtree_model', 'GTR')).strip(),
+        'iqtree_exe': os.path.realpath(iqtree_path) if iqtree_path else '',
+        'iqtree_version': str(
+            g.get('iqtree_version', g.get('iqtree_output_version', ''))
+        ),
+        'csubst_version': str(__version__),
+        'selected_branch_ids': _normalize_branch_ids_for_3di_cache(selected_branch_ids),
+        'state_cdn_shape': [int(v) for v in list(state_cdn_shape)],
+        'full_cds_alignment': _get_file_signature(full_cds_path),
+        'iqtree_state': _get_file_signature(g.get('path_iqtree_state', '')),
+    }
+    rooted_tree = g.get('rooted_tree', None)
+    if rooted_tree is not None:
+        tree_payload = repr(tree.get_tree_cache_signature(rooted_tree)).encode('utf-8')
+        context['rooted_tree_sha256'] = hashlib.sha256(tree_payload).hexdigest()
+    else:
+        context['rooted_tree_sha256'] = ''
+    return context
+
+
+def _3di_state_cache_context_matches(cached, expected):
+    """Relocating identical inputs does not change the fitted state model."""
+    def semantic_context(context):
+        context = dict(context)
+        for key in ('full_cds_alignment', 'iqtree_state'):
+            signature = dict(context.get(key, {}))
+            # Keep content SHA-256 and size; paths/timestamps are provenance,
+            # not model inputs. All other inference settings must still match.
+            signature.pop('path', None)
+            signature.pop('mtime_ns', None)
+            context[key] = signature
+        return context
+    return semantic_context(cached) == semantic_context(expected)
+
+
+def _try_load_3di_state_cache(g, selected_branch_ids, state_cdn_shape):
+    cache_file = str(g.get('sa_state_cache_file', '')).strip()
+    if cache_file == '':
+        return None, None, '--sa_state_cache_file is empty.'
+    cache_path = os.path.abspath(cache_file)
+    if not os.path.isfile(cache_path):
+        return None, None, 'cache file not found: {}'.format(cache_path)
+    try:
+        with np.load(cache_path, allow_pickle=False) as cache:
+            required = ['metadata_json', 'state_nsy', 'state_orders']
+            missing = [key for key in required if key not in cache]
+            if len(missing) > 0:
+                txt = 'cache file missing field(s): {}'
+                return None, None, txt.format(','.join(missing))
+            metadata_raw = np.asarray(cache['metadata_json']).reshape(-1)
+            if metadata_raw.shape[0] != 1:
+                return None, None, 'metadata_json should contain a single record.'
+            cached_context = json.loads(str(metadata_raw[0]))
+            expected_context = _get_3di_state_cache_context(
+                g=g,
+                selected_branch_ids=selected_branch_ids,
+                state_cdn_shape=state_cdn_shape,
+            )
+            if not _3di_state_cache_context_matches(cached_context, expected_context):
+                return None, None, 'cache metadata mismatch.'
+            state_nsy = np.asarray(cache['state_nsy'], dtype=g['float_type'])
+            state_orders = np.asarray(cache['state_orders'], dtype=object).reshape(-1)
+            model_context = {}
+            if expectation_3di.required(g):
+                model_context = {key: np.asarray(cache[key]) for key in expectation_3di.CONTEXT_KEYS}
+                expectation_3di.validate_context(model_context, int(state_cdn_shape[0]), int(state_cdn_shape[1]))
+            elif str(g.get('sa_asr_mode', 'direct')).lower() == 'direct':
+                mask = np.asarray(cache['tip_invariant_mask'])
+                if mask.dtype != np.bool_ or mask.shape != (int(state_cdn_shape[1]),):
+                    raise ValueError('Invalid direct 3Di tip-invariant mask.')
+                model_context['_precomputed_tip_invariant_site_mask'] = mask
+    except Exception as exc:
+        return None, None, 'failed to read cache file: {}'.format(str(exc))
+    if state_nsy.ndim != 3:
+        return None, None, 'cached state_nsy should be 3D.'
+    if state_nsy.shape[0] != int(state_cdn_shape[0]):
+        return None, None, 'cached state_nsy node axis mismatch.'
+    if state_nsy.shape[1] != int(state_cdn_shape[1]):
+        return None, None, 'cached state_nsy site axis mismatch.'
+    if state_nsy.shape[2] != state_orders.shape[0]:
+        return None, None, 'cached state_nsy/state_orders dimensions mismatch.'
+    if not np.array_equal(state_orders, structural_alphabet.get_3di_state_orders()):
+        return None, None, 'cached 3Di state order is invalid.'
+    # Corrupt but readable NPZ files must not inject invalid probabilities into
+    # convergence counts. Validate in bounded chunks, allowing all-zero rows
+    # for missing/unloaded states and IQ-TREE's rounded posterior probabilities.
+    rows = state_nsy.reshape(-1, state_orders.shape[0])
+    for start in range(0, rows.shape[0], 65536):
+        block = rows[start:start + 65536]
+        if not np.isfinite(block).all() or np.any(block < 0) or np.any(block > 1):
+            return None, None, 'cached 3Di probabilities must be finite and between 0 and 1.'
+        masses = block.sum(axis=1, dtype=np.float64)
+        if np.any((masses != 0) & (np.abs(masses - 1) > 1e-3)):
+            return None, None, 'cached 3Di probability rows must sum to 0 (missing) or 1.'
+    g.update(model_context)
+    return state_nsy, state_orders, None
+
+
+def _write_3di_state_cache(g, selected_branch_ids, state_cdn_shape, state_nsy, state_orders):
+    cache_file = str(g.get('sa_state_cache_file', '')).strip()
+    if cache_file == '':
+        raise ValueError('--sa_state_cache_file is empty.')
+    cache_path = os.path.abspath(cache_file)
+    output_safety.validate_destination(cache_path, mutable_input_label='input --sa_state_cache_file')
+    cache_dir = os.path.dirname(cache_path)
+    if (cache_dir != '') and (not os.path.isdir(cache_dir)):
+        raise ValueError('Cache directory does not exist: {}'.format(cache_dir))
+    context = _get_3di_state_cache_context(
+        g=g,
+        selected_branch_ids=selected_branch_ids,
+        state_cdn_shape=state_cdn_shape,
+    )
+    model_context = {}
+    if expectation_3di.required(g):
+        expectation_3di.validate_context(g, int(state_cdn_shape[0]), int(state_cdn_shape[1]))
+        model_context = {key: g[key] for key in expectation_3di.CONTEXT_KEYS}
+    elif str(g.get('sa_asr_mode', 'direct')).lower() == 'direct':
+        mask = np.asarray(g['_precomputed_tip_invariant_site_mask'])
+        if mask.dtype != np.bool_ or mask.shape != (int(state_cdn_shape[1]),):
+            raise ValueError('Invalid direct 3Di tip-invariant mask.')
+        model_context['tip_invariant_mask'] = mask
+    metadata_json = json.dumps(context, sort_keys=True, separators=(',', ':'))
+    fd, tmp_path = tempfile.mkstemp(prefix='.{}.tmp.'.format(os.path.basename(cache_path)), suffix='.npz', dir=cache_dir or '.')
+    os.close(fd)
+    try:
+        np.savez_compressed(
+            tmp_path,
+            metadata_json=np.array([metadata_json], dtype=np.str_),
+            state_orders=np.asarray([str(v) for v in np.asarray(state_orders, dtype=object).reshape(-1)], dtype=np.str_),
+            state_nsy=np.asarray(state_nsy, dtype=g['float_type']),
+            **model_context,
+        )
+        with open(tmp_path, mode='rb') as handle:
+            os.fsync(handle.fileno())
+        output_safety.validate_destination(cache_path, mutable_input_label='input --sa_state_cache_file')
+        os.replace(tmp_path, cache_path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+    return cache_path
+
+
+def _read_package_text(file):
+    txt = pkgutil.get_data('csubst', file)
+    if txt is None:
+        raise FileNotFoundError('Unable to read package data file: {}'.format(file))
+    txt = txt.decode('utf-8')
+    return txt
+
+
+def _all_iqtree_intermediate_paths_are_explicit(g):
+    extensions = ('iqtree', 'log', 'rate', 'state', 'treefile')
+    return all(
+        str(g.get('iqtree_' + extension, '')).strip().lower() not in ('', 'infer')
+        for extension in extensions
+    )
+
+
+def generate_intermediate_files(g, force_notree_run=False):
+    if g['infile_type'] == 'iqtree':
+        from csubst import fitted_model, iqtree_fit
+        previous_omega_check = None
+        g,all_exist = parser_iqtree.check_intermediate_files(g)
+        if (all_exist)&(not g['iqtree_redo']):
+            explicit_paths = _all_iqtree_intermediate_paths_are_explicit(g)
+            compatible = explicit_paths
+            if explicit_paths:
+                print(
+                    'All IQ-TREE intermediate files were explicitly specified. '
+                    'A provenance manifest is not required.'
+                )
+            else:
+                compatible, reason = parser_iqtree.is_iqtree_manifest_compatible(g)
+                if compatible:
+                    print('IQ-TREE\'s inferred intermediate files and provenance manifest are compatible.')
+                else:
+                    print('IQ-TREE intermediate files will be regenerated because {}.'.format(reason))
+            if compatible:
+                g = parser_iqtree.read_iqtree(g, eq=False)
+                iqtree_model = g['substitution_model']
+                g['substitution_model'] = None
+                if explicit_paths:
+                    print('Using the model in the explicitly supplied IQ-TREE fit: {}. Use --iqtree_redo to refit.'.format(iqtree_model))
+                    return g
+                if iqtree_model == g['iqtree_model']:
+                    can_reuse = True
+                    if iqtree_fit.checks_hybrid_omega(g):
+                        can_reuse = fitted_model.checkpoint_path(g['path_iqtree_state']).is_file()
+                        if can_reuse:
+                            previous_omega_check = iqtree_fit.audit_hybrid_omega(g)
+                            can_reuse = previous_omega_check is None or not previous_omega_check.stalled
+                        else:
+                            print('The inferred ECMK07 hybrid fit lacks a checkpoint. Refitting IQ-TREE.')
+                    if can_reuse:
+                        txt = 'The model in the IQ-TREE\'s output ({}) matched --iqtree_model ({}). Skipping IQ-TREE.'
+                        print(txt.format(iqtree_model, g['iqtree_model']))
+                        return g
+                else:
+                    txt = 'The model in the IQ-TREE\'s output ({}) did not match --iqtree_model ({}). Redoing IQ-TREE.'
+                    print(txt.format(iqtree_model, g['iqtree_model']))
+        if (all_exist)&(g['iqtree_redo']):
+            print('--iqtree_redo is set.')
+        print('Starting IQ-TREE to estimate parameters and ancestral states.', flush=True)
+        parser_iqtree.check_iqtree_dependency(g)
+        parser_iqtree.run_iqtree_ancestral(g, force_notree_run=force_notree_run,
+                                         previous_omega_check=previous_omega_check)
+    else:
+        raise ValueError('Unsupported infile_type: {}'.format(g['infile_type']))
+    return g
+
+def read_input(g, state_metadata_only=False):
+    if g['infile_type'] == 'iqtree':
+        if state_metadata_only:
+            g = parser_iqtree.read_state_header(g)
+            g = parser_iqtree.read_iqtree(g)
+            g = parser_iqtree.read_log(g)
+            g['iqtree_rate_values'] = parser_iqtree.read_rate(g)
+        else:
+            g = parser_iqtree.get_input_information(g)
+    else:
+        raise ValueError('Unsupported infile_type: {}'.format(g['infile_type']))
+    expectation_method = _resolve_expectation_method(g)
+    from csubst import endpoint_io
+    if expectation_method != 'codon_model' and not endpoint_io.enabled(g):
+        g = _initialize_and_report_nonsyn_recode(g)
+        return g
+    base_model = re.sub(r'\+G.*', '', g['substitution_model'])
+    base_model = re.sub(r'\+R.*', '', base_model)
+    txt = 'Instantaneous substitution rate matrix will be generated using the base model: {}'
+    print(txt.format(base_model))
+    txt = 'Transition matrix will be generated using the model in the ancestral state reconstruction: {}'
+    print(txt.format(g['substitution_model']))
+    if g['substitution_model'].startswith(('ECMK07_', 'ECMrest_')):
+        endpoint_io.validate_codon_model(g['substitution_model'])
+    if (g['substitution_model'].startswith('ECMK07')):
+        matrix_file = 'substitution_matrix/ECMunrest.dat'
+        g['exchangeability_matrix'] = read_exchangeability_matrix(matrix_file, g['codon_orders'])
+        g['exchangeability_eq_freq'] = read_exchangeability_eq_freq(file=matrix_file, g=g)
+        g['empirical_eq_freq'] = get_equilibrium_frequency(g, mode='cdn')
+        if g['substitution_model'].split('+', 1)[0] != 'ECMK07_GY0K':
+            g['instantaneous_codon_rate_matrix'] = exchangeability2Q(
+                g['exchangeability_matrix'], g['empirical_eq_freq'],
+            )
+        # The hybrid's multiplier is loaded by fitted_model.prepare below.
+        # IQ-TREE reports omega_E (a derived ratio) in the text files.
+    elif (g['substitution_model'].startswith('ECMrest')):
+        matrix_file = 'substitution_matrix/ECMrest.dat'
+        g['exchangeability_matrix'] = read_exchangeability_matrix(matrix_file, g['codon_orders'])
+        g['exchangeability_eq_freq'] = read_exchangeability_eq_freq(file=matrix_file, g=g)
+        g['empirical_eq_freq'] = get_equilibrium_frequency(g, mode='cdn')
+        g['instantaneous_codon_rate_matrix'] = exchangeability2Q(g['exchangeability_matrix'], g['empirical_eq_freq'])
+    elif (g['substitution_model'].startswith('GY')):
+        txt = 'Estimated omega is not available in IQ-TREE\'s log file. Run IQ-TREE with a GY-based model.'
+        if g['omega'] is None:
+            raise AssertionError(txt)
+        txt = 'Estimated kappa is not available in IQ-TREE\'s log file. Run IQ-TREE with a GY-based model.'
+        if g['kappa'] is None:
+            raise AssertionError(txt)
+        g['instantaneous_codon_rate_matrix'] = get_mechanistic_instantaneous_rate_matrix(g=g)
+    elif (g['substitution_model'].startswith('MG')):
+        txt = 'Estimated omega is not available in IQ-TREE\'s log file. Run IQ-TREE with a GY-based model.'
+        if g['omega'] is None:
+            raise AssertionError(txt)
+        g['instantaneous_codon_rate_matrix'] = get_mechanistic_instantaneous_rate_matrix(g=g)
+    else:
+        txt = 'Unsupported substitution model for --expectation_method codon_model: {}'
+        raise ValueError(txt.format(g['substitution_model']))
+    from csubst import fitted_model
+    fitted_model.prepare(g)
+    g = _initialize_and_report_nonsyn_recode(g)
+    g['instantaneous_aa_rate_matrix'] = cdn2pep_matrix(inst_cdn=g['instantaneous_codon_rate_matrix'], g=g)
+    g['rate_syn_tensor'] = get_rate_tensor(inst=g['instantaneous_codon_rate_matrix'], mode='syn', g=g)
+    g['rate_aa_tensor'] = get_rate_tensor(inst=g['instantaneous_aa_rate_matrix'], mode='asis', g=g)
+    if g['nonsyn_recode'] != '3di20':
+        g['instantaneous_nsy_rate_matrix'] = cdn2nsy_matrix(inst_cdn=g['instantaneous_codon_rate_matrix'], g=g)
+        g['rate_nsy_tensor'] = get_rate_tensor(inst=g['instantaneous_nsy_rate_matrix'], mode='asis', g=g)
+        sum_tensor_nsy = g['rate_nsy_tensor'].sum()
+        sum_matrix_nsy = g['instantaneous_nsy_rate_matrix'][g['instantaneous_nsy_rate_matrix']>0].sum()
+        if (g['nonsyn_recode'] != 'no') and (abs(sum_tensor_nsy - sum_matrix_nsy) >= g['float_tol']):
+            raise AssertionError('Sum of recoded nonsynonymous rates did not match.')
+    sum_tensor_aa = g['rate_aa_tensor'].sum()
+    sum_tensor_syn = g['rate_syn_tensor'].sum()
+    sum_matrix_aa = g['instantaneous_aa_rate_matrix'][g['instantaneous_aa_rate_matrix']>0].sum()
+    sum_matrix_cdn = g['instantaneous_codon_rate_matrix'][g['instantaneous_codon_rate_matrix']>0].sum()
+    if abs(sum_tensor_aa - sum_matrix_aa) >= g['float_tol']:
+        raise AssertionError('Sum of rates did not match.')
+    txt = 'Sum of rates did not match. Check if --codon_table ({}) matches to that used in the ancestral state reconstruction ({}).'
+    txt = txt.format(g['codon_table'], g['reconstruction_codon_table'])
+    if abs(sum_matrix_cdn - sum_tensor_syn - sum_tensor_aa) >= g['float_tol']:
+        raise AssertionError(txt)
+    if bool(g.get('write_instantaneous_rate_matrix', False)):
+        np.savetxt(
+            runtime.output_path(g, 'instantaneous_rate_matrix.tsv'),
+            g['instantaneous_codon_rate_matrix'],
+            delimiter='\t',
+        )
+    q_ij_x_pi_i = g['instantaneous_codon_rate_matrix'][0,1]*g['equilibrium_frequency'][0]
+    q_ji_x_pi_j = g['instantaneous_codon_rate_matrix'][1,0]*g['equilibrium_frequency'][1]
+    if abs(q_ij_x_pi_i - q_ji_x_pi_j) >= g['float_tol']:
+        raise AssertionError('Instantaneous codon rate matrix (Q) is not time-reversible.')
+    return g
+
+def get_mechanistic_instantaneous_rate_matrix(g):
+    num_codon = len(g['codon_orders'])
+    inst = np.ones(shape=(num_codon,num_codon))
+    transition_pairs = {'AG', 'GA', 'CT', 'TC'}
+    for i1,c1 in enumerate(g['codon_orders']):
+        for i2,c2 in enumerate(g['codon_orders']):
+            num_diff_codon_position = sum([ cp1!=cp2 for cp1,cp2 in zip(c1,c2) ])
+            if (num_diff_codon_position!=1):
+                inst[i1,i2] = 0 # prohibit double substitutions
+    is_single_substitution = (inst != 0)
+    if g['omega'] is not None:
+        omega = float(g['omega'])
+        if omega < 0:
+            raise ValueError('omega should be >= 0.')
+        if omega != 1.0:
+            inst *= omega # nonsynonymous substitutions are scaled by omega
+        # Keep synonymous substitutions at 1.0 (where codon transitions are allowed).
+        for aa in g['amino_acid_orders']:
+            ind_cdn = np.array(g['synonymous_indices'][aa])
+            for i1,i2 in itertools.permutations(ind_cdn, 2):
+                if is_single_substitution[i1,i2]:
+                    inst[i1,i2] = 1.0
+    if g['kappa'] is not None:
+        for i1,c1 in enumerate(g['codon_orders']):
+            for i2,c2 in enumerate(g['codon_orders']):
+                num_diff_codon_position = sum([ cp1!=cp2 for cp1,cp2 in zip(c1,c2) ])
+                if (num_diff_codon_position==1):
+                    diff_nucs = [ cp1+cp2 for cp1,cp2 in zip(c1,c2) if cp1!=cp2 ][0]
+                    if diff_nucs in transition_pairs:
+                        inst[i1,i2] *= g['kappa'] # multiply kappa to transition substitutions
+    if str(g.get('substitution_model', '')).startswith('MG'):
+        frequencies = np.asarray(g.get('mg_nucleotide_frequencies'), dtype=float)
+        if (frequencies.shape != (3, 4) or not np.isfinite(frequencies).all()
+                or (frequencies < 0).any() or not np.allclose(frequencies.sum(axis=1), 1)):
+            raise ValueError('MG requires fitted position-specific nucleotide frequencies.')
+        stationary = np.array([np.prod([frequencies[p, 'ACGT'.index(c[p])] for p in range(3)])
+                               for c in g['codon_orders']])
+        stationary /= stationary.sum()
+        if not np.allclose(stationary, g['equilibrium_frequency'], atol=1e-10, rtol=1e-8):
+            raise ValueError('MG codon equilibrium frequencies must match its nucleotide frequency products.')
+        for i, source in enumerate(g['codon_orders']):
+            for j, target in enumerate(g['codon_orders']):
+                if inst[i, j] != 0:
+                    position = next(p for p in range(3) if source[p] != target[p])
+                    inst[i, j] *= frequencies[position, 'ACGT'.index(target[position])]
+        inst = inst.astype(g['float_type'])
+    else:
+        inst = inst.dot(np.diag(g['equilibrium_frequency'])).astype(g['float_type']) # pi_j * q_ij
+    inst = scale_instantaneous_rate_matrix(inst, g['equilibrium_frequency'])
+    inst = fill_instantaneous_rate_matrix_diagonal(inst)
+    return inst
+
+def fill_instantaneous_rate_matrix_diagonal(inst):
+    for i in np.arange(inst.shape[0]):
+        inst[i,i] = 0
+        inst[i,i] = -inst[i,:].sum()
+    return inst
+
+def scale_instantaneous_rate_matrix(inst, eq):
+    # scaling to satisfy Sum_i Sum_j!=i pi_i*q_ij, equals 1.
+    # See Kosiol et al. 2007. https://academic.oup.com/mbe/article/24/7/1464/986344
+    diagonal = np.diag(inst)
+    if not np.all(np.isclose(diagonal, 0)):
+        raise AssertionError('Diagonal elements should still be zeros.')
+    q_ijxpi_i = np.einsum('ad,a->ad', inst, eq)
+    scaling_factor = q_ijxpi_i.sum()
+    if scaling_factor <= 0:
+        raise AssertionError('Instantaneous rate matrix scaling factor must be positive.')
+    inst /= scaling_factor
+    return inst
+
+def get_rate_tensor(inst, mode, g):
+    if mode=='asis':
+        inst2 = np.copy(inst)
+        np.fill_diagonal(inst2, 0)
+        rate_tensor = np.expand_dims(inst2, axis=0)
+    elif mode=='syn':
+        num_syngroup = len(g['amino_acid_orders'])
+        num_state = g['max_synonymous_size']
+        axis = (num_syngroup,num_state,num_state)
+        rate_tensor = np.zeros(axis, dtype=inst.dtype)
+        for s,aa in enumerate(g['amino_acid_orders']):
+            ind_cdn = np.array(g['synonymous_indices'][aa])
+            ind_tensor = np.arange(len(ind_cdn))
+            for it1,it2 in itertools.permutations(ind_tensor, 2):
+                rate_tensor[s,it1,it2] = inst[ind_cdn[it1],ind_cdn[it2]]
+    else:
+        raise ValueError('Unsupported rate-tensor mode: {}'.format(mode))
+    rate_tensor = rate_tensor.astype(g['float_type'])
+    return rate_tensor
+
+def _cdn2group_matrix(inst_cdn, group_orders, group_indices):
+    group_orders = [str(order) for order in group_orders]
+    num_group = len(group_orders)
+    inst_group = np.zeros([num_group, num_group], dtype=inst_cdn.dtype)
+    for i, group_from in enumerate(group_orders):
+        idx_from = np.asarray(group_indices[group_from], dtype=np.int64).reshape(-1)
+        if idx_from.shape[0] == 0:
+            continue
+        for j, group_to in enumerate(group_orders):
+            if group_from == group_to:
+                continue
+            idx_to = np.asarray(group_indices[group_to], dtype=np.int64).reshape(-1)
+            if idx_to.shape[0] == 0:
+                continue
+            inst_group[i, j] = inst_cdn[np.ix_(idx_from, idx_to)].sum()
+    inst_group = fill_instantaneous_rate_matrix_diagonal(inst_group)
+    return inst_group
+
+
+def cdn2pep_matrix(inst_cdn, g):
+    inst_pep = _cdn2group_matrix(
+        inst_cdn=inst_cdn,
+        group_orders=g['amino_acid_orders'],
+        group_indices=g['synonymous_indices'],
+    )
+    # Following lines were commented out because this shouldn't be readjusted.
+    # Branch lengths are subst/codon.
+    # If readjusted, we have to provide subst/aa to calculate expected nonsynonymous convergence.
+    #eq_pep = get_equilibrium_frequency(g, mode='pep')
+    #inst_pep = scale_instantaneous_rate_matrix(inst_pep, eq_pep)
+    return inst_pep
+
+
+def cdn2nsy_matrix(inst_cdn, g):
+    if g.get('nonsyn_recode') == '3di20':
+        raise ValueError('A codon model does not define transition rates for 3Di states.')
+    return _cdn2group_matrix(
+        inst_cdn=inst_cdn,
+        group_orders=g['nonsyn_state_orders'],
+        group_indices=g['nonsynonymous_indices'],
+    )
+
+def exchangeability2Q(ex, eq):
+    inst = ex.dot(np.diag(eq)).astype(np.float64) # pi_j * s_ij. float32 is not enough for Pyvolve
+    inst = scale_instantaneous_rate_matrix(inst, eq)
+    inst = fill_instantaneous_rate_matrix_diagonal(inst)
+    return inst
+
+
+def codon_nonsynonymous_mask(g):
+    aa = np.empty(len(g['codon_orders']), dtype=int)
+    for index, codon_indices in enumerate(g['synonymous_indices'].values()):
+        aa[codon_indices] = index
+    return aa[:, None] != aa
+
+
+def get_ecm_omega_rate_matrix(g):
+    """Rebuild the IQ-TREE ECMK07_GY0K generator, including multi-hit entries."""
+    omega = g.get('omega')
+    if omega is None or not np.isfinite(omega) or omega < 0:
+        raise ValueError('ECMK07_GY0K requires a finite, nonnegative fitted omega from IQ-TREE.')
+    if g.get('kappa') not in (None, 1.0):
+        raise ValueError('ECMK07_GY0K requires kappa = 1.')
+    exchange = g['exchangeability_matrix']
+    if omega != 1.0:
+        # GY0K contributes only an N multiplier in the hybrid. Keep the
+        # empirical exchangeabilities for codons separated by 2 or 3 bases.
+        exchange = exchange.copy()
+        exchange[codon_nonsynonymous_mask(g)] *= omega
+    return exchangeability2Q(exchange, g['equilibrium_frequency'])
+
+def get_equilibrium_frequency(g, mode):
+    if 'equilibrium_frequency' in g.keys():
+        print('Applying estimated codon frequencies to obtain the instantaneous rate matrix.')
+        eq = g['equilibrium_frequency']
+    else:
+        print('Applying empirical codon frequencies to obtain the instantaneous rate matrix.')
+        eq = g['exchangeability_eq_freq']
+    if mode=='cdn':
+        return eq
+    elif mode=='pep':
+        num_pep_state = len(g['amino_acid_orders'])
+        eq_pep = np.zeros([num_pep_state,], dtype=eq.dtype)
+        for i,aa in enumerate(g['amino_acid_orders']):
+            aa_indices = g['synonymous_indices'][aa]
+            eq_pep[i] = eq[aa_indices].sum()
+        txt = 'Equilibrium amino acid frequency should sum to 1.'
+        if abs(eq_pep.sum()-1) >= g['float_tol']:
+            raise AssertionError(txt)
+        return eq_pep
+    else:
+        raise ValueError('Unsupported equilibrium-frequency mode: {}'.format(mode))
+
+def _can_use_selective_state_loading(g):
+    from csubst import endpoint_io
+    if endpoint_io.enabled(g):
+        return False, 'joint endpoint inference conditions on all tips.'
+    if g.get('exhaustive_until', None) != 1:
+        return False, None
+    if g.get('foreground', None) is None:
+        return False, None
+    if not bool(g.get('cb', False)):
+        return False, '--cb is disabled.'
+    # Foreground counts alone are insufficient for empirical site weights:
+    # training (including background/explicit IDs and clade cross-fitting)
+    # consumes substitution states outside the foreground loading plan.
+    if (g.get('expectation_method', 'codon_model') == 'urn'
+            and g.get('asrv', 'each') in ('pool', 'sn', 'each', 'file_each')):
+        return False, 'empirical ASRV training requires full-tree states.'
+    # Selection also emits the site audit. Its tip counts and zero-mass mask
+    # must describe the input tree, independently of requested output tables.
+    if g.get('site_filter_report', False) or g.get('drop_invariant_tip_sites', False):
+        return False, 'site selection/auditing requires full-tree states.'
+    blocking_outputs = [name for name in ['b', 's', 'bs', 'cs', 'cbs'] if bool(g.get(name, False))]
+    if len(blocking_outputs) > 0:
+        txt = 'full-tree outputs are enabled ({})'
+        return False, txt.format(', '.join(blocking_outputs))
+    if tree.has_state_plot_request(g.get('plot_state_aa', False)) or tree.has_state_plot_request(g.get('plot_state_codon', False)):
+        return False, 'state-tree plotting is enabled.'
+    if int(g.get('fg_clade_permutation', 0)) > 0:
+        return False, '--fg_clade_permutation is enabled.'
+    return True, None
+
+
+def _normalize_branch_ids(branch_ids):
+    if branch_ids is None:
+        return np.array([], dtype=np.int64)
+    values = np.asarray(branch_ids, dtype=object)
+    flat_values = np.atleast_1d(values).reshape(-1)
+    if flat_values.size == 0:
+        return np.array([], dtype=np.int64)
+    normalized = []
+    for value in flat_values.tolist():
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError('target_ids should be integer-like.')
+        if isinstance(value, (int, np.integer)):
+            normalized.append(int(value))
+            continue
+        if isinstance(value, (float, np.floating)):
+            if (not np.isfinite(value)) or (not float(value).is_integer()):
+                raise ValueError('target_ids should be integer-like.')
+            normalized.append(int(value))
+            continue
+        value_txt = str(value).strip()
+        if (value_txt == '') or (not bool(re.fullmatch(r'[+-]?[0-9]+(?:\.0+)?', value_txt))):
+            raise ValueError('target_ids should be integer-like.')
+        normalized.append(int(value_txt.split('.', 1)[0]))
+    return np.array(normalized, dtype=np.int64)
+
+
+def _get_required_state_branch_ids(g):
+    root_nn = ete.get_prop(ete.get_tree_root(g['tree']), "numerical_label")
+    required = set([int(root_nn)])
+    node_by_id = dict()
+    for node in g['tree'].traverse():
+        node_by_id[int(ete.get_prop(node, "numerical_label"))] = node
+    target_ids = set()
+    for trait_name in g['target_ids'].keys():
+        values = _normalize_branch_ids(g['target_ids'][trait_name])
+        target_ids.update([int(v) for v in values.tolist()])
+    for branch_id in target_ids:
+        required.add(branch_id)
+        node = node_by_id.get(branch_id, None)
+        if (node is None) or ete.is_root(node):
+            continue
+        parent = getattr(node, 'up', None)
+        while parent is not None:
+            required.add(int(ete.get_prop(parent, "numerical_label")))
+            parent_name = '' if (parent.name is None) else str(parent.name)
+            if ete.is_root(parent) or (parent_name != ''):
+                break
+            parent = getattr(parent, 'up', None)
+    required_ids = np.array(sorted(required), dtype=np.int64)
+    return required_ids
+
+
+def resolve_state_loading(g):
+    g['state_loaded_branch_ids'] = None
+    g['is_state_selective_loading'] = False
+    use_selective, reason = _can_use_selective_state_loading(g)
+    if not use_selective:
+        if (g.get('exhaustive_until', None) == 1) and (g.get('foreground', None) is not None) and (reason is not None):
+            print('Selective state loading disabled: {}'.format(reason), flush=True)
+        return g
+    required_ids = _get_required_state_branch_ids(g)
+    if required_ids.shape[0] == 0:
+        print('Selective state loading disabled: no required branches were found.', flush=True)
+        return g
+    g['state_loaded_branch_ids'] = required_ids
+    g['is_state_selective_loading'] = True
+    txt = 'Selective state loading enabled: loading {:,} nodes out of {:,} total nodes.'
+    print(txt.format(required_ids.shape[0], g['num_node']), flush=True)
+    return g
+
+
+def get_site_index_alignment(g, expected_num_site=None):
+    site_index_alignment = g.get('site_index_alignment', None)
+    if site_index_alignment is None:
+        if expected_num_site is None:
+            if g.get('state_cdn', None) is not None:
+                expected_num_site = int(g['state_cdn'].shape[1])
+            elif g.get('state_nuc', None) is not None:
+                expected_num_site = int(g['state_nuc'].shape[1] // 3)
+            elif g.get('num_input_site', None) is not None:
+                expected_num_site = int(g['num_input_site'])
+            else:
+                expected_num_site = 0
+        site_index_alignment = np.arange(int(expected_num_site), dtype=np.int64)
+        g['site_index_alignment'] = site_index_alignment
+    else:
+        site_index_alignment = np.asarray(site_index_alignment, dtype=np.int64).reshape(-1)
+        g['site_index_alignment'] = site_index_alignment
+    if expected_num_site is not None:
+        expected_num_site = int(expected_num_site)
+        if site_index_alignment.shape[0] != expected_num_site:
+            txt = 'site_index_alignment length ({}) did not match expected number of sites ({}).'
+            raise ValueError(txt.format(site_index_alignment.shape[0], expected_num_site))
+    return site_index_alignment
+
+
+def map_internal_site_indices(site_indices, g, missing_value=-1, allow_invalid=False):
+    arr = np.asarray(site_indices, dtype=np.int64)
+    site_index_alignment = g.get('site_index_alignment', None)
+    if site_index_alignment is None:
+        return arr.copy()
+    site_index_alignment = np.asarray(site_index_alignment, dtype=np.int64).reshape(-1)
+    if site_index_alignment.size == 0:
+        return arr.copy()
+    if site_index_alignment.dtype != np.int64:
+        site_index_alignment = site_index_alignment.astype(np.int64, copy=False)
+    out = np.full(arr.shape, int(missing_value), dtype=np.int64)
+    valid = (arr >= 0) & (arr < site_index_alignment.shape[0])
+    out[valid] = site_index_alignment[arr[valid]]
+    if (not allow_invalid) and (~valid).any():
+        invalid_values = np.unique(arr[~valid]).tolist()
+        invalid_txt = ','.join([str(int(v)) for v in invalid_values[:10]])
+        if len(invalid_values) > 10:
+            invalid_txt += ',...'
+        txt = 'Internal site index out of range for mapping: {}'
+        raise ValueError(txt.format(invalid_txt))
+    return out
+
+
+def write_site_index_map(g, output_path='csubst_sites_index_map.tsv'):
+    site_index_alignment = get_site_index_alignment(g=g)
+    if site_index_alignment.shape[0] == 0:
+        return None
+    num_alignment_site = int(g.get('num_input_site', 0))
+    if num_alignment_site <= 0:
+        num_alignment_site = int(site_index_alignment.max()) + 1
+    if site_index_alignment.max() >= num_alignment_site:
+        txt = 'site_index_alignment included alignment index {} but num_input_site is {}.'
+        raise ValueError(txt.format(int(site_index_alignment.max()), num_alignment_site))
+    internal_site = np.full(shape=(num_alignment_site,), fill_value=-1, dtype=np.int64)
+    internal_site[site_index_alignment] = np.arange(site_index_alignment.shape[0], dtype=np.int64)
+    out = pd.DataFrame({
+        'codon_site_alignment': np.arange(num_alignment_site, dtype=np.int64),
+        'codon_site_alignment_1based': np.arange(1, num_alignment_site + 1, dtype=np.int64),
+        'site': internal_site,
+        'site_1based': np.where(internal_site >= 0, internal_site + 1, 0).astype(np.int64),
+        'is_retained': np.where(internal_site >= 0, 'Y', 'N'),
+    })
+    tsv.write_dataframe(out, output_path)
+    return os.path.abspath(output_path)
+
+
+def get_site_retained_mask(g, num_alignment_site=None):
+    site_index_alignment = get_site_index_alignment(g=g)
+    if site_index_alignment.shape[0] == 0:
+        if num_alignment_site is None:
+            num_alignment_site = int(g.get('num_input_site', 0))
+        return np.zeros(shape=(max(int(num_alignment_site), 0),), dtype=bool)
+    if num_alignment_site is None:
+        num_alignment_site = int(g.get('num_input_site', 0))
+        if num_alignment_site <= 0:
+            num_alignment_site = int(site_index_alignment.max()) + 1
+    num_alignment_site = int(num_alignment_site)
+    if num_alignment_site <= 0:
+        return np.zeros(shape=(0,), dtype=bool)
+    if int(site_index_alignment.max()) >= num_alignment_site:
+        txt = 'site_index_alignment included alignment index {} but num_alignment_site is {}.'
+        raise ValueError(txt.format(int(site_index_alignment.max()), num_alignment_site))
+    retained = np.zeros(shape=(num_alignment_site,), dtype=bool)
+    retained[site_index_alignment] = True
+    return retained
+
+
+def expand_site_axis_table_to_alignment(
+    df,
+    g,
+    site_col='site',
+    group_cols=None,
+    site_is_one_based=False,
+    retention_col='is_site_retained',
+):
+    if site_col not in df.columns:
+        return df
+    out = df.copy(deep=True)
+    if group_cols is None:
+        group_cols = list()
+    for col in group_cols:
+        if col not in out.columns:
+            raise ValueError('Group column was not found in table: {}'.format(col))
+    site_values = pd.to_numeric(out.loc[:, site_col], errors='coerce')
+    out = out.loc[site_values.notna(), :].copy()
+    out.loc[:, site_col] = site_values.loc[site_values.notna()].astype(np.int64).to_numpy(copy=False)
+    key_cols = group_cols + [site_col]
+    if out.duplicated(subset=key_cols).any():
+        txt = 'Cannot expand table because duplicated key rows were found for columns: {}'
+        raise ValueError(txt.format(','.join(key_cols)))
+    num_alignment_site = int(g.get('num_input_site', 0))
+    if num_alignment_site <= 0:
+        site_index_alignment = get_site_index_alignment(g=g)
+        if site_index_alignment.shape[0] == 0:
+            return out
+        num_alignment_site = int(site_index_alignment.max()) + 1
+    if site_is_one_based:
+        site_start = 1
+    else:
+        site_start = 0
+    site_template = pd.DataFrame({
+        site_col: np.arange(site_start, site_start + int(num_alignment_site), dtype=np.int64),
+    })
+    if len(group_cols) == 0:
+        full = site_template
+    else:
+        groups = out.loc[:, group_cols].drop_duplicates().reset_index(drop=True)
+        if groups.shape[0] == 0:
+            return out
+        groups = groups.copy(deep=True)
+        site_template = site_template.copy(deep=True)
+        groups.loc[:, '__tmpkey__'] = 1
+        site_template.loc[:, '__tmpkey__'] = 1
+        full = pd.merge(groups, site_template, on='__tmpkey__', how='inner')
+        full = full.drop(columns=['__tmpkey__'])
+    expanded = pd.merge(full, out, on=key_cols, how='left', sort=False)
+    expanded = expanded.sort_values(by=key_cols).reset_index(drop=True)
+    if retention_col is not None:
+        retained_mask = get_site_retained_mask(g=g, num_alignment_site=num_alignment_site)
+        site_values_full = expanded.loc[:, site_col].to_numpy(dtype=np.int64, copy=False)
+        if site_is_one_based:
+            site_values_zero = site_values_full - 1
+        else:
+            site_values_zero = site_values_full
+        is_valid_site = (site_values_zero >= 0) & (site_values_zero < retained_mask.shape[0])
+        retained_values = np.full(shape=(expanded.shape[0],), fill_value='N', dtype=object)
+        retained_values[is_valid_site] = np.where(
+            retained_mask[site_values_zero[is_valid_site]],
+            'Y',
+            'N',
+        )
+        expanded.loc[:, retention_col] = retained_values
+    return expanded
+
+
+def _get_tip_invariant_site_mask(g, site_index_alignment):
+    leaf_seqs = list()
+    for leaf in ete.iter_leaves(g['tree']):
+        seq = ete.get_prop(leaf, 'sequence', '').upper()
+        if seq == '':
+            continue
+        if (len(seq) % 3) != 0:
+            raise AssertionError('Sequence length is not multiple of 3. Node name = {}'.format(leaf.name))
+        num_codon_site = len(seq) // 3
+        if num_codon_site != int(g['num_input_site']):
+            msg = 'Codon site count did not match alignment size for leaf "{}". '
+            msg += 'Expected {}, observed {}.'
+            raise AssertionError(msg.format(leaf.name, g['num_input_site'], num_codon_site))
+        leaf_seqs.append(seq)
+    num_site = int(site_index_alignment.shape[0])
+    is_tip_invariant = np.zeros(shape=(num_site,), dtype=bool)
+    if len(leaf_seqs) == 0:
+        return is_tip_invariant
+    codon_orders = g['codon_orders']
+    codon_state_lookup = sequence.build_state_index_lookup(codon_orders)
+    for i, aln_site in enumerate(site_index_alignment.tolist()):
+        observed_codon = -1
+        num_nonmissing = 0
+        is_invariant = True
+        start = int(aln_site) * 3
+        end = start + 3
+        for seq in leaf_seqs:
+            codon = seq[start:end]
+            codon_id = codon_state_lookup.get(codon, None)
+            if codon_id is not None:
+                codon_index = [int(codon_id)]
+            else:
+                codon_index = sequence.get_state_index(
+                    codon,
+                    codon_orders,
+                    genetic_code.ambiguous_table,
+                    state_lookup=codon_state_lookup,
+                )
+            if len(codon_index) == 0:
+                continue
+            if len(codon_index) != 1:
+                is_invariant = False
+                break
+            codon_id = int(codon_index[0])
+            num_nonmissing += 1
+            if observed_codon == -1:
+                observed_codon = codon_id
+            elif observed_codon != codon_id:
+                is_invariant = False
+                break
+        # Drop also when only one unambiguous tip codon is observed:
+        # such sites have no within-tip codon variation and are now treated as tip-invariant.
+        is_tip_invariant[i] = bool(is_invariant and (num_nonmissing >= 1) and (observed_codon >= 0))
+    return is_tip_invariant
+
+
+def _get_drop_site_branch_pairs(g):
+    selected_branch_ids = g.get('state_loaded_branch_ids', None)
+    selected_branch_set = None
+    if selected_branch_ids is not None:
+        selected_branch_set = set(int(v) for v in _normalize_branch_ids(selected_branch_ids).tolist())
+    state_cdn = g.get('state_cdn', None)
+    state_nsy = g.get('state_nsy', None)
+    if state_cdn is not None:
+        state_has_mass = (state_cdn.sum(axis=(1, 2)) > float(g.get('float_tol', 0)))
+    elif state_nsy is not None:
+        state_has_mass = (state_nsy.sum(axis=(1, 2)) > float(g.get('float_tol', 0)))
+    else:
+        state_has_mass = None
+    branch_pairs = list()
+    for node in g['tree'].traverse():
+        if ete.is_root(node):
+            continue
+        child = int(ete.get_prop(node, "numerical_label"))
+        if (selected_branch_set is not None) and (child not in selected_branch_set):
+            continue
+        if not ete.node_has_state(node, state_has_mass=state_has_mass):
+            continue
+        parent_node = ete.get_effective_state_parent(node, state_has_mass=state_has_mass)
+        if parent_node is None:
+            continue
+        parent = int(ete.get_prop(parent_node, "numerical_label"))
+        branch_pairs.append((child, parent))
+    return branch_pairs
+
+
+def _get_zero_substitution_mass_site_mask(g):
+    from csubst import endpoint_io, substitution
+    if endpoint_io.enabled(g):
+        endpoint_io.prepare(g)
+        s_counts = substitution.get_site_sub_counts(g['_endpoint_tensors']['S'])
+        n_counts = substitution.get_site_sub_counts(g['_endpoint_tensors']['N'])
+        return (s_counts + n_counts) <= float(g.get('float_tol', 0))
+    state_cdn = g.get('state_cdn', None)
+    state_nsy = g.get('state_nsy', None)
+    if (state_cdn is None) or (state_nsy is None):
+        raise ValueError('state_cdn and state_nsy are required for zero_sub_mass site filtering.')
+    if state_cdn.shape[1] != state_nsy.shape[1]:
+        txt = 'state_cdn and state_nsy have inconsistent site axes: {} vs {}.'
+        raise ValueError(txt.format(state_cdn.shape[1], state_nsy.shape[1]))
+    num_site = int(state_cdn.shape[1])
+    if num_site == 0:
+        return np.zeros(shape=(0,), dtype=bool)
+    tol = float(g.get('float_tol', 0))
+    is_nonzero_mass = np.zeros(shape=(num_site,), dtype=bool)
+    syn_group_indices = [
+        np.asarray(g['synonymous_indices'][aa], dtype=np.int64).reshape(-1)
+        for aa in g['amino_acid_orders']
+    ]
+    syn_group_indices = [ind for ind in syn_group_indices if ind.shape[0] > 1]
+    branch_pairs = _get_drop_site_branch_pairs(g)
+    if len(branch_pairs) == 0:
+        return np.zeros(shape=(num_site,), dtype=bool)
+    for child, parent in branch_pairs:
+        parent_nsy = state_nsy[parent, :, :]
+        child_nsy = state_nsy[child, :, :]
+        n_mass = (parent_nsy.sum(axis=1) * child_nsy.sum(axis=1)) - np.einsum('ij,ij->i', parent_nsy, child_nsy)
+        is_nonzero_mass |= (n_mass > tol)
+        parent_cdn = state_cdn[parent, :, :]
+        child_cdn = state_cdn[child, :, :]
+        s_mass = np.zeros(shape=(num_site,), dtype=state_cdn.dtype)
+        for ind in syn_group_indices:
+            parent_syn = parent_cdn[:, ind]
+            child_syn = child_cdn[:, ind]
+            s_mass += (
+                (parent_syn.sum(axis=1) * child_syn.sum(axis=1))
+                - np.einsum('ij,ij->i', parent_syn, child_syn)
+            )
+        is_nonzero_mass |= (s_mass > tol)
+        if is_nonzero_mass.all():
+            break
+    return ~is_nonzero_mass
+
+
+def _slice_site_axis_in_state_tensor(state_tensor, keep_mask):
+    if state_tensor is None:
+        return None
+    if state_tensor.ndim < 2:
+        return state_tensor
+    if state_tensor.shape[1] == keep_mask.shape[0]:
+        return state_tensor[:, keep_mask, ...]
+    if state_tensor.shape[1] == (keep_mask.shape[0] * 3):
+        nuc_keep_mask = np.repeat(keep_mask, 3)
+        return state_tensor[:, nuc_keep_mask, ...]
+    txt = 'State tensor site axis ({}) did not match keep_mask length ({}).'
+    raise ValueError(txt.format(state_tensor.shape[1], keep_mask.shape[0]))
+
+
+def get_site_drop_mask(g, mode, site_index_alignment):
+    """Compute a selection mask without mutating state or model site axes."""
+    state_cdn = g.get('state_cdn')
+    if mode == 'no':
+        return np.zeros(len(site_index_alignment), dtype=bool)
+    if mode == 'tip_invariant':
+        precomputed = g.get('3di_tip_invariant_mask', g.get('_precomputed_tip_invariant_site_mask', None))
+        if precomputed is not None:
+            precomputed = np.asarray(precomputed, dtype=bool).reshape(-1)
+            if precomputed.shape[0] != site_index_alignment.shape[0]:
+                txt = 'Precomputed tip-invariant site mask length ({}) did not match current site axis ({}).'
+                raise ValueError(txt.format(precomputed.shape[0], site_index_alignment.shape[0]))
+            is_drop_site = precomputed
+            print('Using the tip-invariant site mask from direct 3Di predictions.', flush=True)
+        else:
+            is_drop_site = _get_tip_invariant_site_mask(g=g, site_index_alignment=site_index_alignment)
+    elif mode == 'zero_sub_mass':
+        if state_cdn is None:
+            raise ValueError('state_cdn and state_nsy are required for zero_sub_mass site filtering.')
+        is_drop_site = _get_zero_substitution_mass_site_mask(g=g)
+    else:
+        raise ValueError('Unsupported --drop_invariant_tip_sites_mode: {}'.format(mode))
+    return is_drop_site
+
+
+def drop_invariant_tip_sites(g):
+    state_cdn = g.get('state_cdn', None)
+    mode = str(g.get('drop_invariant_tip_sites_mode', 'tip_invariant')).strip().lower()
+    expected_num_site = None
+    if state_cdn is not None:
+        expected_num_site = state_cdn.shape[1]
+    elif g.get('num_input_site', None) is not None:
+        expected_num_site = int(g['num_input_site'])
+    site_index_alignment = get_site_index_alignment(g=g, expected_num_site=expected_num_site)
+    is_drop_site = get_site_drop_mask(g, mode, site_index_alignment)
+    mode_label = mode.replace('_', '-')
+    num_drop = int(is_drop_site.sum())
+    if num_drop == 0:
+        print('No codon sites were dropped (mode={}).'.format(mode), flush=True)
+        g['drop_invariant_tip_sites_mode_applied'] = mode
+        g['num_dropped_sites'] = 0
+        g['dropped_site_alignment'] = np.array([], dtype=np.int64)
+        g['num_dropped_tip_invariant_sites'] = 0
+        g['dropped_tip_invariant_site_alignment'] = np.array([], dtype=np.int64)
+        return g
+    keep_mask = ~is_drop_site
+    from csubst import endpoint_io
+    if endpoint_io.enabled(g):
+        endpoint_io.invalidate(g)
+    if keep_mask.sum() == 0:
+        txt = 'All codon sites were classified as drop candidates and would be dropped (mode={}).'
+        raise ValueError(txt.format(mode))
+    if state_cdn is not None:
+        g['state_nuc'] = _slice_site_axis_in_state_tensor(g.get('state_nuc', None), keep_mask)
+        g['state_cdn'] = _slice_site_axis_in_state_tensor(g.get('state_cdn', None), keep_mask)
+        g['state_pep'] = _slice_site_axis_in_state_tensor(g.get('state_pep', None), keep_mask)
+        g['state_nsy'] = _slice_site_axis_in_state_tensor(g.get('state_nsy', None), keep_mask)
+    g['site_index_alignment'] = site_index_alignment[keep_mask]
+    dropped_alignment_sites = site_index_alignment[is_drop_site]
+    g['drop_invariant_tip_sites_mode_applied'] = mode
+    g['num_dropped_sites'] = num_drop
+    g['dropped_site_alignment'] = dropped_alignment_sites
+    g['num_dropped_tip_invariant_sites'] = num_drop
+    g['dropped_tip_invariant_site_alignment'] = dropped_alignment_sites
+    for rate_key in ['iqtree_rate_values', 'iqtree_categorized_rate_values', '3di_rates', '3di_tip_invariant_mask']:
+        if (rate_key not in g) or (g[rate_key] is None):
+            continue
+        rate_values = np.asarray(g[rate_key])
+        num_input_site = int(g.get('num_input_site', rate_values.shape[0]))
+        if rate_values.shape[0] == num_input_site:
+            g[rate_key] = rate_values[g['site_index_alignment']]
+        elif rate_values.shape[0] == keep_mask.shape[0]:
+            g[rate_key] = rate_values[keep_mask]
+        else:
+            txt = '{} length ({}) did not match num_input_site ({}) or current site axis ({}).'
+            raise ValueError(txt.format(rate_key, rate_values.shape[0], num_input_site, keep_mask.shape[0]))
+    map_path = None
+    if bool(g.get('write_site_index_map', False)):
+        map_path = write_site_index_map(
+            g=g,
+            output_path=runtime.output_path(g, 'site_index_map.tsv'),
+        )
+    txt = 'Dropped {:,} codon site(s) by {} criterion; retained {:,} / {:,} sites.'
+    print(txt.format(num_drop, mode_label, int(keep_mask.sum()), int(keep_mask.shape[0])), flush=True)
+    if map_path is not None:
+        print('Writing site index map: {}'.format(map_path), flush=True)
+    return g
+
+
+def apply_site_filters(g):
+    if bool(g.get('drop_invariant_tip_sites', False)):
+        g = drop_invariant_tip_sites(g)
+    return g
+
+
+def prep_state(g, apply_site_filtering=True):
+    state_nuc = None
+    state_cdn = None
+    state_pep = None
+    state_nsy = None
+    loaded_branch_ids = g.get('state_loaded_branch_ids', None)
+    nsy_branch_ids = g.get('sa_inference_branch_ids', None)
+    if nsy_branch_ids is None:
+        nsy_branch_ids = loaded_branch_ids
+
+    def _resolve_state_nsy(state_cdn_local, state_pep_local):
+        if g.get('nonsyn_recode', 'no') != '3di20':
+            return sequence.cdn2nsy_state(
+                state_cdn=state_cdn_local,
+                g=g,
+                selected_branch_ids=loaded_branch_ids,
+            )
+        cache_mode = _normalize_sa_state_cache_mode(g.get('sa_state_cache', 'auto'))
+        sa_mode = str(g.get('sa_asr_mode', 'direct')).strip().lower()
+        state_cdn_shape = tuple([int(v) for v in state_cdn_local.shape])
+
+        def _activate_cached_state(cached_state_nsy, cached_orders, after_lock=False):
+            g['nonsyn_state_orders'] = np.asarray(cached_orders, dtype=object)
+            g.pop('_3di_alignment_by_branch_id', None)
+            g.pop('_3di_tip_alignment_by_leaf', None)
+            if after_lock:
+                txt = 'Loaded 3Di state cache after lock acquisition: {}'
+            else:
+                txt = 'Loaded 3Di state cache: {}'
+            print(txt.format(os.path.abspath(str(g.get('sa_state_cache_file', '')).strip())), flush=True)
+            if expectation_3di.required(g):
+                print('Model expectations: N=3Di GTRX+FQ (uniform); S=codon.', flush=True)
+            return cached_state_nsy
+
+        def _compute_3di_state():
+            if sa_mode == 'translate':
+                state_nsy_local, state_orders, aligned_3di = structural_alphabet.build_3di_state_from_state_pep(
+                    g=g,
+                    state_pep=state_pep_local,
+                    selected_branch_ids=nsy_branch_ids,
+                )
+                g['nonsyn_state_orders'] = np.asarray(state_orders, dtype=object)
+                g['_3di_alignment_by_branch_id'] = aligned_3di
+                return state_nsy_local, state_orders
+            if sa_mode == 'direct':
+                state_nsy_local, state_orders, tip_3di = structural_alphabet.build_3di_state_direct(
+                    g=g,
+                    selected_branch_ids=nsy_branch_ids,
+                )
+                g['nonsyn_state_orders'] = np.asarray(state_orders, dtype=object)
+                g['_3di_tip_alignment_by_leaf'] = tip_3di
+                if not expectation_3di.required(g):
+                    g['_precomputed_tip_invariant_site_mask'] = structural_alphabet._get_tip_invariant_3di_site_mask(tip_3di)
+                return state_nsy_local, state_orders
+            raise ValueError('--sa_asr_mode should be one of translate, direct.')
+
+        if cache_mode in ['auto', 'yes']:
+            cached_state_nsy, cached_orders, cache_msg = _try_load_3di_state_cache(
+                g=g,
+                selected_branch_ids=nsy_branch_ids,
+                state_cdn_shape=state_cdn_shape,
+            )
+            if cached_state_nsy is not None:
+                return _activate_cached_state(cached_state_nsy, cached_orders)
+            if cache_mode == 'yes':
+                txt = '--sa_state_cache yes requested a compatible 3Di cache, but it was unavailable: {}'
+                raise ValueError(txt.format(cache_msg))
+            if cache_msg is not None:
+                txt = '3Di state cache was not used (--sa_state_cache auto): {}'
+                print(txt.format(cache_msg), flush=True)
+        if cache_mode == 'auto':
+            cache_file = str(g.get('sa_state_cache_file', '')).strip()
+            if cache_file == '':
+                state_nsy_local, _ = _compute_3di_state()
+                return state_nsy_local
+            lock_path = resource_cache.resolve_path_lock_path(cache_file, lock_label='3di-state-cache')
+            with resource_cache.acquire_exclusive_lock(
+                lock_path=lock_path,
+                lock_label='3Di state cache',
+                poll_seconds=float(g.get('resource_lock_poll', resource_cache.DEFAULT_LOCK_POLL_SECONDS)),
+                timeout_seconds=float(g.get('resource_lock_timeout', resource_cache.DEFAULT_LOCK_TIMEOUT_SECONDS)),
+            ):
+                cached_state_nsy, cached_orders, _ = _try_load_3di_state_cache(
+                    g=g,
+                    selected_branch_ids=nsy_branch_ids,
+                    state_cdn_shape=state_cdn_shape,
+                )
+                if cached_state_nsy is not None:
+                    return _activate_cached_state(cached_state_nsy, cached_orders, after_lock=True)
+                state_nsy_local, state_orders = _compute_3di_state()
+                try:
+                    cache_path = _write_3di_state_cache(
+                        g=g,
+                        selected_branch_ids=nsy_branch_ids,
+                        state_cdn_shape=state_cdn_shape,
+                        state_nsy=state_nsy_local,
+                        state_orders=state_orders,
+                    )
+                    print('Wrote 3Di state cache: {}'.format(cache_path), flush=True)
+                except Exception as exc:
+                    txt = 'Failed to write 3Di state cache in auto mode: {}'
+                    print(txt.format(str(exc)), flush=True)
+                return state_nsy_local
+        state_nsy_local, _ = _compute_3di_state()
+        return state_nsy_local
+
+    if g['infile_type'] == 'iqtree':
+        from csubst import parser_iqtree
+        if g['input_data_type'] != 'cdn':
+            raise NotImplementedError(
+                'Non-codon input is obsolete and no longer supported. '
+                'Run ancestral reconstruction with a codon model.'
+            )
+        state_cdn = parser_iqtree.get_state_tensor(g, selected_branch_ids=loaded_branch_ids)
+        state_pep = sequence.cdn2pep_state(state_cdn=state_cdn, g=g, selected_branch_ids=loaded_branch_ids)
+        # The default nonsynonymous alphabet is the amino-acid alphabet, so
+        # state_nsy and state_pep are semantically identical.  Sharing the
+        # array avoids keeping a second node x site x 20 tensor alive.
+        if g.get('nonsyn_recode', 'no') == 'no':
+            state_nsy = state_pep
+        else:
+            state_nsy = _resolve_state_nsy(state_cdn_local=state_cdn, state_pep_local=state_pep)
+    else:
+        raise ValueError('Unsupported infile_type: {}'.format(g['infile_type']))
+    g['state_nuc'] = state_nuc
+    g['state_cdn'] = state_cdn
+    g['state_pep'] = state_pep
+    g['state_nsy'] = state_nsy
+    if state_cdn is not None:
+        get_site_index_alignment(g=g, expected_num_site=state_cdn.shape[1])
+    from csubst import endpoint_io
+    endpoint_io.prepare(g)
+    if apply_site_filtering:
+        g = apply_site_filters(g)
+    return g
+
+def read_exchangeability_matrix(file, codon_orders):
+    txt = _read_package_text(file=file)
+    txt = txt.replace('\r', '').split('\n')
+    txt_mat = txt[0:60]
+    txt_mat = ''.join(txt_mat).split()
+    arr = np.array([ float(s) for s in txt_mat ], dtype=float)
+    if arr.shape[0] != 1830:
+        raise AssertionError('This is not a codon substitution matrix.')
+    num_state = 61
+    mat_exchangeability = np.zeros(shape=(num_state,num_state))
+    ind = np.tril_indices_from(mat_exchangeability, k=-1)
+    mat_exchangeability[ind] = arr
+    mat_exchangeability += mat_exchangeability.T
+    ex_codon_order = get_exchangeability_codon_order()
+    codon_order_index = get_codon_order_index(order_from=codon_orders, order_to=ex_codon_order)
+    mat_exchangeability = mat_exchangeability[codon_order_index,:][:,codon_order_index] # Index matches to g['codon_orders']
+    return mat_exchangeability
+
+def get_codon_order_index(order_from, order_to):
+    if len(order_from) != len(order_to):
+        txt = 'Codon order lengths should match. Emprical codon substitution models are currently supported only for the Standard codon table.'
+        raise AssertionError(txt)
+    source_codon_list = [str(fr) for fr in order_from]
+    if len(source_codon_list) != len(set(source_codon_list)):
+        duplicate_codons = sorted(list(set([c for c in source_codon_list if source_codon_list.count(c) > 1])))
+        duplicate_txt = ','.join(duplicate_codons[:10])
+        if len(duplicate_codons) > 10:
+            duplicate_txt += ',...'
+        raise ValueError('Duplicate codon found in source order: {}'.format(duplicate_txt))
+    index_by_codon = dict()
+    for i,to in enumerate(order_to):
+        if to in index_by_codon:
+            raise ValueError('Duplicate codon found in target order: {}'.format(to))
+        index_by_codon[to] = i
+    missing = [fr for fr in order_from if fr not in index_by_codon]
+    if len(missing) > 0:
+        missing_txt = ','.join(missing[:10])
+        if len(missing) > 10:
+            missing_txt += ',...'
+        raise ValueError('Codon(s) from source order not found in target order: {}'.format(missing_txt))
+    out = np.array([index_by_codon[fr] for fr in order_from], dtype=int)
+    return out
+
+def get_exchangeability_codon_order():
+    exchangeability_codon_order = [
+        'TTT', 'TTC', 'TTA', 'TTG', 'TCT', 'TCC', 'TCA', 'TCG',
+        'TAT', 'TAC', 'TGT', 'TGC', 'TGG', 'CTT', 'CTC', 'CTA',
+        'CTG', 'CCT', 'CCC', 'CCA', 'CCG', 'CAT', 'CAC', 'CAA',
+        'CAG', 'CGT', 'CGC', 'CGA', 'CGG', 'ATT', 'ATC', 'ATA',
+        'ATG', 'ACT', 'ACC', 'ACA', 'ACG', 'AAT', 'AAC', 'AAA',
+        'AAG', 'AGT', 'AGC', 'AGA', 'AGG', 'GTT', 'GTC', 'GTA',
+        'GTG', 'GCT', 'GCC', 'GCA', 'GCG', 'GAT', 'GAC', 'GAA',
+        'GAG', 'GGT', 'GGC', 'GGA', 'GGG',
+    ]
+    exchangeability_codon_order = np.array(exchangeability_codon_order)
+    return exchangeability_codon_order
+
+def read_exchangeability_eq_freq(file, g):
+    txt = _read_package_text(file=file)
+    txt = txt.replace('\r', '').split('\n')
+    if len(txt) <= 61:
+        txt = 'Exchangeability file format is invalid: expected equilibrium frequencies on line 62.'
+        raise AssertionError(txt)
+    freqs = txt[61].split()
+    freqs = np.array([ float(s) for s in freqs ], dtype=float)
+    if freqs.shape[0] != 61:
+        raise AssertionError('Number of equilibrium frequencies ({}) should be 61.'.format(freqs.shape[0]))
+    ex_codon_order = get_exchangeability_codon_order()
+    codon_order_index = get_codon_order_index(order_from=g['codon_orders'], order_to=ex_codon_order)
+    freqs = freqs[codon_order_index]
+    return freqs
+
+def annotate_tree(g, ignore_tree_inconsistency=False):
+    g['node_label_tree_file'] = g['iqtree_treefile']
+    with open(g['node_label_tree_file']) as f:
+        node_label_tree_newick = f.read()
+    g['node_label_tree'] = ete.PhyloNode(node_label_tree_newick, format=1)
+    g['node_label_tree'] = tree.standardize_node_names(g['node_label_tree'])
+    is_consistent_tree = tree.is_consistent_tree(tree1=g['node_label_tree'], tree2=g['rooted_tree'])
+    if is_consistent_tree:
+        g['tree'] = tree.transfer_root(tree_to=g['node_label_tree'], tree_from=g['rooted_tree'], verbose=False)
+    else:
+        sys.stderr.write('Input tree and iqtree\'s treefile did not have identical leaves.\n')
+        if ignore_tree_inconsistency:
+            sys.stderr.write('--rooted_tree will be used.\n')
+            g['tree'] = g['rooted_tree']
+        else:
+            raise ValueError('Input tree and iqtree\'s treefile did not have identical leaves.')
+    g['tree'] = tree.add_numerical_node_labels(g['tree'])
+    total_root_tree_len = sum([(n.dist or 0.0) for n in g['rooted_tree'].traverse()])
+    total_iqtree_len = sum([(n.dist or 0.0) for n in g['node_label_tree'].traverse()])
+    print('Total branch length of --rooted_tree_file: {:,.4f}'.format(total_root_tree_len))
+    print('Total branch length of --iqtree_treefile: {:,.4f}'.format(total_iqtree_len))
+    print('')
+    return g

@@ -1,0 +1,1352 @@
+"""The trajectory for the browser as binary frames: a topology and a DCD.
+
+The viewer was sent a multi-model PDB, about 81 bytes an atom a frame,
+parsed whole as text, and capped at a million atoms times frames, which
+gave a 116,000-atom system eight frames. As binary a frame is 12 bytes an
+atom (three 32-bit coordinates), so a topology is sent once and the frames
+as a DCD, bounded by :data:`BINARY_ATOM_FRAMES` at about 120 MB: a
+5,000-atom protein gets 2,000 frames and a 116,000-atom system 86.
+
+What is sent, in order of preference: a study's joined trajectory, else its
+production trajectory, else, while a run is going, the snapshots it has
+written; solvent stripped; evenly spaced frames; and made whole and centred
+on the protein as the analyses read the trajectory. The topology is the
+source's own lines for the atoms kept, so insertion codes and a ligand's
+bonds survive, which MDTraj's PDB writer would drop.
+
+Each file is written under a name of its own and renamed into place, so a
+reader never sees half of one, and two servers writing the same study at
+once (two dashboards on one folder) each finish, the last one's copy kept.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from fastmdxplora.refusals import CodedError, MissingResultError, StudyError
+
+logger = logging.getLogger("fastmdxplora.gui.trajectory_frames")
+
+__all__ = ["BINARY_ATOM_FRAMES", "FRAMES_FILE", "FRAMES_TOPOLOGY", "PIECE_ATOM_FRAMES",
+           "SUPERPOSED_ON", "as_xtc", "exact_frame", "exact_frame_info", "exact_frame_xtc",
+           "exact_frames_dcd", "frames_for_binary", "frames_info", "frames_pieces",
+           "pocket_backbone", "superposed_frames", "superposed_name"]
+
+FRAMES_FILE = "frames.dcd"
+FRAMES_TOPOLOGY = "frames_topology.pdb"
+FRAMES_INDEX = "frames_index.json"
+
+#: The most atoms times frames sent as binary: 12 bytes each, about 120 MB.
+BINARY_ATOM_FRAMES = 10_000_000
+
+#: The most frames sent, whatever the system's size.
+MOST_FRAMES = 2000
+
+_LOCKS: dict[str, threading.RLock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def frames_for_binary(n_atoms: int, most: int = MOST_FRAMES) -> int:
+    """How many frames of a system this size are sent: as many as fit in
+    :data:`BINARY_ATOM_FRAMES`, at most ``most``, never fewer than two."""
+    most = max(2, min(MOST_FRAMES, int(most)))
+    if n_atoms <= 0:
+        return most
+    return max(2, min(most, BINARY_ATOM_FRAMES // n_atoms))
+
+
+def _unavailable(reason: str) -> dict[str, Any]:
+    return {"available": False, "playback_available": False, "reason": reason, "n_atoms": 0,
+            "n_frames_total": 0, "n_frames_browser": 0, "frame_indices": [],
+            "simulation_steps": [], "frame_times_ns": []}
+
+
+def frames_info(output_dir: str | Path, *, most_frames: int = MOST_FRAMES,
+                simulation_time_ns_total: float | None = None,
+                force: bool = False) -> dict[str, Any]:
+    """The binary frames for the study at ``output_dir``, written beside its
+    simulation if they are not already there for this source, or why there
+    are none."""
+    out = Path(output_dir)
+    key = str(out.resolve())
+    with _LOCKS_GUARD:
+        lock = _LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        return _frames_info(out, most_frames=most_frames,
+                            simulation_time_ns_total=simulation_time_ns_total, force=force)
+
+
+#: How many exact frames are prepared at once; a request beyond these waits
+#: up to :data:`_PREPARING_WAIT_S` for one to finish, then is refused.
+_PREPARING = threading.BoundedSemaphore(2)
+_PREPARING_WAIT_S = 30.0
+
+#: Parsed topologies and fit references, by the file (its device, inode,
+#: size and time), so a frame opened again does not read them again.
+_READ_CACHE: dict[tuple[Any, ...], Any] = {}
+_READ_CACHE_GUARD = threading.Lock()
+_READ_CACHE_MOST = 8
+#: One reading of each file at a time: a second request for it waits for
+#: the first instead of reading it beside it.
+_READING: dict[tuple[Any, ...], threading.Lock] = {}
+
+
+def _cached(kind: str, path: Path, make: Any) -> Any:
+    """``make()``, kept while ``path`` is unchanged."""
+    stat = path.stat()
+    key = (kind, str(path.resolve()), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    with _READ_CACHE_GUARD:
+        if key in _READ_CACHE:
+            return _READ_CACHE[key]
+        reading = _READING.setdefault(key, threading.Lock())
+    try:
+        with reading:
+            with _READ_CACHE_GUARD:
+                if key in _READ_CACHE:
+                    return _READ_CACHE[key]
+            value = make()
+            with _READ_CACHE_GUARD:
+                if len(_READ_CACHE) >= _READ_CACHE_MOST:
+                    _READ_CACHE.pop(next(iter(_READ_CACHE)))
+                _READ_CACHE[key] = value
+    finally:
+        # Let go of whether ``make()`` gave a value or raised: a file that
+        # could not be read is not waited on for ever after.
+        with _READ_CACHE_GUARD:
+            if _READING.get(key) is reading:
+                _READING.pop(key)
+    return value
+
+
+def same_source(signature: str | None, other: str | None) -> bool:
+    """Whether two frame signatures name the same trajectory: the part after
+    ``:most=`` says how many frames the browser was sent, not which."""
+    def source(value: str | None) -> str:
+        return str(value or "").split(":most=", 1)[0]
+
+    return source(signature) == source(other)
+
+
+def most_frames_sent(output_dir: str | Path) -> int:
+    """How many frames the browser was last sent of this study, so a scene
+    written without a server's setting reads the frames as they are."""
+    index = _load_json(Path(output_dir) / "simulation" / FRAMES_INDEX)
+    found = re.search(r":most=(\d+)", str(index.get("source_signature") or ""))
+    return int(found.group(1)) if found else MOST_FRAMES
+
+
+def _refused(reason: str, code: str) -> dict[str, Any]:
+    return {"ok": False, "reason": reason, "code": code}
+
+
+def _not_prepared(frame: int, exc: BaseException) -> dict[str, Any]:
+    """What the page is told when a frame could not be read or written: no
+    path or library message, which may name the server's folders. The
+    exception is logged here."""
+    logger.warning("exact frame %s could not be prepared: %s", frame, exc)
+    logger.debug("exact frame %s could not be prepared", frame, exc_info=exc)
+    return _refused(f"Frame {frame} could not be prepared.", "analysis.trajectory.unreadable")
+
+
+def exact_frame_info(output_dir: str | Path, frame: Any, *, most_frames: int = MOST_FRAMES,
+                     source_signature: str | None = None, on: str = "none",
+                     ligand: str | None = None, cutoff_angstrom: Any = 5.0,
+                     to: str = "first") -> dict[str, Any]:
+    """Validate one source-frame request and describe its bounded coordinate loads.
+
+    A caller names only a frame number and optional viewer alignment settings;
+    the study's recorded trajectory and its source signature are resolved here.
+    """
+    from urllib.parse import urlencode
+
+    out = Path(output_dir)
+    if type(frame) is not int or frame < 0:
+        return _refused("A source frame is a non-negative integer.", "config.option.wrong_type")
+    payload = frames_info(out, most_frames=most_frames)
+    if not payload.get("playback_available") or payload.get("source_kind") != "production-dcd":
+        return _refused("An exact frame is available only from this study's production "
+                        "trajectory.", "analysis.data.absent")
+    signature = str(payload.get("source_signature") or "")
+    if source_signature is not None and not same_source(source_signature, signature):
+        return _refused("The trajectory has changed since this frame was named; "
+                        "reload its charts before opening it.", "analysis.frame.changed")
+    source = _source(out)
+    if source is None or source.get("kind") != "trajectory":
+        return _refused("The study's source trajectory is unavailable.", "analysis.data.absent")
+    total = int(payload.get("n_frames_total") or 0)
+    if frame >= total:
+        return _refused(f"The source frame is outside 0 to {max(0, total - 1)}.",
+                        "analysis.frame.outside")
+    if on != "none":
+        name, _, reason = superposed_name(on, ligand, cutoff_angstrom, to, 1)
+        if name is None:
+            return _refused(reason or "The alignment settings are unavailable.",
+                            "config.option.not_permitted")
+    simulation = _load_json(out / "simulation" / "simulation_parameters.json")
+    from fastmdxplora.simulation.runner import chose_its_own_step
+
+    # No time where the integrator chose its own step, as playback says none
+    # (`frame_times_ns`): spreading the run's length evenly made one up.
+    exact_time = (None if chose_its_own_step(out / "simulation")
+                  else _times([frame], total, simulation.get("duration_ns_actual"),
+                              _interval_ns(out, source))[0])
+    query: dict[str, Any] = {"frame": frame, "signature": signature}
+    dcd_query: dict[str, Any] = {"exact_frame": frame, "signature": signature}
+    for values in (query, dcd_query):
+        if on != "none":
+            values.update(on=on, to=to)
+            if on == "pocket":
+                values.update(ligand=ligand or "", cutoff=f"{float(cutoff_angstrom):g}")
+    return {"ok": True, "frame": frame, "time_ns": exact_time,
+            "source_signature": signature, "frame_indices": payload["frame_indices"],
+            "frame_times_ns": payload["frame_times_ns"], "n_frames_total": total,
+            "exact_url": "/structure/exact-frame.xtc?" + urlencode(query),
+            "dcd_url": "/structure/frames.dcd?" + urlencode(dcd_query)}
+
+
+class _Preparing:
+    """At most two frames prepared at once; refused once the wait is over."""
+
+    def __enter__(self) -> bool:
+        self.held = _PREPARING.acquire(timeout=_PREPARING_WAIT_S)
+        return self.held
+
+    def __exit__(self, *_exc: Any) -> None:
+        if self.held:
+            _PREPARING.release()
+
+
+_BUSY = ("Other frames are being prepared; try again in a moment.", "environment.service.busy")
+_NOT_SENT = ("The frames sent to the browser are not this study's own records.",
+             "analysis.data.absent")
+
+
+def _sent_here(simulation: Path, *names: str) -> bool:
+    """Whether the files written beside the trajectory for the browser are
+    the study's own: through `record_access`, so in a read held to the
+    study one linked out of it is refused and named, never opened where it
+    leads (MDTraj then reads each by its name)."""
+    from fastmdxplora import record_access
+
+    return all(record_access.is_file(simulation / name) for name in names)
+
+
+def _linked_out(path: Path) -> bool:
+    """Whether a read held to the study refuses ``path``, a link out of it
+    (named, so the page says it was not read): checked before the file is
+    stat'ed or opened where it leads. False outside a held read."""
+    from fastmdxplora import record_access
+
+    with record_access.refusals_noted() as refused:
+        record_access.exists(path)
+    return bool(refused)
+
+
+def exact_frame(output_dir: str | Path, frame: int, *, most_frames: int = MOST_FRAMES,
+                source_signature: str | None = None, on: str = "none",
+                ligand: str | None = None, cutoff_angstrom: Any = 5.0,
+                to: str = "first") -> tuple[Any | None, dict[str, Any]]:
+    """One validated source frame, made whole and fitted for playback or export."""
+    out = Path(output_dir)
+    details = exact_frame_info(out, frame, most_frames=most_frames,
+                               source_signature=source_signature, on=on, ligand=ligand,
+                               cutoff_angstrom=cutoff_angstrom, to=to)
+    if not details.get("ok"):
+        return None, details
+    with _Preparing() as held:
+        if not held:
+            return None, _refused(*_BUSY)
+        if on != "none" and not _sent_here(out / "simulation", FRAMES_FILE, FRAMES_TOPOLOGY):
+            return None, _refused(*_NOT_SENT)
+        try:
+            exact = _source_frame(out, _source(out), frame)
+            if on != "none":
+                # Fitted as the viewer's playback is: to the first frame it
+                # plays, read alone (the fit and the pocket use no other).
+                exact = _fit_exact_frame(out, exact, on=on, ligand=ligand,
+                                         cutoff_angstrom=float(cutoff_angstrom), to=to)
+            return exact, details
+        except CodedError as exc:
+            return None, _refused(str(exc), exc.code)
+        except Exception as exc:  # noqa: BLE001 - said to the page without its text
+            return None, _not_prepared(frame, exc)
+
+
+def exact_frame_xtc(output_dir: str | Path, frame: int, *, most_frames: int = MOST_FRAMES,
+                    source_signature: str | None = None, on: str = "none",
+                    ligand: str | None = None, cutoff_angstrom: Any = 5.0,
+                    to: str = "first") -> tuple[bytes | None, dict[str, Any]]:
+    """The one requested frame, made whole and optionally fitted, as one XTC."""
+    import tempfile
+
+    exact, details = exact_frame(output_dir, frame, most_frames=most_frames,
+                                 source_signature=source_signature, on=on, ligand=ligand,
+                                 cutoff_angstrom=cutoff_angstrom, to=to)
+    if exact is None:
+        return None, details
+    try:
+        with tempfile.TemporaryDirectory(prefix="fastmdx-exact-") as directory:
+            target = Path(directory) / "frame.xtc"
+            exact.save_xtc(str(target))
+            return target.read_bytes(), details
+    except Exception as exc:  # noqa: BLE001 - said to the page without its text
+        return None, _not_prepared(frame, exc)
+
+
+def exact_frames_dcd(output_dir: str | Path, frame: int, *, most_frames: int = MOST_FRAMES,
+                     source_signature: str | None = None, on: str = "none",
+                     ligand: str | None = None, cutoff_angstrom: Any = 5.0,
+                     to: str = "first") -> tuple[bytes | None, dict[str, Any]]:
+    """The bounded browser sample plus one exact frame, for a DCD-only engine path."""
+    import tempfile
+
+    import mdtraj as md
+
+    out = Path(output_dir)
+    details = exact_frame_info(out, frame, most_frames=most_frames,
+                               source_signature=source_signature, on=on, ligand=ligand,
+                               cutoff_angstrom=cutoff_angstrom, to=to)
+    if not details.get("ok"):
+        return None, details
+    simulation = out / "simulation"
+    with _Preparing() as held:
+        if not held:
+            return None, _refused(*_BUSY)
+        if not _sent_here(simulation, FRAMES_FILE, FRAMES_TOPOLOGY):
+            return None, _refused(*_NOT_SENT)
+        try:
+            base_path = simulation / FRAMES_FILE
+            if on != "none":
+                fitted = superposed_frames(out, on, ligand=ligand,
+                                           cutoff_angstrom=float(cutoff_angstrom), to=to,
+                                           smooth=1)
+                if not fitted.get("ok"):
+                    return None, _refused(str(fitted.get("reason") or
+                                              "The frames could not be superposed."),
+                                          fitted.get("code") or "config.option.not_permitted")
+                base_path = simulation / str(fitted["file"])
+                if not _sent_here(simulation, str(fitted["file"])):
+                    return None, _refused(*_NOT_SENT)
+            from fastmdxplora.utils.native_output import suppress_native_output
+
+            with suppress_native_output():
+                base = md.load_dcd(str(base_path), top=str(simulation / FRAMES_TOPOLOGY))
+                exact = _source_frame(out, _source(out), frame)
+                if on != "none":
+                    exact = _fit_exact_frame(out, exact, on=on, ligand=ligand,
+                                             cutoff_angstrom=float(cutoff_angstrom), to=to,
+                                             reference_frames=base)
+            # Keep exactly one temporary frame beside the bounded browser sample.
+            joined = md.join([base, exact], check_topology=False)
+            with tempfile.TemporaryDirectory(prefix="fastmdx-exact-") as directory:
+                target = Path(directory) / "frames.dcd"
+                joined.save_dcd(str(target))
+                return target.read_bytes(), details
+        except CodedError as exc:
+            return None, _refused(str(exc), exc.code)
+        except Exception as exc:  # noqa: BLE001 - said to the page without its text
+            return None, _not_prepared(frame, exc)
+
+
+def _source_frame(out: Path, source: dict[str, Any] | None, frame: int) -> Any:
+    """Read one source frame using the topology and solvent rule of playback."""
+    import mdtraj as md
+
+    if source is None or source.get("kind") != "trajectory":
+        raise MissingResultError("the source trajectory is unavailable")
+    from fastmdxplora.analysis.loading import _made_whole
+    from fastmdxplora.utils.native_output import suppress_native_output, topology_quietly
+
+    topology_path: Path = source["topology"]
+
+    def shown_atoms() -> tuple[Any, Any]:
+        whole = topology_quietly(topology_path)
+        shown = whole.select("not water")
+        if len(shown) == 0:
+            shown = np.arange(whole.n_atoms)
+        return whole.subset(shown), shown
+
+    topology, shown = _cached("shown", Path(topology_path), shown_atoms)
+    with (
+        suppress_native_output(),
+        md.formats.DCDTrajectoryFile(str(source["trajectory"])) as handle,
+    ):
+        handle.seek(frame)
+        xyz, lengths, angles = handle.read(1, atom_indices=shown)
+    if not len(xyz):
+        raise MissingResultError("the source frame could not be read")
+    boxed = lengths is not None and np.all(np.asarray(lengths) > 0)
+    result = md.Trajectory(
+        np.asarray(xyz, dtype=np.float32) / 10.0,
+        topology,
+        unitcell_lengths=np.asarray(lengths, dtype=np.float32) / 10.0 if boxed else None,
+        unitcell_angles=np.asarray(angles, dtype=np.float32) if boxed else None,
+    )
+    return _made_whole(result) if boxed else result
+
+
+def _first_played(simulation: Path) -> Any:
+    """The first frame the browser plays, with its topology."""
+    import mdtraj as md
+
+    from fastmdxplora.utils.native_output import suppress_native_output, topology_quietly
+
+    topology = topology_quietly(simulation / FRAMES_TOPOLOGY)
+    with (
+        suppress_native_output(),
+        md.formats.DCDTrajectoryFile(str(simulation / FRAMES_FILE)) as handle,
+    ):
+        xyz, lengths, angles = handle.read(1)
+    boxed = lengths is not None and np.all(np.asarray(lengths) > 0)
+    return md.Trajectory(
+        np.asarray(xyz, dtype=np.float32) / 10.0, topology,
+        unitcell_lengths=np.asarray(lengths, dtype=np.float32) / 10.0 if boxed else None,
+        unitcell_angles=np.asarray(angles, dtype=np.float32) if boxed else None)
+
+
+def _fit_exact_frame(out: Path, exact: Any, *, on: str, ligand: str | None,
+                     cutoff_angstrom: float, to: str,
+                     reference_frames: Any | None = None) -> Any:
+    """Fit an exact frame by the viewer's current saved alignment settings."""
+    import mdtraj as md
+
+    from fastmdxplora.utils.native_output import pdb_quietly
+
+    simulation = out / "simulation"
+    if reference_frames is None:
+        # The fit is to the first frame played, and the pocket is found in
+        # it: that frame is read, not every frame the browser plays.
+        reference_frames = _cached("first-played", simulation / FRAMES_FILE,
+                                   lambda: _first_played(simulation))
+    atoms = (reference_frames.topology.select("protein and backbone") if on == "backbone"
+             else pocket_backbone(reference_frames, str(ligand or "").upper(),
+                                  cutoff_angstrom)[0])
+    if atoms is None or len(atoms) < 3:
+        raise StudyError("the selected alignment has fewer than three matching backbone atoms",
+                         code="analysis.system.inapplicable")
+    reference, reference_atoms = reference_frames, atoms
+    if to == "start":
+        reference = pdb_quietly(simulation / FRAMES_TOPOLOGY)
+    elif to == "deposited":
+        matched, xyz, reason = _deposited_reference(out, simulation / FRAMES_TOPOLOGY, atoms)
+        if matched is None:
+            raise StudyError(reason, code="analysis.system.inapplicable")
+        atoms = matched
+        reference = md.Trajectory(xyz[None].astype(np.float32), exact.topology.subset(atoms))
+        reference_atoms = np.arange(len(atoms))
+    from fastmdxplora.analysis.base import superposed
+
+    fitted = superposed(exact, atom_indices=atoms, reference=reference,
+                        ref_atom_indices=reference_atoms)
+    if exact.unitcell_lengths is not None and fitted.unitcell_lengths is None:
+        fitted.unitcell_lengths = exact.unitcell_lengths
+        fitted.unitcell_angles = exact.unitcell_angles
+    return fitted
+
+
+def _source(out: Path) -> dict[str, Any] | None:
+    """Where the frames come from: the joined trajectory, then production,
+    then the snapshots a run still going has written. A study that saved a
+    subset of its atoms is read with the topology of what was saved.
+
+    The snapshots stand in for the trajectory only while the simulation
+    goes on. They begin at minimisation and run through equilibration, so
+    a run that ended in any way (finished, stopped, failed, or ended
+    without saying so) is played from its production trajectory where it
+    wrote one: a finished run whose record still said "running" was played
+    as its 190 snapshots of every stage."""
+    from fastmdxplora import record_access
+    from fastmdxplora.gui.live_frames import read_live_frame_history
+
+    # Through `record_access`: in a read held to the study, a record linked
+    # out of it is refused and named, never opened where it leads. Outside
+    # a held read, as pathlib.
+    simulation = out / "simulation"
+    saved = simulation / "trajectory_topology.pdb"
+    with record_access.refusals_noted() as refused:
+        found = record_access.is_file(saved)
+    if refused:
+        # The topology of what was saved, refused: no other read in its
+        # place (the full topology fits the trajectory only where it saved
+        # every atom).
+        return None
+    topology = saved if found else simulation / "topology.pdb"
+    trajectory = simulation / "production.dcd"
+    finished = not _simulation_going(out)
+    joined = _load_json(out / "joined" / "joined.json")
+    joined_dcd = out / "joined" / "production.dcd"
+    if joined and record_access.is_file(joined_dcd) and record_access.stat(joined_dcd).st_size > 0:
+        trajectory = joined_dcd
+        named = Path(str(joined.get("topology") or ""))
+        # The topology the join names, where it is a record of the study
+        # (it is named by the folder the study was in when it was joined).
+        # One outside it is refused and named, and no other read in its
+        # place; one that is nowhere (a study moved since) is passed over.
+        if record_access.can_read(named):
+            if record_access.is_file(named):
+                topology = named
+        elif str(named) not in ("", ".") and os.path.lexists(named):
+            record_access.is_file(named)
+            return None
+        finished = True
+    history = [record for record in read_live_frame_history(simulation).get("frames", [])
+               if isinstance(record, dict)]
+    if len(history) >= 2 and not finished:
+        return {"kind": "live-history", "records": history, "simulation": simulation,
+                "signature": f"history:{len(history)}:{history[-1].get('sequence')}:"
+                             f"{history[-1].get('mtime_ns')}"}
+    # Each looked at, so a trajectory linked out is refused, and named, with
+    # no topology left to read it with.
+    there = [record_access.is_file(topology), record_access.is_file(trajectory)]
+    if all(there) and record_access.stat(trajectory).st_size > 0:
+        return {"kind": "trajectory", "trajectory": trajectory, "topology": topology,
+                "records": history, "simulation": simulation,
+                "signature": f"{trajectory.parent.name}/{trajectory.name}:"
+                             f"{_stamp(trajectory)}:{topology.name}:{_stamp(topology)}"}
+    if len(history) >= 2:
+        return {"kind": "live-history", "records": history, "simulation": simulation,
+                "signature": f"history:{len(history)}:{history[-1].get('sequence')}:"
+                             f"{history[-1].get('mtime_ns')}"}
+    return None
+
+
+def _simulation_going(out: Path) -> bool:
+    """Whether the study's simulation is still being run, by its record as
+    the GUI reads it (`telemetry.status_as_it_stands`: a record left saying
+    "running" by a run that ended without saying so is not believed)."""
+    from fastmdxplora.gui.telemetry import _GOING_STATUSES, status_as_it_stands
+
+    try:
+        status = status_as_it_stands(out)
+    except Exception:  # noqa: BLE001 - a record, not a verdict
+        status = _load_json(out / "simulation" / "live_status.json")
+    if str(status.get("status") or "").lower() not in _GOING_STATUSES:
+        return False
+    if status.get("piece"):
+        # Carried on in a piece of its own (`segment-001/`): the study's own
+        # simulation ended, and its production is what it has to play.
+        return False
+    # Analysis and report come after the simulation: its frames are written.
+    return str(status.get("stage") or "").lower() not in {"analysis", "report"}
+
+
+def _frames_info(out: Path, *, most_frames: int, simulation_time_ns_total: float | None,
+                 force: bool) -> dict[str, Any]:
+    simulation = out / "simulation"
+    source = _source(out)
+    if source is None:
+        return _unavailable("There is no trajectory, and fewer than two frames written.")
+    if any([_linked_out(simulation / name) for name in (FRAMES_FILE, FRAMES_TOPOLOGY)]):
+        # In a read held to the study: frames linked out of it are neither
+        # sent nor written over; each is named as not read.
+        return _unavailable(_NOT_SENT[0])
+    # The index file persists across launches. Bump this when the meaning of
+    # an identity field changes so a former live-step-as-frame cache is not
+    # served as though it were a logical sequence.
+    signature = f"{source['signature']}:most={int(most_frames)}:payload=2"
+    index = simulation / FRAMES_INDEX
+    from fastmdxplora.simulation.runner import chose_its_own_step
+
+    if chose_its_own_step(simulation):
+        # Its frames are steps apart, not a time: no time is spread over them.
+        simulation_time_ns_total = None
+    if not force:
+        # The index linked out of the study is not read, and not saved over:
+        # the frames written beside it are played from what was said of them
+        # when they were written here, while they stand (`_load_json`).
+        cached = _load_json(index)
+        if (cached.get("available") and cached.get("signature") == signature
+                and _sent_here(simulation, FRAMES_FILE, FRAMES_TOPOLOGY)):
+            interval = (_interval_ns(out, source) if source["kind"] == "trajectory"
+                        and cached.get("source_kind") == "production-dcd" else None)
+            cached.setdefault("simulation_steps",
+                              [None] * len(cached.get("frame_indices") or []))
+            if (chose_its_own_step(simulation)
+                    and cached.get("source_kind") != "live-history"):
+                cached["frame_times_ns"] = [None] * len(cached.get("frame_indices") or [])
+            elif interval:
+                # Read again where a record says it: frames written before
+                # the times were read from the records carry the old ones,
+                # and an analysis run since can say the interval.
+                cached["frame_times_ns"] = _times(
+                    list(cached.get("frame_indices") or []),
+                    int(cached.get("n_frames_total") or 0), None, interval)
+            return cached
+    try:
+        if source["kind"] == "trajectory":
+            try:
+                said = _from_trajectory(source, simulation, most_frames,
+                                        simulation_time_ns_total)
+            except Exception:  # noqa: BLE001 - the snapshots stand in, or it is said
+                # A trajectory that cannot be read now (being written, or
+                # cut short) is played from the snapshots the run wrote.
+                if len(source["records"]) < 2:
+                    raise
+                source = dict(source, kind="live-history",
+                              signature=f"history:{len(source['records'])}:"
+                                        f"{source['records'][-1].get('sequence')}:"
+                                        f"{source['records'][-1].get('mtime_ns')}")
+                signature = f"{source['signature']}:most={int(most_frames)}:payload=2"
+                said = _from_history(source, simulation, most_frames)
+        else:
+            said = _from_history(source, simulation, most_frames)
+    except Exception as exc:  # noqa: BLE001 - the viewer is told, not broken
+        return _unavailable(f"The frames could not be written: {exc}")
+    if not said.get("available"):
+        return said
+    # The names the page reads: the dashboard's transport and a chart's
+    # point opening its frame (`source_kind` "production-dcd" is a
+    # trajectory's frames).
+    said.update(signature=signature, source_signature=signature, playback_available=True,
+                source_kind="production-dcd" if source["kind"] == "trajectory"
+                else source["kind"],
+                compiled_at=time.time(), topology=FRAMES_TOPOLOGY, coordinates=FRAMES_FILE)
+    try:
+        _write_json(index, said)
+        _UNSAVED_INDEX.pop(str(simulation.resolve()), None)
+    except OSError:
+        # Not saved, and said so (`record_access.not_saved`): the frames are
+        # played all the same, and not written again for the next request
+        # while they stand as written (`_unsaved_index`).
+        _UNSAVED_INDEX[str(simulation.resolve())] = (said, _stamps(simulation))
+    return said
+
+
+#: What was said of the frames written for a study whose index could not be
+#: saved, by its simulation folder, with the frames' stamps then.
+_UNSAVED_INDEX: dict[str, tuple[dict[str, Any], tuple[Any, ...]]] = {}
+
+
+def _stamps(simulation: Path) -> tuple[Any, ...]:
+    """The frames' and their topology's device, inode, size and time, held
+    to the study where the read is (`record_access.stat`); None where
+    either is not there or is refused."""
+    from fastmdxplora import record_access
+
+    found = []
+    for name in (FRAMES_FILE, FRAMES_TOPOLOGY):
+        try:
+            info = record_access.stat(simulation / name)
+        except OSError:
+            return (None,)
+        found.append((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
+    return tuple(found)
+
+
+def _unsaved_index(simulation: Path) -> dict[str, Any]:
+    """What was said of the frames last written for ``simulation``, where its
+    index could not be saved: given while they are those frames (whose
+    source the caller checks by its signature), and said again not saved;
+    else none."""
+    from fastmdxplora import record_access
+
+    kept = _UNSAVED_INDEX.get(str(simulation.resolve()))
+    if kept is None or kept[1] != _stamps(simulation):
+        return {}
+    record_access.note_not_saved(simulation / FRAMES_INDEX, "it leads outside the study")
+    return dict(kept[0])
+
+
+def _from_trajectory(source: dict[str, Any], simulation: Path, most_frames: int,
+                     total_ns: float | None) -> dict[str, Any]:
+    import mdtraj as md
+
+    from fastmdxplora.analysis.loading import _made_whole
+    from fastmdxplora.utils.native_output import suppress_native_output, topology_quietly
+
+    topology_path: Path = source["topology"]
+    # The structure read where its warnings reach the terminal; only the
+    # DCD's own reader, which prints below Python, is kept from it.
+    whole = topology_quietly(topology_path)
+    with suppress_native_output():
+        kept = "not water"
+        shown = whole.select(kept)
+        if len(shown) == 0:
+            kept = "all"
+            shown = np.arange(whole.n_atoms)
+        topology = whole.subset(shown)
+        with md.formats.DCDTrajectoryFile(str(source["trajectory"])) as handle:
+            total = len(handle)
+        if total < 1:
+            return _unavailable("The trajectory has no frames.")
+        indices = _even(total, frames_for_binary(len(shown), most_frames))
+        xyz, lengths, angles = [], [], []
+        with md.formats.DCDTrajectoryFile(str(source["trajectory"])) as handle:
+            for frame in indices:
+                handle.seek(frame)
+                coordinates, length, angle = handle.read(1, atom_indices=shown)
+                xyz.append(coordinates[0])
+                lengths.append(None if length is None else length[0])
+                angles.append(None if angle is None else angle[0])
+    boxed = all(length is not None and np.all(np.asarray(length) > 0) for length in lengths)
+    frames = md.Trajectory(
+        np.asarray(xyz, dtype=np.float32) / 10.0, topology,
+        unitcell_lengths=np.asarray(lengths, dtype=np.float32) / 10.0 if boxed else None,
+        unitcell_angles=np.asarray(angles, dtype=np.float32) if boxed else None)
+    if boxed:
+        frames = _made_whole(frames)
+    _write_topology(topology_path, shown, simulation / FRAMES_TOPOLOGY)
+    _write_dcd(frames, simulation / FRAMES_FILE)
+    # Which atoms of which topology the frames are, so an atom clicked in
+    # them is named in that topology exactly (gui/selection.py).
+    try:
+        source_topology = str(topology_path.resolve().relative_to(simulation.parent.resolve()))
+    except ValueError:
+        source_topology = str(topology_path.resolve())
+    # Each frame's box, in angstroms and degrees as the DCD holds it, for the
+    # Viewer to show the box of the frame shown: an NPT run's changes.
+    cells = ([[round(float(v), 4) for v in (*length, *angle)]
+              for length, angle in zip(lengths, angles)] if boxed else None)
+    return {"available": True, "reason": None, "n_atoms": int(len(shown)),
+            "n_frames_total": int(total), "n_frames_browser": len(indices),
+            "frame_indices": indices,
+            "simulation_steps": [None] * len(indices),
+            "frame_times_ns": _times(indices, total, total_ns,
+                                     _interval_ns(simulation.parent, source)),
+            "made_whole": bool(boxed), "source_topology": source_topology, "shown": kept,
+            "cells": cells}
+
+
+def _from_history(source: dict[str, Any], simulation: Path, most_frames: int) -> dict[str, Any]:
+    import mdtraj as md
+
+    from fastmdxplora.gui.live_frames import cell_of, made_whole_frames
+    from fastmdxplora.simulation.runner import chose_its_own_step
+
+    records = source["records"]
+    first = _atom_lines(_read(simulation / str(records[-1].get("path") or "")))
+    chosen_positions = _even(len(records), frames_for_binary(len(first), most_frames))
+    chosen = [(position, records[position]) for position in chosen_positions]
+    lines: list[str] | None = None
+    opened = ""
+    xyz, used, cells, source_positions = [], [], [], []
+    for source_position, record in chosen:
+        text = _read(simulation / str(record.get("path") or ""))
+        atoms = _atom_lines(text)
+        if not atoms or (lines is not None and len(atoms) != len(lines)):
+            continue
+        if lines is None:
+            lines, opened = atoms, text
+        xyz.append([(float(a[30:38]), float(a[38:46]), float(a[46:54])) for a in atoms])
+        cells.append(cell_of(text))
+        used.append(record)
+        source_positions.append(source_position)
+    if lines is None or len(used) < 2:
+        return _unavailable("Fewer than two of the frames written could be read.")
+    # Each snapshot wraps every molecule into the box on its own, so a bound
+    # ligand was played a box length from its pocket; the frames are made
+    # whole about the protein as a trajectory's are.
+    coordinates = np.asarray(xyz, dtype=np.float32)
+    try:
+        whole = made_whole_frames(opened, coordinates, cells)
+    except Exception:  # noqa: BLE001 - played as written rather than not at all
+        whole = None
+    if whole is not None:
+        coordinates = whole
+        lines = [f"{line.ljust(54)[:30]}{x:8.3f}{y:8.3f}{z:8.3f}{line.ljust(54)[54:]}".rstrip()
+                 for line, (x, y, z) in zip(lines, whole[0])]
+    _write_text(simulation / FRAMES_TOPOLOGY, "\n".join(lines) + "\nEND\n")
+    topology = md.Topology()
+    chain = topology.add_chain()
+    residue = topology.add_residue("UNK", chain)
+    for _ in lines:
+        topology.add_atom("X", md.element.carbon, residue)
+    _write_dcd(md.Trajectory(coordinates / 10.0, topology), simulation / FRAMES_FILE)
+    return {"available": True, "reason": None, "n_atoms": len(lines),
+            "n_frames_total": len(records), "n_frames_browser": len(used),
+            # Snapshot sequence and simulation step are different identities.
+            # The sequence indexes the playable snapshot; frame_index is the
+            # integrator step, and each recorded time is independent metadata.
+            "frame_indices": [int(record["sequence"])
+                              if isinstance(record.get("sequence"), int) else position
+                              for position, record in zip(source_positions, used)],
+            "simulation_steps": [record.get("frame_index") for record in used],
+            # Older adaptive-step snapshots store step * nominal timestep,
+            # which is not their physical time. Until the history records an
+            # actual integrator clock, do not present that estimate as time.
+            "frame_times_ns": ([None] * len(used) if chose_its_own_step(simulation)
+                               else [record.get("simulation_time_ns") for record in used]),
+            "made_whole": whole is not None}
+
+
+#: What the frames can be superposed on, and how a pocket is chosen.
+SUPERPOSED_ON = ("backbone", "pocket")
+#: What they are fitted to: the first frame played, the structure the run
+#: started from (as setup prepared it, the frames' own topology file), or
+#: the structure the study was given (``setup/input.pdb``, a deposited
+#: entry as it was downloaded).
+SUPERPOSED_TO = ("first", "start", "deposited")
+#: Windows the superposed frames can be smoothed over, in frames played: a
+#: centred moving average of each atom's position, for watching a motion
+#: through the jitter of thermal noise.
+SMOOTHED_OVER = (1, 3, 5, 9, 15)
+_LIGAND_NAME = re.compile(r"^[A-Za-z0-9]{1,4}$")
+_BACKBONE = ("N", "CA", "C", "O")
+
+
+def superposed_name(on: str, ligand: str | None, cutoff_angstrom: Any, to: str = "first",
+                    smooth: Any = 1) -> tuple[str | None, float | None, str | None]:
+    """The file the frames superposed so are written to, made from the
+    request's words alone (never a path), with the cutoff read; or why
+    there is none."""
+    if on not in SUPERPOSED_ON:
+        return None, None, f"Frames are superposed on {' or '.join(SUPERPOSED_ON)}."
+    if to not in SUPERPOSED_TO:
+        return None, None, ("Frames are fitted to the first frame, the starting structure "
+                            "or the deposited structure.")
+    window = _window(smooth)
+    if window is None:
+        return None, None, ("Frames are smoothed over "
+                            + ", ".join(str(w) for w in SMOOTHED_OVER[1:]) + " frames, or not.")
+    suffix = ("" if to == "first" else f"_to_{to}") + ("" if window == 1 else f"_smooth{window}")
+    if on == "backbone":
+        return f"frames_superposed_backbone{suffix}.dcd", None, None
+    if not ligand or not _LIGAND_NAME.match(ligand):
+        return None, None, "A pocket is the ligand's: no ligand was named."
+    try:
+        cutoff = float(cutoff_angstrom)
+    except (TypeError, ValueError):
+        cutoff = float("nan")
+    if not 1.0 <= cutoff <= 20.0:
+        return None, None, "The pocket's cutoff is 1 to 20 \u00c5."
+    return f"frames_superposed_pocket_{ligand.upper()}_{cutoff:.2f}{suffix}.dcd", cutoff, None
+
+
+def _window(smooth: Any) -> int | None:
+    try:
+        window = int(str(smooth).strip() or 1)
+    except (TypeError, ValueError):
+        return None
+    return window if window in SMOOTHED_OVER else None
+
+
+def smoothed(xyz: Any, window: int) -> Any:
+    """Each frame's coordinates averaged with the ``window // 2`` frames on
+    either side, over fewer at the ends where there are fewer: a centred
+    moving average, which moves no feature in time."""
+    if window <= 1 or len(xyz) < 2:
+        return xyz
+    half = window // 2
+    running = np.concatenate([np.zeros((1,) + xyz.shape[1:], dtype=np.float64),
+                              np.cumsum(xyz, axis=0, dtype=np.float64)])
+    n = len(xyz)
+    starts = np.clip(np.arange(n) - half, 0, n)
+    ends = np.clip(np.arange(n) + half + 1, 0, n)
+    counts = (ends - starts)[:, None, None]
+    return ((running[ends] - running[starts]) / counts).astype(xyz.dtype)
+
+
+def deposited_structure(output_dir: str | Path) -> Path | None:
+    """The structure the study was given, as the B-factor comparison finds
+    it: ``setup/input.pdb`` (a deposited entry as it was downloaded), else
+    ``setup/structure.pdb``."""
+    out = Path(output_dir)
+    for candidate in (out / "setup" / "input.pdb", out / "setup" / "structure.pdb",
+                      out / "input.pdb"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _backbone_keys(lines: list[str]) -> dict[tuple[str, str, str], int]:
+    """Each backbone atom of the lines, by its chain, residue number with
+    insertion code, and name, to its place among them: the first of
+    alternate locations, and the first model."""
+    keys: dict[tuple[str, str, str], int] = {}
+    for place, line in enumerate(lines):
+        name = line[12:16].strip()
+        if name not in _BACKBONE or line[16:17] not in (" ", "A", ""):
+            continue
+        keys.setdefault((line[21:22], line[22:27].strip(), name), place)
+    return keys
+
+
+def _deposited_reference(output_dir: Path, topology_file: Path, atoms: Any
+                         ) -> tuple[Any, Any, str] | tuple[None, None, str]:
+    """The atoms of ``atoms`` the deposited structure has too, matched by
+    chain, residue number and name, with its coordinates for them in nm; or
+    why there are none."""
+    deposited = deposited_structure(output_dir)
+    if deposited is None:
+        return None, None, "The study has no deposited structure (setup/input.pdb) to fit to."
+    text = _read(deposited)
+    first_model = text.split("\nENDMDL", 1)[0]
+    theirs = [line for line in _atom_lines(first_model) if line.startswith("ATOM  ")]
+    ours = _atom_lines(_read(topology_file))
+    their_keys = _backbone_keys(theirs)
+    our_keys = {place: key for key, place in _backbone_keys(ours).items()}
+    matched = [(int(i), their_keys[our_keys[int(i)]]) for i in atoms
+               if int(i) in our_keys and our_keys[int(i)] in their_keys]
+    if len(matched) < 3:
+        return None, None, ("The deposited structure's backbone could not be matched to the "
+                            "frames' by chain, residue number and atom name.")
+    try:
+        xyz = np.array([[float(theirs[j][30:38]), float(theirs[j][38:46]),
+                         float(theirs[j][46:54])] for _, j in matched]) / 10.0
+    except ValueError:
+        return None, None, "The deposited structure's coordinates could not be read."
+    try:
+        named = str(deposited.relative_to(output_dir))
+    except ValueError:
+        named = deposited.name
+    said = f"the deposited structure ({named}, {len(matched):,} of {len(atoms):,} atoms matched)"
+    return np.array([i for i, _ in matched], dtype=int), xyz, said
+
+
+def pocket_backbone(frames: Any, ligand: str, cutoff_angstrom: float) -> tuple[Any, list[int]]:
+    """The backbone atoms (N, CA, C, O) of each protein residue with a heavy
+    atom within ``cutoff_angstrom`` of the ligand's heavy atoms in the first
+    frame, and those residues; None for the atoms where the frames hold no
+    such ligand."""
+    import mdtraj as md
+
+    topology = frames.topology
+    heavy = topology.select(f"resname {ligand.upper()} and not element H")
+    if len(heavy) == 0:
+        return None, []
+    protein = topology.select("protein and not element H")
+    near = md.compute_neighbors(frames[0], float(cutoff_angstrom) / 10.0, heavy,
+                                haystack_indices=protein)[0]
+    residues = sorted({topology.atom(int(i)).residue.index for i in near})
+    chosen = set(residues)
+    backbone = topology.select("protein and backbone")
+    atoms = np.array([i for i in backbone if topology.atom(int(i)).residue.index in chosen],
+                     dtype=int)
+    return atoms, residues
+
+
+def superposed_frames(output_dir: str | Path, on: str, *, ligand: str | None = None,
+                      cutoff_angstrom: float = 5.0, to: str = "first",
+                      smooth: Any = 1) -> dict[str, Any]:
+    """The frames the viewer plays, each turned and moved onto a reference.
+
+    ``on`` is ``"backbone"`` (N, CA, C and O of the protein) or ``"pocket"``
+    (the same atoms of each protein residue with a heavy atom within
+    ``cutoff_angstrom`` of the ligand's heavy atoms in the first frame), by
+    MDTraj's least-squares fit. ``to`` is the reference: the first frame,
+    the structure the run started from, or the deposited structure, whose
+    atoms are matched to the frames' by chain, residue number and name.
+    ``smooth``, a window of frames from ``SMOOTHED_OVER``, averages each
+    atom's fitted position over that many frames centred on each (the fit
+    first: an average of a molecule turning is a molecule shrunk). Written
+    once beside the frames, and again when they are. Returns
+    ``{"ok": True, "file", "said", "atoms", "to", "smooth"}``, or why there
+    is none.
+    """
+    import mdtraj as md
+
+    out = Path(output_dir)
+    simulation = out / "simulation"
+    name, cutoff, reason = superposed_name(on, ligand, cutoff_angstrom, to, smooth)
+    window = _window(smooth) or 1
+    if name is None:
+        return {"ok": False, "reason": reason}
+    frames_file, topology_file = simulation / FRAMES_FILE, simulation / FRAMES_TOPOLOGY
+    target = simulation / name
+    with _LOCKS_GUARD:
+        lock = _LOCKS.setdefault(str(out.resolve()), threading.RLock())
+    with lock:
+        if not _sent_here(simulation, FRAMES_FILE, FRAMES_TOPOLOGY):
+            return {"ok": False, "reason": "There are no frames to superpose yet."}
+        if _linked_out(target):
+            # Refused before it is stat'ed or opened, not written over.
+            return {"ok": False, "reason": _NOT_SENT[0], "code": _NOT_SENT[1]}
+        from fastmdxplora.utils.native_output import pdb_quietly, suppress_native_output
+
+        with suppress_native_output():
+            frames = md.load_dcd(str(frames_file), top=str(topology_file))
+        topology = frames.topology
+        backbone = topology.select("protein and backbone")
+        if on == "backbone":
+            atoms = backbone
+            said = f"the protein's backbone ({len(atoms):,} atoms)"
+        else:
+            atoms, residues = pocket_backbone(frames, ligand, cutoff)
+            if atoms is None:
+                return {"ok": False, "reason": f"There is no {ligand.upper()} in the frames."}
+            said = (f"the backbone of the {len(residues)} residues within {cutoff:g} \u00c5 "
+                    f"of {ligand.upper()} in the first frame ({len(atoms):,} atoms)")
+        if len(atoms) < 3:
+            return {"ok": False, "reason": (
+                "The frames have no protein backbone to superpose on." if on == "backbone"
+                else f"No protein residue is within {cutoff:g} \u00c5 of {ligand.upper()} in "
+                     "the first frame.")}
+        reference, reference_atoms = frames, atoms
+        if to == "start":
+            reference = pdb_quietly(topology_file)
+            said += ", fitted to the structure the run started from"
+        elif to == "deposited":
+            atoms, xyz, fitted = _deposited_reference(out, topology_file, atoms)
+            if atoms is None:
+                return {"ok": False, "reason": fitted}
+            reference = md.Trajectory(xyz[None].astype(np.float32),
+                                      frames.topology.subset(atoms))
+            reference_atoms = np.arange(len(atoms))
+            said += f", fitted to {fitted}"
+        else:
+            said += ", fitted to the first frame"
+        if window > 1:
+            said += f", smoothed over {window} frames"
+        fresh = (target.is_file() and target.stat().st_mtime_ns >= frames_file.stat().st_mtime_ns
+                 and (frames.unitcell_lengths is None or _has_a_cell(target)))
+        if not fresh:
+            from fastmdxplora.analysis.base import superposed
+
+            # Fitted as the analyses fit, by one function: each frame is
+            # turned as well as moved, so its box is no longer its own and
+            # the Viewer draws none for them. Its size is kept all the same:
+            # Mol* reads a cell for each frame of a file that had one, and
+            # frames written without one gave its transforms a cell of
+            # nothing, logging "non-invertible matrix" with NaN in it at
+            # every frame played.
+            fitted = superposed(frames, atom_indices=atoms, reference=reference,
+                                ref_atom_indices=reference_atoms)
+            fitted.xyz = smoothed(fitted.xyz, window)
+            if frames.unitcell_lengths is not None and fitted.unitcell_lengths is None:
+                fitted.unitcell_lengths = frames.unitcell_lengths
+                fitted.unitcell_angles = frames.unitcell_angles
+            _write_dcd(fitted, target)
+    return {"ok": True, "file": name, "said": said, "atoms": int(len(atoms)), "to": to,
+            "smooth": window}
+
+
+#: The most atoms times frames in one piece of the frames sent as XTC:
+#: about 24 MB as a DCD, about a third of that as XTC.
+PIECE_ATOM_FRAMES = 2_000_000
+PIECES = "frames_pieces"
+
+
+def frames_pieces(output_dir: str | Path) -> dict[str, Any]:
+    """The frames written as XTC in pieces, for the Viewer to play from the
+    first while the rest arrive: each piece's address, first frame and
+    count. XTC keeps a coordinate to a thousandth of a nanometre (0.01
+    angstrom), about a third of a DCD's size; the DCD stays for whatever
+    reads the frames here. Written once for the frames as they are."""
+    import mdtraj as md
+
+    from fastmdxplora.utils.native_output import suppress_native_output
+
+    out = Path(output_dir)
+    simulation = out / "simulation"
+    index = _load_json(simulation / FRAMES_INDEX)
+    # Through `record_access` (`_sent_here`): in a read held to the study,
+    # frames or pieces linked out of it are refused and named.
+    if not index.get("available") or not _sent_here(simulation, FRAMES_FILE, FRAMES_TOPOLOGY):
+        return {"ok": False, "reason": "There are no frames yet."}
+    folder = simulation / PIECES
+    with _LOCKS_GUARD:
+        lock = _LOCKS.setdefault(str(out.resolve()), threading.RLock())
+    with lock:
+        if any([_linked_out(folder), _linked_out(folder / "index.json")]):
+            # Refused before anything is written there: a folder linked out
+            # of the study is not written into.
+            return {"ok": False, "reason": _NOT_SENT[0]}
+        said = _load_json(folder / "index.json")
+        if said.get("signature") == index.get("signature") and _sent_here(
+                folder, *(f"piece_{k}.xtc" for k in range(len(said.get("pieces", []))))):
+            return said
+        if any(_linked_out(folder / f"piece_{k}.xtc")
+               for k in range(len(said.get("pieces", [])))):
+            return {"ok": False, "reason": _NOT_SENT[0]}
+        with suppress_native_output():
+            frames = md.load_dcd(str(simulation / FRAMES_FILE),
+                                 top=str(simulation / FRAMES_TOPOLOGY))
+        size = max(1, min(frames.n_frames, PIECE_ATOM_FRAMES // max(1, frames.n_atoms)))
+        folder.mkdir(exist_ok=True)
+        pieces = []
+        for k, start in enumerate(range(0, frames.n_frames, size)):
+            piece = frames[start:start + size]
+            _write_xtc(piece, folder / f"piece_{k}.xtc")
+            pieces.append({"start": start, "frames": int(piece.n_frames),
+                           "url": f"/structure/frames-piece.xtc?k={k}"})
+        said = {"ok": True, "signature": index.get("signature"), "pieces": pieces,
+                "total": int(frames.n_frames), "atoms": int(frames.n_atoms),
+                "bytes": sum((folder / f"piece_{k}.xtc").stat().st_size
+                             for k in range(len(pieces))),
+                "dcd_bytes": (simulation / FRAMES_FILE).stat().st_size}
+        _write_json(folder / "index.json", said)
+        return said
+
+
+def as_xtc(dcd: Path) -> Path | None:
+    """A DCD of the frames (the frames superposed) as XTC beside it, written
+    once for it as it is; None where the XTC beside it is linked out of the
+    study (in a read held to it), which is neither read nor written over."""
+    import mdtraj as md
+
+    from fastmdxplora.utils.native_output import suppress_native_output
+
+    target = dcd.with_suffix(".xtc")
+    if _linked_out(target):
+        return None
+    if target.is_file() and target.stat().st_mtime_ns >= dcd.stat().st_mtime_ns:
+        return target
+    with suppress_native_output():
+        frames = md.load_dcd(str(dcd), top=str(dcd.parent / FRAMES_TOPOLOGY))
+    _write_xtc(frames, target)
+    return target
+
+
+#: How many frames a movie may put in between two frames played.
+BETWEEN = (1, 3, 7)
+
+
+def frames_between(source: Path, span: Any, between: Any
+                   ) -> tuple[Path | None, str | None]:
+    """For a movie: the frames played ``from:to:every`` (``span``, either
+    way), with ``between`` frames after each but the last, each atom moved
+    in a straight line from its place in one frame played to its place in
+    the next. Not simulated: a display between frames, which shortens a bond
+    whose atoms swing far between them. Written beside ``source`` (the
+    frames, or the frames superposed), replacing the last written for it."""
+    import mdtraj as md
+
+    from fastmdxplora.utils.native_output import suppress_native_output
+
+    try:
+        n = int(str(between))
+        first, last, every = (int(part) for part in str(span).split(":"))
+    except (TypeError, ValueError):
+        return None, "Frames in between are asked for as span=from:to:every and between=1, 3 or 7."
+    if n not in BETWEEN:
+        return None, "A movie puts 1, 3 or 7 frames in between two frames played."
+    if every < 1 or first < 0 or last < 0:
+        return None, "A movie's frames are counted from 0, every 1 or more."
+    target = source.with_name(f"{source.stem}_between{n}_{first}_{last}_{every}.dcd")
+    if _linked_out(target):
+        # In a read held to the study: neither read nor written over.
+        return None, _NOT_SENT[0]
+    with _LOCKS_GUARD:
+        lock = _LOCKS.setdefault(str(source.parent.parent.resolve()), threading.RLock())
+    with lock:
+        if target.is_file() and target.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+            return target, None
+        with suppress_native_output():
+            frames = md.load_dcd(str(source), top=str(source.parent / FRAMES_TOPOLOGY))
+        if max(first, last) >= frames.n_frames:
+            return None, f"The frames played are 0 to {frames.n_frames - 1}."
+        played = list(range(first, last + 1, every) if first <= last
+                      else range(first, last - 1, -every))
+        count = (len(played) - 1) * (n + 1) + 1
+        if count * frames.n_atoms > BINARY_ATOM_FRAMES:
+            return None, (f"{count:,} frames of {frames.n_atoms:,} atoms are too many to send; "
+                          "choose fewer frames, or fewer in between.")
+        xyz = frames.xyz[played].astype(np.float64)
+        steps = np.arange(n + 1, dtype=np.float64) / (n + 1)
+        moved = (xyz[:-1, None] + steps[None, :, None, None] * (xyz[1:] - xyz[:-1])[:, None])
+        out = np.concatenate([moved.reshape(-1, *xyz.shape[1:]), xyz[-1:]]).astype(np.float32)
+        lengths = angles = None
+        if frames.unitcell_lengths is not None:
+            given = frames.unitcell_lengths[played].astype(np.float64)
+            lengths = np.concatenate([
+                (given[:-1, None] + steps[None, :, None] * (given[1:] - given[:-1])[:, None])
+                .reshape(-1, 3), given[-1:]])
+            angles = np.repeat(frames.unitcell_angles[played], n + 1, axis=0)[:count]
+        tweened = md.Trajectory(out, frames.topology, unitcell_lengths=lengths,
+                                unitcell_angles=angles)
+        for old in source.parent.glob(f"{source.stem}_between*"):
+            if old.stem != target.stem:
+                old.unlink(missing_ok=True)
+        _write_dcd(tweened, target)
+    return target, None
+
+
+def _write_topology(source: Path, kept: Any, target: Path) -> None:
+    """The source's own lines for the atoms kept, in order, with the box
+    and the bonds among them."""
+    keep = {int(index) for index in kept}
+    lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+    written: list[str] = []
+    serials: set[int] = set()
+    position = -1
+    since_ter = False
+    for line in lines:
+        record = line[:6]
+        if record.startswith("ENDMDL"):
+            break
+        if record.startswith("CRYST1"):
+            written.append(line)
+        elif record in ("ATOM  ", "HETATM"):
+            position += 1
+            if position in keep:
+                written.append(line)
+                since_ter = True
+                try:
+                    serials.add(int(line[6:11]))
+                except ValueError:
+                    pass
+        elif record.startswith("TER") and since_ter:
+            written.append("TER")
+            since_ter = False
+    for line in lines:
+        if line.startswith("CONECT"):
+            fields = [line[i:i + 5].strip() for i in range(6, len(line), 5)]
+            numbers = [int(field) for field in fields if field.isdigit()]
+            if numbers and all(number in serials for number in numbers):
+                written.append(line)
+    _write_text(target, "\n".join(written) + "\nEND\n")
+
+
+def _write_text(target: Path, text: str) -> None:
+    """``text`` saved as ``target`` through a new temporary file beside it,
+    never one of a fixed name, nor through a link out of the study
+    (`record_access.save`)."""
+    from fastmdxplora import record_access
+    from fastmdxplora.refusals import OutsideWorkspace
+
+    # Two local dashboard requests can atomically replace the same Windows
+    # target at once. Windows may briefly refuse the second rename while the
+    # first replacement is settling; retry that transient sharing failure.
+    for attempt in range(6):
+        try:
+            record_access.save(target, text)
+            return
+        except OutsideWorkspace:
+            raise
+        except PermissionError:
+            if os.name != "nt" or attempt == 5:
+                raise
+            time.sleep(0.01 * (attempt + 1))
+
+
+def _has_a_cell(path: Path) -> bool:
+    """Whether a DCD records a unit cell (one written before cells were
+    kept for fitted frames does not, and is written again)."""
+    import mdtraj as md
+
+    try:
+        with md.formats.DCDTrajectoryFile(str(path)) as handle:
+            _, lengths, _ = handle.read(1)
+    except Exception:  # noqa: BLE001 - written again
+        return False
+    return lengths is not None
+
+
+def _write_dcd(frames: Any, target: Path) -> None:
+    """``frames`` saved as the DCD ``target``, as `_write_text` saves text:
+    MDTraj writes over the new temporary file by its name."""
+    from fastmdxplora import record_access
+
+    record_access.save_by_name(target, frames.save_dcd)
+
+
+def _write_xtc(frames: Any, target: Path) -> None:
+    """``frames`` saved as the XTC ``target``, as `_write_dcd` saves a DCD."""
+    from fastmdxplora import record_access
+
+    record_access.save_by_name(target, frames.save_xtc)
+
+
+def _times(indices: list[int], total: int, total_ns: float | None,
+           interval_ns: float | None = None) -> list[float | None]:
+    """Each frame's time in the production, in ns.
+
+    OpenMM's reporter writes frame k at (k + 1) saving intervals, which is
+    the clock the analyses plot (`gui/series.analysed_axis`). The frames
+    were spread evenly from 0 to the run's length, 0, 0.101, ... 10 ns for
+    100 frames of 10 ns where they were 0.1, 0.2, ... 10, and a frame shown
+    in the Viewer was a frame's spacing from the same frame on the Analysis
+    page. A DCD written through MDTraj records no clock of its own, so the
+    interval comes from the records (:func:`_interval_ns`); where none says
+    it, the old spread stands.
+    """
+    if interval_ns:
+        return [round((index + 1) * interval_ns, 12) for index in indices]
+    if total_ns is None or total < 2:
+        return [None] * len(indices)
+    return [float(total_ns) * index / (total - 1) for index in indices]
+
+
+def _interval_ns(out: Path, source: dict[str, Any]) -> float | None:
+    """The time between the trajectory's frames, from the records: the
+    interval the analyses read the played trajectory at, else, for a run's
+    own production, its saving interval and timestep (the reading Derrick
+    Kwan's branch, `fix/viewer-recorded-frame-times`, gives). ``None``
+    where neither says it, or the integrator chose its own step."""
+    from fastmdxplora.gui.series import of_the_played_trajectory
+    from fastmdxplora.simulation.runner import chose_its_own_step
+
+    if chose_its_own_step(out / "simulation"):
+        return None
+
+    manifest = _load_json(out / "analysis" / "analysis_manifest.json")
+    loaded = manifest.get("load_kwargs") if isinstance(manifest.get("load_kwargs"), dict) else {}
+    interval_ps = loaded.get("saving_interval_ps")
+    if (type(interval_ps) in (int, float) and np.isfinite(interval_ps) and interval_ps > 0
+            and of_the_played_trajectory(out)):
+        return float(interval_ps) / 1000.0
+    trajectory = source.get("trajectory")
+    if not isinstance(trajectory, Path) or trajectory != out / "simulation" / "production.dcd":
+        return None
+    record = _load_json(trajectory.parent / "simulation_parameters.json")
+    resolved, parameters = record.get("resolved"), record.get("parameters")
+    if record.get("continues") or not isinstance(resolved, dict) \
+            or not isinstance(parameters, dict):
+        return None
+    steps = resolved.get("trajectory_interval_steps")
+    timestep = parameters.get("timestep_fs")
+    if (type(steps) is int and steps > 0 and type(timestep) in (int, float)
+            and np.isfinite(timestep) and timestep > 0
+            and parameters.get("integrator") in {"langevin", "langevin_middle", "verlet",
+                                                 "brownian"}):
+        return steps * float(timestep) / 1_000_000.0
+    return None
+
+
+def _even(count: int, cap: int) -> list[int]:
+    if count <= cap:
+        return list(range(count))
+    if cap <= 2:
+        return [0, count - 1]
+    return sorted({round(index * (count - 1) / (cap - 1)) for index in range(cap)})
+
+
+def _atom_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line[:6] in ("ATOM  ", "HETATM")]
+
+
+def _read(path: Path) -> str:
+    # Through `record_access`: held to its study where the read is.
+    from fastmdxplora import record_access
+
+    try:
+        return record_access.read_text(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _stamp(path: Path) -> str:
+    stat = path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    """A record of the study, through `record_access`: held to it where the
+    read is. The index of the frames written for the Viewer, refused there
+    (a link out of the study, not saved over), is what was said of those
+    frames when they were written here, while they stand (`_unsaved_index`):
+    what is computed from them is computed as before, the index said not
+    read and not saved."""
+    from fastmdxplora import record_access
+
+    with record_access.refusals_noted() as refused:
+        try:
+            value = json.loads(record_access.read_text(path, encoding="utf-8"))
+        except (OSError, ValueError):
+            value = {}
+    if refused and Path(path).name == FRAMES_INDEX:
+        return _unsaved_index(Path(path).parent)
+    return value if isinstance(value, dict) else {}
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    _write_text(path, json.dumps(payload))

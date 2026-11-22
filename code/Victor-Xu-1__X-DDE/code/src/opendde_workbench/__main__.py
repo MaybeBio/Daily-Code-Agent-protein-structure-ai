@@ -1,0 +1,33 @@
+"""Single-process localhost entry point."""
+
+import argparse
+import logging
+import os
+
+import uvicorn
+
+
+def main():
+    parser = argparse.ArgumentParser(description="X-DDE (localhost only)")
+    parser.add_argument("--port", type=int, default=4320)
+    args = parser.parse_args()
+    if not 1024 <= args.port <= 65535:
+        parser.error("Port must be between 1024 and 65535.")
+    os.environ.setdefault(
+        "WB_ALLOWED_ORIGINS", f"http://127.0.0.1:{args.port},http://localhost:{args.port}"
+    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    uvicorn.run(
+        "opendde_workbench.api:create_app",
+        factory=True,
+        host="127.0.0.1",
+        port=args.port,
+        workers=1,
+        # Drain retained browser reads before the owned stop command times out.
+        # Application lifespan cleanup still finishes before the process exits.
+        timeout_graceful_shutdown=5,
+    )
+
+
+if __name__ == "__main__":
+    main()

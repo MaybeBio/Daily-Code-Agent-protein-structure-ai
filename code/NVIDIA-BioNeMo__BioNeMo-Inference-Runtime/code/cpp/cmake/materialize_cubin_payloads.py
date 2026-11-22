@@ -1,0 +1,2588 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Verify public CUBIN packs and materialize deterministic native build inputs."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import lzma
+import os
+import re
+import sys
+import tarfile
+import tempfile
+import zlib
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import NoReturn, cast
+
+INDEX_FORMAT = "bioir-cubin-pack-v2"
+REGISTRY_VERSION = 2
+MATERIALIZATION_FORMAT = "bioir-cubin-materialization-v1"
+ASSEMBLY_FORMAT = "bioir-cubin-assembly-v1"
+FINGERPRINT_FORMAT = "bioir-cubin-materialization-fingerprint-v1"
+
+_FAMILIES = frozenset(
+    {
+        "adaln_layernorm_sigmoid",
+        "attn_epilogue",
+        "conditioned_transition_mlp",
+        "dual_gemm_x0_x1",
+        "dual_gemm_x_x",
+        "gated_sigmoid",
+        "outer_product_mean",
+        "pair_weighted_averaging",
+        "pairwise_attention",
+        "transition_mlp",
+        "transition_mlp_w_norm",
+        "triangle_attention",
+        "trimul_kf_k1",
+        "trimul_kf_k2",
+        "trimul_kf_k3",
+        "window_attention",
+    }
+)
+# Public build-contract tests use this exact baseline while the protected
+# publisher performs the declared transition to ``_FAMILIES``. Remove it with
+# the matching CI declaration after the expanded corpus lands.
+_PREVIOUS_FAMILIES = frozenset(
+    {
+        "adaln_layernorm_sigmoid",
+        "attn_epilogue",
+        "dual_gemm_x0_x1",
+        "dual_gemm_x_x",
+        "gated_sigmoid",
+        "outer_product_mean",
+        "pair_weighted_averaging",
+        "pairwise_attention",
+        "transition_mlp",
+        "transition_mlp_w_norm",
+        "triangle_attention",
+        "trimul_kf_k1",
+        "trimul_kf_k2",
+        "trimul_kf_k3",
+        "window_attention",
+    }
+)
+# Families whose images on a ``*_mask_ptr_v1`` launch ABI take the row mask as a nullable pointer, so one image
+# serves both mask states.
+_NULLABLE_MASK_FAMILIES = frozenset({"dual_gemm_x_x", "transition_mlp"})
+_BF16_ONLY_FAMILIES = frozenset(
+    {
+        "conditioned_transition_mlp",
+        "transition_mlp",
+        "transition_mlp_w_norm",
+        "trimul_kf_k1",
+        "trimul_kf_k2",
+        "trimul_kf_k3",
+    }
+)
+_DTYPES = {
+    "adaln_layernorm_sigmoid": frozenset({"fp16", "bf16", "fp32"}),
+    **{family: frozenset({"bf16"}) for family in _BF16_ONLY_FAMILIES},
+    **{
+        family: frozenset({"fp16", "bf16"})
+        for family in _FAMILIES
+        if family != "adaln_layernorm_sigmoid" and family not in _BF16_ONLY_FAMILIES
+    },
+}
+_HEX20_RE = re.compile(r"[0-9a-f]{20}")
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
+_FAMILY_RE = re.compile(r"[a-z][a-z0-9_]{0,127}")
+_ARCH_RE = re.compile(r"sm_(?P<sm>[0-9]{2,3})(?P<suffix>[af]?)")
+_ABI_RE = re.compile(r"[a-z][a-z0-9_]{0,127}")
+_SYMBOL_RE = re.compile(r"k[0-9a-f_]{1,511}")
+_LFS_PREFIX = b"version https://git-lfs.github.com/spec/v1\n"
+
+_MAX_INDEX_BYTES = 4 * 1024 * 1024
+_SHARD_DIGITS = "0123456789abcdef"
+_MAX_PACK_BYTES = 8 * 1024 * 1024 * 1024
+_MAX_IMAGE_BYTES = 256 * 1024 * 1024
+_MAX_FAMILY_IMAGES = 65_536
+_MAX_TAR_BYTES = 16 * 1024 * 1024 * 1024
+_IO_CHUNK = 1024 * 1024
+_UINT32_MAX = (1 << 32) - 1
+_INT32_MAX = (1 << 31) - 1
+_XZ_MAGIC = b"\xfd7zXZ\x00"
+_XZ_FOOTER_MAGIC = b"YZ"
+_XZ_STREAM_FLAGS = b"\x00\x04"
+_XZ_LZMA2_DICT_PROPERTY_8_MIB = b"\x16"
+
+_COMMON_METADATA = frozenset({"dynamic_smem_bytes", "non_portable_cluster_size_allowed"})
+# One declaration per family, replacing what used to be five parallel switch
+# statements. Each field appears exactly once and drives, in this order:
+#   * the accepted runtime-metadata key set,
+#   * the value validation,
+#   * the generated C++ ``CubinImage`` member,
+#   * that member's initializer in the generated registry.
+# Field order IS the C++ struct layout and the initializer order, so a launcher
+# reading `image.<name>` cannot drift from what the index declares.
+_POSITIVE = "positive"  # 1..UINT32_MAX
+_COUNT = "count"  # 0..UINT32_MAX
+_INDEX = "index"  # 0..INT32_MAX
+_BOOL = "bool"
+_TEXT = "text"
+_TRIPLE = "triple"  # exactly three integers, each >= 1
+_DTYPE_CODE = "dtype_code"  # derived from the variant, not from metadata
+_NO_DEFAULT = object()
+
+
+@dataclass(frozen=True)
+class _Field:
+    """One runtime-metadata value and the C++ member it materializes into.
+
+    ``default_from`` copies a sibling key when this field is absent, so an
+    implementation MR still builds against a corpus that predates the field.
+    ``default`` does the same from a constant, which is what a field with no
+    sibling to copy needs: an axis added to a family is absent from every
+    already-published image, and the value those images actually carry is the
+    one the axis had before it was nameable. ``default_by`` does the same from a
+    closed table keyed by a sibling's value, for a field whose value differed
+    between the already-published images: an image outside the table must carry
+    the field itself. The generated C++ member is always present.
+    """
+
+    name: str
+    kind: str
+    declaration: str
+    suffix: str = ""
+    default_from: str | None = None
+    default: object = _NO_DEFAULT
+    default_by: tuple[str, tuple[tuple[object, object], ...]] | None = None
+
+    @property
+    def from_metadata(self) -> bool:
+        return self.kind != _DTYPE_CODE
+
+
+@dataclass(frozen=True)
+class _AliasSpec:
+    """Per-variant ``RuntimeAlias`` table appended to the image record."""
+
+    keys: tuple[str, str]
+    declarations: tuple[str, str]
+
+
+@dataclass(frozen=True)
+class _Sm90Spec:
+    """Native-SM90 launch record; families differ in name, operands, TMA ranks and epilogue tile."""
+
+    enabled_field: str
+    operands: tuple[str, ...]
+    rank: int = 4
+    epi_tile: bool = False
+    # Per-operand TMA ranks in ``operands`` order, for families whose operands differ; empty uses ``rank``.
+    # A tuple entry lists the ranks an operand may lower to.
+    ranks: tuple[int | tuple[int, ...], ...] = ()
+    # Operands only some images record, each with its TMA rank (or the ranks it may lower to); an absent one renders
+    # as a rank-0 map.
+    optional: tuple[tuple[str, int | tuple[int, ...]], ...] = ()
+
+    @property
+    def declared_operands(self) -> tuple[str, ...]:
+        """Every operand the C++ launch record declares, the optional ones last."""
+        return (*self.operands, *(name for name, _ in self.optional))
+
+
+@dataclass(frozen=True)
+class _Sm100Spec:
+    """Native-SM100 launch record for Blackwell TMA kernels.
+
+    ``clusters`` adds the cluster shape and scheduling policy a clustered launch
+    (for example 2-SM ``tcgen05`` UMMA) needs; ``rank`` is the TMA rank.
+    ``ranks`` and ``optional`` work as in :class:`_Sm90Spec`. ``kernels``, when
+    set, lists each kernel's cluster shape with its descriptors' ranks in
+    ``operands`` order; an image must match one of them. ``fp16_operands``
+    pairs an operand with the launch ABI under which its map is FP16 whatever
+    the variant dtype, as for a GEMM that a BF16 image runs in FP16.
+    """
+
+    enabled_field: str
+    operands: tuple[str, ...]
+    rank: int = 4
+    clusters: bool = False
+    ranks: tuple[int | tuple[int, ...], ...] = ()
+    optional: tuple[tuple[str, int | tuple[int, ...]], ...] = ()
+    kernels: tuple[tuple[tuple[int, int, int], tuple[int, ...]], ...] = ()
+    fp16_operands: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def declared_operands(self) -> tuple[str, ...]:
+        """Every operand the C++ launch record declares, the optional ones last."""
+        return (*self.operands, *(name for name, _ in self.optional))
+
+
+@dataclass(frozen=True)
+class _FamilySpec:
+    """Everything family-specific about one registry."""
+
+    fields: tuple[_Field, ...]
+    # Runtime uniqueness key, in order. "@name" reads the per-alias value, which
+    # also makes the key expand to one entry per alias.
+    runtime_key: tuple[str, ...]
+    dtype_key: str = "is_bfloat16"
+    alias: _AliasSpec | None = None
+    sm90: _Sm90Spec | None = None
+    sm100: _Sm100Spec | None = None
+
+    @property
+    def metadata_keys(self) -> frozenset[str]:
+        keys = {field.name for field in self.fields if field.from_metadata}
+        keys.add(self.dtype_key)
+        if self.alias is not None:
+            keys.add("runtime_aliases")
+        if self.sm90 is not None:
+            keys.add("sm90_launch")
+        if self.sm100 is not None:
+            keys.add("sm100_launch")
+        return frozenset(keys)
+
+
+_ATTENTION_SPEC = _FamilySpec(
+    fields=(
+        _Field("head_dim", _POSITIVE, "std::int32_t head_dim;"),
+        _Field("bucket", _INDEX, "std::int32_t bucket;"),
+        _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+        _Field("packed_output", _BOOL, "bool packed_output;"),
+    ),
+    runtime_key=("head_dim", "bucket", "is_bfloat16", "packed_output"),
+    sm90=_Sm90Spec("enabled", ("q", "k", "v", "bias", "output")),
+    sm100=_Sm100Spec("enabled", ("q", "k", "v", "bias", "output")),
+)
+
+_FAMILY_SPECS: dict[str, _FamilySpec] = {
+    "adaln_layernorm_sigmoid": _FamilySpec(
+        fields=(
+            _Field("dtype", _DTYPE_CODE, "std::uint8_t dtype;"),
+            _Field("feature_dim", _POSITIVE, "std::int32_t feature_dim;"),
+            _Field("threads_per_row", _POSITIVE, "std::int32_t threads_per_row;"),
+            _Field("num_threads", _POSITIVE, "std::int32_t num_threads;"),
+            _Field("cluster_n", _POSITIVE, "std::int32_t cluster_n;"),
+            # Every image published before the norm axis existed is LayerNorm.
+            _Field("is_rms_norm", _BOOL, "bool is_rms_norm;", default=False),
+        ),
+        runtime_key=("dtype_name", "feature_dim", "threads_per_row", "num_threads", "is_rms_norm"),
+        dtype_key="dtype_name",
+    ),
+    "gated_sigmoid": _FamilySpec(
+        fields=(
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("has_bias", _BOOL, "bool has_bias;"),
+            # Images published before the residual, mask and unroll axes carry none of them.
+            _Field("has_residual", _BOOL, "bool has_residual;", default=False),
+            _Field("has_mask", _BOOL, "bool has_mask;", default=False),
+            _Field("m_block_size", _POSITIVE, "std::int32_t m_block_size;"),
+            _Field("n_block_size", _POSITIVE, "std::int32_t n_block_size;"),
+            _Field("k_block_size", _POSITIVE, "std::int32_t k_block_size;"),
+            _Field("num_stages", _POSITIVE, "std::int32_t num_stages;"),
+            _Field("raster_factor", _COUNT, "std::int32_t raster_factor;"),
+            _Field("num_threads", _POSITIVE, "std::int32_t num_threads;"),
+            _Field("atom_layout_mnk", _TRIPLE, "std::int32_t atom_layout_mnk[3];"),
+            _Field("unroll", _POSITIVE, "std::int32_t unroll;", default=1),
+        ),
+        runtime_key=(
+            "is_bfloat16",
+            "has_bias",
+            "has_residual",
+            "has_mask",
+            "m_block_size",
+            "n_block_size",
+            "k_block_size",
+            "num_stages",
+            "raster_factor",
+            "atom_layout_mnk",
+            "unroll",
+        ),
+        # The persistent tcgen05 kernel's tensor maps for s and W; no cluster.
+        sm100=_Sm100Spec("enabled", ("s", "weight"), rank=2),
+    ),
+    "outer_product_mean": _FamilySpec(
+        fields=(
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("has_bias", _BOOL, "bool has_bias;"),
+            _Field("norm_before", _BOOL, "bool norm_before;"),
+            _Field("config_identity", _TEXT, "char const* config_identity;"),
+            _Field("tile_i", _POSITIVE, "std::int32_t tile_i;"),
+            _Field("tile_j", _POSITIVE, "std::int32_t tile_j;"),
+            _Field("raster_factor", _COUNT, "std::int32_t raster_factor;"),
+            _Field("num_threads", _POSITIVE, "std::int32_t num_threads;"),
+            # Images published before C_z = 256 and the SM90 kernel carry none of these.
+            _Field("c_z", _POSITIVE, "std::int32_t c_z;", default=128),
+            _Field("tile_s", _POSITIVE, "std::int32_t tile_s;", default=32),
+            _Field("ptile", _POSITIVE, "std::int32_t ptile;", default=1),
+            _Field("csplit", _POSITIVE, "std::int32_t csplit;", default=1),
+        ),
+        runtime_key=("is_bfloat16", "has_bias", "norm_before", "config_identity"),
+        sm90=_Sm90Spec("is_sm90", ("a", "a2", "b", "w"), ranks=((3, 4), (3, 4), 3, 2)),
+        # The CTA pair loads the relaid a and b, streams W and stores the output, all through TMA.
+        sm100=_Sm100Spec("is_sm100", ("a", "b", "w", "output"), clusters=True, ranks=(4, 3, 2, 4)),
+    ),
+    "pair_weighted_averaging": _FamilySpec(
+        fields=(
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("H", _POSITIVE, "std::int32_t H;"),
+            _Field("D", _POSITIVE, "std::int32_t D;"),
+            _Field("c_m", _POSITIVE, "std::int32_t c_m;"),
+            _Field("tile_i", _POSITIVE, "std::uint32_t tile_i;", suffix="U"),
+            _Field("tile_s", _POSITIVE, "std::uint32_t tile_s;", suffix="U"),
+            _Field("tile_j", _POSITIVE, "std::uint32_t tile_j;", suffix="U"),
+            _Field("num_threads", _POSITIVE, "std::uint32_t num_threads;", suffix="U"),
+            # The SM90 or SM100 kernel within its launch ABI: 0 for D=32, 1 for D=8. Images published before carry
+            # none.
+            _Field("kernel_variant", _INDEX, "std::int32_t kernel_variant;", default=0),
+            # Token tiles and MSA-row tiles per cluster. Images published before carry none and launch no cluster.
+            _Field("cluster_i", _POSITIVE, "std::uint32_t cluster_i;", suffix="U", default=1),
+            _Field("cluster_s", _POSITIVE, "std::uint32_t cluster_s;", suffix="U", default=1),
+        ),
+        runtime_key=("is_bfloat16", "D", "c_m", "@n_anchor", "@s_anchor"),
+        alias=_AliasSpec(
+            ("n_anchor", "s_anchor"),
+            ("std::int32_t n_anchor;", "std::int32_t s_anchor;"),
+        ),
+        sm90=_Sm90Spec("enabled", ("w", "v", "g", "wo"), ranks=(4, 4, 4, 2), optional=(("output", 4),)),
+        # The tcgen05 kernels split each head's d out of v, a rank-5 map; the D=8 kernel loads v transposed, which
+        # changes the map's dimension order and box, not its rank. Only the D=32 TMA epilogue records the output store,
+        # with g as a rank-5 map; the D=8 kernel records a rank-4 g, and the D=32 direct and pair tiles neither. The
+        # D=32 split tile leaves Wo to the caller and records no Wo map either.
+        sm100=_Sm100Spec(
+            "enabled",
+            ("w", "v"),
+            clusters=True,
+            ranks=(4, 5),
+            optional=(("wo", 2), ("g", (4, 5)), ("output", 4)),
+        ),
+    ),
+    "pairwise_attention": _ATTENTION_SPEC,
+    "triangle_attention": _FamilySpec(
+        fields=(
+            *_ATTENTION_SPEC.fields,
+            _Field("kernel_variant", _INDEX, "std::int32_t kernel_variant;", default=0),
+            _Field("split_mma", _BOOL, "bool split_mma;", default=False),
+            _Field("scheduler_variants", _BOOL, "bool scheduler_variants;", default=False),
+        ),
+        runtime_key=(*_ATTENTION_SPEC.runtime_key, "kernel_variant"),
+        sm90=_ATTENTION_SPEC.sm90,
+        sm100=_ATTENTION_SPEC.sm100,
+    ),
+    "dual_gemm_x_x": _FamilySpec(
+        fields=(
+            _Field("K", _POSITIVE, "std::int32_t K;"),
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("transpose_out", _BOOL, "bool transpose_out;"),
+            _Field("has_bias", _BOOL, "bool has_bias;"),
+            _Field("legacy_has_mask", _BOOL, "bool legacy_has_mask;", default=False),
+            # Every image published before the gate axis existed is sigmoid.
+            _Field("is_silu_gate", _BOOL, "bool is_silu_gate;", default=False),
+            _Field("tile_m", _POSITIVE, "std::uint32_t tile_m;", suffix="U"),
+            _Field("tile_n", _POSITIVE, "std::uint32_t tile_n;", suffix="U"),
+            _Field("tile_k", _POSITIVE, "std::uint32_t tile_k;", suffix="U"),
+            _Field("num_threads", _POSITIVE, "std::uint32_t num_threads;", suffix="U"),
+            _Field("raster_factor", _COUNT, "std::uint32_t raster_factor;", suffix="U"),
+        ),
+        runtime_key=(
+            "K",
+            "@N",
+            "@bucket",
+            "is_bfloat16",
+            "transpose_out",
+            "has_bias",
+            "has_mask",
+            "is_silu_gate",
+        ),
+        alias=_AliasSpec(("N", "bucket"), ("std::int32_t N;", "std::int32_t bucket;")),
+        sm90=_Sm90Spec("enabled", ("x0", "x1", "w0", "w1", "output"), rank=2, epi_tile=True),
+        sm100=_Sm100Spec("enabled", ("x", "w0", "w1", "output"), rank=2, clusters=True),
+    ),
+    "dual_gemm_x0_x1": _FamilySpec(
+        fields=(
+            _Field("K", _POSITIVE, "std::int32_t K;"),
+            _Field("K1", _POSITIVE, "std::int32_t K1;", default_from="K"),
+            _Field("N", _POSITIVE, "std::int32_t N;"),
+            _Field("bucket", _INDEX, "std::int32_t bucket;"),
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("has_bias", _BOOL, "bool has_bias;"),
+            _Field("fused_residual", _BOOL, "bool fused_residual;", default=False),
+            _Field("tile_m", _POSITIVE, "std::uint32_t tile_m;", suffix="U"),
+            _Field("tile_n", _POSITIVE, "std::uint32_t tile_n;", suffix="U"),
+            _Field("num_threads", _POSITIVE, "std::uint32_t num_threads;", suffix="U"),
+            _Field("raster_factor", _COUNT, "std::uint32_t raster_factor;", suffix="U"),
+        ),
+        runtime_key=("K", "K1", "N", "bucket", "is_bfloat16", "has_bias", "fused_residual"),
+        sm90=_Sm90Spec("is_native", ("x0", "x1", "w0", "w1", "output"), rank=2, epi_tile=True),
+        # Blackwell ships only the fused-residual ABI, so every image carries the residual map.
+        sm100=_Sm100Spec("enabled", ("x0", "x1", "w0", "w1", "residual", "output"), rank=2, clusters=True),
+    ),
+    "transition_mlp": _FamilySpec(
+        fields=(
+            _Field("width", _POSITIVE, "std::int32_t width;"),
+            _Field("hidden", _POSITIVE, "std::int32_t hidden;"),
+            # The tuned pseudo sequence length; 0 for an image that serves every size.
+            _Field("bucket", _INDEX, "std::int32_t bucket;"),
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("is_silu_gate", _BOOL, "bool is_silu_gate;"),
+            # Every image published before the 3-way SwiGLU existed gates a single value.
+            _Field("is_three_way", _BOOL, "bool is_three_way;", default=False),
+            _Field("has_bias", _BOOL, "bool has_bias;"),
+            _Field("has_mask", _BOOL, "bool has_mask;"),
+            _Field("has_residual", _BOOL, "bool has_residual;"),
+            _Field("tile_m", _POSITIVE, "std::uint32_t tile_m;", suffix="U"),
+            _Field("num_threads", _POSITIVE, "std::uint32_t num_threads;", suffix="U"),
+        ),
+        runtime_key=(
+            "is_bfloat16",
+            "is_silu_gate",
+            "is_three_way",
+            "has_bias",
+            "has_mask",
+            "has_residual",
+            "width",
+            "hidden",
+            "bucket",
+        ),
+        sm90=_Sm90Spec("enabled", ("x", "w1", "w2", "residual", "output"), rank=2),
+        sm100=_Sm100Spec("enabled", ("x", "w1", "w2"), clusters=True, ranks=(2, 4, 2)),
+    ),
+    # The SM90 image bulk-copies from raw addresses, not through TMA, so it records no tensor maps.
+    "transition_mlp_w_norm": _FamilySpec(
+        fields=(
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("width", _POSITIVE, "std::int32_t width;"),
+            _Field("hidden", _POSITIVE, "std::int32_t hidden;"),
+            # Every image published before SwiGLU existed is ReLU.
+            _Field("is_silu_gate", _BOOL, "bool is_silu_gate;", default=False),
+            _Field("num_threads", _POSITIVE, "std::uint32_t num_threads;", suffix="U"),
+            _Field("tile_m", _POSITIVE, "std::uint32_t tile_m;", suffix="U"),
+            # Every image published before the field existed ran one CTA per SM.
+            _Field("ctas_per_sm", _POSITIVE, "std::uint32_t ctas_per_sm;", suffix="U", default=1),
+            # The (tile_wgs, split) launch layouts, one bit each; images published before the field took none of
+            # them, being of an earlier launch ABI.
+            _Field("layouts", _COUNT, "std::uint32_t layouts;", suffix="U", default=0),
+            # The persistent image of a shape (the full tile at split 1 only) beside the one taking every layout;
+            # every image published before the field is the latter's predecessor.
+            _Field("is_persistent", _BOOL, "bool is_persistent;", default=False),
+        ),
+        runtime_key=("is_bfloat16", "width", "hidden", "is_silu_gate", "is_persistent"),
+        # The C384 ReLU image runs GEMM2 in FP16, so it reads W2 as FP16.
+        sm100=_Sm100Spec(
+            "enabled",
+            ("x", "w1", "w2"),
+            clusters=True,
+            ranks=(2, (3, 4), 2),
+            optional=(("output", 2),),
+            fp16_operands=(("w2", "transition_mlp_w_norm_sm100_f16_v1"),),
+        ),
+    ),
+    # A sample-major image maps x and the output as [atoms, C, samples] (rank 3), the others as rows (rank 2).
+    "conditioned_transition_mlp": _FamilySpec(
+        fields=(
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("width", _POSITIVE, "std::int32_t width;"),
+            _Field("hidden", _POSITIVE, "std::int32_t hidden;"),
+            # The 3-way SwiGLU, with a second value block, rather than the 2-way one.
+            _Field("is_three_way", _BOOL, "bool is_three_way;"),
+            # Whether the image stages each atom's conditioning in shared memory.
+            _Field("cond_stage", _BOOL, "bool cond_stage;"),
+            # The samples of a sample-major image's tiles; 0 for row tiles.
+            _Field("samples", _COUNT, "std::uint32_t samples;", suffix="U"),
+            # Rows of a CTA pair's row tile, and atoms of its sample-major tile (0 for row tiles).
+            _Field("tile_m", _POSITIVE, "std::uint32_t tile_m;", suffix="U"),
+            _Field("tile_atoms", _COUNT, "std::uint32_t tile_atoms;", suffix="U"),
+            _Field("num_threads", _POSITIVE, "std::uint32_t num_threads;", suffix="U"),
+        ),
+        runtime_key=("is_bfloat16", "width", "hidden", "is_three_way", "cond_stage", "samples"),
+        sm100=_Sm100Spec("enabled", ("x", "w1", "w2", "output"), clusters=True, ranks=((2, 3), 4, 2, (2, 3))),
+    ),
+    "attn_epilogue": _FamilySpec(
+        fields=(
+            _Field("heads", _POSITIVE, "std::int32_t heads;"),
+            _Field("head_dim", _POSITIVE, "std::int32_t head_dim;"),
+            _Field("channels", _POSITIVE, "std::int32_t channels;"),
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("has_bias", _BOOL, "bool has_bias;"),
+            _Field("has_output_gate", _BOOL, "bool has_output_gate;"),
+            # Every image published before the residual-free kernel accumulated into z.
+            _Field("has_residual", _BOOL, "bool has_residual;", default=True),
+            _Field("tile_j", _POSITIVE, "std::uint32_t tile_j;", suffix="U"),
+            # Every image published before streamed Wo covered all 128 channels in one tile.
+            _Field("tile_n", _POSITIVE, "std::uint32_t tile_n;", suffix="U", default=128),
+            _Field("num_threads", _POSITIVE, "std::uint32_t num_threads;", suffix="U"),
+            # The folded-rows tuning anchor; every image published before
+            # anchors existed served all rows from a single tuning.
+            _Field("bucket", _INDEX, "std::int32_t bucket;", default=0),
+            # The Blackwell token kernel's 2-SM pairs rather than its 1-SM triples.
+            _Field("pairs", _BOOL, "bool pairs;", default=False),
+        ),
+        runtime_key=(
+            "heads",
+            "head_dim",
+            "channels",
+            "is_bfloat16",
+            "has_bias",
+            "has_output_gate",
+            "has_residual",
+            "bucket",
+            "pairs",
+        ),
+        # Every Hopper image records the residual's z map and the output gate's
+        # y map; only an image with the residual encodes z, and only a gated one y.
+        sm90=_Sm90Spec("is_native", ("o", "g", "w", "z", "y", "d"), ranks=(4, 3, 2, 3, 3, 3)),
+        # The triangle kernel's pair maps are rank 3 and the token kernel's flat row maps rank 2. Only a gated
+        # triangle image records the output gate's y map; every other image renders it as a rank-0 map.
+        sm100=_Sm100Spec(
+            "enabled",
+            ("o", "g", "w", "z", "d"),
+            ranks=((2, 3),) * 5,
+            clusters=True,
+            optional=(("y", 3),),
+            kernels=(((2, 1, 1), (3, 3, 2, 3, 3)), ((6, 1, 1), (2, 2, 2, 2, 2))),
+        ),
+    ),
+    "trimul_kf_k1": _FamilySpec(
+        fields=(
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("C", _POSITIVE, "std::int32_t C;"),
+            _Field("D", _POSITIVE, "std::int32_t D;"),
+            # N of the configs' K1_<N>.
+            _Field("kernel_variant", _INDEX, "std::int32_t kernel_variant;"),
+            _Field("num_threads", _POSITIVE, "std::uint32_t num_threads;", suffix="U"),
+            # Every image published before the padded flavour wrote dense a/b planes.
+            _Field("padded", _BOOL, "bool padded;", default=False),
+            # The SM100 K1_B0 tile (TrimulKFK1Tile); 0 in every other image, including all published before it.
+            _Field("bnc", _COUNT, "std::uint32_t bnc;", suffix="U", default=0),
+            _Field("epi_n", _COUNT, "std::uint32_t epi_n;", suffix="U", default=0),
+            _Field("ctas", _COUNT, "std::uint32_t ctas;", suffix="U", default=0),
+            _Field("w_slots", _COUNT, "std::uint32_t w_slots;", suffix="U", default=0),
+            _Field("s_stages", _COUNT, "std::uint32_t s_stages;", suffix="U", default=0),
+            # Work items per tile in images published before the kernel split tiles into unit shares; 0 in
+            # every later image. Kept in the runtime key so those images stay distinct until they are rebuilt.
+            _Field("split", _COUNT, "std::uint32_t split;", suffix="U", default=0),
+            _Field("store_warps", _COUNT, "std::uint32_t store_warps;", suffix="U", default=0),
+            _Field("epi_groups", _COUNT, "std::uint32_t epi_groups;", suffix="U", default=0),
+        ),
+        runtime_key=(
+            "is_bfloat16",
+            "C",
+            "D",
+            "kernel_variant",
+            "padded",
+            "bnc",
+            "epi_n",
+            "ctas",
+            "w_slots",
+            "s_stages",
+            "split",
+            "store_warps",
+            "epi_groups",
+        ),
+        # A padded image also loads x one row chunk at a time through its x_chunk map.
+        sm90=_Sm90Spec(
+            "enabled", ("x", "w_proj", "w_gate", "a", "b"), ranks=(2, 2, 2, 3, 3), optional=(("x_chunk", 3),)
+        ),
+        # x loads dense rows (rank 3) or, padded, row chunks (rank 4). K1_B0 stores both plane sets through one
+        # planes map; K1_B1 stores a and b apart, rank 3 dense and rank 4 padded.
+        sm100=_Sm100Spec(
+            "enabled",
+            ("x", "w_proj", "w_gate"),
+            clusters=True,
+            ranks=((3, 4), 2, 2),
+            optional=(("planes", 4), ("a", (3, 4)), ("b", (3, 4))),
+        ),
+    ),
+    "trimul_kf_k2": _FamilySpec(
+        fields=(
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("outgoing", _BOOL, "bool outgoing;"),
+            # N of the configs' K2_<N>.
+            _Field("kernel_variant", _INDEX, "std::int32_t kernel_variant;"),
+            _Field("tile_m", _POSITIVE, "std::uint32_t tile_m;", suffix="U"),
+            _Field("tile_n", _POSITIVE, "std::uint32_t tile_n;", suffix="U"),
+            _Field("cluster_m", _POSITIVE, "std::uint32_t cluster_m;", suffix="U"),
+            _Field("defer_kmin", _COUNT, "std::uint32_t defer_kmin;", suffix="U"),
+            _Field("split_epi", _BOOL, "bool split_epi;"),
+            _Field("num_threads", _POSITIVE, "std::uint32_t num_threads;", suffix="U"),
+            # Every image published before the dynamic schedule ran its tile's static round-robin.
+            _Field("dynamic", _BOOL, "bool dynamic;", default=False),
+            # The SM100 tile's CTAs (K2_B0) or CTA pairs (K2_B1) per cluster along N, whether K2_B1 schedules by
+            # cluster launch control, and K2_B2's tail width; 0 and false in every other image, including all
+            # published before them.
+            _Field("cluster_n", _COUNT, "std::uint32_t cluster_n;", suffix="U", default=0),
+            _Field("clc", _BOOL, "bool clc;", default=False),
+            _Field("tail_w", _COUNT, "std::uint32_t tail_w;", suffix="U", default=0),
+        ),
+        runtime_key=(
+            "is_bfloat16",
+            "outgoing",
+            "kernel_variant",
+            "tile_n",
+            "cluster_m",
+            "defer_kmin",
+            "split_epi",
+            "dynamic",
+            "cluster_n",
+            "clc",
+            "tail_w",
+        ),
+        sm90=_Sm90Spec("enabled", ("a", "b", "prod"), rank=3),
+        # K2_B2 also loads its narrow tails of b (b_tail) and of a (a_tail), b in a's place (b_as_a), and stores
+        # the transposed product (prod_t).
+        sm100=_Sm100Spec(
+            "enabled",
+            ("a", "b", "prod"),
+            rank=3,
+            clusters=True,
+            optional=(("b_tail", 3), ("a_tail", 3), ("b_as_a", 3), ("prod_t", 3)),
+        ),
+    ),
+    "trimul_kf_k3": _FamilySpec(
+        fields=(
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("C", _POSITIVE, "std::int32_t C;"),
+            _Field("D", _POSITIVE, "std::int32_t D;"),
+            # N of the configs' K3_<N>.
+            _Field("kernel_variant", _INDEX, "std::int32_t kernel_variant;"),
+            _Field("residual", _BOOL, "bool residual;"),
+            _Field("num_threads", _POSITIVE, "std::uint32_t num_threads;", suffix="U"),
+            # Every image published before the ping-pong variants streamed 128-row tiles.
+            _Field("tile_m", _POSITIVE, "std::uint32_t tile_m;", suffix="U", default=128),
+            # Every image published before the ping-pong variants covered a tile's columns in one CTA.
+            _Field("tile_ctas", _POSITIVE, "std::uint32_t tile_ctas;", suffix="U", default=1),
+            # Whether the image reads K1's row statistics. Of the images published before the field,
+            # K3_1, K3_3 and K3_4 did; any later variant's image carries it.
+            _Field(
+                "reads_stats",
+                _BOOL,
+                "bool reads_stats;",
+                default_by=("kernel_variant", ((0, False), (1, True), (2, False), (3, True), (4, True))),
+            ),
+            # Every image published before the pitched product read a dense one.
+            _Field("pitched", _BOOL, "bool pitched;", default=False),
+        ),
+        runtime_key=("is_bfloat16", "C", "D", "kernel_variant", "residual", "pitched"),
+        # A weights-resident image stores its output from registers and records no output map. A pitched image
+        # reads the product as (N, D, N, B) and x, and stores the output, as (N, C, B * N).
+        sm90=_Sm90Spec(
+            "enabled", ("prod", "x", "w_out", "w_gate"), ranks=((3, 4), (2, 3), 2, 2), optional=(("output", (2, 3)),)
+        ),
+        # The SM100 images read a dense (N * N, D, B) product and (N * N, C, B) x, and store the output the same way.
+        sm100=_Sm100Spec("enabled", ("prod", "x", "w_out", "w_gate", "output"), clusters=True, ranks=(3, 3, 2, 2, 3)),
+    ),
+    # The SM90 image loads with cp.async, not TMA, so neither ABI records tensor maps.
+    "window_attention": _FamilySpec(
+        fields=(
+            _Field("is_bfloat16", _BOOL, "bool is_bfloat16;"),
+            _Field("head_dim", _POSITIVE, "std::int32_t head_dim;"),
+            _Field("n_queries", _POSITIVE, "std::int32_t n_queries;"),
+            _Field("n_keys", _POSITIVE, "std::int32_t n_keys;"),
+            _Field("num_threads", _POSITIVE, "std::uint32_t num_threads;", suffix="U"),
+        ),
+        runtime_key=("is_bfloat16", "head_dim", "n_queries", "n_keys"),
+    ),
+}
+
+# Public tuning aliases are index records, not launch metadata: each family
+# declares its own key set, and two carry a "everything else" sentinel form.
+_PUBLIC_ALIAS_FIELDS: dict[str, tuple[tuple[str, int | None], ...]] = {
+    "adaln_layernorm_sigmoid": (("feature_dim", 1), ("num_threads", 1)),
+    "dual_gemm_x0_x1": (
+        ("K", 1),
+        ("K1", 1),
+        ("N", 1),
+        ("has_bias", None),
+        ("fused_residual", None),
+    ),
+    "dual_gemm_x_x": (("N", 1), ("bucket", 0)),
+    "gated_sigmoid": (("K", 1), ("N", 1), ("m_bucket", 0)),
+    "outer_product_mean": (("N", 1), ("S", 1)),
+    "pair_weighted_averaging": (("n_anchor", 1), ("s_anchor", 1)),
+    "pairwise_attention": (("head_dim", 1), ("packed", None)),
+    "transition_mlp": (
+        ("width", 1),
+        ("hidden", 1),
+        ("bucket", 0),
+        ("is_silu_gate", None),
+        ("is_three_way", None),
+        ("has_bias", None),
+        ("has_mask", None),
+        ("has_residual", None),
+    ),
+    "transition_mlp_w_norm": (("width", 1), ("hidden", 1), ("is_silu_gate", None)),
+    "conditioned_transition_mlp": (
+        ("width", 1),
+        ("hidden", 1),
+        ("is_three_way", None),
+        ("cond_stage", None),
+        ("samples", 0),
+    ),
+    "triangle_attention": (("head_dim", 1), ("packed", None)),
+    "attn_epilogue": (
+        ("heads", 1),
+        ("head_dim", 1),
+        ("channels", 1),
+        ("has_bias", None),
+        ("has_output_gate", None),
+    ),
+    "trimul_kf_k1": (("C", 1), ("D", 1), ("bucket", 1)),
+    "trimul_kf_k2": (("D", 1), ("bucket", 1), ("outgoing", None)),
+    "trimul_kf_k3": (("C", 1), ("D", 1), ("bucket", 1), ("residual", None)),
+    "window_attention": (("head_dim", 1), ("n_queries", 1), ("n_keys", 1)),
+}
+# Implementation changes must remain buildable with the last protected artifact
+# corpus. The previous dual-GEMM index predates asymmetric K1: public aliases
+# omit it, and runtime_metadata has no K1 (K1 defaults to K via default_from).
+# After that default, K1 is a runtime-dispatch axis for the asymmetric tunings.
+_PUBLIC_LEGACY_ALIAS_FIELDS = {
+    "dual_gemm_x0_x1": (
+        (("K", 1), ("K1", 1), ("N", 1), ("has_bias", None)),
+        (("K", 1), ("N", 1), ("has_bias", None)),
+    ),
+    # The ReLU-only images name no activation.
+    "transition_mlp_w_norm": ((("width", 1), ("hidden", 1)),),
+}
+_PUBLIC_ALIAS_SENTINELS = {"gated_sigmoid": "fallback_tile", "outer_product_mean": "default_config"}
+_DTYPE_CODES = {"fp16": 0, "bf16": 1, "fp32": 2}
+
+_TMA_DATA_TYPE = {
+    "float16": "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+    "bfloat16": "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
+}
+_TMA_INTERLEAVE = {"none": "CU_TENSOR_MAP_INTERLEAVE_NONE"}
+_TMA_SWIZZLE = {
+    "none": "CU_TENSOR_MAP_SWIZZLE_NONE",
+    "32b": "CU_TENSOR_MAP_SWIZZLE_32B",
+    "64b": "CU_TENSOR_MAP_SWIZZLE_64B",
+    "128b": "CU_TENSOR_MAP_SWIZZLE_128B",
+}
+_TMA_L2_PROMOTION = {"128b": "CU_TENSOR_MAP_L2_PROMOTION_L2_128B"}
+_TMA_OOB_FILL = {"none": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE"}
+_CLUSTER_POLICY = {"default": "CU_CLUSTER_SCHEDULING_POLICY_DEFAULT"}
+
+
+class MaterializationError(RuntimeError):
+    """A public index, pack, image, or generated-output validation failed."""
+
+
+@dataclass(frozen=True)
+class MaterializationResult:
+    """Location of one complete content-addressed materialization."""
+
+    fingerprint: str
+    output_dir: Path
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    """Summary of source-independent index and pack verification."""
+
+    family_count: int
+    pack_count: int
+    variant_count: int
+    image_count: int
+    total_image_bytes: int
+
+
+@dataclass(frozen=True)
+class PackRecord:
+    target_arch: str
+    file: str
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True)
+class ImageRecord:
+    sha256: str
+    size: int
+    pack: str
+
+
+@dataclass(frozen=True)
+class VariantRecord:
+    variant_id: str
+    target_sm: int
+    target_arch: str
+    kernel_sm: int
+    launch_abi: str
+    supported_sms: tuple[int, ...]
+    dtype: str
+    runtime_metadata: dict[str, object]
+    kernel_symbol: str
+    image: ImageRecord
+
+
+@dataclass(frozen=True)
+class FamilyIndex:
+    family: str
+    path: Path
+    raw_bytes: bytes
+    compile_fingerprint: str
+    packs: tuple[PackRecord, ...]
+    variants: tuple[VariantRecord, ...]
+    shard_paths: tuple[Path, ...]
+
+
+def _fail(message: str) -> NoReturn:
+    raise MaterializationError(message)
+
+
+def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            _fail(f"JSON object contains duplicate key {key!r}")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> NoReturn:
+    _fail(f"JSON contains non-finite number {value}")
+
+
+def _as_object(value: object, where: str) -> dict[str, object]:
+    if type(value) is not dict:
+        _fail(f"{where} must be an object")
+    return cast(dict[str, object], value)
+
+
+def _as_list(value: object, where: str) -> list[object]:
+    if type(value) is not list:
+        _fail(f"{where} must be an array")
+    return cast(list[object], value)
+
+
+def _exact_keys(value: Mapping[str, object], expected: frozenset[str] | set[str], where: str) -> None:
+    actual = set(value)
+    if actual != set(expected):
+        _fail(
+            f"{where} has invalid keys: missing={sorted(set(expected) - actual)}, extra={sorted(actual - set(expected))}"
+        )
+
+
+def _string(value: object, where: str, *, maximum: int = 4096) -> str:
+    if type(value) is not str or not value or len(value) > maximum:
+        _fail(f"{where} must be a non-empty string of at most {maximum} characters")
+    result = cast(str, value)
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in result):
+        _fail(f"{where} contains a control character")
+    return result
+
+
+def _integer(value: object, where: str, *, minimum: int = 0, maximum: int = _INT32_MAX) -> int:
+    if type(value) is not int or not minimum <= cast(int, value) <= maximum:
+        _fail(f"{where} must be an integer in [{minimum}, {maximum}]")
+    return cast(int, value)
+
+
+def _boolean(value: object, where: str) -> bool:
+    if type(value) is not bool:
+        _fail(f"{where} must be a boolean")
+    return cast(bool, value)
+
+
+def _integer_array(
+    value: object,
+    where: str,
+    *,
+    length: int | None = None,
+    minimum: int = 0,
+    maximum: int = _UINT32_MAX,
+) -> tuple[int, ...]:
+    raw = _as_list(value, where)
+    if length is not None and len(raw) != length:
+        _fail(f"{where} must contain exactly {length} integers")
+    return tuple(
+        _integer(item, f"{where}[{index}]", minimum=minimum, maximum=maximum) for index, item in enumerate(raw)
+    )
+
+
+def _json_bytes(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _content_id(value: object) -> str:
+    return hashlib.sha256(_json_bytes(value)).hexdigest()
+
+
+def _read_index(path: Path) -> tuple[dict[str, object], bytes]:
+    if path.is_symlink():
+        _fail(f"CUBIN index must not be a symlink: {path}")
+    try:
+        stat = path.stat()
+    except OSError as error:
+        raise MaterializationError(f"cannot stat CUBIN index {path}: {error}") from error
+    if not path.is_file() or stat.st_size > _MAX_INDEX_BYTES:
+        _fail(f"CUBIN index is not a regular file or exceeds {_MAX_INDEX_BYTES} bytes: {path}")
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw, object_pairs_hook=_strict_object, parse_constant=_reject_json_constant)
+    except MaterializationError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MaterializationError(f"cannot read valid JSON from {path}: {error}") from error
+    if not raw.endswith(b"\n"):
+        _fail(f"CUBIN index must end with a newline: {path}")
+    return _as_object(value, str(path)), raw
+
+
+def _validate_tma_descriptor(value: object, where: str, dtype: str, rank: int | tuple[int, ...]) -> dict[str, object]:
+    descriptor = _as_object(value, where)
+    _exact_keys(
+        descriptor,
+        {
+            "data_type",
+            "rank",
+            "global_dim_order",
+            "box_dims",
+            "element_strides",
+            "interleave",
+            "swizzle",
+            "l2_promotion",
+            "oob_fill",
+        },
+        where,
+    )
+    accepted = rank if isinstance(rank, tuple) else (rank,)
+    rank = _integer(descriptor["rank"], f"{where}.rank", minimum=1, maximum=5)
+    if rank not in accepted:
+        _fail(f"{where}.rank must be {accepted[0] if len(accepted) == 1 else f'one of {list(accepted)}'}")
+    expected_dtype = "bfloat16" if dtype == "bf16" else "float16"
+    if _string(descriptor["data_type"], f"{where}.data_type") != expected_dtype:
+        _fail(f"{where}.data_type does not match dtype {dtype}")
+    order = _integer_array(descriptor["global_dim_order"], f"{where}.global_dim_order", length=rank)
+    if sorted(order) != list(range(rank)):
+        _fail(f"{where}.global_dim_order must be a permutation of [0, {rank})")
+    _integer_array(descriptor["box_dims"], f"{where}.box_dims", length=rank, minimum=1)
+    _integer_array(descriptor["element_strides"], f"{where}.element_strides", length=rank, minimum=1)
+    for key, values in (
+        ("data_type", _TMA_DATA_TYPE),
+        ("interleave", _TMA_INTERLEAVE),
+        ("swizzle", _TMA_SWIZZLE),
+        ("l2_promotion", _TMA_L2_PROMOTION),
+        ("oob_fill", _TMA_OOB_FILL),
+    ):
+        if _string(descriptor[key], f"{where}.{key}") not in values:
+            _fail(f"{where}.{key} has an unsupported value")
+    return descriptor
+
+
+def _validate_sm90_launch(spec: _Sm90Spec, value: object, where: str, dtype: str, kernel_sm: int) -> None:
+    if kernel_sm != 90:
+        if value is not None:
+            _fail(f"{where} must be null for a non-SM90 kernel ABI")
+        return
+    if value is None:
+        _fail(f"{where} is required for an SM90 kernel ABI")
+    launch = _as_object(value, where)
+    expected_keys = {"block_dims", "cluster_dims", "cluster_scheduling_policy", "tma_descriptors"}
+    if spec.epi_tile:
+        expected_keys.add("epi_tile")
+    _exact_keys(launch, expected_keys, where)
+    block = _integer_array(launch["block_dims"], f"{where}.block_dims", length=3, minimum=1)
+    if block[0] * block[1] * block[2] > 1024:
+        _fail(f"{where}.block_dims exceeds 1024 threads")
+    _integer_array(launch["cluster_dims"], f"{where}.cluster_dims", length=3, minimum=1)
+    if _string(launch["cluster_scheduling_policy"], f"{where}.cluster_scheduling_policy") not in _CLUSTER_POLICY:
+        _fail(f"{where}.cluster_scheduling_policy is unsupported")
+    if spec.epi_tile:
+        _integer_array(launch["epi_tile"], f"{where}.epi_tile", length=2, minimum=1)
+    descriptors = _as_object(launch["tma_descriptors"], f"{where}.tma_descriptors")
+    recorded_optional = set(descriptors) & {name for name, _ in spec.optional}
+    _exact_keys(descriptors, set(spec.operands) | recorded_optional, f"{where}.tma_descriptors")
+    ranks = spec.ranks or (spec.rank,) * len(spec.operands)
+    for name, rank in (*zip(spec.operands, ranks, strict=True), *spec.optional):
+        if name in descriptors:
+            _validate_tma_descriptor(descriptors[name], f"{where}.tma_descriptors.{name}", dtype, rank)
+
+
+def _validate_sm100_launch(
+    spec: _Sm100Spec, value: object, where: str, dtype: str, kernel_sm: int, launch_abi: str
+) -> None:
+    if kernel_sm != 100:
+        if value is not None:
+            _fail(f"{where} must be null for a non-SM100 kernel ABI")
+        return
+    if value is None:
+        _fail(f"{where} is required for an SM100 kernel ABI")
+    launch = _as_object(value, where)
+    expected_keys = {"block_dims", "tma_descriptors"}
+    if spec.clusters:
+        expected_keys |= {"cluster_dims", "cluster_scheduling_policy"}
+    _exact_keys(launch, expected_keys, where)
+    block = _integer_array(launch["block_dims"], f"{where}.block_dims", length=3, minimum=1)
+    if block[0] * block[1] * block[2] > 1024:
+        _fail(f"{where}.block_dims exceeds 1024 threads")
+    if block[1] != 1 or block[2] != 1:
+        _fail(f"{where}.block_dims must be [num_threads, 1, 1]")
+    cluster = (1, 1, 1)
+    if spec.clusters:
+        cluster = tuple(_integer_array(launch["cluster_dims"], f"{where}.cluster_dims", length=3, minimum=1))
+        if _string(launch["cluster_scheduling_policy"], f"{where}.cluster_scheduling_policy") not in _CLUSTER_POLICY:
+            _fail(f"{where}.cluster_scheduling_policy is unsupported")
+    descriptors = _as_object(launch["tma_descriptors"], f"{where}.tma_descriptors")
+    recorded_optional = set(descriptors) & {name for name, _ in spec.optional}
+    _exact_keys(descriptors, set(spec.operands) | recorded_optional, f"{where}.tma_descriptors")
+    ranks = spec.ranks or (spec.rank,) * len(spec.operands)
+    for name, rank in (*zip(spec.operands, ranks, strict=True), *spec.optional):
+        if name in descriptors:
+            operand_dtype = "f16" if (name, launch_abi) in spec.fp16_operands else dtype
+            _validate_tma_descriptor(descriptors[name], f"{where}.tma_descriptors.{name}", operand_dtype, rank)
+    recorded_ranks = tuple(descriptors[name]["rank"] for name in spec.operands)
+    if spec.kernels and (cluster, recorded_ranks) not in spec.kernels:
+        expected = " or ".join(f"cluster {list(c)} with ranks {list(r)}" for c, r in spec.kernels)
+        _fail(f"{where} pairs cluster {list(cluster)} with ranks {list(recorded_ranks)}; expected {expected}")
+
+
+def _validate_runtime_aliases(value: object, where: str, keys: tuple[str, str]) -> tuple[dict[str, object], ...]:
+    aliases: list[dict[str, object]] = []
+    seen: set[tuple[int, int]] = set()
+    for index, raw in enumerate(_as_list(value, where)):
+        alias = _as_object(raw, f"{where}[{index}]")
+        _exact_keys(alias, set(keys), f"{where}[{index}]")
+        normalized = tuple(_integer(alias[key], f"{where}[{index}].{key}", minimum=0) for key in keys)
+        if normalized in seen:
+            _fail(f"{where} contains duplicate alias {normalized}")
+        seen.add(normalized)
+        aliases.append(alias)
+    if not aliases:
+        _fail(f"{where} must not be empty")
+    if [tuple(alias[key] for key in keys) for alias in aliases] != sorted(
+        tuple(alias[key] for key in keys) for alias in aliases
+    ):
+        _fail(f"{where} must be sorted")
+    return tuple(aliases)
+
+
+def _validate_public_aliases(family: str, aliases: tuple[dict[str, object], ...], where: str) -> None:
+    if not aliases:
+        _fail(f"{where} must not be empty")
+    encoded = [_json_bytes(alias) for alias in aliases]
+    if encoded != sorted(set(encoded)):
+        _fail(f"{where} must be unique and sorted by canonical JSON")
+    candidates = (_PUBLIC_ALIAS_FIELDS[family], *_PUBLIC_LEGACY_ALIAS_FIELDS.get(family, ()))
+    sentinel = _PUBLIC_ALIAS_SENTINELS.get(family)
+    for index, alias in enumerate(aliases):
+        alias_where = f"{where}[{index}]"
+        if sentinel is not None and set(alias) == {sentinel}:
+            if alias[sentinel] is not True:
+                _fail(f"{alias_where}.{sentinel} must be true")
+            continue
+        # Match on this record's own keys rather than the first record's, which
+        # may be a sentinel. Keys matching no candidate fall through to the
+        # family's current schema, so _exact_keys reports them against it.
+        observed = set(alias)
+        fields = next(
+            (candidate for candidate in candidates if observed == {key for key, _ in candidate}),
+            candidates[0],
+        )
+        _exact_keys(alias, {key for key, _ in fields}, alias_where)
+        for key, minimum in fields:
+            if minimum is None:
+                _boolean(alias[key], f"{alias_where}.{key}")
+            else:
+                _integer(alias[key], f"{alias_where}.{key}", minimum=minimum)
+
+
+def _validate_field(field: _Field, metadata: Mapping[str, object], where: str) -> None:
+    at = f"{where}.{field.name}"
+    value = metadata[field.name]
+    if field.kind == _POSITIVE:
+        _integer(value, at, minimum=1, maximum=_UINT32_MAX)
+    elif field.kind == _COUNT:
+        _integer(value, at, maximum=_UINT32_MAX)
+    elif field.kind == _INDEX:
+        _integer(value, at)
+    elif field.kind == _BOOL:
+        _boolean(value, at)
+    elif field.kind == _TEXT:
+        _string(value, at, maximum=1024)
+    elif field.kind == _TRIPLE:
+        _integer_array(value, at, length=3, minimum=1)
+    else:
+        _fail(f"{at} has no validation rule for kind {field.kind!r}")
+
+
+def _apply_metadata_defaults(spec: _FamilySpec, metadata: dict[str, object]) -> None:
+    """Fill fields whose corpus predates them, from a sibling or a constant."""
+    for field in spec.fields:
+        if not field.from_metadata or field.name in metadata:
+            continue
+        if field.default_from is not None:
+            source = field.default_from
+            if source in metadata:
+                metadata[field.name] = metadata[source]
+        elif field.default is not _NO_DEFAULT:
+            metadata[field.name] = field.default
+        elif field.default_by is not None:
+            source, table = field.default_by
+            for key, value in table:
+                if source in metadata and metadata[source] == key:
+                    metadata[field.name] = value
+    # Keep an implementation change buildable against the previous family
+    # corpus. Old triangle-attention images have no native-SM100 record.
+    if spec.sm100 is not None and "sm100_launch" not in metadata:
+        metadata["sm100_launch"] = None
+
+
+def _validate_metadata(family: str, variant: VariantRecord, where: str) -> None:
+    spec = _FAMILY_SPECS[family]
+    metadata = variant.runtime_metadata
+    _apply_metadata_defaults(spec, metadata)
+    _exact_keys(metadata, _COMMON_METADATA | spec.metadata_keys, where)
+    _integer(metadata["dynamic_smem_bytes"], f"{where}.dynamic_smem_bytes", maximum=_UINT32_MAX)
+    non_portable = _boolean(metadata["non_portable_cluster_size_allowed"], f"{where}.non_portable_cluster_size_allowed")
+    if non_portable and variant.kernel_sm not in {90, 100}:
+        _fail(f"{where}.non_portable_cluster_size_allowed requires an SM90 or SM100 kernel ABI")
+    if spec.sm100 is not None and variant.kernel_sm == 100 and not non_portable:
+        _fail(f"{where}.non_portable_cluster_size_allowed is required for an SM100 kernel ABI")
+
+    # Every family states its dtype twice: once as the variant's own dtype and
+    # once inside the launch metadata the kernel was compiled with.
+    if spec.dtype_key == "dtype_name":
+        if _string(metadata["dtype_name"], f"{where}.dtype_name") != variant.dtype:
+            _fail(f"{where}.dtype_name disagrees with variant dtype")
+    elif _boolean(metadata["is_bfloat16"], f"{where}.is_bfloat16") != (variant.dtype == "bf16"):
+        _fail(f"{where}.is_bfloat16 disagrees with variant dtype")
+
+    for field in spec.fields:
+        if field.from_metadata:
+            _validate_field(field, metadata, where)
+    if spec.alias is not None:
+        _validate_runtime_aliases(metadata["runtime_aliases"], f"{where}.runtime_aliases", spec.alias.keys)
+    if spec.sm90 is not None:
+        _validate_sm90_launch(
+            spec.sm90, metadata["sm90_launch"], f"{where}.sm90_launch", variant.dtype, variant.kernel_sm
+        )
+    if spec.sm100 is not None:
+        _validate_sm100_launch(
+            spec.sm100,
+            metadata["sm100_launch"],
+            f"{where}.sm100_launch",
+            variant.dtype,
+            variant.kernel_sm,
+            variant.launch_abi,
+        )
+    if "num_threads" in metadata and cast(int, metadata["num_threads"]) > 1024:
+        _fail(f"{where}.num_threads exceeds 1024")
+
+
+def _runtime_keys(family: str, variant: VariantRecord) -> tuple[tuple[object, ...], ...]:
+    """Return every (sm, axes...) tuple this variant claims at run time.
+
+    A key naming an alias axis expands to one key per alias, which is how the
+    aliasing families cover the anchors a single image serves.
+    """
+    spec = _FAMILY_SPECS[family]
+    metadata = variant.runtime_metadata
+    aliases = cast(
+        "list[dict[str, object]]",
+        metadata["runtime_aliases"] if spec.alias is not None else [{}],
+    )
+
+    def value(token: str, alias: Mapping[str, object], mask_override: bool | None) -> object:
+        # A nullable-mask image claims both mask states. Otherwise dual_gemm_x_x keys its images on a
+        # legacy field; transition_mlp's has_mask is an ordinary metadata field.
+        if token == "has_mask" and mask_override is not None:
+            return mask_override
+        if token == "has_mask" and family == "dual_gemm_x_x":
+            return metadata["legacy_has_mask"]
+        raw = alias[token[1:]] if token.startswith("@") else metadata[token]
+        return tuple(cast("list[object]", raw)) if isinstance(raw, list) else raw
+
+    mask_modes: tuple[bool | None, ...] = (
+        (False, True) if family in _NULLABLE_MASK_FAMILIES and variant.launch_abi.endswith("_mask_ptr_v1") else (None,)
+    )
+    return tuple(
+        (sm, *(value(token, alias, mask_override) for token in spec.runtime_key))
+        for sm in variant.supported_sms
+        for alias in aliases
+        for mask_override in mask_modes
+    )
+
+
+def _parse_executable(
+    family: str,
+    executable_id: str,
+    value: object,
+    kernel_symbols: Mapping[str, str],
+    sm90_launches: Mapping[str, object],
+    where: str,
+) -> dict[str, object]:
+    raw = _as_object(value, where)
+    required = {
+        "image_sha256",
+        "image_size",
+        "target_sm",
+        "target_arch",
+        "kernel_sm",
+        "launch_abi",
+        "dtype",
+        "kernel_symbol",
+        "dynamic_smem_bytes",
+    }
+    optional = {"supported_sms", "non_portable_cluster_size_allowed", "sm90_launch"}
+    if not required.issubset(raw) or not set(raw).issubset(required | optional):
+        _fail(f"{where} keys differ: required {sorted(required)}, optional {sorted(optional)}, got {sorted(raw)}")
+    if _content_id(raw) != executable_id:
+        _fail(f"{where} content does not match executable ID {executable_id}")
+    image_hash = _string(raw["image_sha256"], f"{where}.image_sha256", maximum=64)
+    if _HEX64_RE.fullmatch(image_hash) is None:
+        _fail(f"{where}.image_sha256 must be a full lowercase SHA-256")
+    target_sm = _integer(raw["target_sm"], f"{where}.target_sm", minimum=10, maximum=999)
+    target_arch = _string(raw["target_arch"], f"{where}.target_arch", maximum=16)
+    arch_match = _ARCH_RE.fullmatch(target_arch)
+    if arch_match is None or int(arch_match.group("sm")) != target_sm:
+        _fail(f"{where}.target_arch does not encode target_sm {target_sm}")
+    kernel_sm = _integer(raw["kernel_sm"], f"{where}.kernel_sm", minimum=10, maximum=999)
+    launch_abi = _string(raw["launch_abi"], f"{where}.launch_abi", maximum=128)
+    if _ABI_RE.fullmatch(launch_abi) is None or not launch_abi.startswith(family):
+        _fail(f"{where}.launch_abi is not a canonical {family} ABI")
+    supported_sms = _integer_array(
+        raw.get("supported_sms", [target_sm]), f"{where}.supported_sms", minimum=10, maximum=999
+    )
+    if not supported_sms or tuple(sorted(set(supported_sms))) != supported_sms or target_sm not in supported_sms:
+        _fail(f"{where}.supported_sms must be sorted, unique, non-empty, and include target_sm")
+    dtype = _string(raw["dtype"], f"{where}.dtype", maximum=8)
+    if dtype not in _DTYPES[family]:
+        _fail(f"{where}.dtype {dtype!r} is unsupported for {family}")
+    symbol_id = _string(raw["kernel_symbol"], f"{where}.kernel_symbol", maximum=64)
+    if symbol_id not in kernel_symbols:
+        _fail(f"{where}.kernel_symbol references an unknown symbol")
+    launch_id = raw.get("sm90_launch")
+    if launch_id is not None:
+        launch_id = _string(launch_id, f"{where}.sm90_launch", maximum=64)
+        if launch_id not in sm90_launches:
+            _fail(f"{where}.sm90_launch references unknown metadata")
+    return {
+        "target_sm": target_sm,
+        "target_arch": target_arch,
+        "kernel_sm": kernel_sm,
+        "launch_abi": launch_abi,
+        "supported_sms": supported_sms,
+        "dtype": dtype,
+        "kernel_symbol": kernel_symbols[symbol_id],
+        "dynamic_smem_bytes": _integer(raw["dynamic_smem_bytes"], f"{where}.dynamic_smem_bytes", maximum=_UINT32_MAX),
+        "non_portable_cluster_size_allowed": _boolean(
+            raw.get("non_portable_cluster_size_allowed", False), f"{where}.non_portable_cluster_size_allowed"
+        ),
+        "sm90_launch": None if launch_id is None else sm90_launches[launch_id],
+        "image": ImageRecord(
+            sha256=image_hash,
+            size=_integer(raw["image_size"], f"{where}.image_size", minimum=4, maximum=_MAX_IMAGE_BYTES),
+            pack=target_arch,
+        ),
+    }
+
+
+def _parse_variant(
+    family: str, value: object, executables: Mapping[str, dict[str, object]], where: str
+) -> VariantRecord:
+    raw = _as_object(value, where)
+    _exact_keys(raw, {"variant_id", "executable", "runtime_metadata"}, where)
+    variant_id = _string(raw["variant_id"], f"{where}.variant_id", maximum=20)
+    if _HEX20_RE.fullmatch(variant_id) is None:
+        _fail(f"{where}.variant_id must be 20 lowercase hexadecimal characters")
+    executable_id = _string(raw["executable"], f"{where}.executable", maximum=64)
+    if executable_id not in executables:
+        _fail(f"{where}.executable references an unknown executable")
+    executable = executables[executable_id]
+    runtime_metadata = _as_object(raw["runtime_metadata"], f"{where}.runtime_metadata")
+    if family == "dual_gemm_x_x" and "has_mask" in runtime_metadata:
+        if "legacy_has_mask" in runtime_metadata:
+            _fail(f"{where}.runtime_metadata repeats legacy mask metadata")
+        runtime_metadata["legacy_has_mask"] = runtime_metadata.pop("has_mask")
+    moved = {
+        "dynamic_smem_bytes",
+        "non_portable_cluster_size_allowed",
+        "sm90_launch",
+        "is_bfloat16",
+        "dtype_name",
+    }
+    if moved & set(runtime_metadata):
+        _fail(f"{where}.runtime_metadata repeats executable metadata")
+    runtime_metadata.update(
+        {
+            "dynamic_smem_bytes": executable["dynamic_smem_bytes"],
+            "non_portable_cluster_size_allowed": executable["non_portable_cluster_size_allowed"],
+        }
+    )
+    spec = _FAMILY_SPECS[family]
+    dtype = cast(str, executable["dtype"])
+    runtime_metadata[spec.dtype_key] = dtype if spec.dtype_key == "dtype_name" else dtype == "bf16"
+    if spec.sm90 is not None:
+        runtime_metadata["sm90_launch"] = executable["sm90_launch"]
+    variant = VariantRecord(
+        variant_id=variant_id,
+        target_sm=cast(int, executable["target_sm"]),
+        target_arch=cast(str, executable["target_arch"]),
+        kernel_sm=cast(int, executable["kernel_sm"]),
+        launch_abi=cast(str, executable["launch_abi"]),
+        supported_sms=cast(tuple[int, ...], executable["supported_sms"]),
+        dtype=dtype,
+        runtime_metadata=runtime_metadata,
+        kernel_symbol=cast(str, executable["kernel_symbol"]),
+        image=cast(ImageRecord, executable["image"]),
+    )
+    _validate_metadata(family, variant, f"{where}.runtime_metadata")
+    return variant
+
+
+def _parse_family(expected_family: str, index_path: Path) -> FamilyIndex:
+    if expected_family not in _FAMILIES or _FAMILY_RE.fullmatch(expected_family) is None:
+        _fail(f"unsupported CUBIN family {expected_family!r}")
+    if index_path.is_symlink():
+        _fail(f"CUBIN index must not be a symlink: {index_path}")
+    path = index_path.resolve()
+    root, raw_bytes = _read_index(path)
+    _exact_keys(
+        root,
+        {
+            "format",
+            "family",
+            "registry_version",
+            "compile_fingerprint",
+            "toolchain",
+            "packs",
+            "shards",
+        },
+        str(path),
+    )
+    if root["format"] != INDEX_FORMAT:
+        _fail(f"{path}: unsupported format {root['format']!r}; expected {INDEX_FORMAT!r}")
+    family = _string(root["family"], f"{path}.family", maximum=128)
+    if family != expected_family:
+        _fail(f"{path}: family is {family!r}, expected {expected_family!r}")
+    registry_version = _integer(root["registry_version"], f"{path}.registry_version", minimum=0)
+    if registry_version != REGISTRY_VERSION:
+        _fail(f"{path}: unsupported registry_version {registry_version}; expected {REGISTRY_VERSION}")
+    compile_fingerprint = _string(root["compile_fingerprint"], f"{path}.compile_fingerprint", maximum=64)
+    if _HEX64_RE.fullmatch(compile_fingerprint) is None:
+        _fail(f"{path}.compile_fingerprint must be a full lowercase SHA-256")
+    toolchain = _as_object(root["toolchain"], f"{path}.toolchain")
+    _exact_keys(toolchain, {"nvidia-cutlass-dsl", "compile_environment"}, f"{path}.toolchain")
+    _string(toolchain["nvidia-cutlass-dsl"], f"{path}.toolchain.nvidia-cutlass-dsl", maximum=64)
+    environment = _string(toolchain["compile_environment"], f"{path}.toolchain.compile_environment", maximum=71)
+    if not environment.startswith("sha256:") or _HEX64_RE.fullmatch(environment[7:]) is None:
+        _fail(f"{path}.toolchain.compile_environment must be sha256:<full digest>")
+
+    packs_raw = _as_object(root["packs"], f"{path}.packs")
+    if not packs_raw or list(packs_raw) != sorted(packs_raw):
+        _fail(f"{path}.packs must be non-empty and sorted by target architecture")
+    packs: list[PackRecord] = []
+    for target_arch, pack_value in packs_raw.items():
+        pack_where = f"{path}.packs.{target_arch}"
+        arch_match = _ARCH_RE.fullmatch(target_arch)
+        if arch_match is None:
+            _fail(f"{pack_where} has an invalid target architecture key")
+        pack = _as_object(pack_value, pack_where)
+        _exact_keys(pack, {"sha256", "size"}, pack_where)
+        digest = _string(pack["sha256"], f"{pack_where}.sha256", maximum=64)
+        if _HEX64_RE.fullmatch(digest) is None:
+            _fail(f"{pack_where}.sha256 must be a full lowercase SHA-256")
+        file = f"packs/{family}_{target_arch.replace('_', '')}_{digest}.tar.xz"
+        packs.append(
+            PackRecord(
+                target_arch=target_arch,
+                file=file,
+                sha256=digest,
+                size=_integer(pack["size"], f"{pack_where}.size", minimum=1, maximum=_MAX_PACK_BYTES),
+            )
+        )
+
+    kernel_symbols: dict[str, str] = {}
+    sm90_launches: dict[str, object] = {}
+    shards_raw = _as_object(root["shards"], f"{path}.shards")
+    if list(shards_raw) != list(_SHARD_DIGITS):
+        _fail(f"{path}.shards must contain all hexadecimal partitions in order")
+    executables: dict[str, dict[str, object]] = {}
+    referenced_symbol_ids: set[str] = set()
+    referenced_launch_ids: set[str] = set()
+    variants_raw: list[object] = []
+    shard_paths: list[Path] = []
+    shard_documents: list[tuple[str, Path, dict[str, object]]] = []
+    aggregate = bytearray(raw_bytes)
+    for digit, value in shards_raw.items():
+        shard_where = f"{path}.shards.{digit}"
+        record = _as_object(value, shard_where)
+        _exact_keys(record, {"sha256", "size"}, shard_where)
+        digest = _string(record["sha256"], f"{shard_where}.sha256", maximum=64)
+        if _HEX64_RE.fullmatch(digest) is None:
+            _fail(f"{shard_where}.sha256 must be a full lowercase SHA-256")
+        size = _integer(record["size"], f"{shard_where}.size", minimum=1, maximum=_MAX_INDEX_BYTES)
+        shard_path = path.parent / "records" / f"{digit}_{digest}.json"
+        shard, shard_bytes = _read_index(shard_path)
+        if len(shard_bytes) != size or hashlib.sha256(shard_bytes).hexdigest() != digest:
+            _fail(f"{shard_path} does not match its index record")
+        _exact_keys(shard, {"kernel_symbols", "sm90_launches", "executables", "variants"}, str(shard_path))
+        symbols = _as_object(shard["kernel_symbols"], f"{shard_path}.kernel_symbols")
+        launches = _as_object(shard["sm90_launches"], f"{shard_path}.sm90_launches")
+        if list(symbols) != sorted(symbols) or list(launches) != sorted(launches):
+            _fail(f"{shard_path} content-addressed tables must be sorted")
+        for symbol_id, symbol_value in symbols.items():
+            symbol = _string(symbol_value, f"{shard_path}.kernel_symbols.{symbol_id}", maximum=512)
+            if (
+                not symbol_id.startswith(digit)
+                or _HEX64_RE.fullmatch(symbol_id) is None
+                or _content_id(symbol) != symbol_id
+                or _SYMBOL_RE.fullmatch(symbol) is None
+            ):
+                _fail(f"{shard_path}.kernel_symbols.{symbol_id} is not canonical")
+            kernel_symbols[symbol_id] = symbol
+        for launch_id, launch_value in launches.items():
+            if (
+                not launch_id.startswith(digit)
+                or _HEX64_RE.fullmatch(launch_id) is None
+                or _content_id(launch_value) != launch_id
+            ):
+                _fail(f"{shard_path}.sm90_launches.{launch_id} is not canonical")
+            sm90_launches[launch_id] = launch_value
+        shard_documents.append((digit, shard_path, shard))
+        shard_paths.append(shard_path)
+        aggregate.extend(len(shard_bytes).to_bytes(8, "big"))
+        aggregate.extend(shard_bytes)
+
+    for digit, shard_path, shard in shard_documents:
+        for executable_id, executable_value in _as_object(shard["executables"], f"{shard_path}.executables").items():
+            if (
+                _HEX64_RE.fullmatch(executable_id) is None
+                or not executable_id.startswith(digit)
+                or executable_id in executables
+            ):
+                _fail(f"{shard_path} contains a misplaced or duplicate executable {executable_id}")
+            raw_executable = _as_object(executable_value, f"{shard_path}.executables.{executable_id}")
+            referenced_symbol_ids.add(cast(str, raw_executable.get("kernel_symbol")))
+            if raw_executable.get("sm90_launch") is not None:
+                referenced_launch_ids.add(cast(str, raw_executable["sm90_launch"]))
+            executables[executable_id] = _parse_executable(
+                family,
+                executable_id,
+                executable_value,
+                kernel_symbols,
+                sm90_launches,
+                f"{shard_path}.executables.{executable_id}",
+            )
+        shard_variants = _as_list(shard["variants"], f"{shard_path}.variants")
+        if any(
+            not isinstance(item, dict) or not str(item.get("variant_id", "")).startswith(digit)
+            for item in shard_variants
+        ):
+            _fail(f"{shard_path} contains a misplaced variant")
+        variants_raw.extend(shard_variants)
+    if not variants_raw or len(variants_raw) > _MAX_FAMILY_IMAGES:
+        _fail(f"{path}.variants must contain between 1 and {_MAX_FAMILY_IMAGES} entries")
+    variants = tuple(
+        _parse_variant(family, value, executables, f"{path}.variants[{index}]")
+        for index, value in enumerate(variants_raw)
+    )
+    variant_ids = tuple(variant.variant_id for variant in variants)
+    if tuple(sorted(set(variant_ids))) != variant_ids:
+        _fail(f"{path}.variants must be sorted by unique variant_id")
+
+    pack_by_arch = {pack.target_arch: pack for pack in packs}
+    referenced: dict[str, set[str]] = {target_arch: set() for target_arch in pack_by_arch}
+    runtime_keys: set[tuple[object, ...]] = set()
+    for variant in variants:
+        if variant.target_arch not in pack_by_arch:
+            _fail(f"{path}: variant {variant.variant_id} references undeclared pack {variant.target_arch}")
+        referenced[variant.target_arch].add(variant.image.sha256)
+        for key in _runtime_keys(family, variant):
+            if key in runtime_keys:
+                _fail(f"{path}: multiple variants resolve to runtime key {key}")
+            runtime_keys.add(key)
+    referenced_executables = {
+        _string(_as_object(value, "variant")["executable"], "variant.executable", maximum=64) for value in variants_raw
+    }
+    if referenced_executables != set(executables):
+        _fail(f"{path} contains unreferenced executables")
+    if referenced_symbol_ids != set(kernel_symbols):
+        _fail(f"{path} contains unreferenced kernel symbols")
+    if referenced_launch_ids != set(sm90_launches):
+        _fail(f"{path} contains unreferenced SM90 launch records")
+    return FamilyIndex(family, path, bytes(aggregate), compile_fingerprint, tuple(packs), variants, tuple(shard_paths))
+
+
+def _load_families(family_indexes: Sequence[tuple[str, Path]]) -> tuple[FamilyIndex, ...]:
+    if not family_indexes:
+        _fail("at least one family index is required")
+    normalized: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for family, path in family_indexes:
+        if not isinstance(family, str) or not isinstance(path, Path):
+            raise TypeError("family_indexes entries must be (str, pathlib.Path)")
+        if family in seen:
+            _fail(f"duplicate family index argument {family!r}")
+        seen.add(family)
+        normalized.append((family, path))
+    return tuple(_parse_family(family, path) for family, path in sorted(normalized))
+
+
+def _global_images(families: Sequence[FamilyIndex]) -> dict[str, int]:
+    images: dict[str, int] = {}
+    for family in families:
+        for variant in family.variants:
+            previous = images.setdefault(variant.image.sha256, variant.image.size)
+            if previous != variant.image.size:
+                _fail(
+                    f"image {variant.image.sha256} has inconsistent indexed sizes {previous} and {variant.image.size}"
+                )
+    return images
+
+
+def _expected_pack_images(family: FamilyIndex, target_arch: str) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for variant in family.variants:
+        if variant.image.pack != target_arch:
+            continue
+        previous = result.setdefault(variant.image.sha256, variant.image.size)
+        if previous != variant.image.size:
+            _fail(f"{family.path}: image {variant.image.sha256} has inconsistent sizes within one pack")
+    return result
+
+
+def _pack_path(family: FamilyIndex, pack: PackRecord) -> Path:
+    packs_dir = family.path.parent / "packs"
+    if packs_dir.is_symlink():
+        _fail(f"pack directory must not be a symlink: {packs_dir}")
+    path = family.path.parent / PurePosixPath(pack.file)
+    if path.parent != packs_dir or path.name != PurePosixPath(pack.file).name:
+        _fail(f"pack path is not a canonical direct child of packs/: {pack.file}")
+    return path
+
+
+def _verify_exact_pack_set(family: FamilyIndex) -> None:
+    """Require the family pack directory to contain only indexed packs."""
+    packs_dir = family.path.parent / "packs"
+    if packs_dir.is_symlink() or not packs_dir.is_dir():
+        _fail(f"pack directory must be a regular directory: {packs_dir}")
+    expected = {PurePosixPath(pack.file).name for pack in family.packs}
+    try:
+        entries = list(packs_dir.iterdir())
+    except OSError as error:
+        raise MaterializationError(f"cannot inspect CUBIN pack directory {packs_dir}: {error}") from error
+    actual = {entry.name for entry in entries}
+    if actual != expected:
+        _fail(
+            f"{packs_dir} does not exactly match its family index: "
+            f"missing={sorted(expected - actual)}, unreferenced={sorted(actual - expected)}"
+        )
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            _fail(f"indexed CUBIN pack must be a regular file: {entry}")
+
+
+def _verify_exact_pack_sets(families: Sequence[FamilyIndex]) -> None:
+    for family in families:
+        _verify_exact_pack_set(family)
+
+
+def _verify_exact_shard_set(family: FamilyIndex) -> None:
+    """Require the record directory to contain only shards named by the index."""
+    records_dir = family.path.parent / "records"
+    if records_dir.is_symlink() or not records_dir.is_dir():
+        _fail(f"record directory must be a regular directory: {records_dir}")
+    expected = {path.name for path in family.shard_paths}
+    try:
+        entries = list(records_dir.iterdir())
+    except OSError as error:
+        raise MaterializationError(f"cannot inspect CUBIN record directory {records_dir}: {error}") from error
+    actual = {entry.name for entry in entries}
+    if actual != expected:
+        _fail(
+            f"{records_dir} does not exactly match its family index: "
+            f"missing={sorted(expected - actual)}, unreferenced={sorted(actual - expected)}"
+        )
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_file():
+            _fail(f"indexed CUBIN record shard must be a regular file: {entry}")
+
+
+def _verify_exact_shard_sets(families: Sequence[FamilyIndex]) -> None:
+    for family in families:
+        _verify_exact_shard_set(family)
+
+
+def _xz_vli(data: bytes, offset: int, limit: int, where: str) -> tuple[int, int]:
+    """Read one canonical XZ variable-length integer."""
+    value = 0
+    for byte_index in range(9):
+        if offset >= limit:
+            _fail(f"{where} contains a truncated XZ variable-length integer")
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << (7 * byte_index)
+        if byte & 0x80 == 0:
+            if byte_index and byte == 0:
+                _fail(f"{where} contains a non-canonical XZ variable-length integer")
+            return value, offset
+    _fail(f"{where} contains an oversized XZ variable-length integer")
+
+
+def _verify_xz_profile(path: Path) -> None:
+    """Validate the decoder-visible, deterministic v1 XZ/LZMA2 profile."""
+    try:
+        with path.open("rb") as stream:
+            stream_header = stream.read(12)
+            if len(stream_header) != 12 or stream_header[:6] != _XZ_MAGIC:
+                _fail(f"{path} has a missing or invalid XZ stream header")
+            if stream_header[6:8] != _XZ_STREAM_FLAGS:
+                _fail(f"{path} does not use the required single-stream XZ CRC64 profile")
+            if int.from_bytes(stream_header[8:12], "little") != zlib.crc32(stream_header[6:8]):
+                _fail(f"{path} has an invalid XZ stream-header CRC")
+
+            encoded_header_size = stream.read(1)
+            if not encoded_header_size or encoded_header_size == b"\0":
+                _fail(f"{path} has no XZ data block")
+            block_header_size = (encoded_header_size[0] + 1) * 4
+            block_header = encoded_header_size + stream.read(block_header_size - 1)
+            if len(block_header) != block_header_size:
+                _fail(f"{path} has a truncated XZ block header")
+            if int.from_bytes(block_header[-4:], "little") != zlib.crc32(block_header[:-4]):
+                _fail(f"{path} has an invalid XZ block-header CRC")
+
+            block_flags = block_header[1]
+            if block_flags & 0x3C or block_flags & 0x03:
+                _fail(f"{path} must use exactly one XZ block filter with no reserved flags")
+            cursor = 2
+            body_end = len(block_header) - 4
+            if block_flags & 0x40:
+                _, cursor = _xz_vli(block_header, cursor, body_end, str(path))
+            if block_flags & 0x80:
+                _, cursor = _xz_vli(block_header, cursor, body_end, str(path))
+            filter_id, cursor = _xz_vli(block_header, cursor, body_end, str(path))
+            properties_size, cursor = _xz_vli(block_header, cursor, body_end, str(path))
+            properties_end = cursor + properties_size
+            if properties_end > body_end:
+                _fail(f"{path} has truncated XZ filter properties")
+            properties = block_header[cursor:properties_end]
+            if filter_id != lzma.FILTER_LZMA2 or properties != _XZ_LZMA2_DICT_PROPERTY_8_MIB:
+                _fail(f"{path} does not use the required LZMA2 8 MiB dictionary profile")
+            if any(block_header[properties_end:body_end]):
+                _fail(f"{path} has nonzero XZ block-header padding")
+
+            stream.seek(-12, os.SEEK_END)
+            footer = stream.read(12)
+            if len(footer) != 12 or footer[10:] != _XZ_FOOTER_MAGIC:
+                _fail(f"{path} has a missing or invalid XZ stream footer")
+            if footer[8:10] != _XZ_STREAM_FLAGS:
+                _fail(f"{path} has inconsistent XZ stream flags")
+            if int.from_bytes(footer[:4], "little") != zlib.crc32(footer[4:10]):
+                _fail(f"{path} has an invalid XZ stream-footer CRC")
+            index_size = (int.from_bytes(footer[4:8], "little") + 1) * 4
+            index_offset = stream.tell() - 12 - index_size
+            if index_offset < 12 + block_header_size:
+                _fail(f"{path} has an invalid XZ index location")
+            stream.seek(index_offset)
+            index = stream.read(index_size)
+            if len(index) != index_size or index[0:1] != b"\0":
+                _fail(f"{path} has a missing or invalid XZ index")
+            if int.from_bytes(index[-4:], "little") != zlib.crc32(index[:-4]):
+                _fail(f"{path} has an invalid XZ index CRC")
+            index_end = len(index) - 4
+            record_count, cursor = _xz_vli(index, 1, index_end, str(path))
+            if record_count != 1:
+                _fail(f"{path} must contain exactly one XZ block")
+            unpadded_size, cursor = _xz_vli(index, cursor, index_end, str(path))
+            uncompressed_size, cursor = _xz_vli(index, cursor, index_end, str(path))
+            if unpadded_size == 0 or uncompressed_size == 0 or any(index[cursor:index_end]):
+                _fail(f"{path} has an invalid or non-canonical XZ index record")
+    except MaterializationError:
+        raise
+    except OSError as error:
+        raise MaterializationError(f"cannot validate XZ profile in {path}: {error}") from error
+
+
+def _verify_compressed_pack(path: Path, pack: PackRecord, maximum_tar_bytes: int) -> None:
+    if path.is_symlink():
+        _fail(f"CUBIN pack must not be a symlink: {path}")
+    try:
+        file_stat = path.stat()
+    except OSError as error:
+        raise MaterializationError(f"cannot stat CUBIN pack {path}: {error}") from error
+    if not path.is_file():
+        _fail(f"CUBIN pack is not a regular file: {path}")
+    try:
+        with path.open("rb") as stream:
+            prefix = stream.read(len(_LFS_PREFIX))
+            if prefix == _LFS_PREFIX:
+                _fail(f"{path} is a Git LFS pointer; run `git lfs pull --include={path}` and retry")
+            if file_stat.st_size != pack.size:
+                _fail(f"{path} compressed size is {file_stat.st_size}, expected {pack.size}")
+            stream.seek(0)
+            digest = hashlib.sha256()
+            compressed_size = 0
+            decompressed_size = 0
+            decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ)
+            while chunk := stream.read(_IO_CHUNK):
+                if decompressor.eof:
+                    _fail(f"{path} contains trailing data or more than one XZ stream")
+                digest.update(chunk)
+                compressed_size += len(chunk)
+                pending = chunk
+                while True:
+                    output = decompressor.decompress(pending, max_length=_IO_CHUNK)
+                    pending = b""
+                    decompressed_size += len(output)
+                    if decompressed_size > min(maximum_tar_bytes, _MAX_TAR_BYTES):
+                        _fail(f"{path} expands beyond its permitted tar size")
+                    if decompressor.eof:
+                        if decompressor.unused_data:
+                            _fail(f"{path} contains trailing data or more than one XZ stream")
+                        break
+                    if decompressor.needs_input:
+                        break
+            if not decompressor.eof:
+                _fail(f"{path} contains a truncated XZ stream")
+            if decompressor.check != lzma.CHECK_CRC64:
+                _fail(f"{path} does not use the required XZ CRC64 integrity check")
+    except MaterializationError:
+        raise
+    except (OSError, EOFError, lzma.LZMAError) as error:
+        raise MaterializationError(f"cannot verify XZ pack {path}: {error}") from error
+    _verify_xz_profile(path)
+    if compressed_size != pack.size:
+        _fail(f"{path} compressed size is {compressed_size}, expected {pack.size}")
+    if digest.hexdigest() != pack.sha256:
+        _fail(f"{path} SHA-256 is {digest.hexdigest()}, expected {pack.sha256}")
+
+
+def _valid_materialized_object(path: Path, expected_hash: str, expected_size: int) -> bool:
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        if path.stat().st_size != expected_size:
+            return False
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while chunk := stream.read(_IO_CHUNK):
+                digest.update(chunk)
+        return digest.hexdigest() == expected_hash
+    except OSError:
+        return False
+
+
+def _read_exact(stream: lzma.LZMAFile, size: int, where: str) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(min(_IO_CHUNK, remaining))
+        if not chunk:
+            _fail(f"{where} is truncated")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _discard_exact(stream: lzma.LZMAFile, size: int, where: str) -> None:
+    remaining = size
+    while remaining:
+        chunk = stream.read(min(_IO_CHUNK, remaining))
+        if not chunk:
+            _fail(f"{where} is truncated")
+        remaining -= len(chunk)
+
+
+def _verify_ustar_layout(path: Path, expected_names: Sequence[str], expected: Mapping[str, int]) -> None:
+    """Reject GNU/PAX headers and any nonzero bytes after the USTAR terminator."""
+    try:
+        with lzma.open(path, "rb", format=lzma.FORMAT_XZ) as stream:
+            for member_index, expected_name in enumerate(expected_names):
+                where = f"{path}:header[{member_index}]"
+                header = _read_exact(stream, tarfile.BLOCKSIZE, where)
+                encoded_name = expected_name.encode()
+                if len(encoded_name) > 100 or header[:100] != encoded_name.ljust(100, b"\0"):
+                    _fail(f"{where} does not contain the expected canonical USTAR name {expected_name!r}")
+                if header[156:157] != tarfile.REGTYPE:
+                    _fail(f"{where} is not an explicit regular-file USTAR header")
+                if header[257:263] != b"ustar\0" or header[263:265] != b"00" or any(header[345:500]):
+                    _fail(f"{where} is not canonical POSIX USTAR")
+                image_hash = PurePosixPath(expected_name).name.removesuffix(".cubin")
+                size = expected[image_hash]
+                padded_size = ((size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+                _discard_exact(stream, size, f"{path}:{expected_name}")
+                padding = _read_exact(stream, padded_size - size, f"{path}:{expected_name}:padding")
+                if any(padding):
+                    _fail(f"{path}:{expected_name} has nonzero USTAR member padding")
+            trailing_size = 0
+            trailing_nonzero = False
+            while chunk := stream.read(_IO_CHUNK):
+                trailing_size += len(chunk)
+                trailing_nonzero = trailing_nonzero or any(chunk)
+    except MaterializationError:
+        raise
+    except (OSError, EOFError, lzma.LZMAError) as error:
+        raise MaterializationError(f"cannot validate raw USTAR layout in {path}: {error}") from error
+    if trailing_size < 2 * tarfile.BLOCKSIZE or trailing_size % tarfile.BLOCKSIZE != 0 or trailing_nonzero:
+        _fail(f"{path} has a missing USTAR terminator or nonzero/truncated bytes after its final member")
+
+
+def _verify_pack_members(
+    path: Path,
+    expected: Mapping[str, int],
+    object_dir: Path | None,
+    installed: set[str],
+) -> None:
+    expected_names = [f"objects/{digest}.cubin" for digest in sorted(expected)]
+    _verify_ustar_layout(path, expected_names, expected)
+    observed: list[str] = []
+    try:
+        with tarfile.open(path, mode="r|xz") as archive:
+            for member_index, member in enumerate(archive):
+                if member_index >= _MAX_FAMILY_IMAGES:
+                    _fail(f"{path} contains too many archive members")
+                where = f"{path}:{member.name}"
+                if member.type != tarfile.REGTYPE or not member.isfile():
+                    _fail(f"{where} is not a canonical regular USTAR member")
+                if member.pax_headers or member.sparse is not None:
+                    _fail(f"{where} contains PAX or sparse metadata")
+                if (
+                    member.mode != 0o444
+                    or member.uid != 0
+                    or member.gid != 0
+                    or member.mtime != 0
+                    or member.uname != ""
+                    or member.gname != ""
+                    or member.linkname != ""
+                ):
+                    _fail(f"{where} has non-canonical ownership, timestamp, mode, or link metadata")
+                pure_name = PurePosixPath(member.name)
+                if len(pure_name.parts) != 2 or pure_name.parts[0] != "objects":
+                    _fail(f"{where} is not a canonical objects/<sha256>.cubin path")
+                filename = pure_name.parts[1]
+                if not filename.endswith(".cubin") or _HEX64_RE.fullmatch(filename[:-6]) is None:
+                    _fail(f"{where} is not content-addressed by a full SHA-256")
+                image_hash = filename[:-6]
+                if image_hash not in expected:
+                    _fail(f"{where} is not referenced by the family index")
+                if member.size != expected[image_hash]:
+                    _fail(f"{where} size is {member.size}, expected {expected[image_hash]}")
+                observed.append(member.name)
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    _fail(f"cannot stream {where}")
+                destination = object_dir / filename if object_dir is not None else None
+                temporary: Path | None = None
+                output = None
+                if destination is not None and image_hash not in installed:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{filename}.", dir=destination.parent)
+                    temporary = Path(temporary_name)
+                    output = os.fdopen(descriptor, "wb")
+                digest = hashlib.sha256()
+                prefix = b""
+                size = 0
+                try:
+                    while chunk := extracted.read(_IO_CHUNK):
+                        if len(prefix) < 4:
+                            prefix = (prefix + chunk)[:4]
+                        digest.update(chunk)
+                        size += len(chunk)
+                        if output is not None:
+                            output.write(chunk)
+                    if output is not None:
+                        output.flush()
+                        os.fsync(output.fileno())
+                finally:
+                    extracted.close()
+                    if output is not None:
+                        output.close()
+                if prefix != b"\x7fELF":
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                    _fail(f"{where} is not an ELF CUBIN")
+                if size != expected[image_hash] or digest.hexdigest() != image_hash:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                    _fail(f"{where} content does not match its indexed size and SHA-256")
+                if destination is not None and temporary is not None:
+                    if not _valid_materialized_object(destination, image_hash, size):
+                        temporary.chmod(0o444)
+                        os.replace(temporary, destination)
+                    else:
+                        temporary.unlink(missing_ok=True)
+                    installed.add(image_hash)
+    except MaterializationError:
+        raise
+    except (OSError, EOFError, lzma.LZMAError, tarfile.TarError) as error:
+        raise MaterializationError(f"cannot verify tar pack {path}: {error}") from error
+    if observed != expected_names:
+        _fail(
+            f"{path} members are missing, duplicated, extra, or not sorted: expected={expected_names}, got={observed}"
+        )
+
+
+def _verify_archives(families: Sequence[FamilyIndex], object_dir: Path | None = None) -> VerificationResult:
+    global_images = _global_images(families)
+    installed: set[str] = set()
+    pack_count = 0
+    for family in families:
+        for pack in family.packs:
+            expected = _expected_pack_images(family, pack.target_arch)
+            tar_limit = min(
+                _MAX_TAR_BYTES,
+                sum(512 + ((size + 511) // 512) * 512 for size in expected.values()) + 1024 * 1024,
+            )
+            path = _pack_path(family, pack)
+            _verify_compressed_pack(path, pack, tar_limit)
+            _verify_pack_members(path, expected, object_dir, installed)
+            pack_count += 1
+    return VerificationResult(
+        family_count=len(families),
+        pack_count=pack_count,
+        variant_count=sum(len(family.variants) for family in families),
+        image_count=len(global_images),
+        total_image_bytes=sum(global_images.values()),
+    )
+
+
+def verify_packs(family_indexes: Sequence[tuple[str, Path]]) -> VerificationResult:
+    """Validate public family indexes, compressed packs, and every packed image.
+
+    Args:
+        family_indexes: Explicit ``(expected_family, index_path)`` pairs.
+
+    Returns:
+        Aggregate verification counts.
+
+    Raises:
+        MaterializationError: If any index, pack, or image is invalid.
+    """
+    families = _load_families(family_indexes)
+    _verify_exact_shard_sets(families)
+    _verify_exact_pack_sets(families)
+    return _verify_archives(families)
+
+
+def prune_unreferenced_packs(family_indexes: Sequence[tuple[str, Path]]) -> tuple[Path, ...]:
+    """Delete pack and record files no family index names, and report which went.
+
+    A pack filename embeds the hash of its own contents, so rebuilding a family
+    writes NEW files BESIDE the ones it supersedes rather than over them. Nothing
+    then removes the old generation, and two of them in one directory is exactly
+    what ``_verify_exact_pack_set`` refuses.
+
+    That collision is not hypothetical, it is how CI hands a rebuilt corpus on:
+    GitLab extracts a job's artifacts ON TOP OF the checkout, never in place of
+    it, so a wheel job inheriting a ``BIOIR_CUBIN_REBUILD`` corpus holds both the
+    packs its index names and the committed ones that revision invalidated.
+
+    The index is the authority and the filename is a content hash, so a pack no
+    index references is superseded by construction. Removing those is what keeps
+    the exact-set check meaningful; relaxing it to a subset test would instead let
+    a stale pack ship inside a wheel, which is the hazard the check exists for.
+
+    Args:
+        family_indexes: Explicit ``(expected_family, index_path)`` pairs.
+
+    Returns:
+        The pruned paths, in deletion order. Empty when nothing was superseded,
+        which is every call that follows no rebuild.
+
+    Raises:
+        MaterializationError: If an index is invalid, a pack directory is not a
+            regular directory, or an unreferenced entry is not a regular file.
+    """
+    families = _load_families(family_indexes)
+    pruned: list[Path] = []
+    for family in families:
+        directories = (
+            (family.path.parent / "packs", {PurePosixPath(pack.file).name for pack in family.packs}),
+            (family.path.parent / "records", {path.name for path in family.shard_paths}),
+        )
+        for directory, expected in directories:
+            if directory.is_symlink() or not directory.is_dir():
+                _fail(f"CUBIN artifact directory must be a regular directory: {directory}")
+            try:
+                entries = sorted(directory.iterdir())
+            except OSError as error:
+                raise MaterializationError(f"cannot inspect CUBIN artifact directory {directory}: {error}") from error
+            for entry in entries:
+                if entry.name in expected:
+                    continue
+                if entry.is_symlink() or not entry.is_file():
+                    _fail(f"refusing to prune a non-regular CUBIN artifact entry: {entry}")
+                entry.unlink()
+                pruned.append(entry)
+    return tuple(pruned)
+
+
+def _fingerprint(families: Sequence[FamilyIndex]) -> str:
+    digest = hashlib.sha256()
+
+    def add(label: str, value: bytes) -> None:
+        encoded_label = label.encode()
+        digest.update(len(encoded_label).to_bytes(8, "big"))
+        digest.update(encoded_label)
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    add("fingerprint-format", FINGERPRINT_FORMAT.encode())
+    add("assembly-format", ASSEMBLY_FORMAT.encode())
+    add("host-object-format", b"elf-gnu")
+    try:
+        add("materializer", Path(__file__).resolve().read_bytes())
+    except OSError as error:
+        raise MaterializationError(f"cannot fingerprint public materializer {__file__}: {error}") from error
+    for family in families:
+        add(f"index:{family.family}", family.raw_bytes)
+        add(
+            f"packs:{family.family}",
+            _json_bytes(
+                [{"target_arch": pack.target_arch, "sha256": pack.sha256, "size": pack.size} for pack in family.packs]
+            ),
+        )
+    return digest.hexdigest()
+
+
+def _cpp_string(value: object) -> str:
+    return json.dumps(cast(str, value), ensure_ascii=True)
+
+
+def _cpp_bool(value: object) -> str:
+    return "true" if cast(bool, value) else "false"
+
+
+def _cpp_uint_array(value: object, size: int, fill: int = 0) -> str:
+    values = list(cast(list[int], value))
+    values.extend([fill] * (size - len(values)))
+    return "{" + ", ".join(f"{item}U" for item in values) + "}"
+
+
+def _render_tma_descriptor(value: object, indent: str) -> list[str]:
+    metadata = cast(dict[str, object], value)
+    rank = cast(int, metadata["rank"])
+    return [
+        f"{indent}{{",
+        f"{indent}  {_TMA_DATA_TYPE[cast(str, metadata['data_type'])]},",
+        f"{indent}  {rank}U,",
+        f"{indent}  {_cpp_uint_array(metadata['global_dim_order'], 5)},",
+        f"{indent}  {_cpp_uint_array(metadata['box_dims'], 5, 1)},",
+        f"{indent}  {_cpp_uint_array(metadata['element_strides'], 5, 1)},",
+        f"{indent}  {_TMA_INTERLEAVE[cast(str, metadata['interleave'])]},",
+        f"{indent}  {_TMA_SWIZZLE[cast(str, metadata['swizzle'])]},",
+        f"{indent}  {_TMA_L2_PROMOTION[cast(str, metadata['l2_promotion'])]},",
+        f"{indent}  {_TMA_OOB_FILL[cast(str, metadata['oob_fill'])]},",
+        f"{indent}}},",
+    ]
+
+
+def _render_sm90(value: object, operands: tuple[str, ...], indent: str) -> list[str]:
+    if value is None:
+        return [f"{indent}{{}},"]
+    metadata = cast(dict[str, object], value)
+    descriptors = cast(dict[str, object], metadata["tma_descriptors"])
+    lines = [
+        f"{indent}{{",
+        f"{indent}  true,",
+        f"{indent}  {_cpp_uint_array(metadata['block_dims'], 3)},",
+        f"{indent}  {_cpp_uint_array(metadata['cluster_dims'], 3)},",
+        f"{indent}  {_CLUSTER_POLICY[cast(str, metadata['cluster_scheduling_policy'])]},",
+    ]
+    for operand in operands:
+        if operand in descriptors:
+            lines.extend(_render_tma_descriptor(descriptors[operand], indent + "  "))
+        else:
+            lines.append(f"{indent}  {{}},")
+    lines.append(f"{indent}}},")
+    return lines
+
+
+def _render_sm100(value: object, spec: _Sm100Spec, indent: str) -> list[str]:
+    if value is None:
+        return [f"{indent}{{}},"]
+    metadata = cast(dict[str, object], value)
+    descriptors = cast(dict[str, object], metadata["tma_descriptors"])
+    lines = [
+        f"{indent}{{",
+        f"{indent}  true,",
+        f"{indent}  {_cpp_uint_array(metadata['block_dims'], 3)},",
+    ]
+    if spec.clusters:
+        lines.append(f"{indent}  {_cpp_uint_array(metadata['cluster_dims'], 3)},")
+        lines.append(f"{indent}  {_CLUSTER_POLICY[cast(str, metadata['cluster_scheduling_policy'])]},")
+    for operand in spec.declared_operands:
+        if operand in descriptors:
+            lines.extend(_render_tma_descriptor(descriptors[operand], indent + "  "))
+        else:
+            lines.append(f"{indent}  {{}},")
+    lines.append(f"{indent}}},")
+    return lines
+
+
+def _sm90_declarations(spec: _FamilySpec) -> list[str]:
+    assert spec.sm90 is not None
+    return [
+        "struct SM90LaunchInfo",
+        "{",
+        f"  bool {spec.sm90.enabled_field};",
+        "  std::uint32_t block_dims[3];",
+        "  std::uint32_t cluster_dims[3];",
+        "  CUclusterSchedulingPolicy cluster_scheduling_policy;",
+        *(f"  TmaDescriptorInfo {operand};" for operand in spec.sm90.declared_operands),
+        "};",
+        "",
+    ]
+
+
+def _sm100_declarations(spec: _FamilySpec) -> list[str]:
+    assert spec.sm100 is not None
+    cluster_members = (
+        ["  std::uint32_t cluster_dims[3];", "  CUclusterSchedulingPolicy cluster_scheduling_policy;"]
+        if spec.sm100.clusters
+        else []
+    )
+    return [
+        "struct SM100LaunchInfo",
+        "{",
+        f"  bool {spec.sm100.enabled_field};",
+        "  std::uint32_t block_dims[3];",
+        *cluster_members,
+        *(f"  TmaDescriptorInfo {operand};" for operand in spec.sm100.declared_operands),
+        "};",
+        "",
+    ]
+
+
+def _family_type_declarations(family: str) -> list[str]:
+    """Declare this family's registry record, in field order."""
+    spec = _FAMILY_SPECS[family]
+    lines: list[str] = []
+    if spec.alias is not None:
+        lines.extend(["struct RuntimeAlias", "{", *(f"  {item}" for item in spec.alias.declarations), "};", ""])
+    if spec.sm90 is not None:
+        lines.extend(_sm90_declarations(spec))
+    if spec.sm100 is not None:
+        lines.extend(_sm100_declarations(spec))
+    lines.extend(
+        [
+            "struct CubinImage",
+            "{",
+            "  EmbeddedCubinImage cubin;",
+            *(f"  {field.declaration}" for field in spec.fields),
+        ]
+    )
+    if spec.sm90 is not None:
+        lines.append("  SM90LaunchInfo sm90;")
+    if spec.sm100 is not None:
+        lines.append("  SM100LaunchInfo sm100;")
+    if spec.alias is not None:
+        lines.extend(["  RuntimeAlias const* aliases;", "  std::size_t alias_count;"])
+    lines.append("};")
+    return lines
+
+
+def _registry_header(family: str) -> str:
+    guard = f"BIOIR_GENERATED_{family.upper()}_REGISTRY_H_"
+    lines = [
+        "/* SPDX-License-Identifier: Apache-2.0",
+        " * Generated by cpp/cmake/materialize_cubin_payloads.py. Do not edit.",
+        " */",
+        "",
+        f"#ifndef {guard}",
+        f"#define {guard}",
+        "",
+        '#include "cubin_runtime.h"',
+        "",
+        "#include <cstddef>",
+        "#include <cstdint>",
+        "",
+        f"namespace bioir::cutedsl::{family}::embedded",
+        "{",
+        "",
+        *_family_type_declarations(family),
+        "",
+        "struct RegistryView",
+        "{",
+        "  CubinImage const* images;",
+        "  std::size_t count;",
+        "};",
+        "",
+        "RegistryView registry() noexcept;",
+        "",
+        f"}} // namespace bioir::cutedsl::{family}::embedded",
+        "",
+        f"#endif /* {guard} */",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _alias_table_name(variant: VariantRecord) -> str:
+    return f"kRuntimeAliases_{variant.variant_id}"
+
+
+def _alias_lines(family: str, variant: VariantRecord) -> list[str]:
+    spec = _FAMILY_SPECS[family]
+    if spec.alias is None:
+        return []
+    aliases = cast("list[dict[str, object]]", variant.runtime_metadata["runtime_aliases"])
+    first, second = spec.alias.keys
+    name = _alias_table_name(variant)
+    return [
+        f"constexpr RuntimeAlias {name}[] = {{",
+        *(f"  {{{alias[first]}, {alias[second]}}}," for alias in aliases),
+        "};",
+        "",
+    ]
+
+
+def _field_value(field: _Field, variant: VariantRecord) -> str:
+    if field.kind == _DTYPE_CODE:
+        return str(_DTYPE_CODES[variant.dtype])
+    value = variant.runtime_metadata[field.name]
+    if field.kind == _BOOL:
+        return _cpp_bool(value)
+    if field.kind == _TEXT:
+        return _cpp_string(value)
+    if field.kind == _TRIPLE:
+        return "{" + ", ".join(str(item) for item in cast("list[object]", value)) + "}"
+    return f"{value}{field.suffix}"
+
+
+def _family_initializer_lines(family: str, variant: VariantRecord, indent: str) -> list[str]:
+    """Initialize one ``CubinImage``, matching _family_type_declarations."""
+    spec = _FAMILY_SPECS[family]
+    lines = [f"{indent}{_field_value(field, variant)}," for field in spec.fields]
+    if spec.sm90 is not None:
+        lines.extend(_render_sm90(variant.runtime_metadata["sm90_launch"], spec.sm90.declared_operands, indent))
+    if spec.sm100 is not None:
+        lines.extend(_render_sm100(variant.runtime_metadata["sm100_launch"], spec.sm100, indent))
+    if spec.alias is not None:
+        name = _alias_table_name(variant)
+        lines.extend([f"{indent}{name},", f"{indent}sizeof({name}) / sizeof({name}[0]),"])
+    return lines
+
+
+def _registry_source(family: FamilyIndex) -> str:
+    image_hashes = sorted({variant.image.sha256 for variant in family.variants})
+    lines = [
+        "/* SPDX-License-Identifier: Apache-2.0",
+        " * Generated by cpp/cmake/materialize_cubin_payloads.py. Do not edit.",
+        " */",
+        "",
+        f'#include "{family.family}_registry.h"',
+        "",
+        'extern "C"',
+        "{",
+        *(f"extern unsigned char bioir_cubin_{digest}_start[];" for digest in image_hashes),
+        "}",
+        "",
+        f"namespace bioir::cutedsl::{family.family}::embedded",
+        "{",
+        "namespace",
+        "{",
+        "",
+    ]
+    for variant in family.variants:
+        supported = ", ".join(str(sm) for sm in variant.supported_sms)
+        lines.append(f"constexpr std::int32_t kSupportedSms_{variant.variant_id}[] = {{{supported}}};")
+    lines.append("")
+    for variant in family.variants:
+        lines.extend(_alias_lines(family.family, variant))
+    lines.extend(["CubinImage const kImages[] = {"])
+    for variant in family.variants:
+        supported_name = f"kSupportedSms_{variant.variant_id}"
+        metadata = variant.runtime_metadata
+        lines.extend(
+            [
+                "  {",
+                "    {",
+                f"      {variant.target_sm},",
+                f"      {variant.kernel_sm},",
+                f"      {metadata['dynamic_smem_bytes']}U,",
+                f"      {_cpp_bool(metadata['non_portable_cluster_size_allowed'])},",
+                f"      {_cpp_string(variant.launch_abi)},",
+                f"      {supported_name},",
+                f"      sizeof({supported_name}) / sizeof({supported_name}[0]),",
+                f"      {_cpp_string(variant.variant_id)},",
+                f"      {_cpp_string(variant.kernel_symbol)},",
+                f"      bioir_cubin_{variant.image.sha256}_start,",
+                f"      static_cast<std::size_t>({variant.image.size}),",
+                "    },",
+            ]
+        )
+        lines.extend(_family_initializer_lines(family.family, variant, "    "))
+        lines.append("  },")
+    lines.extend(
+        [
+            "};",
+            "",
+            "} // namespace",
+            "",
+            "RegistryView registry() noexcept",
+            "{",
+            "  return {kImages, sizeof(kImages) / sizeof(kImages[0])};",
+            "}",
+            "",
+            f"}} // namespace bioir::cutedsl::{family.family}::embedded",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _gas_path(path: Path) -> str:
+    value = str(path.resolve())
+    try:
+        value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise MaterializationError(f"assembler input path must be ASCII: {value!r}") from error
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        _fail(f"assembler input path contains a control character: {value!r}")
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _assembly_shard(shard: str, hashes: Sequence[str], object_dir: Path) -> str:
+    lines = [
+        "# SPDX-License-Identifier: Apache-2.0",
+        "# Generated by cpp/cmake/materialize_cubin_payloads.py. Do not edit.",
+        "",
+    ]
+    for digest in hashes:
+        symbol = f"bioir_cubin_{digest}"
+        lines.extend(
+            [
+                '.section .rodata.bioir_cubins,"a",%progbits',
+                ".balign 16",
+                f".global {symbol}_start",
+                f".hidden {symbol}_start",
+                f".type {symbol}_start,%object",
+                f".global {symbol}_end",
+                f".hidden {symbol}_end",
+                f"{symbol}_start:",
+                f'.incbin "{_gas_path(object_dir / f"{digest}.cubin")}"',
+                f"{symbol}_end:",
+                f".size {symbol}_start,{symbol}_end-{symbol}_start",
+                "",
+            ]
+        )
+    lines.extend(['.section .note.GNU-stack,"",%progbits', ""])
+    return "\n".join(lines)
+
+
+def _atomic_write_if_changed(path: Path, content: bytes, mode: int = 0o644) -> None:
+    try:
+        if path.is_file() and not path.is_symlink() and path.read_bytes() == content:
+            return
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _stamp_value(families: Sequence[FamilyIndex], fingerprint: str, images: Mapping[str, int]) -> dict[str, object]:
+    files = [f"cubin_payloads_{digit}.S" for digit in "0123456789abcdef"]
+    for family in families:
+        files.extend([f"{family.family}_registry.h", f"{family.family}_registry.cpp"])
+    files.extend(f"objects/{digest}.cubin" for digest in sorted(images))
+    return {
+        "format": MATERIALIZATION_FORMAT,
+        "fingerprint": fingerprint,
+        "families": [family.family for family in families],
+        "files": sorted(files),
+        "objects": [{"sha256": digest, "size": images[digest]} for digest in sorted(images)],
+    }
+
+
+def _has_exact_materialized_objects(object_dir: Path, images: Mapping[str, int]) -> bool:
+    if object_dir.is_symlink() or not object_dir.is_dir():
+        return False
+    expected_names = {f"{digest}.cubin" for digest in images}
+    try:
+        entries = list(object_dir.iterdir())
+    except OSError:
+        return False
+    if {entry.name for entry in entries} != expected_names:
+        return False
+    return all(
+        _valid_materialized_object(object_dir / f"{digest}.cubin", digest, size) for digest, size in images.items()
+    )
+
+
+def _prepare_object_dir(output_dir: Path, images: Mapping[str, int]) -> Path:
+    """Create the reserved object directory and remove safe stale entries."""
+    object_dir = output_dir / "objects"
+    if object_dir.is_symlink():
+        _fail(f"materialized CUBIN object directory must not be a symlink: {object_dir}")
+    object_dir.mkdir(exist_ok=True)
+    if object_dir.is_symlink() or not object_dir.is_dir():
+        _fail(f"materialized CUBIN object path must be a directory: {object_dir}")
+
+    expected_names = {f"{digest}.cubin" for digest in images}
+    for entry in object_dir.iterdir():
+        if entry.name in expected_names and not entry.is_symlink() and entry.is_file():
+            continue
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink()
+            continue
+        _fail(f"unexpected non-file entry in materialized CUBIN object directory: {entry}")
+    return object_dir
+
+
+def _matches_generated_file(path: Path, expected: bytes) -> bool:
+    """Return whether a regular generated file has the exact expected bytes."""
+    try:
+        return (
+            not path.is_symlink()
+            and path.is_file()
+            and path.stat().st_size == len(expected)
+            and path.read_bytes() == expected
+        )
+    except OSError:
+        return False
+
+
+def _is_complete(
+    output_dir: Path,
+    stamp: Mapping[str, object],
+    images: Mapping[str, int],
+    families: Sequence[FamilyIndex],
+) -> bool:
+    stamp_path = output_dir / "materialization.json"
+    if output_dir.is_symlink() or stamp_path.is_symlink() or not stamp_path.is_file():
+        return False
+    try:
+        actual = json.loads(
+            stamp_path.read_bytes(), object_pairs_hook=_strict_object, parse_constant=_reject_json_constant
+        )
+    except (OSError, json.JSONDecodeError, MaterializationError):
+        return False
+    if actual != stamp:
+        return False
+    object_dir = output_dir / "objects"
+    sorted_hashes = sorted(images)
+    try:
+        for digit in "0123456789abcdef":
+            shard = output_dir / f"cubin_payloads_{digit}.S"
+            shard_hashes = [digest for digest in sorted_hashes if digest[0] == digit]
+            if not _matches_generated_file(shard, _assembly_shard(digit, shard_hashes, object_dir).encode()):
+                return False
+        for family in families:
+            header = output_dir / f"{family.family}_registry.h"
+            source = output_dir / f"{family.family}_registry.cpp"
+            if not _matches_generated_file(header, _registry_header(family.family).encode()):
+                return False
+            if not _matches_generated_file(source, _registry_source(family).encode()):
+                return False
+    except OSError:
+        return False
+    return _has_exact_materialized_objects(object_dir, images)
+
+
+def materialize(
+    family_indexes: Sequence[tuple[str, Path]],
+    output_root: Path,
+) -> MaterializationResult:
+    """Verify packs and generate assembly plus typed family registries.
+
+    Args:
+        family_indexes: Explicit ``(expected_family, index_path)`` pairs.
+        output_root: Build-tree root under which the fingerprint directory is created.
+
+    Returns:
+        The materialization fingerprint and completed output directory.
+
+    Raises:
+        MaterializationError: If validation or materialization fails.
+    """
+    if not isinstance(output_root, Path):
+        raise TypeError("output_root must be pathlib.Path")
+    families = _load_families(family_indexes)
+    _verify_exact_shard_sets(families)
+    _verify_exact_pack_sets(families)
+    images = _global_images(families)
+    fingerprint = _fingerprint(families)
+    output_root = output_root.resolve()
+    output_dir = output_root / fingerprint
+    stamp = _stamp_value(families, fingerprint, images)
+    if _is_complete(output_dir, stamp, images, families):
+        return MaterializationResult(fingerprint, output_dir)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if output_dir.is_symlink():
+            _fail(f"materialization directory must not be a symlink: {output_dir}")
+        object_dir = _prepare_object_dir(output_dir, images)
+        _verify_archives(families, object_dir)
+        if not _has_exact_materialized_objects(object_dir, images):
+            _fail(f"materialized CUBIN object set is incomplete or contains unindexed entries: {object_dir}")
+        for digit in "0123456789abcdef":
+            shard_hashes = [digest for digest in sorted(images) if digest[0] == digit]
+            _atomic_write_if_changed(
+                output_dir / f"cubin_payloads_{digit}.S",
+                _assembly_shard(digit, shard_hashes, object_dir).encode(),
+            )
+        for family in families:
+            _atomic_write_if_changed(
+                output_dir / f"{family.family}_registry.h", _registry_header(family.family).encode()
+            )
+            _atomic_write_if_changed(output_dir / f"{family.family}_registry.cpp", _registry_source(family).encode())
+        _atomic_write_if_changed(
+            output_dir / "materialization.json",
+            (json.dumps(stamp, indent=2, sort_keys=True) + "\n").encode(),
+        )
+    except MaterializationError:
+        raise
+    except OSError as error:
+        raise MaterializationError(f"cannot materialize CUBIN build inputs in {output_dir}: {error}") from error
+    return MaterializationResult(fingerprint, output_dir)
+
+
+def _parse_index_argument(value: str) -> tuple[str, Path]:
+    family, separator, raw_path = value.partition("=")
+    if not separator or not family or not raw_path:
+        raise argparse.ArgumentTypeError("expected FAMILY=PATH")
+    return family, Path(raw_path)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-root", type=Path, required=True, help="build-tree output root")
+    parser.add_argument(
+        "--index",
+        type=_parse_index_argument,
+        action="append",
+        required=True,
+        metavar="FAMILY=PATH",
+        help="expected family and its public index (repeatable)",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the source-independent materializer CLI."""
+    parser = _parser()
+    arguments = parser.parse_args(argv)
+    try:
+        result = materialize(arguments.index, arguments.output_root)
+    except MaterializationError as error:
+        parser.exit(2, f"error: {error}\n")
+    print(result.output_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

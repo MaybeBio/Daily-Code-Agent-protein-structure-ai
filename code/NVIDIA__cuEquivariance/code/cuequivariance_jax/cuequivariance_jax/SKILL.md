@@ -1,0 +1,1 @@
+../../skills/cuequivariance-jax/SKILL.md

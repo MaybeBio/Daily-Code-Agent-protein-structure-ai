@@ -1,0 +1,1023 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Foldism - Protein Structure Prediction</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        h1 { margin-bottom: 5px; }
+        .subtitle { color: #666; margin-bottom: 20px; }
+        .panel { background: white; border-radius: 8px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        h2 { margin-top: 0; color: #444; font-size: 1.2em; }
+        textarea { width: 100%; height: 150px; font-family: monospace; font-size: 12px; border: 1px solid #ddd; border-radius: 4px; padding: 10px; }
+        .methods { display: flex; gap: 15px; margin: 15px 0; flex-wrap: wrap; }
+        .methods label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+        button { background: #2563eb; color: white; border: none; padding: 12px 24px; border-radius: 6px; font-size: 16px; cursor: pointer; width: 100%; }
+        button:hover { background: #1d4ed8; }
+        button:disabled { background: #9ca3af; cursor: not-allowed; }
+        .progress-container { margin-top: 15px; display: none; }
+        .progress-container.active { display: block; }
+        .progress-bar { height: 24px; background: #e5e7eb; border-radius: 12px; overflow: hidden; margin-bottom: 10px; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #8b5cf6); width: 0%; transition: width 0.3s; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px; }
+        .log { background: #1e1e1e; color: #d4d4d4; font-family: monospace; font-size: 11px; padding: 10px; border-radius: 4px; height: 150px; overflow-y: auto; margin-top: 10px; }
+        .log .info { color: #4fc3f7; }
+        .log .success { color: #81c784; }
+        .log .error { color: #e57373; }
+        #viewer-container { width: 100%; height: 500px; background: #fff; border-radius: 4px; border: 1px solid #ddd; position: relative; display: none; }
+        .results { margin-top: 15px; }
+        .result-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; background: #f9fafb; border-radius: 4px; margin-bottom: 8px; }
+        .result-item input[type="checkbox"] { margin-right: 8px; cursor: pointer; }
+        .result-item .downloads { display: flex; gap: 8px; }
+        .result-item .downloads a { color: #2563eb; text-decoration: none; font-size: 13px; padding: 4px 8px; border: 1px solid #2563eb; border-radius: 4px; }
+        .metrics { display: flex; gap: 8px; margin-left: 12px; }
+        .metric { font-size: 12px; }
+        .metric-label { color: #666; margin-right: 2px; }
+        .metric-value { font-weight: 600; }
+        .metric-value.good { color: #16a34a; }
+        .metric-value.medium { color: #ca8a04; }
+        .metric-value.poor { color: #dc2626; }
+        .metric[data-tip] { cursor: help; border-bottom: 1px dotted #999; position: relative; }
+        .metric[data-tip]:hover::after { content: attr(data-tip); position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%); background: #333; color: #fff; padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; max-width: 350px; white-space: normal; z-index: 1000; margin-bottom: 4px; }
+        .example-link { font-size: 13px; color: #666; margin-top: 10px; }
+        .example-link a { color: #2563eb; }
+        .active-option { display:block; margin-top:8px; font-size:13px; }
+        .active-option span, .confidence-note { color:#64748b; font-size:12px; }
+        .model-name { display:inline-block; min-width:96px; }
+        .confidence-percentile { display:inline-block; margin-left:5px; padding:2px 5px; border-radius:4px; background:#e0f2ed; color:#166453; font-size:10px; font-weight:600; }
+        .percentile-note { margin:9px 2px; color:#64748b; font-size:12px; line-height:1.5; }
+        .results-table-wrap { overflow-x:auto; margin-bottom:12px; }
+        .results-table { width:100%; border-collapse:collapse; font-size:13px; }
+        .results-table th { padding:10px 12px; text-align:left; color:#475569; background:#eaf1fa; font-size:12px; font-weight:600; }
+        .results-table tr.result-item { display:table-row; }
+        .results-table td { padding:12px; border-bottom:1px solid #e2e8f0; vertical-align:middle; }
+        .results-table .model-cell { white-space:nowrap; }
+        .model-rmsd { margin-left:8px; font-size:12px; color:#64748b; }
+        .results-table .model-marker { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; }
+        .confidence-values { font-size:14px; font-variant-numeric:tabular-nums; white-space:nowrap; }
+        .confidence-pairs { color:#64748b; white-space:nowrap; }
+        .pair-separator { color:#94a3b8; padding:0 3px; }
+        .results-table .downloads { white-space:nowrap; }
+    </style>
+</head>
+<body>
+
+<div style="display: flex; align-items: flex-end; gap: 3px; margin-bottom: 5px;">
+  <svg viewBox="430 200 380 530" xmlns="http://www.w3.org/2000/svg" style="width: 52px; height: 52px; margin-bottom: -8px;">
+    <defs>
+      <path id="p" d="M548,427c10,-4 30,-12 47,-22c40,-22 85,-45 113,-82c15,-20 18,-55 5,-70c-10,-12 -30,-5 -42,10c-20,25 -25,70 -30,110c-8,65 -15,140 -40,200c-12,30 -35,55 -60,50c-20,-4 -25,-30 -15,-55c12,-30 35,-50 60,-75c45,-40 100,-80 145,-110"/>
+      <linearGradient id="g" y2="1">
+        <stop offset="0" stop-color="#4ECDC4"/>
+        <stop offset="1" stop-color="#96E6A1"/>
+      </linearGradient>
+    </defs>
+    <use href="#p" fill="none" stroke="#000" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+    <use href="#p" fill="none" stroke="url(#g)" stroke-width="32" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+  <h1 style="color: #333; font-size: 2rem; font-weight: 300; letter-spacing: 0.1em; margin: 0;">foldism</h1>
+</div>
+    <p class="subtitle">Protein structure prediction with ESMFold 2, OpenDDE, Mol-1, and AlphaFold 2</p>
+    <div class="panel">
+        <h2>Input Sequence</h2>
+        <form id="fold-form">
+            <textarea id="fasta-input" name="fasta" placeholder="Paste FASTA sequence here..."></textarea>
+            <div class="methods">
+                <label><input type="checkbox" name="method" value="alphafold2"> AlphaFold 2</label>
+                <label><input type="checkbox" name="method" value="esmfold2" checked> ESMFold 2</label>
+                <label><input type="checkbox" name="method" value="opendde"> OpenDDE</label>
+                <label><input type="checkbox" name="method" value="mol1"> Mol-1</label>
+            </div>
+            <div style="margin: 8px 0; font-size: 13px; color: #666;">
+                <label style="cursor:pointer;"><input type="checkbox" id="use-msa" checked style="margin-right: 4px;">Use MSA <span style="color:#999;">(recommended — fetches via ColabSearch and shares MSAs across selected models)</span></label>
+                <details style="margin-top: 4px; font-size: 12px;">
+                    <summary style="cursor:pointer; color: #888;">What happens when MSA is off?</summary>
+                    <ul style="margin: 6px 0 0 18px; padding: 0; color: #666;">
+                        <li><b>AlphaFold 2</b> — runs in <code>single_sequence</code> mode.</li>
+                        <li><b>ESMFold 2</b> — runs without MSA, using sequence embeddings.</li>
+                        <li><b>OpenDDE</b> — runs without MSA.</li>
+                        <li><b>Mol-1</b> — runs without MSA.</li>
+                    </ul>
+                </details>
+                <div class="active-option"><span id="confidence-download-estimate">Confidence array downloads: ~25 MB per model at 300 total residues; ~250 MB at 1,000, before compression.</span><br><span>Structure ZIPs include scores and percentiles, but no confidence arrays. Download arrays separately for each model.</span></div>
+            </div>
+            <div style="margin: 8px 0; font-size: 13px; color: #666; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                <label for="reference-pdb-id" style="white-space: nowrap;">Reference PDB:</label>
+                <input type="text" id="reference-pdb-id" placeholder="e.g. 1lyz" style="width: 100px; padding: 4px 6px; border: 1px solid #ddd; border-radius: 4px; font-family: monospace;">
+                <span style="color: #999;">or</span>
+                <input type="file" id="reference-file" accept=".pdb,.cif,.ent" style="font-size: 12px;">
+                <span style="color: #999;">(overlaid; chains auto-matched to FASTA, ≥85% identity)</span>
+            </div>
+            <button type="submit" id="submit-btn">Predict Structure</button>
+        </form>
+        <div class="progress-container" id="progress-container">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <div id="progress-text">Initializing...</div>
+                <div id="elapsed-time" style="font-family: monospace; color: #666;">0:00</div>
+            </div>
+            <div class="progress-bar"><div class="progress-fill" id="progress-fill">0%</div></div>
+            <div class="log" id="log"></div>
+        </div>
+        <div class="example-link">
+            Examples: <span id="examples-list">loading...</span>
+            <a href="#" onclick="saveCurrentSequence(); return false;" style="margin-left:8px;color:#16a34a;" title="Save current sequence">[+]</a>
+            <span id="undo-btn" style="display:none;"><a href="#" onclick="undoDelete(); return false;" style="margin-left:8px;color:#666;" title="Undo delete">[undo]</a></span>
+        </div>
+    </div>
+    <div class="panel">
+        <h2>Results</h2>
+        <div class="results" id="results"></div>
+        <div id="viewer-container"></div>
+    </div>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/molstar@4.7.0/build/viewer/molstar.css">
+    <script src="https://cdn.jsdelivr.net/npm/molstar@4.7.0/build/viewer/molstar.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3/dist/jszip.min.js"></script>
+    <script>
+        let viewer = null;
+        let loadedStructures = {};
+        const methodColors = {'OpenDDE': '#0D9488', 'Mol-1': '#6366F1', 'AlphaFold2': '#F59E0B', 'ESMFold 2': '#EC4899'};
+        function colorForMethod(name) {
+            if (methodColors[name]) return methodColors[name];
+            if (name && name.startsWith('Reference')) return '#6B7280';
+            return '#888888';
+        }
+
+        function hexToLCHHue(hex) {
+            let r = parseInt(hex.slice(1,3), 16) / 255;
+            let g = parseInt(hex.slice(3,5), 16) / 255;
+            let b = parseInt(hex.slice(5,7), 16) / 255;
+            r = r > 0.04045 ? Math.pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
+            g = g > 0.04045 ? Math.pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
+            b = b > 0.04045 ? Math.pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
+            const x = (r * 0.4124564 + g * 0.3575761 + b * 0.1804375) / 0.95047;
+            const y = (r * 0.2126729 + g * 0.7151522 + b * 0.0721750);
+            const z = (r * 0.0193339 + g * 0.1191920 + b * 0.9503041) / 1.08883;
+            const f = t => t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16/116;
+            const a = 500 * (f(x) - f(y));
+            const bLab = 200 * (f(y) - f(z));
+            const hue = Math.atan2(bLab, a) * 180 / Math.PI;
+            return hue < 0 ? hue + 360 : hue;
+        }
+
+        document.addEventListener("DOMContentLoaded", function () {
+            molstar.Viewer.create("viewer-container", {
+                layoutIsExpanded: false,
+                layoutShowControls: false,
+                layoutShowRemoteState: false,
+                layoutShowSequence: false,
+                layoutShowLog: false,
+                viewportShowExpand: false,
+                viewportShowSelectionMode: false,
+                viewportShowAnimation: false,
+                pixelScale: window.devicePixelRatio || 1,
+            }).then(v => {
+                viewer = v;
+                loadExamples();
+            });
+        });
+
+        let defaultExamples = {
+            'Insulin': '>Insulin\nGIVEQCCTSICSLYQLENYCN\n>InsulinB\nFVNQHLCGSHLVEALYLVCGERGFFYTPKT',
+            'GFP': '>GFP\nMSKGEELFTGVVPILVELDGDVNGHKFSVSGEGEGDATYGKLTLKFICTTGKLPVPWPTLVTTLTYGVQCFSRYPDHMKQHDFFKSAMPEGYVQERTIFFKDDGNYKTRAEVKFEGDTLVNRIELKGIDFKEDGNILGHKLEYNYNSHNVYIMADKQKNGIKVNFKIRHNIEDGSVQLADHYQQNTPIGDGPVLLPDNHYLSTQSALSKDPNEKRDHMVLLEFVTAAGITLGMDELYK',
+            'Lysozyme': '>Lysozyme\nKVFGRCELAAAMKRHGLDNYRGYSLGNWVCAAKFESNFNTQATNRNTDGSTDYGILQINSRWWCNDGRTPGSRNLCNIPCSALLSSDITASVNCAKKIVSDGNGMNAWVAWRNRCKGTDVQAWIRGCRL'
+        };
+
+        // Add configured examples without hiding the built-in examples.
+        fetch('/overrides.json').then(r => r.ok ? r.json() : null).then(data => {
+            if (data && data.examples) { defaultExamples = {...defaultExamples, ...data.examples}; loadExamples(); }
+        }).catch(() => {});
+
+        function getExamples() {
+            try { return JSON.parse(localStorage.getItem('foldism-examples') || '{}'); }
+            catch (e) { return {}; }
+        }
+
+        function saveExamples(examples) {
+            localStorage.setItem('foldism-examples', JSON.stringify(examples));
+        }
+
+        function loadExamples() {
+            const container = document.getElementById('examples-list');
+            let html = Object.keys(defaultExamples).map(name =>
+                `<a href="#" onclick="loadExample('${name}'); return false;">${name}</a>`
+            ).join(' | ');
+            const userExamples = getExamples();
+            const userNames = Object.keys(userExamples).sort();
+            if (userNames.length > 0) {
+                html += ' | ' + userNames.map(name =>
+                    `<a href="#" onclick="loadExample('${name}'); return false;">${name}</a><a href="#" onclick="deleteExample('${name}'); return false;" style="color:#999;text-decoration:none;" title="Delete ${name}">[×]</a>`
+                ).join(' ');
+            }
+            container.innerHTML = html;
+        }
+
+        function loadExample(name) {
+            if (defaultExamples[name]) {
+                document.getElementById('fasta-input').value = defaultExamples[name];
+                return;
+            }
+            const examples = getExamples();
+            if (examples[name]) document.getElementById('fasta-input').value = examples[name];
+        }
+
+        function saveCurrentSequence() {
+            const fasta = document.getElementById('fasta-input').value.trim();
+            if (!fasta) { alert('No sequence to save'); return; }
+            const match = fasta.match(/^>([^\n\r]+)/);
+            let name = match ? match[1].split(/\s/)[0].split('|')[0].substring(0, 30) : 'sequence';
+            name = name.replace(/[^a-zA-Z0-9_-]/g, '_');
+            const examples = getExamples();
+            examples[name] = fasta;
+            saveExamples(examples);
+            loadExamples();
+            document.getElementById('undo-btn').style.display = 'none';
+        }
+
+        let lastDeleted = null;
+        function deleteExample(name) {
+            const examples = getExamples();
+            if (examples[name]) lastDeleted = { name, fasta: examples[name] };
+            delete examples[name];
+            saveExamples(examples);
+            loadExamples();
+            document.getElementById('undo-btn').style.display = 'inline';
+        }
+
+        function undoDelete() {
+            if (!lastDeleted) return;
+            const examples = getExamples();
+            examples[lastDeleted.name] = lastDeleted.fasta;
+            saveExamples(examples);
+            lastDeleted = null;
+            document.getElementById('undo-btn').style.display = 'none';
+            loadExamples();
+        }
+
+        // Track running methods for progressive dots
+        const runningMethods = {};
+
+        // Method configurations for log sections
+        const methodConfigs = {
+            'opendde': { name: 'OpenDDE', prefix: '[OpenDDE]' },
+            'mol1': { name: 'Mol-1', prefix: '[Mol-1]' },
+            'alphafold2': { name: 'AlphaFold2', prefix: '[AlphaFold2]' },
+            'esmfold2': { name: 'ESMFold 2', prefix: '[ESMFold2]' }
+        };
+
+        function createLogSection(methodKey) {
+            const config = methodConfigs[methodKey];
+            if (!config) return;
+
+            const containerId = methodKey + '-log-container';
+            const detailsId = methodKey + '-details';
+
+            // Don't create if already exists
+            if (document.getElementById(detailsId)) return;
+
+            const logEl = document.getElementById('log');
+            const container = document.createElement('div');
+            container.id = containerId;
+            container.style.cssText = 'margin: 4px 0; padding: 6px 8px; background: rgba(255, 255, 255, 0.05); border-left: 3px solid rgba(255, 255, 255, 0.2); border-radius: 2px;';
+
+            const header = document.createElement('div');
+            header.style.cssText = 'cursor: pointer; font-size: 12px; color: rgba(255, 255, 255, 0.7); user-select: none;';
+            header.innerHTML = `▶ ${config.name} detailed logs <span style="opacity: 0.5;">(click to expand)</span>`;
+
+            const detailsEl = document.createElement('div');
+            detailsEl.id = detailsId;
+            detailsEl.style.cssText = 'display: none; max-height: 200px; overflow-y: auto; margin-top: 6px; padding: 6px; background: rgba(0, 0, 0, 0.3); border-radius: 2px; font-size: 11px; line-height: 1.4;';
+
+            let isExpanded = false;
+            header.onclick = () => {
+                isExpanded = !isExpanded;
+                detailsEl.style.display = isExpanded ? 'block' : 'none';
+                header.innerHTML = `${isExpanded ? '▼' : '▶'} ${config.name} detailed logs <span style="opacity: 0.5;">(click to ${isExpanded ? 'collapse' : 'expand'})</span>`;
+            };
+
+            container.appendChild(header);
+            container.appendChild(detailsEl);
+
+            // Insert after the main method log line if it exists, otherwise append
+            const methodLogLine = document.getElementById('log-' + methodKey);
+            if (methodLogLine) {
+                methodLogLine.parentNode.insertBefore(container, methodLogLine.nextSibling);
+            } else {
+                logEl.appendChild(container);
+            }
+        }
+
+        function log(msg, cls = '', methodKey = null) {
+            const logEl = document.getElementById('log');
+
+            // Special handling for detailed logs from any method
+            const detailedLogPrefixes = {
+                '[OpenDDE]': { key: 'opendde', name: 'OpenDDE' },
+                '[Mol-1]': { key: 'mol1', name: 'Mol-1' },
+                '[AlphaFold2]': { key: 'alphafold2', name: 'AlphaFold2' },
+                '[ESMFold2]': { key: 'esmfold2', name: 'ESMFold 2' }
+            };
+
+            for (const [prefix, config] of Object.entries(detailedLogPrefixes)) {
+                if (msg.startsWith(prefix + ' ')) {
+                    const containerId = config.key + '-log-container';
+                    const detailsId = config.key + '-details';
+                    let detailsEl = document.getElementById(detailsId);
+
+                    if (!detailsEl) {
+                        // Create expandable log section
+                        const container = document.createElement('div');
+                        container.id = containerId;
+                        container.style.cssText = 'margin: 4px 0; padding: 6px 8px; background: rgba(255, 255, 255, 0.05); border-left: 3px solid rgba(255, 255, 255, 0.2); border-radius: 2px;';
+
+                        const header = document.createElement('div');
+                        header.style.cssText = 'cursor: pointer; font-size: 12px; color: rgba(255, 255, 255, 0.7); user-select: none;';
+                        header.innerHTML = `▶ ${config.name} detailed logs <span style="opacity: 0.5;">(click to expand)</span>`;
+
+                        detailsEl = document.createElement('div');
+                        detailsEl.id = detailsId;
+                        detailsEl.style.cssText = 'display: none; max-height: 200px; overflow-y: auto; margin-top: 6px; padding: 6px; background: rgba(0, 0, 0, 0.3); border-radius: 2px; font-size: 11px; line-height: 1.4;';
+
+                        let isExpanded = false;
+                        header.onclick = () => {
+                            isExpanded = !isExpanded;
+                            detailsEl.style.display = isExpanded ? 'block' : 'none';
+                            header.innerHTML = `${isExpanded ? '▼' : '▶'} ${config.name} detailed logs <span style="opacity: 0.5;">(click to ${isExpanded ? 'collapse' : 'expand'})</span>`;
+                        };
+
+                        container.appendChild(header);
+                        container.appendChild(detailsEl);
+
+                        // Insert after the main method log line if it exists, otherwise append
+                        const methodLogLine = document.getElementById('log-' + config.key);
+                        if (methodLogLine) {
+                            methodLogLine.parentNode.insertBefore(container, methodLogLine.nextSibling);
+                        } else {
+                            logEl.appendChild(container);
+                        }
+                    }
+
+                    // Add log line to details
+                    const logLine = document.createElement('div');
+                    logLine.textContent = msg.replace(prefix + ' ', '');
+                    logLine.style.cssText = 'color: rgba(255, 255, 255, 0.65); margin: 1px 0; font-family: monospace;';
+                    detailsEl.appendChild(logLine);
+                    detailsEl.scrollTop = detailsEl.scrollHeight;
+                    return;
+                }
+            }
+
+            const line = document.createElement('div');
+            line.className = cls;
+            line.textContent = msg;
+            if (methodKey) {
+                line.id = 'log-' + methodKey;
+                runningMethods[methodKey] = true;
+            }
+            logEl.appendChild(line);
+            // Create expandable log section AFTER adding line to DOM so insertion works
+            if (methodKey) {
+                createLogSection(methodKey);
+            }
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        function markMethodComplete(methodKey, success = true) {
+            delete runningMethods[methodKey];
+            const el = document.getElementById('log-' + methodKey);
+            if (el) {
+                // Replace "Running X..." with "Completed X" or "Failed X"
+                const status = success ? 'Completed' : 'Failed';
+                el.textContent = el.textContent.replace(/^Running/, status).replace(/\.+$/, '');
+                el.className = success ? 'success' : 'error';
+            }
+        }
+
+        function formatMetric(value, label, tooltip) {
+            if (value === undefined || value === null) return '';
+            const titleAttr = tooltip ? ` data-tip="${tooltip}"` : '';
+            // Handle array of values (e.g., multi-chain ipTM)
+            if (Array.isArray(value)) {
+                const formatted = value.map(v => {
+                    let numVal = typeof v === 'number' ? v : parseFloat(v);
+                    if (isNaN(numVal)) return null;
+                    if (numVal > 1) numVal /= 100;
+                    return numVal.toFixed(2);
+                }).filter(v => v !== null);
+                if (formatted.length === 0) return '';
+                const avgVal = value.reduce((a, b) => a + (typeof b === 'number' ? b : parseFloat(b)), 0) / value.length;
+                const colorClass = avgVal >= 0.8 ? 'good' : avgVal >= 0.5 ? 'medium' : 'poor';
+                return `<span class="metric"${titleAttr}><span class="metric-label">${label}:</span><span class="metric-value ${colorClass}">${formatted.join(', ')}</span></span>`;
+            }
+            let numVal = typeof value === 'number' ? value : parseFloat(value);
+            if (isNaN(numVal)) return '';
+            // Normalize to 0-1 scale (AlphaFold2 reports pLDDT as 0-100)
+            if (numVal > 1) numVal /= 100;
+            const displayVal = numVal.toFixed(2);
+            const colorClass = numVal >= 0.8 ? 'good' : numVal >= 0.5 ? 'medium' : 'poor';
+            return `<span class="metric"${titleAttr}><span class="metric-label">${label}:</span><span class="metric-value ${colorClass}">${displayVal}</span></span>`;
+        }
+
+        function countChains(fasta) {
+            // Count number of chains (headers starting with >) in FASTA
+            return (fasta.match(/^>/gm) || []).length;
+        }
+
+        function extractMetrics(scores, method) {
+            if (!scores) return {};
+            if (scores.interface_confidence) return { interface_confidence: scores.interface_confidence };
+            const metrics = {};
+            if (method === 'AlphaFold2') {
+                // ranking_debug.json format: {plddts: {model_1: 85.2}, order: [...]}
+                if (scores.plddts) {
+                    const plddtVals = Object.values(scores.plddts);
+                    if (plddtVals.length > 0) metrics.plddt = plddtVals[0];
+                }
+                // Individual model scores: {plddt: 85.2} or {plddt: [per-residue array]}
+                if (scores.plddt !== undefined) {
+                    metrics.plddt = Array.isArray(scores.plddt)
+                        ? scores.plddt.reduce((a, b) => a + b, 0) / scores.plddt.length
+                        : scores.plddt;
+                }
+                // ptm can be dict {model_1: 0.9} or direct value
+                if (scores.ptm !== undefined) {
+                    if (typeof scores.ptm === 'object') {
+                        const ptmVals = Object.values(scores.ptm);
+                        if (ptmVals.length > 0) metrics.ptm = ptmVals[0];
+                    } else metrics.ptm = scores.ptm;
+                }
+                if (scores.iptm !== undefined) {
+                    if (typeof scores.iptm === 'object' && !Array.isArray(scores.iptm)) {
+                        const iptmVals = Object.values(scores.iptm);
+                        metrics.iptm = iptmVals.length > 1 ? iptmVals : iptmVals[0];
+                    } else {
+                        metrics.iptm = scores.iptm;
+                    }
+                }
+            } else if (method === 'ESMFold 2') {
+                // scores.json from esmfold2: {plddt: mean (0-1), plddt_per_token: [...],
+                //   num_tokens, sample_index, ptm, iptm, chain_pair_iptm}
+                if (scores.plddt !== undefined) {
+                    let p = scores.plddt;
+                    if (Array.isArray(p)) p = p.reduce((a, b) => a + b, 0) / p.length;
+                    // ESMFold2 reports pLDDT on 0-1; scale to 0-100 to match other backends.
+                    metrics.plddt = (typeof p === 'number' && p <= 1) ? p * 100 : p;
+                }
+                if (scores.ptm !== undefined && scores.ptm !== null) metrics.ptm = scores.ptm;
+                // Per-chain-pair iptm matrix: row 0 vs every other chain.
+                if (Array.isArray(scores.chain_pair_iptm) && scores.chain_pair_iptm.length > 0) {
+                    const row0 = scores.chain_pair_iptm[0];
+                    if (Array.isArray(row0) && row0.length > 1) {
+                        metrics.iptm = row0.slice(1);
+                    }
+                } else if (scores.iptm !== undefined && scores.iptm !== null) {
+                    metrics.iptm = scores.iptm;
+                }
+            }
+            return metrics;
+        }
+
+        async function readFoldismResponse(response) {
+            const unavailable = 'Foldism is unavailable. The temporary test server may have stopped.';
+            if (!response.ok) throw new Error(`${unavailable} HTTP ${response.status}.`);
+            if (!response.headers.get('content-type')?.includes('application/json')) {
+                throw new Error(unavailable);
+            }
+            try {
+                return await response.json();
+            } catch {
+                throw new Error(unavailable);
+            }
+        }
+
+        function confidenceFileSize(bytes) {
+            const divisor = bytes >= 1e9 ? 1e9 : 1e6;
+            const value = bytes / divisor;
+            return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${bytes >= 1e9 ? 'GB' : 'MB'}`;
+        }
+
+        function updateConfidenceDownloadEstimate() {
+            const fasta = document.getElementById('fasta-input').value;
+            const residues = fasta.split('\n').filter(line => !line.trim().startsWith('>')).join('').replace(/[^A-Za-z]/g, '').length;
+            if (!residues) return;
+            const models = document.querySelectorAll('input[name="method"]:checked').length;
+            // Full 64-bin float32 PAE distributions dominate the uncompressed size.
+            const bytes = residues * residues * (64 * 4 + 8);
+            document.getElementById('confidence-download-estimate').textContent =
+                `Confidence array downloads: ~${confidenceFileSize(bytes)} per model; ~${confidenceFileSize(bytes * models)} total for ${models} selected. Before compression; ${residues} total residues.`;
+        }
+        document.getElementById('fasta-input').addEventListener('input', updateConfidenceDownloadEstimate);
+        document.querySelectorAll('input[name="method"]').forEach(input => input.addEventListener('change', updateConfidenceDownloadEstimate));
+
+        function confidenceTable(scores) {
+            const escape = value => String(value).replace(/[&<>"']/g, char => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[char]));
+            const pairs = scores.pairs || [];
+            const pairLabels = pairs.map(pair => pair.map(escape).join('–')).join(' / ');
+            const cells = ['iptm', 'ipsae', 'ipdae', 'actifptm'].map(key => {
+                const values = pairs.map((pair, index) => {
+                    const value = scores[key]?.[index];
+                    const status = scores.status?.[key]?.[index] || 'unavailable';
+                    const display = Number.isFinite(value) ? Number(value).toPrecision(2) : '—';
+                    const percentile = scores.percentiles?.[key]?.[index];
+                    const contactNote = scores.percentile_status?.[key]?.[index] === 'no_contacts_ranked_as_zero'
+                        ? ' No interface contacts; ranked as zero.' : '';
+                    const badge = Number.isFinite(percentile)
+                        ? `<span class="confidence-percentile" title="${percentile.toFixed(1)}th percentile among measured nonbinders; targets have equal weight. Not a binding probability.${contactNote}">P${Math.round(percentile)}</span>` : '';
+                    return `<span title="${escape(status.replaceAll('_',' '))}">${display}</span>${badge}`;
+                }).join('<span class="pair-separator">/</span>');
+                return `<td class="confidence-values">${values || '—'}</td>`;
+            }).join('');
+            return `<td class="confidence-pairs">${pairLabels || '—'}</td>${cells}`;
+        }
+
+        function outputTableBody(resultsEl) {
+            let body = resultsEl.querySelector('.results-table tbody');
+            if (!body) {
+                const wrapper = document.createElement('div');
+                wrapper.className = 'results-table-wrap';
+                wrapper.innerHTML = '<table class="results-table" aria-label="Prediction confidence scores"><thead><tr><th scope="col">Model</th><th scope="col">Chain pairs</th><th scope="col">ipTM</th><th scope="col">ipSAE</th><th scope="col">ipDAE</th><th scope="col">actifpTM</th><th scope="col">Downloads</th></tr></thead><tbody></tbody></table>';
+                wrapper.insertAdjacentHTML('beforeend', '<p class="percentile-note">P95 means the score exceeds approximately 95% of the nonbinder reference, with ties split equally. Each target has equal weight. Reference: 200 measured nonbinders across 23 targets. This is not a binding probability. Percentiles apply only to MSA-backed predictions with two protein chains and the binder first; AlphaFold2 has no reference.</p>');
+                resultsEl.appendChild(wrapper);
+                body = wrapper.querySelector('tbody');
+            }
+            return body;
+        }
+
+        function buildMetricsHTML(metrics, numChains) {
+            if (!metrics || Object.keys(metrics).length === 0) return '';
+            let html = '';
+            if (metrics.plddt !== undefined) html += formatMetric(metrics.plddt, 'pLDDT');
+            // ipTM only meaningful for multi-chain complexes
+            if (numChains > 1) {
+                if (metrics.iptm !== undefined) {
+                    const iptmTip = Array.isArray(metrics.iptm) && metrics.iptm.length > 1
+                        ? 'Interface pTM: first chain vs each other chain (chain 1 vs 2, vs 3, …)'
+                        : 'Interface pTM: first chain vs the other chain(s)';
+                    html += formatMetric(metrics.iptm, 'ipTM', iptmTip);
+                }
+            }
+            if (metrics.ptm !== undefined) html += formatMetric(metrics.ptm, 'pTM');
+            // RMSD + TM-score vs reference, from USalign (sequence-aware alignment,
+            // so cognate residues are paired correctly regardless of numbering).
+            // RMSD: lower is better (Å). TM-score: higher is better (0-1; >0.5 = same fold).
+            if (metrics.rmsd_ref) {
+                const n = metrics.rmsd_ref.n_atoms;
+                if (typeof metrics.rmsd_ref.tm_score === 'number') {
+                    const tm = metrics.rmsd_ref.tm_score;
+                    const tmCls = tm >= 0.5 ? 'good' : tm >= 0.3 ? 'medium' : 'poor';
+                    const tmTip = `TM-score vs reference (USalign, normalized by reference length; >0.5 = same fold)`;
+                    html += `<span class="metric" data-tip="${tmTip}"><span class="metric-label">TM:</span><span class="metric-value ${tmCls}">${tm.toFixed(3)}</span></span>`;
+                }
+                if (typeof metrics.rmsd_ref.rmsd === 'number') {
+                    const r = metrics.rmsd_ref.rmsd;
+                    const cls = r <= 2 ? 'good' : r <= 5 ? 'medium' : 'poor';
+                    const tip = `Cα RMSD vs reference over ${n} USalign-aligned residues`;
+                    html += `<span class="metric" data-tip="${tip}"><span class="metric-label">RMSD:</span><span class="metric-value ${cls}">${r.toFixed(2)} Å</span></span>`;
+                }
+            }
+            return html ? `<span class="metrics">${html}</span>` : '';
+        }
+
+        let _loadQueue = Promise.resolve();
+        async function loadStructure(dataB64, format, methodName) {
+            _loadQueue = _loadQueue.then(() => _loadStructureImpl(dataB64, format, methodName));
+            return _loadQueue;
+        }
+        async function _loadStructureImpl(dataB64, format, methodName) {
+            try {
+                const data = atob(dataB64);
+                const fmt = (format === 'pdb') ? 'pdb' : 'mmcif';
+                console.log(`Loading ${methodName} as ${fmt}...`);
+
+                const structCountBefore = viewer.plugin.managers.structure.hierarchy.current.structures.length;
+                await viewer.loadStructureFromData(data, fmt, { dataLabel: methodName });
+
+                const plugin = viewer.plugin;
+                const structs = plugin.managers.structure.hierarchy.current.structures;
+                const struct = structs.length > structCountBefore
+                    ? structs[structs.length - 1]
+                    : structs.find(s => s.cell?.obj?.label === methodName) || structs[structs.length - 1];
+
+                const colorHex = colorForMethod(methodName);
+                const isReference = methodName && methodName.startsWith('Reference');
+                let colorTheme;
+                if (isReference) {
+                    // Reference gets a flat grey — the chain-id LCH palette below
+                    // forces high chroma so a grey seed comes out blue. Solid grey
+                    // also visually distinguishes "ground truth" from predictions.
+                    colorTheme = {
+                        name: 'uniform',
+                        params: { value: 0x6B7280 },
+                    };
+                } else {
+                    const hue = hexToLCHHue(colorHex);
+                    colorTheme = {
+                        name: 'chain-id',
+                        params: {
+                            palette: {
+                                name: 'generate',
+                                params: {
+                                    maxCount: 20,
+                                    hue: [Math.max(0, hue - 12), Math.min(360, hue + 12)],
+                                    chroma: [30, 80],
+                                    luminance: [35, 75],
+                                }
+                            }
+                        }
+                    };
+                }
+
+                for (const component of struct.components) {
+                    for (const repr of component.representations) {
+                        await plugin.state.data.build()
+                            .to(repr.cell)
+                            .update(old => ({
+                                ...old,
+                                colorTheme,
+                            }))
+                            .commit();
+                    }
+                }
+
+                loadedStructures[methodName] = struct.cell.transform.ref;
+                document.getElementById('viewer-container').style.display = 'block';
+                const pp = plugin.canvas3d?.props.postprocessing;
+                plugin.canvas3d?.setProps({
+                    pixelScale: window.devicePixelRatio || 1,
+                    postprocessing: {
+                        ...pp,
+                        antialiasing: { name: 'smaa', params: { edgeThreshold: 0.1, maxSearchSteps: 16 } },
+                        outline: { name: 'on', params: { scale: 1, threshold: 0.33, color: 0x000000, includeTransparent: true } },
+                    },
+                });
+                plugin.canvas3d?.handleResize();
+                console.log(`${methodName} added to viewport`);
+                plugin.canvas3d?.requestCameraReset();
+            } catch (e) { console.error(`Failed to load ${methodName}:`, e); }
+        }
+
+        function toggleStructureVisibility(methodName, visible) {
+            const ref = loadedStructures[methodName];
+            if (!ref) return;
+            const state = viewer.plugin.state.data;
+            function setHidden(r) {
+                state.updateCellState(r, { isHidden: !visible });
+                const children = state.tree.children.get(r);
+                if (children) children.forEach(c => setHidden(c));
+            }
+            setHidden(ref);
+        }
+
+        let downloadAllPending = null;  // Guard against concurrent calls
+        async function updateDownloadAllButton(resultsData, inputHash, totalMethods) {
+            if (resultsData.length === 0) return;
+
+            // Wait for any pending update to finish
+            if (downloadAllPending) await downloadAllPending;
+
+            const updatePromise = (async () => {
+                const resultsEl = document.getElementById('results');
+
+                // Create zip from current results
+                const zip = new JSZip();
+                for (const r of resultsData) {
+                    const methodSlug = r.method.toLowerCase().replace(/[^a-z0-9]/g, '_');
+                    const structureBytes = atob(r.structure);
+                    zip.file(`${methodSlug}-${inputHash}.${r.ext}`, structureBytes);
+
+                    if (r.all_files) {
+                        const allFilesBytes = atob(r.all_files);
+                        const allFilesBlob = new Blob([new Uint8Array([...allFilesBytes].map(c => c.charCodeAt(0)))]);
+                        const allFilesZip = await JSZip.loadAsync(allFilesBlob);
+                        const folder = zip.folder(methodSlug);
+                        for (const [path, fileObj] of Object.entries(allFilesZip.files)) {
+                            if (!fileObj.dir) {
+                                const content = await fileObj.async('uint8array');
+                                folder.file(path, content);
+                            }
+                        }
+                    }
+                }
+
+                const blob = await zip.generateAsync({type: 'blob'});
+                const zipUrl = URL.createObjectURL(blob);
+
+                // Check for existing element AFTER async work (in case another call created it)
+                let downloadAllRow = document.getElementById('download-all-row');
+                if (!downloadAllRow) {
+                    downloadAllRow = document.createElement('div');
+                    downloadAllRow.id = 'download-all-row';
+                    downloadAllRow.className = 'result-item';
+                    downloadAllRow.style.background = '#e0f2fe';
+                    downloadAllRow.style.flexWrap = 'wrap';
+                    downloadAllRow.style.gap = '8px';
+                    resultsEl.insertBefore(downloadAllRow, resultsEl.firstChild);
+                }
+
+                const labelText = `Structures and scores (${resultsData.length}/${totalMethods})`;
+                downloadAllRow.innerHTML = `<span><span style="font-weight:500;">${labelText}</span><small style="display:block; margin-top:4px; color:#475569;">Confidence arrays are not included. Use each model’s “Confidence arrays” download.</small></span><span class="downloads"><a href="${zipUrl}" download="foldism-${inputHash}.zip">Combined ZIP · no arrays</a></span>`;
+            })();
+
+            downloadAllPending = updatePromise;
+            await updatePromise;
+            downloadAllPending = null;
+        }
+
+        document.getElementById('fold-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const fasta = document.getElementById('fasta-input').value.trim();
+            if (!fasta) { alert('Please enter a sequence'); return; }
+            updateConfidenceDownloadEstimate();
+            const methods = Array.from(document.querySelectorAll('input[name="method"]:checked')).map(el => el.value);
+            if (methods.length === 0) { alert('Please select at least one method'); return; }
+
+            const progressContainer = document.getElementById('progress-container');
+            const progressFill = document.getElementById('progress-fill');
+            const progressText = document.getElementById('progress-text');
+            const submitBtn = document.getElementById('submit-btn');
+            const logEl = document.getElementById('log');
+            const resultsEl = document.getElementById('results');
+
+            progressContainer.classList.add('active');
+            submitBtn.disabled = true;
+            logEl.innerHTML = '';
+            resultsEl.innerHTML = '';
+            if (viewer) { await viewer.plugin.clear(); loadedStructures = {}; document.getElementById('viewer-container').style.display = 'none'; }
+
+            // Estimate total time based on methods and protein size
+            const seqLength = fasta.replace(/>[^\n]*\n/g, '').replace(/\s/g, '').length;
+            const useMsa = document.getElementById('use-msa').checked;
+            const baseTimePerMethod = useMsa ? 180 : 60;  // seconds
+            const sizeMultiplier = Math.max(1, seqLength / 200);
+            const estimatedTotal = baseTimePerMethod * sizeMultiplier;  // Methods run in parallel
+            const numChains = countChains(fasta);
+
+            // Smooth progress state
+            let currentProgress = 0;
+            let targetProgress = 0;
+            let completedMethods = 0;
+            let isDone = false;
+
+            // Start timer
+            const elapsedEl = document.getElementById('elapsed-time');
+            const startTime = Date.now();
+            const timerInterval = setInterval(() => {
+                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                const mins = Math.floor(elapsed / 60);
+                const secs = elapsed % 60;
+                elapsedEl.textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
+            }, 1000);
+
+            // Smooth progress animation with asymptotic behavior
+            const progressInterval = setInterval(() => {
+                if (isDone) {
+                    currentProgress = 100;
+                } else {
+                    const elapsed = (Date.now() - startTime) / 1000;
+                    // Base progress from time elapsed (asymptotic to ~80%)
+                    // Time constant = estimatedTotal means ~63% at estimatedTotal seconds
+                    const timeProgress = 80 * (1 - Math.exp(-elapsed / estimatedTotal));
+                    // Bonus from completed methods
+                    const methodProgress = (completedMethods / methods.length) * 15;
+                    targetProgress = Math.min(95, timeProgress + methodProgress);
+                    // Smooth interpolation toward target
+                    currentProgress += (targetProgress - currentProgress) * 0.1;
+                }
+                const displayProgress = Math.round(currentProgress);
+                progressFill.style.width = displayProgress + '%';
+                progressFill.textContent = displayProgress + '%';
+                if (isDone) clearInterval(progressInterval);
+            }, 100);
+
+            log('Starting prediction...', 'info');
+
+            // Generate 6-char hash of input for filenames
+            async function hashFasta(str) {
+                const encoder = new TextEncoder();
+                const data = encoder.encode(str);
+                const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+                const hashArray = Array.from(new Uint8Array(hashBuffer));
+                return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 6);
+            }
+            const inputHash = await hashFasta(fasta);
+
+            function base64ToBlob(b64, mime) {
+                const bytes = atob(b64);
+                const arr = new Uint8Array(bytes.length);
+                for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+                return URL.createObjectURL(new Blob([arr], { type: mime }));
+            }
+
+            async function createPartialZip(resultsData, inputHash) {
+                const zip = new JSZip();
+
+                for (const r of resultsData) {
+                    const methodSlug = r.method.toLowerCase().replace(/[^a-z0-9]/g, '_');
+                    const structureBytes = atob(r.structure);
+                    zip.file(`${methodSlug}-${inputHash}.${r.ext}`, structureBytes);
+
+                    if (r.all_files) {
+                        const allFilesBytes = atob(r.all_files);
+                        const allFilesBlob = new Blob([new Uint8Array([...allFilesBytes].map(c => c.charCodeAt(0)))]);
+                        const allFilesZip = await JSZip.loadAsync(allFilesBlob);
+                        const folder = zip.folder(methodSlug);
+                        for (const [path, fileObj] of Object.entries(allFilesZip.files)) {
+                            if (!fileObj.dir) {
+                                const content = await fileObj.async('uint8array');
+                                folder.file(path, content);
+                            }
+                        }
+                    }
+                }
+
+                const blob = await zip.generateAsync({type: 'blob'});
+                return URL.createObjectURL(blob);
+            }
+
+            const formData = new FormData();
+            formData.append('fasta', fasta);
+            methods.forEach(m => formData.append('method', m));
+            formData.append('use_msa', useMsa ? 'true' : 'false');
+            formData.append('calculate_actifptm', 'true');
+            formData.append('download_confidence_data', 'true');
+            const refPdbId = document.getElementById('reference-pdb-id').value.trim();
+            const refFile = document.getElementById('reference-file').files[0];
+            if (refPdbId) formData.append('reference_pdb_id', refPdbId);
+            if (refFile) formData.append('reference_file', refFile);
+
+            try {
+                // Submit job and get job_id
+                const response = await fetch('/fold', { method: 'POST', body: formData });
+                const { job_id, error: submitError } = await readFoldismResponse(response);
+                if (submitError) throw new Error(submitError);
+                if (!job_id) throw new Error('Foldism did not return a job ID.');
+
+                // Track displayed logs and results to avoid duplicates
+                let displayedLogs = 0;
+                let displayedResults = new Set();
+                let completedResultsData = [];
+                let pollCount = 0;
+                let hasReference = false;  // bumps the denominator when a Reference row arrives
+
+                // Poll for status
+                function getPollDelay() {
+                    if (pollCount < 3) return 1000;   // First 3 polls: 1s
+                    return 3000;                       // After that: 3s
+                }
+
+                async function poll() {
+                    pollCount++;
+                    try {
+                        const statusRes = await fetch('/status/' + job_id);
+                        const data = await readFoldismResponse(statusRes);
+
+                        if (data.error) {
+                            log('Error: ' + data.error, 'error');
+                            isDone = true;
+                            clearInterval(timerInterval);
+                            clearInterval(progressInterval);
+                            submitBtn.disabled = false;
+                            return;
+                        }
+
+                        // Update progress and status
+                        if (data.status) progressText.textContent = data.status;
+                        if (data.progress) targetProgress = data.progress;
+
+                        // Display new logs
+                        if (data.logs && data.logs.length > displayedLogs) {
+                            for (let i = displayedLogs; i < data.logs.length; i++) {
+                                const l = data.logs[i];
+                                if (l.msg) log(l.msg, l.cls || '', l.method_key || null);
+                                if (l.method_complete) markMethodComplete(l.method_complete, l.cls !== 'error');
+                            }
+                            displayedLogs = data.logs.length;
+                        }
+
+                        // Handle method completion/error from top-level data
+                        if (data.method_complete) {
+                            markMethodComplete(data.method_complete, !data.method_error);
+                        }
+
+                        // Display new results
+                        if (data.results) {
+                            for (const result of data.results) {
+                                if (displayedResults.has(result.method_key)) continue;
+                                displayedResults.add(result.method_key);
+                                completedMethods++;
+
+                                const resultData = result.data;
+                                const colorStr = colorForMethod(result.method);
+
+                                const structureMime = resultData.ext === 'pdb' ? 'chemical/x-pdb' : 'chemical/x-cif';
+                                let downloadUrl = base64ToBlob(resultData.structure, structureMime), downloadExt = resultData.ext;
+                                if (resultData.original_cif) {
+                                    downloadUrl = base64ToBlob(resultData.original_cif, 'chemical/x-cif');
+                                    downloadExt = 'cif';
+                                }
+
+                                const methodSlug = result.method.toLowerCase().replace(/[^a-z0-9]/g, '');
+                                let downloads = `<a href="${downloadUrl}" download="${methodSlug}-${inputHash}.${downloadExt}">Structure</a>`;
+                                if (resultData.zip && result.method_key !== 'reference') {
+                                    const zipUrl = base64ToBlob(resultData.zip, 'application/zip');
+                                    downloads += `<a href="${zipUrl}" download="${methodSlug}-${inputHash}_all.zip">Structure + scores</a>`;
+                                }
+
+                                if (resultData.confidence_arrays_url) {
+                                    downloads += `<a href="${resultData.confidence_arrays_url}" download>Confidence arrays${Number.isFinite(resultData.confidence_arrays_bytes) ? ` · ${confidenceFileSize(resultData.confidence_arrays_bytes)}` : ''}</a>`;
+                                }
+
+                                // Parse scores and build metrics HTML
+                                let metricsHTML = '';
+                                let metrics = {};
+                                if (resultData.scores) {
+                                    try {
+                                        const scoresBytes = atob(resultData.scores);
+                                        const scores = JSON.parse(scoresBytes);
+                                        metrics = extractMetrics(scores, result.method);
+                                    } catch (e) { console.error('Failed to parse scores:', e); }
+                                }
+                                // RMSD vs reference (Å) — only present when a reference PDB was provided
+                                // and the prediction superposed onto it. From the orchestrator, not the
+                                // backend's scores.json.
+                                if (resultData.rmsd_ref && typeof resultData.rmsd_ref.rmsd === 'number') {
+                                    metrics.rmsd_ref = resultData.rmsd_ref;
+                                }
+                                metricsHTML = metrics.interface_confidence
+                                    ? confidenceTable(metrics.interface_confidence)
+                                    : `<td>—</td><td colspan="4">${buildMetricsHTML(metrics, numChains) || '—'}</td>`;
+
+                                const tableBody = outputTableBody(resultsEl);
+                                const item = document.createElement('tr');
+                                item.className = 'result-item';
+                                item.dataset.method = result.method;
+                                const rmsdRef = metrics.rmsd_ref;
+                                const rmsdHTML = rmsdRef
+                                    ? `<span class="model-rmsd" title="Cα RMSD and TM-score against the reference (USalign)">RMSD ${rmsdRef.rmsd.toFixed(2)} Å${typeof rmsdRef.tm_score === 'number' ? ` · TM ${rmsdRef.tm_score.toFixed(2)}` : ''}</span>`
+                                    : '';
+                                item.innerHTML = `<td class="model-cell"><input type="checkbox" aria-label="Show ${result.method} structure" checked onchange="toggleStructureVisibility('${result.method}', this.checked)"><span class="model-marker" style="background:${colorStr}"></span>${result.method}${rmsdHTML}</td>${metricsHTML}<td><span class="downloads">${downloads}</span></td>`;
+                                // Insert alphabetically. Reference rows (label starts with "Reference") pin to the top.
+                                const isRef = result.method && result.method.startsWith('Reference');
+                                const existing = Array.from(tableBody.querySelectorAll('.result-item[data-method]'));
+                                let insertBefore = null;
+                                if (!isRef) {
+                                    for (const el of existing) {
+                                        const name = el.dataset.method || '';
+                                        if (name.startsWith('Reference')) continue;
+                                        if (name.localeCompare(result.method) > 0) { insertBefore = el; break; }
+                                    }
+                                } else {
+                                    // Reference: insert at top of the data-method block (after any non-data-method header rows)
+                                    insertBefore = existing[0] || null;
+                                }
+                                if (insertBefore) tableBody.insertBefore(item, insertBefore);
+                                else tableBody.appendChild(item);
+
+                                // Load structure asynchronously (don't block on it)
+                                loadStructure(resultData.structure, result.format, result.method).catch(e =>
+                                    console.error(`Failed to load structure for ${result.method}:`, e)
+                                );
+
+                                // Track completed results for the ZIP. Reference rows are
+                                // included so users get the full set in one download; the
+                                // denominator is bumped by 1 to match (e.g. 3/3 = 2 backends + ref).
+                                if (result.method.startsWith('Reference')) hasReference = true;
+                                completedResultsData.push({
+                                    method: result.method,
+                                    method_key: result.method_key,
+                                    structure: resultData.original_cif || resultData.structure,
+                                    ext: resultData.original_cif ? 'cif' : resultData.ext,
+                                    all_files: resultData.zip
+                                });
+
+                                // Update "Download All" button after each result
+                                updateDownloadAllButton(completedResultsData, inputHash, methods.length + (hasReference ? 1 : 0));
+                            }
+                        }
+
+                        // Check if done
+                        if (data.done) {
+                            isDone = true;
+                            currentProgress = 100;
+                            progressFill.style.width = '100%';
+                            progressFill.textContent = '100%';
+                            progressText.textContent = 'Complete!';
+                            log('All predictions complete!', 'success');
+
+                            clearInterval(timerInterval);
+                            clearInterval(progressInterval);
+                            submitBtn.disabled = false;
+                        }
+                    } catch (pollError) {
+                        log(pollError.message, 'error');
+                        progressText.textContent = 'Connection lost';
+                        isDone = true;
+                        clearInterval(timerInterval);
+                        clearInterval(progressInterval);
+                        submitBtn.disabled = false;
+                    }
+                    if (!isDone) setTimeout(poll, getPollDelay());
+                }
+                setTimeout(poll, 500);  // First poll after 500ms
+            } catch (error) { log(error.message, 'error'); progressText.textContent = 'Request failed'; isDone = true; clearInterval(timerInterval); clearInterval(progressInterval); submitBtn.disabled = false; }
+        });
+    </script>
+</body>
+</html>

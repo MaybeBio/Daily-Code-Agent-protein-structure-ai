@@ -1,0 +1,281 @@
+// Prevents the Terminal displaying on Windows.
+// #![cfg_attr(
+//     all(not(debug_assertions), target_os = "windows"),
+//     windows_subsystem = "windows"
+// )]
+
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::needless_range_loop)]
+// Note: To test if it compiles on ARM:
+// `rustup target add aarch64-pc-windows-msvc`
+// `cargo check --target aarch64-pc-windows-msvc`
+// note: Currently getting Clang errors when I attempt htis.
+
+// todo: Consider APBS: https://github.com/Electrostatics/apbs (For a type of surface visulaization?)P
+
+//! [S3 Geostd link](https://daedalus-mols.s3.us-east-1.amazonaws.com/amber_geostd)
+
+mod annotations;
+mod compute_caps;
+mod docking;
+mod drawing;
+mod edit_history;
+mod file_io;
+mod force_fields;
+mod inputs;
+mod inspection;
+mod pocket_render;
+mod prefs;
+mod project;
+mod publication;
+mod region_select;
+mod render;
+mod sfc_mesh;
+mod split_join;
+mod ui;
+mod util;
+
+mod cli;
+mod rdkit_smiles;
+mod reflection;
+
+pub mod antibody;
+mod cam;
+mod crystal;
+mod drug_design;
+mod external_tools;
+mod gizmo;
+mod gromacs;
+mod lod_generalization;
+mod md;
+mod mol_alignment;
+mod mol_db;
+mod mol_diagrams;
+mod mol_editor;
+mod mol_manip;
+mod nucleic_acid_creation;
+mod orca;
+mod peptide_creation;
+mod peptide_ligands;
+mod properties;
+mod protein_alignment;
+mod reactions;
+#[cfg(feature = "synthesis")]
+mod reactions_synthesis;
+mod screening;
+mod selection;
+#[cfg(feature = "sonification")]
+mod sonification;
+mod state;
+#[cfg(test)]
+mod tests;
+mod therapeutic_misc;
+mod threads;
+mod xtb;
+
+use std::time::Instant;
+
+use dynamics::{
+    Integrator,
+    params::{FfParamSet, amber::LIPID_21_LIB},
+};
+use mol_defs::molecules::{
+    amino_acid::load_aa_templates, lipid::load_lipid_templates, nucleic_acid::load_na_templates,
+};
+use state::State;
+
+use crate::{render::render, util::handle_err};
+
+/// The application version, e.g. for the About popup. Cargo.toml's `[package] version` is the
+/// single place it's set; the `make_release` scripts read it from there too.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Handle the maintenance flags that run instead of launching the GUI.
+///
+/// Kept to a hand-rolled match rather than an argument parser: there is one flag, and the normal
+/// invocation takes no arguments at all.
+fn handle_cli_flags() -> Option<i32> {
+    let flag = std::env::args().nth(1)?;
+    match flag.as_str() {
+        // Internal worker: exit before initializing application state, CUDA, or the viewport.
+        "--render-figure" => Some(publication::worker_main()),
+        "--bio-tools-adapter-rpc" => {
+            let paths: Vec<_> = std::env::args_os().skip(2).collect();
+            let [request, response] = paths.as_slice() else {
+                return Some(2);
+            };
+            match bio_tools::adapters::rpc::serve(
+                std::path::Path::new(request),
+                std::path::Path::new(response),
+            ) {
+                Ok(()) => Some(0),
+                Err(error) => {
+                    eprintln!("bio_tools adapter: {error}");
+                    Some(1)
+                }
+            }
+        }
+        // Checks the native ProteinMPNN port in src/therapeutic_misc/ddg against the reference forward
+        // pass scripts/convert_mpnn_weights.py recorded from upstream. See that module's docs.
+        "--verify-mpnn" => {
+            let path = match therapeutic_misc::ddg::weights_path() {
+                Some(path) => path,
+                None => {
+                    eprintln!("No location is known for the ProteinMPNN weights.");
+                    return Some(1);
+                }
+            };
+            println!(
+                "Verifying the native ProteinMPNN implementation against {}",
+                path.display()
+            );
+            match therapeutic_misc::ddg::verify(&path) {
+                Ok(difference) => {
+                    println!("Largest disagreement with upstream: {difference:.3e}");
+                    // A port that matches should agree to within f32 accumulation noise over six
+                    // message-passing layers. Anything above this means a layer differs from the
+                    // one it mirrors, and the ΔΔG numbers should not be trusted.
+                    if difference < 1e-3 {
+                        println!("The native implementation matches upstream ProteinMPNN.");
+                        Some(0)
+                    } else {
+                        eprintln!(
+                            "This exceeds the 1e-3 tolerance: the native implementation does NOT \
+                             match upstream. Do not rely on its ΔΔG output."
+                        );
+                        Some(1)
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Verification could not run: {error}");
+                    Some(1)
+                }
+            }
+        }
+        "--help" | "-h" => {
+            println!(
+                "Molchanica — molecule editing, visualization, and dynamics.\n\n\
+                 Run with no arguments to launch the GUI.\n\n\
+                 Flags:\n  \
+                 --verify-mpnn   Check the native ProteinMPNN ΔΔG implementation against the \
+                 reference pass recorded by scripts/convert_mpnn_weights.py."
+            );
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+fn main() {
+    if let Some(code) = handle_cli_flags() {
+        std::process::exit(code);
+    }
+
+    // Before anything reads the data root: earlier versions installed optional tools into the
+    // per-user data directory instead of beside the executable.
+    external_tools::migrate_legacy_data();
+
+    // Managed GROMACS installs aren't on PATH.
+    bio_files::gromacs::set_gmx_resolver(|| {
+        external_tools::find_executable(external_tools::Tool::Gromacs).ok()
+    });
+
+    compute_caps::detect_in_background();
+
+    let mut state = State::default();
+
+    // todo: Consider if you want this here. Currently required when adding H to a molecule.
+    // In release mode, takes 20ms on a fast CPU. (todo: Test on a slow CPU.)
+    println!("Loading force field data from Amber lib/dat/frcmod...");
+    let start = Instant::now();
+    match FfParamSet::new_amber() {
+        Ok(f) => {
+            state.ff_param_set = f;
+            let elapsed = start.elapsed().as_millis();
+            println!("Loaded FF data in {elapsed}ms");
+        }
+        Err(e) => {
+            handle_err(
+                &mut state.ui,
+                format!("Unable to load Amber force field data: {e:?}"),
+            );
+        }
+    }
+
+    state.load_prefs();
+
+    // Molecule preparation starts with Amber each session. A sidebar choice
+    // changes both displayed atom types and the MD family's conventions.
+    if state.to_save.md.config.ff_family != dynamics::ForceFieldFamily::Amber {
+        let preset = dynamics::MdConfig::for_family(dynamics::ForceFieldFamily::Amber);
+        state.to_save.md.config.ff_family = preset.ff_family;
+        state.to_save.md.config.coulomb_cutoff = preset.coulomb_cutoff;
+        state.to_save.md.config.lj_cutoff = preset.lj_cutoff;
+        state.to_save.md.config.lj_modifier = preset.lj_modifier;
+        state.to_save.md.config.water_model = None;
+    }
+
+    {
+        // Set these UI strings for numerical values up after loading prefs
+        state.ui.ph_input = state.to_save.ph.to_string();
+
+        state
+            .ui
+            .md
+            .sync(&state.to_save.md.config, state.to_save.md.dt);
+
+        state.ui.md.langevin_γ = match state.to_save.md.config.integrator {
+            Integrator::LangevinMiddle { gamma } => gamma.to_string(),
+            _ => "0.".to_string(),
+        };
+
+        state.ui.md.temp_tau = match state.to_save.md.config.integrator {
+            Integrator::VerletVelocity { thermostat } => match thermostat {
+                Some(tau) => tau.to_string(),
+                None => "0.".to_string(),
+            },
+            _ => "0.".to_string(),
+        };
+
+        state.graphics_settings = state.to_save.graphics.to_engine();
+    }
+
+    match load_lipid_templates(LIPID_21_LIB) {
+        Ok(t) => {
+            state.templates.lipid = t;
+        }
+        Err(e) => {
+            handle_err(
+                &mut state.ui,
+                format!("Unable to load lipid templates: {e}"),
+            );
+        }
+    }
+
+    match load_na_templates() {
+        Ok((dna, rna)) => {
+            state.templates.dna = dna;
+            state.templates.rna = rna;
+        }
+        Err(e) => {
+            handle_err(
+                &mut state.ui,
+                format!("Unable to load nucleic acid templates: {e}"),
+            );
+        }
+    }
+
+    match load_aa_templates() {
+        Ok(t) => {
+            state.templates.amino_acid = t;
+        }
+        Err(e) => {
+            handle_err(
+                &mut state.ui,
+                format!("Unable to load amino acid templates: {e}"),
+            );
+        }
+    }
+
+    render(state);
+}

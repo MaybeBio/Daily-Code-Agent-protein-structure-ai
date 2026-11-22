@@ -1,0 +1,868 @@
+# Changelog
+
+## Unreleased
+
+- **Literature benchmark suite (tier `t9`).** `validation/science/scripts/benchmark.py`
+  imports published DFT references (LiPS-25, LiPS20, OMat24, JARVIS-DFT, and
+  local MS25 manifests) through a hash-pinned registry, evaluates a model
+  profile with `literature_eval.py`, and writes a bilingual report. It reuses
+  the existing result schema, evidence aggregator and backend venv isolation,
+  separates software verification from model accuracy, labels every record as
+  `reference_matched` or `cross_method`, and never converts a stored virial
+  into stress.
+- `run_suite.py` gained `t9` plus `--dataset/--split/--relax/--workflows`
+  forwarding; `evidence.loader.TIER_NAMES` knows `t9`. Both changes are
+  additive: existing tiers, records and history are untouched.
+
+## 2.0.0b5
+
+Stabilisation, whole-tree source audit and scientific-correctness beta. It is
+still a beta: the test suite and the audits cover *software* behaviour; how
+accurately a model reproduces DFT for your material remains the model's
+question, answered only by your own reference calculations.
+
+Highlights since `2.0.0b4`:
+
+- **Configuration search (`confsearch`).** `mliport confsearch run|resume|extend`
+  explores surface/intercalation minima with MD + quench + Metropolis over
+  several random starts, and writes resumable, fingerprinted checkpoints and
+  exports. It is covered by synthetic-model tests and has not been through a
+  real-model GPU campaign, so treat its ranking as a screening for DFT.
+- **NEP-ASE and native GPUMD.** A NEP potential can now run through Calorine in
+  the ASE engine, or natively through GPUMD (versioned `nep89` files, per-element
+  cutoffs, commit-verified native trajectory and provenance). The installer
+  refuses a pre-existing environment that does not satisfy the pinned contract.
+- **Dispersion correction.** `--d3` adds DFT-D3 through `torch-dftd` inside the
+  existing MLIP environment; it is opt-in and recorded in provenance.
+- **Task folders and INCAR-style input.** `mliport run` reads `INCAR.mliport`
+  from a task folder, the TUI has a three-question new-task wizard, and the
+  option table, templates and generated key reference all come from one schema.
+  Name-only `MODEL_PATH` values resolve through `models/` (two matches refuse
+  rather than pick one). `OUTPUT_DIR = .` is a real opt-out.
+- **ASE isotropic MTK NPT** for the four ASE engines: volume-only degrees of
+  freedom, per-frame cells in the trajectory, MTK options validated before any
+  output or model load, keyword-only placement so the historical positional
+  `MDRunner` order keeps working (Issue #102), and fixed-cell XDATCAR/transport
+  use refused for a variable cell.
+- **Backend compatibility and runtime reliability.** UMA moved to
+  `fairchem-core 2.25.0`; MACE refuses checkpoints that are not potential-energy
+  models instead of mispredicting; DPA accepts lossless dtype widths and gained
+  a legacy runtime for DPA-2 checkpoints such as DPA-SSE; GRACE has a Verlet
+  neighbour cache that keeps every periodic image; the runtime probe works on
+  CPU and on any structure.
+- **Failure states that used to look like success.** A `numpy` boolean can no
+  longer decide "converged"; a NEB resume that changes a physics option is
+  refused and names the conflicting field; one bad structure cannot abort a
+  batch, and an unserialisable value (NaN/Inf/object) no longer truncates
+  `batch_summary.json`; MD/CLI errors report the actual problem instead of a
+  POSIX errno.
+- **GEMDAT site analysis.** The "is this really a zero-transition trajectory?"
+  cross-check now compares atoms and sites in one coordinate frame and uses the
+  true triclinic minimum image; unresolved or non-finite geometry fails closed
+  instead of reporting a physical zero.
+- **kinisi transport credibility.** `publication_grade` now carries an explicit
+  scope and every result records `quality.statistical_adequacy = "not_assessed"`;
+  neither flag claims statistical convergence, and both are written to
+  `provenance.json`.
+- **Thermodynamics and provenance.** `thermo` reports per-column frame counts
+  (total / finite / non-finite) so a partially corrupted `md.csv` cannot look
+  healthy, block statistics now drop `±Inf` as well as `NaN`, and the analysis
+  cache identity uses exactly the files the loader reads (with an actionable
+  error when a run directory has no trajectory).
+- **Cleanup, dependencies and licences.** Unreferenced inherited modules were
+  removed (see the compatibility table below), the `transport`/`electrolyte`
+  extras now declare `scipp`/`pymatgen` because they are imported directly, the
+  installer texts say Python 3.10–3.13, and the GRACE backend page states that
+  `tensorpotential` is academic/non-commercial only.
+
+**Python API compatibility.** `mliport.utils` (whole module),
+`mliport.logger.setup_logger`, `mliport.logger.CalculationLogger`,
+`mliport.cli._model_layer_from_context`, `mliport.calculators.nep_calc._parse_cutoff_row`,
+`mliport.neb.results._max_atom_force`,
+`mliport.analysis.electrolyte.GEMDAT_STATUS_UNSUPPORTED` and two unused constants
+in `mliport.analysis.units` were removed. The CLI, the documented Python API and
+every workflow are unaffected; an external script that imported those names must
+switch to the replacements listed below (section "Repository maintenance").
+
+**Scientific boundaries (unchanged by this release).**
+
+- Software correctness is not model accuracy: the validated surface is "the
+  workflow computes what it says it computes", not "the potential matches DFT
+  for your material".
+- NPT is isotropic MTK only (volume freedom); there is no fully flexible or
+  Parrinello–Rahman cell.
+- `publication_grade` does not mean the diffusion coefficient has converged;
+  statistical adequacy is not auto-certified, and a short trajectory cannot give
+  a reliable ionic conductivity.
+- A historical GEMDAT `no_events` result for a non-cubic cell (or one whose
+  nearest-site assignment is ambiguous) was decided by an unreliable check and
+  should be re-run with this version before it is cited.
+- GRACE/`tensorpotential` is under an Academic Software Licence: academic,
+  non-commercial use only.
+- Parts of the hardware matrix, the official long-running validation suites and
+  the MLIP-vs-DFT comparisons remain unrun; see the living ledger (#75).
+
+Detailed development log since `2.0.0b4` follows.
+
+### Detailed changes
+
+Repository maintenance (tracking: #75):
+
+**Removals that can break an out-of-tree `import`.** Nothing inside this
+repository, its tests, `scripts/`, `validation/`, docs or entry points referenced
+any of the names below, and none is exported through `mliport.__all__` or
+documented as an API. Code outside this repository that imported them directly
+now fails:
+
+| removed | what you get now |
+| --- | --- |
+| `mliport/utils.py` (the whole module) | `ModuleNotFoundError: No module named 'mliport.utils'` |
+| `mliport.logger.setup_logger`, `mliport.logger.CalculationLogger` | `ImportError` / `AttributeError` |
+| `mliport.cli._model_layer_from_context` | `AttributeError` |
+| `mliport.calculators.nep_calc._parse_cutoff_row` | `AttributeError` |
+| `mliport.neb.results._max_atom_force` | `AttributeError` |
+| `mliport.analysis.electrolyte.GEMDAT_STATUS_UNSUPPORTED` | `AttributeError` |
+| `mliport.analysis.units.PS_TO_S`, `CM2_S_TO_M2_S` | `AttributeError` |
+
+The replacements exist and are what the product itself uses: `mliport.analysis`
+for trajectory/thermodynamics work instead of the old `utils` helpers,
+`LiveRunLogger` + `follow_log_command` for logging,
+`_confsearch_layer_from_context` for the confsearch config layer, and
+`nep_model_format.read_nep_model_metadata` for NEP model headers. The two unit
+constants are trivially re-derivable (`PS_TO_S = 1e-12`, `CM2_S_TO_M2_S = 1e-4`).
+
+Why the removed code was not worth keeping:
+
+- `mliport/utils.py` held 8 FAIRChem-inherited helpers that duplicated behaviour
+  living elsewhere with *different* rules (`calculate_pressure` /
+  `stress_voigt_to_tensor` assume one specific Voigt order, `find_structure_file`
+  has its own glob priority next to the real resolver, `estimate_memory` is a
+  fixed guess), so two versions of the same physics invited divergence;
+- `logger.CalculationLogger` was a second logging path nothing called (it created
+  its own `calculation.log`, a name the run-artifact scanner treats specially);
+- `nep_calc._parse_cutoff_row` was superseded by the shared parser but kept
+  *different* cutoff rules, and `cli._model_layer_from_context` was superseded by
+  `_confsearch_layer_from_context` (which also reconstructs `cs_starts`);
+- `GEMDAT_STATUS_UNSUPPORTED` was a status the adapter never produces.
+
+- The `confsearch` discovery column now uses `DISCOVERY_WINDOW_EV` instead of a
+  second hard-coded `0.2` (same value, one source of truth).
+- The `transport` and `electrolyte` extras now declare `scipp` and `pymatgen`
+  explicitly: both are imported directly and were only available through
+  `kinisi`/`gemdat`.
+- The installer's usage text and docstring say Python 3.10–3.13, matching
+  `SUPPORTED_PYTHON_VERSIONS` (the error message derives the range from it).
+
+TUI new-task wizard (tracking: #61, R5):
+
+- `mliport tui` now opens on a wizard that asks three things - calculation type,
+  structure file and model (backend first, then a file from the `models/`
+  listing) - and writes a task folder: `INCAR.mliport` from the same generator
+  as `mliport template` with `MODEL_TYPE`/`MODEL_PATH` filled in, plus a
+  byte-for-byte copy of the structure under the name `mliport run` looks for
+  (`POSCAR` / `structure.cif` / `structure.xyz`). It then prints
+  `cd <folder> && mliport run`; "Create & Run" calls `mliport run` itself, so
+  the wizard and the command line share one run path.
+- The previous entry points stay reachable under "Advanced": the manual
+  configuration screens (SP/OPT/MD/NEB/CONFSEARCH), jobs, analysis and the
+  template generator, which now also accepts `confsearch` instead of silently
+  writing an SP template.
+- The wizard leaves `TASK` (and `HEAD` where the backend has an active one) as
+  `REQUIRED` placeholders and reports them, because the UMA task family and the
+  other backends' `bulk`/`molecule` semantic are model decisions that a
+  one-click run must not inherit from a template default.
+- A model picked from a `models/` subdirectory (`uma/s1.pt`) is written as the
+  absolute path inside `models/`, not as a working-directory-relative path.
+- The task-folder logic lives in `mliport/task_folder.py` (no Textual import),
+  so it is unit-tested without a terminal: template reuse, suffix
+  normalization, byte-identical copies, refusal to overwrite an existing task,
+  and the run delegation.
+- `docs/configuration.md` (+ `.zh.md`) describes the new TUI flow.
+
+`models/` directory convention (tracking: #61):
+
+- A `MODEL_PATH` that is a file name (no path separator) is looked up next to
+  the declaring file first and then in `<MLIPORT_ROOT>/models/<name>` and
+  `<MLIPORT_ROOT>/models/*/<name>` (one level of subdirectories). Two matches
+  are an error instead of an arbitrary pick, because a different checkpoint is
+  a different model identity. Values that contain a path separator keep exactly
+  their previous meaning and are never redirected into `models/`. A bare name
+  that cannot be found now fails before the run starts, with every searched
+  location and the files `models/` does contain, instead of failing later at
+  model load.
+- `MLIPORT_ROOT` is taken from the environment, else from the parent of an
+  installer-created `.venv-<engine>` prefix; with no root a bare file name is
+  refused with instructions rather than resolved against a guess. The generated
+  `bin/mliport-<engine>` launchers export it (POSIX and Windows).
+- `mliport doctor` reports the resolved checkout root, the `models/` directory
+  and the model files it holds.
+- The resolved absolute model path is what `resolved_config.json` records, as
+  before - only the lookup that produced it is new.
+- `docs/configuration.md` (+ `.zh.md`) documents the convention, the lookup
+  order, the fail-closed cases and the new environment variable.
+- A model may be a directory (GRACE SavedModel) as well as a file: a
+  same-named directory next to the declaring file keeps the previous
+  behaviour, and a directory in `models/` is found by name.
+- `MLIPORT_ROOT` is only derived from a `.venv-<engine>` prefix when its parent
+  really is a checkout (`models/`, a `bin/mliport-*` launcher or
+  `mliport/pyproject.toml`), because `.venv` is also the name of any project
+  virtualenv; otherwise a file name fails closed with instructions. The
+  generated launchers only set `MLIPORT_ROOT` when the caller has not set it,
+  so a shared model store pointed at by `MLIPORT_ROOT` keeps working.
+- `models/` stays git-ignored and the repository hygiene policy still refuses
+  tracked weights.
+
+Task folder + INCAR usage round (tracking: #61):
+
+- `mliport run` now writes into `results/` in the folder that holds the INCAR
+  instead of the current directory. This is the one intentional behaviour
+  change of the round: `--output` and `OUTPUT_DIR` still win, a relative
+  `OUTPUT_DIR` resolves against the INCAR folder instead of the current
+  directory, and `OUTPUT_DIR = .` restores the old behaviour (a relative
+  `OUTPUT_DIR` from `settings.ini` or the command line is still
+  current-directory relative, as before). Only `run` changes its default;
+  `sp`/`opt`/`md`/`neb`/`batch`/`confsearch` are unaffected. A directory that already holds results is still refused without
+  `--overwrite`.
+- `mliport run` validates the INCAR and resolves the model path before it looks
+  for or reads the structure, so a broken configuration is reported as a
+  configuration error rather than as a missing POSCAR or a backend failure.
+- `CALC_TYPE = CONFSEARCH` is accepted by `mliport run` and goes through the
+  same code path as `mliport confsearch run`; `CALC_TYPE = BATCH` still points
+  at `mliport batch`.
+- The `confsearch` template now emits `CS_STARTS` / `CS_ADSORBATE_INDICES` as
+  fill-in placeholders (mode A) with the mode-B keys as commented examples, and
+  a parametrised round-trip test (5 template types x 6 backend values) pins
+  that every generated template is accepted by the validation and resolution
+  `mliport run` performs.
+- `docs/configuration.md` (+ `.zh.md`) documents the task folder, the new
+  default output directory and the `CONFSEARCH` dispatch; `docs/outputs.md`
+  (+ `.zh.md`) records where a run writes.
+
+Generated INCAR templates and key reference from one option table (tracking:
+#61):
+
+- `OptionSpec` in `mliport/config/schema.py` now carries the presentation
+  metadata - section, order, template membership, "applies only when"
+  conditions, the placeholder a template writes for a value only the user can
+  supply and a display value for keys whose runtime default lives in the
+  writer - and the confsearch and MTK NPT keys finally have real one-line
+  meanings instead of "confsearch option <name> (spec section 12.3)".
+- `mliport template <type>` is generated from that table: sections appear once
+  each in a fixed order (`Calculation`, `Model`, `Device and resources`,
+  `Optimization`, `Molecular dynamics`, `NEB`, `Configuration search`,
+  `Output`), every key carries its one-line meaning, only the keys of the
+  selected calculation type appear, only the selected thermostat's parameters
+  are written, and the MD template keeps the NPT keys as a commented example
+  (`MD_ENSEMBLE = NPT`, `PRESSURE_GPA`, `NPT_TDAMP`, `NPT_PDAMP`, ...).
+- New bilingual reference page `docs/incar.md` (+ `.zh.md`), generated by
+  `scripts/generate_docs.py` (so `--check` in CI keeps it in sync) from the same
+  table: key, type, default, allowed values, meaning, applicability and
+  aliases, per section and per calculation type. It is in the `mkdocs.yml` nav,
+  linked from `docs/configuration.md` (+ `.zh.md`), from `docs/quickstart.md`
+  (+ `.zh.md`) and from one README row.
+- `mliport config schema` prints the section of every key, so the command, the
+  templates and the documentation cannot disagree.
+- `docs/quickstart.md` (+ `.zh.md`) gains a "task folder" section next to the
+  existing command-line walkthrough, which is unchanged.
+
+- The NEB template writes `NEB_INITIAL = REQUIRED` / `NEB_FINAL = REQUIRED`
+  instead of the plausible-looking `initial.vasp` / `final.vasp`, so a task
+  folder cannot look complete while pointing at structures that do not exist.
+- The model section's `MODEL_PATH` / `MODEL_TYPE` comments now come from the
+  option table instead of the stale "path relative to settings.ini" wording.
+- The generated key reference covers the batch keys and no longer prints the
+  internal "mode B" sentinel as an `CS_MODE = MODE_B` condition; example-only
+  values are marked as examples rather than as required.
+
+Tests: `tests/mliport/mliport/config/test_incar_templates.py` pins the template
+structure (one section each, fixed order, one comment per key, only the
+selected thermostat, the commented NPT example, per-calc-type key sets) and
+checks that every template key is documented and every documented key is a real
+option.
+
+DPA-SSE support through a DPA-2 legacy runtime:
+
+- DPA has a second, explicitly selected environment. `.venv-dpa-legacy` (install
+  target `dpa-legacy`) pins `deepmd-kit==3.0.0b3` - an upstream pre-release, and
+  the newest release whose repformer layout reconstructs DPA-2 checkpoints - with
+  `torch==2.3.1` (`+cu121`, which still ships Volta sm_70 kernels) and Python
+  3.10-3.12. The pinned DPA runtime rebuilt `SSE-VASP-dpa2.pt` with 24 reshaped
+  tensors, and mliport does not reshape, re-key or re-initialise weights; the two
+  conversion routes fail as well (frozen `.pth`: unknown `charge_spin` argument;
+  `convert-backend`: `KeyError: 'g1_out_mlp'`), so the mismatch is an environment
+  boundary, not an adapter bug.
+- `DPA_RUNTIME=legacy|current` (default `current`, `--dpa-runtime`, INCAR
+  `DPA_RUNTIME`, settings, API, queue): no automatic fallback in either
+  direction. The legacy environment refuses DPA-3/DPA4/DPA4C checkpoints and
+  names the runtime to use; the current environment refuses the legacy
+  deepmd-kit. The legacy runtime only accepts a checkpoint that loads with
+  `torch.load(weights_only=True)`, so the distributed training checkpoint must go
+  through the existing trust-gated `scripts/convert_dpa_checkpoint.py`.
+- Provenance records `dpa_runtime` and the deepmd-kit version next to the model
+  identity. On a torch without `device_properties().uuid` (2.3.1) the GPU UUID is
+  taken from the single-entry `CUDA_VISIBLE_DEVICES` the isolation contract
+  requires, and `actual_device_uuid_source` says so instead of implying a
+  runtime check.
+- `docs/backends/dpa.md` (+ `.zh.md`) documents DPA-SSE, its PBEsol sulfide
+  chemistry, the legacy route and the warning that a 118-element `type_map` is
+  not training coverage; the model-support table gains the `dpa_sse` row.
+- Evidence: mliport reproduces the deepmd-kit 3.0.0b3 references exactly
+  (|dE| = 0, max |dF| <= 8e-16 eV/A, max |dvirial| <= 1.1e-14 eV on four
+  structures) and passes the callable probe on CPU and V100.
+
+Model support status:
+
+- `docs/models.md` (+ `.zh.md`) now carries the measured status of the pinned
+  profiles and of the models added to scope: 18 profiles are `verified` on both
+  CPU and GPU after the bounded callable check (load, finite energy/force/stress
+  on the 50-atom LGPS cell, shared calculator, central-difference forces, 10 NVE
+  steps, five-image NEB). Across all of them the largest CPU-vs-GPU difference
+  was 6.1e-7 eV/atom and 7.5e-6 eV/angstrom (`mace_omat_float32`).
+- UMA: `uma_omat`, `uma_s_1p2p1_omat` and `uma_s_1p2p1_ft_r2scan_omat` verified
+  on both devices (`inference_preset: batch`, `nitro_enabled: false`; the r2SCAN
+  fine-tune is refused by the NEB gradient preflight, which the table states).
+  `uma_omat` needed the artifact re-downloaded first: the earlier copy had the
+  right size but failed the zip CRC, and the re-uploaded file matches the pinned
+  manifest hash `ba5c0d912efa...`.
+- Every Evidence cell links the specific #75 comment that holds the record.
+
+Model registry corrections:
+
+- Three model licenses in `validation/science/model_manifest.json` were wrong and
+  are corrected against the upstream cards read on 2026-11-14: MACE-OMAT-0 (both
+  dtype profiles) is ASL as the `mace-foundations` model table says, not
+  Apache-2.0; DPA-3.1-3M is CC-BY-4.0 per its Hugging Face card, not LGPL-2.1;
+  and the GRACE foundation models are under the Academic Software License (ASL)
+  per the `AMS-ICAMS-RUB/grace-foundation-models` card. Metadata only.
+- The docs count five backends, not four, and name the NEP adapter in the model
+  table.
+- `docs/models.md` gains a "Model support status" section: the `verified` /
+  `untested` / `needs_runtime_upgrade` / `unsupported` vocabulary, the note that
+  `verified` means "called correctly", not "accurate", and one row per pinned
+  profile, per model newly in scope and for NEP89. The archived `uma-s-1.pt` is
+  described in prose rather than given a row: `unsupported` means mliport
+  refuses a model, and nothing refuses that one.
+  A docs contract test keeps the table in step with the manifest.
+
+MACE model-class gate:
+
+- `MACECalculatorWrapper` now refuses checkpoints that are not potential-energy
+  models instead of evaluating them: dipole/polarizability-only models
+  (`AtomicDipolesMACE`, `AtomicDielectricMACE`, the MACE-MDP family),
+  MACE-POLAR polarizable electrostatics (`PolarMACE` from
+  `mace.modules.extensions`, which upstream loads through `mace_polar` with
+  `model_type="PolarMACE"`), and models with charge/spin joint embeddings
+  (`embedding_specs`/`joint_embedding`, the MACE-OMOL family, which reads total
+  charge and spin from `atoms.info`). The decision is taken from the loaded
+  model object, never from the file name, and the error names the reason and
+  the upstream loader.
+- The gate is only meaningful when the loaded calculator exposes the models it
+  built: a missing, empty or non-list `calculator.models` now stops the load
+  with an explicit message instead of silently skipping the check. The
+  attribute-shaped polar/OMOL discriminators are only applied to real
+  `torch.nn.Module` models, so a mock or a proxy that answers every attribute
+  cannot fake a polar checkpoint.
+- MACE-MH-1 is unaffected: it loads as `ScaleShiftMACE` with six heads and no
+  embedding block, and a test pins that.
+- `docs/backends/mace.md` (+ `.zh.md`) documents the gate.
+
+UMA runtime upgrade for UMA-S 1.2.1:
+
+- `fairchem-core` moves from 2.21.0 (torch 2.8.0) to the newest release whose
+  torch pin still has a CUDA 12.6 wheel for Volta: 2.25.0 on torch 2.13.0
+  (`torch~=2.13.0`, Python >=3.11,<3.15). Volta stays on `cu126`; Turing and
+  newer use `cu130`, the CUDA version of the default PyPI torch 2.13.0 build,
+  because CUDA 13 has no kernels below Turing.
+- `FRAMEWORK_PYTHON` gains torch 2.13.0 and `_torch_modern_cuda` maps it to
+  `cu130`, so an unknown version still fails closed until audited.
+- The install docs and the UMA backend page are regenerated from the registry.
+- UMA Nitro is not exposed. fairchem-core 2.22+ redefined the upstream
+  `default` preset as UMA Nitro and removed `turbo`, so mliport now maps its own
+  two names onto the presets that keep the documented numbers: `default` ->
+  upstream `batch` (tf32 off, no compile, no merged MOLE) and `turbo` ->
+  upstream `multigpu` (upstream's "turbo's former settings"). A preset that
+  would enable Nitro is refused, a missing preset fails closed with an upgrade
+  message, and the effective preset, its tf32 flag and its Nitro flag are
+  recorded in the model identity. Regression tests pin the mapping.
+- `docs/backends/uma.md` (+ `.zh.md`) records that the beta scientific
+  validation of `uma_omat` ran on fairchem-core 2.21.0 and does not carry over
+  to this runtime.
+- `docs/installation.md` (+ `.zh.md`) and the UMA page state the driver
+  requirement: the CUDA 13 `cu130` wheels used on Turing and newer need an
+  NVIDIA driver of 580 or newer, while Volta stays on `cu126` and keeps working
+  with older drivers.
+
+DPA-3.1 checkpoints load on the DPA4 runtime:
+
+- The pinned deepmd-kit 3.2.1 builds the three DPA-3.1 statistics tensors
+  (`atomic_model.out_bias`, `out_std`, `bias_atom_e`) as float64 while the
+  distributed checkpoint stores them in float32. Every one of the 351 tensors
+  keeps its shape and value, but the all-or-nothing tensor guard treated that
+  lossless widening as a changed model and refused DPA-3.1-3M on the runtime
+  that DPA4 needs -- so DPA-3.1 could only run on the older 3.1.3 environment.
+- The guard now accepts only a strictly wider floating type whose values are
+  bit-identical after the cast, and records the widening in the checkpoint
+  migrations. Narrowing, shape changes and value changes are still refused, and
+  `declared_model_precision` keeps reporting what the checkpoint stored.
+- `docs/backends/dpa.md` (+ `.zh.md`) documents the rule.
+
+Callable-check probe on CPU and on any structure:
+
+- `scripts/validate_runtime.py` could not run at all: it imported `_hash_model`
+  from `mliport.neb.workflow`, which no longer exists. It also hard-coded
+  `cuda:0`, UMA's `omat` task, a Cu cell and a `v100-` evidence prefix, so it
+  could not check a CPU run or another structure.
+- The probe now takes a required `--device cpu|cuda:N`, an optional
+  `--structure` (any ASE-readable file with 2-32 unconstrained atoms) and
+  `--task` (required for `uma`, `bulk` otherwise). A CPU run needs no GPU UUID
+  and rejects a GPU placement; a CUDA run keeps the UUID and ordinal
+  confirmation. The evidence id names the device type, the hardware block is
+  written only for GPU runs, and the report schema is
+  `mliport.runtime-validation/2`.
+- Follow-ups found on real backends: the GPU-only GRACE memory cap is no longer
+  sent on CPU runs; `dpa` and `grace` refuse to start without
+  `CUDA_VISIBLE_DEVICES` (the CLI restarts itself, a standalone probe cannot)
+  and the probe says so with the exact command; the five-image NEB relaxes its
+  endpoints instead of relying on the fixture's initial forces.
+- `docs/validation.md` (+ `.zh.md`) documents the usage.
+
+Installer environment contract and CI repair:
+
+- An existing target environment is now inspected before any step runs. A
+  compatible venv (real virtual environment of the requested Python, carrying no
+  other backend's packages) is reused and its pinned packages are re-resolved in
+  place; a plain directory, an unreadable interpreter, another Python version or
+  a venv holding another backend's framework is refused with an actionable
+  `--clean` message and nothing is executed. `uv venv --allow-existing` is no
+  longer an unconditional pass: on its own it initialises a venv inside a
+  foreign directory and replaces a venv built with a different Python.
+- Update the DPA plan assertions to the pinned torch 2.11.0 (DeepMD ABI pin) and
+  add a regression that plans track the compatibility matrix, so a framework
+  bump can no longer leave main's CI red.
+
+DPA4 runtime compatibility:
+
+- Pin PyTorch 2.11.0 and upstream DeePMD commit
+  `0edeaef5617e9878edeb2346bf37bb6a035a4f51` for DPA4-Neo and the published
+  DPA4C checkpoints using `gaussian/fix`. Install the SO(3)/neighbor-list
+  dependencies, build against the selected torch ABI, and retain exact source
+  and package constraints. Existing matching Python environments are preserved
+  during installation; offline source-runtime installs use a local wheelhouse.
+- Record actual device and precision for both regular and exportable PyTorch
+  evaluators. Reject partial `.pt` loads and changed learned tensors, while
+  recording the pinned upstream's non-spin descriptor schema migration and
+  regenerated integer gather caches.
+- The legacy DPA-SSE checkpoint remains incompatible with the current network
+  layout after its metadata conversion; no weight reshaping or missing-weight
+  initialization is used to make it load.
+
+DPA checkpoint migration (#91):
+
+- Added explicit trust-gated offline conversion of legacy DPA-SSE training
+  `.pt` checkpoints whose NumPy scalar metadata is rejected by DeePMD's
+  `weights_only=True` loader. The converter does not patch upstream or change
+  global deserialization policy; it preserves float64 tensors exactly, removes
+  optimizer data and records input/output SHA-256 in a separate provenance file.
+  Only use it with verified trusted checkpoints; model predictions still require
+  scientific reference validation.
+
+NEP model-format compatibility (#90):
+
+- Recognize GPUMD format-version-1 energy NEP files such as NEP89 (first
+  line `nep 89 ...`, separate `format_version 1` and `model nep`). Both
+  runtime paths use the same strict header parser. Record format revision,
+  model family, ordered elements, cutoffs, ZBL, energy references and native
+  model SHA-256; refuse unsupported temperature, charge, dipole, spin and vdW
+  families rather than treating them as plain energy NEP.
+- Legacy `nep4` and `nep4_zbl` headers remain accepted. The parser checks
+  model metadata, not the numerical parameter block or real GPU inference.
+
+Confsearch checkpoint integrity (AUD-007, #83):
+
+- Fixed checkpoint/resume to preserve each individual minimum member's atomic
+  geometry and classification together with its energy/origin. Prior resumes
+  could export representative coordinates with a different member's energy.
+- Checkpoint schema and registry schema are now version 2; old schema-1
+  checkpoints are refused on resume because their per-member geometries cannot
+  be recovered. Existing artifacts remain untouched and need provenance
+  assessment if created after a resume. Added exact extxyz resume regressions.
+
+NEP installer and documentation integration (tracking #61):
+
+- **`--engines nep` now installs mliport into `.venv-nep`.** The NEP install step
+  only installed `calorine`, ASE and NumPy, so the verify stage failed with
+  `FileNotFoundError` on `.venv-nep/bin/mliport`. It is now one resolver run with
+  an editable `./mliport[analysis-all]` plus the pinned `calorine==4.1`, built from
+  the same `_uv_pip` and package-source arguments as the other backends. The NEP
+  step previously set `PIP_EXTRA_INDEX_URL` (which the installer strips for managed
+  profiles) and read a non-existent `profile.index_url`, so `--source china*` and
+  `--source offline` were silently ignored for NEP; they are honoured now. NEP stays
+  opt-in and isolated in `.venv-nep`; the plans of the other backends are unchanged.
+  The installer still does not build `gpumd`.
+- **Docs.** `README.md`/`README_CN.md` describe the NEP backend (install, environment
+  table, example, limits). The generated environment table no longer prints
+  `calorine==4.1 (12.9)`: for NEP the NumPy/ASE dependency is resolved by the
+  installer and 12.9 is the CUDA Toolkit used to build `gpumd`. The manual NEP
+  install route now includes mliport, and the docs state that `doctor` finds
+  `gpumd` on `PATH` or via `MLIPORT_GPUMD_COMMAND` (not `NEP_GPUMD_COMMAND`).
+
+Internal (no user-visible behaviour change):
+
+- **Shared runner safety helpers.** The numerical-safety gates that MD already
+  enforced (atomic-state validation, finite energy/force checks, raw vs
+  constraint-applied force views, the raw-force `fmax_abort` evaluation and the
+  per-frame safe-point validation) now live in `mliport/runners/safety.py`, and
+  `MDRunner`/`BaseRunner` delegate to them. The energy–force gradient pre-flight
+  accepts one or more structures (NEB still requires at least two images and
+  keeps its exact refusal wording and schema), and the model-identity record is
+  a shared helper that additionally records `dispersion`. No scientific record
+  invalidated and no result changes.
+
+Native GPUMD runtime fixes (PR #88; no existing backend result changes):
+
+- **Native GPUMD run directories load through `TrajectoryDataset.load()`.** The
+  analysis layer could not discover `trajectory.extxyz`/`manifest.json` at all.
+  The loader now accepts a native run directory only when its manifest is
+  `completed`, describes an MD run, and vouches for the trajectory (SHA-256,
+  frame count, atoms, PBC, position convention, recorded time and step axes);
+  anything else raises `InvalidTrajectoryError`. The dataset keeps the
+  GPUMD-recorded times and steps, 3-D PBC, unwrapped coordinates when dumped
+  (otherwise `wrapped`, never promoted), and GPUMD's own per-atom masses.
+  Missing time is never inferred.
+- **Exit status 0 is no longer completion for native MD.** The dump must hold
+  `steps // dump_interval` frames with a recorded, uniform, on-grid time axis
+  ending inside the requested window, the input species/PBC/cell in every frame,
+  and a `thermo.out` aligned with it. A short or mixed dump is `failed`, leaves
+  no `trajectory.extxyz`, and keeps the raw output. Non-divisible save intervals
+  are accepted.
+- **Native MD post-processing streams.** The dump was parsed into a list of
+  `Atoms`, parsed again for the summary and again for writing; it is now read
+  once, one frame at a time, and the normalised trajectory is published
+  atomically after every check passed.
+- **A zero-time-step native single point whose coordinates or cell moved now
+  fails** instead of reporting `positions_unchanged: false` as `completed`.
+- The manifest only advertises a trajectory this run committed, and the docs'
+  layout text now names the real files (`manifest.json`, `native/provenance.json`).
+
+Batch fixes and features:
+
+- **Batch outputs no longer collide on equal file names.** Each structure's
+  output directory now mirrors its path below the input directory, so
+  `A/rank_1/1.cif` and `B/rank_1/1.cif` no longer write into the same `1_cif`
+  directory (the later one silently replaced the earlier one while the summary
+  still counted both as successes). Flat directories keep their old names; any
+  remaining collision stops the batch before it runs.
+- **`mliport batch --calc-type opt` honours relaxation settings.** `--fmax`,
+  `--max-steps`, `--optimizer`, `--cell-opt` and `--fix-symmetry` (and the same
+  keys in settings/INCAR) now reach the optimizer; previously every batch
+  relaxation ran with FIRE, 0.05 eV/Å, 500 steps and a fixed cell. They are
+  rejected for `--calc-type sp` instead of being ignored.
+- **Per-structure status and `--resume`.** Every finished structure writes
+  `batch_status.json` and a line in `batch_progress.jsonl` immediately;
+  `batch_manifest.json` records the batch settings. `mliport batch --resume`
+  reuses completed and not-converged structures, reruns failed and unfinished
+  ones, and refuses to resume when any setting differs. A record is reused
+  only if the input file's sha256 is unchanged and every output file it wrote
+  is still present at its recorded size; local model weights are identified by
+  sha256, so replacing them behind the same path blocks the resume. A resumed
+  batch appends to `run.log`. Cooperative
+  cancellation now stops the batch instead of being recorded as a failure.
+
+New features:
+
+- **NEP backend with two explicit execution runtimes (`MODEL_TYPE = NEP`,
+  tracking PR #61).** `NEP_RUNTIME = ase` runs Calorine `CPUNEP` on `cpu`
+  (float64, in-process) or `GPUNEP` on `cuda` (float32, one `gpumd` subprocess
+  per ASE evaluation); `NEP_RUNTIME = gpumd` runs sp/opt/md in a single native
+  `gpumd` process on `cuda` (float32) with raw `native/` output, a normalised
+  `trajectory.extxyz`, unwrapped positions and a `manifest.json` carrying the
+  terminal status. The runtime is a required, explicit user decision in the
+  CLI, Python API, INCAR/settings, TUI and queue; mliport never infers it from
+  the device or falls back between the two, and `neb`/`batch`/`confsearch` are
+  refused for the native runtime instead of being rerouted. `gpumd` is only
+  invoked as an argv list (never through a shell) and its path, version and
+  SHA-256 are recorded. DFT-D3 is rejected for NEP (no evidence it avoids
+  double-counting a NEP van der Waals term). GPUMD's `nvt_*` coupling constant
+  `T_coup = tau_T/dt` is derived from the ASE-style `friction`/`bussi_tau`/
+  `nhc_tdamp` and recorded with the mapping. New `docs/backends/nep.md` and
+  `nep.zh.md`, `mliport doctor --engine nep`, and an opt-in `.venv-nep` install
+  plan entry. No existing backend default, dtype, task or output changed.
+- **Validation harness: model-identity comparison for directory artifacts
+  (audit H-01).** `validation/science/scripts/neb_suite.py` compared the
+  engine-recorded path hash with the manifest's `model_sha256`, which for a
+  GRACE SavedModel directory is the *distributed archive* identity. Every GRACE
+  saddle record was therefore a false `fail` even when the barrier, CI
+  convergence, force and negative-mode criteria all passed. The harness now
+  hashes the local artifact with the same algorithm `mliport.model_record`
+  uses (`common.artifact_sha256`) and records the manifest identity separately;
+  the file-by-file manifest check is unchanged. No threshold was relaxed, no
+  historical record rewritten.
+- **Validation harness: `--tiers t3` argument forwarding (audit H-02).**
+  `run_suite.py` started `omat_eval.py` without its required `--subset`, so the
+  tier could never run. `--subset` is now forwarded and `--tiers t3` without it
+  is rejected with an actionable message instead of an argparse failure inside
+  the child.
+- **Configuration search (`confsearch`, new `CALC_TYPE = CONFSEARCH`).** MD-based
+  configuration search for one adsorbate on a periodic slab (spec revision 4,
+  tracking PR #61): multiple starts (user-prepared mode A, or automatic
+  placement mode B with `cs_place_anchor` chemisorption-first starts),
+  Langevin NVT heat/hold/cool cycles with per-step finite/force gates and an
+  early adsorbate-integrity check, FIRE quenches at fixed cell, Metropolis
+  restarts, deduplication by energy plus a direct geometric identity rule `G`
+  (fixed slab) or the focused Oganov-Valle fingerprint `D`, top-K refinement,
+  saturation diagnostics ("lowest found", never a global minimum), and exports
+  for DFT (`POSCAR` with selective dynamics, `structure.extxyz`,
+  `cp2k_coord.xyz`, `cp2k_cell.inc`, `cp2k_fixed_atoms.inc`, `minimum.json`).
+  Checkpoint/resume is bitwise-identical on CPU; the model identity includes
+  `dispersion`, so a D3 search can never be merged with a plain one. Interfaces:
+  `mliport confsearch run|place|resume`, `mliport.api.run_confsearch`,
+  `CS_*` INCAR keys, and a capability-matrix entry. `scipy` and `matplotlib`
+  were added to the `dev` extra so the ASE OFP known-answer test runs in CI.
+  `mliport confsearch extend RUN --cycles N` adds cycles to a finished search
+  (previous results move to `history/extension_N/`; only `cs_cycles` is exempt
+  from the resume fingerprint), and `mliport confsearch merge RUN1 RUN2
+  --output DIR` combines comparable finished searches without new calculations
+  (refusing runs whose comparability key differs). The bilingual workflow page
+  `docs/workflows/confsearch.md` (+ `.zh.md`) documents the scope, the outputs,
+  the dedup rules and the caveats. Queue task files now accept
+  `"calc_type": "confsearch"` in both modes (mode A: `structure` +
+  `adsorbate_indices`; mode B: `slab` + `molecule` + `n_starts`), forward every
+  `CS_*` option that has a CLI flag, and refuse a `resume` field because
+  resuming is an interactive command. The TUI entry and the real-model
+  validation campaign script now exists
+  (`validation/science/scripts/confsearch_suite.py`, owner-run on GPU: baseline
+  of N placements without MD vs confsearch with the same N starts on CH3OH over
+  an LGPS-derived slab, reporting best energies, unique counts and the discovery
+  curve). The TUI now offers the confsearch entry: a configuration screen with
+  both start modes (Structure File + 0-based Adsorbate Indices, or Slab File +
+  Molecule File + Number of Placed Starts) plus cycles, MD-mobile set,
+  temperatures, hold/cool durations and top-K, validated and forwarded to the
+  same background command builder the queue uses. Resuming stays a command, and
+  extend/merge/export are not exposed in the TUI; the capability matrix records
+  that.
+
+- **DFT-D3 dispersion.** `--d3` / `D3 = .TRUE.` / API `d3=True` adds Grimme
+  DFT-D3 (via `torch-dftd`, float64) on top of any backend as
+  `SumCalculator([model, D3])`; `--d3-xc` (default `pbe`) names the model's
+  reference functional and `--d3-damping` (default `bj`) the damping. Fails
+  closed: UMA tasks whose reference already contains dispersion (`omol`,
+  `omc`, `odac`, `oc25`) are refused, UMA `omat`/`oc20` must use `pbe`/`rpbe`,
+  D3 sub-options without `--d3` are an error, and NEB refuses D3 until its
+  model identity records the term. The correction is recorded as
+  `dispersion` in the run metadata and in the OUTCAR-style header. Optional
+  extra: `mliport[d3]`.
+
+Documentation site:
+
+- **Docs site.** The documentation is now a MkDocs Material site published to
+  GitHub Pages (`mkdocs.yml`, `.github/workflows/docs.yml`, toolchain in
+  `requirements-docs.txt`). English is the default; a language switch in the
+  header selects 中文 (`page.md` / `page.zh.md`, mkdocs-static-i18n).
+- **Generated facts, hand-written prose.** `scripts/generate_docs.py` no longer
+  writes whole pages. It refreshes marker-delimited blocks (backend/Python
+  matrix, GPU install routes, per-backend environment and model profiles, NEB
+  capability matrix) inside pages written by hand, in both languages.
+
+Review fixes (scientific correctness, data safety, robustness):
+
+- **IDPP convergence.** Check the projected-plus-spring NEB band force used by
+  ASE's IDPP optimizer, not just raw pair forces. Unfinished bands are refused.
+  NEB scientific revision is now 2, preventing resume across this change.
+- **NEB checkpoint identity.** Preserve custom-array `atom_id` / `atom_ids` in
+  ASE image info so integer/string IDs and explicit atom maps survive repeated
+  save/resume cycles without mutating caller data.
+- **DPA load retries.** A model that fails metadata/head inspection is never
+  cached; retrying cannot bypass validation.
+- **NEB identity input.** Direct `BandInput` construction rejects float and
+  boolean atom maps/lattice shifts instead of silently converting them to integers.
+- **Spectrum compatibility.** Area normalization works with NumPy 1.x as well
+  as 2.x. The bilingual docs now state that VACF/spectrum require stored velocities.
+- **MD / NHC drift.** NHC no longer keeps the random Maxwell-Boltzmann
+  centre-of-mass momentum: `com_policy=auto` (and `initialize_only`) zero it
+  once, NHC conserves it, the run reports `3N-3` kinetic DOF and the
+  thermostat set point is scaled by `(3N-3)/3N` (`nhc_set_temperature_K`).
+  Previously every NHC run translated the whole cell ballistically.
+- **Analysis COM-drift guard.** `msd` and `transport` record
+  `com_drift_diagnostics` and warn when an uncorrected whole-system COM
+  displacement exceeds 5% of the mobile-ion MSD.
+- **No silent overwrite.** sp/opt/md/batch refuse an output directory that
+  already holds calculation outputs (earlier runs, or VASP OUTCAR/CONTCAR)
+  unless `--overwrite`/`overwrite=True`, and hold an exclusive run lock.
+  `calculate_energy()` uses a temporary directory by default.
+- **Pre-relaxation stays fail-closed.** If it does not reach
+  `pre_relax_fmax` within `pre_relax_steps`, the run stops before production
+  MD with an actionable error (raise the step budget, loosen the threshold
+  with scientific justification, or disable pre-relaxation explicitly). The
+  outcome of a completed pre-relaxation is recorded in
+  `md_provenance.pre_relax`.
+- **UMA MD precision.** MD no longer defaults to `inference_mode=turbo`
+  (TF32 + torch.compile); turbo is opt-in.
+- **TUI templates** are the backend-neutral single-source templates (the old
+  ones hard-coded UMA and used unknown NEB keys).
+- **Analysis memory.** Trajectories are streamed frame by frame; MD frames no
+  longer duplicate the constraint-applied forces in `atoms.info`.
+- **GPU identity.** torch backends verify the device inside the CUDA
+  runtime's own enumeration (no nvidia-smi dependency, correct on mixed-GPU
+  nodes); CLI/queue default `CUDA_DEVICE_ORDER=PCI_BUS_ID`; a single MIG
+  instance in `CUDA_VISIBLE_DEVICES` is supported.
+- **Queue.** `mliport queue start --max-jobs-per-gpu N` lets small jobs share
+  a GPU (default 1, exclusive).
+- **Static NEB evidence removed.** The packaged `mliport/data/validation`
+  records, the evidence matching in `mliport.capabilities` and the wheel
+  smoke assertions that depended on them are gone: the runtime pre-flight is
+  the only energy-force check. `--allow-unvalidated-neb` /
+  `allow_unvalidated_neb` / `NEB_ALLOW_UNVALIDATED` no longer exist in the
+  CLI, config, TUI, queue and API (strict config rejects them). Direct-force
+  models are still rejected. The V100 provenance records under `validation/`
+  are kept as history.
+- **NEB docs.** README wording on NEB validation fixed (evidence matching is
+  unchanged and stays exact).
+- **NEB runtime pre-flight.** Before the first step NEB measures whether the
+  model's forces are the gradient of its energy on the band to be optimized
+  (endpoints and interpolated images; force and random directions; central
+  finite differences at two step sizes with Richardson extrapolation and a
+  dtype-aware energy-noise tolerance) and refuses to run otherwise, instead
+  of relying on static evidence recorded on another PyTorch/CUDA build.
+  Direct-force models are still always refused. The record is stored as
+  `gradient_preflight` in `run_context.json`/`neb_results.json`.
+  `--allow-unvalidated-neb` is deprecated and has no effect; it can no longer
+  bypass a failed check. This is a spot check, not a proof over the whole
+  energy surface and not a statement about model accuracy.
+- **NEB progress in run.log.** The NEB runner never wrote optimizer progress,
+  so `run.log` stayed silent until the end. It now logs the pre-flight, the
+  start/finish of every FIRE stage and a progress line (max physical force,
+  highest interior image energy) for the first step and every 5th step.
+- **Contributing.** The development-environment commands match CI
+  (`uv sync` at the repository root installs nothing).
+- **Python 3.13** is supported (package, installer, CI).
+- **Maintainability.** One backend calculator-option table replaces three
+  copies; engine fallbacks read `BUILTIN_DEFAULTS`; unused `mliport/templates`
+  removed; root `LICENSE.md` matches the package license.
+- **CI.** pytest failures and ruff findings are emitted as GitHub
+  annotations.
+
+Isotropic NPT molecular dynamics (ASE backends):
+
+- `mliport md --ensemble NPT` runs ASE's isotropic Martyna-Tobias-Klein
+  integrator on the UMA, MACE, GRACE and DPA ASE runtimes, with
+  `--pressure-gpa` (positive is compressive), `--npt-tdamp`, `--npt-pdamp`,
+  `--npt-tchain`, `--npt-pchain`, `--npt-tloop` and `--npt-ploop`. The same
+  options are available from INCAR-style files, `settings.ini`, the Python
+  API, the queue and the TUI. NEP/GPUMD, constraints, partial PBC, zero
+  temperature and models without stress are refused with an explicit error.
+- The trajectory is variable-cell: `vasp/XDATCAR` is not written (the reason
+  is logged), `raw/trajectory.traj` keeps every frame's cell and momenta,
+  `raw/md.csv` records volume and total pressure, and the run is marked
+  not transport-eligible. `docs/workflows/md.md` (+ `.zh.md`) and
+  `docs/outputs.md` (+ `.zh.md`) describe the workflow and its limits.
+- Fix: an INCAR file with `MD_ENSEMBLE = NPT` was rejected by the INCAR
+  validation in `mliport run` ("Invalid MD_ENSEMBLE"), and two tests
+  asserted that rejection. NPT now passes validation, the invalid-value
+  tests use a genuinely invalid ensemble, and a test covers the INCAR path.
+- The beta validation matrix no longer lists NPT as unsupported: NPT was added
+  after the campaign, so it is "not run in this campaign" (and the limitations
+  list says so) rather than "do not claim".
+- The `docs/workflows/md.md` option table says pre-relaxation is off by default
+  for NPT as well as NVE, matching the CLI.
+
+Repository hygiene:
+
+- `mliport/pyproject.toml` no longer carries its own `[tool.ruff]` section.
+  It made ruff use only its default rules for `mliport/mliport/**`, so the
+  repository rule set (bugbear, simplify, perflint, ruff-specific, ...) was
+  applied to the tests alone. One configuration now governs everything; the
+  findings it surfaced were fixed (import order, `ClassVar` annotations,
+  explicit `zip(strict=False)` / `subprocess.run(check=False)`, small
+  behavior-neutral rewrites). Rule families whose fixes are not
+  behavior-neutral stay ignored, each with a reason in `pyproject.toml`.
+- Removed the transient process records `validation/maintenance/`
+  (`FINAL_FREEZE_REPORT.md`, `LEGACY_AUDIT.md`, `WHEEL_CONTENTS.txt`, all about
+  2.0.0b4) and `validation/science/reports/MAIN_RECOVERY_20260913.md` (a Git
+  forensics note that cites a local task book), which `AGENTS.md` rule 9 keeps
+  out of the repository. They stay in the Git history; the distribution
+  hashes belong with the release assets.
+- `test_json_writer.py` and `test_dpa_checkpoint_conversion.py` skip, instead
+  of failing at collection, when torch is not installed.
+
+## 2.0.0b4
+
+Repository freeze / state isolation / compatibility audit beta:
+
+- removes the last implicit UMA defaults from queue task files and the TUI,
+  so a run without an explicit backend (or a checkpoint that supplies one)
+  fails closed;
+- moves persistent job history to the OS state directory, records the state
+  schema/application/version, scopes records to their project, adds
+  `mliport state path`/`state migrate`, and keeps legacy `~/.mliport` records
+  explicitly import-only;
+- unifies CUDA device resolution so the CLI isolation re-exec and the queue
+  device lease honour an existing `CUDA_VISIBLE_DEVICES` mapping and choose
+  the same physical GPU;
+- removes the deprecated `mliport/calculator.py` shim and the accidental
+  top-level `examples` package from the distribution;
+- audits the pinned frameworks at the binary level for Maxwell through
+  Blackwell, records wheel hashes and compiled architectures, ships the
+  audit to `mliport doctor`, and keeps non-Volta families at
+  `binary_theory_verified`/`experimental` instead of claiming hardware
+  verification;
+- adds a wheel/sdist content gate to CI and makes the generic MD template
+  device default CPU-safe.
+
+
+## 2.0.0b3
+
+Recovery/release-bridge beta polish:
+
+- reconciles the productization tree with the validation-report lineage; Git
+  forensics proved `v2.0.0b2`/`0f53dbb` is an ancestor of `main`, so no
+  history rewrite or force-push was required;
+- locks the productization invariants with behavior-level CI tests
+  (backend-neutral selection, strict config, project-scoped citation, docs
+  installer matrix, rename hygiene, package metadata);
+- preserves the corrected citation/docs/installer contracts and the
+  per-backend installation model;
+- consolidates current vs historical validation reporting
+  (`target_commit_revalidated`, tier scopes, historical section, GO evidence
+  queries) and adds the exact-release four-backend bridge smoke with its own
+  archive;
+- refines the T7 estimator audit with two deterministic OLS windows on the
+  same trajectory and an explicit estimator-model difference flag, without
+  forcing kinisi and OLS to agree;
+- retains the T8 startup/warm benchmark separation and records warmup stop
+  reasons plus the actual backend GPU-synchronization method.
+
+## 2.0.0b2
+
+Beta polish after `2.0.0b1`:
+
+- **Backend-neutral core.** No implicit UMA default anywhere; the backend
+  must be explicit (`--model-type`/`MODEL_TYPE`, model alias/profile) or the
+  run fails closed. `fairchem` remains an alias for UMA.
+- **Strict scientific config by default.** Misspelled and cross-backend keys
+  are fatal; `--lenient-config` / `strict_config = false` is the explicit
+  opt-in to the legacy warning mode.
+- **Installer UX.** Environment names, Python ranges and runtime pins come
+  from the compatibility registry and are machine-generated into
+  `docs/installation.md`; `./bin/mliport-<engine>` launchers only select the
+  runtime; backend-incompatible `--python` requests fail closed.
+- **Documentation architecture.** New `docs/` tree, rewritten READMEs,
+  CONTRIBUTING, troubleshooting (DPA head fails closed) and an mlipx
+  migration guide, with link/CLI/generated-block contract tests.
+- **Rename hygiene.** Backend-neutral brand tagline and a CI guard against
+  `mlipx` residue in current code/docs.
+- **Validation narrative.** Explicit per-tier scope
+  (current_campaign/historical_reuse/not_run), historical evidence listed
+  separately, `target_commit_revalidated` naming and machine-linked GO
+  checklist queries.
+- **T8 benchmark contract.** Startup/warmup/timed separation, full latency
+  spread, anomaly flags, and a V100 rerun (four backends plus GRACE cache
+  ON/OFF) that showed the old 32-atom anomalies were cold-start artifacts.
+- **T7 transport audit.** Aligned plain-OLS baseline, three-estimator
+  comparison, known-answer unit audit (`1 Å²/ps = 1e-8 m²/s`) and the
+  `kinisi_to_plain_D_ratio` disagreement warning; trajectories reused.
+
+## 2.0.0b1
+
+Initial public beta: MACE/DPA/GRACE/UMA adapters, SP/OPT/MD/NEB/batch
+workflows, queue/TUI/API, trajectory analysis suite and the V100 validation
+campaign anchored to software commit `5f8d91d`.

@@ -1,0 +1,91 @@
+//> 01_IdealGas_NVT
+//> Minimal ideal gas simulation in the NVT (canonical) ensemble.
+
+#include <CLI/App.hpp>
+#include <CLI/Config.hpp>
+#include <CLI/Formatter.hpp>
+
+#include "action/VelocityVerletLangevinThermostat.hpp"
+#include "communication/GhostLayer.hpp"
+#include "data/Atoms.hpp"
+#include "data/Subdomain.hpp"
+#include "datatypes.hpp"
+#include "io/DumpCSV.hpp"
+#include "util/simulationSetup.hpp"
+
+using namespace mrmd;
+
+//> Configuration for the ideal gas example simulation in NVT ensemble.
+struct Config
+{
+    idx_t nsteps = 2001;                 ///< number of steps to simulate
+    static constexpr real_t dt = 0.005;  ///< time step size in reduced units
+
+    // thermostat parameters
+    static constexpr real_t temperature =
+        1.5_r;  ///< target temperature for thermostat in reduced units
+    static constexpr real_t friction =
+        0.04_r / dt;  ///< friction coefficient for Langevin thermostat
+};
+
+//> Simulation logic goes here
+void runIdealGas(const Config& config)
+{
+    // initialize simulation domain
+    auto subdomain = data::Subdomain({0_r, 0_r, 0_r}, {100_r, 100_r, 100_r}, 1_r);
+
+    // initialize atoms randomly in the domain
+    auto atoms = util::fillDomainWithAtoms(subdomain, 100000, 1_r, 1_r);
+
+    // set up ghost layer for periodic boundary conditions
+    communication::GhostLayer ghostLayer;
+
+    // set up thermostat for temperature control
+    action::VelocityVerletLangevinThermostat integrator(config.friction, config.temperature);
+
+    // set up timer for runtime measurement
+    Kokkos::Timer timer;
+
+    // main simulation loop
+    for (auto i = 0; i < config.nsteps; ++i)
+    {
+        // integrate equations of motion before (potentially) calculating forces
+        integrator.preForceIntegrate(atoms, config.dt);
+
+        // reinsert atoms that left the domain according to periodic boundary conditions
+        ghostLayer.exchangeRealAtoms(atoms, subdomain);
+
+        // finish integrating equations of motion
+        integrator.postForceIntegrate(atoms, config.dt);
+
+        // handle output
+        if (i % 100 == 0)
+        {
+            io::dumpCSV("atoms_" + std::to_string(i) + ".csv", atoms);
+        }
+    }
+    // print performance data
+    auto time = timer.seconds();
+    std::cout << time << std::endl;
+}
+
+//> Main function for the simulation
+int main(int argc, char* argv[])
+{
+    // initialize Kokkos environment
+    Kokkos::ScopeGuard scope_guard(argc, argv);
+
+    // print Kokkos execution space
+    std::cout << "execution space: " << typeid(Kokkos::DefaultExecutionSpace).name() << std::endl;
+
+    // initialize simulation configuration with command line interface
+    Config config;
+    CLI::App app{"ideal gas benchmark application"};
+    app.add_option("-n,--nsteps", config.nsteps, "number of simulation steps");
+    CLI11_PARSE(app, argc, argv);
+
+    // run simulation of the ideal gas
+    runIdealGas(config);
+
+    return EXIT_SUCCESS;
+}

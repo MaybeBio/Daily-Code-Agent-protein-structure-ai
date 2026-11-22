@@ -1,0 +1,442 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Shared graph-cache keying, input routing, and shape-bucket padding."""
+
+import abc
+import copy
+import inspect
+import weakref
+from collections.abc import Iterator
+from typing import Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+from bionemo_ir._torch.graph_optimization.config import (
+    GraphOptimizationConfig,
+    acceptance_max_by_name,
+    bucket_lengths_by_name,
+    input_acceptance_assignments,
+    input_padded_assignments,
+    output_padded_assignments,
+)
+from bionemo_ir._torch.graph_optimization.tensor_copy_utils import _dataclass_fields, _is_dataclass_instance
+from bionemo_ir.runtime.backend import BackendBase
+
+# A call container with at least one tensor.
+TensorContainer = Tensor | tuple | dict
+
+# Dotted tensor path to its 1-D shape tensor.
+TensorContainerShapes = dict[str, Tensor]
+TensorContainerHostShapes = dict[str, tuple[int, ...]]
+
+
+class GraphOptimizationTracker(BackendBase):
+    """Base wrapper for graph-cache keying, routing, and eager fallback."""
+
+    SEP_FOR_ARGS = "|"
+    SEP_BW_NAME_AND_SHAPE = "+"
+    SEP_FOR_DIMS = "-"
+    SEP_BW_ARG_AND_DIM = "."
+    SEP_BW_ARG_AND_TYPE = ","
+
+    # ``buffers`` is mutable scratch shared across score-model stages. Capture
+    # changes its keys and shapes, so it cannot satisfy the static copy contract.
+    # Pass it during warmup/capture, but exclude it from keys and replay copies;
+    # the captured graph owns and reuses its workspace.
+    GRAPH_INTERNAL_WORKSPACE_KWARGS: frozenset = frozenset({"buffers"})
+
+    def _effective_workspace_kwargs(self) -> frozenset:
+        """Return configured workspace kwargs or the built-in fallback."""
+        cfg = self.graph_optimization_config.input_routing_config
+        if cfg is not None and cfg.internal_workspace_kwargs:
+            return frozenset(cfg.internal_workspace_kwargs)
+        return self.GRAPH_INTERNAL_WORKSPACE_KWARGS
+
+    def _positional_param_names(self, num_positional: int) -> list[str]:
+        """Return cached parameter names, falling back to ``arg{i}``."""
+        names = self._forward_positional_names
+        if names is None:
+            names = []
+            inner = self.inner_module
+            if inner is not None:
+                try:
+                    sig = inspect.signature(inner.forward)
+                    names = [
+                        p.name
+                        for p in sig.parameters.values()
+                        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                    ]
+                except (TypeError, ValueError):
+                    names = []
+            self._forward_positional_names = names
+        return [names[i] if i < len(names) else f"arg{i}" for i in range(num_positional)]
+
+    def _graph_input_kwargs(self, kwargs: dict) -> dict:
+        """Remove graph-owned workspaces from key and replay inputs."""
+        workspace = self._effective_workspace_kwargs()
+        if not workspace:
+            return kwargs
+        return {k: v for k, v in kwargs.items() if k not in workspace}
+
+    def __init__(
+        self, graph_optimization_config: GraphOptimizationConfig, inner_module: nn.Module | None = None
+    ) -> None:
+        """Initialize the wrapper.
+
+        Args:
+            graph_optimization_config: Backend configuration.
+            inner_module: Wrapped eager module.
+        """
+        super().__init__(graph_optimization_config)
+        self.inner_module = inner_module
+        # Lazily cached positional parameter names.
+        self._forward_positional_names: list[str] | None = None
+        # Each stable input tensor's last key part by path, with a weak reference to the tensor it describes.
+        self._stable_tensor_parts: dict[str, tuple[weakref.ref, str]] = {}
+
+    @property
+    def graph_optimization_config(self) -> GraphOptimizationConfig:
+        return self._config
+
+    def __getattr__(self, name: str) -> Any:
+        """Resolve module attributes before delegating to the wrapped module."""
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            modules = self.__dict__.get("_modules")
+            inner = modules.get("inner_module") if modules else None
+            if inner is not None:
+                return getattr(inner, name)
+            raise
+
+    def input_accepted(self, tensor_container_shapes: TensorContainerHostShapes) -> bool:
+        """Return whether all configured axes are within inclusive limits."""
+        cfg = self.graph_optimization_config.input_routing_config
+        if cfg is None:
+            return True
+        acceptance_max = acceptance_max_by_name(cfg)
+        for tensor_name, dim_idx, dim_name in input_acceptance_assignments(cfg):
+            dim_len_max = acceptance_max.get(dim_name)
+            if dim_len_max is None:
+                continue
+            shape = tensor_container_shapes.get(f"{tensor_name}_shape")
+            if shape is None:
+                continue
+            ndim = len(shape)
+            if not (-ndim <= dim_idx < ndim):
+                continue
+            if int(shape[dim_idx]) > dim_len_max:
+                return False
+        return True
+
+    def validate_input_ties(self, tensor_container_shapes: TensorContainerHostShapes) -> None:
+        """Check configured names, axes and equal lengths for a new signature."""
+        cfg = self.graph_optimization_config.input_routing_config
+        if cfg is not None:
+            available = sorted(name[: -len("_shape")] for name in tensor_container_shapes if name.endswith("_shape"))
+            for tie in cfg.named_dim_ties:
+                expected_length = None
+                for tensor_name, axes in tie.input_dims:
+                    shape = tensor_container_shapes.get(f"{tensor_name}_shape")
+                    for dim_idx in axes:
+                        if shape is None:
+                            raise ValueError(
+                                f"input routing ties dim {tie.name!r} to input "
+                                f"{tensor_name!r} (axis {dim_idx}), but no such tensor is "
+                                f"present in the call; available inputs: {available}"
+                            )
+                        ndim = len(shape)
+                        if not (-ndim <= dim_idx < ndim):
+                            raise ValueError(
+                                f"input routing ties dim {tie.name!r} to axis {dim_idx} "
+                                f"of input {tensor_name!r}, but that tensor has only "
+                                f"{ndim} dimension(s)"
+                            )
+                        length = shape[dim_idx]
+                        if expected_length is not None and length != expected_length:
+                            raise ValueError(
+                                f"input routing ties dim {tie.name!r} to unequal lengths: "
+                                f"expected {expected_length}, got {length} at {tensor_name!r} axis {dim_idx}"
+                            )
+                        expected_length = length
+
+    def input_key_for_this_call(self, *args, **kwargs) -> str:
+        """Return a cache key from tensor metadata and non-tensor values/types, each in walk order."""
+        stable = self._stable_input_kwargs()
+        tensor_parts: list[str] = []
+        nontensor_parts: list[str] = []
+        for root, value in self._call_roots(args, kwargs):
+            tensors, nontensors = self._root_metadata(
+                root, value, self._stable_tensor_parts if root in stable else None
+            )
+            tensor_parts += tensors
+            nontensor_parts += nontensors
+        return f"{self.SEP_FOR_ARGS.join(tensor_parts)}{self.SEP_FOR_ARGS}{self.SEP_FOR_ARGS.join(nontensor_parts)}"
+
+    def _walk_container_leaves(self, value: TensorContainer, path: str, on_leaf) -> None:
+        """Call ``on_leaf(path, leaf)`` for each nested leaf."""
+        if isinstance(value, torch.Tensor):
+            on_leaf(path, value)
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                child = f"{path}{self.SEP_BW_ARG_AND_DIM}{k}" if path else str(k)
+                self._walk_container_leaves(v, child, on_leaf)
+        elif isinstance(value, (list, tuple)):
+            for i, v in enumerate(value):
+                child = f"{path}{self.SEP_BW_ARG_AND_DIM}{i}" if path else str(i)
+                self._walk_container_leaves(v, child, on_leaf)
+        elif _is_dataclass_instance(value):
+            for name, v in _dataclass_fields(value):
+                child = f"{path}{self.SEP_BW_ARG_AND_DIM}{name}" if path else name
+                self._walk_container_leaves(v, child, on_leaf)
+        else:
+            on_leaf(path, value)
+
+    def _call_roots(self, args: tuple, kwargs: dict) -> Iterator[tuple[str, Any]]:
+        """Yield each call input with its root path, excluding graph-owned workspace kwargs."""
+        yield from zip(self._positional_param_names(len(args)), args, strict=True)
+        yield from self._graph_input_kwargs(kwargs).items()
+
+    def _walk_call(self, args: tuple, kwargs: dict, on_leaf) -> None:
+        """Walk call leaves, excluding graph-owned workspace kwargs."""
+        for root, value in self._call_roots(args, kwargs):
+            self._walk_container_leaves(value, root, on_leaf)
+
+    def _extract_tensor_container_shape_maps(
+        self, args: tuple, kwargs: dict
+    ) -> tuple[TensorContainerShapes, TensorContainerHostShapes]:
+        """Map tensor paths to device tensors and zero-copy host metadata."""
+        shapes_device: TensorContainerShapes = {}
+        shapes_host: TensorContainerHostShapes = {}
+
+        def on_leaf(path: str, leaf: Any) -> None:
+            if isinstance(leaf, torch.Tensor):
+                key = f"{path}_shape"
+                shape = tuple(leaf.shape)
+                shapes_device[key] = torch.tensor(shape, dtype=torch.int32).to(leaf.device, non_blocking=True)
+                shapes_host[key] = shape
+
+        self._walk_call(args, kwargs, on_leaf)
+        return shapes_device, shapes_host
+
+    def _extract_host_shapes(self, args: tuple, kwargs: dict) -> TensorContainerHostShapes:
+        """Read routing dimensions without allocating device shape tensors."""
+        shapes: TensorContainerHostShapes = {}
+
+        def on_leaf(path: str, leaf: object) -> None:
+            if isinstance(leaf, Tensor):
+                shapes[f"{path}_shape"] = tuple(leaf.shape)
+
+        self._walk_call(args, kwargs, on_leaf)
+        return shapes
+
+    def _extract_tensor_container_shapes(self, args: tuple, kwargs: dict) -> TensorContainerShapes:
+        """Map tensor paths to shape tensors on the input devices."""
+        shapes_device, _ = self._extract_tensor_container_shape_maps(args, kwargs)
+        return shapes_device
+
+    def _stable_input_kwargs(self) -> frozenset:
+        """Return the kwargs whose unchanged tensors skip replay copies and key serialization."""
+        routing = self.graph_optimization_config.input_routing_config
+        return frozenset(routing.stable_input_kwargs) if routing is not None else frozenset()
+
+    def _leaf_metadata(self, path: str, leaf: Any) -> tuple[bool, str]:
+        """Serialize one leaf: a tensor's dtype, device, stride and shape, else its value or type."""
+        if isinstance(leaf, Tensor):
+            dims = self.SEP_FOR_DIMS.join(str(d) for d in leaf.shape)
+            return True, (
+                f"{path}{self.SEP_BW_NAME_AND_SHAPE}{leaf.dtype}:{leaf.device}:{leaf.stride()}"
+                f"{self.SEP_BW_NAME_AND_SHAPE}{dims}"
+            )
+        if isinstance(leaf, (bool, int, float, str)):
+            return False, f"{path}{self.SEP_BW_NAME_AND_SHAPE}{leaf}"
+        return False, f"{path}{self.SEP_BW_ARG_AND_TYPE}{type(leaf)}"
+
+    def _root_metadata(
+        self, root: str, value: Any, memo: dict[str, tuple[weakref.ref, str]] | None = None
+    ) -> tuple[list[str], list[str]]:
+        """Serialize one call input's tensor and non-tensor leaves in walk order.
+
+        With ``memo``, a tensor reuses its part while the same tensor object comes back at its path. A rollout passes
+        the same cache to every denoising step, and formatting its many tensors dominates keying; the stable contract
+        makes identity sufficient, and the weak reference never keeps a finished rollout's cache alive.
+        """
+        tensor_parts: list[str] = []
+        nontensor_parts: list[str] = []
+
+        def on_leaf(path: str, leaf: Any) -> None:
+            if memo is not None and isinstance(leaf, Tensor):
+                cached = memo.get(path)
+                if cached is not None and cached[0]() is leaf:
+                    tensor_parts.append(cached[1])
+                    return
+            is_tensor, part = self._leaf_metadata(path, leaf)
+            if not is_tensor:
+                nontensor_parts.append(part)
+                return
+            tensor_parts.append(part)
+            if memo is not None:
+                memo[path] = (weakref.ref(leaf), part)
+
+        self._walk_container_leaves(value, root, on_leaf)
+        return tensor_parts, nontensor_parts
+
+    @abc.abstractmethod
+    def update_graph_state_by_key(self, key: str) -> None:
+        """Advance this call's per-key state for ``key``. Implemented by subclasses."""
+        ...
+
+    # Bucketed mode pads tied inputs for capture and restores live output sizes.
+    # Routing assignments use the same dotted paths as metadata extraction.
+    def _map_container_tensors(self, value: TensorContainer, path: str, fn) -> TensorContainer:
+        """Map tensor leaves while preserving paths and container structure."""
+        if isinstance(value, torch.Tensor):
+            return fn(path, value)
+        if isinstance(value, dict):
+            return {
+                k: self._map_container_tensors(v, f"{path}{self.SEP_BW_ARG_AND_DIM}{k}" if path else str(k), fn)
+                for k, v in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            mapped = [
+                self._map_container_tensors(v, f"{path}{self.SEP_BW_ARG_AND_DIM}{i}" if path else str(i), fn)
+                for i, v in enumerate(value)
+            ]
+            return tuple(mapped) if isinstance(value, tuple) else mapped
+        if _is_dataclass_instance(value):
+            mapped_value = copy.copy(value)
+            for name, v in _dataclass_fields(value):
+                object.__setattr__(
+                    mapped_value,
+                    name,
+                    self._map_container_tensors(v, f"{path}{self.SEP_BW_ARG_AND_DIM}{name}" if path else name, fn),
+                )
+            return mapped_value
+        return value
+
+    @staticmethod
+    def _bucket_length(dim_len_values, length: int) -> int:
+        """Return the smallest bucket that covers ``length``."""
+        candidates = [int(v) for v in dim_len_values if int(v) >= int(length)]
+        if not candidates:
+            raise ValueError(
+                f"dim length {int(length)} exceeds the largest configured bucket {max(int(v) for v in dim_len_values)}"
+            )
+        return min(candidates)
+
+    def _pad_tensor_dims_to(self, t: Tensor, targets: dict) -> Tensor:
+        """Right-pad selected dimensions to explicit lengths."""
+        rank = t.dim()
+        pad = [0] * (2 * rank)  # F.pad orders dimensions from last to first.
+        changed = False
+        for dim_idx, target in targets.items():
+            axis = dim_idx + rank if dim_idx < 0 else dim_idx
+            if not 0 <= axis < rank:
+                raise ValueError(f"padded dim {dim_idx} out of range for tensor of rank {rank}")
+            extra = int(target) - t.shape[axis]
+            if extra < 0:
+                raise ValueError(f"pad target {int(target)} < current length {t.shape[axis]} on dim {dim_idx}")
+            if extra:
+                pad[2 * (rank - 1 - axis) + 1] = extra
+                changed = True
+        return F.pad(t, pad, mode="constant", value=0) if changed else t
+
+    def _padded_input_targets(self) -> dict:
+        """Return bucket boundaries by input path and dimension."""
+        cfg = self.graph_optimization_config.input_routing_config
+        if cfg is None:
+            return {}
+        targets: dict = {}
+        bucket_lengths = bucket_lengths_by_name(cfg)
+        for tensor_name, dim_idx, dim_name in input_padded_assignments(cfg):
+            targets.setdefault(tensor_name, {})[dim_idx] = bucket_lengths[dim_name]
+        return targets
+
+    def _output_tied_live_lengths(self, input_tensor_shapes: TensorContainerHostShapes) -> dict:
+        """Return live lengths for output dimensions tied to padded inputs."""
+        cfg = self.graph_optimization_config.input_routing_config
+        if cfg is None:
+            return {}
+        live_len_by_dim_name: dict = {}
+        for tensor_name, dim_idx, dim_name in input_padded_assignments(cfg):
+            shape = input_tensor_shapes.get(f"{tensor_name}_shape")
+            if shape is not None:
+                live_len_by_dim_name.setdefault(dim_name, int(shape[dim_idx]))
+        targets: dict = {}
+        for out_idx, out_dim_idx, dim_name in output_padded_assignments(cfg):
+            if dim_name in live_len_by_dim_name:
+                targets.setdefault(out_idx, {})[out_dim_idx] = (dim_name, live_len_by_dim_name[dim_name])
+        return targets
+
+    def pad_input(
+        self,
+        args: tuple,
+        kwargs: dict,
+        input_tensor_shapes: TensorContainerHostShapes,
+    ) -> TensorContainer:
+        """Pad configured input dimensions to their smallest covering buckets.
+
+        Graph-owned workspace kwargs pass through unchanged.
+        """
+        targets_by_path = self._padded_input_targets()
+        if not targets_by_path:
+            return args, kwargs
+
+        def fn(path: str, t: Tensor) -> Tensor:
+            dims = targets_by_path.get(path)
+            if not dims:
+                return t
+            shape = input_tensor_shapes.get(f"{path}_shape")
+            pad_targets = {
+                dim_idx: self._bucket_length(
+                    dim_len_values, int(shape[dim_idx]) if shape is not None else t.shape[dim_idx]
+                )
+                for dim_idx, dim_len_values in dims.items()
+            }
+            return self._pad_tensor_dims_to(t, pad_targets)
+
+        roots = self._positional_param_names(len(args))
+        padded_args = tuple(self._map_container_tensors(v, roots[i], fn) for i, v in enumerate(args))
+        workspace = self._effective_workspace_kwargs()
+        padded_kwargs = {k: (v if k in workspace else self._map_container_tensors(v, k, fn)) for k, v in kwargs.items()}
+        return padded_args, padded_kwargs
+
+    def unpad_output(self, args: tuple, input_tensor_shapes: TensorContainerHostShapes) -> TensorContainer:
+        """Restore tied output dimensions to their live input lengths."""
+        if not isinstance(args, tuple):
+            raise ValueError(f"expected args tuple, got {type(args)}")
+        output = args[0] if len(args) == 1 else args
+        out_targets = self._output_tied_live_lengths(input_tensor_shapes)
+        if not out_targets:
+            return output
+
+        def truncate_at(idx: int, t):
+            dims = out_targets.get(idx)
+            if not dims or not isinstance(t, torch.Tensor):
+                return t
+            target = list(t.shape)
+            for d, (_dim_name, live_len) in dims.items():
+                target[d] = min(target[d], live_len)
+            return t[tuple(slice(0, n) for n in target)]
+
+        if isinstance(output, torch.Tensor):
+            return truncate_at(0, output)
+        if isinstance(output, (list, tuple)):
+            mapped = [truncate_at(i, t) for i, t in enumerate(output)]
+            return tuple(mapped) if isinstance(output, tuple) else mapped
+        return output

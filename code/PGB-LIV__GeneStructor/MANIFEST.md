@@ -1,7 +1,7 @@
 # 代码快照清单
 
 - 上游仓库: https://github.com/PGB-LIV/GeneStructor
-- 快照日期: 2026-11-18
+- 快照日期: 2026-11-22
 - 快照 commit: [`00d03f7a224d`](https://github.com/PGB-LIV/GeneStructor/commit/00d03f7a224d2dedf34b6c77730bf208fe164789)
 - 归档策略: `repo_copy=code` — **代码摘录,不是完整仓库**。保留源码、构建/配置文件、README、文档;数据、二进制、图片、权重不保留。
 

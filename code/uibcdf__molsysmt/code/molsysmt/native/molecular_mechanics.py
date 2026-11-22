@@ -1,0 +1,432 @@
+import pandas as pd
+from depdigest import dep_digest
+
+from molsysmt import pyunitwizard as puw
+from molsysmt._private.argdigest import arg_digest
+
+# Preserve the legacy native mechanics module namespace.
+from molsysmt._private.smonitor import *  # noqa: F403
+
+
+class MolecularMechanics:
+    """Container for molecular mechanics force-field settings.
+
+    Per-atom force-field parameters (formal_charge, partial_charge,
+    atom_ff_type) are grouped in the ``atoms_ff`` DataFrame, indexed by
+    atom position (0..n_atoms-1).  The DataFrame is None when no per-atom
+    FF data has been assigned. Native partial-charge values use elementary charge.
+    ``partial_charge_assignment`` holds an optional detached named-model report;
+    ``atom_type_assignment`` holds optional named chemical typing provenance.
+    Replacing either property clears its report. Copying retains producer versions.
+    This experimental domain is not persisted by H5MSM 0.5.
+
+    ``forcefield`` identifies the solute parameterization separately from
+    ``implicit_solvent`` (for example, OBC1 or OBC2). These are physical-model
+    requests, independent of a simulation engine. An execution adapter selects
+    its resources or rejects unsupported combinations. Public conversion uses
+    supported stored settings before defaults; explicit keywords, including
+    ``implicit_solvent=None``, override stored choices without editing them.
+    Storing a request does not certify completed parameterization. The current
+    construction adapter rejects unsupported nonempty tuning/per-atom requests
+    rather than dropping them. Use molecular_mechanics.get_model_recipe for
+    requested/default origins and inspected compiled settings.
+    """
+
+    def __repr__(self):
+        """Summarizing stored metadata without reading or rendering payloads."""
+        from ._repr import size, summary
+
+        return summary(
+            self,
+            n_atoms=size(vars(self).get("atoms_ff")),
+            forcefield=vars(self).get("forcefield") is not None,
+        )
+
+    def __init__(
+        self,
+        forcefield=None,
+        water_model=None,
+        implicit_solvent=None,
+        non_bonded_method=None,
+        cutoff_distance=None,
+        switch_distance=None,
+        dispersion_correction=None,
+        ewald_error_tolerance=None,
+        constraints=None,
+        flexible_constraints=None,
+        rigid_water=None,
+        hydrogen_mass=None,
+        salt_concentration=None,
+        kappa=None,
+        solute_dielectric=None,
+        solvent_dielectric=None,
+        formal_charge=None,
+        partial_charge=None,
+        atom_ff_type=None,
+    ):
+        """Initialize molecular mechanics parameters."""
+
+        # default values:
+        # non_bonded_method='no_cutoff'
+        # use_dispersion_correction=False
+        # ewald_error_tolerance=0.0001
+        # flexible_constraints=False
+        # rigid_water=True
+        # ignore_external_bonds=False
+        # implicit_solvent_salt_conc=0.0 mol/L
+        # implicit_solvent_kappa=0.0 1/nm
+        # solute_dielectric=1.0
+        # solvent_dielectric=78.5
+
+        # Per-atom FF parameters: stored in atoms_ff DataFrame
+        self.atoms_ff = None
+        self.partial_charge_assignment = None
+        self.atom_type_assignment = None
+        if formal_charge is not None:
+            self.formal_charge = formal_charge
+        if partial_charge is not None:
+            self.partial_charge = partial_charge
+        if atom_ff_type is not None:
+            self.atom_ff_type = atom_ff_type
+
+        self.forcefield = forcefield
+
+        self.non_bonded_method = non_bonded_method
+        self.cutoff_distance = cutoff_distance
+        self.switch_distance = switch_distance
+        self.dispersion_correction = dispersion_correction
+        self.ewald_error_tolerance = ewald_error_tolerance
+
+        self.hydrogen_mass = hydrogen_mass
+
+        self.constraints = constraints
+        self.flexible_constraints = flexible_constraints
+
+        self.water_model = water_model
+        self.rigid_water = rigid_water
+        # self.residue_templates = residue_templates
+        # self.ignore_external_bonds = ignore_external_bonds
+
+        self.implicit_solvent = implicit_solvent
+        self.solute_dielectric = solute_dielectric
+        self.solvent_dielectric = solvent_dielectric
+        self.salt_concentration = salt_concentration
+        self.kappa = kappa
+
+    def __setstate__(self, state):
+        """Restore current storage or stage legacy charge arrays for MolSys."""
+
+        legacy_formal_charge = state.pop("formal_charge", None)
+        legacy_partial_charge = state.pop("partial_charge", None)
+        restored = type(self)()
+        self.__dict__.update(restored.__dict__)
+        self.__dict__.update(state)
+        if legacy_formal_charge is not None:
+            self._legacy_formal_charge = legacy_formal_charge
+        if legacy_partial_charge is not None:
+            self._legacy_partial_charge = legacy_partial_charge
+
+    def __copy__(self):
+        """Copying independent mechanics state without running restoration."""
+        return self.__deepcopy__({})
+
+    def __deepcopy__(self, memo):
+        """Copying stored parameters and producer metadata with one graph memo."""
+        from ._copy import _clone
+
+        return _clone(self, memo)
+
+    # ------------------------------------------------------------------
+    # atoms_ff helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_atoms_ff(self, n_atoms):
+        """Create atoms_ff DataFrame if it does not exist yet."""
+        if self.atoms_ff is None:
+            self.atoms_ff = pd.DataFrame(index=range(n_atoms))
+
+    def _get_atoms_ff_column(self, column):
+        """Return the column values, or None if absent/all-null."""
+        if self.atoms_ff is None or column not in self.atoms_ff.columns:
+            return None
+        col = self.atoms_ff[column]
+        if col.isnull().all():
+            return None
+        return col.to_numpy(dtype=object)
+
+    def _set_atoms_ff_column(self, column, value):
+        """Write *value* into the given atoms_ff column."""
+        if value is None:
+            if self.atoms_ff is not None and column in self.atoms_ff.columns:
+                self.atoms_ff = self.atoms_ff.drop(columns=column)
+                if self.atoms_ff.shape[1] == 0:
+                    self.atoms_ff = None
+            return
+        self._ensure_atoms_ff(len(value))
+        self.atoms_ff[column] = value
+
+    # ------------------------------------------------------------------
+    # Per-atom properties (backed by atoms_ff)
+    # ------------------------------------------------------------------
+
+    @property
+    def formal_charge(self):
+        return self._get_atoms_ff_column("formal_charge")
+
+    @formal_charge.setter
+    def formal_charge(self, value):
+        self._set_atoms_ff_column("formal_charge", value)
+
+    @property
+    def partial_charge(self):
+        return self._get_atoms_ff_column("partial_charge")
+
+    @partial_charge.setter
+    def partial_charge(self, value):
+        self._set_atoms_ff_column("partial_charge", value)
+        self.partial_charge_assignment = None
+
+    @property
+    def atom_ff_type(self):
+        return self._get_atoms_ff_column("atom_ff_type")
+
+    @atom_ff_type.setter
+    def atom_ff_type(self, value):
+        self._set_atoms_ff_column("atom_ff_type", value)
+        self.atom_type_assignment = None
+
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        """Return a dictionary representation of the parameters."""
+
+        tmp_dict = {
+            "formal_charge": self.formal_charge,
+            "partial_charge": self.partial_charge,
+            "atom_ff_type": self.atom_ff_type,
+            "forcefield": self.forcefield,
+            "non_bonded_method": self.non_bonded_method,
+            "cutoff_distance": self.cutoff_distance,
+            "switch_distance": self.switch_distance,
+            "dispersion_correction": self.dispersion_correction,
+            "ewald_error_tolerance": self.ewald_error_tolerance,
+            "hydrogen_mass": self.hydrogen_mass,
+            "constraints": self.constraints,
+            "flexible_constraints": self.flexible_constraints,
+            "water_model": self.water_model,
+            "rigid_water": self.rigid_water,
+            "implicit_solvent": self.implicit_solvent,
+            "solute_dielectric": self.solute_dielectric,
+            "solvent_dielectric": self.solvent_dielectric,
+            "salt_concentration": self.salt_concentration,
+            "kappa": self.kappa,
+        }
+
+        return tmp_dict
+
+    @arg_digest()
+    def copy(self, *, skip_digestion=False):
+        """Copying stored mechanics parameters and producer metadata independently.
+
+        Parameters
+        ----------
+        skip_digestion : bool, default=False
+            Skip argument digestion only for inputs already satisfying this contract.
+
+        Returns
+        -------
+        MolecularMechanics
+            Independent parameters preserving the concrete native type.
+
+        Notes
+        -----
+        Parameter tables, settings, assignment reports and supported extension
+        state are retained with one copy memo, without construction or legacy
+        restoration. Canonical tables copy eagerly. This does not add force-field
+        calculation or mechanics persistence to H5MSM 0.5.
+
+        Examples
+        --------
+        >>> mechanics = MolecularMechanics(forcefield='example')
+        >>> duplicate = mechanics.copy()
+        >>> duplicate is mechanics
+        False
+        >>> duplicate.forcefield
+        'example'
+
+        .. admonition:: User guide
+
+           See :ref:`user-foundations-resident-copying` for native and payload copy contracts.
+
+        .. versionadded:: 1.0.0
+        """
+        from ._copy import _copy_independently
+
+        return _copy_independently(self, skip_digestion)
+
+    def set_parameters(self, return_non_processed=False, **kwargs):
+        """Standardize and set available parameters from keyword arguments."""
+
+        for argument, value in kwargs.items():
+            if argument.lower() in self.__dict__.keys():
+                self.__dict__[argument] = puw.standardize(value)
+                del kwargs[argument.lower()]
+
+        if return_non_processed:
+            return kwargs
+        else:
+            pass
+
+    def get_leap_parameters(self):
+        """Get parameter names for LEaP-compatible force fields."""
+
+        from molsysmt.molecular_mechanics.forcefields import get_forcefield_names
+
+        parameters = {}
+
+        parameters["forcefield"] = get_forcefield_names(
+            self.forcefield,
+            "LEaP",
+            water_model=self.water_model,
+            implicit_solvent=self.implicit_solvent,
+        )
+        parameters["water_model"] = self.water_model
+        parameters["implicit_solvent"] = self.implicit_solvent
+
+        return parameters
+
+    def get_openmm_forcefield_names(self):
+        """Resolve OpenMM force field names for the configured options."""
+
+        from molsysmt.molecular_mechanics.forcefields import get_forcefield_names
+
+        return get_forcefield_names(
+            self.forcefield,
+            "OpenMM",
+            water_model=self.water_model,
+            implicit_solvent=self.implicit_solvent,
+        )
+
+    def to_openmm_ForceField(self):
+        """Instantiate an OpenMM ForceField object."""
+
+        from openmm.app import ForceField
+
+        forcefield_names = self.get_openmm_forcefield_names()
+        forcefield = ForceField(*forcefield_names)
+
+        return forcefield
+
+    @arg_digest()
+    @dep_digest("openmm")
+    def get_openmm_System_parameters(self, *, skip_digestion=False):
+        """Translating stored options into legacy OpenMM constructor keywords.
+
+        Parameters
+        ----------
+        skip_digestion : bool, default=False
+            Skip argument digestion only for already validated inputs.
+
+        Returns
+        -------
+        dict
+            New keyword dictionary containing OpenMM constants and stored
+            settings. Constraint names use the same translation as public
+            conversion: None/'none', 'hbonds', 'all bonds' and 'h angles',
+            including space, underscore and hyphen spellings.
+
+        Raises
+        ------
+        ArgumentChoiceError
+            If the stored constraint policy is unsupported.
+        LibraryNotFoundError
+            If the optional OpenMM dependency is unavailable.
+
+        Notes
+        -----
+        This legacy engine-specific translation does not construct a model or
+        certify that every returned keyword is supported by every OpenMM
+        constructor. Stored fields remain unchanged. Public conversion and
+        force evaluation retain their own capability/refusal contracts; an
+        effective engine-neutral recipe is tracked separately under #582.
+
+        Examples
+        --------
+        >>> from molsysmt.native import MolecularMechanics
+        >>> from openmm import app
+        >>> settings = MolecularMechanics(
+        ...     non_bonded_method='no_cutoff', constraints='all_bonds')
+        >>> settings.get_openmm_System_parameters()['constraints'] is app.AllBonds
+        True
+
+        .. versionadded:: 1.0.0
+        """
+
+        from openmm import app
+
+        parameters = {}
+
+        if self.non_bonded_method == "no_cutoff":
+            parameters["nonbondedMethod"] = app.NoCutoff
+        elif self.non_bonded_method == "cutoff_non_periodic":
+            parameters["nonbondedMethod"] = app.CutoffNonPeriodic
+        elif self.non_bonded_method == "cutoff_periodic":
+            parameters["nonbondedMethod"] = app.CutoffPeriodic
+        elif self.non_bonded_method == "Ewald":
+            parameters["nonbondedMethod"] = app.Ewald
+        elif self.non_bonded_method == "PME":
+            parameters["nonbondedMethod"] = app.PME
+        elif self.non_bonded_method == "LJPME":
+            parameters["nonbondedMethod"] = app.LJPME
+        else:
+            raise NotImplementedError()
+
+        if self.cutoff_distance is not None:
+            parameters["nonbondedCutoff"] = puw.convert(
+                self.cutoff_distance, to_form="openmm.unit", to_unit="nm"
+            )
+
+        if self.switch_distance is not None:
+            parameters["switchDistance"] = puw.convert(
+                self.switch_distance, to_form="openmm.unit", to_unit="nm"
+            )
+
+        from molsysmt._private.engine_constraints import openmm_constraints
+
+        parameters["constraints"] = openmm_constraints(
+            self.constraints,
+            caller="molsysmt.native.MolecularMechanics.get_openmm_System_parameters",
+        )
+
+        parameters["hydrogenMass"] = self.hydrogen_mass
+        parameters["rigidWater"] = self.rigid_water
+        # parameters['removeCMMotion']=self.remove_cm_motion
+        parameters["flexibleConstraints"] = self.flexible_constraints
+
+        if self.implicit_solvent is not None:
+            if self.implicit_solvent == "HCT":
+                parameters["implicitSolvent"] = app.HCT
+            elif self.implicit_solvent == "OBC1":
+                parameters["implicitSolvent"] = app.OBC1
+            elif self.implicit_solvent == "OBC2":
+                parameters["implicitSolvent"] = app.OBC2
+            elif self.implicit_solvent == "GBn":
+                parameters["implicitSolvent"] = app.GBn
+            elif self.implicit_solvent == "GBn2":
+                parameters["implicitSolvent"] = app.GBn2
+            else:
+                raise NotImplementedError
+
+            parameters["implicitSolventSaltConc"] = puw.convert(
+                self.salt_concentration, to_unit="mole/liter", to_form="openmm.unit"
+            )
+            parameters["implicitSolventKappa"] = puw.convert(
+                self.kappa, to_unit="1/nm", to_form="openmm.unit"
+            )
+            parameters["soluteDielectric"] = self.solute_dielectric
+            parameters["solventDielectric"] = self.solvent_dielectric
+
+        else:
+            parameters["implicitSolvent"] = None
+
+        return parameters

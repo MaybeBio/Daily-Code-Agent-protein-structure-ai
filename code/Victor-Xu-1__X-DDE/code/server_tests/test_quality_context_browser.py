@@ -1,0 +1,185 @@
+"""Read real retained STAT6 quality results; never create or repair a molecule."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+import pytest
+from playwright.sync_api import expect, sync_playwright
+
+from opendde_workbench.settings import Settings
+from opendde_workbench.store import Store
+from server_tests.browser_platform import platform
+
+QUALITY_JOB = "8969b071-879b-4374-9044-f9108ba29588"
+
+
+@pytest.mark.parametrize("language,width", [("en", 1440), ("zh", 390)])
+def test_retained_stat6_report_distinguishes_assessed_from_missing_context(language, width):
+    settings = Settings.from_env()
+    assert settings.state_dir.resolve().is_relative_to(Path(os.environ["RUNNER_TEMP"]).resolve())
+    store = Store(settings.state_dir / "jobs.sqlite3")
+    job = store.get(QUALITY_JOB)
+    assert job and job.status == "succeeded" and job.request.operation == "pose_quality"
+    output = settings.state_dir / "jobs" / job.id / "output"
+    report_path = output / "result.json"
+    result = json.loads(report_path.read_text())
+    assert result["options"]["profile"] == "dock" and result["classification"] == "passes"
+    assert len(result["checks"]) == 22 and all(c["outcome"] == "pass" for c in result["checks"])
+    protein = output / "protein-preview.pdb"
+    assert not any(line.startswith("HETATM") for line in protein.read_text().splitlines())
+    components = ("waters", "organic_cofactors", "inorganic_cofactors")
+    for component in components:
+        assert "smallest_distance_" + component not in result["metrics"]
+        assert "volume_overlap_" + component not in result["metrics"]
+    files = [report_path, protein, output / "molecule-preview.sdf"]
+    before_files = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+    before_jobs = {row.id: row.status for row in store.list_jobs(1000)}
+    evidence = Path("outputs/quality-context") / language
+    evidence.mkdir(parents=True, exist_ok=True)
+    zh = language == "zh"
+    with (
+        platform(settings.state_dir, evidence / "service.log") as base,
+        sync_playwright() as driver,
+    ):
+        browser = driver.chromium.launch(channel="chrome")
+        height = 775 if zh else 850
+        page = browser.new_page(viewport={"width": width, "height": height})
+        page.add_init_script(f"localStorage.setItem('opendde-workbench.language','{language}')")
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.goto(base + "/#task=" + QUALITY_JOB)
+        panel = page.get_by_role(
+            "region", name="构象与姿势质控结果" if zh else "Pose quality results"
+        )
+        expect(panel).to_be_visible(timeout=30000)
+        measurement = panel.get_by_role("region", name="姿势测量" if zh else "Pose measurements")
+        expect(
+            measurement.get_by_text(
+                f"{result['metrics']['smallest_distance_protein']:.2f} Å", exact=True
+            )
+        ).to_be_visible()
+        expect(
+            panel.get_by_role(
+                "button", name="受体内最小化" if zh else "Minimize in receptor", exact=True
+            )
+        ).to_have_count(0)
+        table = panel.get_by_role("table", name="质控检查结果" if zh else "Quality check outcomes")
+        canvas = panel.locator(".molecular-stage iframe")
+        expect(canvas).to_be_visible()
+        scene_before = canvas.bounding_box()
+        assert scene_before and scene_before["width"] > (300 if zh else 500)
+        assert height - scene_before["y"] >= (180 if zh else 450)
+        page.screenshot(path=evidence / "quality-first-screen.png")
+        (evidence / "native-source.json").write_text(
+            json.dumps(
+                {
+                    "source_job": job.id,
+                    "native_checks": result["checks"],
+                    "native_metrics": result["metrics"],
+                    "original_files": before_files,
+                },
+                indent=2,
+            )
+        )
+        page.screenshot(path=evidence / "native-before-assessment.png", full_page=True)
+        water = table.get_by_role("row").filter(
+            has=page.get_by_text(
+                "结构水距离碰撞" if zh else "Water distance clash", exact=True
+            )
+        )
+        expect(water.get_by_text("未评估" if zh else "Not assessed", exact=True)).to_be_visible()
+        expect(
+            panel.get_by_text(
+                "已通过全部适用检查" if zh else "All applicable checks passed", exact=False
+            )
+        ).to_have_count(0)
+        summary = panel.get_by_role(
+            "status", name="质控评估摘要" if zh else "Quality assessment summary"
+        )
+        for text in (
+            ["通过: 15", "未评估: 6", "不适用: 1"]
+            if zh
+            else ["Pass: 15", "Not assessed: 6", "Not applicable: 1"]
+        ):
+            expect(summary.get_by_text(text, exact=True)).to_be_visible()
+        disclosure = panel.locator(".quality-method-details")
+        expect(disclosure).not_to_have_attribute("open", "")
+        disclosure.locator("summary").click()
+        expect(
+            disclosure.get_by_text(
+                "原始报告：22 项通过" if zh else "Source report: 22 passed", exact=False
+            )
+        ).to_be_visible()
+        disclosure.locator("summary").click()
+        selector = panel.get_by_role("combobox", name="显示哪些检查？" if zh else "Which checks?")
+        expect(selector).to_have_value("attention")
+        expect(table.get_by_role("row")).to_have_count(7)
+        if zh:
+            jump = panel.get_by_role("button", name="查看检查", exact=True)
+            back = panel.get_by_role("button", name="返回三维", exact=True)
+            original_scene = canvas.element_handle()
+            jump.press("Space")
+            expect(panel.get_by_role("region", name="质量判读")).to_be_focused()
+            expect(selector).to_be_in_viewport()
+            selector.select_option("unassessed")
+            expect(back).to_be_in_viewport()
+            for button in (jump, back):
+                box = button.bounding_box()
+                assert box and box["height"] >= 44
+            back.press("Space")
+            expect(panel.get_by_role("region", name="姿势三维预览")).to_be_focused()
+            scene_returned = canvas.bounding_box()
+            assert scene_returned and height - scene_returned["y"] >= 340
+            assert canvas.evaluate("(current, original) => current === original", original_scene)
+            expect(selector).to_have_value("unassessed")
+        selector.select_option("all")
+        expect(table.get_by_role("row")).to_have_count(len(result["checks"]) + 1)
+        selector.select_option("not_applicable")
+        expect(table.get_by_role("row")).to_have_count(2)
+        expect(table.get_by_text("不适用" if zh else "Not applicable", exact=True)).to_have_count(1)
+        selector.select_option("unassessed")
+        expect(table.get_by_role("row")).to_have_count(7)
+        expect(table.get_by_text("未评估" if zh else "Not assessed", exact=True)).to_have_count(6)
+        expect(
+            panel.get_by_role(
+                "button", name="生成三维视图图片" if zh else "Capture 3D view", exact=True
+            )
+        ).to_be_enabled(timeout=30000)
+        preview = panel.locator(".structure-workbench-view").bounding_box()
+        details = panel.locator(".structure-workbench-details").bounding_box()
+        assert preview and details
+        if width > 1000:
+            assert preview["x"] + preview["width"] <= details["x"] + 2
+            assert preview["width"] > details["width"]
+            assert abs(preview["y"] - details["y"]) < 2
+        else:
+            assert preview["y"] < details["y"]
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 2")
+        page.screenshot(path=evidence / "retained-native-context.png", full_page=True)
+        original = page.request.get(base + "/api/jobs/" + job.id + "/result").json()
+        assert original == result
+        assert not errors
+        browser.close()
+    assert {row.id: row.status for row in store.list_jobs(1000)} == before_jobs
+    assert {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in files
+    } == before_files
+    (evidence / "receipt.json").write_text(
+        json.dumps(
+            {
+                "source_job": job.id,
+                "target": "STAT6",
+                "native_report_flags_unchanged": True,
+                "native_passes": 22,
+                "context_without_finite_measurements": 6,
+                "missing_context_not_presented_as_pass": True,
+                "original_files": before_files,
+                "new_scientific_jobs": 0,
+                "language": language,
+                "width": width,
+            },
+            indent=2,
+        )
+    )

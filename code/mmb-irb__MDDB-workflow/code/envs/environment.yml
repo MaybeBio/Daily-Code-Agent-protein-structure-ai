@@ -1,0 +1,71 @@
+name: mwf_env
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  # Compatible with python<3.13
+  - python=3.11
+  # Use pyyaml to read the inputs.yaml file
+  - pyyaml
+  # From ambertools we use pytraj mostly
+  - ambertools
+  # From biopython we use the sequence alignment tools
+  - biopython>1.79
+  # CMIP is used for the energies analysis
+  # Its version is pinned since the energies golden test (test/unittests/test_energies.py) holds the values it prints
+  - bioconda::cmip=2.7.0
+  # Fpocket is used for the pockets analysis
+  - fpocket
+  # Gromacs is used for several processing and analysis steps
+  - bioconda::gromacs_mddb=2025.3=he1b2d42_6
+  # MDanalysis is used for some processing steps
+  # MDanalysis reads mmCIF files since version 2.11 and it needs gemmi to do so
+  - mdanalysis >=2.11.0
+  - gemmi
+  # MDtraj is used for several processing and analysis steps
+  # MDtraj 1.10 has a critical error: https://github.com/mdtraj/mdtraj/issues/1893
+  - mdtraj >=1.11.0
+  # Numpy and scipy are usually already included but they are required
+  - numpy
+  - scipy
+  # Numba compiles the pair-energy kernel of the grid-free energies engine (BSD-2-Clause, with llvmlite)
+  - numba
+  # VMD is used for some processing steps
+  - vmd=1.9.3=hbf76b22_2
+  # Parser to read blast results
+  - xmltodict
+  # Ligands analyses
+  - rdkit
+  # mordred compatible with new numpy versions
+  - mordredcommunity 
+  # Membrane proteins analysis
+  - bioconda::biobb_mem >=5.3.1
+  - bioconda::chap_mddb
+  # - bioconda::chap
+  - requests # To check is molecules is in LIPID MAPS
+  # AGUS: la versión de 'openssl' 3.5  dió problemas en el cluster con certificados y requests
+  # RUBEN: el error puede seguir pero hace falta abrir los constrains para resolver dependencias
+  - conda-forge::openssl>=3.6.0,<4
+  # We must declare pip explicitly according to a warning
+  - pip
+  # This library is used to calculate TM scores
+  # Biotite 2 changed the superimpose API used by the tmscores analysis
+  - biotite >=1.4,<2
+  # For helical parameters. Can break the environment?
+  - bioconda::curves
+  # Visual tool to display graphs in terminal and even text logs
+  - plotext
+  # For rich display in the console for dataframes
+  - rich
+  # For dataset templates
+  - jinja2
+  # To compare file content between runs thus telling if the inputs have changed
+  - python-xxhash
+  # To validate the inputs file against a schema
+  - pydantic>=2
+  # To measure the actual size of documents to be loaded in the database (MongoDB uses BSON)
+  - pymongo
+  # Optional dependencies
+  # - bioconda::blast
+  # Nextflow for the local InterProScan (mwf run -lip), which also needs Apptainer, Singularity or Docker
+  # - bioconda::nextflow>=25.10.4

@@ -1,0 +1,1467 @@
+import gzip
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+from collections import OrderedDict
+from contextlib import closing
+from itertools import zip_longest
+
+import numpy as np
+import pandas as pd
+
+from csubst import genetic_code
+from csubst import output_safety
+from csubst import resource_cache
+from csubst import runtime
+from csubst import sequence
+from csubst import sequence_io
+from csubst import tree
+from csubst import ete
+from csubst._extensions import load_optional_extension
+
+parser_iqtree_cy = load_optional_extension('parser_iqtree_cy')
+_FIT_EXTENSIONS = ('iqtree', 'log', 'rate', 'state', 'treefile')
+
+
+def _parse_version_tuple(version_text):
+    parts = re.findall(r'[0-9]+', str(version_text))
+    if len(parts) == 0:
+        return (0,)
+    return tuple(int(p) for p in parts)
+
+
+def _encode_unambiguous_codon(codon):
+    if (not isinstance(codon, str)) or (len(codon) != 3):
+        return -1
+    nuc2code = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+    try:
+        return (nuc2code[codon[0]] * 16) + (nuc2code[codon[1]] * 4) + nuc2code[codon[2]]
+    except KeyError:
+        return -1
+
+
+def _build_unambiguous_codon_lookup(codon_orders):
+    lookup = np.full(64, -1, dtype=np.int64)
+    for idx, codon in enumerate(np.asarray(codon_orders, dtype=object).tolist()):
+        code = _encode_unambiguous_codon(str(codon).upper())
+        if code >= 0:
+            lookup[code] = int(idx)
+    return lookup
+
+
+def _can_use_cython_leaf_codon_fill(state_matrix, codon_lookup):
+    if parser_iqtree_cy is None:
+        return False
+    if not isinstance(state_matrix, np.ndarray):
+        return False
+    if not isinstance(codon_lookup, np.ndarray):
+        return False
+    if state_matrix.dtype != np.float64:
+        return False
+    if codon_lookup.dtype != np.int64:
+        return False
+    if codon_lookup.shape != (64,):
+        return False
+    if state_matrix.ndim != 2:
+        return False
+    return hasattr(parser_iqtree_cy, 'fill_leaf_state_matrix_codon_unambiguous')
+
+
+def _fill_leaf_state_matrix_codon(seq, state_matrix, g, codon_lookup, codon_state_lookup=None):
+    num_codon_site = state_matrix.shape[0]
+    unresolved_sites = np.arange(num_codon_site, dtype=np.int64)
+    if _can_use_cython_leaf_codon_fill(state_matrix=state_matrix, codon_lookup=codon_lookup):
+        unresolved_mask = parser_iqtree_cy.fill_leaf_state_matrix_codon_unambiguous(
+            seq.encode('ascii'),
+            state_matrix,
+            codon_lookup,
+        )
+        unresolved_sites = np.where(unresolved_mask != 0)[0]
+    for s in unresolved_sites:
+        codon = seq[(s * 3):((s + 1) * 3)]
+        codon_index = sequence.get_state_index(
+            codon,
+            g['codon_orders'],
+            genetic_code.ambiguous_table,
+            state_lookup=codon_state_lookup,
+        )
+        if len(codon_index) == 0:
+            continue
+        weight = 1 / len(codon_index)
+        for ci in codon_index:
+            state_matrix[s, ci] = weight
+
+
+def _is_version_at_least(version_text, minimum_text):
+    version_tuple = _parse_version_tuple(version_text)
+    minimum_tuple = _parse_version_tuple(minimum_text)
+    for v, m in zip_longest(version_tuple, minimum_tuple, fillvalue=0):
+        if v > m:
+            return True
+        if v < m:
+            return False
+    return True
+
+
+def _parse_iqtree_version_text(txt):
+    # IQ-TREE 2 and 3 both expose a semantic version string in startup banners.
+    patterns = [
+        r'IQ-TREE(?: multicore)? version\s+([0-9]+(?:\.[0-9]+)*)',
+        r'IQ-TREE\s+([0-9]+(?:\.[0-9]+)*)',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, txt)
+        if m is not None:
+            version = m.group(1)
+            major = int(version.split('.')[0])
+            return version, major
+    return None, None
+
+def _read_text(path):
+    with open(path, encoding='utf-8', errors='replace') as f:
+        return f.read()
+
+def detect_iqtree_output_version(g):
+    g['iqtree_output_version'] = None
+    g['iqtree_output_version_major'] = None
+    for key in ['path_iqtree_iqtree', 'path_iqtree_log']:
+        path = g.get(key, None)
+        if (path is None) or (not os.path.exists(path)):
+            continue
+        txt = _read_text(path)
+        version, major = _parse_iqtree_version_text(txt)
+        if version is not None:
+            g['iqtree_output_version'] = version
+            g['iqtree_output_version_major'] = major
+            break
+    return g
+
+def _parse_substitution_model(iqtree_txt):
+    model = None
+    for line in iqtree_txt.splitlines():
+        m = re.match(r'\s*Model of substitution:\s*(.+?)\s*$', line)
+        if m is not None:
+            model = m.group(1)
+            break
+    return model
+
+def _parse_equilibrium_frequency(iqtree_txt, codon_orders, parser_name, float_type):
+    # IQ-TREE 2 and 3 share similar labels but differ slightly in spacing/number formatting.
+    pattern_iqtree2 = r'pi\(([A-Z]+)\)\s*=\s*([0-9.]+)(?![eE][+-]?[0-9]+)'
+    pattern_iqtree3 = r'pi\(\s*([A-Z]+)\s*\)\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)'
+    # Parse the robust IQ-TREE3-compatible pattern first and avoid overriding
+    # already parsed codons with legacy partial matches.
+    if parser_name == 'iqtree3':
+        patterns = [pattern_iqtree3, pattern_iqtree2]
+    else:
+        patterns = [pattern_iqtree3, pattern_iqtree2]
+    eq_map = dict()
+    for pattern in patterns:
+        for codon,freq in re.findall(pattern, iqtree_txt):
+            codon = codon.upper().replace('U', 'T')
+            if codon in eq_map:
+                continue
+            try:
+                eq_map[codon] = float(freq)
+            except ValueError:
+                continue
+    values = list()
+    missing_codons = list()
+    for codon in codon_orders:
+        freq = eq_map.get(codon, np.nan)
+        if not np.isfinite(freq):
+            missing_codons.append(codon)
+        values.append(freq)
+    if len(missing_codons)>0:
+        txt = 'Failed to parse equilibrium frequencies from {} output. '
+        txt += 'Missing codon(s): {}'
+        missing_txt = ','.join(missing_codons[0:10])
+        if len(missing_codons)>10:
+            missing_txt += ',...'
+        raise AssertionError(txt.format(parser_name, missing_txt))
+    equilibrium_frequency = np.array(values, dtype=float_type)
+    total = equilibrium_frequency.sum()
+    if not (total > 0):
+        raise AssertionError('Failed to parse equilibrium frequencies: sum should be positive.')
+    equilibrium_frequency /= total
+    return equilibrium_frequency
+
+def _parse_float_from_log_line(line, label):
+    pattern = r'\s*{}\s*:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)'.format(re.escape(label))
+    m = re.match(pattern, line)
+    if m is not None:
+        return float(m.group(1))
+    return None
+
+def _estimate_empirical_codon_frequency_from_alignment(alignment_file, codon_orders, float_type, *,
+                                                      include_ambiguous=True):
+    seq_dict = sequence.read_fasta(alignment_file)
+    codon_orders = np.array(codon_orders, dtype=object)
+    codon_state_lookup = sequence.build_state_index_lookup(codon_orders)
+    counts = np.zeros(shape=(codon_orders.shape[0],), dtype=float_type)
+    for seq in seq_dict.values():
+        seq = seq.upper().replace('U', 'T')
+        if (len(seq) % 3) != 0:
+            raise AssertionError('Sequence length is not multiple of 3 in alignment file.')
+        for s in np.arange(0, len(seq), 3):
+            codon = seq[s:s+3]
+            codon_idx_direct = codon_state_lookup.get(codon, None)
+            if codon_idx_direct is not None:
+                counts[int(codon_idx_direct)] += 1
+            elif include_ambiguous:
+                codon_idx = sequence.get_state_index(
+                    codon,
+                    codon_orders,
+                    genetic_code.ambiguous_table,
+                    state_lookup=codon_state_lookup,
+                )
+                if len(codon_idx):
+                    counts[codon_idx] += 1 / len(codon_idx)
+    total = counts.sum()
+    if not (total > 0):
+        raise AssertionError('Failed to estimate codon frequencies from alignment file.')
+    counts /= total
+    return counts
+
+
+def _get_state_file_path(g):
+    state_path = str(g.get('path_iqtree_state', '')).strip()
+    if state_path != '':
+        return state_path
+    return str(g.get('iqtree_state', '')).strip()
+
+
+def _open_state_text(state_path):
+    open_fn = gzip.open if str(state_path).lower().endswith('.gz') else open
+    return open_fn(state_path, mode='rt', encoding='utf-8', errors='replace')
+
+
+def _read_state_header_columns(state_path):
+    with _open_state_text(state_path) as handle:
+        for line in handle:
+            stripped = line.rstrip('\r\n')
+            if (stripped == '') or stripped.startswith('#'):
+                continue
+            columns = [column.strip() for column in stripped.split('\t')]
+            missing = [column for column in ('Node', 'Site', 'State') if column not in columns]
+            if missing:
+                raise ValueError(
+                    '.state file is missing required column(s): {}.'.format(','.join(missing))
+                )
+            if columns[:3] != ['Node', 'Site', 'State']:
+                raise ValueError('.state columns Node, Site, and State must be the first three columns.')
+            return columns
+    raise ValueError('.state file does not contain a header: {}'.format(state_path))
+
+
+def _iter_state_rows(state_path):
+    """Yield the first three fields and the unsplit probability suffix."""
+    header_seen = False
+    with _open_state_text(state_path) as handle:
+        for line_number, line in enumerate(handle, start=1):
+            stripped = line.rstrip('\r\n')
+            if (stripped == '') or stripped.startswith('#'):
+                continue
+            if not header_seen:
+                header_seen = True
+                continue
+            fields = stripped.split('\t', 3)
+            if len(fields) != 4:
+                raise ValueError(
+                    'Malformed .state row at line {}: expected Node, Site, State, and probabilities.'.format(
+                        line_number
+                    )
+                )
+            yield fields[0], fields[1], fields[2], fields[3], line_number
+
+
+def _parse_state_site_label(site_text):
+    try:
+        site_value = float(site_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('Non-numeric Site value(s) were found in .state file.') from exc
+    if not math.isfinite(site_value):
+        raise ValueError('Non-numeric Site value(s) were found in .state file.')
+    rounded = round(site_value)
+    if abs(site_value - rounded) > 1e-12:
+        raise ValueError('Non-integer Site value(s) were found in .state file.')
+    return int(rounded)
+
+
+def _populate_state_metadata_from_columns(g, state_columns):
+    state_columns = pd.Index(state_columns)
+    g['state_probability_columns'] = state_columns.tolist()
+    g['num_input_state'] = int(state_columns.shape[0])
+    g['input_state'] = state_columns.str.replace('p_', '', regex=False).tolist()
+    if g['num_input_state'] == 4:
+        raise NotImplementedError(
+            'Nucleotide ancestral-state input is obsolete and no longer supported. '
+            'Use codon input instead.'
+        )
+    elif g['num_input_state'] == 20:
+        raise NotImplementedError(
+            'Protein ancestral-state input is obsolete and no longer supported. '
+            'Use codon input instead.'
+        )
+    elif g['num_input_state'] > 20:
+        g['input_data_type'] = 'cdn'
+        g['codon_orders'] = state_columns.str.replace('p_', '', regex=False).to_numpy(dtype=object)
+        codon_orders_list = [str(c) for c in g['codon_orders'].tolist()]
+        if len(codon_orders_list) != len(set(codon_orders_list)):
+            duplicate_codons = sorted(list(set([c for c in codon_orders_list if codon_orders_list.count(c) > 1])))
+            duplicate_txt = ','.join(duplicate_codons[:10])
+            if len(duplicate_codons) > 10:
+                duplicate_txt += ',...'
+            raise ValueError('Duplicate codon state columns were found in .state file: {}'.format(duplicate_txt))
+    else:
+        msg = 'Unsupported number of input states: {}. Only codon input (>20 states) is supported.'
+        raise AssertionError(msg.format(g['num_input_state']))
+    if g['input_data_type'] == 'cdn':
+        g['amino_acid_orders'] = sorted(list(set([c[0] for c in g['codon_table'] if c[0] != '*'])))
+        matrix_groups = OrderedDict()
+        for aa in g['amino_acid_orders']:
+            matrix_groups[aa] = [c[1] for c in g['codon_table'] if c[0] == aa]
+        g['matrix_groups'] = matrix_groups
+        synonymous_indices = dict()
+        for aa in matrix_groups.keys():
+            synonymous_indices[aa] = []
+        for i, c in enumerate(g['codon_orders']):
+            for aa in matrix_groups.keys():
+                if c in matrix_groups[aa]:
+                    synonymous_indices[aa].append(i)
+                    break
+        g['synonymous_indices'] = synonymous_indices
+        g['max_synonymous_size'] = max([len(si) for si in synonymous_indices.values()])
+    return g
+
+
+def _infer_num_input_site_from_alignment_file(alignment_file):
+    path_txt = str(alignment_file).strip()
+    if path_txt == '':
+        raise ValueError('alignment_file is required to infer the number of input sites.')
+    with closing(sequence_io.iter_fasta_records(path_txt)) as records:
+        first_record = next(records, None)
+    if first_record is None:
+        raise ValueError('Alignment file is empty: {}'.format(alignment_file))
+    seq_len = len(first_record.sequence)
+    if (seq_len % 3) != 0:
+        raise AssertionError('Sequence length is not multiple of 3 in alignment file.')
+    return int(seq_len // 3)
+
+def check_iqtree_dependency(g):
+    try:
+        test_iqtree = subprocess.run([g['iqtree_exe'], '--version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise AssertionError("iqtree PATH cannot be found: " + g['iqtree_exe']) from exc
+    if test_iqtree.returncode != 0:
+        raise AssertionError("iqtree PATH cannot be found: " + g['iqtree_exe'])
+    txt = test_iqtree.stdout.decode('utf8', errors='replace') + '\n'
+    txt += test_iqtree.stderr.decode('utf8', errors='replace')
+    version_iqtree,major_iqtree = _parse_iqtree_version_text(txt)
+    if version_iqtree is None:
+        version_iqtree = txt.split('\n')[0].strip()
+    g['iqtree_version'] = version_iqtree
+    g['iqtree_version_major'] = major_iqtree
+    is_satisfied_version = _is_version_at_least(version_iqtree, '2.0.0')
+    if not is_satisfied_version:
+        raise AssertionError('IQ-TREE version ({}) should be 2.0.0 or greater.'.format(version_iqtree))
+    print("IQ-TREE's version: {}, PATH: {}".format(version_iqtree, g['iqtree_exe']), flush=True)
+    return None
+
+
+def _infer_iqtree_output_prefix_from_alignment(alignment_file):
+    return runtime.infer_iqtree_output_prefix(alignment_file=alignment_file)
+
+
+def _get_iqtree_manifest_path(g):
+    state_path = str(g.get('path_iqtree_state', '')).strip()
+    if state_path == '':
+        prefix = runtime.infer_iqtree_output_prefix(
+            alignment_file=g.get('alignment_file', ''),
+            iqtree_outdir=g.get('iqtree_outdir', 'csubst_iqtree'),
+        )
+        state_path = prefix + '.state'
+    return os.path.abspath(state_path) + '.csubst-manifest.json'
+
+
+def _sha256_alignment_content(alignment_path):
+    alignment_path = os.path.abspath(os.path.expanduser(str(alignment_path)))
+    open_fn = gzip.open if alignment_path.lower().endswith('.gz') else open
+    digest = hashlib.sha256()
+    with open_fn(alignment_path, mode='rb') as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _build_portable_iqtree_manifest_context(alignment_path, rooted_tree, iqtree_model, genetic_code):
+    alignment_path = os.path.abspath(os.path.expanduser(str(alignment_path)))
+    if not os.path.isfile(alignment_path):
+        raise FileNotFoundError('Alignment file not found: {}'.format(alignment_path))
+    tree_payload = repr(tree.get_tree_cache_signature(rooted_tree)).encode('utf-8')
+    return {
+        'format': 'csubst-iqtree-v2',
+        'alignment_sha256': _sha256_alignment_content(alignment_path),
+        'rooted_tree_sha256': hashlib.sha256(tree_payload).hexdigest(),
+        'iqtree_model': str(iqtree_model),
+        'genetic_code': int(genetic_code),
+    }
+
+
+def _build_iqtree_manifest_context(g):
+    return _build_portable_iqtree_manifest_context(
+        alignment_path=g.get('alignment_file', ''),
+        rooted_tree=g['rooted_tree'],
+        iqtree_model=g.get('iqtree_model', ''),
+        genetic_code=g.get('genetic_code', 1),
+    )
+
+
+def is_iqtree_manifest_compatible(g):
+    manifest_path = _get_iqtree_manifest_path(g)
+    if not os.path.isfile(manifest_path):
+        return False, 'provenance manifest is missing: {}'.format(manifest_path)
+    try:
+        with open(manifest_path, encoding='utf-8') as handle:
+            observed = json.load(handle)
+        expected = _build_iqtree_manifest_context(g)
+    except (OSError, TypeError, ValueError) as exc:
+        return False, 'provenance manifest could not be validated: {}'.format(exc)
+    if observed != expected:
+        return False, 'alignment, tree, IQ-TREE model, or genetic code changed'
+    return True, ''
+
+
+def _write_iqtree_manifest(g):
+    manifest_path = _get_iqtree_manifest_path(g)
+    payload = json.dumps(
+        _build_iqtree_manifest_context(g),
+        sort_keys=True,
+        indent=2,
+    ) + '\n'
+    resource_cache.atomic_write_text(manifest_path, payload)
+    return manifest_path
+
+
+def write_dataset_iqtree_manifest(
+    alignment_path,
+    rooted_tree_path,
+    iqtree_report_path,
+    state_path,
+    genetic_code=1,
+):
+    with open(rooted_tree_path, encoding='utf-8') as handle:
+        rooted_tree = ete.PhyloNode(handle.read(), format=1)
+    model_pattern = re.compile(r'^\s*Model of substitution:\s*(.+?)\s*$')
+    iqtree_model = ''
+    with open(iqtree_report_path, encoding='utf-8', errors='replace') as handle:
+        for line in handle:
+            match = model_pattern.match(line)
+            if match is not None:
+                iqtree_model = match.group(1).strip()
+                break
+    if iqtree_model == '':
+        raise ValueError('Unable to read IQ-TREE model from {}.'.format(iqtree_report_path))
+    payload = json.dumps(
+        _build_portable_iqtree_manifest_context(
+            alignment_path=alignment_path,
+            rooted_tree=rooted_tree,
+            iqtree_model=iqtree_model,
+            genetic_code=genetic_code,
+        ),
+        sort_keys=True,
+        indent=2,
+    ) + '\n'
+    manifest_path = os.path.abspath(str(state_path)) + '.csubst-manifest.json'
+    resource_cache.atomic_write_text(manifest_path, payload)
+    return manifest_path
+
+
+def check_intermediate_files(g):
+    all_exist = True
+    g = runtime.ensure_iqtree_layout(g, create_dir=False)
+    iqtree_prefix = runtime.infer_iqtree_output_prefix(
+        alignment_file=g.get('alignment_file', ''),
+        iqtree_outdir=g['iqtree_outdir'],
+    )
+    for ext in _FIT_EXTENSIONS:
+        if (g['iqtree_'+ext]=='infer'):
+            g['path_iqtree_'+ext] = iqtree_prefix+'.'+ext
+        else:
+            g['path_iqtree_'+ext] = g['iqtree_'+ext]
+        if not os.path.exists(g['path_iqtree_'+ext]):
+            print('Intermediate file is missing: {}'.format(g['path_iqtree_'+ext]))
+            all_exist = False
+    return g,all_exist
+
+def _run_iqtree(command):
+    returncode = runtime.run_subprocess_tee(command)
+    if returncode != 0:
+        raise AssertionError('IQ-TREE did not finish safely (exit code {}).'.format(returncode))
+
+
+def _set_fit_paths(g, prefix):
+    g.update({'path_iqtree_' + ext: prefix + '.' + ext for ext in _FIT_EXTENSIONS})
+
+
+def _run_guarded_hybrid(g, command, prefix, previous_check):
+    from csubst import iqtree_fit
+
+    lock = resource_cache.resolve_path_lock_path(prefix + '.state', lock_label='iqtree-fit')
+    with resource_cache.acquire_exclusive_lock(lock, lock_label='IQ-TREE fit'):
+        with tempfile.TemporaryDirectory(prefix='.csubst-iqtree-', dir=os.path.dirname(prefix)) as work:
+            local = dict(g)
+
+            def run_in_stage(name, extra_args=()):
+                folder = Path(work) / name
+                folder.mkdir()
+                staged_prefix = str(folder / os.path.basename(prefix))
+                local_command = command.copy()
+                local_command[local_command.index('--prefix') + 1] = staged_prefix
+                _run_iqtree([*local_command, *extra_args])
+                _set_fit_paths(local, staged_prefix)
+                return folder
+
+            if previous_check is None or not previous_check.stalled:
+                folder = run_in_stage('initial')
+                previous_check = iqtree_fit.audit_hybrid_omega(local)
+            if previous_check is not None and previous_check.stalled:
+                print('IQ-TREE omega remained at {} with a nearby log-likelihood gain of {:.6g}. '
+                      'Refitting with a codon frequency floor of {}.'.format(
+                          previous_check.omega, previous_check.probe_gain, iqtree_fit.FREQUENCY_FLOOR,
+                      ), flush=True)
+                folder = run_in_stage('retry', ('--inc-zero-freq', '--min-freq', iqtree_fit.FREQUENCY_FLOOR))
+                recovered = iqtree_fit.audit_hybrid_omega(local, verify_refit=True)
+                iqtree_fit.validate_recovery(previous_check, recovered)
+                print('Accepted IQ-TREE refit: omega={:.8g}, log-likelihood gain={:.6g}.'.format(
+                    recovered.omega, recovered.reported - previous_check.reported,
+                ), flush=True)
+            # Validate every file before publishing any of them. A failed
+            # fitting attempt leaves the existing bundle and its manifest intact.
+            required = {os.path.basename(prefix) + '.' + ext for ext in (*_FIT_EXTENSIONS, 'ckp.gz')}
+            staged = {path.name: path for path in folder.iterdir() if path.is_file()}
+            if not required.issubset(staged):
+                raise ValueError('IQ-TREE did not produce a complete model fit.')
+            destinations = {name: Path(prefix).with_name(name) for name in staged}
+            mutable = {os.path.basename(prefix) + '.' + ext: 'input --iqtree_' + ext for ext in _FIT_EXTENSIONS}
+            mutable[os.path.basename(prefix) + '.ckp.gz'] = 'input IQ-TREE checkpoint'
+            for name, path in destinations.items():
+                output_safety.validate_destination(path, mutable_input_label=mutable.get(name))
+                if path.exists() and not path.is_file():
+                    raise ValueError('IQ-TREE output is not a regular file: {}'.format(path))
+            _set_fit_paths(g, prefix)
+            manifest = Path(_get_iqtree_manifest_path(g))
+            output_safety.validate_destination(manifest)
+            manifest.unlink(missing_ok=True)
+            for name, path in destinations.items():
+                os.replace(staged[name], path)
+            _write_iqtree_manifest(g)
+
+
+def run_iqtree_ancestral(g, force_notree_run=False, previous_omega_check=None):
+    file_tree = runtime.temp_path('tmp.csubst.nwk')
+    tree.write_tree(g['rooted_tree'], outfile=file_tree, add_numerical_label=False)
+    g = runtime.ensure_iqtree_layout(g, create_dir=True)
+    iqtree_prefix = runtime.infer_iqtree_output_prefix(
+        alignment_file=g.get('alignment_file', ''),
+        iqtree_outdir=g['iqtree_outdir'],
+        create_dir=True,
+    )
+    try:
+        is_consistent = tree.is_consistent_tree_and_aln(g=g)
+        if is_consistent:
+            command = [g['iqtree_exe'], '-s', g['alignment_file'], '-te', file_tree,
+                       '-m', g['iqtree_model'], '--seqtype', 'CODON'+str(g['genetic_code']),
+                       '--threads-max', str(g['threads']), '-T', 'AUTO', '--ancestral', '--rate', '--redo',
+                       '--prefix', iqtree_prefix]
+        else:
+            sys.stderr.write('--rooted_tree and --alignment_file are not consistent.\n')
+            if force_notree_run:
+                sys.stderr.write('Running iqtree without tree input to estimate simulation parameters.\n')
+                command = [g['iqtree_exe'], '-s', g['alignment_file'],
+                           '-m', g['iqtree_model'], '--seqtype', 'CODON'+str(g['genetic_code']),
+                           '--threads-max', str(g['threads']), '-T', 'AUTO', '--ancestral', '--rate', '--redo',
+                           '--prefix', iqtree_prefix]
+            else:
+                raise ValueError('--rooted_tree and --alignment_file are not consistent.')
+        if g.get('random_seed') is not None:
+            command.extend(['-seed', str(int(g['random_seed']))])
+        keep_model_precision = str(g.get('iqtree_model', '')).startswith(('GY', 'MG', 'ECMK07_GY0K'))
+        if (g.get('subcommand') == 'scan' or g.get('scan_pvalue_calibration') == 'parametric_bootstrap'
+                or keep_model_precision):
+            command.append('-v')  # Preserve empirical frequencies at full log precision.
+        from csubst import iqtree_fit
+        if iqtree_fit.checks_hybrid_omega(g):
+            _run_guarded_hybrid(g, command, iqtree_prefix, previous_omega_check)
+            return None
+        _run_iqtree(command)
+        _set_fit_paths(g, iqtree_prefix)
+        _write_iqtree_manifest(g)
+        ckp_paths = [g['alignment_file']+'.ckp.gz', iqtree_prefix+'.ckp.gz']
+        for ckp_path in ckp_paths:
+            if (os.path.exists(ckp_path) and g.get('scan_pvalue_calibration') != 'parametric_bootstrap'
+                    and g.get('scan_observation', 'marginal') == 'marginal'
+                    and not keep_model_precision):
+                os.remove(ckp_path)
+    finally:
+        if os.path.exists(file_tree):
+            os.remove(file_tree)
+    return None
+
+def read_state(g):
+    state_path = _get_state_file_path(g)
+    print('Reading the state file:', state_path)
+    state_columns = _read_state_header_columns(state_path)[3:]
+    alignment_file = str(g.get('alignment_file', '')).strip()
+    if alignment_file != '':
+        g['num_input_site'] = _infer_num_input_site_from_alignment_file(alignment_file)
+    else:
+        site_labels = set()
+        for _node, site_text, _state, _probabilities, _line_number in _iter_state_rows(state_path):
+            site_labels.add(_parse_state_site_label(site_text))
+        g['num_input_site'] = len(site_labels)
+    g = _populate_state_metadata_from_columns(g=g, state_columns=state_columns)
+    print('')
+    return g
+
+
+def read_state_header(g):
+    state_path = _get_state_file_path(g)
+    print('Reading the state file header:', state_path)
+    state_columns = _read_state_header_columns(state_path)[3:]
+    g['num_input_site'] = _infer_num_input_site_from_alignment_file(g['alignment_file'])
+    g = _populate_state_metadata_from_columns(g=g, state_columns=state_columns)
+    print('')
+    return g
+
+def read_rate(g):
+    rate_table = pd.read_csv(g['path_iqtree_rate'], sep='\t', header=0, comment='#')
+    rate_table.columns = [str(col).strip() for col in rate_table.columns]
+    if rate_table.shape[0] == 0:
+        model = g.get('substitution_model', '')
+        asrv_mode = g.get('asrv', 'each')
+        if (g.get('expectation_method') == 'urn' and asrv_mode in ('file', 'file_each')
+                and not g.get('asrv_posterior_draws')
+                and re.search(r'\+(?:G\d*|R\d*)(?=\+|\{|$)', model, re.I)):
+            raise ValueError('--asrv {} requires site-rate rows for fitted model {} in {}.'.format(
+                asrv_mode, model, g['path_iqtree_rate']))
+        g['iqtree_rate_column'] = None
+        g['iqtree_categorized_rate_values'] = np.ones(g['num_input_site'])
+        return np.ones(g['num_input_site'])
+    column_by_lower = {str(col).lower(): str(col) for col in rate_table.columns}
+    if 'site' not in column_by_lower:
+        raise ValueError('Unable to find Site column in {}.'.format(g['path_iqtree_rate']))
+    site_col = column_by_lower['site']
+    site_values = pd.to_numeric(rate_table.loc[:, site_col], errors='coerce').to_numpy(dtype=float)
+    rounded_sites = np.round(site_values)
+    if (
+        (not np.isfinite(site_values).all())
+        or (not np.isclose(site_values, rounded_sites, rtol=0.0, atol=1e-12).all())
+    ):
+        raise ValueError('Invalid Site value(s) were found in {}.'.format(g['path_iqtree_rate']))
+    site_values = rounded_sites.astype(np.int64)
+    expected_sites = int(g['num_input_site'])
+    if site_values.shape[0] != expected_sites:
+        raise ValueError(
+            'The number of site-rate rows in {} ({}) did not match num_input_site ({}).'.format(
+                g['path_iqtree_rate'], site_values.shape[0], expected_sites
+            )
+        )
+    if not np.array_equal(np.sort(site_values), np.arange(1, expected_sites + 1)):
+        raise ValueError(
+            'Site values in {} should contain each integer from 1 through {} exactly once.'.format(
+                g['path_iqtree_rate'], expected_sites
+            )
+        )
+    rate_table = rate_table.assign(_csubst_site=site_values).sort_values(
+        '_csubst_site', kind='stable'
+    )
+    if 'rate' in column_by_lower:
+        rate_col = column_by_lower['rate']
+    elif 'c_rate' in column_by_lower:
+        rate_col = column_by_lower['c_rate']
+        txt = 'Using categorized "C_Rate" because posterior-mean "Rate" was not found in the IQ-TREE rate file.'
+        print(txt, flush=True)
+    else:
+        available_cols = ','.join([str(c) for c in rate_table.columns.tolist()])
+        txt = 'Unable to find site-rate column ("C_Rate" or "Rate") in {}. Columns: {}'
+        raise ValueError(txt.format(g['path_iqtree_rate'], available_cols))
+    rate_sites = pd.to_numeric(rate_table.loc[:, rate_col], errors='coerce').to_numpy(dtype=float)
+    if (not np.isfinite(rate_sites).all()) or np.any(rate_sites < 0):
+        txt = 'Non-finite or negative site-rate value(s) were found in {} column of {}.'
+        raise ValueError(txt.format(rate_col, g['path_iqtree_rate']))
+    if rate_sites.shape[0] != expected_sites:
+        txt = 'The number of site-rate rows in {} ({}) did not match num_input_site ({}).'
+        raise ValueError(txt.format(g['path_iqtree_rate'], rate_sites.shape[0], expected_sites))
+    if 'c_rate' in column_by_lower:
+        categorized = pd.to_numeric(
+            rate_table.loc[:, column_by_lower['c_rate']], errors='coerce'
+        ).to_numpy(dtype=float)
+        if (
+            (categorized.shape[0] != expected_sites)
+            or (not np.isfinite(categorized).all())
+            or np.any(categorized < 0)
+        ):
+            raise ValueError('Invalid categorized site-rate values were found in {}.'.format(g['path_iqtree_rate']))
+        g['iqtree_categorized_rate_values'] = categorized
+    else:
+        g['iqtree_categorized_rate_values'] = None
+    g['iqtree_rate_column'] = rate_col
+    return rate_sites
+
+def _read_mg_frequencies(g, report):
+    """Rebuild counted F1X4/F3X4 from the fitted alignment, excluding unknown codons.
+
+    Codon marginals cannot be summed to recover nucleotide frequencies because
+    stop codons have been excluded. Check against the rounded report to detect
+    a mismatched alignment or externally supplied frequency parameters.
+    """
+    model = g['substitution_model']
+    if not re.fullmatch(r'MGK?(?:\+(?:F1X4|F3X4|G\d*|R\d*|I))*', model):
+        raise ValueError('MG supports counted F1X4/F3X4 frequencies; other MG variants/frequency schemes require a verified model.')
+    codons = np.asarray(g['codon_orders'], dtype=str)
+    serialized = re.findall(r'^CSUBST MG nucleotide frequencies position ([123]): ([^\n]+)$', report, re.M)
+    if serialized:
+        if len(serialized) != 3 or len({row[0] for row in serialized}) != 3:
+            raise ValueError('Incomplete MG nucleotide frequencies in the simulation bundle.')
+        frequencies = np.array([[float(v) for v in text.split()] for _, text in sorted(serialized)])
+        if (frequencies.shape != (3, 4) or not np.isfinite(frequencies).all()
+                or (frequencies < 0).any() or not np.allclose(frequencies.sum(axis=1), 1)):
+            raise ValueError('Invalid MG nucleotide frequencies in the simulation bundle.')
+    else:
+        lookup = {c: i for i, c in enumerate(codons)}
+        counts = np.zeros(len(codons))
+        for seq in sequence.read_fasta(g['alignment_file']).values():
+            seq = seq.upper().replace('U', 'T')
+            for start in range(0, len(seq), 3):
+                index = lookup.get(seq[start:start + 3])
+                if index is not None:
+                    counts[index] += 1
+        letters = np.array([list(c) for c in codons])
+        frequencies = np.array([[counts[letters[:, p] == base].sum() for base in 'ACGT'] for p in range(3)])
+        if '+F1X4' in model:
+            frequencies[:] = frequencies.sum(axis=0)
+        if (frequencies.sum(axis=1) == 0).any():
+            raise ValueError('MG frequencies require observed sense codons in the fitted alignment.')
+        frequencies /= frequencies.sum(axis=1, keepdims=True)
+    pi = np.prod([[frequencies[p, 'ACGT'.index(c[p])] for p in range(3)] for c in codons], axis=1)
+    pi /= pi.sum()
+    if re.search(r'pi\(', report):
+        reported = _parse_equilibrium_frequency(report, codons, g['iqtree_parser'], np.float64)
+        if not np.allclose(pi, reported, atol=1.2e-4, rtol=0):
+            raise ValueError('MG counted frequencies do not match the IQ-TREE report; use the original fitted alignment and F1X4/F3X4 settings.')
+    g['mg_nucleotide_frequencies'] = frequencies
+    g['equilibrium_frequency'] = pi.astype(g['float_type'])
+    return g
+
+
+def read_iqtree(g, eq=True):
+    iqtree_txt = _read_text(g['path_iqtree_iqtree'])
+    g = detect_iqtree_output_version(g)
+    if g['iqtree_output_version_major'] is None:
+        # Fall back to executable version if .iqtree file lacks a version banner.
+        g['iqtree_output_version'] = g.get('iqtree_version', None)
+        g['iqtree_output_version_major'] = g.get('iqtree_version_major', None)
+    if (g['iqtree_output_version_major'] is not None) and (g['iqtree_output_version_major']>=3):
+        parser_name = 'iqtree3'
+    else:
+        parser_name = 'iqtree2'
+    g['iqtree_parser'] = parser_name
+    g['substitution_model'] = _parse_substitution_model(iqtree_txt)
+    if g['substitution_model'] is None:
+        raise AssertionError('Failed to parse substitution model from IQ-TREE output.')
+    if eq:
+        if g['substitution_model'].startswith('MG'):
+            return _read_mg_frequencies(g, iqtree_txt)
+        if re.search(r'(?:^|\+)FQ(?:\+|$)', g['substitution_model']):
+            # Equal frequencies are part of the model definition; IQ-TREE
+            # legitimately omits pi(...) entries for this case.
+            count = len(g['codon_orders'])
+            if count == 0:
+                raise ValueError('An equal-frequency model requires a nonempty codon alphabet.')
+            g['equilibrium_frequency'] = np.full(count, 1.0 / count, dtype=g['float_type'])
+            return g
+        try:
+            g['equilibrium_frequency'] = _parse_equilibrium_frequency(
+                iqtree_txt=iqtree_txt,
+                codon_orders=g['codon_orders'],
+                parser_name=parser_name,
+                float_type=g['float_type'],
+            )
+        except AssertionError as e:
+            # IQ-TREE 3 may omit codon pi(...) entries from .iqtree outputs for codon models.
+            if parser_name == 'iqtree3' and re.search(r'(?:^|\+)F(?:\+|$)', g['substitution_model']):
+                txt = 'Could not parse codon frequencies from IQ-TREE 3 output. '
+                txt += 'Estimating empirical codon frequencies from alignment: {}'
+                print(txt.format(g['alignment_file']), flush=True)
+                g['equilibrium_frequency'] = _estimate_empirical_codon_frequency_from_alignment(
+                    alignment_file=g['alignment_file'],
+                    codon_orders=g['codon_orders'],
+                    float_type=g['float_type'],
+                    # The hybrid fit's +F checkpoint counts fully resolved sense codons.
+                    include_ambiguous=g['substitution_model'].split('+')[0] != 'ECMK07_GY0K',
+                )
+            else:
+                raise e
+    return g
+
+def read_log(g):
+    g = detect_iqtree_output_version(g)
+    g['omega'] = None
+    g['kappa'] = None
+    g['reconstruction_codon_table'] = None
+    with open(g['path_iqtree_log']) as f:
+        lines = f.readlines()
+    for line in lines:
+        omega = _parse_float_from_log_line(line, 'Nonsynonymous/synonymous ratio (omega)')
+        if omega is not None:
+            g['omega'] = omega
+        kappa = _parse_float_from_log_line(line, 'Transition/transversion ratio (kappa)')
+        if kappa is not None:
+            g['kappa'] = kappa
+        rgc = re.match(r'\s*Converting to codon sequences with genetic code\s+([0-9]+)\s*\.\.\.', line)
+        if rgc is not None:
+            g['reconstruction_codon_table'] = int(rgc.group(1))
+    return g
+
+def _initialize_state_tensor(axis, dtype, selective, mmap_name):
+    axis = tuple(axis)
+    if not selective:
+        return np.zeros(axis, dtype=dtype)
+    mmap_tensor = runtime.temp_path(mmap_name)
+    if os.path.exists(mmap_tensor):
+        os.unlink(mmap_tensor)
+    txt = 'Generating memory map: dtype={}, axis={}, path={}'
+    print(txt.format(dtype, axis, mmap_tensor), flush=True)
+    return np.memmap(mmap_tensor, dtype=dtype, shape=axis, mode='w+')
+
+
+def _get_num_node_axis(tree_obj):
+    node_ids = list()
+    for node in tree_obj.traverse():
+        nl = ete.get_prop(node, "numerical_label")
+        if isinstance(nl, (bool, np.bool_)):
+            raise ValueError('numerical_label should be an integer.')
+        try:
+            nl_int = int(nl)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('numerical_label should be an integer.') from exc
+        if nl_int < 0:
+            raise ValueError('numerical_label should be non-negative.')
+        node_ids.append(nl_int)
+    if len(node_ids) == 0:
+        return 0
+    return max(node_ids) + 1
+
+
+def _normalize_selected_branch_ids(selected_branch_ids):
+    if selected_branch_ids is None:
+        return np.array([], dtype=np.int64)
+    arr = np.asarray(selected_branch_ids, dtype=object)
+    arr = np.atleast_1d(arr).reshape(-1)
+    if arr.size == 0:
+        return np.array([], dtype=np.int64)
+    normalized = []
+    for value in arr.tolist():
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError('selected_branch_ids should be integer-like.')
+        if isinstance(value, (int, np.integer)):
+            normalized.append(int(value))
+            continue
+        if isinstance(value, (float, np.floating)):
+            if (not np.isfinite(value)) or (not float(value).is_integer()):
+                raise ValueError('selected_branch_ids should be integer-like.')
+            normalized.append(int(value))
+            continue
+        value_txt = str(value).strip()
+        if (value_txt == '') or (not bool(re.fullmatch(r'[+-]?[0-9]+(?:\.0+)?', value_txt))):
+            raise ValueError('selected_branch_ids should be integer-like.')
+        normalized.append(int(value_txt.split('.', 1)[0]))
+    return np.array(normalized, dtype=np.int64)
+
+
+def _get_selected_branch_context(tree, selected_branch_ids):
+    if selected_branch_ids is None:
+        return None, None, set()
+    selected_set = set(int(v) for v in _normalize_selected_branch_ids(selected_branch_ids))
+    selected_internal_ids = list()
+    node_by_id = dict()
+    for node in tree.traverse():
+        node_by_id[int(ete.get_prop(node, "numerical_label"))] = node
+    selected_set = selected_set.intersection(set(node_by_id.keys()))
+    root_nn = int(ete.get_prop(ete.get_tree_root(tree), "numerical_label"))
+    selected_set.add(root_nn)
+    for branch_id in sorted(selected_set):
+        node = node_by_id.get(branch_id, None)
+        if node is None:
+            continue
+        if ete.is_root(node) or ete.is_leaf(node):
+            continue
+        selected_internal_ids.append(branch_id)
+    required_leaf_ids = set()
+    for branch_id in selected_internal_ids:
+        node = node_by_id[int(branch_id)]
+        children = ete.get_children(node)
+        sisters = ete.get_sisters(node)
+        for child in children:
+            required_leaf_ids.update([int(ete.get_prop(leaf, "numerical_label")) for leaf in ete.get_leaves(child)])
+        for sister in sisters:
+            required_leaf_ids.update([int(ete.get_prop(leaf, "numerical_label")) for leaf in ete.get_leaves(sister)])
+    return selected_set, selected_internal_ids, required_leaf_ids
+
+
+def _get_leaf_nonmissing_sites(g, required_leaf_ids):
+    num_node = _get_num_node_axis(g['tree'])
+    leaf_nonmissing = np.zeros(shape=(num_node, g['num_input_site']), dtype=bool)
+    if len(required_leaf_ids) == 0:
+        return leaf_nonmissing
+    codon_state_lookup = sequence.build_state_index_lookup(g['codon_orders'])
+    for node in g['tree'].traverse():
+        if not ete.is_leaf(node):
+            continue
+        nl = int(ete.get_prop(node, "numerical_label"))
+        if nl not in required_leaf_ids:
+            continue
+        if (nl < 0) or (nl >= num_node):
+            txt = 'Leaf branch ID {} is out of bounds for state tensor axis {}.'
+            raise ValueError(txt.format(nl, num_node))
+        seq = ete.get_prop(node, 'sequence', '').upper()
+        if seq == '':
+            continue
+        if (len(seq) % 3) != 0:
+            raise AssertionError('Sequence length is not multiple of 3. Node name = ' + node.name)
+        num_codon_site = len(seq) // 3
+        if num_codon_site != g['num_input_site']:
+            msg = 'Codon site count did not match alignment size for leaf "{}". '
+            msg += 'Expected {}, observed {}.'
+            raise AssertionError(msg.format(node.name, g['num_input_site'], num_codon_site))
+        for s in np.arange(num_codon_site):
+            codon = seq[(s*3):((s+1)*3)]
+            codon_index_direct = codon_state_lookup.get(codon, None)
+            if codon_index_direct is not None:
+                codon_index = [int(codon_index_direct)]
+            else:
+                codon_index = sequence.get_state_index(
+                    codon,
+                    g['codon_orders'],
+                    genetic_code.ambiguous_table,
+                    state_lookup=codon_state_lookup,
+                )
+            leaf_nonmissing[nl, s] = (len(codon_index) > 0)
+    return leaf_nonmissing
+
+
+def mask_missing_sites(state_tensor, tree, selected_internal_ids=None, leaf_nonmissing_sites=None):
+    nonzero_masks = get_internal_site_nonzero_masks(
+        tree=tree,
+        state_tensor=state_tensor,
+        selected_internal_ids=selected_internal_ids,
+        leaf_nonmissing_sites=leaf_nonmissing_sites,
+    )
+    for nl, is_nonzero in nonzero_masks.items():
+        state_tensor[nl,:,:] = np.einsum('ij,i->ij', state_tensor[nl,:,:], is_nonzero)
+    return state_tensor
+
+
+def get_internal_site_nonzero_masks(tree, state_tensor=None, selected_internal_ids=None, leaf_nonmissing_sites=None):
+    if (state_tensor is None) and (leaf_nonmissing_sites is None):
+        raise ValueError('Either state_tensor or leaf_nonmissing_sites is required.')
+    # Valid posterior rows are nonnegative, so presence can be propagated once
+    # per subtree. Bound temporary node/site booleans independently of sites.
+    selected = None if selected_internal_ids is None else set(map(int, selected_internal_ids))
+    nodes = list(tree.traverse('postorder'))
+    targets = [(node, list(ete.get_children(node)) + list(ete.get_sisters(node)))
+               for node in tree.traverse() if not ete.is_root(node) and not ete.is_leaf(node)
+               and (selected is None or int(ete.get_prop(node, 'numerical_label')) in selected)]
+    targets = [(node, groups) for node, groups in targets if len(groups) >= 2]
+    if not targets:
+        return {}
+    roots = {group for _, groups in targets for group in groups}
+    needed = set()
+    for node in tree.traverse('preorder'):
+        if node in roots or node.up in needed:
+            needed.add(node)
+    source = state_tensor if leaf_nonmissing_sites is None else leaf_nonmissing_sites
+    if leaf_nonmissing_sites is not None and source.dtype.kind != 'b':
+        return _get_internal_site_nonzero_masks_by_leaves(
+            tree, state_tensor, selected, leaf_nonmissing_sites)
+    num_site = source.shape[1]
+    out = {int(ete.get_prop(node, 'numerical_label')): np.empty(num_site, dtype=bool)
+           for node, _ in targets}
+    block_size = max(1, (8 * 1024**2) // max(1, len(needed)))
+    for start in range(0, num_site, block_size):
+        stop = min(start + block_size, num_site)
+        presence = {}
+        for node in nodes:
+            if node not in needed:
+                continue
+            children = ete.get_children(node)
+            if not children:
+                values = source[int(ete.get_prop(node, 'numerical_label')), start:stop]
+                if leaf_nonmissing_sites is None:
+                    # Preserve the historical sum/cancellation behavior for
+                    # arbitrary signed or nonfinite arrays accepted by this API.
+                    if np.any(values < 0) or not np.isfinite(values).all():
+                        return _get_internal_site_nonzero_masks_by_leaves(
+                            tree, state_tensor, selected, leaf_nonmissing_sites)
+                    values = np.any(values != 0, axis=1)
+                presence[node] = values
+            else:
+                values = presence[children[0]].copy()
+                for child in children[1:]:
+                    values |= presence[child]
+                presence[node] = values
+        for node, groups in targets:
+            # Count only up to two; avoid a group/site temporary on polytomies.
+            seen = np.zeros(stop - start, dtype=bool)
+            twice = np.zeros_like(seen)
+            for group in groups:
+                twice |= seen & presence[group]
+                seen |= presence[group]
+            out[int(ete.get_prop(node, 'numerical_label'))][start:stop] = twice
+    return out
+
+
+def _get_internal_site_nonzero_masks_by_leaves(tree, state_tensor, selected_internal_ids, leaf_nonmissing_sites):
+    selected_set = None if selected_internal_ids is None else set([int(v) for v in selected_internal_ids])
+    nonzero_masks = dict()
+    for node in tree.traverse():
+        if (ete.is_root(node)) | (ete.is_leaf(node)):
+            continue
+        nl = int(ete.get_prop(node, "numerical_label"))
+        if (selected_set is not None) and (nl not in selected_set):
+            continue
+        children = ete.get_children(node)
+        sisters = ete.get_sisters(node)
+        groups = list(children) + list(sisters)
+        if len(groups) < 2:
+            continue
+        group_nonzero = list()
+        for grp in groups:
+            leaf_nls = np.array(
+                [int(ete.get_prop(leaf, "numerical_label")) for leaf in ete.get_leaves(grp)],
+                dtype=int,
+            )
+            if leaf_nls.shape[0] == 0:
+                continue
+            if leaf_nonmissing_sites is None:
+                grp_nonzero = (state_tensor[leaf_nls,:,:].sum(axis=(0,2)) != 0)
+            else:
+                grp_nonzero = (leaf_nonmissing_sites[leaf_nls,:].sum(axis=0) != 0)
+            group_nonzero.append(grp_nonzero)
+        if len(group_nonzero) < 2:
+            continue
+        group_nonzero = np.stack(group_nonzero, axis=0)
+        nonzero_masks[nl] = (group_nonzero.sum(axis=0) >= 2)
+    return nonzero_masks
+
+
+
+
+
+
+
+
+def _state_probability_batches(state_path, target_names, num_state, dtype, batch_size=256):
+    """Batch reductions while retaining row-order validation and parse errors."""
+    rows = iter(_iter_state_rows(state_path))
+    exhausted = False
+    while not exhausted:
+        batch, pending_error = [], None
+        try:
+            while len(batch) < batch_size:
+                row = next(rows)
+                if row[0] in target_names:
+                    batch.append(row)
+        except StopIteration:
+            exhausted = True
+        except Exception as error:
+            # Earlier probability/metadata errors must win over a later broken
+            # text row, just as in the original streaming validation.
+            pending_error = error
+            exhausted = True
+        parsed, complete = [], []
+        for index, row in enumerate(batch):
+            try:
+                values = np.fromstring(row[3], sep='\t', dtype=dtype)
+            except ValueError as error:
+                values = error
+            parsed.append(values)
+            if isinstance(values, np.ndarray) and values.size == num_state:
+                complete.append(index)
+        invalid, sums = {}, {}
+        if complete:
+            matrix = np.stack([parsed[index] for index in complete])
+            good = np.isfinite(matrix).all(axis=1) & ~(matrix < 0).any(axis=1)
+            totals = np.zeros(len(matrix), dtype=matrix.dtype)
+            totals[good] = matrix[good].sum(axis=1)
+            invalid = dict(zip(complete, ~good))
+            sums = dict(zip(complete, totals))
+        for index, row in enumerate(batch):
+            yield row, parsed[index], invalid.get(index), sums.get(index)
+        if pending_error is not None:
+            raise pending_error
+
+
+def _load_internal_state_rows_one_pass(
+    state_tensor,
+    state_path,
+    state_columns,
+    expected_num_site,
+    internal_id_by_name,
+    target_node_names,
+    required_node_names,
+    dtype,
+):
+    """Validate and load selected internal-state rows in one file pass."""
+    target_node_names = set(target_node_names or [])
+    required_node_names = set(required_node_names or [])
+    expected_num_site = int(expected_num_site)
+    expected_site_set = set(range(1, expected_num_site + 1))
+    num_state = len(state_columns)
+    sites_by_node = OrderedDict()
+    loaded_names = set()
+    for row, values, invalid, probability_sum in _state_probability_batches(
+            state_path, target_node_names, num_state, dtype):
+        node_name, site_text, state_text, probabilities, line_number = row
+        site_label = _parse_state_site_label(site_text)
+        if site_label < 1 or site_label > expected_num_site:
+            raise ValueError(
+                'Unexpected Site labels in .state file. Expected the contiguous range 1..{}.'.format(
+                    expected_num_site
+                )
+            )
+        node_sites = sites_by_node.setdefault(node_name, set())
+        if site_label in node_sites:
+            raise ValueError(
+                'Duplicate Node/Site row(s) were found in .state file: {}:{}'.format(
+                    node_name, site_label
+                )
+            )
+        node_sites.add(site_label)
+        if isinstance(values, Exception):
+            raise values
+        if values.shape[0] != num_state:
+            raise ValueError(
+                'Malformed .state probabilities at line {}: expected {}, observed {}.'.format(
+                    line_number, num_state, values.shape[0]
+                )
+            )
+        if state_text in ('?', '???'):
+            values.fill(0)
+        else:
+            if invalid:
+                raise ValueError(
+                    'Invalid probability value(s) in .state file at line {}.'.format(line_number)
+                )
+            probability_sum = float(probability_sum)
+            if (not math.isfinite(probability_sum)) or (abs(probability_sum - 1.0) > 1e-3):
+                raise ValueError(
+                    '.state probabilities at line {} sum to {:.8g}; expected 1.'.format(
+                        line_number, probability_sum
+                    )
+                )
+        state_tensor[int(internal_id_by_name[node_name]), site_label - 1, :] = values
+        loaded_names.add(node_name)
+
+    invalid_nodes = [
+        (node_name, len(node_sites))
+        for node_name, node_sites in sites_by_node.items()
+        if len(node_sites) != expected_num_site
+    ]
+    if invalid_nodes:
+        invalid_txt = ', '.join(
+            ['{}:{}'.format(node_name, count) for node_name, count in invalid_nodes[:10]]
+        )
+        if len(invalid_nodes) > 10:
+            invalid_txt += ',...'
+        txt = 'Unexpected number of unique Site rows in .state file. '
+        txt += 'Expected {} sites per node; observed {}'
+        raise ValueError(txt.format(expected_num_site, invalid_txt))
+    mismatched_nodes = [
+        node_name for node_name, node_sites in sites_by_node.items()
+        if node_sites != expected_site_set
+    ]
+    if mismatched_nodes:
+        mismatch_txt = ', '.join(mismatched_nodes[:10])
+        if len(mismatched_nodes) > 10:
+            mismatch_txt += ',...'
+        raise ValueError(
+            'Inconsistent Site label sets were found among nodes in .state file: {}'.format(
+                mismatch_txt
+            )
+        )
+    missing_nodes = sorted(required_node_names.difference(sites_by_node))
+    if missing_nodes:
+        missing_txt = ', '.join(missing_nodes[:10])
+        if len(missing_nodes) > 10:
+            missing_txt += ',...'
+        raise ValueError(
+            'Internal node(s) were missing from .state file: {}'.format(missing_txt)
+        )
+    return loaded_names
+
+
+def get_state_tensor(g, selected_branch_ids=None):
+    if g.get('input_data_type', None) != 'cdn':
+        raise NotImplementedError(
+            'Non-codon input is obsolete and no longer supported. '
+            'Run ancestral reconstruction with a codon model.'
+        )
+    ete.link_to_alignment(g['tree'], alignment=g['alignment_file'], alg_format='fasta')
+    first_leaf_seq = ete.get_prop(ete.get_leaves(g['tree'])[0], 'sequence', '')
+    if first_leaf_seq == '':
+        msg = 'Failed to map alignment to tree leaves. Check leaf labels in --alignment_file and --rooted_tree_file.'
+        raise AssertionError(msg)
+    if (len(first_leaf_seq) % 3) != 0:
+        raise AssertionError('Sequence length is not multiple of 3 in alignment file.')
+    num_alignment_site = int(len(first_leaf_seq)/3)
+    err_txt = 'The number of codon sites did not match between the alignment and ancestral states. ' \
+              'Delete intermediate files and rerun.'
+    if num_alignment_site != g['num_input_site']:
+        raise AssertionError(err_txt)
+    joint_endpoints = (g.get('substitution_posterior') == 'joint'
+                       and g.get('subcommand') in ('search', 'analyze', 'benchmark', 'sites'))
+    # Scan filters sites before reconstructing its joint states. The
+    # zero-substitution filter still needs the imported ancestral states.
+    joint_scan = (g.get('subcommand') == 'scan' and g.get('scan_observation') == 'joint'
+                  and not (g.get('drop_invariant_tip_sites', False)
+                           and g.get('drop_invariant_tip_sites_mode') == 'zero_sub_mass'))
+    tip_only = ((joint_endpoints or joint_scan)
+                and g.get('nonsyn_recode', 'no') == 'no'
+                and selected_branch_ids is None)
+    g['_endpoint_tip_only_input'] = tip_only
+    use_state_cache = bool(g.get('_cache_state_tensor', False)) and not tip_only
+    state_cache_key = None
+    if use_state_cache:
+        state_cache_key = _state_tensor_cache_key(
+            g=g,
+            selected_branch_ids=selected_branch_ids,
+        )
+        cached_state_tensor = _get_cached_state_tensor(state_cache_key)
+        if cached_state_tensor is not None:
+            print('Reusing cached IQ-TREE state tensor.', flush=True)
+            return cached_state_tensor
+    num_node = _get_num_node_axis(g['tree'])
+    selected_set, selected_internal_ids, required_leaf_ids = _get_selected_branch_context(
+        tree=g['tree'],
+        selected_branch_ids=selected_branch_ids,
+    )
+    state_path = g['path_iqtree_state']
+    state_columns = _read_state_header_columns(state_path)[3:]
+    if len(state_columns) != int(g['num_input_state']):
+        raise ValueError(
+            'The number of probability columns in .state ({}) did not match num_input_state ({}).'.format(
+                len(state_columns), int(g['num_input_state'])
+            )
+        )
+    internal_id_by_name = {
+        node.name: int(ete.get_prop(node, "numerical_label"))
+        for node in g['tree'].traverse()
+        if not ete.is_leaf(node)
+    }
+    required_internal_names = {
+        node.name
+        for node in g['tree'].traverse()
+        if (
+            (not ete.is_leaf(node))
+            and (not ete.is_root(node))
+            and (node.name is not None)
+            and (str(node.name).strip() != '')
+        )
+    }
+    if selected_set is not None:
+        target_internal_names = {
+            node_name
+            for node_name, node_id in internal_id_by_name.items()
+            if node_id in selected_set
+        }
+        internal_id_by_name = {
+            node_name: node_id
+            for node_name, node_id in internal_id_by_name.items()
+            if node_name in target_internal_names
+        }
+        required_internal_names.intersection_update(target_internal_names)
+    else:
+        target_internal_names = set(internal_id_by_name)
+    axis = [num_node, g['num_input_site'], g['num_input_state']]
+    state_tensor = _initialize_state_tensor(
+        axis=axis,
+        dtype=g['float_type'],
+        selective=(selected_set is not None),
+        mmap_name='tmp.csubst.state_tensor.mmap',
+    )
+    if tip_only:
+        loaded_internal_names = set()
+        print('Joint endpoint input: reading tip observations; internal posteriors will be recomputed.', flush=True)
+    else:
+        loaded_internal_names = _load_internal_state_rows_one_pass(
+            state_tensor=state_tensor,
+            state_path=state_path,
+            state_columns=state_columns,
+            expected_num_site=g['num_input_site'],
+            internal_id_by_name=internal_id_by_name,
+            target_node_names=target_internal_names,
+            required_node_names=required_internal_names,
+            dtype=g['float_type'],
+        )
+    codon_lookup = None
+    codon_state_lookup = None
+    if g['input_data_type'] == 'cdn':
+        codon_lookup = _build_unambiguous_codon_lookup(g['codon_orders'])
+        codon_state_lookup = sequence.build_state_index_lookup(g['codon_orders'])
+    for node in g['tree'].traverse():
+        nl = int(ete.get_prop(node, "numerical_label"))
+        if (nl < 0) or (nl >= num_node):
+            txt = 'Branch ID {} is out of bounds for state tensor axis {}.'
+            raise ValueError(txt.format(nl, num_node))
+        if (selected_set is not None) and (nl not in selected_set):
+            continue
+        elif ete.is_leaf(node):
+            seq = ete.get_prop(node, 'sequence', '').upper()
+            if seq == '':
+                msg = 'Leaf sequence not found for node "{}". Check tree/alignment labels.'
+                raise AssertionError(msg.format(node.name))
+            state_matrix = np.zeros([g['num_input_site'], g['num_input_state']], dtype=g['float_type'])
+            if g['input_data_type']=='cdn':
+                if (len(seq) % 3) != 0:
+                    raise AssertionError('Sequence length is not multiple of 3. Node name = ' + node.name)
+                num_codon_site = len(seq) // 3
+                if num_codon_site != g['num_input_site']:
+                    msg = 'Codon site count did not match alignment size for leaf "{}". '
+                    msg += 'Expected {}, observed {}.'
+                    raise AssertionError(msg.format(node.name, g['num_input_site'], num_codon_site))
+                _fill_leaf_state_matrix_codon(
+                    seq=seq,
+                    state_matrix=state_matrix,
+                    g=g,
+                    codon_lookup=codon_lookup,
+                    codon_state_lookup=codon_state_lookup,
+                )
+            state_tensor[nl,:,:] = state_matrix
+        else: # Internal nodes
+            if tip_only:
+                continue
+            if (
+                (not ete.is_root(node))
+                and (node.name is not None)
+                and (str(node.name).strip() != '')
+                and (node.name not in loaded_internal_names)
+            ):
+                raise ValueError('Internal node was missing from .state file: {}'.format(node.name))
+    state_tensor = np.nan_to_num(state_tensor, copy=False)
+    if tip_only:
+        pass  # Internal missingness is inferred from the tip likelihoods by EndpointModel.
+    elif selected_set is None:
+        state_tensor = mask_missing_sites(state_tensor, g['tree'])
+    else:
+        leaf_nonmissing_sites = _get_leaf_nonmissing_sites(g, required_leaf_ids=required_leaf_ids)
+        state_tensor = mask_missing_sites(
+            state_tensor=state_tensor,
+            tree=g['tree'],
+            selected_internal_ids=selected_internal_ids,
+            leaf_nonmissing_sites=leaf_nonmissing_sites,
+        )
+    if (g['ml_anc']):
+        print('Ancestral state frequency is converted to the ML-like binary states.')
+        if selected_set is None:
+            idxmax = np.argmax(state_tensor, axis=2)
+            state_tensor2 = np.zeros(state_tensor.shape, dtype=bool)
+            is_nonmissing = (state_tensor.sum(axis=2) != 0)
+            nonmissing_branch, nonmissing_site = np.where(is_nonmissing)
+            if nonmissing_branch.shape[0] > 0:
+                state_tensor2[nonmissing_branch, nonmissing_site, idxmax[nonmissing_branch, nonmissing_site]] = True
+            state_tensor = state_tensor2
+            del state_tensor2
+        else:
+            state_tensor2 = _initialize_state_tensor(
+                axis=state_tensor.shape,
+                dtype=bool,
+                selective=True,
+                mmap_name='tmp.csubst.state_tensor_ml.mmap',
+            )
+            for b in sorted(selected_set):
+                branch_state = state_tensor[b, :, :]
+                if branch_state.sum() == 0:
+                    continue
+                idxmax = np.argmax(branch_state, axis=1)
+                is_nonmissing = (branch_state.sum(axis=1) != 0)
+                if is_nonmissing.any():
+                    state_tensor2[b, is_nonmissing, idxmax[is_nonmissing]] = True
+            state_tensor = state_tensor2
+    if use_state_cache:
+        return _cache_state_tensor(state_cache_key, state_tensor)
+    return state_tensor
+
+def get_input_information(g):
+    g = read_state(g)
+    g = read_iqtree(g)
+    g = read_log(g)
+    g['iqtree_rate_values'] = read_rate(g)
+    return g
+
+
+_STATE_TENSOR_CACHE = OrderedDict()
+_STATE_TENSOR_CACHE_MAX_ITEMS = 2
+
+
+def _file_cache_signature(path):
+    stat = os.stat(path)
+    return (os.path.abspath(os.fspath(path)), int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def _state_tensor_cache_key(g, selected_branch_ids):
+    if selected_branch_ids is None:
+        selected = None
+    else:
+        selected = tuple(
+            sorted(int(v) for v in np.asarray(selected_branch_ids, dtype=np.int64).reshape(-1))
+        )
+    tree_signature = tuple(
+        sorted(
+            (
+                int(ete.get_prop(node, 'numerical_label')),
+                '' if node.name is None else str(node.name),
+                bool(ete.is_leaf(node)),
+                -1 if ete.is_root(node) else int(ete.get_prop(node.up, 'numerical_label')),
+            )
+            for node in g['tree'].traverse()
+        )
+    )
+    return (
+        _file_cache_signature(g['path_iqtree_state']),
+        _file_cache_signature(g['alignment_file']),
+        tree_signature,
+        selected,
+        int(g['num_input_site']),
+        int(g['num_input_state']),
+        np.dtype(g['float_type']).str,
+        bool(g.get('ml_anc', False)),
+        tuple(str(value) for value in np.asarray(g.get('codon_orders', []), dtype=object)),
+    )
+
+
+def _get_cached_state_tensor(cache_key):
+    cached = _STATE_TENSOR_CACHE.get(cache_key, None)
+    if cached is not None:
+        _STATE_TENSOR_CACHE.move_to_end(cache_key)
+    return cached
+
+
+def _cache_state_tensor(cache_key, state_tensor):
+    cached = np.array(state_tensor, copy=True)
+    cached.flags.writeable = False
+    _STATE_TENSOR_CACHE[cache_key] = cached
+    _STATE_TENSOR_CACHE.move_to_end(cache_key)
+    while len(_STATE_TENSOR_CACHE) > _STATE_TENSOR_CACHE_MAX_ITEMS:
+        _STATE_TENSOR_CACHE.popitem(last=False)
+    return cached

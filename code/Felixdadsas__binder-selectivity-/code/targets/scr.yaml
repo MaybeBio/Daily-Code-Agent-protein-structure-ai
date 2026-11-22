@@ -1,0 +1,17 @@
+# 阴性对照：把 BNP-32 的序列打乱
+# 保留：氨基酸组成完全相同、两个 Cys 仍在第 10 和第 26 位（所以 17 元环结构仍在）
+# 改变：序列顺序（与 BNP 仅 3/32 位置相同）
+# 用途：如果设计对这条"假靶点"也表现出选择性，说明观察到的 Δ 是噪声
+entities:
+  - protein:
+      id: A
+      sequence: 90
+
+  - protein:
+      id: B
+      sequence: KLMSGGHGSCVGSFRGSKPMRIKDRCSRVLSQ
+
+constraints:
+  - bond:
+      atom1: [B, 10, SG]
+      atom2: [B, 26, SG]

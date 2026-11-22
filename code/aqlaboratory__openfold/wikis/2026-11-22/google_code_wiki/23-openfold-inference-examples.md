@@ -1,0 +1,5 @@
+## OpenFold Inference Examples
+The [`/aqlaboratory/openfold/examples`](https://github.com/aqlaboratory/openfold/examples) directory provides practical demonstrations of how to perform protein structure prediction inference using OpenFold. These examples guide users through the process of setting up and executing predictions, particularly for monomeric proteins, leveraging pre-trained models, and utilizing precomputed alignments to streamline the workflow.
+
+A core example is the script for running monomeric protein inference located at [`/aqlaboratory/openfold/examples/monomer/inference.sh`](https://github.com/aqlaboratory/openfold/examples/monomer/inference.sh). This script showcases how to configure and execute the OpenFold model for single-chain proteins. It specifies the use of a pre-trained model configuration, targets a specific GPU device for computation, and sets a random seed to ensure reproducibility of results. A key feature highlighted is the option to use precomputed alignments, which can significantly accelerate the inference process by bypassing the computationally intensive alignment generation step.
+

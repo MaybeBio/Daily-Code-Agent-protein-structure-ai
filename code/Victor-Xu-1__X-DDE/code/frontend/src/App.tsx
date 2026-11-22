@@ -1,0 +1,701 @@
+import "./presentation/result-layout.css";
+import { useEffect, useRef, useState } from "react";
+import { ApplicationScope } from "./studio/ApplicationScope";
+import {
+  InputActionProvider,
+  useInputActionController,
+} from "./guided/InputActionScope";
+import { api, artifactUrl } from "./api";
+import { persistLanguage, restoreLanguage, translator } from "./i18n";
+import {
+  useWorkbench,
+  taskIdFromHash,
+  type SelectionNavigation,
+} from "./useWorkbench";
+import { WorkbenchReadStatus } from "./WorkbenchReadStatus";
+import { useScience } from "./studio/useScience";
+import { Navigation } from "./studio/Navigation";
+import { Header } from "./studio/Header";
+import {
+  viewTitle,
+  toolForView,
+  viewForTool,
+  viewForResults,
+  resultModule,
+  type View,
+} from "./studio/navigation-model";
+import { ModuleTaskPicker } from "./studio/ModuleTaskPicker";
+import { ModuleWorkspaceNavigation } from "./studio/ModuleWorkspaceNavigation";
+import { kindForJob, moduleForKind } from "./studio/task-history-model";
+import { PredictionResults } from "./studio/PredictionResults";
+import { TaskWorkspace } from "./studio/TaskWorkspace";
+import { TaskWorkspaceSelectionState } from "./studio/TaskWorkspaceSelectionState";
+import { taskHistoryHash, taskHistoryRoute } from "./studio/task-history-route";
+import { taskEntryHash, taskEntryRoute } from "./studio/task-entry-route";
+import { WorkspaceTabs } from "./studio/WorkspaceTabs";
+import { EnvironmentWorkspace } from "./studio/EnvironmentWorkspace";
+import {
+  environmentHash,
+  environmentTabFromHash,
+  type EnvironmentTab,
+} from "./studio/environment-route";
+import { HelpWorkspace } from "./studio/HelpWorkspace";
+import { ProjectPanel } from "./studio/ProjectPanel";
+import type { ToolId } from "./operations/catalog";
+import "./design/research-navigation.css";
+import "./design/module-surfaces.css";
+import { workspaceTheme } from "./design/module-theme";
+import { HomeWorkspace } from "./studio/HomeWorkspace";
+import type { Job, Language, Prediction } from "./types";
+import { ToolCenter } from "./operations/ToolCenter";
+import { isPrediction } from "./operations/types";
+import { useDeployment } from "./deployment/client";
+import { InterfaceSettings } from "./studio/InterfaceSettings";
+import { UtilityWorkspace } from "./utilities/UtilityWorkspace";
+import { Editors } from "./editors/Editors";
+import { ResearchWorkspace } from "./research/ResearchWorkspace";
+import type { ScientificObject } from "./research/types";
+export function App() {
+  const actions = useInputActionController();
+  const [detachedReceipt, setDetachedReceipt] = useState<Job | null>(null);
+  const content = useRef<HTMLElement>(null);
+  const deployment = useDeployment();
+  const [imageRequest, setImageRequest] = useState(0);
+  const [editorObject, setEditorObject] = useState<ScientificObject | null>(
+    null,
+  );
+  const [editorsOpened, setEditorsOpened] = useState(false);
+  const [researchOpened, setResearchOpened] = useState(false),
+    [researchTab, setResearchTab] = useState("projects"),
+    [entryRevision, setEntryRevision] = useState(0);
+  const [language, setLanguage] = useState<Language>(restoreLanguage),
+    [storageWarning, setStorageWarning] = useState(false);
+  const requestedTask = useRef(taskIdFromHash(location.hash));
+  const [environmentTab, setEnvironmentTab] = useState<EnvironmentTab>(
+    () => environmentTabFromHash(location.hash) ?? "components",
+  );
+  const [requestedView, setView] = useState<View>(() => {
+      if (location.hash === "#view=utilities" || !location.hash)
+        return "utilities";
+      if (environmentTabFromHash(location.hash)) return "deployment";
+      const entry = taskEntryRoute(location.hash);
+      if (entry) return entry.tool ? viewForTool(entry.tool) : "tools";
+      const history = taskHistoryRoute(location.hash);
+      return history?.module
+        ? viewForResults(history.module)
+        : taskIdFromHash(location.hash) || history
+          ? "tasks"
+          : "tools";
+    }),
+    [projectId, setProjectId] = useState<string | null>(
+      () =>
+        taskEntryRoute(location.hash)?.project ??
+        taskHistoryRoute(location.hash)?.project ??
+        null,
+    );
+  useEffect(() => {
+    function navigate() {
+      if (window.location.hash === "#view=utilities" || !window.location.hash) {
+        setView("utilities");
+        return;
+      }
+      const tab = environmentTabFromHash(window.location.hash);
+      if (tab) {
+        requestedTask.current = "";
+        setEnvironmentTab(tab);
+        setView("deployment");
+        return;
+      }
+      const entry = taskEntryRoute(window.location.hash);
+      const route = taskHistoryRoute(window.location.hash);
+      if (entry) {
+        requestedTask.current = "";
+        setView(entry.tool ? viewForTool(entry.tool) : "tools");
+        setProjectId(entry.project);
+        setDraft(null);
+        setEntryRevision((value) => value + 1);
+        if (entry.tool === "predict") setInputVersion((value) => value + 1);
+      } else if (taskIdFromHash(window.location.hash) || route) {
+        requestedTask.current = taskIdFromHash(window.location.hash);
+        setView(route?.module ? viewForResults(route.module) : "tasks");
+        setProjectId(route?.project ?? null);
+      }
+    }
+    window.addEventListener("hashchange", navigate);
+    window.addEventListener("popstate", navigate);
+    return () => {
+      window.removeEventListener("hashchange", navigate);
+      window.removeEventListener("popstate", navigate);
+    };
+  }, []);
+  const [resultsVersion, setResultsVersion] = useState(0);
+  const [catalogueRevision, setCatalogueRevision] = useState(0);
+  useEffect(() => {
+    if (requestedView === "research") setResearchOpened(true);
+    if (requestedView === "research" && researchTab === "editors")
+      setEditorsOpened(true);
+  }, [requestedView, researchTab]);
+  const [inputVersion, setInputVersion] = useState(0);
+  const [candidateId, setCandidateId] = useState<string | null>(null),
+    [compared, setCompared] = useState<string[]>([]),
+    [focusResidue, setFocusResidue] = useState<{
+      residue: string;
+      nonce: number;
+    } | null>(null);
+  const [draft, setDraft] = useState<Prediction | null>(null),
+    [submitted, setSubmitted] = useState<Job | null>(null);
+  const work = useWorkbench(),
+    { health, jobs, selected, select, detail, refresh } = work;
+  const job =
+      (work.selectedJob?.id === selected ? work.selectedJob : null) ??
+      jobs.find((x) => x.id === selected) ??
+      (submitted?.id === selected ? submitted : null),
+    science = useScience(job),
+    t = translator(language),
+    zh = language === "zh";
+  const taskServiceAvailable = Boolean(
+    health?.worker_ready && !work.connectionError,
+  );
+  const ready = Boolean(health?.engine.ready && taskServiceAvailable);
+  // Legacy links wait for their exact task. Ownership is a pure projection of
+  // that selection, so switching within one module cannot stall in a pending view.
+  const view: View =
+    requestedView === "tasks" && job && selected === requestedTask.current
+      ? viewForResults(moduleForKind(kindForJob(job)))
+      : requestedView;
+  const scopedResults = resultModule(view);
+  const resultOperation =
+    scopedResults &&
+    job &&
+    moduleForKind(kindForJob(job)) === scopedResults &&
+    (!projectId || job.request.project_id === projectId)
+      ? (job.request.operation ?? "predict")
+      : undefined;
+  const resultSubmissionPending = Boolean(
+    scopedResults && actions.action === "submission",
+  );
+  const hasPendingResult = () =>
+    Boolean(scopedResults && actions.isLocked("submission"));
+  const showingResults = Boolean(scopedResults) || view === "tasks";
+  const predictionLayout =
+    view === "home" ||
+    ["fold", "boltz.predict", "mol1.predict"].includes(
+      toolForView(view) ?? "",
+    ) ||
+    scopedResults === "structures";
+  const analysis = science.analysis;
+  const candidate =
+    analysis?.candidates.find((x) => x.id === candidateId) ??
+    (analysis
+      ? [...analysis.candidates].sort(
+          (a, b) =>
+            (b.ranking_score ?? -Infinity) - (a.ranking_score ?? -Infinity),
+        )[0]
+      : undefined);
+  const comparison =
+    analysis?.candidates.filter((x) => compared.includes(x.id)) ?? [];
+  const fallback =
+    job?.status === "succeeded" && detail?.id === job.id
+      ? detail.artifacts.find((x) => x.name.endsWith(".cif"))
+      : null;
+  const urls =
+    job && comparison.length > 1
+      ? comparison.map((x) =>
+          artifactUrl(job.id, x.aligned_artifact ?? x.artifact),
+        )
+      : job && candidate
+        ? [artifactUrl(job.id, candidate.artifact)]
+        : job && fallback
+          ? [artifactUrl(job.id, fallback.name)]
+          : [];
+  useEffect(() => {
+    document.documentElement.lang = zh ? "zh-CN" : "en";
+    document.title = viewTitle(view, language) + " · X-DDE";
+  }, [language, view]);
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: "instant" });
+    const active = document.activeElement;
+    // Header search survives view changes, including asynchronous task ownership
+    // resolution. Preserve typing, while explicit navigation still focuses main.
+    if (
+      !content.current?.contains(active) &&
+      !active?.matches('.studio-topbar input[type="search"]')
+    )
+      content.current?.focus({ preventScroll: true });
+  }, [view]);
+
+  function chooseJob(id: string, navigation: SelectionNavigation = true) {
+    requestedTask.current = id;
+    select(id, navigation);
+    setCandidateId(null);
+    setCompared([]);
+    setFocusResidue(null);
+  }
+  function showJob(id: string) {
+    if (hasPendingResult()) return;
+    inspectJob(id);
+    setResultsVersion((n) => n + 1);
+    const next =
+      jobs.find((job) => job.id === id) ??
+      (submitted?.id === id ? submitted : null);
+    setView(next ? viewForResults(moduleForKind(kindForJob(next))) : "tasks");
+  }
+  function inspectJob(id: string) {
+    const next = jobs.find((x) => x.id === id);
+    if (next) setProjectId(next.request.project_id ?? null);
+    chooseJob(id);
+  }
+  function chooseProject(id: string | null) {
+    setProjectId(id);
+    const next =
+      view === "home"
+        ? jobs.find(
+            (job) =>
+              isPrediction(job.request) &&
+              (!id || job.request.project_id === id),
+          )
+        : undefined;
+    chooseJob(next?.id ?? "");
+    if (!next) setSubmitted(null);
+  }
+  function chooseCandidate(id: string) {
+    setCandidateId(id);
+    setCompared([]);
+    setFocusResidue(null);
+  }
+  function retainAcceptedTask(next: Job) {
+    work.confirmJob(next);
+    setDetachedReceipt(next);
+    refresh();
+  }
+  function changed(next: Job) {
+    work.confirmJob(next);
+    setSubmitted(next);
+    chooseJob(next.id);
+    setResultsVersion((n) => n + 1);
+    setView(viewForResults(moduleForKind(kindForJob(next))));
+    setProjectId(next.request.project_id ?? null);
+    refresh();
+  }
+  async function submit(value: Prediction, key: string) {
+    const created = await api.submit(value, key);
+    changed(created);
+    return created;
+  }
+  function prepareDraft(value: Prediction) {
+    if (hasPendingResult()) return;
+    chooseJob("", {
+      pushHash: taskEntryHash("predict", value.project_id ?? null),
+    });
+    setDraft(value);
+    setProjectId(value.project_id ?? null);
+    setInputVersion((n) => n + 1);
+    setView("home");
+  }
+  function openEnvironment(tab: EnvironmentTab) {
+    const hash = environmentHash(tab);
+    if (window.location.hash !== hash) chooseJob("", { pushHash: hash });
+    setEnvironmentTab(tab);
+    setView("deployment");
+  }
+  function openTool(tool: ToolId | null) {
+    if (tool === "resources") {
+      openEnvironment("runtime");
+      return;
+    }
+    chooseJob("", { pushHash: taskEntryHash(tool, projectId) });
+    setDraft(null);
+    setEntryRevision((n) => n + 1);
+    if (tool === "predict") setInputVersion((n) => n + 1);
+    setView(tool ? viewForTool(tool) : "tools");
+  }
+  function openRecognition() {
+    setImageRequest((value) => value + 1);
+    navigate("utilities");
+  }
+  function navigate(next: View) {
+    if (hasPendingResult()) return;
+    if (next === "deployment") {
+      openEnvironment("components");
+      return;
+    }
+    if (next === "utilities") {
+      chooseJob("", { pushHash: "#view=utilities" });
+      setView("utilities");
+      return;
+    }
+    const module = resultModule(next);
+    if (module) {
+      chooseJob("", {
+        pushHash: taskHistoryHash({
+          module,
+          type: "all",
+          status: "all",
+          query: "",
+          page: 0,
+          project: projectId,
+        }),
+      });
+      setView(next);
+      return;
+    }
+    const tool = toolForView(next);
+    if (tool) {
+      openTool(tool);
+      return;
+    }
+    if (next === "tools") {
+      setCatalogueRevision((n) => n + 1);
+      openTool(null);
+      return;
+    }
+    setView(next);
+  }
+  const common = {
+    onDraft: prepareDraft,
+    language,
+    ready,
+    health,
+    retryAvailable: taskServiceAvailable,
+    job,
+    detail,
+    // Source-specific read failures and Retry appear once above the workspace.
+    detailError: false,
+    onChanged: changed,
+    projects: science.projects,
+    projectId,
+    onProject: chooseProject,
+    analysis,
+    loadingAnalysis: science.loadingAnalysis,
+    analysisError: science.analysisError,
+    onRetry: science.reloadAnalysis,
+    candidate,
+    onCandidate: chooseCandidate,
+  };
+  return (
+    <ApplicationScope
+      taskServiceAvailable={taskServiceAvailable}
+      deployment={deployment}
+      primaryBackendCapability={toolForView(view)}
+    >
+      <div className="studio-app">
+        <Navigation
+          view={view}
+          onView={navigate}
+          language={language}
+          jobs={jobs}
+        />
+        <div
+          className={
+            "studio-main" + (view === "utilities" ? " is-utilities" : "")
+          }
+        >
+          <Header
+            onOpenRecognition={openRecognition}
+            view={view}
+            language={language}
+            jobs={jobs}
+            onJob={showJob}
+            resultOperation={resultOperation}
+            storageWarning={storageWarning}
+            workspace={
+              <ModuleWorkspaceNavigation
+                view={view}
+                language={language}
+                disabled={resultSubmissionPending}
+                onView={navigate}
+              />
+            }
+          />
+          <main
+            className="studio-content"
+            ref={content}
+            tabIndex={-1}
+            data-prediction-layout={predictionLayout ? "true" : undefined}
+            data-module-theme={workspaceTheme(
+              view,
+              toolForView(view),
+              job?.request,
+            )}
+          >
+            {detachedReceipt && (
+              <div className="notice" role="status">
+                {zh ? "任务已提交。" : "Task submitted."}{" "}
+                <button
+                  type="button"
+                  className="text-button"
+                  disabled={resultSubmissionPending}
+                  onClick={() => {
+                    if (hasPendingResult()) return;
+                    showJob(detachedReceipt.id);
+                    setDetachedReceipt(null);
+                  }}
+                >
+                  {zh ? "查看已提交任务" : "View submitted task"}
+                </button>
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => setDetachedReceipt(null)}
+                >
+                  {zh ? "关闭提示" : "Dismiss"}
+                </button>
+              </div>
+            )}
+            {view === "settings" && (
+              <InterfaceSettings
+                language={language}
+                storageWarning={storageWarning}
+                onLanguage={(value) => {
+                  setLanguage(value);
+                  setStorageWarning(!persistLanguage(value));
+                }}
+              />
+            )}
+            <div className="utility-view" hidden={view !== "utilities"}>
+              <UtilityWorkspace
+                language={language}
+                jobs={jobs}
+                active={view === "utilities"}
+                imageRequest={imageRequest}
+                onCreated={(next) => {
+                  work.confirmJob(next);
+                  refresh();
+                }}
+              />
+            </div>
+            <div hidden={view !== "research"}>
+              {(researchOpened || view === "research") && (
+                <WorkspaceTabs
+                  label={zh ? "研究空间" : "Research workspace"}
+                  value={researchTab}
+                  onChange={setResearchTab}
+                  tabs={[
+                    { id: "projects", label: zh ? "项目" : "Projects" },
+                    { id: "files", label: zh ? "研究文件" : "Research files" },
+                    {
+                      id: "editors",
+                      label: zh ? "结构编辑" : "Structure editor",
+                    },
+                  ]}
+                >
+                  <div hidden={researchTab !== "projects"}>
+                    <ProjectPanel
+                      language={language}
+                      projects={science.projects}
+                      error={science.projectError}
+                      loading={science.loadingProjects}
+                      onRetry={() => science.reloadProjects()}
+                      active={projectId}
+                      onChoose={(id) => {
+                        chooseProject(id);
+                        setView(viewForResults("structures"));
+                      }}
+                      onCreated={science.reloadProjects}
+                    />
+                  </div>
+                  <div hidden={researchTab !== "files"}>
+                    <ResearchWorkspace
+                      language={language}
+                      onCreated={changed}
+                      onJob={showJob}
+                      onEdit={(object) => {
+                        setEditorObject(object);
+                        setResearchTab("editors");
+                      }}
+                    />
+                  </div>
+                  <div hidden={researchTab !== "editors"}>
+                    {(editorsOpened || researchTab === "editors") && (
+                      <Editors
+                        initialObject={editorObject}
+                        language={language}
+                        deployment={deployment.data}
+                        deploymentError={deployment.error}
+                        onRetry={deployment.refresh}
+                        onSetup={() => openEnvironment("components")}
+                        onCreated={changed}
+                      />
+                    )}
+                  </div>
+                </WorkspaceTabs>
+              )}
+            </div>
+            {view === "deployment" && (
+              <EnvironmentWorkspace
+                language={language}
+                tab={environmentTab}
+                onTab={openEnvironment}
+                data={deployment.data}
+                error={deployment.error}
+                refresh={deployment.refresh}
+                health={health}
+                connectionError={work.connectionError}
+                onReconnect={refresh}
+              />
+            )}
+            {view === "help" && (
+              <HelpWorkspace
+                language={language}
+                onStart={() => navigate("tools")}
+                onScreenshot={openRecognition}
+              />
+            )}
+            {view !== "deployment" && (
+              <WorkbenchReadStatus
+                work={work}
+                hasJob={Boolean(job) && (showingResults || view === "home")}
+                showJobsError={view !== "home"}
+                language={language}
+              />
+            )}
+            {!work.healthError &&
+              health?.queue_wait_reason &&
+              showingResults && (
+                <p className="notice" role="status">
+                  {zh
+                    ? "计算资源暂不可用，已提交的任务会继续等待。"
+                    : "Compute resources are unavailable; submitted tasks remain queued."}
+                </p>
+              )}
+            <div hidden={view !== "home"}>
+              <ModuleTaskPicker
+                value="predict"
+                language={language}
+                onChange={openTool}
+              />
+              <HomeWorkspace
+                {...common}
+                active={view === "home"}
+                resultsVersion={resultsVersion}
+                inputVersion={inputVersion}
+                jobs={jobs.filter(
+                  (x) =>
+                    isPrediction(x.request) &&
+                    (!projectId || x.request.project_id === projectId),
+                )}
+                onJob={chooseJob}
+                connectionError={Boolean(work.jobsError)}
+                onRefresh={refresh}
+                compared={compared}
+                onCompare={(ids) => {
+                  setCompared(ids);
+                  setFocusResidue(null);
+                }}
+                urls={urls}
+                focusResidue={focusResidue}
+                onResidue={(residue) => {
+                  setCompared([]);
+                  setFocusResidue({ residue, nonce: Date.now() });
+                }}
+                draft={draft}
+                onReuse={() => {
+                  if (job && isPrediction(job.request)) {
+                    setProjectId(job.request.project_id ?? null);
+                    setDraft({
+                      ...job.request,
+                      name:
+                        job.request.name.slice(0, 72) +
+                        (zh ? " · 副本" : " · copy"),
+                    });
+                  }
+                }}
+                onSubmit={submit}
+              />
+            </div>
+            {(view === "tools" || (view !== "home" && toolForView(view))) && (
+              <>
+                {view !== "tools" && (
+                  <ModuleTaskPicker
+                    value={toolForView(view)!}
+                    language={language}
+                    onChange={openTool}
+                  />
+                )}
+                <ToolCenter
+                  selectedTool={view === "tools" ? null : toolForView(view)}
+                  onSelectTool={openTool}
+                  entryRevision={entryRevision}
+                  catalogueRevision={catalogueRevision}
+                  language={language}
+                  health={health}
+                  jobs={jobs}
+                  onCreated={changed}
+                  onDraft={prepareDraft}
+                  projects={science.projects}
+                  onOpenWorkspace={(project) => {
+                    navigate("research");
+                    setResearchTab("projects");
+                    setProjectId(project?.id ?? null);
+                  }}
+                />
+              </>
+            )}
+            {view === "tasks" && (
+              <section className="utility-page task-history-workspace">
+                <TaskWorkspaceSelectionState
+                  language={language}
+                  error={work.selectedJobError}
+                  loading={work.selectedJobLoading}
+                  onRetry={refresh}
+                  historyHref={taskHistoryHash({
+                    module: "other",
+                    type: "all",
+                    status: "all",
+                    query: "",
+                    page: 0,
+                    project: projectId,
+                  })}
+                />
+              </section>
+            )}
+            {scopedResults && (
+              <InputActionProvider
+                value={{ ...actions, onDetachedAccept: retainAcceptedTask }}
+              >
+                <TaskWorkspace
+                  key={scopedResults}
+                  scopedModule={scopedResults}
+                  {...common}
+                  selected={selected}
+                  selectedError={work.selectedJobError}
+                  selectedLoading={work.selectedJobLoading}
+                  onRefresh={refresh}
+                  onStart={(tool) =>
+                    tool ? openTool(tool) : navigate("tools")
+                  }
+                  onJob={(id) => {
+                    // Keep the resolved module when clearing a legacy task link.
+                    setView(view);
+                    chooseJob(id);
+                  }}
+                  projectId={projectId}
+                  onProject={chooseProject}
+                  onDraft={prepareDraft}
+                  renderPrediction={(onHistory, headerActions) => (
+                    <PredictionResults
+                      {...common}
+                      onHistory={onHistory}
+                      headerActions={headerActions}
+                      urls={urls}
+                      compared={compared}
+                      onCompare={(ids) => {
+                        setCompared(ids);
+                        setFocusResidue(null);
+                      }}
+                      focusResidue={focusResidue}
+                      onResidue={(residue) => {
+                        setCompared([]);
+                        setFocusResidue({ residue, nonce: Date.now() });
+                      }}
+                    />
+                  )}
+                />
+              </InputActionProvider>
+            )}
+          </main>
+        </div>
+      </div>
+    </ApplicationScope>
+  );
+}

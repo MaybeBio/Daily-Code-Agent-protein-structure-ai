@@ -1,0 +1,10 @@
+# Arm D: both targets at once, letter + lambda * vector.
+# lambda 0.45 is the value ProteinJEPA used.
+
+arm: D
+pretrain:
+  target: both
+  lambda: 0.45
+
+finetune:
+  mode: frozen

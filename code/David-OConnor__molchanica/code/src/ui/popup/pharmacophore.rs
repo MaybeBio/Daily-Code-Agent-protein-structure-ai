@@ -1,0 +1,603 @@
+use std::{collections::HashMap, slice};
+
+use egui::{Color32, ComboBox, RichText, ScrollArea, Ui};
+use graphics::{EngineUpdates, Scene};
+use mol_defs::{
+    molecules::{MolType, MoleculeGeneric},
+    screening::pharmacophore::{
+        FeatureRelation, PHARMACOPHORE_SCREENING_THRESH_DEFAULT, Pharmacophore,
+        PharmacophoreFeatType, PharmacophoreFeature, PharmacophoreState, add_pharmacophore_feat,
+    },
+};
+
+use crate::{
+    button, drawing,
+    drawing::blend_color,
+    label, mol_manip,
+    mol_manip::ManipMode,
+    screening::PharmacophoreScreen,
+    selection::Selection,
+    state::{ComputationType, PopupState, State},
+    ui::{
+        COL_SPACING, COLOR_ACTION, COLOR_ACTIVE, COLOR_INACTIVE, COLOR_REMOVE, ROW_SPACING,
+        popup::mol_db::db_selector, util::color_egui_from_f32,
+    },
+    util::{RedrawFlags, handle_err, make_egui_color},
+};
+
+/// Assumes run from the editor for now. For setting relations between
+/// Pharmacophore features, e.g. "or" logic.
+pub(in crate::ui) fn pharmacophore_boolean_window(state: &mut State, ui: &mut Ui) {
+    label!(ui, "Relate pharmacophore features", Color32::WHITE);
+
+    ui.label(RichText::new("Select 2 features to mark with *Or* logic.").color(Color32::GRAY));
+
+    ui.separator();
+    ui.add_space(ROW_SPACING);
+
+    for (i, feat) in state
+        .mol_editor
+        .mol
+        .pharmacophore
+        .features
+        .iter_mut()
+        .enumerate()
+    {
+        ui.horizontal(|ui| {
+            label!(
+                ui,
+                format!("{}: {feat}", i + 1),
+                make_egui_color(feat.feature_type.color())
+            );
+
+            ui.add_space(COL_SPACING);
+
+            let color = if feat.ui_selected {
+                COLOR_ACTIVE
+            } else {
+                COLOR_INACTIVE
+            };
+
+            if ui.button(RichText::new("Select").color(color)).clicked() {
+                feat.ui_selected = !feat.ui_selected
+            }
+        });
+    }
+
+    let num_selected = state
+        .mol_editor
+        .mol
+        .pharmacophore
+        .features
+        .iter()
+        .filter(|f| f.ui_selected)
+        .count();
+
+    if num_selected == 2 {
+        ui.add_space(ROW_SPACING);
+
+        if ui
+            .button(RichText::new("Create OR logic").color(COLOR_ACTION))
+            .on_hover_text(
+                "Allow either of these features to match for a given ligand; both aren't required.",
+            )
+            .clicked()
+        {
+            let sel: Vec<_> = state
+                .mol_editor
+                .mol
+                .pharmacophore
+                .features
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.ui_selected)
+                .map(|(i, _)| i)
+                .collect();
+
+            state
+                .mol_editor
+                .mol
+                .pharmacophore
+                .feature_relations
+                .push(FeatureRelation::Or((sel[0], sel[1])));
+
+            for v in sel {
+                state.mol_editor.mol.pharmacophore.features[v].ui_selected = false;
+            }
+        }
+    }
+
+    boolean_list(
+        &state.mol_editor.mol.pharmacophore.features,
+        &mut state.mol_editor.mol.pharmacophore.feature_relations,
+        ui,
+    );
+}
+
+/// Show all boolean relations (*Or* logic etc)
+fn boolean_list(feats: &[PharmacophoreFeature], relations: &mut Vec<FeatureRelation>, ui: &mut Ui) {
+    if relations.is_empty() {
+        return;
+    }
+
+    ui.separator();
+    ui.add_space(ROW_SPACING);
+    ui.label(RichText::new("Relations:").color(Color32::GRAY));
+
+    let mut rel_removed = None;
+    for (i_rel, rel) in relations.iter().enumerate() {
+        ui.horizontal(|ui| {
+            if let FeatureRelation::Or(pair) = rel {
+                // Blend to white so it's more visible against the dark UI.
+                label!(ui, "Or", Color32::WHITE);
+                for i in [pair.0, pair.1] {
+                    if i >= feats.len() {
+                        eprintln!("Invalid feature index in boolean list.");
+                        return;
+                    }
+
+                    let color = blend_color(feats[i].feature_type.color(), (1., 1., 1.), 0.4);
+                    let color = color_egui_from_f32(color);
+
+                    label!(ui, &format!("{}: {}", i + 1, feats[i].feature_type), color);
+                }
+
+                if ui.button(RichText::new("❌").color(COLOR_REMOVE)).clicked() {
+                    println!("{rel:?}");
+                    rel_removed = Some(i_rel);
+                }
+            }
+        });
+    }
+
+    if let Some(i) = rel_removed {
+        relations.remove(i);
+    }
+}
+
+/// Allows viewing and selecting each pharmacophore feature from a tabular etc display. I.e.,
+/// to supplement positional renderings.
+pub(in crate::ui) fn pharmacophore_list(
+    pharmacophore: &mut Pharmacophore,
+    popup: &mut PopupState,
+    vis_flag: &mut bool,
+    ui: &mut Ui,
+    redraw: &mut bool,
+) {
+    ui.horizontal(|ui| {
+        label!(ui, "Pharmacophores", Color32::GRAY);
+        ui.add_space(COL_SPACING / 2.);
+
+        if ui
+            .button(RichText::new("And / Or logic").color(Color32::GRAY))
+            .on_hover_text(
+                "Add or change boolean logic between pharmacophore features. E.g. marking
+            a pair of features as requiring a match of one or the other, but not both.",
+            )
+            .clicked()
+        {
+            popup.pharmacophore_boolean = !popup.pharmacophore_boolean;
+        }
+
+        ui.add_space(COL_SPACING / 2.);
+
+        if ui
+            .button(RichText::new("Close").color(Color32::LIGHT_RED))
+            .clicked()
+        {
+            *vis_flag = false;
+        }
+    });
+    ui.separator();
+
+    let mut remove = None;
+    for (i, feat) in pharmacophore.features.iter().enumerate() {
+        let descrip = format!("{} | {feat}", i + 1);
+
+        ui.horizontal(|ui| {
+            let color = color_egui_from_f32(feat.feature_type.color());
+            label!(ui, descrip, color);
+
+            ui.add_space(COL_SPACING);
+            if ui.button(RichText::new("❌").color(COLOR_REMOVE)).clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+
+    if let Some(i) = remove {
+        pharmacophore.features.remove(i);
+        *redraw = true;
+    }
+
+    boolean_list(
+        &pharmacophore.features,
+        &mut pharmacophore.feature_relations,
+        ui,
+    );
+
+    ui.add_space(ROW_SPACING);
+}
+
+pub(in crate::ui) fn pharmacophore_edit_tools(
+    state: &mut State,
+    scene: &mut Scene,
+    ui: &mut Ui,
+    updates: &mut EngineUpdates,
+    redraw: &mut bool,
+) {
+    ui.horizontal(|ui| {
+        label!(ui, "Pharmacophore: ", Color32::WHITE);
+
+        let prev = state.ui.pharmacaphore_type;
+        ComboBox::from_id_salt(11123)
+            .width(120.)
+            .selected_text(state.ui.pharmacaphore_type.to_string())
+            .show_ui(ui, |ui| {
+                for v in PharmacophoreFeatType::all() {
+                    ui.selectable_value(&mut state.ui.pharmacaphore_type, v, v.to_string());
+                }
+            });
+
+        if state.ui.pharmacaphore_type != prev {
+            let mol = &state.mol_editor.mol;
+
+            let Some(char) = &mol.characterization else {
+                eprintln!("Missing char on mol editor when changing pharmacophore type.");
+                return;
+            };
+
+            let hint_sites = state
+                .ui
+                .pharmacaphore_type
+                .hint_sites(char, &mol.common.atom_posits);
+
+            drawing::draw_pharmacophore_hint_sites(&mut scene.entities, &hint_sites, updates);
+        }
+
+        if let Selection::AtomLig((_mol_i, atom_i)) = &state.ui.selection
+            && ui
+                .button(RichText::new("Add ph feat").color(COLOR_ACTION))
+                .on_hover_text("Add pharmacophore feature.")
+                .clicked()
+        {
+            if add_pharmacophore_feat(
+                &mut state.mol_editor.mol,
+                state.ui.pharmacaphore_type,
+                *atom_i,
+            )
+            .is_err()
+            {
+                eprintln!("Error adding pharmacophore feature.");
+            };
+
+            *redraw = true;
+        }
+
+        // if !state.mol_editor.mol.pharmacophore.features.is_empty()
+        //     && ui
+        //         .button(RichText::new("Save ph"))
+        //         .on_hover_text("Save the pharmacophore to a file.")
+        //         .clicked()
+        // {
+        //     let name = &state.mol_editor.mol.common.ident;
+        //
+        //     if state
+        //         .mol_editor
+        //         .mol
+        //         .pharmacophore
+        //         .save_using_dialog(&mut state.volatile.dialogs.save, name)
+        //         .is_err()
+        //     {
+        //         handle_err(&mut state.ui, "Problem saving the pharmacophore".to_owned());
+        //     }
+        // }
+
+        // Pocket-related functionality.
+        if state.mol_editor.mol.pharmacophore.pocket.is_some() {
+            // todo: Match on selection, or active mol here?
+            // let pocket_sel_prev = matches!(state.ui.selection, Selection::AtomPocket(_));
+            let pocket_sel_prev = matches!(state.volatile.active_mol, Some((MolType::Pocket, _)));
+
+            // Allow selecting the pocket, e.g. as opposed to a lig atom or bond.
+            {
+                let color = if pocket_sel_prev {
+                    COLOR_ACTIVE
+                } else {
+                    COLOR_INACTIVE
+                };
+
+                if ui
+                    .button(RichText::new("Select pocket").color(color))
+                    .on_hover_text(
+                        "Select the pocket, e.g. to manipulate it relative to the ligand.",
+                    )
+                    .clicked()
+                {
+                    state.ui.selection = if pocket_sel_prev {
+                        Selection::None
+                    } else {
+                        Selection::AtomPocket((0, 0))
+                    };
+
+                    state.volatile.active_mol = if pocket_sel_prev {
+                        None
+                    } else {
+                        Some((MolType::Pocket, 0))
+                    };
+                }
+            }
+
+            // if matches!(state.ui.selection, Selection::AtomPocket(_)) {
+            if pocket_sel_prev {
+                let mut color_move = COLOR_INACTIVE;
+                let mut color_rotate = COLOR_INACTIVE;
+
+                match state.volatile.mol_manip.mode {
+                    ManipMode::Move((mol_type, _mol_i)) => {
+                        if mol_type == MolType::Pocket {
+                            color_move = COLOR_ACTIVE;
+                        }
+                    }
+                    ManipMode::Rotate((mol_type, _mol_i)) => {
+                        if mol_type == MolType::Pocket {
+                            color_rotate = COLOR_ACTIVE;
+                        }
+                    }
+                    ManipMode::None => (),
+                }
+
+                // dummy API interaction.
+                let mut redraw_flags = RedrawFlags {
+                    pocket: *redraw,
+                    ..Default::default()
+                };
+
+                if ui
+                    .button(RichText::new("↔ pocket").color(color_move))
+                    .on_hover_text("Move the pocket relative to the molecule.")
+                    .clicked()
+                {
+                    mol_manip::set_manip(
+                        state,
+                        scene,
+                        &mut redraw_flags,
+                        &mut false,
+                        ManipMode::Move((MolType::Pocket, 0)),
+                        updates,
+                    );
+                    *redraw = redraw_flags.pocket;
+                }
+
+                if ui
+                    .button(RichText::new("⟳ pocket").color(color_rotate))
+                    .on_hover_text("Rotate the pocket relative to the molecule.")
+                    .clicked()
+                {
+                    mol_manip::set_manip(
+                        state,
+                        scene,
+                        &mut redraw_flags,
+                        &mut false,
+                        ManipMode::Rotate((MolType::Pocket, 0)),
+                        updates,
+                    );
+                    *redraw = redraw_flags.pocket;
+                }
+            }
+
+            if ui
+                .button(RichText::new("Delete pocket").color(COLOR_REMOVE))
+                .on_hover_text("Delete this pocket from the pharmacophore")
+                .clicked()
+            {
+                state.mol_editor.mol.pharmacophore.pocket = None;
+                *redraw = true;
+            }
+
+            // ui.add_space(COL_SPACING);
+            // if ui
+            //     .button("Use this pocket for pharmacophore")
+            //     .on_hover_text("Use the displayed pocket as part of the pharmacophore")
+            //     .clicked()
+            // {
+            //     copy_pocket_to_pharmacophore = true;
+            // }
+        }
+    });
+}
+
+/// Similar to the `summary` method, but splits up labels for color-coding.
+pub(in crate::ui) fn pharmacophore_summary(
+    ph: &Pharmacophore,
+    ph_i: usize,
+    popup: &mut PopupState,
+    ph_state: &mut PharmacophoreState,
+    ui: &mut Ui,
+) {
+    let mut feat_counts = HashMap::new();
+    for feat in &ph.features {
+        *feat_counts.entry(feat.feature_type).or_insert(0) += 1;
+    }
+
+    let mut items: Vec<_> = feat_counts.into_iter().collect();
+    items.sort_by(|(a_ft, _), (b_ft, _)| a_ft.cmp(b_ft));
+
+    ui.horizontal(|ui| {
+        for (ft, count) in items {
+            // Blend to white so it's more visible against the dark UI.
+            let color = blend_color(ft.color(), (1., 1., 1.), 0.4);
+            let color = color_egui_from_f32(color);
+
+            label!(ui, &format!("{ft}: {count} "), color);
+        }
+
+        if ui.button(RichText::new("Screen")).clicked() {
+            popup.pharmacophore_screening = !popup.pharmacophore_screening;
+            ph_state.ph_for_screening = Some(ph_i)
+        }
+    });
+
+    if ph_state.screening_in_progress {
+        label!(ui, "Screening in progress", COLOR_ACTIVE);
+    }
+}
+
+pub(in crate::ui) fn pharmacophore_screen(
+    state: &mut State,
+    scene: &mut Scene,
+    ui: &mut Ui,
+    updates: &mut EngineUpdates,
+) {
+    ui.horizontal(|ui| {
+        label!(ui, "Pharmacophore screening", Color32::WHITE);
+        ui.add_space(COL_SPACING);
+
+        // if ui
+        //     .button(RichText::new("Choose mol path"))
+        //     .on_hover_text("Choose a path which contains the molecules to screen.")
+        //     .clicked()
+        // {
+        //     // Re-using this dialog.
+        //     state.volatile.dialogs.screening.pick_directory();
+        // }
+
+        // The Parquet DB popup must load after this for it to work as intended, opening over the
+        // screening one.
+        if ui
+            .button("Load or create databases")
+            .on_hover_text(
+                "Open the Parquet Database management window. This lets you create a database \
+            from molecule files, or load one from disk.",
+            )
+            .clicked()
+        {
+            state.ui.popup.parquet_db = true;
+        }
+    });
+    ui.add_space(ROW_SPACING);
+
+    db_selector(state, ui);
+
+    let Some(ph_i) = state.pharmacophore.ph_for_screening else {
+        return;
+    };
+
+    let Some((db_mol_count, db_name, db_source)) = state
+        .active_mol_db()
+        .map(|db| (db.index_meta.len(), db.name(), db.source.clone()))
+    else {
+        label!(
+            ui,
+            "No database selected. Use 'Load or create databases' above.",
+            Color32::GRAY
+        );
+        return;
+    };
+
+    label!(
+        ui,
+        format!("Database: {db_name} ({db_mol_count} molecules)"),
+        Color32::GRAY
+    );
+    ui.add_space(ROW_SPACING);
+
+    if state.pharmacophore.screening_in_progress {
+        label!(ui, "Screening in progress", COLOR_ACTIVE);
+        ui.add_space(ROW_SPACING);
+    }
+
+    label!(ui, "Results:", Color32::GRAY);
+    ui.separator();
+
+    // We are using SMILES to index the database.
+    let mut smiles_to_load: Option<String> = None;
+
+    ScrollArea::vertical()
+        .min_scrolled_height(800.0)
+        .show(ui, |ui| {
+            let results: Vec<_> = state
+                .pharmacophore
+                .screening_results
+                .iter()
+                .map(|v| (v.smiles_or_ident.clone(), v.score))
+                .collect();
+
+            for (smiles, score) in &results {
+                ui.horizontal(|ui| {
+                    label!(ui, format!("{smiles}  score: {score:.2}"), Color32::WHITE);
+
+                    ui.add_space(COL_SPACING);
+                    if button!(
+                        ui,
+                        "Load mol",
+                        Color32::GRAY,
+                        "Load this molecule from the database to view"
+                    )
+                    .clicked()
+                    {
+                        smiles_to_load = Some(smiles.clone());
+                    }
+                });
+            }
+        });
+
+    if let Some(smiles) = smiles_to_load {
+        // Loaded before `load_mol_to_state`, which needs `state` mutably while the DB borrows it.
+        let loaded = state.active_mol_db().map(|db| {
+            db.load_mol(&smiles).map(|mut mol| {
+                // Screening only reads `mol_data`; now that we're opening this molecule for
+                // viewing, load its idents and metadata too. Non-fatal: the molecule is still
+                // usable without them.
+                if let Err(e) = db.apply_idents_meta(slice::from_mut(&mut mol)) {
+                    eprintln!("Error loading idents and metadata for '{smiles}': {e}");
+                }
+                mol
+            })
+        });
+
+        match loaded {
+            Some(Ok(mol)) => {
+                state.load_mol_to_state(MoleculeGeneric::Small(mol), scene, updates, None);
+            }
+            Some(Err(e)) => handle_err(
+                &mut state.ui,
+                format!("Failed to load molecule '{smiles}' from database: {e}"),
+            ),
+            None => (),
+        }
+    }
+
+    ui.add_space(ROW_SPACING);
+
+    if state.pharmacophore.screening_in_progress {
+        if button!(ui, "Stop", COLOR_ACTION, "Abort the screening process.").clicked() {
+            state.pharmacophore.screening_in_progress = false;
+            // Dropping the receiver causes the screening thread's next tx.send() to
+            // fail cleanly.
+            state.volatile.thread_receivers.ph_screening = None;
+            println!("Screening aborted.");
+        }
+    } else if button!(
+        ui,
+        "Run Screening",
+        COLOR_ACTION,
+        "Start the screening using the active database"
+    )
+    .clicked()
+    {
+        let computation = state.volatile.ongoing_computations.start(
+            ComputationType::Other,
+            "Pharmacophore screening",
+            Some(db_source.name()),
+        );
+
+        let rx = state.ligands[ph_i].pharmacophore.screen_ligs(
+            &db_source,
+            PHARMACOPHORE_SCREENING_THRESH_DEFAULT,
+            &mut state.pharmacophore.screening_in_progress,
+            computation,
+        );
+        state.volatile.thread_receivers.ph_screening = Some(rx);
+    }
+}

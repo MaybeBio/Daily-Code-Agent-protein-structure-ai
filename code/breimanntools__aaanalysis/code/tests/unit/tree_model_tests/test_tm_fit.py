@@ -1,0 +1,433 @@
+"""This script tests the TreeModel.fit() method."""
+import numpy as np
+import pytest
+from hypothesis import given, settings
+import hypothesis.strategies as st
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, GradientBoostingClassifier
+import aaanalysis as aa
+import hypothesis.extra.numpy as npst
+
+# Set default deadline from 200 to 400
+settings.register_profile("ci", deadline=None)
+settings.load_profile("ci")
+
+
+aa.options["verbose"] = False
+
+def create_labels(size):
+    labels = np.array([1, 1, 0, 0] + list(np.random.choice([1, 0], size=size-4)))
+    return labels
+
+
+def check_invalid_conditions(X, min_samples=3, check_unique=True):
+    n_samples, n_features = X.shape
+    n_unique_samples = len(set(map(tuple, X)))
+    conditions = [
+        (np.any(np.isinf(X)) or np.any(np.isnan(X)), "X contains NaN or Inf"),
+        (n_samples < min_samples, f"n_samples={n_samples} should be >= {min_samples}"),
+        (n_features < 2, f"n_features={n_features} should be >= 2"),
+    ]
+    if check_unique:
+        conditions.append((n_unique_samples == 1, "Feature matrix 'X' should not have all identical samples."))
+    for condition, msg in conditions:
+        if condition:
+            return True
+    return False
+
+N_ROUNDS = 2
+ARGS = dict(use_rfe=False, n_cv=2, n_rounds=N_ROUNDS)
+
+
+class TestTreeModelFit:
+    """Test TreeModel.fit() method for each parameter individually with positive test cases."""
+
+    # Positive test cases
+    @settings(deadline=None, max_examples=10)
+    @given(X=npst.arrays(dtype=np.float64, shape=npst.array_shapes(min_dims=2, max_dims=2),
+                         elements=st.floats(min_value=-1e3, max_value=1e3, allow_nan=False, allow_infinity=False)))
+    def test_X_parameter(self, X):
+        tree_model = aa.TreeModel()
+        size, n_feat = X.shape
+        if size > 3 and n_feat > 3:
+            labels = create_labels(X.shape[0])
+            if not check_invalid_conditions(X):
+                tree_model.fit(X=X, labels=labels, **ARGS)
+                assert tree_model.list_models_ is not None
+                assert len(tree_model.is_selected_) == N_ROUNDS
+                assert len(tree_model.feat_importance) == n_feat
+                assert len(tree_model.feat_importance_std) == n_feat
+                assert isinstance(tree_model.is_selected_, np.ndarray)
+                assert isinstance(tree_model.feat_importance, np.ndarray)
+                assert isinstance(tree_model.feat_importance_std, np.ndarray)
+
+    @settings(max_examples=5, deadline=None)
+    @given(labels=st.lists(st.integers(0, 1), min_size=10, max_size=20))
+    def test_labels_parameter(self, labels):
+        """Test the 'labels' parameter with valid inputs."""
+        X = np.random.rand(len(labels), 10)
+        size, n_feat = X.shape
+        unique, counts = np.unique(labels, return_counts=True)
+        min_class_count = min(counts)
+        if min_class_count >= 2 and n_feat > 3 and len(set(labels)) == 2:
+            if not check_invalid_conditions(X):
+                tree_model = aa.TreeModel()
+                tree_model.fit(X=X, labels=labels, **ARGS)
+                assert tree_model.list_models_ is not None
+                assert len(tree_model.is_selected_) == N_ROUNDS
+                assert len(tree_model.feat_importance) == n_feat
+                assert len(tree_model.feat_importance_std) == n_feat
+                assert isinstance(tree_model.is_selected_, np.ndarray)
+                assert isinstance(tree_model.feat_importance, np.ndarray)
+                assert isinstance(tree_model.feat_importance_std, np.ndarray)
+
+    @settings(max_examples=3, deadline=None)
+    @given(n_rounds=st.integers(min_value=1, max_value=3))
+    def test_n_rounds_parameter(self, n_rounds):
+        """Test the 'n_rounds' parameter with valid inputs."""
+        X = np.random.rand(10, 5)
+        size, n_feat = X.shape
+        labels = create_labels(X.shape[0])
+        unique, counts = np.unique(labels, return_counts=True)
+        min_class_count = min(counts)
+        if min_class_count >= 2 and n_feat > 3 and not check_invalid_conditions(X):
+            tree_model = aa.TreeModel()
+            tree_model.fit(X=X, labels=labels, n_rounds=n_rounds, use_rfe=False, n_cv=2)
+            assert len(tree_model.list_models_) == n_rounds
+            assert tree_model.list_models_ is not None
+            assert len(tree_model.is_selected_) == n_rounds
+            assert len(tree_model.feat_importance) == n_feat
+            assert len(tree_model.feat_importance_std) == n_feat
+            assert isinstance(tree_model.is_selected_, np.ndarray)
+            assert isinstance(tree_model.feat_importance, np.ndarray)
+            assert isinstance(tree_model.feat_importance_std, np.ndarray)
+
+    def test_use_rfe_parameter(self):
+        """Test the 'use_rfe' parameter with valid inputs."""
+        X = np.random.rand(10, 5)
+        labels = create_labels(X.shape[0])
+        unique, counts = np.unique(labels, return_counts=True)
+        min_class_count = min(counts)
+        size, n_feat = X.shape
+        if min_class_count >= 2 and n_feat > 3 and not check_invalid_conditions(X):
+            tree_model = aa.TreeModel()
+            tree_model.fit(X=X, labels=labels, n_feat_min=n_feat-2, n_feat_max=n_feat-1, n_cv=2, n_rounds=2)
+            assert tree_model.list_models_ is not None
+            assert len(tree_model.is_selected_) == N_ROUNDS
+            assert len(tree_model.feat_importance) == n_feat
+            assert len(tree_model.feat_importance_std) == n_feat
+            assert isinstance(tree_model.is_selected_, np.ndarray)
+            assert isinstance(tree_model.feat_importance, np.ndarray)
+            assert isinstance(tree_model.feat_importance_std, np.ndarray)
+
+    @settings(max_examples=10, deadline=None)
+    @given(n_cv=st.integers(min_value=2))
+    def test_n_cv_parameter(self, n_cv):
+        """Test the 'n_cv' parameter with valid inputs."""
+        X = np.random.rand(10, 5)
+        labels = create_labels(X.shape[0])
+        unique, counts = np.unique(labels, return_counts=True)
+        min_class_count = min(counts)
+        size, n_feat = X.shape
+        if min_class_count >= n_cv and n_feat > 3 and not check_invalid_conditions(X):
+            tree_model = aa.TreeModel()
+            tree_model.fit(X=X, labels=labels, n_cv=n_cv, use_rfe=False, n_rounds=2)
+            assert tree_model.list_models_ is not None
+            assert len(tree_model.is_selected_) == N_ROUNDS
+            assert len(tree_model.feat_importance) == n_feat
+            assert len(tree_model.feat_importance_std) == n_feat
+            assert isinstance(tree_model.is_selected_, np.ndarray)
+            assert isinstance(tree_model.feat_importance, np.ndarray)
+            assert isinstance(tree_model.feat_importance_std, np.ndarray)
+
+    @settings(max_examples=5, deadline=None)
+    @given(n_feat_min=st.integers(min_value=1), n_feat_max=st.integers(min_value=2))
+    def test_n_feat_min_max_parameter(self, n_feat_min, n_feat_max):
+        """Test the 'n_feat_min' and 'n_feat_max' parameters with valid inputs."""
+        X = np.random.rand(10, 5)
+        labels = create_labels(X.shape[0])
+        size, n_feat = X.shape
+        if size > 2 and n_feat > 3 and not check_invalid_conditions(X):
+            tree_model = aa.TreeModel()
+            if n_feat_min >= n_feat_max:
+                n_feat_max = n_feat_min + 1
+            tree_model.fit(X=X, labels=labels, n_feat_min=n_feat_min, n_feat_max=n_feat_max, **ARGS)
+            assert tree_model.list_models_ is not None
+            assert len(tree_model.is_selected_) == N_ROUNDS
+            assert len(tree_model.feat_importance) == n_feat
+            assert len(tree_model.feat_importance_std) == n_feat
+            assert isinstance(tree_model.is_selected_, np.ndarray)
+            assert isinstance(tree_model.feat_importance, np.ndarray)
+            assert isinstance(tree_model.feat_importance_std, np.ndarray)
+
+
+
+    @settings(max_examples=3, deadline=None)
+    @given(metric=st.sampled_from(['accuracy', 'balanced_accuracy', 'precision', 'recall', 'f1', 'roc_auc']))
+    def test_metric_parameter(self, metric):
+        X = np.random.rand(10, 5)
+        labels = create_labels(X.shape[0])
+        size, n_feat = X.shape
+        if size > 2 and n_feat > 3 and not check_invalid_conditions(X):
+            tree_model = aa.TreeModel()
+            tree_model.fit(X=X, labels=labels, metric=metric, n_feat_min=n_feat-2, n_feat_max=n_feat-1, **ARGS)
+            assert tree_model.list_models_ is not None
+            assert len(tree_model.is_selected_) == N_ROUNDS
+            assert len(tree_model.feat_importance) == n_feat
+            assert len(tree_model.feat_importance_std) == n_feat
+            assert isinstance(tree_model.is_selected_, np.ndarray)
+            assert isinstance(tree_model.feat_importance, np.ndarray)
+            assert isinstance(tree_model.feat_importance_std, np.ndarray)
+
+    @settings(max_examples=3, deadline=None)
+    @given(step=st.one_of(st.integers(min_value=1, max_value=3), st.none()))
+    def test_step_parameter(self, step):
+        """Test the 'step' parameter with valid inputs."""
+        X = np.random.rand(10, 10)
+        labels = create_labels(X.shape[0])
+        size, n_feat = X.shape
+        if size > 2 and n_feat > 3 and not check_invalid_conditions(X) and (step is None or step < n_feat):
+            tree_model = aa.TreeModel()
+            tree_model.fit(X=X, labels=labels, step=step, n_feat_min=n_feat-2, n_feat_max=n_feat-1, n_cv=2, n_rounds=2)
+            assert tree_model.list_models_ is not None
+            assert len(tree_model.is_selected_) == N_ROUNDS
+            assert len(tree_model.feat_importance) == n_feat
+            assert len(tree_model.feat_importance_std) == n_feat
+            assert isinstance(tree_model.is_selected_, np.ndarray)
+            assert isinstance(tree_model.feat_importance, np.ndarray)
+            assert isinstance(tree_model.feat_importance_std, np.ndarray)
+
+    # Negative test cases
+    def test_invalid_X_parameter(self):
+        """Test with invalid 'X' parameter."""
+        tree_model = aa.TreeModel()
+        with pytest.raises(ValueError):
+            tree_model.fit(X="invalid", labels=np.array([0, 1]))
+        with pytest.raises(ValueError):
+            tree_model.fit(X=[], labels=np.array([0, 1]))
+        with pytest.raises(ValueError):
+            tree_model.fit(X={}, labels=np.array([0, 1]))
+        with pytest.raises(ValueError):
+            tree_model.fit(X=np.array(["asdf", "asdf"]), labels=np.array([0, 1]))
+
+    def test_invalid_labels_parameter(self):
+        """Test with invalid 'labels' parameter."""
+        tree_model = aa.TreeModel()
+        X = np.random.rand(10, 5)
+        size, _ = X.shape
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels="invalid")
+        labels = [1] * size
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels)
+        labels[0] = "str"
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels)
+        labels[0] = 0
+        labels.append(1)
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels)
+
+    def test_invalid_n_rounds_parameter(self):
+        """Test with invalid 'n_rounds' parameter."""
+        tree_model = aa.TreeModel()
+        X = np.random.rand(10, 5)
+        labels = np.random.randint(0, 2, 10)
+        invalid_n_rounds = -1  # Negative integer
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, n_rounds=invalid_n_rounds)
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, n_rounds="estr")
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, n_rounds=[12, 2])
+
+    def test_invalid_n_cv_parameter(self):
+        """Test with invalid 'n_cv' parameter."""
+        tree_model = aa.TreeModel()
+        X = np.random.rand(10, 5)
+        n_samples, n_feat = X.shape
+        labels = np.random.randint(0, 2, 10)
+        invalid_n_cv = 0  # Non-positive integer
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, n_cv=invalid_n_cv)
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, n_cv=1000)
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, n_cv=n_samples)
+
+    def test_invalid_n_feat_min_max_parameter(self):
+        """Test with invalid 'n_feat_min' and 'n_feat_max' parameters."""
+        tree_model = aa.TreeModel()
+        X = np.random.rand(10, 5)
+        labels = np.random.randint(0, 2, 10)
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, n_feat_min=5, n_feat_max=3)
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, n_feat_min=5, n_feat_max="str")
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, n_feat_min=5, n_feat_max=None)
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, n_feat_min=-123, n_feat_max=123)
+
+    def test_invalid_metric_parameter(self):
+        """Test with invalid 'metric' parameter."""
+        tree_model = aa.TreeModel()
+        X = np.random.rand(10, 5)
+        labels = np.random.randint(0, 2, 10)
+        invalid_metric = 'not_a_metric'  # Non-existent metric
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, metric=invalid_metric)
+
+    def test_invalid_step_parameter(self):
+        """Test with invalid 'step' parameter."""
+        tree_model = aa.TreeModel()
+        X = np.random.rand(10, 10)
+        labels = np.random.randint(0, 2, 10)
+        invalid_step = 11  # Greater than number of features
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, step=invalid_step)
+
+    def test_X_with_nan_or_inf(self):
+        """Test 'X' parameter containing NaN or Inf."""
+        tree_model = aa.TreeModel()
+        X_with_nan = np.array([[np.nan, 1], [2, 3]])
+        labels = np.array([1, 0])
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X_with_nan, labels=labels)
+
+    def test_labels_not_matching_X(self):
+        """Test when 'labels' length does not match 'X'."""
+        tree_model = aa.TreeModel()
+        X = np.random.rand(10, 5)
+        mismatched_labels = np.array([1, 0])  # Length not matching X's row count
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=mismatched_labels)
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=[0, 12, "ser"])
+
+    def test_invalid_use_rfe_parameter(self):
+        """Test with invalid 'use_rfe' parameter."""
+        tree_model = aa.TreeModel()
+        X = np.random.rand(10, 5)
+        labels = np.random.randint(0, 2, 10)
+        invalid_use_rfe = 'not_boolean'  # Not a boolean value
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, use_rfe=invalid_use_rfe)
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, use_rfe=[])
+        with pytest.raises(ValueError):
+            tree_model.fit(X=X, labels=labels, use_rfe="asrter")
+
+
+class TestTreeModelFitComplex:
+    """Combination tests that actually exercise recursive feature elimination."""
+
+    @staticmethod
+    def _rfe_data(n_samples=30, n_feat=20, seed=0):
+        rng = np.random.default_rng(seed)
+        X = rng.random((n_samples, n_feat))
+        labels = np.array([1, 0] * (n_samples // 2))
+        return X, labels
+
+    def test_use_rfe_true_step_none(self):
+        """use_rfe=True with step=None removes all minimum-importance features per round."""
+        X, labels = self._rfe_data()
+        tree_model = aa.TreeModel()
+        tree_model.fit(X=X, labels=labels, use_rfe=True, step=None,
+                       n_feat_min=5, n_feat_max=15, n_cv=2, n_rounds=2)
+        assert tree_model.is_selected_.shape == (2, X.shape[1])
+        # RFE keeps at least n_feat_min features in each round
+        assert all(row.sum() >= 5 for row in tree_model.is_selected_)
+
+    def test_use_rfe_true_step_int(self):
+        """use_rfe=True with a fixed step removes 'step' least-important features per round."""
+        X, labels = self._rfe_data(seed=1)
+        tree_model = aa.TreeModel()
+        tree_model.fit(X=X, labels=labels, use_rfe=True, step=2,
+                       n_feat_min=5, n_feat_max=15, n_cv=2, n_rounds=2)
+        assert tree_model.is_selected_.shape == (2, X.shape[1])
+        assert len(tree_model.feat_importance) == X.shape[1]
+
+    def test_use_rfe_true_verbose_prints_progress(self):
+        """verbose=True drives the RFE start/progress/end messages."""
+        X, labels = self._rfe_data(seed=2)
+        aa.options["verbose"] = True
+        tree_model = aa.TreeModel(verbose=True)
+        tree_model.fit(X=X, labels=labels, use_rfe=True, step=2,
+                       n_feat_min=5, n_feat_max=15, n_cv=2, n_rounds=1)
+        assert tree_model.list_models_ is not None
+
+    def test_use_rfe_true_with_is_preselected(self):
+        """A preselected feature mask is honoured as the RFE starting set."""
+        X, labels = self._rfe_data(seed=3)
+        is_preselected = np.ones(X.shape[1], dtype=bool)
+        is_preselected[:4] = False  # start from 16 of 20 features
+        tree_model = aa.TreeModel(is_preselected=is_preselected)
+        tree_model.fit(X=X, labels=labels, use_rfe=True, step=2,
+                       n_feat_min=5, n_feat_max=12, n_cv=2, n_rounds=2)
+        assert tree_model.is_selected_.shape == (2, X.shape[1])
+
+    def test_preselected_without_rfe_used_as_selection(self):
+        """With use_rfe=False, the preselected mask is the selected set each round."""
+        X, labels = self._rfe_data(seed=4)
+        is_preselected = np.ones(X.shape[1], dtype=bool)
+        is_preselected[:3] = False
+        tree_model = aa.TreeModel(is_preselected=is_preselected)
+        tree_model.fit(X=X, labels=labels, use_rfe=False, n_cv=2, n_rounds=2)
+        for row in tree_model.is_selected_:
+            assert np.array_equal(row, is_preselected)
+
+class TestTreeModelFitReproducibility:
+    """Same random_state -> identical feature importance (reproducibility.md)."""
+
+    def test_same_random_state_same_importance(self):
+        rng = np.random.default_rng(0)
+        X = rng.random((40, 6))
+        labels = create_labels(40)  # built once, reused for both fits
+        a = aa.TreeModel(random_state=0); a.fit(X=X, labels=labels, **ARGS)
+        b = aa.TreeModel(random_state=0); b.fit(X=X, labels=labels, **ARGS)
+        assert np.allclose(a.feat_importance, b.feat_importance)
+        assert np.array_equal(a.is_selected_, b.is_selected_)
+
+
+class TestTreeModelFeatureImportances:
+    """The sklearn-named feature_importances_ property (#92)."""
+
+    def _fit(self, seed=0, n_feat=6):
+        rng = np.random.default_rng(seed)
+        X = rng.random((40, n_feat))
+        labels = create_labels(40)
+        return aa.TreeModel(random_state=seed).fit(X=X, labels=labels, **ARGS)
+
+    def test_unavailable_before_fit_raises(self):
+        tree_model = aa.TreeModel()
+        with pytest.raises(ValueError, match="fit"):
+            _ = tree_model.feature_importances_
+
+    def test_shape_matches_n_features(self):
+        tm = self._fit(n_feat=6)
+        assert tm.feature_importances_.shape == (6,)
+
+    def test_is_ndarray_float(self):
+        tm = self._fit()
+        fi = tm.feature_importances_
+        assert isinstance(fi, np.ndarray) and fi.dtype == float
+
+    def test_alias_of_feat_importance_over_100(self):
+        tm = self._fit()
+        assert np.allclose(tm.feature_importances_, np.asarray(tm.feat_importance, dtype=float) / 100.0)
+
+    def test_sklearn_convention_nonneg_and_sums_to_one(self):
+        # use_rfe=False -> every feature used each round, per-round importances sum to 1,
+        # so the averaged fractions sum to ~1 (allowing rounding drift).
+        tm = self._fit()
+        fi = tm.feature_importances_
+        assert (fi >= 0).all()
+        assert np.isclose(fi.sum(), 1.0, atol=0.05)
+
+    def test_reproducible_across_same_seed(self):
+        rng = np.random.default_rng(0)
+        X = rng.random((40, 6))
+        labels = create_labels(40)  # built once, reused for both fits
+        a = aa.TreeModel(random_state=0).fit(X=X, labels=labels, **ARGS)
+        b = aa.TreeModel(random_state=0).fit(X=X, labels=labels, **ARGS)
+        assert np.array_equal(a.feature_importances_, b.feature_importances_)

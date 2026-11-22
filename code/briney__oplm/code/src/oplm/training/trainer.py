@@ -1,0 +1,2709 @@
+"""Trainer class for OPLM masked language model pretraining."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import math
+import os
+import time
+from dataclasses import asdict, dataclass, replace
+from datetime import timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+import torch
+import torch.nn as nn
+
+from oplm.training.ema import EMA_HF_DIRNAME, EMA_SIDECAR_NAME, build_ema
+from oplm.training.signals import (
+    DRAIN_EXIT_CODE,
+    DrainSignal,
+    clear_stale_drain_marker,
+    seconds_until_job_end,
+    write_drain_marker,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping, Sequence
+
+    from accelerate import Accelerator
+    from torch.distributed import ProcessGroup
+    from torch.optim.swa_utils import AveragedModel
+    from torch.utils.data import DataLoader
+
+    from oplm.config import OplmConfig
+    from oplm.data import Reshard
+    from oplm.eval.context import EvalContext
+    from oplm.eval.evaluator import Evaluator
+    from oplm.model import OplmForMaskedLM
+    from oplm.training.callbacks import TrainerCallback
+    from oplm.training.checkpoint import PendingSave
+    from oplm.training.remote import UploadManager
+    from oplm.training.task import TrainTask
+
+logger = logging.getLogger(__name__)
+
+
+def _no_phase(name: str) -> contextlib.nullcontext[None]:
+    """Phase timer stand-in when profiling is off."""
+    return contextlib.nullcontext()
+
+
+# Wall-clock margin (seconds) before SLURM_JOB_END_TIME at which the env drain
+# clock starts reporting requested=True. Fixed module constant for now; may
+# become a config knob later if a use case needs it.
+_DRAIN_MARGIN_SECONDS = 600
+
+# Bounds (seconds) on how long Trainer._drain_remote_uploads blocks on a background
+# checkpoint upload (Task 4.2) before giving up and proceeding anyway -- the local
+# checkpoint the upload mirrors already exists and is a valid resume target
+# regardless of whether the remote mirror finished. Matches the drain path's own
+# "checkpoint, then exit 85" budget philosophy: bounded, never indefinite.
+#
+# That wait runs in SERIES inside the _DRAIN_MARGIN_SECONDS budget above (drain flag ->
+# checkpoint -> upload drain -> exit 85 -> requeue), so a flat 600s cap could consume the
+# entire 600s margin on its own and let the scheduler SIGKILL the job mid-shutdown. The
+# effective budget is therefore derived from the remaining wall clock whenever the
+# scheduler exposes one (see _remote_upload_drain_budget): whatever is left before
+# SLURM_JOB_END_TIME, minus a safety buffer for the exit path itself, clamped to
+# [0, _REMOTE_UPLOAD_DRAIN_MAX_SECONDS]. Without that env var (a workstation run, no
+# wall-clock deadline at all) it falls back to a small fraction of the margin.
+_REMOTE_UPLOAD_DRAIN_MAX_SECONDS = 600.0
+_REMOTE_UPLOAD_DRAIN_FALLBACK_SECONDS = 180.0
+_REMOTE_UPLOAD_DRAIN_SAFETY_BUFFER_SECONDS = 60.0
+
+# Loss-spike warn-only detector (Task 1.8, spec §6): same 0.98/0.02 EMA smoothing
+# oplm.training.mup's logging helper uses. Warns (never aborts) once the EMA has had
+# _LOSS_SPIKE_WARMUP_LOGS logged steps to settle, so a cold-start EMA (which starts
+# equal to the very first loss) can't trivially trip the 3x threshold.
+_LOSS_EMA_DECAY = 0.98
+_LOSS_SPIKE_MULTIPLIER = 3.0
+_LOSS_SPIKE_WARMUP_LOGS = 50
+
+
+def _remote_upload_drain_budget(env: Mapping[str, str] | None = None) -> float:
+    """Seconds to wait on the background remote upload before giving up.
+
+    Sized from the scheduler's own wall clock rather than being a second, independent
+    10-minute budget nested inside the 10-minute drain margin: whatever is left before
+    ``SLURM_JOB_END_TIME``, minus :data:`_REMOTE_UPLOAD_DRAIN_SAFETY_BUFFER_SECONDS`
+    for the rest of the shutdown path (exit 85 -> wrapper -> ``scontrol requeue``),
+    clamped to ``[0, _REMOTE_UPLOAD_DRAIN_MAX_SECONDS]``. Waiting past the job's end
+    time buys nothing: the scheduler kills the process, and the local checkpoint is a
+    valid resume target regardless of whether the mirror finished.
+
+    Args:
+        env: Environment mapping to read the end-time clock from (see
+            :func:`oplm.training.signals.seconds_until_job_end`); defaults to the real
+            process environment. Tests inject a plain dict.
+
+    Returns:
+        The bound in seconds. Falls back to
+        :data:`_REMOTE_UPLOAD_DRAIN_FALLBACK_SECONDS` when the scheduler exposes no
+        end time at all (e.g. a workstation run), where there is no deadline to fit
+        inside and an unbounded-ish wait would only stall an interactive shutdown.
+    """
+    remaining = seconds_until_job_end(env)
+    if remaining is None:
+        return _REMOTE_UPLOAD_DRAIN_FALLBACK_SECONDS
+    usable = remaining - _REMOTE_UPLOAD_DRAIN_SAFETY_BUFFER_SECONDS
+    return max(0.0, min(usable, _REMOTE_UPLOAD_DRAIN_MAX_SECONDS))
+
+
+@dataclass(frozen=True)
+class _StepFlags:
+    """Rank-synchronized control bundle for the just-completed optimizer step.
+
+    Every rank computes its own local inputs (raw token count, whether it
+    observed a drain signal, whether its own loss was non-finite, whether its
+    own ``save_every_minutes`` timer fired, whether its own pending async save's
+    local write is done) and :meth:`Trainer._reduce_step_flags` sum-reduces them
+    into one rank-identical bundle: token counts add up normally (sequence counts
+    too: GPUs differ in sequences per batch in token mode), and any boolean
+    flag true on *any* rank becomes true on *every* rank (sum > 0). This is the
+    single rank-synchronization point later resilience features plug into — the
+    drain signal (Task 1.5) and the non-finite-loss guardrail (Task 1.8) only
+    need to change their local input to this reduce, not add a new collective.
+
+    ``pending_done_count`` is deliberately kept as the raw sum rather than
+    booleanized like the others: an async checkpoint save (Task 2.3) may only be
+    safely committed once *every* rank's local write is done, so the trainer
+    needs to compare this count against ``accelerator.num_processes`` exactly --
+    a partial count (some but not all ranks done) must never look like "true" the
+    way the other flags' any-rank-trips-it-for-everyone semantics intend.
+    """
+
+    tokens_delta: int
+    samples_delta: int
+    drain: bool
+    nonfinite: bool
+    save_due: bool
+    pending_done_count: int
+
+
+@dataclass(frozen=True)
+class _PendingAsyncSave:
+    """Trainer-local wrapper around a checkpoint.py ``PendingSave`` handle.
+
+    ``checkpoint.py``'s :func:`~oplm.training.checkpoint.save_checkpoint` /
+    :func:`~oplm.training.checkpoint.finalize_pending_save` know nothing about the
+    ``keep_every_n_hours`` permanent-marker rule (Task 1.3) -- that decision is made
+    entirely on the trainer side, from wall-clock state ``save_checkpoint`` never sees.
+    This wrapper carries the decision alongside the handle: ``should_mark_permanent``
+    is computed at TRIGGER time in :meth:`Trainer._save_checkpoint` (identically to the
+    synchronous path, which also decides it before saving), and applied at FINALIZE
+    time in :meth:`Trainer._finalize_pending_save`, once the checkpoint has actually
+    been renamed into its final, markable location.
+
+    ``global_step`` is also captured at TRIGGER time -- by the time
+    :meth:`Trainer._finalize_pending_save` runs, ``self.global_step`` may already have
+    advanced past the step this checkpoint was actually saved at (that is the entire
+    point of deferring the commit), so ``on_checkpoint_saved`` must be told the
+    checkpoint's own step explicitly rather than reading the trainer's live counter.
+    """
+
+    handle: PendingSave
+    should_mark_permanent: bool
+    global_step: int
+
+
+class _SaveDeferral:
+    """Worker-cycle save-alignment deferral (Task 3.3 controller addition).
+
+    Task 3.1 established that global batch order on resume is exact only when
+    ``batches_in_epoch % num_workers == 0`` -- a resumed ``DataLoader`` always restarts
+    its worker round-robin at worker 0, so the interruption must have landed on a full
+    worker-cycle boundary for the *global* interleaving order to reproduce exactly (each
+    worker's own content is exact regardless). This class defers a checkpoint trigger
+    (periodic step-cadence, ``save_every_minutes``, or drain) across at most
+    ``num_workers - 1`` extra optimizer steps, looking for the first step where
+    ``batches_in_epoch`` lands back on that boundary, before saving anyway. Rank-safe by
+    construction in sequence mode: every input (``batches_in_epoch``, ``num_workers``,
+    ``global_step``) is rank-identical, so every rank reaches the same decision without a
+    new collective. In token mode ``batches_in_epoch`` is per-rank (each GPU rolls over on
+    its own), so the trainer passes ``num_workers=1`` and the deferral never fires
+    (:meth:`Trainer._alignment_workers`).
+
+    A deferral budget exists because some ``(gradient_accumulation_steps, num_workers)``
+    combinations never realign: ``batches_in_epoch`` advances by
+    ``gradient_accumulation_steps`` each optimizer step, so if
+    ``gcd(gradient_accumulation_steps, num_workers)`` does not divide the current
+    ``batches_in_epoch % num_workers`` offset, ``0`` is mathematically unreachable and
+    waiting longer would never help. In that pathological case the budget expires and
+    the save happens anyway, misaligned -- correctness (having a checkpoint) beats
+    alignment, and the resume side (:meth:`Trainer._resume_from_checkpoint`) logs a
+    warning when it detects the recorded cursor is misaligned.
+
+    One instance tracks one cadence's in-flight deferral (the trainer keeps a separate
+    instance for periodic saves and for drain, since drain must never share state with,
+    or be starved by, the periodic-save cadence).
+    """
+
+    def __init__(self) -> None:
+        self._since_step: int | None = None
+
+    def decide(
+        self, *, triggered: bool, batches_in_epoch: int, num_workers: int, global_step: int
+    ) -> bool:
+        """Return ``True`` if a save should happen now for this cadence.
+
+        Args:
+            triggered: This step's own local trigger condition (e.g. ``step_saved or
+                flags.save_due``, or the drain flag). Ignored once a deferral is already
+                in flight -- the pending save is owed regardless of whether the original
+                per-step trigger condition still holds.
+            batches_in_epoch: The trainer's current ``self._batches_in_epoch``
+                (rank-identical in sequence mode; per-rank in token mode, where the
+                deferral is disabled).
+            num_workers: The alignment worker count (rank-identical, from config; 1 in
+                token mode).
+            global_step: The trainer's current ``self.global_step``, used to bound the
+                deferral window to ``num_workers - 1`` extra steps.
+
+        Returns:
+            ``True`` exactly on the step the caller should actually call
+            ``_save_checkpoint`` for this cadence; ``False`` while deferring.
+        """
+        if self._since_step is None:
+            if not triggered:
+                return False
+            self._since_step = global_step
+
+        aligned = num_workers <= 1 or batches_in_epoch % num_workers == 0
+        extra_steps = global_step - self._since_step
+        budget_expired = extra_steps >= max(num_workers - 1, 0)
+
+        if aligned or budget_expired:
+            self._since_step = None
+            return True
+        return False
+
+
+class Trainer:
+    """Training loop for OPLM with accelerate, wandb, and rich progress.
+
+    Args:
+        cfg: Full OPLM configuration. If ``data.eval`` is configured, an
+            :class:`~oplm.eval.Evaluator` is built automatically.
+    """
+
+    def __init__(
+        self,
+        cfg: OplmConfig,
+        callbacks: Sequence[TrainerCallback] | None = None,
+        task: TrainTask | None = None,
+    ) -> None:
+        from accelerate import Accelerator
+        from accelerate.utils import DataLoaderConfiguration, InitProcessGroupKwargs, set_seed
+        from rich.console import Console
+
+        from oplm.config import validate_parallelism_compat, validate_token_batching
+        from oplm.data import DeviceDataLoader, train_data_fingerprint
+        from oplm.training.optim import build_optimizers, build_schedulers
+        from oplm.training.preflight import run_preflight
+        from oplm.training.task import MLMTask
+
+        self.cfg = cfg
+        self._data_fingerprint = train_data_fingerprint(cfg.data.train)
+        self.callbacks = list(callbacks or [])
+        # Objective-specific model/data/step (docs/training.md, "Training tasks"). The default
+        # reproduces MLM training exactly; fold stages pass FoldTask (milestone 2).
+        self.task: TrainTask = task if task is not None else MLMTask()
+
+        # Cross-section config guard (Task 5.1), first thing and before any process-group
+        # work: a config built directly (tests, sweeps, notebooks) never went through
+        # load_config's copy of this check. Currently refuses hsdp + configured eval --
+        # see validate_parallelism_compat for the deadlock it prevents.
+        validate_parallelism_compat(cfg)
+        validate_token_batching(cfg)
+
+        # Drain trigger (Task 1.5): SIGUSR1/SIGTERM handlers plus the Slurm
+        # SLURM_JOB_END_TIME wall-clock margin. Installed immediately so a signal
+        # arriving during the (potentially slow) rest of __init__ is still caught.
+        self._drain_signal = DrainSignal(margin_seconds=_DRAIN_MARGIN_SECONDS)
+        self._drain_signal.install()
+
+        # Latest pre-clip gradient norm, captured in the training loop when
+        # clipping is active; read by StabilityDiagnosticsCallback. Stays None
+        # when max_grad_norm <= 0 (no clip) so the diagnostic simply omits it.
+        self._last_grad_norm: torch.Tensor | None = None
+
+        # Opt-in stability diagnostics (docs/mup-lr.md, "Stability diagnostics"). Attached
+        # here so plain `oplm train ... train.stability_diagnostics=true` runs
+        # (the probe/control) get it without a bespoke entry point.
+        if cfg.train.stability_diagnostics:
+            from oplm.training.mup import StabilityDiagnosticsCallback
+
+            self.callbacks.append(
+                StabilityDiagnosticsCallback(probe_every=cfg.train.stability_probe_every)
+            )
+        if cfg.train.weight_diag_every > 0:
+            from oplm.training.diagnostics import WeightDiagnosticsCallback
+
+            self.callbacks.append(WeightDiagnosticsCallback(every=cfg.train.weight_diag_every))
+
+        # Seed everything
+        set_seed(cfg.train.seed)
+
+        # Accelerator. kwargs_handlers=[InitProcessGroupKwargs(timeout=...)] (Task 1.8)
+        # bounds every NCCL/gloo collective's wait, converting a genuine hang into a
+        # raised exception (-> nonzero exit -> requeue) within cfg.train.dist_timeout_minutes
+        # instead of wedging until the Slurm time limit; on a single process it is a harmless
+        # no-op (there is no process group to time out).
+        log_with = "wandb" if cfg.train.wandb_enabled else None
+        self.accelerator = Accelerator(
+            mixed_precision=cfg.train.mixed_precision,
+            gradient_accumulation_steps=cfg.train.gradient_accumulation_steps,
+            log_with=log_with,
+            project_dir=cfg.train.output_dir,
+            dataloader_config=DataLoaderConfiguration(dispatch_batches=False),
+            step_scheduler_with_optimizer=False,
+            kwargs_handlers=[
+                InitProcessGroupKwargs(timeout=timedelta(minutes=cfg.train.dist_timeout_minutes))
+            ],
+        )
+        # Token mode: the global token budget fixes accumulation for this world size. Written
+        # into the config and the accelerator before anything reads it, so the loop, the
+        # total-step math and the saved config.yaml all see the value in use.
+        self._token_mode = cfg.train.batch_tokens is not None
+        if self._token_mode:
+            from oplm.config import resolve_token_accumulation
+
+            accumulation = resolve_token_accumulation(cfg.train, self.accelerator.num_processes)
+            cfg.train.gradient_accumulation_steps = accumulation
+            self.accelerator.gradient_accumulation_steps = accumulation
+
+        # Preflight (Task 1.8): allocate + matmul on every rank, right after the
+        # Accelerator exists and BEFORE anything below touches checkpoints or data. A
+        # sick node must fail here, in seconds and attributably, rather than hanging
+        # mid-training or corrupting a resume by racing the stale-checkpoint cleanup
+        # below. Unconditional on every rank -- like the resume-target broadcast further
+        # down, run_preflight contains a collective (a gather_object exchange of every
+        # rank's local pass/fail, when num_processes > 1) that every rank must reach
+        # together, REGARDLESS of its own local outcome, or a locally-failing rank would
+        # leave the healthy ranks hanging in it instead of failing fast and attributably.
+        run_preflight(self.accelerator)
+
+        # Dedicated process group for checkpoint I/O collectives (Task 5.1b, fixing a
+        # latent bug found -- and reproduced live -- during Task 5.1's HSDP pilot).
+        # dcp.async_save's background write thread runs its own DCP planning/metadata
+        # collectives over whatever process group it is given; left unset, that was the
+        # DEFAULT process group -- the exact same group the training loop's own
+        # collectives (the per-step control-bundle reduce, gradient
+        # all-reduce/reduce-scatter) run on from the MAIN thread. Two threads issuing
+        # collectives on one group interleave nondeterministically and can abort with a
+        # gloo "collective mismatch" (see build_checkpoint_process_group's docstring and
+        # task-5.1-report.md's Concern 1). Building ONE dedicated GLOO group here, once,
+        # and threading it into every checkpoint collective (save_checkpoint's
+        # process_group parameter -> dcp.save/dcp.async_save) from here on closes that
+        # hole. Collective -- called unconditionally on EVERY rank, never behind a
+        # feature-flag guard (unlike the remote-upload group below, checkpointing itself
+        # is not optional), or a rank that skips it hangs every other rank here forever.
+        # None on a single process (no process group exists to build a subgroup of).
+        from oplm.training.checkpoint import build_checkpoint_process_group
+
+        self._checkpoint_process_group: ProcessGroup | None = build_checkpoint_process_group(
+            self.accelerator,
+            timeout=timedelta(minutes=cfg.train.dist_timeout_minutes),
+        )
+
+        # Remote checkpoint mirror (Task 4.2). build_upload_group is a collective --
+        # EVERY rank calls it here, unconditionally within this branch, whenever a
+        # remote URI is configured (never skipped on some ranks and not others, or it
+        # hangs every rank at that collective). Only this run's node leaders
+        # (local_process_index == 0) actually construct an UploadManager; every other
+        # rank's self._remote_upload_manager stays None and every per-checkpoint call
+        # into it (_submit_remote_upload/_drain_remote_uploads) is then a no-op on that
+        # rank. Unset remote_checkpoint_uri (the default): this whole block is skipped
+        # on every rank, so nothing here executes and nothing in oplm.training.remote
+        # is even imported -- the zero-behavior-change contract for existing runs.
+        self._remote_upload_manager: UploadManager | None = None
+        if cfg.train.remote_checkpoint_uri is not None:
+            from oplm.training.remote import RemoteStore, UploadManager, build_upload_group
+
+            upload_group = build_upload_group(
+                self.accelerator,
+                timeout=timedelta(minutes=cfg.train.dist_timeout_minutes),
+            )
+            if self.accelerator.local_process_index == 0:
+                self._remote_upload_manager = UploadManager(
+                    RemoteStore(cfg.train.remote_checkpoint_uri),
+                    self.accelerator,
+                    upload_group=upload_group,
+                )
+
+        # Status helper for user-facing messages (main process only)
+        _console = Console()
+
+        def _status(msg: str) -> None:
+            if self.accelerator.is_main_process:
+                _console.print(msg)
+
+        # Consolidate all run artifacts (checkpoints, config copy, wandb logs)
+        # under output_dir. Create it up front so wandb can log into it.
+        if self.accelerator.is_main_process:
+            Path(cfg.train.output_dir).mkdir(parents=True, exist_ok=True)
+
+            # A checkpoint-<step>.tmp/ staging dir surviving to trainer start means the
+            # process that created it was killed mid-save (torn, unconditionally deleted).
+            # A checkpoint-<step>.old/ dir means it was killed mid-replace (the previous
+            # commit at that step, moved aside before the new one landed) — recovered back
+            # onto checkpoint-<step>/ if the new commit never landed. Resolve both before
+            # any resume logic below can consider the directory listing.
+            from oplm.training.checkpoint import clean_stale_checkpoint_dirs
+
+            clean_stale_checkpoint_dirs(Path(cfg.train.output_dir))
+
+            # A drain marker surviving to trainer start means the requeue wrapper never
+            # ran after the drain that wrote it (e.g. the batch node died and Slurm
+            # itself requeued the job). Clear it so it cannot misclassify this attempt's
+            # next genuine crash as a drain -- see clear_stale_drain_marker.
+            clear_stale_drain_marker(Path(cfg.train.output_dir))
+
+        # Barrier: no rank proceeds to the resume-target resolution below until the main
+        # process's clean_stale_checkpoint_dirs recovery renames (checkpoint-<N>.old ->
+        # checkpoint-<N>) have landed. Without it, a rank that reaches the auto_resume scan
+        # before the main process finishes an interrupted same-step recovery could see a
+        # directory listing the main process itself never would have. A no-op on a single
+        # process.
+        self.accelerator.wait_for_everyone()
+
+        # Resolve the resume target *before* wandb init (Task 1.7) so a resumed run's id can
+        # be threaded into wandb_kwargs below. _resolve_resume_target scans for the newest
+        # *committed* checkpoint (oplm.training.checkpoint.latest_checkpoint) ON THE MAIN
+        # PROCESS ONLY and broadcasts the result to every other rank, rather than letting
+        # every rank scan the directory itself: the barrier above only orders the main
+        # process's recovery renames ahead of the scan, it does not guarantee every rank's
+        # own directory listing agrees with the main process's -- multi-node shared
+        # filesystems (NFS/Lustre) commonly serve a stale/cached listing to a non-writer
+        # rank for a window after a writer's rename lands. Scanning once and broadcasting
+        # makes the resume target rank-identical BY CONSTRUCTION, independent of filesystem
+        # visibility semantics -- the actual property this branch exists to provide. A fresh
+        # output_dir with no committed checkpoint yet is a no-op: training starts at step 0,
+        # exactly as if auto_resume were unset. The heavy state restore
+        # (_resume_from_checkpoint) happens later, once the model/optimizer/dataloader exist.
+        resume_target = _resolve_resume_target(
+            self.accelerator,
+            cfg.train.resume_from,
+            cfg.train.auto_resume,
+            cfg.train.output_dir,
+            cfg,
+            status=_status,
+        )
+        self._resolved_resume_target = resume_target  # exposed for tests/observability
+
+        initialization_source = None
+        if resume_target is None and cfg.train.init_from is not None:
+            from oplm.training.initialization import resolve_initialization_source
+
+            initialization_source = resolve_initialization_source(cfg.train.init_from)
+            protected = {initialization_source}
+            checkpoint = initialization_source.parent
+            if initialization_source.name == "hf":
+                protected.add(checkpoint)
+                if checkpoint.name.startswith("checkpoint-"):
+                    protected.add(checkpoint.parent)
+            if Path(cfg.train.output_dir).expanduser().resolve() in protected:
+                raise ValueError(
+                    "train.output_dir must differ from the initialization export "
+                    "and its checkpoint or parent run directory; use a new stage directory."
+                )
+            logger.info("Initializing new stage from pretrained weights: %s", initialization_source)
+
+        # Branch (same precedence as init_from): only when nothing in output_dir resumes.
+        # Requeues of the branch then auto_resume from the branch's own checkpoints.
+        branch_source: Path | None = None
+        if resume_target is None and cfg.train.branch_from is not None:
+            branch_source = Path(cfg.train.branch_from).expanduser().resolve()
+            if not (branch_source / "trainer_state.json").is_file():
+                raise FileNotFoundError(
+                    f"train.branch_from must be a checkpoint directory (with trainer_state.json), "
+                    f"got {branch_source}"
+                )
+            if Path(cfg.train.output_dir).expanduser().resolve() in (
+                branch_source,
+                branch_source.parent,
+            ):
+                raise ValueError(
+                    "train.output_dir must differ from the branch_from checkpoint and its run "
+                    "directory; branches write into a fresh output_dir."
+                )
+            logger.info("Branching from checkpoint: %s", branch_source)
+
+        # Run id persisted right after init_trackers below; reused as the wandb_run_id
+        # extra_state key on every checkpoint save. Stays None when wandb is disabled or
+        # (main-process-only) on non-main ranks, so save_checkpoint's extra_state omits it.
+        self._wandb_run_id: str | None = None
+        # What _init_wandb did to the resumed run's history: "applied" (rewound to the
+        # checkpoint), "unavailable" (the server refused; plain resume), or None (no rewind
+        # was needed). Main process only; the recovery drills record it.
+        self._wandb_rewind: str | None = None
+
+        # Init wandb early so login prompt appears before slow setup steps
+        if cfg.train.wandb_enabled:
+            _status("[dim]Initializing wandb...[/dim]")
+            # accelerate's WandBTracker ignores project_dir (requires_logging_directory
+            # is False), so point wandb's local logs into output_dir explicitly via
+            # `dir` -> they land in output_dir/wandb/ instead of ./wandb.
+            wandb_kwargs: dict[str, Any] = {"dir": cfg.train.output_dir}
+            if cfg.train.wandb_run_name is not None:
+                wandb_kwargs["name"] = cfg.train.wandb_run_name
+            rewind: tuple[int, int] | None = None
+            if resume_target is not None:
+                # Task 1.7: continue the same W&B run across a requeue instead of
+                # starting a new one. Checkpoint's trainer_state.json is the first
+                # choice (authoritative for that checkpoint); the output_dir marker
+                # file is the fallback (e.g. a checkpoint saved before this field
+                # existed, or a save that landed between the id write and the next
+                # checkpoint).
+                run_id = _read_resume_wandb_run_id(resume_target, cfg.train.output_dir)
+                if run_id is not None:
+                    wandb_kwargs |= {"id": run_id, "resume": "allow"}
+                    if self.accelerator.is_main_process:
+                        rewind = _wandb_rewind_window(
+                            resume_target, cfg.train.wandb_project, run_id
+                        )
+            self._init_wandb(cfg, wandb_kwargs, rewind)
+
+            # Persist the run id immediately so a mid-run kill still leaves a
+            # resumable marker. Lazy/guarded import: wandb is an optional dependency,
+            # only needed when wandb_enabled. `wandb.run` is set by init_trackers just
+            # above (WandBTracker.start() calls wandb.init()); it is main-process-only
+            # (WandBTracker methods are @on_main_process) and can stay None in some
+            # offline edge cases, which is skipped gracefully.
+            if self.accelerator.is_main_process:
+                import wandb
+
+                active_run = wandb.run
+                if active_run is not None:
+                    active_run.define_metric("train/global_step", hidden=True)
+                    active_run.define_metric("*", step_metric="train/global_step")
+                    self._wandb_run_id = active_run.id
+                    (Path(cfg.train.output_dir) / "wandb_run_id").write_text(
+                        f"{self._wandb_run_id}\n"
+                    )
+
+        # Drop a top-level copy of the fully resolved config alongside the run.
+        if self.accelerator.is_main_process:
+            from oplm.config import serialize_config
+
+            (Path(cfg.train.output_dir) / "config.yaml").write_text(serialize_config(cfg))
+
+        # Build evaluator from config if eval datasets are specified
+        self.evaluator: Evaluator | None = None
+        if cfg.data.eval is not None:
+            _status("[dim]Building evaluator...[/dim]")
+            from oplm.eval import Evaluator
+
+            self.evaluator = Evaluator(cfg)
+
+        # Model
+        _status("[dim]Building model...[/dim]")
+        # Read before build_model: transformers strips the flag off the HF config during
+        # PreTrainedModel.__init__; the compile block below still needs it.
+        gradient_checkpointing = getattr(cfg.model, "gradient_checkpointing", False)
+        model = self.task.build_model(cfg, initialization_source)
+
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Model: task=%s unique_parameters=%d",
+                type(self.task).__name__,
+                sum(parameter.numel() for parameter in model.parameters()),
+            )
+            if isinstance(self.task, MLMTask):
+                logger.info(
+                    "MLM backbone: physical_depth=%d effective_depth=%d loops=%d strategy=%s "
+                    "range=[%d, %d)",
+                    cfg.model.num_hidden_layers,
+                    len(cast("OplmForMaskedLM", model).oplm.backbone.layer_execution_order),
+                    cfg.model.num_loops,
+                    cfg.model.loop_strategy,
+                    cfg.model.loop_start,
+                    cfg.model.num_hidden_layers
+                    if cfg.model.loop_end is None
+                    else cfg.model.loop_end,
+                )
+
+        # FSDP2/HSDP sharding (Task 5.1), when train.parallelism == "hsdp". Applied HERE,
+        # before build_optimizers, because fully_shard swaps the module's parameters for
+        # DTensor ones -- an optimizer built beforehand would keep references to tensors
+        # the model no longer uses. See oplm.training.parallel's module docstring for why
+        # the sharded model deliberately bypasses accelerator.prepare (and what accelerate
+        # still provides on this path). A no-op on the default "ddp" path: nothing in
+        # oplm.training.parallel is even imported.
+        if cfg.train.parallelism == "hsdp":
+            from oplm.training.parallel import apply_hsdp
+
+            model = apply_hsdp(model, self.accelerator, mixed_precision=cfg.train.mixed_precision)
+
+        # Optimizer and dataloader
+        optimizers = build_optimizers(model, cfg.train)
+        _status("[dim]Loading training data...[/dim]")
+        dataloader = self.task.build_dataloader(cfg)
+        raw_dataset_size = self._get_dataset_size_from_dataloader(dataloader)
+
+        # Compute total_steps
+        self.total_steps = self._compute_total_steps(cfg, dataloader)
+        schedulers = build_schedulers(optimizers, cfg.train, self.total_steps)
+
+        # Prepare with accelerate. The dataloader is deliberately excluded: it is
+        # built from ShardedProteinDataset, which already stripes rows over the
+        # joint (rank, worker) index. Passing it through accelerator.prepare would
+        # wrap it in accelerate's own IterableDatasetShard, striping a second time
+        # and silently dropping rows (confirmed in
+        # .superpowers/sdd/TODOS/task-0.1-report.md). DeviceDataLoader below
+        # supplies the only two things prepare was providing for the dataloader:
+        # device placement and set_epoch forwarding.
+        #
+        # Gradient-accumulation caveat: without a prepared dataloader, accelerate
+        # cannot detect end-of-dataloader for a partial final accumulation window.
+        # The training stream is effectively infinite (epoch rollover re-iterates
+        # via _set_dataset_epoch below), so no partial window ever needs to sync —
+        # identical semantics to before for gradient_accumulation_steps == 1, and
+        # for >1 the tail micro-batches of an epoch simply roll into the next
+        # window instead of forcing an early sync.
+        #
+        # Under train.parallelism="hsdp" the MODEL is excluded from prepare as well: it
+        # is already sharded (and device-placed) by apply_hsdp above, and passing it
+        # through prepare would wrap the FSDP2 module in DDP -- double data parallelism,
+        # with an all-reduce over already-reduce-scattered gradients. Everything prepare
+        # was providing for the model on the DDP path is covered on the sharded path by
+        # fully_shard itself (device placement, and the MixedPrecisionPolicy in place of
+        # accelerate's autocast wrapper). Optimizers and schedulers still go through
+        # prepare on both paths, so their handling -- and every downstream index into
+        # `prepared` -- is identical.
+        _status("[dim]Preparing for training...[/dim]")
+        prepared: tuple[Any, ...]
+        if cfg.train.parallelism == "hsdp":
+            # cast: a tuple literal would narrow the element types (Module | Tensor),
+            # which the untyped optimizer/scheduler slices below are not written against
+            # -- prepare's own return is effectively Any on the ddp branch.
+            prepared = cast(
+                "tuple[Any, ...]", (model, *self.accelerator.prepare(*optimizers, *schedulers))
+            )
+        else:
+            prepared = self.accelerator.prepare(model, *optimizers, *schedulers)
+        num_optimizers = len(optimizers)
+        self.model = prepared[0]
+
+        # Apply torch.compile AFTER accelerator.prepare so that accelerate always
+        # receives the raw model and wraps it with DDP normally. Compiling the
+        # DDP-wrapped model produces OptimizedModule(_orig_mod=DDP(model)), which
+        # accelerate.unwrap_model can unambiguously peel. Compiling before prepare
+        # causes some accelerate versions to strip the compile wrapper during prepare,
+        # leaving self.model = DDP(model) with no _orig_mod — and unwrap_model then
+        # fails with KeyError: '_orig_mod' at the first eval call.
+        #
+        # Under parallelism="hsdp" this same position also gives the ordering FSDP2
+        # wants: fully_shard first (above), then compile the sharded module, so Dynamo
+        # traces the FSDP-hooked forward rather than having its own wrapper sharded
+        # underneath it.
+        if cfg.train.compile:
+            if gradient_checkpointing and cfg.model.num_loops > 1:
+                from torch import _dynamo
+
+                # PyTorch 2.10 caches dynamic Python-float proxies across repeated
+                # checkpoint subgraphs, then tries to lift a proxy from a sibling
+                # tracer ("lift_tracked_freevar_to_input ... root SubgraphTracer").
+                # Specialize configuration floats such as norm epsilon and attention
+                # scale; sequence/batch shapes remain dynamic. No tensor is detached.
+                # PyTorch annotates this mutable config default as Literal[False].
+                _dynamo.config.specialize_float = True  # ty: ignore[invalid-assignment]
+            # Selective activation checkpointing (SAC) is incompatible with the
+            # default DDPOptimizer: it splits the compiled graph at gradient-bucket
+            # boundaries to overlap allreduce with backward, which fragments each
+            # block's activation-checkpoint higher-order op across subgraphs. AOT
+            # autograd's min-cut partitioner then can't honor the SAC MUST_SAVE set,
+            # so `selective` silently collapses to full recompute under DDP+compile
+            # (single-GPU is unaffected — DDPOptimizer never engages). Disabling
+            # graph-splitting keeps SAC intact; the only cost is the lost comm/compute
+            # overlap (a few ms of allreduce on a ~500 ms step over NVLink — negligible
+            # next to the recompute SAC saves back). Gate on `selective` only so
+            # `full`/`none` keep the default overlap. The flag is a process-global
+            # dynamo config, set once before compile, and is numerically transparent.
+            if getattr(cfg.model, "gradient_checkpointing_mode", "full") == "selective":
+                # `from torch import _dynamo` (not `import torch._dynamo`) so the local
+                # binding is `_dynamo`, not `torch` — the latter would shadow the
+                # module-level `torch` and break the `torch.compile` call just below.
+                from torch import _dynamo
+
+                _dynamo.config.optimize_ddp = False
+            # When compile_dynamic is not True (False or None/auto with bucketed static
+            # shapes), raise the Dynamo recompile budget so bucketed shapes do not
+            # silently fall back to eager. Use the same local `from torch import _dynamo`
+            # pattern to avoid shadowing the module-level `torch`.
+            if cfg.train.compile_dynamic is not True:
+                from torch import _dynamo
+
+                if cfg.data.pad_to_multiple_of is not None:
+                    buckets = math.ceil(
+                        cfg.model.max_position_embeddings / cfg.data.pad_to_multiple_of
+                    )
+                    _dynamo.config.cache_size_limit = max(
+                        _dynamo.config.cache_size_limit, buckets + 8
+                    )
+                    logger.info(
+                        "compile_dynamic=%s, pad_to_multiple_of=%d: "
+                        "expecting ~%d sequence-length buckets; "
+                        "raised cache_size_limit to %d",
+                        cfg.train.compile_dynamic,
+                        cfg.data.pad_to_multiple_of,
+                        buckets,
+                        _dynamo.config.cache_size_limit,
+                    )
+                elif cfg.train.compile_dynamic is False:
+                    logger.warning(
+                        "compile_dynamic=False with pad_to_multiple_of=None: "
+                        "batch-max padding produces unbounded shapes under static "
+                        "compile and will thrash Dynamo recompiles. "
+                        "Set pad_to_multiple_of or compile_dynamic=True.",
+                    )
+            # torch 2.10/2.11 enable Inductor's mix-order-reduction pass by
+            # default. It produces FusedMixOrderReductions scheduler nodes that
+            # crash the combo-kernel fusion path during backward compilation:
+            #   scheduler.py: assert not isinstance(node1, FusedMixOrderReductions)
+            # (pytorch/pytorch#169811). The crash is build/cache-sensitive — it
+            # surfaces on a cold Inductor cache (e.g. ephemeral SUNK/CoreWeave
+            # pods) but is masked by a warm cache on-prem. Disable the pass; it's
+            # a fusion-throughput optimization, not a correctness feature. Set
+            # unconditionally (the bug is independent of SAC mode and
+            # compile_mode) and guarded so torch versions lacking the flag won't
+            # raise (the inductor config module raises AttributeError on unknown
+            # attributes). Remove once #169811 is fixed and the torch floor is
+            # raised past the fix.
+            from torch._inductor import config as _inductor_config
+
+            if hasattr(_inductor_config.triton, "mix_order_reduction"):
+                _inductor_config.triton.mix_order_reduction = False
+            _status(
+                f"[dim]Compiling model (torch.compile, dynamic={cfg.train.compile_dynamic})"
+                "...[/dim]"
+            )
+            # torch.compile stubs return Callable; cast to nn.Module so downstream
+            # calls are well-typed — OptimizedModule IS an nn.Module at runtime.
+            self.model = cast(
+                "nn.Module",
+                torch.compile(
+                    self.model, dynamic=cfg.train.compile_dynamic, mode=cfg.train.compile_mode
+                ),
+            )
+        elif cfg.model.packed_attention == "flex" and self.accelerator.device.type == "cuda":
+            logger.warning(
+                "model.packed_attention='flex' without train.compile: FlexAttention runs "
+                "unfused and materializes the full scores matrix. Set train.compile=true."
+            )
+        self.optimizers = list(prepared[1 : 1 + num_optimizers])
+        self.optimizer = self.optimizers[0]
+        self.dataloader = DeviceDataLoader(dataloader, self.accelerator.device)
+        self.schedulers = list(prepared[1 + num_optimizers :])
+        self.scheduler = self.schedulers[0]
+
+        # Unwrapped live model (no DDP/compile wrapper): the EMA source and hf/ export
+        # target. keep_torch_compile=False for the reason given in checkpoint.save_checkpoint.
+        self._unwrapped_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+        # EMA (train.ema_decay). Built after prepare/compile so the copy sits on the
+        # right device, and before the resume below so a checkpoint's ema.pt lands in it.
+        self._ema: AveragedModel | None = None
+        if cfg.train.ema_decay is not None:
+            self._ema = build_ema(self._unwrapped_model, cfg.train.ema_decay)
+
+        # Training state
+        self.global_step = 0
+        self.epoch = 0
+        self.tokens_seen = 0
+        self._samples_seen = 0
+        self._last_eval_loss: float | None = None
+        self._epoch_at_last_opt_step = 0
+        self._step_local_tokens = 0  # local tokens accumulated across the current opt step
+
+        # Data-cursor state (Task 3.3): count of micro-batches (DataLoader batch pulls,
+        # not optimizer steps) consumed so far this epoch. Rank-identical in sequence mode
+        # (every rank pulls exactly one batch per micro-step); per-rank and informational in
+        # token mode, where each GPU rolls over on its own and resume uses `_worker_rows`
+        # instead. Reset to 0 -- and the top-level
+        # dataset's armed resume skip cleared -- on every epoch rollover (the
+        # StopIteration branch in `train`). Snapshotted into a DataCursor at every
+        # checkpoint trigger (`_save_checkpoint`) and, on a layout-compatible resume,
+        # restored from the checkpoint's cursor (`_resume_from_checkpoint`).
+        self._batches_in_epoch = 0
+
+        # Token mode (spec §6.1): rows each DataLoader worker had emitted this epoch, as of the
+        # last batch the loop consumed (its stream_position). The per-worker resume position; a
+        # mix counts draws and adds each worker's per-source [pass, offset] (`_worker_sources`).
+        self._worker_rows = [0] * self._effective_num_workers()
+        self._worker_sources: list[list[list[int]] | None] = [None] * len(self._worker_rows)
+        # Reshard events (layout changes at a resume) the data stream replays; see DataCursor.
+        self._reshards: list[Reshard] = []
+        self._step_local_samples = 0  # local sequences accumulated across the current opt step
+        if self._token_mode:
+            logger.info(
+                "Token mode: %d tokens per step, %d per micro-batch, accumulation %d; "
+                "worker-cycle save alignment is off (each GPU rolls over epochs on its own)",
+                cfg.train.tokens_per_step,
+                cfg.train.batch_tokens,
+                cfg.train.gradient_accumulation_steps,
+            )
+
+        # Worker-cycle save-alignment deferral (Task 3.3 controller addition): one
+        # `_SaveDeferral` per cadence so periodic saves and drain never share or starve
+        # each other's deferral budget. Transient, in-run-only state -- never persisted
+        # (a fresh Trainer always starts with nothing in flight).
+        self._periodic_save_deferral = _SaveDeferral()
+        self._drain_save_deferral = _SaveDeferral()
+        # De-dupes the "deferring drain checkpoint" log line to once per deferral
+        # episode instead of once per deferred step (DrainSignal.requested is sticky,
+        # so without this it would otherwise repeat on every step until aligned).
+        self._drain_defer_logged = False
+
+        # Loss-spike warn-only detector state (Task 1.8). Not persisted across a
+        # requeue/resume: it is a diagnostic-only trend, not training state, and simply
+        # re-warms from the resumed run's own logged losses.
+        self._loss_ema: float | None = None
+        self._loss_log_count = 0
+
+        # Wall-clock/time-based checkpoint cadence state (Task 1.3). _last_save_at
+        # uses time.monotonic() and is never persisted (meaningless across process
+        # restarts); _first_checkpoint_at/_last_time_keep_index anchor the
+        # keep_every_n_hours rule and ARE persisted (trainer_state.json) so a
+        # requeue doesn't reset the hours anchor.
+        self._last_save_at = time.monotonic()
+        self._first_checkpoint_at: float | None = None
+        self._last_time_keep_index = 0
+
+        # At most one outstanding async periodic save (Task 2.3): set by
+        # _save_checkpoint(blocking=False), cleared by _finalize_pending_save once its
+        # deferred commit tail (barrier + rename + pointer + rotation) has run. Never
+        # persisted across a resume -- a Future can't survive a process restart, and a
+        # kill while this is set intentionally leaves only a .tmp dir (see
+        # clean_stale_checkpoint_dirs), never a resume candidate.
+        self._pending_save: _PendingAsyncSave | None = None
+
+        # FLOP estimation; None when the task has no honest per-token formula (spec §6.4),
+        # in which case train/flops, train/achieved_tflops and train/mfu are omitted.
+        self.flops_per_token: int | None = self.task.flops_per_token(cfg)
+
+        # Throughput timing state (steady-state window; warmup steps excluded)
+        self._step_timer_start: float | None = None
+        self._tput_window_tokens = 0
+        self._tput_window_seconds = 0.0
+        self._tput_window_steps = 0
+
+        # Per-log-window diagnostics (reset on every train log, never persisted):
+        # mean loss, pre-clip grad norm (mean/max) and clip fraction, mean sequence length.
+        self._window_loss_sum = 0.0
+        self._window_steps = 0
+        self._window_grad_norm_sum = 0.0
+        self._window_grad_norm_max = 0.0
+        self._window_clipped = 0
+        self._window_data_wait = 0.0  # seconds blocked on the DataLoader (no GPU sync)
+        self._window_tokens_start = 0
+        self._window_samples_start = 0
+        # Task-reported per-micro-batch metrics, window-averaged in _log_step.
+        self._window_metric_sums: dict[str, float] = {}
+        self._window_metric_counts: dict[str, int] = {}
+
+        # Dataset size for fractional epoch computation
+        self._dataset_size = raw_dataset_size
+
+        # Resume from checkpoint. resume_target was already resolved above (ahead of wandb
+        # init, so a resumed run can reuse its wandb id); only the heavy state restore
+        # happens here, now that the model/optimizer/dataloader exist.
+        if resume_target is not None:
+            self._resume_from_checkpoint(resume_target)
+        elif branch_source is not None:
+            self._branch_from_checkpoint(branch_source)
+        self._window_tokens_start = self.tokens_seen
+        self._window_samples_start = self._samples_seen
+
+    def train(self) -> None:
+        """Run the training loop."""
+        from rich.progress import (
+            BarColumn,
+            Progress,
+            TextColumn,
+            TimeRemainingColumn,
+        )
+
+        cfg = self.cfg.train
+
+        # Rich progress bar (main process only)
+        progress: Progress | None = None
+        task_id: Any = None
+        if self.accelerator.is_main_process:
+            progress = Progress(
+                TextColumn("{task.fields[status]}"),
+                BarColumn(),
+                TextColumn("{task.fields[metrics]}"),
+                TimeRemainingColumn(),
+            )
+            task_id = progress.add_task(
+                "Training",
+                total=self.total_steps,
+                completed=self.global_step,
+                status=f"{self.global_step}/{self.total_steps}",
+                metrics="loss=N/A eval=N/A",
+            )
+            progress.start()
+
+        self._emit_train_start()
+        self.model.train()
+        profiler = None
+        if cfg.profile_start is not None:
+            from oplm.training.profiling import StepProfiler, allreduce_benchmark
+
+            profiler = StepProfiler(
+                self.accelerator, cfg.output_dir, cfg.profile_start, cfg.profile_steps
+            )
+            profiler.comm = allreduce_benchmark(self.accelerator)
+            if self.accelerator.is_main_process:
+                for row in profiler.comm:
+                    logger.info(
+                        "profile: all-reduce %d MB over %d ranks: %.1f ms, bus bandwidth %.1f GB/s",
+                        row["size_mb"],
+                        self.accelerator.num_processes,
+                        row["ms"],
+                        row["busbw_gbs"],
+                    )
+        phase = profiler.phase if profiler is not None else _no_phase
+        step_open = False  # an optimizer step's first micro-batch has been fetched
+        data_iter = iter(self.dataloader)
+        current_loss = float("nan")
+        step_loss_sum = 0.0
+        last_step_did_save = False
+        # Canon kernel self-check: once per run (a resume included), on the first micro-batch,
+        # when the model's Canon calls will take the Triton kernel (autocast sets their dtype).
+        from oplm.model.conv import CanonConv, _use_kernel
+
+        autocast_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(
+            self.accelerator.mixed_precision, torch.float32
+        )
+        canon_check = _use_kernel(
+            torch.empty(0, device=self.accelerator.device), autocast_dtype
+        ) and any(isinstance(m, CanonConv) for m in self._unwrapped_model.modules())
+
+        try:
+            while self.global_step < self.total_steps:
+                if profiler is not None and not step_open:
+                    profiler.begin_step(self.global_step)
+                step_open = True
+                # Get next batch, handle epoch boundaries
+                data_t0 = time.perf_counter()
+                with phase("data_wait"):
+                    try:
+                        batch = next(data_iter)
+                    except StopIteration:
+                        self.epoch += 1
+                        self._set_dataset_epoch(self.epoch)
+                        # Data-cursor state (Task 3.3): a new epoch starts a fresh count of
+                        # batches, and any resume skip armed for the epoch that just ended
+                        # must not linger and get (incorrectly) reapplied to this new one --
+                        # see ShardedProteinDataset.set_resume_skip's docstring on why the
+                        # skip is one-epoch-scoped and must be explicitly cleared.
+                        self._batches_in_epoch = 0
+                        self._clear_dataset_resume_skip()
+                        self._worker_rows = [0] * self._effective_num_workers()
+                        self._worker_sources = [None] * len(self._worker_rows)
+                        data_iter = iter(self.dataloader)
+                        try:
+                            batch = next(data_iter)
+                        except StopIteration:
+                            raise RuntimeError(
+                                f"the training stream produced no batch in epoch {self.epoch}: too "
+                                "little data for one batch per rank and worker (in token mode, "
+                                "lower train.batch_tokens or set data.drop_last=false)"
+                            ) from None
+                self._window_data_wait += time.perf_counter() - data_t0
+                if self._token_mode:
+                    # The DataLoader turns the tag's tuples into lists. A mix's tag is
+                    # (draws, per-source (pass, offset)); its draws are the resume position.
+                    worker_id, rows_emitted, tag = batch["stream_position"]
+                    worker = int(worker_id)
+                    self._worker_rows[worker] = int(tag[0] if tag else rows_emitted)
+                    self._worker_sources[worker] = (
+                        [[int(pass_), int(offset)] for pass_, offset in tag[1]] if tag else None
+                    )
+
+                if canon_check:
+                    canon_check = False
+                    self._canon_self_check(batch)
+
+                # Forward + backward inside accumulation context
+                with self.accelerator.accumulate(self.model):
+                    with phase("forward"):
+                        result = self.task.step(self.model, batch)
+                    loss = result.loss
+                    with phase("backward"):
+                        self.accelerator.backward(loss)
+
+                    if cfg.max_grad_norm > 0 and self.accelerator.sync_gradients:
+                        with phase("clip"):
+                            # Retain the pre-clip total norm so StabilityDiagnosticsCallback
+                            # can log it (grads are zeroed before the log step fires).
+                            self._last_grad_norm = self.accelerator.clip_grad_norm_(
+                                self.model.parameters(),
+                                cfg.max_grad_norm,
+                            )
+                            # Window stats for _log_step. float() syncs, but the per-step
+                            # loss.item() below already does; no extra cost.
+                            grad_norm = float(self._last_grad_norm)
+                        self._window_grad_norm_sum += grad_norm
+                        self._window_grad_norm_max = max(self._window_grad_norm_max, grad_norm)
+                        self._window_clipped += int(grad_norm > cfg.max_grad_norm)
+
+                    with phase("optimizer"):
+                        for optimizer in self.optimizers:
+                            optimizer.step()
+                            optimizer.zero_grad()
+
+                # Accumulate the per-micro-batch loss so logging reports the mean
+                # across the optimizer step, not just the final micro-batch.
+                with phase("sync"):
+                    step_loss_sum += loss.detach().item()
+
+                # Track tokens and samples (local; reduced across ranks on the opt-step
+                # boundary below) and the data cursor's micro-batch count (Task 3.3 --
+                # every rank pulls exactly one DataLoader batch per micro-step, so this
+                # stays rank-identical without a reduce in sequence mode; in token mode it
+                # is a per-rank count, informational only).
+                self._step_local_tokens += result.tokens
+                self._step_local_samples += result.samples
+                self._batches_in_epoch += 1
+                for key, value in result.metrics.items():
+                    self._window_metric_sums[key] = self._window_metric_sums.get(key, 0.0) + value
+                    self._window_metric_counts[key] = self._window_metric_counts.get(key, 0) + 1
+
+                # Only act on optimizer steps (accumulation boundary)
+                if not self.accelerator.sync_gradients:
+                    continue
+
+                for scheduler in self.schedulers:
+                    scheduler.step()
+                self.global_step += 1
+                # EMA: once per real optimizer step (never on accumulation micro-steps --
+                # we are past the sync_gradients gate -- and never on a step the fp16
+                # scaler skipped).
+                if self._ema is not None and not self.accelerator.optimizer_step_was_skipped:
+                    self._ema.update_parameters(self._unwrapped_model)
+                current_loss = step_loss_sum / cfg.gradient_accumulation_steps
+                step_loss_sum = 0.0
+                self._window_loss_sum += current_loss
+                self._window_steps += 1
+
+                # Rank-sync the control bundle for this optimizer step in a single
+                # reduce: tokens and samples (so tokens_seen / tokens_delta are rank-identical —
+                # the EvalContext rank-sync invariant; see design §3.2) plus the
+                # drain, non-finite, and time-based-save flags later resilience
+                # tasks plug into. Unconditional: a per-rank token estimate would
+                # diverge on ragged batches.
+                local_tokens = self._step_local_tokens
+                self._step_local_tokens = 0
+                local_samples = self._step_local_samples
+                self._step_local_samples = 0
+                # Triton/LLVM may have taken the C-level SIGUSR1 handler since the
+                # last step (first kernel compile); take it back (#113).
+                self._drain_signal.reassert()
+                with phase("sync"):
+                    flags = self._reduce_step_flags(
+                        local_tokens,
+                        local_samples=local_samples,
+                        drain=self._drain_signal.requested,
+                        nonfinite=not math.isfinite(current_loss),
+                        save_due=self._save_timer_due(),
+                        pending_done=(
+                            self._pending_save is not None
+                            and self._pending_save.handle.future.done()
+                        ),
+                    )
+                if profiler is not None:
+                    profiler.end_step(local_tokens)
+                step_open = False
+                tokens_delta = flags.tokens_delta
+                self.tokens_seen += tokens_delta
+                self._samples_seen += flags.samples_delta
+
+                # Opportunistically commit a pending async save (Task 2.3) once every
+                # rank's local write has actually finished, not merely started --
+                # pending_done_count is the raw sum, so this only fires once every rank
+                # agrees (== num_processes), never on a partial-done count. A cheap no-op
+                # guard when there is nothing pending.
+                if (
+                    self._pending_save is not None
+                    and flags.pending_done_count == self.accelerator.num_processes
+                ):
+                    self._finalize_pending_save()
+
+                # Non-finite loss guard (Task 1.8, spec §6): a NaN/inf loss on ANY rank trips
+                # this flag on EVERY rank (it is post-reduce), so all ranks raise together
+                # here -- after this step's tokens_seen accounting is complete (consistent
+                # with where the drain branch sits below), but before eval/checkpoint can act
+                # on a poisoned step. The requeue loop then resumes from the last checkpoint,
+                # an automatic rollback; two such restarts with no step advance trips the
+                # no-progress crash-loop guard instead of requeueing forever. A still-pending
+                # async save is force-finalized first (blocks on its future) so the process
+                # doesn't raise/exit with a background write in flight (Task 2.3): the commit
+                # protocol invariants demand that, absent this, a torn write left behind would
+                # be a kill mid-async -- fine on a true kill, but not on a controlled raise.
+                if flags.nonfinite:
+                    if self._pending_save is not None:
+                        self._finalize_pending_save()
+                    logger.error(
+                        "non-finite training loss %s at step %d", current_loss, self.global_step
+                    )
+                    raise RuntimeError(f"non-finite training loss at step {self.global_step}")
+
+                # Accumulate throughput window, excluding warmup steps
+                now = time.perf_counter()
+                if (
+                    self._step_timer_start is not None
+                    and self.global_step > cfg.throughput_warmup_steps
+                ):
+                    self._tput_window_seconds += now - self._step_timer_start
+                    self._tput_window_tokens += tokens_delta
+                    self._tput_window_steps += 1
+
+                # Drain takes priority over logging/eval/periodic-save: this step's
+                # bookkeeping (tokens_seen, throughput window) is already complete above,
+                # so the checkpoint below carries tokens_seen consistent with global_step
+                # across a drain+resume. Worker-cycle save-alignment deferral (Task 3.3):
+                # the actual save/exit is deferred up to num_workers - 1 extra steps looking
+                # for batches_in_epoch % num_workers == 0 -- bounded and rank-safe (see
+                # _SaveDeferral). While that deferral is outstanding (`drain_pending`
+                # below), eval is explicitly skipped for the rest of this step (see the
+                # Evaluation section) -- a multi-minute eval landing in the deferral window
+                # would burn the SLURM drain margin the whole mechanism exists to beat.
+                # Logging/progress still proceed either way (cheap, and useful signal that
+                # the run is alive while draining). A pending async save is finalized
+                # (blocking) FIRST (Task 2.3) once the deferral actually fires: the drain's
+                # own save must always be blocking, and must never be preceded by a
+                # torn/uncommitted async save left dangling behind it.
+                drain_pending = False
+                if flags.drain:
+                    drain_ready = self._drain_save_deferral.decide(
+                        triggered=True,
+                        batches_in_epoch=self._batches_in_epoch,
+                        num_workers=self._alignment_workers(),
+                        global_step=self.global_step,
+                    )
+                    if drain_ready:
+                        if self._pending_save is not None:
+                            self._finalize_pending_save()
+                        self._save_checkpoint()
+                        self._drain_remote_uploads()
+                        # The marker, not the exit code, is what the requeue wrapper
+                        # actually keys the drain branch on: SystemExit(85) below only
+                        # reaches the sbatch script's $? on a launcher-less run --
+                        # `accelerate launch` flattens any worker exit to its own 1
+                        # (torchelastic ChildFailedError). Written strictly after the
+                        # drain checkpoint committed, main process only.
+                        if self.accelerator.is_main_process:
+                            write_drain_marker(Path(self.cfg.train.output_dir), self.global_step)
+                        logger.warning(
+                            "Drain requested: checkpoint saved at step %d; exiting %d",
+                            self.global_step,
+                            DRAIN_EXIT_CODE,
+                        )
+                        raise SystemExit(DRAIN_EXIT_CODE)
+                    drain_pending = True
+                    # DrainSignal.requested is sticky (never clears), so without this
+                    # guard this would otherwise log once per deferred step instead of
+                    # once per deferral episode.
+                    if not self._drain_defer_logged:
+                        logger.info(
+                            "Drain requested at step %d: deferring checkpoint for "
+                            "worker-cycle alignment (batches_in_epoch=%d, num_workers=%d)",
+                            self.global_step,
+                            self._batches_in_epoch,
+                            self._effective_num_workers(),
+                        )
+                        self._drain_defer_logged = True
+
+                # Logging
+                if self.global_step % cfg.log_every == 0:
+                    self._log_step(current_loss)
+
+                # Evaluation -- skipped entirely while a drain checkpoint is deferred
+                # (drain_pending): eval can run for minutes, which would burn the SLURM
+                # drain margin before the deferral ever gets to align and save/exit.
+                if not drain_pending:
+                    eval_metrics = self._run_eval(tokens_delta)
+                    if eval_metrics:
+                        eval_loss = self._extract_eval_loss(eval_metrics)
+                        if eval_loss is not None:
+                            self._last_eval_loss = eval_loss
+                        self._log_metrics(eval_metrics)
+                        self._emit_eval_end(eval_metrics)
+
+                # Checkpointing: step cadence OR the rank-synced save_every_minutes
+                # timer (flags.save_due is identical on every rank after the reduce
+                # above, so this decision is too). Worker-cycle save-alignment deferral
+                # (Task 3.3): the trigger may not fire the actual save this step --
+                # _SaveDeferral defers up to num_workers - 1 extra steps looking for
+                # batches_in_epoch % num_workers == 0 before saving anyway (see its
+                # docstring); with num_workers <= 1 this is unconditionally the trigger
+                # itself, identical to pre-3.3 behavior. Periodic saves default to async
+                # (Task 2.3): a prior pending save that hasn't been finalized yet (the
+                # opportunistic gate above didn't catch it this step) is force-finalized
+                # first -- at most one outstanding async save at a time -- then this
+                # save is triggered without blocking on its own write.
+                step_saved = cfg.save_every > 0 and self.global_step % cfg.save_every == 0
+                last_step_did_save = self._periodic_save_deferral.decide(
+                    triggered=step_saved or flags.save_due,
+                    batches_in_epoch=self._batches_in_epoch,
+                    num_workers=self._alignment_workers(),
+                    global_step=self.global_step,
+                )
+                if last_step_did_save:
+                    if self._pending_save is not None:
+                        self._finalize_pending_save()
+                    self._save_checkpoint(blocking=False)
+
+                # Update progress bar
+                if progress is not None and task_id is not None:
+                    eval_str = (
+                        f"{self._last_eval_loss:.4f}" if self._last_eval_loss is not None else "N/A"
+                    )
+                    progress.update(
+                        task_id,
+                        completed=self.global_step,
+                        status=f"{self.global_step}/{self.total_steps}",
+                        metrics=f"loss={current_loss:.4f} eval={eval_str}",
+                    )
+
+                # Restart the step timer AFTER eval/checkpoint so their wall time
+                # is excluded from the next step's measurement.
+                self._step_timer_start = time.perf_counter()
+
+            # A still-outstanding async save must be finalized before the run ends
+            # normally (Task 2.3) -- otherwise its background dcp.async_save write
+            # could still be in flight when the process exits, and its commit rename
+            # would never happen at all. This does not apply to the drain/non-finite
+            # exit paths above: those raise/exit through the `finally` below without
+            # reaching this point, by design (their own pending-save handling already
+            # ran, and a genuine kill is meant to leave nothing but a `.tmp`).
+            if self._pending_save is not None:
+                self._finalize_pending_save()
+
+            # Final checkpoint — guaranteed unless disabled. Skip when the last
+            # optimizer step already triggered a save, for either reason (step
+            # cadence or the save_every_minutes timer), to avoid a redundant
+            # re-write.
+            if cfg.save_final and not last_step_did_save:
+                self._save_checkpoint()
+
+            # A still-outstanding remote upload (Task 4.2) must drain before training
+            # ends normally, for the same reason as the local pending-save finalize
+            # just above: otherwise the final checkpoint's background upload thread is
+            # abandoned mid-upload the moment this process exits. Bounded (10 min
+            # default) rather than unconditional -- see _drain_remote_uploads.
+            self._drain_remote_uploads()
+
+        finally:
+            # Deliberately NOT finalizing self._pending_save here. This finally runs on
+            # every exit from the try above, including an unrelated crash (an exception
+            # this method didn't raise itself -- e.g. an OOM, a NCCL/dist error, a
+            # keyboard interrupt) with a pending async save still outstanding. Forcing a
+            # finalize (which blocks on the future, then renames tmp_dir onto the final
+            # name) on that path would be wrong: it would let a checkpoint commit AFTER
+            # the crash that was supposed to kill the run, on a filesystem state that may
+            # not reflect what every rank actually finished writing (a crash on one rank
+            # doesn't guarantee every other rank's write, or its own barrier, resolves
+            # cleanly). Every DELIBERATE stop (drain, the non-finite guard, a new
+            # save trigger, or a normal end-of-training) already force-finalizes at its
+            # own call site, above, before reaching here -- so by the time control
+            # reaches this finally through one of those paths, self._pending_save is
+            # already None. An unrelated crash instead leaves self._pending_save's
+            # tmp_dir exactly where clean_stale_checkpoint_dirs expects a torn,
+            # never-committed staging dir: invisible to discovery/rotation, and deleted
+            # unconditionally the next time a Trainer starts against this output_dir.
+            # This is the commit protocol's core invariant working as designed, not a
+            # gap: "a kill mid-async leaves only a .tmp" is supposed to include kills
+            # that happen to land while an async save is pending.
+            if progress is not None:
+                progress.stop()
+            self._emit_train_end()
+            self.accelerator.end_training()
+
+    def _build_eval_context(self, tokens_delta: int) -> EvalContext:
+        """Build the EvalContext for the current optimizer step.
+
+        Rank-identical in sequence mode. In token mode ``epoch`` and ``epoch_delta`` are
+        per-rank (each GPU rolls over on its own); no eval cadence reads them yet, so a
+        future epoch-cadenced task would have to reduce them first.
+        """
+        from oplm.eval.context import EvalContext
+
+        epoch_delta = self.epoch - self._epoch_at_last_opt_step
+        self._epoch_at_last_opt_step = self.epoch
+        return EvalContext(
+            global_step=self.global_step,
+            epoch=self.epoch,
+            tokens_seen=self.tokens_seen,
+            steps_delta=1,
+            tokens_delta=tokens_delta,
+            epoch_delta=epoch_delta,
+            is_final=(self.global_step >= self.total_steps),
+        )
+
+    def _run_eval(self, tokens_delta: int) -> dict[str, float]:
+        """Run all due evaluations for the current optimizer step.
+
+        Builds the :class:`~oplm.eval.context.EvalContext` (see :meth:`_build_eval_context`
+        for its rank-identity caveat in token mode) and delegates
+        to :meth:`~oplm.eval.Evaluator.run_due`, which handles per-task scheduling and
+        unwraps the (wrapped) model only when a task is due. Returns an empty dict when
+        no evaluator is configured or nothing is due.
+        """
+        if self.evaluator is None:
+            return {}
+        ctx = self._build_eval_context(tokens_delta)
+        return self.evaluator.run_due(ctx, self.model, self.accelerator)
+
+    def _reduce_step_flags(
+        self,
+        local_tokens: int,
+        *,
+        local_samples: int = 0,
+        drain: bool = False,
+        nonfinite: bool = False,
+        save_due: bool = False,
+        pending_done: bool = False,
+    ) -> _StepFlags:
+        """Rank-sync the control bundle for this optimizer step in one reduce.
+
+        Packs ``[local_tokens, local_samples, drain, nonfinite, save_due, pending_done]``
+        into a single 6-element long tensor and sum-reduces it across ranks: the token and
+        sample counts accumulate normally, ``drain``/``nonfinite``/``save_due`` each become True
+        everywhere if True on *any* rank (sum > 0), and ``pending_done`` is instead
+        returned as the raw sum (see :class:`_StepFlags`'s docstring for why it alone
+        needs the exact count rather than any-rank-trips-it semantics). Per-rank clock
+        or signal skew on the boolean inputs is harmless by construction — one rank
+        tripping a flag trips it for all ranks.
+
+        Args:
+            local_tokens: This rank's token count for the just-completed optimizer
+                step.
+            local_samples: This rank's sequence count for the just-completed optimizer
+                step (ranks differ in sequences per batch in token mode).
+            drain: This rank's local drain signal (SIGUSR1/SIGTERM/SLURM end-time
+                margin), from :attr:`_drain_signal` (Task 1.5).
+            nonfinite: This rank's local non-finite-loss signal, i.e.
+                ``not math.isfinite(current_loss)`` for this rank's just-computed loss
+                (Task 1.8).
+            save_due: This rank's local ``save_every_minutes`` timer signal.
+            pending_done: This rank's local signal that its pending async save's
+                write has finished (Task 2.3): ``self._pending_save is not None and
+                self._pending_save.handle.future.done()``.
+
+        Returns:
+            A rank-identical :class:`_StepFlags`.
+        """
+        bundle = torch.tensor(
+            [
+                int(local_tokens),
+                int(local_samples),
+                int(drain),
+                int(nonfinite),
+                int(save_due),
+                int(pending_done),
+            ],
+            device=self.accelerator.device,
+            dtype=torch.long,
+        )
+        reduced = self.accelerator.reduce(bundle, reduction="sum").tolist()
+        tokens_delta, samples_delta, drain_sum, nonfinite_sum, save_due_sum, pending_done_sum = (
+            int(x) for x in reduced
+        )
+        return _StepFlags(
+            tokens_delta=tokens_delta,
+            samples_delta=samples_delta,
+            drain=drain_sum > 0,
+            nonfinite=nonfinite_sum > 0,
+            save_due=save_due_sum > 0,
+            pending_done_count=pending_done_sum,
+        )
+
+    def _save_timer_due(self) -> bool:
+        """Return True if this rank's ``save_every_minutes`` wall-clock timer fired.
+
+        Uses ``time.monotonic()`` (never persisted — meaningless across process
+        restarts); ``self._last_save_at`` is reset every time a checkpoint is
+        actually saved, in :meth:`_save_checkpoint`.
+        """
+        save_every_minutes = self.cfg.train.save_every_minutes
+        if save_every_minutes is None:
+            return False
+        return (time.monotonic() - self._last_save_at) >= save_every_minutes * 60
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _compute_total_steps(self, cfg: OplmConfig, dataloader: DataLoader) -> int:
+        """Compute total training steps from config."""
+        if cfg.train.max_epochs is not None:
+            dataset_size = self._get_dataset_size_from_dataloader(dataloader)
+            effective_batch = (
+                cfg.train.batch_size
+                * cfg.train.gradient_accumulation_steps
+                * self.accelerator.num_processes
+            )
+            steps_per_epoch = max(1, math.ceil(dataset_size / effective_batch))
+            return int(steps_per_epoch * cfg.train.max_epochs)
+        return cfg.train.max_steps
+
+    @staticmethod
+    def _get_dataset_size_from_dataloader(dataloader: DataLoader) -> int:
+        """Get the dataset size from the dataloader."""
+        dataset = getattr(dataloader, "dataset", None)
+        return _resolve_total_length(dataset)
+
+    def _fractional_epoch(self) -> float:
+        """Compute the current fractional epoch."""
+        if self._dataset_size <= 0:
+            return float(self.epoch)
+        return self._samples_seen / self._dataset_size
+
+    def _set_dataset_epoch(self, epoch: int) -> None:
+        """Propagate epoch to the dataset for deterministic shuffling."""
+        if hasattr(self.dataloader, "set_epoch"):
+            self.dataloader.set_epoch(epoch)
+            return
+
+        dataset = self.dataloader.dataset
+        if hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(epoch)
+
+    def _effective_num_workers(self) -> int:
+        """Return the dataset-striping worker count implied by ``cfg.data.num_workers``.
+
+        ``cfg.data.num_workers == 0`` tells ``DataLoader`` not to spawn worker
+        processes -- the main process fetches batches itself. Dataset-internal
+        striping arithmetic (``oplm.data.sequence.dataset._resolve_distributed_context``)
+        reflects this as a *single* worker (``get_worker_info()`` returns ``None`` ->
+        ``(worker_id=0, num_workers=1)``), not zero -- so every consumer of "num_workers"
+        for cursor/resume-skip/alignment purposes here must use this normalized count,
+        never the raw config value (passing ``0`` straight into the dataset's
+        ``range(..., step=num_workers)`` arithmetic raises ``ValueError``).
+        """
+        return max(self.cfg.data.num_workers, 1)
+
+    def _alignment_workers(self) -> int:
+        """Worker count for :class:`_SaveDeferral`; 1 (no deferral) in token mode.
+
+        The deferral assumes ``batches_in_epoch`` is identical on every rank (the per-rank
+        count is informational in token mode, not a shared position). In token mode each
+        GPU rolls over to its next epoch on its own, so ranks could disagree on whether to defer
+        and enter a save apart, which deadlocks. Each worker's resume position is exact without
+        it; only the interleaving of a GPU's workers can shift within one cycle (spec §6.4).
+        """
+        return 1 if self._token_mode else self._effective_num_workers()
+
+    def _top_level_dataset(self) -> object:
+        """Return the top-level training dataset (Task 3.3's cursor arm/clear target).
+
+        ``self.dataloader`` is :class:`~oplm.data.DeviceDataLoader`, whose ``dataset``
+        property forwards to the wrapped ``torch.utils.data.DataLoader``'s own
+        ``dataset`` -- i.e. exactly the object :func:`~oplm.data.build_train_dataloader`
+        constructed: a bare ``ShardedProteinDataset``, or an ``InterleavedDataset`` that
+        propagates ``set_resume_skip``/``clear_resume_skip`` to its sources internally.
+        Either way, only this one, top-level object needs to be armed/cleared.
+        """
+        return self.dataloader.dataset
+
+    def _clear_dataset_resume_skip(self) -> None:
+        """Disarm the top-level dataset's resume skip, if it supports one.
+
+        Called on every epoch rollover (Task 3.3): the skip armed by
+        :meth:`_resume_from_checkpoint` (if any) is scoped to one epoch only, and must
+        not silently reapply to the next one. A no-op for a dataset type that never
+        supports it.
+        """
+        clear = getattr(self._top_level_dataset(), "clear_resume_skip", None)
+        if callable(clear):
+            clear()
+
+    def _log_step(self, loss: float) -> None:
+        """Log training metrics to wandb."""
+        fractional_epoch = self._fractional_epoch()
+
+        metrics = {
+            "train/loss": loss,
+            "train/epoch": fractional_epoch,
+            "train/samples": self._samples_seen,
+            "train/tokens": self.tokens_seen,
+            "train/lr": self.scheduler.get_last_lr()[0],
+        }
+        if self.flops_per_token is not None:
+            metrics["train/flops"] = self.flops_per_token * self.tokens_seen
+        for key, total in self._window_metric_sums.items():
+            metrics[f"train/{key}"] = total / self._window_metric_counts[key]
+        self._window_metric_sums.clear()
+        self._window_metric_counts.clear()
+        if len(self.schedulers) > 1:
+            # Muon mode: the auxiliary AdamW optimizer's first group (embeddings & co.).
+            metrics["train/lr_adamw"] = self.schedulers[-1].get_last_lr()[0]
+
+        # Per-window diagnostics: window-mean loss, pre-clip grad norm, clip fraction,
+        # and mean sequence length (tokens / samples over the window).
+        if self._window_steps > 0:
+            metrics["train/loss_mean"] = self._window_loss_sum / self._window_steps
+            if self.cfg.train.max_grad_norm > 0:
+                metrics["train/grad_norm"] = self._window_grad_norm_sum / self._window_steps
+                metrics["train/grad_norm_max"] = self._window_grad_norm_max
+                metrics["train/clip_frac"] = self._window_clipped / self._window_steps
+            # Seconds per optimizer step blocked on the DataLoader; ~0 unless it starves the GPU.
+            metrics["train/data_wait_s"] = self._window_data_wait / self._window_steps
+        samples_delta = self._samples_seen - self._window_samples_start
+        if samples_delta > 0:
+            tokens_delta = self.tokens_seen - self._window_tokens_start
+            metrics["train/mean_seq_len"] = tokens_delta / samples_delta
+            if self._token_mode and self._window_steps > 0:
+                # Real tokens over capacity: what the packing leaves empty (spec §5.5).
+                tokens_per_step = self.cfg.train.tokens_per_step
+                assert tokens_per_step is not None
+                metrics["train/batch_fill"] = tokens_delta / (self._window_steps * tokens_per_step)
+        self._window_loss_sum = 0.0
+        self._window_steps = 0
+        self._window_grad_norm_sum = 0.0
+        self._window_grad_norm_max = 0.0
+        self._window_clipped = 0
+        self._window_data_wait = 0.0
+        self._window_tokens_start = self.tokens_seen
+        self._window_samples_start = self._samples_seen
+
+        # Steady-state throughput (window resets after each log emission).
+        # Note: flops_per_token omits attention-score FLOPs, so achieved_tflops/mfu
+        # undercount padding waste — tokens_per_sec is the headline metric.
+        if self._tput_window_steps > 0 and self._tput_window_seconds > 0:
+            tokens_per_sec = self._tput_window_tokens / self._tput_window_seconds
+            step_time_s = self._tput_window_seconds / self._tput_window_steps
+            metrics["train/tokens_per_sec"] = tokens_per_sec
+            metrics["train/step_time_s"] = step_time_s
+            if self.flops_per_token is not None:
+                achieved_tflops = (
+                    self.flops_per_token
+                    * self._tput_window_tokens
+                    / self._tput_window_seconds
+                    / 1e12
+                )
+                metrics["train/achieved_tflops"] = achieved_tflops
+                if self.cfg.train.peak_tflops:
+                    metrics["train/mfu"] = achieved_tflops / self.cfg.train.peak_tflops
+            # Reset window accumulators
+            self._tput_window_tokens = 0
+            self._tput_window_seconds = 0.0
+            self._tput_window_steps = 0
+
+        self._log_metrics(metrics)
+
+        # Main-process-only: _log_step itself runs on every rank (accelerator.log/
+        # _log_metrics' callback dispatch is what's already gated), and `loss` is this
+        # rank's own local value, not a cross-rank reduction -- gating here keeps the EMA
+        # state and any warning single-sourced instead of one (possibly divergent) copy
+        # per rank.
+        if self.accelerator.is_main_process:
+            self._check_loss_spike(loss)
+
+    def _check_loss_spike(self, loss: float) -> None:
+        """Warn (never abort) when a logged loss deviates sharply from its EMA trend.
+
+        Maintains ``self._loss_ema`` with the same 0.98/0.02 smoothing
+        ``oplm.training.mup``'s logging helper uses, and flags ``loss > 3 * ema`` once
+        at least ``_LOSS_SPIKE_WARMUP_LOGS`` logged steps have built up a trend (a
+        cold-start EMA equals the very first loss, which would otherwise trivially
+        clear the 3x threshold on step one). Spikes self-recover often enough that
+        acting on them (abort/rollback, as the non-finite guard does) would cause more
+        harm than the spike itself, so this only logs.
+
+        Args:
+            loss: This step's logged training loss.
+        """
+        self._loss_log_count += 1
+        if self._loss_ema is None:
+            self._loss_ema = loss
+        else:
+            self._loss_ema = _LOSS_EMA_DECAY * self._loss_ema + (1.0 - _LOSS_EMA_DECAY) * loss
+
+        if self._loss_log_count <= _LOSS_SPIKE_WARMUP_LOGS:
+            return
+        if loss > _LOSS_SPIKE_MULTIPLIER * self._loss_ema:
+            logger.warning(
+                "loss spike: %.4f vs EMA %.4f at step %d", loss, self._loss_ema, self.global_step
+            )
+
+    def _save_checkpoint(self, *, blocking: bool = True) -> None:
+        """Save a training checkpoint.
+
+        Updates ``self._last_save_at`` (monotonic) so the ``save_every_minutes``
+        timer restarts from this save. On the main process, also anchors
+        ``self._first_checkpoint_at`` (wall clock, on the first checkpoint ever)
+        and applies the ``keep_every_n_hours`` rule: once wall-clock time since
+        that anchor crosses a new multiple of ``keep_every_n_hours * 3600``,
+        this checkpoint is marked permanent via
+        :func:`~oplm.training.checkpoint.mark_permanent`. Both anchor and index
+        are persisted into ``trainer_state.json`` (``first_checkpoint_unix`` /
+        ``last_time_keep_index``) so a requeue resumes the hours anchor instead
+        of restarting it. The ``keep_every_n_hours`` decision itself is always made
+        here, at TRIGGER time, regardless of ``blocking`` -- only *applying* it
+        (:func:`~oplm.training.checkpoint.mark_permanent`) is deferred for an async
+        save (see :class:`_PendingAsyncSave`).
+
+        Also snapshots the data cursor (Task 3.3) at TRIGGER time -- ``self
+        ._batches_in_epoch`` and the run's current layout (``world_size``,
+        ``num_workers``, ``per_rank_batch``, ``seed``) -- into a
+        :class:`~oplm.data.DataCursor`, passed through to
+        ``save_checkpoint(cursor=...)``. This is safe for an async save too: the cursor
+        dict is built and handed to ``save_checkpoint`` before ``dcp.async_save`` stages
+        anything, and ``trainer_state.json`` (which the cursor lands in, under the
+        ``"cursor"`` key) is one of the synchronous sidecars written before this call
+        returns -- never deferred to :meth:`_finalize_pending_save`. In token mode the cursor
+        also carries every rank's epoch and per-worker row counts (``rank_epochs``,
+        ``worker_rows``), gathered here, so every rank must enter this method together.
+
+        Args:
+            blocking: When ``True`` (default), calls ``save_checkpoint(...,
+                blocking=True)`` and the checkpoint is fully committed --
+                ``on_checkpoint_saved`` fires -- before this method returns. When
+                ``False`` (the default for periodic saves, set by the caller in
+                :meth:`train`), the write is handed to ``dcp.async_save`` and this
+                method returns as soon as the (synchronous) sidecars are written and
+                the model/optimizer write has started; the commit itself, and
+                ``on_checkpoint_saved``, are deferred to :meth:`_finalize_pending_save`.
+                Asserts ``self._pending_save is None`` on entry -- callers must finalize
+                any existing pending save before triggering a new one (see
+                :meth:`train`'s "new trigger while pending" handling).
+        """
+        from oplm.data import DataCursor
+        from oplm.training.checkpoint import PendingSave, mark_permanent, save_checkpoint
+
+        assert blocking or self._pending_save is None, (
+            "at most one outstanding async save at a time -- caller must finalize first"
+        )
+
+        checkpoint_dir = Path(self.cfg.train.output_dir) / f"checkpoint-{self.global_step}"
+
+        rank_epochs: list[int] | None = None
+        worker_rows: list[list[int]] | None = None
+        worker_sources: list[list[list[list[int]] | None]] | None = None
+        reshards: list[dict[str, Any]] = []
+        if self._token_mode:
+            # Every rank enters this save at the same step (each trigger is rank-reduced, and
+            # _SaveDeferral is off in token mode), so the gather cannot strand a rank.
+            from accelerate.utils import gather_object
+
+            gathered = gather_object(
+                [(self.epoch, list(self._worker_rows), list(self._worker_sources))]
+            )
+            rank_epochs = [int(epoch) for epoch, _, _ in gathered]
+            worker_rows = [[int(n) for n in rows] for _, rows, _ in gathered]
+            worker_sources = [list(sources) for _, _, sources in gathered]
+            # An event no rank's current or later epoch is in can never apply again.
+            reshards = [asdict(r) for r in self._reshards if max(r.epochs) >= min(rank_epochs)]
+        cursor = DataCursor(
+            epoch=self.epoch,
+            batches_in_epoch=self._batches_in_epoch,
+            world_size=self.accelerator.num_processes,
+            num_workers=self._effective_num_workers(),
+            per_rank_batch=0 if self._token_mode else self.cfg.train.batch_size,
+            seed=self.cfg.train.seed,
+            rank_epochs=rank_epochs,
+            worker_rows=worker_rows,
+            worker_sources=worker_sources,
+            reshards=reshards,
+            data_fingerprint=self._data_fingerprint,
+        )
+
+        should_mark_permanent = False
+        if self.accelerator.is_main_process:
+            now_wall = time.time()
+            if self._first_checkpoint_at is None:
+                self._first_checkpoint_at = now_wall
+            keep_every_n_hours = self.cfg.train.keep_every_n_hours
+            if keep_every_n_hours is not None:
+                interval_seconds = keep_every_n_hours * 3600
+                elapsed = now_wall - self._first_checkpoint_at
+                current_time_keep_index = int(elapsed // interval_seconds)
+                if current_time_keep_index > self._last_time_keep_index:
+                    should_mark_permanent = True
+                    self._last_time_keep_index = current_time_keep_index
+
+        result = save_checkpoint(
+            accelerator=self.accelerator,
+            model=self.model,
+            optimizers=self.optimizers,
+            schedulers=self.schedulers,
+            cfg=self.cfg,
+            output_dir=self.cfg.train.output_dir,
+            global_step=self.global_step,
+            epoch=self.epoch,
+            samples_seen=self._samples_seen,
+            tokens_seen=self.tokens_seen,
+            save_total_limit=self.cfg.train.save_total_limit,
+            keep_every_n_steps=self.cfg.train.keep_every_n_steps,
+            extra_state=self._checkpoint_extra_state(),
+            cursor=cursor,
+            blocking=blocking,
+            process_group=self._checkpoint_process_group,
+            ema=self._ema,
+        )
+        self._last_save_at = time.monotonic()
+
+        if blocking:
+            assert isinstance(result, Path)
+            if should_mark_permanent:
+                mark_permanent(checkpoint_dir)
+            self._submit_remote_upload(checkpoint_dir, should_mark_permanent)
+            self._emit_checkpoint_saved(checkpoint_dir, self.global_step)
+        else:
+            assert isinstance(result, PendingSave)
+            self._pending_save = _PendingAsyncSave(
+                handle=result,
+                should_mark_permanent=should_mark_permanent,
+                global_step=self.global_step,
+            )
+
+    def _finalize_pending_save(self) -> None:
+        """Block on the pending async save's future (a no-op if already done) and commit it.
+
+        Runs the deferred commit tail via
+        :func:`~oplm.training.checkpoint.finalize_pending_save` (barrier, rank-0 rename +
+        pointer + rotation, second barrier), applies the ``keep_every_n_hours``
+        permanent-marker decision made at trigger time (see :class:`_PendingAsyncSave`),
+        fires ``on_checkpoint_saved`` with the checkpoint's own (trigger-time) step --
+        NOT ``self.global_step``, which may have advanced past it by now -- and clears
+        :attr:`_pending_save`. Called both from the opportunistic "every rank already
+        reported its write done" gate in :meth:`train` (where the ``.result()`` inside
+        is a no-op) and from the force-finalize paths (new trigger while pending,
+        drain, and end-of-training), where it may actually block.
+        """
+        from oplm.training.checkpoint import finalize_pending_save, mark_permanent
+
+        pending = self._pending_save
+        assert pending is not None, "_finalize_pending_save called with no pending save"
+
+        final_dir = finalize_pending_save(self.accelerator, pending.handle)
+        if pending.should_mark_permanent:
+            mark_permanent(final_dir)
+        self._submit_remote_upload(final_dir, pending.should_mark_permanent)
+        self._pending_save = None
+        self._emit_checkpoint_saved(final_dir, pending.global_step)
+
+    def _submit_remote_upload(self, checkpoint_dir: Path, permanent: bool) -> None:
+        """Hand the just-committed checkpoint to the background remote-upload thread.
+
+        A no-op on any rank without an upload manager -- either
+        ``train.remote_checkpoint_uri`` is unset (every rank), or this rank isn't its
+        node's leader (only leaders hold a manager at all; see ``Trainer.__init__``).
+        Building the :class:`~oplm.training.remote.UploadJob` partitions the
+        checkpoint's files into this node's own shard files plus, on global rank 0,
+        the shared artifacts -- see
+        :func:`~oplm.training.remote.build_upload_job`. ``submit`` itself is
+        non-blocking: see :class:`~oplm.training.remote.UploadManager` for the
+        one-in-flight, drop-oldest-queued serialization.
+
+        Args:
+            checkpoint_dir: The just-committed checkpoint directory (identical on
+                every rank).
+            permanent: Whether this checkpoint is exempt from local rotation
+                (``keep_every_n_steps``/``keep_every_n_hours``) -- mirrored into the
+                remote manifest so ``RemoteStore.rotate`` makes the same exemption.
+        """
+        if self._remote_upload_manager is None:
+            return
+
+        from oplm.training.remote import build_upload_job
+
+        job = build_upload_job(
+            checkpoint_dir,
+            self.accelerator,
+            permanent=permanent,
+            save_total_limit=self.cfg.train.save_total_limit,
+            keep_every_n_steps=self.cfg.train.keep_every_n_steps,
+        )
+        self._remote_upload_manager.submit(job)
+
+    def _drain_remote_uploads(self, timeout: float | None = None) -> None:
+        """Block (bounded) until the background remote upload has drained.
+
+        A no-op on any rank without an upload manager (see :meth:`_submit_remote_upload`).
+        Called before the drain exit (so the drained checkpoint's remote mirror has a
+        chance to land before the process exits with :data:`DRAIN_EXIT_CODE`) and at
+        the natural end of training (so the final checkpoint isn't left mirroring in a
+        daemon thread that the process exit abandons). Deliberately *not* called on
+        the non-finite-loss guard's raise path or an unrelated crash -- those paths are
+        already killing the process for other reasons, and this bound exists to keep
+        drain/shutdown responsive, not to guarantee every checkpoint's remote mirror
+        always completes.
+
+        Args:
+            timeout: Explicit bound in seconds. ``None`` (the default, and what every
+                production call site uses) derives it from the remaining wall clock --
+                see :func:`_remote_upload_drain_budget` -- so this wait cannot eat the
+                whole drain margin it runs inside.
+        """
+        if self._remote_upload_manager is None:
+            return
+        budget = _remote_upload_drain_budget() if timeout is None else timeout
+        self._remote_upload_manager.drain(timeout=budget)
+
+    def _checkpoint_extra_state(self) -> dict[str, Any]:
+        """Build the ``extra_state`` payload merged into ``trainer_state.json``.
+
+        Includes the ``keep_every_n_hours`` bookkeeping keys and, when a wandb run is
+        active (``self._wandb_run_id`` set on the main process), the run id (Task 1.7)
+        so a resumed run can be threaded back into ``wandb.init(id=..., resume="allow")``
+        without depending on the ``wandb_run_id`` marker file surviving.
+        """
+        extra_state: dict[str, Any] = {
+            "first_checkpoint_unix": self._first_checkpoint_at,
+            "last_time_keep_index": self._last_time_keep_index,
+        }
+        if self._wandb_run_id is not None:
+            extra_state["wandb_run_id"] = self._wandb_run_id
+        if self._ema is not None:
+            extra_state["ema"] = {
+                "decay": self.cfg.train.ema_decay,
+                "sidecar": EMA_SIDECAR_NAME,
+                "hf_dir": EMA_HF_DIRNAME,
+                "n_averaged": int(self._ema.n_averaged),
+            }
+        return extra_state
+
+    def _resume_from_checkpoint(self, checkpoint_dir: str) -> None:
+        """Resume training state from a checkpoint.
+
+        Also resumes the data cursor (Task 3.3), when the checkpoint has one and
+        ``cfg.train.resume_data_position`` is true -- see :meth:`_resume_data_cursor`.
+        """
+        from oplm.training.checkpoint import load_checkpoint
+
+        state = load_checkpoint(
+            self.accelerator,
+            self.model,
+            self.optimizers,
+            self.schedulers,
+            checkpoint_dir,
+            self.cfg,
+            ema=self._ema,
+        )
+        self.global_step = state["global_step"]
+        self.epoch = state["epoch"]
+        self.tokens_seen = state["tokens_seen"]
+        self._samples_seen = int(
+            state.get("samples_seen", self.global_step * self._global_effective_batch_size())
+        )
+        # keep_every_n_hours anchor: restore rather than reset, so a requeue keeps
+        # accumulating toward the same wall-clock boundary instead of starting over.
+        self._first_checkpoint_at = state.get("first_checkpoint_unix")
+        self._last_time_keep_index = int(state.get("last_time_keep_index", 0))
+        self._set_dataset_epoch(self.epoch)
+        self._resume_data_cursor(state, checkpoint_dir)
+
+        # Reset per-opt-step snapshot markers so the first post-resume step computes
+        # correct deltas. tokens_seen is already restored from trainer_state.json; the
+        # half-open crossing test neither re-fires at the resumed step nor skips a multiple.
+        self._epoch_at_last_opt_step = self.epoch
+        self._step_local_tokens = 0
+        self._step_local_samples = 0
+
+        logger.info(
+            "Resumed from checkpoint %s (step=%d, epoch=%d, samples=%d, tokens=%d)",
+            checkpoint_dir,
+            self.global_step,
+            self.epoch,
+            self._samples_seen,
+            self.tokens_seen,
+        )
+
+    def _branch_from_checkpoint(self, checkpoint_dir: Path) -> None:
+        """Branch: restore full state like a resume, but keep THIS config's LR/WD/schedule.
+
+        ``load_checkpoint`` restores every optimizer hyperparameter (``lr``,
+        ``initial_lr``, ``weight_decay``, betas, ...) and each LambdaLR's ``base_lrs``
+        from the checkpoint. A branch wants the checkpoint's *state* (weights, momentum,
+        counters, data position) under the *live* hyperparameters, so those are captured
+        from the freshly built optimizers before the load and written back afterwards;
+        the live schedule's λ is then evaluated at the restored step so the very first
+        branch step already uses the right LR (LambdaLR only sets it on ``step()``).
+
+        The data cursor is restored only when the training data matches the checkpoint's, by
+        content fingerprint (or, for a cursor without one, by ``data.train`` as written). A
+        different mix invalidates the cursor; the stream then restarts at row 0.
+        """
+        from oplm.config import load_config
+        from oplm.training.checkpoint import (
+            _unwrap_optimizer,
+            _unwrap_scheduler,
+            load_checkpoint,
+        )
+
+        live_hparams = [
+            [{k: v for k, v in group.items() if k != "params"} for group in opt.param_groups]
+            for opt in (_unwrap_optimizer(o) for o in self.optimizers)
+        ]
+        state = load_checkpoint(
+            self.accelerator,
+            self.model,
+            self.optimizers,
+            self.schedulers,
+            str(checkpoint_dir),
+            self.cfg,
+            validate_schedule=False,
+            ema=self._ema,
+        )
+        for opt, sched, hparams in zip(self.optimizers, self.schedulers, live_hparams, strict=True):
+            inner, scheduler = _unwrap_optimizer(opt), _unwrap_scheduler(sched)
+            scheduler.base_lrs = [h["initial_lr"] for h in hparams]
+            for group, live, lr_lambda in zip(
+                inner.param_groups, hparams, scheduler.lr_lambdas, strict=True
+            ):
+                group.update(live)
+                group["lr"] = live["initial_lr"] * lr_lambda(scheduler.last_epoch)
+
+        self.global_step = state["global_step"]
+        self.epoch = state["epoch"]
+        self.tokens_seen = state["tokens_seen"]
+        self._samples_seen = int(
+            state.get("samples_seen", self.global_step * self._global_effective_batch_size())
+        )
+        self._set_dataset_epoch(self.epoch)
+        self._epoch_at_last_opt_step = self.epoch
+        self._step_local_tokens = 0
+        self._step_local_samples = 0
+
+        config_path = checkpoint_dir / "config.yaml"
+        saved = state.get("cursor")
+        saved_fp = saved.get("data_fingerprint") if isinstance(saved, dict) else None
+        if saved_fp is not None:
+            differs = saved_fp != self._data_fingerprint
+        elif config_path.is_file():
+            differs = load_config(["--config", str(config_path)]).data.train != self.cfg.data.train
+        else:
+            differs = False
+        if differs:
+            logger.warning(
+                "branch_from: data.train differs from the checkpoint's; dropping its data "
+                "cursor and starting the stream from row 0 of epoch %d.",
+                self.epoch,
+            )
+            state.pop("cursor", None)
+        self._resume_data_cursor(state, str(checkpoint_dir))
+
+        logger.info(
+            "Branched from checkpoint %s (step=%d, epoch=%d, tokens=%d); lr=%s "
+            "adamw_lr_mult=%s weight_decay=%s scheduler=%s max_steps=%d",
+            checkpoint_dir,
+            self.global_step,
+            self.epoch,
+            self.tokens_seen,
+            self.cfg.train.lr,
+            self.cfg.train.adamw_lr_mult,
+            self.cfg.train.weight_decay,
+            self.cfg.train.scheduler,
+            self.cfg.train.max_steps,
+        )
+
+    def _resume_data_cursor(self, state: dict[str, Any], checkpoint_dir: str) -> None:
+        """Restore ``self._batches_in_epoch`` and arm the dataset's resume skip, or bypass.
+
+        Three cases (Task 3.3):
+
+        - No cursor in ``state`` (a pre-Task-3.3 checkpoint, or one saved with
+          ``resume_data_position=false``): today's behavior -- the epoch's data stream
+          restarts from row 0 (``self._batches_in_epoch`` stays ``0``, no skip armed) --
+          plus a WARNING that some training rows will be re-seen.
+        - A cursor is present but ``cfg.train.resume_data_position`` is false: same
+          restart-from-row-0 behavior and warning, as an explicit operator opt-out.
+        - A cursor is present and ``resume_data_position`` is true: the cursor's layout
+          (``world_size``, ``num_workers``, ``per_rank_batch``, ``seed``) is validated
+          against the live run. A mismatch raises ``ValueError`` naming every differing
+          field and the ``resume_data_position=false`` escape hatch (resuming into a
+          different layout would silently reproduce the wrong data order/coverage --
+          see ``DataCursor``'s docstring). On a match, ``self._batches_in_epoch`` is
+          restored and the top-level dataset's resume skip is armed via
+          :meth:`_top_level_dataset`'s ``set_resume_skip`` (``InterleavedDataset``
+          propagates to its sources internally). If the recorded ``batches_in_epoch``
+          is not itself a multiple of ``num_workers`` (the interruption did not land on
+          a full worker-cycle boundary -- see the worker-cycle save-alignment deferral
+          in :meth:`train`), a WARNING notes that global batch interleaving may be
+          window-shifted, though each worker's own data content stays exact.
+        - Token mode (``train.batch_tokens`` set) with a token-mode cursor: only the seed must
+          match (the token budget may change at a resume too). The cursor's reshard events are
+          restored and replayed. At the same world size and worker count, this rank's epoch,
+          per-worker row counts (``cursor.worker_rows``) and, for a mix, per-source positions
+          (``cursor.worker_sources``) are restored and armed via the top-level dataset's
+          ``set_resume_rows``/``set_resume_sources``. At another layout the cursor becomes a
+          new :class:`~oplm.data.Reshard` event: every rank starts at ``min(rank_epochs)`` from
+          row 0 of a stream that stripes only the rows the old streams had not consumed. A mix
+          needs ``worker_sources`` for that (``ValueError`` without). A sequence-mode cursor
+          (no ``worker_rows``) must match the layout; it maps exactly onto per-worker rows
+          (worker ``w`` has served ``len(range(w, batches_in_epoch, num_workers)) *
+          per_rank_batch`` rows, every rank in the cursor's epoch). A token-mode cursor in a
+          sequence-mode run raises ``ValueError`` (per-worker counts are not batch multiples
+          and ranks may be in different epochs).
+
+        Args:
+            state: The trainer state dict returned by
+                :func:`~oplm.training.checkpoint.load_checkpoint` (holds the optional
+                ``"cursor"`` key).
+            checkpoint_dir: The checkpoint directory being resumed from (for the error
+                message only).
+
+        Raises:
+            ValueError: The cursor's layout disagrees with the live run (only the seed, for a
+                token-mode cursor in token mode), it is a token-mode cursor in a sequence-mode
+                run, or it would reshard a mix without per-source positions, and
+                ``resume_data_position`` is true.
+        """
+        from oplm.data import DataCursor, Reshard
+        from oplm.data.config import parse_train_configs
+
+        cursor_dict = state.get("cursor")
+        if cursor_dict is None:
+            logger.warning(
+                "Checkpoint %s has no data cursor (saved before Task 3.3, or with "
+                "resume_data_position=false); restarting epoch %d's data stream from "
+                "row 0 -- some training rows will be re-seen.",
+                checkpoint_dir,
+                self.epoch,
+            )
+            return
+
+        if not self.cfg.train.resume_data_position:
+            logger.warning(
+                "train.resume_data_position=false: restarting epoch %d's data stream "
+                "from row 0 instead of resuming from the checkpoint's data cursor -- "
+                "some training rows will be re-seen.",
+                self.epoch,
+            )
+            return
+
+        cursor = DataCursor(**cursor_dict)
+        if cursor.worker_rows is not None and not self._token_mode:
+            raise ValueError(
+                f"Checkpoint {checkpoint_dir}'s data cursor is from a token-mode run, but this "
+                "run is in sequence mode (train.batch_tokens unset); each worker's row count is "
+                "not a whole number of batches, so its position cannot be mapped onto batches. "
+                "To resume anyway (restarting the epoch's data position from row 0), set "
+                "train.resume_data_position=false."
+            )
+        # Rows per worker depend only on the striping (world size, workers, seed); in token mode
+        # the batch size can change at a resume without moving the position, and a token-mode
+        # cursor reshards onto another world size or worker count.
+        world_size, num_workers = self.accelerator.num_processes, self._effective_num_workers()
+        live_layout: dict[str, int] = {
+            "world_size": world_size,
+            "num_workers": num_workers,
+            "seed": self.cfg.train.seed,
+        }
+        if not self._token_mode:
+            live_layout["per_rank_batch"] = self.cfg.train.batch_size
+        elif cursor.worker_rows is not None:
+            del live_layout["world_size"], live_layout["num_workers"]
+        mismatches = [
+            f"{attr} (checkpoint={getattr(cursor, attr)!r}, live={live_value!r})"
+            for attr, live_value in live_layout.items()
+            if getattr(cursor, attr) != live_value
+        ]
+        if mismatches:
+            raise ValueError(
+                f"Checkpoint {checkpoint_dir}'s data cursor layout does not match the "
+                f"current run -- resuming would silently reproduce the wrong data order "
+                f"or coverage. Mismatched field(s): {'; '.join(mismatches)}. To resume "
+                "anyway (restarting the epoch's data position from row 0 instead of "
+                "resuming it), set train.resume_data_position=false."
+            )
+
+        if self._token_mode:
+            if cursor.worker_rows is None:
+                # A sequence-mode cursor maps exactly: worker w of every rank has served its
+                # round-robin share of the epoch's batches (what _resolve_sample_skip computes),
+                # and every rank is in the cursor's epoch (ranks step in lockstep there).
+                rows = [
+                    len(range(w, cursor.batches_in_epoch, cursor.num_workers))
+                    * cursor.per_rank_batch
+                    for w in range(cursor.num_workers)
+                ]
+                cursor = replace(
+                    cursor,
+                    rank_epochs=[cursor.epoch] * cursor.world_size,
+                    worker_rows=[rows] * cursor.world_size,
+                )
+                logger.info(
+                    "Checkpoint %s has a sequence-mode data cursor; mapped it to per-worker "
+                    "row counts %s (batches_in_epoch=%d, per_rank_batch=%d).",
+                    checkpoint_dir,
+                    rows,
+                    cursor.batches_in_epoch,
+                    cursor.per_rank_batch,
+                )
+            assert cursor.rank_epochs is not None and cursor.worker_rows is not None
+            dataset: Any = self._top_level_dataset()  # a TokenBatcher
+            self._reshards = [Reshard(**event) for event in cursor.reshards]
+            if (cursor.world_size, cursor.num_workers) == (world_size, num_workers):
+                rank = self.accelerator.process_index
+                self.epoch = cursor.rank_epochs[rank]
+                self._worker_rows = list(cursor.worker_rows[rank])
+                dataset.set_reshards(self._reshards)
+                dataset.set_resume_rows(cursor.worker_rows[rank])
+                if cursor.worker_sources is not None:
+                    self._worker_sources = list(cursor.worker_sources[rank])
+                    dataset.set_resume_sources(cursor.worker_sources[rank])
+            else:
+                if (
+                    cursor.worker_sources is None
+                    and len(parse_train_configs(self.cfg.data.train)) > 1
+                ):
+                    raise ValueError(
+                        f"Checkpoint {checkpoint_dir}'s data cursor has no per-source positions "
+                        "(saved before they were recorded), so it cannot reshard a data.train "
+                        f"mix from {cursor.world_size} ranks x {cursor.num_workers} workers to "
+                        f"{world_size} x {num_workers}. Resume at the checkpoint's layout, or set "
+                        "train.resume_data_position=false to restart the epoch's data position "
+                        "from row 0."
+                    )
+                self._reshards.append(
+                    Reshard(
+                        stride=cursor.world_size * cursor.num_workers,
+                        epochs=[e for e in cursor.rank_epochs for _ in range(cursor.num_workers)],
+                        rows=[n for rows in cursor.worker_rows for n in rows],
+                        sources=(
+                            None
+                            if cursor.worker_sources is None
+                            else [s for sources in cursor.worker_sources for s in sources]
+                        ),
+                    )
+                )
+                # Every new stream starts from row 0 of what the old streams left.
+                self.epoch = min(cursor.rank_epochs)
+                dataset.set_reshards(self._reshards)
+                logger.info(
+                    "Resharding the data cursor of %s: %d streams (%d ranks x %d workers) -> %d "
+                    "(%d x %d), starting at epoch %d.",
+                    checkpoint_dir,
+                    cursor.world_size * cursor.num_workers,
+                    cursor.world_size,
+                    cursor.num_workers,
+                    world_size * num_workers,
+                    world_size,
+                    num_workers,
+                    self.epoch,
+                )
+            self._set_dataset_epoch(self.epoch)
+            self._epoch_at_last_opt_step = self.epoch
+            return
+
+        self._batches_in_epoch = cursor.batches_in_epoch
+        set_resume_skip = getattr(self._top_level_dataset(), "set_resume_skip", None)
+        if callable(set_resume_skip):
+            set_resume_skip(
+                cursor.batches_in_epoch,
+                per_rank_batch=cursor.per_rank_batch,
+                num_workers=cursor.num_workers,
+            )
+
+        if cursor.num_workers > 1 and cursor.batches_in_epoch % cursor.num_workers != 0:
+            logger.warning(
+                "Resuming with batches_in_epoch=%d not a multiple of num_workers=%d: "
+                "global batch interleaving across workers may be window-shifted on "
+                "resume, while each worker's own data content remains exact.",
+                cursor.batches_in_epoch,
+                cursor.num_workers,
+            )
+
+    def _global_effective_batch_size(self) -> int:
+        """Return the batch size of one optimizer step; tokens per step in token mode."""
+        if self._token_mode:
+            assert self.cfg.train.tokens_per_step is not None
+            return self.cfg.train.tokens_per_step
+        return int(
+            self.cfg.train.batch_size
+            * self.cfg.train.gradient_accumulation_steps
+            * self.accelerator.num_processes
+        )
+
+    @staticmethod
+    def _extract_eval_loss(metrics: dict[str, float]) -> float | None:
+        """Extract a progress-bar loss from evaluator output."""
+        if "eval/loss" in metrics:
+            return metrics["eval/loss"]
+
+        losses = [value for key, value in metrics.items() if key.endswith("/loss")]
+        if not losses:
+            return None
+        return sum(losses) / len(losses)
+
+    def _init_wandb(
+        self, cfg: OplmConfig, wandb_kwargs: dict[str, Any], rewind: tuple[int, int] | None
+    ) -> None:
+        """Start or resume the W&B run, rewinding its history first when it is ahead.
+
+        Rows are logged at ``step=global_step`` and W&B never accepts a step below its
+        latest, so after a rollback (a crash resumed from an earlier checkpoint) the
+        resumed attempt's rows for the replayed steps would be dropped. ``rewind`` is
+        ``(checkpoint_step, server_last_step)`` in that case: the run is reattached with
+        ``resume_from="<id>?_step=<checkpoint_step + 1>"``, which truncates the abandoned
+        attempt's rows from that step on, so the history records only the run that
+        continues. W&B enables rewinding per entity (private preview); a refusal falls back
+        to the plain resume and a warning names the steps that keep the earlier attempt's
+        values. ``tests/training/test_wandb_rewind_online.py`` pins the server behaviour.
+        """
+
+        def init(kwargs: dict[str, Any]) -> None:
+            self.accelerator.init_trackers(
+                project_name=cfg.train.wandb_project,
+                config=_config_to_flat_dict(cfg),
+                init_kwargs={"wandb": kwargs},
+            )
+
+        if rewind is None:
+            init(wandb_kwargs)
+            return
+        checkpoint_step, server_step = rewind
+        run_id = wandb_kwargs["id"]
+        rewind_kwargs = {k: v for k, v in wandb_kwargs.items() if k not in ("id", "resume")}
+        rewind_kwargs["resume_from"] = f"{run_id}?_step={checkpoint_step + 1}"
+        try:
+            init(rewind_kwargs)
+            self._wandb_rewind = "applied"
+            logger.info(
+                "Rewound W&B run %s to step %d (its history reached step %d)",
+                run_id,
+                checkpoint_step + 1,
+                server_step,
+            )
+        except Exception as exc:  # noqa: BLE001 -- a refused rewind must not stop training
+            import wandb
+
+            # init_trackers appends each tracker before starting it; drop the one that failed.
+            # The refused init also leaves the run id registered in W&B's background service
+            # ("run ID ... is in use"); tearing the service down lets the next init respawn it.
+            self.accelerator.trackers.clear()
+            wandb.teardown()
+            self._wandb_rewind = "unavailable"
+            logger.warning(
+                "W&B history rewind unavailable (%s); resuming run %s without it: "
+                "steps %d-%d keep the earlier attempt's values and this attempt's "
+                "metrics for them are dropped",
+                exc,
+                run_id,
+                checkpoint_step + 1,
+                server_step,
+            )
+            init(wandb_kwargs)
+
+    def _log_metrics(self, metrics: dict[str, float]) -> None:
+        """Log metrics and notify callbacks."""
+        # W&B's history step is the training step, so its `Step` axis matches
+        # `train/global_step`. W&B rejects a step below its latest: a resume behind the
+        # server's history rewinds it first (`_init_wandb`), or warns when it cannot.
+        self.accelerator.log(
+            metrics | {"train/global_step": self.global_step}, step=self.global_step
+        )
+        if not self.accelerator.is_main_process:
+            return
+
+        for callback in self.callbacks:
+            callback.on_log(self, dict(metrics), self.global_step)
+
+    def _canon_self_check(self, batch: dict[str, Any]) -> None:
+        """Run `canon_self_check` on the first `min(4, B)` rows of `batch`; a mismatch, or no
+        Canon call checked, raises.
+
+        Every `(B, ...)` tensor (`input_ids`, `attention_mask`, `labels`, `segment_ids`) keeps its
+        first rows, so packed rows stay whole and the model builds its masks from the slice;
+        other entries pass through (`num_sequences` still counts the full batch, but only feeds
+        `StepResult.samples`, which is discarded). The uncompiled, unwrapped model runs eagerly
+        (no DDP collectives; eager flex attention is why the rows are capped).
+        """
+        from rich.console import Console
+
+        from oplm.model.canon_kernel import canon_self_check
+
+        rows = batch["input_ids"].shape[0]
+        small = {
+            k: v[:4] if isinstance(v, torch.Tensor) and v.ndim and v.shape[0] == rows else v
+            for k, v in batch.items()
+        }
+
+        def run_forward() -> None:
+            with self.accelerator.autocast():
+                self.task.step(self._unwrapped_model, small)
+
+        calls = canon_self_check(self._unwrapped_model, run_forward)
+        if calls == 0:
+            raise RuntimeError(
+                "Canon self-check ran no Canon calls: the model has CanonConv modules and the "
+                "kernel is in use, but the first micro-batch's forward never reached them"
+            )
+        if self.accelerator.is_main_process:
+            # Console, like the other startup status lines: INFO logging is not shown by default.
+            Console().print(f"[dim]Canon self-check passed: {calls} calls[/dim]")
+
+    def _emit_train_start(self) -> None:
+        """Notify callbacks that training is starting."""
+        if not self.accelerator.is_main_process:
+            return
+
+        for callback in self.callbacks:
+            callback.on_train_start(self)
+
+    def _emit_eval_end(self, metrics: dict[str, float]) -> None:
+        """Notify callbacks that evaluation completed."""
+        if not self.accelerator.is_main_process:
+            return
+
+        for callback in self.callbacks:
+            callback.on_eval_end(self, dict(metrics), self.global_step)
+
+    def _emit_checkpoint_saved(self, checkpoint_dir: Path, step: int) -> None:
+        """Notify callbacks that a checkpoint was saved.
+
+        Args:
+            checkpoint_dir: The committed checkpoint directory.
+            step: The checkpoint's own step -- explicit rather than reading
+                ``self.global_step``, since a deferred async commit (Task 2.3) may run
+                after ``self.global_step`` has already advanced past the step the
+                checkpoint was actually saved at.
+        """
+        if not self.accelerator.is_main_process:
+            return
+
+        for callback in self.callbacks:
+            callback.on_checkpoint_saved(self, checkpoint_dir, step)
+
+    def _emit_train_end(self) -> None:
+        """Notify callbacks that training has ended."""
+        if not self.accelerator.is_main_process:
+            return
+
+        for callback in self.callbacks:
+            callback.on_train_end(self)
+
+
+# auto_resume fallback budget: the newest committed checkpoint plus this many
+# next-newest candidates, before giving up and raising fatally.
+_MAX_AUTO_RESUME_FALLBACK_ATTEMPTS = 2
+
+
+def _select_auto_resume_candidate(
+    output_dir: Path,
+    cfg: OplmConfig,
+    status: Callable[[str], None] | None,
+) -> Path | None:
+    """Pick the newest committed checkpoint that passes cheap pre-load validation.
+
+    Called on the main process only, from within :func:`_resolve_resume_target`, before
+    the auto-resume target is broadcast -- see that function's docstring for why the
+    fallback decision has to be made and validated *before* the broadcast rather than
+    after a failed ``dcp.load``.
+
+    Walks ``checkpoint`` :func:`oplm.training.checkpoint.list_committed_checkpoints`
+    (newest first) and returns the first one that passes
+    :func:`oplm.training.checkpoint.validate_checkpoint_for_resume`, logging loudly (main
+    process only) about every candidate skipped along the way. Gives up after the newest
+    checkpoint plus :data:`_MAX_AUTO_RESUME_FALLBACK_ATTEMPTS` next-newest candidates.
+
+    Args:
+        output_dir: The training output directory to scan.
+        cfg: The live, resolved config being trained/resumed with (for schedule-compat
+            validation).
+        status: Optional main-process-only status callback; ``None`` suppresses it.
+
+    Returns:
+        The selected checkpoint path, or ``None`` if there is no committed checkpoint at
+        all (a fresh ``output_dir`` -- not an error, auto_resume is simply a no-op).
+
+    Raises:
+        Exception: Re-raises the *last* candidate's validation error if every candidate
+            (newest plus fallbacks) fails validation. The caller
+            (:func:`_resolve_resume_target`) turns this into a rank-identical
+            ``RuntimeError`` broadcast to every rank instead of letting it propagate from
+            the main process alone.
+    """
+    from oplm.training.checkpoint import list_committed_checkpoints, validate_checkpoint_for_resume
+
+    candidates = list_committed_checkpoints(output_dir)
+    if not candidates:
+        return None
+
+    attempts = candidates[: _MAX_AUTO_RESUME_FALLBACK_ATTEMPTS + 1]
+    last_error: Exception | None = None
+    for index, candidate in enumerate(attempts):
+        try:
+            validate_checkpoint_for_resume(candidate, cfg)
+        except Exception as exc:  # noqa: BLE001 -- any validation failure triggers fallback
+            remaining = len(attempts) - index - 1
+            logger.error(
+                "auto_resume: checkpoint %s failed pre-load validation (%s: %s); %s",
+                candidate,
+                type(exc).__name__,
+                exc,
+                f"trying the next-newest committed checkpoint ({remaining} attempt(s) left)"
+                if remaining > 0
+                else "no further fallback attempts left",
+            )
+            last_error = exc
+            continue
+
+        if index > 0:
+            logger.warning(
+                "auto_resume: falling back to checkpoint %s after %d newer checkpoint(s) "
+                "failed pre-load validation",
+                candidate,
+                index,
+            )
+        if status is not None:
+            status(f"[dim]Auto-resuming from {candidate.name}[/dim]")
+        return candidate
+
+    assert last_error is not None  # at least one attempt ran (candidates is non-empty)
+    raise last_error
+
+
+def _checkpoint_step(name: str) -> int | None:
+    """Parse the numeric step out of a ``checkpoint-<step>`` name, or ``None``."""
+    suffix = name.removeprefix("checkpoint-")
+    return int(suffix) if suffix.isdigit() else None
+
+
+def _consult_remote_resume_candidate(
+    local_found: Path | None,
+    output_dir: Path,
+    cfg: OplmConfig,
+    status: Callable[[str], None] | None,
+) -> Path | None:
+    """Extend auto-resume (Task 4.2) to consult the remote mirror, main process only.
+
+    Called from :func:`_resolve_resume_target`'s main-process branch, immediately
+    after :func:`_select_auto_resume_candidate` has picked ``local_found`` (or found
+    nothing local at all) -- still before the broadcast to every other rank, so the
+    download below (when it happens) lands before any rank branches on the result,
+    exactly like the local candidate selection it extends.
+
+    A total no-op, including no import of :mod:`oplm.training.remote` and no fsspec
+    call whatsoever, when ``cfg.train.remote_checkpoint_uri`` is unset -- the
+    zero-behavior-change contract for every run that doesn't opt in. When it *is*
+    set, consults ``RemoteStore.latest_committed()``: if there is no remote
+    checkpoint, or its step does not exceed ``local_found``'s (a tie keeps the local
+    copy -- no point re-downloading what's already there), ``local_found`` is
+    returned unchanged. Otherwise the remote checkpoint is downloaded to
+    ``output_dir`` (``RemoteStore.download_checkpoint``'s own tmp-dir + rename
+    commits it as ``output_dir/checkpoint-<step>``, the same local commit convention
+    ``checkpoint.save_checkpoint`` uses) and cheaply pre-load-validated exactly like a
+    local candidate (:func:`~oplm.training.checkpoint.validate_checkpoint_for_resume`)
+    before being returned as the new resume target.
+
+    **Multi-node assumption:** the download lands at ``output_dir`` on the MAIN
+    process, before the resume-target broadcast to every other rank (see
+    :func:`_resolve_resume_target`) -- exactly like the local auto-resume scan. On a
+    shared/network filesystem ``output_dir`` (the common case for a Slurm cluster,
+    e.g. SUNK), every rank on every node can read the downloaded checkpoint straight
+    away. If ``output_dir`` is instead node-local storage (e.g. node-local NVMe) on a
+    multi-node run, only ranks on the main process's own node can actually see the
+    download -- this function has no way to detect that from here, so a multi-node
+    run with a node-local ``output_dir`` must not rely on this path (see docs/training.md,
+    "Remote checkpoint mirror").
+
+    Args:
+        local_found: The local candidate already selected (possibly ``None``).
+        output_dir: The training output directory (download destination).
+        cfg: The live, resolved config being trained/resumed with.
+        status: Optional main-process-only status callback; ``None`` suppresses it.
+
+    Returns:
+        ``local_found``, or the freshly downloaded remote checkpoint's local path if
+        it exists and its step exceeds ``local_found``'s (or there was no local
+        candidate at all).
+
+    Raises:
+        Exception: Whatever :meth:`~oplm.training.remote.RemoteStore.download_checkpoint`
+            or :func:`~oplm.training.checkpoint.validate_checkpoint_for_resume` raises
+            for a torn/incompatible remote checkpoint -- propagates to
+            :func:`_resolve_resume_target`'s caller, which packages it into the
+            broadcast identically to a local candidate's validation failure.
+    """
+    remote_uri = cfg.train.remote_checkpoint_uri
+    if remote_uri is None:
+        return local_found
+
+    from oplm.training.checkpoint import validate_checkpoint_for_resume
+    from oplm.training.remote import RemoteStore
+
+    store = RemoteStore(remote_uri)
+    remote_result = store.latest_committed()
+    if remote_result is None:
+        return local_found
+
+    remote_name, _remote_manifest = remote_result
+    remote_step = _checkpoint_step(remote_name)
+    local_step = _checkpoint_step(local_found.name) if local_found is not None else None
+    if remote_step is None or (local_step is not None and local_step >= remote_step):
+        return local_found
+
+    if status is not None:
+        status(f"[dim]Auto-resuming from remote checkpoint {remote_name}[/dim]")
+    logger.info(
+        "auto_resume: no usable local checkpoint at or past remote step %d; downloading %s from %s",
+        remote_step,
+        remote_name,
+        remote_uri,
+    )
+    downloaded = store.download_checkpoint(remote_name, output_dir)
+    validate_checkpoint_for_resume(downloaded, cfg)
+    return downloaded
+
+
+def _resolve_resume_target(
+    accelerator: Accelerator,
+    resume_from: str | None,
+    auto_resume: bool,
+    output_dir: str,
+    cfg: OplmConfig,
+    status: Callable[[str], None] | None = None,
+) -> str | None:
+    """Resolve the checkpoint path to resume from, rank-identical by construction.
+
+    An explicit ``resume_from`` is already rank-identical (it's config), so no scan is
+    needed for it -- and, per the binding constraint that explicit ``resume_from`` never
+    falls back, it is never validated or substituted here either: if it turns out to be
+    corrupt, ``Trainer._resume_from_checkpoint`` raises and the job dies (test (d)).
+
+    When ``auto_resume`` applies instead (no explicit path given), ONLY the main process
+    scans the filesystem and selects a candidate (:func:`_select_auto_resume_candidate`).
+    A non-main rank never performs this scan itself: the recovery renames in
+    :func:`oplm.training.checkpoint.clean_stale_checkpoint_dirs` (also main-only) plus
+    shared-filesystem directory-listing caches on a multi-node cluster mean a rank's own
+    scan is not guaranteed to see what the main rank sees, even after a barrier -- so the
+    only way to guarantee a rank-identical result is to compute it once and hand it to
+    everyone.
+
+    Auto-resume fallback design (Task 2.2): ``dcp.load`` is collective, so retrying a
+    *different* checkpoint after a failed ``dcp.load`` would require ranks to agree, mid
+    failure, to retry together -- exactly the desynchronized-exception/hang risk
+    rank-sync discipline exists to avoid. Instead, everything cheap to validate without
+    the collective (``trainer_state.json`` readability, ``.metadata`` readability, RNG
+    sidecar count vs. this run's world size, schedule compatibility -- see
+    :func:`oplm.training.checkpoint.validate_checkpoint_for_resume`) runs here, on the
+    main process, *before* the broadcast: a torn or schedule-incompatible candidate is
+    rejected identically on every rank, and the next-newest committed checkpoint is
+    substituted (and broadcast) in its place, up to
+    :data:`_MAX_AUTO_RESUME_FALLBACK_ATTEMPTS` times. If every candidate fails, the main
+    process's last validation error is packaged into the broadcast payload (rather than
+    raised locally, which would leave every other rank hanging at the broadcast call) and
+    every rank raises an identical ``RuntimeError`` from it. A genuine failure *inside*
+    ``dcp.load`` after a candidate has already passed this validation is treated as
+    fatal: it is allowed to propagate straight out of ``Trainer._resume_from_checkpoint``,
+    the job dies, and the external requeue loop retries -- which, given the pre-validation
+    above, should be rare.
+
+    Args:
+        accelerator: The trainer's Accelerator, called after the ``wait_for_everyone``
+            barrier that follows ``clean_stale_checkpoint_dirs``.
+        resume_from: ``cfg.train.resume_from`` -- an explicit operator-pinned path, or
+            ``None``.
+        auto_resume: ``cfg.train.auto_resume``.
+        output_dir: The training output directory to scan when ``auto_resume`` applies.
+        cfg: The live, resolved config being trained/resumed with (threaded into
+            candidate validation for schedule-compat checking).
+        status: Optional main-process-only status callback (mirrors the trainer's
+            ``_status`` helper); ``None`` suppresses it.
+
+    Returns:
+        The resolved checkpoint directory path, identical on every rank, or ``None`` if
+        there is nothing to resume.
+
+    Raises:
+        RuntimeError: Every auto-resume candidate (newest plus fallbacks) failed pre-load
+            validation. Raised identically on every rank.
+    """
+    from accelerate.utils import broadcast_object_list
+
+    resume_target: str | None = resume_from
+    resolve_error: str | None = None
+    if resume_target is None and auto_resume and accelerator.is_main_process:
+        try:
+            found = _select_auto_resume_candidate(Path(output_dir), cfg, status)
+            found = _consult_remote_resume_candidate(found, Path(output_dir), cfg, status)
+        except Exception as exc:  # noqa: BLE001 -- packaged into the broadcast, see above
+            resolve_error = (
+                f"auto_resume: no usable checkpoint found under {output_dir} after "
+                f"{_MAX_AUTO_RESUME_FALLBACK_ATTEMPTS + 1} attempt(s); last error: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        else:
+            resume_target = str(found) if found is not None else None
+
+    resume_target, resolve_error = broadcast_object_list([resume_target, resolve_error])
+    if resolve_error is not None:
+        raise RuntimeError(resolve_error)
+    return resume_target
+
+
+def _read_trainer_state(checkpoint_dir: str) -> dict[str, Any]:
+    """A checkpoint's ``trainer_state.json``, or ``{}`` when it is missing or unreadable."""
+    state_path = Path(checkpoint_dir) / "trainer_state.json"
+    if not state_path.is_file():
+        return {}
+    try:
+        return json.loads(state_path.read_text())
+    except json.JSONDecodeError:
+        return {}
+
+
+def _wandb_last_history_step(project: str, run_id: str) -> int | None:
+    """The last step in a W&B run's server history, or ``None`` when it cannot be read.
+
+    Uses the public API with ``wandb.init``'s entity resolution (``WANDB_ENTITY`` or the
+    account default). Offline or disabled W&B never touches the network, and any API error
+    returns ``None``: the rewind only tidies the record, training never depends on it.
+    """
+    if os.environ.get("WANDB_MODE", "").lower() in ("offline", "disabled", "dryrun"):
+        return None
+    try:
+        import wandb
+
+        step = wandb.Api(timeout=30).run(f"{project}/{run_id}").lastHistoryStep
+    except Exception as exc:  # noqa: BLE001 -- unknown means "resume without a rewind"
+        logger.warning("Could not read W&B history of run %s (%s); no rewind", run_id, exc)
+        return None
+    return int(step) if step is not None and step >= 0 else None
+
+
+def _wandb_rewind_window(resume_target: str, project: str, run_id: str) -> tuple[int, int] | None:
+    """``(checkpoint_step, server_last_step)`` when the run's W&B history is past the checkpoint.
+
+    ``None`` when the server is not ahead (a drain checkpoint, saved before its step was
+    logged) or either step is unknown; the caller then resumes without a rewind.
+    """
+    checkpoint_step = _read_trainer_state(resume_target).get("global_step")
+    if checkpoint_step is None:
+        return None
+    server_step = _wandb_last_history_step(project, run_id)
+    if server_step is None or server_step <= int(checkpoint_step):
+        return None
+    return int(checkpoint_step), server_step
+
+
+def _read_resume_wandb_run_id(resume_target: str, output_dir: str) -> str | None:
+    """Read the wandb run id to resume, for threading into ``wandb.init(id=..., ...)``.
+
+    Prefers the id recorded in the resume target checkpoint's own ``trainer_state.json``
+    (authoritative for that exact checkpoint); falls back to the
+    ``<output_dir>/wandb_run_id`` marker file (e.g. a checkpoint saved before this field
+    existed, or a checkpoint dir moved/copied without its marker).
+
+    Args:
+        resume_target: Path to the checkpoint directory being resumed from.
+        output_dir: The training output directory.
+
+    Returns:
+        The wandb run id string, or ``None`` if neither source has one.
+    """
+    run_id = _read_trainer_state(resume_target).get("wandb_run_id")
+    if run_id:
+        return str(run_id)
+
+    id_path = Path(output_dir) / "wandb_run_id"
+    if id_path.is_file():
+        text = id_path.read_text().strip()
+        if text:
+            return text
+    return None
+
+
+def _config_to_flat_dict(cfg: OplmConfig) -> dict[str, Any]:
+    """Flatten OplmConfig to a single-level dict for wandb init."""
+    from dataclasses import asdict
+
+    flat: dict[str, Any] = {}
+    for key, value in cfg.model.to_dict().items():
+        flat[f"model/{key}"] = value
+    for section_name in ("train", "data"):
+        section = asdict(getattr(cfg, section_name))
+        for key, value in section.items():
+            flat[f"{section_name}/{key}"] = value
+    return flat
+
+
+def _resolve_total_length(dataset: object) -> int:
+    """Resolve the raw dataset length through wrapper layers."""
+    if dataset is None:
+        return 0
+
+    total_length = getattr(dataset, "total_length", None)
+    if total_length is not None:
+        return int(total_length)
+
+    child_dataset = getattr(dataset, "dataset", None)
+    if child_dataset is not None and child_dataset is not dataset:
+        child_length = _resolve_total_length(child_dataset)
+        if child_length > 0:
+            return child_length
+
+    try:
+        return len(dataset)  # ty: ignore[invalid-argument-type]  # guarded by except TypeError
+    except TypeError:
+        return 0

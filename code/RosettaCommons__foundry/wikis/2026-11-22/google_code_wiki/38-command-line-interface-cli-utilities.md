@@ -1,0 +1,7 @@
+## Command Line Interface (CLI) Utilities
+Foundry provides command-line interface (CLI) tools for managing model checkpoints, which are crucial for consistent and reproducible model usage. These utilities facilitate tasks such as installing new models, viewing available and installed checkpoints, and cleaning up storage. The core functionality for these operations resides within the [`/rosettacommons/foundry/src/foundry_cli`](https://github.com/rosettacommons/foundry/src/foundry_cli) directory, with the primary logic implemented in [`/rosettacommons/foundry/src/foundry_cli/download_checkpoints.py`](https://github.com/rosettacommons/foundry/src/foundry_cli/download_checkpoints.py).
+
+The CLI streamlines the process of obtaining and organizing pre-trained models. For example, users can install specific model checkpoints or an entire set of base models. The system determines where to store these checkpoints by resolving appropriate directories, which can be influenced by user-specified paths or environment variables. Downloads include integrity verification through SHA256 hashing to ensure files are not corrupted.
+
+To aid in managing the downloaded assets, the CLI offers commands to list all models that are registered as available for download, along with their descriptions. It also allows users to inspect which models are currently installed on their system, providing information on their storage locations and cumulative size. For maintaining disk space, a cleanup command is available to remove all downloaded checkpoint files after user confirmation.
+

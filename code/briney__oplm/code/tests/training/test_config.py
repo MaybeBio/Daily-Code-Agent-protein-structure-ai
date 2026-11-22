@@ -1,0 +1,877 @@
+"""Training-config tests for load_config (model + TrainConfig surface)."""
+
+from __future__ import annotations
+
+import inspect
+import math
+from dataclasses import asdict
+from importlib.resources import files
+from typing import TYPE_CHECKING, Any
+
+import pytest
+from omegaconf import OmegaConf
+
+from oplm.config import (
+    AVAILABLE_PRESETS,
+    DataConfig,
+    TrainConfig,
+    load_config,
+    resolve_token_accumulation,
+    serialize_config,
+    validate_token_batching,
+)
+from oplm.model import OplmConfig as OplmModelConfig
+from tests.training.conftest import tiny_train_cfg
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+def _write_yaml(tmp_path: Path, body: str) -> str:
+    """Write a YAML config file and return its path."""
+    path = tmp_path / "config.yaml"
+    path.write_text(body)
+    return str(path)
+
+
+def _packaged_section(package: str, filename: str, section: str) -> dict[str, Any]:
+    """Load one top-level section from a packaged ``base.yaml`` as a plain dict."""
+    text = files(package).joinpath(filename).read_text()
+    container = OmegaConf.to_container(OmegaConf.create(text), resolve=True)
+    assert isinstance(container, dict)
+    return container[section]  # type: ignore[return-value]
+
+
+# --- --name → train.wandb_run_name propagation ---------------------------------
+
+
+def test_name_flag_sets_run_name() -> None:
+    """``--name`` populates ``train.wandb_run_name`` when nothing else sets it."""
+    cfg = load_config(["--name", "from_flag"])
+    assert cfg.train.wandb_run_name == "from_flag"
+
+
+def test_run_name_defaults_to_none() -> None:
+    """With neither ``--name`` nor an explicit value, the run name stays None."""
+    cfg = load_config([])
+    assert cfg.train.wandb_run_name is None
+
+
+def test_cli_override_beats_name_flag() -> None:
+    """An explicit ``train.wandb_run_name`` CLI override wins over ``--name``."""
+    cfg = load_config(["--name", "from_flag", "train.wandb_run_name=from_cli"])
+    assert cfg.train.wandb_run_name == "from_cli"
+
+
+def test_yaml_value_beats_name_flag(tmp_path: Path) -> None:
+    """An explicit ``train.wandb_run_name`` in YAML wins over ``--name``."""
+    config_path = _write_yaml(tmp_path, "train:\n  wandb_run_name: from_yaml\n")
+    cfg = load_config(["--name", "from_flag", "--config", config_path])
+    assert cfg.train.wandb_run_name == "from_yaml"
+
+
+def test_explicit_null_override_beats_name_flag() -> None:
+    """An explicit ``wandb_run_name=null`` is honored (random W&B name), not ``--name``."""
+    cfg = load_config(["--name", "from_flag", "train.wandb_run_name=null"])
+    assert cfg.train.wandb_run_name is None
+
+
+def test_run_name_without_flag() -> None:
+    """An explicit run name with no ``--name`` flag resolves to that value."""
+    cfg = load_config(["train.wandb_run_name=from_cli"])
+    assert cfg.train.wandb_run_name == "from_cli"
+
+
+# --- --name → train.output_dir propagation -------------------------------------
+
+
+def test_name_flag_sets_output_dir() -> None:
+    """``--name`` seeds ``train.output_dir`` to ``./<name>`` when nothing else sets it."""
+    cfg = load_config(["--name", "myrun"])
+    assert cfg.train.output_dir == "myrun"
+
+
+def test_output_dir_defaults_without_name() -> None:
+    """With neither ``--name`` nor an explicit value, output_dir keeps the default."""
+    cfg = load_config([])
+    assert cfg.train.output_dir == "outputs"
+
+
+def test_cli_output_dir_beats_name_flag() -> None:
+    """An explicit ``train.output_dir`` CLI override wins over ``--name``."""
+    cfg = load_config(["--name", "myrun", "train.output_dir=explicit"])
+    assert cfg.train.output_dir == "explicit"
+
+
+def test_yaml_output_dir_beats_name_flag(tmp_path: Path) -> None:
+    """An explicit ``train.output_dir`` in YAML wins over ``--name``."""
+    config_path = _write_yaml(tmp_path, "train:\n  output_dir: from_yaml\n")
+    cfg = load_config(["--name", "myrun", "--config", config_path])
+    assert cfg.train.output_dir == "from_yaml"
+
+
+# --- model config: type, presets, derived fields, unknown keys -----------------
+
+
+def test_default_model_is_hf_config() -> None:
+    """``load_config([])`` resolves ``cfg.model`` to a validated HF ``OplmConfig``."""
+    cfg = load_config([])
+    assert isinstance(cfg.model, OplmModelConfig)
+    # Construction runs OplmConfig._validate(); reaching here means it passed. The
+    # derived fields are concrete (never None) post-__init__.
+    assert cfg.model.head_dim is not None
+    assert cfg.model.intermediate_size is not None
+
+
+def test_preset_and_cli_override_apply() -> None:
+    """A size preset sets dims; a CLI dotlist override beats the preset/base layer."""
+    cfg = load_config(["--preset", "50M", "model.num_hidden_layers=4"])
+    assert cfg.model.num_hidden_layers == 4  # CLI override wins
+    assert cfg.model.hidden_size == 512  # from the `50M` preset
+
+
+def test_ablation_toggle_cli_overrides_apply() -> None:
+    """CLI dotlist overrides reach the new architecture-ablation knobs."""
+    cfg = load_config(
+        [
+            "model.qk_norm_mode=l2",
+            "model.qk_norm_l2_scale_init=8.0",
+            "model.mask_dropout=true",
+            "model.residual_gate=channel",
+            "model.residual_gate_init=0.5",
+            "model.ffn_activation=relu2",
+        ]
+    )
+    assert cfg.model.qk_norm_mode == "l2"
+    assert cfg.model.qk_norm_l2_scale_init == 8.0
+    assert cfg.model.mask_dropout is True
+    assert cfg.model.residual_gate == "channel"
+    assert cfg.model.residual_gate_init == 0.5
+    assert cfg.model.ffn_activation == "relu2"
+
+
+def test_ablation_toggle_defaults_preserve_current_behavior() -> None:
+    """With no overrides the new knobs resolve to behavior-preserving defaults."""
+    cfg = load_config([])
+    assert cfg.model.qk_norm_mode == "channel"
+    assert cfg.model.qk_norm_l2_scale_init is None
+    assert cfg.model.mask_dropout is False
+    assert cfg.model.mask_dropout_reference_ratio == 0.12
+    assert cfg.model.residual_gate == "none"
+    assert cfg.model.residual_gate_init == 1.0
+    assert cfg.model.canon_residual is True
+
+
+def test_mup_cli_overrides_apply() -> None:
+    """CLI dotlist overrides reach the μP knobs and the derived multiplier updates."""
+    cfg = load_config(
+        [
+            "--preset",
+            "400M",  # hidden_size = 1024
+            "model.mup_enable=true",
+            "model.mup_base_width=512",
+            "model.mup_output_mult=2.0",
+        ]
+    )
+    assert cfg.model.mup_enable is True
+    assert cfg.model.mup_base_width == 512
+    assert cfg.model.mup_output_mult == 2.0
+    assert cfg.model.mup_width_mult() == 2.0  # 1024 / 512
+
+
+def test_default_run_uses_mup_muon_recipe() -> None:
+    """With no overrides the production default is the confirmed μP + Muon winner."""
+    cfg = load_config([])
+    assert cfg.train.optimizer == "muon"
+    assert cfg.train.muon_adjust_lr_fn == "original"
+    # μP refresh winner (Oct 2026, 4M tokens/step), anchored at the 768-wide 170M proxy.
+    assert cfg.train.lr == pytest.approx(0.0063)
+    assert cfg.train.adamw_lr_mult == pytest.approx(0.333)
+    assert cfg.train.embedding_weight_decay == pytest.approx(0.01)
+    assert cfg.train.weight_decay_to_init == pytest.approx(0.1)
+    assert cfg.model.residual_gate == "none"
+    assert cfg.model.mup_enable is True
+    assert cfg.model.mup_base_width == 768
+    assert cfg.model.mup_output_mult == 1.0
+    # Default hidden_size 1024 over base 768 ⇒ m = 4/3 (μP actively scales here).
+    assert cfg.model.mup_width_mult() == pytest.approx(1024 / 768)
+
+
+_ESMC_RECIPE = str(files("oplm.configs.train").joinpath("esm-c.yaml"))
+# Set by --preset, the tokenizer, the fine-tuning head, or the runtime -- not part of a recipe.
+_ESMC_UNPINNED_MODEL_KEYS = {
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "head_dim",
+    "intermediate_size",
+    "max_position_embeddings",
+    "packed_attention",
+    "gradient_checkpointing",
+    "gradient_checkpointing_mode",
+    "num_labels",
+    "classifier_pool",
+    "classifier_dropout",
+    "pre_head_norm",
+    "pad_token_id",
+    "bos_token_id",
+    "eos_token_id",
+    "unk_token_id",
+    "mask_token_id",
+}
+_ESMC_PINNED_TRAIN_KEYS = {
+    "optimizer",
+    "lr",
+    "weight_decay",
+    "adam_beta1",
+    "adam_beta2",
+    "adam_eps",
+    "mup_depth_lr_exponent",
+    "mup_depth_reference_layers",
+    "adamw_lr_mult",
+    "embedding_weight_decay",
+    "weight_decay_to_init",
+}
+
+
+def test_esmc_recipe_pins_every_architecture_key() -> None:
+    """A new OPLM model knob can't leak into the ESM-C recipe: it must be pinned there too."""
+    base = _packaged_section("oplm.configs.model", "base.yaml", "model")
+    esmc = _packaged_section("oplm.configs.train", "esm-c.yaml", "model")
+    assert set(esmc) == set(base) - _ESMC_UNPINNED_MODEL_KEYS
+
+
+def test_esmc_recipe_pins_the_optimizer() -> None:
+    esmc = _packaged_section("oplm.configs.train", "esm-c.yaml", "train")
+    assert set(esmc) == _ESMC_PINNED_TRAIN_KEYS
+
+
+def test_esmc_recipe_resolves_esmc_architecture() -> None:
+    """Pre-LN, full-width QK LayerNorm, sqrt(L/36) branches, nothing OPLM-specific, AdamW μP."""
+    cfg = load_config(["--config", _ESMC_RECIPE])
+    m, t = cfg.model, cfg.train
+    assert (m.norm_strategy, m.norm_type, m.norm_eps) == ("pre", "layernorm", 1e-5)
+    assert (m.qk_norm, m.qk_norm_mode, m.residual_scaling) == (True, "full", "esmc")
+    assert (m.residual_gate, m.attn_output_gate, m.value_residual) == ("none", "none", "none")
+    assert m.canon_enabled is False
+    assert (m.ffn_activation, m.ffn_bias, m.tie_word_embeddings) == ("swiglu", False, False)
+    assert m.mup_enable is True
+    assert t.optimizer == "adamw"
+    assert (t.adamw_lr_mult, t.weight_decay_to_init, t.embedding_weight_decay) == (1.0, 0.0, 0.0)
+
+
+def test_dataclass_fallbacks_are_conservative() -> None:
+    """Bare dataclass construction stays μP-off / AdamW (library fallback, backward-compatible).
+
+    The production recipe lives in the YAML (configs/{model,train}/base.yaml); the
+    dataclass keeps the vanilla architecture so bare ``OplmConfig()`` and loading
+    older checkpoints stay backward-compatible.
+    """
+    assert OplmModelConfig().mup_enable is False
+    assert TrainConfig().optimizer == "adamw"
+    assert TrainConfig().lr == pytest.approx(1e-4)
+    # Architecture defaults stay vanilla at the library level (not the YAML recipe).
+    model = OplmModelConfig()
+    assert model.norm_strategy == "pre"
+    assert model.attn_output_gate == "none"
+    assert model.value_residual == "none"
+    assert model.canon_enabled is False
+
+
+def test_canon_residual_cli_override_applies() -> None:
+    """The residual Canon toggle remains a simple boolean model field."""
+    cfg = load_config(["model.canon_residual=false"])
+    assert cfg.model.canon_enabled is True  # Canon is on by default
+    assert cfg.model.canon_residual is False
+
+
+def test_derived_fields_resolve_when_omitted() -> None:
+    """Omitted ``head_dim`` / ``intermediate_size`` resolve from the source dims."""
+    cfg = load_config(["model.hidden_size=256", "model.num_attention_heads=4"])
+    assert cfg.model.head_dim == 64  # 256 / 4
+    assert cfg.model.intermediate_size > 0
+    assert cfg.model.intermediate_size % 256 == 0  # rounded to a tensor-core multiple
+
+
+def test_relu2_intermediate_size_derives_iso_param() -> None:
+    """relu2 (2 projections) derives ~4*D so FFN params match the gated ~8/3*D variants."""
+    gated = load_config(["model.hidden_size=768"])
+    assert gated.model.intermediate_size == 2048  # round_up(8/3 * 768, 256)
+    relu2 = load_config(["model.hidden_size=768", "model.ffn_activation=relu2"])
+    assert relu2.model.intermediate_size == 3072  # round_up(4 * 768, 256)
+    # Iso-param: 2 projections * 3072 == 3 projections * 2048.
+    assert 2 * relu2.model.intermediate_size == 3 * gated.model.intermediate_size
+
+
+def test_unknown_model_key_raises() -> None:
+    """Unknown ``model.*`` keys are rejected, not silently absorbed into kwargs."""
+    with pytest.raises(ValueError, match="Unknown model config key"):
+        load_config(["model.bogus_key=1"])
+
+
+def test_misspelled_canon_key_raises() -> None:
+    """A typo'd ablation key (``cannon_enabled``) raises instead of silently no-op'ing."""
+    with pytest.raises(ValueError, match="cannon_enabled"):
+        load_config(["model.cannon_enabled=true"])
+
+
+def test_misspelled_dimension_key_raises() -> None:
+    """A typo'd dimension key (``hidden_dimm``) is rejected at load time."""
+    with pytest.raises(ValueError, match="Unknown model config key"):
+        load_config(["model.hidden_dimm=1024"])
+
+
+@pytest.mark.parametrize("preset", AVAILABLE_PRESETS)
+def test_all_presets_pass_strict_validation(preset: str) -> None:
+    """Every packaged size preset loads cleanly under strict key validation."""
+    cfg = load_config(["--preset", preset])
+    assert isinstance(cfg.model, OplmModelConfig)
+
+
+def test_800m_preset_uses_64_dimensional_heads() -> None:
+    cfg = load_config(["--preset", "800M"])
+    assert cfg.model.hidden_size == 1280
+    assert cfg.model.num_hidden_layers == 40
+    assert cfg.model.num_attention_heads == 20
+    assert cfg.model.head_dim == 64
+
+
+def test_depth_lr_defaults_are_noop_at_170m_reference() -> None:
+    """The confirmed exponent (0.5) still yields correction (24/L)**e == 1 at L=24."""
+    cfg = load_config([])
+    assert cfg.train.mup_depth_lr_exponent == 0.5
+    assert cfg.train.mup_depth_reference_layers == 24
+
+
+@pytest.mark.parametrize("value", [-0.1, math.inf, -math.inf, math.nan])
+def test_depth_lr_exponent_must_be_finite_and_nonnegative(value: float) -> None:
+    with pytest.raises(ValueError, match="mup_depth_lr_exponent"):
+        TrainConfig(mup_depth_lr_exponent=value)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_depth_lr_reference_layers_must_be_positive(value: int) -> None:
+    with pytest.raises(ValueError, match="mup_depth_reference_layers"):
+        TrainConfig(mup_depth_reference_layers=value)
+
+
+@pytest.mark.parametrize("preset", AVAILABLE_PRESETS)
+def test_all_presets_resolve_golden_canon_defaults(preset: str) -> None:
+    """Every preset resolves the default Canon recipe (all four positions, k=7, residual on)."""
+    cfg = load_config(["--preset", preset])
+    assert cfg.model.canon_enabled is True
+    assert cfg.model.canon_residual is True
+    assert cfg.model.canon_positions == ["A", "B", "C", "D"]
+    assert cfg.model.canon_kernel_sizes == [7] * cfg.model.num_hidden_layers
+    assert cfg.model.canon_activation == "none"
+
+
+def test_canon_default_run_resolves_golden_encoder_config() -> None:
+    """The default run resolves to the golden encoder configuration.
+
+    Golden assertions for the ablation surface: Canon at all four positions with
+    residual updates, no conv activation, sandwich norm strategy, and the base
+    k=7 kernel broadcast across every layer.
+    """
+    cfg = load_config([])
+    assert cfg.model.canon_enabled is True
+    assert cfg.model.canon_residual is True
+    assert cfg.model.canon_positions == ["A", "B", "C", "D"]
+    assert cfg.model.canon_activation == "none"
+    assert cfg.model.norm_strategy == "sandwich"
+    # base.yaml's k=7 resolves to a per-layer list of the right length.
+    assert cfg.model.canon_kernel_sizes == [7] * cfg.model.num_hidden_layers
+
+
+def test_serialized_config_roundtrips_through_load_config(tmp_path: Path) -> None:
+    """A serialized run config (HF ``to_dict`` metadata included) reloads via ``--config``.
+
+    Strict validation must allow the HF metadata keys (``model_type``,
+    ``transformers_version``, ``architectures``, ...) that ``serialize_config``
+    emits, or every saved config would fail to reload.
+    """
+    cfg = load_config(["model.canon_enabled=true", "model.canon_positions=[A,D]"])
+    path = tmp_path / "run.yaml"
+    path.write_text(serialize_config(cfg))
+    restored = load_config(["--config", str(path)])
+    assert restored.model.canon_enabled is True
+    assert restored.model.canon_positions == ["A", "D"]
+
+
+def test_removed_max_length_alias_raises() -> None:
+    """The removed ``data.max_length`` alias points users at the HF field name."""
+    with pytest.raises(ValueError, match="model.max_position_embeddings"):
+        load_config(["data.max_length=5"])
+
+
+# --- base.yaml layer is actually loaded (not just documentation) ----------------
+
+
+def test_base_layer_is_loaded() -> None:
+    """The packaged ``train/base.yaml`` value is what ``load_config`` returns."""
+    yaml_train = _packaged_section("oplm.configs.train", "base.yaml", "train")
+    assert yaml_train  # the section is non-empty
+    assert load_config([]).train.seed == yaml_train["seed"]
+
+
+# --- YAML↔dataclass drift guards -----------------------------------------------
+
+_TRAIN_YAML = _packaged_section("oplm.configs.train", "base.yaml", "train")
+_DATA_YAML = _packaged_section("oplm.configs.data", "base.yaml", "data")
+_MODEL_YAML = _packaged_section("oplm.configs.model", "base.yaml", "model")
+
+
+# train/base.yaml carries OPLM's opinionated production defaults (μP + Muon), which
+# intentionally diverge from the conservative TrainConfig dataclass fallbacks for
+# these fields. Every other key must still mirror the dataclass (drift guard).
+_TRAIN_PRODUCTION_OVERRIDES = {
+    "optimizer",
+    "lr",
+    "muon_adjust_lr_fn",
+    "mup_depth_lr_exponent",
+    "adamw_lr_mult",
+    "embedding_weight_decay",
+    "weight_decay_to_init",
+}
+
+
+@pytest.mark.parametrize("key", sorted(_TRAIN_YAML))
+def test_train_base_yaml_matches_dataclass(key: str) -> None:
+    """Every ``train/base.yaml`` key is a ``TrainConfig`` field; non-overrides equal the default."""
+    defaults = asdict(TrainConfig())
+    assert key in defaults, f"{key!r} is not a TrainConfig field"
+    if key not in _TRAIN_PRODUCTION_OVERRIDES:
+        assert _TRAIN_YAML[key] == defaults[key]
+
+
+@pytest.mark.parametrize("key", sorted(_DATA_YAML))
+def test_data_base_yaml_matches_dataclass(key: str) -> None:
+    """Every ``data/base.yaml`` key equals its ``DataConfig`` default (train/eval are None)."""
+    defaults = asdict(DataConfig())
+    assert key in defaults, f"{key!r} is not a DataConfig field"
+    assert _DATA_YAML[key] == defaults[key]
+
+
+@pytest.mark.parametrize("key", sorted(_MODEL_YAML))
+def test_model_base_yaml_has_no_typos(key: str) -> None:
+    """Every ``model/base.yaml`` key is a recognized HF ``OplmConfig`` field.
+
+    ``load_config`` now rejects unknown ``model.*`` keys at runtime, but this
+    guards the packaged default itself (which is merged in before any override).
+    The allowed set mirrors ``_reject_unknown_model_keys``: constructor params
+    plus ``to_dict()`` metadata (``num_labels`` is a constructor param backed by
+    ``id2label``, so it never appears in ``to_dict()``).
+    """
+    params = inspect.signature(OplmModelConfig.__init__).parameters
+    allowed = {
+        name
+        for name, p in params.items()
+        if name != "self" and p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)
+    }
+    allowed |= set(OplmModelConfig().to_dict())
+    assert key in allowed
+
+
+# --- torch.compile config fields -----------------------------------------------
+
+
+def test_compile_defaults() -> None:
+    """``compile`` is False and ``compile_mode`` is 'default' out of the box."""
+    cfg = TrainConfig(wandb_enabled=False)
+    assert cfg.compile is False
+    assert cfg.compile_mode == "default"
+
+
+@pytest.mark.parametrize("mode", ["default", "reduce-overhead", "max-autotune"])
+def test_compile_mode_valid(mode: str) -> None:
+    """Each recognized compile mode is accepted without error."""
+    cfg = TrainConfig(wandb_enabled=False, compile_mode=mode)
+    assert cfg.compile_mode == mode
+
+
+def test_compile_mode_invalid() -> None:
+    """An unrecognized compile_mode raises ValueError."""
+    with pytest.raises(ValueError, match="compile_mode"):
+        TrainConfig(wandb_enabled=False, compile_mode="turbo")
+
+
+# --- Phase-1 new knobs: defaults -------------------------------------------------
+
+
+def test_new_knob_defaults() -> None:
+    """Bare DataConfig()/TrainConfig() expose the new knobs with behavior-preserving defaults."""
+    dc = DataConfig()
+    assert dc.pad_to_multiple_of is None
+
+    tc = TrainConfig()
+    assert tc.compile_dynamic is True
+    assert tc.throughput_warmup_steps == 50
+    assert tc.peak_tflops is None
+
+
+# --- Phase-1 DataConfig.pad_to_multiple_of validation ---------------------------
+
+
+@pytest.mark.parametrize("bad_val", [0, -1])
+def test_pad_to_multiple_of_rejects_non_positive(bad_val: int) -> None:
+    """pad_to_multiple_of must be >= 1 (0 and negative raise ValueError)."""
+    with pytest.raises(ValueError, match="pad_to_multiple_of"):
+        DataConfig(pad_to_multiple_of=bad_val)
+
+
+def test_pad_to_multiple_of_rejects_bool() -> None:
+    """pad_to_multiple_of=True must raise even though bool is a subtype of int."""
+    with pytest.raises(ValueError, match="pad_to_multiple_of"):
+        DataConfig(pad_to_multiple_of=True)  # type: ignore[arg-type]
+
+
+# --- Phase-1 TrainConfig throughput/peak_tflops validation -----------------------
+
+
+def test_throughput_warmup_steps_rejects_negative() -> None:
+    """throughput_warmup_steps must be >= 0."""
+    with pytest.raises(ValueError, match="throughput_warmup_steps"):
+        TrainConfig(throughput_warmup_steps=-1)
+
+
+def test_peak_tflops_rejects_zero() -> None:
+    """peak_tflops=0 must raise ValueError."""
+    with pytest.raises(ValueError, match="peak_tflops"):
+        TrainConfig(peak_tflops=0.0)
+
+
+def test_peak_tflops_rejects_negative() -> None:
+    """peak_tflops must be > 0 when provided."""
+    with pytest.raises(ValueError, match="peak_tflops"):
+        TrainConfig(peak_tflops=-1.0)
+
+
+# --- Phase-1 cross-config divisibility (load_config) ----------------------------
+
+
+def test_pad_divisibility_raises_on_non_divisible(tmp_path: Path) -> None:
+    """pad_to_multiple_of=128 with max_position_embeddings=1000 (non-divisible) raises."""
+    config_path = _write_yaml(tmp_path, "data:\n  pad_to_multiple_of: 128\n")
+    with pytest.raises(ValueError, match="pad_to_multiple_of"):
+        load_config(["--config", config_path, "model.max_position_embeddings=1000"])
+
+
+def test_pad_divisibility_passes_on_divisible(tmp_path: Path) -> None:
+    """pad_to_multiple_of=128 with max_position_embeddings=1024 (divisible) loads cleanly."""
+    config_path = _write_yaml(tmp_path, "data:\n  pad_to_multiple_of: 128\n")
+    cfg = load_config(["--config", config_path, "model.max_position_embeddings=1024"])
+    assert cfg.data.pad_to_multiple_of == 128
+    assert cfg.model.max_position_embeddings == 1024
+
+
+# --- Phase-1/2 cadence + retention knobs (Task 1.2) -----------------------------
+
+
+def test_cadence_retention_knob_defaults() -> None:
+    """Bare TrainConfig() exposes the new cadence/retention knobs, all off/None by default."""
+    cfg = TrainConfig()
+    assert cfg.save_every_minutes is None
+    assert cfg.keep_every_n_steps is None
+    assert cfg.keep_every_n_hours is None
+    assert cfg.auto_resume is False
+    assert cfg.resume_data_position is True
+    assert cfg.dist_timeout_minutes == 15
+    assert cfg.remote_checkpoint_uri is None
+
+
+@pytest.mark.parametrize("bad_val", [0, -1])
+def test_save_every_minutes_rejects_non_positive(bad_val: int) -> None:
+    """save_every_minutes must be > 0 when set."""
+    with pytest.raises(ValueError, match="save_every_minutes"):
+        TrainConfig(save_every_minutes=bad_val)
+
+
+@pytest.mark.parametrize("bad_val", [0, -1])
+def test_keep_every_n_steps_rejects_non_positive(bad_val: int) -> None:
+    """keep_every_n_steps must be > 0 when set."""
+    with pytest.raises(ValueError, match="keep_every_n_steps"):
+        TrainConfig(keep_every_n_steps=bad_val)
+
+
+@pytest.mark.parametrize("bad_val", [0, -1.0])
+def test_keep_every_n_hours_rejects_non_positive(bad_val: float) -> None:
+    """keep_every_n_hours must be > 0 when set."""
+    with pytest.raises(ValueError, match="keep_every_n_hours"):
+        TrainConfig(keep_every_n_hours=bad_val)
+
+
+@pytest.mark.parametrize("bad_val", [0, -1])
+def test_dist_timeout_minutes_rejects_non_positive(bad_val: int) -> None:
+    """dist_timeout_minutes must be > 0."""
+    with pytest.raises(ValueError, match="dist_timeout_minutes"):
+        TrainConfig(dist_timeout_minutes=bad_val)
+
+
+def test_cadence_retention_knobs_accept_positive_values() -> None:
+    """Setting each knob to a valid positive value is accepted and round-trips."""
+    cfg = TrainConfig(
+        save_every_minutes=30,
+        keep_every_n_steps=1000,
+        keep_every_n_hours=6.0,
+        auto_resume=True,
+        resume_data_position=False,
+        dist_timeout_minutes=45,
+        remote_checkpoint_uri="s3://bucket/prefix",
+    )
+    assert cfg.save_every_minutes == 30
+    assert cfg.keep_every_n_steps == 1000
+    assert cfg.keep_every_n_hours == 6.0
+    assert cfg.auto_resume is True
+    assert cfg.resume_data_position is False
+    assert cfg.dist_timeout_minutes == 45
+    assert cfg.remote_checkpoint_uri == "s3://bucket/prefix"
+
+
+# --- Phase-5 train.parallelism validation ----------------------------------------
+
+
+def test_parallelism_defaults_to_ddp() -> None:
+    """``train.parallelism`` defaults to ``ddp`` so existing runs are unchanged."""
+    assert TrainConfig().parallelism == "ddp"
+
+
+@pytest.mark.parametrize("value", ["ddp", "hsdp"])
+def test_parallelism_accepts_supported_values(value: str) -> None:
+    """Both supported parallelism strategies are accepted."""
+    assert TrainConfig(parallelism=value).parallelism == value
+
+
+def test_parallelism_rejects_unknown_value() -> None:
+    """An unrecognized parallelism strategy raises ValueError naming the field."""
+    with pytest.raises(ValueError, match="parallelism"):
+        TrainConfig(parallelism="fsdp")
+
+
+def test_parallelism_hsdp_rejects_fp16() -> None:
+    """``hsdp`` + ``fp16`` raises: the fp16 GradScaler is not shard-aware.
+
+    Under FSDP2 every gradient is a sharded ``DTensor``, and ``torch.amp.GradScaler``'s
+    ``unscale_``/inf-check runs per rank over local shards -- so ranks can disagree on
+    whether to skip a step, desynchronizing the run. bf16 (the default) needs no scaler.
+    """
+    with pytest.raises(ValueError, match="fp16"):
+        TrainConfig(parallelism="hsdp", mixed_precision="fp16")
+
+
+def test_parallelism_hsdp_rejects_the_stability_probe() -> None:
+    """``hsdp`` + the μP stability probe raises: the probe forward is main-process only.
+
+    Under FSDP2 that forward all-gathers sharded parameters, so running it on rank 0
+    alone would hang every other rank -- a deadlock, not a wrong number.
+    """
+    with pytest.raises(ValueError, match="stability_probe_every"):
+        TrainConfig(parallelism="hsdp", stability_diagnostics=True)
+
+
+def test_parallelism_hsdp_allows_grad_norm_only_diagnostics() -> None:
+    """``stability_probe_every=0`` keeps the collective-free grad-norm diagnostic usable."""
+    cfg = TrainConfig(parallelism="hsdp", stability_diagnostics=True, stability_probe_every=0)
+    assert cfg.stability_diagnostics is True
+
+
+def test_parallelism_hsdp_rejects_configured_eval() -> None:
+    """``hsdp`` + any eval dataset raises: in-loop eval deadlocks under FSDP2.
+
+    Eval tasks stripe their forwards across ranks, so ranks issue different numbers of
+    all-gathers and the group wedges (reproduced in review) -- a hang, which is far worse
+    than a clean refusal.
+    """
+    from oplm.config import OplmConfig, validate_parallelism_compat
+
+    cfg = OplmConfig(
+        train=TrainConfig(parallelism="hsdp"),
+        data=DataConfig(eval={"proteingym": "some/path.parquet"}),
+    )
+    with pytest.raises(ValueError, match="data.eval"):
+        validate_parallelism_compat(cfg)
+
+
+def test_parallelism_hsdp_without_eval_is_accepted() -> None:
+    """The guard is scoped to configured eval; a plain hsdp training config passes."""
+    from oplm.config import OplmConfig, validate_parallelism_compat
+
+    validate_parallelism_compat(
+        OplmConfig(train=TrainConfig(parallelism="hsdp"), data=DataConfig(eval=None))
+    )
+
+
+def test_parallelism_ddp_with_eval_is_accepted() -> None:
+    """The guard must not touch the default ddp path, which evaluates in-loop normally."""
+    from oplm.config import OplmConfig, validate_parallelism_compat
+
+    validate_parallelism_compat(
+        OplmConfig(
+            train=TrainConfig(parallelism="ddp"),
+            data=DataConfig(eval={"proteingym": "some/path.parquet"}),
+        )
+    )
+
+
+def test_parallelism_roundtrips_through_load_config(tmp_path: Path) -> None:
+    """``train.parallelism`` survives a serialize_config -> load_config round trip."""
+    cfg = load_config(["train.parallelism=hsdp"])
+    path = tmp_path / "run.yaml"
+    path.write_text(serialize_config(cfg))
+    assert load_config(["--config", str(path)]).train.parallelism == "hsdp"
+
+
+def test_cadence_retention_knobs_roundtrip_through_load_config(tmp_path: Path) -> None:
+    """The new knobs survive a serialize_config -> load_config round trip."""
+    cfg = load_config(
+        [
+            "train.save_every_minutes=30",
+            "train.keep_every_n_steps=1000",
+            "train.keep_every_n_hours=6.0",
+            "train.auto_resume=true",
+            "train.resume_data_position=false",
+            "train.dist_timeout_minutes=45",
+            "train.remote_checkpoint_uri=s3://bucket/prefix",
+        ]
+    )
+    path = tmp_path / "run.yaml"
+    path.write_text(serialize_config(cfg))
+    restored = load_config(["--config", str(path)])
+    assert restored.train.save_every_minutes == 30
+    assert restored.train.keep_every_n_steps == 1000
+    assert restored.train.keep_every_n_hours == 6.0
+    assert restored.train.auto_resume is True
+    assert restored.train.resume_data_position is False
+    assert restored.train.dist_timeout_minutes == 45
+    assert restored.train.remote_checkpoint_uri == "s3://bucket/prefix"
+
+
+def test_init_from_cli_yaml_roundtrip(tmp_path: Path) -> None:
+    cfg = load_config(["train.init_from=outputs/parent/checkpoint-2", "model.num_loops=2"])
+    assert TrainConfig().init_from is None
+    assert cfg.train.init_from == "outputs/parent/checkpoint-2"
+    path = tmp_path / "stage.yaml"
+    path.write_text(serialize_config(cfg))
+    restored = load_config(["--config", str(path)])
+    assert restored.train.init_from == cfg.train.init_from
+    assert restored.model.num_loops == 2
+
+
+# --- late-loss diagnostics / branching knobs -----------------------------------
+
+
+def test_branch_from_is_exclusive_with_resume_and_init() -> None:
+    with pytest.raises(ValueError, match="branch_from"):
+        TrainConfig(branch_from="ckpt", resume_from="ckpt")
+    with pytest.raises(ValueError, match="branch_from"):
+        TrainConfig(branch_from="ckpt", init_from="ckpt/hf")
+    assert TrainConfig(branch_from="ckpt").branch_from == "ckpt"
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, math.inf])
+def test_adamw_lr_mult_must_be_positive_and_finite(value: float) -> None:
+    with pytest.raises(ValueError, match="adamw_lr_mult"):
+        TrainConfig(adamw_lr_mult=value)
+
+
+def test_weight_diag_every_validation() -> None:
+    with pytest.raises(ValueError, match="weight_diag_every"):
+        TrainConfig(weight_diag_every=-1)
+    with pytest.raises(ValueError, match="weight_diag_every"):
+        TrainConfig(parallelism="hsdp", weight_diag_every=100)
+    assert TrainConfig(weight_diag_every=100).weight_diag_every == 100
+
+
+# --- fold block (Task 6) ---------------------------------------------------------
+
+
+def test_fold_block_defaults_to_none_and_parses_from_overrides(tmp_path: Path) -> None:
+    from oplm.config import FoldRunConfig, load_config, serialize_config
+
+    assert load_config([]).fold is None
+    cfg = load_config(["fold.crop_size=256", "fold.model.pair_width=128", "fold.diffusion_microbatch=4"])
+    assert isinstance(cfg.fold, FoldRunConfig)
+    assert cfg.fold.crop_size == 256 and cfg.fold.diffusion_microbatch == 4
+    assert cfg.fold.model == {"pair_width": 128}
+    assert cfg.fold.lm == "esmc:esmc_600m" and cfg.fold.loss_confidence == 1e-4
+    path = tmp_path / "run.yaml"
+    path.write_text(serialize_config(cfg))
+    assert "fold:" in path.read_text()
+    reloaded = load_config(["--config", str(path)])
+    assert reloaded.fold == cfg.fold
+
+
+def test_fold_block_validates_its_fields() -> None:
+    from oplm.config import FoldRunConfig
+
+    with pytest.raises(ValueError, match="crop_size"):
+        FoldRunConfig(crop_size=100)
+    with pytest.raises(ValueError, match="contiguous_prob"):
+        FoldRunConfig(contiguous_prob=1.5)
+    with pytest.raises(ValueError, match="diffusion_microbatch"):
+        FoldRunConfig(diffusion_microbatch=0)
+    with pytest.raises(ValueError, match="loss_"):
+        FoldRunConfig(loss_distogram=-1.0)
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="loss_confidence must be finite and >= 0"):
+            FoldRunConfig(loss_confidence=bad)
+    with pytest.raises(ValueError, match="lm"):
+        FoldRunConfig(lm="")
+
+
+# --- token mode (train.tokens_per_step / train.batch_tokens) ---------------------
+
+
+def test_token_mode_needs_both_fields() -> None:
+    with pytest.raises(ValueError, match="set together"):
+        TrainConfig(tokens_per_step=4096)
+    with pytest.raises(ValueError, match="set together"):
+        TrainConfig(batch_tokens=4096)
+
+
+def test_token_mode_rejects_non_positive_budgets() -> None:
+    with pytest.raises(ValueError, match="must be >= 1"):
+        TrainConfig(tokens_per_step=0, batch_tokens=4096)
+
+
+def test_token_mode_tokens_per_step_must_be_a_multiple_of_batch_tokens() -> None:
+    with pytest.raises(ValueError, match="multiple of train.batch_tokens"):
+        TrainConfig(tokens_per_step=6000, batch_tokens=4096)
+
+
+def test_token_mode_rejects_max_epochs() -> None:
+    with pytest.raises(ValueError, match="max_steps"):
+        TrainConfig(tokens_per_step=8192, batch_tokens=4096, max_epochs=1)
+
+
+def test_validate_token_batching(tmp_path: Path) -> None:
+    data = tmp_path / "unused.parquet"
+    ok = tiny_train_cfg(tmp_path, data, tokens_per_step=256, batch_tokens=256, pack_sequences=True)
+    validate_token_batching(ok)  # max_position_embeddings is 64 in tiny_train_cfg
+    validate_token_batching(tiny_train_cfg(tmp_path, data))  # sequence mode: nothing to check
+    bad_width = tiny_train_cfg(
+        tmp_path, data, tokens_per_step=400, batch_tokens=200, pack_sequences=True
+    )
+    with pytest.raises(ValueError, match="multiple of model.max_position_embeddings"):
+        validate_token_batching(bad_width)
+    unpacked = tiny_train_cfg(tmp_path, data, tokens_per_step=256, batch_tokens=256)
+    with pytest.raises(ValueError, match="data.pack_sequences"):
+        validate_token_batching(unpacked)
+
+
+def test_resolve_token_accumulation() -> None:
+    train = TrainConfig(tokens_per_step=4 * 8192, batch_tokens=8192)
+    assert resolve_token_accumulation(train, 1) == 4
+    assert resolve_token_accumulation(train, 2) == 2
+    assert resolve_token_accumulation(train, 4) == 1
+    for world_size in (3, 8):  # not a divisor; more capacity per step than the budget
+        with pytest.raises(ValueError, match="multiple of train.batch_tokens x world size"):
+            resolve_token_accumulation(train, world_size)
+
+
+def test_resolve_token_accumulation_accepts_saved_value_and_rejects_others() -> None:
+    # A token-mode run's saved config.yaml records the derived accumulation (2 at world size 2).
+    saved = TrainConfig(tokens_per_step=4 * 8192, batch_tokens=8192, gradient_accumulation_steps=2)
+    assert resolve_token_accumulation(saved, 2) == 2
+    with pytest.raises(ValueError, match="leave it at 1"):
+        resolve_token_accumulation(saved, 1)  # derived 4 here, so the saved 2 is stale

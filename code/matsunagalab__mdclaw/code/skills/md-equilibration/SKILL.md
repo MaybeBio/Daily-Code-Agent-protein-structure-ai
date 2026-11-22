@@ -1,0 +1,93 @@
+---
+name: md-equilibration
+description: "Standalone minimization plus equilibration of a prepared MD system using MDClaw CLI tools, including low-temperature NVT warmup, NVT heating, and optional NPT density. Creates min and eq DAG nodes and writes restart artifacts for production handoff."
+---
+
+# MD Equilibration
+
+You are a computational biophysics expert running MD equilibration using MDClaw CLI tools.
+
+Follow `skills/common/preamble.md`, `skills/common/run-loop.md` (the canonical
+node loop), `skills/common/solvent-regimes.md`, and
+`skills/common/tool-output.md` for error handling.
+
+## Step 0: Parse and Confirm
+
+Extract parameters from the user's request and present a summary.
+If the user specifies a duration in ns/ps/time units, do **not** convert it to
+steps yourself. Use `nvt_time_ns` / `npt_time_ns` in node conditions and
+`--nvt-time-ns` / `--npt-time-ns` when invoking `run_equilibration`. The tool
+will convert durations to steps using the actual `timestep_fs`.
+
+| Parameter | Value |
+|-----------|-------|
+| Target | (job directory) |
+| Execution mode | read `progress.json.params.execution_mode` |
+| Temperature | the requested value, else 300 K (default); production inherits it |
+| Pressure | 1.0 bar (default, explicit) / 0 (implicit) |
+| Other | (non-default parameters: seed, label, etc.) |
+
+## Prerequisites
+
+Follow `skills/common/run-loop.md` (inspect -> create -> explain -> run). Start
+with `inspect_job` to confirm a completed `topo` node, then create or reuse the
+`min`/`eq` node for this stage. The tools auto-resolve `system_xml_file`,
+`topology_pdb_file`, and `state_xml_file` from the `topo` ancestor; `eq` also
+auto-resolves the parent `min` node's `state`. If topology metadata contains
+ligand charge or clash diagnostics, record them for reporting, but do not choose
+a different equilibration protocol.
+
+## Workflow
+
+This skill operates on one `job_dir`. Reuse the same `topo` node and branch into
+multiple `eq` nodes when you need replicates or different conditions. If
+`progress.json.params.execution_mode` is unset, infer it from the request and
+persist it with `mdclaw update_workflow_state --params '{"execution_mode":"autonomous"}'`.
+
+1. Create the `min` and `eq` nodes (see Node Setup below).
+2. Read and follow `skills/md-equilibration/run-eq.md`, which owns the platform
+   preflight and the `run_minimization` / `run_equilibration` commands for both
+   explicit water and implicit solvent (implicit delta: NVT only,
+   `--pressure-bar 0`).
+3. Hand off (see Handoff below).
+
+The default `eq` keeps k=100 solute-heavy restraints through NVT and NPT, then
+transfers the end state to a restraint-free checkpoint without unrestrained MD.
+Use `multi-stage-eq.md` only for an explicit final-unrestrained-NPT request.
+
+## Node Setup
+
+Create nodes first; the regime page runs the tools with `--job-dir` /
+`--node-id`. `--conditions` is one quoted JSON string.
+
+```bash
+mdclaw create_node --job-dir <job_dir> --node-type min \
+  --label "minimized" \
+  --conditions '{"max_iterations": 5000,
+                 "restraint_atoms": "solute_heavy",
+                 "restraint_force_constant": 100.0}'
+
+mdclaw create_node --job-dir <job_dir> --node-type eq \
+  --label "300K" \
+  --conditions '{"temperature_kelvin": 300, "pressure_bar": 1.0,
+                 "nvt_time_ns": 1.0, "npt_time_ns": 1.0}'
+```
+
+For replicates or alternate conditions, branch a new `eq` node from the same
+`min` node with `--parent-node-ids <min_node_id>` and a distinct `--label` (and
+`random_seed` in `--conditions` when needed).
+
+## Handoff
+
+1. Verify the `min` and `eq` nodes are `completed` in `progress.json`.
+2. For requested playback, rotation, a still image, or a visual check,
+   follow `skills/common/visual-qa.md` for display selection and review scope.
+   If a requested review finds high severity, ask the user before production.
+3. Follow the stopping rule in `skills/common/run-loop.md`. If the current
+   request continues through production or beyond, invoke
+   `skills/md-production/SKILL.md` on this `job_dir`. Otherwise tell the user:
+   ```
+   Equilibration complete. Next:
+     Continue with skills/md-production/SKILL.md on this job_dir.
+     Shortcut, if available: /md-production <job_dir>
+   ```

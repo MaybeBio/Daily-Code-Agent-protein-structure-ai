@@ -1,0 +1,34 @@
+# DeepSeek V4 Flash on Together.ai.
+#
+# Together exposes an OpenAI-compatible /v1/chat/completions endpoint, so the
+# standard `openai_chat` provider works unchanged. The model's 1,048,576-token
+# window covers every prompt in the benchmark, so no --max-input-tokens filter
+# is needed and coverage is complete.
+#
+#   source ~/.config/pdbthink/env      # exports TOGETHER_API_KEY
+#   structural-reasoning evaluate --dataset datasets/smoke \
+#       --model-config configs/models/together_deepseek_v4_flash.yaml \
+#       --output runs/deepseek-v4-flash --resume
+# The timeout is scaled to the output budget rather than left at a default. At
+# 32,768 tokens and the concurrency below, a 900-second limit cuts responses off
+# mid-write -- and the runner records that as a network error rather than
+# truncation, so the render silently leaves the run. Ninety-seven of Gemma's 253
+# renders were lost that way before this was raised.
+model_id: deepseek-ai/DeepSeek-V4-Flash-0731
+provider: openai_chat
+base_url: https://api.together.ai/v1
+api_key_env: TOGETHER_API_KEY
+# This is a reasoning model and these are long, arithmetic-heavy prompts. At
+# 8,192 output tokens it spent the whole budget on the reasoning trace and
+# returned empty content for half the set; at 32,768 a quarter of the set still
+# truncated, concentrated in the set-valued families (I01, S06, N01) where the
+# answer requires checking many residue pairs. Truncation scores zero, so an
+# output budget that is too small is indistinguishable from a model that cannot
+# do the task -- check the truncation count before believing a score.
+max_output_tokens: 65536
+temperature: 0.0
+completions: 1
+concurrency: 24
+request_timeout: 1920
+max_retries: 1
+label: deepseek-v4-flash

@@ -1,0 +1,357 @@
+name: CI smoke
+
+# Bounded native scientific and bound-viewer contract tiers for main development.
+# The job budget includes environment/toolchain setup, native build, both pytest
+# tiers and cleanup. Keep the selected scientific guards when adjusting budget.
+
+on:
+  push:
+    branches:
+      - "main"
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.rst'
+      - '**/*.ipynb'
+      - 'docs/**'
+      - 'paper/**'
+      - 'examples/**'
+      - 'logos/**'
+  pull_request:
+    branches:
+      - "main"
+    paths-ignore:
+      - '**/*.md'
+      - '**/*.rst'
+      - '**/*.ipynb'
+      - 'docs/**'
+      - 'paper/**'
+      - 'examples/**'
+      - 'logos/**'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: Smoke test — ${{ matrix.cfg.os }}, Python ${{ matrix.cfg.python-version }}
+    if: >
+      !(
+        (github.event_name == 'push' && contains(github.event.head_commit.message, '[skip ci]'))
+        ||
+        (github.event_name == 'pull_request' && contains(github.event.pull_request.title, '[skip ci]'))
+        ||
+        (github.event_name == 'pull_request' && contains(github.event.pull_request.head.ref, 'skip-ci'))
+      )
+    runs-on: ${{ matrix.cfg.os }}
+    timeout-minutes: 45
+    concurrency:
+      group: ci-smoke-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        cfg:
+          - { os: ubuntu-latest, python-version: "3.14" }
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Additional info about the build
+        shell: bash
+        run: uname -a
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.cfg.python-version }}
+
+      - name: Setup conda env
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-file: devtools/conda-envs/test_env.yaml
+          environment-name: test
+          condarc: |
+            channels:
+              - uibcdf
+              - conda-forge
+              - ambermd
+            channel_priority: strict
+            # Temporary runtime fence; removal requires #402 qualification.
+            pinned_packages:
+              - mkl<2026.2
+          create-args: >-
+            python=${{ matrix.cfg.python-version }}
+
+      - name: Select the pinned minimal Rust toolchain
+        shell: bash -l {0}
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustc +1.97.1 --version
+
+      - name: Install package
+        shell: bash -l {0}
+        env:
+          RUSTUP_TOOLCHAIN: 1.97.1
+        run: |
+          set -euo pipefail
+          python -m pip install --no-deps \
+            -r devtools/controlled_sources.txt \
+            git+https://github.com/uibcdf/molsysviewer@5164f13bb503625dbe65f3b657ab5260feadcb65
+          python -m pip install --editable . --no-deps
+
+      - name: Validate controlled dependency versions
+        shell: bash -l {0}
+        run: python devtools/scripts/validate_controlled_dependencies.py
+
+      - name: Validate bound addon test command
+        shell: bash -l {0}
+        run: python -m pytest --receptor=ci devtools/tests/test_smoke_addon_test_command.py devtools/tests/test_molsysviewer_tools_api_inventory.py devtools/tests/test_native_viewer_integration.py
+
+      - name: Test import
+        shell: bash -l {0}
+        run: |
+          cd
+          python -c "from argdigest import Domain, UnknownArgumentError"
+          python -c "import molsysmt; print('Version:', molsysmt.__version__)"
+
+      - name: Validate public API stability against parent
+        shell: bash -l {0}
+        run: |
+          if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            python devtools/scripts/validate_public_api_stability.py --base HEAD~1
+          fi
+
+      - name: Validate docstrings bidirectionally
+        shell: bash -l {0}
+        run: python devtools/scripts/validate_docstrings.py
+
+      - name: Validate form contracts
+        shell: bash -l {0}
+        run: python devtools/scripts/validate_form_adapters.py
+
+      - name: Enforce the Rust-only runtime
+        shell: bash -l {0}
+        run: python devtools/scripts/audit_numba_surface.py --require-zero
+
+      - name: Run test suite
+        shell: bash -l {0}
+        run: |
+          # Keep this bounded tier aligned with devtools/tests/run_tiers.sh smoke.
+          python -m pytest --receptor=ci -q \
+            tests/element/component/test_get_component_index.py \
+            tests/element/group/amino_acid/test_name_examples.py \
+            tests/element/group/test_reference_bond_map_validation.py \
+            tests/element/group/test_name_resolution.py \
+            tests/element/group/test_name_recognition.py \
+            tests/element/group/amino_acid/test_naming_atom_expectations.py \
+            tests/build/test_naming_preparation.py \
+            tests/build/build_peptide/test_naming_schemes.py \
+            tests/conversion_truth/test_group_naming_fidelity.py \
+            tests/build/get_non_standard_residues/test_naming_schemes.py \
+            tests/native/test_missing_group_type_inference.py \
+            tests/basic/convert/test_source_naming_scheme.py \
+            tests/topology/get_sequence_identity/test_naming_schemes.py \
+            tests/form/molsysmt_Topology/test_sequence_name_schemes.py \
+            tests/topology/get_covalent_blocks/test_get_covalent_blocks_from_molsysmt_MolSys.py \
+            tests/pbc/get_lengths_and_angles_from_box/test_get_lengths_and_angles_from_box.py \
+            tests/structure/get_rmsd/test_get_rmsd_from_molsysmt_MolSys.py \
+            tests/structure/test_distance_family_contract.py \
+            tests/form/string_amino_acids_3/test_biopython_codec.py \
+            tests/structure/principal_component_analysis/test_weighted_contract.py \
+            tests/structure/center/test_center_contract.py \
+            tests/documentation/test_center_examples.py \
+            tests/structure/move_away/test_move_away_contract.py \
+            tests/structure/flip/test_reflection_contract.py \
+            tests/structure/get_center/test_get_center_extended.py::test_empty_atom_population_raises_argument_error_before_group_dispatch \
+            tests/documentation/test_move_away_examples.py \
+            tests/structure/align/test_sequence_alignment_contract.py \
+            tests/documentation/test_sequence_alignment_examples.py \
+            tests/basic/test_file_copy.py \
+            tests/basic/test_file_copy_lifecycle.py \
+            tests/form/test_raw_file_copy.py \
+            tests/physchem/test_property_selection_contract.py \
+            tests/physchem/get_hydrogen_inventory/test_inventory.py \
+            tests/physchem/test_get_chemical_readiness.py \
+            tests/physchem/test_get_aromatic_rings.py \
+            tests/physchem/test_get_aromaticity.py \
+            tests/physchem/test_get_charge_centers.py \
+            tests/physchem/test_get_hydrophobic_sites.py \
+            tests/physchem/test_get_halogen_bond_sites.py \
+            tests/physchem/test_get_bulkiness.py \
+            tests/physchem/test_get_tpsa.py \
+            tests/physchem/test_get_lipophilicity.py \
+            tests/physchem/test_descriptor_contributions.py \
+            tests/physchem/test_get_autodock_atom_types.py \
+            tests/physchem/test_get_cip_stereochemistry.py \
+            tests/physchem/test_get_partial_charges.py \
+            tests/physchem/test_get_water_sites.py \
+            tests/physchem/test_get_metal_coordination_sites.py \
+            tests/physchem/test_chemical_template.py \
+            tests/physchem/test_chemical_template_connectivity.py \
+            tests/physchem/test_chemical_template_selection.py \
+            tests/physchem/test_chemical_template_context.py \
+            tests/physchem/test_chemical_template_stereochemistry.py \
+            tests/physchem/test_get_peptide_chemical_template.py \
+            tests/physchem/test_normalize_aromatic_bond_orders.py \
+            tests/build/test_get_residue_chemical_coverage.py \
+            tests/build/test_get_covalent_bond_candidates.py \
+            tests/build/test_get_peptide_bond_candidates.py \
+            tests/build/get_missing_heavy_atoms/ \
+            tests/build/get_missing_terminal_cappings/ \
+            tests/build/get_non_standard_residues/ \
+            tests/build/get_missing_bonds/ \
+            tests/interactions/disulfides/ \
+            tests/interactions/ionic/ \
+            tests/interactions/hydrophobic/ \
+            tests/interactions/halogen_bonds/ \
+            tests/interactions/metal_coordination/ \
+            tests/interactions/pi_pi/ \
+            tests/interactions/cation_pi/ \
+            tests/interactions/test_aromatic_reference_selections.py \
+            tests/interactions/water_bridges/ \
+            tests/interactions/hbonds/test_get_hbond_sites.py \
+            tests/interactions/hbonds/test_site_structure_scope.py \
+            tests/basic/test_structure_index_types.py \
+            tests/interactions/hbonds/test_get_hbond_site_directions.py \
+            tests/interactions/hbonds/test_donor_pair_integrity.py \
+            tests/interactions/hbonds/test_precomputed_donors.py \
+            tests/_private/argdigest/test_hbond_ion_digesters.py \
+            tests/_private/argdigest/test_layout_selection_digesters.py \
+            tests/interactions/hbonds/test_role_rule_ownership.py \
+            tests/interactions/hbonds/test_role_rule_syntax.py \
+            tests/interactions/hbonds/test_attributed_hbonds.py \
+            tests/interactions/hbonds/test_buch_results.py \
+            tests/interactions/hbonds/test_luzard_chandler_results.py \
+            tests/form/molsysmt_Topology/test_atom_membership_order.py \
+            tests/form/molsysmt_Topology/test_mdtraj_missing_hierarchy.py \
+            tests/native/test_builder_inherited_molecules.py \
+            tests/native/test_builder_atom_extension.py \
+            tests/physchem/test_get_secondary_structure_propensity.py \
+            tests/physchem/test_reference_metadata_ownership.py \
+            tests/native/test_group_free_molecules.py \
+            tests/native/test_chemical_component_extraction.py \
+            tests/basic/convert/mult_to_one/test_convert_chemical_and_structural_domains.py \
+            tests/basic/append_structures/test_domain_atomicity.py \
+            tests/attribute \
+            tests/basic/get/test_piped_attributes.py::test_piped_get_requests_bonds_only_for_graph_attributes \
+            tests/basic/get/test_piped_attributes.py::test_foreign_selection_requests_bonds_only_for_graph_membership \
+            devtools/tests/test_benchmark_comparability.py \
+            devtools/tests/test_benchmark_comparison.py \
+            devtools/tests/test_benchmark_evidence.py \
+            devtools/tests/test_benchmark_geometry_semantics.py \
+            devtools/tests/test_benchmark_telemetry.py \
+            devtools/tests/test_benchmark_worker_lifecycle.py \
+            devtools/tests/test_validate_rust_wheel.py \
+            devtools/tests/test_license_build_contract.py \
+            devtools/tests/test_devguide_workflow.py \
+            devtools/tests/test_execute_scientific_evidence.py \
+            tests/form/molsysmt_ChemicalStatesDict/test_roundtrip.py::test_decoding_keeps_declared_object_columns_with_string_inference \
+            tests/topology/get_substructure_matches/test_reference_selections.py \
+            tests/chemical_states/test_graph_only_h5msm_preparation.py \
+            tests/form/file_pdbqt/test_known_source_poses.py::test_pose_reconstruction_does_not_read_source_trajectory \
+            tests/structure/test_dihedral_edit_contract.py
+
+
+      - name: Receive the bound MolSysViewer tools
+        shell: bash -l {0}
+        run: |
+          # This integration tier uses the exact host installed above. A missing
+          # receiver must fail before pytest can skip an optional-host module.
+          python -c "import inspect; from molsysviewer.system_edits import SystemEditsManager; from molsysviewer import AddonPanelWidget; assert hasattr(AddonPanelWidget, 'read_only_actions'); assert callable(SystemEditsManager.synchronize); assert 'rejection_check' in inspect.signature(SystemEditsManager.execute).parameters"
+          python -m pytest --receptor=ci \
+            tests/molsysviewer_molsysmt/test_read_tools.py \
+            tests/molsysviewer_molsysmt/test_navigation_tools.py \
+            tests/molsysviewer_molsysmt/test_water_box_tools.py \
+            tests/molsysviewer_molsysmt/test_system_panel.py \
+            tests/molsysviewer_molsysmt/test_geometry_panel.py \
+            tests/molsysviewer_molsysmt/test_external_reference_panel.py \
+            tests/molsysviewer_molsysmt/test_sequence_alignment_panel.py \
+            tests/molsysviewer_molsysmt/test_periodic_panel.py \
+            tests/molsysviewer_molsysmt/test_chemistry_panel.py \
+            tests/molsysviewer_molsysmt/test_chemistry_assessments_panel.py \
+            tests/molsysviewer_molsysmt/test_assessed_protonation_panel.py \
+            tests/molsysviewer_molsysmt/test_chemistry_preparation_panel.py \
+            tests/molsysviewer_molsysmt/test_construction_panel.py \
+            tests/molsysviewer_molsysmt/test_chemistry_repair_panel.py \
+            tests/molsysviewer_molsysmt/test_analysis_panel.py \
+            tests/molsysviewer_molsysmt/test_contacts_panel.py \
+            tests/molsysviewer_molsysmt/test_vector_angular_analysis_panel.py \
+            tests/molsysviewer_molsysmt/test_pca_analysis_panel.py \
+            tests/molsysviewer_molsysmt/test_property_analysis_panel.py \
+            tests/molsysviewer_molsysmt/test_secondary_structure_panel.py \
+            tests/molsysviewer_molsysmt/test_analysis_visual_adoption.py \
+            tests/molsysviewer_molsysmt/test_figure_observations.py \
+            tests/molsysviewer_molsysmt/test_mechanical_analysis_panel.py \
+            tests/molsysviewer_molsysmt/test_physical_model_panel.py \
+            tests/molsysviewer_molsysmt/test_interaction_analysis_panel.py \
+            tests/molsysviewer_molsysmt/test_minimization_panel.py \
+            tests/molsysviewer_molsysmt/test_scientific_session.py \
+            tests/molsysviewer_molsysmt/test_continuous_session.py \
+            tests/molsysviewer_molsysmt/test_jupyter_runtime_files.py \
+            tests/molsysviewer_molsysmt/test_jupyter_stage_diagnostics.py \
+            tests/molsysviewer_molsysmt/test_remove_tools.py \
+            tests/molsysviewer_molsysmt/test_set_tools.py \
+            tests/molsysviewer_molsysmt/test_conversion_tools.py \
+            tests/molsysviewer_molsysmt/test_predicate_tools.py \
+            tests/molsysviewer_molsysmt/test_identity_tools.py \
+            tests/molsysviewer_molsysmt/test_topology_tools.py \
+            tests/molsysviewer_molsysmt/test_topology_chemistry_tools.py \
+            tests/molsysviewer_molsysmt/test_structure_tools.py \
+            tests/molsysviewer_molsysmt/test_structure_comparison_tools.py \
+            tests/molsysviewer_molsysmt/test_structure_relations_tools.py \
+            tests/molsysviewer_molsysmt/test_structure_analysis_tools.py \
+            tests/molsysviewer_molsysmt/test_configuration_context_tools.py \
+            tests/molsysviewer_molsysmt/test_descriptor_dispositions_tools.py \
+            tests/molsysviewer_molsysmt/test_structure_transform_tools.py \
+            tests/molsysviewer_molsysmt/test_axis_angle_rotation_tools.py \
+            tests/molsysviewer_molsysmt/test_provider_admission_tools.py \
+            tests/molsysviewer_molsysmt/test_structure_fitting_tools.py \
+            tests/molsysviewer_molsysmt/test_structure_center_tools.py \
+            tests/molsysviewer_molsysmt/test_structure_move_away_tools.py \
+            tests/molsysviewer_molsysmt/test_structure_axes_tools.py \
+            tests/molsysviewer_molsysmt/test_structure_dihedral_tools.py \
+            tests/molsysviewer_molsysmt/test_pbc_tools.py \
+            tests/molsysviewer_molsysmt/test_pbc_edit_tools.py \
+            tests/molsysviewer_molsysmt/test_physchem_tools.py \
+            tests/molsysviewer_molsysmt/test_physchem_tables_tools.py \
+            tests/molsysviewer_molsysmt/test_sasa_tools.py \
+            tests/molsysviewer_molsysmt/test_chemical_audit_tools.py \
+            tests/molsysviewer_molsysmt/test_aromatic_tools.py \
+            tests/molsysviewer_molsysmt/test_feature_sites_tools.py \
+            tests/molsysviewer_molsysmt/test_reference_scales_tools.py \
+            tests/molsysviewer_molsysmt/test_tpsa_tools.py \
+            tests/molsysviewer_molsysmt/test_molecular_descriptors_tools.py \
+            tests/molsysviewer_molsysmt/test_chemical_assignment_readers_tools.py \
+            tests/molsysviewer_molsysmt/test_physchem_remainder_tools.py \
+            tests/molsysviewer_molsysmt/test_build_diagnostic_tools.py \
+            tests/molsysviewer_molsysmt/test_build_assignment_tools.py \
+            tests/molsysviewer_molsysmt/test_build_name_projection_tools.py \
+            tests/molsysviewer_molsysmt/test_molecular_mechanics_tools.py \
+            tests/molsysviewer_molsysmt/test_nonbonded_energy_tools.py \
+            tests/molsysviewer_molsysmt/test_minimization_tools.py \
+            tests/molsysviewer_molsysmt/test_build_independent_tools.py \
+            tests/molsysviewer_molsysmt/test_build_expansion_tools.py \
+            tests/molsysviewer_molsysmt/test_build_preparation_tools.py \
+            tests/molsysviewer_molsysmt/test_solvation_tools.py \
+            tests/molsysviewer_molsysmt/test_ion_tools.py \
+            tests/molsysviewer_molsysmt/test_protonation_tools.py \
+            tests/molsysviewer_molsysmt/test_native_receiving_583_584.py \
+            tests/molsysviewer_molsysmt/test_build_staging_tools.py \
+            tests/molsysviewer_molsysmt/test_build_sequence_tools.py \
+            tests/molsysviewer_molsysmt/test_build_bond_edit_tools.py \
+            tests/molsysviewer_molsysmt/test_build_alternate_tools.py \
+            tests/molsysviewer_molsysmt/test_naming_context_tools.py \
+            tests/molsysviewer_molsysmt/test_build_audit_tools.py \
+            tests/molsysviewer_molsysmt/test_hbond_site_tools.py \
+            tests/molsysviewer_molsysmt/test_interaction_detector_tools.py \
+            tests/molsysviewer_molsysmt/test_contact_detector_tools.py \
+            tests/molsysviewer_molsysmt/test_remaining_interaction_tools.py \
+            tests/molsysviewer_molsysmt/test_map_and_file_tools.py \
+            tests/molsysviewer_molsysmt/test_element_utilities.py \
+            tests/molsysviewer_molsysmt/test_element_hierarchy_tools.py \
+            tests/molsysviewer_molsysmt/test_element_domain_tools.py \
+            tests/molsysviewer_molsysmt/test_element_label_tools.py \
+            tests/molsysviewer_molsysmt/test_element_template_tools.py \
+            tests/molsysviewer_molsysmt/test_composition_tools.py \
+            tests/molsysviewer_molsysmt/test_supported_tools.py \
+            tests/molsysviewer_molsysmt/test_attribute_tools.py

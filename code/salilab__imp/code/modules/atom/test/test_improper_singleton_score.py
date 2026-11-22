@@ -1,0 +1,108 @@
+import IMP
+import IMP.test
+import IMP.atom
+try:
+    import jax
+except ImportError:
+    jax = None
+
+
+def make_dihedrals():
+    m = IMP.Model()
+    dihs = []
+    ps = []
+    for stiffness in (5.0, -3.0, 0.0):
+        p1 = IMP.Particle(m)
+        xyz1 = IMP.core.XYZ.setup_particle(p1, IMP.algebra.Vector3D(0,0,0))
+        p2 = IMP.Particle(m)
+        xyz2 = IMP.core.XYZ.setup_particle(p2, IMP.algebra.Vector3D(1,0,0))
+        p3 = IMP.Particle(m)
+        xyz3 = IMP.core.XYZ.setup_particle(p3, IMP.algebra.Vector3D(0,1,0))
+        p4 = IMP.Particle(m)
+        xyz4 = IMP.core.XYZ.setup_particle(p4, IMP.algebra.Vector3D(0,0,1))
+        d = IMP.Particle(m)
+        dih = IMP.atom.Dihedral.setup_particle(d, xyz1, xyz2, xyz3, xyz4)
+        dih.set_ideal(0.)
+        dih.set_multiplicity(1)
+        dih.set_stiffness(stiffness)
+        dihs.append(dih)
+        ps.append((p1, p2, p3, p4))
+    return m, ps, dihs
+
+
+class Tests(IMP.test.TestCase):
+
+    def test_score(self):
+        """Test score of ImproperSingletonScore"""
+        m, _, dih = make_dihedrals()
+        ss = IMP.atom.ImproperSingletonScore(IMP.core.Linear(0, 1))
+        self.assertAlmostEqual(ss.evaluate_index(m, dih[0], None), -4.77658,
+                               delta=0.01)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax(self):
+        """Test JAX implementation of ImproperSingletonScore"""
+        import IMP.jax
+        m, _, dih = make_dihedrals()
+        ss = IMP.atom.ImproperSingletonScore(IMP.core.Linear(0, 1))
+        lsc = IMP.container.ListSingletonContainer(m, dih)
+        r = IMP.container.SingletonsRestraint(ss, lsc)
+        imp_score = r.evaluate(False)
+        ji = r._get_jax(space=IMP.jax.FreeSpace)
+        jm = ji.get_jax_model()
+        j = jax.jit(ji.score_func)
+        jax_score = j(jm)
+        self.assertAlmostEqual(imp_score, -1.9106, delta=0.01)
+        self.assertAlmostEqual(imp_score, jax_score, delta=0.01)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_multi_attr(self):
+        """Test JAX ImproperSingletonScore, multiple attrsets"""
+        import IMP.jax
+        m, ps, dih = make_dihedrals()
+        ss = IMP.atom.ImproperSingletonScore(IMP.core.Linear(0, 1))
+        r = IMP.core.SingletonRestraint(m, ss, dih[0])
+        imp_score1 = r.evaluate(False)
+
+        # Second attrset
+        m.set_number_of_sphere_attribute_sets(2)
+        m.set_active_sphere_attribute_set(1)
+        IMP.core.XYZ.setup_particle(ps[0][0])
+        IMP.core.XYZ.setup_particle(ps[0][1])
+        IMP.core.XYZ.setup_particle(ps[0][2], (0.5, 0., 0.))
+        IMP.core.XYZ.setup_particle(ps[0][3], (0., 0.5, 0.))
+        imp_score2 = r.evaluate(False)
+
+        jax_score = r._evaluate_jax()
+        self.assertEqual(jax_score.shape, (2,))
+        self.assertAlmostEqual(jax_score[0], imp_score1, delta=1e-4)
+        self.assertAlmostEqual(jax_score[1], imp_score2, delta=1e-4)
+
+    @IMP.test.skipIf(jax is None, "No JAX support")
+    def test_jax_periodic(self):
+        """Test JAX ImproperSingletonScore with periodic boundaries"""
+        import IMP.jax
+        space = IMP.jax.PeriodicSpace([10., 10., 10.])
+        m = IMP.Model()
+        xyzs = [IMP.core.XYZ.setup_particle(IMP.Particle(m),
+                                            IMP.algebra.Vector3D(*c))
+                for c in ((9., 1., 0.), (9., 0., 0.), (10.5, 0., 0.),
+                          (10.5, 0.5, 0.8))]
+        dih = IMP.atom.Dihedral.setup_particle(IMP.Particle(m), *xyzs)
+        dih.set_ideal(0.5)
+        dih.set_multiplicity(1)
+        dih.set_stiffness(2.)
+        ss = IMP.atom.ImproperSingletonScore(IMP.core.Harmonic(0, 1))
+        r = IMP.core.SingletonRestraint(m, ss, dih)
+        imp_score = r.evaluate(False)
+        # Put each atom in the periodic cell, splitting the dihedral across
+        # the boundary; the score should not change
+        xyzs[2].set_coordinates(IMP.algebra.Vector3D(0.5, 0., 0.))
+        xyzs[3].set_coordinates(IMP.algebra.Vector3D(0.5, 0.5, 0.8))
+        ji = r._get_jax(space)
+        jax_score = jax.jit(ji.score_func)(ji.get_jax_model())
+        self.assertAlmostEqual(jax_score, imp_score, delta=1e-4)
+
+
+if __name__ == '__main__':
+    IMP.test.main()

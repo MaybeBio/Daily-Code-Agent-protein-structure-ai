@@ -1,0 +1,51 @@
+# Configuration file that stores all hooks that pre-commit runs
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: no-commit-to-branch  # disallow commiting to master / main directly
+        args: ['--branch', 'main', '--branch', 'master']
+        stages: [pre-commit]
+      - id: check-yaml  # check yaml files for parsable syntax
+        stages: [pre-push]
+      - id: check-toml  # checks toml files for parsable syntax
+        stages: [pre-push]
+      - id: check-json  # checks json files for parsable syntax
+        stages: [pre-push]
+      - id: check-added-large-files  # prevent large files from commit
+        stages: [pre-push]
+      - id: check-merge-conflict  # checks for merge conflict strings
+        stages: [pre-push]
+      - id: debug-statements  # checks for "breakpoint()" and debugger imports
+        stages: [pre-push]
+
+  # Python hooks
+  - repo: https://github.com/psf/black
+    rev: 22.6.0
+    hooks:
+      - id: black
+        stages: [pre-push]
+
+  - repo: https://github.com/pycqa/flake8
+    rev: 4.0.1
+    hooks:
+      - id: flake8
+        stages: [pre-push]
+
+  - repo: https://github.com/myint/autoflake
+    rev: v1.4
+    hooks:
+      - id: autoflake
+        stages: [pre-push]
+
+  # Regenerate include/torchani.h and interface/torchani.F90
+  - repo: local
+    hooks:
+      - id: generate-interfaces
+        name: generate C and Fortran interfaces
+        entry: python interface/generate.py
+        language: python
+        additional_dependencies: [jinja2, pyyaml]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit, pre-push]

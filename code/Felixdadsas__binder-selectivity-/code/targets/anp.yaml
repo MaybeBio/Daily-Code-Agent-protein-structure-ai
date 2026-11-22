@@ -1,0 +1,20 @@
+# 靶点：人 ANP(1-28)（心房利钠肽）
+# 目标：同一套设计流程换成 ANP，用来和 BNP 的结果对比，看选择性
+entities:
+  # 要设计的结合蛋白，和 BNP 那边同样固定 90 残基
+  - protein:
+      id: A
+      sequence: 90
+
+  # 靶点：人 ANP(1-28)，固定不变
+  # S L R R S S C F G G R M D R I G A Q S G L G C N S F R Y
+  # 1 2 3 4 5 6 7 8 9 10          15        20  23      28
+  - protein:
+      id: B
+      sequence: SLRRSSCFGGRMDRIGAQSGLGCNSFRY
+
+constraints:
+  # ANP 的 17 元环：Cys7 - Cys23 之间的二硫键
+  - bond:
+      atom1: [B, 7, SG]
+      atom2: [B, 23, SG]

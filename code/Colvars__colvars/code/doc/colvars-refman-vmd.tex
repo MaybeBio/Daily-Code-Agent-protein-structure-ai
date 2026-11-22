@@ -1,0 +1,43 @@
+% This file is part of the Collective Variables module (Colvars).
+% The original version of Colvars and its updates are located at:
+% https://github.com/Colvars/colvars
+% Please update all Colvars source files before making any changes.
+% If you wish to distribute your changes, please submit them to the
+% Colvars repository at GitHub.
+
+
+\newcommand{\MDENGINE}{VMD}
+\newcommand{\mdengine}{vmd}
+
+% macros to identify which program
+\newcommand{\cvnamdonly}[1]{}
+\newcommand{\cvvmdonly}[1]{#1}
+\newcommand{\cvlammpsonly}[1]{}
+\newcommand{\cvgromacsonly}[1]{}
+\newcommand{\cvtinkerhponly}[1]{}
+
+\newcommand{\lengthunit}{\textit{length unit}}
+\newcommand{\energyunit}{\textit{energy unit}}
+
+% only in programs were scripting is available
+\newcommand{\cvscriptonly}[1]{#1}
+
+% File containining the (auto-generated) Tcl interface reference doc
+\newcommand{\cvscripttclref}{cvscript-tcl.tex}
+
+% only in programs were Lepton is available
+\newcommand{\cvleptononly}[1]{#1}
+
+% content that applies only to programs that use atom names (i.e. not LAMMPS)
+\newcommand{\cvnamebasedonly}[1]{#1}
+
+% only in programs were the alchemical coordinate (alchLambda) is available
+\newcommand{\cvalchlambdaonly}[1]{}
+
+% File output prefixes
+\newcommand{\outputName}{\emph{outputName}}
+\newcommand{\restartName}{\emph{restartName}}
+\newcommand{\inputName}{\emph{inputName}}
+
+
+\input{colvars-refman.tex}

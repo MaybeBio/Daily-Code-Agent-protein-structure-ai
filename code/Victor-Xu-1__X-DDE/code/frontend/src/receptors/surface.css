@@ -1,0 +1,98 @@
+.surface-region-choices,
+.surface-region-preview {
+  min-width: 0;
+}
+.surface-region-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.surface-region-toolbar > .field {
+  flex: 1;
+}
+.surface-selected,
+.surface-context-chains {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.surface-selected {
+  margin: 12px 0;
+  min-height: 36px;
+  align-items: center;
+}
+.surface-selected button {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--ink);
+  padding: 6px 10px;
+}
+.surface-area-bar {
+  height: 7px;
+  background: #e5ecf5;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.surface-area-bar span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #5586df, #41b9af);
+}
+@media (max-width: 600px) {
+  .surface-region-toolbar {
+    align-items: flex-end;
+  }
+}
+
+.surface-results .research-table :is(th, td) {
+  padding: 8px 6px;
+}
+.surface-results .research-table thead th {
+  white-space: normal;
+  overflow-wrap: normal;
+}
+.surface-results .research-table-toolbar {
+  padding-block: 8px;
+}
+.surface-results .result-search {
+  flex-basis: 100%;
+  max-width: none;
+}
+.surface-results .column-sort,
+.surface-results .column-header-content {
+  gap: 3px;
+}
+.surface-area-column {
+  display: inline-grid;
+  gap: 2px;
+  white-space: nowrap;
+}
+.surface-area-column small {
+  font-weight: normal;
+}
+
+.surface-detail-tabs {
+  display: flex;
+  gap: 8px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 10px;
+}
+.surface-detail-tabs button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  padding: 8px 14px;
+  font: inherit;
+  font-size: 13px;
+}
+.surface-detail-tabs button[aria-selected="true"] {
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.surface-detail-tabs button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

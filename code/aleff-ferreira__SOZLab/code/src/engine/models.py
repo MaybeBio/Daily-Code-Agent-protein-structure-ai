@@ -1,0 +1,636 @@
+"""Data models for SOZLab project and analysis configuration."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class SelectionSpec:
+    label: str
+    display_label: Optional[str] = None
+    selection: Optional[str] = None
+    atom_indices: Optional[List[int]] = None
+    pdb_serials: Optional[List[int]] = None
+    resid: Optional[int] = None
+    resname: Optional[str] = None
+    atomname: Optional[str] = None
+    segid: Optional[str] = None
+    chain: Optional[str] = None
+    expect_count: Optional[int] = None
+    require_unique: bool = False
+    updating: bool = False  # re-evaluate geometric selections (around, sphzone, ...) every frame
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "label": self.label,
+            "display_label": self.display_label,
+            "selection": self.selection,
+            "atom_indices": self.atom_indices,
+            "pdb_serials": self.pdb_serials,
+            "resid": self.resid,
+            "resname": self.resname,
+            "atomname": self.atomname,
+            "segid": self.segid,
+            "chain": self.chain,
+            "expect_count": self.expect_count,
+            "require_unique": self.require_unique,
+            "updating": self.updating,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SelectionSpec":
+        return cls(
+            label=data.get("label", "selection"),
+            display_label=data.get("display_label"),
+            selection=data.get("selection"),
+            atom_indices=data.get("atom_indices"),
+            pdb_serials=data.get("pdb_serials"),
+            resid=data.get("resid"),
+            resname=data.get("resname"),
+            atomname=data.get("atomname"),
+            segid=data.get("segid"),
+            chain=data.get("chain"),
+            expect_count=data.get("expect_count"),
+            require_unique=bool(data.get("require_unique", False)),
+            updating=bool(data.get("updating", False)),
+        )
+
+
+
+@dataclass
+class ProbeConfig:
+    """Probe definition for solvent positioning."""
+    selection: str = "name O OW OH2"
+    position: str = "atom"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "selection": self.selection,
+            "position": self.position,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ProbeConfig":
+        return cls(
+            selection=str(data.get("selection", "")),
+            position=str(data.get("position", "atom")),
+        )
+
+
+@dataclass
+class SolventConfig:
+    solvent_label: str = "Water"
+    water_resnames: List[str] = field(default_factory=lambda: ["SOL", "WAT", "TIP3", "HOH"])
+    water_oxygen_names: List[str] = field(default_factory=lambda: ["O", "OW", "OH2"])
+    water_hydrogen_names: List[str] = field(default_factory=lambda: ["H1", "H2", "HW1", "HW2"])
+    ion_resnames: List[str] = field(default_factory=lambda: ["NA", "CL", "K", "CA", "MG"])
+    include_ions: bool = False
+    probe: ProbeConfig = field(default_factory=ProbeConfig)
+    probe_source: Optional[str] = field(default=None, repr=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "solvent_label": self.solvent_label,
+            "water_resnames": self.water_resnames,
+            "water_oxygen_names": self.water_oxygen_names,
+            "water_hydrogen_names": self.water_hydrogen_names,
+            "ion_resnames": self.ion_resnames,
+            "include_ions": self.include_ions,
+            "probe": self.probe.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SolventConfig":
+        resnames = data.get("solvent_resnames", data.get("water_resnames", ["SOL", "WAT", "TIP3", "HOH"]))
+        oxygen_names = list(data.get("water_oxygen_names", ["O", "OW", "OH2"]))
+
+        probe = None
+        probe_source = None
+        probe_data = data.get("probe")
+        if isinstance(probe_data, dict):
+            probe = ProbeConfig.from_dict(probe_data)
+            probe_source = "probe"
+        else:
+            selection = str(data.get("probe_selection", "") or "")
+            position = str(data.get("probe_position", "") or "")
+            if selection or position:
+                probe = ProbeConfig(selection=selection, position=position or "atom")
+                probe_source = "probe_fields"
+            elif oxygen_names:
+                selection = "name " + " ".join(oxygen_names)
+                probe = ProbeConfig(selection=selection, position="atom")
+                probe_source = "legacy_water_oxygen_names"
+            else:
+                probe = ProbeConfig()
+                probe_source = "default_probe"
+
+        cfg = cls(
+            solvent_label=str(data.get("solvent_label", "Water")),
+            water_resnames=list(resnames),
+            water_oxygen_names=oxygen_names,
+            water_hydrogen_names=list(data.get("water_hydrogen_names", ["H1", "H2", "HW1", "HW2"])),
+            ion_resnames=list(data.get("ion_resnames", ["NA", "CL", "K", "CA", "MG"])),
+            include_ions=bool(data.get("include_ions", False)),
+            probe=probe,
+        )
+        cfg.probe_source = probe_source
+        return cfg
+
+
+@dataclass
+class SOZNode:
+    """Logic tree node for a SOZ definition."""
+    type: str
+    params: Dict[str, Any] = field(default_factory=dict)
+    children: List["SOZNode"] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "type": self.type,
+            "params": self.params,
+            "children": [child.to_dict() for child in self.children],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SOZNode":
+        return cls(
+            type=data.get("type", "and"),
+            params=dict(data.get("params", {})),
+            children=[cls.from_dict(child) for child in data.get("children", [])],
+        )
+
+
+@dataclass
+class SOZDefinition:
+    name: str
+    description: str
+    root: SOZNode
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "root": self.root.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SOZDefinition":
+        return cls(
+            name=data.get("name", "SOZ"),
+            description=data.get("description", ""),
+            root=SOZNode.from_dict(data.get("root", {"type": "and", "children": []})),
+        )
+
+
+@dataclass
+class AnalysisOptions:
+    frame_start: int = 0
+    frame_stop: Optional[int] = None
+    stride: int = 1
+    gap_tolerance: int = 0
+    workers: Optional[int] = None
+    store_ids: bool = True
+    store_min_distances: bool = True
+    preview_frames: int = 200
+    # ---- added in 2.1 -------------------------------------------------------------
+    dt_override: Optional[float] = None  # ps per trajectory frame (formats without time stamps)
+    gap_tolerance_time: Optional[float] = None  # ps; overrides gap_tolerance, stride independent
+    uncertainty_blocks: int = 5
+    stride_sensitivity: bool = True
+    parallel_min_seconds: float = 10.0  # estimated serial time below which workers are not started
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "frame_start": self.frame_start,
+            "frame_stop": self.frame_stop,
+            "stride": self.stride,
+            "gap_tolerance": self.gap_tolerance,
+            "workers": self.workers,
+            "store_ids": self.store_ids,
+            "store_min_distances": self.store_min_distances,
+            "preview_frames": self.preview_frames,
+            "dt_override": self.dt_override,
+            "gap_tolerance_time": self.gap_tolerance_time,
+            "uncertainty_blocks": self.uncertainty_blocks,
+            "stride_sensitivity": self.stride_sensitivity,
+            "parallel_min_seconds": self.parallel_min_seconds,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AnalysisOptions":
+        return cls(
+            frame_start=int(data.get("frame_start", 0)),
+            frame_stop=data.get("frame_stop"),
+            stride=int(data.get("stride", 1)),
+            gap_tolerance=int(data.get("gap_tolerance", 0)),
+            workers=data.get("workers"),
+            store_ids=bool(data.get("store_ids", True)),
+            store_min_distances=bool(data.get("store_min_distances", True)),
+            preview_frames=int(data.get("preview_frames", 200)),
+            dt_override=None if data.get("dt_override") is None else float(data["dt_override"]),
+            gap_tolerance_time=None if data.get("gap_tolerance_time") is None else float(data["gap_tolerance_time"]),
+            uncertainty_blocks=int(data.get("uncertainty_blocks", 5)),
+            stride_sensitivity=bool(data.get("stride_sensitivity", True)),
+            parallel_min_seconds=float(data.get("parallel_min_seconds", 10.0)),
+        )
+
+
+@dataclass
+class HbondHydrationConfig:
+    name: str
+    residue_selection: str
+    distance: float = 3.0
+    angle: float = 150.0
+    unit: str = "A"
+    conditioning: str = "soz"
+    soz_name: Optional[str] = None
+    water_selection: Optional[str] = None
+    donors_selection: Optional[str] = None
+    hydrogens_selection: Optional[str] = None
+    acceptors_selection: Optional[str] = None
+    update_selections: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "residue_selection": self.residue_selection,
+            "distance": self.distance,
+            "angle": self.angle,
+            "unit": self.unit,
+            "conditioning": self.conditioning,
+            "soz_name": self.soz_name,
+            "water_selection": self.water_selection,
+            "donors_selection": self.donors_selection,
+            "hydrogens_selection": self.hydrogens_selection,
+            "acceptors_selection": self.acceptors_selection,
+            "update_selections": self.update_selections,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "HbondHydrationConfig":
+        return cls(
+            name=data.get("name", "hbond_hydration"),
+            residue_selection=data.get("residue_selection", "protein"),
+            distance=float(data.get("distance", data.get("d_a_cutoff", 3.0))),
+            angle=float(data.get("angle", data.get("d_h_a_angle", 150.0))),
+            unit=data.get("unit", "A"),
+            conditioning=data.get("conditioning", data.get("mode", "soz")),
+            soz_name=data.get("soz_name"),
+            donors_selection=data.get("donors_selection", data.get("donors_sel")),
+            hydrogens_selection=data.get("hydrogens_selection", data.get("hydrogens_sel")),
+            acceptors_selection=data.get("acceptors_selection", data.get("acceptors_sel")),
+            update_selections=bool(data.get("update_selections", True)),
+            water_selection=data.get("water_selection"),
+        )
+
+
+@dataclass
+class DensityMapConfig:
+    """Time-averaged solvent number-density map in a solute-fixed frame.
+
+    ``engine="solute"`` (default, algorithm 2) wraps solvent about the solute, superposes
+    every frame on a reference and accumulates counts on a grid defined by the solute, with
+    block-based uncertainty and bulk normalisation. ``engine="mdanalysis"`` reproduces the
+    v2.0.0 behaviour (``MDAnalysis.analysis.density.DensityAnalysis``) for comparison.
+    ``stride``/``frame_start``/``frame_stop`` of ``None`` inherit the analysis window.
+    """
+
+    name: str
+    species_selection: str
+    grid_spacing: float = 1.0
+    padding: float = 2.0  # legacy engine only
+    stride: Optional[int] = None
+    frame_start: Optional[int] = None
+    frame_stop: Optional[int] = None
+    align: bool = False
+    align_selection: Optional[str] = None
+    align_reference: str = "first_frame"
+    align_reference_path: Optional[str] = None
+    output_format: str = "dx"
+    view_mode: str = "physical"
+    conditioning_policy: str = "strict"
+    # ---- added in 2.1 -------------------------------------------------------------
+    engine: str = "solute"
+    region_selection: Optional[str] = None  # defaults to align_selection
+    region_padding: float = 12.0  # A beyond the region selection's extent
+    grid_center: Optional[List[float]] = None  # A; defaults to the reference solute centre
+    grid_size: Optional[List[float]] = None  # A edge lengths; overrides region/padding
+    bulk_density: Optional[float] = None  # A^-3 override
+    bulk_method: str = "auto"  # auto | box | far_field | user
+    far_field_distance: float = 8.0  # A from the region atoms
+    n_blocks: int = 5
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "species_selection": self.species_selection,
+            "grid_spacing": self.grid_spacing,
+            "padding": self.padding,
+            "stride": self.stride,
+            "frame_start": self.frame_start,
+            "frame_stop": self.frame_stop,
+            "align": self.align,
+            "align_selection": self.align_selection,
+            "align_reference": self.align_reference,
+            "align_reference_path": self.align_reference_path,
+            "output_format": self.output_format,
+            "view_mode": self.view_mode,
+            "conditioning_policy": self.conditioning_policy,
+            "engine": self.engine,
+            "region_selection": self.region_selection,
+            "region_padding": self.region_padding,
+            "grid_center": self.grid_center,
+            "grid_size": self.grid_size,
+            "bulk_density": self.bulk_density,
+            "bulk_method": self.bulk_method,
+            "far_field_distance": self.far_field_distance,
+            "n_blocks": self.n_blocks,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DensityMapConfig":
+        def _opt_float(key):
+            value = data.get(key)
+            return None if value is None else float(value)
+
+        stride = data.get("stride")
+        return cls(
+            name=data.get("name", "density_map"),
+            species_selection=data.get("species_selection", data.get("selection", "")),
+            grid_spacing=float(data.get("grid_spacing", data.get("delta", 1.0))),
+            padding=float(data.get("padding", 2.0)),
+            stride=None if stride is None else int(stride),
+            frame_start=data.get("frame_start"),
+            frame_stop=data.get("frame_stop"),
+            align=bool(data.get("align", False)),
+            align_selection=data.get("align_selection"),
+            align_reference=data.get("align_reference", "first_frame"),
+            align_reference_path=data.get("align_reference_path"),
+            output_format=data.get("output_format", "dx"),
+            view_mode=data.get("view_mode", "physical"),
+            conditioning_policy=data.get("conditioning_policy", "strict"),
+            engine=str(data.get("engine", "solute")),
+            region_selection=data.get("region_selection"),
+            region_padding=float(data.get("region_padding", 12.0)),
+            grid_center=None if data.get("grid_center") is None else [float(v) for v in data["grid_center"]],
+            grid_size=None if data.get("grid_size") is None else [float(v) for v in data["grid_size"]],
+            bulk_density=_opt_float("bulk_density"),
+            bulk_method=str(data.get("bulk_method", "auto")),
+            far_field_distance=float(data.get("far_field_distance", 8.0)),
+            n_blocks=int(data.get("n_blocks", 5)),
+        )
+
+    @property
+    def selection(self) -> str:
+        return self.species_selection
+
+    @selection.setter
+    def selection(self, value: str) -> None:
+        self.species_selection = value
+
+
+@dataclass
+class WaterDynamicsConfig:
+    name: str
+    region_mode: str = "soz"
+    soz_name: Optional[str] = None
+    region_selection: Optional[str] = None
+    region_cutoff: float = 3.5
+    region_unit: str = "A"
+    region_probe_mode: str = "probe"
+    residence_mode: str = "continuous"
+    hbond_distance: float = 3.0
+    hbond_angle: float = 150.0
+    solute_selection: Optional[str] = None
+    water_selection: Optional[str] = None
+    donors_selection: Optional[str] = None
+    acceptors_selection: Optional[str] = None
+    update_selections: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "region_mode": self.region_mode,
+            "soz_name": self.soz_name,
+            "region_selection": self.region_selection,
+            "region_cutoff": self.region_cutoff,
+            "region_unit": self.region_unit,
+            "region_probe_mode": self.region_probe_mode,
+            "residence_mode": self.residence_mode,
+            "hbond_distance": self.hbond_distance,
+            "hbond_angle": self.hbond_angle,
+            "solute_selection": self.solute_selection,
+            "water_selection": self.water_selection,
+            "donors_selection": self.donors_selection,
+            "acceptors_selection": self.acceptors_selection,
+            "update_selections": self.update_selections,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "WaterDynamicsConfig":
+        return cls(
+            name=data.get("name", "water_dynamics"),
+            region_mode=data.get("region_mode", data.get("mode", "soz")),
+            soz_name=data.get("soz_name"),
+            region_selection=data.get("region_selection"),
+            region_cutoff=float(data.get("region_cutoff", 3.5)),
+            region_unit=data.get("region_unit", "A"),
+            region_probe_mode=data.get("region_probe_mode", data.get("probe_mode", "probe")),
+            residence_mode=data.get("residence_mode", data.get("residence", "continuous")),
+            hbond_distance=float(data.get("hbond_distance", data.get("distance", 3.0))),
+            hbond_angle=float(data.get("hbond_angle", data.get("angle", 150.0))),
+            solute_selection=data.get("solute_selection"),
+            water_selection=data.get("water_selection"),
+            donors_selection=data.get("donors_selection"),
+            acceptors_selection=data.get("acceptors_selection"),
+            update_selections=bool(data.get("update_selections", True)),
+        )
+
+
+
+@dataclass
+class InputConfig:
+    topology: str
+    trajectory: Optional[str] = None
+    processed_trajectory: Optional[str] = None
+    preprocessing_notes: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "topology": self.topology,
+            "trajectory": self.trajectory,
+            "processed_trajectory": self.processed_trajectory,
+            "preprocessing_notes": self.preprocessing_notes,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "InputConfig":
+        return cls(
+            topology=data.get("topology", ""),
+            trajectory=data.get("trajectory"),
+            processed_trajectory=data.get("processed_trajectory"),
+            preprocessing_notes=data.get("preprocessing_notes"),
+        )
+
+
+@dataclass
+class OutputConfig:
+    output_dir: str
+    write_per_frame: bool = True
+    write_parquet: bool = False
+    report_format: str = "html"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "output_dir": self.output_dir,
+            "write_per_frame": self.write_per_frame,
+            "write_parquet": self.write_parquet,
+            "report_format": self.report_format,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "OutputConfig":
+        return cls(
+            output_dir=data.get("output_dir", "results"),
+            write_per_frame=bool(data.get("write_per_frame", True)),
+            write_parquet=bool(data.get("write_parquet", False)),
+            report_format=data.get("report_format", "html"),
+        )
+
+
+@dataclass
+class ExtractionConfig:
+    soz_name: Optional[str] = None
+    rule: str = "n_solvent>=1"
+    min_run_length: int = 1
+    gap_tolerance: int = 0
+    output_format: str = "xtc"
+    output_dir: str = "results/extracted"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "soz_name": self.soz_name,
+            "rule": self.rule,
+            "min_run_length": self.min_run_length,
+            "gap_tolerance": self.gap_tolerance,
+            "output_format": self.output_format,
+            "output_dir": self.output_dir,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ExtractionConfig":
+        return cls(
+            soz_name=data.get("soz_name"),
+            rule=data.get("rule", "n_solvent>=1"),
+            min_run_length=int(data.get("min_run_length", 1)),
+            gap_tolerance=int(data.get("gap_tolerance", 0)),
+            output_format=data.get("output_format", "xtc"),
+            output_dir=data.get("output_dir", "results/extracted"),
+        )
+
+
+@dataclass
+class ProjectConfig:
+    inputs: InputConfig
+    solvent: SolventConfig
+    selections: Dict[str, SelectionSpec]
+    sozs: List[SOZDefinition]
+    analysis: AnalysisOptions
+    outputs: OutputConfig
+    extraction: ExtractionConfig = field(default_factory=ExtractionConfig)
+    hbond_hydration: List[HbondHydrationConfig] = field(default_factory=list)
+    density_maps: List[DensityMapConfig] = field(default_factory=list)
+    water_dynamics: List[WaterDynamicsConfig] = field(default_factory=list)
+    version: str = "1.0"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "inputs": self.inputs.to_dict(),
+            "solvent": self.solvent.to_dict(),
+            "selections": {name: sel.to_dict() for name, sel in self.selections.items()},
+            "sozs": [soz.to_dict() for soz in self.sozs],
+            "analysis": self.analysis.to_dict(),
+            "outputs": self.outputs.to_dict(),
+            "extraction": self.extraction.to_dict(),
+            "hbond_hydration": [cfg.to_dict() for cfg in self.hbond_hydration],
+            "density_maps": [cfg.to_dict() for cfg in self.density_maps],
+            "water_dynamics": [cfg.to_dict() for cfg in self.water_dynamics],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ProjectConfig":
+        inputs = InputConfig.from_dict(data.get("inputs", {}))
+        solvent = SolventConfig.from_dict(data.get("solvent", {}))
+        selections_raw = data.get("selections", data.get("seeds", {})) or {}
+        selections = {name: SelectionSpec.from_dict(sel) for name, sel in selections_raw.items()}
+        sozs = [SOZDefinition.from_dict(item) for item in data.get("sozs", [])]
+        analysis = AnalysisOptions.from_dict(data.get("analysis", {}))
+        outputs = OutputConfig.from_dict(data.get("outputs", {}))
+        extraction = ExtractionConfig.from_dict(data.get("extraction", {}))
+        hbond_hydration = [
+            HbondHydrationConfig.from_dict(item) for item in data.get("hbond_hydration", [])
+        ]
+        density_maps = [DensityMapConfig.from_dict(item) for item in data.get("density_maps", [])]
+        water_dynamics = [
+            WaterDynamicsConfig.from_dict(item) for item in data.get("water_dynamics", [])
+        ]
+        return cls(
+            inputs=inputs,
+            solvent=solvent,
+            selections=_normalize_selection_labels(selections, sozs),
+            sozs=sozs,
+            analysis=analysis,
+            outputs=outputs,
+            extraction=extraction,
+            hbond_hydration=hbond_hydration,
+            density_maps=density_maps,
+            water_dynamics=water_dynamics,
+            version=data.get("version", "1.0"),
+        )
+
+
+
+def _normalize_selection_labels(
+    selections: Dict[str, SelectionSpec],
+    sozs: List[SOZDefinition],
+) -> Dict[str, SelectionSpec]:
+    mapping = {}
+    normalized = {}
+    for label, spec in selections.items():
+        new_label = label.replace("seed_", "selection_") if label.startswith("seed_") else label
+        mapping[label] = new_label
+        if new_label in normalized:
+            normalized[new_label] = spec
+        else:
+            spec.label = spec.label.replace("seed_", "selection_") if spec.label else new_label
+            normalized[new_label] = spec
+
+    if mapping:
+        for soz in sozs:
+            _rewrite_soz_labels(soz.root, mapping)
+    return normalized
+
+
+def _rewrite_soz_labels(node: SOZNode, mapping: Dict[str, str]) -> None:
+    if node.params:
+        seed_label = node.params.get("seed_label") or node.params.get("selection_label") or node.params.get("seed")
+        if seed_label in mapping:
+            node.params["selection_label"] = mapping[seed_label]
+            node.params.pop("seed_label", None)
+            node.params.pop("seed", None)
+    for child in node.children:
+        _rewrite_soz_labels(child, mapping)
+
+
+def default_project(topology: str, trajectory: Optional[str]) -> ProjectConfig:
+    return ProjectConfig(
+        inputs=InputConfig(topology=topology, trajectory=trajectory),
+        solvent=SolventConfig(),
+        selections={},
+        sozs=[],
+        analysis=AnalysisOptions(),
+        outputs=OutputConfig(output_dir="results"),
+        extraction=ExtractionConfig(),
+    )

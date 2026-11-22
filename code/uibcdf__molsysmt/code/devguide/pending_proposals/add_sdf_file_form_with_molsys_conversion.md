@@ -1,0 +1,417 @@
+---
+summary: Add SDF file form with MolSys conversion
+issue: uibcdf/molsysmt#215
+status: partial
+opened: 2026-09-22
+closed:
+verification: reproduced
+area: [form, convert]
+guard:
+normative:
+blocked_by: []
+supersedes: []
+---
+
+# Add SDF file form with MolSys conversion
+
+**Reported:** 2026-09-22, from the DockingMT ligand-interchange discussion and inspection of the form registry.
+**Status:** Partial. The maintainer brought this work forward on 2026-10-02.
+A native, experimental single-record adapter is implemented. Explicit optional
+RDKit stereo reading/writing and reusable accurate CIP analysis are available;
+broader real-ligand/stereochemical validation remains pending before closure.
+
+**Current extension, 2026-10-22:** blank legacy version markers and declared
+valence on integer covalent graphs are supported. Original 1IEP converts on the
+native route; original versionless 1S63 converts with explicitly selected stereo
+interpretation. See the dated checkpoint below for remaining limits.
+
+## What
+
+Add a file:sdf form with supported conversions in both directions with
+molsysmt.MolSys, initially for one molecular record. This establishes an
+ordinary MolSysMT file form for ligand exchange. The broader SDF metadata and
+multi-record design already appears in
+[chemical_metadata_preservation_sdf_mol2.md](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/pending_proposals/chemical_metadata_preservation_sdf_mol2.md);
+this proposal makes the smaller conversion deliverable explicit. Track the
+DockingMT consumer in uibcdf/dockingmt#3.
+
+## How
+
+- Register file:sdf in the form catalog with working public conversion routes
+  to and from MolSys. The accepted implementation direction is a native CTAB
+  reader/writer, with no RDKit runtime dependency. RDKit is an optional reference
+  for differential tests rather than an implicit parser fallback.
+- Define one-record semantics for molecular graph, atom and bond identity,
+  bond order and aromaticity, formal charge, stereochemistry, and coordinates
+  where the selected SDF variant represents them. Convert angstroms to
+  MolSysMT nanometers and keep native element IDs as strings. Declare only
+  attributes actually delivered by public getter or conversion routes.
+- State how one MolSys structure is chosen for output. Multiple structures
+  and multiple SDF records require an explicit, tested policy; until a
+  multi-record model is accepted, reject unsupported cases rather than silently
+  taking the first record or frame.
+- Detect SDF property blocks that MolSys cannot represent yet. Report their
+  loss clearly, including under strict conversion, rather than treating a
+  parsed graph as a complete round trip. The separate metadata proposal retains
+  ownership of a durable property-block and multi-molecule schema.
+
+## Why
+
+SDF is a common ligand interchange format, and MolSysMT's existing purpose
+includes converting file forms to its native molecular-system representation.
+The current form catalog has RDKit molecular forms and MOL2 files, but no
+file:sdf form. One shared conversion path lets DockingMT use the same MolSys
+input model for ligand data without owning general SDF parsing. This is an
+architectural judgement, not a measured performance claim.
+
+## What is measured and what is assumed
+
+**Inspected at filing:** molsysmt/form had no SDF adapter.
+[forms_and_conversions.md](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/forms_and_conversions.md) explicitly leaves
+property blocks and a multi-record SDF/MOL2 model to a separate schema
+decision. No round-trip fidelity or performance measurement existed at filing.
+
+**Implemented and contract-tested, 2026-10-02:** `file:sdf` is a registered Tier 3
+form with public native conversion, getter piping, explicit count getters and
+byte-preserving identity copies. The reusable CTAB syntax layer lives in
+`molsysmt/_private/ctfile.py`; native-domain assembly remains in the adapter.
+Reading retains every explicit hydrogen. V2000/V3000 ordinary covalent and
+explicit aromatic bonds, finite coordinates, formal charges, absolute isotopes,
+D/T, common-element mass differences and doublet/triplet radical counts are
+handled without chemical sanitization. Query rules, maps, valence overrides,
+stereo, Sgroups, singlet spin, unknown extensions and multiple records fail
+explicitly. The writer validates before opening the destination. SD properties
+are parsed, retained by identity copies, and rejected on native conversion unless
+the caller explicitly requests `discard_properties=True`; reports identify the
+loss and strict mode still rejects it.
+
+Evidence is in `tests/form/file_sdf/test_native_contract.py`: independent
+hand-written V2000/V3000 inputs, a bundled explicit-hydrogen molecule, an optional
+independent RDKit reader, malformed/unsupported inputs, source selections, empty
+records, non-default unit policy, existing-file preservation and a subprocess
+that blocks RDKit imports. These are bounded compatibility results, not a claim
+of complete RDKit parity or a measured speed advantage.
+
+**Implemented and contract-tested continuation, 2026-10-02:** V3000 coordination
+type 9 uses existing native dative relationships and donor/acceptor roles,
+preserving direction through native endpoint sorting and extraction. It does not
+join covalent components or fabricate a covalent order. Output needs V3000 and
+explicit roles. Reports cover separate numeric dative orders, component-joining
+overrides and source drawing-style loss; strict mode rejects detected losses.
+Documented inactive V3000 flags are accepted, while active, unknown or repeated
+fields still fail. No new chemistry store, parser fallback or runtime dependency
+was introduced.
+
+`tests/form/file_sdf/test_coordination.py` covers independent hand-written inputs,
+role remapping, source display options, ambiguous native roles, destination
+preservation, strict reports and an optional RDKit reader. A committed corpus
+contains 46 supported encodings of 17 synthetic molecular graphs covering
+aromatic/Kekule bonds, nitrogen heterocycles, fused rings, nitro, phosphate,
+sulfate, zwitterion, charged groups, isotopes and other ligand chemistry. The
+snapshot producer is RDKit 2025.09.5; `generate_sdf_reference_corpus.py` regenerates
+it without consulting the MolSysMT parser. Counts/net charges are independently
+specified. Tests run from the snapshot without RDKit and optionally compare
+source and native-written files with a live unsanitized reader. Three legitimate
+reference records with valence overrides are rejection tests, not counted as
+successful conversion coverage. This is not broad real-database validation.
+
+Validation checkpoint: the SDF/conversion-truth/report-audit selection passed
+392 tests; the final coordination follow-up passed 18 tests (overlapping that
+selection, not additive). The public SDF doctest passed. Ruff, form-adapter
+delivery, dependency, developer-guide and maintained course-structure checks
+passed. Only Markdown changed in the affected notebooks; their code and outputs
+were retained. No speed or memory benchmark was performed.
+
+**Inspected references:** BIOVIA's
+[CTFile Formats 2020](https://discover.3ds.com/sites/default/files/2020-08/biovia_ctfileformats_2020.pdf)
+defines field meanings and precedence. RDKit commit
+`a24ed4f06a4f73ef419e9b6347999d0abfbacabd` supplied a comparison of reader/writer
+and stereo-processing boundaries; its implementation was not copied. The
+reference supplier is explicitly configured with `removeHs=False`, and graph
+comparisons distinguish declared CTAB aromaticity from RDKit sanitization.
+
+**Pending:** A larger curated real-ligand and stereochemical corpus, enhanced
+stereo scope/policy, and independent reusable valence/hydrogen perception tools.
+The explicit optional stereo provider and reusable accurate CIP tool have since
+been implemented under uibcdf/molsysmt#299; see the checkpoint below. These tools belong to their general
+owners, not hidden inside the SDF adapter. Performance remains unbenchmarked.
+The parser is a format utility with no new scientific attribution boundary.
+
+**Shared-tool continuation, 2026-10-02:** The maintainer approved general
+chemical atom-type validation and explicit isotope normalization, tracked in
+uibcdf/molsysmt#296. Public wrappers live in `element.atom`; the SDF reader
+reuses their private explicit-symbol primitive. The read-only public conversion
+preflight in uibcdf/molsysmt#297 uses the existing audit core without writing
+the destination. Neither change enables stereo perception, atomic-number
+conversion, force-field typing or PDBQT parsing.
+
+The next stereo stage must distinguish relative CTAB wedge/parity from absolute
+CIP labels. RDKit's `finishMolProcessing` explicitly performs geometry/graph
+interpretation before assigning chemical stereo; copying CTAB integers into
+native R/S fields is not a faithful alternative. General graph ranking and
+valence/hydrogen interpretation belong to `physchem`, connectivity traversal to
+`topology`, and geometry to `structure`. The current corpus is intentionally
+achiral and cannot justify enabling native tetrahedral or E/Z perception.
+
+On 2026-10-03, uibcdf/molsysmt#299 supplies public read-only full-graph CIP
+analysis under `physchem`. Explicit `stereo_engine='rdkit'` enables supported
+SDF tetrahedral and double-bond reading/writing without changing the default
+native route. Source atom axes and explicit hydrogens remain intact; CTAB
+wedge/parity is interpreted rather than copied into R/S. Native bond storage
+retains cis/trans with reference atoms; absolute E/Z is queried independently.
+The verified writer rejects conflicting geometry before touching a destination.
+RDKit adapters share the accurate assignment primitive and work on copies.
+
+Focused fixtures cover L-alanine, L-cysteine, isotopic tie-breaking, E/Z,
+pseudoasymmetric full-graph ranking (RDKit's Salome Rieder example), both CTAB
+versions, empty selections, coordinate-unit conversion and real Ackredit credit.
+The existing 46-record corpus remains achiral. A diverse curated stereo source
+corpus and validation of explicitly out-of-scope encodings are still pending;
+this implementation does not claim native toolkit-independent universal CIP.
+
+**Assumed:** Single-record conversion is useful before the broader metadata
+and multi-record model is settled. Representative fixtures must establish
+which SDF features the first adapter supports faithfully.
+
+## What was refuted
+
+Treating rdkit.Mol support as equivalent to file:sdf support leaves no
+discoverable file form or direct MolSys file conversion contract. Claiming
+unqualified SDF round-trip fidelity would hide property-block and record
+boundary loss.
+
+## Scope and exclusions
+
+This issue covers the first file:sdf form and single-record conversions.
+Arbitrary property-block preservation, multi-molecule files, and a general
+record-to-MolSys schema remain in the existing broader proposal. DockingMT's
+ligand preparation and Vina protocol are outside this adapter. A string:sdf
+form may be proposed separately if a consumer needs it. This is new form
+coverage, not a prerequisite for the currently defined MolSysMT 1.0 contract;
+the maintainer explicitly scheduled this bounded implementation before 1.0.
+The wider metadata/multi-record schema remains deferred.
+
+## Acceptance criteria
+
+- The public form catalog recognizes .sdf files, and conversion works between
+  file:sdf and MolSys in both directions for documented one-record inputs.
+- Representative fixtures preserve supported graph, chemical attributes,
+  coordinates, units, and atom alignment through a MolSys round trip within
+  the format's precision. Tests cover selection and structure-index semantics
+  where meaningful.
+- Multiple records, multiple frames, and unsupported properties receive
+  explicit, tested behavior. No record or property is silently dropped while
+  reports or strict mode claim exhaustive preservation.
+- Capability declarations, instance-aware presence, optional dependency
+  behavior, docstrings, User Guide, Cookbook, and applicable course material
+  match the delivered subset.
+- The durable contract is incorporated into
+  [forms_and_conversions.md](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/forms_and_conversions.md) before closure.
+
+## Dependencies and risks
+
+Stereochemistry and aromaticity can change under parser normalization rules;
+fixtures and fidelity claims must distinguish source information from inferred
+chemistry. The deferred metadata proposal remains the owner of any broader
+SDF property and multi-record schema.
+
+## Real-input and preparation follow-up — 2026-10-03
+
+Consumer acceptance of the adapter is requested in uibcdf/dockingmt#33,
+against `eb0549b50`; reusable preparation remains separately owned. Follow
+[the maintained work sequence](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/roadmap.md#current-sdfpdbqt-and-chemical-preparation-sequence--2026-10-03)
+and the linked #214 validation matrix. Curate the pinned Vina 1IEP/1S63/5X72
+SDF inputs without rewriting unsupported flags to make tests pass. The 5X72
+pair supplies real stereo controls for explicit optional interpretation;
+1S63 requires separate handling of the additional prepared-reference H.
+Evaluate SD-property and stereo policy per file, preserve exact source
+checksums and distinguish input parsing from chemical sanitization, implicit-H
+inventory and preparation. Inputs outside the bounded profile need documented
+rejection or an owned extension, not a silent RDKit fallback. No new real-file
+test execution is claimed by this planning checkpoint.
+
+## Original Vina corpus checkpoint — 2026-10-03
+
+**Contract-tested and bounded reference comparison:** nine unmodified upstream
+files are committed under `tests/form/data/vina_examples`, with Apache licensing,
+upstream commit, SHA-256 and independent literal controls. Real SDF tests live in
+`tests/form/file_sdf/test_real_vina_examples.py`.
+
+- 5X72 P59/P69 retain 39 atoms and 42 bonds, coordinates and opposite R/S labels
+  at source atom index 7, using explicit `stereo_engine='rdkit'` and authorized
+  source-property loss. Both V2000 and V3000 output are checked independently.
+  Source bond IDs and Kekule encodings differ; equivalence is checked through
+  independent chemical normalization rather than raw bond-table equality.
+- 1IEP's declared atom valence (index 31) and 1S63's versionless counts line
+  remain unsupported native semantics, with deliberate rejection controls.
+  Independent RDKit accepts these sources; rejection is a bounded implementation
+  gap, not evidence that the files are malformed. Extend their semantics under
+  this issue before claiming their native conversion coverage.
+- Opaque unselected copies now preserve all four source records without semantic
+  decoding, including properties and unsupported fields. The discovered defect
+  and guard are recorded in
+  [the #302 resolution](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/archive/resolved_bugs/sdf_identity_copies_require_native_chemical_interpretation.md).
+
+The focused SDF/PDBQT/fragments/conversion-report regression passed 418 tests in
+104.48 seconds on Linux / Python 3.13.14, with NumPy 2.4.6, RDKit 2025.9.5,
+MDAnalysis 2.10.0 and Vina 1.2.7. The executable command and warnings are recorded
+in #302's local resolution; this is not a full-suite or preparation result.
+
+## Legacy-header and declared-valence extension — 2026-10-22
+
+**Implemented and contract-tested.** The original, hash-verified Vina sources
+are unchanged. A blank version field selects V2000 grammar; an unknown or
+truncated nonblank marker still fails. All ordinary field, terminator, query
+and stereo checks remain in force. 1S63 still needs `stereo_engine='rdkit'`
+because its chiral flag is active, not because its header requires a fallback.
+
+V2000 valence 1–14 and explicit zero (code 15), and V3000 `VAL=1`–`14` / `VAL=-1`,
+are decoded on integer covalent graphs. The sum of drawn bond orders includes
+indexed H bonds. Its remainder is stored as virtual `n_explicit_hydrogens`,
+with `n_implicit_hydrogens=0` and `allows_implicit_hydrogens=False`, in the existing
+ChemicalStates fields. No extra chemistry store, H atom or H coordinate is
+created. Undeclared atoms keep unknown counts. This reads a declaration; it does
+not certify chemically appropriate valence or choose a protonation state.
+
+The native writer re-encodes that combination through valence, including zero.
+Other H metadata combinations remain reported losses and strict conversion
+rejects them. The optional stereo reader verifies the declared H inventory;
+its writer restores explicit valence annotations that RDKit may omit when they
+match an element's default. Methane with four virtual H guards that boundary.
+
+The syntax/assembly split remains unchanged: CTAB decoding is private format
+machinery; ChemicalStates owns assignments, and the existing public
+`physchem.get_hydrogen_inventory` remains the reusable count inspection tool.
+Bond-order summation uses linear passes, without all-pairs storage or a nested
+atom/bond scan. No measured speed claim or compiled kernel is needed here.
+
+**References and attribution.** Interpretation follows
+[BIOVIA CTFile Formats 2020](https://discover.3ds.com/sites/default/files/2020-08/biovia_ctfileformats_2020.pdf),
+V2000 atom valence and V3000 VAL. RDKit FileParsers at source commit
+`cbfb37abddcd5b5feeac97d53530ae6be83cac0d` were inspected for legacy-header and
+valence interoperability; code was not copied. The native branch executes no
+RDKit. This is a format codec rather than a new scientific method/result
+attribution boundary, so a new Ackredit hook is not applicable. Explicit CIP
+calculation retains its existing optional Ackredit integration.
+
+**Remaining bounds.** Declared valence on aromatic/coordination bonds and valence
+smaller than drawn integer orders fail explicitly. The copper corpus record
+remains a rejection; methyl radical and zero-valence atomic oxygen now pass.
+Original 1IEP passes the dependency-free round trip, while an exploratory
+optional stereo round trip rejects a reconstruction mismatch before opening the
+destination: RDKit's 3D reconstruction introduces unlabelled chiral tags on
+nonstereogenic H-bearing sites. That path is not newly qualified. Multi-record
+semantics, durable SD properties, enhanced stereo and wider dialect coverage
+remain pending. #215 is still partial; no complete RDKit-equivalence claim is made.
+
+Primary guards: `tests/form/file_sdf/test_valence.py` and
+`tests/form/file_sdf/test_real_vina_examples.py`. The original source hashes,
+coordinates under a non-default unit policy, both output versions, virtual vs
+indexed H, zero/positive valence, malformed/conflicting fields, strict losses,
+H5MSM 0.5 persistence and extraction are checked. #181's existing docking profile
+now exercises 48 direct/public witness cases, including legacy and valence
+variants; its actual-loader isolation guard covers all of them.
+Source bytes are not rewritten to achieve coverage, and no optional toolkit is
+used as a silent parsing fallback. Broader native SDF coverage remains pending;
+the subsequent consumer evidence and stabilization review follow. This issue stays partial.
+
+## Frozen-profile stabilization — 2026-10-05
+
+S3 reruns native SDF, coordination, reference-corpus, stereo, real-Vina and
+structure-count controls at `fe0b813d7267f4c5a0728264094441e62c910e1b`, within
+the passing 1,094-case preparation/form selection. The
+[execution ledger](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/release_1_0_status.md#s3-preparationform-qualification--2026-10-05)
+and [artifact](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/preparation_profiles_20261005.json) retain
+commands, source/fixture hashes, environment and warnings. Optional independent
+RDKit comparisons execute; they do not establish universal chemical perception.
+
+The 1IEP valence and 1S63 versionless sources still exercise deliberate rejection,
+while opaque identity copies retain their bytes. 5X72 stereoisomers keep their
+distinct source-indexed assignments through explicit stereo-provider round trips.
+Published uibcdf/dockingmt#33 accepts the initial prepared-input/stereo slice;
+that historical evidence is inspected rather than rerun on this source. No source
+is rewritten and no new dialect or chemistry is admitted. Current conservative
+profiles are qualified for experimental inclusion; broader acceptance and parser
+coverage remain post-1.0 work and this issue remains partial.
+
+### Qualification of the legacy/valence extension
+
+The [source receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/sdf_legacy_valence_20261022.json) records
+the exact command, environment, executable-file SHA-256 values and scope. The
+final regression selection passed **751 tests**, zero failures/skips, in
+50.79 seconds on Linux / Python 3.14.7 with 12 workers and Pytest Receptor.
+Its 30 warnings comprise 21 legacy H5MSM notices, six MDAnalysis mass
+deprecations, two expected structural-drop notices and one optional binary-size
+warning already recorded under #237. No warning was suppressed to pass.
+
+The converter doctest passed (one example); the updated Module 01 notebook
+executed successfully in 17.3 seconds. Ruff check/format passed for all 13 changed
+Python files, all 96 form adapters passed delivery checks, the API stability
+guard found zero unauthorized signature changes, the docstring validator passed
+247 functions and all 14 fast release gates passed. No full/installed release
+matrix was started, and these results do not authorize a tag or publication.
+
+
+## Explicit stereo-writer correction — 2026-10-23
+
+The previously recorded 1IEP optional-writer refusal is resolved under
+uibcdf/molsysmt#436. Accurate CIP inventories and the isomeric graph remain
+verified; transient non-CIP marks inferred during 3D readback are handled on
+comparison copies only. Both V2000/V3000 preserve the original source chemistry,
+coordinates and atom-31 valence/H policy. Real 1S63 and 5X72 controls also pass,
+and deliberate stereo/isotope/H changes still protect the destination.
+The [resolution](https://github.com/uibcdf/molsysmt/blob/HEAD/devguide/archive/resolved_bugs/native_sdf_stereo_verification_rejects_inferred_noncip_tags.md)
+and [receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/sdf_stereo_verification_20261023.json) own the
+827-case source evidence. The receiving RDKit 2026.03.1 environment, wider SDF
+profile and consumer adoption remain separate; #215 stays partial.
+
+## PharmacophoreMT CID 6842999 classification — 2026-10-26
+
+**Executed / inspected:** the public import requested by PharmacophoreMT is
+reproduced with current MolSysMT source 312a73200f5c578ba758618ec42179edb0228221,
+Linux/Python 3.14.7 and RDKit 2025.9.5. A fresh single PubChem 3D SDF for CID
+6842999 contains 32 atoms and 33 bonds. Its 6036-byte SHA-256 is
+`6b3d53cbe6320fc1eda589001512d8fa118c06b5228157fdf2e704527c2ef60c`.
+This differs from the consumer's retained original
+`ab1522d3c2f63d38c939be63d9c00bc4288760347aaefcb0d28381312bace6a4`;
+these are independent acquisitions of the same CID, not identical input evidence.
+The current response is retained only in /tmp, without source-data redistribution.
+
+With explicit `discard_properties=True, stereo_engine='rdkit'`, the same
+parity-only guard rejects this acquisition. Source atom indices 6 (N) and 9 (C)
+carry parity flags 2 and 1 respectively. Direct RDKit strict, unsanitized parsing
+returns CHI_UNSPECIFIED for N and CHI_TETRAHEDRAL_CW for C. Sanitization and stereo
+assignment retain unspecified N and assign R to C. There are no wedge bond flags.
+The generic rejection text is therefore not evidence that all source coordinates
+are 2D or absent; one declared atom flag lacks an interpretation in this provider.
+
+**Classification:** bounded unsupported interpretation in the current profile,
+not an established incorrect chemical declaration or a proven new regression.
+The parser intentionally refuses to discard an uninterpreted source stereo flag.
+No supported current native import route preserving every source declaration is
+established by this study. Erasing parity flags, interpreting bare coordinates as
+permission to drop a declaration, or retrying silently without the provider is not
+a supported recovery. A future admission needs an explicit preserved declaration
+contract and independent stereo evidence, including potentially stereogenic N;
+this review does not declare the nitrogen intrinsically achiral.
+
+The existing guard
+`tests/form/file_sdf/test_stereochemistry.py::test_parity_only_without_interpretable_geometry_is_rejected`
+protects conservative refusal. #215 remains partial; this report does not expand
+the accepted SDF dialect, claim universal stereo perception or qualify a new
+installed package. The acquisition/import/provider observations are recorded in
+[the current-source receipt](https://github.com/uibcdf/molsysmt/blob/HEAD/devtools/data/sdf_cid6842999_review_20261026.json).
+
+## Supplemental acceptance review — 2026-11-17
+
+B0 retains #215 as **partial**. The original 1IEP valence and versionless 1S63
+limitations in the visible older consumer comment were addressed by the dated
+legacy/valence and stereo-writer receipts above; they must not be reported as
+current native rejections. Supported V2000/V3000 and explicit optional stereo
+remain bounded experimental profiles. Broader source-dialect/stereo coverage and
+receiving of the evolved profile remain outside completed acceptance. In
+particular CID 6842999 retains its original uninterpreted-parity refusal and
+uncertainty; B0 neither removes the declaration nor invents a supported fallback.
+The native REST returns two comments while service metadata reports nine, so
+this review does not prove that no other consumer return exists. No extra parser
+profile or biological preparation claim is admitted by the waiting-period review.

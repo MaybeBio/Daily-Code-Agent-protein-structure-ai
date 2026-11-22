@@ -1,0 +1,359 @@
+"""Original structure observations, independent of the current repaired graph."""
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
+
+from protrepair.errors import ModelInvariantError
+from protrepair.structure.constitution import ResidueSite, StructureConstitution
+from protrepair.structure.geometry import StructureGeometry
+from protrepair.structure.labels import AtomRef, ResidueId
+from protrepair.structure.source_connection import SourceAtomIdentity, SourceConnection
+from protrepair.structure.topology import (
+    BondProvenance,
+    BondRelationshipType,
+    StructureTopology,
+    TopologyBond,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class StructureObservation:
+    """Keep selected input facts in their original atom address space.
+
+    Parameters
+    ----------
+    constitution : StructureConstitution
+        Original selected atom identities, including observed H/D/T.
+    geometry : StructureGeometry
+        Original coordinates, retained even when current parents move.
+    topology : StructureTopology
+        Reported charges and source-explicit bonds only. Unreported orders are
+        None and unreported relationships are UNKNOWN, not template-filled
+        values. Missing H is not negative evidence.
+    excluded_coordination_connections : tuple[SourceConnection, ...]
+        Typed declarations to partners removed by source normalization. These
+        endpoints do not become atoms or bonds in the selected address space.
+
+    Raises
+    ------
+    ModelInvariantError
+        Facets are misaligned, topology contains inferred chemistry, or excluded
+        coordination evidence is untyped or lacks exactly one selected endpoint.
+    """
+
+    constitution: StructureConstitution
+    geometry: StructureGeometry
+    topology: StructureTopology
+    excluded_coordination_connections: tuple[SourceConnection, ...] = ()
+    _bonds_by_residue: Mapping[ResidueId, tuple[TopologyBond, ...]] = field(
+        init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if not self.geometry.is_aligned_to(self.constitution):
+            raise ModelInvariantError(
+                "observation geometry must match its constitution"
+            )
+        if not self.topology.is_aligned_to(self.constitution):
+            raise ModelInvariantError(
+                "observation topology must match its constitution"
+            )
+        for bond in self.topology.bonds:
+            reported_order = (
+                None
+                if bond.source_metadata is None
+                else bond.source_metadata.reported_order
+            )
+            reported_relationship = (
+                BondRelationshipType.UNKNOWN
+                if bond.source_metadata is None
+                else bond.source_metadata.reported_relationship_type
+            )
+            if (
+                bond.provenance is not BondProvenance.SOURCE_EXPLICIT
+                or bond.order != reported_order
+                or bond.relationship_type is not reported_relationship
+                or bond.aromatic
+            ):
+                raise ModelInvariantError(
+                    "observation bonds must contain only source declarations"
+                )
+
+        excluded_connections = tuple(
+            dict.fromkeys(self.excluded_coordination_connections)
+        )
+        for connection in excluded_connections:
+            if (
+                connection.source_metadata.reported_relationship_type
+                is not BondRelationshipType.METAL_COORDINATION
+            ):
+                raise ModelInvariantError(
+                    "excluded coordination evidence requires a typed declaration"
+                )
+            retained_count = sum(
+                endpoint.resolve_index(self.constitution, self.geometry) is not None
+                for endpoint in connection.endpoint_pair()
+            )
+            if retained_count != 1:
+                raise ModelInvariantError(
+                    "excluded coordination evidence requires one selected endpoint"
+                )
+        object.__setattr__(
+            self, "excluded_coordination_connections", excluded_connections
+        )
+
+        by_residue: dict[ResidueId, list[TopologyBond]] = {}
+        for bond in self.topology.bonds:
+            first = self.constitution.atom_ref_at(bond.atom_index_1).residue_id
+            second = self.constitution.atom_ref_at(bond.atom_index_2).residue_id
+            by_residue.setdefault(first, []).append(bond)
+            if second != first:
+                by_residue.setdefault(second, []).append(bond)
+        object.__setattr__(
+            self,
+            "_bonds_by_residue",
+            MappingProxyType(
+                {residue_id: tuple(bonds) for residue_id, bonds in by_residue.items()}
+            ),
+        )
+
+    @classmethod
+    def from_source_facets(
+        cls,
+        *,
+        constitution: StructureConstitution,
+        geometry: StructureGeometry,
+        topology: StructureTopology,
+        excluded_coordination_connections: tuple[SourceConnection, ...] = (),
+    ) -> "StructureObservation":
+        """Capture source facts before any chemistry-changing transformation.
+
+        Parameters
+        ----------
+        constitution : StructureConstitution
+            Selected source atom address space.
+        geometry : StructureGeometry
+            Geometry in that address space.
+        topology : StructureTopology
+            Ingress topology whose atom charges still describe input records.
+        excluded_coordination_connections : tuple[SourceConnection, ...]
+            Typed declarations incident to a retained metal whose other source
+            endpoint was encountered in a policy-excluded residue or chain.
+
+        Returns
+        -------
+        StructureObservation
+            Snapshot excluding model-resolved bonds and filled bond semantics.
+
+        Raises
+        ------
+        ModelInvariantError
+            The supplied facets do not share an address space.
+        """
+        if not topology.is_aligned_to(constitution):
+            raise ModelInvariantError(
+                "source topology must match observation constitution"
+            )
+        source_topology = StructureTopology(
+            constitution=constitution,
+            atom_topologies=topology.atom_topologies,
+            bonds=tuple(
+                replace(
+                    bond,
+                    order=(
+                        None
+                        if bond.source_metadata is None
+                        else bond.source_metadata.reported_order
+                    ),
+                    aromatic=False,
+                    relationship_type=(
+                        BondRelationshipType.UNKNOWN
+                        if bond.source_metadata is None
+                        else bond.source_metadata.reported_relationship_type
+                    ),
+                )
+                for bond in topology.bonds
+                if bond.provenance is BondProvenance.SOURCE_EXPLICIT
+            ),
+        )
+        return cls(
+            constitution=constitution,
+            geometry=geometry,
+            topology=source_topology,
+            excluded_coordination_connections=excluded_coordination_connections,
+        )
+
+    def coordination_connections(self) -> tuple[SourceConnection, ...]:
+        """Return retained and excluded typed source coordination declarations.
+
+        Returns
+        -------
+        tuple[SourceConnection, ...]
+            Original source identities and metadata, not current or inferred
+            chemistry. Conflicting off-graph declarations remain separate evidence.
+        """
+        retained_connections: list[SourceConnection] = []
+        for bond in self.topology.bonds:
+            if (
+                bond.relationship_type is not BondRelationshipType.METAL_COORDINATION
+                or bond.source_metadata is None
+            ):
+                continue
+            identities: list[SourceAtomIdentity] = []
+            for index in bond.endpoint_pair():
+                atom_ref = self.constitution.atom_ref_at(index)
+                residue = self.constitution.residue_or_ligand(atom_ref.residue_id)
+                assert residue is not None
+                identities.append(
+                    SourceAtomIdentity(
+                        atom_ref,
+                        residue.component_id,
+                        self.geometry.atom_geometry(index).altloc,
+                    )
+                )
+            retained_connections.append(
+                SourceConnection(*identities, source_metadata=bond.source_metadata)
+            )
+        return (*retained_connections, *self.excluded_coordination_connections)
+
+    def unrepresented_coordination_connections(
+        self,
+        constitution: StructureConstitution,
+        geometry: StructureGeometry,
+    ) -> tuple[SourceConnection, ...]:
+        """Compare historical declarations with the current selected atoms.
+
+        Parameters
+        ----------
+        constitution : StructureConstitution
+            Current atom identities, possibly changed since source selection.
+        geometry : StructureGeometry
+            Current geometry aligned with that constitution.
+
+        Returns
+        -------
+        tuple[SourceConnection, ...]
+            Declarations with exactly one currently represented endpoint. This
+            query does not certify a complete site or validate metal physics.
+        """
+        return tuple(
+            connection
+            for connection in self.coordination_connections()
+            if sum(
+                endpoint.resolve_index(constitution, geometry) is not None
+                for endpoint in connection.endpoint_pair()
+            )
+            == 1
+        )
+
+    def formal_charge(self, atom_ref: AtomRef) -> int | None:
+        """Return a reported charge, preserving explicit neutral zero.
+
+        Parameters
+        ----------
+        atom_ref : AtomRef
+            Atom identity in the original input, not the current repaired graph.
+
+        Returns
+        -------
+        int or None
+            Reported charge, or None for an unobserved atom or unspecified charge.
+            The constitution distinguishes those two absence cases.
+        """
+        atom_index = self.constitution.resolve_atom_index(atom_ref)
+        return None if atom_index is None else self.topology.formal_charge(atom_index)
+
+    def heavy_atoms_are_preserved_in(self, residue: ResidueSite) -> bool:
+        """Check that original heavy identities survive in a current residue.
+
+        Parameters
+        ----------
+        residue : ResidueSite
+            Current atom inventory, matched to the observation by residue ID.
+
+        Returns
+        -------
+        bool
+            Every observed heavy name and element/isotope identity is retained.
+            Additional current atoms are allowed; an unobserved residue supplies
+            no contrary evidence. This does not certify scaffold completeness,
+            chemistry, geometry or preservation of source hydrogens.
+        """
+        original = self.constitution.residue_or_ligand(residue.residue_id)
+        if original is None:
+            return True
+        current_identities = {
+            (atom.name, atom.element_identity)
+            for atom in residue.atom_sites
+            if not atom.is_hydrogen()
+        }
+        return all(
+            (atom.name, atom.element_identity) in current_identities
+            for atom in original.atom_sites
+            if not atom.is_hydrogen()
+        )
+
+    def hydrogen_atoms(self, residue_id: ResidueId) -> tuple[AtomRef, ...]:
+        """Return observed H/D/T identities for one original residue.
+
+        Parameters
+        ----------
+        residue_id : ResidueId
+            Residue identity in the original input.
+
+        Returns
+        -------
+        tuple[AtomRef, ...]
+            Observed hydrogens in source atom order; empty for an absent residue.
+        """
+        residue = self.constitution.residue_or_ligand(residue_id)
+        if residue is None:
+            return ()
+        return tuple(
+            AtomRef(residue_id, atom.name)
+            for atom in residue.atom_sites
+            if atom.is_hydrogen()
+        )
+
+    def bonds_for_atom(self, atom_ref: AtomRef) -> tuple[TopologyBond, ...]:
+        """Return explicit connection evidence without resolving unknown chemistry.
+
+        Parameters
+        ----------
+        atom_ref : AtomRef
+            Atom identity in the original input.
+
+        Returns
+        -------
+        tuple[TopologyBond, ...]
+            Source declarations in this observation's atom address space.
+            Relationship types remain distinct: a connectivity-only CONECT is
+            not proof of a covalent H attachment. Empty means no declaration,
+            not proof of an unbound atom; geometric inference is not performed.
+        """
+        atom_index = self.constitution.resolve_atom_index(atom_ref)
+        if atom_index is None:
+            return ()
+        return tuple(
+            bond
+            for bond in self.bonds_for_residue(atom_ref.residue_id)
+            if bond.involves(atom_index)
+        )
+
+    def bonds_for_residue(self, residue_id: ResidueId) -> tuple[TopologyBond, ...]:
+        """Return original bonds touching a residue, including external endpoints.
+
+        Parameters
+        ----------
+        residue_id : ResidueId
+            Identity in the original observation's address space.
+
+        Returns
+        -------
+        tuple[TopologyBond, ...]
+            Source declarations in topology order, each appearing once. Empty for
+            an absent residue or no declared bonds. The immutable index is built
+            once per observation, not once per chemistry decision.
+        """
+        return self._bonds_by_residue.get(residue_id, ())

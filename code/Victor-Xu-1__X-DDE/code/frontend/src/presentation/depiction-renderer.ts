@@ -1,0 +1,317 @@
+import { editorReady, type Ketcher } from "../editors/scientificEditor";
+import { configureKetcherPreview } from "../editors/ketcher-appearance";
+import { foldDisplayHydrogens } from "../editors/ketcher-hydrogens";
+import { molecularRecordText } from "./molecular-record";
+import { structureBytes } from "../viewer/structure-bytes";
+import {
+  molecularImageOptions,
+  type MolecularPrint,
+} from "../publication/molecular-vector";
+export type DepictionSource =
+  { smiles: string } | { url: string; record?: number; sha256?: string };
+const verifiedRecord = Symbol("verified molecular record");
+export type MolecularSourceSnapshot = Readonly<{
+  key: string;
+  text: string;
+  [verifiedRecord]: true;
+}>;
+function sourceKey(source: DepictionSource) {
+  return JSON.stringify(
+    "smiles" in source
+      ? ["smiles", source.smiles]
+      : [
+          "url",
+          source.url,
+          source.record ?? 0,
+          source.sha256?.toLowerCase() ?? null,
+        ],
+  );
+}
+function snapshot(
+  source: DepictionSource,
+  text: string,
+): MolecularSourceSnapshot {
+  return Object.freeze({
+    key: sourceKey(source),
+    text,
+    [verifiedRecord]: true as const,
+  });
+}
+
+/** Shared byte/record identity check; independent of the optional drawing component. */
+export async function readMolecularSource(
+  source: DepictionSource,
+  signal: AbortSignal,
+) {
+  if ("smiles" in source) {
+    if (!source.smiles.trim() || source.smiles.length > 20000)
+      throw new Error("Unsupported molecule size.");
+    return snapshot(source, source.smiles);
+  }
+  const record = source.record ?? 0;
+  if (
+    !Number.isInteger(record) ||
+    record < 0 ||
+    record > 10000 ||
+    !(
+      /^\/api\/(assets|jobs)\//.test(source.url) ||
+      /^\/api\/datasets\/[0-9a-f-]+\/members\/structure\?/.test(source.url)
+    )
+  )
+    throw new Error("Select an exact local molecular record.");
+  if (source.sha256 !== undefined && !/^[a-f0-9]{64}$/i.test(source.sha256))
+    throw new Error("The recorded molecular source is unavailable.");
+  const response = await fetch(source.url, { signal });
+  if (
+    !response.ok ||
+    Number(response.headers.get("Content-Length")) > 5 * 1024 ** 2
+  )
+    throw new Error("The original structure is unavailable or exceeds 5 MiB.");
+  const format =
+    response.headers.get("X-Structure-Format") ??
+    new URL(source.url, location.origin).searchParams
+      .get("name")
+      ?.split(".")
+      .at(-1);
+  if (format !== "sdf" && format !== "mol")
+    throw new Error("2D drawing needs an exact MOL or SDF molecular record.");
+  const { text, sha256 } = await structureBytes(response, 5 * 1024 ** 2);
+  if (source.sha256 !== undefined && source.sha256.toLowerCase() !== sha256)
+    throw new Error("Reviewed molecular source checksum mismatch.");
+  return snapshot(source, molecularRecordText(text, record, format));
+}
+
+/** Native drawing pixels in an image URL accepted by the platform's strict CSP. */
+export async function depictionDataUrl(blob: Blob): Promise<string> {
+  if (blob.type !== "image/svg+xml" || !blob.size || blob.size > 2 * 1024 ** 2)
+    throw new Error("Expected a bounded native SVG drawing.");
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const value = reader.result;
+      if (
+        typeof value !== "string" ||
+        !value.startsWith("data:image/svg+xml;base64,")
+      )
+        reject(new Error("The native drawing could not be read as an image."));
+      else resolve(value);
+    };
+    reader.onerror = () =>
+      reject(reader.error ?? new Error("Cannot read the native drawing."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+/** A bounded, local native Ketcher renderer. It never writes back to the editor or source. */
+export class DepictionRenderer {
+  private controller = new AbortController();
+  private cache = new Map<string, Blob>();
+  private requests = new Map<
+    string,
+    { promise: Promise<Blob>; consumers: Set<AbortSignal> }
+  >();
+  private ready: Promise<Ketcher> | null = null;
+  private tail: Promise<unknown> = Promise.resolve();
+  private pending = 0;
+  constructor(private frame: () => HTMLIFrameElement | null) {}
+  private initialize() {
+    if (!this.ready)
+      this.ready = (async () => {
+        const signal = AbortSignal.any([
+          this.controller.signal,
+          AbortSignal.timeout(60000),
+        ]);
+        const response = await fetch("/api/deployment", { signal });
+        if (!response.ok)
+          throw new Error("Drawing component status is unavailable.");
+        const value = await response.json();
+        if (!value.installed?.ketcher)
+          throw new Error(
+            "Install the Ketcher component to draw 2D structures.",
+          );
+        // Use the declared 60-second initialization budget. A cold native
+        // component can still be loading after the previous 20-second poll cap.
+        const editor = await editorReady(this.frame, signal, 600);
+        // Ketcher's image service derives its native carbon/hydrogen label mode
+        // from these editor options, keeping images and the visible editor consistent.
+        configureKetcherPreview(editor);
+        return editor;
+      })();
+    return this.ready;
+  }
+  retryInitialization() {
+    this.ready = null;
+  }
+  async render(
+    source: DepictionSource,
+    signal: AbortSignal,
+    bondThickness = 1.6,
+    print?: MolecularPrint,
+    verifiedSource?: MolecularSourceSnapshot,
+  ) {
+    if (![1.2, 1.6, 2.2].includes(bondThickness))
+      throw new Error("Choose a supported drawing style.");
+    signal.throwIfAborted();
+    if (
+      verifiedSource &&
+      (verifiedSource[verifiedRecord] !== true ||
+        verifiedSource.key !== sourceKey(source))
+    )
+      throw new Error(
+        "The verified molecular record does not match this source.",
+      );
+    const key = JSON.stringify([source, bondThickness, print]);
+    const cached = this.cache.get(key);
+    if (cached) return cached;
+    let request = this.requests.get(key);
+    if (!request) {
+      if (this.pending >= 80)
+        throw new Error("Too many structure previews. Select fewer records.");
+      this.pending++;
+      const consumers = new Set<AbortSignal>();
+      const ensureVisible = () => {
+        if (![...consumers].some((consumer) => !consumer.aborted))
+          throw new DOMException(
+            "The structure preview is no longer needed.",
+            "AbortError",
+          );
+      };
+      let drawing: Promise<Blob> | undefined;
+      const promise = this.tail.then(async () => {
+        this.controller.signal.throwIfAborted();
+        ensureVisible();
+        const editor = await this.initialize();
+        ensureVisible();
+        const timeout = AbortSignal.timeout(25000);
+        const active = AbortSignal.any([timeout, this.controller.signal]);
+        const structure = (
+          verifiedSource ?? (await readMolecularSource(source, active))
+        ).text;
+        ensureVisible();
+        if (!editor.generateImage)
+          throw new Error(
+            "Update the Ketcher component to draw 2D structures.",
+          );
+        drawing = (async () => {
+          // This canvas belongs only to the invisible drawing service. Native
+          // layout changes a display copy; scientific files and the user's editor stay intact.
+          if (!editor.structService?.dearomatize)
+            throw new Error(
+              "Update Ketcher to draw alternating aromatic bonds.",
+            );
+          // Assign native stereochemical drawing coordinates before Molfile
+          // export; a coordinate-free SMILES conversion loses wedge bonds.
+          let display = structure;
+          if ("smiles" in source) {
+            if (!editor.structService.layout)
+              throw new Error("Update Ketcher to lay out SMILES structures.");
+            display = (
+              await editor.structService.layout({
+                struct: structure,
+                output_format: "chemical/x-mdl-molfile",
+              })
+            ).struct;
+            if (!display?.trim() || display.length > 5 * 1024 ** 2)
+              throw new Error(
+                "The native SMILES display copy is unavailable or too large.",
+              );
+          }
+          // Aromatic [nH] becomes an implicit-H query on a KET/editor roundtrip.
+          // Assign native Kekule bonds while it is still a molecular Molfile,
+          // before layout imports it into the canvas. Never rewrite SVG bonds.
+          display = (
+            await editor.structService.dearomatize(
+              { struct: display, output_format: "chemical/x-mdl-molfile" },
+              // Ketcher's standard service options enable Indigo's generic
+              // model for aromatic rings with external double bonds. Native
+              // dearomatization verification remains enabled.
+              { "aromaticity-model": "generic" },
+            )
+          ).struct;
+          if (!display?.trim() || display.length > 5 * 1024 ** 2)
+            throw new Error(
+              "The native aromatic display copy is unavailable or too large.",
+            );
+          const folded = await foldDisplayHydrogens(editor, display);
+          if (hasUnlocalizedBonds(folded))
+            throw new Error(
+              "This aromatic form needs its original SDF/MOL record for an exact drawing.",
+            );
+          await editor.setMolecule(folded);
+          const arranged = await editor.getMolfile();
+          active.throwIfAborted();
+          return editor.generateImage!(
+            arranged,
+            molecularImageOptions(bondThickness, print),
+          );
+        })();
+        let abort!: () => void;
+        const interrupted = new Promise<never>((_, reject) => {
+          abort = () => reject(active.reason);
+          active.addEventListener("abort", abort, { once: true });
+          if (active.aborted) abort();
+        });
+        let blob: Blob;
+        try {
+          blob = await Promise.race([drawing, interrupted]);
+        } finally {
+          active.removeEventListener("abort", abort);
+        }
+        active.throwIfAborted();
+        if (!blob || !blob.size || blob.size > 2 * 1024 ** 2)
+          throw new Error("The native drawing is empty or too large.");
+        const image = new Blob([blob], { type: "image/svg+xml" });
+        if (this.cache.size >= 64) {
+          const oldest = this.cache.keys().next().value!;
+          this.cache.delete(oldest);
+        }
+        this.cache.set(key, image);
+        return image;
+      });
+      request = { promise, consumers };
+      this.requests.set(key, request);
+      // A caller can time out while the non-cancellable native editor is still
+      // drawing. Keep that editor lane occupied until the native work settles.
+      this.tail = promise
+        .catch(() => {
+          if (this.requests.get(key)?.promise === promise)
+            this.requests.delete(key);
+        })
+        .then(() => drawing?.catch(() => undefined))
+        .finally(() => {
+          this.pending--;
+          if (this.requests.get(key)?.promise === promise)
+            this.requests.delete(key);
+        });
+    }
+    const consumers = request.consumers;
+    consumers.add(signal);
+    const release = () => consumers.delete(signal);
+    signal.addEventListener("abort", release, { once: true });
+    try {
+      const result = await request.promise;
+      signal.throwIfAborted();
+      return result;
+    } finally {
+      signal.removeEventListener("abort", release);
+      release();
+    }
+  }
+  close() {
+    this.controller.abort();
+    this.cache.clear();
+  }
+}
+
+function hasUnlocalizedBonds(ket: string) {
+  return Object.values(JSON.parse(ket) as Record<string, unknown>).some(
+    (node) => {
+      if (!node || typeof node !== "object") return false;
+      const molecule = node as { type?: string; bonds?: { type: number }[] };
+      return (
+        molecule.type === "molecule" &&
+        molecule.bonds?.some((bond) => bond.type === 4)
+      );
+    },
+  );
+}

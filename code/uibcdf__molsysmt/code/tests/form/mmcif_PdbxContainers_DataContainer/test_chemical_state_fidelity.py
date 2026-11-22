@@ -1,0 +1,201 @@
+"""Testing canonical chemical-state fidelity for mmCIF containers."""
+
+import pandas as pd
+import pytest
+
+import molsysmt as msm
+from molsysmt._private.conversion_report import build_conversion_report
+from molsysmt.form.mmcif_PdbxContainers_DataContainer._bond_state import (
+    BondAccumulator,
+    metadata_from_chem_comp_bond,
+)
+
+
+def test_chem_comp_bond_order_and_aromaticity_are_independent():
+    attributes = {
+        "comp_id": 0,
+        "atom_id_1": 1,
+        "atom_id_2": 2,
+        "value_order": 3,
+        "pdbx_aromatic_flag": 4,
+    }
+
+    double = metadata_from_chem_comp_bond(["LIG", "C1", "O1", "DOUB", "N"], attributes)
+    aromatic = metadata_from_chem_comp_bond(
+        ["LIG", "C1", "C2", "AROM", "Y"], attributes
+    )
+
+    assert double == {"bond_type": "covalent", "evidence": "explicit", "bond_order": 2}
+    assert aromatic["is_aromatic"] is True
+    assert "bond_order" not in aromatic
+
+
+def test_explicit_metadata_upgrades_inference_and_conflicts_fail_closed():
+    bonds = BondAccumulator()
+    bonds.add((2, 0), bond_type="covalent", evidence="inferred")
+    bonds.add((0, 2), bond_order=1, bond_type="covalent", evidence="explicit")
+    bonds.add((0, 2), bond_order=2, bond_type="covalent", evidence="explicit")
+
+    table = bonds.to_dataframe()
+    assert table.loc[0, "evidence"] == "explicit"
+    assert pd.isna(table.loc[0, "bond_order"])
+    assert bonds.has_inference is True
+    assert bonds.has_conflict is True
+
+
+def test_altloc_remap_preserves_whole_bond_records():
+    bonds = BondAccumulator()
+    bonds.add((1, 3), bond_order=2, is_aromatic=True, evidence="explicit")
+
+    remapped = bonds.remap([0, 1, 2], replacements={3: 2}).to_dataframe()
+
+    assert remapped[["atom1_index", "atom2_index"]].values.tolist() == [[1, 2]]
+    assert remapped.loc[0, "bond_order"] == 2
+    assert bool(remapped.loc[0, "is_aromatic"]) is True
+    assert remapped.loc[0, "evidence"] == "explicit"
+
+
+def test_real_container_preserves_orders_aromaticity_and_evidence(hp35_bcif_gz_file):
+    container = msm.convert(
+        str(hp35_bcif_gz_file),
+        to_form="mmcif.PdbxContainers.DataContainer",
+    )
+    topology = msm.convert(container, to_form="molsysmt.MolSys")
+
+    assert set(
+        topology.chemical_states._resolve_chemical_state()
+        .bonds["bond_order"]
+        .dropna()
+        .astype(int)
+    ) == {1, 2}
+    assert (
+        topology.chemical_states._resolve_chemical_state()
+        .bonds["is_aromatic"]
+        .fillna(False)
+        .any()
+    )
+    assert set(
+        topology.chemical_states._resolve_chemical_state().bonds["evidence"].dropna()
+    ) == {"explicit", "inferred"}
+    assert (
+        topology.chemical_states._resolve_chemical_state().connectivity_completeness
+        == "partial"
+    )
+
+
+def test_unknown_order_code_is_reported_and_strictly_rejected():
+    pytest.importorskip("mmcif")
+    from mmcif.api.DataCategory import DataCategory
+    from mmcif.api.PdbxContainers import DataContainer
+
+    container = DataContainer("synthetic")
+    container.append(
+        DataCategory(
+            "chem_comp_bond",
+            attributeNameList=["comp_id", "atom_id_1", "atom_id_2", "value_order"],
+            rowList=[["LIG", "C1", "C2", "UNKNOWN"]],
+        )
+    )
+
+    report = build_conversion_report(
+        container,
+        "mmcif.PdbxContainers.DataContainer",
+        "molsysmt.MolSys",
+    )
+
+    assert report.outcome == "lossy"
+    assert [issue.attribute for issue in report.issues] == ["bond_order"]
+    with pytest.raises(msm.NotCompatibleConversionError, match="Strict conversion"):
+        msm.convert(container, to_form="molsysmt.Topology", strict=True)
+
+
+def test_undeclared_contextual_group_does_not_gain_edges_or_complete_status():
+    from mmcif.api.DataCategory import DataCategory
+    from mmcif.api.PdbxContainers import DataContainer
+
+    source = DataContainer("unresolved")
+    source.append(
+        DataCategory(
+            "chem_comp",
+            attributeNameList=["id", "type"],
+            rowList=[["GLH", "NON-POLYMER"]],
+        )
+    )
+    source.append(
+        DataCategory(
+            "pdbx_entity_nonpoly",
+            attributeNameList=["entity_id", "name", "comp_id"],
+            rowList=[["1", "Unresolved group", "GLH"]],
+        )
+    )
+    source.append(
+        DataCategory(
+            "entity",
+            attributeNameList=["id", "type", "pdbx_description"],
+            rowList=[["1", "non-polymer", "Unresolved group"]],
+        )
+    )
+    source.append(
+        DataCategory(
+            "struct_asym", attributeNameList=["id", "entity_id"], rowList=[["A", "1"]]
+        )
+    )
+    names = ["N", "CA", "C", "O", "CB", "CG", "CD", "OE1", "OE2"]
+    attributes = [
+        "group_PDB",
+        "id",
+        "type_symbol",
+        "label_atom_id",
+        "label_alt_id",
+        "label_comp_id",
+        "label_asym_id",
+        "label_entity_id",
+        "label_seq_id",
+        "pdbx_PDB_ins_code",
+        "Cartn_x",
+        "Cartn_y",
+        "Cartn_z",
+        "occupancy",
+        "B_iso_or_equiv",
+        "pdbx_formal_charge",
+        "auth_seq_id",
+        "auth_comp_id",
+        "auth_asym_id",
+        "auth_atom_id",
+        "pdbx_PDB_model_num",
+    ]
+    rows = []
+    for i, name in enumerate(names):
+        element = "N" if name == "N" else "O" if name.startswith("O") else "C"
+        rows.append(
+            [
+                "HETATM",
+                str(i + 1),
+                element,
+                name,
+                ".",
+                "GLH",
+                "A",
+                "1",
+                "1",
+                "?",
+                str(float(i)),
+                "0",
+                "0",
+                "1",
+                "0",
+                "?",
+                "1",
+                "GLH",
+                "A",
+                name,
+                "1",
+            ]
+        )
+    source.append(DataCategory("atom_site", attributeNameList=attributes, rowList=rows))
+    output = msm.convert(source, to_form="molsysmt.MolSys")
+    state = output.chemical_states._resolve_chemical_state()
+    assert output.topology.groups["group_name"].tolist() == ["GLH"]
+    assert output.topology.group_naming_schemes == (None,)
+    assert len(state.bonds) == 0
+    assert state.connectivity_completeness == "partial"

@@ -1,0 +1,362 @@
+import { ChoiceCards } from "../guided/ChoiceCards";
+import { useExampleReference } from "../examples/context";
+import { useId, useLayoutEffect, useState } from "react";
+import {
+  UtilityFormImage,
+  type UtilityImageValue,
+} from "../utilities/UtilityImageInput";
+import type { Job, Language } from "../types";
+import type { MoleculeRef } from "../research/types";
+import type { Asset } from "./types";
+import { AssetPicker } from "./AssetPicker";
+import { useInputTaskSubmit } from "../guided/useInputTaskSubmit";
+import { Hint } from "../guided/Hint";
+import { Questionnaire } from "../guided/Questionnaire";
+import { useTaskReadiness } from "../guided/useTaskReadiness";
+import { MolecularReview } from "../guided/MolecularReview";
+import { ImageMoleculeInput } from "../utilities/ImageMoleculeInput";
+export function PropertyForm(props: Parameters<typeof PropertyFields>[0]) {
+  return (
+    <UtilityFormImage language={props.language}>
+      {(imageInput) => (
+        <PropertyFields
+          {...props}
+          imageInput={imageInput ?? props.imageInput}
+        />
+      )}
+    </UtilityFormImage>
+  );
+}
+
+function PropertyFields({
+  language,
+  onCreated,
+  initialSmiles = "",
+  initialFile = "",
+  scientificInput,
+  imageInput = null,
+}: {
+  language: Language;
+  onCreated(j: Job): void;
+  initialSmiles?: string;
+  initialFile?: string;
+  scientificInput?: MoleculeRef;
+  imageInput?: UtilityImageValue | null;
+}) {
+  const example = useExampleReference("library");
+  initialFile ||= imageInput?.reference.asset_id ?? example?.asset_id ?? "";
+  scientificInput = imageInput?.reference ?? scientificInput;
+  const id = useId(),
+    zh = language === "zh",
+    [smiles, setSmiles] = useState(initialSmiles),
+    [file, setFile] = useState(initialFile),
+    [selectedAsset, setSelectedAsset] = useState<Asset | null>(null),
+    [name, setName] = useState(""),
+    [mode, setMode] = useState<"file" | "smiles" | "both">(
+      initialFile && initialSmiles ? "both" : initialSmiles ? "smiles" : "file",
+    );
+  const run = useInputTaskSubmit(onCreated);
+  useLayoutEffect(() => {
+    if (!imageInput) return;
+    const ref = imageInput.reference;
+    setMode("file");
+    setFile(ref.asset_id);
+    setSelectedAsset((current) =>
+      current?.id === ref.asset_id && current.sha256 === ref.sha256
+        ? current
+        : null,
+    );
+  }, [imageInput?.key]);
+  const { ready, error, recheck } = useTaskReadiness("properties");
+  const lines =
+      mode === "file"
+        ? []
+        : smiles
+            .split(/\r?\n/)
+            .map((s) => s.trim())
+            .filter(Boolean),
+    selectedFile = mode === "smiles" ? "" : file;
+  const bound = Boolean(
+    scientificInput && selectedFile === scientificInput.asset_id,
+  );
+  const fileVerified = Boolean(
+    selectedFile && selectedAsset?.id === selectedFile,
+  );
+  const changedReference = Boolean(
+    bound && fileVerified && scientificInput!.sha256 !== selectedAsset!.sha256,
+  );
+  const valid =
+    Boolean(selectedFile || lines.length) &&
+    lines.length <= 500 &&
+    (!selectedFile || fileVerified) &&
+    !changedReference;
+  const objects = (
+    <>
+      {mode !== "file" && (
+        <ImageMoleculeInput
+          language={language}
+          disabled={run.busy}
+          onMolecule={(molecule) => setSmiles(molecule.smiles)}
+        >
+          <div className="field">
+            <span>
+              <label htmlFor={id}>SMILES</label>{" "}
+              <Hint label={zh ? "SMILES说明" : "SMILES help"}>
+                {zh
+                  ? "用文字表示分子结构。一行一个分子，不附名称或表头；也可以选择分子文件。"
+                  : "A text representation of molecular structure. One molecule per line without names/headers; choose a molecular file instead if unfamiliar."}
+              </Hint>
+            </span>
+            <textarea
+              id={id}
+              value={smiles}
+              onChange={(e) => setSmiles(e.target.value)}
+              rows={5}
+              spellCheck={false}
+              maxLength={200000}
+              data-molecule-source
+            />
+            {lines.length > 500 && (
+              <p role="alert">
+                {zh
+                  ? "每次最多填写500个分子，请分批提交。"
+                  : "Enter up to 500 molecules per task; split larger batches."}
+              </p>
+            )}
+          </div>
+        </ImageMoleculeInput>
+      )}
+      {mode !== "smiles" && (
+        <AssetPicker
+          kind="ligand"
+          value={file}
+          onChange={setFile}
+          onSelectedAsset={setSelectedAsset}
+          language={language}
+          label={
+            zh
+              ? "分子文件（可含多个记录）"
+              : "Molecule file (multiple records allowed)"
+          }
+          uploadKey={imageInput?.key}
+        />
+      )}
+      {bound && (
+        <p className="field-help">
+          {zh
+            ? `已选择第${scientificInput!.record + 1}个分子记录，仅计算此记录。`
+            : `Molecule record ${scientificInput!.record + 1} is selected; only this record is calculated.`}
+        </p>
+      )}
+      {changedReference && (
+        <p role="alert">
+          {zh
+            ? "所选文件与原始分子记录不一致，请重新选择原始文件。"
+            : "The selected file does not match the original molecular record. Choose the original file again."}
+        </p>
+      )}
+    </>
+  );
+  return (
+    <Questionnaire
+      language={language}
+      inputKey={JSON.stringify({
+        mode,
+        lines,
+        selectedFile,
+        selectedAsset,
+        scientificInput,
+        name,
+      })}
+      busy={run.busy}
+      error={error || run.error}
+      ready={ready}
+      onCheckEnvironment={recheck}
+      unavailable={
+        zh
+          ? "RDKit 性质计算环境尚未就绪。请到“安装与组件”配置分子性质工具；当前输入可以保留。"
+          : "The RDKit molecular-property runtime is not ready. Configure molecular-property tools in Installation & components; keep your prepared inputs."
+      }
+      submitLabel={zh ? "计算性质" : "Calculate properties"}
+      onSubmit={() =>
+        run.submit({
+          operation: "properties",
+          scientific_inputs: bound ? [scientificInput!] : [],
+          name: name.trim() || (zh ? "小分子性质" : "Molecular properties"),
+          smiles: lines,
+          ligand_files: selectedFile ? [selectedFile] : [],
+        })
+      }
+      steps={[
+        {
+          title: zh ? "选择方式" : "Choose source",
+          valid: true,
+          content: (
+            <div data-molecule-source>
+              <ChoiceCards<"file" | "smiles" | "both">
+                label={
+                  zh
+                    ? "用哪种方式提供分子？"
+                    : "How will you provide molecules?"
+                }
+                value={mode}
+                onChange={setMode}
+                options={[
+                  {
+                    value: "file",
+                    title: file
+                      ? zh
+                        ? "使用已选分子文件"
+                        : "Use the selected molecular file"
+                      : zh
+                        ? "上传新分子文件（推荐）"
+                        : "Upload a new molecular file (recommended)",
+                    note: file
+                      ? zh
+                        ? "核对已选分子的结构后即可计算。"
+                        : "Inspect the selected molecule before running the calculation."
+                      : zh
+                        ? "一个分子或一组分子，可上传新文件或选择历史文件。"
+                        : "One molecule or a set, from a new or historical file.",
+                  },
+                  {
+                    value: "smiles",
+                    title: zh
+                      ? "粘贴分子结构文字（SMILES）"
+                      : "Paste molecular structure text (SMILES)",
+                    note: zh
+                      ? "每行输入一个 SMILES。"
+                      : "Enter one SMILES per line.",
+                  },
+                  {
+                    value: "both",
+                    title: zh
+                      ? "文件和文字一起计算"
+                      : "Combine file and text inputs",
+                    note: zh ? "同时使用两类输入。" : "Use both input sources.",
+                  },
+                ]}
+              />
+            </div>
+          ),
+        },
+        {
+          title: zh ? "提供分子" : "Provide molecules",
+          valid,
+          content: objects,
+        },
+        {
+          title: zh ? "确认内容" : "Choose calculation",
+          inline: "options",
+          valid: true,
+          content: (
+            <>
+              <p>
+                {zh
+                  ? "推荐：计算基础分子性质，不需要先预测蛋白结构。"
+                  : "Recommended: calculate basic molecular properties; no protein prediction required."}
+              </p>
+              <Hint label={zh ? "性质计算范围" : "Property calculation scope"}>
+                {zh
+                  ? "包括分子量、脂溶性、极性表面积、氢键与柔性、类药性和合成难易度启发式指标。这些是结构描述符，不是 ADMET 预测或实验活性。"
+                  : "Includes molecular weight, lipophilicity, polar surface area, hydrogen bonding/flexibility, drug-likeness and synthetic-accessibility heuristics. These are descriptors, not ADMET or experimental activity."}
+              </Hint>
+              <label className="field">
+                {zh ? "任务名称（可选）" : "Task name (optional)"}
+                <input
+                  value={name}
+                  maxLength={80}
+                  onChange={(e) => setName(e.target.value)}
+                />
+              </label>
+            </>
+          ),
+        },
+        {
+          title: zh ? "确认启动" : "Review & start",
+          inline: "preview",
+          valid: true,
+          content: (
+            <MolecularReview
+              language={language}
+              source={
+                selectedFile &&
+                selectedAsset &&
+                selectedAsset.id === selectedFile &&
+                [".sdf", ".mol"].includes(selectedAsset.suffix)
+                  ? {
+                      url: `/api/assets/${encodeURIComponent(selectedFile)}`,
+                      record: bound ? scientificInput!.record : 0,
+                    }
+                  : !selectedFile && lines.length
+                    ? { smiles: lines[0] }
+                    : null
+              }
+              caption={
+                bound
+                  ? zh
+                    ? `待计算分子 · 第 ${scientificInput!.record + 1} 条记录`
+                    : `Molecule to calculate · Record ${scientificInput!.record + 1}`
+                  : zh
+                    ? "首个分子预览；计算范围以摘要为准"
+                    : "First molecule preview; calculation scope is listed in the summary"
+              }
+              summary={
+                <dl className="questionnaire-review">
+                  <dt>{zh ? "输入方式" : "Input source"}</dt>
+                  <dd>
+                    {mode === "file"
+                      ? zh
+                        ? "分子文件"
+                        : "Molecular file"
+                      : mode === "smiles"
+                        ? "SMILES"
+                        : zh
+                          ? "分子文件＋SMILES"
+                          : "File and SMILES"}
+                  </dd>
+                  {selectedFile && (
+                    <>
+                      <dt>{zh ? "分子文件" : "Molecular file"}</dt>
+                      <dd>
+                        {selectedAsset?.id === selectedFile
+                          ? selectedAsset.name
+                          : zh
+                            ? "已选分子文件"
+                            : "Selected molecular file"}
+                      </dd>
+                      <dt>{zh ? "文件记录范围" : "File records"}</dt>
+                      <dd>
+                        {bound
+                          ? zh
+                            ? `第 ${scientificInput!.record + 1} 条记录`
+                            : `Record ${scientificInput!.record + 1}`
+                          : zh
+                            ? "文件中的全部分子记录"
+                            : "All molecular records in the file"}
+                      </dd>
+                    </>
+                  )}
+                  {lines.length > 0 && (
+                    <>
+                      <dt>{zh ? "文字输入的分子" : "Molecules from text"}</dt>
+                      <dd>
+                        {zh
+                          ? `${lines.length} 个分子`
+                          : `${lines.length} molecules`}
+                      </dd>
+                    </>
+                  )}
+                  <dt>{zh ? "计算内容" : "Calculation"}</dt>
+                  <dd>
+                    {zh ? "基础分子性质组合" : "Basic molecular property panel"}
+                  </dd>
+                </dl>
+              }
+            />
+          ),
+        },
+      ]}
+    />
+  );
+}

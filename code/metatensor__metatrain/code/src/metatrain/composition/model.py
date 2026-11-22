@@ -1,0 +1,477 @@
+import logging
+import warnings
+from collections.abc import Mapping
+from typing import Any, Dict, List, Literal, Optional, Union
+
+import torch
+from metatensor.torch import Labels, TensorMap
+from metatomic.torch import (
+    AtomisticModel,
+    ModelCapabilities,
+    ModelMetadata,
+    ModelOutput,
+    NeighborListOptions,
+    System,
+)
+
+from metatrain.utils.abc import ModelInterface, common_upgrade_checkpoint
+from metatrain.utils.architectures import get_default_hypers
+from metatrain.utils.data import Dataset, DatasetInfo, TargetInfo
+from metatrain.utils.data.atom_pair_helpers import check_no_atom_pair_targets
+from metatrain.utils.dtype import dtype_to_str
+from metatrain.utils.hypers import raise_if_hypers_mismatch
+from metatrain.utils.metadata import merge_metadata
+from metatrain.utils.wrapper import MetatrainModel
+
+from . import checkpoints
+from ._base_composition import (
+    BaseCompositionModel,
+    FixedCompositionWeights,
+)
+from .documentation import ModelHypers
+
+
+class CompositionModel(ModelInterface[ModelHypers]):
+    """
+    A model that predicts invariant targets as a sum of per-species weights,
+    fitted by least squares on the training data.
+
+    It is used both as a standalone architecture and as an additive baseline
+    inside the other architectures.
+
+    :param hypers: Hyperparameters for the model. Should be an empty dictionary.
+    :param dataset_info: Information about the dataset used to initialize the
+        model.
+    """
+
+    __checkpoint_version__ = 3
+    __supported_devices__ = ["cuda", "cpu"]
+    __supported_dtypes__ = [torch.float64]
+    __default_metadata__ = ModelMetadata(
+        references={
+            "architecture": [
+                "Composition model: per-species linear fit to training targets"
+            ]
+        }
+    )
+
+    outputs: Dict[str, TargetInfo]
+    atomic_types: List[int]
+    target_infos: Dict[str, TargetInfo]
+    _new_outputs: List[str]
+
+    @staticmethod
+    def requested_neighbor_lists() -> List[NeighborListOptions]:
+        """
+        Get the neighbor lists required by the model.
+
+        :return: An empty list, as the composition model does not use neighbor
+            lists.
+        """
+        return []
+
+    def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
+        super().__init__(hypers, dataset_info, self.__default_metadata__)
+        check_no_atom_pair_targets(dataset_info.targets, self.__class__.__name__)
+
+        if not (isinstance(hypers, dict) and len(hypers) == 0):
+            raise ValueError(
+                f"{self.__class__.__name__} hypers takes an empty dictionary. "
+                f"Got: {hypers}."
+            )
+
+        self.atomic_types = sorted(dataset_info.atomic_types)
+
+        for target_name, target_info in dataset_info.targets.items():
+            if not self.is_valid_target(target_name, target_info):
+                raise ValueError(
+                    f"Composition model does not support target quantity "
+                    f"{target_info.quantity}. This is an architecture bug. "
+                    "Please report this issue and help us improve!"
+                )
+
+        self.target_infos = {
+            target_name: target_info
+            for target_name, target_info in dataset_info.targets.items()
+        }
+
+        self.model: BaseCompositionModel = BaseCompositionModel(
+            atomic_types=self.atomic_types,
+            layouts={
+                target_name: target_info.layout
+                for target_name, target_info in self.target_infos.items()
+            },
+        )
+
+        self.outputs: Dict[str, TargetInfo] = {}
+
+        self.register_buffer("dummy_buffer", torch.randn(1))
+
+        self._new_outputs = []
+        for target_name in self.dataset_info.targets:
+            self._new_outputs.append(target_name)
+            self._add_output(target_name, self.target_infos[target_name])
+
+    @classmethod
+    def from_valid_targets(
+        cls,
+        dataset_info: DatasetInfo,
+        atomic_types: List[int],
+    ) -> "CompositionModel":
+        """Build a composition model from the valid targets of ``dataset_info``.
+
+        Targets the composition model cannot handle (see ``is_valid_target``)
+        are dropped.
+
+        :param dataset_info: dataset information to build the model from.
+        :param atomic_types: atomic types the model should support. Passed
+            separately because it can be wider than
+            ``dataset_info.atomic_types``, e.g. all the types known to a
+            pretrained backbone (MACE).
+        :return: a composition model for the valid targets.
+        """
+        targets = {
+            name: info
+            for name, info in dataset_info.targets.items()
+            if cls.is_valid_target(name, info)
+        }
+        return cls(
+            hypers={},
+            dataset_info=DatasetInfo(
+                length_unit=dataset_info.length_unit,
+                atomic_types=sorted(atomic_types),
+                targets=targets,
+                extra_data=dataset_info.extra_data,
+            ),
+        )
+
+    def train_model(
+        self,
+        datasets: List[Union[Dataset, torch.utils.data.Subset]],
+        additive_models: List[torch.nn.Module],
+        batch_size: int,
+        is_distributed: bool,
+        fixed_weights: Optional[FixedCompositionWeights] = None,
+    ) -> None:
+        """
+        Fit the composition weights from the provided datasets.
+
+        Deprecated, use ``Trainer.train()`` instead.
+
+        :param datasets: Datasets to fit the weights on.
+        :param additive_models: Additive models (e.g. ZBL) whose contributions
+            are subtracted from the targets before fitting.
+        :param batch_size: Batch size for data loading.
+        :param is_distributed: Whether training is distributed.
+        :param fixed_weights: Fixed per-species baselines, overriding the fit
+            for the targets and atomic types they cover.
+        """
+        warnings.warn(
+            "train_model is deprecated, use Trainer.train() instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        from .trainer import Trainer as CompositionTrainer
+
+        if not isinstance(datasets, list):
+            datasets = [datasets]
+        if len(self.target_infos) == 0:
+            return
+
+        from metatrain.utils.architectures import get_default_hypers
+
+        hypers = get_default_hypers("composition")["training"]
+        hypers["atomic_baseline"] = fixed_weights if fixed_weights is not None else {}
+        hypers["batch_size"] = batch_size
+        hypers["distributed"] = is_distributed
+        trainer = CompositionTrainer(hypers=hypers)
+        trainer._additive_models = additive_models
+        trainer.train(
+            model=MetatrainModel(
+                self, additive_models=[], scaler=None, dataset_info=self.dataset_info
+            ),
+            dtype=torch.float64,
+            devices=[self.dummy_buffer.device],
+            train_datasets=datasets,
+            val_datasets=datasets,
+            checkpoint_dir="",
+        )
+
+    def restart(
+        self,
+        dataset_info: DatasetInfo,
+        model_hypers: Optional[Mapping[str, Any]] = None,
+    ) -> "CompositionModel":
+        """
+        Update the model to continue training, possibly with new targets.
+
+        Targets the composition model cannot handle are dropped, already fitted
+        targets keep their weights, and only the new targets are marked to be
+        fitted. New atomic types are not allowed.
+
+        :param dataset_info: Information about the new dataset, including the
+            targets that will be used for training.
+        :param model_hypers: New hyperparameters for the model. They must match
+            the checkpoint's hyperparameters, otherwise an error is raised.
+        :return: The updated model.
+        """
+        if model_hypers is not None:
+            default_hypers = get_default_hypers("composition")["model"]
+            raise_if_hypers_mismatch(
+                self.hypers, model_hypers, default_hypers=default_hypers
+            )
+
+        valid_targets = {}
+        for target_name in dataset_info.targets:
+            target_info = dataset_info.targets[target_name]
+            if self.is_valid_target(target_name, target_info):
+                valid_targets[target_name] = target_info
+            else:
+                logging.debug(
+                    f"Composition model does not support target "
+                    f"'{target_name}', skipping."
+                )
+
+        if len(valid_targets) == 0:
+            # No new targets to fit: reset so a subsequent Trainer.train() does not
+            # refit (and zero out) the already-fitted targets from __init__.
+            self.target_infos = {}
+            self._new_outputs = []
+            return self
+
+        merged_info = self.dataset_info.union(
+            DatasetInfo(
+                length_unit=dataset_info.length_unit,
+                atomic_types=dataset_info.atomic_types,
+                targets=valid_targets,
+            )
+        )
+        new_atomic_types = [
+            at for at in merged_info.atomic_types if at not in self.atomic_types
+        ]
+        if len(new_atomic_types) > 0:
+            raise ValueError(
+                f"New atomic types found in the dataset: {new_atomic_types}. "
+                "The composition model does not support adding new atomic types."
+            )
+
+        self.target_infos = {
+            target_name: target
+            for target_name, target in valid_targets.items()
+            if target_name not in self.dataset_info.targets
+        }
+
+        self.dataset_info = merged_info
+
+        self._new_outputs = []
+        for target_name, target_info in self.target_infos.items():
+            if target_name in self.model.weights:
+                continue
+            self._new_outputs.append(target_name)
+            self.model.add_output(target_name, target_info.layout)
+            self._add_output(target_name, target_info)
+
+        return self
+
+    def forward(
+        self,
+        systems: List[System],
+        outputs: Dict[str, ModelOutput],
+        selected_atoms: Optional[Labels] = None,
+    ) -> Dict[str, TensorMap]:
+        """
+        Compute the requested outputs as per-atom composition predictions.
+
+        Every atom is predicted as the fitted weight of its atomic type. In
+        evaluation mode, atomic-basis targets are sparsified back to their
+        native layout, with ``atom_type`` in the keys; during training they
+        stay dense.
+
+        :param systems: List of systems to evaluate the model on.
+        :param outputs: Dictionary of outputs that the model should compute.
+        :param selected_atoms: Optional ``Labels`` specifying a subset of atoms
+            to compute the outputs for. If ``None``, the outputs are computed
+            for all atoms in each system.
+        :return: A dictionary mapping each requested output name to the
+            corresponding ``TensorMap`` containing the computed values.
+        """
+        for output_name in outputs.keys():
+            if output_name not in self.outputs:
+                raise ValueError(
+                    f"Output {output_name} is not supported by the "
+                    "composition model. Supported outputs are: "
+                    f"{list(self.outputs.keys())}"
+                )
+
+        pred = self.model.forward(
+            systems,
+            outputs=outputs,
+            selected_atoms=selected_atoms,
+        )
+
+        return pred
+
+    def supported_outputs(self) -> Dict[str, TargetInfo]:
+        """
+        Get the outputs currently supported by this model.
+
+        :return: A dictionary of the supported outputs.
+        """
+        return self.outputs
+
+    def _add_output(self, target_name: str, target_info: TargetInfo) -> None:
+        self.outputs[target_name] = target_info
+
+    def remove_output(self, target_name: str) -> None:
+        """
+        Remove a previously registered output target, mirroring ``_add_output``.
+
+        :param target_name: Name of the target to remove.
+        """
+        self.outputs.pop(target_name, None)
+        self.dataset_info.targets.pop(target_name, None)
+        self.model.remove_output(target_name)
+
+    @staticmethod
+    def is_valid_target(target_name: str, target_info: TargetInfo) -> bool:
+        """
+        Check whether the composition model can fit the given target.
+
+        Only scalar targets and spherical targets with at least one invariant
+        contribution are supported.
+
+        :param target_name: Name of the target, used for logging.
+        :param target_info: Information about the target.
+        :return: Whether the target can be fitted by the composition model.
+        """
+        if target_info.sample_kind == "atom_pair":
+            logging.debug(
+                f"Composition model does not support target {target_name} "
+                "since sample kind 'atom_pair' is not implemented yet."
+            )
+            return False
+
+        if not target_info.is_scalar and not target_info.is_spherical:
+            logging.debug(
+                f"Composition model does not support target {target_name} "
+                "since it is not either scalar or spherical."
+            )
+            return False
+
+        if target_info.is_spherical:
+            if "o3_lambda" in target_info.layout.keys.names:
+                if len(target_info.layout.blocks({"o3_lambda": 0, "o3_sigma": 1})) == 0:
+                    logging.debug(
+                        "Composition model does not support spherical "
+                        f"target {target_name} since it does not have "
+                        "any invariant blocks."
+                    )
+                    return False
+            elif "o3_lambda_2" in target_info.layout.keys.names:
+                if not any(
+                    key["o3_lambda_1"] == key["o3_lambda_2"]
+                    and key["o3_sigma_1"] == key["o3_sigma_2"]
+                    for key in target_info.layout.keys
+                ):
+                    logging.debug(
+                        "Composition model does not support spherical "
+                        f"target {target_name} since it does not have "
+                        "any invariant contribution."
+                    )
+                    return False
+
+        return True
+
+    def get_checkpoint(
+        self, best_model_state_dict: Optional[dict[str, Any]] = None
+    ) -> Dict:
+        model_state_dict = self.state_dict()
+        checkpoint = {
+            "architecture_name": "composition",
+            "model_ckpt_version": self.__checkpoint_version__,
+            "metadata": self.metadata,
+            "model_data": {
+                "model_hypers": self.hypers,
+                "dataset_info": self.dataset_info,
+            },
+            "epoch": None,
+            "best_epoch": None,
+            "model_state_dict": model_state_dict,
+            "best_model_state_dict": best_model_state_dict or model_state_dict,
+        }
+        return checkpoint
+
+    @classmethod
+    def load_checkpoint(
+        cls,
+        checkpoint: Dict,
+        context: Literal["restart", "finetune", "export"],
+    ) -> "CompositionModel":
+        """
+        Create a model from a checkpoint.
+
+        :param checkpoint: Checkpoint's state dictionary.
+        :param context: Context in which to load the model: ``"restart"`` loads
+            the latest state, ``"finetune"`` and ``"export"`` load the best
+            state.
+        :return: An instance of the model.
+        """
+        if context == "restart":
+            logging.info(f"Using latest model from epoch {checkpoint.get('epoch')}")
+            model_state_dict = checkpoint["model_state_dict"]
+        elif context in {"finetune", "export"}:
+            logging.info(f"Using best model from epoch {checkpoint.get('best_epoch')}")
+            model_state_dict = checkpoint.get(
+                "best_model_state_dict", checkpoint["model_state_dict"]
+            )
+        else:
+            raise ValueError("Unknown context tag for checkpoint loading!")
+
+        model_data = checkpoint["model_data"]
+        model = cls(
+            hypers=model_data["model_hypers"],
+            dataset_info=model_data["dataset_info"],
+        )
+
+        model.load_state_dict(model_state_dict)
+
+        model.metadata = merge_metadata(model.metadata, checkpoint.get("metadata"))
+
+        return model
+
+    @classmethod
+    def upgrade_checkpoint(
+        cls, checkpoint: dict[str, Any], version: Optional[int] = None
+    ) -> dict[str, Any]:
+        return common_upgrade_checkpoint(
+            checkpoint, version, cls.__checkpoint_version__, "model", checkpoints
+        )
+
+    def export(self, metadata: Optional[ModelMetadata] = None) -> AtomisticModel:
+        """
+        Turn this model into an :py:class:`metatomic.torch.AtomisticModel`,
+        containing the model itself, its capabilities and its metadata.
+
+        :param metadata: Additional metadata to add to the model, as specified
+            by the user.
+        :return: An instance of :py:class:`metatomic.torch.AtomisticModel`.
+        """
+        dtype = self.dummy_buffer.dtype
+
+        self.to(dtype)
+
+        capabilities = ModelCapabilities(
+            outputs={
+                name: info.to_model_output(sample_kind="atom")
+                for name, info in self.outputs.items()
+            },
+            atomic_types=self.atomic_types,
+            interaction_range=0.0,
+            length_unit=self.dataset_info.length_unit,
+            supported_devices=self.__supported_devices__,
+            dtype=dtype_to_str(dtype),
+        )
+
+        metadata = merge_metadata(self.metadata, metadata)
+
+        return AtomisticModel(self.eval(), metadata, capabilities)

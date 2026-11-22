@@ -1,0 +1,272 @@
+name: Molecular preview and ensemble checks
+on:
+  workflow_dispatch:
+  push:
+    paths: &viewer_paths
+      - "frontend/src/viewer/**"
+      # Deposited polymer identity has exact real-source checks.
+      - "!frontend/src/viewer/modified-polymer*"
+      - "frontend/src/poses/PoseResults*"
+      - "frontend/src/poses/PoseList*"
+      - "frontend/src/poses/PoseOutcomeList*"
+      - "frontend/src/poses/PoseDetail*"
+      - "frontend/src/receptors/ReceptorResults*"
+      - "frontend/src/receptors/ReceptorMember*"
+      - "frontend/src/receptors/receptors.css"
+      - "frontend/src/receptors/StructurePrepareResults*"
+      - "frontend/src/receptors/PreparedStructureWorkspace.tsx"
+      - "frontend/src/diffsbdd/PreparedReceptorResults.tsx"
+      - "frontend/src/receptors/prepared-structure.css"
+      - "frontend/src/presentation/ensemble-results.css"
+      - "frontend/src/diffsbdd/ScientificDetails*"
+      - "frontend/src/diffsbdd/InteractionResults*"
+      - "frontend/src/diffsbdd/interaction-results.css"
+      - "frontend/src/diffsbdd/diffsbdd.css"
+      - "server_tests/test_ensemble_results_browser.py"
+      - "server_tests/test_receptor_workspace_browser.py"
+      - "server_tests/test_prepared_structure_workspace_browser.py"
+      - "scripts/receptor-workspace-scope.py"
+      - "tests/test_receptor_workspace_scope.py"
+      - ".github/workflows/viewer-checks.yml"
+      - "server_tests/test_context_camera_browser.py"
+      - "server_tests/ensemble_browser_helpers.py"
+      - "server_tests/prepare_visual_components.py"
+      - "frontend/src/docking/poseScore*"
+      - "frontend/src/docking/DockingResults*"
+      # Saved-material handoff is verified by exact-result-handoff-checks.
+      - "!frontend/src/docking/DockingResults*"
+      - "frontend/src/docking/types.ts"
+      # Native reference metadata has the exact docking runtime/result gate.
+      - "!frontend/src/docking/types.ts"
+      - "frontend/src/editors/molstar*"
+      - "frontend/src/editors/ketcher*"
+      - "frontend/src/editors/Editors.tsx"
+      - "frontend/src/editors/scientificEditor*"
+      - "frontend/src/regions/AtomSelection.tsx"
+      - "frontend/src/regions/RegionResult.tsx"
+      # Print export and shared entry motion use publication-checks.yml.
+      - "!frontend/src/viewer/StructureViewer.tsx"
+      - "!frontend/src/viewer/StructureViewer.test.tsx"
+      - "!frontend/src/viewer/capture.test.ts"
+      - "!frontend/src/viewer/capture.ts"
+      - "!frontend/src/viewer/contact-labels.ts"
+      - "!frontend/src/viewer/contact-labels.test.ts"
+      - "!frontend/src/viewer/native-labels*"
+      - "!frontend/src/viewer/native-label-layout*"
+      - "!frontend/src/viewer/contacts.ts"
+      - "!frontend/src/viewer/scientific-overlay.ts"
+      - "!frontend/src/viewer/channel-geometry*"
+      - "!frontend/src/viewer/channel-input*"
+      - "!frontend/src/viewer/source-layout.ts"
+      - "!frontend/src/viewer/attachment-geometry*"
+      - "!frontend/src/viewer/viewer.css"
+      - "!frontend/src/viewer/frame.ts"
+      - "!frontend/src/viewer/useViewerSnapshot.test.ts"
+      - "!frontend/src/viewer/useViewerSnapshot.ts"
+      # Shared interactive charts and appearance use chart-quality-checks.yml.
+      - "!frontend/src/viewer/appearance.ts"
+      - "!frontend/src/viewer/scene.ts"
+      - "!frontend/src/datasets/PlotFrame.tsx"
+      - "!frontend/src/datasets/DatasetHeatmaps.tsx"
+      - "!frontend/src/viewer/style.ts"
+      - "!frontend/src/viewer/style.test.ts"
+      # Native stick geometry and its editor consumer use simulation-view-checks.yml.
+      - "!frontend/src/viewer/molstar-sticks.ts"
+      - "!frontend/src/editors/molstar-appearance*"
+      # Shared hydrogen display has focused native Ketcher/3D checks.
+      - "!frontend/src/viewer/donor-hydrogens*"
+      - "!frontend/src/editors/ketcher-hydrogens*"
+      - "!frontend/src/editors/Editors.tsx"
+      - "!frontend/src/editors/scientificEditor.ts"
+      - "!frontend/src/receptors/ReceptorMemberTable.tsx"
+      - "!frontend/src/poses/PoseList.tsx"
+      # Pocket prototype removal belongs to the focused selection gate.
+      - "!frontend/src/viewer/source-depth*"
+      # Pose continuity and exact downstream versions use pose-handoff-checks.yml.
+      - "!frontend/src/poses/PoseDetail.tsx"
+      - "!frontend/src/poses/PoseResults.tsx"
+      - "!frontend/src/viewer/PoseSession.test.tsx"
+      - "!frontend/src/viewer/PoseSession.tsx"
+      - "!frontend/src/viewer/PoseStudyInput.tsx"
+      - "!frontend/src/viewer/StructureViewport.tsx"
+      # Document readiness has exact native replay in generated-candidate-checks.yml.
+      - "!frontend/src/viewer/useViewerConnection.ts"
+      - "!frontend/src/viewer/viewer-connection.test.tsx"
+      - "!frontend/src/viewer/pose-plan.ts"
+      - "!frontend/src/viewer/pose-source.test.ts"
+      - "!frontend/src/viewer/pose-source.ts"
+      - "!frontend/src/viewer/pose-study-input.css"
+      - "!frontend/src/viewer/pose-types.ts"
+      - "!frontend/src/viewer/usePoseHandoff.ts"
+      - "!frontend/src/viewer/usePoseOptimization.test.tsx"
+      # Task-service admission and retained poses have their focused availability gate.
+      - "!frontend/src/viewer/usePoseOptimization.ts"
+      - "!frontend/src/viewer/PreviewAvailability.test.tsx"
+      - "!frontend/src/viewer/InitialPoseStatus.tsx"
+      - "!frontend/src/viewer/PoseOptimizationControls.tsx"
+  pull_request:
+    paths: *viewer_paths
+permissions:
+  contents: read
+jobs:
+  reference-scope:
+    runs-on: ubuntu-24.04
+    outputs:
+      reference_only: ${{ steps.scope.outputs.reference_only }}
+      receptor_workspace_only: ${{ steps.receptors.outputs.receptor_workspace_only }}
+      receptor_alignment: ${{ steps.receptors.outputs.receptor_alignment }}
+      structure_preparation: ${{ steps.receptors.outputs.structure_preparation }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/interaction-workspace-scope.py
+      - id: receptors
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/receptor-workspace-scope.py
+  prediction-scope:
+    uses: ./.github/workflows/prediction-workspace-checks.yml
+    with:
+      scope_only: true
+  molecular-preview:
+    needs: [reference-scope, prediction-scope]
+    if: ${{ needs.reference-scope.outputs.receptor_workspace_only != 'true' && needs.reference-scope.outputs.reference_only != 'true' && needs.prediction-scope.outputs.confidence_frame != 'true' && needs.prediction-scope.outputs.utility_only != 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      WB_AUTO_DEPLOY: "0"
+      WB_BROWSER_URL: http://127.0.0.1:4330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - uses: astral-sh/setup-uv@v6
+      - name: Choose isolated preview state
+        run: |
+          echo "WB_HOME=$RUNNER_TEMP/x-dde-preview" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$RUNNER_TEMP/x-dde-preview/state" >> "$GITHUB_ENV"
+      - run: uv sync --locked --group dev --group browser
+      - name: Verify preview bootstrap freshness and existing origin boundaries
+        run: >-
+          uv run --locked --group dev pytest -q
+          tests/test_api_security.py::test_ui_bootstrap_is_not_stored_across_releases
+          tests/test_api_security.py::test_csrf_origin_and_host_boundaries
+      - name: Verify source atom maps, viewer messages and selection controls
+        working-directory: frontend
+        run: >-
+          npx vitest run src/viewer/atom-region.test.ts src/viewer/channel-geometry.test.ts
+          src/viewer/attachment-geometry.test.ts
+          src/viewer/donor-hydrogens.test.ts
+          src/viewer/StructureViewer.test.tsx src/viewer/geometry.test.ts src/viewer/initial-geometry.test.ts
+          src/viewer/ViewerControls.test.tsx src/viewer/style.test.ts
+          src/viewer/contacts.test.ts src/viewer/source-layout.test.ts src/viewer/focus-layout.test.ts
+          src/viewer/charge-surface.test.ts src/viewer/SurfaceLegend.test.tsx
+          src/viewer/InteractionControls.test.tsx src/viewer/PoseScore.test.tsx
+          src/docking/poseScore.test.ts src/docking/DockingResults.test.tsx
+          src/editors/molstar-appearance.test.ts src/editors/ketcher-appearance.test.ts
+          src/editors/scientificEditor.test.ts
+          src/viewer/capture.test.ts
+          src/viewer/context-focus.test.ts src/viewer/camera-resize.test.ts
+          src/poses/PoseResults.test.tsx src/receptors/ReceptorResults.test.tsx
+          src/poses/PoseWorkspace.test.tsx src/poses/PoseScoreComparison.test.tsx
+          src/operations/OperationResults.test.tsx src/examples/ExampleJobResult.test.tsx
+          src/viewer/contact-label-layout.test.ts src/viewer/contact-labels.test.ts
+          src/viewer/native-contact-labels.test.ts
+          src/diffsbdd/InteractionResults.test.tsx src/diffsbdd/DiffResults.test.tsx
+      - name: Restore exact native cases and graphical editor without inference
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download examples-v1 --repo "$GITHUB_REPOSITORY" --pattern x-dde-public-cases-v1.zip --dir "$RUNNER_TEMP"
+          .venv/bin/python server_tests/prepare_layout_cases.py "$RUNNER_TEMP/x-dde-public-cases-v1.zip"
+          .venv/bin/python server_tests/prepare_visual_components.py --components ketcher public-pose-examples
+      - name: Native paired results and residue camera in Chromium
+        run: |
+          .venv/bin/python -m playwright install --with-deps chromium
+          mkdir -p server_tests/evidence/ensemble
+          .venv/bin/python -m opendde_workbench --port 4330 > server_tests/evidence/ensemble/service.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for n in $(seq 1 30); do curl --silent --fail "$WB_BROWSER_URL/api/health" > /dev/null && break; sleep 1; done
+          curl --silent --fail "$WB_BROWSER_URL/api/health" > /dev/null
+          .venv/bin/python -m pytest -q server_tests/test_ensemble_results_browser.py server_tests/test_context_camera_browser.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-ensemble-preview-evidence
+          path: server_tests/evidence/ensemble
+          if-no-files-found: error
+  receptor-workspace:
+    needs: [reference-scope, prediction-scope]
+    if: >-
+      needs.prediction-scope.outputs.mobile_header_only != 'true' &&
+      (needs.prediction-scope.outputs.desktop_header_only != 'true' ||
+      needs.prediction-scope.outputs.desktop_complex_review_only == 'true') &&
+      (needs.reference-scope.outputs.receptor_alignment == 'true' ||
+      needs.reference-scope.outputs.structure_preparation == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      WB_AUTO_DEPLOY: "0"
+      WB_BROWSER_URL: http://127.0.0.1:4330
+      CHECK_ALIGNMENT: ${{ needs.reference-scope.outputs.receptor_alignment }}
+      CHECK_PREPARATION: ${{ needs.reference-scope.outputs.structure_preparation }}
+      DESKTOP_COMPLEX_REVIEW: ${{ needs.prediction-scope.outputs.desktop_complex_review_only }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci --prefix frontend && npm run build --prefix frontend
+      - name: Receptor selection, original artifacts and downstream inputs
+        working-directory: frontend
+        run: |
+          tests=()
+          if [[ "$CHECK_ALIGNMENT" == true ]]; then tests+=(src/receptors/ReceptorResults.test.tsx); fi
+          if [[ "$CHECK_PREPARATION" == true ]]; then
+            tests+=(src/receptors/StructurePrepareResults.test.tsx src/operations/OperationResults.test.tsx src/diffsbdd/InteractionResults.test.tsx)
+          fi
+          [[ ${#tests[@]} -gt 0 ]]
+          npx vitest run "${tests[@]}"
+      - name: Restore the exact saved STAT6 outputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export WB_HOME="$RUNNER_TEMP/x-dde-receptor-workspace"
+          export WB_STATE_DIR="$WB_HOME/state"
+          echo "WB_HOME=$WB_HOME" >> "$GITHUB_ENV"
+          echo "WB_STATE_DIR=$WB_STATE_DIR" >> "$GITHUB_ENV"
+          uv sync --locked --group dev --group browser
+          version=$(.venv/bin/python -c 'from opendde_workbench.examples.stat6_bundle_release import VERSION; print(VERSION)')
+          gh release download examples-v2 --pattern "stat6-reviewed-results-v${version}.zip" --dir "$RUNNER_TEMP"
+          .venv/bin/python -c 'import os; from pathlib import Path; from opendde_workbench.examples.bundle import restore_bundle; from opendde_workbench.examples.stat6_bundle_release import SHA256, VERSION; from opendde_workbench.settings import Settings; print(restore_bundle(Path(os.environ["RUNNER_TEMP"])/f"stat6-reviewed-results-v{VERSION}.zip", Settings.from_env(), SHA256))'
+      - name: Verify responsive native canvas and exact downloads in Chrome
+        run: |
+          google-chrome --version
+          .venv/bin/python -m pytest -q tests/test_receptor_workspace_scope.py
+          mkdir -p server_tests/evidence/ensemble
+          .venv/bin/python -m opendde_workbench --port 4330 > server_tests/evidence/ensemble/service.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for n in $(seq 1 30); do curl --silent --fail "$WB_BROWSER_URL/api/health" > /dev/null && break; sleep 1; done
+          curl --silent --fail "$WB_BROWSER_URL/api/health" > /dev/null
+          tests=()
+          if [[ "$CHECK_ALIGNMENT" == true ]]; then tests+=(server_tests/test_receptor_workspace_browser.py); fi
+          if [[ "$CHECK_PREPARATION" == true ]]; then tests+=(server_tests/test_prepared_structure_workspace_browser.py); fi
+          [[ ${#tests[@]} -gt 0 ]]
+          args=()
+          if [[ "$DESKTOP_COMPLEX_REVIEW" == true ]]; then args+=(-k '1180 or 1440'); fi
+          .venv/bin/python -m pytest -q "${tests[@]}" "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-receptor-workspace-evidence
+          path: server_tests/evidence/ensemble
+          if-no-files-found: error

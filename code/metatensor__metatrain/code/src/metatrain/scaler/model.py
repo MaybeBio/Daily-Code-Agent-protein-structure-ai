@@ -1,0 +1,479 @@
+import logging
+import warnings
+from collections.abc import Mapping
+from typing import Any, Dict, List, Literal, Optional, Union
+
+import torch
+from metatensor.torch import Labels, TensorBlock, TensorMap
+from metatomic.torch import (
+    AtomisticModel,
+    ModelCapabilities,
+    ModelMetadata,
+    ModelOutput,
+    NeighborListOptions,
+    System,
+)
+
+from metatrain.utils.abc import ModelInterface, common_upgrade_checkpoint
+from metatrain.utils.architectures import get_default_hypers
+from metatrain.utils.data import Dataset, DatasetInfo, TargetInfo
+from metatrain.utils.dtype import dtype_to_str
+from metatrain.utils.hypers import raise_if_hypers_mismatch
+from metatrain.utils.metadata import merge_metadata
+from metatrain.utils.wrapper import MetatrainModel
+
+from . import checkpoints
+from ._base_scaler import BaseScaler
+from .documentation import FixedScalerWeights, ModelHypers
+from .utils.samples import get_samples_labels
+
+
+class Scaler(ModelInterface[ModelHypers]):
+    __checkpoint_version__ = 3
+    __supported_devices__ = ["cuda", "cpu"]
+    __supported_dtypes__ = [torch.float64]
+    __default_metadata__ = ModelMetadata(
+        references={
+            "architecture": ["Scaler: per species, target and property scaling."]
+        }
+    )
+
+    outputs: Dict[str, TargetInfo]
+    atomic_types: List[int]
+    target_infos: Dict[str, TargetInfo]
+    new_outputs: List[str]
+
+    @staticmethod
+    def requested_neighbor_lists() -> List[NeighborListOptions]:
+        return []
+
+    def __init__(self, hypers: ModelHypers, dataset_info: DatasetInfo) -> None:
+        super().__init__(hypers, dataset_info, self.__default_metadata__)
+
+        self.atomic_types = sorted(dataset_info.atomic_types)
+
+        self.target_infos = {
+            target_name: target_info
+            for target_name, target_info in dataset_info.targets.items()
+        }
+
+        # Initialize the scaler model
+        self.model = BaseScaler(
+            atomic_types=self.atomic_types,
+            layouts={
+                target_name: target_info.layout
+                for target_name, target_info in self.target_infos.items()
+            },
+        )
+        self.outputs: Dict[str, TargetInfo] = {}
+
+        # keeps track of dtype and device of the scaler
+        self.register_buffer("dummy_buffer", torch.randn(1))
+
+        self.new_outputs = []
+        for target_name, target_info in self.target_infos.items():
+            self.new_outputs.append(target_name)
+            self._add_output(target_name, target_info)
+
+    @classmethod
+    def from_valid_targets(
+        cls,
+        hypers: ModelHypers,
+        dataset_info: DatasetInfo,
+    ) -> "Scaler":
+        """Build a scaler from the valid targets of ``dataset_info``.
+
+        Targets the scaler cannot handle (see ``is_valid_target``)
+        are dropped.
+
+        :param hypers: hyperparameters for the model.
+        :param dataset_info: dataset information to build the model from.
+        :return: a scaler for the valid targets.
+        """
+        targets = {
+            name: info
+            for name, info in dataset_info.targets.items()
+            if cls.is_valid_target(name, info)
+        }
+        return cls(
+            hypers=hypers,
+            dataset_info=DatasetInfo(
+                length_unit=dataset_info.length_unit,
+                atomic_types=dataset_info.atomic_types,
+                targets=targets,
+                extra_data=dataset_info.extra_data,
+            ),
+        )
+
+    @staticmethod
+    def is_valid_target(target_name: str, target_info: TargetInfo) -> bool:
+        """
+        Check whether the scaler can work with the given target.
+
+        The scaler currently does not support targets with
+        sample kind "atom_pair".
+
+        :param target_name: Name of the target, used for logging.
+        :param target_info: Information about the target.
+        :return: Whether the target can be fitted by the composition model.
+        """
+        if target_info.sample_kind == "atom_pair":
+            logging.debug(
+                f"Scaler does not support target {target_name} "
+                "since sample kind 'atom_pair' is not implemented yet."
+            )
+            return False
+        return True
+
+    def train_model(
+        self,
+        datasets: List[Union[Dataset, torch.utils.data.Subset]],
+        additive_models: List[torch.nn.Module],
+        batch_size: int,
+        is_distributed: bool,
+        fixed_weights: Optional[FixedScalerWeights] = None,
+    ) -> None:
+        warnings.warn(
+            "train_model is deprecated, use Trainer.train() instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        from . import train_or_load_scaler
+
+        if not isinstance(datasets, list):
+            datasets = [datasets]
+
+        train_or_load_scaler(
+            scaler=MetatrainModel(
+                self, additive_models=[], scaler=None, dataset_info=self.dataset_info
+            ),
+            train_datasets=datasets,
+            additive_models=additive_models,
+            device=self.dummy_buffer.device,
+            batch_size=batch_size,
+            is_distributed=is_distributed,
+            fixed_weights=fixed_weights if fixed_weights is not None else {},
+        )
+
+    def restart(
+        self,
+        dataset_info: DatasetInfo,
+        model_hypers: Optional[Mapping[str, Any]] = None,
+    ) -> "Scaler":
+        """
+        Restart the model with a new dataset info.
+
+        :param dataset_info: New dataset information to be used.
+        :param model_hypers: New hyperparameters for the model. They must match
+            the existing hyperparameters, otherwise an error is raised.
+        :return: The restarted Scaler.
+        """
+        if model_hypers is not None:
+            default_hypers = get_default_hypers("scaler")["model"]
+            raise_if_hypers_mismatch(
+                self.hypers, model_hypers, default_hypers=default_hypers
+            )
+
+        # merge old and new dataset info
+        merged_info = self.dataset_info.union(dataset_info)
+
+        self.target_infos = {
+            target_name: merged_info.targets[target_name]
+            for target_name in merged_info.targets
+        }
+
+        # register new outputs
+        self.new_outputs = []
+        for target_name, target_info in self.target_infos.items():
+            if target_name in self.dataset_info.targets:
+                continue
+            self.new_outputs.append(target_name)
+            self.model.add_output(target_name, target_info.layout)
+            self._add_output(target_name, target_info)
+
+        self.dataset_info = merged_info
+
+        return self
+
+    def forward(
+        self,
+        systems: List[System],
+        outputs: Dict[str, ModelOutput],
+        selected_atoms: Optional[Labels] = None,
+    ) -> Dict[str, TensorMap]:
+        """Get the scales for the given outputs.
+
+        It also sparsifies atomic basis targets in evaluation mode.
+
+        :param systems: List of systems for which to provide the scales.
+        :param outputs: Dictionary containing the requested outputs.
+        :param selected_atoms: Optional labels for selected atoms.
+        :returns: A dictionary with the scales.
+        """
+
+        scales = self.get_scales(
+            systems,
+            outputs,
+            selected_atoms=selected_atoms,
+        )
+
+        return scales
+
+    def apply_scales(
+        self,
+        systems: List[System],
+        outputs: Dict[str, TensorMap],
+        remove: bool = False,
+        selected_atoms: Optional[Labels] = None,
+        use_per_target_scales: bool = True,
+        use_per_property_scales: bool = True,
+    ) -> Dict[str, TensorMap]:
+        """Scales the outputs based on the stored (uncentered) standard deviations.
+
+        :param systems: List of systems for which the outputs were computed.
+        :param outputs: Dictionary containing the output TensorMaps.
+        :param remove: If True, removes the scaling (i.e., divides by the scales). If
+            False, applies the scaling (i.e., multiplies by the scales).
+        :param selected_atoms: Optional labels for selected atoms.
+        :param use_per_target_scales: If True, applies/removes per-target scales.
+        :param use_per_property_scales: If True, applies/removes per-block, per-property
+            scales. This only applies to targets with multiple blocks or multiple
+            properties. When combined with `use_per_target_scales`, this is equivalent
+            to applying/removing the full scales.
+        :returns: A dictionary with the scaled outputs.
+
+        :raises ValueError: If no scales have been computed or if `outputs` keys
+            contain unsupported keys.
+        """
+        if len(outputs) == 0:
+            return {}
+
+        scaled_outputs = self.model.forward(
+            systems,
+            outputs,
+            remove,
+            use_per_target_scales,
+            use_per_property_scales,
+            selected_atoms,
+        )
+
+        return scaled_outputs
+
+    def get_scales(
+        self,
+        systems: List[System],
+        outputs: Dict[str, ModelOutput],
+        selected_atoms: Optional[Labels] = None,
+        use_per_target_scales: bool = True,
+        use_per_property_scales: bool = True,
+    ) -> Dict[str, TensorMap]:
+        """Get the scales for the given outputs.
+
+        :param systems: List of systems for which to provide the scales.
+        :param outputs: Dictionary containing the requested outputs.
+        :param selected_atoms: Optional labels for selected atoms.
+        :param use_per_target_scales: If True, get per-target scales.
+        :param use_per_property_scales: If True, get per-block, per-property
+            scales. This only applies to targets with multiple blocks or multiple
+            properties. When combined with `use_per_target_scales`, this is equivalent
+            to getting the full scales.
+        :returns: A dictionary with the scales.
+        """
+        ones: dict[str, TensorMap] = {}
+        device = systems[0].positions.device
+        dtype = systems[0].positions.dtype
+
+        sample_labels = get_samples_labels(
+            systems,
+            selected_atoms=selected_atoms,
+        )
+
+        for k, output in outputs.items():
+            if k not in self.target_infos:
+                raise ValueError(
+                    f"Output key {k} is not in the dataset info targets. "
+                    f"Available targets: {list(self.dataset_info.targets.keys())}"
+                )
+
+            target = self.target_infos[k]
+
+            samples = sample_labels[output.sample_kind]
+
+            # Create a TensorMap full of ones with the corresponing structure
+            ones[k] = TensorMap(
+                keys=target.layout.keys,
+                blocks=[
+                    TensorBlock(
+                        values=torch.ones(
+                            (samples.values.shape[0],) + block.values.shape[1:],
+                            device=device,
+                            dtype=dtype,
+                        ),
+                        samples=samples,
+                        components=block.components,
+                        properties=block.properties,
+                    )
+                    for block in target.layout.blocks()
+                ],
+            )
+
+        scales = self.apply_scales(
+            systems,
+            ones,
+            remove=False,
+            selected_atoms=selected_atoms,
+            use_per_target_scales=use_per_target_scales,
+            use_per_property_scales=use_per_property_scales,
+        )
+
+        return scales
+
+    def supported_outputs(self) -> Dict[str, TargetInfo]:
+        return self.outputs
+
+    def _add_output(self, target_name: str, target_info: TargetInfo) -> None:
+        self.outputs[target_name] = target_info
+
+        layout = target_info.layout
+
+        valid_sample_names = [
+            ["system"],
+            ["system", "atom"],
+            [
+                "system",
+                "first_atom",
+                "second_atom",
+                "cell_shift_a",
+                "cell_shift_b",
+                "cell_shift_c",
+            ],
+        ]
+
+        if layout.sample_names not in valid_sample_names:
+            raise ValueError(
+                "unknown sample kind. TensorMap has sample names"
+                f" {layout.sample_names} but expected one of "
+                f"{valid_sample_names}."
+            )
+
+    def remove_output(self, target_name: str) -> None:
+        """
+        Remove a previously registered output target, mirroring ``_add_output``.
+
+        :param target_name: Name of the target to remove.
+        """
+        self.outputs.pop(target_name, None)
+        self.dataset_info.targets.pop(target_name, None)
+        self.model.remove_output(target_name)
+
+    def get_checkpoint(
+        self, best_model_state_dict: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        model_state_dict = self.state_dict()
+        checkpoint = {
+            "architecture_name": "scaler",
+            "model_ckpt_version": self.__checkpoint_version__,
+            "metadata": self.metadata,
+            "model_data": {
+                "model_hypers": self.hypers,
+                "dataset_info": self.dataset_info,
+            },
+            "epoch": None,
+            "best_epoch": None,
+            "model_state_dict": model_state_dict,
+            "best_model_state_dict": best_model_state_dict or model_state_dict,
+            "training_additive_models": getattr(self, "training_additive_models", []),
+        }
+
+        return checkpoint
+
+    @classmethod
+    def load_checkpoint(
+        cls,
+        checkpoint: Dict,
+        context: Literal["restart", "finetune", "export"],
+    ) -> "Scaler":
+        if context == "restart":
+            logging.info(f"Using latest model from epoch {checkpoint.get('epoch')}")
+            model_state_dict = checkpoint["model_state_dict"]
+        elif context in {"finetune", "export"}:
+            logging.info(f"Using best model from epoch {checkpoint.get('best_epoch')}")
+            model_state_dict = checkpoint.get(
+                "best_model_state_dict", checkpoint["model_state_dict"]
+            )
+        else:
+            raise ValueError("Unknown context tag for checkpoint loading!")
+
+        model_data = checkpoint["model_data"]
+        model = cls(
+            hypers=model_data["model_hypers"],
+            dataset_info=model_data["dataset_info"],
+        )
+
+        model.load_state_dict(model_state_dict)
+
+        model.training_additive_models = checkpoint["training_additive_models"]
+
+        model.metadata = merge_metadata(model.metadata, checkpoint.get("metadata"))
+
+        return model
+
+    @classmethod
+    def upgrade_checkpoint(
+        cls, checkpoint: dict[str, Any], version: Optional[int] = None
+    ) -> dict[str, Any]:
+        return common_upgrade_checkpoint(
+            checkpoint, version, cls.__checkpoint_version__, "model", checkpoints
+        )
+
+    def export(self, metadata: Optional[ModelMetadata] = None) -> AtomisticModel:
+        dtype = self.dummy_buffer.dtype
+
+        capabilities = ModelCapabilities(
+            outputs={
+                name: info.to_model_output(sample_kind="atom")
+                for name, info in self.outputs.items()
+            },
+            atomic_types=self.atomic_types,
+            interaction_range=0.0,
+            length_unit=self.dataset_info.length_unit,
+            supported_devices=self.__supported_devices__,
+            dtype=dtype_to_str(dtype),
+        )
+
+        metadata = merge_metadata(self.metadata, metadata)
+
+        return AtomisticModel(self.eval(), metadata, capabilities)
+
+    def check_correct_additive_models(
+        self, additive_models: List[torch.nn.Module]
+    ) -> None:
+        """Checks that some additive models are compatible with this scaler.
+
+        For now it just checks that the class names of the additive models
+        match the ones used to train the scaler. More sophisticated checks
+        could be added in the future.
+
+        :param additive_models: List of additive models for which one wants to
+            check if they match the current scaler's training configuration.
+        :raises ValueError: If the additive models are not compatible with
+            this scaler.
+        """
+        n_trained = len(getattr(self, "training_additive_models", []))
+        n_provided = len(additive_models)
+        if n_trained != n_provided:
+            raise ValueError(
+                f"The number of additive models used to train the scaler "
+                f"({n_trained}) does not match the number of additive models "
+                f"provided now ({n_provided})."
+            )
+
+        # Check that additive models used to train the scaler are the
+        # same as the ones provided now
+        for i, additive_model in enumerate(additive_models):
+            if additive_model.__class__.__name__ != self.training_additive_models[i]:
+                raise ValueError(
+                    "The additive models used to train the scaler checkpoint "
+                    "are not the same as the ones provided now. Please make sure "
+                    "to use the same additive models for training and inference."
+                )

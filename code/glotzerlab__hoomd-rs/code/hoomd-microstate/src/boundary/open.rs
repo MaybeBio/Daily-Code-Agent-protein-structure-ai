@@ -1,0 +1,46 @@
+// Copyright (c) 2024-2026 The Regents of the University of Michigan.
+// Part of hoomd-rs, released under the BSD 3-Clause License.
+
+//! Implement Open
+
+use arrayvec::ArrayVec;
+use hoomd_geometry::IsPointInside;
+use serde::{Deserialize, Serialize};
+
+use super::{Error, GenerateGhosts, MAX_GHOSTS, Wrap};
+
+/// Allow bodies and sites to exist anywhere in space.
+///
+/// Every point lies inside `Open` boundary conditions, bodies and sites
+/// are never wrapped, and there are no ghost sites.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Open;
+
+impl<P> Wrap<P> for Open {
+    #[inline(always)]
+    fn wrap(&self, properties: P) -> Result<P, Error> {
+        Ok(properties)
+    }
+}
+
+impl<S> GenerateGhosts<S> for Open
+where
+    S: Default,
+{
+    #[inline]
+    fn maximum_interaction_range(&self) -> f64 {
+        f64::INFINITY
+    }
+
+    #[inline(always)]
+    fn generate_ghosts(&self, _site_properties: &S) -> ArrayVec<S, MAX_GHOSTS> {
+        ArrayVec::new()
+    }
+}
+
+impl<P> IsPointInside<P> for Open {
+    #[inline]
+    fn is_point_inside(&self, _point: &P) -> bool {
+        true
+    }
+}

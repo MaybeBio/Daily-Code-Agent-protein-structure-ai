@@ -1,0 +1,466 @@
+"""Autoregression utilities."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from functools import partial
+from typing import TYPE_CHECKING
+
+import jax
+import jax.numpy as jnp
+
+if TYPE_CHECKING:
+  from collections.abc import Sequence
+
+  from jax.typing import DTypeLike
+
+  from aminx.run.specs import RunSpecification
+  from aminx.types.arrays import AutoRegressiveMask, DecodingOrder
+  from aminx.types.bundles import WaveScheduleBundle
+  from aminx.utils.data_structures import Protein
+
+
+def get_decoding_step_map(
+  tie_group_map: jnp.ndarray,
+  group_decoding_order: jnp.ndarray,
+  num_groups: int | None = None,
+) -> jnp.ndarray:
+  """Map each residue to its decoding step index based on group order."""
+  # Use N as a safe upper bound for num_groups if not provided
+  N = tie_group_map.shape[0]
+  M = group_decoding_order.shape[0]
+
+  group_to_step = jnp.zeros(N, dtype=jnp.int32).at[group_decoding_order].set(jnp.arange(M))
+  return group_to_step[tie_group_map]
+
+
+def make_autoregressive_mask(decoding_step_map: jnp.ndarray) -> jnp.ndarray:
+  """Create an (N, N) AR mask for group-based decoding."""
+  steps_i = decoding_step_map[:, None]
+  steps_j = decoding_step_map[None, :]
+  return steps_i >= steps_j
+
+
+def resolve_tie_groups(
+  spec: RunSpecification,
+  combined_protein: Protein,
+  structure_mappings: Sequence[dict] | None = None,
+  num_structures: int | None = None,
+) -> jnp.ndarray:
+  """Resolve tie groups for tied_positions modes.
+
+  Args:
+      spec: RunSpecification with tied_positions.
+      combined_protein: Protein dataclass with batch_dim=1 (1, seq_len, ...).
+      structure_mappings: Optional, for 'auto' mode.
+      num_structures: Optional, number of structures concatenated (for 'direct' mode).
+
+  Returns:
+      tie_group_map: jnp.ndarray of shape (n,) with group ids.
+
+  """
+  chain_ids = combined_protein.chain_index[0]
+  residue_indices = combined_protein.residue_index[0]
+  n = chain_ids.shape[0]
+
+  tie_group_map = jnp.arange(n, dtype=jnp.int32)
+  tied_positions = spec.tied_positions
+
+  if tied_positions is None:
+    return tie_group_map
+
+  if tied_positions == "direct":
+    if num_structures is None:
+      if combined_protein.mapping is not None:
+        structure_indices = combined_protein.mapping[0]  # Remove batch dim
+        num_inputs = int(jnp.max(structure_indices)) + 1
+      else:
+        msg = (
+          "Cannot determine number of structures for 'direct' mode. "
+          "The concatenated protein should have a 'mapping' field with structure indices, "
+          "or pass num_structures explicitly."
+        )
+        raise ValueError(msg)
+    else:
+      num_inputs = num_structures
+
+    ll = n // num_inputs
+    if n % ll != 0:
+      msg = (
+        f"Inputs must be same length for 'direct' mode. "
+        f"Total length {n} is not divisible by {num_inputs} structures."
+      )
+      raise ValueError(msg)
+    k = n // ll
+    return jnp.tile(jnp.arange(ll, dtype=jnp.int32), k)
+
+  if tied_positions == "auto":
+    if structure_mappings is None:
+      msg = "structure_mappings required for 'auto' mode."
+      raise ValueError(msg)
+    for seq_pos, struct_pos_list in enumerate(structure_mappings):
+      if len(struct_pos_list) > 1:
+        group_id = n + seq_pos
+        tie_group_map = tie_group_map.at[jnp.array(struct_pos_list)].set(group_id)
+    _, tie_group_map = jnp.unique(tie_group_map, return_inverse=True)
+    return tie_group_map
+
+  def _collect_group_indices(
+    groups: Sequence[tuple[int, int]],
+    chain_id_arr: jnp.ndarray,
+    residue_idx_arr: jnp.ndarray,
+  ) -> list[tuple[int, list[int]]]:
+    group_map = defaultdict(list)
+    for group_idx, group in enumerate(groups):
+      if isinstance(group[0], (list | tuple)):
+        for tup in group:
+          group_map[group_idx].append(tup)
+      else:
+        group_map[group_idx].append(group)
+    group_indices = []
+    for group_idx, tuples in group_map.items():
+      indices = []
+      for chain_idx, res_idx in tuples:
+        mask = (chain_id_arr == chain_idx) & (residue_idx_arr == res_idx)
+        idx = jnp.where(mask)[0]
+        if idx.size > 0:
+          indices.append(idx[0])
+      group_indices.append((group_idx, indices))
+    return group_indices
+
+  group_indices = _collect_group_indices(
+    tied_positions,
+    chain_ids,
+    residue_indices,
+  )
+  for group_idx, indices in group_indices:
+    if indices:
+      group_id = n + group_idx
+      tie_group_map = tie_group_map.at[jnp.array(indices)].set(group_id)
+  _, tie_group_map = jnp.unique(tie_group_map, return_inverse=True)
+  return tie_group_map
+
+
+@partial(jax.jit, static_argnames=("dtype",))
+def _generate_ar_mask_jit(
+  decoding_order: DecodingOrder,
+  *,
+  chain_idx: jnp.ndarray | None = None,
+  tie_group_map: jnp.ndarray | None = None,
+  num_groups: int | None = None,
+  dtype: DTypeLike = jnp.int8,
+) -> AutoRegressiveMask:
+  """Get the self-excluding autoregressive mask for the given decoding order.
+
+  Delegates to :func:`ar_mask_from_decoding_order` (#1982 / Defect 9). Both the untied and
+  the tied branch consume an ORDER array (``order[t]`` = position decoded at step ``t``).
+
+  **Contract: the argument is an ORDER array, never a rank array.** A rank array
+  (``rank[i]`` = step at which position ``i`` decodes, i.e. ``argsort(order)``) is a
+  different, equally valid permutation, so passing one yields the mask of the inverse order
+  with no error. Nothing here can detect that: both encodings are permutations of
+  ``0 .. L-1``, so the values alone do not say which one was passed. Invert a rank array
+  first. The convention itself is pinned by ``tests/utils/test_autoregression.py`` and
+  ``tests/inference/test_fixed_position_self_visibility.py``.
+
+  Parameters
+  ----------
+  decoding_order : DecodingOrder
+      (L,) ORDER array: position decoded at each step.
+  chain_idx : jnp.ndarray | None
+      Optional (L,) chain indices. When provided, positions in different chains
+      are masked out (cross-chain visibility is 0).
+  tie_group_map : jnp.ndarray | None
+      Optional (L,) tie group id per position. Tied positions are mutually
+      visible and decode together.
+  num_groups : int | None
+      Legacy parameter retained for signature compatibility. Unused.
+  dtype : dtype, optional
+      Mask dtype (default ``int8``); the export wrappers pass ``float32``.
+
+  Returns
+  -------
+  AutoRegressiveMask
+      (L, L) **int8** mask (values 0 or 1; the diagonal is 0), where mask[i, j] == 1 iff
+      position i sees position j's decoded sequence. All mask helpers and bundle storage
+      agree on this int8 contract.
+  """
+  del num_groups
+  ar_mask = ar_mask_from_decoding_order(decoding_order, tie_group_map=tie_group_map, dtype=dtype)
+  if chain_idx is not None:
+    same_chain = (chain_idx[:, None] == chain_idx[None, :]).astype(ar_mask.dtype)
+    ar_mask = ar_mask * same_chain
+  return ar_mask
+
+
+_ORDER_ONLY_MESSAGE = (
+  "generate_ar_mask takes the decoding ORDER as the keyword-only argument `order`: "
+  "generate_ar_mask(order=order_array, ...). `order[t]` is the position decoded at step t. "
+  "A RANK array (`rank[i]` = step at which position i decodes, i.e. argsort(order)) is a different "
+  "permutation and gives the mask of the inverse order; it cannot be detected from its values, so "
+  "this function no longer accepts the order positionally or as `decoding_order=`. Invert a rank "
+  "array first (`jnp.argsort(rank)`), then pass it as `order=`."
+)
+
+
+def generate_ar_mask(
+  *args: object,
+  order: DecodingOrder | None = None,
+  chain_idx: jnp.ndarray | None = None,
+  tie_group_map: jnp.ndarray | None = None,
+  num_groups: int | None = None,
+  dtype: DTypeLike = jnp.int8,
+  **unexpected: object,
+) -> AutoRegressiveMask:
+  # `order` is keyword-only on purpose: an ORDER array and a RANK array are both permutations of
+  # 0..L-1, so a positional call cannot be told apart by value. Forcing every caller to name the
+  # argument is what makes a rank-array caller fail loudly instead of silently getting the inverse mask.
+  if args or "decoding_order" in unexpected:
+    raise TypeError(_ORDER_ONLY_MESSAGE)
+  if unexpected:
+    raise TypeError(f"generate_ar_mask got unexpected keyword arguments: {sorted(unexpected)}")
+  if order is None:
+    raise TypeError("generate_ar_mask missing required keyword-only argument `order`. " + _ORDER_ONLY_MESSAGE)
+  # Canonicalise the dtype spelling (jnp.float32 / np.float32 / 'float32' / np.dtype) so each
+  # logical dtype is one static jit cache key.
+  return _generate_ar_mask_jit(
+    order,
+    chain_idx=chain_idx,
+    tie_group_map=tie_group_map,
+    num_groups=num_groups,
+    dtype=jnp.dtype(dtype),
+  )
+
+
+generate_ar_mask.__doc__ = (_generate_ar_mask_jit.__doc__ or "").replace(
+  "decoding_order : DecodingOrder\n      (L,) ORDER array: position decoded at each step.",
+  "order : DecodingOrder\n      Keyword-only. (L,) ORDER array: position decoded at each step.",
+)
+
+
+def _position_wave_index(wave: WaveScheduleBundle, tie_group_map: jnp.ndarray) -> jnp.ndarray:
+  """(L,) index of the wave each position decodes in -- the one rule every consumer shares.
+
+  Both :func:`generate_wave_ar_mask` (what a position may see) and
+  :func:`decoding_order_from_wave` (the order that is reported) are functions of this, so
+  they cannot disagree about when a position is decoded.
+
+  A position's wave is the first wave its tie group appears in. Positions whose group never
+  appears (a *partial* schedule -- e.g. a caller that only schedules the positions it
+  actually needs) get the sentinel ``num_waves``. The sentinel must be LARGER than any real
+  wave index, not smaller: the mask compares via ``>``/``==``, so a too-small sentinel (e.g.
+  -1) would make every omitted position look "earlier than everything" and leak its (never
+  decoded, all-zero) value as false context. A too-large sentinel makes omitted positions
+  "infinitely late" -- invisible to every real position and to each other.
+  """
+  seq_len = tie_group_map.shape[0]
+  num_waves, max_groups_per_wave = wave.group_ids.shape
+  never_scheduled_sentinel = num_waves
+  wave_index_grid = jnp.broadcast_to(
+    jnp.arange(num_waves, dtype=jnp.int32)[:, None],
+    (num_waves, max_groups_per_wave),
+  )
+  flat_group_ids = jnp.where(wave.group_valid, wave.group_ids, 0).reshape(-1)
+  flat_wave_index = jnp.where(
+    wave.group_valid,
+    wave_index_grid,
+    never_scheduled_sentinel,
+  ).reshape(-1)
+  # Scatter-min: each group id ends up mapped to the (single, real) wave index it was
+  # assigned to; invalid (padding) entries carry the sentinel and never win over a real
+  # (smaller) wave index.
+  group_wave_index = (
+    jnp.full((seq_len,), never_scheduled_sentinel, dtype=jnp.int32)
+    .at[flat_group_ids]
+    .min(flat_wave_index)
+  )
+  return group_wave_index[tie_group_map]
+
+
+@partial(jax.jit, static_argnames=("dtype",))
+def _generate_wave_ar_mask_jit(
+  wave: WaveScheduleBundle,
+  tie_group_map: jnp.ndarray,
+  dtype: DTypeLike = jnp.int8,
+) -> AutoRegressiveMask:
+  """Get the autoregressive mask for a `WaveScheduleBundle` (wave-color scheduling, W0.3+).
+
+  Generalizes `generate_ar_mask` from a flat total-order `decoding_order` to a
+  `WaveScheduleBundle` that may pack multiple (conditionally independent) tie
+  groups into the same wave (chromatic/improper-coloring arms, `G > 1`).
+  Position `i` is visible to position `j` iff `j`'s wave is strictly earlier
+  than `i`'s, OR `i` and `j` are in the same tie group (same wave, same group —
+  tied positions always see each other, matching `generate_ar_mask`). Positions
+  in the *same* wave but *different* groups do NOT see each other — this is the
+  Jacobi-within-a-color independence the chromatic schedule relies on.
+
+  For a `G == 1` schedule (`WaveScheduleBundle.from_tie_groups`/`.empty`, i.e.
+  every existing non-coloring arm), this reduces exactly to `generate_ar_mask`'s
+  semantics: each wave has a unique rank, so "same wave" implies "same group".
+
+  Parameters
+  ----------
+  wave : WaveScheduleBundle
+      Wave/group schedule, shape (W waves, G groups-per-wave, P positions).
+  tie_group_map : Int[Array, "L"]
+      Tie group id per position (state-0 convention, matching the rest of the
+      AR decode kernel).
+  dtype : dtype, optional
+      Mask dtype, static under ``jit``. Defaults to ``int8``; the export wrappers pass
+      ``float32`` so the exported graph carries no integer mask ops.
+
+  Returns
+  -------
+  AutoRegressiveMask
+      (L, L) mask (``int8`` by default); 1 where position i can see position j's decoded sequence.
+
+  """
+  seq_len = tie_group_map.shape[0]
+  position_wave_index = _position_wave_index(wave, tie_group_map)
+
+  same_wave = position_wave_index[:, None] == position_wave_index[None, :]
+  earlier_wave = position_wave_index[:, None] > position_wave_index[None, :]
+  same_group = tie_group_map[:, None] == tie_group_map[None, :]
+
+  mask = (earlier_wave | (same_wave & same_group)).astype(dtype)
+  # Self-exclusion, matching :func:`generate_ar_mask` and both reference implementations.
+  # `same_wave & same_group` is trivially true on the diagonal, so without this every
+  # position read its own slot -- see the "WHY THIS EXISTS" section of the module docstring in
+  # tests/inference/test_fixed_position_self_visibility.py for why that is wrong and what it
+  # measured. Only the diagonal is removed: same-wave/same-group mutual
+  # visibility (and the same-wave/different-group invisibility that gives this schedule
+  # its Jacobi independence) are both preserved exactly.
+  return mask * (~jnp.eye(seq_len, dtype=bool)).astype(dtype)
+
+
+def generate_wave_ar_mask(
+  wave: WaveScheduleBundle,
+  tie_group_map: jnp.ndarray,
+  dtype: DTypeLike = jnp.int8,
+) -> AutoRegressiveMask:
+  # Canonicalise the dtype spelling so each logical dtype is one static jit cache key.
+  return _generate_wave_ar_mask_jit(wave, tie_group_map, dtype=jnp.dtype(dtype))
+
+
+generate_wave_ar_mask.__doc__ = _generate_wave_ar_mask_jit.__doc__
+
+
+def ar_mask_from_decoding_order(
+  decoding_order: DecodingOrder,
+  tie_group_map: jnp.ndarray | None = None,
+  dtype: DTypeLike = jnp.int8,
+) -> AutoRegressiveMask:
+  """Causal, self-excluding mask for an ORDER array (``decoding_order[t]`` = position at step t).
+
+  This is the mask to pair with what ``utils.decoding_order`` functions return. It is built
+  through the same schedule the sampler decodes with (``WaveScheduleBundle.from_decoding_order``
+  then :func:`generate_wave_ar_mask`), so a mask built here and a wave built from the same
+  order cannot disagree. :func:`generate_ar_mask` gives the same 0/1 values for an order (as
+  int8) and additionally accepts ``chain_idx``.
+
+  Args:
+    decoding_order: (L,) ORDER array.
+    tie_group_map: Optional (L,) tie group id per position. Tied positions are mutually
+      visible and decode at their earliest member's step, as in :func:`generate_ar_mask`.
+    dtype: Mask dtype (default ``int8``). The export wrappers pass ``float32`` so the exported
+      graph carries no integer mask ops.
+
+  Returns:
+    (L, L) mask (``int8`` by default); ``mask[i, j] == 1`` iff position ``i`` sees position ``j``.
+  """
+  # Lazy import kept as a precaution. A static walk of explicit imports from aminx.types.* finds
+  # no path back to this module. The only path found runs through the package root:
+  # aminx.types.bundles -> aminx (aminx/__init__.py) -> aminx.sampling.sample -> this module.
+  # Whether a module-level import would actually fail at runtime is NOT established: it was not run.
+  from aminx.types.bundles import WaveScheduleBundle  # noqa: PLC0415 -- see comment above
+
+  seq_len = decoding_order.shape[0]
+  groups = jnp.arange(seq_len, dtype=jnp.int32) if tie_group_map is None else tie_group_map
+  wave = WaveScheduleBundle.from_decoding_order(jnp.asarray(decoding_order), tie_group_map)
+  return generate_wave_ar_mask(wave, groups, dtype=dtype)
+
+
+def decoding_order_from_wave(
+  wave: WaveScheduleBundle,
+  tie_group_map: jnp.ndarray,
+) -> jax.Array:
+  """The ORDER array a `WaveScheduleBundle` actually decodes (jit/vmap-safe).
+
+  Positions sorted by the wave their tie group first appears in; positions that share a
+  wave (a tie group, or conditionally independent groups of a chromatic wave) are ordered
+  by position, and positions the schedule never reaches come last. For a wave built by
+  ``WaveScheduleBundle.from_decoding_order(order, tie_group_map)`` this recovers ``order``
+  exactly when untied, and ``random_decoding_order``'s (step, position) convention when
+  tied.
+
+  Args:
+    wave: The schedule.
+    tie_group_map: (L,) tie group id per position (state-0 convention).
+
+  Returns:
+    (L,) int32 ORDER array.
+  """
+  seq_len = tie_group_map.shape[0]
+  position_wave_index = _position_wave_index(wave, tie_group_map)
+  positions = jnp.arange(seq_len, dtype=jnp.int32)
+  # Two explicit keys, (wave, position): a strict total order, so the result does not depend
+  # on sort stability (IREE's sort is not stable; see utils/decoding_order.py).
+  _, order = jax.lax.sort(
+    (position_wave_index, positions),
+    dimension=0,
+    is_stable=False,
+    num_keys=2,
+  )
+  return jnp.asarray(order, dtype=jnp.int32)
+
+
+def full_context_ar_mask(seq_len: int, dtype: DTypeLike = jnp.int8) -> AutoRegressiveMask:
+  """Every position sees every other position's sequence, but not its own: ``1 - I``.
+
+  ``ar_mask[i, j] == 1`` means position ``i`` SEES position ``j``'s sequence. The decoder
+  gathers it into ``attention_mask`` and uses it as ``mask_bw`` to gate the *sequence* edge
+  features, while ``1 - attention_mask`` gates the structure-only path
+  (``model/decoder.py:144-147``). **An all-zero ``ar_mask`` therefore admits no sequence
+  information at all** and reduces any "conditional" quantity to a function of structure
+  alone.
+
+  This lives here, public and next to the other mask builders, because that mistake has now
+  been made at four separate sites, each with a comment or docstring asserting the opposite:
+
+  - ``forward_jac`` -- made the categorical Jacobian identically zero for its whole
+    existence, fixed in 40f7edfc. Its comment read "fully conditional / no autoregressive
+    masking, every position sees every other", which is precisely backwards.
+  - the runner's reverse-mode path -- same construct, fixed in 40f7edfc. Not catastrophic
+    there (the score reads ``one_hot`` directly, so context loss shifts the gradient by
+    ~0.16% rather than annihilating it) but wrong for a mutation-effect estimate.
+  - ``sampling.conditional_logits``'s split ``decode_fn`` default, and therefore the
+    runner's batched ``conditional_logits`` feature, which relied on it (#4222).
+  - the runner's ``decoded_node_features`` feature (#4204).
+
+  - ``scoring/score.py`` -- a FIFTH site, and a different variant: not an all-zero mask but
+    a self-*inclusive* one, ``generate_ar_mask(decoding_order)`` as it was before the diagonal
+    fix, whose diagonal was 1. That leaked each residue's own identity into its own
+    prediction (+0.036243 nats on 1LVB
+    chain A, paired over 8 seeds, t = 41.3) and made the score depend on the PRNG key at
+    ``backbone_noise=0``, since a fresh order meant a fresh mask.
+
+  Every one of those failures was silent: right shape, right dtype, no error, no warning.
+  Note the two failure modes are opposites -- too little context and too much -- so a test
+  that only checks "the mask is not all zeros" catches one and misses the other.
+
+  ``1 - I`` matches the "full context minus self" default that
+  ``inference/bundle_builder.py:227-228`` uses for ``mode="score_conditional"``, so a
+  teacher-forced conditional built with this mask agrees with the full
+  ``make_conditional_logits_fn`` path. Self-exclusion is wanted independently: a position's
+  dependence on its own token is self-dependence, not a coupling.
+
+  An all-zero mask is still a legitimate thing to ask for -- it is what "unconditional"
+  means -- but it must be passed **explicitly**, never arrived at by omission.
+
+  Args:
+    seq_len: Number of positions.
+
+  Returns:
+    ``(seq_len, seq_len)`` int8 mask, ones off the diagonal and zeros on it.
+  """
+  return (~jnp.eye(seq_len, dtype=bool)).astype(dtype)

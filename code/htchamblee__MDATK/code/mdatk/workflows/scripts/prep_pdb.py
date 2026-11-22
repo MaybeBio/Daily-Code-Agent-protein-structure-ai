@@ -1,0 +1,136 @@
+"""Prepare an RNA PDB file for tleap.
+
+tleap rebuilds hydrogens from its residue templates and expects 5'-terminal
+nucleotides without a phosphate, a TER record between chains, and residue
+names it knows.  This keeps the first MODEL only, drops hydrogens, the
+phosphate atoms of every chain's first nucleotide and (optionally) waters and
+Rosetta's virtual residues, and writes TER records at chain changes and
+residue-number gaps.  A residue made of phosphate atoms alone (a chimera's
+PO2 bridge, a phosphate ion) is kept: tleap then names it instead of
+building the strands it joined as unconnected ones.
+"""
+
+from __future__ import annotations
+
+import sys
+
+PHOSPHATE = {"P", "OP1", "OP2", "OP3", "O1P", "O2P", "O3P"}
+WATERS = {"HOH", "WAT", "H2O", "TIP", "TIP3", "SOL", "DOD"}
+# Rosetta's virtual residues (VRT: the root of a density-scored fold tree, atoms ORIG / X / Y; XXX): tleap has
+# no unit for them, cannot type their atoms and fails to save the topology
+VIRTUAL = {"VRT", "XXX"}
+RESNAMES = {"RA": "A", "RC": "C", "RG": "G", "RU": "U", "ADE": "A", "CYT": "C", "GUA": "G",
+            "URA": "U", "URI": "U", "A5": "A", "C5": "C", "G5": "G", "U5": "U", "A3": "A",
+            "C3": "C", "G3": "G", "U3": "U"}
+
+
+def is_hydrogen(line):
+    element = line[76:78].strip() if len(line) >= 78 else ""
+    if element:
+        return element.upper() in ("H", "D")
+    name = line[12:16].strip().lstrip("0123456789")
+    return name.upper().startswith(("H", "D"))
+
+
+def nucleotide_keys(lines):
+    """(chain, residue number + insertion code) of the residues with sugar atoms (a primed name)."""
+    keys = set()
+    for line in lines:
+        if line.startswith("ENDMDL"):
+            break
+        if line[:6] in ("ATOM  ", "HETATM") and ("'" in line[12:16] or "*" in line[12:16]):
+            keys.add((line[21:22], line[22:27]))
+    return keys
+
+
+def prepare(lines, strip_h=True, strip_5p=True, gap_ter=True, strip_water=True, rename=True,
+            drop_virtual=False):
+    lines = list(lines)
+    nucleotides = nucleotide_keys(lines)  # only these lose a 5'-phosphate
+    out = []
+    prev_key = None
+    prev_chain = None
+    prev_num = None
+    pending_ter = False
+    first_residue = False
+    stats = {"atoms": 0, "hydrogens": 0, "phosphates": 0, "waters": 0, "chains": 0}
+    if drop_virtual:
+        stats["virtual"] = 0
+    for raw in lines:
+        line = raw.rstrip("\n")
+        rec = line[:6]
+        if rec.startswith("ENDMDL"):
+            break
+        if rec.startswith("TER"):
+            pending_ter = True
+            continue
+        if rec not in ("ATOM  ", "HETATM"):
+            continue
+        line = line.ljust(54)
+        resname = line[17:20].strip()
+        if strip_water and resname.upper() in WATERS:
+            stats["waters"] += 1
+            continue
+        if drop_virtual and resname.upper() in VIRTUAL:  # dropped before the chain logic: no TER of its own
+            stats["virtual"] += 1
+            continue
+        chain = line[21]
+        try:
+            num = int(line[22:26])
+        except ValueError:
+            num = prev_num
+        key = (chain, line[22:27])
+        if key != prev_key:
+            gap = (gap_ter and prev_num is not None and num is not None
+                   and num != prev_num and num != prev_num + 1)
+            new_chain = prev_key is None or chain != prev_chain or pending_ter or gap
+            if new_chain:
+                if out and not out[-1].startswith("TER"):
+                    out.append("TER")
+                stats["chains"] += 1
+            first_residue = new_chain
+            pending_ter = False
+            prev_key, prev_chain, prev_num = key, chain, num
+        if strip_h and is_hydrogen(line):
+            stats["hydrogens"] += 1
+            continue
+        name = line[12:16].strip()
+        if strip_5p and first_residue and name.upper() in PHOSPHATE and key in nucleotides:
+            stats["phosphates"] += 1
+            continue
+        if rename and resname.upper() in RESNAMES:
+            line = line[:17] + f"{RESNAMES[resname.upper()]:>3s}" + line[20:]
+        out.append(line.rstrip())
+        stats["atoms"] += 1
+    if out and not out[-1].startswith("TER"):
+        out.append("TER")
+    out.append("END")
+    return out, stats
+
+
+def main(argv, strip_h=True, strip_5p=True, gap_ter=True, strip_water=True, rename=True, drop_virtual=False):
+    if len(argv) != 2 or argv[0] in ("-h", "--help"):
+        print("usage: python3 THIS_SCRIPT INPUT.pdb OUTPUT.pdb", file=sys.stderr)
+        return 2
+    try:
+        with open(argv[0], "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.readlines()
+    except OSError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    lines, stats = prepare(raw, strip_h, strip_5p, gap_ter, strip_water, rename, drop_virtual)
+    if not stats["atoms"]:
+        # a model check that passes on up to N models writes the slots it cannot fill without atoms
+        slot = next((ln[11:].strip() for ln in raw if ln.startswith("REMARK 951") and "empty slot" in ln), "")
+        what = (f"{argv[0]} is an empty slot of a model check ({slot}): no model to build" if slot
+                else f"no atoms found in {argv[0]}")
+        print(f"ERROR: {what}", file=sys.stderr)
+        return 1
+    with open(argv[1], "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    print(f"{argv[1]}: {stats['atoms']} atoms in {stats['chains']} chain(s); removed "
+          f"{stats['hydrogens']} hydrogens, {stats['phosphates']} 5'-phosphate atoms, "
+          f"{stats['waters']} water atoms"
+          + (f", {stats['virtual']} atoms of Rosetta virtual residues" if stats.get("virtual") else ""),
+          file=sys.stderr)
+    return 0

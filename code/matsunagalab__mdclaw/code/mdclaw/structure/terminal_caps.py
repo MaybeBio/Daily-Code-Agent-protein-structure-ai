@@ -1,0 +1,917 @@
+"""
+Structure Server - PDB retrieval and structure cleaning tools.
+
+Provides tools for:
+- Automatic retrieval of structure files from PDB/AlphaFold/PDB-REDO (prefers mmCIF)
+- Chain separation and classification using gemmi
+- Structure cleaning, missing residue modeling, water/heterogen removal, and protonation using PDBFixer
+- Automatic detection of disulfide bonds and CYS->CYX renaming
+- Mutation modeling with HPacker
+- Ligand chemistry preparation with SMILES/SDF template matching
+- LLM-friendly structure validation and error reporting at each step
+"""
+
+# Configure logging early to suppress noisy third-party logs
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from mdclaw._common import setup_logger  # noqa: E402
+
+logger = setup_logger(__name__)
+
+import re  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
+
+from openmm.app import PDBFile  # noqa: E402
+from mdclaw._common import (  # noqa: E402
+    BaseToolWrapper,
+)
+
+# Default working directory for prepare_complex when output_dir is not specified
+WORKING_DIR = Path(".")
+PDB_CHAIN_ID_POOL = (
+    list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    + list("abcdefghijklmnopqrstuvwxyz")
+    + list("0123456789")
+)
+_DEUTERIUM_FALLBACK_ATOM_NAME_RE = re.compile(r"^D[0-9]*$")
+DEFAULT_TERMINAL_CAP_FORCEFIELD = "ff19SB"
+SUPPORTED_N_TERMINAL_CAPS = {"ACE"}
+SUPPORTED_C_TERMINAL_CAPS = {"NME"}
+TERMINAL_CAP_RESIDUES = SUPPORTED_N_TERMINAL_CAPS | SUPPORTED_C_TERMINAL_CAPS
+SUPPORTED_PREP_SOLVENT_TYPES = {"explicit", "implicit", "vacuum"}
+_CYX_ALLOWED_HYDROGEN_NAMES = frozenset({"H", "HA", "HB2", "HB3"})
+
+# Initialize tool wrappers
+pdb2pqr_wrapper = BaseToolWrapper("pdb2pqr")
+pdb4amber_wrapper = BaseToolWrapper("pdb4amber")
+
+from mdclaw.structure.pdb_utils import _load_pdb_with_variant_bonds, _pdb_hydrogen_count, _pdb_hydrogen_counts_by_resname, _pdb_noncap_protein_hydrogen_signature, _pdb_residue_names, _read_pdb_unique_residues, restore_resnames_by_residue_key  # noqa: E402
+
+
+def _normalize_terminal_cap_choice(
+    value: str | None,
+    *,
+    terminus: str,
+) -> str | None:
+    """Normalize a user-facing terminal cap choice.
+
+    The current Amber/OpenMM path only supports the standard ACE/NME pair.
+    ``None`` and common explicit "no cap" spellings mean uncapped.
+    """
+    if value is None:
+        return None
+    normalized = str(value).strip().upper()
+    if normalized in {"", "NONE", "NO", "FALSE", "UNCAPPED", "OFF"}:
+        return None
+    allowed = (
+        SUPPORTED_N_TERMINAL_CAPS
+        if terminus == "n"
+        else SUPPORTED_C_TERMINAL_CAPS
+    )
+    if normalized not in allowed:
+        allowed_text = ", ".join(sorted(allowed))
+        raise ValueError(
+            f"Unsupported {terminus.upper()}-terminal cap {value!r}; "
+            f"supported values are: {allowed_text}, or none"
+        )
+    return normalized
+
+
+TERMINAL_CAP_RESNAMES = frozenset({"ACE", "NME"})
+
+
+def detect_input_terminal_caps(structure_file) -> list[dict[str, Any]]:
+    """Terminal caps already present in a structure, before anything is added.
+
+    A deposit can arrive capped - 1DFJ chain I carries an N-terminal ACE - and
+    ACE/NME sit in ``AMBER_PROTEIN_RESIDUES``, so preparation keeps them and
+    counts them as protein residues. Nothing else reports that, which leaves a
+    caller unable to tell a capped input from an uncapped one until the residue
+    count disagrees with whatever it is being compared against.
+
+    Returns one record per cap: chain, residue number, residue name, and which
+    terminus it sits at, judged by whether it is the first or last residue of
+    its chain.
+    """
+    import gemmi
+
+    caps: list[dict[str, Any]] = []
+    try:
+        structure = gemmi.read_structure(str(structure_file))
+    except Exception as exc:                                   # unreadable input
+        logger.warning(f"Could not scan {structure_file} for terminal caps: {exc}")
+        return caps
+    structure.setup_entities()
+    for model in structure:
+        for chain in model:
+            residues = [r for r in chain]
+            if not residues:
+                continue
+            for position, residue in ((0, residues[0]), (-1, residues[-1])):
+                name = residue.name.strip().upper()
+                if name not in TERMINAL_CAP_RESNAMES:
+                    continue
+                caps.append({
+                    "chain": chain.name,
+                    "resnum": str(residue.seqid.num),
+                    "resname": name,
+                    "terminus": "n" if position == 0 else "c",
+                })
+        break                                                  # first model only
+    return caps
+
+
+def strip_input_terminal_caps(structure_file, output_file,
+                              caps: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Write ``structure_file`` without the terminal caps it arrived with.
+
+    The symmetric operation to the add-cap settings: with it, capped-or-not is
+    the caller's choice rather than a property of whichever deposit was
+    fetched. Only removes caps at a chain terminus, which is what
+    :func:`detect_input_terminal_caps` reports; an ACE anywhere else is not a
+    cap and is left alone.
+    """
+    import gemmi
+
+    caps = detect_input_terminal_caps(structure_file) if caps is None else caps
+    # Keyed on the residue NAME as well as chain and number: a deposit numbers
+    # the cap the same as the residue it caps - 1DFJ has both ACE and MET at
+    # I:1 - so matching on the number alone deletes a real residue with it.
+    targets = {(c["chain"], str(c["resnum"]), c["resname"]) for c in caps}
+    if not targets:
+        return {"success": True, "removed": [], "output_file": str(structure_file)}
+
+    structure = gemmi.read_structure(str(structure_file))
+    structure.setup_entities()
+    removed = []
+    for model in structure:
+        for chain in model:
+            # Delete in place, back to front. Emptying the chain and refilling
+            # it from a list of residues held across the clear segfaults gemmi.
+            for index in range(len(chain) - 1, -1, -1):
+                residue = chain[index]
+                key = (chain.name, str(residue.seqid.num),
+                       residue.name.strip().upper())
+                if key not in targets:
+                    continue
+                removed.append({"chain": chain.name,
+                                "resnum": str(residue.seqid.num),
+                                "resname": residue.name.strip().upper()})
+                del chain[index]
+        break
+    structure.setup_entities()
+    structure.write_pdb(str(output_file))
+    return {"success": True, "removed": removed, "output_file": str(output_file)}
+
+
+def _resolve_terminal_cap_settings(
+    *,
+    cap_termini: bool,
+    n_terminal_cap: str | None,
+    c_terminal_cap: str | None,
+) -> tuple[str | None, str | None]:
+    """Resolve legacy ``cap_termini`` and explicit one-sided cap settings."""
+    n_cap = _normalize_terminal_cap_choice(n_terminal_cap, terminus="n")
+    c_cap = _normalize_terminal_cap_choice(c_terminal_cap, terminus="c")
+    if cap_termini:
+        if n_terminal_cap is None:
+            n_cap = "ACE"
+        if c_terminal_cap is None:
+            c_cap = "NME"
+    return n_cap, c_cap
+
+
+# How many unobserved terminal residues --build-terminal-missing-residues
+# rebuilds at a component end without a range to bound it.
+_TERMINAL_BUILD_LIMIT = 10
+
+
+def _sequence_positions(structure_file) -> dict[str, dict]:
+    """``{label: {"positions": {(num, icode): seq_id}, "first": int, "last": int}}``.
+
+    The polymer sequence of each label chain, observed or not: mmCIF
+    ``_pdbx_poly_seq_scheme`` (which numbers unobserved residues too), or for
+    PDB the SEQRES alignment gemmi makes (observed residues only). A chain
+    without a sequence record is absent: its native ends are unknown.
+    """
+    import gemmi
+
+    path = Path(structure_file)
+    out: dict[str, dict] = {}
+    if path.suffix.lower() in (".cif", ".mmcif"):
+        block = gemmi.cif.read(str(path)).sole_block()
+        table = block.find("_pdbx_poly_seq_scheme.", [
+            "asym_id", "seq_id", "pdb_seq_num", "?pdb_ins_code"])
+        for row in table:
+            try:
+                seq_id = int(row[1])
+                number = int(row[2])
+            except ValueError:
+                continue
+            icode = row[3].strip().strip("'\"") if row.has(3) else ""
+            icode = "" if icode in {".", "?"} else icode
+            entry = out.setdefault(row[0], {"positions": {}, "first": seq_id, "last": seq_id})
+            entry["positions"].setdefault((number, icode), seq_id)
+            entry["first"] = min(entry["first"], seq_id)
+            entry["last"] = max(entry["last"], seq_id)
+        if out:
+            return out
+        structure = gemmi.make_structure_from_block(block)
+    else:
+        structure = gemmi.read_pdb(str(path))
+    structure.setup_entities()
+    structure.assign_label_seq_id()
+    for subchain in structure[0].subchains():
+        entity = structure.get_entity_of(subchain)
+        if entity is None or not entity.full_sequence:
+            continue
+        positions = {(r.seqid.num, str(r.seqid.icode).strip()): r.label_seq
+                     for r in subchain if r.label_seq}
+        if positions:
+            out[subchain.subchain_id()] = {
+                "positions": positions, "first": 1, "last": len(entity.full_sequence)}
+    return out
+
+
+def native_terminus_caps(structure_file, split_result, *, n_cap, c_cap,
+                         build_terminal_missing_residues=False) -> list[dict]:
+    """Requested caps that would sit on a polymer's own end.
+
+    A cap replaces a charged terminus with an amide that stands in for the
+    rest of a chain; on the polymer's real end there is no rest. Campaign v5
+    capped 1AA3 268-330 and 1ARD 102-130 (each the whole deposited entity) in
+    8 attempts, unasked. A terminus is native when nothing of the entity's
+    sequence lies beyond it -- the component's first (last) residue, or the
+    residue a terminal build reaches, is the first (last) sequence position.
+    A terminus a residue range cut inside the sequence, or one beyond which
+    the deposit leaves residues unobserved, is not native and may be capped.
+    Returns ``{"terminus", "cap", "chain", "label", "residue", "file"}`` per
+    refused end; a chain without a sequence record is never refused.
+    """
+    if not (n_cap or c_cap):
+        return []
+    try:
+        sequences = _sequence_positions(structure_file)
+    except Exception as exc:  # noqa: BLE001 - an unreadable sequence refuses nothing
+        logger.warning(f"Could not read the polymer sequence of {structure_file}: {exc}")
+        return []
+    infos = {str(info.get("file")): info for info in split_result.get("chain_file_info", []) or []}
+    problems: list[dict] = []
+    for protein_file in split_result.get("protein_files", []) or []:
+        info = infos.get(str(protein_file), {})
+        sequence = sequences.get(str(info.get("chain_id")))
+        if not sequence:
+            continue
+        residues = [r for r in _read_pdb_unique_residues(protein_file)
+                    if isinstance(r["resnum"], int) and r["resname"] not in TERMINAL_CAP_RESIDUES]
+        if not residues:
+            continue
+        positions = sequence["positions"]
+        first = positions.get((residues[0]["resnum"], residues[0]["icode"]))
+        last = positions.get((residues[-1]["resnum"], residues[-1]["icode"]))
+        if build_terminal_missing_residues:
+            pieces = ([info["residue_range"]] if info.get("residue_range")
+                      else list(info.get("residue_ranges") or []))
+            if pieces:
+                start = positions.get((pieces[0].get("start"), pieces[0].get("start_icode") or ""))
+                end = positions.get((pieces[-1].get("end"), pieces[-1].get("end_icode") or ""))
+                first = start if start is not None else first
+                last = end if end is not None else last
+            else:
+                if first is not None and first - sequence["first"] <= _TERMINAL_BUILD_LIMIT:
+                    first = sequence["first"]
+                if last is not None and sequence["last"] - last <= _TERMINAL_BUILD_LIMIT:
+                    last = sequence["last"]
+        author = info.get("author_chain") or residues[0]["chain"]
+        for terminus, cap, position, end, residue in (
+                ("N", n_cap, first, sequence["first"], residues[0]),
+                ("C", c_cap, last, sequence["last"], residues[-1])):
+            if cap and position is not None and position == end:
+                problems.append({
+                    "terminus": terminus, "cap": cap, "chain": author,
+                    "label": info.get("chain_id"),
+                    "residue": f"{author}:{residue['resname']}{residue['resnum']}{residue['icode']}",
+                    "file": str(protein_file),
+                })
+    return problems
+
+
+def native_terminus_cap_next_action(problems: list[dict], *, n_cap, c_cap) -> str:
+    """Which cap flags to keep so only cut termini are capped."""
+    native = {item["terminus"] for item in problems}
+    keep = []
+    if n_cap and "N" not in native:
+        keep.append(f"--n-terminal-cap {n_cap}")
+    if c_cap and "C" not in native:
+        keep.append(f"--c-terminal-cap {c_cap}")
+    spelled = ", ".join(f"{item['terminus']}-terminus {item['residue']}" for item in problems)
+    if keep:
+        # Lead with the default. Agents followed the old wording ("cap only the
+        # cut termini with --n-terminal-cap ACE") on requests that never asked
+        # for caps; the ACE/NME residue then failed the residue-count and
+        # composition checks against charged-termini references (test-v6-cli:
+        # 109_complex_5sxp x3, 115_nanobody_8ijz x2, 116_nanobody_6ni2 x2).
+        return (f"{spelled} is the polymer's own end and cannot be capped. Unless the request "
+                "explicitly asks for capped termini, drop every cap flag (--cap-termini / "
+                "--n-terminal-cap / --c-terminal-cap) so the termini stay charged -- a cap is an "
+                "extra ACE/NME residue the target system does not have. Only when caps are asked "
+                f"for, cap just the cut termini with {' '.join(keep)}. Then run the same (still "
+                "pending) node again.")
+    return (f"{spelled} is the polymer's own end. Drop --cap-termini / --n-terminal-cap / "
+            "--c-terminal-cap so the native termini stay charged, then run the same (still "
+            "pending) node again.")
+
+
+def _terminal_cap_forcefield_xml(forcefield_name: str | None) -> tuple[str | None, str | None]:
+    """Resolve a protein force field name to the XML used for cap H completion."""
+    from mdclaw import forcefield_catalog as _ff_catalog
+
+    requested = forcefield_name or DEFAULT_TERMINAL_CAP_FORCEFIELD
+    canonical = _ff_catalog.normalize_protein(requested)
+    if not canonical or canonical not in _ff_catalog.PROTEIN_FORCEFIELDS:
+        return None, requested
+    entry = _ff_catalog.PROTEIN_FORCEFIELDS[canonical]
+    if not entry.openmm_xml:
+        return None, canonical
+    return entry.openmm_xml[0], canonical
+
+
+# pdb2pqr's AMBER.DAT carries ACE/NME charges, but its topology does not
+# define either residue, so it can neither complete their hydrogens nor
+# recognise OpenMM's names for the atoms it did get. It charges the handful of
+# atoms it matches, finds the cap charge non-integral, and aborts the entire
+# run -- so a capped chain never reaches the protonation baseline at all.
+# Completing the cap hydrogens and writing them under pdb2pqr's own names makes
+# each cap sum to zero, which is all pdb2pqr needs to pass the cap through
+# untouched, including leaving the capped residue as a plain amide instead of
+# building an NTER/CTER onto it. OpenMM's PDB loader maps these names back on
+# the way out, so nothing downstream has to know they were ever changed.
+_PDB2PQR_CAP_ATOM_NAMES = {
+    ("ACE", "H1"): "HH31",
+    ("ACE", "H2"): "HH32",
+    ("ACE", "H3"): "HH33",
+    ("NME", "C"): "CH3",
+    ("NME", "H1"): "HH31",
+    ("NME", "H2"): "HH32",
+    ("NME", "H3"): "HH33",
+}
+
+
+def _pdb_atom_name_field(name: str) -> str:
+    """Render an atom name into PDB columns 13-16.
+
+    A four-character name occupies the field outright; shorter ones keep the
+    leading space that the element column alignment depends on.
+    """
+    return name.ljust(4)[:4] if len(name) >= 4 else f" {name}".ljust(4)
+
+
+def _rewrite_cap_atom_names_for_pdb2pqr(pdb_file: Path) -> int:
+    """Rename ACE/NME atoms in place to the names pdb2pqr's AMBER.DAT uses."""
+    renamed = 0
+    lines = []
+    for line in pdb_file.read_text().splitlines(keepends=True):
+        if line.startswith(("ATOM", "HETATM")):
+            key = (line[17:20].strip().upper(), line[12:16].strip())
+            new_name = _PDB2PQR_CAP_ATOM_NAMES.get(key)
+            if new_name:
+                line = line[:12] + _pdb_atom_name_field(new_name) + line[16:]
+                renamed += 1
+        lines.append(line)
+    pdb_file.write_text("".join(lines))
+    return renamed
+
+
+
+# Atoms only a free terminus carries. A deposit with hydrogens (NMR; 1AA3's
+# domain starts at ILE 268 with H/H2/H3) keeps them when a cap is attached, and
+# OpenMM then finds an N-terminal ILE bonded to ACE: "No template found for
+# residue 1 (ILE) ... externally bonded atoms has 1 N atom too many"
+# (090_soluble_1aa3, campaign v2). The capped residue is no longer a terminus.
+_N_TERMINUS_ONLY = ("H1", "H2", "H3", "HN1", "HN2", "HN3", "HT1", "HT2", "HT3")
+_C_TERMINUS_ONLY = ("OXT", "HXT", "OT2", "HO")
+
+
+def _strip_terminus_atoms_next_to_caps(modeller) -> list[str]:
+    """Delete terminus-only atoms of residues a cap is attached to.
+
+    Next to an N-cap, one amide hydrogen stays (an ``H1`` is renamed ``H`` when
+    the residue has no ``H``); next to a C-cap, ``OXT``/``HXT`` go. Returns the
+    removed atoms as ``RES chainNUM ATOM`` labels.
+    """
+    doomed, removed = [], []
+    for chain in modeller.topology.chains():
+        residues = list(chain.residues())
+        for index, residue in enumerate(residues):
+            name = residue.name.upper()
+            if name in SUPPORTED_N_TERMINAL_CAPS and index + 1 < len(residues):
+                target = residues[index + 1]
+                atoms = {atom.name: atom for atom in target.atoms()}
+                if "H" not in atoms:
+                    for alias in ("H1", "HN1", "HT1"):
+                        if alias in atoms:
+                            atoms.pop(alias).name = "H"
+                            break
+                names = [n for n in _N_TERMINUS_ONLY if n in atoms]
+            elif name in SUPPORTED_C_TERMINAL_CAPS and index > 0:
+                target = residues[index - 1]
+                atoms = {atom.name: atom for atom in target.atoms()}
+                names = [n for n in _C_TERMINUS_ONLY if n in atoms]
+            else:
+                continue
+            for atom_name in names:
+                doomed.append(atoms[atom_name])
+                removed.append(f"{target.name} {chain.id}{target.id} {atom_name}")
+    if doomed:
+        modeller.delete(doomed)
+    return removed
+
+
+def _prepare_terminal_caps_for_pdb2pqr(
+    pdb_file: str | Path,
+    *,
+    forcefield_name: str | None = None,
+    ph: float = 7.4,
+) -> dict:
+    """Make ACE/NME caps legible to pdb2pqr, without touching anything else.
+
+    PDBFixer inserts caps as heavy atoms only. This completes just their
+    hydrogens -- every hydrogen Modeller adds elsewhere is deleted again, so
+    pdb2pqr still sees the same unprotonated protein it saw before and still
+    owns the protonation baseline.
+
+    Failure is hard, not soft. pdb2pqr cannot complete a cap itself and aborts
+    the whole structure over the non-integral charge that leaves, so handing it
+    the original file would only reproduce that abort under a less informative
+    code.
+    """
+    input_path = Path(pdb_file).resolve()
+    output_file = input_path.with_name(f"{input_path.stem}.cap_pdb2pqr.pdb")
+    result: dict[str, Any] = {
+        "success": False,
+        "input_file": str(input_path),
+        "output_file": None,
+        "cap_hydrogens_added": 0,
+        "cap_atoms_renamed": 0,
+        "resnames_restored": False,
+        "warnings": [],
+        "errors": [],
+    }
+
+    present_caps = _pdb_residue_names(input_path) & TERMINAL_CAP_RESIDUES
+    if not present_caps:
+        result["success"] = True
+        result["skipped"] = True
+        return result
+
+    forcefield_xml, _canonical = _terminal_cap_forcefield_xml(forcefield_name)
+    if not forcefield_xml:
+        result["code"] = "terminal_cap_hydrogen_completion_unavailable"
+        result["errors"].append(
+            "Could not resolve an OpenMM protein force-field XML to complete "
+            f"terminal cap hydrogens before pdb2pqr: {forcefield_name!r}"
+        )
+        return result
+
+    try:
+        from openmm.app import ForceField, Modeller
+
+        pdb = _load_pdb_with_variant_bonds(input_path)
+        modeller = Modeller(pdb.topology, pdb.positions)
+        stripped = _strip_terminus_atoms_next_to_caps(modeller)
+        if stripped:
+            result["terminus_atoms_removed_next_to_caps"] = stripped
+            result["warnings"].append(
+                "Removed free-terminus atoms from residues a cap is attached to: "
+                + ", ".join(stripped[:6]) + ("..." if len(stripped) > 6 else ""))
+        original_atoms = {
+            (
+                atom.residue.chain.id,
+                atom.residue.id,
+                atom.residue.name,
+                atom.name,
+            )
+            for atom in modeller.topology.atoms()
+        }
+        modeller.addHydrogens(ForceField(forcefield_xml), pH=ph)
+        added_outside_caps = [
+            atom
+            for atom in modeller.topology.atoms()
+            if atom.residue.name.upper() not in TERMINAL_CAP_RESIDUES
+            and (
+                atom.residue.chain.id,
+                atom.residue.id,
+                atom.residue.name,
+                atom.name,
+            )
+            not in original_atoms
+        ]
+        modeller.delete(added_outside_caps)
+        cap_atoms_after = sum(
+            1
+            for atom in modeller.topology.atoms()
+            if atom.residue.name.upper() in TERMINAL_CAP_RESIDUES
+        )
+        cap_atoms_before = sum(
+            1
+            for key in original_atoms
+            if key[2].upper() in TERMINAL_CAP_RESIDUES
+        )
+        with output_file.open("w") as handle:
+            PDBFile.writeFile(
+                modeller.topology,
+                modeller.positions,
+                handle,
+                keepIds=True,
+            )
+    except Exception as exc:  # noqa: BLE001 - returned as a structured failure
+        result["code"] = "terminal_cap_hydrogen_completion_failed"
+        result["errors"].append(
+            "Could not complete terminal cap hydrogens before pdb2pqr: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return result
+
+    # OpenMM's PDB loader normalises Amber residue variants on load (CYX->CYS,
+    # ASH->ASP, HID/HIE/HIP->HIS). Writing that back out would hand pdb2pqr a
+    # structure whose cysteines are no longer the disulfide-bonded CYX this
+    # prep decided on, and pdb2pqr would only re-derive them from geometry --
+    # silently discarding an explicit --disulfide-pairs choice, or a bond the
+    # deposit declares but geometry alone would miss. Restore by residue key,
+    # exactly as the post-pdb2pqr helper does.
+    restored = restore_resnames_by_residue_key(output_file.read_text(), input_path)
+    if restored is None:
+        result["code"] = "terminal_cap_hydrogen_completion_failed"
+        result["errors"].append(
+            "Could not restore residue names after completing terminal cap "
+            f"hydrogens; refusing to hand pdb2pqr a renamed structure: {output_file}"
+        )
+        return result
+    output_file.write_text(restored)
+    result["resnames_restored"] = True
+
+    result["cap_hydrogens_added"] = cap_atoms_after - cap_atoms_before
+    result["cap_atoms_renamed"] = _rewrite_cap_atom_names_for_pdb2pqr(output_file)
+    result["output_file"] = str(output_file)
+    result["success"] = True
+    return result
+
+
+def _classify_terminal_cap_noncap_hydrogen_changes(
+    before: dict[str, tuple[str, ...]],
+    after: dict[str, tuple[str, ...]],
+    *,
+    safe_terminal_residue_keys: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return unsafe and accepted non-cap H changes after cap completion.
+
+    ``Modeller.addHydrogens`` operates on the whole topology. For disulfide
+    cysteines, Amber ``CYX`` residues may be heavy-only after pdb4amber
+    (N/CA/CB/SG/C/O) and OpenMM can safely add the ordinary backbone/CB
+    hydrogens while still omitting thiol ``HG``. That specific CYX completion is
+    acceptable; for one-sided caps, the uncapped terminal residue may likewise
+    be heavy-only and require ordinary terminal/protein hydrogens.  Existing H
+    changes, internal-residue repairs, and CYX thiol ``HG`` addition remain
+    hard guardrail failures.  Amber and OpenMM disagree on one common charged
+    N-terminus name (``H1`` vs ``H``), so that terminal-only naming alias is
+    treated as chemically identical.
+    """
+    unsafe: list[str] = []
+    accepted: list[str] = []
+    safe_terminal_residue_keys = safe_terminal_residue_keys or set()
+    changed = sorted(
+        key
+        for key in (set(before) | set(after))
+        if before.get(key) != after.get(key)
+    )
+    for key in changed:
+        before_names = set(before.get(key, ()))
+        after_names = set(after.get(key, ()))
+        is_cyx = key.endswith("::CYX")
+        if is_cyx and "HG" in after_names:
+            unsafe.append(key)
+            continue
+        cyx_safe_completion = (
+            is_cyx
+            and before_names.issubset(after_names)
+            and after_names.issubset(_CYX_ALLOWED_HYDROGEN_NAMES)
+        )
+        terminal_h_name_alias_only = (
+            key in safe_terminal_residue_keys
+            and _normalize_terminal_h_name_aliases(before_names)
+            == _normalize_terminal_h_name_aliases(after_names)
+        )
+        terminal_heavy_only_completion = (
+            key in safe_terminal_residue_keys
+            and not before_names
+            and bool(after_names)
+            and before_names.issubset(after_names)
+        )
+        if (
+            cyx_safe_completion
+            or terminal_h_name_alias_only
+            or terminal_heavy_only_completion
+        ):
+            accepted.append(key)
+        else:
+            unsafe.append(key)
+    return unsafe, accepted
+
+
+def _normalize_terminal_h_name_aliases(names: set[str]) -> set[str]:
+    return {"H" if name == "H1" else name for name in names}
+
+
+def _pdb_line_residue_signature_key(line: str) -> str:
+    chain = line[21:22].strip()
+    resnum = line[22:26].strip()
+    icode = line[26:27].strip()
+    resname = line[17:20].strip().upper()
+    return f"{chain}:{resnum}:{icode}:{resname}"
+
+
+def _restore_noncap_terminal_h_aliases(
+    output_text: str,
+    input_pdb: str | Path,
+    *,
+    safe_terminal_residue_keys: set[str],
+) -> tuple[str, list[str]]:
+    """Restore non-cap terminal H names when OpenMM only renamed H1 -> H."""
+    if not safe_terminal_residue_keys:
+        return output_text, []
+
+    try:
+        input_lines = Path(input_pdb).read_text().splitlines()
+    except OSError:
+        return output_text, []
+
+    input_h1_field_by_key: dict[str, str] = {}
+    input_has_h_keys: set[str] = set()
+    for line in input_lines:
+        if not line.startswith(("ATOM  ", "HETATM")) or len(line) < 27:
+            continue
+        key = _pdb_line_residue_signature_key(line)
+        if key not in safe_terminal_residue_keys:
+            continue
+        atom_name = line[12:16].strip().upper()
+        if atom_name == "H1":
+            input_h1_field_by_key.setdefault(key, line[12:16])
+        elif atom_name == "H":
+            input_has_h_keys.add(key)
+
+    candidate_keys = set(input_h1_field_by_key) - input_has_h_keys
+    if not candidate_keys:
+        return output_text, []
+
+    output_lines = output_text.splitlines()
+    output_has_h1_keys = {
+        _pdb_line_residue_signature_key(line)
+        for line in output_lines
+        if line.startswith(("ATOM  ", "HETATM"))
+        and len(line) >= 27
+        and _pdb_line_residue_signature_key(line) in candidate_keys
+        and line[12:16].strip().upper() == "H1"
+    }
+
+    restored: set[str] = set()
+    rewritten: list[str] = []
+    for line in output_lines:
+        if line.startswith(("ATOM  ", "HETATM")) and len(line) >= 27:
+            key = _pdb_line_residue_signature_key(line)
+            atom_name = line[12:16].strip().upper()
+            if (
+                key in candidate_keys
+                and key not in output_has_h1_keys
+                and atom_name == "H"
+            ):
+                padded = line.ljust(80)
+                line = (
+                    padded[:12] + input_h1_field_by_key[key] + padded[16:]
+                ).rstrip()
+                restored.add(key)
+        rewritten.append(line)
+
+    trailing = "\n" if output_text.endswith("\n") else ""
+    return "\n".join(rewritten) + trailing, sorted(restored)
+
+
+def _pdb_residue_signature_key(residue: dict[str, Any]) -> str:
+    chain = str(residue.get("chain") or "")
+    resnum = str(residue.get("resnum_str") or residue.get("resnum") or "")
+    icode = str(residue.get("icode") or "")
+    resname = str(residue.get("resname") or "").upper()
+    return f"{chain}:{resnum}:{icode}:{resname}"
+
+
+def _uncapped_terminal_noncap_residue_keys(residues: list[dict[str, Any]]) -> set[str]:
+    """Return first/last non-cap residue keys only when that terminus is uncapped."""
+    by_chain: dict[str, list[dict[str, Any]]] = {}
+    for residue in residues:
+        by_chain.setdefault(str(residue.get("chain") or ""), []).append(residue)
+
+    keys: set[str] = set()
+    for chain_residues in by_chain.values():
+        if not chain_residues:
+            continue
+        first = chain_residues[0]
+        last = chain_residues[-1]
+        if str(first.get("resname") or "").upper() not in TERMINAL_CAP_RESIDUES:
+            keys.add(_pdb_residue_signature_key(first))
+        if str(last.get("resname") or "").upper() not in TERMINAL_CAP_RESIDUES:
+            keys.add(_pdb_residue_signature_key(last))
+    return keys
+
+
+def _complete_terminal_cap_hydrogens_with_modeller(
+    pdb_file: str | Path,
+    *,
+    expected_caps: set[str] | None = None,
+    forcefield_name: str | None = None,
+    ph: float = 7.4,
+) -> dict:
+    """Complete ACE/NME cap hydrogens with OpenMM Modeller during prep.
+
+    This is deliberately a prep-only, cap-scoped helper. Topology generation
+    still validates atom/H completeness and does not perform generic repair.
+    """
+    input_path = Path(pdb_file).resolve()
+    output_file = input_path.with_name(f"{input_path.stem}.cap_h.pdb")
+    expected_caps = {str(c).upper() for c in (expected_caps or set()) if c}
+    result: dict[str, Any] = {
+        "success": False,
+        "input_file": str(input_path),
+        "output_file": str(output_file),
+        "method": "openmm_modeller",
+        "forcefield": forcefield_name or DEFAULT_TERMINAL_CAP_FORCEFIELD,
+        "forcefield_xml": None,
+        "cap_residues_present": [],
+        "expected_caps": sorted(expected_caps),
+        "hydrogens_added": 0,
+        "cap_hydrogens_added": 0,
+        "cap_hydrogen_count_before": {},
+        "cap_hydrogen_count_after": {},
+        "noncap_hydrogen_signature_preserved": None,
+        "noncap_hydrogen_signature_changed_residues": [],
+        "accepted_noncap_hydrogen_signature_changes": [],
+        "restored_noncap_terminal_h_aliases": [],
+        "warnings": [],
+        "errors": [],
+        "operations": [],
+    }
+
+    if not input_path.exists():
+        result["code"] = "terminal_cap_hydrogen_completion_failed"
+        result["errors"].append(f"Input PDB not found: {input_path}")
+        return result
+
+    present_caps = _pdb_residue_names(input_path) & TERMINAL_CAP_RESIDUES
+    result["cap_residues_present"] = sorted(present_caps)
+    missing_expected = sorted(expected_caps - present_caps)
+    if missing_expected:
+        result["code"] = "terminal_cap_missing"
+        result["errors"].append(
+            "Requested terminal cap residue(s) are absent after cleaning: "
+            f"{missing_expected}"
+        )
+        return result
+    if not present_caps:
+        result["success"] = True
+        result["skipped"] = True
+        result["operations"].append({
+            "step": "terminal_cap_hydrogen_completion",
+            "status": "skipped",
+            "details": "No ACE/NME terminal cap residues present",
+        })
+        return result
+
+    forcefield_xml, canonical_forcefield = _terminal_cap_forcefield_xml(forcefield_name)
+    result["forcefield"] = canonical_forcefield or result["forcefield"]
+    result["forcefield_xml"] = forcefield_xml
+    if not forcefield_xml:
+        result["code"] = "terminal_cap_hydrogen_completion_unavailable"
+        result["errors"].append(
+            "Could not resolve an OpenMM protein force-field XML for terminal "
+            f"cap hydrogen completion: {forcefield_name!r}"
+        )
+        return result
+
+    residues_before = _read_pdb_unique_residues(input_path)
+    safe_terminal_residue_keys = _uncapped_terminal_noncap_residue_keys(
+        residues_before
+    )
+    cap_h_before = _pdb_hydrogen_counts_by_resname(input_path, present_caps)
+    noncap_h_signature_before = _pdb_noncap_protein_hydrogen_signature(input_path)
+    total_h_before = _pdb_hydrogen_count(input_path)
+    result["cap_hydrogen_count_before"] = cap_h_before
+
+    try:
+        from openmm.app import ForceField, Modeller
+
+        pdb = _load_pdb_with_variant_bonds(input_path)
+        forcefield = ForceField(forcefield_xml)
+        modeller = Modeller(pdb.topology, pdb.positions)
+        stripped = _strip_terminus_atoms_next_to_caps(modeller)
+        if stripped:
+            result["terminus_atoms_removed_next_to_caps"] = stripped
+        modeller.addHydrogens(forcefield, pH=ph)
+        with output_file.open("w") as handle:
+            PDBFile.writeFile(
+                modeller.topology,
+                modeller.positions,
+                handle,
+                keepIds=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        result["code"] = "terminal_cap_hydrogen_completion_failed"
+        result["errors"].append(
+            f"Terminal cap hydrogen completion failed: {type(exc).__name__}: {exc}"
+        )
+        return result
+
+    # OpenMM's PDBFile loader normalized Amber/PTM residue names (ASH->ASP,
+    # HID->HIS, GLH->GLU, ...) on load; restore them from the pre-cap input by
+    # residue key (cap H were added, so atom counts differ and the atom-index
+    # restore cannot be used). Without this the identity guard below sees the
+    # renamed residues and fails the whole prep on any capped+protonated input.
+    _restored = restore_resnames_by_residue_key(output_file.read_text(), input_path)
+    if _restored is not None:
+        output_file.write_text(_restored)
+
+    _restored_alias_text, restored_aliases = _restore_noncap_terminal_h_aliases(
+        output_file.read_text(),
+        input_path,
+        safe_terminal_residue_keys=safe_terminal_residue_keys,
+    )
+    if restored_aliases:
+        output_file.write_text(_restored_alias_text)
+        result["restored_noncap_terminal_h_aliases"] = restored_aliases
+
+    residues_after = _read_pdb_unique_residues(output_file)
+    if residues_after != residues_before:
+        result["code"] = "terminal_cap_hydrogen_completion_failed"
+        result["errors"].append(
+            "Terminal cap hydrogen completion changed residue identity/order."
+        )
+        return result
+
+    noncap_h_signature_after = _pdb_noncap_protein_hydrogen_signature(output_file)
+    if noncap_h_signature_after != noncap_h_signature_before:
+        changed, accepted = _classify_terminal_cap_noncap_hydrogen_changes(
+            noncap_h_signature_before,
+            noncap_h_signature_after,
+            safe_terminal_residue_keys=safe_terminal_residue_keys,
+        )
+        result["accepted_noncap_hydrogen_signature_changes"] = accepted
+        result["code"] = "terminal_cap_hydrogen_completion_changed_noncap_hydrogens"
+        if changed:
+            result["noncap_hydrogen_signature_preserved"] = False
+            result["noncap_hydrogen_signature_changed_residues"] = changed
+            preview = ", ".join(changed[:5])
+            if len(changed) > 5:
+                preview += f", ... (+{len(changed) - 5} more)"
+            result["errors"].append(
+                "Terminal cap hydrogen completion changed non-cap protein "
+                f"hydrogens: {preview}"
+            )
+            return result
+        result.pop("code", None)
+    result["noncap_hydrogen_signature_preserved"] = True
+
+    cap_h_after = _pdb_hydrogen_counts_by_resname(output_file, present_caps)
+    total_h_after = _pdb_hydrogen_count(output_file)
+    cap_added = sum(cap_h_after.values()) - sum(cap_h_before.values())
+    result["cap_hydrogen_count_after"] = cap_h_after
+    result["hydrogens_added"] = max(0, total_h_after - total_h_before)
+    result["cap_hydrogens_added"] = max(0, cap_added)
+    # Modeller adds whatever the template lacks, so "nothing added" on caps that
+    # already carry hydrogens means they arrived complete (e.g. a fragment
+    # re-cleaned by extract_tripeptide). Only a cap left with no hydrogens at
+    # all is worth a warning.
+    bare_caps = sorted(name for name in present_caps if not cap_h_after.get(name))
+    if result["cap_hydrogens_added"] == 0 and bare_caps:
+        result["warnings"].append(
+            "OpenMM Modeller completed but cap residue(s) "
+            f"{', '.join(bare_caps)} still have no hydrogens."
+        )
+
+    result["operations"].append({
+        "step": "terminal_cap_hydrogen_completion",
+        "status": "success",
+        "method": "openmm_modeller",
+        "forcefield": result["forcefield"],
+        "forcefield_xml": forcefield_xml,
+        "ph": ph,
+        "cap_residues_present": sorted(present_caps),
+        "cap_hydrogens_added": result["cap_hydrogens_added"],
+        "accepted_noncap_hydrogen_signature_changes": result[
+            "accepted_noncap_hydrogen_signature_changes"
+        ],
+        "restored_noncap_terminal_h_aliases": result[
+            "restored_noncap_terminal_h_aliases"
+        ],
+    })
+    result["success"] = True
+    return result

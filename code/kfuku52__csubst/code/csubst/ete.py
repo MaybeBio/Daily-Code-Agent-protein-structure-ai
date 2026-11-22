@@ -1,0 +1,232 @@
+"""ETE compatibility helpers.
+
+This module provides a small compatibility layer so CSUBST can run with either
+ete4 (preferred) or ete3 (fallback for older environments).
+"""
+
+from __future__ import annotations
+
+import os
+import types
+
+from csubst import sequence_io
+
+_ete4_import_error = None
+_ete3_import_error = None
+_backend = None
+
+try:
+    from ete4.core.tree import Tree as _ete4_tree  # type: ignore[import-not-found]
+    _ete_mod = types.SimpleNamespace(Tree=_ete4_tree)
+    _backend = "ete4"
+except Exception as exc:  # pragma: no cover - backend-specific
+    _ete4_import_error = exc
+    _ete_mod = None
+
+if _backend is None:
+    try:
+        import ete3 as _ete_mod  # type: ignore[import-not-found]
+        _backend = "ete3"
+    except Exception as exc:  # pragma: no cover - backend-specific
+        _ete3_import_error = exc
+
+if _backend is None:  # pragma: no cover - backend-specific
+    raise ImportError(
+        "Failed to import both ete4 and ete3. "
+        f"ete4 error={_ete4_import_error!r}, ete3 error={_ete3_import_error!r}"
+    )
+
+
+def backend_name():
+    return _backend
+
+
+def PhyloNode(source, format=1):
+    if _backend == "ete4":
+        # ete4 treats path-like strings as filenames and opens them internally
+        # without a context manager in some code paths. Read explicitly here to
+        # avoid leaking file descriptors under strict warning settings.
+        if isinstance(source, (str, os.PathLike)) and os.path.exists(source):
+            with open(source, "r", encoding="utf-8") as handle:
+                source = handle.read()
+        return _ete_mod.Tree(source, parser=format)
+    return _ete_mod.PhyloNode(source, format=format)
+
+
+def is_root(node):
+    value = getattr(node, "is_root")
+    return value() if callable(value) else bool(value)
+
+
+def is_leaf(node):
+    value = getattr(node, "is_leaf")
+    return value() if callable(value) else bool(value)
+
+
+def get_leaf_names(node):
+    if hasattr(node, "leaf_names"):
+        return list(node.leaf_names())
+    return node.get_leaf_names()
+
+
+def get_leaves(node):
+    if hasattr(node, "leaves"):
+        return list(node.leaves())
+    return node.get_leaves()
+
+
+def get_children(node):
+    if hasattr(node, "children"):
+        return list(node.children)
+    return node.get_children()
+
+
+def get_sisters(node):
+    if hasattr(node, "sisters"):
+        return list(node.sisters())
+    return node.get_sisters()
+
+
+def get_descendants(node):
+    if hasattr(node, "descendants"):
+        return list(node.descendants())
+    return node.get_descendants()
+
+
+def iter_leaves(node):
+    if hasattr(node, "leaves"):
+        return node.leaves()
+    return node.iter_leaves()
+
+
+def iter_ancestors(node):
+    if hasattr(node, "ancestors"):
+        return node.ancestors()
+    return node.iter_ancestors()
+
+
+def get_common_ancestor(tree, targets):
+    if hasattr(tree, "common_ancestor"):
+        return tree.common_ancestor(targets)
+    return tree.get_common_ancestor(targets)
+
+
+def get_distance(node, target, topology_only=False):
+    if _backend == "ete4":
+        return node.get_distance(node, target, topological=topology_only)
+    return node.get_distance(target=target, topology_only=topology_only)
+
+
+def get_tree_root(tree):
+    if hasattr(tree, "root"):
+        return tree.root
+    return tree.get_tree_root()
+
+
+def node_has_state(node, state_has_mass=None):
+    if state_has_mass is None:
+        return True
+    nl = get_prop(node, "numerical_label", None)
+    try:
+        nl = int(nl)
+    except (TypeError, ValueError):
+        return False
+    if (nl < 0) or (nl >= len(state_has_mass)):
+        return False
+    return bool(state_has_mass[nl])
+
+
+def get_effective_state_parent(node, state_has_mass=None, accumulate_distance=False):
+    parent = getattr(node, "up", None)
+    if accumulate_distance:
+        distance = max(float(getattr(node, "dist", 0.0) or 0.0), 0.0)
+    while parent is not None:
+        if node_has_state(parent, state_has_mass=state_has_mass):
+            if accumulate_distance:
+                return parent, distance
+            return parent
+        if accumulate_distance:
+            distance += max(float(getattr(parent, "dist", 0.0) or 0.0), 0.0)
+        parent = getattr(parent, "up", None)
+    if accumulate_distance:
+        return None, distance
+    return None
+
+
+def add_features(node, **kwargs):
+    if hasattr(node, "add_props"):
+        node.add_props(**kwargs)
+        return None
+    return node.add_features(**kwargs)
+
+
+def _read_fasta(path):
+    records = sequence_io.read_fasta_records(path)
+    # Keep both complete headers and identifier aliases, but never silently
+    # concatenate sequences when more than one header has the same identifier.
+    seq_dict = sequence_io.records_to_dict(records, key="id")
+    seq_dict.update(sequence_io.records_to_dict(records, key="description"))
+    return seq_dict
+
+
+def set_prop(node, key, value):
+    if (_backend == "ete4") and hasattr(node, "add_props"):
+        node.add_props(**{key: value})
+        return value
+    setattr(node, key, value)
+    return value
+
+
+def get_prop(node, key, default=None):
+    if (_backend == "ete4") and hasattr(node, "props"):
+        return node.props.get(key, default)
+    return getattr(node, key, default)
+
+
+def has_prop(node, key):
+    if (_backend == "ete4") and hasattr(node, "props"):
+        return key in node.props
+    return hasattr(node, key)
+
+
+def del_prop(node, key):
+    if (_backend == "ete4") and hasattr(node, "props"):
+        if key in node.props:
+            del node.props[key]
+        return None
+    if hasattr(node, key):
+        delattr(node, key)
+    return None
+
+
+def link_to_alignment(tree, alignment, alg_format="fasta"):
+    if alg_format.lower() != "fasta":
+        if _backend != "ete4":
+            tree.link_to_alignment(alignment=alignment, alg_format=alg_format)
+            return None
+        raise ValueError(f"Unsupported alignment format for ete4 compatibility: {alg_format}")
+    seq_dict = _read_fasta(alignment)
+    for leaf in iter_leaves(tree):
+        seq = seq_dict.get(leaf.name)
+        if seq is None:
+            # Common fallback: FASTA headers may contain extra description fields.
+            seq = seq_dict.get(leaf.name.split(" ", 1)[0], "")
+        set_prop(leaf, "sequence", seq)
+    return None
+
+
+def write_tree(tree, format=1, outfile=None):
+    if _backend == "ete4":
+        text = tree.write(parser=format, format_root_node=True)
+        if outfile is None:
+            return text
+        with open(outfile, "w") as handle:
+            handle.write(text)
+        return None
+    return tree.write(format=format, outfile=outfile)
+
+
+def get_treeview_module():
+    # Tree plotting is matplotlib-based in CSUBST; keep this compatibility
+    # function as a stable no-op for callers that still import it.
+    return None

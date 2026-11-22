@@ -1,0 +1,654 @@
+# What is checked, and what checking it found
+
+Every claim in this workspace is checked against a **closed form** — an exact limit, a conservation
+law, a convergence rate — or against an independent computation. Never against a second copy of the
+same idea, which verifies nothing. This file is the long form of that: the invariants, the places
+two domains meet, and the defects that came out of taking the rule seriously.
+
+It was the body of `README.md` until that file was cut back to what it is and how to run it.
+
+## Two invariants
+
+Both are now enforced rather than promised, and both survived being generalised past
+optics.
+
+**Nothing is created or destroyed without being noticed.** A `Ledger` is what a
+process claims to hold, `audit` is the check, and a `Violation` names what went
+missing and where. Energy crossing between domains goes over an `Exchange`, which
+compares what was published against what was consumed — because each domain
+conserving energy internally says nothing about the interface between two
+discretisations of the same surface, and that interface is where it actually leaks.
+`SurfaceOptics` still cannot be written down in a form that returns more light than
+reached it.
+
+**Nothing is random.** `Rng::for_index(seed, index)` hashes a work item into its own
+stateless stream, so ray 10 000 can be drawn before ray 3 and neither result
+changes. That is what lets a simulation be parallel *and* bit-reproducible — a
+single shared generator loses reproducibility precisely when the run gets big enough
+to need it. `rng::tests::the_stream_is_pinned` fixes the generator's output as a
+constant, and changing that constant is never the fix.
+
+The parallel half of that is executed rather than argued. `TreeNBody::with_threads`
+changes how many threads evaluate forces, and
+`tree::tests::parallel_and_sequential_agree_bit_for_bit` asserts one force evaluation is
+identical across one, two, three, four, eight and sixteen of them, and
+`a_threaded_run_reproduces_a_sequential_one` holds twenty steps of integration identical
+across one, two, four and eight. It holds because each thread owns a disjoint
+range of the output: there is no reduction, so there is no summation order to vary.
+
+`PeriodicForceField` has a reduction — every pair adds to two forces and to the energy —
+and keeps it on one thread. The threads compute what each pair adds, span of atoms by
+span, and the calling thread adds the spans in order, so every sum takes the one-thread
+evaluation's additions in its order. `periodic::tests::the_threads_move_no_bit` holds the
+energy, the forces, the virial and a decoupling's coupling on 2, 3, 7, 16 and 64 threads
+to one thread's, by the cell list and the neighbour list, each by cells and over every
+pair, before and after the atoms move, asserting each time that the threads were spawned;
+and the pins of the bits `b6558df` and `8b58114` gave before there were threads pass at
+three and at sixteen.
+
+## Running several domains at once
+
+Domains do not agree on how big a step is: an explicit FDTD solver on a nanometre
+grid is stable to about 10⁻¹⁷ s, heat conduction to 10⁻⁹ s, rigid contact to 10⁻⁴ s,
+and a thermal drift that defocuses an instrument plays out over seconds. Stepping
+everything at the smallest limit integrates the slow domains ten billion times for
+nothing. Three mechanisms deal with that:
+
+- `Kind::QuasiStatic` — a domain with no state to roll forward, re-solved on demand
+  rather than stepped. Light crosses an instrument in nanoseconds; against a thermal
+  timescale that is zero, so optics is never integrated. The largest single saving
+  available.
+- `Schedule::Multirate` — each evolving domain takes as many equal substeps as its
+  own stability limit needs. Integer counts from a fixed limit, never adaptive, so
+  two runs follow the same arithmetic path.
+- `Schedule::Iterative` — repeats the sweep until the residuals settle. Necessary
+  because a staggered coupling can be unstable no matter how small the step is; the
+  standard example is fluid-structure interaction at comparable densities. Failing
+  to converge is a `Violation`, not a result — an unconverged coupling produces
+  numbers that look like physics.
+
+## Where two domains meet
+
+Sharing a clock is not enough; they also have to share a *place*. `Exchange::publish`
+carries an amount and nothing else, so "a 1 mm beam on a 20 mm mirror" and "one watt
+spread over the whole mirror" are the same message — and a coating fails at its hot
+spot, not at its average.
+
+An `Interface` is a boundary cut into faces that both sides address, and a `Flux` is a
+quantity spread over them. Both sides share one discretisation on purpose: interpolating
+between two meshes is where energy quietly goes missing, so a face-count disagreement is
+refused rather than papered over, and a caller who genuinely needs to cross grids says so
+with `Flux::resample`, which conserves the total by construction. Spatial channels are
+audited **face by face** — a redistribution that keeps the total but moves it to the wrong
+end of a mirror is exactly the bug a total-only check cannot see.
+
+Three things fell out of building it that are worth knowing.
+
+An enthalpy's reference point is arbitrary, so it should be chosen for precision, and the
+obvious choice is the bad one. Measured from absolute zero the aluminium bar in these
+tests holds 1.42 kJ, so a millijoule arriving is a change in the seventh significant figure,
+and differencing two such numbers leaves a rounding floor of a few times 10⁻¹² J whatever
+the transfer was — worse as the grid is refined, because there are more absolute
+temperatures to add up: 1.6×10⁻¹² J at 41 cells against 7.3×10⁻¹² J at 161. Measured from the initial temperature, the number being summed *is* the change.
+
+An insulated bar under a continuous beam does not flatten out. It settles into a fixed
+shape and rides upward on a mean that climbs forever, so the hot spot is permanent and the
+lumped model's error in kelvin never shrinks; what shrinks is the *fraction*. The
+intuition that says it evens out eventually is about a bar heated once.
+
+And how often the domains talk is itself an error source — here the largest one, and the
+only one no conservation check can catch. A 10 ms coupling window on a bar whose own step
+is 0.44 ms delivers exactly the right joules and reads the peak temperature 12% low,
+because the bar spends most of each window relaxing with nothing arriving. Nothing is
+lost, nothing is created, both domains stay inside their stability limits, and the answer
+is still wrong. The only thing that finds it is a solution that never went through the
+coupling: `tests/beam_heats_where_it_lands.rs` computes one by quadrature from the
+steady-state energy balance, checks *that* against the exact `ṫL²/12α` for a point
+source, and then watches the coupled answer converge on it as the window shrinks.
+
+## Closed form where there is one
+
+`Motion` is a function of `t`: ask for the world at 0.7 s and you get it, without
+having computed 0.6 s first. An exposure can therefore be sampled at seven instants
+for motion blur, and frame 7 of a recording does not depend on frame 6.
+
+That is not available in general — three bodies under gravity have no closed form,
+and neither do contact or heat — so `Integrator` rolls those forward instead, under
+three rules that keep the reproducibility: fixed steps, no wall clock, ordered
+reduction. And for anything conservative it is `velocity_verlet` rather than `Rk4`:
+RK4 is more accurate per step and steadily *dissipates*, while the symplectic method
+is second order and holds its energy within a bound. The test module proves that on a
+harmonic oscillator against the closed-form energy.
+
+## A discretisation that is exact where it matters, and what checking it found
+
+`pantometry-pharmacokinetic` is the one domain here whose *whole* model has closed forms, so the
+interesting result is not that they matched. It is what asking for them turned up.
+
+**Explicit Euler reproduces a constant infusion's steady state exactly, at any step.** The scheme
+is first order and the transient is first order, but the fixed point of `A ← A + h(R − kA)` is
+`A* = R/k`, which is the fixed point of `A' = R − kA` — the discretisation error is in *how* the
+solution approaches the plateau and not in where the plateau is. So that assertion is written at
+`1e-12` where every other assertion about the same run is written at a tolerance derived from
+`t k² h/2`, and the difference between the two numbers is a statement about the scheme rather than
+about how much slack was needed. A single loose tolerance covering both would have hidden it.
+
+**The area under an oral curve is exact for the same kind of reason, and that is why it checks
+less than it looks.** The Bateman curve the model steps is first order — measured at orders 1.0084,
+1.0043, 1.0021 as the step halves — but the Euler step removes exactly `CL·Cₙ·h`, so `CL·Σ Cₙh`
+*is* the eliminated mass and the books make it `F·D`. The left Riemann sum reads `AUC = F·D/CL` to
+2.6e-14, and does not halve when the step does. So the AUC check is the mass-balance identity: it
+pins `F`, and that the samples are the snapshot elimination acts on, and **nothing about timing**.
+A depot absorbing at the wrong rate — integrated by Euler instead of exactly — delivers the same
+total and passed it at 4.1e-15. The review that found that also found the order bands blind to
+the same defect, because a wrong error constant still converges at order one. What pins the
+constant is the exact solution of the stepped recurrence, `Aₙ = F·D(1 − E)(Eⁿ − rⁿ)/(E − r)` with
+`E = e^{−kₐh}` and `r = 1 − kh`, written so it does not cancel at `kₐ = k`: the model matches it to
+0.05–0.18 of a derived rounding bound at every point, and the Euler depot and absorption folded
+into the snapshot miss it by 1.5e-2 and 1.0e-2 at the first step. Deriving that bound found a
+rounding term of its own: the depot's `remaining − remaining·E` is exact, but the product is not,
+so the *absorbed* amount carries `ε/(2(1 − E))` of itself — 130 ulps at `kₐh = 3.75e-3` — which
+the first bound written, `(3n + 40)ε`, did not allow for and the test failed on at 1.3e-14.
+
+**Two tolerances in one test, differing by three orders of magnitude, for a reason that is not
+slack.** After one step from a bolus, the peripheral compartment's *gain* is checked to `1e-22` and
+the central compartment's *loss* to `1e-19`. The gain is read directly; the loss is
+`dose − amount`, a difference of two numbers near `1e-4` whose difference is near `2e-6`, so it
+carries `ε·dose ≈ 2e-20` of cancellation. Both numbers are the arithmetic's, and writing the
+looser one everywhere would have made the tighter check stop meaning anything.
+
+**And a mutation that changes no behaviour proves nothing about a test.** The known failure mode
+here is the one `ThermalNetwork` measured at 0.31% on a three-node ladder: apply an arriving amount
+to the compartment before computing the fluxes, and the compartment's outflow is taken from an
+already-raised concentration — every total stays exactly right and the steady state sits low by
+exactly the turnover number `h·CL/V`. The first attempt to check that the tests would catch it
+moved the dose onto `amount` inside the infusion loop and all fifteen still passed. The mutation
+was a **no-op**: the concentration snapshot is taken before that loop, so the fluxes could not see
+the change. Moving the snapshot as well — the real bug — is caught by two tests. Reporting the
+first result as "the tests are blind to this" would have been wrong in the direction that reads
+like diligence.
+
+**A moment of a stepped curve is exact too, less one step, and the step looks like
+discretisation error.** The perfusion-limited model's `V_ss = V_b + Σ K_p V_t` is checked from the
+moments of a bolus, `CL·AUMC/AUC`. For `P = I + hM` the geometric series of matrices give
+`h Σ Pⁿ = −M⁻¹`, the continuous AUC, and `h² Σ n Pⁿ = M⁻² + h M⁻¹`, the continuous AUMC *less*
+`h·AUC` — so the left-sum mean residence time of the stepped curve is `MRT − h`, exactly, at any
+step. Without the `+ h` the moment estimate of `V_ss` is off by `h·CL/V_ss`: 8.2e-4 at 60 s and
+4.1e-4 at 30 s, halving as the step does, which is exactly what first-order error looks like and
+what a tolerance would have been loosened to absorb. With it, 3.9e-14 and 9.8e-14. The same
+identity, `h Σ xₙ = −M⁻¹U` for any input schedule, makes hepatic first pass exact: a dose that
+enters through the liver reaches the blood with an AUC `1 − E` of one that does not, read at
+6.2e-15 with `E = 0.4`.
+
+**A maximum over a window can sit where the coefficient being measured vanishes.** The same
+model collapses to one compartment as the blood flows grow, and the deviation should fall as
+`1/Q`. Taken as the worst point from 24 to 72 hours, its orders over four doublings of `Q` were
+0.9997, 1.0005, 1.0004, 1.0003 — first order, and with departures that refused to halve, so no
+band could be earned from them. An eigendecomposition outside the crate said why: the worst point
+was at 24 h, the window's start, and at 24 h the `1/Q²` coefficient of the deviation nearly
+vanishes for these volumes and partitions, leaving the `1/Q³` share. At a fixed 48 h the orders
+are 0.8950, 0.9488, 0.9747, 0.9874, departures halving from 0.105 — matching the
+eigendecomposition to four digits — and that is what is asserted. The first measurement was not
+wrong; it was a measurement of a different, smaller, coefficient.
+
+## What implementing the field interface found
+
+The kind of thing that only surfaces when something uses a trait, and more of it once there
+were two implementors that disagreed.
+
+**`ScalarField::at` takes a time, and a marched domain has only "now".** A closed-form field
+like `Motion` answers for any instant; `Bar1D` holds one state and no history, so the
+argument is ignored. That would have made the default `rate` — a difference across two
+times — read zero, which is worse than unavailable, since the bar is visibly heating. The
+fix is not a workaround: a diffusive field's time derivative *is* `α∇²T`, so the governing
+equation supplies from the present state exactly what the finite difference wanted history
+for. And it is not approximately right. The explicit update is `T += α·dt·∇²T` on the same
+stencil, so the rate the field reports is bit-for-bit the step the domain is about to take.
+
+**A field's gradient cannot always be the derivative of its own values.** `at` interpolates
+linearly between cell centres, so its exact second derivative is zero between nodes and
+infinite at them — a Laplacian read off the interpolant is useless, and must come from the
+cell stencil instead. The cost is that `gradient` is the derivative the *scheme* uses rather
+than of `at` exactly. That is a property of sampling a discrete field, not a rough edge that
+could be polished out, and it is documented where a caller meets it.
+
+**`rate` is not always about the next step.** `Bar1D` marches forward, so the rate it reports
+is exactly the change the next step will make. `Room` is a leapfrog and stores its velocities
+half a step behind its pressures, so the velocity for the next update does not exist yet —
+what it can report exactly is `(pⁿ − pⁿ⁻¹)/h`, the step just taken. Being half a step behind
+is the better trade rather than a compromise: a centred difference at the midpoint is second
+order where a forward one at the present instant is first.
+
+**And a claim of mine that was simply wrong.** I wrote that the mirrored stencil gives a zero
+gradient at an insulated wall. For `Bar1D` it does not: its grid is cell-centred, so the first
+sample sits half a cell inside the wall where the temperature really is still changing.
+`Room`'s grid is node-centred, a node sits *on* the wall, and there the gradient is zero to
+the last bit. Same physics, different sampling — and only the second implementor could have
+shown that the first one's behaviour was about the grid rather than about the boundary.
+
+Two smaller things a caller will meet. A grid-backed field interpolates in `at` but snaps to
+the nearest node for its derivatives, because the derivatives are the scheme's own stencils
+and the scheme has values only at nodes — so combining them at an arbitrary point divides a
+number computed here by one computed slightly over there. And a signed field needs a
+different colour map from a positive one: a temperature climbs from a floor, a pressure swings
+about zero, and a ramp built for the first draws a room at rest as though half of it were
+cold. The report chooses between them from the run's own range — `pantometry-view::ramp` — and
+puts the neutral colour at the value zero rather than at the middle of the range, which for
+−100 to +300 are a quarter of the scale apart.
+
+## A boundary defect, and the thing that found it
+
+Both `Tube` and `Room` put their pressure samples *on* the walls rather than half a cell
+inside, so a wall sample owns half a cell. Both divided its divergence by the whole `dx`. The
+walls came out twice as heavy as they are, and every mode read low: 1.4% on an 89-cell room,
+5.4% on a coarse one.
+
+A percent and a half looks like discretisation error and invites a loose tolerance. What
+showed it was not: refining the grid **halved** the error instead of quartering it. A scheme
+second order in the interior converging at first order overall means the boundary is first
+order, and that is a wrong condition rather than a coarse one. The order of convergence found
+it; no single run could have.
+
+Two independent confirmations that the factor of two was the right one. The mirrored
+five-point stencil — the standard second-order treatment of a zero-gradient boundary — gives
+`2(p₁ − p₀)/dx²` at a wall, and the scheme was producing exactly half of that; with the fix
+they agree, which is now asserted directly by stepping once from rest and comparing against
+`ScalarField::laplacian` at every node. And the conservation audit still holds at 1e-15,
+because the energy carries the same half weights the update does. Those two had to move
+together: changing the update alone breaks the audit, and changing the audit alone hides the
+bug.
+
+The fix cost something real, which is the interesting part. `Tube`'s absorbing ends had been
+built against the unweighted update, and at the full CFL limit the corrected boundary drains
+a half-width cell with a factor of exactly **−1** — it inverts the wave instead of swallowing
+it. Not a divergence: a perfectly stable run that quietly reflects. So `max_stable_dt` now
+reports the impedance's own limit as well as the wave's, `Z·dx/2ρc²`, which halves the step
+for a matched end and leaves a closed one alone.
+
+### The same crate, the same shape, a second time
+
+There was another one, in the boundary in *time*, and it was still there after all of the
+above. `released_from` set the velocity to zero at `t = 0`, but a staggered leapfrog carries
+velocity at `t = −h/2`, so the first velocity update travelled a whole step where the initial
+condition entitled it to half. `O(h)`, permanent, and `h` follows `dx` — first order again,
+from a scheme whose interior and whose walls were now both second order.
+
+Found the same way, by the rate. Not by anything in the library: it took `pantometry-world`, the
+first consumer, checking a released mode against `|cos(2πft)|`. The worst departure over 20 ms
+went from 0.0528 to 0.00238 at 31 cells once the first update took half a step.
+
+Two things fell out of it that are worth more than the fix.
+
+**A test had turned the bug into the specification.** One step from rest was asserted to move
+the pressure by `h²c²∇²p` — but from rest `ṗ(0) = 0`, so Taylor gives `½h²c²∇²p`. The test was
+missing the half because the scheme was, and `Tube` carried the identical pair. Both were
+written by reading the implementation. A test written from the closed form cannot do that,
+which is why the conventions say to write it that way.
+
+**And the old startup conserved energy exactly, while the correct one does not.** With `v = 0`
+read as the half-step value, `Σ∇·(p∇p) = 0` at a rigid wall makes the first step's energy
+change cancel to the last bit. Starting correctly breaks that cancellation by `O(h²)` — 0.42%
+at 31 cells, quartering on refinement, and only at the first step; from there the invariant
+holds to 1e-15. So the old code had bought exact bookkeeping by making the scheme first order.
+That is the trap this repository already had written down — *the functional and the update
+were consistent with each other and both wrong* — turning up a second time in the same crate,
+and the audit that was supposed to catch it was the thing keeping it in place. The energy is
+now measured against the released state as its datum, with the difference reported by
+`Room::startup_adjustment` and bounded so a real first-step bug cannot hide in it.
+
+### And a third time, in a film that radiates
+
+`Solid3D`'s cooled face had been through this already. Charged against the cell centre with the
+half cell left out, it converged at 2.08, 2.04 and 2.02 a doubling, and the series form
+`1/(1/G_film + dx/2kA)` made it four — measured in `the_cooled_boundary_order.rs` at two Biot
+numbers, with `ε = 0`. That last condition was the gap. A convective film's conductance is the
+same wherever it is read; a radiating one's grows as `T³`, and the block still read it at the
+centre, which the half cell's drop puts above the surface. On a slab radiating at 800 K the cells
+sat 10.06 K too cold at 1 mm, falling by 1.87 to 1.98 a halving: first order again, behind a
+boundary that had been made second order, because the test that showed it second order turned
+radiation off to keep its closed form linear. Behind a mounting it did not converge at all — the
+joint's drop does not shrink with the cell, and the error tended to −6.21 K.
+
+The closed form that holds it now is the scheme's own. With the surface's temperature solved for,
+every cell of a uniformly heated slab sits exactly `q'''dx²/8k` above the continuous parabola,
+radiating or not, and the order is four to within 2.2e-5 —
+`crates/pantometry-thermal/tests/a_radiating_face_sheds_from_its_surface.rs`. The lesson is the
+one above with a narrower edge: a test that removes a non-linearity to keep its closed form exact
+has said nothing about the non-linear case, and the rate has to be measured there as well.
+
+## The domain whose answers are distributions
+
+Every domain but one is checked against a value: a Fresnel coefficient, a mode frequency, a
+temperature rise. `pantometry-molecular` mostly cannot be. A hundred atoms in a box are chaotic by
+construction — perturb one coordinate in its last bit and the trajectories separate completely
+inside a few hundred steps — so "close enough" is not available as a notion, and the physics
+lives in what the trajectory averages to.
+
+There turns out to be plenty of that, and all of it exact:
+
+| Claim | Exact form |
+| --- | --- |
+| Equipartition | `⟨KE⟩ = (3N − 3) k_BT / 2` |
+| Ideal gas, dilute | `PV = N k_BT`, departing as `1 + B₂(T)ρ` |
+| Virial pressure, any density | `PV = N k_BT + ⟨Σ f·r⟩/3` |
+| Lennard-Jones well | `−ε` exactly, at `2^(1/6)σ` |
+| Momentum | To the last bit, by Newton's third law |
+| Energy, unthermostatted | Bounded rather than drifting, because Verlet is symplectic |
+
+The `− 3` in the first row is not a rounding. Momentum is conserved and the drift was removed,
+so the centre of mass is frozen and three degrees of freedom are gone; counting all `3N` makes
+every reported temperature low by `1/N`, which is a percent at a hundred atoms and looks
+exactly like statistics.
+
+Two things this domain leans on harder than any other. `Rng::for_index` keys the Langevin noise
+on `(seed, step, particle)`, which is the *only* route back to a reproducible run in a chaotic
+system — there is no "close enough" to fall back on. And the symplectic argument behind
+`velocity_verlet`, which the kernel proves on a harmonic oscillator and which is relied on here
+for a many-body potential with a truncated force.
+
+The `melting` example is where this pays off. Three state points are equilibrated and the
+radial distribution function decides which phase each one is, rather than anyone declaring it:
+`g(r)` peaks at 5.1 for the crystal, 2.9 for the liquid and 1.4 for the gas, while the *number*
+of first neighbours barely moves between solid and liquid — 12.4 against 12.8. Melting costs the
+order and keeps the packing, which is why a liquid is nearly as dense as its solid and a gas is
+a thousand times thinner.
+
+The crystal panel is checked exactly before anything harder is attempted: an fcc lattice's
+neighbour shells are at `1 : √2 : √3 : 2` holding 12, 6, 24 and 12 atoms, and the histogram
+reproduces all four to 1e-12. Combinatorics rather than measurement.
+
+And one thing the data corrected. Long-range order should be checked at the *third* shell, not
+the fourth. The fourth was the obvious choice and reads 1.045 for the crystal against 0.999 for
+the liquid — no discrimination at all — because thermal broadening washes out a thin shell at a
+large radius long before a fat one nearer in. The third holds 24 atoms, twice as many as the
+fourth, and separates them cleanly at 2.81 against 1.27.
+
+One test in the crate is worth describing because of how it was wrong first. The ideal-gas check
+asserted that doubling the density doubles the departure, ran on one seed, and passed. Across
+four seeds the ratio came out 1.35, 1.61, 2.34 and 2.92 — averaging to 2.06, but landing
+anywhere. A hundred atoms is a small sample and two thousand correlated snapshots are far fewer
+independent ones than they look. The test now averages over seeds, and the fix for a noisy
+statistical test is more samples rather than a wider tolerance.
+
+## Watts, photons, and the chain that closes
+
+A spectrum is a shape until it is integrated against something. `SpectralPower`
+carries a shape and a total wattage, and answers two different questions from the
+same distribution: `through()` gives watts and `photon_rate()` gives photons per
+second. They are not proportional — a photon at 450 nm carries 1.44 times the energy
+of one at 650 nm, so a milliwatt of blue is *fewer* photons than a milliwatt of red,
+and every silicon detector responds to the count. Filtering moves the mean wavelength
+as well as the total, which is why scaling an unfiltered photon rate by a power
+fraction is wrong by nearly three times for a tungsten lamp.
+
+That number is also the seam between the two domains, and the integration test
+follows it end to end: a dichroic under a 5 W lamp absorbs 96.2 mW, which warms a
+25 mm lens 5.69 K above ambient, which grows its 100 mm mount by 4.04 µm — 46% of the
+depth of focus at NA 0.25 and two thirds of it at NA 0.30. Radiometry comes from the
+optics crate, heat capacity and expansion from the kernel's `Substance`, depth of
+focus from diffraction; the dimensions are what let them compose, and the `Exchange`
+audit is what proves nothing leaked on the way.
+
+Those figures used to be 10.0 K, 7.10 µm and 81%, and the difference is **radiation**.
+`LumpedMass::equilibrium_rise` was `P/(hA)` — convection only — while `step` always
+included the radiative term, so two public functions disagreed with the crate's own
+physics for as long as they existed. `Environment::loss_from`'s documentation had
+been explaining why that would be wrong the whole time: a black surface at room
+temperature radiates about 6 W·m⁻²·K⁻¹, the same order as still-air convection. It was
+reported from outside, by somebody who built a conclusion on the old number and had to
+retract the mechanism, and the error was always in the reassuring direction.
+
+## Numerical against analytic, on purpose
+
+Two ways of computing the same optics, kept side by side so each checks the other.
+`diffraction` answers what a perfect system does, in closed form from Bessel
+functions. `wavefront` answers what an imperfect one does, by transforming a pupil.
+Set the aberrations to zero and the second must reproduce the first — and it does, in
+three independent places that share no code:
+
+| | |
+| --- | --- |
+| Airy profile | The transformed pupil agrees with `[2J₁(v)/v]²` to under 0.5% of the peak, out to 3 λ/D |
+| Ideal MTF | The transform of the PSF agrees with `(2/π)(arccos s − s√(1−s²))`, the closed-form autocorrelation of a disc |
+| Strehl ratio | Small aberrations follow `exp(−(2πσ)²)`, the Maréchal approximation, whichever mode produced the error |
+
+The comparison is what makes either side trustworthy. A pupil transform has a great
+deal of room to be subtly wrong — a sampling factor, a sign, a normalisation — and
+none of it shows up as anything but a plausible picture.
+
+It also catches mistakes in the *questions*. The first Airy zero is at 1.22 λ/D and
+at 0.61 λ/NA; those are the same zero and the factor of two is the numerical aperture.
+Asking for encircled energy at the wrong one of them gives 59% instead of 84%, which
+is exactly what happened the first time.
+
+## A closed form agreeing to 1.1e-4 with a model that was 32.5% wrong
+
+The strongest check in this repository's scene battery writes a resistance stack out **term by
+term from the geometry** — every half cell, every conductivity, the film — and compares it against
+the marched answer. On `24-a-power-module-junction-to-ambient` it agreed to `1.1e-4` of a 141 K
+rise. It had agreed to `1.1e-4` since the day it was written.
+
+The junction temperature was wrong by **32.5%**.
+
+Not by a discretisation, and not by a tolerance that was too loose. The closed form and the solver
+were describing the same stack faithfully, and the *stack* was not the module. Two of its layers
+were 1.5 mm because 1.5 mm is one cell and a `regions` entry is a box of cells — the solder is
+100 µm, so it carried fifteen times its own resistance — and the largest resistance in a real
+junction-to-ambient path, the interface material under the baseplate, was not in the file at all
+because nothing in the format could name that face.
+
+| | K/W | junction |
+| --- | --- | --- |
+| as checked, to `1.1e-4` | 3.1379 | 181.19 °C |
+| with the joints stated | 4.1594 | 227.15 °C |
+
+**What this says about closed forms, which are the first of this workspace's five conventions.**
+"Check against a closed form, never against another implementation" is a rule about *arithmetic*,
+and it holds: the agreement was real and the solver is right about the problem it was given. What
+a closed form computed from the file cannot see is the file. Both sides read the same three
+regions and the same one film; a premise shared by the model and its check is not tested by their
+agreement, however tight, and tightness is exactly what makes it look tested.
+
+The two errors also happened to push opposite ways — thick layers up, the missing mounting down —
+so the number that came out was plausible on its own terms. A junction 46 K hotter or 90 K cooler
+would have been questioned. 181 °C was not.
+
+**What caught it** was neither a test nor the audit. It was reading the scene against a datasheet:
+asking what a SAC305 die-attach layer actually measures, and what sits between a baseplate and a
+cold plate. The fix is `Solid3D::joined` and `Solid3D::mounted_on` — a resistance per unit area
+with no thickness, checked against `1/(A·h)` exactly and against the marched steady state to four
+figures — and the scene now states three terms it previously could not. The closed-form check
+still agrees to `1.1e-4`, on a stack that is the module.
+
+## A rate that a corner sets, and the sweep that would not run to measure it
+
+`17-a-busbar-with-a-notch` is titled "the resistance the shape actually has". Every check it had
+was an inequality or an identity — more than `ρL/A`, more than a series estimate, Tellegen, the
+books closing — and every one of them holds at any grid. The one thing that would have asked how
+much of the answer was grid was the resolution sweep, and it **refused to run**, on the grounds
+that a blocked cell is a one-cell notch and refining shrinks it.
+
+That is true of a refinement that keeps the *indices* and of no other. A cell at `(6, 0, 0)` on a
+1 mm grid occupies `x ∈ [6, 7] mm`; at 0.5 mm those millimetres are indices 12 and 13. Each
+blocked cell becomes its eight children and the notch is the same notch — held in millimetres by
+`a_notch_keeps_its_millimetres`, not in indices, because a count of eight is not the claim.
+
+```text
+      h        in-plane     R at t = 5 mm     above the limit    three-point order
+    1 mm        12 x 5      1.2391920e-05        +4.6525%
+    0.5         24 x 10     1.2059472e-05        +1.8449%           1.33534
+    0.25        48 x 20     1.1927724e-05        +0.7323%           1.33296
+    0.125       96 x 40     1.1875426e-05        +0.2906%           1.33318
+    0.0625     192 x 80     1.1854670e-05        +0.1153%           1.33367
+    0.03125    384 x 160    1.1846434e-05        +0.0458%
+```
+
+One cell through the thickness, because `R·t` is exactly independent of it — `6.195960000000e-08`
+at `nz` = 1, 2, 3, 5 and 8, to twelve digits. That is what makes the table affordable: 0.0625 mm
+costs **1.1 s** that way against the **201 s** the same plane took at the shipped `nz = 5`. Read
+from the ten-digit CSV, because by 0.0625 mm the successive differences are 1e-5 of the value and
+seven digits stop resolving an order.
+
+**The rate is the closed form, and it is not two.** Current crowds into a re-entrant corner the way
+stress does. The conducting wedge at the notch root subtends `3π/2`, so the potential goes as
+`r^λ` with `λ = π/ω = 2/3` and the flux as `r^(-1/3)` — unbounded, at every grid. A resistance is a
+**quadratic** functional of that field, so its error goes as `h^(2λ) = h^(4/3)`. That is
+**1.33333**, against four measured orders that **bracket** it: 1.33534, 1.33296, 1.33318, 1.33367.
+The widest is 0.15% out and the other three are inside 0.03%, but the sequence is not monotone, and
+quoting the first three as a converging one would read tighter than it is — the spread is the
+subleading term, comparable at these grids to what is being measured.
+
+**And the reason first written here was a theorem about a different method.** It said "a resistance
+is an energy-norm quantity", which is the conforming-Galerkin identity `E_h − E = ‖u−u_h‖²_E`. By
+Dirichlet's principle that identity makes a voltage-driven resistor read **low**; every row above
+reads high. `Conductor` is not a Galerkin method — it is a cell-centred conductance network with
+harmonic-mean faces and `Σ g Δφ²` — and its face currents are exactly conservative per cell, so
+the argument is the **dual** one: a conservative current field is admissible for Thomson's
+principle, which makes every grid an *upper* bound, and the lumped `Σ g Δφ²` sits above the
+reconstruction's own quadrature by `(a²+b²)/2 − (a²+ab+b²)/3 = (a−b)²/6 ≥ 0`, cell by cell. The
+sign is *measured*, at all six grids; the dual argument is why it has to be that sign.
+
+This is worth more than the correction itself. The numbers were right, the exponent was right, the
+check passed, and the sentence explaining it predicted the **opposite sign** from the one every
+measurement showed. A justification is not tested by the thing it justifies agreeing.
+
+Every other convergence rate checked in this workspace is an **integer** — first order, second
+order, or an integrator's own, and the test names say which. This is the first that is not, and the
+first on a **singular** problem, and that is what makes the rate say something a value cannot.
+Every other quantity here
+converges: run a finer grid and the error goes away. Here it does not. The scene ships at 1 mm and
+is 4.65% from the limit, and the grid runs out before the answer does — not on the clock but on the
+**audit**: at 0.015625 mm the run is refused, its own 1e-9 drift budget reading 1.094e-9 after 95 s,
+floating-point noise over 246 k cells crossing a tolerance written for a scene a thousandth the
+size. The finest statement this scene can make about itself still has 0.046% in it. The useful
+thing about a notch is not its resistance, it is that no grid you can reach gives you the
+resistance and the rate tells you how far you are.
+
+So the scene keeps its 1 mm cells and states the error instead of spending a grid on it, checked
+against the Richardson limit at the measured `p = 4/3` — `1.184101e-05 ohm`, which is seven digits
+and all that the finest three pairs (1.1841016, 1.1841012, 1.1841016e-05) earn. **The limit is not
+a second implementation.**
+It is this solver's own answer extrapolated along a rate a closed form predicts and a separate test
+measures — which is the distinction the section above this one is about, from the other side.
+
+## A percentage of 4.08e-17, printed as a discretisation
+
+Making that sweep run produced this, under a heading that says "what moved is discretisation":
+
+```text
+  busbar   residual   0.000000 -> 0.000000  (281492.026%)
+```
+
+The values are 7.793e-13 and 6.644e-13 — two converged conjugate-gradient residuals, printed as
+zero by a `{:.6}` chosen for temperatures. The denominator is the **4.08e-17** the residual wobbled
+by between the first and second frame of the *base* run, which is the solver stopping at a
+different iterate on two solves of the same system. The header says the grid did it. The same sweep
+reported the residual "converging at order **-0.77**" in a column beside four real ones.
+
+**Flooring the denominator does not repair it, and that is the interesting part.** The wobble is
+5.2e-5 of the residual's own magnitude — orders of magnitude above any rounding floor — because it
+is real variation in a real quantity. The quantity converges to nothing: refine the grid and the
+iteration count changes, and the residual is wherever the iteration crossed its tolerance. No
+numerical rule separates this row from the others, because what separates it is what the number
+*means*.
+
+**A domain says which of its own readings describe the solve**, through `Domain::diagnostics`.
+Eleven labels across seven crates: a residual from `Conductor` and from elastic `Block`, a divergence
+and a cell Reynolds number from `Channel`, a `div B` from `Cavity`, a wavefunction norm from the
+quantum well, a rigid-mode count and mode separation from `Protein`, and the largest and the rms
+force, the converged flag and the step count from a minimising `Molecule`. They print their values
+with no percentage, get no order, and stay out of `Sweep::worst`, which the window sweep raises a
+finding on — held by a unit test that calls `compare` directly, because the filter was measured to
+be unreachable from any scene: deleting it left both workspaces green.
+
+**This was a list in `verify` and the list was the defect.** It named labels, so it went stale in
+silence and needed three pins to hold: the labels the scenes emit, the length of the list itself
+(the first pin constrains only the intersection, so `"flux"` and `"peak "` could be invented and
+the whole walk stayed green), and who emitted them — because keying on a label alone meant a *new*
+domain reporting `norm` as its **answer** would vanish from the sweep with nothing to say so.
+Asking the domain removes the first two problems by removing the list, and gives `(domain, label)`
+pairs, which is what the third needed. The scene walk pins the **85** `(label, unit)` pairs the
+thirty-four scenes emit — 74 answers and 11 diagnostics — and the **12** `(domain, label)` pairs, so
+an arrival or a departure is a decision somebody made rather than a line nobody read.
+
+The near misses are the argument for a list rather than a heuristic: `invariant` is the energy an
+FDTD scheme conserves — a physical quantity that converges — and `unevenness` and `ring over core`
+are what `18-an-espresso-shot` is asking, not how well it was solved. All three are dimensionless,
+all three sit at a value the physics holds them near, and all three are answers.
+
+## What the audit tolerance is really measuring
+
+A conservation audit needs a tolerance, and the right one is a property of the
+*integrator*, not a concession to sloppiness. Three cases in this workspace, all
+different:
+
+- **Momentum under N-body gravity**: 1e-11 and could be tighter. Newton's third law
+  is structural here, so the only loss is turning each force into an acceleration and
+  back.
+- **Energy across an optics-to-thermal coupling**: 1e-9. Both sides are closed-form
+  evaluations, and nothing is being integrated.
+- **Energy through a penalty contact**: 2e-2. Semi-implicit Euler is symplectic, so
+  its energy error is meant to stay bounded — but that guarantee needs a smooth
+  potential, and a contact that switches on the moment two things touch is not one.
+  Each transition shifts the shadow Hamiltonian the method actually conserves, so the
+  true energy takes an `O(dt)` step at every bounce and those accumulate. Resolving
+  the contact more finely shrinks each step, which is why `ContactSystem` reports a
+  stability limit a hundred times smaller than bare stability needs, but no step size
+  recovers the bound.
+
+The third is the interesting one, because a tolerance chosen without knowing that
+would either fail on correct code or hide a real leak.
+
+## A check a trivial predictor also passes
+
+`pantometry-protein` predicts how far each residue of a protein moves, and a crystallographer
+measured that: a PDB file's temperature factors are `B = 8π²⟨Δr²⟩/3`. Comparing the two is the
+best-looking check in this repository — an independent measurement, taken by somebody else, years
+before the code existed — and correlations of `0.659` for lysozyme and `0.571` for ubiquitin are
+inside the range the elastic-network literature reports.
+
+Then the same file measures two predictors that are one line of geometry each:
+
+| | the model | distance from the centroid | neighbours within the cutoff | residue index |
+| --- | --- | --- | --- | --- |
+| 1CRN | +0.395 | +0.402 | +0.423 | +0.375 |
+| 1UBQ | +0.571 | **+0.804** | **+0.768** | +0.346 |
+| 193L | +0.659 | **+0.699** | **+0.697** | +0.262 |
+| 4LYZ | −0.404 | −0.301 | −0.267 | −0.234 |
+
+**Neither geometric predictor loses to the model on any structure.** Nothing is wrong with the
+arithmetic; the check is weak, and it is weak for a reason that generalises past proteins. A
+B-factor is **one scalar per residue**, and the model's claim is about a *direction* in `3n` space —
+which residues move together and which way. A scalar comparison cannot see that claim at all, so
+passing it distinguishes the model from nothing.
+
+The version of this test written first asserted that the model beat the substitutes. It failed, and
+the honest repair was to assert the ordering that was measured rather than to find a structure where
+the model wins.
+
+### What a sufficient check looked like
+
+Adenylate kinase closes two lids over its substrates. Both ends of that motion are deposited —
+`4AKE` open, `1AKE` closed — and superposed they are **7.1 Å** apart. Given only the open
+structure, the model's **single softest mode** overlaps the observed motion by **0.799**, and ten
+modes reach **0.966**.
+
+The scale that number is read against is not another model but chance: in `3 × 214 = 642`
+dimensions a direction chosen without looking overlaps a fixed one by `√(2/πn) = 0.0315`, measured
+over two hundred draws at `0.0312`. The worst of those two hundred was `0.123`.
+
+That is the shape of a check worth having, and the two differ in one property: **what a wrong
+model would have to get right to pass.** To pass the B-factor comparison, it has to know which
+residues are on the outside. To pass this one, it has to know what the protein does.
+
+### Also: a theorem, and the matrix it is a theorem about
+
+Binding a ligand cannot make a residue more mobile. The effective Hessian on the protein's
+coordinates is the bound potential minimised over the ligand's positions, every coupling term is a
+square, so it dominates the bare Hessian and the covariance goes the other way.
+
+Taking that from the **complex's** Hessian instead — the obvious thing, and what this crate did
+first — breaks it: a pseudo-inverse removes the null space it is handed, the complex's rigid
+motions are not the protein's, and residue 4 of a test helix came out `1.003` times as mobile after
+binding. Through the Schur complement the same residue comes out at `0.828`. The theorem found the
+defect; no amount of the simulation looking reasonable would have.

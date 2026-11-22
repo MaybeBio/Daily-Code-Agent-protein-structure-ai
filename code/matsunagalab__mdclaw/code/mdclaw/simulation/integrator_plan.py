@@ -1,0 +1,191 @@
+"""Integrator and timestep planning helpers."""
+
+# Configure logging early to suppress noisy third-party logs
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from mdclaw._common import setup_logger  # noqa: E402
+
+logger = setup_logger(__name__)
+
+from pathlib import Path  # noqa: E402
+from typing import Optional  # noqa: E402
+
+
+# Default output location, created when a tool writes there, not at import.
+WORKING_DIR = Path("outputs").resolve()
+
+from mdclaw.simulation._base import _node_artifact_path  # noqa: E402
+
+
+def _compute_step_plan(
+    simulation_time_ns: float,
+    timestep_fs: float,
+    current_step: int,
+) -> dict:
+    """Translate a requested duration into a concrete step schedule.
+
+    ``simulation_time_ns`` is always interpreted as time to run **in this
+    call** (additional on top of ``current_step``). Callers pass
+    ``simulation.currentStep`` for restart cases (prod→prod) and 0 for
+    fresh runs; the eq→prod path saves its checkpoint with
+    ``currentStep=0`` by design so legacy callers see unchanged behaviour.
+
+    Returns a dict with:
+
+    - ``start_step`` — step counter at restart (same as ``current_step``)
+    - ``start_time_ns`` — that step count expressed as time
+    - ``steps_to_run`` — MD steps scheduled for this call
+    - ``num_steps`` — total step counter after this call completes
+    """
+    steps_to_run = int(simulation_time_ns * 1_000_000 / timestep_fs)
+    return {
+        "start_step": current_step,
+        "start_time_ns": current_step * timestep_fs / 1e6,
+        "steps_to_run": steps_to_run,
+        "num_steps": current_step + steps_to_run,
+    }
+
+
+def _equilibration_steps_from_time_ns(time_ns: float, timestep_fs: float) -> int:
+    """Convert an equilibration stage duration to an integer step count."""
+    if time_ns < 0:
+        raise ValueError("time_ns must be non-negative")
+    if timestep_fs <= 0:
+        raise ValueError("timestep_fs must be positive")
+    steps = int(round(time_ns * 1_000_000 / timestep_fs))
+    if time_ns > 0 and steps <= 0:
+        raise ValueError("time_ns is shorter than one integration step")
+    return steps
+
+
+def _resolve_equilibration_stage_steps(
+    *,
+    stage_name: str,
+    steps: Optional[int],
+    time_ns: Optional[float],
+    default_steps: int,
+    timestep_fs: float,
+) -> tuple[int, Optional[float], float]:
+    """Resolve user-facing time/step inputs for one equilibration stage.
+
+    Returns ``(resolved_steps, requested_time_ns, effective_time_ns)``.
+    ``requested_time_ns`` is only populated when the caller used a duration
+    flag; ``effective_time_ns`` always reflects the resolved step count at
+    the active timestep.
+    """
+    if steps is not None and time_ns is not None:
+        raise ValueError(
+            f"{stage_name}: specify either {stage_name}_time_ns or "
+            f"{stage_name}_steps, not both"
+        )
+    if time_ns is not None:
+        resolved_steps = _equilibration_steps_from_time_ns(time_ns, timestep_fs)
+        return resolved_steps, float(time_ns), resolved_steps * timestep_fs / 1_000_000
+    resolved_steps = default_steps if steps is None else steps
+    if resolved_steps < 0:
+        raise ValueError(f"{stage_name}_steps must be non-negative")
+    return resolved_steps, None, resolved_steps * timestep_fs / 1_000_000
+
+
+def _record_production_node_result(
+    *,
+    result: dict,
+    job_dir: str,
+    node_id: str,
+    simulation_time_ns: float,
+    temperature_kelvin: float,
+    pressure_bar: Optional[float],
+    platform: str,
+    hmr: bool,
+    timestep_fs: float,
+    output_frequency_ps: float,
+    random_seed: Optional[int],
+    custom_force_script_artifact: Optional[str] = None,
+) -> None:
+    """Persist production artifacts and metadata to the DAG node."""
+    from mdclaw._node import complete_node, fail_node
+
+    if result.get("success"):
+        artifacts = {
+            "trajectory": _node_artifact_path(result.get("trajectory_file")),
+            "final_structure": _node_artifact_path(result.get("final_structure")),
+            "checkpoint": _node_artifact_path(result.get("checkpoint_file")),
+            "state": _node_artifact_path(result.get("state_file")),
+            "energy": _node_artifact_path(result.get("energy_file")),
+            "runtime_system": _node_artifact_path(
+                result.get("runtime_system_file")
+            ),
+            "integrator": _node_artifact_path(result.get("integrator_file")),
+        }
+        # Custom-force provenance + CV log artifacts (only when a bias ran).
+        if custom_force_script_artifact:
+            artifacts["custom_force_script"] = custom_force_script_artifact
+        if result.get("collective_variables_file"):
+            artifacts["collective_variables"] = _node_artifact_path(
+                result.get("collective_variables_file")
+            )
+        if result.get("collective_variables_meta_file"):
+            artifacts["collective_variables_meta"] = _node_artifact_path(
+                result.get("collective_variables_meta_file")
+            )
+        metadata = {
+            "simulation_time_ns": simulation_time_ns,
+            "temperature_kelvin": temperature_kelvin,
+            "temperature_kelvin_source": result.get("temperature_kelvin_source"),
+            "temperature_kelvin_inherited_from": result.get("temperature_kelvin_inherited_from"),
+            "pressure_bar": pressure_bar,
+            "platform": result.get("platform") or platform,
+            "hmr": hmr,
+            "timestep_fs": timestep_fs,
+            "output_frequency_ps": output_frequency_ps,
+            "random_seed": random_seed,
+            "num_steps": result.get("steps_completed"),
+            "start_step": result.get("start_step"),
+            "start_time_ns": result.get("start_time_ns"),
+            "final_step": result.get("steps_completed"),
+            "system_signature": result.get("system_signature"),
+            "integrator_signature": result.get("integrator_signature"),
+            # Timing: integration alone, the whole tool call, and the rate.
+            "md_seconds": result.get("md_seconds"),
+            "wall_seconds": result.get("wall_seconds"),
+            "ns_per_day": result.get("ns_per_day"),
+        }
+        # A run that stopped before its job's time limit: what was asked,
+        # what is left, and why (the next block reads remaining_simulation_time_ns).
+        for key in ("requested_simulation_time_ns", "remaining_simulation_time_ns", "stopped_reason"):
+            if result.get(key) is not None:
+                metadata[key] = result[key]
+        custom_force = result.get("custom_force")
+        if result.get("plumed"):
+            metadata["plumed"] = result["plumed"]
+            metadata["sampling_role"] = result["sampling_role"]
+            for key, filename in {"plumed_input": "plumed.dat", "plumed_runtime": "plumed.runtime.dat",
+                                  "plumed_protocol": "plumed.json", "plumed_colvar": "plumed.COLVAR",
+                                  "plumed_log": "plumed.log"}.items():
+                artifacts[key] = _node_artifact_path(str(Path(result["output_dir"]) / filename))
+        if custom_force:
+            metadata["custom_force"] = custom_force
+            metadata["custom_force_signature"] = custom_force.get("signature")
+            metadata["custom_force_parameters"] = (
+                (custom_force.get("signature") or {}).get("parameters")
+            )
+        if result.get("distance_restraints"):
+            metadata["distance_restraints"] = result["distance_restraints"]
+            metadata["distance_restraint_signature"] = result.get(
+                "distance_restraint_signature"
+            )
+        if result.get("steering"):
+            metadata["steering"] = result["steering"]
+            metadata["sampling_role"] = result.get("sampling_role", "steered")
+            artifacts["steering"] = _node_artifact_path(result["steering_file"])
+            if result.get("steering_initial_file"):
+                artifacts["steering_initial"] = _node_artifact_path(result["steering_initial_file"])
+        # Passed on, so a run whose residue names were not restored says so in
+        # node.json. Under SLURM the tool's stdout is only captured on failure,
+        # so a warned-but-successful run left the message nowhere anyone reads.
+        complete_node(job_dir, node_id, artifacts=artifacts, metadata=metadata,
+                      warnings=result.get("warnings") or None,)
+    else:
+        fail_node(job_dir, node_id, errors=result.get("errors", []))

@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+import dataclasses
+from typing import TYPE_CHECKING
+
+from xtrax.tiling import AxisSpec, BatchPlanner, ChunkedMap, MemoryBudget, Vmap
+
+from aminx.tiling.memory_budget import resolve_memory_budget_bytes
+
+if TYPE_CHECKING:
+  from collections.abc import Sequence
+
+  from xtrax.tiling import AxisDecision
+
+  from aminx.tiling.strategy import AxisStrategy
+
+
+def estimate_memory_theoretical(
+  decisions: Sequence[AxisDecision],
+  base_shape_bytes: float,
+  activation_multiplier: float,
+) -> float:
+  """Estimate peak memory for a set of axis decisions.
+
+  Vmap-strategy axes contribute their full cardinality to the memory
+  product; all other strategies (ChunkedMap, Scan, DedupGather) contribute
+  only their decided tile size (d.batch_size) -- one tile is live at a
+  time.
+
+  Checks isinstance(d.strategy, Vmap) rather than d.batch_size == 0:
+  xtrax.tiling.BatchPlanner's joint-budget mode sets batch_size=spec.default_batch_size
+  even for Vmap decisions, never 0.
+
+  activation_multiplier must be supplied by the caller (no default).
+  """
+  product = 1
+  for d in decisions:
+    if isinstance(d.strategy, Vmap):
+      product *= d.spec.cardinality
+    else:
+      product *= d.batch_size
+  return base_shape_bytes * product * activation_multiplier
+
+
+def plan_axis_strategy(
+  axis_template: AxisSpec,
+  cardinality: int,
+  batch_size_override: int | None,
+  *,
+  activation_bytes_per_element: float,
+  headroom: float = 0.80,
+  size_unsized_tiles: bool = False,
+) -> AxisStrategy:
+  """Resolve a Vmap/ChunkedMap strategy for one axis via xtrax's BatchPlanner.
+
+  Args:
+    axis_template: Axis template from :mod:`aminx.tiling.axes`; only its
+      ``cardinality`` is replaced.
+    cardinality: True element count on this axis for this call.
+    batch_size_override: Fixed ChunkedMap batch_size. Bypasses the planner when > 0.
+    activation_bytes_per_element: Live bytes one element of this axis holds.
+    headroom: Fraction of the device limit the plan may occupy.
+    size_unsized_tiles: When BatchPlanner returns ``ChunkedMap(batch_size=0)`` (it falls back to
+      the axis template's ``default_batch_size``), size the tile from the budget instead. Off by
+      default so existing callers keep their dispatch and float reduction order; opt in on new
+      paths. Without it a 0-size tile runs the whole axis at once.
+
+  Returns:
+    A :class:`Vmap` or :class:`ChunkedMap` strategy.
+
+  Raises:
+    TypeError: If BatchPlanner returns a strategy other than Vmap/ChunkedMap.
+  """
+  if batch_size_override is not None and batch_size_override > 0:
+    return ChunkedMap(batch_size=batch_size_override)
+
+  axis = dataclasses.replace(axis_template, cardinality=cardinality)
+  budget = MemoryBudget(
+    bytes=resolve_memory_budget_bytes(headroom=headroom),
+    estimate=lambda decisions: int(
+      estimate_memory_theoretical(decisions, activation_bytes_per_element, 1.0),
+    ),
+  )
+  plan = BatchPlanner(budget=budget).plan([axis])
+  xtrax_strategy = plan.decisions[0].strategy
+  if size_unsized_tiles and isinstance(xtrax_strategy, ChunkedMap) and xtrax_strategy.batch_size <= 0:
+    # BatchPlanner falls back to ChunkedMap with the axis template's default_batch_size, which is
+    # 0 for the candidate axis; a 0-size tile estimates to 0 bytes, so the "plan" always fits and
+    # then runs the whole axis at once. Measured: 448 (mask, sequence) pairs at the 512 rung
+    # asked a 24 GiB GPU for 21 GiB and OOMed (bathos run 78f04b0b). Size the tile from the same
+    # budget the planner was given instead.
+    per_tile = max(1, int(budget.bytes // max(1, int(activation_bytes_per_element))))
+    if per_tile >= cardinality:
+      return Vmap()
+    return ChunkedMap(batch_size=per_tile)
+  if isinstance(xtrax_strategy, (ChunkedMap, Vmap)):
+    return xtrax_strategy
+  msg = f"plan_axis_strategy: unexpected BatchPlanner decision strategy {type(xtrax_strategy)}"
+  raise TypeError(msg)

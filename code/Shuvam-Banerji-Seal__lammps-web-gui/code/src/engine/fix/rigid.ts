@@ -1,0 +1,1404 @@
+import { Fix } from './fix';
+import { StyleError, typeBounds } from '../force/types';
+import { inumeric, missingArgs, numeric, logical } from '../force/util';
+import type { System } from '../system';
+import { hasMolecule, isEllipsoid, isLineAtom, isSuperEllipsoidStyle, isTriAtom, LINE_BONUS, LINE_FLAG, massOf, nativeOrder, TRI_BONUS, TRI_BONUS_COLS, TRI_FLAG } from '../atoms';
+import { ellipsoidInertia, quatToMatrix } from '../compute/asphere';
+import { RanMars } from '../rng';
+import { ramp, valueOf, type NumOrVar } from './util';
+import { FixGravity } from './force_ext';
+import { libm } from '../libm';
+
+/*
+ * fix ID group rigid|rigid/nve|rigid/small|rigid/nve/small bodystyle ... —
+ * docs.lammps.org/fix_rigid.html: "Treat one or more sets of atoms as
+ * independent rigid bodies." "bodystyle = single or molecule or group";
+ * "For bodystyle single the entire fix group of atoms is treated as one
+ * rigid body"; "For bodystyle molecule, atoms are grouped into rigid bodies
+ * by their respective molecule IDs"; group "N groupID1 groupID2 ...".
+ * "the image flags for each atom in the body are used to "unwrap" the atom
+ * coordinates". "Each rigid body must have two or more atoms."
+ * "The aggregate properties of each rigid body are calculated at the start
+ * of a simulation run": mass, center of mass, principal moments and axes of
+ * inertia, angular momentum; "Positions, velocities, and orientations of the
+ * constituent particles are regenerated from the rigid body data structures
+ * in every time step."
+ * "Components of the external center-of-mass force and torque can be turned
+ * off by the force and torque keywords" (M = 1..Nbody with * wildcards).
+ * "A 3d rigid body has 6 degrees of freedom (3 translational, 3
+ * rotational), except for a collection of point particles lying on a
+ * straight line, which has only 5"; they are removed "only if the
+ * temperature group includes all the particles in a particular rigid body".
+ * "The scalar is the current temperature of the collection of rigid
+ * bodies"; "The number of columns is 15": COM xyz, COM velocity, force,
+ * torque, COM image flags.
+ *
+ * Integration (velocity Verlet for the centers of mass and angular momenta):
+ * half kicks of v_cm by F/M and of the space-frame angular momentum L by the
+ * torque; the orientation quaternion is advanced over dt with Richardson
+ * extrapolation (one full step against two half steps of dq/dt = 1/2 w q,
+ * with w recomputed from L at the midpoint); rigid uses this. rigid/nve and
+ * rigid/nve/small use the no-squish rotation of Miller et al. on the
+ * quaternion momentum conjqm (native FixRigidNVE, src/RIGID/fix_rigid_nh.cpp);
+ * the Richardson path differed from it by 2e-5 in the thermo rows of
+ * oracle rigid_nve_molecule.
+ */
+
+interface Body {
+  atoms: number[];          // atom IDs
+  mass: number;
+  xcm: number[];            // unwrapped center of mass
+  vcm: number[];
+  image: number[];          // COM image flags (xcm wrapped into the box + image * L)
+  /**
+   * The COM image flags as of the last neighbor-list build (native imagebody, set by remap in pre_neighbor): the atoms'
+   * image flags relative to it (native xcmimage) unwrap the positions of the constraint-force virial.
+   */
+  nimage: number[];
+  inertia: number[];        // principal moments
+  q: number[];              // quaternion (w, x, y, z): body -> space
+  angmom: number[];         // space frame
+  omega: number[];
+  displace: number[][];     // body-frame coordinates of the atoms
+  fcm: number[];
+  torque: number[];
+  fflag: boolean[];
+  tflag: boolean[];
+  dof: number;
+  /** finite-size spheres (radius > 0) and line segments among the body's atoms; each adds its own rotational dof and inertia */
+  nsph: number;
+  /**
+   * line atoms (atom_style line): the angle of each atom's segment relative to the body (theta minus the body angle),
+   * per atom in body order, 0 for other atoms. fix_rigid.cpp setup_bodies_static: "orient[i][0] = lbonus[line[i]].theta - theta_body".
+   */
+  orient: number[];
+  /**
+   * triangle atoms (atom_style tri): the orientation quaternion of each triangle relative to the body, 4 per body atom in
+   * body order (fix_rigid.cpp setup_bodies_static, TRIANGLE: orient = conj(quat_body) * quat_atom, normalized); 0 for others.
+   */
+  orientQ: number[];
+  /**
+   * point dipoles (atom_style dipole): the dipole vector in the body frame, 3 per body atom in body order
+   * (fix_rigid_small.cpp setup_bodies_static: dorient = R^T mu scaled to |mu|); 0 for other atoms.
+   */
+  dorient: number[];
+  /**
+   * rigid/nve (fix rigid/nve, rigid/nve/small): the no-squish quaternion momentum conjqm = 2 q (0, R^T L), kept
+   * instead of the angular momentum that Richardson advances. Set at setup; created on demand otherwise.
+   */
+  conjqm?: number[];
+  /** The atom ID of the body's owner: the atom nearest the centre of its bounding box (see constructBody). */
+  owner: number;
+}
+
+/** One line of an infile (fix rigid infile): attributes that override the computed ones. */
+interface InfileBody {
+  mass: number;
+  xcm: number[];
+  /** box-frame inertia tensor (ixx iyy izz ixy ixz iyz), as a symmetric 3x3 */
+  I: number[][];
+  vcm: number[];
+  lam: number[];
+  image: number[];
+}
+
+const cloneBody = (b: Body): Body => ({
+  ...b,
+  atoms: b.atoms.slice(), xcm: b.xcm.slice(), vcm: b.vcm.slice(), image: b.image.slice(), nimage: b.nimage.slice(),
+  inertia: b.inertia.slice(), q: b.q.slice(), angmom: b.angmom.slice(), omega: b.omega.slice(),
+  displace: b.displace.map((r) => r.slice()), fcm: b.fcm.slice(), torque: b.torque.slice(),
+  fflag: b.fflag.slice(), tflag: b.tflag.slice(), orient: b.orient.slice(), orientQ: b.orientQ.slice(), dorient: b.dorient.slice(),
+  conjqm: b.conjqm?.slice(),
+});
+
+/** Quaternion product c = a b (math_extra.h quatquat). */
+const quatMul = (a: number[], b: number[]): number[] => [
+  a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+  a[0] * b[1] + b[0] * a[1] + a[2] * b[3] - a[3] * b[2],
+  a[0] * b[2] + b[0] * a[2] + a[3] * b[1] - a[1] * b[3],
+  a[0] * b[3] + b[0] * a[3] + a[1] * b[2] - a[2] * b[1],
+];
+const quatNormalize = (q: number[]): number[] => {
+  const n = 1.0 / Math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+  return q.map((c) => c * n);
+};
+/** Space-frame inertia tensor of triangle atom i: R diag(moments) R^T (math_extra.h inertia_triangle with the quaternion). */
+const triInertiaSpace = (q: number[], moments: number[]): number[][] => {
+  const R = quatToMatrix(q[0], q[1], q[2], q[3]);
+  const I = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) {
+    for (let k = 0; k < 3; k++) I[a][b] += R[3 * a + k] * moments[k] * R[3 * b + k];
+  }
+  return I;
+};
+
+/** Angle of a body's z-rotation quaternion (w, x, y, z), as fix_rigid.cpp: "theta_body = 2.0*acos(quat[ibody][0])", signed by z. */
+const bodyTheta = (q: number[]): number => (q[3] >= 0 ? 2.0 * libm.acos(Math.min(1, q[0])) : -2.0 * libm.acos(Math.min(1, q[0])));
+/** Wraps an angle to (-pi, pi] as fix_rigid.cpp does for line orientations. */
+const wrapAngle = (t: number): number => {
+  let a = t;
+  while (a <= -Math.PI) a += 2 * Math.PI;
+  while (a > Math.PI) a -= 2 * Math.PI;
+  return a;
+};
+
+const cross = (a: number[], b: number[]) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+/** As native LAMMPS does (src/math_extra.h MathExtra::qnormalize at b332f28): q times 1 / sqrt(q.q). */
+const qnorm = (q: number[]) => {
+  const inv = 1.0 / Math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+  return [q[0] * inv, q[1] * inv, q[2] * inv, q[3] * inv];
+};
+/** Rotation matrix (columns = body axes in the space frame) of a unit quaternion. */
+const qmat = (q: number[]): number[][] => {
+  const [w, x, y, z] = q;
+  return [
+    [w * w + x * x - y * y - z * z, 2 * (x * y - w * z), 2 * (x * z + w * y)],
+    [2 * (x * y + w * z), w * w - x * x + y * y - z * z, 2 * (y * z - w * x)],
+    [2 * (x * z - w * y), 2 * (y * z + w * x), w * w - x * x - y * y + z * z],
+  ];
+};
+/*
+ * Helpers of the rigid/nve integrator (Miller et al., J. Chem. Phys. 116, 8649 (2002)). As native LAMMPS does
+ * (src/RIGID/fix_rigid_nh.cpp FixRigidNH::initial_integrate and final_integrate, steps 1.3 to 1.13, at b332f28):
+ * the torque enters the quaternion momentum, the orientation is advanced by the no-squish splitting
+ * (rotations about body axes 3, 2, 1, 2, 3 with dt/2, dt/2, dt, dt/2, dt/2), and the angular momentum is read
+ * back from the quaternion momentum.
+ */
+/** Vector part of conj(q) p for a quaternion momentum p (w, x, y, z): the body-frame momentum (invquatvec). */
+const invQuatVec = (q: number[], p: number[]): number[] => [
+  -q[1] * p[0] + q[0] * p[1] + q[3] * p[2] - q[2] * p[3],
+  -q[2] * p[0] - q[3] * p[1] + q[0] * p[2] + q[1] * p[3],
+  -q[3] * p[0] + q[2] * p[1] - q[1] * p[2] + q[0] * p[3],
+];
+/** The quaternion q (0, m) (quatvec): the quaternion momentum of a body-frame vector m. */
+const quatVec = (q: number[], m: number[]): number[] => [
+  -q[1] * m[0] - q[2] * m[1] - q[3] * m[2],
+  q[0] * m[0] + q[2] * m[2] - q[3] * m[1],
+  q[0] * m[1] + q[3] * m[0] - q[1] * m[2],
+  q[0] * m[2] + q[1] * m[1] - q[2] * m[0],
+];
+/**
+ * One no-squish rotation about body axis k (1..3) by dt: p and q move together along the flow of the
+ * Hamiltonian term proportional to the axis's inertia. As native LAMMPS does (src/math_extra.cpp no_squish_rotate at
+ * b332f28): kq = q u_k and kp = p u_k with u_k the unit quaternion of the axis, phi = (p . kq) / (4 I_k), then
+ * p <- cos(dt phi) p + sin(dt phi) kp and q <- cos(dt phi) q + sin(dt phi) kq (phi = 0 for a zero moment).
+ */
+const noSquishRotate = (k: 1 | 2 | 3, p: number[], q: number[], inertia: number[], dt: number): void => {
+  const u = k === 1 ? [0, 1, 0, 0] : k === 2 ? [0, 0, 1, 0] : [0, 0, 0, 1];
+  const kq = quatMul(q, u), kp = quatMul(p, u);
+  let phi = p[0] * kq[0] + p[1] * kq[1] + p[2] * kq[2] + p[3] * kq[3];
+  if (inertia[k - 1] === 0) phi = 0;
+  else phi /= 4.0 * inertia[k - 1];
+  const c = libm.cos(dt * phi), sn = libm.sin(dt * phi);
+  for (let m = 0; m < 4; m++) p[m] = c * p[m] + sn * kp[m];
+  for (let m = 0; m < 4; m++) q[m] = c * q[m] + sn * kq[m];
+};
+
+/** Quaternion from a proper rotation matrix (columns = axes). */
+const matq = (R: number[][]): number[] => {
+  const tr = R[0][0] + R[1][1] + R[2][2];
+  let q: number[];
+  if (tr > 0) {
+    const s = 2 * Math.sqrt(tr + 1);
+    q = [0.25 * s, (R[2][1] - R[1][2]) / s, (R[0][2] - R[2][0]) / s, (R[1][0] - R[0][1]) / s];
+  } else if (R[0][0] > R[1][1] && R[0][0] > R[2][2]) {
+    const s = 2 * Math.sqrt(1 + R[0][0] - R[1][1] - R[2][2]);
+    q = [(R[2][1] - R[1][2]) / s, 0.25 * s, (R[0][1] + R[1][0]) / s, (R[0][2] + R[2][0]) / s];
+  } else if (R[1][1] > R[2][2]) {
+    const s = 2 * Math.sqrt(1 + R[1][1] - R[0][0] - R[2][2]);
+    q = [(R[0][2] - R[2][0]) / s, (R[0][1] + R[1][0]) / s, 0.25 * s, (R[1][2] + R[2][1]) / s];
+  } else {
+    const s = 2 * Math.sqrt(1 + R[2][2] - R[0][0] - R[1][1]);
+    q = [(R[1][0] - R[0][1]) / s, (R[0][2] + R[2][0]) / s, (R[1][2] + R[2][1]) / s, 0.25 * s];
+  }
+  return qnorm(q);
+};
+/** Symmetric 3x3 eigen-decomposition by cyclic Jacobi rotations: values and column eigenvectors. */
+const jacobi = (A: number[][]): { values: number[]; vectors: number[][] } => {
+  const a = A.map((r) => r.slice());
+  const v = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (let sweep = 0; sweep < 100; sweep++) {
+    const off = Math.abs(a[0][1]) + Math.abs(a[0][2]) + Math.abs(a[1][2]);
+    if (off < 1e-300) break;
+    for (const [p, r] of [[0, 1], [0, 2], [1, 2]]) {
+      if (a[p][r] === 0) continue;
+      const theta = (a[r][r] - a[p][p]) / (2 * a[p][r]);
+      const t = Math.sign(theta || 1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+      const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+      for (let k = 0; k < 3; k++) {
+        const akp = a[k][p], akr = a[k][r];
+        a[k][p] = c * akp - s * akr; a[k][r] = s * akp + c * akr;
+      }
+      for (let k = 0; k < 3; k++) {
+        const apk = a[p][k], ark = a[r][k];
+        a[p][k] = c * apk - s * ark; a[r][k] = s * apk + c * ark;
+      }
+      for (let k = 0; k < 3; k++) {
+        const vkp = v[k][p], vkr = v[k][r];
+        v[k][p] = c * vkp - s * vkr; v[k][r] = s * vkp + c * vkr;
+      }
+    }
+  }
+  return { values: [a[0][0], a[1][1], a[2][2]], vectors: v };
+};
+
+/**
+ * Principal moments and the body -> space quaternion of a box-frame inertia tensor.
+ * docs.lammps.org/fix_rigid.html: "The values are with respect to the simulation box XYZ axes,
+ * not with respect to the principal axes of the rigid body itself. LAMMPS performs the latter
+ * calculation internally."
+ */
+const principalFrame = (I: number[][], twoD = false): { inertia: number[]; q: number[] } => {
+  const jac = jacobi(I);
+  // fix_rigid.cpp and fix_rigid_small.cpp setup_bodies_static (b332f28): "request that jacobi3() returns them in ascending order" (sort = 1,
+  // MathEigen::jacobi3); the resampled body velocities use one scale per principal axis, so the order is observable.
+  let order = [0, 1, 2].sort((a, b) => jac.values[a] - jac.values[b]);
+  if (twoD) {
+    // fix_rigid.cpp setup_bodies_static (2d): "for 2d, ensure that evector along z axis is last ... so that quaternion
+    // is a simple rotation around +z axis"; the line-orientation bookkeeping (theta_body) relies on it.
+    let zc = 0;
+    for (let c = 1; c < 3; c++) if (Math.abs(jac.vectors[2][c]) > Math.abs(jac.vectors[2][zc])) zc = c;
+    order = [0, 1, 2].filter((c) => c !== zc).concat([zc]);
+  }
+  const values = order.map((c) => jac.values[c]);
+  const vectors = jac.vectors;
+  const maxI = Math.max(values[0], values[1], values[2]);
+  const inertia = values.map((v) => (v < 1e-7 * maxI ? 0 : v));
+  // right-handed axes
+  const e = order.map((c) => [vectors[0][c], vectors[1][c], vectors[2][c]]);
+  const e3 = cross(e[0], e[1]);
+  if (e3[0] * e[2][0] + e3[1] * e[2][1] + e3[2] * e[2][2] < 0) e[2] = e[2].map((x) => -x);
+  // 2d: "negate both ey and ez to keep the eigenbasis right-handed" so that ez points along +z (fix_rigid.cpp)
+  if (twoD && e[2][2] < 0) {
+    e[1] = e[1].map((x) => -x);
+    e[2] = e[2].map((x) => -x);
+  }
+  const R = [[e[0][0], e[1][0], e[2][0]], [e[0][1], e[1][1], e[2][1]], [e[0][2], e[1][2], e[2][2]]];
+  return { inertia, q: matq(R) };
+};
+
+/**
+ * Keywords the native keyword loops of the rigid styles accept (src/RIGID/fix_rigid.cpp FixRigid::FixRigid at b332f28).
+ * A keyword outside the list is reported as unknown; a listed one the engine does not model is refused after that.
+ */
+const RIGID_KEYWORDS = ['force', 'torque', 'langevin', 'temp', 'iso', 'aniso', 'x', 'y', 'z', 'couple', 'dilate', 'tparam', 'pchain', 'infile', 'reinit', 'gravity'];
+/** Keywords of the native /small keyword loop (src/RIGID/fix_rigid_small.cpp FixRigidSmall::FixRigidSmall at b332f28). */
+const RIGID_SMALL_KEYWORDS = ['langevin', 'infile', 'reinit', 'mol', 'temp', 'iso', 'aniso', 'x', 'y', 'z', 'couple', 'dilate', 'tparam', 'pchain', 'gravity'];
+
+/**
+ * Parses an infile: "The file can contain initial blank lines or comment lines starting with "#"
+ * which are ignored. The first non-blank, non-comment line should list N = the number of lines
+ * to follow." Each line: "ID1 masstotal xcm ycm zcm ixx iyy izz ixy ixz iyz vxcm vycm vzcm lx ly lz ixcm iycm izcm".
+ * Measured with native LAMMPS (black box): a blank line between the count line and the body lines is an
+ * error, so only the lines before the count are skipped.
+ */
+const parseInfileText = (text: string, style: string, fname: string): Map<string, InfileBody> => {
+  const where = `fix ${style} infile ${fname}`;
+  // only initial blank and comment lines are skipped; the N body lines follow the count line directly
+  const all = text.split('\n').map((l) => l.trim());
+  let start = 0;
+  while (start < all.length && (all[start] === '' || all[start].startsWith('#'))) start++;
+  if (start >= all.length) throw new StyleError(`${where}: file has no count line`);
+  const n = Number(all[start]);
+  if (!Number.isInteger(n) || n < 0) throw new StyleError(`${where}: first line must be the number of bodies N, got '${all[start]}'`);
+  // the N body lines must follow the count line without a blank line in between
+  let m = 0;
+  while (m < n && start + 1 + m < all.length && all[start + 1 + m] !== '') m++;
+  if (m < n) throw new StyleError(`${where}: expected ${n} body lines, found ${m}`);
+  const lines = all.slice(start + 1, start + 1 + n);
+  const out = new Map<string, InfileBody>();
+  for (let j = 0; j < n; j++) {
+    const w = lines[j].split(/\s+/);
+    if (w.length !== 20) throw new StyleError(`${where}: body line ${j + 1} needs 20 values (ID masstotal xcm ycm zcm ixx iyy izz ixy ixz iyz vxcm vycm vzcm lx ly lz ixcm iycm izcm), got ${w.length}`);
+    const v = w.map(Number);
+    if (v.some((x) => !Number.isFinite(x))) throw new StyleError(`${where}: body line ${j + 1} has a non-numeric value: '${lines[j]}'`);
+    if (!Number.isInteger(v[0]) || v[0] < 1) throw new StyleError(`${where}: body ID on line ${j + 1} must be a positive integer, got ${w[0]}`);
+    if (!(v[1] > 0)) throw new StyleError(`${where}: masstotal of body ${v[0]} must be positive`);
+    const key = String(v[0]);
+    if (out.has(key)) throw new StyleError(`${where}: body ID ${v[0]} listed twice`);
+    out.set(key, {
+      mass: v[1],
+      xcm: v.slice(2, 5),
+      I: [[v[5], v[8], v[9]], [v[8], v[6], v[10]], [v[9], v[10], v[7]]],
+      vcm: v.slice(11, 14),
+      lam: v.slice(14, 17),
+      image: v.slice(17, 20),
+    });
+  }
+  return out;
+};
+
+export class FixRigid extends Fix {
+  readonly style: string;
+  private bodies: Body[] = [];
+  /** rigid/small: the largest body extent (see constructBody), checked against the ghost cutoff at setup. */
+  private maxExtent = 0;
+  private bodystyle: string;
+  private groupList: string[] = [];
+  private forceSpecs: [string, boolean[]][] = [];
+  private torqueSpecs: [string, boolean[]][] = [];
+  private reinit = true;
+  private built = false;
+  /** bodystyle custom: name of the atom-style variable (v_name) that gives each atom's body ID. */
+  private customVar: string | null = null;
+  /** bodystyle custom i_name: the fix property/atom integer vector name. */
+  private customProp: string | null = null;
+  /**
+   * bodystyle custom: each atom's body value (by atom ID), taken when the fix is defined. As native LAMMPS does
+   * (src/RIGID/fix_rigid.cpp constructor at b332f28): the variable or property is evaluated once, in the constructor,
+   * and its value cast to an integer ("(tagint) value[i]", truncation toward zero); the bodies keep that membership.
+   */
+  private customKeys: Map<number, string> | null = null;
+  /** keyword mol: molecule template-ID whose molecules may be added during the run (fix deposit rigid). */
+  private molTemplateId: string | null = null;
+  /** keyword gravity: ID of the fix gravity whose acceleration is applied to each body's centre of mass. */
+  private gravityId: string | null = null;
+  private gravityFix: FixGravity | null = null;
+  /** keyword infile: per-body attributes keyed by body ID (see parseInfile). */
+  private infile: Map<string, InfileBody> | null = null;
+  /** fix_modify bodyforces early: forces and torques are summed in post_force, not final_integrate. */
+  private early = false;
+  /** keyword langevin: Langevin thermostat on the 4 NVE rigid styles. */
+  private langevin = false;
+  private langTStart: NumOrVar = 0;
+  private langTStop = 0;
+  private langDamp = 0;
+  private langRng: RanMars | null = null;
+  /**
+   * Per-atom virial (6 per atom, indexed by atom index). As native LAMMPS does (src/RIGID/fix_rigid_small.cpp set_xv/set_v
+   * at b332f28, v_tally(1, &i, 1.0, vr)): each atom takes its own vr, the same term that goes into the global virial.
+   */
+  private vAtom = new Float64Array(0);
+  /** Adds this fix's per-atom virial to out (compute stress/atom fix). */
+  virialAtom(out: Float64Array): void {
+    for (let k = 0; k < this.vAtom.length && k < out.length; k++) out[k] += this.vAtom[k];
+  }
+  constructor(sys: System, id: string, group: string, args: string[], style: string) {
+    super(sys, id, group, args);
+    this.style = style;
+    this.timeIntegrate = true;
+    this.virialGlobal = true;
+    this.thermoVirial = true;
+    this.scalarFlag = true;
+    this.extscalar = 0;
+    this.arrayFlag = true;
+    this.sizeArrayCols = 15;
+    const small = style.includes('small');
+    this.bodystyle = args[0];
+    let k = 1;
+    if (this.bodystyle === 'single') {
+      // As native LAMMPS does (src/RIGID/fix_rigid_small.cpp at b332f28): the /small styles know molecule and custom only
+      if (small) throw new StyleError(`Unknown fix ${style} body style single`);
+    } else if (this.bodystyle === 'molecule') {
+      // As native LAMMPS does (src/RIGID/fix_rigid.cpp and fix_rigid_small.cpp at b332f28): the molecule ID is needed
+      if (!hasMolecule(sys.state)) {
+        throw new StyleError(small ? `Fix ${style} requires atom attribute molecule` : `Fix ${style} molecule requires atom attribute molecule`);
+      }
+    } else if (this.bodystyle === 'group') {
+      if (small) throw new StyleError(`Unknown fix ${style} body style group`);
+      const n = Number(args[1]);
+      if (!Number.isInteger(n) || n < 1) throw new StyleError(`fix ${style} group: N must be a positive integer`);
+      this.groupList = args.slice(2, 2 + n);
+      if (this.groupList.length !== n) throw new StyleError(`fix ${style} group: expected ${n} group IDs`);
+      for (const gname of this.groupList) sys.groups.bit(gname);
+      k = 2 + n;
+    } else if (this.bodystyle === 'custom') {
+      /* docs.lammps.org/fix_rigid.html: "*custom* args = *i_propname* or *v_varname*",
+       * "i_propname = a custom integer vector defined via fix property/atom" and
+       * "v_varname = an atom-style or atomfile-style variable"; "the floating-point value
+       * produced by the variable is rounded to an integer". The native code casts it ("(tagint) value[i]"): measured with
+       * native LAMMPS, values 0.6, 0.7, 1.4 and 1.45 give 2 rigid bodies (truncation), not 1. */
+      // As native LAMMPS does (src/RIGID/fix_rigid.cpp and fix_rigid_small.cpp constructors at b332f28): an i_name of a
+      // custom integer vector, or a v_name of an atom-style variable
+      if (args.length < 2) throw missingArgs(`fix ${style} custom`);
+      const w = args[1];
+      if (w.startsWith('i_')) {
+        const c = sys.state.custom.get(w.slice(2));
+        if (!c) throw new StyleError(`Fix ${style} custom requires previously defined property/atom`);
+        if (!c.int || c.cols !== 0) throw new StyleError(`Fix ${style} custom requires integer-valued property/atom vector`);
+        this.customProp = w.slice(2);
+        k = 2;
+      } else if (w.startsWith('v_')) {
+        const vname = w.slice(2);
+        const v = sys.vars.get(vname);
+        if (!v) throw new StyleError(`Variable ${vname} for fix ${style} custom does not exist`);
+        if (v.style !== 'atom' && v.style !== 'atomfile') throw new StyleError(`Fix ${style} custom variable ${vname} is not atom-style variable`);
+        this.customVar = vname;
+        k = 2;
+      } else throw new StyleError(`Unsupported fix ${style} custom property: ${w}`);
+    } else {
+      // fix_rigid.cpp: "Unknown fix {} mode {}"; fix_rigid_small.cpp: "Unknown fix {} body style {}"
+      throw new StyleError(small ? `Unknown fix ${style} body style ${this.bodystyle}` : `Unknown fix ${style} mode ${this.bodystyle}`);
+    }
+    const onoff = (w: string | undefined) => {
+      // fix_rigid.cpp: a flag that is neither on nor off is "Illegal fix {} command"
+      if (w !== 'on' && w !== 'off') throw new StyleError(`Illegal fix ${style} command`);
+      return w === 'on';
+    };
+    for (; k < args.length;) {
+      const key = args[k];
+      if (key === 'force' || key === 'torque') {
+        // As native LAMMPS does (src/RIGID/fix_rigid_small.cpp FixRigidSmall::FixRigidSmall at b332f28): the /small keyword loop has no force or torque, so they are unknown there
+        if (small) throw new StyleError(`Unknown fix ${style} keyword ${key}`);
+        const spec: [string, boolean[]] = [args[k + 1], [onoff(args[k + 2]), onoff(args[k + 3]), onoff(args[k + 4])]];
+        (key === 'force' ? this.forceSpecs : this.torqueSpecs).push(spec);
+        k += 5;
+      } else if (key === 'reinit') {
+        // fix_rigid.cpp: utils::logical
+        if (k + 2 > args.length) throw missingArgs(`fix ${style} reinit`);
+        this.reinit = logical(args[k + 1]);
+        k += 2;
+      } else if (key === 'infile') {
+        const fname = args[k + 1];
+        if (!fname) throw new StyleError(`fix ${style}: keyword infile needs a filename`);
+        this.infile = parseInfileText(sys.readFile(fname, 'Cannot open fix rigid infile'), style, fname);
+        // docs.lammps.org/fix_rigid.html: "When using the *infile* keyword, the *reinit* option is automatically set to *no*\ ."
+        this.reinit = false;
+        k += 2;
+      } else if (key === 'mol') {
+        // docs.lammps.org/fix_rigid.html: "The *mol* keyword can only be used with the *rigid/small* styles."
+        // As native LAMMPS does (src/RIGID/fix_rigid.cpp FixRigid::FixRigid at b332f28): mol is not a keyword of the rigid styles, so the keyword loop's catch-all reports it
+        if (!small) throw new StyleError(`Illegal fix ${style} command`);
+        const t = args[k + 1];
+        if (!t) throw new StyleError(`fix ${style}: keyword mol needs a molecule template-ID`);
+        this.molTemplateId = t;
+        k += 2;
+      } else if (key === 'langevin') {
+        /* docs.lammps.org/fix_rigid.html: "langevin values = Tstart Tstop Tperiod
+         * seed"; "The *langevin* keyword applies a Langevin thermostat to the
+         * constant NVE time integration performed by any of the 4 NVE rigid
+         * styles: rigid, rigid/nve, rigid/small, rigid/small/nve. It cannot be
+         * used with the 2 NVT rigid styles". "The desired temperature at each
+         * timestep is a ramped value during the run from Tstart to Tstop." "The
+         * random # seed must be a positive integer." */
+        // As native LAMMPS does (src/RIGID/fix_rigid.cpp FixRigid::FixRigid and fix_rigid_small.cpp
+        // FixRigidSmall::FixRigidSmall at b332f28): the word count and the style, then Tstart, Tstop, Tperiod
+        // (utils::numeric) and seed (utils::inumeric) with their checks; the two families word them differently
+        const illegal = () => new StyleError(`Illegal fix ${style} command`);
+        if (small) {
+          if (k + 5 > args.length) throw missingArgs(`fix ${style} langevin`);
+          if (/^rigid\/n.t\/small/.test(style)) throw new StyleError('Must not combine Langevin with Nose-Hoover thermostat');
+        } else {
+          if (k + 5 > args.length) throw illegal();
+          if (!['rigid', 'rigid/nve', 'rigid/omp', 'rigid/nve/omp'].includes(style)) throw illegal();
+        }
+        this.langTStart = numeric(args[k + 1]);
+        this.langTStop = numeric(args[k + 2]);
+        this.langDamp = numeric(args[k + 3]);
+        const sd = inumeric(args[k + 4]);
+        if (this.langDamp <= 0) throw new StyleError(small ? `Fix ${style} langevin period must be > 0.0` : 'Fix rigid langevin period must be > 0.0');
+        if (sd <= 0) throw small ? new StyleError(`Illegal fix ${style} langevin random seed`) : illegal();
+        this.langevin = true;
+        this.langRng = new RanMars(sd);
+        // Measured with native LAMMPS (black box): the stream starts one draw in,
+        // so the first draw is discarded (the draw is taken here, at fix creation).
+        this.langRng.uniform();
+        k += 5;
+      } else if (key === 'gravity') {
+        // docs.lammps.org/fix_rigid.html: "*gravity* values = gravity-ID", "gravity-ID = ID of fix gravity command to add gravitational forces"
+        const gid = args[k + 1];
+        // As native LAMMPS does (src/RIGID/fix_rigid_small.cpp FixRigidSmall::FixRigidSmall at b332f28): if (iarg+2 > narg) missing_cmd_args("fix {} gravity")
+        if (!gid) throw new StyleError(`Illegal fix ${style} gravity command: missing argument(s)`);
+        this.gravityId = gid;
+        k += 2;
+      } else if (!(small ? RIGID_SMALL_KEYWORDS : RIGID_KEYWORDS).includes(key)) {
+        // As native LAMMPS does (src/RIGID/fix_rigid.cpp and fix_rigid_small.cpp at b332f28): an unknown keyword is reported by the keyword loop. The rigid styles say "Illegal fix {} command", the /small styles "Unknown fix {} keyword {}".
+        throw new StyleError(small ? `Unknown fix ${style} keyword ${key}` : `Illegal fix ${style} command`);
+      } else {
+        throw new StyleError(`fix ${style}: keyword '${key}' is not supported by the browser engine (supported: force, torque, reinit, infile, mol, langevin, gravity)`);
+      }
+    }
+    if (this.molTemplateId && this.bodystyle !== 'molecule') {
+      throw new StyleError(`fix ${style}: the mol keyword requires bodystyle molecule`);
+    }
+    if (this.customVar || this.customProp) {
+      const s = sys.state;
+      const values = this.customVar ? sys.atomVariable(this.customVar) : s.custom.get(this.customProp!)!.data;
+      this.customKeys = new Map();
+      for (let i = 0; i < s.n; i++) if (s.mask[i] & this.groupBit) this.customKeys.set(s.id[i], String(Math.trunc(values[i])));
+    }
+  }
+
+  // ---------------------------------------------------------------- setup
+
+  /** The atom index of each ID (-1: none), refilled by index(). */
+  private idIdx = new Int32Array(0);
+  private readonly idView = {
+    get: (id: number): number | undefined => {
+      const k = id >= 0 && id < this.idIdx.length ? this.idIdx[id] : -1;
+      return k < 0 ? undefined : k;
+    },
+  };
+
+  /** The atom index of each atom ID (a reused table: the integration looks it up for every atom at every step). */
+  private index(): { get(id: number): number | undefined } {
+    const s = this.sys.state;
+    let maxId = 0;
+    for (let i = 0; i < s.n; i++) if (s.id[i] > maxId) maxId = s.id[i];
+    if (this.idIdx.length <= maxId) this.idIdx = new Int32Array(maxId + 1);
+    this.idIdx.fill(-1);
+    for (let i = 0; i < s.n; i++) this.idIdx[s.id[i]] = i;
+    return this.idView;
+  }
+
+  private buildBodies(): void {
+    const sys = this.sys;
+    const s = sys.state;
+    this.maxExtent = 0;
+    const members = new Map<string, number[]>();
+    // bodystyle custom: the body values taken when the fix was defined (customKeys)
+    const custom = this.customKeys;
+    for (let i = 0; i < s.n; i++) {
+      if (!custom && !(s.mask[i] & this.groupBit)) continue;
+      let key: string | null = null;
+      if (this.bodystyle === 'single') key = '1';
+      else if (this.bodystyle === 'molecule') key = String(s.molecule[i]);
+      else if (custom) key = custom.get(s.id[i]) ?? null;
+      else {
+        const k = this.groupList.findIndex((gname) => (s.mask[i] & sys.groups.bit(gname)) !== 0);
+        if (k >= 0) key = String(k + 1);
+      }
+      if (key === null) continue;
+      if (!members.has(key)) members.set(key, []);
+      members.get(key)!.push(i);
+    }
+    // body order: molecule IDs ascending, group order, single
+    const keys = [...members.keys()].sort((a, b) => Number(a) - Number(b));
+    const bodies: Body[] = [];
+    // infile body IDs: the molecule/group/single ID, or for bodystyle custom the value minus the
+    // smallest body value plus 1. Measured with native LAMMPS (black box): custom values 0,1,3,4 take
+    // infile IDs 1,2,4,5, and infile ID 3 (no body with value 2) is an error.
+    const infileId = (key: string) => (this.customVar || this.customProp ? String(Number(key) - Number(keys[0]) + 1) : key);
+    for (const key of keys) {
+      const b = this.constructBody(key, members.get(key)!, infileId(key));
+      // native keeps the owner chosen when the fix was created (bodytag); a rebuilt body keeps it too
+      const first = this.ownerByKey.get(key);
+      if (first !== undefined && b.atoms.includes(first)) b.owner = first;
+      else this.ownerByKey.set(key, b.owner);
+      bodies.push(b);
+    }
+    if (this.infile) {
+      const valid = new Set(keys.map(infileId));
+      for (const key of this.infile.keys()) {
+        if (!valid.has(key)) throw new StyleError(`fix ${this.style}: infile body ID ${key} is not a rigid body (bodystyle ${this.bodystyle})`);
+      }
+    }
+    const nb = bodies.length;
+    for (const [spec, flags] of this.forceSpecs) { const [lo, hi] = typeBounds(spec, nb); for (let k = lo; k <= hi; k++) bodies[k - 1].fflag = flags.slice(); }
+    for (const [spec, flags] of this.torqueSpecs) { const [lo, hi] = typeBounds(spec, nb); for (let k = lo; k <= hi; k++) bodies[k - 1].tflag = flags.slice(); }
+    this.bodies = bodies;
+    this.rankOwners();
+    this.publishBodyMass();
+    this.sizeArrayRows = nb;
+    for (const b of bodies) this.omegaFromAngmom(b);
+    sys.log(`fix ${this.id} ${this.style}: ${nb} rigid bodies with ${bodies.reduce((a, b) => a + b.atoms.length, 0)} atoms`);
+  }
+
+  /** Builds one rigid body from the current state of the atoms at indices `idx` (see buildBodies). */
+  private constructBody(key: string, idx: number[], infileKey: string): Body {
+    const sys = this.sys;
+    const s = sys.state;
+    const g = sys.geom;
+    const u = [0, 0, 0];
+    if (idx.length < 2) throw new StyleError(`fix ${this.style}: "Each rigid body must have two or more atoms." (body ${key})`);
+    for (const i of idx) for (let d = 0; d < 3; d++) if (!s.box.periodic[d] && s.image[3 * i + d] !== 0) throw new StyleError(`fix ${this.style}: an atom of body ${key} has a non-zero image flag in a non-periodic dimension`);
+    let M = 0;
+    const xcm = [0, 0, 0], vcm = [0, 0, 0];
+    const pos = idx.map((i) => { g.unwrap(s.x, s.image, i, u); return [u[0], u[1], u[2]]; });
+    idx.forEach((i, n) => {
+      const m = massOf(s, i);
+      M += m;
+      for (let d = 0; d < 3; d++) { xcm[d] += m * pos[n][d]; vcm[d] += m * s.v[3 * i + d]; }
+    });
+    for (let d = 0; d < 3; d++) { xcm[d] /= M; vcm[d] /= M; }
+    // Body extent (fix_rigid_small.cpp at b332f28, create_bodies): the owner is the atom nearest the centre of the
+    // body's bounding box (ties to the lower atom ID), and the extent is the largest distance of a body atom from it.
+    // Measured with native LAMMPS (black box): chains of 2, 3, 4, 5 and 8 atoms spaced 1 apart give extents 1, 1, 2, 2 and 4.
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (const p of pos) for (let d = 0; d < 3; d++) { lo[d] = Math.min(lo[d], p[d]); hi[d] = Math.max(hi[d], p[d]); }
+    const ctr = [0, 1, 2].map((d) => 0.5 * (lo[d] + hi[d]));
+    let ref = 0, refD2 = Infinity;
+    pos.forEach((p, n) => {
+      const d2 = (p[0] - ctr[0]) ** 2 + (p[1] - ctr[1]) ** 2 + (p[2] - ctr[2]) ** 2;
+      if (d2 < refD2 || (d2 === refD2 && s.id[idx[n]] < s.id[idx[ref]])) { refD2 = d2; ref = n; }
+    });
+    let ext2 = 0;
+    for (const p of pos) ext2 = Math.max(ext2, (p[0] - pos[ref][0]) ** 2 + (p[1] - pos[ref][1]) ** 2 + (p[2] - pos[ref][2]) ** 2);
+    this.maxExtent = Math.max(this.maxExtent, Math.sqrt(ext2));
+    const I = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    const angmom = [0, 0, 0];
+    let nsph = 0;
+    const orientQ = new Array<number>(4 * idx.length).fill(0);
+    const dorient = new Array<number>(3 * idx.length).fill(0);
+    idx.forEach((i, n) => {
+      const m = massOf(s, i);
+      const r = [pos[n][0] - xcm[0], pos[n][1] - xcm[1], pos[n][2] - xcm[2]];
+      const r2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
+      for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) I[a][b] += m * ((a === b ? r2 : 0) - r[a] * r[b]);
+      const L = cross(r, [s.v[3 * i], s.v[3 * i + 1], s.v[3 * i + 2]]);
+      for (let d = 0; d < 3; d++) angmom[d] += m * L[d];
+      this.refuseUnsupportedParticle(key, i);
+      const rad = s.radius ? s.radius[i] : 0;
+      if (isEllipsoid(s, i)) {
+        // fix_rigid_small.cpp setup_bodies_static (ELLIPSOID): inertia_ellipsoid(shape, quat_atom, mass) is the ellipsoid's
+        // own inertia in the space frame (its principal moments m/5 (b^2+c^2) and so on, rotated by quat_atom);
+        // setup_bodies_dynamic adds the particle's own angular momentum (ANGMOM flag). The orientation relative to the
+        // body is set after the body frame is known (below). Finite-size, so it adds a rotational dof (nsph).
+        const q = [s.quat![4 * i], s.quat![4 * i + 1], s.quat![4 * i + 2], s.quat![4 * i + 3]];
+        const Ii = triInertiaSpace(q, ellipsoidInertia(s, i));
+        for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) I[a][b] += Ii[a][b];
+        for (let d = 0; d < 3; d++) angmom[d] += s.angmom![3 * i + d];
+        nsph++;
+      } else if (isLineAtom(s, i)) {
+        // fix_rigid.cpp setup_bodies_static (LINE): the segment's own inertia, inertia_line(length, theta, mass), which
+        // is mass L^2/12 times (1 - u u^T) with u the segment direction (cos theta, sin theta, 0); its spin adds
+        // LINERTIA m L^2 omega_z to the body angular momentum (only the z component, as native)
+        if (sys.dimension !== 2) throw new StyleError(`fix ${this.style}: line atom ${s.id[i]} in rigid body ${key} is supported only in 2d by the browser engine`);
+        const bonus = s.custom.get(LINE_BONUS)!.data;
+        const len = bonus[2 * i];
+        const th = bonus[2 * i + 1];
+        const a = (m * len * len) / 12.0;
+        const ux = libm.cos(th), uy = libm.sin(th);
+        I[0][0] += a * (1 - ux * ux);
+        I[1][1] += a * (1 - uy * uy);
+        I[2][2] += a;
+        I[0][1] -= a * ux * uy;
+        I[1][0] -= a * ux * uy;
+        if (s.omega) angmom[2] += a * s.omega[3 * i + 2];
+        nsph++;
+      } else if (isTriAtom(s, i)) {
+        // fix_rigid.cpp setup_bodies_static (TRIANGLE): inertia_triangle(inertia, quat_atom, mass) is the triangle's own
+        // inertia in the space frame (its moments are the triangle bonus, mass included); setup_bodies_dynamic adds the
+        // atom's own angular momentum to the body (eflags ANGMOM). As native's dof() counts it (eflags TRIANGLE is not
+        // POINT, DIPOLE or TORQUE), the triangle is a finite-size particle for the dof count (nsph): w79rigid_tri needs
+        // compute_modify extra/dof -6 natively, since two bodies of two triangles otherwise have dof 12 - 3 - 12 < 0.
+        if (sys.dimension !== 2) {
+          const moments = [0, 1, 2].map((k) => s.custom.get(TRI_BONUS)!.data[TRI_BONUS_COLS * i + 9 + k]);
+          const Ii = triInertiaSpace([s.quat![4 * i], s.quat![4 * i + 1], s.quat![4 * i + 2], s.quat![4 * i + 3]], moments);
+          for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) I[a][b] += Ii[a][b];
+          for (let d = 0; d < 3; d++) angmom[d] += s.angmom![3 * i + d];
+          nsph++;
+        } else throw new StyleError(`fix ${this.style}: triangle atom ${s.id[i]} in rigid body ${key} needs a 3d simulation`);
+      } else if (rad > 0) {
+        // docs.lammps.org/fix_rigid.html: "Finite-size particles contribute differently to the moment of
+        // inertia of a rigid body than do point particles." A solid sphere adds 2/5 m r^2 about its own centre
+        // (textbook), and its spin omega_i adds I_s omega_i to the body angular momentum. Measured with native
+        // LAMMPS (black box): a two-sphere body with spin 0.3 about z has omega_z = 0.0857142857 = L/I with
+        // both terms included.
+        // docs.lammps.org/fix_rigid.html (dimension 2): "A 2d rigid body has 3 degrees of freedom (2
+        // translational, 1 rotational)". Spheres in 2d keep the 3d moment of inertia (compute_erotate_sphere.html:
+        // "particles are treated as spheres, not disks"). Measured with native LAMMPS (black box), 2d: the spin
+        // enters the body angular momentum through its z component only; x and y spin components are dropped at
+        // setup and the spheres' omega_x, omega_y read back as 0 (z-only spin gives omega_z = 0.13531269 with
+        // x/y spin 0.4, -0.3 set on the same spheres).
+        const Is = 0.4 * m * rad * rad;
+        for (let a = 0; a < 3; a++) I[a][a] += Is;
+        if (s.omega) {
+          if (sys.dimension === 2) angmom[2] += Is * s.omega[3 * i + 2];
+          else for (let d = 0; d < 3; d++) angmom[d] += Is * s.omega[3 * i + d];
+        }
+        nsph++;
+      }
+    });
+    // infile attributes replace the computed ones; the atoms keep their positions relative to the body
+    const over = this.infile?.get(infileKey) ?? null;
+    const L = (d: number) => s.box.hi[d] - s.box.lo[d];
+    const xcmB = over ? over.xcm.map((c, d) => c + (s.box.periodic[d] ? over.image[d] * L(d) : 0)) : xcm;
+    const frame = principalFrame(over ? over.I : I, sys.dimension === 2);
+    const Rq = qmat(frame.q);
+    const displace = pos.map((p) => {
+      const r = [p[0] - xcmB[0], p[1] - xcmB[1], p[2] - xcmB[2]];
+      return [0, 1, 2].map((c) => Rq[0][c] * r[0] + Rq[1][c] * r[1] + Rq[2][c] * r[2]);
+    });
+    // line orientations relative to the body (fix_rigid.cpp setup_bodies_static, LINE branch)
+    const thetaBody = bodyTheta(frame.q);
+    const orient = idx.map((i) => (isLineAtom(s, i) ? wrapAngle(s.custom.get(LINE_BONUS)!.data[2 * i + 1] - thetaBody) : 0));
+    // triangle orientations relative to the body (fix_rigid.cpp setup_bodies_static, TRIANGLE)
+    const qbodyC = [frame.q[0], -frame.q[1], -frame.q[2], -frame.q[3]];
+    idx.forEach((i, n) => {
+      if (!isTriAtom(s, i) && !isEllipsoid(s, i)) return;
+      const qa = [s.quat![4 * i], s.quat![4 * i + 1], s.quat![4 * i + 2], s.quat![4 * i + 3]];
+      const qo = quatNormalize(quatMul(qbodyC, qa));
+      for (let d = 0; d < 4; d++) orientQ[4 * n + d] = qo[d];
+    });
+    // point dipoles (fix_rigid_small.cpp setup_bodies_static, DIPOLE): dorient = R^T mu, scaled to the dipole magnitude
+    // mu[3] (snormalize3); R is the body frame, whose axes are the columns of Rq
+    const Rq0 = qmat(frame.q);
+    idx.forEach((i, n) => {
+      if (!(s.mu && s.mu[4 * i + 3] > 0)) return;
+      const mu = [s.mu[4 * i], s.mu[4 * i + 1], s.mu[4 * i + 2]];
+      const dv = [0, 1, 2].map((c) => Rq0[0][c] * mu[0] + Rq0[1][c] * mu[1] + Rq0[2][c] * mu[2]);
+      const val = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
+      if (val <= 0) return;
+      const scale = s.mu[4 * i + 3] / Math.sqrt(val);
+      for (let d = 0; d < 3; d++) dorient[3 * n + d] = dv[d] * scale;
+    });
+    const inertia = frame.inertia;
+    const ncollinear = inertia.filter((v) => v === 0).length;
+    const b: Body = {
+      atoms: idx.map((i) => s.id[i]),
+      mass: over ? over.mass : M,
+      xcm: xcmB,
+      vcm: over ? over.vcm.slice() : vcm,
+      image: [0, 0, 0],
+      inertia,
+      q: frame.q,
+      angmom: over ? over.lam.slice() : angmom,
+      omega: [0, 0, 0],
+      displace,
+      fcm: [0, 0, 0], torque: [0, 0, 0], fflag: [true, true, true], tflag: [true, true, true],
+      dof: sys.dimension === 2 ? 3 : ncollinear >= 1 ? 5 : 6,
+      nsph,
+      orient,
+      orientQ,
+      dorient,
+      owner: s.id[idx[ref]],
+      nimage: [0, 0, 0],
+    };
+    this.wrapCom(b);
+    b.nimage = b.image.slice();
+    return b;
+  }
+
+  /**
+   * Ellipsoids and point dipoles are integrated by every style of this fix (constructBody, setXV); superellipsoids are
+   * refused. As native LAMMPS does (src/RIGID/fix_rigid.cpp and fix_rigid_small.cpp at b332f28, init: "Superellipsoids
+   * not supported in fix rigid" and "... in fix rigid/small").
+   */
+  private refuseUnsupportedParticle(key: string, i: number): void {
+    void key; void i;
+    const s = this.sys.state;
+    if (isSuperEllipsoidStyle(s.atomStyle)) {
+      throw new StyleError(`fix ${this.style}: Superellipsoids not supported in fix ${this.style.includes('small') ? 'rigid/small' : 'rigid'}`);
+    }
+  }
+
+  /** The mol template-ID of this fix (null without the mol keyword); fix gcmc rigid must name the same one. */
+  moleculeTemplateId(): string | null { return this.molTemplateId; }
+
+  /**
+   * Removes the rigid body that holds the given atom IDs (fix gcmc deletes a molecule with the rigid keyword).
+   * Deleted atoms have no entry any more, so the body is found by its atom IDs.
+   * docs.lammps.org/fix_gcmc.html: "use the *rigid* keyword, specifying as its value the ID of a separate
+   * fix rigid/small command which also appears in your input script."
+   */
+  removeMolecule(atomIds: readonly number[]): void {
+    if (this.bodystyle !== 'molecule') throw new StyleError(`fix ${this.style}: the mol keyword needs bodystyle molecule`);
+    const gone = new Set(atomIds);
+    const before = this.bodies.length;
+    for (const b of this.bodies) if (b.atoms.some((id) => gone.has(id))) for (const id of b.atoms) this.sys.state.rigidBodyMass?.delete(id);
+    this.bodies = this.bodies.filter((b) => !b.atoms.some((id) => gone.has(id)));
+    if (this.bodies.length !== before - 1) throw new StyleError(`fix ${this.style}: expected one rigid body for the deleted molecule, found ${before - this.bodies.length}`);
+    this.sizeArrayRows = this.bodies.length;
+  }
+
+  /**
+   * Publishes each body's mass for its atoms (SimState.rigidBodyMass), read by the granular contact styles.
+   * docs.lammps.org/pair_gran.html: "If either particle is part of a rigid body, its mass is replaced by the
+   * mass of the rigid body in the formula above."
+   */
+  private publishBodyMass(): void {
+    const s = this.sys.state;
+    if (!s.rigidBodyMass) s.rigidBodyMass = new Map();
+    for (const b of this.bodies) for (const id of b.atoms) s.rigidBodyMass.set(id, b.mass);
+  }
+
+  /**
+   * The storage order of the bodies of native rigid/small, by owner atom ID. As native LAMMPS does
+   * (src/RIGID/fix_rigid_small.cpp at b332f28, the constructor and unpack_exchange): the bodies are stored in the
+   * local order of their owner atoms when the fix is created, and a body added later (or brought back by an
+   * exchange) goes to the end. A sort of the atoms does not move the bodies. The engine builds the bodies at the
+   * first run; the order of the atoms then is the order they had when the fix was defined, since only runs reorder
+   * them. Used by the HMC resampling of rigid-body momenta, which draws per body in this order.
+   */
+  private readonly ownerRank = new Map<number, number>();
+  private readonly ownerByKey = new Map<string, number>();
+
+  private rankOwners(): void {
+    const s = this.sys.state;
+    const pos = new Map<number, number>();
+    nativeOrder(s).forEach((i, r) => pos.set(s.id[i], r));
+    let next = 0;
+    for (const r of this.ownerRank.values()) if (r >= next) next = r + 1;
+    const fresh = this.bodies.filter((b) => !this.ownerRank.has(b.owner)).sort((a, b) => (pos.get(a.owner) ?? 0) - (pos.get(b.owner) ?? 0));
+    for (const b of fresh) this.ownerRank.set(b.owner, next++);
+  }
+
+  /** The live bodies in the native storage order (see ownerRank). */
+  bodiesInNativeOrder(): Body[] {
+    this.rankOwners();
+    return this.bodies.slice().sort((a, b) => this.ownerRank.get(a.owner)! - this.ownerRank.get(b.owner)!);
+  }
+
+  /** Sets the native storage order to that of these owner atom IDs (bodies brought back in this atom order). */
+  setBodyNativeOrder(ownerIds: readonly number[]): void {
+    this.ownerRank.clear();
+    ownerIds.forEach((id, r) => this.ownerRank.set(id, r));
+  }
+
+  /**
+   * The atom velocities from the bodies' centre-of-mass velocities and angular velocities (set_v), after a change of
+   * the bodies' momenta (vcm, omega and angmom set together); the no-squish styles take the quaternion momentum from
+   * the angular momentum. The constraint-force virial of the velocity change is added with virialFactor (native
+   * set_v tallies one half of x . f_c while the virial of the step is accumulated; it is reset at the next step).
+   */
+  velocitiesFromBodies(virialFactor: number): void {
+    if (this.noSquish) for (const b of this.bodies) b.conjqm = this.conjqmFromAngmom(b);
+    this.setXV(false, virialFactor);
+  }
+
+  /**
+   * velocity ... zero linear|angular rigid fix-ID (velocity.html: "the rigid keyword ... the linear or angular momentum
+   * of each rigid body defined by the fix is zeroed"). As native LAMMPS does (src/velocity.cpp zero and
+   * src/RIGID/fix_rigid.cpp zero_momentum, zero_rotation, setup_bodies_early at b332f28): the bodies are built from the
+   * atoms if no run has built them (the /small styles rebuild them with reinit, as their setup_pre_neighbor does, or
+   * wrap their centres of mass), the centre-of-mass velocity (or angular momentum and angular velocity) of every body
+   * is set to 0, and the atom velocities follow the bodies without a virial.
+   */
+  zeroMomentum(): void {
+    this.bodiesEarly();
+    for (const b of this.bodies) b.vcm = [0, 0, 0];
+    this.setXV(false, 0);
+  }
+
+  zeroRotation(): void {
+    this.bodiesEarly();
+    for (const b of this.bodies) {
+      b.angmom = [0, 0, 0];
+      b.omega = [0, 0, 0];
+    }
+    this.setXV(false, 0);
+  }
+
+  /** The IDs of the atoms in bodies once the bodies are built, else null (FixRigid::extract("body")). */
+  bodyAtomIds(): Set<number> | null {
+    return this.built ? new Set(this.bodies.flatMap((b) => b.atoms)) : null;
+  }
+
+  private bodiesEarly(): void {
+    if (this.style.includes('small')) {
+      if (this.reinit || !this.built) {
+        this.buildBodies();
+        this.built = true;
+      } else for (const b of this.bodies) this.wrapCom(b);
+    } else if (!this.built) {
+      this.buildBodies();
+      this.built = true;
+    }
+  }
+
+  /** Copies of the body list, to undo a rejected deletion (see removeMolecule). */
+  snapshotBodies(): Body[] { return this.bodies.map(cloneBody); }
+
+  restoreBodies(snap: Body[]): void {
+    this.bodies = snap.map(cloneBody);
+    this.publishBodyMass();
+    this.sizeArrayRows = this.bodies.length;
+  }
+
+  /**
+   * Adds a rigid body for the molecule given by its new atom IDs (fix deposit with the rigid keyword).
+   * docs.lammps.org/fix_rigid.html: "It must be used when other commands, such as fix deposit or fix pour,
+   * add rigid bodies on-the-fly during a simulation." The body is built from the atoms as deposited, so it
+   * keeps the deposited positions and velocities.
+   */
+  addMolecule(atomIds: readonly number[]): void {
+    if (this.bodystyle !== 'molecule') throw new StyleError(`fix ${this.style}: the mol keyword needs bodystyle molecule`);
+    const idx = this.index();
+    const ii: number[] = [];
+    for (const idNum of atomIds) {
+      const k = idx.get(idNum);
+      if (k === undefined) throw new StyleError(`fix ${this.style}: atom ${idNum} does not exist`);
+      ii.push(k);
+    }
+    const key = String(this.sys.state.molecule[ii[0]]);
+    const b = this.constructBody(key, ii, key);
+    this.bodies.push(b);
+    this.publishBodyMass();
+    this.sizeArrayRows = this.bodies.length;
+    this.omegaFromAngmom(b);
+  }
+
+  /**
+   * FixRigid::deform (src/RIGID/fix_rigid.cpp at b332f28): "adjust xcm of each rigid body due to box deformation";
+   * flag 0 maps xcm to lamda coordinates (the xcm array then holds lamda until flag 1), flag 1 maps it back.
+   */
+  deformBodies(flag: 0 | 1): void {
+    const g = this.sys.geom;
+    const t = [0, 0, 0];
+    for (const b of this.bodies) {
+      if (flag === 0) g.toLamda(b.xcm[0], b.xcm[1], b.xcm[2], t);
+      else g.fromLamda(b.xcm[0], b.xcm[1], b.xcm[2], t);
+      b.xcm[0] = t[0]; b.xcm[1] = t[1]; b.xcm[2] = t[2];
+    }
+  }
+
+  /** COM image flags: xcm stays the unwrapped position; image counts box periods. */
+  private wrapCom(b: Body): void {
+    const box = this.sys.state.box;
+    for (let d = 0; d < 3; d++) {
+      const L = box.hi[d] - box.lo[d];
+      b.image[d] = box.periodic[d] ? Math.floor((b.xcm[d] - box.lo[d]) / L) : 0;
+    }
+  }
+
+  private omegaFromAngmom(b: Body): void {
+    const R = qmat(b.q);
+    const w = [0, 0, 0];
+    for (let k = 0; k < 3; k++) {
+      if (b.inertia[k] === 0) continue;
+      const ek = [R[0][k], R[1][k], R[2][k]];
+      const lk = (b.angmom[0] * ek[0] + b.angmom[1] * ek[1] + b.angmom[2] * ek[2]) / b.inertia[k];
+      for (let d = 0; d < 3; d++) w[d] += lk * ek[d];
+    }
+    b.omega = w;
+  }
+
+  init(): void {
+    if (this.molTemplateId && !this.sys.molecules.has(this.molTemplateId)) {
+      throw new StyleError(`fix ${this.style}: mol molecule template '${this.molTemplateId}' does not exist`);
+    }
+    if (this.gravityId) {
+      const f = this.sys.fixes.find((x) => x.id === this.gravityId);
+      if (!f) throw new StyleError(`fix ${this.style} gravity: fix ID ${this.gravityId} does not exist`);
+      if (!(f instanceof FixGravity)) throw new StyleError(`fix ${this.style} gravity: fix ID ${this.gravityId} is not a gravity fix style`);
+      this.gravityFix = f;
+    }
+    if (!this.built || this.reinit) { this.buildBodies(); this.built = true; }
+  }
+
+  /**
+   * Degrees of freedom a body takes away from a temperature compute: its atoms' translational dof
+   * (dimension per atom) minus the body's own (3 in 2d). Measured with native LAMMPS (black box): two
+   * 3-atom bodies in 2d give temp 0.796366300611291 with ke 0.265455433537097 per atom, i.e.
+   * 2 * 3 * 2 - 2 - 2 * (6 - 3) = 4 dof (w37rigid_temp2d, fix rigid and rigid/small); counting 3 dof per
+   * atom in 2d left -2 and a temperature of 0.
+   */
+  dofRemoved(groupBit: number): number {
+    const s = this.sys.state;
+    const idx = this.index();
+    const d = this.sys.dimension;
+    let n = 0;
+    for (const b of this.bodies) {
+      if (!b.atoms.every((id) => (s.mask[idx.get(id)!] & groupBit) !== 0)) continue;
+      // finite-size spheres take their rotational dof away too: measured with native LAMMPS (black box),
+      // a body of n spheres removes 6n - 6 from a temperature compute in 3d (sphere-spin oracle w42rfs_sphere_spin)
+      // and, in 2d, n + 2n - 3 with one rotational dof per sphere (w92rig2d_* oracles: a 3-sphere body removes 6)
+      n += d * b.atoms.length - b.dof + (d === 3 ? 3 : 1) * b.nsph;
+    }
+    return n;
+  }
+
+  // ---------------------------------------------------------------- integration
+
+  private sumForces(): void {
+    const s = this.sys.state;
+    const g = this.sys.geom;
+    const idx = this.index();
+    const u = [0, 0, 0];
+    // keyword gravity: the fix gravity's acceleration (force/mass units, internal) times the body mass
+    const acc = new Float64Array(3);
+    this.gravityFix?.accel(acc);
+    for (const b of this.bodies) {
+      const F = [0, 0, 0], T = [0, 0, 0];
+      for (const id of b.atoms) {
+        const i = idx.get(id)!;
+        const fx = s.f[3 * i], fy = s.f[3 * i + 1], fz = s.f[3 * i + 2];
+        g.unwrap(s.x, s.image, i, u);
+        const rx = u[0] - b.xcm[0], ry = u[1] - b.xcm[1], rz = u[2] - b.xcm[2];
+        // r x f
+        F[0] += fx; T[0] += ry * fz - rz * fy;
+        F[1] += fy; T[1] += rz * fx - rx * fz;
+        F[2] += fz; T[2] += rx * fy - ry * fx;
+        // per-atom torques of finite-size particles (granular contacts, fix addtorque) add to the body torque
+        if (s.torque) for (let d = 0; d < 3; d++) T[d] += s.torque[3 * i + d];
+      }
+      // docs.lammps.org/fix_rigid.html: "A gravity force will then be applied to each rigid body at its
+      // center-of-mass position using its total mass." The force has no torque.
+      if (this.gravityFix) for (let d = 0; d < 3; d++) F[d] += b.mass * acc[d];
+      // stored unflagged (the global array reports them so, measured); the flags act on the kicks
+      for (let d = 0; d < 3; d++) { b.fcm[d] = F[d]; b.torque[d] = T[d]; }
+    }
+  }
+
+  /**
+   * Atom positions (with image flags) and velocities from the body state.
+   * Virial (measured with native LAMMPS, oracle rigid_molecule): each
+   * regeneration adds factor * sum x_u (x) fc with the constraint force
+   * fc = m (v_new - v_old) / (dt/2) - f, x_u the unwrapped position before
+   * the update (xy = x fc_y, xz = x fc_z, yz = y fc_z); factor 1 at setup
+   * (where v_old are the atoms' own velocities) and 1/2 in each of
+   * initial_integrate and final_integrate. This reproduces native pressure
+   * components to ~1e-9 absolute (the scalar pressure to 1e-12).
+   */
+  private setXV(setX: boolean, virialFactor: number): void {
+    const s = this.sys.state;
+    const g = this.sys.geom;
+    const idx = this.index();
+    const dtf = 0.5 * s.dt * s.units.ftm2v;
+    const vir = this.virial;
+    if (this.vAtom.length !== 6 * s.n) this.vAtom = new Float64Array(6 * s.n);
+    const va = this.vAtom;
+    const u = [0, 0, 0];
+    // per-atom scratch: R d, omega x R d, the old velocity and unwrapped position, the constraint force
+    const r = [0, 0, 0], w = [0, 0, 0], vold = [0, 0, 0], xold = [0, 0, 0], fc = [0, 0, 0];
+    // the per-atom flags of line and triangle particles (isLineAtom, isTriAtom), looked up once per call
+    const lineFlag = s.custom.get(LINE_FLAG)?.data ?? null, triFlag = s.custom.get(TRI_FLAG)?.data ?? null;
+    for (const b of this.bodies) {
+      const R = qmat(b.q);
+      const om = b.omega;
+      for (let n = 0; n < b.atoms.length; n++) {
+        const i = idx.get(b.atoms[n])!;
+        const dsp = b.displace[n];
+        for (let d = 0; d < 3; d++) r[d] = R[d][0] * dsp[0] + R[d][1] * dsp[1] + R[d][2] * dsp[2];
+        w[0] = om[1] * r[2] - om[2] * r[1]; w[1] = om[2] * r[0] - om[0] * r[2]; w[2] = om[0] * r[1] - om[1] * r[0];
+        vold[0] = s.v[3 * i]; vold[1] = s.v[3 * i + 1]; vold[2] = s.v[3 * i + 2];
+        g.unwrap(s.x, s.image, i, xold);
+        for (let d = 0; d < 3; d++) s.v[3 * i + d] = b.vcm[d] + w[d];
+        // finite-size spheres rotate with the body: their angular velocity is the body's (measured with native LAMMPS, black box)
+        if (s.omega && s.radius && s.radius[i] > 0) for (let d = 0; d < 3; d++) s.omega[3 * i + d] = b.omega[d];
+        // fix_rigid.cpp set_xv(): the segment angle follows the body, theta = orient + theta_body (set_v does not)
+        if (setX && (lineFlag !== null && !!lineFlag[i])) s.custom.get(LINE_BONUS)!.data[2 * i + 1] = wrapAngle(b.orient[n] + bodyTheta(b.q));
+        // fix_rigid.cpp set_xv()/set_v() (TRIANGLE): set_xv sets the triangle's quaternion quat_body * orient; both set its
+        // angular momentum from the body's omega with its principal moments (omega_to_angmom)
+        // fix_rigid_small.cpp set_xv() and set_v() (ELLIPSOID): quat_atom = quat_body * orient (set_xv only), then
+        // angmom from the body omega with the ellipsoid's own moments in the space frame (omega_to_angmom)
+        if (isEllipsoid(s, i)) {
+          if (setX) {
+            const qo = quatNormalize(quatMul(b.q, b.orientQ.slice(4 * n, 4 * n + 4)));
+            for (let d = 0; d < 4; d++) s.quat![4 * i + d] = qo[d];
+          }
+          const q = [s.quat![4 * i], s.quat![4 * i + 1], s.quat![4 * i + 2], s.quat![4 * i + 3]];
+          const R = quatToMatrix(q[0], q[1], q[2], q[3]);
+          const moments = ellipsoidInertia(s, i);
+          const L = [0, 0, 0];
+          for (let k = 0; k < 3; k++) {
+            const ek = [R[k], R[3 + k], R[6 + k]];
+            const wk = (b.omega[0] * ek[0] + b.omega[1] * ek[1] + b.omega[2] * ek[2]) * moments[k];
+            for (let d = 0; d < 3; d++) L[d] += wk * ek[d];
+          }
+          for (let d = 0; d < 3; d++) s.angmom![3 * i + d] = L[d];
+        }
+        // fix_rigid_small.cpp set_xv() (DIPOLE): mu = R dorient, scaled to the magnitude mu[3]; set_v leaves mu alone
+        if (setX && s.mu && s.mu[4 * i + 3] > 0) {
+          const dv = [b.dorient[3 * n], b.dorient[3 * n + 1], b.dorient[3 * n + 2]];
+          const val = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
+          if (val > 0) {
+            const scale = s.mu[4 * i + 3] / Math.sqrt(val);
+            for (let d = 0; d < 3; d++) s.mu[4 * i + d] = (R[d][0] * dv[0] + R[d][1] * dv[1] + R[d][2] * dv[2]) * scale;
+          }
+        }
+        if ((triFlag !== null && !!triFlag[i])) {
+          if (setX) {
+            const qo = quatNormalize(quatMul(b.q, b.orientQ.slice(4 * n, 4 * n + 4)));
+            for (let d = 0; d < 4; d++) s.quat![4 * i + d] = qo[d];
+          }
+          const q = [s.quat![4 * i], s.quat![4 * i + 1], s.quat![4 * i + 2], s.quat![4 * i + 3]];
+          const R = quatToMatrix(q[0], q[1], q[2], q[3]);
+          const moments = [0, 1, 2].map((k) => s.custom.get(TRI_BONUS)!.data[TRI_BONUS_COLS * i + 9 + k]);
+          // omega_to_angmom: L = sum_k (omega . e_k) I_k e_k
+          const L = [0, 0, 0];
+          for (let k = 0; k < 3; k++) {
+            const ek = [R[k], R[3 + k], R[6 + k]];
+            const wk = (b.omega[0] * ek[0] + b.omega[1] * ek[1] + b.omega[2] * ek[2]) * moments[k];
+            for (let d = 0; d < 3; d++) L[d] += wk * ek[d];
+          }
+          for (let d = 0; d < 3; d++) s.angmom![3 * i + d] = L[d];
+        }
+        if (setX) {
+          // As native LAMMPS does (src/RIGID/fix_rigid.cpp and fix_rigid_small.cpp set_xv at b332f28): the atom keeps
+          // its image flags, x = xcm + R d minus their shift (with the tilt factors of a triclinic box: "map back into
+          // periodic box via xbox,ybox,zbox"); atoms that leave the box are mapped back when the lists are rebuilt
+          const ix = s.image[3 * i], iy = s.image[3 * i + 1], iz = s.image[3 * i + 2];
+          s.x[3 * i] = r[0] + (b.xcm[0] - ix * g.lx - iy * g.xy - iz * g.xz);
+          s.x[3 * i + 1] = r[1] + (b.xcm[1] - iy * g.ly - iz * g.yz);
+          s.x[3 * i + 2] = r[2] + (b.xcm[2] - iz * g.lz);
+        }
+        if (virialFactor) {
+          const m = massOf(s, i);
+          if (setX) { u[0] = xold[0]; u[1] = xold[1]; u[2] = xold[2]; } else g.unwrap(s.x, s.image, i, u);
+          // As native LAMMPS does (src/RIGID/fix_rigid.cpp and fix_rigid_small.cpp set_xv and set_v at b332f28): the
+          // position is unwrapped by xcmimage, the atom's image flags relative to the body's ("x0 = x[i][0] + xbox*xprd
+          // + ybox*xy + zbox*xz"), i.e. the absolute unwrap less the body image of the last build; with a non-zero
+          // total constraint force on the body (a run's setup) the virial depends on it
+          const bi = b.nimage ?? b.image;
+          if (bi[0] !== 0 || bi[1] !== 0 || bi[2] !== 0) {
+            u[0] -= bi[0] * g.lx + bi[1] * g.xy + bi[2] * g.xz;
+            u[1] -= bi[1] * g.ly + bi[2] * g.yz;
+            u[2] -= bi[2] * g.lz;
+          }
+          for (let d = 0; d < 3; d++) fc[d] = (m * (s.v[3 * i + d] - vold[d])) / dtf - s.f[3 * i + d];
+          vir[0] += virialFactor * u[0] * fc[0]; vir[1] += virialFactor * u[1] * fc[1]; vir[2] += virialFactor * u[2] * fc[2];
+          vir[3] += virialFactor * u[0] * fc[1]; vir[4] += virialFactor * u[0] * fc[2]; vir[5] += virialFactor * u[1] * fc[2];
+          // fix_rigid_small.cpp set_xv()/set_v(): vr = 0.5 * x fc terms of this atom, v_tally(1, &i, 1.0, vr)
+          va[6 * i] += virialFactor * u[0] * fc[0]; va[6 * i + 1] += virialFactor * u[1] * fc[1]; va[6 * i + 2] += virialFactor * u[2] * fc[2];
+          va[6 * i + 3] += virialFactor * u[0] * fc[1]; va[6 * i + 4] += virialFactor * u[0] * fc[2]; va[6 * i + 5] += virialFactor * u[1] * fc[2];
+        }
+      }
+    }
+  }
+
+  setup(): void {
+    // Measured with native LAMMPS (black box): a rigid/small body whose extent exceeds the ghost cutoff is an error at the run.
+    if (this.style.includes('small') && this.maxExtent > this.sys.nb.cutghost) {
+      throw new StyleError(`Rigid body extent ${this.maxExtent} > ghost atom cutoff - use comm_modify cutoff`);
+    }
+    this.sumForces();
+    for (const b of this.bodies) {
+      this.omegaFromAngmom(b);
+      if (this.noSquish) b.conjqm = this.conjqmFromAngmom(b);
+    }
+    // native setup_pre_neighbor -> pre_neighbor: the centre of mass remapped into the box (imagebody)
+    this.snapshotImages(true);
+    // atom velocities become those of the rigid motion
+    this.virial.fill(0);
+    this.vAtom.fill(0);
+    this.setXV(false, 1);
+  }
+
+  /** The neighbor build of the bodies' nimage. */
+  private nimageBuild = -1;
+
+  /**
+   * nimage = the COM image flags at a neighbor build (native pre_neighbor: "domain->remap(xcm[ibody],imagebody[ibody])"
+   * and image_shift), taken once per build: at the run setup (force) and, during the run, at the first set_v after a
+   * build (the build follows initial_integrate, whose wrap of the centres of mass it sees).
+   */
+  private snapshotImages(force: boolean): void {
+    const nbuild = this.sys.nb.nbuild;
+    if (!force && nbuild === this.nimageBuild) return;
+    for (const b of this.bodies) {
+      if (force) this.wrapCom(b);
+      b.nimage = b.image.slice();
+    }
+    this.nimageBuild = nbuild;
+  }
+
+  /** The rigid/nve styles integrate with the no-squish splitting (native FixRigidNVE); the others with Richardson. */
+  private get noSquish(): boolean {
+    return this.style === 'rigid/nve' || this.style === 'rigid/nve/small';
+  }
+
+  /** conjqm = 2 quatvec(q, R^T L) from the space-frame angular momentum (native FixRigidNH::setup). */
+  private conjqmFromAngmom(b: Body): number[] {
+    const R = qmat(b.q);
+    const m = [0, 1, 2].map((k) => R[0][k] * b.angmom[0] + R[1][k] * b.angmom[1] + R[2][k] * b.angmom[2]);
+    return quatVec(b.q, m).map((v) => 2.0 * v);
+  }
+
+  /** Body-frame torque (flags applied) kick of the quaternion momentum by dtf2 = 2 dtf (native conjqm += dtf2 fquat). */
+  private conjqmTorqueKick(b: Body, dtf: number): void {
+    const R = qmat(b.q);
+    const t = [0, 1, 2].map((d) => (b.tflag[d] ? b.torque[d] : 0));
+    const tb = [0, 1, 2].map((k) => R[0][k] * t[0] + R[1][k] * t[1] + R[2][k] * t[2]);
+    const fq = quatVec(b.q, tb);
+    const dtf2 = dtf * 2.0;
+    if (!b.conjqm) b.conjqm = this.conjqmFromAngmom(b);
+    for (let k = 0; k < 4; k++) b.conjqm[k] += dtf2 * fq[k];
+  }
+
+  /** Angular momentum and omega from the quaternion momentum (native FixRigidNH: invquatvec, matvec, 0.5, angmom_to_omega). */
+  private angmomFromConjqm(b: Body): void {
+    const R = qmat(b.q);
+    const m = invQuatVec(b.q, b.conjqm!);
+    b.angmom = [0, 1, 2].map((d) => (R[d][0] * m[0] + R[d][1] * m[1] + R[d][2] * m[2]) * 0.5);
+    this.omegaFromAngmom(b);
+  }
+
+  initialIntegrate(): void {
+    const s = this.sys.state;
+    const dtf = 0.5 * s.dt * s.units.ftm2v;
+    const dtv = s.dt;
+    for (const b of this.bodies) {
+      for (let d = 0; d < 3; d++) {
+        if (b.fflag[d]) b.vcm[d] += (dtf * b.fcm[d]) / b.mass;
+        b.xcm[d] += dtv * b.vcm[d];
+        if (!this.noSquish && b.tflag[d]) b.angmom[d] += dtf * b.torque[d];
+      }
+      if (this.noSquish) {
+        // native FixRigidNH::initial_integrate: torque kick, then the no-squish rotations 3, 2, 1(dt), 2, 3
+        this.conjqmTorqueKick(b, dtf);
+        const dtq = 0.5 * dtv;
+        const I = b.inertia;
+        noSquishRotate(3, b.conjqm!, b.q, I, dtq);
+        noSquishRotate(2, b.conjqm!, b.q, I, dtq);
+        noSquishRotate(1, b.conjqm!, b.q, I, dtv);
+        noSquishRotate(2, b.conjqm!, b.q, I, dtq);
+        noSquishRotate(3, b.conjqm!, b.q, I, dtq);
+        this.angmomFromConjqm(b);
+      } else {
+        this.richardson(b, dtv);
+      }
+      this.wrapCom(b);
+    }
+    this.virial.fill(0);
+    this.vAtom.fill(0);
+    this.setXV(true, 0.5);
+  }
+
+  /** fix_modify bodyforces early|late (fix_modify.rst: "early/late = compute rigid-body forces/torques early or late in the timestep"). */
+  modify(key: string, values: string[]): number {
+    if (key === 'bodyforces') {
+      // src/RIGID/fix_rigid.cpp FixRigid::modify_param at b332f28: a missing or unknown value is "Illegal fix_modify command"
+      if (values[0] !== 'early' && values[0] !== 'late') throw new StyleError('Illegal fix_modify command');
+      this.early = values[0] === 'early';
+      return 1;
+    }
+    // fix_modify dynamic/dof is stored by Fix.modify: measured with native LAMMPS (black box, w38gcr_co2 with and
+    // without compute_modify thermo_temp dynamic/dof), dynamic/dof yes on fix rigid/small alone leaves the thermo
+    // temperature unchanged
+    return super.modify(key, values);
+  }
+
+  /** Early bodyforces: the forces are summed right after the per-atom forces (before later fixes' post_force). */
+  postForce(): void {
+    if (this.early) { this.sumForces(); this.applyLangevin(); }
+  }
+
+  /**
+   * The langevin keyword: a drag plus a random force on each body's center-of-mass velocity and a drag plus a random
+   * torque on its angular velocity (docs.lammps.org/fix_rigid.html: "The *langevin* keyword applies a Langevin
+   * thermostat"). As native LAMMPS does (src/RIGID/fix_rigid.cpp FixRigid::apply_langevin_thermostat and
+   * fix_rigid_small.cpp FixRigidSmall::apply_langevin_thermostat at b332f28), body by body:
+   *   gamma1 = -masstotal / t_period / ftm2v, gamma2 = sqrt(masstotal) tsqrt sqrt(24 boltz / t_period / dt / mvv2e) / ftm2v,
+   *   langextra[0..2] = gamma1 vcm + gamma2 (uniform() - 0.5);
+   *   gamma1 = -1 / t_period / ftm2v, gamma2 = tsqrt sqrt(24 boltz / t_period / dt / mvv2e) / ftm2v,
+   *   wbody = transpose_matvec(ex, ey, ez, omega), tbody[k] = inertia[k] gamma1 wbody[k] + sqrt(inertia[k]) gamma2
+   *   (uniform() - 0.5), langextra[3..5] = matvec(ex, ey, ez, tbody),
+   * with the body's principal axes and moments in their own order (ascending, z last in 2d: principalFrame) and omega as
+   * the integration left it (richardson's half-step one). compute_forces_and_torques then adds "fflag * langextra" to the
+   * force and "tflag * langextra" to the torque. RanMars(seed) here is native's after its constructor's own uniform().
+   */
+  private applyLangevin(): void {
+    if (!this.langevin) return;
+    const s = this.sys.state;
+    const u = s.units;
+    const tt = typeof this.langTStart === 'number' ? ramp(this.sys, this.langTStart, this.langTStop) : valueOf(this.sys, this.langTStart);
+    if (tt < 0) throw new StyleError(`fix ${this.id} rigid langevin: target temperature is negative`);
+    const rng = this.langRng!;
+    const tPeriod = this.langDamp;
+    const tsqrt = Math.sqrt(tt);
+    const boltz = u.boltz, dt = s.dt, mvv2e = u.mvv2e, ftm2v = u.ftm2v;
+    const lang = [0, 0, 0, 0, 0, 0];
+    const wbody = [0, 0, 0], tbody = [0, 0, 0];
+    const dim2 = s.dimension === 2;
+    for (const b of this.bodies) {
+      let gamma1 = -b.mass / tPeriod / ftm2v;
+      let gamma2 = Math.sqrt(b.mass) * tsqrt * Math.sqrt(24.0 * boltz / tPeriod / dt / mvv2e) / ftm2v;
+      lang[0] = gamma1 * b.vcm[0] + gamma2 * (rng.uniform() - 0.5);
+      lang[1] = gamma1 * b.vcm[1] + gamma2 * (rng.uniform() - 0.5);
+      lang[2] = gamma1 * b.vcm[2] + gamma2 * (rng.uniform() - 0.5);
+      gamma1 = -1.0 / tPeriod / ftm2v;
+      gamma2 = tsqrt * Math.sqrt(24.0 * boltz / tPeriod / dt / mvv2e) / ftm2v;
+      // ex, ey, ez: the columns of the body's rotation (native q_to_exyz)
+      const R = qmat(b.q);
+      const om = b.omega;
+      for (let k = 0; k < 3; k++) wbody[k] = R[0][k] * om[0] + R[1][k] * om[1] + R[2][k] * om[2];
+      const I = b.inertia;
+      for (let k = 0; k < 3; k++) tbody[k] = I[k] * gamma1 * wbody[k] + Math.sqrt(I[k]) * gamma2 * (rng.uniform() - 0.5);
+      for (let d = 0; d < 3; d++) lang[3 + d] = R[d][0] * tbody[0] + R[d][1] * tbody[1] + R[d][2] * tbody[2];
+      // native 2d: "fflag[i][2] = tflag[i][0] = tflag[i][1] = 0.0" (FixRigid::FixRigid; a 2d z force is refused)
+      for (let d = 0; d < 3; d++) {
+        if (b.fflag[d] && !(dim2 && d === 2)) b.fcm[d] += lang[d];
+        if (b.tflag[d] && !(dim2 && d < 2)) b.torque[d] += lang[3 + d];
+      }
+    }
+  }
+
+  finalIntegrate(): void {
+    const s = this.sys.state;
+    const dtf = 0.5 * s.dt * s.units.ftm2v;
+    this.snapshotImages(false);
+    if (!this.early) { this.sumForces(); this.applyLangevin(); }
+    for (const b of this.bodies) {
+      for (let d = 0; d < 3; d++) {
+        if (b.fflag[d]) b.vcm[d] += (dtf * b.fcm[d]) / b.mass;
+        if (!this.noSquish && b.tflag[d]) b.angmom[d] += dtf * b.torque[d];
+      }
+      if (this.noSquish) {
+        // native FixRigidNH::final_integrate: the torque kick of the quaternion momentum, then angmom from it
+        this.conjqmTorqueKick(b, dtf);
+        this.angmomFromConjqm(b);
+      } else {
+        this.omegaFromAngmom(b);
+      }
+    }
+    this.setXV(false, 0.5);
+  }
+
+  /**
+   * Orientation over dt with Richardson extrapolation of dq/dt = 1/2 (0, w) q (w from L, space frame). As native LAMMPS does (src/math_extra.cpp richardson at b332f28):
+   * omega is the one of the half-step quaternion (mq_to_omega(angmom, qhalf)); it is not recomputed from the corrected
+   * quaternion. The rigid virial (set_xv) uses it, so recomputing it moved pxx and pyy by about 1e-8.
+   */
+  private richardson(b: Body, dt: number): void {
+    const wq = (q: number[], w: number[]) => [
+      -w[0] * q[1] - w[1] * q[2] - w[2] * q[3],
+      w[0] * q[0] + w[1] * q[3] - w[2] * q[2],
+      w[1] * q[0] + w[2] * q[1] - w[0] * q[3],
+      w[2] * q[0] + w[0] * q[2] - w[1] * q[1],
+    ];
+    const dtq = 0.5 * dt;
+    this.omegaFromAngmom(b);
+    const q0 = b.q;
+    const d0 = wq(q0, b.omega);
+    const qfull = qnorm(q0.map((v, k) => v + dtq * d0[k]));
+    const qhalf = qnorm(q0.map((v, k) => v + 0.5 * dtq * d0[k]));
+    b.q = qhalf;
+    this.omegaFromAngmom(b);
+    const d1 = wq(qhalf, b.omega);
+    const qhalf2 = qnorm(qhalf.map((v, k) => v + 0.5 * dtq * d1[k]));
+    b.q = qnorm(qhalf2.map((v, k) => 2 * v - qfull[k]));
+  }
+
+  // ---------------------------------------------------------------- output
+
+  /**
+   * Temperature of the rigid bodies: (sum m v_cm^2 + sum omega . L) / (dof kB),
+   * with 3 + 3 degrees of freedom per body minus the components switched off
+   * by force / torque (space-frame x, y, z). Measured: native LAMMPS counts 6
+   * per body here even for linear bodies (153 vs 162 for 9 dimers among 27
+   * bodies), unlike the 5 it removes from temperature computes.
+   * With force / torque flags off, native LAMMPS's value differs from every
+   * form tried (0.393266 vs 0.393379 here, oracle rigid_force_torque); the
+   * engine removes the flagged space-frame components of omega and takes
+   * the body-frame energy sum I_k w_k^2. The dynamics are not affected.
+   */
+  computeScalar(): number {
+    const s = this.sys.state;
+    let ke = 0, dof = 0;
+    // docs.lammps.org/fix_rigid.html: "A 2d rigid body has 3 degrees of freedom (2 translational, 1 rotational)".
+    // Measured with native LAMMPS (black box, w92rig2d_* oracles): the scalar of a 2d fix rigid body counts only x, y
+    // and the z rotation (3 dof), while fix rigid/small gives exactly twice that value on the same bodies (6 dof per
+    // body, as in 3d); the kinetic part is the same for both.
+    const dim2 = this.sys.dimension === 2 && !this.style.includes('small');
+    for (const b of this.bodies) {
+      for (let d = 0; d < 3; d++) {
+        if (b.fflag[d] && !(dim2 && d === 2)) { ke += b.mass * b.vcm[d] * b.vcm[d]; dof++; }
+        if (b.tflag[d] && !(dim2 && d < 2)) dof++;
+      }
+      // flagged space-frame components of omega removed, energy in the body frame
+      const R = qmat(b.q);
+      const w = b.omega.map((v, d) => (b.tflag[d] ? v : 0));
+      for (let k = 0; k < 3; k++) {
+        const wk = w[0] * R[0][k] + w[1] * R[1][k] + w[2] * R[2][k];
+        ke += b.inertia[k] * wk * wk;
+      }
+    }
+    return dof > 0 ? (ke * s.units.mvv2e) / (dof * s.units.boltz) : 0;
+  }
+
+  computeArray(i: number, j: number): number {
+    // Measured with native LAMMPS (black box, w92rig2d_dimer and w92rig2d_star after fix rigid/small replaces fix rigid):
+    // every f_ID[i][j] of a rigid/small fix reads 0 while its scalar (temperature) is nonzero.
+    if (this.style.includes('small')) return 0;
+    const b = this.bodies[i];
+    if (!b) throw new StyleError(`fix ${this.id}: rigid body ${i + 1} does not exist`);
+    const box = this.sys.state.box;
+    if (j < 3) return b.xcm[j] - b.image[j] * (box.hi[j] - box.lo[j]);
+    if (j < 6) return b.vcm[j - 3];
+    if (j < 9) return b.fcm[j - 6];
+    if (j < 12) return b.torque[j - 9];
+    return b.image[j - 12];
+  }
+}

@@ -1,0 +1,71 @@
+# Pixi environment validation: proves the committed pixi.lock materializes on
+# all three dev platforms and the code passes lint + the standard test set.
+# macos-latest is Apple Silicon (osx-arm64); ubuntu-latest covers linux-64,
+# whose lock carries the CUDA builds (installable without a GPU through
+# CONDA_OVERRIDE_CUDA). GPU execution is not tested here — see
+# docs/developer/deploy-v2-plan.md.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: pixi env (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+    timeout-minutes: 90
+    env:
+      # Satisfy the lock's __cuda=12.9 virtual package on GPU-less runners.
+      CONDA_OVERRIDE_CUDA: "12.9"
+    steps:
+      - uses: actions/checkout@v4
+
+      # The linux-64 env includes CUDA-build PyTorch/OpenMM (several GB);
+      # reclaim the space hosted runners spend on toolchains we never use.
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: prefix-dev/setup-pixi@v0.11.2
+        with:
+          pixi-version: v0.82.1
+          cache: true
+          # `pixi install --locked`: fails the job when pixi.lock is out of
+          # date with pixi.toml instead of silently re-solving.
+          locked: true
+
+      - name: Install official ARM64 MODELLER binaries
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: pixi run --frozen python scripts/install-modeller-arm64.py
+
+      - name: Lint
+        run: pixi run --frozen ruff check mdclaw/ tests/ scripts/_internal/doctor.py scripts/install-modeller-arm64.py container/scripts/test-gpu.py
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Molstar playback pacing and buffering
+        run: node --test tests/js/molstar_playback.test.cjs tests/js/molstar_page.test.cjs
+
+      - name: Tests
+        run: >
+          pixi run --frozen pytest
+          tests/test_registry.py tests/test_cli.py tests/test_guardrails.py
+          tests/test_guardrail_code_registry.py tests/test_slurm_server.py
+          tests/test_molstar_viewer.py
+          tests/test_molstar_display.py
+          tests/test_molstar_mcp.py
+          tests/test_mddb_export.py
+          tests/test_deployment_scripts.py tests/test_docs_paths.py
+          tests/test_bin_wrapper.py tests/test_runtime_selection.py
+          tests/test_gpu_acceptance.py tests/test_modeller_arm_install.py -q

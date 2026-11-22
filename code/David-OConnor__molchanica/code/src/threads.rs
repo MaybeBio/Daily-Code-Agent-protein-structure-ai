@@ -1,0 +1,1141 @@
+//! Handle threads for potentially long-running calls, e.g. HTTP.
+
+use std::{
+    path::PathBuf,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
+    time::Duration,
+};
+
+use bio_apis::{
+    ReqError,
+    amber_geostd::GeostdData,
+    chebi,
+    pdbe::SiftsUniprotMapping,
+    pubchem::{self, StructureSearchNamespace},
+    rcsb::{FilesAvailable, PdbDataResults},
+};
+use bio_files::gromacs::GromacsOutput;
+use chrono::Utc;
+use graphics::{EngineUpdates, Scene};
+use mol_defs::{
+    molecules::{MolIdent, MolType, small::MoleculeSmall},
+    properties::therapeutic::TherapeuticProperties,
+    screening::pharmacophore::PhScreeningScore,
+    sfc_mesh::MeshColors,
+};
+
+use crate::{
+    file_io::{SessionRestoreItem, SessionRestorePayload, managed_mols, parse_session_history},
+    gromacs::on_gromacs_md_complete,
+    mol_db::{ParquetMolDb, load_chebi_mol_db, load_hmdb_mol_db},
+    mol_editor,
+    render::MESH_PEP_SOLVENT_SURFACE,
+    sfc_mesh::apply_mesh_colors,
+    split_join::{StructureLookup, on_structure_lookup},
+    state::State,
+    ui::{QueryResult, apply_query_result},
+    util::{RedrawFlags, handle_err, handle_success},
+};
+
+/// Contains receivers for threads. We use these for longer-running processes, as to
+/// not block the UI. For example, computations, and HTTP calls.
+#[allow(clippy::type_complexity)]
+#[derive(Default)]
+pub struct ThreadReceivers {
+    /// Result of the query bar's current molecule lookup.
+    pub query: Option<Receiver<QueryResult>>,
+    /// Built-in molecule databases are decoded only if their popup is opened.
+    pub builtin_mol_dbs: Option<Receiver<BuiltinMolDbResult>>,
+    /// Previous-session files are parsed serially on one worker and applied one at a time on the
+    /// UI thread. Keeping the failure list alongside the receiver mirrors the worker's lifetime.
+    pub session_restore: Option<SessionRestoreReceiver>,
+    /// Receives thread data upon an HTTP result completion.
+    pub mol_pending_data_avail: Vec<(
+        usize,
+        Receiver<(
+            Result<PdbDataResults, ReqError>,
+            Result<FilesAvailable, ReqError>,
+        )>,
+    )>,
+    /// Receives thread data upon an HTTP result completion.
+    pub pubchem_properties_avail:
+        Option<Receiver<(MolIdent, Result<pubchem::Properties, ReqError>)>>,
+    /// Identifiers found for a ligand by querying PubChem and ChEBI. The tuple carries the ligand
+    /// index and internal name from when the request started, so a removed/reordered ligand does
+    /// not receive another molecule's result.
+    pub all_idents_avail: Option<(usize, String, Receiver<IdentLookupOutcome>)>,
+    /// Safety lookups retain molecule identity and connectivity across selection changes.
+    pub safety_data_avail: Vec<SafetyLookup>,
+    /// PubChem lookups naming molecules produced by a split or join; one per molecule.
+    pub structure_lookups: Vec<StructureLookup>,
+    /// The molecule editor's "Check DBs" PubChem lookup. Carries the SMILES looked up, so a
+    /// result for a structure that has since been edited isn't applied.
+    pub editor_db_check: Option<(String, Receiver<Result<pubchem::Properties, ReqError>>)>,
+    /// The first param is the index.
+    pub therapeutic_properties_avail: Option<Receiver<(usize, TherapeuticProperties)>>,
+    /// The first param is the index.
+    pub amber_geostd_data_avail: Option<Receiver<(usize, Result<GeostdData, ReqError>)>>,
+    pub sifts_mapping_avail: Vec<(usize, Receiver<Result<Vec<SiftsUniprotMapping>, ReqError>>)>,
+    pub peptide_mesh_coloring: Option<Receiver<Option<MeshColors>>>,
+    /// Pharmacophore. Returned in batches, e.g. of a large directory.
+    // /// This threads runs the whole outer loops, screening all molecules
+    // pub ph_screening_outer: Option<Receiver<Vec<PhScreeningScore>>>,
+    pub ph_screening: Option<Receiver<Vec<PhScreeningScore>>>,
+    pub gromacs_md_avail: Option<Receiver<(GromacsOutput, Duration)>>,
+    pub xtb_md: Option<crate::xtb::XtbRun>,
+}
+
+pub struct SessionRestoreReceiver {
+    receiver: Receiver<Result<SessionRestoreItem, SessionRestoreFailure>>,
+    failed: Vec<PathBuf>,
+}
+
+pub struct SessionRestoreFailure {
+    path: PathBuf,
+    error: String,
+}
+
+impl ThreadReceivers {
+    /// True while any background worker still needs periodic non-blocking polling.
+    pub fn has_pending(&self) -> bool {
+        self.query.is_some()
+            || self.builtin_mol_dbs.is_some()
+            || self.session_restore.is_some()
+            || !self.mol_pending_data_avail.is_empty()
+            || self.pubchem_properties_avail.is_some()
+            || self.all_idents_avail.is_some()
+            || !self.safety_data_avail.is_empty()
+            || !self.structure_lookups.is_empty()
+            || self.editor_db_check.is_some()
+            || self.therapeutic_properties_avail.is_some()
+            || self.amber_geostd_data_avail.is_some()
+            || !self.sifts_mapping_avail.is_empty()
+            || self.peptide_mesh_coloring.is_some()
+            || self.ph_screening.is_some()
+            || self.gromacs_md_avail.is_some()
+            || self.xtb_md.is_some()
+    }
+}
+
+pub struct SafetyLookup {
+    requested_index: usize,
+    ident: String,
+    smiles: String,
+    cid: Option<u32>,
+    receiver: Receiver<Result<(u32, Option<pubchem::SafetyData>), String>>,
+}
+
+impl SafetyLookup {
+    pub fn matches_molecule(&self, mol: &MoleculeSmall) -> bool {
+        self.ident == mol.common.ident
+            && self.smiles == mol.common.to_smiles()
+            && self.cid.is_none_or(|cid| molecule_cid(mol) == Some(cid))
+    }
+}
+
+fn molecule_cid(mol: &MoleculeSmall) -> Option<u32> {
+    mol.idents.iter().find_map(|ident| match ident {
+        MolIdent::PubChem(cid) if *cid > 0 => Some(*cid),
+        _ => None,
+    })
+}
+
+fn load_molecule_safety(idents: &[MolIdent]) -> Result<(u32, Option<pubchem::SafetyData>), String> {
+    let cid = idents.iter().find_map(|ident| match ident {
+        MolIdent::PubChem(cid) if *cid > 0 => Some(*cid),
+        _ => None,
+    });
+    let cid = match cid {
+        Some(cid) => cid,
+        None => {
+            let mut resolved = idents.to_vec();
+            let props = pubchem_properties_from_idents(&resolved)
+                .or_else(|error| {
+                    let Some(id) = resolved.iter().find_map(|ident| match ident {
+                        MolIdent::Chebi(id) => Some(*id),
+                        _ => None,
+                    }) else {
+                        return Err(error);
+                    };
+                    let compound = chebi::load_compound(id)?;
+                    apply_chebi_compound(&mut resolved, &compound);
+                    pubchem_properties_from_idents(&resolved)
+                })
+                .map_err(|error| {
+                    format!("Unable to resolve a PubChem CID for safety data: {error:?}")
+                })?;
+            if props.cid == 0 {
+                return Err(
+                    "PubChem has no compound record for this structure; safety is unknown."
+                        .to_owned(),
+                );
+            }
+            props.cid
+        }
+    };
+
+    let mut data = pubchem::safety_data(cid)
+        .map_err(|error| format!("Unable to load safety data for CID {cid}: {error:?}"))?;
+    if let Some(data) = &mut data {
+        data.retrieved_on = Some(Utc::now().format("%Y-%m-%d").to_string());
+    }
+    Ok((cid, data))
+}
+
+pub fn start_safety_data_lookup(
+    receivers: &mut ThreadReceivers,
+    index: usize,
+    mol: &MoleculeSmall,
+) {
+    if receivers
+        .safety_data_avail
+        .iter()
+        .any(|lookup| lookup.matches_molecule(mol))
+    {
+        return;
+    }
+    let idents = mol.idents.clone();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(load_molecule_safety(&idents));
+    });
+    receivers.safety_data_avail.push(SafetyLookup {
+        requested_index: index,
+        ident: mol.common.ident.clone(),
+        smiles: mol.common.to_smiles(),
+        cid: molecule_cid(mol),
+        receiver: rx,
+    });
+}
+
+fn poll_safety_data(state: &mut State) {
+    let mut i = 0;
+    while i < state.volatile.thread_receivers.safety_data_avail.len() {
+        let result = state.volatile.thread_receivers.safety_data_avail[i]
+            .receiver
+            .try_recv();
+        let result = match result {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => {
+                i += 1;
+                continue;
+            }
+            Err(TryRecvError::Disconnected) => {
+                Err("The safety data lookup stopped unexpectedly.".to_owned())
+            }
+        };
+        let lookup = state
+            .volatile
+            .thread_receivers
+            .safety_data_avail
+            .swap_remove(i);
+        let index = state
+            .ligands
+            .get(lookup.requested_index)
+            .filter(|mol| lookup.matches_molecule(mol))
+            .map(|_| lookup.requested_index)
+            .or_else(|| {
+                state
+                    .ligands
+                    .iter()
+                    .position(|mol| lookup.matches_molecule(mol))
+            });
+        let Some(index) = index else {
+            continue;
+        };
+
+        match result {
+            Ok((cid, data)) => {
+                let mol = &mut state.ligands[index];
+                // An identifier lookup may have completed while safety data was in flight.
+                if molecule_cid(mol).is_some_and(|current| current != cid) {
+                    continue;
+                }
+                if molecule_cid(mol).is_none() {
+                    mol.idents.push(MolIdent::PubChem(cid));
+                }
+                let available = data.is_some();
+                mol.safety_data = data;
+                let cache_result = managed_mols::update_managed_mol(&state.volatile.prefs_dir, mol);
+                state.to_save.save_flag = true;
+                if let Err(error) = cache_result {
+                    handle_err(
+                        &mut state.ui,
+                        format!(
+                            "Loaded safety data, but could not update the cached molecule: {error}"
+                        ),
+                    );
+                } else if available {
+                    handle_success(
+                        &mut state.ui,
+                        format!("Loaded GHS safety data for CID {cid}"),
+                    );
+                } else {
+                    handle_err(
+                        &mut state.ui,
+                        format!(
+                            "No GHS classification is available for CID {cid}. Safety remains unknown."
+                        ),
+                    );
+                }
+            }
+            Err(error) => handle_err(&mut state.ui, error),
+        }
+    }
+}
+
+/// One database produced by the on-demand built-in database worker.
+pub enum BuiltinMolDbResult {
+    Hmdb(Option<ParquetMolDb>),
+    Chebi(Option<ParquetMolDb>),
+}
+
+/// Decode and index the large embedded databases away from the UI thread. Results are streamed so
+/// the first database can become available without waiting for the second one.
+pub fn start_builtin_mol_db_load(state: &mut State) {
+    if state.volatile.builtin_mol_db_load_started {
+        return;
+    }
+
+    state.volatile.builtin_mol_db_load_started = true;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        if tx
+            .send(BuiltinMolDbResult::Hmdb(load_hmdb_mol_db()))
+            .is_err()
+        {
+            return;
+        }
+        let _ = tx.send(BuiltinMolDbResult::Chebi(load_chebi_mol_db()));
+    });
+    state.volatile.thread_receivers.builtin_mol_dbs = Some(rx);
+}
+
+/// Begin restoring the previous session after the first UI frame has started. File reads and
+/// format parsing happen on the worker; state and scene updates remain on the UI thread.
+pub fn start_session_restore(state: &mut State) {
+    if state.volatile.session_restore_started {
+        return;
+    }
+
+    state.volatile.session_restore_started = true;
+    let histories = state.to_save.open_history.clone();
+    let referenced = histories
+        .iter()
+        .map(|history| history.path.clone())
+        .collect::<Vec<_>>();
+    let prefs_dir = state.volatile.prefs_dir.clone();
+    let peptide_ff_q_map = state.ff_param_set.amber().unwrap().peptide_ff_q_map.clone();
+    let ph = state.to_save.ph;
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        if let Err(error) = managed_mols::cleanup_orphans(&prefs_dir, &referenced) {
+            eprintln!("Unable to clean managed molecule cache: {error}");
+        }
+
+        for history in histories.into_iter().filter(|history| history.last_session) {
+            let path = history.path.clone();
+            let result = parse_session_history(history, &prefs_dir, peptide_ff_q_map.as_ref(), ph)
+                .map_err(|error| SessionRestoreFailure {
+                    path,
+                    error: error.to_string(),
+                });
+            if tx.send(result).is_err() {
+                return;
+            }
+        }
+    });
+
+    state.volatile.thread_receivers.session_restore = Some(SessionRestoreReceiver {
+        receiver: rx,
+        failed: Vec::new(),
+    });
+}
+
+fn apply_session_restore_item(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    item: SessionRestoreItem,
+) {
+    let history = item.history;
+    match item.payload {
+        SessionRestorePayload::Molecule {
+            molecule,
+            specific_params,
+        } => {
+            if let Some((name, params)) = specific_params {
+                state.mol_specific_params.insert(name, params);
+            }
+
+            let mol_type = molecule.mol_type();
+            let mol_i = match mol_type {
+                MolType::Peptide => state.peptides.len(),
+                MolType::Ligand => state.ligands.len(),
+                MolType::NucleicAcid => state.nucleic_acids.len(),
+                MolType::Lipid => state.lipids.len(),
+                MolType::Pocket => state.pockets.len(),
+                MolType::Water => return,
+            };
+            state.restore_mol_to_state(molecule, scene, updates, &history.path);
+
+            if let Some(mut molecule) = state.get_mol_mut(mol_type, mol_i) {
+                let common = molecule.common_mut();
+
+                // Orientation is relative to the file's coordinates; apply it before moving.
+                if let Some(orientation) = history.orientation {
+                    common.reset_posits();
+                    common.rotate(orientation, None);
+                }
+                if let Some(position) = history.position {
+                    common.move_to(position);
+                }
+            }
+        }
+        SessionRestorePayload::Density(density) => state.load_density(density),
+        SessionRestorePayload::GeneralForceField(params) => {
+            state.ff_param_set.amber_mut().unwrap().small_mol = Some(params);
+        }
+        SessionRestorePayload::SpecificForceField(name, params) => {
+            state.mol_specific_params.insert(name.clone(), params);
+            for ligand in &mut state.ligands {
+                if ligand.common.ident.eq_ignore_ascii_case(&name) {
+                    ligand.frcmod_loaded = true;
+                }
+            }
+        }
+        SessionRestorePayload::Trajectory(trajectory, set) => {
+            crate::md::mdposit::register(state, trajectory, set);
+        }
+        SessionRestorePayload::ParquetDb(db) => {
+            state.volatile.parquet_dbs.push(db);
+            if state.volatile.parquet_dbs.len() == 1 {
+                state.volatile.parquet_db_active = Some(crate::state::DbSel::Loaded(0));
+            }
+        }
+        SessionRestorePayload::MdMols(restored) => {
+            let viewer = &mut state.volatile.md_local.viewer;
+            let old_len = viewer.mol_sets.len();
+            viewer.mol_sets.extend(restored.mol_sets);
+            if viewer.mol_set_active.is_none() {
+                viewer.mol_set_active = restored.mol_set_active.map(|i| old_len + i);
+            }
+        }
+        SessionRestorePayload::MdParams => {}
+        SessionRestorePayload::Sequences(seqs) => state.sequences.extend(seqs),
+    }
+}
+
+fn finish_session_restore(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    failed: Vec<PathBuf>,
+) {
+    if !failed.is_empty() {
+        state
+            .to_save
+            .open_history
+            .retain(|history| !failed.contains(&history.path));
+        for path in &failed {
+            if let Err(error) = managed_mols::remove_entry(&state.volatile.prefs_dir, path) {
+                eprintln!("Unable to remove invalid managed molecule cache entry: {error}");
+            }
+        }
+
+        let names = failed
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<unknown>")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        handle_err(
+            &mut state.ui,
+            format!(
+                "Problem opening the following files from history: {}",
+                names.join(", ")
+            ),
+        );
+        state.update_save_prefs();
+    }
+
+    crate::ui::util::finish_session_restore(state, scene, updates);
+}
+
+/// Result of asking the online small-molecule databases to fill identifier gaps.
+#[derive(Debug, Default)]
+pub struct IdentLookupOutcome {
+    pub idents: Vec<MolIdent>,
+    pub warnings: Vec<String>,
+}
+
+/// Start the shared online identifier lookup used by the metadata popup and characterization
+/// sidebar. Only one lookup is kept at a time; callers disable their buttons while it is pending.
+pub fn start_all_idents_lookup(
+    receivers: &mut ThreadReceivers,
+    ligand_i: usize,
+    ligand_ident: String,
+    idents: Vec<MolIdent>,
+) {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let outcome = load_all_idents(&idents);
+        let _ = tx.send(outcome);
+    });
+    receivers.all_idents_avail = Some((ligand_i, ligand_ident, rx));
+}
+
+fn has_ident_kind(idents: &[MolIdent], candidate: &MolIdent) -> bool {
+    let kind = std::mem::discriminant(candidate);
+    idents
+        .iter()
+        .any(|ident| std::mem::discriminant(ident) == kind)
+}
+
+fn push_if_kind_missing(idents: &mut Vec<MolIdent>, ident: MolIdent) {
+    if !has_ident_kind(idents, &ident) {
+        idents.push(ident);
+    }
+}
+
+fn apply_pubchem_properties(idents: &mut Vec<MolIdent>, props: &pubchem::Properties) {
+    push_if_kind_missing(idents, MolIdent::PubChem(props.cid));
+    if !props.smiles.is_empty() {
+        push_if_kind_missing(idents, MolIdent::Smiles(props.smiles.clone()));
+    }
+    if !props.inchi.is_empty() {
+        push_if_kind_missing(idents, MolIdent::InchI(props.inchi.clone()));
+    }
+    if !props.inchi_key.is_empty() {
+        push_if_kind_missing(idents, MolIdent::InchIKey(props.inchi_key.clone()));
+    }
+    if !props.iupac_name.is_empty() {
+        push_if_kind_missing(idents, MolIdent::IupacName(props.iupac_name.clone()));
+    }
+    if !props.title.is_empty() {
+        push_if_kind_missing(idents, MolIdent::PubchemTitle(props.title.clone()));
+    }
+}
+
+fn apply_chebi_compound(idents: &mut Vec<MolIdent>, compound: &chebi::Compound) {
+    push_if_kind_missing(idents, MolIdent::Chebi(compound.id));
+
+    let props = chebi::Properties::from(compound);
+    if let Some(value) = props.smiles {
+        push_if_kind_missing(idents, MolIdent::Smiles(value));
+    }
+    if let Some(value) = props.inchi {
+        push_if_kind_missing(idents, MolIdent::InchI(value));
+    }
+    if let Some(value) = props.inchi_key {
+        push_if_kind_missing(idents, MolIdent::InchIKey(value));
+    }
+    if let Some(value) = props.iupac_name {
+        push_if_kind_missing(idents, MolIdent::IupacName(value));
+    }
+
+    if let Some(value) = compound.xrefs_from_source("DrugBank").into_iter().next() {
+        push_if_kind_missing(idents, MolIdent::DrugBank(value));
+    }
+    if let Some(value) = compound.xrefs_from_source("PDBeChem").into_iter().next() {
+        push_if_kind_missing(idents, MolIdent::PdbeAmber(value));
+    }
+}
+
+fn pubchem_properties_from_idents(idents: &[MolIdent]) -> Result<pubchem::Properties, ReqError> {
+    let mut last_error = None;
+
+    for ident in idents {
+        let query = match ident {
+            MolIdent::PubChem(cid) => Some((StructureSearchNamespace::Cid, cid.to_string())),
+            MolIdent::InchIKey(value) => Some((StructureSearchNamespace::InchiKey, value.clone())),
+            MolIdent::InchI(value) => Some((StructureSearchNamespace::Inchi, value.clone())),
+            MolIdent::Smiles(value) => Some((StructureSearchNamespace::Smiles, value.clone())),
+            _ => None,
+        };
+
+        if let Some((namespace, value)) = query {
+            match pubchem::properties(namespace, &value) {
+                Ok(props) => return Ok(props),
+                Err(error) => last_error = Some(error),
+            }
+        }
+    }
+
+    if let Some(MolIdent::PdbeAmber(value)) = idents
+        .iter()
+        .find(|ident| matches!(ident, MolIdent::PdbeAmber(_)))
+    {
+        match pubchem::properties_from_pdbe_id(value) {
+            Ok(props) => return Ok(props),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    // PubChem's name namespace also accepts many registry identifiers, including DrugBank IDs.
+    for text in idents.iter().filter_map(|ident| match ident {
+        MolIdent::DrugBank(value) | MolIdent::IupacName(value) | MolIdent::PubchemTitle(value) => {
+            Some(value.as_str())
+        }
+        _ => None,
+    }) {
+        let lookup = pubchem::find_cids_from_search(text, false).and_then(|cids| {
+            let cid = cids.into_iter().next().ok_or(ReqError::Deserialize)?;
+            pubchem::properties(StructureSearchNamespace::Cid, &cid.to_string())
+        });
+        match lookup {
+            Ok(props) => return Ok(props),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or(ReqError::Deserialize))
+}
+
+fn chebi_id_from_idents(idents: &[MolIdent]) -> Result<Option<u32>, ReqError> {
+    if let Some(cid) = idents.iter().find_map(|ident| match ident {
+        MolIdent::PubChem(value) => Some(*value),
+        _ => None,
+    }) {
+        if let Some(id) = pubchem::chebi_id_from_cid(cid)? {
+            return Ok(Some(id));
+        }
+    }
+
+    if let Some(key) = idents.iter().find_map(|ident| match ident {
+        MolIdent::InchIKey(value) => Some(value.as_str()),
+        _ => None,
+    }) {
+        let normalized = key.trim().trim_start_matches("InChIKey=");
+        let result = chebi::search(normalized, 1, 15)?;
+        if let Some(hit) = result.results.into_iter().find(|hit| {
+            hit.data
+                .inchi_key
+                .as_deref()
+                .map(|value| value.trim().trim_start_matches("InChIKey=") == normalized)
+                .unwrap_or(false)
+        }) {
+            return Ok(Some(hit.id));
+        }
+    }
+
+    if let Some(drugbank_id) = idents.iter().find_map(|ident| match ident {
+        MolIdent::DrugBank(value) => Some(value.as_str()),
+        _ => None,
+    }) {
+        for hit in chebi::search(drugbank_id, 1, 15)?
+            .results
+            .into_iter()
+            .take(3)
+        {
+            let compound = chebi::load_compound(hit.id)?;
+            if compound
+                .xrefs_from_source("DrugBank")
+                .iter()
+                .any(|value| value.eq_ignore_ascii_case(drugbank_id))
+            {
+                return Ok(Some(compound.id));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Query PubChem and ChEBI using whichever identifiers are already available, then return one
+/// value for every identifier kind those databases can resolve. This performs blocking HTTP and
+/// is intended to run on a worker thread.
+pub fn load_all_idents(existing: &[MolIdent]) -> IdentLookupOutcome {
+    let mut outcome = IdentLookupOutcome {
+        idents: existing.to_vec(),
+        warnings: Vec::new(),
+    };
+
+    let mut chebi_loaded = false;
+    if let Some(id) = existing.iter().find_map(|ident| match ident {
+        MolIdent::Chebi(value) => Some(*value),
+        _ => None,
+    }) {
+        match chebi::load_compound(id) {
+            Ok(compound) => {
+                apply_chebi_compound(&mut outcome.idents, &compound);
+                chebi_loaded = true;
+            }
+            Err(error) => outcome
+                .warnings
+                .push(format!("ChEBI lookup for {id} failed: {error:?}")),
+        }
+    }
+
+    let mut pubchem_loaded = false;
+    match pubchem_properties_from_idents(&outcome.idents) {
+        Ok(props) => {
+            apply_pubchem_properties(&mut outcome.idents, &props);
+            pubchem_loaded = true;
+        }
+        Err(error) => outcome
+            .warnings
+            .push(format!("PubChem lookup failed: {error:?}")),
+    }
+
+    if !chebi_loaded {
+        match chebi_id_from_idents(&outcome.idents) {
+            Ok(Some(id)) => match chebi::load_compound(id) {
+                Ok(compound) => {
+                    apply_chebi_compound(&mut outcome.idents, &compound);
+                    chebi_loaded = true;
+                }
+                Err(error) => outcome
+                    .warnings
+                    .push(format!("ChEBI lookup for {id} failed: {error:?}")),
+            },
+            Ok(None) => {}
+            Err(error) => outcome
+                .warnings
+                .push(format!("ChEBI identifier lookup failed: {error:?}")),
+        }
+    }
+
+    // Starting from ChEBI often gives us the structure identifier PubChem needs.
+    if !pubchem_loaded && chebi_loaded {
+        match pubchem_properties_from_idents(&outcome.idents) {
+            Ok(props) => apply_pubchem_properties(&mut outcome.idents, &props),
+            Err(error) => outcome
+                .warnings
+                .push(format!("PubChem retry failed: {error:?}")),
+        }
+    }
+
+    // If PubChem was reached only on the retry, make one final attempt at its curated ChEBI link.
+    if !chebi_loaded
+        && let Ok(Some(id)) = chebi_id_from_idents(&outcome.idents)
+        && let Ok(compound) = chebi::load_compound(id)
+    {
+        apply_chebi_compound(&mut outcome.idents, &compound);
+    }
+
+    outcome
+}
+
+/// Poll receivers for data on potentially long-running calls. E.g. HTTP.
+pub fn handle_thread_rx(
+    state: &mut State,
+    scene: &mut Scene,
+    redraw: &mut RedrawFlags,
+    updates: &mut EngineUpdates,
+) {
+    poll_safety_data(state);
+    let query_result = state
+        .volatile
+        .thread_receivers
+        .query
+        .as_ref()
+        .map(Receiver::try_recv);
+    match query_result {
+        Some(Ok(result)) => {
+            state.volatile.thread_receivers.query = None;
+            apply_query_result(state, scene, redraw, updates, result);
+        }
+        Some(Err(TryRecvError::Disconnected)) => {
+            state.volatile.thread_receivers.query = None;
+            handle_err(
+                &mut state.ui,
+                "Molecule query worker stopped unexpectedly".to_owned(),
+            );
+        }
+        Some(Err(TryRecvError::Empty)) | None => {}
+    }
+
+    let builtin_db_result = state
+        .volatile
+        .thread_receivers
+        .builtin_mol_dbs
+        .as_ref()
+        .map(Receiver::try_recv);
+    match builtin_db_result {
+        Some(Ok(BuiltinMolDbResult::Hmdb(db))) => state.hmdb_mol_db = db,
+        Some(Ok(BuiltinMolDbResult::Chebi(db))) => state.chebi_mol_db = db,
+        Some(Err(TryRecvError::Disconnected)) => {
+            state.volatile.thread_receivers.builtin_mol_dbs = None;
+        }
+        Some(Err(TryRecvError::Empty)) | None => {}
+    }
+
+    let session_restore_result = state
+        .volatile
+        .thread_receivers
+        .session_restore
+        .as_ref()
+        .map(|pending| pending.receiver.try_recv());
+    match session_restore_result {
+        Some(Ok(Ok(item))) => apply_session_restore_item(state, scene, updates, item),
+        Some(Ok(Err(failure))) => {
+            eprintln!(
+                "Unable to restore session file {}: {}",
+                failure.path.display(),
+                failure.error
+            );
+            if let Some(pending) = &mut state.volatile.thread_receivers.session_restore {
+                pending.failed.push(failure.path);
+            }
+        }
+        Some(Err(TryRecvError::Disconnected)) => {
+            let failed = state
+                .volatile
+                .thread_receivers
+                .session_restore
+                .take()
+                .map(|pending| pending.failed)
+                .unwrap_or_default();
+            finish_session_restore(state, scene, updates, failed);
+        }
+        Some(Err(TryRecvError::Empty)) | None => {}
+    }
+
+    let all_idents_result = state
+        .volatile
+        .thread_receivers
+        .all_idents_avail
+        .as_ref()
+        .map(|(ligand_i, ligand_ident, rx)| (*ligand_i, ligand_ident.clone(), rx.try_recv()));
+    match all_idents_result {
+        Some((requested_i, ligand_ident, Ok(outcome))) => {
+            state.volatile.thread_receivers.all_idents_avail = None;
+
+            let ligand_i = state
+                .ligands
+                .get(requested_i)
+                .filter(|mol| mol.common.ident == ligand_ident)
+                .map(|_| requested_i)
+                .or_else(|| {
+                    state
+                        .ligands
+                        .iter()
+                        .position(|mol| mol.common.ident == ligand_ident)
+                });
+            let Some(ligand_i) = ligand_i else {
+                handle_err(
+                    &mut state.ui,
+                    "The molecule was removed before its identifiers finished loading".to_owned(),
+                );
+                return;
+            };
+            // Taken before the molecule is borrowed mutably below.
+            let prefs_dir = state.volatile.prefs_dir.clone();
+
+            let Some(mol) = state.ligands.get_mut(ligand_i) else {
+                return;
+            };
+
+            let count_before = mol.idents.len();
+            for ident in outcome.idents {
+                if !mol.idents.contains(&ident) {
+                    mol.idents.push(ident);
+                }
+            }
+            let added = mol.idents.len() - count_before;
+
+            // A downloaded molecule's source file is ours to maintain; refresh it so the
+            // identifiers we just resolved are there the next time the program opens it.
+            let cache_error = if added > 0 {
+                managed_mols::update_managed_mol(&prefs_dir, mol)
+                    .err()
+                    .map(|error| error.to_string())
+            } else {
+                None
+            };
+
+            if let Some(error) = cache_error {
+                handle_err(
+                    &mut state.ui,
+                    format!(
+                        "Loaded identifiers, but could not update the downloaded copy: {error}"
+                    ),
+                );
+            }
+
+            if added > 0 {
+                state.to_save.save_flag = true;
+                let suffix = if outcome.warnings.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} online lookup(s) failed)", outcome.warnings.len())
+                };
+                handle_success(
+                    &mut state.ui,
+                    format!("Loaded {added} additional molecule identifier(s){suffix}"),
+                );
+            } else if outcome.warnings.is_empty() {
+                handle_success(
+                    &mut state.ui,
+                    "No additional molecule identifiers were found".to_owned(),
+                );
+            } else {
+                handle_err(
+                    &mut state.ui,
+                    format!(
+                        "No additional molecule identifiers were loaded: {}",
+                        outcome.warnings.join("; ")
+                    ),
+                );
+            }
+        }
+        Some((_, _, Err(TryRecvError::Disconnected))) => {
+            state.volatile.thread_receivers.all_idents_avail = None;
+            handle_err(
+                &mut state.ui,
+                "The molecule identifier lookup stopped before returning a result".to_owned(),
+            );
+        }
+        Some((_, _, Err(TryRecvError::Empty))) | None => {}
+    }
+
+    if let Some(rx) = &mut state.volatile.thread_receivers.pubchem_properties_avail
+        && let Ok((ident, http_result)) = rx.try_recv()
+    {
+        let mut mol = None;
+        for mol_ in &mut state.ligands {
+            for ident_ in &mol_.idents {
+                if ident_ == &ident {
+                    mol = Some(mol_);
+                    break;
+                }
+            }
+        }
+
+        let Some(mol) = mol else {
+            state.volatile.thread_receivers.pubchem_properties_avail = None;
+            eprintln!("Unable to find the mol we requested PubChem properties for: {ident:?}");
+            return;
+        };
+
+        match http_result {
+            Ok(props) => {
+                println!("Received PubChem properties over HTTP.");
+                mol.update_idents_and_char_from_pubchem(&props);
+
+                state
+                    .to_save
+                    .pubchem_properties_map
+                    .insert(ident.clone(), props.clone());
+                state.to_save.save_flag = true;
+            }
+            Err(e) => {
+                // Note: This is currently broken.
+                // println!("Unable to find Smiles for ident {ident_type:?}, generating one.");
+                eprintln!("Unable to find PubChem properties for ident {ident:?}: {e:?}");
+                // todo: Not saving to cache; not confident enough.
+                // mol.smiles = Some(mol.common.to_smiles());
+            }
+        }
+        state.volatile.thread_receivers.pubchem_properties_avail = None;
+    }
+
+    let mut pending_i = 0;
+    while pending_i < state.volatile.thread_receivers.structure_lookups.len() {
+        let result = state.volatile.thread_receivers.structure_lookups[pending_i]
+            .rx
+            .try_recv();
+
+        match result {
+            Ok(result) => {
+                let lookup = state
+                    .volatile
+                    .thread_receivers
+                    .structure_lookups
+                    .swap_remove(pending_i);
+
+                on_structure_lookup(state, lookup, result, redraw);
+            }
+            Err(TryRecvError::Empty) => pending_i += 1,
+            Err(TryRecvError::Disconnected) => {
+                let lookup = state
+                    .volatile
+                    .thread_receivers
+                    .structure_lookups
+                    .swap_remove(pending_i);
+
+                eprintln!(
+                    "PubChem lookup for {} stopped before returning a result",
+                    lookup.ident
+                );
+            }
+        }
+    }
+
+    let editor_db_check = state
+        .volatile
+        .thread_receivers
+        .editor_db_check
+        .as_ref()
+        .map(|(_, rx)| rx.try_recv());
+    match editor_db_check {
+        Some(Ok(result)) => {
+            if let Some((smiles, _)) = state.volatile.thread_receivers.editor_db_check.take() {
+                mol_editor::on_db_check(state, smiles, result);
+            }
+        }
+        Some(Err(TryRecvError::Disconnected)) => {
+            if let Some((smiles, _)) = state.volatile.thread_receivers.editor_db_check.take() {
+                mol_editor::on_db_check(state, smiles, Err(ReqError::Http));
+            }
+        }
+        Some(Err(TryRecvError::Empty)) | None => {}
+    }
+
+    let mut prefs_dirty = false;
+    let mut pending_i = 0;
+    while pending_i < state.volatile.thread_receivers.mol_pending_data_avail.len() {
+        let outcome = {
+            let (peptide_i, rx) =
+                &state.volatile.thread_receivers.mol_pending_data_avail[pending_i];
+            state
+                .peptides
+                .get_mut(*peptide_i)
+                .map_or(Some(false), |mol| mol.poll_mol_pending_data(rx))
+        };
+
+        if let Some(updated) = outcome {
+            prefs_dirty |= updated;
+            state
+                .volatile
+                .thread_receivers
+                .mol_pending_data_avail
+                .swap_remove(pending_i);
+        } else {
+            pending_i += 1;
+        }
+    }
+    if prefs_dirty {
+        state.to_save.save_flag = true;
+    }
+    let therapeutic_result = state
+        .volatile
+        .thread_receivers
+        .therapeutic_properties_avail
+        .as_ref()
+        .map(|rx| rx.try_recv());
+    match therapeutic_result {
+        Some(Ok((i_mol, properties))) => {
+            if let Some(mol) = state.ligands.get_mut(i_mol) {
+                mol.therapeutic_props = Some(properties);
+            }
+            state.volatile.thread_receivers.therapeutic_properties_avail = None;
+        }
+        Some(Err(TryRecvError::Disconnected)) => {
+            state.volatile.thread_receivers.therapeutic_properties_avail = None;
+        }
+        Some(Err(TryRecvError::Empty)) | None => {}
+    }
+
+    if let Some(rx) = &mut state.volatile.thread_receivers.amber_geostd_data_avail
+        && let Ok((i_mol, data)) = rx.try_recv()
+    {
+        if i_mol >= state.ligands.len() {
+            eprintln!("Uhoh: Can't find a ligand we loaded Geostd data for");
+            state.volatile.thread_receivers.amber_geostd_data_avail = None;
+            return;
+        }
+        let mol = &mut state.ligands[i_mol];
+
+        match data {
+            Ok(d) => {
+                mol.apply_geostd_data(d, &mut state.mol_specific_params);
+            }
+            Err(_) => {
+                eprintln!(
+                    " Unable to load GeoStd data for this molecule (Likely not in the data set.)"
+                );
+            }
+        }
+        state.volatile.thread_receivers.amber_geostd_data_avail = None;
+    }
+
+    let mut pending_i = 0;
+    while pending_i < state.volatile.thread_receivers.sifts_mapping_avail.len() {
+        let result = state.volatile.thread_receivers.sifts_mapping_avail[pending_i]
+            .1
+            .try_recv();
+        match result {
+            Ok(result) => {
+                let (peptide_i, _) = state
+                    .volatile
+                    .thread_receivers
+                    .sifts_mapping_avail
+                    .swap_remove(pending_i);
+                if let Some(pep) = state.peptides.get_mut(peptide_i) {
+                    match result {
+                        Ok(mappings) => {
+                            println!("{} SIFTS UniProt mappings loaded", mappings.len());
+                            pep.sifts_mapping = Some(mappings);
+                            state.volatile.flags.update_sas_coloring = true;
+                            redraw.set(MolType::Peptide);
+                        }
+                        Err(e) => eprintln!("Failed to load SIFTS mappings: {e:?}"),
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => pending_i += 1,
+            Err(TryRecvError::Disconnected) => {
+                eprintln!("SIFTS worker thread died before sending a result");
+                state
+                    .volatile
+                    .thread_receivers
+                    .sifts_mapping_avail
+                    .swap_remove(pending_i);
+            }
+        }
+    }
+    // Poll for completed mesh coloring from thread.
+    if let Some(rx) = &mut state.volatile.thread_receivers.peptide_mesh_coloring
+        && let Ok(colors) = rx.try_recv()
+    {
+        apply_mesh_colors(&mut scene.meshes[MESH_PEP_SOLVENT_SURFACE], &colors);
+        updates.meshes = true;
+        state.volatile.thread_receivers.peptide_mesh_coloring = None;
+        if state.ui.mol_view_peptide == crate::drawing::MoleculeView::Dots {
+            crate::drawing::peptide::draw_peptide(state, scene, updates);
+        }
+    }
+
+    if let Some(rx) = &mut state.volatile.thread_receivers.ph_screening {
+        loop {
+            match rx.try_recv() {
+                Ok(batch) => state.pharmacophore.screening_results.extend(batch),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Thread finished; drop the receiver.
+                    state.volatile.thread_receivers.ph_screening = None;
+                    state.pharmacophore.screening_in_progress = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    let gromacs_result = state
+        .volatile
+        .thread_receivers
+        .gromacs_md_avail
+        .as_ref()
+        .map(|rx| rx.try_recv());
+    match gromacs_result {
+        Some(Ok((out, elapsed))) => {
+            state.volatile.thread_receivers.gromacs_md_avail = None;
+            on_gromacs_md_complete(state, scene, updates, &out, elapsed);
+            state.volatile.md_local.gromacs_output = Some(out);
+        }
+        Some(Err(TryRecvError::Disconnected)) => {
+            state.volatile.thread_receivers.gromacs_md_avail = None;
+            handle_err(&mut state.ui, "GROMACS MD worker disconnected.".into());
+        }
+        _ => (),
+    }
+
+    crate::xtb::poll_md(state, scene, updates);
+}

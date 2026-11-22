@@ -1,0 +1,1672 @@
+# Copyright 2024 DeepMind Technologies Limited
+#
+# AlphaFold 3 source code is licensed under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with the
+# License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# To request access to the AlphaFold 3 model parameters, follow the process set
+# out at https://github.com/google-deepmind/alphafold3. You may only use these
+# if received directly from Google. Use is subject to terms of use available at
+# https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
+
+"""Haiku modules for the Diffuser model."""
+
+from collections.abc import Sequence
+import os
+from typing import Literal
+
+from alphafold3.common import base_config
+from alphafold3.model import model_config
+from alphafold3.model.components import haiku_modules as hm
+from alphafold3.model.components import utils
+from alphafold3.model.components import mapping
+from . import diffusion_transformer
+import haiku as hk
+import jax
+import jax.numpy as jnp
+import tokamax
+
+# Fused pairformer kernels, installed by ColabFold under --use-fast-kernels; None keeps the stock graph.
+# PACKED_ATTENTION(dtype, head_dim) -> f(p, bias, kmask, gate_bias[, kv], *, sm_scale, column) or None
+PACKED_ATTENTION = None
+# PAIR_PROJECTIONS(dtype, channels, num_head, head_dim) -> (ln_projection, output_projection) or None, around it:
+# ln_projection(x, ln_scale, ln_offset, w, wb[, keep], seq_len=None, rows=None) -> (p, bias [h, M], kv or None), w None
+# for the bias alone, seq_len the attended length when x is a slab, rows (start, slab) to read a slab's rows of the whole
+# x in place (colabfold_kernels packed_attn.slab_index); output_projection(o, w, b[, residual, keep, start], slab=None)
+PAIR_PROJECTIONS = None
+# TRIMUL_KERNELS(dtype, channels, hidden) -> (contract, epilogue) or None, both reading the raw input and its LN params:
+# contract(x, ln_scale, ln_offset, wp, bp, wg, bg, mask, *, equation) -> [hidden, N, N]; epilogue is trimul_epilogue_ln
+TRIMUL_KERNELS = None
+# GLU_TRANSITION(dtype, channels, hidden) -> f(x, ln_scale, ln_offset, wa, wb, wo[, keep], *, add_input) or None
+GLU_TRANSITION = None
+# PAD_KEEP: the kernels above take the pair mask as `keep` (ln_projection, output_projection and the epilogue as a last
+# positional argument, the transition as its keep) and skip the row blocks it leaves out, the bucket's padding
+PAD_KEEP = False
+
+
+def _layer_norm_params(name, n):
+  """hm.LayerNorm(name=name)'s scale and offset, for a kernel that runs it."""
+  with hk.name_scope(name):
+    return (hk.get_parameter('scale', (n,), jnp.float32, init=jnp.ones),
+            hk.get_parameter('offset', (n,), jnp.float32, init=jnp.zeros))
+
+
+def _pair_dropout(act, use_dropout, rate=0.25, columnwise=False):
+  """ColabDesign2: shared row/column-wise dropout on a pair tensor (i, j, c).
+
+  AF3 was TRAINED with dropout in the pair stack (SI Algorithms 8/16/17, sec 5.5;
+  cross-checked against OpenFold3): DropoutRowwise 0.25 on TriangleMultiplication
+  outgoing/incoming and TriangleAttentionStartingNode, DropoutColumnwise 0.25 on
+  TriangleAttentionEndingNode. The released inference code stripped it. This adds
+  it back so a design run can use it as a stochastic regulariser, the way the AF2
+  design path does.
+
+  No-recompile toggle, exactly as AF2's apply_dropout: rate is jnp.where(
+  use_dropout, rate, 0), so the op is always in the graph and OFF is an exact
+  identity -- bernoulli(keep_rate=1.0) is all-ones and act*1/1 == act -- meaning
+  prediction stays bit-identical and toggling never triggers a recompile.
+
+  The mask is SHARED along one axis of the pair tensor (a whole row's or column's
+  worth of channels are dropped together): row-wise shares over axis 0 (i),
+  column-wise over axis 1 (j). Uses hk.next_rng_key(), which hk layer_stack
+  splits per block.
+  """
+  r = jnp.where(use_dropout, rate, 0.0)
+  keep_rate = 1.0 - r
+  shape = list(act.shape)
+  shape[1 if columnwise else 0] = 1
+  keep = jax.random.bernoulli(hk.next_rng_key(), keep_rate, shape=shape)
+  return act * keep / keep_rate
+
+
+def get_shard_size(
+    num_residues: int, shard_spec: Sequence[tuple[int | None, int | None]]
+) -> int | None:
+  shard_size = shard_spec[0][-1]
+  for num_residues_upper_bound, num_residues_shard_size in shard_spec:
+    shard_size = num_residues_shard_size
+    if (
+        num_residues_upper_bound is None
+        or num_residues <= num_residues_upper_bound
+    ):
+      break
+  return shard_size
+
+
+class TransitionBlock(hk.Module):
+  """Transition block for transformer."""
+
+  class Config(base_config.BaseConfig):
+    num_intermediate_factor: int = 4
+    use_glu_kernel: bool = True
+
+  def __init__(
+      self, config: Config, global_config: model_config.GlobalConfig, *, name
+  ):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = global_config
+
+  def __call__(self, act, broadcast_dim=0, mask=None, residual=None):
+    """AF3's transition; `mask` is the OpenFold3 lineage's `_mask_trans`; with `residual`, returns residual + the masked update.
+
+    OpenFold3 multiplies every transition's OUTPUT by the mask of the axis it
+    ran over (`layers/transition.py`: `x = self.linear_out(x) * mask`), and
+    every caller in of3 takes the `_mask_trans=True` default -- the MSA module,
+    the pairformer, the diffusion transformer and the heads. AF3 does not, and
+    neither did we.
+
+    Inert on an all-ones mask, which is exactly why no gate saw it: L1 through
+    L4 feed one unpadded chain with a full MSA. `L1b.msa_nonuniform` is the
+    cell that finds it. Read model_config.MASK_TRANSITIONS before assuming it
+    changes a fold -- on our features it does not, and that was measured.
+    """
+    num_channels = act.shape[-1]
+
+    num_intermediate = int(num_channels * self.config.num_intermediate_factor)
+
+    kernel = self.glu_kernel(self.config, act.dtype, num_channels)
+    if kernel is not None:
+      return self._fused(act, mask, residual, kernel, num_intermediate)
+
+    act = hm.LayerNorm(name='input_layer_norm')(act)
+
+    if self.config.use_glu_kernel:
+      weights, _ = hm.haiku_linear_get_params(
+          act,
+          num_output=num_intermediate * 2,
+          initializer='relu',
+          name='transition1',
+      )
+      weights = jnp.reshape(weights, (len(weights), 2, num_intermediate))
+      c = tokamax.gated_linear_unit(
+          x=act, weights=weights, activation=jax.nn.swish
+      )
+    else:
+      act = hm.Linear(
+          num_intermediate * 2, initializer='relu', name='transition1'
+      )(act)
+      a, b = jnp.split(act, 2, axis=-1)
+      c = jax.nn.swish(a) * b
+
+    out = hm.Linear(
+        num_channels,
+        initializer=self.global_config.final_init,
+        name='transition2',
+    )(c)
+    if mask is not None:
+      out = out * mask[..., None].astype(out.dtype)
+    return out if residual is None else residual + out
+
+  @staticmethod
+  def glu_kernel(config, dtype, num_channels):
+    """The fused kernel for this transition, or None."""
+    if GLU_TRANSITION is None or not config.use_glu_kernel:
+      return None
+    return GLU_TRANSITION(dtype, num_channels, int(num_channels * config.num_intermediate_factor))
+
+  @hk.transparent
+  def _fused(self, act, mask, residual, kernel, num_intermediate):
+    """LayerNorm, the GLU, transition2, the mask and the residual in one kernel; the same parameters under the same names."""
+    c = act.shape[-1]
+    with hk.name_scope('input_layer_norm'):
+      scale = hk.get_parameter('scale', (c,), jnp.float32, init=jnp.ones)
+      offset = hk.get_parameter('offset', (c,), jnp.float32, init=jnp.zeros)
+    w1, _ = hm.haiku_linear_get_params(act, num_output=num_intermediate * 2, initializer='relu', name='transition1')
+    w2, _ = hm.haiku_linear_get_params(jax.ShapeDtypeStruct((num_intermediate,), act.dtype), num_output=c,
+                                       initializer=self.global_config.final_init, name='transition2')
+    keep = [] if mask is None else [jnp.broadcast_to(mask, act.shape[:-1]).astype(act.dtype)]
+    x = act if residual is None else residual
+    assert residual is None or residual is act, 'the kernel adds the input it normalised'
+    return kernel(x, scale, offset, w1[:, :num_intermediate].astype(act.dtype), w1[:, num_intermediate:].astype(act.dtype),
+                  w2.astype(act.dtype), *keep, add_input=residual is not None)
+
+
+def _msa_pair_logits(pair_act, num_head):
+  """`Linear(LayerNorm(pair_act))` in float32, the norm folded into the weights.
+
+  The logits reach tens, where half-precision rounding shifts the softmax weights;
+  folding keeps the pair in its own dtype. Same parameters under the same names.
+  """
+  channels = pair_act.shape[-1]
+  with hk.name_scope('pair_norm'):
+    scale = hk.get_parameter('scale', (channels,), jnp.float32, init=jnp.ones)
+    offset = hk.get_parameter('offset', (channels,), jnp.float32, init=jnp.zeros)
+  with hk.name_scope('pair_logits'):
+    weights = hk.get_parameter(
+        'weights', (channels, num_head), jnp.float32,
+        hm.get_initializer_scale('linear', (channels,)))
+  x = pair_act.astype(jnp.float32)
+  mean = jnp.mean(x, axis=-1, keepdims=True)
+  var = jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True)
+  folded = scale[:, None] * weights
+  logits = jnp.einsum('...c,ch->...h', x, folded, precision='highest')
+  logits = (logits - mean * jnp.sum(folded, axis=0)) * jax.lax.rsqrt(var + 1e-5)
+  return logits + offset @ weights
+
+
+class MSAAttention(hk.Module):
+  """MSA Attention."""
+
+  class Config(base_config.BaseConfig):
+    num_head: int = 8
+    # per-head value width. None keeps AF3's coupling value_dim = c_m // num_head
+    # (so this is a no-op for AF3/OF3/IF2). OpenDDE decouples it -- its
+    # MSAPairWeightedAveraging uses c=8 with c_m=128, num_head=8 (hidden 64), which
+    # AF3's coupling (=16) cannot express; set value_dim=8 to load those weights.
+    value_dim: int | None = None
+
+  def __init__(
+      self, config: Config, global_config: model_config.GlobalConfig, *, name
+  ):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = global_config
+
+  def __call__(self, act, mask, pair_act, pair_mask=None, rows=None, then=None):
+    if rows:
+      return self._rows_in_place(act, mask, pair_act, rows, then)
+    chai1 = self.global_config.model == 'chai1'
+    act = hm.LayerNorm(name='act_norm')(act)
+    logits = _msa_pair_logits(pair_act, self.config.num_head)
+    logits = jnp.transpose(logits, [2, 0, 1])
+    if chai1 and pair_mask is not None:
+      # chai masks these logits with the TOKEN PAIR mask (fill -10000), where we
+      # derive a per-token mask from the MSA (max over rows). Read off its graph
+      # rather than inferred -- trunk forward_256 node 10767.
+      logits = jnp.where(pair_mask[None].astype(jnp.bool_), logits, -10000.0)
+    else:
+      logits += utils.mask_bias(
+          lambda m: 1e9 * (jnp.max(m, axis=0) - 1.0), mask)
+    weights = jax.nn.softmax(logits, axis=-1).astype(act.dtype)
+    num_channels = act.shape[-1]
+    value_dim = self.config.value_dim or num_channels // self.config.num_head
+    v = hm.Linear(
+        [self.config.num_head, value_dim], use_bias=False, name='v_projection'
+    )(act)
+    if chai1:
+      # chai ZEROES the value wherever the MSA mask is false (node 10818) before
+      # the weighted average; we averaged those positions in. The einsum
+      # contracts over KEY TOKENS, so an uncovered position in an otherwise real
+      # row still contributed -- which is most of a cropped MSA.
+      v = v * mask[..., None, None].astype(v.dtype)
+    v_avg = jnp.einsum('hqk, bkhc -> bqhc', weights, v)
+    v_avg = jnp.reshape(v_avg, v_avg.shape[:-2] + (-1,))
+    gate_values = hm.Linear(
+        self.config.num_head * value_dim,
+        bias_init=1.0,
+        initializer='zeros',
+        name='gating_query',
+    )(act)
+    v_avg *= jax.nn.sigmoid(gate_values)
+
+    return hm.Linear(
+        num_channels,
+        initializer=self.global_config.final_init,
+        name='output_projection',
+    )(v_avg)
+
+  @hk.transparent
+  def _rows_in_place(self, act, mask, pair_act, rows, then):
+    """then(act + self(act), mask) a chunk of MSA rows at a time, written back into act in place.
+
+    The averaging weights come from the pair alone and every row is independent, so only one chunk's normed MSA,
+    values and gate exist at a time. Modules are made once: inside the loop they would get fresh names.
+    """
+    logits = jnp.transpose(_msa_pair_logits(pair_act, self.config.num_head), [2, 0, 1])
+    logits += utils.mask_bias(lambda m: 1e9 * (jnp.max(m, axis=0) - 1.0), mask)
+    weights = jax.nn.softmax(logits, axis=-1).astype(act.dtype)
+    num_channels = act.shape[-1]
+    value_dim = self.config.value_dim or num_channels // self.config.num_head
+    act_norm = hm.LayerNorm(name='act_norm')
+    v_projection = hm.Linear([self.config.num_head, value_dim], use_bias=False, name='v_projection')
+    gating_query = hm.Linear(self.config.num_head * value_dim, bias_init=1.0, initializer='zeros',
+                             name='gating_query')
+    output_projection = hm.Linear(num_channels, initializer=self.global_config.final_init,
+                                  name='output_projection')
+
+    def update(x):
+      a = act_norm(x)
+      v_avg = jnp.einsum('hqk, bkhc -> bqhc', weights, v_projection(a))
+      v_avg = jnp.reshape(v_avg, v_avg.shape[:-2] + (-1,)) * jax.nn.sigmoid(gating_query(a))
+      return output_projection(v_avg)
+
+    def run(buf, i0, n):
+      x = jax.lax.dynamic_slice_in_dim(buf, i0, n, 0)
+      m = jax.lax.dynamic_slice_in_dim(mask, i0, n, 0)
+      return jax.lax.dynamic_update_slice_in_dim(buf, then(x + update(x), m), i0, 0)
+
+    whole, rest = divmod(act.shape[0], rows)
+    buf = hk.fori_loop(0, whole, lambda i, b: run(b, i * rows, rows), act)
+    return buf if not rest else run(buf, whole * rows, rest)
+
+
+class GridSelfAttention(hk.Module):
+  """Self attention that is either per-sequence or per-residue."""
+
+  class Config(base_config.BaseConfig):
+    num_head: int = 4
+    # Per-head dim. None -> derived (max(channels//num_head, 16)), the AF3 default. Boltz's
+    # template pairformer fixes it (pairwise_head_width=32) independent of channels (64), so a
+    # boltz2 template branch sets qkv_dim=32; leaving it None keeps the trunk bit-identical.
+    qkv_dim: int | None = None
+    # chai-1's CONFIDENCE triangle attention only. Its linear_out is
+    # (2*c_z, 2*c_z), not the trunk's (c_z, 2*c_z): each direction's output
+    # reads BOTH directions' heads and the two halves combine as
+    # `out0 + transpose(out1)`. So each direction needs TWO output projections
+    # -- one kept, one transposed -- instead of one. The cross-direction blocks
+    # are not negligible (Frobenius 24-30, same as the diagonal), so dropping
+    # them is not an option: it costs corr 0.831 against chai's own output.
+    dual_output: bool = False
+
+  def __init__(
+      self,
+      config: Config,
+      global_config: model_config.GlobalConfig,
+      transpose: bool,
+      *,
+      name: str,
+  ):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = global_config
+    self.transpose = transpose
+
+  @hk.transparent
+  def _attention(
+      self,
+      act,
+      mask,
+      bias,
+  ):
+    num_channels = act.shape[-1]
+    assert num_channels % self.config.num_head == 0
+    # Triton requires a minimum dimension of 16 for doing matmul.
+    qkv_dim = self.config.qkv_dim or max(num_channels // self.config.num_head, 16)
+
+    qkv_shape = (self.config.num_head, qkv_dim)
+    q = hm.Linear(
+        qkv_shape, use_bias=False, name='q_projection', transpose_weights=True
+    )(act)
+    k = hm.Linear(
+        qkv_shape, use_bias=False, name='k_projection', transpose_weights=True
+    )(act)
+    v = hm.Linear(qkv_shape, use_bias=False, name='v_projection')(act)
+
+    # Dot product attention requires the bias term to have a batch dimension.
+    bias = jnp.expand_dims(bias, 0)
+
+    from alphafold3.model.components.attention import dot_product_attention as _flash_dpa
+    weighted_avg = _flash_dpa(
+        q,
+        k,
+        v,
+        mask=mask,
+        bias=bias,
+        implementation=self.global_config.flash_attention_implementation,
+    )
+    weighted_avg = jnp.reshape(weighted_avg, weighted_avg.shape[:-2] + (-1,))
+
+    # RF3's triangle-attention gate and output projections carry trained biases
+    # (to_g.bias init 1.0 -> gate open; to_out.bias) that stock AF3 GridSelfAttention
+    # lacks. Dropping them halves the gate (weight inits to zeros, so the gate is
+    # bias-dominated) and compounds across the 96 tri-attentions. Gated on
+    # rosettafold3 so other families stay bias-free / byte-identical.
+    rosettafold3 = self.global_config.model in model_config.TRI_ATT_BIAS
+    gate_values = hm.Linear(
+        self.config.num_head * qkv_dim,
+        use_bias=rosettafold3,
+        bias_init=1.0,
+        initializer='zeros',
+        transpose_weights=True,
+        name='gating_query',
+    )(act)
+    weighted_avg *= jax.nn.sigmoid(gate_values)
+
+    out = hm.Linear(
+        num_channels,
+        use_bias=rosettafold3,
+        initializer=self.global_config.final_init,
+        name='output_projection',
+    )(weighted_avg)
+    if self.config.dual_output:
+      # concatenated rather than returned as a tuple: this runs under
+      # mapping.inference_subbatch, which chunks a single array.
+      out = jnp.concatenate([out, hm.Linear(
+          num_channels,
+          use_bias=rosettafold3,
+          initializer=self.global_config.final_init,
+          name='output_projection_transposed',
+      )(weighted_avg)], axis=-1)
+    return out
+
+  @hk.transparent
+  def _qkvg_weights(self, act, h, d):
+    """The q/k/v/gate projections stacked [C, 4, H, D], and the gate's bias [H, D]."""
+    rf3 = self.global_config.model in model_config.TRI_ATT_BIAS
+    get = lambda **kw: hm.haiku_linear_get_params(act, **kw)[0]
+    wq = get(num_output=(h, d), transpose_weights=True, name='q_projection')
+    wk = get(num_output=(h, d), transpose_weights=True, name='k_projection')
+    wv = get(num_output=(h, d), name='v_projection')
+    wg, bg = hm.haiku_linear_get_params(act, num_output=h * d, use_bias=rf3, bias_init=1.0, initializer='zeros',
+                                        transpose_weights=True, name='gating_query')
+    chd = lambda w: jnp.moveaxis(w.reshape(h, d, -1), -1, 0)  # (h, d, c) -> (c, h, d)
+    w = jnp.stack([chd(wq), chd(wk), wv, chd(wg)], axis=1).astype(act.dtype)
+    gb = jnp.zeros((h, d), act.dtype) if bg is None else bg.reshape(h, d).astype(act.dtype)
+    return w, gb
+
+  @hk.transparent
+  def _packed_attention(self, act, bias, kmask):
+    """_attention from one [X, Y, 4, H, D] projection that a fused kernel reads in place, along rows or columns."""
+    h = self.config.num_head
+    d = self.config.qkv_dim or max(act.shape[-1] // h, 16)
+    kernel = PACKED_ATTENTION(act.dtype, d)
+    if kernel is None:
+      return None
+    rf3 = self.global_config.model in model_config.TRI_ATT_BIAS
+    w, gb = self._qkvg_weights(act, h, d)
+    out = kernel(jnp.einsum('xyc,cghd->xyghd', act, w), bias.astype(act.dtype), kmask.astype(jnp.bool_), gb,
+                 sm_scale=d ** -0.5, column=self.transpose)
+    return hm.Linear(act.shape[-1], use_bias=rf3, initializer=self.global_config.final_init,
+                     name='output_projection')(out.reshape(out.shape[:-2] + (-1,)))
+
+  def _ln_projection_kernels(self, act):
+    """(attention, ln_projection, output_projection) for the fused path from the raw pair, or None."""
+    h = self.config.num_head
+    d = self.config.qkv_dim or max(act.shape[-1] // h, 16)
+    if PAIR_PROJECTIONS is None:
+      return None
+    kernel = PACKED_ATTENTION(act.dtype, d)
+    projections = PAIR_PROJECTIONS(act.dtype, act.shape[-1], h, d)
+    return None if kernel is None or projections is None else (kernel, *projections)
+
+  @hk.transparent
+  def _projection_params(self, act):
+    """_ln_projection's act_norm (scale, offset), pair_bias_projection, q/k/v/gate and gate bias."""
+    c = act.shape[-1]
+    h = self.config.num_head
+    d = self.config.qkv_dim or max(c // h, 16)
+    ln = _layer_norm_params('act_norm', c)
+    wb, _ = hm.haiku_linear_get_params(act, num_output=h, name='pair_bias_projection')
+    return (ln, wb, *self._qkvg_weights(act, h, d))
+
+  @hk.transparent
+  def _output_params(self, act, h, d):
+    """output_projection's weight and bias, for _ln_packed_attention."""
+    wo, bo = hm.haiku_linear_get_params(jax.ShapeDtypeStruct((h * d,), act.dtype), num_output=act.shape[-1],
+                                        use_bias=self.global_config.model in model_config.TRI_ATT_BIAS,
+                                        initializer=self.global_config.final_init, name='output_projection')
+    return wo, jnp.zeros((act.shape[-1],), act.dtype) if bo is None else bo.astype(act.dtype)
+
+  @hk.transparent
+  def _ln_projection(self, act, ln_projection, keep=None, params=None, seq_len=None, rows=None):
+    """act_norm, q/k/v/gate and the pair bias in one kernel from the raw pair: p [X, Y, G, H, D], bias [H, X, Y].
+    rows (start, slab, (X, Y)): only the slab's X x Y pairs of the whole act, read in place (see _slab_attention)."""
+    x, y, c = act.shape if rows is None else (*rows[2], act.shape[-1])
+    h = self.config.num_head
+    d = self.config.qkv_dim or max(c // h, 16)
+    ln, wb, w, gb = params or self._projection_params(act)
+    kw = {} if seq_len is None else {'seq_len': seq_len}
+    if rows is not None:
+      kw['rows'] = rows[:2]
+    p, bias, kv = ln_projection(act.reshape(-1, c), *ln, jnp.moveaxis(w, 1, 0).reshape(4, c, h * d),
+                                None if wb is None else wb.astype(act.dtype),
+                                *([] if keep is None else [keep.reshape(-1)]), **kw)
+    kv = None if kv is None else kv.reshape(x, y, 2, h, d)
+    return p.reshape(x, y, -1, h, d), None if bias is None else bias.reshape(h, x, y), kv, gb
+
+  @hk.transparent
+  def _ln_packed_attention(self, act, p, bias, kv, gb, kmask, kernels, residual, keep=None, out_params=None,
+                           rows=None):
+    """The packed kernel on _ln_projection's output, then output_projection with the residual in one kernel."""
+    attention, _, output_projection = kernels
+    x, y, c = act.shape
+    h, d = p.shape[-2:]
+    out = attention(p, bias, kmask.astype(jnp.bool_), gb, *([] if kv is None else [kv]), sm_scale=d ** -0.5,
+                    column=self.transpose)
+    wo, bo = out_params or self._output_params(act, h, d)
+    res = [] if residual is None else [residual.reshape(-1, c)]
+    if keep is not None:
+      res = (res or [None]) + [keep.reshape(-1)]
+    kw = {}
+    if rows is not None:
+      # the slab's rows of the whole residual, updated in place: the result is the whole pair
+      res, kw = res + [None] * (2 - len(res)) + [rows[0]], {'slab': rows[1]}
+    return output_projection(out.reshape(-1, h * d), wo.astype(act.dtype), bo, *res, **kw).reshape(x, y, c)
+
+  @hk.transparent
+  def _pair_bias(self, act, ln_projection, params, keep=None):
+    """act_norm and pair_bias_projection [H, X, Y] alone, ln_projection without the packed slots: the slabs below need
+    the bias whole, and it is a fraction of the pair."""
+    x, y, c = act.shape
+    ln, wb = params[:2]
+    _, bias, _ = ln_projection(act.reshape(-1, c), *ln, None, wb.astype(act.dtype),
+                               *([] if keep is None else [keep.reshape(-1)]))
+    return bias.reshape(-1, x, y)
+
+  @hk.transparent
+  def _slab_attention(self, act, bias, kmask, kernels, residual, keep, chunk_size, params):
+    """_ln_projection and _ln_packed_attention a slab of the attention's batch at a time (rows, or columns when
+    transposed), so the [X, Y, 4, H, D] projection is never whole; the bias spans the pair and comes in whole.
+    Parameters are fetched once out here: each hk.name_scope a slab entered would get a fresh name."""
+    out_params = self._output_params(act, *params[2].shape[-2:])
+    # kmask is [batch, keys] in either direction
+    ax = 1 if self.transpose else 0
+    seq_len = act.shape[1 - ax]
+    if residual is act:
+      # the residual is the pair: a slab reads its own rows (columns) of it, which no other slab reads, and adds into
+      # them in place, so the loop carries the one pair and copies nothing
+      ln, _, w, gb = params
+      X, Y, _ = act.shape
+
+      def run(buf, j0, n):
+        x, y = (X, n) if self.transpose else (n, Y)
+        start = jnp.reshape(j0 if self.transpose else j0 * Y, (1,)).astype(jnp.int32)
+        rows = (start, (x * y, n, Y) if self.transpose else (x * y,) * 3, (x, y))
+        k = None if keep is None else jax.lax.dynamic_slice_in_dim(keep, j0, n, ax)
+        m = jax.lax.dynamic_slice_in_dim(kmask, j0, n, 0)
+        p, _, kv, g = self._ln_projection(buf, kernels[1], k, (ln, None, w, gb), seq_len, rows)
+        return self._ln_packed_attention(buf, p, bias, kv, g, m, kernels, buf, k, out_params, rows)
+
+      whole, rest = divmod(act.shape[ax], chunk_size)
+      buf = hk.fori_loop(0, whole, lambda i, b: run(b, i * chunk_size, chunk_size), act)
+      return buf if not rest else run(buf, whole * chunk_size, rest)
+
+    def slab(a, m, r, k):
+      p, _, kv, gb = self._ln_projection(a, kernels[1], k, params, seq_len)
+      return self._ln_packed_attention(a, p, bias, kv, gb, m, kernels, r, k, out_params)
+
+    return mapping.sharded_apply(slab, chunk_size, in_axes=(ax, 0, ax, ax), out_axes=ax)(act, kmask, residual, keep)
+
+  def __call__(self, act, pair_mask, residual=None, keep_mask=None):
+    """Builds a module.
+
+    Arguments:
+      act: [num_seq, num_res, channels] activations tensor
+      pair_mask: [num_seq, num_res] mask of non-padded regions in the tensor.
+        Only used in inducing points attention currently.
+      residual: added to the output when given.
+      keep_mask: the rows whose output matters, when not `pair_mask` (PAD_KEEP).
+
+    Returns:
+      Result of the self-attention operation.
+    """
+    assert len(act.shape) == 3
+    assert len(pair_mask.shape) == 2
+
+    # the pair's own rows that matter, for the kernels that skip padding (PAD_KEEP), in act's layout
+    keep = (pair_mask if keep_mask is None else keep_mask).astype(act.dtype) if PAD_KEEP else None
+    pair_mask = jnp.swapaxes(pair_mask, -1, -2)
+    num_residues = act.shape[0]
+
+    chunk_size = get_shard_size(
+        num_residues, self.global_config.pair_attention_chunk_size
+    )
+    # dual_output mixes both directions: stock path
+    packed = PACKED_ATTENTION is not None and not self.config.dual_output
+    kernels = self._ln_projection_kernels(act) if packed else None
+    # past the chunking length only the fused path stays packed: whole, or a slab of rows (columns) at a time once
+    # the projection outgrows packed_slab_bytes (parameters fetched once: a repeated hk.name_scope gets a fresh name)
+    packed = packed and (chunk_size is None or kernels is not None)
+    fused = self._projection_params(act) if kernels is not None and chunk_size is not None else None
+    slab_bytes, part_bytes = packed_slab_bytes()
+    slabs = fused is not None and act.shape[0] * act.shape[1] * fused[2][0].size * act.dtype.itemsize > slab_bytes
+    if slabs:
+      nonbatched_bias = self._pair_bias(act, kernels[1], fused, keep)
+    elif kernels is not None:
+      # act_norm and pair_bias_projection run in the kernel that projects q/k/v/gate; the bias comes out as below
+      p, nonbatched_bias, kv, gate_bias = self._ln_projection(act, kernels[1], keep, fused)
+    else:
+      act = hm.LayerNorm(name='act_norm')(act)
+
+      nonbatched_bias = hm.Linear(
+          self.config.num_head, use_bias=False, name='pair_bias_projection'
+      )(act)
+      nonbatched_bias = jnp.transpose(nonbatched_bias, [2, 0, 1])
+    # OpenFold3 computes the pair bias from transposed z for column-wise attention;
+    # swap axes to match that convention for its lineage. RoseTTAFold3's
+    # TriangleAttention (end-node) computes to_b from the NON-transposed pair and does
+    # NOT transpose the bias (it transposes only the pair before attention), so it is
+    # excluded from the list below.
+    #
+    # openbind0 (OpenFold3 v0.5.0) IS EXCLUDED TOO, and that was settled twice --
+    # wrongly on 2026-09-07, then correctly on 2026-09-11 when a native
+    # openbind0 FOLD became runnable. The whole episode is worth keeping, because
+    # the wrong answer came with three pieces of supporting evidence.
+    #
+    # WHAT THE SOURCE ACTUALLY SAYS. Both releases hand their end-node attention
+    # an ALREADY-TRANSPOSED pair (`z.transpose(-2, -3)` around the call in
+    # base_blocks.py), and the bias is a permutation of `linear_z` applied to
+    # that transposed tensor:
+    #
+    #   main / preview-2   permute_final_dims(lz(zT), (2, 0, 1)) -> b[h,i,j] = lz(z)[j,i,h]
+    #   v0.5.0             permute_final_dims(lz(zT), (2, 1, 0)) -> b[h,i,j] = lz(z)[i,j,h]
+    #
+    # We compute the bias from the NON-transposed `act`, i.e. lz(z)[i,j,h], and
+    # then optionally swap. So preview-2 needs the swap and v0.5.0 needs NO swap:
+    # the two releases are opposite, and it is v0.5.0's EXTRA transposition in
+    # the permute tuple that cancels our own.
+    #
+    # WHY THE FIRST ANSWER WAS WRONG. It read the permute tuples -- (2, 1, 0)
+    # "transposes", so openbind0 was put in the list -- without carrying through
+    # that the input is already transposed. And it was CONFIRMED by
+    # `trunk_parity.py`, which reported z 0.471977 without the swap and 1.000000
+    # with it. That measurement was real and it was against the wrong code:
+    # `~/openfold-3` is checked out at main, whose PairFormerStack loads
+    # openbind0's pairformer tensors happily (the two releases differ by name
+    # only in the DIFFUSION LayerNorms), so the oracle ran main's convention
+    # over v0.5.0's weights and certified main's answer. A native reference has
+    # to be the right RELEASE, not just the right repository -- the gates now
+    # point openbind0 at `~/openfold-3-v050` (a worktree of the v0.5.0 tag,
+    # which IS the openbind release).
+    #
+    # WHAT IT COST, and why nothing cheaper would have found it: 10.4 A on plain
+    # ubiquitin where native openbind0 gets 2.4 and our openfold3 gets 1.4.
+    # NEITHER SETTING CHANGES ANY WEIGHT (linear_z is still per block and
+    # identically shaped), so no shape gate and no coverage audit can see it;
+    # the trunk gate on random inputs grades FLOOR; and fold quality on the
+    # panel this port was accepted on could not discriminate it either:
+    #
+    #   6MRR, single sequence     1.702 A (absent)  vs 1.712 A (present)
+    #   1STP + MSA, seed 1        0.548 A           vs 0.763 A
+    #   1STP + MSA, seed 7        0.532 A           vs 0.460 A
+    #
+    # Two seeds disagreed about which was better, so one seed would have
+    # "confirmed" either answer. What DID find it: one block of the trunk
+    # pairformer, sub-module by sub-module, on native's own real input, with
+    # native's tf32-vs-fp32 spread measured first as the floor (max|d| 0.09).
+    # Four of the five pair sub-modules were exact to 2e-5 for both releases and
+    # `pair_attention2` read corr 0.93 for openbind0 -- and, with the setting
+    # flipped, corr 0.93 for openfold3. Exactly complementary, which is what a
+    # convention that differs between two releases looks like.
+    if (self.transpose
+        and self.global_config.model in model_config.TRANSPOSED_COLUMN_PAIR_BIAS):
+      nonbatched_bias = jnp.swapaxes(nonbatched_bias, -1, -2)
+    if self.global_config.model in model_config.BF16_TRI_ATT_PAIR_BIAS:
+      # helixfold3 adds the pair bias as bfloat16 even in float32 (see
+      # model_config.BF16_TRI_ATT_PAIR_BIAS)
+      nonbatched_bias = nonbatched_bias.astype(jnp.bfloat16).astype(nonbatched_bias.dtype)
+
+    if slabs:
+      # slabs of PACKED_SLAB_PART_BYTES of projection: few launches, each long enough that its tail does not show
+      row = act.shape[0 if self.transpose else 1] * fused[2][0].size * act.dtype.itemsize
+      rows = max(chunk_size, part_bytes // row // 64 * 64)
+      out = self._slab_attention(act, nonbatched_bias, pair_mask, kernels, residual, keep, rows, fused)
+    elif kernels is not None:
+      out = self._ln_packed_attention(act, p, nonbatched_bias, kv, gate_bias, pair_mask, kernels, residual, keep)
+    elif packed:
+      out = self._packed_attention(act, nonbatched_bias, pair_mask)
+      out = out if out is None or residual is None else residual + out
+    if packed and out is not None:
+      # the kernels answer in act's layout, and chai1 keeps the ending node's transposed (see below)
+      return jnp.swapaxes(out, -2, -3) if self.transpose and self.global_config.model == 'chai1' else out
+
+    if self.transpose:
+      act = jnp.swapaxes(act, -2, -3)
+
+    pair_mask = pair_mask[:, None, None, :].astype(jnp.bool_)
+
+    act = mapping.inference_subbatch(
+        self._attention,
+        chunk_size,  # pyrefly: ignore[bad-argument-type]
+        batched_args=[act, pair_mask],
+        nonbatched_args=[nonbatched_bias],
+    )
+
+    # chai-1 does NOT transpose the ending-node direction's output back. Its two
+    # directions are one module: the outputs are concatenated as
+    # [dir0(i,j), dir1(j,i)] and a single linear_out reads them in that mixed
+    # orientation. We hold the two halves of that linear_out in the two
+    # pair_attention scopes, so this one must hand back the transposed
+    # orientation for the sum to reproduce chai's. Restoring it here caps the
+    # op at corr 0.78 against the native reference; skipping it gives 0.9991.
+    if self.transpose and self.global_config.model != 'chai1':
+      act = jnp.swapaxes(act, -2, -3)
+
+    if self.config.dual_output:
+      # (kept, to-be-transposed); the caller sums each group before the one
+      # transpose, exactly as chai does at its nodes 856/861.
+      return jnp.split(act, 2, axis=-1)
+    return act if residual is None else residual + act
+
+
+# the f32 gated projection size above which the triangle multiplication runs by channel blocks
+TRIMUL_BLOCK_BYTES = 8 * 2 ** 30
+# the pair size (its own dtype, 96 GB card; device_scale shrinks it) above which a blocked triangle multiplication's
+# epilogue runs in row slabs in place: 3.4% slower at 2,560 tokens, where nothing needs the memory
+TRIMUL_SLAB_PAIR_BYTES = 8 * 2 ** 30
+# an epilogue slab, in f32 bytes of its [C, rows, N] input
+TRIMUL_SLAB_BYTES = 2 ** 30
+# the MSA size (its own dtype, 96 GB card) above which the MSA update and the outer product mean's projections run
+# MSA_CHUNK_ROW_BYTES of f32 rows at a time (2% slower at 825 tokens, deep MSA)
+MSA_CHUNK_BYTES = 12 * 2 ** 30
+MSA_CHUNK_ROW_BYTES = 2 ** 30
+
+
+def device_scale():
+  """The device's memory as a share of a 96 GB card, at most 1."""
+  try:
+    limit = (jax.local_devices()[0].memory_stats() or {}).get('bytes_limit')
+  except Exception:  # pylint: disable=broad-except
+    limit = None
+  if not limit:
+    return 1.0
+  # the allocator's limit is this fraction of the card (ColabFold asks for 4.0, with unified memory)
+  frac = float(os.environ.get('XLA_CLIENT_MEM_FRACTION', os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION', 0.75)))
+  return min(1.0, limit / frac / (94 * 2 ** 30))
+
+
+def _msa_row_chunks(msa):
+  """MSA rows per chunk, or None to run whole."""
+  if hk.running_init() or msa.size * msa.dtype.itemsize <= MSA_CHUNK_BYTES * device_scale():
+    return None
+  return max(1, MSA_CHUNK_ROW_BYTES // (msa[0].size * 4))
+
+
+# the packed [X, Y, 4, H, D] projection size above which triangle attention runs it a slab of rows at a time, once the
+# config chunks it (slabs cost ~1%), on a 96 GB card; packed_slab_bytes scales it to the device
+PACKED_SLAB_BYTES = 8 * 2 ** 30
+# a slab's share of it: 256-row slabs cost the attention kernel 3% in launch tails at 2,560 tokens
+PACKED_SLAB_PART_BYTES = 2 * 2 ** 30
+
+
+def packed_slab_bytes():
+  """(PACKED_SLAB_BYTES, PACKED_SLAB_PART_BYTES), shrunk to the same share of a smaller device's memory."""
+  scale = device_scale()
+  return int(PACKED_SLAB_BYTES * scale), int(PACKED_SLAB_PART_BYTES * scale)
+
+
+def _real_length(pair_mask, num_residues):
+  """The REAL token count rf3's triangle multiplication divides by.
+
+  rf3 runs unpadded, so its `L` is the number of real tokens. Ours may be padded
+  to a bucket, and dividing by the padded length is not a no-op in front of the
+  centre LayerNorm (its eps -- see model_config.TRIANGLE_MUL_DIVIDE_BY_LENGTH):
+  padding ligand_ccd 83 -> 128 tokens moved the trunk pair by 1e-2 on the real
+  tokens. pair_mask is the token pair mask (seq_mask outer seq_mask), so its
+  largest row sum is the real count, and exactly `num_residues` when nothing is
+  padded. An all-zero mask falls back to `num_residues`.
+  """
+  n = jnp.max(jnp.sum(pair_mask.astype(jnp.float32), axis=-1))
+  return jnp.where(n > 0, n, jnp.float32(num_residues))
+
+
+def _wide(dtype):
+  """float32 for a float16 triangle contraction, whose sums of N products overflow it (NaN at center_norm), else None."""
+  return jnp.float32 if dtype == jnp.float16 else None
+
+
+class TriangleMultiplication(hk.Module):
+  """Triangle Multiplication."""
+
+  class Config(base_config.BaseConfig):
+    equation: Literal['ikc,jkc->ijc', 'kjc,kic->ijc']
+    use_glu_kernel: bool = True
+    # Width of the a/b projections and the einsum, when it is NOT the input
+    # channel count. AF3 always ties the two, and every model here agrees except
+    # Protenix-v1's TEMPLATE stack, which runs a 128-wide triangle multiplication
+    # on a 64-channel template pair (the two projections are (128, 64) where AF3
+    # would build (64, 64)). None keeps AF3's behaviour exactly.
+    hidden_dim: int | None = None
+    # einsum channels per block above TRIMUL_BLOCK_BYTES; 0 never blocks
+    channel_block: int = 32
+
+  def __init__(
+      self, config: Config, global_config: model_config.GlobalConfig, *, name
+  ):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = global_config
+
+  @staticmethod
+  def blocks(config, num_residues, num_channels):
+    """Whether the einsum runs by channel blocks."""
+    hidden_dim = num_channels if config.hidden_dim is None else config.hidden_dim
+    cb = config.channel_block
+    return bool(cb and hidden_dim % cb == 0 and num_residues ** 2 * hidden_dim * 8 > TRIMUL_BLOCK_BYTES)
+
+  @staticmethod
+  def slabs(config, pair):
+    """Whether a blocked einsum's epilogue, given the pair as residual, runs in row slabs into it in place."""
+    return (TriangleMultiplication.blocks(config, pair.shape[0], pair.shape[-1]) and not hk.running_init()
+            and pair.size * pair.dtype.itemsize > TRIMUL_SLAB_PAIR_BYTES * device_scale())
+
+  def __call__(self, act, mask, residual=None):
+    """Applies Module.
+
+    Args:
+      act: The activation.
+      mask: The mask.
+      residual: added to the output when given.
+
+    Returns:
+      Outputs, should have same shape/type as output_act
+    """
+    mask = mask[None, ...]
+    num_channels = act.shape[-1]
+    # the token count, read BEFORE `act` is reassigned by the input LayerNorm
+    num_residues = act.shape[-2]
+    # the a/b projections, the einsum and center_norm all run at hidden_dim;
+    # only output_projection and the gate come back to num_channels
+    hidden_dim = (num_channels if self.config.hidden_dim is None
+                  else self.config.hidden_dim)
+    equation = {
+        'ikc,jkc->ijc': 'cik,cjk->cij',
+        'kjc,kic->ijc': 'ckj,cki->cij',
+    }[self.config.equation]
+
+    blocked = self.blocks(self.config, num_residues, num_channels)
+    # helixfold3's six Linears carry trained biases (model_config.TRIMUL_BIAS),
+    # which the fused kernels take; the GLU kernels do not: those run the plain einsum
+    biased = self.global_config.model in model_config.TRIMUL_BIAS
+    if TRIMUL_KERNELS is not None and not blocked:
+      kernels = TRIMUL_KERNELS(act.dtype, num_channels, hidden_dim)
+      if kernels is not None:
+        return self._fused(act, mask[0], hidden_dim, equation, kernels, residual, biased)
+
+    # A pre-Ampere card (T4, V100) can launch none of the fused kernels this
+    # module reaches for -- tokamax's GLU included -- so on `volta` the input
+    # LayerNorm and the GLU go to colabfold-legacy-kernels instead (Milot
+    # Mirdita's sm_70/sm_75 CUDA kernels). Both fall back silently: the
+    # LayerNorm hook and `gated_dual_proj` return the haiku path / None rather
+    # than a wrong answer when the kernel is missing or the shape is outside
+    # what it instantiates.
+    # 'auto' keeps the historical behaviour: the GLU follows the attention
+    # backend. Anything else names the GLU kernel outright -- see
+    # model_config.GlobalConfig.glu_kernel for why an A100 wants them apart.
+    glu = self.global_config.glu_kernel
+    if glu == 'auto':
+      glu = self.global_config.flash_attention_implementation
+    volta_ops = glu == 'volta'
+    # The same two kernels exist for Ampere and newer, in Milot Mirdita's other
+    # package (colabfold-kernels, Pallas). Only the GLU is taken: his fused
+    # LayerNorm measures 0.164 ms against XLA's 0.166 on an A10, while the GLU
+    # is 0.512 against tokamax's 0.872 and XLA's 0.941.
+    pallas_ops = glu == 'pallas'
+
+    left_norm = hm.LayerNorm(name='left_norm_input', kernel='volta' if volta_ops else None)
+    pair = act
+    act = left_norm(act)   # the fused LayerNorm pays on a T4 only: 0.164 vs XLA's 0.166 here
+    input_act = act
+
+    if blocked:
+      act = self._blocked_einsum(act, mask, hidden_dim, equation, biased)
+    else:
+      act = self._einsum(act, mask, hidden_dim, equation,
+                         glu_ops='volta' if volta_ops else
+                         'pallas' if pallas_ops else None, biased=biased)
+    # rf3 divides by the sequence length here, and it is NOT a no-op in front of
+    # a LayerNorm because of the norm's epsilon -- see
+    # model_config.TRIANGLE_MUL_DIVIDE_BY_LENGTH for the measurement.
+    if self.global_config.model in model_config.TRIANGLE_MUL_DIVIDE_BY_LENGTH:
+      act = act / _real_length(mask[0], num_residues).astype(act.dtype)
+    center_norm = hm.LayerNorm(name='center_norm', axis=0, param_axis=0)
+    output_projection = hm.Linear(
+        num_channels,
+        use_bias=biased,
+        initializer=self.global_config.final_init,
+        name='output_projection',
+    )
+    gating_linear = hm.Linear(
+        num_channels,
+        name='gating_linear',
+        use_bias=biased,
+        bias_init=1.0,
+        initializer=self.global_config.final_init,
+    )
+
+    def epilogue(tri, normed):
+      out = output_projection(jnp.transpose(center_norm(tri).astype(normed.dtype), (1, 2, 0)))
+      return out * jax.nn.sigmoid(gating_linear(normed))
+
+    if residual is pair and self.slabs(self.config, pair):
+      return self._slab_epilogue(act, pair, lambda t, x: epilogue(t, left_norm(x)))
+    act = epilogue(act, input_act)
+    return act if residual is None else residual + act
+
+  def _slab_epilogue(self, tri, pair, epilogue):
+    """pair + epilogue(tri rows, pair rows), a slab of rows at a time into the pair in place.
+
+    The input LayerNorm is redone per slab for the gate, so neither it nor the projection or the gate is ever
+    whole; each slab reads only the rows it writes, and tri was finished before the first.
+    """
+    n, c = pair.shape[0], tri.shape[0]
+    rows = max(64, TRIMUL_SLAB_BYTES // (n * c * 4) // 64 * 64)
+
+    def run(buf, i0, m):
+      t = jax.lax.dynamic_slice_in_dim(tri, i0, m, 1)
+      x = jax.lax.dynamic_slice_in_dim(buf, i0, m, 0)
+      return jax.lax.dynamic_update_slice_in_dim(buf, x + epilogue(t, x), i0, 0)
+
+    whole, rest = divmod(n, rows)
+    buf = hk.fori_loop(0, whole, lambda i, b: run(b, i * rows, rows), pair)
+    return buf if not rest else run(buf, whole * rows, rest)
+
+  @hk.transparent
+  def _fused(self, act, mask, hidden_dim, equation, kernels, residual, biased=False):
+    """Kernels around the einsum that each run left_norm_input, so the normed pair is never written."""
+    contract, epilogue = kernels
+    n, c = act.shape[0], act.shape[-1]
+    in_ln = _layer_norm_params('left_norm_input', c)
+    wp, bp = hm.haiku_linear_get_params(act, num_output=hidden_dim * 2, use_bias=biased, name='projection')
+    wg, bg = hm.haiku_linear_get_params(act, num_output=hidden_dim * 2, use_bias=biased, bias_init=1.0,
+                                        initializer=self.global_config.final_init, name='gate')
+    # output channel 2c is a[c] and 2c + 1 is b[c]: regroup as [a | b], the kernel's split; no bias is zeros
+    ab = lambda w: jnp.concatenate([w[..., 0::2], w[..., 1::2]], axis=-1).astype(act.dtype)
+    zero = jnp.zeros((hidden_dim * 2,), act.dtype)
+    bp, bg = (zero, zero) if bp is None else (ab(bp), ab(bg))
+    tri = contract(act, *in_ln, ab(wp), bp, ab(wg), bg, mask.astype(act.dtype), equation=equation)
+    if self.global_config.model in model_config.TRIANGLE_MUL_DIVIDE_BY_LENGTH:
+      tri = tri / _real_length(mask, n).astype(tri.dtype)  # rf3, as in __call__
+
+    final = self.global_config.final_init
+    ln = _layer_norm_params('center_norm', hidden_dim)
+    wo, bo = hm.haiku_linear_get_params(jax.ShapeDtypeStruct((hidden_dim,), act.dtype), num_output=c,
+                                        use_bias=biased, initializer=final, name='output_projection')
+    wgo, bgo = hm.haiku_linear_get_params(act, num_output=c, use_bias=biased, bias_init=1.0, initializer=final,
+                                          name='gating_linear')
+    zero = jnp.zeros((c,), act.dtype)
+    bo, bgo = (zero, zero) if bo is None else (bo.astype(act.dtype), bgo.astype(act.dtype))
+    keep = [mask.astype(act.dtype).reshape(-1)] if PAD_KEEP else []
+    out = epilogue(tri.reshape(hidden_dim, -1), act.reshape(-1, c), *in_ln, *ln, wo.astype(act.dtype), bo,
+                   wgo.astype(act.dtype), bgo, *keep, add_input=residual is act).reshape(act.shape)
+    return out if residual is None or residual is act else residual + out
+
+  @hk.transparent
+  def _blocked_einsum(self, act, mask, hidden_dim, equation, biased=False):
+    """The einsum one channel block at a time, so the [N, N, 2 * hidden] gated projection never exists whole."""
+    cb = self.config.channel_block
+    nb = hidden_dim // cb
+    n = act.shape[0]
+    weights_projection, bias_projection = hm.haiku_linear_get_params(
+        act, num_output=hidden_dim * 2, use_bias=biased, name='projection')
+    weights_gate, bias_gate = hm.haiku_linear_get_params(
+        act, num_output=hidden_dim * 2, use_bias=biased, bias_init=1.0,
+        initializer=self.global_config.final_init, name='gate')
+    # output channel 2c is a[c] and 2c + 1 is b[c]; regroup as [nb, K, cb] per operand
+    blocks = lambda w: w.reshape(w.shape[0], nb, cb).transpose(1, 0, 2)
+    wa, wb = blocks(weights_projection[:, 0::2]), blocks(weights_projection[:, 1::2])
+    ga, gb = blocks(weights_gate[:, 0::2]), blocks(weights_gate[:, 1::2])
+    if biased:
+      bblocks = lambda v: v.reshape(nb, cb)
+      ba, bb = bblocks(bias_projection[0::2]), bblocks(bias_projection[1::2])
+      gba, gbb = bblocks(bias_gate[0::2]), bblocks(bias_gate[1::2])
+    else:
+      ba = bb = gba = gbb = jnp.zeros((nb, cb), act.dtype)
+
+    def gated(w, g, bw, bg):
+      return ((jnp.einsum('ijk,kc->cij', act, w.astype(act.dtype)) + bw.astype(act.dtype)[:, None, None])
+              * jax.nn.sigmoid(jnp.einsum('ijk,kc->cij', act, g.astype(act.dtype))
+                               + bg.astype(act.dtype)[:, None, None]) * mask)
+
+    def body(i, out):
+      block = jnp.einsum(equation, gated(wa[i], ga[i], ba[i], gba[i]), gated(wb[i], gb[i], bb[i], gbb[i]),
+                         preferred_element_type=_wide(act.dtype))
+      return jax.lax.dynamic_update_slice(out, block.astype(out.dtype), (i * cb, 0, 0))
+
+    # zeros read from act, so XLA cannot allocate them before act exists (it hoisted the next module's beside these)
+    zero = jnp.broadcast_to((act[0, 0, 0] * 0).astype(_wide(act.dtype) or act.dtype), (hidden_dim, n, n))
+    return jax.lax.fori_loop(0, nb, body, zero)
+
+  @hk.transparent
+  def _einsum(self, act, mask, hidden_dim, equation, glu_ops=None, biased=False):
+    if self.config.use_glu_kernel and not biased:
+      weights_projection, _ = hm.haiku_linear_get_params(
+          act, num_output=hidden_dim * 2, name='projection'
+      )
+      weights_gate, _ = hm.haiku_linear_get_params(
+          act,
+          num_output=hidden_dim * 2,
+          initializer=self.global_config.final_init,
+          name='gate',
+      )
+      ab = None
+      if glu_ops == 'volta':
+        from alphafold3.model.components import volta_attn  # pylint: disable=g-import-not-at-top
+
+        # Already channel-major and already split into the a/b the einsum wants.
+        ab = volta_attn.gated_dual_proj(
+            act, weights_projection, weights_gate, mask[0]
+        )
+      elif glu_ops == 'pallas':
+        from alphafold3.model.components import pallas_attn  # pylint: disable=g-import-not-at-top
+
+        ab = pallas_attn.gated_dual_proj(
+            act, weights_projection, weights_gate, mask[0]
+        )
+      if ab is not None:
+        return jnp.einsum(equation, *ab, preferred_element_type=_wide(act.dtype))
+      weights_glu = jnp.stack([weights_gate, weights_projection], axis=1)
+
+      projection = tokamax.gated_linear_unit(
+          act, weights_glu, activation=jax.nn.sigmoid
+      )
+      projection = jnp.transpose(projection, (2, 0, 1))
+      projection *= mask
+    else:
+      projection = hm.Linear(hidden_dim * 2, use_bias=biased, name='projection')(act)
+      projection = jnp.transpose(projection, (2, 0, 1))
+      projection *= mask
+
+      gate = hm.Linear(
+          hidden_dim * 2,
+          name='gate',
+          use_bias=biased,
+          bias_init=1.0,
+          initializer=self.global_config.final_init,
+      )(act)
+      gate = jnp.transpose(gate, (2, 0, 1))
+      projection *= jax.nn.sigmoid(gate)
+
+    projection = projection.reshape(hidden_dim, 2, *projection.shape[1:])
+    a, b = jnp.split(projection, 2, axis=1)
+    a, b = jnp.squeeze(a, axis=1), jnp.squeeze(b, axis=1)
+    return jnp.einsum(equation, a, b, preferred_element_type=_wide(act.dtype))
+
+
+class OuterProductMean(hk.Module):
+  """Computed mean outer product."""
+
+  class Config(base_config.BaseConfig):
+    chunk_size: int = 128
+    num_outer_channel: int = 32
+
+  def __init__(
+      self,
+      config: Config,
+      global_config: model_config.GlobalConfig,
+      num_output_channel,
+      *,
+      name,
+  ):
+    super().__init__(name=name)
+    self.global_config = global_config
+    self.config = config
+    self.num_output_channel = num_output_channel
+
+  def __call__(self, act, mask):
+    mask = mask[..., None]
+    layer_norm_input = hm.LayerNorm(name='layer_norm_input')
+    msa = act
+    act = None if _msa_row_chunks(msa) else layer_norm_input(msa)
+
+    if self.global_config.model == 'chai1':
+      return self._chai_grouped(layer_norm_input(msa), mask)
+
+    # RF3's proj_left/proj_right are nn.Linear, i.e. WITH bias, and both are trained
+    # away from their zero init (|b| 0.080 / 0.108). AF3's are bias-free and have no
+    # slot for them. Dropping them is not a constant offset either: the outer product
+    # is bilinear, so a dropped bias loses the two cross terms b_l (x) W_r x_m and
+    # W_l x_l (x) b_r as well. It held the MSA module's outer product to corr 0.924
+    # against native with otherwise near-exact inputs.
+    lr_bias = self.global_config.model in model_config.OPM_LR_BIAS
+
+    left_projection = hm.Linear(
+        self.config.num_outer_channel,
+        initializer='linear',
+        use_bias=lr_bias,
+        name='left_projection',
+    )
+    right_projection = hm.Linear(
+        self.config.num_outer_channel,
+        initializer='linear',
+        use_bias=lr_bias,
+        name='right_projection',
+    )
+    if act is None:
+      # the normed MSA is never whole: LayerNorm and both projections a chunk of MSA rows at a time
+      def project(x, m):
+        x = layer_norm_input(x)
+        return m * left_projection(x), m * right_projection(x)
+      left_act, right_act = mapping.sharded_apply(project, _msa_row_chunks(msa))(msa, mask)
+      act = msa
+    else:
+      left_act = mask * left_projection(act)
+      right_act = mask * right_projection(act)
+
+    if self.global_config.final_init == 'zeros':
+      w_init = hk.initializers.Constant(0.0)
+    else:
+      w_init = hk.initializers.VarianceScaling(scale=2.0, mode='fan_in')
+
+    output_w = hk.get_parameter(
+        'output_w',
+        shape=(
+            self.config.num_outer_channel,
+            self.config.num_outer_channel,
+            self.num_output_channel,
+        ),
+        dtype=act.dtype,
+        init=w_init,
+    )
+    output_b = hk.get_parameter(
+        'output_b',
+        shape=(self.num_output_channel,),
+        dtype=act.dtype,
+        init=hk.initializers.Constant(0.0),
+    )
+
+    # boltz2 and ESMFold2's EXPERIMENTAL line both divide BEFORE the output
+    # projection, so their bias must not be added inside the chunk -- see
+    # model_config.OPM_BIAS_AFTER_NORM for the algebra and for why ESMFold2's
+    # two release lines disagree about it.
+    bias_after_norm = (
+        self.global_config.model in model_config.OPM_BIAS_AFTER_NORM)
+    if act.dtype == jnp.float16:
+      return self._float16_mean(left_act, right_act, output_w, output_b, mask,
+                                bias_after_norm)
+
+    def compute_chunk(left_act):
+      # Make sure that the 'b' dimension is the most minor batch like dimension
+      # so it will be treated as the real batch by XLA (both during the forward
+      # and the backward pass)
+      out = jnp.einsum('abc,ade,cef->bdf', left_act, right_act, output_w)
+      return out if bias_after_norm else out + output_b
+
+    act = mapping.inference_subbatch(
+        compute_chunk,
+        self.config.chunk_size,
+        batched_args=[left_act],
+        nonbatched_args=[],
+        input_subbatch_dim=1,
+        output_subbatch_dim=0,
+    )
+
+    norm = jnp.einsum('abc,adc->bdc', mask, mask)
+    if bias_after_norm:
+      # boltz2: divide by the PAIRWISE count clamped at 1, THEN add the output
+      # bias. The count is AF3's -- boltz builds the pairwise mask first
+      # (`mask[:, :, None, :] * mask[:, :, :, None]`) and only then sums over
+      # rows, so `mask.sum(1)` in its source is already a pairwise count and
+      # NOT a per-token row count. Reading it as per-token and normalising that
+      # way made a non-uniform mask WORSE (0.996 -> 0.968) while leaving the
+      # uniform case exact -- which is exactly why the non-uniform case is in
+      # the gate. See model_config.OPM_ROW_COUNT_NORM.
+      return act / jnp.maximum(norm, 1.0) + output_b
+    if self.global_config.model in model_config.CLAMPED_OPM_NORM:
+      # ESMFold2 clamps the pair count at 1 instead of adding AF3's 1e-3. The
+      # two agree to 1/(1 + eps/n), which is 3.3e-04 at depth 3 and 1e-03 at
+      # DEPTH 1 -- and depth 1 is where ESMFold2 normally runs, so this is a
+      # systematic 0.1% scale on the entire OPM contribution rather than noise.
+      return act / jnp.maximum(norm, 1.0)
+    epsilon = 1e-3
+    return act / (epsilon + norm)
+
+  def _float16_mean(self, left_act, right_act, output_w, output_b, mask,
+                    bias_after_norm):
+    """The mean with each row pre-divided, so its float16 sum stays in range."""
+    ones = mask.astype(jnp.float32)
+    norm = jnp.einsum('abc,adc->bdc', ones, ones)
+    if bias_after_norm or self.global_config.model in model_config.CLAMPED_OPM_NORM:
+      denom = jnp.maximum(norm, 1.0)
+    else:
+      denom = 1e-3 + norm
+    rows = jnp.maximum(jnp.max(norm), 1.0)
+    dtype = left_act.dtype
+    act = mapping.inference_subbatch(
+        lambda left: jnp.einsum('abc,ade,cef->bdf', left, right_act, output_w),
+        self.config.chunk_size,
+        batched_args=[left_act * (1.0 / rows).astype(dtype)],
+        nonbatched_args=[],
+        input_subbatch_dim=1,
+        output_subbatch_dim=0,
+    )
+    # a pair with no rows has act 0 and a 1e-3 denominator: keep the ratio finite
+    ratio = jnp.minimum(rows / denom, jnp.finfo(dtype).max / 2).astype(dtype)
+    act = act * ratio
+    if bias_after_norm:
+      return act + output_b
+    return act + output_b * (1.0 / denom).astype(dtype)
+
+  @hk.transparent
+  def _chai_grouped(self, act, mask):
+    """chai-1's grouped outer product mean.
+
+    AF3 projects the MSA to `num_outer_channel` on each side and takes one
+    C x C outer product. chai projects to G GROUPS of K channels and takes the
+    outer product WITHIN each group: its `weight_ab (2, G, K, c_m)` einsums
+    (`abc,defc->abdef` per side, then `abcde,afcdg->cegabf`) contract only the
+    MSA-depth axis and BROADCAST the group index, giving G*K*K channels where
+    AF3's single group gives K*K. AF3 is the G = 1 case. Here G == K ==
+    num_outer_channel (chai uses 8 and 8).
+
+    Two further conventions, both of which would pass any shape check:
+      * there is NO mean. The depth axis is summed and never divided -- not by
+        the row count, not by the pair count (AF3 divides by the pair count).
+      * the LayerNorm over the product channels, which is what absorbs that
+        missing scale, uses epsilon 0.1 rather than the 1e-5 the rest of the
+        graph uses.
+    Both were read off the trace.
+    """
+    g = k = self.config.num_outer_channel
+
+    def project(name):
+      # one Linear to g*k, then split the group axis -- keeps AF3's own param
+      # names (a name_scope here would land the weights under `~_chai_grouped`,
+      # since haiku prefixes anything created outside __call__)
+      proj = hm.Linear(g * k, initializer='linear', use_bias=False, name=name)(act)
+      return mask[..., None] * proj.reshape(proj.shape[:-1] + (g, k))
+
+    left_act = project('left_projection')
+    right_act = project('right_projection')
+
+    if self.global_config.final_init == 'zeros':
+      w_init = hk.initializers.Constant(0.0)
+    else:
+      w_init = hk.initializers.VarianceScaling(scale=2.0, mode='fan_in')
+    output_w = hk.get_parameter(
+        'output_w', shape=(g, k, k, self.num_output_channel), dtype=act.dtype,
+        init=w_init)
+    output_b = hk.get_parameter(
+        'output_b', shape=(self.num_output_channel,), dtype=act.dtype,
+        init=hk.initializers.Constant(0.0))
+
+    def compute_chunk(left_act):
+      # contract the MSA-depth axis only; the group axis is shared, not summed
+      prod = jnp.einsum('sigk,sjgl->ijgkl', left_act, right_act)
+      return prod.reshape(prod.shape[0], prod.shape[1], g * k * k)
+
+    prod = mapping.inference_subbatch(
+        compute_chunk,
+        self.config.chunk_size,
+        batched_args=[left_act],
+        nonbatched_args=[],
+        input_subbatch_dim=1,
+        output_subbatch_dim=0,
+    )
+    prod = hm.LayerNorm(name='product_norm', eps=0.1)(prod)
+    return jnp.einsum('ijn,nf->ijf', prod,
+                      output_w.reshape(g * k * k, self.num_output_channel)) + output_b
+
+
+class PairFormerIteration(hk.Module):
+  """Single Iteration of Pair Former."""
+
+  class Config(base_config.BaseConfig):
+    """Config for PairFormerIteration."""
+
+    num_layer: int
+    pair_attention: GridSelfAttention.Config = base_config.autocreate()
+    pair_transition: TransitionBlock.Config = base_config.autocreate()
+    single_attention: diffusion_transformer.SelfAttentionConfig | None = None
+    single_transition: TransitionBlock.Config | None = None
+    triangle_multiplication_incoming: TriangleMultiplication.Config = (
+        base_config.autocreate(equation='kjc,kic->ijc')
+    )
+    triangle_multiplication_outgoing: TriangleMultiplication.Config = (
+        base_config.autocreate(equation='ikc,jkc->ijc')
+    )
+    shard_transition_blocks: bool = True
+
+  def __init__(
+      self,
+      config: Config,
+      global_config: model_config.GlobalConfig,
+      with_single=False,
+      with_pair_attention=True,
+      *,
+      name,
+  ):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = global_config
+    self.with_single = with_single
+    # ESMFold2's PairUpdateBlock is tri_mul_out, tri_mul_in, pair_transition and
+    # nothing else -- no triangle attention at all. The port expressed that by
+    # filling the attention weights with zeros, which reproduces the block
+    # exactly (the act_norm scale is zero, so the whole branch evaluates to zero
+    # and lands on a residual add) but pays for two full GridSelfAttentions per
+    # block to compute it. That is 24 or 48 blocks times every recycle, and
+    # triangle attention is the same order as the triangle multiplications that
+    # are actually wanted -- so it roughly doubled the trunk.
+    #
+    # NOT inferable from with_single: the template stacks are pair-only too and
+    # their attention is real.
+    self.with_pair_attention = with_pair_attention
+
+  def __call__(
+      self,
+      act,
+      pair_mask,
+      single_act=None,
+      seq_mask=None,
+      use_dropout=False,
+      extra_pair_bias=None,
+      keep_mask=None,
+  ):
+    """Build a single iteration of the pair former.
+
+    Args:
+      act: [num_res, num_res, num_channel] Input pairwise activations.
+      pair_mask: [num_res, num_res] padding mask.
+      single_act: [num_res, single_channel] Single Input activations, optional
+      seq_mask: [num_res] Sequence Mask, optional.
+      use_dropout: traced flag enabling the SI's pair-stack dropout (0.25). Used
+        for DESIGN as a stochastic regulariser; default False = exact inference.
+      keep_mask: [num_res, num_res] padding-only mask for the PAD_KEEP kernels'
+        skipped rows, where `pair_mask` masks more than padding (helixfold3's
+        same-chain template stack: cross-chain pairs still get every update).
+
+    Returns:
+      [num_res, num_res, num_channel] tensor of activations.
+    """
+
+    num_residues = act.shape[0]
+
+    # chai-1's PairformerBlock is PARALLEL on both tracks: every pair update reads
+    # the pair rep ENTERING the block and their results are summed into it, and the
+    # single attention and single transition both read the single entering the block
+    # (verified in chai's traced graph -- z20/input0 are the operand of all five).
+    # AF3 instead threads each update through the running activation. `parallel`
+    # therefore holds the block input and the deltas accumulate against it.
+    parallel = self.global_config.model == 'chai1'
+    pair_in = act
+    pair_delta = jnp.zeros_like(act) if parallel else None
+
+    def add_pair(delta):
+      nonlocal act, pair_delta
+      if parallel:
+        pair_delta = pair_delta + delta
+      else:
+        act = act + delta
+
+    # SI Algorithm 17: rowwise 0.25 on the two triangle multiplications and the
+    # starting-node attention, columnwise 0.25 on the ending-node attention (the
+    # transpose=True one). No dropout on the transition. off => bit-identical.
+    for direction in ('outgoing', 'incoming'):
+      tri_mul = TriangleMultiplication(
+          getattr(self.config, f'triangle_multiplication_{direction}'),
+          self.global_config,
+          name=f'triangle_multiplication_{direction}',
+      )
+      if not parallel and use_dropout is False:
+        # dropout statically off is the identity, so a fused kernel can add the residual itself;
+        # its key is still drawn so later draws do not shift
+        hk.next_rng_key()
+        act = tri_mul(act, pair_mask, residual=act)
+      else:
+        add_pair(_pair_dropout(tri_mul(act if not parallel else pair_in, pair_mask), use_dropout))
+
+    _attn = lambda nm, tr, **kw: GridSelfAttention(
+        self.config.pair_attention,
+        self.global_config,
+        name=nm,
+        transpose=tr,
+    )(act if not parallel else pair_in, pair_mask, keep_mask=keep_mask, **kw)
+
+    if not self.with_pair_attention:
+      pass
+    elif self.config.pair_attention.dual_output:
+      # chai's confidence triangle attention is ONE module over both directions
+      # whose output projection mixes them, then splits into a half that is kept
+      # and a half that is transposed. Each direction therefore contributes to
+      # both halves; we sum within each half and transpose once, which is chai's
+      # `out0 + permute(out1)` (nodes 856/861/862).
+      kept1, xpose1 = _attn('pair_attention1', False)
+      kept2, xpose2 = _attn('pair_attention2', True)
+      add_pair(_pair_dropout(kept1 + kept2, use_dropout))
+      # NOT transposed. chai's tail reads
+      #     856 dropout(out0)
+      #     858 permute(out1) -> 859 dropout -> 861 permute
+      #     862 add(856, 861)
+      # and those two permutes CANCEL -- they exist only so the dropout lands
+      # columnwise on that half. At inference dropout is identity, so chai adds
+      # out1 in its original orientation. Transposing it here cost pae 0.983
+      # against 0.99994, while pde barely noticed (0.9974) because that head
+      # symmetrises: the error was purely antisymmetric, which is what pointed
+      # at an orientation term in the first place.
+      add_pair(_pair_dropout(xpose1 + xpose2, use_dropout, columnwise=True))
+    elif not parallel and use_dropout is False:
+      # as the triangle multiplications: the residual can go into the output projection's kernel
+      for nm, tr in (('pair_attention1', False), ('pair_attention2', True)):
+        hk.next_rng_key()
+        act = _attn(nm, tr, residual=act)
+    else:
+      add_pair(_pair_dropout(_attn('pair_attention1', False), use_dropout))
+      add_pair(_pair_dropout(
+          _attn('pair_attention2', True), use_dropout, columnwise=True))
+
+    transition_block = unsharded = TransitionBlock(
+        self.config.pair_transition, self.global_config, name='pair_transition'
+    )
+    if self.config.shard_transition_blocks:
+      transition_block = mapping.sharded_apply(
+          transition_block,
+          get_shard_size(
+              num_residues, self.global_config.pair_transition_shard_spec
+          ),
+      )
+    # `_mask_trans`, the OF3 lineage only -- see model_config.MASK_TRANSITIONS.
+    _mt = self.global_config.model in model_config.MASK_TRANSITIONS
+    # The mask is applied OUTSIDE the sharded call: `sharded_apply` shards its
+    # arguments along axis 0, and handing it a (N, N) mask beside an (N, N, C)
+    # activation is one more thing to get right for no gain -- masking the
+    # output is pointwise, so the two are identical.
+    if not parallel and TransitionBlock.glu_kernel(self.config.pair_transition, act.dtype, act.shape[-1]):
+      # the residual add (and OpenFold3's mask) can then happen inside a fused kernel; no sharding, it never holds the hidden
+      # with PAD_KEEP every model's pair mask goes in: its padded rows then skip the transition, real rows are as before
+      act = unsharded(act, mask=pair_mask if _mt else (
+          (pair_mask if keep_mask is None else keep_mask) if PAD_KEEP else None), residual=act)
+    else:
+      _trans = transition_block(act if not parallel else pair_in)
+      if _mt:
+        _trans = _trans * pair_mask[..., None].astype(_trans.dtype)
+      add_pair(_trans)
+    if parallel:
+      act = pair_in + pair_delta
+
+    if self.with_single:
+      assert self.config.single_attention is not None
+      # chai reads the pair rep entering the block here, not the updated one
+      pair_logits = hm.Linear(
+          self.config.single_attention.num_head,
+          name='single_pair_logits_projection',
+      )(hm.LayerNorm(name='single_pair_logits_norm')(pair_in if parallel else act))
+
+      pair_logits = jnp.transpose(pair_logits, [2, 0, 1])
+
+      # OpenDDE's structural-token refiner adds a precomputed pair attention bias
+      # (from the token-expander's structural relationships) to the single-attention
+      # logits, broadcast over heads. None for every other pairformer use.
+      if extra_pair_bias is not None:
+        pair_logits = pair_logits + extra_pair_bias[None].astype(pair_logits.dtype)
+
+      single_in = single_act
+      attn = diffusion_transformer.self_attention(
+          single_act,
+          seq_mask,
+          pair_logits=pair_logits,
+          config=self.config.single_attention,
+          global_config=self.global_config,
+          name='single_attention_',
+          gate_bias=1.0 if parallel else 0.0,
+      )
+      # chai masks the attention residual, so padded rows stay exactly zero
+      if parallel and seq_mask is not None:
+        attn = attn * seq_mask[:, None].astype(attn.dtype)
+      single_act = single_act + attn
+
+      single_act = single_act + TransitionBlock(
+          self.config.single_transition,
+          self.global_config,
+          name='single_transition',
+      )(single_in if parallel else single_act, broadcast_dim=None,
+        mask=(seq_mask if (seq_mask is not None and self.global_config.model
+                           in model_config.MASK_TRANSITIONS) else None))
+
+      return act, single_act
+    else:
+      return act
+
+
+class EvoformerIteration(hk.Module):
+  """Single Iteration of Evoformer Main Stack."""
+
+  class Config(base_config.BaseConfig):
+    """Configuration for EvoformerIteration."""
+
+    num_layer: int = 4
+    msa_attention: MSAAttention.Config = base_config.autocreate()
+    outer_product_mean: OuterProductMean.Config = base_config.autocreate()
+    msa_transition: TransitionBlock.Config = base_config.autocreate()
+    pair_attention: GridSelfAttention.Config = base_config.autocreate()
+    pair_transition: TransitionBlock.Config = base_config.autocreate()
+    triangle_multiplication_incoming: TriangleMultiplication.Config = (
+        base_config.autocreate(equation='kjc,kic->ijc')
+    )
+    triangle_multiplication_outgoing: TriangleMultiplication.Config = (
+        base_config.autocreate(equation='ikc,jkc->ijc')
+    )
+    shard_transition_blocks: bool = True
+
+  def __init__(
+      self,
+      config: Config,
+      global_config: model_config.GlobalConfig,
+      name='evoformer_iteration',
+      with_pair_attention=True,
+  ):
+    super().__init__(name=name)
+    self.config = config
+    self.global_config = global_config
+    # As in PairFormerIteration: ESMFold2's MSA encoder block has no triangle
+    # attention, and the port expressed that with zero weights -- which still
+    # costs two GridSelfAttentions per block to compute a guaranteed zero.
+    self.with_pair_attention = with_pair_attention
+
+  def __call__(self, activations, masks, use_dropout=False):
+
+    msa_act, pair_act = activations['msa'], activations['pair']
+
+    num_residues = pair_act.shape[0]
+
+    msa_mask, pair_mask = masks['msa'], masks['pair']
+
+    # `_mask_trans`, the OF3 lineage only -- see model_config.MASK_TRANSITIONS.
+    _mask_trans = self.global_config.model in model_config.MASK_TRANSITIONS
+
+    def _opm():
+      return OuterProductMean(
+          config=self.config.outer_product_mean,
+          global_config=self.global_config,
+          num_output_channel=int(pair_act.shape[-1]),
+          name='outer_product_mean',
+      )(msa_act, msa_mask)
+
+    def _msa_update(m):
+      rows = _msa_row_chunks(m)
+      if rows and use_dropout is False and self.global_config.model != 'chai1':
+        # dropout statically off is the identity; its key is still drawn so later draws do not shift
+        hk.next_rng_key()
+        transition = TransitionBlock(self.config.msa_transition, self.global_config, name='msa_transition')
+        return MSAAttention(self.config.msa_attention, self.global_config, name='msa_attention1')(
+            m, msa_mask, pair_act, rows=rows,
+            then=lambda x, mk: x + transition(x, mask=mk if _mask_trans else None))
+      # MSAPairWeightedAveraging: DropoutRowwise 0.15 over the MSA tensor (s,r,c),
+      # sharing the mask across sequences (axis 0) -- AF3 SI Alg 8, OF3 msa_dropout.
+      pwa = _pair_dropout(MSAAttention(
+          self.config.msa_attention, self.global_config, name='msa_attention1'
+      )(m, msa_mask, pair_act=pair_act, pair_mask=pair_mask),
+                          use_dropout, rate=0.15)
+      if self.global_config.model == 'chai1':
+        # chai's transition reads the same MSA as its weighted averaging, in parallel (msa_repr + transition(msa_repr)
+        # + cat(pwa chunks) in the trunk trace); in sequence its trunk read corr 0.994 against chai-lab's at pass 0
+        return m + pwa + TransitionBlock(
+            self.config.msa_transition, self.global_config, name='msa_transition')(m)
+      m = m + pwa
+      m = m + TransitionBlock(
+          self.config.msa_transition, self.global_config, name='msa_transition'
+      )(m, mask=msa_mask if _mask_trans else None)
+      return m
+
+    # OpenDDE's MSABlock updates the MSA FIRST, then feeds the *updated* MSA to the
+    # OuterProductMean (opendde/model/modules/pairformer.py MSABlock.forward). AF3
+    # runs the OPM on the pre-update MSA. Order matters and compounds over blocks;
+    # gate on opendde so AF3/OF3/IF2 keep their original ordering byte-for-byte.
+    # Boltz-2's MSALayer uses the same update-then-OPM order, and so does
+    # ESMFold2's EXPERIMENTAL line (but not its released one, which is why
+    # model_config.MSA_UPDATE_BEFORE_OPM names the members instead of this
+    # branch carrying a tuple: an inline tuple is what let the experimental
+    # releases sit silently in the wrong branch).
+    # protenix mini/tiny have no msa_stack at all -- OPM into the pair, and that
+    # is the entire MSA contribution. Building _msa_update for them creates 12
+    # parameters per block that the checkpoint cannot fill.
+    if self.global_config.model in model_config.NO_MSA_ROW_UPDATE:
+      pair_act += _opm()
+    elif self.global_config.model in model_config.MSA_UPDATE_BEFORE_OPM:
+      msa_act = _msa_update(msa_act)
+      pair_act += _opm()
+    else:
+      pair_act += _opm()
+      msa_act = _msa_update(msa_act)
+
+    # LOCALFOLD ORACLE TAP (env-gated, no effect unless AF3_ESM_TRUNK_TAPS):
+    # the pair after the MSA update and the outer product, before the pair
+    # track. Splits an EvoformerIteration in two so a whole-block residual can
+    # be attributed.
+    # 🔴 io_callback, NOT a direct record: inside layer_stack the value is a
+    # TRACER and numpy conversion raises TracerArrayConversionError.
+    import os as _os
+    if _os.environ.get("AF3_MSA_BLOCK_TAPS"):
+      import jax as _jax, numpy as _np
+      from .evoformer import ESM_TRUNK_TAPS as _T
+      def _rec(name):
+        def _f(v):
+          _T.setdefault(name, []).append(_np.asarray(v))
+          return None
+        return _f
+      for _n, _v in (("msa_block_post_opm", pair_act), ("msa_block_msa_act", msa_act)):
+        _jax.experimental.io_callback(_rec(_n), None, _v, ordered=False)
+
+    def _tri_mul_out(z):
+      return _pair_dropout(TriangleMultiplication(
+          self.config.triangle_multiplication_outgoing,
+          self.global_config,
+          name='triangle_multiplication_outgoing',
+      )(z, pair_mask), use_dropout)
+
+    def _tri_mul_in(z):
+      return _pair_dropout(TriangleMultiplication(
+          self.config.triangle_multiplication_incoming,
+          self.global_config,
+          name='triangle_multiplication_incoming',
+      )(z, pair_mask), use_dropout)
+
+    def _tri_mul_residual(direction, z):
+      # z + the update; slabs add it into z in place (dropout statically off is the identity; its key is still
+      # drawn so later draws do not shift)
+      config = getattr(self.config, f'triangle_multiplication_{direction}')
+      if use_dropout is False and TriangleMultiplication.slabs(config, z):
+        hk.next_rng_key()
+        return TriangleMultiplication(config, self.global_config,
+                                      name=f'triangle_multiplication_{direction}')(z, pair_mask, residual=z)
+      return z + (_tri_mul_out if direction == 'outgoing' else _tri_mul_in)(z)
+
+    def _attn1(z):
+      return _pair_dropout(GridSelfAttention(
+          self.config.pair_attention,
+          self.global_config,
+          name='pair_attention1',
+          transpose=False,
+      )(z, pair_mask), use_dropout)
+
+    def _attn2(z):
+      return _pair_dropout(GridSelfAttention(
+          self.config.pair_attention,
+          self.global_config,
+          name='pair_attention2',
+          transpose=True,
+      )(z, pair_mask), use_dropout, columnwise=True)
+
+    def _transition(z):
+      transition_block = TransitionBlock(
+          self.config.pair_transition, self.global_config, name='pair_transition'
+      )
+      if self.config.shard_transition_blocks:
+        transition_block = mapping.sharded_apply(
+            transition_block,
+            get_shard_size(
+                num_residues, self.global_config.pair_transition_shard_spec
+            ),
+        )
+      out = transition_block(z)          # mask OUTSIDE the sharded call
+      if _mask_trans:
+        out = out * pair_mask[..., None].astype(out.dtype)
+      return out
+
+    if self.global_config.model == 'chai1':
+      # chai's MSA block is PARALLEL in two stages, and its pair transition sits
+      # in the FIRST stage rather than last: the two triangle multiplications and
+      # the transition all read the same post-OPM z and are summed into it, then
+      # both attention directions read that result and are summed in turn. AF3
+      # instead threads all five updates sequentially, each reading the output of
+      # the one before. Same modules, same weights, different function -- and it
+      # only shows up in the assembled graph, because the trunk harness
+      # (cmp_trunk.py) hand-wires this block the parallel way and so agrees with
+      # chai while the graph does not. Matches the trunk trace verbatim
+      # (`z20 = token_pair_repr + (pair_repr13 + tri_attn_output2)`).
+      delta = _tri_mul_out(pair_act) + _tri_mul_in(pair_act) + _transition(pair_act)
+      pair_act = pair_act + delta
+      if self.with_pair_attention:
+        pair_act = pair_act + (_attn1(pair_act) + _attn2(pair_act))
+    else:
+      if use_dropout is False and TriangleMultiplication.slabs(self.config.triangle_multiplication_outgoing, pair_act):
+        # the MSA update reads this pair: finish it before the triangle multiplication overwrites the pair in place,
+        # or XLA copies the whole pair to keep it
+        msa_act, pair_act = jax.lax.optimization_barrier((msa_act, pair_act))
+      pair_act = _tri_mul_residual('outgoing', pair_act)
+      pair_act = _tri_mul_residual('incoming', pair_act)
+      if self.with_pair_attention:
+        pair_act += _attn1(pair_act)
+        pair_act += _attn2(pair_act)
+      pair_act += _transition(pair_act)
+
+    return {'msa': msa_act, 'pair': pair_act}

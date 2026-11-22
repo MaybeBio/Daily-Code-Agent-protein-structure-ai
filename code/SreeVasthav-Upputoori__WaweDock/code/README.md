@@ -3,6 +3,7 @@
 Open-source molecular docking workbench for Windows: protein preparation, ligand preparation,
 AutoDock Vina docking, interactive 3D visualisation and result analysis.
 Architecture and roadmap: [docs/ARCHITECTURE.md](https://github.com/SreeVasthav-Upputoori/WaweDock/blob/HEAD/docs/ARCHITECTURE.md).
+User instructions: [docs/help-guide.md](https://github.com/SreeVasthav-Upputoori/WaweDock/blob/HEAD/docs/help-guide.md).
 
 ## Start
 

@@ -1,0 +1,806 @@
+import type { System } from '../system';
+import type { ThermoRow } from '../types';
+import { THERMO_KEYWORDS } from '../types';
+import { StyleError } from '../force/types';
+import { totalVirial } from '../force/types';
+import { massOf } from '../atoms';
+import { generalBoxFromRestricted, rotateTensorToGeneral, type GeneralBox } from '../triclinic_general';
+import { checkCFormat, compileCFormat, type ValueKind } from '../cformat';
+import { libm } from '../libm';
+import { errorUrl } from '../formula';
+
+/*
+ * Thermodynamic output — docs.lammps.org/thermo_style.html and
+ * thermo_modify.html.
+ *
+ * "Style one prints a single line of thermodynamic info that is the
+ * equivalent of "thermo_style custom step temp epair emol etotal press"."
+ * "Style multi ... is the equivalent of "thermo_style custom etotal ke temp
+ * pe ebond eangle edihed eimp evdwl ecoul elong press"."
+ * "When you use a "thermo_style" command, all thermodynamic settings are
+ * restored to their default values, including those previously set by a
+ * thermo_modify command."
+ * "The kinetic energy of the system ke is inferred from the temperature of
+ * the system with 1/2 k_B T of energy for each degree of freedom."
+ * "The etail contribution is included in evdwl, epair, pe, and etotal".
+ * "enthalpy = enthalpy (etotal + press*vol)"; "econserve = pe + ke +
+ * ecouple". Extensive values (energies) are divided by the number of atoms
+ * when thermo_modify norm is yes ("norm = yes for unit style of lj, norm = no
+ * for unit style of real and metal"); compute and fix values follow their
+ * extensive flag; variables are never normalized.
+ * Default computes: "compute thermo_temp all temp", "compute thermo_press
+ * all pressure thermo_temp", "compute thermo_pe all pe".
+ * Restricted triclinic cell constants (Howto_triclinic.html):
+ *   a = lx, b^2 = ly^2 + xy^2, c^2 = lz^2 + xz^2 + yz^2,
+ *   cos(alpha) = (xy*xz + ly*yz)/(b*c), cos(beta) = xz/c, cos(gamma) = xy/b.
+ */
+
+export const THERMO_ONE = ['step', 'temp', 'epair', 'emol', 'etotal', 'press'];
+export const THERMO_MULTI = ['etotal', 'ke', 'temp', 'pe', 'ebond', 'eangle', 'edihed', 'eimp', 'evdwl', 'ecoul', 'elong', 'press'];
+
+/** Keywords that scale with the number of atoms (normalized with norm yes). */
+const EXTENSIVE = new Set([
+  'pe', 'ke', 'etotal', 'enthalpy', 'evdwl', 'ecoul', 'epair', 'ebond', 'eangle', 'edihed', 'eimp', 'emol',
+  'elong', 'etail', 'ecouple', 'econserve',
+]);
+
+const BUILTIN = new Set<string>([...THERMO_KEYWORDS, 'cpuuse', 'ecouple', 'econserve',
+  'avecx', 'avecy', 'avecz', 'bvecx', 'bvecy', 'bvecz', 'cvecx', 'cvecy', 'cvecz']);
+
+/** LAMMPS column names for the log header. */
+const HEADER: Record<string, string> = {
+  step: 'Step', elapsed: 'Elapsed', elaplong: 'Elaplong', dt: 'Dt', time: 'Time', cpu: 'CPU', tpcpu: 'T/CPU',
+  spcpu: 'S/CPU', cpuremain: 'CPULeft', part: 'Part', timeremain: 'TimeoutLeft', atoms: 'Atoms', temp: 'Temp',
+  press: 'Press', pe: 'PotEng', ke: 'KinEng', etotal: 'TotEng', enthalpy: 'Enthalpy', evdwl: 'E_vdwl',
+  ecoul: 'E_coul', epair: 'E_pair', ebond: 'E_bond', eangle: 'E_angle', edihed: 'E_dihed', eimp: 'E_impro',
+  emol: 'E_mol', elong: 'E_long', etail: 'E_tail', vol: 'Volume', density: 'Density', lx: 'Lx', ly: 'Ly', lz: 'Lz',
+  xlo: 'Xlo', xhi: 'Xhi', ylo: 'Ylo', yhi: 'Yhi', zlo: 'Zlo', zhi: 'Zhi', xy: 'Xy', xz: 'Xz', yz: 'Yz',
+  xlat: 'Xlat', ylat: 'Ylat', zlat: 'Zlat', bonds: 'Bonds', angles: 'Angles', dihedrals: 'Diheds', impropers: 'Impros',
+  pxx: 'Pxx', pyy: 'Pyy', pzz: 'Pzz', pxy: 'Pxy', pxz: 'Pxz', pyz: 'Pyz', fmax: 'Fmax', fnorm: 'Fnorm',
+  nbuild: 'Nbuild', ndanger: 'Ndanger', cella: 'Cella', cellb: 'Cellb', cellc: 'Cellc', cellalpha: 'CellAlpha',
+  cellbeta: 'CellBeta', cellgamma: 'CellGamma', ecouple: 'Ecouple', econserve: 'Econserve', cpuuse: 'CPUuse',
+};
+
+/** A c_ID, f_ID or v_name thermo keyword with up to two [i] indices (native's ArgInfo takes any name up to the brackets). */
+const parseField = (k: string): { kind: 'c' | 'f' | 'v'; id: string; idx: number[] } | null => {
+  const m = /^([cfv])_([^[\]]+)((?:\[\d+\]){0,2})$/.exec(k);
+  if (!m) return null;
+  return { kind: m[1] as 'c' | 'f' | 'v', id: m[2], idx: [...m[3].matchAll(/\[(\d+)\]/g)].map((x) => Number(x[1])) };
+};
+
+/** The thermo keywords that use the temperature, pressure or potential-energy compute (native Thermo::parse_fields). */
+const TEMP_KEYS = new Set(['temp', 'ke', 'etotal', 'enthalpy', 'econserve']);
+const PRESS_KEYS = new Set(['press', 'enthalpy', 'pxx', 'pyy', 'pzz', 'pxy', 'pxz', 'pyz']);
+const PE_KEYS = new Set(['pe', 'etotal', 'evdwl', 'ecoul', 'epair', 'ebond', 'eangle', 'edihed', 'eimp', 'emol', 'elong', 'etail', 'enthalpy', 'ecouple', 'econserve']);
+const CPU_KEYS = new Set(['cpu', 'tpcpu', 'spcpu', 'cpuuse', 'cpuremain']);
+
+export class Thermo {
+  style: 'one' | 'multi' | 'custom' | 'yaml' = 'one';
+  keywords: string[] = [...THERMO_ONE];
+  /** thermo N (0 = first and last step only) or thermo v_name. */
+  every = 0;
+  everyVar: string | null = null;
+  normUser: boolean | null = null;
+  tempId = 'thermo_temp';
+  pressId = 'thermo_press';
+  lost: 'error' | 'warn' | 'ignore' = 'error';
+  lostBond: 'error' | 'warn' | 'ignore' = 'error';
+  flush = false;
+  /** thermo_modify format: line / int / float / per column. */
+  formatLine: string | null = null;
+  formatInt: string | null = null;
+  formatFloat: string | null = null;
+  formatCol = new Map<number, string>();
+  /** thermo_modify colname: header text per column index (0-based). */
+  colname = new Map<number, string>();
+  /** thermo_modify colname auto: fix nvt/npt/nph and compute reduce columns get their generated names. */
+  autoNames = false;
+  lineStyle: 'one' | 'multi' | 'yaml' = 'one';
+  /** thermo_modify triclinic/general: edge vectors and the pressure tensor in the general triclinic frame. */
+  triclinicGeneral = false;
+  /** Last wall time / step for tpcpu, spcpu. */
+  private lastCpu = { t: 0, step: 0, time: 0 };
+  /**
+   * The temperature, pressure and potential-energy computes thermo has bound (native's temperature, pressure and pe
+   * pointers): set by the run's init for the ones the thermo keywords use, and by thermo_modify temp and press; a new
+   * thermo_style unbinds them (src/thermo.cpp at b332f28).
+   */
+  private bound = { temp: false, press: false, pe: false };
+
+  constructor(private sys: System) {}
+
+  get norm(): boolean {
+    return this.normUser ?? this.sys.units.normDefault;
+  }
+
+  /** thermo_style ... ; resets thermo_modify settings. */
+  setStyle(style: string, args: string[]): void {
+    let kw: string[];
+    if (style === 'one') kw = [...THERMO_ONE];
+    else if (style === 'multi') kw = [...THERMO_MULTI];
+    else if (style === 'yaml') kw = [...THERMO_ONE];
+    else if (style === 'custom') {
+      if (!args.length) throw new StyleError('Cannot use thermo style custom without custom keywords');
+      kw = [];
+      for (const a of args) kw.push(...this.expand(a));
+    } else throw new StyleError(`Unknown thermo style ${style}`);
+    // native ignores the words after one, multi and yaml
+    for (const k of kw) this.validate(k);
+    this.style = style as Thermo['style'];
+    this.keywords = kw;
+    this.lineStyle = style === 'multi' ? 'multi' : style === 'yaml' ? 'yaml' : 'one';
+    // "all thermodynamic settings are restored to their default values"
+    this.normUser = null;
+    this.tempId = 'thermo_temp';
+    this.pressId = 'thermo_press';
+    this.bound = { temp: false, press: false, pe: false };
+    this.lost = 'error';
+    this.lostBond = 'error';
+    this.flush = false;
+    this.formatLine = this.formatInt = this.formatFloat = null;
+    this.formatCol.clear();
+    this.colname.clear();
+    this.autoNames = false;
+  }
+
+  /**
+   * c_ID[*] / f_ID[*] wildcards expand to every component. A second index after the wildcard (f_ID[*][J]) is kept
+   * as a tail on every expanded word: "Using a wildcard is the same as if the individual elements of the vector had
+   * been listed one by one" (thermo_style.html, Wildcards). As native LAMMPS does (src/utils.cpp expand_args at
+   * b332f28, mode 0), the wildcard index ranges over the global vector only, so a tail needs a vector.
+   */
+  private expand(a: string): string[] {
+    const m = /^([cfv])_([A-Za-z0-9_]+)\[(\d*)\*(\d*)\](\[\d+\])?$/.exec(a);
+    if (!m) return [a];
+    const [, kind, id, lo, hi, tail = ''] = m;
+    if (kind === 'v' && tail) throw new StyleError(`${a}: a variable wildcard takes one index`);
+    let n: number;
+    if (kind === 'c') {
+      const c = this.sys.compute(id);
+      n = c.vectorFlag ? c.sizeVector : !tail && c.arrayFlag ? c.sizeArrayCols : 0;
+    } else if (kind === 'f') {
+      const f = this.sys.fix(id);
+      n = f.vectorFlag ? f.sizeVector : 0;
+    } else if (hi) {
+      // native LAMMPS (src/utils.cpp expand_args): "[*N]" of a vector-style variable needs no length; the variable
+      // is not read here (its fixes are not initialised before the run)
+      n = Number(hi);
+    } else n = this.sys.vars.evalVector(id, this.sys.formulaEnv).length;
+    if (!n) throw new StyleError(`${a}: ${kind}_${id} has no vector to expand`);
+    const i0 = lo ? Number(lo) : 1, i1 = hi ? Number(hi) : n;
+    const out: string[] = [];
+    for (let i = i0; i <= i1; i++) out.push(`${kind}_${id}[${i}]${tail}`);
+    return out;
+  }
+
+  /**
+   * A thermo_style custom keyword, checked as native LAMMPS does when the command is read (src/thermo.cpp
+   * Thermo::parse_fields at b332f28): c_ID, f_ID and v_name must exist, and a variable must be equal-style (or
+   * vector-style with one index). Whether a compute or fix provides the scalar, vector or array element the brackets
+   * ask for is checked at run setup (checkFieldValue), when the engine's computes and fixes know their sizes.
+   */
+  private validate(k: string): void {
+    if (BUILTIN.has(k)) return;
+    const f = parseField(k);
+    if (!f) throw new StyleError(`Unknown keyword '${k}' in thermo_style custom command`);
+    const { kind, id, idx } = f;
+    if (kind === 'v') {
+      const v = this.sys.vars.get(id);
+      if (!v) throw new StyleError(`Could not find thermo custom variable name: ${id}`);
+      if (idx.length === 0 && v.style !== 'equal' && v.style !== 'timer' && v.style !== 'internal') {
+        throw new StyleError(`Thermo custom variable ${id} is not an equal-style variable`);
+      }
+      if (idx.length === 1 && v.style !== 'vector') throw new StyleError(`Thermo custom variable ${id} is not a vector-style variable`);
+      if (idx.length === 2) throw new StyleError(`Thermo custom variable ${id} cannot have two indices`);
+      return;
+    }
+    const what = kind === 'c' ? 'compute' : 'fix';
+    const o = kind === 'c' ? this.sys.computes.find((x) => x.id === id) : this.sys.fixes.find((x) => x.id === id);
+    if (!o) throw new StyleError(`Could not find thermo custom ${what} ID: ${id}`);
+    // a fix whose sizes are the native ones now (fix vector) is checked here, as native's parse_fields does
+    if ('sizeExact' in o && o.sizeExact) this.checkFieldValue(k);
+  }
+
+  /**
+   * The value a c_ID or f_ID keyword asks for, with native's parse_fields messages: a scalar, a vector element in
+   * 1..size or an array element in its rows and columns (a size of 0 is a size known only when the value is computed,
+   * native's size_*_variable).
+   */
+  private checkFieldValue(k: string): void {
+    const f = parseField(k);
+    if (!f || f.kind === 'v') return;
+    const { kind, id, idx } = f;
+    const what = kind === 'c' ? 'compute' : 'fix';
+    const o = kind === 'c' ? this.sys.computes.find((x) => x.id === id) : this.sys.fixes.find((x) => x.id === id);
+    if (!o) return;
+    const range = '\nFor more information see https://docs.lammps.org/err0020';
+    // native compares with the sizes unless they vary (size_vector_variable, size_array_rows_variable)
+    const exact = 'sizeExact' in o && o.sizeExact;
+    const vecVar = 'sizeVectorVariable' in o && o.sizeVectorVariable;
+    const rowsVar = 'sizeArrayRowsVariable' in o && o.sizeArrayRowsVariable;
+    if (idx.length === 0 && !o.scalarFlag) throw new StyleError(`Thermo custom ${what} ${id} does not compute a scalar`);
+    if (idx.length === 1) {
+      if (!o.vectorFlag) throw new StyleError(`Thermo custom ${what} ${id} does not compute a vector`);
+      if (idx[0] < 1 || ((o.sizeVector > 0 || exact) && !vecVar && idx[0] > o.sizeVector)) throw new StyleError(`Thermo custom ${what} ${id} vector is accessed out-of-range${range}`);
+    }
+    if (idx.length === 2) {
+      if (!o.arrayFlag) throw new StyleError(`Thermo custom ${what} ${id} does not compute an array`);
+      if (idx[0] < 1 || idx[1] < 1 || ((o.sizeArrayRows > 0 || exact) && !rowsVar && idx[0] > o.sizeArrayRows) || (o.sizeArrayCols > 0 && idx[1] > o.sizeArrayCols)) {
+        throw new StyleError(`Thermo custom ${what} ${id} array is accessed out-of-range${range}`);
+      }
+    }
+  }
+
+  /** Checks references before a run. */
+  init(): void {
+    // the references may have been deleted since thermo_style; as native LAMMPS does (src/thermo.cpp Thermo::init and
+    // src/output.cpp Output::setup at b332f28)
+    for (const k of this.keywords) {
+      const m = /^([cfv])_([A-Za-z0-9_]+)/.exec(k);
+      if (!m) continue;
+      if (m[1] === 'c') {
+        if (!this.sys.computes.some((c) => c.id === m[2])) throw new StyleError(`Could not find thermo compute with ID ${m[2]}`);
+      } else if (m[1] === 'f') {
+        const f = this.sys.fixes.find((x) => x.id === m[2]);
+        if (!f) throw new StyleError(`Could not find thermo fix ID ${m[2]}`);
+        // Measured with native LAMMPS (black box): thermo 2 with a fix ave/time of Nfreq 4 is "ERROR: Thermo and fix
+        // a not computed at compatible times"; thermo 4 is accepted.
+        if (this.every > 0 && f.globalFreq > 0 && this.every % f.globalFreq !== 0) {
+          throw new StyleError(`Thermo and fix ${m[2]} not computed at compatible times\nFor more information see https://docs.lammps.org/err0007`);
+        }
+      } else if (!this.sys.vars.has(m[2])) throw new StyleError(`Could not find thermo variable ${m[2]}`);
+    }
+    for (const k of this.keywords) this.checkFieldValue(k);
+    if (this.everyVar !== null) {
+      const v = this.sys.vars.get(this.everyVar);
+      if (!v) throw new StyleError('Variable name for thermo every does not exist');
+      if (v.style !== 'equal' && v.style !== 'timer' && v.style !== 'internal') throw new StyleError('Variable for thermo every is invalid style');
+    }
+    this.checkFormats();
+    const t = this.sys.compute(this.tempId);
+    if (!t.tempFlag) throw new StyleError(`thermo_modify temp: compute ${this.tempId} does not compute a temperature`);
+    const p = this.sys.compute(this.pressId);
+    if (!p.pressFlag) throw new StyleError(`thermo_modify press: compute ${this.pressId} does not compute a pressure`);
+    const uses = (keys: Set<string>) => this.keywords.some((k) => keys.has(k));
+    if (uses(TEMP_KEYS)) this.bound.temp = true;
+    if (uses(PRESS_KEYS)) this.bound.press = true;
+    if (uses(PE_KEYS)) this.bound.pe = true;
+    this.lastCpu = { t: performance.now(), step: this.sys.state.step, time: 0 };
+  }
+
+  /** Column labels for the notebook table when thermo_modify colname renamed a column (else undefined). */
+  labels(): string[] | undefined {
+    return this.colname.size || this.autoNames ? this.header() : undefined;
+  }
+
+  header(): string[] {
+    return this.keywords.map((k, c) => this.autoName(k) ?? this.colname.get(c) ?? HEADER[k] ?? k);
+  }
+
+  /**
+   * thermo_modify colname auto: "certain fixes or computes will generate more descriptive strings as their
+   * thermo keywords" (thermo_modify.html, versionadded 10Dec2025); the auto name overrides a user string
+   * for those styles only. The fix and compute classes supply the names (autoColumnNames).
+   */
+  private autoName(k: string): string | undefined {
+    if (!this.autoNames) return undefined;
+    const m = /^([fc])_([A-Za-z0-9_]+)(?:\[(\d+)\])?$/.exec(k);
+    if (!m) return undefined;
+    const obj = (m[1] === 'f' ? this.sys.fix(m[2]) : this.sys.compute(m[2])) as unknown as { autoColumnNames?: () => { scalar?: string; vector?: string[] } };
+    const names = obj.autoColumnNames?.();
+    if (!names) return undefined;
+    const prefix = `${m[1]}_${m[2]}:`;
+    if (m[3] === undefined) return names.scalar === undefined ? undefined : prefix + names.scalar;
+    const v = names.vector?.[Number(m[3]) - 1];
+    return v === undefined ? undefined : prefix + v;
+  }
+
+  /** thermo_modify format ID: a column number (negative counts from the right), a range "N*M", "N*", "*M" or "*", or a keyword. */
+  private columnsOf(id: string): number[] {
+    const n = this.keywords.length;
+    const bad = (): never => { throw new StyleError(`Invalid thermo_modify format argument: ${id}`); };
+    if (/^\d*\*\d*$/.test(id)) {
+      const star = id.indexOf('*');
+      const lo = star > 0 ? Number(id.slice(0, star)) : 1;
+      const hi = star < id.length - 1 ? Number(id.slice(star + 1)) : n;
+      if (lo < 1 || hi > n || lo > hi) bad();
+      return Array.from({ length: hi - lo + 1 }, (_, i) => lo - 1 + i);
+    }
+    if (/^-?\d+$/.test(id)) {
+      const v = Number(id);
+      if (v >= 1 && v <= n) return [v - 1];
+      if (v <= -1 && v >= -n) return [n + v];
+      return bad();
+    }
+    const c = this.keywords.indexOf(id);
+    return c < 0 ? bad() : [c];
+  }
+
+  /** The thermo format of column c for its kind: ID, then int/float, then the line (thermo_modify.html precedence). */
+  private columnFormat(c: number): string | undefined {
+    return this.formatCol.get(c) ?? (kindOf(this.keywords[c]) === 'int' ? this.formatInt ?? undefined : this.formatFloat ?? undefined);
+  }
+
+  /**
+   * Checks the formats when the thermo output is set up (run), as thermo_modify.html says: "Format strings are
+   * checked when the thermo output is set up and LAMMPS will stop with an error if a format string does not match
+   * the kind of value it is applied to". Measured with native LAMMPS (black box): a line format with fewer
+   * formats than columns is an error (only for columns that take their format from the line).
+   */
+  checkFormats(): void {
+    const toks = this.formatLine === null ? null : this.formatLine.trim().split(/\s+/);
+    this.keywords.forEach((k, c) => {
+      const kind = kindOf(k);
+      let f = this.columnFormat(c);
+      if (f === undefined) {
+        if (!toks) return;
+        if (c >= toks.length) throw new StyleError(`thermo_modify format line has ${toks.length} format(s) for ${this.keywords.length} thermo columns (No more tokens)`);
+        f = toks[c];
+      }
+      checkCFormat(f, kind, `Invalid thermo format for column ${c + 1} (${HEADER[k] ?? k})`);
+    });
+  }
+
+  /** The current row (fresh compute values). */
+  row(): ThermoRow {
+    // a thermo output step tallies the energy (native Integrate::ev_set: update->eflag_global)
+    this.sys.run.eflagStep = this.sys.state.step;
+    this.sys.refreshComputes();
+    const out: ThermoRow = {};
+    this.sys.thermoOutput = true;
+    try {
+      for (const k of this.keywords) out[k] = this.value(k);
+    } finally {
+      this.sys.thermoOutput = false;
+    }
+    return out;
+  }
+
+  private natoms(): number {
+    return this.sys.state.n;
+  }
+
+  private normalize(v: number, extensive: boolean): number {
+    if (!extensive || !this.norm) return v;
+    const n = this.natoms();
+    return n > 0 ? v / n : v;
+  }
+
+  /** A thermo keyword for formulas, or undefined if `name` is not a keyword. */
+  keyword(name: string): number | undefined {
+    if (!BUILTIN.has(name)) return undefined;
+    this.checkKeyword(name);
+    return this.value(name);
+  }
+
+  /**
+   * A thermo keyword in a variable formula. As native LAMMPS does (src/thermo.cpp Thermo::evaluate_keyword and its
+   * check_temp, check_pe and check_press_* at b332f28): the CPU keywords only during a run; the energy keywords on a step
+   * whose energy was tallied (between runs: the last thermo output's step, until the step changes); and the keywords of
+   * the temperature, pressure and potential-energy computes when thermo has bound the compute and a run initialized it.
+   * The engine computes energies when they are asked for during a run, so it checks the tally between runs only.
+   */
+  private checkKeyword(k: string): void {
+    const sys = this.sys;
+    if (CPU_KEYS.has(k) && !sys.run.inRun) throw new StyleError(`The variable thermo keyword ${k} cannot be used between runs`);
+    const tallied = () => !sys.run.inRun && sys.run.eflagStep !== sys.state.step;
+    if (k === 'etail' && tallied()) throw new StyleError(`Energy was not tallied on needed timestep for thermo keyword etail${errorUrl(22)}`);
+    const check = (what: 'temp' | 'press' | 'pe', id: string, text: string) => {
+      if (!this.bound[what]) throw new StyleError(`Thermo keyword ${k} in variable requires thermo to use/init ${text}`);
+      if (!sys.computes.find((c) => c.id === id)?.initialized) throw new StyleError(`Thermo keyword ${k} cannot be invoked before initialization by a run`);
+    };
+    if (PE_KEYS.has(k) && k !== 'etail' && k !== 'ecouple') {
+      if (tallied()) throw new StyleError(`Energy was not tallied on needed timestep${errorUrl(22)}`);
+      check('pe', 'thermo_pe', 'potential energy');
+    }
+    if (TEMP_KEYS.has(k)) check('temp', this.tempId, 'temperature');
+    if (PRESS_KEYS.has(k)) check('press', this.pressId, 'press');
+  }
+
+  value(k: string): number {
+    const m = /^([cfv])_([A-Za-z0-9_]+)(?:\[(\d+)\])?(?:\[(\d+)\])?$/.exec(k);
+    if (m) return this.reference(m[1], m[2], m[3] ? Number(m[3]) : null, m[4] ? Number(m[4]) : null);
+    const sys = this.sys;
+    const s = sys.state;
+    const g = sys.geom;
+    const u = s.units;
+    const temp = () => sys.compute(this.tempId);
+    const press = () => sys.compute(this.pressId);
+    const acc = () => sys.forces();
+    const vol = () => g.volume(s.dimension);
+    const pe = () => sys.compute('thermo_pe').scalarValue();
+    // the temperature first: a dynamic/dof compute updates its dof while it computes its scalar
+    const ke = () => { const t = temp(); const T = t.scalarValue(); return 0.5 * t.dof * u.boltz * T; };
+    const n = (v: number) => this.normalize(v, EXTENSIVE.has(k));
+    const now = performance.now();
+    switch (k) {
+      case 'step': return s.step;
+      case 'elapsed': return s.step - sys.run.firstStep;
+      case 'elaplong': return s.step - sys.run.beginStep;
+      case 'dt': return s.dt;
+      case 'time': return s.time + (s.step - s.timeStep) * s.dt;
+      case 'cpu': return sys.run.inRun ? (now - sys.run.t0) / 1000 : 0;
+      case 'tpcpu': case 'spcpu': {
+        const dtw = (now - this.lastCpu.t) / 1000;
+        const dstep = s.step - this.lastCpu.step;
+        this.lastCpu = { t: now, step: s.step, time: 0 };
+        if (!(dtw > 0) || dstep <= 0) return 0;
+        return k === 'spcpu' ? dstep / dtw : (dstep * s.dt) / dtw;
+      }
+      case 'cpuremain': {
+        if (!sys.run.inRun) return 0;
+        const done = s.step - sys.run.firstStep;
+        const left = sys.run.lastStep - s.step;
+        return done > 0 ? ((now - sys.run.t0) / 1000) * left / done : 0;
+      }
+      case 'cpuuse': return 100;
+      case 'part': return 0;
+      case 'timeremain': return 0;
+      case 'atoms': return s.n;
+      case 'temp': return temp().scalarValue();
+      case 'press': return press().scalarValue();
+      case 'pe': return n(pe());
+      case 'ke': return n(ke());
+      case 'etotal': return n(pe() + ke());
+      case 'enthalpy': {
+        const e = pe() + ke();
+        return n(e + press().scalarValue() * vol() / u.nktv2p);
+      }
+      case 'ecouple': return n(sys.ecouple());
+      case 'econserve': return n(pe() + ke() + sys.ecouple());
+      case 'evdwl': return n(acc().evdwl);
+      case 'ecoul': return n(acc().ecoul);
+      case 'epair': { const a = acc(); return n(a.evdwl + a.ecoul + a.elong); }
+      case 'ebond': return n(acc().ebond);
+      case 'eangle': return n(acc().eangle);
+      case 'edihed': return n(acc().edihed);
+      case 'eimp': return n(acc().eimp);
+      case 'emol': { const a = acc(); return n(a.ebond + a.eangle + a.edihed + a.eimp); }
+      case 'elong': return n(acc().elong);
+      case 'etail': return n(sys.ff.etailV / vol());
+      case 'vol': return vol();
+      case 'density': {
+        let m = 0;
+        for (let i = 0; i < s.n; i++) m += massOf(s, i);
+        return (m * u.mv2d) / vol();
+      }
+      case 'lx': return g.lx;
+      case 'ly': return g.ly;
+      case 'lz': return g.lz;
+      case 'xlo': return s.box.lo[0];
+      case 'xhi': return s.box.hi[0];
+      case 'ylo': return s.box.lo[1];
+      case 'yhi': return s.box.hi[1];
+      case 'zlo': return s.box.lo[2];
+      case 'zhi': return s.box.hi[2];
+      case 'xy': return s.box.tilt[0];
+      case 'xz': return s.box.tilt[1];
+      case 'yz': return s.box.tilt[2];
+      // thermo_style.html: "**A**, **B**, **C** vector which define the general triclinic box." (thermo_modify triclinic/general yes)
+      case 'avecx': return this.triclinicGeneral ? this.generalEdges().A[0] : g.lx;
+      case 'avecy': return this.triclinicGeneral ? this.generalEdges().A[1] : 0;
+      case 'avecz': return this.triclinicGeneral ? this.generalEdges().A[2] : 0;
+      case 'bvecx': return this.triclinicGeneral ? this.generalEdges().B[0] : g.xy;
+      case 'bvecy': return this.triclinicGeneral ? this.generalEdges().B[1] : g.ly;
+      case 'bvecz': return this.triclinicGeneral ? this.generalEdges().B[2] : 0;
+      case 'cvecx': return this.triclinicGeneral ? this.generalEdges().C[0] : g.xz;
+      case 'cvecy': return this.triclinicGeneral ? this.generalEdges().C[1] : g.yz;
+      case 'cvecz': return this.triclinicGeneral ? this.generalEdges().C[2] : g.lz;
+      case 'xlat': return sys.lattice?.spacing[0] ?? 1;
+      case 'ylat': return sys.lattice?.spacing[1] ?? 1;
+      case 'zlat': return sys.lattice?.spacing[2] ?? 1;
+      case 'cella': return g.lx;
+      case 'cellb': return Math.sqrt(g.ly * g.ly + g.xy * g.xy);
+      case 'cellc': return Math.sqrt(g.lz * g.lz + g.xz * g.xz + g.yz * g.yz);
+      case 'cellalpha': {
+        const b = Math.sqrt(g.ly * g.ly + g.xy * g.xy), c = Math.sqrt(g.lz * g.lz + g.xz * g.xz + g.yz * g.yz);
+        return (libm.acos((g.xy * g.xz + g.ly * g.yz) / (b * c)) * 180) / Math.PI;
+      }
+      case 'cellbeta': {
+        const c = Math.sqrt(g.lz * g.lz + g.xz * g.xz + g.yz * g.yz);
+        return (libm.acos(g.xz / c) * 180) / Math.PI;
+      }
+      case 'cellgamma': {
+        const b = Math.sqrt(g.ly * g.ly + g.xy * g.xy);
+        return (libm.acos(g.xy / b) * 180) / Math.PI;
+      }
+      case 'pxx': case 'pyy': case 'pzz': case 'pxy': case 'pxz': case 'pyz':
+        if (this.triclinicGeneral) {
+          // thermo_style.html: "the 6 components will be output as values consistent with" the orientation of the general box
+          const Q = this.generalEdgesQ();
+          return rotateTensorToGeneral(Q, press().vectorValues())[['pxx', 'pyy', 'pzz', 'pxy', 'pxz', 'pyz'].indexOf(k)];
+        }
+        return press().vectorValues()[['pxx', 'pyy', 'pzz', 'pxy', 'pxz', 'pyz'].indexOf(k)];
+      case 'bonds': return s.topo.bonds.n;
+      case 'angles': return s.topo.angles.n;
+      case 'dihedrals': return s.topo.dihedrals.n;
+      case 'impropers': return s.topo.impropers.n;
+      case 'fmax': {
+        sys.forces();
+        let mx = 0;
+        for (let i = 0; i < 3 * s.n; i++) mx = Math.max(mx, Math.abs(s.f[i]));
+        return mx;
+      }
+      case 'fnorm': {
+        sys.forces();
+        let t = 0;
+        for (let i = 0; i < 3 * s.n; i++) t += s.f[i] * s.f[i];
+        return Math.sqrt(t);
+      }
+      // thermo_style.html: "nbuild = # of neighbor list builds"; native compute_nbuild reads neighbor->ncalls
+      case 'nbuild': return sys.nb.ncalls;
+      case 'ndanger': return sys.nb.ndanger;
+    }
+    throw new StyleError(`unknown thermo keyword '${k}'`);
+  }
+
+  private reference(kind: string, id: string, i: number | null, j: number | null): number {
+    const sys = this.sys;
+    if (kind === 'v') {
+      if (i === null) return sys.equalVariable(id);
+      const v = sys.vars.evalVector(id, sys.formulaEnv);
+      if (i < 1 || i > v.length) throw new StyleError(`v_${id}[${i}] is out of range`);
+      return v[i - 1];
+    }
+    if (kind === 'c') {
+      const c = sys.compute(id);
+      if (i === null) return this.normalize(c.scalarValue(), c.extscalar === 1);
+      if (j === null) {
+        const v = c.vectorValues();
+        if (i < 1 || i > v.length) throw new StyleError(`c_${id}[${i}] is out of range (1..${v.length})`);
+        const ext = c.extlist ? c.extlist[i - 1] === 1 : c.extvector === 1;
+        return this.normalize(v[i - 1], ext);
+      }
+      const a = c.arrayValues();
+      // As native LAMMPS does (src/thermo.cpp at b332f28, compute_compute and compute_fix): an array element is
+      // divided by the atom count when the array is extensive ("if (normflag && compute->extarray) dvalue /= natoms")
+      return this.normalize(a[(i - 1) * c.sizeArrayCols + j - 1], c.extarray === 1);
+    }
+    const f = sys.fix(id);
+    if (i === null) return this.normalize(f.computeScalar(), f.extscalar === 1);
+    // As native LAMMPS does (src/thermo.cpp compute_fix at b332f28): past the end of a vector or array whose length
+    // varies the value is 0
+    if (j === null) {
+      if (f.sizeVectorVariable && i > f.sizeVector) return 0;
+      return this.normalize(f.computeVector(i - 1), f.extlist ? f.extlist[i - 1] === 1 : f.extvector === 1);
+    }
+    if (f.sizeArrayRowsVariable && i > f.sizeArrayRows) return 0;
+    return this.normalize(f.computeArray(i - 1, j - 1), f.extarray === 1);
+  }
+
+  /** thermo_modify keyword list. */
+  /** Edge vectors of the general box (thermo_modify triclinic/general yes); throws when the box is not general. */
+  private generalEdges(): GeneralBox {
+    const b = this.sys.state.box;
+    if (!b.general) throw new StyleError('thermo_modify triclinic/general cannot be used if simulation box is not general triclinic');
+    return generalBoxFromRestricted(b.general.Q, b.lo, b.hi, b.tilt);
+  }
+
+  private generalEdgesQ() {
+    const b = this.sys.state.box;
+    if (!b.general) throw new StyleError('thermo_modify triclinic/general cannot be used if simulation box is not general triclinic');
+    return b.general.Q;
+  }
+
+  modify(args: string[]): void {
+    for (let k = 0; k < args.length;) {
+      const key = args[k];
+      const val = args[k + 1];
+      // As native LAMMPS does (src/thermo.cpp at b332f28, modify_params, utils::missing_cmd_args)
+      const need = (w: string | undefined) => {
+        if (w === undefined) throw new StyleError(`Illegal thermo_modify ${key} command: missing argument(s)`);
+        return w;
+      };
+      switch (key) {
+        case 'norm': this.normUser = yesno(need(val), key); k += 2; break;
+        case 'temp': {
+          // As native LAMMPS does (src/thermo.cpp Thermo::modify_params at b332f28)
+          need(val);
+          if (!this.keywords.some((x) => TEMP_KEYS.has(x))) throw new StyleError('Thermo style does not use temp');
+          if (!this.sys.computes.some((x) => x.id === val)) throw new StyleError(`Could not find thermo_modify temperature compute ${val}`);
+          const c = this.sys.compute(val!);
+          if (!c.tempFlag) throw new StyleError(`Thermo_modify compute ${val} does not compute temperature`);
+          this.tempId = val!;
+          this.bound.temp = true;
+          // "a pressure compute defines its own temperature compute as an argument when it is
+          // specified. The temp keyword will override this (for the pressure compute being used
+          // by thermodynamics), but only if the temp keyword comes after the press keyword."
+          const p = this.sys.compute(this.pressId) as unknown as { tempId?: string | null };
+          if (p.tempId !== undefined) p.tempId = val!;
+          k += 2;
+          break;
+        }
+        case 'press': {
+          need(val);
+          if (!this.keywords.some((x) => PRESS_KEYS.has(x))) throw new StyleError('Thermo style does not use press');
+          if (!this.sys.computes.some((x) => x.id === val)) throw new StyleError(`Could not find thermo_modify pressure compute ${val}`);
+          const c = this.sys.compute(val!);
+          if (!c.pressFlag) throw new StyleError(`Thermo_modify compute ${val} does not compute pressure`);
+          this.pressId = val!;
+          this.bound.press = true;
+          k += 2;
+          break;
+        }
+        case 'lost': case 'lost/bond': {
+          const v = need(val);
+          if (v !== 'error' && v !== 'warn' && v !== 'ignore') throw new StyleError(`Unknown thermo_modify ${key} argument: ${v}`);
+          if (key === 'lost') this.lost = v; else this.lostBond = v;
+          k += 2;
+          break;
+        }
+        case 'warn': {
+          // thermo_modify.html: "warn value = ignore or reset or default or a number". "Any number after the keyword warn
+          // will change the warning limit accordingly. With the value ignore all warnings will be suppressed ... with the
+          // value reset the internal warning counter will be reset to zero, and with the value default, the counter is
+          // reset and the limit set to 100." Measured with native LAMMPS (black box): warn foo stops with
+          // "Expected integer parameter instead of 'foo'"; warn 2 prints two warnings and then
+          // "Too many warnings: 3 vs 2. All future warnings will be suppressed"; warn ignore prints none.
+          // As native LAMMPS does (src/thermo.cpp and error.cpp at b332f28): ignore and a negative number suppress every
+          // warning (maxwarn < 0), always and 0 print every one (maxwarn 0), a positive number is the limit
+          const w = need(val);
+          const sys = this.sys;
+          if (w === 'ignore') sys.warnOff = true;
+          else if (w === 'always') { sys.warnLimit = Infinity; sys.warnOff = false; }
+          else if (w === 'reset') { sys.warnCount = 0; sys.warnOff = false; }
+          else if (w === 'default') { sys.warnCount = 0; sys.warnLimit = 100; sys.warnOff = false; }
+          else {
+            if (!/^[-+]?\d+$/.test(w)) throw new StyleError(`Expected integer parameter instead of '${w}' in input script or data file`);
+            const m = Number(w);
+            if (m < 0) sys.warnOff = true;
+            else { sys.warnLimit = m === 0 ? Infinity : m; sys.warnOff = false; }
+          }
+          k += 2;
+          break;
+        }
+        case 'flush': this.flush = yesno(need(val), key); k += 2; break;
+        case 'line': {
+          const v = need(val);
+          if (v !== 'one' && v !== 'multi' && v !== 'yaml') throw new StyleError(`Unknown thermo_modify line argument: ${v}`);
+          this.lineStyle = v;
+          k += 2;
+          break;
+        }
+        case 'format': {
+          const which = need(val);
+          const fmt = args[k + 2];
+          if (which === 'none') { this.formatLine = this.formatInt = this.formatFloat = null; this.formatCol.clear(); k += 2; break; }
+          // As native LAMMPS does (src/thermo.cpp Thermo::modify_params at b332f28): "if (iarg + 3 > narg) utils::missing_cmd_args(FLERR, \"thermo_modify format\", error)"
+          if (fmt === undefined) throw new StyleError('Illegal thermo_modify format command: missing argument(s)');
+          if (which === 'line') this.formatLine = fmt;
+          else if (which === 'int') { checkCFormat(fmt, 'int', 'Invalid thermo_modify int format'); this.formatInt = fmt; }
+          else if (which === 'float') { checkCFormat(fmt, 'float', 'Invalid thermo_modify float format'); this.formatFloat = fmt; }
+          else for (const c of this.columnsOf(which)) this.formatCol.set(c, fmt);
+          k += 3;
+          break;
+        }
+        case 'colname': {
+          // thermo_modify.html: "*colname* values =  ID string, or *default*"; "*ID* can be a positive
+          // integer when it represents the column number counting from the left, a negative integer
+          // when it represents the column number from the right (i.e., :math:`-1` is the last
+          // column/keyword), or a thermo keyword (or compute, fix, property, or variable reference)";
+          // "A setting of *default* clears all previous settings". Measured with native LAMMPS (black
+          // box): a column number out of range, 0, or a keyword not in the thermo style stop with
+          // Invalid thermo_modify colname argument: <ID>.
+          const id = need(val);
+          if (id === 'default') { this.colname.clear(); this.autoNames = false; k += 2; break; }
+          if (id === 'auto') { this.autoNames = true; k += 2; break; }
+          const name = args[k + 2];
+          if (name === undefined) throw new StyleError('thermo_modify colname needs an ID and a string');
+          const n = this.keywords.length;
+          let col = -1;
+          if (/^-?\d+$/.test(id)) {
+            const v = Number(id);
+            if (v >= 1 && v <= n) col = v - 1;
+            else if (v <= -1 && v >= -n) col = n + v;
+          } else col = this.keywords.indexOf(id);
+          if (col < 0) throw new StyleError(`Invalid thermo_modify colname argument: ${id}`);
+          this.colname.set(col, name);
+          k += 3;
+          break;
+        }
+        case 'every': {
+          // thermo_modify every was removed upstream; accept v_name like the thermo command
+          throw new StyleError('Unknown thermo_modify keyword: every');
+        }
+        case 'triclinic/general':
+          // thermo_modify.html: "The *triclinic/general* keyword can only be used with a value of *yes*" (the simulation box
+          // must have been created as a general triclinic box). Measured with native LAMMPS (black box): the check runs when the
+          // command executes, so a box created later does not satisfy it: Thermo_modify triclinic/general cannot be used
+          // if simulation box is not general triclinic
+          // src/thermo.cpp Thermo::modify_params at b332f28 names the missing value "thermo_modify tricinic/general"
+          if (val === undefined) throw new StyleError('Illegal thermo_modify tricinic/general command: missing argument(s)');
+          if (yesno(need(val), key)) {
+            if (!this.sys.hasBox || !this.sys.state.box.general) {
+              throw new StyleError('Thermo_modify triclinic/general cannot be used if simulation box is not general triclinic');
+            }
+            this.triclinicGeneral = true;
+          } else this.triclinicGeneral = false;
+          k += 2;
+          break;
+        default:
+          throw new StyleError(`Unknown thermo_modify keyword: ${key}`);
+      }
+    }
+  }
+
+  /** The log-file lines a run starts with: the one-line labels, or the yaml keyword list (log.html: thermo output is copied to the log). */
+  logHeader(): string[] {
+    const labels = this.header();
+    if (this.lineStyle === 'yaml') return ['---', `keywords: [ ${labels.map((l) => `'${l}'`).join(', ')} ]`, 'data:'];
+    if (this.lineStyle === 'multi') return [];
+    return [labels.map((l) => l.padStart(14)).join(' ')];
+  }
+
+  /**
+   * The log-file lines of one thermo row. thermo_modify.html: "The format keyword ... changes the format of the thermo
+   * output"; "line value = one or multi or yaml" selects the layout. The column format is its own, then the int or
+   * float setting, then the line (the precedence checkFormats uses).
+   */
+  logRow(row: ThermoRow): string[] {
+    const vals = this.keywords.map((k, c) => this.logValue(c, row[k]));
+    if (this.lineStyle === 'yaml') return [`  - [ ${vals.join(', ')} ]`];
+    if (this.lineStyle === 'multi') {
+      const out = [`------------ Step ${this.sys.state.step} ----- CPU = ${this.value('cpu')} (sec) -------------`];
+      const labels = this.header();
+      for (let c = 0; c < vals.length; c += 3) {
+        const parts: string[] = [];
+        for (let j = c; j < Math.min(c + 3, vals.length); j++) parts.push(`${labels[j].padEnd(8)} = ${vals[j]}`);
+        out.push(parts.join(' '));
+      }
+      return out;
+    }
+    return [vals.join(' ')];
+  }
+
+  /** The log-file lines a run ends with (yaml closes its document). */
+  logEnd(): string[] {
+    return this.lineStyle === 'yaml' ? ['...'] : [];
+  }
+
+  private logValue(c: number, v: number): string {
+    const kind = kindOf(this.keywords[c]);
+    const own = this.columnFormat(c);
+    const toks = this.formatLine === null ? [] : this.formatLine.trim().split(/\s+/);
+    const spec = own ?? toks[c] ?? (kind === 'int' ? '%10d' : '%14.8g');
+    return compileCFormat(spec, kind, `Invalid thermo format for column ${c + 1}`)(v);
+  }
+
+  /** Thermo lines due on this step? */
+  due(step: number, firstStep: number, lastStep: number): boolean {
+    if (step === firstStep || step === lastStep) return true;
+    if (this.everyVar) return false;
+    return this.every > 0 && step % this.every === 0;
+  }
+
+  /** For thermo v_name: the next output step after `step`. */
+  /**
+   * The next thermo step of thermo v_name, after the current step. As native LAMMPS does (src/output.cpp Output::setup
+   * and Output::write at b332f28): a value at or before the current step is an error.
+   */
+  nextVariableStep(during = false): number {
+    if (!this.everyVar) return Number.MAX_SAFE_INTEGER;
+    const next = Math.trunc(this.sys.equalVariable(this.everyVar));
+    const step = this.sys.state.step;
+    if (next <= step) {
+      throw new StyleError(during ? `Thermo every variable returned a bad timestep: ${next} vs ${step}` : 'Thermo every variable returned a bad timestep');
+    }
+    return next;
+  }
+
+  /** Pressure tensor helper (unused virial pieces). */
+  virialSum(): Float64Array {
+    return totalVirial(this.sys.forces(), new Float64Array(6));
+  }
+}
+
+/** utils::logical (src/utils.cpp at b332f28): yes, on, true and 1, or no, off, false and 0. */
+const yesno = (w: string, key: string): boolean => {
+  void key;
+  if (w === 'yes' || w === 'on' || w === 'true' || w === '1') return true;
+  if (w === 'no' || w === 'off' || w === 'false' || w === '0') return false;
+  throw new StyleError(`Expected boolean parameter instead of '${w}' in input script or data file`);
+};
+
+/** Thermo keywords whose value is an integer (the thermo_style keyword list; measured with native LAMMPS: a "%g" format on these is an error). */
+const THERMO_INT = new Set(['step', 'elapsed', 'elaplong', 'atoms', 'nbuild', 'ndanger', 'bonds', 'angles', 'dihedrals', 'impropers', 'part']);
+const kindOf = (k: string): ValueKind => (THERMO_INT.has(k) ? 'int' : 'float');

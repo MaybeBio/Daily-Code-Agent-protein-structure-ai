@@ -1,0 +1,3128 @@
+//! The windows for every tool run through `bio_tools`' shared adapter: a form built from the tool's
+//! contract, a runner, and a browser over each run's retained results.
+//!
+//! [`ToolWindowKind`] selects a group of tools. Each tool's fields and examples come from
+//! `bio_tools`.
+
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    fs, io,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+
+use bio_tools::tool_definitions::catalog::DataCategory;
+use egui::{
+    Button, CollapsingHeader, Color32, ComboBox, DragValue, RichText, ScrollArea, TextEdit, Ui,
+    UiBuilder,
+};
+use egui_file_dialog::{FileDialog, FileDialogConfig};
+use graphics::{AdapterInfo, DeviceType, EngineUpdates, Scene};
+use mol_defs::molecules::peptide::MoleculePeptide;
+use na_seq::{SeqType, Sequence};
+use serde_json::{Map, Value, json};
+
+use super::{
+    external_tools::tool_links,
+    flex_lists::{self, PageLists},
+    quantum_chem::{
+        self, Psi4Preview, QcRequest,
+        orca::{ActiveMol, OrcaForm},
+    },
+};
+use crate::{
+    compute_caps,
+    external_tools::{
+        self, RunControl, Tool,
+        pdb_write::{PdbWriteOptions, peptide_to_pdb},
+        remote::{self, ComputeTarget},
+        shared_adapter::{self, AdapterResult},
+        tool_form::{FieldKind, FormContract, FormField, Preset},
+    },
+    file_io::sequence::{load_sequences, seq_exts_open},
+    orca::OrcaJob,
+    state::{ComputationGuard, ComputationType, Computations, State},
+    ui::{
+        COL_SPACING, COLOR_ACTION, COLOR_AMBER, COLOR_HIGHLIGHT, ROW_SPACING,
+        misc::{selector_box, selector_option},
+        util::open_dir,
+    },
+    util::handle_err,
+};
+
+/// Outputs larger than this are not previewed inline.
+const MAX_PREVIEW_BYTES: u64 = 2_000_000;
+
+/// Taller errors scroll, so a run's output can't crowd out the form.
+const ERROR_MAX_HEIGHT: f32 = 160.;
+
+/// PCI vendor ID, as `AdapterInfo::vendor` reports it.
+const NVIDIA_VENDOR_ID: u32 = 0x10DE;
+
+/// Whether `tool` is better run locally or remotely on this machine, and why. `None` while the GPU
+/// check is still running.
+fn recommended_compute(
+    tool: Tool,
+    adapter: Option<&AdapterInfo>,
+) -> Option<(ComputeTarget, String)> {
+    if let Some(message) = tool.spec().unavailable_message() {
+        return Some((ComputeTarget::Remote, format!("{message}.")));
+    }
+
+    let caps = compute_caps::get();
+    if cfg!(feature = "cuda") && caps.is_none() {
+        return None;
+    }
+
+    let cuda_gpu = caps
+        .filter(|caps| caps.cuda.is_some())
+        .and_then(|caps| caps.gpus.first());
+    if let Some(gpu) = cuda_gpu {
+        return Some((ComputeTarget::Local, format!("{gpu} detected.")));
+    }
+
+    let unverified = (
+        ComputeTarget::Local,
+        "CUDA support is unverified.".to_owned(),
+    );
+    let Some(adapter) = adapter else {
+        return Some(unverified);
+    };
+
+    Some(match adapter.device_type {
+        DeviceType::IntegratedGpu => (
+            ComputeTarget::Remote,
+            "Integrated graphics only; local runs would be slow.".to_owned(),
+        ),
+        DeviceType::Cpu => (
+            ComputeTarget::Remote,
+            "No GPU in use; local runs would be slow.".to_owned(),
+        ),
+        DeviceType::DiscreteGpu if adapter.vendor != NVIDIA_VENDOR_ID => (
+            ComputeTarget::Remote,
+            format!(
+                "{} is not an NVIDIA GPU; local runs would be slow.",
+                adapter.name
+            ),
+        ),
+        _ => unverified,
+    })
+}
+
+/// Which compute target to use for `tool`; orange when it isn't the one selected.
+fn compute_guidance(tool: Tool, target: ComputeTarget, adapter: Option<&AdapterInfo>, ui: &mut Ui) {
+    let Some((recommended, reason)) = recommended_compute(tool, adapter) else {
+        ui.label("Checking local GPU support…");
+        ui.request_repaint_after(Duration::from_millis(100));
+
+        return;
+    };
+
+    let text = format!("{} compute recommended · {reason}", recommended.label());
+    if recommended == target {
+        ui.label(text);
+    } else {
+        ui.colored_label(Color32::ORANGE, text);
+    }
+}
+
+/// The API token setting, as `remote::run` takes it.
+fn remote_token(token: &str) -> Option<String> {
+    let token = token.trim();
+
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Windows
+// ---------------------------------------------------------------------------------------------
+
+/// One of the shared-adapter tool windows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolWindowKind {
+    StructurePrediction,
+    SequenceDesign,
+    BackboneDesign,
+    QuantumChemistry,
+}
+
+impl ToolWindowKind {
+    fn heading(self) -> &'static str {
+        match self {
+            Self::StructurePrediction => "Structure prediction and co-folding",
+            Self::SequenceDesign => "Sequence design and scoring",
+            Self::BackboneDesign => "RFdiffusion3 backbone generation",
+            Self::QuantumChemistry => "Quantum chemistry",
+        }
+    }
+
+    /// What a run does, for the computation status display.
+    fn activity(self) -> &'static str {
+        match self {
+            Self::StructurePrediction => "structure prediction",
+            Self::SequenceDesign => "sequence design",
+            Self::BackboneDesign => "backbone generation",
+            Self::QuantumChemistry => "quantum chemistry",
+        }
+    }
+
+    /// The tools this window offers. The first is selected when the window is opened.
+    fn tools(self) -> &'static [Tool] {
+        match self {
+            Self::StructurePrediction => &[
+                Tool::OpenFold3,
+                Tool::OpenDde,
+                Tool::Boltz2,
+                Tool::Chai1,
+                Tool::Protenix,
+                Tool::EsmFold2,
+                Tool::AlphaFold3,
+            ],
+            Self::SequenceDesign => &[Tool::ProteinMpnn, Tool::LigandMpnn],
+            Self::BackboneDesign => &[Tool::RfDiffusion3],
+            Self::QuantumChemistry => &[Tool::Psi4, Tool::Orca],
+        }
+    }
+}
+
+/// State for every shared-adapter tool window.
+pub(crate) struct ToolWindows {
+    structure_prediction: ToolWindow,
+    sequence_design: ToolWindow,
+    backbone_design: ToolWindow,
+    quantum_chem: ToolWindow,
+}
+
+impl Default for ToolWindows {
+    fn default() -> Self {
+        Self {
+            structure_prediction: ToolWindow::new(ToolWindowKind::StructurePrediction),
+            sequence_design: ToolWindow::new(ToolWindowKind::SequenceDesign),
+            backbone_design: ToolWindow::new(ToolWindowKind::BackboneDesign),
+            quantum_chem: ToolWindow::new(ToolWindowKind::QuantumChemistry),
+        }
+    }
+}
+
+impl ToolWindows {
+    /// Load a sequence into the structure prediction window's input, and set the job name, the
+    /// next time it's drawn.
+    pub(crate) fn load_structure_pred_seq(&mut self, sequence: Sequence, job_name: String) {
+        self.structure_prediction.pending_sequence = Some((sequence, job_name));
+    }
+
+    pub(super) fn quantum_chem(&mut self) -> &mut ToolWindow {
+        &mut self.quantum_chem
+    }
+}
+
+/// Draw one tool window's contents, loading any structure the user picks from its results.
+pub(in crate::ui) fn tool_window(
+    state: &mut State,
+    kind: ToolWindowKind,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    ui: &mut Ui,
+) {
+    let windows = &mut state.ui.tool_windows;
+    let window = match kind {
+        ToolWindowKind::StructurePrediction => &mut windows.structure_prediction,
+        ToolWindowKind::SequenceDesign => &mut windows.sequence_design,
+        ToolWindowKind::BackboneDesign => &mut windows.backbone_design,
+        ToolWindowKind::QuantumChemistry => &mut windows.quantum_chem,
+    };
+
+    if kind != ToolWindowKind::QuantumChemistry {
+        ui.heading(kind.heading());
+    }
+
+    let computations = &state.volatile.ongoing_computations;
+    let install_pending = kind == ToolWindowKind::QuantumChemistry
+        && state.ui.external_tools.has_pending_job(window.tool);
+    let compute = Compute {
+        target: match kind {
+            ToolWindowKind::QuantumChemistry => state.to_save.quantum_compute_target,
+            _ => state.to_save.compute_target,
+        },
+        token: &state.to_save.athanor_api_token,
+        adapter: scene.adapter_info.as_ref(),
+    };
+
+    let load = ui
+        .push_id(kind.heading(), |ui| {
+            window.draw(
+                kind,
+                &state.peptides,
+                &state.sequences,
+                computations,
+                &compute,
+                install_pending,
+                ui,
+            )
+        })
+        .inner;
+
+    if let Some(path) = load
+        && let Err(error) = state.open_file(&path, scene, updates)
+    {
+        handle_err(&mut state.ui, error.to_string());
+    }
+}
+
+/// Where a tool window's runs go, and what it needs to advise on that.
+pub(super) struct Compute<'a> {
+    pub target: ComputeTarget,
+    /// athanortools.com API token, for remote runs. May be empty.
+    pub token: &'a str,
+    pub adapter: Option<&'a AdapterInfo>,
+}
+
+impl Compute<'_> {
+    fn remote(&self) -> bool {
+        self.target == ComputeTarget::Remote
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Form
+// ---------------------------------------------------------------------------------------------
+
+/// One tool's contract, presets, and the values currently entered.
+struct Form {
+    contract: FormContract,
+    presets: Vec<Preset>,
+    values: HashMap<String, String>,
+    mode: String,
+    authoritative_mode: String,
+    projection_error: Option<String>,
+    preset: Option<usize>,
+    preset_search: String,
+    upload_format: String,
+    opened_protein: Option<usize>,
+}
+
+impl Form {
+    fn new(tool: Tool) -> Result<Self, String> {
+        let slug = shared_adapter::slug(tool);
+        let contract = FormContract::load(slug)?;
+        let upload_format = contract
+            .field("input_format")
+            .map(FormField::default_text)
+            .unwrap_or_default();
+
+        Ok(Self {
+            mode: contract.default_mode(),
+            authoritative_mode: contract.default_mode(),
+            projection_error: None,
+            values: contract.defaults(),
+            presets: Preset::load_all(slug)?,
+            contract,
+            preset: None,
+            preset_search: String::new(),
+            upload_format,
+            opened_protein: None,
+        })
+    }
+
+    fn apply_preset(&mut self, tool: Tool, index: usize) {
+        let working = self.mode.clone();
+        self.projection_error = None;
+        self.opened_protein = None;
+        self.values = self.contract.defaults();
+        self.values.extend(self.presets[index].form_values());
+        self.authoritative_mode = self
+            .values
+            .get("input_mode")
+            .cloned()
+            .unwrap_or_else(|| self.contract.default_mode());
+        self.preset = Some(index);
+        self.preset_search.clear();
+        self.upload_format = self
+            .contract
+            .field("input_format")
+            .map(FormField::default_text)
+            .unwrap_or_default();
+        if working == "upload" || shared_adapter::slug(tool) != "rfd3" {
+            self.mode = self.authoritative_mode.clone();
+        } else {
+            self.mode = working;
+            self.project_mode();
+        }
+    }
+
+    fn project_mode(&mut self) {
+        self.projection_error = None;
+        if self.mode == self.authoritative_mode || self.mode == "upload" {
+            return;
+        }
+        let result = match (self.authoritative_mode.as_str(), self.mode.as_str()) {
+            ("parameters", "text") => {
+                let preset = self.preset.and_then(|index| self.presets.get(index));
+                rfd3_document(&self.contract, &mut self.values, preset).map(|document| {
+                    self.values.insert("inputs".into(), document);
+                })
+            }
+            ("text", "parameters") => rfd3_parameters(&self.contract, &mut self.values),
+            _ => Ok(()),
+        };
+        if let Err(error) = result {
+            self.projection_error = Some(error);
+        }
+    }
+
+    fn insert_sequence(
+        &mut self,
+        tool: Tool,
+        target: &SequenceTarget,
+        sequence: &Sequence,
+    ) -> Result<(), String> {
+        let field = match target {
+            SequenceTarget::Molecule(_) => "sequence_molecules",
+            SequenceTarget::Document { field, .. } => field,
+        };
+        let current = self
+            .values
+            .get(field)
+            .ok_or_else(|| format!("No {field} input is available"))?;
+        let updated = replace_sequence_input(tool, target, current, sequence)?;
+        self.values.insert(field.to_owned(), updated);
+        self.authoritative_mode = self.mode.clone();
+        Ok(())
+    }
+
+    /// Put a sequence in the input's first molecule: the first entity of a document entered as
+    /// text, or the molecule builder's first protein. Switches to the builder if the current
+    /// input mode has nowhere to put it, e.g. when uploading a file.
+    fn load_sequence(&mut self, tool: Tool, sequence: &Sequence) -> Result<(), String> {
+        let document_target = self
+            .contract
+            .fields
+            .iter()
+            .filter(|field| field.kind() == FieldKind::TextArea && field.applies_to(&self.mode))
+            .find_map(|field| {
+                let current = self.values.get(&field.name)?;
+                let targets = document_sequence_targets(tool, &field.name, current).ok()?;
+                targets.into_iter().next().map(|(_, target)| target)
+            });
+
+        if let Some(target) = document_target {
+            return self.insert_sequence(tool, &target, sequence);
+        }
+
+        let field = self
+            .contract
+            .field("sequence_molecules")
+            .ok_or_else(|| "This tool has no sequence input".to_owned())?;
+
+        if !field.applies_to(&self.mode)
+            && let Some(mode) = field.input_modes.split(',').next()
+        {
+            self.mode = mode.trim().to_owned();
+        }
+
+        let current = self
+            .values
+            .get("sequence_molecules")
+            .map(String::as_str)
+            .unwrap_or("[]");
+        let mut boxes: Vec<Value> = serde_json::from_str(current)
+            .map_err(|error| format!("Molecule input is invalid JSON: {error}"))?;
+
+        let index = match boxes.iter().position(|b| b["type"] == "protein") {
+            Some(i) => i,
+            None => {
+                boxes.insert(
+                    0,
+                    json!({"type": "protein", "sequence": "", "modifications": []}),
+                );
+                0
+            }
+        };
+
+        self.values.insert(
+            "sequence_molecules".into(),
+            serde_json::to_string(&boxes).map_err(|error| error.to_string())?,
+        );
+
+        self.insert_sequence(tool, &SequenceTarget::Molecule(index), sequence)
+    }
+
+    /// Prepare the selected structure only when Run is clicked. The shared adapter accepts
+    /// its contents directly, so an opened molecule never needs an intermediate file here.
+    fn run_payload(&self, tool: Tool, proteins: &[MoleculePeptide]) -> io::Result<Value> {
+        let mut file_contents = HashMap::new();
+        if let Some(index) = self.opened_protein
+            && let Some(field) = self.contract.structure_field(&self.mode)
+        {
+            let protein = proteins.get(index).ok_or_else(|| {
+                io::Error::other("The selected opened protein is no longer available.")
+            })?;
+            let pdb = peptide_to_pdb(protein, &PdbWriteOptions::with_ligand_context())?;
+            file_contents.insert(field.name.clone(), pdb);
+        }
+
+        shared_adapter::payload(tool, &self.values, &self.mode, &file_contents)
+    }
+}
+
+fn sequence_type_label(sequence: &Sequence) -> &'static str {
+    match sequence.seq_type() {
+        SeqType::AminoAcid => "protein",
+        SeqType::Dna => "dna",
+        SeqType::Rna => "rna",
+    }
+}
+
+fn replace_sequence_input(
+    tool: Tool,
+    target: &SequenceTarget,
+    current: &str,
+    sequence: &Sequence,
+) -> Result<String, String> {
+    let kind = sequence_type_label(sequence);
+    let letters = sequence.data.to_letters();
+
+    match target {
+        SequenceTarget::Molecule(index) => {
+            let mut boxes: Vec<Value> = serde_json::from_str(current)
+                .map_err(|error| format!("Molecule input is invalid JSON: {error}"))?;
+            let molecule = boxes
+                .get_mut(*index)
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| format!("Molecule {} is missing", index + 1))?;
+            molecule.insert("type".into(), json!(kind));
+            molecule.insert("sequence".into(), json!(letters));
+            molecule.remove("ligand");
+            molecule.remove("ion");
+            serde_json::to_string(&boxes).map_err(|error| error.to_string())
+        }
+        SequenceTarget::Document {
+            field,
+            job: _,
+            entity,
+        } if field == "input_fasta" => replace_fasta_record(current, *entity, kind, &letters),
+        SequenceTarget::Document {
+            field,
+            job: _,
+            entity,
+        } if field == "yaml_spec" => {
+            let mut document: Value = serde_yaml::from_str(current)
+                .map_err(|error| format!("YAML input is invalid: {error}"))?;
+            let item = document
+                .get_mut("sequences")
+                .and_then(Value::as_array_mut)
+                .and_then(|items| items.get_mut(*entity))
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| format!("Molecule {} is missing in the YAML", entity + 1))?;
+            replace_keyed_entity(item, kind, &letters);
+            serde_yaml::to_string(&document).map_err(|error| error.to_string())
+        }
+        SequenceTarget::Document { field, job, entity } if field == "input_json" => {
+            let mut document: Value = serde_json::from_str(current)
+                .map_err(|error| format!("JSON input is invalid: {error}"))?;
+            let entries = if tool == Tool::OpenFold3 {
+                let job_index = job.ok_or("Query is missing")?;
+                document
+                    .get_mut("queries")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|queries| queries.values_mut().nth(job_index))
+                    .and_then(|query| query.get_mut("chains"))
+                    .and_then(Value::as_array_mut)
+            } else if matches!(tool, Tool::OpenDde | Tool::Protenix) {
+                let job_index = job.ok_or("Job is missing")?;
+                document
+                    .as_array_mut()
+                    .and_then(|jobs| jobs.get_mut(job_index))
+                    .and_then(|job| job.get_mut("sequences"))
+                    .and_then(Value::as_array_mut)
+            } else {
+                document.get_mut("sequences").and_then(Value::as_array_mut)
+            }
+            .ok_or_else(|| "The JSON has no chain list".to_owned())?;
+            let item = entries
+                .get_mut(*entity)
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| format!("Molecule {} is missing in the JSON", entity + 1))?;
+
+            if tool == Tool::OpenFold3 {
+                let ids = item.remove("chain_ids").ok_or("Chain IDs are missing")?;
+                item.clear();
+                item.insert("chain_ids".into(), ids);
+                item.insert("molecule_type".into(), json!(kind));
+                item.insert("sequence".into(), json!(letters));
+            } else if matches!(tool, Tool::OpenDde | Tool::Protenix) {
+                let chain_key = match kind {
+                    "protein" => "proteinChain",
+                    "dna" => "dnaSequence",
+                    _ => "rnaSequence",
+                };
+                let old_key = [
+                    "proteinChain",
+                    "dnaSequence",
+                    "rnaSequence",
+                    "ligand",
+                    "ion",
+                ]
+                .into_iter()
+                .find(|old_key| item.contains_key(*old_key));
+                let old = old_key.and_then(|old_key| item.remove(old_key));
+                let mut details = if old_key == Some(chain_key) {
+                    old.unwrap_or_else(|| json!({}))
+                } else {
+                    let mut details = json!({});
+                    for key in ["id", "count"] {
+                        if let Some(value) = old.as_ref().and_then(|old| old.get(key)) {
+                            details[key] = value.clone();
+                        }
+                    }
+                    details
+                };
+                details["sequence"] = json!(letters);
+                item.insert(chain_key.into(), details);
+            } else if tool == Tool::AlphaFold3 {
+                replace_keyed_entity(item, kind, &letters);
+            } else {
+                item.insert("type".into(), json!(kind));
+                item.insert("sequence".into(), json!(letters));
+                item.remove("smiles");
+                item.remove("ccd");
+            }
+            serde_json::to_string_pretty(&document).map_err(|error| error.to_string())
+        }
+        SequenceTarget::Document { .. } => Err("Unsupported sequence input document".into()),
+    }
+}
+
+/// Put `letters` in a sequence entry keyed by its entity type, as Boltz's YAML and AlphaFold 3's
+/// JSON write them (`{"protein": {"id": "A", "sequence": ...}}`). An entry of the same type keeps
+/// its other details; one of another type keeps only its ID.
+fn replace_keyed_entity(item: &mut Map<String, Value>, kind: &str, letters: &str) {
+    let old_kind = ["protein", "dna", "rna", "ligand"]
+        .into_iter()
+        .find(|old_kind| item.contains_key(*old_kind));
+    let old = old_kind.and_then(|old_kind| item.remove(old_kind));
+    let mut details = if old_kind == Some(kind) {
+        old.unwrap_or_else(|| json!({}))
+    } else {
+        let id = old.as_ref().and_then(|old| old.get("id")).cloned();
+        let mut details = json!({});
+        if let Some(id) = id {
+            details["id"] = id;
+        }
+        details
+    };
+    details["sequence"] = json!(letters);
+    item.insert(kind.into(), details);
+}
+
+/// Byte offsets of each FASTA record's header and sequence body.
+fn fasta_record_spans(text: &str) -> Vec<(usize, usize, usize)> {
+    let mut headers = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with('>') {
+            headers.push((offset, offset + line.len()));
+        }
+        offset += line.len();
+    }
+
+    headers
+        .iter()
+        .enumerate()
+        .map(|(i, &(start, body_start))| {
+            let body_end = headers
+                .get(i + 1)
+                .map(|&(next, _)| next)
+                .unwrap_or(text.len());
+            (start, body_start, body_end)
+        })
+        .collect()
+}
+
+fn replace_fasta_record(
+    current: &str,
+    entity: usize,
+    kind: &str,
+    letters: &str,
+) -> Result<String, String> {
+    let spans = fasta_record_spans(current);
+    let &(start, body_start, body_end) = spans
+        .get(entity)
+        .ok_or_else(|| format!("Molecule {} is missing in the FASTA", entity + 1))?;
+    let header = current[start..body_start].trim_end_matches(['\r', '\n']);
+    let suffix = header.split_once('|').map(|(_, suffix)| suffix);
+    let line_ending = if current[start..body_start].ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let header = match suffix {
+        Some(suffix) => format!(">{kind}|{suffix}"),
+        None => format!(">{kind}"),
+    };
+    Ok(format!(
+        "{}{}{}{}{}{}",
+        &current[..start],
+        header,
+        line_ending,
+        letters,
+        line_ending,
+        &current[body_end..]
+    ))
+}
+
+fn document_sequence_targets(
+    tool: Tool,
+    field: &str,
+    current: &str,
+) -> Result<Vec<(String, SequenceTarget)>, String> {
+    let target = |job, entity| SequenceTarget::Document {
+        field: field.to_owned(),
+        job,
+        entity,
+    };
+
+    if field == "input_fasta" && tool == Tool::Chai1 {
+        return Ok(fasta_record_spans(current)
+            .into_iter()
+            .enumerate()
+            .map(|(entity, _)| (format!("Molecule {}", entity + 1), target(None, entity)))
+            .collect());
+    }
+
+    let document: Value = if field == "yaml_spec" && tool == Tool::Boltz2 {
+        serde_yaml::from_str(current).map_err(|error| format!("Invalid YAML: {error}"))?
+    } else if field == "input_json"
+        && matches!(
+            tool,
+            Tool::OpenDde | Tool::Protenix | Tool::EsmFold2 | Tool::AlphaFold3 | Tool::OpenFold3
+        )
+    {
+        serde_json::from_str(current).map_err(|error| format!("Invalid JSON: {error}"))?
+    } else {
+        return Ok(Vec::new());
+    };
+
+    let mut targets = Vec::new();
+    if tool == Tool::OpenFold3 {
+        let queries = document
+            .get("queries")
+            .and_then(Value::as_object)
+            .ok_or("Expected a queries object")?;
+        for (job_index, (name, query)) in queries.iter().enumerate() {
+            let Some(chains) = query.get("chains").and_then(Value::as_array) else {
+                continue;
+            };
+            for entity in 0..chains.len() {
+                targets.push((
+                    format!("{name} · Chain {}", entity + 1),
+                    target(Some(job_index), entity),
+                ));
+            }
+        }
+    } else if matches!(tool, Tool::OpenDde | Tool::Protenix) {
+        let jobs = document
+            .as_array()
+            .ok_or("Expected a list of prediction jobs")?;
+        for (job_index, job) in jobs.iter().enumerate() {
+            let Some(entries) = job.get("sequences").and_then(Value::as_array) else {
+                continue;
+            };
+            for entity in 0..entries.len() {
+                targets.push((
+                    format!("Job {} · Molecule {}", job_index + 1, entity + 1),
+                    target(Some(job_index), entity),
+                ));
+            }
+        }
+    } else {
+        let entries = document
+            .get("sequences")
+            .and_then(Value::as_array)
+            .ok_or("Expected a sequences list")?;
+        for entity in 0..entries.len() {
+            targets.push((format!("Molecule {}", entity + 1), target(None, entity)));
+        }
+    }
+    Ok(targets)
+}
+
+fn rfd3_document(
+    contract: &FormContract,
+    values: &mut HashMap<String, String>,
+    preset: Option<&Preset>,
+) -> Result<String, String> {
+    let name = values
+        .get("job_name")
+        .filter(|name| !name.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "design".into());
+    let previous =
+        values
+            .get("inputs")
+            .and_then(|document| match serde_json::from_str::<Value>(document) {
+                Ok(parsed) => Some(parsed),
+                Err(_) => serde_yaml::from_str(document).ok(),
+            });
+    let explicit: Vec<String> = previous
+        .as_ref()
+        .and_then(|document| document.get(&name))
+        .and_then(Value::as_object)
+        .map(|design| design.keys().cloned().collect())
+        .unwrap_or_else(|| {
+            preset
+                .map(|preset| preset.form_values().into_keys().collect())
+                .unwrap_or_default()
+        });
+    let mut design = Map::new();
+    for field in &contract.fields {
+        if !field
+            .input_modes
+            .split(',')
+            .any(|mode| mode == "parameters")
+        {
+            continue;
+        }
+        let owned = values.get(&field.name).cloned().unwrap_or_default();
+        let value = owned.trim();
+        if value.is_empty()
+            || (value == field.default_text()
+                && field.name != "length"
+                && !explicit.contains(&field.name))
+        {
+            continue;
+        }
+        let parsed = if field.name == "input" {
+            if let Some(asset) = value.strip_prefix("bio-tools://rfd3/") {
+                Value::String(format!("../{asset}"))
+            } else {
+                values.insert("spec_input_file".into(), value.to_owned());
+                Value::String("uploaded".into())
+            }
+        } else if field.name == "ori_token" && !value.starts_with('[') {
+            let coordinates: Result<Vec<f64>, _> = value
+                .split(',')
+                .map(|part| part.trim().parse::<f64>())
+                .collect();
+            let coordinates =
+                coordinates.map_err(|_| "ori_token needs three numbers".to_owned())?;
+            if coordinates.len() != 3 || coordinates.iter().any(|number| !number.is_finite()) {
+                return Err("ori_token needs three finite numbers".into());
+            }
+            json!(coordinates)
+        } else if matches!(field.kind(), FieldKind::Checkbox)
+            || matches!(field.name.as_str(), "is_non_loopy")
+        {
+            Value::Bool(matches!(value, "true" | "True" | "1" | "on"))
+        } else if field.name == "length" && value == "null" {
+            Value::Null
+        } else if matches!(field.kind(), FieldKind::Number)
+            || (field.name == "length" && value.parse::<u64>().is_ok())
+            || field.name == "dialect"
+        {
+            serde_json::from_str(value)
+                .map_err(|_| format!("{} is not a valid number", field.label))?
+        } else if value.starts_with('{') || value.starts_with('[') {
+            serde_json::from_str(value).map_err(|_| format!("{} is not valid JSON", field.label))?
+        } else {
+            Value::String(value.to_owned())
+        };
+        design.insert(field.name.clone(), parsed);
+    }
+    let document = json!({name: design});
+    serde_json::to_string_pretty(&document).map_err(|error| error.to_string())
+}
+
+fn rfd3_parameters(
+    contract: &FormContract,
+    values: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    let document = values.get("inputs").map(String::as_str).unwrap_or("");
+    let parsed: Value = match serde_json::from_str(document) {
+        Ok(parsed) => parsed,
+        Err(_) => serde_yaml::from_str(document).map_err(|error| {
+            format!("The RFDiffusion3 input is not valid JSON or YAML: {error}")
+        })?,
+    };
+    let designs = parsed
+        .as_object()
+        .ok_or("The RFDiffusion3 input must be an object of named designs")?;
+    if designs.len() != 1 {
+        return Err(
+            "Set parameters here describes one design. Keep multiple designs in the text mode."
+                .into(),
+        );
+    }
+    let (name, entry) = designs.iter().next().unwrap();
+    let entry = entry
+        .as_object()
+        .ok_or("The named design must be an object")?;
+    let fields: Vec<&FormField> = contract
+        .fields
+        .iter()
+        .filter(|field| {
+            field
+                .input_modes
+                .split(',')
+                .any(|mode| mode == "parameters")
+        })
+        .collect();
+    for key in entry.keys() {
+        if !fields.iter().any(|field| &field.name == key) {
+            return Err(format!("Set parameters here has no field for {key}"));
+        }
+    }
+    let mut updated: HashMap<String, String> = fields
+        .iter()
+        .map(|field| (field.name.clone(), field.default_text()))
+        .collect();
+    for (key, value) in entry {
+        let text = if key == "input" {
+            let source = value.as_str().ok_or("input must be a structure path")?;
+            if let Some(asset) = source.strip_prefix("../input_pdbs/") {
+                let reference = format!("bio-tools://rfd3/input_pdbs/{asset}");
+                bio_tools::tool_definitions::presets::input_text("rfd3", &reference)
+                    .map_err(|error| error.to_string())?;
+                reference
+            } else if source == "uploaded" {
+                values
+                    .get("spec_input_file")
+                    .filter(|path| !path.is_empty())
+                    .cloned()
+                    .ok_or("Choose the structure file before switching to parameters")?
+            } else if source.starts_with("bio-tools://rfd3/") {
+                bio_tools::tool_definitions::presets::input_text("rfd3", source)
+                    .map_err(|error| error.to_string())?;
+                source.to_owned()
+            } else {
+                return Err("Only a bundled example structure can be carried to parameters".into());
+            }
+        } else {
+            match value {
+                Value::Null if key == "length" => "null".into(),
+                Value::Null => String::new(),
+                Value::String(text) => text.clone(),
+                Value::Array(_) | Value::Object(_) => {
+                    serde_json::to_string_pretty(value).map_err(|error| error.to_string())?
+                }
+                _ => value.to_string(),
+            }
+        };
+        updated.insert(key.clone(), text);
+    }
+    values.extend(updated);
+    values.insert("job_name".into(), name.clone());
+    Ok(())
+}
+
+enum FileAction {
+    Input(Tool, String),
+    OrcaInput,
+    Export(PathBuf),
+    LoadRun(Tool),
+}
+
+#[derive(Clone)]
+enum SequenceTarget {
+    Molecule(usize),
+    Document {
+        field: String,
+        job: Option<usize>,
+        entity: usize,
+    },
+}
+
+enum JobResult {
+    Run(Result<AdapterResult, String>),
+    Install(Result<(), String>),
+    ProjectInput(io::Result<HashMap<String, String>>),
+}
+
+#[derive(Clone, Copy)]
+enum JobAction {
+    Run,
+    Install,
+    ProjectInput,
+}
+
+impl JobAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Run => "Running",
+            Self::Install => "Installing",
+            Self::ProjectInput => "Converting input",
+        }
+    }
+}
+
+/// A tool window: which tool is selected, each tool's form, the job running, and past results.
+pub(crate) struct ToolWindow {
+    tool: Tool,
+    forms: HashMap<Tool, Form>,
+    receiver: Option<mpsc::Receiver<JobResult>>,
+    control: Option<RunControl>,
+    started: Option<(Instant, JobAction)>,
+    error: Option<String>,
+    message: Option<String>,
+    results: Vec<(Tool, AdapterResult)>,
+    selected_result: usize,
+    selected_file: Option<PathBuf>,
+    preview: Option<String>,
+    dialog: FileDialog,
+    file_action: Option<FileAction>,
+    sequence_dialog: FileDialog,
+    sequence_file_target: Option<(Tool, SequenceTarget)>,
+    /// A sequence to load into the selected tool's input, and a job name.
+    /// See [`ToolWindows::load_structure_pred_seq`].
+    pending_sequence: Option<(Sequence, String)>,
+    /// When set, the window shows results only (without the input form), under this heading.
+    /// `None` shows the job setup form.
+    results_heading: Option<&'static str>,
+    boltz_outputs: HashMap<PathBuf, Vec<(String, Result<Value, String>)>>,
+    /// Height of the controls under the form, as of last frame.
+    footer_height: f32,
+    /// The ORCA backend's form, for the quantum chemistry window.
+    pub(super) orca: OrcaForm,
+    /// For the quantum chemistry window, which sets it each frame.
+    pub(super) active_mol: Option<ActiveMol>,
+    /// Work for the quantum chemistry window, which has the rest of the program's state.
+    request: Option<QcRequest>,
+    /// The input Psi4's "Set parameters here" makes, shown above it.
+    psi4_preview: Psi4Preview,
+}
+
+impl ToolWindow {
+    fn new(kind: ToolWindowKind) -> Self {
+        let tools = kind.tools();
+        let tool = tools
+            .iter()
+            .copied()
+            .find(|tool| tool.spec().is_supported())
+            .unwrap_or(tools[0]);
+
+        Self {
+            tool,
+            forms: HashMap::new(),
+            receiver: None,
+            control: None,
+            started: None,
+            error: None,
+            message: None,
+            results: Vec::new(),
+            selected_result: 0,
+            selected_file: None,
+            preview: None,
+            dialog: FileDialog::new(),
+            file_action: None,
+            sequence_dialog: FileDialog::with_config(
+                FileDialogConfig::default()
+                    .add_file_filter_extensions("Sequence files", seq_exts_open()),
+            )
+            .default_file_filter("Sequence files"),
+            sequence_file_target: None,
+            pending_sequence: None,
+            results_heading: None,
+            boltz_outputs: HashMap::new(),
+            footer_height: 0.,
+            orca: OrcaForm::default(),
+            active_mol: None,
+            request: None,
+            psi4_preview: Psi4Preview::default(),
+        }
+    }
+
+    pub(super) fn tool(&self) -> Tool {
+        self.tool
+    }
+
+    pub(super) fn set_tool(&mut self, tool: Tool) {
+        self.tool = tool;
+    }
+
+    pub(super) fn take_request(&mut self) -> Option<QcRequest> {
+        self.request.take()
+    }
+
+    pub(super) fn set_error(&mut self, error: String) {
+        self.message = None;
+        self.error = Some(error);
+    }
+
+    /// Replace the Psi4 geometry, e.g. with the active molecule's.
+    pub(super) fn set_psi4_geometry(&mut self, coordinates: String, name: &str) {
+        let Some(form) = self.forms.get_mut(&Tool::Psi4) else {
+            return;
+        };
+
+        // Psi4 uses the name as an identifier.
+        let mut name: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .take(60)
+            .collect();
+        if name.starts_with(|c: char| c.is_ascii_digit()) {
+            name.insert(0, 'm');
+        }
+
+        form.values.insert("coordinates".into(), coordinates);
+        form.values.insert("molecule_name".into(), name);
+        form.authoritative_mode = form.mode.clone();
+        form.projection_error = None;
+        self.error = None;
+    }
+
+    /// Start an ORCA run, whose result joins this window's results.
+    pub(super) fn start_orca(&mut self, ui: &Ui, computations: &Computations, job: OrcaJob) {
+        let computation = computations.start(
+            ComputationType::QuantumMechanics,
+            Tool::Orca.spec().name(),
+            Some(job.activity.clone()),
+        );
+        let control = RunControl::default();
+
+        self.control = Some(control.clone());
+        self.start_job(ui, JobAction::Run, computation, move || {
+            JobResult::Run(crate::orca::run(job, &control).map_err(|error| error.to_string()))
+        });
+    }
+
+    pub(crate) fn poll(&mut self) {
+        let Some(receiver) = &self.receiver else {
+            return;
+        };
+
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let message = "The worker stopped without returning a result.";
+                if matches!(self.started, Some((_, JobAction::ProjectInput))) {
+                    JobResult::ProjectInput(Err(io::Error::other(message)))
+                } else {
+                    JobResult::Run(Err(message.into()))
+                }
+            }
+        };
+
+        match result {
+            JobResult::Run(Ok(result)) => {
+                let first = primary_file(self.tool, &result);
+                let message = if remote_results_url(&result).is_some() {
+                    "Downloaded from athanortools.com. All raw results are retained on disk."
+                } else {
+                    "All raw results are retained on disk."
+                };
+
+                self.results.push((self.tool, result));
+                self.selected_result = self.results.len() - 1;
+                self.preview = first.as_ref().map(|path| preview_text(path));
+                self.selected_file = first;
+                self.message = Some(message.into());
+                self.results_heading = Some("Run complete");
+            }
+            JobResult::Run(Err(error)) | JobResult::Install(Err(error)) => self.error = Some(error),
+            JobResult::Install(Ok(())) => self.message = Some("Installation completed.".into()),
+            JobResult::ProjectInput(result) => {
+                if let Some(form) = self.forms.get_mut(&self.tool) {
+                    match result {
+                        Ok(values) => form.values.extend(values),
+                        Err(error) => form.projection_error = Some(error.to_string()),
+                    }
+                }
+            }
+        }
+
+        self.receiver = None;
+        self.control = None;
+        self.started = None;
+    }
+
+    pub(crate) fn for_binding() -> Self {
+        let mut window = Self::new(ToolWindowKind::StructurePrediction);
+        window.tool = Tool::Boltz2;
+        window
+    }
+
+    pub(crate) fn busy(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    /// Reuse installation, cancellation, retained run history, and structure import for a
+    /// workflow that builds scientific inputs from loaded molecules instead of raw fields.
+    pub(super) fn binding_controls(
+        &mut self,
+        computations: &Computations,
+        compute: &Compute,
+        lists: &mut PageLists,
+        ui: &mut Ui,
+        make_request: impl FnOnce() -> Result<crate::drug_design::binding::PredictionRequest, String>,
+    ) -> Option<PathBuf> {
+        self.poll();
+        self.handle_picked_file(ui);
+        self.progress_ui(ui);
+
+        let tool = Tool::Boltz2;
+        let spec = tool.spec();
+        let busy = self.busy();
+        let remote = compute.remote();
+        let installed = external_tools::is_installed(tool);
+        compute_guidance(tool, compute.target, compute.adapter, ui);
+
+        let mut run = false;
+        let mut install = false;
+        ui.horizontal_wrapped(|ui| {
+            run = ui
+                .add_enabled(
+                    !busy && (remote || (installed && spec.is_supported())),
+                    Button::new(RichText::new("Predict complex + affinity").color(COLOR_ACTION)),
+                )
+                .clicked();
+            if !installed && !remote {
+                install = ui
+                    .add_enabled(
+                        !busy && spec.can_install_here(),
+                        Button::new("Install Boltz-2"),
+                    )
+                    .clicked();
+            }
+            if ui.button("Open saved run…").clicked() {
+                self.file_action = Some(FileAction::LoadRun(tool));
+                self.dialog.pick_file();
+            }
+        });
+        if install {
+            let computation = computations.start(
+                ComputationType::Install,
+                spec.name(),
+                Some("installing".into()),
+            );
+            self.start_job(ui, JobAction::Install, computation, move || {
+                JobResult::Install(external_tools::install(tool).map_err(|e| e.to_string()))
+            });
+        }
+        if run {
+            match make_request() {
+                Err(error) => self.error = Some(error),
+                Ok(request) => {
+                    let computation = computations.start(
+                        ComputationType::MachineLearning,
+                        spec.name(),
+                        Some(activity("complex and affinity prediction", remote)),
+                    );
+                    let control = RunControl::default();
+                    let token = remote_token(compute.token);
+
+                    self.control = Some(control.clone());
+                    self.start_job(ui, JobAction::Run, computation, move || {
+                        let result = if remote {
+                            request.run_remote(token, &control)
+                        } else {
+                            request.run(&control)
+                        };
+
+                        JobResult::Run(result.map_err(|e| e.to_string()))
+                    });
+                }
+            }
+        }
+        self.status_ui(ui);
+        if !self.results.is_empty() {
+            ui.small("Results below belong to their saved inputs, which may differ from the current controls.");
+        }
+        self.results_ui(lists, ui)
+    }
+
+    /// Start a job on a worker thread, reporting through [`Self::poll`]. `computation` is released
+    /// when the job finishes.
+    fn start_job(
+        &mut self,
+        ui: &Ui,
+        action: JobAction,
+        computation: ComputationGuard,
+        job: impl FnOnce() -> JobResult + Send + 'static,
+    ) {
+        let (sender, receiver) = mpsc::channel();
+        let context = ui.ctx().clone();
+
+        self.receiver = Some(receiver);
+        self.started = Some((Instant::now(), action));
+        self.error = None;
+        self.message = None;
+
+        thread::spawn(move || {
+            let result = job();
+            drop(computation);
+
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// Draw the window. Returns a result file the user asked to load as a structure.
+    fn draw(
+        &mut self,
+        kind: ToolWindowKind,
+        proteins: &[MoleculePeptide],
+        sequences: &[Sequence],
+        computations: &Computations,
+        compute: &Compute,
+        install_pending: bool,
+        ui: &mut Ui,
+    ) -> Option<PathBuf> {
+        let tools = kind.tools();
+        let remote = compute.remote();
+
+        self.poll();
+        self.handle_picked_file(ui);
+        self.handle_picked_sequence_file(ui);
+
+        // A sequence sent here from elsewhere goes into the form, so show it.
+        if self.pending_sequence.is_some() {
+            self.results_heading = None;
+        }
+
+        if let Some(heading) = self.results_heading {
+            return self.results_page(heading, ui);
+        }
+
+        let busy = self.receiver.is_some();
+
+        // The quantum chemistry window draws its backend picker beside its compute selector.
+        if kind != ToolWindowKind::QuantumChemistry {
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    ComboBox::from_id_salt("scientific_tool")
+                        .selected_text(self.tool.spec().name())
+                        .show_ui(ui, |ui| {
+                            for tool in tools {
+                                ui.selectable_value(&mut self.tool, *tool, tool.spec().name());
+                            }
+                        });
+                });
+
+                ui.add_space(COL_SPACING);
+                tool_links(self.tool, ui);
+            });
+
+            compute_guidance(self.tool, compute.target, compute.adapter, ui);
+        }
+
+        if self.tool == Tool::Orca {
+            self.draw_orca(remote, ui);
+            return None;
+        }
+
+        let spec = self.tool.spec();
+
+        if let Entry::Vacant(entry) = self.forms.entry(self.tool) {
+            match Form::new(self.tool) {
+                Ok(form) => {
+                    entry.insert(form);
+                }
+                Err(error) => {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                    return None;
+                }
+            }
+        }
+
+        if let Some((sequence, job_name)) = self.pending_sequence.take() {
+            let form = self.forms.get_mut(&self.tool).unwrap();
+
+            match form.load_sequence(self.tool, &sequence) {
+                Ok(()) => {
+                    if form.contract.field("job_name").is_some() {
+                        form.values.insert("job_name".into(), job_name);
+                    }
+
+                    self.error = None;
+                    self.message = Some(format!(
+                        "Loaded {} into the input.",
+                        sequence.display_name()
+                    ));
+                }
+                Err(error) => self.error = Some(error),
+            }
+        }
+
+        self.progress_ui(ui);
+
+        let mut pick = None;
+        let mut pick_sequence = None;
+        let mut use_sequence = None;
+        let mut use_protein = None;
+        let mut use_active_mol = false;
+        let mut project_input = false;
+        let form = self.forms.get_mut(&self.tool).unwrap();
+
+        ui.add_enabled_ui(!busy, |ui| {
+            preset_ui(self.tool, form, ui);
+            project_input = mode_and_task_ui(self.tool, form, ui);
+            ui.add_space(ROW_SPACING);
+
+            if form.contract.structure_field(&form.mode).is_some() && !proteins.is_empty() {
+                ui.label("Choose an opened protein");
+                ui.horizontal_wrapped(|ui| {
+                    for (index, protein) in proteins.iter().enumerate() {
+                        let name = protein
+                            .common
+                            .name
+                            .as_deref()
+                            .unwrap_or(&protein.common.ident);
+                        let mut text = RichText::new(name);
+                        if form.opened_protein == Some(index) {
+                            text = text.color(COLOR_HIGHLIGHT);
+                        }
+
+                        if ui.button(text).clicked() {
+                            use_protein = Some(index);
+                        }
+                    }
+                });
+                ui.add_space(ROW_SPACING);
+            }
+
+            if let Some(index) = use_protein
+                && let Some(field) = form.contract.structure_field(&form.mode)
+            {
+                form.values.insert(field.name.clone(), String::new());
+                form.authoritative_mode = form.mode.clone();
+                form.opened_protein = Some(index);
+            }
+
+            if self.tool == Tool::Psi4 && form.mode == "parameters" {
+                let mut values = form.contract.defaults();
+                for field in &form.contract.fields {
+                    if field.applies_to("parameters")
+                        && let Some(value) = form.values.get(&field.name)
+                    {
+                        values.insert(field.name.clone(), value.clone());
+                    }
+                }
+                self.psi4_preview.update(values, ui.ctx());
+
+                let height = (ui.available_height() * 0.3).clamp(60., 280.);
+                quantum_chem::input_preview_ui(
+                    &self.psi4_preview.preview,
+                    "psi4_input_preview",
+                    height,
+                    ui,
+                );
+            }
+
+            fields_ui(
+                self.tool,
+                kind,
+                form,
+                proteins,
+                sequences,
+                &mut pick,
+                &mut pick_sequence,
+                &mut use_sequence,
+                &mut use_active_mol,
+                self.footer_height,
+                ui,
+            );
+        });
+
+        if use_active_mol {
+            self.request = Some(QcRequest::Psi4Geometry);
+        }
+
+        if let Some((target, index)) = use_sequence
+            && let Some(sequence) = sequences.get(index)
+        {
+            match form.insert_sequence(self.tool, &target, sequence) {
+                Ok(()) => self.error = None,
+                Err(error) => self.error = Some(error),
+            }
+        }
+
+        if let Some(target) = pick_sequence {
+            self.sequence_file_target = Some((self.tool, target));
+            self.sequence_dialog.pick_file();
+        }
+
+        if let Some(field) = pick {
+            if self.tool == Tool::Psi4
+                && let Some(field) = form.contract.field(&field)
+            {
+                quantum_chem::filter_input_files(self.dialog.config_mut(), field);
+            }
+            self.file_action = Some(FileAction::Input(self.tool, field));
+            self.dialog.pick_file();
+        }
+
+        if use_protein.is_some() {
+            self.error = None;
+        }
+
+        // Not allocated in `ui`, as a frame of overflow would grow the window for good. Its space
+        // is reserved below, from last frame's height.
+        let mut footer = ui.new_child(UiBuilder::new().max_rect(ui.available_rect_before_wrap()));
+
+        let mut install = false;
+        let mut run = false;
+        let installed = !install_pending && external_tools::is_installed(self.tool);
+        let busy = busy || project_input;
+
+        footer.horizontal(|ui| {
+            if remote || installed {
+                run = ui
+                    .add_enabled(
+                        !busy && (remote || spec.is_supported()) && form.projection_error.is_none(),
+                        Button::new(RichText::new("Run").color(COLOR_ACTION)),
+                    )
+                    .clicked();
+            } else if kind != ToolWindowKind::QuantumChemistry {
+                install = ui
+                    .add_enabled(
+                        !busy && spec.can_install_here(),
+                        Button::new(RichText::new("Install / repair tool").color(COLOR_ACTION)),
+                    )
+                    .clicked();
+            }
+
+            let note = if remote {
+                "Runs on athanortools.com. Raw outputs are downloaded and saved locally."
+            } else if self.tool == Tool::Psi4 {
+                "Runs locally on the CPU."
+            } else {
+                "Raw outputs are saved locally."
+            };
+            ui.label(RichText::new(note).small());
+            if ui
+                .add_enabled(
+                    self.tool != Tool::Psi4 || !busy,
+                    Button::new("Open saved run…"),
+                )
+                .on_hover_text("Choose result.json from a saved run folder.")
+                .clicked()
+            {
+                self.file_action = Some(FileAction::LoadRun(self.tool));
+                self.dialog.config_mut().default_file_filter = None;
+                self.dialog.pick_file();
+            }
+        });
+
+        let tool = self.tool;
+        let payload = run.then(|| form.run_payload(tool, proteins));
+
+        if project_input {
+            let target = form.mode.clone();
+            let mut values = form.contract.defaults();
+            let mut target_values = HashMap::new();
+            for field in &form.contract.fields {
+                if field.applies_to(&form.authoritative_mode)
+                    && let Some(value) = form.values.get(&field.name)
+                {
+                    values.insert(field.name.clone(), value.clone());
+                }
+                if field.input_modes == target {
+                    target_values.insert(field.name.clone(), field.default_text());
+                }
+            }
+            let computation = computations.start(
+                ComputationType::QuantumMechanics,
+                spec.name(),
+                Some("converting input".into()),
+            );
+            self.start_job(ui, JobAction::ProjectInput, computation, move || {
+                let result = external_tools::psi4::project(&values, &target).map(|projected| {
+                    target_values.extend(projected);
+
+                    target_values
+                });
+                JobResult::ProjectInput(result)
+            });
+        }
+
+        if install {
+            let computation = computations.start(
+                ComputationType::Install,
+                spec.name(),
+                Some("installing".to_owned()),
+            );
+
+            self.start_job(ui, JobAction::Install, computation, move || {
+                JobResult::Install(external_tools::install(tool).map_err(|error| error.to_string()))
+            });
+        }
+
+        if let Some(payload) = payload {
+            match payload {
+                Err(error) => self.error = Some(error.to_string()),
+                Ok(payload) => {
+                    let comp_type = match kind {
+                        ToolWindowKind::QuantumChemistry => ComputationType::QuantumMechanics,
+                        _ => ComputationType::MachineLearning,
+                    };
+                    let computation = computations.start(
+                        comp_type,
+                        spec.name(),
+                        Some(activity(kind.activity(), remote)),
+                    );
+
+                    let control = RunControl::default();
+                    let token = remote_token(compute.token);
+
+                    self.control = Some(control.clone());
+                    self.start_job(ui, JobAction::Run, computation, move || {
+                        let result = if remote {
+                            remote::run(tool, payload, token, &control)
+                        } else {
+                            shared_adapter::run(tool, payload, &control)
+                        };
+
+                        JobResult::Run(result.map_err(|error| error.to_string()))
+                    });
+                }
+            }
+        }
+
+        self.footer_end(footer, busy, ui);
+
+        None
+    }
+
+    /// The ORCA backend's form and controls.
+    fn draw_orca(&mut self, remote: bool, ui: &mut Ui) {
+        let busy = self.busy();
+        self.progress_ui(ui);
+
+        let mut event = Default::default();
+        ui.add_enabled_ui(!busy, |ui| {
+            event = quantum_chem::orca::form_ui(
+                &mut self.orca,
+                self.active_mol.as_ref(),
+                self.footer_height,
+                ui,
+            );
+        });
+        let quantum_chem::orca::FormEvent {
+            pick_file,
+            make_text,
+            use_active_mol,
+        } = event;
+
+        if pick_file {
+            quantum_chem::orca::filter_input_files(self.dialog.config_mut());
+            self.file_action = Some(FileAction::OrcaInput);
+            self.dialog.pick_file();
+        }
+        if make_text {
+            self.request = Some(QcRequest::OrcaText);
+        }
+        if use_active_mol {
+            self.request = Some(QcRequest::OrcaGeometry);
+        }
+
+        // See `draw`.
+        let mut footer = ui.new_child(UiBuilder::new().max_rect(ui.available_rect_before_wrap()));
+        let installed = external_tools::is_installed(Tool::Orca);
+        let not_ready = self.orca.not_ready();
+
+        footer.horizontal(|ui| {
+            let blocker = if remote {
+                Some("ORCA isn't available remotely. Set Compute to Local.")
+            } else if !installed {
+                Some("ORCA isn't installed, or isn't on the PATH.")
+            } else {
+                not_ready
+            };
+
+            let run = ui
+                .add_enabled(
+                    !busy && blocker.is_none(),
+                    Button::new(RichText::new("Run").color(COLOR_ACTION)),
+                )
+                .on_hover_text("Run ORCA. Its files are kept, and listed when it finishes.")
+                .on_disabled_hover_text(blocker.unwrap_or("Running…"))
+                .clicked();
+            if run {
+                self.request = Some(QcRequest::OrcaRun);
+            }
+
+            if remote {
+                ui.label(RichText::new("Local only").small().color(COLOR_AMBER));
+            } else {
+                ui.label(RichText::new("Runs locally on the CPU.").small());
+            }
+
+            if ui
+                .add_enabled(!busy, Button::new("Open saved run…"))
+                .on_hover_text("Choose result.json from a saved run folder.")
+                .clicked()
+            {
+                self.file_action = Some(FileAction::LoadRun(Tool::Orca));
+                self.dialog.config_mut().default_file_filter = None;
+                self.dialog.pick_file();
+            }
+        });
+
+        self.footer_end(footer, busy, ui);
+    }
+
+    /// The status, a link to past results, and reserving the footer's space in `ui`.
+    fn footer_end(&mut self, mut footer: Ui, busy: bool, ui: &mut Ui) {
+        self.status_ui(&mut footer);
+
+        if !self.results.is_empty() && !busy {
+            footer.add_space(ROW_SPACING);
+            if footer
+                .button("View results ▶")
+                .on_hover_text("Show the results of this window's previous runs.")
+                .clicked()
+            {
+                self.error = None;
+                self.message = None;
+                self.results_heading = Some("Previous results");
+            }
+        }
+
+        ui.add_space(self.footer_height);
+
+        // Whole pixels, so `add_space`'s rounding can't creep the window taller.
+        let footer_height = footer.min_rect().height().ceil();
+        if footer_height != self.footer_height {
+            self.footer_height = footer_height;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// The error and status message, if any. A multi-line error, e.g. a failed run's output, scrolls
+    /// within a capped height, starting at its end, where the cause usually is.
+    fn status_ui(&self, ui: &mut Ui) {
+        if let Some(error) = &self.error {
+            match error.split_once('\n') {
+                Some((first, rest)) => {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(Color32::LIGHT_RED, first);
+                        if ui.small_button("Copy").clicked() {
+                            ui.ctx().copy_text(error.clone());
+                        }
+                    });
+
+                    // Salted with the length, so a new error starts scrolled to its end.
+                    ScrollArea::vertical()
+                        .id_salt(("tool_error", error.len()))
+                        .max_height(ERROR_MAX_HEIGHT)
+                        .auto_shrink([false, true])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(rest).monospace().color(Color32::LIGHT_RED));
+                        });
+                }
+                None => {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+            }
+        }
+        if let Some(message) = &self.message {
+            ui.label(message);
+        }
+    }
+
+    /// The window after a run: its results only, and a way back to the job setup form.
+    fn results_page(&mut self, heading: &str, ui: &mut Ui) -> Option<PathBuf> {
+        if ui.button("◀ Back to job setup").clicked() {
+            self.results_heading = None;
+            self.error = None;
+            self.message = None;
+            return None;
+        }
+        ui.add_space(ROW_SPACING);
+
+        ui.label(
+            RichText::new(heading)
+                .color(Color32::LIGHT_GREEN)
+                .size(16.)
+                .strong(),
+        );
+
+        // E.g. a saved run loaded while another is still going.
+        self.progress_ui(ui);
+        self.status_ui(ui);
+        ui.add_space(ROW_SPACING);
+
+        flex_lists::page(ui, "tool_results_page", |ui, lists| {
+            self.results_ui(lists, ui)
+        })
+    }
+
+    /// Route a file the dialog returned: into a form field, or as the destination of an export.
+    fn handle_picked_file(&mut self, ui: &Ui) {
+        self.dialog.update(ui.ctx());
+        let Some(path) = self.dialog.take_picked() else {
+            return;
+        };
+
+        match self.file_action.take() {
+            Some(FileAction::Input(tool, field)) => {
+                if let Some(form) = self.forms.get_mut(&tool) {
+                    if form
+                        .contract
+                        .structure_field(&form.mode)
+                        .is_some_and(|structure| structure.name == field)
+                    {
+                        form.opened_protein = None;
+                    }
+                    if tool == Tool::Psi4 {
+                        quantum_chem::set_file_format(&mut form.values, &path);
+                    } else {
+                        form.authoritative_mode = form.mode.clone();
+                    }
+                    form.values.insert(field, path.display().to_string());
+                }
+            }
+            Some(FileAction::OrcaInput) => self.orca.input_file = path.display().to_string(),
+            Some(FileAction::Export(source)) => match fs::copy(&source, &path) {
+                Ok(_) => self.message = Some(format!("Saved {}", path.display())),
+                Err(error) => self.error = Some(error.to_string()),
+            },
+            Some(FileAction::LoadRun(tool)) => {
+                match AdapterResult::load(path.parent().unwrap_or(Path::new(".")).to_owned()) {
+                    Ok(result) => {
+                        let saved_slug = result.details.get("tool_slug").and_then(Value::as_str);
+                        let tool = Tool::ALL
+                            .into_iter()
+                            .find(|candidate| Some(candidate.spec().catalog_slug) == saved_slug)
+                            .unwrap_or(tool);
+                        self.selected_file = primary_file(tool, &result);
+                        self.preview = self.selected_file.as_ref().map(|path| preview_text(path));
+                        self.selected_result = self.results.len();
+                        self.results.push((tool, result));
+                        self.error = None;
+                        self.message = None;
+                        self.results_heading = Some("Saved run loaded");
+                    }
+                    Err(error) => self.error = Some(error.to_string()),
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn handle_picked_sequence_file(&mut self, ui: &Ui) {
+        self.sequence_dialog.update(ui.ctx());
+        let Some(path) = self.sequence_dialog.take_picked() else {
+            return;
+        };
+        let Some((tool, target)) = self.sequence_file_target.take() else {
+            return;
+        };
+
+        let loaded = match load_sequences(&path) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.error = Some(format!("Could not open sequence file: {error}"));
+                return;
+            }
+        };
+        let Some(sequence) = loaded.records.first() else {
+            return;
+        };
+        let Some(form) = self.forms.get_mut(&tool) else {
+            return;
+        };
+
+        match form.insert_sequence(tool, &target, sequence) {
+            Ok(()) => {
+                self.error = None;
+                let mut message = format!("Loaded {} into the input.", sequence.display_name());
+                if loaded.records.len() > 1 {
+                    message.push_str(" Used the first record in the file.");
+                }
+                if loaded.skipped_residues > 0 {
+                    message.push_str(&format!(
+                        " {} unsupported residue letter(s) were omitted.",
+                        loaded.skipped_residues
+                    ));
+                }
+                self.message = Some(message);
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    /// The spinner, elapsed time, and cancel button for a running job.
+    fn progress_ui(&self, ui: &mut Ui) {
+        let Some((started, action)) = self.started else {
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.spinner();
+            let elapsed = started.elapsed().as_secs();
+            ui.label(format!(
+                "{} · {}m {:02}s",
+                action.label(),
+                elapsed / 60,
+                elapsed % 60
+            ));
+
+            if let Some(control) = &self.control {
+                if let Some(note) = control.note() {
+                    ui.label(note);
+                }
+
+                if ui
+                    .add_enabled(!control.is_abort_requested(), Button::new("Abort run"))
+                    .clicked()
+                {
+                    control.cancel();
+                }
+                if control.is_abort_requested() {
+                    ui.label("Stopping…");
+                }
+            }
+        });
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
+    }
+
+    /// Past runs: their files, a preview, and the adapter's diagnostics.
+    fn results_ui(&mut self, lists: &mut PageLists, ui: &mut Ui) -> Option<PathBuf> {
+        if self.results.is_empty() {
+            return None;
+        }
+
+        let previous = self.selected_result;
+        ComboBox::from_id_salt("tool_result_history")
+            .selected_text(format!(
+                "Result {} · {}",
+                self.selected_result + 1,
+                self.results[self.selected_result].0.spec().name()
+            ))
+            .show_ui(ui, |ui| {
+                for (index, (tool, _)) in self.results.iter().enumerate() {
+                    ui.selectable_value(
+                        &mut self.selected_result,
+                        index,
+                        format!("Run {} · {}", index + 1, tool.spec().name()),
+                    );
+                }
+            });
+        if previous != self.selected_result {
+            let (tool, result) = &self.results[self.selected_result];
+            self.selected_file = primary_file(*tool, result);
+            self.preview = self.selected_file.as_ref().map(|path| preview_text(path));
+        }
+
+        let (tool, result) = &self.results[self.selected_result];
+        if *tool == Tool::Psi4 {
+            quantum_chem::summary_ui(&result.details, lists, ui);
+        }
+        if *tool == Tool::Orca
+            && let Some(apply) = quantum_chem::orca::summary_ui(&result.details, lists, ui)
+        {
+            self.request = Some(QcRequest::Apply(apply));
+        }
+        if *tool == Tool::Boltz2 {
+            let outputs = self
+                .boltz_outputs
+                .entry(result.directory.clone())
+                .or_insert_with(|| {
+                    let provenance = result.directory.join("binding-input.json");
+                    result
+                        .files
+                        .iter()
+                        .chain(provenance.is_file().then_some(&provenance))
+                        .filter_map(|path| {
+                            let name = path.file_name()?.to_str()?;
+                            if !(name.starts_with("affinity_")
+                                || name.starts_with("confidence_")
+                                || name == "binding-input.json")
+                                || !name.ends_with(".json")
+                            {
+                                return None;
+                            }
+                            let value = read_output_text(path, MAX_PREVIEW_BYTES)
+                                .map_err(|e| e.to_string())
+                                .and_then(|text| {
+                                    serde_json::from_str(&text).map_err(|e| e.to_string())
+                                });
+                            Some((name.to_owned(), value))
+                        })
+                        .collect()
+                });
+            boltz_summary_ui(outputs, ui);
+        }
+        let mut load = None;
+
+        // The predicted structures are the main output; list them first so they can be opened
+        // without hunting through the full file list.
+        let structures: Vec<&PathBuf> = result
+            .files
+            .iter()
+            .filter(|path| output_category(path) == Some(DataCategory::Structure))
+            .collect();
+        if !structures.is_empty() {
+            ui.label(RichText::new("Structures").strong());
+            lists.show(ui, "tool_result_structures", 160.0, |ui| {
+                for path in structures {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new("Load structure").color(COLOR_ACTION))
+                            .clicked()
+                        {
+                            match structure_for_loading(path, &result.directory) {
+                                Ok(path) => load = Some(path),
+                                Err(error) => self.error = Some(error.to_string()),
+                            }
+                        }
+                        ui.label(output_label(*tool, result, path))
+                            .on_hover_text(path.display().to_string());
+                    });
+                }
+            });
+            ui.add_space(4.0);
+        }
+
+        let mut export = None;
+        ui.horizontal(|ui| {
+            if let Some(path) = &self.selected_file
+                && ui.button("Save selected output…").clicked()
+            {
+                export = Some(path.clone());
+            }
+            if result.archive.is_file() && ui.button("Save raw results (.zip)…").clicked() {
+                export = Some(result.archive.clone());
+            }
+            if ui.button("Open run folder").clicked()
+                && let Err(error) = open_dir(&result.directory)
+            {
+                self.error = Some(error.to_string());
+            }
+            if let Some(url) = remote_results_url(result) {
+                ui.hyperlink_to("View on athanortools.com", url);
+            }
+        });
+
+        lists.show(ui, "tool_result_files", 180.0, |ui| {
+            for path in &result.files {
+                ui.horizontal(|ui| {
+                    if output_category(path) == Some(DataCategory::Structure)
+                        && ui
+                            .button(RichText::new("Load structure").color(COLOR_ACTION))
+                            .clicked()
+                    {
+                        match structure_for_loading(path, &result.directory) {
+                            Ok(path) => load = Some(path),
+                            Err(error) => self.error = Some(error.to_string()),
+                        }
+                    }
+                    if ui.button("Save…").clicked() {
+                        export = Some(path.clone());
+                    }
+
+                    let label = output_label(*tool, result, path);
+                    if ui
+                        .selectable_label(self.selected_file.as_ref() == Some(path), label)
+                        .on_hover_text(path.display().to_string())
+                        .clicked()
+                    {
+                        self.selected_file = Some(path.clone());
+                        self.preview = Some(preview_text(path));
+                    }
+                });
+            }
+        });
+
+        if let Some(text) = &self.preview {
+            if self
+                .selected_file
+                .as_ref()
+                .is_some_and(|path| output_category(path) == Some(DataCategory::Sequence))
+            {
+                sequence_results_ui(text, lists, ui);
+            }
+            ui.horizontal(|ui| {
+                ui.label("Selected output");
+                if ui.button("Copy text").clicked() {
+                    ui.ctx().copy_text(text.clone());
+                }
+            });
+            lists.show(ui, "tool_output_preview", 220.0, |ui| {
+                ui.add(
+                    TextEdit::multiline(&mut text.as_str())
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY),
+                );
+            });
+        }
+
+        CollapsingHeader::new("Run details and diagnostics").show(ui, |ui| {
+            let text = serde_json::to_string_pretty(&result.details).unwrap_or_default();
+            if ui.button("Copy details").clicked() {
+                ui.ctx().copy_text(text.clone());
+            }
+            lists.show(ui, "tool_run_details", 180.0, |ui| {
+                ui.label(RichText::new(text).monospace());
+            });
+        });
+
+        if let Some(path) = export {
+            self.dialog.config_mut().default_file_filter = None;
+            self.dialog.config_mut().default_file_name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            self.file_action = Some(FileAction::Export(path));
+            self.dialog.save_file();
+        }
+        load
+    }
+}
+
+/// Scientific summaries keep both affinity heads and structural confidence separate.
+fn boltz_summary_ui(outputs: &[(String, Result<Value, String>)], ui: &mut Ui) {
+    use crate::drug_design::binding::AffinityPrediction;
+
+    ui.strong("Predicted affinity · Boltz-2");
+    if let Some((_, Ok(input))) = outputs
+        .iter()
+        .find(|(name, _)| name == "binding-input.json")
+    {
+        ui.label(format!(
+            "Saved job: {} · protein: {}",
+            input["job_name"].as_str().unwrap_or("—"),
+            input["protein"]["identifier"].as_str().unwrap_or("—")
+        ));
+        ui.label(format!(
+            "Ligand SMILES: {}",
+            input["ligand_smiles"].as_str().unwrap_or("—")
+        ));
+    }
+    let mut found = false;
+    for (name, value) in outputs
+        .iter()
+        .filter(|(name, _)| name.starts_with("affinity_"))
+    {
+        found = true;
+        ui.label(name);
+        let prediction = value
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(AffinityPrediction::parse);
+        match prediction {
+            Err(error) => {
+                ui.colored_label(Color32::ORANGE, error);
+            }
+            Ok(prediction) => {
+                match prediction.binder_probability {
+                    Some(p) => {
+                        ui.label(format!("Binder probability: {p:.3} (hit discovery)"));
+                    }
+                    None => {
+                        ui.label("Binder probability: not reported");
+                    }
+                }
+                match prediction.log_ic50_um {
+                    Some(y) => {
+                        ui.label(format!(
+                            "Affinity: {y:.3} log10(IC50 / µM); lower is stronger"
+                        ));
+                        let micromolar = 10_f64.powf(y);
+                        if micromolar.is_finite() && micromolar > 0. {
+                            ui.label(format!(
+                                "IC50 equivalent: {micromolar:.3e} µM · pIC50: {:.3}",
+                                6. - y
+                            ));
+                        }
+                    }
+                    None => {
+                        ui.label("Continuous affinity: not reported");
+                    }
+                }
+            }
+        }
+    }
+    if !found {
+        ui.colored_label(Color32::ORANGE, "No affinity output in this run. A structure alone does not provide an affinity estimate.");
+    }
+    ui.small("Continuous affinity is for comparing active compounds. These are model predictions for the generated complex, not measured Kd or Ki.");
+    CollapsingHeader::new("Structural confidence · separate from affinity").show(ui, |ui| {
+        for (name, value) in outputs
+            .iter()
+            .filter(|(name, _)| name.starts_with("confidence_"))
+        {
+            ui.label(name);
+            match value {
+                Ok(value) => {
+                    for (key, label) in [
+                        ("confidence_score", "Complex confidence"),
+                        ("ligand_iptm", "Ligand interface ipTM"),
+                    ] {
+                        if let Some(v) = value
+                            .get(key)
+                            .and_then(Value::as_f64)
+                            .filter(|v| v.is_finite())
+                        {
+                            ui.label(format!("{label}: {v:.3}"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    ui.colored_label(Color32::ORANGE, error);
+                }
+            }
+        }
+    });
+    ui.hyperlink_to(
+        "Boltz output definitions",
+        "https://github.com/jwohlwend/boltz/blob/main/docs/prediction.md#output",
+    );
+    ui.separator();
+}
+
+/// The athanortools.com page of a run made there.
+fn remote_results_url(result: &AdapterResult) -> Option<&str> {
+    result.details["remote"]["results_url"].as_str()
+}
+
+/// What a run does, for the computation status display.
+fn activity(what: &str, remote: bool) -> String {
+    if remote {
+        format!("{what} on athanortools.com")
+    } else {
+        what.to_owned()
+    }
+}
+
+/// The text shown when an output file is selected.
+fn preview_text(path: &Path) -> String {
+    read_output_text(path, MAX_PREVIEW_BYTES).unwrap_or_else(|error| error.to_string())
+}
+
+fn read_output_text(path: &Path, maximum: u64) -> io::Result<String> {
+    let file = fs::File::open(path)?;
+    let reader: Box<dyn Read> = if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gz"))
+    {
+        Box::new(flate2::read::GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+    let mut bytes = Vec::new();
+    reader.take(maximum + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > maximum {
+        return Err(io::Error::other(
+            "This output is too large for inline preview. Save the original file to inspect it.",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::other("Binary output. Save the original file to inspect it."))
+}
+
+/// An output's path relative to the run's `outputs` folder, when it is under it.
+fn output_label(tool: Tool, result: &AdapterResult, path: &Path) -> String {
+    if tool == Tool::Psi4
+        && let Some(label) = quantum_chem::output_name(path)
+    {
+        return label.into();
+    }
+    if tool == Tool::Orca {
+        return match quantum_chem::orca::output_name(path) {
+            Some(label) => label.into(),
+            None => path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into(),
+            ),
+        };
+    }
+
+    let log_root = result
+        .details
+        .get("run_log_dir")
+        .and_then(Value::as_str)
+        .map(Path::new);
+
+    log_root
+        .and_then(|root| path.strip_prefix(root.join("outputs")).ok())
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn output_category(path: &Path) -> Option<DataCategory> {
+    let name = path.to_string_lossy().to_lowercase();
+    let name = name.strip_suffix(".gz").unwrap_or(&name);
+    if name.ends_with(".xyz") {
+        return Some(DataCategory::Structure);
+    }
+
+    [
+        DataCategory::Structure,
+        DataCategory::Sequence,
+        DataCategory::Table,
+    ]
+    .into_iter()
+    .find(|kind| kind.suffixes().iter().any(|suffix| name.ends_with(suffix)))
+}
+
+fn primary_file(tool: Tool, result: &AdapterResult) -> Option<PathBuf> {
+    if tool == Tool::Orca {
+        return quantum_chem::orca::primary_file(&result.details, &result.files);
+    }
+
+    if tool == Tool::Psi4
+        && let Some(geometry) = result
+            .files
+            .iter()
+            .find(|path| quantum_chem::is_final_geometry(path))
+    {
+        return Some(geometry.clone());
+    }
+
+    let category = tool
+        .spec()
+        .catalog()
+        .and_then(|entry| entry.primary_output)
+        .map(|kind| kind.category());
+    result
+        .files
+        .iter()
+        .find(|path| category.is_some() && output_category(path) == category)
+        .or_else(|| result.files.first())
+        .cloned()
+}
+
+fn structure_for_loading(path: &Path, directory: &Path) -> io::Result<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let gzip = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gz"));
+    let ent = path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ent"));
+    if !gzip && !ent {
+        return Ok(path.to_owned());
+    }
+    let name = if gzip {
+        path.file_stem()
+    } else {
+        path.file_name()
+    }
+    .unwrap_or_default();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hash);
+    let folder = directory
+        .join("viewer")
+        .join(format!("{:x}", hash.finish()));
+    fs::create_dir_all(&folder)?;
+    let mut destination = folder.join(name);
+    if destination
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ent"))
+    {
+        destination.set_extension("pdb");
+    }
+    fs::write(&destination, read_output_text(path, 200_000_000)?)?;
+    Ok(destination)
+}
+
+fn sequence_results_ui(fasta: &str, lists: &mut PageLists, ui: &mut Ui) {
+    let mut records: Vec<(String, String)> = Vec::new();
+    for line in fasta.lines() {
+        if let Some(header) = line.strip_prefix('>') {
+            records.push((header.to_owned(), String::new()));
+        } else if let Some((_, sequence)) = records.last_mut() {
+            sequence.extend(line.chars().filter(|character| !character.is_whitespace()));
+        }
+    }
+    if records.is_empty() {
+        return;
+    }
+    ui.label(RichText::new(format!("{} sequence records", records.len())).strong());
+    lists.show(ui, "designed_sequences", 240.0, |ui| {
+        for (index, (header, sequence)) in records.iter().take(500).enumerate() {
+            ui.push_id(index, |ui| {
+                ui.group(|ui| {
+                    ui.label(header);
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{} residues",
+                            sequence.chars().filter(char::is_ascii_alphabetic).count()
+                        ));
+                        if ui.button("Copy sequence").clicked() {
+                            ui.ctx().copy_text(sequence.clone());
+                        }
+                        if ui.button("Copy FASTA").clicked() {
+                            ui.ctx().copy_text(format!(">{header}\n{sequence}\n"));
+                        }
+                    });
+                    ui.label(RichText::new(sequence).monospace());
+                })
+            });
+        }
+    });
+    if records.len() > 500 {
+        ui.label("Showing the first 500 records. Save the FASTA file for every sequence.");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Form widgets
+// ---------------------------------------------------------------------------------------------
+
+/// The example picker, and the selected example's description.
+fn preset_ui(tool: Tool, form: &mut Form, ui: &mut Ui) {
+    ui.horizontal(|ui| {
+        let mut chosen = form.preset;
+        let mut picker = ComboBox::from_id_salt("tool_preset");
+        if tool == Tool::Psi4 {
+            picker = picker
+                .height(390.0)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        }
+        picker
+            .selected_text(
+                chosen
+                    .map(|index| form.presets[index].label.as_str())
+                    .unwrap_or("Choose an example…"),
+            )
+            .show_ui(ui, |ui| {
+                if tool == Tool::Psi4 {
+                    ui.add(
+                        TextEdit::singleline(&mut form.preset_search).hint_text("Search examples"),
+                    );
+                }
+
+                let search = form.preset_search.trim().to_lowercase();
+                let mut group = "";
+                for (index, preset) in form.presets.iter().enumerate() {
+                    if !search.is_empty()
+                        && ![&preset.label, &preset.id, &preset.group]
+                            .iter()
+                            .any(|text| text.to_lowercase().contains(&search))
+                    {
+                        continue;
+                    }
+                    if preset.group != group {
+                        group = &preset.group;
+                        ui.separator();
+                        if !group.is_empty() {
+                            ui.strong(group);
+                        }
+                    }
+
+                    if ui
+                        .selectable_value(&mut chosen, Some(index), &preset.label)
+                        .on_hover_text(&preset.description)
+                        .clicked()
+                        && tool == Tool::Psi4
+                    {
+                        ui.close();
+                    }
+                }
+            });
+
+        let reload = ui
+            .add_enabled(chosen.is_some(), Button::new("Load example"))
+            .clicked();
+        if (chosen != form.preset || reload)
+            && let Some(index) = chosen
+        {
+            form.apply_preset(tool, index);
+        }
+
+        if ui.button("Reset fields").clicked()
+            && let Ok(fresh) = Form::new(tool)
+        {
+            *form = fresh;
+        }
+    });
+
+    if let Some(index) = form.preset {
+        let preset = &form.presets[index];
+        ui.label(&preset.description);
+        if let Some(url) = &preset.source_url {
+            ui.hyperlink_to("Example source", url);
+        }
+    }
+    if let Some(error) = &form.projection_error {
+        ui.colored_label(Color32::ORANGE, error);
+    }
+}
+
+/// The input-mode radio buttons and the task picker, for the tools that have them.
+fn mode_and_task_ui(tool: Tool, form: &mut Form, ui: &mut Ui) -> bool {
+    let mut project_input = false;
+    if let Some(modes) = &form.contract.input_modes {
+        let previous = form.mode.clone();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(&modes.label);
+            selector_box().show(ui, |ui| {
+                for option in &modes.options {
+                    let label = if tool == Tool::Psi4 && option.value == "upload" {
+                        "Choose a Psithon or Python file".to_owned()
+                    } else {
+                        option.label.replace("Upload", "Choose file:")
+                    };
+                    if selector_option(ui, form.mode == option.value, label).clicked() {
+                        form.mode = option.value.clone();
+                    }
+                }
+            });
+        });
+        if form.mode != previous {
+            match tool {
+                Tool::RfDiffusion3 => form.project_mode(),
+                Tool::Psi4 => {
+                    form.projection_error = None;
+                    if previous == "upload" || form.mode == "upload" {
+                        let format = form.values.entry("input_format".into()).or_default();
+                        std::mem::swap(format, &mut form.upload_format);
+                    }
+                    project_input = form.mode != "upload" && form.mode != form.authoritative_mode;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !form.contract.tasks.is_empty() {
+        let task = form.values.entry("task".into()).or_default();
+        ui.horizontal(|ui| {
+            ui.label("Task: ");
+            ComboBox::from_id_salt("tool_task")
+                .selected_text(
+                    form.contract
+                        .tasks
+                        .iter()
+                        .find(|option| &option.value == task)
+                        .map(|option| option.label.as_str())
+                        .unwrap_or(task),
+                )
+                .show_ui(ui, |ui| {
+                    for option in &form.contract.tasks {
+                        ui.selectable_value(task, option.value.clone(), &option.label);
+                    }
+                });
+        });
+    }
+
+    project_input
+}
+
+/// Every field visible in the current mode and task, under its group's heading.
+fn fields_ui(
+    tool: Tool,
+    window_kind: ToolWindowKind,
+    form: &mut Form,
+    proteins: &[MoleculePeptide],
+    sequences: &[Sequence],
+    pick: &mut Option<String>,
+    pick_sequence: &mut Option<SequenceTarget>,
+    use_sequence: &mut Option<(SequenceTarget, usize)>,
+    use_active_mol: &mut bool,
+    footer_height: f32,
+    ui: &mut Ui,
+) {
+    let before = form.values.clone();
+    let opened_protein = form.opened_protein.and_then(|index| proteins.get(index));
+    let structure_field = form
+        .contract
+        .structure_field(&form.mode)
+        .map(|field| field.name.as_str());
+
+    // Fill the window, less the footer. An egui window can't be dragged taller than its contents.
+    let height = ui.available_height() - footer_height - ui.spacing().item_spacing.y;
+
+    ScrollArea::vertical()
+        .id_salt("tool_form_scroll")
+        .max_height(height)
+        .auto_shrink([true, false])
+        .show(ui, |ui| {
+            let groups = form.contract.groups_in_mode(&form.mode);
+            for (index, (label, group, fields)) in groups.into_iter().enumerate() {
+                // Every group the contract names gets its own heading. The salt is the group name
+                // rather than the heading text so that the sections keep distinct ids: the one
+                // group a tool may leave unnamed is the only one drawn as "Parameters".
+                let title = if label.is_empty() {
+                    "Parameters"
+                } else {
+                    label
+                };
+
+                CollapsingHeader::new(title)
+                    .id_salt((shared_adapter::slug(tool), label))
+                    .default_open(index == 0 || tool == Tool::Psi4)
+                    .show(ui, |ui| {
+                        if let Some(url) = group.and_then(|group| group.docs_url.as_deref()) {
+                            ui.hyperlink_to("Parameter documentation", url);
+                        }
+
+                        let task = form.values.get("task").cloned().unwrap_or_default();
+                        for field in fields {
+                            if !field.applies_to_task(&task) {
+                                continue;
+                            }
+                            ui.push_id(&field.name, |ui| {
+                                draw_field(
+                                    tool,
+                                    window_kind,
+                                    field,
+                                    &mut form.values,
+                                    opened_protein
+                                        .filter(|_| structure_field == Some(field.name.as_str())),
+                                    sequences,
+                                    pick,
+                                    pick_sequence,
+                                    use_sequence,
+                                    use_active_mol,
+                                    ui,
+                                );
+                            });
+                        }
+                    });
+            }
+        });
+    if let Some(field) = form.contract.structure_field(&form.mode)
+        && form.values.get(&field.name) != before.get(&field.name)
+    {
+        form.opened_protein = None;
+    }
+    let edited_input = form.contract.fields.iter().any(|field| {
+        field.input_modes == form.mode && form.values.get(&field.name) != before.get(&field.name)
+    });
+    let changed_format = form.values.get("input_format") != before.get("input_format");
+    if tool == Tool::Psi4
+        && form.mode == "upload"
+        && edited_input
+        && let Some(path) = form.values.get("psi4_input_file").cloned()
+    {
+        quantum_chem::set_file_format(&mut form.values, Path::new(path.trim()));
+    }
+    if edited_input && tool == Tool::RfDiffusion3
+        || tool == Tool::Psi4
+            && form.mode != "upload"
+            && (edited_input || (changed_format && form.projection_error.is_none()))
+    {
+        form.authoritative_mode = form.mode.clone();
+        form.projection_error = None;
+    }
+}
+
+fn draw_field(
+    tool: Tool,
+    window_kind: ToolWindowKind,
+    field: &FormField,
+    values: &mut HashMap<String, String>,
+    opened_protein: Option<&MoleculePeptide>,
+    sequences: &[Sequence],
+    pick: &mut Option<String>,
+    pick_sequence: &mut Option<SequenceTarget>,
+    use_sequence: &mut Option<(SequenceTarget, usize)>,
+    use_active_mol: &mut bool,
+    ui: &mut Ui,
+) {
+    if field.managed_by_runner {
+        ui.label(RichText::new(format!("{}: {}", field.label, field.help_note)).weak());
+        return;
+    }
+    let value = values.entry(field.name.clone()).or_default();
+    let label = format!("{}{}", field.label, if field.required { " *" } else { "" });
+
+    let psi4_widget = match field.name.as_str() {
+        _ if tool != Tool::Psi4 => None,
+        "properties" => Some(quantum_chem::psi4_properties_field(&label, value, ui)),
+        _ => quantum_chem::psi4_choice_field(field, &label, value, ui),
+    };
+    if let Some(response) = psi4_widget {
+        response.on_hover_text(format!("{}\n{}", field.help, field.help_note));
+        return;
+    }
+
+    let response = match field.kind() {
+        FieldKind::Checkbox => {
+            let mut checked = matches!(value.as_str(), "true" | "1" | "yes" | "on");
+            let response = ui.checkbox(&mut checked, &label);
+            if response.changed() {
+                *value = checked.to_string();
+            }
+            response
+        }
+        FieldKind::Select => {
+            ui.horizontal(|ui| {
+                ui.label(&label);
+                ComboBox::from_id_salt("choice")
+                    .selected_text(
+                        field
+                            .options
+                            .iter()
+                            .find(|option| &option.value == value)
+                            .map(|option| option.label.as_str())
+                            .unwrap_or(value),
+                    )
+                    .show_ui(ui, |ui| {
+                        for option in &field.options {
+                            ui.selectable_value(value, option.value.clone(), &option.label);
+                        }
+                    });
+            })
+            .response
+        }
+        FieldKind::TextArea => {
+            if tool == Tool::Psi4 && field.name == "coordinates" {
+                ui.horizontal(|ui| {
+                    ui.label(&label);
+                    if ui
+                        .button("Use active molecule")
+                        .on_hover_text("Replace the geometry with the active molecule's atoms.")
+                        .clicked()
+                    {
+                        *use_active_mol = true;
+                    }
+                });
+            } else {
+                ui.label(&label);
+            }
+            if window_kind == ToolWindowKind::StructurePrediction {
+                match document_sequence_targets(tool, &field.name, value) {
+                    Ok(targets) => {
+                        for (name, target) in targets {
+                            ui.push_id(&name, |ui| {
+                                ui.label(&name);
+                                sequence_input_controls(
+                                    sequences,
+                                    &target,
+                                    pick_sequence,
+                                    use_sequence,
+                                    ui,
+                                );
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        ui.colored_label(Color32::LIGHT_RED, error);
+                    }
+                }
+            }
+            let rows = field.rows.unwrap_or(3);
+            let editor = TextEdit::multiline(value).desired_width(f32::INFINITY);
+            if tool == Tool::Psi4 {
+                ui.add(editor.code_editor().desired_rows(rows.max(2)))
+            } else {
+                ui.add(editor.desired_rows(rows.clamp(2, 12)))
+            }
+        }
+        FieldKind::Molecules => {
+            ui.label(&label);
+            molecules(
+                field,
+                value,
+                sequences,
+                window_kind == ToolWindowKind::StructurePrediction,
+                pick_sequence,
+                use_sequence,
+                ui,
+            );
+            ui.label(&field.help)
+        }
+        FieldKind::File => {
+            let structure = field
+                .accepted_extensions()
+                .iter()
+                .any(|extension| extension.eq_ignore_ascii_case("pdb"));
+
+            if structure {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(&label);
+                        if ui.button("Choose…").on_hover_text(&field.accept).clicked() {
+                            *pick = Some(field.name.clone());
+                        }
+                    });
+                    if let Some(protein) = opened_protein {
+                        let name = protein
+                            .common
+                            .name
+                            .as_deref()
+                            .unwrap_or(&protein.common.ident);
+                        ui.colored_label(Color32::WHITE, format!("Opened protein: {name}"));
+                    } else {
+                        if let Some(name) = Path::new(value.trim()).file_name() {
+                            ui.colored_label(Color32::WHITE, name.to_string_lossy());
+                        }
+                        ui.add(
+                            TextEdit::multiline(value)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .return_key(None),
+                        );
+                    }
+                })
+                .response
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(&label);
+                    ui.add(TextEdit::singleline(value).desired_width(300.0));
+                    if ui.button("Choose…").on_hover_text(&field.accept).clicked() {
+                        *pick = Some(field.name.clone());
+                    }
+                })
+                .response
+            }
+        }
+        FieldKind::Number | FieldKind::Text | FieldKind::Other => {
+            let width = if field.kind() == FieldKind::Number {
+                100.0
+            } else {
+                300.0
+            };
+            ui.horizontal(|ui| {
+                ui.label(&label);
+                ui.add(TextEdit::singleline(value).desired_width(width));
+            })
+            .response
+        }
+    };
+
+    let mut help = format!("{}\n{}", field.help, field.help_note);
+    if field.kind() == FieldKind::Number {
+        if let Some(minimum) = field.minimum {
+            help.push_str(&format!("\nMinimum: {minimum}"));
+        }
+        if let Some(maximum) = field.maximum {
+            help.push_str(&format!("\nMaximum: {maximum}"));
+        }
+        if !field.step.is_null() {
+            help.push_str(&format!("\nStep: {}", value_to_hint(&field.step)));
+        }
+    }
+    response.on_hover_text(help);
+}
+
+fn value_to_hint(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn sequence_input_controls(
+    sequences: &[Sequence],
+    target: &SequenceTarget,
+    pick_sequence: &mut Option<SequenceTarget>,
+    use_sequence: &mut Option<(SequenceTarget, usize)>,
+    ui: &mut Ui,
+) {
+    ui.horizontal_wrapped(|ui| {
+        if !sequences.is_empty() {
+            ui.label("Load an opened seq:");
+            for (index, sequence) in sequences.iter().enumerate() {
+                if ui
+                    .button(sequence.display_name())
+                    .on_hover_text(format!("Use this {} sequence", sequence.seq_type()))
+                    .clicked()
+                {
+                    *use_sequence = Some((target.clone(), index));
+                }
+            }
+        }
+        if ui.button("Upload sequence file…").clicked() {
+            *pick_sequence = Some(target.clone());
+        }
+    });
+}
+
+/// The molecule builder: one box per entity, over the JSON list the field holds.
+fn molecules(
+    field: &FormField,
+    text: &mut String,
+    sequences: &[Sequence],
+    enable_sequence_input: bool,
+    pick_sequence: &mut Option<SequenceTarget>,
+    use_sequence: &mut Option<(SequenceTarget, usize)>,
+    ui: &mut Ui,
+) {
+    let editor_id = ui.id().with("molecule_json_editor");
+    let mut raw = ui.data_mut(|data| data.get_temp::<bool>(editor_id).unwrap_or(false));
+    ui.checkbox(&mut raw, "Edit molecules as JSON");
+    ui.data_mut(|data| data.insert_temp(editor_id, raw));
+    if raw {
+        if enable_sequence_input && let Ok(boxes) = serde_json::from_str::<Vec<Value>>(text) {
+            for index in 0..boxes.len() {
+                ui.push_id(index, |ui| {
+                    ui.label(format!("Molecule {}", index + 1));
+                    sequence_input_controls(
+                        sequences,
+                        &SequenceTarget::Molecule(index),
+                        pick_sequence,
+                        use_sequence,
+                        ui,
+                    );
+                });
+            }
+        }
+        ui.add(
+            TextEdit::multiline(text)
+                .desired_rows(10)
+                .desired_width(f32::INFINITY),
+        );
+        if let Err(error) = serde_json::from_str::<Vec<serde_json::Map<String, Value>>>(text) {
+            ui.colored_label(Color32::LIGHT_RED, error.to_string());
+        }
+        return;
+    }
+    let Ok(mut boxes) = serde_json::from_str::<Vec<Value>>(text) else {
+        ui.colored_label(
+            Color32::LIGHT_RED,
+            "Molecules must be a JSON list. Edit the document below to repair it.",
+        );
+        ui.add(TextEdit::multiline(text).desired_rows(5));
+        return;
+    };
+    if boxes.iter().any(|value| !value.is_object()) {
+        ui.colored_label(
+            Color32::LIGHT_RED,
+            "Each molecule must be a JSON object. Enable the JSON editor to repair it.",
+        );
+        return;
+    }
+
+    let features: Vec<_> = field.molecule_features.split(',').collect();
+    let mut remove = None;
+
+    for (index, molecule) in boxes.iter_mut().enumerate() {
+        ui.push_id(index, |ui| {
+            ui.group(|ui| {
+                molecule_ui(
+                    field,
+                    &features,
+                    index,
+                    molecule,
+                    &mut remove,
+                    sequences,
+                    enable_sequence_input,
+                    pick_sequence,
+                    use_sequence,
+                    ui,
+                );
+            });
+        });
+    }
+
+    if let Some(index) = remove {
+        boxes.remove(index);
+    }
+    if ui.button("Add molecule").clicked() {
+        boxes.push(json!({"type": "protein", "sequence": "", "modifications": []}));
+    }
+
+    *text = serde_json::to_string(&boxes).unwrap_or_default();
+}
+
+/// One molecule's box in the builder.
+fn molecule_ui(
+    field: &FormField,
+    features: &[&str],
+    index: usize,
+    molecule: &mut Value,
+    remove: &mut Option<usize>,
+    sequences: &[Sequence],
+    enable_sequence_input: bool,
+    pick_sequence: &mut Option<SequenceTarget>,
+    use_sequence: &mut Option<(SequenceTarget, usize)>,
+    ui: &mut Ui,
+) {
+    ui.horizontal(|ui| {
+        ui.label(format!("Molecule {}", index + 1));
+
+        let mut kind = molecule["type"].as_str().unwrap_or("protein").to_owned();
+        ComboBox::from_id_salt("molecule_kind")
+            .selected_text(&kind)
+            .show_ui(ui, |ui| {
+                for option in &field.options {
+                    ui.selectable_value(&mut kind, option.value.clone(), &option.label);
+                }
+            });
+        molecule["type"] = json!(kind);
+
+        if ui.small_button("Remove").clicked() {
+            *remove = Some(index);
+        }
+    });
+
+    let kind = molecule["type"].as_str().unwrap_or("protein").to_owned();
+    let key = match kind.as_str() {
+        "ligand" => "ligand",
+        "ion" => "ion",
+        _ => "sequence",
+    };
+    let hint = if key == "sequence" {
+        "Sequence"
+    } else {
+        "SMILES or CCD code"
+    };
+
+    let mut sequence = molecule[key].as_str().unwrap_or_default().to_owned();
+    let edited = ui
+        .add(
+            TextEdit::multiline(&mut sequence)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .hint_text(hint),
+        )
+        .changed();
+    if edited {
+        molecule[key] = json!(sequence);
+    }
+    if enable_sequence_input {
+        sequence_input_controls(
+            sequences,
+            &SequenceTarget::Molecule(index),
+            pick_sequence,
+            use_sequence,
+            ui,
+        );
+    }
+
+    if features.contains(&"id") {
+        let mut id = match &molecule["id"] {
+            Value::String(id) => id.clone(),
+            Value::Array(ids) => ids
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(","),
+            _ => ((b'A' + (index % 26) as u8) as char).to_string(),
+        };
+        ui.horizontal(|ui| {
+            ui.label("Entity ID(s)");
+            if ui.text_edit_singleline(&mut id).changed() {
+                molecule["id"] = json!(id);
+            }
+        });
+        if molecule.get("id").is_none() {
+            molecule["id"] = json!(id);
+        }
+    }
+
+    if features.contains(&"count") {
+        let mut count = molecule["count"].as_u64().unwrap_or(1);
+        ui.horizontal(|ui| {
+            ui.label("Copies");
+            if ui.add(DragValue::new(&mut count).range(1..=64)).changed() {
+                molecule["count"] = json!(count);
+            }
+        });
+    }
+
+    if features.contains(&"cyclic") {
+        let mut cyclic = molecule["cyclic"].as_bool().unwrap_or(false);
+        if ui.checkbox(&mut cyclic, "Cyclic").changed() {
+            molecule["cyclic"] = json!(cyclic);
+        }
+    }
+
+    if !matches!(kind.as_str(), "ligand" | "ion") {
+        if features.contains(&"modifications") || features.contains(&"zero_indexed_modifications") {
+            modifications_ui(
+                molecule,
+                features.contains(&"zero_indexed_modifications"),
+                ui,
+            );
+        }
+        for (feature, key, label) in [
+            (
+                "protein_paired_msa",
+                "paired_msa_path",
+                "Paired protein MSA path",
+            ),
+            (
+                "protein_unpaired_msa",
+                "unpaired_msa_path",
+                "Unpaired protein MSA path",
+            ),
+            (
+                "protein_templates",
+                "templates_path",
+                "Protein templates path",
+            ),
+            ("rna_unpaired_msa", "unpaired_msa_path", "RNA MSA path"),
+            ("protein_msa", "msa", "Protein MSA"),
+            ("rna_msa", "msa", "RNA MSA"),
+        ] {
+            if features.contains(&feature) && feature.starts_with(&kind) {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    let mut value = match &molecule[key] {
+                        Value::Null => String::new(),
+                        Value::String(value) => value.clone(),
+                        value => value.to_string(),
+                    };
+                    if ui.text_edit_singleline(&mut value).changed() {
+                        // Preserve ordinary paths; the whole-document editor also accepts structured MSAs.
+                        molecule[key] = json!(value);
+                    }
+                });
+            }
+        }
+    }
+}
+
+fn modifications_ui(molecule: &mut Value, zero_based: bool, ui: &mut Ui) {
+    CollapsingHeader::new("Modified residues").show(ui, |ui| {
+        let base = if zero_based { 0 } else { 1 };
+        ui.label(format!(
+            "Positions start at {base}. Residue codes use the CCD, e.g. MSE."
+        ));
+        let modifications = molecule
+            .as_object_mut()
+            .unwrap()
+            .entry("modifications")
+            .or_insert_with(|| json!([]));
+        let Some(modifications) = modifications.as_array_mut() else {
+            ui.colored_label(
+                Color32::LIGHT_RED,
+                "Modifications must be a list; repair them in the JSON editor.",
+            );
+            return;
+        };
+        let mut remove = None;
+        for (index, modification) in modifications.iter_mut().enumerate() {
+            if !modification.is_object() {
+                continue;
+            }
+            ui.push_id(index, |ui| {
+                ui.horizontal(|ui| {
+                    let mut position = modification["position"].as_i64().unwrap_or(base);
+                    ui.label("Position");
+                    if ui
+                        .add(DragValue::new(&mut position).range(base..=i64::MAX))
+                        .changed()
+                    {
+                        modification["position"] = json!(position);
+                    }
+                    let mut residue = modification["residue"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
+                    ui.label("CCD");
+                    if ui
+                        .add(TextEdit::singleline(&mut residue).desired_width(80.0))
+                        .changed()
+                    {
+                        modification["residue"] = json!(residue);
+                    }
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(index);
+                    }
+                })
+            });
+        }
+        if let Some(index) = remove {
+            modifications.remove(index);
+        }
+        if ui.button("Add modification").clicked() {
+            modifications.push(json!({"position": base, "residue": ""}));
+        }
+    });
+}

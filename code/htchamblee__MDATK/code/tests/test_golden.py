@@ -1,0 +1,111 @@
+"""Released behaviour stays put: every file the planner writes, and every planner message, matches
+what MDATK 0.0.7 produced for the same cases (see tests/golden.py for the cases and for the two
+things normalised before comparing: the "written by MDATK x.y.z" version and dates).
+
+New step types are not part of the comparison; a step type that existed in 0.0.7 must not change
+its output unless that change is intended and the reference is re-recorded from the release that
+introduces it."""
+
+import json
+import os
+import re
+
+import pytest
+
+import golden
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REFERENCE = os.path.join(HERE, "data", "golden_v0.0.7.json")
+# intended changes of 0.0.7 output, each with its reason; everything else must match 0.0.7 byte for byte
+INTENDED = [
+    # 0.0.8: the Amber build's topology check also checks that residues named as nucleotides have a
+    # nucleotide's atoms (an L-RNA library without the names MDATK writes: LA / LU became La / Lu ions)
+    (re.compile(r"(^|/|:)[^/]*_check_\d{8}-\d{4}\.py$"), None),
+    # ... and runs for dry L-RNA builds too (they had no topology check)
+    (re.compile(r"_amber-build_\d{8}-\d{4}\.sh$|_00_plan_\d{8}-\d{4}\.md$"), {"tool:amber-build:water=none"}),
+    # 0.0.10: the main script of a step whose production runs in a separate script stops at once when that
+    # script has finished and otherwise ends with exit status 75 ("waiting"), never with success (an
+    # all-production step used to "succeed" having run nothing); only lines are added.  Every case with a
+    # separate production script, i.e. all but separate_production=False
+    (re.compile(r"_amber-md_\d{8}-\d{4}\.sh$"),
+     {"example:rna_plan.mdatk.toml", "template:amber", "template:builder-amber", "template:farfar2-amber"}
+     | {f"tool:amber-md:{v}" for v in ("default", "amber_version=24", "dry_pdb=False", "dry_traj=True",
+                                       "engine=pmemd", "engine=pmemd.MPI", "input_velocities=True",
+                                       "min_engine=pmemd", "restraint_ref=initial", "resume=False")}),
+    (re.compile(r"_gromacs_\d{8}-\d{4}\.sh$"),
+     {"template:amber-gromacs"}
+     | {f"tool:gromacs:{v}" for v in ("default", "allow_nbfix_loss=True", "convert=acpype", "convert=none",
+                                      "gmx_version=2023", "gpu=False", "mass_repartition=True",
+                                      "update_gpu=True")}),
+    # 0.0.12: the Amber build's two helpers are copies of library code, and that code grew: the PDB tools
+    # (mdatk.pdbtools: infer_base, residue hands, the 'standard' scheme, hydrogen / virtual-residue removal,
+    # empty slots of a model check) and the PDB preparation, which now drops Rosetta's virtual residues
+    # VRT / XXX (on by default: tleap cannot type them, so only builds that failed change) and names an
+    # empty slot instead of reporting 'no atoms'.  The build script, the leap / ParmEd inputs and
+    # the planner messages stay as they were (":forced:" keys: the files of builds refused for errors)
+    (re.compile(r"(^\d+_amber-build/|^:forced:[^:]+:)[^/]*_(pdbtools|prep)_\d{8}-\d{4}\.py$"), None),
+    # unreleased: a separately run (cluster) production script activates its conda environment only when
+    # MDATK runs it on this computer ($MDATK_LOCAL); only the example sets a conda environment
+    (re.compile(r"_amber-prod_\d{8}-\d{4}\.sh$"), {"example:rna_plan.mdatk.toml"}),
+    # 0.0.16: the helix-restraint helper (a copy of mdatk/workflows/scripts/helix_dist.py) reads DNA and L-DNA
+    # residue names (DT, DG5, LDA ...) and matches T with the U of the secondary structure: it refused every
+    # DNA pair. RNA names give the same letters as before, so RNA restraints are unchanged
+    (re.compile(r"(^|/)\d+_amber-restraints/[^/]*_helix_\d{8}-\d{4}\.py$"), None),
+    # 0.1.0: SimRNA's run script ends with an error when every run failed (it ended with exit status 0 even
+    # then) and warns with the number of failed runs otherwise, and without clustering it writes
+    # the step's 'trajectory' output itself (only the clustering script did). The config, sequence and
+    # restraint files and the SimRNA command line stay as they were
+    (re.compile(r"_simrna_\d{8}-\d{4}\.sh$"), None),
+    # ... and the clustering script no longer stops without a message at 'ls ... | head -n 1' (SIGPIPE under
+    # pipefail: most of the time from about 40 runs x 10 replicas on) and removes the clusters and models of
+    # an earlier run first (another threshold names its clusters differently, and they were rebuilt as models)
+    (re.compile(r"_simrna-cluster_\d{8}-\d{4}\.sh$"), None),
+    # 0.1.0: FARFAR2's run script, likewise, ends with an error when every rna_denovo run failed (exit status
+    # 0 even then, or when rna_denovo was not found) and warns otherwise. The flags, FASTA and secstruct files and
+    # the rna_denovo command line stay as they were
+    (re.compile(r"_farfar2_\d{8}-\d{4}\.sh$"), None),
+    # 0.1.0: the FARFAR2 models script removes the numbered models and their list of an earlier run before it
+    # extracts (the list was appended to, and a model the new run did not write was passed on as its own),
+    # and annotates every model with DSSR (model-[0-9][0-9] left out the models from 100 on)
+    (re.compile(r"_farfar2-models_\d{8}-\d{4}\.sh$"), None),
+    # 0.1.0: the RNAMake script removes the design PDBs of an earlier run first (with fewer designs than that
+    # run wrote, its last ones stayed as outputs of the step); every case that writes design PDBs
+    (re.compile(r"_rnamake_\d{8}-\d{4}\.sh$"),
+     {f"tool:rnamake:{v}" for v in ("default", "app=design_rna", "dump_scaffold=True", "no_bp_checks=True",
+                                    "no_sterics=True", "search_type=exhaustive", "search_type=mc",
+                                    "skip_seq_opt=True", "thermo_fluc=True")}),
+    # 0.1.0: the VMD script of a movie removes the frames of an earlier run first (with fewer frames than that
+    # run rendered, its last ones were joined into the movie); snapshots and interactive scripts are unchanged
+    (re.compile(r"_vmd_\d{8}-\d{4}\.sh$"), {"tool:vmd:render=movie"}),
+    # 0.1.0: the GROMACS position-restraint helper (a copy of mdatk/workflows/scripts/gmx_posre.py) takes the
+    # L-DNA residues LDA LDC LDG LDT for nucleic acid too: an L-DNA strand got no restraints. Every name it
+    # recognised before is recognised as before, so the restraints of RNA and D-DNA are unchanged
+    (re.compile(r"(^|/)\d+_gromacs/[^/]*_posre_\d{8}-\d{4}\.py$"), None),
+]
+
+
+def intended(case, key):
+    return any(rx.search(key) and (cases is None or case in cases) for rx, cases in INTENDED)
+
+
+@pytest.fixture(scope="module")
+def reference():
+    with open(REFERENCE, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_released_output_unchanged(reference):
+    from mdatk.workflows import TOOLS
+    assert reference["mdatk_version"] == "0.0.7"
+    assert set(reference["tools"]) <= set(TOOLS), "a step type of 0.0.7 was removed"
+    now = golden.collect(os.path.join(os.path.dirname(HERE), "examples"), reference["tools"])
+    ref = reference["cases"]
+    assert set(ref) <= set(now), f"cases no longer generated: {sorted(set(ref) - set(now))[:10]}"
+    changed = {}
+    for case, files in ref.items():
+        diff = sorted(k for k in set(files) | set(now[case])
+                      if files.get(k) != now[case].get(k) and not intended(case, k))
+        if diff:
+            changed[case] = diff
+    assert not changed, (f"{len(changed)} case(s) differ from 0.0.7, e.g. "
+                         + "; ".join(f"{c}: {', '.join(d[:4])}" for c, d in list(changed.items())[:6]))

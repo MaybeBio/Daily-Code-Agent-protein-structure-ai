@@ -1,0 +1,4500 @@
+"""
+Structure Server - PDB retrieval and structure cleaning tools.
+
+Provides tools for:
+- Automatic retrieval of structure files from PDB/AlphaFold/PDB-REDO (prefers mmCIF)
+- Chain separation and classification using gemmi
+- Structure cleaning, missing residue modeling, water/heterogen removal, and protonation using PDBFixer
+- Automatic detection of disulfide bonds and CYS->CYX renaming
+- Mutation modeling with HPacker
+- Ligand chemistry preparation with SMILES/SDF template matching
+- LLM-friendly structure validation and error reporting at each step
+"""
+
+# Configure logging early to suppress noisy third-party logs
+import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from mdclaw._common import setup_logger  # noqa: E402
+from mdclaw._tool_meta import node_tool, tool_parameter_examples  # noqa: E402
+
+logger = setup_logger(__name__)
+
+import json  # noqa: E402
+import re  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import List, Optional, Dict, Any  # noqa: E402
+
+from mdclaw._common import (  # noqa: E402
+    BaseToolWrapper,
+    create_validation_error,
+    ensure_directory,
+    generate_job_id,
+)
+from mdclaw.chemistry_constants import (  # noqa: E402
+    is_glycan_residue_name,
+    AMBER_PROTEIN_RESIDUES,
+    AMINO_ACIDS,
+)
+from mdclaw.selection_utils import likely_additive_ligands  # noqa: E402
+
+# Default working directory for prepare_complex when output_dir is not specified
+WORKING_DIR = Path(".")
+PDB_CHAIN_ID_POOL = (
+    list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    + list("abcdefghijklmnopqrstuvwxyz")
+    + list("0123456789")
+)
+_DEUTERIUM_FALLBACK_ATOM_NAME_RE = re.compile(r"^D[0-9]*$")
+DEFAULT_TERMINAL_CAP_FORCEFIELD = "ff19SB"
+SUPPORTED_N_TERMINAL_CAPS = {"ACE"}
+SUPPORTED_C_TERMINAL_CAPS = {"NME"}
+TERMINAL_CAP_RESIDUES = SUPPORTED_N_TERMINAL_CAPS | SUPPORTED_C_TERMINAL_CAPS
+SUPPORTED_PREP_SOLVENT_TYPES = {"explicit", "implicit", "vacuum"}
+
+# Initialize tool wrappers
+pdb2pqr_wrapper = BaseToolWrapper("pdb2pqr")
+pdb4amber_wrapper = BaseToolWrapper("pdb4amber")
+
+from mdclaw.structure.clean_ligand import clean_ligand  # noqa: E402
+from mdclaw.structure.clean_protein import (  # noqa: E402
+    _disulfide_pair_sites,
+    normalize_protonation_method,
+    _prepare_standard_nucleic,
+    _validate_declared_disulfides,
+    clean_protein,
+    repair_complex_missing_residues,
+)
+from mdclaw.structure.disulfide import _merge_disulfide_pairs, _reconcile_cyx_cys_in_pdb  # noqa: E402
+from mdclaw.structure.merge import _build_nucleic_residue_mapping, _build_residue_mapping_for_type, _enrich_chain_identity_map, _index_prepared_component_sources, merge_structures  # noqa: E402
+from mdclaw.structure.pdb_utils import _apply_component_disposition_to_split_result, _component_disposition_payload, _normalize_prepare_solvent_type  # noqa: E402
+from mdclaw.structure.phosphorylation import _build_source_to_merged_chain_map, _build_source_to_topology_index_map, _remap_detected_ptm_chains, _remap_disulfide_chains, _remap_histidine_state_chains, _remap_protonation_state_chains, _resolve_source_site_mapping  # noqa: E402
+from mdclaw.structure.protonation import _normalize_protonation_state_overrides  # noqa: E402
+from mdclaw.structure.split import _inspect_molecules_impl, _split_listed_ids, split_molecules  # noqa: E402
+from mdclaw.structure.terminal_caps import _resolve_terminal_cap_settings  # noqa: E402
+
+
+def _confirmation_source_from_entries(
+    entries: list[dict],
+    default: str = "auto_detected",
+) -> str:
+    """Summarize per-entry provenance without hiding mixed decisions."""
+    sources = {
+        str(entry.get("source") or default)
+        for entry in entries
+        if isinstance(entry, dict)
+    }
+    if not sources:
+        return default
+    if len(sources) == 1:
+        return next(iter(sources))
+    return "mixed"
+
+
+def _has_unmodeled_terminal_residues(detection: dict) -> bool:
+    terminal = detection.get("terminal_excluded") or {}
+    return int(terminal.get("total_residues") or 0) > 0
+
+
+def _missing_residue_confirmation_block(
+    repairs: list[dict],
+    detections: list[dict],
+    method: str,
+) -> dict | None:
+    """Build confirmation data without treating method choice as approval."""
+    undetectable = [
+        detection
+        for detection in detections
+        if not detection.get("reference_sequence_available")
+    ]
+    terminal_unmodeled = [
+        detection
+        for detection in detections
+        if _has_unmodeled_terminal_residues(detection)
+    ]
+    if not (repairs or undetectable or terminal_unmodeled):
+        return None
+    methods_used = {
+        str(repair.get("method_used") or repair.get("method"))
+        for repair in repairs
+        if repair.get("method_used") or repair.get("method")
+    }
+    method_used = (
+        next(iter(methods_used))
+        if len(methods_used) == 1
+        else ("mixed" if methods_used else method)
+    )
+    escalated = any(bool(repair.get("escalated")) for repair in repairs)
+    return {
+        "source": "predicted" if repairs else "auto_detected",
+        "method": method_used,
+        "method_requested": method,
+        "escalated": escalated,
+        "repairs": repairs,
+        "detection": detections,
+        "terminal_unmodeled": terminal_unmodeled,
+    }
+
+
+def flatten_disulfide_pairs(disulfide_pairs) -> list:
+    """The nested public schema in the flat shape ``clean_protein`` consumes.
+
+    One function so the two ends cannot drift: reading only ``cys1``/``cys2``
+    downstream once made every declared bond vanish silently, and a hand-written
+    flat record in a test would not have noticed the shapes disagreeing.
+
+    The insertion code travels with the endpoint. ``None`` means the caller did
+    not state one -- which is not the same as an explicit blank, and only the
+    former is ambiguous where several residues share a number.
+    """
+    flat = []
+    for pair in disulfide_pairs or []:
+        one = pair.get("cys1") or {}
+        two = pair.get("cys2") or {}
+        flat.append({
+            "chain1": one.get("chain"),
+            "resnum1": one.get("resnum"),
+            "icode1": one.get("icode"),
+            "chain2": two.get("chain"),
+            "resnum2": two.get("resnum"),
+            "icode2": two.get("icode"),
+            "form_bond": pair.get("form_bond", True),
+        })
+    return flat
+
+
+# Under this distance two atoms share a point: the force between them is not
+# finite and no minimizer parts them. Up to CLOSE_CONTACT_ANGSTROM they are a
+# contact the capped steepest descent (mdclaw.simulation.relax) resolves.
+DUPLICATE_ATOM_ANGSTROM = 0.1
+CLOSE_CONTACT_ANGSTROM = 0.8
+
+
+def _heavy_atom_overlaps(pdb_path, cutoff: float = CLOSE_CONTACT_ANGSTROM) -> list[str]:
+    """Labels of the pairs ``_close_atom_pairs`` finds under ``cutoff`` A."""
+    return [label for _distance, label in _close_atom_pairs(pdb_path, cutoff)]
+
+
+def _close_atom_pairs(pdb_path, cutoff: float = CLOSE_CONTACT_ANGSTROM) -> list[tuple[float, str]]:
+    """``(distance, label)`` for atom pairs under ``cutoff`` A that no bond holds.
+
+    Any two atoms under 0.8 A are on top of each other: the shortest bond is
+    0.96 A. Hydrogens count -- 1GQV (NMR) deposits ILE 133 with HG21 0.71 A
+    from HD12, which pdb2pqr's standard-state path kept, and the built
+    System's forces reached 3e8 kJ/mol/nm on those two and the minimiser
+    diverged to 1e42 kJ/mol (087_soluble_1gqv cli_sif r3, campaign v2).
+    Inside one residue a bonded pair (a hydrogen within 1.3 A of a heavy atom,
+    two heavy atoms within 1.9 A; pdb2pqr writes some N-H at 0.76 A) or a pair
+    sharing a bonded neighbour is left alone (PDBFixer puts a terminal OXT
+    0.5 A from O, both on C; the angle term opens it -- 6JZH, 6KUY); anything
+    else is reported. A grid walk keeps this linear in the atom count.
+    """
+    import math
+
+    atoms: list[tuple[str, str, str, float, float, float, bool]] = []
+    for line in Path(pdb_path).read_text(errors="ignore").splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")) or len(line) < 54:
+            continue
+        element = line[76:78].strip().upper() if len(line) >= 78 else ""
+        name = line[12:16].strip()
+        residue = f"{line[17:20].strip()} {line[21]}{line[22:26].strip()}{line[26].strip()}"
+        atoms.append((f"{residue} {name}", residue, name,
+                      float(line[30:38]), float(line[38:46]), float(line[46:54]),
+                      (element or name[:1].upper()) in ("H", "D")))
+    grid: dict[tuple[int, int, int], list[int]] = {}
+    for index, atom in enumerate(atoms):
+        grid.setdefault((math.floor(atom[3] / cutoff), math.floor(atom[4] / cutoff),
+                         math.floor(atom[5] / cutoff)), []).append(index)
+    by_residue: dict[str, list[int]] = {}
+    for index, atom in enumerate(atoms):
+        by_residue.setdefault(atom[1], []).append(index)
+
+    def _bonded(i: int, j: int) -> bool:
+        a, b = atoms[i], atoms[j]
+        if a[6] and b[6]:
+            return False   # two hydrogens are never bonded to each other
+        limit = 1.3 if (a[6] or b[6]) else 1.9
+        return math.dist(a[3:6], b[3:6]) < limit
+
+    def _share_a_neighbour(i: int, j: int) -> bool:
+        for k in by_residue.get(atoms[i][1], ()):
+            if k not in (i, j) and _bonded(i, k) and _bonded(j, k):
+                return True
+        return False
+
+    found: list[tuple[float, str]] = []
+    for (cx, cy, cz), members in grid.items():
+        for index in members:
+            label, residue, _name, x, y, z, _h = atoms[index]
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        for other in grid.get((cx + dx, cy + dy, cz + dz), ()):
+                            if other <= index:
+                                continue
+                            olabel, oresidue, _oname, ox, oy, oz, _oh = atoms[other]
+                            distance = math.dist((x, y, z), (ox, oy, oz))
+                            if distance >= cutoff:
+                                continue
+                            if residue == oresidue and (
+                                    _bonded(index, other) or _share_a_neighbour(index, other)):
+                                continue
+                            found.append((distance, f"{label} - {olabel} {distance:.2f} A"))
+    return sorted(found, key=lambda pair: pair[1])
+
+
+def _disulfide_pairs_in_merged_frame(disulfide_pairs, chain_mapping_entries):
+    """Rewrite declared pairs into the merged structure's chain ids.
+
+    The merge may rename chains, and a pair still written in author chains would
+    then match nothing -- every bond quietly "out of scope" and unverified.
+    One author chain can also reach the merge as several pieces (residue ranges
+    ``A:17-217 A:377-456`` become protein_1 -> A and protein_2 -> B), so a site
+    is located by the piece whose file carries the residue; a chain is mapped by
+    name alone only when it became exactly one merged chain. Returns
+    ``(pairs, unmapped)``; ``unmapped`` names the pairs that cannot be located.
+    """
+    if not disulfide_pairs:
+        return [], []
+    from mdclaw.structure.pdb_utils import _read_pdb_unique_residues
+
+    owner: dict[tuple[str, int, str], str] = {}
+    targets_by_chain: dict[str, list[str]] = {}
+    for entry in chain_mapping_entries:
+        source = str(entry.get("source_chain_id") or "").strip()[:1]
+        target = str(entry.get("md_chain_id") or "").strip()[:1]
+        if not source or not target:
+            continue
+        targets = targets_by_chain.setdefault(source, [])
+        if target not in targets:
+            targets.append(target)
+        source_file = entry.get("source_file")
+        if source_file and Path(source_file).is_file():
+            for residue in _read_pdb_unique_residues(source_file):
+                if residue["chain"] != source or not isinstance(residue["resnum"], int):
+                    continue
+                owner.setdefault((source, residue["resnum"], residue["icode"] or ""), target)
+
+    pairs, unmapped = [], []
+    for pair in disulfide_pairs:
+        sites = _disulfide_pair_sites(pair)
+        if sites is None:
+            continue
+        moved = []
+        for chain_id, resnum, icode in sites:
+            icode = icode if icode is not None else ""
+            target = owner.get((chain_id, int(resnum), icode))
+            if target is None:
+                targets = targets_by_chain.get(chain_id)
+                if not targets_by_chain:
+                    target = chain_id             # nothing was renamed
+                elif targets and len(targets) == 1:
+                    target = targets[0]
+            if target is None:
+                break
+            moved.append({"chain": target, "resnum": resnum, "icode": icode})
+        if len(moved) == 2:
+            pairs.append({"cys1": moved[0], "cys2": moved[1], "source_pair": pair})
+        else:
+            unmapped.append(
+                f"{sites[0][0]}:{sites[0][1]}-{sites[1][0]}:{sites[1][1]}"
+            )
+    return pairs, unmapped
+
+
+def _merged_chain_ids(pdb_file) -> set:
+    """The chain ids a merged PDB actually carries."""
+    ids = set()
+    for line in Path(pdb_file).read_text(errors="ignore").splitlines():
+        if line.startswith(("ATOM  ", "HETATM")) and len(line) >= 22:
+            ids.add(line[21])
+    return ids
+
+
+def _remap_missing_residue_record(
+    protein: dict,
+    record: dict,
+    chain_map: dict,
+) -> dict:
+    """Make merged.pdb chain identity primary while retaining provenance."""
+    source_chain = protein.get("chain_id")
+    author_chain = protein.get("author_chain") or source_chain
+    pieces = protein.get("residue_ranges") or [protein.get("residue_range") or {}]
+    piece = pieces[0]
+    merged_chain = _resolve_source_site_mapping(
+        chain_map,
+        author_chain,
+        piece.get("start"),
+        piece.get("start_icode"),
+    )
+    if merged_chain is None:
+        fallback = chain_map.get(source_chain, source_chain)
+        merged_chain = source_chain if isinstance(fallback, list) else fallback
+    remapped = {
+        **record,
+        "chain_id": merged_chain,
+        "source_chain": source_chain,
+        "author_chain": author_chain,
+    }
+
+    def _remap_segments(segments: list[dict]) -> list[dict]:
+        return [
+            {
+                **segment,
+                "chain_id": merged_chain,
+                "source_chain": segment.get("chain_id") or source_chain,
+                "author_chain": author_chain,
+            }
+            for segment in segments
+        ]
+
+    if isinstance(record.get("segments"), list):
+        remapped["segments"] = _remap_segments(record["segments"])
+    terminal = record.get("terminal_excluded")
+    if isinstance(terminal, dict) and isinstance(terminal.get("segments"), list):
+        remapped["terminal_excluded"] = {
+            **terminal,
+            "segments": _remap_segments(terminal["segments"]),
+        }
+    return remapped
+
+
+def _as_linkage_resnum(value: object) -> object:
+    text = str(value or "").strip()
+    return int(text) if text.lstrip("-").isdigit() else text
+
+
+def _glycan_linkage_key(linkage: dict) -> tuple:
+    protein = linkage.get("protein") or {}
+    glycan = linkage.get("glycan") or {}
+    return (
+        str(protein.get("chain", "")),
+        str(protein.get("resnum", "")),
+        str(protein.get("icode", "") or ""),
+        str(protein.get("resname", "")).upper(),
+        str(protein.get("atom", "")),
+        str(glycan.get("chain", "")),
+        str(glycan.get("resnum", "")),
+        str(glycan.get("icode", "") or ""),
+        str(glycan.get("resname", "")).upper(),
+        str(glycan.get("atom", "")),
+    )
+
+
+def _endpoint_metadata(
+    *,
+    atom: str,
+    resname: str,
+    chain: str,
+    resnum: object,
+    icode: str,
+    source: str,
+    connection_id: str | None,
+    reported_distance: float | None,
+) -> dict:
+    return {
+        "atom": atom,
+        "resname": resname,
+        "chain": chain,
+        "resnum": _as_linkage_resnum(resnum),
+        "icode": icode,
+        "source": source,
+        "connection_id": connection_id,
+        "reported_distance": reported_distance,
+    }
+
+
+def _parse_pdb_glycan_link_records(structure_path: Path) -> list[dict]:
+    """Parse PDB LINK records that connect a protein residue to a glycan."""
+    linkages: list[dict] = []
+    try:
+        lines = structure_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return linkages
+
+    protein_resnames = AMINO_ACIDS | AMBER_PROTEIN_RESIDUES
+    for line in lines:
+        if not line.startswith("LINK"):
+            continue
+        atom1 = line[12:16].strip()
+        res1 = line[17:20].strip()
+        chain1 = line[21].strip() or "A"
+        resnum1 = line[22:26].strip()
+        icode1 = line[26].strip()
+        atom2 = line[42:46].strip()
+        res2 = line[47:50].strip()
+        chain2 = line[51].strip() or "A"
+        resnum2 = line[52:56].strip()
+        icode2 = line[56].strip()
+
+        side1_is_glycan = is_glycan_residue_name(res1)
+        side2_is_glycan = is_glycan_residue_name(res2)
+        side1_is_protein = res1 in protein_resnames
+        side2_is_protein = res2 in protein_resnames
+        if side1_is_protein and side2_is_glycan:
+            protein = (atom1, res1, chain1, resnum1, icode1)
+            glycan = (atom2, res2, chain2, resnum2, icode2)
+        elif side2_is_protein and side1_is_glycan:
+            protein = (atom2, res2, chain2, resnum2, icode2)
+            glycan = (atom1, res1, chain1, resnum1, icode1)
+        else:
+            continue
+
+        linkages.append({
+            "source": "pdb_link",
+            "connection_id": None,
+            "reported_distance": None,
+            "protein": _endpoint_metadata(
+                atom=protein[0],
+                resname=protein[1],
+                chain=protein[2],
+                resnum=protein[3],
+                icode=protein[4],
+                source="pdb_link",
+                connection_id=None,
+                reported_distance=None,
+            ),
+            "glycan": _endpoint_metadata(
+                atom=glycan[0],
+                resname=glycan[1],
+                chain=glycan[2],
+                resnum=glycan[3],
+                icode=glycan[4],
+                source="pdb_link",
+                connection_id=None,
+                reported_distance=None,
+            ),
+        })
+    return linkages
+
+
+def _parse_gemmi_glycan_link_records(structure_path: Path) -> list[dict]:
+    """Parse mmCIF/PDB covalent connections between protein and glycans."""
+    try:
+        import gemmi
+    except ImportError:
+        return []
+
+    try:
+        suffix = structure_path.suffix.lower()
+        if suffix in {".cif", ".mmcif"}:
+            doc = gemmi.cif.read(str(structure_path))
+            structure = gemmi.make_structure_from_block(doc[0])
+            source = "mmcif_struct_conn"
+        else:
+            structure = gemmi.read_pdb(str(structure_path))
+            source = "pdb_struct_conn"
+    except Exception:
+        return []
+
+    protein_resnames = AMINO_ACIDS | AMBER_PROTEIN_RESIDUES
+    covalent_type = getattr(gemmi.ConnectionType, "Covale", None)
+    linkages: list[dict] = []
+
+    def _is_covalent(conn: object) -> bool:
+        conn_type = getattr(conn, "type", None)
+        if covalent_type is not None and conn_type == covalent_type:
+            return True
+        return "coval" in str(conn_type).lower()
+
+    def _partner_tuple(partner: object) -> tuple[str, str, str, object, str]:
+        res_id = getattr(partner, "res_id", None)
+        seqid = getattr(res_id, "seqid", None)
+        return (
+            str(getattr(partner, "atom_name", "") or "").strip(),
+            str(getattr(res_id, "name", "") or "").strip().upper(),
+            str(getattr(partner, "chain_name", "") or "").strip() or "A",
+            getattr(seqid, "num", "") if seqid is not None else "",
+            str(getattr(seqid, "icode", "") or "").strip(),
+        )
+
+    for conn in getattr(structure, "connections", []):
+        if not _is_covalent(conn):
+            continue
+        p1 = _partner_tuple(conn.partner1)
+        p2 = _partner_tuple(conn.partner2)
+        side1_is_glycan = is_glycan_residue_name(p1[1])
+        side2_is_glycan = is_glycan_residue_name(p2[1])
+        side1_is_protein = p1[1] in protein_resnames
+        side2_is_protein = p2[1] in protein_resnames
+        if side1_is_protein and side2_is_glycan:
+            protein, glycan = p1, p2
+        elif side2_is_protein and side1_is_glycan:
+            protein, glycan = p2, p1
+        else:
+            continue
+
+        reported_distance = getattr(conn, "reported_distance", None)
+        try:
+            reported_distance = float(reported_distance) if reported_distance is not None else None
+        except (TypeError, ValueError):
+            reported_distance = None
+        connection_id = str(getattr(conn, "name", "") or "").strip() or None
+        linkages.append({
+            "source": source,
+            "connection_id": connection_id,
+            "reported_distance": reported_distance,
+            "protein": _endpoint_metadata(
+                atom=protein[0],
+                resname=protein[1],
+                chain=protein[2],
+                resnum=protein[3],
+                icode=protein[4],
+                source=source,
+                connection_id=connection_id,
+                reported_distance=reported_distance,
+            ),
+            "glycan": _endpoint_metadata(
+                atom=glycan[0],
+                resname=glycan[1],
+                chain=glycan[2],
+                resnum=glycan[3],
+                icode=glycan[4],
+                source=source,
+                connection_id=connection_id,
+                reported_distance=reported_distance,
+            ),
+        })
+    return linkages
+
+
+def _parse_glycan_link_records(structure_path: Path) -> list[dict]:
+    """Parse protein-glycan covalent linkages from mmCIF/PDB metadata."""
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for linkage in _parse_gemmi_glycan_link_records(structure_path):
+        key = _glycan_linkage_key(linkage)
+        if key not in seen:
+            out.append(linkage)
+            seen.add(key)
+    for linkage in _parse_pdb_glycan_link_records(structure_path):
+        key = _glycan_linkage_key(linkage)
+        if key not in seen:
+            out.append(linkage)
+            seen.add(key)
+    return out
+
+
+def _expand_covalently_linked_glycan_selection(
+    *,
+    select_chains: Optional[List[str]],
+    include_types: Optional[List[str]],
+    inspection: dict,
+    linkages: list[dict],
+    selected_labels: Optional[List[str]] = None,
+    excluded_labels: Optional[set] = None,
+) -> tuple[Optional[List[str]], list[dict], Optional[dict]]:
+    """Include glycan label chains covalently linked to selected proteins.
+
+    ``selected_labels`` is the request as the split resolves it
+    (``resolve_chain_selection``); without it the names are read label first.
+    A glycan chain in ``excluded_labels`` (named by ``--exclude-ligand-ids``)
+    is neither added nor kept among the linkages: an explicit exclusion
+    outranks the closure (069_soluble_1aol, glm v5).
+    """
+    excluded_labels = {str(label) for label in (excluded_labels or ())}
+    chains = inspection.get("chains", [])
+    if excluded_labels:
+        excluded_residues = {
+            (str(chain.get("author_chain")), str(record.get("resnum")),
+             str(record.get("resname")).upper())
+            for chain in chains
+            if str(chain.get("chain_id")) in excluded_labels
+            for record in (chain.get("residue_numbering") or {}).get("ordered_residues") or []
+        }
+        linkages = [
+            linkage for linkage in linkages or []
+            if (str((linkage.get("glycan") or {}).get("chain")),
+                str((linkage.get("glycan") or {}).get("resnum")),
+                str((linkage.get("glycan") or {}).get("resname", "")).upper())
+            not in excluded_residues
+        ]
+    if (include_types is not None and "glycan" not in include_types) or not linkages:
+        return select_chains, [], None
+    if select_chains is None:
+        return None, list(linkages), None
+
+    if selected_labels is not None:
+        selected_labels = {str(label) for label in selected_labels}
+    else:
+        selected_labels = set()
+        for requested in select_chains:
+            label_hits = {
+                str(chain.get("chain_id"))
+                for chain in chains
+                if chain.get("chain_id") == requested
+            }
+            if label_hits:
+                selected_labels.update(label_hits)
+            else:
+                selected_labels.update(
+                    str(chain.get("chain_id"))
+                    for chain in chains
+                    if chain.get("author_chain") == requested
+                )
+
+    selected_protein_authors = {
+        str(chain.get("author_chain"))
+        for chain in chains
+        if chain.get("chain_type") == "protein"
+        and str(chain.get("chain_id")) in selected_labels
+    }
+    selected_linkages = [
+        linkage
+        for linkage in linkages
+        if str((linkage.get("protein") or {}).get("chain"))
+        in selected_protein_authors
+    ]
+    linked_glycan_authors = {
+        str((linkage.get("glycan") or {}).get("chain"))
+        for linkage in selected_linkages
+    }
+    added_labels = sorted(
+        {
+            str(chain.get("chain_id"))
+            for chain in chains
+            if chain.get("chain_type") == "glycan"
+            and str(chain.get("author_chain")) in linked_glycan_authors
+            and str(chain.get("chain_id")) not in selected_labels
+            and str(chain.get("chain_id")) not in excluded_labels
+        }
+    )
+    if not added_labels:
+        return select_chains, selected_linkages, None
+
+    adjustment = {
+        "code": "covalently_linked_glycan_chains_auto_included",
+        "message": (
+            "Glycan chain(s) covalently linked to selected protein chain(s) "
+            "were added."
+        ),
+        "selected_protein_author_chains": sorted(selected_protein_authors),
+        "added_chain_ids": added_labels,
+        "connection_ids": sorted(
+            {
+                str(linkage.get("connection_id"))
+                for linkage in selected_linkages
+                if linkage.get("connection_id")
+            }
+        ),
+    }
+    return list(select_chains) + added_labels, selected_linkages, adjustment
+
+
+def _remap_glycan_linkages(
+    linkages: list[dict],
+    protein_chain_map: dict,
+    glycan_residue_mapping: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Resolve source LINK endpoints onto merged.pdb chain/residue IDs."""
+    glycan_by_source = {
+        (
+            str(r["source_chain"]),
+            str(r["source_resnum"]),
+            str(r.get("source_icode", "") or ""),
+            str(r["source_resname"]).upper(),
+        ): r
+        for r in glycan_residue_mapping or []
+    }
+    remapped: list[dict] = []
+    dropped: list[dict] = []
+    for link in linkages or []:
+        protein = dict(link.get("protein") or {})
+        glycan = dict(link.get("glycan") or {})
+        protein_chain = _resolve_source_site_mapping(
+            protein_chain_map,
+            protein.get("chain"),
+            protein.get("resnum"),
+            protein.get("icode"),
+        )
+        glycan_key = (
+            str(glycan.get("chain")),
+            str(glycan.get("resnum")),
+            str(glycan.get("icode", "") or ""),
+            str(glycan.get("resname", "")).upper(),
+        )
+        glycan_map = glycan_by_source.get(glycan_key)
+        if protein_chain is None or glycan_map is None:
+            dropped.append(dict(link))
+            continue
+        protein.update({
+            "original_chain": protein.get("chain"),
+            "chain": protein_chain,
+            "merged_chain": protein_chain,
+            "merged_resnum": protein.get("resnum"),
+        })
+        glycan.update({
+            "original_chain": glycan.get("chain"),
+            "chain": glycan_map["merged_chain"],
+            "merged_chain": glycan_map["merged_chain"],
+            "merged_resnum": glycan_map["merged_resnum"],
+            "merged_icode": glycan_map.get("merged_icode", ""),
+        })
+        remapped.append({
+            **link,
+            "protein": protein,
+            "glycan": glycan,
+            "status": "remapped",
+        })
+    return remapped, dropped
+
+
+def _resolve_prepare_node_structure_file(
+    job_dir: Optional[str],
+    node_id: Optional[str],
+    structure_file: Optional[str],
+    source_selection: Optional[dict] = None,
+) -> dict:
+    """Resolve the source even for overrides, so reinput cannot erase identity."""
+    if not (job_dir and node_id):
+        return {"structure_file": structure_file}
+    from mdclaw._node import resolve_node_inputs
+
+    inputs = resolve_node_inputs(job_dir, node_id, "prep")
+    if inputs.get("source_bundle_file"):
+        try:
+            from mdclaw.source_bundle import materialize_source_selection
+
+            selected = materialize_source_selection(
+                bundle_file=inputs["source_bundle_file"],
+                selection=source_selection,
+                prep_artifacts_dir=Path(job_dir) / "nodes" / node_id / "artifacts",
+            )
+            if structure_file and Path(structure_file).resolve() != Path(selected["structure_file"]).resolve():
+                from .residue_identity import checked_structure_override
+
+                selected["structure_file"] = checked_structure_override(
+                    selected["structure_file"], structure_file,
+                    Path(job_dir) / "nodes" / node_id / "artifacts" / "identity_checked_input.cif",
+                )
+            return {
+                "structure_file": selected.get("structure_file"),
+                "input_resolution_error": inputs.get("input_resolution_error"),
+                "input_resolution_errors": inputs.get("input_resolution_errors", []),
+                "source_bundle_file": selected.get("source_bundle_file"),
+                "source_selection_file": selected.get("source_selection_file"),
+                "source_selection": selected.get("source_selection"),
+                "source_structure_id": selected.get("selected_structure", {}).get("structure_id"),
+                "source_structure": selected.get("selected_structure"),
+            }
+        except Exception as exc:
+            return {
+                "structure_file": None,
+                "input_resolution_error": str(exc),
+                "input_resolution_errors": inputs.get("input_resolution_errors", []) + [str(exc)],
+                "source_bundle_file": inputs.get("source_bundle_file"),
+                "source_selection": source_selection,
+                "source_structure_id": inputs.get("source_structure_id"),
+            }
+    if structure_file and inputs.get("structure_file"):
+        try:
+            from .residue_identity import checked_structure_override
+
+            if Path(structure_file).resolve() != Path(inputs["structure_file"]).resolve():
+                artifacts = Path(job_dir) / "nodes" / node_id / "artifacts"
+                artifacts.mkdir(parents=True, exist_ok=True)
+                structure_file = checked_structure_override(
+                    inputs["structure_file"], structure_file, artifacts / "identity_checked_input.cif")
+        except (ValueError, OSError, RuntimeError) as exc:
+            return {"structure_file": None, "input_resolution_error": str(exc)}
+    return {
+        "structure_file": structure_file or inputs.get("structure_file"),
+        "input_resolution_error": inputs.get("input_resolution_error"),
+        "input_resolution_errors": inputs.get("input_resolution_errors", []),
+        "source_bundle_file": inputs.get("source_bundle_file"),
+        "source_selection": source_selection,
+        "source_structure_id": inputs.get("source_structure_id"),
+        "source_structure": inputs.get("source_structure"),
+    }
+
+
+def _validate_prepare_node_context(*, job_dir, node_id, **parameters) -> dict:
+    """Compare the actual prep arguments, not a separately maintained allowlist."""
+    from mdclaw._node import validate_node_execution_context
+
+    # File locations are resolved by the DAG, not scientific conditions.
+    for key in ("structure_file", "output_dir"):
+        parameters.pop(key, None)
+    parameters["missing_residue_method"] = str(
+        parameters.get("missing_residue_method") or "auto").strip().lower()
+    for key in ("residue_ranges", "join_range_groups"):
+        parameters[key] = parameters.get(key) or []
+    return validate_node_execution_context(
+        job_dir, node_id, "prep", actual_conditions=parameters,
+    )
+
+
+def _prepare_complex_initial_result(job_id: str, structure_file: Optional[str]) -> dict:
+    return {
+        "success": False,
+        "job_id": job_id,
+        "output_dir": None,
+        "source_file": str(structure_file) if structure_file else None,
+        "source_bundle_file": None,
+        "source_selection_file": None,
+        "source_selection": None,
+        "source_structure_id": None,
+        "inspection": None,
+        "split": None,
+        "proteins": [],
+        "nucleics": [],
+        "glycans": [],
+        "ligands": [],
+        "errors": [],
+        "warnings": [],
+        "component_disposition": _component_disposition_payload([]),
+        "component_disposition_summary": _component_disposition_payload([])["summary"],
+        "component_disposition_file": None,
+        "excluded_components_file": None,
+        "retained_ion_files": [],
+        "excluded_ion_files": [],
+    }
+
+
+def _drop_detections_outside_ranges(result, split_result, disulfide_bonds, metal_sites):
+    """Detection runs on the whole structure; the range decides what survives.
+
+    Disulfides and metal sites are found before the split, so they know nothing
+    about a residue range applied during it.  Left alone, a bond or a site whose
+    residues were cropped is still requested of a structure that no longer holds
+    them: measured on 4OW0 with ``A:4-226``, the zinc keeps all four of its
+    cysteines assigned and cleaning fails with "Protonation target not found:
+    A:227", which names the symptom and not the cause.
+
+    Returns (disulfide_bonds, metal_sites) with what the range removed taken
+    out, and says so in the warnings.
+    """
+    resolved = ((split_result or {}).get("residue_ranges") or {}).get("resolved") or {}
+    if not resolved:
+        return disulfide_bonds, metal_sites
+
+    bounds = {}
+    for entry in resolved.values():
+        for name in (entry.get("author_chain"),):
+            if name:
+                bounds[str(name).strip()] = [(piece["start"], piece["end"])
+                                             for piece in _pieces(entry)]
+
+    def inside(chain, resnum):
+        windows = bounds.get(str(chain).strip())
+        if not windows:
+            return True
+        try:
+            number = int(str(resnum).strip())
+        except (TypeError, ValueError):
+            return True
+        # Any piece, because a chain given several ranges holds a residue if one
+        # of them does; the gaps between them are what the ranges left out.
+        return any(start <= number <= end for start, end in windows)
+
+    kept_bonds = []
+    for pair in disulfide_bonds:
+        ends = [(pair.get("cys1") or {}), (pair.get("cys2") or {})]
+        if all(inside(end.get("chain"), end.get("resnum")) for end in ends):
+            kept_bonds.append(pair)
+        else:
+            result.setdefault("warnings", []).append(
+                f"Dropped the disulfide "
+                f"{ends[0].get('chain')}:{ends[0].get('resnum')}-"
+                f"{ends[1].get('chain')}:{ends[1].get('resnum')}: a residue range "
+                "cut one of its cysteines, so the bond has nothing to join and "
+                "the cysteine that remains is left free rather than renamed CYX")
+
+    kept_sites = []
+    for site in metal_sites:
+        outside = [item for item in site["ligands"]
+                   if not inside(item["chain"], item["resnum"])]
+        if not outside:
+            kept_sites.append(site)
+        else:
+            names = ", ".join(f"{item['chain']}:{item['resname']}{item['resnum']}"
+                              for item in outside)
+            result.setdefault("warnings", []).append(
+                f"{site['label']} ({site['motif']}) loses {len(outside)} ligand(s) "
+                f"to a residue range ({names}); the site is no longer the one that "
+                "was detected, so no metal-derived protonation is assigned and the "
+                "remaining ligands keep whatever pdb2pqr gives them")
+
+    return kept_bonds, kept_sites
+
+
+def _source_pair_key(pair):
+    """An unordered pair of (chain, resnum, icode) in source (author) ids; None if unreadable.
+
+    ``form_bond`` does not matter here: a pair named with ``form_bond: false``
+    is still named.
+    """
+    try:
+        ends = []
+        for end in ("cys1", "cys2"):
+            site = pair.get(end) or {}
+            ends.append((str(site.get("chain") or "").strip(), int(site.get("resnum")),
+                         str(site.get("icode") or "").strip()))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return frozenset(ends)
+
+
+def _inside_windows(pair, windows) -> bool:
+    """Both cysteines inside the residue ranges of their chains (chains without a range pass)."""
+    for end in ("cys1", "cys2"):
+        site = pair.get(end) or {}
+        spans = (windows or {}).get(str(site.get("chain") or "").strip())
+        if not spans:
+            continue
+        try:
+            number = int(site.get("resnum"))
+        except (TypeError, ValueError):
+            continue
+        if not any(low <= number <= high for low, high in spans):
+            return False
+    return True
+
+
+def deposit_disulfides(structure_path, select_chains=None, range_windows=None) -> list[dict]:
+    """The disulfides the deposit says are there, on the selected chains and ranges.
+
+    SSBOND / ``_struct_conn`` records merged with S-S distances (metal-bridged
+    pairs excluded by detection), kept when the two sulfurs are bonded or
+    overlapping, or when a record names a pair whose sulfur is unobserved
+    (the bond is built with the residue). This is the set a preparation may
+    only leave unformed when the caller names the pair with ``form_bond: false``.
+    """
+    from mdclaw.structure.disulfide import (
+        _detect_disulfide_candidates,
+        _merge_disulfide_pairs,
+        _parse_ssbond_records,
+    )
+
+    try:
+        detected = _merge_disulfide_pairs(
+            _parse_ssbond_records(Path(structure_path)),
+            _detect_disulfide_candidates(Path(structure_path)),
+            select_chains=select_chains,
+        )
+    except Exception:  # noqa: BLE001 - detection is evidence, never a crash
+        return []
+    if select_chains is not None and not select_chains:
+        return []
+    kept = []
+    for pair in detected:
+        recorded = "ssbond" in str(pair.get("source") or "")
+        if pair.get("geometry") in ("bonded", "overlap") or (
+                recorded and pair.get("distance_angstrom") is None):
+            if _inside_windows(pair, range_windows):
+                kept.append(pair)
+    return kept
+
+
+def _detected_disulfides_not_declared(structure_path, declared_pairs, select_chains,
+                                      range_windows=None) -> list[dict]:
+    """Bonded disulfides the deposit shows that a declared list leaves out.
+
+    A declared ``--disulfide-pairs`` list replaces detection entirely, and
+    ``'[]'`` means none. The omission used to be silent: 096_soluble_1ay7
+    cli_skill_sif r2 (campaign v2) passed ``'[]'`` with a long protonation
+    list, lost the deposit's C7-C96 (2.04 A) and failed the reference's
+    disulfide check without any warning naming the bond; a warning followed,
+    and now a refusal. Returns the :func:`deposit_disulfides` pairs that the
+    declared list neither names nor names with ``form_bond: false``.
+    """
+    declared_keys = {_source_pair_key(pair) for pair in declared_pairs or []} - {None}
+    return [pair for pair in deposit_disulfides(structure_path, select_chains, range_windows)
+            if _source_pair_key(pair) not in declared_keys]
+
+
+def _unformed_disulfides_in_merged(merged_pdb, disulfide_bonds, deposit_pairs=None,
+                                   chain_mapping_entries=None) -> list[dict]:
+    """Disulfides the prepared structure should carry and does not.
+
+    The invariant behind every disulfide path, checked on the merged file
+    itself, so a pair lost anywhere upstream -- a chain filter that read the
+    wrong chain (2DD8's heavy chain, campaign v5), a declared list that left
+    a bond out -- is caught however it was lost:
+
+    - two cysteines whose sulfurs sit within the S-S bond window (or closer)
+      with no metal bridging them, and
+    - every deposit record (``deposit_pairs``, source ids) that maps onto two
+      cysteines of the merged file,
+
+    must be CYX and named by ``disulfide_bonds`` (merged ids), unless
+    ``disulfide_bonds`` names the pair with ``form_bond: false``. Returns
+    ``{"merged": "A:22-A:96", "source": ..., "distance_angstrom": ...,
+    "reason": ...}`` per pair that is not formed.
+    """
+    from mdclaw.structure.disulfide import (
+        DISULFIDE_BOND_MAX_ANGSTROM,
+        DISULFIDE_METAL_ELEMENTS,
+        close_sulfur_pairs,
+    )
+    from mdclaw.structure.pdb_utils import resolve_residue_site
+
+    cysteines: dict[tuple[str, int, str], dict] = {}
+    metals: list[tuple[float, float, float]] = []
+    for line in Path(merged_pdb).read_text(errors="ignore").splitlines():
+        if not line.startswith(("ATOM  ", "HETATM")) or len(line) < 54:
+            continue
+        try:
+            xyz = (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+        except ValueError:
+            continue
+        element = (line[76:78].strip() if len(line) >= 78 else "") or line[12:14].strip()
+        if element.upper() in DISULFIDE_METAL_ELEMENTS and line.startswith("HETATM"):
+            metals.append(xyz)
+        resname = line[17:20].strip()
+        if resname not in ("CYS", "CYX", "CYM"):
+            continue
+        try:
+            key = (line[21].strip(), int(line[22:26]), line[26].strip())
+        except ValueError:
+            continue
+        record = cysteines.setdefault(key, {"resname": resname, "sg": None})
+        if line[12:16].strip() == "SG":
+            record["sg"] = xyz
+
+    def resolve(site):
+        if not isinstance(site, dict) or site.get("chain") is None or site.get("resnum") is None:
+            return None
+        try:
+            key, _problem = resolve_residue_site(
+                cysteines, site.get("chain"), site.get("resnum"), site.get("icode"))
+        except (TypeError, ValueError):
+            return None
+        return key
+
+    formed, excluded = set(), set()
+    for bond in disulfide_bonds or []:
+        ends = (resolve(bond.get("cys1")), resolve(bond.get("cys2")))
+        if None in ends:
+            continue
+        (excluded if bond.get("form_bond") is False else formed).add(frozenset(ends))
+
+    def spelled(key):
+        return f"{key[0]}:{key[1]}{key[2]}"
+
+    problems: dict[frozenset, dict] = {}
+
+    def check(ends, source, distance, reason):
+        pair = frozenset(ends)
+        if len(pair) != 2 or pair in excluded or pair in problems:
+            return
+        if pair in formed and all(cysteines[end]["resname"] == "CYX" for end in ends):
+            return
+        problems[pair] = {
+            "merged": "-".join(spelled(end) for end in sorted(ends)),
+            "source": source,
+            "distance_angstrom": distance,
+            "resnames": [cysteines[end]["resname"] for end in sorted(ends)],
+            "reason": reason,
+        }
+
+    sulfurs = {key: rec["sg"] for key, rec in cysteines.items() if rec["sg"] is not None}
+    for one, two, distance in close_sulfur_pairs(sulfurs, metals, DISULFIDE_BOND_MAX_ANGSTROM):
+        check((one, two), None, distance, "sulfurs_within_bond_distance")
+
+    if deposit_pairs:
+        mapped, _unmapped = _disulfide_pairs_in_merged_frame(
+            deposit_pairs, chain_mapping_entries or [])
+        for pair in mapped:
+            ends = (resolve(pair["cys1"]), resolve(pair["cys2"]))
+            if None in ends:
+                continue
+            original = pair.get("source_pair") or {}
+            check(ends, _spell_pair(original) if original else None,
+                  original.get("distance_angstrom"), "recorded_in_deposit")
+    return list(problems.values())
+
+
+def _spell_pair(pair) -> str:
+    one, two = (pair.get("cys1") or {}), (pair.get("cys2") or {})
+    return (f"{one.get('chain', '')}:{one.get('resnum')}{(one.get('icode') or '').strip()}-"
+            f"{two.get('chain', '')}:{two.get('resnum')}{(two.get('icode') or '').strip()}")
+
+
+def _public_pair(pair, form_bond=None) -> dict:
+    """A pair in the public ``--disulfide-pairs`` shape (chain, resnum, icode)."""
+    out = {}
+    for end in ("cys1", "cys2"):
+        site = pair.get(end) or {}
+        entry = {"chain": site.get("chain"), "resnum": site.get("resnum")}
+        if (site.get("icode") or "").strip():
+            entry["icode"] = site["icode"].strip()
+        out[end] = entry
+    if form_bond is not None:
+        out["form_bond"] = form_bond
+    elif pair.get("form_bond") is False:
+        out["form_bond"] = False
+    return out
+
+
+def _suppressed_disulfides_next_action(declared_pairs, suppressed) -> str:
+    """The exact commands that either form or deliberately reduce the omitted pairs."""
+    declared = [_public_pair(pair) for pair in declared_pairs or []]
+    formed = json.dumps(declared + [_public_pair(pair) for pair in suppressed])
+    reduced = json.dumps(declared + [_public_pair(pair, form_bond=False) for pair in suppressed])
+    return (
+        "Run the same (still pending) node again with one of: omit --disulfide-pairs "
+        "(detection forms every bonded pair); form them: "
+        f"--disulfide-pairs '{formed}'; keep them reduced on purpose: "
+        f"--disulfide-pairs '{reduced}'."
+    )
+
+
+def _ligand_id_for_file(ligand_file, cinfo: dict, all_chains_lookup: dict) -> Optional[str]:
+    """The residue name a split ligand file is prepared under (step 5's rule)."""
+    component = cinfo.get("ligand_component")
+    if component:
+        return component["residue_name"]
+    chain_data = all_chains_lookup.get(cinfo.get("chain_id"), {})
+    unique = ((chain_data.get("residue_names") or {}).get("unique_residues") or [])
+    if unique:
+        return unique[0]
+    try:
+        for line in Path(ligand_file).read_text(errors="ignore").splitlines():
+            if line.startswith(("HETATM", "ATOM")) and line[17:20].strip():
+                return line[17:20].strip()
+    except OSError:
+        return None
+    return None
+
+
+def _expected_ligand_net_charge(ligand_net_charges, instance_id, ligand_id, sa_spec):
+    """Instance id, then residue name, then structure_analysis; None when unstated."""
+    for key in (instance_id, ligand_id):
+        if key and ligand_net_charges and key in ligand_net_charges:
+            return int(ligand_net_charges[key])
+    if sa_spec and sa_spec.get("net_charge") is not None:
+        return int(sa_spec["net_charge"])
+    return None
+
+
+def _structure_analysis_ligand_spec(structure_analysis, ligand_id, chain_id):
+    for spec in (structure_analysis or {}).get("ligands", []) or []:
+        if spec.get("resname") == ligand_id or spec.get("chain") == chain_id:
+            return spec
+    return None
+
+
+def _ligand_chemistry_preflight(split_result, *, ligand_smiles, ligand_net_charges,
+                                structure_analysis, protonate_ligands, ph) -> Optional[dict]:
+    """Refusals the ligand step would reach after the whole preparation, decided now.
+
+    - ``invalid_ligand_net_charges``: a ``--ligand-net-charges`` key names no
+      selected ligand (residue name or instance id).
+    - ``ligand_smiles_ccd_mismatch``: a supplied SMILES has the CCD ligand's
+      heavy atoms wired differently (``smiles_ccd_mismatch``).
+    - ``ligand_protonation_ambiguous``: Dimorphite-DL offers states of
+      different net charge and nothing says which is meant.
+    - ``ligand_protonation_charge_unreachable``: no state has the stated charge.
+    """
+    from mdclaw.structure import ligand_chemistry as lc
+
+    all_chains_lookup = {c.get("chain_id"): c for c in split_result.get("all_chains", []) or []}
+    infos = {str(info.get("file")): info for info in split_result.get("chain_file_info", []) or []}
+    seen_keys: set[str] = set()
+    for ligand_file in split_result.get("ligand_files", []) or []:
+        cinfo = infos.get(str(ligand_file), {})
+        ligand_id = _ligand_id_for_file(ligand_file, cinfo, all_chains_lookup)
+        if not ligand_id:
+            continue
+        instance_id = cinfo.get("unique_id")
+        seen_keys.update({ligand_id, ligand_id[:3].upper(), str(instance_id or "")})
+        if cinfo.get("ligand_component"):
+            continue
+        sa_spec = _structure_analysis_ligand_spec(structure_analysis, ligand_id, cinfo.get("chain_id"))
+        if sa_spec and not sa_spec.get("include", True):
+            continue
+        user_smiles = (ligand_smiles or {}).get(ligand_id)
+        if sa_spec and sa_spec.get("smiles"):
+            user_smiles = sa_spec["smiles"]
+        expected = _expected_ligand_net_charge(ligand_net_charges, instance_id, ligand_id, sa_spec)
+
+        if user_smiles and not cinfo.get("covalent_members"):
+            mismatch = lc.smiles_ccd_mismatch(ligand_id, user_smiles)
+            if mismatch is not None:
+                return {
+                    "errors": [
+                        f"--ligand-smiles for {ligand_id} has the CCD definition's heavy atoms "
+                        f"but bonds them differently: given {mismatch['user_skeleton']}, CCD "
+                        f"{mismatch['ccd_skeleton']} (charges, hydrogens and stereo ignored). "
+                        "It would template-match the deposited atoms and build another molecule."],
+                    "code": "ligand_smiles_ccd_mismatch",
+                    "context": {"ligand_id": ligand_id, **mismatch},
+                    "next_action": (
+                        f"Drop {ligand_id} from --ligand-smiles to use the CCD definition, or give "
+                        f"a SMILES with the CCD bond orders (charges may differ), e.g. "
+                        f"--ligand-smiles '{{\"{ligand_id}\": \"{mismatch['ccd_smiles']}\"}}', then "
+                        "run the same (still pending) node again."),
+                }
+
+        if not protonate_ligands:
+            continue
+        smiles = user_smiles or lc._get_ligand_smiles(ligand_id, user_smiles=None, fetch_from_ccd=True)
+        if not smiles or lc._smiles_has_explicit_charge(smiles):
+            continue
+        candidates = lc._protonate_smiles_dimorphite(smiles, ph)
+        choice = lc.choose_protonation_state(candidates, expected)
+        if choice["status"] == "ambiguous":
+            spelled = "; ".join(f"{c['smiles']} (net charge {c['charge']})"
+                                for c in choice["candidates"])
+            return {
+                "errors": [
+                    f"Ligand {ligand_id} ({instance_id or ligand_file}): Dimorphite-DL offers "
+                    f"protonation states of different net charge at pH {ph}: {spelled}. Its "
+                    "order is not a ranking, so the charge is not picked for you."],
+                "code": "ligand_protonation_ambiguous",
+                "context": {"ligand_id": ligand_id, "ligand_instance_id": instance_id,
+                            "ph": ph, "candidates": choice["candidates"]},
+                "next_action": lc.ligand_protonation_next_action(ligand_id, choice["candidates"]),
+            }
+        if choice["status"] == "unreachable":
+            charges = sorted({c["charge"] for c in choice["candidates"]})
+            return {
+                "errors": [
+                    f"Ligand {ligand_id}: no Dimorphite-DL protonation state at pH {ph} has "
+                    f"net charge {expected}; the states offered have {charges}."],
+                "code": "ligand_protonation_charge_unreachable",
+                "context": {"ligand_id": ligand_id, "candidates": choice["candidates"]},
+                "next_action": (
+                    f"Give {ligand_id} a charged SMILES that encodes net charge {expected} "
+                    f"(--ligand-smiles '{{\"{ligand_id}\": \"...\"}}'), or state one of "
+                    f"{charges} in --ligand-net-charges, then run the same (still pending) "
+                    "node again."),
+            }
+
+    unknown = sorted(key for key in (ligand_net_charges or {}) if key not in seen_keys)
+    if unknown:
+        offered = sorted(key for key in seen_keys if key)
+        return {
+            "errors": [f"--ligand-net-charges names {', '.join(unknown)}, which no selected "
+                       f"ligand answers to (selected: {', '.join(offered) or 'none'})"],
+            "code": "invalid_ligand_net_charges",
+            "next_action": (
+                "Key --ligand-net-charges by a selected ligand's residue name or instance id "
+                f"({', '.join(offered) or 'none selected'}), then run the same (still pending) "
+                "node again."),
+        }
+    return None
+
+
+def _declared_disulfide_site_problems(disulfide_pairs, split_result, *, terminal_builds: bool) -> list[str]:
+    """Declared cysteine sites the selected protein pieces cannot hold.
+
+    Checked on the split output, before the node begins: 028_complex_1dfj
+    (campaign v2) declared RNase A's A:26-A:84 by label chain A while the
+    pieces carry author chain E, and lost the node after the whole preparation
+    ("could not be located in the merged structure"). Pairs are written in
+    author chain ids, as inspect_molecules and the disulfide detection report
+    them. A site passes when a piece holds it as a cysteine, when the range
+    contract requests it (unobserved residues are built), or when it lies
+    inside the observed span of its chain (an internal gap the repair builds;
+    near a chain end too when terminal residues are built). An unstated
+    insertion code matches any.
+    """
+    from mdclaw.structure.clean_protein import _disulfide_pair_sites
+    from mdclaw.structure.pdb_utils import _read_pdb_unique_residues
+
+    cysteines = {"CYS", "CYX", "CYM"}
+    held: dict[tuple[str, int, str], set] = {}
+    spans: dict[str, list[tuple[int, int]]] = {}
+    label_to_author: dict[str, str] = {}
+    infos = {str(info.get("file")): info for info in split_result.get("chain_file_info", []) or []}
+    for path in split_result.get("protein_files", []) or []:
+        info = infos.get(str(path), {})
+        try:
+            residues = _read_pdb_unique_residues(path)
+        except OSError:
+            continue
+        numbers_by_chain: dict[str, list[int]] = {}
+        for residue in residues:
+            if isinstance(residue["resnum"], int):
+                held.setdefault((residue["chain"], residue["resnum"], residue["icode"]),
+                                set()).add(residue["resname"])
+                numbers_by_chain.setdefault(residue["chain"], []).append(residue["resnum"])
+        for chain, numbers in numbers_by_chain.items():
+            spans.setdefault(chain, []).append((min(numbers), max(numbers)))
+        file_chain = next(iter(numbers_by_chain), None)
+        label = str(info.get("chain_id") or "").strip()[:1]
+        if label and file_chain and label != file_chain:
+            label_to_author.setdefault(label, file_chain)
+        for row in (info.get("residue_identity") or {}).get("residues") or []:
+            if file_chain and row.get("number") is not None and row.get("name"):
+                held.setdefault((file_chain, row["number"], row.get("icode") or ""),
+                                set()).add(row["name"])
+
+    def _held_names(chain, resnum, icode):
+        # An unstated insertion code means the residue without one, as the
+        # merged-frame mapping reads it: 1CEB numbers GLU 1A before CYS 1,
+        # and "A:1" is the cysteine. Only when no such residue exists does
+        # any insertion code match.
+        if icode is not None:
+            return held.get((chain, resnum, icode))
+        if (chain, resnum, "") in held:
+            return held[(chain, resnum, "")]
+        found = set()
+        for (c, n, _i), names in held.items():
+            if c == chain and n == resnum:
+                found |= names
+        return found or None
+
+    problems: list[str] = []
+    for pair in disulfide_pairs or []:
+        sites = _disulfide_pair_sites(pair)
+        if sites is None:
+            continue
+        for chain, resnum, icode in sites:
+            spelled = f"{chain}:{resnum}{icode or ''}"
+            if chain in spans:
+                names = _held_names(chain, resnum, icode)
+                if names:
+                    if not names & cysteines:
+                        problems.append(f"{spelled} is {'/'.join(sorted(names))}, not a cysteine")
+                    continue
+                reach = 10 if terminal_builds else 0
+                if not any(low - reach < resnum < high + reach for low, high in spans[chain]):
+                    shown = ", ".join(f"{chain}:{low}-{high}" for low, high in sorted(spans[chain]))
+                    problems.append(f"{spelled} is outside the selected residues of chain {chain} ({shown})")
+            elif chain in label_to_author:
+                author = label_to_author[chain]
+                problems.append(
+                    f"{spelled} names label chain {chain}; pairs use author chain ids, and "
+                    f"label {chain} is author chain {author} ({author}:{resnum}{icode or ''})")
+            else:
+                problems.append(
+                    f"{spelled}: chain {chain} is not a selected protein chain "
+                    f"(selected: {', '.join(sorted(spans)) or 'none'})")
+    return problems
+
+
+def _unbuildable_range_ends(split_result, *, terminal_builds: bool) -> list[dict]:
+    """Requested residues at a range end that the preparation can never deliver.
+
+    Each protein piece's identity contract lists every residue its range asked
+    for, observed or not (mmCIF polymer scheme or SEQRES alignment), and the
+    identity audit at the end refuses the finished preparation when any is
+    absent. Two cases are certain to be refused, so they are refused here,
+    before the node begins: an endpoint the source cannot identify at all
+    (``unresolved_endpoints``), and an unobserved run at a component end when
+    nothing builds terminal residues (neither
+    ``build_terminal_missing_residues`` nor terminal caps; 008_membrane_6i53's
+    B:8-312 with 8-20 unobserved, campaign v2). A run facing another range of
+    the same component is not an end: joined ranges are bonded across the
+    omitted span and the run is built as the insertion between them. Returns
+    one record per offending run.
+    """
+    problems: list[dict] = []
+    for info in split_result.get("chain_file_info", []) or []:
+        pieces = list(info.get("residue_ranges")
+                      or ([info["residue_range"]] if info.get("residue_range") else []))
+        if not pieces:
+            continue
+        identity = info.get("residue_identity") or {}
+        spelled = ", ".join(str(piece.get("range") or f"{piece['start']}-{piece['end']}")
+                            for piece in pieces)
+        for endpoint in identity.get("unresolved_endpoints") or []:
+            problems.append({
+                "range": spelled, "residues": None, "count": None, "end": None,
+                "observed_span": None,
+                "reason": (f"endpoint {endpoint} is not a residue the source identifies (not "
+                           "observed, and no sequence numbering covers it), so the prepared "
+                           "chain can never be matched to the request"),
+            })
+        rows = identity.get("residues") or []
+        if not rows:
+            continue
+        bounds = [(piece["start"], piece["end"]) for piece in pieces]
+        for piece in pieces:
+            start, end = piece["start"], piece["end"]
+            letter = str(piece.get("range") or "").split(":")[0] or str(
+                info.get("author_chain") or info.get("chain_id") or "")
+            in_piece = [row for row in rows
+                        if row.get("number") is not None and start <= row["number"] <= end]
+            if not in_piece:
+                continue
+            seen = [i for i, row in enumerate(in_piece) if row.get("observed")]
+            if seen:
+                leading, trailing = in_piece[:seen[0]], in_piece[seen[-1] + 1:]
+                first, last = in_piece[seen[0]], in_piece[seen[-1]]
+                span = (f"{letter}:{first['number']}{first.get('icode') or ''}-"
+                        f"{last['number']}{last.get('icode') or ''}")
+            else:
+                leading, trailing, span = in_piece, [], None
+            for run, which in ((leading, "start"), (trailing, "end")):
+                if not run:
+                    continue
+                faces_range = any(
+                    (other_end < start) if which == "start" else (other_start > end)
+                    for other_start, other_end in bounds if (other_start, other_end) != (start, end))
+                if faces_range or terminal_builds:
+                    continue
+                reason = ("nothing builds unobserved terminal residues here "
+                          "(build_terminal_missing_residues is off and no caps are requested)")
+                problems.append({
+                    "range": str(piece.get("range") or spelled),
+                    "residues": (f"{run[0]['number']}{run[0].get('icode') or ''}-"
+                                 f"{run[-1]['number']}{run[-1].get('icode') or ''}"),
+                    "count": len(run), "end": which, "observed_span": span, "reason": reason,
+                })
+    return problems
+
+
+def _residue_range_coverage(split_result, protein_results):
+    """Audit final components against source identity, not integer intervals."""
+    import gemmi
+    from .residue_identity import chain_residues, compare_identity
+
+    resolved = ((split_result or {}).get("residue_ranges") or {}).get("resolved") or {}
+    if not resolved:
+        return {}
+    contracts = {info["file"]: info.get("residue_identity")
+                 for info in split_result.get("chain_file_info", [])}
+    coverage = {}
+    for protein in protein_results:
+        chain_id = protein.get("chain_id")
+        entry = resolved.get(chain_id)
+        output = protein.get("output_file")
+        if not entry or not output or not protein.get("success"):
+            continue
+        record = coverage.setdefault(chain_id, {
+            "range": entry["range"], "requested": 0, "delivered": 0,
+            "missing": [], "unexpected": [], "unresolved_endpoints": [],
+            "components": [],
+        })
+        contract = contracts.get(protein.get("input_file"))
+        if contract is None:
+            record["unresolved_endpoints"].append("source identity unavailable; rerun split")
+            continue
+        try:
+            actual = [r for chain in gemmi.read_pdb(output)[0]
+                      for r in chain_residues(chain)]
+        except (OSError, RuntimeError) as exc:
+            record["unresolved_endpoints"].append(f"Cannot read prepared identity: {exc}")
+            continue
+        audit = compare_identity(contract["residues"], actual)
+        record["components"].append({"input_file": protein["input_file"],
+                                     "output_file": output, **contract, **audit})
+        for key in ("requested", "delivered"):
+            record[key] += audit[key]
+        for key in ("missing", "unexpected"):
+            record[key].extend(audit[key])
+        record["unresolved_endpoints"].extend(contract["unresolved_endpoints"])
+    return coverage
+
+
+def _pieces(entry):
+    """A resolved range record's pieces, for records written before there were any.
+
+    ``resolved`` grew a ``pieces`` list when one chain became able to carry more
+    than one range.  A record without it is a single range whose bounds are its
+    own, and reading it that way keeps a cached or hand-written split result
+    working.
+    """
+    return (entry or {}).get("pieces") or [{"start": entry["start"],
+                                            "end": entry["end"],
+                                            "range": entry.get("range")}]
+
+
+def _window_for_chain(split_result, chain_id):
+    """The (start, end) windows this chain was cropped to, or None.
+
+    One window per range: a fusion construct is cropped to 18-214 and 383-458,
+    and the missing-residue repair must not read that as 18-458 and build the
+    crystallisation partner back in.
+
+    Read from the split's own resolution rather than resolved again here.  The
+    two would drift: a homodimer whose copies are labels C and E under one
+    author chain C is cropped on the label, so only C is cropped, while a
+    second resolution on the author name would also bound E -- and E still
+    holds the residues the bound would have removed.
+
+    Insertion codes are dropped: a rebuilt residue has none, so the numeric
+    bound is the whole of what a window can say about it.
+    """
+    resolved = ((split_result or {}).get("residue_ranges") or {}).get("resolved") or {}
+    entry = resolved.get(chain_id)
+    if not entry:
+        return None
+    return [(piece["start"], piece["end"]) for piece in _pieces(entry)]
+
+
+def _window_for_component(split_result, chain_info):
+    """Return the build window for one split file/component."""
+    pieces = (chain_info or {}).get("residue_ranges") or []
+    if pieces:
+        return [(piece["start"], piece["end"]) for piece in pieces]
+    piece = (chain_info or {}).get("residue_range")
+    if piece:
+        return [(piece["start"], piece["end"])]
+    return _window_for_chain(split_result, (chain_info or {}).get("chain_id"))
+
+
+def _states_for_chain(states, author_chain, chain_id, window=None):
+    """The protonation records that belong to one split protein file.
+
+    Cleaning runs per chain, on a file containing only that chain, and
+    ``_apply_protonation_states_with_modeller`` fails the whole node when a
+    record names a residue the file does not hold.  Passing the whole list to
+    every chain therefore turns any multi-chain assignment into a failure -- and
+    metal-site assignment produces one whenever a homo-oligomer has a site in
+    each copy.  Records whose chain does not match are dropped rather than
+    failed: they could never have applied to this file.
+    """
+    if not states:
+        return states
+    wanted = {str(value).strip() for value in (author_chain, chain_id) if value}
+    # The split writes PDB, whose chain column is one character wide, so a
+    # multi-letter author chain (7QVK's "BBB") reaches the file as "B". A record
+    # written in author space would then match nothing and fail the whole chain
+    # on "target not found", so the truncation is accepted here too.
+    wanted |= {name[:1] for name in wanted if name}
+    matching = [state for state in states
+                if str(state.get("chain", "")).strip() in wanted
+                or str(state.get("chain", "")).strip()[:1] in wanted]
+    # Separate ranges may retain the same chain name. Route by the declared
+    # build window, not observed atoms: missing residues can still be rebuilt.
+    if window is not None:
+        matching = [state for state in matching if any(
+            start <= int(state["resnum"]) <= end for start, end in window)]
+    return matching or None
+
+def _node_relative_artifact(path, artifacts_dir, fallback_rel: str) -> str:
+    """``artifacts/<...>`` for a file under the node's artifacts directory.
+
+    Files written outside the node (never expected in node mode) are copied to
+    the fallback location so the registered artifact always exists.
+    """
+    import shutil
+
+    artifacts_dir = Path(artifacts_dir).resolve()
+    node_dir = artifacts_dir.parent
+    candidate = Path(path).resolve()
+    try:
+        rel = candidate.relative_to(node_dir)
+        return str(rel)
+    except ValueError:
+        target = artifacts_dir / fallback_rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(candidate, target)
+        return str(target.relative_to(node_dir))
+
+
+
+def _range_delivery_warnings(split_result: dict) -> list[str]:
+    """Say when a chain did not come out as its range asked: an endpoint
+    beyond the deposited residues, or residues missing inside the range."""
+    warnings: list[str] = []
+    resolved = ((split_result.get("residue_ranges") or {}).get("resolved") or {})
+    for entry in split_result.get("delivered_chain_ranges") or []:
+        requested = entry.get("requested") or []
+        if not requested:
+            continue
+        label = f"chain {entry.get('author_chain')} ({entry.get('chain_id')})"
+        pieces = (resolved.get(entry.get("chain_id")) or {}).get("pieces") or []
+        unobserved = [
+            piece["range"] for piece in pieces
+            if piece.get("range") in requested
+            and (piece.get("start_observed") is False or piece.get("end_observed") is False)
+        ]
+        if unobserved:
+            warnings.append(
+                f"Residue range {', '.join(unobserved)} on {label} reaches beyond the deposited "
+                f"residues: kept {entry.get('span')} ({entry.get('count')} residues)."
+            )
+        if entry.get("gaps"):
+            warnings.append(
+                f"Residue range {', '.join(requested)} on {label} spans residues absent from the "
+                f"deposited structure ({', '.join(entry['gaps'])}; {entry.get('missing_count')} "
+                f"missing); kept {entry.get('span')}, {entry.get('count')} residues."
+            )
+    return warnings
+
+
+@node_tool(node_type="prep")
+@tool_parameter_examples(
+    ligand_smiles=[{"LIG": "CCO"}],
+    disulfide_pairs=[[
+        {
+            "cys1": {"chain": "A", "resnum": 6},
+            "cys2": {"chain": "A", "resnum": 127},
+        }
+    ]],
+    histidine_states=[{"A:57": "HID"}],
+    protonation_states=[
+        {"A:11": "GLH"},
+        [{"chain": "A", "resnum": 11, "state": "GLH"}],
+    ],
+)
+def prepare_complex(
+    structure_file: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    select_chains: Optional[List[str]] = None,
+    ph: float = 7.4,
+    cap_termini: bool = False,
+    n_terminal_cap: str | None = None,
+    c_terminal_cap: str | None = None,
+    terminal_cap_forcefield: str | None = None,
+    process_proteins: bool = True,
+    process_ligands: bool = True,
+    ligand_smiles: Optional[Dict[str, str]] = None,
+    ligand_ph: Optional[float] = None,
+    protonate_ligands: bool = True,
+    include_types: Optional[List[str]] = None,
+    include_ligand_ids: Optional[List[str]] = None,
+    include_ligand_resnames: Optional[List[str]] = None,
+    exclude_ligand_ids: Optional[List[str]] = None,
+    include_associated_ligands: bool = False,
+    optimize_ligands: bool = False,
+    structure_analysis: Optional[dict] = None,
+    disulfide_pairs: Optional[List[Dict[str, Any]]] = None,
+    histidine_states: Optional[Dict[str, str]] = None,
+    protonation_states: Optional[Dict[str, Any]] = None,
+    protonation_method: str = "propka",
+    preserve_input_protonation: bool = False,
+    strip_input_caps: bool = False,
+    solvent_type: Optional[str] = "explicit",
+    source_structure_id: Optional[str] = None,
+    source_candidate_id: Optional[str] = None,
+    source_model_index: Optional[int] = None,
+    source_model_id: Optional[str] = None,
+    missing_residue_method: str = "auto",
+    repair_nonpolymer_context: bool = True,
+    build_terminal_missing_residues: bool = False,
+    residue_ranges: Optional[List[str]] = None,
+    join_range_pieces: bool = False,
+    join_range_groups: Optional[List[str]] = None,
+    job_dir: Optional[str] = None,
+    node_id: Optional[str] = None,
+    ligand_components: Optional[List[Dict[str, str]]] = None,
+    ligand_net_charges: Optional[Dict[str, int]] = None,
+) -> dict:
+    """Prepare a protein-ligand complex for MD simulation (complete workflow).
+
+    This tool combines multiple steps into a single workflow:
+    1. Inspect the structure to identify chains
+    2. Split the structure into individual chain files
+    3. Clean protein chains (PDBFixer + pdb4amber)
+    4. Rebuild hydrogens on standard DNA/RNA chains with OpenMM Modeller
+    5. Clean ligand chains (SMILES template matching)
+    6. Record ligand chemistry artifacts for topology-time ligand FF resolution
+    7. Merge all prepared structures into a single PDB file
+
+    This is the recommended one-step workflow for preparing structures from
+    PDB or Boltz-2 predictions for MD simulation. In CLI workflows, the DAG
+    records ``merged_pdb`` and resolves it for the next node automatically.
+
+    Args:
+        structure_file: Path to mmCIF (.cif) or PDB (.pdb/.ent) file
+        output_dir: Output directory (auto-generated if None)
+        select_chains: List of chain IDs to process. **Pass the short
+                       chain ID exactly as it appears in your input file:**
+                       ``chain_id`` (label_asym_id) for mmCIF,
+                       ``author_chain`` (auth_asym_id) for PDB. One unified
+                       matching rule handles both formats — see
+                       ``split_molecules`` for the full chain-ID contract.
+                       Gotcha: for mmCIF, ``author_chain`` can be
+                       multi-letter (e.g. 7QVK ``AAA BBB AbA``) and
+                       occasionally reordered (7NMU ``label C ↔ auth
+                       DDD``) — stick to ``chain_id`` there. For PDB,
+                       gemmi's internal ``chain_id`` is an auto-generated
+                       subchain label like ``Axp`` / ``Ax1`` / ``Axw`` and
+                       is not user-facing. None = all chains.
+        repair_nonpolymer_context: Keep the selected ligands and ions in the MODELLER
+            template as rigid BLK residues while missing loops are rebuilt, so no loop is
+            built through them; the model is measured against them either way and a
+            loop inside 2.2 A of a ligand atom stops with modeller_loop_nonpolymer_clash.
+        missing_residue_method: How requested missing residues are rebuilt.
+            ``"auto"`` (default) uses PDBFixer for short gaps and MODELLER for
+            out-of-scope gaps when licensed; ``"pdbfixer"`` never escalates;
+            ``"modeller"`` always uses MODELLER loop modeling; ``"none"``
+            records internal gaps but leaves every missing residue unbuilt.
+            Terminal segments are considered only when
+            ``build_terminal_missing_residues`` is true; PDBFixer is limited
+            to 5 residues per terminal segment and MODELLER to 10.
+            MODELLER is licensed — export a ``KEY_MODELLER*`` variable.
+        residue_ranges: Which residues of a chain to build from, as
+            ``CHAIN:START-END`` strings using author residue numbers -- for
+            example ``["A:4-315"]``, or several separated by commas. A chain
+            with no range is taken whole, and ions, ligands and water are
+            unaffected: a range describes a polymer construct, while the rest
+            are selected by their own identifiers. The range is a request, so a
+            range naming a chain that is not there, or selecting no residue,
+            is an error carrying the chain's real span rather than a quietly
+            smaller system. Combined with
+            ``build_terminal_missing_residues`` it also bounds what may be
+            built: ``A:4-315`` on a chain whose SEQRES runs to 317 adds residue
+            315 and stops.
+        join_range_pieces: Bond the selected ranges of one chain into a single
+            chain across the omitted span. Only for a request that says "join
+            the pieces" / "single continuous chain". "Chain A residues 16-214
+            and 380-458" or "without the fusion" means separate components
+            (the default), which the reference keeps as separate molecules.
+        join_range_groups: Comma-separated groups of selected ranges to bond
+            into one component, for example
+            ``["A:29-173,A:183-227"]``. Ranges not named in a group remain
+            separate. Mutually exclusive with ``join_range_pieces``.
+        build_terminal_missing_residues: Also rebuild residues missing from a
+            chain's termini (default: False). An unresolved terminus is
+            disorder rather than a gap to bridge, and a simulation normally
+            starts from what the deposit resolved, so this stays off unless
+            asked for. Turn it on when the target range is known to run past
+            the resolved one -- a reference simulation covering residues
+            4-315 of a chain the deposit resolves to 314, say. Note what the
+            default protects against: an unresolved terminus can be one
+            residue or seventy-seven, and the count is reported either way,
+            under ``missing_residue_detection.terminal_excluded`` when they
+            are left alone and ``.terminal_built`` when they are made.
+        ph: pH for propka (default: 7.4); ignored by no-prediction.
+        cap_termini: Backward-compatible shortcut to add ACE at the
+                     N terminus and NME at the C terminus (default: False).
+                     Only when the request asks for capped termini: each cap
+                     is an extra residue, and a reference with charged
+                     termini counts it against the residue count.
+        n_terminal_cap: Optional one-sided N-terminal cap. Currently supports
+                        ``"ACE"`` or an explicit none-like value. Only when
+                        the request asks for it (an extra ACE residue).
+        c_terminal_cap: Optional one-sided C-terminal cap. Currently supports
+                        ``"NME"`` or an explicit none-like value. Only when
+                        the request asks for it (an extra NME residue).
+        terminal_cap_forcefield: Protein force field used only for prep-stage
+                                 cap hydrogen completion. Use the planned
+                                 topology force field when specified; default
+                                 is ff19SB.
+        process_proteins: Whether to clean protein chains (default: True)
+        process_ligands: Whether to clean ligands and record topology-time
+                         chemistry inputs (default: True)
+        ligand_smiles: Dict mapping ligand_id to charged SMILES
+                       (e.g., {"ACE": "CC(=O)[O-]"}). If not provided,
+                       SMILES will be fetched from PDB CCD and used as-is.
+                       A SMILES that already carries an explicit formal charge
+                       is authoritative and bypasses Dimorphite-DL protonation.
+        ligand_components: Explicit peptide-to-ligand declarations, each with
+            selection (CHAIN:START-END), residue_name and isomeric smiles.
+            Select the complete source subchain and include the protein input
+            type. The component is routed to clean_ligand, not clean_protein;
+            source heavy atoms/coordinates and chemical identity are verified.
+            This cannot cut external covalent links or implicitly cap fragments.
+        ligand_ph: pH used for Dimorphite-DL ligand protonation of neutral
+                   SMILES. Defaults to the protein ``ph`` when None.
+        ligand_net_charges: Expected formal net charge per ligand, keyed by
+                   residue name or instance id (e.g. ``{"9V2": 0}`` or
+                   ``{"A:AMH:80": 0}``). Picks the Dimorphite-DL state of that
+                   charge and is checked against the final graph. When
+                   Dimorphite-DL offers states of different net charge and no
+                   charge is stated, the run is refused
+                   (``ligand_protonation_ambiguous``) with the node pending.
+                   A key that names no selected ligand is refused
+                   (``invalid_ligand_net_charges``).
+        protonate_ligands: When True (default), neutral CCD/dictionary ligand
+                           SMILES are protonated to a pH-appropriate state via
+                           Dimorphite-DL. Set False to keep SMILES as-is.
+        include_types: List of molecular types to include: "protein", "nucleic", "glycan", "ligand", "ion".
+                       Default (None) includes all five. Crystal waters are not supported:
+                       "water" is refused (``crystal_waters_unsupported``) and water residues
+                       are always removed; explicit solvent comes from solvate_structure.
+        solvent_type: Prep-stage solvent intent. Defaults to ``"explicit"``.
+                      Pass ``"implicit"`` when building an implicit-solvent
+                      topology downstream so explicit ion components are
+                      excluded before merge and recorded in component_disposition.
+        source_structure_id: Candidate ID from the source bundle to prepare,
+                             e.g. ``candidate_002``. Used only in node mode
+                             when the source bundle contains multiple candidates.
+        source_candidate_id: Alias for ``source_structure_id``.
+        source_model_index: Model index/rank selector for NMR-style inputs.
+                            Accepts the user-facing one-based model rank.
+        source_model_id: Model identifier selector when present in the source
+                         bundle provenance.
+        include_ligand_ids: List of ligand unique IDs to include (format:
+                           "author_chain:resname:resnum", e.g.,
+                           ["A:ACP:501"]). If specified, only these ligands
+                           are processed. Requested ligand label chains are
+                           auto-included when select_chains would otherwise
+                           omit them.
+        include_ligand_resnames: List of ligand residue names to include in
+                         the selected polymer scope, e.g. ["NDP"]. Matching
+                         associated ligand label chains are auto-included even
+                         when their label chain IDs differ from the selected
+                         protein/nucleic/glycan chain IDs.
+        exclude_ligand_ids: List of ligand unique IDs to exclude (format: "chain:resname:resnum",
+                           e.g., ["A:ACT:401", "A:ACT:402"]). These ligands are skipped.
+        include_associated_ligands: Auto-include ligand label chains associated
+                         with selected protein/nucleic/glycan author chains.
+                         If False, such candidates require explicit selection
+                         instead of being silently dropped.
+        optimize_ligands: Run MMFF94 optimization on ligands (default: False).
+                          Bound-ligand heavy-atom coordinates are preserved unless
+                          this is explicitly enabled.
+        structure_analysis: Pre-computed structure analysis from Phase 1. Contains
+                           user-approved settings for disulfide bonds, histidine states,
+                           missing residue handling, and ligand processing. If provided,
+                           these settings are used instead of auto-detection.
+        disulfide_pairs: Explicit disulfide bond list — complete replacement of
+                        auto-detection. Each pair is ``{"cys1": {"chain", "resnum"},
+                        "cys2": {"chain", "resnum"}}``. Pass ``[]`` to disable
+                        disulfides entirely. Wins over ``structure_analysis``
+                        when both are provided.
+        histidine_states: Explicit histidine protonation state overrides. Dict
+                         mapping ``"<chain>:<resnum>"`` to ``"HID"`` / ``"HIE"``
+                         / ``"HIP"``. Only the keys present are overridden; the
+                         rest keep their propka-derived state. Wins over
+                         ``structure_analysis`` when both are provided.
+        protonation_method: propka (default) predicts each titratable side
+                         chain's state from its environment at ``ph``;
+                         no-prediction skips the prediction and keeps the force
+                         field's fixed states (Asp-/Glu-/Lys+/Arg+, His and Cys
+                         neutral; the His tautomer is still chosen from hydrogen
+                         bonding). A request for 'standard states' means
+                         no-prediction, not --ph 7.0; naming every residue
+                         propka moved through ``protonation_states`` is the
+                         slow way to the same place. ``"standard"`` is a
+                         deprecated alias of no-prediction. Explicit
+                         ``protonation_states`` still win over either mode.
+        preserve_input_protonation: Preserve explicit input ASH/GLH/LYN and
+                         histidine variants as overrides on the selected
+                         baseline. False makes ``standard`` genuinely
+                         all-standard. Structural CYX and metal-site CYM are
+                         derived independently and survive either setting.
+        strip_input_caps: Remove ACE/NME terminal caps the deposit arrived
+                         with. They are kept by default and counted as protein
+                         residues, which is right when the deposit means them;
+                         set this when the target system is uncapped. The cap
+                         set found on the input is reported either way.
+        protonation_states: Explicit residue protonation state overrides. Accepts
+                         either ``{"A:57": "HIP", "A:25": "ASH"}`` or a list of
+                         ``{"chain": "A", "resnum": 57, "state": "HIP"}``
+                         records. Supports ASP/ASH, GLU/GLH, HID/HIE/HIP,
+                         LYS/LYN, and CYS/CYX/CYM. Wins over
+                         ``structure_analysis`` when provided.
+
+    Returns:
+        Dict with:
+            - success: bool - True if workflow completed successfully
+            - job_id: str - Unique identifier for this operation
+            - output_dir: str - Directory containing all output files
+            - source_file: str - Original input file path
+            - inspection: dict - Results from inspect_molecules
+            - split: dict - Results from split_molecules
+            - proteins: list[dict] - Results for each protein chain:
+                - chain_id: str
+                - input_file: str
+                - output_file: str (cleaned .amber.pdb)
+                - success: bool
+                - statistics: dict
+            - nucleics: list[dict] - Standard DNA/RNA chains prepared for topology:
+                - chain_id: str
+                - input_file: str
+                - output_file: str (hydrogen-complete nucleic PDB)
+                - nucleic_subtype: str
+                - hydrogens_added: int
+                - nucleic_forcefield_xml: str
+                - success: bool
+            - glycans: list[dict] - Glycan chains passed through for GLYCAM:
+                - chain_id: str
+                - input_file: str
+                - output_file: str
+                - residue_names: list[str]
+                - success: bool
+            - ligands: list[dict] - Results for each ligand chain:
+                - chain_id: str
+                - ligand_id: str (residue name)
+                - input_file: str
+                - sdf_file: str (cleaned SDF)
+                - pdb_file: str (cleaned ligand PDB)
+                - net_charge: int (formal charge from charged molecule graph)
+                - success: bool
+            - merged_pdb: str - Path to merged PDB file (protein + ligands combined)
+            - merge_result: dict - Results from merge_structures
+            - errors: list[str] - Error messages (empty if success=True)
+            - warnings: list[str] - Non-critical issues encountered
+    
+    Example:
+        >>> result = prepare_complex(
+        ...     "boltz_prediction.cif",
+        ...     ph=7.4,
+        ...     cap_termini=False,
+        ...     ligand_smiles={"SAH": "Nc1ncnc2c1ncn2[C@@H]1O[C@H]..."}
+        ... )
+        >>> print(f"Proteins: {len(result['proteins'])}")
+        >>> print(f"Ligands: {len(result['ligands'])}")
+        >>> for lig in result['ligands']:
+        ...     print(f"  {lig['ligand_id']}: {lig['sdf_file']}")
+    """
+    # Capture before introducing locals: future CLI arguments automatically
+    # participate in declared-condition checks too.
+    _runtime_conditions = locals().copy()
+    if disulfide_pairs is not None:
+        # An argument error, refused before any node is touched, so the same
+        # pending node can be run again with a corrected list.
+        from mdclaw.structure.disulfide import validate_declared_disulfide_pairs
+
+        pair_problems = validate_declared_disulfide_pairs(disulfide_pairs)
+        if pair_problems:
+            return create_validation_error(
+                "disulfide_pairs",
+                "; ".join(pair_problems[:5]) + (" ..." if len(pair_problems) > 5 else ""),
+                expected=('a JSON list of {"cys1": {"chain": "A", "resnum": 6}, '
+                          '"cys2": {"chain": "A", "resnum": 127}} objects '
+                          "(icode and form_bond optional)"),
+                actual=repr(disulfide_pairs)[:200],
+                hints=["An empty list means no disulfides at all; omit the option to auto-detect."],
+                code="invalid_disulfide_pairs",
+            )
+    if ligand_net_charges is not None:
+        bad = (["expected a JSON object"] if not isinstance(ligand_net_charges, dict) else [
+            f"{key!r}: {value!r}" for key, value in ligand_net_charges.items()
+            if not isinstance(key, str) or isinstance(value, bool) or not (
+                isinstance(value, int)
+                or (isinstance(value, str) and value.strip().lstrip("+-").isdigit()))
+        ])
+        if bad:
+            return create_validation_error(
+                "ligand_net_charges",
+                "entries must map a residue name or ligand id to an integer: " + ", ".join(bad),
+                expected='a JSON object such as {"9V2": 0} or {"A:AMH:80": 0}',
+                actual=repr(ligand_net_charges)[:200],
+                code="invalid_ligand_net_charges",
+            )
+        ligand_net_charges = {str(key).strip(): int(value) for key, value in ligand_net_charges.items()}
+    from mdclaw.source_bundle import source_selection_from_values
+
+    _source_selection = source_selection_from_values(
+        source_structure_id=source_structure_id,
+        source_candidate_id=source_candidate_id,
+        source_model_index=source_model_index,
+        source_model_id=source_model_id,
+    )
+    _resolved_structure = _resolve_prepare_node_structure_file(
+        job_dir, node_id, structure_file, _source_selection
+    )
+    structure_file = _resolved_structure["structure_file"]
+
+    logger.info(f"Preparing complex: {structure_file}")
+
+    # Initialize result structure
+    job_id = generate_job_id()
+    result = _prepare_complex_initial_result(job_id, structure_file)
+    protonation_method, deprecated_method_warning = normalize_protonation_method(
+        protonation_method)
+    if deprecated_method_warning:
+        result["warnings"].append(deprecated_method_warning)
+    result["source_bundle_file"] = _resolved_structure.get("source_bundle_file")
+    result["source_selection_file"] = _resolved_structure.get("source_selection_file")
+    result["source_selection"] = _resolved_structure.get("source_selection")
+    result["source_structure_id"] = _resolved_structure.get("source_structure_id")
+    solvent_type = _normalize_prepare_solvent_type(solvent_type)
+    missing_residue_method = str(
+        missing_residue_method or "auto"
+    ).strip().lower()
+    result["solvent_type"] = solvent_type
+    if solvent_type is not None and solvent_type not in SUPPORTED_PREP_SOLVENT_TYPES:
+        blocked = {
+            **result,
+            **create_validation_error(
+                "solvent_type",
+                f"Unknown prep solvent_type: {solvent_type}",
+                expected=f"One of: {sorted(SUPPORTED_PREP_SOLVENT_TYPES)}",
+                actual=solvent_type,
+                code="invalid_prep_solvent_type",
+            ),
+        }
+        if job_dir and node_id:
+            from mdclaw._node import fail_node_from_result
+            return fail_node_from_result(
+                job_dir,
+                node_id,
+                blocked,
+                default_error="prepare_complex invalid prep solvent_type",
+            )
+        return blocked
+
+    if _resolved_structure.get("input_resolution_error"):
+        blocked = {
+            **result,
+            **create_validation_error(
+                "job_dir/node_id",
+                _resolved_structure["input_resolution_error"],
+                expected="Completed source ancestor with structure_file artifact",
+                actual=f"job_dir={job_dir}, node_id={node_id}",
+                context_extra={
+                    "input_resolution_errors": _resolved_structure.get("input_resolution_errors", []),
+                },
+                code="input_resolution_blocked",
+            ),
+        }
+        if job_dir and node_id:
+            from mdclaw._node import fail_node_from_result
+            return fail_node_from_result(
+                job_dir,
+                node_id,
+                blocked,
+                default_error="prepare_complex input resolution blocked",
+            )
+        return blocked
+
+    if job_dir and node_id:
+        _runtime_conditions.update(
+            solvent_type=solvent_type, missing_residue_method=missing_residue_method,
+            source_structure_id=_resolved_structure.get("source_structure_id"),
+        )
+        _ctx = _validate_prepare_node_context(**_runtime_conditions)
+        if not _ctx["success"]:
+            blocked = {"success": False, "error_type": "ValidationError", **_ctx}
+            from mdclaw._node import fail_node_from_result
+            return fail_node_from_result(
+                job_dir,
+                node_id,
+                blocked,
+                default_error="prepare_complex node execution context invalid",
+            )
+
+    if not structure_file:
+        blocked = {
+            **result,
+            **create_validation_error(
+                "structure_file",
+                "structure_file is required",
+                expected="Explicit structure path, or --job-dir/--node-id with a source ancestor",
+                actual=structure_file,
+                hints=["Run fetch_structure first or execute in node mode from a prep node."],
+                code="missing_structure_file",
+            ),
+        }
+        if job_dir and node_id:
+            from mdclaw._node import fail_node_from_result
+            return fail_node_from_result(
+                job_dir,
+                node_id,
+                blocked,
+                default_error="prepare_complex missing structure_file",
+            )
+        return blocked
+
+    # Validate input file
+    structure_path = Path(structure_file)
+    if not structure_path.exists():
+        result["errors"].append(f"Structure file not found: {structure_file}")
+        logger.error(f"Structure file not found: {structure_file}")
+        if job_dir and node_id:
+            from mdclaw._node import fail_node_from_result
+            return fail_node_from_result(
+                job_dir,
+                node_id,
+                result,
+                default_error="prepare_complex structure file not found",
+            )
+        return result
+
+    # Setup output directory.
+    _node_mode = job_dir and node_id
+    if _node_mode:
+        base_dir = (Path(job_dir) / "nodes" / node_id / "artifacts").resolve()
+        base_dir.mkdir(parents=True, exist_ok=True)
+    elif output_dir:
+        base_dir = Path(output_dir)
+    else:
+        base_dir = WORKING_DIR / f"job_{job_id}"
+    ensure_directory(base_dir)
+    out_dir = base_dir
+    result["output_dir"] = str(base_dir)
+
+    def _refused(refusal: dict) -> dict:
+        """A refusal raised before anything was prepared.
+
+        Inspection, the disulfide/cap/range argument checks and the split only
+        read the source and describe the selection; the node is begun once
+        the split has delivered it. Until then a refusal (a ``--select-chains``
+        naming an absent chain, ``associated_ligands_require_selection``, a
+        range that selects nothing, a malformed ligand declaration) leaves
+        the node pending and the same node is run again with corrected
+        arguments (``fail_node_from_result``). Campaign v2 sealed 39 prep
+        nodes on ``associated_ligands_require_selection`` alone, each followed
+        by a fresh node with the ligand added.
+        """
+        refusal["overall_status"] = "failed"
+        if _node_mode:
+            from mdclaw._node import fail_node_from_result
+
+            return fail_node_from_result(job_dir, node_id, refusal)
+        return refusal
+
+    from mdclaw.node.lifecycle import NodeSealedError
+
+    try:
+        # Step 1: Inspect structure
+        logger.info("Step 1: Inspecting structure...")
+        inspection = _inspect_molecules_impl(str(structure_file))
+
+        # PTM detection (SEP / TPO / PTR). Recorded *before* cleaning, since
+        # PDBFixer's replaceNonstandardResidues will swap them for SER/THR/TYR
+        # in the output merged.pdb. The list lets a follow-up
+        # `phosphorylate_residues --restore-from-detection` re-introduce them
+        # on a branched prep node, and lets `build_amber_system` decide
+        # whether to add the matching ``amber/phosaa*.xml`` to the
+        # ``openmmforcefields.SystemGenerator`` bundle.
+        from mdclaw.research.inspection import detect_ptm_sites
+        detected_ptm_residues = detect_ptm_sites(str(structure_file))
+
+        # Token optimization: Store only essential inspection info (not full chains/entities)
+        result["inspection"] = {
+            "success": inspection["success"],
+            "summary": inspection.get("summary", {}),
+            "header": inspection.get("header", {}),
+            "errors": inspection.get("errors", []),
+            "warnings": inspection.get("warnings", [])
+        }
+
+        if not inspection["success"]:
+            result["errors"].append(f"Inspection failed: {inspection['errors']}")
+            return _refused(result)
+
+        summary = inspection["summary"]
+        logger.info(f"Found: {summary['num_protein_chains']} proteins, "
+                   f"{summary.get('num_nucleic_chains', 0)} nucleics, "
+                   f"{summary.get('num_glycan_chains', 0)} glycans, "
+                   f"{summary['num_ligand_chains']} ligands, "
+                   f"{summary['num_ion_chains']} ions")
+
+        # The chain request, resolved once by the rule split_molecules applies
+        # (label first, author ids when the ranges say so, a water-only label
+        # read as the author chain), and in author space: SSBOND /
+        # _struct_conn records, metal sites and gemmi's ``chain.name`` carry
+        # author ids. Mapping each requested name through chain_id_map instead
+        # read 2DD8's "H" as label H -- the water of author S -- and filtered
+        # out every disulfide of the heavy chain (13 attempts of campaign v5
+        # across 2DD8, 1DFJ and 3RVW). Ranges without select_chains select the
+        # chains they name, here and in the split alike.
+        from mdclaw.structure.split import (
+            default_select_chains_from_ranges,
+            exclusion_targets,
+            resolve_chain_selection,
+            unmatched_exclusion_refusal,
+        )
+        select_chains, range_default = default_select_chains_from_ranges(
+            select_chains, residue_ranges, inspection)
+        if range_default is not None:
+            result.setdefault("selection_adjustments", []).append(range_default)
+            result["warnings"].append(f"{range_default['code']}: {range_default['message']}")
+        include_ligand_ids = _split_listed_ids(include_ligand_ids)
+        exclude_ligand_ids = _split_listed_ids(exclude_ligand_ids)
+        if exclude_ligand_ids:
+            exclusion_refusal = unmatched_exclusion_refusal(inspection, exclude_ligand_ids)
+            if exclusion_refusal is not None:
+                for key in ("code", "message", "errors", "hints", "context", "next_action"):
+                    if key in exclusion_refusal:
+                        result[key] = exclusion_refusal[key]
+                return _refused(result)
+        excluded_labels = set()
+        if exclude_ligand_ids:
+            targets = exclusion_targets(inspection)
+            excluded_labels = {label for entry in exclude_ligand_ids for label in targets[entry]}
+        chain_selection = resolve_chain_selection(
+            structure_file, select_chains, include_types=include_types,
+            residue_ranges=residue_ranges, analysis=inspection)
+        ss_select_chains: Optional[List[str]] = chain_selection["author_chains"]
+
+        detected_glycan_linkages = _parse_glycan_link_records(Path(structure_file))
+        (
+            _glycan_select_chains,
+            selected_glycan_linkages,
+            glycan_selection_adjustment,
+        ) = _expand_covalently_linked_glycan_selection(
+            select_chains=select_chains,
+            include_types=include_types,
+            inspection=inspection,
+            linkages=detected_glycan_linkages,
+            selected_labels=chain_selection["label_ids"],
+            excluded_labels=excluded_labels,
+        )
+        # Added to the split as resolved labels, not appended to the request:
+        # a glycan label among author-read names would change how they read.
+        glycan_extra_labels = list(
+            (glycan_selection_adjustment or {}).get("added_chain_ids") or [])
+
+        # Step 1.5: Aggregate disulfide bonds. When the caller supplies
+        # ``disulfide_pairs`` explicitly, it is a **complete replacement** of
+        # auto-detection — empty list means "no disulfides at all". Otherwise
+        # we merge explicit PDB SSBOND / mmCIF _struct_conn entries with
+        # distance-based candidates so downstream tools have a single
+        # chain-filtered source of truth. Detection runs on the ORIGINAL
+        # structure file (before splitting) so inter-chain pairs survive.
+        if disulfide_pairs is not None:
+            # A copy of the records, not of the list: the merged-frame remap
+            # below rewrites chains in place and adds keys, and on the
+            # caller's own dicts that rewrote the receipt's "requested" pairs
+            # (028_complex_1dfj: the agent passed E:26-E:84, the receipt
+            # showed A:26-A:84 with original_chain E).
+            import copy
+
+            disulfide_bonds = copy.deepcopy(list(disulfide_pairs))
+            for b in disulfide_bonds:
+                b.setdefault("source", "user_override")
+            logger.info(
+                f"Disulfide pairs overridden by caller: {len(disulfide_bonds)} pair(s)"
+            )
+            disulfide_source = "user_override"
+            # The deposit's own SG-SG distance for every declared pair, read
+            # before anything is rebuilt: a pair that later comes back short is
+            # then attributable to the input rather than to the repair.
+            from mdclaw.structure.disulfide import measure_disulfide_pairs
+
+            input_geometry = measure_disulfide_pairs(structure_path, disulfide_bonds)
+            result["declared_disulfide_input_geometry"] = input_geometry
+            for entry, bond in zip(input_geometry, disulfide_bonds):
+                if entry.get("geometry") is not None:
+                    bond.setdefault("geometry", entry["geometry"])
+                    bond.setdefault("distance_angstrom", entry["sg_sg_angstrom"])
+            # Both sulfurs observed and beyond bonding distance: preparation
+            # keeps observed atoms where the deposit put them (loop repair
+            # included), so the merged check is certain to refuse the pair --
+            # after the whole preparation, as "came back at 3.48 A", although
+            # nothing was rebuilt (035_nanobody_6gwn, campaign v2: B22-B96 is
+            # 3.49 A apart in the deposit). Decided here, with the node pending.
+            from mdclaw.structure.disulfide import (
+                DISULFIDE_BOND_MAX_ANGSTROM as _ss_max,
+                DISULFIDE_BOND_MIN_ANGSTROM as _ss_min,
+            )
+            # A declared list is a complete replacement, and a bonded disulfide
+            # it leaves out is refused rather than dropped: omission is not a
+            # decision (096_soluble_1ay7 v2 passed '[]' and lost C7-C96). A
+            # pair is kept reduced only when it is named with form_bond false.
+            suppressed = _detected_disulfides_not_declared(
+                structure_path, disulfide_bonds, ss_select_chains,
+                range_windows=chain_selection["range_windows_by_author"])
+            if suppressed:
+                spelled = ", ".join(_spell_pair(b) + f" ({b.get('distance_angstrom')} A)"
+                                    for b in suppressed)
+                result["errors"].append(
+                    f"The declared --disulfide-pairs list leaves out {len(suppressed)} "
+                    f"disulfide(s) the deposit shows bonded: {spelled}. Omitting a bonded "
+                    "pair does not reduce it; name it with form_bond false to keep it reduced.")
+                result["code"] = "detected_disulfides_suppressed"
+                result["context"] = {"suppressed_disulfides": [_spell_pair(b) for b in suppressed]}
+                result["next_action"] = _suppressed_disulfides_next_action(
+                    disulfide_pairs, suppressed)
+                return _refused(result)
+            unbonded = [entry for entry, bond in zip(input_geometry, disulfide_bonds)
+                        if entry.get("geometry") == "not_formed"
+                        and bond.get("form_bond", True) is not False]
+            if unbonded:
+                for entry in unbonded:
+                    result["errors"].append(
+                        f"Declared disulfide {entry['chain1']}:{entry['resnum1']}"
+                        f"{entry.get('icode1') or ''}-{entry['chain2']}:{entry['resnum2']}"
+                        f"{entry.get('icode2') or ''}: the deposit places the two sulfurs "
+                        f"{entry['sg_sg_angstrom']:.2f} A apart (a bond is {_ss_min}-{_ss_max} A), "
+                        "and preparation keeps observed atoms where the deposit put them, so "
+                        "this bond cannot be formed from this structure")
+                result["code"] = "declared_disulfide_unbonded_in_source"
+                result["hints"] = [
+                    'Drop the pair (or give it "form_bond": false) and let detection decide; '
+                    "it forms only the pairs the deposit's geometry supports.",
+                ]
+                return _refused(result)
+        else:
+            from mdclaw.structure.disulfide import (
+                _detect_disulfide_candidates,
+                _parse_ssbond_records,
+            )
+            ssbond_pairs = _parse_ssbond_records(structure_path)
+            distance_pairs = _detect_disulfide_candidates(structure_path)
+            disulfide_bonds = _merge_disulfide_pairs(
+                ssbond_pairs, distance_pairs, select_chains=ss_select_chains
+            )
+            if disulfide_bonds:
+                logger.info(
+                    f"Disulfide pairs detected: {len(disulfide_bonds)} "
+                    f"(ssbond={len(ssbond_pairs)}, distance={len(distance_pairs)})"
+                )
+            disulfide_source = "auto_detected"
+        # Overlapping sulfurs are reported the same way whichever route named
+        # the pair: the auto-detected 1.30 A pair and the declared one are the
+        # same atoms, and until now only the declared one was ever remarked on.
+        for bond in disulfide_bonds:
+            if bond.get("geometry") == "overlap":
+                cys1, cys2 = bond.get("cys1") or {}, bond.get("cys2") or {}
+                result.setdefault("warning_records", []).append({
+                    "code": "disulfide_sg_overlap",
+                    "pair": f"{cys1.get('chain', '')}{cys1.get('resnum')}-"
+                            f"{cys2.get('chain', '')}{cys2.get('resnum')}",
+                    "sg_sg_angstrom": bond.get("distance_angstrom"),
+                    "source": bond.get("source"),
+                })
+                result["warnings"].append(
+                    f"Disulfide {cys1.get('chain', '')}{cys1.get('resnum')}-"
+                    f"{cys2.get('chain', '')}{cys2.get('resnum')}: SG-SG "
+                    f"{bond.get('distance_angstrom')} A in the input is shorter than "
+                    "an S-S bond; the deposit overlaps the two sulfurs. The bond is "
+                    "formed and minimization relaxes it (code disulfide_sg_overlap)"
+                )
+        # A sulfur holds one disulfide whatever the source. `_merge_disulfide_pairs`
+        # enforces that for auto-detected pairs; a caller-supplied list bypassed it
+        # entirely, so an impossible pairing reached the builder unremarked. An
+        # explicit instruction is refused rather than silently trimmed.
+        claimed_by: dict = {}
+        for pair in disulfide_bonds:
+            for end in ((pair.get("cys1") or {}), (pair.get("cys2") or {})):
+                icode = end.get("icode")
+                # The insertion code is part of the sulfur's identity: without
+                # it A52 and A52A read as one cysteine, and two legitimate bonds
+                # are refused as one sulfur holding both.
+                key = (end.get("chain"), end.get("resnum"),
+                       None if icode is None else str(icode).strip())
+                if key[0] is None and key[1] is None:
+                    continue
+                claimed_by.setdefault(key, []).append(pair)
+        overbonded = {key: pairs for key, pairs in claimed_by.items() if len(pairs) > 1}
+        if overbonded:
+            named = ", ".join(f"{chain}:{resnum}{icode or ''}"
+                              for chain, resnum, icode in sorted(
+                                  overbonded,
+                                  key=lambda k: (str(k[0]), str(k[1]), str(k[2] or ""))))
+            result["errors"].append(
+                f"Disulfide pairing gives more than one bond to {named}; a cysteine "
+                "holds at most one disulfide")
+            result["code"] = "invalid_disulfide_pairing"
+            return _refused(result)
+
+        result["disulfide_bonds"] = disulfide_bonds
+        result["disulfide_source"] = disulfide_source
+
+        # Metal sites, from the same structure and the same selection as the
+        # disulfides. A cysteine ligating a metal is a thiolate, and nothing
+        # told the protonation step so: the split hands pdb2pqr the protein
+        # alone and the ion leaves in its own file, so propka never sees the
+        # metal. Measured on 6W9C/6WRH/4OW0, it deprotonates one cysteine of a
+        # four-cysteine zinc; the other three stay neutral and leave the metal
+        # during MD.
+        #
+        # Whether a site survives is decided after the split, not here: chain
+        # selection works in label_asym_id space while these records are in
+        # author space, and 4OW0's zinc is author chain A and label chain C, so
+        # "--select-chains A" drops it while an author-space filter still sees
+        # it. Assigning thiolates to a metal that was dropped would leave a
+        # -4 pocket with nothing in it.
+        from mdclaw.structure.metal_site import (
+            detect_metal_sites,
+            describe_sites,
+            protonation_states_for_metal_sites,
+        )
+        detected_metal_sites = detect_metal_sites(structure_path,
+                                                  select_chains=ss_select_chains)
+        metal_sites: list = []
+        metal_protonation_states: list = []
+
+        try:
+            resolved_n_terminal_cap, resolved_c_terminal_cap = _resolve_terminal_cap_settings(
+                cap_termini=cap_termini,
+                n_terminal_cap=n_terminal_cap,
+                c_terminal_cap=c_terminal_cap,
+            )
+        except ValueError as exc:
+            result["errors"].append(str(exc))
+            result["code"] = "invalid_terminal_cap"
+            return _refused(result)
+        terminal_caps_requested = bool(resolved_n_terminal_cap or resolved_c_terminal_cap)
+
+        # Parsed once here as well: split validates and reports them, and the
+        # cleaning step needs the same bounds to know what it may build.
+        from mdclaw.structure.residue_range import (
+            ResidueRangeError,
+            parse_residue_ranges,
+        )
+        try:
+            parse_residue_ranges(residue_ranges)
+        except ResidueRangeError as exc:
+            result["errors"].append(str(exc))
+            result["code"] = exc.code
+            result["hints"] = exc.hints
+            return _refused(result)
+
+        # Protonation-state names are an argument check: a name outside the
+        # supported set ("ARG" from 5ZKB/6GT3 in campaign v2, now accepted;
+        # anything else) is refused here, with the node still pending, rather
+        # than after the split.
+        try:
+            _normalize_protonation_state_overrides(
+                protonation_states=protonation_states,
+                histidine_states=dict(histidine_states) if histidine_states else None,
+            )
+        except (TypeError, ValueError) as exc:
+            result["errors"].append(str(exc))
+            result["code"] = "invalid_protonation_state"
+            return _refused(result)
+
+        # Step 2: Split structure
+        logger.info("Step 2: Splitting structure...")
+        split_result = split_molecules(
+            str(structure_file),
+            output_dir=str(base_dir),
+            select_chains=select_chains,
+            extra_label_ids=glycan_extra_labels or None,
+            include_types=include_types,
+            include_ligand_ids=include_ligand_ids,
+            include_ligand_resnames=include_ligand_resnames,
+            exclude_ligand_ids=exclude_ligand_ids,
+            include_associated_ligands=include_associated_ligands,
+            residue_ranges=residue_ranges,
+            join_range_pieces=join_range_pieces,
+            join_range_groups=join_range_groups,
+        )
+        if range_default is not None:
+            # Decided here, so the split saw an explicit request and did not
+            # record it; carried into its adjustments for the receipt.
+            split_result.setdefault("selection_adjustments", []).insert(0, range_default)
+        if glycan_selection_adjustment is not None:
+            split_result.setdefault("selection_adjustments", []).append(
+                glycan_selection_adjustment
+            )
+            split_result.setdefault("warnings", []).append(
+                glycan_selection_adjustment["code"] + ": "
+                + glycan_selection_adjustment["message"]
+            )
+
+        # Adopt split_molecules output dir as our working dir
+        if ligand_components is not None and split_result["success"]:
+            from .ligand_components import route_ligand_components
+
+            try:
+                if not process_ligands or optimize_ligands:
+                    raise ValueError("ligand_components requires process_ligands and no ligand optimization")
+                if include_types is not None and "protein" not in include_types:
+                    raise ValueError("ligand_components requires the protein input type in include_types")
+                route_ligand_components(structure_file, split_result, ligand_components)
+                result["ligand_components"] = ligand_components
+            except ValueError as exc:
+                result["errors"].append(str(exc))
+                result["code"] = "ligand_component_invalid"
+                from mdclaw.structure.free_amino_acid import (
+                    free_amino_acid_next_action,
+                    free_amino_acid_sites_for_declarations,
+                )
+
+                free = free_amino_acid_sites_for_declarations(
+                    ligand_components,
+                    list(split_result.get("chain_file_info") or [])
+                    + list((inspection or {}).get("chains") or []))
+                if free:
+                    result["next_action"] = free_amino_acid_next_action(
+                        free, reason=f"has a declaration the tool refused ({exc})")
+                return _refused(result)
+        if split_result["success"]:
+            result["output_dir"] = split_result["output_dir"]
+            out_dir = Path(split_result["output_dir"])
+            disposition_result = _apply_component_disposition_to_split_result(
+                split_result,
+                solvent_type=solvent_type,
+            )
+            component_disposition = disposition_result["component_disposition"]
+            result["component_disposition"] = component_disposition
+            result["component_disposition_summary"] = component_disposition["summary"]
+            result["retained_ion_files"] = disposition_result["retained_ion_files"]
+            result["excluded_ion_files"] = disposition_result["excluded_ion_files"]
+
+            if component_disposition["summary"]["experimental_isotope_atoms_excluded"]:
+                result["warnings"].append(
+                    "Excluded experimental deuterium atom(s) during component "
+                    "disposition; standard hydrogens will be rebuilt downstream"
+                )
+            if disposition_result["excluded_ion_files"]:
+                result["warnings"].append(
+                    "Excluded explicit ion component(s) from implicit-solvent "
+                    "prep output; topology will use the continuum solvent model"
+                )
+
+        result["split"] = {
+            "success": split_result["success"],
+            "protein_files": split_result.get("protein_files", []),
+            "nucleic_files": split_result.get("nucleic_files", []),
+            "glycan_files": split_result.get("glycan_files", []),
+            "ligand_files": split_result.get("ligand_files", []),
+            "ion_files": split_result.get("ion_files", []),
+            "retained_ion_files": result.get("retained_ion_files", []),
+            "excluded_ion_files": result.get("excluded_ion_files", []),
+            "water_files": split_result.get("water_files", []),
+            "chain_file_info": split_result.get("chain_file_info", []),
+            "residue_ranges": split_result.get("residue_ranges", {}),
+        }
+        for key in ("ligand_selection", "selection_adjustments"):
+            if key in split_result:
+                result["split"][key] = split_result[key]
+                result[key] = split_result[key]
+        # What each polymer chain really kept, at the top of the result and
+        # protected from --output brief: 036_ligand_1ceb, 028_complex_1dfj
+        # and 024_antibody_5cba (campaign v4) each delivered a chain one
+        # residue off the task's range, and nothing in the result said so.
+        result["kept_residue_ranges"] = list(split_result.get("delivered_chain_ranges") or [])
+        result["warnings"].extend(_range_delivery_warnings(split_result))
+
+        if not split_result["success"]:
+            result["errors"].append(f"Split failed: {split_result['errors']}")
+            result["warnings"].extend(split_result.get("warnings", []))
+            result["code"] = split_result.get("code", "split_failed")
+            for key in (
+                "hints",
+                "context",
+                "ligand_selection",
+                "selection_adjustments",
+                "next_action",
+            ):
+                if key in split_result:
+                    result[key] = split_result[key]
+            return _refused(result)
+
+        # Two more refusals the split output decides, before anything runs.
+        terminal_builds = bool(build_terminal_missing_residues or terminal_caps_requested)
+        if disulfide_pairs and split_result.get("protein_files"):
+            site_problems = _declared_disulfide_site_problems(
+                disulfide_pairs, split_result, terminal_builds=terminal_builds)
+            if site_problems:
+                result["errors"].append(
+                    "Declared disulfide site(s) the selection cannot hold: "
+                    + "; ".join(site_problems))
+                result["code"] = "disulfide_site_not_selected"
+                result["hints"] = [
+                    "Name each cysteine as <author chain>:<resnum> of a selected chain "
+                    "(inspect_molecules lists author ids), or drop the pair.",
+                ]
+                return _refused(result)
+        unbuildable = _unbuildable_range_ends(split_result, terminal_builds=terminal_builds)
+        if unbuildable:
+            for item in unbuildable:
+                if item["residues"]:
+                    result["errors"].append(
+                        f"Residue range {item['range']}: residues {item['residues']} "
+                        f"({item['count']}) at its {item['end']} are not observed in the "
+                        f"deposit, and {item['reason']}")
+                else:
+                    result["errors"].append(f"Residue range {item['range']}: {item['reason']}")
+            spans = sorted({item["observed_span"] for item in unbuildable if item["observed_span"]})
+            result["code"] = "residue_range_endpoint_unobserved"
+            result["hints"] = [
+                ("Ask for the observed span instead: " + ", ".join(spans))
+                if spans else
+                "Ask for a range whose endpoints are observed residues (inspect_molecules lists them).",
+                "Or build them: --build-terminal-missing-residues rebuilds unobserved "
+                "residues at a component end (up to 10 per end).",
+            ]
+            return _refused(result)
+
+        # A free amino acid deposited on its own (free L-arginine in 6MJ7, with
+        # its OXT) as a one-residue protein component would need NH3+ and COO-
+        # on one residue, which no Amber protein template has:
+        # build_amber_system failed on it with OpenMM's "No template found"
+        # after solvation (105_ligand_6mj7, test-v6-cli: 26 of 30 attempts).
+        # Capped on both sides it is an ordinary dipeptide-like unit.
+        if not (resolved_n_terminal_cap and resolved_c_terminal_cap):
+            from mdclaw.structure.free_amino_acid import (
+                deposited_as_free_molecule,
+                free_amino_acid_chains,
+                free_amino_acid_next_action,
+            )
+
+            protein_file_set = set(split_result.get("protein_files") or [])
+            protein_infos = [info for info in split_result.get("chain_file_info", []) or []
+                             if info.get("file") in protein_file_set]
+            free_chains = {info.get("chain_id") for info in protein_infos
+                           if info.get("residue_count") == 1
+                           and deposited_as_free_molecule(info.get("file"))}
+            lone = [site for site in free_amino_acid_chains(protein_infos)
+                    if site["chain_id"] in free_chains]
+            if lone:
+                result["errors"].append(
+                    "One-residue protein component(s) selected: " + ", ".join(
+                        f"{site['resname']} {site['author_chain'] or site['chain_id']}:{site['resnum']}"
+                        for site in lone)
+                    + "; a lone amino acid has no Amber protein template")
+                result["code"] = "single_residue_protein_component"
+                result["free_amino_acid_components"] = lone
+                result["next_action"] = free_amino_acid_next_action(
+                    lone, reason="is selected as a one-residue protein chain")
+                return _refused(result)
+
+        # A protonation state for a residue no selected protein component
+        # holds is refused by the per-component routing after the split; the
+        # routing is decided by the split alone, so it is decided here
+        # (021_antibody_3eoa, campaign v2: "B:6" on a selection that held no
+        # chain B sealed a prep node).
+        if protonation_states or histidine_states:
+            try:
+                requested_sites = _normalize_protonation_state_overrides(
+                    protonation_states=protonation_states,
+                    histidine_states=dict(histidine_states) if histidine_states else None,
+                )
+            except (TypeError, ValueError):
+                requested_sites = []          # refused above, before the split
+            infos = {info.get("file"): info for info in split_result.get("chain_file_info", []) or []}
+            routed = [
+                _states_for_chain(requested_sites, infos.get(path, {}).get("author_chain"),
+                                  infos.get(path, {}).get("chain_id"),
+                                  _window_for_component(split_result, infos.get(path, {}))) or []
+                for path in split_result.get("protein_files", []) or []
+            ]
+            outside = [site for site in requested_sites
+                       if not any(site in states for states in routed)]
+            if outside:
+                held = []
+                for path in split_result.get("protein_files", []) or []:
+                    info = infos.get(path, {})
+                    author, label = info.get("author_chain"), info.get("chain_id")
+                    window = _window_for_component(split_result, info)
+                    held.append(f"{author}" + (f" (label {label})" if label and label != author else "")
+                                + (" " + ",".join(f"{lo}-{hi}" for lo, hi in window) if window else ""))
+                result["errors"].append(
+                    "Protonation target not in any selected protein component: "
+                    + ", ".join(f"{s['chain']}:{s['resnum']}{s['icode'] or ''}" for s in outside)
+                    + f"; the selected protein components are {', '.join(held) or 'none'}")
+                result["code"] = "invalid_protonation_state"
+                result["hints"] = [
+                    "Key protonation states by <chain>:<resnum> of a selected protein chain "
+                    "inside its requested range, or drop the entry.",
+                ]
+                return _refused(result)
+
+        # A cap stands in for the rest of a chain; on the polymer's own end
+        # there is no rest, so a cap there changes the molecule.
+        if terminal_caps_requested and split_result.get("protein_files"):
+            from mdclaw.structure.terminal_caps import (
+                native_terminus_cap_next_action,
+                native_terminus_caps,
+            )
+            native = native_terminus_caps(
+                structure_file, split_result,
+                n_cap=resolved_n_terminal_cap, c_cap=resolved_c_terminal_cap,
+                build_terminal_missing_residues=build_terminal_missing_residues)
+            if native:
+                result["errors"].append(
+                    "Terminal cap requested on the polymer's own end: " + "; ".join(
+                        f"{item['cap']} on {item['terminus']}-terminus {item['residue']} "
+                        "(nothing of the entity sequence lies beyond it)" for item in native))
+                result["code"] = "terminal_cap_on_native_terminus"
+                result["context"] = {"native_termini": native}
+                result["next_action"] = native_terminus_cap_next_action(
+                    native, n_cap=resolved_n_terminal_cap, c_cap=resolved_c_terminal_cap)
+                return _refused(result)
+
+        # Ligand chemistry the arguments must decide: which protonation state,
+        # and whether a supplied SMILES is the deposited molecule. Both are
+        # known from the split alone, so they are refused with the node pending.
+        if process_ligands and split_result.get("ligand_files"):
+            ligand_refusal = _ligand_chemistry_preflight(
+                split_result,
+                ligand_smiles=ligand_smiles,
+                ligand_net_charges=ligand_net_charges,
+                structure_analysis=structure_analysis,
+                protonate_ligands=protonate_ligands,
+                ph=ligand_ph if ligand_ph is not None else ph,
+            )
+            if ligand_refusal is not None:
+                for key, value in ligand_refusal.items():
+                    if key == "errors":
+                        result["errors"].extend(value)
+                    else:
+                        result[key] = value
+                return _refused(result)
+        elif ligand_net_charges:
+            result["errors"].append(
+                "--ligand-net-charges names " + ", ".join(sorted(ligand_net_charges))
+                + " but no ligand is selected for preparation")
+            result["code"] = "invalid_ligand_net_charges"
+            result["next_action"] = (
+                "Drop --ligand-net-charges, or select the ligand (--include-ligand-ids "
+                "with its id from inspect_molecules), then run the same (still pending) "
+                "node again.")
+            return _refused(result)
+
+        # The selection is delivered and the arguments are accepted: from here
+        # on the node has run, and a failure seals it.
+        if _node_mode:
+            from mdclaw._node import begin_node
+
+            begin_node(job_dir, node_id)
+
+        # Which metals survived the split, identified by residue name, chain and
+        # number rather than by element: 6W9C chain C carries two zincs, one on
+        # the Cys4 site and one shared between three copies at Cys270, and
+        # selecting only the first still leaves "a ZN survived" true. Matching on
+        # element alone deprotonated Cys270 for a metal that had been dropped.
+        # Sites whose metal is gone contribute no protonation; sites whose metal
+        # is gone but whose ligands stayed are a silent structural change and are
+        # warned about -- the guardrail table had a "metals" heading and nothing
+        # under it.
+        surviving_metals = set()
+        for ion_file in result.get("retained_ion_files") or []:
+            try:
+                for line in Path(ion_file).read_text().splitlines():
+                    if line.startswith(("ATOM", "HETATM")):
+                        surviving_metals.add((line[17:20].strip().upper(),
+                                              line[21].strip(),
+                                              line[22:26].strip(),
+                                              line[26].strip()))
+            except OSError as exc:
+                result.setdefault("warnings", []).append(
+                    f"Could not read {ion_file} to confirm which metals survived "
+                    f"the selection ({exc}); metal-bound cysteines keep whatever "
+                    "state pdb2pqr assigns them")
+
+        def _survived(site: dict) -> bool:
+            """Match on residue name, number and insertion code; chain loosely.
+
+            The split writes PDB, whose chain column is one character wide, so a
+            multi-character auth chain (7QVK's "BBB") arrives truncated and an
+            exact comparison never matches.
+            """
+            chain = str(site["chain"]).strip()
+            for resname, pdb_chain, resnum, icode in surviving_metals:
+                if resname != site["resname"]:
+                    continue
+                if resnum != str(site["resnum"]) or icode != site.get("icode", ""):
+                    continue
+                if pdb_chain in (chain, chain[:1]):
+                    return True
+            return False
+
+        for site in detected_metal_sites:
+            if _survived(site):
+                metal_sites.append(site)
+            elif len(site["ligands"]) >= 2:
+                ligands = ", ".join(f"{item['chain']}:{item['resname']}{item['resnum']}"
+                                    for item in site["ligands"])
+                result.setdefault("warnings", []).append(
+                    f"{site['label']} ({site['motif']}) was dropped by the selection "
+                    f"but is held by {len(site['ligands'])} side chain(s) ({ligands}); "
+                    "that removes a structural metal and leaves its ligands "
+                    "uncoordinated. Select the chain the metal is in to keep it.")
+        # Before either detection is used: what the range removed is not there
+        # to bond to or to coordinate.
+        disulfide_bonds, metal_sites = _drop_detections_outside_ranges(
+            result, split_result, disulfide_bonds, metal_sites)
+        result["disulfide_bonds"] = disulfide_bonds
+
+        metal_protonation_states = protonation_states_for_metal_sites(metal_sites)
+        result["metal_sites"] = metal_sites
+        for line in describe_sites(metal_sites):
+            logger.info(f"Metal site: {line}")
+
+        # Build lookup for chain info
+        # Create a lookup from chain_id to all_chain_data (match by chain_id, not index)
+        all_chains_lookup = {c["chain_id"]: c for c in split_result.get("all_chains", [])}
+        
+        chain_info_map = {}
+        chain_info_by_file = {}
+        for info in split_result.get("chain_file_info", []):
+            chain_id = info["chain_id"]
+            enriched = {
+                **info,
+                "all_chain_data": all_chains_lookup.get(chain_id, {})
+            }
+            chain_info_map.setdefault(chain_id, enriched)
+            chain_info_by_file[info["file"]] = enriched
+
+        # Preflight: catch crystallization additives / placeholder residues that
+        # the default ``ligand`` selection swept in, before they fail much later
+        # at build_amber_system with "No template found for residue <RESNAME>".
+        retained_ligand_chains = [
+            all_chains_lookup[info["chain_id"]]
+            for info in split_result.get("chain_file_info", [])
+            if info.get("chain_type") == "ligand"
+            and info.get("chain_id") in all_chains_lookup
+        ]
+        additive_ligands = likely_additive_ligands(retained_ligand_chains)
+        if additive_ligands:
+            additive_names = sorted(
+                {
+                    name
+                    for item in additive_ligands
+                    for name in item.get("residue_names", [])
+                }
+            )
+            placeholder_ligands = [
+                item for item in additive_ligands if item.get("unparametrizable")
+            ]
+            recommendation = {
+                "summary": (
+                    "Selected ligand(s) look like crystallization additives or "
+                    "placeholder residues, not biological cofactors: "
+                    f"{', '.join(additive_names)}."
+                ),
+                "options": [
+                    {
+                        "action": "drop_additive_ligands",
+                        "detail": (
+                            "Rerun a new prep node with `ligand` omitted from "
+                            "`--include-types` (keep protein/nucleic/glycan/ion)."
+                        ),
+                    },
+                    {
+                        "action": "name_target_ligand",
+                        "detail": (
+                            "If one of these is the intended target, keep it with "
+                            "`--include-ligand-resnames <RESNAME>` and drop the rest."
+                        ),
+                    },
+                ],
+            }
+            if placeholder_ligands:
+                # UNX/UNL/UNK carry no chemistry and can never be parameterized;
+                # block now instead of proceeding to a guaranteed topology failure.
+                placeholder_names = sorted(
+                    {
+                        name
+                        for item in placeholder_ligands
+                        for name in item.get("residue_names", [])
+                    }
+                )
+                result["likely_additive_ligands"] = additive_ligands
+                result["errors"].append(
+                    "Selected unparameterizable placeholder ligand(s): "
+                    f"{', '.join(placeholder_names)}. These residues have no "
+                    "defined chemistry and cannot be parameterized."
+                )
+                result["code"] = "unparametrizable_ligand_selected"
+                result["workflow_recommendation"] = recommendation
+                result["overall_status"] = "failed"
+                return result
+            # Known additives are chemically valid, so warn (do not block): the
+            # user may deliberately want to model e.g. glycerol.
+            result["likely_additive_ligands"] = additive_ligands
+            result["warnings"].append(
+                "Retained likely crystallization additive/buffer ligand(s): "
+                f"{', '.join(additive_names)}. If unintended, rerun prep with "
+                "`ligand` omitted from `--include-types`."
+            )
+            result.setdefault("workflow_recommendation", recommendation)
+
+        # Declared before the protein branch: the merge below verifies these
+        # whether or not this structure has any protein at all.
+        sa_disulfide_pairs = None
+
+        # Step 3: Process proteins
+        if process_proteins and split_result.get("protein_files"):
+            logger.info(f"Step 3: Processing {len(split_result['protein_files'])} protein(s)...")
+
+            # Assemble the disulfide + histidine override lists that the
+            # per-chain clean_protein step actually consumes. Precedence is
+            # direct CLI args > structure_analysis > auto-detect.
+            sa_histidine_states = None
+            sa_protonation_states = None
+
+            if disulfide_pairs is not None:
+                # Convert user's nested cys1/cys2 schema into the flat shape
+                # clean_protein expects. An empty list intentionally disables
+                # disulfide formation in cleaning too.
+                sa_disulfide_pairs = flatten_disulfide_pairs(disulfide_pairs)
+                logger.info(f"User override: {len(sa_disulfide_pairs)} disulfide pair(s)")
+
+            if histidine_states:
+                sa_histidine_states = dict(histidine_states)
+                logger.info(f"User override: {len(sa_histidine_states)} histidine state(s)")
+
+            if protonation_states:
+                try:
+                    sa_protonation_states = _normalize_protonation_state_overrides(
+                        protonation_states=protonation_states,
+                        histidine_states=sa_histidine_states,
+                    )
+                    # The generic protonation list subsumes legacy HIS overrides.
+                    sa_histidine_states = None
+                except ValueError as exc:
+                    result["errors"].append(str(exc))
+                    result["code"] = "invalid_protonation_state"
+                    result["overall_status"] = "failed"
+                    return result
+                logger.info(
+                    f"User override: {len(sa_protonation_states)} residue protonation state(s)"
+                )
+
+            if structure_analysis:
+                # Extract disulfide bonds only if no direct override
+                if sa_disulfide_pairs is None:
+                    sa_disulfide_bonds = structure_analysis.get("disulfide_bonds", [])
+                    if sa_disulfide_bonds:
+                        # Filter to only form_bond=True and convert to expected format
+                        sa_disulfide_pairs = [
+                            {
+                                "chain1": bond.get("chain1"),
+                                "resnum1": bond.get("resnum1"),
+                                "chain2": bond.get("chain2"),
+                                "resnum2": bond.get("resnum2"),
+                                "form_bond": bond.get("form_bond", True),
+                            }
+                            for bond in sa_disulfide_bonds
+                            if bond.get("form_bond", True)
+                        ]
+                        logger.info(f"Using {len(sa_disulfide_pairs)} pre-defined disulfide pair(s)")
+
+                # Extract generic protonation states if no direct override.
+                if (
+                    sa_protonation_states is None
+                    and sa_histidine_states is None
+                    and structure_analysis.get("protonation_states")
+                ):
+                    try:
+                        sa_protonation_states = _normalize_protonation_state_overrides(
+                            protonation_states=structure_analysis.get("protonation_states"),
+                        )
+                    except ValueError as exc:
+                        result["errors"].append(str(exc))
+                        result["code"] = "invalid_protonation_state"
+                        result["overall_status"] = "failed"
+                        return result
+                    logger.info(
+                        f"Using {len(sa_protonation_states)} pre-defined residue protonation state(s)"
+                    )
+
+                # Extract histidine states only if no generic/direct override
+                if sa_histidine_states is None and sa_protonation_states is None:
+                    sa_histidine_list = structure_analysis.get("histidine_states", [])
+                    if sa_histidine_list:
+                        sa_histidine_states = {}
+                        for his in sa_histidine_list:
+                            chain = his.get("chain")
+                            resnum = his.get("resnum")
+                            state = his.get("state")
+                            if chain and resnum and state:
+                                sa_histidine_states[f"{chain}:{resnum}"] = state
+                        logger.info(f"Using {len(sa_histidine_states)} pre-defined histidine state(s)")
+
+            # Metal-bound cysteines are thiolates. Added last and never over an
+            # explicit choice: a caller who names a residue has decided it, and
+            # the deprotonation here is only for residues nobody spoke for.
+            if metal_protonation_states:
+                def _site_key(chain, resnum, icode=""):
+                    return (str(chain).strip(), str(resnum).strip(),
+                            str(icode or "").strip())
+
+                spoken_for = {
+                    _site_key(state.get("chain"), state.get("resnum"),
+                              state.get("icode"))
+                    for state in (sa_protonation_states or [])
+                }
+                for key in (sa_histidine_states or {}):
+                    spoken_for.add(_site_key(*key.split(":")))
+                pending = [state for state in metal_protonation_states
+                           if _site_key(state["chain"], state["resnum"],
+                                        state.get("icode")) not in spoken_for]
+                if pending:
+                    try:
+                        sa_protonation_states = _normalize_protonation_state_overrides(
+                            protonation_states=list(sa_protonation_states or []) + pending,
+                            histidine_states=sa_histidine_states,
+                        )
+                    except ValueError as exc:
+                        result["errors"].append(str(exc))
+                        result["code"] = "invalid_protonation_state"
+                        result["overall_status"] = "failed"
+                        return result
+                    sa_histidine_states = None
+                    logger.info(
+                        f"Metal coordination: {len(pending)} cysteine(s) assigned "
+                        f"{', '.join(sorted({s['state'] for s in pending}))} "
+                        f"({', '.join(s['chain'] + ':' + s['resnum'] for s in pending)})"
+                    )
+                    result.setdefault("metal_protonation_applied", []).extend(pending)
+
+            # Route both override spellings once, before any component is cleaned.
+            # A target outside every retained component must not silently vanish.
+            try:
+                requested_states = _normalize_protonation_state_overrides(
+                    protonation_states=sa_protonation_states,
+                    histidine_states=sa_histidine_states,
+                )
+                states_by_file = {}
+                for protein_file in split_result["protein_files"]:
+                    info = chain_info_by_file.get(protein_file, {})
+                    states_by_file[protein_file] = _states_for_chain(
+                        requested_states, info.get("author_chain"),
+                        info.get("chain_id"), _window_for_component(split_result, info))
+                for state in requested_states:
+                    if not any(state in (states or []) for states in states_by_file.values()):
+                        raise ValueError(
+                            f"Protonation target not in any selected protein component: "
+                            f"{state['chain']}:{state['resnum']}:{state['icode']}")
+            except ValueError as exc:
+                result["errors"].append(str(exc))
+                result["code"] = "invalid_protonation_state"
+                result["overall_status"] = "failed"
+                return result
+
+            # Rebuild internal gaps for the whole complex before the per-chain
+            # pass. A gap at a chain-chain interface modeled one chain at a time
+            # is built into space the partner chain occupies; the chains about
+            # to be merged are the assembly, so MODELLER gets them together.
+            build_windows_by_source = {
+                str(cinfo["file"]): _window_for_component(split_result, cinfo)
+                for cinfo in chain_info_by_file.values()
+                if cinfo.get("file") in split_result["protein_files"]
+                and _window_for_component(split_result, cinfo) is not None
+            }
+            complex_repair = repair_complex_missing_residues(
+                split_result["protein_files"],
+                method=missing_residue_method,
+                work_dir=Path(split_result["protein_files"][0]).parent,
+                disulfide_pairs=sa_disulfide_pairs,
+                build_terminal_missing_residues=build_terminal_missing_residues,
+                build_windows_by_source=build_windows_by_source,
+                # prepare_complex has always normalized non-standard protein
+                # residues in its per-chain clean step; the complex MODELLER
+                # pre-pass must make the same choice before it builds gaps.
+                replace_nonstandard_residues=True,
+                # The selected ligands and ions: loops are built around them and
+                # the result is measured against them.
+                nonpolymer_context_files=[
+                    *(split_result.get("ligand_files") or []),
+                    *(result.get("retained_ion_files") or split_result.get("ion_files") or []),
+                ],
+                nonpolymer_in_template=repair_nonpolymer_context,
+            )
+            result["warnings"].extend(complex_repair["warnings"])
+            if not complex_repair["success"]:
+                result["errors"].extend(complex_repair["errors"])
+                result["code"] = complex_repair["code"]
+                result["overall_status"] = "failed"
+                return result
+            repaired_by_file = complex_repair["outputs_by_source"]
+            if complex_repair["applied"]:
+                result["complex_missing_residue_repair"] = {
+                    "applied": True,
+                    "chain_ids": complex_repair["chain_ids"],
+                    "summary": complex_repair["summary"],
+                    "model_file": complex_repair["model_file"],
+                    "validation": complex_repair.get("validation"),
+                    "operation": complex_repair.get("operation"),
+                    "nonpolymer_in_template": complex_repair.get("nonpolymer_in_template"),
+                    "nonpolymer_clearance": complex_repair.get("nonpolymer_clearance"),
+                }
+
+            for protein_file in split_result["protein_files"]:
+                # Find chain info for this file
+                component_info = chain_info_by_file.get(protein_file, {})
+                chain_id = component_info.get("chain_id")
+
+                protein_result = {
+                    "chain_id": chain_id,
+                    "author_chain": (
+                        component_info.get("author_chain")
+                        or chain_id
+                    ),
+                    "residue_range": component_info.get("residue_range"),
+                    "residue_ranges": component_info.get("residue_ranges"),
+                    "input_file": protein_file,
+                    "output_file": None,
+                    "success": False,
+                    "statistics": {},
+                    "errors": []
+                }
+
+                try:
+                    clean_result = clean_protein(
+                        pdb_file=repaired_by_file.get(protein_file, protein_file),
+                        ph=ph,
+                        cap_termini=cap_termini,
+                        n_terminal_cap=n_terminal_cap,
+                        c_terminal_cap=c_terminal_cap,
+                        terminal_cap_forcefield=terminal_cap_forcefield,
+                        # Caps already implied terminal rebuilding; asking for
+                        # it outright is the other way in, and the two are ORed
+                        # so neither route changes what the other did.
+                        ignore_terminal_missing_residues=not (
+                            terminal_caps_requested or build_terminal_missing_residues),
+                        build_terminal_missing_residues=build_terminal_missing_residues,
+                        build_window=_window_for_component(
+                            split_result, component_info
+                        ),
+                        disulfide_pairs=sa_disulfide_pairs,
+                        protonation_method=protonation_method,
+                        preserve_input_protonation=preserve_input_protonation,
+                        strip_input_caps=strip_input_caps,
+                        protonation_states=states_by_file[protein_file],
+                        missing_residue_method=missing_residue_method,
+                        context_pdb_files=[
+                            other for other in (
+                                list(split_result.get("protein_files", []))
+                                + list(split_result.get("nucleic_files", []))
+                            )
+                            if other != protein_file
+                        ],
+                    )
+                    escalation_warnings = [
+                        warning
+                        for warning in clean_result.get("warnings", [])
+                        if "escalated from PDBFixer to MODELLER" in warning
+                    ]
+                    if escalation_warnings:
+                        protein_result["warnings"] = escalation_warnings
+                        result["warnings"].extend(
+                            f"Protein {chain_id}: {warning}"
+                            for warning in escalation_warnings
+                        )
+
+                    if clean_result["success"]:
+                        protein_result["output_file"] = clean_result["output_file"]
+                        protein_result["statistics"] = clean_result.get("statistics", {})
+                        protein_result["provenance"] = clean_result.get("provenance", {})
+                        protein_result["n_terminal_cap"] = clean_result.get("n_terminal_cap")
+                        protein_result["c_terminal_cap"] = clean_result.get("c_terminal_cap")
+                        protein_result["terminal_caps"] = clean_result.get("terminal_caps", {})
+                        # Caps the structure arrived with, as distinct from
+                        # caps we added. Without these two the caller cannot
+                        # tell a capped deposit from an uncapped one until the
+                        # residue count disagrees with whatever it is being
+                        # compared against.
+                        protein_result["input_terminal_caps"] = clean_result.get(
+                            "input_terminal_caps", []
+                        )
+                        protein_result["input_terminal_caps_removed"] = clean_result.get(
+                            "input_terminal_caps_removed", []
+                        )
+                        protein_result["terminal_cap_forcefield"] = clean_result.get(
+                            "terminal_cap_forcefield"
+                        )
+                        protein_result["terminal_cap_hydrogen_completion"] = clean_result.get(
+                            "terminal_cap_hydrogen_completion"
+                        )
+                        for key in ("missing_residue_repair", "missing_residue_detection"):
+                            if clean_result.get(key) is not None:
+                                protein_result[key] = clean_result[key]
+                        # The protonation record, so the receipt can say which
+                        # method ran and which residues propka moved off the
+                        # force field's fixed state (campaign failures 2026-09-16
+                        # went unnoticed because nothing surfaced HIP/ASH/GLH).
+                        for key in ("protonation_method", "protonation_states",
+                                    "histidine_states", "requested_ph"):
+                            if clean_result.get(key) is not None:
+                                protein_result[key] = clean_result[key]
+                        protein_result["success"] = True
+                        logger.info(f"  ✓ Protein {chain_id}: {clean_result['output_file']}")
+                    else:
+                        protein_result["errors"] = clean_result.get("errors", [])
+                        for key in (
+                            "code",
+                            "workflow_recommendation",
+                            "recommended_next_action",
+                            "recommended_next_skills",
+                            "missing_residue_repair",
+                        ):
+                            if clean_result.get(key) is not None:
+                                protein_result[key] = clean_result[key]
+                        if clean_result.get("code") and not result.get("code"):
+                            result["code"] = clean_result["code"]
+                        if (
+                            clean_result.get("workflow_recommendation")
+                            and not result.get("workflow_recommendation")
+                        ):
+                            result["workflow_recommendation"] = clean_result[
+                                "workflow_recommendation"
+                            ]
+                            result["recommended_next_action"] = clean_result.get(
+                                "recommended_next_action"
+                            )
+                            result["recommended_next_skills"] = clean_result.get(
+                                "recommended_next_skills",
+                                [],
+                            )
+                        result["errors"].extend(protein_result["errors"])
+                        result["warnings"].append(f"Protein {chain_id} cleaning failed: {clean_result['errors']}")
+                        logger.warning(f"  ✗ Protein {chain_id} failed: {clean_result['errors']}")
+
+                except Exception as e:
+                    protein_result["errors"].append(str(e))
+                    result["warnings"].append(f"Protein {chain_id} error: {str(e)}")
+                    logger.error(f"  ✗ Protein {chain_id} error: {e}")
+
+                result["proteins"].append(protein_result)
+
+        # Step 4: Rebuild standard DNA/RNA hydrogens during prep. Topology
+        # generation deliberately validates atom/H completeness without doing
+        # generic repair.
+        if split_result.get("nucleic_files"):
+            logger.info(f"Step 4: Preparing {len(split_result['nucleic_files'])} nucleic chain(s)...")
+            for nucleic_file in split_result["nucleic_files"]:
+                cinfo_for_nucleic = chain_info_by_file.get(nucleic_file, {})
+                chain_id = cinfo_for_nucleic.get("chain_id")
+                nucleic_result = _prepare_standard_nucleic(
+                    nucleic_file,
+                    nucleic_subtype=cinfo_for_nucleic.get("nucleic_subtype"),
+                    ph=ph,
+                )
+                nucleic_result.update({
+                    "chain_id": chain_id,
+                    "author_chain": cinfo_for_nucleic.get("author_chain", chain_id),
+                    "input_file": nucleic_file,
+                })
+                if nucleic_result["success"]:
+                    logger.info(
+                        f"  ✓ Nucleic {chain_id}: {nucleic_result['output_file']} "
+                        f"({nucleic_result['hydrogens_added']} H added)"
+                    )
+                else:
+                    result["errors"].extend(nucleic_result.get("errors", []))
+                    result["warnings"].append(
+                        f"Nucleic {chain_id} preparation failed: "
+                        f"{nucleic_result.get('errors', [])}"
+                    )
+                    logger.warning(
+                        f"  ✗ Nucleic {chain_id} failed: "
+                        f"{nucleic_result.get('errors', [])}"
+                    )
+                result["nucleics"].append(nucleic_result)
+
+        # Step 4.5: Pass glycan chains through unchanged. GLYCAM support is
+        # applied during build_amber_system; these should not be parameterized
+        # as GAFF ligands.
+        if split_result.get("glycan_files"):
+            logger.info(f"Step 4.5: Passing through {len(split_result['glycan_files'])} glycan chain(s)...")
+            for glycan_file in split_result["glycan_files"]:
+                cinfo_for_glycan = chain_info_by_file.get(glycan_file, {})
+                chain_id = cinfo_for_glycan.get("chain_id")
+                chain_data = cinfo_for_glycan.get("all_chain_data", {})
+                residue_names = chain_data.get("glycan_residue_names") or chain_data.get("residue_names", [])
+                if isinstance(residue_names, dict):
+                    residue_names = residue_names.get("unique_residues", [])
+                result["glycans"].append({
+                    "chain_id": chain_id,
+                    "author_chain": cinfo_for_glycan.get("author_chain", chain_id),
+                    "input_file": glycan_file,
+                    "output_file": glycan_file,
+                    "residue_names": sorted(set(residue_names or [])),
+                    "success": True,
+                    "warnings": [],
+                })
+                logger.info(f"  ✓ Glycan {chain_id}: {glycan_file}")
+
+        # Step 5: Process ligands
+        if process_ligands and split_result.get("ligand_files"):
+            logger.info(f"Step 5: Processing {len(split_result['ligand_files'])} ligand(s)...")
+            
+            for ligand_file in split_result["ligand_files"]:
+                # Find chain info for this file
+                cinfo_for_ligand = chain_info_by_file.get(ligand_file, {})
+                chain_id = cinfo_for_ligand.get("chain_id")
+                ligand_id = None
+                chain_data = cinfo_for_ligand.get("all_chain_data", {})
+                residue_names = chain_data.get("residue_names", {})
+                if residue_names:
+                    unique_residues = residue_names.get("unique_residues", [])
+                    if unique_residues:
+                        ligand_id = unique_residues[0]  # First residue name
+                
+                # If ligand_id not found in chain_info_map, read directly from PDB file
+                component = cinfo_for_ligand.get("ligand_component")
+                if component:
+                    ligand_id = component["residue_name"]
+                if not ligand_id:
+                    try:
+                        with open(ligand_file, 'r') as f:
+                            for line in f:
+                                if line.startswith('HETATM') or line.startswith('ATOM'):
+                                    # Residue name is at columns 17-20 (0-indexed: 17:20)
+                                    ligand_id = line[17:20].strip()
+                                    if ligand_id:
+                                        break
+                    except Exception as e:
+                        logger.warning(f"Could not read ligand ID from {ligand_file}: {e}")
+                
+                if not ligand_id:
+                    result["warnings"].append(f"Could not determine ligand ID for {ligand_file}")
+                    continue
+                
+                ligand_instance_id = cinfo_for_ligand.get("unique_id")
+                author_chain = cinfo_for_ligand.get("author_chain", chain_id)
+                resnum = cinfo_for_ligand.get("resnum")
+                if not ligand_instance_id:
+                    ligand_instance_id = f"{author_chain or chain_id}:{ligand_id}:{resnum or 'UNK'}"
+
+                ligand_result = {
+                    "ligand_instance_id": ligand_instance_id,
+                    "chain_id": chain_id,
+                    "author_chain": author_chain,
+                    "ligand_id": ligand_id,
+                    "residue_name": ligand_id[:3].upper(),
+                    "resnum": resnum,
+                    "input_file": ligand_file,
+                    "sdf_file": None,
+                    "prepared_pdb_file": None,
+                    "pdb_file": None,
+                    "net_charge": None,
+                    "charge_source": None,
+                    "mol_formal_charge": None,
+                    "expected_net_charge": None,
+                    "roundtrip_validation": None,
+                    "success": False,
+                    "errors": []
+                }
+
+                # Check if this ligand is excluded in structure_analysis
+                sa_ligand_spec = None
+                if structure_analysis:
+                    sa_ligands = structure_analysis.get("ligands", [])
+                    for lig_spec in sa_ligands:
+                        if lig_spec.get("resname") == ligand_id or lig_spec.get("chain") == chain_id:
+                            sa_ligand_spec = lig_spec
+                            break
+
+                    if sa_ligand_spec and not sa_ligand_spec.get("include", True):
+                        if component:
+                            result["errors"].append("a declared ligand component cannot also be excluded")
+                            result["code"] = "ligand_component_invalid"
+                            result["overall_status"] = "failed"
+                            return result
+                        logger.info(f"  Skipping ligand {ligand_id} (user excluded)")
+                        continue
+
+                try:
+                    # Get SMILES (user-provided or from structure_analysis or fetch)
+                    user_smiles = None
+                    expected_net_charge = None
+
+                    # First check direct ligand_smiles parameter
+                    if ligand_smiles and ligand_id in ligand_smiles:
+                        user_smiles = ligand_smiles[ligand_id]
+
+                    # Then check structure_analysis for overrides
+                    if sa_ligand_spec:
+                        if sa_ligand_spec.get("smiles"):
+                            user_smiles = sa_ligand_spec["smiles"]
+                        if sa_ligand_spec.get("net_charge") is not None:
+                            expected_net_charge = sa_ligand_spec["net_charge"]
+                            logger.info(
+                                f"  Validating expected ligand charge "
+                                f"{expected_net_charge} for {ligand_id}"
+                            )
+
+                    # The direct argument outranks structure_analysis.
+                    stated = _expected_ligand_net_charge(
+                        ligand_net_charges, ligand_instance_id, ligand_id, None)
+                    if stated is not None:
+                        expected_net_charge = stated
+
+                    if component:
+                        if user_smiles and user_smiles != component["smiles"]:
+                            raise ValueError("conflicting ligand component SMILES")
+                        user_smiles = component["smiles"]
+                    # Clean ligand. Ligand protonation uses the protein pH by
+                    # default; an explicit ligand_ph overrides it.
+                    clean_result = clean_ligand(
+                        ligand_pdb=ligand_file,
+                        ligand_id=ligand_id,
+                        smiles=user_smiles,
+                        optimize=optimize_ligands,
+                        expected_net_charge=expected_net_charge,
+                        ligand_ph=ligand_ph if ligand_ph is not None else ph,
+                        protonate=False if component else protonate_ligands,
+                    )
+                    
+                    if clean_result["success"]:
+                        if component:
+                            from .ligand_components import validate_ligand_conversion
+
+                            ligand_result["source_conversion"] = validate_ligand_conversion(
+                                ligand_file, clean_result, component)
+                        ligand_result["sdf_file"] = clean_result["sdf_file"]
+                        ligand_result["prepared_pdb_file"] = clean_result.get("pdb_file")
+                        ligand_result["pdb_file"] = clean_result.get("pdb_file")
+                        ligand_result["net_charge"] = clean_result["net_charge"]
+                        ligand_result["charge_source"] = clean_result.get("charge_source")
+                        ligand_result["mol_formal_charge"] = clean_result.get("mol_formal_charge")
+                        ligand_result["expected_net_charge"] = clean_result.get("expected_net_charge")
+                        ligand_result["smiles_used"] = clean_result.get("smiles_used")
+                        ligand_result["smiles_original"] = clean_result.get("smiles_original")
+                        ligand_result["smiles_source"] = clean_result.get("smiles_source")
+                        ligand_result["protonation_method"] = clean_result.get("protonation_method")
+                        ligand_result["protonation_ph"] = clean_result.get("protonation_ph")
+                        ligand_result["smiles_protonated"] = clean_result.get("smiles_protonated")
+                        ligand_result["protonation_candidates"] = clean_result.get("protonation_candidates")
+                        logger.info(
+                            f"  ✓ Ligand {ligand_id} ({chain_id}): cleaned, "
+                            f"graph charge={clean_result['net_charge']}"
+                        )
+                        ligand_result["success"] = True
+                    else:
+                        ligand_result["errors"] = clean_result.get("errors", [])
+                        ligand_result["failure_class"] = "ligand_chemistry_failed"
+                        ligand_result["recommended_next_action"] = (
+                            "provide_smiles_or_exclude_ligand"
+                        )
+                        result["warnings"].append(f"Ligand {ligand_id} cleaning failed: {clean_result['errors']}")
+                        logger.warning(f"  ✗ Ligand {ligand_id} failed: {clean_result['errors']}")
+                        
+                except Exception as e:
+                    ligand_result["errors"].append(str(e))
+                    result["warnings"].append(f"Ligand {ligand_id} error: {str(e)}")
+                    logger.error(f"  ✗ Ligand {ligand_id} error: {e}")
+                
+                result["ligands"].append(ligand_result)
+                if component and not ligand_result["success"]:
+                    result["errors"].extend(ligand_result["errors"])
+                    result["code"] = "ligand_component_invalid"
+                    result["overall_status"] = "failed"
+                    from mdclaw.structure.free_amino_acid import (
+                        free_amino_acid_next_action,
+                        free_amino_acid_sites_for_declarations,
+                    )
+
+                    free = free_amino_acid_sites_for_declarations(
+                        [component], inspection.get("chains") or [])
+                    if free:
+                        first_error = (ligand_result["errors"] or ["no reason recorded"])[0]
+                        result["next_action"] = free_amino_acid_next_action(
+                            free, pending=False,
+                            reason=f"failed as a declared ligand component ({first_error})")
+                    return result
+        
+        # Determine overall success
+        # A residue range is a request, and the answer is what the cleaned file
+        # holds, not what the crop selected. Handing back 4-314 for "4-315" is
+        # the difference this parameter exists to make visible, so it is refused
+        # here rather than reported as a smaller success.
+        coverage = _residue_range_coverage(split_result, result["proteins"])
+        if coverage:
+            result["residue_range_coverage"] = coverage
+        short = {chain: record for chain, record in coverage.items()
+                 if record["missing"] or record["unexpected"] or record["unresolved_endpoints"]}
+        if short:
+            for chain, record in short.items():
+                shown = record["missing"][:6]
+                result["errors"].append(
+                    f"Residue range {record['range']} asked for "
+                    f"{record['requested']} residues of chain {chain} and the "
+                    f"prepared chain holds {record['delivered']}; "
+                    f"{len(record['missing'])} are absent: {shown}; "
+                    f"{len(record['unexpected'])} unexpected residues; "
+                    f"unresolved endpoints: {record['unresolved_endpoints']}")
+            result["code"] = "residue_range_not_delivered"
+            result["hints"] = [
+                "Residues the deposit does not resolve are only built when "
+                "build_terminal_missing_residues is enabled for a terminus, or "
+                "by the missing-residue repair for an internal gap.",
+                "Author-number gaps are not evidence of missing residues. "
+                "Use the source sequence mapping; do not renumber or add residues "
+                "to satisfy an integer interval.",
+            ]
+            result["next_action"] = (
+                "Inspect residue_range_coverage and the source sequence mapping. "
+                "Build only confirmed missing residues; unresolved identity requires "
+                "a source with a usable sequence mapping.")
+            result["overall_status"] = "failed"
+            return result
+
+        # Success if requested protein/ligand processing succeeded; nucleic
+        # chains are pass-through inputs and only fail if split omitted them.
+        proteins_ok = all(p["success"] for p in result["proteins"]) if result["proteins"] else True
+        nucleics_ok = all(nuc["success"] for nuc in result["nucleics"]) if result["nucleics"] else True
+        glycans_ok = all(gly["success"] for gly in result["glycans"]) if result["glycans"] else True
+        ligands_ok = all(lig["success"] for lig in result["ligands"]) if result["ligands"] else True
+        
+        if process_proteins and not result["proteins"]:
+            proteins_ok = not split_result.get("protein_files")  # OK if no proteins to process
+        if process_ligands and not result["ligands"]:
+            ligands_ok = not split_result.get("ligand_files")  # OK if no ligands to process
+        
+        critical_components_ok = proteins_ok and nucleics_ok and glycans_ok
+
+        # Step 6: Merge structures if required macromolecular components are
+        # complete. Ligand failures may still yield a protein-only artifact for
+        # the explicit blocking-ligand recovery path, but failed protein/nucleic
+        # or glycan preparation must never silently truncate the merged system.
+        if critical_components_ok:
+            logger.info("Step 6: Merging structures...")
+            pdb_files_to_merge = []
+            
+            # Add protein files
+            for p in result["proteins"]:
+                if p["success"] and p.get("output_file"):
+                    pdb_files_to_merge.append(p["output_file"])
+
+            # Add hydrogen-complete standard DNA/RNA files.
+            for nuc in result["nucleics"]:
+                if nuc["success"] and nuc.get("output_file"):
+                    pdb_files_to_merge.append(nuc["output_file"])
+
+            # Add glycan files as-is; topology generation loads GLYCAM and
+            # applies recorded protein-glycan linkages.
+            for gly in result["glycans"]:
+                if gly["success"] and gly.get("output_file"):
+                    pdb_files_to_merge.append(gly["output_file"])
+            
+            # Add ligand files. The standard path uses the cleaned ligand PDB
+            # emitted alongside the SDF.
+            for lig in result["ligands"]:
+                if lig["success"]:
+                    # Prefer the explicit ligand PDB recorded on the ligand.
+                    ligand_pdb = lig.get("pdb_file")
+                    if ligand_pdb and Path(ligand_pdb).exists():
+                        pdb_files_to_merge.append(ligand_pdb)
+                    else:
+                        result["warnings"].append(
+                            f"No cleaned PDB found for ligand {lig.get('ligand_id')}"
+                        )
+
+            # Add ion files as-is (no cleaning needed). Standard bare ions
+            # must land in merged.pdb so the water-model XML templates can
+            # match them; otherwise the ion would silently disappear between
+            # split and merge even though "ion" was in include_types.
+            for ion_pdb in result.get("retained_ion_files", split_result.get("ion_files", [])):
+                if ion_pdb and Path(ion_pdb).exists():
+                    pdb_files_to_merge.append(ion_pdb)
+
+            if pdb_files_to_merge:
+                merge_result = merge_structures(
+                    pdb_files=pdb_files_to_merge,
+                    output_dir=str(out_dir.parent),  # Will create subdirectory
+                    output_name="merged"
+                )
+                
+                if merge_result["success"]:
+                    # The one place every declared disulfide is present at once.
+                    # A repair run chain by chain defers the inter-chain bonds --
+                    # neither run holds both ends -- so without this check a bond
+                    # that never formed reaches the topology unnoticed.
+                    # Defined only on the protein path; a nucleic- or
+                    # glycan-only structure reaches the merge without it.
+                    merged_pairs, unmapped = _disulfide_pairs_in_merged_frame(
+                        sa_disulfide_pairs,
+                        merge_result.get("chain_mapping_entries") or [],
+                    )
+                    merged_disulfides = _validate_declared_disulfides(
+                        Path(merge_result["output_file"]),
+                        merged_pairs,
+                        _merged_chain_ids(merge_result["output_file"]),
+                    )
+                    if unmapped:
+                        # Never "not applicable": a declared bond that cannot be
+                        # located in the merged frame is unverified, and passing
+                        # it silently is the failure this check exists to stop.
+                        merged_disulfides["success"] = False
+                        merged_disulfides["errors"].extend(
+                            f"declared disulfide {entry} could not be located in "
+                            "the merged structure, so it was never verified"
+                            for entry in unmapped
+                        )
+                    result["declared_disulfide_validation"] = merged_disulfides
+                    result["warnings"].extend(merged_disulfides.get("warnings") or [])
+                    if not merged_disulfides["success"]:
+                        result["errors"].extend(merged_disulfides["errors"])
+                        result["code"] = "modeller_disulfide_not_formed"
+                        result["overall_status"] = "failed"
+                        return result
+                    close_pairs = _close_atom_pairs(Path(merge_result["output_file"]))
+                    duplicates = [label for distance, label in close_pairs
+                                  if distance < DUPLICATE_ATOM_ANGSTROM]
+                    if duplicates:
+                        # Two atoms on one point have no direction to part in;
+                        # the force between them is not finite and no
+                        # minimizer moves them.
+                        result["errors"].append(
+                            "prepared structure has atoms on top of each other: "
+                            + "; ".join(duplicates[:6]) + (" ..." if len(duplicates) > 6 else "")
+                            + ". Either the deposit duplicates them or atoms completed for one "
+                            "piece landed on another; this cannot be minimized away."
+                        )
+                        result["code"] = "prepared_atoms_overlap"
+                        result["overall_status"] = "failed"
+                        return result
+                    if close_pairs:
+                        # Campaign v2 built and ran 47 such preps (heavy atoms
+                        # down to 0.44 A, hydrogens to 0.19 A); the capped
+                        # steepest descent before every minimization parts
+                        # them. Said here so a later blow-up can be traced.
+                        spelled = "; ".join(label for _d, label in close_pairs[:6])
+                        result["warnings"].append(
+                            f"prepared_close_contacts: {len(close_pairs)} atom pair(s) under "
+                            f"{CLOSE_CONTACT_ANGSTROM} A that no bond holds: {spelled}"
+                            + (" ..." if len(close_pairs) > 6 else "")
+                            + ". The topology build relaxes them before minimizing."
+                        )
+                        result.setdefault("warning_records", []).append({
+                            "code": "prepared_close_contacts",
+                            "pairs": [{"distance_angstrom": round(d, 2), "atoms": label}
+                                      for d, label in close_pairs[:50]],
+                            "count": len(close_pairs),
+                        })
+                    result["merged_pdb"] = merge_result["output_file"]
+                    result["merge_result"] = {
+                        "success": True,
+                        "output_file": merge_result["output_file"],
+                        "statistics": merge_result.get("statistics", {}),
+                        "chain_mapping": merge_result.get("chain_mapping", {}),
+                        "chain_mapping_entries": merge_result.get("chain_mapping_entries", []),
+                        "chain_identity_map_file": merge_result.get("chain_identity_map_file"),
+                    }
+                    prepared_source_index = _index_prepared_component_sources(
+                        chain_info_map=chain_info_map,
+                        proteins=result.get("proteins", []),
+                        nucleics=result.get("nucleics", []),
+                        glycans=result.get("glycans", []),
+                        ligands=result.get("ligands", []),
+                        ion_files=result.get("retained_ion_files", split_result.get("ion_files", [])),
+                    )
+                    chain_identity_map = _enrich_chain_identity_map(
+                        merge_result.get("chain_identity_map", {}),
+                        prepared_source_index,
+                    )
+                    if ligand_components:
+                        from .ligand_components import audit_converted_merge
+
+                        audit_converted_merge(result["ligands"], chain_identity_map, merge_result["output_file"])
+                    if coverage:
+                        from .residue_identity import audit_merged_identity
+
+                        identity_failures = audit_merged_identity(
+                            coverage, chain_identity_map, merge_result["output_file"])
+                        if identity_failures:
+                            result["chain_identity_map"] = chain_identity_map
+                            result["errors"].append(
+                                f"Merged source identity/connectivity mismatch: {identity_failures}")
+                            result["code"] = "residue_range_not_delivered"
+                            result["overall_status"] = "failed"
+                            return result
+                    result["chain_identity_map"] = chain_identity_map
+                    chain_identity_map_json = base_dir / "chain_identity_map.json"
+                    with open(chain_identity_map_json, "w") as f:
+                        json.dump(chain_identity_map, f, indent=2)
+                    result["chain_identity_map_file"] = str(chain_identity_map_json)
+                    logger.info(f"  ✓ Merged: {merge_result['output_file']}")
+                    logger.info(
+                        "  ↳ Wrote chain_identity_map.json "
+                        f"({len(chain_identity_map.get('components', []))} components)"
+                    )
+
+                    residue_mapping = _build_nucleic_residue_mapping(
+                        split_result=split_result,
+                        merge_result=merge_result,
+                    )
+                    result["residue_mapping"] = residue_mapping
+                    if residue_mapping:
+                        residue_mapping_json = base_dir / "residue_mapping.json"
+                        with open(residue_mapping_json, "w") as f:
+                            json.dump(residue_mapping, f, indent=2)
+                        result["residue_mapping_file"] = str(residue_mapping_json)
+                        logger.info(
+                            f"  ↳ Wrote residue_mapping.json ({len(residue_mapping)} nucleic residues)"
+                        )
+
+                    glycan_residue_mapping = _build_residue_mapping_for_type(
+                        split_result=split_result,
+                        merge_result=merge_result,
+                        chain_type="glycan",
+                    )
+                    result["glycan_residue_mapping"] = glycan_residue_mapping
+                    glycan_metadata = {
+                        "glycans": result.get("glycans", []),
+                        "residue_mapping": glycan_residue_mapping,
+                    }
+                    if glycan_residue_mapping:
+                        glycan_metadata_json = base_dir / "glycan_metadata.json"
+                        with open(glycan_metadata_json, "w") as f:
+                            json.dump(glycan_metadata, f, indent=2)
+                        result["glycan_metadata_file"] = str(glycan_metadata_json)
+                        logger.info(
+                            f"  ↳ Wrote glycan_metadata.json ({len(glycan_residue_mapping)} glycan residues)"
+                        )
+
+                    if result.get("glycans"):
+                        protein_chain_map_for_glycans = _build_source_to_merged_chain_map(
+                            chain_file_info=split_result.get("chain_file_info", []),
+                            proteins=result.get("proteins", []),
+                            merge_chain_mapping=merge_result.get("chain_mapping", {}),
+                        )
+                        remapped_links, dropped_links = _remap_glycan_linkages(
+                            selected_glycan_linkages,
+                            protein_chain_map_for_glycans,
+                            glycan_residue_mapping,
+                        )
+                        result["glycan_linkages"] = remapped_links
+                        if dropped_links:
+                            result["unmapped_glycan_linkages"] = dropped_links
+                            result["code"] = "covalent_glycan_selection_incomplete"
+                            result["errors"].append(
+                                "Covalently linked glycan component(s) could not be "
+                                "mapped onto merged.pdb: " + str(dropped_links)
+                            )
+                            result["overall_status"] = "failed"
+                            return result
+                        glycan_linkages_json = base_dir / "glycan_linkages.json"
+                        with open(glycan_linkages_json, "w") as f:
+                            json.dump(remapped_links, f, indent=2)
+                        result["glycan_linkages_file"] = str(glycan_linkages_json)
+                        logger.info(
+                            f"  ↳ Wrote glycan_linkages.json ({len(remapped_links)} linkages)"
+                        )
+
+                    # Apply merge_structures' chain reassignment to the PTM
+                    # detection list captured before cleaning. Without this,
+                    # `phosphorylate_residues --restore-from-detection` would
+                    # look up the source chain id against merged.pdb's
+                    # reassigned ids and either miss (multi-letter mmCIF
+                    # author chain truncated by split_molecules + reassigned
+                    # by merge_structures) or — worse — silently hit the
+                    # wrong residue.
+                    # merge_structures reassigns chain ids, so every site-keyed
+                    # list captured against the SOURCE chains must be remapped to
+                    # the merged ids before it is used or reported. Build the
+                    # source->merged map once and apply it to PTMs and disulfides.
+                    composite_map = _build_source_to_merged_chain_map(
+                        chain_file_info=split_result.get("chain_file_info", []),
+                        proteins=result.get("proteins", []),
+                        merge_chain_mapping=merge_result.get("chain_mapping", {}),
+                    )
+                    # The merged 1-char chain id is reused once the 62-id PDB
+                    # pool is exhausted (>62 chains), so it cannot uniquely
+                    # select a chain for site-keyed PTM edits. The topology
+                    # chain index never collides — carry it alongside so
+                    # phosphorylate_residues targets the right chain block.
+                    chain_index_map = _build_source_to_topology_index_map(
+                        chain_file_info=split_result.get("chain_file_info", []),
+                        proteins=result.get("proteins", []),
+                        chain_mapping_entries=merge_result.get(
+                            "chain_mapping_entries", []
+                        ),
+                    )
+                    # Stash for the protonation/histidine summary remap below
+                    # (that code runs in a scope where merge_result may be absent).
+                    result["_chain_remap_source_to_merged"] = composite_map
+                    if detected_ptm_residues:
+                        remapped, dropped = _remap_detected_ptm_chains(
+                            detected_ptm_residues,
+                            composite_map,
+                            chain_index_map,
+                        )
+                        if dropped:
+                            result["warnings"].append(
+                                "PTM residue(s) on source chains that did not "
+                                "make it into the merged PDB (likely excluded "
+                                f"by select_chains): {dropped}. They will not "
+                                "be available for `phosphorylate_residues "
+                                "--restore-from-detection`."
+                            )
+                        detected_ptm_residues = remapped
+
+                    # Disulfide pairs: _reconcile_cyx_cys_in_pdb below keys on
+                    # (chain, resnum) against the MERGED pdb, so the pair chain
+                    # ids must be merged ids (else a chain reassignment makes it
+                    # promote/demote the wrong CYS).
+                    if result.get("disulfide_bonds"):
+                        _remap_disulfide_chains(
+                            result["disulfide_bonds"], composite_map
+                        )
+
+                    # Reconcile CYS/CYX residue names against the
+                    # authoritative disulfide_bonds list. pdb2pqr does its
+                    # own geometric SS detection and may have left CYX
+                    # residues that our list does not include (or vice
+                    # versa). Without this step, `disulfide_pairs=[]`
+                    # would yield CYX residues in merged.pdb without a
+                    # corresponding SG-SG topology bond, leaving SG
+                    # atoms unprotonated.
+                    try:
+                        reconcile = _reconcile_cyx_cys_in_pdb(
+                            merge_result["output_file"],
+                            result.get("disulfide_bonds", []),
+                            ph=ph,
+                        )
+                        result["cys_cyx_reconciliation"] = reconcile
+                        if (
+                            reconcile["renamed_to_cys"]
+                            or reconcile["renamed_to_cyx"]
+                            or reconcile.get("stripped_hg_from_cyx", 0)
+                            or reconcile.get("rebuilt_hg_on_demoted_cys", 0)
+                        ):
+                            logger.info(
+                                f"  ↳ CYS/CYX reconciliation: "
+                                f"{reconcile['renamed_to_cyx']} promoted, "
+                                f"{reconcile['renamed_to_cys']} demoted, "
+                                f"{reconcile.get('stripped_hg_from_cyx', 0)} HG atoms stripped, "
+                                f"{reconcile.get('rebuilt_hg_on_demoted_cys', 0)} thiol H atoms rebuilt"
+                            )
+                        unresolved = reconcile.get("unresolved_endpoints") or []
+                        if unresolved:
+                            declared_here = disulfide_source == "user_override"
+                            origin = ("declared" if declared_here else
+                                      "detected (deposit SSBOND/_struct_conn or S-S distance)")
+                            result["errors"].extend(
+                                f"CYS/CYX reconciliation could not resolve a "
+                                f"{origin} disulfide endpoint: {problem}"
+                                for problem in unresolved
+                            )
+                            result["code"] = "disulfide_endpoint_unresolvable"
+                            if declared_here:
+                                result["next_action"] = (
+                                    "On a new prep node, name each declared cysteine as "
+                                    "<author chain>:<resnum>[icode] of a selected chain "
+                                    "(inspect_molecules lists them) or drop the pair.")
+                            else:
+                                # Not the caller's list: detection named a cysteine
+                                # the selection does not hold (a tool defect, now
+                                # guarded by the shared chain resolution).
+                                result["next_action"] = (
+                                    "This pair came from detection, not from your "
+                                    "arguments. On a new prep node pass --disulfide-pairs "
+                                    "listing the selected chains' disulfides explicitly "
+                                    "(inspect_molecules / disulfide_bonds.json name them), "
+                                    "and report the selection that produced it.")
+                            result["overall_status"] = "failed"
+                            return result
+                        # The invariant behind every route: a disulfide the
+                        # deposit shows on the delivered chains, or two sulfurs
+                        # at bonding distance, is formed -- or the caller named
+                        # it with form_bond false. 2DD8 (campaign v5) reached
+                        # MD with its heavy chain's SG-SG 2.03 A left as two CYS.
+                        written_authors = sorted({
+                            str(info.get("author_chain"))
+                            for info in split_result.get("chain_file_info", []) or []
+                            if info.get("chain_type") == "protein"
+                        })
+                        unformed = _unformed_disulfides_in_merged(
+                            merge_result["output_file"],
+                            result.get("disulfide_bonds", []),
+                            deposit_pairs=deposit_disulfides(
+                                structure_path, written_authors,
+                                chain_selection["range_windows_by_author"],
+                            ) if written_authors else [],
+                            chain_mapping_entries=merge_result.get("chain_mapping_entries") or [],
+                        )
+                        if unformed:
+                            result["unformed_disulfides"] = unformed
+                            result["errors"].append(
+                                "Disulfide(s) the deposit shows are not formed in the prepared "
+                                "structure: " + "; ".join(
+                                    f"{item['merged']} (merged ids"
+                                    + (f", source {item['source']}" if item.get("source") else "")
+                                    + (f", SG-SG {item['distance_angstrom']} A"
+                                       if item.get("distance_angstrom") is not None else "")
+                                    + f", {'/'.join(item['resnames'])})"
+                                    for item in unformed))
+                            result["code"] = "detected_disulfide_not_formed"
+                            result["next_action"] = (
+                                "Create a new prep node (this one is sealed) and pass "
+                                "--disulfide-pairs naming every disulfide of the selected "
+                                "chains in source author ids -- these with form_bond false "
+                                "only if they must stay reduced -- then report the selection "
+                                "that lost them.")
+                            result["overall_status"] = "failed"
+                            return result
+                    except Exception as e:
+                        result["errors"].append(
+                            f"CYS/CYX reconciliation failed: {type(e).__name__}: {e}"
+                        )
+                        result["code"] = "protonation_state_override_failed"
+                        result["overall_status"] = "failed"
+                        return result
+                else:
+                    result["warnings"].append(f"Merge failed: {merge_result.get('errors', [])}")
+                    result["merge_result"] = {"success": False, "errors": merge_result.get("errors", [])}
+                    logger.warning(f"  ✗ Merge failed: {merge_result.get('errors', [])}")
+            else:
+                result["warnings"].append("No files available to merge")
+        else:
+            result["warnings"].append(
+                "Skipping merge because required protein, nucleic, or glycan "
+                "preparation failed"
+            )
+        
+        result["success"] = proteins_ok and nucleics_ok and glycans_ok and ligands_ok
+        result["protein_preparation_success"] = proteins_ok
+        result["nucleic_preparation_success"] = nucleics_ok
+        result["glycan_preparation_success"] = glycans_ok
+        result["ligand_preparation_success"] = ligands_ok
+
+        # -- overall_status: workflow-level status for skill dispatch ------
+        failed_ligands = [
+            lig for lig in result.get("ligands", []) if not lig.get("success")
+        ]
+        if proteins_ok and nucleics_ok and glycans_ok and ligands_ok:
+            result["overall_status"] = "success"
+        elif proteins_ok and not ligands_ok:
+            result["overall_status"] = "completed_with_blocking_ligand_failure"
+            # A protein-only artifact was produced; the only failure is ligand
+            # chemistry. Stamp a stable code so the error contract does not
+            # flatten this into the generic ``unhandled_error`` ("fix and
+            # retry") advice, which is wrong here: the agent must instead follow
+            # workflow_recommendation.options (provide SMILES, exclude, stop).
+            if not result.get("code"):
+                result["code"] = "blocking_ligand_failure"
+        else:
+            result["overall_status"] = "failed"
+
+        # -- workflow_recommendation: deterministic options for the caller --
+        if failed_ligands and proteins_ok:
+            blocking = []
+            for lig in failed_ligands:
+                blocking.append({
+                    "ligand_id": lig.get("ligand_id"),
+                    "failure_class": lig.get("failure_class"),
+                    "ligand_class": lig.get("ligand_class"),
+                    "recommended_next_action": lig.get("recommended_next_action"),
+                })
+            # Collect unique next-actions
+            actions = {b["recommended_next_action"] for b in blocking
+                       if b["recommended_next_action"]}
+            options = []
+            if "provide_smiles_or_exclude_ligand" in actions:
+                options.append("provide_ligand_chemistry_and_rerun")
+            options.append("exclude_ligands_and_continue_protein_only")
+            if "hard_fail" in actions:
+                options.append("stop")
+            else:
+                options.append("stop")
+            result["workflow_recommendation"] = {
+                "blocking_ligands": blocking,
+                "options": options,
+            }
+
+        component_disposition = result.get("component_disposition") or _component_disposition_payload([])
+        component_entries = list(component_disposition.get("entries", []) or [])
+        excluded_components = {
+            "schema_version": component_disposition["schema_version"],
+            "summary": component_disposition["summary"],
+            "entries": [
+                entry for entry in component_entries
+                if entry.get("action_taken") == "excluded"
+            ],
+        }
+        component_disposition_json = base_dir / "component_disposition.json"
+        excluded_components_json = base_dir / "excluded_components.json"
+        with open(component_disposition_json, "w") as f:
+            json.dump(component_disposition, f, indent=2)
+        with open(excluded_components_json, "w") as f:
+            json.dump(excluded_components, f, indent=2)
+        result["component_disposition"] = component_disposition
+        result["component_disposition_summary"] = component_disposition["summary"]
+        result["component_disposition_file"] = str(component_disposition_json)
+        result["excluded_components_file"] = str(excluded_components_json)
+
+        # Aggregate provenance from all proteins into top-level summary
+        # so LLM can read it directly without digging into proteins[]
+        preparation_summary = {}
+        if result.get("source_structure_id"):
+            preparation_summary["source_structure_id"] = result["source_structure_id"]
+            preparation_summary["source_selection"] = result.get("source_selection") or {}
+        range_result = ((result.get("split") or {}).get("residue_ranges") or {})
+        if range_result.get("requested"):
+            preparation_summary["residue_range_groups"] = range_result.get(
+                "resolved_groups", []
+            )
+            preparation_summary["residue_range_component_sizes"] = range_result.get(
+                "component_sizes", []
+            )
+        preparation_summary["kept_residue_ranges"] = [
+            {key: entry.get(key) for key in ("chain_id", "author_chain", "chain_type",
+                                             "requested", "first", "last", "count",
+                                             "span", "gaps", "insertion_codes")}
+            for entry in result.get("kept_residue_ranges") or []
+        ]
+        preparation_summary["disulfide_pairs"] = result.get("disulfide_bonds", [])
+        # Surface the caps the input arrived with on the node itself, not only
+        # inside the per-chain records, so `inspect_job` shows them.
+        input_caps, caps_removed = [], []
+        for entry in (result.get("proteins") or []):
+            input_caps.extend(entry.get("input_terminal_caps") or [])
+            caps_removed.extend(entry.get("input_terminal_caps_removed") or [])
+        preparation_summary["input_terminal_caps"] = input_caps
+        preparation_summary["input_terminal_caps_removed"] = caps_removed
+        preparation_summary["protonation_method"] = protonation_method
+        preparation_summary["preserve_input_protonation"] = bool(
+            preserve_input_protonation)
+        preparation_summary["disulfide_detection_recorded"] = bool(
+            result.get("disulfide_source")
+        )
+        for p in result.get("proteins", []):
+            prov = p.get("provenance", {})
+            if prov:
+                for key, val in prov.items():
+                    if key == "histidine_states" and isinstance(val, dict):
+                        preparation_summary.setdefault("histidine_states", {}).update(val)
+                    elif key == "protonation_states" and isinstance(val, list):
+                        preparation_summary.setdefault("protonation_states", []).extend(val)
+                    elif key == "missing_residues_modeled" and val:
+                        preparation_summary.setdefault("missing_residues_modeled", []).extend(val)
+                    elif key == "missing_residues_count" and val:
+                        preparation_summary["missing_residues_count"] = \
+                            preparation_summary.get("missing_residues_count", 0) + val
+                    elif key not in preparation_summary:
+                        preparation_summary[key] = val
+        # Remap the aggregated protonation/histidine summaries from SOURCE chain
+        # ids to MERGED ids. The states were correctly APPLIED per-chain before
+        # merge, but reporting them under source chains makes the keys point at
+        # the wrong residue in merged.pdb for any consumer that re-applies them.
+        _cmap = result.get("_chain_remap_source_to_merged") or {}
+        if _cmap:
+            if isinstance(preparation_summary.get("protonation_states"), list):
+                _remap_protonation_state_chains(
+                    preparation_summary["protonation_states"], _cmap
+                )
+            if isinstance(preparation_summary.get("histidine_states"), dict):
+                preparation_summary["histidine_states"] = (
+                    _remap_histidine_state_chains(
+                        preparation_summary["histidine_states"], _cmap
+                    )
+                )
+        successful_proteins = [p for p in result.get("proteins", []) if p.get("success")]
+
+        # Aggregate what happened to missing residues across the chains. This
+        # belongs on the node, not only in the log: in autonomous or batch runs
+        # nobody reads stderr, and a rebuilt 30-residue loop is a structural
+        # decision the study rests on.
+        repairs = [
+            _remap_missing_residue_record(
+                protein,
+                protein["missing_residue_repair"],
+                _cmap,
+            )
+            for protein in successful_proteins
+            if protein.get("missing_residue_repair")
+        ]
+        # A complex-wide repair leaves nothing for the per-chain pass to report:
+        # the chains it hands on have no internal gaps left, so every per-chain
+        # record is empty and 58 rebuilt residues would reach neither the
+        # warnings nor confirmation_needed. Record it here instead, once, in the
+        # shape the rest of this block already understands.
+        complex_repair_record = result.get("complex_missing_residue_repair") or {}
+        if complex_repair_record.get("applied"):
+            summary = complex_repair_record.get("summary") or {}
+            repairs.append({
+                "method": "modeller",
+                "method_requested": missing_residue_method,
+                "method_used": "modeller",
+                "status": "modeled",
+                "scope": "complex",
+                "interface_context": "complex_context",
+                "chain_ids": complex_repair_record.get("chain_ids") or [],
+                **{k: v for k, v in summary.items() if k != "segments"},
+                "segments": summary.get("segments") or [],
+            })
+        detections = [
+            _remap_missing_residue_record(
+                protein,
+                protein["missing_residue_detection"],
+                _cmap,
+            )
+            for protein in successful_proteins
+            if protein.get("missing_residue_detection")
+        ]
+        result.pop("_chain_remap_source_to_merged", None)
+        if detections:
+            preparation_summary["missing_residue_detection"] = detections
+        if repairs:
+            preparation_summary["missing_residue_repair"] = repairs
+            preparation_summary["contains_predicted_terminal_residues"] = any(
+                repair.get("contains_predicted_terminal_residues")
+                or any(
+                    segment.get("location") in {"n_terminal", "c_terminal"}
+                    for segment in (repair.get("segments") or [])
+                )
+                for repair in repairs
+            )
+            modelled = [r for r in repairs if r.get("method") == "modeller"]
+            if modelled:
+                total = sum(int(r.get("total_residues") or 0) for r in modelled)
+                terminal_total = sum(
+                    int(segment.get("residue_count") or 0)
+                    for repair in modelled
+                    for segment in (repair.get("segments") or [])
+                    if segment.get("location") in {"n_terminal", "c_terminal"}
+                )
+                # Count chains, not records: a complex-wide repair is one record
+                # covering several chains, and counting records reported "across
+                # 1 chain(s)" for a two-chain rebuild.
+                repaired_chains = set()
+                for repair in modelled:
+                    ids = repair.get("chain_ids")
+                    if ids:
+                        repaired_chains.update(str(i) for i in ids)
+                    elif repair.get("chain_id") is not None:
+                        repaired_chains.add(str(repair["chain_id"]))
+                    else:
+                        repaired_chains.add(f"_record_{id(repair)}")
+                result.setdefault("warnings", []).append(
+                    f"MODELLER rebuilt {total} missing residue(s) "
+                    f"({terminal_total} terminal one-anchor prediction(s)) across "
+                    f"{len(repaired_chains)} chain(s); these coordinates are predicted, "
+                    "not experimental"
+                )
+                if len(successful_proteins) > 1 and not complex_repair_record.get("applied"):
+                    # Each chain is repaired from its own file, so a loop that
+                    # packs against a partner chain in the real complex is built
+                    # without ever seeing it. Only true when the complex-wide
+                    # pass did not run -- saying it after one did would describe
+                    # the opposite of what happened.
+                    result.setdefault("warnings", []).append(
+                        f"Gaps were rebuilt chain by chain in a {len(successful_proteins)}-chain "
+                        "structure: loops near a chain-chain interface were modeled "
+                        "without the partner chain present"
+                    )
+                    for repair in modelled:
+                        repair["interface_context"] = "chain_isolated"
+
+        n_caps = sorted({
+            p.get("n_terminal_cap")
+            for p in successful_proteins
+            if p.get("n_terminal_cap")
+        })
+        c_caps = sorted({
+            p.get("c_terminal_cap")
+            for p in successful_proteins
+            if p.get("c_terminal_cap")
+        })
+        cap_h_reports = [
+            p.get("terminal_cap_hydrogen_completion") or {}
+            for p in successful_proteins
+        ]
+        cap_h_reports = [r for r in cap_h_reports if r.get("success") and not r.get("skipped")]
+        if n_caps or c_caps or cap_h_reports:
+            preparation_summary["terminal_capping_recorded"] = True
+            if n_caps:
+                preparation_summary["n_terminal_cap"] = n_caps[0] if len(n_caps) == 1 else n_caps
+            if c_caps:
+                preparation_summary["c_terminal_cap"] = c_caps[0] if len(c_caps) == 1 else c_caps
+            preparation_summary["terminal_cap_hydrogen_completion_method"] = "openmm_modeller"
+            preparation_summary["terminal_cap_hydrogens_added"] = sum(
+                int(r.get("cap_hydrogens_added") or 0)
+                for r in cap_h_reports
+            )
+            cap_forcefields = sorted({
+                str(r.get("forcefield"))
+                for r in cap_h_reports
+                if r.get("forcefield")
+            })
+            cap_forcefield_xml = sorted({
+                str(r.get("forcefield_xml"))
+                for r in cap_h_reports
+                if r.get("forcefield_xml")
+            })
+            if cap_forcefields:
+                preparation_summary["terminal_cap_forcefield"] = (
+                    cap_forcefields[0] if len(cap_forcefields) == 1 else cap_forcefields
+                )
+            if cap_forcefield_xml:
+                preparation_summary["terminal_cap_forcefield_xml"] = cap_forcefield_xml
+        if result.get("nucleics"):
+            successful_nucleics = [n for n in result["nucleics"] if n.get("success")]
+            preparation_summary["has_nucleic"] = bool(successful_nucleics)
+            preparation_summary["nucleic_subtypes"] = sorted({
+                n.get("nucleic_subtype")
+                for n in successful_nucleics
+                if n.get("nucleic_subtype")
+            })
+            preparation_summary["nucleic_chains"] = [
+                {
+                    "chain_id": n.get("chain_id"),
+                    "author_chain": n.get("author_chain"),
+                    "nucleic_subtype": n.get("nucleic_subtype"),
+                    "hydrogen_rebuild_method": n.get("hydrogen_rebuild_method"),
+                    "nucleic_forcefield_xml": n.get("nucleic_forcefield_xml"),
+                    "hydrogens_added": n.get("hydrogens_added", 0),
+                }
+                for n in successful_nucleics
+            ]
+            preparation_summary["nucleic_hydrogen_rebuild_method"] = "openmm_modeller"
+            preparation_summary["nucleic_hydrogens_added"] = sum(
+                int(n.get("hydrogens_added") or 0)
+                for n in successful_nucleics
+            )
+            preparation_summary["nucleic_forcefield_xml"] = sorted({
+                n.get("nucleic_forcefield_xml")
+                for n in successful_nucleics
+                if n.get("nucleic_forcefield_xml")
+            })
+            residue_names = set()
+            for info in split_result.get("chain_file_info", []):
+                if info.get("chain_type") == "nucleic":
+                    chain_data = chain_info_map.get(info.get("chain_id"), {}).get("all_chain_data", {})
+                    res_data = chain_data.get("residue_names", {})
+                    if isinstance(res_data, dict):
+                        residue_names.update(res_data.get("unique_residues", []))
+                    elif isinstance(res_data, list):
+                        residue_names.update(res_data)
+            preparation_summary["nucleic_residue_names"] = sorted(residue_names)
+        if result.get("glycans"):
+            successful_glycans = [g for g in result["glycans"] if g.get("success")]
+            preparation_summary["has_glycan"] = bool(successful_glycans)
+            preparation_summary["glycan_chains"] = [
+                {
+                    "chain_id": g.get("chain_id"),
+                    "author_chain": g.get("author_chain"),
+                    "residue_names": g.get("residue_names", []),
+                }
+                for g in successful_glycans
+            ]
+            glycan_residue_names = set()
+            for gly in successful_glycans:
+                glycan_residue_names.update(gly.get("residue_names", []))
+            preparation_summary["glycan_residue_names"] = sorted(glycan_residue_names)
+            preparation_summary["glycan_linkage_count"] = len(result.get("glycan_linkages", []))
+        if detected_ptm_residues:
+            preparation_summary["detected_ptm_residues"] = detected_ptm_residues
+        if result.get("chain_identity_map"):
+            chain_identity_components = result["chain_identity_map"].get("components", [])
+            preparation_summary["chain_identity_map"] = {
+                "component_count": len(chain_identity_components),
+                "pdb_chain_ids_may_repeat": result["chain_identity_map"].get(
+                    "pdb_chain_ids_may_repeat", True
+                ),
+                "artifact": "chain_identity_map.json",
+            }
+        component_summary = result.get("component_disposition_summary") or {}
+        preparation_summary["component_disposition_recorded"] = bool(
+            result.get("component_disposition_file")
+        )
+        if solvent_type:
+            preparation_summary["prep_solvent_type"] = solvent_type
+        preparation_summary["experimental_isotope_atoms_excluded"] = int(
+            component_summary.get("experimental_isotope_atoms_excluded", 0)
+        )
+        preparation_summary["experimental_isotopes_excluded"] = (
+            preparation_summary["experimental_isotope_atoms_excluded"] > 0
+        )
+        preparation_summary["explicit_ion_components_excluded"] = len(
+            result.get("excluded_ion_files", [])
+        )
+        result["preparation_summary"] = preparation_summary
+
+        # -- confirmation_needed: structured block for HITL review --------
+        # Surface disulfide bonds and residue protonation states in one
+        # place so the skill can show them to the user before proceeding
+        # to solvation. Each block carries a `source` field so the skill
+        # can tell "auto_detected" from "user_override" and avoid prompting
+        # again when the caller already supplied an explicit value.
+        applied_his = preparation_summary.get("histidine_states", {}) or {}
+        applied_protonation = preparation_summary.get("protonation_states", []) or []
+        protonation_source = _confirmation_source_from_entries(
+            applied_protonation
+        )
+        histidine_source = (
+            "user_override"
+            if histidine_states
+            else "auto_detected"
+        )
+        confirmation_items = {
+            "disulfide_bonds": {
+                "source": result.get("disulfide_source", "auto_detected"),
+                "pairs": result.get("disulfide_bonds", []),
+            },
+            "histidine_states": {
+                "source": histidine_source,
+                "states": applied_his,
+            },
+            "protonation_states": {
+                "source": protonation_source,
+                "states": applied_protonation,
+            },
+        }
+        # Rebuilt residues belong here too: they are coordinates that were not
+        # measured, and everything downstream treats them the same as the ones
+        # that were.
+        missing_confirmation = _missing_residue_confirmation_block(
+            repairs,
+            detections,
+            missing_residue_method,
+        )
+        if missing_confirmation:
+            confirmation_items["missing_residues"] = missing_confirmation
+        if (
+            confirmation_items["disulfide_bonds"]["pairs"]
+            or applied_his
+            or applied_protonation
+            or confirmation_items.get("missing_residues")
+        ):
+            confirmation_items["policy"] = (
+                "In human_in_the_loop mode, present these values to the user "
+                "and confirm before invoking solvate_structure. In autonomous "
+                "mode, log and continue. When `source == user_override` the "
+                "skill may skip the prompt — the caller already made the "
+                "decision. Predicted missing-residue coordinates always require "
+                "confirmation regardless of `method_requested`. To change "
+                "auto-detected values, re-run "
+                "prepare_complex with --disulfide-pairs, --histidine-states, "
+                "or --protonation-states."
+            )
+            result["confirmation_needed"] = confirmation_items
+
+        # Write ligand_chemistry.json to the job root for auto-detection by
+        # build_amber_system. Prep owns ligand identity, coordinates,
+        # chemistry graph and coordinate provenance; topology owns ligand
+        # partial-charge assignment and GAFFTemplateGenerator force-field
+        # resolution.
+        ligand_chemistry = []
+        if result.get("ligands"):
+            ligand_chemistry = [
+                {
+                    "sdf": lig.get("sdf_file"),
+                    "sdf_file": lig.get("sdf_file"),
+                    "pdb": lig.get("prepared_pdb_file") or lig.get("pdb_file"),
+                    "coordinate_file": lig.get("prepared_pdb_file") or lig.get("pdb_file"),
+                    "ligand_instance_id": lig.get("ligand_instance_id"),
+                    "chain_id": lig.get("chain_id"),
+                    "author_chain": lig.get("author_chain"),
+                    "ligand_id": lig.get("ligand_id"),
+                    "residue_name": lig.get("residue_name", lig.get("ligand_id", "LIG")[:3].upper()),
+                    "resnum": lig.get("resnum"),
+                    "net_charge": lig.get("net_charge"),
+                    "charge_source": lig.get("charge_source"),
+                    "mol_formal_charge": lig.get("mol_formal_charge"),
+                    "expected_net_charge": lig.get("expected_net_charge"),
+                    "smiles": lig.get("smiles_used"),
+                    "smiles_original": lig.get("smiles_original"),
+                    "smiles_source": lig.get("smiles_source"),
+                    "protonation_method": lig.get("protonation_method"),
+                    "protonation_ph": lig.get("protonation_ph"),
+                    "smiles_protonated": lig.get("smiles_protonated"),
+                    "protonation_candidates": lig.get("protonation_candidates"),
+                    "source_conversion": lig.get("source_conversion"),
+                }
+                for lig in result["ligands"]
+                if lig.get("success") and lig.get("sdf_file")
+            ]
+            if ligand_chemistry:
+                ligand_chemistry_json = base_dir / "ligand_chemistry.json"
+                with open(ligand_chemistry_json, 'w') as f:
+                    json.dump(ligand_chemistry, f, indent=2)
+                result["ligand_chemistry"] = ligand_chemistry
+                logger.info(
+                    f"Wrote ligand_chemistry.json ({len(ligand_chemistry)} ligands) "
+                    f"to {ligand_chemistry_json}"
+                )
+
+        # Persist merged disulfide bond pairs (written even when empty so
+        # downstream consumers can distinguish "none" from "not recorded").
+        disulfide_json = base_dir / "disulfide_bonds.json"
+        with open(disulfide_json, 'w') as f:
+            json.dump(result.get("disulfide_bonds", []), f, indent=2)
+
+        # Save workflow summary
+        summary_file = out_dir / "prepare_complex_summary.json"
+        with open(summary_file, 'w') as f:
+            json.dump(result, f, indent=2, default=str)
+
+        n_prot = sum(1 for p in result['proteins'] if p['success'])
+        n_nuc = sum(1 for nuc in result['nucleics'] if nuc['success'])
+        n_gly = sum(1 for gly in result['glycans'] if gly['success'])
+        n_lig = sum(1 for lig in result['ligands'] if lig['success'])
+        logger.info(f"Complex preparation: overall_status={result['overall_status']}")
+        logger.info(f"  Proteins: {n_prot}/{len(result['proteins'])}")
+        logger.info(f"  Nucleics: {n_nuc}/{len(result['nucleics'])}")
+        logger.info(f"  Glycans: {n_gly}/{len(result['glycans'])}")
+        logger.info(f"  Ligands: {n_lig}/{len(result['ligands'])}")
+        if result.get("merged_pdb"):
+            logger.info(f"  Merged PDB: {result['merged_pdb']}")
+
+    except NodeSealedError:
+        # begin_node on a node sealed meanwhile: the CLI names the fix
+        # (node_terminal) instead of this tool recording it as a crash.
+        raise
+    except Exception as e:
+        error_msg = f"Error during complex preparation: {type(e).__name__}: {str(e)}"
+        result["errors"].append(error_msg)
+        result["overall_status"] = "failed"
+        logger.error(error_msg)
+
+    # Node state update
+    if _node_mode:
+        from mdclaw._node import complete_node, fail_node, update_job_summaries
+        if result.get("success") or result.get("overall_status") == "success":
+            proteins = result.get("proteins", [])
+            nucleics = result.get("nucleics", [])
+            glycans = result.get("glycans", [])
+            ligands = result.get("ligands", [])
+            artifacts = {}
+            if result.get("merged_pdb"):
+                # Register the file this run wrote. A node whose artifacts dir
+                # was already populated (an interrupted earlier run) gets a
+                # ``merge_2/`` directory, and the old hard-coded
+                # ``artifacts/merge/merged.pdb`` then pointed at a stale or
+                # missing file (campaign 2026-09-10, task 009_membrane_6jzh).
+                artifacts["merged_pdb"] = _node_relative_artifact(
+                    result["merged_pdb"], base_dir, "merge/merged.pdb"
+                )
+            lig_chemistry = [
+                {
+                    "sdf": lig.get("sdf_file"),
+                    "sdf_file": lig.get("sdf_file"),
+                    "pdb": lig.get("prepared_pdb_file") or lig.get("pdb_file"),
+                    "coordinate_file": lig.get("prepared_pdb_file") or lig.get("pdb_file"),
+                    "ligand_instance_id": lig.get("ligand_instance_id"),
+                    "chain_id": lig.get("chain_id"),
+                    "author_chain": lig.get("author_chain"),
+                    "ligand_id": lig.get("ligand_id"),
+                    "residue_name": lig.get("residue_name", lig.get("ligand_id", "LIG")[:3].upper()),
+                    "resnum": lig.get("resnum"),
+                    "net_charge": lig.get("net_charge"),
+                    "charge_source": lig.get("charge_source"),
+                    "mol_formal_charge": lig.get("mol_formal_charge"),
+                    "expected_net_charge": lig.get("expected_net_charge"),
+                    "smiles": lig.get("smiles_used"),
+                    "smiles_original": lig.get("smiles_original"),
+                    "smiles_source": lig.get("smiles_source"),
+                    "protonation_method": lig.get("protonation_method"),
+                    "protonation_ph": lig.get("protonation_ph"),
+                    "smiles_protonated": lig.get("smiles_protonated"),
+                    "protonation_candidates": lig.get("protonation_candidates"),
+                }
+                for lig in ligands if lig.get("success") and lig.get("sdf_file")
+            ]
+            if lig_chemistry:
+                artifacts["ligand_chemistry"] = lig_chemistry
+            # disulfide_bonds.json is always written (see above); register
+            # it as a node artifact so build_amber_system / analysis tools
+            # can auto-resolve it from the prep ancestor.
+            if (base_dir / "disulfide_bonds.json").exists():
+                artifacts["disulfide_bonds"] = "artifacts/disulfide_bonds.json"
+            if (base_dir / "component_disposition.json").exists():
+                artifacts["component_disposition"] = "artifacts/component_disposition.json"
+            if (base_dir / "excluded_components.json").exists():
+                artifacts["excluded_components"] = "artifacts/excluded_components.json"
+            if (base_dir / "residue_mapping.json").exists():
+                artifacts["residue_mapping"] = "artifacts/residue_mapping.json"
+            if (base_dir / "chain_identity_map.json").exists():
+                artifacts["chain_identity_map"] = "artifacts/chain_identity_map.json"
+            if (base_dir / "glycan_metadata.json").exists():
+                artifacts["glycan_metadata"] = "artifacts/glycan_metadata.json"
+            if (base_dir / "glycan_linkages.json").exists():
+                artifacts["glycan_linkages"] = "artifacts/glycan_linkages.json"
+            if result.get("source_selection_file"):
+                artifacts["source_selection"] = result["source_selection_file"]
+            # Keep the confirmation block on the node, not only in this
+            # result. stderr scrolls away and a batch job has no one reading
+            # it; three days later `inspect_job` still has to be able to say
+            # what protonation and disulfides this system was built with.
+            node_metadata = dict(result.get("preparation_summary", {}))
+            if result.get("confirmation_needed"):
+                node_metadata["confirmation_needed"] = result["confirmation_needed"]
+            complete_node(job_dir, node_id,
+                artifacts=artifacts,
+                metadata=node_metadata,
+                warnings=result.get("warnings", []))
+            update_job_summaries(job_dir,
+                system={
+                    "pdb_id": result.get("pdb_id"),
+                    "chains": [
+                        p.get("chain_id", "") for p in proteins
+                    ] + [
+                        n.get("chain_id", "") for n in nucleics
+                    ] + [
+                        g.get("chain_id", "") for g in glycans
+                    ],
+                    "num_residues": sum(
+                        p.get("statistics", {}).get("final_residues", 0)
+                        for p in proteins if p.get("success")),
+                    "nucleics": [
+                        {
+                            "chain_id": n.get("chain_id"),
+                            "nucleic_subtype": n.get("nucleic_subtype"),
+                        }
+                        for n in nucleics if n.get("success")
+                    ],
+                    "glycans": [
+                        {
+                            "chain_id": g.get("chain_id"),
+                            "residue_names": g.get("residue_names", []),
+                        }
+                        for g in glycans if g.get("success")
+                    ],
+                    "ligands": [lig["ligand_id"] for lig in ligands if lig.get("success")],
+                },
+                preparation=result.get("preparation_summary", {}))
+        else:
+            fail_node(job_dir, node_id,
+                      errors=result.get("errors", []),
+                      warnings=result.get("warnings", []),
+                      code=result.get("code"))
+
+    return result

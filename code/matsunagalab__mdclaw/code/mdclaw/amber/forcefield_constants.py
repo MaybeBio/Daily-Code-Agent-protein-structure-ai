@@ -1,0 +1,273 @@
+"""
+Amber Server — curated Amber → OpenMM System builder.
+
+Provides tools for:
+- ``build_amber_system``: load a prepared PDB through OpenFF Pablo, apply Amber
+  protein / nucleic / glycan / lipid / PTM force fields plus topology-time
+  ligand templates (``GAFFTemplateGenerator``), and emit a portable
+  ``system.xml`` +
+  ``topology.pdb`` + ``state.xml`` triple consumed by ``run_minimization`` /
+  ``run_equilibration`` / ``run_production``, plus a minimization report for
+  benchmark evidence.
+- Supporting both implicit (no PBC) and explicit (with PBC, optionally
+  membrane) solvent setups.
+- Handling protein-ligand complexes by consuming prep-stage
+  ``ligand_chemistry`` records; topology parameterizes the small molecules
+  with ``GAFFTemplateGenerator``.
+- Handling glycoproteins by converting deposited glycan residues to
+  Amber/GLYCAM notation at topology time, preserving the generated bond plan,
+  and completing only GLYCAM-specific hydrogens before System creation.
+
+The XML triple is the only topology contract on the run side; tleap and
+parm7/rst7 are not produced or consumed anywhere. AmberTools
+(``pdb4amber`` and ``cpptraj``) remain available for structure-preparation
+support; ligand parameterization is not a prep-stage mdclaw artifact.
+"""
+
+# Configure logging early to suppress noisy third-party logs
+import os
+import sys
+import xml.etree.ElementTree as ET
+from functools import lru_cache
+from importlib import resources
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from mdclaw._common import setup_logger  # noqa: E402
+
+logger = setup_logger(__name__)
+
+from pathlib import Path  # noqa: E402
+
+from mdclaw._common import (  # noqa: E402
+    BaseToolWrapper,
+)
+
+# Default output location, created when a tool writes there, not at import.
+WORKING_DIR = Path("outputs").resolve()
+
+# Initialize tool wrappers.
+# ``tleap`` is no longer used: the curated build path runs through
+# ``openmmforcefields.SystemGenerator`` and emits the modern
+# ``system.xml`` + ``topology.pdb`` + ``state.xml`` triple (PR3 of the
+# openmmforcefields-unification refactor). ``cpptraj`` is still used for
+# the GLYCAM ``prepareforleap`` glycan conversion stage; see
+# ``_prepare_glycam_pdb_with_cpptraj`` for context.
+cpptraj_wrapper = BaseToolWrapper("cpptraj")
+
+
+# =============================================================================
+# Force Field Mappings (based on Amber Manual 2024 recommendations)
+# =============================================================================
+
+
+PROTEIN_FORCEFIELDS = {
+    "ff14SB": "leaprc.protein.ff14SB",
+    "ff19SB": "leaprc.protein.ff19SB",
+    "ff14sb": "leaprc.protein.ff14SB",
+    "ff19sb": "leaprc.protein.ff19SB",
+    # Implicit solvent specific
+    "ff14SBonlysc": "leaprc.protein.ff14SBonlysc",
+    "ff14sbonlysc": "leaprc.protein.ff14SBonlysc",
+}
+
+# Phosphorylated-residue (SEP/TPO/PTR) libraries paired by Amber convention to
+# each protein forcefield. `phosaa19SB` was the Amber 2020+ refit for ff19SB;
+# `phosaa14SB` is the ff14SB-compatible version; `phosaa10` is the older
+# generic library and is used as a fallback.
+
+
+PHOSAA_LIBRARY_FOR_FF = {
+    "ff19SB": "leaprc.phosaa19SB",
+    "ff14SB": "leaprc.phosaa14SB",
+    "ff14SBonlysc": "leaprc.phosaa14SB",
+}
+
+
+@lru_cache(maxsize=1)
+def glycam_template_residue_names() -> frozenset[str]:
+    """Return the exact-case residue namespace shipped by GLYCAM_06j-1.
+
+    This is the sole MDClaw authority for post-``prepareforleap`` GLYCAM
+    template names.  It is intentionally derived from the installed force
+    field instead of copied into Python, so an openmmforcefields update cannot
+    silently make a hand-maintained list stale.
+    """
+    resource = resources.files("openmmforcefields").joinpath(
+        "ffxml",
+        "amber",
+        "GLYCAM_06j-1.xml",
+    )
+    with resource.open("rb") as handle:
+        root = ET.parse(handle).getroot()
+    names = frozenset(
+        residue.attrib["name"]
+        for residue in root.findall(".//Residue")
+        if residue.attrib.get("name")
+    )
+    if not names:
+        raise RuntimeError(
+            "GLYCAM_06j-1.xml contains no residue templates; "
+            "the installed openmmforcefields data is incomplete"
+        )
+    return names
+
+
+def is_glycam_template_residue(residue_name: str) -> bool:
+    """Match the force-field namespace exactly; GLYCAM residue case matters."""
+    return str(residue_name or "") in glycam_template_residue_names()
+
+
+_GLYCAM_LINKED_ASN_RESNAME = "NLN"
+
+
+WATER_FORCEFIELDS = {
+    "tip3p": "leaprc.water.tip3p",
+    "opc": "leaprc.water.opc",
+    "opc3": "leaprc.water.opc3",
+    "tip4pew": "leaprc.water.tip4pew",
+    "spce": "leaprc.water.spce",
+    # Case-insensitive aliases
+    "TIP3P": "leaprc.water.tip3p",
+    "OPC": "leaprc.water.opc",
+    "OPC3": "leaprc.water.opc3",
+    "TIP4PEW": "leaprc.water.tip4pew",
+    "SPCE": "leaprc.water.spce",
+    "SPC/E": "leaprc.water.spce",
+}
+
+# Ion parameters per water model (Amber Manual recommendations)
+# - TIP3P, TIP4PEW: Joung-Cheatham parameters
+# - OPC: Li-Merz 12-6 HFE set (best for OPC)
+# - OPC3: Li-Merz 12-6 normal usage set
+# - SPC/E: Joung-Cheatham parameters
+
+
+WATER_ION_PARAMS = {
+    "tip3p": "frcmod.ionsjc_tip3p",
+    "opc": "frcmod.ionslm_hfe_opc",  # Li-Merz HFE set recommended for OPC
+    "opc3": "frcmod.ionslm_126_opc3",
+    "tip4pew": "frcmod.ionsjc_tip4pew",
+    "spce": "frcmod.ionsjc_spce",
+}
+
+
+STANDARD_PROTEIN_RESIDUES = {
+    "ALA", "ARG", "ASN", "ASP", "CYS", "CYX", "GLN", "GLU", "GLY", "HIS",
+    "HID", "HIE", "HIP", "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER",
+    "THR", "TRP", "TYR", "VAL",
+}
+
+
+WATER_RESIDUES = {"HOH", "WAT", "H2O", "TIP", "TIP3", "OPC"}
+
+
+POLYPHOSPHATE_LIGANDS = {"AP5", "ATP", "ADP", "AMP", "GTP", "GDP", "NAD", "NAP"}
+
+
+NUCLEIC_FORCEFIELDS = {
+    "dna": "leaprc.DNA.OL15",
+    "rna": "leaprc.RNA.OL3",
+}
+
+
+GLYCAN_FORCEFIELDS = {
+    "auto": "leaprc.GLYCAM_06j-1",
+    "glycam06j": "leaprc.GLYCAM_06j-1",
+    "glycam_06j": "leaprc.GLYCAM_06j-1",
+    "glycam06j-1": "leaprc.GLYCAM_06j-1",
+    "glycam_06j-1": "leaprc.GLYCAM_06j-1",
+    "GLYCAM_06j-1": "leaprc.GLYCAM_06j-1",
+}
+
+
+# Protein-anchor templates in the GLYCAM XML are not carbohydrate residues.
+# Keep them protected when a GLYCAM-only operation is allowed to alter sugars.
+GLYCAM_LINKED_PROTEIN_RESNAMES = {"NLN", "OLS", "OLT", "OLP", "HYP", "CHYP"}
+
+# =============================================================================
+# Force Field Compatibility (based on Amber Manual 2024)
+# =============================================================================
+# ff19SB was developed with OPC water and is strongly recommended to use with OPC.
+# The Amber manual explicitly warns against using ff19SB with TIP3P.
+
+
+FORCEFIELD_WATER_COMPATIBILITY = {
+    "ff19SB": {
+        "recommended": ["opc"],  # Amber manual: "strongly recommend using ff19SB with OPC"
+        "acceptable": ["opc3", "tip4pew"],
+        "not_recommended": ["tip3p"],  # Amber manual: "TIP3P has serious limitations with ff19SB"
+    },
+    "ff14SB": {
+        "recommended": ["tip3p", "opc", "tip4pew"],
+        "acceptable": ["opc3", "spce"],
+        "not_recommended": [],
+    },
+    "ff14SBonlysc": {
+        # For implicit solvent (GB), ff14SBonlysc with igb=8 is recommended
+        "recommended": [],  # Typically used with implicit solvent
+        "acceptable": ["tip3p", "opc", "tip4pew"],
+        "not_recommended": [],
+    },
+}
+
+# Recommended combinations for different simulation types
+
+
+RECOMMENDED_COMBINATIONS = {
+    "explicit_protein": {
+        "forcefield": "ff19SB",
+        "water_model": "opc",
+        "reason": "Amber manual strongly recommends ff19SB with OPC water"
+    },
+    "explicit_legacy": {
+        "forcefield": "ff14SB",
+        "water_model": "tip3p",
+        "reason": "Well-tested combination for backward compatibility"
+    },
+    "implicit_protein": {
+        "forcefield": "ff14SBonlysc",
+        "gb_model": "igb=8",
+        "radii": "mbondi3",
+        "reason": "Best GB results with GBneck2 model"
+    },
+    "membrane": {
+        "forcefield": "ff19SB",
+        "water_model": "opc",
+        "lipid_ff": "lipid21",
+        "reason": "lipid21 is the recommended lipid force field"
+    },
+}
+
+
+# Every catalog entry the builder will accept, keyed by lowercased alias.
+#
+# Derived from ``PROTEIN_FORCEFIELDS`` rather than hand-listed, because the two
+# had drifted: the guardrail layer already passes ``legacy`` entries with a
+# warning ("ff99SBildn is a legacy force field. ... works but newer choices are
+# preferred") and blocks only ``obsolete`` ones against Amber25 manual section
+# 3.12, yet this map named three entries, so ff99SB / ff99SBildn / ff99SBnmr /
+# ff03.r1 / ff03ua were rejected as ``unknown_forcefield`` before their
+# guardrail ever ran, and the ``supported`` ff15ipq and fb15 were rejected too.
+# ``resolve_xml_bundle`` has always read the XML straight from the catalog, so
+# nothing else had to change.
+#
+# ``obsolete`` stays out: the catalog blocks ff99 / ff96 / ff94 on an external
+# authority, and a name that reaches the builder only to be refused downstream
+# is worse than one refused here.
+def _accepted_protein_forcefields() -> dict[str, str]:
+    from mdclaw.forcefield_catalog import PROTEIN_FORCEFIELDS
+
+    accepted: dict[str, str] = {}
+    for name, entry in PROTEIN_FORCEFIELDS.items():
+        if entry.status == "obsolete":
+            continue
+        accepted[name.lower()] = name
+        accepted[name.lower().replace(".", "")] = name
+    return accepted
+
+
+CANONICAL_PROTEIN_FORCEFIELDS = _accepted_protein_forcefields()
+
+# =============================================================================
+# Helper Functions
+# =============================================================================

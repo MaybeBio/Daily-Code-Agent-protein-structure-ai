@@ -1,0 +1,54 @@
+# Preserve and restore complete interface-score results
+
+Stage every original matched native file through ordinary Files inputs. Keep the
+original input sequences and producer identity/settings records, full confidence,
+summary, structure and token-map derivation together. OpenDDE needs native identity
+and original input roles. OpenFold3 needs its original native confidence and feature
+identity files as well as the exported JSON. Retain feature files as originals;
+scoring does not load their PT/pickle payloads. Preserve each handoff's relative
+layout when staging it. A host absolute path must be explicitly rebased in a
+separate workload handoff to its actual `/inputs` location; retain the original
+handoff beside that derivative.
+
+Write scores, checker reports and logs under `/workspace/interface-scores`,
+along with any native positional v3 text, by-residue and PyMOL files used for
+comparison. Preserve failed attempts and unavailable values. Scratch is
+disposable. Wait for every writer to finish, sync and require the flush state `saved`:
+
+Set `PROJECT` to the session's returned `project_id`.
+
+```sh
+ariax forge sync "$SESSION" --wait --timeout 1800 --json
+ariax forge files "$PROJECT" --path /inputs --json
+ariax forge files "$PROJECT" --path /workspace/interface-scores --json
+ariax forge link "$PROJECT" /workspace/interface-scores/af2.json --json
+```
+
+`files` lists immediate children; inspect each
+required subdirectory. Confirm that the complete registered input set and all
+workspace result/reference/log files are retained, with expected paths and byte
+counts. Saving just the final result JSON cannot restore its native evidence.
+Use project links to inspect/download current scientific files; later writes can change their bytes. Bulk output
+remains in private remote storage under the workstation storage policy.
+
+The [shared outputs guide](https://github.com/cytokineking/ariax-cli/blob/HEAD/agent-skills/skills/ariax-forge/outputs.md) supplies the ordinary authorized
+resume command and the distinction between same-project resume and a new project.
+A resume allocates normal billed compute and needs available authorization; this
+guide grants no extra allocation. Require current project files to load before command admission. Resume loads
+input and workspace files, starts with empty scratch, and performs no scientific replay.
+
+After resume, compare saved input/workspace paths and bytes to the recorded
+scientific evidence. Check the restored result explicitly, using its original availability
+expectation:
+
+```sh
+ariax forge run "$RESTORED_SESSION" --tool interface-scores --timeout-seconds 60 --json -- python3 /opt/interface-scores/check.py /workspace/interface-scores/af2.json --require-available
+ariax forge watch "$RESTORED_SESSION" "$RESTORED_CHECK_COMMAND_ID" --timeout 120 --json
+```
+
+Omit `--require-available` for a monomer or a case with recorded unavailable metrics.
+Compare stored directional metrics, aggregates, residue identities and reasons.
+Do not run `interface-scores` or prediction merely to reconstruct missing saved
+results. An explicit later scoring command needs its own fresh output path and
+retains its actual command ID. Inspect status after closing owned compute and
+confirm resource release.

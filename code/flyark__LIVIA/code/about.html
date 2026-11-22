@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <title>LIVIA — About</title>
+    <style>
+        html { scrollbar-gutter: stable; } * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f7fa; color: #333; }
+        .header { background: white; color: #1a5276; padding: 0.8rem 2rem 0.8rem; border-bottom: 1px solid #e8e8e8; }
+        .header h1 { font-size: 1.8rem; font-weight: 700; margin-bottom: 0.15rem; color: #1a5276; letter-spacing: -0.02em; }
+        .header p { font-size: 0.92rem; color: #6B6B6B; margin-bottom: 0.8rem; font-weight: 400; }
+        .header-links { display: flex; gap: 0.5rem 0.25rem; flex-wrap: wrap; }
+        .header-links a { position: relative; color: #555; text-decoration: none; font-size: 0.72rem; padding: 0.22rem 0.4rem; border: 1px solid #ddd; border-radius: 6px; transition: all 0.2s; background: #f8f9fa; }
+        .header-links a:hover { background: #2471A3; color: white; border-color: #2471A3; }
+        .header-links .new-tag { position: absolute; top: -7px; right: -3px; padding: 0 4px; border-radius: 6px; background: #B35A12; color: #fff; font-size: 8px; font-weight: 700; line-height: 11px; letter-spacing: 0.02em; pointer-events: none; }
+        .header-links a.active { background: #2471A3; color: white; border-color: #2471A3; cursor: default; }
+        .container { max-width: 1100px; margin: 0 auto; padding: 1.5rem; }
+        .container p a:not([class]), .container li a:not([class]), .container td a:not([class]) { text-decoration: underline; text-underline-offset: 2px; text-decoration-thickness: 1px; }   /* links in running text: more than color */
+
+        .tool-section { margin-bottom: 3rem; }
+        .tool-title { font-size: 1.4rem; color: #1a5276; margin-bottom: 1.5rem; padding-bottom: 0.5rem; border-bottom: 3px solid #2471A3; }
+
+        .step { display: flex; gap: 1.5rem; margin-bottom: 2rem; align-items: flex-start; }
+        .step-badge { flex-shrink: 0; width: 48px; height: 48px; border-radius: 50%; background: #2471A3; color: white; display: flex; align-items: center; justify-content: center; font-size: 1.3rem; font-weight: 700; }
+        .step-content { flex: 1; }
+        .step-content h3 { font-size: 1.05rem; color: #1a5276; margin-bottom: 0.4rem; }
+        .step-content p { font-size: 0.9rem; color: #555; line-height: 1.6; margin-bottom: 0.5rem; }
+        .step-content code { background: #e8f0fe; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.82rem; color: #1a5276; }
+
+        .mock-ui { background: white; border-radius: 12px; padding: 1.2rem; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-top: 0.8rem; position: relative; border: 2px solid #e0e0e0; }
+        .mock-ui.highlight { border-color: #E67E22; }
+        .mock-label { position: absolute; top: -12px; right: 12px; background: #E67E22; color: white; font-size: 0.7rem; font-weight: 700; padding: 0.15rem 0.6rem; border-radius: 4px; }
+        .mock-url { background: #f8f9fa; border: 2px solid #2471A3; border-radius: 8px; padding: 0.6rem 1rem; font-family: monospace; font-size: 0.8rem; color: #333; margin-bottom: 0.5rem; }
+        .mock-btn { display: inline-block; background: #2471A3; color: white; padding: 0.4rem 1.2rem; border-radius: 6px; font-weight: 600; font-size: 0.85rem; }
+        .mock-drop { border: 2px dashed #2471A3; border-radius: 12px; padding: 1.5rem; text-align: center; color: #2471A3; background: #eaf2f8; }
+
+        .mock-results { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; margin-top: 0.8rem; }
+        .mock-metric { background: #f8f9fa; border-radius: 8px; padding: 0.5rem; text-align: center; }
+        .mock-metric .val { font-size: 1.1rem; font-weight: 700; color: #2471A3; }
+        .mock-metric .lbl { font-size: 0.7rem; color: #6B6B6B; }
+
+        .mock-maps { display: flex; gap: 0.4rem; margin-top: 0.8rem; }
+        .mock-map { width: 80px; height: 80px; border-radius: 4px; border: 1px solid #ddd; position: relative; overflow: hidden; }
+        .mock-map canvas { width: 100%; height: 100%; }
+        .mock-map-label { font-size: 0.6rem; color: #6B6B6B; text-align: center; margin-top: 0.2rem; }
+
+        .mock-script { background: #1e1e2e; color: #cdd6f4; border-radius: 8px; padding: 0.8rem; font-family: monospace; font-size: 0.72rem; line-height: 1.5; margin-top: 0.8rem; max-height: 120px; overflow: hidden; }
+        .mock-script .cmd { color: #89b4fa; }
+        .mock-script .cmt { color: #9399B2; }
+
+        .arrow { color: #B35A12; font-size: 1.5rem; margin: 0 0.3rem; }
+        .tip { background: #fff3cd; border-left: 4px solid #ffc107; padding: 0.6rem 1rem; border-radius: 0 8px 8px 0; font-size: 0.85rem; color: #856404; margin-top: 0.8rem; }
+        .output-flow { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.8rem; }
+        .output-file { background: #f0f0f0; padding: 0.3rem 0.8rem; border-radius: 6px; font-family: monospace; font-size: 0.8rem; }
+        .output-file.cxc { border-left: 4px solid #2471A3; }
+        .output-file.pdb { border-left: 4px solid #E67E22; }
+        .output-file.cif { border-left: 4px solid #E67E22; }
+
+        .prereq { background: #eaf2f8; border-radius: 8px; padding: 1rem; margin-bottom: 2rem; }
+        .prereq h4 { color: #1a5276; margin-bottom: 0.5rem; }
+        .prereq ul { padding-left: 1.2rem; font-size: 0.9rem; color: #555; line-height: 1.8; }
+        .prereq a { color: #2471A3; }
+        @media (max-width: 600px) {   /* "What leaves your browser": one stacked card per row on a phone */
+            .data-table tr:first-child { display: none; }
+            .data-table tr { display: block; border-top: 1px solid #eee; padding: 0.45rem 0; }
+            .data-table td { display: block; border: none !important; padding: 0.12rem 0.2rem !important; }
+            .data-table td:first-child { font-weight: 600; color: #333; }
+            .data-table td:nth-child(2)::before { content: 'To: '; font-weight: 600; color: #1a5276; }
+            .data-table td:nth-child(3)::before { content: 'When: '; font-weight: 600; color: #1a5276; }
+        }
+
+        .subsection { background: white; border-radius: 12px; padding: 1.2rem 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 1.5rem; }
+        .subsection h3 { font-size: 1.05rem; color: #1a5276; margin-bottom: 0.6rem; }
+        .subsection p { font-size: 0.9rem; color: #555; line-height: 1.6; margin-bottom: 0.5rem; }
+
+        .quick-steps { counter-reset: qs; list-style: none; padding-left: 0; margin-top: 0.3rem; }
+        .quick-steps li { counter-increment: qs; position: relative; padding-left: 2.2rem; font-size: 0.88rem; color: #555; line-height: 1.7; margin-bottom: 0.4rem; }
+        .quick-steps li::before { content: counter(qs); position: absolute; left: 0; width: 22px; height: 22px; border-radius: 50%; background: #2471A3; color: white; font-size: 0.72rem; font-weight: 700; display: flex; align-items: center; justify-content: center; top: 0.15rem; }
+        .quick-steps li a { color: #2471A3; text-decoration: none; }
+        .quick-steps li a:hover { text-decoration: underline; }
+
+        .features-list { padding-left: 1.2rem; font-size: 0.88rem; color: #555; line-height: 1.8; margin-top: 0.3rem; }
+        .features-list li { margin-bottom: 0.2rem; }
+        .features-list ul { padding-left: 1.2rem; margin-top: 0.2rem; margin-bottom: 0.2rem; }
+
+        @media (max-width: 768px) {
+            .header { padding: 1rem; }
+            .header h1 { font-size: 1.2rem; }
+            .header-links { gap: 0.5rem 0.25rem; }
+            .header-links a { font-size: 0.72rem; padding: 0.15rem 0.4rem; }
+        }
+        .footer { text-align: center; padding: 1.5rem 2rem; font-size: 0.8rem; color: #707070; }
+        .footer a { color: #2471A3; text-decoration: none; }
+        .footer a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <div class="container" role="main">
+        <h1><span style="color:#2471A3;">LIVIA</span> &mdash; About</h1>
+        <p>Metric definitions, color schemes, and references</p>
+        <div class="header-links">
+            <a href="index.html">Home</a>
+            <a href="universal.html">Prediction Analysis</a>
+            <a href="flypredictome.html">FlyPredictome</a>
+            <a href="ortholog_predictome.html">Ortholog Interactome</a>
+            <a href="dimer.html">AFDB Dimer</a>
+            <a href="monomer.html">AFDB Monomer Subdomain</a>
+            <a href="clip.html">cLIP</a>
+            <a href="network.html">PPI Network</a>
+            <a href="https://flyark.github.io/livia-atlas/" target="_blank" rel="noopener">LIVIA Atlas<span class="new-tag">new</span></a>
+            <a href="tutorials.html">Tutorials</a>
+            <a href="about.html" class="active">About</a>
+            <a href="https://github.com/flyark/LIVIA" target="_blank">GitHub</a>
+        </div>
+    </div>
+</div>
+
+<div class="container">
+
+    <div class="prereq">
+        <ul>
+            <li>All analysis runs in your browser, and your files are never uploaded. To add names, domains and reported interactions, some pages look things up at public services: see <a href="#data">What leaves your browser</a></li>
+            <li>Tested in Google Chrome and Safari (macOS/iOS)</li>
+            <li>Generates visualization scripts for <a href="https://www.cgl.ucsf.edu/chimerax/download.html" target="_blank">ChimeraX</a> and <a href="https://pymol.org" target="_blank">PyMOL</a> (optional, for 3D structure export)</li>
+        </ul>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- WHAT LEAVES YOUR BROWSER (every outside request LIVIA makes; keep in step with the code) -->
+    <!-- ================================================================ -->
+    <div class="tool-section" id="data">
+        <h2 class="tool-title">What leaves your browser</h2>
+        <p style="font-size:0.9rem; color:#555; line-height:1.7;">LIVIA has no server for your data. Every file you load (structures, PAE and confidence files, lis.py CSVs, bundles) is read and analyzed in your browser and is never uploaded. To add names, domains and reported interactions, some pages look things up at public services. This is everything they send:</p>
+        <table class="data-table" style="width:100%; border-collapse:collapse; font-size:0.88rem; margin-top:0.6rem;">
+            <tr style="background:#f8f9fa;"><th style="text-align:left; padding:0.5rem 0.8rem; color:#1a5276;">What is sent</th><th style="text-align:left; padding:0.5rem 0.8rem; color:#1a5276;">To</th><th style="text-align:left; padding:0.5rem 0.8rem; color:#1a5276;">When</th></tr>
+            <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">A checksum of each chain&rsquo;s sequence (LIVIA&rsquo;s own index receives only its first three characters)</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">LIVIA&rsquo;s sequence index (flyark.github.io) and UniProt</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Prediction Analysis and cLIP, to name each chain</td></tr>
+            <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>A chain&rsquo;s amino-acid sequence</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">EBI BLAST (ebi.ac.uk)</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Prediction Analysis only, when you click <em>Identify by BLAST</em> beside a chain of 25 or more residues that no checksum or name lookup identifies (a construct or a fragment, for example); never automatically</td></tr>
+            <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">UniProt accessions</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">UniProt, InterPro and AlphaFold DB</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Once a chain is named, or for an ID you enter: gene names, domains (UniProt, Pfam, TED), pLDDT and AlphaMissense</td></tr>
+            <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">NCBI Gene IDs</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">MIST (flyrnai.org) and BioGRID, through LIVIA&rsquo;s proxy</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Reported Interactions, for the named chains</td></tr>
+            <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Gene names or IDs from your data</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">MyGene.info and UniProt</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">cLIP and PPI Network, when names are converted to gene symbols</td></tr>
+            <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">The address of a prediction you ask for</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">AlphaFold DB (directly over HTTPS from EBI, or via LIVIA&rsquo;s proxy if blocked/stalled); FlyPredictome (flyrnai.org) and Human Predictome (AWS S3), through LIVIA&rsquo;s proxy</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">AFDB Dimer, AFDB Monomer Subdomain, FlyPredictome, Ortholog Interactome, and archived models opened from LIVIA Atlas</td></tr>
+            <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">A page visit</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">GoatCounter</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Every page: anonymous visit counts, no cookies</td></tr>
+        </table>
+        <p style="font-size:0.9rem; color:#555; line-height:1.7; margin-top:0.8rem;">Nothing else leaves your browser: not your structures, not PAE or confidence values, not scores, and not the figures or scripts you download. LIVIA&rsquo;s proxies (a Cloudflare worker) only forward the requests above; the worker caches the public answers it fetches. The worker forwards only to an allow-list of hosts (flyrnai.org, AlphaFold DB, and OSF for prediction bundles that OSF serves without cross-origin headers) and adds the BioGRID access key itself, so the key is never in page code. To have a host added, open an issue on the <a href="https://github.com/flyark/LIVIA/issues" target="_blank" style="color:#2471A3;">LIVIA repository</a>; to run your own copy of the proxy, see <a href="https://github.com/flyark/LIVIA/tree/main/tools/cloudflare-worker" target="_blank" style="color:#2471A3;">tools/cloudflare-worker</a>. The pages also load their visualization libraries (such as Mol* and Plotly) from public CDNs. Where a page says &ldquo;upload&rdquo; (a FASTA, a structure, a list), it means loading the file into your browser; the file is not sent anywhere.</p>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- TOOL 2: UNIVERSAL -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">1. Prediction Analysis</h2>
+
+        <div class="subsection">
+            <h3>Quick Start</h3>
+            <ol class="quick-steps">
+                <li>Run a prediction using any supported platform (AlphaFold3, AlphaFold2, ColabFold, Boltz-1/2, Chai-1, OpenFold3, Protenix-v2, or ESMFold2)</li>
+                <li>Open <a href="universal.html">Prediction Analysis</a> and load your prediction files (.zip, .gz, .xz, .cif, .pdb, .json, .npz, .npy)</li>
+                <li>The tool auto-detects the prediction platform, shows the available models/ranks and starts the analysis on its own</li>
+                <li>Optionally change the PAE cutoff (default: 12 &Aring;) or C&beta; cutoff (default: 8 &Aring;) and click <strong>Process</strong> to re-run</li>
+                <li>Explore PAE/LIS/cLIS maps, score matrix, and chain pair table</li>
+                <li>Click a row in the chain pair table to generate a visualization script</li>
+                <li>Download the <code>.cxc</code> script and structure file, place them in the same folder, then open the script in ChimeraX or PyMOL</li>
+            </ol>
+        </div>
+
+        <div class="subsection">
+            <h3>Supported Platforms</h3>
+            <ul class="features-list">
+                <li><strong>AlphaFold3</strong> &mdash; .cif + summary_confidences + full_data JSON (from AlphaFold Server or local)</li>
+                <li><strong>AlphaFold2</strong> &mdash; ranked_*.pdb + PAE JSON (PAE must be pre-converted from .pkl)</li>
+                <li><strong>ColabFold</strong> &mdash; *_unrelaxed_rank_*.pdb + *_scores_rank_*.json</li>
+                <li><strong>Boltz-1/2</strong> &mdash; .pdb/.cif + confidence_*.json + pae_*.npz</li>
+                <li><strong>Chai-1</strong> &mdash; pred.rank_*.cif + scores.rank_*.json (PAE in JSON or .npy)</li>
+                <li><strong>OpenFold3</strong> &mdash; result_sample_*_model.pdb + confidences JSON</li>
+                <li><strong>Protenix-v2</strong> &mdash; *_sample_*.cif + *_summary_confidence_sample_*.json + *_full_data_sample_*.json</li>
+                <li><strong>ESMFold2</strong> &mdash; *_model.pdb + *_pae.json (biohub API), or a folder of .pdb/.cif with .npy/.npz PAE</li>
+                <li><strong>Tamarind Bio</strong> &mdash; output from any platform via Tamarind (auto-detected)</li>
+                <li><strong>Generic</strong> &mdash; any .cif/.pdb with a PAE JSON file</li>
+            </ul>
+        </div>
+
+        <div class="subsection">
+            <h3>Features</h3>
+            <ul class="features-list">
+                <li><strong>Auto-detection &amp; drag anywhere</strong> &mdash; automatically identifies the prediction platform from file names; drop files or folders anywhere on the window (full-window drop overlay)</li>
+                <li><strong>Compressed files &amp; fast parsing</strong> &mdash; accepts <code>.zip</code>, <code>.gz</code>, and <code>.xz</code> files in browser with Web Worker PAE parsing and zero-copy handoff from LIVIA Atlas</li>
+                <li><strong>Interactive PAE / LIS / cLIS maps</strong> &mdash; PAE (bwr), LIS (Blues; directional row &rarr; column), and contact-filtered cLIS (Greens) across all models, with live hover crosshair readouts (exact chain/residue pair and score) and click-to-highlight in the 3D viewer</li>
+                <li><strong>Multi-chain pair table &amp; shortcuts</strong> &mdash; filter by subunit or pair name, toggle <em>Best model per pair</em> with expandable model rows, and navigate with keyboard shortcuts (<code>&uarr;</code>/<code>&darr;</code> switch pair, <code>1</code>&ndash;<code>5</code> switch model, <code>i</code> isolate pair in 3D); viewing preferences persist in your browser</li>
+                <li><strong>Score matrix</strong> &mdash; lower-left and upper-right triangles are each independently selectable from iLIS, iLIA, iLISA, ipTM, ipSAE, actifpTM, LIS, cLIS, LIR, cLIR, pDockQ, LIpDockQ, pDockQ2 or LIpDockQ2, each with its own colormap (default: iLIS / iLISA)</li>
+                <li><strong>3D viewer (Mol*)</strong> &mdash; interactive LIR/cLIR coloring, chain toggles, <strong>Isolate selected pair</strong> mode, hover/click synchronization from 2D maps, and one-click <strong>PNG</strong> snapshot export</li>
+                <li><strong>Sequence viewer</strong> &mdash; amino acid letters with LIR/cLIR highlighting</li>
+                <li><strong>Chain identity</strong> &mdash; looks up each chain in UniProt by sequence and lists any domains found (<strong>Identify chains via UniProt</strong> button)</li>
+                <li><strong>Reported Interactions (<a href="https://www.flyrnai.org/MIST/" target="_blank" style="color:#2471A3;">MIST</a>)</strong> &mdash; once chain identity resolves, checks whether the pair is already reported as a physical or genetic interaction</li>
+                <li><strong>Linear Contact Map</strong> &mdash; lines connect cLIR residue pairs in physical contact, with optional UniProt/Pfam and TED domain tracks, pLDDT coloring, and reported-interaction (MIST) counts alongside</li>
+                <li><strong>Circular Contact Map</strong> &mdash; chord diagram with chain arcs sized by length, cLIR contact lines, and optional pLDDT, UniProt/Pfam, and TED domain rings, plus a Circos-style residue-position tick ruler; view a single model or all models combined</li>
+                <li><strong>Label Settings</strong> &mdash; shared panel controlling axis label mode (gene name or chain ID) and custom per-chain labels across the Score Matrix and the PAE/LIS/cLIS maps</li>
+                <li><strong>Color presets</strong> &mdash; gradient, high-contrast, solid, and coloring-mode (pLDDT, bychain, bypolymer) presets, plus per-residue custom chain colors via a pasted or uploaded CSV</li>
+                <li><strong>NPZ/NPY parser</strong> &mdash; reads Boltz PAE (.npz) and Chai-1 PAE (.npy) in browser</li>
+                <li><strong>Lightweight bundle</strong> &mdash; shrinks a prediction to a small, share-ready package (scores + structures + static PAE images, no numeric PAE), with adjustable PAE color scale, image size, and font scale &mdash; see <a href="#lightweight-bundle" style="color:#2471A3;">Lightweight Bundle</a> below for the command-line route, built-in 6&ndash;14-subunit examples, and the full format</li>
+                <li><strong>Exports</strong> &mdash; <code>.cxc</code>/<code>.pml</code> scripts, structure files, CSV with full metrics, one-click <strong>Copy Markdown</strong> summary, and ready-to-refold <strong>FASTA</strong>, <strong>AlphaFold 3 JSON</strong>, and <strong>Boltz-2 YAML</strong> inputs (full-length or interface-only)</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- ================================================================ -->
+    <!-- TOOL 1: FLYPREDICTOME -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">2. FlyPredictome Analysis</h2>
+
+        <div class="subsection">
+            <h3>Quick Start</h3>
+            <ol class="quick-steps">
+                <li>Open <a href="flypredictome.html">FlyPredictome Analysis</a> and search by gene name (<strong>Search by Gene</strong>) or by a gene pair (<strong>Gene Pair</strong>); or paste a FlyPredictome prediction page URL directly (<strong>Paste URL</strong>)</li>
+                <li>Click a result row to load that pair's analysis</li>
+                <li>Review the <strong>All Ranks</strong> table &mdash; click any row to switch between ranks 1&ndash;5</li>
+                <li>Explore metrics (iLIS, ipTM, LIR/cLIR counts), reported interactions (MIST), the sequence viewer, and the visualization script preview</li>
+                <li>Download the script (.cxc for ChimeraX or .pml for PyMOL) and structure file, place them in the same folder, then open the script in ChimeraX or PyMOL</li>
+            </ol>
+        </div>
+
+        <div class="subsection">
+            <h3>Features</h3>
+            <ul class="features-list">
+                <li><strong>Search by Gene / Gene Pair</strong> &mdash; look up a gene or a specific gene pair directly by name, with UniProt-backed autocomplete; the Gene Pair tab leaves out prediction sets whose pages do not load</li>
+                <li><strong>All Ranks table</strong> &mdash; shows iLIS, iLIA, iLISA, ipTM, pDockQ, LIpDockQ and LIR/cLIR counts for all five ranks, plus an average row; click any row to load that rank</li>
+                <li><strong>Sequence viewer</strong> &mdash; displays actual amino acid letters for each chain with LIR (light color) and cLIR (dark color) highlighting</li>
+                <li><strong>Reported Interactions (<a href="https://www.flyrnai.org/MIST/" target="_blank" style="color:#2471A3;">MIST</a>)</strong> &mdash; checks whether the pair is already reported as a physical or genetic interaction</li>
+                <li><strong>Visualization script</strong> &mdash; syntax-highlighted preview with color presets (Gradient, Solid, coloring modes); Swap A &harr; B button reverses chain colors</li>
+                <li><strong>Linear Contact Map</strong> &mdash; lines connect cLIR residue pairs in physical contact, with optional UniProt/Pfam and TED domain tracks, pLDDT coloring, and reported-interaction (MIST) counts alongside</li>
+                <li><strong>Circular Contact Map</strong> &mdash; chord diagram with chain arcs sized by length, cLIR contact lines, and optional pLDDT, UniProt/Pfam, and TED domain rings, plus a Circos-style residue-position tick ruler; view a single model or all models combined</li>
+                <li><strong>Downloads</strong> &mdash; .cxc script, .pdb structure, and CSV of all ranks with full metrics</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- ================================================================ -->
+    <!-- TOOL 5: ORTHOLOG INTERACTOME -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">3. Ortholog Interactome</h2>
+        <div class="subsection">
+            <h3>Quick Start</h3>
+            <ol class="quick-steps">
+                <li>Open <a href="ortholog_predictome.html">Ortholog Interactome</a> and search for a gene (e.g. <code>CDK2</code>, <code>TP53</code>) or a gene pair: the search opens it in the <a href="https://flyark.github.io/livia-atlas/" target="_blank">LIVIA Atlas</a>, which holds these screens</li>
+                <li>Or paste a FlyPredictome prediction page URL directly in the Paste URL tab</li>
+                <li>Review ranks, contact maps, 3D viewer, and visualization script</li>
+                <li>Download the script and structure file for ChimeraX or PyMOL</li>
+            </ol>
+        </div>
+        <div class="subsection">
+            <h3>Features</h3>
+            <ul class="features-list">
+                <li><strong>Gene search / Gene Pair</strong> &mdash; UniProt autocomplete with species selector (Human, Mouse, Zebrafish, Worm, Yeast); opens the gene's partners or the pair in the LIVIA Atlas</li>
+                <li><strong>Pre-built examples</strong> &mdash; CDK2&ndash;CCNA2, TP53&ndash;MDM2, MAPK14&ndash;MKNK1, ABL1&ndash;CRK, and more</li>
+                <li><strong>Reported Interactions (<a href="https://www.flyrnai.org/MIST/" target="_blank" style="color:#2471A3;">MIST</a>)</strong> &mdash; checks whether the pair is already reported as a physical or genetic interaction</li>
+                <li><strong>Circular Contact Map</strong> &mdash; chord diagram with chain arcs sized by length, cLIR contact lines, and optional pLDDT, UniProt/Pfam, and TED domain rings, plus a Circos-style residue-position tick ruler; view a single model or all models combined</li>
+                <li><strong>Full analysis pipeline</strong> &mdash; same as FlyPredictome (ranks, Linear Contact Map, Mol* viewer, scripts)</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- ================================================================ -->
+    <!-- TOOL 3: DIMER -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">4. AlphaFold DB Dimer Analysis</h2>
+
+        <div class="subsection">
+            <h3>Quick Start</h3>
+            <ol class="quick-steps">
+                <li>Open <a href="dimer.html">AlphaFold DB Dimer Analysis</a> and enter a UniProt ID (e.g. <code>P69905</code>), a model entity ID (e.g. <code>AF-0000000066214167</code>), or a full AlphaFold DB URL</li>
+                <li>Click <strong>Search Dimers</strong> &mdash; a table of available dimer complexes appears with LIS, ipTM, and ipSAE scores</li>
+                <li>Click a dimer row in the table to load it &mdash; the tool fetches CIF and PAE data from AlphaFold DB automatically</li>
+                <li>Review PAE/LIS/cLIS maps, sequence viewer, and metrics (iLIS, LIS, cLIS, ipTM, ipSAE)</li>
+                <li>Download the script (.cxc/.pml) and structure file, place them in the same folder, then open the script in ChimeraX or PyMOL</li>
+            </ol>
+        </div>
+
+        <div class="subsection">
+            <h3>Features</h3>
+            <ul class="features-list">
+                <li><strong>Flexible input</strong> &mdash; accepts UniProt ID, AlphaFold model entity ID, or full AlphaFold DB URL</li>
+                <li><strong>Dimer search table</strong> &mdash; lists all available dimer predictions for a protein with complex name, type, gene names, LIS, ipTM, and ipSAE; click any row to select</li>
+                <li><strong>Auto-fetch from AlphaFold DB</strong> &mdash; CIF structure and PAE matrix are fetched directly from the database</li>
+                <li><strong>PAE/LIS/cLIS maps</strong> &mdash; same colormaps as the Universal tool (bwr, Blues, Greens)</li>
+                <li><strong>Sequence viewer</strong> &mdash; amino acid letters with LIR (light) and cLIR (dark) highlighting per chain</li>
+                <li><strong>Reported Interactions (<a href="https://www.flyrnai.org/MIST/" target="_blank" style="color:#2471A3;">MIST</a>)</strong> &mdash; checks whether the pair is already reported as a physical or genetic interaction</li>
+                <li><strong>Linear Contact Map</strong> &mdash; lines connect cLIR residue pairs in physical contact, with optional UniProt/Pfam and TED domain tracks, pLDDT coloring, and reported-interaction (MIST) counts alongside</li>
+                <li><strong>Circular Contact Map</strong> &mdash; chord diagram with chain arcs sized by length, cLIR contact lines, and optional pLDDT, UniProt/Pfam, and TED domain rings, plus a Circos-style residue-position tick ruler; view a single model or all models combined</li>
+                <li><strong>Label Settings</strong> &mdash; shared panel controlling axis label mode (gene name or chain ID) and custom per-chain labels across the Score Matrix and the PAE/LIS/cLIS maps</li>
+                <li><strong>ipSAE metric</strong> &mdash; interaction prediction Score from Aligned Errors (<a href="https://www.biorxiv.org/content/10.1101/2025.02.10.637595" target="_blank" style="color:#2471A3;">Dunbrack, 2025</a>)</li>
+                <li><strong>actifpTM metric</strong> &mdash; actual interface pTM (<a href="https://doi.org/10.1093/bioinformatics/btaf107" target="_blank" style="color:#2471A3;">Varga et al., 2025</a>), approximate; marked actifpTM* in the tables</li>
+                <li><strong>Visualization script</strong> &mdash; color presets with Swap A &harr; B support</li>
+                <li><strong>Downloads</strong> &mdash; .cxc script, .cif structure, CSV with full metrics and LIR/cLIR indices</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- ================================================================ -->
+    <!-- TOOL 4: MONOMER -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">5. AlphaFold DB Monomer Subdomain Analysis</h2>
+
+        <div class="subsection">
+            <h3>Quick Start</h3>
+            <ol class="quick-steps">
+                <li>Open <a href="monomer.html">AlphaFold DB Monomer Subdomain Analysis</a> and enter a UniProt ID (e.g. <code>P31749</code>), gene symbol (e.g. <code>TP53</code>), or AlphaFold DB URL &mdash; autocomplete suggestions appear as you type</li>
+                <li>Click <strong>Fetch</strong> &mdash; the tool retrieves the PDB structure, PAE matrix, and domain annotations in parallel from AlphaFold DB and UniProt/InterPro</li>
+                <li>Regions are <strong>detected automatically</strong> from pLDDT and LIS; adjust the settings if needed (min length, merge LIS threshold, pLDDT cutoff, boundary margin)</li>
+                <li>Click <strong>Detect Regions</strong> to detect again with new settings, or edit region boundaries by hand</li>
+                <li>Review PAE/LIS/cLIS maps, the iLIS/iLISA score matrix between regions, and the sequence viewer</li>
+                <li>Download the script (.cxc/.pml) and structure file, place them in the same folder, then open the script in ChimeraX or PyMOL</li>
+            </ol>
+        </div>
+
+        <div class="subsection">
+            <h3>Features</h3>
+            <ul class="features-list">
+                <li><strong>Auto-fetch from AlphaFold Database</strong> &mdash; PDB structure and PAE matrix fetched directly by UniProt ID</li>
+                <li><strong>LIS/pLDDT-based domain detection</strong> &mdash; uses smoothed per-residue pLDDT scores and LIS between adjacent segments to automatically detect domain boundaries, with adjustable parameters:
+                    <ul>
+                        <li>Min region length (default: 15 residues)</li>
+                        <li>Merge LIS threshold (default: 0.35) &mdash; adjacent regions are merged when the LIS from one region to the next (edges trimmed by 2 residues) exceeds the threshold (higher = less merging)</li>
+                        <li>pLDDT cutoff (default: 50) &mdash; residues below this are treated as disordered linkers</li>
+                        <li>Boundary margin (default: 2) &mdash; residues left out at each region edge when iLIS is computed between regions, so adjacent regions are not scored on their shared boundary</li>
+                    </ul>
+                    Regions are segments of the chain, not annotated domains: compare them with the protein's UniProt or Pfam domains.
+                </li>
+                <li><strong>Intramolecular iLIS</strong> &mdash; iLIS between every pair of detected regions; the 10% FPR cutoff (0.223) was set for pairs of proteins, so for regions of one chain it is a guide, not a calibrated rate</li>
+                <li><strong>Score matrix</strong> &mdash; iLIS (lower-left) / iLISA (upper-right) between regions</li>
+                <li><strong>PAE/LIS/cLIS maps</strong> &mdash; same colormaps (bwr, Blues, Greens) with domain boundaries overlaid</li>
+                <li><strong>Circular Contact Map</strong> &mdash; chord diagram with a domain arc per detected subdomain, cLIR contact lines, an optional pLDDT ring, and a residue-position tick ruler</li>
+                <li><strong>Sequence viewer</strong> &mdash; amino acid letters with LIR (light) and cLIR (dark) highlighting per domain pair</li>
+                <li><strong>script presets</strong> &mdash; domain-colored view (default), pLDDT coloring, color by chain, color by polymer</li>
+                <li><strong>Downloads</strong> &mdash; .cxc script, .pdb structure, CSV with domain pair metrics</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- TOOL 6: cLIP -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">6. cLIP (clustered Local Interaction Profiler)</h2>
+
+        <div class="subsection">
+            <p>cLIP takes the output of a screen &mdash; one bait against many partners &mdash; and clusters the partners by <strong>which residues of the bait they contact</strong>. Partners that bind the same surface fall into the same cluster, so a large screen resolves into a handful of interaction modes. Everything runs in the browser from <code>lis.py</code> output; no structure files are required.</p>
+            <h3>Quick Start</h3>
+            <ol class="quick-steps">
+                <li>Open <a href="clip.html">cLIP</a> and drop your <code>lis.py</code> output (a CSV or a ZIP of CSVs). Add a FASTA in the same panel for exact sequences (optional) &mdash; or click a bundled example</li>
+                <li>Prediction names (FlyBase IDs, UniProt entry names, accessions) are auto-converted to gene symbols (mygene.info + UniProt); set a species if needed</li>
+                <li>Choose a query (bait) protein &mdash; the partner picker is scrollable and searchable. Optionally narrow the set with the subset picker</li>
+                <li>Click <strong>Generate</strong> &mdash; partners are clustered by shared contact residues (cLIR)</li>
+                <li>Review the clustered heatmap, contact-residue frequency, per-partner interface map, sequence viewer, 3D structure, and the interaction scatter</li>
+                <li>Download the filtered <code>lis.py</code> CSV, the paired FASTA, a self-contained report HTML, or SVG/PNG figures</li>
+            </ol>
+        </div>
+
+        <div class="subsection">
+            <h3>Features</h3>
+            <ul class="features-list">
+                <li><strong>Flexible input</strong> &mdash; a <code>lis.py</code> CSV or a ZIP of CSVs. Drop the lis.py output and a FASTA together; files are sorted by content automatically</li>
+                <li><strong>Name resolution</strong> &mdash; arbitrary prediction names are converted to gene symbols (mygene.info + UniProt), with a downloadable identity-map template for manual mapping</li>
+                <li><strong>Clustered fingerprint heatmap</strong> &mdash; partners (rows) &times; query residues (columns), clustered by shared cLIR contacts (cosine distance, average linkage; <em>k</em> by silhouette: the <em>k</em> before the first silhouette drop greater than 0.05, otherwise the maximum, at most 30); reorderable palettes</li>
+                <li><strong>Contact residue frequency</strong> &mdash; how often each query residue is a contact residue across predictions (each model of each partner; one per partner when that option is on), with three display modes: <strong>by cluster</strong> (each cluster&rsquo;s line over the combined total), <strong>all models</strong> (the combined total curve alone), and <strong>classic</strong> (bars colored by the dominant cluster), with pLDDT and (human) AlphaMissense tracks</li>
+                <li><strong>Interaction Residues</strong> &mdash; a per-partner interface map showing each protein's LIR/cLIR straight from the lis.py indices (no structure file needed), with UniProt domains overlaid</li>
+                <li><strong>Sequence viewer</strong> &mdash; full sequences with LIR/cLIR highlighting, grouped by ten and searchable (&#8984;F / Ctrl-F). Uses an uploaded FASTA, or falls back to UniProt canonical sequences with a caveat</li>
+                <li><strong>3D structure</strong> &mdash; query resolved from AlphaFold DB, residues colored by the cluster that consensus-contacts them; upload your own structure or set a UniProt accession manually to override</li>
+                <li><strong>Interaction scatter</strong> &mdash; plot any two metrics, plus a global-rank axis (rank by the selected metric across every prediction) and a rank-1-per-pair / every-prediction toggle; colored per prediction by cluster</li>
+                <li><strong>Subset picker</strong> &mdash; include or exclude partners before clustering, with a downloadable review list you can edit and re-upload</li>
+                <li><strong>Downloads</strong> &mdash; filtered <code>lis.py</code> CSV, paired FASTA, self-contained report HTML, and SVG/PNG figures</li>
+                <li><strong>Examples</strong> &mdash; bundled human kinase&times;TF and <em>Drosophila</em> TF&times;kinase screens, each with lis.py output and FASTA</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- TOOL 7: PPI NETWORK -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">7. PPI Network (Network Builder)</h2>
+
+        <div class="subsection">
+            <p>PPI Network turns an all-by-all screen into an interaction graph and finds communities of densely connected proteins. Community detection runs locally in the browser using LIVIA&rsquo;s WebAssembly graph engine &mdash; no server, no installation.</p>
+            <h3>Quick Start</h3>
+            <ol class="quick-steps">
+                <li>Open <a href="network.html">PPI Network</a> and drop your <code>lis.py</code> output (a CSV or a ZIP of CSVs); include a FASTA to carry sequences to cLIP (optional) &mdash; or try the example</li>
+                <li>Set the iLIS threshold and, optionally, an identity map or name conversion</li>
+                <li>Click <strong>Build network</strong> &mdash; Leiden community detection runs in your browser (WebAssembly)</li>
+                <li>Adjust the objective and resolution, the layout, and the coloring; rebuild with a node subset if needed</li>
+                <li>Export SVG, node/edge CSVs, or a Cytoscape file &mdash; or open any hub's interactome in cLIP</li>
+            </ol>
+        </div>
+
+        <div class="subsection">
+            <h3>Features</h3>
+            <ul class="features-list">
+                <li><strong>Same input as cLIP</strong> &mdash; a <code>lis.py</code> CSV or a ZIP of CSVs; a FASTA can be included (dropped alongside, or inside the ZIP) to carry sequences to cLIP</li>
+                <li><strong>Leiden communities in-browser</strong> &mdash; compiled WebAssembly graph engine, with a choice of modularity or CPM objective, adjustable resolution and seed</li>
+                <li><strong>iLIS threshold</strong> &mdash; edges kept at or above an adjustable iLIS cutoff, with FPR reference marks</li>
+                <li><strong>Identity map &amp; node subset</strong> &mdash; relabel nodes to your own names, or rebuild the network from a chosen subset of proteins</li>
+                <li><strong>Layouts &amp; styling</strong> &mdash; force and other layouts; color nodes by community, degree, or interaction strength (&Sigma; iLIS); adjustable node size and edge width</li>
+                <li><strong>Exports</strong> &mdash; SVG (current view or the full network), node/edge CSVs, and a Cytoscape file</li>
+                <li><strong>Hand-off to cLIP</strong> &mdash; open any hub's partners directly in cLIP for contact-residue clustering, carrying that node's sequences so the sequence viewer works immediately</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- TOOL 8: LIVIA ATLAS & MARKDOWN / PROGRAMMATIC EXPORT -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">8. LIVIA Atlas &amp; Programmatic Export</h2>
+
+        <div class="subsection">
+            <p><a href="https://flyark.github.io/livia-atlas/" target="_blank" rel="noopener">LIVIA Atlas</a> indexes proteome-scale AlphaFold-Multimer interaction screens across human, mouse, rat, fly, zebrafish, worm, yeast, viruses, and over 40 additional species, resolved to individual contact residues.</p>
+            <ul class="features-list">
+                <li><strong>Instant protein &amp; pair search</strong> &mdash; press <code>/</code> anywhere in the Atlas to search a single gene, UniProt/FlyBase ID, or type <strong>two names</strong> (e.g. <code>TP53 MDM2</code>) to jump straight to a pair page; aliases fall back to live UniProt synonym lookup</li>
+                <li><strong>In-browser cLIP &amp; 1D&ndash;3D sync</strong> &mdash; binding-site clustering runs in WebAssembly; switch Contact residue frequency between <strong>by cluster</strong>, <strong>all models</strong>, and <strong>classic</strong>; hover any residue on the frequency or fingerprint plot to highlight it live on the 3D AlphaFold DB structure</li>
+                <li><strong>Multi-span &amp; motif residue lookup</strong> &mdash; query a single residue, comma-separated ranges (<code>10-19,188-202</code>), peptide sequences, or PROSITE/ELM motifs (<code>LXXLL</code>, <code>[ST]P</code>) on both protein and pair pages, preserved in shareable URLs</li>
+                <li><strong>Fast archive handoff to LIVIA</strong> &mdash; open AlphaFold Database release archive models or Human Predictome models directly in <a href="universal.html">Prediction Analysis</a> via byte-range streaming (reading only the needed CIF and PAE bytes, never the full archive)</li>
+                <li><strong>One-click Copy Markdown &amp; JavaScript API</strong> &mdash; every LIVIA analysis page and every Atlas protein, pair, and network view includes a <strong>Copy Markdown</strong> button for structured summaries, alongside read-only browser APIs (<code>window.LIVIA</code>, <code>window.LIVIA_ATLAS</code>) and machine-readable navigation guides (<a href="llms.txt">LIVIA llms.txt</a>, <a href="https://flyark.github.io/livia-atlas/llms.txt" target="_blank" rel="noopener">Atlas llms.txt</a>)</li>
+            </ul>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- LIR DISPLAY OPTIONS -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">LIR Display Options</h2>
+        <div class="subsection">
+            <p>All tools include adjustable LIR display settings that affect the visualization script and 3D viewer:</p>
+            <ul class="features-list">
+                <li><strong>Gap filling</strong> (default: 10 residues) &mdash; bridges short breaks between LIR regions for continuous cartoon display.</li>
+                <li><strong>Min segment</strong> (default: 3 residues) &mdash; removes isolated LIR fragments shorter than the threshold. cLIR residues within removed segments are also removed.</li>
+            </ul>
+            <p style="margin-top:0.5rem; font-size:0.85rem; color:#6B6B6B;">Click <strong>Apply</strong> after changing values to update the visualization script and 3D viewer.</p>
+        </div>
+    </div>
+    <!-- SEQUENCE VIEWER -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">Sequence Viewer</h2>
+
+        <div class="subsection">
+            <p>The analysis tools include a <strong>sequence viewer</strong> that displays the actual amino acid sequence (one-letter codes) for each chain or domain. Residues are color-coded based on their interaction status:</p>
+            <div style="display:flex; gap:1.5rem; margin:0.8rem 0; flex-wrap:wrap;">
+                <div style="display:flex; align-items:center; gap:0.5rem;"><div style="width:60px; height:24px; background:#80CBC4; border-radius:4px; border:1px solid #ccc; text-align:center; font-family:monospace; font-size:0.8rem; line-height:24px;">A K L</div><span style="font-size:0.85rem;">LIR residues (light color)</span></div>
+                <div style="display:flex; align-items:center; gap:0.5rem;"><div style="width:60px; height:24px; background:#00776B; border-radius:4px; text-align:center; font-family:monospace; font-size:0.8rem; line-height:24px; color:white; font-weight:700;">R D E</div><span style="font-size:0.85rem;">cLIR residues (dark color, bold white)</span></div>
+                <div style="display:flex; align-items:center; gap:0.5rem;"><div style="width:60px; height:24px; background:#f0f0f0; border-radius:4px; text-align:center; font-family:monospace; font-size:0.8rem; line-height:24px; color:#707070;">G P S</div><span style="font-size:0.85rem;">Non-interacting residues</span></div>
+            </div>
+            <p>Residue numbering is shown at intervals. The viewer scrolls horizontally for long sequences. In <a href="clip.html">cLIP</a> the sequence is grouped by ten and stays searchable (&#8984;F / Ctrl-F), and when no FASTA is loaded it falls back to the UniProt canonical sequence.</p>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- COLOR SCHEMES -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">Color Scheme Reference</h2>
+
+        <div class="subsection">
+            <h3>Map Colormaps</h3>
+            <p>PAE, LIS and cLIS maps use fixed colormaps, not affected by the color presets. The Score Matrix shows iLIS (lower-left, Oranges) and iLISA (upper-right, Greens) by default; each triangle's metric and colormap can be changed.</p>
+            <table style="width:100%; border-collapse:collapse; font-size:0.9rem; margin-top:0.5rem;">
+                <tr style="background:#f8f9fa;"><th style="text-align:left; padding:0.5rem 0.8rem; color:#1a5276;">Map</th><th style="text-align:left; padding:0.5rem 0.8rem; color:#1a5276;">Colormap</th><th style="text-align:left; padding:0.5rem 0.8rem; color:#1a5276;">Scale</th></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>PAE map</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><span style="color:#2471A3;">blue</span> &ndash; white &ndash; <span style="color:#c0392b;">red</span> (bwr)</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">0 &Aring; (confident) &rarr; 30 &Aring; (uncertain)</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>LIS map</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">matplotlib <span style="color:#2471A3;">Blues</span></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">0 &rarr; 1 (higher = stronger interaction)</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>cLIS map</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">matplotlib <span style="color:#1E7E46;">Greens</span></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">0 &rarr; 1 (higher = stronger contact-filtered interaction)</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>Score matrix (iLIS, default)</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">matplotlib <span style="color:#B35A12;">Oranges</span> (selectable)</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Lower-left triangle</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>Score matrix (iLISA, default)</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">matplotlib <span style="color:#1E7E46;">Greens</span> (selectable)</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Upper-right triangle</td></tr>
+            </table>
+        </div>
+
+        <div class="subsection">
+            <h3>Visualization Script Colors</h3>
+            <p>The visualization script (.cxc for ChimeraX, .pml for PyMOL) uses chain colors that you can customize via presets. The default is Teal/Coral gradient.</p>
+            <div style="display:flex; gap:1rem; margin-top:0.8rem; flex-wrap:wrap;">
+                <div style="display:flex; align-items:center; gap:0.5rem;"><div style="width:24px; height:24px; background:#80CBC4; border-radius:4px; border:1px solid #ccc;"></div><span style="font-size:0.85rem;">Chain A &mdash; LIR (light teal)</span></div>
+                <div style="display:flex; align-items:center; gap:0.5rem;"><div style="width:24px; height:24px; background:#00897B; border-radius:4px;"></div><span style="font-size:0.85rem;">Chain A &mdash; cLIR (dark teal)</span></div>
+                <div style="display:flex; align-items:center; gap:0.5rem;"><div style="width:24px; height:24px; background:#FFAB91; border-radius:4px; border:1px solid #ccc;"></div><span style="font-size:0.85rem;">Chain B &mdash; LIR (light coral)</span></div>
+                <div style="display:flex; align-items:center; gap:0.5rem;"><div style="width:24px; height:24px; background:#E64A19; border-radius:4px;"></div><span style="font-size:0.85rem;">Chain B &mdash; cLIR (dark coral)</span></div>
+            </div>
+            <ul class="features-list" style="margin-top:0.8rem;">
+                <li><strong>Gradient</strong> &mdash; light color for LIR, dark color for cLIR (e.g., Blue/Orange, Purple/Gold, Teal/Coral)</li>
+                <li><strong>Solid</strong> &mdash; same color for both LIR and cLIR</li>
+                <li><strong>Named colors</strong> &mdash; familiar colors (Cornflower/Tomato, SkyBlue/Gold, etc.)</li>
+                <li><strong>Multi-chain (tab10)</strong> &mdash; auto-assigned distinct colors per chain, shown for complexes with more than 2 chains</li>
+                <li><strong>Swap A &harr; B</strong> button &mdash; reverses chain colors without changing the color combination</li>
+            </ul>
+        </div>
+
+        <div class="subsection">
+            <h3>Coloring Mode Presets</h3>
+            <p>The Monomer tool provides additional coloring presets beyond the default domain-colored view:</p>
+            <ul class="features-list">
+                <li><strong>pLDDT coloring</strong> &mdash; colors residues by AlphaFold confidence: <span style="display:inline-block; width:0.8em; height:0.8em; border-radius:2px; background:#0053D6; vertical-align:-1px; margin-right:3px;"></span><b>very high (&gt;90)</b>, <span style="display:inline-block; width:0.8em; height:0.8em; border-radius:2px; background:#65CBF3; vertical-align:-1px; margin-right:3px;"></span><b>confident (70&ndash;90)</b>, <span style="display:inline-block; width:0.8em; height:0.8em; border-radius:2px; background:#FFDB13; vertical-align:-1px; margin-right:3px;"></span><b>low (50&ndash;70)</b>, <span style="display:inline-block; width:0.8em; height:0.8em; border-radius:2px; background:#FF7D45; vertical-align:-1px; margin-right:3px;"></span><b>very low (&le;50)</b></li>
+                <li><strong>color bychain</strong> &mdash; chain coloring</li>
+                <li><strong>color bypolymer</strong> &mdash; polymer coloring</li>
+            </ul>
+        </div>
+
+        <div class="subsection">
+            <h3>Applying Color Changes</h3>
+            <p>Color presets and custom colors update the visualization script (ChimeraX/PyMOL) automatically when you select a preset. The PAE/LIS/cLIS maps use fixed colorscales and are not affected by color choices.</p>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- METRICS -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">Score Metrics</h2>
+
+        <div style="margin-bottom:1.5rem;">
+            <table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
+                <tr style="background:#f8f9fa;"><th style="text-align:left; padding:0.5rem 0.8rem; color:#1a5276;">Metric</th><th style="text-align:left; padding:0.5rem 0.8rem; color:#1a5276;">Full Name</th><th style="text-align:left; padding:0.5rem 0.8rem; color:#1a5276;">Definition</th></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>iLIS</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">integrated LIS</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">&radic;(LIS &times; cLIS) &mdash; geometric mean of LIS and cLIS; balanced score combining the confident residue pairs (PAE &le; 12 &Aring;) and those also in contact (C&beta; &le; 8 &Aring;)</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>LIS</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Local Interaction Score</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Average of inversely scaled PAE (0&ndash;1, higher is better) within LIA</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>cLIS</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">contact-filtered LIS</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Average of inversely scaled PAE within cLIA (contact-filtered)</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>LIR</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Local Interaction Residues</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Residues in the confident interaction region (PAE &le; 12 &Aring;)</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>cLIR</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">contact residues (LIR also in contact)</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Residues in direct physical contact (PAE &le; 12 &Aring; &amp; C&beta; &le; 8 &Aring;)</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>LIA</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Local Interaction Area</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Confident interaction area (PAE &le; 12 &Aring;)</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>cLIA</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">contact-filtered LIA</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Confident interaction area within contact distance (PAE &le; 12 &Aring; &amp; C&beta; &le; 8 &Aring;)</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>iLIA</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">integrated LIA</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">&radic;(LIA &times; cLIA) &mdash; geometric mean of LIA and cLIA, the confident residue pairs counted in each direction (a pair confident both ways counts twice); reflects interface size weighted by contact density</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>iLISA</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">integrated LIS-area</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">iLIS &times; iLIA &mdash; composite score combining interface confidence (iLIS) with interface size (iLIA); useful for ranking large vs. small interfaces of comparable confidence (not an affinity)</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>pDockQ</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">predicted DockQ</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">The original formula (<a href="https://doi.org/10.1038/s41467-022-28865-w" target="_blank" style="color:#2471A3;">Bryant et al., 2022</a>): interface pLDDT and the number of contacting residue pairs (C&beta; &le; 8&nbsp;&Aring;), with no PAE</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>LIpDockQ</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Local Interaction-derived pDockQ</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">The pDockQ formula computed only on <strong>cLIR</strong> pairs, so contacts the PAE does not support no longer count (<a href="https://doi.org/10.64898/2026.05.01.721633" target="_blank" style="color:#2471A3;">Kim &amp; Perrimon, 2026</a>)</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>pDockQ2</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">predicted DockQ v2</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">The original formula (<a href="https://doi.org/10.1093/bioinformatics/btad424" target="_blank" style="color:#2471A3;">Zhu et al., 2023</a>): each contact of the C&alpha;-based interface weighted by its PAE</td></tr>
+                <tr><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;"><strong>LIpDockQ2</strong></td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">Local Interaction-derived pDockQ2</td><td style="padding:0.5rem 0.8rem; border-top:1px solid #eee;">The pDockQ2 formula computed only on <strong>cLIR</strong> pairs, so a small confident interface is not diluted by a large, poorly placed contact surface (<a href="https://doi.org/10.64898/2026.05.01.721633" target="_blank" style="color:#2471A3;">Kim &amp; Perrimon, 2026</a>)</td></tr>
+            </table>
+        </div>
+
+        <div style="margin-bottom:1rem;">
+            <p style="font-size:0.9rem; color:#555; line-height:1.6;">
+                <strong>Default cutoffs:</strong> PAE &le; <strong>12 &Aring;</strong> (confident interaction) and C&beta; &le; <strong>8 &Aring;</strong> (direct contact). These can be adjusted before processing in the Prediction Analysis, AFDB Dimer and AFDB Monomer Subdomain tools.
+            </p>
+            <p style="font-size:0.9rem; color:#555; line-height:1.6; margin-top:0.5rem;">
+                <strong>PAE transformation:</strong> For each inter-chain residue pair (i, j), the PAE value is converted to a confidence score: <code>confidence = 1 &minus; (PAE / cutoff)</code> if PAE &le; cutoff, otherwise 0. This linearly maps PAE = 0 &Aring; to confidence = 1.0 (highest) and PAE = cutoff to 0. The PAE cutoff of 12 &Aring; was determined by ROC analysis to maximize AUC (<a href="https://doi.org/10.1101/2024.02.19.580970" target="_blank" style="color:#2471A3;">Kim et al., 2024</a>).
+            </p>
+            <p style="font-size:0.9rem; color:#555; line-height:1.6; margin-top:0.5rem;">
+                <strong>LIS calculation:</strong> <strong>LIA</strong> (Local Interaction Area) counts the inter-chain residue pairs with PAE &le; cutoff in each direction (a pair confident both ways counts twice). <strong>LIS</strong> is computed separately for A&rarr;B and B&rarr;A, each as the mean confidence (1 &minus; PAE/cutoff) over that direction's pairs with PAE &le; cutoff, and the two directional values are averaged. <strong>cLIA</strong> further restricts to pairs also in physical contact (C&beta; &le; 8 &Aring;), and <strong>cLIS</strong> is the mean confidence within cLIA. PAE itself is not symmetrized. <strong>iLIS</strong> = &radic;(LIS &times; cLIS), combining interface confidence with direct contact evidence into a single robust metric (Kim et al., 2026). Two derived size-weighted metrics are also reported for completeness: <strong>iLIA</strong> = &radic;(LIA &times; cLIA) summarizes interface size, and <strong>iLISA</strong> = iLIS &times; iLIA combines interface confidence with size. These secondary metrics may help differentiate predictions with similar iLIS but different interface sizes.
+            </p>
+            <p style="font-size:0.9rem; color:#555; line-height:1.6; margin-top:0.5rem;">
+                <strong>Additional confidence metrics:</strong> <strong>ipSAE</strong> (interaction prediction Score from Aligned Errors; <a href="https://doi.org/10.1101/2025.02.10.637595" target="_blank" style="color:#2471A3;">Dunbrack, 2025</a>) scores inter-chain residue pairs with PAE below 10 &Aring; (no distance filter) with a pTM-like function, d0 set per residue from its count of partner residues with PAE below 10 &Aring;; the score is the maximum over residues, and LIVIA reports the larger of the two directions (chain A to B, chain B to A). <strong>actifpTM</strong> (actual interface pTM; <a href="https://doi.org/10.1093/bioinformatics/btaf107" target="_blank" style="color:#2471A3;">Varga et al., 2025</a>): LIVIA and lis.py report an approximation, the TM-score transform of the PAE over residue pairs in contact (C&beta; cutoff), best residue in either direction, in place of the published weighting by predicted contact probabilities (which needs the model's distogram). It runs higher than the published value (ColabFold p53&ndash;MDM2: 0.97&ndash;0.98 against ColabFold's own 0.90&ndash;0.95), and the actifpTM cutoffs were benchmarked on this approximation. A platform's own actifpTM, such as ColabFold's <code>actifptm</code>, is not used. Tables mark the approximation with an asterisk: actifpTM*.
+            </p>
+            <p style="font-size:0.9rem; color:#555; line-height:1.6; margin-top:0.5rem;">
+                <strong>pDockQ family:</strong> <strong>pDockQ</strong> (<a href="https://doi.org/10.1038/s41467-022-28865-w" target="_blank" style="color:#2471A3;">Bryant, Pozzati &amp; Elofsson, 2022</a>) and <strong>pDockQ2</strong> (<a href="https://doi.org/10.1093/bioinformatics/btad424" target="_blank" style="color:#2471A3;">Zhu et al., 2023</a>) are reproduced here exactly as published: pDockQ is a sigmoid on mean interface pLDDT &times; log(interface contact count), over a purely geometric interface (C&beta;&ndash;C&beta; &le; 8 &Aring;, C&alpha; for glycine &mdash; no PAE at all; LIVIA's pDockQ follows the C&beta; cutoff if it is changed from 8 &Aring;); pDockQ2 is the same sigmoid form, refit to mean pLDDT &times; mean PAE-decay over a C&alpha;&ndash;C&alpha; &le; 8 &Aring; interface. Neither formula gates which residue pairs count as "interface" by PAE &mdash; a pair the model happened to place close together, without genuine confidence in their relative orientation, still counts toward pDockQ, and is only down-weighted (not excluded) in pDockQ2. <strong>LIpDockQ</strong> and <strong>LIpDockQ2</strong> apply the identical published formulas to this file's own <strong>cLIR</strong> interface (PAE &le; cutoff <em>and</em> physical contact) instead of the original pure-distance one, so a geometrically-close but PAE-unconfident pair is excluded from the interface entirely, rather than merely down-weighted. (Note: despite the "LI" prefix, LIpDockQ/LIpDockQ2 are built on the contact-filtered <strong>cLIR</strong> interface, not the PAE-only <strong>LIR</strong> &mdash; the LI/c naming convention used elsewhere on this page does not apply here.)
+            </p>
+            <p style="font-size:0.9rem; color:#555; line-height:1.6; margin-top:0.5rem;">
+                <strong>pDockQ availability:</strong> pDockQ2/LIpDockQ2 need the raw numeric PAE matrix, so they are not computable from a lightweight bundle, a FlyPredictome partner-search result, or a cLIP CSV that doesn't already carry them &mdash; the FlyPredictome partner table shows an estimated LIpDockQ only; the FlyPredictome/Ortholog pair-detail views show pDockQ and LIpDockQ. Only the AFDB Dimer tool computes all four live, once a pair is selected and its structure is fetched.
+            </p>
+            <p style="font-size:0.9rem; color:#555; line-height:1.6; margin-top:0.5rem;">
+                <strong>Contact map:</strong> Built from C&beta; atom distances (C&alpha; for glycine). Two residues are in contact if their C&beta;&ndash;C&beta; distance &le; 8 &Aring;. For nucleic acids, phosphorus (P) atoms are used with a 4 &Aring; distance adjustment.
+            </p>
+            <p style="font-size:0.9rem; color:#555; line-height:1.6; margin-top:0.5rem;">
+                <strong>Two directions:</strong> LIS, cLIS and ipTM are averaged over the two directions (A&rarr;B and B&rarr;A); ipSAE and actifpTM take the larger direction; LIR and cLIR are the union of both. For the average over models, iLIS is the mean of each model's own iLIS (as the average cutoffs were benchmarked), the other scores are the mean of the models' values, and the LIR and cLIR <em>counts</em> are the mean of the models' counts (rounded), while the residues <em>highlighted</em> for the average (maps, sequence viewer, structure) are the union across models: a residue counts if any model places it.
+            </p>
+            <p style="font-size:0.9rem; color:#555; line-height:1.6; margin-top:0.5rem;">
+                <strong>Suggested threshold:</strong> <strong>iLIS &ge; 0.223</strong> was established at 10% FPR using large-scale Y2H reference datasets in yeast (<a href="https://doi.org/10.1126/science.1158684" target="_blank" style="color:#2471A3;">Yu et al., 2008</a>), fly (<a href="https://doi.org/10.1038/s41467-023-37876-0" target="_blank" style="color:#2471A3;">Tang et al., 2023</a>), and human (<a href="https://doi.org/10.1038/nmeth.1281" target="_blank" style="color:#2471A3;">Braun et al., 2009</a>). This threshold was determined using AlphaFold-Multimer predictions (via ColabFold), on the top-ranked of five models (five recycles): 0.223 / 0.339 / 0.551 for 10% / 5% / 1% FPR, and 0.072 / 0.120 / 0.268 for the average of the five models. Applied to other models, to the best of several, or to other platforms, they are a guide. See <a href="https://doi.org/10.64898/2026.04.14.718529" target="_blank" style="color:#2471A3;">Kim et al., 2026</a>, for details.
+            </p>
+            <div style="background:#fdeaea; border-left:4px solid #c0392b; padding:0.8rem 1rem; border-radius:0 8px 8px 0; font-size:0.9rem; color:#8b1a1a; margin-top:0.8rem;">
+                <strong>Caution:</strong> Computational predictions should be interpreted with care. The iLIS &ge; 0.223 threshold was derived from AlphaFold-Multimer (ColabFold) predictions with specific reference datasets. <strong>Other prediction platforms (AlphaFold 3, Boltz, Chai-1, OpenFold) may require different cutoffs</strong> due to differences in model architecture, training data, and confidence calibration. Each platform produces distinct PAE distributions and ipTM scales, which can affect iLIS values. Optimal thresholds may also vary depending on the species, protein types, and experimental system. <strong>Experimental validation is highly recommended</strong> before drawing biological conclusions from predicted interactions.
+            </div>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- LIGHTWEIGHT BUNDLE -->
+    <!-- ================================================================ -->
+    <div class="tool-section" id="lightweight-bundle">
+        <h2 class="tool-title">Lightweight Bundle</h2>
+        <div class="subsection">
+            <p>A lightweight bundle shrinks a full prediction &mdash; which for a higher-order complex can be tens to hundreds of MB, dominated by the numeric PAE &mdash; down to a <strong>~1&ndash;5&nbsp;MB</strong> package that LIVIA renders with no loss of any figure: the 3D viewer, chord diagram, contact map, score matrix, and sequence viewer all work exactly like a full load. This works because LIVIA only ever uses the numeric PAE at one point &mdash; computing the LIS metrics and interaction residues &mdash; and those are already in the scores CSV; the bundle keeps that CSV and trades the numeric PAE for a static PAE image.</p>
+            <p style="margin-top:0.8rem;"><strong>In-browser, one click:</strong> after loading any prediction, a <strong>&#8595; Lightweight bundle</strong> button appears next to <strong>Download CSV</strong> at the top of the results &mdash; no install, no Python. Adjustable PAE color scale, image size, and font scale before export. To try one immediately, open <a href="universal.html" style="color:#2471A3;">Prediction Analysis</a> and click any of the 6- to 14-subunit higher-order examples (<strong>ORC&ndash;Cdc6</strong>, <strong>CCT/TRiC</strong>, <strong>eIF3</strong>, or <strong>Complex I</strong>, 4.6&ndash;5.9&nbsp;MB each).</p>
+            <p style="margin-top:0.8rem;"><strong>Share by URL or offline:</strong> host a bundle ZIP anywhere public (GitHub Pages, Zenodo, OSF) and share a direct link via <code>universal.html?url=&lt;encoded_zip_url&gt;</code>, or drop a bundle (including offline <code>.zip.js</code> wrappers) straight onto <a href="universal.html" style="color:#2471A3;">Prediction Analysis</a>.</p>
+            <p style="margin-top:0.8rem;"><strong>Command line, for many predictions at once:</strong> use <code>make_lightweight_bundle.py</code> from the <a href="https://github.com/flyark/LIVIA/tree/main/python" target="_blank" style="color:#2471A3; font-weight:600;">python/</a> directory of this repository.</p>
+            <div style="background:#1e1e2e; color:#cdd6f4; border-radius:8px; padding:0.8rem; font-family:monospace; font-size:0.82rem; line-height:1.6; margin-top:0.6rem;">
+                <span style="color:#89b4fa;">python</span> make_lightweight_bundle.py fold_mycomplex.zip -o bundles/<br>
+                <span style="color:#89b4fa;">python</span> make_lightweight_bundle.py preds/*.zip -o bundles/ &nbsp;<span style="color:#9399B2;"># batch, one bundle per prediction</span><br>
+                <span style="color:#89b4fa;">python</span> make_lightweight_bundle.py --check bundles/*.zip &nbsp;<span style="color:#9399B2;"># verify before publishing/sharing</span>
+            </div>
+            <p style="margin-top:0.5rem;">Features: keeps every ranked model&rsquo;s scores in one <code>lis.csv</code>, auto-generates the PAE image, self-validates against the bundle format, and <code>--delete-original</code> only reclaims disk space once a bundle has already passed every check.</p>
+            <p style="margin-top:0.8rem;">For the exact bundle format &mdash; useful if you&rsquo;re hosting your own catalog or building other tooling around it &mdash; see the <a href="https://github.com/flyark/LIVIA/blob/main/docs/lightweight-bundle.md" target="_blank" style="color:#2471A3; font-weight:600;">lightweight bundle authoring guide</a>.</p>
+            <p style="margin-top:0.8rem;">Two ways this looks in practice: the <a href="https://flyark.github.io/FlyPredictome-higher-order-complex/" target="_blank" style="color:#2471A3; font-weight:600;">FlyPredictome higher-order complex catalog</a> is a standalone, sortable catalog page built entirely from lightweight bundles, while the <a href="https://flyark.github.io/FlyPredictome-network/" target="_blank" style="color:#2471A3; font-weight:600;">FlyPredictome Network Explorer</a> links the same bundles contextually &mdash; a &ldquo;3D structure in LIVIA&rdquo; button per cluster, surfaced from inside an existing interactome browser rather than a separate catalog.</p>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- BATCH ANALYSIS -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">Batch Analysis</h2>
+        <div class="subsection">
+            <p>For large-scale batch analysis of many predictions, use <code>lis.py</code> from the <a href="https://github.com/flyark/AFM-LIS" target="_blank" style="color:#2471A3; font-weight:600;">AFM-LIS</a> repository. It supports all the same platforms (AlphaFold3, ColabFold, Boltz, Chai-1, OpenFold3, Protenix-v2, ESMFold2), auto-detects the prediction format, and outputs CSV.</p>
+            <div style="background:#1e1e2e; color:#cdd6f4; border-radius:8px; padding:0.8rem; font-family:monospace; font-size:0.82rem; line-height:1.6; margin-top:0.6rem;">
+                <span style="color:#89b4fa;">python</span> lis.py /path/to/predictions/<br>
+                <span style="color:#89b4fa;">python</span> lis.py /path/to/predictions/ -w 4 &nbsp;<span style="color:#9399B2;"># parallel with 4 CPUs</span>
+            </div>
+            <p style="margin-top:0.5rem;">Features: <code>.gz</code>/<code>.xz</code> decompression, incremental CSV output (safe to interrupt and resume), progress bar with ETA.</p>
+
+            <p style="margin-top:1.2rem;">For batch generation of ChimeraX visualization scripts from the <code>lis.py</code> CSV, use <code>lis_to_cxc.py</code> (also in <a href="https://github.com/flyark/AFM-LIS" target="_blank" style="color:#2471A3; font-weight:600;">AFM-LIS</a>). It writes one <code>.cxc</code> per fold &times; rank with LIR (light) and cLIR (dark) per-chain coloring, an iLIS/cLIS label panel, and an optional LIR-only partial PDB for Foldseek-multimer search.</p>
+            <div style="background:#1e1e2e; color:#cdd6f4; border-radius:8px; padding:0.8rem; font-family:monospace; font-size:0.82rem; line-height:1.6; margin-top:0.6rem;">
+                <span style="color:#89b4fa;">python</span> lis_to_cxc.py --csv results_lis_analysis.csv --pdb-root . --out cxc/<br>
+                <span style="color:#89b4fa;">python</span> lis_to_cxc.py --csv results.csv --pdb-root . --out cxc/ --best-rank-only --save-lir-pdb &nbsp;<span style="color:#9399B2;"># 1 cxc per fold + Foldseek-ready PDB</span>
+            </div>
+            <p style="margin-top:0.5rem;">Features: per-chain LIR/cLIR coloring with custom palettes, iLIS-based rank reassignment for AF3/Boltz/Chai/OpenFold3/Protenix, gap-fill + isolated-residue pruning, ChimeraX figure-save tip embedded.</p>
+        </div>
+    </div>
+
+    <!-- ================================================================ -->
+    <!-- REFERENCES -->
+    <!-- ================================================================ -->
+    <div class="tool-section">
+        <h2 class="tool-title">References</h2>
+        <div style="font-size:0.9rem; color:#555; line-height:1.8;">
+            <p><strong>AFM-LIS</strong></p>
+            <ul style="padding-left:1.2rem; margin-bottom:1rem;">
+                <li><a href="https://www.biorxiv.org/content/10.1101/2024.02.19.580970" target="_blank" style="color:#2471A3;">Kim et al. 2024</a> &mdash; Enhanced Protein-Protein Interaction Discovery via AlphaFold-Multimer. <em>bioRxiv</em>.</li>
+                <li><a href="https://doi.org/10.64898/2026.04.14.718529" target="_blank" style="color:#2471A3;">Kim et al. 2026</a> &mdash; FlyPredictome: A structural atlas of predicted protein-protein interactions in <em>Drosophila</em>. <em>bioRxiv</em>.</li>
+                <li><a href="https://github.com/flyark/AFM-LIS" target="_blank" style="color:#2471A3;">AFM-LIS GitHub</a> &mdash; Code and documentation for calculating integrated Local Interaction Score (iLIS)</li>
+            </ul>
+            <p><strong>Structure Prediction</strong></p>
+            <ul style="padding-left:1.2rem; margin-bottom:1rem;">
+                <li><a href="https://doi.org/10.1038/s41586-021-03819-2" target="_blank" style="color:#2471A3;">Jumper et al. 2021</a> &mdash; Highly accurate protein structure prediction with AlphaFold. <em>Nature</em> 596, 583&ndash;589.</li>
+                <li><a href="https://doi.org/10.1101/2021.10.04.463034" target="_blank" style="color:#2471A3;">Evans et al. 2021</a> &mdash; Protein complex prediction with AlphaFold-Multimer. <em>bioRxiv</em>.</li>
+                <li><a href="https://doi.org/10.1038/s41586-024-07487-w" target="_blank" style="color:#2471A3;">Abramson et al. 2024</a> &mdash; Accurate structure prediction of biomolecular interactions with AlphaFold 3. <em>Nature</em> 630, 493&ndash;500.</li>
+                <li><a href="https://doi.org/10.1038/s41592-022-01488-1" target="_blank" style="color:#2471A3;">Mirdita et al. 2022</a> &mdash; ColabFold: making protein folding accessible to all. <em>Nature Methods</em> 19, 679&ndash;682.</li>
+            </ul>
+            <p><strong>Confidence Metrics</strong></p>
+            <ul style="padding-left:1.2rem; margin-bottom:1rem;">
+                <li><a href="https://www.biorxiv.org/content/10.1101/2025.02.10.637595" target="_blank" style="color:#2471A3;">Dunbrack 2025</a> &mdash; <em>R&emacr;s ipSAE loquuntur</em>: What&rsquo;s wrong with AlphaFold&rsquo;s ipTM score and how to fix it. <em>bioRxiv</em>.</li>
+                <li><a href="https://doi.org/10.1093/bioinformatics/btaf107" target="_blank" style="color:#2471A3;">Varga et al. 2025</a> &mdash; actifpTM: a refined confidence metric of AlphaFold2 predictions involving flexible regions. <em>Bioinformatics</em> 41(3), btaf107.</li>
+            </ul>
+            <p><strong>Y2H Reference Datasets (iLIS Benchmarks)</strong></p>
+            <ul style="padding-left:1.2rem; margin-bottom:1rem;">
+                <li><a href="https://doi.org/10.1126/science.1158684" target="_blank" style="color:#2471A3;">Yu et al. 2008</a> &mdash; High-quality binary protein interaction map of the yeast interactome network. <em>Science</em> 322, 104&ndash;110.</li>
+                <li><a href="https://doi.org/10.1038/s41467-023-37876-0" target="_blank" style="color:#2471A3;">Tang et al. 2023</a> &mdash; Next-generation large-scale binary protein interaction network for <em>Drosophila melanogaster</em>. <em>Nature Communications</em> 14, 2162.</li>
+                <li><a href="https://doi.org/10.1038/nmeth.1281" target="_blank" style="color:#2471A3;">Braun et al. 2009</a> &mdash; An experimentally derived confidence score for binary protein-protein interactions. <em>Nature Methods</em> 6, 91&ndash;97.</li>
+            </ul>
+            <p><strong>Visualization</strong></p>
+            <ul style="padding-left:1.2rem; margin-bottom:1rem;">
+                <li><a href="https://doi.org/10.1093/nar/gkab314" target="_blank" style="color:#2471A3;">Sehnal et al. 2021</a> &mdash; Mol* Viewer: modern web app for 3D visualization and analysis of large biomolecular structures. <em>Nucleic Acids Research</em> 49, W431&ndash;W437.</li>
+                <li><a href="https://doi.org/10.1002/pro.3943" target="_blank" style="color:#2471A3;">Pettersen et al. 2021</a> &mdash; UCSF ChimeraX: Structure visualization for researchers, educators, and developers. <em>Protein Science</em> 30, 70&ndash;82.</li>
+                <li>The PyMOL Molecular Graphics System, Schr&ouml;dinger, LLC. <a href="https://pymol.org" target="_blank" style="color:#2471A3;">pymol.org</a></li>
+            </ul>
+            <p><strong>Databases</strong></p>
+            <ul style="padding-left:1.2rem; margin-bottom:1rem;">
+                <li><a href="https://doi.org/10.1093/nar/gkac1052" target="_blank" style="color:#2471A3;">UniProt Consortium 2023</a> &mdash; UniProt: the Universal Protein Knowledgebase in 2023. <em>Nucleic Acids Research</em> 51, D523&ndash;D531.</li>
+                <li><a href="https://doi.org/10.1093/nar/gkab1061" target="_blank" style="color:#2471A3;">Varadi et al. 2022</a> &mdash; AlphaFold Protein Structure Database: massively expanding the structural coverage of protein-sequence space with high-accuracy models. <em>Nucleic Acids Research</em> 50, D439&ndash;D444.</li>
+                <li><a href="https://doi.org/10.64898/2026.03.27.714458" target="_blank" style="color:#2471A3;">Han et al. 2026</a> &mdash; AlphaFold Database expands to proteome-scale quaternary structures. <em>bioRxiv</em>.</li>
+                <li><a href="https://doi.org/10.64898/2026.04.14.718529" target="_blank" style="color:#2471A3;">Kim et al. 2026</a> &mdash; FlyPredictome: A structural atlas of predicted protein-protein interactions in <em>Drosophila</em>.</li>
+                <li><a href="https://doi.org/10.1101/2025.10.10.681672" target="_blank" style="color:#2471A3;">Kim et al. 2025</a> &mdash; A Structure-Guided Kinase&ndash;Transcription Factor Interactome Atlas Reveals Docking Landscapes of the Kinome. <em>bioRxiv</em>.</li>
+                <li><a href="https://doi.org/10.1093/nar/gkx1116" target="_blank" style="color:#2471A3;">Hu et al. 2018</a> &mdash; Molecular Interaction Search Tool (MIST): an integrated resource for mining gene and protein interaction data. <em>Nucleic Acids Research</em> 46(D1), D567&ndash;D574.</li>
+                <li><a href="https://doi.org/10.1093/nar/gkac993" target="_blank" style="color:#2471A3;">Paysan-Lafosse et al. 2023</a> &mdash; InterPro in 2022. <em>Nucleic Acids Research</em> 51(D1), D418&ndash;D427.</li>
+                <li><a href="https://doi.org/10.1093/genetics/iyad211" target="_blank" style="color:#2471A3;">Ozturk-Colak et al. 2024</a> &mdash; FlyBase: updates to the <em>Drosophila</em> genes and genomes database. <em>Genetics</em> 227(1), iyad211.</li>
+            </ul>
+            <p><strong>This Tool</strong></p>
+            <ul style="padding-left:1.2rem;">
+                <li><a href="https://doi.org/10.64898/2026.05.01.721633" target="_blank" style="color:#2471A3;">Kim &amp; Perrimon 2026</a> &mdash; LIVIA: a browser-based tool for assessing and visualizing predicted protein interactions. <em>bioRxiv</em>.</li>
+                <li><a href="https://github.com/flyark/LIVIA" target="_blank" style="color:#2471A3;">LIVIA GitHub</a> &mdash; Source code for all visualization and analysis tools</li>
+            </ul>
+            <div style="margin-top:1.5rem; padding:1rem; background:#eaf2f8; border-radius:8px;">
+                <p style="font-weight:600; color:#1a5276; margin-bottom:0.4rem;">Cite this tool</p>
+                <p style="font-size:0.82rem; color:#555; line-height:1.6;">If you use LIVIA in your research, please cite:</p>
+                <div style="background:white; border:1px solid #d0d8e0; border-radius:6px; padding:0.6rem 0.8rem; margin-top:0.4rem; font-size:0.78rem; font-family:'SF Mono','Fira Code',monospace; line-height:1.5; color:#333;">
+                    Kim, A.-R. &amp; Perrimon, N. (2026). LIVIA: a browser-based tool for assessing and visualizing predicted protein interactions. <em>bioRxiv</em>. <a href="https://doi.org/10.64898/2026.05.01.721633" target="_blank" style="color:#2471A3;">https://doi.org/10.64898/2026.05.01.721633</a>
+                </div>
+                <p style="font-size:0.82rem; color:#555; line-height:1.6; margin-top:0.8rem;">If you use the LIS or iLIS metric, please also cite:</p>
+                <div style="background:white; border:1px solid #d0d8e0; border-radius:6px; padding:0.6rem 0.8rem; margin-top:0.4rem; font-size:0.78rem; font-family:'SF Mono','Fira Code',monospace; line-height:1.5; color:#333;">
+                    Kim, A.-R. et al. (2024). Enhanced Protein-Protein Interaction Discovery via AlphaFold-Multimer. <em>bioRxiv</em>. <a href="https://doi.org/10.1101/2024.02.19.580970" target="_blank" style="color:#2471A3;">https://doi.org/10.1101/2024.02.19.580970</a>
+                </div>
+                <div style="background:white; border:1px solid #d0d8e0; border-radius:6px; padding:0.6rem 0.8rem; margin-top:0.4rem; font-size:0.78rem; font-family:'SF Mono','Fira Code',monospace; line-height:1.5; color:#333;">
+                    Kim, A.-R. et al. (2026). FlyPredictome: A structural atlas of predicted protein-protein interactions in <em>Drosophila</em>. <em>bioRxiv</em>. <a href="https://doi.org/10.64898/2026.04.14.718529" target="_blank" style="color:#2471A3;">https://doi.org/10.64898/2026.04.14.718529</a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<div class="footer">
+    <a href="https://github.com/flyark/LIVIA" target="_blank">LIVIA GitHub</a> &middot; <a href="https://github.com/flyark/AFM-LIS" target="_blank">AFM-LIS GitHub</a>
+    <br>
+    <a href="https://doi.org/10.64898/2026.05.01.721633" target="_blank">Kim &amp; Perrimon (2026)</a>
+    <br>
+    Ah-Ram Kim &middot; Harvard Medical School
+</div>
+
+<script>window.goatcounter = { path: function () { return location.pathname.replace(/index\.html$/, ''); }, title: 'LIVIA ' + (location.pathname.split('/').pop() || 'index.html') };   /* the page only: never the file, pair or query */</script>
+<script data-goatcounter="https://livia.goatcounter.com/count"
+        async src="https://gc.zgo.at/count.js"></script>
+<script src="js/livia-version.js?v=20261117b"></script>
+</body>
+</html>

@@ -1,0 +1,66 @@
+from __future__ import print_function
+from __future__ import absolute_import
+import os
+import glob
+from libtbx import easy_run
+import libtbx.load_env
+
+qrefine_path = libtbx.env.find_in_repositories("qrefine")
+
+pdb_lines = '''
+CRYST1   81.798   80.030   79.804  90.00  90.00  90.00 P 1
+ATOM   1163  N   CYS A  78      11.141  13.078  17.954  1.00  8.15           N
+ANISOU 1163  N   CYS A  78      368   2009    718    -21     61    -57       N
+ATOM   1164  CA  CYS A  78      10.932  12.280  19.167  1.00  8.14           C
+ANISOU 1164  CA  CYS A  78      335   2060    698     37     66   -116       C
+ATOM   1165  C   CYS A  78      12.067  11.265  19.234  1.00  7.84           C
+ANISOU 1165  C   CYS A  78      482   1942    556    -72    125   -132       C
+ATOM   1166  O   CYS A  78      12.293  10.604  18.236  1.00 10.09           O
+ANISOU 1166  O   CYS A  78      760   2315    759     85    -15   -185       O
+ATOM   1167  CB  CYS A  78       9.596  11.643  19.135  1.00  9.23           C
+ANISOU 1167  CB  CYS A  78      350   2159    997     -5     45    -59       C
+ATOM   1168  SG  CYS A  78       9.430  10.394  20.434  1.00  9.81           S
+ANISOU 1168  SG  CYS A  78      707   2210    809   -188     50    -25       S
+ATOM   1169  H   CYS A  78      10.663  12.707  17.133  1.00  8.15           H
+ATOM   1170  HA  CYS A  78      10.991  12.924  20.044  1.00  8.14           H
+ATOM   1171  HB2 CYS A  78       8.830  12.403  19.291  1.00  9.23           H
+ATOM   1172  HB3 CYS A  78       9.453  11.155  18.172  1.00  9.23           H
+HETATM 1832 CU    CU A 201       7.545   9.241  20.314  1.00  8.15          Cu
+ANISOU 1832 CU    CU A 201      503   1903    690    -55    119      0      Cu
+'''
+
+def run(prefix = "qrefine_"+os.path.basename(__file__).replace(".py","")):
+  """
+  Make sure charges works in this special case: a Cu-bound CYS (the Cu at
+  full occupancy: with a partially occupied metal reduce2 keeps HG and
+  flags the site). qr.finalise
+  (mmtbx.reduce2 qmready=True) leaves SG a thiolate (no HG) and puts the
+  total charge into the output name; qr.charges on that output agrees.
+  """
+  os.makedirs(prefix, exist_ok=True)
+  os.chdir(prefix)
+  #
+  fn='test_cu_cys.pdb'
+  f=open(fn, 'w')
+  f.write(pdb_lines)
+  f.close()
+  cmd = 'qr.finalise %s' % (fn)
+  if 1: print(cmd)
+  rc = easy_run.go(cmd)
+  assert rc.return_code == 0, rc.stdout_lines + rc.stderr_lines
+  outs = glob.glob('test_cu_cysH_charge*.pdb')
+  assert len(outs) == 1, outs
+  fnc = outs[0]
+  charge = int(fnc.replace('test_cu_cysH_charge', '').replace('.pdb', ''))
+  f=open(fnc, 'r')
+  lines=f.read()
+  f.close()
+  assert ' HG  CYS A  78' not in lines
+  cmd = 'qr.charges %s verbose=1' % (fnc)
+  if 1: print(cmd)
+  rc = easy_run.go(cmd)
+  assert 'Charge: %d' % charge in rc.stdout_lines, (charge, rc.stdout_lines)
+  return rc
+
+if(__name__=='__main__'):
+  run()

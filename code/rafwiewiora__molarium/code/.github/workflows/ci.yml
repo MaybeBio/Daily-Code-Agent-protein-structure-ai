@@ -1,0 +1,374 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+    inputs:
+      render_sos1:
+        description: Render the fail-closed SOS1 interface movie and upload its evidence bundle
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Production build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build production bundle
+        run: |
+          node scripts/version-web-code.test.mjs
+          npm run build:web
+          node scripts/social-preview.test.mjs --dist
+      - name: Check submitted manuscript integrity and tamper rejection
+        run: npm run test:paper-submission
+      - name: Compile bounded hosted cofolding relay
+        run: bunx wrangler@4.50.0 pages functions build functions --outdir=/tmp/molarium-hosted-functions
+      - name: Preserve production bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: molarium-dist-${{ github.sha }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 3
+
+  scientific:
+    name: Scientific validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Run scientific validation suite
+        run: npm run test:ci:scientific
+      - name: Check folding requests, chemical mapping and pinned upstream sources
+        run: node --test folding/integration.test.mjs folding/library.test.mjs folding/ligand-normalization.test.mjs folding/comparison/*.test.mjs
+      - name: Check hosted queue durability and bounded credential relay
+        run: node --test folding/hosted-library.test.mjs server/hosted-cofold.test.mjs
+      - name: Check browser MSA features against the official OpenFold3 CPU export
+        run: node folding/comparison/compare-msa-features.mjs reviews/cofold-recent-pdb-2026-11-13/panel-msa256.json reviews/cofold-recent-pdb-2026-11-13/msa256/official-openbind-msa-features.json /tmp/recent-msa-comparison.json
+      - name: Check all seven frozen SOS1 graphs through strict 2D depiction
+        run: npm run test:depiction-hydrogens
+      - name: Check simulation benchmark acceptance logic and parameter import
+        run: npm run test:simulation-benchmarks
+      - name: Check Design finding regressions, option help, and preserved baseline evidence
+        run: npm run test:design-validation
+      - name: Check explicit SOS1 contact revision against the immutable source
+        run: node design-history/sos1-recompute-revision.test.mjs
+
+  cofold-analysis:
+    name: Cofolding comparison integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install isolated analysis dependencies
+        run: |
+          python3 -m venv /tmp/cofold-analysis
+          /tmp/cofold-analysis/bin/pip install -r folding/comparison/requirements-analysis.txt
+      - name: Check protein-frame metrics and native chemical identity
+        run: /tmp/cofold-analysis/bin/python -m unittest discover -s folding/comparison -p 'test_*.py'
+      - name: Recompute all selected Runs N’ Poses native baselines
+        run: /tmp/cofold-analysis/bin/python folding/comparison/check_rnp_selection.py --report reviews/cofold-rnp-spectrum-2026-11-15
+      - name: Recompute the initial stock Runs N’ Poses snapshot and verify actual sampling
+        run: /tmp/cofold-analysis/bin/python folding/comparison/check_stock_benchmark.py reviews/cofold-rnp-spectrum-2026-11-15/initial-snapshot
+      - name: Recompute the 221-prediction checkpoint and verify actual sampling
+        run: /tmp/cofold-analysis/bin/python folding/comparison/check_stock_benchmark.py reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-221
+      - name: Reproduce the diagnostic breakdown and distinguish rounded confidence ties
+        run: |
+          /tmp/cofold-analysis/bin/python folding/comparison/diagnose_rnp_stock.py --plan reviews/cofold-rnp-spectrum-2026-11-15/frozen-stock-plan.json --scores reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-221/scores.json --samples 3 --output /tmp/rnp-prefix-diagnostics
+          cmp /tmp/rnp-prefix-diagnostics/diagnostics.json reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-221/diagnostics-first3/diagnostics.json
+          cmp /tmp/rnp-prefix-diagnostics/README.md reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-221/diagnostics-first3/README.md
+      - name: Recompute all 288 predictions in the uniform six-sample checkpoint
+        run: /tmp/cofold-analysis/bin/python folding/comparison/check_stock_benchmark.py reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-288
+      - name: Reproduce the six-sample diagnostic and similarity summaries
+        run: |
+          /tmp/cofold-analysis/bin/python folding/comparison/diagnose_rnp_stock.py --plan reviews/cofold-rnp-spectrum-2026-11-15/frozen-stock-plan.json --scores reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-288/scores.json --samples 6 --output /tmp/rnp-prefix6-diagnostics
+          cmp /tmp/rnp-prefix6-diagnostics/diagnostics.json reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-288/diagnostics-first6/diagnostics.json
+          cmp /tmp/rnp-prefix6-diagnostics/README.md reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-288/diagnostics-first6/README.md
+          /tmp/cofold-analysis/bin/python folding/comparison/summarize_rnp_stock.py --plan reviews/cofold-rnp-spectrum-2026-11-15/frozen-stock-plan.json --scores reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-288/scores.json --output /tmp/rnp-prefix6-similarity.json
+          cmp /tmp/rnp-prefix6-similarity.json reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-288/similarity-summary.json
+      - name: Reproduce portable stock review examples and verify original graphs and coordinates
+        run: |
+          /tmp/cofold-analysis/bin/python folding/comparison/export_stock_review.py --review reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-288 --samples 6 --case 8px8__1__1-a__1-d --case 8u7x__1__1-a__1-c --case 8iqt__1__1-a__1-b --case 8a3a__1__1-a__1-b --case 8usm__1__1-a__1-c --attribution reviews/cofold-rnp-spectrum-2026-11-15/dataset-attribution.json --output /tmp/rnp-stock-review-exports
+          /tmp/cofold-analysis/bin/python - <<'PY'
+          from pathlib import Path
+          expected = Path('reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-288/review-examples')
+          for path in Path('/tmp/rnp-stock-review-exports').iterdir():
+              assert path.read_bytes() == (expected / path.name).read_bytes(), path.name
+          PY
+          node folding/comparison/check_stock_review.mjs --review reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-288 --exports reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-288/review-examples --plan reviews/cofold-rnp-spectrum-2026-11-15/frozen-stock-plan.json --repository . --components reviews/cofold-rnp-spectrum-2026-11-15/stock-input-components/components --attribution reviews/cofold-rnp-spectrum-2026-11-15/dataset-attribution.json
+      - name: Verify saved all-48 reviewer receipts against regenerated original six-sample exports
+        run: |
+          /tmp/cofold-analysis/bin/python - <<'PYCOHORT'
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, 'folding/comparison')
+          from export_stock_review import export
+          root = Path('reviews/cofold-rnp-spectrum-2026-11-15')
+          cases = [p['caseId'] for p in json.loads((root / 'frozen-stock-plan.json').read_text())['pairs']]
+          export(root / 'checkpoint-288', Path('/tmp/rnp-all48-review'), cases, 6,
+                 attribution_file=root / 'dataset-attribution.json')
+          PYCOHORT
+          /tmp/cofold-analysis/bin/python reviews/cofold-rnp-spectrum-2026-11-15/review-ui-2026-11-16/verify-saved-cohort.py --cohort reviews/cofold-rnp-spectrum-2026-11-15/review-ui-2026-11-16/all48-six-sample --exports /tmp/rnp-all48-review --output /tmp/rnp-saved-ui-verification.json
+      - name: Independently replay all 480 final predictions with bounded archive limits
+        run: /tmp/cofold-analysis/bin/python folding/comparison/check_stock_benchmark.py reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-480 --max-expanded-mib 1024 --max-members 12000
+      - name: Reproduce final summaries and diagnostic tables without inference
+        run: |
+          /tmp/cofold-analysis/bin/python - <<'PYFINAL'
+          import hashlib, json, sys
+          from pathlib import Path
+          sys.path.insert(0, 'folding/comparison')
+          from prepare_rnp_publication import render_summary
+          from summarize_rnp_stock import summarize
+          from analyze_rnp_sampling import analyze
+          from diagnose_rnp_stock import diagnose, markdown
+          sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+          root = Path('reviews/cofold-rnp-spectrum-2026-11-15')
+          check = root / 'checkpoint-480'
+          plan = json.loads((root / 'frozen-stock-plan.json').read_bytes())
+          scores = json.loads((check / 'scores.json').read_bytes())
+          analysis = json.loads((check / 'selection-analysis.json').read_bytes())
+          assert scores['status'] == 'complete' and scores['completed'] == scores['planned'] == 480
+          assert (check / 'README.md').read_text() == render_summary(plan, scores, analysis, 10)
+          summary = summarize(plan, scores)
+          summary.update(planSha256=sha(root / 'frozen-stock-plan.json'), scoresSha256=sha(check / 'scores.json'))
+          assert summary == json.loads((check / 'final-summary.json').read_bytes())
+          assert summary == json.loads((check / 'similarity-summary.json').read_bytes())
+          for n in [3, 6, 10]:
+              result = diagnose(plan, scores, n)
+              result.update(planSha256=sha(root / 'frozen-stock-plan.json'), scoresSha256=sha(check / 'scores.json'), scriptSha256=sha(Path('folding/comparison/diagnose_rnp_stock.py')))
+              folder = check / f'diagnostics-first{n}'
+              assert result == json.loads((folder / 'diagnostics.json').read_bytes())
+              assert markdown(result) == (folder / 'README.md').read_text()
+          receipt = json.loads((root / 'publication-preparation-receipt.json').read_bytes())
+          assert receipt['newNeuralForwards'] == receipt['publicationActions'] == 0
+          assert receipt['sourceScoresSha256'] == sha(check / 'scores.json')
+          for item in receipt['files']:
+              path = root / item['path']
+              assert path.resolve().is_relative_to(root.resolve()) and path.stat().st_size == item['bytes'] and sha(path) == item['sha256'], item['path']
+          PYFINAL
+      - name: Reproduce all 96 final human-review libraries and verify original coordinates
+        run: |
+          /tmp/cofold-analysis/bin/python - <<'PYREVIEW'
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, 'folding/comparison')
+          from export_stock_review import export
+          root = Path('reviews/cofold-rnp-spectrum-2026-11-15')
+          cases = [p['caseId'] for p in json.loads((root / 'frozen-stock-plan.json').read_text())['pairs']]
+          output = Path('/tmp/rnp-final48-review')
+          export(root / 'checkpoint-480', output, cases, 10, 1024, 12000, root / 'dataset-attribution.json')
+          expected = root / 'checkpoint-480/review-libraries'
+          for path in output.glob('*.json'):
+              assert path.read_bytes() == (expected / path.name).read_bytes(), path.name
+          PYREVIEW
+          node folding/comparison/check_stock_review.mjs --review reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-480 --exports reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-480/review-libraries --plan reviews/cofold-rnp-spectrum-2026-11-15/frozen-stock-plan.json --repository . --components reviews/cofold-rnp-spectrum-2026-11-15/stock-input-components/components --attribution reviews/cofold-rnp-spectrum-2026-11-15/dataset-attribution.json
+      - name: Verify all 48 saved ten-sample browser workflows against the final regenerated exports
+        run: /tmp/cofold-analysis/bin/python reviews/cofold-rnp-spectrum-2026-11-15/review-ui-2026-11-16/verify-saved-cohort.py --cohort reviews/cofold-rnp-spectrum-2026-11-15/review-ui-2026-11-16/all48-ten-sample --exports /tmp/rnp-final48-review --output /tmp/rnp-final48-saved-ui-verification.json
+
+  browser:
+    name: Browser integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Set up Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Run browser integration suite
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: npm run test:ci:browser
+      - name: Check accessible option help and unchanged molecular settings
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: npm run test:design-help-browser
+      - name: Check folding controls and local-only boundary
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: bun scripts/localfold-ui.browser.test.mjs
+      - name: Check hosted submissions, saved retrieval and Local Lab isolation
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: bun scripts/hosted-cofold.browser.test.mjs
+      - name: Check actual RDKit WASM ligand normalization and conformer generation
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: bun scripts/cofold-ligand-chemistry.browser.mjs
+      - name: Check local Foldarium pose review, decisions and portable export
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          MOLARIUM_LIBRARY_REUSE: reviews/library-cofolding-2026-11-12/standard/library-1.json
+        run: bun scripts/cofold-library.browser.mjs
+      - name: Check closed IndexedDB recovery and checkpoint loss without repeated inference
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: bun scripts/cofold-storage.browser.mjs
+      - name: Check recent-PDB review links, saved decisions and reference separation
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: bun scripts/recent-cofold-review.browser.mjs
+      - name: Import preserved stock review files and retain local preferences without inference
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          MOLARIUM_HEADLESS_SOFTWARE_WEBGPU: '1'
+          MOLARIUM_STOCK_REVIEW_REQUIRE_SOFTWARE: '1'
+          MOLARIUM_STOCK_REVIEW_EXPORTS: reviews/cofold-rnp-spectrum-2026-11-15/checkpoint-480/review-libraries
+          MOLARIUM_STOCK_REVIEW_CASE_ID: 8cjg__1__1-a__1-d
+        run: bun scripts/stock-cofold-review.browser.mjs
+      - name: Check method-labelled browser/native comparison review
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          MOLARIUM_LIBRARY_REUSE=reviews/cofold-method-comparison-2026-11-12/boltz2-browser-native.library.json bun scripts/cofold-library.browser.mjs
+          MOLARIUM_LIBRARY_REUSE=reviews/cofold-method-comparison-2026-11-12/openbind0-browser-native.library.json bun scripts/cofold-library.browser.mjs
+          MOLARIUM_LIBRARY_REUSE=reviews/cofold-method-comparison-2026-11-12/boltz2-browser-standard.library.json bun scripts/cofold-library.browser.mjs
+          MOLARIUM_LIBRARY_REUSE=reviews/cofold-method-comparison-2026-11-12/openbind0-browser-standard.library.json bun scripts/cofold-library.browser.mjs
+          MOLARIUM_LIBRARY_REUSE=reviews/cofold-crystal-reference-2026-11-13/review/3mxf-jq1.library.json bun scripts/cofold-library.browser.mjs
+          MOLARIUM_LIBRARY_REUSE=reviews/cofold-crystal-reference-2026-11-13/review/181l-bnz.library.json bun scripts/cofold-library.browser.mjs
+      - name: Check numerical-only public validation panel and evidence links
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: bun validation/dashboard.browser.test.mjs
+      - name: Check final SOS1 contact failure and explicit release through public actions
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: bun scripts/sos1-final-contact.browser.test.mjs
+      - name: Check unprepared protein calculation notice and prepared controls
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          node --test calculation-readiness.test.mjs
+          node --test scripts/stale-polish.test.mjs
+          bun scripts/unprepared-protein.browser.test.mjs
+          bun scripts/preparation-button.browser.test.mjs
+          bun scripts/version-web-code.browser.test.mjs
+          MOLARIUM_TEST_API=1 bun scripts/calculation-readiness.browser.test.mjs
+      - name: Check minimization reuse in the release bundle
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          npm run build:web
+          bun scripts/readiness-release.browser.test.mjs
+
+  local-lab:
+    name: Local Lab network and integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Set up Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Check committed manifest without regenerating it
+        run: npm run manifest:local:check
+      - name: Check local server exposure and startup failure handling
+        run: npm run test:server-security
+      - name: Check database cancellation, timeouts and recovery
+        run: npm run test:campaign-store
+      - name: Verify privacy UI, content hashes, and blocked external canaries
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: npm run test:local-lab
+
+  worker-contracts:
+    name: WebGPU worker contracts (software correctness only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Set up Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Dispatch real production workers and check rejection and analytic contracts
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          MOLARIUM_HEADLESS_SOFTWARE_WEBGPU: '1'
+        run: npm run test:worker-contract-browser
+
+  render-sos1:
+    name: SOS1 interface render
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.render_sos1 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Set up Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Install media tools
+        run: sudo apt-get update && sudo apt-get install --yes ffmpeg
+      - name: Verify media tools
+        run: ffmpeg -version && ffprobe -version
+      - name: Verify headless WebGPU adapter
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          MOLARIUM_HEADLESS_SOFTWARE_WEBGPU: '1'
+        run: bun scripts/probe-headless-webgpu.mjs
+      - name: Render fail-closed SOS1 interface story
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          MOLARIUM_HEADLESS_SOFTWARE_WEBGPU: '1'
+        run: npm run render:designer-moves-interface
+      - name: Preserve verified movie, audit, manifest, and QA frames
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sos1-interface-render-${{ github.sha }}
+          path: outputs/design-history/sos1-hit-only-growth-clash-v7/interface-movie
+          if-no-files-found: error
+          retention-days: 7

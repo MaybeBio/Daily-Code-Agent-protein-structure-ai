@@ -1,0 +1,167 @@
+/* Conceptual decoration never represents scientific data or covers result canvases. */
+[data-module-theme="targets"] {
+  --module-art: url("/images/modules/targets.webp");
+}
+[data-module-theme="structures"] {
+  --module-art: url("/images/modules/structures.webp");
+}
+[data-module-theme="docking"] {
+  --module-art: url("/images/modules/docking.webp");
+}
+[data-module-theme="molecules"] {
+  --module-art: url("/images/modules/molecules.webp");
+}
+[data-module-theme="biologics"] {
+  --module-art: url("/images/modules/biologics.webp");
+}
+[data-module-theme="properties"] {
+  --module-art: url("/images/modules/properties.webp");
+}
+[data-module-theme="research"] {
+  --module-art: url("/images/modules/research.webp");
+}
+[data-module-theme="environments"] {
+  --module-art: url("/images/modules/environments.webp");
+}
+
+.studio-app .studio-content {
+  padding: 24px 28px 32px;
+}
+.studio-app .module-task-picker {
+  max-width: none;
+  width: 100%;
+  min-height: 0;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 0;
+  margin-bottom: 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.studio-app .workspace-tabs {
+  min-height: 48px;
+  gap: 6px;
+  margin-bottom: 16px;
+  padding: 6px 0;
+  background: transparent;
+}
+.studio-app .module-task-picker > label {
+  flex: 0 1 460px;
+}
+.studio-app .module-task-picker > label > select {
+  flex: 1;
+  min-height: 36px;
+}
+.studio-app .module-task-picker .hint {
+  flex: 0 0 auto;
+}
+.studio-app .workspace-tabs > button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+}
+.studio-app .workspace-tabs > button[aria-pressed="true"] {
+  border-bottom-color: var(--accent);
+  background: transparent;
+  color: var(--accent);
+}
+.studio-app .modality-filters button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+}
+.studio-app .modality-filters button.selected {
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
+.studio-app .capability-group {
+  background-image:
+    linear-gradient(180deg, transparent 36px, var(--surface) 128px),
+    var(--module-art);
+  background-repeat: no-repeat;
+  background-position: right top;
+  background-size:
+    100% 128px,
+    auto 128px;
+}
+.studio-app .capability-group-heading {
+  min-height: 96px;
+  align-items: flex-start;
+  padding-top: 8px;
+}
+.studio-app .capability-heading-copy {
+  padding-top: 2px;
+}
+.studio-app .capability-heading-copy small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.studio-app .capability-icon {
+  width: 40px;
+  height: 40px;
+  flex-basis: 40px;
+  font-size: 21px;
+}
+.studio-app .capability-recommended {
+  grid-auto-rows: minmax(44px, auto);
+  gap: 0;
+}
+.studio-app .questionnaire-steps {
+  gap: 10px;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+}
+.studio-app .questionnaire-choices {
+  gap: 12px;
+  align-items: stretch;
+}
+.studio-app .questionnaire-choices label {
+  min-height: 58px;
+  padding: 14px 16px;
+}
+.studio-app .questionnaire-choices label:has(small) {
+  min-height: 96px;
+}
+/* Compact result cards yield to the shared fullscreen viewport sizing. */
+.studio-app
+  .task-workspace.is-result:where(:not(:popover-open):not(:has(:popover-open)))
+  .viewer-panel
+  .molecular-stage {
+  height: 520px;
+}
+
+/* Readability takes precedence over decoration in alternate contrast modes. */
+:root[data-theme="dark"] .studio-app .capability-group {
+  background-image: none;
+}
+@media (prefers-contrast: more) {
+  .studio-app .capability-group {
+    background-image: none;
+  }
+}
+@media (max-width: 680px) {
+  .studio-app .studio-content {
+    padding: 16px 14px 24px;
+  }
+  .studio-app .workspace-tabs {
+    min-height: 58px;
+    padding: 10px 16px;
+  }
+  .studio-app .capability-group {
+    min-height: 324px;
+  }
+  .studio-app .module-task-picker > label {
+    flex: 1 1 100%;
+  }
+  .studio-app
+    .task-workspace.is-result:where(
+      :not(:popover-open):not(:has(:popover-open))
+    )
+    .viewer-panel
+    .molecular-stage {
+    height: 360px;
+  }
+}

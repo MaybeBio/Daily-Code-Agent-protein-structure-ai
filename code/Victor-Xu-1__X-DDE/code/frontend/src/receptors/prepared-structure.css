@@ -1,0 +1,113 @@
+.prepared-structure-workspace .viewer-panel {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.prepared-structure-workspace .viewer-panel > .studio-heading {
+  gap: 6px 10px;
+  margin-block: 0 6px;
+}
+.prepared-structure-workspace .viewer-panel > .viewer-modes {
+  gap: 4px 6px;
+  margin-block: 0 8px;
+}
+.prepared-structure-summary {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.prepared-structure-summary :is(h3, dl, dd, p) {
+  margin: 0;
+}
+.prepared-structure-summary h3 {
+  font-size: 15px;
+}
+.prepared-structure-summary dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(68px, 1fr));
+  gap: 8px 12px;
+  padding-block: 10px;
+  border-block: 1px solid var(--line);
+}
+.prepared-structure-summary dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+.prepared-structure-summary dl > div {
+  display: grid;
+  grid-template-rows: subgrid;
+  grid-row: span 2;
+  row-gap: 3px;
+}
+.prepared-structure-summary dd {
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.prepared-structure-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.prepared-structure-summary details p {
+  margin-block-start: 7px;
+  overflow-wrap: anywhere;
+}
+@media (min-width: 1001px) {
+  .prepared-structure-workspace
+    .structure-workbench:not([data-workspace-expanded]) {
+    grid-template-columns: minmax(0, 1fr) minmax(245px, 28%);
+    gap: 16px;
+  }
+}
+@media (max-width: 680px) {
+  .studio-app
+    .task-result-content
+    > .detail-panel:has(> .operation-results > .prepared-structure-workspace) {
+    padding-inline: 10px;
+  }
+  .prepared-structure-workspace .structure-display-controls {
+    gap: 4px 8px;
+    margin-inline-start: 0;
+  }
+  .prepared-structure-workspace .structure-display-controls label {
+    gap: 4px;
+    font-size: 11px;
+  }
+  .prepared-structure-actions > :is(a, button) {
+    min-height: 44px;
+  }
+}
+@media (max-width: 360px) {
+  .task-history-workspace
+    .detail-panel.has-header-navigation:has(
+      > .operation-results > .prepared-structure-workspace
+    )
+    > .task-detail-header {
+    gap: 6px;
+    margin-block-end: 8px;
+  }
+  .task-history-workspace
+    .detail-panel.has-header-navigation:has(
+      > .operation-results > .prepared-structure-workspace
+    )
+    .panel-heading
+    h2 {
+    font-size: 16px;
+  }
+  .prepared-structure-workspace .structure-display-controls {
+    gap: 4px;
+  }
+  .prepared-structure-workspace .structure-display-controls label {
+    gap: 3px;
+  }
+  .prepared-structure-workspace .structure-display-controls input {
+    width: 26px;
+    min-width: 26px;
+    flex-basis: 26px;
+  }
+  .prepared-structure-workspace
+    .structure-display-controls
+    input:checked::after {
+    transform: translateX(8px);
+  }
+}

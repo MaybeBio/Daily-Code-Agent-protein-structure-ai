@@ -1,0 +1,118 @@
+"""Source-node registration for fetched structures."""
+
+import os
+import sys
+from pathlib import Path
+from typing import Optional
+
+
+# Configure logging
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from mdclaw._common import (  # noqa: E402
+    setup_logger,
+)
+logger = setup_logger(__name__)
+
+# Default output location, created when a tool writes there, not at import.
+WORKING_DIR = Path("outputs")
+
+from mdclaw._tool_meta import node_tool  # noqa: E402
+from mdclaw.research.fetch import _fetch_local_structure  # noqa: E402
+from mdclaw.research.source_core import _resolve_source_bundle_file  # noqa: E402
+
+
+@node_tool(node_type="source")
+def register_local_structure(
+    file_path: str,
+    job_dir: str,
+    node_id: str,
+    copy: bool = True,
+) -> dict:
+    """Compatibility wrapper for fetching a local structure file.
+
+    Prefer ``fetch_structure(source="local", file_path=...)`` for new
+    workflows. This wrapper remains synchronous for existing callers.
+    """
+    return _fetch_local_structure(
+        file_path=file_path,
+        job_dir=job_dir,
+        node_id=node_id,
+        copy=copy,
+    )
+
+
+# =============================================================================
+# UniProt Tools (mirrors UniProt-MCP-Server)
+# =============================================================================
+
+
+def list_source_candidates(job_dir: str, node_id: Optional[str] = None) -> dict:
+    """List normalized source candidates for a source node or descendant.
+
+    Without ``node_id`` the job's (single) source node is used.
+    """
+    result = {
+        "success": False,
+        "job_dir": job_dir,
+        "node_id": node_id,
+        "source_node_id": None,
+        "source_bundle_file": None,
+        "default_candidate_id": None,
+        "candidates": [],
+        "errors": [],
+        "warnings": [],
+    }
+    if not node_id:
+        from mdclaw.research.source_core import job_source_node
+
+        chosen = job_source_node(job_dir, "list_source_candidates")
+        if chosen.get("error"):
+            error = chosen["error"]
+            result.update(code=error["code"], message=error["input_resolution_error"],
+                          next_action=error["next_action"], candidate_node_ids=error["candidate_node_ids"])
+            result["errors"].append(error["input_resolution_error"])
+            return result
+        node_id = result["node_id"] = chosen["node_id"]
+        result["warnings"].append(f"--node-id not given: listed the job's source node {node_id}")
+    resolved = _resolve_source_bundle_file(job_dir, node_id)
+    if resolved.get("input_resolution_error"):
+        result["errors"].append(resolved["input_resolution_error"])
+        return result
+
+    from mdclaw.source_bundle import load_source_bundle, source_record_path
+
+    source_node_id = resolved["source_node_id"]
+    bundle_file = Path(resolved["source_bundle_file"])
+    bundle = load_source_bundle(bundle_file)
+    source_node_dir = Path(job_dir) / "nodes" / source_node_id
+    candidates = []
+    for record in bundle.get("structures", []):
+        if not isinstance(record, dict):
+            continue
+        path = source_record_path(record, source_node_dir)
+        row = {
+            "structure_id": record.get("structure_id"),
+            "candidate_id": record.get("candidate_id"),
+            "rank": record.get("rank"),
+            "is_primary": bool(record.get("is_primary")),
+            "label": record.get("label"),
+            "file": str(path),
+            "artifact": record.get("candidate_file") or record.get("file"),
+            "format": record.get("format"),
+            "origin": record.get("origin", {}),
+            "metrics": record.get("metrics", {}),
+            "exists": path.is_file(),
+        }
+        if row["is_primary"]:
+            result["default_candidate_id"] = row["structure_id"]
+        candidates.append(row)
+
+    if result["default_candidate_id"] is None and candidates:
+        result["default_candidate_id"] = candidates[0]["structure_id"]
+    result.update({
+        "success": True,
+        "source_node_id": source_node_id,
+        "source_bundle_file": str(bundle_file),
+        "candidates": candidates,
+    })
+    return result

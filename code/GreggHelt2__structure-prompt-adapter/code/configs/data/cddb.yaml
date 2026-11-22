@@ -1,0 +1,72 @@
+# CDDB primary dataset: 455,473 single-chain structures. CDDB is one structure per Foldseek
+# (structural) cluster of AFDB -> already structurally de-duplicated, so a simple length-stratified
+# random split is leakage-safe at the structural level (dev 04 §2 / 07 I.9). NO clustering / NO MMseqs2.
+name: cddb
+
+# Raw CDDB release (source structures + per-structure metadata).
+pdb_dir: ${paths.data_root}/proteina-atomistica_data_vrelease/atomistica_data_release/pdb
+metadata_parquet: ${paths.data_root}/proteina-atomistica_data_vrelease/atomistica_data_release/metadata/metadata_atomistica_syn_release.parquet
+
+# Split artifacts (built by scripts/build_splits.py — kickoff step 8 Part A):
+#   master:    ${master_manifest}                       every id + metadata + assigned split
+#   per-split: ${splits_root}/{train,validate,test}/manifest.parquet
+splits_root: ${paths.data_root}
+master_manifest: ${paths.data_root}/processed/splits.parquet
+
+# Split construction (consumed by build_splits.py). Filtering is deliberately LIGHT (dev 04 §1):
+# pLDDT/length were already applied at CDDB construction, and the rmsd_ca designability cut is
+# SKIPPED by default — the CDDB paper's own ablation shows it hurts diversity & co-designability
+# (07 I.9). rmsd_ca is retained as a manifest column (soft knob), not a hard filter.
+split:
+  seed: 0
+  ratios: {train: 0.8, validate: 0.1, test: 0.1}
+  stratify_by: length        # length-stratified shuffle; set null for plain random
+  n_length_bins: 20
+  filter_rmsd_ca_max: null   # null = keep all; set e.g. 2.0 ONLY to experiment with the cut
+  min_length: null
+  max_length: null           # do NOT cap at split time — the length cap is a runtime view (below)
+
+# Runtime dataloader view (VRAM lever; NOT baked into the splits). Overridden per hardware
+# (A5000 small, H100 larger). Structures longer than this are skipped at load time.
+length_cap: 256
+
+# D — per-structure diffusion noise-replica count (RFD3 training default 32, from
+# datasets.diffusion_batch_size_train). The dominant per-step GPU multiplier: forward+backward scale
+# ~linearly with D. null = use the ckpt's 32; lowering it (e.g. 8) covers ~4x more DISTINCT structures
+# per hour at the cost of noisier per-structure gradients (dev 04 §11 / 08 §6 throughput profiling;
+# for a frozen-backbone adapter, structure diversity > noise-replicas of one structure).
+diffusion_batch_size: null
+
+# Local testing only: restrict the dataset to structures that already have a cached ESM3 prompt, so
+# the small local cache (a few structures) suffices. No-op on the full cloud cache. Default off.
+require_cached_prompt: false
+
+# Native RFD3 conditioning curriculum (dev 10 §7 / 17): `unconditional` (Run A — SPA-only), `island`
+# (Run B — motif scaffolding + SPA on the non-motif scaffold, via prompt-row masking), or
+# `multigranularity` (dev 17 editing curriculum — native denoise stays unconditional; SPA conditions
+# on a per-example sampled sub-region S via the `granularity` block below). `island` re-enables indexed
+# fixed-coord motifs; the SPA prompt then masks those motif rows (non-overlap).
+conditioning: unconditional
+
+# Multi-granularity "editing" curriculum knobs (dev 17). ACTIVE ONLY when conditioning=multigranularity;
+# dormant otherwise. Per example, sample a granularity and mask the cached ESM3 prompt to a sub-region S
+# (slice-via-mask, 17 §4) so SPA conditions on S only. This is the EDITING use case — train AND infer on
+# the slice — NOT isolated-motif scaffolding (17 §1 framing lock). N×1536 (variant C, identity projector)
+# ONLY: pooled variants (B/A) mean-pool before attention, so the mask can't restrict the pool — they need
+# mask-aware pooling / true-slice (17 §5, deferred).
+granularity:
+  weights: {global: 0.4, segment: 0.4, domain: 0.2}  # granularity mix (17 §9 default)
+  min_seg: 12          # segment window length ~ U(min_seg, N); floor ~10-15 (17 §9)
+  contact_thresh: 8.0  # domain-split Cα contact threshold, Å (domain_split.py default)
+  min_dom: 40          # domain-split min residues per domain (domain_split.py default)
+  # Accept a 2-domain split as S only if its domain-ness score (cross/weaker-intra contacts; lower =
+  # cleaner) <= this; else fall back to segment. 0.4 CALIBRATED on 834 real ≥80-res CDDB structures:
+  # score p50=0.12 p90=0.35 p95=0.43 (long tail to 1.8 = single-domain/arbitrary cuts); 0.4 keeps ~93%
+  # of scored splits while rejecting the not-cleanly-2-domain tail. Tunable (17 §9 open decision).
+  domain_score_max: 0.4
+
+# Run-B motif sampler (dev 10 §7.3): true = the coupled total-then-partition island sampler
+# (1–5 islands weighted to fewer; total ~10–35% of L, floor 8, cap 50; per-island ≥4 res — bounds
+# grounded in MotifBench / Genie2). false = RFD3's stock independent sampler (2–5 × 1–12, can be
+# degenerate). Only affects conditioning=island/mixed.
+coupled_motif: true

@@ -1,0 +1,313 @@
+import type {
+  AxisId,
+  BlockRenderCtx,
+  DatasetOption,
+  InferOutputsType,
+  PColumn,
+  PColumnDataUniversal,
+  PColumnIdAndSpec,
+  PFrameHandle,
+  PObjectSpec,
+  ValueType,
+} from "@platforma-sdk/model";
+import {
+  DataColumn,
+  BlockModelV3,
+  buildDatasetOptions,
+  createPlDataTableStateV2,
+  createPlDataTableV3,
+  DataModelBuilder,
+  getAxisId,
+  isPColumnSpec,
+  parseResourceMap,
+} from "@platforma-sdk/model";
+import { kind } from "@platforma-open/milaboratories.3d-structure-based-liabilities.kind";
+import type { BlockArgs, BlockData, BlockDataV1, DetectedMode } from "./types";
+
+export type { NumberingScheme, DetectedMode, BlockData, BlockArgs } from "./types";
+
+const dataModel = new DataModelBuilder({ kind })
+  .from<BlockDataV1>("v1")
+  // v1 -> v2: drop the removed manual chain fields and seed the persisted
+  // results-table state so existing block instances gain sortable tables.
+  .migrate<BlockData>("v2", (v1) => ({
+    dataset: v1.dataset,
+    frConfThresh: v1.frConfThresh,
+    cdrConfThresh: v1.cdrConfThresh,
+    customBlockLabel: v1.customBlockLabel,
+    tableState: createPlDataTableStateV2(),
+  }))
+  // `params` carries the kind's init-params contract, and is undefined whenever a
+  // block is created outside a template. So each field it can seed keeps its
+  // default behind a `??`. The seedable set is exactly what `.templateParams`
+  // projects back below — the two are inverses.
+  .init(({ params }) => ({
+    dataset: params?.dataset,
+    frConfThresh: params?.frConfThresh ?? 4.0,
+    cdrConfThresh: params?.cdrConfThresh ?? 6.0,
+    customBlockLabel: "",
+    tableState: createPlDataTableStateV2(),
+  }));
+
+type ScoresCtx = BlockRenderCtx<unknown, unknown>;
+type ScoresPColumn = PColumn<PColumnDataUniversal | undefined>;
+
+/** Dataset-level mode emitted by the workflow as a scalar block output.
+ *
+ * `ctx.outputs` throws "Staging context not available" when called from
+ * the middle layer's args-only context (used to render the block-overview
+ * sidebar's subtitle), so guard the read. Optional chaining on
+ * `ctx.outputs?` doesn't help , the throw happens inside the getter,
+ * before the chain can short-circuit. */
+function resolveMode(ctx: ScoresCtx): DetectedMode | undefined {
+  let m: string | undefined;
+  try {
+    m = ctx.outputs?.resolve("detectedMode")?.getDataAsJson<string>();
+  } catch {
+    return undefined;
+  }
+  return m === "TAP" || m === "TNP" ? m : undefined;
+}
+
+/** Block label derived from mode + cutoffs when the user hasn't set one.
+ * `data` is optional so this is safe to call from contexts where block
+ * storage hasn't been parsed yet (the middle-layer args-only context
+ * surfaces `ctx.data` as undefined during early renders; an unguarded
+ * deref throws and the platform falls back to the literal string
+ * "Invalid subtitle" in the block-overview sidebar). */
+export function defaultBlockLabelFor(
+  data: Partial<BlockData> | undefined,
+  mode?: DetectedMode,
+): string {
+  const fmt = (v?: number) => (v === undefined ? "?" : Number.isInteger(v) ? `${v}` : v.toFixed(1));
+  const fr = fmt(data?.frConfThresh);
+  const cdr = fmt(data?.cdrConfThresh);
+  const tail = `rSASA ≤ 0.075, gating FR ≥ ${fr} Å / CDR ≥ ${cdr} Å`;
+  return mode ? `${mode}, ${tail}` : tail;
+}
+
+// Helpers for the per-metric histogram output pairs. Each resolves a single
+// `scoresData` PColumn by name; `pfFromScores` wraps it in a single-column
+// PFrame for graph-maker, `specFromScores` returns the {columnId, spec} pair
+// the histogram pages bind to.
+function findScoresCol(ctx: ScoresCtx, name: string): ScoresPColumn | undefined {
+  const cols = ctx.outputs?.resolve("scoresData")?.getPColumns() as ScoresPColumn[] | undefined;
+  return cols?.find((c) => c.spec.name === name);
+}
+function pfFromScores(ctx: ScoresCtx, name: string): PFrameHandle | undefined {
+  const col = findScoresCol(ctx, name);
+  return col ? ctx.createPFrame([col]) : undefined;
+}
+function specFromScores(ctx: ScoresCtx, name: string): PColumnIdAndSpec | undefined {
+  const col = findScoresCol(ctx, name);
+  return col ? { columnId: col.id, spec: col.spec } : undefined;
+}
+
+/**
+ * Name of the record-key axis this run is keyed on, read off the scores columns.
+ *
+ * It is inherited all the way from the dataset 3D Structure Prediction was pointed at, so it
+ * is `pl7.app/vdj/scClonotypeKey` for legacy MiXCR single-cell, `pl7.app/vdj/clonotypeKey` for
+ * bulk, and `pl7.app/variantKey` for import-vdj-data's bare antibody sets. Reading it rather
+ * than naming it is what lets the enrichment join below work in all three regimes.
+ *
+ * Derived from `scoresData` for the same reason `clonotypeAxisId` is: those are the columns
+ * the table is built from, so their axis is the one the enrichment has to meet.
+ */
+function recordAxisName(ctx: ScoresCtx): string | undefined {
+  let cols: ScoresPColumn[] | undefined;
+  try {
+    cols = ctx.outputs?.resolve("scoresData")?.getPColumns() as ScoresPColumn[] | undefined;
+  } catch {
+    return undefined;
+  }
+  return cols?.[0]?.spec.axesSpec[0]?.name;
+}
+
+/**
+ * Upstream columns to join onto the scores table, matched on the record-key axis.
+ *
+ * Queried by axis NAME only, with no domain — the query this replaced hardcoded
+ * `pl7.app/vdj/scClonotypeKey`, so single-cell behaviour is unchanged and bulk and imported
+ * sets stop silently coming back empty.
+ */
+function findOnRecordAxis(ctx: ScoresCtx, name: string, valueType: ValueType) {
+  const axisName = recordAxisName(ctx);
+  if (axisName === undefined) return [] as ScoresPColumn[];
+  return ctx.resultPool.findDataWithCompatibleSpec({
+    kind: "PColumn",
+    name,
+    valueType,
+    axesSpec: [{ type: "String", name: axisName }],
+  }) as ScoresPColumn[];
+}
+
+export const platforma = BlockModelV3.create({ dataModel, kind })
+  // Project back exactly the fields the kind's `BlockParams` declares, so
+  // exporting a block to a template and initializing one from it are inverses.
+  // `dataset` goes with the gates, so a project made from the template scores the
+  // structures of the block the original one read. `tableState` and
+  // `customBlockLabel` are not configuration, so they do not travel.
+  .templateParams((data) => ({
+    dataset: data.dataset,
+    frConfThresh: data.frConfThresh,
+    cdrConfThresh: data.cdrConfThresh,
+  }))
+  .args<BlockArgs>((data) => {
+    if (!data.dataset?.primary?.column) {
+      throw new Error("Pick a 3D structures dataset");
+    }
+    return {
+      primaryRef: data.dataset.primary,
+      frConfThresh: data.frConfThresh,
+      cdrConfThresh: data.cdrConfThresh,
+    };
+  })
+  // Surface anchor-marked `pl7.app/structure/pdb` PColumns as selectable
+  // datasets; the filter predicate exposes the Boolean/Int columns the user
+  // can pick to narrow the clonotype set.
+  .output("datasetOptions", (ctx): DatasetOption[] | undefined =>
+    buildDatasetOptions(ctx, {
+      primary: (spec: PObjectSpec): boolean =>
+        isPColumnSpec(spec) &&
+        spec.name === "pl7.app/structure/pdb" &&
+        spec.annotations?.["pl7.app/isAnchor"] === "true",
+      // No subset filter: the PDB map is already confident-only, so the dataset
+      // is picked directly. `() => false` is required — omitting `filter`
+      // defaults to accept-all, which would attach unrelated `isSubset` columns
+      // on the clonotype axis (e.g. Lead Selection's subsets).
+      filter: () => false,
+    }),
+  )
+  // Dataset-level mode, consumed by the mode-specific histogram page and the
+  // default block label.
+  .output("detectedMode", (ctx): DetectedMode | undefined => resolveMode(ctx))
+  // Per-record scalar metrics table. Score columns are primary; upstream
+  // label / cdrh3Length / cluster columns join on the shared record-key axis
+  // (see `recordAxisName`). Mode-specific flag columns default-visible only in
+  // their mode.
+  .outputWithStatus("scoresTable", (ctx) => {
+    const scoreCols = ctx.outputs?.resolve("scoresData")?.getPColumns() as
+      | ScoresPColumn[]
+      | undefined;
+    if (scoreCols === undefined) return undefined;
+
+    const enrich = [
+      findOnRecordAxis(ctx, "pl7.app/structure/cdrh3Length", "Long"),
+      findOnRecordAxis(ctx, "pl7.app/label", "String"),
+      findOnRecordAxis(ctx, "pl7.app/clusterId", "String"),
+      findOnRecordAxis(ctx, "pl7.app/structure/clustering/isCentroid", "Int"),
+      findOnRecordAxis(ctx, "pl7.app/structure/clustering/tmDistanceToCentroid", "Double"),
+      findOnRecordAxis(ctx, "pl7.app/structure/clustering/tmScoreToCentroid", "Double"),
+    ].flat();
+
+    const mode = resolveMode(ctx);
+    return createPlDataTableV3(ctx, {
+      primaryColumns: scoreCols.map((c) => DataColumn.fromColumn(c)),
+      columns: enrich.map((c) => DataColumn.fromColumn(c)),
+      tableState: ctx.data.tableState,
+      displayOptions: mode
+        ? {
+            visibility: [
+              {
+                match: { name: "pl7.app/liabilities/sfvcspFlag" },
+                visibility: mode === "TAP" ? "default" : "optional",
+              },
+              {
+                match: { name: "pl7.app/liabilities/cdrh3CompactnessFlag" },
+                visibility: mode === "TNP" ? "default" : "optional",
+              },
+            ],
+          }
+        : undefined,
+    });
+  })
+  // Per-metric histograms. Each pair is a single-column PFrame + its spec.
+  // `ctx.createPFrame([col])` over `createPFrameForGraphs` so graph-maker
+  // binds the bound column rather than an unrelated sibling.
+  .outputWithStatus("pshPf", (ctx) => pfFromScores(ctx, "pl7.app/liabilities/psh"))
+  .output("pshSpec", (ctx) => specFromScores(ctx, "pl7.app/liabilities/psh"))
+  .outputWithStatus("ppcPf", (ctx) => pfFromScores(ctx, "pl7.app/liabilities/ppc"))
+  .output("ppcSpec", (ctx) => specFromScores(ctx, "pl7.app/liabilities/ppc"))
+  .outputWithStatus("pncPf", (ctx) => pfFromScores(ctx, "pl7.app/liabilities/pnc"))
+  .output("pncSpec", (ctx) => specFromScores(ctx, "pl7.app/liabilities/pnc"))
+  .outputWithStatus("sfvcspPf", (ctx) => pfFromScores(ctx, "pl7.app/liabilities/sfvcsp"))
+  .output("sfvcspSpec", (ctx) => specFromScores(ctx, "pl7.app/liabilities/sfvcsp"))
+  .outputWithStatus("cdrh3CompactnessPf", (ctx) =>
+    pfFromScores(ctx, "pl7.app/liabilities/cdrh3Compactness"),
+  )
+  .output("cdrh3CompactnessSpec", (ctx) =>
+    specFromScores(ctx, "pl7.app/liabilities/cdrh3Compactness"),
+  )
+  .outputWithStatus("devScorePf", (ctx) =>
+    pfFromScores(ctx, "pl7.app/liabilities/structuralDevelopabilityScore"),
+  )
+  .output("devScoreSpec", (ctx) =>
+    specFromScores(ctx, "pl7.app/liabilities/structuralDevelopabilityScore"),
+  )
+  // Per-clonotype PDB ResourceMap from the workflow's `pdbsMap` output;
+  // parsed into [{key, value}] pairs the viewer modal consumes via
+  // `entry.value.handle`.
+  .output("clonotypePdbsMap", (ctx) => {
+    const pCols = ctx.outputs?.resolve("pdbsMap")?.getPColumns();
+    if (pCols === undefined || pCols.length === 0) return undefined;
+    const parsed = parseResourceMap(pCols[0].data, (acc) => acc.getRemoteFileHandle(), false);
+    if (!parsed.isComplete) return undefined;
+    return parsed.data;
+  })
+  // Axis id of the record-key axis (scClonotypeKey for single-cell,
+  // clonotypeKey for bulk, variantKey for imported sets), used to attach the viewer-trigger
+  // button to that column in the table. Derive from the actual scoresData
+  // column (which is what populates the table), so the AxisId matches the
+  // table column's id byte-for-byte. Deriving from the PDB col's spec
+  // produced false negatives when its axis carried a domain that the
+  // table column did not.
+  .output("clonotypeAxisId", (ctx): AxisId | undefined => {
+    let cols: ScoresPColumn[] | undefined;
+    try {
+      cols = ctx.outputs?.resolve("scoresData")?.getPColumns() as ScoresPColumn[] | undefined;
+    } catch {
+      return undefined;
+    }
+    const first = cols?.[0];
+    // The record-key axis is named `scClonotypeKey` for single-cell data,
+    // `clonotypeKey` for bulk and `variantKey` for imported antibody sets; match
+    // any of them so the viewer-trigger button attaches in every regime (the
+    // scores column is single-keyed on it).
+    const found = first?.spec.axesSpec.find(
+      (a) =>
+        a.name === "pl7.app/vdj/scClonotypeKey" ||
+        a.name === "pl7.app/vdj/clonotypeKey" ||
+        a.name === "pl7.app/variantKey",
+    );
+    if (!found) return undefined;
+    return getAxisId(found);
+  })
+  .sections((ctx) => {
+    const mode = resolveMode(ctx);
+    const modeSpecificLabel =
+      mode === "TNP"
+        ? "CDRH3 compactness"
+        : mode === "TAP"
+          ? "Fv charge symmetry"
+          : "CDRH3 compactness / Fv charge symmetry";
+    return [
+      { type: "link", href: "/", label: "Main" },
+      { type: "link", href: "/histogram-psh", label: "Hydrophobicity" },
+      { type: "link", href: "/histogram-ppc", label: "Positive charge patches" },
+      { type: "link", href: "/histogram-pnc", label: "Negative charge patches" },
+      { type: "link", href: "/histogram-mode-specific", label: modeSpecificLabel },
+      { type: "link", href: "/histogram-developability", label: "Structural developability cost" },
+    ];
+  })
+  .title(() => "3D Structure-Based Liabilities")
+  .subtitle(
+    // Optional-chain `ctx.data`: the args-only context the middle layer
+    // uses for sidebar rendering can surface `data` as undefined before
+    // block storage is parsed. An unguarded deref throws and the
+    // platform substitutes "Invalid subtitle" as the visible string.
+    (ctx) => ctx.data?.customBlockLabel || defaultBlockLabelFor(ctx.data, resolveMode(ctx)),
+  )
+  .done();
+
+export type BlockOutputs = InferOutputsType<typeof platforma>;

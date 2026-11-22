@@ -1,0 +1,155 @@
+/* The native scene stays mounted; pending/unsafe views cannot appear accepted. */
+.editor-canvas[data-structure-valid="false"] [role="application"] {
+  visibility: hidden;
+}
+.recognition-editor-status {
+  position: absolute;
+  inset: 46px 42px 50px;
+  display: grid;
+  place-content: center;
+  gap: 12px;
+  text-align: center;
+  color: #687687;
+  background: #ffffffed;
+  z-index: 5;
+}
+/* Narrow desktop embeds can use two panels before the wider host layout takes over. */
+@media (min-width: 800px), (min-width: 730px) and (not (pointer: coarse)) {
+  .application.is-embedded {
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    padding: 0 10px 6px;
+  }
+  .application.is-embedded .app-header {
+    flex: 0 0 42px;
+    height: 42px;
+  }
+  .is-embedded .brand-icon {
+    width: 30px;
+    height: 30px;
+  }
+  .is-embedded .brand-icon svg {
+    width: 18px;
+  }
+  .is-embedded .brand h1 {
+    font-size: 16px;
+  }
+  .is-embedded :is(.brand span, .app-footer, .step-number) {
+    display: none;
+  }
+  .application.is-embedded .workbench {
+    flex: 1 0 auto;
+    grid-template-columns: minmax(252px, 0.85fr) minmax(0, 1.55fr);
+    border-radius: 10px;
+  }
+  .application.is-embedded :is(.input-panel, .output-panel) {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .application.is-embedded .panel-heading {
+    height: 38px;
+    padding-inline: 10px;
+  }
+  .is-embedded .input-panel {
+    border-right: 1px solid var(--border);
+    border-bottom: 0;
+  }
+  .application.is-embedded :is(.image-stage, .editor-canvas) {
+    flex: 1 0 260px;
+    min-height: 0;
+    height: auto;
+    margin-inline: 9px;
+  }
+  .application.is-embedded :is(.image-meta, .smiles-output, .output-panel > [role="note"]) {
+    min-height: 35px;
+    height: auto;
+    margin-block: 0;
+    padding: 3px 10px;
+    font-size: 12px;
+  }
+  .is-embedded .smiles-output textarea {
+    height: 29px;
+    padding-block: 5px;
+  }
+  .application.is-embedded .panel-footer {
+    min-height: 46px;
+    padding: 5px 10px;
+    gap: 6px;
+  }
+  .is-embedded .input-footer .recognize {
+    min-width: auto;
+    height: 34px;
+    padding-inline: 8px;
+    white-space: nowrap;
+  }
+  .is-embedded .examples select {
+    min-width: 0;
+    max-width: 107px;
+  }
+  .is-embedded .export-group {
+    gap: 4px;
+  }
+  .is-embedded .export-group button {
+    min-height: 32px;
+    padding: 5px 7px;
+  }
+}
+@media (min-width: 730px) and (max-height: 480px) and (not (pointer: coarse)) {
+  .application.is-embedded :is(.image-stage, .editor-canvas) {
+    flex-basis: 220px;
+  }
+}
+@media (730px <= width <= 820px) and (not (pointer: coarse)) {
+  .application.is-embedded .editor-canvas {
+    margin-inline: 5px;
+  }
+  .application.is-embedded .editor-canvas [data-testid="top-toolbar"] {
+    padding-inline: 5px;
+  }
+  .application.is-embedded .editor-canvas [data-testid="top-toolbar"] hr {
+    margin-inline: 2px;
+  }
+  .application.is-embedded .editor-canvas [data-testid="zoom-selector"] {
+    min-width: 54px;
+  }
+}
+@media (800px <= width <= 999px), (730px <= width < 800px) and (not (pointer: coarse)) {
+  .is-embedded .input-panel .toolbar {
+    gap: 4px;
+  }
+  .is-embedded .input-panel .toolbar > button {
+    width: 32px;
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+    justify-content: center;
+  }
+  .is-embedded .input-panel .toolbar > button > span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .is-embedded .input-footer .examples > svg {
+    display: none;
+  }
+  .is-embedded .input-footer .recognize {
+    font-size: 12px;
+  }
+}
+@media (max-width: 680px), (pointer: coarse) {
+  .app-header .power-switch {
+    flex: none;
+    width: 50px;
+    height: 44px;
+    min-height: 44px;
+    border-radius: 999px;
+  }
+  .app-header .power-switch[aria-checked="true"] span {
+    transform: translateX(27px);
+  }
+}

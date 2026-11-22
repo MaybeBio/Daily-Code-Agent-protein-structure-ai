@@ -1,0 +1,130 @@
+import { useRef, useState } from "react";
+import { StructureWorkbench } from "../presentation/StructureWorkbench";
+import type { Job, Language } from "../types";
+import { QualityPreview, qualityPreviewFiles } from "./QualityPreview";
+import { QualityMeasurements } from "./QualityMeasurements";
+import type { PoseQualityResult } from "./types";
+import { QualityCheckList } from "./QualityCheckList";
+import {
+  assessQuality,
+  attentionCount,
+  type QualityFilter,
+} from "./assessment";
+import { QualityAssessmentBar } from "./QualityAssessmentBar";
+import "../presentation/result-inspection.css";
+import "../presentation/spatial-result-review.css";
+import "./quality-results.css";
+
+interface QualityResultsProps {
+  job: Job;
+  result: PoseQualityResult;
+  language: Language;
+}
+
+export function QualityResults(props: QualityResultsProps) {
+  return <QualityWorkspace key={props.job.id} {...props} />;
+}
+
+function revealPanel(panel: HTMLElement | null) {
+  panel?.focus({ preventScroll: true });
+  panel?.scrollIntoView?.({ block: "start", behavior: "instant" });
+}
+
+function QualityWorkspace({ job, result, language }: QualityResultsProps) {
+  const zh = language === "zh";
+  const assessment = assessQuality(result);
+  const [choice, setChoice] = useState<QualityFilter>();
+  const filter =
+    choice ?? (attentionCount(assessment.counts) ? "attention" : "all");
+  const hasPreview = qualityPreviewFiles(result).length > 0;
+  const scene = useRef<HTMLDivElement>(null);
+  const review = useRef<HTMLElement>(null);
+  return (
+    <section
+      className={
+        "discovery-results quality-results" + (hasPreview ? " spatial-review" : "")
+      }
+      aria-label={zh ? "构象与姿势质控结果" : "Pose quality results"}
+    >
+      <StructureWorkbench
+        toolbar={
+          hasPreview && (
+            <button
+              className="secondary-button quality-panel-jump"
+              type="button"
+              onClick={() => revealPanel(review.current)}
+            >
+              {zh ? "查看检查" : "Review checks"}
+            </button>
+          )
+        }
+        preview={
+          <div
+            className="result-inspection-detail quality-scene"
+            ref={scene}
+            tabIndex={hasPreview ? -1 : undefined}
+            role="region"
+            aria-label={zh ? "姿势三维预览" : "Pose 3D preview"}
+          >
+            <QualityPreview
+              key={job.id}
+              job={job}
+              result={result}
+              language={language}
+            />
+          </div>
+        }
+      >
+        <section
+          className="quality-review"
+          ref={review}
+          tabIndex={-1}
+          aria-label={zh ? "质量判读" : "Quality review"}
+        >
+          {hasPreview && (
+            <button
+              className="secondary-button quality-panel-jump"
+              type="button"
+              onClick={() => revealPanel(scene.current)}
+            >
+              {zh ? "返回三维" : "Return to 3D"}
+            </button>
+          )}
+          <QualityAssessmentBar
+            assessment={assessment}
+            language={language}
+            filter={filter}
+            onFilter={setChoice}
+          />
+          <QualityMeasurements result={result} language={language} />
+          <QualityCheckList
+            key={job.id}
+            checks={assessment.checks}
+            filter={filter}
+            language={language}
+          />
+        </section>
+      </StructureWorkbench>
+      <details className="quality-method-details">
+        <summary>
+          {zh ? "方法与评估范围" : "Method and assessment scope"}
+        </summary>
+        <p>
+          {zh
+            ? `原始报告：${assessment.nativeCounts.pass} 项通过，${assessment.nativeCounts.fail} 项需复核，${assessment.nativeCounts.unavailable} 项未能计算。原始报告和坐标保持完整，本页另行标出未评估及不适用的项目。`
+            : `Source report: ${assessment.nativeCounts.pass} passed, ${assessment.nativeCounts.fail} need review, ${assessment.nativeCounts.unavailable} were not calculated. Original reports and coordinates are retained; this view separately identifies unassessed and inapplicable items.`}
+        </p>
+        <p>
+          {zh
+            ? "本页的“未评估”表示报告没有提供有效几何测量，不改写原始判定。原程序可能在检测范围内没有相关原子时给出“无碰撞”；这不能证明真实体系中没有水或辅因子。分子靠近受体，也不排除距离过近的碰撞。"
+            : "Here, not assessed means that the report contains no valid geometric measurement; the original decision is retained. The engine may report no clash when no matching atoms are in its search range. This does not establish that water or cofactors are absent in the biological system. Being near a receptor does not rule out an overly close clash."}
+        </p>
+        <p>
+          {zh
+            ? "先复核输入和三维姿势，必要时另建准备、对接或优化任务。原始分子保持原样。未能计算时需要复核输入或计算条件，不能自动视为合格；质控不是活性或亲和力预测。"
+            : "Review inputs and coordinates, then create a separate preparation, docking or refinement task if needed. Original molecules remain unchanged. Missing checks need input or compute-condition review and never qualify automatically. This is not activity or affinity prediction."}
+        </p>
+      </details>
+    </section>
+  );
+}

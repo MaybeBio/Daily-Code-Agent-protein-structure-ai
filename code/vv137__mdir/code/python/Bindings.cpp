@@ -1,0 +1,2388 @@
+// Owned Python inputs; collections cross the boundary by value.
+#include "mdir/Compiler/Compile.h"
+#include "mdir/Compiler/Simulation.h"
+#include "mdir/Compiler/Skins.h"
+#include "mdir/Driver/H5MD.h"
+#include "mdir/Driver/ModelTerm.h"
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <memory>
+#include <cstdlib>
+#include <mutex>
+#include <stdexcept>
+#include <optional>
+#include <set>
+namespace py = pybind11;
+using namespace mdir;
+struct InputError : std::runtime_error { using std::runtime_error::runtime_error; };
+struct UnsupportedError : std::runtime_error { using std::runtime_error::runtime_error; };
+struct CompileError : std::runtime_error { using std::runtime_error::runtime_error; };
+struct StaleProgramError : std::runtime_error { using std::runtime_error::runtime_error; };
+struct SimulationError : std::runtime_error { using std::runtime_error::runtime_error; };
+[[noreturn]] static void raise(llvm::Error error) {
+  bool unsupported = false, compile = false, simulation = false;
+  std::string message;
+  llvm::handleAllErrors(std::move(error),
+    [&](const model::ModelError &e) {
+      unsupported = e.kind == model::ModelError::Unsupported; message = e.message;
+    }, [&](const compiler::CompileError &e) {
+      compile = true; message = e.diagnostic;
+    }, [&](const compiler::SimulationError &e) {
+      simulation = true; message = e.message;
+    }, [&](const llvm::ErrorInfoBase &e) {
+      llvm::raw_string_ostream os(message); e.log(os);
+    });
+  if (unsupported) throw UnsupportedError(message);
+  if (compile) throw CompileError(message);
+  if (simulation) throw SimulationError(message);
+  throw InputError(message);
+}
+template <class T> static T unwrap(llvm::Expected<T> value) {
+  if (!value) raise(value.takeError());
+  return std::move(*value);
+}
+#include "Units.h"
+#include "HostArrays.h"
+#include "Tunables.h"
+#include "DLPack.h"
+#include "Topology.h"
+#include "XlaFfi.h"
+
+struct Version {
+  uint64_t version = 0;
+  /// The attributes given explicitly, which the fingerprint of a checkpoint
+  /// records (D223).
+  std::set<std::string> given;
+  virtual ~Version() = default;
+};
+template <class T> struct Input : Version { T value; std::optional<size_t> particleCount; };
+/// The type of `mdir.Auto` (D281).
+struct AutoValue {};
+template <class T, class V>
+static void property(py::class_<Input<T>, std::shared_ptr<Input<T>>> &c,
+                     const char *name, V T::*member) {
+  c.def_property(name, [member](const Input<T> &o) { return o.value.*member; },
+    [member, name](Input<T> &o, V value) {
+      o.value.*member = std::move(value); ++o.version; o.given.insert(name);
+    });
+}
+/// A real-valued property in `unit`, which also takes a unit quantity.
+template <class T>
+static void property(py::class_<Input<T>, std::shared_ptr<Input<T>>> &c,
+                     const char *name, double T::*member, units::Unit unit) {
+  std::string qualified = py::cast<std::string>(c.attr("__name__")) + "." + name;
+  c.def_property(name, [member](const Input<T> &o) { return o.value.*member; },
+    [member, qualified, unit, name](Input<T> &o, py::object value) {
+      o.value.*member = units::scalar(value, qualified, unit); ++o.version;
+      o.given.insert(name);
+    });
+}
+/// A real-valued property in `unit` that may be absent: None.
+template <class T>
+static void optionalProperty(py::class_<Input<T>, std::shared_ptr<Input<T>>> &c,
+                             const char *name, std::optional<double> T::*member,
+                             units::Unit unit) {
+  std::string qualified = py::cast<std::string>(c.attr("__name__")) + "." + name;
+  c.def_property(name, [member](const Input<T> &o) -> py::object {
+      if (!(o.value.*member)) return py::none();
+      return py::float_(*(o.value.*member));
+    },
+    [member, qualified, unit, name](Input<T> &o, py::object value) {
+      if (value.is_none()) {
+        (o.value.*member).reset(); o.given.erase(name);
+      } else {
+        o.value.*member = units::scalar(value, qualified, unit); o.given.insert(name);
+      }
+      ++o.version;
+    });
+}
+template <class T> static auto input(py::module_ &m, const char *name) {
+  return py::class_<Input<T>, std::shared_ptr<Input<T>>>(m, name).def(py::init<>());
+}
+struct Program {
+  /// The built program and its pipeline; not lowered (D224).
+  compiler::CompiledProgram compiled;
+  /// The lowered text, made on the first read of `lowered_ir`, under the
+  /// mutex, by the thread that reads it first.
+  struct Lowering {
+    std::mutex mutex;
+    std::optional<std::string> text;
+  };
+  std::shared_ptr<Lowering> lowering = std::make_shared<Lowering>();
+  /// What a simulation compiles its programs from (D196).
+  std::shared_ptr<const model::PreparedModel> prepared;
+  /// The code that its simulations left, which later ones take
+  /// (D236); freed with the program.
+  std::shared_ptr<compiler::CodeStore> code =
+      std::make_shared<compiler::CodeStore>();
+  /// Whether its compilations use the compile cache, the default of its
+  /// simulations (D217).
+  bool cache = true;
+  /// The program of the terms that a tunable enters (D243), once a frame
+  /// evaluator has asked for it: a second evaluator takes it, with the
+  /// code that the first left in its store (D251).
+  mutable std::shared_ptr<Program> dependent;
+  std::vector<std::pair<std::shared_ptr<Version>, uint64_t>> inputs;
+  template <class T> void track(const std::shared_ptr<Input<T>> &o) {
+    inputs.emplace_back(o, o->version);
+  }
+  bool stale() const {
+    for (const auto &o : inputs) if (o.first->version != o.second) return true;
+    return false;
+  }
+  void checkCurrent() const {
+    if (stale()) throw StaleProgramError("compile inputs changed; explicitly recompile the program");
+  }
+};
+// Runs `call` with the GIL released. Signals reach Python between parts; a
+// KeyboardInterrupt ends the call there and is raised once the GIL is held
+// again.
+template <class Call> static int64_t withSignals(Call call) {
+  std::optional<py::error_already_set> interrupt;
+  std::optional<llvm::Expected<int64_t>> taken;
+  {
+    py::gil_scoped_release release;
+    taken.emplace(call([&] {
+      py::gil_scoped_acquire acquire;
+      if (PyErr_CheckSignals() != 0) {
+        interrupt.emplace();
+        return true;
+      }
+      return false;
+    }));
+  }
+  if (interrupt) {
+    if (!*taken) llvm::consumeError(taken->takeError());
+    throw *interrupt;
+  }
+  return unwrap(std::move(*taken));
+}
+/// Reads a checkpoint for a simulation (D223): without
+/// HDF5 an UnsupportedError, and a file that is not one, of a newer format,
+/// or whose hashes differ an InputError with the pointer to `.prev` that
+/// `mdir run` gives.
+static driver::Checkpoint readCheckpointFile(const std::string &path) {
+  if (!driver::hasCheckpointSupport())
+    throw UnsupportedError("this build of MDIR has no HDF5, which checkpoints need");
+  // Without the GIL: the read waits for the mutex of the library (#262),
+  // which a thread that writes holds without the GIL.
+  std::optional<llvm::Expected<driver::Checkpoint>> taken;
+  {
+    py::gil_scoped_release release;
+    taken.emplace(driver::readCheckpoint(path));
+  }
+  auto &read = *taken;
+  if (!read)
+    throw InputError(llvm::toString(read.takeError()) + "; '" +
+                     driver::getPreviousCheckpointPath(path) +
+                     "' holds the checkpoint before it, if there is one");
+  return std::move(*read);
+}
+static py::array_t<double> vectors(const std::vector<double> &values) {
+  return host::copy(values.data(), values.size(),
+                    {static_cast<py::ssize_t>(values.size() / 3), 3});
+}
+/// `observe` of a term (D189, D232): None, the term is not
+/// observed, or the names of the constants whose derivatives are, with its
+/// energy.
+template <class Term> static py::object observeOf(const Term &term) {
+  if (!term.observed) return py::none();
+  return py::cast(term.observe);
+}
+template <class Term>
+static void setObserve(Term &term, py::object value, const char *name) {
+  if (value.is_none()) {
+    term.observed = false;
+    term.observe.clear();
+    return;
+  }
+  std::string message = std::string(name) + ".observe takes None or a list of the names "
+                        "of constants of the term";
+  if (py::isinstance<py::str>(value) || !py::isinstance<py::sequence>(value))
+    throw py::type_error(message);
+  std::vector<std::string> names;
+  for (py::handle item : value) {
+    if (!py::isinstance<py::str>(item)) throw py::type_error(message);
+    names.push_back(item.cast<std::string>());
+  }
+  term.observed = true;
+  term.observe = std::move(names);
+}
+PYBIND11_MODULE(_core, m) {
+  // The program of a model term asks the plugin beside the runtime for the
+  // model's cutoff when it is built (D277).
+  driver::setPluginDirectory(compiler::getRuntimeDirectory());
+  // Required at import as well as configuration, including installed modules.
+  try {
+    auto numpy = py::module_::import("numpy");
+    auto version = numpy.attr("lib").attr("NumpyVersion")(numpy.attr("__version__"));
+    if (!py::cast<bool>(version.attr("__ge__")("1.23.0")))
+      throw py::import_error("The MDIR Python interface requires NumPy >=1.23");
+  } catch (const py::error_already_set &e) {
+    throw py::import_error(std::string("The MDIR Python interface requires NumPy >=1.23: ") + e.what());
+  }
+  m.attr("__version__") = MDIR_VERSION;
+  py::register_exception<InputError>(m, "InputError", PyExc_ValueError);
+  py::register_exception<UnsupportedError>(m, "UnsupportedError");
+  py::register_exception<CompileError>(m, "CompileError");
+  py::register_exception<StaleProgramError>(m, "StaleProgramError");
+  py::register_exception<SimulationError>(m, "SimulationError", PyExc_RuntimeError);
+  py::enum_<driver::Target>(m, "Target")
+    .value("CPU", driver::Target::CPU)
+    .value("GPU", driver::Target::GPU)
+    ;
+  py::enum_<driver::Precision>(m, "Precision")
+    .value("Single", driver::Precision::Single)
+    .value("Mixed", driver::Precision::Mixed)
+    .value("Double", driver::Precision::Double)
+    ;
+  // `[execution] neighbor_structure` (D89, D245).
+  py::enum_<driver::NeighborStructure>(m, "NeighborStructure")
+    .value("Matrix", driver::NeighborStructure::Matrix)
+    .value("Groups", driver::NeighborStructure::Groups)
+    .value("Auto", driver::NeighborStructure::Auto);
+  // `[performance] rigid_units` (D424).
+  py::enum_<driver::RigidUnits>(m, "RigidUnits")
+    .value("Auto", driver::RigidUnits::Auto)
+    .value("On", driver::RigidUnits::On)
+    .value("Off", driver::RigidUnits::Off);
+  // `mdir.Auto`, the value of a reach that the run chooses, as "AUTO" of
+  // the control file (D281).
+  py::class_<AutoValue>(m, "AutoType")
+    .def("__repr__", [](const AutoValue &) { return "mdir.Auto"; })
+    .def("__eq__", [](const AutoValue &, py::object other) {
+      return py::isinstance<AutoValue>(other);
+    })
+    .def("__hash__", [](const AutoValue &) { return 0x417554; });
+  m.attr("Auto") = AutoValue{};
+  py::enum_<driver::Integrator>(m, "IntegratorMethod")
+    .value("VelocityVerlet", driver::Integrator::VelocityVerlet)
+    .value("Leapfrog", driver::Integrator::Leapfrog)
+    .value("Brownian", driver::Integrator::Brownian)
+    ;
+  // `[thermostat] method` (D249).
+  py::enum_<driver::ThermostatMethod>(m, "ThermostatMethod")
+    .value("VRescale", driver::ThermostatMethod::VRescale)
+    .value("Langevin", driver::ThermostatMethod::Langevin)
+    .value("NoseHoover", driver::ThermostatMethod::NoseHoover);
+  py::enum_<model::EnsembleKind>(m, "EnsembleKind")
+    .value("NVE", model::EnsembleKind::NVE)
+    .value("NVT", model::EnsembleKind::NVT)
+    .value("NPT", model::EnsembleKind::NPT)
+    ;
+  // `[pme] influence` (D134, D246).
+  py::enum_<model::PMEInfluence>(m, "PMEInfluence")
+    .value("SPME", model::PMEInfluence::SPME)
+    .value("Optimal", model::PMEInfluence::Optimal)
+    .value("P3M", model::PMEInfluence::P3M);
+  // The kernel of PME: the Gaussian, or the prolate spheroidal wave
+  // function of Ewald summation with prolates (D266).
+  py::enum_<driver::PMEKernel>(m, "PMEKernel")
+    .value("Gaussian", driver::PMEKernel::Gaussian)
+    .value("Prolate", driver::PMEKernel::Prolate);
+  // `[barostat] coupling` and `work` (D247).
+  py::enum_<model::BarostatCoupling>(m, "BarostatCoupling")
+    .value("Isotropic", model::BarostatCoupling::Isotropic)
+    .value("SemiIsotropic", model::BarostatCoupling::SemiIsotropic)
+    .value("Anisotropic", model::BarostatCoupling::Anisotropic);
+  py::enum_<driver::BarostatWork>(m, "BarostatWork")
+    .value("Trotter", driver::BarostatWork::Trotter)
+    .value("TrotterFirstOrder", driver::BarostatWork::TrotterFirstOrder)
+    .value("Exact", driver::BarostatWork::Exact)
+    .value("FirstOrder", driver::BarostatWork::FirstOrder);
+  py::enum_<model::Electrostatics>(m, "Electrostatics")
+    .value("Cutoff", model::Electrostatics::Cutoff)
+    .value("PME", model::Electrostatics::PME)
+    ;
+  py::enum_<model::CoulombModifier>(m, "CoulombModifier")
+    .value("None_", model::CoulombModifier::None)
+    .value("PotentialShift", model::CoulombModifier::PotentialShift)
+    ;
+  py::enum_<driver::Truncation>(m, "Truncation")
+    .value("None_", driver::Truncation::None)
+    .value("Shift", driver::Truncation::Shift)
+    .value("Switch", driver::Truncation::Switch)
+    .value("ForceSwitch", driver::Truncation::ForceSwitch)
+    .value("PowerForceSwitch", driver::Truncation::PowerForceSwitch)
+    .value("SquaredDistanceSwitch", driver::Truncation::SquaredDistanceSwitch)
+    ;
+  py::enum_<driver::DispersionCorrection>(m, "DispersionCorrection")
+    .value("None_", driver::DispersionCorrection::None)
+    .value("EnergyPressure", driver::DispersionCorrection::EnergyPressure)
+    ;
+  py::enum_<model::Format>(m, "Format")
+    .value("Amber", model::Format::Amber)
+    .value("Gromacs", model::Format::Gromacs)
+    .value("Charmm", model::Format::Charmm)
+    ;
+  auto cell = py::class_<driver::Cell>(m, "Cell").def(py::init<>());
+  for (auto item : {std::make_pair("diagonal", &driver::Cell::diagonal),
+                    std::make_pair("tilt", &driver::Cell::tilt)}) {
+    auto member = item.second;
+    std::string name = std::string("Cell.") + item.first;
+    cell.def_property(item.first, [member](const driver::Cell &c) {
+      return host::copy((c.*member).data(), 3, {3});
+    }, [member, name](driver::Cell &c, py::object input) {
+      auto values = host::doubles(input, name, 3, {}, units::nm);
+      std::copy(values.begin(), values.end(), (c.*member).begin());
+    });
+  }
+  cell.def_property_readonly("vectors", [](const driver::Cell &c) {
+    auto vectors = c.getVectors();
+    std::array<double, 9> values;
+    for (size_t i = 0; i < 3; ++i)
+      std::copy(vectors[i].begin(), vectors[i].end(), values.begin() + 3 * i);
+    return host::copy(values.data(), values.size(), {3, 3});
+  });
+  py::class_<driver::PairTerm>(m, "PairTerm").def(py::init<>())
+    .def_readwrite("name", &driver::PairTerm::name)
+    .def_readwrite("expression", &driver::PairTerm::expression)
+    .def_readwrite("constants", &driver::PairTerm::constants)
+    .def_readwrite("groups", &driver::PairTerm::groups)
+    .def_property("observe", [](const driver::PairTerm &t) { return observeOf(t); },
+                  [](driver::PairTerm &t, py::object value) { setObserve(t, value, "PairTerm"); })
+    // `dispersion_correction` of the term (D209, D222):
+    // None (Python's) follows the system, DispersionCorrection.None_ leaves
+    // the term out of the correction, EnergyPressure asks for its tail.
+    .def_property("dispersion", [](const driver::PairTerm &t) -> py::object {
+      if (!t.dispersionGiven) return py::none();
+      return py::cast(t.dispersion);
+    }, [](driver::PairTerm &t, py::object value) {
+      if (!value.is_none() && !py::isinstance<driver::DispersionCorrection>(value))
+        throw py::type_error("PairTerm.dispersion takes a DispersionCorrection or None");
+      t.dispersionGiven = !value.is_none();
+      t.dispersion = t.dispersionGiven ? value.cast<driver::DispersionCorrection>()
+                                       : driver::DispersionCorrection::None;
+    });
+  py::class_<driver::TupleTerm>(m, "TupleTerm").def(py::init<>())
+    .def_readwrite("name", &driver::TupleTerm::name)
+    .def_readwrite("expression", &driver::TupleTerm::expression)
+    .def_readwrite("arity", &driver::TupleTerm::arity)
+    .def_property("particles", [](const driver::TupleTerm &t) { return host::particles(t); },
+                  [](driver::TupleTerm &t, py::object value) { host::particles(t, value); })
+    .def_property("parameters", [](const driver::TupleTerm &t) { return host::parameters(t); },
+                  [](driver::TupleTerm &t, py::sequence value) { host::parameters(t, value); })
+    .def_property("observe", [](const driver::TupleTerm &t) { return observeOf(t); },
+                  [](driver::TupleTerm &t, py::object value) { setObserve(t, value, "TupleTerm"); });
+  // Terms of the absolute positions, `[[energy.external]]` (D148,
+  // D233): x, y, z in nm, the charge q, kJ/mol.
+  py::enum_<driver::ExternalTerm::Scaling>(m, "ExternalScaling")
+    .value("None_", driver::ExternalTerm::Scaling::None)
+    .value("Cell", driver::ExternalTerm::Scaling::Cell)
+    ;
+  py::class_<driver::ExternalTerm>(m, "ExternalTerm").def(py::init<>())
+    .def_readwrite("name", &driver::ExternalTerm::name)
+    .def_readwrite("expression", &driver::ExternalTerm::expression)
+    .def_readwrite("selection", &driver::ExternalTerm::selection)
+    .def_readwrite("constants", &driver::ExternalTerm::constants)
+    .def_property("particles", [](const driver::ExternalTerm &t) {
+      std::vector<int64_t> values(t.particles.begin(), t.particles.end());
+      return host::copy(values.data(), values.size(), {static_cast<py::ssize_t>(values.size())});
+    }, [](driver::ExternalTerm &t, py::object source) {
+      const std::string name = "ExternalTerm.particles";
+      auto values = py::array_t<int64_t, py::array::c_style | py::array::forcecast>::ensure(source);
+      if (!values || values.ndim() != 1)
+        throw InputError(name + ": expected a one-dimensional array of particle indices, from 0");
+      std::vector<unsigned> particles;
+      for (py::ssize_t k = 0; k != values.shape(0); ++k) {
+        int64_t value = values.at(k);
+        if (value < 0 || static_cast<uint64_t>(value) > std::numeric_limits<unsigned>::max())
+          throw InputError(name + ": a particle index is negative or exceeds the native range");
+        particles.push_back(static_cast<unsigned>(value));
+      }
+      t.particles = std::move(particles);
+    })
+    // How the term follows a barostat (D154): None (Python's) leaves it
+    // unset, which a model with a barostat refuses.
+    .def_property("scaling", [](const driver::ExternalTerm &t) -> py::object {
+      if (t.scaling == driver::ExternalTerm::Scaling::Unset) return py::none();
+      return py::cast(t.scaling);
+    }, [](driver::ExternalTerm &t, py::object value) {
+      if (!value.is_none() && !py::isinstance<driver::ExternalTerm::Scaling>(value))
+        throw py::type_error("ExternalTerm.scaling takes an ExternalScaling or None");
+      t.scaling = value.is_none() ? driver::ExternalTerm::Scaling::Unset
+                                  : value.cast<driver::ExternalTerm::Scaling>();
+    })
+    .def_property("observe", [](const driver::ExternalTerm &t) { return observeOf(t); },
+                  [](driver::ExternalTerm &t, py::object value) { setObserve(t, value, "ExternalTerm"); });
+  // Learned potentials, `[[energy.model]]` (D270): a
+  // metatomic artifact or an AOTInductor package (D273) evaluated
+  // through the optional plugin, on a GPU.
+  py::class_<driver::Control::ModelTerm>(m, "ModelTerm")
+    .def(py::init([](std::string name, std::string path, std::string backend,
+                     int64_t centersPerCall, std::string stageFieldPrecision) {
+           driver::Control::ModelTerm term;
+           term.name = std::move(name);
+           term.path = std::move(path);
+           term.backend = std::move(backend);
+           term.centersPerCall = centersPerCall;
+           term.stageFieldPrecision = std::move(stageFieldPrecision);
+           return term;
+         }),
+         py::arg("name"), py::arg("path"), py::arg("backend") = "METATOMIC",
+         py::arg("centers_per_call") = 0,
+         py::arg("stage_field_precision") = "")
+    .def_readwrite("name", &driver::Control::ModelTerm::name)
+    .def_readwrite("path", &driver::Control::ModelTerm::path)
+    .def_readwrite("backend", &driver::Control::ModelTerm::backend)
+    .def_readwrite("centers_per_call", &driver::Control::ModelTerm::centersPerCall)
+    .def_readwrite("stage_field_precision", &driver::Control::ModelTerm::stageFieldPrecision)
+    .def("__repr__", [](const driver::Control::ModelTerm &t) {
+      return "ModelTerm(name='" + t.name + "', path='" + t.path + "', backend='" +
+             t.backend + "', centers_per_call=" + std::to_string(t.centersPerCall) +
+             (t.stageFieldPrecision.empty()
+                  ? ""
+                  : ", stage_field_precision='" + t.stageFieldPrecision + "'") +
+             ")";
+    });
+  // Tunable parameters (D213).
+  tunables::bindTunable(m);
+  // Read-only topology views (D221).
+  topology::bind(m);
+  // Restraints (D74, D124; D198).
+  py::enum_<driver::ReferenceScaling>(m, "ReferenceScaling")
+    .value("Center", driver::ReferenceScaling::Center)
+    .value("All", driver::ReferenceScaling::All)
+    ;
+  py::class_<model::System::Restraint>(m, "Restraint")
+    .def(py::init<>())
+    .def(py::init([](std::string selection, py::object forceConstant,
+                     driver::ReferenceScaling scaling) {
+      return model::System::Restraint{
+          std::move(selection),
+          units::scalar(forceConstant, "Restraint.force_constant", units::springConstant), scaling};
+    }), py::arg("selection"), py::arg("force_constant"),
+        py::arg("reference_scaling") = driver::ReferenceScaling::Center)
+    .def_readwrite("selection", &model::System::Restraint::selection)
+    .def_property("force_constant",
+                  [](const model::System::Restraint &r) { return r.forceConstant; },
+                  [](model::System::Restraint &r, py::object value) {
+                    r.forceConstant = units::scalar(value, "Restraint.force_constant",
+                                                    units::springConstant);
+                  })
+    .def_readwrite("reference_scaling", &model::System::Restraint::scaling);
+  auto system = input<model::System>(m, "System");
+  property(system, "periodic", &model::System::periodic);
+  property(system, "cutoff", &model::System::cutoff, units::nm);
+  // Not set (or set to None), the two follow the cutoff as the control
+  // file without their keys: 0.15 nm beyond it, and the cutoff itself
+  // (D248). Reading gives the value in effect.
+  auto followsCutoff = [&system](const char *name, std::optional<double> model::System::*member,
+                                 double (model::System::*effective)() const) {
+    std::string qualified = std::string("System.") + name;
+    system.def_property(name, [effective](const Input<model::System> &o) {
+      return (o.value.*effective)();
+    }, [member, qualified, name](Input<model::System> &o, py::object value) {
+      if (value.is_none()) {
+        (o.value.*member).reset(); o.given.erase(name);
+      } else {
+        o.value.*member = units::scalar(value, qualified, units::nm); o.given.insert(name);
+      }
+      ++o.version;
+    });
+  };
+  // The reaches take `mdir.Auto` as well (D281): the run chooses
+  // them, from the defaults or the cache of earlier choices.
+  system.def_property("pairlist_distance", [](const Input<model::System> &o) -> py::object {
+    if (o.value.pairlistDistanceAuto) return py::cast(AutoValue{});
+    return py::float_(o.value.getPairlistDistance());
+  }, [](Input<model::System> &o, py::object value) {
+    o.value.pairlistDistanceAuto = py::isinstance<AutoValue>(value);
+    if (value.is_none() || o.value.pairlistDistanceAuto) {
+      o.value.pairlistDistance.reset();
+      if (o.value.pairlistDistanceAuto) o.given.insert("pairlist_distance");
+      else o.given.erase("pairlist_distance");
+    } else {
+      o.value.pairlistDistance =
+          units::scalar(value, "System.pairlist_distance", units::nm);
+      o.given.insert("pairlist_distance");
+    }
+    ++o.version;
+  });
+  followsCutoff("switch_distance", &model::System::switchDistance,
+                &model::System::getSwitchDistance);
+  system.def_property("pruned_distance", [](const Input<model::System> &o) -> py::object {
+    if (o.value.prunedDistanceAuto) return py::cast(AutoValue{});
+    return py::float_(o.value.prunedDistance);
+  }, [](Input<model::System> &o, py::object value) {
+    o.value.prunedDistanceAuto = py::isinstance<AutoValue>(value);
+    o.value.prunedDistance =
+        o.value.prunedDistanceAuto
+            ? 0.0
+            : units::scalar(value, "System.pruned_distance", units::nm);
+    o.given.insert("pruned_distance");
+    ++o.version;
+  });
+  property(system, "truncation", &model::System::truncation);
+  property(system, "electrostatics", &model::System::electrostatics);
+  property(system, "coulomb_modifier", &model::System::coulombModifier);
+  // Setting the correction makes it explicit, as the key of the control
+  // file; None restores the default (D222).
+  system.def_property("dispersion", [](const Input<model::System> &o) {
+    return o.value.dispersion;
+  }, [](Input<model::System> &o, py::object value) {
+    if (!value.is_none() && !py::isinstance<driver::DispersionCorrection>(value))
+      throw py::type_error("System.dispersion takes a DispersionCorrection or None");
+    o.value.dispersionGiven = !value.is_none();
+    o.value.dispersion = o.value.dispersionGiven
+                             ? value.cast<driver::DispersionCorrection>()
+                             : driver::DispersionCorrection::EnergyPressure;
+    ++o.version;
+  });
+  system.def_property_readonly("dispersion_given", [](const Input<model::System> &o) {
+    return o.value.dispersionGiven;
+  });
+  property(system, "pme_alpha", &model::System::pmeAlpha, units::inverseNm);
+  property(system, "pme_tolerance", &model::System::pmeTolerance, units::none);
+  property(system, "pme_spacing", &model::System::pmeSpacing, units::nm);
+  property(system, "pme_grid", &model::System::pmeGrid);
+  property(system, "pme_order", &model::System::pmeOrder);
+  property(system, "pme_influence", &model::System::pmeInfluence);
+  property(system, "pme_kernel", &model::System::pmeKernel);
+  property(system, "pme_bandwidth", &model::System::pmeBandwidth, units::none);
+  property(system, "pme_window_bandwidth", &model::System::pmeWindowBandwidth, units::none);
+  property(system, "analytic_bonds", &model::System::analyticBonds);
+  property(system, "rigid_hydrogen_bonds", &model::System::rigidHydrogenBonds);
+  property(system, "rigid_water", &model::System::rigidWater);
+  property(system, "flexible_water", &model::System::flexibleWater);
+  property(system, "water_residues", &model::System::waterResidues);
+  property(system, "pair_terms", &model::System::pairTerms);
+  property(system, "tuple_terms", &model::System::tupleTerms);
+  property(system, "external_terms", &model::System::externalTerms);
+  property(system, "models", &model::System::models);
+  property(system, "restraints", &model::System::restraints);
+  property(system, "tunables", &model::System::tunables);
+  // Whether the program carries the derivative of the energy in the
+  // tunables (D230).
+  property(system, "tunable_gradient", &model::System::tunableGradient);
+  system.def_property("restraint_reference", [](const Input<model::System> &o) {
+    const auto &v = o.value.restraintReference;
+    return host::copy(v.data(), v.size(), {static_cast<py::ssize_t>(v.size() / 3), 3});
+  }, [](Input<model::System> &o, py::object source) {
+    const std::string name = "System.restraint_reference";
+    auto values = host::doubles(source, name, {}, 3, units::nm);
+    size_t count = values.size() / 3, particles = o.value.topology.getNumParticles();
+    if (count != 0 && count != particles)
+      throw InputError(name + ": expected shape (" + std::to_string(particles) +
+                       ", 3) or (0, 3); found (" + std::to_string(count) + ", 3)");
+    o.value.restraintReference = std::move(values);
+    ++o.version;
+  });
+  auto initialstate = input<model::InitialState>(m, "InitialState");
+  for (auto item : {std::make_pair("positions", &model::InitialState::positions),
+                    std::make_pair("velocities", &model::InitialState::velocities)}) {
+    auto member = item.second;
+    bool velocity = member == &model::InitialState::velocities;
+    std::string name = std::string("InitialState.") + item.first;
+    initialstate.def_property(item.first, [member](const Input<model::InitialState> &o) {
+      const auto &v = o.value.*member;
+      return host::copy(v.data(), v.size(), {static_cast<py::ssize_t>(v.size() / 3), 3});
+    }, [member, velocity, name](Input<model::InitialState> &o, py::object source) {
+      auto values = host::doubles(source, name, {}, 3, velocity ? units::nmPerPs : units::nm);
+      size_t count = values.size() / 3;
+      if (o.particleCount && count != *o.particleCount && !(velocity && count == 0))
+        throw InputError(name + ": expected shape (" + std::to_string(*o.particleCount) +
+                         ", 3); found (" + std::to_string(count) + ", 3)");
+      o.value.*member = std::move(values);
+      if (!o.particleCount && count) o.particleCount = count;
+      ++o.version;
+    });
+  }
+  property(initialstate, "cell", &model::InitialState::cell);
+  // The velocities that `mdir run` draws for the same system, temperature,
+  // and seed, in a new state (D198).
+  initialstate.def("draw_velocities", [](const Input<model::InitialState> &o,
+                                         std::shared_ptr<Input<model::System>> system,
+                                         py::object temperatureValue, py::int_ seed) {
+    if (!system) throw InputError("draw_velocities takes a System");
+    double temperature = units::scalar(temperatureValue, "draw_velocities: temperature",
+                                       units::kelvin);
+    int overflow = 0;
+    long long value = PyLong_AsLongLongAndOverflow(seed.ptr(), &overflow);
+    if (overflow || value < 0)
+      throw InputError("draw_velocities: the seed must be from 0 to 2^63-1, as [dynamics] seed");
+    auto result = std::make_shared<Input<model::InitialState>>();
+    result->value = unwrap(model::drawVelocities(system->value, o.value, temperature,
+                                                 static_cast<uint64_t>(value)));
+    result->particleCount = o.particleCount;
+    if (!result->particleCount && !o.value.positions.empty())
+      result->particleCount = o.value.positions.size() / 3;
+    return result;
+  }, py::arg("system"), py::arg("temperature"), py::arg("seed"));
+  // A new initial state from the state that a simulation reached: copies of
+  // its positions, its cell, and, unless velocities=False or it has none, its
+  // velocities. A new stage begins there; the baths, the step, and the
+  // random streams are not carried (a continuation is a checkpoint's, #132).
+  initialstate.def_static("from_state", [](const compiler::SimulationState &state,
+                                           bool velocities) {
+    auto result = std::make_shared<Input<model::InitialState>>();
+    result->value.positions = state.positions;
+    if (velocities && !state.velocities.empty()) {
+      if (state.velocityOffset != 0.0)
+        throw InputError("InitialState.from_state: the velocities of this state are " +
+                         std::to_string(state.velocityOffset) +
+                         " of a step from its positions (leapfrog); an initial state takes "
+                         "velocities at the time of its positions. Give velocities=False "
+                         "and draw them, or continue the simulation itself");
+      result->value.velocities = state.velocities;
+    }
+    for (int k = 0; k != 3; ++k) {
+      result->value.cell.diagonal[k] = state.box[k];
+      result->value.cell.tilt[k] = state.tilt[k];
+    }
+    if (!state.positions.empty())
+      result->particleCount = state.positions.size() / 3;
+    return result;
+  }, py::arg("state"), py::arg("velocities") = true);
+  auto integrator = input<model::Integrator>(m, "Integrator");
+  property(integrator, "method", &model::Integrator::method);
+  property(integrator, "timestep", &model::Integrator::timestep, units::ps);
+  // `[dynamics] friction`, of Brownian dynamics (D249).
+  optionalProperty(integrator, "friction", &model::Integrator::friction, units::inversePs);
+  property(integrator, "minimize", &model::Integrator::minimize);
+  property(integrator, "minimize_step", &model::Integrator::minimizeStep, units::nm);
+  auto ensemble = input<model::Ensemble>(m, "Ensemble");
+  property(ensemble, "kind", &model::Ensemble::kind);
+  property(ensemble, "temperature", &model::Ensemble::temperature, units::kelvin);
+  property(ensemble, "tau_t", &model::Ensemble::tauT, units::ps);
+  property(ensemble, "pressure", &model::Ensemble::pressure, units::bar);
+  property(ensemble, "tau_p", &model::Ensemble::tauP, units::ps);
+  // One number, or one of each axis for the anisotropic coupling, as
+  // `[barostat] compressibility` (D247).
+  ensemble.def_property("compressibility", [](const Input<model::Ensemble> &o) -> py::object {
+    if (o.value.compressibilities.empty()) return py::float_(o.value.compressibility);
+    return py::tuple(py::cast(o.value.compressibilities));
+  }, [](Input<model::Ensemble> &o, py::object value) {
+    const std::string name = "Ensemble.compressibility";
+    py::object plain = units::isQuantity(value) ? units::strip(value, name, units::inverseBar) : value;
+    if (py::isinstance<py::sequence>(plain) && !py::isinstance<py::str>(plain)) {
+      std::vector<double> axes;
+      for (py::handle item : plain) axes.push_back(units::scalar(item, name, units::none));
+      if (axes.size() != 3)
+        throw InputError(name + ": expected one number, or three that are not negative, "
+                         "those of x, y, and z, in 1/bar");
+      o.value.compressibilities = std::move(axes);
+    } else {
+      o.value.compressibility = units::scalar(value, name, units::inverseBar);
+      o.value.compressibilities.clear();
+    }
+    ++o.version; o.given.insert("compressibility");
+  });
+  // The keys of the semi-isotropic coupling (D119, D247);
+  // None for the compressibility of z follows `compressibility`.
+  ensemble.def_property("compressibility_z", [](const Input<model::Ensemble> &o) -> py::object {
+    if (!o.value.compressibilityZ) return py::none();
+    return py::float_(*o.value.compressibilityZ);
+  }, [](Input<model::Ensemble> &o, py::object value) {
+    if (value.is_none()) o.value.compressibilityZ.reset();
+    else o.value.compressibilityZ = units::scalar(value, "Ensemble.compressibility_z", units::inverseBar);
+    ++o.version; o.given.insert("compressibility_z");
+  });
+  property(ensemble, "surface_tension", &model::Ensemble::surfaceTension, units::barNm);
+  property(ensemble, "surfaces", &model::Ensemble::surfaces);
+  property(ensemble, "barostat_coupling", &model::Ensemble::barostatCoupling);
+  property(ensemble, "barostat_work", &model::Ensemble::barostatWork);
+  // The thermostat of the control file: `[thermostat] method`, `friction`,
+  // and `chain_length` (D135, D163a; D249).
+  property(ensemble, "thermostat", &model::Ensemble::thermostat);
+  optionalProperty(ensemble, "friction", &model::Ensemble::friction, units::inversePs);
+  property(ensemble, "chain_length", &model::Ensemble::chainLength);
+  // `[thermostat] interval`; None is the control file without the key.
+  ensemble.def_property("coupling_period", [](const Input<model::Ensemble> &o) -> py::object {
+    if (!o.value.couplingPeriod) return py::none();
+    return py::int_(*o.value.couplingPeriod);
+  }, [](Input<model::Ensemble> &o, py::object value) {
+    if (value.is_none()) {
+      o.value.couplingPeriod.reset(); o.given.erase("coupling_period");
+    } else {
+      o.value.couplingPeriod = value.cast<int64_t>(); o.given.insert("coupling_period");
+    }
+    ++o.version;
+  });
+  // None, the default: as the control file without
+  // `center_of_mass_interval`, with the thermostat or never
+  // (D248).
+  ensemble.def_property("com_period", [](const Input<model::Ensemble> &o) -> py::object {
+    if (!o.value.comPeriod) return py::none();
+    return py::int_(*o.value.comPeriod);
+  }, [](Input<model::Ensemble> &o, py::object value) {
+    if (value.is_none()) {
+      o.value.comPeriod.reset(); o.given.erase("com_period");
+    } else {
+      o.value.comPeriod = value.cast<int64_t>(); o.given.insert("com_period");
+    }
+    ++o.version;
+  });
+  property(ensemble, "seed", &model::Ensemble::seed);
+  auto execution = input<model::Execution>(m, "Execution");
+  property(execution, "target", &model::Execution::target);
+  property(execution, "precision", &model::Execution::precision);
+  property(execution, "device", &model::Execution::device);
+  property(execution, "threads", &model::Execution::threads);
+  property(execution, "deterministic", &model::Execution::deterministic);
+  property(execution, "reorder", &model::Execution::reorder);
+  property(execution, "fast_math", &model::Execution::fastMath);
+  property(execution, "neighbor_capacity", &model::Execution::neighborCapacity);
+  property(execution, "neighbor_structure", &model::Execution::neighborStructure);
+  property(execution, "rigid_units", &model::Execution::rigidUnits);
+  auto schedule = input<model::Schedule>(m, "Schedule");
+  property(schedule, "steps", &model::Schedule::steps);
+  property(schedule, "energy_period", &model::Schedule::energyPeriod);
+  system.def_property_readonly("particle_count", [](const Input<model::System> &s) {
+    return s.value.topology.masses.size();
+  });
+  system.def_property_readonly("topology", [](const Input<model::System> &s) {
+    return topology::of(s.value.topology, false);
+  });
+  py::class_<model::LoadedData>(m, "LoadedData")
+    .def_property_readonly("format", [](const model::LoadedData &d) { return d.format; })
+    .def_property_readonly("sources", [](const model::LoadedData &d) { return d.sources; })
+    .def_property_readonly("topology", [](const model::LoadedData &d) {
+      return topology::of(d.topology, false);
+    })
+    .def("make_system", [](const model::LoadedData &d) {
+      auto result = std::make_shared<Input<model::System>>(); result->value = d.makeSystem(); return result;
+    })
+    .def("make_state", [](const model::LoadedData &d) {
+      auto result = std::make_shared<Input<model::InitialState>>(); result->value = d.makeState();
+      result->particleCount = d.topology.getNumParticles(); return result;
+    });
+  m.def("load_amber", [](const std::string &top, const std::string &coordinates) {
+    return unwrap(model::loadAmber(top, coordinates));
+  }, py::arg("topology"), py::arg("coordinates"));
+  m.def("load_gromacs", [](const std::string &top, const std::string &coordinates,
+                            const std::vector<std::string> &includes,
+                            const std::vector<std::string> &defines) {
+    return unwrap(model::loadGromacs(top, coordinates, includes, defines));
+  }, py::arg("topology"), py::arg("coordinates"),
+     py::arg("includes") = std::vector<std::string>{}, py::arg("defines") = std::vector<std::string>{});
+  m.def("load_charmm", [](const std::string &structure, const std::string &coordinates,
+                           const std::vector<std::string> &parameters, const driver::Cell &cell) {
+    return unwrap(model::loadCharmm(structure, coordinates, parameters, cell));
+  }, py::arg("structure"), py::arg("coordinates"), py::arg("parameters"), py::arg("cell") = driver::Cell{});
+  py::class_<Program, std::shared_ptr<Program>>(m, "Program")
+    .def_property_readonly("ir", [](const Program &p) {
+      return driver::printModuleForReading(p.compiled.program);
+    })
+    .def_property_readonly("lowered_ir", [](const Program &p) {
+      // Lowered when first asked for, with the GIL released: a simulation
+      // lowers programs of its own (D224).
+      std::optional<llvm::Error> failed;
+      {
+        py::gil_scoped_release release;
+        std::lock_guard<std::mutex> lock(p.lowering->mutex);
+        if (!p.lowering->text) {
+          auto lowered = compiler::lowerToText(p.prepared->control, p.compiled);
+          if (lowered)
+            p.lowering->text = std::move(*lowered);
+          else
+            failed.emplace(lowered.takeError());
+        }
+      }
+      if (failed) raise(std::move(*failed));
+      return *p.lowering->text;
+    })
+    .def_property_readonly("pipeline", [](const Program &p) { return p.compiled.pipeline; })
+    .def_property_readonly("stale", &Program::stale)
+    // The topology as compiled, with its constraints resolved.
+    .def_property_readonly("topology", [](const Program &p) {
+      return topology::of(*p.prepared->system.topology, true);
+    })
+    .def("check_current", &Program::checkCurrent)
+    // The program of the terms that a tunable enters, alone
+    // (D243, docs/python-frames.md), for a frame
+    // evaluator: built from the model of this one, with its inputs.
+    // The values of the tunables of the program, by name, in MD units
+    // (`mdir.jax.params`); private.
+    .def("_tunable_values", [](const Program &p) {
+      py::dict d;
+      const model::TunableSet &set = p.prepared->tunables;
+      for (size_t k = 0; k != set.tunables.size(); ++k)
+        d[py::str(set.tunables[k].name)] =
+            host::copy(set.values[k].data(), set.values[k].size(),
+                       {static_cast<py::ssize_t>(set.values[k].size())});
+      return d;
+    })
+    .def("_dependent", [](const Program &p) {
+      if (p.dependent)
+        return p.dependent;
+      if (p.prepared->tunables.empty())
+        throw InputError("the program declares no tunable parameters (System.tunables)");
+      if (!p.prepared->control.tunableGradient)
+        throw InputError("the program was compiled without the derivative in the tunables: "
+                         "set System.tunable_gradient = True and compile again");
+      model::PreparedModel prepared = *p.prepared;
+      driver::keepDependentTerms(prepared.control, prepared.system);
+      Program result;
+      result.compiled = unwrap(compiler::plan(prepared, p.cache));
+      result.cache = p.cache;
+      result.prepared = std::make_shared<const model::PreparedModel>(std::move(prepared));
+      result.inputs = p.inputs;
+      p.dependent = std::make_shared<Program>(std::move(result));
+      return p.dependent;
+    })
+    .def_property_readonly("plan", [](const Program &p) {
+      py::dict d;
+      const auto &c = p.compiled;
+      d["target"] = c.execution.target; d["precision"] = c.execution.precision;
+      d["device"] = c.execution.device; d["threads"] = c.execution.threads;
+      d["deterministic"] = c.execution.deterministic;
+      d["reorders"] = c.program.reorders;
+      d["neighbor_capacity"] = c.program.neighborWidth;
+      // The structure that the program builds, `Auto` resolved, what was
+      // asked and why it was resolved so, as the manifest of `mdir run`
+      // has them (D261), and the reaches in nm, the inner one
+      // of a dual list 0 without one (D245).
+      const driver::Control &resolved = p.prepared->control;
+      d["neighbor_structure"] = driver::getNeighborStructureName(resolved.neighborStructure);
+      d["neighbor_structure_requested"] =
+          driver::getNeighborStructureName(resolved.neighborStructureRequested);
+      d["neighbor_structure_reason"] = resolved.neighborStructureReason;
+      // The route of the rigid units and why (D424).
+      d["rigid_units"] = resolved.rigidUnitsRoute.units ? "units" : "general";
+      d["rigid_units_requested"] = driver::getRigidUnitsName(resolved.rigidUnits);
+      d["rigid_units_reason"] = resolved.rigidUnitsRoute.reason;
+      py::list rigidKinds;
+      if (resolved.rigidUnitsRoute.units)
+        for (const auto &kind : resolved.rigidUnitsRoute.kinds)
+          if (kind.taken)
+            rigidKinds.append(kind.number);
+      d["rigid_units_kinds"] = rigidKinds;
+      py::list rigidWarnings;
+      for (const auto &warning : resolved.rigidUnitsRoute.warnings)
+        rigidWarnings.append(warning.second);
+      d["rigid_units_warnings"] = rigidWarnings;
+      d["pairlist_distance"] = resolved.pairlistDistance * driver::units::length;
+      d["pruned_distance"] = resolved.prunedDistance * driver::units::length;
+      // Where the reaches came from (D281).
+      d["pairlist_distance_source"] = resolved.getSkinSource(/*outer=*/true);
+      d["pruned_distance_source"] = resolved.getSkinSource(/*outer=*/false);
+      d["skin_reason"] = resolved.skinReason;
+      // The key of the cache of the skins where a run reads that cache,
+      // else None and why (D401); a clean build's is the
+      // key of `mdir` for the same system.
+      {
+        std::string why;
+        if (compiler::canSearchSkins(resolved, why)) {
+          d["skin_cache_key"] =
+              compiler::getSkinCacheKey(resolved, p.prepared->system);
+          d["skin_cache_key_reason"] = py::none();
+        } else {
+          d["skin_cache_key"] = py::none();
+          d["skin_cache_key_reason"] = why;
+        }
+      }
+      d["entry"] = c.program.entry;
+      d["state_dtype"] = c.program.state == driver::Element::F64 ? "float64" : "float32";
+      d["force_dtype"] = c.program.force == driver::Element::F64 ? "float64" : "float32";
+      d["pme"] = c.program.pme;
+      d["pme_grid"] = std::array<int64_t, 3>{c.program.pmeGrid[0], c.program.pmeGrid[1], c.program.pmeGrid[2]};
+      // The barostat of the program: its coupling and its work, or None
+      // without one (D247).
+      {
+        const auto &control = p.prepared->control;
+        if (control.barostat) {
+          py::dict barostat;
+          barostat["coupling"] = control.semiIsotropic ? model::BarostatCoupling::SemiIsotropic
+                                 : control.anisotropic ? model::BarostatCoupling::Anisotropic
+                                                       : model::BarostatCoupling::Isotropic;
+          barostat["work"] = control.barostatWork;
+          d["barostat"] = barostat;
+        } else {
+          d["barostat"] = py::none();
+        }
+        // The thermostat of the program: its method, with the friction
+        // of Langevin dynamics in 1/ps or the length of a Nose-Hoover
+        // chain; None without one, which Brownian dynamics is too, whose
+        // friction is with the method of the integrator
+        // (D249).
+        if (control.thermostat) {
+          py::dict thermostat;
+          thermostat["method"] = control.thermostatMethod;
+          if (control.isLangevin()) thermostat["friction"] = control.friction;
+          if (control.isNoseHoover()) thermostat["chain_length"] = control.chainLength;
+          d["thermostat"] = thermostat;
+        } else {
+          d["thermostat"] = py::none();
+        }
+        py::dict integrator;
+        integrator["method"] = control.integrator;
+        if (control.isBrownian()) integrator["friction"] = control.friction;
+        d["integrator"] = integrator;
+      }
+      d["tunables"] = tunables::describe(p.prepared->tunables, c.program);
+      // The terms of the potential: all of the model, or those that a
+      // tunable enters (D243).
+      if (p.prepared->control.dependentTerms)
+        d["terms"] = driver::getDependentTerms(p.prepared->control, p.prepared->system).names;
+      else
+        d["terms"] = std::vector<std::string>{"all"};
+      // The correction for the dispersion (D209): whether it is on and was
+      // given, and for each pair term whether its tail is in it
+      // (D222).
+      const auto &control = p.prepared->control;
+      const auto &tails = p.prepared->system.pairTails;
+      py::dict dispersion, terms;
+      bool on = control.topologyDispersion != driver::DispersionCorrection::None;
+      dispersion["correction"] = control.topologyDispersion;
+      dispersion["given"] = control.topologyDispersionGiven;
+      for (size_t k = 0; k != control.pairs.size(); ++k)
+        terms[py::str(control.pairs[k].name)] = on && k < tails.size() && !tails[k].empty();
+      dispersion["pair_terms"] = terms;
+      d["dispersion"] = dispersion;
+      // The columns that the terms observe, in their order
+      // (D232).
+      std::vector<std::string> observed;
+      for (const auto &[name, unit] : control.getObservableColumns()) observed.push_back(name);
+      d["observables"] = observed;
+      return d;
+    });
+  m.def("compile", [](std::shared_ptr<Input<model::System>> system,
+                        std::shared_ptr<Input<model::InitialState>> state,
+                        std::shared_ptr<Input<model::Integrator>> integrator,
+                        std::shared_ptr<Input<model::Ensemble>> ensemble,
+                        std::shared_ptr<Input<model::Execution>> execution,
+                        std::shared_ptr<Input<model::Schedule>> schedule,
+                        bool cache) {
+    if (!system || !state || !integrator || !ensemble || !execution || !schedule)
+      throw InputError("compile inputs must not be None");
+    // Keep the GIL while copying and building: concurrent mutation cannot
+    // race version capture. GIL release belongs to persistent execution.
+    // The prolate kernel's own defaults of the order and the spacing, where
+    // they were not set (D266).
+    system->value.pmeOrderGiven = system->given.count("pme_order") != 0;
+    system->value.pmeSpacingGiven = system->given.count("pme_spacing") != 0;
+    auto prepared = unwrap(model::prepare(system->value, state->value, integrator->value,
+                                          ensemble->value, execution->value, schedule->value));
+    // The reaches that are `mdir.Auto` (D281): the defaults or the
+    // cache; a Python simulation does not measure candidates.
+    compiler::chooseSkins(prepared.control, prepared.system, /*search=*/false);
+    // A restraint that selects nothing restrains nothing: the control file
+    // warns of it, and so does compile.
+    for (const auto &[code, message] : prepared.system.warnings)
+      if ((code == "empty_selection" && llvm::StringRef(message).starts_with("the restraint of")) ||
+          code == "tunable_fixed_pairs" || code == "pair_tail_left_out" ||
+          code == "dispersion_switched")
+        if (PyErr_WarnEx(PyExc_UserWarning, message.c_str(), 1) != 0)
+          throw py::error_already_set();
+    // What defined the model, for its checkpoints (D223).
+    prepared.fingerprint = model::getFingerprint(
+        system->value, integrator->value, ensemble->value, execution->value,
+        model::GivenSettings{system->given, integrator->given, ensemble->given,
+                             execution->given},
+        prepared);
+    Program result;
+    // Built, not lowered: a simulation lowers programs of its own, and
+    // `lowered_ir` lowers on its first read (D224, #151).
+    result.compiled = unwrap(compiler::plan(prepared, cache));
+    result.cache = cache;
+    result.prepared = std::make_shared<const model::PreparedModel>(std::move(prepared));
+    result.track(system); result.track(state); result.track(integrator);
+    result.track(ensemble); result.track(execution); result.track(schedule);
+    return std::make_shared<Program>(std::move(result));
+  }, py::arg("system"), py::arg("state"), py::arg("integrator"),
+     py::arg("ensemble"), py::arg("execution"), py::arg("schedule"),
+     py::kw_only(), py::arg("cache") = true);
+
+  // Removes the entries of the compile cache (D217):
+  // those of this format in `directory`, else in MDIR_COMPILE_CACHE_DIR,
+  // else in the default directory (D397), which
+  // MDIR_COMPILE_CACHE=off does not hide from it.
+  // The idle memory of the device, given back to the driver (#622,
+  // docs/runtime.md): for a long process between simulations of other sizes.
+  m.def("trim_device_memory", []() {
+    py::gil_scoped_release release;
+    return compiler::trimDeviceMemory();
+  });
+  python::xla::addBindings(m);
+  m.def("clear_compile_cache", [](std::optional<std::string> directory) {
+    // Without a directory, the one a compile would use, opened and checked
+    // as a compile opens it (D397).
+    std::shared_ptr<compiler::CacheDirectory> opened;
+    if (!directory) {
+      std::string path;
+      opened = compiler::openCacheDirectoryToClear(path);
+      if (!path.empty())
+        directory = path;
+    } else if (!directory->empty()) {
+      opened = std::make_shared<compiler::CacheDirectory>(*directory);
+    }
+    compiler::ClearedCache cleared;
+    if (opened) {
+      py::gil_scoped_release release;
+      cleared = compiler::clearCache(*opened);
+    }
+    py::dict d;
+    d["directory"] = directory && !directory->empty() ? py::cast(*directory) : py::none();
+    d["host_entries"] = cleared.hostEntries;
+    d["gpu_entries"] = cleared.gpuEntries;
+    d["bytes"] = cleared.bytes;
+    return d;
+  }, py::arg("directory") = py::none());
+
+  // Persistent simulations (D196, docs/python-segments.md).
+  py::class_<compiler::SimulationState>(m, "State")
+    .def_property_readonly("step", [](const compiler::SimulationState &s) { return s.step; })
+    .def_property_readonly("time", [](const compiler::SimulationState &s) { return s.time; })
+    .def_property_readonly("positions", [](const compiler::SimulationState &s) {
+      return host::copy(s.positions.data(), s.positions.size(),
+                        {static_cast<py::ssize_t>(s.positions.size() / 3), 3});
+    })
+    .def_property_readonly("velocities", [](const compiler::SimulationState &s) {
+      return host::copy(s.velocities.data(), s.velocities.size(),
+                        {static_cast<py::ssize_t>(s.velocities.size() / 3), 3});
+    })
+    .def_property_readonly("tunables_version",
+                           [](const compiler::SimulationState &s) { return s.tunablesVersion; })
+    .def_property_readonly("velocity_offset",
+                           [](const compiler::SimulationState &s) { return s.velocityOffset; })
+    .def_property_readonly("forces", [](const compiler::SimulationState &s) -> py::object {
+      if (s.forces.empty()) return py::none();
+      return host::copy(s.forces.data(), s.forces.size(),
+                        {static_cast<py::ssize_t>(s.forces.size() / 3), 3});
+    })
+    .def_property_readonly("energies", [](const compiler::SimulationState &s) -> py::object {
+      // Those of a run that ended with a step of energy (run(n, energy=True)),
+      // at this step: kJ/mol, K, bar, nm^3.
+      if (!s.energies) return py::none();
+      const auto &e = *s.energies;
+      py::dict d;
+      d["potential"] = e.potential; d["kinetic"] = e.kinetic; d["total"] = e.total;
+      d["conserved"] = e.conserved; d["temperature"] = e.temperature;
+      d["virial"] = e.virial; d["pressure"] = e.pressure; d["volume"] = e.volume;
+      return d;
+    })
+    .def_property_readonly("observables", [](const compiler::SimulationState &s) -> py::object {
+      // The columns of `observe` at this step, where `energies` is set:
+      // kJ/mol and kJ/mol per unit of the constant (D232).
+      if (!s.observables) return py::none();
+      py::dict d;
+      for (const auto &[name, value] : *s.observables) d[py::str(name)] = value;
+      return d;
+    })
+    .def_property_readonly("minimization", [](const compiler::SimulationState &s) -> py::object {
+      // The row of the log of `mdir run` at the last step of a minimization,
+      // in kJ/mol and nm (D202).
+      if (!s.minimization) return py::none();
+      const auto &m = *s.minimization;
+      py::dict d;
+      d["energy"] = m.energy; d["rms_force"] = m.rmsForce; d["max_force"] = m.maxForce;
+      d["max_force_particle"] = m.maxForceParticle; d["step_size"] = m.stepSize;
+      d["converged"] = m.converged ? py::cast(*m.converged) : py::none();
+      d["stalled"] = m.stalled;
+      return d;
+    })
+    .def_property_readonly("cell", [](const compiler::SimulationState &s) {
+      driver::Cell cell;
+      for (int k = 0; k != 3; ++k) { cell.diagonal[k] = s.box[k]; cell.tilt[k] = s.tilt[k]; }
+      return cell;
+    });
+  // A read-only view of a checkpoint (D223), in MD units.
+  using driver::Checkpoint;
+  py::class_<Checkpoint>(m, "Checkpoint")
+    .def_property_readonly("step", [](const Checkpoint &c) { return c.step; })
+    .def_property_readonly("time", [](const Checkpoint &c) { return c.time; })
+    .def_property_readonly("positions", [](const Checkpoint &c) { return vectors(c.positions); })
+    .def_property_readonly("velocities", [](const Checkpoint &c) { return vectors(c.velocities); })
+    .def_property_readonly("forces", [](const Checkpoint &c) -> py::object {
+      if (c.forces.empty()) return py::none();
+      return vectors(c.forces);
+    })
+    .def_property_readonly("masses", [](const Checkpoint &c) {
+      return host::copy(c.masses.data(), c.masses.size(), {static_cast<py::ssize_t>(c.masses.size())});
+    })
+    .def_property_readonly("cell", [](const Checkpoint &c) {
+      driver::Cell cell;
+      for (int k = 0; k != 3; ++k) { cell.diagonal[k] = c.box[k]; cell.tilt[k] = c.tilt[k]; }
+      return cell;
+    })
+    .def_property_readonly("periodic", [](const Checkpoint &c) { return c.periodic; })
+    .def_property_readonly("integrator", [](const Checkpoint &c) { return c.integrator; })
+    .def_property_readonly("velocity_offset", [](const Checkpoint &c) { return c.velocityOffset; })
+    .def_property_readonly("precision", [](const Checkpoint &c) { return c.precision; })
+    .def_property_readonly("timestep", [](const Checkpoint &c) { return c.timestep; })
+    .def_property_readonly("seed", [](const Checkpoint &c) { return c.seed; })
+    .def_property_readonly("first_step", [](const Checkpoint &c) { return c.firstStep; })
+    .def_property_readonly("part", [](const Checkpoint &c) { return c.part; })
+    .def_property_readonly("outputs_part", [](const Checkpoint &c) { return c.outputsPart; })
+    .def_property_readonly("trajectory", [](const Checkpoint &c) { return c.trajectory; })
+    .def_property_readonly("frames", [](const Checkpoint &c) { return c.frames; })
+    .def_property_readonly("bath", [](const Checkpoint &c) { return c.bath; })
+    // The state of a Nose-Hoover chain: the positions of its thermostats,
+    // then their velocities; empty without one (D163a,
+    // D249).
+    .def_property_readonly("thermostat_state", [](const Checkpoint &c) { return c.thermostatState; })
+    .def_property_readonly("fingerprint", [](const Checkpoint &c) {
+      py::list entries;
+      for (const auto &e : c.fingerprint) entries.append(py::make_tuple(e.group, e.name, e.value));
+      return entries;
+    })
+    .def_property_readonly("creator", [](const Checkpoint &c) {
+      return c.creator + (c.creatorVersion.empty() ? "" : " " + c.creatorVersion);
+    })
+    .def_property_readonly("front_end", [](const Checkpoint &c) {
+      return c.frontEnd.empty() ? std::string("mdir run") : c.frontEnd;
+    })
+    .def_property_readonly("model_sha256", [](const Checkpoint &c) -> py::object {
+      if (c.modelHash.empty()) return py::none();
+      return py::str(c.modelHash);
+    })
+    .def_property_readonly("plan_sha256", [](const Checkpoint &c) -> py::object {
+      if (c.planHash.empty()) return py::none();
+      return py::str(c.planHash);
+    })
+    .def_property_readonly("tunables", [](const Checkpoint &c) {
+      py::dict d;
+      for (const auto &[name, values] : c.tunables)
+        d[py::str(name)] = host::copy(values.data(), values.size(),
+                                      {static_cast<py::ssize_t>(values.size())});
+      return d;
+    })
+    .def_property_readonly("tunables_version", [](const Checkpoint &c) { return c.tunablesVersion; })
+    .def_property_readonly("tunables_history", [](const Checkpoint &c) { return c.tunablesHistory; })
+    .def("__repr__", [](const Checkpoint &c) {
+      return "Checkpoint(step=" + std::to_string(c.step) + ", particles=" +
+             std::to_string(c.getNumParticles()) + ", integrator=" + c.integrator + ")";
+    });
+  m.def("read_checkpoint", [](const std::string &path) {
+    return readCheckpointFile(path);
+  }, py::arg("path"));
+  // The frames of a trajectory in H5MD, read one at a time
+  // (D239, docs/python-h5md.md).
+  struct Frame { driver::H5MDFrame frame; size_t particles; };
+  static auto frameVectors = [](const Frame &f, const std::vector<char> &bytes) -> py::object {
+    if (bytes.empty() && f.particles > 0) return py::none();
+    std::vector<py::ssize_t> shape = {static_cast<py::ssize_t>(f.particles), 3};
+    py::array a = f.frame.width == 4
+        ? py::array(py::array_t<float>(shape, reinterpret_cast<const float *>(bytes.data())))
+        : py::array(py::array_t<double>(shape, reinterpret_cast<const double *>(bytes.data())));
+    a.attr("flags").attr("writeable") = false;
+    return a;
+  };
+  // The second item of the pair that a frame unpacks to: the edges of an
+  // orthorhombic cell, the cell vectors in rows of a triclinic one.
+  static auto frameEdges = [](const Frame &f) -> py::object {
+    const double *c = f.frame.cell;
+    if (!f.frame.hasCell) return py::none();
+    if (c[1] == 0.0 && c[2] == 0.0 && c[3] == 0.0 && c[5] == 0.0 && c[6] == 0.0 && c[7] == 0.0) {
+      double edges[3] = {c[0], c[4], c[8]};
+      return host::copy(edges, 3, {3});
+    }
+    return host::copy(c, 9, {3, 3});
+  };
+  py::class_<Frame>(m, "Frame")
+    .def_property_readonly("step", [](const Frame &f) { return f.frame.step; })
+    .def_property_readonly("time", [](const Frame &f) -> py::object {
+      if (std::isnan(f.frame.time)) return py::none();
+      return py::float_(f.frame.time);
+    })
+    .def_property_readonly("positions", [](const Frame &f) { return frameVectors(f, f.frame.positions); })
+    .def_property_readonly("velocities", [](const Frame &f) -> py::object {
+      if (f.frame.velocities.empty()) return py::none();
+      return frameVectors(f, f.frame.velocities);
+    })
+    .def_property_readonly("forces", [](const Frame &f) -> py::object {
+      if (f.frame.forces.empty()) return py::none();
+      return frameVectors(f, f.frame.forces);
+    })
+    .def_property_readonly("cell", [](const Frame &f) -> py::object {
+      // As State.cell: the edges and the tilts of the reduced cell.
+      const double *c = f.frame.cell;
+      if (!f.frame.hasCell) return py::none();
+      if (c[1] != 0.0 || c[2] != 0.0 || c[5] != 0.0)
+        throw InputError("Frame.cell: the cell vectors of the frame are not in the reduced form "
+                         "(a along x, b in the xy plane) that mdir.Cell holds; read Frame.cell_vectors");
+      driver::Cell cell;
+      cell.diagonal = {c[0], c[4], c[8]};
+      cell.tilt = {c[3], c[6], c[7]};
+      return py::cast(cell);
+    })
+    .def_property_readonly("cell_vectors", [](const Frame &f) -> py::object {
+      if (!f.frame.hasCell) return py::none();
+      return host::copy(f.frame.cell, 9, {3, 3});
+    })
+    .def_property_readonly("potential_energy", [](const Frame &f) -> py::object {
+      if (!f.frame.potential) return py::none();
+      return py::float_(*f.frame.potential);
+    })
+    .def_property_readonly("tunables_version", [](const Frame &f) -> py::object {
+      if (!f.frame.tunablesVersion) return py::none();
+      return py::int_(*f.frame.tunablesVersion);
+    })
+    .def("__len__", [](const Frame &) { return 2; })
+    .def("__iter__", [](const Frame &f) {
+      // The pair (positions, cell) of the input of the frame evaluator.
+      return py::iter(py::make_tuple(frameVectors(f, f.frame.positions), frameEdges(f)));
+    })
+    .def("__repr__", [](const Frame &f) {
+      return "Frame(step=" + std::to_string(f.frame.step) + ", particles=" +
+             std::to_string(f.particles) + ")";
+    });
+  struct H5MDTrajectory { std::shared_ptr<driver::H5MDReader> reader; std::string file; };
+  py::class_<H5MDTrajectory>(m, "H5MDTrajectory")
+    .def("__len__", [](const H5MDTrajectory &t) { return t.reader->getNumFrames(); })
+    .def("__getitem__", [](const H5MDTrajectory &t, py::ssize_t index) {
+      py::ssize_t count = static_cast<py::ssize_t>(t.reader->getNumFrames());
+      if (index < 0) index += count;
+      if (index < 0 || index >= count) throw py::index_error("frame index out of range");
+      std::optional<llvm::Expected<driver::H5MDFrame>> read;
+      {
+        py::gil_scoped_release release;
+        read.emplace(t.reader->read(static_cast<size_t>(index)));
+      }
+      return Frame{unwrap(std::move(*read)), t.reader->getNumParticles()};
+    })
+    .def_property_readonly("file", [](const H5MDTrajectory &t) { return t.file; })
+    .def_property_readonly("group", [](const H5MDTrajectory &t) { return t.reader->getGroup(); })
+    .def_property_readonly("particles", [](const H5MDTrajectory &t) { return t.reader->getNumParticles(); })
+    .def_property_readonly("steps", [](const H5MDTrajectory &t) {
+      const auto &v = t.reader->getSteps();
+      py::array_t<int64_t> a(static_cast<py::ssize_t>(v.size()), v.data());
+      a.attr("flags").attr("writeable") = false;
+      return a;
+    })
+    .def_property_readonly("times", [](const H5MDTrajectory &t) -> py::object {
+      const auto &v = t.reader->getTimes();
+      if (v.empty() && t.reader->getNumFrames() > 0) return py::none();
+      return host::copy(v.data(), v.size(), {static_cast<py::ssize_t>(v.size())});
+    })
+    .def_property_readonly("dtype", [](const H5MDTrajectory &t) {
+      return t.reader->getWidth() == 4 ? py::dtype::of<float>() : py::dtype::of<double>();
+    })
+    .def_property_readonly("has_velocities", [](const H5MDTrajectory &t) { return t.reader->hasVelocities(); })
+    .def_property_readonly("has_forces", [](const H5MDTrajectory &t) { return t.reader->hasForces(); })
+    .def_property_readonly("has_potential_energy", [](const H5MDTrajectory &t) { return t.reader->hasPotential(); })
+    .def_property_readonly("has_tunables_version", [](const H5MDTrajectory &t) { return t.reader->hasTunablesVersion(); })
+    .def_property_readonly("units", [](const H5MDTrajectory &t) {
+      py::dict d;
+      for (const auto &[name, unit] : t.reader->getUnits()) d[py::str(name)] = unit;
+      return d;
+    })
+    .def_property_readonly("creator", [](const H5MDTrajectory &t) { return t.reader->getCreator(); })
+    .def("close", [](H5MDTrajectory &t) { t.reader->close(); })
+    .def("__enter__", [](py::object self) { return self; })
+    .def("__exit__", [](H5MDTrajectory &t, py::args) { t.reader->close(); })
+    .def("__repr__", [](const H5MDTrajectory &t) {
+      return "H5MDTrajectory('" + t.file + "', frames=" + std::to_string(t.reader->getNumFrames()) +
+             ", particles=" + std::to_string(t.reader->getNumParticles()) + ")";
+    });
+  m.def("read_h5md", [](const std::string &path, std::optional<std::string> group) {
+    if (!driver::hasCheckpointSupport())
+      throw UnsupportedError("this build of MDIR has no HDF5, which a trajectory in H5MD needs");
+    std::optional<llvm::Expected<std::unique_ptr<driver::H5MDReader>>> opened;
+    {
+      py::gil_scoped_release release;
+      opened.emplace(driver::H5MDReader::open(path, group ? *group : std::string()));
+    }
+    auto &reader = *opened;
+    if (!reader) throw InputError(llvm::toString(reader.takeError()));
+    return H5MDTrajectory{std::shared_ptr<driver::H5MDReader>(std::move(*reader)), path};
+  }, py::arg("file"), py::arg("group") = py::none());
+  // Reporters (D207, docs/python-reporters.md): the files
+  // of `mdir run` written inside the parts of a run, and Python functions
+  // called after the part that ends at their step.
+  py::enum_<driver::TrajectoryFormat>(m, "TrajectoryFormat")
+    .value("DCD", driver::TrajectoryFormat::DCD)
+    .value("XTC", driver::TrajectoryFormat::XTC)
+    ;
+  struct EnergyReporter { std::string file; int64_t period; };
+  struct TrajectoryReporter { std::string file; int64_t period; driver::TrajectoryFormat format; };
+  struct CallbackReporter { py::object function; int64_t period; };
+  struct ObservablesReporter { std::string file; int64_t period; };
+  auto positive = [](int64_t period) {
+    if (period <= 0) throw InputError("a reporter's period must be a positive number of steps");
+    return period;
+  };
+  py::class_<EnergyReporter>(m, "EnergyReporter")
+    .def(py::init([positive](std::string file, int64_t period) {
+      return EnergyReporter{std::move(file), positive(period)};
+    }), py::arg("file"), py::arg("period"))
+    .def_readonly("file", &EnergyReporter::file)
+    .def_readonly("period", &EnergyReporter::period);
+  // The file of `[output] observables` (D189, D232).
+  py::class_<ObservablesReporter>(m, "ObservablesReporter")
+    .def(py::init([positive](std::string file, int64_t period) {
+      if (file.empty()) throw InputError("ObservablesReporter takes the name of a file");
+      return ObservablesReporter{std::move(file), positive(period)};
+    }), py::arg("file"), py::arg("period"))
+    .def_readonly("file", &ObservablesReporter::file)
+    .def_readonly("period", &ObservablesReporter::period);
+  py::class_<TrajectoryReporter>(m, "TrajectoryReporter")
+    .def(py::init([positive](std::string file, int64_t period,
+                             std::optional<driver::TrajectoryFormat> format) {
+      if (!format) {
+        llvm::StringRef name(file);
+        if (name.ends_with_insensitive(".dcd")) format = driver::TrajectoryFormat::DCD;
+        else if (name.ends_with_insensitive(".xtc")) format = driver::TrajectoryFormat::XTC;
+        else if (name.ends_with_insensitive(".h5md"))
+          throw InputError("TrajectoryReporter writes DCD and XTC; a trajectory in H5MD, '" + file +
+                           "', is written by H5MDReporter");
+        else throw InputError("TrajectoryReporter: cannot tell the format of '" + file +
+                              "'; name a .dcd or .xtc file, or give format=");
+      }
+      return TrajectoryReporter{std::move(file), positive(period), *format};
+    }), py::arg("file"), py::arg("period"), py::arg("format") = py::none())
+    .def_readonly("file", &TrajectoryReporter::file)
+    .def_readonly("period", &TrajectoryReporter::period)
+    .def_readonly("format", &TrajectoryReporter::format);
+  // Frames of the state without loss, in H5MD (D239,
+  // docs/python-h5md.md): the trajectory of the simulation in a third
+  // format, with the velocities and the forces if asked.
+  struct H5MDReporter { std::string file; int64_t period; bool single, velocities, forces, variable; };
+  py::class_<H5MDReporter>(m, "H5MDReporter")
+    .def(py::init([positive](std::string file, int64_t period, const std::string &positions,
+                     bool velocities, bool forces, const std::string &strings) {
+      if (!driver::hasCheckpointSupport())
+        throw UnsupportedError("this build of MDIR has no HDF5, which a trajectory in H5MD needs");
+      if (file.empty()) throw InputError("H5MDReporter takes the name of a file");
+      if (positions != "f64" && positions != "f32")
+        throw InputError("H5MDReporter: positions is \"f64\" or \"f32\"; found \"" + positions + "\"");
+      if (strings != "fixed" && strings != "variable")
+        throw InputError("H5MDReporter: strings is \"fixed\" or \"variable\"; found \"" + strings + "\"");
+      return H5MDReporter{std::move(file), positive(period), positions == "f32", velocities, forces,
+                          strings == "variable"};
+    }), py::arg("file"), py::arg("period"), py::arg("positions") = "f64",
+        py::arg("velocities") = false, py::arg("forces") = false, py::arg("strings") = "fixed")
+    .def_readonly("file", &H5MDReporter::file)
+    .def_readonly("period", &H5MDReporter::period)
+    .def_property_readonly("positions", [](const H5MDReporter &r) { return r.single ? "f32" : "f64"; })
+    .def_readonly("velocities", &H5MDReporter::velocities)
+    .def_readonly("forces", &H5MDReporter::forces)
+    .def_property_readonly("strings", [](const H5MDReporter &r) { return r.variable ? "variable" : "fixed"; });
+  // Checkpoints (D223, docs/python-checkpoints.md).
+  struct CheckpointReporter { std::string file; int64_t period; };
+  py::class_<CheckpointReporter>(m, "CheckpointReporter")
+    .def(py::init([positive](std::string file, int64_t period) {
+      if (file.empty()) throw InputError("CheckpointReporter takes the name of a file");
+      return CheckpointReporter{std::move(file), positive(period)};
+    }), py::arg("file"), py::arg("period"))
+    .def_readonly("file", &CheckpointReporter::file)
+    .def_readonly("period", &CheckpointReporter::period);
+  py::class_<CallbackReporter>(m, "CallbackReporter")
+    .def(py::init([positive](py::object function, int64_t period) {
+      if (!PyCallable_Check(function.ptr())) throw InputError("CallbackReporter takes a callable");
+      return CallbackReporter{std::move(function), positive(period)};
+    }), py::arg("function"), py::arg("period"))
+    .def_readonly("function", &CallbackReporter::function)
+    .def_readonly("period", &CallbackReporter::period);
+  struct PySimulation {
+    std::shared_ptr<Program> program;
+    /// Shared with the leases of views, which keep it alive
+    /// (D220).
+    std::shared_ptr<compiler::Simulation> simulation;
+    std::shared_ptr<compiler::Simulation> frameBatch;
+    std::shared_ptr<std::mutex> frameBatchMutex = std::make_shared<std::mutex>();
+    py::list reporters;
+    /// The checkpoint reporter of the list, if any.
+    std::optional<CheckpointReporter> checkpoints;
+    /// Gives the simulation the built-in reporters of the list; returns the
+    /// callbacks.
+    std::vector<CallbackReporter> sync() {
+      compiler::Simulation::Reports given;
+      std::vector<CallbackReporter> callbacks;
+      checkpoints.reset();
+      for (py::handle item : reporters) {
+        if (py::isinstance<CheckpointReporter>(item)) {
+          if (checkpoints) throw InputError("a simulation takes one CheckpointReporter");
+          checkpoints = item.cast<CheckpointReporter>();
+          continue;
+        }
+        if (py::isinstance<EnergyReporter>(item)) {
+          if (given.energyPeriod) throw InputError("a simulation takes one EnergyReporter");
+          const auto &r = item.cast<const EnergyReporter &>();
+          given.energyPath = r.file; given.energyPeriod = r.period;
+        } else if (py::isinstance<TrajectoryReporter>(item)) {
+          if (given.framePeriod)
+            throw InputError("a simulation takes one TrajectoryReporter or one H5MDReporter");
+          const auto &r = item.cast<const TrajectoryReporter &>();
+          given.trajectoryPath = r.file; given.framePeriod = r.period;
+          given.trajectoryFormat = r.format;
+        } else if (py::isinstance<H5MDReporter>(item)) {
+          if (given.framePeriod)
+            throw InputError("a simulation takes one TrajectoryReporter or one H5MDReporter");
+          const auto &r = item.cast<const H5MDReporter &>();
+          given.trajectoryPath = r.file; given.framePeriod = r.period;
+          given.trajectoryFormat = driver::TrajectoryFormat::H5MD;
+          given.frameSingle = r.single; given.frameVelocities = r.velocities;
+          given.frameForces = r.forces; given.creatorVersion = MDIR_VERSION;
+          given.frameVariableStrings = r.variable;
+        } else if (py::isinstance<ObservablesReporter>(item)) {
+          if (given.observablesPeriod) throw InputError("a simulation takes one ObservablesReporter");
+          const auto &r = item.cast<const ObservablesReporter &>();
+          given.observablesPath = r.file; given.observablesPeriod = r.period;
+        } else if (py::isinstance<CallbackReporter>(item)) {
+          callbacks.push_back(item.cast<CallbackReporter>());
+        } else {
+          throw InputError("Simulation.reporters holds EnergyReporter, TrajectoryReporter, "
+                           "H5MDReporter, ObservablesReporter, CheckpointReporter, and "
+                           "CallbackReporter values");
+        }
+      }
+      const auto &now = simulation->getReports();
+      if (given.energyPath != now.energyPath || given.energyPeriod != now.energyPeriod ||
+          given.trajectoryPath != now.trajectoryPath || given.framePeriod != now.framePeriod ||
+          given.trajectoryFormat != now.trajectoryFormat ||
+          given.frameSingle != now.frameSingle || given.frameVelocities != now.frameVelocities ||
+          given.frameForces != now.frameForces ||
+          given.frameVariableStrings != now.frameVariableStrings ||
+          given.observablesPath != now.observablesPath ||
+          given.observablesPeriod != now.observablesPeriod)
+        if (llvm::Error error = simulation->setReports(given)) raise(std::move(error));
+      return callbacks;
+    }
+  };
+  // The values of a simulation's tunables, a mapping of names to arrays
+  // (D213).
+  struct TunableValues { py::object owner; };
+  static auto simulationOf = [](const TunableValues &t) -> compiler::Simulation & {
+    return *t.owner.cast<PySimulation &>().simulation;
+  };
+  // The readers take the snapshot of the values, the version, and the
+  // history (#621), which an update on another thread, without the GIL,
+  // publishes whole once it has succeeded.
+  static auto valueOf = [](const TunableValues &t, const std::string &name) {
+    auto &sim = simulationOf(t);
+    int k = sim.getTunables().find(name);
+    if (k < 0) throw py::key_error(name);
+    const auto v = std::move(sim.getTunableSnapshot().values[k]);
+    return host::copy(v.data(), v.size(), {static_cast<py::ssize_t>(v.size())});
+  };
+  // One snapshot, and the arrays of its values by name.
+  static auto snapshotOf = [](const TunableValues &t) {
+    auto &sim = simulationOf(t);
+    auto snapshot = sim.getTunableSnapshot();
+    std::vector<std::pair<std::string, py::array>> values;
+    const auto &set = sim.getTunables();
+    for (size_t k = 0; k != set.tunables.size(); ++k) {
+      const auto &v = snapshot.values[k];
+      values.emplace_back(set.tunables[k].name,
+                          host::copy(v.data(), v.size(), {static_cast<py::ssize_t>(v.size())}));
+    }
+    return std::make_pair(std::move(snapshot), std::move(values));
+  };
+  static auto namesOf = [](const TunableValues &t) {
+    std::vector<std::string> names;
+    for (const auto &entry : simulationOf(t).getTunables().tunables) names.push_back(entry.name);
+    return names;
+  };
+  static auto updateOf = [](TunableValues &t, py::handle mapping) {
+    auto &sim = simulationOf(t);
+    const auto &set = sim.getTunables();
+    if (set.empty())
+      throw InputError("the program of this simulation declares no tunable parameters "
+                       "(System.tunables)");
+    std::vector<std::pair<std::string, std::vector<double>>> changes;
+    auto items = py::reinterpret_borrow<py::object>(mapping).attr("items")();
+    for (py::handle item : items) {
+      auto pair = py::reinterpret_borrow<py::tuple>(item);
+      if (!py::isinstance<py::str>(pair[0]))
+        throw InputError("Simulation.tunables: the names of tunables are strings");
+      auto name = py::cast<std::string>(pair[0]);
+      int k = set.find(name);
+      if (k < 0) throw InputError("this simulation has no tunable named '" + name + "'");
+      const auto &entry = set.tunables[k];
+      changes.emplace_back(name, host::doubles(pair[1], "Simulation.tunables['" + name + "']",
+                                               entry.entries, {},
+                                               tunables::unitOf(entry.parameter, entry.term)));
+    }
+    std::optional<llvm::Error> error;
+    {
+      py::gil_scoped_release release;
+      error.emplace(sim.updateTunables(changes));
+    }
+    if (*error) raise(std::move(*error));
+    return sim.getTunableSnapshot().version;
+  };
+  // The derivative of the energy in the tunables at a state
+  // (D230): a read-only mapping of the names to arrays of
+  // the shape of the values.
+  struct TunableGradient {
+    py::dict values;
+    py::frozenset zero;
+    double energy;
+    int64_t version, step;
+  };
+  py::class_<TunableGradient>(m, "TunableGradient")
+    .def("__getitem__", [](const TunableGradient &g, const std::string &name) -> py::object {
+      if (!g.values.contains(name)) throw py::key_error(name);
+      return g.values[py::str(name)];
+    })
+    .def("__len__", [](const TunableGradient &g) { return g.values.size(); })
+    .def("__contains__", [](const TunableGradient &g, const std::string &name) {
+      return g.values.contains(name);
+    })
+    .def("__iter__", [](const TunableGradient &g) { return py::iter(g.values); })
+    .def("keys", [](const TunableGradient &g) { return g.values.attr("keys")(); })
+    .def("values", [](const TunableGradient &g) { return g.values.attr("values")(); })
+    .def("items", [](const TunableGradient &g) { return g.values.attr("items")(); })
+    .def_property_readonly("energy", [](const TunableGradient &g) { return g.energy; })
+    .def_property_readonly("version", [](const TunableGradient &g) { return g.version; })
+    .def_property_readonly("step", [](const TunableGradient &g) { return g.step; })
+    .def_property_readonly("zero", [](const TunableGradient &g) { return g.zero; })
+    .def("__repr__", [](const TunableGradient &g) {
+      return "TunableGradient(step=" + std::to_string(g.step) + ", version=" +
+             std::to_string(g.version) + ", " + py::str(py::list(g.values)).cast<std::string>() + ")";
+    });
+  py::class_<TunableValues>(m, "TunableValues")
+    .def("gradient", [](TunableValues &t) {
+      auto &sim = simulationOf(t);
+      std::optional<llvm::Expected<compiler::Simulation::TunableGradient>> result;
+      {
+        py::gil_scoped_release release;
+        result.emplace(sim.evaluateTunableGradient());
+      }
+      if (!*result) raise(result->takeError());
+      const auto &given = **result;
+      TunableGradient g{py::dict(), py::frozenset(py::set()), given.energy, given.version, given.step};
+      py::set zero;
+      const auto &set = sim.getTunables();
+      for (size_t k = 0; k != set.tunables.size(); ++k) {
+        const auto &v = given.values[k];
+        py::array a = host::copy(v.data(), v.size(), {static_cast<py::ssize_t>(v.size())});
+        a.attr("setflags")(py::arg("write") = false);
+        g.values[py::str(set.tunables[k].name)] = a;
+        if (given.zero[k]) zero.add(py::str(set.tunables[k].name));
+      }
+      g.zero = py::frozenset(zero);
+      return g;
+    })
+    .def("__getitem__", [](const TunableValues &t, const std::string &name) { return valueOf(t, name); })
+    .def("__setitem__", [](TunableValues &t, const std::string &name, py::object value) {
+      py::dict d; d[py::str(name)] = value; updateOf(t, d);
+    })
+    .def("__len__", [](const TunableValues &t) { return simulationOf(t).getTunables().tunables.size(); })
+    .def("__contains__", [](const TunableValues &t, const std::string &name) {
+      return simulationOf(t).getTunables().find(name) >= 0;
+    })
+    .def("__iter__", [](const TunableValues &t) { return py::iter(py::cast(namesOf(t))); })
+    .def("keys", [](const TunableValues &t) { return namesOf(t); })
+    .def("values", [](const TunableValues &t) {
+      py::list result;
+      for (const auto &[name, value] : snapshotOf(t).second) result.append(value);
+      return result;
+    })
+    .def("items", [](const TunableValues &t) {
+      py::list result;
+      for (const auto &[name, value] : snapshotOf(t).second) result.append(py::make_tuple(name, value));
+      return result;
+    })
+    .def("snapshot", [](const TunableValues &t) {
+      auto [snapshot, values] = snapshotOf(t);
+      py::dict d;
+      for (const auto &[name, value] : values) d[py::str(name)] = value;
+      return py::make_tuple(d, snapshot.version, py::cast(snapshot.history));
+    })
+    .def("update", [](TunableValues &t, py::object mapping, py::kwargs more) {
+      py::dict all;
+      if (!mapping.is_none()) all = py::dict(mapping);
+      for (auto item : more) all[item.first] = item.second;
+      return updateOf(t, all);
+    }, py::arg("values") = py::none())
+    .def_property_readonly("version", [](const TunableValues &t) { return simulationOf(t).getTunableSnapshot().version; })
+    .def_property_readonly("history", [](const TunableValues &t) { return simulationOf(t).getTunableSnapshot().history; })
+    .def_property_readonly("units", [](const TunableValues &t) {
+      py::dict d;
+      for (const auto &entry : simulationOf(t).getTunables().tunables) d[py::str(entry.name)] = entry.unit;
+      return d;
+    })
+    .def("__repr__", [](const TunableValues &t) {
+      std::string text = "TunableValues(version=" + std::to_string(simulationOf(t).getTunableSnapshot().version) + ", [";
+      bool first = true;
+      for (const auto &name : namesOf(t)) { text += (first ? "'" : ", '") + name + "'"; first = false; }
+      return text + "])";
+    });
+  views::bind(m);
+  py::class_<PySimulation>(m, "Simulation")
+    .def(py::init([](std::shared_ptr<Program> program, std::optional<bool> cache,
+                     std::optional<std::string> checkpoint, bool stage, bool append,
+                     bool frames, bool frameProduct, bool frameProductPositions,
+                     bool frameProductDirection) {
+      if (!program) throw InputError("Simulation takes a compiled program");
+      program->checkCurrent();
+      if (!checkpoint && stage)
+        throw InputError("Simulation: stage=True begins a stage from a checkpoint; give checkpoint=");
+      // A checkpoint is read before anything is compiled.
+      std::optional<driver::Checkpoint> taken;
+      if (checkpoint) {
+        taken = readCheckpointFile(*checkpoint);
+      }
+      // A learned potential (D270): torch is imported before
+      // the plugin loads, so that the plugin takes the libtorch of the
+      // imported module, whose version must be that of the plugin's build;
+      // a process never holds two.
+      if (!program->prepared->control.models.empty()) {
+        py::object torch;
+        try {
+          torch = py::module_::import("torch");
+        } catch (py::error_already_set &e) {
+          throw UnsupportedError(std::string("a model term needs PyTorch, the libtorch "
+                                             "of the plugin: ") + e.what());
+        }
+        std::string imported = py::str(torch.attr("__version__"));
+        imported = imported.substr(0, imported.find('+'));
+        auto built = driver::getPluginTorchVersion(
+            driver::getPluginPath(compiler::getRuntimeDirectory()));
+        if (!built) throw UnsupportedError(llvm::toString(built.takeError()));
+        if (*built != imported)
+          throw UnsupportedError("the plugin of learned potentials was built against "
+                                 "torch " + *built + ", and this process imported torch " +
+                                 imported + "; build the plugin against the torch of this "
+                                 "Python");
+      }
+      // The program's choice unless one is given (D217).
+      bool useCache = cache.value_or(program->cache);
+      auto prepared = program->prepared;
+      std::optional<llvm::Expected<std::unique_ptr<compiler::Simulation>>> created;
+      {
+        // The inputs were copied at compilation; nothing here touches Python.
+        py::gil_scoped_release release;
+        created.emplace(compiler::Simulation::create(*prepared, useCache,
+                                                     program->code.get(), frames,
+                                                     frameProduct, frameProductPositions,
+                                                     false, frameProductDirection));
+      }
+      PySimulation result;
+      result.program = std::move(program);
+      result.simulation = unwrap(std::move(*created));
+      // The same run goes on, or a stage begins (D223);
+      // what differs in execution, or is evaluated anew, is a warning.
+      if (taken) {
+        auto notes = unwrap(result.simulation->continueFrom(*taken, stage, append));
+        for (const std::string &note : notes)
+          if (PyErr_WarnEx(PyExc_UserWarning, ("Simulation: '" + *checkpoint + "': " + note).c_str(), 1) != 0)
+            throw py::error_already_set();
+      }
+      return result;
+    }), py::arg("program"), py::kw_only(), py::arg("cache") = py::none(),
+       py::arg("checkpoint") = py::none(), py::arg("stage") = false,
+       py::arg("append") = true,
+       // The simulation of a frame evaluator, whose entry is a loop over
+       // frames (D251); private to `mdir.FrameEvaluator`.
+       py::arg("_frames") = false,
+       // With `_frames`, the product program of a frame evaluator
+       // (D381, #726); private to `mdir.FrameEvaluator`.
+       py::arg("_frame_product") = false,
+       // With `_frame_product`, the product program that also gives the
+       // derivative of the product in the positions (#771,
+       // D383); private to `mdir.FrameEvaluator`.
+       py::arg("_frame_product_positions") = false,
+       // With `_frame_product`, the product program of forward mode in the
+       // tunables (#726, D389); private to
+       // `mdir.FrameEvaluator`.
+       py::arg("_frame_product_direction") = false)
+    .def("save_checkpoint", [](PySimulation &s, const std::string &path) {
+      std::optional<llvm::Error> error;
+      {
+        py::gil_scoped_release release;
+        error.emplace(s.simulation->saveCheckpoint(path, MDIR_VERSION));
+      }
+      if (*error) raise(std::move(*error));
+    }, py::arg("path"))
+    // The module that the builder emitted for the program of the
+    // simulation, which for an evaluator is the loop over frames
+    // (D251): private, for the tests of what the builder
+    // emits (#302). Not part of the interface: it may change or go.
+    .def_property_readonly("_ir", [](const PySimulation &s) {
+      driver::Program program;
+      program.module = s.simulation->getProgramText();
+      return driver::printModuleForReading(program);
+    })
+    .def_property_readonly("_start_values", [](const PySimulation &s) {
+      return s.simulation->getStartValueNames();
+    })
+    // The bytes of its stack that the entry held at the last boundary,
+    // 0 without an activation: private, for the tests of the memory per
+    // frame (#302). Not part of the interface: it may change or go.
+    .def_property_readonly("_stack_in_use", [](const PySimulation &s) { return s.simulation->getStackInUse(); })
+    // (taken, built, seconds): how many structures of the tuples the
+    // activations took from those that the simulation keeps, how many they
+    // built, and the time their code spent on both
+    // (D253). Private, for the tests and the
+    // measurements: it may change or go.
+    .def_property_readonly("_kept_tuples", [](const PySimulation &s) { return s.simulation->getKeptTuples(); })
+    // False: every activation from the next on builds its structures of
+    // the tuples anew, as a simulation that keeps none. Private, for the
+    // tests and the measurements, which compare the two.
+    .def_property("_keep_tuples",
+                  [](const PySimulation &s) { return s.simulation->getKeepsTuples(); },
+                  [](PySimulation &s, bool keeps) { s.simulation->setKeepsTuples(keeps); })
+    // {name: (seconds, page faults, calls)}: where the host has spent its
+    // time in the updates of the tunables and the starts of the activations,
+    // summed since the simulation was made (#324). A name with a dot is a
+    // part of the name before the dot. Private, for the measurements: it
+    // may change or go.
+    .def_property_readonly("_host_times", [](const PySimulation &s) {
+      py::dict d;
+      for (const auto &[name, slice] : s.simulation->getHostTimes().slices)
+        d[py::str(name)] = py::make_tuple(slice.seconds, slice.faults, slice.calls);
+      return d;
+    })
+    // (kept, anew, arrays kept, arrays made, comparisons): the programs
+    // that the updates of the tunables built from the model that the
+    // simulation keeps for them (D254) and from a copy of the
+    // model of the compile; the arrays of the program that the simulation
+    // keeps and those that every update makes, and the comparisons of a
+    // program built with the kept arrays with one built from a copy
+    // (D256); zeros before the first update. Private, for
+    // the tests and the measurements: it may change or go.
+    .def_property_readonly("_tunable_builds", [](const PySimulation &s) {
+      auto counts = s.simulation->getTunableBuilds();
+      return py::make_tuple(counts[0], counts[1], counts[2], counts[3], counts[4]);
+    })
+    // Adds 1 to a number of an array that the updates keep, as a defect
+    // would. Private, for the test of the comparison.
+    .def("_spoil_kept_array", [](PySimulation &s) { return s.simulation->spoilKeptArray(); })
+    // (handed, kept, made): the arrays of the program that the starts of
+    // the activations handed the entry without a copy, and the conversions
+    // into the type of the entry that they took as the simulation kept them
+    // and that they made (D258). Private, for
+    // the tests and the measurements: it may change or go.
+    .def_property_readonly("_start_arguments", [](const PySimulation &s) {
+      auto counts = s.simulation->getStartArguments();
+      return py::make_tuple(counts[0], counts[1], counts[2]);
+    })
+    .def_property_readonly("_device_batch_start_arguments", [](const PySimulation &s) {
+      py::gil_scoped_release release;
+      std::lock_guard<std::mutex> lock(*s.frameBatchMutex);
+      if (!s.frameBatch) return std::array<int64_t, 3>{};
+      return s.frameBatch->getStartArguments();
+    })
+    .def_property_readonly("_device_batch_aux_names", [](const PySimulation &s) {
+      return s.simulation->getFrameBatchAuxNames();
+    })
+    .def_property_readonly("_device_batch_copy_bytes", [](const PySimulation &s) {
+      py::gil_scoped_release release;
+      std::lock_guard<std::mutex> lock(*s.frameBatchMutex);
+      return s.frameBatch ? s.frameBatch->getFrameBatchCopyBytes() : std::array<uint64_t, 4>{};
+    })
+    // False: every start from the next on copies and converts the arrays
+    // of the program anew, as a simulation that keeps nothing for its
+    // starts. Private, for the tests, which compare the two.
+    .def_property("_keep_start_arguments",
+                  [](const PySimulation &s) { return s.simulation->getKeepsStartArguments(); },
+                  [](PySimulation &s, bool keeps) { s.simulation->setKeepsStartArguments(keeps); })
+    // Adds 1 to the first byte of the first buffer that the activation
+    // took without a copy, as a write of its entry would. Private, for the
+    // test of the check of MDRT_CHECK_KEPT_TUPLES.
+    .def("_spoil_start_argument", [](PySimulation &s) { return s.simulation->spoilStartArgument(); })
+    // False: every update of the tunables builds its program from a copy of
+    // the model of the compile. Private, for the tests and the
+    // measurements, which compare the two.
+    .def_property("_keep_model",
+                  [](const PySimulation &s) { return s.simulation->getKeepsModel(); },
+                  [](PySimulation &s, bool keeps) { s.simulation->setKeepsModel(keeps); })
+    // Writes over one number of the kept model that no tunable owns, as a
+    // defect would. Private, for the test of the comparison of
+    // MDRT_CHECK_KEPT_TUPLES.
+    .def("_spoil_kept_model", [](PySimulation &s) { return s.simulation->spoilKeptModel(); })
+    // The evaluation of stored frames (D240,
+    // docs/python-frames.md), for `mdir.FrameEvaluator`: `positions` is
+    // (k, N, 3) float64 in nm in the order of the input, `cells` and
+    // `tilts` (k, 3) or None; `first` is the index of the first frame, for the messages.
+    // Returns the energies, the virials, the volumes (k,), the observed
+    // columns (k, columns), and with `gradient` the rows of the Jacobian
+    // (k, entries of all tunables in their order), else None; then, with
+    // `position_gradient`, the gradient of the energies in the positions
+    // (k, N, 3) in the type of the forces of the program, kJ/mol/nm, and
+    // with `strain_gradient` that in the strain (k, 3, 3) float64, kJ/mol
+    // (D252), else None.
+    .def("_evaluate_device_batch", [](PySimulation &s, py::object positions,
+        py::object theta, py::object energies, py::object cells,
+        py::object positionGradient, py::object strain, py::object rows,
+        py::object tangent, py::object cotangent, py::object jvp, py::object vjp,
+        py::object aux,
+        uint64_t stream) {
+      if (tangent.is_none() != jvp.is_none() || cotangent.is_none() != vjp.is_none())
+        throw InputError("device frames: pair each product output with its tangent or cotangent");
+      dlpack::BorrowedTensor x(positions, stream, false, "positions");
+      auto device = x.tensor.device;
+      if (device.type != dlpack::CUDA || x.tensor.ndim != 3 || !x.tensor.shape)
+        throw InputError("device frames require CUDA positions of shape (K, N, 3)");
+      int64_t frames = x.tensor.shape[0];
+      int64_t particles = s.simulation->getParticleCount();
+      unsigned bits = s.program->prepared->control.precision == driver::Precision::Single ? 32 : 64;
+      if (s.program->prepared->control.precision == driver::Precision::Mixed &&
+          !s.program->prepared->control.deterministic && x.tensor.dtype.bits == 32)
+        bits = 32;
+      auto check = [&](const dlpack::BorrowedTensor &tensor,
+                       llvm::ArrayRef<int64_t> shape, unsigned width,
+                       dlpack::Device where, const char *name) {
+        if (!tensor.contiguous(shape, width, where))
+          throw InputError(std::string("device frames: invalid shape, dtype, device or strides for ") + name);
+      };
+      check(x, {frames, particles, 3}, bits, device, "positions");
+      dlpack::BorrowedTensor parameters(theta, stream, false, "theta");
+      int64_t entries = 0;
+      for (const auto &entry : s.simulation->getTunables().tunables) entries += entry.entries;
+      check(parameters, {entries}, 64, device, "theta");
+      dlpack::BorrowedTensor u(energies, stream, true, "energies");
+      check(u, {frames}, 64, device, "energies");
+      std::unique_ptr<dlpack::BorrowedTensor> c, g, v, r;
+      if (!cells.is_none()) {
+        c = std::make_unique<dlpack::BorrowedTensor>(cells, stream, false, "cells");
+        auto where = c->tensor.device.type == dlpack::CPU ? dlpack::Device{dlpack::CPU, 0} : device;
+        check(*c, {frames, 6}, 64, where, "cells");
+      }
+      if (!positionGradient.is_none()) {
+        g = std::make_unique<dlpack::BorrowedTensor>(positionGradient, stream, true, "position_gradient");
+        check(*g, {frames, particles, 3}, bits, device, "position_gradient");
+      }
+      if (!strain.is_none()) {
+        v = std::make_unique<dlpack::BorrowedTensor>(strain, stream, true, "strain");
+        check(*v, {frames, 3, 3}, 64, device, "strain");
+      }
+      if (!rows.is_none()) {
+        r = std::make_unique<dlpack::BorrowedTensor>(rows, stream, true, "rows");
+        check(*r, {frames, entries}, 64, device, "rows");
+      }
+      std::unique_ptr<dlpack::BorrowedTensor> t, q, j, p;
+      if (!jvp.is_none()) {
+        t = std::make_unique<dlpack::BorrowedTensor>(tangent, stream, false, "tangent");
+        j = std::make_unique<dlpack::BorrowedTensor>(jvp, stream, true, "jvp");
+        check(*t, {entries}, 64, device, "tangent");
+        check(*j, {frames}, 64, device, "jvp");
+      }
+      if (!vjp.is_none()) {
+        q = std::make_unique<dlpack::BorrowedTensor>(cotangent, stream, false, "cotangent");
+        p = std::make_unique<dlpack::BorrowedTensor>(vjp, stream, true, "vjp");
+        check(*q, {frames}, 64, device, "cotangent");
+        check(*p, {entries}, 64, device, "vjp");
+      }
+      std::unique_ptr<dlpack::BorrowedTensor> a;
+      if (!aux.is_none()) {
+        a = std::make_unique<dlpack::BorrowedTensor>(aux, stream, true, "aux");
+        check(*a, {frames, int64_t(s.simulation->getFrameBatchAuxNames().size())}, 64, device, "aux");
+      }
+      compiler::Simulation::FrameBatch batch;
+      batch.positions = x.data();
+      batch.parameters = static_cast<const double *>(parameters.data());
+      batch.energies = static_cast<double *>(u.data());
+      batch.cells = c ? static_cast<const double *>(c->data()) : nullptr;
+      batch.cellsOnDevice = c && c->tensor.device.type == dlpack::CUDA;
+      batch.positionGradient = g ? g->data() : nullptr;
+      batch.strain = v ? static_cast<double *>(v->data()) : nullptr;
+      batch.rows = r ? static_cast<double *>(r->data()) : nullptr;
+      batch.tangent = t ? static_cast<const double *>(t->data()) : nullptr;
+      batch.cotangent = q ? static_cast<const double *>(q->data()) : nullptr;
+      batch.jvp = j ? static_cast<double *>(j->data()) : nullptr;
+      batch.vjp = p ? static_cast<double *>(p->data()) : nullptr;
+      batch.aux = a ? static_cast<double *>(a->data()) : nullptr;
+      batch.frames = frames;
+      batch.parameterCount = entries;
+      batch.device = device.id;
+      batch.positionWidth = bits / 8;
+      batch.stream = stream == 1 ? nullptr : reinterpret_cast<void *>(stream);
+      llvm::Error error = llvm::Error::success();
+      {
+        py::gil_scoped_release release;
+        std::lock_guard<std::mutex> lock(*s.frameBatchMutex);
+        if (!s.frameBatch) {
+          auto created = compiler::Simulation::create(*s.program->prepared,
+              s.program->cache, s.program->code.get(), true, false, false, true);
+          if (!created) error = created.takeError();
+          else s.frameBatch = std::move(*created);
+        }
+        if (!error) error = s.frameBatch->evaluateFrames(batch);
+      }
+      if (error) raise(std::move(error));
+    }, py::arg("positions"), py::arg("theta"), py::arg("energies"),
+       py::kw_only(), py::arg("cells") = py::none(),
+       py::arg("position_gradient") = py::none(), py::arg("strain") = py::none(),
+       py::arg("rows") = py::none(),
+       py::arg("tangent") = py::none(), py::arg("cotangent") = py::none(),
+       py::arg("jvp") = py::none(), py::arg("vjp") = py::none(),
+       py::arg("aux") = py::none(),
+       py::arg("stream") = 1)
+    .def("_evaluate_frames", [](py::object self,
+                                py::array_t<double, py::array::c_style> positions,
+                                py::object cellsGiven, py::object tiltsGiven, bool gradient,
+                                int64_t first, bool positionGradient, bool strainGradient) {
+      auto &s = self.cast<PySimulation &>();
+      compiler::Simulation &sim = *s.simulation;
+      const auto &set = sim.getTunables();
+      size_t count = sim.getParticleCount();
+      if (positions.ndim() != 3 || static_cast<size_t>(positions.shape(1)) != count ||
+          positions.shape(2) != 3)
+        throw InputError("frames: expected positions of shape (K, " + std::to_string(count) +
+                         ", 3)");
+      size_t frames = positions.shape(0);
+      std::optional<py::array_t<double, py::array::c_style>> cells;
+      if (!cellsGiven.is_none()) {
+        cells = cellsGiven.cast<py::array_t<double, py::array::c_style>>();
+        if (cells->ndim() != 2 || static_cast<size_t>(cells->shape(0)) != frames ||
+            cells->shape(1) != 3)
+          throw InputError("frames: expected cells of shape (K, 3)");
+      }
+      std::optional<py::array_t<double, py::array::c_style>> tilts;
+      if (!tiltsGiven.is_none()) {
+        tilts = tiltsGiven.cast<py::array_t<double, py::array::c_style>>();
+        if (tilts->ndim() != 2 || static_cast<size_t>(tilts->shape(0)) != frames ||
+            tilts->shape(1) != 3)
+          throw InputError("frames: expected tilts of shape (K, 3)");
+      }
+      const double *t = tilts ? tilts->data() : nullptr;
+      size_t columns = sim.getObservableNames().size(), entries = 0;
+      for (const auto &entry : set.tunables) entries += entry.entries;
+      std::vector<double> energy(frames), virial(frames), volume(frames),
+          observed(frames * columns), rows(gradient ? frames * entries : 0);
+      const double *x = positions.data();
+      const double *c = cells ? cells->data() : nullptr;
+      // The gradient in the positions is written where the caller will
+      // have it, in the type of the forces: no copy of it is kept here.
+      py::object positionGradients = py::none(), strainGradients = py::none();
+      char *g = nullptr;
+      double *strains = nullptr;
+      size_t width = sim.keepsForcesInDouble() ? sizeof(double) : sizeof(float);
+      if (positionGradient) {
+        std::vector<py::ssize_t> shape = {static_cast<py::ssize_t>(frames),
+                                          static_cast<py::ssize_t>(count), 3};
+        py::array made = sim.keepsForcesInDouble() ? py::array(py::array_t<double>(shape))
+                                                   : py::array(py::array_t<float>(shape));
+        g = static_cast<char *>(made.mutable_data());
+        positionGradients = made;
+      }
+      if (strainGradient) {
+        py::array_t<double> made({static_cast<py::ssize_t>(frames), py::ssize_t(3), py::ssize_t(3)});
+        strains = made.mutable_data();
+        strainGradients = made;
+      }
+      std::optional<llvm::Error> error;
+      size_t at = 0;
+      {
+        py::gil_scoped_release release;
+        for (; at != frames && !error; ++at) {
+          // The tilts of a frame that gives its edges alone are zero.
+          std::optional<std::array<double, 6>> cell;
+          if (c)
+            cell = {c[3 * at], c[3 * at + 1], c[3 * at + 2],
+                    t ? t[3 * at] : 0.0, t ? t[3 * at + 1] : 0.0, t ? t[3 * at + 2] : 0.0};
+          auto result = sim.evaluateFrame(x + 3 * count * at, cell, gradient,
+                                          g ? g + 3 * count * width * at : nullptr,
+                                          strains != nullptr);
+          if (!result) { error.emplace(result.takeError()); break; }
+          if (strains)
+            std::copy(result->strain.begin(), result->strain.end(), strains + 9 * at);
+          energy[at] = result->energy; virial[at] = result->virial; volume[at] = result->volume;
+          for (size_t k = 0; k != columns && k != result->observables.size(); ++k)
+            observed[at * columns + k] = result->observables[k];
+          size_t offset = 0;
+          for (const auto &values : result->gradient) {
+            std::copy(values.begin(), values.end(), rows.begin() + at * entries + offset);
+            offset += values.size();
+          }
+        }
+      }
+      if (error) {
+        // The class of the error, with the frame it is of.
+        std::string where = "frame " + std::to_string(first + static_cast<int64_t>(at)) + ": ";
+        try {
+          raise(std::move(*error));
+        } catch (const UnsupportedError &e) {
+          throw UnsupportedError(where + e.what());
+        } catch (const SimulationError &e) {
+          throw SimulationError(where + e.what());
+        } catch (const InputError &e) {
+          throw InputError(where + e.what());
+        }
+      }
+      auto shape1 = std::vector<py::ssize_t>{static_cast<py::ssize_t>(frames)};
+      py::object jacobian = py::none();
+      if (gradient)
+        jacobian = host::copy(rows.data(), rows.size(),
+                              {static_cast<py::ssize_t>(frames), static_cast<py::ssize_t>(entries)});
+      return py::make_tuple(
+          host::copy(energy.data(), frames, shape1), host::copy(virial.data(), frames, shape1),
+          host::copy(volume.data(), frames, shape1),
+          host::copy(observed.data(), observed.size(),
+                     {static_cast<py::ssize_t>(frames), static_cast<py::ssize_t>(columns)}),
+          jacobian, positionGradients, strainGradients);
+    }, py::arg("positions"), py::arg("cells"), py::arg("tilts"), py::arg("gradient"),
+       py::arg("first") = 0, py::arg("position_gradient") = false,
+       py::arg("strain_gradient") = false)
+    // The product of stored frames (D381, #726), for
+    // `FrameEnergies.vjp`: `positions` (k, N, 3) float64 in nm in the order
+    // of the input, `cells` and `tilts` (k, 3) or None, the cotangents of
+    // the energies `energy` (k,) and of their gradients in the positions
+    // `position` (k, N, 3) float64; `first` is the index of the first frame,
+    // for the messages. Returns the sum over the frames, in their order, of
+    // g_n dU_n/dθ + Σ_i Ḡ_n,i · d²U_n/dx_i dθ, (entries of all tunables in
+    // their order) float64.
+    .def("_evaluate_frame_products", [](py::object self,
+                                        py::array_t<double, py::array::c_style> positions,
+                                        py::object cellsGiven, py::object tiltsGiven,
+                                        py::array_t<double, py::array::c_style> energy,
+                                        py::array_t<double, py::array::c_style> position,
+                                        int64_t first, bool positionsDerivative) {
+      auto &s = self.cast<PySimulation &>();
+      compiler::Simulation &sim = *s.simulation;
+      const auto &set = sim.getTunables();
+      size_t count = sim.getParticleCount();
+      if (positions.ndim() != 3 || static_cast<size_t>(positions.shape(1)) != count ||
+          positions.shape(2) != 3)
+        throw InputError("frames: expected positions of shape (K, " + std::to_string(count) +
+                         ", 3)");
+      size_t frames = positions.shape(0);
+      if (energy.ndim() != 1 || static_cast<size_t>(energy.shape(0)) != frames)
+        throw InputError("frames: expected the cotangents of the energies of shape (K,)");
+      if (position.ndim() != 3 || static_cast<size_t>(position.shape(0)) != frames ||
+          static_cast<size_t>(position.shape(1)) != count || position.shape(2) != 3)
+        throw InputError("frames: expected the cotangents of the gradients in the positions "
+                         "of shape (K, " + std::to_string(count) + ", 3)");
+      std::optional<py::array_t<double, py::array::c_style>> cells, tilts;
+      if (!cellsGiven.is_none()) {
+        cells = cellsGiven.cast<py::array_t<double, py::array::c_style>>();
+        if (cells->ndim() != 2 || static_cast<size_t>(cells->shape(0)) != frames ||
+            cells->shape(1) != 3)
+          throw InputError("frames: expected cells of shape (K, 3)");
+      }
+      if (!tiltsGiven.is_none()) {
+        tilts = tiltsGiven.cast<py::array_t<double, py::array::c_style>>();
+        if (tilts->ndim() != 2 || static_cast<size_t>(tilts->shape(0)) != frames ||
+            tilts->shape(1) != 3)
+          throw InputError("frames: expected tilts of shape (K, 3)");
+      }
+      size_t entries = 0;
+      for (const auto &entry : set.tunables) entries += entry.entries;
+      std::vector<double> total(entries, 0.0);
+      // With `positions_derivative`, the derivative of the product of each
+      // frame in its positions, (k, N, 3) float64 (#771).
+      py::object derivatives = py::none();
+      double *dx = nullptr;
+      if (positionsDerivative) {
+        py::array_t<double> made({static_cast<py::ssize_t>(frames),
+                                  static_cast<py::ssize_t>(count), py::ssize_t(3)});
+        dx = made.mutable_data();
+        derivatives = made;
+      }
+      const double *x = positions.data(), *g = energy.data(), *v = position.data();
+      const double *c = cells ? cells->data() : nullptr, *t = tilts ? tilts->data() : nullptr;
+      std::optional<llvm::Error> error;
+      size_t at = 0;
+      {
+        py::gil_scoped_release release;
+        for (; at != frames && !error; ++at) {
+          std::optional<std::array<double, 6>> cell;
+          if (c)
+            cell = {c[3 * at], c[3 * at + 1], c[3 * at + 2],
+                    t ? t[3 * at] : 0.0, t ? t[3 * at + 1] : 0.0, t ? t[3 * at + 2] : 0.0};
+          auto result = sim.evaluateFrameProduct(x + 3 * count * at, cell, g[at],
+                                                 v + 3 * count * at,
+                                                 dx ? dx + 3 * count * at : nullptr);
+          if (!result) { error.emplace(result.takeError()); break; }
+          size_t offset = 0;
+          for (const auto &values : *result) {
+            for (size_t m = 0; m != values.size(); ++m) total[offset + m] += values[m];
+            offset += values.size();
+          }
+        }
+      }
+      if (error) {
+        std::string where = "frame " + std::to_string(first + static_cast<int64_t>(at)) + ": ";
+        try {
+          raise(std::move(*error));
+        } catch (const UnsupportedError &e) {
+          throw UnsupportedError(where + e.what());
+        } catch (const SimulationError &e) {
+          throw SimulationError(where + e.what());
+        } catch (const InputError &e) {
+          throw InputError(where + e.what());
+        }
+      }
+      py::object summed = host::copy(total.data(), entries, {static_cast<py::ssize_t>(entries)});
+      if (!positionsDerivative) return summed;
+      return py::object(py::make_tuple(summed, derivatives));
+    }, py::arg("positions"), py::arg("cells"), py::arg("tilts"), py::arg("energy"),
+       py::arg("position"), py::arg("first") = 0, py::arg("positions_derivative") = false)
+    // Forward mode in the tunables (#726, D389),
+    // of the product program of forward mode: `positions` (k, N, 3) float64
+    // in the order of the input, `cells` and `tilts` (k, 3) or None, and the
+    // tangent of the entries of all tunables in their order, `tangent`
+    // (entries,) float64; `first` is the index of the first frame, for the
+    // messages. Returns the tangents of the energies (k,) and of their
+    // gradients in the positions (k, N, 3), float64.
+    .def("_evaluate_frame_directions", [](py::object self,
+                                          py::array_t<double, py::array::c_style> positions,
+                                          py::object cellsGiven, py::object tiltsGiven,
+                                          py::array_t<double, py::array::c_style> tangent,
+                                          int64_t first) {
+      auto &s = self.cast<PySimulation &>();
+      compiler::Simulation &sim = *s.simulation;
+      const auto &set = sim.getTunables();
+      size_t count = sim.getParticleCount();
+      if (positions.ndim() != 3 || static_cast<size_t>(positions.shape(1)) != count ||
+          positions.shape(2) != 3)
+        throw InputError("frames: expected positions of shape (K, " + std::to_string(count) +
+                         ", 3)");
+      size_t frames = positions.shape(0);
+      std::optional<py::array_t<double, py::array::c_style>> cells, tilts;
+      if (!cellsGiven.is_none()) {
+        cells = cellsGiven.cast<py::array_t<double, py::array::c_style>>();
+        if (cells->ndim() != 2 || static_cast<size_t>(cells->shape(0)) != frames ||
+            cells->shape(1) != 3)
+          throw InputError("frames: expected cells of shape (K, 3)");
+      }
+      if (!tiltsGiven.is_none()) {
+        tilts = tiltsGiven.cast<py::array_t<double, py::array::c_style>>();
+        if (tilts->ndim() != 2 || static_cast<size_t>(tilts->shape(0)) != frames ||
+            tilts->shape(1) != 3)
+          throw InputError("frames: expected tilts of shape (K, 3)");
+      }
+      size_t entries = 0;
+      for (const auto &entry : set.tunables) entries += entry.entries;
+      if (tangent.ndim() != 1 || static_cast<size_t>(tangent.shape(0)) != entries)
+        throw InputError("frames: expected a tangent of shape (" + std::to_string(entries) +
+                         ",)");
+      std::vector<std::vector<double>> split;
+      const double *d = tangent.data();
+      for (const auto &entry : set.tunables) {
+        split.emplace_back(d, d + entry.entries);
+        d += entry.entries;
+      }
+      py::array_t<double> energies(static_cast<py::ssize_t>(frames));
+      py::array_t<double> gradients({static_cast<py::ssize_t>(frames),
+                                     static_cast<py::ssize_t>(count), py::ssize_t(3)});
+      double *u = energies.mutable_data(), *dx = gradients.mutable_data();
+      const double *x = positions.data();
+      const double *c = cells ? cells->data() : nullptr, *t = tilts ? tilts->data() : nullptr;
+      std::optional<llvm::Error> error;
+      size_t at = 0;
+      {
+        py::gil_scoped_release release;
+        for (; at != frames && !error; ++at) {
+          std::optional<std::array<double, 6>> cell;
+          if (c)
+            cell = {c[3 * at], c[3 * at + 1], c[3 * at + 2],
+                    t ? t[3 * at] : 0.0, t ? t[3 * at + 1] : 0.0, t ? t[3 * at + 2] : 0.0};
+          auto result = sim.evaluateFrameDirection(x + 3 * count * at, cell, split,
+                                                   dx + 3 * count * at);
+          if (!result) { error.emplace(result.takeError()); break; }
+          u[at] = *result;
+        }
+      }
+      if (error) {
+        std::string where = "frame " + std::to_string(first + static_cast<int64_t>(at)) + ": ";
+        try {
+          raise(std::move(*error));
+        } catch (const UnsupportedError &e) {
+          throw UnsupportedError(where + e.what());
+        } catch (const SimulationError &e) {
+          throw SimulationError(where + e.what());
+        } catch (const InputError &e) {
+          throw InputError(where + e.what());
+        }
+      }
+      return py::make_tuple(energies, gradients);
+    }, py::arg("positions"), py::arg("cells"), py::arg("tilts"), py::arg("tangent"),
+       py::arg("first") = 0)
+    .def_property_readonly("_particle_count", [](PySimulation &s) {
+      return s.simulation->getParticleCount();
+    })
+    // Whether the program keeps its forces in f64, the type of the gradient
+    // in the positions of `_evaluate_frames`; private.
+    .def_property_readonly("_forces_double", [](PySimulation &s) {
+      return s.simulation->keepsForcesInDouble();
+    })
+    // The key and the fingerprint under which the handlers of the XLA FFI
+    // find this simulation of a frame evaluator (`mdir.jax`,
+    // D371); private.
+    .def("_xla_ffi_register", [](PySimulation &s) {
+      const model::PreparedModel &prepared = *s.program->prepared;
+      auto [key, fingerprint] = python::xla::registerProgram(s.simulation, prepared);
+      py::dict d;
+      d["key"] = key;
+      d["fingerprint"] = fingerprint;
+      d["periodic"] = prepared.control.periodic;
+      // Restraints to reference positions, whose virial is not the
+      // derivative of the energy of a frame in the strain (D252).
+      d["restrained"] = !prepared.system.restraintConstants.empty();
+      return d;
+    })
+    .def("run", [](py::object self, int64_t steps, bool energy) {
+      auto &s = self.cast<PySimulation &>();
+      if (steps < 0) throw InputError("run takes a nonnegative number of steps");
+      std::vector<CallbackReporter> callbacks = s.sync();
+      // No step, and the energies of the state (D213).
+      if (steps == 0 && energy) {
+        std::optional<llvm::Error> error;
+        {
+          py::gil_scoped_release release;
+          error.emplace(s.simulation->evaluate());
+        }
+        if (*error) raise(std::move(*error));
+        return int64_t(0);
+      }
+      // The parts end at the steps of the callbacks, whose state they take;
+      // the files of the built-in reporters are written inside the parts.
+      int64_t taken = 0, end = s.simulation->getStep() + steps;
+      // A checkpoint reporter ends a part at its steps, as a callback does
+      // (D223).
+      std::optional<CheckpointReporter> saves = s.checkpoints;
+      while (taken < steps) {
+        int64_t now = s.simulation->getStep(), next = end;
+        for (const auto &c : callbacks) next = std::min(next, (now / c.period + 1) * c.period);
+        if (saves) next = std::min(next, (now / saves->period + 1) * saves->period);
+        // A frame of the state with its velocities or forces ends a part
+        // at its step, with a step of energy (D239).
+        int64_t frame = s.simulation->getNextStateFrame();
+        if (frame >= 0) next = std::min(next, frame);
+        bool atCallback = next < end || (!callbacks.empty() && llvm::any_of(callbacks,
+            [&](const CallbackReporter &c) { return end % c.period == 0; })) ||
+            next == frame;
+        int64_t leg = withSignals([&](const std::function<bool()> &poll) {
+          return s.simulation->run(next - now, poll, energy || atCallback);
+        });
+        taken += leg;
+        if (leg < next - now) break;  // A stop.
+        int64_t at = s.simulation->getStep();
+        if (at == frame) {
+          std::optional<llvm::Error> error;
+          {
+            py::gil_scoped_release release;
+            error.emplace(s.simulation->writeStateFrame());
+          }
+          if (*error) raise(std::move(*error));
+        }
+        if (saves && at % saves->period == 0) {
+          std::optional<llvm::Error> error;
+          {
+            py::gil_scoped_release release;
+            error.emplace(s.simulation->saveCheckpoint(saves->file, MDIR_VERSION));
+          }
+          if (*error) raise(std::move(*error));
+        }
+        bool due = false;
+        for (const auto &c : callbacks) due = due || at % c.period == 0;
+        if (!due) continue;
+        py::object state = py::cast(unwrap(s.simulation->getState()));
+        for (const auto &c : callbacks)
+          if (at % c.period == 0) c.function(self, state);
+      }
+      return taken;
+    }, py::arg("steps"), py::arg("energy") = false)
+    .def_property("reporters", [](PySimulation &s) { return s.reporters; },
+                  [](PySimulation &s, py::list reporters) { s.reporters = std::move(reporters); })
+    .def("close_reporters", [](PySimulation &s) {
+      s.simulation->closeReports();
+      s.reporters = py::list();
+    })
+    .def("minimize", [](PySimulation &s, std::optional<int64_t> steps, py::object given) {
+      // The largest force at which it stops, in kJ/mol/nm (D219).
+      std::optional<double> tolerance;
+      if (!given.is_none())
+        tolerance = units::scalar(given, "minimize: tolerance", units::force);
+      return withSignals([&](const std::function<bool()> &poll) {
+        return s.simulation->minimize(steps, poll, tolerance);
+      });
+    }, py::arg("steps") = py::none(), py::arg("tolerance") = py::none())
+    .def("request_stop", [](PySimulation &s) { s.simulation->requestStop(); })
+    // For the tests of interleavings (#621; Simulation::pausePoint): a
+    // callable that an operation calls, with the name of the point, where
+    // it runs without the GIL; None removes it. The callable is held so that
+    // it is released with the GIL, wherever the simulation ends.
+    .def("_set_pause_point", [](PySimulation &s, py::object callable) {
+      if (callable.is_none()) {
+        s.simulation->pausePoint = nullptr;
+        return;
+      }
+      auto held = std::shared_ptr<py::object>(new py::object(std::move(callable)),
+                                              [](py::object *o) {
+                                                py::gil_scoped_acquire gil;
+                                                delete o;
+                                              });
+      s.simulation->pausePoint = [held](const char *point) {
+        py::gil_scoped_acquire gil;
+        try {
+          (*held)(point);
+        } catch (py::error_already_set &e) {
+          e.discard_as_unraisable("Simulation._set_pause_point");
+        }
+      };
+    })
+    .def("state", [](PySimulation &s) { return unwrap(s.simulation->getState()); })
+    // The learned potentials (D270) at their last evaluation,
+    // that of the last step: their energy (kJ/mol) and their virial tensor
+    // W = -dE/d(strain) (kJ/mol); None without a model term.
+    .def("model_energies", [](PySimulation &s) -> py::object {
+      double energy = 0.0;
+      std::array<double, 9> virial;
+      if (!s.simulation->readModelTerms(energy, virial)) return py::none();
+      py::dict d;
+      d["energy"] = energy;
+      d["virial"] = host::copy(virial.data(), 9, {3, 3});
+      return d;
+    })
+    // Read-only DLPack views of the buffers (D220).
+    .def("view", [](PySimulation &s) { return views::take(s.simulation); })
+    // Writable borrows with a commit (D229).
+    .def("borrow", [](PySimulation &s) { return views::borrow(s.simulation); })
+    .def_property_readonly("versions", [](const PySimulation &s) {
+      auto v = s.simulation->getStateVersions();
+      py::dict d;
+      d["positions"] = v.positions;
+      d["velocities"] = v.velocities;
+      d["cell"] = v.cell;
+      d["tunables"] = s.simulation->getTunableSnapshot().version;
+      return d;
+    })
+    .def_property_readonly("commits", [](const PySimulation &s) {
+      py::list result;
+      for (const auto &[step, fields] : s.simulation->getCommits()) {
+        py::list names;
+        for (const std::string &name : fields) names.append(name);
+        result.append(py::make_tuple(step, py::tuple(names)));
+      }
+      return result;
+    })
+    .def_property_readonly("leases", [](const PySimulation &s) { return s.simulation->getLeases(); })
+    .def_property_readonly("step", [](const PySimulation &s) { return s.simulation->getStep(); })
+    .def_property_readonly("time", [](const PySimulation &s) { return s.simulation->getTime(); })
+    .def_property_readonly("failed", [](const PySimulation &s) { return s.simulation->hasFailed(); })
+    .def_property_readonly("program", [](const PySimulation &s) { return s.program; })
+    // What compiling the programs cost, and what the compile cache saved
+    // (D212).
+    .def_property_readonly("compile_stats", [](const PySimulation &s) {
+      compiler::CompileStats c = s.simulation->getCompileStats();
+      py::dict d;
+      d["programs"] = c.programs;
+      d["pipeline_seconds"] = c.pipelineSeconds;
+      d["engine_seconds"] = c.engineSeconds;
+      d["host_compiled"] = c.compiled;
+      d["host_compile_seconds"] = c.compileSeconds;
+      d["cache_hits"] = c.hits;
+      d["cache_saved_seconds"] = c.savedSeconds;
+      d["cache_rejected"] = c.rejected;
+      d["cache_stored"] = c.stored;
+      d["cache_unstored"] = c.unstored;
+      d["cache_lookup_seconds"] = c.lookupSeconds;
+      // The GPU modules (D214).
+      d["gpu_modules"] = c.gpuModules;
+      d["gpu_serialize_seconds"] = c.gpuSerializeSeconds;
+      d["gpu_ptx_compiled"] = c.gpuPtxCompiled;
+      d["gpu_ptx_hits"] = c.gpuPtxHits;
+      d["gpu_cubin_compiled"] = c.gpuCubinCompiled;
+      d["gpu_cubin_hits"] = c.gpuCubinHits;
+      d["gpu_compile_seconds"] = c.gpuCompileSeconds;
+      d["gpu_cache_saved_seconds"] = c.gpuSavedSeconds;
+      d["gpu_cache_lookup_seconds"] = c.gpuLookupSeconds;
+      d["gpu_cache_rejected"] = c.gpuRejected;
+      d["gpu_cache_stored"] = c.gpuStored;
+      d["gpu_cache_unstored"] = c.gpuUnstored;
+      // Programs compiled with cache=False (D217).
+      d["cache_bypassed"] = c.bypassed;
+      // Programs that took the code kept with their Program
+      // (D236).
+      d["program_reused"] = c.reused;
+      d["reuse_saved_seconds"] = c.reuseSavedSeconds;
+      return d;
+    })
+    .def_property_readonly("tunables", [](py::object self) { return TunableValues{self}; })
+    .def_property("part_seconds",
+                  [](const PySimulation &s) { return s.simulation->partSeconds; },
+                  [](PySimulation &s, py::object value) {
+                    // Wall-clock time: a quantity converts to seconds.
+                    double seconds = units::scalar(value, "Simulation.part_seconds", units::second);
+                    if (!(seconds > 0) || !std::isfinite(seconds))
+                      throw InputError("part_seconds must be positive and finite");
+                    s.simulation->partSeconds = seconds;
+                  });
+}

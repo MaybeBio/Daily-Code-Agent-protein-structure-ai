@@ -1,0 +1,681 @@
+/*
+    Copyright 2017 Zheyong Fan and GPUMD development team
+    This file is part of GPUMD.
+    GPUMD is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+    GPUMD is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Lesser General Public License for more details.
+    You should have received a copy of the GNU Lesser General Public License
+    along with GPUMD.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
+/*----------------------------------------------------------------------------80
+The class defining the simulation model.
+
+Major contributors:
+  Zheyong Fan: Initial implementation.
+  Chengbing Chen: Reading atomic spins from model.xyz.
+------------------------------------------------------------------------------*/
+
+#include "atom.cuh"
+#include "box.cuh"
+#include "group.cuh"
+#include "read_xyz.cuh"
+#include "utilities/common.cuh"
+#include "utilities/error.cuh"
+#include "utilities/gpu_macro.cuh"
+#include "utilities/nep_io/compact_nep.cuh"
+#include "utilities/nep_io/nep_spin_model_file.cuh"
+#include "utilities/run_input.cuh"
+#include <algorithm>
+#include <cctype>
+#include <climits>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <sstream>
+#include <string>
+
+const std::map<std::string, double> MASS_TABLE{
+  {"H", 1.0080000000},
+  {"He", 4.0026020000},
+  {"Li", 6.9400000000},
+  {"Be", 9.0121831000},
+  {"B", 10.8100000000},
+  {"C", 12.0110000000},
+  {"N", 14.0070000000},
+  {"O", 15.9990000000},
+  {"F", 18.9984031630},
+  {"Ne", 20.1797000000},
+  {"Na", 22.9897692800},
+  {"Mg", 24.3050000000},
+  {"Al", 26.9815385000},
+  {"Si", 28.0850000000},
+  {"P", 30.9737619980},
+  {"S", 32.0600000000},
+  {"Cl", 35.4500000000},
+  {"Ar", 39.9480000000},
+  {"K", 39.0983000000},
+  {"Ca", 40.0780000000},
+  {"Sc", 44.9559080000},
+  {"Ti", 47.8670000000},
+  {"V", 50.9415000000},
+  {"Cr", 51.9961000000},
+  {"Mn", 54.9380440000},
+  {"Fe", 55.8450000000},
+  {"Co", 58.9331940000},
+  {"Ni", 58.6934000000},
+  {"Cu", 63.5460000000},
+  {"Zn", 65.3800000000},
+  {"Ga", 69.7230000000},
+  {"Ge", 72.6300000000},
+  {"As", 74.9215950000},
+  {"Se", 78.9710000000},
+  {"Br", 79.9040000000},
+  {"Kr", 83.7980000000},
+  {"Rb", 85.4678000000},
+  {"Sr", 87.6200000000},
+  {"Y", 88.9058400000},
+  {"Zr", 91.2240000000},
+  {"Nb", 92.9063700000},
+  {"Mo", 95.9500000000},
+  {"Tc", 98},
+  {"Ru", 101.0700000000},
+  {"Rh", 102.9055000000},
+  {"Pd", 106.4200000000},
+  {"Ag", 107.8682000000},
+  {"Cd", 112.4140000000},
+  {"In", 114.8180000000},
+  {"Sn", 118.7100000000},
+  {"Sb", 121.7600000000},
+  {"Te", 127.6000000000},
+  {"I", 126.9044700000},
+  {"Xe", 131.2930000000},
+  {"Cs", 132.9054519600},
+  {"Ba", 137.3270000000},
+  {"La", 138.9054700000},
+  {"Ce", 140.1160000000},
+  {"Pr", 140.9076600000},
+  {"Nd", 144.2420000000},
+  {"Pm", 145},
+  {"Sm", 150.3600000000},
+  {"Eu", 151.9640000000},
+  {"Gd", 157.2500000000},
+  {"Tb", 158.9253500000},
+  {"Dy", 162.5000000000},
+  {"Ho", 164.9303300000},
+  {"Er", 167.2590000000},
+  {"Tm", 168.9342200000},
+  {"Yb", 173.0450000000},
+  {"Lu", 174.9668000000},
+  {"Hf", 178.4900000000},
+  {"Ta", 180.9478800000},
+  {"W", 183.8400000000},
+  {"Re", 186.2070000000},
+  {"Os", 190.2300000000},
+  {"Ir", 192.2170000000},
+  {"Pt", 195.0840000000},
+  {"Au", 196.9665690000},
+  {"Hg", 200.5920000000},
+  {"Tl", 204.3800000000},
+  {"Pb", 207.2000000000},
+  {"Bi", 208.9804000000},
+  {"Po", 210},
+  {"At", 210},
+  {"Rn", 222},
+  {"Fr", 223},
+  {"Ra", 226},
+  {"Ac", 227},
+  {"Th", 232.0377000000},
+  {"Pa", 231.0358800000},
+  {"U", 238.0289100000},
+  {"Np", 237},
+  {"Pu", 244},
+  {"Am", 243},
+  {"Cm", 247},
+  {"Bk", 247},
+  {"Cf", 251},
+  {"Es", 252},
+  {"Fm", 257},
+  {"Md", 258},
+  {"No", 259},
+  {"Lr", 262}};
+
+static void read_xyz_line_1(std::ifstream& input, int& N)
+{
+  std::vector<std::string> tokens = get_tokens(input);
+  if (tokens.size() != 1) {
+    PRINT_INPUT_ERROR("The first line for the xyz file should have one value.");
+  }
+  N = get_int_from_token(tokens[0], __FILE__, __LINE__);
+  if (N < 1) {
+    PRINT_INPUT_ERROR("Number of atoms should >= 1.");
+  } else {
+    printf("Number of atoms is %d.\n", N);
+  }
+}
+
+static void read_xyz_line_2(
+  std::ifstream& input,
+  Box& box,
+  int& has_velocity_in_xyz,
+  bool& has_mass,
+  bool& has_charge,
+  bool& has_spin,
+  bool& has_spin_velocity,
+  const bool enable_spin,
+  int& num_columns,
+  int* property_offset,
+  std::vector<Group>& group)
+{
+  std::vector<std::string> tokens = get_tokens_without_unwanted_spaces(input);
+  for (auto& token : tokens) {
+    std::transform(
+      token.begin(), token.end(), token.begin(), [](unsigned char c) { return std::tolower(c); });
+  }
+
+  box.pbc_x = box.pbc_y = box.pbc_z = 1; // default is periodic
+  bool has_pbc = false;
+  for (int n = 0; n < tokens.size(); ++n) {
+    const std::string tmp_string = "pbc=";
+    if (tokens[n].substr(0, tmp_string.length()) == tmp_string) {
+      if (has_pbc) {
+        PRINT_INPUT_ERROR("Duplicate pbc field in model.xyz.");
+      }
+      has_pbc = true;
+      if (
+        tokens.size() - n < 3 || (tokens[n] != "pbc=\"t" && tokens[n] != "pbc=\"f") ||
+        (tokens[n + 1] != "t" && tokens[n + 1] != "f") ||
+        (tokens[n + 2] != "t\"" && tokens[n + 2] != "f\"")) {
+        PRINT_INPUT_ERROR("pbc in model.xyz must contain exactly three T/F "
+                          "values in double quotes.");
+      }
+      box.pbc_x = tokens[n] == "pbc=\"t";
+      box.pbc_y = tokens[n + 1] == "t";
+      box.pbc_z = tokens[n + 2] == "t\"";
+    }
+  }
+  printf("Use %s boundary conditions along x.\n", (box.pbc_x == 1) ? "periodic" : "free");
+  printf("Use %s boundary conditions along y.\n", (box.pbc_y == 1) ? "periodic" : "free");
+  printf("Use %s boundary conditions along z.\n", (box.pbc_z == 1) ? "periodic" : "free");
+
+  // box matrix
+  bool has_lattice_in_exyz = false;
+  for (int n = 0; n < tokens.size(); ++n) {
+    const std::string lattice_string = "lattice=";
+    if (tokens[n].substr(0, lattice_string.length()) == lattice_string) {
+      if (has_lattice_in_exyz) {
+        PRINT_INPUT_ERROR("Duplicate lattice field in model.xyz.");
+      }
+      if (
+        tokens.size() - n < 9 || tokens[n].substr(0, lattice_string.length() + 1) != "lattice=\"" ||
+        tokens[n + 8].back() != '"') {
+        PRINT_INPUT_ERROR("lattice in model.xyz must contain exactly nine "
+                          "values in double quotes.");
+      }
+      has_lattice_in_exyz = true;
+      const int transpose_index[9] = {0, 3, 6, 1, 4, 7, 2, 5, 8};
+      for (int m = 0; m < 9; ++m) {
+        std::string value = tokens[n + m].substr((m == 0) ? lattice_string.length() + 1 : 0);
+        if (m == 8) {
+          value.pop_back();
+        }
+        if (value.empty() || value.find('"') != std::string::npos) {
+          PRINT_INPUT_ERROR("lattice in model.xyz must contain exactly nine "
+                            "values in double quotes.");
+        }
+        box.cpu_h[transpose_index[m]] = get_double_from_token(value, __FILE__, __LINE__);
+      }
+    }
+  }
+  if (!has_lattice_in_exyz) {
+    PRINT_INPUT_ERROR("'lattice' is missing in the second line of the model file.");
+  } else {
+    printf("Box matrix h = [a, b, c] is\n");
+    for (int d1 = 0; d1 < 3; ++d1) {
+      for (int d2 = 0; d2 < 3; ++d2) {
+        printf("%20.10e", box.cpu_h[d1 * 3 + d2]);
+      }
+      printf("\n");
+    }
+
+    const double volume = box.get_volume();
+    if (!std::isfinite(volume) || volume == 0.0) {
+      PRINT_INPUT_ERROR(
+        "Invalid lattice in model.xyz line 2: cell volume must be finite and nonzero.");
+    }
+    box.get_inverse();
+    for (int n = 9; n < 18; ++n) {
+      if (!std::isfinite(box.cpu_h[n])) {
+        PRINT_INPUT_ERROR(
+          "Invalid lattice in model.xyz line 2: inverse cell matrix must be finite.");
+      }
+    }
+
+    printf("Inverse box matrix g = inv(h) is\n");
+    for (int d1 = 0; d1 < 3; ++d1) {
+      for (int d2 = 0; d2 < 3; ++d2) {
+        printf("%20.10e", box.cpu_h[9 + d1 * 3 + d2]);
+      }
+      printf("\n");
+    }
+  }
+
+  // properties
+  const int num_properties = 8;
+  std::string property_name[num_properties] = {
+    "species", "pos", "mass", "charge", "vel", "group", "spin", "spin_vel"};
+  const std::string property_type[num_properties] = {"s", "r", "r", "r", "r", "i", "r", "r"};
+  const int property_size[num_properties] = {1, 3, 1, 1, 3, 0, 3, 3};
+  int property_position[num_properties] = {-1, -1, -1, -1, -1, -1, -1, -1};
+  bool has_properties = false;
+  for (int n = 0; n < tokens.size(); ++n) {
+    const std::string properties_string = "properties=";
+    if (tokens[n].substr(0, properties_string.length()) == properties_string) {
+      if (has_properties) {
+        PRINT_INPUT_ERROR("Duplicate properties field in model.xyz.");
+      }
+      has_properties = true;
+      std::string line = tokens[n].substr(properties_string.length(), tokens[n].length());
+      if (
+        line.empty() || line.front() == ':' || line.back() == ':' ||
+        line.find("::") != std::string::npos) {
+        PRINT_INPUT_ERROR("properties in model.xyz must contain complete "
+                          "name:type:columns triples.");
+      }
+      for (auto& letter : line) {
+        if (letter == ':') {
+          letter = ' ';
+        }
+      }
+      std::vector<std::string> sub_tokens = get_tokens(line);
+      if (sub_tokens.size() % 3 != 0) {
+        PRINT_INPUT_ERROR("properties in model.xyz must contain complete "
+                          "name:type:columns triples.");
+      }
+      std::vector<int> property_lengths(sub_tokens.size() / 3);
+      for (int k = 0; k < sub_tokens.size() / 3; ++k) {
+        const int length = get_int_from_token(sub_tokens[k * 3 + 2], __FILE__, __LINE__);
+        if (length <= 0 || length > INT_MAX - num_columns) {
+          PRINT_INPUT_ERROR("properties in model.xyz must have positive column "
+                            "counts with a total <= INT_MAX.");
+        }
+        property_lengths[k] = length;
+        num_columns += length;
+        for (int prop = 0; prop < num_properties; ++prop) {
+          if (sub_tokens[k * 3] == property_name[prop] && (prop < 6 || enable_spin)) {
+            if (property_position[prop] >= 0) {
+              PRINT_INPUT_ERROR(
+                ("Duplicate " + property_name[prop] + " property in model.xyz.").c_str());
+            }
+            if (
+              sub_tokens[k * 3 + 1] != property_type[prop] ||
+              (property_size[prop] != 0 && length != property_size[prop])) {
+              PRINT_INPUT_ERROR(
+                ("Invalid type or column count for " + property_name[prop] + " in model.xyz.")
+                  .c_str());
+            }
+            property_position[prop] = k;
+          }
+        }
+      }
+
+      if (property_position[4] < 0) {
+        has_velocity_in_xyz = 0;
+        printf("Do not specify initial velocities here.\n");
+      } else {
+        has_velocity_in_xyz = 1;
+        printf("Specify initial velocities here.\n");
+      }
+
+      if (property_position[5] < 0) {
+        group.resize(0);
+        printf("Have no grouping method.\n");
+      } else {
+        int num_of_grouping_methods = property_lengths[property_position[5]];
+        group.resize(num_of_grouping_methods);
+        printf("Have %d grouping method(s).\n", num_of_grouping_methods);
+      }
+
+      for (int k = 0; k < sub_tokens.size() / 3; ++k) {
+        const int tmp_length = property_lengths[k];
+        for (int prop = 0; prop < num_properties; ++prop) {
+          if (k < property_position[prop]) {
+            property_offset[prop] += tmp_length;
+          }
+        }
+      }
+    }
+  }
+
+  if (property_position[0] < 0) {
+    PRINT_INPUT_ERROR("'species' or 'properties' is missing in the model file.");
+  }
+  if (property_position[1] < 0) {
+    PRINT_INPUT_ERROR("'pos' or 'properties' is missing in the model file.");
+  }
+  if (property_position[2] < 0) {
+    has_mass = false;
+  } else {
+    has_mass = true;
+  }
+  if (property_position[3] < 0) {
+    has_charge = false;
+  } else {
+    has_charge = true;
+  }
+  has_spin = property_position[6] >= 0;
+  has_spin_velocity = property_position[7] >= 0;
+  if (has_spin_velocity && !has_spin) {
+    PRINT_INPUT_ERROR("spin_vel:R:3 requires spin:R:3.");
+  }
+}
+
+void read_xyz_in_line_3(
+  std::ifstream& input,
+  const int N,
+  const int has_velocity_in_xyz,
+  const bool has_mass,
+  const bool has_charge,
+  const bool has_spin,
+  const bool has_spin_velocity,
+  const int num_columns,
+  const int* property_offset,
+  int& number_of_types,
+  std::vector<std::string>& atom_symbols,
+  std::vector<std::string>& cpu_atom_symbol,
+  std::vector<int>& cpu_type,
+  std::vector<double>& cpu_mass,
+  std::vector<float>& cpu_charge,
+  std::vector<double>& cpu_position_per_atom,
+  std::vector<double>& cpu_velocity_per_atom,
+  std::vector<double>& cpu_spin_per_atom,
+  std::vector<double>& cpu_spin_velocity_per_atom,
+  std::vector<Group>& group)
+{
+  cpu_atom_symbol.resize(N);
+  cpu_type.resize(N);
+  cpu_mass.resize(N);
+  cpu_charge.resize(N, 0.0);
+  cpu_position_per_atom.resize(N * 3);
+  cpu_velocity_per_atom.resize(N * 3);
+  cpu_spin_per_atom.resize(has_spin ? N * 3 : 0);
+  cpu_spin_velocity_per_atom.resize(has_spin ? N * 3 : 0, 0.0);
+  number_of_types = atom_symbols.size();
+
+  for (int m = 0; m < group.size(); ++m) {
+    group[m].cpu_label.resize(N);
+    group[m].number = 0;
+  }
+
+  for (int n = 0; n < N; n++) {
+    std::vector<std::string> tokens = get_tokens(input);
+    if (tokens.size() != num_columns) {
+      PRINT_INPUT_ERROR("number of columns does not match properties.\n");
+    }
+
+    cpu_atom_symbol[n] = tokens[property_offset[0]];
+
+    bool is_allowed_element = false;
+    for (int t = 0; t < number_of_types; ++t) {
+      if (cpu_atom_symbol[n] == atom_symbols[t]) {
+        cpu_type[n] = t;
+        is_allowed_element = true;
+      }
+    }
+    if (!is_allowed_element) {
+      PRINT_INPUT_ERROR("There is atom in model.xyz that is not allowed in the used potential.\n");
+    }
+
+    for (int d = 0; d < 3; ++d) {
+      cpu_position_per_atom[n + N * d] =
+        get_double_from_token(tokens[property_offset[1] + d], __FILE__, __LINE__);
+    }
+
+    if (has_mass) {
+      cpu_mass[n] = get_double_from_token(tokens[property_offset[2]], __FILE__, __LINE__);
+      if (cpu_mass[n] <= 0) {
+        PRINT_INPUT_ERROR("Atom mass should > 0.");
+      }
+    } else {
+      cpu_mass[n] = MASS_TABLE.at(cpu_atom_symbol[n]);
+    }
+
+    if (has_charge) {
+      cpu_charge[n] = get_double_from_token(tokens[property_offset[3]], __FILE__, __LINE__);
+    }
+
+    if (has_velocity_in_xyz) {
+      const double A_per_fs_to_natural = TIME_UNIT_CONVERSION;
+      for (int d = 0; d < 3; ++d) {
+        cpu_velocity_per_atom[n + N * d] =
+          get_double_from_token(tokens[property_offset[4] + d], __FILE__, __LINE__) *
+          A_per_fs_to_natural;
+      }
+    }
+
+    if (has_spin) {
+      for (int d = 0; d < 3; ++d) {
+        cpu_spin_per_atom[n + N * d] =
+          get_double_from_token(tokens[property_offset[6] + d], __FILE__, __LINE__);
+      }
+    }
+
+    if (has_spin_velocity) {
+      const double spin_velocity_to_natural = TIME_UNIT_CONVERSION;
+      for (int d = 0; d < 3; ++d) {
+        cpu_spin_velocity_per_atom[n + N * d] =
+          get_double_from_token(tokens[property_offset[7] + d], __FILE__, __LINE__) *
+          spin_velocity_to_natural;
+      }
+    }
+
+    for (int m = 0; m < group.size(); ++m) {
+      group[m].cpu_label[n] =
+        get_int_from_token(tokens[property_offset[5] + m], __FILE__, __LINE__);
+      if (group[m].cpu_label[n] < 0 || group[m].cpu_label[n] >= N) {
+        PRINT_INPUT_ERROR("Group label should >= 0 and < N.");
+      }
+      if ((group[m].cpu_label[n] + 1) > group[m].number) {
+        group[m].number = group[m].cpu_label[n] + 1;
+      }
+    }
+  }
+}
+
+void find_type_size(
+  const int N,
+  const int number_of_types,
+  const std::vector<int>& cpu_type,
+  std::vector<int>& cpu_type_size)
+{
+  cpu_type_size.resize(number_of_types);
+
+  if (number_of_types == 1) {
+    printf("There is only one atom type.\n");
+  } else {
+    printf("There are %d atom types.\n", number_of_types);
+  }
+
+  for (int m = 0; m < number_of_types; m++) {
+    cpu_type_size[m] = 0;
+  }
+  for (int n = 0; n < N; n++) {
+    cpu_type_size[cpu_type[n]]++;
+  }
+  for (int m = 0; m < number_of_types; m++) {
+    printf("    %d atoms of type %d.\n", cpu_type_size[m], m);
+  }
+}
+
+std::string get_filename_potential(const RunInput& run_input)
+{
+  std::string filename_potential;
+  for (const auto& line : run_input.lines()) {
+    if (line.tokens.size() >= 2 && line.tokens[0] == "potential") {
+      filename_potential = line.tokens[1];
+    }
+  }
+  if (filename_potential.size() == 0) {
+    PRINT_INPUT_ERROR("There is no 'potential' keyword in run.in.");
+  } else {
+    return filename_potential;
+  }
+}
+
+std::string get_filename_potential()
+{
+  RunInput run_input("run.in");
+  return get_filename_potential(run_input);
+}
+
+std::vector<std::string> get_atom_symbols(std::string& filename_potential)
+{
+  std::ifstream input_potential(filename_potential);
+  if (!input_potential.is_open()) {
+    std::cout << "Error: cannot open " + filename_potential << std::endl;
+    exit(1);
+  }
+
+  std::vector<std::string> tokens = get_tokens(input_potential);
+  if (tokens.size() < 3) {
+    std::cout << "The first line of the potential file should have at least 3 items." << std::endl;
+    exit(1);
+  }
+
+  int number_of_types = get_int_from_token(tokens[1], __FILE__, __LINE__);
+  if (tokens.size() != 2 + number_of_types) {
+    std::cout << "The first line of the potential file should have " << number_of_types
+              << " atom symbols." << std::endl;
+    exit(1);
+  }
+
+  std::vector<std::string> atom_symbols(number_of_types);
+  for (int n = 0; n < number_of_types; ++n) {
+    atom_symbols[n] = tokens[2 + n];
+  }
+
+  input_potential.close();
+  return atom_symbols;
+}
+
+void initialize_position(
+  const RunInput& run_input,
+  int& has_velocity_in_xyz,
+  int& number_of_types,
+  Box& box,
+  std::vector<Group>& group,
+  Atom& atom)
+{
+  std::string filename("model.xyz");
+  std::ifstream input(filename);
+
+  if (!input.is_open()) {
+    PRINT_INPUT_ERROR("Failed to open model.xyz.");
+  }
+
+  std::vector<std::string> atom_symbols;
+  auto filename_potential = get_filename_potential(run_input);
+  atom_symbols = get_atom_symbols(filename_potential);
+
+  read_xyz_line_1(input, atom.number_of_atoms);
+  int property_offset[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int num_columns = 0;
+  bool has_mass = true;
+  bool has_charge = true;
+  read_xyz_line_2(
+    input,
+    box,
+    has_velocity_in_xyz,
+    has_mass,
+    has_charge,
+    atom.has_spin,
+    atom.spin_velocity_initialized,
+    NEP_Spin_Model_File::is_spin_model(filename_potential),
+    num_columns,
+    property_offset,
+    group);
+
+  read_xyz_in_line_3(
+    input,
+    atom.number_of_atoms,
+    has_velocity_in_xyz,
+    has_mass,
+    has_charge,
+    atom.has_spin,
+    atom.spin_velocity_initialized,
+    num_columns,
+    property_offset,
+    number_of_types,
+    atom_symbols,
+    atom.cpu_atom_symbol,
+    atom.cpu_type,
+    atom.cpu_mass,
+    atom.cpu_charge,
+    atom.cpu_position_per_atom,
+    atom.cpu_velocity_per_atom,
+    atom.cpu_spin_per_atom,
+    atom.cpu_spin_velocity_per_atom,
+    group);
+
+  input.close();
+
+  prepare_compact_nep_files(atom.cpu_atom_symbol, run_input);
+  const std::vector<std::string>& compact_species = get_compact_nep_species();
+  if (compact_species.size() > 0 && compact_species.size() < atom_symbols.size()) {
+    atom_symbols = compact_species;
+    number_of_types = atom_symbols.size();
+    for (int n = 0; n < atom.number_of_atoms; ++n) {
+      atom.cpu_type[n] = get_compact_nep_type(atom.cpu_atom_symbol[n]);
+    }
+  }
+
+  for (int m = 0; m < group.size(); ++m) {
+    group[m].find_size(atom.number_of_atoms, m);
+    group[m].find_contents(atom.number_of_atoms);
+  }
+
+  find_type_size(atom.number_of_atoms, number_of_types, atom.cpu_type, atom.cpu_type_size);
+}
+
+void allocate_memory_gpu(std::vector<Group>& group, Atom& atom, GPU_Vector<double>& thermo)
+{
+  const int N = atom.number_of_atoms;
+  atom.type.resize(N);
+  atom.type.copy_from_host(atom.cpu_type.data());
+  for (int m = 0; m < group.size(); ++m) {
+    group[m].label.resize(N);
+    group[m].size.resize(group[m].number);
+    group[m].size_sum.resize(group[m].number);
+    group[m].contents.resize(N);
+    group[m].label.copy_from_host(group[m].cpu_label.data());
+    group[m].size.copy_from_host(group[m].cpu_size.data());
+    group[m].size_sum.copy_from_host(group[m].cpu_size_sum.data());
+    group[m].contents.copy_from_host(group[m].cpu_contents.data());
+  }
+  atom.mass.resize(N);
+  atom.mass.copy_from_host(atom.cpu_mass.data());
+  atom.charge.resize(N);
+  atom.charge.copy_from_host(atom.cpu_charge.data());
+  atom.position_per_atom.resize(N * 3);
+  atom.position_per_atom.copy_from_host(atom.cpu_position_per_atom.data());
+  atom.velocity_per_atom.resize(N * 3);
+  if (atom.has_spin) {
+    atom.spin_per_atom.resize(N * 3);
+    atom.spin_velocity_per_atom.resize(N * 3);
+    atom.spin_velocity_per_atom.copy_from_host(atom.cpu_spin_velocity_per_atom.data());
+    atom.mforce_per_atom.resize(N * 3, 0.0);
+    atom.spin_per_atom.copy_from_host(atom.cpu_spin_per_atom.data());
+  }
+  atom.velocity_per_atom.copy_from_host(atom.cpu_velocity_per_atom.data());
+  atom.force_per_atom.resize(N * 3, 0);
+  atom.virial_per_atom.resize(N * 9);
+  atom.potential_per_atom.resize(N);
+  thermo.resize(12);
+}

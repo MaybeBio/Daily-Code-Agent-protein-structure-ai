@@ -1,0 +1,382 @@
+import json
+from mddb_workflow.tools.get_atom_counts import get_atom_counts
+from mddb_workflow.tools.get_system_keywords import get_system_keywords
+from mddb_workflow.tools.get_lipids import get_lipids_selection
+from mddb_workflow.tools.generate_map import get_sequence_metadata
+from mddb_workflow.tools.get_coverage_and_presence import get_coverage_and_presence
+from mddb_workflow.utils.auxiliar import InputError, save_json
+from mddb_workflow.utils.constants import MD_DIRECTORY, PROJECT_METADATA_VERSION
+from mddb_workflow.utils.type_hints import *
+
+# Input fields + interaction type
+METADATA_INTERACTION_FIELDS = { "name", "agent_1", "agent_2", "selection_1", "selection_2", "type" }
+
+
+def prepare_project_metadata (
+    output_file : 'File',
+    structure : 'Structure',
+    cg_selection : 'Selection',
+    ua_selection : 'Selection',
+    residue_map : dict,
+    membrane_map : dict,
+    inchikey_map : dict,
+    lipid_references : dict,
+    protein_map : list[dict],
+    chain_contacts : dict,
+    protein_references_file : 'File',
+    pdb_references : list[dict],
+    input_protein_references : list[str] | dict,
+    input_ligands : list[dict],
+    interactions : list[dict],
+    warnings : dict,
+    simulation_box : tuple[tuple],
+    simulation_box_size: tuple,
+    simulation_box_shape: str,
+    # Set all inputs to be loaded as they are
+    input_force_fields : list[str],
+    input_collections : list[str],
+    input_chain_names : list[str],
+    input_type : str,
+    input_framestep : float,
+    input_name : str,
+    input_description : str,
+    input_authors : list[str],
+    input_groups : list[str],
+    input_contact : str,
+    input_program : str,
+    input_version : str,
+    input_method : str,
+    input_license : str,
+    input_linkcense : str,
+    input_citation : str,
+    input_thanks : str,
+    input_links : list[dict],
+    input_timestep : float,
+    input_temperature : float,
+    input_ensemble : str,
+    input_water : str,
+    input_pbc_selection : str,
+    input_cg_selection : str,
+    input_ua_selection : str,
+    input_qm_selection : str,
+    input_forced_class_selections: dict[str, str],
+    input_customs : list[dict],
+    input_orientation : list[float],
+    input_metadditions : dict,
+    # Additional topic-specific inputs
+    input_cv19_unit : str,
+    input_cv19_startconf : str,
+    input_cv19_abs : bool,
+    input_cv19_nanobs : bool,
+    ):
+    """Prepare a JSON file with all project metadata."""
+    # Get the box data
+    boxsizex, boxsizey, boxsizez = simulation_box_size if simulation_box_size else (None, None, None)
+
+    # Select lipids using lipid references for all-atom regions and residue classification for CG and UA regions
+    lipids_selection = get_lipids_selection(structure, inchikey_map, lipid_references, cg_selection + ua_selection)
+
+    # Count different types of atoms and residues
+    # Unpack atom counts to write them independently in the metadata
+    (system_atoms, system_residues, protein_atoms, protein_residues,
+    dna_atoms, dna_residues, rna_atoms, rna_residues, lipid_atoms, lipid_residues,
+    carbohydrates_atoms, carbohydrates_residues, solvent_atoms, solvent_residues,
+    counter_cations, counter_anions, counter_ions, non_counter_ions, other_atoms) = get_atom_counts(structure, lipids_selection)
+
+    # Get the system keywords
+    system_keywords = get_system_keywords(structure, inchikey_map, lipids_selection, membrane_map, cg_selection, ua_selection, protein_map, chain_contacts)
+
+    # Get protein references from the residues map
+    # Get ligand references from the residues map
+    mapped_protein_references = []
+    mapped_ligand_references = []
+    mapped_inchikey_references = []
+    references = residue_map['references']
+    if references and len(references) > 0:
+        for ref, ref_type in zip(references, residue_map['reference_types']):
+            if ref_type == 'protein':
+                mapped_protein_references.append(ref)
+            elif ref_type == 'ligand':
+                mapped_ligand_references.append(ref)
+            elif ref_type == 'inchikey':
+                mapped_inchikey_references.append(ref)
+
+    # Get ligand names if any
+    forced_ligand_names = {
+        lig['name']: lig['forced_name'] for lig in mapped_ligand_references if lig.get('forced_name', False) }
+    if len(forced_ligand_names) == 0:
+        forced_ligand_names = None
+
+    # Make the forcefields a list in case it is a single string
+    forcefields = input_force_fields
+    if type(forcefields) == str:
+        forcefields = [forcefields]
+
+    # Collections must be null in case there are not collections
+    collections = input_collections
+    if not collections:
+        collections = []
+    if type(collections) == str:
+        collections = [collections]
+
+    # Get additional metadata related to the aminoacids sequence
+    sequence_metadata = get_sequence_metadata(structure, protein_references_file, residue_map)
+
+    # Precompute coverage (proteins) and presence (proteins + inchikeys) from the residue map
+    # These values replace on-the-fly topology calculations that the API can no longer perform
+    cover, prese, coveres, presres = get_coverage_and_presence(residue_map, sequence_metadata.get('reference_lengths', {}))
+
+    # Find the PTMs
+    # Save only their names for now
+    # DANI: Esto es temporal y de momento solo busca ser un parámetro de facil query
+    # DANI: Cuando esté más maduro también almacenaremos residuo afectado, como mínimo
+    ptms = structure.find_ptms()
+    ptm_names = list(set([ ptm['name'] for ptm in ptms ]))
+
+    # Check chainnames to actually exist in the structure
+    structure_chains = set([ chain.name for chain in structure.chains ])
+    chainnames = input_chain_names
+    if chainnames:
+        for chain in chainnames.keys():
+            if chain not in structure_chains:
+                raise InputError(f'Chain {chain} from chainnames does not exist in the structure')
+
+    # Get a summary of atom/residue/chain names which are potential query targets
+    # Sort values alphabetically so later the lists are identical or the loader will complain
+    # LORE: These fields were topology queries but they were innefficient
+    unique_atom_names = sorted(list(set([ atom.name for atom in structure.atoms ])))
+    unique_atom_elements = sorted(list(set([ atom.element for atom in structure.atoms ])))
+    unique_residue_names = sorted(list(set([ residue.name for residue in structure.residues ])))
+    unique_chain_names = sorted(list(set([ chain.name for chain in structure.chains ])))
+
+    # Get the MD type
+    md_type = input_type
+
+    # Metadata interactions are input interactions and the interaction types combined
+    # Thus we take the processed interactions and remove the field we are not interested in
+    metadata_interactions = []
+    if interactions is not None:
+        for interaction in interactions:
+            metadata_interaction = { k: v for k, v in interaction.items() if k in METADATA_INTERACTION_FIELDS }
+            metadata_interactions.append(metadata_interaction)
+
+    # Make sure the version is a string
+    # Note that in some cases it may be a numeric value (e.g. 5.1)
+    program_version = input_version
+    if type(program_version) in { float, int }:
+        program_version = str(program_version)
+
+    # Get the reference PDB ids
+    # Note that may differ from the input PDB ids since obsolete entries are replaced automatically
+    final_pdb_ids = []
+    if pdb_references:
+        final_pdb_ids = [ pdb_references['id'] for pdb_references in pdb_references ]
+
+    # Write the metadata file
+    # Metadata keys must be in CAPS, as they are in the client
+    metadata = {
+        'NAME': input_name,
+        'DESCRIPTION': input_description,
+        'AUTHORS': input_authors,
+        'GROUPS': input_groups,
+        'CONTACT': input_contact,
+        'PROGRAM': input_program,
+        'VERSION': program_version,
+        'TYPE': md_type,
+        'METHOD': input_method,
+        'LICENSE': input_license,
+        'LINKCENSE': input_linkcense,
+        'CITATION': input_citation,
+        'THANKS': input_thanks,
+        'LINKS': input_links,
+        'PDBIDS': final_pdb_ids,
+        'FORCED_REFERENCES': input_protein_references,
+        'REFERENCES': mapped_protein_references,
+        'COVER': cover,
+        'PRESE': prese,
+        'COVERES': coveres,
+        'PRESRES': presres,
+        'INPUT_LIGANDS': input_ligands,
+        # TODO: Ligands are now inchikeys only, remove after checking it does not break the client removing this
+        'LIGANDS': [],
+        'LIGANDNAMES': forced_ligand_names,
+        'INCHIKEYS': mapped_inchikey_references,
+        'PROTSEQ': sequence_metadata['protein_sequences'],
+        'PROTSEQLEN': sequence_metadata['protein_sequence_lengths'],
+        'NUCLSEQ': sequence_metadata['nucleic_sequences'],
+        'NUCLSEQLEN': sequence_metadata['nucleic_sequence_lengths'],
+        'DOMAINS': sequence_metadata['domains'],
+        'FRAMESTEP': input_framestep,
+        'TIMESTEP': input_timestep,
+        'TEMP': input_temperature,
+        'ENSEMBLE': input_ensemble,
+        'FF': forcefields,
+        'WAT': input_water,
+        'BOXTYPE': simulation_box_shape,
+        'BOXSIZEX': boxsizex,
+        'BOXSIZEY': boxsizey,
+        'BOXSIZEZ': boxsizez,
+        'BOX': simulation_box,
+        'METADDITIONS': input_metadditions,
+        'SYSTATS': system_atoms,
+        'SYSTRES': system_residues,
+        'PROTATS': protein_atoms,
+        'PROTRES': protein_residues,
+        'DNAATS': dna_atoms,
+        'DNARES': dna_residues,
+        'RNAATS': rna_atoms,
+        'RNARES': rna_residues,
+        'LIPIATS': lipid_atoms,
+        'LIPIRES': lipid_residues,
+        'CARBATS': carbohydrates_atoms,
+        'CARBRES': carbohydrates_residues,
+        'SOLVATS': solvent_atoms,
+        'SOLVRES': solvent_residues,
+        'COUNCAT': counter_cations,
+        'COUNANI': counter_anions,
+        'COUNION': counter_ions,
+        'NOCNION': non_counter_ions,
+        'OTHRATS': other_atoms,
+        'INTERACTIONS': metadata_interactions,
+        'PBC_SELECTION': input_pbc_selection,
+        'CG_SELECTION': input_cg_selection,
+        'UA_SELECTION': input_ua_selection,
+        'QM_SELECTION': input_qm_selection,
+        'FORCED_CLASS_SELECTION': input_forced_class_selections,
+        'CHAINNAMES': chainnames,
+        'CUSTOMS': input_customs,
+        'ORIENTATION': input_orientation,
+        'PTM': ptm_names,
+        'COLLECTIONS': collections,
+        'SYSKEYS': system_keywords,
+        'ATNAME': unique_atom_names,
+        'ATELEM': unique_atom_elements,
+        'RSNAME': unique_residue_names,
+        'CHNAME': unique_chain_names,
+        'WARNINGS': warnings,
+        # Beware, we already have a VERSION field for the PROGRAM version
+        'ver': PROJECT_METADATA_VERSION,
+    }
+    # Let the boxsizes only if all of them are available (they may be 0)
+    if not boxsizex or not boxsizey or not boxsizez:
+        del metadata['BOXSIZEX']
+        del metadata['BOXSIZEY']
+        del metadata['BOXSIZEZ']
+    # Let the forced class selection only if it is present, since it is a rare input
+    if input_forced_class_selections is None:
+        del metadata['FORCED_CLASS_SELECTION']
+    # Remove metadditions since they are not common
+    if input_metadditions is None:
+        del metadata['METADDITIONS']
+    # Add collection specific fields
+    if 'cv19' in collections:
+        cv19_unit = input_cv19_unit
+        cv19_startconf = input_cv19_startconf
+        cv19_abs = input_cv19_abs
+        cv19_nanobs = input_cv19_nanobs
+        cv19_variant = sequence_metadata['cv19_variant']
+
+        if cv19_unit is not None:
+            metadata['CV19_UNIT'] = cv19_unit
+
+        if cv19_startconf is not None:
+            metadata['CV19_STARTCONF'] = cv19_startconf
+
+        if cv19_abs is not None:
+            metadata['CV19_ABS'] = cv19_abs
+
+        if cv19_nanobs is not None:
+            metadata['CV19_NANOBS'] = cv19_nanobs
+
+        if cv19_variant is not None:
+            metadata['CV19_VARIANT'] = cv19_variant
+
+    # Write metadata to a file
+    save_json(metadata, output_file.path)
+
+# Set which metadata fields may be specified for a specific MD thus overwritting project metadata
+# Note than not all fields are allawed since some fields make no sense if as long as replicas have the same system (e.g. uniprots)
+METADATA_FIELDS = set([ 'NAME', 'DESCRIPTION', 'AUTHORS', 'GROUPS', 'CONTACT', 'PROGRAM', 'VERSION',
+    'TYPE', 'METHOD', 'LICENSE', 'LINKCENSE', 'CITATION', 'THANKS', 'LINKS', 'DOMAINS', 'FRAMESTEP', 'TIMESTEP',
+    'TEMP', 'ENSEMBLE', 'FF', 'WAT', 'BOXTYPE', 'BOXSIZEX', 'BOXSIZEY', 'BOXSIZEZ', 'INTERACTIONS', 'PBC_SELECTION',
+    'CHAINNAMES', 'CUSTOMS', 'ORIENTATION', 'PTM', 'METADDITIONS', 'WARNINGS',
+    'CV19_UNIT', 'CV19_STARTCONF', 'CV19_ABS', 'CV19_NANOBS', 'CV19_VARIANT'
+])
+
+
+def generate_md_metadata (
+    md_inputs : dict,
+    structure : 'Structure',
+    snapshots : int,
+    reference_frame : int,
+    global_rmsd : Optional[tuple[float, float, float]],
+    simulation_box : tuple[tuple],
+    simulation_box_size : tuple,
+    simulation_box_shape : str,
+    reference_simulation_box_data : tuple,
+    warnings : dict,
+    output_file : 'File'
+    ):
+    """Produce the MD metadata file to be uploaded to the database."""
+    # Mine name and directory from MD inputs
+    name = md_inputs.get('name', None)
+    directory = md_inputs.get(MD_DIRECTORY, None)
+
+    # Write the metadata file
+    md_metadata = {
+        'name': name,
+        'frames': snapshots,
+        'atoms': len(structure.atoms), # Should be always the same but we better have explicit confirmation
+        'refframe': reference_frame,
+        'warnings': warnings,
+    }
+
+    # Add the global RMSD values (against the first frame), if any
+    # Note that the tuple becomes a list when it is retrieved from the cache
+    if global_rmsd:
+        rmsd_mean, rmsd_stdv, rmsd_max = global_rmsd
+        md_metadata['rmsd_mean'] = rmsd_mean
+        md_metadata['rmsd_stdv'] = rmsd_stdv
+        md_metadata['rmsd_max'] = rmsd_max
+
+    # Get other MD inputs than the name and the directory
+    other_md_inputs = { k: v for k, v in md_inputs.items() }
+    # Remove name from MD inputs to not further overwrite project metadata
+    if name:
+        del other_md_inputs['name']
+    # Remove the directory name form MD inputs since it is not to be uploaded to the database
+    if directory:
+        del other_md_inputs[MD_DIRECTORY]
+
+    # The project metadata has the box of the reference replica
+    # If this replica has a different box then write it here to replace the project box
+    # Values read from the cache are lists while new values are tuples, so compare them as JSON
+    def is_different (value, reference_value) -> bool:
+        return json.dumps(value) != json.dumps(reference_value)
+    metadata = {}
+    reference_box, reference_box_size, _, _, reference_box_shape = reference_simulation_box_data
+    if is_different(simulation_box, reference_box):
+        metadata['BOX'] = simulation_box
+    if is_different(simulation_box_shape, reference_box_shape):
+        metadata['BOXTYPE'] = simulation_box_shape
+    if is_different(simulation_box_size, reference_box_size):
+        # Write the box sizes only if all of them are available (they may be 0)
+        # Otherwise write them empty so the project box sizes are not used for this replica
+        if simulation_box_size and all(simulation_box_size):
+            metadata['BOXSIZEX'], metadata['BOXSIZEY'], metadata['BOXSIZEZ'] = simulation_box_size
+        else:
+            metadata['BOXSIZEX'] = metadata['BOXSIZEY'] = metadata['BOXSIZEZ'] = None
+
+    # Search for other metadata inputs specific for this MD
+    for field in METADATA_FIELDS:
+        input_field = field.lower()
+        field_value = other_md_inputs.get(input_field, None)
+        if field_value:
+            metadata[field] = field_value
+
+    # Add the matadata field only if there is at least one value
+    if len(metadata) > 0:
+        md_metadata['metadata'] = metadata
+
+    # Write metadata to a file
+    save_json(md_metadata, output_file.path)

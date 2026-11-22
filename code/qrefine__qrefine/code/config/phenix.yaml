@@ -1,0 +1,6 @@
+channels:
+  - conda-forge
+dependencies:
+  - pymongo
+  - ase=3.22.1
+  # - xtb

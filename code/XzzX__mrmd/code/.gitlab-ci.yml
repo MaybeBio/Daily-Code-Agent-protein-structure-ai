@@ -1,0 +1,31 @@
+nvidia:
+  image: gitlab-registry.mpcdf.mpg.de/mpcdf/ci-module-image/nvhpcsdk_25-openmpi_5_0:2025
+  tags:
+    - gpu-nvidia
+  script:
+    - module purge
+    - module load cmake/3.30 git gcc/13 nvhpcsdk/25
+    - |
+      cmake \
+        -S . \
+        -B mrmd-build \
+        -DCMAKE_C_COMPILER=gcc \
+        -DCMAKE_CXX_COMPILER=g++ \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DMRMD_VERBOSE_ASSERTS=ON \
+        -DMRMD_WERROR=ON \
+        -DKokkos_ENABLE_DEBUG=ON \
+        -DKokkos_ENABLE_DEBUG_BOUNDS_CHECK=ON \
+        -DKokkos_ENABLE_DEBUG_DUALVIEW_MODIFY_CHECK=ON \
+        -DKokkos_ENABLE_HWLOC=OFF \
+        -DKokkos_ENABLE_SERIAL=ON \
+        -DKokkos_ENABLE_OPENMP=ON \
+        -DKokkos_ENABLE_CUDA=ON 
+    - cmake --build mrmd-build --target gmock gmock_main gtest gtest_main kokkoscontainers kokkoscore kokkossimd yaml-cpp yaml-cpp-parse yaml-cpp-read yaml-cpp-sandbox --parallel 2
+    - cmake --build mrmd-build --target all --parallel 2
+    - cd mrmd-build && ctest --output-on-failure --parallel 2
+  variables:
+    OMP_PROC_BIND: "spread"
+    OMP_PLACES: "threads"
+    CXX: "g++"
+    CC: "gcc"

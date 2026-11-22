@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  engine:
+    name: Engine (C++ and Fortran, CPU) tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gfortran
+        run: sudo apt-get update && sudo apt-get install -y gfortran
+      - name: Build
+        run: cmake -S engine -B engine/build/cm -DVERLET_NATIVE=OFF && cmake --build engine/build/cm -j 4
+      - name: Tests (FFT, PME vs Ewald, forces vs finite differences, SETTLE, NVE, alchemy)
+        run: ctest --test-dir engine/build/cm --output-on-failure
+
+  prep:
+    name: System preparation (Python) against OpenMM
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install numpy openmm pytest
+      - name: Tests
+        run: python -m pytest -q prep/tests
+
+  analysis:
+    name: Analysis (Julia)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1"
+      - name: Tests (RDF, MSD, block averages, MBAR, TI, RMSD)
+        run: julia --project=analysis -e 'using Pkg; Pkg.test()'
+
+  viewer:
+    name: Viewer (TypeScript)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build and test
+        run: cd viewer && npm ci && npm test

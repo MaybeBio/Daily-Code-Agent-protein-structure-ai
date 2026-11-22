@@ -1,0 +1,4095 @@
+# Overview
+
+
+
+BioJava is an open-source Java framework designed specifically for **processing biological data**. As a mature project in the bioinformatics community, BioJava provides a comprehensive set of tools and libraries that enable developers to work with biological sequences, structures, and related data efficiently. Whether you're a researcher analyzing DNA sequences, a bioinformatician comparing protein structures, or a developer building custom bioinformatics applications, BioJava offers the building blocks you need to accelerate your work.
+
+## Why BioJava?
+
+BioJava addresses a critical need in the bioinformatics landscape: providing a **standardized, reliable, and well-documented Java framework** for biological data analysis. Before frameworks like BioJava, researchers often had to write custom parsers and algorithms from scratch for common bioinformatics tasks. BioJava eliminates this duplication of effort by providing:
+
+- **Ready-to-use implementations** of popular bioinformatics algorithms
+- **Parsers for common file formats** used in bioinformatics (PDB, FASTA, GenBank, etc.)
+- **Analytical and statistical routines** for biological data
+- **Tools for manipulating sequences and 3D structures**
+
+With BioJava, you can focus on your specific research questions rather than spending time implementing fundamental algorithms and data handling routines.
+
+## Modular Architecture
+
+BioJava is designed with a **modular architecture** that allows you to use only the components you need for your specific application. This approach keeps your project lightweight and focused while still giving you access to the full power of the BioJava ecosystem when needed.
+
+The framework is organized into several specialized modules, each addressing a specific aspect of bioinformatics:
+
+### Core Modules
+
+| Module | Purpose | Key Features |
+|--------|---------|--------------|
+| biojava-core | Foundation module | Basic data structures, interfaces, and utilities |
+| biojava-alignment | Sequence alignment | Multiple sequence alignment algorithms, pairwise alignment |
+| biojava-structure | Protein structure analysis | PDB file parsing, structure manipulation, geometric calculations |
+| biojava-genome | Genome analysis | Genome assembly, annotation, comparative genomics |
+
+### Specialized Modules
+
+| Module | Purpose |
+|--------|---------|
+| biojava-structure-gui | 3D structure visualization |
+| biojava-modfinder | Post-translational modification detection |
+| biojava-ws | Web services integration |
+| biojava-protein-disorder | Protein disorder prediction |
+| biojava-aa-prop | Amino acid properties calculation |
+| biojava-survival | Survival analysis |
+| biojava-ontology | Ontology support |
+| biojava-protein-comparison-tool | Protein structure comparison |
+
+This modular design means you can start with just the core module and add others as your needs grow, keeping your application lightweight and focused.
+
+## Key Capabilities
+
+BioJava provides a rich set of capabilities across different domains of bioinformatics:
+
+### Sequence Analysis
+
+BioJava offers comprehensive tools for working with biological sequences, including DNA, RNA, and protein sequences. You can easily load sequences from various file formats, perform basic manipulations, and run analyses like:
+
+```java
+// Load a protein sequence from a FASTA file
+ProteinSequence sequence = FastaReaderHelper.readFastaProteinSequence(new File("protein.fasta")).get("seq1");
+
+// Calculate molecular weight
+double weight = ProteaseManager.getProteaseByName("Trypsin").getMolecularWeight();
+
+// Translate DNA to protein
+DNASequence dna = new DNASequence("ATGGCCATTGTAATGGGCCGCTGAAAGGGTGCCCGATAG");
+ProteinSequence protein = DNASequenceTools.translate(dna);
+```
+
+Sources: [README.md#L7](README.md#L7), [pom.xml#L723-L725](pom.xml#L723-L725)
+
+### Protein Structure Analysis
+
+One of BioJava's strengths is its comprehensive support for protein structure analysis. The structure module allows you to:
+
+- Load and manipulate protein structures from PDB files
+- Perform geometric calculations on structures
+- Align structures and sequences
+- Visualize structures in 3D
+
+```java
+// Load a protein structure from PDB
+Structure structure = StructureIO.getStructure("4HHB");
+
+// Access the first chain
+Chain chain = structure.getChain(0);
+
+// Calculate phi/psi angles
+List<AminoAcid> aas = StructureTools.getAminoAcids(chain);
+for (AminoAcid aa : aas) {
+    double phi = Calc.getPhi(aa);
+    double psi = Calc.getPsi(aa);
+    System.out.println(aa.getAminoType() + ": phi=" + phi + ", psi=" + psi);
+}
+```
+
+Sources: [biojava-structure/readme.md#L12-L18](biojava-structure/readme.md#L12-L18)
+
+### Integration with External Resources
+
+BioJava makes it easy to integrate with external bioinformatics resources and databases through its web services module. This allows you to:
+
+- Query remote databases
+- Access web-based bioinformatics tools
+- Retrieve data from public repositories
+
+```java
+// Get a protein sequence from UniProt
+UniversalClient client = new UniversalClient();
+String uniprotId = "P69905";
+String sequence = client.getSequenceFromUniprot(uniprotId);
+```
+
+## Getting Started
+
+Getting started with BioJava is straightforward. The project is distributed through Maven Central, making it easy to include in your Java projects. To begin using BioJava, simply add the required modules to your project's dependencies:
+
+```xml
+<dependencies>
+  <dependency>
+    <groupId>org.biojava</groupId>
+    <artifactId>biojava-core</artifactId>
+    <version>7.2.3</version>
+  </dependency>
+  <!-- Add other modules as needed -->
+</dependencies>
+```
+
+> [!TIP]
+> Start with just the biojava-core module and add other modules as you need them. This keeps your project lightweight and focused.
+
+BioJava requires Java 11 or later and is licensed under the GNU Lesser General Public License (LGPL) version 2.1, making it suitable for both open-source and commercial applications.
+
+## Community and Support
+
+BioJava is a **community-driven project** with a long history (since 2000) and active development. The project is supported by:
+
+- Comprehensive documentation and tutorials
+- Active mailing lists for user discussions
+- GitHub issues for bug reports and feature requests
+- Regular releases with new features and improvements
+
+The BioJava community welcomes contributions of all kinds, from bug reports to code contributions to documentation improvements.
+
+Sources: [README.md#L50-L61](README.md#L50-L61), [pom.xml#L738](pom.xml#L738), [pom.xml#L739-L742](pom.xml#L739-L742)
+
+## Next Steps
+
+This overview has introduced you to BioJava and its capabilities. To dive deeper:
+
+1. Check out the [Quick Start](2-quick-start) guide for your first BioJava program
+2. Follow the [Installation Guide](3-installation-guide) for detailed setup instructions
+3. Explore the [Key Concepts in Bioinformatics](4-key-concepts-in-bioinformatics) to understand the fundamental concepts
+4. Learn about the [Module Organization](5-module-organization) to understand how BioJava's components work together
+
+BioJava is a powerful tool that can significantly accelerate your bioinformatics development. By leveraging its modular architecture and comprehensive functionality, you can focus on solving biological problems rather than implementing fundamental algorithms and data handling routines.
+
+# Quick Start
+
+
+
+Welcome to BioJava! This guide will help you get up and running with BioJava in just a few minutes. BioJava is a powerful open-source Java framework for processing biological data, providing tools for sequence analysis, structure manipulation, and much more.
+
+## What is BioJava?
+
+BioJava is a comprehensive Java library designed specifically for bioinformatics applications. It provides analytical and statistical routines, parsers for common file formats, reference implementations of popular algorithms, and allows the manipulation of sequences and 3D structures. Whether you're working with DNA, RNA, proteins, or complex biological structures, BioJava offers the tools you need.
+
+Sources: [README.md#L7](README.md#L7), [pom.xml#L17-L21](pom.xml#L17-L21)
+
+## Setting Up BioJava
+
+### Prerequisites
+
+Before you begin, ensure you have:
+- Java Development Kit (JDK) 11 or higher
+- Apache Maven (recommended for dependency management)
+
+### Adding BioJava to Your Project
+
+The easiest way to include BioJava in your project is through Maven. Add the following dependency to your `pom.xml` file:
+
+```xml
+<dependencies>
+  <dependency>
+    <groupId>org.biojava</groupId>
+    <artifactId>biojava-core</artifactId>
+    <version>7.2.2</version>
+  </dependency>
+  <!-- Add other modules as needed -->
+</dependencies>
+```
+
+This will include the core module of BioJava, which provides fundamental functionality for sequence handling and basic bioinformatics operations.
+
+Sources: [README.md#L27-L36](README.md#L27-L36)
+
+## Your First BioJava Program
+
+Let's start with a simple example: parsing a FASTA file containing protein sequences. This is a common task in bioinformatics, and BioJava makes it straightforward.
+
+### Example: Parsing a FASTA File
+
+```java
+import org.biojava.nbio.core.sequence.ProteinSequence;
+import org.biojava.nbio.core.sequence.compound.AminoAcidCompound;
+import org.biojava.nbio.core.sequence.io.FastaReader;
+import org.biojava.nbio.core.sequence.io.GenericFastaHeaderParser;
+import org.biojava.nbio.core.sequence.io.ProteinSequenceCreator;
+import org.biojava.nbio.core.sequence.compound.AminoAcidCompoundSet;
+
+import java.io.File;
+import java.io.InputStream;
+import java.util.Map;
+import org.biojava.nbio.core.util.InputStreamProvider;
+
+public class FastaParser {
+    public static void main(String[] args) throws Exception {
+        // Provide path to your FASTA file
+        File fastaFile = new File("path/to/your/protein.fasta");
+        
+        // Automatically handle compressed files
+        InputStreamProvider isp = new InputStreamProvider();
+        InputStream inStream = isp.getInputStream(fastaFile);
+        
+        // Create a FASTA reader
+        FastaReader<ProteinSequence, AminoAcidCompound> fastaReader = new FastaReader<>(
+            inStream,
+            new GenericFastaHeaderParser<ProteinSequence, AminoAcidCompound>(),
+            new ProteinSequenceCreator(AminoAcidCompoundSet.getAminoAcidCompoundSet())
+        );
+        
+        // Read all sequences
+        Map<String, ProteinSequence> sequences = fastaReader.process();
+        
+        // Print sequence information
+        for (String header : sequences.keySet()) {
+            ProteinSequence sequence = sequences.get(header);
+            System.out.println("Header: " + header);
+            System.out.println("Sequence: " + sequence.getSequenceAsString());
+            System.out.println("Length: " + sequence.getLength());
+            System.out.println("---");
+        }
+    }
+}
+```
+
+This program demonstrates how to:
+1. Read a FASTA file (even if it's compressed)
+2. Parse protein sequences
+3. Access sequence information including headers and sequence data
+
+Sources: [ParseFastaFileDemo.java](biojava-core/src/main/java/demo/ParseFastaFileDemo.java)
+
+### Example: DNA Translation
+
+Another common bioinformatics task is translating DNA sequences to protein sequences. Here's how to do it with BioJava:
+
+```java
+import org.biojava.nbio.core.sequence.DNASequence;
+import org.biojava.nbio.core.sequence.ProteinSequence;
+import org.biojava.nbio.core.sequence.compound.AmbiguityDNACompoundSet;
+import org.biojava.nbio.core.sequence.compound.NucleotideCompound;
+import org.biojava.nbio.core.sequence.io.DNASequenceCreator;
+import org.biojava.nbio.core.sequence.io.FastaReader;
+import org.biojava.nbio.core.sequence.io.GenericFastaHeaderParser;
+import org.biojava.nbio.core.sequence.transcription.TranscriptionEngine;
+import org.biojava.nbio.core.sequence.transcription.Frame;
+
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
+import java.util.Map;
+
+public class DNATranslator {
+    public static void main(String[] args) throws Exception {
+        // Example DNA sequence in FASTA format
+        String dnaFasta = ">example_dna\n" +
+                         "ATGGCCATTGTAATGGGCCGCTGAAAGGGTGCCCGATAG";
+        
+        // Parse the DNA sequence
+        InputStream stream = new ByteArrayInputStream(dnaFasta.getBytes());
+        
+        FastaReader<DNASequence, NucleotideCompound> fastaReader = new FastaReader<>(
+            stream,
+            new GenericFastaHeaderParser<DNASequence, NucleotideCompound>(),
+            new DNASequenceCreator(AmbiguityDNACompoundSet.getDNACompoundSet())
+        );
+        
+        Map<String, DNASequence> dnaSequences = fastaReader.process();
+        
+        // Initialize the transcription engine
+        TranscriptionEngine engine = new TranscriptionEngine.Builder()
+            .dnaCompounds(AmbiguityDNACompoundSet.getDNACompoundSet())
+            .build();
+        
+        // Translate DNA to protein
+        for (DNASequence dna : dnaSequences.values()) {
+            ProteinSequence protein = dna.getRNASequence().getProteinSequence(engine);
+            System.out.println("DNA: " + dna.getSequenceAsString());
+            System.out.println("Protein: " + protein.getSequenceAsString());
+        }
+    }
+}
+```
+
+This example shows how to:
+1. Parse a DNA sequence
+2. Use BioJava's transcription engine
+3. Translate DNA to protein sequence
+
+Sources: [DemoSixFrameTranslation.java](biojava-core/src/main/java/demo/DemoSixFrameTranslation.java)
+
+## BioJava Module Overview
+
+BioJava is organized into several modules, each providing specific functionality:
+
+| Module | Description |
+|--------|-------------|
+| biojava-core | Core functionality including sequence handling and basic operations |
+| biojava-alignment | Sequence alignment algorithms and tools |
+| biojava-structure | Protein structure analysis and manipulation |
+| biojava-genome | Genome analysis tools |
+| biojava-ontology | Ontology support |
+| biojava-ws | Web services integration |
+| biojava-protein-disorder | Protein disorder prediction |
+| biojava-aa-prop | Amino acid properties calculation |
+| biojava-survival | Survival analysis tools |
+| biojava-modfinder | Post-translational modification finder |
+| biojava-protein-comparison-tool | Protein structure comparison |
+| biojava-structure-gui | GUI components for structure visualization |
+
+You can include additional modules by adding their dependencies to your `pom.xml` file. For example, to include the structure module:
+
+```xml
+<dependency>
+    <groupId>org.biojava</groupId>
+    <artifactId>biojava-structure</artifactId>
+    <version>7.2.2</version>
+</dependency>
+```
+
+Sources: [pom.xml#L721-L737](pom.xml#L721-L737)
+
+## Next Steps
+
+Congratulations! You've successfully set up BioJava and run your first bioinformatics programs. Here are some suggestions for what to explore next:
+
+1. **Explore the Core API**: Dive deeper into the sequence manipulation capabilities in the `biojava-core` module.
+2. **Try Sequence Alignment**: Use the `biojava-alignment` module to perform sequence alignments.
+3. **Work with Protein Structures**: If you're interested in structural biology, explore the `biojava-structure` module.
+4. **Check the Documentation**: Visit the [BioJava tutorial](https://github.com/biojava/biojava-tutorial) for more detailed examples and guides.
+5. **Join the Community**: Participate in the [BioJava mailing list](http://lists.open-bio.org/mailman/listinfo/biojava-l) for support and discussions.
+
+> [!TIP]
+> Remember that BioJava has extensive Javadoc documentation available at the [BioJava website](http://biojava.org/docs/api). When working with a new class or method, always check the documentation for detailed information and additional examples.
+
+
+# Installation Guide
+
+
+
+Welcome to the BioJava installation guide! This document will walk you through the process of setting up BioJava in your development environment, whether you're a beginner looking to use BioJava for your bioinformatics projects or a developer planning to contribute to the codebase.
+
+## Prerequisites
+
+Before installing BioJava, ensure you have the following prerequisites in place:
+
+**Java Development Kit (JDK)**: BioJava requires **Java 11 or higher** to run properly. The project is configured to use Java 11 as the minimum version, which provides modern language features and performance improvements for bioinformatics applications.
+
+**Apache Maven**: BioJava is built using Maven, a popular project management and comprehension tool. You'll need Maven 3.0 or higher installed on your system to build BioJava from source or manage dependencies.
+
+**Memory Requirements**: BioJava can be memory-intensive, especially when working with large biological datasets or 3D protein structures. Ensure your system has at least **2GB of RAM** available, though **4GB or more** is recommended for optimal performance.
+
+Sources: [pom.xml#L36](pom.xml#L36), [pom.xml#L41](pom.xml#L41)
+
+## Installation Methods
+
+BioJava offers two primary installation methods depending on your needs:
+
+1. **Using Maven Central** (Recommended for users who want to use BioJava in their projects)
+2. **Building from Source** (Required for developers contributing to BioJava)
+
+Let's explore each method in detail.
+
+### Method 1: Installing from Maven Central
+
+For most users, the simplest way to get started with BioJava is by adding it as a dependency to your Maven project. BioJava releases are published to Maven Central, making integration straightforward.
+
+#### Step 1: Configure Your pom.xml
+
+Add the BioJava dependencies to your project's `pom.xml` file. Here's a basic configuration:
+
+```xml
+<dependencies>
+    <!-- Core BioJava module - required for most functionality -->
+    <dependency>
+        <groupId>org.biojava</groupId>
+        <artifactId>biojava-core</artifactId>
+        <version>7.2.2</version>
+    </dependency>
+    
+    <!-- Add additional modules as needed -->
+    <dependency>
+        <groupId>org.biojava</groupId>
+        <artifactId>biojava-structure</artifactId>
+        <version>7.2.2</version>
+    </dependency>
+</dependencies>
+```
+
+#### Step 2: Choose Your Modules
+
+BioJava is organized into modular components, each focusing on specific bioinformatics tasks. You only need to include the modules relevant to your work:
+
+| Module | Purpose | Common Use Cases |
+|--------|---------|------------------|
+| biojava-core | Core functionality and shared utilities | Basic sequence operations, data models |
+| biojava-alignment | Sequence alignment algorithms | DNA/protein sequence alignment, BLAST integration |
+| biojava-structure | Protein structure analysis | PDB file parsing, 3D structure manipulation |
+| biojava-genome | Genome analysis and manipulation | Genome assembly, annotation processing |
+| biojava-aa-prop | Amino acid properties calculations | Protein property prediction, analysis |
+| biojava-protein-disorder | Protein disorder prediction | Identifying disordered regions in proteins |
+| biojava-ontology | Ontology support | GO terms, controlled vocabularies |
+| biojava-ws | Web services integration | External API calls, data retrieval |
+
+> [!TIP]
+> Start with biojava-core and add additional modules only as needed. This keeps your project lightweight and avoids unnecessary dependencies.
+
+#### Step 3: Verify Installation
+
+Create a simple test to verify BioJava is properly installed:
+
+```java
+import org.biojava.nbio.core.sequence.DNASequence;
+import org.biojava.nbio.core.sequence.ProteinSequence;
+import org.biojava.nbio.core.sequence.compound.AminoAcidCompound;
+import org.biojava.nbio.core.sequence.compound.NucleotideCompound;
+
+public class BioJavaTest {
+    public static void main(String[] args) {
+        try {
+            // Test DNA sequence functionality
+            DNASequence dnaSequence = new DNASequence("ATGC");
+            System.out.println("DNA Sequence: " + dnaSequence.getSequenceAsString());
+            
+            // Test protein sequence functionality
+            ProteinSequence proteinSequence = new ProteinSequence("ACDE");
+            System.out.println("Protein Sequence: " + proteinSequence.getSequenceAsString());
+            
+            System.out.println("BioJava installation successful!");
+        } catch (Exception e) {
+            System.err.println("Error testing BioJava: " + e.getMessage());
+        }
+    }
+}
+```
+
+If this code compiles and runs successfully, BioJava is properly installed in your project.
+
+Sources: [README.md#L23-L36](README.md#L23-L36), [pom.xml#L721-L737](pom.xml#L721-L737)
+
+### Method 2: Building from Source
+
+If you're planning to contribute to BioJava or need the latest development version, you'll need to build it from source.
+
+#### Step 1: Clone the Repository
+
+First, clone the BioJava repository from GitHub:
+
+```bash
+git clone https://github.com/biojava/biojava.git
+cd biojava
+```
+
+#### Step 2: Build the Project
+
+Use Maven to build the entire project:
+
+```bash
+# Clean previous builds and compile all modules
+mvn clean compile
+
+# Run tests to ensure everything works correctly
+mvn test
+
+# Install to your local Maven repository
+mvn install
+```
+
+The build process may take several minutes as it compiles all modules and runs extensive test suites.
+
+#### Step 3: Build Specific Modules
+
+If you only need to work with specific modules, you can build them individually:
+
+```bash
+# Build only the core module
+cd biojava-core
+mvn clean install
+
+# Build only the structure module
+cd ../biojava-structure
+mvn clean install
+```
+
+> [!TIP]
+> When building from source, ensure you have a stable internet connection as Maven needs to download various dependencies during the first build.
+
+#### Step 4: Working with IDEs
+
+BioJava can be imported into popular Java IDEs for development:
+
+**IntelliJ IDEA**:
+1. File → Open → Select the biojava root directory
+2. Choose "Import from Maven model" when prompted
+3. Wait for Maven to download dependencies and index the project
+
+**Eclipse**:
+1. File → Import → Maven → Existing Maven Projects
+2. Browse to the biojava root directory
+3. Select all modules and click Finish
+
+**NetBeans**:
+1. File → Open Project
+2. Navigate to the biojava root directory
+3. Select the pom.xml file and click Open Project
+
+The project includes formatter configurations in the `development/eclipse` directory that can be imported into your IDE to maintain consistent code style.
+
+Sources: [CONTRIBUTING.md#L12](CONTRIBUTING.md#L12), [development/eclipse](development/eclipse)
+
+## Troubleshooting Common Issues
+
+### Java Version Compatibility
+
+If you encounter Java version errors, ensure you're using Java 11 or higher:
+
+```bash
+# Check your Java version
+java -version
+javac -version
+
+# If needed, set JAVA_HOME environment variable
+export JAVA_HOME=/path/to/java11
+```
+
+### Memory Issues During Build
+
+If you run into memory issues during the build process, increase Maven's memory allocation:
+
+```bash
+# For Unix/Linux/Mac
+export MAVEN_OPTS="-Xmx2g -XX:MaxPermSize=512m"
+
+# For Windows
+set MAVEN_OPTS=-Xmx2g -XX:MaxPermSize=512m
+
+# Then run your Maven commands
+mvn clean install
+```
+
+### Network/Proxy Issues
+
+If you're behind a corporate proxy, configure Maven's settings.xml file:
+
+```xml
+<settings>
+  <proxies>
+    <proxy>
+      <id>my-proxy</id>
+      <active>true</active>
+      <protocol>http</protocol>
+      <host>proxy.company.com</host>
+      <port>8080</port>
+      <username>proxyuser</username>
+      <password>proxypass</password>
+    </proxy>
+  </proxies>
+</settings>
+```
+
+### Missing Dependencies
+
+If Maven reports missing dependencies, try cleaning your local repository:
+
+```bash
+# Clean Maven's local repository
+mvn dependency:purge-local-repository
+
+# Then rebuild
+mvn clean install
+```
+
+Sources: [pom.xml#L357-L361](pom.xml#L357-L361)
+
+## Next Steps
+
+Congratulations! You now have BioJava installed and ready to use. Here are some recommended next steps:
+
+1. **Explore the Tutorial**: Check out the [BioJava tutorial](https://github.com/biojava/biojava-tutorial) for comprehensive examples and walkthroughs.
+
+2. **Review the Cookbook**: Browse the [BioJava Cookbook](http://biojava.org/wiki/BioJava:CookBook4.0/) for quick solutions to common problems.
+
+3. **Examine the API Documentation**: Full JavaDocs are available at the [BioJava website](http://biojava.org/docs/api).
+
+4. **Join the Community**: Subscribe to the [biojava-l mailing list](http://lists.open-bio.org/mailman/listinfo/biojava-l) to connect with other users and developers.
+
+5. **Start Small**: Begin with simple sequence operations in the core module before moving to more complex functionality like protein structure analysis.
+
+Remember that BioJava is a powerful framework with extensive capabilities. Take your time to explore different modules and find the ones that best suit your bioinformatics needs. The modular design allows you to start simple and gradually incorporate more advanced features as your projects grow.
+
+
+# Key Concepts in Bioinformatics
+
+
+
+Bioinformatics is an interdisciplinary field that combines biology, computer science, and statistics to analyze and interpret biological data. As a developer working with BioJava, understanding these fundamental concepts will help you leverage the library effectively for your bioinformatics applications. This guide introduces the key bioinformatics concepts that form the foundation of BioJava's functionality.
+
+## What is Bioinformatics?
+
+Bioinformatics is the application of computational techniques to analyze and manage biological data. It encompasses a wide range of activities from collecting and storing biological information to analyzing complex datasets and modeling biological systems. Think of it as the bridge between raw biological data and meaningful biological insights.
+
+In BioJava, these concepts are implemented as modular components that you can use individually or together to build sophisticated bioinformatics applications. Each module focuses on specific aspects of biological data analysis, making it easier to work with complex biological problems in a structured way.
+
+## Core Biological Data Types
+
+### Sequences
+
+Sequences are the fundamental building blocks of bioinformatics. They represent the linear arrangement of biological molecules such as DNA, RNA, and proteins. In BioJava, sequences are represented as strings of characters where each character corresponds to a specific biological unit:
+
+- **DNA sequences**: Composed of nucleotides (A, T, G, C)
+- **RNA sequences**: Composed of nucleotides (A, U, G, C)
+- **Protein sequences**: Composed of amino acids (represented by 20 standard letters)
+
+```java
+// Creating a DNA sequence in BioJava
+DNASequence dnaSeq = new DNASequence("ATGCGATCGTAGC");
+System.out.println("DNA Sequence: " + dnaSeq.getSequenceAsString());
+
+// Creating a protein sequence
+ProteinSequence proteinSeq = new ProteinSequence("MAGLRHLLVA");
+System.out.println("Protein Sequence: " + proteinSeq.getSequenceAsString());
+```
+
+Sources: [README.md#L7](README.md#L7)
+
+### Structures
+
+Biological structures refer to the three-dimensional arrangements of molecules, particularly proteins. Understanding protein structure is crucial because the structure determines the function of a protein. BioJava provides comprehensive tools for working with protein structures:
+
+```java
+// Loading a protein structure from PDB file
+Structure structure = StructureIO.getStructure("4HHB");
+System.out.println("Protein structure loaded: " + structure.getPDBCode());
+
+// Accessing chains in the structure
+for (Chain chain : structure.getChains()) {
+    System.out.println("Chain " + chain.getChainID() + " has " + 
+                      chain.getAtomGroups().size() + " groups");
+}
+```
+
+Sources: [biojava-structure/readme.md#L12-L16](biojava-structure/readme.md#L12-L16), [pom.xml#L725](pom.xml#L725)
+
+## Key Bioinformatics Concepts
+
+### Sequence Alignment
+
+Sequence alignment is the process of arranging two or more sequences to identify regions of similarity. This is one of the most fundamental operations in bioinformatics, used to:
+
+- Identify functional or evolutionary relationships between sequences
+- Find conserved regions across species
+- Predict the function of unknown sequences
+
+BioJava provides both pairwise and multiple sequence alignment algorithms:
+
+```java
+// Pairwise sequence alignment
+Sequence<DNASequence, NucleotideCompound> seq1 = new DNASequence("ATGCGATCGTAGC");
+Sequence<DNASequence, NucleotideCompound> seq2 = new DNASequence("ATGCGTTAGTAC");
+
+SimpleGapPenalty gapPenalty = new SimpleGapPenalty((short)5, (short)2);
+SubstitutionMatrix<NucleotideCompound> matrix = SubstitutionMatrixHelper.getNuc4_2();
+
+PairwiseSequenceAligner<Sequence<DNASequence, NucleotideCompound>, NucleotideCompound> aligner = 
+    Alignments.getPairwiseAligner(seq1, seq2, PairwiseSequenceAlignerType.LOCAL, gapPenalty, matrix);
+
+SequencePair<Sequence<DNASequence, NucleotideCompound>, NucleotideCompound> alignment = aligner.getAlignment();
+System.out.println("Alignment score: " + alignment.getScore());
+```
+
+Sources: [pom.xml#L724](pom.xml#L724)
+
+### Genome Analysis
+
+Genome analysis involves studying the complete set of DNA in an organism, including all of its genes. This field encompasses:
+
+- Gene prediction and annotation
+- Genome assembly from short reads
+- Comparative genomics
+- Identification of genetic variations
+
+BioJava's genome module provides tools for working with genomic data at various scales:
+
+```java
+// Working with genomic features
+ChromosomeSequence chr1 = new ChromosomeSequence("chr1");
+chr1.addFeature(new GeneFeature("gene1", 1000, 5000, Strand.POSITIVE));
+chr1.addFeature(new GeneFeature("gene2", 6000, 9000, Strand.NEGATIVE));
+
+// Iterating through features
+for (GeneFeature feature : chr1.getFeatures()) {
+    System.out.println("Found feature: " + feature.getName() + 
+                      " at " + feature.getStart() + "-" + feature.getEnd());
+}
+```
+
+Sources: [pom.xml#L727](pom.xml#L727)
+
+### Protein Structure Analysis
+
+Protein structure analysis involves studying the 3D arrangement of atoms in a protein molecule. Key concepts include:
+
+- **Primary structure**: The linear sequence of amino acids
+- **Secondary structure**: Local folding patterns (alpha helices, beta sheets)
+- **Tertiary structure**: Overall 3D fold of the protein
+- **Quaternary structure**: Arrangement of multiple protein chains
+
+BioJava provides comprehensive tools for protein structure analysis:
+
+```java
+// Loading and analyzing protein structure
+Structure structure = StructureIO.getStructure("1TIM");
+
+// Calculating secondary structure
+SecStrucCalc ssCalc = new SecStrucCalc();
+ssCalc.calculate(structure);
+
+// Accessing secondary structure elements
+for (Chain chain : structure.getChains()) {
+    for (Group group : chain.getAtomGroups()) {
+        if (group instanceof AminoAcid) {
+            AminoAcid aa = (AminoAcid) group;
+            SecStrucType ssType = aa.getSecStrucType();
+            System.out.println("Residue " + aa.getResidueNumber() + 
+                              " has secondary structure: " + ssType);
+        }
+    }
+}
+```
+
+Sources: [biojava-structure/readme.md#L12-L16](biojava-structure/readme.md#L12-L16), [pom.xml#L725](pom.xml#L725)
+
+### Protein Disorder Prediction
+
+Protein disorder refers to regions of proteins that lack a fixed three-dimensional structure. These intrinsically disordered regions are important for:
+
+- Protein-protein interactions
+- Signaling pathways
+- Regulatory functions
+
+BioJava provides tools for predicting protein disorder:
+
+```java
+// Predicting protein disorder
+ProteinSequence sequence = new ProteinSequence("MAGLRHLLVALRILLLVLVSS");
+DisorderPredictor predictor = new DisoRDPredictor();
+DisorderPrediction prediction = predictor.predict(sequence);
+
+// Accessing disorder scores
+for (int i = 0; i < sequence.getLength(); i++) {
+    double score = prediction.getDisorderScore(i + 1); // 1-based indexing
+    System.out.println("Position " + (i + 1) + " disorder score: " + score);
+}
+```
+
+Sources: [pom.xml#L730](pom.xml#L730)
+
+### Amino Acid Properties
+
+Amino acids are the building blocks of proteins, and each has unique chemical properties that influence protein structure and function. Key properties include:
+
+- Hydrophobicity
+- Charge
+- Size
+- Flexibility
+- Propensity to form secondary structures
+
+BioJava provides tools for calculating and analyzing these properties:
+
+```java
+// Calculating amino acid properties
+ProteinSequence sequence = new ProteinSequence("MAGLRHLLVA");
+AminoAcidPropertiesCalculator calc = new AminoAcidPropertiesCalculator();
+
+// Calculate various properties
+double hydrophobicity = calc.getHydrophobicity(sequence);
+double charge = calc.getCharge(sequence, 7.0); // at pH 7.0
+double molecularWeight = calc.getMolecularWeight(sequence);
+
+System.out.println("Hydrophobicity: " + hydrophobicity);
+System.out.println("Charge at pH 7.0: " + charge);
+System.out.println("Molecular weight: " + molecularWeight);
+```
+
+Sources: [pom.xml#L731](pom.xml#L731)
+
+### Ontology Support
+
+Ontologies in bioinformatics are controlled vocabularies that describe biological concepts and their relationships. They provide a standardized way to annotate and analyze biological data. BioJava supports various biological ontologies including:
+
+- Gene Ontology (GO)
+- Sequence Ontology (SO)
+- Protein Ontology (PRO)
+
+```java
+// Working with Gene Ontology terms
+GOTerm goTerm = new GOTerm("GO:0008150"); // biological_process
+System.out.println("GO Term: " + goTerm.getName());
+System.out.println("Definition: " + goTerm.getDefinition());
+
+// Finding parent and child terms
+for (GOTerm parent : goTerm.getParents()) {
+    System.out.println("Parent: " + parent.getName());
+}
+```
+
+Sources: [pom.xml#L733](pom.xml#L733)
+
+### Web Services Integration
+
+Bioinformatics often requires accessing remote databases and services. BioJava provides integration with various bioinformatics web services:
+
+- PDB (Protein Data Bank)
+- UniProt
+- NCBI services
+- BLAST services
+
+```java
+// Accessing PDB through web services
+PDBFileReader reader = new PDBFileReader();
+reader.setPath("/path/to/pdb/files");
+
+// Downloading a structure
+Structure structure = reader.getStructureById("4HHB");
+System.out.println("Downloaded structure: " + structure.getPDBCode());
+```
+
+Sources: [pom.xml#L729](pom.xml#L729)
+
+## Bioinformatics Data Formats
+
+BioJava supports parsing and writing various bioinformatics file formats:
+
+| Format Type | Common Formats | Description |
+|-------------|---------------|-------------|
+| Sequence | FASTA, GenBank, EMBL | Formats for storing sequence data |
+| Structure | PDB, mmCIF | Formats for storing 3D structures |
+| Alignment | CLUSTAL, Stockholm | Formats for storing sequence alignments |
+| Annotation | GFF, GTF | Formats for storing genomic annotations |
+
+```java
+// Reading different sequence formats
+// FASTA format
+FastaReader<DNASequence, NucleotideCompound> fastaReader = 
+    new FastaReader<DNASequence, NucleotideCompound>(
+        new File("sequences.fasta"), 
+        new DNASequenceCreator());
+LinkedHashMap<String, DNASequence> fastaSequences = fastaReader.process();
+
+// GenBank format
+GenbankReader<ProteinSequence, AminoAcidCompound> genbankReader = 
+    new GenbankReader<ProteinSequence, AminoAcidCompound>(
+        new File("sequence.gb"), 
+        new ProteinSequenceCreator());
+ProteinSequence genbankSequence = genbankReader.readSequence();
+```
+
+Sources: [README.md#L7](README.md#L7)
+
+## Putting It All Together
+
+The real power of BioJava comes from combining these concepts to solve complex biological problems. Here's a conceptual workflow that demonstrates how these concepts work together:
+
+```mermaid
+flowchart TD
+    A[Raw Biological Data] --> B[Sequence Analysis]
+    A --> C[Structure Analysis]
+    B --> D[Sequence Alignment]
+    B --> E[Genome Analysis]
+    C --> F[Structure Comparison]
+    D --> G[Functional Annotation]
+    E --> G
+    F --> G
+    G --> H[Biological Insights]
+```
+
+> [!TIP]
+> When working with BioJava, remember that each module is designed to work independently but can also be combined with other modules for more complex analyses. Start with the core module for basic sequence operations, then add other modules as needed for specific tasks.
+
+## Next Steps
+
+Now that you understand the key concepts in bioinformatics that BioJava addresses, you're ready to dive deeper into specific modules and their APIs. The next guide, [Module Organization](5-module-organization), will show you how BioJava is structured and how to choose the right modules for your specific bioinformatics tasks.
+
+
+# Module Organization
+
+
+
+BioJava is designed as a modular framework, allowing developers to use only the components they need for their specific bioinformatics tasks. This modular architecture keeps the library lightweight and flexible while providing comprehensive functionality for biological data analysis.
+
+## Understanding BioJava's Modular Architecture
+
+BioJava follows a **multi-module Maven project structure** where each module focuses on a specific domain of bioinformatics. This design approach allows for better maintainability, reduced dependencies, and targeted functionality. The project is organized with a parent POM that coordinates all child modules, ensuring consistent versioning and dependency management across the entire framework.
+
+The modular architecture offers several key advantages:
+- **Selective Usage**: You can include only the modules relevant to your project
+- **Reduced Footprint**: Smaller applications by avoiding unnecessary dependencies
+- **Clear Separation of Concerns**: Each module has a well-defined purpose
+- **Independent Development**: Modules can be developed and updated independently
+
+## Core Modules Overview
+
+BioJava consists of **13 main modules**, each serving a specific purpose in the bioinformatics landscape:
+
+```mermaid
+graph TD
+    A[BioJava Parent] --> B[biojava-core]
+    A --> C[biojava-alignment]
+    A --> D[biojava-structure]
+    A --> E[biojava-structure-gui]
+    A --> F[biojava-genome]
+    A --> G[biojava-modfinder]
+    A --> H[biojava-ws]
+    A --> I[biojava-protein-disorder]
+    A --> J[biojava-aa-prop]
+    A --> K[biojava-survival]
+    A --> L[biojava-ontology]
+    A --> M[biojava-protein-comparison-tool]
+    A --> N[biojava-integrationtest]
+```
+
+Sources: [pom.xml#L721-L737](pom.xml#L721-L737)
+
+### Foundation Module: biojava-core
+
+The **biojava-core** module serves as the foundation for the entire BioJava framework. It provides essential data structures, interfaces, and utilities that other modules build upon. This module contains fundamental classes for representing biological sequences, basic I/O operations, and core utilities that are used throughout the framework.
+
+Key features of biojava-core include:
+- Basic sequence representations and manipulations
+- Core data structures for biological entities
+- Fundamental I/O utilities
+- Common utilities and helper classes
+
+The core module has minimal external dependencies, primarily relying on logging frameworks (SLF4J with Log4j2) and XML binding libraries (Jakarta XML Bind). This lightweight design makes it an ideal starting point for any BioJava-based application.
+
+Sources: [biojava-core/pom.xml](biojava-core/pom.xml)
+
+### Sequence Analysis: biojava-alignment
+
+The **biojava-alignment** module extends the core functionality with sequence alignment capabilities. It builds upon biojava-core and adds specialized algorithms and data structures for comparing biological sequences. This module is essential for tasks involving sequence similarity, evolutionary analysis, and comparative genomics.
+
+Key features include:
+- Multiple sequence alignment algorithms
+- Pairwise sequence alignment implementations
+- Support for various alignment scoring schemes
+- Integration with the Forester library for phylogenetic analysis
+
+The alignment module depends on biojava-core and includes the Forester library as a third-party dependency for advanced phylogenetic tree operations.
+
+Sources: [biojava-alignment/pom.xml#L48-L56](biojava-alignment/pom.xml#L48-L56)
+
+### Protein Structure Analysis: biojava-structure
+
+The **biojava-structure** module is one of the most comprehensive components, providing tools for protein structure analysis and manipulation. This module enables developers to work with 3D protein structures from the Protein Data Bank (PDB) and other structural biology file formats.
+
+Key capabilities include:
+- Loading and parsing protein structure files (PDB, mmCIF)
+- Structure manipulation and analysis
+- Geometric calculations and measurements
+- Integration with modern structure file formats (MMTF)
+
+This module has richer dependencies, including:
+- **biojava-core** and **biojava-alignment** as foundational modules
+- **MMTF libraries** for efficient structure file handling
+- **CIF tools** for crystallographic information file processing
+- **JGraphT** for graph-based structure analysis
+- **Jackson** for JSON processing
+- **Vecmath** for 3D vector mathematics
+
+The protein structure modules provide an API that allows to maintain local installations of PDB, load structures and manipulate them, and perform standard analysis such as sequence and structure alignments.
+
+Sources: [biojava-structure/pom.xml#L52-L62](biojava-structure/pom.xml#L52-L62), [biojava-structure/readme.md#L12-L18](biojava-structure/readme.md#L12-L18)
+
+## Specialized Modules
+
+Beyond the core functionality, BioJava includes several specialized modules that address specific bioinformatics domains:
+
+### Protein-Focused Modules
+
+- **biojava-structure-gui**: Provides visualization capabilities for protein structures, building upon the structure module to offer interactive 3D visualization.
+- **biojava-protein-disorder**: Implements algorithms for predicting intrinsically disordered regions in proteins.
+- **biojava-aa-prop**: Calculates various physicochemical properties of amino acids and proteins.
+- **biojava-protein-comparison-tool**: Offers specialized utilities for comparing protein sequences and structures.
+
+### Genomics and Advanced Analysis
+
+- **biojava-genome**: Provides tools for genome-scale analysis, including handling large genomic sequences and annotations.
+- **biojava-modfinder**: Specialized in identifying post-translational modifications in protein sequences.
+- **biojava-survival**: Implements statistical methods for survival analysis, commonly used in biomedical research.
+
+### Integration and Support Modules
+
+- **biojava-ontology**: Handles biological ontologies and controlled vocabularies, essential for standardized data representation.
+- **biojava-ws**: Provides web service integration capabilities, allowing BioJava to interact with external bioinformatics resources.
+- **biojava-integrationtest**: Contains integration tests that verify the compatibility and interaction between different modules.
+
+## Module Dependencies and Interactions
+
+The modules in BioJava are designed with a clear dependency hierarchy that ensures stability and prevents circular dependencies:
+
+```mermaid
+graph LR
+    biojava-core --> biojava-alignment
+    biojava-core --> biojava-genome
+    biojava-core --> biojava-ontology
+    biojava-alignment --> biojava-structure
+    biojava-core --> biojava-aa-prop
+    biojava-core --> biojava-modfinder
+    biojava-core --> biojava-protein-disorder
+    biojava-core --> biojava-survival
+    biojava-structure --> biojava-structure-gui
+    biojava-core --> biojava-ws
+    biojava-core --> biojava-protein-comparison-tool
+```
+
+This hierarchical structure ensures that:
+- **biojava-core** remains the foundation with no dependencies on other BioJava modules
+- Specialized modules build upon the core or other foundational modules
+- Integration tests can validate the entire ecosystem
+- Clear separation of concerns is maintained throughout the framework
+
+> [!TIP]
+> When starting a new BioJava project, begin with biojava-core and only add additional modules as needed. This approach minimizes dependencies and keeps your application lightweight.
+
+## Choosing the Right Modules for Your Project
+
+Selecting the appropriate modules depends on your specific bioinformatics needs:
+
+| Use Case | Recommended Modules | Description |
+|----------|-------------------|-------------|
+| Basic sequence operations | biojava-core | Fundamental sequence handling and manipulation |
+| Sequence alignment analysis | biojava-core, biojava-alignment | Pairwise and multiple sequence alignments |
+| Protein structure analysis | biojava-core, biojava-alignment, biojava-structure | 3D structure loading, manipulation, and analysis |
+| Protein visualization | biojava-core, biojava-alignment, biojava-structure, biojava-structure-gui | Interactive 3D structure visualization |
+| Genome-scale analysis | biojava-core, biojava-genome | Large genomic sequence processing |
+| Protein property calculation | biojava-core, biojava-aa-prop | Physicochemical property calculations |
+| Web service integration | biojava-core, biojava-ws | Access to external bioinformatics resources |
+
+## Best Practices for Module Usage
+
+When working with BioJava's modular architecture, follow these best practices:
+
+1. **Start Minimal**: Begin with only biojava-core and add modules as needed
+2. **Understand Dependencies**: Be aware of transitive dependencies when adding modules
+3. **Version Consistency**: Ensure all modules use the same version (managed by parent POM)
+4. **Leverage Integration Tests**: Use biojava-integrationtest to verify module compatibility
+5. **Check Module Documentation**: Each module may have specific documentation in its README file
+
+The modular design of BioJava reflects the diverse nature of bioinformatics applications, allowing developers to create tailored solutions that are both powerful and efficient. By understanding the module organization, you can make informed decisions about which components to include in your projects, ensuring optimal performance and functionality.
+
+
+# BioJava Core API
+
+
+
+The BioJava Core API forms the foundation of the entire BioJava framework, providing essential data structures and functionality for working with biological sequences. This module serves as the backbone for all other BioJava components, offering a robust and flexible architecture for handling DNA, RNA, and protein sequences.
+
+## Understanding the Core Architecture
+
+At the heart of BioJava's design is a generic sequence model that can represent any type of biological sequence. The Core API uses a template-based approach where sequences are parameterized by the type of compounds they contain. This elegant design allows for type-safe operations while maintaining flexibility across different biological data types.
+
+The primary building blocks of the Core API include:
+
+- **Sequence Interface**: The fundamental abstraction for all biological sequences
+- **Compound Interface**: Represents individual elements in a sequence (nucleotides, amino acids)
+- **CompoundSet Interface**: Defines the valid compounds for a particular sequence type
+- **AbstractSequence Class**: Provides base implementation for all sequence types
+
+This architecture enables developers to work with sequences in a consistent manner regardless of whether they're dealing with DNA, RNA, or proteins.
+Sources: [AbstractSequence.java#L1-L50](biojava-core/src/main/java/org/biojava/nbio/core/sequence/template/AbstractSequence.java#L1-L50), [Compound.java](biojava-core/src/main/java/org/biojava/nbio/core/sequence/template/Compound.java)
+
+## Working with Sequences
+
+BioJava provides specialized implementations for different biological sequence types. The most commonly used are:
+
+### DNA Sequences
+
+DNA sequences in BioJava are represented by the `DNASequence` class, which extends `AbstractSequence<NucleotideCompound>`. This class provides methods specific to DNA manipulation, including transcription and complement operations.
+
+```java
+// Creating a DNA sequence from a string
+DNASequence dnaSequence = new DNASequence("ATGCGTACGT", DNACompoundSet.getDNACompoundSet());
+```
+
+DNA sequences also support enumeration of types through the `DNAType` enum, which includes CHROMOSOME, MITOCHONDRIAL, PLASMID, PLASTID, and UNKNOWN types. This metadata helps in categorizing and organizing DNA sequences appropriately.
+Sources: [DNASequence.java#L1-L50](biojava-core/src/main/java/org/biojava/nbio/core/sequence/DNASequence.java#L1-L50)
+
+### Protein Sequences
+
+Protein sequences are handled by the `ProteinSequence` class, which extends `AbstractSequence<AminoAcidCompound>`. This class provides functionality specific to protein analysis and manipulation.
+
+```java
+// Creating a protein sequence
+ProteinSequence proteinSequence = new ProteinSequence("MAGVKQLADDRTLLMAGVSHDLRTPLTRIRLATEMMSEQDGYLAESINKDIEEQ", 
+    AminoAcidCompoundSet.getAminoAcidCompoundSet());
+```
+
+The `ProteinSequence` class integrates with various BioJava modules for protein analysis, including structure prediction, modification detection, and comparison tools.
+Sources: [ProteinSequence.java#L1-L50](biojava-core/src/main/java/org/biojava/nbio/core/sequence/ProteinSequence.java#L1-L50)
+
+### Basic Sequences
+
+For simple use cases, BioJava provides the `BasicSequence` class, which is a minimal implementation of the sequence interface. It's designed for situations where you don't need the specialized functionality of DNA or protein sequences.
+
+```java
+// Creating a basic sequence
+BasicSequence<NucleotideCompound> basicSequence = new BasicSequence<>("ATGCGT", DNACompoundSet.getDNACompoundSet());
+```
+
+While `BasicSequence` is lightweight, it's recommended to use the specialized sequence classes when working with specific biological data types to take advantage of their domain-specific methods.
+Sources: [BasicSequence.java](biojava-core/src/main/java/org/biojava/nbio/core/sequence/BasicSequence.java)
+
+## Sequence I/O Operations
+
+The Core API provides robust support for reading and writing sequences in various formats, with FASTA being the most commonly used. The `FastaReader` class offers efficient parsing of FASTA files, even for large datasets.
+
+```java
+// Reading protein sequences from a FASTA file
+InputStreamProvider isp = new InputStreamProvider();
+InputStream inStream = isp.getInputStream(new File("proteins.fasta"));
+
+FastaReader<ProteinSequence, AminoAcidCompound> fastaReader = new FastaReader<>(
+    inStream,
+    new GenericFastaHeaderParser<ProteinSequence, AminoAcidCompound>(),
+    new ProteinSequenceCreator(AminoAcidCompoundSet.getAminoAcidCompoundSet()));
+
+Map<String, ProteinSequence> sequences = fastaReader.process(100); // Process in batches of 100
+```
+
+The `InputStreamProvider` class automatically handles compressed files (like .gz), making it convenient to work with downloaded bioinformatics data without manual decompression.
+Sources: [ParseFastaFileDemo.java](biojava-core/src/main/java/demo/ParseFastaFileDemo.java)
+
+## Sequence Translation and Transcription
+
+One of the most powerful features of the Core API is its ability to perform sequence translations and transcriptions. The `TranscriptionEngine` class provides a flexible framework for converting DNA to RNA and then to protein sequences.
+
+```java
+// Initialize the Transcription Engine
+TranscriptionEngine engine = new TranscriptionEngine.Builder()
+    .dnaCompounds(AmbiguityDNACompoundSet.getDNACompoundSet())
+    .rnaCompounds(AmbiguityRNACompoundSet.getRNACompoundSet())
+    .build();
+
+// Perform six-frame translation
+Frame[] sixFrames = Frame.getAllFrames();
+Map<Frame, Sequence<AminoAcidCompound>> results = engine.multipleFrameTranslation(dnaSequence, sixFrames);
+
+for (Frame frame : sixFrames) {
+    System.out.println("Frame " + frame + ": " + results.get(frame));
+}
+```
+
+Six-frame translation is a common bioinformatics technique that translates a DNA sequence in all six possible reading frames (three forward, three reverse), which is essential for identifying potential coding regions in genomic DNA.
+Sources: [DemoSixFrameTranslation.java](biojava-core/src/main/java/demo/DemoSixFrameTranslation.java)
+
+## Core Utility Classes
+
+The Core API includes several utility classes that provide common functionality for sequence manipulation and analysis:
+
+- **SequenceTools**: Offers static methods for common sequence operations
+- **InputStreamProvider**: Handles file input, including automatic decompression
+- **FileDownloadUtils**: Provides functionality for downloading files from URLs
+- **XMLHelper**: Assists with XML processing for bioinformatics data
+
+These utility classes simplify many routine tasks and provide consistent behavior across the BioJava framework.
+
+> [!TIP]
+> When working with large sequence files, consider using the batch processing capabilities of FastaReader to avoid memory issues. The process(int batchSize) method allows you to process sequences in manageable chunks rather than loading everything into memory at once.
+
+## Integration with Other BioJava Modules
+
+The Core API is designed to work seamlessly with other BioJava modules:
+
+- **biojava-structure**: Uses Core API sequences for 3D structure analysis
+- **biojava-alignment**: Leverages Core API for sequence alignment algorithms
+- **biojava-genome**: Extends Core API for genomic data analysis
+- **biojava-ontology**: Integrates with Core API for annotation and ontology support
+
+This modular architecture allows you to start with the Core API and add additional functionality as needed, making BioJava suitable for projects ranging from simple sequence analysis to complex bioinformatics pipelines.
+
+## Best Practices
+
+When working with the BioJava Core API, consider these best practices:
+
+1. **Use specialized sequence classes** when possible (DNASequence, ProteinSequence) rather than BasicSequence
+2. **Handle exceptions properly**, especially CompoundNotFoundException when creating sequences from strings
+3. **Process large files in batches** to avoid memory issues
+4. **Use appropriate CompoundSets** for your sequence type to ensure valid compound representation
+5. **Leverage the template system** for creating reusable sequence processing code
+
+The BioJava Core API provides a solid foundation for bioinformatics applications in Java. Its well-designed architecture and comprehensive feature set make it an excellent choice for developers working with biological sequence data.
+
+# Data Models and Parsers
+
+
+
+In the world of bioinformatics, data comes in many formats and represents complex biological information. BioJava provides a robust framework for handling this data through well-designed data models and flexible parsers. Understanding these components is essential for effectively working with biological sequences and structures in Java.
+
+## Core Data Models
+
+At the heart of BioJava's architecture are the fundamental data models that represent biological sequences. The primary interface is `Sequence<C extends Compound>`, which defines a collection of compounds (nucleotides, amino acids, etc.) with biological indexing. This interface provides essential methods for sequence manipulation:
+
+```java
+public interface Sequence<C extends Compound> extends Iterable<C>, Accessioned {
+    public int getLength();
+    public C getCompoundAt(int position);
+    public int getIndexOf(C compound);
+    public String getSequenceAsString();
+    public SequenceView<C> getSubSequence(Integer start, Integer end);
+    public CompoundSet<C> getCompoundSet();
+}
+```
+
+The `Sequence` interface uses 1-based indexing, following biological convention rather than computer science's 0-based indexing. This design choice makes BioJava more intuitive for biologists and reduces off-by-one errors when working with genomic coordinates.
+
+### Concrete Sequence Implementations
+
+BioJava provides several concrete implementations for different types of biological sequences:
+
+| Sequence Type | Class | Compound Type | Use Case |
+|---------------|-------|---------------|----------|
+| DNA | `DNASequence` | `NucleotideCompound` | Genomic DNA, mitochondrial DNA, plasmids |
+| RNA | `RNASequence` | `NucleotideCompound` | mRNA, tRNA, rRNA |
+| Protein | `ProteinSequence` | `AminoAcidCompound` | Polypeptide chains, proteins |
+
+For example, creating a DNA sequence is straightforward:
+
+```java
+try {
+    DNASequence dnaSeq = new DNASequence("ATGCGTAACGT");
+    System.out.println("Length: " + dnaSeq.getLength());
+    System.out.println("Sequence: " + dnaSeq.getSequenceAsString());
+} catch (CompoundNotFoundException e) {
+    e.printStackTrace();
+}
+```
+
+The `DNASequence` class extends `AbstractSequence<NucleotideCompound>` and adds DNA-specific functionality like transcription to RNA:
+
+```java
+public DNASequence(String seqString) throws CompoundNotFoundException {
+    super(seqString, DNACompoundSet.getDNACompoundSet());
+}
+```
+
+This constructor creates a DNA sequence using the default DNA compound set, which validates that only valid nucleotides (A, T, G, C) are present in the sequence.
+
+## Parser Architecture
+
+BioJava's parser architecture is designed to be flexible and extensible, supporting multiple file formats while maintaining a consistent interface. The parsers follow a template pattern with clear separation of concerns:
+
+### Key Parser Components
+
+1. **Sequence Readers**: Classes that read from input streams and parse sequence data
+2. **Header Parsers**: Handle metadata associated with sequences
+3. **Sequence Creators**: Factory objects that create appropriate sequence objects
+4. **Format-specific Parsers**: Specialized parsers for different file formats
+
+The `FastaReader<S extends Sequence<?>, C extends Compound>` class exemplifies this architecture. It's designed to parse FASTA files, one of the most common formats in bioinformatics:
+
+```java
+public class FastaReader<S extends Sequence<?>, C extends Compound> {
+    SequenceCreatorInterface<C> sequenceCreator;
+    SequenceHeaderParserInterface<S,C> headerParser;
+    BufferedReaderBytesRead br;
+    // ... other fields
+}
+```
+
+### FASTA Parsing Process
+
+The FASTA parsing logic demonstrates how BioJava handles file parsing efficiently:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant FastaReader
+    participant SequenceCreator
+    participant HeaderParser
+    participant Sequence
+    
+    User->>FastaReader: new FastaReader(file, headerParser, sequenceCreator)
+    User->>FastaReader: process()
+    loop For each FASTA record
+        FastaReader->>FastaReader: readLine()
+        alt Line starts with '>'
+            FastaReader->>FastaReader: extract header
+        else Line is sequence data
+            FastaReader->>FastaReader: append to sequence buffer
+        end
+    end
+    FastaReader->>SequenceCreator: getSequence(sequenceString)
+    SequenceCreator->>Sequence: new DNASequence(sequenceString)
+    Sequence-->>SequenceCreator: sequence object
+    SequenceCreator-->>FastaReader: sequence object
+    FastaReader->>HeaderParser: parseHeader(header, sequence)
+    FastaReader-->>User: Map<String, S> sequences
+```
+
+The parser processes FASTA files line by line, identifying headers (lines starting with '>') and accumulating sequence data. When a new header is encountered, it signals the completion of the previous sequence, which is then created and added to the result map.
+
+### Supported File Formats
+
+BioJava supports parsing various bioinformatics file formats through specialized readers:
+
+| Format | Reader Class | Description |
+|--------|-------------|-------------|
+| FASTA | `FastaReader` | Simple sequence format with headers |
+| GenBank | `GenbankReader` | NCBI GenBank format with rich annotations |
+| EMBL | `EmblReader` | EMBL/EBI sequence database format |
+| ABIF | `ABITrace` | Applied Biosystems trace files |
+
+Each reader follows a similar pattern but handles format-specific details. For example, the `GenbankReader` parses complex feature annotations, while the `FastaReader` focuses on simple sequence and header parsing.
+
+## Working with Parsers
+
+Using BioJava parsers is straightforward. Here's how to read a FASTA file containing DNA sequences:
+
+```java
+File fastaFile = new File("sequences.fasta");
+FastaReader<DNASequence, NucleotideCompound> fastaReader = 
+    new FastaReader<>(
+        fastaFile,
+        new GenericFastaHeaderParser<DNASequence, NucleotideCompound>(),
+        new DNASequenceCreator()
+    );
+
+Map<String, DNASequence> sequences = fastaReader.process();
+for (Map.Entry<String, DNASequence> entry : sequences.entrySet()) {
+    System.out.println("ID: " + entry.getKey());
+    System.out.println("Sequence: " + entry.getValue().getSequenceAsString());
+}
+fastaReader.close();
+```
+
+For convenience, BioJava provides helper classes that simplify common parsing tasks:
+
+```java
+// Using FastaReaderHelper for quick parsing
+Map<String, DNASequence> sequences = 
+    FastaReaderHelper.readFastaDNASequence(new File("sequences.fasta"));
+```
+
+> [!TIP]
+> When working with large sequence files, consider using the `process(int max)` method instead of `process()` to limit memory usage. This allows you to process sequences in batches rather than loading everything at once.
+
+## Compound System
+
+BioJava's compound system represents the individual units that make up biological sequences. The `Compound` interface is the foundation, with specialized implementations for different types:
+
+- `NucleotideCompound`: Represents DNA and RNA nucleotides
+- `AminoAcidCompound`: Represents amino acids in proteins
+- `CompoundSet`: Defines valid compounds and their relationships
+
+This system ensures type safety and validates sequence data. For example, attempting to create a DNA sequence with invalid characters will throw a `CompoundNotFoundException`:
+
+```java
+try {
+    DNASequence invalidSeq = new DNASequence("ATGCX123"); // X and 1,2,3 are invalid
+} catch (CompoundNotFoundException e) {
+    System.out.println("Invalid nucleotide detected: " + e.getMessage());
+}
+```
+
+## Extending the Framework
+
+BioJava's data models and parsers are designed to be extensible. You can create custom sequence types, parsers for new formats, or specialized compound sets. For example, to create a parser for a custom file format, you would:
+
+1. Implement `SequenceParserInterface` for parsing logic
+2. Implement `SequenceHeaderParserInterface` for header handling
+3. Implement `SequenceCreatorInterface` for object creation
+4. Create a main reader class that coordinates these components
+
+This modular architecture allows BioJava to adapt to new bioinformatics data formats and requirements while maintaining backward compatibility.
+
+## Conclusion
+
+BioJava's data models and parsers provide a solid foundation for bioinformatics applications in Java. The combination of well-designed interfaces, concrete implementations, and flexible parsing architecture makes it easier to work with biological data while ensuring correctness and type safety. Whether you're working with DNA, RNA, or protein sequences, BioJava offers the tools you need to parse, manipulate, and analyze biological information effectively.
+
+
+# Sequence Alignment Algorithms
+
+
+
+Sequence alignment is a fundamental technique in bioinformatics that compares DNA, RNA, or protein sequences to identify regions of similarity. These similarities can help us understand evolutionary relationships, predict protein function, and identify conserved domains. In BioJava, the biojava-alignment module provides a comprehensive suite of tools for performing both pairwise and multiple sequence alignments using well-established algorithms.
+
+## Why Sequence Alignment Matters
+
+Sequence alignment is like comparing two texts to find similar passages, but for biological sequences. When we align sequences, we're looking for evolutionary traces - regions that have been conserved across species because they're important for function. BioJava makes this powerful technique accessible through a clean, intuitive API that handles the complex mathematics behind the scenes.
+
+**Key applications of sequence alignment include:**
+- Identifying homologous genes or proteins across species
+- Predicting protein structure and function
+- Detecting mutations and polymorphisms
+- Building phylogenetic trees to understand evolutionary relationships
+- Finding conserved domains that indicate functional regions
+
+## Core Alignment Algorithms in BioJava
+
+BioJava implements the two most fundamental sequence alignment algorithms: global alignment using the Needleman-Wunsch algorithm and local alignment using the Smith-Waterman algorithm. These algorithms use dynamic programming to find optimal alignments efficiently.
+
+### Global Alignment: Needleman-Wunsch Algorithm
+
+The Needleman-Wunsch algorithm finds the best alignment between two entire sequences, from beginning to end. This is particularly useful when you believe the sequences are similar across their entire length and evolutionarily related.
+
+The algorithm works by:
+1. Creating a scoring matrix where each cell represents the best score up to that point
+2. Filling the matrix using dynamic programming based on match/mismatch scores and gap penalties
+3. Tracing back from the bottom-right corner to find the optimal alignment path
+
+Here's how to perform a global alignment in BioJava:
+
+```java
+// Create sequences to align
+ProteinSequence s1 = getSequenceForId("P69905");
+ProteinSequence s2 = getSequenceForId("P68871");
+
+// Set up alignment parameters
+SubstitutionMatrix<AminoAcidCompound> matrix = SubstitutionMatrixHelper.getBlosum65();
+GapPenalty penalty = new SimpleGapPenalty(8, 1); // gap open: 8, gap extend: 1
+
+// Perform global alignment
+PairwiseSequenceAligner<ProteinSequence, AminoAcidCompound> aligner =
+    Alignments.getPairwiseAligner(s1, s2, PairwiseSequenceAlignerType.GLOBAL, penalty, matrix);
+SequencePair<ProteinSequence, AminoAcidCompound> pair = aligner.getPair();
+
+System.out.println(pair.toString(60));
+```
+
+Sources: [NeedlemanWunsch.java#L34-41](biojava-alignment/src/main/java/org/biojava/nbio/alignment/NeedlemanWunsch.java#L34-41), [DemoAlignProteins.java#L47-63](biojava-alignment/src/main/java/demo/DemoAlignProteins.java#L47-63)
+
+### Local Alignment: Smith-Waterman Algorithm
+
+The Smith-Waterman algorithm finds the best matching subsequences within two larger sequences. This is ideal when you suspect only parts of the sequences are related, or when looking for domains or motifs.
+
+Unlike global alignment, local alignment:
+1. Allows alignments to start and end anywhere within the sequences
+2. Can find multiple high-scoring local alignments
+3. Is better for detecting distant evolutionary relationships
+
+```java
+// Perform local alignment
+PairwiseSequenceAligner<ProteinSequence, AminoAcidCompound> smithWaterman =
+    Alignments.getPairwiseAligner(s1, s2, PairwiseSequenceAlignerType.LOCAL, penalty, matrix);
+
+SequencePair<ProteinSequence, AminoAcidCompound> localPair = smithWaterman.getPair();
+System.out.println(localPair.toString(60));
+```
+
+Sources: [SmithWaterman.java#L38-44](biojava-alignment/src/main/java/org/biojava/nbio/alignment/SmithWaterman.java#L38-44), [DemoAlignProteins.java#L57-63](biojava-alignment/src/main/java/demo/DemoAlignProteins.java#L57-63)
+
+## Understanding Alignment Parameters
+
+The quality of your alignment depends heavily on choosing appropriate parameters. BioJava gives you full control over these critical settings.
+
+### Substitution Matrices
+
+Substitution matrices define the score for aligning each possible pair of amino acids or nucleotides. BioJava provides several built-in matrices:
+
+| Matrix Type | Best For | Description |
+|-------------|----------|-------------|
+| BLOSUM62 | General protein alignment | Default matrix for protein comparisons |
+| BLOSUM45 | Distantly related proteins | For sequences with <30% identity |
+| BLOSUM80 | Closely related proteins | For sequences with >80% identity |
+| PAM250 | Ancient evolutionary relationships | Based on observed mutations over long periods |
+| NUC4_4 | DNA/RNA alignment | For nucleotide sequences |
+
+```java
+// Choose appropriate substitution matrix
+SubstitutionMatrix<AminoAcidCompound> matrix = SubstitutionMatrixHelper.getBlosum62();
+// or for DNA sequences:
+SubstitutionMatrix<NucleotideCompound> dnaMatrix = SubstitutionMatrixHelper.getNuc4_4();
+```
+
+Sources: [Alignments.java#L153-166](biojava-alignment/src/main/java/org/biojava/nbio/alignment/Alignments.java#L153-166)
+
+### Gap Penalties
+
+Gap penalties control how much alignment scores are reduced for insertions or deletions. BioJava supports both simple and affine gap penalties:
+
+```java
+// Simple gap penalty (same cost for opening and extending gaps)
+GapPenalty simplePenalty = new SimpleGapPenalty();
+simplePenalty.setOpenPenalty(8);  // Cost to open a gap
+simplePenalty.setExtensionPenalty(1);  // Cost to extend a gap by one position
+```
+
+> [!TIP]
+> Choosing appropriate gap penalties is crucial. For protein alignments, gap open penalties of 8-12 and extension penalties of 1-2 are common. For DNA alignments, lower penalties (5-10 for open, 0.5-2 for extend) work better due to higher rates of insertion/deletion.
+
+Sources: [SimpleGapPenalty.java](biojava-alignment/src/main/java/org/biojava/nbio/alignment/SimpleGapPenalty.java)
+
+## Multiple Sequence Alignment
+
+While pairwise alignment compares two sequences, multiple sequence alignment (MSA) aligns three or more sequences simultaneously. This is essential for:
+- Building accurate phylogenetic trees
+- Identifying conserved regions across many species
+- Predicting protein structure and function
+- Detecting evolutionary patterns
+
+BioJava implements a progressive alignment strategy for MSA:
+
+```mermaid
+flowchart TD
+    A[Input Sequences] --> B[Calculate All Pairs Scores]
+    B --> C[Build Guide Tree]
+    C --> D[Progressive Alignment]
+    D --> E[Refine Alignment]
+    E --> F[Final MSA]
+```
+
+Here's how to perform a multiple sequence alignment:
+
+```java
+// Prepare list of sequences
+List<ProteinSequence> sequences = new ArrayList<>();
+sequences.add(getSequenceForId("Q21691"));
+sequences.add(getSequenceForId("A8WS47"));
+sequences.add(getSequenceForId("O48771"));
+
+// Perform multiple sequence alignment
+Profile<ProteinSequence, AminoAcidCompound> profile = 
+    Alignments.getMultipleSequenceAlignment(sequences);
+
+System.out.printf("Clustalw format:%n%s%n", profile);
+
+// Clean up concurrent resources
+ConcurrencyTools.shutdown();
+```
+
+Sources: [CookbookMSA.java#L45-54](biojava-alignment/src/main/java/demo/CookbookMSA.java#L45-54), [Alignments.java#L187-199](biojava-alignment/src/main/java/org/biojava/nbio/alignment/Alignments.java#L187-199)
+
+## Advanced Features and Scoring Options
+
+BioJava provides sophisticated scoring options beyond basic alignment:
+
+### Alignment Scoring Types
+
+The framework supports multiple ways to score alignments:
+
+| Scoring Type | Use Case | Description |
+|--------------|----------|-------------|
+| GLOBAL | Full sequence similarity | Standard global alignment score |
+| GLOBAL_IDENTITIES | Percent identity | Counts identical positions only |
+| GLOBAL_SIMILARITIES | Conservative substitutions | Scores similar amino acids positively |
+| LOCAL | Best local match | Finds highest-scoring local regions |
+| KMERS | Fast pre-alignment scoring | Uses k-mer matches for quick filtering |
+
+```java
+// Different scoring options
+double identityScore = getPairwiseScore(s1, s2, 
+    PairwiseSequenceScorerType.GLOBAL_IDENTITIES, penalty, matrix);
+double similarityScore = getPairwiseScore(s1, s2, 
+    PairwiseSequenceScorerType.GLOBAL_SIMILARITIES, penalty, matrix);
+```
+
+Sources: [Alignments.java#L79-88](biojava-alignment/src/main/java/org/biojava/nbio/alignment/Alignments.java#L79-88)
+
+### Parallel Processing
+
+BioJava leverages multi-core processors for faster alignment of multiple sequence pairs:
+
+```java
+// Align all pairs in parallel
+List<SequencePair<ProteinSequence, AminoAcidCompound>> allPairs = 
+    Alignments.getAllPairsAlignments(sequences, 
+        PairwiseSequenceAlignerType.GLOBAL, penalty, matrix);
+
+// Remember to shut down the thread pool when done
+ConcurrencyTools.shutdown();
+```
+
+> [!TIP]
+> When using parallel processing methods, always call ConcurrencyTools.shutdown() when you're done to properly clean up thread pools and avoid resource leaks.
+
+Sources: [Alignments.java#L132-136](biojava-alignment/src/main/java/org/biojava/nbio/alignment/Alignments.java#L132-136)
+
+## Practical Example: Protein Alignment Workflow
+
+Let's walk through a complete example of aligning protein sequences and interpreting the results:
+
+```java
+public class ProteinAlignmentExample {
+    public static void main(String[] args) throws Exception {
+        // 1. Load sequences from UniProt
+        ProteinSequence hemoglobin = getSequenceForId("P69905");  // Human hemoglobin
+        ProteinSequence myoglobin = getSequenceForId("P02144");   // Human myoglobin
+        
+        // 2. Set up alignment parameters
+        SubstitutionMatrix<AminoAcidCompound> matrix = SubstitutionMatrixHelper.getBlosum62();
+        GapPenalty penalty = new SimpleGapPenalty(10, 1);
+        
+        // 3. Perform both global and local alignments
+        SequencePair<ProteinSequence, AminoAcidCompound> globalAlign = 
+            Alignments.getPairwiseAlignment(hemoglobin, myoglobin, 
+                PairwiseSequenceAlignerType.GLOBAL, penalty, matrix);
+        
+        SequencePair<ProteinSequence, AminoAcidCompound> localAlign = 
+            Alignments.getPairwiseAlignment(hemoglobin, myoglobin, 
+                PairwiseSequenceAlignerType.LOCAL, penalty, matrix);
+        
+        // 4. Calculate alignment statistics
+        double globalScore = globalAlign.getScore();
+        double localScore = localAlign.getScore();
+        int numIdentical = globalAlign.getNumIdenticals();
+        double similarity = (double) numIdentical / globalAlign.getLength();
+        
+        // 5. Display results
+        System.out.println("Global Alignment Score: " + globalScore);
+        System.out.println("Local Alignment Score: " + localScore);
+        System.out.println("Sequence Identity: " + (similarity * 100) + "%");
+        System.out.println("\nGlobal Alignment:");
+        System.out.println(globalAlign.toString(60));
+    }
+    
+    private static ProteinSequence getSequenceForId(String uniProtId) throws Exception {
+        URL uniprotFasta = new URL(String.format(
+            "http://www.uniprot.org/uniprot/%s.fasta", uniProtId));
+        return FastaReaderHelper.readFastaProteinSequence(
+            uniprotFasta.openStream()).get(uniProtId);
+    }
+}
+```
+
+This example demonstrates the complete workflow from sequence retrieval to alignment and analysis, showing how BioJava integrates seamlessly with other bioinformatics tasks.
+
+## Conclusion
+
+BioJava's sequence alignment module provides a powerful, flexible framework for both pairwise and multiple sequence alignments. By implementing classic algorithms like Needleman-Wunsch and Smith-Waterman with a modern, object-oriented approach, BioJava makes sophisticated sequence analysis accessible to all developers.
+
+Whether you're performing quick pairwise comparisons or building complex phylogenetic analyses, BioJava's alignment tools offer the performance and flexibility you need. The key to success lies in understanding your biological question and choosing the appropriate algorithm, parameters, and scoring methods for your specific use case.
+
+
+# Genome Analysis
+
+
+
+Genome analysis is a fundamental aspect of bioinformatics that involves studying the structure, function, and evolution of genomes. BioJava provides comprehensive tools for genome analysis through its `biojava-genome` module, which enables researchers to parse, manipulate, and analyze genomic data efficiently. This module serves as a bridge between raw genomic data and meaningful biological insights.
+
+## Understanding Genome Analysis in BioJava
+
+The genome analysis capabilities in BioJava are centered around the concept of **gene features** - structured representations of genomic elements such as genes, exons, introns, and coding sequences (CDS). These features allow researchers to work with genome annotations in a standardized, programmatic way.
+
+BioJava's genome analysis module is particularly powerful because it supports multiple annotation formats from various gene prediction tools, making it a versatile solution for comparative genomics and annotation studies. Whether you're working with model organisms or newly sequenced genomes, BioJava provides the tools to extract and analyze genomic features effectively.
+
+## Key Components of Genome Analysis
+
+### Core Data Structures
+
+At the heart of BioJava's genome analysis are several key data structures that represent genomic features:
+
+1. **ChromosomeSequence**: Represents a chromosome or contig sequence with associated gene features
+2. **GeneSequence**: Represents a gene with its location, strand, and associated transcripts
+3. **TranscriptSequence**: Represents a transcript with its exons, CDS regions, and UTRs
+4. **ProteinSequence**: Represents the protein product translated from a transcript
+
+These structures form a hierarchical relationship that mirrors the biological organization of genomic information.
+
+### Annotation Format Support
+
+BioJava supports parsing genome annotations from multiple formats and tools:
+
+| Format/Tool | Description | Use Case |
+|-------------|-------------|----------|
+| GFF3 | Generic Feature Format version 3 | Standard annotation format |
+| GFF2 | Generic Feature Format version 2 | Legacy format support |
+| GTF | Gene Transfer Format | Gene prediction outputs |
+| GeneID | Gene prediction tool output | Eukaryotic gene prediction |
+| Glimmer | Gene prediction tool output | Prokaryotic gene prediction |
+| GeneMark | Gene prediction tool output | Prokaryotic/eukaryotic prediction |
+
+This multi-format support ensures compatibility with various genome annotation pipelines and tools.
+
+## Practical Genome Analysis with BioJava
+
+### Loading Genomic Data
+
+The most common starting point for genome analysis is loading genomic sequences along with their annotations. BioJava's `GeneFeatureHelper` class provides convenient methods for this:
+
+```java
+// Load FASTA sequences and GFF3 annotations
+Map<String, ChromosomeSequence> chromosomeSequences = 
+    GeneFeatureHelper.loadFastaAddGeneFeaturesFromGmodGFF3(
+        new File("genome.fasta"), 
+        new File("annotations.gff3"), 
+        false
+    );
+```
+
+This method reads both the genomic sequences in FASTA format and their annotations in GFF3 format, creating a structured representation of the genome with all its features.
+
+### Extracting Protein Sequences
+
+Once you have loaded the genomic data, you can easily extract protein sequences from the annotated genes:
+
+```java
+// Extract all protein sequences from the genome
+LinkedHashMap<String, ProteinSequence> proteinSequences = 
+    GeneFeatureHelper.getProteinSequences(chromosomeSequences.values());
+
+// Write protein sequences to a FASTA file
+FastaWriterHelper.writeProteinSequence(
+    new File("proteins.faa"), 
+    proteinSequences.values()
+);
+```
+
+This capability is particularly useful for downstream analyses such as protein function prediction, homology searches, and comparative genomics.
+
+### Working with Gene Features
+
+BioJava provides fine-grained access to individual gene features, allowing for detailed analysis:
+
+```java
+// Iterate through all genes in a chromosome
+for (GeneSequence gene : chromosomeSequences.get("chr1").getGeneSequences().values()) {
+    System.out.println("Gene: " + gene.getAccession().getID());
+    System.out.println("Location: " + gene.getBioBegin() + "-" + gene.getBioEnd());
+    System.out.println("Strand: " + gene.getStrand());
+    
+    // Iterate through transcripts
+    for (TranscriptSequence transcript : gene.getTranscripts().values()) {
+        System.out.println("  Transcript: " + transcript.getAccession().getID());
+        
+        // Get protein sequence
+        ProteinSequence protein = transcript.getProteinSequence();
+        System.out.println("  Protein length: " + protein.getLength());
+    }
+}
+```
+
+This level of detail enables researchers to perform sophisticated analyses of gene structure, alternative splicing, and protein-coding potential.
+
+## Advanced Genome Analysis Features
+
+### Custom Annotation Processing
+
+BioJava allows for custom processing of genome annotations through its flexible feature system. For example, you can filter genes based on specific criteria:
+
+```java
+// Filter genes by length
+List<GeneSequence> longGenes = new ArrayList<>();
+for (ChromosomeSequence chr : chromosomeSequences.values()) {
+    for (GeneSequence gene : chr.getGeneSequences().values()) {
+        if (gene.getLength() > 10000) { // Genes longer than 10kb
+            longGenes.add(gene);
+        }
+    }
+}
+```
+
+### Genome Statistics
+
+BioJava provides utilities for calculating genome-wide statistics:
+
+```java
+// Calculate gene density per chromosome
+for (String chrName : chromosomeSequences.keySet()) {
+    ChromosomeSequence chr = chromosomeSequences.get(chrName);
+    int geneCount = chr.getGeneSequences().size();
+    double chrLength = chr.getLength();
+    double density = geneCount / (chrLength / 1000000.0); // genes per Mb
+    
+    System.out.printf("Chromosome %s: %d genes, %.2f genes/Mb%n", 
+                     chrName, geneCount, density);
+}
+```
+
+## Internal Architecture
+
+### Feature Processing Pipeline
+
+BioJava's genome analysis follows a well-defined pipeline for processing genomic annotations:
+
+```mermaid
+flowchart TD
+    A[FASTA File] --> C[GeneFeatureHelper]
+    B[GFF/GTF File] --> C
+    C --> D[ChromosomeSequence Objects]
+    D --> E[GeneSequence Objects]
+    E --> F[TranscriptSequence Objects]
+    F --> G[ProteinSequence Objects]
+    G --> H[Downstream Analysis]
+```
+
+This pipeline ensures that genomic data is processed systematically and consistently, regardless of the input format.
+
+### Parser Architecture
+
+The parser system is designed to be extensible, with separate parsers for different annotation formats:
+
+```mermaid
+classDiagram
+    class GFF3Reader {
+        +read(String filename) FeatureList
+        +parseLine(String line) Feature
+    }
+    
+    class GeneIDGFF2Reader {
+        +read(String filename) FeatureList
+    }
+    
+    class GeneMarkGTFReader {
+        +read(String filename) FeatureList
+    }
+    
+    class FeatureList {
+        +add(FeatureI feature)
+        +selectByType(String type) FeatureList
+        +selectByAttribute(String key, String value) FeatureList
+    }
+    
+    GFF3Reader --> FeatureList
+    GeneIDGFF2Reader --> FeatureList
+    GeneMarkGTFReader --> FeatureList
+```
+
+This architecture allows for easy addition of new parsers as new annotation formats emerge.
+
+> [!TIP]
+> When working with large genome files, consider using the lazy loading option available in some methods to reduce memory usage. This is particularly important for mammalian genomes which can be quite large.
+
+## Best Practices for Genome Analysis
+
+1. **Validate Input Data**: Always check that your FASTA and annotation files are compatible and properly formatted before processing.
+2. **Handle Memory Wisely**: For large genomes, use lazy loading when available and process chromosomes sequentially when possible.
+3. **Check Strand Information**: Pay attention to strand information when analyzing gene features, as it affects the interpretation of start/end positions.
+4. **Use Appropriate Data Structures**: Choose the right data structure for your analysis - ChromosomeSequence for whole-genome analyses, GeneSequence for gene-focused studies.
+
+## Conclusion
+
+BioJava's genome analysis module provides a comprehensive toolkit for genomic research. Its support for multiple annotation formats, hierarchical feature representation, and extensible architecture make it suitable for a wide range of genome analysis tasks. From basic gene extraction to complex comparative genomics, BioJava offers the tools needed to transform raw genomic data into biological insights.
+
+
+# Amino Acid Properties
+
+
+
+Understanding the physico-chemical properties of amino acids is fundamental to protein analysis in bioinformatics. BioJava's amino acid properties module provides a comprehensive toolkit for calculating various characteristics of protein sequences, from basic molecular weight to complex structural predictions. This guide will walk you through the essential properties you can compute and how to use them in your bioinformatics workflows.
+
+## Why Amino Acid Properties Matter
+
+Amino acid properties are the building blocks of protein function and structure. They determine how proteins fold, interact with other molecules, and perform their biological roles. By analyzing these properties, you can:
+
+- Predict protein stability and behavior in different environments
+- Understand protein-protein interactions
+- Design experiments for protein purification and characterization
+- Identify potential functional regions in protein sequences
+
+BioJava's amino acid properties module makes these calculations accessible through a clean, intuitive API that integrates seamlessly with the rest of the BioJava framework.
+
+## Core Properties You Can Calculate
+
+The module provides access to a wide range of physico-chemical properties through the `IPeptideProperties` interface. Let's explore the most commonly used ones:
+
+### Molecular Weight
+
+Molecular weight is one of the most fundamental properties of any protein. It's essential for determining protein concentration, designing experiments, and understanding protein behavior.
+
+```java
+ProteinSequence sequence = new ProteinSequence("VLSPADKTNVKAAWGKVGAHAG");
+double molecularWeight = PeptideProperties.getMolecularWeight(sequence.toString());
+System.out.println("Molecular weight: " + molecularWeight + " Da");
+```
+
+The calculation includes the weight of a water molecule, as this represents the complete weight of the protein as it would exist in solution. The molecular weights are based on standard values from the EXPASY database, ensuring accuracy and consistency with other bioinformatics tools.
+Sources: [IPeptideProperties.java#L55-L64](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/IPeptideProperties.java#L55-L64), [PeptideProperties.java#L84-L95](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/PeptideProperties.java#L84-L95)
+
+### Isoelectric Point (pI)
+
+The isoelectric point is the pH at which a protein carries no net electrical charge. This property is crucial for understanding protein solubility and for designing purification strategies like isoelectric focusing.
+
+```java
+ProteinSequence sequence = new ProteinSequence("VLSPADKTNVKAAWGKVGAHAG");
+double pI = PeptideProperties.getIsoelectricPoint(sequence.toString());
+System.out.println("Isoelectric point: " + pI);
+```
+
+BioJava offers two sets of pKa values for calculation: the default Expasy values and Innovagen values. You can choose which set to use based on your specific needs:
+Sources: [IPeptideProperties.java#L235-L255](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/IPeptideProperties.java#L235-L255)
+
+### Net Charge at Specific pH
+
+Understanding a protein's charge at different pH values is essential for predicting its behavior in various experimental conditions.
+
+```java
+ProteinSequence sequence = new ProteinSequence("VLSPADKTNVKAAWGKVGAHAG");
+double netCharge = PeptideProperties.getNetCharge(sequence.toString(), 7.0);
+System.out.println("Net charge at pH 7.0: " + netCharge);
+```
+
+This calculation uses established pKa values for ionizable amino acid side chains and considers both N-terminal and C-terminal charges.
+Sources: [IPeptideProperties.java#L258-L282](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/IPeptideProperties.java#L258-L282)
+
+### Extinction Coefficient and Absorbance
+
+These properties are vital for protein quantification using spectrophotometry. The extinction coefficient tells you how much light a protein absorbs at a specific wavelength (typically 280 nm), which is directly related to its concentration.
+
+```java
+ProteinSequence sequence = new ProteinSequence("VLSPADKTNVKAAWGKVGAHAG");
+boolean assumeCysReduced = true; // or false if cystines are formed
+double extinctionCoeff = PeptideProperties.getExtinctionCoefficient(sequence.toString(), assumeCysReduced);
+double absorbance = PeptideProperties.getAbsorbance(sequence.toString(), assumeCysReduced);
+
+System.out.println("Extinction coefficient: " + extinctionCoeff);
+System.out.println("Absorbance: " + absorbance);
+```
+
+The calculation considers the contribution of aromatic amino acids (Tryptophan, Tyrosine) and cysteine residues, with the option to specify whether cysteines are reduced or form disulfide bonds.
+Sources: [IPeptideProperties.java#L153-L185](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/IPeptideProperties.java#L153-L185)
+
+### Instability Index
+
+The instability index provides an estimate of protein stability in vitro. This is particularly useful for predicting whether a protein will remain stable during purification and storage.
+
+```java
+ProteinSequence sequence = new ProteinSequence("VLSPADKTNVKAAWGKVGAHAG");
+double instabilityIndex = PeptideProperties.getInstabilityIndex(sequence.toString());
+System.out.println("Instability index: " + instabilityIndex);
+
+if (instabilityIndex < 40) {
+    System.out.println("Predicted to be stable");
+} else {
+    System.out.println("May be unstable");
+}
+```
+
+A value below 40 suggests the protein is stable, while values above 40 indicate potential instability.
+Sources: [IPeptideProperties.java#L188-L199](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/IPeptideProperties.java#L188-L199)
+
+### Aliphatic Index
+
+The aliphatic index measures the relative volume occupied by aliphatic side chains (Alanine, Valine, Isoleucine, and Leucine). This property correlates with protein thermostability - proteins with higher aliphatic indices tend to be more stable at higher temperatures.
+
+```java
+ProteinSequence sequence = new ProteinSequence("VLSPADKTNVKAAWGKVGAHAG");
+double aliphaticIndex = PeptideProperties.getApliphaticIndex(sequence.toString());
+System.out.println("Aliphatic index: " + aliphaticIndex);
+```
+Sources: [IPeptideProperties.java#L202-L216](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/IPeptideProperties.java#L202-L216)
+
+### Average Hydropathy
+
+Hydropathy values indicate the hydrophobic or hydrophilic nature of amino acids. The average hydropathy of a protein sequence can reveal insights about its potential membrane association or solubility.
+
+```java
+ProteinSequence sequence = new ProteinSequence("VLSPADKTNVKAAWGKVGAHAG");
+double avgHydropathy = PeptideProperties.getAvgHydropathy(sequence.toString());
+System.out.println("Average hydropathy: " + avgHydropathy);
+```
+
+These values are based on the widely used Kyte-Doolittle scale, where positive values indicate hydrophobicity and negative values indicate hydrophilicity.
+Sources: [IPeptideProperties.java#L219-L232](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/IPeptideProperties.java#L219-L232)
+
+### Amino Acid Composition
+
+Understanding the composition of amino acids in your protein can provide insights into its function and properties.
+
+```java
+ProteinSequence sequence = new ProteinSequence("VLSPADKTNVKAAWGKVGAHAG");
+
+// Get composition of a specific amino acid
+AminoAcidCompoundSet aaSet = new AminoAcidCompoundSet();
+AminoAcidCompound alanine = aaSet.getCompoundForString("A");
+double alanineComposition = PeptideProperties.getEnrichment(sequence.toString(), alanine);
+System.out.println("Alanine composition: " + alanineComposition);
+
+// Get composition of all 20 standard amino acids
+Map<AminoAcidCompound, Double> allCompositions = PeptideProperties.getAAComposition(sequence.toString());
+System.out.println("All amino acid compositions: " + allCompositions);
+```
+Sources: [IPeptideProperties.java#L284-L314](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/IPeptideProperties.java#L284-L314)
+
+## Advanced Properties with PROFEAT
+
+Beyond the basic properties, BioJava also integrates PROFEAT functionality, which provides more sophisticated protein feature calculations. PROFEAT converts amino acid sequences into various physico-chemical attributes and calculates composition, transition, and distribution features.
+
+The seven main attributes in PROFEAT are:
+- Hydrophobicity (Polar, Neutral, Hydrophobic)
+- Normalized van der Waals volume
+- Polarity
+- Polarizability
+- Charge (Positive, Neutral, Negative)
+- Secondary structure propensity
+- Solvent accessibility
+
+```java
+ProteinSequence sequence = new ProteinSequence("VLSPADKTNVKAAWGKVGAHAG");
+IProfeatProperties profeat = new ProfeatPropertiesImpl();
+
+// Get composition for a specific attribute
+Map<GROUPING, Double> hydrophobicityComp = profeat.getComposition(sequence, ATTRIBUTE.HYDROPHOBICITY);
+System.out.println("Hydrophobicity composition: " + hydrophobicityComp);
+
+// Get all properties for all attributes
+Map<ATTRIBUTE, Map<GROUPING, Double>> allProperties = profeat.getComposition(sequence);
+System.out.println("All PROFEAT properties: " + allProperties);
+```
+Sources: [IProfeatProperties.java#L28-L43](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/profeat/IProfeatProperties.java#L28-L43)
+
+## How BioJava Calculates These Properties
+
+Behind the scenes, BioJava uses carefully curated data and established algorithms to ensure accuracy. The `Constraints` class contains predefined values for amino acid properties, including molecular weights, hydropathy values, and pKa constants.
+
+```mermaid
+flowchart TD
+    A[ProteinSequence Input] --> B[PeptideProperties]
+    B --> C{Property Type}
+    C -->|Molecular Weight| D[Sum individual AA weights + H2O]
+    C -->|Isoelectric Point| E[Calculate pKa values and find pH where net charge = 0]
+    C -->|Extinction Coefficient| F[Sum contributions from Trp, Tyr, Cys]
+    C -->|Instability Index| G[Use dipeptide instability values]
+    C -->|Hydropathy| H[Average Kyte-Doolittle values]
+    D --> I[Return Result]
+    E --> I
+    F --> I
+    G --> I
+    H --> I
+```
+
+The molecular weight calculation, for example, sums the individual weights of each amino acid and adds the weight of a water molecule (18.015 Da) to represent the complete protein as it exists in solution. These values are sourced from authoritative databases like EXPASY to ensure consistency with other bioinformatics tools.
+Sources: [Constraints.java#L87-L100](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/Constraints.java#L87-L100), [PeptidePropertiesImpl.java#L73-L87](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/PeptidePropertiesImpl.java#L73-L87)
+
+## Customizing Calculations with XML Files
+
+For specialized applications, BioJava allows you to use custom XML files to define amino acid properties. This is particularly useful when working with non-standard amino acids or when you need to use specific values from the literature.
+
+```java
+// Use custom amino acid composition file
+File customAAFile = new File("path/to/custom/composition.xml");
+double customMW = PeptideProperties.getMolecularWeight(sequence.toString(), customAAFile);
+
+// Or use both custom element mass and amino acid composition files
+File elementMassFile = new File("path/to/element/mass.xml");
+File aaCompositionFile = new File("path/to/aa/composition.xml");
+double fullyCustomMW = PeptideProperties.getMolecularWeight(sequence.toString(), elementMassFile, aaCompositionFile);
+```
+
+This flexibility makes BioJava adaptable to various research needs and allows for reproducible science with clearly defined parameters.
+Sources: [IPeptideProperties.java#L83-L103](biojava-aa-prop/src/main/java/org/biojava/nbio/aaproperties/IPeptideProperties.java#L83-L103)
+
+> [!TIP]
+> When working with protein sequences, always ensure your input contains only standard amino acid codes (A, C, D, E, F, G, H, I, K, L, M, N, P, Q, R, S, T, V, W, Y). BioJava will validate sequences and throw exceptions for invalid characters, helping you catch errors early in your analysis.
+
+## Practical Applications
+
+These amino acid properties calculations have numerous real-world applications:
+
+1. **Protein Purification**: Use isoelectric point to design ion-exchange chromatography protocols
+2. **Protein Engineering**: Modify sequences to achieve desired stability or solubility characteristics
+3. **Drug Design**: Understand how mutations might affect protein-drug interactions
+4. **Structural Biology**: Predict regions that might be difficult to crystallize based on sequence properties
+5. **Metabolic Engineering**: Design enzymes with optimal properties for industrial processes
+
+By integrating these calculations into your bioinformatics workflows, you can gain deeper insights into protein function and behavior, ultimately accelerating your research and discovery processes.
+
+## Getting Started
+
+To begin using amino acid properties in BioJava, you'll need to include the `biojava-aa-prop` module in your project. The static methods in `PeptideProperties` provide the easiest entry point, while the `IPeptideProperties` interface offers more flexibility for advanced use cases.
+
+```java
+// Simple example to get started
+ProteinSequence sequence = new ProteinSequence("MVLSEGEWQLVLHVWAKVEADVAGHGQDILIRLFKSHPETLEKFDRVKHLKTEAEMKASEDLKKAGVTVLTALGAILKKKGHHEAELKPLAQSHATKHKIPIKYLEFISEAIIHVLHSRHPGDFGADAQGAMNKALELFRKDIAAKYKELGYQG");
+System.out.println("Molecular weight: " + PeptideProperties.getMolecularWeight(sequence.toString()));
+System.out.println("Isoelectric point: " + PeptideProperties.getIsoelectricPoint(sequence.toString()));
+System.out.println("Instability index: " + PeptideProperties.getInstabilityIndex(sequence.toString()));
+```
+
+This example demonstrates how quickly you can extract valuable information from protein sequences using BioJava's amino acid properties module.
+Sources: [BioJavaAADemo.java#L35-L41](biojava-aa-prop/src/main/java/demo/BioJavaAADemo.java#L35-L41)
+
+## Conclusion
+
+BioJava's amino acid properties module provides a comprehensive, well-documented, and scientifically accurate toolkit for protein sequence analysis. Whether you're a beginner just starting with bioinformatics or an experienced researcher working on complex protein engineering projects, this module offers the functionality you need with the flexibility to adapt to specialized requirements.
+
+By understanding and leveraging these physico-chemical properties, you can gain deeper insights into protein function, stability, and behavior - ultimately accelerating your research and discovery processes in the exciting field of bioinformatics.
+
+# Protein Structure Analysis
+
+
+
+Protein structure analysis is a fundamental aspect of bioinformatics that helps researchers understand the three-dimensional organization of proteins and how their structure relates to function. BioJava provides a comprehensive set of tools for protein structure analysis, allowing you to load, manipulate, analyze, and visualize protein structures with ease.
+
+## Why Protein Structure Analysis Matters
+
+Proteins are the workhorses of biological systems, and their three-dimensional structure is crucial for understanding their function. By analyzing protein structures, researchers can:
+
+- Identify active sites and binding pockets
+- Understand protein-protein interactions
+- Discover evolutionary relationships between proteins
+- Predict the effects of mutations on protein function
+- Design new drugs and therapeutic agents
+
+BioJava's protein structure analysis module provides a powerful framework for all these tasks and more.
+
+## Core Concepts in Protein Structure Representation
+
+Before diving into the code, it's essential to understand how BioJava represents protein structures. The framework follows a hierarchical organization that mirrors the actual structure of proteins:
+
+```
+Structure (entire PDB file)
+    |
+    Model (for NMR structures, multiple models; for X-ray, usually one)
+        |
+        Chain (polypeptide chain)
+            |
+            Group (amino acid, nucleotide, or ligand)
+                |
+                Atom (individual atoms with coordinates)
+```
+
+This hierarchical representation allows you to navigate and manipulate protein structures at any level of detail, from entire complexes down to individual atoms. The `Structure` class serves as the main entry point for working with protein data in BioJava. `Sources: [Structure.java#L26-L76](biojava-structure/src/main/java/org/biojava/nbio/structure/Structure.java#L26-L76)`
+
+## Loading Protein Structures
+
+The first step in protein structure analysis is loading the structure data. BioJava provides multiple ways to load structures, depending on your needs:
+
+### Loading from PDB ID
+
+The simplest way to load a structure is by its PDB identifier:
+
+```java
+// Load a structure by its PDB ID
+Structure structure = StructureIO.getStructure("1gav");
+System.out.println("Loaded structure: " + structure.getPDBCode());
+System.out.println("Number of atoms: " + StructureTools.getNrAtoms(structure));
+```
+
+This code fetches the structure directly from the PDB database, making it ideal for quick analyses without needing local files. `Sources: [DemoLoadStructure.java#L36-L42](biojava-structure/src/main/java/demo/DemoLoadStructure.java#L36-L42)`
+
+### Loading from Local Files
+
+For working with local PDB files or when you need more control over the parsing process:
+
+```java
+PDBFileReader reader = new PDBFileReader();
+reader.setPath("/path/to/pdb/files");
+
+// Configure parsing parameters
+FileParsingParameters params = new FileParsingParameters();
+params.setAlignSeqRes(true);      // Align ATOM and SEQRES records
+params.setParseSecStruc(false);   // Don't parse secondary structure
+reader.setFileParsingParameters(params);
+
+// Load structure by ID
+Structure structure = reader.getStructureById("4hhb");
+```
+
+This approach gives you fine-grained control over how the structure is parsed and is useful when working with modified or custom PDB files. `Sources: [DemoLoadStructure.java#L56-L76](biojava-structure/src/main/java/demo/DemoLoadStructure.java#L56-L76)`
+
+### Using the AtomCache for Efficient Loading
+
+For applications that need to load multiple structures repeatedly, the AtomCache provides significant performance improvements:
+
+```java
+// Enable caching (default is true when using AtomCache)
+System.setProperty(InputStreamProvider.CACHE_PROPERTY, "true");
+AtomCache cache = new AtomCache();
+
+// Load structures
+Structure s = cache.getStructure("4hhb");
+Atom[] caAtoms = cache.getAtoms("4hhb.A");  // Get CA atoms of chain A
+```
+
+The AtomCache automatically handles downloading and caching structures, making it ideal for applications that need to access many structures efficiently. `Sources: [DemoLoadStructure.java#L86-L107](biojava-structure/src/main/java/demo/DemoLoadStructure.java#L86-L107)`
+
+> [!TIP]
+> When working with multiple structures, always use the AtomCache. It provides automatic caching and can significantly improve performance, especially when analyzing large datasets of protein structures.
+
+## Navigating and Analyzing Protein Structures
+
+Once you've loaded a structure, you can navigate its hierarchy and extract useful information:
+
+```java
+// Get the first chain from the structure
+Chain chain = structure.getChainByIndex(0);
+System.out.println("First chain: " + chain.getName());
+
+// Get all amino acid groups from the chain
+List<Group> aminoAcids = chain.getAtomGroups(GroupType.AMINOACID);
+
+// Iterate through amino acids and access atoms
+for (Group group : aminoAcids) {
+    AminoAcid aa = (AminoAcid) group;
+    System.out.println("Residue: " + aa.getPDBName() + " " + aa.getResidueNumber());
+    
+    // Get the CA atom
+    Atom ca = aa.getCA();
+    if (ca != null) {
+        System.out.println("  CA coordinates: " + ca.getCoords());
+    }
+}
+```
+
+This example shows how to navigate the structure hierarchy and access specific atoms within amino acids. `Sources: [Structure.java#L42-L76](biojava-structure/src/main/java/org/biojava/nbio/structure/Structure.java#L42-L76)`
+
+## Secondary Structure Analysis
+
+Secondary structure elements (SSEs) like alpha-helices and beta-sheets are fundamental features of protein structure. BioJava provides tools for calculating and analyzing secondary structure:
+
+```java
+// Load structure
+AtomCache cache = new AtomCache();
+Structure s = cache.getStructure("5pti");
+
+// Calculate secondary structure
+SecStrucCalc ssp = new SecStrucCalc();
+ssp.calculate(s, true);
+
+// Print DSSP-style output
+System.out.println("DSSP output:");
+System.out.println(ssp.printDSSP());
+
+// Get secondary structure elements
+List<SecStrucElement> sse = SecStrucTools.getSecStrucElements(s);
+System.out.println("\nSecondary Structure Elements:");
+for (SecStrucElement e : sse) {
+    System.out.println(e);
+}
+```
+
+BioJava's secondary structure calculation is based on the DSSP algorithm and provides detailed information about hydrogen bonding patterns and secondary structure assignments. `Sources: [DemoSecStrucCalc.java#L35-L56](biojava-structure/src/main/java/demo/DemoSecStrucCalc.java#L35-L56)`
+
+## Protein Structure Alignment
+
+Comparing protein structures is essential for understanding evolutionary relationships and functional similarities. BioJava provides several algorithms for structure alignment, including the CE (Combinatorial Extension) algorithm:
+
+```java
+// Load two structures for comparison
+AtomCache cache = new AtomCache();
+Structure structure1 = cache.getStructure("1cdg.A");
+Structure structure2 = cache.getStructure("1tim.B");
+
+// Get CA atoms for alignment
+Atom[] ca1 = StructureTools.getAtomCAArray(structure1);
+Atom[] ca2 = StructureTools.getAtomCAArray(structure2);
+
+// Configure alignment parameters
+CeParameters params = new CeParameters();
+params.setShowAFPRanges(true);
+params.setMaxGapSize(-1);  // Unlimited gap size
+
+// Perform alignment
+StructureAlignment algorithm = StructureAlignmentFactory.getAlgorithm(CeMain.algorithmName);
+AFPChain afpChain = algorithm.align(ca1, ca2, params);
+
+// Print alignment scores
+System.out.println("Alignment RMSD: " + afpChain.getTotalRmsdOpt());
+System.out.println("Alignment TM-score: " + afpChain.getTMScore());
+System.out.println("Sequence identity: " + afpChain.getIdentity() + "%");
+```
+
+Structure alignment in BioJava provides comprehensive metrics including RMSD, TM-score, sequence identity, and coverage, allowing you to thoroughly assess the similarity between protein structures. `Sources: [DemoCE.java#L42-L70](biojava-structure/src/main/java/demo/DemoCE.java#L42-L70)`
+
+## Advanced Structure Analysis
+
+### Calculating Geometric Properties
+
+BioJava provides tools for calculating various geometric properties of protein structures:
+
+```java
+// Calculate phi and psi angles
+Chain chain = structure.getChain(0);
+List<Group> groups = chain.getAtomGroups(GroupType.AMINOACID);
+
+for (int i = 0; i < groups.size(); i++) {
+    AminoAcid current = (AminoAcid) groups.get(i);
+    double phi = 360.0;
+    double psi = 360.0;
+    
+    if (i > 0) {
+        AminoAcid prev = (AminoAcid) groups.get(i - 1);
+        phi = Calc.getPhi(prev, current);
+    }
+    if (i < groups.size() - 1) {
+        AminoAcid next = (AminoAcid) groups.get(i + 1);
+        psi = Calc.getPsi(current, next);
+    }
+    
+    System.out.printf("%s %s: phi=%+7.2f, psi=%+7.2f%n", 
+        current.getPDBCode(), current.getPDBName(), phi, psi);
+}
+```
+
+This example demonstrates how to calculate backbone dihedral angles, which are crucial for understanding protein conformation. `Sources: [Structure.java#L49-L76](biojava-structure/src/main/java/org/biojava/nbio/structure/Structure.java#L49-L76)`
+
+### Working with Biological Assemblies
+
+Many proteins function as multimers, and BioJava provides tools for working with biological assemblies:
+
+```java
+// Load asymmetric unit
+Structure s1 = StructureIO.getStructure("1gav");
+System.out.println("Asymmetric unit atoms: " + StructureTools.getNrAtoms(s1));
+
+// Load biological assembly
+Structure s2 = StructureIO.getBiologicalAssembly("1gav");
+System.out.println("Biological assembly atoms: " + StructureTools.getNrAtoms(s2));
+```
+
+This shows how to access both the asymmetric unit (the contents of the PDB file) and the biologically relevant assembly of the protein. `Sources: [DemoLoadStructure.java#L36-L47](biojava-structure/src/main/java/demo/DemoLoadStructure.java#L36-L47)`
+
+## Visualizing Protein Structures
+
+While the core structure module provides the data analysis capabilities, the `biojava-structure-gui` module offers visualization tools. This module integrates with Jmol, a popular Java-based molecular viewer:
+
+```xml
+<!-- Maven dependency for structure GUI -->
+<dependency>
+    <groupId>org.biojava</groupId>
+    <artifactId>biojava-structure-gui</artifactId>
+    <version>7.2.3-SNAPSHOT</version>
+</dependency>
+```
+
+The GUI module provides components for embedding structure visualization in Java applications, making it easy to build interactive tools for protein structure analysis. `Sources: [pom.xml#L31-41](biojava-structure-gui/pom.xml#L31-41)`
+
+## Common Analysis Workflows
+
+Here are some common workflows for protein structure analysis:
+
+### 1. Structure Quality Assessment
+
+```java
+// Load structure
+Structure structure = StructureIO.getStructure("1xyz");
+
+// Check for missing atoms
+List<Chain> chains = structure.getChains();
+for (Chain chain : chains) {
+    List<Group> residues = chain.getAtomGroups();
+    for (Group residue : residues) {
+        if (residue instanceof AminoAcid) {
+            AminoAcid aa = (AminoAcid) residue;
+            if (aa.getCA() == null) {
+                System.out.println("Missing CA in " + aa.getResidueNumber());
+            }
+        }
+    }
+}
+```
+
+### 2. Active Site Analysis
+
+```java
+// Find residues within a certain distance of a ligand
+Group ligand = structure.getChainByPDB("A").getGroupByResidueNumber("HOH", 100);
+double cutoffDistance = 5.0; // Angstroms
+
+for (Chain chain : structure.getChains()) {
+    for (Group residue : chain.getAtomGroups()) {
+        if (residue instanceof AminoAcid) {
+            double distance = Calc.getDistance(ligand, residue);
+            if (distance < cutoffDistance) {
+                System.out.println("Residue " + residue.getResidueNumber() + 
+                                 " is " + distance + "A from ligand");
+            }
+        }
+    }
+}
+```
+
+## Best Practices for Protein Structure Analysis
+
+When working with protein structures in BioJava, keep these best practices in mind:
+
+1. **Use the AtomCache** for repeated access to structures to improve performance
+2. **Check for null values** when accessing atoms or groups, as some may be missing in the structure
+3. **Work with CA atoms** for structure alignment and comparisons when full atomic detail isn't needed
+4. **Consider biological assemblies** when studying protein function, as many proteins operate as multimers
+5. **Validate your results** by comparing with known structural features or literature
+
+> [!TIP]
+> Always validate your structure analysis results by checking against known features or literature. Protein structures can have errors or missing regions, and it's important to verify that your analysis is working correctly.
+
+## Conclusion
+
+BioJava provides a comprehensive toolkit for protein structure analysis, from basic structure loading and navigation to advanced calculations like secondary structure assignment and structure alignment. By understanding the hierarchical representation of protein structures and leveraging BioJava's extensive API, you can build powerful applications for structural bioinformatics research.
+
+Whether you're studying protein-ligand interactions, comparing evolutionary related proteins, or analyzing structural features, BioJava's protein structure module provides the tools you need to get started quickly and dive deep into structural analysis.
+
+# Protein Disorder Prediction
+
+
+
+Protein disorder prediction is a crucial aspect of bioinformatics that helps identify regions within proteins that lack a fixed three-dimensional structure. These intrinsically disordered regions (IDRs) play significant roles in protein function, signaling, and disease mechanisms. BioJava's protein disorder prediction module, based on the Regional Order Neural Network (RONN) algorithm, provides developers with powerful tools to analyze protein sequences and predict disordered regions.
+
+## Understanding Protein Disorder
+
+Proteins are traditionally viewed as having well-defined three-dimensional structures that determine their functions. However, it's now known that many proteins contain regions that are **intrinsically disordered**—these segments don't adopt a fixed structure but instead exist as dynamic ensembles of conformations. Disordered regions are essential for many biological processes, including molecular recognition, signaling, and regulation.
+
+The BioJava protein disorder module implements the RONN algorithm, which uses a neural network approach to predict the probability of disorder for each residue in a protein sequence. The algorithm analyzes sequence patterns and compares them against known structured and disordered regions to make predictions.
+
+## Getting Started with Jronn
+
+The primary API for protein disorder prediction in BioJava is the `Jronn` class, which provides a simple, intuitive interface for predicting disordered regions. This class loads prediction models automatically and offers several methods for analyzing protein sequences.
+
+```java
+import org.biojava.nbio.ronn.Jronn;
+import org.biojava.nbio.core.sequence.ProteinSequence;
+
+// Create a protein sequence
+ProteinSequence sequence = new ProteinSequence("MAEGEITTFTALTEKFNLPPGNYKKPKLLYCSNGGHFLRILPDGTVDGTRDRSDQHIQLQLSAESVGEVYIKSTETGQYLAMDTSGLLYGSQTPSEECLFLERLEENHYNTYTSKKHAEKNWFVGLKKNGSCKRGPRTHYGQKAILFLPLPV");
+
+// Get disorder scores for each residue
+float[] disorderScores = Jronn.getDisorderScores(sequence);
+```
+
+The `getDisorderScores()` method returns an array of float values where each value represents the probability (0.0 to 1.0) that the corresponding residue in the sequence is disordered. Generally, values greater than 0.5 indicate a higher likelihood of disorder.
+
+Sources: [Jronn.java#L135-L137](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/Jronn.java#L135-L137), [PredictDisorder.java#L46-L48](biojava-protein-disorder/src/main/java/demo/PredictDisorder.java#L46-L48)
+
+## Identifying Disordered Regions
+
+While individual residue scores are useful, you'll often want to identify contiguous regions of disorder. The `Jronn` class provides methods to convert raw scores into defined disordered regions:
+
+```java
+import org.biojava.nbio.ronn.Jronn.Range;
+
+// Get disordered regions as ranges
+Range[] disorderedRegions = Jronn.getDisorder(sequence);
+
+// Process the results
+for (Range region : disorderedRegions) {
+    System.out.println("Disordered region from position " + region.from + 
+                      " to " + region.to + " with score " + region.score);
+}
+```
+
+The `Range` class represents a disordered region with start (`from`) and end (`to`) positions (1-indexed) along with the average disorder score for that region. This makes it easy to identify and work with functionally important disordered segments in your proteins.
+
+Sources: [Jronn.java#L199-L201](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/Jronn.java#L199-L201), [Jronn.java#L75-L92](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/Jronn.java#L75-L92)
+
+## Working with Multiple Sequences
+
+BioJava's disorder prediction module efficiently handles multiple sequences, making it suitable for high-throughput analysis:
+
+```java
+import org.biojava.nbio.data.sequence.FastaSequence;
+import java.util.List;
+import java.util.Map;
+
+// Assuming you have a list of protein sequences
+List<FastaSequence> sequences = ...; // Your list of sequences
+
+// Get disorder scores for all sequences
+Map<FastaSequence, float[]> allScores = Jronn.getDisorderScores(sequences);
+
+// Get disordered regions for all sequences
+Map<FastaSequence, Range[]> allRegions = Jronn.getDisorder(sequences);
+
+// Process results
+for (Map.Entry<FastaSequence, Range[]> entry : allRegions.entrySet()) {
+    System.out.println("Sequence: " + entry.getKey().getId());
+    for (Range region : entry.getValue()) {
+        System.out.println("  Disordered region: " + region.from + "-" + region.to);
+    }
+}
+```
+
+This approach is particularly useful when analyzing entire proteomes or large sets of proteins, as it leverages BioJava's optimized processing pipeline.
+
+Sources: [Jronn.java#L247-L250](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/Jronn.java#L247-L250), [Jronn.java#L260-L263](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/Jronn.java#L260-L263)
+
+## Understanding the Prediction Algorithm
+
+The RONN algorithm implemented in BioJava uses a neural network approach to predict disorder. Here's a simplified overview of how it works:
+
+1. **Sliding Window Analysis**: The algorithm uses a sliding window of 19 amino acids to analyze local sequence patterns.
+
+2. **Sequence Alignment**: For each window, it performs alignments against a database of known structured and disordered sequences.
+
+3. **Probability Calculation**: Based on alignment scores, it calculates the probability that the central residue in the window is disordered.
+
+4. **Model Averaging**: The final prediction is obtained by averaging results from multiple neural network models (10 models by default), improving prediction accuracy.
+
+```mermaid
+flowchart TD
+    A[Input Protein Sequence] --> B[Sliding Window Analysis]
+    B --> C[Sequence Alignment with Database]
+    C --> D[Probability Calculation]
+    D --> E[Model Averaging]
+    E --> F[Disorder Scores]
+```
+
+The algorithm uses the BLOSUM62 substitution matrix for sequence comparisons and employs statistical models to distinguish between ordered and disordered regions. The prediction models are loaded automatically when you first use the `Jronn` class.
+
+Sources: [ORonnModel.java#L75-L125](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/ORonnModel.java#L75-L125), [ORonn.java#L144-L146](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/ORonn.java#L144-L146)
+
+## Sequence Constraints and Limitations
+
+When using the protein disorder prediction module, be aware of these important constraints:
+
+- **Minimum Sequence Length**: Sequences must be at least 19 amino acids long for prediction. Shorter sequences will trigger an exception.
+  
+- **Valid Characters**: The algorithm works with standard amino acid codes. Non-standard amino acids are handled but may affect prediction accuracy.
+
+- **Ambiguous Sequences**: Sequences with ambiguous amino acids (like 'X') are processed but may generate warnings.
+
+```java
+// Checking sequence validity
+if (sequence.getLength() < RonnConstraint.MIN_SEQUENCE_LENGTH) {
+    throw new IllegalArgumentException("Sequence too short for disorder prediction");
+}
+```
+
+> [!TIP]
+> For optimal results, use sequences longer than 30 amino acids. While the minimum is 19, longer sequences provide more context for accurate predictions.
+
+Sources: [RonnConstraint.java#L155](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/RonnConstraint.java#L155), [ORonn.java#L199-L221](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/ORonn.java#L199-L221)
+
+## Customizing Prediction Parameters
+
+BioJava allows you to customize certain aspects of the disorder prediction:
+
+```java
+// Convert raw scores to ranges with a custom threshold
+float[] scores = Jronn.getDisorderScores(sequence);
+Range[] customRegions = Jronn.scoresToRanges(scores, 0.6f); // Using 0.6 as threshold
+```
+
+The default threshold for identifying disordered regions is 0.5, but you can adjust this value to be more or less stringent depending on your needs. Higher thresholds will identify fewer but more confidently predicted disordered regions.
+
+Sources: [Jronn.java#L211-L236](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/Jronn.java#L211-L236), [RonnConstraint.java#L43](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/RonnConstraint.java#L43)
+
+## Integration with BioJava Core
+
+The protein disorder module integrates seamlessly with BioJava's core sequence handling capabilities:
+
+```java
+import org.biojava.nbio.core.sequence.ProteinSequence;
+import org.biojava.nbio.core.sequence.compound.AminoAcidCompound;
+
+// Working with BioJava ProteinSequence objects
+ProteinSequence bioJavaSequence = ...; // Your BioJava sequence
+
+// Convert to FastaSequence for disorder prediction
+FastaSequence fastaSequence = Jronn.convertProteinSequencetoFasta(bioJavaSequence);
+
+// Get disorder predictions
+float[] scores = Jronn.getDisorderScores(fastaSequence);
+```
+
+This integration allows you to leverage BioJava's rich sequence manipulation features alongside disorder prediction, creating powerful analysis pipelines.
+
+Sources: [Jronn.java#L147-L151](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/Jronn.java#L147-L151), [Jronn.java#L160-L174](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/Jronn.java#L160-L174)
+
+## Performance Considerations
+
+The protein disorder prediction module is designed for performance:
+
+1. **Parallel Processing**: For large datasets, the module supports multi-threaded processing to speed up predictions.
+
+2. **Model Caching**: Prediction models are loaded once and cached for subsequent use, minimizing initialization overhead.
+
+3. **Optimized Algorithms**: The implementation uses efficient data structures and algorithms to minimize computational complexity.
+
+When processing many sequences, consider using the batch processing methods to take advantage of these optimizations. The module automatically handles thread management and resource allocation for optimal performance.
+
+Sources: [ORonn.java#L346-384](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/ORonn.java#L346-384), [Jronn.java#L57-67](biojava-protein-disorder/src/main/java/org/biojava/nbio/ronn/Jronn.java#L57-67)
+
+## Practical Applications
+
+Protein disorder prediction has numerous applications in bioinformatics research:
+
+- **Functional Annotation**: Disordered regions often correspond to functional sites in proteins.
+- **Disease Research**: Many diseases are associated with mutations in disordered regions.
+- **Protein Engineering**: Understanding disorder helps in designing proteins with desired properties.
+- **Drug Discovery**: Disordered regions can be targets for therapeutic intervention.
+
+By integrating BioJava's disorder prediction capabilities into your applications, you can leverage these insights for advanced protein analysis and research.
+
+
+# Protein Comparison Tools
+
+
+
+Protein structure comparison is a fundamental task in bioinformatics that helps scientists understand evolutionary relationships, functional similarities, and structural patterns across different proteins. BioJava provides a comprehensive suite of protein comparison tools that enable researchers to perform sophisticated structural analyses with ease.
+
+## Understanding Protein Structure Comparison
+
+Protein structure comparison goes beyond simple sequence alignment by examining the three-dimensional arrangements of atoms in protein structures. This approach is crucial because proteins with similar structures often share similar functions, even when their sequences have diverged significantly through evolution. BioJava's protein comparison tools implement several well-established algorithms to address this complex computational challenge.
+
+The protein comparison tools in BioJava are primarily focused on **structural alignment algorithms** that determine the optimal three-dimensional superposition of two protein structures while maximizing the similarity between their spatial arrangements. These tools are essential for identifying structural motifs, detecting evolutionary relationships, and predicting protein functions.
+
+Sources: [pom.xml#L28-L80](biojava-protein-comparison-tool/pom.xml#L28-L80), [CeMain.java#L36-L48](biojava-structure/src/main/java/org/biojava/nbio/structure/align/ce/CeMain.java#L36-L48)
+
+## Key Algorithms in BioJava
+
+BioJava implements two major protein structure comparison algorithms: CE (Combinatorial Extension) and FATCAT (Flexible structure AlignmenT by Chaining Aligned fragment pairs allowing Twists). Each algorithm offers unique advantages for different types of structural comparisons.
+
+### CE (Combinatorial Extension) Algorithm
+
+The CE algorithm, originally developed by Shindyalov and Bourne in 1998, works by identifying local structural similarities between two proteins and then extending these regions into a comprehensive alignment. CE is particularly effective for detecting **global structural similarities** and is known for its ability to handle proteins with significant conformational differences.
+
+The algorithm operates by:
+1. Finding short fragment pairs that are structurally similar
+2. Combining these fragments into longer aligned regions
+3. Optimizing the alignment to maximize the number of aligned residues while minimizing RMSD (Root Mean Square Deviation)
+
+CE is especially useful when you need to determine if two proteins share a common fold or when analyzing proteins with low sequence similarity but potentially similar structures.
+
+Sources: [CeMain.java#L37-L44](biojava-structure/src/main/java/org/biojava/nbio/structure/align/ce/CeMain.java#L37-L44)
+
+### FATCAT Algorithm
+
+FATCAT, developed by Ye and Godzik in 2003, introduces flexibility into the structural alignment process. Unlike CE, which assumes proteins are rigid structures, FATCAT allows for **flexible alignments** that can accommodate structural variations such as domain movements or hinge regions.
+
+The key innovation in FATCAT is its ability to:
+1. Identify Aligned Fragment Pairs (AFPs) between the two structures
+2. Chain these AFPs together while allowing for twists (flexible regions)
+3. Optimize the alignment to balance the number of aligned residues with the number of twists introduced
+
+FATCAT is particularly valuable when comparing proteins that may have undergone conformational changes or when analyzing multi-domain proteins with flexible linkers.
+
+Sources: [FatCat.java#L1-L9](biojava-structure/src/main/java/org/biojava/nbio/structure/align/fatcat/FatCat.java#L1-L9)
+
+## Using the Protein Comparison Tool
+
+BioJava's protein comparison tool provides both programmatic access and a graphical user interface for performing structural alignments. The tool is designed to be accessible to both developers and researchers with varying levels of computational expertise.
+
+### Command Line Interface
+
+The protein comparison tool can be executed from the command line using shell scripts for different algorithms:
+
+```bash
+# Run CE algorithm
+./runCE.sh
+
+# Run CECP algorithm (CE with circular permutation)
+./runCECP.sh
+
+# Run FATCAT algorithm
+./runFATCAT.sh
+```
+
+These scripts accept various parameters to customize the alignment process, such as specifying PDB identifiers, setting alignment thresholds, and defining output formats.
+
+Sources: [assembly.xml#L32-L48](biojava-protein-comparison-tool/src/main/assembly/assembly.xml#L32-L48)
+
+### Input Format
+
+The tool accepts protein structures in various formats, with PDB identifiers being the most common input method. The `example.lst` file demonstrates the expected input format:
+
+```
+# an example input for a DB search
+4hhb.C 4hhb.D
+4hhb:0 4hhb:1
+1cdg.A 1tim.B
+1hiv.A 1a4w.H
+1RLW 1BYN
+```
+
+Each line represents a pair of protein structures to compare. The format supports:
+- Full PDB IDs with chain identifiers (e.g., `4hhb.C`)
+- Domain specifications (e.g., `4hhb:0`)
+- Complex combinations with residue ranges (e.g., `4hhb:(A:10-40,B:10-40)`)
+
+Sources: [example.lst#L1-L11](biojava-protein-comparison-tool/src/main/assembly/example.lst#L1-L11)
+
+### Output Interpretation
+
+The alignment results provide comprehensive information about the structural comparison, including:
+
+```
+#Legend: 
+# name1	name2	score	z-score	rmsd	len1	len2	sim1	sim2	
+4hhb.C	4hhb.D	309.61	6.47	1.41	141	146	99	95	0.43	null	
+```
+
+The output columns represent:
+- **name1, name2**: Identifiers of the compared proteins
+- **score**: Alignment score (higher values indicate better alignments)
+- **z-score**: Statistical significance of the alignment
+- **rmsd**: Root Mean Square Deviation of aligned residues (lower values indicate better structural similarity)
+- **len1, len2**: Lengths of the aligned regions in each protein
+- **sim1, sim2**: Sequence similarity percentages for each protein
+- **Alignment coverage**: Fraction of each protein included in the alignment
+
+Sources: [db.out#L1-L12](biojava-protein-comparison-tool/src/main/assembly/db.out#L1-L12)
+
+## Programmatic Usage
+
+For developers who want to integrate protein comparison functionality into their applications, BioJava provides a clean API for accessing the alignment algorithms.
+
+### Basic CE Alignment Example
+
+```java
+// Load two protein structures
+Atom[] ca1 = StructureTools.getAtomCAArray(structure1);
+Atom[] ca2 = StructureTools.getAtomCAArray(structure2);
+
+// Create CE alignment instance
+CeMain ce = new CeMain();
+
+// Perform alignment
+AFPChain afpChain = ce.align(ca1, ca2);
+
+// Access alignment results
+double rmsd = afpChain.getTotalRmsdOpt();
+int alignmentLength = afpChain.getAlignLength();
+```
+
+### Basic FATCAT Alignment Example
+
+```java
+// Load protein structures
+Atom[] ca1 = StructureTools.getAtomCAArray(structure1);
+Atom[] ca2 = StructureTools.getAtomCAArray(structure2);
+
+// Create FATCAT alignment instance
+FatCat fatCat = new FatCat();
+
+// Perform flexible alignment
+AFPChain afpChain = fatCat.align(ca1, ca2);
+
+// Check if flexible alignment was needed
+int blockNum = afpChain.getBlockNum();
+boolean isFlexible = blockNum > 1;
+```
+
+The `AFPChain` object returned by these methods contains all the alignment information, including aligned residue pairs, rotation matrices, and various statistical measures of alignment quality.
+
+Sources: [CeMain.java#L49](biojava-structure/src/main/java/org/biojava/nbio/structure/align/ce/CeMain.java#L49), [FatCat.java#L38-L50](biojava-structure/src/main/java/org/biojava/nbio/structure/align/fatcat/FatCat.java#L38-L50)
+
+## Graphical User Interface
+
+For researchers who prefer a visual approach, BioJava provides a comprehensive GUI for protein structure comparison. The `AlignmentGui` class serves as the main entry point for this interface.
+
+The GUI offers:
+- Interactive protein structure visualization
+- Real-time alignment parameter adjustment
+- 3D structure superposition viewing
+- Alignment quality metrics display
+- Export capabilities for results
+
+```java
+// Launch the protein comparison GUI
+public static void main(String[] args) {
+    AlignmentGui gui = new AlignmentGui();
+    gui.setVisible(true);
+}
+```
+
+The GUI integrates with Jmol for molecular visualization, allowing users to inspect aligned structures in 3D and interactively explore the alignment results.
+
+Sources: [pom.xml#L135](biojava-protein-comparison-tool/pom.xml#L135), [AlignmentGui.java](biojava-structure-gui/src/main/java/org/biojava/nbio/structure/align/gui/AlignmentGui.java)
+
+## Advanced Features
+
+### Multiple Structure Alignment
+
+Beyond pairwise comparisons, BioJava supports multiple structure alignment, which allows simultaneous comparison of three or more protein structures. This is particularly useful for identifying common structural motifs across protein families or analyzing conserved structural features in evolutionarily related proteins.
+
+```java
+// Create multiple structure aligner
+MultipleStructureAligner multiAligner = new MultipleMcMain();
+
+// Prepare structures for alignment
+List<Atom[]> structures = new ArrayList<>();
+structures.add(StructureTools.getAtomCAArray(structure1));
+structures.add(StructureTools.getAtomCAArray(structure2));
+structures.add(StructureTools.getAtomCAArray(structure3));
+
+// Perform multiple alignment
+MultipleAlignment multipleAlignment = multiAligner.align(structures);
+```
+
+### Custom Parameters and Optimization
+
+Both CE and FATCAT algorithms offer extensive parameter customization to fine-tune the alignment process:
+
+```java
+// Custom CE parameters
+CeParameters ceParams = new CeParameters();
+ceParams.setScoringStrategy(CEParameters.SCORING_CA_ONLY);
+ceParams.setMinAlignmentLength(20);
+ceParams.setMaxGapSize(30);
+
+// Custom FATCAT parameters
+FatCatParameters fatCatParams = new FatCatParameters();
+fatCatParams.setFlexible(true);
+fatCatParams.setDisThreshold(3.0);
+fatCatParams.setGapOpen(-5);
+fatCatParams.setGapExtend(-1);
+```
+
+> [!TIP]
+> When working with protein structure comparison, always consider the biological context of your analysis. Different algorithms and parameter settings may be more appropriate depending on whether you're looking for evolutionary relationships, functional similarities, or structural motifs.
+
+## Performance Considerations
+
+Protein structure comparison can be computationally intensive, especially for large proteins or when performing database searches. BioJava implements several optimizations to improve performance:
+
+1. **C-alpha atom representation**: By default, alignments are performed using only C-alpha atoms, which reduces computational complexity while maintaining accuracy.
+
+2. **Pre-filtering**: The tools include pre-filtering steps to quickly eliminate non-promising alignments before performing detailed calculations.
+
+3. **Parallel processing**: Some algorithms support parallel processing for multi-core systems.
+
+4. **Incremental alignment**: For large structures, algorithms can perform incremental alignments focusing on the most promising regions first.
+
+For large-scale comparisons, consider using the command-line interface with batch processing capabilities rather than the GUI, which is optimized for interactive use with individual protein pairs.
+
+Sources: [AbstractStructureAlignment.java](biojava-structure/src/main/java/org/biojava/nbio/structure/align/AbstractStructureAlignment.java)
+
+## Integration with Other BioJava Modules
+
+The protein comparison tools integrate seamlessly with other BioJava modules, providing a comprehensive bioinformatics toolkit:
+
+- **Structure module**: For loading and manipulating protein structures from PDB files
+- **Alignment module**: For sequence-based alignments and combined sequence-structure analysis
+- **Core module**: For fundamental bioinformatics data structures and utilities
+- **Structure-GUI module**: For visualization and interactive analysis
+
+```mermaid
+flowchart TD
+    A[Protein Comparison Tools] --> B[CE Algorithm]
+    A --> C[FATCAT Algorithm]
+    A --> D[GUI Interface]
+    B --> E[biojava-structure]
+    C --> E
+    D --> F[biojava-structure-gui]
+    E --> G[biojava-core]
+    F --> G
+    E --> H[biojava-alignment]
+    G --> I[Data Models]
+    G --> J[Parsers]
+    H --> K[Sequence Alignment]
+```
+
+This modular architecture allows researchers to combine protein structure comparison with other bioinformatics analyses, creating powerful workflows for structural biology research.
+
+Sources: [pom.xml#L36-L56](biojava-protein-comparison-tool/pom.xml#L36-L56)
+
+## Conclusion
+
+BioJava's protein comparison tools provide a robust, flexible, and accessible platform for protein structure analysis. Whether you're a developer building bioinformatics applications or a researcher investigating protein structure-function relationships, these tools offer the algorithms, interfaces, and integration capabilities needed for sophisticated structural comparisons.
+
+By implementing both rigid (CE) and flexible (FATCAT) alignment algorithms, BioJava ensures that researchers can choose the most appropriate method for their specific research questions. The combination of command-line, programmatic, and graphical interfaces makes these tools accessible to users with varying levels of computational expertise.
+
+As structural biology continues to grow in importance, particularly with the expansion of structural genomics initiatives and advances in protein structure prediction, tools like those provided by BioJava will remain essential for extracting biological insights from protein structure data.
+
+# Ontology Support
+
+
+
+Ontologies are formal representations of knowledge in a domain, providing a structured framework for organizing and categorizing information. In bioinformatics, ontologies play a crucial role in standardizing terminology, enabling data integration, and supporting complex queries across biological databases. BioJava's ontology module provides a comprehensive framework for working with biological ontologies, allowing developers to load, manipulate, and reason with ontological data.
+
+## Understanding Ontologies in BioJava
+
+BioJava's ontology support is built around a few core concepts: **ontologies**, **terms**, and **triples**. An ontology represents a collection of terms and the relationships between them. Terms are the basic building blocks that represent concepts or entities, while triples define relationships between these terms following a subject-predicate-object structure, similar to RDF (Resource Description Framework).
+
+The `Ontology` interface serves as the main entry point for working with ontologies in BioJava. It provides methods to create, retrieve, and manage terms and relationships within an ontology. Each ontology has a name and description, and maintains collections of terms and triples that define its structure.
+
+```java
+// Creating a new ontology
+OntologyFactory factory = OntoTools.getDefaultFactory();
+Ontology ontology = factory.createOntology("MyOntology", "A sample biological ontology");
+
+// Adding terms to the ontology
+Term cell = ontology.createTerm("cell", "The basic structural unit of living organisms");
+Term nucleus = ontology.createTerm("nucleus", "The organelle containing the cell's genetic material");
+
+// Creating relationships between terms
+Term partOf = ontology.createTerm("part_of", "A relationship indicating partonomy");
+ontology.createTriple(nucleus, cell, partOf, "nucleus part_of cell", "Nucleus is part of a cell");
+```
+
+Sources: [Ontology.java#L45-L60](biojava-ontology/src/main/java/org/biojava/nbio/ontology/Ontology.java#L45-L60), [Ontology.java#L132-L155](biojava-ontology/src/main/java/org/biojava/nbio/ontology/Ontology.java#L132-L155)
+
+## Working with Terms and Triples
+
+Terms in BioJava's ontology system can represent various biological concepts, from cellular components to biological processes. Each term has a unique name, an optional description, and can have multiple synonyms. The `Term` interface provides methods to access and modify these properties.
+
+```java
+// Creating a term with synonyms
+Object[] synonyms = {"DNA container", "cell control center"};
+Term nucleus = ontology.createTerm("nucleus", "The organelle containing the cell's genetic material", synonyms);
+
+// Accessing term properties
+String name = nucleus.getName();
+String description = nucleus.getDescription();
+Object[] termSynonyms = nucleus.getSynonyms();
+```
+
+Triples represent relationships between terms and are fundamental to expressing knowledge in ontologies. A triple consists of a subject term, an object term, and a predicate term that defines the relationship between them. For example, "nucleus is_a cellular_component" would be represented as a triple with "nucleus" as the subject, "cellular_component" as the object, and "is_a" as the predicate.
+
+```java
+// Creating a triple representing an "is_a" relationship
+Term isA = ontology.createTerm("is_a", "Indicates that one term is a subtype of another");
+Term cellularComponent = ontology.createTerm("cellular_component", "A component of a cell");
+Triple nucleusIsA = ontology.createTriple(nucleus, cellularComponent, isA, 
+                                        "nucleus is_a cellular_component", 
+                                        "Nucleus is a type of cellular component");
+
+// Querying triples
+Set<Triple> triples = ontology.getTriples(null, cellularComponent, isA);
+```
+
+Sources: [Triple.java#L46-L67](biojava-ontology/src/main/java/org/biojava/nbio/ontology/Triple.java#L46-L67), [Ontology.java#L106-L106](biojava-ontology/src/main/java/org/biojava/nbio/ontology/Ontology.java#L106-L106)
+
+## Loading Ontologies from Standard Formats
+
+BioJava provides parsers for common ontology formats used in bioinformatics, particularly the OBO (Open Biomedical Ontologies) format and the Gene Ontology (GO) flatfile format. These parsers make it easy to load existing ontologies into BioJava's ontology framework.
+
+### OBO Format Support
+
+The OBO format is widely used in the biomedical community for representing ontologies. BioJava's `OboParser` class can parse OBO files and convert them into BioJava ontology objects.
+
+```java
+// Parsing an OBO file
+OboParser parser = new OboParser();
+BufferedReader oboFile = new BufferedReader(new FileReader("path/to/ontology.obo"));
+Ontology ontology = parser.parseOBO(oboFile, "MyOntology", "Ontology loaded from OBO file");
+
+// Accessing terms from the loaded ontology
+Set<Term> terms = ontology.getTerms();
+for (Term term : terms) {
+    System.out.println("Term: " + term.getName() + " - " + term.getDescription());
+}
+```
+
+Sources: [OboParser.java#L64-L81](biojava-ontology/src/main/java/org/biojava/nbio/ontology/io/OboParser.java#L64-L81)
+
+### Gene Ontology Format Support
+
+The Gene Ontology (GO) is one of the most important ontologies in bioinformatics, providing controlled vocabularies for gene product characteristics across species. BioJava includes a specialized parser for GO flatfiles.
+
+```java
+// Parsing a GO file
+GOParser parser = new GOParser();
+BufferedReader goFile = new BufferedReader(new FileReader("path/to/go.ontology"));
+OntologyFactory factory = OntoTools.getDefaultFactory();
+Ontology goOntology = parser.parseGO(goFile, "Gene_Ontology", "The Gene Ontology", factory);
+
+// Querying the Gene Ontology
+Term biologicalProcess = goOntology.getTerm("GO:0008150"); // biological_process
+Set<Triple> childProcesses = goOntology.getTriples(null, biologicalProcess, goOntology.getTerm("is_a"));
+```
+
+Sources: [GOParser.java#L41-49](biojava-ontology/src/main/java/org/biojava/nbio/ontology/io/GOParser.java#L41-49)
+
+## Advanced Features
+
+### Ontology Imports and Remote Terms
+
+BioJava supports importing terms from other ontologies, allowing you to create relationships between terms in different ontologies. This is particularly useful when working with multiple related ontologies.
+
+```java
+// Creating two ontologies
+Ontology ontology1 = factory.createOntology("Ontology1", "First ontology");
+Ontology ontology2 = factory.createOntology("Ontology2", "Second ontology");
+
+// Creating terms in each ontology
+Term term1 = ontology1.createTerm("term1", "Term in first ontology");
+Term term2 = ontology2.createTerm("term2", "Term in second ontology");
+
+// Importing a term from one ontology to another
+Term importedTerm = ontology1.importTerm(term2, "imported_term2");
+
+// Creating a relationship between the local and imported term
+Term relatesTo = ontology1.createTerm("relates_to", "Indicates a relationship");
+ontology1.createTriple(term1, importedTerm, relatesTo);
+```
+
+Sources: [Ontology.java#L209-L212](biojava-ontology/src/main/java/org/biojava/nbio/ontology/Ontology.java#L209-L212)
+
+### Ontology Operations and Queries
+
+BioJava provides utility classes and methods for performing common operations on ontologies, such as finding all terms related to a given term or checking for specific relationships.
+
+```java
+// Getting all terms in the ontology
+Set<Term> allTerms = ontology.getTerms();
+
+// Finding all triples where a term is the subject
+Set<Triple> subjectTriples = ontology.getTriples(someTerm, null, null);
+
+// Finding all triples with a specific predicate
+Set<Triple> isARelationships = ontology.getTriples(null, null, isATerm);
+
+// Checking if a specific relationship exists
+boolean hasRelationship = ontology.containsTriple(term1, term2, relationshipTerm);
+```
+
+Sources: [Ontology.java#L83-L106](biojava-ontology/src/main/java/org/biojava/nbio/ontology/Ontology.java#L83-L106)
+
+## Practical Applications
+
+Ontologies in BioJava can be used for various bioinformatics applications:
+
+1. **Annotation Enrichment**: Use ontologies to categorize and enrich biological annotations
+2. **Data Integration**: Map terms from different databases using ontology relationships
+3. **Semantic Queries**: Perform complex queries based on ontological relationships
+4. **Pathway Analysis**: Represent and analyze biological pathways using ontology structures
+
+> [!TIP]
+> When working with large ontologies like the Gene Ontology, consider using lazy loading or memory-efficient data structures, as these ontologies can contain tens of thousands of terms and relationships.
+
+## Conclusion
+
+BioJava's ontology support provides a powerful and flexible framework for working with biological ontologies. Whether you're loading standard ontologies like GO, creating custom ontologies for specific domains, or performing complex ontological queries, BioJava offers the tools you need. The combination of intuitive APIs, support for standard formats, and advanced features like term importing makes it a valuable resource for bioinformatics applications that require structured knowledge representation.
+
+
+# Web Services Integration
+
+
+
+BioJava's web services integration module provides a powerful way to leverage external bioinformatics resources directly from your Java applications. This functionality allows you to submit sequences to remote services like NCBI BLAST and EBI HMMER, retrieve results, and process them programmatically without leaving your development environment.
+
+## Why Web Services Integration Matters
+
+In bioinformatics research, you often need to analyze sequences against large, constantly updated databases that would be impractical to maintain locally. Web services integration bridges this gap by providing programmatic access to these resources, enabling you to:
+
+- Perform sequence alignments against the latest databases
+- Identify protein domains and motifs
+- Access specialized algorithms without local installation
+- Automate analysis workflows that combine local and remote processing
+
+The web services module in BioJava abstracts away the complexity of HTTP communication, request formatting, and response parsing, allowing you to focus on your scientific questions rather than technical implementation details.
+
+## Supported Web Services
+
+BioJava currently integrates with two major bioinformatics web services:
+
+### NCBI BLAST Service
+
+The NCBI BLAST (Basic Local Alignment Search Tool) service is one of the most widely used tools in bioinformatics for comparing sequences against large databases. BioJava provides a comprehensive implementation through the `NCBIQBlastService` class, which supports:
+
+- All standard BLAST programs (blastn, blastp, blastx, tblastn, tblastx)
+- Multiple database options (nr, nt, swissprot, etc.)
+- Advanced search parameters and filtering options
+- Various output formats (XML, text, HTML, etc.)
+
+The implementation follows NCBI's QBlast API specification, which uses an asynchronous request-response pattern. When you submit a query, you receive a Request ID (RID) that you can use to check the status and retrieve results later.
+
+### EBI HMMER Service
+
+The HMMER service at the European Bioinformatics Institute (EBI) specializes in protein domain analysis using profile hidden Markov models. BioJava's `RemoteHmmerScan` class provides access to this service for:
+
+- Pfam domain identification
+- Protein family classification
+- Domain architecture analysis
+- Statistical evaluation of domain matches
+
+This service is particularly valuable for understanding the functional domains within protein sequences and their evolutionary relationships.
+
+## Architecture and Design
+
+The web services module follows a clean, extensible architecture that separates concerns and provides consistent interfaces for different services.
+
+### Core Interfaces
+
+The foundation of the module is built around two main interfaces:
+
+1. **RemotePairwiseAlignmentService**: Defines the contract for sequence alignment services
+   - `sendAlignmentRequest()`: Submits sequences for analysis
+   - `isReady()`: Checks if results are available
+   - `getAlignmentResults()`: Retrieves completed results
+
+2. **HmmerScan**: Defines the contract for protein domain analysis
+   - `scan()`: Submits protein sequences for domain identification
+
+These interfaces ensure that different service implementations can be used interchangeably, making your code more flexible and easier to maintain.
+
+### Service Implementation Pattern
+
+Both services follow a similar implementation pattern:
+
+```mermaid
+sequenceDiagram
+    participant Client as Your Application
+    participant Service as BioJava Service Class
+    participant Remote as Remote Web Service
+    
+    Client->>Service: Create service instance
+    Client->>Service: Configure parameters
+    Client->>Service: Submit sequence request
+    Service->>Remote: Send HTTP request
+    Remote-->>Service: Return request ID
+    Service-->>Client: Return request ID
+    
+    loop Check status
+        Client->>Service: isReady(requestID)
+        Service->>Remote: Check status
+        Remote-->>Service: Status response
+        Service-->>Client: Ready status
+    end
+    
+    Client->>Service: getAlignmentResults(requestID)
+    Service->>Remote: Retrieve results
+    Remote-->>Service: Return results
+    Service-->>Client: Return processed results
+```
+
+This asynchronous pattern is crucial for web services because analysis can take time to complete, and you don't want your application to block while waiting.
+
+## Practical Usage Examples
+
+### NCBI BLAST Example
+
+Here's how to perform a BLAST search using BioJava's web services integration:
+
+```java
+// Create the BLAST service
+NCBIQBlastService service = new NCBIQBlastService();
+
+// Configure alignment parameters
+NCBIQBlastAlignmentProperties props = new NCBIQBlastAlignmentProperties();
+props.setBlastProgram(BlastProgramEnum.blastp);
+props.setBlastDatabase("swissprot");
+props.setAlignmentOption(ENTREZ_QUERY, "\"serum albumin\"[Protein name]");
+
+// Submit the request
+String sequence = "MKWVTFISLLFLFSSAYSRGVFRRDAHKSEVAHRFKDLGEENFKALVLIAFAQYLQQCPFEDHVKLVNEVTEFAKTCVADESAENCDKS";
+String requestId = service.sendAlignmentRequest(sequence, props);
+
+// Wait for results
+while (!service.isReady(requestId)) {
+    Thread.sleep(5000);
+}
+
+// Retrieve and save results
+NCBIQBlastOutputProperties outputProps = new NCBIQBlastOutputProperties();
+InputStream results = service.getAlignmentResults(requestId, outputProps);
+```
+
+This example demonstrates the complete workflow: creating a service, configuring parameters, submitting a request, waiting for completion, and retrieving results.
+
+Sources: [NCBIQBlastService.java#L1-423](biojava-ws/src/main/java/org/biojava/nbio/ws/alignment/qblast/NCBIQBlastService.java), [NCBIQBlastServiceDemo.java#L1-98](biojava-ws/src/main/java/demo/NCBIQBlastServiceDemo.java)
+
+### HMMER Domain Analysis Example
+
+For protein domain analysis, the HMMER service provides a straightforward interface:
+
+```java
+// Get a protein sequence (from UniProt in this case)
+ProteinSequence sequence = getUniprot("P08487");
+
+// Create HMMER service and scan for domains
+RemoteHmmerScan hmmer = new RemoteHmmerScan();
+SortedSet<HmmerResult> results = hmmer.scan(sequence);
+
+// Process the results
+for (HmmerResult result : results) {
+    for (HmmerDomain domain : result.getDomains()) {
+        System.out.printf("%s\t%s\t%d-%d\te=%.2e%n",
+            result.getName(), domain.getHmmAcc(),
+            domain.getSqFrom(), domain.getSqTo(),
+            domain.getEvalue());
+    }
+}
+```
+
+This example shows how to identify protein domains and their locations within a sequence, along with statistical significance measures.
+
+Sources: [RemoteHmmerScan.java#L1-235](biojava-ws/src/main/java/org/biojava/nbio/ws/hmmer/RemoteHmmerScan.java), [HmmerDemo.java#L1-96](biojava-ws/src/main/java/demo/HmmerDemo.java)
+
+## Advanced Configuration
+
+### Custom Service Endpoints
+
+Both services allow you to specify custom endpoints, which is useful for:
+
+- Using local or institutional BLAST installations
+- Accessing specialized databases
+- Working with development or testing environments
+
+```java
+// Use a custom BLAST service endpoint
+NCBIQBlastService customBlast = new NCBIQBlastService("http://my-institution.edu/blast.cgi");
+
+// Use a custom HMMER service endpoint
+URL customHmmerUrl = new URL("http://my-institution.edu/hmmer/search/hmmscan");
+SortedSet<HmmerResult> results = hmmer.scan(sequence, customHmmerUrl);
+```
+
+### Parameter Customization
+
+BioJava provides extensive parameter customization through enum-based configuration:
+
+| Service | Parameter Type | Configuration Method |
+|---------|---------------|----------------------|
+| BLAST | Alignment parameters | `NCBIQBlastAlignmentProperties` |
+| BLAST | Output formatting | `NCBIQBlastOutputProperties` |
+| HMMER | Search parameters | Direct URL parameters |
+
+This approach provides type safety and autocompletion support in IDEs, reducing errors and improving developer productivity.
+
+## Error Handling and Best Practices
+
+### Robust Error Handling
+
+Web services can fail for various reasons - network issues, service downtime, invalid parameters, etc. BioJava's implementations include comprehensive error handling:
+
+```java
+try {
+    String requestId = service.sendAlignmentRequest(sequence, props);
+    // ... wait and retrieve results
+} catch (IllegalArgumentException e) {
+    // Handle invalid parameters
+    System.err.println("Invalid parameters: " + e.getMessage());
+} catch (IOException e) {
+    // Handle network issues
+    System.err.println("Network error: " + e.getMessage());
+} catch (Exception e) {
+    // Handle other errors
+    System.err.println("Service error: " + e.getMessage());
+}
+```
+
+### Performance Considerations
+
+When working with web services, keep these performance tips in mind:
+
+1. **Batch Processing**: Submit multiple requests before checking for results
+2. **Timeout Management**: Set appropriate timeouts for network operations
+3. **Result Caching**: Cache results locally when possible to avoid repeated requests
+4. **Resource Cleanup**: Always clean up resources and delete completed jobs
+
+> [!TIP]
+> Remember to call `sendDeleteRequest()` for BLAST jobs when you're done with the results. This helps the NCBI service manage its resources efficiently and is considered good web citizenship.
+
+## Integration with Other BioJava Modules
+
+The web services module integrates seamlessly with other BioJava components:
+
+- **Core Module**: Uses `ProteinSequence` and `Compound` classes for sequence representation
+- **Structure Module**: Can combine BLAST results with 3D structure analysis
+- **Alignment Module**: Can process and visualize alignment results
+- **Ontology Module**: Can annotate results with controlled vocabulary terms
+
+This integration allows you to build comprehensive analysis pipelines that leverage both local and remote resources.
+
+## Future Directions
+
+The web services module is designed to be extensible, and future versions may include:
+
+- Additional service providers (EBI BLAST, KEGG API, etc.)
+- Asynchronous processing with callbacks
+- Result caching and local indexing
+- Support for authentication and rate limiting
+- Integration with workflow management systems
+
+By providing a clean, consistent interface to web services, BioJava enables developers to focus on their scientific questions while leveraging the power of external bioinformatics resources.
+
+
+# Structure Visualization
+
+
+
+Structure visualization is a critical aspect of bioinformatics that allows researchers to explore and understand the three-dimensional arrangements of biological macromolecules. BioJava provides powerful structure visualization capabilities through its integration with Jmol, a widely-used open-source molecular viewer. This blog post will guide you through how to leverage BioJava's structure visualization components in your applications.
+
+## Why Structure Visualization Matters
+
+Visualizing protein structures helps researchers understand molecular interactions, binding sites, and overall architecture. Whether you're analyzing protein-ligand interactions, studying protein folding, or comparing structural homologs, visualization provides intuitive insights that complement computational analysis. BioJava's visualization tools bridge the gap between structural data analysis and visual exploration.
+
+## Core Visualization Components
+
+BioJava's structure visualization functionality is primarily provided by the `biojava-structure-gui` module, which contains several key components that work together to enable interactive 3D visualization of protein structures.
+
+### StructureViewer Interface
+
+The `StructureViewer` interface defines the contract for all structure visualization implementations in BioJava. It provides methods for setting structures, controlling rendering styles, managing selections, and interacting with the visualization.
+
+```java
+public interface StructureViewer {
+    public void setStructure(Structure structure);
+    public void repaint();
+    public void setSelection(Selection selection);
+    public Selection getSelection();
+    public void setColor(Color color);
+    public Color getColor();
+    public void setStyle(RenderStyle style);
+    public void clear();
+    public void setZoom(int i);
+}
+```
+
+This interface ensures that different visualization implementations can be used interchangeably in your applications.
+
+Sources: [StructureViewer.java](biojava-structure-gui/src/main/java/org/biojava/nbio/structure/gui/StructureViewer.java)
+
+### JmolViewerImpl: The Primary Implementation
+
+The `JmolViewerImpl` class is the main implementation of the `StructureViewer` interface, providing Jmol-based 3D visualization capabilities. It creates a Swing-based GUI window with an embedded Jmol viewer, complete with interactive controls and command input.
+
+Key features of JmolViewerImpl include:
+- Interactive 3D visualization with mouse controls
+- Support for RASMOL-like scripting commands
+- Multiple rendering styles and coloring schemes
+- Structure selection and highlighting capabilities
+
+```java
+JmolViewerImpl viewer = new JmolViewerImpl();
+viewer.setStructure(proteinStructure);
+```
+
+Sources: [JmolViewerImpl.java](biojava-structure-gui/src/main/java/org/biojava/nbio/structure/gui/JmolViewerImpl.java)
+
+### RenderStyle Options
+
+BioJava provides various rendering styles through the `RenderStyle` enum, allowing you to control how structures are displayed:
+
+| Render Style | Description |
+|--------------|-------------|
+| WIREFRAME | Shows only the bonds between atoms |
+| STICKS | Displays atoms as small spheres connected by cylinders |
+| BALL_AND_STICK | Shows atoms as larger spheres connected by cylinders |
+| SURFACE | Displays the molecular surface |
+| RIBBON | Shows the protein backbone as a ribbon |
+| CARTOON | Displays secondary structure elements as cartoons |
+| SPHERES | Shows atoms as spheres |
+| MESH | Displays a mesh representation of the surface |
+
+```java
+viewer.setStyle(RenderStyle.CARTOON);
+```
+
+Sources: [RenderStyle.java](biojava-structure-gui/src/main/java/org/biojava/nbio/structure/gui/RenderStyle.java)
+
+## Quick Start: Visualizing Your First Structure
+
+Let's walk through a simple example of how to load and visualize a protein structure using BioJava:
+
+```java
+import org.biojava.nbio.structure.Structure;
+import org.biojava.nbio.structure.StructureIO;
+import org.biojava.nbio.structure.gui.JmolViewerImpl;
+
+public class SimpleVisualization {
+    public static void main(String[] args) {
+        try {
+            // Load a structure from the PDB
+            Structure structure = StructureIO.getStructure("1aoi");
+            
+            // Create a viewer and display the structure
+            JmolViewerImpl viewer = new JmolViewerImpl();
+            viewer.setStructure(structure);
+            
+            // Apply some visualization commands
+            viewer.evalString("select *; cartoon on; color chain;");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+This simple example loads the structure with PDB code "1aoi" and displays it in a Jmol window with cartoon representation colored by chain.
+
+Sources: [ShowStructureInJmol.java](biojava-structure-gui/src/main/java/demo/ShowStructureInJmol.java)
+
+## Advanced Visualization Techniques
+
+### Customizing Appearance
+
+You can customize the appearance of your structures using Jmol scripting commands:
+
+```java
+JmolViewerImpl viewer = new JmolViewerImpl();
+viewer.setStructure(structure);
+
+// Apply custom coloring and rendering
+viewer.evalString("select protein; cartoon on; color structure;");
+viewer.evalString("select ligand; wireframe off; spacefill 200;");
+viewer.evalString("select water; spacefill 50%; color blue;");
+```
+
+These commands demonstrate how to apply different rendering styles to different parts of your structure.
+
+### Working with Selections
+
+The `Selection` interface allows you to work with selected parts of your structure:
+
+```java
+Selection selection = viewer.getSelection();
+// Manipulate the selection as needed
+viewer.setSelection(selection);
+viewer.setColor(Color.RED); // Apply color to the selected parts
+```
+
+Sources: [Selection.java](biojava-structure-gui/src/main/java/org/biojava/nbio/structure/gui/Selection.java)
+
+## Architecture Overview
+
+The structure visualization components in BioJava follow a well-defined architecture that separates concerns and promotes flexibility:
+
+```mermaid
+classDiagram
+    class StructureViewer {
+        <<interface>>
+        +setStructure(Structure)
+        +repaint()
+        +setSelection(Selection)
+        +getSelection() Selection
+        +setColor(Color)
+        +getColor() Color
+        +setStyle(RenderStyle)
+        +clear()
+        +setZoom(int)
+    }
+    
+    class JmolViewerImpl {
+        -JmolPanel jmolPanel
+        -JFrame frame
+        +setStructure(Structure)
+        +evalString(String)
+    }
+    
+    class RenderStyle {
+        <<enumeration>>
+        WIREFRAME
+        STICKS
+        BALL_AND_STICK
+        SURFACE
+        RIBBON
+        CARTOON
+        SPHERES
+        MESH
+    }
+    
+    class Selection {
+        <<interface>>
+        +clear()
+        +getSelection() List~AtomInfo~
+        +setSelection(List~AtomInfo~)
+    }
+    
+    StructureViewer <|.. JmolViewerImpl : implements
+    StructureViewer --> RenderStyle : uses
+    StructureViewer --> Selection : uses
+```
+
+This diagram shows how the main components interact. The `StructureViewer` interface defines the contract, while `JmolViewerImpl` provides the concrete implementation using Jmol. The `RenderStyle` and `Selection` interfaces provide additional control over the visualization.
+
+> [!TIP]
+> The biojava-structure-gui module depends on Jmol for 3D visualization capabilities. Make sure to include the Jmol dependency in your Maven project when using these visualization components.
+
+## Integration with Other BioJava Components
+
+Structure visualization works seamlessly with other BioJava modules. For example, you can visualize structures after performing alignments or modifications:
+
+```java
+// Load and modify a structure
+Structure structure = StructureIO.getStructure("1tim");
+// ... perform modifications or analysis ...
+
+// Visualize the result
+JmolViewerImpl viewer = new JmolViewerImpl();
+viewer.setStructure(structure);
+viewer.setStyle(RenderStyle.CARTOON);
+```
+
+Sources: [biojava-structure/readme.md](biojava-structure/readme.md)
+
+## Conclusion
+
+BioJava's structure visualization capabilities provide a powerful toolkit for exploring protein structures programmatically. By leveraging the Jmol integration through the `StructureViewer` interface, you can create applications that combine computational analysis with interactive visualization. Whether you're building research tools, educational software, or analysis pipelines, BioJava's visualization components offer the flexibility and functionality you need.
+
+The modular architecture ensures that you can use these components independently or integrate them with other BioJava functionality, making it easier to create comprehensive bioinformatics applications that bridge the gap between analysis and visualization.
+
+
+# Survival Analysis
+
+
+
+Survival analysis is a crucial statistical method in bioinformatics for analyzing time-to-event data, such as patient survival times, disease progression, or treatment response. The biojava-survival module provides a comprehensive Java implementation of key survival analysis techniques, including **Cox proportional hazards regression** and **Kaplan-Meier survival estimation**, making these powerful statistical methods accessible to Java developers working with biological and clinical data.
+
+## Understanding Survival Analysis in Bioinformatics
+
+Survival analysis deals with analyzing data where the outcome is the time until the occurrence of an event of interest. In bioinformatics, this could be time until death, disease recurrence, or treatment failure. What makes survival analysis unique is its ability to handle **censored data** - cases where we don't know the exact event time because the event hasn't occurred yet or the subject was lost to follow-up.
+
+The biojava-survival module implements two fundamental approaches:
+
+1. **Kaplan-Meier Estimation**: A non-parametric method used to estimate the survival function from lifetime data
+2. **Cox Proportional Hazards Model**: A semi-parametric regression model for analyzing the effect of multiple variables on survival time
+
+Sources: [CoxMethod.java#L27-L36](biojava-survival/src/main/java/org/biojava/nbio/survival/cox/CoxMethod.java#L27-L36), [SurvFitKM.java#L44-L50](biojava-survival/src/main/java/org/biojava/nbio/survival/kaplanmeier/figure/SurvFitKM.java#L44-L50)
+
+## Module Architecture and Key Components
+
+The biojava-survival module is organized into three main packages, each serving a specific purpose in the survival analysis workflow:
+
+```mermaid
+graph TD
+    A[biojava-survival] --> B[cox]
+    A --> C[data]
+    A --> D[kaplanmeier]
+    
+    B --> B1[CoxR.java]
+    B --> B2[CoxHelper.java]
+    B --> B3[SurvivalInfo.java]
+    
+    C --> C1[WorkSheet.java]
+    C --> C2[HeaderInfo.java]
+    
+    D --> D1[KaplanMeierFigure.java]
+    D --> D2[SurvFitKM.java]
+```
+
+### Core Data Structures
+
+At the heart of the module are two key data structures:
+
+**SurvivalInfo**: Represents individual survival data points with essential information:
+- `time`: The survival time or censoring time
+- `status`: Event indicator (1=event occurred, 0=censored)
+- `data`: LinkedHashMap containing covariates and their values
+- Additional fields for weights, strata, and cluster information
+
+**WorkSheet**: A memory-efficient data structure for handling large datasets, similar to a spreadsheet but optimized for performance with biological data.
+
+Sources: [SurvivalInfo.java#L34-L54](biojava-survival/src/main/java/org/biojava/nbio/survival/cox/SurvivalInfo.java#L34-L54), [WorkSheet.java#L32-L38](biojava-survival/src/main/java/org/biojava/nbio/survival/data/WorkSheet.java#L32-L38)
+
+## Getting Started with Cox Regression
+
+The Cox proportional hazards model is the most widely used regression model for survival analysis. It allows you to examine the effect of multiple variables on survival time without needing to specify the underlying survival distribution.
+
+### Basic Cox Regression Analysis
+
+Here's how to perform a simple Cox regression analysis using the CoxHelper class:
+
+```java
+// Load survival data from a tab-delimited file
+String dataFile = "path/to/your/data.txt";
+String timeColumn = "TIME";
+String statusColumn = "CENSOR";
+String[] variables = {"AGE", "TREATMENT", "RACE"};
+
+// Perform Cox regression
+CoxHelper coxHelper = new CoxHelper();
+CoxInfo coxInfo = coxHelper.process(dataFile, timeColumn, statusColumn, 
+                                   "", "", "", variables, false, false);
+
+// Get results
+double[] coefficients = coxInfo.getCoefficients();
+double[] pValues = coxInfo.getPValues();
+```
+
+The results include:
+- **Coefficients**: Log hazard ratios for each variable
+- **P-values**: Statistical significance of each variable
+- **Confidence intervals**: Range of plausible values for hazard ratios
+- **Model fit statistics**: Overall model performance measures
+
+Sources: [CoxHelper.java#L29-L50](biojava-survival/src/main/java/org/biojava/nbio/survival/cox/CoxHelper.java#L29-L50), [uis-complete.txt#L1-L20](biojava-survival/src/main/resources/uis-complete.txt#L1-L20)
+
+### Advanced Cox Regression Features
+
+The module supports advanced features for more sophisticated analyses:
+
+```java
+// Cox regression with strata and weights
+CoxInfo coxInfo = coxHelper.process(dataFile, timeColumn, statusColumn,
+                                   "WEIGHT", "STRATA", "", variables, true, true);
+
+// Using different methods for handling tied events
+CoxMethod method = CoxMethod.Efron; // or CoxMethod.Breslow
+CoxR coxR = new CoxR();
+coxR.process(survivalDataList, method, maxIterations, tolerance);
+```
+
+> [!TIP]
+> The choice between Breslow and Efron methods depends on your data. Breslow is faster but less accurate when many events occur at the same time. Efron provides better accuracy for tied events but requires more computational resources.
+
+Sources: [CoxMethod.java#L27-L36](biojava-survival/src/main/java/org/biojava/nbio/survival/cox/CoxMethod.java#L27-L36), [CoxR.java#L33-L42](biojava-survival/src/main/java/org/biojava/nbio/survival/cox/CoxR.java#L33-L42)
+
+## Kaplan-Meier Survival Analysis
+
+Kaplan-Meier analysis is used to estimate and visualize survival curves, showing the probability of survival over time for different groups.
+
+### Creating Survival Curves
+
+```java
+// Prepare survival data
+ArrayList<SurvivalInfo> survivalData = new ArrayList<>();
+survivalData.add(new SurvivalInfo(10, 1, "GROUP", 1)); // time=10, event=1, group=1
+survivalData.add(new SurvivalInfo(15, 0, "GROUP", 1)); // time=15, censored=0, group=1
+survivalData.add(new SurvivalInfo(8, 1, "GROUP", 2));  // time=8, event=1, group=2
+
+// Perform Kaplan-Meier analysis
+SurvFitKM survFit = new SurvFitKM();
+SurvFitInfo survFitInfo = survFit.process(survivalData, "GROUP");
+
+// Create visualization
+KaplanMeierFigure kmFigure = new KaplanMeierFigure();
+kmFigure.generateFigure(survFitInfo, "Survival Analysis by Treatment Group");
+```
+
+### Interpreting Kaplan-Meier Curves
+
+The Kaplan-Meier figure shows:
+- **Y-axis**: Survival probability (from 1.0 to 0.0)
+- **X-axis**: Time
+- **Steps**: Drops indicate events (deaths/failures)
+- **Tick marks**: Indicate censored observations
+- **Multiple curves**: Different groups can be compared on the same plot
+
+Sources: [KaplanMeierFigure.java#L41-L50](biojava-survival/src/main/java/org/biojava/nbio/survival/kaplanmeier/figure/KaplanMeierFigure.java#L41-L50), [SurvFitKM.java#L34-L38](biojava-survival/src/main/java/org/biojava/nbio/survival/kaplanmeier/figure/SurvFitKM.java#L34-L38)
+
+## Data Preparation and Best Practices
+
+### Working with Clinical Data
+
+The module includes example data in `uis-complete.txt` that demonstrates the typical format for survival analysis:
+
+```
+ID	AGE	BECKTOTA	HERCOC	IVHX	NDRUGTX	RACE	TREAT	SITE	LOS	TIME	CENSOR
+101	33	.	.	.	6	0	1	0	2	2	1
+152	22	.	.	.	3	0	1	0	3	3	1
+```
+
+Key columns for survival analysis:
+- **TIME**: Survival time or time to event
+- **CENSOR**: Event indicator (1=event, 0=censored)
+- **Other columns**: Covariates for analysis
+
+### Data Quality Considerations
+
+When preparing data for survival analysis:
+
+1. **Handle missing values**: The module can handle missing data (marked as ".")
+2. **Ensure proper time units**: Consistent time units across all observations
+3. **Verify censoring status**: Correct coding of events vs. censored observations
+4. **Check for outliers**: Extreme values can significantly affect results
+
+Sources: [uis-complete.txt#L1-L20](biojava-survival/src/main/resources/uis-complete.txt#L1-L20), [SurvivalInfo.java#L60-L96](biojava-survival/src/main/java/org/biojava/nbio/survival/cox/SurvivalInfo.java#L60-L96)
+
+## Internal Architecture and Performance
+
+The biojava-survival module is designed for performance with large biological datasets:
+
+### Memory Optimization
+
+- **CompactCharSequence**: Used in WorkSheet to minimize memory footprint
+- **Efficient data structures**: LinkedHashMap for fast lookups while maintaining order
+- **Stream processing**: Large files can be processed without loading everything into memory
+
+### Algorithm Implementation
+
+The Cox regression implementation is a port of R's survival package, adapted for Java's object-oriented paradigm:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CoxHelper
+    participant CoxR
+    participant SurvivalInfo
+    participant Matrix
+    
+    User->>CoxHelper: process(dataFile, columns)
+    CoxHelper->>WorkSheet: load data
+    CoxHelper->>SurvivalInfo: create objects
+    CoxHelper->>CoxR: process data
+    CoxR->>Matrix: perform calculations
+    CoxR->>CoxR: iterative optimization
+    CoxR-->>CoxHelper: return CoxInfo
+    CoxHelper-->>User: return results
+```
+
+The algorithm uses:
+- **Newton-Raphson optimization**: For finding maximum likelihood estimates
+- **Cholesky decomposition**: For matrix operations in variance calculations
+- **Efficient handling of ties**: Both Breslow and Efron methods implemented
+
+Sources: [CoxR.java#L53-L95](biojava-survival/src/main/java/org/biojava/nbio/survival/cox/CoxR.java#L53-L95), [WorkSheet.java#L26-L38](biojava-survival/src/main/java/org/biojava/nbio/survival/data/WorkSheet.java#L26-L38)
+
+## Integration with Other BioJava Modules
+
+The survival analysis module can be integrated with other BioJava components for comprehensive bioinformatics analysis:
+
+### Combining with Structure Analysis
+
+```java
+// Analyze protein structure features and survival
+ProteinStructure structure = StructureIO.getStructure("protein.pdb");
+double stabilityScore = calculateStability(structure);
+
+// Add to survival data
+SurvivalInfo survInfo = new SurvivalInfo(survivalTime, eventStatus);
+survInfo.getData().put("PROTEIN_STABILITY", stabilityScore);
+```
+
+### Integration with Sequence Analysis
+
+```java
+// Analyze sequence features and correlate with survival
+DNASequence sequence = new DNASequence(dnaString);
+double gcContent = sequence.getGCContent();
+
+SurvivalInfo survInfo = new SurvivalInfo(survivalTime, eventStatus);
+survInfo.getData().put("GC_CONTENT", gcContent);
+```
+
+This integration allows researchers to investigate relationships between molecular features and clinical outcomes, enabling precision medicine applications.
+
+> [!TIP]
+> When integrating multiple data types, ensure proper normalization of features. Different scales (e.g., protein stability scores vs. gene expression levels) can affect model convergence and interpretation.
+
+Sources: [pom.xml#L21-L50](biojava-survival/pom.xml#L21-L50), [SurvivalInfo.java#L48-L54](biojava-survival/src/main/java/org/biojava/nbio/survival/cox/SurvivalInfo.java#L48-L54)
+
+## Conclusion
+
+The biojava-survival module provides a robust, Java-based implementation of essential survival analysis methods. By offering both Cox regression and Kaplan-Meier analysis with comprehensive visualization capabilities, it enables bioinformaticians to:
+
+1. **Analyze time-to-event data** with proper handling of censored observations
+2. **Identify prognostic factors** using multivariate Cox regression
+3. **Visualize survival patterns** with publication-ready Kaplan-Meier curves
+4. **Integrate molecular data** with clinical outcomes for biomarker discovery
+
+Whether you're analyzing clinical trial data, studying disease progression, or investigating the relationship between molecular features and patient outcomes, the biojava-survival module provides the statistical tools needed for rigorous survival analysis in a Java environment.
+
+The module's efficient implementation, comprehensive feature set, and integration capabilities make it a valuable addition to any bioinformatician's toolkit for survival analysis applications.
+
+# Extending BioJava
+
+
+
+BioJava is designed as a modular framework that provides a solid foundation for bioinformatics applications while allowing developers to extend its functionality to meet specific research needs. This document explores how you can leverage BioJava's architecture to build custom features and integrate them seamlessly with the existing framework.
+
+## Understanding BioJava's Modular Architecture
+
+BioJava is organized as a multi-module Maven project where each module addresses specific aspects of bioinformatics. The framework follows a layered architecture with the core module providing fundamental abstractions and specialized modules building upon this foundation.
+
+The main modules include:
+- **biojava-core**: Provides fundamental classes for sequences, compounds, and basic operations
+- **biojava-alignment**: Implements sequence alignment algorithms
+- **biojava-structure**: Handles protein structure representation and analysis
+- **biojava-genome**: Offers genome-scale analysis capabilities
+- **biojava-ontology**: Supports biological ontology management
+- And several other specialized modules
+
+This modular design allows you to:
+1. Use only the modules relevant to your application
+2. Extend specific functionality without affecting the entire system
+3. Create new modules that integrate seamlessly with existing ones
+
+Sources: [pom.xml#L637-L651](pom.xml#L637-L651)
+
+## Core Extension Points
+
+The biojava-core module provides several key extension points that serve as the foundation for building custom functionality. Understanding these abstractions is crucial for effective extension.
+
+### Sequence and Compound Framework
+
+The sequence framework in BioJava is built around template interfaces that allow for flexible implementations. The core interfaces include:
+
+- `Sequence`: Represents a biological sequence with methods for accessing compounds, length, and metadata
+- `Compound`: Represents individual elements in a sequence (nucleotides, amino acids, etc.)
+- `SequenceReader`: Allows for reading sequences from various sources
+- `SequenceWriter`: Enables writing sequences to different formats
+
+These interfaces are designed to be extended for specialized biological sequences or compounds not directly supported by BioJava.
+
+```java
+public class CustomSequence extends AbstractSequence<CustomCompound> {
+    
+    public CustomSequence(List<CustomCompound> compounds) {
+        super(compounds);
+    }
+    
+    @Override
+    public String getSequenceAsString() {
+        // Custom implementation
+    }
+    
+    // Additional custom methods
+}
+```
+
+Sources: [biojava-core/src/main/java/org/biojava/nbio/core/sequence/template/](biojava-core/src/main/java/org/biojava/nbio/core/sequence/template/)
+
+### Data Parsers and Writers
+
+BioJava provides a flexible I/O framework that can be extended to support new file formats. The core includes:
+
+- `SequenceReaderInterface`: For implementing custom sequence parsers
+- `SequenceWriterInterface`: For implementing custom sequence writers
+- `ProxySequenceReader`: A wrapper class that can be extended for custom data sources
+
+To implement a custom parser, you would extend the appropriate interface and implement the required methods:
+
+```java
+public class CustomFormatParser implements SequenceReaderInterface<ProteinSequence, AminoAcidCompound> {
+    
+    @Override
+    public ProteinSequence readSequence(BufferedReader reader) throws IOException {
+        // Parse custom format and return sequence
+    }
+    
+    @Override
+    public Map<String, ProteinSequence> processMultiple(BufferedReader reader) throws IOException {
+        // Handle multiple sequences in custom format
+    }
+}
+```
+
+Sources: [biojava-core/src/main/java/org/biojava/nbio/core/sequence/io/](biojava-core/src/main/java/org/biojava/nbio/core/sequence/io/)
+
+## Creating Custom Modules
+
+When your extensions become substantial, creating a new BioJava module is the best approach. This ensures proper integration with the BioJava ecosystem and follows the established patterns.
+
+### Module Structure
+
+A new BioJava module should follow the standard Maven project structure:
+
+```
+biojava-myfeature/
+├── pom.xml
+└── src/
+    ├── main/
+    │   ├── java/
+    │   └── resources/
+    └── test/
+        ├── java/
+        └── resources/
+```
+
+The `pom.xml` for your module should inherit from the main BioJava POM and declare dependencies on the required BioJava modules:
+
+```xml
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    
+    <parent>
+        <groupId>org.biojava</groupId>
+        <artifactId>biojava</artifactId>
+        <version>7.2.3-SNAPSHOT</version>
+    </parent>
+    
+    <artifactId>biojava-myfeature</artifactId>
+    <name>biojava-myfeature</name>
+    <description>Custom feature module for BioJava</description>
+    
+    <dependencies>
+        <dependency>
+            <groupId>org.biojava</groupId>
+            <artifactId>biojava-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- Add other required BioJava modules -->
+    </dependencies>
+</project>
+```
+
+Sources: [biojava-structure/pom.xml](biojava-structure/pom.xml)
+
+### Registering Your Module
+
+Once your module is created, you need to register it in the main BioJava POM by adding it to the modules section:
+
+```xml
+<modules>
+    <!-- Existing modules -->
+    <module>biojava-core</module>
+    <module>biojava-alignment</module>
+    <!-- ... -->
+    
+    <!-- Your new module -->
+    <module>biojava-myfeature</module>
+    
+    <!-- Keep integration tests last -->
+    <module>biojava-integrationtest</module>
+</modules>
+```
+
+Sources: [pom.xml#L637-L651](pom.xml#L637-L651)
+
+## Extending Structure Analysis
+
+The biojava-structure module demonstrates how to build specialized functionality on top of the core. It provides classes for representing and analyzing protein 3D structures.
+
+### Structure Representation
+
+The structure module uses a hierarchical model:
+- `Structure`: Represents the entire protein structure
+- `Model`: Contains different conformational models
+- `Chain`: Represents polypeptide chains
+- `Group`: Represents amino acids or nucleotides
+- `Atom`: Represents individual atoms
+
+You can extend these classes to add custom properties or behaviors:
+
+```java
+public class CustomStructure extends StructureImpl {
+    
+    private Map<String, Object> customProperties;
+    
+    public void addCustomProperty(String key, Object value) {
+        if (customProperties == null) {
+            customProperties = new HashMap<>();
+        }
+        customProperties.put(key, value);
+    }
+    
+    public Object getCustomProperty(String key) {
+        return customProperties != null ? customProperties.get(key) : null;
+    }
+}
+```
+
+Sources: [biojava-structure/src/main/java/org/biojava/nbio/structure/StructureImpl.java](biojava-structure/src/main/java/org/biojava/nbio/structure/StructureImpl.java)
+
+### Custom Structure Calculations
+
+The structure module includes utility classes like `Calc` for common structural calculations. You can extend this pattern to add your own calculations:
+
+```java
+public class CustomStructureCalculations {
+    
+    public static double calculateCustomMetric(Structure structure) {
+        // Implement custom structural analysis
+        double result = 0.0;
+        
+        for (Chain chain : structure.getChains()) {
+            for (Group group : chain.getAtomGroups()) {
+                // Perform calculations
+            }
+        }
+        
+        return result;
+    }
+}
+```
+
+Sources: [biojava-structure/src/main/java/org/biojava/nbio/structure/Calc.java](biojava-structure/src/main/java/org/biojava/nbio/structure/Calc.java)
+
+## Implementing Custom Algorithms
+
+BioJava's design encourages the implementation of custom algorithms through well-defined interfaces and abstract classes.
+
+### Algorithm Design Pattern
+
+Most algorithms in BioJava follow a consistent pattern:
+1. Define an interface for the algorithm
+2. Provide an abstract base class with common functionality
+3. Implement specific algorithms as concrete classes
+
+For example, to implement a custom sequence alignment algorithm:
+
+```java
+public interface CustomAligner {
+    AlignmentResult align(Sequence seq1, Sequence seq2);
+}
+
+public abstract class AbstractCustomAligner implements CustomAligner {
+    protected SubstitutionMatrix matrix;
+    protected GapPenalty gapPenalty;
+    
+    // Common functionality for all implementations
+    protected void initialize(Sequence seq1, Sequence seq2) {
+        // Initialization code
+    }
+}
+
+public class MyCustomAligner extends AbstractCustomAligner {
+    @Override
+    public AlignmentResult align(Sequence seq1, Sequence seq2) {
+        // Implement specific alignment algorithm
+        initialize(seq1, seq2);
+        // ... alignment logic
+        return new AlignmentResult();
+    }
+}
+```
+
+Sources: [biojava-alignment/src/main/java/org/biojava/nbio/core/alignment/template/](biojava-alignment/src/main/java/org/biojava/nbio/core/alignment/template/)
+
+## Contributing Extensions to BioJava
+
+If you've developed an extension that could benefit the broader BioJava community, consider contributing it back to the project.
+
+### Development Guidelines
+
+1. **Follow Coding Standards**: BioJava uses specific coding standards documented in the development directory
+2. **Write Tests**: Include comprehensive unit tests for your extensions
+3. **Documentation**: Provide clear documentation for your extensions
+4. **License Compliance**: Ensure your contributions comply with BioJava's LGPL v2 license
+
+Sources: [development/HEADER.txt](development/HEADER.txt)
+
+### Submission Process
+
+1. Fork the BioJava repository on GitHub
+2. Create a feature branch for your extension
+3. Implement your extension following the established patterns
+4. Add tests and documentation
+5. Submit a pull request for review
+
+The BioJava team reviews contributions based on:
+- Technical merit and correctness
+- Consistency with existing codebase
+- Documentation quality
+- Test coverage
+
+Sources: [CONTRIBUTING.md](CONTRIBUTING.md)
+
+> [!TIP]
+> When extending BioJava, always prefer implementing interfaces over extending concrete classes. This approach provides better flexibility and makes your code more resilient to changes in the BioJava framework.
+
+## Best Practices for Extending BioJava
+
+To ensure your extensions are robust and maintainable, follow these best practices:
+
+### 1. Leverage Existing Abstractions
+
+```java
+// Good: Use template interfaces
+public class CustomSequenceReader implements SequenceReaderInterface<ProteinSequence, AminoAcidCompound> {
+    // Implementation
+}
+
+// Avoid: Extending concrete implementations
+public class CustomSequenceReader extends FastaSequenceReader {
+    // This may break if FastaSequenceReader changes
+}
+```
+
+### 2. Handle Exceptions Appropriately
+
+BioJava defines specific exception types for different scenarios. Use these in your extensions:
+
+```java
+public void processSequence(Sequence sequence) throws CompoundNotFoundException {
+    // Check for invalid compounds
+    if (sequence == null) {
+        throw new IllegalArgumentException("Sequence cannot be null");
+    }
+    
+    // Process sequence
+}
+```
+
+Sources: [biojava-core/src/main/java/org/biojava/nbio/core/exceptions/](biojava-core/src/main/java/org/biojava/nbio/core/exceptions/)
+
+### 3. Use Logging Framework
+
+BioJava uses SLF4J with Log4j2 for logging. Integrate with this framework in your extensions:
+
+```java
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class CustomProcessor {
+    private static final Logger logger = LoggerFactory.getLogger(CustomProcessor.class);
+    
+    public void process(Sequence sequence) {
+        logger.info("Processing sequence: {}", sequence.getAccession());
+        // Processing logic
+        logger.debug("Processing completed successfully");
+    }
+}
+```
+
+Sources: [biojava-core/pom.xml#L39-L41](biojava-core/pom.xml#L39-L41)
+
+### 4. Follow Package Conventions
+
+BioJava organizes code into logical packages. Follow these conventions in your extensions:
+
+- `org.biojava.nbio.core.*`: Core abstractions and interfaces
+- `org.biojava.nbio.structure.*`: Structure-related functionality
+- `org.biojava.nbio.alignment.*`: Alignment algorithms
+- `org.biojava.nbio.genome.*`: Genome analysis tools
+
+## Conclusion
+
+Extending BioJava is a powerful way to customize the framework for your specific bioinformatics needs. By understanding the modular architecture and following the established patterns, you can create robust extensions that integrate seamlessly with the BioJava ecosystem.
+
+Whether you're implementing custom algorithms, adding support for new data formats, or creating entirely new modules, BioJava's extensible design provides the flexibility you need while maintaining compatibility with the broader framework.
+
+Remember to leverage the existing abstractions, follow the coding standards, and consider contributing your extensions back to the community to help advance bioinformatics research for everyone.
+

@@ -1,0 +1,77 @@
+from pathlib import Path
+import os
+import warnings
+
+import torch
+from torchani.paths import data_dir
+
+_env_internal_dir = os.getenv("TORCHANI_EXTENSIONS_INTERNAL_DIR")
+if _env_internal_dir:
+    internal_path = Path(_env_internal_dir).expanduser().resolve()
+else:
+    internal_path = Path(__file__).resolve().parent.parent
+external_path = data_dir().parent.parent / "lib" / "Torchani"
+internal_suffix = ".pyd" if os.name == "nt" else ".so"
+external_suffix = ".dll" if os.name == "nt" else ".so"
+
+# This env var is meant to be used by developers to manually disable extensions
+# for testing purposes
+if os.getenv("TORCHANI_DISABLE_EXTENSIONS") == "1":
+    CUAEV_IS_INSTALLED = False
+    MNP_IS_INSTALLED = False
+    CLIST_IS_INSTALLED = False
+    _missing = ["cuaev", "mnp", "cell_list"]
+else:
+    _missing = []
+    try:
+        torch.ops.load_library(internal_path / f"cuaev{internal_suffix}")
+        CUAEV_IS_INSTALLED = True
+    except Exception:
+        try:
+            torch.ops.load_library(external_path / f"cuaev{external_suffix}")
+            CUAEV_IS_INSTALLED = True
+        except Exception:
+            _missing.append("cuaev")
+            CUAEV_IS_INSTALLED = False
+
+    try:
+        torch.ops.load_library(internal_path / f"mnp{internal_suffix}")
+        MNP_IS_INSTALLED = True
+    except Exception:
+        try:
+            torch.ops.load_library(external_path / f"mnp{external_suffix}")
+            MNP_IS_INSTALLED = True
+        except Exception:
+            _missing.append("mnp")
+            MNP_IS_INSTALLED = False
+
+    try:
+        torch.ops.load_library(internal_path / f"cell_list{internal_suffix}")
+        CLIST_IS_INSTALLED = True
+    except Exception:
+        try:
+            torch.ops.load_library(external_path / f"cell_list{external_suffix}")
+            CLIST_IS_INSTALLED = True
+        except Exception:
+            _missing.append("cell_list")
+            CLIST_IS_INSTALLED = False
+
+if os.getenv("TORCHANI_NO_WARN_EXTENSIONS") != "1":
+    if _missing:
+        warnings.warn(
+            f"The extensions: {_missing} are not installed and will not be available."
+            " To install the extensions first install the CUDA Toolkit, and afterwards "
+            " run `ani build-extensions`"
+            " To suppress warn set the env var TORCHANI_NO_WARN_EXTENSIONS=1"
+            " For example, if using bash,"
+            " you may add `export TORCHANI_NO_WARN_EXTENSIONS=1` to your .bashrc"
+        )
+
+if CUAEV_IS_INSTALLED:
+    import torchani.csrc._cuaev_fake  # noqa: F401
+
+if CLIST_IS_INSTALLED:
+    import torchani.csrc._cell_list_fake  # noqa: F401
+
+
+__all__ = ["CUAEV_IS_INSTALLED", "MNP_IS_INSTALLED", "CLIST_IS_INSTALLED"]

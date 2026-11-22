@@ -1,0 +1,1364 @@
+use std::time::{Duration, Instant};
+
+use bio_apis::{pdbe, rcsb};
+use chrono::Local;
+use egui::{
+    Color32, ComboBox, CornerRadius, Event, FocusDirection, Frame, Key, Margin, Panel, RichText,
+    Sense, Slider, Stroke, TextEdit, Ui,
+};
+use graphics::{ControlScheme, EngineUpdates, Scene};
+use mol_defs::molecules::{MolGenericRef, MolType};
+use panels::{
+    md::md_setup,
+    mol_data,
+    mol_data::display_mol_data,
+    view::{ui_section_vis, view_settings},
+};
+use popup::load_popups;
+
+use crate::{
+    button, cam, cli,
+    cli::autocomplete_cli,
+    drawing::peptide::SFC_DIST_SCALE,
+    file_io::download_mols::load_atom_coords_rcsb,
+    inputs::add_atom_with_tab,
+    label,
+    mol_editor::enter_edit_mode,
+    render::set_flashlight,
+    selection::{Selection, ViewSelLevel, cycle_selected, select_from_search},
+    state::{CamSnapshot, DistFilter, OperatingMode, ResColoring, State},
+    threads::{handle_thread_rx, start_session_restore},
+    ui::{
+        misc::section_box,
+        mol_type_tools::mol_type_toolbars,
+        panels::aa_seq,
+        sidebar::sidebar,
+        util::{QUERY_ENTER_LEN_MIN, handle_redraw, load_mol_from_query, update_file_dialogs},
+    },
+    util::{
+        RedrawFlags, check_prefs_save, close_mol, handle_err, handle_scene_flags, orbit_center,
+    },
+};
+
+mod action_search;
+mod camera;
+mod mdposit;
+pub(crate) mod measurements;
+pub mod misc;
+pub mod mol_editor;
+mod mol_type_tools;
+mod panels;
+pub mod popup;
+mod primary_actions;
+mod safety;
+mod sidebar;
+pub mod util;
+
+pub(crate) use util::{QueryResult, apply_query_result};
+
+use crate::{cam::VIEW_DIR_FRONT, ui::popup::about::DOCS_URL};
+
+pub(in crate::ui) const ROW_SPACING: f32 = 10.;
+pub(in crate::ui) const COL_SPACING: f32 = 30.;
+
+const DENS_ISO_MIN: f32 = 0.6;
+const DENS_ISO_MAX: f32 = 3.0;
+
+const NEARBY_THRESH_MIN: u16 = 5;
+const NEARBY_THRESH_MAX: u16 = 60;
+
+pub(in crate::ui) const COLOR_INACTIVE: Color32 = Color32::GRAY;
+pub(in crate::ui) const COLOR_ACTIVE: Color32 = Color32::LIGHT_GREEN;
+pub(in crate::ui) const COLOR_HIGHLIGHT: Color32 = Color32::LIGHT_BLUE;
+pub(in crate::ui) const COLOR_ACTIVE_RADIO: Color32 = Color32::LIGHT_BLUE;
+pub(in crate::ui) const _COLOR_ATTENTION: Color32 = Color32::ORANGE;
+
+// Creation, simulation runs etc.
+pub(in crate::ui) const COLOR_ACTION: Color32 = Color32::GOLD;
+pub(in crate::ui) const COLOR_REMOVE: Color32 = Color32::LIGHT_RED;
+
+pub(in crate::ui) const COLOR_AMBER: Color32 = Color32::from_rgb(255, 176, 0);
+
+/// The status light, and text, while background computations are running. Amber.
+const COLOR_COMPUTING: Color32 = COLOR_AMBER;
+
+/// Restores egui 0.36's widget sizing and rounding. egui 0.37 doubled the button padding,
+/// made interactive widgets taller, and rounded their corners more.
+fn use_compact_style(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        style.spacing.button_padding = egui::vec2(4., 1.);
+        style.spacing.interact_size.y = 18.;
+
+        let widgets = &mut style.visuals.widgets;
+
+        widgets.noninteractive.corner_radius = CornerRadius::same(2);
+        widgets.inactive.corner_radius = CornerRadius::same(2);
+        widgets.hovered.corner_radius = CornerRadius::same(3);
+        widgets.active.corner_radius = CornerRadius::same(2);
+        widgets.open.corner_radius = CornerRadius::same(2);
+    });
+}
+
+/// Shared trigger for the small-molecule identifier lookup. The lookup itself and its receiver
+/// are shared in `threads`; this keeps its two UI entry points consistent as well.
+pub(in crate::ui) fn load_all_idents_button(ui: &mut Ui, loading: bool) -> bool {
+    if loading {
+        ui.label(RichText::new("Loading identifiers...").color(Color32::GRAY));
+        false
+    } else {
+        button!(
+            ui,
+            "Load all idents",
+            COLOR_ACTION,
+            "Query online databases to load other idents, e.g. ChEBI, PubChem etc"
+        )
+        .clicked()
+    }
+}
+
+const COLOR_OUT_ERROR: Color32 = Color32::LIGHT_RED;
+const COLOR_OUT_NORMAL: Color32 = Color32::WHITE;
+const _COLOR_OUT_SUCCESS: Color32 = Color32::LIGHT_GREEN; // Unused for now
+
+pub const _COLOR_POPUP: Color32 = Color32::from_rgb(20, 20, 30);
+
+// Number of characters to display. E.g. the molecular description. Often long.
+const MAX_TITLE_LEN: usize = 40;
+
+/// Update the tilebar to reflect the current molecule
+fn set_window_title(title: &str, scene: &mut Scene) {
+    scene.window_title = title.to_owned();
+    // ui.ctx().send_viewport_cmd(ViewportCommand::Title(title.to_string()));
+}
+
+#[derive(Clone)]
+struct NumFieldBuffer<T> {
+    text: String,
+    last_value: T,
+    initialized: bool,
+}
+
+impl<T: Default> Default for NumFieldBuffer<T> {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            last_value: T::default(),
+            initialized: false,
+        }
+    }
+}
+
+pub fn num_field<T>(val: &mut T, label: &str, width: u16, ui: &mut Ui)
+where
+    T: std::fmt::Display + std::str::FromStr + Default + Copy + PartialEq + Send + Sync + 'static,
+{
+    ui.label(label);
+    let id = ui.next_auto_id();
+    ui.skip_ahead_auto_ids(1);
+    let had_focus = ui.memory(|memory| memory.has_focus(id));
+    let mut buffer = ui
+        .ctx()
+        .data_mut(|data| data.remove_temp::<NumFieldBuffer<T>>(id))
+        .unwrap_or_default();
+
+    if !buffer.initialized || (!had_focus && buffer.last_value != *val) {
+        buffer.text = val.to_string();
+        buffer.initialized = true;
+    }
+
+    let response = ui.add_sized(
+        [width as f32, Ui::available_height(ui)],
+        TextEdit::singleline(&mut buffer.text).id(id),
+    );
+    if response.changed()
+        && let Ok(value) = buffer.text.parse::<T>()
+    {
+        *val = value;
+    }
+    if response.lost_focus() && buffer.text.parse::<T>().is_err() {
+        buffer.text = val.to_string();
+    }
+
+    buffer.last_value = *val;
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(id, buffer);
+    });
+}
+
+/// Handles keyboard and mouse input not associated with a widget.
+pub fn handle_input(
+    state: &mut State,
+    ui: &mut Ui,
+    engine_updates: &mut EngineUpdates,
+    scene: &mut Scene,
+) {
+    if ui.ctx().memory(|memory| memory.top_modal_layer().is_some()) {
+        return;
+    }
+
+    // EGUI records Tab focus navigation before this handler runs. Clear it before
+    // drawing any widgets, while still handling Tab over the GUI and the scene.
+    if ui.input(|input| input.key_pressed(Key::Tab)) && !ui.ctx().text_edit_focused() {
+        ui.ctx()
+            .memory_mut(|memory| memory.move_focus(FocusDirection::None));
+
+        if state.volatile.operating_mode == OperatingMode::MolEditor || state.active_mol().is_some()
+        {
+            let tab_consumed = ui.input_mut(|input| {
+                let modifiers = input.modifiers;
+                input.consume_key(modifiers, Key::Tab)
+            });
+
+            if tab_consumed {
+                if state.volatile.operating_mode == OperatingMode::MolEditor {
+                    add_atom_with_tab(state, scene, engine_updates);
+                } else {
+                    cam::reset_camera(state, scene, engine_updates, VIEW_DIR_FRONT);
+                }
+            }
+        }
+    }
+
+    // Enter also acts as a click on focused buttons. Keep it available to text
+    // fields, which use Enter to submit commands and queries.
+    if ui.input(|input| input.key_pressed(Key::Enter))
+        && !ui.ctx().text_edit_focused()
+        && state.volatile.mol_manip.mode == crate::mol_manip::ManipMode::None
+    {
+        ui.input_mut(|input| {
+            let modifiers = input.modifiers;
+            input.consume_key(modifiers, Key::Enter);
+        });
+    }
+
+    ui.ctx().input(|ip| {
+        // Check for file drop
+        if let Some(dropped_file) = ip.raw.dropped_files.first()
+            && let Err(e) = state.open_file(dropped_file.path(), scene, engine_updates)
+        {
+            handle_err(&mut state.ui, e.to_string());
+        }
+    });
+}
+
+/// A status light for long-running background computations, e.g. MD, ML inference, or tool
+/// installs: grey if none are running. Otherwise amber, followed by a terse description of each.
+/// Hover for details.
+fn computation_status(state: &State, ui: &mut Ui) {
+    let comps = state.volatile.ongoing_computations.list();
+
+    let color = if comps.is_empty() {
+        COLOR_INACTIVE
+    } else {
+        COLOR_COMPUTING
+    };
+
+    let diameter = ui.spacing().interact_size.y * 0.6;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(diameter, diameter), Sense::hover());
+    let painter = ui.painter();
+
+    painter.circle_filled(rect.center(), diameter / 2., color);
+    if !comps.is_empty() {
+        // A faint halo, so it reads as a light that's on.
+        painter.circle_stroke(
+            rect.center(),
+            diameter / 2. + 2.,
+            Stroke::new(2., color.gamma_multiply(0.35)),
+        );
+    }
+
+    if comps.is_empty() {
+        resp.on_hover_text("No background computations are running.");
+        return;
+    }
+
+    let hover = comps
+        .iter()
+        .map(|c| {
+            let start = c.start.with_timezone(&Local).format("%H:%M:%S");
+            format!("{c}. Started at {start}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let text = comps
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let resp = resp.union(label!(ui, text, COLOR_COMPUTING));
+    resp.on_hover_text(format!("Running in the background:\n{hover}"));
+
+    // Keeps the elapsed times current. This also clears the light shortly after a computation
+    // finishes: its worker thread doesn't request a repaint when its entry is removed.
+    ui.ctx().request_repaint_after(Duration::from_secs(1));
+}
+
+fn get_snap_name(snap: Option<usize>, snaps: &[CamSnapshot]) -> &str {
+    snap.and_then(|i| snaps.get(i))
+        .map_or("None", |snapshot| snapshot.name.as_str())
+}
+
+// todo: Update params A/R
+fn draw_cli(
+    state: &mut State,
+    scene: &mut Scene,
+    engine_updates: &mut EngineUpdates,
+    redraw: &mut RedrawFlags,
+    ui: &mut Ui,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Out: ");
+        if button!(ui, "Clear", Color32::GRAY, "Clear the output text.").clicked() {
+            state.ui.cmd_line_output.clear();
+            state.ui.cmd_line_out_is_err = false;
+        }
+
+        let color = if state.ui.cmd_line_out_is_err {
+            COLOR_OUT_ERROR
+        } else {
+            COLOR_OUT_NORMAL
+        };
+        ui.label(RichText::new(&state.ui.cmd_line_output).color(color));
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("In: ");
+        let edit_resp = ui.add(
+            TextEdit::singleline(&mut state.ui.cmd_line_input)
+                .desired_width(200.)
+                .lock_focus(true),
+        );
+
+        if edit_resp.changed() {
+            // todo: Validate input and color-code?
+        }
+
+        ui.add_space(COL_SPACING / 2.);
+        computation_status(state, ui);
+        ui.add_space(COL_SPACING / 2.);
+
+        let button_clicked = ui.button(RichText::new("Submit")).clicked();
+        // This  behavior of lost and has are due to the default EGUI beavhior of those keys.
+        // We can use the `lock_focus(true)` method to prevent these, but we generally like them.
+        let enter_pressed = edit_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+        let tab_pressed = edit_resp.has_focus() && ui.input(|i| i.key_pressed(Key::Tab));
+        let up_pressed = edit_resp.has_focus() && ui.input(|i| i.key_pressed(Key::ArrowUp));
+        let dn_pressed = edit_resp.has_focus() && ui.input(|i| i.key_pressed(Key::ArrowDown));
+
+        if tab_pressed && !state.ui.cmd_line_input.is_empty() {
+            autocomplete_cli(&mut state.ui.cmd_line_input);
+        }
+
+        if up_pressed {
+            if state.volatile.cli_input_selected != 0 {
+                state.volatile.cli_input_selected -= 1;
+            }
+            if state.volatile.cli_input_history.len() > state.volatile.cli_input_selected {
+                state.ui.cmd_line_input =
+                    state.volatile.cli_input_history[state.volatile.cli_input_selected].clone();
+            }
+        }
+
+        if dn_pressed {
+            if state.volatile.cli_input_selected
+                < state.volatile.cli_input_history.len().saturating_sub(1)
+            {
+                state.volatile.cli_input_selected += 1;
+            }
+            if state.volatile.cli_input_history.len() > state.volatile.cli_input_selected {
+                state.ui.cmd_line_input =
+                    state.volatile.cli_input_history[state.volatile.cli_input_selected].clone();
+            }
+        }
+
+        if (button_clicked || enter_pressed) && state.ui.cmd_line_input.len() >= 2 {
+            // todo: Error color
+            state.ui.cmd_line_output =
+                match cli::handle_cmd(state, scene, engine_updates, &mut redraw.peptide) {
+                    Ok(out) => {
+                        state.ui.cmd_line_out_is_err = false;
+                        out
+                    }
+                    Err(e) => {
+                        eprintln!("Error processing command");
+                        state.ui.cmd_line_out_is_err = true;
+                        e.to_string()
+                    }
+                };
+
+            redraw.set_all();
+
+            state.ui.cmd_line_input = String::new();
+            // Compensates for the default lose focus behavior; we still want the cursor to remain here.
+            edit_resp.request_focus();
+        }
+
+        ui.add_space(COL_SPACING);
+        if ui.button("Command files / macros").clicked() {
+            state.ui.command_files.open = true;
+        }
+        search_in_mol(state, scene, redraw, ui);
+    });
+}
+
+/// UI widget for searching. Depending on context, can search for residues, atoms, or other
+/// parts of the molecule from residue name, amino acid number, or atom/residue serial number. (View select mode
+/// determines which number is searched for.)
+fn search_in_mol(state: &mut State, scene: &mut Scene, redraw: &mut RedrawFlags, ui: &mut Ui) {
+    let active_seq = state
+        .volatile
+        .active_seq
+        .filter(|&i| i < state.sequences.len());
+
+    let residue_navigation = state.ui.view_sel_level == ViewSelLevel::Residue
+        && matches!(state.volatile.active_mol, Some((MolType::Peptide, _)));
+    let nucleic_residues = state.ui.view_sel_level == ViewSelLevel::Residue
+        && matches!(state.active_mol(), Some(MolGenericRef::NucleicAcid(m)) if !m.residues.is_empty());
+
+    let (btn_text_p, btn_text_n) = if active_seq.is_some() || nucleic_residues {
+        ("Prev residue", "Next residue")
+    } else if residue_navigation {
+        ("Prev AA", "Next AA")
+    } else if state.ui.selection.is_bond() {
+        ("Prev bond", "Next bond")
+    } else {
+        ("Prev atom", "Next atom")
+    };
+
+    let help_txt = "Search in the active molecule or sequence by position or residue letter; \
+    for molecules, search by atom serial number, residue serial number, \
+    amino acid identifier, hetero residue name, etc. In Atom/Bond mode, an atom serial number \
+    matches the atom and its connected bonds. Press Enter to go to the next match, e.g. the \
+    same residue number in another chain.";
+
+    let text_color = state.ui.atom_res_search_miss.then_some(COLOR_OUT_ERROR);
+
+    ui.label("Find:").on_hover_text(help_txt);
+    let search_resp = ui
+        .add(
+            TextEdit::singleline(&mut state.ui.atom_res_search)
+                .id(egui::Id::new(primary_actions::FIND_ID))
+                .desired_width(60.)
+                .text_color_opt(text_color),
+        )
+        .on_hover_text(help_txt);
+
+    let enter_pressed = search_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+
+    if search_resp.changed() || enter_pressed {
+        let sel_prev = state.ui.selection.clone();
+
+        let found = select_from_search(state, enter_pressed);
+        let miss = !found && !state.ui.atom_res_search.trim().is_empty();
+
+        if miss != state.ui.atom_res_search_miss {
+            state.ui.atom_res_search_miss = miss;
+            // The text color is applied when the field is drawn; show the change right away.
+            ui.ctx().request_repaint();
+        }
+
+        if state.ui.selection != sel_prev {
+            // The previous selection may be on a different molecule type; clear its highlight too.
+            redraw.set_from_sel(&sel_prev);
+            redraw.set_from_sel(&state.ui.selection);
+
+            if state.volatile.operating_mode == OperatingMode::Primary
+                && let ControlScheme::Arc { center } = &mut scene.input_settings.control_scheme
+            {
+                *center = orbit_center(state);
+            }
+        }
+
+        // Enter surrenders focus by default; keep it, so repeated presses cycle through matches.
+        if enter_pressed {
+            search_resp.request_focus();
+        }
+    }
+
+    if state.active_mol().is_some() || active_seq.is_some() {
+        if ui
+            .button(btn_text_p)
+            .on_hover_text("(Hotkey: Left arrow). Change the selection")
+            .clicked()
+        {
+            cycle_selected(state, scene, true);
+            redraw.set_from_sel(&state.ui.selection);
+        }
+        // todo: DRY
+
+        if ui
+            .button(btn_text_n)
+            .on_hover_text("(Hotkey: Right arrow. Change the selection)")
+            .clicked()
+        {
+            cycle_selected(state, scene, false);
+            redraw.set_from_sel(&state.ui.selection);
+        }
+    }
+}
+
+fn res_coloring_text(coloring: ResColoring, nucleic: bool) -> &'static str {
+    match coloring {
+        ResColoring::AminoAcid if nucleic => "Base",
+        ResColoring::AminoAcid => "AA",
+        ResColoring::Position => "Posit",
+        ResColoring::Hydrophobicity => "Hydro",
+        ResColoring::SiftsUniprot => "SIFTS",
+        ResColoring::Chain => "Chain",
+    }
+}
+
+pub fn view_sel_selector(state: &mut State, redraw: &mut bool, ui: &mut Ui, include_res: bool) {
+    let help_text = "(Hotkeys:  ;  and  '  )";
+    ui.label("View/Sel:").on_hover_text(help_text);
+    let prev_view = state.ui.view_sel_level;
+    let mut view_sel_level = prev_view;
+
+    let views: &[ViewSelLevel] = if include_res {
+        &[ViewSelLevel::AtomBond, ViewSelLevel::Residue]
+    } else {
+        &[ViewSelLevel::AtomBond]
+    };
+
+    // Ideally hover text here too, but I'm not sure how.
+    ComboBox::from_id_salt(1)
+        .width(80.)
+        .selected_text(view_sel_level.to_string())
+        .show_ui(ui, |ui| {
+            for &view in views {
+                ui.selectable_value(&mut view_sel_level, view, view.to_string());
+            }
+        })
+        .response
+        .on_hover_text(help_text);
+
+    if view_sel_level != prev_view {
+        state.set_view_sel_level(view_sel_level);
+        *redraw = true;
+    }
+
+    // Buttons to alter the color profile, e.g. for res position, or partial charge.
+    ui.add_space(COL_SPACING / 2.);
+    match state.ui.view_sel_level {
+        ViewSelLevel::AtomBond => (),
+        ViewSelLevel::Residue => {
+            let prev = state.ui.res_coloring;
+            let nucleic = matches!(state.volatile.active_mol, Some((MolType::NucleicAcid, _)));
+            let options: &[ResColoring] = if nucleic {
+                &[
+                    ResColoring::AminoAcid,
+                    ResColoring::Position,
+                    ResColoring::Chain,
+                ]
+            } else {
+                &[
+                    ResColoring::AminoAcid,
+                    ResColoring::Position,
+                    ResColoring::Hydrophobicity,
+                    ResColoring::SiftsUniprot,
+                    ResColoring::Chain,
+                ]
+            };
+            let displayed = if options.contains(&prev) {
+                prev
+            } else {
+                ResColoring::Position
+            };
+            ComboBox::from_id_salt(11)
+                .width(40.)
+                .selected_text(res_coloring_text(displayed, nucleic))
+                .show_ui(ui, |ui| {
+                    for &v in options {
+                        ui.selectable_value(
+                            &mut state.ui.res_coloring,
+                            v,
+                            res_coloring_text(v, nucleic),
+                        );
+                    }
+                });
+
+            if state.ui.res_coloring != prev {
+                state.volatile.flags.update_ss_mesh = true;
+
+                let peptide_i = state.peptide_for_tools_i();
+                let sifts_pending = peptide_i.is_some_and(|peptide_i| {
+                    state
+                        .volatile
+                        .thread_receivers
+                        .sifts_mapping_avail
+                        .iter()
+                        .any(|(i, _)| *i == peptide_i)
+                });
+                if let Some(pep) = peptide_i.and_then(|i| state.peptides.get_mut(i)) {
+                    if pep.sifts_mapping.is_none() && !sifts_pending {
+                        let ident = &pep.common.ident;
+
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let ident_for_thread = ident.clone();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(pdbe::load_uniprot_mappings(&ident_for_thread));
+                        });
+                        state
+                            .volatile
+                            .thread_receivers
+                            .sifts_mapping_avail
+                            .push((peptide_i.unwrap(), rx));
+                    }
+
+                    // if !state.peptide.is_empty() {
+                    state.volatile.flags.update_sas_coloring = true;
+                }
+                *redraw = true;
+            }
+        }
+    }
+
+    if state.ligands.len() >= 2 {
+        let color = if state.ui.color_by_mol {
+            COLOR_ACTIVE
+        } else {
+            COLOR_INACTIVE
+        };
+
+        if ui
+            .button(RichText::new("Contrast ligs").color(color))
+            .on_hover_text(
+                "Color each small molecule a different color, so you can tell them apart.",
+            )
+            .clicked()
+        {
+            state.ui.color_by_mol = !state.ui.color_by_mol;
+            *redraw = true;
+        }
+    }
+}
+
+fn misc_view_options(state: &mut State, redraw: &mut bool, ui: &mut Ui) {
+    // todo: DRY with view.
+    ui.horizontal_wrapped(|ui| {
+        section_box().show(ui, |ui| {
+            view_sel_selector(state, redraw, ui, true);
+
+            if state.peptides.is_empty() {
+                return; // Only returns from the closure.
+            }
+
+            let dist_filter_opts = [
+                (
+                    DistFilter::None,
+                    "All",
+                    "Show all protein atoms, regardless of distance.",
+                ),
+                (
+                    DistFilter::NearSel,
+                    "Near sel",
+                    "Hide all protein atoms not near the selected atom(s), bond(s), or residue(s).",
+                ),
+                (
+                    DistFilter::NearLig,
+                    "Near lig",
+                    "Hide all protein atoms not near the ligand (Active non-protein molecule).",
+                ),
+                (
+                    DistFilter::NearSfc,
+                    "Near sfc",
+                    "Hide all protein atoms not near the surface of the protein. May assist \
+                    in visualizing interaction sites in some visualization modes, e.g. sticks or \
+                    ball and stick.",
+                ),
+            ];
+
+            if let Some(filter) = misc::selector(ui, state.ui.dist_filter, &dist_filter_opts) {
+                state.ui.dist_filter = filter;
+                *redraw = true;
+            }
+
+            ui.label("pH:");
+            if ui
+                .add_sized(
+                    [34., Ui::available_height(ui)],
+                    TextEdit::singleline(&mut state.ui.ph_input),
+                )
+                .changed()
+                && let Ok(v) = &mut state.ui.ph_input.parse::<f32>()
+            {
+                state.to_save.ph = *v;
+
+                // pH is global, so keep every open peptide in sync.
+                let mut hydrogen_err = None;
+                if let Some(ff_map) = &state.ff_param_set.amber().unwrap().peptide_ff_q_map {
+                    for mol in &mut state.peptides {
+                        if let Err(e) = mol.reassign_hydrogens(state.to_save.ph, ff_map) {
+                            hydrogen_err = Some(format!("Error reassigning hydrogens: {e:?}"));
+                            break;
+                        }
+                        *redraw = true;
+                    }
+                }
+                if let Some(msg) = hydrogen_err {
+                    handle_err(&mut state.ui, msg);
+                }
+            }
+
+            if state.ui.dist_filter != DistFilter::None {
+                let dist_prev = state.ui.nearby_dist_thresh;
+                ui.spacing_mut().slider_width = 160.;
+
+                let slider = Slider::new(
+                    &mut state.ui.nearby_dist_thresh,
+                    NEARBY_THRESH_MIN..=NEARBY_THRESH_MAX,
+                );
+
+                if state.ui.dist_filter == DistFilter::NearSfc {
+                    // The same value, displayed as the depth below the surface it maps to.
+                    let scale = SFC_DIST_SCALE as f64;
+
+                    ui.label("Depth:").on_hover_text(
+                        "Hide protein atoms deeper than this below the surface, in Å.",
+                    );
+                    ui.add(
+                        slider
+                            .custom_formatter(move |v, _| format!("{:.1}", v * scale))
+                            .custom_parser(move |s| s.parse::<f64>().ok().map(|v| v / scale)),
+                    );
+                } else {
+                    ui.label("Dist:");
+                    ui.add(slider);
+                }
+
+                if state.ui.nearby_dist_thresh != dist_prev {
+                    *redraw = true;
+                }
+            }
+        });
+
+        if state.ui.selection != Selection::None {
+            section_box().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    mol_data::selected_data(state, &state.ui.selection, ui);
+                });
+            });
+        }
+    });
+}
+
+/// Conservatively marks preferences dirty for input capable of changing a widget or saved view.
+/// Pointer motion alone is excluded so merely hovering the application never triggers disk I/O.
+fn input_may_change_prefs(ui: &Ui) -> bool {
+    ui.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Cut
+                    | Event::Paste(_)
+                    | Event::Text(_)
+                    | Event::Key { .. }
+                    | Event::PointerButton { .. }
+                    | Event::MouseWheel { .. }
+                    | Event::Zoom(_)
+                    | Event::Rotate(_)
+                    | Event::Ime(_)
+                    | Event::Touch { .. }
+            )
+        })
+    })
+}
+
+fn open_docs() {
+    if let Err(e) = webbrowser::open(DOCS_URL) {
+        eprintln!("Failed to open the web browser: {e:?}");
+    }
+}
+
+fn set_alignment_open(state: &mut State, open: bool) {
+    state.ui.popup.alignment = open;
+    if state.volatile.alignment.mols_to_align.len() < 2 {
+        state.volatile.alignment.mols_to_align = vec![0, 1];
+    }
+}
+
+#[cfg(feature = "synthesis")]
+fn set_synthesis_reactions_open(state: &mut State, open: bool) {
+    if open && !state.ui.popup.synthesis_reactions {
+        state.ui.synthesis_reactions.load();
+    }
+    state.ui.popup.synthesis_reactions = open;
+}
+
+/// A set of controls near the top of the main view. This has buttons to open various tools, settings, databases etc, and
+/// the query input.
+fn top_controls(
+    state: &mut State,
+    scene: &mut Scene,
+    updates: &mut EngineUpdates,
+    redraw: &mut RedrawFlags,
+    ui: &mut Ui,
+) {
+    ui.horizontal_wrapped(|ui| {
+        section_box().show(ui, |ui| {
+            primary_actions::show(state, scene, updates, ui);
+
+            let color_settings = if state.ui.popup.show_settings {
+                Color32::LIGHT_RED
+            } else {
+                COLOR_HIGHLIGHT
+            };
+            if ui
+                .button(RichText::new("⚙").color(color_settings))
+                .clicked()
+            {
+                state.ui.popup.show_settings = !state.ui.popup.show_settings;
+            }
+
+            if ui.button(RichText::new("Editor").color(COLOR_HIGHLIGHT)).clicked() {
+                enter_edit_mode(state, scene, updates);
+            }
+
+            if button!(
+                    ui,
+                    "FF params",
+                    COLOR_HIGHLIGHT,
+                    "View, edit, load, and save the general force field parameters loaded, e.g. \
+                    Amber's parm19, gaff2, amino19, and lipid21, or OPLS-AA/L's."
+                ).clicked() {
+                state.ui.popup.ff_params = !state.ui.popup.ff_params;
+            }
+
+            if button!(
+                        ui, "Mol DBs",
+                        COLOR_HIGHLIGHT,
+                        "Open a window where you can create, read, and update Parquest databases of molecules.\
+                        This is for screening large numbers of molecules."
+
+                    ).clicked() {
+                state.ui.popup.parquet_db = !state.ui.popup.parquet_db;
+            }
+
+            #[cfg(feature = "synthesis")]
+            if button!(
+                    ui,
+                    "Reaction lib",
+                    COLOR_HIGHLIGHT,
+                    "Browse, search, sort, and filter the curated synthesis reaction library."
+                )
+                .clicked()
+            {
+                set_synthesis_reactions_open(state, !state.ui.popup.synthesis_reactions);
+            }
+
+            if button!(
+                    ui,
+                    "Prot design",
+                    COLOR_HIGHLIGHT,
+                    "Generate backbones with RFdiffusion3, predict sequences and structures, and \
+                    inspect or predict protein–ligand binding."
+                )
+                .clicked()
+            {
+                state.ui.popup.protein_tools = !state.ui.popup.protein_tools;
+            }
+
+            if button!(
+                ui,
+                "Q chem",
+                COLOR_HIGHLIGHT,
+                "Run quantum chemistry calculations with Psi4 or ORCA."
+            )
+            .clicked()
+            {
+                state.ui.popup.quantum_chem = !state.ui.popup.quantum_chem;
+            }
+
+            if state.peptides.len() >= 2 && button!(ui, "Compare proteins", COLOR_HIGHLIGHT, "Compare and align 2 proteins").clicked() {
+                state.ui.popup.protein_comparison = true;
+            }
+
+            if button!(ui, "Sel / layers", COLOR_HIGHLIGHT, "View and update fine-tuned selection, and visual layers").clicked() {
+                state.ui.popup.selections = true;
+            }
+
+            if button!(ui, "Meas / colors", COLOR_HIGHLIGHT, "Measure distances and angles, and set color schemes based on atom or residue properties").clicked() {
+                state.ui.popup.measurement = true;
+            }
+
+            if button!(
+            ui,
+            "Res mgmt",
+            COLOR_HIGHLIGHT,
+            "Create ligands from hetero groups or pockets around protein residues. \
+                This may be used in pharmacophore creation, screening, etc. Hetero residues included in mmCIF \
+                files may represent bound ligands."
+        )
+                .clicked()
+            {
+                state.ui.popup.lig_pocket_creation = !state.ui.popup.lig_pocket_creation;
+            }
+
+            if button!(ui, "Figure", COLOR_HIGHLIGHT, "Create a figure suitable for publication.").clicked() {
+                state.publication.open = true;
+            }
+
+
+            // todo: Sort out the intent behind this "Design" button. If we don't end up
+            // todo using it in something like it's current form, remove the underlying
+            // todo code this button woujld call.
+            // if button!(
+            //     ui,
+            //     "Design",
+            //     COLOR_HIGHLIGHT,
+            //     "Design sequences for the active protein's backbone, scan every point mutation \
+            //     for stability, and annotate antibody chains."
+            // )
+            //     .clicked()
+            // {
+            //     state.ui.popup.protein_design = !state.ui.popup.protein_design;
+            // }
+
+            if button!(
+                    ui,
+                    "Alignment screen",
+                    COLOR_HIGHLIGHT,
+                    "Perform a fast small molecule alignment screening from all \
+                    files in a selected folder"
+                ).clicked() {
+                state.ui.popup.alignment_screening = !state.ui.popup.alignment_screening;
+            }
+
+            if button!(
+                    ui,
+                    "Tools",
+                    COLOR_HIGHLIGHT,
+                    "Show which optional third-party tools (OpenFold, RFdiffusion3, OpenDDE, Boltz-2, LigandMPNN, \
+                    GROMACS, ORCA, ...) are installed and working, and how to install the ones that \
+                    are not."
+                )
+                .clicked()
+            {
+                state.ui.popup.external_tools = !state.ui.popup.external_tools;
+            }
+
+            if button!(
+                    ui,
+                    "About",
+                    COLOR_HIGHLIGHT,
+                    "Show this program's version, and links to its home page and source code."
+                )
+                .clicked()
+            {
+                state.ui.popup.about = !state.ui.popup.about;
+            }
+
+            if button!(
+                    ui,
+                    "Docs",
+                    COLOR_HIGHLIGHT,
+                    "Open a web browser to the Molchanica documentation."
+                )
+                .clicked()
+            {
+                open_docs();
+                state.ui.popup.about = !state.ui.popup.about;
+            }
+
+
+            ui.add_space(COL_SPACING * 2.);
+            query_input(state, scene, ui, redraw, updates);
+        });
+    });
+}
+
+/// This function draws the (immediate-mode) GUI.
+/// [UI items](https://docs.rs/egui/latest/egui/struct.Ui.html)
+pub fn ui_handler(state: &mut State, ui: &mut Ui, scene: &mut Scene) -> EngineUpdates {
+    let selection_before = crate::edit_history::SelectionState::capture(state);
+    let history_revision = state.volatile.history.revision;
+    let editor_before = ui
+        .input(|input| !input.events.is_empty())
+        .then(|| crate::edit_history::EditorSnapshot::capture(state))
+        .flatten();
+    let mut updates = EngineUpdates::default();
+    // Some molecule-opening paths set `active_mol` directly. Keep the two pickers exclusive.
+    if state.volatile.active_mol.is_some() && state.volatile.active_seq.is_some() {
+        state.volatile.active_seq = None;
+        state.ui.seq_selection.clear();
+    }
+    if input_may_change_prefs(ui) {
+        state.to_save.save_flag = true;
+    }
+
+    handle_input(state, ui, &mut updates, scene);
+
+    let mut redraw = RedrawFlags::default();
+    crate::inputs::handle_ui_interactions(state, scene, ui.ctx(), &mut redraw, &mut updates);
+
+    if state.refresh_force_fields() {
+        ui.request_repaint();
+        redraw.peptide = true;
+        redraw.ligand = true;
+        redraw.lipid = true;
+        redraw.na = true;
+    }
+
+    // For getting DT for certain buttons when held. Does not seem to be the same as the 3D render DT.
+    let start = Instant::now();
+
+    sidebar(state, scene, &mut redraw, &mut updates, ui);
+
+    let out_main_panel = Panel::top("0").show(ui, |ui| {
+        ui.spacing_mut().slider_width = 120.;
+
+        if state.volatile.operating_mode == OperatingMode::MolEditor {
+            mol_editor::editor(state, scene, &mut updates, redraw.ligand, ui);
+
+            if let Err(e) = update_file_dialogs(state, scene, ui, &mut updates) {
+                handle_err(&mut state.ui, format!("Problem saving file: {e:?}"));
+            }
+
+            if state.mol_editor.md.running {
+                state.mol_editor.md_step(
+                    &state.computation_device(),
+                    &mut scene.entities,
+                    &state.ui,
+                    &mut updates,
+                    state.volatile.mol_manip.mode,
+                );
+            }
+
+            load_popups(state, scene, ui, &mut redraw, &mut updates);
+
+            return;
+        }
+
+        let close_active_mol = false; // to avoid borrow error.
+
+        top_controls(
+            state,
+            scene,
+            &mut updates,
+            &mut redraw,
+            ui,
+        );
+
+        if state.volatile.active_mol.is_some() || state.ligands.len() >= 2 {
+            ui.horizontal(|ui| {
+                section_box().show(ui, |ui| {
+                    if state.volatile.active_mol.is_some() {
+                        display_mol_data(
+                            state,
+                            scene,
+                            ui,
+                            &mut redraw.ligand,
+                            &mut updates,
+                        );
+                    }
+
+                    if state.ligands.len() >= 2 && ui.button("Align")
+                        .on_hover_text("Perform flexible alignment on two opened small molecules. This button opens a \
+                    window which lets you configure and run this alignment, then view the resulting 3D conformations,\
+                    and similarity metrics.")
+                        .clicked() {
+                        set_alignment_open(state, !state.ui.popup.alignment);
+                    }
+                });
+            });
+        }
+
+        // Prevents the UI from jumping.
+        if state.volatile.active_mol.is_none() {
+            ui.add_space(3.);
+        }
+
+        let redraw_prev = redraw.peptide;
+
+        misc_view_options(state, &mut redraw.peptide, ui);
+
+        // todo: Kludge
+        if redraw.peptide && !redraw_prev {
+            redraw.set_all();
+        }
+
+        // One wrapped row shared by the camera controls and the scene snapshots, so items wrap
+        // onto new lines when the window is narrow. (A `section_box` per group instead squeezes
+        // the second group into whatever width is left on the first row, hiding its buttons.)
+        section_box().show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                camera::cam_controls(scene, state, &mut updates, ui);
+
+                ui.add_space(COL_SPACING / 2.);
+                ui.separator();
+                ui.add_space(COL_SPACING / 2.);
+
+                camera::cam_snapshots(state, scene, &mut updates, ui);
+            });
+        });
+
+        // A single wrapped row: view settings and the UI-section toggles share one flow, so
+        // individual items wrap onto new lines when the window is too narrow. (Nesting a
+        // `section_box` per group here instead squeezes the second group into whatever width is
+        // left on the first row, hiding its buttons.)
+        section_box().show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                view_settings(state, scene, &mut updates, &mut redraw, ui);
+
+                ui.add_space(COL_SPACING / 2.);
+                ui.separator();
+                ui.add_space(COL_SPACING / 2.);
+
+                ui_section_vis(state, ui);
+            });
+        });
+
+        if state.ui.ui_vis.aa_selection {
+            panels::aa_selection::aa_selection(state, &mut redraw.peptide, ui);
+        }
+
+        mol_type_toolbars(state, scene, &mut updates, ui);
+
+        if state.ui.ui_vis.dynamics {
+            md_setup(state, scene, &mut updates, ui, &mut redraw);
+        }
+        panels::md_viewer::playback(state, scene, &mut updates, &mut redraw, ui);
+
+        // todo: Allow switching between chains and secondary-structure features here.
+
+        ui.add_space(ROW_SPACING / 2.);
+
+        if let Some(seq_i) = state.volatile.active_seq {
+            aa_seq::standalone_sequence(state, seq_i, scene, &mut updates, ui);
+        } else if state.ui.ui_vis.aa_seq && !state.peptides.is_empty() {
+            let peptide_name = state
+                .volatile
+                .active_peptide
+                .and_then(|i| state.peptides.get(i))
+                .map(|mol| mol.common.name(None).to_string());
+
+            let create_seq = aa_seq::peptide_aa_seq(
+                &mut state.ui.selection,
+                peptide_name.as_deref(),
+                &state.volatile.aa_seq_text,
+                &state.volatile.aa_seq_res_indices,
+                &state.volatile.aa_seq_res_sns,
+                &mut state.volatile.aa_seq_display_cache,
+                ui,
+                &mut redraw.peptide,
+            );
+
+            // The whole sequence, not just the selected residues.
+            if create_seq {
+                let text = state.volatile.aa_seq_text.clone();
+                panels::aa_creation::create_sequence(&text, peptide_name.as_deref(), state);
+            }
+        }
+
+        draw_cli(
+            state,
+            scene,
+            &mut updates,
+            &mut redraw,
+            ui,
+        );
+
+        load_popups(state, scene, ui, &mut redraw, &mut updates);
+
+        // -------UI above; clean-up items (based on flags) below
+
+        if close_active_mol && let Some((mol_type, i)) = state.volatile.active_mol {
+            close_mol(mol_type, i, state, scene, &mut redraw, &mut updates);
+        }
+
+        if let Err(e) = update_file_dialogs(state, scene, ui, &mut updates) {
+            handle_err(&mut state.ui, format!("Problem saving file: {e:?}"));
+        }
+    });
+
+    // todo: Experimenting
+    updates.ui_reserved_px.1 = out_main_panel.response.rect.height();
+
+    if let Some(selection) = state.volatile.pending_selection_redraw.take() {
+        redraw.set_from_sel(&selection);
+    }
+
+    // todo: Appropriate place for this?
+    if state.volatile.inputs_commanded.inputs_present() {
+        set_flashlight(scene);
+        updates.lighting = true;
+    }
+
+    measurements::show(state, ui.ctx(), &mut redraw);
+    popup::command_files::command_window(state, scene, &mut updates, &mut redraw, ui.ctx());
+    let scene_restored = std::mem::take(&mut state.volatile.flags.scene_restored);
+    if scene_restored {
+        redraw.set_all();
+    }
+    handle_scene_flags(state, scene, &mut updates);
+    let query_was_pending = state.volatile.thread_receivers.query.is_some();
+    handle_thread_rx(state, scene, &mut redraw, &mut updates);
+    mdposit::show(state, scene, &mut updates, &mut redraw, ui.ctx());
+    if query_was_pending && state.volatile.thread_receivers.query.is_none() {
+        ui.request_repaint();
+    }
+    start_session_restore(state);
+    if state.refresh_force_fields() {
+        ui.request_repaint();
+        redraw.peptide = true;
+        redraw.ligand = true;
+        redraw.lipid = true;
+        redraw.na = true;
+    }
+    if state.volatile.thread_receivers.has_pending() || state.force_fields.has_pending() {
+        ui.request_repaint_after(Duration::from_millis(50));
+    }
+
+    handle_redraw(state, scene, &mut redraw, &mut updates);
+
+    // Load a finished Dynamics run's output. The run itself is on a worker thread.
+    crate::md::poll_dynamics_run(state, scene, &mut updates);
+    if scene_restored && state.volatile.md_local.draw_md_mols {
+        crate::md::viewer::draw_mols(state, scene, &mut updates);
+    }
+    crate::drawing::representations::update(state, scene, &mut updates);
+    crate::drawing::floor::update(state, scene, &mut updates);
+    crate::util::release_unused_scene_memory(state, scene, &mut updates);
+    state.release_mol_db_caches();
+    updates.camera |= cam::apply_slab(state, &mut scene.camera);
+    measurements::paint(state, scene, ui.ctx(), updates.ui_reserved_px);
+    measurements::paint_labels(state, scene, ui.ctx(), updates.ui_reserved_px);
+
+    // Capture after pending geometry updates, so the figure reflects this frame's scene.
+    crate::publication::show(state, scene, ui.ctx());
+
+    state.ui.dt_render = start.elapsed().as_secs_f32();
+
+    if let Some(prefs_check_delay) = check_prefs_save(state) {
+        ui.request_repaint_after(prefs_check_delay);
+    }
+
+    if state.mol_editor.md.running {
+        ui.request_repaint();
+    } else if state.volatile.md_local.running() {
+        // For the progress display, and to poll for completion.
+        ui.request_repaint_after(Duration::from_millis(100));
+    }
+
+    crate::edit_history::record_editor(state, editor_before, history_revision);
+    crate::edit_history::record_selection(state, selection_before, history_revision);
+    crate::gizmo::update_overlays(state, scene, ui.ctx());
+    crate::region_select::paint(state, scene, ui.ctx());
+
+    updates
+}
+
+pub fn flag_btn(val: &mut bool, label: &str, hover_text: &str, ui: &mut Ui) {
+    let color = if *val { COLOR_ACTIVE } else { COLOR_INACTIVE };
+    if ui
+        .button(RichText::new(label).color(color))
+        .on_hover_text(hover_text)
+        .clicked()
+    {
+        *val = !(*val);
+    }
+}
+
+/// Frame so we can draw a colored box around the active one.
+pub(in crate::ui) fn highlighted_box(active: bool, fill: Color32) -> Frame {
+    if active {
+        Frame::new()
+            .stroke(Stroke::new(1.0, COLOR_ACTIVE_RADIO))
+            .fill(fill)
+            .corner_radius(CornerRadius::same(2))
+            .inner_margin(Margin::symmetric(2, 2))
+            .outer_margin(Margin::symmetric(0, 0))
+    } else {
+        Frame::new()
+    }
+}
+
+/// An input element to query remote databases, and similar.
+fn query_input(
+    state: &mut State,
+    scene: &mut Scene,
+    ui: &mut Ui,
+    redraw: &mut RedrawFlags,
+    updates: &mut EngineUpdates,
+) {
+    let color_open_tools = if state.peptides.is_empty() && state.ligands.is_empty() {
+        COLOR_ACTION
+    } else {
+        COLOR_INACTIVE
+    };
+
+    let query_help = "Download and view a molecule from databases including RCSB PDB, PDBe, \
+        PubChem, DrugBank, ChEBI, UniProt, AlphaFold DB, etc. Prefix with `pdbe:` or `chebi:` to \
+        query only that database.";
+    ui.label(RichText::new("Query:").color(color_open_tools))
+        .on_hover_text(query_help);
+
+    let mut input_trimmed = std::mem::take(&mut state.ui.db_input_trimmed);
+    let mut input_lowercase = std::mem::take(&mut state.ui.db_input_lowercase);
+
+    let query_loading = state.volatile.thread_receivers.query.is_some();
+    let edit_resp = ui
+        .add_enabled(
+            !query_loading,
+            TextEdit::singleline(&mut state.ui.db_input)
+                .id(egui::Id::new(primary_actions::DB_QUERY_ID))
+                .desired_width(180.),
+        )
+        .on_hover_text(query_help);
+
+    if query_loading {
+        ui.spinner().on_hover_text("Loading molecule...");
+    }
+
+    if edit_resp.changed() {
+        input_trimmed.clear();
+        input_trimmed.push_str(state.ui.db_input.trim());
+        input_lowercase.clear();
+        input_lowercase.push_str(&input_trimmed);
+        input_lowercase.make_ascii_lowercase();
+    }
+
+    if !state.ui.db_input.is_empty() {
+        // Preserve original case — SMILES uses lowercase for aromatic atoms and
+        // uppercase for aliphatic atoms; lowercasing destroys that distinction.
+        let enter_pressed = input_trimmed.len() >= QUERY_ENTER_LEN_MIN
+            && edit_resp.lost_focus()
+            && ui.input(|i| i.key_pressed(Key::Enter));
+
+        ui.add_enabled_ui(!query_loading, |ui| {
+            load_mol_from_query(state, ui, &input_trimmed, &input_lowercase, enter_pressed);
+        });
+    }
+
+    if state.ui.db_input.is_empty() {
+        input_trimmed.clear();
+        input_lowercase.clear();
+    }
+    state.ui.db_input_trimmed = input_trimmed;
+    state.ui.db_input_lowercase = input_lowercase;
+    if state.peptides.is_empty()
+        && state.ligands.is_empty()
+        && state.nucleic_acids.is_empty()
+        && state.lipids.is_empty()
+        && state.active_mol().is_none()
+    {
+        ui.add_space(COL_SPACING / 2.);
+        if ui
+            .button(RichText::new("I'm feeling lucky 🍀").color(color_open_tools))
+            .on_hover_text("Open a random recently-uploaded protein from RCSB PDB.")
+            .clicked()
+        {
+            match rcsb::get_newly_released() {
+                Ok(ident) => {
+                    load_atom_coords_rcsb(&ident, state, scene, updates, &mut redraw.peptide);
+                }
+                Err(e) => handle_err(
+                    &mut state.ui,
+                    format!("Error loading a protein from RCSB: {e:?}"),
+                ),
+            }
+        }
+    }
+}

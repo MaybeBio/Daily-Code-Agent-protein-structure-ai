@@ -1,0 +1,901 @@
+"""Contact definition edge cases, the causal zero, and the refusals that matter.
+
+The contact relation carries the structural claim of E01 and E02, so the places
+it could silently admit the wrong pair are tested directly: the cutoff boundary,
+the sequence-separation floor, and a position whose coordinate was never mapped.
+An assay without an admitted structure must fail by name rather than quietly
+produce a non-structural number under a structural heading, which is the last
+test group here.
+"""
+
+import hashlib
+import importlib.util
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from src.capability.position.anticipation import (
+    MIN_FAMILIES,
+    anchor_partner_design,
+    composition,
+    excess_logprob,
+    pair_conditional,
+)
+from src.capability.position.contact_response import (
+    CONTACT_ANGSTROM,
+    MIN_SEQUENCE_SEPARATION,
+    ProfileAccumulator,
+    SiteGeometry,
+    admitted_geometry,
+    agrees_with_frozen,
+    contact_family_table,
+    contact_pairs,
+    decay_fit,
+    panel_contact_simultaneous,
+    receiver_census,
+    require_geometry,
+    separation_stratum,
+    simultaneous_admits,
+    simultaneous_bands,
+    stratified_contact_contrast,
+)
+from src.capability.position.position_likelihood import CAUSAL, MASKED
+
+WILDTYPE = "MKQLEDKVEELLSKNYHLENEVARLKKLVGER"
+ALPHABET = tuple(sorted(set(WILDTYPE)))
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def line(positions, *, spacing=1.0):
+    """Residues on a straight line, so every distance is exactly computable."""
+
+    return {
+        position: SiteGeometry(
+            j=position, residue=WILDTYPE[position],
+            atom="CA" if WILDTYPE[position] == "G" else "CB",
+            xyz=(spacing * position, 0.0, 0.0), rsa=0.25,
+        )
+        for position in positions
+    }
+
+
+# ------------------------------------------------------- the contact relation
+
+
+def test_the_cutoff_is_strict_so_a_pair_exactly_at_it_is_not_a_contact():
+    geometry = line([0, 8, 16], spacing=1.0)
+    pairs = contact_pairs(geometry, cutoff=8.0, min_separation=6)
+    assert pairs["distance"][(0, 8)] == 8.0
+    assert (0, 8) not in pairs["contacts"]
+    assert (8, 16) not in pairs["contacts"]
+    closer = contact_pairs(line([0, 8], spacing=0.9), cutoff=8.0, min_separation=6)
+    assert (0, 8) in closer["contacts"]
+
+
+def test_the_separation_floor_removes_trivially_close_neighbours():
+    geometry = line(range(12), spacing=0.5)
+    floored = contact_pairs(geometry, min_separation=6)
+    assert all(high - low >= 6 for low, high, _ in floored["pairs"])
+    assert floored["min_separation"] == 6
+    loose = contact_pairs(geometry, min_separation=1)
+    assert loose["n_pairs"] > floored["n_pairs"]
+    assert all(high - low >= 1 for low, high, _ in loose["pairs"])
+
+
+def test_a_position_without_a_coordinate_is_in_neither_class():
+    full = contact_pairs(line([0, 7, 14, 21]), min_separation=6)
+    partial = contact_pairs(line([0, 14, 21]), min_separation=6)
+    assert 7 in full["eligible_positions"]
+    assert 7 not in partial["eligible_positions"]
+    # A dropped position does not become a non-contact: it leaves the population.
+    assert partial["n_pairs"] < full["n_pairs"]
+    assert all(7 not in (low, high) for low, high, _ in partial["pairs"])
+
+
+def test_the_relation_is_symmetric_carries_no_self_pair_and_declares_itself():
+    pairs = contact_pairs(line([0, 7, 14]), min_separation=6)
+    assert all(low < high for low, high, _ in pairs["pairs"])
+    assert all(low != high for low, high, _ in pairs["pairs"])
+    assert "8.0 angstrom" in pairs["definition"] and "at least 6" in pairs["definition"]
+    assert pairs["cutoff_angstrom"] == CONTACT_ANGSTROM == 8.0
+    assert MIN_SEQUENCE_SEPARATION == 6
+
+
+def test_an_impossible_cutoff_or_floor_is_refused_rather_than_clamped():
+    geometry = line([0, 7, 14])
+    for cutoff in (0.0, -1.0, float("inf")):
+        with pytest.raises(ValueError, match="positive finite distance"):
+            contact_pairs(geometry, cutoff=cutoff)
+    with pytest.raises(ValueError, match="at least one residue"):
+        contact_pairs(geometry, min_separation=0)
+
+
+def test_a_non_finite_coordinate_cannot_enter_the_relation():
+    geometry = dict(line([0, 7]))
+    geometry[14] = SiteGeometry(j=14, residue="S", atom="CB",
+                                xyz=(float("nan"), 0.0, 0.0), rsa=None)
+    with pytest.raises(ValueError):
+        contact_pairs(geometry, min_separation=6)
+
+
+def test_the_separation_strata_reuse_the_frozen_edges():
+    assert separation_stratum(6) == "3-8"
+    assert separation_stratum(9) == "9-16"
+    assert separation_stratum(33) == "33-64"
+    assert separation_stratum(500) == "129+"
+
+
+# ----------------------------------------------- missing structure: refusals
+
+
+def structure_fixture(wildtype=WILDTYPE, *, admitted_positions=None, drop_position=None,
+                      assay="TEST_ASSAY", cluster=7):
+    """A minimal site table and the coverage receipt it must agree with."""
+
+    digest = hashlib.sha256(wildtype.encode()).hexdigest()
+    source_sha = "a" * 64
+    source_path = "/structures/TEST.cif.gz"
+    provenance = {
+        "source_sha256": source_sha, "source_path": source_path, "entry_id": "TEST",
+        "entity_id": "1", "chain": "A", "auth_chain": "A", "model": 1,
+        "mapping_kind": "full_entity",
+    }
+    admitted = set(range(len(wildtype)) if admitted_positions is None else admitted_positions)
+    rows = []
+    for index, residue in enumerate(wildtype):
+        if drop_position is not None and index == drop_position:
+            continue
+        present = index in admitted
+        rows.append({
+            "assay_id": assay, "cluster": cluster, "wt_position": index + 1,
+            "residue": residue, "wildtype": wildtype, "wildtype_sha256": digest,
+            "status": "admitted", "method": "SOLUTION NMR",
+            "contact_atom": "CA" if residue == "G" else "CB",
+            "contact_atom_present": present, "coordinate_present": present,
+            "contact_coordinate": [float(index), 0.0, 0.0] if present else None,
+            "rsa": 0.3 if present else None, "secondary_structure": None,
+            **provenance,
+        })
+    coverage = {
+        "assays": [{"assay": assay, "cluster": cluster, "status": "admitted",
+                    "method": "SOLUTION NMR", **provenance}],
+        "sources": [{"path": source_path, "sha256": source_sha, "status": "parsed",
+                     "method": "SOLUTION NMR", "entry_id": "TEST"}],
+    }
+    return rows, coverage, assay, cluster
+
+
+def test_a_valid_site_table_yields_only_the_mapped_coordinates():
+    rows, coverage, assay, cluster = structure_fixture(admitted_positions=range(0, 32, 2))
+    geometry = admitted_geometry(rows, assay=assay, family=cluster, wildtype=WILDTYPE,
+                                 coverage=coverage)
+    assert sorted(geometry) == list(range(0, 32, 2))
+    assert geometry[0].residue == WILDTYPE[0]
+
+
+def test_an_incomplete_site_table_fails_rather_than_mapping_what_it_has():
+    rows, coverage, assay, cluster = structure_fixture(drop_position=5)
+    with pytest.raises(ValueError, match="every WT site"):
+        admitted_geometry(rows, assay=assay, family=cluster, wildtype=WILDTYPE,
+                          coverage=coverage)
+
+
+def test_a_site_table_for_another_family_fails_rather_than_being_reassigned():
+    rows, coverage, assay, cluster = structure_fixture()
+    with pytest.raises(ValueError, match="assay/family binding mismatch"):
+        admitted_geometry(rows, assay=assay, family=cluster + 1, wildtype=WILDTYPE,
+                          coverage=coverage)
+
+
+def test_an_assay_absent_from_the_table_fails_by_name():
+    rows, coverage, _assay, cluster = structure_fixture()
+    with pytest.raises(ValueError):
+        admitted_geometry(rows, assay="MISSING_ASSAY", family=cluster, wildtype=WILDTYPE,
+                          coverage=coverage)
+
+
+def test_an_unmappable_assay_is_refused_and_not_analysed_without_structure():
+    with pytest.raises(ValueError, match="no structural support and is refused"):
+        require_geometry({}, assay="TEST_ASSAY")
+    with pytest.raises(ValueError, match="no structural support and is refused"):
+        require_geometry(line([3]), assay="TEST_ASSAY")
+    require_geometry(line([3, 20]), assay="TEST_ASSAY")
+
+
+# --------------------------------------------------- the per-residue response
+
+
+def archive(wild_terms, mutant_terms, *, counts=None, offset=0):
+    """A minimal two-state payload in the layout the archive writes."""
+
+    wild = np.asarray(wild_terms, dtype=np.float32)
+    mutant = np.asarray(mutant_terms, dtype=np.float32)
+    counts = np.ones(len(wild), dtype=np.int64) if counts is None else np.asarray(counts)
+    return {
+        "position_nats": np.concatenate([wild, mutant]),
+        "position_offsets": np.asarray([0, len(wild), len(wild) + len(mutant)]),
+        "position_residue_counts": np.concatenate([counts, counts]),
+        "position_residue_offsets": np.asarray([offset, offset]),
+        "state_id_offsets": np.asarray([0, len(wild) + 1, 2 * (len(wild) + 1)]),
+        "state_ids": np.arange(2 * (len(wild) + 1)),
+        "state_spans": np.asarray([[1, len(wild) + 1], [1, len(mutant) + 1]]),
+    }
+
+
+def test_the_response_before_a_substitution_is_required_to_be_exactly_zero():
+    wild = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    moved = [1.0, 1.0, 1.0001, 1.0, 2.0, 2.0, 2.0, 2.0]
+    with pytest.raises(ValueError, match="packing, alignment or forward defect"):
+        receiver_census(archive(wild, moved), 0, site=4, paradigm=CAUSAL)
+
+
+def test_a_clean_causal_response_is_one_sided_and_reports_its_own_census():
+    wild = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    mutant = [1.0, 1.0, 1.0, 1.0, 3.0, 2.0, 1.5, 1.0]
+    census = receiver_census(archive(wild, mutant), 0, site=4, paradigm=CAUSAL)
+    assert census["upstream_max_abs_nats"] == 0.0
+    assert census["upstream_receivers"] == 4
+    assert census["downstream_receivers"] == 3
+    assert census["site_response"] == pytest.approx(-2.0)
+    assert all(row["response"] == 0.0 for row in census["receivers"]
+               if row["direction"] == "upstream")
+    assert census["total"] == pytest.approx(-3.5)
+
+
+def test_a_masked_arm_may_respond_upstream_and_that_is_recorded_not_refused():
+    wild = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    mutant = [1.2, 0.9, 1.0, 1.4, 3.0, 2.0, 1.5, 1.0]
+    census = receiver_census(archive(wild, mutant), 0, site=4, paradigm=MASKED)
+    assert census["upstream_max_abs_nats"] == pytest.approx(0.4, abs=1e-6)
+    assert any(row["response"] != 0.0 for row in census["receivers"]
+               if row["direction"] == "upstream")
+
+
+def test_a_multiresidue_token_is_a_remainder_and_never_attributed_to_a_position():
+    wild = [1.0, 1.0, 1.0, 1.0, 1.0]
+    mutant = [1.0, 1.0, 1.0, 2.0, 3.0]
+    counts = np.asarray([1, 1, 1, 2, 1], dtype=np.int64)
+    census = receiver_census(archive(wild, mutant, counts=counts), 0, site=2,
+                             paradigm=CAUSAL)
+    assert {row["j"] for row in census["receivers"]} == {0, 1, 5}
+    assert census["multiresidue_remainder"] == pytest.approx(-1.0)
+
+
+def test_a_disagreement_with_the_frozen_reader_is_an_error_not_a_tolerance():
+    wild = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    mutant = [1.0, 1.0, 1.0, 1.0, 3.0, 2.0, 1.5, 1.0]
+    census = receiver_census(archive(wild, mutant), 0, site=4, paradigm=CAUSAL)
+    frozen = {"receivers": [{"j": 5, "response": -1.0}, {"j": 6, "response": -0.5},
+                            {"j": 7, "response": 0.0}]}
+    assert agrees_with_frozen(census, frozen)["downstream_receivers"] == 3
+    frozen["receivers"][0]["response"] = -1.25
+    with pytest.raises(ValueError, match="differ from the frozen reader"):
+        agrees_with_frozen(census, frozen)
+    del frozen["receivers"][0]
+    with pytest.raises(ValueError, match="receiver sets disagree"):
+        agrees_with_frozen(census, frozen)
+
+
+# -------------------------------------------------- the profile and contrast
+
+
+def test_the_profile_streams_and_its_decay_describes_a_falling_response():
+    accumulator = ProfileAccumulator(direction="downstream", min_support=1)
+    for separation in range(1, 21):
+        accumulator.add([{"direction": "downstream", "separation": separation,
+                          "response": -float(np.exp(-0.1 * separation))}
+                         for _ in range(3)])
+    profile = accumulator.profile()
+    assert profile["receivers"] == 60 and profile["max_separation"] == 20
+    assert profile["decay"]["fitted"] is True
+    assert profile["decay"]["slope_per_residue"] == pytest.approx(-0.1, abs=1e-6)
+    assert profile["decay"]["half_distance_residues"] == pytest.approx(np.log(2) / 0.1, rel=1e-3)
+
+
+def test_a_flat_or_rising_profile_reports_no_half_distance():
+    flat = [{"separation": d, "n": 10, "mean_absolute_nats": 0.5, "sufficient": True}
+            for d in range(1, 6)]
+    assert decay_fit(flat)["fitted"] is False
+    assert decay_fit(flat)["half_distance_residues"] is None
+    assert decay_fit(flat)["half_distance_undefined_reason"]
+
+    rising = [{"separation": d, "n": 10, "mean_absolute_nats": 0.1 * d, "sufficient": True}
+              for d in range(1, 8)]
+    fitted = decay_fit(rising)
+    assert fitted["fitted"] is True and fitted["slope_per_residue"] > 0
+    assert fitted["half_distance_residues"] is None
+
+    noisy = [{"separation": d, "n": 10, "sufficient": True,
+              "mean_absolute_nats": 0.5 + 0.3 * ((-1) ** d)} for d in range(1, 9)]
+    assert decay_fit(noisy)["half_distance_residues"] is None
+
+    # Too few supported separations is not a fit at all, and still has the key.
+    short = decay_fit(flat[:2])
+    assert short["fitted"] is False and short["half_distance_residues"] is None
+    assert short["half_distance_interval_residues"] is None
+
+
+def test_the_half_distance_interval_brackets_the_fitted_half_distance():
+    # A clean exponential: the half-distance of exp(-d/tau) is tau * ln 2.
+    clean = [{"separation": d, "n": 100, "sufficient": True,
+              "mean_absolute_nats": 0.5 * np.exp(-d / 30.0)} for d in range(1, 80)]
+    fit = decay_fit(clean)
+    assert fit["half_distance_residues"] == pytest.approx(30.0 * np.log(2), rel=1e-6)
+    low, high = fit["half_distance_interval_residues"]
+    assert low <= fit["half_distance_residues"] <= high
+
+    # Noise on the same decay widens the interval and keeps it bracketing.
+    noisy = [{"separation": d, "n": 100, "sufficient": True,
+              "mean_absolute_nats": 0.5 * np.exp(-d / 30.0) * (1 + 0.3 * ((-1) ** d))}
+             for d in range(1, 80)]
+    rough = decay_fit(noisy)
+    rough_low, rough_high = rough["half_distance_interval_residues"]
+    assert rough_low < rough["half_distance_residues"] < rough_high
+    assert rough_high - rough_low > high - low
+    # Monotone, not linearised: a steeper slope is the SHORTER half-distance.
+    assert rough_low == pytest.approx(
+        np.log(2) / (-rough["slope_per_residue"] + 1.96 * rough["slope_standard_error"])
+    )
+    assert fit["half_distance_interval_basis"]
+
+    # An unresolved slope has no half-distance and therefore no interval.
+    rising = [{"separation": d, "n": 10, "mean_absolute_nats": 0.1 * d, "sufficient": True}
+              for d in range(1, 8)]
+    unresolved = decay_fit(rising)
+    assert unresolved["half_distance_residues"] is None
+    assert unresolved["half_distance_interval_residues"] is None
+
+
+def test_the_contrast_compares_only_inside_one_anchor_and_one_stratum():
+    def row(contact, stratum, separation, response, mutation="A1G"):
+        return {"assay": "A", "family": 1, "mutation": mutation, "i": 0, "j": separation,
+                "separation": separation, "direction": "downstream",
+                "response": response, "absolute_response": abs(response),
+                "contact": contact, "structure_distance_angstrom": 5.0 if contact else 15.0,
+                "rsa": 0.2, "stratum": stratum}
+
+    unmatched = [row(True, "9-16", 10, -1.0), row(False, "33-64", 40, -0.1)]
+    result = stratified_contact_contrast(unmatched)
+    assert result["matched_cells"] == 0
+    assert result["estimate_nats"]["point"] is None
+
+    matched = []
+    for family in range(1, 7):
+        for contact, value in ((True, -1.0), (False, -0.4)):
+            item = row(contact, "9-16", 10, value)
+            item["family"] = family
+            item["assay"] = f"A{family}"
+            matched.append(item)
+    result = stratified_contact_contrast(matched)
+    assert result["matched_cells"] == 6
+    assert result["estimate_nats"]["point"] == pytest.approx(0.6)
+    assert result["separation_imbalance_residues"] == pytest.approx(0.0)
+
+
+# ------------------------------------------- the receiver-burial sensitivity
+
+
+def _rsa_row(*, contact, rsa, response, j, separation=10, direction="downstream",
+             mutation="A1G"):
+    """One receiver in one mutation and separation stratum, with its own burial."""
+
+    return {
+        "assay": "A", "family": 1, "mutation": mutation, "i": 0, "j": j,
+        "separation": separation, "direction": direction,
+        "response": response, "absolute_response": abs(response),
+        "contact": contact, "structure_distance_angstrom": 5.0 if contact else 15.0,
+        "rsa": rsa, "stratum": "9-16",
+    }
+
+
+def _band_composition_rows():
+    """Three buried contacts and one buried control at 0.3, one exposed contact and
+    three exposed controls at 0.1, all in one mutation and one separation stratum.
+
+    The primary contrast is +0.1 and is entirely a difference in how buried the
+    two classes are, not a contact effect; the single separation cell splits into
+    a buried and an exposed band cell under the sensitivity key.
+    """
+
+    return (
+        [_rsa_row(contact=True, rsa=0.10, response=0.3, j=10) for _ in range(3)]
+        + [_rsa_row(contact=False, rsa=0.10, response=0.3, j=11)]
+        + [_rsa_row(contact=True, rsa=0.60, response=0.1, j=12)]
+        + [_rsa_row(contact=False, rsa=0.60, response=0.1, j=13) for _ in range(3)]
+    )
+
+
+def load_propagation_stage():
+    """The E01 runner, loaded the way the sibling stage tests load theirs."""
+
+    path = ROOT / "scripts/capability/position/analyse_position_propagation.py"
+    spec = importlib.util.spec_from_file_location("_position_propagation_stage", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_receiver_burial_matched_sensitivity_removes_a_band_composition_contrast():
+    rows = _band_composition_rows()
+    primary = stratified_contact_contrast(rows)
+    assert primary["estimate_nats"]["point"] == pytest.approx(0.1)
+    # The primary path carries none of the sensitivity's fields.
+    assert "rsa_boundary" not in contact_family_table(rows)
+    assert "receiver_rsa_imbalance" not in primary
+
+    matched = stratified_contact_contrast(rows, rsa_boundary=0.25)
+    assert matched["estimate_nats"]["point"] == pytest.approx(0.0)
+    assert matched["matched_cells"] == 2
+    assert matched["matched_receivers"] == 8
+    assert matched["families"] == [1]
+    assert matched["rsa_boundary"] == 0.25
+    assert matched["receiver_bands_present"] == ["buried", "exposed"]
+    assert matched["receiver_rsa_imbalance"] == pytest.approx(0.0)
+    assert matched["separation_imbalance_residues"] == pytest.approx(0.0)
+    # Direction is still a filter, and a direction with no contacts is left
+    # undefined rather than answered from the other direction.
+    assert stratified_contact_contrast(
+        rows, direction="upstream", rsa_boundary=0.25
+    )["matched_cells"] == 0
+
+
+def test_the_receiver_burial_matched_sensitivity_preserves_a_within_band_contrast():
+    rows = [
+        _rsa_row(contact=True, rsa=0.10, response=0.5, j=10),
+        _rsa_row(contact=False, rsa=0.10, response=0.2, j=11),
+    ]
+    primary = stratified_contact_contrast(rows)
+    matched = stratified_contact_contrast(rows, rsa_boundary=0.25)
+    assert primary["estimate_nats"]["point"] == pytest.approx(0.3)
+    assert matched["estimate_nats"]["point"] == pytest.approx(0.3)
+    assert matched["matched_cells"] == 1
+    assert matched["matched_receivers"] == 2
+
+    # The sensitivity panel declares its own boundary and weighting, and the
+    # primary panel record is unchanged by the option existing.
+    columns = [{
+        "arm": "arm", "direction": "downstream",
+        "family_values": contact_family_table(
+            _family_rows({family: 0.1 * family for family in range(1, 7)}),
+            rsa_boundary=0.25,
+        )["family_values"],
+    }]
+    plain = panel_contact_simultaneous(columns, outcome="absolute_response", draws=200)
+    declared = panel_contact_simultaneous(
+        columns, outcome="absolute_response", draws=200, rsa_boundary=0.25
+    )
+    assert "rsa_boundary" not in plain
+    assert declared["rsa_boundary"] == 0.25
+    assert declared["weighting"] != plain["weighting"]
+    assert "band" in declared["weighting"]
+
+
+def test_disjoint_receiver_bands_leave_the_sensitivity_undefined_not_falling_back():
+    rows = (
+        [_rsa_row(contact=True, rsa=0.60, response=0.5, j=j) for j in (10, 11, 12)]
+        + [_rsa_row(contact=False, rsa=0.10, response=0.1, j=j) for j in (13, 14, 15)]
+    )
+    primary = stratified_contact_contrast(rows)
+    assert primary["estimate_nats"]["point"] == pytest.approx(0.4)
+
+    matched = stratified_contact_contrast(rows, rsa_boundary=0.25)
+    assert matched["matched_cells"] == 0
+    assert matched["family_values"] == {}
+    assert matched["families"] == []
+    assert matched["estimate_nats"]["point"] is None
+    assert matched["estimate_nats"]["undefined"]
+    # No cross-contact control is manufactured: the sensitivity stays undefined
+    # instead of being answered with the primary number.
+    assert matched["estimate_nats"]["point"] != primary["estimate_nats"]["point"]
+
+
+def test_the_receiver_burial_sensitivity_refuses_an_absent_or_nonfinite_rsa():
+    rows = [
+        _rsa_row(contact=True, rsa=0.10, response=0.4, j=10),
+        _rsa_row(contact=False, rsa=0.10, response=0.2, j=11),
+    ]
+    # The primary key does not read burial at all, so an absent RSA is admissible.
+    missing = [dict(row) for row in rows]
+    missing[1]["rsa"] = None
+    assert contact_family_table(missing)["matched_cells"] == 1
+    with pytest.raises(ValueError, match="finite receiver relative accessibility"):
+        contact_family_table(missing, rsa_boundary=0.25)
+    for bad in (float("nan"), float("inf")):
+        broken = [dict(row) for row in rows]
+        broken[0]["rsa"] = bad
+        with pytest.raises(ValueError, match="finite receiver relative accessibility"):
+            stratified_contact_contrast(broken, rsa_boundary=0.25)
+    for bad_boundary in (0.0, -0.1, float("nan")):
+        with pytest.raises(ValueError, match="positive finite relative accessibility"):
+            contact_family_table(rows, rsa_boundary=bad_boundary)
+
+
+def test_the_attrition_record_never_subtracts_cells_of_two_definitions():
+    # The first sensitivity fixture is primary-one-cell / sensitivity-two-cell: the
+    # one "9-16" separation cell splits into a buried and an exposed band cell, so
+    # a cell-count difference would be a negative "loss" between two different
+    # quantities.
+    rows = _band_composition_rows()
+    primary = stratified_contact_contrast(rows)
+    matched = stratified_contact_contrast(rows, rsa_boundary=0.25)
+    assert primary["matched_cells"] == 1
+    assert matched["matched_cells"] == 2
+    record = load_propagation_stage().receiver_rsa_attrition(primary, matched)
+    assert "matched_cells_lost" not in record
+    assert record["primary_separation_cells"] == 1
+    assert record["sensitivity_separation_band_cells"] == 2
+    # Family and receiver counts are comparable and can only fall.
+    assert record["families_lost"] == 0
+    assert record["matched_receivers_lost"] == 0
+
+
+def test_an_empty_sensitivity_column_stays_a_declared_slot_not_a_silent_drop():
+    # An arm whose bands never match still gets a declared panel slot, so the
+    # panel names it under excluded_columns instead of quietly emitting a narrower
+    # sensitivity than was declared. The empty column is never answered with the
+    # primary's families.
+    empty = {"arm": "disjoint", "direction": "downstream", "family_values": {}}
+    supported = {
+        "arm": "supported", "direction": "downstream",
+        "family_values": contact_family_table(
+            _family_rows({family: 0.1 * family for family in range(1, 7)}), rsa_boundary=0.25
+        )["family_values"],
+    }
+    record = panel_contact_simultaneous(
+        [empty, supported], outcome="absolute_response", draws=200, rsa_boundary=0.25
+    )
+    assert [column["arm"] for column in record["columns"]] == ["supported"]
+    assert [item["arm"] for item in record["excluded_columns"]] == ["disjoint"]
+    assert record["excluded_columns"][0]["families"] == 0
+    assert "0 families" in record["excluded_columns"][0]["reason"]
+
+    # With no labelled arm at all the panel is undefined, but the declared slot is
+    # still named and the sensitivity boundary still recorded.
+    undefined = panel_contact_simultaneous(
+        [empty], outcome="absolute_response", draws=200, rsa_boundary=0.25
+    )
+    assert undefined["columns"] == []
+    assert [item["arm"] for item in undefined["excluded_columns"]] == ["disjoint"]
+    assert undefined["undefined"]
+    assert undefined["rsa_boundary"] == 0.25
+
+
+# ------------------------------------------- the panel-wide simultaneous family
+
+
+def _family_rows(values, *, assay_prefix="A", stratum="9-16", separation=10,
+                 direction="downstream", floor=0.2):
+    """One matched contact/non-contact pair per family, with a chosen contrast.
+
+    Both sides sit above ``floor`` so that a negative contrast is representable
+    on the absolute outcome; a fixture whose non-contact side is pinned at zero
+    can only ever produce a one-sided null.
+    """
+
+    rows = []
+    for family, contrast in values.items():
+        for contact, value in ((True, floor + contrast), (False, floor)):
+            rows.append({
+                "assay": f"{assay_prefix}{family}", "family": family, "mutation": "A1G",
+                "i": 0, "j": separation, "separation": separation, "direction": direction,
+                "response": value, "absolute_response": abs(value), "contact": contact,
+                "structure_distance_angstrom": 5.0 if contact else 15.0,
+                "rsa": 0.2, "stratum": stratum,
+            })
+    return rows
+
+
+def test_the_family_table_is_the_one_the_marginal_interval_resamples():
+    values = {family: 0.1 * family for family in range(1, 9)}
+    rows = _family_rows(values)
+    table = contact_family_table(rows, direction="downstream")
+    contrast = stratified_contact_contrast(rows, direction="downstream")
+    # The marginal record exposes exactly the table's units, so a panel-wide
+    # statement and a per-arm one cannot be built from two populations.
+    assert sorted(table["family_values"]) == contrast["families"]
+    assert set(contrast["family_values"]) == {str(key) for key in table["family_values"]}
+    assert contrast["estimate_nats"]["point"] == pytest.approx(
+        float(np.mean(list(table["family_values"].values())))
+    )
+    assert table["matched_cells"] == contrast["matched_cells"] == len(values)
+
+
+def test_a_simultaneous_band_is_wider_than_the_marginal_one_it_corrects():
+    rng = np.random.default_rng(20261010)
+    single = rng.normal(0.1, 0.05, (12, 1))
+    many = np.column_stack([single[:, 0]] + [rng.normal(0.0, 0.05, 12) for _ in range(9)])
+    one = simultaneous_bands(single, draws=2000)
+    ten = simultaneous_bands(many, draws=2000)
+    assert ten["critical_value"] > one["critical_value"] > 1.0
+    low_one, high_one = one["simultaneous_interval"][0]
+    low_ten, high_ten = ten["simultaneous_interval"][0]
+    assert low_ten < low_one and high_ten > high_one
+    # And every band is strictly wider than its own pointwise interval.
+    assert ten["n_columns"] == 10
+    for index in range(ten["n_columns"]):
+        point_low, point_high = ten["pointwise_interval"][index]
+        band_low, band_high = ten["simultaneous_interval"][index]
+        assert band_low < point_low and band_high > point_high
+    assert ten["conditional_on_fitted_predictions"] is False
+
+
+def test_a_constant_column_does_not_set_the_critical_value():
+    rng = np.random.default_rng(7)
+    varying = rng.normal(0.0, 0.05, (16, 3))
+    with_zero = np.column_stack([varying, np.zeros(16)])
+    free = simultaneous_bands(varying, draws=2000)
+    pinned = simultaneous_bands(with_zero, draws=2000)
+    assert pinned["degenerate_columns"] == 1
+    assert pinned["critical_value"] == pytest.approx(free["critical_value"])
+    assert pinned["simultaneous_interval"][3] == [0.0, 0.0]
+
+
+def test_a_constant_column_is_degenerate_whether_or_not_it_is_representable():
+    # The exact-zero case above has always been dropped from the maximum. 0.3 has
+    # no exact binary representation, so a column of it has a rounding-residue
+    # standard error rather than a zero one; `se > 0` admitted it and its
+    # residue-over-residue studentised deviation then took the family maximum.
+    rng = np.random.default_rng(7)
+    varying = rng.normal(0.0, 0.05, (16, 3))
+    free = simultaneous_bands(varying, draws=2000)
+    pinned = simultaneous_bands(
+        np.column_stack([varying, np.full(16, 0.3)]), draws=2000
+    )
+    assert pinned["critical_value"] == pytest.approx(free["critical_value"], rel=1e-12)
+    assert pinned["degenerate_columns"] == 1
+    assert pinned["simultaneous_interval"][3] == pytest.approx([0.3, 0.3], abs=1e-15)
+    # A family in which nothing varies has no studentised maximum at all, and a
+    # zero critical value would read as every column resolved exactly.
+    with pytest.raises(ValueError, match="no studentised maximum"):
+        simultaneous_bands(np.full((16, 2), 0.3), draws=200)
+
+
+def test_a_simultaneous_family_refuses_unsupported_or_nonfinite_units():
+    with pytest.raises(ValueError):
+        simultaneous_bands(np.zeros((8,)), draws=100)
+    with pytest.raises(ValueError):
+        simultaneous_bands(np.array([[0.1, 0.2]]), draws=100)
+    thin = np.full((6, 2), np.nan)
+    thin[:, 0] = 0.1
+    thin[0, 1] = 0.2
+    with pytest.raises(ValueError):
+        simultaneous_bands(thin, draws=100)
+    with pytest.raises(ValueError):
+        simultaneous_bands(np.array([[0.1, np.inf]] * 6), draws=100)
+
+
+def test_only_a_measurable_direction_enters_the_panel_family():
+    # A causal arm's upstream contrast is zero by construction, not an estimate.
+    assert simultaneous_admits(CAUSAL, "downstream") is True
+    assert simultaneous_admits(CAUSAL, "upstream") is False
+    assert simultaneous_admits(MASKED, "downstream") is True
+    assert simultaneous_admits(MASKED, "upstream") is True
+    with pytest.raises(ValueError):
+        simultaneous_admits("something_else", "downstream")
+    with pytest.raises(ValueError):
+        simultaneous_admits(CAUSAL, "sideways")
+
+
+def test_the_panel_family_keeps_each_arm_point_and_absent_families_absent():
+    null = {family: 0.01 * (-1) ** family for family in range(1, 13)}
+    positive = {family: 0.1 + 0.01 * family for family in range(1, 13)}
+    positive.pop(12)
+    columns = [
+        {"arm": "causal", "direction": "downstream",
+         "family_values": contact_family_table(_family_rows(null))["family_values"]},
+        {"arm": "bidirectional", "direction": "upstream",
+         "family_values": contact_family_table(
+             _family_rows(positive, direction="upstream"), direction="upstream",
+         )["family_values"]},
+    ]
+    record = panel_contact_simultaneous(columns, outcome="absolute_response", draws=2000)
+    assert record["family_universe"] == 12
+    assert [column["families"] for column in record["columns"]] == [12, 11]
+    assert record["columns"][0]["point_nats"] == pytest.approx(float(np.mean(list(null.values()))))
+    assert record["columns"][1]["point_nats"] == pytest.approx(
+        float(np.mean(list(positive.values())))
+    )
+    assert record["columns"][1]["simultaneously_excludes_zero"] is True
+    assert record["columns"][0]["simultaneously_excludes_zero"] is False
+    # A band that holds jointly is at least as wide as the marginal one.
+    assert record["critical_value"] > 1.0
+    assert record["excluded_columns"] == []
+    assert panel_contact_simultaneous([], outcome="response")["undefined"]
+
+
+def test_a_thinly_supported_arm_is_named_rather_than_blocking_the_panel():
+    # Five families is this lane's floor, and it is declared in one place.
+    from src.capability.position import contact_response
+
+    assert MIN_FAMILIES is contact_response.MIN_FAMILIES
+
+    supported = {family: 0.1 * family for family in range(1, 1 + MIN_FAMILIES + 3)}
+    thin = {family: 0.9 for family in range(1, MIN_FAMILIES)}
+    columns = [
+        {"arm": "supported", "direction": "downstream",
+         "family_values": contact_family_table(_family_rows(supported))["family_values"]},
+        {"arm": "byte-pair", "direction": "downstream",
+         "family_values": contact_family_table(
+             _family_rows(thin, assay_prefix="B"))["family_values"]},
+    ]
+    record = panel_contact_simultaneous(columns, outcome="absolute_response", draws=2000)
+    assert [column["arm"] for column in record["columns"]] == ["supported"]
+    assert [item["arm"] for item in record["excluded_columns"]] == ["byte-pair"]
+    assert record["excluded_columns"][0]["families"] == MIN_FAMILIES - 1
+    assert str(MIN_FAMILIES) in record["excluded_columns"][0]["reason"]
+    # The thin arm's own families never enter the resampled universe either.
+    assert record["family_universe"] == len(supported)
+
+    # Every column thin is an undefined family, not a crash and not a silent zero.
+    only_thin = panel_contact_simultaneous(
+        columns[1:], outcome="absolute_response", draws=2000
+    )
+    assert only_thin["columns"] == [] and only_thin["undefined"]
+    assert only_thin["excluded_columns"][0]["arm"] == "byte-pair"
+
+
+
+# --------------------------------------------------- the anticipation statistic
+
+
+def test_the_anticipation_design_keeps_only_matched_anchor_strata():
+    geometry = line(range(0, 32, 2), spacing=0.6)
+    pairs = contact_pairs(geometry, cutoff=8.0, min_separation=6)
+    rows = anchor_partner_design(
+        geometry, pairs, anchors=sorted(geometry), wildtype=WILDTYPE, residues=ALPHABET,
+    )
+    assert rows
+    assert all(row["j"] > row["i"] for row in rows)
+    assert all(row["separation"] >= 6 for row in rows)
+    for anchor in {row["i"] for row in rows}:
+        for stratum in {row["stratum"] for row in rows if row["i"] == anchor}:
+            cell = [row for row in rows if row["i"] == anchor and row["stratum"] == stratum]
+            assert any(row["contact"] for row in cell)
+            assert any(not row["contact"] for row in cell)
+
+
+def test_the_excess_log_probability_is_renormalised_and_composition_centred():
+    residues = ("A", "C", "D", "E")
+    weights = composition("AACD", residues)
+    assert weights == pytest.approx([0.5, 0.25, 0.25, 0.0])
+    flat = np.log(np.full(4, 0.25))
+    assert excess_logprob(flat, weights, 0) == pytest.approx(0.0)
+    # An unnormalised row gives the same answer as its normalisation.
+    peaked = np.asarray([0.0, -2.0, -2.0, -2.0])
+    assert excess_logprob(peaked, weights, 0) == pytest.approx(
+        excess_logprob(peaked - 3.1415, weights, 0)
+    )
+    assert excess_logprob(peaked, weights, 0) > 0.0
+    assert excess_logprob(peaked, weights, 1) < 0.0
+    with pytest.raises(ValueError, match="align and be finite"):
+        excess_logprob(np.asarray([0.0, float("inf"), 0.0, 0.0]), weights, 0)
+
+
+def test_the_covariation_control_never_sees_its_own_family():
+    residues = ("A", "C", "D", "E")
+    rows = [{"family": 1, "anchor_residue": "A", "partner_residue": "A", "contact": True},
+            {"family": 1, "anchor_residue": "A", "partner_residue": "A", "contact": False},
+            {"family": 2, "anchor_residue": "A", "partner_residue": "E", "contact": True},
+            {"family": 2, "anchor_residue": "A", "partner_residue": "E", "contact": False}]
+    held_one = pair_conditional(rows, residues, holdout=1)
+    held_two = pair_conditional(rows, residues, holdout=2)
+    assert held_one[0].argmax() == residues.index("E")
+    assert held_two[0].argmax() == residues.index("A")
+    with pytest.raises(ValueError, match="only family"):
+        pair_conditional(rows[:2], residues, holdout=1)
+
+
+# ------------------------------- the admitted upstream tolerance
+
+
+def test_the_census_admits_only_the_tolerance_the_extraction_recorded():
+    wild = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    drifted = [1.0, 1.0, 1.000004, 1.0, 2.0, 2.0, 2.0, 2.0]
+    payload = archive(wild, drifted)
+    with pytest.raises(ValueError, match="admitted tolerance of 0.0"):
+        receiver_census(payload, 0, site=4, paradigm=CAUSAL)
+    census = receiver_census(payload, 0, site=4, paradigm=CAUSAL, upstream_tolerance=1e-5)
+    assert census["upstream_max_abs_nats"] == pytest.approx(4e-6, rel=5e-2)
+    # A tolerance never turns a half-nat layout shift into a measurement.
+    gross = archive(wild, [1.0, 1.0, 1.5, 1.0, 2.0, 2.0, 2.0, 2.0])
+    with pytest.raises(ValueError, match="packing, alignment or forward defect"):
+        receiver_census(gross, 0, site=4, paradigm=CAUSAL, upstream_tolerance=1e-4)
+    for bad in (-1e-9, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite non-negative"):
+            receiver_census(payload, 0, site=4, paradigm=CAUSAL, upstream_tolerance=bad)
+
+
+# ------------------------------- the E02 attribution controls
+
+
+def anticipation_rows(n_families=8, *, contact_shift=0.0):
+    """Matched cells across several families, with a tunable contact signal."""
+
+    rows = []
+    for family in range(n_families):
+        for anchor in (0, 10):
+            for offset, contact in ((7, True), (8, False), (9, False)):
+                rows.append({
+                    "assay": f"A{family}", "family": family, "i": anchor,
+                    "j": anchor + offset, "separation": offset, "stratum": "3-8",
+                    "contact": contact, "structure_distance_angstrom": 5.0 if contact else 15.0,
+                    "anchor_residue": "A", "partner_residue": "L" if contact else "D",
+                    "anchor_rsa": 0.1 if anchor == 0 else 0.6,
+                    "partner_rsa": 0.2 if contact else 0.5,
+                })
+    return rows
+
+
+def test_the_within_protein_anchor_control_is_a_derangement_of_its_own_protein():
+    from src.capability.position.anticipation import permuted_anchor_maps
+
+    rows = anticipation_rows()
+    within, across = permuted_anchor_maps(rows)
+    assert within
+    for (assay, anchor), (other_assay, other_anchor) in within.items():
+        assert other_assay == assay            # same protein, same family, same fold
+        assert other_anchor != anchor          # and never the anchor itself
+    for (assay, _anchor), (other_assay, _other) in across.items():
+        assert other_assay != assay            # a different protein in a different family
+
+
+def test_a_single_anchor_protein_contributes_no_within_protein_control():
+    from src.capability.position.anticipation import permuted_anchor_maps
+
+    rows = [row for row in anticipation_rows() if row["i"] == 0]
+    within, _across = permuted_anchor_maps(rows)
+    assert within == {}
+
+
+def test_the_contact_label_permutation_null_is_centred_on_zero():
+    from src.capability.position.anticipation import permutation_null
+
+    cells = {
+        (family, f"A{family}", 0, "3-8"): {"contact": [1.0], "control": [0.0, 0.2]}
+        for family in range(8)
+    }
+    null = permutation_null(cells, 0.9, draws=400, seed=7)
+    assert null["draws"] == 400
+    assert abs(null["mean_nats"]) < 0.2
+    assert null["interval_nats"][0] < 0 < null["interval_nats"][1]
+    assert null["two_sided_p"] < 0.05
+    # An observed value inside the null is not significant.
+    assert permutation_null(cells, 0.0, draws=400, seed=7)["two_sided_p"] > 0.2
+    assert permutation_null({}, 0.9)["draws"] == 0
+
+
+def test_the_attribution_pairs_the_measurement_against_each_control():
+    from src.capability.position.anticipation import paired_attribution
+
+    sources = {
+        "model_conditional": {"per_family_contrast": {str(f): 0.20 for f in range(10)}},
+        "anchor_permuted_within_protein": {
+            "per_family_contrast": {str(f): 0.12 for f in range(10)}
+        },
+        "pair_covariation": {"per_family_contrast": {}},
+    }
+    result = paired_attribution(sources)
+    fold = result["controls"]["anchor_permuted_within_protein"]
+    assert fold["families"] == 10
+    assert fold["control_nats"] == pytest.approx(0.12)
+    assert fold["share_explained"] == pytest.approx(0.6)
+    assert fold["residual_nats"]["point"] == pytest.approx(0.08)
+    assert result["controls"]["pair_covariation"]["status"] == "no shared family"
+    assert paired_attribution({})["status"]
+
+
+def test_a_control_that_fully_explains_the_measurement_leaves_no_residual():
+    from src.capability.position.anticipation import paired_attribution
+
+    sources = {
+        "model_conditional": {"per_family_contrast": {str(f): 0.2 + 0.01 * f for f in range(10)}},
+        "anchor_permuted_within_protein": {
+            "per_family_contrast": {str(f): 0.2 + 0.01 * f for f in range(10)}
+        },
+    }
+    residual = paired_attribution(sources)["controls"]["anchor_permuted_within_protein"]
+    assert residual["residual_nats"]["point"] == pytest.approx(0.0)
+    assert residual["residual_nats"]["excludes_zero"] is False
+    assert residual["share_explained"] == pytest.approx(1.0)

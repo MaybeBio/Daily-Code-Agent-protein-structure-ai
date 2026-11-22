@@ -1,0 +1,23 @@
+# Enzyme / motif-scaffolding campaign.
+campaign: pdflow_demo_enzyme
+task: enzyme_scaffold
+
+design:
+  engine: rfd4
+  input: inputs/motif_scaffold.yaml
+  num_designs: 20
+  seed: 0
+  extra: ["~metrics"]
+
+targets: {}
+ligands: []
+
+score:
+  predictors: [af3, boltz2, opendde, mol1]
+  default: af3
+  align_chains: [A]
+  # Catalytic / binding residues that must survive scaffolding.
+  motif:
+    - chain: A
+      res_ids: [45, 46, 47, 102, 103]
+  tmol: true

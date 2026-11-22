@@ -1,0 +1,21 @@
+name: MacOS (Clang)
+
+on: [push]
+
+jobs:
+    ci:
+        runs-on: macos-15
+        steps:
+        - uses: actions/checkout@v4
+        - name: prepare
+          run: |
+            git submodule update --init --recursive
+        - name: cmake
+          run: |
+            cmake .
+        - name: build
+          run: |
+            make -j 4
+        - name: test
+          run: |
+            ctest -R '^viamd_test$' --output-on-failure --no-tests=error

@@ -1,0 +1,538 @@
+"""Base class of the script generators and the per-step context they use."""
+
+from __future__ import annotations
+
+import copy
+import datetime as _dt
+import logging
+import os
+import posixpath
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+
+from .. import PROJECT_ABBREV, __version__
+from .budget import Resources
+from .naming import file_name, sanitize_project, step_folder
+from .schema import GeneratedFile, Issue, Option, Port, Section
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class PortValue:
+    """Files flowing along a planner connection.
+
+    ``paths`` are relative to the plan folder (files produced by a step) or
+    absolute (files chosen by hand).  ``data`` carries facts known when the
+    files are planned, e.g. the secondary structure behind a ``.secstruct``
+    file or whether a topology carries NBfix / 12-6-4 / HMR modifications.
+
+    A collection (:attr:`mdatk.workflows.schema.Port.collection`) passes ``lists``: files, also among
+    ``paths``, that its step writes when it runs, naming one member per line (relative to the plan folder),
+    with the most members each can name.  :meth:`StepContext.inps` leaves them out.
+    """
+
+    paths: List[str]
+    kind: str
+    data: Dict[str, Any] = field(default_factory=dict)
+    source: str = ""  # producing node id ("" = chosen by hand)
+    source_label: str = ""
+    lists: Dict[str, int] = field(default_factory=dict)  # collections: list file -> most members it names
+
+    @property
+    def path(self) -> str:
+        """The first file ("" when there are only the lists of collections)."""
+        return next((p for p in self.paths if p not in self.lists), "")
+
+
+class StepContext:
+    """Names and inputs of one step, as seen from the step's own folder.
+
+    Generated scripts ``cd`` into their folder first, so every path handed
+    to a generator is relative to that folder (absolute for hand-picked
+    files).
+    """
+
+    def __init__(self, project: str, step: int, stamp: str, tag: str,
+                 inputs: Optional[Dict[str, PortValue]] = None, root: str = "",
+                 step_folders: bool = True, title: str = "", node_id: str = "",
+                 groups: Optional[Sequence[Any]] = None):
+        self.project = sanitize_project(project)
+        self.step = int(step)
+        self.stamp = stamp
+        self.tag = tag
+        self.folder = step_folder(self.step, tag) if step_folders else ""
+        self.inputs: Dict[str, PortValue] = dict(inputs or {})
+        self.root = root
+        self.title = title
+        self.node_id = node_id
+        self.groups = list(groups or [])
+        self.preview = False  # True while the wizard previews the files: no network or slow work
+
+    def with_stamp(self, stamp: str) -> "StepContext":
+        """The same step with another time stamp in its own file names (e.g. one of its earlier runs)."""
+        other = copy.copy(self)
+        other.stamp = stamp
+        other.inputs = dict(self.inputs)
+        return other
+
+    # ------------------------------------------------------------- naming
+    def name(self, tag: str, ext: str = "") -> str:
+        """File name of one of this step's own files."""
+        return file_name(self.project, self.step, tag, self.stamp, ext)
+
+    def own(self, tag: str, ext: str = "") -> str:
+        """Plan-relative path of one of this step's own files."""
+        return posixpath.join(self.folder, self.name(tag, ext)) if self.folder else self.name(tag, ext)
+
+    def from_own(self, name: str) -> str:
+        """Plan-relative path of a file name inside this step's folder."""
+        return posixpath.join(self.folder, name) if self.folder else name
+
+    # ------------------------------------------------------------- inputs
+    def has(self, port: str) -> bool:
+        value = self.inputs.get(port)
+        return bool(value and value.paths)
+
+    def value(self, port: str) -> Optional[PortValue]:
+        return self.inputs.get(port)
+
+    def rel(self, path: str) -> str:
+        """``path`` (plan-relative or absolute) as seen from this step's folder."""
+        if not path or os.path.isabs(path):
+            return path
+        return posixpath.relpath(path, self.folder) if self.folder else path
+
+    def inp(self, port: str) -> str:
+        value = self.inputs.get(port)
+        return self.rel(value.path) if value and value.paths else ""
+
+    def inps(self, port: str) -> List[str]:
+        """The input's files; the lists of a collection are left out (:meth:`lists`)."""
+        value = self.inputs.get(port)
+        return [self.rel(p) for p in value.paths if p not in value.lists] if value else []
+
+    def lists(self, port: str) -> List[str]:
+        """The files listing the members of a collection input (written when its step runs)."""
+        value = self.inputs.get(port)
+        return [self.rel(p) for p in value.lists] if value else []
+
+    def count(self, port: str) -> int:
+        """How many files the input carries: its own, and as many as its collections can list at most."""
+        value = self.inputs.get(port)
+        return len(self.inps(port)) + sum(value.lists.values()) if value else 0
+
+    def data(self, port: str) -> Dict[str, Any]:
+        value = self.inputs.get(port)
+        return value.data if value else {}
+
+    def abspath(self, path: str) -> str:
+        if not path or os.path.isabs(path):
+            return path
+        return os.path.join(self.root, path) if self.root else path
+
+    def existing(self, port: str) -> str:
+        """Absolute path of an input that already exists on disk ("" otherwise)."""
+        value = self.inputs.get(port)
+        if not value or not value.paths:
+            return ""
+        path = self.abspath(value.path)
+        return path if path and os.path.isfile(path) else ""
+
+    def source_label(self, port: str) -> str:
+        value = self.inputs.get(port)
+        return value.source_label if value else ""
+
+
+class Tool:
+    """A script generator, i.e. a step type of RNAdo's plan.
+
+    Subclasses define ``sections`` (the options), ``inputs`` / ``outputs``
+    (planner ports) and implement :meth:`check`, :meth:`output_values` and
+    :meth:`generate`.  Generators only *write* files; they never run the
+    programs they prepare.
+    """
+
+    name = ""
+    label = ""
+    category = ""
+    tag = ""  # step folder name and default file tag
+    description = ""
+    generates = True
+    sections: List[Section] = []
+    inputs: List[Port] = []
+    outputs: List[Port] = []
+    path_settings: Tuple[str, ...] = ()  # settings that hold paths relative to the project file
+
+    # ----------------------------------------------------------- schema
+    def all_options(self) -> Iterator[Tuple[Section, Option]]:
+        for section in self.sections:
+            for opt in section.options:
+                yield section, opt
+
+    def flat_options(self) -> Dict[str, Option]:
+        return {o.key: o for s in self.sections if not s.repeat for o in s.options}
+
+    def section(self, key: str) -> Section:
+        for s in self.sections:
+            if s.key == key:
+                return s
+        raise KeyError(key)
+
+    def defaults(self) -> Dict[str, Any]:
+        values: Dict[str, Any] = {}
+        for s in self.sections:
+            if s.repeat:
+                values[s.key] = s.default_records()
+            else:
+                for o in s.options:
+                    values[o.key] = copy.deepcopy(o.default)
+        return values
+
+    def normalise(self, settings: Optional[Dict[str, Any]],
+                  issues: Optional[List[Issue]] = None) -> Dict[str, Any]:
+        """Complete ``settings`` with defaults and coerce types.
+
+        Invalid values fall back to their default with a warning issue;
+        unknown keys are dropped (logged), so project files from other versions
+        still load.
+        """
+        settings = dict(settings or {})
+        out = self.defaults()
+        known = set(out)
+        for s in self.sections:
+            if s.repeat:
+                raw = settings.get(s.key)
+                if raw is None:
+                    continue
+                if not isinstance(raw, list):
+                    self._bad(issues, s.key, "expected a list")
+                    continue
+                records = []
+                for k, rec in enumerate(raw):
+                    if not isinstance(rec, dict):
+                        self._bad(issues, f"{s.key}.{k}", "expected an object")
+                        continue
+                    clean = s.record_defaults()
+                    for o in s.options:
+                        if o.key in rec:
+                            try:
+                                clean[o.key] = o.coerce(rec[o.key])
+                            except ValueError as exc:
+                                self._bad(issues, f"{s.key}.{k}.{o.key}", str(exc))
+                    records.append(clean)
+                out[s.key] = records
+            else:
+                for o in s.options:
+                    if o.key in settings:
+                        try:
+                            out[o.key] = o.coerce(settings[o.key])
+                        except ValueError as exc:
+                            self._bad(issues, o.key, str(exc))
+        unknown = sorted(set(settings) - known)
+        if unknown:
+            log.warning("%s: ignoring unknown settings %s", self.name, ", ".join(unknown))
+        return out
+
+    @staticmethod
+    def _bad(issues, key, message):
+        text = f"{message} - using the default"
+        if issues is not None:
+            issues.append(Issue("warning", text, (key,)))
+        else:
+            log.warning("%s: %s", key, text)
+
+    def input_ports(self, settings: Dict[str, Any]) -> List[Port]:
+        return list(self.inputs)
+
+    def output_ports(self, settings: Dict[str, Any]) -> List[Port]:
+        return list(self.outputs)
+
+    # --------------------------------------------------------- behaviour
+    def check(self, s: Dict[str, Any], ctx: StepContext) -> List[Issue]:
+        return []
+
+    def output_values(self, s: Dict[str, Any], ctx: StepContext) -> Dict[str, PortValue]:
+        return {}
+
+    def generate(self, s: Dict[str, Any], ctx: StepContext) -> List[GeneratedFile]:
+        return []
+
+    def describe(self, s: Dict[str, Any]) -> str:
+        """Short summary shown on planner boxes."""
+        return self.description.split(".")[0]
+
+    def summary_lines(self, s: Dict[str, Any], ctx: StepContext) -> List[str]:
+        """Extra Markdown lines for the plan summary (e.g. what a custom script runs)."""
+        return []
+
+    def resources(self, s: Dict[str, Any]) -> List[str]:
+        """Ids of the programs / force fields / parameter sets these settings use (see mdatk.citations)."""
+        return []
+
+    def programs(self, s: Dict[str, Any]) -> List[Tuple[str, str]]:
+        """The programs the step's scripts call, each with a regular expression that a non-comment line of a
+        script matches where it calls it (a script needs only the programs it calls: a main script whose
+        stages all run separately calls no MD engine).  Before MDATK runs a script it checks them in the
+        environment the script gets (its conda environment, setup file and setup commands; mdatk.workflows.
+        runner.missing_programs), so a missing program stops the step at once, not hours into it."""
+        return []
+
+    def run_resources(self, s: Dict[str, Any]) -> Resources:
+        """CPU cores, GPUs and named GPU ids one run of the step's scripts uses (see mdatk.workflows.budget);
+        MDATK starts the script when they are free.  Default: one core."""
+        return Resources()
+
+    def finish_marks(self, s: Dict[str, Any], ctx: StepContext) -> List[Tuple[str, str]]:
+        """(plan-relative path, regular expression) pairs: a run of this step is complete only when each
+        file exists and its end matches (e.g. a program's closing timing lines), besides its output files.
+        Used when looking for earlier runs (mdatk.workflows.runstate)."""
+        return []
+
+    def run_folders(self, s: Dict[str, Any], ctx: StepContext) -> List[str]:
+        """Plan-relative folders inside the step folder that a run fills and whose names carry no time stamp
+        (e.g. one working folder per parallel run), whatever the current settings (only folders that exist
+        move).  They move with a completed run when the step is written again (mdatk.workflows.supersede); in
+        a plan without step folders only those named as the step's own (``<project>_<NN>_...``) move, and only
+        while no other step has the step's number."""
+        return []
+
+
+# ---------------------------------------------------------------------------
+# helpers shared by the generators
+# ---------------------------------------------------------------------------
+
+
+def env_section(placeholder: str, extra: Sequence[Option] = ()) -> Section:
+    """'Environment' options: shell lines run before any program is called."""
+    return Section("environment", "Environment", [
+        Option("conda_env", "Conda environment", "text", "",
+               "Activate this conda environment at the top of the script "
+               "(eval \"$(conda shell.bash hook)\"; conda activate <name>). Leave empty when "
+               "the programs are already on PATH.", placeholder="e.g. AmberTools26"),
+        Option("env_file", "Setup file", "file", "",
+               "A shell file the script sources before any program, after the conda environment, e.g. "
+               "/opt/amber26/amber.sh (an absolute path: the script runs in the step folder). A file that "
+               "does not exist where the script runs is reported (a warning in the output) and skipped; the "
+               "planner warns when it is missing on this computer.", placeholder="/opt/amber26/amber.sh"),
+        Option("env_setup", "Setup commands", "multiline", "",
+               "Shell lines run before any program, after the setup file, e.g. 'module load ...' on a cluster "
+               "or 'source /opt/amber26/amber.sh' on a workstation. 'module' is a shell function that a login "
+               "shell's profile defines (/etc/profile.d/modules.sh, Lmod's init): RNAdo started from the "
+               "applications menu runs its scripts in the environment of an interactive shell (~/.bashrc), "
+               "without a login profile, so source the modules init file first there. Before it runs a "
+               "script MDATK checks that the step's programs are found after these lines.",
+               placeholder=placeholder),
+        *extra,
+    ], tooltip="How the generated scripts find the programs.")
+
+
+# Set by MDATK for every script it runs itself (RNAdo, mdatk workflow run); a cluster job has not got it
+LOCAL_VAR = "MDATK_LOCAL"
+# Set by a step's cluster job script (mdatk.workflows.cluster) for the scripts it runs
+JOB_VAR = "MDATK_JOB"
+
+SEPARATE_CONDA = Option(
+    "conda_separate", "Conda in the separate script on a cluster too", "bool", False,
+    "The separately run script (production, e.g. on a cluster) activates the conda environment only when "
+    f"MDATK runs it on this computer (RNAdo's 'Also run the scripts marked run separately here', or "
+    f"{LOCAL_VAR}=1 bash <script>); a cluster job skips it, as clusters set up their own programs (the "
+    "Setup commands run everywhere). Tick to activate it on the cluster too. With a Cluster job header the "
+    "step's main script skips it as well while the job runs it (in the job, the cluster's modules set up the "
+    "programs).")
+
+
+def env_lines(s: Dict[str, Any], separate: bool = False) -> List[str]:
+    """The Environment lines of a script: conda activation, the setup file, then the setup commands.  In a separately run
+    script (``separate``) the conda lines run only when MDATK runs it here (``$MDATK_LOCAL``), unless the
+    step's ``conda_separate`` is set; in the main script of a step with a cluster job header
+    (:mod:`mdatk.workflows.cluster`) they run except in that job (``$MDATK_JOB``), likewise."""
+    lines: List[str] = []
+    if s.get("conda_env", "").strip():
+        conda = ['eval "$(conda shell.bash hook)"', f"conda activate {s['conda_env'].strip()}"]
+        if separate and not s.get("conda_separate"):
+            conda = ["# conda only when MDATK runs this script on this computer; a cluster job skips it",
+                     f'if [ -n "${{{LOCAL_VAR}:-}}" ]; then'] + [f"  {c}" for c in conda] + ["fi"]
+        elif not separate and not s.get("conda_separate") and ((s.get("job_header") or "").strip()
+                                                               or (s.get("cluster") or "").strip()):
+            conda = ["# conda except in the step's cluster job, where the cluster's modules set up the programs",
+                     f'if [ -z "${{{JOB_VAR}:-}}" ]; then'] + [f"  {c}" for c in conda] + ["fi"]
+        lines += conda
+    setup_file = (s.get("env_file") or "").strip()
+    if setup_file:
+        q = shell_quote(setup_file)
+        # in the message the path stands between double quotes: one with a character the shell reads there
+        # (a quote would end the script with a syntax error) is quoted on its own
+        shown = f'"{q}"' if any(c in setup_file for c in '"$`\\') else setup_file
+        lines.append(f'if [ -f {q} ]; then . {q}; else echo "WARNING: setup file {shown} not found" >&2; fi')
+    for line in (s.get("env_setup") or "").splitlines():
+        if line.strip():
+            lines.append(line.rstrip())
+    return lines
+
+
+def script_header(title: str, ctx: StepContext, s: Dict[str, Any], script: str,
+                  notes: Sequence[str] = (), separate: bool = False) -> List[str]:
+    today = _dt.date.today().isoformat()
+    lines = ["#!/bin/bash",
+             f"# {title}",
+             f"# Project {ctx.project}, step {ctx.step:02d} - written by {PROJECT_ABBREV} {__version__} "
+             f"on {today}.",
+             f"# {PROJECT_ABBREV} only writes this script; review it, then run it with: bash {script}"]
+    lines += [f"# {n}" for n in notes]
+    lines += ["", "set -eo pipefail", 'cd "$(dirname "$0")"', ""]
+    env = env_lines(s, separate)
+    if env:
+        lines += ["# Environment"] + env + [""]
+    return lines
+
+
+def require_file(path: str, what: str) -> str:
+    """Shell line that stops the script when a program did not produce ``path``."""
+    return f'[ -s "{path}" ] || {{ echo "ERROR: {what} did not write {path}" >&2; exit 1; }}'
+
+
+def bash_array(name: str, paths: Sequence[str]) -> List[str]:
+    """A bash array of file names, one per line (decoy lists can be long)."""
+    return [f"{name}=("] + [f"  {shell_quote(p)}" for p in paths] + [")"]
+
+
+def listed_files(name: str, ctx: StepContext, port: str) -> List[str]:
+    """Shell lines that add the members of a collection input to the bash array ``name``, read from its lists
+    when the script runs (their paths are relative to the plan folder); the script stops when a list is
+    missing or the array stays empty.  No lines when the input has no collection."""
+    lists = ctx.lists(port)
+    if not lists:
+        return []
+    root = posixpath.relpath(".", ctx.folder) if ctx.folder else "."
+    out = ["# ... and every member of the set of files, as listed when its step ran (from the plan folder)"]
+    for path in lists:
+        q = shell_quote(path)
+        out += [f'[ -f {q} ] || {{ echo "ERROR: {path} is missing: run the step that lists the set first" '
+                ">&2; exit 1; }",
+                'while IFS= read -r f || [ -n "$f" ]; do',
+                f'  case "$f" in "") ;; /*) {name}+=("$f") ;; *) {name}+=("{root}/$f") ;; esac',
+                f"done < {q}"]
+    out.append(f'[ "${{#{name}[@]}}" -gt 0 ] || {{ echo "ERROR: no files in {" ".join(lists)}" >&2; '
+               "exit 1; }")
+    return out
+
+
+# Exit status of a step's main script while part of the step runs in a separate script (e.g. production on
+# a cluster) that has not finished: "run that one, then this one again" (sysexits' EX_TEMPFAIL).  MDATK's
+# runner reports it as waiting, not as a failure, and does not start the steps that depend on the step.
+WAITING_STATUS = 75
+# ... or, for batch schedulers that cancel the jobs depending on a non-zero exit (sbatch --dependency), the
+# main script exits 0 and leaves the file <main script>.waiting beside itself (WAITING_EXIT 'file'); the
+# runner reports that as waiting too
+WAITING_EXT = ".waiting"
+
+WAITING_EXIT = Option(
+    "waiting_exit", "While the separate script has not finished", "radio", "status",
+    f"What the main script does while the step's separately run script has not finished. Exit status "
+    f"{WAITING_STATUS}: it stops with that status ('waiting'), which a batch scheduler counts as a failure "
+    f"(sbatch --dependency=afterok cancels the jobs submitted after it, e.g. the separate script). Exit 0 + "
+    f"{WAITING_EXT} file: it leaves <main script>{WAITING_EXT} beside itself and exits 0, so those jobs start; "
+    f"the file is removed when the script starts and when it finishes. MDATK (and the plan's master script) "
+    f"reports the step as waiting either way and does not start the steps after it.",
+    choices=[("status", f"Exit status {WAITING_STATUS}"), ("file", f"Exit 0 + {WAITING_EXT} file")])
+
+
+def waiting_file(script: str) -> str:
+    """The file a main script in the 'exit 0' waiting mode (:data:`WAITING_EXIT`) leaves beside itself while
+    its separately run script has not finished: ``<script>.waiting``."""
+    return script + WAITING_EXT
+
+
+def separate_check(script: str, finished: Sequence[str], what: str,
+                   flag: str = "") -> Tuple[List[str], List[str]]:
+    """Shell lines for the main script of a step that leaves ``what`` to the separate ``script``.
+
+    ``finished`` are shell tests that all succeed once that script has finished.  The first lines define
+    ``separate_done`` (place them before the step's own work; :func:`skip_when_done` keeps the work that
+    production starts from from running again).  The last lines exit with :data:`WAITING_STATUS` and name
+    the script to run while it has not finished - place them before anything that needs its output - so a
+    step never reports success with its production missing.  With ``flag`` (:func:`waiting_file` of the
+    main script) they write that file and exit 0 instead; the first lines remove it, and so do the lines of
+    :func:`waiting_done`, which end the script."""
+    tests = [f"  {t} &&" for t in finished[:-1]] + [f"  {finished[-1]}"]
+    head = [f"# {what[:1].upper() + what[1:]} run in a separate script, e.g. on a cluster: this step is "
+            f"complete once", f"# bash {script} has finished",
+            "separate_done() {", *tests, "}", ""]
+    if flag:
+        head += [f"# While they have not finished, this script exits 0 and leaves {flag}",
+                 f"# (instead of exit status {WAITING_STATUS}); every run starts without it", f"rm -f {flag}", ""]
+    tail = [f"# The step is not complete before {what} have finished",
+            "if ! separate_done; then",
+            f'  echo "WAITING: {what} have not finished. Run them (e.g. on a cluster) with:" >&2',
+            f'  echo "  bash $PWD/{script}" >&2',
+            '  echo "then run this script again." >&2']
+    if flag:
+        tail += [f'  echo "WAITING: {what} have not finished: bash {script}, then this script again" > {flag}',
+                 "  exit 0"]
+    else:
+        tail.append(f"  exit {WAITING_STATUS}")
+    return head, tail + ["fi", ""]
+
+
+def waiting_done(flag: str) -> List[str]:
+    """The last lines of a main script in the 'exit 0' waiting mode (``flag``: its :func:`waiting_file`): the
+    step is complete, so it no longer waits.  No lines without ``flag``."""
+    return ["# The step is complete: it no longer waits", f"rm -f {flag}", ""] if flag else []
+
+
+def skip_when_done(lines: Sequence[str], what: str) -> List[str]:
+    """``lines`` (the work production starts from) run only while ``separate_done`` fails: once the separate
+    script has finished, running them again would replace its starting point (without per-stage resume)."""
+    if not lines:
+        return []
+    body = list(lines)
+    while body and not body[-1].strip():
+        body.pop()
+    if not any("<<" in ln for ln in body):  # here-documents must keep their lines as they are
+        body = [f"  {ln}" if ln else ln for ln in body]
+    return (["if separate_done; then", f'  echo "{what} have finished: the work before them is not run again"',
+             "else"] + body + ["fi", ""])
+
+
+def fortran_float(x: float) -> str:
+    """Format like hand-written Amber input: 10.0, 0.002, 1.0e-6."""
+    x = float(x)
+    if x == 0:
+        return "0.0"
+    if 1e-4 <= abs(x) < 1e7:
+        text = repr(x)
+        if "e" in text or "E" in text:
+            text = f"{x:.6f}".rstrip("0")
+        if "." not in text:
+            text += ".0"
+        if text.endswith("."):
+            text += "0"
+        return text
+    mant, exp = f"{x:.6e}".split("e")
+    mant = mant.rstrip("0")
+    if mant.endswith("."):
+        mant += "0"
+    return f"{mant}e{int(exp)}"
+
+
+def shell_quote(text: str) -> str:
+    if text and all(c.isalnum() or c in "@%+=:,./-_" for c in text):
+        return text
+    return "'" + text.replace("'", "'\"'\"'") + "'"
+
+
+def extra_lines(text: str) -> List[str]:
+    return [line.rstrip() for line in (text or "").splitlines() if line.strip()]
+
+
+def extra_flags(text: str) -> List[str]:
+    """Extra command-line flags typed in a free-text box (one or more per line; '#' starts a comment,
+    also after a flag - a comment left in a continued command line would swallow its backslash)."""
+    out = []
+    for line in (text or "").splitlines():
+        line = re.split(r"(?:^|\s)#", line, maxsplit=1)[0].strip()
+        if line:
+            out.append(line)
+    return out

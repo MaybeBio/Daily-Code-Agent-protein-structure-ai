@@ -1,0 +1,77 @@
+[workspace]
+members = [
+    "crates/pantometry-units",
+    "crates/pantometry-core",
+    "crates/pantometry-optics",
+    "crates/pantometry-thermal",
+    "crates/pantometry-mechanics",
+    "crates/pantometry-acoustic",
+    "crates/pantometry-molecular",
+    "crates/pantometry-electrical",
+    "crates/pantometry-porous",
+    "crates/pantometry-elastic",
+    "crates/pantometry-em",
+    "crates/pantometry-fluid",
+    "crates/pantometry-quantum",
+    "crates/pantometry-pharmacokinetic",
+    "crates/pantometry-protein",
+    "crates/pantometry-forcefield",
+    # Not a domain and not a layer: input preparation. It depends on `pantometry-units` and nothing else
+    # in the workspace, and no domain depends on it — it hands out a predicate and a domain's `fill`
+    # takes one, which is the whole coupling.
+    "crates/pantometry-shape",
+    "crates/pantometry-scene",
+    "crates/pantometry-view",
+    "crates/pantometry",
+]
+exclude = [
+    # Its own workspace: pyo3 brings fifteen crates and a libpython link, and this workspace's
+    # lockfile, `deny.toml` allow-list and wasm jobs are promises that should not have to
+    # accommodate a Python extension. See its Cargo.toml.
+    "bindings/python",
+    # And everything a person *runs*: the CLI, the viewer, the editor and the GPU accelerator, in
+    # one workspace above this one. Same argument, measured rather than assumed — this workspace
+    # resolves 12 external crates and a GUI shell is 371 — and it is the only boundary that
+    # argument supports. It used to be three. See app/Cargo.toml.
+    "app",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.24.0"
+edition = "2021"
+# Verified by the `msrv` CI job rather than guessed, and set by `Cargo.lock` being
+# format version 4 rather than by anything in the source — see that job's comment.
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+authors = ["Younghyeon Park and pantometry contributors"]
+repository = "https://github.com/YounghyeonPark/pantometry"
+
+[workspace.dependencies]
+pantometry-units = { path = "crates/pantometry-units", version = "0.24.0" }
+pantometry-core = { path = "crates/pantometry-core", version = "0.24.0" }
+pantometry-optics = { path = "crates/pantometry-optics", version = "0.24.0" }
+pantometry-thermal = { path = "crates/pantometry-thermal", version = "0.24.0" }
+pantometry-mechanics = { path = "crates/pantometry-mechanics", version = "0.24.0" }
+pantometry-acoustic = { path = "crates/pantometry-acoustic", version = "0.24.0" }
+pantometry = { path = "crates/pantometry", version = "0.24.0" }
+pantometry-molecular = { path = "crates/pantometry-molecular", version = "0.24.0" }
+pantometry-electrical = { path = "crates/pantometry-electrical", version = "0.24.0" }
+pantometry-porous = { path = "crates/pantometry-porous", version = "0.24.0" }
+pantometry-elastic = { path = "crates/pantometry-elastic", version = "0.24.0" }
+pantometry-em = { path = "crates/pantometry-em", version = "0.24.0" }
+pantometry-fluid = { path = "crates/pantometry-fluid", version = "0.24.0" }
+pantometry-quantum = { path = "crates/pantometry-quantum", version = "0.24.0" }
+pantometry-pharmacokinetic = { path = "crates/pantometry-pharmacokinetic", version = "0.24.0" }
+pantometry-protein = { path = "crates/pantometry-protein", version = "0.24.0" }
+pantometry-forcefield = { path = "crates/pantometry-forcefield", version = "0.24.0" }
+pantometry-shape = { path = "crates/pantometry-shape", version = "0.24.0" }
+pantometry-scene = { path = "crates/pantometry-scene", version = "0.24.0" }
+pantometry-view = { path = "crates/pantometry-view", version = "0.24.0" }
+glam = { version = "0.29", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true

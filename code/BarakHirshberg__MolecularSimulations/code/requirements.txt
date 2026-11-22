@@ -1,0 +1,24 @@
+# Curated dependencies for the "Molecular Simulations" Jupyter Book.
+#
+# Install into a fresh virtual environment (Python 3.11+):
+#     python -m venv jupyterbook-env
+#     source jupyterbook-env/bin/activate
+#     pip install -r requirements.txt
+#
+# (Conda users: prefer `conda env create -f environment.yml`, which installs
+#  the same stack.)
+
+# --- Build toolchain ---------------------------------------------------------
+# Jupyter Book 1.0.x = the Sphinx-based line. Pinning only jupyter-book lets it
+# pull compatible Sphinx / MyST-Parser / MyST-NB / sphinx-book-theme versions.
+# Do NOT jump to 2.x: it uses a different engine, incompatible with our config.
+jupyter-book>=1.0,<1.1
+ghp-import>=2.1          # publish _build/html to the gh-pages branch
+
+# --- Scientific stack (demo + project notebooks) -----------------------------
+numpy>=1.26,<2.0
+scipy>=1.13
+matplotlib>=3.8
+pandas>=2.2
+altair>=4.2.2,<5         # kept on the v4 API; v5 changes the API
+vega_datasets>=0.9

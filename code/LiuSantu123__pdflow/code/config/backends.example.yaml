@@ -1,0 +1,199 @@
+# pdflow Blackwell acceleration profile.
+#
+# Materialize with:
+#   pdflow setup --profile kit
+# The __TOKENS__ below are filled from --home/--conda-base/--model-root/
+# --kit-root/--af3-root/--usalign. `pdflow doctor` checks every entry.
+#
+# Every predictor is called through its own environment. pdflow never imports
+# predictor packages, so environments cannot conflict with each other.
+# Command templates accept {python}, {binary}, {input}, {out_dir}, {seed},
+# {num_designs} and {extra}.
+
+pdflow:
+  workspace: ~/pdflow-runs
+  threads: 8
+  gpu_memory_gb: 14
+
+usalign:
+  # US-align binary (not on PATH by default).
+  binary: __USALIGN__
+  # On some hosts an injected LD_LIBRARY_PATH shadows the system libstdc++.
+  # Setting this to true runs US-align with LD_LIBRARY_PATH removed.
+  clean_ld_library_path: true
+
+design:
+  rfd4:
+    python: __CONDA_BASE__/envs/rfd4/bin/python
+    binary: __CONDA_BASE__/envs/rfd4/bin/rfd4-generate
+    # RFdiffusion4 is Hydra-driven. `inputs` is an annotated CIF or a
+    # condition-spec YAML/JSON; `extra` holds additional Hydra overrides
+    # (e.g. inference_experiment=quickstart, compile_lengths=null).
+    # For runs without the quickstart preset, put "~metrics" in extra to keep
+    # RFD4's own refolding off; pdflow scores downstream.
+    command: >-
+      {binary} inputs={input} num_replicates={num_designs}
+      out_dir={out_dir} {extra}
+    # Local checkpoint bundle (takes precedence over the HF default).
+    # On another machine point these at your own RFD4 bundle, or delete this
+    # block and set hf_ckpt_path=nvidia/RFD4-Proteina.
+    default_extra:
+      - hf_ckpt_path=null
+      - ckpt_path=__HOME__/hf-bundle/flow_checkpoints
+      - ckpt_name=rfd4_proteina_flow-ema.ckpt
+      - autoencoder_ckpt_path=__HOME__/hf-bundle/ae_checkpoints/rfd4_proteina_ae-ema.ckpt
+    env: {}
+
+  # Sequence design for backbones that arrive without sequences (RFD3).
+  # Fill in the actual LigandMPNN/ProteinMPNN entry point on your machine.
+  mpnn:
+    python: __CONDA_BASE__/envs/ligandmpnn/bin/python
+    command: >-
+      {python} /path/to/LigandMPNN/run.py
+      --pdb_path {input} --out_folder {out_dir} --number_of_batches {num_designs}
+    env: {}
+
+predictors:
+  af3:
+    python: __CONDA_BASE__/envs/alphafold3/bin/python
+    script: __AF3_ROOT__/run_alphafold_5070ti.py
+    model_dir: __AF3_ROOT__/models
+    # Only needed when the AF3 data pipeline runs. pdflow always supplies its
+    # own MSA, so this can stay empty.
+    db_dir: ""
+    num_samples: 5
+    # RTX 5070 Ti needs the XLA GLU path.
+    extra_args: ["--flash_attention_implementation=xla"]
+    env: {}
+
+  boltz2:
+    # Dedicated kit venv (torch 2.12/cu130). The stock conda env is torch 2.11
+    # and the kit's exact arm refuses it.
+    binary: __HOME__/.venvs/boltz2kit/bin/boltz
+    cache: __MODEL_ROOT__/boltz2/cache
+    num_samples: 5
+    clean_ld_library_path: true
+    # The kit exits 3 when exactln cannot apply; accept the completed output.
+    accept_returncodes: [0, 3]
+    launcher:
+      - bash
+      - __KIT_ROOT__/kits/boltz2/run.sh
+      - pred
+      - --config
+      - sm120
+      - --mode
+      - fast
+      - --allow-partial
+    path_prepend: __HOME__/.venvs/boltz2kit/bin
+    extra_args: []
+    env:
+      BOLTZ_CACHE: __MODEL_ROOT__/boltz2/cache
+      MODEL_OPT_JIT_ROOT: __HOME__/.cache/boltz2kit-jit
+
+  protenix2:
+    # Dedicated Blackwell kit venv (torch 2.13/cu130). The stock conda env
+    # (torch 2.7/cu128) produces all-NaN coordinates on sm_120.
+    binary: __HOME__/.venvs/ptxv2kit/bin/protenix
+    model_name: protenix-v2
+    num_samples: 5
+    # The injected LD_LIBRARY_PATH carries an older libstdc++.
+    clean_ld_library_path: true
+    # Protenix only writes full_data (token_pair_pae) with this flag.
+    extra_args: ["--need_atom_confidence", "True"]
+    # Kit acceleration. Use --mode exact for bitwise-close output, or fast for
+    # the benchmarked 1.5x path. fast needs ln_core disabled with torch LayerNorm.
+    launcher:
+      - bash
+      - __KIT_ROOT__/kits/protenix_v2/run.sh
+      - pred
+      - --config
+      - sm120
+      - --mode
+      - fast
+    # kalign lives in the venv; nvcc is in the conda base.
+    path_prepend:
+      - __HOME__/.venvs/ptxv2kit/bin
+      - __CONDA_BASE__/bin
+    env:
+      PROTENIX_ROOT_DIR: __MODEL_ROOT__/protenix2
+      # Stock fast LayerNorm is not sm_120-safe; torch LayerNorm is.
+      LAYERNORM_TYPE: torch
+      MODEL_OPT_LEVERS_OFF: ln_core
+      MODEL_OPT_JIT_ROOT: __HOME__/.cache/ptxv2kit-jit
+      CUDA_HOME: __CONDA_BASE__
+      CUDACXX: __CONDA_BASE__/bin/nvcc
+      CPATH: __HOME__/.venvs/ptxv2kit/lib/python3.11/site-packages/nvidia/cu13/include:__CONDA_BASE__/targets/x86_64-linux/include
+
+  opendde:
+    binary: __CONDA_BASE__/envs/opendde/bin/opendde
+    model_name: opendde_v1
+    num_samples: 5
+    clean_ld_library_path: true
+    # OpenDDE's frozen-weights gate requires an explicit MSA; fall back to a
+    # query-only a3m when the campaign has no target MSA.
+    query_msa_fallback: true
+    launcher:
+      - bash
+      - __KIT_ROOT__/kits/opendde/run.sh
+      - pred
+      - --config
+      - sm120
+      - --mode
+      - fast
+    path_prepend: __CONDA_BASE__/envs/opendde/bin
+    extra_args: []
+    # Local runtime (checkpoint + CCD); otherwise OpenDDE downloads from HF.
+    env:
+      OPENDDE_ROOT_DIR: __MODEL_ROOT__/opendde/runtime
+      PYTHONHASHSEED: "0"
+      TORCH_CUDA_ARCH_LIST: "12.0"
+      CUDA_HOME: __CONDA_BASE__
+      CUDACXX: __CONDA_BASE__/bin/nvcc
+      CPATH: __CONDA_BASE__/envs/opendde/lib/python3.11/site-packages/nvidia/cuda_runtime/include:__CONDA_BASE__/envs/opendde/lib/python3.11/site-packages/nvidia/cusparse/include:__CONDA_BASE__/envs/opendde/lib/python3.11/site-packages/nvidia/cublas/include:__CONDA_BASE__/envs/opendde/lib/python3.11/site-packages/nvidia/cusolver/include:__CONDA_BASE__/envs/opendde/lib/python3.11/site-packages/nvidia/cuda_cupti/include:__CONDA_BASE__/envs/opendde/lib/python3.11/site-packages/triton/backends/nvidia/include
+
+  mol1:
+    binary: __CONDA_BASE__/envs/mol1/bin/mol
+    model_name: mol-1-base
+    num_samples: 5
+    extra_args: []
+    env:
+      MOL_ROOT_DIR: __HOME__/mol1-data
+
+  # Legacy ID: runs ESMFold v1.
+  esmfold2:
+    python: __CONDA_BASE__/envs/esmfold/bin/python
+    script: __MODEL_ROOT__/esmfold/run_esmfold.py
+    pythonpath: __MODEL_ROOT__/esmfold/openfold-latest
+    weights: __HOME__/.cache/torch/hub/checkpoints/esmfold_3B_v1.pt
+    # fp16 hits a NaN in this OpenFold build's compute_tm; fp32 is stable.
+    extra_args: ["--fp32"]
+    env: {}
+    # ESMFold has no MSA and no ligands; pdflow skips it for complexes.
+    single_chain_only: true
+
+  # ESMFold2 + ESMC-6B. Enable and set repo, python and both local checkpoints.
+  esmfold2_overlay:
+    enabled: false
+    repo: "__KIT_ROOT__"
+    python: "__HOME__/.venvs/esmfold2kit/bin/python"
+    mode: blackwell
+    env:
+      ESMFOLD2_WEIGHTS: "__HOME__/esmfold2/ESMFold2"
+      ESMFOLD2_ESMC: "__HOME__/esmfold2/ESMC-6B"
+
+tmol:
+  python: __CONDA_BASE__/envs/tmol/bin/python
+  mode: score            # score | minimize | relax
+  device: cuda
+  num_repeats: 2
+
+metrics:
+  contact_cutoff: 5.0        # A, heavy-atom interface definition
+  pae_interface_cutoff: 10.0 # A, residue pairs used by the ipSAE-like score
+  sasa_probe: 1.4
+  # Ranking weights for choosing the best model of each design/predictor.
+  weights:
+    iptm: 0.45
+    ptm: 0.20
+    plddt: 0.20
+    pae: 0.15

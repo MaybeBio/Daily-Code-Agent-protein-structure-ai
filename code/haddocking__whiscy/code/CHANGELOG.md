@@ -1,0 +1,108 @@
+# Changelog
+
+All notable changes to WHISCY, one line per pull request, newest first.
+Releases are tagged in git and published as Docker images at
+`ghcr.io/haddocking/whiscy:<tag>`.
+
+## Unreleased
+
+- An empty `.lac` file (no partly buried residue, as in extended or
+  disordered chains) no longer stops `whiscy` with `No surface residues`:
+  it warns and writes an empty `.lcons`, and smoothing then uses only the
+  surface neighbours (#73, closes #66)
+
+## [v1.6.1] - 2026-11-06
+
+- Report: show ▲/▼ on the sorted column of the residue table, say how to view
+  `report.html` at the end of `whiscy_haddock` (terminal and `whiscy.log`),
+  and link the input structure, copied next to the report when needed (#72,
+  closes #65)
+
+## [v1.6.0] - 2026-11-04
+
+- Examples regenerated with latest version (#63, closes #55)
+- Publish the protein-protein benchmark (BM5) on the documentation site (#62,
+  closes #60)
+- Give the top-10 HADDOCK residues next to the score cutoff in
+  `whiscy_haddock` (`active_top10.txt`, `passive_top10.txt`,
+  `haddock-top10.pdb`, and a view and lists in the report); the output PDB
+  files have fixed names (`haddock-cutoff.pdb`, `haddock-top10.pdb`), so the
+  output PDB argument is removed (#61, closes #59)
+- Remove the HSSP download, which no longer works, and the HSSPCONV
+  dependency; a local HSSP file is still read with `--hssp` (#58, closes #54)
+- Write a log file of the run (`whiscy.log`), to which every command appends,
+  starting with the WHISCY version and its command line; the report links to
+  it (#50, closes #45)
+- Add a web server manual and publish the documentation with MkDocs at
+  <https://www.bonvinlab.org/whiscy> (#49, closes #46)
+
+## [v1.5.0] - 2026-11-03
+
+- Write an HTML report of the prediction in `whiscy_haddock` (`report.html`,
+  a Mol* view of the WHISCY scores and of the active and passive residues;
+  `--no-report` to turn it off) (#44, closes #43)
+
+## [v1.4.0] - 2026-10-23
+
+- Restrict the passive residues of `whiscy_haddock` to the surface, taken from
+  the new `--surface_list` option or else the scored residues (#41)
+- Replace the NCBI BLAST search with the ColabFold MMseqs2 server, falling back
+  to EBI BLAST (UniProtKB), and filter out redundant hits; drop MUSCLE (#40,
+  closes #39)
+
+## [v1.3.1] - 2026-10-20
+
+- Take the HSSP `MASTER` row from the HSSP alignment, so residues with
+  insertion codes no longer shift or break the alignment (#38, closes #37)
+
+## [v1.3.0] - 2026-10-20
+
+- Map alignment columns onto the target residues in `whiscy_setup`, so
+  conservation scores are assigned to the right residues for uploaded and BLAST
+  alignments; pin the Docker base image to `python:3.11-bookworm` (protdist no
+  longer compiles on Debian trixie); run the setup regression tests offline;
+  exclude tests from Codacy's Bandit check (#35, closes #34)
+
+## [v1.2.1] - 2024-06-27
+
+- Exit with code 1 instead of 0 when a step fails (#33, closes #29, #30, #31,
+  #32)
+- Integrate with Codacy (#28)
+- Update the installation instructions (#26)
+
+## [v1.2.0] - 2024-04-22
+
+- Repository-wide cleanup and linting (#25)
+- Update the installation and usage documentation and the README (#24)
+- Reorganize the repository (#23, closes #22)
+- Add `pyproject.toml` (#21, closes #20)
+- Configure third-party binaries through environment variables instead of
+  `local.json` (#19, closes #18)
+- Update the base Python version to 3.11 (#17, closes #14)
+
+## [v1.1.3] - 2024-04-17
+
+- Fall back to generating the alignment with BLAST (NCBI) and MUSCLE when no
+  HSSP file is available (#16)
+
+## [v1.1.2] - 2024-04-15
+
+- Refactor the tests (#15)
+- Add a devcontainer configuration (#12)
+- Add CI/CD (#11)
+
+## [v1.1.1] - 2024-03-14
+
+- Fix an unbound variable in `get_from_ftp` (#10, closes #9)
+
+## [v1.1.0] - 2021-04-06
+
+- Skip non-standard residues instead of failing (#7, closes #6)
+- Support HSSP3 files, converted with `hsspconv` (#5)
+- Add the license (#4)
+- Link DOIs to the preferred resolver (#3)
+
+## [1.0] - 2018-09-03
+
+- Support older Python versions, warn when configured paths are missing, and
+  make protdist compile with older GCC (#2)

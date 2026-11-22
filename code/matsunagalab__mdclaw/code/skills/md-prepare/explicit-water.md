@@ -1,0 +1,156 @@
+# Explicit Water: Solvation & Topology
+
+Solvent-regime mapping, the explicit-water constant defaults (`ff19SB + opc`,
+15 Å buffer, 0.15 M salt, box/HMR), the `ff19SB + tip3p` guardrail, the
+supported-ion policy, and the local-run/platform preflight all live in
+`skills/common/solvent-regimes.md`. Open that reference only when a regime or
+default needs clarification; this page covers the solvation and topology steps.
+
+Continue here only after a completed `prep` node exists. For special source,
+chemistry, or branch handling, use the conditional links in `SKILL.md`.
+
+---
+
+## Preparation Prerequisite
+
+Confirm that the selected `prep` node is completed. A standard bare metal ion
+needs no extra branch — `inspect_molecules` reports
+`preparation_guidance.ions.bare_ion_templates`; only `missing` (or a PTM) needs
+the matching explicit prep branch before solvation.
+
+Before solvation, verify that any source ions intentionally kept by the request
+are present in the prep `merged_pdb`. If the user requested implicit solvent,
+use `implicit-water.md` instead and do not retain explicit ions.
+
+---
+
+## Solvation
+
+### Bulk Water
+
+```bash
+mdclaw create_node --job-dir <job_dir> --node-type solv
+mdclaw explain_node --job-dir <job_dir> --node-id <solv_node_id>
+mdclaw --job-dir <job_dir> --node-id <solv_node_id> solvate_structure \
+  --water-model opc --dist 15.0 --salt --saltcon 0.15
+```
+
+The water model is decided here and only here, and `--water-model` is
+required (`water_model_required` otherwise): `opc` unless the request names
+another water, for example `--water-model tip3p`. The topology stage inherits
+the solv node's water model and pairs the protein force field with it, so do
+not repeat it at `build_amber_system`; a different value there is refused
+(`solvation_topology_water_model_mismatch`).
+
+Read `warnings` before topology: an elongated solute in the default cubic box
+names the rectangular alternative (`--no-cubic`) with both atom counts
+(`box_advisory`), and a system of 500k atoms or more says to run topo and min
+through `submit_job`.
+
+`pdb_file` is auto-resolved from the `prep` parent's `merged_pdb` artifact. If
+that artifact is wrong, create a corrected prep branch instead of overriding
+the path on the solv node.
+
+Before topology, do a quick request-match check: for ligand-free systems,
+the prep node must not carry `ligand_chemistry`, and the `solvated_pdb` must not
+contain source ligands. If either check fails, branch from the valid ancestor;
+do not rerun the same node with changed inputs. Prefer node artifacts and PDB
+contents over stale prose fields in logs or metadata.
+
+After solvation, if the next stages will run on this machine, run the
+local-execution / platform preflight from `skills/common/solvent-regimes.md`
+with `--atom-count <result.statistics.total_atoms>` before topology/min/eq/prod.
+
+For membrane systems, use the same `solv` node type but run `embed_in_membrane`
+instead of `solvate_structure`. The full procedure (backend, cold-build timing,
+Packmol race, salt override, failure codes) lives in
+`skills/md-prepare/membrane.md`.
+
+For exact user wording -> ion flags, automatic-charge semantics, and result
+fields, use `skills/common/solvent-regimes.md#ion-intent---exact-flags`.
+
+---
+
+## Build Topology
+
+```bash
+mdclaw create_node --job-dir <job_dir> --node-type topo
+mdclaw explain_node --job-dir <job_dir> --node-id <topo_node_id>
+mdclaw --job-dir <job_dir> --node-id <topo_node_id> build_amber_system
+```
+
+`pdb_file`, the box, the membrane flag and the water model are auto-resolved
+from the `solv` parent (`solvated_pdb`, `box_dimensions`, `is_membrane`,
+`water_model`); the protein force field defaults to the pairing for that
+water (ff19SB for OPC, ff14SB for TIP3P) unless `--forcefield` is given. The
+result's `parameters.water_model_source` and `parameters.forcefield_source`
+say where each value came from.
+Do not pass a manual `--pdb-file`; if the wrong structure would be resolved,
+fix the upstream `prep`/`solv` branch and create a new `topo` node.
+
+If topology output is quiet, inspect `nodes/<topo_id>/node.json` and report
+`metadata.topology_build_stage`, `metadata.topology_build_stage_updated_at`,
+and `metadata.topology_build_stage_history`. Long OPC/explicit-water stages
+such as `modeller_prepare`, `system_generator_create_system`, and
+`initial_minimization` can be slow on CPU; retry or branch only after the node
+has failed, completed, or the user explicitly abandons it.
+
+`build_amber_system` is the curated Amber → OpenMM system builder for completed
+prep/solv DAG artifacts. It runs the resolved prepared/solvated PDB through
+OpenFF Pablo (with a validated OpenMM PDBFile fallback when needed), applies the resolved Amber XML
+bundle via `openmmforcefields.SystemGenerator` (`GAFFTemplateGenerator` from
+prep's `ligand_chemistry` artifact; NAGL charges are assigned internally, or
+AM1-BCC for every ligand with `--ligand-charge-method am1bcc`), and
+emits the modern artifact triple
+`system.system.xml` +
+`system.topology.pdb` + `system.state.xml` on the topo node, with
+`metadata.system_artifact_kind="openmm_system_xml"` and a
+`metadata.forcefield_provenance` dict (XML names, sha256, OpenMM /
+openmmforcefields versions, `method.hmr`, ligand template sources). HMR defaults
+to `--hmr` (4 amu hydrogens); run nodes inherit HMR and the 4 fs timestep from
+the topology. The run-time validator rejects explicit mismatches with
+`modern_system_hmr_mismatch`. The XML triple is the only topology
+contract on the run side — tleap / `parm7` / `rst7` are not produced
+or consumed anywhere. The topo node's `state.xml` carries the topology-time
+minimized coordinates; `topology.pdb` supplies atom/residue topology. When a PDB
+view of the minimized state is needed for reports or benchmark submissions, run:
+
+```bash
+mdclaw export_state_pdb \
+  --topology-pdb-file <topology.pdb> \
+  --state-xml-file <state.xml> \
+  --output-pdb-file minimized_structure.pdb
+```
+
+To use an older protein force field that is not the recommended default,
+choose the water at solvation (`solvate_structure --water-model tip3p`) and,
+if the request names a force field, pass it at topology
+(`build_amber_system --forcefield ff99SBildn`); with no `--forcefield` the
+topology pairs ff14SB with TIP3P by itself. This is a research / comparison
+choice, not a "legacy artifact format" toggle.
+
+### Protonation Notes
+- pH 7.4 is physiological default
+- pdb2pqr + propka assigns pH-dependent HIS states (HID/HIE/HIP)
+- Fallback to pdb4amber + reduce (geometry-based) if pdb2pqr unavailable
+- Ligands: neutral SMILES are protonated to a pH-appropriate state via
+  Dimorphite-DL (defaults to the same `--ph` as the protein). Override with
+  `--ligand-ph`, disable with `--no-protonate-ligands`, or force a specific
+  state by passing a charged SMILES (`[O-]`/`[NH3+]`) or a known net charge
+  (`--ligand-net-charges '{"AMH": 0}'`, used to select the matching state)
+
+---
+
+## State Tracking
+
+Each tool auto-updates its `node.json` and job-level `progress.json`.
+No manual writing needed. Read `progress.json` to verify state before handoff.
+Use `progress.json.params.execution_mode` as the source of truth for
+interaction policy.
+
+## Handoff
+
+Verify the `topo` node is `completed` in `progress.json`, then follow the
+canonical handoff in `SKILL.md` step 9 (continue with
+`skills/md-equilibration/SKILL.md` on this `job_dir`; shortcut
+`/md-equilibration`) when the current request continues beyond preparation.

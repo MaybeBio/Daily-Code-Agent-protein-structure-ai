@@ -1,0 +1,67 @@
+name: Artifex Build Verification
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer push to a pull request cancels its superseded run; a push to main always completes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Package Build Verification (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The macOS-14 runners queue for hours and run the same steps; they run on
+        # pushes to main only, so a branch or pull request is gated by the ubuntu
+        # jobs alone and the merge to main measures both platforms.
+        os: ${{ fromJSON(github.ref == 'refs/heads/main' && '["ubuntu-latest", "macos-15"]' || '["ubuntu-latest"]') }}
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Artifex
+        uses: ./.github/actions/setup-artifex
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache-suffix: build-${{ matrix.os }}-${{ matrix.python-version }}
+          linux-editable-target: ".[dev]"
+          macos-editable-target: ".[all-cpu]"
+          extra-packages: types-requests types-setuptools
+
+      - name: Build package
+        run: uv run python -m build
+
+      - name: Verify package metadata
+        run: uv run twine check --strict dist/*
+
+      - name: Run install smoke contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv venv test_venv
+          . test_venv/bin/activate
+          uv pip install dist/*.whl
+          python scripts/require_python.py ${{ matrix.python-version }}
+          python - <<'PY'
+          import artifex
+
+          exports = dir(artifex)
+          assert exports == ["generative_models"], exports
+          print(exports)
+          PY
+          deactivate
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-artifacts-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: dist/

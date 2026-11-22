@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% set active = 'examples' %}
+{% block title %}Examples &middot; AlphaFraud{% endblock %}
+
+{% block content %}
+  <h1>Examples — AlphaFold's blind spots, up close</h1>
+  <p class="sub">AlphaFraud hunts for confident failures, but it is an even-handed analyzer — so we open
+  with a <strong>positive control</strong>: a protein AlphaFold had never seen, yet predicted almost
+  perfectly (the metrics certify it with a near-zero fraud score). Below it, every week we automatically
+  catch the most striking confidently-wrong structure from that week's PDB release, and beneath the weekly
+  archive sit our hand-curated deep-dives into the worst offenders.</p>
+
+  {% if control %}
+  <div class="exsection">
+    <h2 class="exsection-h">{{ control.section }}</h2>
+    {% if control.section_note %}<p class="sub">{{ control.section_note }}</p>{% endif %}
+  </div>
+  {% with x = control %}
+  {% include "_expanel.html" %}
+  {% endwith %}
+  {% endif %}
+
+  {% if featured %}
+  <div class="exsection">
+    <h2 class="exsection-h">🎣 Fresh catch — example of the week {{ featured.week }}</h2>
+    <p class="sub">Auto-selected from this release's confidently-wrong catches and written deterministically
+    from the database — no hand-curation.</p>
+  </div>
+  {% with x = featured, fresh = true %}
+  {% include "_expanel.html" %}
+  {% endwith %}
+
+  {% if archive %}
+  <section class="card arccard">
+    <div class="arc-head">
+      <h2 class="exsection-h">🗄️ Weekly archive — {{ counts.weeks }} release weeks</h2>
+      <p class="sub">Every weekly PDB release since AlphaFold's cutoff. {{ counts.catches }} produced a
+      confidently-wrong catch (expand to read its panel); the rest were <em>quiet weeks</em> where
+      AlphaFold was never overconfident — no fraud to report.</p>
+      <input type="search" id="arcSearch" class="arc-search" placeholder="Filter by protein, UniProt, week or failure mode…" aria-label="Filter archive">
+    </div>
+    <div class="arclist" id="arcList" data-visible="6">
+      {% for a in archive %}
+      <details class="arcrow{% if not a.has_catch %} arc-quiet{% endif %}{% if loop.index0 >= 6 %} arc-extra{% endif %}" data-key="{{ (a.week ~ ' ' ~ a.data.name ~ ' ' ~ (a.uniprot or '') ~ ' ' ~ (a.failure_mode or 'quiet clean no confident miss'))|lower }}">
+        <summary>
+          <span class="arc-week">{{ a.week }}</span>
+          <span class="arc-name">{{ a.data.name }}{% if a.data.gene %} <span class="exgene">{{ a.data.gene }}</span>{% endif %}</span>
+          {% if a.has_catch %}
+          <span class="chip mode arc-mode">{{ a.failure_mode }}</span>
+          {% else %}
+          <span class="chip clean arc-mode">✓ no confident miss</span>
+          {% endif %}
+          <span class="arc-m">TM {{ '%.2f'|format(a.tm) if a.tm is not none else '—' }}</span>
+          <span class="arc-m arc-hide-xs">pLDDT {{ '%.0f'|format(a.plddt) if a.plddt is not none else '—' }}</span>
+          <span class="arc-m{% if a.has_catch %} bad{% endif %}">FRAUD {{ '%.2f'|format(a.fraud_score) if a.fraud_score is not none else '—' }}</span>
+          <span class="exsec-toggle" aria-hidden="true"></span>
+        </summary>
+        <div class="arc-body">
+          <div class="arc-prose">
+            {% if a.has_catch %}
+            <p class="exheadline">{{ a.data.headline }}</p>
+            {% for p in a.data.structure %}<p>{{ p }}</p>{% endfor %}
+            {% for p in a.data.why_wrong %}<p>{{ p }}</p>{% endfor %}
+            <p class="arc-link"><a href="{{ url_for('entry', entity_id=a.entity_id) }}">Open full analysis for {{ a.data.entry }}_{{ a.data.chain }} →</a></p>
+            {% else %}
+            <p>{{ a.data.note }}</p>
+            <p class="arc-link"><a href="{{ url_for('entry', entity_id=a.entity_id) }}">Open the week's closest miss ({{ a.data.entry }}) →</a></p>
+            {% endif %}
+          </div>
+          {% if a.has_catch %}
+          {% set aru = ribbon_url(a.entity_id) %}
+          {% if aru %}
+          <div class="arc-thumb">
+            <img src="{{ aru }}" alt="Cα-deviation ribbon of {{ a.data.entry }}_{{ a.data.chain }}" loading="lazy">
+            <span class="arc-thumb-cap">{{ a.data.entry }}_{{ a.data.chain }} · Cα deviation</span>
+          </div>
+          {% endif %}
+          {% endif %}
+        </div>
+      </details>
+      {% endfor %}
+      <p class="arc-empty" id="arcEmpty" hidden>No weeks match that filter.</p>
+    </div>
+    {% if archive|length > 6 %}
+    <button type="button" id="arcToggle" class="arc-toggle">Show all {{ archive|length }} weeks ▾</button>
+    {% endif %}
+  </section>
+  {% endif %}
+  {% endif %}
+
+  {% set ns = namespace(cur='') %}
+  {% for x in examples %}
+  {% if x.section and x.section != ns.cur %}{% set ns.cur = x.section %}
+  <div class="exsection">
+    <h2 class="exsection-h">{{ x.section }}</h2>
+    {% if x.section_note %}<p class="sub">{{ x.section_note }}</p>{% endif %}
+  </div>
+  {% endif %}
+  {% include "_expanel.html" %}
+  {% endfor %}
+{% endblock %}

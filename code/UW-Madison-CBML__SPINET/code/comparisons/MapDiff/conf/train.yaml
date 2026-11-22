@@ -1,0 +1,28 @@
+defaults:
+  - dataset: atlas
+  - model: egnn
+  - diffusion: discrete_default
+  - mask_prior: default
+  - mask_train: default
+  - train: train_diff
+  - wandb: basic
+
+hydra:
+  run:
+    dir: ./outputs/${experiment.name}_${now:%Y-%m-%d}_${now:%H-%M-%S}
+  output_subdir: configs
+
+experiment:
+  name: MapDiff_mdcath_450
+
+# Device placement. A requested index that does not exist on this machine falls
+# back to cuda:0 with a warning rather than crashing.
+compute:
+  device: cuda:0
+
+# Optional: path to an already-trained mask-prior IPA checkpoint (as saved by
+# this same script's stage-1 pretraining, under <output_dir>/model/). When
+# set, stage 1 is skipped and this checkpoint is loaded straight into the
+# diffusion model's frozen prior instead of training one from scratch.
+prior_model:
+  path: null

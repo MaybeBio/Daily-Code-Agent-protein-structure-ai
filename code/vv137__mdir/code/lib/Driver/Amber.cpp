@@ -1,0 +1,1264 @@
+// Readers of the formats of Amber: topologies (prmtop) and coordinates
+// (inpcrd, rst7).
+//
+// The readers are written from a specification of the formats, with no
+// code of Amber or of its tools. The terms are converted to the forms of
+// docs/conventions.md.
+
+#include "mdir/Driver/Cell.h"
+#include "mdir/Driver/Topology.h"
+#include "mdir/Support/PhysicalConstants.h"
+
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/Support/MemoryBuffer.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <map>
+#include <set>
+
+using namespace mdir::driver;
+using llvm::StringRef;
+
+namespace {
+
+/// A number as a message shows it.
+std::string show(double value) {
+  char text[32];
+  std::snprintf(text, sizeof(text), "%g", value);
+  return text;
+}
+
+/// Units of Amber in those of MDIR.
+constexpr double nmPerAngstrom = mdir::physical::nanometersPerAngstrom;
+constexpr double kjPerKcal = mdir::physical::kilojoulesPerKilocalorie;
+/// The factor of the charges of a prmtop: `q = CHARGE / 18.2223`.
+constexpr double chargeFactor = 18.2223;
+/// Velocities of a restart are in Å per 1/20.455 ps.
+constexpr double velocityFactor = 20.455;
+
+/// A section of a prmtop: the descriptor of `%FORMAT` and the data lines.
+struct Section {
+  std::string format;
+  std::vector<StringRef> lines;
+  unsigned line = 0;
+};
+
+/// `[count](letter width[.decimals])`, with or without parentheses.
+struct Format {
+  char letter = 0;
+  unsigned width = 0;
+};
+
+class Reader {
+public:
+  explicit Reader(StringRef path) : path(path) {}
+
+  llvm::Expected<Topology> read();
+
+private:
+  llvm::Error fail(const llvm::Twine &message) {
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "%s: %s", path.c_str(),
+                                   message.str().c_str());
+  }
+
+  llvm::Error split(StringRef text);
+  /// Splits a topology of the format before Amber 7, which has no %FLAG
+  /// lines: a title, 30 pointers, and sections in a fixed order whose
+  /// lengths follow from the pointers.
+  llvm::Error splitOld(llvm::ArrayRef<StringRef> lines);
+  llvm::Expected<Format> parseFormat(StringRef flag, StringRef text);
+
+  /// The items of the section `flag`, `count` of them if `count` is not
+  /// -1. A missing section is an error if `required`.
+  llvm::Error readStrings(StringRef flag, long count,
+                          std::vector<std::string> &values,
+                          bool required = true);
+  llvm::Error readIntegers(StringRef flag, long count,
+                           std::vector<long> &values, bool required = true);
+  llvm::Error readReals(StringRef flag, long count,
+                        std::vector<double> &values, bool required = true);
+  llvm::Error readFields(StringRef flag, long count, char kind,
+                         std::vector<std::string> &fields, bool required);
+
+  llvm::Error checkSupported(const std::vector<long> &pointers);
+  llvm::Error readTypes(Topology &topology, long count, long numPairs);
+  llvm::Error readTerms(Topology &topology, const std::vector<long> &p);
+  llvm::Error checkExclusions(const Topology &topology);
+  /// Finds the extra points and the frames that place them, and removes
+  /// the bonded terms of the extra points.
+  llvm::Error readExtraPoints(Topology &topology, long numExtra);
+  /// Reads the correction maps of pairs of dihedrals (CMAP).
+  llvm::Error readCMaps(Topology &topology);
+
+  std::string path;
+  std::unique_ptr<llvm::MemoryBuffer> buffer;
+  std::map<std::string, Section> sections;
+  /// Whether the file is of the format before Amber 7.
+  bool old = false;
+
+  /// Lennard-Jones by the triangle of types that the 1-4 pairs use.
+  std::vector<double> tableA, tableB;
+  std::vector<long> index;
+  std::vector<long> numExcluded, excludedList;
+  /// The type of each atom, AMBER_ATOM_TYPE.
+  std::vector<std::string> atomTypes;
+};
+
+} // namespace
+
+//===----------------------------------------------------------------------===//
+// Sections
+//===----------------------------------------------------------------------===//
+
+/// The atomic number of an atom of mass `mass`, in amu, and name `name`,
+/// for a topology without atomic numbers, or 0 for a particle without mass.
+/// The element whose symbol begins the name is taken where the mass allows
+/// it: a hydrogen below 4.1 amu, and a heavier element from its standard
+/// atomic weight down to 6.5 amu less, which repartitioned masses of its
+/// hydrogens take from it; `CA` of 40 amu is calcium, and of 12 or less
+/// carbon. Otherwise the element of the nearest standard atomic weight,
+/// within 0.5 amu.
+static int inferAtomicNumber(double mass, StringRef name) {
+  if (mass <= 0.0)
+    return 0;
+  struct Element {
+    int number;
+    const char *symbol;
+    double weight;
+  };
+  static const Element elements[] = {
+      {1, "H", 1.008},    {3, "LI", 6.94},    {6, "C", 12.011},
+      {7, "N", 14.007},   {8, "O", 15.999},   {9, "F", 18.998},
+      {11, "NA", 22.990}, {12, "MG", 24.305}, {15, "P", 30.974},
+      {16, "S", 32.06},   {17, "CL", 35.45},  {19, "K", 39.098},
+      {20, "CA", 40.078}, {25, "MN", 54.938}, {26, "FE", 55.845},
+      {29, "CU", 63.546}, {30, "ZN", 65.38},  {35, "BR", 79.904},
+      {37, "RB", 85.468}, {53, "I", 126.90},  {55, "CS", 132.91}};
+  std::string upper = name.trim().upper();
+  StringRef symbol(upper);
+  // Two letters first, so that CL is chlorine and not carbon.
+  for (size_t letters : {2, 1}) {
+    if (symbol.size() < letters)
+      continue;
+    for (const Element &element : elements) {
+      if (StringRef(element.symbol) != symbol.take_front(letters))
+        continue;
+      if (element.number == 1 ? mass < 4.1
+                              : mass <= element.weight + 0.5 &&
+                                    mass >= element.weight - 6.5)
+        return element.number;
+    }
+  }
+  int best = 0;
+  double closest = 0.5;
+  for (const Element &element : elements) {
+    if (std::fabs(mass - element.weight) < closest) {
+      closest = std::fabs(mass - element.weight);
+      best = element.number;
+    }
+  }
+  return best;
+}
+
+/// The phase of a dihedral as Amber takes it from a topology, which holds
+/// it to 8 digits (3.141594 for π in older files): a phase within 10⁻³ of
+/// ±π is ±π, and one whose cosine or sine is below 10⁻⁶ in magnitude has
+/// that cosine or sine 0.
+static double snapPhase(double phase) {
+  if (std::fabs(phase - M_PI) < 1e-3)
+    phase = M_PI;
+  else if (std::fabs(phase + M_PI) < 1e-3)
+    phase = -M_PI;
+  double c = std::cos(phase), s = std::sin(phase);
+  if (std::fabs(c) < 1e-6)
+    c = 0.0;
+  if (std::fabs(s) < 1e-6)
+    s = 0.0;
+  return std::atan2(s, c);
+}
+
+llvm::Error Reader::split(StringRef text) {
+  llvm::SmallVector<StringRef> lines;
+  text.split(lines, '\n');
+  if (!text.starts_with("%VERSION") && !text.starts_with("%FLAG") &&
+      !text.contains("\n%FLAG"))
+    return splitOld(lines);
+  bool hasVersion = false;
+  Section *current = nullptr;
+  bool inData = false;
+  for (StringRef line : lines) {
+    line = line.rtrim("\r");
+    if (line.starts_with("%VERSION")) {
+      hasVersion = true;
+      continue;
+    }
+    if (line.starts_with("%FLAG")) {
+      std::string name = line.drop_front(5).trim().str();
+      if (sections.count(name))
+        return fail("the section '" + name + "' appears twice");
+      current = &sections[name];
+      inData = false;
+      continue;
+    }
+    if (line.starts_with("%COMMENT")) {
+      if (inData)
+        return fail("a %COMMENT line among the data of a section");
+      continue;
+    }
+    if (line.starts_with("%FORMAT")) {
+      if (!current)
+        return fail("%FORMAT before the first %FLAG");
+      StringRef format = line.drop_front(7).trim();
+      if (!format.consume_front("(") || !format.consume_back(")"))
+        return fail("cannot read the line '" + line + "'");
+      current->format = format.str();
+      inData = true;
+      continue;
+    }
+    if (line.starts_with("%"))
+      return fail("an unknown control line '" + line + "'");
+    if (inData)
+      current->lines.push_back(line);
+  }
+  if (!hasVersion)
+    return fail("%FLAG lines without a %VERSION line");
+  return llvm::Error::success();
+}
+
+llvm::Error Reader::splitOld(llvm::ArrayRef<StringRef> all) {
+  old = true;
+  std::vector<StringRef> lines;
+  for (StringRef line : all)
+    lines.push_back(line.rtrim("\r"));
+  size_t next = 0;
+  // Takes the lines of `count` items of `kind`, at least one line: a
+  // Fortran read of no items still reads a record.
+  auto take = [&](StringRef flag, char kind, long count) -> llvm::Error {
+    long perLine = kind == 'I' ? 12 : kind == 'E' ? 5 : 20;
+    long numLines = count == 0 ? 1 : (count + perLine - 1) / perLine;
+    if (count < 0 || next + numLines > lines.size())
+      return fail("the file ends in the section " + flag +
+                  " of a topology of the format before Amber 7");
+    Section &section = sections[flag.str()];
+    section.format = kind == 'I' ? "12I6" : kind == 'E' ? "5E16.8" : "20a4";
+    for (long n = 0; n != numLines; ++n)
+      section.lines.push_back(lines[next++]);
+    return llvm::Error::success();
+  };
+  if (lines.empty())
+    return fail("the file is empty");
+  sections["TITLE"].format = "20a4";
+  sections["TITLE"].lines.push_back(lines[next++]);
+  if (llvm::Error error = take("POINTERS", 'I', 30))
+    return error;
+  std::vector<long> p;
+  if (llvm::Error error = readIntegers("POINTERS", 30, p))
+    return error;
+  long natom = p[0], ntypes = p[1], nres = p[11];
+  struct Entry {
+    const char *flag;
+    char kind;
+    long count;
+  };
+  const Entry entries[] = {
+      {"ATOM_NAME", 'A', natom},
+      {"CHARGE", 'E', natom},
+      {"MASS", 'E', natom},
+      {"ATOM_TYPE_INDEX", 'I', natom},
+      {"NUMBER_EXCLUDED_ATOMS", 'I', natom},
+      {"NONBONDED_PARM_INDEX", 'I', ntypes * ntypes},
+      {"RESIDUE_LABEL", 'A', nres},
+      {"RESIDUE_POINTER", 'I', nres},
+      {"BOND_FORCE_CONSTANT", 'E', p[15]},
+      {"BOND_EQUIL_VALUE", 'E', p[15]},
+      {"ANGLE_FORCE_CONSTANT", 'E', p[16]},
+      {"ANGLE_EQUIL_VALUE", 'E', p[16]},
+      {"DIHEDRAL_FORCE_CONSTANT", 'E', p[17]},
+      {"DIHEDRAL_PERIODICITY", 'E', p[17]},
+      {"DIHEDRAL_PHASE", 'E', p[17]},
+      {"SOLTY", 'E', p[18]},
+      {"LENNARD_JONES_ACOEF", 'E', ntypes * (ntypes + 1) / 2},
+      {"LENNARD_JONES_BCOEF", 'E', ntypes * (ntypes + 1) / 2},
+      {"BONDS_INC_HYDROGEN", 'I', 3 * p[2]},
+      {"BONDS_WITHOUT_HYDROGEN", 'I', 3 * p[12]},
+      {"ANGLES_INC_HYDROGEN", 'I', 4 * p[4]},
+      {"ANGLES_WITHOUT_HYDROGEN", 'I', 4 * p[13]},
+      {"DIHEDRALS_INC_HYDROGEN", 'I', 5 * p[6]},
+      {"DIHEDRALS_WITHOUT_HYDROGEN", 'I', 5 * p[14]},
+      {"EXCLUDED_ATOMS_LIST", 'I', p[10]},
+      {"HBOND_ACOEF", 'E', p[19]},
+      {"HBOND_BCOEF", 'E', p[19]},
+      {"HBCUT", 'E', p[19]},
+      {"AMBER_ATOM_TYPE", 'A', natom},
+      {"TREE_CHAIN_CLASSIFICATION", 'A', natom},
+      {"JOIN_ARRAY", 'I', natom},
+      {"IROTAT", 'I', natom},
+  };
+  for (const Entry &entry : entries)
+    if (llvm::Error error = take(entry.flag, entry.kind, entry.count))
+      return error;
+  // The cell and the molecules of the solvent.
+  if (p[27] != 0) {
+    if (llvm::Error error = take("SOLVENT_POINTERS", 'I', 3))
+      return error;
+    std::vector<long> solvent;
+    if (llvm::Error error = readIntegers("SOLVENT_POINTERS", 3, solvent))
+      return error;
+    if (llvm::Error error = take("ATOMS_PER_MOLECULE", 'I', solvent[1]))
+      return error;
+    if (llvm::Error error = take("BOX_DIMENSIONS", 'E', 4))
+      return error;
+  }
+  // A perturbed topology or a cap has more sections, which the checks of
+  // what MDIR supports refuse.
+  if (p[20] != 0 || p[29] != 0)
+    return llvm::Error::success();
+  for (; next != lines.size(); ++next)
+    if (!lines[next].trim().empty())
+      return fail("data after the last section of a topology of the "
+                  "format before Amber 7, at line " +
+                  llvm::Twine(next + 1));
+  return llvm::Error::success();
+}
+
+llvm::Expected<Format> Reader::parseFormat(StringRef flag, StringRef text) {
+  // `10I8`, `5E16.8`, `20a4`, `8(F9.5)`.
+  StringRef rest = text.trim();
+  rest = rest.drop_while([](char c) { return llvm::isDigit(c); });
+  rest.consume_front("(");
+  rest.consume_back(")");
+  if (rest.empty())
+    return fail("cannot read the format '" + text + "' of " + flag);
+  Format format;
+  format.letter = llvm::toUpper(rest.front());
+  StringRef width = rest.drop_front().take_while(
+      [](char c) { return llvm::isDigit(c); });
+  if (width.getAsInteger(10, format.width) || format.width == 0 ||
+      !llvm::is_contained(StringRef("AIEFD"), format.letter))
+    return fail("cannot read the format '" + text + "' of " + flag);
+  return format;
+}
+
+llvm::Error Reader::readFields(StringRef flag, long count, char kind,
+                               std::vector<std::string> &fields,
+                               bool required) {
+  fields.clear();
+  auto found = sections.find(flag.str());
+  if (found == sections.end()) {
+    if (required)
+      return fail("no section " + flag);
+    return llvm::Error::success();
+  }
+  auto format = parseFormat(flag, found->second.format);
+  if (!format)
+    return format.takeError();
+  bool isName = format->letter == 'A';
+  if ((kind == 'A') != isName || (kind == 'I') != (format->letter == 'I'))
+    return fail("the section " + flag + " has the format '" +
+                found->second.format + "', which is not of its kind");
+
+  // Fields of a fixed width, not separated by blanks. Names are counted
+  // from the length that the section should have.
+  for (StringRef line : found->second.lines) {
+    StringRef data = isName ? line : line.rtrim();
+    for (size_t start = 0; start < data.size(); start += format->width) {
+      if (isName && count >= 0 && static_cast<long>(fields.size()) == count)
+        break;
+      fields.push_back(data.substr(start, format->width).str());
+    }
+  }
+  if (count >= 0 && static_cast<long>(fields.size()) != count)
+    return fail("the section " + flag + " has " +
+                llvm::Twine(fields.size()) + " values, and the file needs " +
+                llvm::Twine(count));
+  return llvm::Error::success();
+}
+
+llvm::Error Reader::readStrings(StringRef flag, long count,
+                                std::vector<std::string> &values,
+                                bool required) {
+  if (llvm::Error error = readFields(flag, count, 'A', values, required))
+    return error;
+  for (std::string &value : values)
+    value = StringRef(value).trim().str();
+  return llvm::Error::success();
+}
+
+llvm::Error Reader::readIntegers(StringRef flag, long count,
+                                 std::vector<long> &values, bool required) {
+  std::vector<std::string> fields;
+  if (llvm::Error error = readFields(flag, count, 'I', fields, required))
+    return error;
+  values.clear();
+  for (const std::string &field : fields) {
+    StringRef text = StringRef(field).trim();
+    long value = 0;
+    if (!text.empty() && text.getAsInteger(10, value))
+      return fail("cannot read the integer '" + text + "' in " + flag);
+    values.push_back(value);
+  }
+  return llvm::Error::success();
+}
+
+llvm::Error Reader::readReals(StringRef flag, long count,
+                              std::vector<double> &values, bool required) {
+  std::vector<std::string> fields;
+  if (llvm::Error error = readFields(flag, count, 'E', fields, required))
+    return error;
+  values.clear();
+  for (std::string &field : fields) {
+    std::string text = StringRef(field).trim().str();
+    for (char &c : text)
+      if (c == 'D' || c == 'd')
+        c = 'E';
+    double value = 0.0;
+    if (!text.empty() && StringRef(text).getAsDouble(value))
+      return fail("cannot read the number '" + text + "' in " + flag);
+    values.push_back(value);
+  }
+  return llvm::Error::success();
+}
+
+//===----------------------------------------------------------------------===//
+// What MDIR does not support
+//===----------------------------------------------------------------------===//
+
+llvm::Error Reader::checkSupported(const std::vector<long> &p) {
+  auto has = [&](StringRef flag) { return sections.count(flag.str()) != 0; };
+  if (has("CTITLE") || has("FORCE_FIELD_TYPE"))
+    return fail("a topology of CHARMM (Chamber) is not supported");
+  for (auto &[name, section] : sections) {
+    StringRef flag = name;
+    if (flag.starts_with("CHARMM_"))
+      return fail("a topology of CHARMM (Chamber) is not supported: " + flag);
+    if (flag.starts_with("AMOEBA_"))
+      return fail("a topology of AMOEBA is not supported: " + flag);
+  }
+  if (has("LENNARD_JONES_CCOEF"))
+    return fail("12-6-4 terms are not supported: LENNARD_JONES_CCOEF");
+  if ((p.size() > 32 && p[32] > 0) || has("LENNARD_JONES_DCOEF") ||
+      has("LENNARD_JONES_DVALUE"))
+    return fail("pairwise C4 terms are not supported: POINTERS[32] = " +
+                llvm::Twine(p.size() > 32 ? p[32] : 0));
+  if (has("POLARIZABILITY") || has("DIPOLE_DAMP_FACTOR"))
+    return fail("a polarizable topology is not supported: POLARIZABILITY");
+  std::vector<long> ipol;
+  if (llvm::Error error = readIntegers("IPOL", -1, ipol, false))
+    return error;
+  if (!ipol.empty() && ipol.front() > 0)
+    return fail("a polarizable topology is not supported: IPOL = " +
+                llvm::Twine(ipol.front()));
+  // 0: no periodic cell, for a run without one (D142); 1: rectangular, 2: truncated octahedron, 3: triclinic; the cell itself
+  // is that of the file of coordinates.
+  if (p[27] < 0 || p[27] > 3)
+    return fail("the kind of periodic cell is not known: IFBOX = " +
+                llvm::Twine(p[27]));
+  if (p[29] != 0)
+    return fail("a solvent cap is not supported: IFCAP = " +
+                llvm::Twine(p[29]));
+  if (p[20] != 0)
+    return fail("a perturbed topology is not supported: IFPERT = " +
+                llvm::Twine(p[20]));
+  if (p[9] == 1)
+    return fail("a topology of LES is not supported: NPARM = 1");
+  if (p.size() > 31 && p[31] > 1)
+    return fail("a topology of PIMD is not supported: NCOPY = " +
+                llvm::Twine(p[31]));
+  if (p[12] != p[3] || p[13] != p[5] || p[14] != p[7])
+    return fail("constraints in the topology are not supported: NBONA, "
+                "NTHETA, or NPHIA differs from MBONA, MTHETA, or MPHIA");
+  for (StringRef flag :
+       {"BOND_STIFFNESS_PULL_ADJ", "BOND_EQUIL_PULL_ADJ",
+        "BOND_STIFFNESS_PRESS_ADJ", "BOND_EQUIL_PRESS_ADJ"})
+    if (has(flag))
+      return fail("augmented bonds are not supported: " + flag);
+  for (auto &[name, section] : sections)
+    if (StringRef(name).starts_with("DOUBLE_EXPONENTIAL_") ||
+        StringRef(name).starts_with("EXPVDWMODEL_"))
+      return fail("another form of the van der Waals term is not "
+                  "supported: " +
+                  name);
+
+  // A section that MDIR does not know and that holds more than zeros may
+  // change the physics.
+  static const std::set<std::string> known = {
+      "TITLE", "POINTERS", "ATOM_NAME", "CHARGE", "ATOMIC_NUMBER", "MASS",
+      "ATOM_TYPE_INDEX", "NUMBER_EXCLUDED_ATOMS", "NONBONDED_PARM_INDEX",
+      "RESIDUE_LABEL", "RESIDUE_POINTER", "BOND_FORCE_CONSTANT",
+      "BOND_EQUIL_VALUE", "ANGLE_FORCE_CONSTANT", "ANGLE_EQUIL_VALUE",
+      "DIHEDRAL_FORCE_CONSTANT", "DIHEDRAL_PERIODICITY", "DIHEDRAL_PHASE",
+      "SCEE_SCALE_FACTOR", "SCNB_SCALE_FACTOR", "SOLTY",
+      "LENNARD_JONES_ACOEF", "LENNARD_JONES_BCOEF", "BONDS_INC_HYDROGEN",
+      "BONDS_WITHOUT_HYDROGEN", "ANGLES_INC_HYDROGEN",
+      "ANGLES_WITHOUT_HYDROGEN", "DIHEDRALS_INC_HYDROGEN",
+      "DIHEDRALS_WITHOUT_HYDROGEN", "EXCLUDED_ATOMS_LIST", "HBOND_ACOEF",
+      "HBOND_BCOEF", "HBCUT", "AMBER_ATOM_TYPE",
+      "TREE_CHAIN_CLASSIFICATION", "JOIN_ARRAY", "IROTAT",
+      "SOLVENT_POINTERS", "ATOMS_PER_MOLECULE", "BOX_DIMENSIONS",
+      "RADIUS_SET", "RADII", "SCREEN", "IPOL", "RESIDUE_NUMBER",
+      "RESIDUE_CHAINID", "RESIDUE_ICODE", "ATOM_NUMBER", "ATOM_BFACTOR",
+      "ATOM_OCCUPANCY", "ATOM_ALTLOC", "CMAP_COUNT", "CMAP_RESOLUTION",
+      "CMAP_INDEX"};
+  for (auto &[name, section] : sections) {
+    if (known.count(name) || StringRef(name).starts_with("CMAP_PARAMETER_"))
+      continue;
+    for (StringRef line : section.lines) {
+      StringRef data = line.trim();
+      bool zeros = llvm::all_of(data, [](char c) {
+        return c == '0' || c == '.' || c == ' ' || c == '+' || c == '-' ||
+               c == 'E' || c == 'e';
+      });
+      if (!zeros)
+        return fail("the section " + name + " is not known to MDIR and "
+                    "holds data that may change the physics");
+    }
+  }
+  return llvm::Error::success();
+}
+
+//===----------------------------------------------------------------------===//
+// Types
+//===----------------------------------------------------------------------===//
+
+llvm::Error Reader::readTypes(Topology &topology, long count,
+                              long numPairs) {
+  if (llvm::Error error =
+          readIntegers("NONBONDED_PARM_INDEX", count * count, index))
+    return error;
+  long triangle = count * (count + 1) / 2;
+  if (llvm::Error error = readReals("LENNARD_JONES_ACOEF", triangle, tableA))
+    return error;
+  if (llvm::Error error = readReals("LENNARD_JONES_BCOEF", triangle, tableB))
+    return error;
+  std::vector<double> hbondA, hbondB;
+  if (llvm::Error error = readReals("HBOND_ACOEF", numPairs, hbondA, false))
+    return error;
+  if (llvm::Error error = readReals("HBOND_BCOEF", numPairs, hbondB, false))
+    return error;
+
+  std::vector<bool> used(count, false);
+  for (unsigned type : topology.types)
+    used[type] = true;
+
+  topology.sigma.assign(count * count, 0.0);
+  topology.epsilon.assign(count * count, 0.0);
+  for (long a = 0; a != count; ++a)
+    for (long b = 0; b != count; ++b) {
+      long entry = index[a * count + b];
+      long high = std::max(a, b) + 1, low = std::min(a, b) + 1;
+      long canonical = high * (high - 1) / 2 + low;
+      if (entry < 0) {
+        // A 10-12 pair. With zero coefficients it is a placeholder, as
+        // that of TIP3P, and the pair has no Lennard-Jones.
+        long slot = -entry - 1;
+        if (slot >= static_cast<long>(hbondA.size()))
+          return fail("NONBONDED_PARM_INDEX points beyond HBOND_ACOEF");
+        if ((hbondA[slot] != 0.0 || hbondB[slot] != 0.0) && used[a] &&
+            used[b])
+          return fail("10-12 terms are not supported: HBOND_ACOEF or "
+                      "HBOND_BCOEF of the types " +
+                      topology.typeNames[a] + " and " +
+                      topology.typeNames[b] + " is not 0");
+        continue;
+      }
+      // sander takes the 1-4 pairs from the triangle directly; the two
+      // agree only for the canonical index.
+      if (entry != canonical)
+        return fail("NONBONDED_PARM_INDEX is not in the canonical order at "
+                    "the types " +
+                    llvm::Twine(a + 1) + " and " + llvm::Twine(b + 1) +
+                    ", so that the nonbonded pairs and the 1-4 pairs of "
+                    "Amber would take different parameters");
+      double A = tableA[entry - 1], B = tableB[entry - 1];
+      if (A == 0.0 && B == 0.0)
+        continue;
+      if (A <= 0.0 || B <= 0.0)
+        return fail("the Lennard-Jones coefficients of the types " +
+                    llvm::Twine(a + 1) + " and " + llvm::Twine(b + 1) +
+                    " are not a Lennard-Jones pair: A = " + show(A) +
+                    ", B = " + show(B));
+      // A = 4 ε σ¹², B = 4 ε σ⁶.
+      topology.sigma[a * count + b] =
+          std::pow(A / B, 1.0 / 6.0) * nmPerAngstrom;
+      topology.epsilon[a * count + b] = B * B / (4.0 * A) * kjPerKcal;
+    }
+  return llvm::Error::success();
+}
+
+//===----------------------------------------------------------------------===//
+// Terms
+//===----------------------------------------------------------------------===//
+
+llvm::Error Reader::readTerms(Topology &topology,
+                              const std::vector<long> &p) {
+  long natom = p[0];
+  auto atom = [&](long coordinate, unsigned &value) -> llvm::Error {
+    coordinate = std::labs(coordinate);
+    if (coordinate % 3 != 0 || coordinate / 3 >= natom)
+      return fail("an atom index " + llvm::Twine(coordinate) +
+                  " of a bonded term is out of range");
+    value = coordinate / 3;
+    return llvm::Error::success();
+  };
+
+  // Bonds: k (r − r0)² in the file.
+  std::vector<double> bondK, bondR;
+  if (llvm::Error error = readReals("BOND_FORCE_CONSTANT", p[15], bondK))
+    return error;
+  if (llvm::Error error = readReals("BOND_EQUIL_VALUE", p[15], bondR))
+    return error;
+  for (auto [flag, count, hydrogen] :
+       {std::tuple<StringRef, long, bool>{"BONDS_INC_HYDROGEN", p[2], true},
+        {"BONDS_WITHOUT_HYDROGEN", p[3], false}}) {
+    std::vector<long> list;
+    if (llvm::Error error = readIntegers(flag, 3 * count, list))
+      return error;
+    for (long n = 0; n != count; ++n) {
+      Topology::Bond bond;
+      if (llvm::Error error = atom(list[3 * n], bond.i))
+        return error;
+      if (llvm::Error error = atom(list[3 * n + 1], bond.j))
+        return error;
+      long type = list[3 * n + 2];
+      if (type < 1 || type > p[15])
+        return fail("a bond type of " + flag + " is out of range");
+      bond.k = 2.0 * bondK[type - 1] * kjPerKcal /
+               (nmPerAngstrom * nmPerAngstrom);
+      bond.r0 = bondR[type - 1] * nmPerAngstrom;
+      bond.hydrogen = hydrogen;
+      topology.bonds.push_back(bond);
+    }
+  }
+
+  // Angles: k (θ − θ0)², with θ0 in radians.
+  std::vector<double> angleK, angleT;
+  if (llvm::Error error = readReals("ANGLE_FORCE_CONSTANT", p[16], angleK))
+    return error;
+  if (llvm::Error error = readReals("ANGLE_EQUIL_VALUE", p[16], angleT))
+    return error;
+  for (auto [flag, count] :
+       {std::pair<StringRef, long>{"ANGLES_INC_HYDROGEN", p[4]},
+        {"ANGLES_WITHOUT_HYDROGEN", p[5]}}) {
+    std::vector<long> list;
+    if (llvm::Error error = readIntegers(flag, 4 * count, list))
+      return error;
+    for (long n = 0; n != count; ++n) {
+      Topology::Angle angle;
+      if (llvm::Error error = atom(list[4 * n], angle.i))
+        return error;
+      if (llvm::Error error = atom(list[4 * n + 1], angle.j))
+        return error;
+      if (llvm::Error error = atom(list[4 * n + 2], angle.k))
+        return error;
+      long type = list[4 * n + 3];
+      if (type < 1 || type > p[16])
+        return fail("an angle type of " + flag + " is out of range");
+      angle.force = 2.0 * angleK[type - 1] * kjPerKcal;
+      angle.theta0 = angleT[type - 1];
+      topology.angles.push_back(angle);
+    }
+  }
+
+  // Dihedrals: k (1 + cos(n φ − φ0)); a negative third index leaves the
+  // 1-4 pair out, a negative fourth marks an improper. A negative
+  // periodicity of a type means that the dihedral has the term of the next
+  // type as well, which may continue the same way: topologies in the format
+  // before Amber 7 give a dihedral of several terms so, with one entry.
+  std::vector<double> dihedralK, dihedralN, dihedralPhase, scee, scnb;
+  long numTypes = p[17];
+  if (llvm::Error error =
+          readReals("DIHEDRAL_FORCE_CONSTANT", numTypes, dihedralK))
+    return error;
+  if (llvm::Error error =
+          readReals("DIHEDRAL_PERIODICITY", numTypes, dihedralN))
+    return error;
+  if (llvm::Error error = readReals("DIHEDRAL_PHASE", numTypes, dihedralPhase))
+    return error;
+  if (llvm::Error error =
+          readReals("SCEE_SCALE_FACTOR", numTypes, scee, false))
+    return error;
+  if (llvm::Error error =
+          readReals("SCNB_SCALE_FACTOR", numTypes, scnb, false))
+    return error;
+  if (scee.empty())
+    scee.assign(numTypes, 1.2);
+  if (scnb.empty())
+    scnb.assign(numTypes, 2.0);
+
+  long count = topology.getNumTypes();
+  std::set<std::pair<unsigned, unsigned>> pairs14;
+  for (auto [flag, number] :
+       {std::pair<StringRef, long>{"DIHEDRALS_INC_HYDROGEN", p[6]},
+        {"DIHEDRALS_WITHOUT_HYDROGEN", p[7]}}) {
+    std::vector<long> list;
+    if (llvm::Error error = readIntegers(flag, 5 * number, list))
+      return error;
+    for (long n = 0; n != number; ++n) {
+      const long *entry = &list[5 * n];
+      if (entry[2] == 0 || entry[3] == 0)
+        return fail("a dihedral of " + flag + " has atom 1 in its third or "
+                    "fourth place, where the sign of the index is lost");
+      Topology::Dihedral dihedral;
+      if (llvm::Error error = atom(entry[0], dihedral.i))
+        return error;
+      if (llvm::Error error = atom(entry[1], dihedral.j))
+        return error;
+      if (llvm::Error error = atom(entry[2], dihedral.k))
+        return error;
+      if (llvm::Error error = atom(entry[3], dihedral.l))
+        return error;
+      long type = entry[4];
+      if (type < 1 || type > numTypes)
+        return fail("a dihedral type of " + flag + " is out of range");
+      dihedral.improper = entry[3] < 0;
+      long last = type;
+      for (long term = type;; ++term) {
+        if (term > numTypes)
+          return fail("the last dihedral type has a negative periodicity, "
+                      "which continues to a type that does not exist");
+        double periodicity = std::fabs(dihedralN[term - 1]);
+        if (periodicity != std::round(periodicity))
+          return fail("a dihedral type has a periodicity that is not a "
+                      "whole number: " +
+                      show(dihedralN[term - 1]));
+        dihedral.force = dihedralK[term - 1] * kjPerKcal;
+        dihedral.n = static_cast<int>(periodicity);
+        dihedral.phase = snapPhase(dihedralPhase[term - 1]);
+        topology.dihedrals.push_back(dihedral);
+        last = term;
+        if (dihedralN[term - 1] >= 0.0)
+          break;
+      }
+
+      // The pair three bonds apart, with the factors of the last type of
+      // the entry, the first of positive periodicity; a type of periodicity
+      // 0 carries none, as in Amber.
+      if (entry[2] < 0 || entry[3] < 0 || dihedralN[last - 1] == 0.0)
+        continue;
+      double e = scee[last - 1], v = scnb[last - 1];
+      if (e == 0.0 || v == 0.0)
+        return fail("a dihedral that carries a 1-4 pair has a factor of 0 "
+                    "in SCEE_SCALE_FACTOR or SCNB_SCALE_FACTOR (type " +
+                    llvm::Twine(last) + ")");
+      unsigned i = dihedral.i, l = dihedral.l;
+      if (!pairs14.insert({std::min(i, l), std::max(i, l)}).second)
+        return fail("the 1-4 pair of atoms " + llvm::Twine(i + 1) + " and " +
+                    llvm::Twine(l + 1) + " is carried by two dihedrals");
+      // sander takes the pair from the triangle of the two types.
+      unsigned a = topology.types[i], b = topology.types[l];
+      Topology::Pair pair;
+      pair.i = i;
+      pair.j = l;
+      pair.scaleCoulomb = 1.0 / e;
+      pair.scaleLJ = 1.0 / v;
+      long high = std::max(a, b) + 1, low = std::min(a, b) + 1;
+      double A = tableA[high * (high - 1) / 2 + low - 1];
+      double B = tableB[high * (high - 1) / 2 + low - 1];
+      pair.sigma = pair.epsilon = 0.0;
+      if (A > 0.0 && B > 0.0) {
+        pair.sigma = std::pow(A / B, 1.0 / 6.0) * nmPerAngstrom;
+        pair.epsilon = B * B / (4.0 * A) * kjPerKcal;
+      }
+      (void)count;
+      topology.pairs.push_back(pair);
+    }
+  }
+
+  if (llvm::Error error = readExtraPoints(topology, p[30]))
+    return error;
+  if (llvm::Error error = readCMaps(topology))
+    return error;
+
+  // Without extra points, the exclusions are those of the file, as Amber
+  // takes them. With extra points Amber builds them again: the members of
+  // the bonds, the ends of the angles, and the ends of every dihedral, and
+  // an extra point is excluded from its owner and from what its owner is
+  // excluded from (constraints.md, Section 2).
+  if (topology.virtualSites.empty()) {
+    std::set<std::pair<unsigned, unsigned>> listed;
+    size_t next = 0;
+    for (size_t i = 0, e = numExcluded.size(); i != e; ++i) {
+      for (long n = 0; n != numExcluded[i]; ++n, ++next) {
+        if (next >= excludedList.size())
+          return fail("EXCLUDED_ATOMS_LIST is shorter than "
+                      "NUMBER_EXCLUDED_ATOMS says");
+        long j = excludedList[next];
+        if (j == 0)
+          continue;
+        if (j < 1 || j > static_cast<long>(topology.getNumParticles()) ||
+            static_cast<size_t>(j - 1) == i)
+          return fail("EXCLUDED_ATOMS_LIST names the atom " + llvm::Twine(j) +
+                      " for the atom " + llvm::Twine(i + 1));
+        unsigned a = i, b = j - 1;
+        listed.insert({std::min(a, b), std::max(a, b)});
+      }
+    }
+    topology.exclusions.assign(listed.begin(), listed.end());
+    return llvm::Error::success();
+  }
+  std::vector<std::vector<unsigned>> extras(topology.getNumParticles());
+  for (const Topology::VirtualSite &site : topology.virtualSites)
+    extras[site.i].push_back(site.site);
+  std::set<std::pair<unsigned, unsigned>> excluded;
+  auto excludeOne = [&](unsigned i, unsigned j) {
+    if (i != j)
+      excluded.insert({std::min(i, j), std::max(i, j)});
+  };
+  auto exclude = [&](unsigned i, unsigned j) {
+    excludeOne(i, j);
+    for (unsigned a : extras[i]) {
+      excludeOne(a, j);
+      for (unsigned b : extras[j])
+        excludeOne(a, b);
+    }
+    for (unsigned b : extras[j])
+      excludeOne(i, b);
+  };
+  for (const Topology::VirtualSite &site : topology.virtualSites)
+    excludeOne(site.site, site.i);
+  for (const Topology::Bond &bond : topology.bonds)
+    exclude(bond.i, bond.j);
+  for (const Topology::Angle &angle : topology.angles)
+    exclude(angle.i, angle.k);
+  for (const Topology::Dihedral &dihedral : topology.dihedrals)
+    exclude(dihedral.i, dihedral.l);
+  topology.exclusions.assign(excluded.begin(), excluded.end());
+  return checkExclusions(topology);
+}
+
+llvm::Error Reader::readCMaps(Topology &topology) {
+  if (!sections.count("CMAP_COUNT"))
+    return llvm::Error::success();
+  std::vector<long> counts, resolutions, index;
+  if (llvm::Error error = readIntegers("CMAP_COUNT", 2, counts))
+    return error;
+  long numTerms = counts[0], numMaps = counts[1];
+  if (numTerms < 0 || numMaps < 1)
+    return fail("CMAP_COUNT is out of range");
+  if (llvm::Error error =
+          readIntegers("CMAP_RESOLUTION", numMaps, resolutions))
+    return error;
+  // sander takes the slopes at the grid points right only for 24 points,
+  // a step of 15°, which every map of Amber has.
+  for (long resolution : resolutions)
+    if (resolution != 24)
+      return fail("CMAP_RESOLUTION is " + llvm::Twine(resolution) +
+                  "; only maps of 24 points, as sander reads them, are "
+                  "supported");
+  topology.cmapResolution = 24;
+  for (long map = 1; map <= numMaps; ++map) {
+    std::string flag = "CMAP_PARAMETER_" + std::string(map < 10 ? "0" : "") +
+                       std::to_string(map);
+    std::vector<double> grid;
+    if (llvm::Error error = readReals(flag, 24 * 24, grid))
+      return error;
+    for (double &value : grid)
+      value *= kjPerKcal;
+    topology.cmapGrids.push_back(std::move(grid));
+  }
+  // Five atoms, numbered from 1 (not times 3), and the map.
+  if (llvm::Error error = readIntegers("CMAP_INDEX", 6 * numTerms, index))
+    return error;
+  long natom = topology.getNumParticles();
+  for (long n = 0; n != numTerms; ++n) {
+    const long *entry = &index[6 * n];
+    for (int k = 0; k != 5; ++k)
+      if (entry[k] < 1 || entry[k] > natom)
+        return fail("an atom of CMAP_INDEX is out of range");
+    if (entry[5] < 1 || entry[5] > numMaps)
+      return fail("a map of CMAP_INDEX is out of range");
+    topology.cmaps.push_back(
+        {static_cast<unsigned>(entry[0] - 1),
+         static_cast<unsigned>(entry[1] - 1),
+         static_cast<unsigned>(entry[2] - 1),
+         static_cast<unsigned>(entry[3] - 1),
+         static_cast<unsigned>(entry[4] - 1),
+         static_cast<unsigned>(entry[5] - 1)});
+  }
+  return llvm::Error::success();
+}
+
+llvm::Error Reader::readExtraPoints(Topology &topology, long numExtra) {
+  size_t count = topology.getNumParticles();
+  std::vector<bool> extra(count, false);
+  long found = 0;
+  for (size_t i = 0; i != count; ++i)
+    if (atomTypes[i] == "EP") {
+      extra[i] = true;
+      ++found;
+    }
+  if (found != numExtra)
+    return fail("NUMEXTRA is " + llvm::Twine(numExtra) + ", but " +
+                llvm::Twine(found) + " atoms are of the type EP");
+  if (found == 0)
+    return llvm::Error::success();
+
+  // The neighbors of each atom, in the order of the bonds of the file: the
+  // heavy atoms and the extra points through the bonds without hydrogen,
+  // and the atoms through those with hydrogen. An extra point is placed
+  // by the bond to its owner, which is in the bonds without hydrogen, and
+  // at the distance of that bond.
+  std::vector<std::vector<unsigned>> heavy(count), hydrogens(count),
+      extras(count);
+  std::vector<long> owner(count, -1);
+  std::vector<double> distance(count, 0.0);
+  for (const Topology::Bond &bond : topology.bonds) {
+    for (auto [a, b] : {std::pair{bond.i, bond.j}, std::pair{bond.j, bond.i}}) {
+      if (bond.hydrogen) {
+        if (extra[a] || extra[b])
+          return fail("the extra point " +
+                      llvm::Twine((extra[a] ? a : b) + 1) +
+                      " is bonded in BONDS_INC_HYDROGEN, where sander does "
+                      "not look for the owner of an extra point");
+        hydrogens[a].push_back(b);
+        continue;
+      }
+      if (extra[b]) {
+        if (extra[a])
+          return fail("the extra points " + llvm::Twine(a + 1) + " and " +
+                      llvm::Twine(b + 1) + " are bonded to each other");
+        if (owner[b] >= 0 && owner[b] != static_cast<long>(a))
+          return fail("the extra point " + llvm::Twine(b + 1) +
+                      " is bonded to two atoms");
+        owner[b] = a;
+        distance[b] = bond.r0;
+        extras[a].push_back(b);
+      } else if (!extra[a]) {
+        heavy[a].push_back(b);
+      }
+    }
+  }
+
+  // The frame of each owner. Only the one of four-site water is supported:
+  // an owner with two hydrogens, no heavy neighbor, and one extra point,
+  // which is placed on the bisector on the side of the hydrogens.
+  for (size_t n = 0; n != count; ++n) {
+    if (!extra[n])
+      continue;
+    if (owner[n] < 0)
+      return fail("the extra point " + llvm::Twine(n + 1) +
+                  " has no bond in BONDS_WITHOUT_HYDROGEN to an owner");
+    unsigned o = owner[n];
+    if (!heavy[o].empty() || hydrogens[o].size() != 2 ||
+        extras[o].size() != 1)
+      return fail("the extra point " + llvm::Twine(n + 1) + " belongs to " +
+                  "the atom " + llvm::Twine(o + 1) + ", with " +
+                  llvm::Twine(heavy[o].size()) + " heavy neighbors, " +
+                  llvm::Twine(hydrogens[o].size()) + " hydrogens, and " +
+                  llvm::Twine(extras[o].size()) +
+                  " extra points; only the extra point of four-site water, "
+                  "as in OPC or TIP4P-Ew, is supported");
+    Topology::VirtualSite site;
+    site.kind = Topology::VirtualSite::AmberWater;
+    site.site = n;
+    site.i = o;
+    site.j = hydrogens[o][0];
+    site.k = hydrogens[o][1];
+    site.a = distance[n];
+    site.b = 0.0;
+    topology.virtualSites.push_back(site);
+  }
+
+  // sander drops every bonded term of an extra point: the bond to its owner
+  // gives no energy and no constraint.
+  auto touches = [&](std::initializer_list<unsigned> members) {
+    for (unsigned m : members)
+      if (extra[m])
+        return true;
+    return false;
+  };
+  llvm::erase_if(topology.bonds, [&](const Topology::Bond &bond) {
+    return touches({bond.i, bond.j});
+  });
+  llvm::erase_if(topology.angles, [&](const Topology::Angle &angle) {
+    return touches({angle.i, angle.j, angle.k});
+  });
+  llvm::erase_if(topology.dihedrals, [&](const Topology::Dihedral &d) {
+    return touches({d.i, d.j, d.k, d.l});
+  });
+  llvm::erase_if(topology.pairs, [&](const Topology::Pair &pair) {
+    return touches({pair.i, pair.j});
+  });
+  for (size_t n = 0; n != count; ++n)
+    if (extra[n] && topology.masses[n] != 0.0)
+      return fail("the extra point " + llvm::Twine(n + 1) + " has a mass of " +
+                  show(topology.masses[n]) + "; an extra point has none");
+  return llvm::Error::success();
+}
+
+/// The list of the file must not exclude a pair that the bonded terms do
+/// not: a periodic run of sander would drop it, so what the file means is
+/// not clear.
+llvm::Error Reader::checkExclusions(const Topology &topology) {
+  std::set<std::pair<unsigned, unsigned>> known(topology.exclusions.begin(),
+                                                topology.exclusions.end());
+  size_t next = 0;
+  for (size_t i = 0, e = numExcluded.size(); i != e; ++i) {
+    for (long n = 0; n != numExcluded[i]; ++n, ++next) {
+      if (next >= excludedList.size())
+        return fail("EXCLUDED_ATOMS_LIST is shorter than "
+                    "NUMBER_EXCLUDED_ATOMS says");
+      long j = excludedList[next];
+      if (j == 0)
+        continue;
+      unsigned a = i, b = j - 1;
+      if (!known.count({std::min(a, b), std::max(a, b)}))
+        return fail("EXCLUDED_ATOMS_LIST excludes the atoms " +
+                    llvm::Twine(i + 1) + " and " + llvm::Twine(j) +
+                    ", which no bond, angle, or dihedral joins; Amber builds "
+                    "the exclusions of a topology with extra points again "
+                    "and would not exclude them");
+    }
+  }
+  return llvm::Error::success();
+}
+
+//===----------------------------------------------------------------------===//
+// The topology
+//===----------------------------------------------------------------------===//
+
+llvm::Expected<Topology> Reader::read() {
+  auto file = llvm::MemoryBuffer::getFile(path);
+  if (!file)
+    return fail("cannot read the file: " + file.getError().message());
+  buffer = std::move(*file);
+  if (llvm::Error error = split(buffer->getBuffer()))
+    return std::move(error);
+
+  std::vector<long> p;
+  if (llvm::Error error = readIntegers("POINTERS", -1, p))
+    return std::move(error);
+  // The format before Amber 7 has no extra points, nor their count.
+  if (old)
+    p.push_back(0);
+  if (p.size() < 31)
+    return fail("POINTERS has " + llvm::Twine(p.size()) +
+                " values; at least 31 are needed");
+  if (llvm::Error error = checkSupported(p))
+    return std::move(error);
+
+  Topology topology;
+  long natom = p[0], ntypes = p[1], nres = p[11];
+  if (llvm::Error error = readStrings("ATOM_NAME", natom, topology.atomNames))
+    return std::move(error);
+  std::vector<double> charges;
+  if (llvm::Error error = readReals("CHARGE", natom, charges))
+    return std::move(error);
+  for (double charge : charges)
+    topology.charges.push_back(charge / chargeFactor);
+  if (llvm::Error error = readReals("MASS", natom, topology.masses))
+    return std::move(error);
+  // The radii and the screening of generalized Born, in Å, if the
+  // topology has them (D144).
+  if (llvm::Error error =
+          readReals("RADII", natom, topology.bornRadii, false))
+    return std::move(error);
+  for (double &radius : topology.bornRadii)
+    radius *= nmPerAngstrom;
+  if (llvm::Error error =
+          readReals("SCREEN", natom, topology.bornScreens, false))
+    return std::move(error);
+  std::vector<long> numbers;
+  if (llvm::Error error = readIntegers("ATOMIC_NUMBER", natom, numbers, false))
+    return std::move(error);
+  topology.atomicNumbers.assign(numbers.begin(), numbers.end());
+  // Older topologies have no atomic numbers; they are taken from the
+  // masses, and from the names for a hydrogen whose mass has been
+  // repartitioned.
+  if (topology.atomicNumbers.empty())
+    for (size_t i = 0; i != natom; ++i)
+      topology.atomicNumbers.push_back(
+          inferAtomicNumber(topology.masses[i], topology.atomNames[i]));
+
+  std::vector<long> types;
+  if (llvm::Error error = readIntegers("ATOM_TYPE_INDEX", natom, types))
+    return std::move(error);
+  std::vector<std::string> &typeNames = atomTypes;
+  if (llvm::Error error = readStrings("AMBER_ATOM_TYPE", natom, typeNames))
+    return std::move(error);
+  topology.typeNames.assign(ntypes, "");
+  for (long i = 0; i != natom; ++i) {
+    if (types[i] < 1 || types[i] > ntypes)
+      return fail("ATOM_TYPE_INDEX of atom " + llvm::Twine(i + 1) +
+                  " is out of range");
+    topology.types.push_back(types[i] - 1);
+    // The name of the first atom of a type names the type.
+    std::string &name = topology.typeNames[types[i] - 1];
+    if (name.empty())
+      name = typeNames[i];
+    // sander takes an atom of the type EP for an extra point, and stops
+    // at any other type whose name begins with EP, which tleap counts.
+    if (StringRef(typeNames[i]).starts_with("EP") && typeNames[i] != "EP")
+      return fail("the atom " + llvm::Twine(i + 1) + " is of the type " +
+                  typeNames[i] + ", which tleap counts as an extra point "
+                  "and sander does not; only the type EP is an extra point");
+  }
+  for (long t = 0; t != ntypes; ++t)
+    if (topology.typeNames[t].empty())
+      topology.typeNames[t] = "type" + std::to_string(t + 1);
+
+  if (llvm::Error error =
+          readStrings("RESIDUE_LABEL", nres, topology.residueNames))
+    return std::move(error);
+  std::vector<long> starts;
+  if (llvm::Error error = readIntegers("RESIDUE_POINTER", nres, starts))
+    return std::move(error);
+  for (long start : starts) {
+    if (start < 1 || start > natom)
+      return fail("RESIDUE_POINTER is out of range");
+    topology.residueStarts.push_back(start - 1);
+  }
+  topology.residueOf.assign(natom, 0);
+  for (long r = 0; r != nres; ++r) {
+    long end = r + 1 < nres ? starts[r + 1] - 1 : natom;
+    for (long i = starts[r] - 1; i < end; ++i)
+      topology.residueOf[i] = r;
+  }
+
+  if (llvm::Error error =
+          readIntegers("NUMBER_EXCLUDED_ATOMS", natom, numExcluded))
+    return std::move(error);
+  if (llvm::Error error =
+          readIntegers("EXCLUDED_ATOMS_LIST", p[10], excludedList))
+    return std::move(error);
+
+  if (llvm::Error error = readTypes(topology, ntypes, p[19]))
+    return std::move(error);
+  if (llvm::Error error = readTerms(topology, p))
+    return std::move(error);
+  return std::move(topology);
+}
+
+llvm::Expected<Topology> mdir::driver::readAmberTopology(StringRef path) {
+  return Reader(path).read();
+}
+
+//===----------------------------------------------------------------------===//
+// Coordinates
+//===----------------------------------------------------------------------===//
+
+llvm::Error mdir::driver::readAmberCoordinates(StringRef path,
+                                               Topology &topology) {
+  auto fail = [&](const llvm::Twine &message) {
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), "%s: %s",
+                                   path.str().c_str(),
+                                   message.str().c_str());
+  };
+  auto file = llvm::MemoryBuffer::getFile(path);
+  if (!file)
+    return fail("cannot read the file: " + file.getError().message());
+  StringRef text = (*file)->getBuffer();
+  if (text.starts_with("CDF"))
+    return fail("a restart in NetCDF is not supported yet; write it in "
+                "ASCII");
+
+  llvm::SmallVector<StringRef> all;
+  text.split(all, '\n');
+  std::vector<StringRef> lines;
+  for (StringRef line : all)
+    lines.push_back(line.rtrim("\r"));
+  while (!lines.empty() && lines.back().trim().empty())
+    lines.pop_back();
+  if (lines.size() < 2)
+    return fail("expected a title and the number of atoms");
+
+  // The number of atoms, then a time and one more number, each optional.
+  llvm::SmallVector<StringRef> tokens;
+  lines[1].split(tokens, ' ', -1, /*KeepEmpty=*/false);
+  long natom = 0;
+  if (tokens.empty() || tokens.size() > 3 ||
+      tokens.front().getAsInteger(10, natom))
+    return fail("cannot read the number of atoms in '" + lines[1] + "'");
+  size_t count = topology.getNumParticles();
+  if (natom != static_cast<long>(count))
+    return fail("the file has " + llvm::Twine(natom) +
+                " atoms, and the topology " + llvm::Twine(count));
+
+  // Fields of 12 columns, six on a line.
+  auto readLine = [&](StringRef line, std::vector<double> &values) {
+    for (size_t start = 0; start < line.size(); start += 12) {
+      StringRef field = line.substr(start, 12).trim();
+      if (field.empty())
+        continue;
+      double value;
+      if (field.contains('*') || field.getAsDouble(value))
+        return false;
+      values.push_back(value);
+    }
+    return true;
+  };
+  size_t block = (count + 1) / 2;
+  size_t data = lines.size() - 2;
+  bool hasVelocities, hasBox;
+  if (count <= 2)
+    return fail("a system of 2 atoms or fewer is not supported: its box "
+                "and its velocities cannot be told apart");
+  if (data == block + 1) {
+    hasVelocities = false;
+    hasBox = true;
+  } else if (data == 2 * block + 1) {
+    hasVelocities = hasBox = true;
+  } else if (data == block || data == 2 * block) {
+    // No box: a run without a periodic cell (D142).
+    hasVelocities = data == 2 * block;
+    hasBox = false;
+  } else {
+    return fail("the file has " + llvm::Twine(data) + " lines of numbers, "
+                "which is not a layout of a file of coordinates");
+  }
+
+  auto readBlock = [&](size_t first, std::vector<double> &values,
+                       double scale) -> llvm::Error {
+    values.clear();
+    for (size_t k = 0; k != block; ++k)
+      if (!readLine(lines[first + k], values))
+        return fail("cannot read the line " + llvm::Twine(first + k + 1) +
+                    ": '" + lines[first + k] + "'");
+    if (values.size() != 3 * count)
+      return fail("expected " + llvm::Twine(3 * count) + " numbers, got " +
+                  llvm::Twine(values.size()));
+    for (double &value : values)
+      value *= scale;
+    return llvm::Error::success();
+  };
+  if (llvm::Error error =
+          readBlock(2, topology.positions, nmPerAngstrom))
+    return error;
+  topology.velocities.clear();
+  if (hasVelocities)
+    if (llvm::Error error = readBlock(2 + block, topology.velocities,
+                                      nmPerAngstrom * velocityFactor))
+      return error;
+
+  if (!hasBox)
+    return llvm::Error::success();
+  std::vector<double> box;
+  if (!readLine(lines.back(), box))
+    return fail("cannot read the box '" + lines.back() + "'");
+  if (box.size() != 6 && box.size() != 3)
+    return fail("expected the lengths and the angles of the box in '" +
+                lines.back() + "'");
+  // The angles: 90 for a right angle, as some files write it, or 0.
+  double angles[3] = {90.0, 90.0, 90.0};
+  if (box.size() == 6)
+    for (int k = 0; k != 3; ++k)
+      if (box[3 + k] != 0.0 && std::fabs(box[3 + k] - 90.0) > 1.0e-5)
+        angles[k] = box[3 + k];
+  llvm::Expected<Cell> cell =
+      makeCell(box[0] * nmPerAngstrom, box[1] * nmPerAngstrom,
+               box[2] * nmPerAngstrom, angles[0], angles[1], angles[2]);
+  if (!cell)
+    return fail("the box '" + lines.back() + "': " +
+                llvm::toString(cell.takeError()));
+  for (int k = 0; k != 3; ++k) {
+    topology.box[k] = cell->diagonal[k];
+    topology.tilt[k] = cell->tilt[k];
+  }
+  return llvm::Error::success();
+}

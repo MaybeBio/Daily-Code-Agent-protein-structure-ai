@@ -1,0 +1,244 @@
+"""Sequence dataloader builders.
+
+``build_train_dataloader`` and ``build_sequence_eval_dataloader`` assemble the
+datasets, MLM collator, and :class:`torch.utils.data.DataLoader` from an
+:class:`oplm.config.OplmConfig`, applying train vs. eval shuffling/determinism
+policy.
+
+The two builders share the same machinery — :class:`ShardedProteinDataset`
+(optionally wrapped in :class:`InterleavedDataset`), an :class:`MLMCollator`, and
+a :class:`~torch.utils.data.DataLoader`. They differ only in *policy*
+parameters: training shuffles and draws fresh masks each epoch, while sequence
+evaluation freezes shuffling and masking for reproducibility (docs/data.md,
+Deterministic eval masking). There is deliberately no separate "eval dataset"/"eval collator"
+class.
+
+:class:`DeviceDataLoader` wraps the training dataloader in place of
+``accelerator.prepare`` (see its docstring): the dataset self-shards over
+``(rank, worker)``, so it must never pass through accelerate's own
+``IterableDatasetShard``-adding ``prepare`` call.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, cast
+
+import torch
+from torch.utils.data import DataLoader
+
+from oplm.data.config import parse_train_configs
+from oplm.data.sequence.batching import TokenBatcher
+from oplm.data.sequence.collate import MLMCollator
+from oplm.data.sequence.dataset import InterleavedDataset, ShardedProteinDataset
+from oplm.data.tokenizer import get_tokenizer
+
+if TYPE_CHECKING:
+    from torch import Tensor
+    from torch.utils.data import IterableDataset
+
+    from oplm.config import OplmConfig
+
+__all__ = ["DeviceDataLoader", "build_sequence_eval_dataloader", "build_train_dataloader"]
+
+# Fixed seed for sequence evaluation. Shuffling is off and masks are frozen, so
+# the seed only needs to be stable run-to-run; decoupling it from
+# ``train.seed`` keeps eval batches identical even when the training seed
+# changes (docs/data.md, Deterministic eval masking).
+_EVAL_SEED = 42
+
+
+class DeviceDataLoader:
+    """Device-placement wrapper for a self-sharding dataloader.
+
+    ``ShardedProteinDataset`` stripes rows over the joint (rank, worker) index itself, so the
+    training dataloader must NOT pass through ``accelerator.prepare`` — accelerate would wrap the
+    IterableDataset in ``IterableDatasetShard`` and stripe a second time (each rank would then see
+    1/N of its already-1/N stripe). This wrapper supplies the only two things ``prepare`` was
+    providing: device placement and ``set_epoch`` forwarding.
+
+    Dict batches move tensor values; any other batch must implement `.to(device, non_blocking=...)`
+    and is moved as a whole.
+    """
+
+    def __init__(self, dataloader: DataLoader, device: torch.device) -> None:
+        self._dataloader = dataloader
+        self._device = device
+
+    @property
+    def dataset(self):  # noqa: ANN201 — mirrors DataLoader.dataset
+        return self._dataloader.dataset
+
+    def __len__(self) -> int:
+        return len(self._dataloader)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Forward epoch to the underlying dataset for deterministic shuffling."""
+        set_epoch = getattr(self._dataloader.dataset, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
+
+    def __iter__(self):
+        for batch in self._dataloader:
+            if isinstance(batch, Mapping):
+                yield {
+                    k: v.to(self._device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                    for k, v in batch.items()
+                }
+            else:  # a batch object that owns its placement (oplm.fold.data.collate.FoldBatch)
+                yield batch.to(self._device, non_blocking=True)
+
+
+def build_train_dataloader(cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
+    """Build the training dataloader from an :class:`~oplm.config.OplmConfig`.
+
+    Applies the **training policy**: shard/row shuffling per ``cfg.data`` and
+    dynamic (RoBERTa-style) masking that is re-drawn each epoch. With more than
+    one training dataset the sources are mixed by their parsed fractions via
+    :class:`InterleavedDataset`.
+
+    Args:
+        cfg: Fully resolved configuration. Reads ``cfg.data.train`` (the dataset
+            spec), the masking knobs, the shard-iteration flags, the DataLoader
+            settings, and ``cfg.model.max_position_embeddings`` / ``cfg.train``
+            (seed, batch size).
+
+    Returns:
+        A :class:`~torch.utils.data.DataLoader` yielding the batch contract
+        (docs/data.md, Collation) (``input_ids`` / ``attention_mask`` / ``labels``). In token mode
+        (``train.batch_tokens`` set) it yields :class:`TokenBatcher`'s fixed
+        ``(rows, max_position_embeddings)`` batches instead, with no DataLoader batching.
+
+    Raises:
+        ValueError: If ``cfg.data.train`` resolves to no datasets.
+    """
+    entries = parse_train_configs(cfg.data.train)
+    if not entries:
+        raise ValueError("cfg.data.train resolved to no datasets; nothing to train on")
+
+    sources = [
+        ShardedProteinDataset(
+            entry.path,
+            shuffle_shards=cfg.data.shuffle_shards,
+            shuffle_rows=cfg.data.shuffle_rows,
+            seed=cfg.train.seed,
+            load_masking_weights=cfg.data.weighted_masking,
+            drop_remainder=cfg.data.drop_last,
+            sample_members=entry.sample_members,
+        )
+        for entry in entries
+    ]
+
+    dataset: IterableDataset[dict[str, object]]
+    if len(sources) > 1:
+        dataset = InterleavedDataset(
+            sources,
+            [entry.fraction for entry in entries],
+            seed=cfg.train.seed,
+            reshuffle_on_refill=cfg.data.reshuffle_on_refill,
+            drop_remainder=cfg.data.drop_last,
+        )
+    else:
+        dataset = sources[0]
+
+    if cfg.data.pack_sequences and getattr(cfg.model, "mask_dropout", False):
+        # Mask dropout rescales by each row's masked fraction, which packing would pool
+        # across the sequences sharing a row.
+        raise ValueError("data.pack_sequences is incompatible with model.mask_dropout.")
+    width = cfg.model.max_position_embeddings
+    rows = cfg.train.batch_tokens // width if cfg.train.batch_tokens is not None else None
+    collator = MLMCollator(
+        get_tokenizer(),
+        max_length=width,
+        mask_prob=cfg.data.mask_prob,
+        mask_token_prob=cfg.data.mask_token_prob,
+        random_token_prob=cfg.data.random_token_prob,
+        weighted_masking=cfg.data.weighted_masking,
+        deterministic=False,
+        seed=cfg.train.seed,
+        pad_to_multiple_of=cfg.data.pad_to_multiple_of,
+        pack_sequences=cfg.data.pack_sequences,
+        pack_rows=rows,
+    )
+    if rows is not None:
+        # Token mode: each worker builds whole (rows, width) batches; no DataLoader batching.
+        batcher = TokenBatcher(
+            dataset, collator, rows=rows, width=width, drop_last=cfg.data.drop_last
+        )
+        return _build_dataloader(batcher, None, cfg, batch_size=None)
+    return _build_dataloader(
+        dataset, collator, cfg, batch_size=cfg.train.batch_size, drop_last=cfg.data.drop_last
+    )
+
+
+def build_sequence_eval_dataloader(path: str, cfg: OplmConfig) -> DataLoader[dict[str, Tensor]]:
+    """Build a deterministic sequence-evaluation dataloader for one parquet path.
+
+    Applies the **evaluation policy**: shard/row shuffling disabled and masking
+    frozen via ``deterministic=True`` so each sequence gets the same mask on every
+    pass, at any GPU count, worker count or batch size. Masking probabilities and
+    DataLoader settings are otherwise shared with training (docs/data.md, Deterministic
+    eval masking).
+
+    Args:
+        path: A single ``.parquet`` file or directory of shards to evaluate on.
+        cfg: Fully resolved configuration; shares masking knobs, DataLoader
+            settings, and ``cfg.model.max_position_embeddings`` with the
+            training builder.
+
+    Returns:
+        A :class:`~torch.utils.data.DataLoader` yielding the batch contract
+        (docs/data.md, Collation).
+    """
+    dataset = ShardedProteinDataset(
+        path,
+        shuffle_shards=False,
+        shuffle_rows=False,
+        seed=_EVAL_SEED,
+        load_masking_weights=cfg.data.weighted_masking,
+    )
+    collator = MLMCollator(
+        get_tokenizer(),
+        max_length=cfg.model.max_position_embeddings,
+        mask_prob=cfg.data.mask_prob,
+        mask_token_prob=cfg.data.mask_token_prob,
+        random_token_prob=cfg.data.random_token_prob,
+        weighted_masking=cfg.data.weighted_masking,
+        deterministic=True,
+        seed=_EVAL_SEED,
+        pad_to_multiple_of=cfg.data.pad_to_multiple_of,
+    )
+    return _build_dataloader(dataset, collator, cfg, batch_size=cfg.train.batch_size)
+
+
+def _build_dataloader(
+    dataset: IterableDataset[dict[str, object]],
+    collator: MLMCollator | None,
+    cfg: OplmConfig,
+    *,
+    batch_size: int | None,
+    drop_last: bool = False,
+) -> DataLoader[dict[str, Tensor]]:
+    """Wrap a dataset + collator in a DataLoader using ``cfg``'s worker settings.
+
+    ``prefetch_factor`` must be ``None`` when ``num_workers == 0`` (PyTorch rejects
+    a positive value with no worker processes), so it is gated accordingly.
+    ``drop_last`` drops each worker's partial final batch (training only; evaluation
+    must score every row). ``batch_size=None`` disables DataLoader batching for a dataset
+    that yields whole batches (:class:`TokenBatcher`, with ``collator=None``); ``drop_last``
+    must then stay False.
+    """
+    num_workers = cfg.data.num_workers
+    # The collator turns row dicts into tensor batches, which the dataset's type can't express.
+    return cast(
+        "DataLoader[dict[str, Tensor]]",
+        DataLoader(
+            dataset,
+            batch_size=batch_size,
+            collate_fn=collator,
+            num_workers=num_workers,
+            pin_memory=cfg.data.pin_memory,
+            prefetch_factor=cfg.data.prefetch_factor if num_workers > 0 else None,
+            drop_last=drop_last,
+        ),
+    )

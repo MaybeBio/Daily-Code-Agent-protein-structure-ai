@@ -1,0 +1,79 @@
+import { useRef } from "react";
+import { api } from "../api";
+import type { ObjectKind, ScientificObject } from "./types";
+
+// Match VersionInput.str_strip_whitespace (Unicode White_Space), not JS trim:
+// the server strips U+0085 but preserves U+FEFF. Keep internal text unchanged.
+function versionText(value: string) {
+  return value.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
+}
+
+export function useResearchRegistration({
+  notes,
+  rating,
+  selectionIntent,
+  load,
+  selectSaved,
+  retainSaved,
+}: {
+  notes: string;
+  rating: number;
+  selectionIntent(): number;
+  load(): Promise<void>;
+  selectSaved(id: string, intent: number): void;
+  retainSaved(value: ScientificObject): void;
+}) {
+  const pending = useRef<{ fingerprint: string; key: string } | null>(null);
+  return async function register(
+    assetId: string,
+    kind: ObjectKind,
+    name: string,
+    parent?: ScientificObject,
+    selection?: { intent: number; reveal(): void },
+  ) {
+    const intent = selection?.intent ?? selectionIntent();
+    const body = {
+      asset_id: assetId,
+      kind,
+      label: versionText(name),
+      record: parent?.reference.record ?? 0,
+      conformer: parent?.reference.conformer ?? 0,
+      parent_id: parent?.id ?? null,
+      relation: parent ? "edited_from" : "derived_from",
+      notes: parent ? versionText(notes) : "",
+      rating: parent ? rating : 0,
+    };
+    const fingerprint = JSON.stringify(body);
+    if (pending.current?.fingerprint !== fingerprint)
+      pending.current = { fingerprint, key: crypto.randomUUID() };
+    const value = await api.post<ScientificObject>(
+      "/research/objects",
+      body,
+      pending.current.key,
+    );
+    if (
+      !value ||
+      !value.id ||
+      value.reference?.version_id !== value.id ||
+      value.reference.asset_id !== assetId ||
+      value.kind !== kind ||
+      value.label !== body.label ||
+      value.parent_id !== body.parent_id ||
+      value.reference.record !== body.record ||
+      value.reference.conformer !== body.conformer ||
+      value.notes !== body.notes ||
+      value.rating !== body.rating ||
+      value.relation !== body.relation ||
+      (parent && value.family_id !== parent.family_id) ||
+      (parent && value.reference.sha256 !== parent.reference.sha256)
+    )
+      throw new Error(
+        "The saved version does not match the confirmed material. Choose the original material again.",
+      );
+    retainSaved(value);
+    if (selection && selectionIntent() === intent) selection.reveal();
+    selectSaved("object:" + value.id, intent);
+    await load();
+    return value;
+  };
+}

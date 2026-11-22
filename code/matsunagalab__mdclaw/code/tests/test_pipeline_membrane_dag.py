@@ -1,0 +1,121 @@
+"""Level 3: membrane-protein node-DAG integration test using PDB 2LOP."""
+from __future__ import annotations
+
+import pytest
+
+from tests.pipeline_helpers import (
+    fetch_pdb_node,
+    node_artifact,
+    require_packmol_memgen,
+    require_topology_builder_stack,
+)
+
+pytestmark = [pytest.mark.integration, pytest.mark.slow]
+
+
+class TestPipelineMembraneDag:
+    """Embed a real small membrane protein and build a membrane topology."""
+
+    @pytest.fixture(scope="class")
+    def job_dir(self, tmp_path_factory):
+        from mdclaw.study.workflow import bootstrap_md_workflow
+        boot = bootstrap_md_workflow(str(tmp_path_factory.mktemp("study_2lop_membrane_dag")),
+                                     "Non-SMO membrane chemistry regression", solvent_regime="membrane")
+        assert boot["success"], boot
+        from pathlib import Path
+        return Path(boot["job_dir"])
+
+    def test_step1_fetch_and_inspect_membrane_protein(self, job_dir):
+        from mdclaw.research.inspection import inspect_molecules
+
+        self.__class__.fetch_id = fetch_pdb_node(job_dir, "2LOP")
+        inspected = inspect_molecules(str(node_artifact(job_dir, self.fetch_id, "structure_file")))
+        assert inspected["success"], inspected.get("errors")
+        assert inspected["summary"]["protein_chain_ids"] == ["A"]
+        assert inspected["summary"]["num_ligand_chains"] == 0
+
+    def test_step2_prepare_protein(self, job_dir):
+        from mdclaw._node import create_node, read_node
+        from mdclaw.structure.prepare_complex import prepare_complex
+
+        node = create_node(str(job_dir), "prep", parent_node_ids=[self.fetch_id])
+        assert node["success"], node
+        self.__class__.prep_id = node["node_id"]
+
+        result = prepare_complex(
+            job_dir=str(job_dir),
+            node_id=self.prep_id,
+            # Multi-candidate source bundles (NMR models / assemblies) require
+            # an explicit selection at prep time.
+            source_structure_id="candidate_001",
+            select_chains=["A"],
+            include_types=["protein"],
+            process_ligands=False,
+            ph=7.4,
+            cap_termini=False,
+        )
+        assert result["success"], result.get("errors")
+        assert read_node(str(job_dir), self.prep_id)["artifacts"]["merged_pdb"]
+
+    def test_step3_embed_in_membrane(self, job_dir):
+        from mdclaw._node import create_node, read_node
+        from mdclaw.solvation import embed_in_membrane
+
+        require_packmol_memgen()
+        node = create_node(str(job_dir), "solv", parent_node_ids=[self.prep_id])
+        assert node["success"], node
+        self.__class__.solv_id = node["node_id"]
+
+        result = embed_in_membrane(
+            job_dir=str(job_dir),
+            node_id=self.solv_id,
+            lipids="POPC",
+            ratio="1",
+            preoriented=True,
+            salt=True,
+            saltcon=0,
+            water_model="opc",
+            nloop=20,
+            nloop_all=20,
+        )
+        assert result["success"], result.get("errors")
+        solv_node = read_node(str(job_dir), self.solv_id)
+        assert solv_node["artifacts"]["solvated_pdb"] == "artifacts/membrane.pdb"
+        assert solv_node["artifacts"]["box_dimensions"] == "artifacts/box_dimensions.json"
+        assert solv_node["metadata"]["is_membrane"] is True
+        assert solv_node["metadata"]["lipid_type"] == "POPC"
+        # Default membrane backend is patch-tile (build once, cache, tile).
+        assert solv_node["metadata"]["membrane_backend"] == "patch-tile"
+
+    def test_step4_membrane_topology(self, job_dir):
+        from mdclaw._node import create_node, read_node
+        from mdclaw.amber.build_system import build_amber_system
+
+        require_topology_builder_stack()
+        node = create_node(str(job_dir), "topo", parent_node_ids=[self.solv_id])
+        assert node["success"], node
+        self.__class__.topo_id = node["node_id"]
+
+        result = build_amber_system(
+            job_dir=str(job_dir),
+            node_id=self.topo_id,
+            forcefield="ff19SB",
+            water_model="opc",
+        )
+        assert result["success"], result.get("errors")
+        topo_node = read_node(str(job_dir), self.topo_id)
+        assert topo_node["artifacts"]["system_xml"]
+        assert topo_node["metadata"]["is_membrane"] is True
+
+    def test_step5_minimize_and_short_equilibrate(self, job_dir):
+        from mdclaw._node import create_node, read_node
+        from mdclaw.simulation.minimize import run_minimization
+        from mdclaw.simulation.equilibrate import run_equilibration
+        node = create_node(str(job_dir), 'min', parent_node_ids=[self.topo_id])
+        result = run_minimization(job_dir=str(job_dir), node_id=node['node_id'], max_iterations=500)
+        assert result['success'], result
+        eq = create_node(str(job_dir), 'eq', parent_node_ids=[node['node_id']])
+        result = run_equilibration(job_dir=str(job_dir), node_id=eq['node_id'],
+                                   nvt_time_ns=0.01, npt_time_ns=0.02, random_seed=1234)
+        assert result['success'], result
+        assert read_node(str(job_dir), eq['node_id'])['status'] == 'completed'

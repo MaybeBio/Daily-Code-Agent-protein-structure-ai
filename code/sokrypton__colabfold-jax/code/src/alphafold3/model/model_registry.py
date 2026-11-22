@@ -1,0 +1,1470 @@
+# Copyright 2024 DeepMind Technologies Limited
+#
+# AlphaFold 3 source code is licensed under CC BY-NC-SA 4.0. To view a copy of
+# this license, visit https://creativecommons.org/licenses/by-nc-sa/4.0/
+#
+# To request access to the AlphaFold 3 model parameters, follow the process set
+# out at https://github.com/google-deepmind/alphafold3. You may only use these
+# if received directly from Google. Use is subject to terms of use available at
+# https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
+
+"""Per-model settings: what each AF3-family model needs beyond the graph itself.
+
+`global_config.model` names which family's forward branches run; this module
+carries everything else that name implies -- the config-shape divergences (each
+family widened its own channels, head counts and bin counts), the trained
+Fourier noise embedding, the EDM sampler constants, and where the converted
+weights live.
+
+Runtime only. Conversion is offline tooling in `converters/` at the repo root;
+nothing here imports torch or knows what a checkpoint looks like.
+"""
+
+from __future__ import annotations
+
+import os
+
+from alphafold3.model import model_config
+
+# IntelliFold-v2's "full_fat" preset: the four channels it widens over stock AF3.
+# (scope, attribute) pairs resolved against model.Model.Config(); everything not
+# listed is byte-identical to public AF3. Values from IntelliFold's own
+# widen_config_full_fat (patches.py) / convert.py V2_HEADS (c_z=512, c_m=256,
+# c_t=256, diffusion-conditioning pair=512).
+FULL_FAT_CHANNELS = (
+    ('evoformer.pair_channel', 512),
+    ('evoformer.msa_channel', 256),
+    ('evoformer.template.num_channels', 256),
+    ('heads.diffusion.conditioning.pair_channel', 512),
+)
+
+
+# IntelliFold-v2 also raises the pair/template/msa attention head counts to 8
+# (its converter's V2_HEADS: pair=8, template=8, msa=8; stock AF3 GridSelfAttention
+# defaults to 4). Every GridSelfAttention in the fork is a pair- or template-axis
+# attention, and MSAAttention is the msa one -- so widening num_head on those two
+# config types everywhere (trunk pairformer, template embedder, evoformer msa
+# stack, AND the confidence head's pairformer) is exactly V2_HEADS, no path list
+# to drift. single (16) / token (16) / atom (4) attentions use other config types
+# and are unchanged. All four full_fat channels stay divisible by 8.
+# IntelliFold-v2 also raises the pair/template/msa attention head counts to 8
+# (its converter's V2_HEADS: pair=8, template=8, msa=8; stock AF3
+# GridSelfAttention defaults to 4). Every GridSelfAttention in this graph is a
+# pair- or template-axis attention and MSAAttention is the msa one, so widening
+# num_head on those two config types everywhere -- trunk pairformer, template
+# embedder, evoformer msa stack, AND the confidence head's pairformer -- is
+# exactly V2_HEADS, with no path list to drift. single (16) / token (16) / atom
+# (4) attentions use other config types and are unchanged. All four full_fat
+# channels stay divisible by 8.
+FULL_FAT_NUM_HEAD = 8
+
+
+def _widen_full_fat(cfg):
+  '''widen cfg in place to IntelliFold-v2 dims; raise if a channel path is missing
+  so a config-layout drift is caught loudly rather than silently loading zeros.'''
+  for dotted, value in FULL_FAT_CHANNELS:
+    node = cfg
+    parts = dotted.split('.')
+    for p in parts[:-1]:
+      if not hasattr(node, p):
+        raise AttributeError(
+            f'full_fat: config path {dotted!r} not found (missing {p!r}); '
+            'AF3 config layout drift -- re-check FULL_FAT_CHANNELS')
+      node = getattr(node, p)
+    setattr(node, parts[-1], value)
+
+  # raise every pair/template/msa attention to 8 heads by walking the config tree
+  from alphafold3.model.network import modules as _modules
+  head_types = (_modules.GridSelfAttention.Config, _modules.MSAAttention.Config)
+  seen = set()
+  def _walk(node):
+    if id(node) in seen:
+      return
+    seen.add(id(node))
+    if isinstance(node, head_types):
+      node.num_head = FULL_FAT_NUM_HEAD
+      return
+    for v in list(getattr(node, '__dict__', {}).values()):
+      if isinstance(v, (list, tuple)):
+        for x in v:
+          _walk(x)
+      else:
+        _walk(v)
+  _walk(cfg)
+
+
+# OpenDDE's width/head/bin profile (its production config, model_base.py). Unlike
+# full_fat's uniform widening, OpenDDE's heads are NON-uniform (trunk triangle
+# attention 12, template 2), so these are set by explicit config path. Each entry
+# (dotted-path, value); attention head dims stay 32 (c / num_head).
+OPENDDE_SETTINGS = (
+    ('evoformer.pair_channel', 384),                              # c_z
+    ('evoformer.msa_channel', 128),                               # c_m
+    ('evoformer.pairformer.pair_attention.num_head', 12),         # trunk tri-att, 384/32
+    ('evoformer.msa_stack.pair_attention.num_head', 12),          # MSA-module pair stack tri-att
+    ('evoformer.msa_stack.msa_attention.num_head', 8),            # MSA pair-weighted-averaging
+    ('evoformer.msa_stack.msa_attention.value_dim', 8),           # decoupled per-head width (blocker)
+    ('evoformer.template.template_stack.pair_attention.num_head', 2),  # template tri-att, 64/32
+    ('heads.confidence.pairformer.pair_attention.num_head', 12),  # confidence pairformer (c_z=384)
+    ('heads.distogram.num_bins', 96),                             # OpenDDE no_bins=96 (vs AF3 64)
+    # OpenDDE's MSA module subsamples to `msa_depth` (config/data.py: 1280),
+    # not AF3's num_msa=1024 -- `MSAModule.forward` passes num_msa=self.msa_depth
+    # to subsample_msa_feature_dict_valid_first (model/modules/pairformer.py).
+    # Only bites on an MSA deeper than 1024, which every gate here so far has
+    # been (self-MSAs of depth 1-2), so nothing could see it.
+    ('evoformer.num_msa', int(__import__('os').environ.get('AF3_DDE_NUM_MSA', 1280))),
+)
+
+
+def _widen_opendde(cfg):
+  '''set cfg in place to OpenDDE's production dims/heads/bins; raise on a missing
+  path so a config-layout drift is caught loudly rather than silently mis-shaping.'''
+  for dotted, value in OPENDDE_SETTINGS:
+    node = cfg
+    parts = dotted.split('.')
+    for p in parts[:-1]:
+      if not hasattr(node, p):
+        raise AttributeError(
+            f'opendde: config path {dotted!r} not found (missing {p!r}); '
+            'AF3 config layout drift -- re-check OPENDDE_SETTINGS')
+      node = getattr(node, p)
+    setattr(node, parts[-1], value)
+
+
+# Boltz-2's config divergence from stock AF3 is tiny: same channels (c_z=128, c_s=384),
+# same diffusion nesting (24 blocks / super_block_size 4 = 6 super) and atom/template/msa
+# counts -- only the pairformer (64 vs 48) and confidence pairformer (8 vs 4) are deeper.
+# The rest of Boltz's differences are FORWARD branches (a_to_b conditioned transition, the
+# summed input embedder, the concat single_conditioner, MSA update-then-OPM order) gated
+# on instance flags, not config shape. (WIP: only boltz2_cond_transition is wired so far.)
+BOLTZ2_SETTINGS = (
+    ('evoformer.pairformer.num_layer', 64),
+    ('heads.confidence.pairformer.num_layer', 8),
+    # Boltz's diffusion single conditioning s = 2*token_s = 768 (AF3's is seq_channel=384).
+    # The token transformer adaln takes this full 768-d s, so widen the diffusion single
+    # conditioning channel. per_token_channels (the token act) is already 768.
+    ('heads.diffusion.conditioning.seq_channel', 768),
+    # Boltz's MSA pair-weighted-averaging hidden = 8 heads x 32 = 256 (proj_m/proj_g are
+    # (256,64), proj_o (64,256)). msa_attention.value_dim is PER-HEAD here (default None ->
+    # 8), so 32 gives 8x32 = 256 total, not 256.
+    ('evoformer.msa_stack.msa_attention.value_dim', 32),
+    # Boltz template pairformer: pairwise_head_width=32 (AF3 would derive 64//4=16) and a
+    # 4x transition (template_stack defaults to 2x). Only used on the boltz2 template path.
+    ('evoformer.template.template_stack.pair_attention.qkv_dim', 32),
+    ('evoformer.template.template_stack.pair_transition.num_intermediate_factor', 4),
+)
+
+
+def _widen_boltz2(cfg):
+  '''set cfg in place to Boltz-2's block counts; raise on a missing path.'''
+  for dotted, value in BOLTZ2_SETTINGS:
+    node = cfg
+    parts = dotted.split('.')
+    for p in parts[:-1]:
+      if not hasattr(node, p):
+        raise AttributeError(f'boltz2: config path {dotted!r} not found (missing {p!r})')
+      node = getattr(node, p)
+    setattr(node, parts[-1], value)
+
+
+# Protenix-v2 (ByteDance, Apache-2.0): AF3-lineage, OpenFold-derived like OF3. Its ONLY
+# architectural divergence from stock AF3 is the "hidden_scale_up" widening of the trunk
+# pair channel to c_z=256 (stock is 128). Everything derived from c_z follows: triangle
+# multiplication hidden = c_z = 256, and triangle attention heads = c_z//32 = 8 (stock 4).
+# The diffusion stack is UNWIDENED (token 768, single cond 384, same as stock/of3) -- only
+# the trunk carries the wider pair rep. Block counts match AF3 defaults (pairformer 48,
+# msa 4, template 2, confidence 4, distogram 64 bins). c_m stays 128. So the config delta
+# is just the pair channel + the derived per-stack head counts (set explicitly so a config
+# layout drift is caught loudly). Protenix-v2 is in OPENFOLD3_LINEAGE (it rides the OF3
+# forward branches) + trained Fourier; its Protenix-specific bits are the CONVERTER's
+# naming/feature conventions, not forward-graph shape. See converters/protenix2.py +
+# memory protenix-v2-port.md.
+PROTENIX2_SETTINGS = (
+    ('evoformer.pair_channel', 256),                              # c_z (hidden_scale_up)
+    ('evoformer.msa_channel', 128),                               # c_m (unchanged)
+    ('evoformer.pairformer.pair_attention.num_head', 8),          # trunk tri-att, 256/32
+    ('evoformer.msa_stack.pair_attention.num_head', 8),           # MSA-module pair stack tri-att
+    ('evoformer.msa_stack.msa_attention.num_head', 8),            # MSA pair-weighted-averaging
+    ('evoformer.msa_stack.msa_attention.value_dim', 8),           # per-head width (8*8=64 = proj_m/g)
+    ('evoformer.template.template_stack.pair_attention.num_head', 2),  # template tri-att, 64/32
+    ('heads.confidence.pairformer.pair_attention.num_head', 8),   # confidence pairformer (c_z=256)
+    # Protenix's DiffusionConditioning pair path is also widened to c_z=256 (its relpe
+    # projects to 256, cat([z_trunk(256), relpe(256)])->layernorm_z(512)->256). The
+    # diffusion conditioning pair_channel defaults to 128, so widen it too or the
+    # diffusion pair_cond/transition params mis-shape (structural gate caught this).
+    ('heads.diffusion.conditioning.pair_channel', 256),
+)
+
+
+# Protenix's SMALL model types (mini, tiny). Everything they change from the
+# v0.5.0 base is a COUNT: 16 / 8 pairformer blocks against 48, one MSA block
+# against 4, an 8-block diffusion transformer against 24, and a single-block
+# diffusion atom encoder/decoder against 3. They keep stock AF3 widths (c_z=128,
+# 4 tri-attention heads), unlike protenix2, so there is no widening here at all.
+#
+# Two things worth stating because they are easy to get wrong:
+#   * the INPUT-EMBEDDER atom encoder stays at 3 blocks while the DIFFUSION one
+#     drops to 1, so the two need separate knobs -- one `n_atom` would be wrong
+#     for one of them.
+#   * these are v0.5.0-lineage and TEMPLATELESS (the checkpoints carry zero
+#     template_embedder blocks), so the template stack is set to 0.
+# All of it is verified against the checkpoints by converters/protenix2.derive_dims,
+# which reads the same numbers off the artefact rather than trusting this table.
+
+
+def _apply_settings(cfg, settings, who):
+  for dotted, value in settings:
+    node = cfg
+    parts = dotted.split('.')
+    for part in parts[:-1]:
+      if not hasattr(node, part):
+        raise AttributeError(f'{who}: config path {dotted!r} not found (missing {part!r})')
+      node = getattr(node, part)
+    setattr(node, parts[-1], value)
+
+
+# Protenix-v1 (368 M). Its counts are IDENTICAL to protenix2's -- same 4174
+# tensors, same 48/4/2/24/3 blocks -- and it sits at stock AlphaFold 3 widths
+# throughout (c_z 128, c_m 64, 4 tri-attention heads, msa value_dim 8), so almost
+# nothing needs setting.
+#
+# The one exception is real and is what stalled an earlier attempt at this port:
+# v1's TEMPLATE stack runs a 128-wide triangle multiplication on a 64-channel
+# template pair. AF3 ties the two, so its projections would be (64, 64) where the
+# checkpoint carries (128, 64). That needed a hidden_dim knob on
+# TriangleMultiplication, which defaults to None and leaves every other model
+# byte-identical.
+PROTENIX1_SETTINGS = (
+    ('evoformer.template.template_stack.triangle_multiplication_outgoing.hidden_dim', 128),
+    ('evoformer.template.template_stack.triangle_multiplication_incoming.hidden_dim', 128),
+    # and its template attention is 4 heads x 32 = 128 hidden on the same
+    # 64-channel pair, where AF3 derives max(64 // 4, 16) = 16. Same story as the
+    # tri-mul above: v1's template stack is uniformly twice as wide as its
+    # channel count would imply.
+    ('evoformer.template.template_stack.pair_attention.qkv_dim', 32),
+)
+
+
+def _widen_protenix1(cfg):
+  _apply_settings(cfg, PROTENIX1_SETTINGS, 'protenix1')
+
+
+# HelixFold3 (2025-07-14 weights): stock AlphaFold 3 widths except the MSA
+# pair-weighted averaging (8 heads x 32 where AF3 has 8 x 8), the 4096 MSA rows
+# it samples per pass, and protenix1's 128-wide template triangle
+# multiplication on its 64-channel template pair (with a 4x template
+# transition). Read off the checkpoint by converters/helixfold3.py, which
+# refuses a mismatch.
+HELIXFOLD3_SETTINGS = (
+    ('evoformer.msa_stack.msa_attention.value_dim', 32),
+    ('evoformer.num_msa', 4096),
+    ('evoformer.template.template_stack.triangle_multiplication_outgoing.hidden_dim', 128),
+    ('evoformer.template.template_stack.triangle_multiplication_incoming.hidden_dim', 128),
+    ('evoformer.template.template_stack.pair_transition.num_intermediate_factor', 4),
+    # PAE / PDE bin edges linspace(0, 32, 63): AF3's 31 A top edge is 32 here
+    ('heads.confidence.max_error_bin', 32.0),
+    ('heads.confidence.pae.max_error_bin', 32.0),
+)
+
+
+def _widen_helixfold3(cfg):
+  _apply_settings(cfg, HELIXFOLD3_SETTINGS, 'helixfold3')
+
+
+# Mol-1 (Molence Bio, 577 M): Protenix-v2's model code at c_z 448 and c_m 192,
+# with its 48-block trunk split in two (mol/model/modules/pairformer.py
+# PairformerStack): blocks 0-7 are "PairMixer" blocks -- pairformer blocks with no
+# triangle attention -- at 448, then 40 ordinary pairformer blocks at 320 between
+# two bias-free width adapters (448->320, 320->448). Everything outside that stack
+# runs at 448. hidden_scale_up holds throughout: each triangle multiplication's
+# hidden width is its own stack's c_z, which the AF3 graph does by default.
+# Triangle-attention heads are c_z // 32 per stack: 14 at 448 (MSA module pair
+# stack, confidence pairformer), 10 in the 320 trunk. Read off the checkpoint by
+# converters/mol1.py, which refuses a mismatch.
+MOL1_SETTINGS = (
+    ('evoformer.pair_channel', 448),
+    ('evoformer.msa_channel', 192),
+    ('evoformer.trunk_pair_channel', 320),
+    ('evoformer.pairmixer.num_layer', 8),
+    ('evoformer.pairformer.num_layer', 40),
+    ('evoformer.pairformer.pair_attention.num_head', 10),
+    ('evoformer.msa_stack.pair_attention.num_head', 14),
+    ('evoformer.msa_stack.msa_attention.num_head', 8),
+    ('evoformer.msa_stack.msa_attention.value_dim', 8),
+    ('evoformer.template.template_stack.pair_attention.num_head', 2),
+    ('heads.confidence.pairformer.pair_attention.num_head', 14),
+    ('heads.diffusion.conditioning.pair_channel', 448),
+)
+
+
+def _widen_mol1(cfg):
+  _apply_settings(cfg, MOL1_SETTINGS, 'mol1')
+
+
+def _widen_protenix2(cfg):
+  '''set cfg in place to Protenix-v2's c_z=256 trunk widening; raise on a missing path.'''
+  for dotted, value in PROTENIX2_SETTINGS:
+    node = cfg
+    parts = dotted.split('.')
+    for p in parts[:-1]:
+      if not hasattr(node, p):
+        raise AttributeError(f'protenix: config path {dotted!r} not found (missing {p!r})')
+      node = getattr(node, p)
+    setattr(node, parts[-1], value)
+
+
+# RoseTTAFold3 (Baker lab / RosettaCommons foundry): AF3-family, adopted the AF3 architecture
+# (pairformer + af3 diffusion + af3 losses). STOCK AF3 dims (c_z=128, tri-att 4 heads, tri-mul
+# hidden 128 -- all AF3 defaults), so unlike protenix there is NO trunk widening. The only
+# config-shape divergences are the distogram bin count (65 vs 64) and the MSA depth (a single
+# weight-tied module, not a 4-block stack). Everything else is a FORWARD divergence gated on the
+# rf3 flag: kq_norm (q/k LayerNorm in diffusion attention), no_residual (diffusion block wiring),
+# single/tied MSA, fused template (=protenix branch). See converters/rosettafold3.py + memory
+# rosettafold3-port.md. (WIP: converter trunk+heads+diffusion(cond+token) done; atom path + branches next.)
+ROSETTAFOLD3_SETTINGS = (
+    ('heads.distogram.num_bins', 65),          # RF3 distogram = 65 bins (vs AF3 64)
+    # RF3's MSAModule holds ONE set of weights and runs them n_block=4 times
+    # (rf3_net.yaml msa_module.n_block; pairformer_layers.MSAModule.forward loops
+    # `for i in range(self.n_block)` over the same submodules). The single copy in
+    # the state dict is weight TYING, not a single iteration -- running it once
+    # leaves the trunk three MSA/pair updates short, which no structural gate can
+    # see. The converter replicates the one block across all four layers.
+    ('evoformer.msa_stack.num_layer', 4),
+    ('evoformer.msa_stack.msa_attention.value_dim', 32),  # RF3 msa pwa hidden 8x32=256 (AF3 default 8)
+    # RF3 template pairformer: per-head qkv=64 (4 heads x 64 = 256 hidden; AF3 derives
+    # 64//4=16) and a 4x transition (template_stack defaults to 2x).
+    ('evoformer.template.template_stack.pair_attention.qkv_dim', 64),
+    ('evoformer.template.template_stack.pair_transition.num_intermediate_factor', 4),
+)
+
+
+# chai-1 (chaidiscovery). Read off the JIT state_dict shapes, not a config file --
+# chai ships no model source, only frozen TorchScript, so every number here was
+# derived from a weight shape (see memory chai1-port.md for the dump). The trunk is
+# c_z=256 like protenix, but chai widens/narrows far more than the pair channel:
+#   - transitions are 2x in the pairformer and confidence stacks (AF3 is 4x), while
+#     the MSA module keeps 4x. Read off linear_out: pairformer pair (256,512) = 2x256,
+#     MSA pair (256,1024) = 4x256.
+#   - the MSA pair-weighted-averaging head is 8 heads x 32 (AF3 derives 64//8 = 8):
+#     linear_msa2vg (512,64) = v(256) | g(256).
+#   - the template pairformer runs 4 heads x 32 = 128 hidden at c=64 (AF3 derives
+#     64//4 = 16): pair2qkvg1 (512,64) = 4 x 128.
+#   - the diffusion transformer is 16 blocks, not AF3's 24, and its conditioning pair
+#     path carries the full c_z=256.
+# num_outer_channel is chai's OPM GROUP size: its outer product mean is a grouped
+# rank-8 einsum (weight_ab (2,8,8,64) -> 8*8*8 = 512 channels -> 256), not AF3's
+# left/right projection to 32, so the knob means something different under the chai
+# branch and 8 is the group width it reads.
+CHAI1_SETTINGS = (
+    ('evoformer.pair_channel', 256),                                    # c_z
+    ('evoformer.msa_channel', 64),                                      # c_m (unchanged)
+    ('evoformer.pairformer.pair_transition.num_intermediate_factor', 2),
+    ('evoformer.pairformer.single_transition.num_intermediate_factor', 2),
+    ('evoformer.msa_stack.msa_attention.value_dim', 32),                # 8 heads x 32
+    ('evoformer.msa_stack.outer_product_mean.num_outer_channel', 8),    # grouped OPM width
+    ('evoformer.template.template_stack.pair_attention.qkv_dim', 32),   # 4 heads x 32 at c=64
+    ('heads.diffusion.transformer.num_blocks', 16),                     # AF3 has 24
+    ('heads.diffusion.conditioning.pair_channel', 256),
+    ('heads.confidence.pairformer.pair_transition.num_intermediate_factor', 2),
+    ('heads.confidence.pairformer.single_transition.num_intermediate_factor', 2),
+    # CONFIDENCE only, not the trunk: chai's confidence triangle attention has a
+    # (2*c_z, 2*c_z) output projection whose two halves are combined as
+    # `kept + transpose(other)`, so each direction needs two output projections.
+    # The trunk's is (c_z, 2*c_z), which is AF3's per-direction pair summed, and
+    # must stay on the ordinary path.
+    ('heads.confidence.pairformer.pair_attention.dual_output', True),
+    # chai's EDM schedule. Its InferenceNoiseSchedule multiplies by sigma_data
+    # exactly as ours does, but with S_tmax = 80 where AF3 uses 160 -- so AF3
+    # starts sampling at 16 * 160 = 2560 and chai at 16 * 80 = 1280. The seam
+    # confirms it: chai's step-0 noise_sigma is 1261.6. Starting at twice the
+    # noise the denoiser was trained for is not a small error.
+    ('heads.diffusion.eval.sigma_max', 80.0),
+    # chai runs every MSA row, up to its MAX_MSA_DEPTH, on every pass (recycle_msa_subsample=0 by default). A CAP for
+    # chai, not a depth: the trunk takes the power-of-two bucket featurisation cropped to (full_msa), so its padding
+    # to 16384 -- inert rows -- is not run
+    ('evoformer.num_msa', int(os.environ.get('AF3_CHAI_NUM_MSA', 16384))),
+)
+
+
+def _widen_chai1(cfg):
+  '''set cfg in place to chai-1's dims; raise on a missing path.'''
+  for dotted, value in CHAI1_SETTINGS:
+    node = cfg
+    parts = dotted.split('.')
+    for p in parts[:-1]:
+      if not hasattr(node, p):
+        raise AttributeError(f'chai1: config path {dotted!r} not found (missing {p!r})')
+      node = getattr(node, p)
+    setattr(node, parts[-1], value)
+
+
+def _widen_rosettafold3(cfg):
+  '''set cfg in place to RF3's (minimal) config divergences; raise on a missing path.'''
+  for dotted, value in ROSETTAFOLD3_SETTINGS:
+    node = cfg
+    parts = dotted.split('.')
+    for p in parts[:-1]:
+      if not hasattr(node, p):
+        raise AttributeError(
+            f'rosettafold3: config path {dotted!r} not found (missing {p!r})')
+      node = getattr(node, p)
+    setattr(node, parts[-1], value)
+
+
+# How each model reads its templates (model_features.prepare_input -> pipeline/template_policy.py): one policy per
+# model along five axes -- altloc, modified residues, alignment, prefilter, the prefilter's letter for a modified
+# residue. A model absent here reads templates as AF3 does. Each value was read off the vendor's code and checked
+# against its featuriser on 5K9P (vendor_native_parity template / template_std / multi_template).
+TEMPLATE_POLICIES = {
+    # boltz: gemmi keeps the first altloc; a modified residue is atomised (its N stands for it); the YAML takes a whole
+    # chain and boltz aligns the query to it
+    'boltz2': dict(altloc='first', modified='unk_n', realign='whole_chain'),
+    # protenix's template featuriser (OpenDDE copies it): prefilter, kalign to the whole SEQRES, a modified residue UNK
+    **{m: dict(modified='unk_n', realign='whole_chain', prefilter=True, hit_letter='X')
+       for m in ('protenix1', 'protenix2', 'mol1', 'opendde')},
+    # HelixFold3 runs AlphaFold 2's template pipeline (TemplateHitFeaturizer): the same prefilter
+    # (_assess_hit: a near-duplicate of the query is dropped -- 5K9P on itself never reaches it),
+    # the hit's own alignment kept (AF2 realigns only on a sequence mismatch), a modified residue read as UNK
+    # (its SEQRES reads a modified residue as its parent's letter, so 5K9P's SEP is S and the hit is a duplicate)
+    # a modified residue reads as its PARENT, atoms by name (AF2's mmcif parser: SEP is S) -- AF3's own rule
+    'helixfold3': dict(prefilter=True, hit_letter='parent'),
+    # IntelliFold: protenix's prefilter, but it re-aligns within the hit's range and maps a modified residue to its parent
+    'intellifold2': dict(prefilter=True, hit_letter='parent'),
+    # chai: a hit carrying any residue outside its standard codes (SEP, MSE, ...) is dropped
+    'chai1': dict(modified='drop_hit'),
+    # rf3 reads its template structure through atomworks, whose parser keeps the first altloc (io/parser.py
+    # altloc="first"); 5K9P's LYS 29 / GLY 76 move 0.09 / 0.17 A and the template case read trunk pair 2.47
+    'rosettafold3': dict(altloc='first'),
+    # OpenFold3 (0.4.5 and v0.5.0 alike) in CIF-direct mode: kalign of the query to the chain's whole canonical
+    # (parent-letter) sequence, templates ranked by seq_id * q_cov, and a modified template residue typed UNK on its
+    # own backbone (vendor_native_parity template / multi_template: SEP 20 read UNK; the 11-60 hit realigned to 1-76)
+    **{m: dict(modified='unk_restype', realign='whole_chain', hit_letter='parent', rank=True)
+       for m in ('openfold3', 'openbind0')},
+}
+
+
+# EDM sampler constants per model family. AF3's values are NOT universal -- each
+# family trained its own, and running boltz2's network under AF3's constants was a
+# silent mismatch (nothing errors; the sampler just anneals on the wrong schedule).
+# Only entries verified against the native implementation belong here; a model
+# absent from this table keeps AF3's defaults, which is the honest state for one
+# nobody has checked.
+#   boltz2: stock boltz 2.2.1, boltz.main.Boltz2DiffusionParams -- what `boltz
+#   predict` builds for the boltz2 model (main.py: step_scale 1.5 unless given).
+#   These had been Boltz-1's BoltzDiffusionParams (gamma_0 0.605, gamma_min
+#   1.107, noise_scale 0.901, step_scale 1.638, rho 8, sigma_min 4e-4); the
+#   full-trajectory parity (vendor_native_parity --trajectory) found it.
+_SAMPLER_CONSTANTS = {
+    # bioemu2: its EDMSampler/edm_sampler and the checkpoint's EDMSchedule --
+    # boltz's loop (gamma keyed on the NEXT sigma, a realign before each step,
+    # 0 appended to the schedule) at sigma_min 4e-4, noise_scale 1.0, and
+    # predict-structure's step_scale 1.5 (sample-equilibrium uses 1.0).
+    'bioemu2': dict(gamma_0=0.8, gamma_min=1.0, noise_scale=1.0, step_scale=1.5,
+                    rho=7.0, sigma_min=0.0004, sigma_max=160.0, steps=200,
+                    schedule_tail='append'),
+    'boltz2': dict(gamma_0=0.8, gamma_min=1.0, noise_scale=1.003,
+                   step_scale=1.5, rho=7.0, sigma_min=0.0001, sigma_max=160.0,
+                   schedule_tail='append'),
+    # protenix and OpenDDE: AF3's constants and grid, but InferenceNoiseScheduler
+    # overwrites the last sigma (0.0064) with 0, so the final step lands on the
+    # denoised structure (x = den - 0.5 (x - den)) instead of a quarter of the way.
+    **{m: dict(schedule_tail='replace') for m in ('protenix1', 'protenix2', 'mol1', 'opendde')},
+    # IntelliFold's native stack appends a 0 to AF3's 201 points: 201 steps.
+    'intellifold2': dict(schedule_tail='extend'),
+    # RF3's inference engine samples num_steps=50 (configs/inference_engine/
+    # rf3.yaml), and its schedule is linspace(0, 1, num_timesteps) -- 50 POINTS,
+    # 49 steps, ending at sigma_min. AF3's grid at steps=49 is exactly that.
+    'rosettafold3': dict(steps=49),
+    # ESMFold2's checkpoints set 14 schedule points (esm `inference_num_steps`),
+    # built boltz's way (14 points then a 0 appended) and then CLIPPED at sigma
+    # 256 with 256 prepended -- 10 steps. The EDM schedule opens at sigma_data
+    # * smax = 2560, so AF3's constants would start the trajectory with ten
+    # times the noise the model was trained to undo. Every ESMFold2 variant BUT
+    # ONE samples the same way.
+    **{m: dict(steps=14, max_sigma=256.0, schedule_tail='append')
+       for m in model_config.ESMFOLD2_FAMILY},
+    # The 600M tier does not: its config carries a different EDM schedule
+    # entirely -- and it is Boltz-1's, constant for constant (gamma_0 0.605,
+    # gamma_min 1.107, noise_scale 0.901, step_scale 1.638, rho 8). Found by
+    # check_release_config refusing the conversion, which is exactly the failure
+    # it exists for: nothing about the wrong schedule errors, it just anneals
+    # differently and returns a plausible structure. Synthyra's runtime
+    # (generation_esmfold2.py) builds the same append-then-cap schedule.
+    **{m: dict(steps=15, gamma_0=0.605, gamma_min=1.107,
+               noise_scale=0.901, step_scale=1.638, rho=8.0,
+               sigma_min=0.0004, sigma_max=160.0, max_sigma=256.0,
+               schedule_tail='append')
+       for m in ('esmfold2_lm600m', 'esmfold2_lm300m')},
+}
+
+
+
+# Config-shape divergences, one widener per family that has any. A family absent
+# here runs at stock AF3 dimensions.
+# The trunk depth is the ONLY thing that differs across the family: "Fast" is
+# 24 pair-only blocks where the base model is 48. Read off each release's
+# config.json, not guessed.
+# One row per ESMFold2 release, read off its own config.json and confirmed
+# against the tensor inventory -- NOT assumed from the name. "Fast" is not only
+# a shallower trunk: it also turns the MSA encoder OFF (msa_encoder.enabled
+# false, 0 msa_encoder tensors), so it is ESM-C-only. And the EXPERIMENTAL line
+# is a different architecture again: no parcae, no coda, no lm_encoder stack,
+# a wider MSA head and a 128-bin confidence distogram. "Fast" ALWAYS means no
+# MSA encoder, on both lines -- convert_esmfold2_weights asserts every row here
+# against the checkpoint, because this table was wrong twice before it did.
+#
+#   hub      the biohub repo it is converted from (all six share ESM-C 6B)
+#   trunk    folding_trunk.n_layers
+#   msa      msa_encoder.n_layers, or 0 where the encoder is disabled
+#   coda     parcae.coda_n_layers, 0 without parcae
+#   lm_enc   lm_encoder.n_layers, 0 where the release has no lm_encoder
+#   msa_w    msa_encoder.msa_head_width
+#   bins     distogram_head bins (the TRUNK head, not confidence)
+#   conf_bins classes in the confidence re-embedding distance one-hot
+#            (its trained `boundaries` has one fewer)
+#   esmc     WHICH ESM-C tower this release was trained against. Not
+#            cosmetic: the shim is per-model and so is the tower, and
+#            pairing a variant with the wrong one is silent -- the base
+#            shim on another variant's hidden states reads corr 0.026.
+ESMFOLD2_VARIANTS = {
+    'esmfold2': dict(hub='ESMFold2', trunk=48, msa=4, coda=2, lm_enc=4,
+                     msa_w=16, bins=64, conf_bins=39, esmc='esmc'),
+    'esmfold2_fast': dict(hub='ESMFold2-Fast', trunk=24, msa=0, coda=2, lm_enc=4,
+                          msa_w=0, bins=64, conf_bins=39, esmc='esmc'),
+    # The 600M-ESM-C tier: 24 blocks, no MSA encoder, no lm_encoder, no parcae,
+    # and trained against a DIFFERENT tower, which is the only thing `esmc`
+    # records and the only thing that makes it a separate model. step1500k is
+    # the last checkpoint of upstream's scaling series, i.e. the best of that
+    # tier. (Its architecture came from the dropped ESMFold2-Experimental-Fast,
+    # which is why these two rows carry bins 128 and conf_bins 128 where the
+    # released pair carry 64 and 39.)
+    #
+    # Now served from Synthyra/ESMFold2-600 and -300, which add a TRAINED
+    # confidence head (pLDDT/PAE/pTM/iPTM) to folding weights that are
+    # bit-identical to biohub's step1500k. These were the only members of
+    # NO_CONFIDENCE_HEAD, which is why that tuple is now empty.
+    'esmfold2_lm600m': dict(
+        hub='ESMFold2-600', trunk=24, msa=0,
+        coda=0, lm_enc=0, msa_w=0, bins=128, conf_bins=128, esmc='esmc_600m'),
+    # Identical to the row above in every field but the tower: the two configs
+    # differ only in esmc_id, lm_d_model (960 vs 1152) and lm_num_layers (30 vs
+    # 36), all of which live in the LM, not the folding trunk.
+    'esmfold2_lm300m': dict(
+        hub='ESMFold2-300', trunk=24, msa=0,
+        coda=0, lm_enc=0, msa_w=0, bins=128, conf_bins=128, esmc='esmc_300m'),
+}
+
+ESMFOLD2_HUB_IDS = {m: v['hub'] for m, v in ESMFOLD2_VARIANTS.items()}
+
+ESMFOLD2_SETTINGS = (
+    # trunk: PAIR-ONLY blocks at c_z 256 (AF3 is 128), no templates. The block
+    # COUNT is per-variant, applied after this tuple.
+    ('evoformer.pair_channel', 256),
+    ('evoformer.msa_channel', 128),
+    ('evoformer.template.template_stack.num_layer', 0),
+    ('evoformer.per_atom_conditioning.atom_transformer.num_blocks', 3),
+    # diffusion: 12 token blocks in (3, 4) supers, 16 heads, 3 atom blocks
+    ('heads.diffusion.transformer.num_blocks', 12),
+    ('heads.diffusion.transformer.super_block_size', 4),
+    ('heads.diffusion.transformer.num_head', 16),
+    ('heads.diffusion.conditioning.pair_channel', 256),
+    # ESMFold2's diffusion single is 768 wide, not AF3's 384
+    ('heads.diffusion.conditioning.seq_channel', 768),
+    ('heads.diffusion.atom_transformer.num_blocks', 3),
+)
+
+
+def _widen_esmfold2(name):
+  """-> a widener for one ESMFold2 variant. The family shares every setting
+  except the trunk depth, so the depth rides in as a per-name row rather than as
+  six near-identical tuples."""
+  v = ESMFOLD2_VARIANTS[name]
+
+  def widen(cfg):
+    _apply_settings(cfg, ESMFOLD2_SETTINGS, name)
+    _apply_settings(cfg, (
+        ('evoformer.pairformer.num_layer', v['trunk']),
+        ('evoformer.msa_stack.num_layer', v['msa']),
+        ('evoformer.coda.num_layer', v['coda']),
+        ('evoformer.lm_encoder.num_layer', v['lm_enc']),
+        ('evoformer.msa_stack.msa_attention.value_dim', v['msa_w']),
+        ('heads.distogram.num_bins', v['bins']),
+        ('heads.confidence.reembed_dist_bins', v['conf_bins']),
+    ), name)
+  return widen
+
+
+_WIDENERS = {
+    **{m: _widen_esmfold2(m) for m in model_config.ESMFOLD2_FAMILY},
+    'opendde': _widen_opendde,
+    'boltz2': _widen_boltz2,
+    'protenix2': _widen_protenix2,
+    'mol1': _widen_mol1,
+    'protenix1': _widen_protenix1,
+    'helixfold3': _widen_helixfold3,
+    'rosettafold3': _widen_rosettafold3,
+    'chai1': _widen_chai1,
+}
+
+
+# Featurisation knobs each family REQUIRES: conventions its weights were trained
+# under that the input pipeline has to reproduce. Not preferences -- getting one
+# wrong is silent, and shows up as a fold that is merely mediocre.
+_FEATURISE = {
+    # BioEmu2 reads its own feature dict (pipeline/bioemu2_features.py), built
+    # from the fold input; the AF3 batch only carries it and the output layout.
+    'bioemu2': dict(bioemu2_features=True),
+    # ESMFold2 attends +/-64 atoms by rank, which needs 32 + 2*64 = 160 keys of
+    # context around a query block; AF3's default 128 is too narrow, so widen the
+    # key subset and let the exact window ride in as a mask.
+    # ...and its atom encoder was trained on ESMFold2's OWN idealised residue
+    # geometry (`constants/esmfold2_ref_pos.py`, its ccd.pkl conformers for
+    # residues and nucleotides), which its featuriser writes into
+    # `ref_pos` with no centering and no augmentation -- not the CCD ideal
+    # values AF3 uses. Read off an env override so the two can be A/B'd:
+    # substituting it is what takes the family's L2.atom_encoder from
+    # a_token corr 0.9998 with max|d|/rms ~0.5 to parity, and the fold effect
+    # has to be measured rather than assumed.
+    # ...and no terminal OXT: ESMFold2 builds its atom list from
+    # PROTEIN_REF_POS's keys, which carry no such atom for any residue, so AF3's
+    # extra terminal oxygen is an atom native has never seen. Not harmless --
+    # the atom window is +/-64 by RANK, so one spurious atom at the END of the
+    # list corrupts the last ~64 atoms' attention, which is what the atom gate's
+    # DIAG showed: max|d| 0.0000 at the median, rising only over the final seven
+    # tokens. AF3_NO_ESM_DROP_OXT keeps it, for the A/B.
+    # ...and its self-MSA is the query ONCE. AF3 hands a chain with no
+    # alignments two identical rows (one from the paired MSA, one from the
+    # unpaired); native emits depth 1. See model_features._dedupe_self_msa for
+    # the measurement -- it moves the trunk's MSA injection by 4.3%.
+    # AF3_NO_ESM_DEDUPE_MSA=1 keeps AF3's two rows, for the A/B.
+    **{m: dict(atom_keys_subset_size=192, lm_pair=True,
+               # SMILES atoms named as esm's tokenize_ligand_smiles names them --
+               # AddHs, CanonicalRankAtoms, SYMBOL + (rank + 1): boltz's rule
+               # exactly (stock-ESMFold2 ligand_smiles: s_inputs corr 0.989)
+               smiles_atom_names='boltz',
+               # 'query_once': native's MSA is the a3m, query once, with or without homologs (6648 rows to our 6649)
+               dedupe_self_msa=not os.environ.get('AF3_NO_ESM_DEDUPE_MSA') and 'query_once',
+               # profile over the complex MSA: a nucleic chain beside a protein MSA reads ~all gap, not its own one-hot
+               complex_msa_profile=not os.environ.get('AF3_NO_ESM_COMPLEX_PROFILE'),
+               # deletion_mean over rows of (pi / 2) * arctan(d / 3), as esm prepare_input; AF3 takes the raw count mean
+               esm_deletion_mean=not os.environ.get('AF3_NO_ESM_DELETION'),
+               esmfold2_ref_pos=not os.environ.get('AF3_NO_ESM_REF_POS'),
+               # An atomised residue is UNKNOWN to ESMFold2, not its parent.
+               # Its featuriser (esm 3.4.1 prepare_esmfold2_input) puts
+               # PROTEIN_UNK_RES_TYPE = 22 on all ten tokens of a
+               # phospho-serine where we put SER -- the same convention
+               # rosettafold3 already needs, and for the same reason -- and on
+               # a modified nucleotide's tokens too.
+               atomized_unknown_restype=not os.environ.get(
+                   'AF3_NO_ESM_ATOMIZED_UNK') and 'esm',
+               # its protein MSA comes from the a3m, whose query row is the sequence as typed (PXZ written G reads G)
+               query_letter_msa=True,
+               # compute_token_bonds links an atomised protein residue to its neighbours (prev C - N, C - next N)
+               atomized_backbone_bonds=not os.environ.get('AF3_NO_ESM_BACKBONE_BONDS') and 'esm',
+               # esm prepare_input atomises a modified residue or nucleotide from its CCD minus the CCD leaving atoms
+               # unless it ends the chain (FGA: OE2 off, OXT kept), and drops nothing from an unbonded glycan (O1 kept)
+               ccd_leaving_atoms=not os.environ.get('AF3_NO_ESM_LEAVING'),
+               drop_inner_terminal_atoms=not os.environ.get('AF3_NO_ESM_LEAVING') and 'leaving',
+               # DIAGNOSTIC: AF3_ESM_PTM_ONE_TOKEN=1 keeps a modified residue
+               # as ONE token holding all its atoms (boltz2's convention)
+               # instead of atomising it.
+               **(dict(modified_as_one_token=True)
+                  if os.environ.get('AF3_ESM_PTM_ONE_TOKEN') else {}),
+               # its standard residue tables carry no OXT and no 5' OP3 (DNA_HEAVY_ATOMS["DA"] starts at P)
+               **({} if os.environ.get('AF3_NO_ESM_DROP_OXT')
+                  else dict(drop_atoms=('OXT', 'OP3'))))
+       for m in model_config.ESMFOLD2_FAMILY},
+    # boltz2 keeps a modified residue as ONE token holding all its atoms
+    # (data/tokenize/boltz2.py: standard -> per residue, NONPOLYMER -> per atom,
+    # else -> one token, all atoms). AF3 atomises instead, and handing boltz2 ten
+    # single-atom tokens where it wants one ten-atom token inflates the residue
+    # ~2.4x. Inert when nothing is modified, and ligands atomise either way.
+    # boltz2 CLIPS AND PADS its atom key window, where AF3 slides it back in
+    # bounds -- the same convention opendde and protenix use, and it was set for
+    # them and not for boltz2. Enumerated from `get_indexing_matrix` /
+    # `single_to_keys` rather than inferred: window 0 holds keys 0..79 with its
+    # leading 48 slots filled with index 0 and masked, window 1 holds 0..111
+    # with 16 such slots, and the last two windows pad at the END. So the edge
+    # blocks see fewer real neighbours AND the ones they see sit at different
+    # key SLOTS, which misaligns the per-slot pair bias too.
+    #
+    # The signature in the gate is unmistakable once the layout is right: q per
+    # 32-atom window read 39.7 / 45.3 at windows 0-1 and 15.5 / 26.6 at 16-17,
+    # against 0.1-2.1 across the whole interior.
+    # dedupe_self_msa: boltz's own featuriser emits a DEPTH-1 MSA for a chain
+    # with no alignments -- `dummy_msa` holds one sequence, and the pairing takes
+    # the first row of each chain and then finds nothing to add, so its batch
+    # carries msa at (1, 1, 68). Read off boltz's inference data module, not
+    # inferred. AF3 hands the same input the query TWICE.
+    # drop_atoms OXT: boltz has no terminal OXT, ever. Its canonical atom table
+    # is fixed and does not list one (`const.ref_atoms["GLU"] = [N, CA, C, O,
+    # CB, CG, CD, OE1, OE2]`), its own CCD mol flags OXT `leaving_atom: True`,
+    # and its featuriser's output on 6MRR carries 573 atoms where ours carries
+    # 574 -- the extra one being the C-terminal OXT. An atom the model never saw
+    # in training, occupying a slot in the atom windows and shifting the flat
+    # atom axis of every chain after the first. Same knob esmfold2 and chai-1
+    # already use.
+    # declared_polymer_bonds: boltz's `bond` constraint between two tokens is a token bond, polymer-polymer included
+    # constraints: pocket/contact conditioning from the input's `constraints` (model_features._boltz2_constraints)
+    'boltz2': dict(modified_as_one_token=True, padded_keys=True, declared_polymer_bonds=True, constraints='boltz2',
+                   templates=TEMPLATE_POLICIES['boltz2'],
+                   **({} if os.environ.get('AF3_NO_BOLTZ2_DROP_OXT')
+                      else dict(drop_atoms=('OXT', 'OP3', 'O3P'))),
+                   # 'query': boltz keeps the a3m as given, query once, with
+                   # or without real alignments (_dedupe_query_row).
+                   dedupe_self_msa=('query' if not os.environ.get(
+                       'AF3_NO_BOLTZ2_DEDUPE_MSA') else False),
+                   # a non-polymer token's MSA column is UNK, not a gap
+                   # (model_features._ligand_query_unk).
+                   ligand_msa_unk=True,
+                   # boltz keeps a ligand's leaving atoms; AF3 drops a glycan's
+                   # O1 unless O1 is the bonded atom. NAG bonded at C1 to an
+                   # Asn: boltz 15 ligand atoms, ours 14, until this.
+                   keep_ligand_leaving_atoms=True,
+                   # SMILES atoms named element + canonical rank, as boltz
+                   # names them (_boltz_smiles_atom_names).
+                   smiles_atom_names='boltz',
+                   # deletion_mean: boltz averages its deletion VALUE, (pi / 2) * arctan(d / 3), as ESMFold2 does
+                   esm_deletion_mean=not os.environ.get('AF3_NO_BOLTZ2_DELETION'),
+                   # boltz_msa: rows, pairing and caps as boltz predict builds them (model_features._boltz_msa)
+                   boltz_msa=not os.environ.get('AF3_NO_BOLTZ2_MSA'),
+                   # raw_last_conformer: its last conformer group keeps the stored frame (constants/boltz2_conformers.py)
+                   raw_last_conformer=not os.environ.get('AF3_NO_BOLTZ2_RAW_LAST'),
+                   # parse_polymer drops a non-canonical residue's CCD leaving atoms (parse_ccd_residue
+                   # drop_leaving_atoms=True) wherever it sits; ligands are parsed whole (an unbonded sugar keeps O1)
+                   **({} if os.environ.get('AF3_NO_BOLTZ2_LEAVING')
+                      else dict(ccd_leaving_atoms='polymer', drop_inner_terminal_atoms='leaving_all'))),
+    # opendde runs its diffusion on an expanded structural-token set, and pads
+    # the atom key window rather than sliding it in bounds.
+    # struct_num_tokens is deliberately absent: the structural-token count
+    # depends on the input, so a fixed bucket only works for inputs small enough
+    # to fit it ("Can't pad to a smaller shape" for anything larger). Left unset,
+    # attach_structural_batch rounds the true count up to a multiple of 32, which
+    # keeps shapes stable across similar inputs without capping them.
+    # empty_template_gap: opendde's TemplateEmbedder divides by the padded slot
+    # count, so the template term is LIVE with no template supplied -- and its
+    # empty slots are GAP in slot 0, zero in slots 1-3, exactly protenix's
+    # pattern.
+    #
+    # CORRECTED 2026-09-12. This said 'all' first, read off `make_dummy_feature`
+    # (`torch.full(..., 31)  # gap` over the whole (4, N) block). That path only
+    # runs when the template featurizer returns NOTHING; its own featuriser
+    # actually emits [31, 0, 0, 0], measured on both `--use_template true` and
+    # `false`. Reading the code got the right question and the wrong answer, and
+    # the feature dump is what settled it -- which is the argument for
+    # dev/oracles/featurisation_diff.py existing.
+    # dedupe_self_msa: a protenix fork, and its featuriser too emits a depth-1 self MSA; the duplicate query row
+    # moved a single-sequence protein+RNA trunk to another basin (u1a pair rel 0.35 -> 0.06 against native)
+    'opendde': dict(opendde=True, padded_keys=True, templates=TEMPLATE_POLICIES['opendde'],
+                    # a protenix fork: same include_discont_poly_poly_bonds=True rule for declared bonds
+                    declared_polymer_bonds=not os.environ.get('AF3_NO_DECLARED_BONDS') and 'discontinuous',
+                    # and its leaving atoms by the CCD flags: the group at each declared bond atom goes before
+                    # tokenising (remove_leaving_atoms), an unflagged OXT stays (featurise_input ccd_leaving_atoms)
+                    ccd_leaving_atoms=not os.environ.get('AF3_NO_DECLARED_BONDS'),
+                    drop_inner_terminal_atoms='protenix',
+                    empty_template_gap=not os.environ.get(
+                        'AF3_NO_DDE_TEMPLATE_GAP'),
+                    empty_template_gap_slots='first',
+                    dedupe_self_msa=not os.environ.get('AF3_NO_DDE_DEDUPE_MSA'),
+                    # its featuriser fills a ligand's MSA with UNK and a nucleic chain's all-gap rows with its query
+                    native_nonprotein_msa=not os.environ.get('AF3_NO_DDE_NONPROTEIN_MSA'),
+                    # and deduplicates a protein chain's unpaired MSA, which AF3 keeps as supplied
+                    dedupe_unpaired_msa=not os.environ.get('AF3_NO_DEDUPE_UNPAIRED_MSA'),
+                    # protenix configs_inference msa_pair_as_unpair True; its MSA query row is the sequence as typed
+                    pair_as_unpair=not os.environ.get('AF3_NO_PX_PAIR_AS_UNPAIR'), query_letter_msa=True,
+                    # after the centring its featuriser moves each reference conformer by U(-1, 1) per axis
+                    translate_conformers=True,
+                    # ccd_restype: a non-standard residue reads its CCD one-letter code (add_cano_seq_resname)
+                    ccd_restype=not os.environ.get('AF3_NO_PX_CCD_RESTYPE'),
+                    atomized_backbone_bonds=not os.environ.get('AF3_NO_PX_ATOMIZED_BONDS') and 'protenix'),
+    # PER FAMILY, not per model. One `protenix/model/modules/primitives.py`
+    # serves every protenix release, so the padded key window is a property of
+    # the implementation and not of a checkpoint. It was set for protenix2
+    # alone, and protenix1 therefore SLID its window where native pads --
+    # invisible to L1/L2-conditioning/L3-token-transformer (all 1.000000) and
+    # visible only in the atom encoder, which nothing had ever run for
+    # protenix1: p_atom_pair corr 0.844, and a denoise step 1.16 A/atom whose
+    # error sat at the chain ends (1.95 vs 0.53 interior) and in the final
+    # partial window (2.93) -- the signature of sliding against padding.
+    # empty_template_gap: protenix's own featuriser fills its one empty
+    # template with the GAP restype and zero-pads the rest, and its template
+    # embedder divides by the padded slot count -- so the term is live with no
+    # template at all. See model_features._empty_template_gap and
+    # model_config.TEMPLATE_MEAN_OVER_ALL_SLOTS.
+    # dedupe_self_msa: protenix's own featuriser emits a DEPTH-1 self MSA (its
+    # dump carries msa at (1, 76)); AF3 concatenates a paired and an unpaired
+    # MSA and so hands a chain with no alignments the query TWICE. The outer
+    # product mean over duplicates is unchanged, but the pair-weighted averaging
+    # and the row transition are depth-sensitive -- see
+    # model_features._dedupe_self_msa, which esmfold2 needed first.
+    # Both are env-overridable for A/B on a target, the way the esmfold2 dedupe
+    # already is -- a convention that changes a fold by 9 A deserves a switch
+    # that can be flipped without an edit.
+    # native_nonprotein_msa: the same msa_featurizer as opendde's -- ligands UNK, nucleic all-gap rows filled with the query
+    **{m: dict(padded_keys=True,
+               empty_template_gap=not os.environ.get('AF3_NO_PX_TEMPLATE_GAP'),
+               templates=TEMPLATE_POLICIES[m],
+               dedupe_self_msa=not os.environ.get('AF3_NO_PX_DEDUPE_MSA'),
+               native_nonprotein_msa=not os.environ.get('AF3_NO_PX_NONPROTEIN_MSA'),
+               dedupe_unpaired_msa=not os.environ.get('AF3_NO_DEDUPE_UNPAIRED_MSA'),
+               # protenix configs_inference msa_pair_as_unpair True; its MSA query row is the sequence as typed
+               pair_as_unpair=not os.environ.get('AF3_NO_PX_PAIR_AS_UNPAIR'), query_letter_msa=True,
+               translate_conformers=True,
+               # ccd_restype: a non-standard residue reads its CCD one-letter code (add_cano_seq_resname)
+               ccd_restype=not os.environ.get('AF3_NO_PX_CCD_RESTYPE'),
+               atomized_backbone_bonds=not os.environ.get('AF3_NO_PX_ATOMIZED_BONDS') and 'protenix',
+               # declared bonds: discontinuous polymer-polymer and modified-residue-to-ligand, as include_discont_poly_poly_bonds
+               declared_polymer_bonds=not os.environ.get('AF3_NO_DECLARED_BONDS') and 'discontinuous',
+               # and its leaving atoms by the CCD flags: the group at each declared bond atom goes before
+               # tokenising (remove_leaving_atoms), an unflagged OXT stays (featurise_input ccd_leaving_atoms)
+               ccd_leaving_atoms=not os.environ.get('AF3_NO_DECLARED_BONDS'),
+               drop_inner_terminal_atoms='protenix',
+               # replay native's MC dropout and per-pass MSA subsets from the seed; the value is the pair width.
+               # Mol-1 never applies MC dropout at inference (mc_dropout_apply_rate 0.0, configs inference.py),
+               # though it still makes the draw
+               **({} if os.environ.get('AF3_NO_PX_NATIVE_RNG')
+                  else {'native_rng': {'protenix1': 128, 'protenix2': 256, 'mol1': 448}[m],
+                        **({'native_rng_mc_rate': 0.0} if m == 'mol1' else {})}))
+       for m in model_config.PROTENIX_FAMILY},
+    # EXPERIMENT (see the if2 tail investigation): align the atom key window's
+    # edge to the atom count rounded up to a whole query block, which is what
+    # if2's own reshape-into-windows forces.
+    # HelixFold3: its featuriser keeps every CCD heavy atom (OXT on every amino
+    # acid, OP3 on every nucleotide, leaving atoms on modified residues and
+    # ligands -- dropped only at output); clamps its atom key window and masks the
+    # out-of-range keys (diffusion.py AttentionIndex, as protenix); and pads its
+    # four template slots with empty GAP-typed ones its template embedder reads.
+    'helixfold3': dict(padded_keys=True, ccd_leaving_atoms=True,
+                       drop_inner_terminal_atoms='keep_all',
+                       keep_ligand_leaving_atoms=True,
+                       empty_template_gap='no_msa', empty_template_gap_slots='atoms',
+                       # the query ONCE (a chain with no alignment is one row,
+                       # create_chain_features_without_real_msa; AF3 builds two), and
+                       # duplicate rows dropped ignoring insertions (AF2 make_msa_features)
+                       dedupe_self_msa='query', dedupe_unpaired_msa=True,
+                       # blank atom-token names, a DNA token's gap profile, a ligand's UNK msa row
+                       hf3_features=True,
+                       # its chain order: protein, RNA (identical chains together), DNA, ligand
+                       hf3_chain_order=True,
+                       # MSE, which AF3 keeps whole, is one token per atom
+                       atomize_mse=True,
+                       # copies of one SMILES ligand are one entity
+                       shared_smiles_ligand_names=True,
+                       # a modified residue's tokens read the protein unknown; an unknown amino acid is
+                       # built from the CCD UNK (N CA C O CB CG)
+                       modified_restype='hf3', ccd_unk=True,
+                       mask_padded_atoms=True),
+    'intellifold2': dict(qblock_keys=bool(__import__('os').environ.get('IF2_QBLOCK'))),
+    # IntelliFold-2's atom key window edge is the atom count ROUNDED UP to a
+    # whole query block, because it reshapes the flat atom axis into windows
+    # (`b (n w) -> b n w`) and must pad to a multiple of 32 first -- so its last
+    # two blocks take keys 448..575 on 6MRR where AF3's slide gives 446..573.
+    #
+    # This is only half of what if2's atom encoder needed; the other half is the
+    # KEY-SIDE MASK (model_config.KEY_MASKED_ATOM_ATTENTION). With the window
+    # aligned and the mask wrong, block 1 read 9.5e-03 and blocks 2-3 blew up on
+    # windows 16 and 17 ALONE. With both, the whole encoder is exact at full
+    # depth: a_token 2.33e-05, q_atom 1.23e-05, every window at the numerical
+    # floor.
+    # The reference is IntelliFold-v2's native PyTorch stack (stock v2.0.4,
+    # dev/oracles/intellifold2_upstream_runner.py), whose boltz-forked
+    # featuriser drops terminal OXT/OP3 and dedupes the self-MSA -- NOT its
+    # vendored AF3 engine, which featurises as AF3 does (b352d10 matched that
+    # one; decided 2026-10-19). AF3_NO_IF2_DEDUPE_MSA / AF3_NO_TERMINAL_DROP
+    # give the AF3-engine behaviour.
+    'intellifold2': dict(qblock_keys=True,
+                         templates=TEMPLATE_POLICIES['intellifold2'],
+                         # its boltz-derived a3m parser drops a row repeating an earlier one (gaps removed, upper-cased)
+                         boltz_msa_dedupe=True,
+                         # its featuriser is boltz's construct_paired_msa (rows paired across chains on the CSV
+                         # key), with per-chain profile / deletion mean over the chain's own rows
+                         # (model_features._boltz_msa variant 'intellifold2'; stock-IntelliFold paired_msa:
+                         # target_feat corr 0.9957 without it)
+                         boltz_msa=('intellifold2' if not os.environ.get('AF3_NO_IF2_BOLTZ_MSA') else False),
+                         # 'query', as boltz2: the featuriser IntelliFold forks
+                         # keeps the a3m as given, query once, WITH alignments
+                         # too -- a 4-row a3m is 4 rows where AF3 builds 5
+                         # (stock-IntelliFold comparison: trunk pair 2.73).
+                         dedupe_self_msa=('query' if not os.environ.get(
+                             'AF3_NO_IF2_DEDUPE_MSA') else False),
+                         # as its boltz-forked featuriser: a ligand's leaving
+                         # atoms kept, SMILES atoms named element + canonical
+                         # rank, an internal modified nucleotide keeps OP3, and
+                         # a modified residue's type is its CCD letter read
+                         # through the protein table (stock-IntelliFold
+                         # comparison, covalent / ligand_smiles / rna_mod /
+                         # dna_mod).
+                         keep_ligand_leaving_atoms=True,
+                         smiles_atom_names='boltz',
+                         keep_modified_nucleotide_op3=True,
+                         modified_restype='protein_letter',
+                         **({} if os.environ.get('AF3_NO_TERMINAL_DROP')
+                            else dict(drop_atoms=('OXT', 'OP3', 'O3P')))),
+    # rf3 (atomworks) renames atomised atoms to their ELEMENT symbol, carries
+    # chirality features, aligns restypes to its own alphabet, and calls an
+    # atomised polymer token UNKNOWN where AlphaFold 3 keeps the parent residue
+    # type (which is what asserted the L enantiomer over 11 D-amino acids).
+    # padded_keys: rf3's atom attention CLAMPS its key window and masks the
+    # out-of-range slots (`Cs = arange(nq)*32 + 16`, `patchk = arange(128) - 64`
+    # -> keys 32i-48 .. 32i+79, then `torch.clamp(indices, 0, L-1)` and
+    # `-1e9 * (maskQ | maskK)`), where AF3 slides the window bodily in bounds.
+    # Same convention as opendde and protenix; it was missed here because rf3
+    # was already in KEY_MASKED_ATOM_ATTENTION and that list is about the MASK,
+    # not about where the window sits.
+    # dedupe_self_msa: rf3 runs atomworks, whose MSA transform early-returns with
+    # `full_encoded_msa = expand_dims(encoded["seq"], 0)` -- the query alone,
+    # shape [1, n_tokens] -- when no polymer MSA is present. AF3 hands the same
+    # input the query twice.
+    # drop_atoms: rf3's prediction path calls atomworks'
+    # `remove_protein_terminal_oxygen` (OXT, non-atomized protein residues only)
+    # and the matching nucleic OP3 filter, so neither reaches its model.
+    'rosettafold3': dict(**({} if os.environ.get('AF3_NO_TERMINAL_DROP')
+                            else dict(drop_atoms=('OXT', 'OP3', 'O3P'))),
+                         chirals=True, atomized_element_names=True,
+                         # atomworks keeps OXT/OP3 of an atomised residue only at the chain end
+                         drop_inner_terminal_atoms=True,
+                         restype_alignment=True,
+                         # rf3_msa: rows, caps and dense stacking as atomworks builds them (model_features._rf3_msa)
+                         rf3_msa=not os.environ.get('AF3_NO_RF3_MSA'),
+                         # native gives a modified nucleotide's atomised tokens the protein UNK too (5CM: 20)
+                         atomized_unknown_restype='nucleic',
+                         atomized_backbone_bonds=True,
+                         # atomworks keeps a modified (atomised) residue's bond to a ligand, drops polymer-polymer ones
+                         declared_polymer_bonds=not os.environ.get('AF3_NO_DECLARED_BONDS') and 'ligand',
+                         # atomworks atomises a residue covalently bound to a ligand (covalent_modifications.py)
+                         atomize_ligand_bonded=not os.environ.get('AF3_NO_RF3_ATOMIZE_BONDED'),
+                         # atomworks recharges a declared bond's atoms from their bond degree (Asn ND2 +1)
+                         declared_bond_charge=not os.environ.get('AF3_NO_RF3_BOND_CHARGE'),
+                         # atomworks atomises an unknown amino acid (X -> UNK) like any non-standard residue
+                         atomize_unknown=not os.environ.get('AF3_NO_RF3_ATOMIZE_UNK'),
+                         # atomworks drops a declared bond's CCD leaving atoms too (bR: retinal O1 at the Schiff base)
+                         ccd_leaving_atoms=not os.environ.get('AF3_NO_DECLARED_BONDS'),
+                         padded_keys=True,
+                         # 'query': atomworks keeps the a3m as given, query
+                         # once, with or without real alignments -- a 4-row a3m
+                         # is 4 rows where AF3 builds 5 (stock-RF3 comparison).
+                         dedupe_self_msa=('query' if not os.environ.get(
+                             'AF3_NO_RF3_DEDUPE_MSA') else False)),
+    # chai-1's four input conventions, every one of them silent when forgotten:
+    # it takes the atom key window MODULO the atom count where AF3 slides it back
+    # in bounds; it numbers its atoms without the C-terminal OXT; it carries its
+    # own standard-residue conformers (ligands fall through to the CCD, as chai
+    # does too); and with no alignment it feeds an all-gap MSA rather than a
+    # depth-1 self-MSA. It also takes ESM2 embeddings, which are optional but not
+    # minor -- without them a natural protein folds to 5.70 A where chai reaches
+    # 0.642.
+    # std_conformers: chai's own standard-residue conformers (constants/chai1_conformers.py) in place of CCD ideal ones
+    # atomized_unknown_restype: chai-lab's restype is gemmi's fasta_code(), X for
+    # every modified residue (SEP, TPO, MSE ...), where AlphaFold 3 keeps the
+    # parent; atomised, a phosphoserine's ten tokens are UNKNOWN to chai
+    # (data/parsing/structure/residue.py get_restype), and its ESM2 sequence
+    # reads X there too (_resolve_esm).
+    # atomized_unknown_restype='chai': a modified nucleotide's atomised tokens are chai's DX/RX (our N), not the parent
+    # chai_msa: its uint8 profile and single-sequence context for chains without an alignment (model_features._chai_msa)
+    'chai1': dict(circular_keys=True, drop_atoms=('OXT', 'OP3'), constraints='chai1',
+                  zero_msa_without_alignment=True, esm=True, full_msa=True,
+                  atomized_unknown_restype='chai', chai_msa=True,
+                  templates=TEMPLATE_POLICIES['chai1'],
+                  # its TokenBondRestraint: every declared bond, directed, into both pair inputs
+                  declared_bond_feature=not os.environ.get('AF3_NO_DECLARED_BONDS'),
+                  std_conformers=not os.environ.get('AF3_NO_CHAI_CONFORMERS'),
+                  # chai builds every residue from its conformer cache: CCD heavy atoms minus OXT (5CM keeps OP3, a
+                  # terminal MSE has no OXT, an unbonded sugar keeps O1); a declared bond drops its CCD leaving atoms
+                  # on the polymer side, while a LIGAND keeps them as tokens it does not place: the NAG on an Asn
+                  # has its O1 token with reference features (atom_ref_mask) and atom_exists false (stock-chai
+                  # covalent case: 33 tokens to our 32). keep_ligand_leaving_atoms + unresolved_leaving_atoms.
+                  **({} if os.environ.get('AF3_NO_CHAI_LEAVING')
+                     else dict(ccd_leaving_atoms='polymer', drop_inner_terminal_atoms='chai',
+                               keep_ligand_leaving_atoms=True, unresolved_leaving_atoms=True))),
+}
+
+# Conformer centering rides in as a featurise KNOB as well as a
+# model_config list, and the knob is what makes it actually run: every caller
+# guards the whole step on `if spec.featurise:` (dev/oracles/fold_check.py,
+# and the runner), so a model with an EMPTY featurise entry never reaches
+# `model_features.apply` at all. openfold3 and openbind0 have no other knob, so
+# centering was silently skipped for exactly the two models it was most likely
+# to matter for -- caught because their folds came back BYTE-IDENTICAL while
+# boltz2's and protenix's moved.
+#
+# Derived from the list rather than restated, so the two cannot disagree.
+for _m in model_config.CENTRE_REF_CONFORMERS:
+  _FEATURISE.setdefault(_m, {})['centre_conformers'] = True
+
+
+# TERMINAL ATOMS. of3 removes them explicitly and says why:
+# `remove_std_residue_terminal_atoms` -- "Models like AF3 and AF2 expect all
+# tokens with the same restype to map to the same number of atoms" -- with
+# `MOLECULE_TYPE_TO_LEAVING_ATOMS = {PROTEIN: ["OXT"], DNA/RNA: ["OP3", "O3P"]}`.
+# Measured against its own featuriser on ubiquitin: 601 atoms to our 602, the
+# extra one being the C-terminal OXT.
+#
+# NOT universal -- protenix indexes OXT per residue (`constants.py` "ALA":
+# {... "OXT": 5}) and opendde appends it explicitly
+# (`staying_atoms = np.append(staying_atoms, ["OXT"])`), so both keep it and are
+# deliberately absent here.
+#
+# The nucleic half matters more than the protein half: OP3 is the FIRST atom of
+# residue 1, so carrying it shifts the ENTIRE flat atom axis of a nucleic chain
+# by one against native's, where OXT only displaces the tail of a protein chain.
+for _m in ('openfold3', 'openbind0'):
+  if not os.environ.get('AF3_NO_TERMINAL_DROP'):
+    _FEATURISE.setdefault(_m, {})['drop_atoms'] = ('OXT', 'OP3', 'O3P')
+  # of3's query featuriser drops a non-canonical polymer residue's CCD leaving atoms wherever it sits (PXZ OXT', a
+  # terminal MVA's OXT, IAS OD2 not OXT) and builds a CCD ligand whole (an unbonded sugar keeps O1)
+  if not os.environ.get('AF3_NO_OF3_LEAVING'):
+    _FEATURISE.setdefault(_m, {}).update(ccd_leaving_atoms=True, drop_inner_terminal_atoms='leaving_all')
+  # of3 tokens of an atomised residue read restype UNK, while its msa query row and profile keep the sequence letter
+  # (PXZ typed as G reads G; ours read UNK there and the parent elsewhere, which flipped actinomycin's chromophore)
+  if not os.environ.get('AF3_NO_OF3_ATOMIZED_RESTYPE'):
+    _FEATURISE.setdefault(_m, {}).update(atomized_unknown_restype='aatype', query_letter_msa=True)
+  # of3 MSA has no DNA query rows (gap everywhere, zero profile), and its token_bonds link two consecutive atomised
+  # residues (SAR4-MVA5) but never an atomised residue to a standard neighbour
+  if not os.environ.get('AF3_NO_OF3_DNA_GAP'):
+    _FEATURISE.setdefault(_m, {}).update(dna_gap_msa=True, atomized_backbone_bonds='both_atomized')
+  # of3 profiles the deduplicated first 16384 main-MSA rows; on msa_gappy that is 6530 of 21577, profile max|d| 0.18 without
+  if not os.environ.get('AF3_NO_OF3_MAIN_MSA'):
+    _FEATURISE.setdefault(_m, {})['of3_main_msa'] = 16384
+    # ...and DEDUPLICATES those rows only from v0.5.0 on (sample_processing/msa.py np.unique of the main MSA,
+    # absent in 0.4.5): openbind0 drops the repeats, openfold3 (0.4.5) keeps every row (deep_msa: 2109 vs 2145 rows)
+    _FEATURISE.setdefault(_m, {})['of3_main_msa_dedupe'] = _m != 'openfold3'
+  # of3 builds an unknown amino acid from the CCD UNK, N CA C O CB CG (593 atoms on unk_residues to AF3's GLY-built 587)
+  if not os.environ.get('AF3_NO_CCD_UNK'):
+    _FEATURISE.setdefault(_m, {})['ccd_unk'] = True
+  # of3 pads to 4 empty templates that are all GAP (create_template_restype), where AF3's empty slots read restype 0
+  if not os.environ.get('AF3_NO_OF3_TEMPLATE_GAP'):
+    _FEATURISE.setdefault(_m, {}).update(empty_template_gap=True, empty_template_gap_slots='atoms')
+  # of3's MSA on DNA/ligand tokens (gap rows, zero profile) and its row count
+  # (model_features._of3_msa_rows), and every modified residue a protein UNK
+  # (_modified_restype_protein_unknown); stock-OF3 comparison, 2026-10-19
+  if not os.environ.get('AF3_NO_OF3_MSA_ROWS'):
+    _FEATURISE.setdefault(_m, {}).update(
+        of3_msa_rows=True, modified_restype='protein_unknown')
+# Synthyra's lm-tier ESMFold2 (the experimental line) is configured disable_msa_features: its forward replaces the
+# profile and deletion mean with zeros (modeling_esmfold2_experimental.py). Stock-Synthyra protein case: the profile
+# block was the whole s_inputs gap (ours one-hot, theirs zero).
+for _m in ('esmfold2_lm600m', 'esmfold2_lm300m'):
+  _FEATURISE.setdefault(_m, {})['zero_profile'] = not os.environ.get('AF3_NO_ESM_ZERO_PROFILE')
+
+# chai-1 too builds an unknown amino acid from the CCD UNK (6 atoms per X on unk_residues, ours 4), as do protenix,
+# opendde and rf3 (their natives' UNK carry CB and CG); boltz's const.ref_atoms["UNK"] is N CA C O CB
+if not os.environ.get('AF3_NO_CCD_UNK'):
+  for _m in ('chai1', 'protenix1', 'protenix2', 'mol1', 'opendde', 'rosettafold3'):
+    _FEATURISE.setdefault(_m, {})['ccd_unk'] = True
+  # intellifold2 too: it forks boltz's featuriser, so its UNK is the same N CA C O CB
+  # (stock-IntelliFold comparison, unknown case: CB the one atom ours lacked)
+  for _m in ('boltz2', 'intellifold2'):
+    _FEATURISE.setdefault(_m, {})['ccd_unk'] = 'cb'
+
+# Bucket padding: AF3's featuriser (upstream's too) marks every padded atom-query slot REAL, pointing at the last
+# padded slot, so padding atoms join the atom attention as keys. That is DeepMind's padding and AF3 keeps it; no vendor
+# here pads atoms that way, and a padded fold drifted off the unpadded one (intellifold2 OURS_BUCKET=shipped: s_inputs
+# 1e-2..6e-2). Every other model masks those slots (model_features._mask_padded_atoms); an unpadded batch is untouched.
+# every model with a template policy carries it (those wired explicitly above keep the same dict)
+for _m, _policy in TEMPLATE_POLICIES.items():
+  _FEATURISE.setdefault(_m, {}).setdefault('templates', _policy)
+
+if not os.environ.get('AF3_NO_MASK_PADDED_ATOMS'):
+  for _m in (('boltz2', 'chai1', 'intellifold2', 'mol1', 'openbind0', 'opendde', 'openfold3', 'protenix1', 'protenix2',
+              'rosettafold3') + tuple(model_config.ESMFOLD2_FAMILY)):
+    _FEATURISE.setdefault(_m, {})['mask_padded_atoms'] = True
+
+
+# Where a converted model's weights are published. The file name is what
+# `converters/convert.py` writes; the repo is where we upload it. AlphaFold3
+# itself is absent: DeepMind's blob is not ours to redistribute, and its terms
+# require you to request it (--model_dir points at your own copy).
+_WEIGHTS_REPO = 'sokrypton/af3-any-model'
+
+
+# One folder per family in the published repo. The families that already have a
+# membership table are read from it rather than restated; the rest are their own
+# folder. openbind0 rides with openfold3 because it IS an OpenFold3 release.
+WEIGHTS_FOLDERS = {
+    **{m: 'protenix' for m in model_config.PROTENIX_FAMILY},
+    'mol1': 'mol1',
+    **{m: 'esmfold2' for m in model_config.ESMFOLD2_FAMILY},
+    'openfold3': 'openfold3',
+    'openbind0': 'openfold3',
+}
+
+# The protein language models. Not ModelSpecs -- separate graphs with their own
+# loader -- so they carry their folder here.
+TOWER_FOLDER = 'lm'
+
+
+# Trunk passes each model's own inference path runs by default (its CLI, not its base config); unlisted = AF3's 11.
+_TRUNK_PASSES = {
+    'openfold3': 4,      # of3_all_atom model_config num_recycles 3; num_cycles = num_recycles + 1
+    'openbind0': 4,      # the same OpenFold3 config
+    'boltz2': 4,         # boltz main.py --recycling_steps 3; range(recycling_steps + 1)
+    'protenix1': 10,     # runner --cycle 10 (and use_default_params); range(N_cycle)
+    'protenix2': 10,
+    'mol1': 20,          # mol pred --cycle 20 (batch_inference.py; configs base.py N_cycle 20)
+    'opendde': 10,       # config/model_base.py N_cycle 10
+    'rosettafold3': 10,  # inference_engine/rf3.yaml n_recycles 10; range(n_recycles)
+    'chai1': 3,          # chai1.py num_trunk_recycles 3; range(num_trunk_recycles)
+    'esmfold2': 20,      # esmfold2/processor.py num_loops 20
+    'esmfold2_fast': 20,
+    'esmfold2_lm600m': 20,
+    'esmfold2_lm300m': 20,
+    'bioemu2': 4,        # load_model num_steps_recycle=3; range(num_steps_recycle + 1)
+    'helixfold3': 10,    # config.py num_recycle 9; range(1 + num_recycle)
+}
+
+
+class ModelSpec:
+  """Everything `global_config.model = name` implies, in one place."""
+
+  __slots__ = ('name', 'full_fat', 'trained_fourier', 'featurise',
+               'weights_repo', 'weights_file', 'weights_prefix', 'weights_licence',
+               'weights_source', 'default_num_recycles')
+
+  # Which network this spec's weights run on. Everything in MODELS rides the
+  # AF3 graph; AF2 does not (see AF2Spec). Read this rather than testing the
+  # name against a tuple -- a name test is the thing that silently admits a new
+  # model to the wrong graph.
+  engine = 'af3'
+
+  def __init__(self, name, full_fat=False, trained_fourier=None,
+               weights_repo=_WEIGHTS_REPO, weights_file=None,
+               weights_licence=None, weights_source=None):
+    from alphafold3.model import model_config
+
+    if name not in model_config.MODELS:
+      raise ValueError(
+          f'unknown model {name!r}; known: {list(model_config.MODELS)}')
+    self.name = name
+    self.full_fat = full_fat
+    # chai-1 also carries a trained Fourier embedding but is deliberately not in
+    # OPENFOLD3_LINEAGE (it is not OpenFold-derived), so it has to be named.
+    if trained_fourier is None:
+      trained_fourier = (name in model_config.OPENFOLD3_LINEAGE
+                         or name == 'chai1')
+    self.trained_fourier = trained_fourier
+    self.featurise = dict(_FEATURISE.get(name, {}))
+    # AF's convention (N recycles = N + 1 passes) for the model's own default pass count
+    self.default_num_recycles = _TRUNK_PASSES.get(name, 11) - 1
+    self.weights_repo = weights_repo
+    self.weights_file = weights_file or f'{name}.bin.zst'
+    # Where it lives IN the repo. A flat repo of forty-odd blobs is unreadable;
+    # one folder per family is. This is the published path only -- locally a
+    # model still keeps its own directory named after itself.
+    self.weights_prefix = WEIGHTS_FOLDERS.get(name, name)
+    # What the OUTPUT of a run may be used for is the weights' licence, not this
+    # code's. None means we have not established it -- say so and point at the
+    # source rather than guess, because guessing here would be an assurance we
+    # cannot give.
+    self.weights_licence = weights_licence
+    self.weights_source = weights_source
+
+  # Storage precisions published beside the float32 blob. float32 stays the
+  # default and keeps its original filename, so every link already handed out
+  # resolves to the same bytes; the smaller forms are additions, not
+  # replacements. See converters/quantise.py for what each costs.
+  PRECISIONS = ('fp32', 'fp16', 'int8')
+
+  def weights_path_for(self, precision='fp32'):
+    """The path INSIDE the weights repo, folder included."""
+    return '%s/%s' % (self.weights_prefix, self.weights_file_for(precision))
+
+  def companion_path(self, filename):
+    """The repo path of a companion artifact (an ESMFold2 shim, say)."""
+    return '%s/%s' % (self.weights_prefix, filename)
+
+  def weights_file_for(self, precision='fp32'):
+    """The published filename of this model's weights at `precision`."""
+    if precision not in self.PRECISIONS:
+      raise ValueError(f'unknown precision {precision!r}, want one of '
+                       f'{self.PRECISIONS}')
+    if precision == 'fp32':
+      return self.weights_file
+    stem = self.weights_file.split('.', 1)[0]
+    return f'{stem}.{precision}.bin.zst'
+
+  def output_terms(self):
+    """The terms-of-use text to write beside a prediction made with this model."""
+    if self.name == 'alphafold3':
+      import os
+      import alphafold3.cpp
+
+      # Packaged, the terms sit beside the built extension; in a source checkout
+      # they are at the repo root, three levels above this file.
+      here = os.path.dirname(os.path.abspath(__file__))
+      for path in (
+          os.path.join(os.path.dirname(alphafold3.cpp.__file__),
+                       'OUTPUT_TERMS_OF_USE.md'),
+          os.path.join(here, '..', '..', '..', 'OUTPUT_TERMS_OF_USE.md'),
+      ):
+        if os.path.isfile(path):
+          with open(path) as fh:
+            return fh.read()
+      raise FileNotFoundError('OUTPUT_TERMS_OF_USE.md not found')
+    where = self.weights_source or 'the model\'s own distribution'
+    if self.weights_licence is None:
+      return (
+          '# OUTPUT TERMS OF USE\n\n'
+          f'These structure predictions were generated using {self.name} model\n'
+          'weights, run through AlphaFold 3 code (copyright Google DeepMind,\n'
+          'Apache 2.0: https://github.com/google-deepmind/alphafold3).\n\n'
+          'The AlphaFold 3 Output Terms of Use do NOT apply to these outputs --\n'
+          'they were not produced with AlphaFold 3 parameters. What DOES apply is\n'
+          f'the licence those weights are distributed under, which we have not\n'
+          f'established here. Check it before you rely on these outputs:\n'
+          f'  {where}\n')
+    return (
+        '# OUTPUT TERMS OF USE\n\n'
+        f'These structure predictions were generated using {self.name} model\n'
+        f'weights, which are licensed under {self.weights_licence}.\n\n'
+        'The AlphaFold 3 Output Terms of Use (which restrict commercial use) do\n'
+        'NOT apply to these outputs -- they were not produced with AlphaFold 3\n'
+        f'parameters. Use is subject to {self.weights_licence} alone.\n\n'
+        f'Weights: {where}\n\n'
+        'AlphaFold 3 code is copyright Google DeepMind, also Apache 2.0:\n'
+        'https://github.com/google-deepmind/alphafold3\n')
+
+  def without(self, knobs):
+    """A copy of this spec with the named featurisation conventions removed.
+
+    For ablation: every convention here is silent when wrong, so the only honest
+    way to say what one buys is to run without it and measure.
+    """
+    import copy
+
+    unknown = set(knobs) - set(self.featurise)
+    if unknown:
+      raise ValueError(f'{self.name} has no featurisation conventions named '
+                       f'{sorted(unknown)}; it has {sorted(self.featurise)}')
+    clone = copy.copy(self)
+    clone.featurise = {k: v for k, v in self.featurise.items()
+                       if k not in set(knobs)}
+    return clone
+
+  @property
+  def sampler(self):
+    """EDM constants for this family, or {} to keep AF3's."""
+    out = dict(_SAMPLER_CONSTANTS.get(self.name, {}))
+    if self.name == 'bioemu2':
+      from alphafold3.model.pipeline import bioemu2_features
+      # sample-equilibrium and propagate sample at step_scale 1.0, predict-
+      # structure at 1.5 (bioemu2.sampling.get_sampler); the mode's other half
+      # is its method token (pipeline/model_features._bioemu2_features)
+      out['step_scale'] = 1.5 if bioemu2_features.mode() == 'structure' else 1.0
+    return out
+
+  def configure(self, config):
+    """Apply this model's shape and sampler settings to a Model.Config, in place."""
+    config.global_config.model = self.name
+    # trained_fourier is not a declared GlobalConfig field (unlike `model`); the
+    # dataclass is unfrozen, so set it on the instance -- diffusion_head reads it
+    # back defensively with getattr.
+    config.global_config.trained_fourier = self.trained_fourier
+    if self.full_fat:
+      _widen_full_fat(config)
+    widen = _WIDENERS.get(self.name)
+    if widen is not None:
+      widen(config)
+    for field, value in self.sampler.items():
+      for sample_config in (config.heads.diffusion.eval,):
+        if hasattr(sample_config, field):
+          setattr(sample_config, field, value)
+    return config
+
+
+
+class AF2Spec:
+  """A model that runs on the vendored AlphaFold 2 network, not the AF3 graph.
+
+  Deliberately NOT a subclass of ModelSpec. Every attribute ModelSpec carries --
+  full_fat, trained_fourier, featurise, a converted `.bin.zst` blob -- describes
+  the AF3 graph, and inheriting them would give an AF2 model a set of settings
+  that look meaningful and are not. What the two share is what a caller actually
+  needs: a name, an engine, and enough licence provenance to write output terms.
+
+  AF2's parameters are not converted and not republished. They are DeepMind's
+  own `params_model_*.npz` from the AlphaFold 2 release, read straight from
+  `--model_dir`, which is why there is no weights_file here.
+  """
+
+  __slots__ = ('name', 'model_type', 'weights_licence', 'weights_source')
+
+  engine = 'af2'
+
+  # AF2 declares no featurisation conventions: it reads the batch the AF3
+  # featuriser produces (alphafold3.af2.features.from_af3_batch) rather than
+  # asking for it to be built differently. Present, and empty, so that
+  # `predict_structure` can consult `spec.featurise` without caring which engine
+  # it has.
+  featurise = {}
+
+  def __init__(self, name, model_type, weights_licence=None,
+               weights_source=None):
+    from alphafold3.model import model_config
+
+    if name not in model_config.AF2_MODELS:
+      raise ValueError(
+          f'unknown AF2 model {name!r}; known: {list(model_config.AF2_MODELS)}')
+    self.name = name
+    # What `alphafold3.af2.runner.AF2Runner(model_type=...)` wants. The runner
+    # keeps ColabDesign's names because its own branches are keyed on them.
+    self.model_type = model_type
+    self.weights_licence = weights_licence
+    self.weights_source = weights_source
+
+  def without(self, featurise_off):
+    '''No featurisation knobs to switch off; --featurise_off cannot apply.'''
+    if featurise_off:
+      raise ValueError(
+          f'--featurise_off={list(featurise_off)} does not apply to '
+          f'{self.name}: AlphaFold 2 declares no featurisation conventions.')
+    return self
+
+  def default_model_names(self, use_templates=False):
+    from alphafold3.af2 import runner as af2_runner
+    return af2_runner.default_model_names(self.model_type, use_templates)
+
+  def output_terms(self):
+    return (
+        '# OUTPUT TERMS OF USE\n\n'
+        f'These structure predictions were generated with AlphaFold 2 '
+        f'({self.name}) parameters,\n'
+        'run through the AlphaFold 2 network vendored in this package.\n\n'
+        'The AlphaFold 3 Output Terms of Use do NOT apply: no AlphaFold 3\n'
+        'parameters were used. What applies is the licence the AlphaFold 2\n'
+        f'parameters are distributed under -- {self.weights_licence} --\n'
+        f'see {self.weights_source}.\n')
+
+
+AF2_SPECS = {
+    'af2_ptm': AF2Spec(
+        'af2_ptm', 'alphafold2_ptm',
+        weights_licence='CC BY 4.0',
+        weights_source='https://github.com/google-deepmind/alphafold'),
+    'af2_multimer': AF2Spec(
+        'af2_multimer', 'alphafold2_multimer_v3',
+        weights_licence='CC BY 4.0',
+        weights_source='https://github.com/google-deepmind/alphafold'),
+}
+
+MODEL_SPECS = {
+    'alphafold3': ModelSpec('alphafold3', trained_fourier=False,
+                            weights_repo=None, weights_file='af3.bin.zst'),
+    'openfold3': ModelSpec('openfold3', weights_licence='the Apache License, Version 2.0',
+                           weights_source='https://github.com/aqlaboratory/openfold'),
+    # OpenBind, OpenFold3's v0.5.0 release, which upstream says supersedes the
+    # preview-2 weights `openfold3` runs ("the previously released preview 2
+    # weights are deprecated and will not function correctly with
+    # openfold3>=0.5"). A SEPARATE MODEL rather than a flag on openfold3: it
+    # differs in a forward convention, and every other divergence in this file is
+    # named by model, so a boolean here would be the one thing you had to
+    # remember. The two share a converter, which picks the mapping off the
+    # checkpoint (converters/openfold3.py `of3_release`).
+    'protenix1': ModelSpec('protenix1',
+                           weights_licence='the Apache License, Version 2.0',
+                           weights_source='https://github.com/bytedance/Protenix'),
+    'openbind0': ModelSpec('openbind0', weights_licence='the Apache License, Version 2.0',
+                           weights_source='https://github.com/aqlaboratory/openfold-3'),
+    # IntelliFold-v2: stock-AF3 module tree (deliberately NOT in
+    # OPENFOLD3_LINEAGE -- its converter emits stock-AF3 haiku names) at the
+    # "full_fat" widened channels.
+    # trained_fourier has to be named here: IF2 carries one, but it is not in
+    # OPENFOLD3_LINEAGE (stock-AF3 module tree), which is what the default reads.
+    'intellifold2': ModelSpec('intellifold2', full_fat=True,
+                              trained_fourier=True,
+                              weights_licence='the Apache License, Version 2.0',
+                              weights_source='https://huggingface.co/intelligenAI/intellifold'),
+    'opendde': ModelSpec('opendde', weights_licence='the Apache License, Version 2.0',
+                         weights_source='https://huggingface.co/aurekaresearch/OpenDDE'),
+    'boltz2': ModelSpec('boltz2', weights_licence='the MIT License',
+                        weights_source='https://github.com/jwohlwend/boltz'),
+    'protenix2': ModelSpec('protenix2', weights_licence='the Apache License, Version 2.0',
+                           weights_source='https://github.com/bytedance/Protenix'),
+    # The repository is Apache-2.0; the weights carry no separate statement.
+    'mol1': ModelSpec('mol1', weights_licence='the Apache License, Version 2.0',
+                      weights_source='https://github.com/molence/Mol-1'),
+    'rosettafold3': ModelSpec('rosettafold3',
+                              weights_licence='the BSD 3-Clause License',
+                              weights_source='https://github.com/RosettaCommons/foundry'),
+    'chai1': ModelSpec('chai1', weights_licence='the Apache License, Version 2.0',
+                       weights_source='https://github.com/chaidiscovery/chai-lab'),
+    # its Fourier noise projection is the checkpoint's. NON-COMMERCIAL: code and
+    # weights carry the HelixFold3 terms (CC BY-NC-SA 4.0 style, with a ban on
+    # unauthorised automated screening/design systems).
+    'helixfold3': ModelSpec('helixfold3', trained_fourier=True,
+                            weights_licence='the HelixFold3 non-commercial licence '
+                                            '(Attribution-NonCommercial-ShareAlike)',
+                            weights_source='https://github.com/PaddlePaddle/PaddleHelix/'
+                                           'tree/dev/apps/protein_folding/helixfold3'),
+    # its Fourier noise projection is the checkpoint's (a frozen draw, saved)
+    'bioemu2': ModelSpec('bioemu2', trained_fourier=True, weights_licence='the MIT License',
+                         weights_source='https://huggingface.co/microsoft/bioemu2'),
+    # ESMFold2 carries a trained Fourier noise embedding like the OF3 lineage,
+    # but is not OpenFold-derived, so it is named rather than inherited -- the
+    # same reason chai1 is named.
+    # MIT, stated on every card in the family (with a third-party notice
+    # alongside it). We were emitting "we have not established" while actively
+    # redistributing these weights, which understated what the cards say.
+    **{m: ModelSpec(m, trained_fourier=True,
+                    weights_licence='the MIT License',
+                    weights_source='https://huggingface.co/biohub/%s' % hub)
+       for m, hub in ESMFOLD2_HUB_IDS.items()},
+}
+
+# Historical / abbreviated spellings, kept working.
+ALIASES = {
+    'af3': 'alphafold3',
+    'af2': 'af2_ptm', 'alphafold2': 'af2_ptm', 'af2_monomer': 'af2_ptm',
+    'af2_multimer_v3': 'af2_multimer', 'alphafold2_multimer': 'af2_multimer',
+    'of3': 'openfold3',
+    'if2': 'intellifold2', 'intellifold': 'intellifold2',
+    'protenix': 'protenix2',
+    'mol-1': 'mol1', 'mol': 'mol1',
+    'rf3': 'rosettafold3',
+    'chai': 'chai1',
+    'bioemu': 'bioemu2',
+    'hf3': 'helixfold3', 'helixfold': 'helixfold3',
+    # OpenBind's own release is called "OpenBind 0"
+    # (openbind.uk/news/blog-openbind-0-advancing-open-molecular-structure-prediction),
+    # so the model key carries the version and leaves room for the next one.
+    # The unversioned name stays an alias: it is what the published weights file
+    # is still called, and what earlier runs and notes refer to.
+    'openbind': 'openbind0',
+}
+
+
+def featurise_kwargs(spec):
+  """The featurise_input arguments a family's knobs imply, in ONE place.
+
+  Every caller that featurises for a model must pass these. Two of them did,
+  each spelling out its own copy of the first knob, which is how a second knob
+  would have reached one caller and not the other.
+  """
+  knobs = getattr(spec, 'featurise', None) or {}
+  return dict(
+      flatten_non_standard_residues=not knobs.get('modified_as_one_token',
+                                                  False),
+      drop_ligand_leaving_atoms=not knobs.get('keep_ligand_leaving_atoms',
+                                              False),
+      # protenix/opendde's leaving atoms by CCD flags. Declared as a knob on
+      # main and passed by NO caller -- model_features warned at runtime that
+      # "an older caller does not pass" it; this is where callers get it.
+      # True, or a mode such as 'polymer' (boltz2: a ligand keeps its side's
+      # leaving atoms).
+      ccd_leaving_atoms=knobs.get('ccd_leaving_atoms', False) or False,
+      keep_modified_nucleotide_op3=bool(
+          knobs.get('keep_modified_nucleotide_op3', False)))
+
+
+def get(name):
+  """-> the ModelSpec (AF3 graph) or AF2Spec (AF2 network) for a name or alias.
+
+  Check `spec.engine` before assuming which graph you have: 'af3' for everything
+  in MODELS, 'af2' for the AlphaFold 2 models.
+  """
+  key = ALIASES.get(name, name)
+  spec = MODEL_SPECS.get(key) or AF2_SPECS.get(key)
+  if spec is None:
+    known = sorted(list(MODEL_SPECS) + list(AF2_SPECS))
+    raise ValueError(f'unknown model {name!r}; known: {known} '
+                     f'(aliases {sorted(ALIASES)})')
+  return spec

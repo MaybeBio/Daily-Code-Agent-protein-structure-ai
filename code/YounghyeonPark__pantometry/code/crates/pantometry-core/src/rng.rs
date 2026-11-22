@@ -1,0 +1,503 @@
+//! A deterministic pseudo-random generator, and the sampling built on it.
+//!
+//! Every stochastic choice in a simulation has to be reproducible or the results
+//! cannot be compared, so this is a plain seeded generator with no global state
+//! and no entropy source. Two runs of the same scene draw the same numbers.
+//!
+//! # The same bits on every platform
+//!
+//! **The stream is**: the generator itself, [`Rng::unit`] and [`Rng::range`] are
+//! integer operations and IEEE `+ − × ÷`, so they give the same bits on every
+//! platform and in WebAssembly. `the_stream_is_pinned` holds a digest of ten
+//! thousand draws, and CI runs it on Linux, macOS, Windows and `wasm32-wasip1`.
+//!
+//! **So is what is sampled from it.** Every method that needs a transcendental
+//! calls [`crate::math`]'s, which are built from `+ − × ÷` in a written order:
+//! - [`Rng::gaussian`] and [`Rng::normal`] call [`math::ln`] and
+//!   [`math::sin_cos_turns`];
+//! - [`Rng::poisson`] calls [`math::exp`], and above a mean of 30 it calls
+//!   [`Rng::gaussian`];
+//! - [`Rng::in_disc`], [`Rng::on_sphere`], [`Rng::on_hemisphere`] and
+//!   [`Rng::cosine_hemisphere`] call [`math::sin_cos_turns`], and `sqrt`.
+//!
+//! `the_samplers_are_pinned` holds a digest of all seven, on the same four
+//! platforms. Through 0.23 they called the platform's C library instead, and CI
+//! measured the difference on `pantometry-forcefield`'s water lattice, whose
+//! molecules are oriented through [`Rng::gaussian`]: one digest on Linux, another
+//! on Windows (MSVC) and a third on macOS; this machine's Windows (GNU), which no
+//! CI job runs, gave Linux's. A result recorded
+//! before that drew different numbers, and is reproducible only on the machine,
+//! and at the version, that recorded it.
+//!
+//! # Determinism survives parallelism, but only through [`Rng::for_index`]
+//!
+//! A single [`Rng`] threaded through a trace is reproducible only while the draws
+//! happen in one order. Hand that generator to several threads and the order
+//! becomes whatever the scheduler decided this time, so the run stops being
+//! repeatable — the invariant is lost precisely when the simulation gets big
+//! enough to need it.
+//!
+//! [`Rng::for_index`] is the way out. It hashes a `(seed, index)` pair into an
+//! independent stream, statelessly, so ray 10 000 can be drawn before ray 3 and
+//! neither result changes. Seed by whatever identifies the work — pixel, sample,
+//! bounce, cell, particle — and the answer no longer depends on the order the
+//! work happened to be done in.
+
+use glam::DVec3;
+
+use crate::math;
+use crate::vector::basis_for;
+
+/// Deterministic xorshift64* PRNG. Avoids a dependency, and its stream is the same
+/// bits on every platform and in WebAssembly, and so is every method sampled from
+/// it, as the module documentation says.
+///
+/// `Clone` is deliberate: cloning captures the exact stream position, which is
+/// how a speculative draw can be replayed or a substream forked at a known point.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Rng(u64);
+
+/// SplitMix64's finaliser: an avalanche mix that decorrelates inputs differing by
+/// a single bit. Used to turn structured indices — a pixel number, a bounce depth
+/// — into seeds that behave like independent ones.
+fn mix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+impl Rng {
+    /// A generator from a seed.
+    ///
+    /// Every seed but zero is used as given; xorshift is stuck at zero forever,
+    /// so that one value is replaced.
+    pub fn new(seed: u64) -> Self {
+        Rng(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
+    }
+
+    /// An independent stream for one piece of work, identified by index.
+    ///
+    /// Stateless and order-free: the stream for index 10 000 is what it is
+    /// whether or not index 3 was ever drawn. That is what lets a trace be
+    /// parallel and bit-reproducible at the same time, and it is why every
+    /// stochastic loop should seed per item rather than share one generator.
+    ///
+    /// Both arguments are mixed, so `(seed, index)` and `(index, seed)` differ and
+    /// adjacent indices do not produce correlated streams.
+    pub fn for_index(seed: u64, index: u64) -> Rng {
+        Rng::new(mix64(seed ^ mix64(index)))
+    }
+
+    /// Fork a child stream and advance this one past it.
+    ///
+    /// For nesting that has no natural index — a recursive bounce that needs its
+    /// own sampling without disturbing the caller's sequence. Where an index
+    /// exists, prefer [`Rng::for_index`]: splitting is still order-dependent.
+    pub fn split(&mut self) -> Rng {
+        let drawn = self.next_u64();
+        Rng::new(mix64(drawn))
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// Uniform in [0, 1).
+    pub fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Uniform in `[lo, hi)`. One draw from the stream, whatever the bounds.
+    pub fn range(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.unit()
+    }
+
+    /// Uniform point inside a disc of the given radius.
+    pub fn in_disc(&mut self, radius: f64) -> (f64, f64) {
+        let r = radius * self.unit().sqrt();
+        let (sin, cos) = math::sin_cos_turns(self.unit());
+        (r * cos, r * sin)
+    }
+
+    /// Uniform direction on the unit sphere.
+    pub fn on_sphere(&mut self) -> DVec3 {
+        let z = self.range(-1.0, 1.0);
+        let (sin, cos) = math::sin_cos_turns(self.unit());
+        let r = (1.0 - z * z).max(0.0).sqrt();
+        DVec3::new(r * cos, r * sin, z)
+    }
+
+    /// Uniform direction on the hemisphere about `normal`.
+    pub fn on_hemisphere(&mut self, normal: DVec3) -> DVec3 {
+        let d = self.on_sphere();
+        if d.dot(normal) < 0.0 {
+            -d
+        } else {
+            d
+        }
+    }
+
+    /// Cosine-weighted direction about `normal` — the Lambertian scatter.
+    ///
+    /// A matte surface does not spray light evenly over the hemisphere: it sends
+    /// it in proportion to the cosine of the angle from the normal, which is why
+    /// it looks equally bright from every direction. Sampled by Malley's method
+    /// (a uniform disc lifted onto the hemisphere), so the cosine weight is in the
+    /// distribution and the estimator needs no correction factor.
+    pub fn cosine_hemisphere(&mut self, normal: DVec3) -> DVec3 {
+        let n = normal.normalize();
+        let (x, y) = self.in_disc(1.0);
+        let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+        let (u, v) = basis_for(n);
+        (u * x + v * y + n * z).normalize()
+    }
+
+    /// A standard normal deviate, mean 0 and variance 1.
+    ///
+    /// Read noise, mechanical jitter, thermal fluctuation, Brownian motion: the
+    /// noise in a simulation is Gaussian far more often than it is uniform. Plain
+    /// Box-Muller rather than the polar form, because it draws exactly two numbers
+    /// every time — a rejection loop would make stream consumption depend on the
+    /// values drawn, and that is a needless dependency in something whose whole
+    /// job is being predictable.
+    pub fn gaussian(&mut self) -> f64 {
+        // Guard the log against an exact zero, which `unit` can return.
+        let u1 = self.unit().max(f64::MIN_POSITIVE);
+        let u2 = self.unit();
+        (-2.0 * math::ln(u1)).sqrt() * math::sin_cos_turns(u2).1
+    }
+
+    /// A normal deviate with the given mean and standard deviation.
+    pub fn normal(&mut self, mean: f64, std_dev: f64) -> f64 {
+        mean + std_dev * self.gaussian()
+    }
+
+    /// A Poisson deviate: the number of independent events that happened, when the
+    /// expected number was `mean`.
+    ///
+    /// The distribution of counting things that arrive at random — photons on a detector,
+    /// decays in a sample, molecules crossing a boundary. Its defining property is that
+    /// **the variance equals the mean**, so the noise on a count of `N` is `√N` and the
+    /// signal-to-noise ratio of counting improves only as the square root of how long you
+    /// count. That is not a limitation of any instrument; it is what counting is.
+    ///
+    /// Two methods, chosen by the mean rather than by the draw, so stream consumption
+    /// stays a function of the inputs:
+    ///
+    /// - Below 30, inverse transform from a *single* uniform. Walking the cumulative
+    ///   distribution costs `O(mean)` time and exactly one draw, where the textbook
+    ///   product-of-uniforms method would consume a variable number and make the stream
+    ///   depend on the values it produced.
+    /// - At 30 and above, a rounded normal. The skew there is 0.18 and the tail error is
+    ///   under a percent, which is far below any detector's calibration — and the exact
+    ///   method's cost grows with the mean while its benefit does not.
+    pub fn poisson(&mut self, mean: f64) -> u64 {
+        // A NaN mean is neither positive nor negative, so it needs saying separately —
+        // `mean <= 0.0` alone would let it through into the loop below.
+        if mean.is_nan() || mean <= 0.0 {
+            return 0;
+        }
+        if mean < 30.0 {
+            let u = self.unit();
+            // p is P(k) and cumulative is P(X <= k), stepped up together.
+            let mut p = math::exp(-mean);
+            let mut cumulative = p;
+            let mut k = 0u64;
+            // A generous cap: at mean 30 the distribution is spent by 100, and this only
+            // guards against a uniform draw arbitrarily close to one.
+            let cap = (mean * 20.0) as u64 + 100;
+            while u > cumulative && k < cap {
+                k += 1;
+                p *= mean / k as f64;
+                cumulative += p;
+            }
+            k
+        } else {
+            let drawn = mean + self.gaussian() * mean.sqrt();
+            drawn.round().max(0.0) as u64
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The property the whole determinism claim rests on: an indexed stream does
+    /// not care when it was asked for. Drawing the indices backwards gives the
+    /// same numbers as drawing them forwards, so a parallel trace that finishes
+    /// its work in any order still produces one answer.
+    #[test]
+    fn indexed_streams_are_order_free() {
+        let forward: Vec<f64> = (0..64)
+            .map(|i| Rng::for_index(0xD0A1_15EE, i).unit())
+            .collect();
+        let backward: Vec<f64> = (0..64)
+            .rev()
+            .map(|i| Rng::for_index(0xD0A1_15EE, i).unit())
+            .collect();
+        let mut backward_reordered = backward;
+        backward_reordered.reverse();
+        assert_eq!(forward, backward_reordered);
+    }
+
+    /// Adjacent indices must not be correlated: a per-pixel seed of `y * w + x`
+    /// is the common case, and if index i and i+1 shared most of their stream the
+    /// image would show it as structure.
+    #[test]
+    fn adjacent_indices_are_decorrelated() {
+        let draws: Vec<Vec<f64>> = (0..16)
+            .map(|i| {
+                let mut r = Rng::for_index(7, i);
+                (0..8).map(|_| r.unit()).collect()
+            })
+            .collect();
+        for i in 0..draws.len() {
+            for j in (i + 1)..draws.len() {
+                assert_ne!(draws[i], draws[j], "streams {i} and {j} collided");
+            }
+        }
+        // Neighbouring streams should not even agree on their first value to a
+        // few digits, which a weak mixer would allow.
+        for i in 1..draws.len() {
+            assert!(
+                (draws[i][0] - draws[i - 1][0]).abs() > 1e-6,
+                "streams {} and {i} start too close",
+                i - 1
+            );
+        }
+    }
+
+    /// Swapping seed and index gives a different stream — otherwise seeding by
+    /// (frame, pixel) and (pixel, frame) would alias.
+    #[test]
+    fn seed_and_index_are_not_interchangeable() {
+        assert_ne!(
+            Rng::for_index(3, 9).unit(),
+            Rng::for_index(9, 3).unit(),
+            "the pair must be ordered"
+        );
+    }
+
+    /// Zero is the one seed xorshift cannot use — it would emit zero forever.
+    #[test]
+    fn the_degenerate_seed_is_handled() {
+        let mut zero = Rng::new(0);
+        let draws: Vec<f64> = (0..4).map(|_| zero.unit()).collect();
+        assert!(draws.iter().all(|&v| v > 0.0 && v < 1.0), "{draws:?}");
+        assert!(draws[0] != draws[1]);
+    }
+
+    /// A fork diverges from its parent rather than replaying it.
+    #[test]
+    fn a_split_stream_diverges_from_its_parent() {
+        let mut parent = Rng::new(42);
+        let mut child = parent.split();
+        let p: Vec<f64> = (0..8).map(|_| parent.unit()).collect();
+        let c: Vec<f64> = (0..8).map(|_| child.unit()).collect();
+        assert_ne!(p, c);
+        // Cloning captures the position exactly, which is what makes a draw
+        // replayable.
+        let mut a = Rng::new(42);
+        let mut b = a.clone();
+        assert_eq!(a.unit(), b.unit());
+    }
+
+    /// The generator's numbers are fixed, not merely reproducible-in-principle.
+    /// This is the test that would fail if the algorithm, the seeding or the
+    /// [0,1) conversion were ever changed — which is the point, since a changed
+    /// stream silently invalidates every recorded result.
+    #[test]
+    fn the_stream_is_pinned() {
+        let mut r = Rng::new(0x5A17_7E3D);
+        // A cheap order-sensitive digest of 10 000 draws.
+        let mut hash = 0u64;
+        for _ in 0..10_000 {
+            hash = hash.rotate_left(7).wrapping_mul(0x1000_0000_01B3)
+                ^ (r.unit() * (1u64 << 53) as f64) as u64;
+        }
+        assert_eq!(hash, PINNED_DIGEST, "the generator's output has changed");
+    }
+
+    /// Changing this constant is never the fix. If this test fails, the stream
+    /// moved, and every result recorded against the old one is now unreproducible.
+    const PINNED_DIGEST: u64 = 6_777_642_030_472_145_829;
+
+    /// What is sampled from the stream is fixed too, and the same bits on every platform: every
+    /// method that draws through a transcendental, through `pantometry_core::math`, folded into
+    /// one digest that CI runs on Linux, macOS, Windows and `wasm32-wasip1`. Both of
+    /// [`Rng::poisson`]'s methods are in it, the exact one at a mean drawn anew each time below 30,
+    /// and the rounded normal at 200.
+    ///
+    /// **Sized to see the platform's `ln` in place of the kernel's, measured here** over four
+    /// million of `unit`'s pairs: the two `ln`s differ at 950, and a Gaussian shows it at 450 of
+    /// those, since `sqrt` halves the difference; `normal(−3, 0.25)` shows 25 and `poisson(200)`
+    /// none. At 2048 rounds of one Gaussian each the digest saw no difference, and a Box–Muller on
+    /// the platform's `ln` passed. At 16 384 rounds of eight about 15 are expected.
+    ///
+    /// **A count almost never sees [`Rng::poisson`]'s `exp`**, and this does not claim to: the
+    /// platform's differs from [`math::exp`] at 7.4% of means `k/4096` below 30, but a last-bit
+    /// change in `P(0)` moves a count only when the uniform falls within a few ulps of a
+    /// cumulative sum, about `10⁻¹⁵` of draws. The platform's `exp` there passes this test.
+    #[test]
+    fn the_samplers_are_pinned() {
+        let mut r = Rng::new(0x5A4D_9E15);
+        let n = DVec3::new(1.0, 2.0, -0.5).normalize();
+        let mut hash = 0xCBF2_9CE4_8422_2325u64;
+        let mut fold = |x: f64| {
+            hash = (hash ^ x.to_bits()).wrapping_mul(0x0000_0100_0000_01B3);
+        };
+        for _ in 0..16_384 {
+            for _ in 0..8 {
+                fold(r.gaussian());
+            }
+            fold(r.normal(-3.0, 0.25));
+            let mean = 0.5 + 29.0 * r.unit();
+            fold(r.poisson(mean) as f64);
+            fold(r.poisson(200.0) as f64);
+            let (x, y) = r.in_disc(2.0);
+            fold(x);
+            fold(y);
+            for d in [r.on_sphere(), r.on_hemisphere(n), r.cosine_hemisphere(n)] {
+                fold(d.x);
+                fold(d.y);
+                fold(d.z);
+            }
+        }
+        assert_eq!(hash, SAMPLER_DIGEST, "a sampler's output has changed");
+    }
+
+    /// Like [`PINNED_DIGEST`], changing this is never the fix: it is every recorded result that
+    /// drew a Gaussian or a direction.
+    const SAMPLER_DIGEST: u64 = 1_280_833_278_511_547_787;
+
+    /// Box-Muller has to actually be normal: zero mean, unit variance, and a
+    /// tail that reaches past three sigma without running away.
+    #[test]
+    fn gaussians_are_standard_normal() {
+        let mut r = Rng::new(1234);
+        const N: usize = 100_000;
+        let draws: Vec<f64> = (0..N).map(|_| r.gaussian()).collect();
+        let mean = draws.iter().sum::<f64>() / N as f64;
+        let variance = draws.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / N as f64;
+        assert!(mean.abs() < 0.02, "mean {mean}");
+        assert!((variance - 1.0).abs() < 0.03, "variance {variance}");
+        // About 0.27% of a normal distribution lies beyond three sigma.
+        let tail = draws.iter().filter(|d| d.abs() > 3.0).count() as f64 / N as f64;
+        assert!((tail - 0.0027).abs() < 0.002, "three-sigma tail {tail}");
+        assert!(draws.iter().all(|d| d.is_finite()));
+    }
+
+    /// A cosine-weighted sample stays in the hemisphere and leans towards the
+    /// normal. The mean of the cosine over a Lambertian distribution is 2/3, which
+    /// is a closed form and therefore worth testing against.
+    #[test]
+    fn cosine_sampling_leans_towards_the_normal() {
+        let mut r = Rng::new(99);
+        let n = DVec3::new(1.0, 2.0, -0.5).normalize();
+        const N: usize = 50_000;
+        let mut cos_sum = 0.0;
+        for _ in 0..N {
+            let d = r.cosine_hemisphere(n);
+            let c = d.dot(n);
+            assert!(c > -1e-9, "sample left the hemisphere: {c}");
+            assert!((d.length() - 1.0).abs() < 1e-9);
+            cos_sum += c;
+        }
+        let mean_cos = cos_sum / N as f64;
+        assert!(
+            (mean_cos - 2.0 / 3.0).abs() < 0.01,
+            "Lambertian mean cosine should be 2/3, got {mean_cos}"
+        );
+    }
+
+    /// The property that defines a Poisson count: its variance equals its mean.
+    ///
+    /// Checked across the crossover between the two methods, because that is where an
+    /// error would hide — either side alone could be right while the join is not.
+    #[test]
+    fn poisson_variance_equals_its_mean() {
+        const N: usize = 200_000;
+        for mean in [0.5f64, 3.0, 12.0, 29.0, 31.0, 200.0, 5000.0] {
+            let mut r = Rng::new(0xC0FFEE);
+            let draws: Vec<f64> = (0..N).map(|_| r.poisson(mean) as f64).collect();
+            let measured_mean = draws.iter().sum::<f64>() / N as f64;
+            let variance = draws
+                .iter()
+                .map(|d| (d - measured_mean).powi(2))
+                .sum::<f64>()
+                / N as f64;
+            assert!(
+                (measured_mean / mean - 1.0).abs() < 0.02,
+                "mean {mean}: got {measured_mean}"
+            );
+            assert!(
+                (variance / mean - 1.0).abs() < 0.05,
+                "mean {mean}: variance {variance} should equal the mean"
+            );
+        }
+    }
+
+    /// At a small mean the exact probabilities are checkable term by term, which the
+    /// variance alone would not catch — a distribution with the right first two moments
+    /// can still be the wrong distribution.
+    #[test]
+    fn a_small_poisson_matches_its_exact_probabilities() {
+        const N: usize = 400_000;
+        let mean = 2.5f64;
+        let mut r = Rng::new(7);
+        let mut counts = [0usize; 12];
+        for _ in 0..N {
+            let k = r.poisson(mean) as usize;
+            if k < counts.len() {
+                counts[k] += 1;
+            }
+        }
+        // P(k) = e^-m m^k / k!
+        let mut factorial = 1.0;
+        for (k, count) in counts.iter().enumerate() {
+            if k > 0 {
+                factorial *= k as f64;
+            }
+            let exact = (-mean).exp() * mean.powi(k as i32) / factorial;
+            let measured = *count as f64 / N as f64;
+            assert!(
+                (measured - exact).abs() < 3e-3,
+                "P({k}): measured {measured:.5}, exact {exact:.5}"
+            );
+        }
+    }
+
+    /// Counting nothing counts nothing, and a nonsensical mean does not panic.
+    #[test]
+    fn a_degenerate_poisson_counts_nothing() {
+        let mut r = Rng::new(1);
+        assert_eq!(r.poisson(0.0), 0);
+        assert_eq!(r.poisson(-5.0), 0);
+        assert_eq!(r.poisson(f64::NAN), 0);
+        // And a large mean stays finite rather than overflowing the cast.
+        assert!(r.poisson(1e12) > 0);
+    }
+
+    /// Uniform hemisphere sampling has mean cosine 1/2, which is how it differs
+    /// from the cosine-weighted one — and getting the two confused is a
+    /// factor-of-4/3 error in every diffuse bounce.
+    #[test]
+    fn uniform_hemisphere_is_not_cosine_weighted() {
+        let mut r = Rng::new(5);
+        let n = DVec3::Z;
+        const N: usize = 50_000;
+        let mean_cos: f64 = (0..N).map(|_| r.on_hemisphere(n).dot(n)).sum::<f64>() / N as f64;
+        assert!((mean_cos - 0.5).abs() < 0.01, "got {mean_cos}");
+    }
+}
